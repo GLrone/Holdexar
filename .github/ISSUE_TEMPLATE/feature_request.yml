@@ -1,0 +1,39 @@
+name: 💡 功能建议
+description: 新功能 / 体验改进的想法
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: pain
+    attributes:
+      label: 想解决什么问题
+      description: 先说场景和痛点,再说方案——这比直接描述实现方式更有帮助
+      placeholder: 例：每次想看某游戏历史低价都要点进详情页再开走势抽屉,想在列表页直接看到史低徽章
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: 你的设想
+      description: 期望的交互 / 展示形态,可附草图
+      placeholder: 例：列表行价格旁加「史低」角标,悬停显示历史最低价与当前折扣差距
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 相关模块
+      options:
+        - 仪表盘
+        - 游戏库 / 详情 / 价格矩阵
+        - 愿望单 / 监控
+        - 家庭组
+        - 账单 / 许可证
+        - 汇率
+        - 捆绑包
+        - 任务中心 / 爬取
+        - 代理管理
+        - 工具箱（CDK 等）
+        - 设置 / 外观 / 语言
+        - 其他
+    validations:
+      required: true

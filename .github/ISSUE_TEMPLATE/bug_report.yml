@@ -1,0 +1,67 @@
+name: 🐛 问题反馈
+description: 功能异常 / 数据不对 / 报错——请先翻 FAQ 与已有 Issue 再提
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > 提前感谢！以下信息能大幅加快定位。敏感信息（Cookie、订阅 URL、真实账单）**一律打码**。
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 问题描述
+      description: 发生了什么？期待是什么？
+      placeholder: 例：任务页手动触发爬取后,某游戏 41 区只有 3 区有价格,其余显示 —
+    validations:
+      required: true
+
+  - type: dropdown
+    id: run-mode
+    attributes:
+      label: 运行方式
+      options:
+        - 绿色版 exe（Releases 下载）
+        - 源码运行 python run.py
+        - --server 模式（浏览器访问）
+        - --dev 开发模式
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: 关于页 / 启动日志里的 v0.1.0 这类版本号；绿色版写 zip 文件名
+      placeholder: v0.1.0-beta
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 从启动开始,一步一步怎么操作出的这个问题
+      placeholder: |
+        1. 打开 xx 页面
+        2. 点击 xx
+        3. 看到 xx
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志 / 截图
+      description: 后端终端输出、窗口报错弹窗、页面截图（日志里敏感行请打码）
+      placeholder: 粘贴日志或拖入截图
+
+  - type: checkboxes
+    id: environment
+    attributes:
+      label: 环境信息
+      options:
+        - label: Windows 10 / 11
+        - label: 已配置 Clash 订阅（代理页可见存活节点）
+        - label: 已绑定 Steam 账号 Cookie（桌面登录）
+        - label: 确认没人提过同样的问题（已搜过 Issue）

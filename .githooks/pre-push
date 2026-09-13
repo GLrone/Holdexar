@@ -1,0 +1,12 @@
+#!/bin/sh
+# Holdexar 全量门禁 —— pre-push（配置：git config core.hooksPath .githooks）
+#
+# 全量后端 pytest 放 push 层跑（分钟级，塞进 15s 的 pre-commit 线里必被误杀）：
+# 桌面客户端对 git 进程有 15s 强杀线（提交会被误判超时），
+# pre-commit 只留快速门禁（敏感面/lint/路由/词典/旗帜素材），全量测试移到此处。
+echo "[pre-push] 后端 pytest 全量（含旗帜素材完整性检查）..."
+if ! (cd server && { .venv/Scripts/python.exe -m pytest tests/ -q --no-header 2>/dev/null || python -m pytest tests/ -q --no-header; }); then
+  echo "✗ pytest 未通过（含旗帜素材检查：CC_LIST 加新区须先下载 web/public/flags/{code}.png）。" >&2
+  exit 1
+fi
+echo "[pre-push] ✓ 通过"
