@@ -1,0 +1,26 @@
+# NOTE: keep this file pure ASCII. pip decodes requirements files with the
+# OS locale (cp936 on zh-CN Windows) when there is no BOM -- any non-ASCII
+# comment byte crashes the install with UnicodeDecodeError.
+
+# Web framework & server
+fastapi>=0.116,<1.0
+uvicorn[standard]>=0.35,<1.0
+pydantic>=2.11,<3.0
+pydantic-settings>=2.4,<3.0
+
+# Data layer (SQLAlchemy async + SQLite)
+sqlalchemy[asyncio]>=2.0.43,<2.1
+aiosqlite>=0.20,<1.0
+alembic>=1.13,<2.0
+
+# Crawler & external requests
+aiohttp>=3.10,<4.0
+aiohttp-socks>=0.9,<1.0
+httpx>=0.27,<1.0
+
+# Scheduling & events
+apscheduler>=3.10,<4.0
+sse-starlette>=2.1,<3.0
+
+# Desktop shell
+pywebview>=5.4,<6.0
