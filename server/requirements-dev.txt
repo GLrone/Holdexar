@@ -1,0 +1,21 @@
+# Development-only dependencies. NOT needed to run Holdexar.
+#
+# Why this file exists separately from requirements.txt:
+#   run.py installs requirements.txt on first launch for end users. Test tooling
+#   must not ride along there -- it would make every user's first start download
+#   pytest, and a broken test dep would break the app for people who never run
+#   tests. Keep this list strictly to what CI and local `pytest` need.
+#
+# NOTE: keep this file pure ASCII, same reason as requirements.txt -- pip decodes
+# requirements files with the OS locale (cp936 on zh-CN Windows) when there is no
+# BOM, and a single non-ASCII byte crashes the install with UnicodeDecodeError.
+
+# Test runner. Versions pinned to what the project is actually verified against
+# locally; the ranges stay open enough to pick up patch fixes on CI.
+pytest>=9.1,<10.0
+pytest-asyncio>=1.4,<2.0
+
+# HTTP mocking for the crawler/updater tests (httpx.MockTransport is stdlib-ish but
+# some tests reach for respx-style helpers; keep httpx pinned in lockstep with
+# requirements.txt rather than letting pip resolve a different major here).
+httpx>=0.28,<1.0
