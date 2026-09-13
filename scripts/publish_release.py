@@ -19,8 +19,12 @@
 用法（发布机，需已 `gh auth login`）：
     python scripts/publish_release.py --dry-run     # 只打印将执行的命令
     python scripts/publish_release.py               # 正式发布
-    python scripts/publish_release.py --prerelease  # 发预发布版
+    python scripts/publish_release.py --prerelease  # 发预发布版（RC 用；见下）
     python scripts/publish_release.py --scoop-dir D:\\scoop-bucket   # 顺带更新 Scoop 清单
+
+发 Beta 的推荐做法：标题写「Holdexar vX.Y.Z Beta」，**不加** --prerelease。
+预发布标记不能当 Latest（GitHub 限制），会让 releases/latest 指空，
+客户端更新检查的降级路径（走该接口）就没了着落。
 
 没装 gh：
     winget install --id GitHub.cli      # 或 scoop install gh
@@ -127,6 +131,16 @@ def publish_version_release(
     ]
     if prerelease:
         cmd.append("--prerelease")
+        print(
+            "[提示] 预发布标记的版本 Release 不能当 Latest，GitHub 会把\n"
+            "       releases/latest 指空——想发 Beta 又保住 Latest，用「标题带\n"
+            "       Beta + 不加 --prerelease」（预发布标记留给真正的 RC）。"
+        )
+    else:
+        # 版本 Release 才是用户看到的「最新版本」：显式置 Latest。不加这句时，
+        # 清单 Release（updater）会被 GitHub 算成 Latest——它是机器页，
+        # 会让 releases/latest 与仓库首页指错地方
+        cmd.append("--latest")
     run(cmd, dry)
 
 
@@ -151,7 +165,11 @@ def publish_manifest_release(dry: bool) -> None:
             "下载地址与文件校验值。\n"
             "\n"
             "它不是版本发布页，请勿删除——删除后客户端将无法检测到新版本。",
-            # 关键：否则会被标成 Latest release，带偏 releases/latest 与 RSS
+            # 也标预发布：GitHub 的 Latest 取「最新的非预发布」，
+            # 只加 --latest=false 挡不住它 —— 清单页会把 releases/latest
+            # 抢过去（那是机器页，客户端降级路径拿它当版本页会扑空）
+            "--prerelease",
+            # 双保险：预发布本就不会被标 Latest
             "--latest=false",
         ],
         dry,
