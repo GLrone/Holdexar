@@ -1,0 +1,165 @@
+# ── Agent / AI 工具目录（本机专用，绝不上传）──
+.zcode/
+.workbuddy/
+.cursor/
+.claude/
+.aider*
+.continue/
+.codeium/
+.windsurf/
+
+# ── Git Hooks / CI ──
+# 已入库。pre-commit 的敏感面门禁与 .github/workflows/ci.yml 是防泄漏机制本身，
+# 排除它们等于让每个 clone 都失去防护。启用钩子：git config core.hooksPath .githooks
+
+# ── 桌面壳源码（run.py 启动依赖，随仓库分发）──
+# 注意：仅排除构建产物，desktop/ 源码本身必须入库（desktop/、run.py 直接执行 desktop/main.py）
+desktop/__pycache__/
+
+# ── 文档 ──
+# 上传的说明文档只保留 README.md 与 LICENSE（MIT），其余全部本地保留：
+# docs/ 整体屏蔽——DEV_LOG.md 含完整的绕行参数与内部档案，计划/交接/复盘
+# 文档同属内部资料；THIRD_PARTY_NOTICES.md 仍随发布包分发（构建合规所需），
+# 只是不再随仓库公开。AGENTS.md / CONTRIBUTING.md / SECURITY.md 同为本地
+# 约束文档，不上传。
+docs/*
+AGENTS.md
+CONTRIBUTING.md
+SECURITY.md
+# 交接文档（内部资料）
+H*ND*.md
+P?AN.md
+
+# ── 根目录临时文件 ──
+/*.txt
+/dy
+/_*.png
+# CDP 调试浏览器实例数据（含 Cookies/History，绝不入库）
+/.tmp-chrome-profile/
+
+# ── 调研残留 / 外部参考资料（本机专用）──
+.tmp-research/
+reference-repos/
+# 根目录散落资料归档地：浏览器脚本脚本原文、调试截图（见 reference/README.md）
+reference/
+
+# ── E2E 截图 ──
+gui-test-screenshots/
+
+# ── 原型 / 试验代码 ──
+price-history-prototype/
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.coverage
+htmlcov/
+
+# ── Node / 前端 ──
+node_modules/
+web/dist/
+web/.eslintcache
+web/node_modules/
+dist-ssr/
+*.local
+*.tsbuildinfo
+coverage/
+stats.html
+
+# ── Playwright / E2E ──
+playwright-report/
+test-results/
+
+# ── PyInstaller / 发布构建 ──
+build/
+dist/
+release/
+*.spec.bak
+
+# ── 资产种子（二进制大文件不进 git）──
+assets/seed/
+
+# ── 运行时数据 ──
+data/
+# 数据目录迁出仓库后的旧位置（改名保留的副本，见 dev.bat 的迁移提示）。
+# 注意：`data/` 只匹配名为 data 的目录，**不**匹配 data.old/，故须显式列出——
+# 否则其中散落的 .json/.md 草稿会被 `git add -A` 一并收走（*.db 已被下面挡住）。
+/data.old/
+*.db
+*.sqlite3
+*.log
+*.pid
+
+# ── pytest 临时产物 ──
+.tmp-pytest/
+
+# ── 机密 ──
+.env
+.env.*
+!.env.example
+mail.ini
+secrets/
+
+# ── 编辑器 / 系统 ──
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
+desktop.ini
+~$*
+*.bak
+*.orig
+*.swp
+*.tmp
+
+# ── 调试转储 ──
+# 锚定规则：模式中间出现 `/` 即锚定到本文件所在目录（仓库根），
+# 故 `scripts/x.py` 只匹配根目录的 scripts/，**不**匹配 server/scripts/。
+# 一次性的调试脚本实际落在 server/scripts/，因此两个位置都要列。
+scripts/_report_*.json
+server/scripts/_report_*.json
+scripts/_history_*.html
+server/scripts/_history_*.html
+# 价格历史抓取的一次性对拍转储，落在仓库根（如 history-now.json）
+/history-*.json
+
+# ── 一次性开发脚本（本机调试/基准/验证用，不上传）──
+# 刻意不写 `**/scripts/`：那会连 web/scripts/check-routes.mjs（构建门禁必需）一起扫掉。
+scripts/bench_*.py
+server/scripts/bench_*.py
+scripts/debug_*.cjs
+server/scripts/debug_*.cjs
+scripts/seed_*.py
+server/scripts/seed_*.py
+scripts/shot_*.cjs
+server/scripts/shot_*.cjs
+scripts/verify_*.cjs
+server/scripts/verify_*.cjs
+scripts/verify_*.py
+server/scripts/verify_*.py
+scripts/import_*.py
+server/scripts/import_*.py
+dy-tour-e2e/
+
+# ── 外部平台爬虫 / 本机一次性诊断脚本 ──
+# 共同特征：含第三方平台签名协议实现，或硬编码本机绝对路径
+# （E:\本机目录、E:\本机目录）。入库后对任何其他 clone 都是坏引用——
+# 例如 test_外部平台_proxy.py 会 import 下面第一个模式覆盖的文件。
+# 模式写成 外部平台*.py 而非 外部平台_*.py：后者要求 外部平台 后必须跟下划线，
+# 会漏掉 外部平台403_steam_check.py（该文件含 403 绕行逻辑，同样不该入库）。
+server/scripts/外部平台*.py
+server/scripts/外部平台_watchdog.ps1
+server/scripts/probe_recover.py
+server/scripts/test_外部平台_proxy.py
+
+# ── 隔离验证数据目录（本会话/历史会话的迁移演练与爬虫验证临时库，绝不入库）──
+server/_tmp_*/
+server/_tmp_verify_data/

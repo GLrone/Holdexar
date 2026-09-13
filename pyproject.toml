@@ -1,0 +1,62 @@
+# 工具配置的唯一落点。
+#
+# **为什么需要它**：此前项目里一个 pytest 配置文件都没有，pytest 靠 rootdir
+# 推断（在 server/ 与仓库根两处运行会得到不同的收集结果），而 pytest-asyncio
+# 在没有配置时跑在 strict 模式——这个模式恰好是我们要的，但它此前是「碰巧」而非
+# 「声明」，换个环境就可能变成 auto，让 38 个显式标了 @pytest.mark.asyncio 的
+# 文件行为改变。这里把它固定下来。
+
+[tool.pytest.ini_options]
+# 显式声明，不再靠推断：测试都在 server/tests 下
+testpaths = ["server/tests"]
+# **刻意保持 strict**：38 个测试文件已显式标注 @pytest.mark.asyncio，
+# 改成 auto 会让「忘了标注的 async 测试」静默地不被执行（pytest 对未标注的
+# async 函数只警告不失败），那等于用「测试变少」换取「不报错」。
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+# 让测试能 `import app.*` 而不必每个文件自己 sys.path.insert
+pythonpath = ["server"]
+addopts = "-ra"
+filterwarnings = [
+    # 第三方库的 DeprecationWarning 不是本项目要处理的事，但也不能全忽略——
+    # 只压掉已确认与我们无关的几条，其余照旧打印。
+    "ignore::DeprecationWarning:apscheduler.*",
+    "ignore::DeprecationWarning:pkg_resources.*",
+]
+
+[tool.ruff]
+target-version = "py311"  # 与 CI 最低版本、README 声明一致
+line-length = 100
+extend-exclude = [
+    "release",
+    "reference",
+    "reference-repos",
+    "web/node_modules",
+    # 迁移期的历史归档，不参与新代码规范
+    "data.old",
+]
+
+[tool.ruff.lint]
+# 起步只开「几乎不可能误报」的规则集：F(未使用导入/变量等真问题) + E/W 里的
+# 空白与语法类。刻意**不**开 I(isort)/UP(pyupgrade)/B(bugbear)——那会一次性
+# 产生上千条与本次改造无关的改动，淹没真正的评审点。要扩规则另开一轮。
+select = ["F", "E4", "E7", "E9", "W6"]
+ignore = [
+    "E501",  # 行宽交由 formatter 管，不靠 lint 报
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里允许「导入即为了注册/副作用」以及未使用的 fixture 参数
+"server/tests/**" = ["F401", "F841"]
+"scripts/**" = ["F401"]
+
+[tool.mypy]
+python_version = "3.11"
+# 渐进式：先只查「代码里已经写了类型标注」的地方，未标注的函数体不追。
+# 一次性开严格模式会让一个没有历史标注的代码库产生上千条错误，没人会修。
+check_untyped_defs = false
+disallow_untyped_defs = false
+warn_redundant_casts = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+exclude = ["release/", "reference/", "reference-repos/", "data\\.old/"]
