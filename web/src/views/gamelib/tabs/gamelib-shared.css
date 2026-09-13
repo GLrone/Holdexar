@@ -1,0 +1,185 @@
+/* 游戏库页签共享样式（views/gamelib/tabs/*.vue 经 <style src> 引入，
+   Vite 对同一文件去重）。类名 gl-* 自成一体，不与 family 页的 fx-* /
+   wl-* 共享文件——两页各自演进，互不牵连。 */
+
+/* KPI 行：HlStat 只管卡片本体，这里只管几列几间距 */
+.gl-kpi-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+/* 工具栏：搜索 / 计数 / 排序 chips / 筛选 / 刷新 */
+.gl-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.gl-search {
+  flex: 1;
+  min-width: 150px;
+  max-width: 300px;
+  height: 30px;
+  background: var(--input-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  padding: 0 10px;
+  font-size: 12px;
+  color: var(--text-primary);
+  transition: var(--transition);
+  outline: none;
+  font-family: inherit;
+}
+.gl-search:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-a15);
+}
+.gl-search::placeholder {
+  color: var(--text-faint);
+}
+.gl-toolbar__count {
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 卡片网格 */
+.gl-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(196px, 1fr));
+  gap: 12px;
+}
+
+/* 分页行 */
+.gl-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 14px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.gl-pager__btns {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+.gl-pgbtn {
+  font-size: 10.5px;
+  padding: 3px 9px;
+  border-radius: 4px;
+  border: 1px solid var(--border-soft);
+  background: var(--surface-chip);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: var(--transition);
+  font-family: inherit;
+}
+.gl-pgbtn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.gl-pgbtn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* 分析组件的模块卡与节标题 */
+.gl-module {
+  background: var(--bg-card);
+  border: 1px solid var(--line-1);
+  border-radius: var(--radius-lg);
+  padding: 15px 16px;
+  box-shadow: var(--shadow-sm);
+  min-width: 0;
+}
+.gl-sub {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin: 0 0 12px;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.gl-sub::before {
+  content: '';
+  width: 3px;
+  height: 12px;
+  border-radius: 2px;
+  background: var(--accent-fill);
+  align-self: center;
+}
+.gl-sub small {
+  font-weight: 400;
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+
+/* 横向比例条行（账号对比 / 类型分布共用） */
+.gl-ratio {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-bottom: 10px;
+  font-size: 12px;
+}
+.gl-ratio:last-child {
+  margin-bottom: 0;
+}
+.gl-ratio__name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 118px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+  min-width: 0;
+}
+.gl-ratio__name span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gl-ratio__track {
+  flex: 1;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--surface-track);
+  overflow: hidden;
+}
+.gl-ratio__fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width calc(var(--duration-4) * var(--motion-scale)) var(--ease-out);
+}
+.gl-ratio__val {
+  width: 88px;
+  text-align: right;
+  font-family: var(--font-mono, monospace);
+  color: var(--text-muted);
+  font-size: 11px;
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 双列组件网格（分析页） */
+.gl-modules {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  align-items: start;
+}
+@media (max-width: 1100px) {
+  .gl-modules {
+    grid-template-columns: 1fr;
+  }
+}

@@ -1,0 +1,108 @@
+/* 家庭库标签页共享样式（框架 fx-* 令牌化类，多标签组件复用；
+   通过 <style src> 引入，Vite 对同一文件去重） */
+.fx-module { background: var(--bg-card); border: 1px solid var(--line-1); border-radius: var(--radius-lg); padding: 18px; box-shadow: var(--shadow-sm); }
+.fx-module__head { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; flex-wrap: wrap; }
+.fx-module__icon { width: 34px; height: 34px; border-radius: var(--radius); display: grid; place-items: center; background: var(--accent-a15); color: var(--accent); flex-shrink: 0; }
+.fx-module__icon svg { width: 19px; height: 19px; }
+.fx-module__title { font-size: 15px; font-weight: 700; color: var(--text-primary); }
+.fx-module__sub { font-size: 12px; color: var(--text-muted); margin: 2px 0 14px 44px; }
+
+.fx-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+.fx-grid--3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+@media (max-width: 1100px) { .fx-grid, .fx-grid--3 { grid-template-columns: 1fr; } }
+
+/* `.fx-mini-stat` 曾在这里定义（本仓库该类的第二份副本，另两份在 family/Index.vue
+   与 toolbox/Index.vue，四份里两份左对齐两份居中）。KPI 卡本体已统一到
+   components/ui/HlStat.vue，故整块删除；各 tab 只保留**布局**（.lib-stats /
+   .wl-kpi-row / .pa-kpi-row … 决定几列几间距），不再定义卡片长相。 */
+
+.fx-empty-mini {
+  padding: 26px 20px;
+  text-align: center;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  background: var(--surface-inset);
+  border: 1px dashed var(--border-soft);
+  border-radius: var(--radius);
+  line-height: 1.8;
+}
+
+.fx-sub { font-size: 12px; font-weight: 600; color: var(--text-secondary); margin: 14px 0 8px; display: flex; align-items: center; gap: 7px; }
+.fx-sub::before { content: ''; width: 3px; height: 12px; border-radius: 2px; background: var(--accent-fill); }
+
+.ratio-row { display: flex; align-items: center; gap: 9px; margin-bottom: 9px; font-size: 12px; }
+.ratio-row__name { width: 64px; color: var(--text-secondary); flex-shrink: 0; }
+.ratio-row__track { flex: 1; height: 8px; border-radius: 999px; background: var(--surface-track); overflow: hidden; }
+.ratio-row__fill { height: 100%; border-radius: 999px; transition: width 0.9s var(--ease-out); }
+.ratio-row__val { width: 52px; text-align: right; font-family: var(--font-mono, monospace); color: var(--text-muted); font-size: 11px; flex-shrink: 0; }
+
+/* `.bill-chip` 曾在这里（全仓库三份副本之一），chip 本体已统一到 HlChip.vue，只留布局。 */
+.bill-chips { display: flex; gap: 7px; flex-wrap: wrap; margin-bottom: 12px; }
+.bill-type { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--accent-a15); color: var(--accent); white-space: nowrap; }
+.bill-type--refund { background: var(--success-a15); color: var(--success); }
+.bill-type--gift { background: color-mix(in srgb, #ec4899 15%, transparent); color: #ec4899; }
+
+.ring-progress {
+  --p: 0;
+  width: 74px;
+  height: 74px;
+  border-radius: 50%;
+  background: conic-gradient(var(--success) calc(var(--p) * 1%), var(--surface-track) 0);
+  display: grid;
+  place-items: center;
+  position: relative;
+  flex-shrink: 0;
+}
+.ring-progress::before { content: ''; position: absolute; width: 56px; height: 56px; border-radius: 50%; background: var(--bg-card); }
+.ring-progress span { position: relative; z-index: 1; font-size: 13px; font-weight: 700; font-family: var(--font-mono, monospace); }
+
+/* `.lib-sort` 曾在这里（FamBuy / FamLib 的排序 chip），与 FamWish 的 `.wl-filter`
+   是逐字相同的两份副本，已统一到 `HlChip.vue` 的 `<HlChip shape="soft">`。 */
+
+.wl-search {
+  flex: 1;
+  min-width: 120px;
+  height: 30px;
+  background: var(--input-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  padding: 0 10px;
+  font-size: 12px;
+  color: var(--text-primary);
+  transition: var(--transition);
+  outline: none;
+  font-family: inherit;
+}
+.wl-search:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-a15); }
+
+.wl-pager { display: flex; align-items: center; justify-content: space-between; font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+.wl-pager__btns { display: flex; gap: 4px; }
+.wl-pgbtn {
+  font-size: 10.5px;
+  padding: 3px 9px;
+  border-radius: 4px;
+  border: 1px solid var(--border-soft);
+  background: var(--surface-chip);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: var(--transition);
+  font-family: inherit;
+}
+.wl-pgbtn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.wl-pgbtn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* GitHub 入库热力图五级色（主题相关，双主题契约） */
+:root {
+  --gh-0: #ebedf0;
+  --gh-1: #9be9a8;
+  --gh-2: #40c463;
+  --gh-3: #30a14e;
+  --gh-4: #216e39;
+}
+html.dark {
+  --gh-0: #161b22;
+  --gh-1: #0e4429;
+  --gh-2: #006d32;
+  --gh-3: #26a641;
+  --gh-4: #39d353;
+}
