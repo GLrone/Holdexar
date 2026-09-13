@@ -1,0 +1,124 @@
+"""捆绑包存量刷新随价格链测试（链尾段接线语义，不出网不触库）。
+
+规则：捆绑包 lane 播种只捞「无价包」管首价，存量包的各区价/折扣
+没有别的自动通道——价格刷新链（6h 锚点网格）的两层串行
+missing → pool（全池，愿望单优先序排前）在 run_sequential 内逐个
+await 跑完后，紧跟 bundles.refresh_bundles() 全量刷包。
+
+隔离：run_sequential / refresh_bundles / 重锚 / 总开关全部打桩，
+只验证接线、顺序、异常隔离与开关门禁。
+"""
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.core import scheduler as sched_mod
+from app.domains.bundles import refresh as bundles_refresh
+from app.domains.crawl import service as crawl_service
+
+
+def _stub_chain_env(monkeypatch, *, events, auto=True, gate=None):
+    """价格链出网/重锚/开关/代理闸门全打桩；run_sequential 与
+    refresh_bundles 把调用顺序记录进 events（"chain" 元组 / "bundles"）。
+    gate=None = 闸门放行；传异常则闸门拒绝（如 ValueError = 无可用代理）。"""
+
+    async def _auto_enabled():
+        return auto
+
+    monkeypatch.setattr(sched_mod, "price_auto_enabled", _auto_enabled)
+
+    async def _no_reanchor(reason):
+        return None
+
+    monkeypatch.setattr(sched_mod, "_reanchor_price_refresh", _no_reanchor)
+
+    async def _gate():
+        if gate is not None:
+            raise gate
+
+    monkeypatch.setattr(crawl_service, "ensure_proxy_available", _gate)
+
+    async def _run_sequential(specs, **kwargs):
+        events.append(("chain", [s.get("kind", s.get("scope")) for s in specs]))
+        return [{"id": 1}]
+
+    monkeypatch.setattr(crawl_service, "run_sequential", _run_sequential)
+
+    async def _refresh_bundles():
+        events.append("bundles")
+        return {
+            "ok": True, "updated": 3, "total": 3, "regionPrices": 126,
+            "failed": [], "droppedSingletons": 0,
+        }
+
+    monkeypatch.setattr(bundles_refresh, "refresh_bundles", _refresh_bundles)
+
+
+@pytest.fixture
+def _idle():
+    """任务表空 + busy 复位（用例前后各置一次，防泄漏影响别的测试）。"""
+    crawl_service._active = None
+    sched_mod._price_cycle_busy = False
+    yield
+    crawl_service._active = None
+    sched_mod._price_cycle_busy = False
+
+
+@pytest.mark.asyncio
+async def test_bundle_refresh_follows_game_chain(monkeypatch, _idle):
+    """游戏侧三层链跑完 → 紧跟捆绑包全量刷新（顺序 + 接线）。"""
+    events: list = []
+    _stub_chain_env(monkeypatch, events=events)
+
+    await sched_mod._job_price_refresh()
+
+    assert events == [("chain", ["missing", "pool"]), "bundles"]
+    assert sched_mod._price_cycle_busy is False
+
+
+@pytest.mark.asyncio
+async def test_bundle_refresh_failure_does_not_break_job(monkeypatch, _idle):
+    """捆绑包刷新抛异常：主链已完成、busy 正常复位、异常不外溢。"""
+    events: list = []
+    _stub_chain_env(monkeypatch, events=events)
+
+    async def _boom():
+        events.append("bundles")
+        raise RuntimeError("抓取炸了")
+
+    monkeypatch.setattr(bundles_refresh, "refresh_bundles", _boom)
+
+    await sched_mod._job_price_refresh()  # 不抛
+    assert events == [("chain", ["missing", "pool"]), "bundles"]
+    assert sched_mod._price_cycle_busy is False
+
+
+@pytest.mark.asyncio
+async def test_bundle_refresh_respects_auto_price_switch(monkeypatch, _idle):
+    """crawl.auto_price 关：整条链（含捆绑包尾段）都不跑。"""
+    events: list = []
+    _stub_chain_env(monkeypatch, events=events, auto=False)
+
+    await sched_mod._job_price_refresh()
+
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_bundle_refresh_skipped_without_proxy(monkeypatch, _idle):
+    """代理前置闸门拒绝（无可用代理）：主链照常（spec 级跳过由闸门语义
+    决定），捆绑包尾段静默让路不直连硬打 Steam。"""
+    events: list = []
+    _stub_chain_env(
+        monkeypatch, events=events,
+        gate=ValueError("无可用代理（订阅未保存/节点全不可用）——自动爬取已跳过，手动启动不受限"),
+    )
+
+    await sched_mod._job_price_refresh()  # 闸门 ValueError 不外溢
+
+    assert events == [("chain", ["missing", "pool"])]
+    assert "bundles" not in events
+    assert sched_mod._price_cycle_busy is False
