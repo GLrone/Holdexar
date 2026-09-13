@@ -1,0 +1,90 @@
+/* ════════════════════════════════════════════════════════════════
+   浅色主题适配层 —— 必须最后加载（覆盖 SteamHL 移植样式的深色表面）
+   ════════════════════════════════════════════════════════════════ */
+html:not(.dark) .game-card {
+  background: #ffffff;
+  border-color: rgba(42, 71, 94, 0.14);
+}
+
+html:not(.dark) .game-card:hover {
+  border-color: rgba(28, 110, 164, 0.4);
+  box-shadow: 0 15px 40px rgba(23, 32, 42, 0.12);
+}
+
+html:not(.dark) .game-title {
+  color: #17202a;
+}
+
+html:not(.dark) .price-section,
+html:not(.dark) .gpw-inline {
+  background: rgba(42, 71, 94, 0.05);
+}
+
+html:not(.dark) .price-value {
+  color: #17202a;
+}
+
+html:not(.dark) .navbar,
+html:not(.dark) .filter-toolbar {
+  background: rgba(240, 244, 248, 0.95);
+}
+
+html:not(.dark) .search-box {
+  background: rgba(42, 71, 94, 0.06);
+  color: #17202a;
+}
+
+html:not(.dark) .filter-panel {
+  background: #ffffff;
+}
+
+html:not(.dark) .gpw-popover,
+html:not(.dark) .gifting-popup {
+  background: #ffffff;
+  border: 1px solid rgba(42, 71, 94, 0.18);
+}
+
+html:not(.dark) .gpw-title {
+  color: #17202a;
+}
+
+html:not(.dark) .proxyx-hero {
+  background: #ffffff;
+}
+
+html:not(.dark) .proxyx-console {
+  background: rgba(42, 71, 94, 0.05);
+}
+
+html:not(.dark) .filter-main-btn {
+  background: linear-gradient(135deg, #ffffff, #e7edf4);
+  border-color: rgba(28, 110, 164, 0.4);
+  color: #1c6ea4;
+}
+
+html:not(.dark) .filter-main-btn:hover {
+  border-color: #6b9a00;
+  color: #6b9a00;
+}
+
+html:not(.dark) .filter-main-btn.active {
+  background: linear-gradient(135deg, #6b9a00, #5a8000);
+  border-color: #6b9a00;
+  color: #fff;
+}
+
+html:not(.dark) .layout-switch {
+  border-color: rgba(42, 71, 94, 0.15);
+}
+
+html:not(.dark) .sort-btn.active {
+  background: var(--accent-fill);
+  border-color: var(--accent-fill);
+  color: var(--on-accent-fill);
+}
+
+html:not(.dark) .sort-btn:hover:not(.active) {
+  background: rgba(28, 110, 164, 0.08);
+  border-color: rgba(28, 110, 164, 0.35);
+  color: #1c6ea4;
+}
