@@ -1,0 +1,45 @@
+#!/bin/sh
+# Holdexar 收口门禁 —— pre-commit（配置：git config core.hooksPath .githooks）
+#
+# 快速层，必须 <15s：桌面客户端对 git commit 有 15s 强杀线（全量 pytest
+# 40s 会导致提交被误判超时），重活全部移到 .githooks/pre-push。
+#   0. 敏感面门禁（路径 / 体积 / 凭据形状，只查暂存改动）——放最前：
+#      最便宜的一层，且失败时没必要再花时间跑后面任何检查
+#   1. 前端收口 lint（--cache 增量，error 级，见 web/eslint.config.mjs）
+#   2. 路由完整性（悬空引用拦截，/bills 事故防线）
+#   3. 词典完整性（拼错的 key / 缺译 / 孤儿词条，见 web/scripts/check-i18n.mjs）
+#   4. 旗帜素材完整性（CC_LIST 新区忘下载 /flags/{code}.png 即报错）
+#
+# 例外存量已在 eslint 豁免清单（web/eslint.config.mjs 的 LEGACY_FILES）镜像；
+# 新增例外 = 违规，先登记评审、再同步改豁免清单。
+echo "[pre-commit] 敏感面门禁（凭据 / 大文件 / 用户数据，只查本次暂存改动）..."
+if ! { python scripts/check_secrets.py --staged || server/.venv/Scripts/python.exe scripts/check_secrets.py --staged; }; then
+  echo "✗ 敏感面检查未通过：命中项已在上方列出（只给位置与掩码，不回显值）。" >&2
+  echo "  判定为误报时先跑 python scripts/check_secrets.py --all 确认全树仍零命中，" >&2
+  echo "  再按脚本头部的「加新特征」流程调整规则；严禁 --no-verify 绕行。" >&2
+  exit 1
+fi
+echo "[pre-commit] 前端收口 lint（--cache 增量，--quiet 只报 error）..."
+if ! (cd web && npx eslint src --quiet --cache); then
+  echo "✗ 收口规则违规：请按错误信息改用 HlSelect/HlDrawer/HlDialog/统一出口；" >&2
+  echo "  确需豁免的，先在 web/eslint.config.mjs 的 LEGACY_FILES 登记并注明原因。" >&2
+  exit 1
+fi
+echo "[pre-commit] 路由完整性（悬空引用拦截，/bills 事故防线）..."
+if ! (cd web && npm run check:routes); then
+  echo "✗ 路由指向的视图文件缺失：挂路由与视图必须同批落地，" >&2
+  echo "  中途停工请撤回路由或提交「施工中」占位视图（src/views/_stub/Missing.vue 可作模板）。" >&2
+  exit 1
+fi
+echo "[pre-commit] 词典完整性（拼错的 key / 缺译 / 孤儿词条）..."
+if ! (cd web && npm run --silent check:i18n); then
+  echo "✗ 词典校验未通过：t() 的 key 必须存在于 zh-CN 词典且中英逐条对齐。" >&2
+  echo "  拼错的 key 不会让构建失败，只会在界面上静默渲染成 key 原文——所以在这里拦。" >&2
+  exit 1
+fi
+echo "[pre-commit] 旗帜素材完整性（CC_LIST 新区必须先下载 /flags/{code}.png）..."
+if ! (cd server && { .venv/Scripts/python.exe -m pytest tests/test_flags_integrity.py -q --no-header 2>/dev/null || python -m pytest tests/test_flags_integrity.py -q --no-header; }); then
+  echo "✗ 旗帜素材检查未通过：CC_LIST 加新区须先下载 web/public/flags/{code}.png。" >&2
+  exit 1
+fi
+echo "[pre-commit] ✓ 快速门禁通过（全量后端 pytest 在 pre-push 层）"

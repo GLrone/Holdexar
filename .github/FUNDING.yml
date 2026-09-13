@@ -1,0 +1,9 @@
+# 本项目当前**没有**开通任何赞助渠道，因此本文件不声明任何平台。
+#
+# 此前这里写的是 `contact_links: []`——那不是本文件的合法键（`contact_links` 属于
+# `.github/ISSUE_TEMPLATE/config.yml`）。GitHub 只校验 FUNDING.yml 里已定义的键，
+# 所以它既不会生效、也不会报错，只是一个看着像配置了的空占位。
+#
+# 将来若要开通，删掉本行注释并填写对应平台的键即可，例如：
+#   github: [GLrone]
+#   custom: ["https://example.com/donate"]

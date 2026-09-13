@@ -1,0 +1,45 @@
+# 行尾与文本属性：跨平台检出的一致性基础。
+#
+# **为什么必须有这个文件**：`.githooks/` 里的钩子是 `#!/bin/sh` 脚本，此前以 CRLF
+# 入库（`git ls-files --eol` 显示 i/crlf），在 Git Bash / WSL / 任何 Linux runner 上
+# 都会以 `bad interpreter: /bin/sh^M` 失败——CI 与 Linux 协作者拿到的是坏的钩子。
+# 仓库里同时有 .bat（必须 CRLF）与 .sh（必须 LF），所以不能靠全局 autocrlf 猜。
+
+# 默认：按内容自动判定文本，入库统一 LF
+* text=auto
+
+# Shell 脚本必须 LF（否则 shebang 带 \r 直接不可执行）
+*.sh        text eol=lf
+.githooks/* text eol=lf
+
+# Windows 批处理必须 CRLF（cmd.exe 对 LF-only 的 .bat 处理不稳定，尤其是 goto/label）
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+
+# PowerShell 脚本：LF 在 pwsh 5.1/7 下均正常，保持与 sh 一致
+*.ps1       text eol=lf
+
+# 二进制：禁止行尾转换与 diff 文本化（否则 git 会把它们当文本改坏）
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.ico       binary
+*.gif       binary
+*.webp      binary
+*.db        binary
+*.db-wal    binary
+*.db-shm    binary
+*.sqlite3   binary
+*.zip       binary
+*.exe       binary
+*.dll       binary
+*.so        binary
+*.dat       binary
+*.mmdb      binary
+*.woff      binary
+*.woff2     binary
+*.ttf       binary
+
+# 生成物与锁文件：语言统计里不该把它们算成手写代码，diff 里也不该展开
+web/dist/**          linguist-generated=true
+web/package-lock.json linguist-generated=true -diff
