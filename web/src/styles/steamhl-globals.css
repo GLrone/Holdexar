@@ -1,0 +1,938 @@
+
+
+/* ════════════════════════════════════════════════════════════════
+   SteamHL Legacy Design System — 1:1 Migration from HTML Report
+   Source: 设计原型生成.py (V1.2 – V7.3)
+   ════════════════════════════════════════════════════════════════ */
+
+/* ─── Reset ─────────────────────────────────────────────────── */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+/* ════════════════════════════════════════════════════════════════
+   导航栏 (Navbar)
+   ════════════════════════════════════════════════════════════════ */
+.navbar {
+    position: sticky;
+    top: 0;
+    z-index: 9;
+    background: var(--surface-overlay-panel);
+    backdrop-filter: blur(10px);
+    padding: 12px 20px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid var(--accent-a20);
+    box-shadow: 0 4px 20px var(--surface-inset);
+}
+
+.navbar-left {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+}
+
+.logo-wrapper {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    cursor: pointer;
+    overflow: hidden;
+    /* Default hidden (when top Global Header holds the title) */
+    max-width: 0;
+    opacity: 0;
+    margin-right: 0;
+    transform: translateX(-10px);
+    transition: max-width 0.3s ease, opacity 0.3s ease, margin 0.3s ease, transform 0.3s ease;
+    pointer-events: none;
+}
+
+.navbar.scrolled .logo-wrapper {
+    max-width: 200px;
+    opacity: 1;
+    margin-right: 15px; /* Restores visually pleasing gap */
+    transform: translateX(0);
+    pointer-events: auto;
+}
+
+.logo-wrapper:hover { transform: scale(1.05); }
+
+.logo-img {
+    height: 1.8rem;
+    width: auto;
+    filter: drop-shadow(0 0 6px var(--accent-a30));
+}
+
+.logo {
+    font-size: 1.6rem;
+    font-weight: 800;
+    color: var(--text-strong);
+    display: inline-block;
+    filter: drop-shadow(0 2px 4px var(--surface-inset));
+}
+
+.hamburger {
+    display: none;
+    background: none;
+    border: none;
+    color: var(--accent);
+    font-size: 24px;
+    cursor: pointer;
+    padding: 5px 10px;
+}
+
+.nav-controls {
+    display: flex;
+    gap: 15px;
+    align-items: center;
+}
+
+/* ─── 搜索框 ───────────────────────────────────────────────── */
+.search-box {
+    background: var(--surface-overlay-panel);
+    border: 1px solid var(--accent-a30);
+    border-radius: 8px;
+    padding: 10px 16px;
+    color: var(--text-strong);
+    font-size: 14px;
+    width: 280px;
+    transition: all 0.3s ease;
+    outline: none;
+}
+
+.search-box:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 15px var(--accent-a30);
+}
+
+.search-box::placeholder { color: var(--text-faint); }
+
+/* ─── 排序按钮 ─────────────────────────────────────────────── */
+.sort-buttons { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+
+.sort-dropdown-btn {
+    background: var(--accent-a15);
+    border: 1px solid var(--accent-a40);
+    color: var(--accent);
+    padding: 8px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    transition: all 0.3s ease;
+    white-space: nowrap;
+}
+
+.sort-dropdown-btn:hover { background: var(--accent-a30); }
+.sort-dropdown-btn.active { background: var(--accent); color: var(--ink-on-fill); font-weight: 600; }
+
+.sort-btn {
+    background: var(--accent-a15);
+    border: 1px solid var(--accent-a40);
+    color: var(--accent);
+    padding: 8px 16px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: all 0.3s ease;
+    white-space: nowrap;
+}
+
+.sort-btn:hover { background: var(--accent-a30); transform: translateY(-2px); }
+.sort-btn.active { background: var(--accent); color: var(--ink-on-fill); font-weight: 600; }
+
+/* ─── 地区筛选下拉 ─────────────────────────────────────────── */
+.region-dropdown { position: relative; }
+
+.region-dropdown-btn {
+    background: var(--success-a15);
+    border: 1px solid var(--success-a40);
+    color: var(--success);
+    padding: 8px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    transition: all 0.3s ease;
+    white-space: nowrap;
+}
+
+.region-dropdown-btn:hover { background: var(--success-a30); }
+.region-dropdown-btn.active { background: var(--success); color: var(--ink-on-fill); font-weight: 600; }
+
+/* ─── 下拉菜单幕布（对齐 design-system.html el-select-dropdown）─── */
+.region-dropdown-menu {
+    display: none;
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    min-width: 200px;
+    z-index: 1500;
+    background: var(--bg-card);
+    border: 1px solid var(--border-soft);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-lg);
+    padding: 6px;
+    max-height: 400px;
+    overflow-y: auto;
+    animation: gpw-popover-in 0.2s ease-out;
+}
+
+.region-dropdown-menu.show { display: block; }
+
+@keyframes gpw-popover-in {
+    from { opacity: 0; transform: translateY(-4px) scale(0.97); }
+    to { opacity: 1; transform: none; }
+}
+
+.region-option {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 12px;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--text-secondary);
+    transition: all var(--transition);
+}
+
+.region-option:hover { background: var(--bg-soft); color: var(--text-primary); }
+.region-option.active {
+    background: var(--select-selected-bg);
+    color: var(--select-selected-fg);
+    font-weight: 600;
+}
+
+.region-option .flag { width: 18px; height: 13px; border-radius: 2px; }
+.region-option .name { flex: 1; }
+
+/* ─── 统计信息 ─────────────────────────────────────────────── */
+.stats { font-size: 12px; color: var(--text-dim); white-space: nowrap; }
+
+/* ─── 高级筛选主按钮 ───────────────────────────────────────── */
+.filter-main-btn {
+    background: linear-gradient(135deg, var(--surface-card), var(--surface-card-2));
+    border: 1px solid var(--accent-a50);
+    color: var(--accent);
+    padding: 8px 16px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    transition: all 0.3s ease;
+    position: relative;
+    box-shadow: 0 4px 10px var(--surface-inset);
+    white-space: nowrap;
+}
+
+.filter-main-btn:hover {
+    border-color: var(--success);
+    color: var(--success);
+    transform: translateY(-2px);
+}
+
+.filter-main-btn.active {
+    background: linear-gradient(135deg, var(--success), var(--success-deep));
+    color: var(--ink-on-fill);
+    border-color: var(--success);
+}
+
+.filter-badge {
+    position: absolute;
+    top: -6px;
+    right: -6px;
+    background: var(--danger);
+    color: white;
+    border-radius: 10px;
+    padding: 2px 6px;
+    font-size: 10px;
+    font-weight: bold;
+    line-height: 1;
+    box-shadow: 0 2px 5px var(--danger-a50);
+}
+
+/* ════════════════════════════════════════════════════════════════
+   主容器
+   ════════════════════════════════════════════════════════════════ */
+.container { max-width: 1800px; margin: 0 auto; padding: 20px 20px 40px; }
+
+/* ════════════════════════════════════════════════════════════════
+   高级筛选面板 (SteamDB风格)
+   ════════════════════════════════════════════════════════════════ */
+.filter-panel-overlay {
+    display: none;
+    pointer-events: none;
+}
+
+.filter-panel-overlay.show { 
+    display: block; 
+}
+
+.filter-panel {
+    position: fixed;
+    top: 120px;
+    left: 20px;
+    z-index: 10005;
+    background: var(--surface-card);
+    border: 1px solid var(--accent-a30);
+    border-radius: 8px;
+    width: 400px;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 10px 40px var(--surface-mask);
+    overflow: hidden;
+    pointer-events: auto;
+}
+
+.filter-panel-header {
+    padding: 12px 16px;
+    background: var(--surface-panel);
+    border-bottom: 1px solid var(--line-1);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.filter-panel-header h3 {
+    font-size: 15px;
+    color: var(--accent);
+    font-weight: 600;
+    margin: 0;
+}
+
+.filter-panel-close {
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    font-size: 16px;
+    cursor: pointer;
+    transition: color 0.2s;
+}
+
+.filter-panel-close:hover { color: var(--text-strong); }
+
+.filter-panel-body {
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    max-height: 70vh;
+    overflow-y: auto;
+}
+
+.filter-modal { display: flex; flex-direction: column; max-height: 75vh; }
+.filter-body { overflow-y: auto; flex: 1; padding-right: 5px; margin-bottom: 10px; }
+.filter-buttons { flex-shrink: 0; }
+
+.filter-section { margin-bottom: 0; }
+
+.filter-section-title {
+    font-size: 12px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 8px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--line-1);
+}
+
+.filter-checkbox-group {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+/* 自定义复选框 */
+.filter-checkbox-label {
+    display: flex;
+    align-items: center;
+    font-size: 13px;
+    color: var(--text-base);
+    cursor: pointer;
+    position: relative;
+    padding-left: 24px;
+    user-select: none;
+    transition: color 0.2s;
+}
+
+.filter-checkbox-label:hover { color: var(--text-strong); }
+
+.filter-checkbox-label input {
+    position: absolute;
+    opacity: 0;
+    cursor: pointer;
+    height: 0; width: 0;
+}
+
+.checkmark {
+    position: absolute;
+    left: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    height: 16px;
+    width: 16px;
+    background-color: var(--surface-inset);
+    border: 1px solid var(--accent-a40);
+    border-radius: 3px;
+    transition: all 0.2s;
+}
+
+.filter-checkbox-label:hover input ~ .checkmark {
+    background-color: var(--accent-a10);
+}
+
+.filter-checkbox-label input:checked ~ .checkmark {
+    background-color: var(--accent);
+    border-color: var(--accent);
+}
+
+.checkmark:after {
+    content: "";
+    position: absolute;
+    display: none;
+    left: 5px;
+    top: 2px;
+    width: 4px;
+    height: 8px;
+    border: solid var(--ink-on-fill);
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+}
+
+.filter-checkbox-label input:checked ~ .checkmark:after { display: block; }
+
+/* 价格范围输入 */
+.filter-price-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.filter-price-inputs {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1;
+}
+
+.filter-num-input {
+    width: 100%;
+    background: var(--surface-inset);
+    border: 1px solid var(--accent-a30);
+    color: var(--text-strong);
+    padding: 6px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    outline: none;
+    transition: border-color 0.2s;
+}
+
+.filter-num-input:focus { border-color: var(--accent); }
+
+.filter-num-input::-webkit-outer-spin-button,
+.filter-num-input::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+
+.filter-currency-label {
+    font-size: 11px;
+    color: var(--accent);
+    font-weight: 600;
+    margin-left: 4px;
+}
+
+/* 面板底部按钮 */
+.filter-panel-footer {
+    padding: 12px 16px;
+    background: var(--surface-panel);
+    border-top: 1px solid var(--line-1);
+    display: flex;
+    gap: 10px;
+    justify-content: flex-end;
+}
+
+.filter-btn-reset, .filter-btn-apply {
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    border: none;
+    transition: all 0.2s;
+}
+
+.filter-btn-reset {
+    background: rgba(100, 100, 100, 0.2);
+    color: var(--text-base);
+}
+.filter-btn-reset:hover { background: rgba(100, 100, 100, 0.4); }
+
+.filter-btn-apply {
+    background: linear-gradient(135deg, var(--success), var(--success-deep));
+    color: var(--ink-on-fill);
+}
+.filter-btn-apply:hover { transform: translateY(-1px); box-shadow: 0 4px 10px var(--success-a30); }
+
+/* ─── HL 复选框颜色覆写 (新史低=蓝, 平史低=绿) ──────────────── */
+.filter-checkbox-label.hl-new-check input:checked ~ .checkmark { background-color: var(--hl-new); border-color: var(--hl-new); }
+.filter-checkbox-label.hl-equal-check input:checked ~ .checkmark { background-color: var(--success); border-color: var(--success); }
+
+/* ─── 筛选面板地区选择器 ───────────────────────────────────── */
+.filter-region-selector {
+    background: var(--surface-inset);
+    border: 1px solid var(--accent-a30);
+    border-radius: 4px;
+    padding: 6px 10px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    position: relative;
+    flex-shrink: 0;
+    width: 100px;
+    transition: border-color 0.2s;
+}
+
+.filter-region-selector:hover { border-color: var(--accent); }
+
+.filter-region-popup {
+    display: none;
+    margin-top: 10px;
+    background: var(--surface-card);
+    border: 1px solid var(--accent-a40);
+    border-radius: 6px;
+    padding: 8px;
+    width: 280px;
+    z-index: 1600;
+    box-shadow: 0 10px 30px var(--surface-mask);
+    grid-template-columns: repeat(2, 1fr);
+    gap: 4px;
+    max-height: 200px;
+    overflow-y: auto;
+}
+
+.filter-region-popup.show { display: grid; }
+
+.filter-region-popup-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px;
+    cursor: pointer;
+    border-radius: 3px;
+    font-size: 11px;
+    color: var(--text-base);
+    transition: background 0.2s;
+}
+
+.filter-region-popup-item:hover { background: var(--accent-a15); }
+.filter-region-popup-item.active { background: var(--success-a20); color: var(--success); }
+
+/* ─── 范围滑块 ─────────────────────────────────────────────── */
+.filter-slider-container {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.filter-range-slider {
+    flex: 1;
+    -webkit-appearance: none;
+    height: 4px;
+    background: var(--surface-track);
+    border-radius: 2px;
+    outline: none;
+}
+
+.filter-range-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+    box-shadow: 0 0 5px rgba(0,0,0,0.5);
+    transition: transform 0.1s;
+}
+
+.filter-range-slider::-webkit-slider-thumb:hover { transform: scale(1.2); }
+
+.filter-rate-input-wrap {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--surface-inset);
+    border: 1px solid var(--accent-a30);
+    border-radius: 4px;
+    padding: 0 8px;
+    width: 60px;
+}
+
+.filter-rate-input-wrap .filter-num-input {
+    border: none;
+    padding: 6px 0;
+    text-align: right;
+    background: transparent;
+    width: 100%;
+}
+.filter-rate-input-wrap span { font-size: 12px; color: var(--text-dim); }
+
+/* ─── 容错输入行 ───────────────────────────────────────────── */
+.filter-tolerance-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--text-strong);
+    margin-top: 8px;
+    margin-bottom: 4px;
+}
+.filter-tolerance-row .filter-checkbox-label {
+    margin: 0;
+    padding-left: 24px;
+    color: var(--text-strong);
+    line-height: 1.2;
+}
+.filter-tolerance-row .filter-num-input {
+    width: 50px;
+    text-align: center;
+    padding: 2px;
+}
+
+/* ─── 差价类型下拉 ─────────────────────────────────────────── */
+.filter-region-dropdown { position: relative; }
+
+/* ════════════════════════════════════════════════════════════════
+   Loading / Empty States
+   ════════════════════════════════════════════════════════════════ */
+.loading-sentinel {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 32px;
+    color: var(--text-dim);
+    font-size: 0.85rem;
+    gap: 8px;
+}
+
+/* `.spinner` 与 `@keyframes spin` 曾在这里——与 hl-framework.css 的 `.hl-spinner`
+   / `hlSpin` 是同一枚转圈的逐字两份（20px / 2px 环 / 0.8s linear / 同一组色）。
+   最后一处消费（library 无限滚动的「加载更多」）已改用 HlSpinner 组件，故删除。
+   至此全项目只剩 `hl-spinner` 一套实现，尺寸刻度：--xs 12 / --inline 14 / 默认 20。 */
+
+/* .empty-state 已彻底退场：此处与 tokens.css 曾各有一份同名定义，靠导入次序
+   分胜负（padding 80/24 vs 60/24），同一个类名两种表现。两份都已删，空态统一走
+   components/ui/HlEmpty.vue。 */
+
+/* ─── Skeleton loader ──────────────────────────────────────── */
+.skeleton {
+    background: linear-gradient(90deg, var(--surface-pop) 25%, var(--skeleton-2) 50%, var(--surface-pop) 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+    border-radius: 6px;
+}
+
+@keyframes shimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+}
+
+/* 系统级「减少动态效果」：微光是**无限循环**动画，不能靠 --motion-scale
+   （0s 时长 + infinite 会让浏览器空转），必须显式 none。
+   这条此前漏在 hl-framework.css 那份降级清单之外——那份清单只列了 .hl-* 前缀的
+   选择器，而 .skeleton 是 steamhl-* 这套历史样式里的同名实现（.spinner 那一半
+   已随该实现退场）。 */
+@media (prefers-reduced-motion: reduce) {
+    .skeleton { animation: none; }
+}
+
+/* ════════════════════════════════════════════════════════════════
+   手机端适配
+   ════════════════════════════════════════════════════════════════ */
+@media (max-width: 768px) {
+    .navbar {
+        padding: 10px 15px;
+        justify-content: space-between;
+    }
+
+    .navbar-left {
+        flex: 1;
+        justify-content: space-between;
+        align-items: center;
+        gap: 10px;
+    }
+
+    .mobile-search-inline {
+        flex: 1;
+        min-width: 0;
+        width: 100%;
+        margin: 0;
+        height: 32px;
+        font-size: 13px;
+    }
+
+    .logo { font-size: 1.1em; }
+
+    .hamburger { display: block; }
+
+    .nav-controls {
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+        max-height: 0;
+        overflow: hidden;
+        opacity: 0;
+        gap: 10px;
+        margin-top: 0;
+        padding-top: 0;
+        border-top: 1px solid transparent;
+        transition: max-height 0.4s ease, opacity 0.3s ease, margin-top 0.3s ease, padding-top 0.3s ease;
+    }
+
+    .nav-controls.open {
+        max-height: 500px;
+        opacity: 1;
+        margin-top: 12px;
+        padding-top: 12px;
+        border-top: 1px solid var(--accent-a20);
+    }
+
+    .search-box { width: 100%; }
+
+    .sort-buttons { width: 100%; justify-content: center; }
+
+    .sort-btn { padding: 6px 12px; font-size: 12px; }
+
+    .container { padding-top: 20px; }
+
+    /* 筛选面板手机端居中，置于顶层 */
+    .filter-panel-overlay.show {
+        position: fixed;
+        inset: 0;
+        background: var(--surface-mask);
+        z-index: 10004;
+        pointer-events: auto;
+    }
+
+    .filter-panel {
+        top: 50%;
+        bottom: auto;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        width: 90%;
+        max-height: 85vh;
+        z-index: 10005;
+    }
+
+    .filter-panel-body { padding: 12px; gap: 12px; max-height: none; }
+    .filter-price-controls { flex-direction: column; align-items: stretch; }
+    .filter-price-inputs { width: 100%; }
+}
+
+@media (max-width: 768px) {
+    .navbar { padding: 8px 12px; }
+    .logo { font-size: 12px; }
+    .logo-img { height: 1.0rem; }
+    .hamburger { padding: 4px 8px; font-size: 16px; }
+    .logo-wrapper { gap: 4px; flex-shrink: 0; }
+    .navbar.scrolled .logo-wrapper { max-width: 120px; margin-right: 2px; flex-shrink: 0; }
+}
+
+/* ════════════════════════════════════════════════════════════════
+   地区筛选子分类工具栏 (Filter Toolbar)
+   ════════════════════════════════════════════════════════════════ */
+.filter-toolbar {
+    position: sticky;
+    /* 吸在 navbar 下方：navbar 高度随布局变（桌面 68px / 窄屏 50px），CSS 变量动态适配 */
+    top: calc(var(--navbar-h, 68px) + 6px);
+    z-index: 9000;
+    background: var(--surface-overlay-panel);
+    backdrop-filter: blur(10px);
+    padding: 10px 20px;
+    display: flex;
+    justify-content: center;
+    gap: 12px;
+    border-bottom: 1px solid var(--accent-a20);
+    flex-wrap: wrap;
+}
+
+.filter-toolbar-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: var(--text-base);
+    flex-shrink: 0;
+}
+
+.filter-toolbar-label img { width: 18px; height: 13px; border-radius: 2px; }
+
+.filter-mode-btn {
+    background: var(--accent-a10);
+    border: 1px solid var(--accent-a30);
+    color: var(--text-dim);
+    padding: 6px 14px;
+    border-radius: 6px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.2s;
+    white-space: nowrap;
+}
+
+.filter-mode-btn:hover { background: var(--accent-a20); }
+.filter-mode-btn.active {
+    background: var(--success-a20);
+    border-color: var(--success-a50);
+    color: var(--success);
+}
+
+.filter-close-btn {
+    background: var(--danger-a15);
+    border: 1px solid var(--danger-a30);
+    color: var(--danger);
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    cursor: pointer;
+    margin-left: 8px;
+    white-space: nowrap;
+}
+
+.filter-close-btn:hover { background: var(--danger-a25); }
+
+/* ════════════════════════════════════════════════════════════════
+   页脚
+   ════════════════════════════════════════════════════════════════ */
+.footer {
+    text-align: center;
+    padding: 30px 20px;
+    color: var(--text-faint);
+    font-size: 12px;
+    border-top: 1px solid var(--accent-a10);
+    margin-top: 40px;
+}
+
+/* ════════════════════════════════════════════════════════════════
+   左下角悬浮控件 (PC端)
+   ════════════════════════════════════════════════════════════════ */
+.floating-controls {
+    position: fixed;
+    bottom: 20px;
+    left: 20px;
+    z-index: 800;
+    background: var(--surface-overlay-panel);
+    backdrop-filter: blur(10px);
+    border-radius: 10px;
+    padding: 12px 16px;
+    border: 1px solid var(--accent-a20);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    box-shadow: 0 4px 20px var(--surface-inset);
+}
+
+/* 关注作者按钮 */
+.author-btn {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--accent-a10);
+    border: 1px solid var(--accent-a20);
+    border-radius: 6px;
+    padding: 6px 10px;
+    cursor: pointer;
+    transition: all 0.2s;
+    text-decoration: none;
+}
+
+.author-btn:hover {
+    background: var(--accent-a20);
+    border-color: var(--accent-a40);
+}
+
+.author-btn .author-icon {
+    width: 20px;
+    height: 20px;
+    border-radius: 4px;
+    background-image: var(--author-icon);
+    background-size: cover;
+    background-position: center;
+    background-color: var(--accent-a20);
+}
+
+.author-btn .author-text {
+    font-size: 11px;
+    color: var(--text-base);
+}
+
+/* ════════════════════════════════════════════════════════════════
+   右下角 Steam 同步按钮
+   ════════════════════════════════════════════════════════════════ */
+.sync-btn {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    z-index: 800;
+    height: 36px;
+    padding: 0 14px;
+    border-radius: 18px;
+    background: var(--surface-overlay-panel);
+    backdrop-filter: blur(10px);
+    border: 1px solid var(--accent-a30);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    box-shadow: 0 4px 20px var(--surface-inset);
+    transition: all 0.2s;
+}
+
+.sync-btn:hover {
+    background: var(--accent-a20);
+    border-color: var(--accent);
+    transform: translateY(-2px);
+}
+
+.sync-btn:active { transform: scale(0.98); }
+
+.sync-btn .sync-icon {
+    width: 18px;
+    height: 18px;
+    background-image: var(--steam-icon);
+    background-size: contain;
+    background-repeat: no-repeat;
+    background-position: center;
+    flex-shrink: 0;
+}
+
+.sync-btn .sync-text {
+    font-size: 12px;
+    color: var(--text-base);
+    white-space: nowrap;
+}
+
+/* 移动端: 隐藏左下角悬浮控件 */
+@media (max-width: 768px) {
+    .floating-controls { display: none !important; }
+    .sync-btn {
+        width: 40px;
+        height: 40px;
+        padding: 0;
+        border-radius: 50%;
+        justify-content: center;
+    }
+    .sync-btn .sync-text { display: none; }
+    .sync-btn .sync-icon { width: 20px; height: 20px; }
+}
+

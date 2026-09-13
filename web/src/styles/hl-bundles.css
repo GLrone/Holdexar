@@ -1,0 +1,364 @@
+/* ════════════════════════════════════════════════════════════════════
+   hl-bundles.css — 捆绑包浏览视图（移植自 SteamHL 设计原型生成.py
+   「[V1.2] Bundle 专用样式」段，颜色字面量已全部主题化为语义变量）
+
+   卡片骨架复用 steamhl-gamecard.css 的 .game-card / .cover-wrapper /
+   .price-row / .diff-badge / .details-btn（原版即复用 .game-card 结构），
+   本文件只补捆绑包特有规则。
+   ════════════════════════════════════════════════════════════════════ */
+
+/* ── 网格 ── */
+.bundle-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+  gap: 14px;
+}
+@media (max-width: 720px) {
+  .bundle-grid {
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  }
+}
+
+/* ── 补齐/基础折扣/撞库标签（tags-row 内） ── */
+.bundle-mps-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.bundle-mps-tag.completable {
+  background: var(--success-a30);
+  color: var(--success);
+}
+.bundle-mps-tag.must-buy {
+  background: var(--danger-a30);
+  color: var(--danger);
+}
+.bundle-mps-tag.unknown {
+  background: var(--surface-inset);
+  color: var(--text-muted);
+}
+.bundle-base-discount-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--accent-a15);
+  color: var(--accent);
+}
+
+/* ── 补齐状态栏（全区价格展开区顶部） ── */
+.bundle-status-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--surface-inset);
+  border: 1px solid var(--row-border);
+  margin-bottom: 8px;
+}
+.bundle-status-label {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.bundle-status-value {
+  font-weight: 600;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+.bundle-status-value.completable {
+  color: var(--success);
+}
+.bundle-status-value.must-buy-all {
+  color: var(--danger);
+}
+
+/* ── 锁区提示 ── */
+.bundle-lock-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 4px 0 8px;
+}
+
+/* ── 全区价格明细行（detail-item 语义：抽屉内专用 bundle-detail-* 前缀） ── */
+.bd-price-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 6px;
+}
+.bd-price-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 5px;
+  background: var(--surface-inset);
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: border-color 0.15s;
+  min-width: 0;
+}
+.bd-price-item:hover {
+  border-color: var(--accent-a40);
+}
+.bd-price-item.lowest-region {
+  border-color: var(--success-a40);
+}
+.bd-price-item.partial-lock {
+  background: var(--warning-a15);
+}
+.bd-price-item .bd-region {
+  flex: 1;
+  min-width: 0;
+}
+.bd-price-item .bd-region .region-flag__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bd-price-item .bd-prices {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-shrink: 0;
+}
+/* 外币原价与 ¥CNY 是同一价格的两个币种展示，非折前/折后关系，不取删除线 */
+.bd-price-item .bd-orig {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+.bd-price-item .bd-cny {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.bd-price-item .bd-cny.cheaper {
+  color: var(--success);
+}
+.bd-price-item .bd-cny.expensive {
+  color: var(--danger);
+}
+.bd-price-item .bd-locked {
+  font-size: 11px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+/* ── 包内游戏列表 ── */
+.bundle-game-section {
+  margin-top: 10px;
+}
+.bundle-game-title {
+  font-size: 12px;
+  font-weight: bold;
+  color: var(--accent);
+  margin-bottom: 8px;
+}
+.bundle-game-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 8px;
+}
+.bundle-game-card {
+  position: relative;
+  border-radius: 5px;
+  overflow: hidden;
+  border: 1px solid var(--row-border);
+  background: var(--surface-inset);
+  cursor: default;
+  transition: border-color 0.15s;
+}
+.bundle-game-card:hover {
+  border-color: var(--accent-a40);
+}
+.bundle-game-card img {
+  width: 100%;
+  aspect-ratio: 460 / 215;
+  object-fit: cover;
+  display: block;
+}
+.bundle-game-card .bgc-name {
+  font-size: 10px;
+  color: var(--text-secondary);
+  padding: 4px 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: center;
+}
+.bundle-game-card.bgc-owned {
+  background: var(--success-a30);
+  border-color: var(--success-a40);
+}
+.bundle-game-card.bgc-family {
+  background: var(--purple-a15);
+  border-color: var(--purple-a30);
+}
+.bundle-game-card.bgc-wishlist {
+  background: var(--accent-a15);
+  border-color: var(--accent-a30);
+}
+.bundle-game-card.bgc-favorite {
+  background: var(--warning-a15);
+  border-color: var(--warning-a30);
+}
+
+/* ── 排除遮罩（计算器"不购买"标记 / AGR 锁区标记） ── */
+.exclusion-mask {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 10;
+}
+.exclusion-mask.exclude {
+  background: var(--danger-a50);
+}
+.exclusion-mask.region-locked {
+  background: var(--surface-overlay-solid);
+}
+.exclusion-mask span {
+  font-size: 15px;
+  font-weight: 700;
+}
+
+/* ── 地区 AppID 差异分组（AGR） ── */
+.agr-section {
+  margin-top: 8px;
+  border-top: 1px solid var(--accent-a15);
+  padding-top: 6px;
+}
+.agr-section-title {
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 2px 0 6px;
+}
+.appid-group-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  margin-bottom: 4px;
+  border-radius: 5px;
+  background: var(--surface-inset);
+  border: 1px solid var(--row-border);
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.appid-group-row:hover {
+  border-color: var(--accent-a40);
+}
+.appid-group-row .agr-flags {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+}
+.appid-group-row .agr-flags img {
+  width: 16px;
+  height: 12px;
+  object-fit: cover;
+  border-radius: 2px;
+}
+.appid-group-row .agr-count {
+  font-size: 11px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+/* ── 计算器游戏网格 ── */
+.calc-games-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  gap: 8px;
+  max-height: 300px;
+  overflow-y: auto;
+  padding: 2px;
+}
+.calc-games-grid .bundle-game-card {
+  cursor: pointer;
+}
+
+/* ── 抽屉/对话框通用小件 ── */
+.bundle-detail-header {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.bundle-detail-header img {
+  width: 132px;
+  height: 62px;
+  object-fit: cover;
+  border-radius: 5px;
+  flex-shrink: 0;
+}
+.bundle-detail-header .bdh-name {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1.35;
+}
+.bundle-detail-header .bdh-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 3px;
+}
+.calc-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+  gap: 10px;
+}
+.calc-row .calc-label {
+  color: var(--text-secondary);
+  font-size: 13px;
+  flex-shrink: 0;
+}
+.calc-result-foreign {
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.calc-result-cny {
+  font-weight: 700;
+  color: var(--success);
+  font-size: 16px;
+}
+.calc-result-none {
+  color: var(--danger);
+}
+.calc-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  text-align: center;
+  padding-top: 8px;
+  border-top: 1px dashed var(--row-border);
+}
+/* excludeHint 词条里的行内强调（v-html 渲染）。
+   必须写在这份**全局**表里：scoped 样式不作用于 v-html 注入的节点，
+   写在 Index.vue 的 <style scoped> 里会静默不生效（同 .hl-banner__item .new）。 */
+.calc-hint-em {
+  color: var(--danger);
+  font-weight: bold;
+  font-style: normal;
+}
+.calc-hint-sub {
+  font-size: 11px;
+  color: var(--accent);
+  text-align: center;
+  padding-top: 4px;
+  opacity: 0.8;
+}
