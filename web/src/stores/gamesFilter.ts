@@ -19,6 +19,8 @@ interface FilterState {
   onlyEpic: boolean
   onlyXgp: boolean
   hideOwned: boolean
+  /** 屏蔽家庭共享（非主账户已拥有=家人库可玩；与卡片「家庭共享」徽章同口径） */
+  hideFamilySharing: boolean
   minPrice: string
   maxPrice: string
   minRating: string
@@ -60,6 +62,7 @@ export const useFilterStore = defineStore('gamesFilter', {
     onlyEpic: false,
     onlyXgp: false,
     hideOwned: false,
+    hideFamilySharing: false,
     minPrice: '',
     maxPrice: '',
     minRating: '',
@@ -96,6 +99,7 @@ export const useFilterStore = defineStore('gamesFilter', {
       this.onlyEpic = false
       this.onlyXgp = false
       this.hideOwned = false
+      this.hideFamilySharing = false
       this.minPrice = ''
       this.maxPrice = ''
       this.minRating = ''
@@ -124,6 +128,7 @@ export const useFilterStore = defineStore('gamesFilter', {
       if (this.onlyEpic) count++
       if (this.onlyXgp) count++
       if (this.hideOwned) count++
+      if (this.hideFamilySharing) count++
       if (this.strictLowest) count++
       if (!this.top3Check) count++
       if (this.hlNew) count++
