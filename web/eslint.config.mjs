@@ -33,7 +33,7 @@ import noHardcodedCjk from './eslint-rules/no-hardcoded-cjk.mjs'
 /** 收口规则存量豁免清单 —— ⚠️ 与「例外登记表」必须一一对应。 */
 const LEGACY_FILES = [
   // ── HlSelect 能力缺口期遗留（multiple / filterable / 紧凑尺寸补齐后回归）──
-  'src/views/proxies/Index.vue', // ElMessageBox JS 弹窗存量（confirm ×4 + prompt 改名；pinned 下架后 select 豁免消除，此为暴露出的 EP 存量）
+  'src/views/proxies/Index.vue', // ElMessageBox JS confirm ×4 存量（prompt 改名已迁 HlDialog 编辑弹窗；pinned 下架后 select 豁免消除，此为暴露出的 EP 存量）
   'src/views/rates/Index.vue', // el-select multiple：追踪币种多选（HlSelect 暂无 multiple）
   // ── 文本链接当按键存量（迁 HlButton variant="text" 后移除）──
   'src/views/dashboard/Index.vue', // <a @click> 跳转 ×1 + el-button text ×3

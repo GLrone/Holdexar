@@ -85,6 +85,112 @@ async def test_rename_missing_subscription(db):
         await proxies_service.update_subscription_label(999, "x")
 
 
+# ─── 编辑订阅（改名 + 换链接自动重拉）─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_update_subscription_rename_only(db):
+    """只改名（不传链接）：不触发重拉，落库即返；空串清名。"""
+    sub_id = await _add_sub(db)
+
+    res = await proxies_service.update_subscription(sub_id, label="  我的机场  ")
+    assert res["synced"] is False
+    assert res["label"] == "我的机场"
+    assert res["url"] == SUB_URL
+    assert (await _get_sub(db, sub_id)).label == "我的机场"
+
+    res2 = await proxies_service.update_subscription(sub_id, label="   ")
+    assert res2["label"] is None
+
+
+@pytest.mark.asyncio
+async def test_update_subscription_url_change_triggers_sync(db, monkeypatch):
+    """换链接的 clash 订阅保存即自动重拉：synced=True，节点/流量并道回传。"""
+    sub_id = await _add_sub(db)
+    calls: list[int] = []
+
+    async def fake_refresh(sid):
+        calls.append(sid)
+        return {
+            "id": sid, "label": "新名字", "nodes": 7, "traffic": USERINFO,
+            "alive": 3, "total": 7, "usedCache": False,
+            "restarted": False, "prunedLedger": 0,
+        }
+
+    monkeypatch.setattr(proxies_service, "refresh_clash_subscription", fake_refresh)
+
+    res = await proxies_service.update_subscription(
+        sub_id, label="新名字", url="https://example.com/sub?token=xyz"
+    )
+    assert calls == [sub_id]
+    assert res["synced"] is True
+    assert res["nodes"] == 7
+    assert res["traffic"] == USERINFO
+    assert res["label"] == "新名字"
+    assert (await _get_sub(db, sub_id)).url == "https://example.com/sub?token=xyz"
+
+
+@pytest.mark.asyncio
+async def test_update_subscription_same_url_no_sync(db, monkeypatch):
+    """链接没变（同值再存）：不触发重拉。"""
+    sub_id = await _add_sub(db)
+
+    async def boom(sid):
+        raise AssertionError("链接未变化不应触发重拉")
+
+    monkeypatch.setattr(proxies_service, "refresh_clash_subscription", boom)
+    res = await proxies_service.update_subscription(sub_id, url=SUB_URL)
+    assert res["synced"] is False
+
+
+@pytest.mark.asyncio
+async def test_update_subscription_plain_url_change_no_sync(db, monkeypatch):
+    """明文订阅换链接不自动重拉（导入是显式动作）。"""
+    sub_id = await _add_sub(db, kind="plain")
+
+    async def boom(sid):
+        raise AssertionError("明文订阅换链接不应触发重拉")
+
+    monkeypatch.setattr(proxies_service, "refresh_clash_subscription", boom)
+    res = await proxies_service.update_subscription(
+        sub_id, url="https://example.com/plain2"
+    )
+    assert res["synced"] is False
+    assert res["url"] == "https://example.com/plain2"
+
+
+@pytest.mark.asyncio
+async def test_update_subscription_sync_failure_keeps_changes(db, monkeypatch):
+    """重拉失败不回滚改名换链：warning 回传，库里的新名新链保留。"""
+    sub_id = await _add_sub(db)
+
+    async def failing(sid):
+        raise ValueError("订阅下载失败: 全部通道不可用")
+
+    monkeypatch.setattr(proxies_service, "refresh_clash_subscription", failing)
+    res = await proxies_service.update_subscription(
+        sub_id, label="新名字", url="https://example.com/sub?token=xyz"
+    )
+    assert res["synced"] is False
+    assert "自动重拉失败" in res["warning"]
+    row = await _get_sub(db, sub_id)
+    assert row.label == "新名字"
+    assert row.url == "https://example.com/sub?token=xyz"
+
+
+@pytest.mark.asyncio
+async def test_update_subscription_invalid_url(db):
+    sub_id = await _add_sub(db)
+    with pytest.raises(ValueError, match="http\\(s\\) URL"):
+        await proxies_service.update_subscription(sub_id, url="ftp://bad")
+
+
+@pytest.mark.asyncio
+async def test_update_subscription_missing(db):
+    with pytest.raises(ValueError, match="订阅不存在"):
+        await proxies_service.update_subscription(999, label="x")
+
+
 # ─── 流量实时回填 ────────────────────────────────────────────
 
 
