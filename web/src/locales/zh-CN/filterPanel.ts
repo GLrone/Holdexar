@@ -55,6 +55,7 @@ const filterPanel = {
   /* 其他 */
   'filterPanel.other.onlyDiscounted': '仅显示折扣',
   'filterPanel.other.hideOwned': '隐藏已拥有',
+  'filterPanel.other.hideDlc': '隐藏 DLC',
 
   /* 页脚按钮 —— 词条内**保留半角空格**：这是筛选面板的字间距 hack（「重 置」），
      不是漏删的空格，英文侧正常写作 Reset / Apply。 */

@@ -579,6 +579,8 @@ export interface GamesListParams {
   toleranceFen?: number
   /** 绝对低价：最低区价实质低于国区（差价 > toleranceFen，缺省 0=严格任何分差） */
   strictLowest?: boolean
+  /** 游戏商店默认隐藏 DLC（白名单豁免个别常驻 DLC）；false = 含 DLC */
+  excludeDlc?: boolean
 }
 
 function toQuery(params: Record<string, unknown>): string {
