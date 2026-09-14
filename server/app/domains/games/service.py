@@ -492,13 +492,17 @@ async def _list_games_top100(
     """TOP100 热销榜分支（sort=top100 的榜内过滤 + 榜序重排）。
 
     设计：`appid IN (...)` 过滤 + 榜序排序 + SQL 分页。本端 SQLite 无
-    array_position → 等价实现：榜集 ≤100 条，全量拉回后 Python 按榜序
-    重排 + 切片分页；筛选条件（地区/价格/元数据）照常叠加。拉取失败
-    （空榜）返回空集而非随机游戏。
+    array_position → 等价实现：榜集全量拉回后 Python 按榜序重排 + 切片
+    分页；筛选条件（地区/价格/元数据）照常叠加。拉取失败（空榜）返回
+    空集而非随机游戏。
+
+    展示取榜序前 100：榜单抓取侧已扩到 5 页（初始游戏库的发现面），
+    但本排序项语义仍是「近期TOP100热榜」——多出的名次只服务反哺，
+    不进排序集。
     """
     from app.domains.games import boards as boards_mod
 
-    appids = await boards_mod.get_board("topsellers")
+    appids = (await boards_mod.get_board("topsellers"))[:100]
     if not appids:
         return {"items": [], "total": 0, "hasMore": False, "nextCursor": None}
 

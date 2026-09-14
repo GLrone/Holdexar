@@ -78,8 +78,11 @@ const pool = {
   'pool.items.tipAccounts': '追踪账户 {n} 个',
   'pool.items.add': '添加条目',
   'pool.items.addTitle': '添加监控条目',
-  'pool.items.addHint': '加入监控池的条目全部参与价格爬取；Steam 愿望单里的游戏与点星标关注的游戏优先爬取。',
+  'pool.items.addHint':
+    '加入监控池的条目全部参与价格爬取；Steam 愿望单里的游戏与点星标关注的游戏优先爬取。支持粘贴或「选择文件」导入（JSON 数组 / 链接 / 裸 AppID 均可），文件导入的 appid 同时计入预设游戏池，随资产种子分发。',
   'pool.items.addPlaceholder': '粘贴 Steam 商店 / SteamDB 链接或裸 AppID（空格、逗号、换行分隔均可）',
+  'pool.items.importFile': '选择文件',
+  'pool.items.importFileLoaded': '已载入 {name}',
   'pool.items.addSubmit': '加入监控池',
   'pool.items.addNoValid': '没有识别到有效 AppID',
   'pool.items.addResult':

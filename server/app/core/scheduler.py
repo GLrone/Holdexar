@@ -377,12 +377,18 @@ async def _job_bills_sync() -> None:
         logger.exception("[定时] 账单同步异常")
 
 
-def _make_board_job(board_key: str, backfill_limit: int = 100):
+def _make_board_job(
+    board_key: str, backfill_limit: int = 100, record_preset: bool = False
+):
     """榜单发现源定时任务工厂：预热缓存 + 反哺爬取队列。
 
     反哺限量（backfill_limit）：首跑特惠差集可达千级（封顶拉榜 5000 条），
     按 Steam 返回的热度序每轮限量消化（100 → specials 每 6h 一轮 = 400/天），
     避免单轮 run_sequential 跑几千个 appid 挤占任务锁。
+
+    record_preset=True（热销榜）：本轮榜整批登记进预设池清单
+    （games/preset.py，随资产种子分发的初始游戏库来源之一）；登记只记档，
+    不改变反哺/爬取语义，失败只记日志。
 
     **不受 crawl.auto_price 总开关管**：反哺是监控队列的发现源（把榜单新
     条目首爬入库），不是价格更新作业——关掉自动价格更新不应停掉发现；
@@ -404,6 +410,15 @@ def _make_board_job(board_key: str, backfill_limit: int = 100):
         except Exception:  # noqa: BLE001
             logger.exception("[定时] %s 预热失败", board_key)
             return
+
+        if record_preset:
+            from app.domains.games import preset as preset_mod
+
+            try:
+                n = await preset_mod.record_board(appids)
+                logger.info("[定时] %s 预设池登记：%d 款", board_key, n)
+            except Exception:  # noqa: BLE001
+                logger.exception("[定时] %s 预设池登记失败（不阻断反哺）", board_key)
 
         try:
             specs = await boards_mod.backfill_specs(board_key, limit=backfill_limit)
@@ -657,7 +672,12 @@ def start_scheduler() -> None:
     )
     scheduler.add_job(_job_wallet_sync, "interval", minutes=1, id="wallet_sync")
     scheduler.add_job(_job_bills_sync, "interval", minutes=30, id="bills_sync")
-    scheduler.add_job(_make_board_job("topsellers"), "interval", hours=1, id="board_topsellers")
+    # 热销榜：发现面 5 页（500 条，其中前 100 条仍作 TOP100 展示序）；
+    # 首轮反哺放宽到 500 一次补满初始游戏库，并登记预设池清单（随种子分发）
+    scheduler.add_job(
+        _make_board_job("topsellers", backfill_limit=500, record_preset=True),
+        "interval", hours=1, id="board_topsellers",
+    )
     scheduler.add_job(_make_board_job("popularnew"), "interval", hours=24, id="board_popularnew")
     scheduler.add_job(_make_board_job("specials"), "interval", hours=6, id="board_specials")
     scheduler.add_job(_make_board_job("comingsoon"), "interval", hours=24, id="board_comingsoon")

@@ -28,6 +28,7 @@ SYNTHETIC_CUR = "XTS"  # ISO 测试币种，不在任何白名单，误留也会
 APPID_A = 997_102
 APPID_B = 997_103
 APPID_C = 997_104  # 价格历史合并用例专用（种子/本地行全合成）
+APPID_D = 997_105  # 预设池合并用例专用
 
 
 @pytest.fixture
@@ -54,6 +55,8 @@ CREATE TABLE fx_rate_history (
 CREATE TABLE games_curated (
     appid INTEGER PRIMARY KEY, name TEXT, xgp_tier TEXT, epic_date TEXT,
     is_epic INTEGER, is_hb INTEGER, hb_data TEXT, series_id TEXT);
+CREATE TABLE preset_games (
+    appid INTEGER PRIMARY KEY, name TEXT, source TEXT, added_at TEXT);
 CREATE TABLE game_price_history (
     appid INTEGER, region_code TEXT, currency TEXT, price INTEGER,
     original_price INTEGER, discount_percent INTEGER, sub_id INTEGER,
@@ -69,6 +72,7 @@ def _make_seed(
     fx_rates: list[tuple] | None = None,
     fx_history: list[tuple] | None = None,
     curated: list[tuple] | None = None,
+    preset: list[tuple] | None = None,
     history: list[tuple] | None = None,
     version: str = SEED_VERSION,
 ) -> Path:
@@ -84,6 +88,7 @@ def _make_seed(
             fx_history or [],
         )
         con.executemany("INSERT INTO games_curated VALUES (?, ?, ?, ?, ?, ?, ?, ?)", curated or [])
+        con.executemany("INSERT INTO preset_games VALUES (?, ?, ?, ?)", preset or [])
         con.executemany(
             "INSERT INTO game_price_history VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             history or [],
@@ -91,7 +96,7 @@ def _make_seed(
         con.executemany(
             "INSERT INTO seed_meta VALUES (?, ?)",
             [
-                ("schema_version", "3"),
+                ("schema_version", "4"),
                 ("version", version),
                 ("exported_at", version),
                 ("rows_fx_history", str(len(fx_history or []))),
@@ -142,6 +147,7 @@ async def _game_row(appid: int) -> dict | None:
 _ALL_MARKER_KEYS = (
     seed_assets.MARKER_KEY,
     seed_assets.CURATED_MARKER_KEY,
+    seed_assets.PRESET_MARKER_KEY,
     seed_assets.HISTORY_MARKER_KEY,
 )
 
@@ -168,7 +174,7 @@ async def _cleanup():
     yield
     async with get_session_factory()() as session:
         await session.execute(
-            delete(Game).where(Game.appid.in_([APPID_A, APPID_B, APPID_C]))
+            delete(Game).where(Game.appid.in_([APPID_A, APPID_B, APPID_C, APPID_D]))
         )
         await session.execute(
             text(f"DELETE FROM fx_rate_history WHERE currency_code = '{SYNTHETIC_CUR}'")
@@ -213,6 +219,8 @@ def test_export_seed_whitelist_and_dedup(tmp_path: Path) -> None:
         CREATE TABLE games (
             appid INTEGER PRIMARY KEY, name TEXT, xgp_tier TEXT, epic_date TEXT,
             is_epic INTEGER, is_hb INTEGER, hb_data TEXT, series_id TEXT);
+        CREATE TABLE preset_games (
+            appid INTEGER PRIMARY KEY, name TEXT, source TEXT, added_at TEXT);
         CREATE TABLE game_price_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             appid INTEGER, region_code TEXT, currency TEXT, price INTEGER,
@@ -241,6 +249,15 @@ def test_export_seed_whitelist_and_dedup(tmp_path: Path) -> None:
         "INSERT INTO games VALUES (997202, NULL, NULL, NULL, 0, 0, NULL, NULL)"
     )
     con.execute("INSERT INTO steam_accounts VALUES ('765', 'secret')")
+    # 预设池：已在库行（名字以库内为准）+ 未在库但登记时带名 + 两处都无名（不得进种子）
+    con.executemany(
+        "INSERT INTO preset_games (appid, name, source, added_at) VALUES (?, ?, ?, ?)",
+        [
+            (997201, "旧登记名", "上传优先.json", "2026-01-07 00:00:00"),
+            (997203, "文件带来的名", "上传优先.json", "2026-01-07 00:00:00"),
+            (997202, None, "视觉小说.json", "2026-01-07 00:00:00"),
+        ],
+    )
     # 价格历史切片：同逻辑键（appid/区/时刻/sub/gold）不同价两行 → 保留最新 id；
     # 不同区 / 不同时刻 → 独立行
     con.executemany(
@@ -288,6 +305,14 @@ def test_export_seed_whitelist_and_dedup(tmp_path: Path) -> None:
         assert s.execute(
             "SELECT name, xgp_tier, is_epic, hb_data FROM games_curated"
         ).fetchall() == [("正版名A", "GPU", 1, "HB24-1")]
+        # 预设池：库内名字优先（COALESCE）、登记名兜底；两处无名的行不进种子
+        assert s.execute(
+            "SELECT appid, name, source FROM preset_games ORDER BY appid"
+        ).fetchall() == [
+            (997201, "正版名A", "上传优先.json"),
+            (997203, "文件带来的名", "上传优先.json"),
+        ]
+        assert meta["rows_preset"] == "2"
         # 价格历史：同逻辑键保留最新 id（price 200 那行），不同区/时刻独立成行
         assert s.execute("SELECT COUNT(*) FROM game_price_history").fetchone()[0] == 3
         assert s.execute(
@@ -520,6 +545,50 @@ async def test_curated_list_rows_ship_without_monitoring(tmp_path: Path) -> None
 
     # 幂等：marker 命中直接返回
     assert await seed_assets.merge_curated_seed(seed) is None
+
+
+# ── 4.6 预设池随种子落地（缺行落行，已有行不动）───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_preset_seed_inserts_missing_rows(tmp_path: Path) -> None:
+    """预设池并入：缺行落完整 games 行（name 取种子）；已有行不动；同版幂等。"""
+    seed = _make_seed(
+        tmp_path / "holdexar_seed.db",
+        preset=[
+            (APPID_D, "预设名D", "上传优先.json", "2026-01-07 00:00:00"),
+            (APPID_B, "种子不该覆盖的", "上传优先.json", "2026-01-07 00:00:00"),
+        ],
+    )
+    async with get_session_factory()() as session:
+        session.add(Game(appid=APPID_B, name="本地爬到的名", updated_at=datetime.now()))
+        await session.commit()
+
+    stats = await seed_assets.merge_preset_seed(seed)
+    assert stats == {"preset_inserted": 1}
+
+    async with get_session_factory()() as session:
+        d = await session.get(Game, APPID_D)
+        b = await session.get(Game, APPID_B)
+    assert d is not None and d.name == "预设名D"
+    assert d.updated_at is not None  # 带版本戳：孤儿补抓层不会重复捡（刷新走全池层）
+    assert b is not None and b.name == "本地爬到的名"
+
+    # 幂等：同版本二跑 marker 拦截
+    assert await seed_assets.merge_preset_seed(seed) is None
+
+
+@pytest.mark.asyncio
+async def test_preset_merge_missing_table_or_empty_noop(tmp_path: Path) -> None:
+    """旧 schema（无 preset_games 表）或空预设：静默 no-op。"""
+    seed = _make_seed(tmp_path / "holdexar_seed.db")
+    assert await seed_assets.merge_preset_seed(seed) is None  # 空表
+
+    con = sqlite3.connect(str(seed))
+    con.execute("DROP TABLE preset_games")
+    con.commit()
+    con.close()
+    assert await seed_assets.merge_preset_seed(seed) is None  # 无表（旧 schema）
 
 
 # ── 5. 价格历史合并（独立通道：老用户库也并入）─────────────────────────

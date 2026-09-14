@@ -179,3 +179,28 @@ class BundleRegionPrice(Base):
     __table_args__ = (
         Index("ix_brp_bundle_region", "bundle_id", "region_code"),
     )
+
+
+class PresetGame(Base):
+    """预设游戏池清单（appid 账本）：导入文件（关注数据）与 TOP 榜两条来源。
+
+    用途：随包分发的「出品游戏集」——导出资产种子（scripts/export_seed.py）
+    把它写进 holdexar_seed.db，客户端并入（seed_assets.merge_preset_seed）
+    时缺行的 appid 落成 games 行，全池主轮随即接管价格刷新（预设监控）。
+
+    语义：本表只登记，不触发爬取（入池/首爬由调用方既有通道负责）；
+    导入来源只增不改（重复导入保留首次来源与落档时间），榜单来源整批
+    替换（TOP 部分 = 最近一次成功抓取的榜）。name 为登记时从 games 主档
+    带回的展示名（未爬过的新条目为空），导出侧再以库内名字兜底。
+    """
+
+    __tablename__ = "preset_games"
+
+    appid: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    name: Mapped[str | None] = mapped_column(String(512))
+    source: Mapped[str] = mapped_column(String(80))  # 文件名 / "topsellers"
+    added_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+    __table_args__ = (
+        Index("ix_preset_source", "source"),
+    )

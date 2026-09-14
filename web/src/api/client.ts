@@ -781,9 +781,10 @@ export const watchPoolApi = {
     request<PoolItemPayload[]>('GET', `/wishlist${toQuery({ steamid })}`),
   /** 监控池 appid 轻量全集（dashboard 展厅判定用，避免全量条目的大 JSON） */
   appids: () => request<{ appids: number[]; total: number }>('GET', '/wishlist/appids'),
-  /** 批量添加监控条目（池页添加 / 任务页导入共用；单批上限 500，超出分批调） */
-  addItems: (appids: number[]) =>
-    request<PoolMutationResult>('POST', '/pool/items', { appids }),
+  /** 批量添加监控条目（池页添加 / 导入文件 / 任务页导入共用；单批上限 500，超出分批调）。
+      source = 导入文件名：非空时后端把 appid 登记进预设池清单（随资产种子分发） */
+  addItems: (appids: number[], source?: string) =>
+    request<PoolMutationResult>('POST', '/pool/items', source ? { appids, source } : { appids }),
   /** 批量移除监控条目（脱池 + 同步免疫 + 清星标） */
   removeItems: (appids: number[]) =>
     request<PoolMutationResult>('POST', '/pool/items/remove', { appids }),
