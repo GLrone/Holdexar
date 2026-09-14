@@ -23,6 +23,9 @@ const about: Partial<Record<MessageKey, string>> = {
   'about.section.privacy': 'Privacy & disclaimer',
   'about.section.credits': 'Credits',
 
+  /* GitHub repo link beside the project name in hero (external proper noun) */
+  'about.githubRepo': 'GitHub repository',
+
   /* Feature cards */
   'about.feature.multiRegion.title': 'Multi-region price matrix',
   'about.feature.multiRegion.desc':
