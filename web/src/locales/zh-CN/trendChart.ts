@@ -1,5 +1,5 @@
 /* ════════════════════════════════════════════════════════════════════
-   trendChart 词条 —— 价格历史走势图（components/steamhl/PriceTrendChart.vue）。
+   trendChart 词条 —— 价格历史走势图（components/business/PriceTrendChart.vue）。
 
    tooltip 那一组是**参数化整句**：数值与后端返回的格式化原价由组件传入，
    不拆成「标签 + 值」多条再拼——中英的语序、括号形态都不同，拼不回去。

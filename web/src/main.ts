@@ -16,13 +16,13 @@ import * as ElementPlusIconsVue from '@element-plus/icons-vue'
 import './styles/tokens.css'
 // 框架标准层（hl-* 隔离类名，规范来源 web/public/component-framework.html）
 import './styles/hl-framework.css'
-// 库页等保真翻译视图的页面样式（globals + gamecard 全量）
-import './styles/steamhl-globals.css'
-import './styles/steamhl-gamecard.css'
+// 库页/商店页的卡片与列表样式层（globals + gamecard 全量）
+import './styles/hl-globals.css'
+import './styles/hl-gamecard.css'
 // 捆绑包浏览视图专属规则（复用 game-card 骨架，主题化字面量）
 import './styles/hl-bundles.css'
-// 浅色适配层必须最后加载（覆盖移植样式的深色表面）
-import './styles/steamhl-light.css'
+// 浅色适配层必须最后加载（覆盖深色样式层的表面）
+import './styles/hl-light.css'
 
 import { useThemeStore } from './stores/theme'
 import { useLocaleStore } from './stores/locale'

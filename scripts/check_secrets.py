@@ -46,7 +46,7 @@ MAX_FILE_BYTES = 5 * 1024 * 1024
 PATH_DENY: list[tuple[str, str]] = [
     (
         r"^(?:data|data\.old|logs|release|reference|reference-repos|secrets"
-        r"|gui-test-screenshots|price-history-prototype|assets/seed"
+        r"|gui-test-screenshots|price-history-prototype|assets/seed|assets/clash"
         r"|\.tmp-pytest|\.tmp-chrome-profile|\.tmp-research)(?:/|$)",
         "根目录下的运行时数据 / 构建产物 / 参考资料目录",
     ),

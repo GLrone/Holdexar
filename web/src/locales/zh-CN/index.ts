@@ -14,7 +14,7 @@
 
 import common from './common'
 import shell from './shell'
-// ── 期 3 共享业务组件（components/steamhl/*，五个组件各一模块）──
+// ── 共享业务组件（components/business/*，五个组件各一模块）──
 import filterPanel from './filterPanel'
 import gameCard from './gameCard'
 import navbar from './navbar'
@@ -53,7 +53,7 @@ import famHeat from './famHeat'
 //    它们不属于任何视图，故不与视图同构，而是与**数据来源模块**同构。
 import currencies from './currencies'
 import regions from './regions'
-// ── 期 8 共享业务组件（components/steamhl/EpicFreeCards.vue）──
+// ── 共享业务组件（components/business/EpicFreeCards.vue）──
 import epicFree from './epicFree'
 // ── 游戏库页（views/gamelib/Index.vue 及其页签）──
 import gamelib from './gamelib'

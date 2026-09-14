@@ -131,7 +131,7 @@ const ALLOW = [
  * 作用域豁免：以下选择器块内的字面量归**该层自己**管，不由本门禁判。
  *
  *   · 主题层（`.dark` / `:not(.dark)`）——「按主题写死」正是主题层的职责
- *     （`steamhl-light.css` 整个文件都是 `html:not(.dark)` 前缀，tokens.css
+ *     （`hl-light.css` 整个文件都是 `html:not(.dark)` 前缀，tokens.css
  *     的深色半区是 `html.dark`）。
  *   · 固定纹样层（`.hl-btn-art`）——整套「艺术按钮」的配色是一份自洽的固定设计：
  *     金 `#ffe066→#ffb347→#ff9a3c` 配 `#4a2c0a` 字、红 `#ff7b6b→#e74c3c` 配

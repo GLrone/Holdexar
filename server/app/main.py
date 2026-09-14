@@ -169,6 +169,18 @@ async def lifespan(_: FastAPI):
     except Exception:  # noqa: BLE001
         logger.exception("排序缓存初始化失败（不阻塞启动）")
 
+    # 随包内核就位：mihomo 与 GeoIP 数据随发行包分发，复制进 data/clash/
+    # （只补缺失文件）。必须早于内核自启——自启与代理策略都以内核就位为前提。
+    # 失败不阻断启动：前端「内核缺失」态与自动安装入口仍可兜底。
+    from app.domains.proxies import clash_manager
+
+    try:
+        installed = clash_manager.ensure_kernel(get_settings().data_dir)
+        if installed["copied"]:
+            logger.info("随包 Clash 内核就位：%s", ", ".join(installed["copied"]))
+    except Exception:  # noqa: BLE001
+        logger.exception("随包 Clash 内核就位失败（不阻塞启动）")
+
     # Clash 内核随服务自启（常驻后台语义）：有内核 + 有 clash 订阅即拉起。
     # 服务重启后 proxy_first 策略才不会降级直连（Steam 域直连基本不可用）。
     async def _autostart_and_health_check() -> None:

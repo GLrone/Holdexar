@@ -1,9 +1,10 @@
 /* pool 词条 —— 监控池页（views/pool/Index.vue）。
 
-   本页三个分节（Steam 账户 / 监控地区 / 监控条目）共同构成「监控池」的
-   完整链路：绑定数据源 → 圈定抓取区服 → 浏览池内条目。页面名义是监控池
-   ——愿望单只是数据源之一（账户 kinds 同时有 wishlist/owned 两类），
-   文案全部取监控语义，「愿望单」一词只在描述数据来源处出现。
+   本页四个分节（Steam 账户 / 监控地区 / 监控条目 / 添加条目对话框）共同
+   构成「监控池」的完整链路：绑定数据源 → 圈定抓取区服 → 浏览与增删池内
+   条目。页面名义是监控池——愿望单只是数据来源之一（账户 kinds 同时有
+   wishlist/owned 两类），文案全部取监控语义，「愿望单」一词只出现在
+   数据来源与类别标记处。
 
    三个分节锚点 `pool.section.*` 是**共用**词条：既是 data-section 的属性值
    （HlSectionRail 当 key 解释后渲染成气泡/aria-label），又是可见的
@@ -15,7 +16,9 @@
    · 「绑定」这一动作取 dashboard 页的英文说法 bind（dashboard.toast.noAccounts
      的引导正指向本页）；
    · 监控地区的三件动作（保存 / 全选 / 清空）是通用动作，走 common.*，
-     不在本模块重复立条。
+     不在本模块重复立条；
+   · 添加对话框的「识别到 N 个 AppID」复用 crawl.import.detected /
+     .detectedInvalid——同一份粘贴解析在两个入口逐字相同。
 
    三段同步结果文案（新增/新增+爬取/无新增）各自成条，不在组件侧用 + 拼：
    「，已自动开始爬取」是随条件增减的一整个分句，中英语序不同。 */
@@ -64,9 +67,38 @@ const pool = {
   'pool.items.searchPlaceholder': '搜索游戏名或 AppID',
   'pool.items.crawlAll': '全量爬取监控池',
 
+  /* ── 监控池管理（条目增删 + 批量操作）──
+     类别词条 `pool.items.kind.*` 一处三用：筛选 chips 的标签、条目标记、
+     悬停气泡的来源说明（同一概念三处同词，不另立）。 */
+  'pool.items.kind.all': '全部',
+  'pool.items.kind.follow': '关注',
+  'pool.items.kind.wishlist': '愿望单',
+  'pool.items.kind.owned': '已购',
+  'pool.items.kind.manual': '手动添加',
+  'pool.items.tipAccounts': '追踪账户 {n} 个',
+  'pool.items.add': '添加条目',
+  'pool.items.addTitle': '添加监控条目',
+  'pool.items.addHint': '加入监控池的条目全部参与价格爬取；Steam 愿望单里的游戏与点星标关注的游戏优先爬取。',
+  'pool.items.addPlaceholder': '粘贴 Steam 商店 / SteamDB 链接或裸 AppID（空格、逗号、换行分隔均可）',
+  'pool.items.addSubmit': '加入监控池',
+  'pool.items.addNoValid': '没有识别到有效 AppID',
+  'pool.items.addResult':
+    '已加入监控池：新增 {added} · 恢复 {restored} · 已在池 {exists} · 未识别 {invalid}',
+  'pool.items.manage': '管理',
+  'pool.items.manageDone': '完成',
+  'pool.items.manageHint': '勾选条目后批量移除；移除后不再参与价格爬取。',
+  'pool.items.selected': '已选 {n} 项',
+  'pool.items.selectPage': '全选本页',
+  'pool.items.unselectPage': '取消本页',
+  'pool.items.clearSelection': '清空选择',
+  'pool.items.removeSelected': '移除选中',
+  'pool.items.removeConfirm': '从监控池移除选中的 {n} 款游戏？',
+  'pool.items.removeResult': '已移出监控池 {n} 款',
+
   /* ── 条目格子与空态 ── */
   'pool.items.pendingName': '未抓取（新绑定条目）',
   'pool.items.noMatch': '未找到「{query}」—— 不在当前监控条目中。',
+  'pool.items.noKindMatch': '当前类别下没有条目。',
   'pool.items.empty': '暂无监控条目 —— 绑定账户并同步即可开始。',
 } as const
 

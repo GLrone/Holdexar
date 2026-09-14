@@ -46,7 +46,7 @@ const gamelib = {
   'gamelib.pager.range': '{from}–{to} of {n} games',
   'gamelib.pager.refresh': 'Refresh owned games',
 
-  /* ── Game card (components/steamhl/LibGameCard.vue) ── */
+  /* ── Game card (components/business/LibGameCard.vue) ── */
   'gamelib.card.free': 'Free',
   'gamelib.card.noPrice': 'No price',
 

@@ -1,8 +1,8 @@
-"""wishlist 域路由：账户绑定 / 同步 / 条目列表 / 关注（游戏卡星标）。"""
+"""wishlist 域路由：账户绑定 / 同步 / 监控池管理（条目增删）/ 关注（星标）。"""
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import follows, service
 
@@ -71,6 +71,7 @@ async def sync_account(steamid: str, autoCrawl: bool = True):
 
 @router.get("/wishlist")
 async def wishlist(steamid: str | None = None):
+    """监控条目列表（按 appid 聚合，含来源标记：愿望单/关注/已购/手动入池）。"""
     return await service.list_items(steamid)
 
 
@@ -97,6 +98,34 @@ async def ownership(appids: str):
     if not ids:
         raise HTTPException(status_code=400, detail="appids 不能为空")
     return await service.ownership(ids[:200])
+
+
+# ── 监控池管理（监控条目的添加 / 移除；批量操作）──
+
+
+class PoolItemsRequest(BaseModel):
+    """监控条目批量操作请求（单批上限 500，前端超出时分批调用）。"""
+
+    appids: list[int] = Field(min_length=1, max_length=500)
+
+
+@router.post("/pool/items")
+async def add_pool_items(req: PoolItemsRequest):
+    """批量添加监控条目（池页添加 / 任务页导入共用）。
+
+    无行新建 manual_pool 条目（普通监控条目，不进愿望单/关注名单）；
+    已有行复活（含愿望单/已购/关注行）。返回逐条分类明细。
+    """
+    try:
+        return await service.add_pool_items(req.appids)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/pool/items/remove")
+async def remove_pool_items(req: PoolItemsRequest):
+    """批量移除监控条目（脱池 + excluded 挡同步复活 + 清星标）。"""
+    return await service.remove_pool_items(req.appids)
 
 
 # ── 关注列表（游戏卡星标；manual 条目语义，见 follows.py 模块注释）──

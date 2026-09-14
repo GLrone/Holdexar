@@ -14,6 +14,7 @@ import { useSettingsStore } from '@/stores/settings'
 import { flagUrl } from '@/api/regions'
 import { useRegionsStore } from '@/stores/regions'
 import { useI18n } from '@/locales'
+import { parseAppRefs, parseFavoritesRefs } from '@/lib/appidRefs'
 import { HlAvatar, HlButton, HlDialog, HlIcon, HlInput, HlSwitch, message } from '@/components/ui'
 
 const { t } = useI18n()
@@ -144,15 +145,18 @@ async function importBatched(
   let ok = 0
   let own = 0
   let fail = 0
+  let poolIn = 0
   const items: RedeemResultItem[] = []
   for (let i = 0; i < appids.length; i += 100) {
     const r = await crawlApi.importApps(appids.slice(i, i + 100))
     ok += r.ok
     own += r.own
     fail += r.fail
+    poolIn += (r.poolAdded ?? 0) + (r.poolRestored ?? 0)
     items.push(...r.results)
   }
   const parts = [t('crawl.import.added', { n: ok }), t('crawl.import.alreadyTracked', { n: own })]
+  if (poolIn) parts.push(t('crawl.import.poolAdded', { n: poolIn }))
   if (unrecognized) parts.push(t('crawl.import.unrecognized', { n: unrecognized }))
   if (fail) parts.push(t('crawl.import.invalid', { n: fail }))
   const newIds = items
@@ -168,52 +172,6 @@ async function importBatched(
     }
   }
   return { ok, parts, items }
-}
-
-/** 从任意粘贴文本提取 AppID：JSON 数组（数字/对象）/ N 行裸数字 / 链接混排 */
-function parseFavoritesRefs(text: string): { appids: number[]; invalid: string[] } {
-  const appids: number[] = []
-  const invalid: string[] = []
-  const seen = new Set<number>()
-
-  const push = (v: unknown) => {
-    const s = String(v ?? '').trim()
-    const n = typeof v === 'number' ? v : /^\d+$/.test(s) ? Number(s) : NaN
-    if (Number.isSafeInteger(n) && n > 0 && !seen.has(n)) {
-      seen.add(n)
-      appids.push(n)
-    } else if (s !== '' && v !== null && v !== undefined) {
-      invalid.push(s)
-    }
-  }
-
-  const trimmed = text.trim()
-  // 整体是 JSON 数组：逐元素提取（数字直取、对象按 appid|appId|id 键）
-  if (trimmed.startsWith('[')) {
-    try {
-      const arr = JSON.parse(trimmed) as unknown[]
-      for (const el of arr) {
-        if (typeof el === 'object' && el !== null) {
-          const o = el as Record<string, unknown>
-          const key = ['appid', 'appId', 'AppID', 'id'].find((k) => o[k] !== undefined)
-          push(key ? o[key] : o)
-        } else {
-          push(el)
-        }
-      }
-      return { appids, invalid }
-    } catch {
-      /* JSON 断裂（截断复制等）→ 落回逐行扫描 */
-    }
-  }
-  // 回落：按行/空白分隔裸数字与链接（与批量导入同规则）
-  for (const raw of trimmed.split(/[\s,，;；]+/)) {
-    const s = raw.trim()
-    if (!s) continue
-    const m = APP_URL_RE.exec(s)
-    push(m ? m[1] : s)
-  }
-  return { appids, invalid }
 }
 
 const favPreview = computed(() => parseFavoritesRefs(favText.value))
@@ -242,31 +200,6 @@ async function doImportFavorites() {
   } finally {
     importingFav.value = false
   }
-}
-
-/** Steam 商店 / SteamDB app 链接（含 ?query 与尾斜杠）→ appid；裸数字放行 */
-const APP_URL_RE = /(?:store\.steampowered\.com|steamdb\.info|steamdb\.in)\/app\/(\d+)/i
-
-/** 智能解析：逐行识别链接/裸 AppID；无法识别的非空行如实报出（不静默丢弃） */
-function parseAppRefs(text: string): { appids: number[]; invalid: string[] } {
-  const appids: number[] = []
-  const invalid: string[] = []
-  const seen = new Set<number>()
-  for (const raw of text.split(/[\s,，;；]+/)) {
-    const s = raw.trim()
-    if (!s) continue
-    const m = APP_URL_RE.exec(s)
-    const id = m ? Number(m[1]) : /^\d+$/.test(s) ? Number(s) : null
-    if (id === null || !Number.isSafeInteger(id) || id <= 0) {
-      invalid.push(s)
-      continue
-    }
-    if (!seen.has(id)) {
-      seen.add(id)
-      appids.push(id)
-    }
-  }
-  return { appids, invalid }
 }
 
 const parsedPreview = computed(() => parseAppRefs(importAppsText.value))
@@ -413,6 +346,7 @@ const kindLabel = (kind: string) =>
     backfill: t('crawl.kind.backfill'),
     import: t('crawl.kind.import'),
     fav_import: t('crawl.kind.favImport'),
+    pool_add: t('crawl.kind.poolAdd'),
   })[kind] ?? kind
 
 // ── 账户设置弹窗：按账户开关已购同步（库太大的账户可关，只盯愿望单）──

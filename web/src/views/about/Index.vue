@@ -65,46 +65,13 @@ const FEATURES: { icon: string; titleKey: MessageKey; descKey: MessageKey }[] = 
   { icon: 'zap', titleKey: 'about.feature.toolbox.title', descKey: 'about.feature.toolbox.desc' },
 ]
 
-/* 致谢：代码中实际引用 / 移植的开源项目与素材源。
+/* 致谢：随包分发的开源内核与素材源。
    项目名与外链是专名（不翻译），只有说明走词典且同样**存 key 不存文案**。 */
 const CREDITS: { name: string; url: string; noteKey: MessageKey }[] = [
-  {
-    // 此处曾误记为某个 MIT 项目的实现——实际口径来源是下列致谢脚本，其文件头
-    // 写明 `@license GPLv3`，不是 MIT。注明许可不是「认领衍生」：我们只按其
-    // 文档化的字段语义调用 Steam 公开 API，未使用其代码。
-    name: 'steam-family-game-analysis',
-    url: 'https://greasyfork.org/zh-CN/scripts/588235',
-    noteKey: 'about.credit.steamFamily',
-  },
   {
     name: 'mihomo',
     url: 'https://github.com/MetaCubeX/mihomo',
     noteKey: 'about.credit.mihomo',
-  },
-  {
-    name: 'flagcdn',
-    url: 'https://flagcdn.com',
-    noteKey: 'about.credit.flagcdn',
-  },
-  {
-    // 署名是义务，不是客套：MIT 与本项目所用上游的 Commons Clause 附加条款都要求
-    // 分发时保留版权声明，Apache-2.0 要求保留 NOTICE。此前本页只有 3 条，
-    // 下列上游一个都没列——属于「用了但没声明」。
-    // 本条的措辞在本轮 de-GPL 重写后由「移植来源」改为「交互形式参考」：
-    // 两个组件已按本项目自身需要独立重写，不再含上游代码，但参考关系如实署名。
-    name: 'React Bits',
-    url: 'https://github.com/DavidHDev/react-bits',
-    noteKey: 'about.credit.reactBits',
-  },
-  {
-    name: 'Clash Verge Rev',
-    url: 'https://github.com/clash-verge-rev/clash-verge-rev',
-    noteKey: 'about.credit.clashVerge',
-  },
-  {
-    name: 'ArchiSteamFarm',
-    url: 'https://github.com/JustArchiNET/ArchiSteamFarm',
-    noteKey: 'about.credit.asf',
   },
 ]
 </script>

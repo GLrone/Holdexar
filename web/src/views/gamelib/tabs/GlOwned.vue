@@ -11,7 +11,7 @@ import HlChip from '@/components/ui/HlChip.vue'
 import HlEmpty from '@/components/ui/HlEmpty.vue'
 import HlPagination from '@/components/ui/HlPagination.vue'
 import HlStat from '@/components/ui/HlStat.vue'
-import LibGameCard from '@/components/steamhl/LibGameCard.vue'
+import LibGameCard from '@/components/business/LibGameCard.vue'
 import { PALETTE } from '@/lib/familyColors'
 
 const { t } = useI18n()

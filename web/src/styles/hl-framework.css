@@ -1,13 +1,13 @@
 /* ════════════════════════════════════════════════════════════════════
    Holdexar Component Framework — 生产标准层（L2 束口）
    规范来源：web/public/component-framework.html（隔离的框架总览页，唯一真源）
-   移植规则：
+   实现规则：
    1. 所有类名加 hl- 前缀 —— 与生产遗留全局类（.btn/.tag/.game-card 等）完全隔离；
       视图层禁止直接使用本文件类名，必须通过 components/ui/ 的 Hl* 组件。
    2. 取色只准引用 tokens.css 令牌；唯一例外是「艺术按键」的固定品牌渐变
       （主题无关的装饰常量，见下方艺术按键段落）。
    3. 框架页新增/调整样式后，需同步回译本文件（保持 hl- 前缀）。
-   加载顺序：tokens.css → 本文件 → steamhl 遗留样式（见 main.ts）。
+   加载顺序：tokens.css → 本文件 → hl- 样式层（globals/gamecard/light，见 main.ts）。
    ════════════════════════════════════════════════════════════════════ */
 
 /* ══════════ Button 按键 ══════════ */
@@ -1321,7 +1321,7 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
   padding: 0;
 }
 
-/* ══════════ 价格走势图（1:1 移植 component-framework.html 模块 F）══════════ */
+/* ══════════ 价格走势图（对应 component-framework.html 模块 F）══════════ */
 .price-chart-card{background:var(--surface-inset);border:1px solid var(--line-1);border-radius:var(--radius);padding:16px}
 .pc-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px;flex-wrap:wrap;gap:10px}
 .pc-title{font-size:15px;font-weight:700;color:var(--text-primary);display:flex;align-items:center;gap:8px;min-width:0}
@@ -1798,7 +1798,7 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
 .hl-scroll-list__mask--top { top: 0; background: linear-gradient(to bottom, var(--bg-card), transparent); }
 .hl-scroll-list__mask--bottom { bottom: 0; background: linear-gradient(to top, var(--bg-card), transparent); }
 
-/* ══════════ GooeyNav 粒子导航（移植自 steamhl）══════════ */
+/* ══════════ GooeyNav 粒子导航 ══════════ */
 .hl-gooey-nav {
   position: relative;
   display: inline-flex;
@@ -2105,7 +2105,7 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
 .hl-stepper__done .hl-step-next { margin-top: 18px; }
 
 /* ══════════ 应用外壳 · 侧边栏（HlSideNav）══════════
-   移植自 component-framework.html .sidebar / .sb-*；
+   对齐 component-framework.html .sidebar / .sb-*；
    分组标签 + 左缘指示条 + 悬停浮起 + 折叠态 tooltip + 进场级联动效 */
 .hl-sidebar {
   width: var(--sidebar-width);

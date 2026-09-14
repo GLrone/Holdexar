@@ -1,5 +1,5 @@
 /* ════════════════════════════════════════════════════════════════════
-   navbar 词条 —— components/steamhl/HlNavbar.vue（库页导航栏：
+   navbar 词条 —— components/business/HlNavbar.vue（库页导航栏：
    搜索 / 排序下拉 / 地区下拉 + 子分类工具栏 / 布局切换 / 高级筛选入口）。
 
    注意：'navbar.region.allLowest'（下拉按钮上的「无地区筛选」态，前缀另有

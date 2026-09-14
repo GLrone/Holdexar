@@ -17,7 +17,7 @@ import HlChip from '@/components/ui/HlChip.vue'
 import HlEmpty from '@/components/ui/HlEmpty.vue'
 import HlImg from '@/components/ui/HlImg.vue'
 import HlSkeleton from '@/components/ui/HlSkeleton.vue'
-import PriceTrendChart from '@/components/steamhl/PriceTrendChart.vue'
+import PriceTrendChart from '@/components/business/PriceTrendChart.vue'
 
 /** 价格奖牌（金/银/铜 = 非 CN 最低价前三，与卡片 GPW 同一规则） */
 const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/assets/trophy_copper.png']

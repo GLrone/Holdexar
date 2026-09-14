@@ -1,9 +1,8 @@
 /* ════════════════════════════════════════════════════════════════════
-   hl-bundles.css — 捆绑包浏览视图（移植自 SteamHL 设计原型生成.py
-   「[V1.2] Bundle 专用样式」段，颜色字面量已全部主题化为语义变量）
+   hl-bundles.css — 捆绑包浏览视图样式（颜色字面量已全部主题化为语义变量）
 
-   卡片骨架复用 steamhl-gamecard.css 的 .game-card / .cover-wrapper /
-   .price-row / .diff-badge / .details-btn（原版即复用 .game-card 结构），
+   卡片骨架复用 hl-gamecard.css 的 .game-card / .cover-wrapper /
+   .price-row / .diff-badge / .details-btn（复用 .game-card 结构），
    本文件只补捆绑包特有规则。
    ════════════════════════════════════════════════════════════════════ */
 
