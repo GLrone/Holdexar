@@ -47,6 +47,8 @@ const loading = ref(true)
 const errorMsg = ref('')
 
 const historyRegion = ref('cn') // 小写（history API 语义）
+/** 0 = 标准版（请求不带 subId）；其余 = sub 包号（对齐走势抽屉 versionKey 语义） */
+const historySubId = ref(0)
 const history = ref<HistoryPayload | null>(null)
 const historyLoading = ref(false)
 /** 可见时间窗（天）：0=全部。历史全量一次拉齐，缩放只在图表端进行（SteamDB 式导航条） */
@@ -191,8 +193,14 @@ const genresList = computed(() =>
 // component-framework.html 模块 F 权威模版：Steam 价 + Key 店走线 + 史低平线
 // + 缩略导航 + 四格统计 + 事件时间线
 
-/** 走势地区当前现价（priceMatrix 直取，CNY 折算） */
+/** 走势地区当前现价（priceMatrix 直取，CNY 折算）。priceMatrix 是标准版
+    口径——切到具体版本后现价块取该版本序列末点，避免「图表是豪华版、
+    现价是本体」的错位 */
 const regionNowCnyFen = computed(() => {
+  if (historySubId.value !== 0) {
+    const ps = history.value?.points ?? []
+    return ps.length ? (ps[ps.length - 1].cnyFen ?? null) : null
+  }
   const cell = detail.value?.priceMatrix?.[historyRegion.value.toUpperCase()]
   return Array.isArray(cell) && cell[1] ? (cell[1] as number) : null
 })
@@ -315,14 +323,53 @@ async function load() {
   }
 }
 
+// ── 版本切换（版本列表来自 history 响应 versions，随地区刷新）──
+const hasMultipleVersions = computed(() => (history.value?.versions?.length ?? 0) > 1)
+
+const versionOptions = computed<HlSelectOption[]>(() => {
+  const list = history.value?.versions ?? []
+  // 同签名（如同为无后缀非 gold）多 sub 时用 #subId 消歧（与走势抽屉同规则）
+  const sigCount = new Map<string, number>()
+  for (const v of list) {
+    const sig = `${v.suffix ?? ''}|${v.isGold ? 1 : 0}`
+    sigCount.set(sig, (sigCount.get(sig) ?? 0) + 1)
+  }
+  const subs = list.map((v) => {
+    const sig = `${v.suffix ?? ''}|${v.isGold ? 1 : 0}`
+    const base = !v.suffix && !v.isGold
+      ? t('trendDrawer.version.standard')
+      : v.isGold && !v.suffix
+        ? t('trendDrawer.version.gold')
+        : (v.suffix || `#${v.subId}`)
+    return {
+      value: v.subId ?? 0,
+      label: (sigCount.get(sig) ?? 0) > 1 ? `${base} #${v.subId}` : base,
+    }
+  })
+  // 标准版（缺省=无后缀非 gold 并集序列）作为首项，与 historySubId=0 对应
+  return [{ value: 0, label: t('trendDrawer.version.standardAll') }, ...subs]
+})
+
 async function loadHistory() {
   const seq = ++requestSeq
   historyLoading.value = true
   try {
     // days=0 全量拉齐：时间窗缩放全部在图表端（时间 chips / 导航条），不回源
-    const res = await gamesApi.history(appid.value, historyRegion.value, 0)
+    const res = await gamesApi.history(
+      appid.value,
+      historyRegion.value,
+      0,
+      historySubId.value || undefined,
+    )
     if (seq !== requestSeq) return
     history.value = res
+    // 版本列表随地区/响应刷新，当前选择可能已不在列表 → 回落标准版
+    if (
+      historySubId.value !== 0 &&
+      !history.value?.versions?.some((v) => (v.subId ?? 0) === historySubId.value)
+    ) {
+      historySubId.value = 0
+    }
   } catch {
     if (seq === requestSeq) history.value = null
   } finally {
@@ -357,8 +404,13 @@ async function retryRemoved() {
   }
 }
 
-// 切地区 → 重拉全量历史
-watch(historyRegion, () => loadHistory())
+// 切地区 → 版本数据源随区变化，重置标准版再重拉全量历史
+watch(historyRegion, () => {
+  historySubId.value = 0
+  loadHistory()
+})
+// 切版本 → 重拉该 sub 序列（现价块/四格统计/事件线连锁跟随）
+watch(historySubId, () => loadHistory())
 
 /** 捆绑包补齐状态（后端 mustPurchaseAsSet：0=可补齐 1=必须整包 其余=未知）。
     函数体在**渲染期**执行（模板里调用），故 t() 在这里是响应式的——冻结的是
@@ -622,7 +674,15 @@ onMounted(load)
           <div class="gd-card gd-section" data-section="gameDetail.section.trend">
             <div class="gd-section__header">
               <div class="section-title">{{ t('gameDetail.section.trend') }}</div>
-              <HlSelect v-model="historyRegion" :options="regionSelectOptions" class="history-region" />
+              <div class="gd-trend-selects">
+                <HlSelect
+                  v-if="hasMultipleVersions"
+                  v-model="historySubId"
+                  :options="versionOptions"
+                  class="history-version"
+                />
+                <HlSelect v-model="historyRegion" :options="regionSelectOptions" class="history-region" />
+              </div>
             </div>
             <div class="history-ranges">
               <HlChip
@@ -1184,8 +1244,15 @@ html:not(.dark) .gd-link-icon.steamdb { filter: invert(1); }
   gap: 12px;
   flex-wrap: wrap;
 }
+.gd-trend-selects {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
 .history-region { width: 160px; }
 .history-region :deep(.hl-select-wrap) { width: 100%; }
+.history-version { width: 190px; }
+.history-version :deep(.hl-select-wrap) { width: 100%; }
 .history-ranges { display: flex; gap: 6px; margin-top: 12px; }
 /* `.range-chip`（胶囊 + 常驻强调色）曾在这里——它与 `tabs-shared.css` 的 `.bill-chip`、
    `game-detail` 的同名块是同一造型的三份副本，已统一到 `HlChip.vue` 的
