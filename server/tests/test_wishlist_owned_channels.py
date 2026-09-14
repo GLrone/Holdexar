@@ -399,7 +399,8 @@ async def test_list_items_joins_game_name_and_cover(db):
 
 @pytest.mark.asyncio
 async def test_list_items_filter_by_steamid(db):
-    """按账户过滤 + 原有字段（appid/addedAt）不受 JOIN 影响。"""
+    """按账户过滤 + 原有字段（appid/addedAt）不受 JOIN 影响；
+    条目按 appid 聚合，账户落在 steamids 数组里。"""
     await _seed_account(db, steamid=PRIMARY)
     await _seed_account(db, steamid=FRIEND)
     await _seed_item(db, 620, steamid=PRIMARY)
@@ -407,7 +408,7 @@ async def test_list_items_filter_by_steamid(db):
 
     mine = await wishlist_service.list_items(PRIMARY)
     assert [r["appid"] for r in mine] == [620]
-    assert mine[0]["steamid"] == PRIMARY
+    assert mine[0]["steamids"] == [PRIMARY]
     assert mine[0]["addedAt"] is None
 
 

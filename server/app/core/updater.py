@@ -6,10 +6,10 @@
 - 免 GitHub API 的 60 次/小时限速，且 api.github.com 在国内比 release 资产更难可达
 - 清单自带 sha256 与资产名，客户端不必再从 release body 里抠哈希（旧的兜底路径保留）
 
-换装流程对齐 ArchiSteamFarm 的 UpdateFromArchive 三段式（解压暂存 → 旧文件
-移备份目录 → 新文件落位），但把换装时机改到**下次启动**（PyInstaller
-onedir 在 Windows 下运行中替换自身文件句柄风险高；desktop/main.py
---apply-update 在 uvicorn 线程起来之前完成换装，无文件锁）。
+换装流程三段式（解压暂存 → 旧文件移备份目录 → 新文件落位），换装时机
+放在**下次启动**（PyInstaller onedir 在 Windows 下运行中替换自身文件
+句柄风险高；desktop/main.py --apply-update 在 uvicorn 线程起来之前完成
+换装，无文件锁）。
 
 数据安全（本项目核心承诺，优先于一切花哨功能）：
 - 换装只动程序目录，data/ 等用户目录跳过（desktop 侧白名单）

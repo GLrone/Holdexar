@@ -5,7 +5,9 @@
    · Wishlist / Owned —— gameCard 的归属徽章（gameCard.status.wishlist / .owned），
      也是账户 kinds 维度的原文概念；
    · bind / unbind —— dashboard 页指向本页的引导用词；
-   · Sync / crawl —— dashboard 与 shell 的既有译法。
+   · Sync / crawl —— dashboard 与 shell 的既有译法；
+   · “识别到 N 个 AppID”复用 crawl.import.detected / .detectedInvalid——
+     同一份粘贴解析在任务页与池页逐字相同。
 
    三段同步结果文案各自成条，不在组件侧拼片段（中文那个「，已自动开始爬取」
    是随条件增减的整句，直译成英文会拼不出版行）。 */
@@ -56,9 +58,38 @@ const pool: Partial<Record<MessageKey, string>> = {
   'pool.items.searchPlaceholder': 'Search by game name or AppID',
   'pool.items.crawlAll': 'Crawl the whole pool',
 
+  /* Pool management (add / remove / bulk operations) */
+  'pool.items.kind.all': 'All',
+  'pool.items.kind.follow': 'Followed',
+  'pool.items.kind.wishlist': 'Wishlist',
+  'pool.items.kind.owned': 'Owned',
+  'pool.items.kind.manual': 'Manual',
+  'pool.items.tipAccounts': 'Tracked by {n} accounts',
+  'pool.items.add': 'Add items',
+  'pool.items.addTitle': 'Add tracked items',
+  'pool.items.addHint':
+    'Every item added to the pool is crawled for prices; games on your Steam wishlist or starred as followed are crawled first.',
+  'pool.items.addPlaceholder':
+    'Paste Steam store / SteamDB links or raw AppIDs (spaces, commas and new lines all work)',
+  'pool.items.addSubmit': 'Add to pool',
+  'pool.items.addNoValid': 'No valid AppID found',
+  'pool.items.addResult':
+    'Added to the pool: {added} new · {restored} restored · {exists} already in pool · {invalid} unrecognized',
+  'pool.items.manage': 'Manage',
+  'pool.items.manageDone': 'Done',
+  'pool.items.manageHint': 'Select items and remove them in bulk; removed items are no longer crawled.',
+  'pool.items.selected': '{n} selected',
+  'pool.items.selectPage': 'Select page',
+  'pool.items.unselectPage': 'Unselect page',
+  'pool.items.clearSelection': 'Clear selection',
+  'pool.items.removeSelected': 'Remove selected',
+  'pool.items.removeConfirm': 'Remove the {n} selected games from the pool?',
+  'pool.items.removeResult': '{n} games removed from the pool',
+
   /* Item grid and empty states */
   'pool.items.pendingName': 'Not fetched yet (new entry)',
   'pool.items.noMatch': 'No match for “{query}” — not in the tracked items.',
+  'pool.items.noKindMatch': 'No items in this category.',
   'pool.items.empty': 'No tracked items yet — bind an account and sync to get started.',
 }
 

@@ -58,6 +58,7 @@ WEIGHT_SCALE = 100_000  # 权重分辨率，不影响各出口的相对份额
 
 # ── Clash 节点状态机（2026-09 节点级状态存储）────────────────
 HEALTH_INTERVAL_HOURS = 6  # 体检间隔（本地软件不常驻，跨重启靠库门槛）
+SUBSCRIPTION_REFRESH_HOURS = 6  # 订阅重拉间隔（与节点体检同拍，跨重启靠 KV 门槛）
 DEAD_MAX_FAILS = 10  # 累计失败 → dead 终态
 REVIVE_PASSES_REQUIRED = 3  # dead 复活需连续 3-of-3 测通过
 SUBSCRIPTION_DEPRECATE_RATIO = 0.95  # 不可用节点占比 >95% → 订阅废弃
@@ -311,6 +312,24 @@ async def refresh_subscription_traffic(sub_id: int) -> dict:
     return {"id": sub_id, "traffic": userinfo}
 
 
+async def _mark_refreshed(sub_id: int) -> None:
+    """重拉成功留痕：订阅行 last_imported_at（前端「上次拉取」口径）+ KV 门槛。
+
+    KV 门槛（proxy.sub_last_refresh_at）是定时重拉的间隔依据，手动重拉同样
+    计数——刚手动拉过就不必再来一次自动拉。缓存回退（下载全败）不算成功，
+    门槛不被消费，下一拍继续试。
+    """
+    from app.domains.settings.service import set_value
+
+    now = _naive(get_beijing_time_obj())
+    async with get_session_factory()() as session:
+        sub = await session.get(ProxySubscription, sub_id)
+        if sub is not None:
+            sub.last_imported_at = now
+            await session.commit()
+    await set_value("proxy.sub_last_refresh_at", now.isoformat())
+
+
 async def refresh_clash_subscription(sub_id: int) -> dict:
     """独立刷新 Clash 订阅：重新下载配置 + 流量回填 + 账本收敛。
 
@@ -318,6 +337,8 @@ async def refresh_clash_subscription(sub_id: int) -> dict:
     - 内核在跑且配置有变化 → 重启生效（节点增删立即反映）
     - 内核没跑 → 只下载不启动（下次启动自然用新配置）
     存活统计落库：lastStats.alive/total 用账本 + 当前配置节点名口径。
+    成功后写「上次拉取」留痕（订阅行时间戳 + 定时重拉门槛 KV，见
+    _mark_refreshed）；缓存回退（全部通道下载失败）不算成功。
     """
     sub = await get_subscription(sub_id)
     if sub is None:
@@ -383,6 +404,8 @@ async def refresh_clash_subscription(sub_id: int) -> dict:
             restarted = bool(now_pid and now_pid != prev_pid)
         except Exception:  # noqa: BLE001 —— 重启失败保留旧内核运行
             logger.exception("[订阅刷新] 内核重启失败（沿用运行中的实例）")
+    if not meta.get("cached"):
+        await _mark_refreshed(sub_id)
     return {
         "id": sub_id,
         "nodes": meta.get("nodes"),
@@ -392,6 +415,80 @@ async def refresh_clash_subscription(sub_id: int) -> dict:
         "usedCache": meta.get("cached", False),
         "restarted": restarted,
         "prunedLedger": pruned,
+    }
+
+
+async def maybe_refresh_active_clash_subscription() -> dict:
+    """定时重拉「内核正在跑的」Clash 订阅（间隔门槛 SUBSCRIPTION_REFRESH_HOURS）。
+
+    为什么必须定时重拉：机场节点列表会增删/改名/换入口，本地 config.yaml 不
+    重拉就一直是旧节点集——6h 体检也只是反复测这批旧节点，新节点永远进不来。
+
+    为什么只重拉正在跑的那条：
+    - 没在跑的订阅没有流量走它，重拉只是白耗一次外网请求（下次启动内核时
+      本来就会重下）；
+    - config.yaml 是各订阅共用的缓存文件，重拉非在跑订阅会把这个文件换成
+      别家内容，与运行中的内核状态对不上。
+
+    「正在跑哪条」的判据只有一条：内核启动文本里含该订阅 URL
+    （running_subscription_is）——共用缓存文件本身会被后续任何一次下载覆盖，
+    文件名/时间戳都不能作为依据。判定不出来就跳过，不猜、不动。
+
+    门槛（proxy.sub_last_refresh_at）由重拉成功时写（见 _mark_refreshed），
+    失败不消费——下一拍继续试。
+
+    返回 {state, subscriptionId, nodes, restarted}，state 取值：
+    clash_not_running / throttled / no_subscription / unknown_subscription /
+    refreshed / failed（非 refreshed 时后三者无意义）。restarted=true 表示
+    新配置已重启内核生效——新节点在账本里还是空行，调用方应接一次节点检测，
+    否则「存活 x/y」与仪表盘可用数会停在账本口径等下个 6h 窗口。
+    """
+    from app.domains.settings.service import get_value
+
+    skip = {"subscriptionId": None, "nodes": None, "restarted": False}
+    status = clash_manager.runtime.status()
+    if not status["running"]:
+        return {"state": "clash_not_running", **skip}
+    last = await get_value("proxy.sub_last_refresh_at")
+    if last:
+        try:
+            elapsed = _naive(get_beijing_time_obj()) - datetime.fromisoformat(str(last))
+        except ValueError:
+            elapsed = None
+        if elapsed is not None and elapsed < timedelta(hours=SUBSCRIPTION_REFRESH_HOURS):
+            return {"state": "throttled", **skip}
+
+    usable = [s for s in await list_subscriptions("clash") if not s["deprecated"]]
+    if not usable:
+        return {"state": "no_subscription", **skip}
+    # 从新到旧找「URL 出现在启动文本里」的那条（与「最近一条」默认序一致）
+    sub = next(
+        (
+            s
+            for s in reversed(usable)
+            if clash_manager.runtime.running_subscription_is(s["url"])
+        ),
+        None,
+    )
+    if sub is None:
+        logger.info("[订阅重拉] 无法确认内核在跑哪条订阅，跳过（可手动重拉）")
+        return {"state": "unknown_subscription", **skip}
+    try:
+        result = await refresh_clash_subscription(sub["id"])
+    except Exception as e:  # noqa: BLE001 —— 失败不消费门槛，下一拍重试
+        logger.warning("[订阅重拉] 订阅 %s 拉取失败：%s", sub["id"], e)
+        return {"state": "failed", **skip}
+    logger.info(
+        "[订阅重拉] 订阅 %s：%s 节点%s",
+        sub["id"],
+        result.get("nodes"),
+        "，内核已重启生效" if result.get("restarted") else "（配置无变化，内核沿用）",
+    )
+    return {
+        "state": "refreshed",
+        "subscriptionId": sub["id"],
+        "nodes": result.get("nodes"),
+        "restarted": bool(result.get("restarted")),
     }
 
 
@@ -621,7 +718,7 @@ async def list_subscriptions(kind: str | None = None) -> list[dict]:
 
 async def add_subscription(kind: str, url: str, label: str | None = None) -> dict:
     """保存订阅。kind=clash 时一步到位：
-    ① 内核缺失 → 自动下载（进度可经 /clash/install/progress 轮询）；
+    ① 内核缺失 → 自动安装（随包资产复制，缺失时才网络下载，进度可轮询）；
     ② 下载订阅验证内容可用（节点数/流量头回填，失败不删行——返回 warning）。
     """
     url = url.strip()
@@ -632,17 +729,17 @@ async def add_subscription(kind: str, url: str, label: str | None = None) -> dic
     from app.core.config import get_settings
 
     settings = get_settings()
-    kernel_installed = None  # None=原本就有 / dict=本次自动下载结果
+    kernel_installed = None  # None=原本就有 / dict=本次自动安装结果
     if kind == "clash" and not clash_manager.detect_kernel(settings.data_dir)["found"]:
         import asyncio
 
         kernel_installed = await asyncio.to_thread(
-            clash_manager.download_kernel, settings.data_dir
+            clash_manager.install_kernel, settings.data_dir
         )
         if not kernel_installed.get("ok"):
             raise ValueError(
-                f"内核自动下载失败：{kernel_installed.get('error')}；"
-                "可手动放置 mihomo 内核到 data/clash/ 后重试"
+                f"内核安装失败：{kernel_installed.get('error')}；"
+                "可稍后重试，或手动放置 mihomo 内核到 data/clash/"
             )
 
     async with get_session_factory()() as session:

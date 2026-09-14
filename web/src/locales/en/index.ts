@@ -16,7 +16,7 @@
 import type { MessageKey } from '../zh-CN'
 import common from './common'
 import shell from './shell'
-// ── 期 3 共享业务组件（components/steamhl/*，五个组件各一模块）──
+// ── 共享业务组件（components/business/*，五个组件各一模块）──
 import filterPanel from './filterPanel'
 import gameCard from './gameCard'
 import navbar from './navbar'
@@ -54,7 +54,7 @@ import famHeat from './famHeat'
 // ── 期 7 数据层（api/currencies.ts 的币种名、stores/regions.ts 的表外区名）──
 import currencies from './currencies'
 import regions from './regions'
-// ── 期 8 共享业务组件（components/steamhl/EpicFreeCards.vue）──
+// ── 共享业务组件（components/business/EpicFreeCards.vue）──
 import epicFree from './epicFree'
 // ── Game Library page (views/gamelib/Index.vue and its tabs) ──
 import gamelib from './gamelib'

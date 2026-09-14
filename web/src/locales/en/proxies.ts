@@ -45,7 +45,7 @@ const proxies: Partial<Record<MessageKey, string>> = {
   'proxies.kernel.sizeHint': '· mihomo, about 15 MB',
   'proxies.kernel.viaWrap': '({via})',
   'proxies.kernel.downloading': 'Downloading…',
-  'proxies.kernel.autoDownload': 'Download kernel',
+  'proxies.kernel.autoDownload': 'Install kernel',
   'proxies.kernel.downloadDone': 'Kernel downloaded',
   'proxies.kernel.downloadFailed': 'Kernel download failed: {error}',
   'proxies.kernel.orPlaceManual': 'or place it manually in {dir}',

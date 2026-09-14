@@ -51,7 +51,7 @@ export interface BundleOwnership {
 /**
  * 撞库推演：基准 appids 里的"有效游戏"（库内存在 = name 非空的条目）
  * 全部已拥有 → owned；全部靠家庭共享 → family(account)；混编 → owned。
- * 库内无任何有效游戏时不判定（原版语义：validAppIds.length > 0 才进入）。
+ * 库内无任何有效游戏时不判定（至少一个有效游戏才进入判定）。
  */
 export function inferBundleOwnership(
   appIds: number[],
@@ -103,7 +103,7 @@ export interface CompletionResult {
 }
 
 /**
- * 补齐计算（对齐原版 calculateBundlePrice）：
+ * 补齐计算：
  * - 未排除任何游戏 → 直接用该区官方整包价（原价与 CNY 均来自区域价行）；
  * - 有排除 → 对未排除游戏在该区的现价求和（外币 minor 与 cny_fen 各自独立求和，
  *   无价游戏跳过不计 validCount），再乘 (1 − 整包基础折扣%)。
@@ -153,9 +153,9 @@ export function computeCompletion(
 }
 
 /**
- * 计算器自动排除（对齐原版 openBundleCalculator 预选规则）：
+ * 计算器自动排除（预选规则）：
  * 库内无数据的游戏（name 为 null）+ 主账户已拥有的游戏。
- * 家庭共享不算拥有（可玩但仍需购买，原版同）。
+ * 家庭共享不算拥有（可玩但仍需购买）。
  */
 export function autoExcludedAppIds(
   bundle: Pick<BundleDetail, 'appIds' | 'games'>,

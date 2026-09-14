@@ -187,7 +187,7 @@ def _remove_top_divs_by_class(td_html: str, class_keywords: tuple[str, ...]) -> 
 def parse_history_rows_from_html(html_fragment: str) -> list[dict]:
     """从 wallet_history_table tbody（或 AJAX 追加块）HTML 提取行（同构口径）。
 
-    字段口径与 steam_data_exporter.user.js parseHistoryRows 一致：
+    字段口径（与导出件字段一一对应）：
     item 排除 wth_payment/wth_item_refunded；受赠人独立 gift_recipients；
     type/type_count/payment/total/wallet_change/wallet_balance/base_price/
     original_price/discount 全字段。

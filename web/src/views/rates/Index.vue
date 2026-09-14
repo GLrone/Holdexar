@@ -163,7 +163,7 @@ watch(history, async () => {
   }, 500)
 })
 
-/** 窗口内值域（±5% padding，对齐原版 fx-trend；空数据回退 0~1 防发散） */
+/** 窗口内值域（±5% padding；空数据回退 0~1 防发散） */
 const yDomain = computed(() => {
   const values = history.value.map((h) => h.rateToCny)
   if (!values.length) return { min: 0, max: 1 }

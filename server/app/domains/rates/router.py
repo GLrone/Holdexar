@@ -29,7 +29,7 @@ async def backfill(dry_run: bool = False):
 
 @router.get("/history")
 async def history(currency: str = "USD", limit: int = 0, range: str | None = None):
-    """日线历史。range 对齐原版 fx-trend 六档：1mo/6mo/1y/5y/10y/all。
+    """日线历史。range 六档：1mo/6mo/1y/5y/10y/all。
 
     默认全部（16 年档案全量）；limit>0 时再取尾段 limit 天。
     """

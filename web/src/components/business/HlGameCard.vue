@@ -971,7 +971,7 @@ const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/asse
           <span v-if="diffYuan > 0" class="diff-badge positive">
             {{ t('gameCard.price.save', { amount: diffYuan }) }}
           </span>
-          <!-- 行内覆盖已删：.diff-badge 基座（steamhl-gamecard.css:493）本就是
+          <!-- 行内覆盖已删：.diff-badge 基座（hl-gamecard.css:493）本就是
                var(--surface-chip-2)→var(--surface-chip) 渐变 + var(--text-on-fill) 文字，
                这行 `#555/#fff/#666` 是同一徽章的第二套配色，且三色都不随主题。
                bundles/Index.vue:563 的同名徽章一直走基座——此处是分叉的那一份。 -->
