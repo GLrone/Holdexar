@@ -174,10 +174,20 @@ def main() -> None:
     cmd = [str(python), str(ROOT / "desktop" / "main.py")]
     if args.server:
         cmd.append("--server")
+    # LAUNCHER_PID：桌面壳据此监视本进程——包装进程无论怎么死（任务管理器
+    # 强杀 / taskkill / 脚本超时收割），桌面壳随之退出。否则会留下孤儿实例
+    # 继续占着服务端口与单实例锁，下一次启动撞上「已在运行/端口被占用」，
+    # 用户看到的就是「应用无法启动」（实测复现过整条链路）。
+    env[f"{ENV_PREFIX}LAUNCHER_PID"] = str(os.getpid())
     try:
         subprocess.run(cmd, cwd=str(ROOT), env=env, check=True)
     except KeyboardInterrupt:
         print(f"\n[停止] {APP_NAME} 已退出")
+    except subprocess.CalledProcessError as e:
+        # 桌面壳异常退出（窗口层初始化失败等）：给可行动的指引而非裸 traceback
+        print(f"\n[错误] 启动器异常退出（exit {e.returncode}）。")
+        print("       可改用 python run.py --server 以无窗口模式启动本地服务排查。")
+        sys.exit(e.returncode or 1)
 
 
 if __name__ == "__main__":
