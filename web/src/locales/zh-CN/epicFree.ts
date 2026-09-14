@@ -9,6 +9,7 @@
 const epicFree = {
   'epicFree.title': 'Epic 喜加一',
   'epicFree.updatedAt': '{time} 更新',
+  'epicFree.refreshing': '刷新中…',
   'epicFree.free': '免费',
   'epicFree.live': '进行中',
   'epicFree.upcoming': '预告',
