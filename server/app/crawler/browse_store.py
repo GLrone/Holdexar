@@ -94,7 +94,7 @@ PRESERVED: dict[int, dict] = {}     # appid → 库内原值（browse 拿不到�
 FAILED_TASKS: list[str] = []
 NO_OPTIONS_COUNT = 0                # 「可见但无购买选项」计数（判 locked）
 PARENT_FOLLOWED = 0                 # 子 app 跟父补齐计数
-BUNDLES_DISCOVERED = 0             # purchase_options 捆绑包发现计数（lane 自动抓价）
+BUNDLES_DISCOVERED = 0             # purchase_options 捆绑包发现计数（链尾刷新自动抓价）
 FOLLOW_PARENT = True
 EXTRAS_ENABLED = True
 DRY_RUN = False
@@ -903,8 +903,8 @@ async def _browse_price_task_inner(context) -> None:
 
         # ── 捆绑包发现（purchase_options 白送）：游戏条目的购买选项里每条
         #    捆绑包选项都带 bundleid/packageid + must_purchase_as_set。库里
-        #    没有的包写发现桩（无价 + updated_at NULL），单协程 lane 播种
-        #    查询会把它捞走进整区抓价——跨厂 bundle（旧 appdetails 包列表
+        #    没有的包写发现桩（无价 + updated_at NULL），随下一次 6h 主轮
+        #    链尾的全量刷新整区抓价——跨厂 bundle（旧 appdetails 包列表
         #    探测覆盖不到）由此入账。已入库的包不动（不覆盖完整主档）。
         #    失败只计数不抛：发现是副产物，绝不拖垮主价格链路。
         if not DRY_RUN:

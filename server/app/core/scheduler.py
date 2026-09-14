@@ -112,11 +112,12 @@ _DRAIN_MAX_POLLS = 60  # 60 × 10s = 10min 上限，超时放行（走撞锁跳�
 async def price_auto_enabled() -> bool:
     """自动价格链总开关（KV `crawl.auto_price`，默认开）。
 
-    关掉 = 调度器不再自动发起任何爬取：主轮 price_refresh、修复轮
-    price_repair 到点即让路；账户同步只同步池成员资格（新增条目不再
-    即时首爬、收尾补爬跳过）；榜单反哺与 COMING_SOON 重探同样停转。
-    手动发起的爬取（「启动任务」/导入首爬/愿望单页手动同步触发的
-    首爬）不受影响——想手动抓的用户关这里即可，全自动用户无感。
+    关掉 = 定时价格更新停转：主轮 price_refresh（含链尾捆绑包刷新）、
+    修复轮 price_repair 到点即让路；账户同步只同步池成员资格（新增条目
+    不再即时首爬、收尾补爬跳过）；COMING_SOON 重探同样停转。榜单反哺
+    （监控队列发现源）与手动发起的爬取（「启动任务」/导入首爬/愿望单页
+    手动同步触发的首爬）不受影响——想手动抓的用户关这里即可，全自动
+    用户无感。
     """
     from app.domains.settings.service import get_value
 
@@ -192,12 +193,14 @@ async def _job_price_refresh() -> None:
     同轮双爬产生重复快照；孤儿行本就是 games 行，限量随分层失去意义）。
     存储代价由 db_writer 历史差量门禁兜住：价格未变不写快照。
 
-    链尾捆绑包存量刷新：三层链逐个 await 跑完后，紧跟
-    bundles.refresh_bundles() 全量刷包——lane 播种只捞「无价包」管首价，
-    存量包的各区价/折扣跟着同一张 6h 网格轮换（锚点即 Steam 折扣刷新
-    时刻，折扣轮换后捆包/单买比较不失真）；与主链过同一道代理前置
-    闸门（无可用代理自动跳过，等下一轮再探）；自带脏区行清理与单品
-    甄别，异常只记日志，不拖垮主链结果。
+    链尾捆绑包刷新：两层链逐个 await 跑完后，紧跟
+    bundles.refresh_bundles() 全量刷包——发现的捆绑包（游戏条目
+    purchase_options 落下的无价桩）随同一批请求完成首抓，与存量包的
+    各区价/折扣一起跟着这张 6h 网格轮换（锚点即 Steam 折扣刷新时刻，
+    折扣轮换后捆包/单买比较不失真）。捆绑包抓取只在链尾发生，不随
+    其他爬取运行触发；与主链过同一道代理前置闸门（无可用代理自动
+    跳过，等下一轮再探）；自带脏区行清理与单品甄别，异常只记日志，
+    不拖垮主链结果。
     """
     global _price_cycle_busy
     if not await price_auto_enabled():
@@ -223,17 +226,18 @@ async def _job_price_refresh() -> None:
         else:
             logger.info("[定时] 池价格爬取链完成：%s", [r["id"] for r in results])
 
-        # 链尾段：捆绑包存量刷新（游戏侧跑完才轮到它，busy 窗口内修复轮
-        # 继续让路；成败细节由 refresh_bundles 内部日志记录）
+        # 链尾段：捆绑包刷新（游戏侧跑完才轮到它，busy 窗口内修复轮
+        # 继续让路；发现桩首抓并入同一次全量刷新，成败细节由
+        # refresh_bundles 内部日志记录）
         try:
             await crawl_service.ensure_proxy_available()
             from app.domains.bundles import refresh as bundles_refresh
 
             await bundles_refresh.refresh_bundles()
         except ValueError as e:
-            logger.info("[定时] 捆绑包存量刷新跳过：%s", e)
+            logger.info("[定时] 捆绑包刷新跳过：%s", e)
         except Exception:  # noqa: BLE001
-            logger.exception("[定时] 捆绑包存量刷新异常（不影响主链结果）")
+            logger.exception("[定时] 捆绑包刷新异常（不影响主链结果）")
     finally:
         _price_cycle_busy = False
 
@@ -260,6 +264,43 @@ async def _job_fx_refresh() -> None:
             logger.info("[定时] 汇率历史缺口补齐：插入 %d 行", stats["inserted"])
     except Exception:  # noqa: BLE001
         logger.exception("[定时] 汇率历史缺口补齐失败")
+
+
+async def _job_subscription_refresh() -> None:
+    """Clash 订阅重拉（30min 一拍；真间隔由 service 侧 6h 门槛决定）。
+
+    门槛落在库里（KV），跨重启有效——本地软件不常驻，APScheduler 的间隔
+    只是兜底频率，短会话靠启动自启那次下载。只拉「内核正在跑的那条」，
+    内核没跑或认不出在跑哪条就跳过（见 service.maybe_refresh_active_...）。
+
+    爬虫占线让路：配置有变化会重启内核，在跑的爬取连接会被切断——门槛
+    不消费，等到空闲的那一刻照拉。
+
+    重拉带新配置（内核已重启）时接一次节点检测：新节点在账本里是空行，
+    「存活 x/y」与仪表盘可用数否则会停在账本口径等下个 6h 体检窗口。
+    """
+    from app.domains.proxies import service as proxies_service
+
+    if not _crawler_idle():
+        logger.info("[定时] Clash 订阅重拉跳过：爬虫占线")
+        return
+    try:
+        result = await proxies_service.maybe_refresh_active_clash_subscription()
+    except Exception:  # noqa: BLE001
+        logger.exception("[定时] Clash 订阅重拉异常")
+        return
+    if result.get("state") != "refreshed":
+        return
+    logger.info("[定时] Clash 订阅重拉完成：%s 节点", result.get("nodes"))
+    if result.get("restarted") and result.get("subscriptionId"):
+        try:
+            checked = await proxies_service.test_clash_nodes(result["subscriptionId"])
+            logger.info(
+                "[定时] 订阅重拉后首检：共 %s 节点，可用 %s",
+                checked.get("total"), checked.get("alive"),
+            )
+        except Exception:  # noqa: BLE001 —— 首检失败不影响重拉事实
+            logger.exception("[定时] 订阅重拉后首检失败（可稍后手动检测）")
 
 
 async def _job_proxy_health() -> None:
@@ -342,6 +383,11 @@ def _make_board_job(board_key: str, backfill_limit: int = 100):
     反哺限量（backfill_limit）：首跑特惠差集可达千级（封顶拉榜 5000 条），
     按 Steam 返回的热度序每轮限量消化（100 → specials 每 6h 一轮 = 400/天），
     避免单轮 run_sequential 跑几千个 appid 挤占任务锁。
+
+    **不受 crawl.auto_price 总开关管**：反哺是监控队列的发现源（把榜单新
+    条目首爬入库），不是价格更新作业——关掉自动价格更新不应停掉发现；
+    无可用代理时仍由 run_sequential 的代理前置闸门拦下（自动路径直连
+    不许硬打 Steam）。
     """
 
     async def _job() -> None:
@@ -360,10 +406,6 @@ def _make_board_job(board_key: str, backfill_limit: int = 100):
             return
 
         try:
-            if not await price_auto_enabled():
-                # 自动价格更新关闭：榜单缓存照常预热（纯列表拉取，不烧配额），
-                # 反哺爬取停转——新发现的条目等手动爬取或重新开启
-                return
             specs = await boards_mod.backfill_specs(board_key, limit=backfill_limit)
             if specs:
                 results = await crawl_service.run_sequential(
@@ -608,6 +650,11 @@ def start_scheduler() -> None:
     )
     scheduler.add_job(_job_fx_refresh, "cron", hour=3, minute=0, id="fx_refresh")
     scheduler.add_job(_job_proxy_health, "interval", hours=6, id="proxy_health")
+    # 订阅重拉：拍子给密一点（30min），真间隔靠 service 的 6h KV 门槛 +
+    # 爬虫空闲门禁——占线错过一拍不消费门槛，下一拍补上
+    scheduler.add_job(
+        _job_subscription_refresh, "interval", minutes=30, id="subscription_refresh"
+    )
     scheduler.add_job(_job_wallet_sync, "interval", minutes=1, id="wallet_sync")
     scheduler.add_job(_job_bills_sync, "interval", minutes=30, id="bills_sync")
     scheduler.add_job(_make_board_job("topsellers"), "interval", hours=1, id="board_topsellers")
@@ -637,7 +684,7 @@ def start_scheduler() -> None:
         asyncio.create_task(_job_bartervg_catchup())
     except RuntimeError:
         logger.warning("[调度] 无运行中事件循环，跳过 Barter.vg 启动补跑")
-    logger.info("调度器已启动（账户同步 15min / 池价格爬取锚点网格：Steam 折扣刷新锚 北京 01:00[夏令时]/02:00[冬令时] + 6h 步进，外部时间判定 DST / 捆绑包存量刷新随价格链 / 失败记录修复 5min 空闲档 / 汇率每日 03:00 / WAL 收缩每日 04:30 / Barter.vg bundle 计数每日 05:40 / 代理体检 6h / 钱包每分钟轮转 / 账单 30min / 热销榜 1h / 热门新品 24h / 特惠差集 6h / 即将推出 24h / CS 重探每日 10:00 / 自动备份 24h）")
+    logger.info("调度器已启动（账户同步 15min / 池价格爬取锚点网格：Steam 折扣刷新锚 北京 01:00[夏令时]/02:00[冬令时] + 6h 步进，外部时间判定 DST / 捆绑包存量刷新随价格链 / 失败记录修复 5min 空闲档 / 汇率每日 03:00 / WAL 收缩每日 04:30 / Barter.vg bundle 计数每日 05:40 / 代理体检 6h / Clash 订阅重拉 30min 拍[6h 门槛·爬虫空闲档] / 钱包每分钟轮转 / 账单 30min / 热销榜 1h / 热门新品 24h / 特惠差集 6h / 即将推出 24h / CS 重探每日 10:00 / 自动备份 24h）")
 
 
 def stop_scheduler() -> None:

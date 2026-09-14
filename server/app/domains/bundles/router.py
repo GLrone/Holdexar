@@ -19,13 +19,20 @@ async def list_bundles():
 
 @router.post("/refresh")
 async def refresh_bundles():
-    """全量刷新：逐区真实抓取（双轨 Bundle→Package，代理优先）→ upsert。"""
-    return await refresh.refresh_bundles()
+    """全量刷新：监控区整表每区一发（南亚 pk/bd 双发，代理优先）→ upsert。"""
+    try:
+        return await refresh.refresh_bundles()
+    except ValueError as e:
+        # 未启用任何区服等配置错误 → 400（前端静默失败即可，不落 500）
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @router.post("/import")
 async def import_bundle(payload: dict):
-    """导入捆绑包/Sub：粘贴 Steam 商店或 SteamDB 链接（或裸 ID）识别入库。"""
+    """导入捆绑包/Sub：粘贴 Steam 商店或 SteamDB 链接（或裸 ID）识别入库。
+
+    抓取区 = 监控启用区（南亚 pk/bd 双发）——与全量刷新同一口径。
+    """
     text = (payload or {}).get("text", "") if isinstance(payload, dict) else ""
     try:
         return await refresh.import_bundle(str(text))
