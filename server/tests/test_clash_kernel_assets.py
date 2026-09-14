@@ -1,11 +1,13 @@
 """随包 Clash 内核资产验收。
 
-覆盖四条行为：
-1. 随包目录 → data/clash/ 就位，只补缺失、同名不覆盖（用户手动换过的内核不被夺回）；
-2. detect_kernel 只认 data/clash/——随包目录里有内核也不算「已就位」
+覆盖五条行为：
+1. 随包目录 → data/clash/ 就位，GeoIP 数据只补缺失、同名不覆盖；
+2. 内核可执行文件版本感知换装：就位版本低于随包版本才替换，不低于
+   （用户手换更高版）或版本不可辨时保留；
+3. detect_kernel 只认 data/clash/——随包目录里有内核也不算「已就位」
    （不再检索本机其他 Clash 安装）；
-3. install_kernel 随包优先：随包可用时**不触网**（下载函数被顶替为断言失败）；
-4. 随包缺失时 install_kernel 才回退网络下载。
+4. install_kernel 随包优先：随包可用时**不触网**（下载函数被顶替为断言失败）；
+5. 随包缺失时 install_kernel 才回退网络下载。
 
 真实资产（`assets/clash/`，gitignored）不进测试：这里在 tmp_path 合成同构目录，
 用 monkeypatch 顶替 bundled_clash_dir()。
@@ -39,23 +41,33 @@ def _make_bundle(tmp_path: Path, *, kernel: bool = True) -> Path:
     return bundle
 
 
+def _fake_kernel_version(monkeypatch, raw: str | None) -> None:
+    """把 -v 解析链顶替为固定输出（raw=None 模拟版本不可辨）。"""
+    monkeypatch.setattr(
+        clash_manager, "_kernel_exe_version",
+        lambda _exe: clash_manager.parse_kernel_version(raw),
+    )
+
+
 def test_ensure_kernel_copies_bundle_into_data_dir(tmp_path: Path, monkeypatch) -> None:
     """内核与 GeoIP 数据按需复制进 data/clash/，缺失清单随之清空。"""
     bundle = _make_bundle(tmp_path)
     data_dir = tmp_path / "data"
     monkeypatch.setattr(clash_manager, "bundled_clash_dir", lambda: bundle)
+    _fake_kernel_version(monkeypatch, None)  # 假内核不跑真 -v
 
     result = clash_manager.ensure_kernel(data_dir)
 
     assert result["kernelReady"] is True
     assert set(result["copied"]) == {kernel_filename(), *GEO_ASSETS}
     assert result["missing"] == []
+    assert result["upgraded"] is None  # 无旧版本可比，纯新装
     for name in (kernel_filename(), *GEO_ASSETS):
         assert (data_dir / "clash" / name).is_file()
 
 
 def test_ensure_kernel_keeps_existing_files(tmp_path: Path, monkeypatch) -> None:
-    """已有文件一律不动（用户可能手动换了更高版本的内核/更新的 GeoIP 数据）。"""
+    """已有 GeoIP 数据与内核一律不动（版本不可辨 = 保守保留用户文件）。"""
     bundle = _make_bundle(tmp_path)
     data_dir = tmp_path / "data"
     clash_path = data_dir / "clash"
@@ -63,6 +75,8 @@ def test_ensure_kernel_keeps_existing_files(tmp_path: Path, monkeypatch) -> None
     (clash_path / kernel_filename()).write_bytes(b"user-kernel")
     (clash_path / "geoip.dat").write_bytes(b"user-geoip")
     monkeypatch.setattr(clash_manager, "bundled_clash_dir", lambda: bundle)
+    # 版本不可辨（-v 拿不到可解析输出）：既不证明旧、也不证明新，不替换
+    _fake_kernel_version(monkeypatch, None)
 
     result = clash_manager.ensure_kernel(data_dir)
 
@@ -70,7 +84,71 @@ def test_ensure_kernel_keeps_existing_files(tmp_path: Path, monkeypatch) -> None
     assert (clash_path / "geoip.dat").read_bytes() == b"user-geoip"
     assert kernel_filename() not in result["copied"]
     assert "geoip.dat" not in result["copied"]
+    assert result["upgraded"] is None
     assert set(result["copied"]) == {"Country.mmdb", "geosite.dat", "ASN.mmdb"}
+
+
+def _bump_target(monkeypatch, version: str) -> None:
+    """把随包版本常量换成指定值（升级/保留判定的另一端）。"""
+    monkeypatch.setattr(clash_manager, "MIHOMO_VERSION", version)
+
+
+def test_ensure_kernel_upgrades_stale_kernel(tmp_path: Path, monkeypatch) -> None:
+    """就位版本低于随包版本 → 替换（老安装升级后随包新内核落地）。"""
+    bundle = _make_bundle(tmp_path)
+    data_dir = tmp_path / "data"
+    clash_path = data_dir / "clash"
+    clash_path.mkdir(parents=True)
+    (clash_path / kernel_filename()).write_bytes(b"old-kernel")
+    monkeypatch.setattr(clash_manager, "bundled_clash_dir", lambda: bundle)
+    _fake_kernel_version(monkeypatch, "Mihomo Meta v1.19.20 windows amd64")
+
+    result = clash_manager.ensure_kernel(data_dir)
+
+    assert result["upgraded"] == f"1.19.20 → {MIHOMO_VERSION}"
+    assert (clash_path / kernel_filename()).read_bytes() == b"MZ" + b"\x00" * 4096
+
+
+def test_ensure_kernel_keeps_newer_user_kernel(tmp_path: Path, monkeypatch) -> None:
+    """就位版本不低于随包版本 → 保留（用户手换更高版不夺回，同版也不折腾）。"""
+    bundle = _make_bundle(tmp_path)
+    data_dir = tmp_path / "data"
+    clash_path = data_dir / "clash"
+    clash_path.mkdir(parents=True)
+    (clash_path / kernel_filename()).write_bytes(b"user-newer-kernel")
+    monkeypatch.setattr(clash_manager, "bundled_clash_dir", lambda: bundle)
+    target = clash_manager.parse_kernel_version(MIHOMO_VERSION)
+    assert target is not None
+    _fake_kernel_version(
+        monkeypatch,
+        f"Mihomo Meta v{'.'.join(map(str, (target[0], target[1], target[2] + 1)))} windows amd64",
+    )
+
+    result = clash_manager.ensure_kernel(data_dir)
+
+    assert result["upgraded"] is None
+    assert (clash_path / kernel_filename()).read_bytes() == b"user-newer-kernel"
+
+
+def test_ensure_kernel_skips_replacement_while_running(tmp_path: Path, monkeypatch) -> None:
+    """内核进程在跑 → 不替换（Windows 下运行中的 exe 无法覆盖），留给下次。"""
+    bundle = _make_bundle(tmp_path)
+    data_dir = tmp_path / "data"
+    clash_path = data_dir / "clash"
+    clash_path.mkdir(parents=True)
+    (clash_path / kernel_filename()).write_bytes(b"old-kernel")
+    monkeypatch.setattr(clash_manager, "bundled_clash_dir", lambda: bundle)
+    _fake_kernel_version(monkeypatch, "Mihomo Meta v1.19.20 windows amd64")
+    # 本 runtime 实例在跑：模块级 runtime.status() 命中即跳过
+    monkeypatch.setattr(
+        clash_manager.runtime, "status",
+        lambda: {"running": True, "port": 7890, "configPath": None, "controllerUrl": None},
+    )
+
+    result = clash_manager.ensure_kernel(data_dir)
+
+    assert result["upgraded"] is None
+    assert (clash_path / kernel_filename()).read_bytes() == b"old-kernel"
 
 
 def test_detect_kernel_only_checks_data_dir(tmp_path: Path, monkeypatch) -> None:
@@ -78,6 +156,7 @@ def test_detect_kernel_only_checks_data_dir(tmp_path: Path, monkeypatch) -> None
     bundle = _make_bundle(tmp_path)
     data_dir = tmp_path / "data"
     monkeypatch.setattr(clash_manager, "bundled_clash_dir", lambda: bundle)
+    _fake_kernel_version(monkeypatch, None)  # 假内核不跑真 -v
 
     assert clash_manager.detect_kernel(data_dir) == {
         "found": False, "path": None, "builtin": False,
@@ -95,6 +174,8 @@ def test_install_kernel_prefers_bundle_without_network(tmp_path: Path, monkeypat
     """随包可用时安装不触网——两个下载函数都被顶替成「调了就失败」。"""
     bundle = _make_bundle(tmp_path)
     monkeypatch.setattr(clash_manager, "bundled_clash_dir", lambda: bundle)
+    # 全新安装无旧内核可比版本：升级判定不触发（_maybe_upgrade_kernel 短路）
+    _fake_kernel_version(monkeypatch, None)
 
     def _boom(*_args, **_kwargs):
         raise AssertionError("随包资产可用时不应走网络下载")
@@ -113,7 +194,6 @@ def test_install_kernel_falls_back_to_download(tmp_path: Path, monkeypatch) -> N
     """随包缺失（源码 clone 未补资产）才回退网络下载，且走当前平台那支。"""
     bundle = _make_bundle(tmp_path, kernel=False)
     monkeypatch.setattr(clash_manager, "bundled_clash_dir", lambda: bundle)
-    calls: list[str] = []
 
     def _fake_download(data_dir: Path) -> dict:
         calls.append("download")
@@ -122,6 +202,7 @@ def test_install_kernel_falls_back_to_download(tmp_path: Path, monkeypatch) -> N
             "source": "github", "via": "直连",
         }
 
+    calls: list[str] = []
     monkeypatch.setattr(clash_manager, "download_kernel", _fake_download)
     monkeypatch.setattr(clash_manager, "download_kernel_linux", _fake_download)
 
