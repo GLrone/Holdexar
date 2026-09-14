@@ -69,8 +69,6 @@ const shell = {
   'shell.backtop': '返回顶部',
   'shell.sidebar.expand': '展开侧边栏',
   'shell.sidebar.collapse': '折叠侧边栏',
-  'shell.sidebar.expandShort': '展开',
-  'shell.sidebar.collapseShort': '收起侧边栏',
   'shell.theme.toLight': '切换到浅色主题',
   'shell.theme.toDark': '切换到深色主题',
   /* 语言钮：文案**显示目标语言**（当前中文 → EN；当前英文 → 中），与主题钮

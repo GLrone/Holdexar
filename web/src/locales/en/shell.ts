@@ -57,8 +57,6 @@ const shell: Partial<Record<MessageKey, string>> = {
   'shell.backtop': 'Back to top',
   'shell.sidebar.expand': 'Expand sidebar',
   'shell.sidebar.collapse': 'Collapse sidebar',
-  'shell.sidebar.expandShort': 'Expand',
-  'shell.sidebar.collapseShort': 'Collapse sidebar',
   'shell.theme.toLight': 'Switch to light theme',
   'shell.theme.toDark': 'Switch to dark theme',
   // 语言无关文案：两条都指向**目标语言**，故两种语言下取值相同（见 zh-CN 侧说明）

@@ -39,7 +39,7 @@ const productTour: Partial<Record<MessageKey, string>> = {
   'productTour.intro.p2':
     'Now let’s walk the core workflow. Each step highlights the exact spot on screen — just follow Next.',
   'productTour.intro.p3':
-    'Leave any time with Skip tour — and reopen it from the {app} icon in the top left.',
+    'Leave any time with Skip tour — and reopen it from the {app} logo on the About page.',
 
   /* Step 1 · Proxies (sidebar) */
   'productTour.stepProxy.title': 'Step 1 · Set up a proxy (the prerequisite)',
@@ -125,7 +125,7 @@ const productTour: Partial<Record<MessageKey, string>> = {
   'productTour.done.p2':
     'Explore as needed: Store for region-by-region prices, Rates for multi-currency trends, Toolbox for CDK bulk activation and more.',
   'productTour.done.p3':
-    'To replay it: click the {app} icon in the top left, or open Guided tour on the Me page.',
+    'To replay it: click the {app} logo on the About page, or open Guided tour on the Me page.',
 
   /* The overlay's own controls */
   'productTour.action.skip': 'Skip tour',
