@@ -46,7 +46,7 @@ const productTour = {
   'productTour.intro.p2':
     '接下来带你把最核心的事走一遍。每一步都会高亮界面上的具体位置，跟着「下一步」走即可。',
   'productTour.intro.p3':
-    '中途想离开，点「跳过导览」随时可以——左上角点 {app} 图标能重新打开本导览。',
+    '中途想离开，点「跳过导览」随时可以——到「关于」页点 {app} logo 能重新打开本导览。',
 
   /* ── 第 1 步 · 侧栏「代理管理」── */
   'productTour.stepProxy.title': '第 1 步 · 配置代理（一切的前提）',
@@ -123,7 +123,7 @@ const productTour = {
   'productTour.done.p1': '之后的事全自动：价格每 6 小时刷新、达标即通知、汇率自动同步。',
   'productTour.done.p2':
     '其他页面按需探索：「游戏商店」看全量资产和各区比价、「汇率」看多币种走势、「工具箱」有 CDK 批量激活等实用工具。',
-  'productTour.done.p3': '需要重看：左上角点 {app} 图标，或到「我」页「新手教程」分节。',
+  'productTour.done.p3': '需要重看：到「关于」页点 {app} logo，或到「我」页「新手教程」分节。',
 
   /* ── 浮层自身的控件 ── */
   'productTour.action.skip': '跳过导览',

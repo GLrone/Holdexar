@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { onBeforeUnmount, ref } from 'vue'
+
 import { useRoute, useRouter } from 'vue-router'
 import HlIcon from './HlIcon.vue'
 import type { IconName } from './icons'
@@ -29,18 +31,37 @@ withDefaults(
     groups: HlSideNavGroup[]
     /** 品牌区 */
     brandName?: string
-    brandSubtitle?: string
     /** 品牌 logo 图 URL（浅/深主题由父层切换） */
     logoSrc?: string
-    /** 是否显示底部收拢按键 */
-    collapsible?: boolean
   }>(),
-  { brandName: '', brandSubtitle: '', logoSrc: '', collapsible: true },
+  { brandName: '', logoSrc: '' },
 )
 
 const collapsed = defineModel<boolean>('collapsed', { default: false })
 
-const emit = defineEmits<{ (e: 'brand-click'): void }>()
+/** 品牌区点击：收起态 = 展开（悬停时 logo 已换「侧边栏」图标）。
+ *  展开态无动作（原「点击 logo 打开新手引导」已迁至「关于」页 logo）。
+ *  收起/展开只保留品牌区这一处入口——旧底部收拢钮已移除：导航项一多它会
+ *  被挤出视口，等于没有。
+ */
+function onBrandClick() {
+  if (collapsed.value) collapsed.value = false
+}
+
+/* ── 滚动条：默认隐藏，滚动时显形、停手 1.2s 隐去 ──
+   宽度由 CSS 的 .is-scrolling 控制（两侧三角形箭头一律不渲染）。 */
+const navScrolling = ref(false)
+let scrollbarTimer: number | undefined
+
+function onNavScroll() {
+  navScrolling.value = true
+  if (scrollbarTimer !== undefined) window.clearTimeout(scrollbarTimer)
+  scrollbarTimer = window.setTimeout(() => (navScrolling.value = false), 1200)
+}
+
+onBeforeUnmount(() => {
+  if (scrollbarTimer !== undefined) window.clearTimeout(scrollbarTimer)
+})
 
 const route = useRoute()
 const router = useRouter()
@@ -65,22 +86,48 @@ defineOptions({ name: 'HlSideNav' })
 
 <template>
   <aside class="hl-sidebar" :class="{ 'is-collapsed': collapsed }">
-    <!-- 品牌区：logo 悬浮动效，悬停旋转放大；点击派发 brand-click（父层接教程等） -->
-    <button type="button" class="hl-sb-brand" :title="t('shell.tour')" @click="emit('brand-click')">
-      <div class="hl-sb-brand__logo">
-        <img v-if="logoSrc" :src="logoSrc" :alt="brandName" />
-        <span v-else style="font-size: 18px; font-weight: 700; color: var(--accent)">
-          {{ brandName.charAt(0) || 'H' }}
-        </span>
-      </div>
-      <div class="hl-sb-brand__txt">
-        <div class="hl-sb-brand__name">{{ brandName }}</div>
-        <div class="hl-sb-brand__sub">{{ brandSubtitle }}</div>
-      </div>
-    </button>
+    <!-- 头部：品牌（收起态悬停换「侧边栏」图标、点击展开）+ 展开态收起按键 -->
+    <div class="hl-sb-head">
+      <button
+        type="button"
+        class="hl-sb-brand"
+        :title="collapsed ? t('shell.sidebar.expand') : ''"
+        @click="onBrandClick"
+      >
+        <div class="hl-sb-brand__logo">
+          <img v-if="logoSrc" class="hl-sb-brand__logo-img" :src="logoSrc" :alt="brandName" />
+          <span
+            v-else
+            class="hl-sb-brand__logo-fallback"
+            style="font-size: 18px; font-weight: 700; color: var(--accent)"
+          >
+            {{ brandName.charAt(0) || 'H' }}
+          </span>
+          <HlIcon v-if="collapsed" name="sidebar" :size="18" class="hl-sb-brand__expand" />
+        </div>
+        <!-- 副标题（STEAM 多区价格监控终端）已移除：腾出的位置给品牌名与收起键 -->
+        <div class="hl-sb-brand__txt">
+          <div class="hl-sb-brand__name">{{ brandName }}</div>
+        </div>
+      </button>
+      <button
+        v-if="!collapsed"
+        type="button"
+        class="hl-sb-toggle"
+        :title="t('shell.sidebar.collapse')"
+        @click="collapsed = true"
+      >
+        <HlIcon name="sidebar" :size="16" />
+      </button>
+    </div>
 
-    <!-- 分组导航：左缘指示条 + 悬停浮起 + 折叠态 tooltip -->
-    <nav class="hl-sb-nav">
+    <!-- 分组导航：左缘指示条 + 悬停浮起 + 折叠态原生 title -->
+    <nav
+      class="hl-sb-nav"
+      :class="{ 'is-scrolling': navScrolling }"
+      @scroll="onNavScroll"
+      @wheel="onNavScroll"
+    >
       <template v-for="(group, gi) in groups" :key="gi">
         <div v-if="group.label" class="hl-sb-group">{{ group.label }}</div>
         <button
@@ -90,29 +137,15 @@ defineOptions({ name: 'HlSideNav' })
           class="hl-sb-item"
           :class="{ 'is-active': isActive(item) }"
           :data-tour="tourAttr(item)"
+          :title="collapsed ? item.label : undefined"
           @click="go(item)"
         >
           <HlIcon v-if="item.icon" :name="item.icon" :size="17" />
           <span class="hl-sb-item__label">{{ item.label }}</span>
           <span v-if="item.dot" class="hl-sb-dot" :title="item.dotTitle" />
-          <span class="hl-sb-tip">{{ item.label }}</span>
         </button>
       </template>
     </nav>
 
-    <!-- 底部：收拢按键 -->
-    <div v-if="collapsible" class="hl-sb-foot">
-      <button
-        type="button"
-        class="hl-sb-collapse-btn"
-        :title="t(collapsed ? 'shell.sidebar.expand' : 'shell.sidebar.collapse')"
-        @click="collapsed = !collapsed"
-      >
-        <HlIcon :name="collapsed ? 'chevron-right' : 'chevron-left'" :size="16" />
-        <span class="hl-sb-collapse-label">{{
-          t(collapsed ? 'shell.sidebar.expandShort' : 'shell.sidebar.collapseShort')
-        }}</span>
-      </button>
-    </div>
   </aside>
 </template>

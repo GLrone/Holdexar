@@ -10,6 +10,7 @@ import { useI18n, type MessageKey } from '@/locales'
 import { useThemeStore } from '@/stores/theme'
 import { HlIcon } from '@/components/ui'
 import BorderGlow from '@/components/ui/BorderGlow.vue'
+import ProductTour from '@/components/ProductTour.vue'
 
 const { t } = useI18n()
 
@@ -17,6 +18,9 @@ const themeStore = useThemeStore()
 const logo = computed(() =>
   themeStore.isDark ? '/assets/logo_dark.ico' : '/assets/logo_light.ico',
 )
+
+/* 新手引导重看入口：hero logo 点击打开（侧边栏 logo 的原入口已迁到本页） */
+const tourOpen = ref(false)
 
 interface SystemInfo {
   app: string
@@ -85,7 +89,15 @@ const CREDITS: { name: string; url: string; noteKey: MessageKey }[] = [
     <!-- 定位（hero） -->
     <BorderGlow :light="!themeStore.isDark">
       <div class="about-hero">
-        <img class="about-hero__logo" :src="logo" alt="" />
+        <!-- logo 即新手引导入口（悬停微放大提示可点）；首次启动仍由外壳自动弹出 -->
+        <button
+          type="button"
+          class="about-hero__logo-btn"
+          :title="t('about.logo.tourTitle')"
+          @click="tourOpen = true"
+        >
+          <img class="about-hero__logo" :src="logo" alt="" />
+        </button>
         <div class="about-hero__main">
           <div class="about-hero__name">
             <h1>{{ APP_NAME }}</h1>
@@ -195,6 +207,9 @@ const CREDITS: { name: string; url: string; noteKey: MessageKey }[] = [
         <span v-else class="about-env__item">{{ t('about.env.disconnected') }}</span>
       </div>
     </BorderGlow>
+
+    <!-- 产品导览浮层：hero logo 点击打开（与「我」页重看入口、首次启动自动弹同组件） -->
+    <ProductTour v-model="tourOpen" />
   </section>
 </template>
 
@@ -208,7 +223,23 @@ const CREDITS: { name: string; url: string; noteKey: MessageKey }[] = [
 
 /* ── hero ── */
 .about-hero { display: flex; align-items: center; gap: 20px; padding: 26px 28px; }
-.about-hero__logo { width: 64px; height: 64px; flex-shrink: 0; }
+/* logo 是新手引导入口（button 壳）：悬停微放大提示可点，风格对齐原侧边栏 logo */
+.about-hero__logo-btn {
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+  flex-shrink: 0;
+  border-radius: 16px;
+}
+.about-hero__logo-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.about-hero__logo-btn:hover .about-hero__logo { transform: scale(1.08); }
+.about-hero__logo {
+  width: 64px; height: 64px; flex-shrink: 0;
+  transition: transform calc(var(--duration-2, 0.18s) * var(--motion-scale, 1));
+}
 .about-hero__name { display: flex; align-items: center; gap: 10px; }
 .about-hero__name h1 { margin: 0; font-size: 24px; font-weight: 800; color: var(--text-primary); letter-spacing: 0.5px; }
 .about-ver {
