@@ -351,6 +351,11 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
             :label="t('filterPanel.other.hideOwned')"
             @update:model-value="(v: boolean) => store.setFilter('hideOwned', v)"
           />
+          <HlCheckbox
+            :model-value="store.excludeDlc"
+            :label="t('filterPanel.other.hideDlc')"
+            @update:model-value="(v: boolean) => store.setFilter('excludeDlc', v)"
+          />
         </div>
       </div>
     </div>
