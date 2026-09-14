@@ -41,6 +41,12 @@ WORK_DIR = RELEASE / "work"
 VENV_PY = SERVER / ".venv" / "Scripts" / "python.exe"
 
 SEED_BASENAME = "holdexar_seed.db"
+# 公共目录库模板（server/scripts/export_template_db.py 的落点同在 assets/seed/）。
+# 它与种子的分发路径不同：包内只留种子（sanitize 的 .db 白名单只认 SEED_BASENAME，
+# 模板库在打包产物里会被当残留剔除），因此它是**纯独立 Release 资产**——
+# 本脚本负责另存到 release/，由 publish_release.py 与其它产物一起上传。
+TEMPLATE_BASENAME = "holdexar_template.db"
+TEMPLATE_DB_SRC = SEED_DIR / TEMPLATE_BASENAME
 
 # 品牌常量与应用版本同源（app.core.app_info 是纯标准库模块，可直接导入；
 # kernel_release 同为纯标准库，故可在装依赖之前取到内核资产清单）
@@ -209,6 +215,24 @@ def stage_seed_asset() -> Path | None:
     return dest
 
 
+def stage_template_asset() -> Path | None:
+    """把公共目录库模板另存为 release/ 下的独立 Release 资产（有则带，无则跳过）。
+
+    模板库 = 新装用户的初始游戏商店目录（游戏/价格/价格历史/捆绑包/汇率等
+    公共目录数据，见 server/scripts/export_template_db.py）。还没导出过就没有
+    这份产物——构建不因它中断，只是本轮发布少一件资产。
+    """
+    if not TEMPLATE_DB_SRC.is_file():
+        print("[提示] 未找到公共目录库模板（assets/seed/holdexar_template.db），"
+              "本轮发布不含该资产；需要时跑 python server/scripts/export_template_db.py")
+        return None
+    RELEASE.mkdir(parents=True, exist_ok=True)
+    dest = RELEASE / TEMPLATE_BASENAME
+    shutil.copy2(TEMPLATE_DB_SRC, dest)
+    print(f"[发布] 模板资产：{dest.name}（{dest.stat().st_size / 1048576:.1f} MB）")
+    return dest
+
+
 def write_release_body(version: str) -> Path:
     """Release 说明模板：release/RELEASE_NOTES.md —— **人工编辑的唯一入口**。
 
@@ -250,6 +274,7 @@ def main() -> None:
     sanitize()
     version = app_version()
     stage_seed_asset()
+    stage_template_asset()
     zip_path, sha256 = make_zip(version)
     print(f"[完成] 应用包 sha256 {sha256}")
     write_release_body(version)
