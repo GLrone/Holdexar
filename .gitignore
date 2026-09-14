@@ -40,7 +40,7 @@ P?AN.md
 # ── 调研残留 / 外部参考资料（本机专用）──
 .tmp-research/
 reference-repos/
-# 根目录散落资料归档地：浏览器脚本脚本原文、调试截图（见 reference/README.md）
+# 根目录散落资料归档地：外部资料原文、调试截图（见 reference/README.md）
 reference/
 
 # ── E2E 截图 ──
@@ -84,8 +84,10 @@ dist/
 release/
 *.spec.bak
 
-# ── 资产种子（二进制大文件不进 git）──
+# ── 随包资产（二进制大文件不进 git）──
+# seed = 汇率档案种子；clash = mihomo 内核 + GeoIP 数据 + 许可原文
 assets/seed/
+assets/clash/
 
 # ── 运行时数据 ──
 data/
@@ -151,10 +153,9 @@ dy-tour-e2e/
 
 # ── 外部平台爬虫 / 本机一次性诊断脚本 ──
 # 共同特征：含第三方平台签名协议实现，或硬编码本机绝对路径
-# （E:\本机目录、E:\本机目录）。入库后对任何其他 clone 都是坏引用——
-# 例如 test_外部平台_proxy.py 会 import 下面第一个模式覆盖的文件。
-# 模式写成 外部平台*.py 而非 外部平台_*.py：后者要求 外部平台 后必须跟下划线，
-# 会漏掉 外部平台403_steam_check.py（该文件含 403 绕行逻辑，同样不该入库）。
+# （E:\本机目录、E:\本机目录 之类）。入库后对任何其他 clone 都是坏引用。
+# 通配须宽于「下划线形态」（窄模式要求紧跟下划线，会漏掉数字/前缀变体），
+# 带前缀的文件名不匹配通配，单独列出。
 server/scripts/外部平台*.py
 server/scripts/外部平台_watchdog.ps1
 server/scripts/probe_recover.py

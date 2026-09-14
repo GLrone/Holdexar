@@ -116,9 +116,11 @@ def test_allows_bare_identifier_and_placeholder_mentions(line):
         "data/holdexar.db",
         "data.old/notes.json",
         "release/Holdexar-win64.zip",
-        "reference/参考脚本s/x.txt",
+        "reference/notes/x.txt",
         "secrets/fx_maintenance.env",
         "assets/seed/holdexar_seed.db",
+        "assets/clash/mihomo.exe",  # 随包内核资产（二进制不进库，走 Release/脚本补齐）
+        "assets/clash/geoip.dat",
         ".tmp-pytest/x/test.db",
         "gui-test-screenshots/a.png",
         "server/data/holdexar.db-wal",  # 嵌套位置：由扩展名规则兜住
