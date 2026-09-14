@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from fastapi import APIRouter, HTTPException
@@ -56,9 +57,11 @@ async def list_accounts() -> list[dict]:
 
 @router.put("/cookies", response_model=AccountStatus)
 async def save_cookies(payload: SteamCookiesPayload) -> AccountStatus:
-    """绑定 / 换绑 Cookie（upsert 账号 + 置当前账号）并立即试抓一次钱包。
+    """绑定 / 换绑 Cookie（upsert 账号 + 置当前账号）并拉起全量数据拉取。
 
     新 SteamID = 新增账号；已有 SteamID = 该账号换绑 Cookie。均置为当前账号。
+    绑定响应内同步试抓钱包（顶栏余额要立刻可见），随后**后台依次**拉全
+    该账号数据（愿望单/已购 → 账单），见 `_post_bind_fetch`。
     """
     raw = (payload.cookies or "").strip()
     if not raw:
@@ -79,28 +82,47 @@ async def save_cookies(payload: SteamCookiesPayload) -> AccountStatus:
     if not sync.get("ok"):
         logger.info("[account] Cookie 保存成功但首次抓取失败：%s", sync.get("error"))
 
-    # 账单自动同步：后台任务触发（全量翻页较慢，不阻塞绑定响应）。
-    # 多账号语义：账单跟随**主账号**（bills 表无 steamid 维度，混流即数据污染），
-    # 绑二号/切号不触发；主账号换绑 Cookie 时重拉一次。
-    if result["steam_id"] == await service.get_primary_steam_id():
-        async def _bills_background_sync() -> None:
+    # 绑定后置全量拉取：后台任务**依次**抓全该账号数据，不阻塞绑定响应。
+    # 原先只主账号触发账单同步，愿望单/已购要等 15min 定时拍——用户看到的
+    # 是「绑了但游戏库/账单不来」。依次口径：
+    #   ① 愿望单 + 已购库（sync_account：差异入库 + 新增条目按自动价格链
+    #      开关即时首爬，与 15min 定时同步同口径）；
+    #   ② 账单（跟随**主账号**：bills 表无 steamid 维度，混流即数据污染，
+    #      绑二号/切号不触发；主账号换绑时重拉一次）。
+    steam_id = result["steam_id"]
+    is_primary = steam_id == await service.get_primary_steam_id()
+
+    async def _post_bind_fetch() -> None:
+        try:
+            from app.core.scheduler import price_auto_enabled
+            from app.domains.wishlist import service as wishlist_service
+
+            auto_crawl = await price_auto_enabled()
+            r = await wishlist_service.sync_account(steam_id, auto_crawl=auto_crawl)
+            logger.info(
+                "[account] 绑定后同步 %s：愿望单新增 %s 款 / 已购新增 %s 款（活跃 %s）",
+                steam_id, r.get("added"), r.get("addedOwned"), r.get("active"),
+            )
+        except Exception:  # noqa: BLE001 —— 失败由 15min 定时同步兜底
+            logger.exception("[account] 绑定后愿望单/已购同步异常（定时任务将兜底）")
+
+        if not is_primary:
+            return
+        try:
             from app.domains.bills import service as bills_service
 
-            try:
-                r = await bills_service.sync_bills(force=True)
-                if r.get("ok"):
-                    logger.info(
-                        "[account] 主账号绑定触发账单同步：history %s 行 / licenses %s 行",
-                        r.get("historyRows"), r.get("licenseRows"),
-                    )
-                elif r.get("status") != "no_cookie":
-                    logger.info("[account] 主账号绑定触发账单同步失败：%s", r.get("error"))
-            except Exception:  # noqa: BLE001
-                logger.exception("[account] Cookie 绑定触发账单同步异常")
+            r = await bills_service.sync_bills(force=True)
+            if r.get("ok"):
+                logger.info(
+                    "[account] 绑定后账单同步：history %s 行 / licenses %s 行",
+                    r.get("historyRows"), r.get("licenseRows"),
+                )
+            elif r.get("status") != "no_cookie":
+                logger.info("[account] 绑定后账单同步失败：%s", r.get("error"))
+        except Exception:  # noqa: BLE001 —— 失败由 30min 定时同步兜底
+            logger.exception("[account] 绑定后账单同步异常（定时任务将兜底）")
 
-        import asyncio
-
-        asyncio.get_running_loop().create_task(_bills_background_sync())
+    asyncio.get_running_loop().create_task(_post_bind_fetch())
 
     status = await service.get_status()
     status["sync_error"] = "" if sync.get("ok") else sync.get("error", "未知错误")
