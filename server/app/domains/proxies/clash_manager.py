@@ -197,8 +197,11 @@ def subscription_auto_name(headers: httpx.Headers, url: str) -> str | None:
     return None
 
 
-# 机场面板普遍校验 UA：httpx 默认 UA 会被 403，伪装 Clash 客户端（内核同款标识）
-_SUB_HEADERS = {"User-Agent": "mihomo/1.19.20"}
+# 机场面板普遍校验 UA：httpx 默认 UA 会被 403，伪装 Clash 系客户端（内核拉取
+# provider 时的同款标识）。**必须含 "clash" 关键字**——面板按 UA 分流订阅格式，
+# 含 clash/meta 才回 Clash YAML；只写 mihomo 会被当成通用客户端回落 base64
+# 节点表（本项目校验只认 YAML，「更新失败」即此因）。版本随 kernel_release。
+_SUB_HEADERS = {"User-Agent": f"clash.meta/{MIHOMO_VERSION.lstrip('v')}"}
 
 
 def _port_reachable(port: int, host: str = "127.0.0.1", timeout: float = 0.3) -> bool:
@@ -213,26 +216,36 @@ def _port_reachable(port: int, host: str = "127.0.0.1", timeout: float = 0.3) ->
 
 
 def _download_attempts(
-    runtime_port: int | None = None, proxy_url: str | None = None
+    runtime_port: int | None = None, proxy_url: str | list[str] | None = None
 ) -> list[tuple[str | None, str]]:
-    """下载通道链：直连 → 本内核代理 → 本地常见混合端口 → 指定代理。
+    """下载通道链：直连 → 本内核代理 → 项目保存的可用代理 → 本地常见混合端口。
 
     订阅/内核下载全是"鸡生蛋"场景：首次添加订阅时本内核必然没跑
     （无 config.yaml 起不来），面板域名又多被墙——直连是唯一通道时
-    必挂。用户桌面常有 Clash Verge 等在跑（混合端口 7890/7897），
-    试绑探测可用即借道，不依赖系统代理开关（httpx 不读 Windows
-    注册表代理）。
+    必挂。
+
+    **直连永远是第一条**：订阅面板绝大多数时候直连就能拿到，先走代理
+    等于把一次稳定的本地往返换成一次听天由命的外网往返。代理只在直连
+    失败后才登场，且**项目自己保存的可用代理（内核端口/代理池）排在外
+    部混合端口之前**——自己管理、自己体检过的出口优先于借道用户自启的
+    Verge（后者只探端口在听，出口是否可用无人担保）。
+
+    `proxy_url` 可传单个 URL，也可传 URL 列表（逐个作为后续通道）。
+    传列表是给「项目保存的可用代理」用的：池里挑一条也可能它自己正
+    失效，一次只试一条等于把「借道」变成掷骰子。
     """
     attempts: list[tuple[str | None, str]] = [(None, "直连")]
     if runtime_port:
         attempts.append((f"http://127.0.0.1:{runtime_port}", "经内核代理"))
+    saved = [proxy_url] if isinstance(proxy_url, str) else list(proxy_url or [])
+    for url in saved:
+        if url and url not in [a[0] for a in attempts]:
+            attempts.append((url, "经已保存代理"))
     for port in (7890, 7897):
         if port == runtime_port:
             continue
         if _port_reachable(port):
             attempts.append((f"http://127.0.0.1:{port}", f"本地混合端口 {port}"))
-    if proxy_url and proxy_url not in [a[0] for a in attempts]:
-        attempts.append((proxy_url, "指定代理"))
     return attempts
 
 
@@ -603,7 +616,7 @@ class ClashRuntime:
         return self.status()
 
     def _download_attempts(
-        self, proxy_url: str | None = None
+        self, proxy_url: str | list[str] | None = None
     ) -> list[tuple[str | None, str]]:
         """实例包装：补上本内核运行端口后走模块级通道链。"""
         running = self.status()["running"] and self.port
@@ -632,12 +645,14 @@ class ClashRuntime:
                 logger.warning("订阅头拉取失败（%s）：%s", label, e)
         return None
 
-    async def download_subscription(self, sub_url: str, data_dir: Path, proxy_url: str | None = None) -> dict:
+    async def download_subscription(self, sub_url: str, data_dir: Path, proxy_url: str | list[str] | None = None) -> dict:
         """下载用户订阅 yaml 到 data/clash/config.yaml。
 
-        链式引导（对齐旧爬虫脚本）：直连失败且内核已在跑时，经本地混合
-        端口重试一次；全部失败回退上次成功下载的本地缓存。订阅面板域名
-        多数被墙，直连成功纯属侥幸。
+        通道链（_download_attempts）：**直连优先**，失败后依次经本内核代理、
+        本地混合端口、以及调用方传入的已保存可用代理（可多条）。订阅面板
+        域名多数被墙，直连成功纯属侥幸——但侥幸仍是第一选择，代理是兜底
+        而不是默认路径。
+        全部失败回退上次成功下载的本地缓存。
         返回 {path, title, userinfo, nodes, cached}；title 取自 profile-title
         响应头（订阅名），userinfo 为 subscription-userinfo 流量头原文。
         """
