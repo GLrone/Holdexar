@@ -170,14 +170,20 @@ async def lifespan(_: FastAPI):
         logger.exception("排序缓存初始化失败（不阻塞启动）")
 
     # 随包内核就位：mihomo 与 GeoIP 数据随发行包分发，复制进 data/clash/
-    # （只补缺失文件）。必须早于内核自启——自启与代理策略都以内核就位为前提。
-    # 失败不阻断启动：前端「内核缺失」态与自动安装入口仍可兜底。
+    # （GeoIP 只补缺失；内核低版本时升级替换，见 clash_manager）。必须早于
+    # 内核自启——自启与代理策略都以内核就位为前提。失败不阻断启动：前端
+    # 「内核缺失」态与自动安装入口仍可兜底。-v 版本探测走子进程，放线程池
+    # 不占事件循环。
     from app.domains.proxies import clash_manager
 
     try:
-        installed = clash_manager.ensure_kernel(get_settings().data_dir)
+        installed = await asyncio.to_thread(
+            clash_manager.ensure_kernel, get_settings().data_dir
+        )
         if installed["copied"]:
             logger.info("随包 Clash 内核就位：%s", ", ".join(installed["copied"]))
+        if installed.get("upgraded"):
+            logger.info("随包内核已升级：%s", installed["upgraded"])
     except Exception:  # noqa: BLE001
         logger.exception("随包 Clash 内核就位失败（不阻塞启动）")
 
