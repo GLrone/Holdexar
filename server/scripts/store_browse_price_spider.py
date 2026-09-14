@@ -3,8 +3,9 @@
 本脚本只做「测试壳」：隔离库落地、生产快照种子、对账报告、CLI。
 抓取/解析/落库/**编排**零复刻——run() 把目标 appid 与代理配置交给生产
 runner.run_crawl，多协程 worker 池（CrawlerScheduler）、IP 循环（每任务独立
-Session 迫使 Clash 换出口 + 失败换代理）、429 全局熔断、元数据/CIS 预取、
-捆绑包 lane 全部继承生产实现；对账通过即代表生产链路可用。
+Session 迫使 Clash 换出口 + 失败换代理）、429 全局熔断、元数据/CIS 预取
+全部继承生产实现；对账通过即代表生产链路可用。捆绑包抓取不在 run_crawl
+内（链尾全量刷新独立通道），本脚本不覆盖。
 
 用法（在 server/ 目录下）:
     .venv/Scripts/python.exe scripts/store_browse_price_spider.py --fresh          # 清库重跑全量
@@ -403,7 +404,7 @@ async def run(args) -> int:
 
     # ── 编排全权委托生产 runner.run_crawl（与 app.crawler CLI / 服务端 crawl
     #    service 同一条链路）：任务切批、元数据与 CIS 预取、多协程 worker 池、
-    #    Per-任务 Session 换出口 IP、429 熔断/退避/换代理、捆绑包 lane、
+    #    Per-任务 Session 换出口 IP、429 熔断/退避/换代理、
     #    PRESERVED 原值装载全在对面——本壳不复刻任何一处。PRESERVED 不许
     #    在这里抢先灌：run_crawl 开头的 reset_run_state 会清空，随后由它
     #    自己从隔离库重装。 ──

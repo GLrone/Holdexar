@@ -29,7 +29,7 @@ const crawl: Partial<Record<MessageKey, string>> = {
   /* Start a crawl */
   'crawl.start.desc':
     'Regions come from your Me page settings. First-time imports skip the sale pre-check; turn it on for refreshes to save requests.',
-  'crawl.start.scopeWishlist': 'Full wishlist',
+  'crawl.start.scopeWishlist': 'Whole watch pool',
   'crawl.start.scopeAppids': 'Specific AppIDs',
   'crawl.start.appidsPlaceholder': 'e.g. 620,105600',
   'crawl.start.button': 'Start task',
@@ -49,9 +49,9 @@ const crawl: Partial<Record<MessageKey, string>> = {
   'crawl.autoPrice.badgeOn': 'Auto on',
   'crawl.autoPrice.badgeOff': 'Manual',
   'crawl.autoPrice.tip':
-    'Turn this off to stop every scheduled crawl: the 6-hourly refresh, failed-price repair, board backfill and first-crawl of new entries. Manual crawls and account sync (membership only) are unaffected.',
+    'Turn this off to stop scheduled price updates: the 6-hourly refresh (bundles included), failed-price repair and first-crawl of new entries. Board backfill and manual crawls are unaffected (account sync keeps membership in sync only).',
   'crawl.autoPrice.on': 'Auto price updates on: prices are crawled every 6 hours on the anchor grid',
-  'crawl.autoPrice.off': 'Auto price updates off: all scheduled crawls stopped; prices update manually',
+  'crawl.autoPrice.off': 'Auto price updates off: scheduled price refresh stopped — prices update manually',
   'crawl.autoPrice.failed': 'Could not save the setting — please try again',
 
   /* Bundle import */
@@ -61,10 +61,9 @@ const crawl: Partial<Record<MessageKey, string>> = {
   'crawl.bundle.refreshed': 'Refreshed: {name}',
   'crawl.bundle.imported': 'Imported: {name}',
 
-  /* Bulk import (crawled into the library as monitoring data; never joins
-     the wishlist or the watch pool) */
+  /* Bulk import (joins the watch pool, then a first crawl) */
   'crawl.bulk.desc':
-    'Paste Steam store / SteamDB game links or bare AppIDs (separated by spaces, commas or newlines; duplicates are removed). Imported games are crawled once into the library as monitoring data — they do not join the wishlist or the watch pool; star a game on its card to keep watching it.',
+    'Paste Steam store / SteamDB game links or bare AppIDs (separated by spaces, commas or newlines; duplicates are removed). Importing adds the games to the watch pool and starts a first crawl — every game in the pool is crawled for prices; keep it on your Steam wishlist or star it to crawl it first.',
   'crawl.bulk.import': 'Import & monitor',
   'crawl.bulk.moreHidden':
     '{n} more entries omitted — see the Store page for the full list',
@@ -76,7 +75,7 @@ const crawl: Partial<Record<MessageKey, string>> = {
      and it came out as "FAVORITES_RESPONSE → favorites" — a transformation, which
      is not what the Chinese says. */
   'crawl.fav.desc':
-    'Paste the whole favorites list exported from the browser console (the <code>favorites</code> JSON inside <code>FAVORITES_RESPONSE</code> — an array of IDs or objects). Games not in the library yet are crawled once as monitoring data — nothing joins the wishlist or the follow list; star individual games to keep watching them.',
+    'Paste the whole favorites list exported from the browser console (the <code>favorites</code> JSON inside <code>FAVORITES_RESPONSE</code> — an array of IDs or objects). Importing adds the games to the watch pool; games not in the library yet are crawled once as monitoring data.',
   'crawl.fav.import': 'Import favorites',
   'crawl.fav.placeholder':
     '[2561580,1173800,1173820,3837340]\nor [{"appid":620,"name":"Portal 2"},…]',
@@ -87,6 +86,7 @@ const crawl: Partial<Record<MessageKey, string>> = {
   'crawl.import.detectedInvalid': '{n} unrecognized',
   'crawl.import.added': '{n} newly imported',
   'crawl.import.alreadyTracked': '{n} already in library',
+  'crawl.import.poolAdded': '{n} added to the pool',
   'crawl.import.unrecognized': 'Unrecognized {n}',
   'crawl.import.invalid': 'Invalid {n}',
   'crawl.import.firstCrawlStarted': 'First crawl started',
@@ -151,6 +151,7 @@ const crawl: Partial<Record<MessageKey, string>> = {
   'crawl.kind.backfill': 'Orphan backfill',
   'crawl.kind.import': 'Bulk import',
   'crawl.kind.favImport': 'Favorites import',
+  'crawl.kind.poolAdd': 'Pool add',
 }
 
 export default crawl

@@ -383,49 +383,6 @@ class DbWriter:
             logger.error("查询已知 bundle 失败: %s", e)
             return set()
 
-    async def get_pending_bundle_ids(self, stale_before: datetime) -> list[int]:
-        """无区域价的捆绑包（发现桩 / 上次抓取失败），播种给单协程 lane。
-
-        updated_at 早于 stale_before（或 NULL）才播——24h 失败冷却，
-        防止下架/锁区的死包每轮空转 42 区超时；成功抓取后有价格行，
-        不再入选。
-        """
-        try:
-            async with get_session_factory()() as session:
-                has_price = (
-                    select(BundleRegionPrice.bundle_id)
-                    .where(BundleRegionPrice.bundle_id == Bundle.bundle_id)
-                    .exists()
-                )
-                rows = (
-                    await session.execute(
-                        select(Bundle.bundle_id).where(
-                            ~has_price,
-                            or_(
-                                Bundle.updated_at.is_(None),
-                                Bundle.updated_at < stale_before,
-                            ),
-                        )
-                    )
-                ).scalars().all()
-                return [int(b) for b in rows]
-        except Exception as e:
-            logger.error("查询待爬捆绑包失败: %s", e)
-            return []
-
-    async def touch_bundle_attempt(self, bundle_id: int) -> None:
-        """捆绑包 lane 尝试时间戳（失败也落）：播种冷却判据，防死包每轮空转。"""
-        try:
-            async with get_session_factory()() as session:
-                await session.execute(
-                    update(Bundle)
-                    .where(Bundle.bundle_id == int(bundle_id))
-                    .values(updated_at=_naive(get_beijing_time_obj()))
-                )
-                await session.commit()
-        except Exception as e:
-            logger.error("捆绑包尝试时间戳失败 %s: %s", bundle_id, e)
-
     async def upsert_bundle_candidate(
         self, bundle_id: int, name: str, app_ids: list[int]
     ) -> None:
@@ -462,8 +419,8 @@ class DbWriter:
         """捆绑包发现桩落库（游戏条目 purchase_options 白送的数据）。
 
         只 INSERT 库内没有的包（on_conflict_do_nothing）：既有完整主档不
-        覆盖——发现渠道只负责「把新包带进门」，价格/封面/appids 由单协程
-        lane 播种整区抓取补齐（get_pending_bundle_ids 捞无价包）。
+        覆盖——发现渠道只负责「把新包带进门」，无价桩随 6h 主轮链尾的
+        全量刷新（bundles.refresh_bundles）整区抓取补齐。
         app_ids 只存本游戏一个 id 当种子，抓取时会被 included_appids 校正。
 
         返回新插入数（调用方做发现计数）。

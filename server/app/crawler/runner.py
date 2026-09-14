@@ -24,7 +24,6 @@ from .config import DEFAULT_WORKER_COUNT, HTTP_TIMEOUT
 from .http_client import SteamHttpClient
 from .router import CrawlerRouter
 from .scheduler import CrawlerScheduler
-from .handlers.bundle_handler import handle_bundle_task
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +44,6 @@ class CrawlRunConfig:
 def build_router() -> CrawlerRouter:
     router = CrawlerRouter()
     router.handle("app")(bs.handle_browse_price_task)
-    # 捆绑包 lane 任务：单协程并行抓价（发现即爬 + 播种无价包）
-    router.handle("bundle")(handle_bundle_task)
     return router
 
 
@@ -110,25 +107,10 @@ async def run_crawl(
         target_ids, regions, bs.EXTRAS_ENABLED
     )
 
-    # ── 捆绑包 lane 播种：无区域价的捆绑包（发现桩/上次失败 24h 冷却后
-    # 重试），与 app 任务并行、全程单协程、排干自动收尾 ──
-    from datetime import datetime, timedelta
-
-    try:
-        pending_bundles = await db.get_pending_bundle_ids(
-            datetime.utcnow() - timedelta(hours=24)
-        )
-    except Exception:  # noqa: BLE001
-        pending_bundles = []
-    lane_tasks = [{"type": "bundle", "id": bid} for bid in pending_bundles]
-    if lane_tasks:
-        logger.info("[捆绑包lane] 播种 %d 个无价捆绑包（单协程并行）", len(lane_tasks))
-
     logger.info(
-        "任务就绪：常规 %d + 预构建 %d + 捆绑包lane %d | appids=%d regions=%s workers=%d proxy=%s",
+        "任务就绪：常规 %d + 预构建 %d | appids=%d regions=%s workers=%d proxy=%s",
         len(_build_app_tasks(target_ids, regions, bs.EXTRAS_ENABLED)),
         len(pre_tasks or []),
-        len(lane_tasks),
         len(target_ids),
         ",".join(regions),
         config.workers,
@@ -163,7 +145,7 @@ async def run_crawl(
             router, http_client, db, worker_count=config.workers, stop_event=stop_event,
             failure_ledger=bs.FAILED_TASKS,
         )
-        await scheduler.run(tasks + lane_tasks, session)
+        await scheduler.run(tasks, session)
 
         done, ok, failed = scheduler.counts()
         return {

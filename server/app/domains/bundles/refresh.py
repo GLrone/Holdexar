@@ -1,11 +1,14 @@
-"""bundles 刷新服务：按 CC_LIST 逐区抓取捆绑包价格 → 落 bundles/bundle_region_prices。
+"""bundles 刷新服务：按监控区抓取捆绑包价格 → 落 bundles/bundle_region_prices。
 
 抓取层为 IStoreBrowseService/GetItems/v1（与 app 链路 app/crawler/browse_store 同源）：
 bundleid / packageid 与 appid 一样进 `ids` 数组，单区一发 ≤400 条。与旧链路
 （逐区 ajaxresolvebundles → packagedetails 降级）的关键差异：
 
+- **抓取区 = 监控启用区**（「我」页勾选，与游戏侧同一口径），不再全区全发；
+  南亚（CC_LIST 的 pk 聚合位）按 Steam 实际拆巴基斯坦（pk）/ 孟加拉（bd）
+  两个独立区各发一次、各落一行（展示层按追踪位合并放行、取两区更低价）。
 - **请求数**：旧链路每包每区一发（148 包 × 41 区 ≈ 6068 发）；新接口整表每区一发
-  （41 发，URL ≈3.4KB）。
+  （监控区数发，URL ≈3.4KB）。
 - **身份直给**：`item_type`（1=Sub / 2=Bundle）与 `store_url_path`（sub/… vs
   bundle/…）即 Steam 权威身份，不再需要「us 区基准判定整包身份 → 全区沿用」的
   双轨探测（同号 sub/bundle 混写即该探测的失真场景）。
@@ -49,10 +52,34 @@ _CRAWLABLE_TYPES = {"game", "dlc"}
 # 进度单调递减，不丢不重
 _PRECHECK_PER_RUN = 30
 
+# 南亚拆区：CC_LIST 的 pk 是聚合"南亚"追踪位，Steam 侧巴基斯坦（pk）与
+# 孟加拉（bd）是两个独立区——启用南亚时两区各发一次、各落一行，展示层
+# 按追踪位合并放行（PK/BD 同进同出，最低价取两区更低价）。
+# BD 不在 CC_LIST（不是独立追踪位），币种随南亚位（USD）。
+_SOUTH_ASIA_EXTRA = {"pk": ("bd",)}
 _CC_CURRENCY = {cc: cur for cc, _, cur in CC_LIST}
+_CC_CURRENCY.update(
+    {extra: _CC_CURRENCY["pk"] for extra in _SOUTH_ASIA_EXTRA["pk"]}
+)
 # 新接口请求参数（语言固定 english：名称与 app 链路同口径，区域价与语言无关）
 BROWSE_LANG = "english"
 BROWSE_TIMEOUT = 20
+
+
+async def _bundle_fetch_ccs() -> list[str]:
+    """本次捆绑包抓取的 cc 列表：监控启用区 + 南亚拆区展开。
+
+    与游戏侧同口径——只抓「我」页勾选的区（全禁用由 effective_regions 抛
+    ValueError，调用方按跳过语义处理；手动导入转 400）。南亚（pk 聚合位）
+    拆成 pk / bd 两次请求见 _SOUTH_ASIA_EXTRA。
+    """
+    from app.domains.regions.service import effective_regions
+
+    ccs: list[str] = []
+    for code in await effective_regions(None):
+        ccs.append(code)
+        ccs.extend(_SOUTH_ASIA_EXTRA.get(code, ()))
+    return ccs
 
 
 async def _strategy_proxy() -> str | None:
@@ -214,36 +241,43 @@ async def _fetch_regions_batched(
     session: aiohttp.ClientSession,
     want: list[tuple[int, int | None]],
     proxy: str | None,
+    ccs: list[str] | None = None,
 ) -> dict[int, list[dict]]:
     """整表逐区一发：want=[(bundle_id, item_kind)] → {bundle_id: 区域行}。
 
-    每区按形态（bundleid / packageid）各发，全区并发；单发超 400 条或 URL 超长
-    由 plan_id_batches 自动再切。请求失败的区不写行（下轮重试），锁区照写 locked，
-    未收录（伪造 id）不写行。
+    抓取区（ccs，缺省取监控启用区 + 南亚拆区展开）每区按形态（bundleid /
+    packageid）各发；单发超 400 条或 URL 超长由 plan_id_batches 自动再切。
+    全部（区 × 形态 × 批）请求一次 fan-out 并发，不再区内串行。请求失败的区
+    不写行（下轮重试），锁区照写 locked，未收录（伪造 id）不写行。
     """
     groups: dict[str, list[int]] = {}
     for bid, item_kind in want:
         groups.setdefault(_browse_kind(bid, item_kind), []).append(int(bid))
 
-    out: dict[int, list[dict]] = {}
+    fetch_ccs = list(ccs) if ccs is not None else await _bundle_fetch_ccs()
 
-    async def one_region(cc: str) -> None:
+    plans: list[tuple[str, str, list[dict]]] = []
+    for cc in fetch_ccs:
         for kind, ids in groups.items():
-            batches = bs.StoreBrowseAPI.plan_id_batches(
+            for batch in bs.StoreBrowseAPI.plan_id_batches(
                 [{kind: bid} for bid in ids], cc, BROWSE_LANG, True,
                 bs.DEFAULT_BATCH_SIZE,
-            )
-            for batch in batches:
-                batch_ids = [int(next(iter(s.values()))) for s in batch]
-                items = await _fetch_browse_region(session, batch, cc, proxy)
-                if items is None:
-                    continue
-                for bid, item in _align_items(items, batch_ids):
-                    row = _browse_row(item, bid, cc, kind)
-                    if row is not None:
-                        out.setdefault(bid, []).append(row)
+            ):
+                plans.append((cc, kind, batch))
 
-    await asyncio.gather(*(one_region(cc) for cc, _, _ in CC_LIST))
+    async def one(cc: str, kind: str, batch: list[dict]):
+        items = await _fetch_browse_region(session, batch, cc, proxy)
+        return cc, kind, batch, items
+
+    out: dict[int, list[dict]] = {}
+    for cc, kind, batch, items in await asyncio.gather(*(one(*p) for p in plans)):
+        if items is None:
+            continue
+        batch_ids = [int(next(iter(s.values()))) for s in batch]
+        for bid, item in _align_items(items, batch_ids):
+            row = _browse_row(item, bid, cc, kind)
+            if row is not None:
+                out.setdefault(bid, []).append(row)
     return out
 
 
@@ -251,7 +285,7 @@ async def _fetch_bundle_regions(
     session: aiohttp.ClientSession, bundle_id: int, proxy: str | None,
     *, force_package: bool = False,
 ) -> list[dict]:
-    """整包抓取（单包出口：导入 / lane / 刷新共用）。
+    """整包抓取（单包出口：手动导入共用，抓取区=监控启用区）。
 
     形态：force_package（/sub/ 链接）→ 直接按 packageid 问；其余先按
     bundleid 问，**一条真实条目都没有**（未收录）再按 packageid 兜一次——数字 ID
@@ -316,7 +350,7 @@ async def _upsert_bundle_rows(
     baseline = max(regions, key=lambda r: len(r.get("app_ids") or []))
     baseline_appids = baseline.get("app_ids") or []
     if not allow_singleton and len(set(baseline_appids)) < 2:
-        # 单品：删净既有主档/区域价（发现桩+lane 抓价后到此甄别）
+        # 单品：删净既有主档/区域价（发现桩经链尾刷新抓价后到此甄别）
         async with get_session_factory()() as db:
             await db.execute(
                 delete(BundleRegionPrice).where(
@@ -404,11 +438,18 @@ async def _upsert_bundle_rows(
 
 
 async def refresh_bundles() -> dict:
-    """全量刷新捆绑包：库内所有包**每区一发**（≤400 条）→ upsert 主档 + 区域价。"""
+    """全量刷新捆绑包：库内所有包**监控区整表每区一发**（≤400 条）→ upsert。
+
+    同时承担「无价桩首抓」职责：发现的捆绑包（游戏爬取 purchase_options
+    落下的无价桩）就在全量表内，随同一批请求完成首抓——不需要独立的
+    逐包播种通道。抓取区 = 监控启用区（南亚 pk/bd 双发），全禁用时由
+    effective_regions 抛 ValueError（链尾按跳过语义、手动导入转 400）。
+    """
     rates = await get_rates()  # {currency: rate_to_cny}
     rate_map = dict(rates) if isinstance(rates, dict) else {}
     rate_map.setdefault("CNY", 1.0)
     proxy = await _strategy_proxy()
+    ccs = await _bundle_fetch_ccs()
 
     async with get_session_factory()() as session:
         want = [
@@ -423,8 +464,17 @@ async def refresh_bundles() -> dict:
                 )
             ).all()
         ]
+        priced = {
+            int(b)
+            for b in (
+                await session.execute(
+                    select(BundleRegionPrice.bundle_id).distinct()
+                )
+            ).scalars()
+        }
     if not want:
         return {"ok": False, "detail": "库内无捆绑包（先从原项目导入或添加）"}
+    pending_ids = {bid for bid, _kind in want if bid not in priced}
 
     now = datetime.utcnow()
     updated_bundles = 0
@@ -432,7 +482,7 @@ async def refresh_bundles() -> dict:
 
     connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=60)
     async with aiohttp.ClientSession(connector=connector) as session:
-        rows_by_id = await _fetch_regions_batched(session, want, proxy)
+        rows_by_id = await _fetch_regions_batched(session, want, proxy, ccs=ccs)
         # 形态兜底：按库内形态问不到真实条目的包，换另一形态再问一次
         # （历史形态缺失/曾按错形态导入的包自愈；单区一发，代价可忽略）
         missing = [(bid, kind) for bid, kind in want if not rows_by_id.get(bid)]
@@ -442,13 +492,14 @@ async def refresh_bundles() -> dict:
                 for bid, kind in missing
             ]
             logger.info("[bundles] %d 个包按库内形态未命中，换形态兜底探测", len(flipped))
-            alt = await _fetch_regions_batched(session, flipped, proxy)
+            alt = await _fetch_regions_batched(session, flipped, proxy, ccs=ccs)
             for bid, _kind in missing:
                 if alt.get(bid):
                     rows_by_id[bid] = alt[bid]
 
     failed: list[int] = [bid for bid, _kind in want if not rows_by_id.get(bid)]
     dropped_singletons = 0
+    seeded = 0
     for bid, _kind in want:
         regions = rows_by_id.get(bid) or []
         if not regions:
@@ -458,11 +509,14 @@ async def refresh_bundles() -> dict:
             continue
         updated_bundles += 1
         updated_prices += len(regions)
+        if bid in pending_ids:
+            seeded += 1
 
     logger.info(
-        "捆绑包刷新完成：成功 %d/%d，区域价 %d 行，失败 %d 个，单品甄别剔除 %d 个（%d 区整表一发）",
+        "捆绑包刷新完成：成功 %d/%d，区域价 %d 行，失败 %d 个，单品甄别剔除 %d 个，"
+        "无价桩首抓 %d 个（%s 区整表一发）",
         updated_bundles, len(want), updated_prices, len(failed),
-        dropped_singletons, len(CC_LIST),
+        dropped_singletons, seeded, "/".join(ccs),
     )
     result = {
         "ok": not failed,
@@ -471,6 +525,7 @@ async def refresh_bundles() -> dict:
         "regionPrices": updated_prices,
         "failed": failed,
         "droppedSingletons": dropped_singletons,
+        "seeded": seeded,
     }
     invalidate_bundles_cache()
     # ── 包内 appid 检测 → app 爬取队列联动 ──
@@ -575,48 +630,6 @@ async def import_bundle(text: str) -> dict:
     return result
 
 
-async def fetch_and_upsert_bundle(
-    session: aiohttp.ClientSession,
-    bundle_id: int,
-    rate_map: dict[str, float],
-    now: datetime | None = None,
-    *,
-    force_package: bool = False,
-) -> list[dict]:
-    """单包整区抓取 + 落库（crawler 捆绑包 lane 与本域共用出口）。
-
-    内部解析策略代理；返回抓到的区域行（空 = 抓取失败，调用方自行
-    决定重试语义——lane 层失败会 touch 尝试时间戳走 24h 冷却）。
-    库内形态已知（item_kind=1，如发现桩写明的 sub）时直接按该形态问，
-    避免先问 bundleid 撞上同号 bundle 产品的边缘场景。
-    """
-    if not force_package:
-        try:
-            async with get_session_factory()() as db:
-                kind = (
-                    await db.execute(
-                        select(Bundle.item_kind).where(Bundle.bundle_id == int(bundle_id))
-                    )
-                ).scalar_one_or_none()
-            if kind == 1:
-                force_package = True
-        except Exception:  # noqa: BLE001 —— 形态查询失败退回默认探测序
-            pass
-    proxy = await _strategy_proxy()
-    regions = await _fetch_bundle_regions(
-        session, bundle_id, proxy, force_package=force_package
-    )
-    if regions:
-        invalidate_bundles_cache()
-        if not await _upsert_bundle_rows(
-            bundle_id, regions, rate_map, now or datetime.utcnow()
-        ):
-            # 单品甄别剔除（发现桩带到此鉴别）：回空表让 lane 视为终态
-            # 失败并 touch 冷却，发现桩已删不会再重试
-            return []
-    return regions
-
-
 async def _fetch_app_type(
     session: aiohttp.ClientSession, appid: int, proxy: str | None
 ) -> tuple[str | None, str]:
@@ -718,7 +731,7 @@ async def _enqueue_new_bundle_apps() -> tuple[int, int]:
                 await db_writer.mark_non_game_type(appid, app_type)
                 skipped += 1
                 logger.info("[bundles] appid %s (%s) 为 %s → 打标跳过", appid, name[:30], app_type)
-            # appdetails 限速（原版 bundle 爬虫封面图三级缓存同样 0.3s 间隔）
+            # appdetails 限速（封面图三级缓存同为 0.3s 间隔）
             await asyncio.sleep(0.3)
     if probe_failed:
         logger.warning(
