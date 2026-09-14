@@ -1,9 +1,8 @@
 """bills 域测试：解析器纯函数 + 真实样本端到端对账。
 
-对账基准来自维护者本人的前作脚本（汇率导出脚本，非第三方代码）
-在两份 Steam_Report 真实账单转储上的实测输出，本模块的解析行为必须与
-之逐项一致。样本文件名含个人昵称，落在 汇率档案_DIR（环境变量，默认
-E:\\汇率档案），目录不存在时相关用例自动 skip。
+对账基准来自两份真实账单转储的历史实测输出，本模块的解析行为必须与之
+逐项一致。样本目录由环境变量 BILLS_SAMPLE_DIR 提供（未设置时相关用例
+自动 skip）。
 
 DB 用例隔离方式对齐 test_account_wallet.py：monkeypatch 临时库 session factory。
 """
@@ -28,15 +27,15 @@ from app.domains.bills.parser import (
 )
 from app.domains.bills import service as bills_service
 
-# 源样本目录（个人外部数据源，路径由环境变量 汇率档案_DIR 提供；未设置时对账用例 skip）
-汇率档案_DIR = Path(os.environ.get("汇率档案_DIR", ""))
-# 样本文件名按昵称区分（样本A/tree），真实文件名含个人昵称——
-# 由环境变量提供映射，未设且默认文件缺失时相关用例 skip
+# 源样本目录（个人外部数据源，路径由环境变量 BILLS_SAMPLE_DIR 提供；未设置时对账用例 skip）
+BILLS_SAMPLE_DIR = Path(os.environ.get("BILLS_SAMPLE_DIR", ""))
+# 样本文件名由环境变量映射（BILLS_SAMPLE_A / BILLS_SAMPLE_B）——
+# 未设置且默认文件缺失时相关用例 skip
 _SAMPLE_FILENAMES = {
-    "样本A": os.environ.get("汇率档案_SAMPLE_样本A", "bills_sample_2026-03-17.json"),
-    "tree": os.environ.get("汇率档案_SAMPLE_TREE", "bills_sample_2026-03-19.json"),
+    "a": os.environ.get("BILLS_SAMPLE_A", "bills_sample_a.json"),
+    "b": os.environ.get("BILLS_SAMPLE_B", "bills_sample_b.json"),
 }
-SAMPLES = {k: 汇率档案_DIR / f for k, f in _SAMPLE_FILENAMES.items()}
+SAMPLES = {k: BILLS_SAMPLE_DIR / f for k, f in _SAMPLE_FILENAMES.items()}
 
 
 def _load_sample(name: str) -> dict:
@@ -283,7 +282,7 @@ def test_english_report():
     assert parsed["cdk_games"][1]["acq"] == "gift"
 
 
-# ── 许可分类（《Steam 许可分类器》MATCH_CFG 四类同源）─────────
+# ── 许可分类（四类）─────────
 
 
 @pytest.mark.parametrize(
@@ -461,8 +460,8 @@ def test_steam_fetch_full_chain_matches_exporter_format():
     ("name", "game", "topup", "cdk", "spend", "refund"),
     [
         # 基准：源脚本实测输出
-        ("样本A", 143, 108, 140, 8442.51, 1435.42),
-        ("tree", 87, 41, 9, 4386.28, 1372.09),
+        ("a", 143, 108, 140, 8442.51, 1435.42),
+        ("b", 87, 41, 9, 4386.28, 1372.09),
     ],
 )
 def test_real_sample_parse(name, game, topup, cdk, spend, refund):
@@ -475,7 +474,7 @@ def test_real_sample_parse(name, game, topup, cdk, spend, refund):
     assert parsed["game_txs"], "解析产物为空"
     spend_any = sum(t["amount"] for t in parsed["game_txs"] if not t["is_refund"])
     assert spend_any > 0
-    if name == "样本A":
+    if name == "a":
         assert {t["currency"] for t in parsed["game_txs"]} == {"KZT", "CNY", "HKD"}
     else:
         assert {t["currency"] for t in parsed["game_txs"]} == {"USD", "RUB"}

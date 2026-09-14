@@ -107,7 +107,7 @@ def _filter_region_prices(
 
     - 未启用任何区 / 后端不可达 → 不过滤（对齐游戏卡 GPW「未启用即全部」语义）；
     - CN 恒保留（国区价是差价基准列）；
-    - 南亚：原版 pk（巴基斯坦）与 BD（孟加拉）是两个独立 Steam 区但共享"南亚"
+    - 南亚：pk（巴基斯坦）与 BD（孟加拉）是两个独立 Steam 区但共享"南亚"
       追踪位。本端爬虫 CC_LIST 只有 pk 位（BD 在 refresh 容灾时以 BD 落行）。
       启用集含 pk 时：PK、BD 两行都放行（有哪个显示哪个，最低价取两者更低价）；
       启用集不含 pk 时：两行都剔除。
@@ -147,7 +147,7 @@ def _aggregate(
     # ── 双产品隔离 ──
     # refresh 双轨降级按区混用 Bundle/Package API 时，同一 bundle_id 会出现两套
     # appids（bundle 本体 vs 同号 sub 的 appid 列表）。以 appids 最多的行为"主产品"
-    # （原版 baseline 语义），其余行若 appids 是主产品 appids 的子集之外的产品
+    # （baseline 语义），其余行若 appids 是主产品 appids 的子集之外的产品
     # （套娃行，见 bundle 61597 = sub 347440 污染），整行剔除——只保留与主产品
     # 同族（appids 与主基准有交集）的行，锁区判定/最低价不再被异种产品带偏。
     rows: list[BundleRegionPrice] = []
@@ -250,7 +250,7 @@ async def _load_all() -> tuple[list[Bundle], dict[int, list[BundleRegionPrice]],
 
 
 async def list_bundles() -> list[dict]:
-    """全量捆绑包列表（差价降序，对齐原版 df 排序）。
+    """全量捆绑包列表（差价降序）。
 
     区域价/最低价/差价按追踪区（crawl_regions 启用集）过滤——
     未启用任何区时全量展示（对齐游戏卡 GPW 语义）。
@@ -279,7 +279,7 @@ async def get_bundle_detail(bundle_id: int) -> dict | None:
 
     包内游戏现价是补齐计算器的求和数据源：区键大写，值含 minor 原价与
     cny_fen（price_status=ok）。游戏未入库（games 表无行）时 name 为 None，
-    前端回退 AppID 展示，且计算器按原版规则将无数据项自动排除。
+    前端回退 AppID 展示，且计算器按既定规则将无数据项自动排除。
     """
     bundles, prices_by_bundle, rates = await _load_all()
     bundle = next((b for b in bundles if b.bundle_id == bundle_id), None)
