@@ -14,7 +14,7 @@ from __future__ import annotations
 import platform
 
 # mihomo 版本：随包内核与网络下载共用；改版本只改这里。
-MIHOMO_VERSION = "v1.19.20"
+MIHOMO_VERSION = "v1.19.31"
 
 # 通道链：国内直连 GitHub 发布资产基本不可用，镜像优先、直连兜底。
 # 与 app/core/updater.py、scripts/fetch_seed.py 的镜像链同源，改动请三处对齐。

@@ -47,11 +47,82 @@ def bundled_clash_dir() -> Path:
     return get_settings().clash_dir
 
 
+_VERSION_RE = re.compile(r"v(\d+(?:\.\d+)+)")
+
+
+def parse_kernel_version(raw: str | None) -> tuple[int, ...] | None:
+    """mihomo -v 输出首行 → 点分元组：`Mihomo Meta v1.19.12 …` → (1, 19, 12)。
+
+    None = 无法识别（版本未知，调用方保守处理）。
+    """
+    m = _VERSION_RE.search(raw or "")
+    if not m:
+        return None
+    return tuple(int(part) for part in m.group(1).split("."))
+
+
+def _kernel_exe_version(exe_path: Path) -> tuple[int, ...] | None:
+    """就位内核的版本：跑 `-v` 解析（失败/超时/输出非 mihomo 格式 = None）。"""
+    return parse_kernel_version(kernel_version(exe_path))
+
+
+def _maybe_upgrade_kernel(kernel_path: Path) -> str | None:
+    """版本感知的内核换装：随包版本**高于**就位版本才替换，返回替换动作描述。
+
+    语义（升级不夺回）：
+    - 就位版本 < 随包版本 → 替换（发行包升内核后，老安装随更新获得新内核）；
+    - 就位版本 ≥ 随包版本 → 保留（用户手换更高版/自装同版，不替用户做决定）；
+    - 版本不可辨（-v 失败、非 mihomo 文件）→ 保留（看不清的文件不动它）；
+    - 内核进程在跑（本 runtime 实例或孤儿 mihomo）→ 保留（Windows 下运行中
+      的 exe 无法覆盖；启动链里 start() 会先 stop/清孤儿再走到这里，
+      真正撞上的只有 lifespan 启动期孤儿还活着的窗口，留给下次启动）。
+
+    GeoIP 数据不在此列：滚动数据无版本可比，维持只补缺失不覆盖。
+    """
+    exe = kernel_path / kernel_filename()
+    bundled_exe = bundled_clash_dir() / kernel_filename()
+    if not exe.is_file() or not bundled_exe.is_file():
+        return None
+    if runtime.status()["running"] or _kernel_process_alive():
+        return None
+    current = _kernel_exe_version(exe)
+    target = parse_kernel_version(MIHOMO_VERSION)
+    if current is None or target is None or current >= target:
+        return None
+    try:
+        shutil.copy2(bundled_exe, exe)
+    except OSError as e:  # noqa: BLE001 —— 文件锁/权限失败：保留旧内核继续可用
+        logger.warning("内核升级替换失败（保留现有 %s）：%s", current, e)
+        return None
+    logger.info("内核已升级：%s → %s", ".".join(map(str, current)), MIHOMO_VERSION)
+    return f"{'.'.join(map(str, current))} → {MIHOMO_VERSION}"
+
+
+def _kernel_process_alive() -> bool:
+    """内核进程存活探测：真孤儿（非本 runtime 实例）的兜底。
+
+    tasklist 快速过滤 mihomo 进程；查询失败（Windows 专属命令、非 Windows
+    环境等）返回 False——探测只是保守替换的额外闸门，失败不阻断补资产。
+    """
+    if not is_windows():
+        return False
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {kernel_filename()}", "/FO", "CSV", "/NH"],
+            capture_output=True, timeout=10,
+            encoding="utf-8", errors="replace",
+        ).stdout
+    except Exception:  # noqa: BLE001
+        return False
+    return kernel_filename().lower() in (out or "").lower()
+
+
 def _copy_bundled(kernel_path: Path, names: Sequence[str]) -> dict:
     """把随包目录里的 `names` 补齐进内核目录（只补缺失，同名一律不覆盖）。
 
-    「不覆盖」是刻意的：用户可能手动换了更高版本的内核、或自己更新过 GeoIP
-    数据，静默覆盖等于替用户做决定。返回 {"copied": [...], "missing": [...]}。
+    GeoIP 数据的「不覆盖」是刻意的：用户可能自己更新过数据，静默覆盖
+    等于替用户做决定。可执行文件的升级换代另走 _maybe_upgrade_kernel
+    （版本感知，见其 docstring）。返回 {"copied": [...], "missing": [...]}。
     """
     bundle = bundled_clash_dir()
     kernel_path.mkdir(parents=True, exist_ok=True)
@@ -76,18 +147,25 @@ def ensure_kernel_files(kernel_path: Path) -> dict:
     入参是**内核目录本身**（config.yaml 所在处，也是 mihomo `-d` 的工作目录）；
     以 data_dir 为入参的版本见 ensure_kernel()。
     """
-    return _copy_bundled(kernel_path, (kernel_filename(), *_GEO_FILES))
+    result = _copy_bundled(kernel_path, (kernel_filename(), *_GEO_FILES))
+    upgrade = _maybe_upgrade_kernel(kernel_path)
+    if upgrade:
+        result["upgraded"] = upgrade
+    return result
 
 
 def ensure_kernel(data_dir: Path) -> dict:
     """随包内核就位（data_dir 版本）：把内核与 GeoIP 数据补进 data/clash/。
 
     随包资产落到用户数据目录的唯一入口。返回
-    {"kernelReady": bool, "copied": [...], "missing": [...], "bundleDir": str}；
-    发行包缺内核（源码 clone 未补资产）时 kernelReady=False，由调用方决定
-    是回退网络下载还是提示用户。
+    {"kernelReady": bool, "copied": [...], "missing": [...], "bundleDir": str,
+     "upgraded": str | None}；发行包缺内核（源码 clone 未补资产）时
+    kernelReady=False，由调用方决定是回退网络下载还是提示用户。
     """
     result = _copy_bundled(kernel_dir(data_dir), (kernel_filename(), *_GEO_FILES))
+    upgrade = _maybe_upgrade_kernel(kernel_dir(data_dir))
+    if upgrade:
+        result["upgraded"] = upgrade
     ready = kernel_exe(data_dir).is_file()
     if result["copied"]:
         logger.info("随包内核资产已就位：%s", ", ".join(result["copied"]))
@@ -105,6 +183,7 @@ def ensure_kernel(data_dir: Path) -> dict:
         "kernelReady": ready,
         "copied": result["copied"],
         "missing": result["missing"],
+        "upgraded": upgrade,
         "bundleDir": str(bundled_clash_dir()),
     }
 
@@ -406,7 +485,8 @@ def download_kernel_linux(data_dir: Path) -> dict:
 def kernel_version(exe_path: Path) -> str | None:
     try:
         result = subprocess.run(
-            [str(exe_path), "-v"], capture_output=True, text=True, timeout=10
+            [str(exe_path), "-v"], capture_output=True, timeout=10,
+            encoding="utf-8", errors="replace",
         )
         first = (result.stdout or result.stderr).splitlines()
         return first[0] if first else None
