@@ -60,7 +60,8 @@ async def refresh_epic_free() -> dict:
 async def epic_free_offers(force: bool = False) -> dict:
     """当期 + 预告白送元素（封面/商店页/原价），仪表盘卡片数据源。
 
-    进程内缓存 30 分钟；force=1 跳过缓存强制拉取（调试用）。
+    快照缓存 30 分钟 + 过期后台刷新（冷启动先回落库快照，前端短轮询
+    自动覆盖）；force=1 跳过缓存强制拉取（调试用）。
     """
     return await service.epic_free_offers(force=force)
 
