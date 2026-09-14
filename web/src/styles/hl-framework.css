@@ -2124,20 +2124,31 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
 .hl-sidebar.is-collapsed {
   width: var(--sidebar-collapsed);
   padding: 20px 10px;
-  /* 收拢为静态图标栏：放开裁剪让 tooltip 溢出显示（悬停时才出现） */
-  overflow: visible;
+  /* 裁剪保持开启（继承基础规则）。旧实现为让折叠态 tooltip 溢出而放开
+     overflow——代价是导航项一多，nav 的自动最小高度回到内容高，把底部
+     收拢钮顶出视口，收起后再也点不回来（用户报告的「收起后无法打开」）。
+     tooltip 已改原生 title，这里恢复滚动语义。 */
 }
-.hl-sidebar.is-collapsed .hl-sb-nav { overflow: visible; }
+
+/* 头部行：品牌（logo + 品牌名）+ 展开态收起按键。旧实现的收拢钮在侧边栏
+   底部，导航项一多就被挤出视口——入口收敛到头部，永远可达。 */
+.hl-sb-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 18px;
+  flex-shrink: 0;
+}
 
 .hl-sb-brand {
   display: flex;
   align-items: center;
   gap: 12px;
-  margin-bottom: 20px;
   padding: 4px 8px;
-  flex-shrink: 0;
-  /* 品牌区是 button（点击弹新手教程）：剥掉原生按钮皮，视觉与旧 div 态一致 */
-  width: 100%;
+  /* 品牌区是 button（收起态点击展开）：剥掉原生按钮皮，视觉与旧 div 态一致。
+     占满头部剩余宽度，品牌名超长时在列内截断。 */
+  flex: 1 1 auto;
+  min-width: 0;
   background: none;
   border: none;
   font: inherit;
@@ -2169,36 +2180,46 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
   transform: rotate(8deg) scale(1.08);
 }
 /* 品牌文字区宽度 = 232 − 14×2(sidebar padding) − 8×2(brand padding) − 36(logo) − 12(gap)
-   ≈ 140px。中文副标题「Steam 多区价格监控终端」约 126px 一行放得下；
-   英文的 'Steam multi-region price terminal' 是 33 个字符、还要吃 uppercase 与
-   0.08em 字距（≈250px），**放不下**——原先这里是 `white-space: nowrap` +
-   `overflow: hidden` 且**没有 ellipsis**，英文下会从词中间硬切，看着像坏了。
-   改为：名字仍单行省略（它必须单行），副标题允许折行——语言无关的解法，
-   再来别的语言也不用再调。 */
-.hl-sb-brand__txt { overflow: hidden; }
+   副标题（品牌名下的站点标语）已移除：腾出的位置给品牌名与收起按键，
+   品牌名因此放大加粗，不再需要为标语预留两行。 */
+.hl-sb-brand__txt { overflow: hidden; min-width: 0; }
 .hl-sb-brand__name {
-  font-size: 15px;
-  font-weight: 700;
+  font-size: 17px;
+  font-weight: 800;
   letter-spacing: -0.03em;
   color: var(--text-primary);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.hl-sb-brand__sub {
-  font-size: 10px;
+
+/* 展开态收起按键（品牌名右侧）：与收起态品牌区的展开图标同一枚
+   sidebar 图标，两侧形态互为镜像 */
+.hl-sb-toggle {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
   color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  margin-top: 1px;
-  line-height: 1.35;
-  /* 最多两行：防将来某个语言的长文案把品牌区撑得挤掉导航 */
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  line-clamp: 2;
-  overflow: hidden;
+  cursor: pointer;
+  transition: color calc(var(--duration-2) * var(--motion-scale)),
+    border-color calc(var(--duration-2) * var(--motion-scale)),
+    background-color calc(var(--duration-2) * var(--motion-scale));
 }
+.hl-sb-toggle:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.hl-sb-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.hl-sidebar.is-collapsed .hl-sb-head { justify-content: center; }
 .hl-sidebar.is-collapsed .hl-sb-brand {
   display: grid;
   place-items: center;
@@ -2208,6 +2229,27 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
 .hl-sidebar.is-collapsed .hl-sb-brand__txt { display: none; }
 .hl-sidebar.is-collapsed .hl-sb-brand__logo { margin: 0 auto; }
 
+/* 收起态悬停：品牌图让位「侧边栏」图标（点击展开）。顶部入口永远可达，
+   不依赖可能被导航挤走的底部收拢钮；图标不旋转不浮起，稳定居中。 */
+.hl-sb-brand__expand {
+  display: none;
+  color: var(--text-secondary);
+}
+.hl-sidebar.is-collapsed .hl-sb-brand:hover {
+  background: var(--accent-soft);
+}
+.hl-sidebar.is-collapsed .hl-sb-brand:hover .hl-sb-brand__logo {
+  transform: none;
+}
+.hl-sidebar.is-collapsed .hl-sb-brand:hover .hl-sb-brand__logo-img,
+.hl-sidebar.is-collapsed .hl-sb-brand:hover .hl-sb-brand__logo-fallback {
+  display: none;
+}
+.hl-sidebar.is-collapsed .hl-sb-brand:hover .hl-sb-brand__expand {
+  display: block;
+  color: var(--accent);
+}
+
 .hl-sb-nav {
   flex: 1;
   overflow-y: auto;
@@ -2215,8 +2257,25 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
   display: flex;
   flex-direction: column;
   gap: 3px;
-  scrollbar-width: thin;
+  /* 滚动条默认隐藏，滚动时显形：组件侧 scroll/wheel 事件挂 .is-scrolling
+     （停手 1.2s 摘掉）。Firefox 走 scrollbar-width，Chromium/WebView2 走
+     ::-webkit-scrollbar 宽度切换。 */
+  scrollbar-width: none;
   scrollbar-color: var(--scroll-thumb) transparent;
+}
+.hl-sb-nav.is-scrolling { scrollbar-width: thin; }
+.hl-sb-nav::-webkit-scrollbar { width: 0; height: 0; }
+.hl-sb-nav.is-scrolling::-webkit-scrollbar { width: 6px; }
+.hl-sb-nav::-webkit-scrollbar-track { background: transparent; }
+.hl-sb-nav::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border-radius: 3px;
+}
+/* 滚动条两端的三角形箭头一律不渲染 */
+.hl-sb-nav::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
 }
 .hl-sb-group {
   font-size: 10px;
@@ -2288,30 +2347,9 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
   box-shadow: 0 0 0 2px var(--bg-card);
 }
 .hl-sidebar.is-collapsed .hl-sb-dot { top: 8px; right: 8px; }
-/* 折叠态 tooltip */
-.hl-sb-tip {
-  position: absolute;
-  left: calc(100% + 10px);
-  top: 50%;
-  transform: translateY(-50%) translateX(-4px);
-  background: var(--surface-float);
-  color: var(--text-primary);
-  font-size: 12px;
-  font-weight: 500;
-  padding: 5px 10px;
-  border-radius: 6px;
-  white-space: nowrap;
-  pointer-events: none;
-  opacity: 0;
-  border: 1px solid var(--border-soft);
-  box-shadow: var(--shadow-lg);
-  z-index: 100;
-  transition: opacity 0.2s ease, transform 0.2s ease;
-}
-.hl-sidebar.is-collapsed .hl-sb-item:hover .hl-sb-tip {
-  opacity: 1;
-  transform: translateY(-50%) translateX(0);
-}
+/* 折叠态自绘 tooltip 已废止：气泡要溢出侧边栏就需 overflow: visible，
+   那会破坏 nav 的最小高度语义（见 .hl-sidebar.is-collapsed 注释——收起后
+   收拢钮被挤出视口的根因）。收起态条目提示改走原生 title（HlSideNav 模板）。 */
 .hl-sidebar.is-collapsed .hl-sb-item__label { opacity: 0; width: 0; }
 .hl-sidebar.is-collapsed .hl-sb-item { justify-content: center; padding: 9px; }
 
@@ -2332,51 +2370,8 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
 .hl-sb-nav > :nth-child(14) { animation-delay: 0.7s; }
 .hl-sb-nav > :nth-child(n + 15) { animation-delay: 0.75s; }
 
-.hl-sb-foot {
-  padding-top: 10px;
-  border-top: 1px solid var(--border-soft);
-  flex-shrink: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  align-items: stretch;
-}
-/* 收拢侧边栏按键（底部胶囊钮） */
-.hl-sb-collapse-btn {
-  width: 100%;
-  height: 36px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  border: 1px solid var(--border-soft);
-  border-radius: 999px;
-  background: var(--bg-card);
-  color: var(--text-muted);
-  cursor: pointer;
-  transition: all 0.25s var(--ease-spring);
-  font-size: 12px;
-  font-weight: 500;
-  overflow: hidden;
-  white-space: nowrap;
-  font-family: inherit;
-}
-.hl-sb-collapse-btn:hover {
-  color: var(--accent);
-  border-color: var(--accent);
-  background: var(--accent-soft);
-  box-shadow: 0 2px 10px var(--accent-a15);
-}
-.hl-sb-collapse-btn svg {
-  width: 16px;
-  height: 16px;
-  flex-shrink: 0;
-  transition: transform 0.3s var(--ease-spring);
-}
-.hl-sb-collapse-btn:hover svg { transform: translateX(-2px); }
-.hl-sidebar.is-collapsed .hl-sb-collapse-btn { padding: 0; width: 36px; height: 36px; margin: 0 auto; }
-.hl-sidebar.is-collapsed .hl-sb-collapse-btn:hover svg { transform: translateX(2px); }
-.hl-sidebar.is-collapsed .hl-sb-collapse-btn .hl-sb-collapse-label { display: none; }
+/* 底部收拢按键（.hl-sb-foot / .hl-sb-collapse-btn）已移除：导航项多时它会被
+   溢出内容顶出视口，收起后就没法再展开。收起/展开统一走头部品牌区。 */
 
 /* ══════════ 顶栏主题切换按键（纯图标）══════════ */
 .hl-theme-btn {

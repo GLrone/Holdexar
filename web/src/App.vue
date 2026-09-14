@@ -261,14 +261,13 @@ async function manualRefreshWallet() {
 
 <template>
   <div class="app-shell">
-    <!-- 侧边栏（HlSideNav：分组导航 + 收拢按键 + 折叠态 tooltip；品牌区点击 → 新手教程） -->
+    <!-- 侧边栏（HlSideNav：分组导航 + 收拢按键；收起态品牌区悬停换
+         「侧边栏」图标，点击展开——新手引导入口已迁至「关于」页 logo） -->
     <HlSideNav
       v-model:collapsed="collapsed"
       :groups="navGroups"
       :brand-name="APP_NAME"
-      :brand-subtitle="t('app.subtitle')"
       :logo-src="logo"
-      @brand-click="onboardingOpen = true"
     />
 
     <!-- 主区 -->
