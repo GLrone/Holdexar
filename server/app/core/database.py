@@ -61,8 +61,14 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
     },
     "wishlist_items": {
         "owned": "BOOLEAN DEFAULT 0",
-        # 手动导入标记（任务页批量导入）：同步停用核对免疫
+        # 星标关注标记：同步停用核对免疫；与愿望单同属爬取第一优先级
         "manual": "BOOLEAN DEFAULT 0",
+        # 愿望单成员标记：爬取第一优先级；反向核对时随成员资格清零
+        "wishlisted": "BOOLEAN DEFAULT 0",
+        # 手动加入监控池（池页添加 / 导入）：同步反向核对免疫
+        "manual_pool": "BOOLEAN DEFAULT 0",
+        # 手动移出监控池：同步复活挡标（重加时清标）
+        "excluded": "BOOLEAN DEFAULT 0",
     },
     # 补抓账本：missing 状态的补抓尝试计数
     "game_current_prices": {
@@ -161,7 +167,7 @@ def _ensure_schema(sync_conn) -> None:
 #   2. _MIGRATIONS 追加 (版本号, 描述, SQL 列表)；SQL 须幂等（中断续跑 +
 #      用户库版本乱序防御），复杂逻辑可登记 async fn(engine) 同位元素
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # 零小数货币（Steam 以整数计价）：旧捆绑包链路的除数表按 1 处理，与「统一存分」
 # 的新约定差 100 倍——v2 归一的目标集合
@@ -285,7 +291,7 @@ async def _migrate_bundle_price_units(conn) -> None:
 async def _migrate_gph_snapshot_unique(conn) -> None:
     """补建 game_price_history 的幂等唯一索引。
 
-    写入侧（crawler/db_writer、外部平台历史导入脚本）用 `INSERT OR REPLACE` 去重，
+    写入侧（crawler/db_writer、历史导入脚本）用 `INSERT OR REPLACE` 去重，
     靠的就是这个唯一索引——但它此前只手工建在开发库上，代码与 create_all 里都没
     定义。于是**新装的库**表建出来没有它，OR REPLACE 退化成普通 INSERT：同一天
     同一 sub 反复堆积，表现是走势图出现同日重复点、史低次数虚高、`count` 与库内
@@ -343,6 +349,17 @@ _MIGRATIONS: list[tuple[int, str, object]] = [
         "（写入侧靠 INSERT OR REPLACE 去重，此前该索引只手工建在开发库上、"
         "代码与 create_all 里都没有，新库会退化成无约束插入）",
      _migrate_gph_snapshot_unique),
+    (5, "wishlist_items 愿望单成员标记回填（监控池三模块语义："
+        "愿望单与星标关注识别为爬取队列第一优先级）",
+     [
+         # 存量活跃条目中 owned=0 且非星标关注的行均为愿望单同步来源——
+         # 手动入池功能此前不存在，无需区分；回填后未覆盖的行（manual=1）
+         # 已属第一优先级，其愿望单成员资格由下一次账户同步按真实愿望单
+         # 覆写补正（15min 一轮，自愈）。脱池行（active=0）不回填：
+         # 成员资格随下一次同步恢复入池时写入。
+         "UPDATE wishlist_items SET wishlisted = 1"
+         " WHERE owned = 0 AND active = 1 AND manual = 0",
+     ]),
 ]
 
 
