@@ -9,6 +9,7 @@ import { APP_NAME, APP_SUBTITLE_KEY } from '@/appInfo'
 import { useI18n, type MessageKey } from '@/locales'
 import { useThemeStore } from '@/stores/theme'
 import { HlIcon } from '@/components/ui'
+import BorderGlow from '@/components/ui/BorderGlow.vue'
 
 const { t } = useI18n()
 
@@ -37,6 +38,9 @@ onMounted(async () => {
 })
 
 const version = computed(() => info.value?.version ?? '')
+
+/** 本项目的 GitHub 仓库（外链专名，不翻译）。 */
+const REPO_URL = 'https://github.com/GLrone/Holdexar'
 /** 运行时长：分档文案走词典。t() 在 computed 里现取，切语言即重算——
  *  若把结果写进 ref（如模块级常量）会把语言冻在求值那一刻。 */
 const uptime = computed(() => {
@@ -79,94 +83,118 @@ const CREDITS: { name: string; url: string; noteKey: MessageKey }[] = [
 <template>
   <section class="about-page">
     <!-- 定位（hero） -->
-    <div class="card about-hero">
-      <img class="about-hero__logo" :src="logo" alt="" />
-      <div class="about-hero__main">
-        <div class="about-hero__name">
-          <h1>{{ APP_NAME }}</h1>
-          <span v-if="version" class="about-ver">v{{ version }}</span>
+    <BorderGlow :light="!themeStore.isDark">
+      <div class="about-hero">
+        <img class="about-hero__logo" :src="logo" alt="" />
+        <div class="about-hero__main">
+          <div class="about-hero__name">
+            <h1>{{ APP_NAME }}</h1>
+            <span v-if="version" class="about-ver">v{{ version }}</span>
+            <a
+              :href="REPO_URL"
+              target="_blank"
+              rel="noopener noreferrer"
+              class="about-hero__gh"
+              :aria-label="t('about.githubRepo')"
+              :title="t('about.githubRepo')"
+            >
+              <HlIcon name="github" :size="20" />
+            </a>
+          </div>
+          <div class="about-hero__sub">{{ t(APP_SUBTITLE_KEY) }}</div>
+          <p class="about-hero__desc">{{ t('about.hero.desc') }}</p>
         </div>
-        <div class="about-hero__sub">{{ t(APP_SUBTITLE_KEY) }}</div>
-        <p class="about-hero__desc">{{ t('about.hero.desc') }}</p>
       </div>
-    </div>
+    </BorderGlow>
 
     <!-- 功能特性 -->
     <div class="sec-title">{{ t('about.section.features') }}</div>
     <div class="about-feats">
-      <div v-for="f in FEATURES" :key="f.titleKey" class="card about-feat">
-        <div class="about-feat__icon"><HlIcon :name="f.icon" :size="17" /></div>
-        <div>
-          <div class="about-feat__title">{{ t(f.titleKey) }}</div>
-          <div class="about-feat__desc">{{ t(f.descKey) }}</div>
+      <BorderGlow v-for="f in FEATURES" :key="f.titleKey" :light="!themeStore.isDark">
+        <div class="about-feat">
+          <div class="about-feat__icon"><HlIcon :name="f.icon" :size="17" /></div>
+          <div>
+            <div class="about-feat__title">{{ t(f.titleKey) }}</div>
+            <div class="about-feat__desc">{{ t(f.descKey) }}</div>
+          </div>
         </div>
-      </div>
+      </BorderGlow>
     </div>
 
     <div class="about-cols">
       <!-- 技术栈 -->
       <div>
         <div class="sec-title">{{ t('about.section.tech') }}</div>
-        <div class="card about-plain">
-          <ul class="about-list">
-            <li><b>{{ t('about.tech.frontend.label') }}</b> — {{ t('about.tech.frontend.desc') }}</li>
-            <li><b>{{ t('about.tech.backend.label') }}</b> — {{ t('about.tech.backend.desc') }}</li>
-            <li><b>{{ t('about.tech.desktop.label') }}</b> — {{ t('about.tech.desktop.desc') }}</li>
-            <li><b>{{ t('about.tech.proxy.label') }}</b> — {{ t('about.tech.proxy.desc') }}</li>
-          </ul>
-        </div>
+        <BorderGlow :light="!themeStore.isDark">
+          <div class="about-plain">
+            <ul class="about-list">
+              <li><b>{{ t('about.tech.frontend.label') }}</b> — {{ t('about.tech.frontend.desc') }}</li>
+              <li><b>{{ t('about.tech.backend.label') }}</b> — {{ t('about.tech.backend.desc') }}</li>
+              <li><b>{{ t('about.tech.desktop.label') }}</b> — {{ t('about.tech.desktop.desc') }}</li>
+              <li><b>{{ t('about.tech.proxy.label') }}</b> — {{ t('about.tech.proxy.desc') }}</li>
+            </ul>
+          </div>
+        </BorderGlow>
       </div>
 
       <!-- 数据来源 -->
       <div>
         <div class="sec-title">{{ t('about.section.sources') }}</div>
-        <div class="card about-plain">
-          <ul class="about-list">
-            <li><b>{{ t('about.source.price.label') }}</b> — {{ t('about.source.price.desc') }}</li>
-            <li><b>{{ t('about.source.account.label') }}</b> — {{ t('about.source.account.desc') }}</li>
-            <li><b>{{ t('about.source.network.label') }}</b> — {{ t('about.source.network.desc') }}</li>
-            <li>
-              <b>{{ t('about.source.flags.label') }}</b> — {{ t('about.source.flags.desc') }}
-              <b>{{ t('about.source.rates.label') }}</b> — {{ t('about.source.rates.desc') }}
-            </li>
-          </ul>
-        </div>
+        <BorderGlow :light="!themeStore.isDark">
+          <div class="about-plain">
+            <ul class="about-list">
+              <li><b>{{ t('about.source.price.label') }}</b> — {{ t('about.source.price.desc') }}</li>
+              <li><b>{{ t('about.source.account.label') }}</b> — {{ t('about.source.account.desc') }}</li>
+              <li><b>{{ t('about.source.network.label') }}</b> — {{ t('about.source.network.desc') }}</li>
+              <li>
+                <b>{{ t('about.source.flags.label') }}</b> — {{ t('about.source.flags.desc') }}
+                <b>{{ t('about.source.rates.label') }}</b> — {{ t('about.source.rates.desc') }}
+              </li>
+            </ul>
+          </div>
+        </BorderGlow>
       </div>
     </div>
 
     <!-- 隐私与免责 -->
     <div class="sec-title">{{ t('about.section.privacy') }}</div>
-    <div class="card about-plain">
-      <ul class="about-list">
-        <li>{{ t('about.privacy.localOnly') }}</li>
-        <li>{{ t('about.privacy.noBypass') }}</li>
-        <li>{{ t('about.privacy.disclaimer') }}</li>
-        <li>{{ t('about.privacy.personalUse') }}</li>
-      </ul>
-    </div>
+    <BorderGlow :light="!themeStore.isDark">
+      <div class="about-plain">
+        <ul class="about-list">
+          <li>{{ t('about.privacy.localOnly') }}</li>
+          <li>{{ t('about.privacy.noBypass') }}</li>
+          <li>{{ t('about.privacy.disclaimer') }}</li>
+          <li>{{ t('about.privacy.personalUse') }}</li>
+        </ul>
+      </div>
+    </BorderGlow>
 
     <!-- 致谢 -->
     <div class="sec-title">{{ t('about.section.credits') }}</div>
-    <div class="card about-plain">
-      <ul class="about-list">
-        <li v-for="c in CREDITS" :key="c.name">
-          <a :href="c.url" target="_blank" rel="noopener noreferrer">{{ c.name }}</a>
-          <span class="about-credit-note">—— {{ t(c.noteKey) }}</span>
-        </li>
-      </ul>
-    </div>
+    <BorderGlow :light="!themeStore.isDark">
+      <div class="about-plain">
+        <ul class="about-list">
+          <li v-for="c in CREDITS" :key="c.name">
+            <a :href="c.url" target="_blank" rel="noopener noreferrer">{{ c.name }}</a>
+            <span class="about-credit-note">—— {{ t(c.noteKey) }}</span>
+          </li>
+        </ul>
+      </div>
+    </BorderGlow>
 
     <!-- 运行环境（/system/info 实时） -->
-    <div class="card about-env">
-      <template v-if="info">
-        <span class="about-env__item"><HlIcon name="info" :size="13" /> {{ t('about.env.version', { v: info.version }) }}</span>
-        <span class="about-env__item">Python {{ info.python }}</span>
-        <span class="about-env__item mono">{{ info.platform }}</span>
-        <span class="about-env__item mono" :title="info.data_dir">{{ t('about.env.dataDir', { path: info.data_dir }) }}</span>
-        <span class="about-env__item">{{ t('about.env.uptime', { d: uptime }) }}</span>
-      </template>
-      <span v-else class="about-env__item">{{ t('about.env.disconnected') }}</span>
-    </div>
+    <BorderGlow :light="!themeStore.isDark">
+      <div class="about-env">
+        <template v-if="info">
+          <span class="about-env__item"><HlIcon name="info" :size="13" /> {{ t('about.env.version', { v: info.version }) }}</span>
+          <span class="about-env__item">Python {{ info.python }}</span>
+          <span class="about-env__item mono">{{ info.platform }}</span>
+          <span class="about-env__item mono" :title="info.data_dir">{{ t('about.env.dataDir', { path: info.data_dir }) }}</span>
+          <span class="about-env__item">{{ t('about.env.uptime', { d: uptime }) }}</span>
+        </template>
+        <span v-else class="about-env__item">{{ t('about.env.disconnected') }}</span>
+      </div>
+    </BorderGlow>
   </section>
 </template>
 
@@ -191,6 +219,14 @@ const CREDITS: { name: string; url: string; noteKey: MessageKey }[] = [
   background: var(--accent-a15);
   color: var(--accent);
 }
+.about-hero__gh {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 2px;
+  color: var(--text-muted);
+  transition: color calc(var(--duration-2, 0.18s) * var(--motion-scale, 1));
+}
+.about-hero__gh:hover { color: var(--accent); }
 .about-hero__sub { font-size: 13px; color: var(--text-muted); margin-top: 3px; }
 .about-hero__desc { font-size: 13px; color: var(--text-secondary); line-height: 1.9; margin: 12px 0 0; max-width: 720px; }
 .about-hero__desc b, .about-hero__desc strong { color: var(--text-primary); }

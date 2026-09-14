@@ -28,6 +28,9 @@ const about = {
   'about.section.privacy': '隐私与免责',
   'about.section.credits': '致谢',
 
+  /* hero 项目名旁的 GitHub 仓库链接（外链专名，label 仅作可读名） */
+  'about.githubRepo': 'GitHub 仓库',
+
   /* 功能特性卡（FEATURES 常量表，与侧边栏模块一一对应） */
   'about.feature.multiRegion.title': '多区价格矩阵',
   'about.feature.multiRegion.desc':
