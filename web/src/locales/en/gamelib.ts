@@ -1,6 +1,7 @@
 /* gamelib strings — Game Library page (views/gamelib/Index.vue and its tabs).
    Tabs: per-account owned games / insights / family library (moved from the
-   family page; its strings still live in the famLib.* module).
+   family page; its strings still live in the famLib.* module) / play activity
+   (also moved from the family page; strings live in the famPlay.* module).
 
    Terminology follows the established A / B tables:
    · 入库 (when this system first saw a game) → acquired / added
@@ -13,9 +14,11 @@ const gamelib = {
   'gamelib.tab.owned': 'Game Library',
   'gamelib.tab.insights': 'Insights',
   'gamelib.tab.family': 'Family Library',
+  'gamelib.tab.play': 'Play activity',
   'gamelib.section.owned': 'Game Library',
   'gamelib.section.insights': 'Insights',
   'gamelib.section.family': 'Family Library',
+  'gamelib.section.play': 'Play activity',
 
   /* ── Empty / loading states ── */
   'gamelib.empty.loading': 'Loading owned games…',

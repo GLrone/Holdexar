@@ -23,7 +23,7 @@ const shell = {
   'nav.bundles': '捆绑包',
   'nav.pool': '监控池',
   'nav.family': '我的家庭组',
-  'nav.bills': '完整账单',
+  'nav.bills': '账单分析',
   'nav.crawl': '任务',
   'nav.proxies': '代理管理',
   'nav.alerts': '价格提醒',

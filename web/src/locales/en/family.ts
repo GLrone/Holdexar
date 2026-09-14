@@ -15,7 +15,7 @@ import type { MessageKey } from '../zh-CN'
 const family: Partial<Record<MessageKey, string>> = {
   /* Module head (shared by the data-section anchor and the title) */
   'family.section.module': 'Steam family library',
-  'family.module.sub': 'Up to 6 members · Contribution / Value / Play activity',
+  'family.module.sub': 'Up to 6 members · Contribution / Heatmap / Purchases / Wishlist',
 
   /* Tabs */
   'family.tab.contrib': 'Contribution split',

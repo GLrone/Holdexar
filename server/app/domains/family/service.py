@@ -582,9 +582,19 @@ async def fetch_family_library() -> dict:
     member_play: dict[str, list[dict]] = {}   # steamid → [{appid, minutes, last}]
     member_owned_count: dict[str, int] = {}
 
-    for m in member_rows:
+    # 成员已购/游玩**并发**拉取（此前串行：每成员一趟代理 HTTPS，2-10s/人 ×
+    # 全组累计 30s+；任一人超时整个聚合直接失败——游玩动态「经常失败」的主因）。
+    # gather + return_exceptions：单成员失败只缺席该成员明细，不再拖垮全家聚合。
+    owned_results = await asyncio.gather(
+        *(fetch_member_owned_games_full(token, m["steamid"]) for m in member_rows),
+        return_exceptions=True,
+    )
+    for m, result in zip(member_rows, owned_results):
         sid = m["steamid"]
-        games = await fetch_member_owned_games_full(token, sid)
+        if isinstance(result, BaseException):
+            logger.warning("[family] 成员 %s 已购/游玩拉取失败（该成员明细缺席）：%s", sid, result)
+            result = []
+        games = result
         member_owned_count[sid] = len(games)
         plist: list[dict] = []
         for g in games:
@@ -713,6 +723,19 @@ async def fetch_family_library() -> dict:
     # 快照 upsert（持久化兜底：重启/断网时家庭页照常出数据）
     await _upsert_library_snapshot(group["family_groupid"], games_out)
 
+    # 游玩明细随组档案落库（play_json）：库快照表只有 app 级字段，成员游玩
+    # 明细此前不落盘——实时聚合一失败、落到快照兜底路径，memberPlay 恒空，
+    # 游玩动态就只剩空态（「经常失败」的另一半）。成功即存，兜底也有数据。
+    if _primary and member_play:
+        try:
+            async with get_session_factory()() as session:
+                row = await session.get(FamilyGroup, _primary)
+                if row is not None:
+                    row.play_json = member_play
+                    await session.commit()
+        except Exception:  # noqa: BLE001 —— 写库失败不影响本次返回
+            logger.exception("[family] 游玩明细快照写库失败（不影响本次返回）")
+
     return {
         "familyGroupid": group["family_groupid"],
         "familyName": group.get("family_name"),
@@ -825,8 +848,9 @@ async def _upsert_library_snapshot(family_groupid: str, games: list[dict]) -> No
 async def _library_from_snapshot(family_groupid: str | None = None) -> dict | None:
     """从快照表重建家庭库 payload（实时聚合失败/启动首开时的兜底数据源）。
 
-    返回与 fetch_family_library 同构的 dict（memberPlay 无游玩明细——快照
-    未存，游玩动态 tab 届时诚实降级）；无快照/未指定组且无任何组时返回 None。
+    返回与 fetch_family_library 同构的 dict（memberPlay 从 family_groups
+    的 play_json 快照合并——实时聚合成功时随组落库，兜底路径也有游玩数据）；
+    无快照/未指定组且无任何组时返回 None。
     成员档案从 family_groups 快照读（members_json 内含 persona/avatar）。
     """
     from .models import FamilyLibrarySnapshot
@@ -910,12 +934,20 @@ async def _library_from_snapshot(family_groupid: str | None = None) -> dict | No
                 "lastPlayed": 0,
             })
 
+    # 游玩明细（组档案的 play_json 快照）：实时聚合成功时随组落库，
+    # 兜底路径同样有游玩数据——此前恒空 dict，游玩动态只能空态
+    play_saved = (
+        fam_row.play_json
+        if fam_row is not None and isinstance(fam_row.play_json, dict)
+        else {}
+    )
+
     return {
         "familyGroupid": groupid,
         "familyName": fam_row.family_name if fam_row else None,
         "members": members_out,
         "games": games_out,
-        "memberPlay": {},
+        "memberPlay": play_saved,
         "sharedCount": len(games_out),
         "fromSnapshot": True,  # 前端可标注「快照数据（离线/拉取失败兜底）」
     }
@@ -1006,6 +1038,42 @@ _LIBRARY_REFRESHING: bool = False
 _LIBRARY_REFRESH_TASK: asyncio.Task | None = None  # 防 create_task 被 GC 提前取消
 
 
+# 未收录补爬节流：同一批缺口不因页面反复刷新而重复起任务
+_WISHLIST_CRAWL_KICK_COOLDOWN_SECONDS = 1800
+_wishlist_crawl_kick_at: datetime | None = None
+
+
+async def _kick_uncrawled_games(appids: list[int]) -> None:
+    """愿望单里从未爬过的游戏（games 表无行）触发后台补爬（读路径自愈）。
+
+    「未收录」的成因：games/game_current_prices 无行 = 爬虫从未抓到该游戏——
+    愿望单聚合只做本地 join 不补数据，用户看到的就是名称空（AppID 兜底）+
+    价格「未收录」。这里把缺口 appid 送进爬取队列（kind="family_wishlist"），
+    爬完名称/封面/CN 价自动补齐。
+
+    过代理闸门与任务互斥（from_scheduler=True / 任务占用抛错即放弃，下轮
+    同步与全池刷新仍是兜底）；30 分钟冷却防页面刷新重复触发。
+    """
+    global _wishlist_crawl_kick_at
+    if not appids:
+        return
+    now = datetime.utcnow()
+    if _wishlist_crawl_kick_at and (
+        now - _wishlist_crawl_kick_at
+    ).total_seconds() < _WISHLIST_CRAWL_KICK_COOLDOWN_SECONDS:
+        return
+    _wishlist_crawl_kick_at = now
+    try:
+        from app.domains.crawl import service as crawl_service
+
+        await crawl_service.start_job(
+            scope="appids", appids=appids, kind="family_wishlist", from_scheduler=True
+        )
+        logger.info("[family] 愿望单 %d 款未收录，已触发补爬", len(appids))
+    except Exception as e:  # noqa: BLE001 —— 闸门/任务占用/网络失败都静默
+        logger.info("[family] 愿望单未收录补爬未触发（%d 款）：%s", len(appids), e)
+
+
 async def family_wishlist() -> dict:
     """家庭成员愿望单聚合（wishlist_items × games 表本地 join，无需 Cookie）。
 
@@ -1048,6 +1116,9 @@ async def family_wishlist() -> dict:
 
     appids = sorted(by_app)
     meta = await _local_games_meta(appids)
+    # games 表无行 = 爬虫从未抓到（名称/价格全空 → 前端「未收录」）：
+    # 读路径自愈，把缺口送进爬取队列（带冷却，静默失败）
+    await _kick_uncrawled_games([a for a in appids if a not in meta])
 
     items = []
     for appid in appids:

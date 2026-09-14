@@ -1,4 +1,4 @@
-/* famPlay 词条 —— 家庭组·游玩页签（views/family/tabs/FamPlay.vue）。
+/* famPlay 词条 —— 游戏库·游玩页签（views/gamelib/tabs/GlPlay.vue，自 family 页迁入）。
 
    术语沿用 A / B 表（英文侧逐字对齐，见 en/famPlay.ts）：
    · 时长 / 游玩时长 → playtime；总游玩时长 → Total playtime（D2：与

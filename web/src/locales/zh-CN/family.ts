@@ -30,7 +30,7 @@
 const family = {
   /* 模块头（data-section 锚点 + 模块标题共用一条） */
   'family.section.module': 'Steam 家庭库',
-  'family.module.sub': '最多 6 名成员 · 贡献 / 价值 / 游玩动态',
+  'family.module.sub': '最多 6 名成员 · 贡献 / 热力图 / 购买动态 / 愿望单',
 
   /* 页签（键存进 tabs 常量表，渲染期 t() 取） */
   'family.tab.contrib': '贡献分布',

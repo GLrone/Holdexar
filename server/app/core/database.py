@@ -115,6 +115,10 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "persona_name": "VARCHAR(100)",
         "avatar_url": "VARCHAR(500)",
     },
+    # family_groups 游玩明细快照列（游玩动态的快照兜底数据源）
+    "family_groups": {
+        "play_json": "JSON",
+    },
 }
 
 # 增量索引（CREATE INDEX IF NOT EXISTS 幂等）
