@@ -403,3 +403,89 @@ async def test_family_wishlist_aggregation(db, monkeypatch):
     assert 440 not in by_app  # owned=True 不进家庭愿望单
     # wantCount 降序：620(2人) 在 570(1人) 前
     assert out["items"][0]["appid"] == 620
+
+
+@pytest.mark.asyncio
+async def test_play_json_persisted_and_fallback_merged(db, monkeypatch):
+    """游玩明细随组落库：聚合成功存 play_json → 快照兜底路径 memberPlay 非空。
+
+    此前快照只存 app 级字段，实时聚合失败时兜底 memberPlay 恒空——
+    游玩动态页签只剩「暂无成员游玩数据」空态（游玩动态「经常失败」的
+    快照兜底那一半）。
+    """
+    from app.domains.family.models import FamilyGroup
+
+    await settings_service.set_value(
+        "account.steam_cookies",
+        f"sessionid=s; steamLoginSecure={PRIMARY}%7C%7Cjwt-token",
+    )
+    # 主账号定位（play_json 按 steamid 落 family_groups 行）
+    await settings_service.set_value("account.steam_id", PRIMARY)
+    # 同步链路先建组档案（真实流程 _save_group 先于任何库聚合）
+    async with db() as session:
+        session.add(FamilyGroup(
+            steamid=PRIMARY, family_groupid="111", family_name="测试家庭",
+            members_json=[], member_count=1,
+        ))
+        await session.commit()
+
+    _mock_steam(
+        monkeypatch,
+        shared_apps=[{"appid": 620, "presence_count": 1}],
+        owned_by_member={
+            PRIMARY: [
+                {"appid": 620, "playtime_forever": 300, "playtime_2weeks": 60,
+                 "rtime_last_played": 1700000100},
+            ],
+        },
+    )
+
+    live = await family_service.fetch_family_library()
+    assert live["memberPlay"][PRIMARY][0]["minutes2w"] == 60
+
+    # Cookie 摘除 → 实时聚合必败 → cached 回快照兜底
+    family_service.invalidate_library_cache()
+    await settings_service.set_value("account.steam_cookies", "")
+    snap = await family_service.cached_family_library()
+    assert snap.get("fromSnapshot") is True
+    # 兜底路径 memberPlay 从 play_json 合并：游玩动态离线也有数据
+    assert snap["memberPlay"][PRIMARY][0]["appid"] == 620
+    assert snap["memberPlay"][PRIMARY][0]["minutes2w"] == 60
+
+
+@pytest.mark.asyncio
+async def test_wishlist_uncrawled_kick(db, monkeypatch):
+    """愿望单未收录（games 表无行）→ 触发后台补爬（读路径自愈）。
+
+    「未收录」= 爬虫从未抓到该游戏，愿望单聚合只做本地 join 补不了数据；
+    缺口 appid 应被送进爬取队列，爬完名称/价格自动补齐。
+    """
+    from datetime import datetime
+
+    from app.domains.wishlist.models import WishlistItem
+
+    family_service._wishlist_crawl_kick_at = None  # 清冷却账本（模块级防串扰）
+    await _seed_games(db)
+    now = datetime(2026, 9, 3, 12, 0, 0)
+    async with db() as session:
+        session.add(WishlistItem(
+            steamid=PRIMARY, appid=777777, added_at=now, active=True, owned=False,
+        ))
+        await session.commit()
+
+    kicked: list[list[int]] = []
+
+    async def fake_start_job(**kw):
+        kicked.append(list(kw.get("appids") or []))
+        return {}
+
+    monkeypatch.setattr("app.domains.crawl.service.start_job", fake_start_job)
+
+    out = await family_service.family_wishlist()
+    assert out["items"][0]["appid"] == 777777  # 未收录照样展示（本地聚合语义不变）
+    assert kicked == [[777777]]  # 缺口 appid 进了补爬队列
+
+    # 冷却期内不重复触发
+    out2 = await family_service.family_wishlist()
+    assert out2["items"][0]["appid"] == 777777
+    assert kicked == [[777777]]

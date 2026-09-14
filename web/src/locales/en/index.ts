@@ -44,10 +44,8 @@ import family from './family'
 import famWish from './famWish'
 import famLib from './famLib'
 import famBuy from './famBuy'
-import famValue from './famValue'
 import famPlay from './famPlay'
 import famContrib from './famContrib'
-import famInsight from './famInsight'
 import famGrowth from './famGrowth'
 import famHeat from './famHeat'
 // famLicense (library licenses module) merged into the bills page's Licenses tab; keys live in bills.cdk.*
@@ -86,10 +84,8 @@ const messages: Partial<Record<MessageKey, string>> = {
   ...famWish,
   ...famLib,
   ...famBuy,
-  ...famValue,
   ...famPlay,
   ...famContrib,
-  ...famInsight,
   ...famGrowth,
   ...famHeat,
   ...currencies,

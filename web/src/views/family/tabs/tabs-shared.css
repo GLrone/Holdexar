@@ -91,16 +91,20 @@
 .wl-pgbtn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 .wl-pgbtn:disabled { opacity: 0.4; cursor: not-allowed; }
 
-/* GitHub 入库热力图五级色（主题相关，双主题契约） */
+/* GitHub 入库热力图五级色（主题相关，双主题契约）。
+   0 级（无入库日）刻意**不逐字抄 GitHub**：GitHub 的空格色贴着它自家页面底色，
+   搬到本站的 --surface-inset 面板里对比度不足——浅色侧 #ebedf0 ≈ 面板底，
+   深色侧 #161b22 比面板底还暗，整片空格看起来「没有格子」。两级各加深/提亮
+   一档让空格可见，1-4 级保持 GitHub 原值（绿阶本身对比充分）。 */
 :root {
-  --gh-0: #ebedf0;
+  --gh-0: #e2e6ea;
   --gh-1: #9be9a8;
   --gh-2: #40c463;
   --gh-3: #30a14e;
   --gh-4: #216e39;
 }
 html.dark {
-  --gh-0: #161b22;
+  --gh-0: #252d36;
   --gh-1: #0e4429;
   --gh-2: #006d32;
   --gh-3: #26a641;

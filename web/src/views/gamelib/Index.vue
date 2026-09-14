@@ -1,9 +1,10 @@
 <script setup lang="ts">
-/* 游戏库：账号游戏库 / 库分析 / 家庭库 三页签。
+/* 游戏库：账号游戏库 / 库分析 / 家庭库 / 游玩动态 四页签。
    - 账号游戏库 + 库分析 → ownedLib store（GET /owned-library，
      wishlist_items.owned 全量矩阵：绑定账号 + 追踪账户 + 家庭组成员）；
    - 家庭库 → familyLib store（GET /family/library），自 family 页迁入，
-     页签激活时由 FamilyLib 自行拉取（familyLib store 的 ready 守卫复用缓存）。 */
+     页签激活时由 FamilyLib 自行拉取（familyLib store 的 ready 守卫复用缓存）；
+   - 游玩动态（GlPlay）同数据源，自 family 页迁入（词条 famPlay.* 随迁）。 */
 import { computed, onMounted, ref, type Component } from 'vue'
 
 import { useI18n, type MessageKey } from '@/locales'
@@ -12,6 +13,7 @@ import { useOwnedLibStore } from '@/stores/ownedLib'
 import GlOwned from './tabs/GlOwned.vue'
 import GlInsights from './tabs/GlInsights.vue'
 import FamilyLib from './tabs/FamilyLib.vue'
+import GlPlay from './tabs/GlPlay.vue'
 
 const { t } = useI18n()
 const ownedStore = useOwnedLibStore()
@@ -27,6 +29,7 @@ const TAB_KEYS: { key: string; labelKey: MessageKey }[] = [
   { key: 'owned', labelKey: 'gamelib.tab.owned' },
   { key: 'insights', labelKey: 'gamelib.tab.insights' },
   { key: 'family', labelKey: 'gamelib.tab.family' },
+  { key: 'play', labelKey: 'gamelib.tab.play' },
 ]
 
 const tabItems = computed<HlTabItem[]>(() =>
@@ -39,6 +42,7 @@ const PANES: Record<string, Component> = {
   owned: GlOwned,
   insights: GlInsights,
   family: FamilyLib,
+  play: GlPlay,
 }
 </script>
 
