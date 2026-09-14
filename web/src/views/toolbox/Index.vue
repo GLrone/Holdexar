@@ -552,7 +552,7 @@ onMounted(() => void loadBills())
       </template>
     </div>
 
-    <!-- ═════ 模块 B：CDK 批量激活（独立整行 · 内部左右分栏，1:1 框架移植）═════ -->
+    <!-- ═════ 模块 B：CDK 批量激活（独立整行 · 内部左右分栏）═════ -->
     <div class="fx-module" style="margin-bottom: 0" data-section="toolbox.section.cdk">
       <div class="fx-module__head">
         <div class="fx-module__icon">

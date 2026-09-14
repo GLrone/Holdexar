@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 
 # 外部数据目录（外部数据管道的落盘文件所在；个人盘符布局不进 git，
 # 本机用环境变量 METADATA_DATA_DIR 覆盖）
-DEFAULT_SOURCE_DIR = Path(os.environ.get("METADATA_DATA_DIR", os.environ.get("STEAMHL_DATA_DIR", "")))
+DEFAULT_SOURCE_DIR = Path(os.environ.get("METADATA_DATA_DIR", ""))
 
 _EPIC_FILE = "epic_free_games_clean_final.json"
 _XGP_TIERED_FILE = "xgp_tiered_steam.json"
@@ -73,7 +73,7 @@ def resolve_source_path(source_dir: str | None, filename: str) -> Path:
     return base / filename
 
 
-# ─── XGP 名称匹配（移植 XGP.py clean_name + 三级查找）───────────────
+# ─── XGP 名称匹配（名称清洗 + 三级查找）───────────────
 
 _TRADEMARK_RE = re.compile(r"\s*\-\s*pc edition|\s*\(pc\)|\s*\(windows\)|\s*windows edition|\s*xbox one|\s*xbox series x\|s")
 _EDITION_RE = re.compile(

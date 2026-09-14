@@ -280,7 +280,7 @@ async def rate_history(currency: str = "USD", limit: int = 0, range: str | None 
     库内混存三类行：实时刷新（同日多行）、16 年档案导入、backfill 补齐行——
     补齐行 id 大于实时行而日期更早，按 id 排序会乱序，故按日期聚合。
 
-    range（对齐原版 fx-trend 六档）：1mo/6mo/1y/5y/10y/all，只保留窗口内尾部。
+    range（六档）：1mo/6mo/1y/5y/10y/all，只保留窗口内尾部。
     默认无窗口（16 年全量），limit>0 时再取尾段 limit 天（向后兼容旧调用）。
     """
     async with get_session_factory()() as session:

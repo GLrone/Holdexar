@@ -143,8 +143,8 @@ def _build_filter_conditions(
 ) -> list:
     """WHERE 条件构建（list_games 与 top100 分支共用同一套筛选语义）。
 
-    top100_appids 非空时注入 `appid IN (...)`（对齐原版 top100 的
-    WHERE 叠加——其他筛选/地区模式照常生效）。
+    top100_appids 非空时注入 `appid IN (...)`（top100 的 WHERE 叠加——
+    其他筛选/地区模式照常生效）。
     flag：hl=新史低+平史低（hl_flag 1/2）、pp=永降（pp_flag 1）、
     any=两者并集——读全库预计算标记，与提醒规则无关（降价动态 feed）。
     hide_owned：排除「已拥有」徽章同款集合——主账户 owned 行（未配置
@@ -231,7 +231,7 @@ def _build_filter_conditions(
                 conditions.append(diff_expr <= diff_max_fen)
     if sort == "new2026":
         conditions.append(g.release_date.like("2026%"))
-    # [模块三] 元数据筛选（对齐原版 route.ts onlyHb/onlyEpic/onlyXgp）
+    # [模块三] 元数据筛选（onlyHb / onlyEpic / onlyXgp）
     if only_hb:
         conditions.append(g.is_hb.is_(True))
     if only_epic:
@@ -246,7 +246,7 @@ def _build_filter_conditions(
     elif flag == "any":
         conditions.append(or_(g.hl_flag.in_((1, 2)), g.pp_flag == 1))
     if top100_appids is not None:
-        # [Top100] 榜内过滤（对齐原版 `appid = ANY($N::bigint[])` 注入）
+        # [Top100] 榜内过滤（appid 集合注入）
         conditions.append(g.appid.in_(top100_appids))
     if hide_owned:
         from app.domains.wishlist.models import WishlistItem
@@ -325,7 +325,7 @@ async def list_games(
     - 全部筛选/排序/分页在 SQL 完成；价格明细仅按页内 appid 拉取；
     - sort=top100 例外：热榜集 ≤100 条，SQL 全拉后 Python 按榜序
       重排 + 切片分页（SQLite 无 array_position 的等价实现，其余
-      筛选条件照常叠加，对齐原版 top100 WHERE 注入语义）。
+      筛选条件照常叠加，与 top100 WHERE 注入语义一致）。
     """
     if sort == "top100":
         return await _list_games_top100(
@@ -385,10 +385,10 @@ async def list_games(
     base = _build_base_stmt(g=g, cn=cn, sr=sr, conditions=conditions,
                            region_code=region_code, is_locked=is_locked)
 
-    # ── 排序（统一在 sorting.py，对齐 lib/sorting.ts）──
-    # 关注置顶前缀（对齐原版通用排序的第一优先级「收藏游戏置顶」）：关注集是
+    # ── 排序（统一在 sorting.py）──
+    # 关注置顶前缀（通用排序的第一优先级「收藏游戏置顶」）：关注集是
     # 用户手工策展的小集合，IN 布尔降序即置顶；地区模式里它压过 3-group
-    # （原版 priorityGroup「关注极致优先」的同位语义——愿望单优先开关本端
+    # （priorityGroup「关注极致优先」的同位语义——愿望单优先开关本端
     # 不存在，关注恒优先）。空集不注入，SQL 保持原样。
     followed = await _followed_appids()
     fav_order = [desc(g.appid.in_(followed))] if followed else []
@@ -470,12 +470,12 @@ async def _list_games_top100(
     tolerance_fen: int | None = None,
     strict_lowest: bool = False,
 ) -> dict:
-    """TOP100 热销榜分支（翻译原版 route.ts 的 sort=top100 注入路径）。
+    """TOP100 热销榜分支（sort=top100 的榜内过滤 + 榜序重排）。
 
-    原版：`appid = ANY($N)` 过滤 + PG `array_position($N, appid)` 榜序排序，
-    SQL 分页。本端 SQLite 无 array_position → 等价实现：榜集 ≤100 条，
-    全量拉回后 Python 按榜序重排 + 切片分页；筛选条件（地区/价格/元数据）
-    与原版一致照常叠加。拉取失败（空榜）返回空集而非随机游戏（原版语义）。
+    设计：`appid IN (...)` 过滤 + 榜序排序 + SQL 分页。本端 SQLite 无
+    array_position → 等价实现：榜集 ≤100 条，全量拉回后 Python 按榜序
+    重排 + 切片分页；筛选条件（地区/价格/元数据）照常叠加。拉取失败
+    （空榜）返回空集而非随机游戏。
     """
     from app.domains.games import boards as boards_mod
 
@@ -515,8 +515,8 @@ async def _list_games_top100(
         rows = (await session.execute(base)).all()
 
     # ── 榜序重排（等价 array_position；榜外 appid 不会出现——IN 过滤保证）──
-    # 排序优先级对齐 buildCteOrderBy，关注置顶压过榜序（对齐原版 top100 分支
-    # 的收藏第一优先级）：锁国区最低价 ASC（早退分支，压过榜序）
+    # 排序优先级对齐 buildCteOrderBy，关注置顶压过榜序（top100 分支的
+    # 收藏第一优先级）：锁国区最低价 ASC（早退分支，压过榜序）
     # > 地区模式 3-group 前缀 + 组内榜序 > 纯榜序。
     followed = set(await _followed_appids())
     rank = {appid: i for i, appid in enumerate(appids)}
@@ -721,7 +721,7 @@ def _bundle_item_kind(b: Bundle) -> int:
 async def linked_bundles(appid: int, rates: dict | None = None) -> list[dict]:
     """游戏关联捆绑包（GPW「关联捆绑包」区块 / 详情页 linkedBundles）。
 
-    行为对齐原版 bundles/[bundleId]/route.ts 的价格聚合：
+    价格聚合口径：
     priceCny=CN 区 CNY 分，lowestPriceFen/lowestRegion=非 CN 最低，diffFen=省多少。
     本地表仅 19 包，直接全量载入 Python 过滤。
 
@@ -1098,9 +1098,9 @@ async def get_game_versions(appid: int) -> dict:
     """全版本 × 全区最新价（走势抽屉「全部版本」区块数据源，B1 拍板形态）。
 
     聚合 history 每 (region_code, sub_id) 的最新 ok 行（snapshot_at 升序
-    扫描后 dict 覆盖 = 最新胜出）；is_bundle 行剔除（拍板点 5，捆绑包由
-    详情页「关联捆绑包」承接）。零迁移：版本列 sub_id/is_gold/version_suffix
-    原版 schema 早已存在（§1.5），is_bundle 为本轮新增。
+    扫描后 dict 覆盖 = 最新胜出）；is_bundle 行剔除（捆绑包由详情页
+    「关联捆绑包」承接）。零迁移：版本列 sub_id/is_gold/version_suffix
+    既有 schema 早已存在，is_bundle 为本轮新增。
     """
     rates = await get_rates()
 
@@ -1192,7 +1192,7 @@ async def get_game_versions(appid: int) -> dict:
 
 
 async def refresh_hl_flags(appids: list[int] | None = None) -> int:
-    """刷新 games.hl_flag（移植「更新新史低.py」自动化）。
+    """刷新 games.hl_flag（新史低 / 平史低标记）。
 
     语义：当前 CN 价 vs 既往历史最低（排除当前快照）→ 1=新史低 2=平史低；
     无既往数据时打折记 3；不打折记 0。appids=None 全库刷新（启动时），

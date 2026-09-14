@@ -1,8 +1,8 @@
 
 
 /* ════════════════════════════════════════════════════════════════
-   SteamHL Legacy Design System — 1:1 Migration from HTML Report
-   Source: 设计原型生成.py (V1.2 – V7.3)
+   全局样式层：导航栏 / 卡片 / 列表 / 骨架屏等基础构件
+   （深色玻璃拟态设计体系；颜色一律走 tokens.css 语义变量）
    ════════════════════════════════════════════════════════════════ */
 
 /* ─── Reset ─────────────────────────────────────────────────── */
@@ -651,7 +651,7 @@
 /* 系统级「减少动态效果」：微光是**无限循环**动画，不能靠 --motion-scale
    （0s 时长 + infinite 会让浏览器空转），必须显式 none。
    这条此前漏在 hl-framework.css 那份降级清单之外——那份清单只列了 .hl-* 前缀的
-   选择器，而 .skeleton 是 steamhl-* 这套历史样式里的同名实现（.spinner 那一半
+   选择器，而 .skeleton 是 hl-* 样式层里的同名实现（.spinner 那一半
    已随该实现退场）。 */
 @media (prefers-reduced-motion: reduce) {
     .skeleton { animation: none; }

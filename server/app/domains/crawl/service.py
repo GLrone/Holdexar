@@ -63,19 +63,18 @@ async def cleanup_orphan_jobs() -> None:
 
 
 async def import_appids(appids: list[int]) -> dict:
-    """批量导入监控（任务页批量导入 / 收藏列表导入共用通道）。
+    """批量导入监控池（任务页批量导入 / 收藏列表导入共用通道）。
 
-    与榜单反哺同语义：**只爬取入库，不写 wishlist_items**——追踪池
-    只保留真实 Steam 账户同步条目与星标关注（manual 条目），导入的
-    游戏落 games 库作监控数据，不进 6h 池刷新轮（要持续盯价请星标关注）。
+    导入 = 加入监控池 + 首爬入库：
+    - 合法 appid 一律入池（wishlist_service.add_pool_items：无行新建
+      manual_pool 条目、已脱池复活；真愿望单/已购/关注行原样保留来源标记；
+      需已绑定账户，否则 ValueError → 400）；
+    - 分类口径（对齐 boards.backfill_specs 的缺口判定）：
+      ok=待首爬 / own=已在库 / fail=无效——供前端对「新导入」触发首爬
+      （kind=import / fav_import）。
 
-    分类口径（对齐 boards.backfill_specs 的缺口判定）：
-    - ok   库内无行，或挂名行（updated_at NULL 且无价格行）→ 待首爬；
-    - own  已有元数据 → 已在库，跳过（防重复首爬）；
-    - fail 非 int → AppID 无效。
-
-    爬取本身由前端分类后触发（kind=import / fav_import），本函数不落
-    任何库表、不启动任务；逐条 detail 供任务页结果表直出。
+    手动入池条目属普通监控条目（必爬，第二优先级）；要升到第一优先级
+    去游戏卡点星标关注，或在 Steam 愿望单里保留它。
     """
     results: list[dict] = []
     ok = own = fail = 0
@@ -115,15 +114,34 @@ async def import_appids(appids: list[int]) -> dict:
             else:
                 results.append({"appid": appid, "status": "ok", "detail": "待首爬入库"})
                 ok += 1
-    return {"results": results, "ok": ok, "own": own, "fail": fail}
+
+    # 入池（manual_pool 条目）：首爬由前端对「新导入」触发，这里不自动开爬
+    pool: dict = {"added": 0, "restored": 0, "exists": 0}
+    if clean:
+        from app.domains.wishlist import service as wishlist_service
+
+        pool = await wishlist_service.add_pool_items(clean, auto_crawl=False)
+    return {
+        "results": results,
+        "ok": ok,
+        "own": own,
+        "fail": fail,
+        "poolAdded": pool.get("added", 0),
+        "poolRestored": pool.get("restored", 0),
+    }
 
 
 async def _wishlist_ordered(
-    wl_ids: list[int], manual_ids: set[int]
+    wl_ids: list[int], manual_ids: set[int], wishlisted_ids: set[int]
 ) -> list[int]:
-    """愿望单优先级排序：手动关注（manual）最优先——价格更新对关注游戏的
-    时间价值最高；打折中（任一区 discount>0）/史低 hl_flag 次之；其余按
-    appid 稳定序。pairs 序 = 入队序 = worker 消费序（FIFO），排头即先爬。
+    """监控条目优先级排序（愿望单 + 关注 = 第一优先级）。
+
+    档位：关注（manual）> 愿望单（wishlisted）> hot（打折中任一区
+    discount>0 / 史低 hl_flag）> 其余 appid 稳定序——第一优先级组内部
+    保持既有细分（星标关注最靠前，价格更新的时间价值最高），第二优先级
+    （已购/手动入池等普通监控条目）内部按 hot 优先、appid 殿后。
+    所有池内条目均为必爬对象，此处只决定入队先后。
+    pairs 序 = 入队序 = worker 消费序（FIFO），排头即先爬。
     """
     if not wl_ids:
         return []
@@ -145,24 +163,31 @@ async def _wishlist_ordered(
             )
         ).scalars().all()
     hot = set(int(a) for a in hot_rows)
-    return sorted(wl_ids, key=lambda a: (a not in manual_ids, a not in hot, a))
+    first = manual_ids | wishlisted_ids
+    return sorted(
+        wl_ids,
+        key=lambda a: (a not in manual_ids, a not in first, a not in hot, a),
+    )
 
 
-async def _active_wishlist_ids() -> tuple[list[int], set[int]]:
-    """活跃愿望单去重 appid（下架脱池后，保序）+ manual 关注集。"""
+async def _active_wishlist_ids() -> tuple[list[int], set[int], set[int]]:
+    """活跃监控条目去重 appid（下架脱池后，保序）+ 关注集 + 愿望单集。"""
     async with get_session_factory()() as session:
         rows = (
             await session.execute(
-                select(WishlistItem.appid, WishlistItem.manual)
+                select(
+                    WishlistItem.appid, WishlistItem.manual, WishlistItem.wishlisted
+                )
                 .where(WishlistItem.active.is_(True))
                 .distinct()
             )
         ).all()
-    # 多账户同游戏多行：manual 按任一账户关注计；appid 去重保序（distinct
-    # 对 (appid, manual) 组合去不干净——SQLite DISTINCT 两列组合各自不同即保留）
+    # 多账户同游戏多行：manual / wishlisted 按任一账户计；appid 去重保序
+    # （distinct 对多列组合去不干净——SQLite DISTINCT 各列组合不同即保留）
     seen_ids: set[int] = set()
     ids: list[int] = []
     manual_ids: set[int] = set()
+    wishlisted_ids: set[int] = set()
     for r in rows:
         appid = int(r.appid)
         if appid not in seen_ids:
@@ -170,22 +195,25 @@ async def _active_wishlist_ids() -> tuple[list[int], set[int]]:
             ids.append(appid)
         if r.manual:
             manual_ids.add(appid)
+        if r.wishlisted:
+            wishlisted_ids.add(appid)
     # 下架脱池（宽限期外）：Steam 愿望单对下架游戏仍返回条目，
     # 不排除则每日价格刷新全 41 区空转打 404
     removed = await _excluded_removed_appids()
-    return [a for a in ids if a not in removed], manual_ids
+    return [a for a in ids if a not in removed], manual_ids, wishlisted_ids
 
 
 async def _resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tuple[int, str]]:
-    """scope: appids（显式列表）| wishlist（全部活跃条目，含已购）
+    """scope: appids（显式列表）| wishlist（全部活跃监控条目，含已购）
     | wishlist_only（活跃且非已购）| owned（活跃且已购）| pool（全池）。
-    前四种按打折/史低优先排序。
+    前四种按第一优先级（愿望单/关注）→ hot（打折/史低）→ appid 序排。
 
     wishlist 含已购是历史合并路径（跟随模式沿用，不为拆分多付一次预检）；
     自定义已购区域时用 wishlist_only + owned 两个 job 分道抓取。
-    pool 为全池监控层：愿望单+已购优先序排前，其余 games 行垫后——主轮
-    6h 网格的爬取范围（appdetails 逐行时代全池不可行、browse 批量后
-    ~34 批/区/轮成本可忽略；存储代价由 db_writer 历史差量门禁兜住）。
+    pool 为全池监控层：监控条目（愿望单/关注/已购/手动入池优先序）排前，
+    其余 games 行垫后——主轮 6h 网格的爬取范围（appdetails 逐行时代全池
+    不可行、browse 批量后 ~34 批/区/轮成本可忽略；存储代价由 db_writer
+    历史差量门禁兜住）。
     """
     if scope == "appids":
         return [(int(a), "") for a in (appids or [])]
@@ -194,7 +222,9 @@ async def _resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tu
         owned_filter = {"wishlist": None, "wishlist_only": False, "owned": True}[scope]
         async with get_session_factory()() as session:
             stmt = (
-                select(WishlistItem.appid, WishlistItem.manual)
+                select(
+                    WishlistItem.appid, WishlistItem.manual, WishlistItem.wishlisted
+                )
                 .where(WishlistItem.active.is_(True))
                 .distinct()
             )
@@ -202,11 +232,12 @@ async def _resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tu
                 stmt = stmt.where(WishlistItem.owned.is_(owned_filter))
             rows = (await session.execute(stmt)).all()
         wl_ids = [int(r.appid) for r in rows]
-        # 多账户同游戏多行：manual 按任一账户关注计；appid 去重保序（distinct
-        # 对 (appid, manual) 组合去不干净——SQLite DISTINCT 两列组合各自不同即保留）
+        # 多账户同游戏多行：manual / wishlisted 按任一账户计；appid 去重保序
+        # （distinct 对多列组合去不干净——SQLite DISTINCT 各列组合不同即保留）
         seen_ids: set[int] = set()
         deduped_ids: list[int] = []
         manual_ids = {int(r.appid) for r in rows if r.manual}
+        wishlisted_ids = {int(r.appid) for r in rows if r.wishlisted}
         for a in wl_ids:
             if a in seen_ids:
                 continue
@@ -216,10 +247,13 @@ async def _resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tu
         # 下架脱池（宽限期外）：Steam 愿望单对下架游戏仍返回条目，
         # 不排除则每日价格刷新全 41 区空转打 404
         wl_ids = [a for a in wl_ids if a not in await _excluded_removed_appids()]
-        return [(a, "") for a in await _wishlist_ordered(wl_ids, manual_ids)]
+        return [
+            (a, "")
+            for a in await _wishlist_ordered(wl_ids, manual_ids, wishlisted_ids)
+        ]
 
     if scope == "pool":
-        # 全池 = 愿望单/已购优先序（复用 wishlist 排序）在前 + 其余 games 行
+        # 全池 = 监控条目优先序（复用 wishlist 排序）在前 + 其余 games 行
         # （下架脱池）appid 稳定序垫后。单 job 一遍过，不做分层——分层会让
         # 愿望单同轮双爬，产出同价重复快照。
         async with get_session_factory()() as session:
@@ -230,8 +264,8 @@ async def _resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tu
                     .order_by(Game.appid)
                 )
             ).scalars().all()
-        wl_ids, manual_ids = await _active_wishlist_ids()
-        head = await _wishlist_ordered(wl_ids, manual_ids)
+        wl_ids, manual_ids, wishlisted_ids = await _active_wishlist_ids()
+        head = await _wishlist_ordered(wl_ids, manual_ids, wishlisted_ids)
         head_set = set(head)
         rest = [int(a) for a in pool_rows if int(a) not in head_set]
         return [(a, "") for a in head] + [(a, "") for a in rest]

@@ -1,5 +1,5 @@
 /* ════════════════════════════════════════════════════════════════════
-   filterPanel 词条 —— components/steamhl/HlFilterPanel.vue（高级筛选抽屉）。
+   filterPanel 词条 —— components/business/HlFilterPanel.vue（高级筛选抽屉）。
 
    覆盖抽屉标题 / 八个分区标题 / 各筛选标签 / 输入框占位符 / 单位词 / 页脚按钮。
 

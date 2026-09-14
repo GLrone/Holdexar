@@ -4,11 +4,15 @@ import { useRouter } from 'vue-router'
 
 import { watchPoolApi, type PoolItemPayload, type TrackedAccount } from '@/api/client'
 import { useRegionsStore } from '@/stores/regions'
-import { useI18n } from '@/locales'
+import { useI18n, type MessageKey } from '@/locales'
+import { parseAppRefs } from '@/lib/appidRefs'
 import RegionFlag from '@/components/RegionFlag.vue'
 import {
   HlAvatar,
   HlButton,
+  HlCheckbox,
+  HlChip,
+  HlDialog,
   HlEmpty,
   HlIcon,
   HlImg,
@@ -17,15 +21,19 @@ import {
   HlPopconfirm,
   HlSkeleton,
   HlTable,
+  HlTextarea,
   HlTooltip,
   message,
   type HlTableColumn,
+  type IconName,
 } from '@/components/ui'
 
 /* 监控池：数据源（账户绑定）→ 抓取区服（监控地区）→ 池内容（监控条目）。
-   原愿望单页改造而来——页面功能本就是「绑定 → 同步 → 条目 → 爬取」的
-   监控链路，愿望单只是数据来源之一（账户 kinds 含 wishlist/owned 两类），
-   故名义与文案全面改用监控语义。监控地区分节自任务页迁入（同属监控域）。 */
+   监控条目是池内所有必爬的游戏，来源四类——愿望单（Steam 同步）、
+   关注（游戏卡星标）、已购（库同步）、手动添加（本页/任务页导入）；
+   愿望单与关注是叠加在监控条目之上的爬取第一优先级。
+   本页承担监控池管理：条目的添加（单个/批量粘贴）与移除（管理模式下多选），
+   以及监控地区的圈定（自任务页迁入，同属监控域）。 */
 
 const router = useRouter()
 const { t } = useI18n()
@@ -41,12 +49,63 @@ const loading = ref(true)
 const syncingId = ref<string | null>(null)
 let personaRetries = 0
 
+// ─── 监控条目类别（关注 / 愿望单 / 已购 / 手动添加）─────────
+//
+// 主类别取爬取优先级口径的展示映射：关注 > 愿望单 > 已购 > 手动。
+// 一个条目可能同时命中多个来源（如愿望单条目后来被星标），展示取最靠前
+// 的那个；类别计数互斥、合计 = 条目总数（筛选 tab 的数字才对得上）。
+
+type PoolKind = 'follow' | 'wishlist' | 'owned' | 'manual'
+
+/** 类别词条 key（存 key 不存译文：模块级常量只求值一次，会把语言冻住） */
+const KIND_LABEL_KEYS: Record<PoolKind, MessageKey> = {
+  follow: 'pool.items.kind.follow',
+  wishlist: 'pool.items.kind.wishlist',
+  owned: 'pool.items.kind.owned',
+  manual: 'pool.items.kind.manual',
+}
+
+const KIND_ICONS: Record<PoolKind, IconName> = {
+  follow: 'star',
+  wishlist: 'heart',
+  owned: 'check',
+  manual: 'plus',
+}
+
+function itemKind(it: PoolItemPayload): PoolKind {
+  if (it.followed) return 'follow'
+  if (it.wishlisted) return 'wishlist'
+  if (it.owned) return 'owned'
+  return 'manual'
+}
+
+const filterKind = ref<'all' | PoolKind>('all')
+
+const kindCounts = computed(() => {
+  const c = { all: items.value.length, follow: 0, wishlist: 0, owned: 0, manual: 0 }
+  for (const it of items.value) c[itemKind(it)] += 1
+  return c
+})
+
+/** 类别筛选标签（渲染期取译文；计数随条目集重算；icon 空串 = 不渲染） */
+const kindTabs = computed(() => [
+  { id: 'all' as const, label: t('pool.items.kind.all'), count: kindCounts.value.all, icon: '' },
+  { id: 'follow' as const, label: t(KIND_LABEL_KEYS.follow), count: kindCounts.value.follow, icon: KIND_ICONS.follow },
+  { id: 'wishlist' as const, label: t(KIND_LABEL_KEYS.wishlist), count: kindCounts.value.wishlist, icon: KIND_ICONS.wishlist },
+  { id: 'owned' as const, label: t(KIND_LABEL_KEYS.owned), count: kindCounts.value.owned, icon: KIND_ICONS.owned },
+  { id: 'manual' as const, label: t(KIND_LABEL_KEYS.manual), count: kindCounts.value.manual, icon: KIND_ICONS.manual },
+])
+
 /** 监控条目本地搜索：中文名/英文名/appid 大小写不敏感过滤（数据已全量在前端，无需后端查询） */
 const search = ref('')
 const filteredItems = computed(() => {
   const q = search.value.trim().toLowerCase()
-  if (!q) return items.value
-  return items.value.filter(
+  let list = items.value
+  if (filterKind.value !== 'all') {
+    list = list.filter((it) => itemKind(it) === filterKind.value)
+  }
+  if (!q) return list
+  return list.filter(
     (it) =>
       (it.name || '').toLowerCase().includes(q) ||
       (it.nameEn || '').toLowerCase().includes(q) ||
@@ -62,8 +121,8 @@ const page = ref(1)
 const pagedItems = computed(() =>
   filteredItems.value.slice((page.value - 1) * PAGE_SIZE, page.value * PAGE_SIZE),
 )
-// 搜索词或数据集替换后回第一页，防旧页码悬空
-watch([search, items], () => {
+// 搜索词/类别筛选或数据集替换后回第一页，防旧页码悬空
+watch([search, filterKind, items], () => {
   page.value = 1
 })
 
@@ -183,6 +242,108 @@ async function remove(account: TrackedAccount) {
   await watchPoolApi.remove(account.steamid)
   message.success(t('pool.account.unbindSuccess'))
   await load()
+}
+
+// ─── 监控池管理：添加条目（单个/批量粘贴）──────────────────
+//
+// 添加即入池（必爬）；批量粘贴与任务页导入共用 parseAppRefs（链接/裸数字
+// 混排同口径）。单批上限 100 由前端分批（与导入通道一致）。
+
+const addOpen = ref(false)
+const addText = ref('')
+const adding = ref(false)
+const addPreview = computed(() => parseAppRefs(addText.value))
+
+async function submitAdd() {
+  const { appids, invalid } = addPreview.value
+  if (!appids.length) {
+    message.warning(t('pool.items.addNoValid'))
+    return
+  }
+  adding.value = true
+  try {
+    let added = 0
+    let restored = 0
+    let exists = 0
+    let failed = invalid.length
+    for (let i = 0; i < appids.length; i += 100) {
+      const r = await watchPoolApi.addItems(appids.slice(i, i + 100))
+      added += r.added ?? 0
+      restored += r.restored ?? 0
+      exists += r.exists ?? 0
+      failed += r.fail ?? 0
+    }
+    message.success(t('pool.items.addResult', { added, restored, exists, invalid: failed }))
+    addOpen.value = false
+    addText.value = ''
+    await load()
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+  } finally {
+    adding.value = false
+  }
+}
+
+// ─── 监控池管理：管理模式（多选批量移除）───────────────────
+
+const manageMode = ref(false)
+const selected = ref<Set<number>>(new Set())
+const removing = ref(false)
+
+const selectedItemsCount = computed(() => selected.value.size)
+const pageSelectedCount = computed(
+  () => pagedItems.value.filter((it) => selected.value.has(it.appid)).length,
+)
+const allPageSelected = computed(
+  () => pagedItems.value.length > 0 && pageSelectedCount.value === pagedItems.value.length,
+)
+
+function toggleManage() {
+  manageMode.value = !manageMode.value
+  if (!manageMode.value) selected.value = new Set()
+}
+
+function toggleSelect(appid: number) {
+  const next = new Set(selected.value)
+  if (next.has(appid)) next.delete(appid)
+  else next.add(appid)
+  selected.value = next
+}
+
+function toggleSelectPage() {
+  const next = new Set(selected.value)
+  if (allPageSelected.value) {
+    for (const it of pagedItems.value) next.delete(it.appid)
+  } else {
+    for (const it of pagedItems.value) next.add(it.appid)
+  }
+  selected.value = next
+}
+
+/** 条目点击：管理模式下切换选中，否则跳转价格详情 */
+function onItemClick(it: PoolItemPayload) {
+  if (manageMode.value) toggleSelect(it.appid)
+  else router.push(`/game/${it.appid}`)
+}
+
+async function removeSelected() {
+  const ids = [...selected.value]
+  if (!ids.length || removing.value) return
+  removing.value = true
+  try {
+    let removed = 0
+    for (let i = 0; i < ids.length; i += 100) {
+      const r = await watchPoolApi.removeItems(ids.slice(i, i + 100))
+      removed += r.removed ?? 0
+    }
+    message.success(t('pool.items.removeResult', { n: removed }))
+    selected.value = new Set()
+    await load()
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+  } finally {
+    removing.value = false
+  }
 }
 
 // ─── 监控地区（自任务页迁入：爬取区服的圈定）────────────────
@@ -408,13 +569,13 @@ onMounted(async () => {
       />
     </div>
 
-    <!-- 监控条目 -->
+    <!-- 监控条目（监控池管理：增删 + 批量操作） -->
     <div class="card section-card" data-section="pool.section.items">
       <div class="section-card__header">
         <div>
           <div class="section-title">{{ t('pool.section.items') }}</div>
           <div class="section-desc">
-            <template v-if="search.trim()">{{ t('pool.items.matchCount', { matched: filteredItems.length, total: items.length }) }}</template>
+            <template v-if="search.trim() || filterKind !== 'all'">{{ t('pool.items.matchCount', { matched: filteredItems.length, total: items.length }) }}</template>
             <template v-else>{{ t('pool.items.totalHint', { total: items.length }) }}</template>
           </div>
         </div>
@@ -425,6 +586,18 @@ onMounted(async () => {
             prefix-icon="search"
             class="pool-search"
           />
+          <HlButton size="sm" @click="addOpen = true">
+            <HlIcon name="plus" :size="14" />
+            {{ t('pool.items.add') }}
+          </HlButton>
+          <HlButton
+            size="sm"
+            :variant="manageMode ? 'primary' : 'default'"
+            @click="toggleManage"
+          >
+            <HlIcon name="edit" :size="14" />
+            {{ manageMode ? t('pool.items.manageDone') : t('pool.items.manage') }}
+          </HlButton>
           <HlButton size="sm" @click="router.push('/crawl')">
             <HlIcon name="play" :size="14" />
             {{ t('pool.items.crawlAll') }}
@@ -432,54 +605,141 @@ onMounted(async () => {
         </div>
       </div>
 
-      <div v-if="filteredItems.length" class="item-grid">
-        <HlTooltip
-          v-for="item in pagedItems"
-          :key="`${item.steamid}-${item.appid}`"
-          :content="String(item.appid)"
-          rich
-          :dark="false"
+      <!-- 类别筛选：关注/愿望单（爬取第一优先级）与已购/手动（普通条目） -->
+      <div class="kind-filter">
+        <HlChip
+          v-for="k in kindTabs"
+          :key="k.id"
+          shape="soft"
+          :on="filterKind === k.id"
+          @click="filterKind = k.id"
         >
-          <button class="item-chip" @click="router.push(`/game/${item.appid}`)">
-            <span class="item-chip__name">{{ item.name || item.appid }}</span>
-          </button>
-          <template #popper>
-            <div class="item-tip">
-              <HlImg
-                class="item-tip__cover"
-                :src="item.headerImage"
-                alt=""
-                loading="lazy"
-              >
-                <template #fallback>
-                  <span class="item-tip__cover">🎮</span>
-                </template>
-              </HlImg>
-              <div class="item-tip__main">
-                <div class="item-tip__name">{{ item.name || t('pool.items.pendingName') }}</div>
-                <div class="item-tip__appid">{{ item.appid }}</div>
-              </div>
-            </div>
-          </template>
-        </HlTooltip>
+          <HlIcon v-if="k.icon" :name="k.icon" :size="12" />
+          {{ k.label }} · {{ k.count }}
+        </HlChip>
       </div>
-      <!-- 超过一页才出分页条；词条无需新增（纯页码） -->
-      <HlPagination
-        v-if="filteredItems.length > PAGE_SIZE"
-        v-model="page"
-        :total="filteredItems.length"
-        :page-size="PAGE_SIZE"
-        class="item-pagination"
-      />
+
+      <!-- 管理模式操作条：多选 + 批量移除 -->
+      <div v-if="manageMode" class="manage-bar">
+        <span class="manage-bar__count">{{ t('pool.items.selected', { n: selectedItemsCount }) }}</span>
+        <HlButton size="sm" @click="toggleSelectPage">
+          {{ allPageSelected ? t('pool.items.unselectPage') : t('pool.items.selectPage') }}
+        </HlButton>
+        <HlButton size="sm" :disabled="!selectedItemsCount" @click="selected = new Set()">
+          {{ t('pool.items.clearSelection') }}
+        </HlButton>
+        <HlPopconfirm
+          :text="t('pool.items.removeConfirm', { n: selectedItemsCount })"
+          :confirm-label="t('common.confirm')"
+          :cancel-label="t('common.cancel')"
+          @confirm="removeSelected"
+        >
+          <HlButton variant="danger" size="sm" :disabled="!selectedItemsCount" :loading="removing">
+            <HlIcon name="delete" :size="14" />
+            {{ t('pool.items.removeSelected') }}
+          </HlButton>
+        </HlPopconfirm>
+        <span class="manage-bar__hint">{{ t('pool.items.manageHint') }}</span>
+      </div>
+
       <!-- 加载态：骨架屏用卡片形态，与 .item-grid 的卡片网格同形 -->
-      <HlSkeleton v-else-if="loading" variant="card" :count="8" />
-      <!-- 两种空态（有筛选词→无匹配 / 无筛选词→池为空）走同一个 HlEmpty -->
+      <HlSkeleton v-if="loading" variant="card" :count="8" />
+      <!-- 有数据：网格 + 超一页才出的分页条 -->
+      <template v-else-if="filteredItems.length">
+        <div class="item-grid">
+          <HlTooltip
+            v-for="item in pagedItems"
+            :key="item.appid"
+            :content="String(item.appid)"
+            rich
+            :dark="false"
+          >
+            <button
+              class="item-chip"
+              :class="{ 'is-managed': manageMode, 'is-selected': manageMode && selected.has(item.appid) }"
+              @click="onItemClick(item)"
+            >
+              <HlCheckbox
+                v-if="manageMode"
+                :model-value="selected.has(item.appid)"
+                class="item-chip__check"
+              />
+              <HlIcon
+                v-else
+                :name="KIND_ICONS[itemKind(item)]"
+                :size="12"
+                class="item-chip__kind"
+                :class="`item-chip__kind--${itemKind(item)}`"
+              />
+              <span class="item-chip__name">{{ item.name || item.appid }}</span>
+            </button>
+            <template #popper>
+              <div class="item-tip">
+                <HlImg
+                  class="item-tip__cover"
+                  :src="item.headerImage"
+                  alt=""
+                  loading="lazy"
+                >
+                  <template #fallback>
+                    <span class="item-tip__cover">🎮</span>
+                  </template>
+                </HlImg>
+                <div class="item-tip__main">
+                  <div class="item-tip__name">{{ item.name || t('pool.items.pendingName') }}</div>
+                  <div class="item-tip__appid">{{ item.appid }}</div>
+                  <div class="item-tip__kind">
+                    <HlIcon :name="KIND_ICONS[itemKind(item)]" :size="11" />
+                    {{ t(KIND_LABEL_KEYS[itemKind(item)]) }}
+                    <span v-if="item.steamids.length > 1"> · {{ t('pool.items.tipAccounts', { n: item.steamids.length }) }}</span>
+                  </div>
+                </div>
+              </div>
+            </template>
+          </HlTooltip>
+        </div>
+        <!-- 超过一页才出分页条；词条无需新增（纯页码） -->
+        <HlPagination
+          v-if="filteredItems.length > PAGE_SIZE"
+          v-model="page"
+          :total="filteredItems.length"
+          :page-size="PAGE_SIZE"
+          class="item-pagination"
+        />
+      </template>
+      <!-- 空态三分支：池为空 / 搜索无匹配 / 类别下无条目，同一个 HlEmpty -->
       <HlEmpty
         v-else
         icon=""
-        :text="items.length ? t('pool.items.noMatch', { query: search.trim() }) : t('pool.items.empty')"
+        :text="items.length ? (search.trim() ? t('pool.items.noMatch', { query: search.trim() }) : t('pool.items.noKindMatch')) : t('pool.items.empty')"
       />
     </div>
+
+    <!-- 添加监控条目对话框（单个 / 批量粘贴；加入即入池必爬） -->
+    <HlDialog v-model="addOpen" :title="t('pool.items.addTitle')" :width="560">
+      <div class="add-panel__hint">{{ t('pool.items.addHint') }}</div>
+      <HlTextarea
+        v-model="addText"
+        :rows="6"
+        :placeholder="t('pool.items.addPlaceholder')"
+      />
+      <div class="add-panel__meta">
+        <template v-if="addPreview.appids.length || addPreview.invalid.length">
+          {{ t('crawl.import.detected', { n: addPreview.appids.length }) }}<span v-if="addPreview.invalid.length"> · {{ t('crawl.import.detectedInvalid', { n: addPreview.invalid.length }) }}</span>
+        </template>
+      </div>
+      <template #footer>
+        <div class="add-panel__foot">
+          <HlButton variant="text" size="sm" :disabled="adding" @click="addOpen = false">
+            {{ t('common.cancel') }}
+          </HlButton>
+          <HlButton variant="primary" size="sm" :loading="adding" @click="submitAdd">
+            <HlIcon v-if="!adding" name="plus" :size="14" />
+            {{ t('pool.items.addSubmit') }}
+          </HlButton>
+        </div>
+      </template>
+    </HlDialog>
   </section>
 </template>
 
@@ -667,6 +927,60 @@ onMounted(async () => {
   color: var(--ink-on-fill);
 }
 
+/* ── 类别筛选与管理模式 ── */
+.kind-filter {
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.manage-bar {
+  margin-top: 12px;
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--bg-soft);
+}
+
+.manage-bar__count {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.manage-bar__hint {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* ── 添加监控条目对话框 ── */
+.add-panel__hint {
+  margin-bottom: 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.add-panel__meta {
+  margin-top: 8px;
+  min-height: 17px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.add-panel__foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 /* ── 监控条目 ── */
 .item-grid {
   margin-top: 12px;
@@ -711,6 +1025,38 @@ onMounted(async () => {
   white-space: nowrap;
 }
 
+/* 来源类别标记（顶部筛选 chips 的同款图标：星=关注 / 心=愿望单 / 勾=已购 / 加=手动） */
+.item-chip__kind {
+  flex-shrink: 0;
+}
+
+.item-chip__kind--follow {
+  color: var(--warning);
+}
+
+.item-chip__kind--wishlist {
+  color: var(--accent);
+}
+
+.item-chip__kind--owned {
+  color: var(--success);
+}
+
+.item-chip__kind--manual {
+  color: var(--text-muted);
+}
+
+/* 管理模式：多选态高亮；勾选框点击穿透给外层 chip（选中语义只在一处） */
+.item-chip.is-selected {
+  border-color: var(--accent);
+  background: var(--accent-a10);
+  color: var(--accent);
+}
+
+.item-chip__check {
+  pointer-events: none;
+}
+
 /* 悬停富气泡内容（HlTooltip #popper 插槽）：封面缩略图 + 名称/appid 两行 */
 .item-tip {
   display: flex;
@@ -749,5 +1095,14 @@ onMounted(async () => {
   font-size: 11px;
   color: var(--text-muted);
   margin-top: 2px;
+}
+
+.item-tip__kind {
+  margin-top: 3px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-muted);
 }
 </style>

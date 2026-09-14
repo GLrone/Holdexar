@@ -81,6 +81,32 @@ class Settings(BaseSettings):
                 return candidate
         return candidates[0]
 
+    @property
+    def clash_dir(self) -> Path:
+        """随包 Clash 内核目录（mihomo + GeoIP 数据 + 许可原文）。
+
+        开发态 assets/clash；打包后随资源目录（spec datas 的 clash/）。
+        内核与 GeoIP 数据是**随包资产**：内核版本固定在
+        app.domains.proxies.kernel_release.MIHOMO_VERSION，用户机器上不再需要
+        自装 Clash 或检索本机内核。
+
+        判定与 seed_dir 同构：命中「目录里有内核可执行文件」才算数，否则回落
+        首位候选（缺失时调用方负责走补资产/下载链，而不是在这里静默换地方）。
+        """
+        kernel_name = "mihomo.exe" if sys.platform == "win32" else "mihomo"
+        if getattr(sys, "frozen", False):
+            meipass = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+            candidates = [
+                meipass / "clash",
+                Path(sys.executable).resolve().parent / "clash",
+            ]
+        else:
+            candidates = [PROJECT_ROOT / "assets" / "clash"]
+        for candidate in candidates:
+            if (candidate / kernel_name).is_file():
+                return candidate
+        return candidates[0]
+
 
 @lru_cache
 def get_settings() -> Settings:

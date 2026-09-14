@@ -137,9 +137,12 @@ async def clash_status():
 
 @router.post("/clash/install")
 async def clash_install():
-    """下载 mihomo 内核（阻塞数分钟，前端用 loading 态呈现）。"""
+    """安装 mihomo 内核：随包资产优先（本地复制，瞬时），随包缺失才走网络下载。
+
+    网络下载那一支会阻塞较久，前端用 loading 态 + 进度弹窗呈现。
+    """
     settings = get_settings()
-    result = await asyncio.to_thread(clash_manager.download_kernel, settings.data_dir)
+    result = await asyncio.to_thread(clash_manager.install_kernel, settings.data_dir)
     if result.get("ok"):
         result["version"] = clash_manager.kernel_version(result["path"])
     return result

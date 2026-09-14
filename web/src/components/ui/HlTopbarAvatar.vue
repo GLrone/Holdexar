@@ -7,7 +7,7 @@ import { normalizeAvatarUrl } from '@/api/avatar'
 import { useI18n, type MessageKey } from '@/locales'
 
 /**
- * 顶栏 Steam 头像（最右上角）—— component-framework.html .topbar-avatar 标准移植。
+ * 顶栏 Steam 头像（最右上角）—— 对齐 component-framework.html .topbar-avatar 标准。
  * 头像图加载失败回退首字符占位；右下角**Steam 真实在线状态点**（三态）：
  * online（在线=绿）/ ingame（游戏中=蓝，title 带游戏名）/ offline（离线=灰）。
  * 圆形蒙版在 __body 上，状态点露出在蒙版外（外层容器不裁剪）。

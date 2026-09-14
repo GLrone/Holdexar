@@ -1,4 +1,4 @@
-/* gameCard 词条 —— 游戏卡（components/steamhl/HlGameCard.vue）。
+/* gameCard 词条 —— 游戏卡（components/business/HlGameCard.vue）。
 
    几处刻意的复用，改一条两边同步：
    · 「全区价格」同时是卡片按钮与 GPW 弹窗小标题（共用 regionPrice.title）。

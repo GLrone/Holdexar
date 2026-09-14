@@ -194,13 +194,13 @@ const hasPartialLock = computed(
     drawerCodes.value.some((c) => (drawerBundle.value!.regionPrices[c]?.lockedCount ?? 0) > 0),
 )
 
-/** 该区有可展示的价格（行存在但全空 = 原版语义的"锁区"） */
+/** 该区有可展示的价格（行存在但全空 = 锁区） */
 function hasPrice(code: string): boolean {
   const rp = drawerBundle.value?.regionPrices[code]
   return !!rp && (rp.cnyFen != null || rp.priceMinor != null)
 }
 
-/** 补齐状态文案（对齐原版 statusBarHtml 分支）。
+/** 补齐状态文案（owned / family / 可补齐 / 未知四态）。
  *  t() 在 computed 里现取，切语言即重算。 */
 const statusBar = computed(() => {
   const b = drawerBundle.value
@@ -234,7 +234,7 @@ async function openDrawer(b: BundleSummary) {
   }
 }
 
-/** 再点同包收回（对齐原版 toggleBundleDetails 的开关语义）。
+/** 再点同包收回（抽屉开合开关语义）。
  *  封面命中徽标（appid-badge，SteamDB 外链）时忽略——外链点击不开抽屉。 */
 function toggleDrawer(b: BundleSummary, e?: Event) {
   if (e && (e.target as HTMLElement).closest?.('.appid-badge')) return
@@ -254,7 +254,7 @@ function openExternal(url: string) {
   a.click()
 }
 
-/** 包内游戏归属 class（owned/family/wishlist 着色，对齐原版 bgc-*） */
+/** 包内游戏归属 class（owned/family/wishlist 着色，bgc-* 前缀） */
 function gameStatusClass(game: BundleGame): string {
   const info = ownershipMap.value[game.appid]
   if (info?.type === 'owned') return 'bgc-owned'
@@ -369,7 +369,7 @@ function openCalculator(b: BundleSummary) {
       })
   }
   calcOpen.value = true
-  // 计算器数据到手后执行自动排除（对齐原版：无数据 + 已拥有）
+  // 计算器数据到手后执行自动排除（无数据 + 已拥有）
   const applyAuto = (d: BundleDetail | null) => {
     if (!d) return
     calcExcluded.value = autoExcludedAppIds(d, ownershipMap.value)
@@ -394,7 +394,7 @@ function toggleExclude(appid: number) {
   calcResult.value = null
 }
 
-// 切区清空结果（对齐原版 onCalcRegionChange → clearCalcResult）
+// 切区清空结果
 watch(calcRegion, () => {
   calcResult.value = null
 })

@@ -6,10 +6,12 @@
     python scripts/build_release.py --skip-web         # 跳过前端构建（dist 已是最新）
 
 产物（三件，全部要上传 Release；清单由 scripts/build_manifest.py 生成）：
-- release/Holdexar-win64-v<版本>.zip —— 应用包，解压双击即用。
-  **用户数据不在包内、也不落在程序目录**：打包态数据目录判定见
-  app/core/paths.py（默认落 %LOCALAPPDATA% 下的同名目录），因此覆盖解压、
-  换目录、整包删除重装都不会碰到用户数据。
+- release/Holdexar-win64-v<版本>.zip —— 应用包，解压双击即用。包内**含
+  mihomo 内核与 GeoIP 数据**（assets/clash → _MEIPASS/clash），用户机器不需要
+  自装 Clash、也不需要首次联网下载内核；缺该资产即中止出包（见
+  ensure_clash_assets）。**用户数据不在包内、也不落在程序目录**：打包态数据
+  目录判定见 app/core/paths.py（默认落 %LOCALAPPDATA% 下的同名目录），因此
+  覆盖解压、换目录、整包删除重装都不会碰到用户数据。
 - release/holdexar_seed.db —— 公共数据种子独立资产（汇率档案 + games 人工策划列
   + 3 年价格历史切片），供源码 clone 用户（run.py 首次启动）经
   scripts/fetch_seed.py 自动获取；价格历史按种子版本对老用户库增量合并。
@@ -32,6 +34,7 @@ WEB = ROOT / "web"
 DESKTOP = ROOT / "desktop"
 SEED_DIR = ROOT / "assets" / "seed"
 SEED_DB = SEED_DIR / "holdexar_seed.db"
+CLASH_DIR = ROOT / "assets" / "clash"
 RELEASE = ROOT / "release"
 DIST_DIR = RELEASE / "build"  # PyInstaller distpath（COLLECT 输出 DIST_DIR/<APP_NAME>/）
 WORK_DIR = RELEASE / "work"
@@ -39,10 +42,16 @@ VENV_PY = SERVER / ".venv" / "Scripts" / "python.exe"
 
 SEED_BASENAME = "holdexar_seed.db"
 
-# 品牌常量与应用版本同源（app.core.app_info 是纯标准库模块，可直接导入）
+# 品牌常量与应用版本同源（app.core.app_info 是纯标准库模块，可直接导入；
+# kernel_release 同为纯标准库，故可在装依赖之前取到内核资产清单）
 if str(SERVER) not in sys.path:
     sys.path.insert(0, str(SERVER))
 from app.core.app_info import APP_NAME, APP_VERSION  # noqa: E402
+from app.domains.proxies.kernel_release import (  # noqa: E402
+    GEO_ASSETS,
+    LICENSE_ASSETS,
+    kernel_filename,
+)
 
 APP_DIR = DIST_DIR / APP_NAME
 
@@ -74,6 +83,27 @@ def ensure_seed_dir() -> None:
     if not SEED_DB.is_file():
         print("[警告] 未找到资产种子（assets/seed/holdexar_seed.db），"
               "本包将不带汇率档案/人工列；发布前建议先跑 --refresh-seed")
+
+
+def ensure_clash_assets() -> None:
+    """随包内核资产校验：mihomo、GeoIP 数据、上游许可原文缺一即中止出包。
+
+    内核随发行包分发（spec datas 的 `clash/`），所以它是**发布前提**而非可选项：
+    缺了它，包内代理会退化成「用户在代理页点一下、再联网下载」——那不是这次
+    改动承诺的分发形态（指定版本、随包即用）。
+    """
+    CLASH_DIR.mkdir(parents=True, exist_ok=True)
+    # SOURCE.txt 随包资产自带来源/许可说明（GPL 合规：二进制旁要有许可与来源）
+    expected = (kernel_filename(), *GEO_ASSETS, *LICENSE_ASSETS, "README.txt")
+    missing = [name for name in expected if not (CLASH_DIR / name).is_file()]
+    if missing:
+        sys.exit(
+            f"[错误] 随包内核资产缺失：{', '.join(missing)}\n"
+            "       先跑 python scripts/fetch_kernel.py 备齐 assets/clash/ 再出包；\n"
+            "       离线环境可用 --from-dir 从本机现成内核目录复制（版本需自行核对）。"
+        )
+    total = sum(p.stat().st_size for p in CLASH_DIR.iterdir() if p.is_file())
+    print(f"[内核] 随包资产齐备：{total / 1048576:.1f} MB（mihomo + GeoIP 数据 + 许可原文）")
 
 
 def build_web() -> None:
@@ -210,6 +240,7 @@ def main() -> None:
     if args.refresh_seed:
         refresh_seed()
     ensure_seed_dir()
+    ensure_clash_assets()
     if not args.skip_web:
         build_web()
 

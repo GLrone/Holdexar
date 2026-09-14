@@ -46,7 +46,7 @@ const gamelib = {
   'gamelib.pager.range': '第 {from}–{to} 款 · 共 {n} 款',
   'gamelib.pager.refresh': '刷新已购数据',
 
-  /* ── 游戏卡片（components/steamhl/LibGameCard.vue）── */
+  /* ── 游戏卡片（components/business/LibGameCard.vue）── */
   'gamelib.card.free': '免费',
   'gamelib.card.noPrice': '暂无价格',
 

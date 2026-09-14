@@ -37,18 +37,18 @@ const LEGACY_FILES = [
   'src/views/rates/Index.vue', // el-select multiple：追踪币种多选（HlSelect 暂无 multiple）
   // ── 文本链接当按键存量（迁 HlButton variant="text" 后移除）──
   'src/views/dashboard/Index.vue', // <a @click> 跳转 ×1 + el-button text ×3
-  // ── 组件目录级翻译产物（保真要求，不迁移）──
-  'src/components/steamhl/HlNavbar.vue', // 自制地区/排序下拉（保真翻译组件）
-  'src/views/family/Index.vue', // 自制带搜索地区弹层（保真翻译视图）
+  // ── 自绘下拉/弹层（不进 HlSelect 迁移清单）──
+  'src/components/business/HlNavbar.vue', // 自制地区/排序下拉
+  'src/views/family/Index.vue', // 自制带搜索地区弹层
   // ── 标准框架优先红线豁免（EP 直连存量，逐页迁 Hl* 后移除）──
   'src/views/settings/Index.vue', // el-input ×3
   // ── flagUrl 直连存量（统一出口就绪后可迁，非违规）──
   'src/views/alerts/Index.vue',
   'src/views/game-detail/Index.vue',
-  'src/components/steamhl/PriceTrendDrawer.vue',
+  'src/components/business/PriceTrendDrawer.vue',
   'src/views/crawl/Index.vue', // el-* 存量 + flagUrl 直连（页面重构时一并迁 Hl*）
-  'src/components/steamhl/HlFilterPanel.vue',
-  'src/components/steamhl/HlGameCard.vue',
+  'src/components/business/HlFilterPanel.vue',
+  'src/components/business/HlGameCard.vue',
 ]
 
 /**

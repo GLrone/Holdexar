@@ -1,4 +1,4 @@
-/* trendDrawer 词条 —— 价格走势抽屉（components/steamhl/PriceTrendDrawer.vue）。
+/* trendDrawer 词条 —— 价格走势抽屉（components/business/PriceTrendDrawer.vue）。
 
    两处刻意的复用，改一条两边同步：
    · 版本标签「标准版」/「Gold 版」在版本下拉与「全部版本」chips 里是同一件事

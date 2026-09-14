@@ -75,7 +75,7 @@ const about: Partial<Record<MessageKey, string>> = {
   'about.source.network.desc':
     'Always through the proxy policy engine (proxy_first); blocked domains are proxied automatically',
   'about.source.flags.label': 'Flags',
-  'about.source.flags.desc': 'flagcdn.com;',
+  'about.source.flags.desc': 'bundled artwork;',
   'about.source.rates.label': 'Rates',
   'about.source.rates.desc': 'third-party exchange-rate API',
 
@@ -89,15 +89,7 @@ const about: Partial<Record<MessageKey, string>> = {
   'about.privacy.personalUse': 'For personal learning and private use only; no commercial use',
 
   /* Credits (project names and links stay in the component) */
-  'about.credit.steamFamily':
-    'Reference for family-library field semantics and metrics (GPLv3 — reference only, no code used)',
   'about.credit.mihomo': 'Clash proxy core (subscription import and node management)',
-  'about.credit.flagcdn': 'National and regional flag artwork',
-  'about.credit.reactBits':
-    'Interaction-style reference for the scroll list and section rail (MIT + Commons Clause; implementations here are original)',
-  'about.credit.clashVerge':
-    'Reference for subscription auto-naming and filename encoding (GPL-3.0 — behaviour only, no code used)',
-  'about.credit.asf': 'Behaviour baseline for the update package swap routine (Apache-2.0)',
 
   /* Runtime footer */
   'about.env.version': 'Version v{v}',

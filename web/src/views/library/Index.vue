@@ -7,9 +7,9 @@ import { useRegionsStore } from '@/stores/regions'
 import { canGift } from '@/lib/gifting'
 import { vStagger } from '@/lib/stagger'
 import { useI18n, useLocaleFormat } from '@/locales'
-import HlNavbar from '@/components/steamhl/HlNavbar.vue'
-import HlFilterPanel from '@/components/steamhl/HlFilterPanel.vue'
-import HlGameCard from '@/components/steamhl/HlGameCard.vue'
+import HlNavbar from '@/components/business/HlNavbar.vue'
+import HlFilterPanel from '@/components/business/HlFilterPanel.vue'
+import HlGameCard from '@/components/business/HlGameCard.vue'
 import { HlEmpty, HlScrollList, HlSpinner } from '@/components/ui'
 
 /**

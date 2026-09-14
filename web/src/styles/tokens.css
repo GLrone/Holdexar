@@ -1,6 +1,6 @@
 /* ════════════════════════════════════════════════════════════════
    Holdexar Design System
-   布局/组件体系参考 mailtools（MIT）· 主题色 = SteamHL Legacy 深蓝
+   布局/组件体系：设计令牌总表（深浅双主题）· 主题色 = 深蓝
    必须在 element-plus 的 css 之后加载（覆盖其 CSS 变量）
    ════════════════════════════════════════════════════════════════ */
 @import 'tailwindcss';
@@ -71,7 +71,7 @@
    主题契约层 —— 双主题唯一真源
    约定：
    1. :root = 浅色，html.dark = 深色，两侧令牌名一一对应，不得缺项。
-   2. 组件层（tokens / theme-components / steamhl-*）只允许引用令牌，
+   2. 组件层（tokens / theme-components / hl-* 样式层）只允许引用令牌，
       禁止再写死色值；新增组件必须从本层取色。
    3. --el-* 为 Element Plus 全量变量映射，保证「未用到的组件」在
       两个主题下同样被约束。
@@ -413,7 +413,7 @@
   }
 }
 
-/* ══════════ 深色主题（SteamHL Legacy）══════════ */
+/* ══════════ 深色主题令牌 ══════════ */
 html.dark {
   /* ── 页面底与容器 ── */
   --bg-base: #0e1a27;
@@ -1164,7 +1164,7 @@ html.dark {
 }
 
 /* ── 空态 ──
-   本文件曾有一份 `.empty-state`，且 steamhl-globals.css 另有同名一份靠 main.ts 的
+   本文件曾有一份 `.empty-state`，且 hl-globals.css 另有同名一份靠 main.ts 的
    导入次序（tokens → hl-framework → globals）压过它，把 padding 改成 80px 24px 并
    自带 h3/p 样式——同一个类名两种表现，改哪边都不确定生效。那份先删、h3/p 并入
    本份；本轮再把本份也删掉：空态一律走 `components/ui/HlEmpty.vue`（样式在
@@ -1213,7 +1213,7 @@ html.dark {
 }
 
 /* ════════════════════════════════════════════════════════════════
-   Element Plus 平滑化 —— mailtools 手感：柔和边框 + 统一过渡曲线
+   Element Plus 平滑化 —— 柔和边框 + 统一过渡曲线
    ════════════════════════════════════════════════════════════════ */
 
 /* 按钮：默认态 = bg-card + 柔和边框，悬停泛蓝；主色钮 = Steam 蓝 */
@@ -1263,7 +1263,7 @@ html.dark {
   background: #4aa3d8;
 }
 
-/* 输入类：深色内嵌底 + 聚焦蓝光（SteamHL search-box 手感）*/
+/* 输入类：深色内嵌底 + 聚焦蓝光（搜索框手感）*/
 .el-input__wrapper,
 .el-textarea__inner,
 .el-select__wrapper {
@@ -1323,7 +1323,7 @@ html.dark {
   color: var(--select-selected-fg);
 }
 
-/* 隐藏末尾的 ✓（原版用 mask 渲染对勾） */
+/* 隐藏末尾的 ✓（对勾由 mask 渲染） */
 .el-select-dropdown__item.is-selected::after,
 .el-select-dropdown__item.is-selected:hover::after {
   content: none;

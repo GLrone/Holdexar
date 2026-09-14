@@ -49,7 +49,7 @@ const common = {
      「Ka区」——所以后缀必须随语言给：中文 `区`，英文**空串**。
      空串在这个出口里是**有意义的取值**，不是缺译：它表示"不做简写，原样返回"，
      英文的截断交给 CSS 的 ellipsis（"Kazakhstan" 截成 "Kazakh…" 远好过 "Ka区"）。
-     调用点见 components/RegionFlag.vue 与 steamhl/HlGameCard.vue 的列表布局。 */
+     调用点见 components/RegionFlag.vue 与 business/HlGameCard.vue 的列表布局。 */
   'common.regionSuffix': '区',
 
   /* 页内分节轨（HlSectionRail）：分节无 data-section 名时的兜底标签 */

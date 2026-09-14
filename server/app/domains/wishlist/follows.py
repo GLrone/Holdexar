@@ -1,14 +1,16 @@
 """关注列表（游戏卡星标）服务。
 
-关注 = 追踪池 wishlist_items 的 manual 条目（星标是关注的唯一入口；
-任务页的批量导入/收藏导入不产生关注——导入的 游戏只爬取入库作监控数据，
-与愿望单、关注列表都无关）。关注即入池，爬取队列最优先。
+关注 = 监控池 wishlist_items 的 manual 条目（星标是关注的唯一入口，
+导入/添加通道不产生关注——那是手动入池 manual_pool，与关注列表无关）。
+关注即入池，与愿望单同属爬取队列第一优先级。
 
 口径（对齐 crawl/service 的 manual_ids）：manual 按任一账户计，appid 去重——
 池子的存续以行为准，主账号换绑后旧账户的手动行仍是池内事实。
 
 unfollow 只清 manual 标记、不动行本身：真愿望单条目的追踪照常保留
 （下次同步不会洗掉）；纯手动条目交由下次账户同步的反向核对自然出池。
+与监控池页「移除」的差异：移除是脱池（active=0 + excluded 挡同步复活），
+unfollow 不脱池。
 """
 from __future__ import annotations
 
@@ -17,6 +19,7 @@ from sqlalchemy import select, update
 from app.core.database import get_session_factory
 from app.crawler.utils import get_beijing_time_obj
 from .models import WishlistItem
+from .service import resolve_pool_steamid
 
 
 async def followed_appids() -> list[int]:
@@ -37,18 +40,6 @@ def _naive_now():
     return get_beijing_time_obj().replace(tzinfo=None)
 
 
-async def _resolve_pool_steamid() -> str:
-    """新关注条目的落行身份：主账号优先，回退设置页手填。"""
-    from app.domains.account import service as account_service
-
-    primary = await account_service.get_primary_steam_id()
-    if primary:
-        return primary
-    from app.domains.settings.service import get_value
-
-    return ((await get_value("account.steam_id", "")) or "").strip()
-
-
 async def follow(appid: int) -> dict:
     """关注一款游戏：已有行复活 + 打 manual 标；无行则在主账号下新建手动条目。"""
     async with get_session_factory()() as session:
@@ -62,13 +53,15 @@ async def follow(appid: int) -> dict:
             .all()
         )
         if rows:
-            # 已有行（真愿望单/已停用的旧手动行）：复活 + 打标，一行不漏；
+            # 已有行（真愿望单/已停用的旧手动行/池页移除过的行）：复活 + 打标，
+            # 一行不漏；同时清 excluded——关注 = 用户显式要求入池；
             # 无需新建 → 不要求绑定（池内事实先行，身份只在落新行时才需要）
             for row in rows:
                 row.active = True
                 row.manual = True
+                row.excluded = False
         else:
-            steamid = await _resolve_pool_steamid()
+            steamid = await resolve_pool_steamid()
             if not steamid:
                 raise ValueError("尚未绑定 SteamID64（请先在「我」页绑定账户）")
             session.add(
