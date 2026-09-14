@@ -23,7 +23,7 @@
     python scripts/release.py --check                  # 只预检，不改任何东西
     python scripts/release.py --bump patch --dry-run   # 全流程演练（不出网、不推送）
     python scripts/release.py --bump patch             # 正式发版
-    python scripts/release.py --version 0.2.0 --yes    # 免交互
+    python scripts/release.py --version 0.1.0 --yes    # 免交互
 
 前置：gh auth login（说明见 scripts/publish_release.py 顶部）。
 """
