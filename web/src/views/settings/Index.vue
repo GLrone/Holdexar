@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from 'vue'
 
+import { currencyName } from '@/api/currencies'
 import {
   settingsApi,
   systemApi,
@@ -10,6 +11,7 @@ import {
 } from '@/api/client'
 import { useI18n, type MessageKey } from '@/locales'
 import { useAccountStore } from '@/stores/account'
+import { useRegionsStore } from '@/stores/regions'
 import { useUpdaterStore } from '@/stores/updater'
 import { friendCodeOf } from '@/utils/steamId'
 import CurrencyFlag from '@/components/CurrencyFlag.vue'
@@ -36,6 +38,8 @@ const hasApiKey = ref(false)
 
 /* ── Steam 多账户绑定（Cookie → 钱包余额 / 结算地区 / 愿望单与游戏计数）── */
 const accountStore = useAccountStore()
+/* 地区列截断后的 title 全名（区服名以 stores/regions 为单一来源） */
+const regionsStore = useRegionsStore()
 const cookieInput = ref('')
 const cookieSaving = ref(false)
 
@@ -622,7 +626,11 @@ onMounted(load)
               </HlImg>
               <div class="account-row__id">
                 <div class="account-row__name">
-                  {{ acc.persona_name || t('settings.steam.noNickname') }}
+                  <!-- 昵称列定宽：超长昵称在本列内截断（title 悬停看全名），
+                       不允许撑列——昵称长短是跨行统计列漂移的源头之一 -->
+                  <span class="account-row__name-text" :title="acc.persona_name || ''">{{
+                    acc.persona_name || t('settings.steam.noNickname')
+                  }}</span>
                   <span v-if="acc.is_primary" class="account-badge account-badge--primary">{{ t('settings.steam.primary') }}</span>
                   <span v-if="acc.is_active" class="account-badge account-badge--active">{{ t('settings.steam.active') }}</span>
                 </div>
@@ -639,12 +647,21 @@ onMounted(load)
                 </div>
                 <div class="account-stat">
                   <span class="account-stat__label">{{ t('settings.steam.currency') }}</span>
-                  <CurrencyFlag v-if="acc.wallet?.currency_code" :code="acc.wallet.currency_code" />
+                  <CurrencyFlag
+                    v-if="acc.wallet?.currency_code"
+                    :code="acc.wallet.currency_code"
+                    :title="currencyName(acc.wallet.currency_code)"
+                  />
                   <span v-else class="account-stat__value">—</span>
                 </div>
                 <div class="account-stat">
                   <span class="account-stat__label">{{ t('settings.steam.region') }}</span>
-                  <RegionFlag v-if="acc.wallet?.region_code" :code="acc.wallet.region_code" compact />
+                  <RegionFlag
+                    v-if="acc.wallet?.region_code"
+                    :code="acc.wallet.region_code"
+                    compact
+                    :title="regionsStore.regionName(acc.wallet.region_code)"
+                  />
                   <span v-else class="account-stat__value">—</span>
                 </div>
                 <div class="account-stat">
@@ -1140,9 +1157,14 @@ onMounted(load)
   background: var(--surface-inset, transparent);
 }
 
+/* ── 列对齐契约（本组样式是账户行跨行对齐的全部依赖，改动前先读注释）──
+   行 = [头像 40px][身份 168px][统计 固定 6 列][操作 ≥160px]：
+   前两段定宽 → 统计区起点跨行一致；统计区内部是固定像素列 →
+   列位置只由列序号决定，与内容长短无关。任何一段改回「内容驱动宽度」
+   （auto / 由内容撑的 min-width），错位立即复现（乌克兰 vs 印度行实测差 73px）。 */
 .account-row__id {
-  min-width: 140px;
-  flex: 0 1 auto;
+  flex: 0 0 168px;
+  min-width: 0;
 }
 
 .account-row__name {
@@ -1152,13 +1174,23 @@ onMounted(load)
   display: flex;
   align-items: center;
   gap: 6px;
-  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.account-row__name-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 .account-row__friend {
   font-size: 12px;
   color: var(--text-muted);
   margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .account-badge {
@@ -1167,6 +1199,7 @@ onMounted(load)
   padding: 1px 7px;
   border-radius: 999px;
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .account-badge--primary {
@@ -1180,30 +1213,42 @@ onMounted(load)
   border: 1px solid var(--success, #27ae60);
 }
 
+/* 统计区：固定模板列（grid 定宽），列位置与内容长短无关。
+   列宽按最长内容定：余额 112（₴21,455.38）/ 币种 140（乌克兰格里夫纳，
+   中文全名不截断）/ 地区 120（United States）/ 计数三列 60·68·60。
+   总宽 620 与「统计区独占行」的可用宽（默认窗口约 724）留有窄窗余量。 */
 .account-row__stats {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: 112px 140px 120px 60px 68px 60px;
+  align-items: start;
+  gap: 12px;
   flex: 1 1 auto;
-  min-width: 260px;
+  min-width: 0;
 }
 
 .account-stat {
   display: flex;
   flex-direction: column;
   gap: 3px;
-  min-width: 44px;
+  min-width: 0;
 }
 
 .account-stat__label {
   font-size: 11px;
   color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .account-stat__value {
   font-size: 13px;
   color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* 等宽数字：位数不同的金额/计数在定宽列内字宽一致（.hl-num 同款） */
+  font-variant-numeric: tabular-nums;
 }
 
 .account-stat__value--balance {
@@ -1212,11 +1257,29 @@ onMounted(load)
   color: var(--accent);
 }
 
+/* 币种/地区超列内截断（英文长名 "Ukrainian Hryvnia" 超 116px）：
+   完整名走组件根元素 title（悬停可见），绝不撑列 */
+.account-stat :deep(.currency-flag),
+.account-stat :deep(.region-flag) {
+  min-width: 0;
+}
+
+.account-stat :deep(.currency-flag__name),
+.account-stat :deep(.region-flag__name) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 操作列定宽：活跃账号无「设为当前」——不定宽则两行按钮总宽不同，
+   窄屏下会出现「一行统计换行、一行不换」的分叉（换行判定依赖剩余宽度） */
 .account-row__actions {
   display: flex;
   gap: 4px;
   margin-left: auto;
   flex-shrink: 0;
+  justify-content: flex-end;
+  min-width: 160px;
 }
 
 .account-summary__meta {
