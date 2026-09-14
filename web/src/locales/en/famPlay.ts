@@ -1,5 +1,5 @@
 /* English 词典 · famPlay（与 zh-CN/famPlay.ts 同构，key 必须逐一对齐）。
-   对应源文件：views/family/tabs/FamPlay.vue。
+   对应源文件：views/gamelib/tabs/GlPlay.vue（moved from the family page）。
 
    措辞对齐（这些词的译法在别处已定，本页沿用）：
    · Total playtime —— D2（与 famLib.kpi.playtime 同一个数，逐字一致）；

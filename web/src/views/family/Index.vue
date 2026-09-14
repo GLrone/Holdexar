@@ -12,11 +12,10 @@ import FamContrib from './tabs/FamContrib.vue'
 // 增长趋势暂时隐藏：与入库热力图信息重叠，代码保留待回归
 // import FamGrowth from './tabs/FamGrowth.vue'
 import FamHeat from './tabs/FamHeat.vue'
-import FamInsights from './tabs/FamInsights.vue'
-import FamValue from './tabs/FamValue.vue'
 import FamBuy from './tabs/FamBuy.vue'
-import FamPlay from './tabs/FamPlay.vue'
 import FamWish from './tabs/FamWish.vue'
+// 价值洞察/成员洞察页签已移除；游玩动态已迁至游戏库页
+// （views/gamelib/tabs/GlPlay.vue，词条 famPlay.* 随迁）
 
 const regionsStore = useRegionsStore()
 const libStore = useFamilyStore()
@@ -235,11 +234,9 @@ const TAB_KEYS: { key: string; labelKey: MessageKey }[] = [
   // 未迁移：本块为停用实现，回归时需一并 t() 化
   // { key: 'growth', label: '增长趋势' },  // 暂时隐藏（与热力图信息重叠），代码保留待回归
   { key: 'heat', labelKey: 'family.tab.heat' },
-  { key: 'value', labelKey: 'family.tab.value' },
-  { key: 'insights', labelKey: 'family.tab.insights' },
   { key: 'buy', labelKey: 'family.tab.buy' },
-  { key: 'play', labelKey: 'family.tab.play' },
   { key: 'wish', labelKey: 'family.tab.wish' },
+  // 游玩动态页签已迁至游戏库页（views/gamelib/tabs/GlPlay.vue），词条 famPlay.* 随迁
   // 家庭库页签已迁至游戏库页（views/gamelib/tabs/FamilyLib.vue），词条 famLib.* 随迁
   // 未迁移：本块为停用实现，回归时需一并 t() 化
   // 共享冷却暂时隐藏：功能语义还没研究清楚，数据链路/模板代码保留，确认用途后再决定回归
@@ -257,10 +254,7 @@ const tabItems = computed<HlTabItem[]>(() =>
 const PANES: Record<string, Component> = {
   contrib: FamContrib,
   heat: FamHeat,
-  value: FamValue,
-  insights: FamInsights,
   buy: FamBuy,
-  play: FamPlay,
   wish: FamWish,
   // growth: FamGrowth,  // 停用（与热力图信息重叠），回归时与上面的 import、tabs 一起放开
   // cool: …,           // 停用（语义待研究），回归时见模板内保留的块
