@@ -107,17 +107,20 @@ class PoolItemsRequest(BaseModel):
     """监控条目批量操作请求（单批上限 500，前端超出时分批调用）。"""
 
     appids: list[int] = Field(min_length=1, max_length=500)
+    # 导入文件来源（池页「导入文件」传文件名，仅添加端点消费）：非空时把
+    # appid 登记进预设池清单（随资产种子分发的出厂游戏集，见 games/preset.py）
+    source: str | None = Field(default=None, max_length=80)
 
 
 @router.post("/pool/items")
 async def add_pool_items(req: PoolItemsRequest):
-    """批量添加监控条目（池页添加 / 任务页导入共用）。
+    """批量添加监控条目（池页添加 / 导入文件 / 任务页导入共用）。
 
     无行新建 manual_pool 条目（普通监控条目，不进愿望单/关注名单）；
     已有行复活（含愿望单/已购/关注行）。返回逐条分类明细。
     """
     try:
-        return await service.add_pool_items(req.appids)
+        return await service.add_pool_items(req.appids, source=req.source)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

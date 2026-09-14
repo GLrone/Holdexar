@@ -68,9 +68,11 @@ const pool: Partial<Record<MessageKey, string>> = {
   'pool.items.add': 'Add items',
   'pool.items.addTitle': 'Add tracked items',
   'pool.items.addHint':
-    'Every item added to the pool is crawled for prices; games on your Steam wishlist or starred as followed are crawled first.',
+    'Every item added to the pool is crawled for prices; games on your Steam wishlist or starred as followed are crawled first. Paste or use "Choose file" (JSON array / links / raw AppIDs all work) — AppIDs imported from a file also join the preset game pool shipped with the app seed.',
   'pool.items.addPlaceholder':
     'Paste Steam store / SteamDB links or raw AppIDs (spaces, commas and new lines all work)',
+  'pool.items.importFile': 'Choose file',
+  'pool.items.importFileLoaded': 'Loaded {name}',
   'pool.items.addSubmit': 'Add to pool',
   'pool.items.addNoValid': 'No valid AppID found',
   'pool.items.addResult':

@@ -27,6 +27,7 @@ PRIMARY = "76561198000000001"
 def db(tmp_path, monkeypatch):
     import app.core.database as database_module
     import app.domains.crawl.service as crawl_service
+    import app.domains.games.preset as preset_mod
 
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
@@ -35,6 +36,7 @@ def db(tmp_path, monkeypatch):
     monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
     monkeypatch.setattr(wishlist_service, "get_session_factory", lambda: factory)
     monkeypatch.setattr(crawl_service, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(preset_mod, "get_session_factory", lambda: factory)
 
     # persona 拉取（miniprofile）与家庭组快照：不触网 / 不依赖未建表
     async def fake_persona(steamid):
@@ -391,3 +393,71 @@ async def test_import_appids_adds_to_pool(db, monkeypatch):
     assert row is not None and row.active is True and row.manual_pool is True
     row = await _get_item(db, 570)
     assert row is not None and row.active is True
+
+
+# ── 导入文件来源登记（预设池清单：随资产种子分发的出厂游戏集）──────
+
+
+@pytest.mark.asyncio
+async def test_add_pool_items_records_preset_source(db, monkeypatch):
+    """池页「导入文件」带 source：appid 登记进 preset_games，名字随库内主档带回。"""
+    from sqlalchemy import select
+
+    from app.domains.games.models import Game, PresetGame
+
+    await _seed_account(db)
+    _mock_primary(monkeypatch, PRIMARY)
+    async with db() as session:
+        session.add(Game(appid=620, name="Portal 2"))
+        await session.commit()
+
+    out = await wishlist_service.add_pool_items(
+        [620, 570], source="上传优先.json"
+    )
+    assert out["added"] == 2
+
+    async with db() as session:
+        rows = (
+            (await session.execute(select(PresetGame).order_by(PresetGame.appid)))
+            .scalars()
+            .all()
+        )
+    assert [(r.appid, r.source) for r in rows] == [
+        (570, "上传优先.json"),
+        (620, "上传优先.json"),
+    ]
+    assert rows[1].name == "Portal 2"  # 已入库的带名；未爬过的留空（导出侧再兜底）
+    assert rows[0].name is None
+
+
+@pytest.mark.asyncio
+async def test_add_pool_items_preset_source_only_first_wins(db, monkeypatch):
+    """重复导入（换文件重导）不覆盖首次来源——预设清单首见即定档。"""
+    await _seed_account(db)
+    _mock_primary(monkeypatch, PRIMARY)
+    from app.domains.games.models import PresetGame
+
+    await wishlist_service.add_pool_items([620], source="上传优先.json")
+    await wishlist_service.add_pool_items([620], source="visual_novel_synced.json")
+
+    async with db() as session:
+        row = await session.get(PresetGame, 620)
+    assert row is not None and row.source == "上传优先.json"
+
+
+@pytest.mark.asyncio
+async def test_add_pool_items_without_source_no_preset(db, monkeypatch):
+    """不带 source 的普通添加（粘贴/池页添加）不写预设清单。"""
+    from sqlalchemy import select
+
+    from app.domains.games.models import PresetGame
+
+    await _seed_account(db)
+    _mock_primary(monkeypatch, PRIMARY)
+    await wishlist_service.add_pool_items([620])
+
+    async with db() as session:
+        total = (
+            await session.execute(select(PresetGame))
+        ).scalars().all()
+    assert total == []
