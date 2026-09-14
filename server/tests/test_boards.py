@@ -104,14 +104,15 @@ def _mock_fetch(monkeypatch, responses: list, proxy_url: str | None = None) -> _
 
 @pytest.mark.asyncio
 async def test_topsellers_params_and_dedup(monkeypatch):
-    """topsellers：参数对齐 top100；首批凑满 100 即停（不再发第 2 批）。"""
-    batch = list(range(101, 201))
-    session = _mock_fetch(monkeypatch, [_steam_page(batch)])
+    """topsellers：参数对齐 top100；拉满 5 页（500 条 = 初始游戏库发现面）即停。"""
+    pages = [list(range(101 + i * 100, 201 + i * 100)) for i in range(5)]
+    session = _mock_fetch(monkeypatch, [_steam_page(p) for p in pages])
 
     appids = await boards_mod.fetch_board("topsellers")
 
-    assert appids == batch
-    assert len(session.calls) == 1
+    expected = [a for p in pages for a in p]
+    assert appids == expected
+    assert len(session.calls) == 5  # 已凑满 500：第 6 批不再请求
     p = session.calls[0]["params"]
     assert p["filter"] == "topsellers"
     assert p["hidef2p"] == 1
@@ -385,6 +386,60 @@ async def test_scheduler_board_job_backfills_even_when_auto_price_off(monkeypatc
     assert calls, "开关关闭不得停掉榜单反哺（发现源常开）"
     assert calls[0][0][0]["kind"] == "top100_backfill"
     assert calls[0][1].get("from_scheduler") is True, "反哺仍是自动路径，须过代理闸门"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_board_job_records_preset(monkeypatch):
+    """record_preset=True（热销榜）：本轮榜整批登记进预设池清单。"""
+    from app.core import scheduler as sched_mod
+    from app.domains.games import preset as preset_mod
+
+    async def _refresh_board(key: str) -> list[int]:
+        return [900101, 900102]
+
+    async def _specs(key: str, limit: int = 100):
+        return []
+
+    recorded: list = []
+
+    async def _record_board(appids, source="topsellers"):
+        recorded.append((list(appids), source))
+        return len(appids)
+
+    monkeypatch.setattr(boards_mod, "refresh_board", _refresh_board)
+    monkeypatch.setattr(boards_mod, "backfill_specs", _specs)
+    monkeypatch.setattr(preset_mod, "record_board", _record_board)
+
+    await sched_mod._make_board_job("topsellers", record_preset=True)()
+
+    assert recorded == [([900101, 900102], "topsellers")]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_board_job_other_boards_skip_preset(monkeypatch):
+    """默认（其他榜单）不登记预设池——登记只挂热销榜。"""
+    from app.core import scheduler as sched_mod
+    from app.domains.games import preset as preset_mod
+
+    async def _refresh_board(key: str) -> list[int]:
+        return [900103]
+
+    async def _specs(key: str, limit: int = 100):
+        return []
+
+    recorded: list = []
+
+    async def _record_board(appids, source="topsellers"):
+        recorded.append(list(appids))
+        return len(appids)
+
+    monkeypatch.setattr(boards_mod, "refresh_board", _refresh_board)
+    monkeypatch.setattr(boards_mod, "backfill_specs", _specs)
+    monkeypatch.setattr(preset_mod, "record_board", _record_board)
+
+    await sched_mod._make_board_job("popularnew")()
+
+    assert recorded == []
 
 
 # ── list_games 集成（真实本地库只读 + mock 热榜）──────────────

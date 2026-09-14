@@ -1,12 +1,12 @@
 """资产种子包（assets/seed/holdexar_seed.db）：随包分发的公共数据切片。
 
 种子 = 发布者集中维护的公共数据快照（汇率档案 + games 人工策划列 +
-game_price_history 价格历史切片），结构上不含任何凭据/用户数据。
-链路：生产库 → scripts/export_seed.py → 种子文件随包 → 启动时按数据
-性质走两条并入通道；爬虫入库新游戏时 apply_curated() 补挂人工列
-（否则"先爬到游戏、后装种子"标记永远贴不上）。
+预设游戏池清单 + game_price_history 价格历史切片），结构上不含任何
+凭据/用户数据。链路：生产库 → scripts/export_seed.py → 种子文件随包 →
+启动时按数据性质走各并入通道；爬虫入库新游戏时 apply_curated() 补挂
+人工列（否则"先爬到游戏、后装种子"标记永远贴不上）。
 
-三条并入通道（marker 互相独立，各自按数据性质选择语义）：
+四条并入通道（marker 互相独立，各自按数据性质选择语义）：
 - **一次性导入**（import_seed，汇率档案）：只在「全新安装」（games 表为空）
   时导入一次。老用户升级 = 换程序目录、data/ 原地保留——库里有数据
   （games>0）则写入跳过 marker 后永久不再导入。marker 形态：首次成功导入
@@ -17,18 +17,24 @@ game_price_history 价格历史切片），结构上不含任何凭据/用户数
   （appid + name + 人工列，updated_at 记种子版本）——名单开箱即查，且行带
   非空 updated_at 永远不会被孤儿补抓层捡去爬（监控范围只由愿望单驱动，
   名单 ≠ 监控）。
+- **预设游戏池合并**（merge_preset_seed，独立 marker）：池页「导入文件」
+  的关注数据 + 热销榜 5 页（games/preset.py 登记）按种子版本对全体用户
+  生效：本地缺行落完整 games 行（appid + name，updated_at 记种子版本），
+  已有行不动（本地爬取结果为准）。行落即被全池价格主轮覆盖（6h 网格），
+  预设监控不依赖监控池——池条目是账户态待办，种子不写用户态数据。
 - **价格历史合并**（merge_history_seed，独立 marker）：纯追加型快照数据，
   老用户库也并入——本地写入（用户自己的爬虫时间线）与种子时间线的键空间
   天然错开，合并 = 补充发布者时间线 + 同键行以种子覆盖价格列。
 
-种子内四段数据语义：
+种子内五段数据语义：
 - fx_rate_history 按 (currency_code, fetched_at原文) 去重追加
 - fx_rates 快照 INSERT OR REPLACE（种子带最新快照）
 - games_curated 人工列覆写 + 缺行落行（详见 merge_curated_seed）
+- preset_games 缺行落行（详见 merge_preset_seed）
 - game_price_history 按逻辑键 (appid, region_code, sub_id, is_gold,
   snapshot_at原文) 同键覆盖价格列、缺键插入（详见 merge_history_seed）
 
-merge_seed_incremental 是后两条通道的统一入口（lifespan 调用）。
+merge_seed_incremental 是后三条通道的统一入口（lifespan 调用）。
 """
 from __future__ import annotations
 
@@ -66,6 +72,9 @@ HISTORY_MARKER_KEY = "seed.history_imported_version"
 
 # 人工列名单合并 marker：名单按种子版本对全体用户生效（详见模块 docstring）
 CURATED_MARKER_KEY = "seed.curated_imported_version"
+
+# 预设游戏池合并 marker：预设按种子版本对全体用户生效（详见模块 docstring）
+PRESET_MARKER_KEY = "seed.preset_imported_version"
 
 # game_price_history 种子列（与 export_seed.py 的 GPH_COLS 同序同集，不含自增 id）
 GPH_COLS = (
@@ -507,22 +516,110 @@ async def merge_curated_seed(seed_path: Path | None = None) -> dict | None:
     return {"curated_updated": updated, "curated_inserted": inserted}
 
 
-async def merge_seed_incremental(seed_path: Path | None = None) -> dict | None:
-    """按种子版本对全体用户生效的增量通道统一入口：人工列名单 + 价格历史。
+# ── 预设游戏池合并（独立通道：老用户库也生效）─────────────────────────────
 
-    两条子通道各自有 marker、各自幂等、互不拖累（任一失败只记日志，
-    另一条照常执行，失败方下次启动自动重试）。两者都无事发生才返回 None。
+
+async def _seed_preset_rows(path: Path) -> dict[int, str] | None:
+    """种子 preset_games → {appid: name}；无该表（schema 3 及以前）返回 None。
+
+    无名行（登记时库内还没爬到、文件也未带名）不进——并入侧落完整 games
+    行必须带 name。坏种子等同无预设。
+    """
+    if not path.is_file():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        try:
+            rows = con.execute(
+                "SELECT appid, name FROM preset_games "
+                "WHERE name IS NOT NULL AND TRIM(name) != ''"
+            ).fetchall()
+        finally:
+            con.close()
+    except sqlite3.OperationalError:
+        return None  # 旧 schema 无该表：非错误，待下一个 schema 4+ 种子再并
+    except Exception as e:  # noqa: BLE001
+        logger.warning("种子预设池读取失败（忽略）：%s", e)
+        return None
+    return {int(a): n for a, n in rows}
+
+
+async def merge_preset_seed(seed_path: Path | None = None) -> dict | None:
+    """预设游戏池并入本地库（按种子版本，全体用户）。返回统计；无预设/已并返回 None。
+
+    - 本地已有 games 行 → 不动（名字与字段以本地爬取为准）；
+    - 本地缺行 → 落完整 games 行（appid + name，updated_at 记种子版本）：
+      预设开箱即查（游戏库有内容）；行落即被全池价格主轮（6h 网格）纳入
+      刷新——预设监控不写监控池（那是账户态数据，种子不碰）。
+    - updated_at 记版本与人工列名单同理：孤儿补抓层只捡 updated_at IS NULL
+      的行，预设行不会被它重复捡（价格刷新由全池层负责）。
+    幂等由 marker 保证；数据操作本身也幂等，marker 写失败下次启动重做无副作用。
+    """
+    path = seed_path or seed_db_path()
+    meta = read_seed_meta(path)
+    version = str(meta.get("version", "")) if meta else ""
+    if not path.is_file() or not version:
+        return None
+
+    preset = await _seed_preset_rows(path)
+    if not preset:
+        return None
+
+    from app.domains.settings import service as settings_service
+
+    marker = await settings_service.get_value(PRESET_MARKER_KEY)
+    if marker == version:
+        return None
+
+    try:
+        stamped = datetime.fromisoformat(version)
+    except ValueError:
+        stamped = datetime.now()
+
+    async with get_session_factory()() as session:
+        present = {
+            int(a)
+            for (a,) in await session.execute(
+                select(Game.appid).where(Game.appid.in_(list(preset)))
+            )
+        }
+        missing = [a for a in preset if a not in present]
+        inserted = 0
+        if missing:
+            values = [
+                {"appid": appid, "name": preset[appid], "updated_at": stamped}
+                for appid in missing
+            ]
+            await session.execute(sqlite_insert(Game).values(values))
+            inserted = len(missing)
+        await session.commit()
+
+    await settings_service.set_value(PRESET_MARKER_KEY, version)
+    logger.info("[种子] 预设池并入完成 v%s：落库 %s 款", version, inserted)
+    return {"preset_inserted": inserted}
+
+
+async def merge_seed_incremental(seed_path: Path | None = None) -> dict | None:
+    """按种子版本对全体用户生效的增量通道统一入口：人工列名单 + 预设池 + 价格历史。
+
+    三条子通道各自有 marker、各自幂等、互不拖累（任一失败只记日志，
+    其余照常执行，失败方下次启动自动重试）。三者都无事发生才返回 None。
     """
     curated = None
+    preset = None
     history = None
     try:
         curated = await merge_curated_seed(seed_path)
     except Exception:  # noqa: BLE001
         logger.exception("人工列名单种子合并失败（不阻塞启动）")
     try:
+        preset = await merge_preset_seed(seed_path)
+    except Exception:  # noqa: BLE001
+        logger.exception("预设池种子合并失败（不阻塞启动）")
+    try:
         history = await merge_history_seed(seed_path)
     except Exception:  # noqa: BLE001
         logger.exception("价格历史种子合并失败（不阻塞启动）")
-    if curated is None and history is None:
+    if curated is None and preset is None and history is None:
         return None
-    return {"curated": curated, "history": history}
+    return {"curated": curated, "preset": preset, "history": history}

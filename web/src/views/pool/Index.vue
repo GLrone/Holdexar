@@ -5,7 +5,7 @@ import { useRouter } from 'vue-router'
 import { watchPoolApi, type PoolItemPayload, type TrackedAccount } from '@/api/client'
 import { useRegionsStore } from '@/stores/regions'
 import { useI18n, type MessageKey } from '@/locales'
-import { parseAppRefs } from '@/lib/appidRefs'
+import { parseFavoritesRefs } from '@/lib/appidRefs'
 import RegionFlag from '@/components/RegionFlag.vue'
 import {
   HlAvatar,
@@ -244,15 +244,39 @@ async function remove(account: TrackedAccount) {
   await load()
 }
 
-// ─── 监控池管理：添加条目（单个/批量粘贴）──────────────────
+// ─── 监控池管理：添加条目（单个 / 批量粘贴 / 导入文件）──────
 //
-// 添加即入池（必爬）；批量粘贴与任务页导入共用 parseAppRefs（链接/裸数字
-// 混排同口径）。单批上限 100 由前端分批（与导入通道一致）。
+// 添加即入池（必爬）；批量粘贴、文件导入与任务页导入共用
+// parseFavoritesRefs（链接 / 裸数字 / JSON 数组同口径）。单批上限 100
+// 由前端分批（与导入通道一致）。
+//
+// 「导入文件」带文件名提交（source）：后端把 appid 登记进预设游戏池
+// 清单（随资产种子分发的出厂内容，见后端 games/preset.py）。
 
 const addOpen = ref(false)
 const addText = ref('')
 const adding = ref(false)
-const addPreview = computed(() => parseAppRefs(addText.value))
+/** 文件导入来源（文件名）：非空时提交携带并登记预设池；手动编辑文本即清除 */
+const addSource = ref('')
+const fileInput = ref<HTMLInputElement | null>(null)
+const addPreview = computed(() => parseFavoritesRefs(addText.value))
+
+function pickFile() {
+  fileInput.value?.click()
+}
+
+async function onPickFile(ev: Event) {
+  const input = ev.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = '' // 复位：允许连续两次选择同一文件
+  if (!file) return
+  try {
+    addText.value = await file.text()
+    addSource.value = file.name
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+  }
+}
 
 async function submitAdd() {
   const { appids, invalid } = addPreview.value
@@ -267,7 +291,10 @@ async function submitAdd() {
     let exists = 0
     let failed = invalid.length
     for (let i = 0; i < appids.length; i += 100) {
-      const r = await watchPoolApi.addItems(appids.slice(i, i + 100))
+      const r = await watchPoolApi.addItems(
+        appids.slice(i, i + 100),
+        addSource.value || undefined,
+      )
       added += r.added ?? 0
       restored += r.restored ?? 0
       exists += r.exists ?? 0
@@ -276,6 +303,7 @@ async function submitAdd() {
     message.success(t('pool.items.addResult', { added, restored, exists, invalid: failed }))
     addOpen.value = false
     addText.value = ''
+    addSource.value = ''
     await load()
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e))
@@ -715,14 +743,34 @@ onMounted(async () => {
       />
     </div>
 
-    <!-- 添加监控条目对话框（单个 / 批量粘贴；加入即入池必爬） -->
+    <!-- 添加监控条目对话框（单个 / 批量粘贴 / 导入文件；加入即入池必爬） -->
     <HlDialog v-model="addOpen" :title="t('pool.items.addTitle')" :width="560">
       <div class="add-panel__hint">{{ t('pool.items.addHint') }}</div>
       <HlTextarea
         v-model="addText"
         :rows="6"
         :placeholder="t('pool.items.addPlaceholder')"
+        @input="addSource = ''"
       />
+      <div class="add-panel__file">
+        <!-- 原生 file input（浏览器/WebView2 系统文件框）；隐藏本体，按钮触发。
+             说明不放悬停气泡：按钮贴对话框左缘，气泡再宽也会被内容区裁掉左半
+             （实测复现）——长说明走 addHint 常驻，气泡形态只留给短句。 -->
+        <input
+          ref="fileInput"
+          type="file"
+          accept=".json,.txt,application/json,text/plain"
+          class="add-panel__file-input"
+          @change="onPickFile"
+        />
+        <HlButton variant="text" size="sm" :disabled="adding" @click="pickFile">
+          <HlIcon name="download" :size="14" />
+          {{ t('pool.items.importFile') }}
+        </HlButton>
+        <span v-if="addSource" class="add-panel__file-src">
+          {{ t('pool.items.importFileLoaded', { name: addSource }) }}
+        </span>
+      </div>
       <div class="add-panel__meta">
         <template v-if="addPreview.appids.length || addPreview.invalid.length">
           {{ t('crawl.import.detected', { n: addPreview.appids.length }) }}<span v-if="addPreview.invalid.length"> · {{ t('crawl.import.detectedInvalid', { n: addPreview.invalid.length }) }}</span>
@@ -965,6 +1013,25 @@ onMounted(async () => {
   font-size: 12px;
   line-height: 1.6;
   color: var(--text-muted);
+}
+
+.add-panel__file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.add-panel__file-input {
+  display: none;
+}
+
+.add-panel__file-src {
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .add-panel__meta {

@@ -953,7 +953,9 @@ async def _refresh_item_counts(session, steamids: set[str]) -> None:
         )
 
 
-async def add_pool_items(appids: list[int], *, auto_crawl: bool = True) -> dict:
+async def add_pool_items(
+    appids: list[int], *, auto_crawl: bool = True, source: str | None = None
+) -> dict:
     """批量添加监控条目（监控池页添加 / 任务页导入共用通道）。
 
     合法 appid 一律入池（active）：
@@ -966,6 +968,9 @@ async def add_pool_items(appids: list[int], *, auto_crawl: bool = True) -> dict:
     fail（无效 appid）。auto_crawl=True 且池内有变化时触发首爬
     （kind="pool_add"，过代理前置闸门）；任务占用/无可用代理静默跳过，
     下轮 6h 全池刷新兜底。无绑定账户且存在新条目时抛 ValueError。
+
+    source 非空（池页「导入文件」传文件名）时把这些 appid 登记进预设池
+    清单（games/preset.py）：登记只记档不建爬取，失败不阻断入池主链。
     """
     results: list[dict] = []
     clean: list[int] = []
@@ -1055,6 +1060,15 @@ async def add_pool_items(appids: list[int], *, auto_crawl: bool = True) -> dict:
             crawl_triggered = True
         except (RuntimeError, ValueError) as e:
             logger.info("监控池新增 %d 项未自动爬取（%s）", len(touched), e)
+
+    # 预设池登记（池页「导入文件」来源，见 games/preset.py）：登记失败不阻断入池
+    if source and clean:
+        from app.domains.games import preset as preset_mod
+
+        try:
+            await preset_mod.record_imported(clean, source)
+        except Exception:  # noqa: BLE001
+            logger.exception("预设池登记失败（不阻断入池）：source=%s", source)
 
     return {
         "results": results,

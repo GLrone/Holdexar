@@ -1,10 +1,10 @@
 """资产种子导出：生产库公共切片 → assets/seed/holdexar_seed.db。
 
-白名单制：只读四块公共数据（汇率快照 / 汇率历史 / games 人工策划列（含
-name 身份列）/ game_price_history 价格历史切片），结构上不可能带出凭据表
-（账号 Cookie / 代理订阅 / 账单 / app_settings）。种子文件随包分发，启动时
-按数据性质走两条并入通道：汇率走一次性导入，人工列名单与价格历史走
-按种子版本的独立合并通道（老用户库也并入）。
+白名单制：只读五块公共数据（汇率快照 / 汇率历史 / games 人工策划列（含
+name 身份列）/ 预设游戏池清单 / game_price_history 价格历史切片），结构上
+不可能带出凭据表（账号 Cookie / 代理订阅 / 账单 / app_settings）。种子文件
+随包分发，启动时按数据性质走各并入通道：汇率走一次性导入，人工列名单、
+预设池与价格历史走按种子版本的独立合并通道（老用户库也并入）。
 
 用法（发布机）：
     python scripts/export_seed.py                     # data/holdexar.db → assets/seed/
@@ -23,6 +23,12 @@ game_price_history 按 (appid, region_code, sub_id, is_gold, snapshot_at 原文)
 games 行（appid + name + 人工列）：合并侧对本地缺行的 appid 直接落行——
 名单开箱即查，但行带非空 updated_at，永远不会被孤儿补抓层捡去爬
 （监控范围只由愿望单驱动，名单 ≠ 监控）。
+
+预设游戏池清单（preset_games：池页「导入文件」的关注数据 + 热销榜 5 页）
+随种子下发：上游由池添加通道与热销榜定时任务登记（见 games/preset.py）；
+导出侧以库内名字为准（COALESCE(games.name, preset_games.name)），两处都
+无名的行不进种子。合并侧对本地缺行的 appid 落完整 games 行（name 取
+种子）——新用户开箱即有初始游戏库，全池主轮随即覆盖其价格刷新。
 
 价格历史窗口：默认全量时间切片（0，不设窗口）；--history-days 仍可按天
 裁窗。合并通道按 (appid, region_code, sub_id, is_gold, snapshot_at) 幂等
@@ -43,7 +49,7 @@ from app.core.paths import resolve_data_dir  # noqa: E402 —— 数据目录判
 
 DEFAULT_OUT = ROOT / "assets" / "seed" / "holdexar_seed.db"
 
-SEED_SCHEMA_VERSION = 3
+SEED_SCHEMA_VERSION = 4
 CURATED_COLS = ("xgp_tier", "epic_date", "is_epic", "is_hb", "hb_data", "series_id")
 # 人工列名单行的身份列：名单行要在用户库里落成完整 games 行（缺行时），
 # name 是 games 表唯一 NOT NULL 的展示字段。与 CURATED_COLS 分列：覆写
@@ -133,6 +139,19 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
         has_gph = src.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='game_price_history'"
         ).fetchone() is not None
+        # 预设游戏池（同缺表语义）：无关名的行不进种子（并入侧落完整
+        # games 行必须带 name）；名字以库内爬取结果为准、登记时带回的名字兜底
+        has_preset = src.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='preset_games'"
+        ).fetchone() is not None
+        preset: list[tuple] = []
+        if has_preset:
+            preset = src.execute(
+                "SELECT p.appid, COALESCE(g.name, p.name), p.source, p.added_at "
+                "FROM preset_games p LEFT JOIN games g ON g.appid = p.appid "
+                "WHERE TRIM(COALESCE(g.name, p.name, '')) != '' "
+                "ORDER BY p.appid"
+            ).fetchall()
 
         exported_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         seed = sqlite3.connect(str(out_path))
@@ -164,6 +183,12 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
                     hb_data TEXT,
                     series_id TEXT
                 );
+                CREATE TABLE preset_games (
+                    appid INTEGER PRIMARY KEY,
+                    name TEXT,
+                    source TEXT,
+                    added_at TEXT
+                );
                 CREATE TABLE game_price_history (
                     appid INTEGER,
                     region_code TEXT,
@@ -192,6 +217,7 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
             seed.executemany(
                 "INSERT INTO games_curated VALUES (?, ?, ?, ?, ?, ?, ?, ?)", curated
             )
+            seed.executemany("INSERT INTO preset_games VALUES (?, ?, ?, ?)", preset)
             gph_rows = 0
             placeholders = ", ".join("?" for _ in GPH_COLS)
             if has_gph:
@@ -209,6 +235,7 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
                     ("rows_fx_rates", str(len(fx_rates))),
                     ("rows_fx_history", str(len(history))),
                     ("rows_curated", str(len(curated))),
+                    ("rows_preset", str(len(preset))),
                     ("rows_history", str(gph_rows)),
                     ("history_days", str(history_days)),
                 ],
@@ -223,7 +250,8 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
     window = f"近{history_days}天" if history_days > 0 else "全量"
     print(
         f"[种子] 汇率快照 {len(fx_rates)} 条 / 汇率历史 {len(history)} 行 / "
-        f"人工列 {len(curated)} 款 / 价格历史（{window}）{gph_rows} 行"
+        f"人工列 {len(curated)} 款 / 预设池 {len(preset)} 款 / "
+        f"价格历史（{window}）{gph_rows} 行"
     )
     print(f"[种子] {out_path}（{size / 1048576:.1f} MB）")
     print(f"[种子] sha256 {_sha256(out_path)[:16]}…  version={exported_at}")
@@ -231,6 +259,7 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
         "fx_rates": len(fx_rates),
         "fx_history": len(history),
         "curated": len(curated),
+        "preset": len(preset),
         "history": gph_rows,
         "size": size,
     }
