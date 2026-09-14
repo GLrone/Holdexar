@@ -308,6 +308,23 @@ def _merge_history_sync(db_file: Path, seed_file: Path, version: str) -> dict:
         cols = ", ".join(GPH_COLS)
         seed_cols = ", ".join(f"s.{c}" for c in GPH_COLS)
         set_cols = ", ".join(f"{c} = s.{c}" for c in GPH_OVERWRITE_COLS)
+        # 版本名只补空不覆写：本地行的 version_suffix 可能因爬虫丢名/档案导入
+        # 而为空（导致该版本被「标准版」判据误收——历史图混入版本价、现价选择
+        # 顶替），发布者库已按 (appid, sub_id) 回填过，同键行（同一 SKU 同一
+        # 时刻快照）种子的版本名是权威补档；本地已有名不回写——本地爬虫持续
+        # 更新，不被旧种子快照拉回。发行版用户库（名单行为主、无爬虫通道）的
+        # 空名行只能靠本通道自愈，故补空必须做在合并侧而非仅靠回填脚本。
+        suffix_backfill = (
+            "version_suffix = CASE WHEN (l.version_suffix IS NULL OR l.version_suffix = '')"
+            " AND IFNULL(s.version_suffix, '') != ''"
+            " THEN s.version_suffix ELSE l.version_suffix END"
+        )
+        # 版本名补空的差异判定：本地空名而种子有名即触发更新（IS NOT 对
+        # NULL↔非空本就为真，价格列无差异时也要让该行进入 UPDATE）
+        suffix_gap = (
+            "((l.version_suffix IS NULL OR l.version_suffix = '')"
+            " AND IFNULL(s.version_suffix, '') != '')"
+        )
         # 逻辑键与写入侧 OR REPLACE / ux_gph_snapshot 唯一索引同口径
         # （NULL 归一常量一致：sub_id→-1、is_gold→0）
         key_match = (
@@ -319,10 +336,11 @@ def _merge_history_sync(db_file: Path, seed_file: Path, version: str) -> dict:
         con.execute("BEGIN IMMEDIATE")
         # 同键行覆盖价格列；IS NOT 哨兵让值完全一致的行不重写（重复启动零写放大）
         overwritten = con.execute(
-            f"UPDATE main.game_price_history AS l SET {set_cols} "
+            f"UPDATE main.game_price_history AS l SET {set_cols}, {suffix_backfill} "
             f"FROM seed.game_price_history AS s "
             f"WHERE {key_match} AND ("
             + " OR ".join(f"l.{c} IS NOT s.{c}" for c in GPH_OVERWRITE_COLS)
+            + f" OR {suffix_gap}"
             + ")"
         ).rowcount
         # 缺键行插入。种子侧每逻辑键唯一（导出已去重），本地侧同键行已被上一步
