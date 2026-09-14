@@ -2,8 +2,10 @@
 /**
  * Epic 喜加一卡片组 —— 当期在送 + 下周预告 + 移动端白送，仪表盘分节卡。
  *
- * 数据链：GET /metadata/epic/offers（服务端进程内缓存 30 分钟，只读展示链，
- * 不做 appid 匹配不落库）→ 前端挂载即拉 + 每小时轮询。
+ * 数据链：GET /metadata/epic/offers（服务端快照缓存 30 分钟 + 过期后台刷新，
+ * 只读展示链，不做 appid 匹配不落游戏行）→ 前端挂载即拉 + 每小时轮询；
+ * 冷启动先显落库快照（stale + 「刷新中」），10s 短轮询盯到后台刷新落点
+ * 自动覆盖，无需等一轮完整抓取。
  * 三种卡刻意不同形（防误读）：
  * - 当期：绿「免费」章 + 「前往领取 ↗」——真实可领，整卡外链商店页；
  * - 预告：去领取 CTA、封面去饱和、虚线框——只传达「N 天后开始」；
@@ -23,6 +25,33 @@ const mobile = ref<EpicMobileOffer | null>(null)
 const fetchedAt = ref('')
 /** loading=首次拉取中 / ok=有数据（含失败时保留的旧数据）/ failed=无数据可显 */
 const state = ref<'loading' | 'ok' | 'failed'>('loading')
+/** true = 当前显示的是过期快照，服务端后台正在刷新（短轮询覆盖） */
+const stale = ref(false)
+
+/** 快照态短轮询：后台刷新完成前每 10s 补拉一次（封顶 6 次），拿到新鲜
+ *  数据即停——「先显示本地快照，刷新完成后自动覆盖」的覆盖侧。 */
+const STALE_POLL_MS = 10_000
+const STALE_POLL_MAX = 6
+let staleTimer: number | undefined
+let stalePolls = 0
+
+function scheduleStalePoll() {
+  if (staleTimer !== undefined || stalePolls >= STALE_POLL_MAX) return
+  stalePolls += 1
+  staleTimer = window.setTimeout(async () => {
+    staleTimer = undefined
+    await load()
+    if (stale.value) scheduleStalePoll()
+  }, STALE_POLL_MS)
+}
+
+function stopStalePoll() {
+  if (staleTimer !== undefined) {
+    window.clearTimeout(staleTimer)
+    staleTimer = undefined
+  }
+  stalePolls = 0
+}
 
 async function load() {
   try {
@@ -32,6 +61,9 @@ async function load() {
       mobile.value = res.mobile
       fetchedAt.value = res.fetchedAt ? res.fetchedAt.slice(11, 16) : ''
       state.value = 'ok'
+      stale.value = res.stale === true
+      if (stale.value) scheduleStalePoll()
+      else stopStalePoll()
     } else if (offers.value.length === 0 && !mobile.value) {
       state.value = 'failed'
     }
@@ -92,6 +124,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   if (timer !== undefined) window.clearInterval(timer)
+  stopStalePoll()
 })
 </script>
 
@@ -106,6 +139,7 @@ onBeforeUnmount(() => {
         <span v-if="fetchedAt" class="epic-free__time">{{
           t('epicFree.updatedAt', { time: fetchedAt })
         }}</span>
+        <span v-if="stale" class="epic-free__refreshing">{{ t('epicFree.refreshing') }}</span>
         <a
           class="epic-free__hub"
           href="https://store.epicgames.com/en-US/free-games"
@@ -235,6 +269,12 @@ onBeforeUnmount(() => {
 .epic-free__time {
   font-size: 12px;
   color: var(--text-muted);
+}
+
+/* 快照刷新提示：纯文字状态（无动画），accent 色与「更新于」区分 */
+.epic-free__refreshing {
+  font-size: 12px;
+  color: var(--accent);
 }
 
 /* 真实外链（Epic 免费游戏总览页），非动作按键 */

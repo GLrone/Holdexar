@@ -667,32 +667,68 @@ async def import_epic_list(items: list[dict]) -> dict:
     }
 
 
-# ─── Epic 白送展示链（仪表盘卡片）：促销端点 → 只读缓存 ──────────────
-# 与标记链（refresh_epic_free）分离：本链不做 storesearch、不落库，
-# 进程内缓存 30 分钟——前端每小时轮询打不穿促销端点，周四轮换后
-# 最多滞后缓存 TTL + 前端轮询间隔显现。
+# ─── Epic 白送展示链（仪表盘卡片）：促销端点 → 快照缓存 + 后台刷新 ──────
+# 与标记链（refresh_epic_free）分离：本链不做 storesearch、不落游戏行。
+# 缓存两层：进程内（热路径零 IO）+ app_settings 落库（进程重启后的数据源）。
+# 本地软件随开随关，进程内缓存在每次启动后都是空的——只靠它意味着每次启动
+# 首开仪表盘都要等一轮完整抓取（实测 5~10s，前端只能落骨架屏）。落库后冷启动
+# 立即回上一份快照（stale 标记），后台静默刷新，前端短轮询到时自动覆盖。
+#
+# 取数顺序（stale-while-revalidate，对齐 family 域快照语义）：
+# 1. 内存缓存新鲜（< TTL）：直接回（cached=True, stale=False）；
+# 2. 内存空/过期但有落库快照：**先回快照**（stale=True）+ 后台单飞刷新——
+#    冷启动首开即刻出卡，不等网络；
+# 3. 无任何快照（全新安装首开）：现拉（诚实加载态），成功写两层缓存。
 
 _EPIC_OFFERS_TTL_SECONDS = 30 * 60
+# 落库键（app_settings KV；value = {"fetched_at": epoch 秒, "payload": {...}}）
+_EPIC_OFFERS_CACHE_KEY = "metadata.epic_offers_cache"
 _epic_offers_cache: dict = {"at": 0.0, "payload": None}
+_epic_offers_refreshing = False
+# 后台刷新任务引用（测试可 await 收尾；生产侧不需要持有）
+_epic_offers_refresh_task: asyncio.Task | None = None
 
 
-async def epic_free_offers(force: bool = False) -> dict:
-    """当期 + 预告白送元素（含封面/商店页/原价），仪表盘卡片数据源。
+async def _read_offers_snapshot() -> dict | None:
+    """落库快照 → {"at": epoch, "payload": ...}；缺失/坏值返回 None。"""
+    from app.domains.settings.service import get_value
 
-    只读链：命中缓存直接返回（cached=True）；拉取失败不缓存、
-    返回 ok=False，前端保持上一份数据或落空态。
+    try:
+        row = await get_value(_EPIC_OFFERS_CACHE_KEY)
+    except Exception as e:  # noqa: BLE001 —— 读缓存失败等同无缓存
+        logger.warning("[epic-offers] 落库快照读取失败（按无缓存处理）：%s", e)
+        return None
+    if not isinstance(row, dict):
+        return None
+    payload, at = row.get("payload"), row.get("fetched_at")
+    if not isinstance(payload, dict) or not isinstance(at, (int, float)):
+        return None
+    return {"at": float(at), "payload": payload}
+
+
+async def _write_offers_snapshot(payload: dict) -> None:
+    """写落库快照（失败只警告：本轮照常返回，下次启动重新现拉）。"""
+    from app.domains.settings.service import set_value
+
+    try:
+        await set_value(
+            _EPIC_OFFERS_CACHE_KEY,
+            {"fetched_at": time.time(), "payload": payload},
+        )
+    except Exception as e:  # noqa: BLE001 —— 落库失败不影响本次返回
+        logger.warning("[epic-offers] 落库快照写入失败（忽略）：%s", e)
+
+
+async def _fetch_offers_payload() -> dict | None:
+    """现拉一轮完整展示链 → payload；PC 列表与移动端全失败返回 None。
+
+    移动白送与 PC 列表**独立取数**（任一成功即出卡；Epic 促销端点偶发
+    连接失败不该连累移动卡），GamerPower 自动源优先，失败降级 breaker。
+    立绘恒用 Epic 自家 breaker 图：高清且无防盗链（GamerPower 缩图在
+    站外 referer 下加载失败）；breaker 缺席时回落 GamerPower 图。
     """
-    now = time.monotonic()
-    cached = _epic_offers_cache["payload"]
-    if cached is not None and not force and now - _epic_offers_cache["at"] < _EPIC_OFFERS_TTL_SECONDS:
-        return {**cached, "cached": True}
-
     proxy = await _strategy_proxy()
     games = await fetch_free_offers(proxy=proxy)
-    # 移动白送与 PC 列表**独立取数**（任一成功即出卡；Epic 促销端点偶发
-    # 连接失败不该连累移动卡），GamerPower 自动源优先，失败降级 breaker。
-    # 立绘恒用 Epic 自家 breaker 图：高清且无防盗链（GamerPower 缩图在
-    # 站外 referer 下加载失败）；breaker 缺席时回落 GamerPower 图。
     raw_mobile = await fetch_mobile_freebie(proxy=proxy)
     breaker = await fetch_mobile_breaker(proxy=proxy)
     if raw_mobile:
@@ -709,9 +745,8 @@ async def epic_free_offers(force: bool = False) -> dict:
     else:
         mobile = None
     if not games and mobile is None:
-        return {"source": "epic-offers", "ok": False, "offers": [], "mobile": None, "fetchedAt": None}
-
-    payload = {
+        return None
+    return {
         "source": "epic-offers", "ok": True,
         "offers": [
             {
@@ -730,10 +765,66 @@ async def epic_free_offers(force: bool = False) -> dict:
         "mobile": mobile,
         "fetchedAt": get_beijing_now_iso(),
     }
-    # PC 列表失败时只出移动卡，不写缓存——下轮轮询重试 Epic
-    if games:
-        _epic_offers_cache["payload"] = payload
-        _epic_offers_cache["at"] = now
+
+
+def _start_offers_refresh() -> None:
+    """后台拉新（单飞：已在刷则跳过）。成功替换两层缓存；失败保留旧快照。"""
+    global _epic_offers_refreshing, _epic_offers_refresh_task
+
+    if _epic_offers_refreshing:
+        return
+    _epic_offers_refreshing = True
+
+    async def _bg() -> None:
+        global _epic_offers_refreshing
+
+        try:
+            payload = await _fetch_offers_payload()
+            if payload is None:
+                logger.info("[epic-offers] 后台刷新全失败（保留旧快照）")
+                return
+            _epic_offers_cache["payload"] = payload
+            _epic_offers_cache["at"] = time.time()
+            # PC 列表失败时只出移动卡，不写快照——下次启动重试 Epic
+            if payload["offers"]:
+                await _write_offers_snapshot(payload)
+            logger.info("[epic-offers] 后台刷新完成：PC %d 张", len(payload["offers"]))
+        except Exception as e:  # noqa: BLE001 —— 后台失败保留旧快照
+            logger.info("[epic-offers] 后台刷新异常（保留旧快照）：%s", e)
+        finally:
+            _epic_offers_refreshing = False
+
+    _epic_offers_refresh_task = asyncio.create_task(_bg())
+
+
+async def epic_free_offers(force: bool = False) -> dict:
+    """当期 + 预告白送元素（含封面/商店页/原价），仪表盘卡片数据源。
+
+    快照优先（stale-while-revalidate）：冷启动立即回上一份落库快照
+    （stale=True）并触发后台刷新，前端短轮询自动覆盖；无快照才现拉。
+    拉取失败不写缓存、返回 ok=False，前端保持上一份数据或落空态。
+    """
+    now = time.time()
+    if _epic_offers_cache["payload"] is None:
+        snapshot = await _read_offers_snapshot()
+        if snapshot:
+            _epic_offers_cache.update(snapshot)
+    cached = _epic_offers_cache["payload"]
+    if cached is not None and not force:
+        if now - _epic_offers_cache["at"] < _EPIC_OFFERS_TTL_SECONDS:
+            return {**cached, "cached": True, "stale": False}
+        # 过期快照先回给前端，后台默默刷新
+        _start_offers_refresh()
+        return {**cached, "cached": True, "stale": True}
+
+    payload = await _fetch_offers_payload()
+    if payload is None:
+        return {"source": "epic-offers", "ok": False, "offers": [], "mobile": None, "fetchedAt": None}
+    _epic_offers_cache["payload"] = payload
+    _epic_offers_cache["at"] = time.time()
+    # PC 列表失败时只出移动卡，不写快照——下次启动重试 Epic
+    if payload["offers"]:
+        await _write_offers_snapshot(payload)
     return dict(payload)
 
 
