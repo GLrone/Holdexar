@@ -137,6 +137,7 @@ def _build_filter_conditions(
     flag: str = "",
     top100_appids: list[int] | None = None,
     hide_owned: bool = False,
+    hide_family_sharing: bool = False,
     primary_steamid: str = "",
     diff_min_fen: int | None = None,
     diff_max_fen: int | None = None,
@@ -153,6 +154,8 @@ def _build_filter_conditions(
     any=两者并集——读全库预计算标记，与提醒规则无关（降价动态 feed）。
     hide_owned：排除「已拥有」徽章同款集合——主账户 owned 行（未配置
     主账户时任一追踪账户 owned 行），与游戏卡归属徽章口径一致。
+    hide_family_sharing：排除「家庭共享」徽章同款集合——非主账户的追踪
+    账户 owned 行；未配置主账户时不生效（无 family 归属可排除）。
     diff_min_fen/diff_max_fen：与国区差价区间（分）。已选地区时差值 =
     cn.price - sr.cny_fen；未选时回退预计算列 g.diff_fen（= CN 价 - 全区
     最低，下限 0）。diff_type=percent 时区间值按百分比解释（0-100）。
@@ -262,6 +265,21 @@ def _build_filter_conditions(
             owned_sq = owned_sq.where(WishlistItem.steamid == primary_steamid)
         conditions.append(g.appid.not_in(owned_sq))
 
+    # 屏蔽家庭共享：排除「非主账户的追踪账户已拥有」的 appid——与游戏卡紫色
+    # 「家庭共享」归属徽章同口径（ownership() 的 family 分支：owned 行且账户
+    # 非主账户）。与 hide_owned 互为补集：两者同开 = 除愿望单外所有已获取渠道
+    # 都隐藏。未配置主账户时全部 owned 行归属「已拥有」，没有 family 归属可
+    # 排除（同 ownership() 的判定），条件不生效。
+    if hide_family_sharing and primary_steamid:
+        from app.domains.wishlist.models import WishlistItem
+
+        family_sq = select(WishlistItem.appid).where(
+            WishlistItem.owned.is_(True),
+            WishlistItem.active.is_(True),
+            WishlistItem.steamid != primary_steamid,
+        )
+        conditions.append(g.appid.not_in(family_sq))
+
     # 游戏商店默认隐藏 DLC（type='DLC'）；type 为 NULL 的游戏（未归类）按非 DLC 处理，
     # 白名单豁免个别确需常驻的 DLC（黄金树幽影）。exclude_dlc 缺省 False，仅商店页显式开启。
     if exclude_dlc:
@@ -324,6 +342,7 @@ async def list_games(
     only_epic: bool = False,
     only_xgp: bool = False,
     hide_owned: bool = False,
+    hide_family_sharing: bool = False,
     diff_min_fen: int | None = None,
     diff_max_fen: int | None = None,
     diff_type: str = "absolute",
@@ -390,7 +409,10 @@ async def list_games(
         flag=flag,
         sort=sort,
         hide_owned=hide_owned,
-        primary_steamid=await _primary_steamid() if hide_owned else "",
+        hide_family_sharing=hide_family_sharing,
+        primary_steamid=(
+            await _primary_steamid() if (hide_owned or hide_family_sharing) else ""
+        ),
         diff_min_fen=diff_min_fen,
         diff_max_fen=diff_max_fen,
         diff_type=diff_type,

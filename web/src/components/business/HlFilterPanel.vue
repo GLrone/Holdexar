@@ -352,6 +352,11 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
             @update:model-value="(v: boolean) => store.setFilter('hideOwned', v)"
           />
           <HlCheckbox
+            :model-value="store.hideFamilySharing"
+            :label="t('filterPanel.other.hideFamilySharing')"
+            @update:model-value="(v: boolean) => store.setFilter('hideFamilySharing', v)"
+          />
+          <HlCheckbox
             :model-value="store.excludeDlc"
             :label="t('filterPanel.other.hideDlc')"
             @update:model-value="(v: boolean) => store.setFilter('excludeDlc', v)"
