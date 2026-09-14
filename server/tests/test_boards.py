@@ -104,7 +104,7 @@ def _mock_fetch(monkeypatch, responses: list, proxy_url: str | None = None) -> _
 
 @pytest.mark.asyncio
 async def test_topsellers_params_and_dedup(monkeypatch):
-    """topsellers：参数对齐原版 top100.ts；首批凑满 100 即停（不再发第 2 批）。"""
+    """topsellers：参数对齐 top100；首批凑满 100 即停（不再发第 2 批）。"""
     batch = list(range(101, 201))
     session = _mock_fetch(monkeypatch, [_steam_page(batch)])
 
@@ -175,7 +175,7 @@ async def test_specials_three_empty_batches_stop(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_partial_on_failure(monkeypatch):
-    """中途批 HTTP 失败：返回已收集部分（原版 break 语义），不炸。"""
+    """中途批 HTTP 失败：返回已收集部分（break 语义），不炸。"""
     session = _mock_fetch(
         monkeypatch,
         [_steam_page([111, 222]), _FakeResponse({}, status=503)],
@@ -347,6 +347,46 @@ async def test_backfill_limit_and_empty(monkeypatch):
     assert specs[0]["appids"] == [910001, 910002, 910003]
 
 
+# ── 反哺调度接线：发现源常开，不受自动价格总开关管 ──────────────
+
+
+@pytest.mark.asyncio
+async def test_scheduler_board_job_backfills_even_when_auto_price_off(monkeypatch):
+    """crawl.auto_price 关闭 → 榜单反哺照常（监控队列发现源不是价格更新作业）。
+
+    接线断言：预热 → backfill_specs → run_sequential(from_scheduler=True)，
+    开关关闭不得让反哺停转（无代理时的拦截属代理闸门职责，另有用例）。
+    """
+    from app.core import scheduler as sched_mod
+    from app.domains.crawl import service as crawl_service
+
+    async def _refresh_board(key: str) -> list[int]:
+        return [900001, 900002]
+
+    async def _specs(key: str, limit: int = 100):
+        return [{"scope": "appids", "appids": [900001, 900002], "kind": "top100_backfill"}]
+
+    calls: list = []
+
+    async def _run_sequential(specs, **kw):
+        calls.append((specs, kw))
+        return [{"id": 1}]
+
+    async def _auto_off() -> bool:
+        return False
+
+    monkeypatch.setattr(boards_mod, "refresh_board", _refresh_board)
+    monkeypatch.setattr(boards_mod, "backfill_specs", _specs)
+    monkeypatch.setattr(crawl_service, "run_sequential", _run_sequential)
+    monkeypatch.setattr(sched_mod, "price_auto_enabled", _auto_off)
+
+    await sched_mod._make_board_job("topsellers")()
+
+    assert calls, "开关关闭不得停掉榜单反哺（发现源常开）"
+    assert calls[0][0][0]["kind"] == "top100_backfill"
+    assert calls[0][1].get("from_scheduler") is True, "反哺仍是自动路径，须过代理闸门"
+
+
 # ── list_games 集成（真实本地库只读 + mock 热榜）──────────────
 
 
@@ -363,7 +403,7 @@ def _library_has_games() -> bool:
 
 @pytest.mark.asyncio
 async def test_list_top100_empty_board(monkeypatch):
-    """热榜拉取失败（空榜）→ 列表返回空集而非随机游戏（原版语义）。"""
+    """热榜拉取失败（空榜）→ 列表返回空集而非随机游戏。"""
     _mock_fetch(monkeypatch, [_FakeResponse({}, status=503)])
 
     r = await service.list_games(sort="top100")

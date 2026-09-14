@@ -39,7 +39,7 @@ const crawl = {
   /* ── 启动爬取 ── */
   'crawl.start.desc':
     '区服来自「我」页配置；新游戏首次入库不走打折预检，刷新场景可用预检省请求。',
-  'crawl.start.scopeWishlist': '愿望单全量',
+  'crawl.start.scopeWishlist': '监控池全量',
   'crawl.start.scopeAppids': '指定 AppID',
   'crawl.start.appidsPlaceholder': '例如 620,105600',
   'crawl.start.button': '启动任务',
@@ -60,9 +60,9 @@ const crawl = {
   'crawl.autoPrice.badgeOn': '自动更新中',
   'crawl.autoPrice.badgeOff': '已转手动',
   'crawl.autoPrice.tip':
-    '关闭后所有定时爬取停转：6h 主轮、失败修复、榜单反哺、新增条目的入库首爬都不再自动执行；手动发起的爬取与账户同步（只同步成员资格）不受影响',
+    '关闭后定时价格更新停转：6h 主轮（含捆绑包刷新）、失败修复、新增条目的入库首爬都不再自动执行；榜单反哺与手动发起的爬取不受影响（账户同步只同步成员资格）',
   'crawl.autoPrice.on': '自动价格更新已开启：按锚点网格每 6 小时自动爬价',
-  'crawl.autoPrice.off': '自动价格更新已关闭：所有定时爬取停转，价格更新全凭手动',
+  'crawl.autoPrice.off': '自动价格更新已关闭：定时爬价停转，价格更新全凭手动',
   'crawl.autoPrice.failed': '设置失败，请重试',
 
   /* ── 捆绑包导入 ── */
@@ -72,9 +72,9 @@ const crawl = {
   'crawl.bundle.refreshed': '已刷新：{name}',
   'crawl.bundle.imported': '已导入：{name}',
 
-  /* ── 批量导入（爬取入库作监控数据；不进愿望单/监控池）── */
+  /* ── 批量导入（加入监控池 + 首爬入库）── */
   'crawl.bulk.desc':
-    '粘贴 Steam 商店 / SteamDB 游戏链接或裸 AppID（空格、逗号、换行分隔均可，自动去重）；导入即首爬入库作监控数据——不进愿望单与监控池，要持续盯价请在游戏卡点星标关注。',
+    '粘贴 Steam 商店 / SteamDB 游戏链接或裸 AppID（空格、逗号、换行分隔均可，自动去重）；导入即加入监控池并首爬入库——池内游戏全部参与价格爬取，要升到第一优先级请在 Steam 愿望单保留它或点星标关注。',
   'crawl.bulk.import': '导入监控',
   'crawl.bulk.moreHidden': '其余 {n} 条明细从略 —— 到「游戏商店」页查看全部',
 
@@ -87,7 +87,7 @@ const crawl = {
      词条是应用自有静态文案（非用户输入），v-html 无注入面；本处无 code 样式，
      故 <code> 走浏览器默认，与迁移前逐字相同。 */
   'crawl.fav.desc':
-    '浏览器脚本控制台导出的收藏列表（<code>FAVORITES_RESPONSE</code> 的 <code>favorites</code> JSON，数字数组或对象数组）整段粘贴即可；未入库的游戏自动爬取入库作监控数据——不进愿望单与关注列表，要持续盯价请逐款星标关注。',
+    '浏览器脚本控制台导出的收藏列表（<code>FAVORITES_RESPONSE</code> 的 <code>favorites</code> JSON，数字数组或对象数组）整段粘贴即可；导入即加入监控池，未入库的游戏自动爬取入库作监控数据。',
   'crawl.fav.import': '导入收藏',
   'crawl.fav.placeholder':
     '[2561580,1173800,1173820,3837340]\n或 [{"appid":620,"name":"Portal 2"},…]',
@@ -98,6 +98,7 @@ const crawl = {
   'crawl.import.detectedInvalid': '{n} 条未识别',
   'crawl.import.added': '新导入 {n}',
   'crawl.import.alreadyTracked': '已在库 {n}',
+  'crawl.import.poolAdded': '加入监控池 {n}',
   'crawl.import.unrecognized': '未识别 {n}',
   'crawl.import.invalid': '无效 {n}',
   'crawl.import.firstCrawlStarted': '首爬已启动',
@@ -162,6 +163,7 @@ const crawl = {
   'crawl.kind.backfill': '孤儿回补',
   'crawl.kind.import': '批量导入',
   'crawl.kind.favImport': '收藏导入',
+  'crawl.kind.poolAdd': '添加监控',
 } as const
 
 export default crawl

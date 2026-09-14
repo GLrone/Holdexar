@@ -334,7 +334,7 @@ class TestIdentitySemanticsSplit:
 
 
 class TestBundleDiscovery:
-    """游戏条目 purchase_options → 捆绑包发现桩（lane 播种自动整区抓价）。"""
+    """游戏条目 purchase_options → 捆绑包发现桩（链尾全量刷新统一抓价）。"""
 
     def test_extracts_identity_and_semantics(self) -> None:
         from app.crawler import browse_store as bs
@@ -499,3 +499,46 @@ def _run(coro):
     import asyncio
 
     return asyncio.run(coro)
+
+
+class TestFetchRegions:
+    """抓取区集：只发监控启用区；南亚（pk 聚合位）拆 pk/bd 两发。"""
+
+    def test_fetch_ccs_follows_enabled_and_expands_south_asia(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.domains.regions import service as regions_service
+
+        async def _enabled(_explicit):
+            return ["cn", "pk", "us"]
+
+        monkeypatch.setattr(regions_service, "effective_regions", _enabled)
+        assert _run(refresh._bundle_fetch_ccs()) == ["cn", "pk", "bd", "us"]
+
+    def test_fetch_regions_batched_fans_out_monitored_ccs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """整表抓取只对监控区（含南亚拆区）各发一发，不再全量 41 区。"""
+        from app.domains.regions import service as regions_service
+
+        async def _enabled(_explicit):
+            return ["cn", "pk"]
+
+        seen: list[str] = []
+
+        async def _fake_region(session, specs, cc, proxy):
+            seen.append(cc)
+            assert len(specs) == 1
+            return [_item(id=13608)]
+
+        monkeypatch.setattr(regions_service, "effective_regions", _enabled)
+        monkeypatch.setattr(refresh, "_fetch_browse_region", _fake_region)
+
+        out = _run(refresh._fetch_regions_batched(None, [(13608, 0)], None))
+
+        assert sorted(seen) == ["bd", "cn", "pk"]
+        assert {r["region_code"] for r in out[13608]} == {"cn", "pk", "bd"}
+
+    def test_bd_currency_follows_south_asia_slot(self) -> None:
+        """BD 不在 CC_LIST，币种随南亚位（USD）——落行不出现 None 币种。"""
+        assert refresh._CC_CURRENCY["bd"] == refresh._CC_CURRENCY["pk"] == "USD"
