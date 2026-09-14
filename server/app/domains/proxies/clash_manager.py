@@ -1,80 +1,121 @@
-"""Clash 内核管理：检测 / 自动下载 / 订阅启动 / 停止。
+"""Clash 内核管理：随包内核就位 / 检测 / 网络下载兜底 / 订阅启动 / 停止。
 
-下载逻辑移植自旧 crawler/clash_manager.py（mihomo v1.19.20，ghfast.top 镜像优先）。
-订阅下载对齐旧爬虫脚本 steam_price_async.py 的链式引导：直连失败且内核
-已在跑时经本地混合端口重试。红线：本模块不内置任何订阅源，订阅 URL
-只能来自用户设置。
+内核与 GeoIP 数据**随发行包分发**（版本固定在 kernel_release.MIHOMO_VERSION，
+源目录 assets/clash → 打包后随资源目录），用户机器上不再检索本机装没装 Clash：
+内核由 ensure_kernel() 复制进 data/clash/，detect_kernel() 只认这一处。
+网络下载（download_kernel*）退居兜底，只服务两类场景：源码 clone 尚未补资产、
+用户手工删掉了 data/clash/ 里的可执行文件。
+
+订阅下载的链式引导：直连失败且内核已在跑时经本地混合端口重试。
+红线：本模块不内置任何订阅源，订阅 URL 只能来自用户设置。
 """
 from __future__ import annotations
 
 import base64
 import io
 import logging
-import os
-import platform
 import re
 import shutil
 import subprocess
 import urllib.parse
 import zipfile
+from collections.abc import Sequence
 from pathlib import Path
 
 import httpx
 
 from app.core.app_info import APP_SLUG
+from app.core.config import get_settings
+from app.domains.proxies.kernel_release import (
+    GEO_ASSETS,
+    MIHOMO_VERSION,
+    MIRRORS,
+    is_windows,
+    kernel_filename,
+    mihomo_url,
+)
 
 logger = logging.getLogger(__name__)
 
-MIHOMO_VERSION = "v1.19.20"
-_MIRRORS = [
-    "https://ghfast.top/",
-    "https://gh-proxy.com/",
-    "",  # 直连兜底
-]
-
-# mihomo 初始化必需的 GeoIP 数据；缺失时内核会自行去 GitHub 下载——
-# 直连网络下必卡死。每台机器的 Clash 安装位置不同，启动前逐个候选目录检索补齐。
-_GEO_FILES = ("Country.mmdb", "geoip.dat", "geosite.dat", "ASN.mmdb")
-_GEO_SOURCE_DIRS = [
-    Path(os.environ.get("APPDATA", "")) / "io.github.clash-verge-rev.clash-verge-rev",
-    Path(os.environ.get("APPDATA", "")) / "clash-verge",
-    Path(os.environ.get("APPDATA", "")) / "clash_win",
-    Path.home() / ".config" / "mihomo",
-    Path.home() / ".config" / "clash",
-    Path.home() / "scoop" / "apps" / "mihomo" / "current",
-    Path("C:/Program Files/Clash Verge"),
-]
+# 兼容旧引用名：镜像链（网络下载兜底用）与内核数据目录需就位的 GeoIP 数据
+_MIRRORS = MIRRORS
+_GEO_FILES = tuple(GEO_ASSETS)
 
 
-def ensure_geo_files(data_dir: Path) -> dict:
-    """内核数据目录缺 GeoIP 库时，从本机常见 Clash 安装位置检索复制。
+def bundled_clash_dir() -> Path:
+    """随包内核目录（发行包 `_MEIPASS/clash`；源码态 `assets/clash`）。"""
+    return get_settings().clash_dir
 
-    只补缺失文件、同名不覆盖；找不到的交给内核自行下载（最后手段）。
-    返回 {"copied": [...], "missing": [...]}。
+
+def _copy_bundled(kernel_path: Path, names: Sequence[str]) -> dict:
+    """把随包目录里的 `names` 补齐进内核目录（只补缺失，同名一律不覆盖）。
+
+    「不覆盖」是刻意的：用户可能手动换了更高版本的内核、或自己更新过 GeoIP
+    数据，静默覆盖等于替用户做决定。返回 {"copied": [...], "missing": [...]}。
     """
-    d = kernel_dir(data_dir)
+    bundle = bundled_clash_dir()
+    kernel_path.mkdir(parents=True, exist_ok=True)
     copied: list[str] = []
     missing: list[str] = []
-    for name in _GEO_FILES:
-        if (d / name).is_file():
+    for name in names:
+        target = kernel_path / name
+        if target.is_file():
             continue
-        src = next(
-            (base / name for base in _GEO_SOURCE_DIRS if (base / name).is_file()),
-            None,
-        )
-        if src is not None:
-            shutil.copy2(src, d / name)
+        src = bundle / name
+        if src.is_file():
+            shutil.copy2(src, target)
             copied.append(name)
         else:
             missing.append(name)
-    if copied:
-        logger.info("GeoIP 数据已从本机 Clash 安装位置补齐：%s", ", ".join(copied))
-    if missing:
-        logger.warning(
-            "GeoIP 数据缺失且本机未找到：%s（内核将尝试自行下载，直连网络下可能卡住）",
-            ", ".join(missing),
-        )
     return {"copied": copied, "missing": missing}
+
+
+def ensure_kernel_files(kernel_path: Path) -> dict:
+    """内核目录补齐：可执行文件 + GeoIP 数据（随包资产为唯一来源）。
+
+    入参是**内核目录本身**（config.yaml 所在处，也是 mihomo `-d` 的工作目录）；
+    以 data_dir 为入参的版本见 ensure_kernel()。
+    """
+    return _copy_bundled(kernel_path, (kernel_filename(), *_GEO_FILES))
+
+
+def ensure_kernel(data_dir: Path) -> dict:
+    """随包内核就位（data_dir 版本）：把内核与 GeoIP 数据补进 data/clash/。
+
+    随包资产落到用户数据目录的唯一入口。返回
+    {"kernelReady": bool, "copied": [...], "missing": [...], "bundleDir": str}；
+    发行包缺内核（源码 clone 未补资产）时 kernelReady=False，由调用方决定
+    是回退网络下载还是提示用户。
+    """
+    result = _copy_bundled(kernel_dir(data_dir), (kernel_filename(), *_GEO_FILES))
+    ready = kernel_exe(data_dir).is_file()
+    if result["copied"]:
+        logger.info("随包内核资产已就位：%s", ", ".join(result["copied"]))
+    if not ready:
+        logger.warning(
+            "随包内核不可用（%s 内无 %s），将回退网络下载",
+            bundled_clash_dir(), kernel_filename(),
+        )
+    elif result["missing"]:
+        logger.info(
+            "内核目录缺少 %s（内核启动时会尝试自行下载，直连网络下可能卡住）",
+            ", ".join(result["missing"]),
+        )
+    return {
+        "kernelReady": ready,
+        "copied": result["copied"],
+        "missing": result["missing"],
+        "bundleDir": str(bundled_clash_dir()),
+    }
+
+
+def ensure_geo_files(data_dir: Path) -> dict:
+    """内核数据目录缺 GeoIP 库时，从随包目录补齐。
+
+    只补缺失文件、同名不覆盖；随包也没有的（如 ASN 数据）交给内核自行下载。
+    返回 {"copied": [...], "missing": [...]}。
+    """
+    return _copy_bundled(kernel_dir(data_dir), _GEO_FILES)
 
 
 def decode_profile_title(raw: str | None) -> str | None:
@@ -94,8 +135,8 @@ def decode_profile_title(raw: str | None) -> str | None:
 def _decode_content_disposition_filename(raw: str | None) -> str | None:
     """Content-Disposition 里的文件名（机场名常用通道）。
 
-    对齐 clash-verge-rev prfitem.rs：先 RFC 5987 扩展格式 filename*
-    （percent-decode 后按 '' 切实际值），回落普通 filename=；
+    先 RFC 5987 扩展格式 filename*（percent-decode 后按 '' 切实际值），
+    回落普通 filename=；
     取不到返回 None。头常见形态：
     attachment; filename*=UTF-8''%E6%9C%BA%E5%9C%BA%E5%90%8D.yaml
     attachment; filename="airport.yaml"
@@ -121,13 +162,13 @@ def _decode_content_disposition_filename(raw: str | None) -> str | None:
 
 
 def subscription_auto_name(headers: httpx.Headers, url: str) -> str | None:
-    """订阅自动取名链（对齐 clash-verge-rev，仅保存时调用；刷新不覆写）。
+    """订阅自动取名链（仅保存时调用；刷新不覆写）。
 
     优先级：profile-title 头（base64/纯文本，面板专用通道）→
     Content-Disposition 文件名 → URL 末段（去 query，percent 解码）。
     三级全空返回 None（调用方落 null，前端回落显示 URL）。
-    Verge 兜底是固定字符串 "Remote File"——这里返回 None 保持
-    「无机场名」的诚实语义，不造假名。
+    兜底若用固定字符串（如 "Remote File"）会造出一个假机场名——
+    这里返回 None 保持「无机场名」的诚实语义。
     """
     title = decode_profile_title(headers.get("profile-title"))
     if title:
@@ -156,12 +197,8 @@ def subscription_auto_name(headers: httpx.Headers, url: str) -> str | None:
     return None
 
 
-# 机场面板普遍校验 UA：httpx 默认 UA 会被 403，伪装 Clash 客户端
-_SUB_HEADERS = {"User-Agent": "clash-verge/1.7.7"}
-
-
-def _is_windows() -> bool:
-    return platform.system() == "Windows"
+# 机场面板普遍校验 UA：httpx 默认 UA 会被 403，伪装 Clash 客户端（内核同款标识）
+_SUB_HEADERS = {"User-Agent": "mihomo/1.19.20"}
 
 
 def _port_reachable(port: int, host: str = "127.0.0.1", timeout: float = 0.3) -> bool:
@@ -206,28 +243,35 @@ def kernel_dir(data_dir: Path) -> Path:
 
 
 def kernel_exe(data_dir: Path) -> Path:
-    return kernel_dir(data_dir) / ("mihomo.exe" if _is_windows() else "mihomo")
+    return kernel_dir(data_dir) / kernel_filename()
 
 
 def detect_kernel(data_dir: Path) -> dict:
-    """检测本地内核：data/clash/ 优先，再找常见安装位置。"""
-    candidates = [
-        kernel_exe(data_dir),
-        Path.home() / "scoop" / "apps" / "mihomo" / "current" / "mihomo.exe",
-        Path("C:/Program Files/Clash/mihomo.exe"),
-        Path("C:/Program Files/Clash Verge/mihomo.exe"),
-    ]
-    for candidate in candidates:
-        if candidate.is_file():
-            return {"found": True, "path": str(candidate), "builtin": candidate == kernel_exe(data_dir)}
-    # PATH 上找
-    which = subprocess.run(
-        ["where" if _is_windows() else "which", "mihomo"],
-        capture_output=True, text=True,
-    )
-    if which.returncode == 0 and which.stdout.strip():
-        return {"found": True, "path": which.stdout.strip().splitlines()[0], "builtin": False}
+    """检测内核就位情况：只认本应用的内核目录 data/clash/。
+
+    刻意**不检索本机其他 Clash 安装**（scoop / Program Files / PATH）：内核已随
+    发行包分发且版本固定，借用用户自装的内核会让「内核从哪来、是哪个版本」不可控
+    ——用户卸载 Verge 或改了 PATH，代理会在毫无提示的情况下失去内核。
+    内核只可能来自随包资产，故 found=True 时 builtin 恒为 True（字段保留给前端）。
+    """
+    exe = kernel_exe(data_dir)
+    if exe.is_file():
+        return {"found": True, "path": str(exe), "builtin": True}
     return {"found": False, "path": None, "builtin": False}
+
+
+def install_kernel(data_dir: Path) -> dict:
+    """安装内核：随包资产优先（本地复制，瞬时完成），随包缺失才走网络下载。
+
+    前端「自动下载内核」与保存订阅时的自动补装都走这里。发行包必然带内核，
+    网络那一支只服务两类情形：源码 clone 尚未补资产、用户手工删了 exe。
+    """
+    ensure_kernel(data_dir)
+    target = kernel_exe(data_dir)
+    if target.is_file():
+        return {"ok": True, "path": str(target), "source": "bundled", "via": "随包资产"}
+    logger.warning("随包内核不可用，回退网络下载（%s）", MIHOMO_VERSION)
+    return download_kernel(data_dir) if is_windows() else download_kernel_linux(data_dir)
 
 
 # 内核下载进度（模块级单例：下载线程写，轮询端点读；dict 原子替换免锁）
@@ -286,13 +330,13 @@ def _download_zip_kernel(
 def download_kernel(data_dir: Path) -> dict:
     """下载 mihomo 内核到 data/clash/（镜像优先，逐镜像过通道链）。
 
-    同步阻塞，调用方放线程；进度写 _KERNEL_PROGRESS 供轮询端点上报。
+    **兜底路径**：正常安装走 install_kernel() 的随包复制。同步阻塞，调用方放
+    线程；进度写 _KERNEL_PROGRESS 供轮询端点上报。
     """
     _kernel_progress_reset()
     _KERNEL_PROGRESS["running"] = True
     try:
-        asset = f"mihomo-windows-amd64-compatible-{MIHOMO_VERSION}.zip"
-        base = f"https://github.com/MetaCubeX/mihomo/releases/download/{MIHOMO_VERSION}/{asset}"
+        base = mihomo_url()
         target = kernel_exe(data_dir)
         # 内核没下载成功自己必然没跑：仅直连 + 本地混合端口（用户 Verge 等）
         channels = _download_attempts(None, None)
@@ -323,14 +367,13 @@ def download_kernel(data_dir: Path) -> dict:
 
 
 def download_kernel_linux(data_dir: Path) -> dict:
-    """linux: gz 单文件（进度按流式字节数上报）。"""
+    """linux: gz 单文件（进度按流式字节数上报）。兜底路径，同上。"""
     import gzip
 
     _kernel_progress_reset()
     _KERNEL_PROGRESS["running"] = True
     try:
-        asset = f"mihomo-linux-amd64-compatible-{MIHOMO_VERSION}.gz"
-        base = f"https://github.com/MetaCubeX/mihomo/releases/download/{MIHOMO_VERSION}/{asset}"
+        base = mihomo_url()
         target = kernel_exe(data_dir)
         for mirror in _MIRRORS:
             url = mirror + base if mirror else base
@@ -393,6 +436,20 @@ def ensure_controller(config_text: str) -> tuple[str, str, str]:
         f"secret: {CONTROLLER_SECRET}\n"
     )
     return config_text.rstrip() + "\n" + injection, f"http://127.0.0.1:{CONTROLLER_PORT}", CONTROLLER_SECRET
+
+
+def config_unchanged(startup_text: str | None, disk_text: str) -> bool:
+    """内核启动文本与磁盘配置是否等价（重启开关的判据）。
+
+    config.yaml 是「下载到的原始订阅文本 + 启动时注入的 external-controller」，
+    而重拉下载写回磁盘的是**原始文本**（没有注入段）——直接字符串比较会把
+    「机场内容其实没变」判成变了，每次重拉都白重启一次内核（在跑的连接全断）。
+    这里先补注入再比，语义回到「内容真的变了才重启」。
+    """
+    if startup_text == disk_text:
+        return True
+    normalized, _url, _secret = ensure_controller(disk_text)
+    return startup_text == normalized
 
 
 # 非真实节点（控制器逻辑节点/内置）
@@ -487,7 +544,9 @@ class ClashRuntime:
             if not restart_if_changed:
                 return self.status()
             disk_text = Path(config_path).read_text(encoding="utf-8", errors="ignore")
-            if self.config_path == config_path and self._startup_text == disk_text:
+            if self.config_path == config_path and config_unchanged(
+                self._startup_text, disk_text
+            ):
                 return self.status()
             self.stop()
         try:
@@ -495,9 +554,9 @@ class ClashRuntime:
         except Exception as e:  # noqa: BLE001 —— 清理失败不阻断启动（psutil 缺失等）
             logger.warning("残留内核清理跳过：%s", e)
         try:
-            ensure_geo_files(Path(config_path).parent)
+            ensure_kernel_files(Path(config_path).parent)
         except Exception as e:  # noqa: BLE001
-            logger.warning("GeoIP 检索失败：%s", e)
+            logger.warning("随包内核资产补齐失败：%s", e)
         config_text = Path(config_path).read_text(encoding="utf-8", errors="ignore")
         self.port = parse_mixed_port(config_text)
         # 注入/解析 external-controller，供节点检测（出口 IP / 存活）使用

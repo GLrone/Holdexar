@@ -1,10 +1,8 @@
 """bills 域：Steam 完整账单分析（解析器）。
 
-由维护者本人的前作 `汇率导出脚本` 的解析函数演进而来（同一作者的
-早期脚本，非第三方代码），行为与它保持一致：中英文双语、货币符号解析、
+解析 Steam_Report_*.json（Steam 消费历史导出件）：中英文双语、货币符号解析、
 钱包充值/退款识别、去重、退款↔原单回溯匹配（orig_is_gift 归属）。
-`server/tests/test_bills.py` 以那批历史导出为对账基准，故行为不可随意变动。
-输入为外部工具 steam_data_exporter.user.js 导出的 Steam_Report_*.json。
+`server/tests/test_bills.py` 以真实转储为对账基准，故行为不可随意变动。
 """
 from __future__ import annotations
 
@@ -128,7 +126,7 @@ def classify_type(tx_type: str, item_str: str = "", wallet_change: str = "") -> 
         return "store"
     return "other"
 
-# ── 许可分类（分类器《Steam 许可分类器》v2.5.5 MATCH_CFG 同源）──
+# ── 许可分类（商店 / 零售 / 免费 / 礼物四类）──
 # 四类关键词（正则，命中即归类，顺序：store → retail → free → gift）：
 #   store  Steam 商店 / Steam Store
 #   retail 零售 / Retail
@@ -314,7 +312,6 @@ def get_rate_from_rows(
 ) -> float | None:
     """从 (date, rate_cny) 行集查汇率：精确日 → 逐日回溯最多 15 天。
 
-    对齐源 get_rate()（汇率导出脚本 L219-233）；
     rows 需按日期升序传入（回溯时从最近可用日往回找）。
     """
     if currency == "CNY":

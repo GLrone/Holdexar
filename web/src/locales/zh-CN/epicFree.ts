@@ -1,4 +1,4 @@
-/* epicFree 词条 —— Epic 喜加一卡片组（components/steamhl/EpicFreeCards.vue）。
+/* epicFree 词条 —— Epic 喜加一卡片组（components/business/EpicFreeCards.vue）。
 
    倒计时/更新时间是参数化整句：中英「剩 {n} 天 / {n}d left」语序不同，
    拆「标签 + 值」拼不回去，全部整句取词。

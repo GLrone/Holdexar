@@ -1,4 +1,9 @@
-"""wishlist 域服务：账户绑定 / 愿望单同步 / 差异入库。
+"""wishlist 域服务：账户绑定 / 愿望单同步 / 监控池管理（条目增删）。
+
+监控池三模块：愿望单与关注系统是叠加在监控条目之上的爬取第一优先级
+（wishlisted / manual 标记，见 domains.crawl 的队列排序），监控池管理
+（add_pool_items / remove_pool_items）负责监控条目的增删与批量操作——
+池内所有游戏均为必须爬取的对象。
 
 数据源（对齐 07_user_misc/fetch_user_games.py）：
 - 愿望单 IWishlistService/GetWishlist/v1 —— 免 Key，公开资料可读
@@ -459,12 +464,19 @@ async def sync_account(steamid: str, auto_crawl: bool = True) -> dict:
             if row is None:
                 session.add(
                     WishlistItem(
-                        steamid=steamid, appid=appid, added_at=_naive(added_dt), active=True
+                        steamid=steamid, appid=appid, added_at=_naive(added_dt),
+                        active=True, wishlisted=True,
                     )
                 )
                 new_appids.append(appid)
-            elif not row.active:
-                row.active = True
+            else:
+                # 成员资格覆写：Steam 愿望单现存条目一律标愿望单（爬取第一
+                # 优先级）；excluded（本地手动移除）行不复活——用户删掉的
+                # 条目不能 15 分钟后被同步洗回来，成员标记照常记录
+                # （Steam 侧事实），重新添加时经成员标记恢复优先级。
+                row.wishlisted = True
+                if not row.active and not row.excluded:
+                    row.active = True
 
         # 已购并入任务池（active 标记，kinds 按账户开关——任务页「已购游戏抓取
         # ·账户设置」可关掉库太大的账户，只盯愿望单）
@@ -487,7 +499,7 @@ async def sync_account(steamid: str, auto_crawl: bool = True) -> dict:
                     )
                     new_owned_appids.append(g["appid"])
                     new_appids.append(g["appid"])
-                elif not row.active:
+                elif not row.active and not row.excluded:
                     row.active = True
 
         # 已购标记覆写：以本次 GetOwnedGames 结果为准（库转私有时回落为愿望单条目）。
@@ -498,18 +510,22 @@ async def sync_account(steamid: str, auto_crawl: bool = True) -> dict:
 
         # 愿望单里已移除的且非已购 → active=0（已购条目常驻任务池，不随愿望单移除停用）。
         # 例外：通道失败时已购状态未知，已购行保守保留，等下次成功同步再判定；
-        # 手动关注条目（manual，游戏卡星标）免疫——存续不取决于 Steam 真实愿望单
-        # （账户同步 15min 高频后，无免疫的手动条目 15 分钟内即被反向核对洗掉）。
+        # 手动来源条目免疫——星标关注（manual）与手动入池（manual_pool）的
+        # 存续不取决于 Steam 真实愿望单（账户同步 15min 高频后，无免疫的
+        # 手动条目 15 分钟内即被反向核对洗掉）。
         wished_ids = {it["appid"] for it in wishlist}
         if wishlist:
             for appid, row in existing.items():
-                if appid in wished_ids or appid in owned_ids or not row.active:
-                    continue
-                if getattr(row, "manual", False):
-                    continue
-                if owned_failed and row.owned:
-                    continue
-                row.active = False
+                if appid not in wished_ids:
+                    # 成员资格覆写：Steam 侧已移除 → 清愿望单标
+                    row.wishlisted = False
+                    if appid in owned_ids or not row.active:
+                        continue
+                    if getattr(row, "manual", False) or getattr(row, "manual_pool", False):
+                        continue
+                    if owned_failed and row.owned:
+                        continue
+                    row.active = False
 
         total_active = (
             await session.execute(
@@ -621,15 +637,22 @@ async def sync_account(steamid: str, auto_crawl: bool = True) -> dict:
 
 
 async def list_items(steamid: str | None = None) -> list[dict]:
-    """监控条目列表（名称/封面从 games 主档 LEFT JOIN 带出）。
+    """监控条目列表（按 appid 聚合：多账户同款合为一条，来源标记取并集）。
 
-    新绑未爬的条目 games 无行（name/headerImage 为 None）——前端回落显示 appid。
+    名称/封面从 games 主档 LEFT JOIN 带出；新入池未爬的条目 games 无行
+    （name/headerImage 为 None）——前端回落显示 appid。
+    来源标记：wishlisted=愿望单成员 / followed=星标关注（manual）/
+    owned=已购 / manualPool=手动入池。
     """
     from app.domains.games.models import Game
 
     wi = WishlistItem
     query = (
-        select(wi, Game.name, Game.name_en, Game.header_image)
+        select(
+            wi.steamid, wi.appid, wi.added_at,
+            wi.owned, wi.manual, wi.wishlisted, wi.manual_pool,
+            Game.name, Game.name_en, Game.header_image,
+        )
         .where(wi.active.is_(True))
         .outerjoin(Game, Game.appid == wi.appid)
     )
@@ -638,17 +661,31 @@ async def list_items(steamid: str | None = None) -> list[dict]:
     query = query.order_by(wi.appid)
     async with get_session_factory()() as session:
         rows = (await session.execute(query)).all()
-    return [
-        {
-            "steamid": item.steamid,
-            "appid": int(item.appid),
-            "addedAt": item.added_at.isoformat() if item.added_at else None,
-            "name": name,
-            "nameEn": name_en,
-            "headerImage": header_image,
-        }
-        for item, name, name_en, header_image in rows
-    ]
+
+    merged: dict[int, dict] = {}
+    for row in rows:
+        appid = int(row.appid)
+        it = merged.get(appid)
+        if it is None:
+            it = merged[appid] = {
+                "appid": appid,
+                "addedAt": row.added_at.isoformat() if row.added_at else None,
+                "name": row.name,
+                "nameEn": row.name_en,
+                "headerImage": row.header_image,
+                "steamids": [],
+                "wishlisted": False,
+                "followed": False,
+                "owned": False,
+                "manualPool": False,
+            }
+        it["steamids"].append(row.steamid)
+        # 来源标记按任一账户计（并集）：任一行落在该来源即标
+        it["wishlisted"] = it["wishlisted"] or bool(row.wishlisted)
+        it["followed"] = it["followed"] or bool(row.manual)
+        it["owned"] = it["owned"] or bool(row.owned)
+        it["manualPool"] = it["manualPool"] or bool(row.manual_pool)
+    return [merged[a] for a in sorted(merged)]
 
 
 async def list_appids() -> dict:
@@ -802,7 +839,7 @@ async def ownership(appids: list[int]) -> dict:
     "ownerAvatars": [头像URL]}}——ownerAvatars 与 owners 按下标对齐，
     无头像的账户为空串（前端落首字符占位）；无归属的 appid 不在结果里。
     - owned：主账户拥有；未配置主账户时任一账户拥有
-    - family：非主账户的追踪账户拥有（原版语义：家庭共享来源）
+    - family：非主账户的追踪账户拥有（家庭共享来源）
     - wishlist：仅存在于愿望单
     """
     from app.domains.settings.service import get_value
@@ -871,3 +908,210 @@ async def ownership(appids: list[int]) -> dict:
         elif wished_by.get(appid):
             result[str(appid)] = {"type": "wishlist", **out(wished_by[appid])}
     return {"ownerships": result}
+
+
+# ── 监控池管理：监控条目的添加 / 移除 ──────────────────────────
+#
+# 监控池 = wishlist_items 的活跃行（监控条目），池内所有游戏均为必须
+# 爬取的对象；愿望单（wishlisted）与星标关注（manual）是叠加在监控条目
+# 之上的爬取第一优先级。本节的增删操作与账户同步的差异：
+# - 添加不要求 Steam 侧名单变化（manual_pool 条目），但要求绑定账户
+#   （条目行的主键身份是 steamid）；
+# - 移除以 excluded 挡同步复活——Steam 愿望单/已购侧仍在名单时，15min
+#   一轮的账户同步不会把用户删掉的条目洗回来。
+
+
+async def resolve_pool_steamid() -> str:
+    """新监控条目的落行身份：主账号优先，回退设置页手填。"""
+    from app.domains.account import service as account_service
+
+    primary = await account_service.get_primary_steam_id()
+    if primary:
+        return primary
+    from app.domains.settings.service import get_value
+
+    return ((await get_value("account.steam_id", "")) or "").strip()
+
+
+async def _refresh_item_counts(session, steamids: set[str]) -> None:
+    """池变动后重算受影响账户的 itemCount（active 条目数口径）。"""
+    for sid in steamids:
+        account = await session.get(TrackedAccount, sid)
+        if account is None:
+            continue
+        account.item_count = int(
+            (
+                await session.execute(
+                    select(func.count())
+                    .select_from(WishlistItem)
+                    .where(
+                        WishlistItem.steamid == sid,
+                        WishlistItem.active.is_(True),
+                    )
+                )
+            ).scalar_one()
+        )
+
+
+async def add_pool_items(appids: list[int], *, auto_crawl: bool = True) -> dict:
+    """批量添加监控条目（监控池页添加 / 任务页导入共用通道）。
+
+    合法 appid 一律入池（active）：
+    - 无行：主账号下新建 manual_pool 条目——属普通监控条目（不进愿望单
+      成员标记、不产生关注），爬取队列第二优先级；
+    - 有行（愿望单/已购/关注/历史手动）：复活（active=True、清 excluded），
+      来源标记原样保留（愿望单成员复活后仍属第一优先级）。
+
+    分类：added（新入池）/ restored（已脱池恢复）/ exists（已在池）/
+    fail（无效 appid）。auto_crawl=True 且池内有变化时触发首爬
+    （kind="pool_add"，过代理前置闸门）；任务占用/无可用代理静默跳过，
+    下轮 6h 全池刷新兜底。无绑定账户且存在新条目时抛 ValueError。
+    """
+    results: list[dict] = []
+    clean: list[int] = []
+    for a in appids:
+        try:
+            appid = int(a)
+        except (TypeError, ValueError):
+            appid = 0
+        if appid <= 0:
+            results.append({"appid": a, "status": "fail", "detail": "AppID 无效"})
+            continue
+        if appid not in clean:
+            clean.append(appid)
+
+    added = restored = exists = 0
+    touched: list[int] = []
+    if clean:
+        async with get_session_factory()() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(WishlistItem).where(WishlistItem.appid.in_(clean))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            by_appid: dict[int, list[WishlistItem]] = {}
+            for row in rows:
+                by_appid.setdefault(int(row.appid), []).append(row)
+
+            need_new = [a for a in clean if a not in by_appid]
+            new_steamid: str | None = None
+            if need_new:
+                new_steamid = await resolve_pool_steamid()
+                if not new_steamid:
+                    raise ValueError("尚未绑定 SteamID64（请先在「我」页绑定账户）")
+                now = _naive(get_beijing_time_obj())
+                for a in need_new:
+                    session.add(
+                        WishlistItem(
+                            steamid=new_steamid,
+                            appid=a,
+                            added_at=now,
+                            active=True,
+                            owned=False,
+                            manual=False,
+                            manual_pool=True,
+                        )
+                    )
+
+            for appid in clean:
+                group = by_appid.get(appid)
+                if group and any(r.active for r in group):
+                    for r in group:
+                        r.excluded = False  # 在池条目不应带移除标（状态一致性）
+                    results.append({"appid": appid, "status": "exists", "detail": "已在监控池"})
+                    exists += 1
+                    continue
+                if group:
+                    for r in group:
+                        r.active = True
+                        r.excluded = False
+                    results.append({"appid": appid, "status": "restored", "detail": "已恢复到监控池"})
+                    restored += 1
+                else:
+                    results.append({"appid": appid, "status": "added", "detail": "已加入监控池"})
+                    added += 1
+                touched.append(appid)
+
+            await _refresh_item_counts(
+                session,
+                {r.steamid for r in rows} | ({new_steamid} if new_steamid else set()),
+            )
+            await session.commit()
+
+    crawl_triggered = False
+    if auto_crawl and touched:
+        from app.domains.crawl import service as crawl_service
+
+        try:
+            # 首爬：新增/恢复的条目若无 games 行（从未抓过），下轮全池刷新的
+            # games 行侧看不到它——池内行本就排在全池 head，会随本轮一并抓。
+            await crawl_service.start_job(
+                scope="appids", appids=touched, kind="pool_add", from_scheduler=True
+            )
+            crawl_triggered = True
+        except (RuntimeError, ValueError) as e:
+            logger.info("监控池新增 %d 项未自动爬取（%s）", len(touched), e)
+
+    return {
+        "results": results,
+        "added": added,
+        "restored": restored,
+        "exists": exists,
+        "fail": sum(1 for r in results if r["status"] == "fail"),
+        "crawlTriggered": crawl_triggered,
+    }
+
+
+async def remove_pool_items(appids: list[int]) -> dict:
+    """批量移除监控条目（监控池管理）。
+
+    所有账户的该 appid 行一并脱池：
+    - active=False：从监控池与爬取队列移除；
+    - excluded=True：同步复活挡标（愿望单/已购侧仍在 Steam 名单时，
+      15min 一轮的账户同步不会把条目洗回来）；
+    - manual=False：星标关注是池内子集（关注 = 入池），脱池后不再有
+      关注态——重新添加不会带着旧星标。
+
+    返回 {results, removed, missing}：removed 以 appid 计（池内移除数），
+    missing 为无池内行的 appid 数。
+    """
+    results: list[dict] = []
+    removed = missing = 0
+    clean: list[int] = []
+    for a in appids:
+        try:
+            appid = int(a)
+        except (TypeError, ValueError):
+            continue
+        if appid > 0 and appid not in clean:
+            clean.append(appid)
+    if clean:
+        async with get_session_factory()() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(WishlistItem).where(WishlistItem.appid.in_(clean))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            active_ids = {int(r.appid) for r in rows if r.active}
+            for row in rows:
+                row.active = False
+                row.excluded = True
+                row.manual = False
+            await _refresh_item_counts(session, {r.steamid for r in rows})
+            await session.commit()
+        for appid in clean:
+            if appid in active_ids:
+                results.append({"appid": appid, "status": "removed", "detail": "已移出监控池"})
+                removed += 1
+            else:
+                results.append({"appid": appid, "status": "missing", "detail": "不在监控池"})
+                missing += 1
+    return {"results": results, "removed": removed, "missing": missing}

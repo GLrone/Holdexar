@@ -35,7 +35,7 @@ import { useRegionsStore } from '@/stores/regions'
 import { useRatesStore } from '@/stores/rates'
 import RegionFlag from '@/components/RegionFlag.vue'
 import CurrencyFlag from '@/components/CurrencyFlag.vue'
-import EpicFreeCards from '@/components/steamhl/EpicFreeCards.vue'
+import EpicFreeCards from '@/components/business/EpicFreeCards.vue'
 
 const router = useRouter()
 const regionsStore = useRegionsStore()

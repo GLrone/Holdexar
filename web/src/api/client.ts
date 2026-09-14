@@ -675,15 +675,37 @@ export interface TrackedAccount {
 }
 
 export interface PoolItemPayload {
-  steamid: string
   appid: number
   addedAt: string | null
-  /** 游戏名（games 主档中文名；新绑未爬时为 null，前端回落显示 appid） */
+  /** 游戏名（games 主档中文名；新入池未爬时为 null，前端回落显示 appid） */
   name?: string | null
   /** 游戏英文名（games 主档 name_en；监控条目搜索用） */
   nameEn?: string | null
-  /** 封面缩略图 URL（games 主档 header_image；新绑未爬时为 null） */
+  /** 封面缩略图 URL（games 主档 header_image；新入池未爬时为 null） */
   headerImage?: string | null
+  /** 覆盖该条目的追踪账户（多账户同款聚合为一条的来源清单） */
+  steamids: string[]
+  /** 愿望单成员（Steam 愿望单同步来源；爬取第一优先级） */
+  wishlisted: boolean
+  /** 星标关注（游戏卡星标；爬取第一优先级） */
+  followed: boolean
+  /** 已购库来源（普通监控条目） */
+  owned: boolean
+  /** 手动加入监控池（池页添加 / 导入；普通监控条目） */
+  manualPool: boolean
+}
+
+/** 监控条目批量操作结果（添加 / 移除共用逐条明细形状） */
+export interface PoolMutationResult {
+  results: { appid: number | string; status: string; detail: string }[]
+  added?: number
+  restored?: number
+  exists?: number
+  removed?: number
+  missing?: number
+  fail?: number
+  /** 添加后自动触发首爬（任务占用 / 无可用代理时为 false） */
+  crawlTriggered?: boolean
 }
 
 export interface SyncResult {
@@ -757,6 +779,12 @@ export const watchPoolApi = {
     request<PoolItemPayload[]>('GET', `/wishlist${toQuery({ steamid })}`),
   /** 监控池 appid 轻量全集（dashboard 展厅判定用，避免全量条目的大 JSON） */
   appids: () => request<{ appids: number[]; total: number }>('GET', '/wishlist/appids'),
+  /** 批量添加监控条目（池页添加 / 任务页导入共用；单批上限 500，超出分批调） */
+  addItems: (appids: number[]) =>
+    request<PoolMutationResult>('POST', '/pool/items', { appids }),
+  /** 批量移除监控条目（脱池 + 同步免疫 + 清星标） */
+  removeItems: (appids: number[]) =>
+    request<PoolMutationResult>('POST', '/pool/items/remove', { appids }),
 }
 
 // ─── follows（关注列表：游戏卡星标 = 追踪池 manual 条目）──────────────────
@@ -819,12 +847,16 @@ export const crawlApi = {
   jobs: (limit = 20) => request<CrawlJob[]>('GET', `/crawl/jobs${toQuery({ limit })}`),
   active: () => request<{ activeJobId: number | null }>('GET', '/crawl/active'),
   /**
-   * 批量导入监控：后端只分类（ok 新导入 / own 已在库 / fail 无效），不落任何库表；
-   * 爬取由调用方对新导入（status=ok）触发。绝不写愿望单/关注列表——追踪池只收
-   * 真实 Steam 同步条目与星标关注。复用 RedeemBatchResult 的批量结果形状。
+   * 批量导入监控池：后端入池（manual_pool 条目）+ 分类（ok 待首爬 / own 已在库 /
+   * fail 无效）；首爬由调用方对新导入（status=ok）触发。复用 RedeemBatchResult
+   * 的批量结果形状，另带 poolAdded / poolRestored 池写入计数。
    */
   importApps: (appids: number[]) =>
-    request<RedeemBatchResult>('POST', '/crawl/import', { appids }),
+    request<RedeemBatchResult & { poolAdded?: number; poolRestored?: number }>(
+      'POST',
+      '/crawl/import',
+      { appids },
+    ),
 }
 
 // ─── system（运行日志 / 数据备份 / 应用更新）──────────────────
@@ -1205,7 +1237,7 @@ export interface RateHistoryItem {
   fetchedAt: string | null
 }
 
-/** 历史窗口档位（对齐原版 fx-trend；null = 全量 16 年档案） */
+/** 历史窗口档位（null = 全量 16 年档案） */
 export type RateRange = '1mo' | '6mo' | '1y' | '5y' | '10y' | 'all'
 
 /**

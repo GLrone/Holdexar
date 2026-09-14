@@ -13,9 +13,13 @@ from app.domains.crawl import service as crawl_service
 from app.domains.wishlist.models import TrackedAccount, WishlistItem
 
 
+PRIMARY = "76561198000000001"
+
+
 @pytest.fixture
 def db(tmp_path, monkeypatch):
     import app.core.database as database_module
+    import app.domains.wishlist.service as wishlist_service
 
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
@@ -23,6 +27,15 @@ def db(tmp_path, monkeypatch):
     factory = async_sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
     monkeypatch.setattr(crawl_service, "get_session_factory", lambda: factory)
+    # import_appids 会走 wishlist 域入池 + 主账户解析：一并打桩到测试库
+    monkeypatch.setattr(wishlist_service, "get_session_factory", lambda: factory)
+
+    import app.domains.account.service as account_service
+
+    async def fake_primary():
+        return PRIMARY
+
+    monkeypatch.setattr(account_service, "get_primary_steam_id", fake_primary)
     return factory
 
 
@@ -34,9 +47,6 @@ async def _schema(db):
 
     async with db.kw["bind"].begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-
-
-PRIMARY = "76561198000000001"
 
 
 async def _seed(db, appid: int, *, owned: bool, active: bool = True):
@@ -166,16 +176,18 @@ async def test_import_appids_classification(db):
 
 
 @pytest.mark.asyncio
-async def test_import_appids_never_writes_wishlist(db):
-    """导入不落 wishlist_items：愿望单/追踪池只收真实同步条目与星标关注。"""
+async def test_import_appids_writes_pool(db):
+    """导入 = 入池：合法 appid 落 manual_pool 条目（监控条目必爬）+ 分类口径不变。"""
     from sqlalchemy import select
 
     from app.domains.wishlist.models import WishlistItem
 
-    await crawl_service.import_appids([620, 570, 730])
+    out = await crawl_service.import_appids([620, 570, 730])
+    assert out["poolAdded"] == 3
     async with db() as session:
         rows = (await session.execute(select(WishlistItem))).scalars().all()
-    assert rows == []
+    assert {int(r.appid) for r in rows} == {620, 570, 730}
+    assert all(r.active and r.manual_pool and not r.manual for r in rows)
 
 
 @pytest.mark.asyncio

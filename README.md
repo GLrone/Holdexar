@@ -6,7 +6,7 @@
 
 **本地 Steam 多区价格监控终端**
 
-[![Version](https://img.shields.io/badge/version-v0.2.0-orange)](../../releases)
+[![Version](https://img.shields.io/badge/version-v0.1.0-orange)](../../releases)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue?logo=python&logoColor=white)](https://www.python.org)
 [![FastAPI](https://img.shields.io/badge/Backend-FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Vue 3](https://img.shields.io/badge/Frontend-Vue%203-42b883?logo=vuedotjs&logoColor=white)](https://vuejs.org)
@@ -24,7 +24,7 @@ Holdexar 在本机完成 Steam 多区价格的抓取、折算与存储:异步爬
 | 后端 | FastAPI · SQLAlchemy(async) · APScheduler(13 个定时任务) · aiohttp 爬核 |
 | 前端 | Vue 3 · TypeScript · Vite · 自制 Hl\* 组件体系(深浅双主题 / 中英双语) |
 | 桌面 | pywebview(WebView2) · onedir 绿色包 · 单实例锁 |
-| 网络 | 出网策略引擎(direct_only / proxy_first / proxy_only) · 自备 Clash 订阅 · mihomo 内核缺失自动下载 |
+| 网络 | 出网策略引擎(direct_only / proxy_first / proxy_only) · 自备 Clash 订阅 · mihomo 内核与 GeoIP 数据随包内置 |
 | 认证 | 桌面登录窗即 Steam 官方页面 |
 
 ## 主要功能
@@ -131,6 +131,8 @@ python run.py --port N   # 指定端口
 
 首次运行会自动补齐公共数据种子(16 年历史汇率与价格历史切片,约 288MB):种子是二进制大文件,不进 git,由 `run.py` 从 Release 资产拉取。没网也不影响启动,只是【汇率】页没有历史档案,之后重跑 `python scripts/fetch_seed.py` 即可。
 
+随包的还有 Clash 内核(mihomo + GeoIP 数据,约 72MB,版本固定):同为二进制不入库,由 `run.py` 调用 `python scripts/fetch_kernel.py` 从上游补齐;获取失败也不阻断启动,【代理】页会显示「内核缺失」并提供一键安装入口。
+
 ## 打包与发布
 
 发布机(建议用 `server/.venv` 的解释器):
@@ -225,7 +227,4 @@ Holdexar/
 
 ## 致谢
 
-- [steam-family-game-analysis](https://greasyfork.org/zh-CN/scripts/588235) — 家庭组 API 调用链与数据口径
-- [SteamRedeemKeys](https://greasyfork.org/zh-CN/scripts/32718) — CDK 激活错误码语义
-- [mihomo](https://github.com/MetaCubeX/mihomo) — Clash 代理内核
-- [flagcdn](https://flagcdn.com) — 国旗素材
+- [mihomo](https://github.com/MetaCubeX/mihomo) — Clash 代理内核（随包分发，GPL-3.0）

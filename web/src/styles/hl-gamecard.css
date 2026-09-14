@@ -1,7 +1,6 @@
 /* 
-   SteamHL Legacy Design System (1:1 Restoration)
-   Source: 设计原型生成.py (V1.2 - V7.3)
-   Aesthetics: Steam Dark Mode, Glassmorphism, Legacy Gradients
+   游戏卡样式层：卡片骨架 / 封面 / 价格行 / 徽章 / 详情按钮
+   美学：深色玻璃拟态 + 渐变；颜色一律走 tokens.css 语义变量
 */
 
 :root {
@@ -281,7 +280,7 @@
     to { opacity: 1; }
 }
 
-/* ==================== 游戏归属弹窗（移植 设计原型生成.py custom-tooltip） ==================== */
+/* ==================== 游戏归属弹窗（悬停工具窗） ==================== */
 .cf-status-tip {
     position: fixed;
     z-index: 99999;

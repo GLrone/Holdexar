@@ -77,9 +77,9 @@ async def list_games(
 
 @router.get("/top100")
 async def games_top100():
-    """Steam 热销 TOP100 appid 列表（对齐原版 GET /api/v1/steam/top100）。
+    """Steam 热销 TOP100 appid 列表。
 
-    拉取完全失败（无缓存无 stale）返回 502，语义对齐原版 FETCH_FAILED。
+    拉取完全失败（无缓存无 stale）返回 502（FETCH_FAILED 语义）。
     """
     from app.domains.games import boards as boards_mod
 

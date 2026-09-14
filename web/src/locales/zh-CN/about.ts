@@ -72,7 +72,7 @@ const about = {
   'about.source.flags.label': '旗帜',
   /* 尾部的「；」绑定同一行里的下一对（旗帜 … ；汇率 …）——标点随语言走，
      故留在词条里，不在模板里写全角分号（英文界面下会很难看）。 */
-  'about.source.flags.desc': 'flagcdn.com；',
+  'about.source.flags.desc': '内置素材；',
   'about.source.rates.label': '汇率',
   'about.source.rates.desc': '第三方汇率接口',
 
@@ -84,14 +84,7 @@ const about = {
   'about.privacy.personalUse': '仅供个人学习与自用，不做任何商业用途',
 
   /* 致谢（CREDITS 常量表；项目名与外链留在组件侧） */
-  'about.credit.steamFamily':
-    '家庭库字段语义与统计口径参考（GPLv3，仅参考口径、未使用其代码）',
   'about.credit.mihomo': 'Clash 代理内核（订阅接入与节点管理）',
-  'about.credit.flagcdn': '国旗 / 区旗素材',
-  'about.credit.reactBits':
-    '滚动列表与分节轨的交互形式参考（MIT + Commons Clause，本项目的实现为独立编写）',
-  'about.credit.clashVerge': '订阅自动取名链与文件名编码的接口语义参考（GPL-3.0，仅对齐行为、未使用其代码）',
-  'about.credit.asf': '更新包换装流程的行为基准（Apache-2.0）',
 
   /* 运行环境页脚（/system/info 实时） */
   'about.env.version': '版本 v{v}',

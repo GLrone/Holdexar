@@ -131,7 +131,7 @@ export const useFamilyStore = defineStore('familyLib', () => {
   const fromSnapshot = computed(() => data.value?.fromSnapshot === true)
 
   /**
-   * 入库日分布（对齐原版 computeAllHeatmaps 的 dayMap）：
+   * 入库日分布（family 与成员各自一份 dayMap）：
    * family = { 'YYYY-MM-DD': 入库数 }；members = { steamid → 同构 dayMap }
    */
   const acquiredDayMaps = computed(() => {
@@ -164,7 +164,7 @@ export const useFamilyStore = defineStore('familyLib', () => {
   })
 
   /**
-   * 成员入库活跃度（对齐原版 _computeMemberActivityRaw）：
+   * 成员入库活跃度：
    * daysSinceLatest = 今天 - 该成员最后一次入库；分档 活跃<14/温热<60/冷淡<180/沉睡。
    * 含健康分（四档均值 100/75/50/25）与月均入库。
    *

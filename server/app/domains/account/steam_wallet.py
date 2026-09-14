@@ -5,8 +5,7 @@ g_rgWalletInfo JS 对象，含余额、延迟余额、币种 ID、钱包国家�
 通道二：商店购物车页 data-store_user_config 中的 webapi_token（JWT），
 调 IWalletService/GetWalletDetails 拿同构数据。两通道任一成功即返回。
 
-抓取目标页均为 Steam 公开页面结构，此处仅消费客观字段，不复制任何
-第三方项目代码。
+抓取目标页均为 Steam 公开页面结构，此处仅消费客观字段。
 """
 from __future__ import annotations
 

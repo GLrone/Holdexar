@@ -1299,8 +1299,8 @@ html:not(.dark) .el-table th.el-table__cell { color:var(--text-secondary); }
 
           <!-- ═══ 04 业务组件 ═══ -->
           <section class="ds-section" id="sec-business">
-            <div class="ds-section__head"><span class="ds-section__no">04</span><h2>业务组件 · 库页移植</h2></div>
-            <p class="ds-section__desc">1:1 移植自 HTML 报告（globals / gamecard 样式层），封装阶段收口进 <span class="mono">components/steamhl/</span>。</p>
+            <div class="ds-section__head"><span class="ds-section__no">04</span><h2>业务组件</h2></div>
+            <p class="ds-section__desc">globals / gamecard 样式层，封装收口进 <span class="mono">components/business/</span>。</p>
             <div class="spec-grid">
               <div class="card spec" style="grid-column:1/-1">
                 <div class="spec__cap"><h3>Navbar 导航栏（悬停 logo 展开 / 搜索聚焦光晕）</h3><span class="state-badge state-badge--use">在用</span></div>
@@ -1616,7 +1616,7 @@ html:not(.dark) .el-table th.el-table__cell { color:var(--text-secondary); }
                   <span class="tag tag--danger">focus 光晕写死 rgba</span>
                 </div>
                 <p style="font-size:11.5px;color:var(--text-muted);margin-top:12px;line-height:1.7">
-                  ⚠ 发现：<span class="mono">tokens.css</span> 与 <span class="mono">steamhl-gamecard.css</span> 各有一个全局 <span class="mono">.tag</span>，
+                  ⚠ 发现：<span class="mono">tokens.css</span> 与 <span class="mono">hl-gamecard.css</span> 各有一个全局 <span class="mono">.tag</span>，
                   后加载者覆盖字号/圆角 —— 收口时拆分为 <span class="mono">.tag</span>（pill）与 <span class="mono">.gc-chip</span>（卡片小标签）。</p>
               </div>
             </div>

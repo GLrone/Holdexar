@@ -243,3 +243,62 @@ async def test_v4_skips_index_when_duplicates_exist(isolated_db: Path) -> None:
         assert con.execute("SELECT COUNT(*) FROM game_price_history").fetchone()[0] == 2
     finally:
         con.close()
+
+
+# ── v5：wishlist_items 愿望单成员标记回填 ──────────────────────────
+#
+# 监控池三模块语义下，愿望单（wishlisted）与星标关注（manual）是爬取队列
+# 第一优先级。存量库的新列由 _ensure_schema 加，但「哪些行是愿望单来源」
+# 只有迁移链知道：活跃且非已购、非关注的行全部来自愿望单同步（手动入池
+# 功能此前不存在），必须回填——否则升级后老愿望单条目掉出第一优先级。
+
+
+@pytest.mark.asyncio
+async def test_v5_backfills_wishlist_member_flag(tmp_path: Path, monkeypatch) -> None:
+    """存量库（v0）首启跑到 v5：活跃愿望单行回填 wishlisted=1，
+    关注/已购/脱池行不回填。**走真实迁移链**（v5 步骤就是生产那一条）。"""
+    db = tmp_path / "legacy.db"
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{db.as_posix()}", echo=False
+    )
+    monkeypatch.setattr(database_module, "get_engine", lambda: engine)
+    monkeypatch.setattr(
+        database_module,
+        "get_session_factory",
+        lambda: async_sessionmaker(engine, expire_on_commit=False),
+    )
+    # 迁移前形态：旧列结构 + 存量行
+    con = sqlite3.connect(str(db))
+    try:
+        con.execute(
+            "CREATE TABLE wishlist_items ("
+            " steamid VARCHAR(20), appid BIGINT, added_at DATETIME,"
+            " active BOOLEAN, owned BOOLEAN, manual BOOLEAN,"
+            " PRIMARY KEY (steamid, appid))"
+        )
+        con.execute("INSERT INTO wishlist_items VALUES ('1', 100, NULL, 1, 0, 0)")  # 愿望单
+        con.execute("INSERT INTO wishlist_items VALUES ('1', 200, NULL, 1, 0, 1)")  # 关注
+        con.execute("INSERT INTO wishlist_items VALUES ('1', 300, NULL, 1, 1, 0)")  # 已购
+        con.execute("INSERT INTO wishlist_items VALUES ('1', 400, NULL, 0, 0, 0)")  # 已脱池
+        con.commit()
+    finally:
+        con.close()
+
+    await database_module.init_db()
+    try:
+        assert _user_version(db) == 5
+        con = sqlite3.connect(str(db))
+        try:
+            cols = {r[1] for r in con.execute("PRAGMA table_info(wishlist_items)")}
+            assert {"wishlisted", "manual_pool", "excluded"} <= cols
+            rows = dict(
+                con.execute("SELECT appid, wishlisted FROM wishlist_items").fetchall()
+            )
+        finally:
+            con.close()
+        assert rows == {100: 1, 200: 0, 300: 0, 400: 0}, (
+            "活跃且非已购非关注的行应回填为愿望单成员；关注/已购/脱池行不动。"
+            f"实际 {rows}"
+        )
+    finally:
+        await engine.dispose()

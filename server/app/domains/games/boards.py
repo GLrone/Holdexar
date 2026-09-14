@@ -35,9 +35,9 @@ SEARCH_URL = "https://store.steampowered.com/search/results"
 CACHE_TTL_SECONDS = 3600.0          # 热缓存 1 小时
 STALE_TTL_SECONDS = 86400.0         # stale 兜底保留 24 小时
 BATCH_SIZE = 100
-BATCH_INTERVAL = 0.5                 # 批间隔 500ms 避免限流（对齐原版）
+BATCH_INTERVAL = 0.5                 # 批间隔 500ms 避免限流
 
-# 对齐原版 STEAM_HEADERS：成人内容放行 + 中文语言（搜索结果需含 logo 字段）
+# 请求头：成人内容放行 + 中文语言（搜索结果需含 logo 字段）
 STEAM_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -53,7 +53,7 @@ _LOGO_APPID_RE = re.compile(r"/apps/(\d+)/")
 
 @dataclass(frozen=True)
 class Board:
-    """榜单源配置（参数对齐各原版脚本）。"""
+    """榜单源配置（各榜单的查询参数）。"""
 
     key: str
     # search/results 附加查询参数（start/count/json 之外）

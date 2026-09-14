@@ -45,6 +45,7 @@ reference/
 
 # ── E2E 截图 ──
 gui-test-screenshots/
+/pool*.yaml
 
 # ── 原型 / 试验代码 ──
 price-history-prototype/

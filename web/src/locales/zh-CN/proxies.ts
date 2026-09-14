@@ -53,7 +53,7 @@ const proxies = {
   'proxies.kernel.sizeHint': '· mihomo 约 15MB',
   'proxies.kernel.viaWrap': '（{via}）',
   'proxies.kernel.downloading': '下载中…',
-  'proxies.kernel.autoDownload': '自动下载内核',
+  'proxies.kernel.autoDownload': '自动安装内核',
   'proxies.kernel.downloadDone': '内核下载完成',
   'proxies.kernel.downloadFailed': '内核下载失败：{error}',
   'proxies.kernel.orPlaceManual': '或手动放置到 {dir}',

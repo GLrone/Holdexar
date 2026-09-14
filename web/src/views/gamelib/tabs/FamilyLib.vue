@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /* 家庭库（自 family 页迁入）：6 KPI + 排序工具栏 + 独占/共享卡片网格 + 分页。
    数据源：familyLib store（GET /family/library —— GetSharedLibraryApps +
-   成员已购/游玩聚合）。卡片统一走 steamhl/LibGameCard（16:9 封面主视觉）。 */
+   成员已购/游玩聚合）。卡片统一走 business/LibGameCard（16:9 封面主视觉）。 */
 import { computed, onMounted, ref } from 'vue'
 
 import { useFamilyStore } from '@/stores/familyLib'
@@ -9,7 +9,7 @@ import { useI18n, useLocaleFormat } from '@/locales'
 import HlButton from '@/components/ui/HlButton.vue'
 import HlChip from '@/components/ui/HlChip.vue'
 import HlStat from '@/components/ui/HlStat.vue'
-import LibGameCard from '@/components/steamhl/LibGameCard.vue'
+import LibGameCard from '@/components/business/LibGameCard.vue'
 import { PALETTE } from '@/lib/familyColors'
 
 const { t } = useI18n()

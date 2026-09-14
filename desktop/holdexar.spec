@@ -5,6 +5,8 @@
 datas 布局与 app/core/config.py 的 sys.frozen 分支对齐：
   web/         ← web/dist        （web_dist_dir 命中 _MEIPASS/web）
   seed/        ← assets/seed     （seed_dir 命中 _MEIPASS/seed）
+  clash/       ← assets/clash    （clash_dir 命中 _MEIPASS/clash；mihomo 内核 +
+                                  GeoIP 数据 + 上游许可原文，随包分发）
   app.ico      ← _MEIPASS 根     （desktop/main.py frozen icon 分支）
   server/app   ← 后端源码落盘    （uvicorn.run("app.main:app") 字符串导入的
                                   磁盘兜底，main.py frozen 态把它插进 sys.path）
@@ -48,6 +50,9 @@ a = Analysis(
     datas=[
         (os.path.join(ROOT, "web", "dist"), "web"),
         (os.path.join(ROOT, "assets", "seed"), "seed"),
+        # 内核随包分发：mihomo 与 GeoIP 数据齐备是发布前提，由
+        # build_release.ensure_clash_assets() 在打包前校验（缺一即中止）
+        (os.path.join(ROOT, "assets", "clash"), "clash"),
         (os.path.join(SERVER, "app"), os.path.join("server", "app")),
         ("app.ico", "."),
         # 许可与第三方声明随包分发：MIT 的正文要求「副本或实质部分中须包含版权

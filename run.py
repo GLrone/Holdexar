@@ -1,6 +1,7 @@
 """Holdexar 一键启动脚本。
 
-流程：选解释器（缺 venv 自动创建）→ 补后端依赖 → 补前端依赖
+流程：选解释器（缺 venv 自动创建）→ 补后端依赖 → 补随包资产
+（汇率档案种子 / Clash 内核与 GeoIP 数据，缺失则从上游取）→ 补前端依赖
 （node_modules 缺失自动 npm install）→ 校验前端产物（缺失则构建）
 → 拉起桌面壳。
 
@@ -35,6 +36,8 @@ from app.core.app_info import APP_NAME, ENV_PREFIX  # noqa: E402
 DEFAULT_PORT = "28765"
 # 覆盖运行链关键面：Web 框架 / 数据层 / 调度 / 桌面壳
 REQUIRED_MODULES = ("fastapi", "uvicorn", "sqlalchemy", "aiohttp", "apscheduler", "webview")
+# 随包内核资产就位的判据（assets/clash/ 内的可执行文件，见 scripts/fetch_kernel.py）
+KERNEL_EXE = ROOT / "assets" / "clash" / ("mihomo.exe" if os.name == "nt" else "mihomo")
 
 
 def _run(cmd: list[str], **kw) -> int:
@@ -110,6 +113,20 @@ def ensure_seed(python: Path) -> None:
         print("[警告] 汇率档案种子未获取到：汇率历史页将为空，其余功能不受影响。")
 
 
+def ensure_kernel(python: Path) -> None:
+    """随包内核资产（mihomo + GeoIP 数据）：缺失则从上游补一份。
+
+    与资产种子同样不进 git（二进制大文件），源码 clone 由这里补齐、发布包已
+    内置。失败只警告不阻断——代理页会显示「内核缺失」并且页内可一键安装。
+    """
+    if KERNEL_EXE.is_file():
+        return
+    print("[内核] 未找到随包 Clash 内核，尝试获取（mihomo + GeoIP 数据，约 80MB）…")
+    rc = _run([str(python), str(ROOT / "scripts" / "fetch_kernel.py")])
+    if rc != 0:
+        print("[警告] 内核资产未获取到：代理页将显示「内核缺失」，可页内一键安装。")
+
+
 def ensure_web_deps() -> None:
     """node_modules 缺失时自动 npm install（新机 clone 后直接双击的场景）。"""
     if NODE_MODULES.is_dir():
@@ -142,6 +159,7 @@ def main() -> None:
     python = ensure_venv()
     ensure_deps(python)
     ensure_seed(python)
+    ensure_kernel(python)
     if args.build or not DIST_INDEX.is_file():
         ensure_web_deps()
         build_web()
