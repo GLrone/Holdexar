@@ -273,33 +273,9 @@ def _mount_spa(app: FastAPI, dist) -> None:
     if (dist / "assets").is_dir():
         app.mount("/assets", StaticFiles(directory=dist / "assets"), name="spa-assets")
 
-    # 启动等待页（桌面壳窗口首载，JS 轮询 health 就绪即跳转真实应用）。
-    # 同源路由而非 data-URL：data: 源向 127.0.0.1 发 fetch 会被 WebView2
-    # 跨源策略拦截（双击冒烟实证等待页卡死）。
-    from fastapi.responses import HTMLResponse
-
-    @app.get("/__splash", include_in_schema=False)
-    async def splash() -> HTMLResponse:
-        return HTMLResponse(
-            "<!doctype html><html><head><meta charset='utf-8'>"
-            f"<title>{APP_NAME}</title>"
-            "<style>html,body{height:100%;margin:0}"
-            "body{display:flex;align-items:center;justify-content:center;"
-            "background:#1b2838;color:#c7d5e0;"
-            "font:15px/1.8 'Segoe UI',system-ui,sans-serif}"
-            ".box{text-align:center}"
-            ".spin{width:34px;height:34px;margin:0 auto 16px;border-radius:50%;"
-            "border:3px solid rgba(199,213,224,.2);border-top-color:#66c0f4;"
-            "animation:r .9s linear infinite}"
-            "@keyframes r{to{transform:rotate(360deg)}}"
-            "</style></head><body><div class='box'><div class='spin'></div>"
-            f"{APP_NAME} 启动中，请稍候…</div>"
-            "<script>(function poll(){"
-            "fetch('api/v1/health').then(function(r){"
-            "if(r.ok){location.replace('/')}else{throw 0}"
-            "}).catch(function(){setTimeout(poll,100)})"
-            "})()</script></body></html>"
-        )
+    # 启动等待页已移交桌面壳内联 HTML（desktop/main.py _SPLASH_HTML）：
+    # uvicorn 在 lifespan 完成前不监听端口，后端同源等待页在窗口期必然
+    # 连接被拒，等待逻辑只有放在不依赖网络的进程内页面才能成立。
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def spa_fallback(full_path: str) -> FileResponse:
