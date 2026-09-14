@@ -76,6 +76,8 @@ function baseParams() {
     diffMax: diffBound(store.diffMax),
     diffType: store.diffType === 'percent' ? 'percent' : undefined,
     strictLowest: store.strictLowest || undefined,
+    // 游戏商店默认隐藏 DLC（excludeDlc=true）；白名单豁免个别常驻 DLC
+    excludeDlc: store.excludeDlc,
     // 绝对低价勾选时容差随输入（0 → 严格任何分差）；未勾选走后端默认 5 元近似容差
     toleranceFen:
       store.strictLowest && store.tolerance !== ''
@@ -135,6 +137,7 @@ watch(
     store.diffType,
     store.strictLowest,
     store.tolerance,
+    store.excludeDlc,
   ],
   () => {
     if (initialized.value) load(true)

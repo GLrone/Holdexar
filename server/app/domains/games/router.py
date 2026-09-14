@@ -46,6 +46,7 @@ async def list_games(
     diffType: str = Query("absolute", pattern="^(absolute|percent)$"),
     toleranceFen: int | None = Query(None, ge=0),
     strictLowest: bool = False,
+    excludeDlc: bool = Query(False),
 ):
     return await service.list_games(
         sort=sort,
@@ -72,6 +73,7 @@ async def list_games(
         diff_type=diffType,
         tolerance_fen=toleranceFen,
         strict_lowest=strictLowest,
+        exclude_dlc=excludeDlc,
     )
 
 

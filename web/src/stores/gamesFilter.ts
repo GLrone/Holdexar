@@ -35,6 +35,8 @@ interface FilterState {
   hlEqual: boolean
   hlNon: boolean
   giftFilter: boolean
+  /** 游戏商店默认隐藏 DLC（白名单豁免个别常驻 DLC） */
+  excludeDlc: boolean
   filterRegion: string
   showAdvancedFilter: boolean
 
@@ -74,6 +76,7 @@ export const useFilterStore = defineStore('gamesFilter', {
     hlEqual: false,
     hlNon: false,
     giftFilter: false,
+    excludeDlc: true,
     filterRegion: 'cn',
     showAdvancedFilter: false,
 
@@ -109,6 +112,7 @@ export const useFilterStore = defineStore('gamesFilter', {
       this.hlEqual = false
       this.hlNon = false
       this.giftFilter = false
+      this.excludeDlc = true
       this.filterRegion = 'cn'
     },
 
@@ -126,6 +130,7 @@ export const useFilterStore = defineStore('gamesFilter', {
       if (this.hlEqual) count++
       if (this.hlNon) count++
       if (this.giftFilter) count++
+      if (!this.excludeDlc) count++
       if (this.minPrice) count++
       if (this.maxPrice) count++
       if (this.minRating) count++

@@ -38,6 +38,9 @@ from app.crawler.config import CC_LIST
 
 TOLERANCE_FEN = 500  # 5 元容差（分）
 
+# 游戏商店默认隐藏 DLC；白名单豁免个别确需常驻的 DLC（黄金树幽影 / 艾尔登法环）
+DLC_EXEMPT_APPIDS = frozenset({2778580})
+
 # ── 汇率进程内缓存（对齐原型 Redis 300s TTL）──
 _RATES_TTL_SECONDS = 300.0
 _rates_cache: tuple[float, dict[str, float]] | None = None
@@ -140,6 +143,7 @@ def _build_filter_conditions(
     diff_type: str = "absolute",
     tolerance_fen: int | None = None,
     strict_lowest: bool = False,
+    exclude_dlc: bool = False,
 ) -> list:
     """WHERE 条件构建（list_games 与 top100 分支共用同一套筛选语义）。
 
@@ -258,6 +262,17 @@ def _build_filter_conditions(
             owned_sq = owned_sq.where(WishlistItem.steamid == primary_steamid)
         conditions.append(g.appid.not_in(owned_sq))
 
+    # 游戏商店默认隐藏 DLC（type='DLC'）；type 为 NULL 的游戏（未归类）按非 DLC 处理，
+    # 白名单豁免个别确需常驻的 DLC（黄金树幽影）。exclude_dlc 缺省 False，仅商店页显式开启。
+    if exclude_dlc:
+        conditions.append(
+            or_(
+                g.type.is_(None),
+                g.type != "DLC",
+                g.appid.in_(DLC_EXEMPT_APPIDS),
+            )
+        )
+
     return conditions
 
 
@@ -314,6 +329,7 @@ async def list_games(
     diff_type: str = "absolute",
     tolerance_fen: int | None = None,
     strict_lowest: bool = False,
+    exclude_dlc: bool = False,
 ) -> dict:
     """游戏列表。返回 {items, total, hasMore, nextCursor}。
 
@@ -351,6 +367,7 @@ async def list_games(
         diff_type=diff_type,
         tolerance_fen=tolerance_fen,
         strict_lowest=strict_lowest,
+        exclude_dlc=exclude_dlc,
     )
 
     rates = await get_rates()
@@ -379,6 +396,7 @@ async def list_games(
         diff_type=diff_type,
         tolerance_fen=tolerance_fen,
         strict_lowest=strict_lowest,
+        exclude_dlc=exclude_dlc,
     )
 
     # ── 基础查询（join 形态对齐原型：LOCKED 走 LEFT JOIN，其余 INNER）──
@@ -469,6 +487,7 @@ async def _list_games_top100(
     diff_type: str = "absolute",
     tolerance_fen: int | None = None,
     strict_lowest: bool = False,
+    exclude_dlc: bool = False,
 ) -> dict:
     """TOP100 热销榜分支（sort=top100 的榜内过滤 + 榜序重排）。
 
@@ -507,6 +526,7 @@ async def _list_games_top100(
         diff_type=diff_type,
         tolerance_fen=tolerance_fen,
         strict_lowest=strict_lowest,
+        exclude_dlc=exclude_dlc,
     )
     base = _build_base_stmt(g=g, cn=cn, sr=sr, conditions=conditions,
                             region_code=region_code, is_locked=is_locked)
