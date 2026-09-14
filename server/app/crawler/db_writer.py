@@ -154,6 +154,28 @@ class DbWriter:
                     #    三件套 + 版本后缀 + gold 标：折扣往返/价格修正/名称修正
                     #    都会正常产生新快照。现价表不受门禁影响，照常每轮刷新
                     #    （updated_at = 最新验证时刻）。
+                    # ── 版本名防丢锚（同 sub_id 历史名）：browse 响应的 option
+                    #    name 偶发缺失、档案导入行天生无名——空名行会被「标准
+                    #    版」判据误收：历史图混入版本价，current 的 min(sub_id)
+                    #    选择还会让编号更小的豪华版顶替本体（黄金版 376686 <
+                    #    447601 实证）。sub_id 是恒定 SKU，版本名不随时间变：
+                    #    取该 appid 每个 sub 的最新非空名，本次为空的行沿用之。
+                    known_suffix: dict[int, str] = {}
+                    rows_known = await session.execute(
+                        text(
+                            "SELECT sub_id, version_suffix FROM ("
+                            "  SELECT sub_id, version_suffix, ROW_NUMBER() OVER ("
+                            "    PARTITION BY sub_id ORDER BY snapshot_at DESC, id DESC"
+                            "  ) AS rn FROM game_price_history"
+                            "  WHERE appid = :appid AND sub_id > 0"
+                            "        AND version_suffix IS NOT NULL AND version_suffix != ''"
+                            ") WHERE rn = 1"
+                        ),
+                        {"appid": int(game_data.get("appid") or 0)},
+                    )
+                    for r in rows_known:
+                        known_suffix[int(r[0])] = str(r[1])
+
                     latest_snapshots: dict[tuple[str, int], tuple] = {}
                     rows_latest = await session.execute(
                         text(
@@ -169,8 +191,12 @@ class DbWriter:
                         {"appid": int(game_data.get("appid") or 0)},
                     )
                     for r in rows_latest:
-                        latest_snapshots[(r[0], int(r[1] or 0))] = (
-                            r[2], r[3], r[4], r[5], bool(r[6]),
+                        sub_id_int = int(r[1] or 0)
+                        # prev 基线与本次写入用同一套回填名：差量门禁不因
+                        # 「丢名→回名」的名称修正误触发冗余快照
+                        suffix_baseline = r[5] or known_suffix.get(sub_id_int) or None
+                        latest_snapshots[(r[0], sub_id_int)] = (
+                            r[2], r[3], r[4], suffix_baseline, bool(r[6]),
                         )
 
                     for p in prices_data:
@@ -179,6 +205,12 @@ class DbWriter:
                         currency = p.get("currency", "")
                         is_gold = p.get("is_gold", False)
                         version_suffix = p.get("version_suffix")
+                        # 丢名行沿用同 sub_id 的历史名（known_suffix），与
+                        # prev 基线同口径——标准版判定 / 差量比较全部一致
+                        if not version_suffix:
+                            version_suffix = known_suffix.get(
+                                int(p.get("sub_id") or 0)
+                            ) or None
                         is_bundle = p.get("is_bundle", False)
                         status = p.get("price_status", "ok")
                         # 质量门禁：ok 但无价格 = 成功响应里的坏数据（如 gold 版

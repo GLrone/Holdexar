@@ -139,8 +139,32 @@ async def _game_row(appid: int) -> dict | None:
     return dict(zip(seed_assets.CURATED_COLS, row)) if row else None
 
 
+_ALL_MARKER_KEYS = (
+    seed_assets.MARKER_KEY,
+    seed_assets.CURATED_MARKER_KEY,
+    seed_assets.HISTORY_MARKER_KEY,
+)
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def _cleanup():
+    # setup：保存三个 marker 的真实值后清空——一次性导入语义下每个用例须从
+    # 「无 marker」起步；但**绝不能只删不还**：本测试对真实开发库跑，marker
+    # 是种子通道的幂等锚，被删后下一次应用启动会整链重跑（跳过判定、602 款
+    # 名单合并、286 万行历史哨兵扫描全量过一遍），日志表现为「每次启动都
+    # 在执行种子导入」——正是曾经发生过的真实污染（pytest 后启动必现）。
+    keys_sql = ", ".join(f"'{k}'" for k in _ALL_MARKER_KEYS)
+    async with get_session_factory()() as session:
+        saved_markers: dict[str, str] = {
+            k: v
+            for k, v in await session.execute(
+                text(f"SELECT key, value_json FROM app_settings WHERE key IN ({keys_sql})")
+            )
+        }
+        await session.execute(
+            text(f"DELETE FROM app_settings WHERE key IN ({keys_sql})")
+        )
+        await session.commit()
     yield
     async with get_session_factory()() as session:
         await session.execute(
@@ -155,17 +179,21 @@ async def _cleanup():
         await session.execute(
             text(f"DELETE FROM game_price_history WHERE appid = {APPID_C}")
         )
-        # marker 无论形态（version / skipped:version）一律清空——一次性
-        # 导入语义下每个用例须从"无 marker"起步；价格历史独立 marker 同理
-        await session.execute(
-            text("DELETE FROM app_settings WHERE key = 'seed.imported_version'")
-        )
-        await session.execute(
-            text(
-                "DELETE FROM app_settings WHERE key IN "
-                f"('{seed_assets.HISTORY_MARKER_KEY}', '{seed_assets.CURATED_MARKER_KEY}')"
-            )
-        )
+        # marker 恢复原值（value_json 按读出的原文写回，编码读写对称）；
+        # 用例中途写入的新 marker 被 setup 时的原值覆盖（无原值 = 删除）
+        for key in _ALL_MARKER_KEYS:
+            if key in saved_markers:
+                await session.execute(
+                    text(
+                        "INSERT INTO app_settings (key, value_json) VALUES (:k, :v) "
+                        "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json"
+                    ),
+                    {"k": key, "v": saved_markers[key]},
+                )
+            else:
+                await session.execute(
+                    text("DELETE FROM app_settings WHERE key = :k"), {"k": key}
+                )
         await session.commit()
     seed_assets.reset_cache()
 
@@ -506,11 +534,12 @@ def _gph_row(
     discount: int = 25,
     sub_id: int | None = 1,
     currency: str = "CNY",
+    version_suffix: str | None = None,
 ) -> tuple:
     """13 列种子行（无 id）：appid, region, currency, price, original,
     discount, sub_id, is_gold, version_suffix, is_bundle, status, cny_fen, snapshot_at。"""
     return (
-        appid, "CN", currency, price, 2000, discount, sub_id, 0, None, 0,
+        appid, "CN", currency, price, 2000, discount, sub_id, 0, version_suffix, 0,
         "ok", cny_fen, snapshot_at,
     )
 
@@ -624,3 +653,51 @@ async def test_history_merge_schema1_seed_noop(tmp_path: Path) -> None:
     from app.domains.settings import service as settings_service
 
     assert await settings_service.get_value(seed_assets.HISTORY_MARKER_KEY) is None
+
+
+@pytest.mark.asyncio
+async def test_history_merge_backfills_blank_suffix(tmp_path: Path) -> None:
+    """同键行版本名补空：本地空名被种子权威名回填（发行版用户库无爬虫
+    通道，空名行只能靠本通道自愈——否则被「标准版」判据误收）；本地已有
+    名不被旧种子快照拉回（本地爬虫持续更新，种子只补空不覆写）。"""
+    snap = "2026-09-01 10:00:00"
+    async with get_session_factory()() as session:
+        await session.execute(
+            text(
+                "INSERT INTO game_price_history (appid, region_code, currency, price, "
+                "original_price, discount_percent, sub_id, is_gold, version_suffix, "
+                "price_status, cny_fen, snapshot_at) VALUES "
+                "(:a, 'CN', 'CNY', 1500, 2000, 0, 1, 0, NULL, 'ok', 1500, :s), "
+                "(:a, 'CN', 'CNY', 1500, 2000, 0, 2, 0, :local_name, 'ok', 1500, :s)"
+            ),
+            {"a": APPID_C, "s": snap, "local_name": "本地已有版本名"},
+        )
+        await session.commit()
+
+    seed = _make_seed(
+        tmp_path / "holdexar_seed.db",
+        history=[
+            # 同键 sub=1：本地空名 → 种子名补空（价格列对齐，缺口纯由版本名构成）
+            _gph_row(APPID_C, snap, sub_id=1, discount=0,
+                     version_suffix="Digital Deluxe Edition"),
+            # 同键 sub=2：本地有名 → 保留本地值（价格全同不触发更新）
+            _gph_row(APPID_C, snap, sub_id=2, discount=0,
+                     version_suffix="种子版本名"),
+        ],
+    )
+    stats = await seed_assets.merge_history_seed(seed)
+    # 仅空名行因版本名缺口触发 UPDATE；有名行值全同不重写
+    assert stats == {"overwritten": 1, "inserted": 0}
+
+    async with get_session_factory()() as session:
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT sub_id, version_suffix FROM game_price_history "
+                    f"WHERE appid = {APPID_C} ORDER BY sub_id"
+                )
+            )
+        ).fetchall()
+    by_sub = {int(r[0]): r[1] for r in rows}
+    assert by_sub[1] == "Digital Deluxe Edition"  # 空名被种子补上
+    assert by_sub[2] == "本地已有版本名"  # 本地名不被旧种子拉回
