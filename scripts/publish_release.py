@@ -1,8 +1,10 @@
 """GitHub Releases 标准发布：版本 Release + 固定 tag 的更新清单。
 
 **为什么是两条 Release**：
-1. **版本 Release**（tag `v<版本>`）——用户看到的那条：应用包 + 种子 + 清单，
-   带 changelog。这是「标准分发方式」里人读的那一面。
+1. **版本 Release**（tag `v<版本>`）——用户看到的那条：release/ 下的**全部**
+   待分发产物（应用包 + 更新清单 + 资产种子 + 公共目录库模板 + 更新说明 +
+   Scoop 清单，缺件按「有则带」），带 changelog。这是「标准分发方式」里
+   人读的那一面。
 2. **清单 Release**（tag `updater`）——机器读的那一面：只挂一个 latest.json，
    地址恒定不随版本变。客户端检查更新只读它（见 app/core/updater.py）。
    注意必须 `--latest=false`：否则它会被 GitHub 标成 "Latest release"，
@@ -48,6 +50,10 @@ MANIFEST = RELEASE / "latest.json"
 # 缺前者时用它兜底（避免「种子明明在却报没有」）
 SEED_DB = RELEASE / "holdexar_seed.db"
 SEED_DB_FALLBACK = ROOT / "assets" / "seed" / "holdexar_seed.db"
+# 公共目录库模板（server/scripts/export_template_db.py 产物）：导出脚本的落点
+# 是 assets/seed/，构建期另存到 release/ 之后由本脚本一并上传
+TEMPLATE_DB = RELEASE / "holdexar_template.db"
+TEMPLATE_DB_FALLBACK = ROOT / "assets" / "seed" / "holdexar_template.db"
 
 if str(SERVER) not in sys.path:
     sys.path.insert(0, str(SERVER))
@@ -108,6 +114,43 @@ def pick_app_zip(version: str) -> Path:
     if not candidates:
         sys.exit(f"[错误] {RELEASE} 下没有应用包，先跑 scripts/build_release.py")
     return candidates[-1]
+
+
+def _with_fallback(primary: Path, fallback: Path, label: str, found: list[Path]) -> None:
+    """资产就位即登记；缺失时退源码树副本，两者都无则记警告跳过。"""
+    if primary.is_file():
+        found.append(primary)
+        return
+    if fallback.is_file():
+        print(f"[提示] 用源码树副本兜底{label}：{fallback}")
+        found.append(fallback)
+        return
+    print(f"[警告] 未找到{label}（{primary} / {fallback}），本次发布不含该件")
+
+
+def collect_artifacts(app_zip: Path) -> list[Path]:
+    """版本 Release 的资产全集：release/ 下**全部**待分发产物。
+
+    「全部」是硬要求——漏传一件就是一个半成品发布（源码用户拉不到种子、
+    Scoop 渠道跟进不到清单、用户看不到更新说明）。顺序固定（应用包在首，
+    人工核对与 Scoop checkver 拼 URL 都靠它）：
+        ① 应用包 zip   ② latest.json   ③ 资产种子 holdexar_seed.db
+        ④ 公共目录库模板 holdexar_template.db（有则带）
+        ⑤ Scoop 渠道清单 release/scoop/holdexar.json（有则带）
+    更新说明 RELEASE_NOTES.md 走 --notes-file 成为 Release 正文，不再另挂附件；
+    构建中间产物（build/、work/、build*.log）不是发布物，一律不带。
+    """
+    artifacts: list[Path] = [app_zip, MANIFEST]
+    _with_fallback(SEED_DB, SEED_DB_FALLBACK, "资产种子", artifacts)
+    _with_fallback(TEMPLATE_DB, TEMPLATE_DB_FALLBACK, "公共目录库模板", artifacts)
+    # Scoop 清单是渠道跟进的入口（checkver 读 latest.json、autoupdate 拼 zip URL），
+    # 属于分发面；更新说明不作附件——它以 --notes-file 成为 Release 正文，
+    # 再挂一份是同一份文字的重复。
+    if SCOOP_JSON.is_file():
+        artifacts.append(SCOOP_JSON)
+    else:
+        print(f"[警告] 未找到 {SCOOP_JSON.name}，本次发布不含 Scoop 清单")
+    return artifacts
 
 
 def publish_version_release(
@@ -234,14 +277,7 @@ def main() -> None:
             + "\n先跑 scripts/build_release.py（含清单生成）"
         )
 
-    artifacts = [app_zip, MANIFEST]
-    if SEED_DB.is_file():
-        artifacts.append(SEED_DB)
-    elif SEED_DB_FALLBACK.is_file():
-        print(f"[提示] 用源码树种子兜底：{SEED_DB_FALLBACK}（build_release.py 会另存到 release/）")
-        artifacts.append(SEED_DB_FALLBACK)
-    else:
-        print(f"[警告] 未找到种子资产（{SEED_DB} / {SEED_DB_FALLBACK}），本次发布不含种子")
+    artifacts = collect_artifacts(app_zip)
 
     print(f"[发布] 仓库 {GITHUB_REPO}  版本 v{version}")
     for p in artifacts:
