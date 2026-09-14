@@ -39,6 +39,7 @@ const filterPanel: Partial<Record<MessageKey, string>> = {
 
   'filterPanel.other.onlyDiscounted': 'Discounted only',
   'filterPanel.other.hideOwned': 'Hide owned',
+  'filterPanel.other.hideFamilySharing': 'Hide family sharing',
   'filterPanel.other.hideDlc': 'Hide DLC',
 
   /* 中文侧的半角空格是字间距 hack（见 zh-CN 侧说明），英文侧正常书写 */

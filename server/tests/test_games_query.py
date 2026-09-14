@@ -12,9 +12,10 @@ import sqlite3
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import delete
 
 from app.core.config import get_settings
-from app.core.database import init_db
+from app.core.database import get_session_factory, init_db
 from app.domains.games import service
 
 
@@ -296,3 +297,104 @@ async def test_strict_lowest_tolerance():
         cn = _cn(item)
         lowest = _lowest_other(item)
         assert cn[1] - lowest > 2000
+
+
+# ─── 屏蔽家庭共享（hide_family_sharing）────────────────────────────────
+
+
+PRIMARY_SID = "76561190000009901"
+FRIEND_SID = "76561190000009902"
+APP_OWNED = 990_711   # 主账户已拥有（归属 owned）
+APP_FAMILY = 990_712  # 非主账户已拥有（归属 family = 家庭共享）
+APP_NONE = 990_713    # 无归属
+
+
+@pytest_asyncio.fixture
+async def _seed_family_filter(monkeypatch):
+    """三形态归属合成行（owned / family / 无归属）+ CN 现价；收尾清理。
+
+    主账户经 monkeypatch 提供（对准 list_games 的 _primary_steamid 取数口）。
+    """
+    from datetime import datetime
+
+    from app.domains.games.models import Game, GameCurrentPrice
+    from app.domains.wishlist.models import WishlistItem
+
+    now = datetime(2026, 9, 1)
+    async with get_session_factory()() as session:
+        session.add_all([
+            Game(appid=a, name=n, created_at=now, updated_at=now)
+            for a, n in (
+                (APP_OWNED, "FamTestOwned"),
+                (APP_FAMILY, "FamTestFamily"),
+                (APP_NONE, "FamTestNone"),
+            )
+        ])
+        session.add_all([
+            GameCurrentPrice(
+                appid=a, region_code="CN", currency="CNY", price=1000,
+                original_price=1000, discount_percent=0, sub_id=0,
+                price_status="ok", cny_fen=1000, updated_at=now,
+            )
+            for a in (APP_OWNED, APP_FAMILY, APP_NONE)
+        ])
+        session.add_all([
+            WishlistItem(steamid=PRIMARY_SID, appid=APP_OWNED, active=True, owned=True),
+            WishlistItem(steamid=FRIEND_SID, appid=APP_FAMILY, active=True, owned=True),
+        ])
+        await session.commit()
+    await service.refresh_sort_cache()
+
+    async def _primary():
+        return PRIMARY_SID
+
+    monkeypatch.setattr(service, "_primary_steamid", _primary)
+    yield
+    async with get_session_factory()() as session:
+        await session.execute(
+            delete(WishlistItem).where(
+                WishlistItem.appid.in_([APP_OWNED, APP_FAMILY])
+            )
+        )
+        await session.execute(
+            delete(GameCurrentPrice).where(
+                GameCurrentPrice.appid.in_([APP_OWNED, APP_FAMILY, APP_NONE])
+            )
+        )
+        await session.execute(
+            delete(Game).where(Game.appid.in_([APP_OWNED, APP_FAMILY, APP_NONE]))
+        )
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_hide_family_sharing(_seed_family_filter, monkeypatch):
+    """屏蔽家庭共享 = 排除非主账户已拥有（family 归属）；与隐藏已拥有互为补集。
+
+    - hide_family_sharing：family 行排除，主账户 owned 与无归属保留；
+    - hide_owned 反向对照：只排主账户行，family 行保留；
+    - 两者同开：只剩无归属行；
+    - 未配置主账户：无 family 归属可排除（同 ownership() 判定），条件不生效。
+    """
+
+    async def _ids(**kw):
+        r = await _fetch(q="FamTest", **kw)
+        return {i["appid"] for i in r["items"]}
+
+    ids = await _ids(hide_family_sharing=True)
+    assert APP_FAMILY not in ids
+    assert {APP_OWNED, APP_NONE} <= ids
+
+    ids = await _ids(hide_owned=True)
+    assert APP_OWNED not in ids
+    assert {APP_FAMILY, APP_NONE} <= ids
+
+    ids = await _ids(hide_owned=True, hide_family_sharing=True)
+    assert ids == {APP_NONE}
+
+    async def _no_primary():
+        return ""
+
+    monkeypatch.setattr(service, "_primary_steamid", _no_primary)
+    ids = await _ids(hide_family_sharing=True)
+    assert {APP_OWNED, APP_FAMILY, APP_NONE} <= ids

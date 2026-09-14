@@ -570,6 +570,8 @@ export interface GamesListParams {
   onlyXgp?: boolean
   /** 隐藏已拥有（主账户已购库，未配置主账户时任一追踪账户） */
   hideOwned?: boolean
+  /** 屏蔽家庭共享（非主账户的追踪账户已拥有 = 家人库可玩；与卡片「家庭共享」徽章同口径） */
+  hideFamilySharing?: boolean
   /** 与国区差价区间（分；percent 模式为 0-100 百分值）——已选地区基准，未选回退全区最低 */
   diffMin?: number
   diffMax?: number
