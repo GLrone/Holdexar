@@ -169,6 +169,14 @@
   flex-wrap: wrap;
 }
 
+/* 账户组合：chip + 自己的删除键（删除动作必须紧贴对应账户，
+   否则一排孤立垃圾桶与账户对不上号） */
+.bills-accounts__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
 .bills-accounts__chip {
   display: inline-flex;
   align-items: center;
