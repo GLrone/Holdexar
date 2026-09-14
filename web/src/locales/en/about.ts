@@ -26,6 +26,9 @@ const about: Partial<Record<MessageKey, string>> = {
   /* GitHub repo link beside the project name in hero (external proper noun) */
   'about.githubRepo': 'GitHub repository',
 
+  /* Hero logo = replay entry for the getting-started tour */
+  'about.logo.tourTitle': 'Replay the getting-started tour',
+
   /* Feature cards */
   'about.feature.multiRegion.title': 'Multi-region price matrix',
   'about.feature.multiRegion.desc':
