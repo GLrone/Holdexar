@@ -91,6 +91,21 @@ const crawl = {
   'crawl.fav.import': '导入收藏',
   'crawl.fav.placeholder':
     '[2561580,1173800,1173820,3837340]\n或 [{"appid":620,"name":"Portal 2"},…]',
+  /* 教程窗：这条通道的数据来自浏览器脚本，脚本原文与控制台代码一并给出，
+     用户不必再去别处翻（脚本随前端产物分发，见 crawl/Index.vue 的说明）。
+     文件名常量在组件里（词典不收文件名——英文值里留中文会被词典门禁判为残留） */
+  'crawl.fav.tutorial': '导入教程',
+  'crawl.fav.tutTitle': '收藏列表导入教程',
+  'crawl.fav.tut.step1': '安装 Tampermonkey（油猴）扩展，把下方脚本添加进去（或下载文件后拖进扩展面板）。',
+  'crawl.fav.tut.step2': '打开脚本生效的页面（本地 HTML 报告 / Steam 收藏页），脚本会把你的收藏存到本地。',
+  'crawl.fav.tut.step3': '按 F12 打开控制台，粘贴并执行下方命令——收藏列表会以 JSON 复制到剪贴板。',
+  'crawl.fav.tut.step4': '回到本页粘贴进输入框并点「导入收藏」：导入即加入监控池，未入库的游戏自动首爬。',
+  'crawl.fav.tut.console': '控制台命令（在脚本生效的页面执行）',
+  'crawl.fav.tut.script': '油猴脚本：SteamHL 助手',
+  'crawl.fav.tut.copy': '复制',
+  'crawl.fav.tut.copied': '已复制',
+  'crawl.fav.tut.download': '下载脚本',
+  'crawl.fav.tut.scriptEmpty': '脚本未取到——关窗重试，或用上面的下载链接',
 
   /* ── 两个导入框共用 ── */
   'crawl.import.importing': '导入中…',
