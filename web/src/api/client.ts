@@ -1109,13 +1109,27 @@ export const proxiesApi = {
     }>('POST', '/proxies/subscriptions', { kind, url, label }),
   removeSubscription: (id: number) =>
     request<{ removed: boolean }>('DELETE', `/proxies/subscriptions/${id}`),
-  renameSubscription: (id: number, label: string) =>
-    request<ProxySubscriptionItem>('PUT', `/proxies/subscriptions/${id}`, { label }),
+  /** 编辑订阅：改名 + 换链接（换链接的 clash 订阅保存即自动重拉，synced=true） */
+  updateSubscription: (id: number, payload: { label?: string; url?: string }) =>
+    request<{
+      id: number
+      kind: 'clash' | 'plain'
+      url: string
+      label: string | null
+      synced: boolean
+      nodes?: number | null
+      traffic?: string | null
+      alive?: number
+      total?: number
+      restarted?: boolean
+      warning?: string
+    }>('PUT', `/proxies/subscriptions/${id}`, payload),
   refreshSubscriptionTraffic: (id: number) =>
     request<{ id: number; traffic: string }>('POST', `/proxies/subscriptions/${id}/refresh`),
   syncSubscription: (id: number) =>
     request<{
       id: number
+      label: string | null
       nodes: number | null
       traffic: string | null
       alive: number

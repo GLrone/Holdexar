@@ -46,7 +46,8 @@ class SubscriptionAdd(BaseModel):
 
 
 class SubscriptionUpdate(BaseModel):
-    label: str  # 手动改名；空串清名
+    label: str | None = None  # 订阅名称；空串清名
+    url: str | None = None  # 订阅链接；变更时 clash 订阅自动重拉
 
 
 @router.get("")
@@ -183,7 +184,7 @@ async def clash_start(req: ClashStart):
 
     try:
         meta = await clash_manager.runtime.download_subscription(
-            sub_url, settings.data_dir
+            sub_url, settings.data_dir, await service._saved_proxy_candidates()
         )
         status = clash_manager.runtime.start(detect["path"], meta["path"])
     except ValueError as e:
@@ -191,7 +192,9 @@ async def clash_start(req: ClashStart):
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"订阅下载失败: {e}")
 
-    # 流量/节点数落库（启动即顺手回填）；订阅名不再自动回填——手动改名
+    # 流量/节点数落库（启动即顺手回填）；订阅名只补空位——已有名称不覆写
+    if meta.get("title"):
+        await service._apply_subscription_name(sub_id, str(meta["title"]))
     if meta.get("userinfo"):
         await service.mark_imported(
             sub_id,
@@ -303,11 +306,11 @@ async def delete_subscription(sub_id: int):
 
 @router.put("/subscriptions/{sub_id}")
 async def update_subscription(sub_id: int, req: SubscriptionUpdate):
-    """订阅手动改名（仅本地显示；面板 profile-title 不再自动回填）。"""
+    """编辑订阅：改名 + 换链接（换链接的 clash 订阅保存即自动重拉）。"""
     try:
-        return await service.update_subscription_label(sub_id, req.label)
+        return await service.update_subscription(sub_id, req.label, req.url)
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/subscriptions/{sub_id}/refresh")
