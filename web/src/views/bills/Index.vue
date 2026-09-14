@@ -398,31 +398,30 @@ onMounted(async () => {
         </div>
       </div>
 
-      <!-- ═══ 账户切换 chips ═══ -->
+      <!-- ═══ 账户切换 chips（每枚 chip 自带删除键：删除动作与账户成组，
+           原先所有删除键平铺在 chips 之后，与账户对不上号）═══ -->
       <div v-if="imports.length > 1" class="bills-accounts">
-        <button
-          v-for="imp in imports"
-          :key="imp.id"
-          type="button"
-          class="bills-accounts__chip"
-          :class="{ 'is-on': imp.id === activeId }"
-          @click="selectImport(imp.id)"
-        >
-          {{ imp.nickname || t('bills.accounts.fallbackName', { id: imp.id }) }}
-          <span class="bills-accounts__net">{{ fmtFen(imp.gameNetFen) }}</span>
-        </button>
-        <HlPopconfirm
-          v-for="imp in imports"
-          :key="`del-${imp.id}`"
-          :text="t('bills.accounts.confirmDelete', { nickname: imp.nickname })"
-          :confirm-label="t('bills.action.delete')"
-          class="bills-accounts__del"
-          @confirm="removeImport(imp)"
-        >
-          <button type="button" class="bills-accounts__delbtn" :title="t('bills.accounts.deleteTip')">
-            <HlIcon name="delete" />
+        <div v-for="imp in imports" :key="imp.id" class="bills-accounts__item">
+          <button
+            type="button"
+            class="bills-accounts__chip"
+            :class="{ 'is-on': imp.id === activeId }"
+            @click="selectImport(imp.id)"
+          >
+            {{ imp.nickname || t('bills.accounts.fallbackName', { id: imp.id }) }}
+            <span class="bills-accounts__net">{{ fmtFen(imp.gameNetFen) }}</span>
           </button>
-        </HlPopconfirm>
+          <HlPopconfirm
+            :text="t('bills.accounts.confirmDelete', { nickname: imp.nickname })"
+            :confirm-label="t('bills.action.delete')"
+            class="bills-accounts__del"
+            @confirm="removeImport(imp)"
+          >
+            <button type="button" class="bills-accounts__delbtn" :title="t('bills.accounts.deleteTip')">
+              <HlIcon name="delete" />
+            </button>
+          </HlPopconfirm>
+        </div>
       </div>
 
       <template v-if="overview">
