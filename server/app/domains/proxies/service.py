@@ -267,6 +267,60 @@ async def _weighted_pick(enabled: list[Proxy]) -> str:
     return chosen.url()
 
 
+async def _saved_proxy_candidates(limit: int = 3) -> list[str]:
+    """订阅拉取的借道出口：项目自己保存的可用代理（proxies 表启用项）。
+
+    只在**直连失败后**才轮到它们（通道链里排在直连之后，见
+    clash_manager._download_attempts）。取多条而不是一条：池里的单条代理
+    随时可能自己失效，一次只试一条等于把「借道」变成掷骰子；加权随机
+    天然倾向健康节点，重复抽到同一条不影响正确性（去重后可能少于 limit）。
+
+    这里**只**返回代理池——内核端口 / 本地混合端口由通道链自行探测补位，
+    不在本函数重复解析（也避免拉取路径多读一次设置库）。
+    池空返回空表（调用方即「直连之外没有可借道的池代理」）。
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    try:
+        enabled = await list_proxies(enabled_only=True)
+    except Exception:  # noqa: BLE001 —— 池不可用按空池处理，不拖垮拉取
+        enabled = []
+    for _ in range(limit):
+        if not enabled:
+            break
+        try:
+            pick = await _weighted_pick(enabled)
+        except Exception:  # noqa: BLE001
+            break
+        if pick not in seen:
+            seen.add(pick)
+            out.append(pick)
+    return out
+
+
+async def _apply_subscription_name(sub_id: int, name: str) -> str | None:
+    """订阅名落库（本地长期保存）：仅在本行尚无名称时写入。
+
+    拉到订阅名（profile-title / Content-Disposition / URL 末段）后调一次，
+    让「只有链接、没有名字」的订阅自动获得可读名称并长期保存在本地库——
+    名字一旦落地就是用户的资产，重拉二十次也不该把「我的机场」换回面板
+    里的 token，故已有名称的行一律不覆写。
+    返回写入后的名称（无名可写 / 订阅不存在时返回 None）。
+    """
+    name = (name or "").strip()[:100]
+    if not name:
+        return None
+    async with get_session_factory()() as session:
+        sub = await session.get(ProxySubscription, sub_id)
+        if sub is None:
+            return None
+        if sub.label:
+            return sub.label
+        sub.label = name
+        await session.commit()
+        return name
+
+
 async def update_subscription_label(sub_id: int, label: str) -> dict:
     """订阅手动改名（订阅名不再自动回填——面板 profile-title 覆盖面窄，
     且回填时机零散；名字由用户自己维护，空串可清名）。"""
@@ -278,6 +332,60 @@ async def update_subscription_label(sub_id: int, label: str) -> dict:
         sub.label = label or None
         await session.commit()
         return {"id": sub.id, "kind": sub.kind, "url": sub.url, "label": sub.label}
+
+
+async def update_subscription(
+    sub_id: int, label: str | None = None, url: str | None = None
+) -> dict:
+    """编辑订阅：改名 + 换链接；链接变更的 clash 订阅**保存即自动重拉**。
+
+    链接是订阅的唯一身份——换了链接等于换了一个机场，磁盘上的 config.yaml
+    与 clash_nodes 账本都还属于旧链接，不重拉就一直对不上。重拉通道同
+    「重拉」按钮：直连优先，失败自动借道项目保存的可用代理（见
+    _saved_proxy_candidates）。
+
+    重拉失败**不回滚**改名换链：名字和链接是用户刚确认的输入，重拉失败
+    是网络的一次抖动，把用户的输入撤掉只会让他再敲一遍。失败以 warning
+    回传，由前端提示可稍后手动重拉。
+
+    返回 {id, kind, url, label, synced, nodes?, traffic?, alive?, total?,
+    restarted?, warning?}；synced=true 表示本次确实重拉过。
+    """
+    async with get_session_factory()() as session:
+        sub = await session.get(ProxySubscription, sub_id)
+        if sub is None:
+            raise ValueError("订阅不存在")
+        if label is not None:
+            sub.label = (label or "").strip() or None
+        url_changed = False
+        if url is not None:
+            new_url = (url or "").strip()
+            if not new_url.lower().startswith(("http://", "https://")):
+                raise ValueError("订阅链接必须是 http(s) URL")
+            if new_url != sub.url:
+                sub.url = new_url
+                url_changed = True
+        await session.commit()
+        result: dict = {
+            "id": sub.id, "kind": sub.kind, "url": sub.url,
+            "label": sub.label, "synced": False,
+        }
+    if url_changed and result["kind"] == "clash":
+        try:
+            sync = await refresh_clash_subscription(sub_id)
+        except Exception as e:  # noqa: BLE001 —— 重拉失败不撤销改名换链
+            result["warning"] = f"订阅链接已更新，但自动重拉失败：{e}"
+            return result
+        result.update({
+            "synced": True,
+            "label": sync.get("label", result["label"]),
+            "nodes": sync.get("nodes"),
+            "traffic": sync.get("traffic"),
+            "alive": sync.get("alive", 0),
+            "total": sync.get("total", 0),
+            "restarted": sync.get("restarted", False),
+        })
+    return result
 
 
 async def refresh_subscription_traffic(sub_id: int) -> dict:
@@ -339,18 +447,23 @@ async def refresh_clash_subscription(sub_id: int) -> dict:
     存活统计落库：lastStats.alive/total 用账本 + 当前配置节点名口径。
     成功后写「上次拉取」留痕（订阅行时间戳 + 定时重拉门槛 KV，见
     _mark_refreshed）；缓存回退（全部通道下载失败）不算成功。
+
+    通道：**直连优先**，直连失败自动改用项目保存的可用代理（_saved_proxy_candidates）。
+    本行还没有名称时，用本次拉到的订阅名（profile-title 等）回填并本地保存
+    ——见 _apply_subscription_name；已有名称（用户手改或此前自动取过）不覆写。
     """
     sub = await get_subscription(sub_id)
     if sub is None:
         raise ValueError("订阅不存在")
     if sub.kind != "clash":
         raise ValueError("该订阅不是 Clash 订阅（kind=clash）")
+    label = sub.label
     from app.core.config import get_settings
 
     settings = get_settings()
     try:
         meta = await clash_manager.runtime.download_subscription(
-            sub.url, settings.data_dir
+            sub.url, settings.data_dir, await _saved_proxy_candidates()
         )
     except ValueError:
         raise
@@ -390,6 +503,10 @@ async def refresh_clash_subscription(sub_id: int) -> dict:
         fields["total"] = total
     await _merge_last_stats(sub_id, **fields)
 
+    # 自动取名（本地保存）：本行还没有名字时才写，手改过的名字不被覆盖
+    if not label and meta.get("title"):
+        label = await _apply_subscription_name(sub_id, str(meta["title"])) or label
+
     # 内核在跑且跑的就是这条订阅：配置变化自动重启生效；跑的是别的订阅
     # 或没在跑 → 只下载不重启（避免共用缓存路径把内核悄悄切到别的订阅）
     restarted = False
@@ -408,6 +525,7 @@ async def refresh_clash_subscription(sub_id: int) -> dict:
         await _mark_refreshed(sub_id)
     return {
         "id": sub_id,
+        "label": label,
         "nodes": meta.get("nodes"),
         "traffic": fields.get("traffic"),
         "alive": fields.get("alive", 0),
@@ -755,7 +873,7 @@ async def add_subscription(kind: str, url: str, label: str | None = None) -> dic
     if kind == "clash":
         try:
             meta = await clash_manager.runtime.download_subscription(
-                url, settings.data_dir
+                url, settings.data_dir, await _saved_proxy_candidates()
             )
             result["nodes"] = meta.get("nodes")
             result["traffic"] = meta.get("userinfo")
@@ -765,15 +883,11 @@ async def add_subscription(kind: str, url: str, label: str | None = None) -> dic
             )
             # 首次自动取名（Verge 链：profile-title → Content-Disposition →
             # URL 末段）：仅在用户没填 label 时落库，机场名可见但不抢
-            # 手动命名权。只在保存时执行——刷新/重拉永不覆写（对齐
-            # 「订阅名不再自动回填」拍板，Verge update_item 同款语义）。
+            # 手动命名权（_apply_subscription_name 保证已有名称不覆写）。
             if not label and meta.get("title"):
-                async with get_session_factory()() as session:
-                    row = await session.get(ProxySubscription, sub_id)
-                    if row is not None and not row.label:
-                        row.label = str(meta["title"])[:100]
-                        await session.commit()
-                        result["label"] = row.label
+                named = await _apply_subscription_name(sub_id, str(meta["title"]))
+                if named:
+                    result["label"] = named
         except Exception as e:  # noqa: BLE001 —— 验证失败不撤销保存
             result["warning"] = f"订阅已保存，但下载验证失败：{e}（可稍后重拉）"
     if kernel_installed is not None:
