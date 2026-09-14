@@ -42,10 +42,8 @@ import family from './family'
 import famWish from './famWish'
 import famLib from './famLib'
 import famBuy from './famBuy'
-import famValue from './famValue'
 import famPlay from './famPlay'
 import famContrib from './famContrib'
-import famInsight from './famInsight'
 import famGrowth from './famGrowth'
 import famHeat from './famHeat'
 // famLicense（入库许可证模块）已并入 bills 页许可证页签，词条归 bills.cdk.*
@@ -86,10 +84,8 @@ export const messages = {
   ...famWish,
   ...famLib,
   ...famBuy,
-  ...famValue,
   ...famPlay,
   ...famContrib,
-  ...famInsight,
   ...famGrowth,
   ...famHeat,
   ...currencies,

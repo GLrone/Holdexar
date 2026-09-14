@@ -1,6 +1,6 @@
 /* gamelib 词条 —— 游戏库页（views/gamelib/Index.vue 及其页签）。
-   页签结构：账号游戏库（每个追踪账户的已购矩阵）/ 库分析 / 家庭库
-   （自 family 页迁入，词条仍挂 famLib.* 模块）。
+   页签结构：账号游戏库（每个追踪账户的已购矩阵）/ 库分析 / 家庭库 /
+   游玩动态（自 family 页迁入，词条仍挂 famPlay.* 模块）。
 
    术语对齐既有 A / B 表：
    · 入库（本系统首次见到该游戏的时间）→ acquired / added
@@ -13,9 +13,11 @@ const gamelib = {
   'gamelib.tab.owned': '账号游戏库',
   'gamelib.tab.insights': '库分析',
   'gamelib.tab.family': '家庭库',
+  'gamelib.tab.play': '游玩动态',
   'gamelib.section.owned': '账号游戏库',
   'gamelib.section.insights': '库分析',
   'gamelib.section.family': '家庭库',
+  'gamelib.section.play': '游玩动态',
 
   /* ── 空态与加载 ── */
   'gamelib.empty.loading': '账户已购数据拉取中…',

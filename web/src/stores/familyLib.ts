@@ -11,25 +11,7 @@ import {
 import { normalizeAvatarUrl } from '@/api/avatar'
 
 /**
- * 活跃度档位 → 词条 key。
- *
- * **只存 key、不存译文**：模块级常量在模块加载那一刻求值一次，存中文等于把语言
- * 冻死在那一刻，组件拿到的永远是中文（「模块级常量存译文」的冻结陷阱，只是发生
- * 在 store 里——brief6 D7）。译文由消费方在**渲染期** `t()` 现取。
- *
- * 属性名以 `Key` 结尾是有意的：`check-i18n.mjs` 的判据 ③ 只扫这种形状的常量表。
- * 这四个 key 的取用点是 `t(m.statusKey)`（动态调用），判据 ② 的静态字面量扫描
- * 看不见它——不写成这个形状，拼错 key 会一路进产物、运行时静默渲染成 key 原文。
- */
-const STATUS_LABEL = {
-  active: { statusKey: 'famInsight.status.active' },
-  warm: { statusKey: 'famInsight.status.warm' },
-  cold: { statusKey: 'famInsight.status.cold' },
-  dormant: { statusKey: 'famInsight.status.dormant' },
-} as const
-
-/**
- * 家庭共享库共享数据源：family 页 7 个 tab 的统一真数据后端快照。
+ * 家庭共享库共享数据源：family 页各 tab 的统一真数据后端快照。
  * load() 失败时记录 message（未绑 Cookie / 未加入家庭组 → 诚实引导），
  * tabs 各自渲染空态；refresh() 强制重拉（后端绕过 5 分钟缓存）。
  */
@@ -163,48 +145,6 @@ export const useFamilyStore = defineStore('familyLib', () => {
     return [...map.entries()].sort((a, b) => a[0].localeCompare(b[0]))
   })
 
-  /**
-   * 成员入库活跃度：
-   * daysSinceLatest = 今天 - 该成员最后一次入库；分档 活跃<14/温热<60/冷淡<180/沉睡。
-   * 含健康分（四档均值 100/75/50/25）与月均入库。
-   *
-   * 档位标签**只回 key**（`statusKey`），不回译文——store 里没有 t()，硬编码中文
-   * 就是冻死。消费方 `FamInsights.vue` 在渲染期 `t(m.statusKey)` 现取。
-   * `monthlyAvg` 回**数值**而不是 `.toFixed(1)` 的字符串：格式化统一走
-   * `useLocaleFormat()` 出口，store 不替视图决定显示形态。
-   */
-  const memberActivity = computed(() => {
-    const nowSec = Math.floor(Date.now() / 1000)
-    const order = { active: 0, warm: 1, cold: 2, dormant: 3 } as const
-    const scoreMap = { active: 100, warm: 75, cold: 50, dormant: 25 } as const
-    const out = members.value.map((m) => {
-      const times = acquiredGames.value
-        .filter((g) => g.owners.includes(m.steamid))
-        .map((g) => g.timeAcquired)
-      const latest = times.length ? Math.max(...times) : -1
-      const first = times.length ? Math.min(...times) : -1
-      const days = latest > 0 ? Math.floor((nowSec - latest) / 86400) : -1
-      const status = days < 0 || days >= 180 ? 'dormant' : days < 14 ? 'active' : days < 60 ? 'warm' : 'cold'
-      const libMonths = first > 0 ? Math.max(1, (nowSec - first) / 2592000) : 1
-      return {
-        ...m,
-        total: times.length,
-        latestTime: latest,
-        daysSinceLatest: days,
-        status,
-        statusKey: STATUS_LABEL[status].statusKey,
-        monthlyAvg: times.length / libMonths,
-      }
-    })
-    const healthScore = out.length
-      ? Math.round(out.reduce((s, m) => s + scoreMap[m.status], 0) / out.length)
-      : 0
-    out.sort((a, b) => order[a.status] - order[b.status] || b.total - a.total)
-    const counts = { active: 0, warm: 0, cold: 0, dormant: 0 }
-    for (const m of out) counts[m.status]++
-    return { members: out, healthScore, counts }
-  })
-
   return {
     data,
     loading,
@@ -222,7 +162,6 @@ export const useFamilyStore = defineStore('familyLib', () => {
     acquiredGames,
     acquiredDayMaps,
     monthlyAcquired,
-    memberActivity,
     fromSnapshot,
     load,
   }
