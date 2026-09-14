@@ -1,6 +1,6 @@
 """Holdexar 桌面启动器。
 
-流程：单实例锁（被占先探活辨真伪）→ 后台线程 uvicorn → 轮询 /api/v1/health → pywebview 窗口（失败降级系统浏览器）。
+流程：单实例锁（被占先探活辨真伪）→ 后台线程 uvicorn → pywebview 窗口首载内联等待页（零网络依赖）→ health 就绪后整窗跳转真实应用（失败降级系统浏览器）。
 
 用法：
     python desktop/main.py                # 桌面窗口模式
@@ -56,18 +56,36 @@ else:
 from app.core.app_info import APP_NAME, APP_SLUG, ENV_PREFIX  # noqa: E402
 from app.core.paths import is_frozen, resolve_data_dir  # noqa: E402
 
-# 启动等待页：后端同源路由 /__splash（app/main.py _mount_spa 提供）。
-# 窗口首载它，JS 轮询 health 就绪即整窗跳转真实应用——窗口初始化
-# （CLR/WebView2 ~1s）与后端 lifespan（~2s）并行重叠。曾试过 data-URL
-# 内联等待页，但 data: 源向 127.0.0.1 发 fetch 被 WebView2 跨源策略拦截
-# （跨源策略会拦截等待页对本地服务的 fetch），故改同源路由。
-
 # WebView2 Runtime（Evergreen 固定产品 GUID）注册表探测 + 官方离线安装链
 _WEBVIEW2_REG_KEYS = (
     r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
     r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
 )
 _WEBVIEW2_DL_URL = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+
+# 启动等待页：pywebview 内联 HTML（create_window(html=...)，零网络依赖）。
+# 窗口出现即显示转圈页，后端 health 就绪后由 _wait_and_navigate 整窗跳转
+# 真实应用——窗口初始化（CLR/WebView2 ~1s）与后端 lifespan（数秒，首装
+# 导入种子更久）并行重叠。等待页不能依赖后端：uvicorn 要等 lifespan 跑完
+# 才监听端口，此窗口期加载同源等待页一律连接被拒（WebView2 直接显示
+# 「网页加载失败」错误页，等页里的 JS 轮询根本没机会跑）；data-URL 方案
+# 又被 WebView2 跨源策略拦截对 127.0.0.1 的 fetch（双击冒烟实证卡死）。
+# 内联 html= 两者皆避：不经网络加载，也就没有加载失败可言。
+_SPLASH_HTML = (
+    "<!doctype html><html><head><meta charset='utf-8'>"
+    f"<title>{APP_NAME}</title>"
+    "<style>html,body{height:100%;margin:0}"
+    "body{display:flex;align-items:center;justify-content:center;"
+    "background:#1b2838;color:#c7d5e0;"
+    "font:15px/1.8 'Segoe UI',system-ui,sans-serif}"
+    ".box{text-align:center}"
+    ".spin{width:34px;height:34px;margin:0 auto 16px;border-radius:50%;"
+    "border:3px solid rgba(199,213,224,.2);border-top-color:#66c0f4;"
+    "animation:r .9s linear infinite}"
+    "@keyframes r{to{transform:rotate(360deg)}}"
+    "</style></head><body><div class='box'><div class='spin'></div>"
+    f"{APP_NAME} 启动中，请稍候…</div></body></html>"
+)
 
 SERVER_HOST = "127.0.0.1"
 # 端口协商结果：默认取环境变量（HOLDEXAR_PORT/HOLDEXAR_LOCK_PORT），
@@ -317,6 +335,17 @@ def _wait_health(timeout: float) -> bool:
         except Exception:  # noqa: BLE001 —— 服务未就绪属预期
             time.sleep(0.3)
     return False
+
+
+def _wait_and_navigate(window, app_url: str) -> None:
+    """health 就绪后把窗口从内联等待页切到真实应用（webview.start 后的
+    后台线程）。90s 未就绪不在此处理——watchdog 线程负责弹窗报错，本线程
+    停止轮询即可，窗口停在转圈页。"""
+    if _wait_health(HEALTH_TIMEOUT):
+        try:
+            window.load_url(app_url)
+        except Exception:  # noqa: BLE001 —— 窗口已销毁（托盘退出）：无需跳转
+            pass
 
 
 class DesktopApi:
@@ -1191,6 +1220,13 @@ def _make_closing_guard(window):
     return _guard
 
 
+def _on_window_ready(window, app_url: str) -> None:
+    """webview.start(func) 入口：窗口真正建好后拉起两件后台事——
+    health 等待跳转线程（等待页 → 真实应用）与托盘线程。"""
+    threading.Thread(target=_wait_and_navigate, args=(window, app_url), daemon=True).start()
+    _run_tray(window)
+
+
 def _run_tray(window) -> None:
     """托盘线程入口（经 webview.start(func) 在窗口建好后拉起）。
 
@@ -1210,21 +1246,20 @@ def _run_tray(window) -> None:
         pass
 
 
-def _open_window(url: str, fallback_url: str | None = None) -> None:
-    """开主窗。url 为首载页（窗口模式下是 data-URL 等待页）；fallback_url
-    为窗口不可用时浏览器兜底要打开的真实地址（data-URL 在系统浏览器里
-    兼容差，兜底必须走真实 URL）。"""
-    real_url = fallback_url or url
+def _open_window(app_url: str) -> None:
+    """开主窗。首载内联等待页（零网络依赖，见 _SPLASH_HTML），health 就绪
+    后由 _wait_and_navigate 切到 app_url；窗口不可用时浏览器兜底直接开
+    app_url（等待页是进程内 HTML，系统浏览器里无意义，兜底必须走真实地址）。"""
     try:
         import webview
     except ImportError:
         webview = None  # type: ignore[assignment]
     if webview is None:
-        _browser_fallback(real_url, "pywebview 未安装")
+        _browser_fallback(app_url, "pywebview 未安装")
         return
     if not _webview2_available():
         _browser_fallback(
-            real_url,
+            app_url,
             "未检测到 WebView2 Runtime（Windows 渲染组件缺失），"
             f"请从微软官网安装后重新启动：{_WEBVIEW2_DL_URL}",
         )
@@ -1236,7 +1271,7 @@ def _open_window(url: str, fallback_url: str | None = None) -> None:
         "js_api": DesktopApi(),
     }
     try:
-        window = webview.create_window(WINDOW_TITLE, url, **kwargs)
+        window = webview.create_window(WINDOW_TITLE, html=_SPLASH_HTML, **kwargs)
         # 关窗语义：点 X = 隐藏到托盘，后端（uvicorn 线程 + 调度器）随进程
         # 常驻继续更新数据；托盘「退出」置 quit 后放行真关闭。closed 事件
         # 保留为终审兜底（两条退出路径都汇聚到 os._exit，不走解释器收尾
@@ -1249,11 +1284,12 @@ def _open_window(url: str, fallback_url: str | None = None) -> None:
             # pywebview 5.x：icon 是 start() 的参数（create_window 无此参，
             # 传了会 TypeError 顶层炸穿兜底）
             start_kwargs["icon"] = icon
-        # 托盘线程在窗口建好后由 start(func) 拉起（时序原因见 _run_tray：
-        # NotifyIcon 早于 start() 创建会炸穿 WinForms 初始化 → 整窗降级）
-        webview.start(_run_tray, (window,), **start_kwargs)  # 阻塞至窗口真关闭（仅托盘退出可达）
+        # 托盘与 health 跳转都在窗口建好后由 start(func) 拉起（时序原因见
+        # _run_tray：NotifyIcon 早于 start() 创建会炸穿 WinForms 初始化 →
+        # 整窗降级）
+        webview.start(_on_window_ready, (window, app_url), **start_kwargs)  # 阻塞至窗口真关闭（仅托盘退出可达）
     except Exception as e:  # noqa: BLE001 —— 窗口创建/渲染层初始化失败一并降级浏览器
-        _browser_fallback(real_url, f"窗口初始化失败：{e}")
+        _browser_fallback(app_url, f"窗口初始化失败：{e}")
         return
     sys.stdout.flush()
     os._exit(0)
@@ -1359,11 +1395,8 @@ def main() -> None:
             return
 
     # 窗口模式：窗口初始化（CLR/WebView2）与后端 lifespan 并行——窗口先载
-    # 同源等待页 /__splash，JS 轮询 health 就绪即整窗跳转真实应用，省掉
-    # 旧的"先等 health 再开窗"串行等待（一轮 ~3s）。注意等待页也在后端
-    # 上（服务就绪前窗口会短暂显示 WebView2 默认空白，属预期）
-    splash = f"{url}/__splash"
-
+    # 内联等待页（不经网络，后端未监听也不受影响），health 就绪后整窗跳转
+    # 真实应用（_wait_and_navigate）
     def _watchdog() -> None:
         """后台看门狗：HEALTH_TIMEOUT 内后端仍不可用则弹窗报错（窗口模式下
         等待页会一直转圈，用户需要明确的失败反馈）。"""
@@ -1381,7 +1414,7 @@ def main() -> None:
                 print(detail)
 
     threading.Thread(target=_watchdog, daemon=True).start()
-    _open_window(splash, fallback_url=url)
+    _open_window(url)
 
 
 if __name__ == "__main__":
