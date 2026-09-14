@@ -218,6 +218,49 @@ def _start_server(ready: threading.Event, error_box: list[str]) -> None:
         ready.set()
 
 
+def _watch_launcher() -> None:
+    """包装进程（run.py）死亡 → 本进程随之退出：孤儿实例防线。
+
+    run.py 被硬杀（任务管理器 / taskkill / 脚本超时收割）时，Windows 不会
+    连带收割子进程——desktop/main.py 存活成无主实例，继续占着服务端口与
+    单实例锁，下一次启动便撞上「已在运行」或「端口被占用」，用户看到的
+    就是「应用无法启动」。控制台正常关闭本就走整树收割，这里兜的是硬杀
+    路径：watcher 线程等包装进程句柄，触发即整体退出。
+    直接拉起（无 LAUNCHER_PID 环境）不设防——打包态 exe、--server 独立
+    运行均属此类，本来就没有可监视的父进程。
+    """
+    if os.name != "nt":
+        return
+    raw = os.environ.get(f"{ENV_PREFIX}LAUNCHER_PID", "").strip()
+    if not raw.isdigit() or int(raw) == os.getpid():
+        return
+    ppid = int(raw)
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        SYNCHRONIZE = 0x00100000
+        INFINITE = 0xFFFFFFFF
+        # HANDLE 按 64 位宽度声明（ctypes 默认 c_int 会在 64 位下截断句柄）
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        handle = kernel32.OpenProcess(SYNCHRONIZE, False, ppid)
+        if not handle:
+            return  # 包装进程已不在/句柄打不开：无孤儿风险，不设防
+
+        def _await_death() -> None:
+            kernel32.WaitForSingleObject(handle, INFINITE)
+            print(f"[退出] 启动器进程 {ppid} 已终止，本实例随之退出。")
+            sys.stdout.flush()
+            os._exit(0)
+
+        threading.Thread(target=_await_death, daemon=True).start()
+    except Exception:  # noqa: BLE001 —— 监视失败不阻断正常启动
+        pass
+
+
 def _alert(message: str) -> None:
     """windowed 打包态 print 不可见：关键失败路径弹系统对话框兜底。"""
     print(message)  # 控制台模式（python 直跑 / --server 调试）照常可见
@@ -1192,25 +1235,25 @@ def _open_window(url: str, fallback_url: str | None = None) -> None:
         "min_size": MIN_SIZE,
         "js_api": DesktopApi(),
     }
-    window = webview.create_window(WINDOW_TITLE, url, **kwargs)
-    # 关窗语义：点 X = 隐藏到托盘，后端（uvicorn 线程 + 调度器）随进程
-    # 常驻继续更新数据；托盘「退出」置 quit 后放行真关闭。closed 事件
-    # 保留为终审兜底（两条退出路径都汇聚到 os._exit，不走解释器收尾
-    # 的延迟路径——后台线程随进程内核直接终结）。
-    window.events.closing += _make_closing_guard(window)
-    window.events.closed += lambda: (sys.stdout.flush(), os._exit(0))
-    start_kwargs = {}
-    icon = _app_icon()
-    if icon:
-        # pywebview 5.x：icon 是 start() 的参数（create_window 无此参，
-        # 传了会 TypeError 顶层炸穿兜底）
-        start_kwargs["icon"] = icon
     try:
+        window = webview.create_window(WINDOW_TITLE, url, **kwargs)
+        # 关窗语义：点 X = 隐藏到托盘，后端（uvicorn 线程 + 调度器）随进程
+        # 常驻继续更新数据；托盘「退出」置 quit 后放行真关闭。closed 事件
+        # 保留为终审兜底（两条退出路径都汇聚到 os._exit，不走解释器收尾
+        # 的延迟路径——后台线程随进程内核直接终结）。
+        window.events.closing += _make_closing_guard(window)
+        window.events.closed += lambda: (sys.stdout.flush(), os._exit(0))
+        start_kwargs = {}
+        icon = _app_icon()
+        if icon:
+            # pywebview 5.x：icon 是 start() 的参数（create_window 无此参，
+            # 传了会 TypeError 顶层炸穿兜底）
+            start_kwargs["icon"] = icon
         # 托盘线程在窗口建好后由 start(func) 拉起（时序原因见 _run_tray：
         # NotifyIcon 早于 start() 创建会炸穿 WinForms 初始化 → 整窗降级）
         webview.start(_run_tray, (window,), **start_kwargs)  # 阻塞至窗口真关闭（仅托盘退出可达）
-    except Exception as e:  # noqa: BLE001 —— WebView2 初始化失败降级浏览器
-        _browser_fallback(real_url, f"窗口渲染初始化失败：{e}")
+    except Exception as e:  # noqa: BLE001 —— 窗口创建/渲染层初始化失败一并降级浏览器
+        _browser_fallback(real_url, f"窗口初始化失败：{e}")
         return
     sys.stdout.flush()
     os._exit(0)
@@ -1240,10 +1283,38 @@ def _focus_running_window() -> bool:
         return False
 
 
+def _apply_webview2_static_args() -> None:
+    """主窗口 WebView2 静态浏览器参数：禁组件更新与后台网络服务。
+
+    WebView2（EdgeChromium）运行时进程的 Chromium 组件更新器会创建 BITS
+    任务（msedgewebview2.exe 的 bits_service）。宿主 exe 无数字签名时，
+    杀软主动防御把这笔 BITS 创建归因到宿主头上——实测拦截弹窗「程序正在
+    创建 BITS 任务，可能造成系统关键文件被篡改」，建议用户阻止（阻止后
+    WebView2 组件更新失效，极端情况窗口渲染异常）。--disable-component-
+    update + --disable-background-networking 从源头关掉组件更新与后台
+    更新流量：BITS 任务不再创建，本地 UI 功能不受影响（本项目全部数据
+    走后端 httpx，WebView2 只渲染 127.0.0.1 页面）。
+
+    进程级固定：同一 user-data 目录下所有 WebView2 环境的浏览器参数必须
+    一致；登录窗（独立 user-data 目录）的暂存/还原逻辑与本值天然兼容
+    （saved_env 即本值，还原后主窗口参数不变）。
+    """
+    key = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"
+    if not os.environ.get(key):
+        os.environ[key] = "--disable-component-update --disable-background-networking"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=f"{APP_NAME} 桌面启动器")
     parser.add_argument("--server", action="store_true", help="无窗口模式，仅启动本地服务")
     args = parser.parse_args()
+
+    # 孤儿实例防线最早挂上：换装/端口协商/服务线程任何阶段包装进程死亡，
+    # 本进程都不应存活成无主实例（防线语义见 _watch_launcher 顶注）
+    _watch_launcher()
+
+    # WebView2 静态参数须在任何窗口创建前就位（webview.start 建环境时读取）
+    _apply_webview2_static_args()
 
     # 启动期换装：staging 就绪则替换程序文件后重启（早期分支：
     # uvicorn 线程/窗口/端口锁均未拉起，程序文件句柄最少）
