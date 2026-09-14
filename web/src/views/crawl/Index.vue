@@ -403,6 +403,56 @@ async function toggleAcctOwned(a: TrackedAccount, owned: boolean) {
   }
 }
 
+// ── 收藏列表导入教程（浏览器脚本 + 控制台导出代码）────────────────
+//
+// 这条通道的数据来自油猴脚本：脚本把收藏存进本地，控制台**主动**查询
+// FAVORITES_RESPONSE 才能拿到 JSON（页面加载事件 STEAM_DATA_INIT 只发一次，
+// 事后再挂监听收不到）。教程窗把脚本原文与查询代码一并给出，用户不必
+// 再到别处翻——脚本随前端产物分发（public/userscript/），打包态由 SPA
+// 回退路由按文件路径直出。
+
+/** 油猴脚本静态资源（dev 与打包态同路径；下载链接与文本预览共用） */
+const SCRIPT_URL = '/userscript/steamhl-helper.user.js'
+/** 下载文件名（ASCII：中文文件名会撞双语红线的「用户可见文案」门禁） */
+const SCRIPT_FILENAME = 'SteamHL-Helper.user.js'
+/** 控制台导出命令（脚本代码，非用户文案——不进词典，中英同文） */
+const FAV_CONSOLE_CODE = `window.addEventListener('FAVORITES_RESPONSE', (e) => copy(JSON.stringify(e.detail.favorites)), { once: true })
+window.dispatchEvent(new CustomEvent('FAVORITES_QUERY'))`
+
+const favTutOpen = ref(false)
+const favScript = ref('')
+const favScriptLoading = ref(false)
+const favTutSteps = computed(() => [
+  t('crawl.fav.tut.step1'),
+  t('crawl.fav.tut.step2'),
+  t('crawl.fav.tut.step3'),
+  t('crawl.fav.tut.step4'),
+])
+
+async function openFavTutorial() {
+  favTutOpen.value = true
+  if (favScript.value || favScriptLoading.value) return
+  favScriptLoading.value = true
+  try {
+    const resp = await fetch(SCRIPT_URL)
+    favScript.value = resp.ok ? await resp.text() : ''
+  } catch {
+    favScript.value = ''
+  } finally {
+    favScriptLoading.value = false
+  }
+}
+
+async function copyTutText(text: string) {
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+    message.success(t('crawl.fav.tut.copied'))
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+  }
+}
+
 onMounted(() => {
   void loadJobs()
   void settingsStore.load()
@@ -557,15 +607,23 @@ onMounted(() => {
       </div>
     </div>
 
-    <!-- 收藏列表导入（FAVORITES 通道；只入库不进池，导入不产生关注） -->
+    <!-- 收藏列表导入（FAVORITES 通道；导入即入池 + 首爬） -->
     <div class="card section-card" data-section="crawl.section.favImport">
-      <div class="section-title">{{ t('crawl.section.favImport') }}</div>
-      <!-- 整句一条词条，两枚 <code> 由词条自带、v-html 渲染（见 zh-CN/crawl.ts 的说明：
+      <div class="section-card__header">
+        <div>
+          <div class="section-title">{{ t('crawl.section.favImport') }}</div>
+          <!-- 整句一条词条，两枚 <code> 由词条自带、v-html 渲染（见 zh-CN/crawl.ts 的说明：
            切成三段会把两个代码标识符钉死在固定位置，英文只能拼出 "A → B" 这种
            读成转换关系的写法，而原意是嵌套）。词条是应用自有静态文案（非用户输入），
            v-html 无注入面；本处无 code 样式，<code> 走浏览器默认，与迁移前逐字相同。
            vue/no-v-html 未启用（flat/essential 不含），与 HlBanner / bundles 同款写法。 -->
-      <div class="section-desc" v-html="t('crawl.fav.desc')"></div>
+          <div class="section-desc" v-html="t('crawl.fav.desc')"></div>
+        </div>
+        <HlButton variant="text" size="sm" @click="openFavTutorial">
+          <HlIcon name="info" :size="14" />
+          {{ t('crawl.fav.tutorial') }}
+        </HlButton>
+      </div>
       <div class="start-row" style="align-items: stretch">
         <textarea
           v-model="favText"
@@ -596,6 +654,32 @@ onMounted(() => {
       </div>
       <div v-if="importFavMsg" class="bundle-import__msg">{{ importFavMsg }}</div>
     </div>
+
+    <!-- 收藏导入教程：数据来源（浏览器脚本）+ 导出代码，脚本随产物分发 -->
+    <HlDialog v-model="favTutOpen" :title="t('crawl.fav.tutTitle')" :width="640">
+      <ol class="fav-tut__steps">
+        <li v-for="step in favTutSteps" :key="step">{{ step }}</li>
+      </ol>
+
+      <div class="fav-tut__label">
+        {{ t('crawl.fav.tut.console') }}
+        <HlButton variant="text" size="sm" @click="copyTutText(FAV_CONSOLE_CODE)">
+          {{ t('crawl.fav.tut.copy') }}
+        </HlButton>
+      </div>
+      <pre class="fav-tut__code">{{ FAV_CONSOLE_CODE }}</pre>
+
+      <div class="fav-tut__label">
+        {{ t('crawl.fav.tut.script') }}
+        <HlButton variant="text" size="sm" :loading="favScriptLoading" @click="copyTutText(favScript)">
+          {{ t('crawl.fav.tut.copy') }}
+        </HlButton>
+        <a class="fav-tut__link" :href="SCRIPT_URL" :download="SCRIPT_FILENAME">
+          {{ t('crawl.fav.tut.download') }}
+        </a>
+      </div>
+      <pre class="fav-tut__code fav-tut__code--long">{{ favScript || t('crawl.fav.tut.scriptEmpty') }}</pre>
+    </HlDialog>
 
     <!-- 已购游戏抓取地区 -->
     <div class="card section-card" data-section="crawl.section.owned">
@@ -979,5 +1063,56 @@ onMounted(() => {
   background: var(--success);
   border-color: var(--success);
   color: var(--ink-on-fill);
+}
+
+/* ── 收藏导入教程窗（步骤 + 控制台代码 + 油猴脚本原文）── */
+.fav-tut__steps {
+  margin: 0 0 4px;
+  /* 序号标记画在左 padding 区，且全局 reset 会收走 list-style——
+     两处都要显式给回，否则步骤没有编号（实测复现） */
+  padding-left: 20px;
+  list-style: decimal;
+  font-size: 12.5px;
+  line-height: 1.85;
+  color: var(--text-secondary);
+}
+
+.fav-tut__label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 14px 0 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.fav-tut__code {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line-1);
+  border-radius: 8px;
+  background: var(--surface-inset);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 170px;
+  overflow-y: auto;
+}
+
+.fav-tut__code--long {
+  max-height: 260px;
+}
+
+.fav-tut__link {
+  font-size: 12px;
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.fav-tut__link:hover {
+  text-decoration: underline;
 }
 </style>

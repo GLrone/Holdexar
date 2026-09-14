@@ -79,6 +79,21 @@ const crawl: Partial<Record<MessageKey, string>> = {
   'crawl.fav.import': 'Import favorites',
   'crawl.fav.placeholder':
     '[2561580,1173800,1173820,3837340]\nor [{"appid":620,"name":"Portal 2"},…]',
+  /* Tutorial dialog: the data comes from a browser userscript, so the dialog
+     ships the script source and the console command (the script is served with
+     the frontend build; see crawl/Index.vue). */
+  'crawl.fav.tutorial': 'How to import',
+  'crawl.fav.tutTitle': 'Favorites import guide',
+  'crawl.fav.tut.step1': 'Install the Tampermonkey extension and add the script below (or download the file and drop it into the extension dashboard).',
+  'crawl.fav.tut.step2': 'Open a page where the script is active (local HTML report / Steam favorites page) — the script stores your favorites locally.',
+  'crawl.fav.tut.step3': 'Open the console (F12), paste and run the command below — the favorites list is copied to your clipboard as JSON.',
+  'crawl.fav.tut.step4': 'Paste it into the box above and press "Import favorites": the games join the watch pool, and new ones are crawled once.',
+  'crawl.fav.tut.console': 'Console command (run it on a page where the script is active)',
+  'crawl.fav.tut.script': 'Userscript: SteamHL helper',
+  'crawl.fav.tut.copy': 'Copy',
+  'crawl.fav.tut.copied': 'Copied',
+  'crawl.fav.tut.download': 'Download script',
+  'crawl.fav.tut.scriptEmpty': 'Script not loaded — reopen this dialog, or use the download link above',
 
   /* Shared by both import boxes */
   'crawl.import.importing': 'Importing…',
