@@ -35,6 +35,9 @@ const NO_CACHE_PATHS = [
   '/system/update-progress', // 更新下载进度 800ms 轮询
   '/system/update-pending',
   '/proxies/clash/install/progress',
+  // Epic 卡片：新鲜度由后端快照缓存管理（过期即回旧数据 + 后台刷新），
+  // 前端再叠 60s 时间窗会把 stale→fresh 的覆盖整个吞掉（轮询永远读旧响应）
+  '/metadata/epic/offers',
 ]
 
 function isNoCachePath(path: string): boolean {
@@ -1537,12 +1540,16 @@ export interface EpicOffersPayload {
   offers: EpicOffer[]
   /** 移动端每周白送（GamerPower 自动源，breaker 立绘兜底）；null = 未取到 */
   mobile: EpicMobileOffer | null
-  /** 北京时间 ISO（卡片「更新于」） */
+  /** 北京时间 ISO（卡片「更新于」；快照态为上次抓取时刻） */
   fetchedAt: string | null
+  /** true = 本次响应来自缓存（含进程重启后的落库快照） */
+  cached?: boolean
+  /** true = 快照已过期、后台正在刷新（前端短轮询届时自动覆盖） */
+  stale?: boolean
 }
 
 export const metadataApi = {
-  /** 当期 + 预告白送元素；后端进程内缓存 30 分钟 */
+  /** 当期 + 预告白送元素；后端快照缓存 30 分钟（冷启动先回快照 + 后台刷新） */
   epicOffers: (opts?: { noCache?: boolean }) =>
     request<EpicOffersPayload>('GET', '/metadata/epic/offers', undefined, opts),
 }

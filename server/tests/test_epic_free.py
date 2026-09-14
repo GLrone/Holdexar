@@ -418,3 +418,138 @@ async def test_resolve_mobile_checkout_none(monkeypatch):
 
     monkeypatch.setattr(ef, "_egs_persisted", no_hit)
     assert await ef.resolve_mobile_checkout("Y") is None
+
+
+# ─── 展示链缓存：落库快照 + 后台刷新（stale-while-revalidate）─────────
+# 仪表盘卡片语义：冷启动先回落库快照（stale）+ 后台刷新覆盖，避免每次
+# 启动首开都等一轮完整抓取。落库键走 app_settings KV，夹具清账防串场。
+
+
+def _offers_payload(title: str = "Cached Game") -> dict:
+    return {
+        "source": "epic-offers", "ok": True,
+        "offers": [{
+            "title": title, "titleCn": "", "appid": None,
+            "start": "2026-9-10", "end": "2026-9-17", "upcoming": False,
+            "image": "https://cdn/x.jpg",
+            "url": "https://store.epicgames.com/en-US/p/x",
+            "priceOriginal": "$9.99",
+        }],
+        "mobile": None,
+        "fetchedAt": "2026-09-15T10:00:00",
+    }
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _reset_offers_cache():
+    """展示链缓存跨用例隔离：内存复位 + 落库键清账 + 后台任务收尾。"""
+    from app.domains.settings import service as settings_service
+
+    await init_db()
+    epic._epic_offers_cache.update({"at": 0.0, "payload": None})
+    epic._epic_offers_refreshing = False
+    await settings_service.delete_value(epic._EPIC_OFFERS_CACHE_KEY)
+    yield
+    task = epic._epic_offers_refresh_task
+    if task is not None and not task.done():
+        await task
+    epic._epic_offers_cache.update({"at": 0.0, "payload": None})
+    epic._epic_offers_refreshing = False
+    await settings_service.delete_value(epic._EPIC_OFFERS_CACHE_KEY)
+
+
+@pytest.mark.asyncio
+async def test_offers_cold_start_serves_snapshot_then_refreshes(monkeypatch):
+    """冷启动（内存空）立即回落库快照（stale=True）+ 后台刷新；刷新完成覆盖。"""
+    import time as _time
+
+    from app.domains.settings import service as settings_service
+
+    await settings_service.set_value(
+        epic._EPIC_OFFERS_CACHE_KEY,
+        {"fetched_at": _time.time() - epic._EPIC_OFFERS_TTL_SECONDS * 2,
+         "payload": _offers_payload("Old Cached")},
+    )
+
+    async def fake_fetch_payload():
+        return _offers_payload("Fresh From Net")
+
+    monkeypatch.setattr(epic, "_fetch_offers_payload", fake_fetch_payload)
+
+    first = await epic.epic_free_offers()
+    assert first["ok"] is True
+    assert first["cached"] is True and first["stale"] is True
+    assert first["offers"][0]["title"] == "Old Cached"  # 先显旧快照，不等网络
+
+    await epic._epic_offers_refresh_task  # 后台刷新收尾
+
+    second = await epic.epic_free_offers()
+    assert second["stale"] is False
+    assert second["offers"][0]["title"] == "Fresh From Net"
+    # 落库同步更新：下次冷启动读到的就是新数据
+    snap = await settings_service.get_value(epic._EPIC_OFFERS_CACHE_KEY)
+    assert snap["payload"]["offers"][0]["title"] == "Fresh From Net"
+
+
+@pytest.mark.asyncio
+async def test_offers_fresh_memory_cache_skips_network(monkeypatch):
+    """内存缓存新鲜（< TTL）：直接返回、零抓取。"""
+    import time as _time
+
+    calls = {"n": 0}
+
+    async def fake_fetch_payload():
+        calls["n"] += 1
+        return _offers_payload()
+
+    monkeypatch.setattr(epic, "_fetch_offers_payload", fake_fetch_payload)
+    epic._epic_offers_cache.update(
+        {"at": _time.time(), "payload": _offers_payload("Hot")}
+    )
+
+    res = await epic.epic_free_offers()
+    assert res["cached"] is True and res["stale"] is False
+    assert res["offers"][0]["title"] == "Hot"
+    assert calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_offers_first_fetch_writes_snapshot(monkeypatch):
+    """全新安装首开（两层缓存全空）：现拉并落库快照，供下次冷启动直出。"""
+    from app.domains.settings import service as settings_service
+
+    async def fake_fetch_payload():
+        return _offers_payload("First")
+
+    monkeypatch.setattr(epic, "_fetch_offers_payload", fake_fetch_payload)
+
+    res = await epic.epic_free_offers()
+    assert res["ok"] is True and res["offers"][0]["title"] == "First"
+    assert res.get("cached") is not True
+
+    snap = await settings_service.get_value(epic._EPIC_OFFERS_CACHE_KEY)
+    assert snap is not None
+    assert snap["payload"]["offers"][0]["title"] == "First"
+    assert isinstance(snap["fetched_at"], float)
+
+
+@pytest.mark.asyncio
+async def test_offers_pc_failure_not_snapshotted(monkeypatch):
+    """PC 列表失败（只出移动卡）不落快照——下次启动重试 Epic 主数据。"""
+    from app.domains.settings import service as settings_service
+
+    async def fake_fetch_payload():
+        return {
+            "source": "epic-offers", "ok": True, "offers": [],
+            "mobile": {
+                "title": "M", "image": "https://cdn/m.jpg", "url": "https://x",
+                "end": None, "worth": None, "source": "breaker",
+            },
+            "fetchedAt": "2026-09-15T10:00:00",
+        }
+
+    monkeypatch.setattr(epic, "_fetch_offers_payload", fake_fetch_payload)
+
+    res = await epic.epic_free_offers()
+    assert res["ok"] is True and res["mobile"] is not None
+    assert await settings_service.get_value(epic._EPIC_OFFERS_CACHE_KEY) is None
