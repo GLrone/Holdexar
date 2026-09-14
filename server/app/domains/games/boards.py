@@ -1,7 +1,8 @@
 """Steam 榜单发现源：topsellers / popularnew / specials / comingsoon 四板聚合。
 
 发现类增量源（补愿望单覆盖不到的游戏）：
-- topsellers  热销 TOP100（filter=topsellers）
+- topsellers  热销榜 5 页 / 500 条（filter=topsellers；前 100 条兼作
+  前端 TOP100 展示序，全量供初始游戏库反哺与预设池登记）
 - popularnew  热门新品
   （sort_by=Released_DESC&filter=popularnew，5 批 500 条）
 - specials    特惠差集
@@ -72,11 +73,12 @@ class Board:
 
 
 BOARDS: dict[str, Board] = {
-    # 热销 TOP100（原 top100.ts 语义原样平移）
+        # 热销榜：发现面拉满 5 页 = 500 条（初始游戏库的来源之一，预设池登记
+    # 见 games/preset.py）；前端「近期TOP100热榜」展示仍取榜序前 100
     "topsellers": Board(
         key="topsellers",
         params={"filter": "topsellers", "hidef2p": 1, "category1": 998},
-        max_records=100,
+        max_records=500,
         max_requests=5,
         empty_tolerance=1,
         backfill_kind="top100_backfill",
