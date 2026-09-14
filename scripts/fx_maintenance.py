@@ -73,13 +73,13 @@ DEFAULT_DSN = os.environ.get(
 )
 
 IMPORT_SOURCE = "archive_pg"
-汇率档案_SOURCE = "汇率档案"
+FXDB_SOURCE = "fx_archive"
 FXJSON_SOURCE = "archive_json"
 
 # 外部档案路径（由环境变量提供：本机 secrets/fx_maintenance.env 自动加载）
 DEFAULT_FXJSON = os.environ.get("FX_ARCHIVE_FXJSON", "")
 
-DEFAULT_汇率档案 = os.environ.get("FX_ARCHIVE_汇率档案", "")
+DEFAULT_FXDB = os.environ.get("FX_ARCHIVE_DB", "")
 
 
 # ── 公共小件 ──────────────────────────────────────────────
@@ -170,13 +170,13 @@ def import_pg(dsn: str) -> None:
     print(f"[import-pg] 完成：插入 {inserted} 行，跳过（白名单外/已有）{skipped} 行")
 
 
-# ── import-汇率档案：汇率档案 汇率档案.db 档案 → 本地 ─────
+# ── import-fxdb：外部汇率 sqlite 档案 → 本地 ─────
 # 账单折算（bills 域）依赖逐日汇率档案；本库恰好补齐 import-pg 未覆盖的
 # 币种-年份（AUD/GBP/MYR/THB 等 2015 前后日线）。幂等：只补缺失的
 # （币种, 日），已有数据一律不动。纯 sqlite3 双库直读，venv/系统 Python 均可跑。
 
 
-def import_汇率档案(src: str = DEFAULT_汇率档案) -> None:
+def import_fxdb(src: str = DEFAULT_FXDB) -> None:
     import sqlite3
 
     from app.crawler.config import CC_LIST
@@ -204,7 +204,7 @@ def import_汇率档案(src: str = DEFAULT_汇率档案) -> None:
             skipped += 1
             continue
         existing.setdefault(code, set()).add(day)
-        batch.append((code, float(rate), 汇率档案_SOURCE, f"{day.isoformat()} 12:00:00"))
+        batch.append((code, float(rate), FXDB_SOURCE, f"{day.isoformat()} 12:00:00"))
         inserted += 1
         if len(batch) >= 5000:
             con.executemany(
@@ -213,7 +213,7 @@ def import_汇率档案(src: str = DEFAULT_汇率档案) -> None:
                 batch,
             )
             con.commit()
-            print(f"[import-汇率档案] ... 已写 {inserted}")
+            print(f"[import-fxdb] ... 已写 {inserted}")
             batch = []
     if batch:
         con.executemany(
@@ -224,7 +224,7 @@ def import_汇率档案(src: str = DEFAULT_汇率档案) -> None:
         con.commit()
     src_con.close()
     con.close()
-    print(f"[import-汇率档案] 完成：插入 {inserted} 行，跳过（白名单外/已有）{skipped} 行")
+    print(f"[import-fxdb] 完成：插入 {inserted} 行，跳过（白名单外/已有）{skipped} 行")
 
 
 # ── import-fxjson：fx_rates.json 导出档案 → 本地 ─────
@@ -333,11 +333,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "command",
-        choices=["import-pg", "import-汇率档案", "import-fxjson", "update", "backfill", "cleanup", "all"],
+        choices=["import-pg", "import-fxdb", "import-fxjson", "update", "backfill", "cleanup", "all"],
         help="见模块 docstring",
     )
     parser.add_argument("--dsn", default=DEFAULT_DSN)
-    parser.add_argument("--src", default=DEFAULT_汇率档案, help="汇率档案.db 路径（import-汇率档案）")
+    parser.add_argument("--src", default=DEFAULT_FXDB, help="外部汇率 sqlite 档案路径（import-fxdb）")
     parser.add_argument("--fxjson", default=DEFAULT_FXJSON, help="fx_rates.json 路径（import-fxjson）")
     parser.add_argument("--dry-run", action="store_true", help="backfill 只打印计划不写库")
     args = parser.parse_args()
@@ -352,8 +352,8 @@ def main() -> None:
 
     if args.command == "import-pg":
         import_pg(args.dsn)
-    elif args.command == "import-汇率档案":
-        import_汇率档案(args.src)
+    elif args.command == "import-fxdb":
+        import_fxdb(args.src)
     elif args.command == "import-fxjson":
         import_fxjson(args.fxjson)
     elif args.command == "update":

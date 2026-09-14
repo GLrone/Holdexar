@@ -19,7 +19,7 @@
 用法：
     python scripts/build_manifest.py                 # 自动取 release/ 内应用包
     python scripts/build_manifest.py --zip <路径>     # 指定应用包
-    python scripts/build_manifest.py --version 0.2.0 # 覆盖版本号（默认读后端配置）
+    python scripts/build_manifest.py --version 0.1.0 # 覆盖版本号（默认读后端配置）
 
 清单 schema 变更时同步递增 app_info.MANIFEST_SCHEMA，客户端按需兼容。
 """
@@ -149,9 +149,8 @@ def build_scoop(version: str, zip_path: Path, zip_sha: str) -> dict:
         "version": version,
         "description": APP_SUBTITLE,
         "homepage": f"https://github.com/{GITHUB_REPO}",
-        # 与本仓库 LICENSE 一致。此处曾误写 GPL-3.0-or-later（AetherSwap 移植
-        # 时期的遗留），会让 Scoop 渠道把 MIT 项目标成 GPL——渠道清单是公开的，
-        # 声明错了等于对外发一份错误的许可证声明。
+        # 与本仓库 LICENSE 一致——渠道清单是公开的，声明错了等于对外发一份
+        # 错误的许可证声明。
         "license": "MIT",
         "architecture": {
             "64bit": {
