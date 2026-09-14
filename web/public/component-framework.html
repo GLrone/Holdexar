@@ -507,7 +507,7 @@ html.dark .theme-switch__icon{transform:rotate(360deg)}
   background:var(--success);border:2px solid var(--bg-card);
 }
 
-/* ── GooeyNav 粒子导航（移植自 steamhl）── */
+/* ── GooeyNav 粒子导航 ── */
 .gooey-nav{
   position:relative;display:inline-flex;align-items:center;
   --gn-color-1:#66c0f4;--gn-color-2:#1a9fff;--gn-color-3:#a4ce3d;--gn-color-4:#60a820;
@@ -1144,7 +1144,7 @@ html:not(.dark) .table th{color:var(--text-secondary)}
 .fx-module__title{font-size:15px;font-weight:700;color:var(--text-primary)}
 .fx-module__sub{font-size:12px;color:var(--text-muted);margin:2px 0 14px 44px}
 .fx-origin{margin-left:auto;font-size:11px;font-family:var(--font-mono);padding:3px 9px;border-radius:999px;background:var(--surface-chip);color:var(--text-secondary);border:1px dashed var(--border-soft)}
-.fx-origin--tm{color:var(--warning);border-color:var(--warning)}
+.fx-origin--plan{color:var(--warning);border-color:var(--warning)}
 .fx-origin--bill{color:var(--info);border-color:var(--info)}
 .fx-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
 .fx-grid--3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
@@ -1544,11 +1544,10 @@ html.dark{
   .grid,.grid--2{grid-template-columns:1fr}
 }
 
-/* ═══════════ 生产环境 HlGameCard 标准模板（1:1 移植 steamhl-gamecard.css + 滚动列表容器 + 横幅动效）═══════════ */
+/* ═══════════ 生产环境 HlGameCard 标准模板（hl-gamecard.css + 滚动列表容器 + 横幅动效）═══════════ */
 /* 
-   Holdexar Legacy Design System
-   Source: 设计原型生成.py (V1.2 - V7.3)
-   Aesthetics: Steam Dark Mode, Glassmorphism, Legacy Gradients
+   Holdexar Design System
+   游戏卡样式层：深色玻璃拟态 + 渐变
 */
 
 :root {
@@ -3107,7 +3106,7 @@ html.dark{
           <img id="topbarAvatarImg" src="" alt="Steam Avatar" />
           <span class="topbar-avatar__status"></span>
         </div>
-        <span class="tag tag--accent" id="themePill">● Dark Legacy</span>
+        <span class="tag tag--accent" id="themePill">● Dark</span>
         <button class="topbar-theme-btn" id="topbarThemeBtn" title="切换主题">
           <span id="themeIcon"></span>
         </button>
@@ -3622,7 +3621,7 @@ html.dark{
             </div>
           
             <div class="card demo" style="grid-column:1/-1">
-              <div class="demo__cap"><h3>GooeyNav 粒子导航（移植自 steamhl 一级导航）</h3><span class="badge-state badge-state--preset">移植</span></div>
+              <div class="demo__cap"><h3>GooeyNav 粒子导航（一级导航）</h3><span class="badge-state badge-state--preset">预置</span></div>
               <p style="font-size:12px;color:var(--text-muted);margin-bottom:16px;line-height:1.7">
                 SVG gooey 滤镜 + 粒子爆炸动效。相邻标签切换时粒子呈毒液弧线流动，非相邻时径向爆炸。点击下方标签体验。</p>
               <div style="display:flex;justify-content:center;padding:20px 0;background:var(--bg-soft);border-radius:var(--radius)">
@@ -3729,7 +3728,7 @@ html.dark{
         <!-- ═══ 08 业务组件 ═══ -->
         <section class="section" id="sec-biz">
           <div class="section__head"><span class="section__no">07</span><h2>库页业务组件</h2></div>
-          <p class="section__desc">1:1 对应 HTML 报告样式，收口进 <span class="mono">components/steamhl/</span>（HlNavbar / HlFilterPanel / HlGameCard）。</p>
+          <p class="section__desc">库页业务组件收口进 <span class="mono">components/business/</span>（HlNavbar / HlFilterPanel / HlGameCard）。</p>
           <div class="grid grid--2">
             <div class="card demo" style="grid-column:1/-1">
               <div class="demo__cap"><h3>HlNavbar 导航栏（搜索聚焦光晕 / 排序切换）</h3><span class="badge-state badge-state--use">在用</span></div>
@@ -4259,7 +4258,7 @@ html.dark{
           </div>
         </section>
 
-        <!-- ═══ 08 未来模块 · 规划 UI（规划模块）═══ -->
+        <!-- ═══ 08 未来模块 · 规划 UI ═══ -->
         <section class="section" id="sec-future">
           <div class="section__head"><span class="section__no">08</span><h2>未来模块 · 规划 UI</h2></div>
           <p class="section__desc">批量激活 / 免费领取 / 家庭库分析等规划模块，叠加本地消费账单与入库许可证分析。以下为双主题高保真交互原型。</p>
@@ -4328,21 +4327,21 @@ html.dark{
             <div class="fx-module__head">
               <div class="fx-module__icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.6 7.6a5 5 0 1 1-7.07 7.07 5 5 0 0 1 7.07-7.07zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg></div>
               <div><div class="fx-module__title">CDK 批量激活</div><div style="font-size:11px;color:var(--text-dim)">每批 9 个同时激活 · 批间等待 20s · 单请求超时 15s · 结果含 SubID + 版本名</div></div>
-              <span class="fx-origin fx-origin--tm">批量激活</span>
+              <span class="fx-origin fx-origin--plan">批量激活</span>
             </div>
             <div class="cdk-split">
               <!-- 左栏：激活码 -->
               <div class="cdk-left">
                 <div class="cdk-section-title">激活码输入（每行一个）</div>
-                <textarea class="key-area" id="keyArea" spellcheck="false" style="min-height:120px">ABCDE-FGHIJ-KLMNO
-PQRST-UVWXY-Z1234
-56789-0ABCD-EFGHI
-JKLMN-OPQRS-TUVWX
-YZ123-45678-90ABC
-DEFGH-IJKLM-NOPQR
-STUVW-XYZ12-34567
-890AB-CDEFG-HIJKL
-MNOPQ-RSTUV-WXYZ1</textarea>
+                <textarea class="key-area" id="keyArea" spellcheck="false" style="min-height:120px">YWT9B-YEKZW-HZVXP
+KZDEZ-DC4BA-YG3D4
+TY6VY-5RFZD-2UXU8
+PPS3M-V68DN-KD9A2
+3A4N6-F46MG-WVSYV
+Y9S3N-WJ2HY-8YEJD
+48MGY-G8445-6TU9K
+KTHRB-T8KAX-2DW4F
+M5M8D-7PMNV-V8UXW</textarea>
                 <div class="key-toolbar">
                   <button class="btn btn--primary btn--sm" id="redeemStart">▶ 开始激活</button>
                   <button class="btn btn--sm" id="redeemReset">重置</button>
@@ -4390,7 +4389,7 @@ MNOPQ-RSTUV-WXYZ1</textarea>
               <div class="fx-module__head">
                 <div class="fx-module__icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 12v7H4v-7M2 7h20v5H2zM12 7v12M12 7H7.5a2.5 2.5 0 0 1 0-5C11 2 12 7 12 7zm0 0h4.5a2.5 2.5 0 0 0 0-5C13 2 12 7 12 7z"/></svg></div>
                 <div><div class="fx-module__title">免费产品领取 / 锁区入库</div><div style="font-size:11px;color:var(--text-dim)">批量提交 AppID / SubID，三态结果归集</div></div>
-                <span class="fx-origin fx-origin--tm">免费领取</span>
+                <span class="fx-origin fx-origin--plan">免费领取</span>
               </div>
               <div class="segmented" id="fodSeg" style="margin-bottom:11px">
                 <span class="segmented__item is-on" data-fod="app">AppID · 加愿望单</span>
@@ -4424,7 +4423,7 @@ MNOPQ-RSTUV-WXYZ1</textarea>
             <div class="fx-module__head">
               <div class="fx-module__icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg></div>
               <div><div class="fx-module__title">Steam 家庭库分析</div><div style="font-size:11px;color:var(--text-dim)">最多 6 名成员 · 贡献 / 价值 / 游玩动态 / 共享冷却</div></div>
-              <span class="fx-origin fx-origin--tm">家庭库分析</span>
+              <span class="fx-origin fx-origin--plan">家庭库分析</span>
             </div>
             <div class="fam-list" id="famMembers">
               <div class="fam-row fam-row--primary is-me" data-fam="0">
@@ -4963,7 +4962,7 @@ MNOPQ-RSTUV-WXYZ1</textarea>
             <div class="fx-module__head">
               <div class="fx-module__icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></div>
               <div><div class="fx-module__title">入库许可证 · CDK 花费台账</div><div style="font-size:11px;color:var(--text-dim)">解析「游戏入库方式」页 · 零售 / 礼物分类 · 第三方参考价对照 · 实付录入</div></div>
-              <span class="fx-origin fx-origin--bill">来源 · steam_cdk_report</span>
+              <span class="fx-origin fx-origin--bill">入库许可证</span>
             </div>
             <div class="fx-grid">
               <div>
@@ -5002,8 +5001,8 @@ MNOPQ-RSTUV-WXYZ1</textarea>
           <div class="fx-module">
             <div class="fx-module__head">
               <div class="fx-module__icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg></div>
-              <div><div class="fx-module__title">价格历史走势</div><div style="font-size:11px;color:var(--text-dim)">Steam 官方价 × 第三方 Key 店最低价 × 历史最低 · 下方全局缩略条 + 双滑块区间选择（参考 IsThereAnyDeal / PSPrices / SteamDB）</div></div>
-              <span class="fx-origin fx-origin--tm">价格追踪 · IsThereAnyDeal</span>
+              <div><div class="fx-module__title">价格历史走势</div><div style="font-size:11px;color:var(--text-dim)">Steam 官方价 × 第三方 Key 店最低价 × 历史最低 · 下方全局缩略条 + 双滑块区间选择</div></div>
+              <span class="fx-origin fx-origin--plan">价格追踪</span>
             </div>
             <div class="price-chart-card">
               <div class="pc-header">
@@ -5310,8 +5309,8 @@ function applyTheme(dark,anim){
   if(anim){root.classList.add('theme-anim');setTimeout(()=>root.classList.remove('theme-anim'),420)}
   root.classList.toggle('dark',dark);
   document.getElementById('themeIcon').innerHTML=dark?ICONS.sun:ICONS.moon;
-  document.getElementById('crumbTheme').textContent=dark?'dark · Legacy':'light';
-  document.getElementById('themePill').textContent=dark?'● Dark Legacy':'○ Light';
+  document.getElementById('crumbTheme').textContent=dark?'dark':'light';
+  document.getElementById('themePill').textContent=dark?'● Dark':'○ Light';
   document.getElementById('themePill').className='tag '+(dark?'tag--accent':'tag--success');
   localStorage.setItem(THEME_KEY,dark?'dark':'light');
   refreshTokenVals();renderStrip();
@@ -5337,7 +5336,7 @@ document.getElementById('sidebarCollapseBtn').addEventListener('click',()=>{
 });
 updateCollapseUI();
 
-/* ═══════ GooeyNav 粒子导航（移植自 steamhl）═══════ */
+/* ═══════ GooeyNav 粒子导航 ═══════ */
 (function(){
   const container=document.getElementById('gooeyNavDemo');
   const list=document.getElementById('gooeyNavList');
@@ -6250,7 +6249,7 @@ function cfBadgeHide(){
   _cfTipTimer=setTimeout(()=>{_cfTip.style.opacity='0';},120);
 }
 
-/* 左上角状态徽章（已拥有 / 家庭共享 / 愿望单）气泡弹窗（移植 设计原型生成.py custom-tooltip） */
+/* 左上角状态徽章（已拥有 / 家庭共享 / 愿望单）气泡弹窗 */
 let _cfStatusTipTimer=null;
 function cfStatusTip(el){
   clearTimeout(_cfStatusTipTimer);

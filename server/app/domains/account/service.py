@@ -75,7 +75,7 @@ _WALLET_BREAKER_SLOW_AFTER = 5
 _WALLET_BREAKER_SLOW_MINUTES = 10.0
 _WALLET_BREAKER_FREEZE_AFTER = 10
 
-# 活跃感知降频（外部平台 递增间隔同款哲学：无人看时自动拉长间隔）。
+# 活跃感知降频（无人看时自动拉长间隔，心跳恢复即塌缩回高频）。
 # 前端每 60s 轮询 GET /account 天然是"有人在看"心跳——后端记录最近
 # 心跳时间，轮转按快照新鲜度分级：
 # - 有人看（心跳 <90s）→ 快照 2min 内不重抓（分钟级刷新语义不变）
@@ -546,7 +546,7 @@ async def refresh_online_states(rows: list[SteamAccount] | None = None) -> dict:
 async def sync_wallets_rotational() -> dict:
     """每分钟轮转：按需刷新全部绑定账号的钱包（活跃感知降频 + 递增退避 + 熔断）。
 
-    四层门禁（外部平台「空闲自动拉长间隔 / 失败冷却 / 限制访问回落」同款哲学）：
+    四层门禁（空闲自动拉长间隔 / 失败冷却 / 限制访问回落）：
 
     0. **熔断冻结**：连续失败累计 10 次（5 次进 10min 慢车道后再挂 5 次）
        的账号停止一切自动请求，等手动刷新余额或换绑解锁——Cookie 失效/
