@@ -230,6 +230,88 @@ async def test_refresh_picks_subscription_actually_running(db, monkeypatch, tmp_
         assert untouched.last_imported_at is None  # 没在跑的那条不动
 
 
+# ─── 拉取成功后自动识别订阅名（仅补空位，本地保存）──────────
+
+
+@pytest.mark.asyncio
+async def test_refresh_auto_names_when_label_empty(db, monkeypatch, tmp_path):
+    """本行无名：拉到面板名（profile-title 等）→ 落库本地保存并回传。"""
+    sub_id = await _seed_sub(db)
+    cfg = _stub_runtime(monkeypatch, tmp_path, startup_text=_config_text())
+
+    async def _fake_download(url, data_dir, proxy_url=None):
+        cfg.write_text(_config_text(), encoding="utf-8")
+        return {
+            "path": str(cfg), "title": "面板机场名", "userinfo": USERINFO,
+            "nodes": 2, "cached": False,
+        }
+
+    monkeypatch.setattr(clash_manager.runtime, "download_subscription", _fake_download)
+
+    res = await proxies_service.refresh_clash_subscription(sub_id)
+    assert res["label"] == "面板机场名"
+    async with db() as session:
+        sub = await session.get(ProxySubscription, sub_id)
+        assert sub.label == "面板机场名"
+
+
+@pytest.mark.asyncio
+async def test_refresh_keeps_user_label(db, monkeypatch, tmp_path):
+    """本行已有名称（用户手改过）：重拉永不覆写——名字是用户的资产。"""
+    sub_id = await _seed_sub(db)
+    cfg = _stub_runtime(monkeypatch, tmp_path, startup_text=_config_text())
+
+    async def _fake_download(url, data_dir, proxy_url=None):
+        cfg.write_text(_config_text(), encoding="utf-8")
+        return {
+            "path": str(cfg), "title": "面板机场名", "userinfo": USERINFO,
+            "nodes": 2, "cached": False,
+        }
+
+    monkeypatch.setattr(clash_manager.runtime, "download_subscription", _fake_download)
+
+    async with db() as session:
+        sub = await session.get(ProxySubscription, sub_id)
+        sub.label = "我的机场"
+        await session.commit()
+
+    res = await proxies_service.refresh_clash_subscription(sub_id)
+    assert res["label"] == "我的机场"
+    async with db() as session:
+        sub = await session.get(ProxySubscription, sub_id)
+        assert sub.label == "我的机场"
+
+
+@pytest.mark.asyncio
+async def test_refresh_uses_saved_proxies_after_direct(db, monkeypatch, tmp_path):
+    """直连失败自动借道项目保存的可用代理：候选传入下载通道（排在直连后）。"""
+    from app.domains.proxies.models import Proxy
+
+    async with db() as session:
+        session.add(Proxy(scheme="http", host="10.0.0.1", port=8080, enabled=True))
+        await session.commit()
+
+    seen_proxy_args: list = []
+    cfg = _stub_runtime(monkeypatch, tmp_path, startup_text=_config_text())
+
+    async def _fake_download(url, data_dir, proxy_url=None):
+        seen_proxy_args.append(proxy_url)
+        cfg.write_text(_config_text(), encoding="utf-8")
+        return {
+            "path": str(cfg), "title": None, "userinfo": USERINFO,
+            "nodes": 2, "cached": False,
+        }
+
+    monkeypatch.setattr(clash_manager.runtime, "download_subscription", _fake_download)
+
+    await proxies_service.refresh_clash_subscription(
+        (await _seed_sub(db))
+    )
+    # 池里的启用代理被作为借道候选传给下载通道（可能抽到 0~3 条，但来自池）
+    assert seen_proxy_args and seen_proxy_args[0]
+    assert all(p == "http://10.0.0.1:8080" for p in seen_proxy_args[0])
+
+
 # ─── 失败留待重试 ───────────────────────────────────────────
 
 

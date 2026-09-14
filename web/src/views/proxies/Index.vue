@@ -98,6 +98,13 @@ const subFailDialog = ref(false)
 const subFailError = ref('')
 const subFailKind = ref<'clash' | 'plain'>('clash')
 
+// 编辑订阅弹窗（名称 + 链接两个参数一起改；链接变更即自动重拉）
+const editDialog = ref(false)
+const editSub = ref<ProxySubscriptionItem | null>(null)
+const editLabel = ref('')
+const editUrl = ref('')
+const editingSub = ref(false)
+
 // Clash 节点检测（出口 IP 去重 → 存活 23/45）
 const clashTest = ref<ClashNodeTestResult | null>(null)
 const testingClash = ref(false)
@@ -128,6 +135,12 @@ function shortTraffic(raw: string): string {
   const total = get('total')
   if (!total) return t('proxies.sub.trafficUsed', { size: gb(used) })
   return `${gb(used)} / ${total >= 1024 ** 4 ? gb(total / 1024) + ' TB' : gb(total) + ' GB'}`
+}
+
+/** 订阅链接只显示前半段：机场链接动辄上百字符，整条铺开会把流量/存活
+    挤出可视区（后半段是 token，对人不携带信息），故硬截断到前 26 字符。 */
+function shortUrl(url: string): string {
+  return url.length > 26 ? `${url.slice(0, 26)}…` : url
 }
 
 const enabledCount = computed(() => items.value.filter((p) => p.enabled).length)
@@ -218,29 +231,44 @@ async function removeSubscription(sub: ProxySubscriptionItem) {
   await load()
 }
 
-/** 订阅手动改名（自动回填已下线：面板名覆盖面窄，名字由用户维护；空串清名） */
-async function renameSubscription(sub: ProxySubscriptionItem) {
-  let name: string
-  try {
-    const { value } = await ElMessageBox.prompt(
-      t('proxies.sub.renamePrompt'),
-      t('proxies.sub.rename'),
-      {
-        inputValue: sub.label ?? '',
-        confirmButtonText: t('proxies.sub.renameSave'),
-        cancelButtonText: t('common.cancel'),
-      },
-    )
-    name = value
-  } catch {
-    return // 取消
+/** 打开编辑弹窗：名称与链接一起呈现，改名换链一次完成 */
+function openEditSubscription(sub: ProxySubscriptionItem) {
+  editSub.value = sub
+  editLabel.value = sub.label ?? ''
+  editUrl.value = sub.url
+  editDialog.value = true
+}
+
+/** 保存编辑：链接变更的 Clash 订阅由后端自动重拉（直连优先，失败借道已保存代理） */
+async function saveEditSubscription() {
+  const sub = editSub.value
+  if (!sub) return
+  const url = editUrl.value.trim()
+  if (!/^https?:\/\//i.test(url)) {
+    message.warning(t('proxies.sub.urlInvalid'))
+    return
   }
+  editingSub.value = true
   try {
-    await proxiesApi.renameSubscription(sub.id, name)
-    message.success(t(name.trim() ? 'proxies.sub.renamed' : 'proxies.sub.cleared'))
+    const res = await proxiesApi.updateSubscription(sub.id, {
+      label: editLabel.value,
+      url,
+    })
+    editDialog.value = false
+    if (res.synced) {
+      const parts = [t('proxies.sub.nodesCount', { n: res.nodes ?? 0 })]
+      if (res.traffic) parts.push(shortTraffic(res.traffic))
+      message.success(t('proxies.sub.editedSynced', { parts: parts.join(' · ') }))
+    } else if (res.warning) {
+      message.warning(res.warning)
+    } else {
+      message.success(t('proxies.sub.edited'))
+    }
     await load()
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e))
+  } finally {
+    editingSub.value = false
   }
 }
 
@@ -661,13 +689,13 @@ onMounted(async () => {
               {{ t('proxies.sub.deprecated') }}
             </span>
             <span v-if="sub.label" class="tag">{{ sub.label }}</span>
-            <span class="proxyx-sub-url mono">{{ sub.url }}</span>
+            <span class="proxyx-sub-url mono">{{ shortUrl(sub.url) }}</span>
             <span v-if="sub.lastStats?.traffic" class="proxyx-sub-hint">{{ shortTraffic(sub.lastStats.traffic) }}</span>
-            <span v-if="sub.lastStats?.alive !== undefined" class="tag">
+            <span v-if="sub.lastStats?.alive !== undefined" class="tag proxyx-sub-alive">
               {{ t('proxies.sub.aliveTag', { alive: sub.lastStats.alive, total: sub.lastStats.total }) }}
             </span>
             <div class="proxyx-sub-actions">
-              <button class="pxbtn pxbtn--sm" @click.prevent="renameSubscription(sub)">{{ t('proxies.sub.rename') }}</button>
+              <button class="pxbtn pxbtn--sm" @click.prevent="openEditSubscription(sub)">{{ t('proxies.sub.edit') }}</button>
               <button class="pxbtn pxbtn--sm" :disabled="syncingSubId === sub.id" :aria-busy="syncingSubId === sub.id || undefined" @click.prevent="syncSubscription(sub)">
                 <span v-if="syncingSubId === sub.id" class="hl-spinner hl-spinner--inline" aria-hidden="true" />
                 {{ t(syncingSubId === sub.id ? 'proxies.sub.syncing' : 'proxies.sub.refetch') }}
@@ -776,12 +804,12 @@ onMounted(async () => {
       <div class="proxyx-sub-list">
         <div class="proxyx-sub-item proxyx-sub-item--static" v-for="sub in plainSubs" :key="sub.id">
           <span v-if="sub.label" class="tag">{{ sub.label }}</span>
-          <span class="proxyx-sub-url mono">{{ sub.url }}</span>
+          <span class="proxyx-sub-url mono">{{ shortUrl(sub.url) }}</span>
           <span v-if="sub.lastStats?.added !== undefined" class="tag">
             {{ t('proxies.plain.lastImport', { n: sub.lastStats.added }) }}
           </span>
           <div class="proxyx-sub-actions">
-            <button class="pxbtn pxbtn--sm" @click="renameSubscription(sub)">{{ t('proxies.sub.rename') }}</button>
+            <button class="pxbtn pxbtn--sm" @click="openEditSubscription(sub)">{{ t('proxies.sub.edit') }}</button>
             <button class="pxbtn pxbtn--sm" :disabled="importingPlainId === sub.id" :aria-busy="importingPlainId === sub.id || undefined" @click="importPlainSubscription(sub)">
               <span v-if="importingPlainId === sub.id" class="hl-spinner hl-spinner--inline" aria-hidden="true" />
               {{ t(importingPlainId === sub.id ? 'proxies.plain.importing' : 'proxies.plain.import') }}
@@ -918,6 +946,27 @@ onMounted(async () => {
       <template #footer>
         <HlButton size="sm" @click="subFailDialog = false">{{ t('common.close') }}</HlButton>
         <HlButton art="outline" tone="green" size="sm" @click="retryAddSubscription">{{ t('common.retry') }}</HlButton>
+      </template>
+    </HlDialog>
+
+    <!-- 编辑订阅：名称 + 链接（链接变更自动重新拉取） -->
+    <HlDialog v-model="editDialog" :title="t('proxies.sub.editTitle')" :width="520">
+      <div class="sed">
+        <label class="sed__row">
+          <span class="sed__label">{{ t('proxies.sub.nameLabel') }}</span>
+          <input v-model="editLabel" class="pxinput" :placeholder="t('proxies.sub.namePlaceholder')" />
+        </label>
+        <label class="sed__row">
+          <span class="sed__label">{{ t('proxies.sub.urlLabel') }}</span>
+          <input v-model="editUrl" class="pxinput mono" :placeholder="t('proxies.sub.urlPlaceholder')" />
+        </label>
+        <p class="sed__tip">{{ t('proxies.sub.editTip') }}</p>
+      </div>
+      <template #footer>
+        <HlButton size="sm" @click="editDialog = false">{{ t('common.cancel') }}</HlButton>
+        <HlButton art="outline" tone="green" size="sm" :disabled="editingSub" :loading="editingSub" @click="saveEditSubscription">
+          {{ t('proxies.sub.editSave') }}
+        </HlButton>
       </template>
     </HlDialog>
   </section>
@@ -1174,10 +1223,17 @@ onMounted(async () => {
   font-size: 12px;
 }
 
+/* 流量 / 存活是这行的判读依据：不许被长链接挤出可视区（flex-shrink 归零，
+   让压缩只作用在链接上——链接另有 shortUrl 硬截断兜底） */
 .proxyx-sub-hint {
   color: var(--text-muted);
   font-size: 11px;
   white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.proxyx-sub-alive {
+  flex-shrink: 0;
 }
 
 .proxyx-sub-actions {
@@ -1451,5 +1507,35 @@ onMounted(async () => {
 .sfd__tip {
   color: var(--text-muted);
   font-size: 12px;
+}
+
+/* 编辑订阅弹窗（名称 + 链接两行表单） */
+.sed {
+  display: grid;
+  gap: 12px;
+  padding: 4px 2px 8px;
+}
+
+.sed__row {
+  display: grid;
+  gap: 6px;
+}
+
+.sed__label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.sed__row .pxinput {
+  width: 100%;
+  min-width: 0;
+}
+
+.sed__tip {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1.5;
 }
 </style>
