@@ -152,14 +152,12 @@ server/scripts/import_*.py
 dy-tour-e2e/
 
 # ── 外部平台爬虫 / 本机一次性诊断脚本 ──
-# 共同特征：含第三方平台签名协议实现，或硬编码本机绝对路径
-# （E:\本机目录、E:\本机目录 之类）。入库后对任何其他 clone 都是坏引用。
-# 通配须宽于「下划线形态」（窄模式要求紧跟下划线，会漏掉数字/前缀变体），
-# 带前缀的文件名不匹配通配，单独列出。
-server/scripts/外部平台*.py
-server/scripts/外部平台_watchdog.ps1
+# 共同特征：含第三方平台签名协议实现，或硬编码本机专属绝对路径。
+# 入库后对任何其他 clone 都是坏引用。通配须宽于「下划线形态」（窄模式
+# 要求紧跟下划线，会漏掉数字/前缀变体）；带前缀的文件名不匹配通配，单独列出。
+server/scripts/hey*box*
 server/scripts/probe_recover.py
-server/scripts/test_外部平台_proxy.py
+server/scripts/test_hey*box*.py
 
 # ── 隔离验证数据目录（本会话/历史会话的迁移演练与爬虫验证临时库，绝不入库）──
 server/_tmp_*/
