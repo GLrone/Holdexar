@@ -28,6 +28,10 @@ class SettingsUpdate(BaseModel):
     auto_price: bool | None = None
     # 已主动提示过的版本号（启动告知「一次一版本」的去重锚点）
     update_notified: str | None = None
+    # 主题镜像（dark/light）：网页主题存 localStorage，桌面壳读不到——
+    # 前端 apply() 每次 apply/toggle 都镜像一份到这里，关闭弹窗（独立
+    # WinForms 窗）按它跟随主题。
+    theme: str | None = None
 
 
 class SettingsPayload(BaseModel):
@@ -35,6 +39,7 @@ class SettingsPayload(BaseModel):
     onboarding_done: bool = False
     auto_price: bool = True
     update_notified: str = ""
+    theme: str = "dark"
 
 
 @router.get("")
@@ -44,6 +49,7 @@ async def get_settings() -> SettingsPayload:
     onboarding_done = await service.get_value("ui.onboarding_done", False)
     auto_price = await service.get_value("crawl.auto_price", True)
     update_notified = await service.get_value("ui.update_notified", "")
+    theme = await service.get_value("ui.theme", "dark")
     return SettingsPayload(
         account={
             "steam_id": steam_id or "",
@@ -53,6 +59,7 @@ async def get_settings() -> SettingsPayload:
         onboarding_done=bool(onboarding_done),
         auto_price=bool(auto_price),
         update_notified=str(update_notified or ""),
+        theme=str(theme or "dark"),
     )
 
 
@@ -77,5 +84,10 @@ async def update_settings(payload: SettingsUpdate) -> SettingsPayload:
 
     if payload.update_notified is not None:
         await service.set_value("ui.update_notified", payload.update_notified.strip())
+
+    if payload.theme is not None:
+        # 主题镜像只认两值：异常值忽略（防脏数据把弹窗配色带歪）
+        if payload.theme in ("dark", "light"):
+            await service.set_value("ui.theme", payload.theme)
 
     return await get_settings()
