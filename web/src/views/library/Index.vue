@@ -219,12 +219,22 @@ watch(isLibraryEmpty, async (empty) => {
 })
 
 // ─── 无限滚动 ───
+// 两种模式各有一个触发点：
+// · 列表模式：列表在 HlScrollList 内部滚动，加载哨兵挂在滚动区末尾（#footer
+//   插槽），由容器的 endReached 事件驱动——页面上的哨兵在「列表内滚」时几何
+//   位置不变，相交状态只在首屏变一次，是本页只能加载一到两页的旧病根。
+// · 网格模式：整页滚动，哨兵留在文档流里，由 .view-container 的 observer 观察。
 
 function handleObserver(entries: IntersectionObserverEntry[]) {
   const [entry] = entries
   if (entry?.isIntersecting && hasNextPage.value && !isFetchingNext.value) {
     load(false)
   }
+}
+
+/** 列表模式：滚动区已接近底部（去重交给 hasNextPage / isFetchingNext） */
+function onEndReached() {
+  if (hasNextPage.value && !isFetchingNext.value) load(false)
 }
 
 function setupObserver() {
@@ -344,6 +354,7 @@ onBeforeUnmount(() => observer?.disconnect())
         v-if="visibleGames.length > 0 && store.layoutMode === 'list'"
         :items="visibleGames"
         max-height="80vh"
+        @end-reached="onEndReached"
       >
         <template #item="{ item }">
           <HlGameCard
@@ -351,6 +362,16 @@ onBeforeUnmount(() => observer?.disconnect())
             :layout-mode="'list'"
             :enabled-regions="regionsStore.enabledCodes"
           />
+        </template>
+        <!-- 加载态随列表一起滚（旧实现挂在页面底部，列表内滚时永远看不到） -->
+        <template #footer>
+          <div v-if="isFetchingNext || !hasNextPage" class="loading-sentinel">
+            <template v-if="isFetchingNext">
+              <HlSpinner />
+              {{ t('library.loadingMore') }}
+            </template>
+            <template v-else>{{ t('library.end') }}</template>
+          </div>
         </template>
       </HlScrollList>
 
@@ -369,9 +390,9 @@ onBeforeUnmount(() => observer?.disconnect())
         />
       </div>
 
-      <!-- 无限滚动哨兵（两种模式共用） -->
+      <!-- 无限滚动哨兵（仅网格模式；列表模式的哨兵在 HlScrollList 滚动区末尾） -->
       <div
-        v-if="visibleGames.length > 0"
+        v-if="visibleGames.length > 0 && store.layoutMode !== 'list'"
         ref="sentinel"
         class="loading-sentinel"
       >

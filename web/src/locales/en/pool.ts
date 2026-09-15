@@ -63,6 +63,7 @@ const pool: Partial<Record<MessageKey, string>> = {
   'pool.items.kind.follow': 'Followed',
   'pool.items.kind.wishlist': 'Wishlist',
   'pool.items.kind.owned': 'Owned',
+  'pool.items.kind.board': 'Trending',
   'pool.items.kind.manual': 'Manual',
   'pool.items.tipAccounts': 'Tracked by {n} accounts',
   'pool.items.add': 'Add items',
