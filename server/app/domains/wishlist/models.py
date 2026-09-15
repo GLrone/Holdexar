@@ -52,3 +52,8 @@ class WishlistItem(Base):
     # 名单里）一律被此标记挡住——否则用户删掉的条目 15 分钟内即被洗回来。
     # 重新添加（add_pool_items / follow）时清标复活。
     excluded: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 榜单发现源入池（topsellers/popularnew/comingsoon 轮询落池，见
+    # wishlist_service.ensure_board_pool）：属普通监控条目（持久监控，
+    # 随全池轮刷新）；同步反向核对免疫——榜单游戏不在 Steam 名单里，
+    # 无此标记 15 分钟内即被同步洗掉。手动移出（excluded）后不被轮询复活。
+    board_pool: Mapped[bool] = mapped_column(Boolean, default=False)
