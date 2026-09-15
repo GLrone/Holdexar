@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import Response
 
 from . import refresh, service
 
@@ -13,8 +14,15 @@ router = APIRouter(prefix="/bundles", tags=["bundles"])
 
 @router.get("")
 async def list_bundles():
-    """全量捆绑包（差价降序）。数据源 bundles/bundle_region_prices 小表直读。"""
-    return {"bundles": await service.list_bundles()}
+    """全量捆绑包（差价降序）。
+
+    返回服务端**预序列化**的 JSON（见 service.list_bundles_json）：15k 条
+    聚合结果的重复编码是每次请求 2s 级开销，编码结果随缓存指纹复用。
+    """
+    return Response(
+        content=await service.list_bundles_json(),
+        media_type="application/json",
+    )
 
 
 @router.post("/refresh")

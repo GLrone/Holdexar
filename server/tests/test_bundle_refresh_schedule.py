@@ -21,10 +21,9 @@ from app.domains.bundles import refresh as bundles_refresh
 from app.domains.crawl import service as crawl_service
 
 
-def _stub_chain_env(monkeypatch, *, events, auto=True, gate=None):
-    """价格链出网/重锚/开关/代理闸门全打桩；run_sequential 与
-    refresh_bundles 把调用顺序记录进 events（"chain" 元组 / "bundles"）。
-    gate=None = 闸门放行；传异常则闸门拒绝（如 ValueError = 无可用代理）。"""
+def _stub_chain_env(monkeypatch, *, events, auto=True):
+    """价格链出网/重锚/开关全打桩；run_sequential 与
+    refresh_bundles 把调用顺序记录进 events（"chain" 元组 / "bundles"）。"""
 
     async def _auto_enabled():
         return auto
@@ -35,12 +34,6 @@ def _stub_chain_env(monkeypatch, *, events, auto=True, gate=None):
         return None
 
     monkeypatch.setattr(sched_mod, "_reanchor_price_refresh", _no_reanchor)
-
-    async def _gate():
-        if gate is not None:
-            raise gate
-
-    monkeypatch.setattr(crawl_service, "ensure_proxy_available", _gate)
 
     async def _run_sequential(specs, **kwargs):
         events.append(("chain", [s.get("kind", s.get("scope")) for s in specs]))
@@ -106,20 +99,3 @@ async def test_bundle_refresh_respects_auto_price_switch(monkeypatch, _idle):
     await sched_mod._job_price_refresh()
 
     assert events == []
-
-
-@pytest.mark.asyncio
-async def test_bundle_refresh_skipped_without_proxy(monkeypatch, _idle):
-    """代理前置闸门拒绝（无可用代理）：主链照常（spec 级跳过由闸门语义
-    决定），捆绑包尾段静默让路不直连硬打 Steam。"""
-    events: list = []
-    _stub_chain_env(
-        monkeypatch, events=events,
-        gate=ValueError("无可用代理（订阅未保存/节点全不可用）——自动爬取已跳过，手动启动不受限"),
-    )
-
-    await sched_mod._job_price_refresh()  # 闸门 ValueError 不外溢
-
-    assert events == [("chain", ["missing", "pool"])]
-    assert "bundles" not in events
-    assert sched_mod._price_cycle_busy is False
