@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import zipfile
 from pathlib import Path
@@ -231,4 +232,45 @@ async def test_download_uses_manifest_asset_name(tmp_path: Path, monkeypatch) ->
     await updater.download_update("v0.2.0", None, "Holdexar-win64-v9.9.9.zip")
     assert updater.pending_status()["pending"] is True
     assert any("Holdexar-win64-v9.9.9.zip" in u for u in seen)
+    updater.clear_staging()
+
+
+@pytest.mark.asyncio
+async def test_download_skips_slow_channel_and_sets_total_upfront(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """通道速率考核换道 + 开跑即挂总量（进度条有分母）。
+
+    复现实测场景：首个镜像连上了却几乎不吐数据（40KB/s，整包拖近一小时），
+    用户看到的就是「进度条不动、像卡死」。规则：非末位通道有试跑期速率下限，
+    低于下限即换道；末位通道不考核（全网都慢也得让它下完）。
+    """
+    payload = tmp_path / "fake.zip"
+    with zipfile.ZipFile(payload, "w") as zf:
+        zf.writestr("Holdexar/Holdexar.exe", "MZ-fake")
+
+    calls: list[tuple[str, int, dict]] = []
+
+    async def fake_stream(url, proxy, dest, expected_total=None, min_rate_bps=0):
+        calls.append((url, min_rate_bps, dict(updater.download_progress())))
+        if len(calls) < 3:
+            raise RuntimeError("通道过慢（0 KB/s < 128 KB/s），换下一通道")
+        shutil.copyfile(payload, dest)
+
+    monkeypatch.setattr(updater, "_stream_to_file", fake_stream)
+    monkeypatch.setattr(updater, "staging_dir", lambda: tmp_path / "staging")
+    monkeypatch.setattr(
+        "app.domains.proxies.clash_manager._download_attempts",
+        lambda *_a, **_k: [(None, "直连")],
+    )
+
+    result = await updater.download_update("v0.2.0", None, "x.zip", expected_size=999)
+
+    assert result["ok"] is True
+    assert len(calls) == 3, "两条镜像都应被判慢换掉，最终落到直连"
+    assert [c[1] for c in calls] == [
+        updater._MIN_CHANNEL_RATE, updater._MIN_CHANNEL_RATE, 0,
+    ], "末位通道不做速率考核（否则全网都慢时会把所有通道试死）"
+    # 第一条通道的试跑期里，进度就必须带总量与 0%——否则进度条无从渲染
+    assert calls[0][2]["total"] == 999 and calls[0][2]["percent"] == 0
     updater.clear_staging()

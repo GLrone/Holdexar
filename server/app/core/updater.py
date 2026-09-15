@@ -27,6 +27,7 @@ import json
 import logging
 import re
 import shutil
+import time
 import zipfile
 from pathlib import Path
 
@@ -57,6 +58,13 @@ _MIRRORS = ("https://ghfast.top/", "https://gh-proxy.com/", "")
 
 STAGING_DIR = "update-staging"  # data/ 下的暂存目录
 _PENDING_FILE = ".update-pending"  # 换装标记（staging 内 manifest.json 同目录）
+
+# 通道速率考核：镜像/直连的存在感差异极大（实测同一个 118MB 包，某镜像 40KB/s、
+# 直连 1.2MB/s——慢通道会让整包拖近一小时，用户看到的就是「进度条不动、像卡死」）。
+# 试跑期过后平均速率低于下限即判该通道为「慢」并换下一个；最后一个通道不做考核
+# （全网都慢时也得让它下完，不能把所有通道都试死）。
+_MIN_CHANNEL_RATE = 128 * 1024  # B/s
+_TRIAL_SECONDS = 20.0
 
 
 def staging_dir() -> Path:
@@ -243,12 +251,17 @@ def download_progress() -> dict:
 
 
 async def download_update(
-    tag: str, expected_sha256: str | None = None, asset_name: str | None = None
+    tag: str,
+    expected_sha256: str | None = None,
+    asset_name: str | None = None,
+    expected_size: int | None = None,
 ) -> dict:
     """下载 release zip 到 data/update-staging/ 并解包 + 校验。
 
     asset_name：清单/检查结果给出的确切资产名。给了就直连下载，省掉一次
     API 反查（资产名含时间戳，猜不出来，只能反查或由清单提供）。
+    expected_size：清单里的体积。通道不给 Content-Length（镜像分块响应）时
+    用它当总量——否则百分比恒为空，前端进度条看着像卡死。
     expected_sha256：清单内的校验值优先；API 路径下取 release body 的
     `SHA256: <hex>` 行。两者皆无则跳过校验（前端展示「未提供校验值」）。
     校验不过 → 清 staging 抛错，绝不进换装链。
@@ -256,7 +269,13 @@ async def download_update(
     from app.domains.proxies import clash_manager
 
     _progress_reset()
-    _PROGRESS.update({"running": True, "phase": "download"})
+    # 开头就把总量挂上：通道试跑期（最长 ~20s）还没吐数据，进度条若没有分母
+    # 就完全不动——用户看到的是「点了没反应」。清单体积兜出 0% 起步即可。
+    _PROGRESS.update({
+        "running": True, "phase": "download", "received": 0,
+        "total": expected_size or None,
+        "percent": 0 if expected_size else None,
+    })
 
     staging = staging_dir()
     try:
@@ -284,18 +303,26 @@ async def download_update(
 
         zip_path = staging / "update.zip"
         staging.mkdir(parents=True, exist_ok=True)
+        # 通道链平铺成 (代理, 镜像) 组合；**最后一个不做速率考核**（全慢也得下完）
+        channels = [
+            (proxy, mirror) for proxy, _label in attempts for mirror in _MIRRORS
+        ]
         last_err: Exception | None = None
-        for proxy, _label in attempts:
-            for mirror in _MIRRORS:
-                url = mirror + asset_url if mirror else asset_url
-                try:
-                    await _stream_to_file(url, proxy, zip_path)
-                    break
-                except Exception as e:  # noqa: BLE001 —— 换下一通道
-                    last_err = e
-            else:
-                continue
-            break
+        for idx, (proxy, mirror) in enumerate(channels):
+            url = mirror + asset_url if mirror else asset_url
+            try:
+                await _stream_to_file(
+                    url, proxy, zip_path, expected_size,
+                    min_rate_bps=0 if idx == len(channels) - 1 else _MIN_CHANNEL_RATE,
+                )
+                break
+            except Exception as e:  # noqa: BLE001 —— 换下一通道
+                logger.info(
+                    "[更新] 通道不可用（%s）：%s",
+                    mirror or "直连",
+                    e or type(e).__name__,  # httpx 超时的 str() 常为空，退回异常类型
+                )
+                last_err = e
         else:
             raise RuntimeError(f"所有下载通道均失败：{last_err}")
 
@@ -332,16 +359,32 @@ async def download_update(
         _PROGRESS["running"] = False
 
 
-async def _stream_to_file(url: str, proxy: str | None, dest: Path) -> None:
-    """流式下载 + 进度上报。失败抛错（调用方换通道）。"""
+async def _stream_to_file(
+    url: str,
+    proxy: str | None,
+    dest: Path,
+    expected_total: int | None = None,
+    min_rate_bps: int = 0,
+) -> None:
+    """流式下载 + 进度上报。失败抛错（调用方换通道）。
+
+    读超时 45s：镜像常见「连上了但几乎不吐数据」的半死通道，300s 的读超时意味着
+    用户对着 0% 干等五分钟才轮到下一个通道（实测）。
+    min_rate_bps > 0 时做速率考核：试跑 _TRIAL_SECONDS 后平均速率仍低于下限即
+    判「过慢」抛错换道——只靠读超时抓不住「慢但在动」的通道（实测某镜像 40KB/s
+    能一直动，整包要一小时）。
+    """
     async with httpx.AsyncClient(
-        timeout=httpx.Timeout(300, connect=15), proxy=proxy, follow_redirects=True
+        timeout=httpx.Timeout(45, connect=15), proxy=proxy, follow_redirects=True
     ) as client:
         async with client.stream("GET", url) as resp:
             resp.raise_for_status()
-            total = int(resp.headers.get("content-length") or 0)
+            # 总量：优先响应头；镜像分块响应不给 Content-Length 时回落清单体积
+            # （否则 percent 恒 None，前端进度条不动，看着像卡死）
+            total = int(resp.headers.get("content-length") or 0) or (expected_total or 0)
             _PROGRESS.update({"total": total or None})
             received = 0
+            started = time.monotonic()
             with dest.open("wb") as f:
                 async for chunk in resp.aiter_bytes(1 << 20):
                     f.write(chunk)
@@ -350,6 +393,13 @@ async def _stream_to_file(url: str, proxy: str | None, dest: Path) -> None:
                         "received": received,
                         "percent": round(received * 100 / total) if total else None,
                     })
+                    if min_rate_bps:
+                        elapsed = time.monotonic() - started
+                        if elapsed >= _TRIAL_SECONDS and received / elapsed < min_rate_bps:
+                            raise RuntimeError(
+                                f"通道过慢（{received / elapsed / 1024:.0f} KB/s < "
+                                f"{min_rate_bps / 1024:.0f} KB/s），换下一通道"
+                            )
 
 
 def _sha256_of(path: Path) -> str:
