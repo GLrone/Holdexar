@@ -76,6 +76,129 @@ async def _job_wishlist_sync() -> None:
         except Exception:  # noqa: BLE001
             logger.exception("[定时] 账户同步收尾补爬失败")
 
+    # 未爬新增回补：同步入库了但从未获得过价格数据（绑定后进程重启中断、
+    # 代理闸门拦截、任务占用漏爬后 15min 内被再次跳过等），会留下
+    # 「active=1 且 games 无行」的条目——这些是监控池第一优先级，用户绑定
+    # 后看不到价格即体验为「首爬没跑」。每次同步收尾做一次存量对账（配额
+    # 帽 _WISH_UNCRAWLED_BATCH 限批），漏多少补多少，直到清零。
+    if auto_crawl:
+        try:
+            appids = await _uncrawled_active_appids()
+            if appids:
+                from app.domains.crawl import service as crawl_service
+
+                results = await crawl_service.run_sequential(
+                    [{
+                        "scope": "appids",
+                        "appids": appids,
+                        "kind": "wishlist_sync",
+                    }],
+                    from_scheduler=True,
+                )
+                if results:
+                    logger.info("[定时] 未爬新增回补 %d 个（配额帽 %d）",
+                                len(appids), _WISH_UNCRAWLED_BATCH)
+                    # 爬完仍无 games 行的条目（全球不可见/预取全空）写一笔
+                    # missing 尝试痕迹，防止下轮回补对同一批无限重扫——
+                    # 之后由 missing 账本通道按自己的节奏重试。
+                    await _stamp_uncrawled_missing(appids)
+        except Exception:  # noqa: BLE001
+            logger.exception("[定时] 未爬新增回补失败")
+
+
+# 未爬新增回补单轮配额帽：首绑大愿望单（几百款）一次全爬会长时间占住
+# 单任务模型；与孤儿回补层的日限量同思路，分轮消化、可预期。
+_WISH_UNCRAWLED_BATCH = 400
+
+
+async def _uncrawled_active_appids() -> list[int]:
+    """活跃监控条目中从未被爬过的 appid（games 无行**且**无任何价格状态行）。
+
+    判据取「没有尝试痕迹」而非「没有价格」：locked/blocked/missing 都是
+    首爬尝试过但拿不到价的**账本结论**（有各自的补抓/修复通道，回补层再抓
+    属于双通道重复烧配额）；games 行（含 COMING_SOON/非游戏打标行）也是
+    尝试痕迹。games 无行但有价格状态行的组合（browse 写价成功但元数据
+    双缺跳过建行）同样算尝试过——只有**两处全空**（首爬从未抵达写入阶段）
+    的条目才是真欠账。排除下架行。
+    """
+    from sqlalchemy import select as _select
+
+    from app.core.database import get_session_factory
+    from app.domains.crawl.service import _excluded_removed_appids
+    from app.domains.games.models import Game, GameCurrentPrice
+    from app.domains.wishlist.models import WishlistItem
+
+    async with get_session_factory()() as session:
+        rows = (
+            await session.execute(
+                _select(WishlistItem.appid)
+                .where(WishlistItem.active.is_(True))
+                .outerjoin(Game, Game.appid == WishlistItem.appid)
+                .outerjoin(GameCurrentPrice, GameCurrentPrice.appid == WishlistItem.appid)
+                .where(Game.appid.is_(None), GameCurrentPrice.appid.is_(None))
+                .distinct()
+            )
+        ).scalars().all()
+    appids = sorted({int(a) for a in rows})
+    excluded = await _excluded_removed_appids()
+    return [a for a in appids[:_WISH_UNCRAWLED_BATCH] if a not in excluded]
+
+
+async def _stamp_uncrawled_missing(appids: list[int]) -> int:
+    """回补轮跑完后，对仍无 games 行的 appid 写 missing 状态行（尝试痕迹）。
+
+    只对「回补任务真跑完」的批次执行（调用方在 results 非空时触发）：
+    全区 browse 仍不可见的条目没有 games 行，不落痕迹的话每 15min 都会
+    被回补层重新选中重扫。missing 行让它们转入 missing 账本通道（4min
+    修复轮 + 5 次穷尽 blocked），与本批其余欠账同节奏。写的是 GameCurrentPrice
+    的状态行，不动 games 表——后续真抓到数据会正常覆盖。
+    """
+    from sqlalchemy import select as _select
+    from sqlalchemy.dialects.sqlite import insert as _insert
+
+    from app.core.database import get_session_factory
+    from app.domains.games.models import Game, GameCurrentPrice
+    from app.crawler.utils import get_beijing_time_obj
+
+    now = get_beijing_time_obj().replace(tzinfo=None)
+    wrote = 0
+    async with get_session_factory()() as session:
+        # 只挑仍然整行缺失的（回补成功建行的跳过）
+        still_missing = (
+            await session.execute(
+                _select(Game.appid).where(Game.appid.in_([int(a) for a in appids]))
+            )
+        ).scalars().all()
+        known = {int(a) for a in still_missing}
+        todo = [int(a) for a in appids if int(a) not in known]
+        for appid in todo:
+            stmt = _insert(GameCurrentPrice).values(
+                appid=appid,
+                region_code="",
+                currency="",
+                price=None,
+                original_price=None,
+                discount_percent=0,
+                sub_id=None,
+                price_status="missing",
+                fail_count=1,
+                cny_fen=None,
+                updated_at=now,
+            )
+            await session.execute(
+                stmt.on_conflict_do_nothing(
+                    index_elements=[
+                        GameCurrentPrice.appid, GameCurrentPrice.region_code,
+                    ]
+                )
+            )
+            wrote += 1
+        if todo:
+            await session.commit()
+    if wrote:
+        logger.info("[定时] 未爬回补后仍无数据：%d 个记 missing（转补抓通道）", wrote)
+    return wrote
+
 
 async def _reanchor_price_refresh(reason: str) -> None:
     """用外部时间重算 price_refresh 下一格并重锚（自续约核心）。
