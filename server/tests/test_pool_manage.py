@@ -1,11 +1,13 @@
 """监控池管理单元测试：条目增删（池页/导入）+ 愿望单成员标记 +
-同步免疫（excluded / manual_pool）+ 爬取第一优先级（mock，不触网）。
+同步免疫（excluded / manual_pool / board_pool）+ 榜单落池 +
+爬取第一优先级（mock，不触网）。
 
-监控池三模块语义：
+监控池四来源语义：
 - 监控条目 = wishlist_items 活跃行（池内所有游戏均为必须爬取的对象）；
 - 愿望单（wishlisted）与星标关注（manual）是叠加其上的爬取第一优先级；
-- 监控池管理（add_pool_items / remove_pool_items）负责增删与批量操作，
-  移除以 excluded 挡同步复活（Steam 名单仍在时也不会被 15min 同步洗回来）。
+- 监控池管理（add_pool_items / remove_pool_items / ensure_board_pool）
+  负责增删与批量操作，移除以 excluded 挡同步复活（Steam 名单仍在时也
+  不会被 15min 同步洗回来）；榜单落池（board_pool）同理不被轮询洗回。
 """
 import sys
 from pathlib import Path
@@ -100,6 +102,7 @@ async def _seed_item(
     wishlisted=False,
     manual_pool=False,
     excluded=False,
+    board_pool=False,
 ):
     async with db() as session:
         session.add(
@@ -112,6 +115,7 @@ async def _seed_item(
                 wishlisted=wishlisted,
                 manual_pool=manual_pool,
                 excluded=excluded,
+                board_pool=board_pool,
             )
         )
         await session.commit()
@@ -461,3 +465,82 @@ async def test_add_pool_items_without_source_no_preset(db, monkeypatch):
             await session.execute(select(PresetGame))
         ).scalars().all()
     assert total == []
+
+
+# ── 榜单发现源落池（ensure_board_pool）─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_ensure_board_pool_lands_new_items(db, monkeypatch):
+    """无行：主账号下新建 board_pool 条目（普通监控条目），计数刷新。"""
+    await _seed_account(db)
+    _mock_primary(monkeypatch, PRIMARY)
+
+    out = await wishlist_service.ensure_board_pool([620, 570])
+
+    assert out == {"added": 2, "exists": 0, "skipped": 0}
+    row = await _get_item(db, 620)
+    assert row is not None
+    assert row.active is True
+    assert row.board_pool is True
+    assert row.manual_pool is False and row.manual is False and row.wishlisted is False
+    async with db() as session:
+        account = await session.get(TrackedAccount, PRIMARY)
+    assert account.item_count == 2
+
+
+@pytest.mark.asyncio
+async def test_ensure_board_pool_skips_existing_and_removed(db, monkeypatch):
+    """活跃行 exists 跳过（来源标记不动）；已移除（excluded）不复活。"""
+    await _seed_account(db)
+    _mock_primary(monkeypatch, PRIMARY)
+    await _seed_item(db, 620, active=True, owned=True)  # 已在池（已购来源）
+    await _seed_item(db, 570, active=False, excluded=True, manual_pool=True)
+
+    out = await wishlist_service.ensure_board_pool([620, 570, 99901])
+
+    assert out == {"added": 1, "exists": 1, "skipped": 1}
+    row = await _get_item(db, 620)
+    assert row.owned is True and row.board_pool is False, "既有来源标记不被覆写"
+    row = await _get_item(db, 570)
+    assert row.active is False and row.excluded is True, "手动移除的条目不得被轮询洗回"
+    row = await _get_item(db, 99901)
+    assert row is not None and row.active is True and row.board_pool is True
+
+
+@pytest.mark.asyncio
+async def test_ensure_board_pool_requires_account(db, monkeypatch):
+    """无绑定账户且有新条目：拒绝且不落行（调用方按「跳过落池」处理）。"""
+    _mock_primary(monkeypatch, None)
+    with pytest.raises(ValueError):
+        await wishlist_service.ensure_board_pool([620])
+    assert await _get_item(db, 620) is None
+
+
+@pytest.mark.asyncio
+async def test_board_pool_immune_to_deactivation(db, monkeypatch):
+    """榜单落池条目：不在 Steam 愿望单也不被同步停用（对照组普通条目照停）。"""
+    await _seed_account(db)
+    await _seed_item(db, 620, active=True, board_pool=True)
+    await _seed_item(db, 570, active=True)  # 对照：普通条目
+
+    _mock_wishlist(monkeypatch, [{"appid": 99801, "added_at": None}])
+    _mock_owned(monkeypatch, [])
+    await wishlist_service.sync_account(PRIMARY, auto_crawl=False)
+
+    assert (await _get_item(db, 620)).active is True, "board_pool 条目应免疫停用"
+    assert (await _get_item(db, 570)).active is False
+
+
+@pytest.mark.asyncio
+async def test_list_items_reports_board_pool_source(db, monkeypatch):
+    """监控条目列表带 boardPool 来源标记（池页类别分类的数据源）。"""
+    await _seed_account(db)
+    await _seed_item(db, 620, active=True, board_pool=True)
+    await _seed_item(db, 570, active=True, manual_pool=True)
+
+    out = await wishlist_service.list_items()
+
+    by_appid = {it["appid"]: it for it in out}
+    assert by_appid[620]["boardPool"] is True and by_appid[620]["manualPool"] is False
+    assert by_appid[570]["manualPool"] is True and by_appid[570]["boardPool"] is False

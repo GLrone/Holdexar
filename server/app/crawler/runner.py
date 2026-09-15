@@ -1,7 +1,8 @@
 """可复用的爬取运行器：CLI（app.crawler.main）与服务端任务（domains/crawl）共用。
 
-抓取层为 IStoreBrowseService（app/crawler/browse_store.py），并发与 IP 调度沿用
-CrawlerScheduler + SteamHttpClient 原装组件。
+抓取层为 IStoreBrowseService（app/crawler/browse_store.py），并发调度沿用
+CrawlerScheduler + SteamHttpClient 原装组件（请求频率由全局限流闸统一约束，
+见 crawler/rate_limit.py）。
 
 任务模型与旧 appdetails 链路的差异：
 - 旧：1 任务 = 1 appid × 全区（appdetails 只能逐 appid 逐区请求）
@@ -12,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,13 +32,10 @@ logger = logging.getLogger(__name__)
 class CrawlRunConfig:
     regions: list[str] | None = None
     workers: int = DEFAULT_WORKER_COUNT
+    # 直连为标准形态（browse 按 country_code 返回各区数据）；proxy_url
+    # 仅供调试通道显式指定（CLI --proxy / 环境变量），生产路径不传
     proxy_url: str | None = None
     timeout: int = HTTP_TIMEOUT
-    # direct_first 失败换代理：直连传输失败/429 时调此取代理出口。
-    # 由调用方按策略注入（crawl service）：direct_first/proxy_first/proxy_only
-    # 给 resolver，direct_only 严格语义给 None。返回 None = 无可用
-    # 代理，沿用退避重试
-    failover_proxy_resolver: Callable[[], Awaitable[str | None]] | None = None
 
 
 def build_router() -> CrawlerRouter:
@@ -97,8 +94,7 @@ async def run_crawl(
     )
 
     http_client = SteamHttpClient(
-        timeout=config.timeout, max_retries=3, proxy_url=config.proxy_url,
-        failover_proxy_resolver=config.failover_proxy_resolver,
+        timeout=config.timeout, max_retries=3, proxy_url=config.proxy_url
     )
     router = build_router()
 
