@@ -1391,20 +1391,70 @@ def _create_tray(window) -> object | None:
     return tray
 
 
+def _ask_close_intent(owner=None) -> str:
+    """关窗意图询问：三选一原生对话框，返回 'minimize' / 'quit' / 'stay'。
+
+    是 = 最小化到托盘（默认键，进程常驻继续更新数据——与旧行为一致）；
+    否 = 退出程序；取消 = 留在窗口。弹窗拿主窗口作 owner（居中其上、
+    置顶随主窗，不会藏到别的窗口后面）；任何异常（pythonnet 缺失 /
+    无桌面会话 / owner 拿不到）一律降级 'minimize'——问不出意图时
+    保持「点 X = 后台常驻」的既定语义，绝不误杀进程。
+
+    同步弹窗是刻意的：closing 事件 handler 本就同步跑在 UI 线程
+    （should_lock=True），pywebview 自己的 confirm_close 也在同一位置
+    同步弹 MessageBox.Show——阻塞在对话框上正是拿用户决定的手段。
+    """
+    try:
+        import clr  # noqa: F401 —— pythonnet 装配件可用性探测
+
+        clr.AddReference("System.Windows.Forms")
+        from System.Windows.Forms import (
+            DialogResult,
+            MessageBox,
+            MessageBoxButtons,
+            MessageBoxIcon,
+        )
+
+        result = MessageBox.Show(
+            owner,
+            f"要最小化 {APP_NAME} 到托盘吗？\n\n"
+            "「是」最小化到托盘，数据继续在后台更新；\n"
+            "「否」完全退出程序；「取消」留在当前窗口。",
+            f"关闭 {APP_NAME}",
+            MessageBoxButtons.YesNoCancel,
+            MessageBoxIcon.Question,
+        )
+        if result == DialogResult.Yes:
+            return "minimize"
+        if result == DialogResult.No:
+            return "quit"
+        return "stay"
+    except Exception:  # noqa: BLE001 —— 问不出就按旧语义隐藏，不误杀进程
+        return "minimize"
+
+
 def _make_closing_guard(window):
-    """关窗守卫：用户点 X = 隐藏到托盘（后端常驻），托盘「退出」放行。
+    """关窗守卫：点 X 先问意图——最小化到托盘 / 退出 / 留在窗口。
 
     pywebview closing 事件契约：handler 返回 **False** = 取消关闭
-    （Event.set 统计 False 值 → winforms on_closing 置 args.Cancel）；
-    True/None = 放行。"""
+    （closing 事件 should_lock=True，handler 同步跑在 UI 线程，返回值
+    统计 False → winforms on_closing 置 args.Cancel）；True/None = 放行。
+    托盘「退出」置 _tray_state['quit'] 后走托盘自己的销毁收尾，不进本守卫
+    （托盘菜单是明确意图，免询问）。"""
     def _guard() -> bool:
         if _tray_state["quit"]:
             return True  # 托盘「退出」：放行真关闭
+        owner = getattr(window, "native", None)
+        intent = _ask_close_intent(owner)
+        if intent == "quit":
+            return True  # 放行真关闭：closed 事件里 os._exit(0) 终结进程
+        if intent == "stay":
+            return False  # 取消关闭：窗口原地不动
         try:
             window.hide()
         except Exception:  # noqa: BLE001
             pass
-        return False  # 取消关闭：窗口隐藏，进程常驻
+        return False  # 最小化：取消关闭，窗口隐藏、进程常驻
 
     return _guard
 
