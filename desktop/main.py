@@ -1391,50 +1391,120 @@ def _create_tray(window) -> object | None:
     return tray
 
 
-def _ask_close_intent(owner=None) -> str:
-    """关窗意图询问：三选一原生对话框，返回 'minimize' / 'quit' / 'stay'。
+def _build_close_dialog(owner=None):
+    """构建「最小化 / 退出程序」二选一对话框（WinForms 自绘）。
 
-    是 = 最小化到托盘（默认键，进程常驻继续更新数据——与旧行为一致）；
-    否 = 退出程序；取消 = 留在窗口。弹窗拿主窗口作 owner（居中其上、
-    置顶随主窗，不会藏到别的窗口后面）；任何异常（pythonnet 缺失 /
-    无桌面会话 / owner 拿不到）一律降级 'minimize'——问不出意图时
-    保持「点 X = 后台常驻」的既定语义，绝不误杀进程。
+    返回 (form, mapping)：mapping 把 ShowDialog 的 DialogResult 译成意图
+    （'minimize' / 'quit'）。系统 MessageBox 的按键文案只有是/否/确定/取消
+    固定几组，出不了「最小化」「退出程序」动作词，故用小 Form 自绘两个
+    动作键；ControlBox=False 去掉右上角 X——二选一语义下没有「不选」的
+    退路（「留在窗口」选项已按需求移除）。回车默认 = 最小化
+    （AcceptButton，安全侧：误回车不杀进程）。
+    """
+    import clr  # noqa: F401 —— pythonnet 装配件
+
+    clr.AddReference("System.Drawing")
+    clr.AddReference("System.Windows.Forms")
+    from System.Drawing import (
+        FontStyle,
+        Point,
+        Size,
+        SystemIcons,
+    )
+    from System.Windows.Forms import (
+        Button as WinButton,
+        DialogResult,
+        Form as WinForm,
+        FormBorderStyle,
+        FormStartPosition,
+        Label as WinLabel,
+        PictureBox,
+        PictureBoxSizeMode,
+    )
+
+    def _button(text: str, dialog_result, x: int) -> WinButton:
+        btn = WinButton()
+        btn.Text = text
+        btn.DialogResult = dialog_result
+        btn.Size = Size(132, 34)
+        btn.Location = Point(x, 104)
+        return btn
+
+    dialog = WinForm()
+    dialog.Text = f"关闭 {APP_NAME}"
+    dialog.FormBorderStyle = FormBorderStyle.FixedSingle
+    dialog.MaximizeBox = False
+    dialog.MinimizeBox = False
+    dialog.ShowInTaskbar = False
+    dialog.ControlBox = False
+    dialog.StartPosition = (
+        FormStartPosition.CenterParent
+        if owner is not None
+        else FormStartPosition.CenterScreen
+    )
+    dialog.ClientSize = Size(416, 156)
+
+    icon = PictureBox()
+    icon.Image = SystemIcons.Question.ToBitmap()
+    icon.SizeMode = PictureBoxSizeMode.Zoom
+    icon.Location = Point(20, 20)
+    icon.Size = Size(32, 32)
+
+    head = WinLabel()
+    head.Text = f"要如何关闭 {APP_NAME}？"
+    head.AutoSize = True
+    head.Location = Point(66, 20)
+    from System.Drawing import Font  # noqa: E402 —— 同装配件第二件，就近导入
+
+    head.Font = Font(head.Font.FontFamily, 11.0, FontStyle.Bold)
+
+    detail = WinLabel()
+    detail.Text = "最小化到托盘后，应用仍在后台继续更新数据。"
+    detail.AutoSize = True
+    detail.Location = Point(66, 52)
+
+    btn_min = _button("最小化", DialogResult.Yes, 136)
+    btn_quit = _button("退出程序", DialogResult.No, 276)
+
+    dialog.AcceptButton = btn_min  # 回车 = 最小化（安全侧）
+    dialog.Controls.Add(icon)
+    dialog.Controls.Add(head)
+    dialog.Controls.Add(detail)
+    dialog.Controls.Add(btn_min)
+    dialog.Controls.Add(btn_quit)
+
+    return dialog, {DialogResult.Yes: "minimize", DialogResult.No: "quit"}
+
+
+def _ask_close_intent(owner=None) -> str:
+    """关窗意图询问：二选一（最小化到托盘 / 退出程序），同步模态对话框。
+
+    返回 'minimize' / 'quit'。弹窗拿主窗口作 owner（居中其上、模态随主窗，
+    不会藏到别的窗口后面）；任何异常（pythonnet 缺失 / 无桌面会话 / owner
+    拿不到）一律降级 'minimize'——问不出意图时保持「点 X = 后台常驻」的
+    既定语义，绝不误杀进程。
 
     同步弹窗是刻意的：closing 事件 handler 本就同步跑在 UI 线程
-    （should_lock=True），pywebview 自己的 confirm_close 也在同一位置
-    同步弹 MessageBox.Show——阻塞在对话框上正是拿用户决定的手段。
+    （should_lock=True），pywebview 上游的 confirm_close 也在同一位置
+    同步弹原生对话框——阻塞在对话框上正是拿用户决定的手段。
     """
+    dialog = None
     try:
-        import clr  # noqa: F401 —— pythonnet 装配件可用性探测
-
-        clr.AddReference("System.Windows.Forms")
-        from System.Windows.Forms import (
-            DialogResult,
-            MessageBox,
-            MessageBoxButtons,
-            MessageBoxIcon,
-        )
-
-        result = MessageBox.Show(
-            owner,
-            f"要最小化 {APP_NAME} 到托盘吗？\n\n"
-            "「是」最小化到托盘，数据继续在后台更新；\n"
-            "「否」完全退出程序；「取消」留在当前窗口。",
-            f"关闭 {APP_NAME}",
-            MessageBoxButtons.YesNoCancel,
-            MessageBoxIcon.Question,
-        )
-        if result == DialogResult.Yes:
-            return "minimize"
-        if result == DialogResult.No:
-            return "quit"
-        return "stay"
+        dialog, mapping = _build_close_dialog(owner)
+        result = dialog.ShowDialog(owner) if owner is not None else dialog.ShowDialog()
+        return mapping.get(result, "minimize")
     except Exception:  # noqa: BLE001 —— 问不出就按旧语义隐藏，不误杀进程
         return "minimize"
+    finally:
+        if dialog is not None:
+            try:
+                dialog.Dispose()
+            except Exception:  # noqa: BLE001 —— 资源回收失败不影响流程
+                pass
 
 
 def _make_closing_guard(window):
-    """关窗守卫：点 X 先问意图——最小化到托盘 / 退出 / 留在窗口。
+    """关窗守卫：点 X 先问意图——最小化到托盘 / 退出程序（二选一）。
 
     pywebview closing 事件契约：handler 返回 **False** = 取消关闭
     （closing 事件 should_lock=True，handler 同步跑在 UI 线程，返回值
@@ -1445,11 +1515,8 @@ def _make_closing_guard(window):
         if _tray_state["quit"]:
             return True  # 托盘「退出」：放行真关闭
         owner = getattr(window, "native", None)
-        intent = _ask_close_intent(owner)
-        if intent == "quit":
+        if _ask_close_intent(owner) == "quit":
             return True  # 放行真关闭：closed 事件里 os._exit(0) 终结进程
-        if intent == "stay":
-            return False  # 取消关闭：窗口原地不动
         try:
             window.hide()
         except Exception:  # noqa: BLE001
