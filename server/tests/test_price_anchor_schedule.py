@@ -168,16 +168,12 @@ async def _fire_price_refresh_once(monkeypatch, is_dst: bool) -> datetime:
     monkeypatch.setattr(external_time, "fetch_pacific_dst", _dst)
     monkeypatch.setattr(crawl_service_mod, "run_sequential", _spy_run)
 
-    # 链尾捆绑包存量刷新 + 代理闸门打桩（真实实现出网 + 触生产库）
+    # 链尾捆绑包存量刷新打桩（真实实现出网 + 触生产库）
     from app.domains.bundles import refresh as bundles_refresh_mod
-
-    async def _gate_ok():
-        return None
 
     async def _no_bundles():
         return {"ok": True, "updated": 0, "total": 0}
 
-    monkeypatch.setattr(crawl_service_mod, "ensure_proxy_available", _gate_ok)
     monkeypatch.setattr(bundles_refresh_mod, "refresh_bundles", _no_bundles)
 
     sched = sched_mod.scheduler

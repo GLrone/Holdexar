@@ -69,6 +69,9 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "manual_pool": "BOOLEAN DEFAULT 0",
         # 手动移出监控池：同步复活挡标（重加时清标）
         "excluded": "BOOLEAN DEFAULT 0",
+        # 榜单发现源入池标记（topsellers/popularnew/comingsoon 轮询落池；
+        # 同步反向核对免疫——榜单游戏不在 Steam 名单里）
+        "board_pool": "BOOLEAN DEFAULT 0",
     },
     # 补抓账本：missing 状态的补抓尝试计数
     "game_current_prices": {
@@ -79,8 +82,13 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "is_bundle": "BOOLEAN DEFAULT 0",
     },
     # 捆绑包形态列：链接/CDN 用（与购买语义 mps 解耦）
+    # + 排序快照预计算列（对齐 games：min_cny_fen/diff_fen/is_lowest；
+    # is_lowest 是旧库可能缺列的存量列，一并登记保证补齐）
     "bundles": {
         "item_kind": "INTEGER DEFAULT -1",
+        "min_cny_fen": "BIGINT",
+        "diff_fen": "INTEGER DEFAULT 0",
+        "is_lowest": "BOOLEAN DEFAULT 0",
     },
     # bills 域新导出字段（Steam 消费历史分类器对齐）
     "bill_game_txs": {
@@ -129,6 +137,10 @@ _TABLE_EXTRA_INDEXES: dict[str, list[str]] = {
     ],
     "games": [
         "CREATE INDEX IF NOT EXISTS ix_games_diff_fen ON games(diff_fen DESC)",
+    ],
+    # 捆绑包列表查询：WHERE 有区域价 + ORDER BY 差价降序（排序快照列）
+    "bundles": [
+        "CREATE INDEX IF NOT EXISTS ix_bundles_diff_fen ON bundles(diff_fen DESC)",
     ],
     # 汇率历史按币种取尾段（rate_history WHERE currency ORDER BY id DESC），
     # 导入 16 年档案（约 9 万行）后走此复合索引
