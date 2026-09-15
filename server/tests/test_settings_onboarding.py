@@ -46,6 +46,7 @@ def payload_stub(**overrides):
         "onboarding_done": None,
         "auto_price": None,
         "update_notified": None,
+        "theme": None,
     }
     values.update(overrides)
     return type("P", (), values)()
