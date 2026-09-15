@@ -14,16 +14,21 @@ import type { IconName } from '@/components/ui/icons'
    - 教练标记（Coachmark）：聚光框旁气泡，8 分向智能避让（优先下方/右上），
      永不与聚光框重叠、永不超出视口——高卡片不再遮挡按键
    - 焦点引导：靶点滚动进视野（聚光框完整可见优先），页面滚动/缩放实时跟随
-   顺序编排（小白实测反馈修正）：
-     代理 → 账号绑定 → 任务导入 → 价格提醒 → 收尾
-   （不配代理 Steam 登录窗都加载不出，代理必须先行。）
+   顺序编排（小白实测反馈修正，2026-09-15 二轮重排）：
+     先看成果再学配置——商店页（它是干什么的 + 数据从哪来）→ 代理 →
+     账号绑定 → 手动导入 → 价格提醒 → 收尾
+     第 0 站直接停在商店页：新用户落地页本来就是空的，正面解释「为什么空、
+     怎么来数据」，而不是把空页藏到导览之后再撞上；配置类步骤明确标注
+     「不配也能逛」，降低「教程=前置作业」的心理门槛。
+     （代理仍然在配置链第 1 位：不配代理 Steam 登录窗都加载不出来、
+     自动抓价也会被闸门拦下——顺序不变，只改叙述。）
    关闭兜底：打开即写 ui.onboarding_done 标志（幂等），关闭路径再补写一次。
 
    靶点选择器契约：
    - 框架层：data-tour 属性（侧边栏项，HlSideNav 按 to 派生）
    - 页面层：data-section 属性（分节卡片既有，零侵入复用）
      ⚠️ 迁移后该属性的值是**词条 key**（如 `proxies.section.clash`）而不是译文：
-     锚点与语言无关，切语言时下面的选择器不会断。四个跨页步骤的 key 是与视图侧
+     锚点与语言无关，切语言时下面的选择器不会断。五个跨页步骤的 key 是与视图侧
      逐字对上的契约（见 .tmp-i18n-brief5.md 第一节），改名即静默选不中。
    重开约定：打开时 step 强制归 0（左上角 logo / 设置页重看都从头走）。 */
 
@@ -43,8 +48,10 @@ const brandLogo = computed(() =>
 interface TourStep {
   /** 需要先导航到的页面 */
   route?: string
-  /** 聚光靶点选择器（缺省 = 全屏居中开场/收尾卡，不聚光） */
-  target?: string
+  /** 聚光靶点选择器（缺省 = 全屏居中开场/收尾卡，不聚光）。
+      数组 = 同一语义的多个候选锚点（如商店页空态卡 / 游戏网格），按序取
+      第一个命中的——同一页面不同数据状态下锚点元素不同时用 */
+  target?: string | string[]
   /** 标题词条 key（**存 key 不存译文**：常量表在 setup 期求值一次，
       存译文会把语言冻在组件创建那一刻） */
   titleKey: MessageKey
@@ -72,6 +79,30 @@ const TOUR: TourStep[] = [
       { textKey: 'productTour.intro.p2' },
       { textKey: 'productTour.intro.p3', params: { app: APP_NAME } },
     ],
+  },
+  {
+    target: '[data-tour="sb-library"]',
+    titleKey: 'productTour.stepStore.title',
+    paras: [
+      { textKey: 'productTour.stepStore.p1' },
+      { emphKey: 'productTour.stepStore.emph', icon: 'store' },
+    ],
+    hintKey: 'productTour.stepStore.hint',
+    side: true,
+  },
+  {
+    route: '/library',
+    // 空态卡 / 卡片网格二选一：同一站教「数据从哪来」，空库时聚光空态卡
+    //（正是要解释的场景），已有数据时聚光网格
+    target: ['[data-tour="lib-empty"]', '.card-grid'],
+    titleKey: 'productTour.stepData.title',
+    paras: [
+      { textKey: 'productTour.stepData.p1', params: { app: APP_NAME } },
+      { textKey: 'productTour.stepData.p2' },
+      { emphKey: 'productTour.stepData.emph', icon: 'zap' },
+      { textKey: 'productTour.stepData.p3' },
+    ],
+    hintKey: 'productTour.stepData.hint',
   },
   {
     target: '[data-tour="sb-proxies"]',
@@ -331,18 +362,26 @@ function attachGlobal() {
   }
 }
 
-/** 靶点选择器安全构建（属性选择器值走 CSS.escape 防御，保留完整属性名） */
+/** 靶点选择器安全构建（属性选择器值走 CSS.escape 防御，保留完整属性名）。
+    数组按序探测第一个命中的（商店步：空态卡与网格二选一） */
 function resolveTarget(): HTMLElement | null {
   const raw = current.value.target
   if (!raw) return null
-  const m = raw.match(/^\[([a-z-]+)="(.+)"\]$/)
-  if (!m) return document.querySelector(raw)
-  const [, attr, val] = m
-  try {
-    return document.querySelector(`[${attr}="${CSS.escape(val)}"]`)
-  } catch {
-    return null
+  const one = (sel: string): HTMLElement | null => {
+    const m = sel.match(/^\[([a-z-]+)="(.+)"\]$/)
+    if (!m) return document.querySelector(sel)
+    const [, attr, val] = m
+    try {
+      return document.querySelector(`[${attr}="${CSS.escape(val)}"]`)
+    } catch {
+      return null
+    }
   }
+  for (const sel of Array.isArray(raw) ? raw : [raw]) {
+    const el = one(sel)
+    if (el) return el
+  }
+  return null
 }
 
 /** 纯测量：滚动/缩放/重排跟随只更新聚光框与气泡方向，不滚页面、不挂监听。
