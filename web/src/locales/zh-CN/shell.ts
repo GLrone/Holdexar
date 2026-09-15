@@ -84,6 +84,14 @@ const shell = {
   /* 应用更新（启动主动告知 + 侧栏红点） */
   'update.toastAvailable': '发现新版本 v{version}，到「我」页可一键更新',
   'update.navDot': '有新版本可用',
+
+  /* 更新已下载：全局重启提示（下载可能在任意页面完成，提示不能只留在设置页） */
+  'shell.updateReady.title': '更新已下载完成',
+  'shell.updateReady.body': 'v{version} 已下载并通过校验，重启应用即可完成安装。',
+  'shell.updateReady.hint':
+    '重启期间界面会短暂关闭，随后自动回到新版；游戏库与账号数据不受影响。',
+  'shell.updateReady.restart': '立即重启并更新',
+  'shell.updateReady.later': '稍后重启',
 } as const
 
 export default shell
