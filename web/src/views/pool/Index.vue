@@ -49,19 +49,20 @@ const loading = ref(true)
 const syncingId = ref<string | null>(null)
 let personaRetries = 0
 
-// ─── 监控条目类别（关注 / 愿望单 / 已购 / 手动添加）─────────
+// ─── 监控条目类别（关注 / 愿望单 / 已购 / 榜单 / 手动添加）─────────
 //
-// 主类别取爬取优先级口径的展示映射：关注 > 愿望单 > 已购 > 手动。
+// 主类别取爬取优先级口径的展示映射：关注 > 愿望单 > 已购 > 榜单 > 手动。
 // 一个条目可能同时命中多个来源（如愿望单条目后来被星标），展示取最靠前
 // 的那个；类别计数互斥、合计 = 条目总数（筛选 tab 的数字才对得上）。
 
-type PoolKind = 'follow' | 'wishlist' | 'owned' | 'manual'
+type PoolKind = 'follow' | 'wishlist' | 'owned' | 'board' | 'manual'
 
 /** 类别词条 key（存 key 不存译文：模块级常量只求值一次，会把语言冻住） */
 const KIND_LABEL_KEYS: Record<PoolKind, MessageKey> = {
   follow: 'pool.items.kind.follow',
   wishlist: 'pool.items.kind.wishlist',
   owned: 'pool.items.kind.owned',
+  board: 'pool.items.kind.board',
   manual: 'pool.items.kind.manual',
 }
 
@@ -69,6 +70,7 @@ const KIND_ICONS: Record<PoolKind, IconName> = {
   follow: 'star',
   wishlist: 'heart',
   owned: 'check',
+  board: 'trophy',
   manual: 'plus',
 }
 
@@ -76,13 +78,14 @@ function itemKind(it: PoolItemPayload): PoolKind {
   if (it.followed) return 'follow'
   if (it.wishlisted) return 'wishlist'
   if (it.owned) return 'owned'
+  if (it.boardPool) return 'board'
   return 'manual'
 }
 
 const filterKind = ref<'all' | PoolKind>('all')
 
 const kindCounts = computed(() => {
-  const c = { all: items.value.length, follow: 0, wishlist: 0, owned: 0, manual: 0 }
+  const c = { all: items.value.length, follow: 0, wishlist: 0, owned: 0, board: 0, manual: 0 }
   for (const it of items.value) c[itemKind(it)] += 1
   return c
 })
@@ -93,6 +96,7 @@ const kindTabs = computed(() => [
   { id: 'follow' as const, label: t(KIND_LABEL_KEYS.follow), count: kindCounts.value.follow, icon: KIND_ICONS.follow },
   { id: 'wishlist' as const, label: t(KIND_LABEL_KEYS.wishlist), count: kindCounts.value.wishlist, icon: KIND_ICONS.wishlist },
   { id: 'owned' as const, label: t(KIND_LABEL_KEYS.owned), count: kindCounts.value.owned, icon: KIND_ICONS.owned },
+  { id: 'board' as const, label: t(KIND_LABEL_KEYS.board), count: kindCounts.value.board, icon: KIND_ICONS.board },
   { id: 'manual' as const, label: t(KIND_LABEL_KEYS.manual), count: kindCounts.value.manual, icon: KIND_ICONS.manual },
 ])
 
@@ -633,7 +637,7 @@ onMounted(async () => {
         </div>
       </div>
 
-      <!-- 类别筛选：关注/愿望单（爬取第一优先级）与已购/手动（普通条目） -->
+      <!-- 类别筛选：关注/愿望单（爬取第一优先级）与已购/榜单/手动（普通条目） -->
       <div class="kind-filter">
         <HlChip
           v-for="k in kindTabs"
@@ -1092,9 +1096,9 @@ onMounted(async () => {
   white-space: nowrap;
 }
 
-/* 来源类别标记（顶部筛选 chips 的同款图标：星=关注 / 心=愿望单 / 勾=已购 / 加=手动） */
+/* 来源类别标记（顶部筛选 chips 的同款图标：星=关注 / 心=愿望单 / 勾=已购 / 杯=榜单 / 加=手动） */
 .item-chip__kind {
-  flex-shrink: 0;
+    flex-shrink: 0;
 }
 
 .item-chip__kind--follow {
@@ -1109,8 +1113,12 @@ onMounted(async () => {
   color: var(--success);
 }
 
+.item-chip__kind--board {
+    color: var(--info);
+}
+
 .item-chip__kind--manual {
-  color: var(--text-muted);
+    color: var(--text-muted);
 }
 
 /* 管理模式：多选态高亮；勾选框点击穿透给外层 chip（选中语义只在一处） */
