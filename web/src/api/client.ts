@@ -700,6 +700,8 @@ export interface PoolItemPayload {
   owned: boolean
   /** 手动加入监控池（池页添加 / 导入；普通监控条目） */
   manualPool: boolean
+  /** 榜单发现源落池（热销/新品/即将推出轮询并入；普通监控条目） */
+  boardPool: boolean
 }
 
 /** 监控条目批量操作结果（添加 / 移除共用逐条明细形状） */
@@ -711,7 +713,7 @@ export interface PoolMutationResult {
   removed?: number
   missing?: number
   fail?: number
-  /** 添加后自动触发首爬（任务占用 / 无可用代理时为 false） */
+  /** 添加后自动触发首爬（任务占用时为 false） */
   crawlTriggered?: boolean
 }
 
@@ -1154,7 +1156,7 @@ export const proxiesApi = {
       checked?: number
       alive?: number
     }>('POST', `/proxies/subscriptions/${id}/import`),
-  /** 当前策略下解析出的代理 URL（null=直连/无可用代理）；商店页空态诊断用 */
+  /** 当前代理策略下解析出的代理 URL（null=直连）；商店页空态诊断用 */
   resolveProxy: () => request<{ proxyUrl: string | null }>('GET', '/proxies/resolve'),
   clashStatus: () => request<ClashStatus>('GET', '/proxies/clash'),
   clashInstall: () =>

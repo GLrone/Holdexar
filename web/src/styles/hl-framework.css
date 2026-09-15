@@ -1754,6 +1754,11 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
 .hl-scroll-list.is-plain-scroll { scrollbar-width: none; -ms-overflow-style: none; }
 .hl-scroll-list.is-plain-scroll::-webkit-scrollbar { display: none; }
 
+/* 尾部哨兵（无限滚动观察点，HlScrollList 组件内常驻）。取 1px 而非 0——
+   0 高元素在部分引擎里不产生交叉回调；视觉不可见，消费方的加载态走
+   #footer 插槽渲染在它前面。 */
+.hl-scroll-list__tail { height: 1px; }
+
 /* 进出视口的显隐。**用位移+透明度，不用 scale**：旧实现是 `scale(0.7)`，
    缩放对前庭敏感用户不友好，且项目内其它出入场（.hl-pane-*、抽屉、弹层）
    统一是位移这一套。时长挂 --motion-scale，系统级「减少动态效果」下归零。
