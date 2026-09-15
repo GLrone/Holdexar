@@ -16,6 +16,7 @@ from app.domains.settings import service as settings_service
 @pytest.fixture
 def db(tmp_path, monkeypatch):
     import app.core.database as database_module
+    from app.domains.bundles import service as bundles_service
 
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
@@ -24,6 +25,13 @@ def db(tmp_path, monkeypatch):
     monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
     monkeypatch.setattr(settings_service, "get_session_factory", lambda: factory)
     monkeypatch.setattr(regions_service, "get_session_factory", lambda: factory)
+
+    # set_enabled 会联动捆绑包排序快照整库重建（追踪区集合变化的写侧事件）：
+    # 本文件只测 regions 域语义，打桩隔离，避免触碰真实库
+    async def _noop_rebuild(*args, **kwargs):
+        return 0
+
+    monkeypatch.setattr(bundles_service, "refresh_bundle_sort_cache", _noop_rebuild)
     return factory
 
 
