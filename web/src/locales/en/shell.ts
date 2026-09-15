@@ -67,6 +67,14 @@ const shell: Partial<Record<MessageKey, string>> = {
 
   'update.toastAvailable': 'Version v{version} is available — update from the "Me" page',
   'update.navDot': 'Update available',
+
+  'shell.updateReady.title': 'Update downloaded',
+  'shell.updateReady.body':
+    'v{version} has been downloaded and verified. Restart the app to finish installing.',
+  'shell.updateReady.hint':
+    'The window closes briefly during the restart and reopens on the new version. Your library and account data are unaffected.',
+  'shell.updateReady.restart': 'Restart and update now',
+  'shell.updateReady.later': 'Restart later',
 }
 
 export default shell

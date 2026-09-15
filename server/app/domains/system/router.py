@@ -317,6 +317,7 @@ class UpdateDownload(BaseModel):
     tag: str
     sha256: str | None = None  # 清单内的校验值；缺省跳过校验
     asset: str | None = None  # 清单给出的确切资产名（省掉一次 API 反查）
+    size: int | None = None  # 清单体积：通道不给 Content-Length 时兜底百分比
 
 
 @router.post("/system/update-download")
@@ -331,7 +332,7 @@ async def update_download(req: UpdateDownload) -> dict:
         raise HTTPException(status_code=409, detail="已有更新下载进行中")
     # fire-and-forget：下载在后台跑，前端轮询 /system/update-progress
     asyncio.get_running_loop().create_task(
-        updater.download_update(req.tag, req.sha256, req.asset)
+        updater.download_update(req.tag, req.sha256, req.asset, req.size)
     )
     return {"started": True}
 
