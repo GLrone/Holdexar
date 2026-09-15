@@ -171,6 +171,17 @@ def main() -> None:
         print(f"[开发] 窗口将加载 {env[f'{ENV_PREFIX}DEV_URL']}（需确保 npm run dev 已运行）")
 
     print(f"[启动] {APP_NAME} · http://127.0.0.1:{args.port} · Ctrl+C 退出")
+    # 开发态防陈旧字节码：桌面端 main.py 改动后 Python 本应因 mtime 失配重编，
+    # 但实测出现过缓存未失效、加载到旧 bug 字节码（仍含 FromArgb(*Color) 之类
+    # 已修 bug）导致启动即崩的情况。每次启动清掉这批 .pyc，成本极低（模块很小），
+    # 重编只是几毫秒。打包态走 exe 自包含、不经由本路径，不受影响。
+    import glob as _glob
+
+    for _p in _glob.glob(str(ROOT / "desktop" / "__pycache__" / "main*.pyc")):
+        try:
+            os.remove(_p)
+        except OSError:
+            pass
     cmd = [str(python), str(ROOT / "desktop" / "main.py")]
     if args.server:
         cmd.append("--server")
