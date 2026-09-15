@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 
-import { crawlApi, gamesApi, watchPoolApi, type GameListItem } from '@/api/client'
+import { crawlApi, gamesApi, proxiesApi, watchPoolApi, type GameListItem } from '@/api/client'
 import { useFilterStore } from '@/stores/gamesFilter'
 import { useRegionsStore } from '@/stores/regions'
 import { canGift } from '@/lib/gifting'
@@ -10,7 +11,7 @@ import { useI18n, useLocaleFormat } from '@/locales'
 import HlNavbar from '@/components/business/HlNavbar.vue'
 import HlFilterPanel from '@/components/business/HlFilterPanel.vue'
 import HlGameCard from '@/components/business/HlGameCard.vue'
-import { HlEmpty, HlScrollList, HlSpinner } from '@/components/ui'
+import { HlButton, HlEmpty, HlScrollList, HlSpinner } from '@/components/ui'
 
 /**
  * 库视图完整实现：Navbar + 高级筛选 + 卡片网格 +
@@ -19,6 +20,7 @@ import { HlEmpty, HlScrollList, HlSpinner } from '@/components/ui'
  */
 const store = useFilterStore()
 const regionsStore = useRegionsStore()
+const router = useRouter()
 // 千分位随界面语言：模板里每渲染一行都会重算，且 `fmt` 内部现读 locale，
 // 故切语言即重渲染（详见 locales/format.ts 的说明）
 const fmt = useLocaleFormat()
@@ -178,13 +180,14 @@ function passesAdvanced(g: GameListItem): boolean {
 
 const visibleGames = computed(() => items.value.filter(passesAdvanced))
 
-// ─── 空库诊断（total=0 时探测监控池与爬虫，给引导文案）───
+// ─── 空库诊断（total=0 时探测监控池、爬虫与代理，给引导文案）───
 
 const emptyDiag = ref<{
   checked: boolean
   poolCount: number | null
   crawlRunning: boolean | null
-}>({ checked: false, poolCount: null, crawlRunning: null })
+  proxyReady: boolean | null
+}>({ checked: false, poolCount: null, crawlRunning: null, proxyReady: null })
 
 /** 服务端全空且无搜索词才算「库空」，有筛选条件时不算（走「没有匹配结果」） */
 const isLibraryEmpty = computed(
@@ -194,9 +197,10 @@ const isLibraryEmpty = computed(
 watch(isLibraryEmpty, async (empty) => {
   if (!empty || emptyDiag.value.checked) return
   emptyDiag.value.checked = true
-  const [pool, active] = await Promise.allSettled([
+  const [pool, active, proxy] = await Promise.allSettled([
     watchPoolApi.accounts(),
     crawlApi.active(),
+    proxiesApi.resolveProxy(),
   ])
   if (pool.status === 'fulfilled') {
     emptyDiag.value.poolCount = pool.value.reduce(
@@ -206,6 +210,11 @@ watch(isLibraryEmpty, async (empty) => {
   }
   if (active.status === 'fulfilled') {
     emptyDiag.value.crawlRunning = active.value.activeJobId !== null
+  }
+  // 与后端自动任务同一判据（ensure_proxy_available）：resolve 出 null=直连
+  // = 自动抓价会被闸门拦下——「商店为什么没数据」最常见根因，空态点破它
+  if (proxy.status === 'fulfilled') {
+    emptyDiag.value.proxyReady = proxy.value.proxyUrl !== null
   }
 })
 
@@ -283,12 +292,27 @@ onBeforeUnmount(() => observer?.disconnect())
         </div>
       </div>
 
-      <!-- 空状态 -->
-      <HlEmpty v-if="!isLoading && !isError && visibleGames.length === 0 && initialized" icon="">
+      <!-- 空状态（挂 data-tour：ProductTour「商店数据」步的聚光锚点——空态
+           正是那步要教的场景。不用 data-section：那会被 HlSectionRail 扫成
+           分节刻度，商店页本无分节轨） -->
+      <HlEmpty
+        v-if="!isLoading && !isError && visibleGames.length === 0 && initialized"
+        icon=""
+        data-tour="lib-empty"
+      >
         <!-- 库本身为空：诊断监控池与爬虫状态，给引导 -->
         <template v-if="isLibraryEmpty">
           <h3>{{ t('library.empty.library.title') }}</h3>
-          <template v-if="emptyDiag.poolCount !== null && emptyDiag.poolCount > 0">
+          <!-- 代理诊断行：无代理时点破「自动抓价被拦」这一最常见根因 -->
+          <template v-if="emptyDiag.checked && emptyDiag.proxyReady === false">
+            <p class="lib-empty-reason">{{ t('library.empty.library.noProxy') }}</p>
+            <div class="lib-empty-actions">
+              <HlButton size="sm" @click="router.push('/proxies')">
+                {{ t('library.empty.library.goProxy') }}
+              </HlButton>
+            </div>
+          </template>
+          <template v-else-if="emptyDiag.poolCount !== null && emptyDiag.poolCount > 0">
             <p>{{ t('library.empty.library.pool', { n: emptyDiag.poolCount }) }}</p>
             <p v-if="emptyDiag.crawlRunning">{{ t('library.empty.library.crawling') }}</p>
             <p v-else>{{ t('library.empty.library.startHint') }}</p>
@@ -296,6 +320,11 @@ onBeforeUnmount(() => observer?.disconnect())
           <template v-else-if="emptyDiag.checked">
             <p>{{ t('library.empty.library.noPool1') }}</p>
             <p>{{ t('library.empty.library.noPool2') }}</p>
+            <div class="lib-empty-actions">
+              <HlButton size="sm" @click="router.push('/crawl')">
+                {{ t('library.empty.library.goImport') }}
+              </HlButton>
+            </div>
           </template>
           <p v-else>{{ t('library.empty.library.checking') }}</p>
         </template>
@@ -357,6 +386,21 @@ onBeforeUnmount(() => observer?.disconnect())
 </template>
 
 <style scoped>
+/* 空态引导按钮行（去配代理 / 去导入游戏）：HlEmpty slot 内的横向排布 */
+.lib-empty-actions {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+/* 代理诊断行：点破「没数据」的根因，视觉权重高于普通引导句 */
+.lib-empty-reason {
+  margin: 6px 0;
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--text-secondary);
+}
+
 /* 加载骨架的仿形卡片（详见模板里「为什么不用 HlSkeleton 的 card 变体」那段）。
    高度**不写行内 style**：真卡列表模式的高度是 `.game-card.list-layout { height: 60px }`，
    行内样式会压过它——这正是此前列表模式下 8 张骨架卡仍是 400px 高的原因。
