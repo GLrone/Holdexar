@@ -16,13 +16,11 @@ from sqlalchemy import or_, select
 from app.core.database import get_session_factory
 from app.core.events import bus
 from app.crawler.config import DEFAULT_WORKER_COUNT, HTTP_TIMEOUT
-from app.crawler.proxy import resolve_proxy_url as resolve_env_proxy
 from app.crawler.runner import CrawlRunConfig, run_crawl
 from app.domains.alerts import service as alerts_service
 from app.domains.crawl.models import CrawlJob
 from app.domains.games.models import Game, GameCurrentPrice
 from app.domains.games import service as games_service
-from app.domains.proxies import service as proxies_service
 from app.domains.regions.service import effective_regions
 from app.domains.wishlist.models import WishlistItem
 
@@ -290,28 +288,6 @@ REPAIR_RETRY_COOLDOWN_MINUTES = 4
 MISSING_BATCH_ROW_LIMIT = 8000
 
 
-async def ensure_proxy_available() -> None:
-    """自动爬取前的代理前置检查。
-
-    proxy_first 策略下 resolve_proxy_url 层层兜底最后回落**直连**——
-    Steam 域直连基本不可用，无订阅状态下自动任务直连全 41 区打 Steam
-    既浪费请求又拿不到数据。自动路径（调度器/同步追加）一律过此闸：
-    解析结果是直连（None）即视为「无可用代理」，拒绝启动等下一轮再探；
-    只用户手动启动（路由层直通，不带闸门）允许直连。
-
-    direct_only/direct_first 是用户显式配置的直连策略（= 授权直连），
-    闸门放行，不拦用户自己的选择。
-    抛 ValueError（run_sequential 跳过该 spec 的既有语义）。
-    """
-    from app.domains.proxies import service as proxies_service
-
-    strategy = (await proxies_service.get_strategy())["strategy"]
-    if strategy in ("direct_only", "direct_first"):
-        return  # 用户显式选择直连 = 授权直连，自动任务放行
-    if await proxies_service.resolve_proxy_url() is None:
-        raise ValueError("无可用代理（订阅未保存/节点全不可用）——自动爬取已跳过，手动启动不受限")
-
-
 async def _missing_tasks(
     cooldown_minutes: int = MISSING_RETRY_COOLDOWN_MINUTES,
     limit_rows: int = MISSING_BATCH_ROW_LIMIT,
@@ -486,7 +462,6 @@ async def start_job(
     regions: list[str] | None = None,
     kind: str = "manual",
     missing_cooldown: int | None = None,
-    from_scheduler: bool = False,
 ) -> dict:
     """启动爬取任务。返回任务摘要；已有任务运行时抛 RuntimeError。
 
@@ -501,17 +476,10 @@ async def start_job(
     kind="backfill" 为孤儿回补层：忽略 scope/appids，取挂名孤儿行
     （updated_at IS NULL）首爬，低 worker、跳过预检、当日限量。
     missing_cooldown 显式传值时覆盖 missing/repair 两类冷却。
-    from_scheduler=True（调度器/自动路径）时过代理前置闸门：无可用
-    代理（解析结果 = 直连）即拒绝启动——未保存订阅时自动任务不许
-    直连硬打 Steam；手动路由不带此标志，用户强制执行可以直连。
-    direct_only/direct_first 是用户显式选择的直连策略，闸门放行。
     """
     global _active
     if _active is not None and not _active.task.done():
         raise RuntimeError("已有爬取任务在运行")
-
-    if from_scheduler:
-        await ensure_proxy_available()
 
     pre_tasks: list[dict] | None = None
     pairs: list[tuple[int, str]] = []
@@ -539,35 +507,17 @@ async def start_job(
         if not pairs:
             raise ValueError("任务列表为空")
         effective = await effective_regions(regions)
-    try:
-        # 策略引擎（direct_only/proxy_only/proxy_first）优先；未配置回落环境变量
-        proxy_url = await proxies_service.resolve_proxy_url()
-    except RuntimeError as e:
-        raise ValueError(str(e))
-    if proxy_url is None:
-        proxy_url = resolve_env_proxy()
+    # 直连为标准形态：browse 按 country_code 返回各区数据，出口 IP 不参与
+    # 判定；加速器（一般用户常态）在系统网络层透明生效。请求频率由全局
+    # 限流闸（rate_limit.py 200 发/5 分钟）统一约束，不再有代理前置条件。
     from app.domains.settings.service import get_value
-
-    # direct_first 失败换代理：直连开局的任务，失败/429 时通过 resolver
-    # 换出口重试（proxy_first/proxy_only 已有代理也受益——出口坏了换下一个）
-    from app.domains.proxies.service import get_strategy, resolve_failover_proxy_url
-
-    failover_resolver = None
-    strategy = (await get_strategy())["strategy"]
-    if strategy in ("direct_first", "proxy_first", "proxy_only"):
-        async def _failover() -> str | None:
-            return await resolve_failover_proxy_url()
-
-        failover_resolver = _failover
 
     worker_count = await get_value("crawl.workers", DEFAULT_WORKER_COUNT) or DEFAULT_WORKER_COUNT
     small_lane = kind in ("missing", "repair", "backfill")
     config = CrawlRunConfig(
         regions=effective,
         workers=min(worker_count, MISSING_RECOVERY_WORKERS) if small_lane else worker_count,
-        proxy_url=proxy_url,
         timeout=HTTP_TIMEOUT,
-        failover_proxy_resolver=failover_resolver,
     )
     async with get_session_factory()() as session:
         job = CrawlJob(
@@ -616,7 +566,6 @@ async def run_sequential(
     specs: list[dict],
     *,
     missing_cooldown: int | None = None,
-    from_scheduler: bool = False,
 ) -> list[dict]:
     """串行链式启动多个爬取任务（单任务模型下唯一的多 spec 方式）。
 
@@ -624,7 +573,6 @@ async def run_sequential(
     await 其完成；已有任务运行（RuntimeError）或任务列表为空（ValueError）
     时跳过该 spec 继续下一个——链式触发的健壮性优先于严格性。
     missing_cooldown 显式传值时透传给 missing/repair 类 spec。
-    from_scheduler=True 时整链过代理前置闸门（无可用代理不自动执行）。
     """
     results: list[dict] = []
     for spec in specs:
@@ -635,7 +583,6 @@ async def run_sequential(
                 regions=spec.get("regions"),
                 kind=spec.get("kind", "scheduled"),
                 missing_cooldown=missing_cooldown,
-                from_scheduler=from_scheduler,
             )
         except (RuntimeError, ValueError) as e:
             logger.info("[链式] 跳过 %s：%s", spec.get("kind", spec.get("scope")), e)

@@ -1,11 +1,13 @@
 """IStoreBrowseService 价格抓取层（替代 appdetails 只换抓取层版）。
 
 与旧 appdetails 链路的关系：
-- 并发与 IP 调度**原封不动**：仍用 CrawlerScheduler（worker 池）+ SteamHttpClient
-  （429 熔断 / 指数退避 / Connection: close / Per-AppID Session）。
+- 并发调度**原封不动**：仍用 CrawlerScheduler（worker 池）+ SteamHttpClient
+  （全局限流 / 429 熔断 / 指数退避 / Connection: close）。
 - 抓取层换成 IStoreBrowseService/GetItems/v1：单区 × ≤400 appid 一发批量，
   元数据（名称/开发商/好评率/发售日/头图/家庭共享/卡牌/成人标记）全部由
-  同一发响应白送，替掉 appdetails + appreviews 两次请求。
+  同一发响应白送，替掉 appdetails + appreviews 两次请求。**价格按请求参数
+  country_code 判定**——出口 IP 不参与数据判定，直连与代理拿到同一份数据，
+  这是直连成为标准形态、限流取代换 IP 规避风控的根因。
 - 原价直接取 original_price_in_cents（一手），不再用 `现价×100÷(100−折扣)` 反推
   （Steam 先定价后折后取整，反推回不去——实测 699→698 / 22900→22833 这类偏差）。
 - 错误语义与旧链路一致：run 内退避重推 MAX_PARTIAL_RETRIES 次 → 仍失败写入
