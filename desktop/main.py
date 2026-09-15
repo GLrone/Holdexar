@@ -12,7 +12,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -654,14 +656,14 @@ class DesktopApi:
     def restart_app(self) -> dict:
         """前端「重启以完成更新」入口：新进程拉起自己，本进程即刻退出。
 
-        js_api 调用在独立线程，os._exit 安全；重启后 main() 最早的
-        _apply_pending_update 分支完成换装。
+        js_api 调用在独立线程，os._exit 安全；重启后 main() 的
+        _handoff_pending_update 分支把换装交给暂存包的新 exe 执行
+        （见该函数 docstring：换装必须等旧进程退出，不能在跑着的进程里动目录）。
         """
         exe = Path(sys.executable) if getattr(sys, "frozen", False) else None
         if exe is None or not exe.is_file():
             return {"ok": False, "error": "仅打包态支持一键重启，请手动重启应用。"}
-        import subprocess
-
+    
         subprocess.Popen(
             [str(exe)],
             cwd=str(exe.parent),
@@ -990,36 +992,117 @@ _UPDATE_KEEP = {
     "update-staging",  # 暂存目录自身
 }
 
+# 换装助手入口标记：暂存包的新 exe 报出这个长选项才允许自动换装（见探测函数）
+_HELPER_FLAG = "--apply-update"
+# 不支持安全换装的暂存包落盘标记：避免每次启动重复探测与弹窗
+_UNSUPPORTED_MARK = ".handoff-unsupported"
 
-def _apply_pending_update() -> bool:
-    """启动期换装：staging 就绪则完成 程序目录替换，返回是否换装成功。
 
-    时机：main() 最早分支、uvicorn 线程与窗口都还没拉起——此刻本进程
-    持有的程序文件句柄最少（仅自身 exe），目录可移动；换装动作全程
-    在子进程视角外完成，失败直接走原程序启动，用户无感回退。
+def _update_log() -> Path:
+    """换装日志路径。换装进程脱离控制台（print 无处可看），失败必须留痕。"""
+    logs = _data_dir() / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    return logs / "update-apply.log"
 
-    步骤：
-    1. data/update-staging/Holdexar/ 存在且 manifest 就绪 → 进入换装
-    2. 当前程序目录 → __old__（白名单目录原地保留）
-    3. staging/Holdexar/* → 程序目录落位
-    4. __old__ 延迟清理（sharing violation 重试，失败留待下次启动）
 
-    **只在打包态生效**（这是硬门禁，不是优化）。开发态下 `_app_root()` 是**仓库根**，
-    而白名单 `_UPDATE_KEEP` 只保 data/logs/__old__/update-staging——一旦触发，
-    `.git`、`server/`、`web/`、`run.py`、`desktop/` 会被整批 move 进 `__old__`，
-    再把 staging 的内容覆盖到仓库根上：一次误放的 `data/update-staging/manifest.json`
-    就能毁掉工作树（且 .git 被移走时连 git 都没法回滚）。换装的目标是「已发布的
-    程序目录」，开发态根本没有这个东西，所以直接不进入。
+def _log_update(message: str) -> None:
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}"
+    print(f"[更新] {line}")
+    try:
+        with _update_log().open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:  # noqa: BLE001 —— 日志写不进去不阻断换装
+        pass
+
+
+def _remove_path(path: Path) -> None:
+
+    try:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001 —— 清不掉留给下次启动
+        pass
+
+
+def _staged_main_exe(payload: Path) -> Path | None:
+    """暂存载荷的主程序：优先与本程序同名，否则取载荷根目录下的 exe。
+
+    用**载荷自己的 exe**而不是「当前进程的 exe 名」定位：用户可能给主程序改过名
+    （`Holdexar (1).exe`、带版本号的副本……），按当前名字硬找会把好好的更新包
+    判成「缺少主程序」而拒换。换装后的启动目标也随之取载荷那个文件名。
+    """
+    candidates = sorted(p for p in payload.glob("*.exe") if p.is_file())
+    if not candidates:
+        return None
+    same_name = payload / Path(sys.executable).name
+    return same_name if same_name.is_file() else candidates[0]
+
+
+def _staged_supports_helper(exe: Path) -> bool:
+    """暂存包的新 exe 是否支持安全换装（`--apply-update`）。
+
+    为什么必须探测：换装要在**旧进程退出后**由暂存包的新 exe 执行；已发布的老
+    版本没有这个入口，硬换装只能走老逻辑——它在运行中的程序目录上对装载中的
+    `_internal` 做 `shutil.move`：`os.rename` 被 Windows 拒绝（WinError 5，实测），
+    `shutil.move` 遂静默降级为 copytree+rmtree，只复制得动未被占用的文件、再把
+    原目录删剩被占用的那些（实测 `_internal` 1319 个文件剩 32 个，安装半截化）。
+    探测失败即拒换：宁可不更新，也不能毁掉现装。
+    """
+
+    try:
+        result = subprocess.run(
+            [str(exe), "--help"], capture_output=True, timeout=25,
+            encoding="utf-8", errors="replace",
+        )
+    except Exception:  # noqa: BLE001 —— 起不来/超时一律按不支持处理
+        return False
+    return _HELPER_FLAG in ((result.stdout or "") + (result.stderr or ""))
+
+
+def _wait_pid_exit(pid: int, timeout: float = 180.0) -> None:
+    """等旧进程退出（Windows 句柄等待：换装进程要先拿到「程序目录没人占用」）。
+
+    非 Windows / 句柄打不开时退化为短等待——换装进程本就是脱前台的兜底进程，
+    多等一会儿不伤人；早动手才会撞文件锁。
+    """
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            SYNCHRONIZE = 0x00100000
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+            kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+            handle = kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
+            if handle:
+                kernel32.WaitForSingleObject(handle, int(timeout * 1000))
+                return
+        except Exception:  # noqa: BLE001 —— 句柄打不开走下面的兜底等待
+            pass
+    time.sleep(min(timeout, 5.0))
+
+
+def _handoff_pending_update() -> bool:
+    """staging 就绪 → 把换装交给**暂存包的新 exe**，本进程随即退出。
+
+    为什么不在本进程里换装（v0.1.0 的老做法，实测毁安装）：本进程正从
+    `_internal` 装载 DLL，而该目录在运行中无法整体 `os.rename`（WinError 5）。
+    换装进程等本进程的句柄消失后再动文件，那时目录没有任何占用，改名与复制
+    都是普通操作。
+
+    返回 True = 已交接（调用方必须立即退出，别再起 uvicorn 与窗口）。
     """
     if not is_frozen():
         return False
 
-    root = _app_root()
     staging = _data_dir() / "update-staging"
-    new_dir = staging / APP_NAME
+    payload = staging / APP_NAME
     manifest = staging / "manifest.json"
-
-    if not manifest.is_file() or not new_dir.is_dir():
+    if not manifest.is_file() or not payload.is_dir():
         return False
     try:
         info = json.loads(manifest.read_text(encoding="utf-8"))
@@ -1028,64 +1111,173 @@ def _apply_pending_update() -> bool:
     if not info.get("ready"):
         return False
 
-    import shutil
+    staged_exe = _staged_main_exe(payload)
+    if staged_exe is None:
+        _alert("[更新] 暂存包缺少主程序，本次换装已跳过（现装保持完好）。")
+        return False
 
-    print(f"[更新] 检测到就绪暂存（{info.get('tag')}），开始换装…")
-    old_dir = root / "__old__"
+    if not _staged_supports_helper(staged_exe):
+        if not (staging / _UNSUPPORTED_MARK).exists():
+            (staging / _UNSUPPORTED_MARK).write_text(
+                f"{info.get('tag')} 由旧版本生成，不支持安全换装\n", encoding="utf-8"
+            )
+            _log_update(f"暂存包 {info.get('tag')} 不支持安全换装，已跳过")
+            # 弹窗放后台线程：MessageBoxW 是模态阻塞调用，放主线程会把本次启动
+            # 卡在对话框上（用户不点确定，应用就起不来）
+            threading.Thread(
+                target=_alert,
+                args=(
+                    "[更新] 该更新包由旧版本生成，不支持安全换装，已跳过——现装保持完好。\n\n"
+                    "请到发布页下载新版压缩包，解压后覆盖本程序目录完成升级；\n"
+                    "用户数据不在程序目录内，覆盖解压不会影响它。",
+                ),
+                daemon=True,
+            ).start()
+        return False
 
-    # ① 旧目录残留（上次换装没清干净）：先删（这次反正要再放一版进去）
+
+    try:
+        subprocess.Popen(
+            [
+                str(staged_exe), _HELPER_FLAG,
+                "--staging", str(staging),
+                "--target", str(_app_root()),
+                "--wait-pid", str(os.getpid()),
+            ],
+            cwd=str(staged_exe.parent),
+            close_fds=True,
+            creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
+        )
+    except Exception as e:  # noqa: BLE001 —— 拉不起来就让位正常运行，下次启动再试
+        _log_update(f"拉起换装进程失败：{e}")
+        return False
+    _log_update(f"换装已交给暂存包（{info.get('tag')}），本进程退出")
+    return True
+
+
+def _count_tree(path: Path) -> int:
+    """文件计数（文件自身算 1，目录递归计数）——落位校验用。"""
+    if path.is_file():
+        return 1
+    return sum(1 for p in path.rglob("*") if p.is_file())
+
+
+def _restore_moved(moved: list[str], target: Path, old_dir: Path) -> None:
+    """回滚已让位的旧条目（改不回的留在 __old__ 供手工恢复，绝不删）。"""
+    for name in reversed(moved):
+        src, dst = old_dir / name, target / name
+        try:
+            if dst.exists():
+                _remove_path(dst)
+            os.replace(src, dst)
+        except Exception as e:  # noqa: BLE001
+            _log_update(f"回滚 {name} 失败：{e}（原件仍在 {old_dir}，可手工移回）")
+
+
+def _swap_payload(staging: Path, target: Path) -> bool:
+    """换装主体：旧条目让位 → 新载荷落位 → 校验 → 清暂存。返回是否成功。
+
+    只用两种搬运方式，别的一律不碰：
+    - 旧条目**只做 os.replace 改名**（同卷原子）。绝不用 `shutil.move`——它在
+      rename 失败时会静默降级成 copytree+rmtree，那正是毁安装的根源；
+    - 新载荷**复制**落位（暂存目录在系统盘、程序目录可能在别的盘，跨卷没法改名）。
+    任一步失败即整体回滚到原版本，程序目录始终保持可启动。
+    """
+
+    payload = staging / APP_NAME
+    old_dir = target / "__old__"
+
+    # ① 上次换装残留：先清（这次反正要再放一版进去）
     if old_dir.exists():
         shutil.rmtree(old_dir, ignore_errors=True)
         if old_dir.exists():
-            _alert("[更新] 清理旧版残留 __old__ 失败，跳过本次换装（可手动删除后重试）。")
+            _log_update("残留 __old__ 清理失败，放弃本次换装")
             return False
+    old_dir.mkdir(parents=True)
 
-    # ② 旧程序整体让位：程序目录里非白名单条目逐个移进 __old__
-    #   （不整目录移动——data/ 在程序目录内，不能进备份）
-    old_dir.mkdir()
-    moved: list[Path] = []
+    # ② 旧条目让位（纯改名，逐条登记以便回滚）
+    moved: list[str] = []
     try:
-        for entry in root.iterdir():
+        for entry in target.iterdir():
             if entry.name in _UPDATE_KEEP or entry == old_dir:
                 continue
-            target = old_dir / entry.name
-            shutil.move(str(entry), str(target))
-            moved.append(target)
-    except Exception as e:  # noqa: BLE001 —— 移到一半失败：回滚已移条目
-        print(f"[更新] 旧文件移动失败：{e}")
-        for target in reversed(moved):
-            try:
-                shutil.move(str(target), str(root / target.name))
-            except Exception:  # noqa: BLE001 —— 回滚失败只能留残迹
-                pass
-        _alert(f"[更新] 换装失败（旧文件移动阶段），已回滚。详情见 data/logs。")
+            os.replace(entry, old_dir / entry.name)
+            moved.append(entry.name)
+    except Exception as e:  # noqa: BLE001
+        _log_update(f"旧条目让位失败：{e}（回滚已让位条目）")
+        _restore_moved(moved, target, old_dir)
         return False
 
-    # ③ 新文件落位
+    # ③ 新载荷落位
+    landed: list[str] = []
     try:
-        for entry in new_dir.iterdir():
-            shutil.move(str(entry), str(root / entry.name))
-        shutil.rmtree(staging, ignore_errors=True)
-    except Exception as e:  # noqa: BLE001 —— 落位失败：__old__ 完整在位，
-        #   下条弹窗指导手工移回 = 有退路（此时新文件已部分混入，
-        #   程序目录可能不完整——手工把 __old__ 内容移回根目录即恢复）
-        print(f"[更新] 新文件落位失败：{e}")
-        _alert(
-            "[更新] 换装失败（新文件落位阶段）。\n\n"
-            "恢复方法：打开程序所在目录，把 __old__ 文件夹内全部内容移回上一级目录即可。"
-        )
+        for entry in payload.iterdir():
+            dst = target / entry.name
+            if entry.is_dir():
+                shutil.copytree(entry, dst)
+            else:
+                shutil.copy2(entry, dst)
+            landed.append(entry.name)
+    except Exception as e:  # noqa: BLE001
+        _log_update(f"新载荷落位失败：{e}（回滚到原版本）")
+        for name in landed:
+            _remove_path(target / name)
+        _restore_moved(moved, target, old_dir)
         return False
 
-    # ④ 延迟清理上一版程序文件：运行中的 exe/WebView 句柄会拖住删除，
-    #   重试窗口覆盖本进程退出 + 新版启动的间隙；失败留待下次启动再清
-    _cleanup_old_dir_async(old_dir)
-    print("[更新] 换装完成。")
+    # ④ 落位校验：少一个文件就是半截安装，宁可回滚
+    #   （计数含顶层文件本身——主程序漏算过一次，把正常换装误判成了半截）
+    want = sum(1 for p in payload.rglob("*") if p.is_file())
+    got = sum(_count_tree(target / name) for name in landed)
+    if got != want:
+        _log_update(f"落位校验失败：期望 {want} 个文件、实得 {got} 个（回滚）")
+        for name in landed:
+            _remove_path(target / name)
+        _restore_moved(moved, target, old_dir)
+        return False
+
+    # ⑤ 清标记与暂存：manifest 先删（重启不再触发换装），暂存目录尽力清——
+    #   本进程就跑在暂存目录里，自己的 exe/DLL 删不掉，残留由新程序启动时收尾
+    (staging / "manifest.json").unlink(missing_ok=True)
+    shutil.rmtree(staging, ignore_errors=True)
+    _log_update(f"换装完成：{got} 个文件落位，上一版在 {old_dir}")
     return True
+
+
+def _run_update_helper(staging: Path, target: Path, wait_pid: int | None) -> None:
+    """换装进程入口（由暂存包的新 exe 以 --apply-update 拉起）。
+
+    先等旧进程退出再动文件：这是整条换装链的立身之本（旧进程在跑时，程序目录
+    的 `_internal` 无法整体改名）。成功即拉起新程序；失败保持原版本完好并弹窗
+    给出日志路径与手工升级指引。
+    """
+
+    _log_update(f"换装进程启动：staging={staging} target={target} wait_pid={wait_pid}")
+    if wait_pid:
+        _wait_pid_exit(int(wait_pid))
+    time.sleep(1.5)  # 进程退出 ≠ 文件锁立刻消失，留一点收尾余量
+
+    if not _swap_payload(staging, target):
+        _alert(
+            "[更新] 换装失败，已回滚到原版本（程序目录未被破坏，可直接使用）。\n\n"
+            f"详情见 {_update_log()}；也可到发布页下载新版压缩包手动解压覆盖。"
+        )
+        return
+
+    try:
+        subprocess.Popen(
+            [str(target / Path(sys.executable).name)],
+            cwd=str(target),
+            close_fds=True,
+            creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
+        )
+        _log_update("新版本已拉起")
+    except Exception as e:  # noqa: BLE001 —— 新程序已就位，手动双击即可
+        _log_update(f"拉起新版本失败：{e}（新程序已就位，可手动启动）")
 
 
 def _cleanup_old_dir_async(old_dir: Path) -> None:
     """后台线程清 __old__：sharing violation 重试（Windows 文件锁语义）。"""
-    import shutil
 
     def _retry_delete() -> None:
         for _ in range(30):  # ~30s 窗口
@@ -1096,21 +1288,18 @@ def _cleanup_old_dir_async(old_dir: Path) -> None:
     threading.Thread(target=_retry_delete, daemon=True).start()
 
 
-def _relaunch_after_update() -> None:
-    """换装成功后重启：新 exe 起进程，本进程退出。"""
-    exe = Path(sys.executable) if getattr(sys, "frozen", False) else None
-    if exe is None or not exe.is_file():
-        print("[更新] 非打包态换装完成，不自动重启（开发态需手动重启服务）。")
-        return
-    import subprocess
+def _cleanup_staging_leftover() -> None:
+    """清理已消费的暂存目录残留。
 
-    subprocess.Popen(
-        [str(exe)],
-        cwd=str(exe.parent),
-        close_fds=True,
-        creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
-    )
-    os._exit(0)
+    换装进程自己就跑在暂存目录里，它的 exe 与 DLL 在退出前删不掉——换装成功后
+    总会留下这一撮。判据是「没有 manifest」：带 manifest 的暂存是待换装的正经
+    包，一个字节都不许动。
+    """
+
+    staging = _data_dir() / "update-staging"
+    if not staging.is_dir() or (staging / "manifest.json").is_file():
+        return
+    shutil.rmtree(staging, ignore_errors=True)
 
 
 def _browser_fallback(url: str, reason: str) -> None:
@@ -1343,7 +1532,27 @@ def _apply_webview2_static_args() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=f"{APP_NAME} 桌面启动器")
     parser.add_argument("--server", action="store_true", help="无窗口模式，仅启动本地服务")
+    # 换装进程入口（内部用，见 _run_update_helper）：由**暂存包的新 exe** 带着
+    # 暂存目录/程序目录/旧进程 PID 拉起，等旧进程退出后完成换装。
+    # ⚠️ 这个选项**必须出现在 --help 里**：老版本启动时靠 `--help` 探测暂存包
+    # 是否支持安全换装（见 _staged_supports_helper）——用 SUPPRESS 藏起来会让
+    # 探测永远失败、所有更新包都被判成「不支持安全换装」。
+    parser.add_argument(
+        _HELPER_FLAG, action="store_true",
+        help="执行待安装的更新后退出（由应用内更新流程自动调用）",
+    )
+    parser.add_argument("--staging", help=argparse.SUPPRESS)
+    parser.add_argument("--target", help=argparse.SUPPRESS)
+    parser.add_argument("--wait-pid", type=int, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    # 换装进程优先分流：不挂孤儿防线、不协商端口、不起服务与窗口——只做换装
+    if getattr(args, "apply_update"):
+        if not args.staging or not args.target:
+            print("[更新] 换装进程缺少 --staging/--target，退出。")
+            return
+        _run_update_helper(Path(args.staging), Path(args.target), args.wait_pid)
+        return
 
     # 孤儿实例防线最早挂上：换装/端口协商/服务线程任何阶段包装进程死亡，
     # 本进程都不应存活成无主实例（防线语义见 _watch_launcher 顶注）
@@ -1352,11 +1561,17 @@ def main() -> None:
     # WebView2 静态参数须在任何窗口创建前就位（webview.start 建环境时读取）
     _apply_webview2_static_args()
 
-    # 启动期换装：staging 就绪则替换程序文件后重启（早期分支：
-    # uvicorn 线程/窗口/端口锁均未拉起，程序文件句柄最少）
-    if _apply_pending_update():
-        _relaunch_after_update()
-        return
+    # 换装：暂存就绪则把换装交给暂存包的新 exe（本进程立即退出，不再起服务）；
+    # 交接失败（旧版暂存包/拉不起来）就照常启动现装，下次启动再试
+    if _handoff_pending_update():
+        sys.stdout.flush()
+        os._exit(0)
+
+    # 换装残留清理：已消费的暂存目录（无 manifest）+ 上一版程序备份 __old__
+    _cleanup_staging_leftover()
+    _stale_old_dir = _app_root() / "__old__"
+    if _stale_old_dir.exists():
+        _cleanup_old_dir_async(_stale_old_dir)
 
     # 启动期端口协商（已运行实例检测在前）：被占自动避让/唤醒分流
     _negotiate_ports()
