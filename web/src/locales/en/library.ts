@@ -12,6 +12,12 @@ const library: Partial<Record<MessageKey, string>> = {
   'library.error.network': 'Cannot reach the server',
 
   'library.empty.library.title': 'The store is still empty',
+  /* Proxy diagnosis (resolve returned null = direct): the usual reason auto-fetching is idle */
+  'library.empty.library.noProxy':
+    'No proxy is configured — automatic crawls will not start without one, so no price data comes in.',
+  'library.empty.library.goProxy': 'Set up a proxy',
+  /* Empty watch pool: one-tap jump to manual import */
+  'library.empty.library.goImport': 'Add games',
   'library.empty.library.pool':
     'The watch pool holds {n} games, but no price data has been crawled yet.',
   'library.empty.library.crawling': 'A crawl is running — results will show up here once it finishes.',
