@@ -164,7 +164,7 @@
 .region-dropdown-btn:hover { background: var(--success-a30); }
 .region-dropdown-btn.active { background: var(--success); color: var(--ink-on-fill); font-weight: 600; }
 
-/* ─── 下拉菜单幕布（对齐 design-system.html el-select-dropdown）─── */
+/* ─── 下拉菜单幕布（卡片底 + 柔和描边 + 浮层圆角，与站内弹层同一版式）─── */
 .region-dropdown-menu {
     display: none;
     position: absolute;

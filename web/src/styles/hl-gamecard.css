@@ -1309,8 +1309,11 @@
 .game-card.list-layout .info {
     flex: 1;
     display: grid;
-    /* 1: Title, 2: Ratings, 3: SteamBtn, 4: PriceSection, 5: DetailsBtn */
-    grid-template-columns: minmax(140px, 1.2fr) minmax(120px, 1fr) 90px 220px 90px;
+    /* 1: Title, 2: Ratings, 3: SteamBtn, 4: PriceSection, 5: DetailsBtn
+       第 5 列按内容宽（全区价格 + 走势两键，flex 行内不换行）：原先固定 90px
+       装不下约 150px 的两键，居中溢出后左压差价列、右被卡片 overflow 裁掉
+       （「走势」按钮只露半个字的来源）。 */
+    grid-template-columns: minmax(120px, 1.2fr) minmax(100px, 1fr) 90px 220px minmax(156px, max-content);
     align-items: center;
     padding: 0 16px;
     gap: 12px;
@@ -1378,7 +1381,11 @@
     padding: 0;
     background: transparent;
     display: grid;
-    grid-template-columns: 50px 70px 60px; /* 固定三列：国区、最低价、差价 */
+    /* 固定三列：国区、全区最低、差价。列宽按**实际内容宽**定，不留「靠溢出
+       挤进 gap」的余地——旧值 50/70/60 装不下国区价（约 58px）与
+       「旗+区名+奖牌」（约 79px），两列各自溢出到 12px 间隙里，视觉上
+       「差价与全区低价挨在一起」。 */
+    grid-template-columns: 58px 88px 50px;
     align-items: center;
     justify-content: end;
     gap: 12px;

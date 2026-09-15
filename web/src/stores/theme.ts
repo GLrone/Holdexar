@@ -18,6 +18,15 @@ export const useThemeStore = defineStore('theme', () => {
     document.documentElement.classList.toggle('dark', isDark.value)
     document.documentElement.style.colorScheme = isDark.value ? 'dark' : 'light'
     localStorage.setItem(STORAGE_KEY, isDark.value ? 'dark' : 'light')
+    // 主题镜像到本地库（app_settings.ui.theme）：关闭弹窗是独立 WinForms
+    // 窗，读不到 localStorage，靠这份镜像跟随主题（初始化 + 每次切换都会
+    // 走到这里，镜像始终新鲜）。fire-and-forget：失败静默——镜像缺位只
+    // 影响弹窗配色，无碍功能。
+    void fetch('/api/v1/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ theme: isDark.value ? 'dark' : 'light' }),
+    }).catch(() => {})
   }
 
   function toggle() {
