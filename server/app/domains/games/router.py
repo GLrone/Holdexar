@@ -26,7 +26,8 @@ async def list_games(
     limit: int = Query(40, ge=1, le=100),
     after: str | None = None,
     q: str | None = Query(None, max_length=200),
-    region: str = Query("", max_length=5),
+    # 6 = "locked"（锁国区特殊项；常规区码 2 字符）
+    region: str = Query("", max_length=6),
     filterMode: str = Query("global"),
     onlyDiscounted: bool = False,
     isLowest: bool = False,
