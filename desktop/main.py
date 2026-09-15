@@ -56,7 +56,7 @@ else:
     if (_bundled_server / "app" / "main.py").is_file() and str(_bundled_server) not in sys.path:
         sys.path.insert(0, str(_bundled_server))
 from app.core.app_info import APP_NAME, APP_SLUG, ENV_PREFIX  # noqa: E402
-from app.core.paths import is_frozen, resolve_data_dir  # noqa: E402
+from app.core.paths import data_dir_filename, is_frozen, resolve_data_dir  # noqa: E402
 
 # WebView2 Runtime（Evergreen 固定产品 GUID）注册表探测 + 官方离线安装链
 _WEBVIEW2_REG_KEYS = (
@@ -141,18 +141,19 @@ def _probe_running(timeout_s: float = 8.0, quick: bool = False) -> bool:
     见 _health_is_ours——端口撞车的别家应用不得被当成自己唤醒）；
     留重试窗口覆盖"双击两次图标、前者还在启动中"的竞态。
     quick=True 时单发一次（150ms 超时）——用于锁已被本进程持有、
+    本地回环请求一律 trust_env=False 直连（同 _wait_health 顶部说明）。
     仅需排除竞态窗口的场景，避免正常冷启动路径白等数秒。
     """
     url = f"http://{SERVER_HOST}:{SERVER_PORT}/api/v1/health"
     if quick:
         try:
-            return _health_is_ours(httpx.get(url, timeout=0.15))
+            return _health_is_ours(httpx.get(url, timeout=0.15, trust_env=False))
         except Exception:  # noqa: BLE001
             return False
     deadline = time.time() + timeout_s
     while True:
         try:
-            if _health_is_ours(httpx.get(url, timeout=1.5)):
+            if _health_is_ours(httpx.get(url, timeout=1.5, trust_env=False)):
                 return True
         except Exception:  # noqa: BLE001 无实例/未就绪均属预期
             pass
@@ -325,6 +326,15 @@ def _app_icon() -> str | None:
 
 
 def _wait_health(timeout: float) -> bool:
+    """轮询本机健康端点直到就绪/超时。
+
+    **本机回环请求必须 trust_env=False 直连**：httpx 在 Windows 上读注册表
+    系统代理（Clash/加速器类常开），且其 no-proxy 判定按逗号分隔——注册表
+    ProxyOverride 是分号分隔（localhost;127.*;…），整串被当成一个主机名，
+    127.0.0.1 的例外**形同虚设**。开着系统代理时，发往本机的 health 探测
+    会被转发到代理端口，服务明明已监听却探测不通——等待页永远转圈、
+    watchdog 误报"服务启动失败"（实测复现）。HTTP(S)_PROXY 环境变量同理。
+    """
     deadline = time.time() + timeout
     url = f"http://{SERVER_HOST}:{SERVER_PORT}/api/v1/health"
     while time.time() < deadline:
@@ -332,11 +342,25 @@ def _wait_health(timeout: float) -> bool:
             # 身份校验同 _probe_running：万一端口号被外来服务抢先绑定，
             # 对方对 health 回 200 也不算本应用就绪（否则窗口会加载到
             # 对方的页面还显示"服务已就绪"）
-            if _health_is_ours(httpx.get(url, timeout=2.0)):
+            if _health_is_ours(httpx.get(url, timeout=2.0, trust_env=False)):
                 return True
         except Exception:  # noqa: BLE001 —— 服务未就绪属预期
             time.sleep(0.3)
     return False
+
+
+def _server_port_listening() -> bool:
+    """TCP 层探测服务端口是否真在监听（socket 直连，不经 httpx 代理层）。
+
+    watchdog 用它定位「health 超时」的责任方：TCP 通 + health 超时 =
+    服务活着、探测链路被拦（代理/TUN 类软件劫持本机回环的残留形态）；
+    TCP 不通 = 服务进程真没起来，走原始报错。
+    """
+    try:
+        with socket.create_connection((SERVER_HOST, SERVER_PORT), timeout=2.0):
+            return True
+    except OSError:
+        return False
 
 
 def _wait_and_navigate(window, app_url: str) -> None:
@@ -698,9 +722,11 @@ class DesktopApi:
 
         proxy_url: str | None = None
         try:
+            # 本机回环请求直连（trust_env=False），不吃系统代理——同 _wait_health
             response = httpx.get(
                 f"http://{SERVER_HOST}:{SERVER_PORT}/api/v1/proxies/resolve",
                 timeout=3.0,
+                trust_env=False,
             )
             data = response.json() if response.status_code == 200 else {}
             proxy_url = data.get("proxyUrl") or None
@@ -822,8 +848,11 @@ class DesktopApi:
         # 打包态亦在本机）；失败静默降级为无侧栏，不阻断登录窗
         known_accounts: list[dict] = []
         try:
+            # 本机回环请求直连（trust_env=False），不吃系统代理——同 _wait_health
             resp = httpx.get(
-                f"http://{SERVER_HOST}:{SERVER_PORT}/api/v1/account/list", timeout=3.0
+                f"http://{SERVER_HOST}:{SERVER_PORT}/api/v1/account/list",
+                timeout=3.0,
+                trust_env=False,
             )
             if resp.status_code == 200:
                 known_accounts = [
@@ -1391,89 +1420,515 @@ def _create_tray(window) -> object | None:
     return tray
 
 
-def _build_close_dialog(owner=None):
-    """构建「最小化 / 退出程序」二选一对话框（WinForms 自绘）。
+# ── 关闭弹窗外观（色值对齐 tokens.css 两档主题）────────────────────────
+# 弹窗是独立 WinForms 窗，主题跟随网页（_app_theme 读 app_settings 镜像）；
+# WinForms 无 CSS 变量体系，模块级只放字体与几何常量，配色全在 _DIALOG_THEMES。
+_DIALOG_FONT_FAMILY = "Microsoft YaHei UI"  # 同网页 --font-sans 的中文回退栈
+# 窗体圆角半径（无边框窗的圆滑轮廓，Region 裁切 + Paint 描边共用）
+_DIALOG_CORNER_RADIUS = 12
+
+# 双主题配色（色值对齐 tokens.css 两档）：深色 = html.dark 档，浅色 = :root 档。
+# 模块级 RGB 元组，绘制处经 _c()（Color.FromArgb(*palette[name])）取用。
+_DIALOG_THEMES: dict[str, dict] = {
+    "dark": {
+        "bg": (27, 40, 56),              # #1b2838
+        "border": (44, 62, 82),          # #2c3e52
+        "head": (255, 255, 255),         # 标题白
+        "text": (199, 213, 224),         # #c7d5e0
+        "subtle": (143, 152, 160),       # #8f98a0
+        "accent_fill": (102, 192, 244),  # #66c0f4
+        "accent_hover": (142, 208, 248),  # #8ed0f8
+        "on_fill": (16, 32, 46),         # #10202e
+        "danger_fill": (231, 76, 60),    # #e74c3c
+        "danger_hover": (192, 57, 43),   # #c0392b
+        "on_danger": (255, 255, 255),
+        "close_fg": (154, 168, 181),     # #9aa8b5
+        "close_fg_hover": (255, 255, 255),
+        # 关闭键圆形悬停底：半透明白（FromArgb 参数序是 (a, r, g, b)）
+        "close_hover_bg": (32, 255, 255, 255),
+        "logo": "logo_dark.ico",         # 深色面 → 浅色（白色线条）logo
+    },
+    "light": {
+        "bg": (247, 250, 253),           # #f7fafd（surface-pop-deep）
+        "border": (219, 228, 238),       # 浅色描边档
+        "head": (23, 32, 42),            # #17202a text-primary
+        "text": (51, 71, 90),            # #33475a text-secondary
+        "subtle": (100, 119, 140),       # #64778c text-muted
+        "accent_fill": (124, 185, 226),  # #7cb9e2 accent-fill
+        "accent_hover": (95, 168, 216),  # #5fa8d8 accent-fill-hover
+        "on_fill": (16, 32, 46),         # #10202e
+        "danger_fill": (192, 57, 43),    # #c0392b danger
+        "danger_hover": (150, 40, 27),   # #96281b danger-deep
+        "on_danger": (255, 255, 255),
+        "close_fg": (100, 119, 140),     # #64778c（浅色面叉线用深灰蓝）
+        "close_fg_hover": (23, 32, 42),  # #17202a
+        "close_hover_bg": (26, 23, 32, 42),  # 半透明深（a,r,g,b）
+        "logo": "logo_light.ico",        # 浅色面 → 深色线条 logo
+    },
+}
+
+
+def _app_theme() -> str:
+    """应用主题偏好：'light' / 'dark'（读不到按深色兜底）。
+
+    网页主题本体在 localStorage（桌面壳读不到），前端 apply() 把它镜像进
+    app_settings（ui.theme，初始化与每次切换都写）——这里同步只读查询。
+    """
+    try:
+        import sqlite3
+
+        db_path = resolve_data_dir(APP_SLUG) / data_dir_filename(APP_SLUG)
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            row = con.execute(
+                "SELECT value_json FROM app_settings WHERE key = 'ui.theme'"
+            ).fetchone()
+        finally:
+            con.close()
+        if row and row[0] in ("dark", "light"):
+            return str(row[0])
+    except Exception:  # noqa: BLE001 —— 读不到按深色兜底
+        pass
+    return "dark"
+
+
+def _brand_logo_path(theme: str = "dark") -> str | None:
+    """弹窗标题栏 logo：**深色面用浅色（白色线条）版**，浅色面用深色版。
+
+    命名语义：logo_dark / logo_light 指「给哪种主题用」——logo_dark 是
+    深色主题下使用的白色线条版，logo_light 是浅色主题下的深色线条版，
+    反了会糊进底色里看不见。打包态前端产物收在 web/dist/assets/（vite
+    把 public/assets 原样复制），找不到回退窗口图标 _app_icon()。
+    """
+    name = "logo_light.ico" if theme == "light" else "logo_dark.ico"
+    candidates: list[Path] = []
+    if getattr(sys, "frozen", False):
+        mei = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+        candidates.append(mei / "web" / "dist" / "assets" / name)
+    else:
+        candidates.append(PROJECT_ROOT / "web" / "public" / "assets" / name)
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return _app_icon()
+
+
+def _round_path(rect, radius: int):
+    """圆角矩形路径（左上/右上/右下/左下四段圆弧闭合）。"""
+    from System.Drawing.Drawing2D import GraphicsPath
+
+    path = GraphicsPath()
+    d = radius * 2
+    path.AddArc(rect.X, rect.Y, d, d, 180, 90)
+    path.AddArc(rect.Right - d, rect.Y, d, d, 270, 90)
+    path.AddArc(rect.Right - d, rect.Bottom - d, d, d, 0, 90)
+    path.AddArc(rect.X, rect.Bottom - d, d, d, 90, 90)
+    path.CloseFigure()
+    return path
+
+
+def _style_surface(control) -> None:
+    """把控件切成自绘模式（无系统边框/背景，交给 Paint 事件画主题外观）。
+
+    **必须用事件绑定而非 override OnPaint**：pythonnet 对 Python 子类的
+    虚方法分派不生效（实测 override 不被回调），CLR→Python 只有事件通路
+    （同托盘 NotifyIcon 的沉淀）。
+    """
+    from System.Windows.Forms import ControlStyles
+
+    control.SetStyle(
+        ControlStyles.UserPaint
+        | ControlStyles.AllPaintingInWmPaint
+        | ControlStyles.OptimizedDoubleBuffer,
+        True,
+    )
+
+
+def _make_close_button(
+    dialog_result,
+    location,
+    size=36,
+    bg=None,
+    fg=None,
+    fg_hover=None,
+    hover_bg=None,
+) -> object:
+    """右上角关闭键（圆滑设计覆盖层：圆形悬停底 + 细叉线）。
+
+    系统标题栏的方形 X 没有任何圆滑可调（DWM 只能染底色），故以自绘按键
+    覆盖：Label 载体（无 Button 的系统边框/焦点框残留），Paint 事件画
+    圆形悬停底与叉线；点击时手动置窗体 DialogResult，语义与
+    Button.DialogResult 一致。叉线/悬停色按主题传入（浅色面深叉线、深色面
+    浅叉线）。
+    """
+    from System.Drawing import Color, Point, Rectangle, Size, SolidBrush, Pen
+    from System.Drawing.Drawing2D import SmoothingMode
+    from System.Windows.Forms import Cursors, Label as WinLabel
+
+    button = WinLabel()
+    button.AutoSize = False
+    button.Text = ""
+    button.AccessibleName = "关闭"
+    button.Size = Size(size, size)
+    button.Location = Point(*location)
+    button.Cursor = Cursors.Hand
+    if bg is not None:
+        button.BackColor = bg
+    _style_surface(button)
+
+    state = {"hover": False}
+
+    def _on_paint(sender, e):
+        g = e.Graphics
+        g.SmoothingMode = SmoothingMode.AntiAlias
+        if bg is not None:
+            g.FillRectangle(SolidBrush(bg), Rectangle(0, 0, button.Width, button.Height))
+        if state["hover"]:
+            # 圆形悬停底：hover 高亮是圆的，不是系统那种方块。
+            # fg/fg_hover/hover_bg 已是 Color 对象（主题表经 _c() 转换后传入），
+            # 直接用——对 Color 做 * 展开会抛「argument after * must be an
+            # iterable, not Color」并弹 CLR 异常对话框（实测）。
+            g.FillEllipse(
+                SolidBrush(hover_bg),
+                Rectangle(0, 0, button.Width - 1, button.Height - 1),
+            )
+        pen = Pen(
+            fg_hover if state["hover"] else fg,
+            1.6,
+        )
+        inset = size * 0.34
+        far = size - inset
+        g.DrawLine(pen, inset, inset, far, far)
+        g.DrawLine(pen, far, inset, inset, far)
+
+    def _on_click(sender, e):
+        form = button.FindForm()
+        if form is not None:
+            form.DialogResult = dialog_result
+
+    def _on_enter(sender, e):
+        state["hover"] = True
+        button.Invalidate()
+
+    def _on_leave(sender, e):
+        state["hover"] = False
+        button.Invalidate()
+
+    button.Paint += _on_paint
+    button.Click += _on_click
+    button.MouseEnter += _on_enter
+    button.MouseLeave += _on_leave
+    return button
+
+
+def _build_close_dialog(owner=None, theme: str | None = None):
+    """构建「最小化 / 退出程序」二选一对话框（WinForms 自绘，随应用主题）。
 
     返回 (form, mapping)：mapping 把 ShowDialog 的 DialogResult 译成意图
-    （'minimize' / 'quit'）。系统 MessageBox 的按键文案只有是/否/确定/取消
-    固定几组，出不了「最小化」「退出程序」动作词，故用小 Form 自绘两个
-    动作键；ControlBox=False 去掉右上角 X——二选一语义下没有「不选」的
-    退路（「留在窗口」选项已按需求移除）。回车默认 = 最小化
-    （AcceptButton，安全侧：误回车不杀进程）。
+    （'minimize' / 'quit'；Cancel = 右上角圆滑关闭键，留在窗口不动）。系统
+    MessageBox 的按键文案只有是/否/确定/取消固定几组，出不了「最小化」
+    「退出程序」动作词，故整窗自绘。
+
+    外观（对齐主界面 + 逐条要求）：
+    - **随应用主题**：theme 缺省时读 app_settings 镜像（ui.theme，前端
+      apply() 初始化与每次切换都写），深浅两套配色对齐 tokens.css 两档；
+      标题栏 logo 也按面取版（深色面浅色线条版 / 浅色面深色线条版）；
+    - **无边框自绘标题栏**：logo + 标题 + 右上角圆滑关闭键（圆形悬停底 +
+      细叉线——系统方形 X 无圆滑可言，DWM 也只能染底色，故自绘覆盖）；
+    - **窗体圆角 + 描边**：无边框窗用 Region 裁圆滑轮廓，Paint 画 1px 描边；
+    - **按键圆角纯色双色**：安全动作（最小化）品牌蓝实底，终止动作（退出
+      程序）危险红实底——两色即两种动作性质；
+    - **无问号图标**；字号用像素单位（pt 是物理单位会随 DPI 放大，与像素
+      布局混用会「字大了框没大」）。
+    回车 = 最小化（AcceptButton，安全侧）；Esc = 留在窗口（KeyPreview +
+    KeyDown）。
     """
     import clr  # noqa: F401 —— pythonnet 装配件
 
     clr.AddReference("System.Drawing")
     clr.AddReference("System.Windows.Forms")
     from System.Drawing import (
+        Color,
+        Font,
         FontStyle,
+        GraphicsUnit,
+        Icon,
+        Pen,
         Point,
+        Rectangle,
+        RectangleF,
         Size,
-        SystemIcons,
+        SolidBrush,
+        StringFormat,
+        StringAlignment,
     )
+    from System.Drawing.Drawing2D import GraphicsPath, SmoothingMode
     from System.Windows.Forms import (
+        AutoScaleMode,
         Button as WinButton,
+        ControlStyles,
+        Cursors,
         DialogResult,
         Form as WinForm,
         FormBorderStyle,
         FormStartPosition,
         Label as WinLabel,
+        MouseButtons,
         PictureBox,
         PictureBoxSizeMode,
     )
+    from System.Drawing import Region
 
-    def _button(text: str, dialog_result, x: int) -> WinButton:
+    theme = theme or _app_theme()
+    palette = _DIALOG_THEMES.get(theme, _DIALOG_THEMES["dark"])
+
+    def _c(name: str) -> Color:
+        return Color.FromArgb(*palette[name])
+
+    # 字号用**像素单位**（GraphicsUnit.Pixel）而非 pt：pt 是物理单位，会随
+    # 系统 DPI 放大，而布局是像素——两者混用就会「字大了框没大」。统一像素
+    # 后任何 DPI 下比例一致。
+    font_title = Font(_DIALOG_FONT_FAMILY, 15.0, FontStyle.Bold, GraphicsUnit.Pixel)
+    font_head = Font(_DIALOG_FONT_FAMILY, 17.0, FontStyle.Bold, GraphicsUnit.Pixel)
+    font_body = Font(_DIALOG_FONT_FAMILY, 14.0, FontStyle.Regular, GraphicsUnit.Pixel)
+    font_button = Font(_DIALOG_FONT_FAMILY, 15.0, FontStyle.Bold, GraphicsUnit.Pixel)
+
+    # 布局（客户区 520×240）：自绘标题栏 52 → 正文 → 按键行 y=170
+    WIDTH, HEIGHT = 520, 240
+    BTN_W, BTN_H, BTN_GAP = 200, 44, 16
+    BTN_Y = 170
+    BTN_X0 = (WIDTH - (BTN_W * 2 + BTN_GAP)) // 2  # 组居中：起点 52
+
+    def _round_button(
+        text: str, dialog_result, x: int, y: int, font, fill, hover, text_color
+    ) -> WinButton:
+        """圆角纯色按键（自绘）。
+
+        为什么不用 FlatStyle.Flat：它的方角 + 系统描边 + 深灰面色正是「按键
+        突兀」的来源，且没有可调的圆角。这里 UserPaint + Paint 事件自绘抗锯齿
+        圆角矩形——**不用 override OnPaint**：pythonnet 对 Python 子类的虚方法
+        分派不生效（实测 override 不被回调，事件绑定才是 CLR→Python 的既有
+        通路，同托盘 NotifyIcon）。DrawString 文字框必须 RectangleF（pythonnet
+        不做 Rectangle→RectangleF 隐式转换，传 Rectangle 会抛 CLR 异常）。
+        载体保留 Button：DialogResult / AcceptButton（回车默认）语义齐全。
+        """
         btn = WinButton()
         btn.Text = text
+        btn.AccessibleName = text  # 自绘按键给语义名（读屏/测试都按它找控件）
         btn.DialogResult = dialog_result
-        btn.Size = Size(132, 34)
-        btn.Location = Point(x, 104)
+        btn.Size = Size(BTN_W, BTN_H)
+        btn.Location = Point(x, y)
+        btn.Font = font
+        btn.Cursor = Cursors.Hand
+        btn.SetStyle(
+            ControlStyles.UserPaint
+            | ControlStyles.AllPaintingInWmPaint
+            | ControlStyles.OptimizedDoubleBuffer,
+            True,
+        )
+        state = {"fill": fill}
+
+        def _on_paint(sender, e):
+            g = e.Graphics
+            g.SmoothingMode = SmoothingMode.AntiAlias
+            rect = Rectangle(0, 0, btn.Width - 1, btn.Height - 1)
+            radius = 9
+            path = GraphicsPath()
+            path.AddArc(rect.X, rect.Y, radius, radius, 180, 90)
+            path.AddArc(rect.Right - radius, rect.Y, radius, radius, 270, 90)
+            path.AddArc(rect.Right - radius, rect.Bottom - radius, radius, radius, 0, 90)
+            path.AddArc(rect.X, rect.Bottom - radius, radius, radius, 90, 90)
+            path.CloseFigure()
+            g.FillPath(SolidBrush(state["fill"]), path)
+            fmt = StringFormat()
+            fmt.Alignment = StringAlignment.Center
+            fmt.LineAlignment = StringAlignment.Center
+            g.DrawString(
+                text,
+                btn.Font,
+                SolidBrush(text_color),
+                RectangleF(0.0, 0.0, float(btn.Width), float(btn.Height)),
+                fmt,
+            )
+
+        def _on_enter(sender, e):
+            state["fill"] = hover
+            btn.Invalidate()
+
+        def _on_leave(sender, e):
+            state["fill"] = fill
+            btn.Invalidate()
+
+        btn.Paint += _on_paint
+        btn.MouseEnter += _on_enter
+        btn.MouseLeave += _on_leave
         return btn
 
     dialog = WinForm()
     dialog.Text = f"关闭 {APP_NAME}"
-    dialog.FormBorderStyle = FormBorderStyle.FixedSingle
-    dialog.MaximizeBox = False
-    dialog.MinimizeBox = False
+    # 无边框自绘：标题栏（logo/标题/圆滑关闭键）全部自绘，拖动转交系统
+    # （WM_NCLBUTTONDOWN）。AutoScaleMode.None + 全程像素坐标（含字号），
+    # 不掺 DPI 换算——任何 DPI 下比例一致（换算方案在部分机器上把窗口撑歪
+    # 过，稳定优先一律不做）。
+    dialog.AutoScaleMode = getattr(AutoScaleMode, "None")
+    dialog.FormBorderStyle = getattr(FormBorderStyle, "None")
+    dialog.BackColor = _c("bg")
+    dialog.ForeColor = _c("text")
     dialog.ShowInTaskbar = False
-    dialog.ControlBox = False
     dialog.StartPosition = (
         FormStartPosition.CenterParent
         if owner is not None
         else FormStartPosition.CenterScreen
     )
-    dialog.ClientSize = Size(416, 156)
+    dialog.ClientSize = Size(WIDTH, HEIGHT)
 
-    icon = PictureBox()
-    icon.Image = SystemIcons.Question.ToBitmap()
-    icon.SizeMode = PictureBoxSizeMode.Zoom
-    icon.Location = Point(20, 20)
-    icon.Size = Size(32, 32)
+    # 窗口图标 = 品牌 logo（任务栏/Alt-Tab；按主题取线条版）
+    logo_bitmap = None
+    icon_path = _brand_logo_path(theme)
+    if icon_path:
+        try:
+            logo_bitmap = Icon(icon_path).ToBitmap()
+            dialog.Icon = Icon(icon_path)
+        except Exception:  # noqa: BLE001 —— 图标加载失败不影响弹窗
+            logo_bitmap = None
 
+    def _on_form_paint(sender, e):
+        """窗底：圆角填充 + 1px 描边（无边框窗没有系统边框可依）。"""
+        g = e.Graphics
+        g.SmoothingMode = SmoothingMode.AntiAlias
+        path = _round_path(
+            Rectangle(0, 0, dialog.Width - 1, dialog.Height - 1),
+            _DIALOG_CORNER_RADIUS,
+        )
+        g.FillPath(SolidBrush(_c("bg")), path)
+        g.DrawPath(Pen(_c("border"), 1.0), path)
+
+    def _apply_round_region(*_args):
+        """窗形裁成圆滑轮廓（Region 不随 DPI 自动换算，按实际尺寸重算）。"""
+        try:
+            dialog.Region = Region(
+                _round_path(
+                    Rectangle(0, 0, dialog.Width, dialog.Height),
+                    _DIALOG_CORNER_RADIUS,
+                )
+            )
+        except Exception:  # noqa: BLE001 —— 圆角失败退化为方窗，功能不受影响
+            pass
+
+    def _start_drag(sender, e):
+        """自绘标题栏的拖动：转交系统标题栏拖动（WM_NCLBUTTONDOWN）。"""
+        if e.Button != MouseButtons.Left:
+            return
+        try:
+            import ctypes
+
+            ctypes.windll.user32.ReleaseCapture()
+            ctypes.windll.user32.SendMessageW(dialog.Handle.ToInt64(), 0xA1, 0x2, 0)
+        except Exception:  # noqa: BLE001 —— 拖动失败不影响其它交互
+            pass
+
+    dialog.Paint += _on_form_paint
+    _apply_round_region()
+    dialog.SizeChanged += _apply_round_region
+    dialog.MouseDown += _start_drag
+
+    # ── 标题栏：品牌 logo（按主题取线条版）+ 标题 + 圆滑关闭键 ──
+    if logo_bitmap is not None:
+        logo = PictureBox()
+        logo.Image = logo_bitmap
+        logo.SizeMode = PictureBoxSizeMode.Zoom
+        logo.Size = Size(20, 20)
+        logo.Location = Point(22, 16)
+        logo.BackColor = _c("bg")
+        logo.AutoSize = False
+        logo.MouseDown += _start_drag
+        dialog.Controls.Add(logo)
+
+    title = WinLabel()
+    title.Text = f"关闭 {APP_NAME}"
+    title.AutoSize = False
+    title.Size = Size(320, 24)
+    title.Location = Point(52, 15)
+    title.Font = font_title
+    title.ForeColor = _c("head")
+    title.BackColor = _c("bg")
+    title.MouseDown += _start_drag
+    dialog.Controls.Add(title)
+
+    btn_close = _make_close_button(
+        DialogResult.Cancel,
+        (WIDTH - 54, 12),
+        36,
+        bg=_c("bg"),
+        fg=_c("close_fg"),
+        fg_hover=_c("close_fg_hover"),
+        hover_bg=_c("close_hover_bg"),
+    )
+    dialog.Controls.Add(btn_close)
+
+    # ── 正文 ──
     head = WinLabel()
     head.Text = f"要如何关闭 {APP_NAME}？"
-    head.AutoSize = True
-    head.Location = Point(66, 20)
-    from System.Drawing import Font  # noqa: E402 —— 同装配件第二件，就近导入
-
-    head.Font = Font(head.Font.FontFamily, 11.0, FontStyle.Bold)
+    head.AutoSize = False
+    head.Size = Size(WIDTH - 56, 28)
+    head.Location = Point(28, 74)
+    head.Font = font_head
+    head.ForeColor = _c("head")
+    head.BackColor = _c("bg")
+    dialog.Controls.Add(head)
 
     detail = WinLabel()
     detail.Text = "最小化到托盘后，应用仍在后台继续更新数据。"
-    detail.AutoSize = True
-    detail.Location = Point(66, 52)
-
-    btn_min = _button("最小化", DialogResult.Yes, 136)
-    btn_quit = _button("退出程序", DialogResult.No, 276)
-
-    dialog.AcceptButton = btn_min  # 回车 = 最小化（安全侧）
-    dialog.Controls.Add(icon)
-    dialog.Controls.Add(head)
+    detail.AutoSize = False
+    detail.Size = Size(WIDTH - 56, 22)
+    detail.Location = Point(28, 110)
+    detail.Font = font_body
+    detail.ForeColor = _c("subtle")
+    detail.BackColor = _c("bg")
     dialog.Controls.Add(detail)
+
+    # ── 按键：圆角纯色双色（两色分工动作性质）──
+    btn_min = _round_button(
+        "最小化",
+        DialogResult.Yes,
+        BTN_X0,
+        BTN_Y,
+        font_button,
+        _c("accent_fill"),
+        _c("accent_hover"),
+        _c("on_fill"),
+    )
+    btn_quit = _round_button(
+        "退出程序",
+        DialogResult.No,
+        BTN_X0 + BTN_W + BTN_GAP,
+        BTN_Y,
+        font_button,
+        _c("danger_fill"),
+        _c("danger_hover"),
+        _c("on_danger"),
+    )
     dialog.Controls.Add(btn_min)
     dialog.Controls.Add(btn_quit)
 
-    return dialog, {DialogResult.Yes: "minimize", DialogResult.No: "quit"}
+    dialog.AcceptButton = btn_min  # 回车 = 最小化（安全侧）
+    # Esc = 留在窗口（回车交给 AcceptButton）：圆滑关闭键是 Label 载体，
+    # 接不了 CancelButton，键盘语义由 KeyPreview + KeyDown 兜住。
+    dialog.KeyPreview = True
+
+    def _on_key_down(sender, e):
+        from System.Windows.Forms import Keys
+
+        if e.KeyCode == Keys.Escape:
+            dialog.DialogResult = DialogResult.Cancel
+
+    dialog.KeyDown += _on_key_down
+
+    return dialog, {
+        DialogResult.Yes: "minimize",
+        DialogResult.No: "quit",
+        DialogResult.Cancel: "stay",
+    }
 
 
 def _ask_close_intent(owner=None) -> str:
@@ -1504,7 +1959,7 @@ def _ask_close_intent(owner=None) -> str:
 
 
 def _make_closing_guard(window):
-    """关窗守卫：点 X 先问意图——最小化到托盘 / 退出程序（二选一）。
+    """关窗守卫：点 X 先问意图——最小化到托盘 / 退出程序（弹窗 X = 留在窗口）。
 
     pywebview closing 事件契约：handler 返回 **False** = 取消关闭
     （closing 事件 should_lock=True，handler 同步跑在 UI 线程，返回值
@@ -1515,8 +1970,11 @@ def _make_closing_guard(window):
         if _tray_state["quit"]:
             return True  # 托盘「退出」：放行真关闭
         owner = getattr(window, "native", None)
-        if _ask_close_intent(owner) == "quit":
+        intent = _ask_close_intent(owner)
+        if intent == "quit":
             return True  # 放行真关闭：closed 事件里 os._exit(0) 终结进程
+        if intent == "stay":
+            return False  # 弹窗右上角 X：取消关闭，窗口原地不动
         try:
             window.hide()
         except Exception:  # noqa: BLE001
@@ -1737,6 +2195,12 @@ def main() -> None:
             hint = ""
             if "10048" in detail or "already in use" in detail.lower():
                 hint = f"\n\n[提示] 端口 {SERVER_PORT} 绑定失败，疑似被其他程序占用。"
+            if not detail and _server_port_listening():
+                hint = (
+                    "\n\n[提示] 服务进程在监听，但健康探测被拦截——疑似"
+                    "代理/加速器类软件（系统代理或 TUN 模式）劫持了本机回环流量。"
+                    "关闭其系统代理/TUN 后重试，或重启应用。"
+                )
             _alert(
                 f"服务启动失败（{HEALTH_TIMEOUT:.0f}s 内健康检查未通过）。{hint}\n\n"
                 + (detail[-1500:] if detail else "详细错误见 data/logs 日志。")
