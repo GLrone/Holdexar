@@ -955,11 +955,19 @@ export const systemApi = {
     request<{ removed: boolean }>('DELETE', `/system/backup/${encodeURIComponent(name)}`),
   // 应用更新（GitHub Releases）
   updateCheck: () => request<UpdateCheckResult>('GET', '/system/update-check'),
-  updateDownload: (tag: string, sha256?: string | null, asset?: string | null) =>
+  /** 发起下载（后端 fire-and-forget，进度走 updateProgress 轮询）。
+      size = 清单体积：镜像分块响应不给 Content-Length 时后端用它算百分比 */
+  updateDownload: (
+    tag: string,
+    sha256?: string | null,
+    asset?: string | null,
+    size?: number | null,
+  ) =>
     request<{ started: boolean }>('POST', '/system/update-download', {
       tag,
       sha256: sha256 ?? null,
       asset: asset ?? null,
+      size: size ?? null,
     }),
   updateProgress: () => request<UpdateProgress>('GET', '/system/update-progress'),
   updatePending: () => request<UpdatePending>('GET', '/system/update-pending'),
@@ -1146,6 +1154,8 @@ export const proxiesApi = {
       checked?: number
       alive?: number
     }>('POST', `/proxies/subscriptions/${id}/import`),
+  /** 当前策略下解析出的代理 URL（null=直连/无可用代理）；商店页空态诊断用 */
+  resolveProxy: () => request<{ proxyUrl: string | null }>('GET', '/proxies/resolve'),
   clashStatus: () => request<ClashStatus>('GET', '/proxies/clash'),
   clashInstall: () =>
     request<{ ok: boolean; path?: string; version?: string; error?: string }>(

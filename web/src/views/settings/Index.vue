@@ -186,10 +186,11 @@ const appVersion = ref('')
 const repoSlug = ref('')
 const updateInfo = computed(() => updaterStore.info)
 const updateChecking = computed(() => updaterStore.checking)
-const updateDownloading = ref(false)
-const updateProgress = ref<UpdateProgress | null>(null)
-const updatePendingTag = ref('')
-let progressTimer: ReturnType<typeof setInterval> | null = null
+/* 下载/进度/暂存三态都在 updater store（跨页存活）：切页回来进度续上、
+   不会重复发起下载（重复点会被后端 409 顶回，store 里已按「续看进度」处理） */
+const updateDownloading = computed(() => updaterStore.downloading)
+const updateProgress = computed(() => updaterStore.progress)
+const updatePendingTag = computed(() => updaterStore.pendingTag)
 
 /** 发布页地址（仓库标识由后端 /system/info 下发，前端不硬编码） */
 const releasesUrl = computed(() =>
@@ -203,86 +204,42 @@ async function checkUpdate() {
   }
 }
 
-function stopProgressPolling() {
-  if (progressTimer) {
-    clearInterval(progressTimer)
-    progressTimer = null
-  }
-}
-
-async function pollUpdateProgress() {
-  try {
-    const p = await systemApi.updateProgress()
-    updateProgress.value = p
-    if (!p.running) {
-      stopProgressPolling()
-      if (p.ok) {
-        updatePendingTag.value = updateInfo.value?.tag || ''
-        message.success(t('settings.toast.updateDownloaded'))
-      } else if (p.error) {
-        message.error(t('settings.toast.updateDownloadFailed', { error: p.error }))
-      }
-      updateDownloading.value = false
-    }
-  } catch {
-    stopProgressPolling()
-    updateDownloading.value = false
-  }
-}
-
-/** 校验值：优先用清单下发的 sha256；旧发布（无清单）从 release body 的 SHA256 行兜底 */
-function extractShaFromNotes(notes: string | undefined): string | null {
-  if (!notes) return null
-  const m = notes.match(/^SHA256:\s*([0-9a-fA-F]{64})\s*$/m)
-  return m ? m[1] : null
-}
+/* 下载失败提示：进度进入「终态且带 error」时弹一次（成功提示由全局
+   「已下载，需重启」弹窗承担，见 App.vue 的 updateReady 弹窗） */
+let lastShownError = ''
+watch(
+  () => updaterStore.progress,
+  (p) => {
+    if (!p || p.running || !p.error || p.error === lastShownError) return
+    lastShownError = p.error
+    message.error(t('settings.toast.updateDownloadFailed', { error: p.error }))
+  },
+)
 
 async function downloadUpdate() {
-  if (!updateInfo.value?.tag) return
-  updateDownloading.value = true
-  try {
-    await systemApi.updateDownload(
-      updateInfo.value.tag,
-      updateInfo.value.sha256 ?? extractShaFromNotes(updateInfo.value.notes),
-      updateInfo.value.asset,
-    )
-    stopProgressPolling()
-    progressTimer = setInterval(pollUpdateProgress, 800)
-    pollUpdateProgress()
-  } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
-    updateDownloading.value = false
+  const res = await updaterStore.download()
+  if (!res.ok && res.error && res.error !== 'no_tag') {
+    message.error(t('settings.toast.updateDownloadFailed', { error: res.error }))
   }
 }
 
 async function cancelUpdate() {
   try {
-    await systemApi.updateCancel()
-    updatePendingTag.value = ''
-    updateProgress.value = null
+    await updaterStore.cancel()
     message.success(t('settings.toast.updateCancelled'))
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e))
   }
 }
 
-/** 重启换装：桌面壳 restart_app（pywebview 桥）；浏览器态无桥提示手动 */
+/** 重启换装：桌面壳 restart_app（pywebview 桥，走 updater store 的同一出口）；
+    浏览器态无桥提示手动 */
 async function restartForUpdate() {
-  const bridge = (window as unknown as { pywebview?: { api?: { restart_app?: () => Promise<{ ok: boolean; error?: string }> } } })
-    .pywebview
-  try {
-    if (bridge?.api?.restart_app) {
-      const res = await bridge.api.restart_app()
-      if (!res.ok) message.error(res.error || t('settings.toast.restartFailed'))
-    } else {
-      message.info(t('settings.toast.restartUnsupported'))
-    }
-  } catch {
-    message.error(t('settings.toast.restartError'))
-  }
+  const res = await updaterStore.restartForUpdate()
+  if (res.ok) return
+  if (res.unsupported) message.info(t('settings.toast.restartUnsupported'))
+  else message.error(res.error || t('settings.toast.restartFailed'))
 }
-
-onUnmounted(stopProgressPolling)
 
 async function load() {
   loading.value = true
@@ -294,13 +251,12 @@ async function load() {
     hasApiKey.value = data.account.has_api_key
     await accountStore.load()
     await loadBackups()
-    /* 版本与暂存状态（更新卡片展示；失败静默不阻塞设置页） */
+    /* 版本信息 + 与后端对齐更新状态（暂存/进行中的下载；失败静默不阻塞设置页） */
     try {
       const info = await systemApi.info()
       appVersion.value = info.version
       repoSlug.value = info.repo
-      const pending = await systemApi.updatePending()
-      if (pending.pending && pending.tag) updatePendingTag.value = pending.tag
+      await updaterStore.sync()
     } catch {
       /* 更新状态拉不到不影响设置页 */
     }

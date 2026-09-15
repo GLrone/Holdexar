@@ -14,6 +14,7 @@ import { buildRateMap, formatWalletCny, walletToCny, type RateMap } from '@/lib/
 import { APP_NAME } from '@/appInfo'
 import ProductTour from '@/components/ProductTour.vue'
 import {
+  HlDialog,
   HlIcon,
   HlImg,
   HlLangToggle,
@@ -41,7 +42,24 @@ onMounted(() => {
   accountStore.load()
   // 钱包快照轮询：后端每分钟轮转刷新，前端只读拉取最新快照（不打 Steam）
   setInterval(() => accountStore.load(), 60_000)
+  // 与后端对齐更新状态：上次会话下载好却没重启的暂存，这次启动要弹「重启完成更新」
+  void updaterStore.sync()
 })
+
+/* ── 更新已下载（暂存就绪）：全局重启提示 ──
+   下载/暂存态都在 updater store（跨页存活、后端是唯一事实来源），所以下载在
+   任何页面完成都会在这里浮现；用户关掉 = 稍后重启，更新包保留。 */
+const updateReadyOpen = computed(
+  () => !!updaterStore.pendingTag && !updaterStore.pendingDialogDismissed,
+)
+
+/** 重启换装（桌面壳桥；浏览器态提示手动重启） */
+async function restartForUpdate() {
+  const res = await updaterStore.restartForUpdate()
+  if (res.ok) return
+  if (res.unsupported) message.info(t('settings.toast.restartUnsupported'))
+  else message.error(res.error || t('settings.toast.restartError'))
+}
 
 /* ── 首次启动产品导览 ──
    settings KV `ui.onboarding_done` 判定：标志拉取后为 false → 延时 800ms
@@ -406,6 +424,32 @@ async function manualRefreshWallet() {
 
     <!-- 首次启动产品导览（蒙层+聚光+教练标记气泡；settings KV 判定，自动弹出一次） -->
     <ProductTour v-model="onboardingOpen" />
+
+    <!-- 更新已下载（暂存就绪）：全局提示重启换装。放外壳而非设置页——
+         下载完成后用户可能在任何页面，进度/暂存态都在 updater store（跨页存活），
+         这里只负责「该重启了」这一句。关闭 = 稍后重启，更新包不丢弃。 -->
+    <HlDialog
+      :model-value="updateReadyOpen"
+      :title="t('shell.updateReady.title')"
+      width="420px"
+      @update:model-value="(v: boolean) => !v && updaterStore.dismissPendingDialog()"
+    >
+      <div class="update-ready">
+        <p class="update-ready__text">
+          {{ t('shell.updateReady.body', { version: updaterStore.pendingTag.replace(/^v/, '') }) }}
+        </p>
+        <p class="update-ready__hint">{{ t('shell.updateReady.hint') }}</p>
+      </div>
+      <template #footer>
+        <HlButton variant="text" @click="updaterStore.dismissPendingDialog()">
+          {{ t('shell.updateReady.later') }}
+        </HlButton>
+        <HlButton art="combo" tone="green" @click="restartForUpdate">
+          <HlIcon name="check" />
+          {{ t('shell.updateReady.restart') }}
+        </HlButton>
+      </template>
+    </HlDialog>
   </div>
 </template>
 
@@ -606,6 +650,20 @@ async function manualRefreshWallet() {
   padding: 6px 8px 2px;
   border-top: 1px solid var(--border-soft);
   margin-top: 4px;
+}
+
+/* 更新已下载：全局重启提示 */
+.update-ready__text {
+  margin: 0 0 8px;
+  font-size: 13.5px;
+  line-height: 1.65;
+  color: var(--text-primary);
+}
+.update-ready__hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-muted);
 }
 </style>
 
