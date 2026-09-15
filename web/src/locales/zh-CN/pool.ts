@@ -74,6 +74,7 @@ const pool = {
   'pool.items.kind.follow': '关注',
   'pool.items.kind.wishlist': '愿望单',
   'pool.items.kind.owned': '已购',
+  'pool.items.kind.board': '榜单',
   'pool.items.kind.manual': '手动添加',
   'pool.items.tipAccounts': '追踪账户 {n} 个',
   'pool.items.add': '添加条目',
