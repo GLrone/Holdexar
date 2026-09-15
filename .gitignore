@@ -165,3 +165,7 @@ server/scripts/test_hey*box*.py
 # ── 隔离验证数据目录（本会话/历史会话的迁移演练与爬虫验证临时库，绝不入库）──
 server/_tmp_*/
 server/_tmp_verify_data/
+
+# ── 本会话临时/调研残留（不入库）──
+/_tmp_close_smoke/
+/holdexar-dev/
