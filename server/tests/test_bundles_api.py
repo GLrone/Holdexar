@@ -121,8 +121,11 @@ async def _seed(monkeypatch):
             ]
         )
         await session.commit()
-    # 种子直写绕过服务写入口 → 聚合缓存必须手动失效（每用例起步冷缓存，
-    # 与生产「写入即失效」语义对齐）；用例中途直写由用例自行失效
+    # 种子直写绕过服务写入口 → 排序快照（bundles.min_cny_fen/diff_fen/is_lowest）
+    # 必须显式重建：生产由写侧（刷新链尾/导入/追踪区变更/启动/汇率刷新）触发，
+    # 任何 GET 都不现算。随后失效聚合缓存（每用例起步冷缓存，与生产「写入即
+    # 失效」语义对齐）；用例中途直写由用例自行重建 + 失效
+    await service.refresh_bundle_sort_cache([BID_A, BID_B, BID_C])
     service.invalidate_bundles_cache()
     yield
     service.invalidate_bundles_cache()
@@ -181,19 +184,15 @@ async def test_import_bundle_upserts_and_enqueue(monkeypatch):
 
     enqueued_calls: list[tuple[int, int]] = []
 
-    async def _fake_fetch(session, bundle_id, proxy, *, force_package=False):
+    async def _fake_fetch(session, bundle_id, *, force_package=False):
         assert force_package is False  # bundle 链接不强制 Package 轨
         return _fake_regions(bundle_id)
-
-    async def _fake_proxy():
-        return None
 
     async def _fake_enqueue():
         enqueued_calls.append((1, 2))
         return 1, 2
 
     monkeypatch.setattr(refresh, "_fetch_bundle_regions", _fake_fetch)
-    monkeypatch.setattr(refresh, "_strategy_proxy", _fake_proxy)
     monkeypatch.setattr(refresh, "_enqueue_new_bundle_apps", _fake_enqueue)
 
     result = await refresh.import_bundle(
@@ -265,19 +264,15 @@ async def test_import_bundle_sub_and_errors(monkeypatch):
 
     seen: dict[str, bool] = {}
 
-    async def _fake_fetch(session, bundle_id, proxy, *, force_package=False):
+    async def _fake_fetch(session, bundle_id, *, force_package=False):
         seen["force_package"] = force_package
         return []
 
-    async def _fake_fetch_sub(session, bundle_id, proxy, *, force_package=False):
+    async def _fake_fetch_sub(session, bundle_id, *, force_package=False):
         seen["force_package_sub"] = force_package
         return _fake_regions(bundle_id, mps=True)
 
-    async def _fake_proxy():
-        return None
-
     monkeypatch.setattr(refresh, "_fetch_bundle_regions", _fake_fetch)
-    monkeypatch.setattr(refresh, "_strategy_proxy", _fake_proxy)
     with pytest.raises(ValueError, match="抓取失败"):
         await refresh.import_bundle("https://store.steampowered.com/sub/990202/")
     assert seen["force_package"] is True
@@ -328,6 +323,75 @@ async def test_diff_floor_zero_and_order():
 
 
 @pytest.mark.asyncio
+async def test_sort_snapshot_materialized():
+    """排序快照列：写时重建（双产品隔离 + 追踪区过滤），列表/详情只读快照。"""
+    written = await service.refresh_bundle_sort_cache([BID_A, BID_B, BID_C])
+    assert written == 3  # 三个合成包都回写（无价包置空）
+    async with get_session_factory()() as session:
+        rows = {
+            b.bundle_id: b
+            for b in (
+                await session.execute(
+                    select(Bundle).where(
+                        Bundle.bundle_id.in_([BID_A, BID_B, BID_C])
+                    )
+                )
+            ).scalars()
+        }
+    a = rows[BID_A]
+    # 非 CN 最低 = JP 15000（jp/JP 去重取有价行）；CN 10000 → 国区即最低，差价 0
+    assert a.min_cny_fen == 15000
+    assert a.diff_fen == 0
+    assert a.is_lowest is True
+    # 双产品隔离：RU 污染行（800 分）不进快照，同族行只剩 CN 20000
+    c = rows[BID_C]
+    assert c.min_cny_fen is None
+    assert c.diff_fen == 0
+    assert c.is_lowest is True
+    # 无价包：快照置空（列表靠 regionPrices 空过滤，不靠快照）
+    b = rows[BID_B]
+    assert b.min_cny_fen is None and b.diff_fen == 0 and b.is_lowest is False
+
+
+@pytest.mark.asyncio
+async def test_sort_snapshot_diff_and_incremental():
+    """国区高于外区 → diff = CN − 最低；增量只刷目标包，列表排序读快照。"""
+    async with get_session_factory()() as session:
+        session.add(_bp(BID_A, "RU", 6000, 6000, [APPID_1, APPID_2, APPID_3]))
+        await session.commit()
+    assert await service.refresh_bundle_sort_cache([BID_A]) == 1  # 增量：只刷 A
+    async with get_session_factory()() as session:
+        a = (
+            await session.execute(select(Bundle).where(Bundle.bundle_id == BID_A))
+        ).scalar_one()
+        c = (
+            await session.execute(select(Bundle).where(Bundle.bundle_id == BID_C))
+        ).scalar_one()
+    assert a.min_cny_fen == 6000
+    assert a.diff_fen == 10000 - 6000
+    assert a.is_lowest is False  # 外区实质更低（超出 ±5 元容差）
+    assert c.min_cny_fen is None  # 未刷的包保持原快照
+    service.invalidate_bundles_cache()
+    items = await service.list_bundles()  # SQL ORDER BY 快照：有差价的 A 排在 C 之前
+    order = [i["bundleId"] for i in items]
+    assert order.index(BID_A) < order.index(BID_C)
+    a_item = next(i for i in items if i["bundleId"] == BID_A)
+    assert a_item["diffFen"] == 10000 - 6000
+    assert a_item["lowestRegion"] == "ru"
+    assert a_item["lowestCnyFen"] == 6000
+    # 清理：移除 RU 行并重建快照（不污染同文件其余用例的排序）
+    async with get_session_factory()() as session:
+        await session.execute(
+            delete(BundleRegionPrice).where(
+                BundleRegionPrice.bundle_id == BID_A,
+                BundleRegionPrice.region_code == "RU",
+            )
+        )
+        await session.commit()
+    await service.refresh_bundle_sort_cache([BID_A])
+
+
+@pytest.mark.asyncio
 async def test_tracked_region_filter(monkeypatch):
     """追踪区过滤：区域表/最低价/差价按启用集重算；南亚 PK/BD 同进同出。"""
     # 追踪区 = cn + us（不含 jp）：JP 行剔除，最低价在 {CN, US} 内取
@@ -335,6 +399,10 @@ async def test_tracked_region_filter(monkeypatch):
         return {"CN", "US"}
 
     monkeypatch.setattr(service, "_tracked_region_codes", _cn_us)
+    # 追踪区集合变化 = 写侧事件：快照必须重建（生产由 regions.set_enabled 触发），
+    # GET 只读快照
+    await service.refresh_bundle_sort_cache([BID_A, BID_B, BID_C])
+    service.invalidate_bundles_cache()
     items = await service.list_bundles()
     a = next(i for i in items if i["bundleId"] == BID_A)
     assert set(a["regionPrices"].keys()) == {"CN", "US"}  # JP 被过滤
@@ -371,6 +439,7 @@ async def test_tracked_region_filter(monkeypatch):
             _bp(BID_C, "TR", 100, 5, [APPID_1, APPID_2, APPID_3])  # 便宜但未追踪
         )
         await session.commit()
+    await service.refresh_bundle_sort_cache([BID_C])  # 直写绕过写入口 → 手动重建快照
     service.invalidate_bundles_cache()  # 直写绕过写入口 → 手动失效聚合缓存
     items = await service.list_bundles()
     c = next(i for i in items if i["bundleId"] == BID_C)

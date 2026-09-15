@@ -463,34 +463,34 @@ class TestBundleRegionsIdentity:
     def test_falls_back_to_packageid(self, monkeypatch: pytest.MonkeyPatch) -> None:
         calls: list[list[tuple[int, int | None]]] = []
 
-        async def fake(session, want, proxy):
+        async def fake(session, want):
             calls.append(want)
             if want[0][1] == 1:  # 换到 packageid 才有真实条目
                 return {13608: [{"price_status": "ok", "mps": 1, "kind": "packageid"}]}
             return {}
 
         monkeypatch.setattr(refresh, "_fetch_regions_batched", fake)
-        rows = _run(refresh._fetch_bundle_regions(None, 13608, None))
+        rows = _run(refresh._fetch_bundle_regions(None, 13608))
         assert [w[0][1] for w in calls] == [0, 1]
         assert rows and rows[0]["mps"] == 1
 
     def test_force_package_skips_bundle_probe(self, monkeypatch: pytest.MonkeyPatch) -> None:
         calls: list[list[tuple[int, int | None]]] = []
 
-        async def fake(session, want, proxy):
+        async def fake(session, want):
             calls.append(want)
             return {}
 
         monkeypatch.setattr(refresh, "_fetch_regions_batched", fake)
-        assert _run(refresh._fetch_bundle_regions(None, 1066582, None, force_package=True)) == []
+        assert _run(refresh._fetch_bundle_regions(None, 1066582, force_package=True)) == []
         assert [w[0][1] for w in calls] == [1]  # 只问一次，不兜底
 
     def test_locked_rows_count_as_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        async def fake(session, want, proxy):
+        async def fake(session, want):
             return {13608: [{"price_status": "locked", "mps": 0, "kind": "bundleid"}]}
 
         monkeypatch.setattr(refresh, "_fetch_regions_batched", fake)
-        rows = _run(refresh._fetch_bundle_regions(None, 13608, None))
+        rows = _run(refresh._fetch_bundle_regions(None, 13608))
         assert len(rows) == 1 and rows[0]["price_status"] == "locked"
 
 
@@ -526,7 +526,7 @@ class TestFetchRegions:
 
         seen: list[str] = []
 
-        async def _fake_region(session, specs, cc, proxy):
+        async def _fake_region(session, specs, cc):
             seen.append(cc)
             assert len(specs) == 1
             return [_item(id=13608)]
@@ -534,7 +534,7 @@ class TestFetchRegions:
         monkeypatch.setattr(regions_service, "effective_regions", _enabled)
         monkeypatch.setattr(refresh, "_fetch_browse_region", _fake_region)
 
-        out = _run(refresh._fetch_regions_batched(None, [(13608, 0)], None))
+        out = _run(refresh._fetch_regions_batched(None, [(13608, 0)]))
 
         assert sorted(seen) == ["bd", "cn", "pk"]
         assert {r["region_code"] for r in out[13608]} == {"cn", "pk", "bd"}

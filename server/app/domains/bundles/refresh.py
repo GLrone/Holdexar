@@ -21,7 +21,9 @@ bundleid / packageid 与 appid 一样进 `ids` 数组，单区一发 ≤400 条�
   （旧 packagedetails 对锁区 Sub 仍给价）。
 - 原价 `price_before_bundle_discount` 一手落库（旧 Bundle 轨没有 original_price）。
 
-出网走策略引擎 proxy_first（Steam 域直连不稳定）。
+出网直连（browse 接口按 country_code 返回各区数据，出口 IP 不参与判定；
+加速器在系统网络层透明生效）+ 全局限流（与 app 爬取链共享 200 发/5 分钟
+窗口预算，见 crawler/rate_limit.py）。
 """
 from __future__ import annotations
 
@@ -40,7 +42,7 @@ from app.domains.games.models import Bundle, BundleRegionPrice, Game
 from app.domains.games.pricing import convert_minor_to_cny_fen
 from app.domains.games.service import get_rates
 
-from .service import invalidate_bundles_cache
+from .service import invalidate_bundles_cache, refresh_bundle_sort_cache
 
 logger = logging.getLogger(__name__)
 
@@ -82,13 +84,11 @@ async def _bundle_fetch_ccs() -> list[str]:
     return ccs
 
 
-async def _strategy_proxy() -> str | None:
-    try:
-        from app.domains.proxies import service as proxies_service
+async def _rate_limit_acquire() -> None:
+    """出网前取限流名额（与 app 爬取链同一进程级窗口预算）。"""
+    from app.crawler.rate_limit import steam_rate_limiter
 
-        return await proxies_service.resolve_proxy_url()
-    except Exception:  # noqa: BLE001
-        return None
+    await steam_rate_limiter.acquire()
 
 
 def _headers() -> dict:
@@ -131,7 +131,7 @@ def _is_real_item(item: dict) -> bool:
 
 
 async def _fetch_browse_region(
-    session: aiohttp.ClientSession, specs: list[dict], cc: str, proxy: str | None
+    session: aiohttp.ClientSession, specs: list[dict], cc: str
 ) -> list[dict] | None:
     """单区一发。返回 store_items（与 specs 位置对齐）；请求失败返回 None。
 
@@ -140,10 +140,10 @@ async def _fetch_browse_region(
     """
     url = bs.StoreBrowseAPI.build_ids_url(specs, cc, BROWSE_LANG)
     try:
+        await _rate_limit_acquire()
         async with session.get(
             url,
             headers=_headers(),
-            proxy=proxy,
             timeout=aiohttp.ClientTimeout(total=BROWSE_TIMEOUT),
         ) as resp:
             if resp.status != 200:
@@ -240,7 +240,6 @@ def _align_items(items: list[dict], ids: list[int]) -> list[tuple[int, dict | No
 async def _fetch_regions_batched(
     session: aiohttp.ClientSession,
     want: list[tuple[int, int | None]],
-    proxy: str | None,
     ccs: list[str] | None = None,
 ) -> dict[int, list[dict]]:
     """整表逐区一发：want=[(bundle_id, item_kind)] → {bundle_id: 区域行}。
@@ -266,7 +265,7 @@ async def _fetch_regions_batched(
                 plans.append((cc, kind, batch))
 
     async def one(cc: str, kind: str, batch: list[dict]):
-        items = await _fetch_browse_region(session, batch, cc, proxy)
+        items = await _fetch_browse_region(session, batch, cc)
         return cc, kind, batch, items
 
     out: dict[int, list[dict]] = {}
@@ -282,7 +281,7 @@ async def _fetch_regions_batched(
 
 
 async def _fetch_bundle_regions(
-    session: aiohttp.ClientSession, bundle_id: int, proxy: str | None,
+    session: aiohttp.ClientSession, bundle_id: int,
     *, force_package: bool = False,
 ) -> list[dict]:
     """整包抓取（单包出口：手动导入共用，抓取区=监控启用区）。
@@ -293,13 +292,13 @@ async def _fetch_bundle_regions(
     （写 locked 行），与「抓取失败（空表）」严格区分。
     """
     primary = 1 if force_package else 0
-    rows = (await _fetch_regions_batched(session, [(int(bundle_id), primary)], proxy)).get(
+    rows = (await _fetch_regions_batched(session, [(int(bundle_id), primary)])).get(
         int(bundle_id), []
     )
     if rows or force_package:
         return rows
     alt = (
-        await _fetch_regions_batched(session, [(int(bundle_id), 1 - primary)], proxy)
+        await _fetch_regions_batched(session, [(int(bundle_id), 1 - primary)])
     ).get(int(bundle_id), [])
     return alt if alt else rows
 
@@ -448,7 +447,6 @@ async def refresh_bundles() -> dict:
     rates = await get_rates()  # {currency: rate_to_cny}
     rate_map = dict(rates) if isinstance(rates, dict) else {}
     rate_map.setdefault("CNY", 1.0)
-    proxy = await _strategy_proxy()
     ccs = await _bundle_fetch_ccs()
 
     async with get_session_factory()() as session:
@@ -482,7 +480,7 @@ async def refresh_bundles() -> dict:
 
     connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=60)
     async with aiohttp.ClientSession(connector=connector) as session:
-        rows_by_id = await _fetch_regions_batched(session, want, proxy, ccs=ccs)
+        rows_by_id = await _fetch_regions_batched(session, want, ccs=ccs)
         # 形态兜底：按库内形态问不到真实条目的包，换另一形态再问一次
         # （历史形态缺失/曾按错形态导入的包自愈；单区一发，代价可忽略）
         missing = [(bid, kind) for bid, kind in want if not rows_by_id.get(bid)]
@@ -492,7 +490,7 @@ async def refresh_bundles() -> dict:
                 for bid, kind in missing
             ]
             logger.info("[bundles] %d 个包按库内形态未命中，换形态兜底探测", len(flipped))
-            alt = await _fetch_regions_batched(session, flipped, proxy, ccs=ccs)
+            alt = await _fetch_regions_batched(session, flipped, ccs=ccs)
             for bid, _kind in missing:
                 if alt.get(bid):
                     rows_by_id[bid] = alt[bid]
@@ -500,6 +498,7 @@ async def refresh_bundles() -> dict:
     failed: list[int] = [bid for bid, _kind in want if not rows_by_id.get(bid)]
     dropped_singletons = 0
     seeded = 0
+    touched: list[int] = []  # 本轮成功落库的包：链尾统一重建排序快照
     for bid, _kind in want:
         regions = rows_by_id.get(bid) or []
         if not regions:
@@ -509,8 +508,18 @@ async def refresh_bundles() -> dict:
             continue
         updated_bundles += 1
         updated_prices += len(regions)
+        touched.append(bid)
         if bid in pending_ids:
             seeded += 1
+
+    # ── 排序快照增量重建（bundles.min_cny_fen/diff_fen/is_lowest）──
+    # 写时算好、GET 只读：本轮价格变了哪些包就重建哪些包（按批，允许
+    # 秒级短窗口——GET 最多看到旧快照，不会看到「价格新 / 差价旧」的半态）
+    if touched:
+        try:
+            await refresh_bundle_sort_cache(touched)
+        except Exception:  # noqa: BLE001
+            logger.exception("[bundles] 排序快照重建失败（列表沿用上一版快照）")
 
     logger.info(
         "捆绑包刷新完成：成功 %d/%d，区域价 %d 行，失败 %d 个，单品甄别剔除 %d 个，"
@@ -578,12 +587,11 @@ async def import_bundle(text: str) -> dict:
     rates = await get_rates()
     rate_map = dict(rates) if isinstance(rates, dict) else {}
     rate_map.setdefault("CNY", 1.0)
-    proxy = await _strategy_proxy()
 
     connector = aiohttp.TCPConnector(limit=4, ttl_dns_cache=60)
     async with aiohttp.ClientSession(connector=connector) as session:
         regions = await _fetch_bundle_regions(
-            session, bundle_id, proxy, force_package=(kind == "sub")
+            session, bundle_id, force_package=(kind == "sub")
         )
     if not regions:
         raise ValueError(
@@ -612,6 +620,11 @@ async def import_bundle(text: str) -> dict:
         "regionPrices": len(regions),
         "name": (max(regions, key=lambda r: len(r.get("app_ids") or []))).get("name", ""),
     }
+    # 排序快照重建（单包，写时算好、GET 只读）→ 再失效列表缓存
+    try:
+        await refresh_bundle_sort_cache([bundle_id])
+    except Exception:  # noqa: BLE001
+        logger.exception("[bundles] 导入后排序快照重建失败（列表沿用上一版快照）")
     # 包内新 appid 即时进 app 爬取队列——后台跑：预检（每轮限量）+ 小批量
     # 爬取是分钟级长事务，导入交互要求落库后立即回显（与全量刷新的同步
     # 计数语义不同，失败只记日志不影响导入结果）
@@ -631,7 +644,7 @@ async def import_bundle(text: str) -> dict:
 
 
 async def _fetch_app_type(
-    session: aiohttp.ClientSession, appid: int, proxy: str | None
+    session: aiohttp.ClientSession, appid: int
 ) -> tuple[str | None, str]:
     """轻量 appdetails type 预检：返回 (type, name)。失败 (None, '')。
 
@@ -640,11 +653,11 @@ async def _fetch_app_type(
     """
     status: int | None = None
     try:
+        await _rate_limit_acquire()
         async with session.get(
             APPDETAILS_URL,
             params={"appids": appid, "cc": "us", "filters": "basic"},
             headers=_headers(),
-            proxy=proxy,
             timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
             status = resp.status
@@ -708,7 +721,6 @@ async def _enqueue_new_bundle_apps() -> tuple[int, int]:
         )
         candidates = candidates[:_PRECHECK_PER_RUN]
 
-    proxy = await _strategy_proxy()
     crawl_pairs: list[tuple[int, str]] = []
     skipped = 0
     probe_failed = 0
@@ -718,7 +730,7 @@ async def _enqueue_new_bundle_apps() -> tuple[int, int]:
 
         db_writer = DbWriter()
         for appid in candidates:
-            app_type, name = await _fetch_app_type(session, appid, proxy)
+            app_type, name = await _fetch_app_type(session, appid)
             if app_type is None:
                 probe_failed += 1  # 预检失败：不标不记，下次刷新重试
                 continue
@@ -746,36 +758,7 @@ async def _enqueue_new_bundle_apps() -> tuple[int, int]:
         regions = await enabled_regions()
         if regions:
             try:
-                # 代理口径对齐手动爬取（crawl service start_job）：策略引擎 →
-                # 环境变量回退 → direct_first/proxy_first/proxy_only 换出口重试。
-                # 此前不传 proxy_url 一律直连，是队列爬取 meta 超时扎堆的根因
-                from app.crawler.proxy import resolve_proxy_url as resolve_env_proxy
-                from app.domains.proxies import service as proxies_service
-                from app.domains.proxies.service import (
-                    get_strategy,
-                    resolve_failover_proxy_url,
-                )
-
-                proxy_url = await proxies_service.resolve_proxy_url()
-                if proxy_url is None:
-                    proxy_url = resolve_env_proxy()
-                failover_resolver = None
-                if (await get_strategy())["strategy"] in (
-                    "direct_first",
-                    "proxy_first",
-                    "proxy_only",
-                ):
-
-                    async def _failover() -> str | None:
-                        return await resolve_failover_proxy_url()
-
-                    failover_resolver = _failover
-                config = CrawlRunConfig(
-                    regions=regions,
-                    workers=4,
-                    proxy_url=proxy_url,
-                    failover_proxy_resolver=failover_resolver,
-                )
+                config = CrawlRunConfig(regions=regions, workers=4)
                 stats = await run_crawl(crawl_pairs, config=config)
                 logger.info("[bundles] 新 appid 爬取完成：%s", {k: v for k, v in stats.items() if k != "elapsed_seconds"})
             except Exception as e:  # noqa: BLE001
