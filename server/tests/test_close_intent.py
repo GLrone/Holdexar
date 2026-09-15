@@ -1,16 +1,23 @@
-"""关窗意图询问（desktop/main.py `_ask_close_intent`）单测：不出网、不弹真窗。
+"""关窗意图询问（desktop/main.py）单测：不出网、不弹真窗。
 
 背景：此前点 X **静默隐藏**到托盘——用户以为退出了程序，进程却常驻后台
-继续占端口/跑调度。改为点 X 弹二选一后（「最小化」到托盘 /「退出程序」；
-按键文案是动作词，系统 MessageBox 出不了，故自绘小 Form），本文件钉死：
-1. ShowDialog 结果 → 意图的映射（Yes=最小化、No=退出、未知=安全侧最小化）；
-2. 异常降级 = minimize：pythonnet/桌面会话不可用时保持旧的「隐藏常驻」
-   语义，绝不误杀进程；
-3. 对话框结构：两键文案正确、回车默认=最小化、无 ControlBox、
-   owner 传给 ShowDialog；
-4. 关窗守卫对两种意图 + 托盘退出置位的行为（返回值即 closing 契约）。
+继续占端口/跑调度。现改为点 X 弹二选一（「最小化」/「退出程序」，右上角
+X = 留在窗口）。按键文案是动作词，系统 MessageBox 出不了，故整窗自绘
+（无边框 + 自绘标题栏 + 圆角按键）。
 
-真实弹窗链路（UI 线程同步模态窗）由真窗口冒烟覆盖，此处只测逻辑层。
+本文件钉死：
+1. ShowDialog 结果 → 意图映射（Yes=最小化、No=退出、Cancel=留在窗口、
+   未知/弹窗链路炸穿=安全侧最小化）；
+2. 对话框结构：三个可点控件（最小化/退出程序/关闭）齐全、两键成组居中、
+   关闭键在右上、文本 Label 固定宽（AutoSize 的 Label 不折行，超窗宽即截断）；
+3. 关窗守卫对三种意图 + 托盘退出置位的行为（返回值即 closing 契约）。
+
+假件用 MagicMock 派生：控件 API 面很大（Paint/Click/MouseEnter/SetStyle/
+FindForm…），逐个手写既脆又长；MagicMock 对任意属性与方法都安全，只在
+需要断言处读回真实赋值（Text/Size/Location/AccessibleName）。
+
+真实弹窗链路（UI 线程同步模态窗 + 自绘渲染）由真窗口冒烟覆盖，此处只测
+逻辑与结构。
 """
 from __future__ import annotations
 
@@ -18,6 +25,7 @@ import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from unittest.mock import MagicMock
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -35,21 +43,35 @@ def _load_desktop_main():
 
 desktop = _load_desktop_main()
 
-# ── 假件：System.Windows.Forms / System.Drawing（纯 Python 替身） ──────────
-# pythonnet 的 CLR 模块对象不可 setattr（.NET 类型对 Python 只读），但
-# `from System.Windows.Forms import ...` 走 sys.modules 查找——把条目
-# 换成 ModuleType 假模块即可全权控制被测代码拿到的件。
+
+class _Widget(MagicMock):
+    """假控件：任意属性读写、方法调用、事件绑定（+=）都安全。"""
 
 
-class _FakeButton:
-    def __init__(self) -> None:
-        self.Text = ""
-        self.DialogResult = None
-        self.Size = None
-        self.Location = None
+class _FakeLabel(_Widget):
+    """Label 载体（标题/正文/关闭键）。"""
 
 
-class _FakeControls:
+class _FakeButton(_Widget):
+    """Button 载体（两个主按键，DialogResult / AcceptButton 语义）。"""
+
+
+class _LooseNS:
+    """假枚举容器：任意成员名都取得到（含 Python 关键字成员名如 "None"）。
+
+    AutoScaleMode 的 None 成员只能用 getattr 取，而 getattr 对普通
+    SimpleNamespace 缺该属性会抛 AttributeError——这里用 __getattr__ 兜底
+    返回 None，让关键字成员名也能被取到。
+    """
+
+    def __init__(self, **members) -> None:
+        self.__dict__.update(members)
+
+    def __getattr__(self, _name):
+        return None
+
+
+class _Controls:
     def __init__(self) -> None:
         self.items: list = []
 
@@ -57,16 +79,21 @@ class _FakeControls:
         self.items.append(item)
 
 
-class _FakeForm:
-    def __init__(self) -> None:
-        self.Controls = _FakeControls()
-        self.Text = ""
-        self.AcceptButton = None
-        self.ControlBox = True
-        self.ClientSize = None
+_SHOW_OUTCOME: dict = {}   # ShowDialog 的返回值（或 Exception）
+_SHOW_ARGS: list = []      # ShowDialog 的实参（owner 传递断言）
+
+
+class _FakeForm(_Widget):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.Controls = _Controls()
+        self.ClientSize = SimpleNamespace(Width=440, Height=204)
+        self.Width = 440
+        self.Height = 204
+        self.DialogResult = None
 
     def ShowDialog(self, *args):
-        _SHOW_ARGS.append(args)  # 类级记账：_ask_close_intent 内部建实例，测试要回看实参
+        _SHOW_ARGS.append(args)
         outcome = _SHOW_OUTCOME.pop("value", None)
         if isinstance(outcome, Exception):
             raise outcome
@@ -76,52 +103,97 @@ class _FakeForm:
         pass
 
 
-# ShowDialog 的返回值（或 Exception）——测试按需塞入，消费即弹出
-_SHOW_OUTCOME: dict = {}
-# 每次 ShowDialog 的实参元组（owner 传递断言用）
-_SHOW_ARGS: list = []
-
-
 def _patch_winforms(monkeypatch):
-    """挂假装配件模块，返回 (fake_wf, sentinel_yes, sentinel_no)。"""
-    sent_yes, sent_no = object(), object()
+    """挂假装配件模块，返回 (fake_wf, sentinel_yes, sentinel_no, sentinel_cancel)。"""
+    sent_yes, sent_no, sent_cancel = object(), object(), object()
+    # 主题读取钉死深色：结构测试不该碰真实库（_app_theme 同步读 app_settings）
+    monkeypatch.setattr(desktop, "_app_theme", lambda: "dark")
 
     fake_wf = ModuleType("System.Windows.Forms")
-    fake_wf.Button = _FakeButton
     fake_wf.Form = _FakeForm
-
-    class _FakeLabel:
-        def __init__(self) -> None:
-            self.Text = ""
-            self.AutoSize = False
-            self.Location = None
-            self.Font = SimpleNamespace(
-                FontFamily=object()
-            )  # FontFamily 占位：假 Font 构造器不吃它
-
     fake_wf.Label = _FakeLabel
-    fake_wf.PictureBox = type(
-        "PictureBox", (), {"__init__": lambda self: None}
-    )
+    fake_wf.Button = _FakeButton
+    fake_wf.PictureBox = _Widget
     fake_wf.PictureBoxSizeMode = SimpleNamespace(Zoom=None)
-    fake_wf.FormBorderStyle = SimpleNamespace(FixedSingle=None)
+    fake_wf.ControlStyles = SimpleNamespace(
+        UserPaint=1, AllPaintingInWmPaint=2, OptimizedDoubleBuffer=4
+    )
+    fake_wf.Cursors = SimpleNamespace(Hand=None)
+    fake_wf.DialogResult = SimpleNamespace(Yes=sent_yes, No=sent_no, Cancel=sent_cancel)
+    fake_wf.FormBorderStyle = _LooseNS(FixedSingle=None)
     fake_wf.FormStartPosition = SimpleNamespace(CenterParent=None, CenterScreen=None)
-    fake_wf.DialogResult = SimpleNamespace(Yes=sent_yes, No=sent_no)
+    fake_wf.AutoScaleMode = _LooseNS(Dpi=None, Font=None)
+    fake_wf.MouseButtons = SimpleNamespace(Left=None)
+    fake_wf.FlatStyle = SimpleNamespace(Flat=None)
+    fake_wf.Keys = SimpleNamespace(Enter=None, Escape=None)
 
     fake_draw = ModuleType("System.Drawing")
-    fake_draw.SystemIcons = SimpleNamespace(
-        Question=SimpleNamespace(ToBitmap=lambda: object())
-    )
+
+    class _Gfx:
+        def __init__(self, *a) -> None:
+            pass
+
+        def __getattr__(self, _name):
+            return lambda *a, **k: None
+
+    class _Size:
+        """既可下标取值（Location[0] 的 tuple 语义）也可读 Width/Height。"""
+
+        def __init__(self, w, h) -> None:
+            self.Width = w
+            self.Height = h
+            self._t = (w, h)
+
+        def __getitem__(self, i):
+            return self._t[i]
+
+        def __eq__(self, other):
+            return isinstance(other, _Size) and self._t == other._t
+
+        def __hash__(self):
+            return hash(self._t)
+
+    fake_draw.Bitmap = _Widget
+    fake_draw.Graphics = _Gfx
+    fake_draw.Color = SimpleNamespace(FromArgb=lambda *a: object(), Transparent=object())
+    fake_draw.SolidBrush = lambda *a: object()
+    fake_draw.Pen = lambda *a: object()
     fake_draw.Point = lambda x, y: (x, y)
-    fake_draw.Size = lambda w, h: (w, h)
+    fake_draw.Size = _Size
+    fake_draw.Rectangle = lambda *a: object()
+    fake_draw.RectangleF = lambda *a: object()
+    fake_draw.Region = lambda *a: object()
+    fake_draw.Icon = lambda *a: SimpleNamespace(ToBitmap=lambda: object())
     fake_draw.Font = lambda *a: object()
-    fake_draw.FontStyle = SimpleNamespace(Bold=object())
+    fake_draw.FontStyle = SimpleNamespace(Bold=object(), Regular=object())
+    fake_draw.FontFamily = lambda *a: object()
+    fake_draw.GraphicsUnit = SimpleNamespace(Pixel=object())
+    fake_draw.StringFormat = _Widget
+    fake_draw.StringAlignment = SimpleNamespace(Center=object())
+    fake_draw.Drawing2D = ModuleType("System.Drawing.Drawing2D")
+    fake_draw.Drawing2D.GraphicsPath = _Widget
+    fake_draw.Drawing2D.SmoothingMode = SimpleNamespace(AntiAlias=object())
 
     import clr  # noqa: F401 —— 真环境同序：装配件命名空间先注册（被测代码也这么走）
 
     monkeypatch.setitem(sys.modules, "System.Windows.Forms", fake_wf)
     monkeypatch.setitem(sys.modules, "System.Drawing", fake_draw)
-    return fake_wf, sent_yes, sent_no
+    monkeypatch.setitem(sys.modules, "System.Drawing.Drawing2D", fake_draw.Drawing2D)
+    return fake_wf, sent_yes, sent_no, sent_cancel
+
+
+def _by_name(controls):
+    """按 AccessibleName 取控件（自绘按键用语义名标识，读屏同源）。
+
+    MagicMock 未显式赋值的属性也返回 Mock（truthy），故只认**真实字符串**
+    的语义名——被测代码必须显式 `AccessibleName = text` 才会被找到。
+    """
+    out = {}
+    for control in controls:
+        name = getattr(control, "AccessibleName", None)
+        if isinstance(name, str) and name:
+            out[name] = control
+    return out
 
 
 # ── 意图映射与降级 ──────────────────────────────────────────────────────────
@@ -129,20 +201,27 @@ def _patch_winforms(monkeypatch):
 
 def test_yes_maps_to_minimize(monkeypatch):
     """「最小化」键（DialogResult.Yes）→ 最小化到托盘。"""
-    fake_wf, sent_yes, _ = _patch_winforms(monkeypatch)
+    _, sent_yes, _, _ = _patch_winforms(monkeypatch)
     _SHOW_OUTCOME["value"] = sent_yes
     assert desktop._ask_close_intent(None) == "minimize"
 
 
 def test_no_maps_to_quit(monkeypatch):
     """「退出程序」键（DialogResult.No）→ 完全退出程序。"""
-    fake_wf, _, sent_no = _patch_winforms(monkeypatch)
+    _, _, sent_no, _ = _patch_winforms(monkeypatch)
     _SHOW_OUTCOME["value"] = sent_no
     assert desktop._ask_close_intent(None) == "quit"
 
 
+def test_cancel_maps_to_stay(monkeypatch):
+    """右上角 X（DialogResult.Cancel）→ 留在窗口，什么都不做。"""
+    _, _, _, sent_cancel = _patch_winforms(monkeypatch)
+    _SHOW_OUTCOME["value"] = sent_cancel
+    assert desktop._ask_close_intent(None) == "stay"
+
+
 def test_unknown_result_falls_back_to_minimize(monkeypatch):
-    """未知返回值（如窗口被系统强关返回 None）→ 安全侧最小化。"""
+    """未知返回值 → 安全侧最小化。"""
     _patch_winforms(monkeypatch)
     _SHOW_OUTCOME["value"] = None
     assert desktop._ask_close_intent(None) == "minimize"
@@ -158,32 +237,54 @@ def test_dialog_failure_falls_back_to_minimize(monkeypatch):
 # ── 对话框结构 ──────────────────────────────────────────────────────────────
 
 
-def test_dialog_structure_and_defaults(monkeypatch):
-    """结构：两键文案=「最小化」「退出程序」；回车默认=最小化；无 ControlBox。"""
-    fake_wf, sent_yes, sent_no = _patch_winforms(monkeypatch)
+def test_dialog_structure(monkeypatch):
+    """结构：三键齐全；两键成组居中且同尺寸；关闭键在右上。"""
+    _patch_winforms(monkeypatch)
     dialog, mapping = desktop._build_close_dialog(None)
 
-    buttons = [
-        c for c in dialog.Controls.items
-        if isinstance(c, _FakeButton) and c.Text
+    controls = _by_name(dialog.Controls.items)
+    assert set(controls) == {"最小化", "退出程序", "关闭"}, list(controls)
+
+    min_btn, quit_btn = controls["最小化"], controls["退出程序"]
+    close_btn = controls["关闭"]
+    assert min_btn.Size == quit_btn.Size
+    assert min_btn.Location[1] == quit_btn.Location[1]
+    width = dialog.ClientSize.Width
+    left = min(min_btn.Location[0], quit_btn.Location[0])
+    right = max(
+        min_btn.Location[0] + min_btn.Size[0], quit_btn.Location[0] + quit_btn.Size[0]
+    )
+    assert abs((left + right) / 2 - width / 2) <= 1.0, "两键组应水平居中"
+    assert close_btn.Location[1] < min_btn.Location[1], "关闭键应在标题栏行"
+    assert close_btn.Location[0] > left, "关闭键应在右侧"
+    assert set(mapping.values()) == {"minimize", "quit", "stay"}
+
+
+def test_dialog_texts_not_autosize(monkeypatch):
+    """文本 Label 必须 AutoSize=False：AutoSize 的 Label 不折行，超宽即截断。"""
+    _patch_winforms(monkeypatch)
+    dialog, _ = desktop._build_close_dialog(None)
+    # 文本 Label = Label 载体且无语义名（标题/正文；关闭键有语义名"关闭"）
+    labels = [
+        c
+        for c in dialog.Controls.items
+        if isinstance(c, _FakeLabel)
+        and not isinstance(getattr(c, "AccessibleName", None), str)
     ]
-    assert [b.Text for b in buttons] == ["最小化", "退出程序"]
-    assert buttons[0].DialogResult is sent_yes  # 最小化 → Yes
-    assert buttons[1].DialogResult is sent_no   # 退出程序 → No
-    assert dialog.AcceptButton is buttons[0]    # 回车默认 = 最小化（安全侧）
-    assert dialog.ControlBox is False           # 二选一没有「不选」退路
-    assert mapping == {sent_yes: "minimize", sent_no: "quit"}
-    assert dialog.Text == f"关闭 {desktop.APP_NAME}"
+    assert labels, "对话框应有文本 Label"
+    for label in labels:
+        assert label.AutoSize is False
+        assert label.Size is not None
 
 
 def test_dialog_gets_owner_in_showdialog(monkeypatch):
-    """弹窗必须以主窗口为 owner（CenterParent 居中其上、模态随主窗）。"""
+    """弹窗必须以主窗口为 owner（居中其上、模态随主窗）。"""
     _patch_winforms(monkeypatch)
     _SHOW_OUTCOME["value"] = None  # 返回值无关紧要，只断言实参
     _SHOW_ARGS.clear()
     owner = object()
     desktop._ask_close_intent(owner)
-    assert _SHOW_ARGS and _SHOW_ARGS[-1] == (owner,)  # owner 原样传给 ShowDialog
+    assert _SHOW_ARGS and _SHOW_ARGS[-1] == (owner,)
 
 
 # ── 关窗守卫（closing 契约） ────────────────────────────────────────────────
@@ -207,6 +308,16 @@ def test_guard_minimize_intent_hides_and_cancels(monkeypatch):
     guard = desktop._make_closing_guard(window)
     assert guard() is False
     assert hidden == [1]
+
+
+def test_guard_stay_intent_keeps_window(monkeypatch):
+    """守卫：意图 stay（点了弹窗 X）→ 只返回 False，不隐藏窗口。"""
+    monkeypatch.setattr(desktop, "_ask_close_intent", lambda owner=None: "stay")
+    hidden = []
+    window = SimpleNamespace(hide=lambda: hidden.append(1), native=None)
+    guard = desktop._make_closing_guard(window)
+    assert guard() is False
+    assert not hidden
 
 
 def test_guard_tray_quit_bypasses_dialog(monkeypatch):
