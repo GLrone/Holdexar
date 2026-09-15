@@ -1,11 +1,18 @@
 """Steam 榜单发现源：topsellers / popularnew / specials / comingsoon 四板聚合。
 
-发现类增量源（补愿望单覆盖不到的游戏）：
+发现类增量源（补愿望单覆盖不到的游戏），反哺去向分两路：
+- 持久监控（board.pool=True，topsellers / popularnew / comingsoon）：
+  本轮榜整批并入监控池（wishlist_service.ensure_board_pool），成为
+  随全池轮刷新的监控条目；同时照常补爬差集拓展游戏商店；
+- 临时队列（specials）：只把「不在库里」的差集补爬入库（发现面用于
+  游戏商店展示），不落监控池——折扣全集量级数千条且定位是展示面
+  拓展，不做持久监控。
+
 - topsellers  热销榜 5 页 / 500 条（filter=topsellers；前 100 条兼作
   前端 TOP100 展示序，全量供初始游戏库反哺与预设池登记）
 - popularnew  热门新品
   （sort_by=Released_DESC&filter=popularnew，5 批 500 条）
-- specials    特惠差集
+- specials    特惠差集（临时队列）
   （sort_by=Global_Topsellers&specials=1，全量翻页求差集）
 - comingsoon  即将推出   ← 商店页 filter=popularcomingsoon&os=win
   （JSON 通道同构直连，item 无价格字段，无包游戏由爬取层 COMING_SOON 暂缓）
@@ -66,6 +73,9 @@ class Board:
     # （updated_at NULL 且无价格行，topsellers 现行语义）
     uncrawled_only: bool = False
     backfill_kind: str = ""           # 爬取 spec kind 标签
+    # 落池语义：True=本榜游戏轮询并入持久监控池（ensure_board_pool）；
+    # False=临时队列——只补游戏商店差集、不落监控池（specials 专用）
+    pool: bool = False
 
     @property
     def cache_key(self) -> str:
@@ -74,7 +84,8 @@ class Board:
 
 BOARDS: dict[str, Board] = {
         # 热销榜：发现面拉满 5 页 = 500 条（初始游戏库的来源之一，预设池登记
-    # 见 games/preset.py）；前端「近期TOP100热榜」展示仍取榜序前 100
+    # 见 games/preset.py）；前端「近期TOP100热榜」展示仍取榜序前 100；
+    # 本榜游戏轮询落持久监控池（board.pool）
     "topsellers": Board(
         key="topsellers",
         params={"filter": "topsellers", "hidef2p": 1, "category1": 998},
@@ -82,6 +93,7 @@ BOARDS: dict[str, Board] = {
         max_requests=5,
         empty_tolerance=1,
         backfill_kind="top100_backfill",
+        pool=True,
     ),
     # 热门新品（对齐 popular_new_supplement.py：filter=popularnew + Released_DESC）
     "popularnew": Board(
@@ -92,8 +104,10 @@ BOARDS: dict[str, Board] = {
         max_requests=5,
         empty_tolerance=1,
         backfill_kind="popularnew_backfill",
+        pool=True,
     ),
-    # 特惠差集（对齐 check_steam_specials.py：specials=1 + Global_Topsellers + l=english）
+    # 特惠差集（对齐 check_steam_specials.py：specials=1 + Global_Topsellers + l=english）。
+    # 临时队列（pool 默认 False）：折扣全集只补游戏商店差集，不落监控池
     "specials": Board(
         key="specials",
         params={"specials": 1, "sort_by": "Global_Topsellers",
@@ -117,6 +131,7 @@ BOARDS: dict[str, Board] = {
         empty_tolerance=1,
         uncrawled_only=True,          # 在库（含 COMING_SOON 挂名行）不重复反哺
         backfill_kind="comingsoon_backfill",  # 转正由重探通道负责
+        pool=True,                    # 即将推出同样落持久监控（上线后自动转正续刷）
     ),
 }
 

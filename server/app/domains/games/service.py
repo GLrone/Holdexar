@@ -18,6 +18,7 @@ import time
 from datetime import datetime, timedelta
 
 from sqlalchemy import and_, asc, desc, func, or_, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.core.database import get_session_factory
@@ -159,7 +160,7 @@ def _build_filter_conditions(
     diff_min_fen/diff_max_fen：与国区差价区间（分）。已选地区时差值 =
     cn.price - sr.cny_fen；未选时回退预计算列 g.diff_fen（= CN 价 - 全区
     最低，下限 0）。diff_type=percent 时区间值按百分比解释（0-100）。
-    tolerance_fen：三模式"近似全区最低"容差（分）；None 用默认 5 元。
+    tolerance_fen：「该区价 ≈ 全区最低价」容差（分）；None 用默认 5 元。
     strict_lowest：绝对低价——最低区价 < 国区价 − tolerance（差价容错的
     反向语义：最低区必须实质低于国区，而非"近似相等也放行"）。
     """
@@ -187,18 +188,24 @@ def _build_filter_conditions(
         conditions.append(g.diff_fen > (tolerance_fen if tolerance_fen is not None else 0))
     if sr is not None:
         conditions.append(cn.cny_fen.is_not(None))
+        # 三模式共用「近似全区最低」判据：**该区价** ≈ 非 CN 全区最低价（±容差），
+        # 即「在这个区买就是全服最低价」。判据必须落在 sr 上：
+        # 写成 COALESCE(min_cny_fen, cn.price) >= cn.price - tolerance 表达的是
+        # 「国区 ≈ 全区最低」（isLowest 分支的语义，刻意保留），套进地区模式
+        # 会把结果集锁死在「该区比国区便宜 1~5 元」的窄区间；highdiff 更会因
+        # 与 >=50 元差价条件互斥而恒空集。
         if filter_mode == "cheaper":
             conditions.append(sr.cny_fen < cn.price - 100)
         elif filter_mode == "highdiff":
             conditions += [
                 or_(cn.discount_percent == 0, cn.discount_percent.is_(None)),
                 cn.price - sr.cny_fen >= 5000,
-                func.coalesce(g.min_cny_fen, cn.price) >= cn.price - tolerance,
+                func.coalesce(g.min_cny_fen, sr.cny_fen) >= sr.cny_fen - tolerance,
             ]
         else:  # global
             conditions += [
                 sr.cny_fen < cn.price - 100,
-                func.coalesce(g.min_cny_fen, cn.price) >= cn.price - tolerance,
+                func.coalesce(g.min_cny_fen, sr.cny_fen) >= sr.cny_fen - tolerance,
             ]
 
     if q:
@@ -354,9 +361,9 @@ async def list_games(
 
     翻译自 route.ts 的 MV/CTE 查询（预计算列版本）：
     - filterMode（仅在选择了具体非国区时生效）：
-      global: 该区价 < 国区-1元 且 近似全区最低（默认±5元，tolerance_fen 可调）
+      global: 该区价 < 国区-1元 且 该区价 ≈ 非 CN 全区最低价（默认±5元，tolerance_fen 可调）
       cheaper: 该区价 < 国区-1元
-      highdiff: 国区未打折 且 国区-该区 >= 50元 且 近似全区最低
+      highdiff: 国区未打折 且 国区-该区 >= 50元 且 该区价 ≈ 全区最低
     - 全部筛选/排序/分页在 SQL 完成；价格明细仅按页内 appid 拉取；
     - sort=top100 例外：热榜集 ≤100 条，SQL 全拉后 Python 按榜序
       重排 + 切片分页（SQLite 无 array_position 的等价实现，其余
@@ -389,7 +396,6 @@ async def list_games(
         exclude_dlc=exclude_dlc,
     )
 
-    rates = await get_rates()
     offset = _decode_cursor(after)
     region_code = (region or "").strip().upper()
     is_locked = region_code == "LOCKED"
@@ -455,7 +461,7 @@ async def list_games(
         price_rows = await _load_page_prices(session, appid_list)
 
     items = [
-        _build_list_item(game, cn_row, price_rows.get(game.appid, []), rates)
+        _build_list_item(game, cn_row, price_rows.get(game.appid, []))
         for game, cn_row in rows
     ]
 
@@ -528,7 +534,6 @@ async def _list_games_top100(
     if not appids:
         return {"items": [], "total": 0, "hasMore": False, "nextCursor": None}
 
-    rates = await get_rates()
     offset = _decode_cursor(after)
     region_code = (region or "").strip().upper()
     is_locked = region_code == "LOCKED"
@@ -591,7 +596,7 @@ async def _list_games_top100(
         price_rows = await _load_page_prices(session, appid_list)
 
     items = [
-        _build_list_item(game, cn_row, price_rows.get(game.appid, []), rates)
+        _build_list_item(game, cn_row, price_rows.get(game.appid, []))
         for game, cn_row in page
     ]
 
@@ -734,7 +739,7 @@ async def get_game_detail(appid: int) -> dict | None:
             else 0
         ),
         "versions": versions,
-        "linkedBundles": await linked_bundles(appid, rates),
+        "linkedBundles": await linked_bundles(appid),
     }
 
 
@@ -764,67 +769,69 @@ def _bundle_item_kind(b: Bundle) -> int:
     return kind
 
 
-async def linked_bundles(appid: int, rates: dict | None = None) -> list[dict]:
+async def linked_bundles(appid: int) -> list[dict]:
     """游戏关联捆绑包（GPW「关联捆绑包」区块 / 详情页 linkedBundles）。
 
-    价格聚合口径：
-    priceCny=CN 区 CNY 分，lowestPriceFen/lowestRegion=非 CN 最低，diffFen=省多少。
-    本地表仅 19 包，直接全量载入 Python 过滤。
+    价格口径：diffFen/lowestPriceFen 直接读 bundles 排序快照
+    （min_cny_fen/diff_fen，refresh_bundle_sort_cache 写时维护），
+    排序由 SQL ORDER BY b.diff_fen DESC 完成——GET 不现算捆绑包最低/差价，
+    也不做 Python sort（与捆绑包列表页同一套快照，两处口径不会漂移）。
 
-    双产品隔离（bundles.service 同源逻辑）：双轨混写的脏行（同号 sub 的异种
-    appids）不参与价格聚合，避免 sub 单品价被当成整包价带偏最低区。
+    lowestRegion 是对快照的展示级查表（全区最低 = min(国区价, 非国区最低
+    快照) 命中的区）；双产品隔离由快照侧统一负责（bundles.service 同源逻辑）。
     """
-    rates = rates if rates is not None else await get_rates()
-
     async with get_session_factory()() as session:
-        bundles = (await session.execute(select(Bundle))).scalars().all()
-        hit = [b for b in bundles if appid in [int(a) for a in (b.app_ids or [])]]
-        if not hit:
+        # appid 命中筛选：app_ids 是 JSON 数组列，逐行解析（命中集极小，
+        # 只取两列不构造实体）；命中后再取主档行（按差价快照降序）
+        pairs = (await session.execute(select(Bundle.bundle_id, Bundle.app_ids))).all()
+        hit_ids = [
+            bid for bid, aids in pairs if appid in {int(a) for a in (aids or [])}
+        ]
+        if not hit_ids:
             return []
-        price_rows = (
+        hit = (
             await session.execute(
-                select(BundleRegionPrice).where(
-                    BundleRegionPrice.bundle_id.in_([b.bundle_id for b in hit])
-                )
+                select(Bundle)
+                .where(Bundle.bundle_id.in_(hit_ids))
+                .order_by(Bundle.diff_fen.desc(), Bundle.bundle_id.asc())
             )
         ).scalars().all()
+        cn_rows = (
+            await session.execute(
+                select(
+                    BundleRegionPrice.bundle_id,
+                    BundleRegionPrice.region_code,
+                    BundleRegionPrice.cny_fen,
+                ).where(BundleRegionPrice.bundle_id.in_(hit_ids))
+            )
+        ).all()
 
-    prices_by_bundle: dict[int, list[BundleRegionPrice]] = {}
-    for p in price_rows:
-        prices_by_bundle.setdefault(p.bundle_id, []).append(p)
+    by_bundle: dict[int, dict[str, int | None]] = {}
+    for bid, code, fen in cn_rows:
+        by_bundle.setdefault(int(bid), {})[(code or "").upper()] = (
+            int(fen) if fen is not None else None
+        )
 
     items = []
     for b in hit:
-        rows = prices_by_bundle.get(b.bundle_id, [])
-        # 与主档 appids 同族（有交集）的行才计入：剔除双轨混写的异种产品行
-        main_appids = {int(a) for a in (b.app_ids or [])}
-        if main_appids:
-            rows = [
-                p for p in rows
-                if main_appids & {int(a) for a in (p.app_ids or [])}
-            ]
-        cn_cny_fen = None
-        lowest_cny_fen = None
+        region_cny = by_bundle.get(b.bundle_id, {})
+        cn_cny_fen = region_cny.get("CN")
+        min_cny_fen = int(b.min_cny_fen) if b.min_cny_fen is not None else None
+        candidates = [v for v in (cn_cny_fen, min_cny_fen) if v is not None]
+        lowest_cny_fen = min(candidates) if candidates else None
         lowest_region = ""
-        for p in rows:
-            code = p.region_code.upper()
-            cny_fen = int(p.cny_fen) if p.cny_fen is not None else None
-            if cny_fen is None and p.price:
-                currency = p.currency or REGION_TO_CURRENCY.get(code, "USD")
-                cny_fen = convert_minor_to_cny_fen(int(p.price), currency, rates)
-            if code == "CN":
-                cn_cny_fen = cny_fen
-            elif cny_fen is not None and (lowest_cny_fen is None or cny_fen < lowest_cny_fen):
-                lowest_cny_fen = cny_fen
-                lowest_region = code.lower()
-        if lowest_cny_fen is None:
-            lowest_cny_fen = cn_cny_fen
-            lowest_region = "cn"
-        diff = (
-            max(cn_cny_fen - lowest_cny_fen, 0)
-            if cn_cny_fen is not None and lowest_cny_fen is not None
-            else 0
-        )
+        if lowest_cny_fen is not None:
+            if cn_cny_fen is not None and cn_cny_fen <= lowest_cny_fen:
+                lowest_region = "cn"
+            else:
+                lowest_region = next(
+                    (
+                        code.lower()
+                        for code, fen in region_cny.items()
+                        if code != "CN" and fen == lowest_cny_fen
+                    ),
+                    "",
+                )
         items.append(
             {
                 "bundleId": b.bundle_id,
@@ -838,12 +845,9 @@ async def linked_bundles(appid: int, rates: dict | None = None) -> list[dict]:
                 "priceCny": cn_cny_fen,
                 "lowestRegion": lowest_region,
                 "lowestPriceFen": lowest_cny_fen,
-                "diffFen": diff,
+                "diffFen": int(b.diff_fen or 0),
             }
         )
-
-    # 省得多的排前（对齐用户视角的"值得看"）
-    items.sort(key=lambda x: x["diffFen"], reverse=True)
     return items
 
 
@@ -1459,13 +1463,19 @@ async def refresh_pp_flags(appids: list[int] | None = None) -> int:
     return len(updates)
 
 
-async def refresh_sort_cache(appids: list[int] | None = None) -> int:
+async def refresh_sort_cache(
+    appids: list[int] | None = None, *, session: AsyncSession | None = None
+) -> int:
     """刷新 games.min_cny_fen / diff_fen 预计算列（对齐 mv_game_sort_cache 构建 SQL）。
 
-    appids=None 全库刷新（启动时）；否则增量（爬取落库后调用，lowest 限定目标集合）。
+    appids=None 全库刷新（启动 / 汇率变更）；否则增量（爬取落库后调用，
+    lowest 限定目标集合）。
     语义：min_cny_fen = 非 CN 各区 ok 价最低（原始值，无则 NULL）；
     diff_fen = MAX(CN 价 - COALESCE(最低, CN 价), 0)。
     需要 SQLite ≥ 3.33（UPDATE ... FROM）。
+
+    session 注入时不自行提交——汇率原子刷新用它把「汇率 → cny_fen →
+    games sort → bundles sort」串进同一事务（GET 只可能读到旧快照或新快照）。
     """
     from sqlalchemy import bindparam, text
 
@@ -1494,14 +1504,23 @@ async def refresh_sort_cache(appids: list[int] | None = None) -> int:
     if appids:
         sql = sql.bindparams(bindparam("appids", expanding=True))
 
-    async with get_session_factory()() as session:
+    if session is not None:
         result = await session.execute(sql, params)
-        await session.commit()
+        return result.rowcount or 0
+
+    async with get_session_factory()() as own:
+        result = await own.execute(sql, params)
+        await own.commit()
     return result.rowcount or 0
 
 
-def _build_list_item(game: Game, cn_row: GameCurrentPrice | None, price_rows: list, rates: dict) -> dict:
-    """对齐 route.ts buildGameResponse。cn_row=None 为锁区（无国区行，LEFT JOIN）。"""
+def _build_list_item(game: Game, cn_row: GameCurrentPrice | None, price_rows: list) -> dict:
+    """对齐 route.ts buildGameResponse。cn_row=None 为锁区（无国区行，LEFT JOIN）。
+
+    cnyFen 只读快照列（cny_fen）：GET 不回算汇率——回算会与排序快照
+    （diff_fen/min_cny_fen）落在不同汇率基准上，出现「排名说省 ¥20 /
+    卡片算出来不是 ¥20」。缺失行由 recompute_cny_fen_all 在汇率刷新时补齐。
+    """
     base_cn_price = int(cn_row.price) if cn_row is not None and cn_row.price is not None else None
 
     price_map: dict[str, dict] = {}
@@ -1516,10 +1535,6 @@ def _build_list_item(game: Game, cn_row: GameCurrentPrice | None, price_rows: li
             continue
         price_cents = int(p.price)
         cny_fen = int(p.cny_fen) if p.cny_fen is not None else None
-        if cny_fen is None:
-            currency = p.currency or REGION_TO_CURRENCY.get(code)
-            if currency:
-                cny_fen = convert_minor_to_cny_fen(price_cents, currency, rates)
         price_map[code] = {"cents": price_cents, "cnyFen": cny_fen}
 
     all_prices: dict[str, list] = {}

@@ -151,7 +151,16 @@ class Bundle(Base):
     # 旧代码拿 mps 兼形态会把这类包拼出错误 /sub/ 链接
     item_kind: Mapped[int] = mapped_column(Integer, default=-1)
     header_image: Mapped[str | None] = mapped_column(String(1024))
+    # 国区买是否即（近似）追踪区最低：国区价 ≈ 追踪区最低价（±5 元容差）
     is_lowest: Mapped[bool] = mapped_column(Boolean, default=False)
+    # ── 排序快照预计算列（refresh_bundle_sort_cache 维护，与 games 同构）──
+    # min_cny_fen = 追踪区（crawl_regions 启用集）内非 CN 各区 ok 价最低 CNY 分
+    # （原始值；无双区价则 NULL）
+    min_cny_fen: Mapped[int | None] = mapped_column(BigInteger)
+    # diff_fen = CN 价 - COALESCE(最低, CN 价)（下限 0；无 CN 价时为 0）
+    # server_default：与 _TABLE_EXTRA_COLUMNS 的存量库 ALTER 口径一致，
+    # 原始 SQL 插行（历史导入/迁移脚本）省略该列时也拿得到默认值
+    diff_fen: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     url: Mapped[str | None] = mapped_column(String(1024))
     app_ids: Mapped[list | None] = mapped_column(JSON, default=list)  # 包含的 Steam AppID 列表
     view_count: Mapped[int] = mapped_column(Integer, default=0)
