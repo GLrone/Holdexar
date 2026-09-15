@@ -67,10 +67,11 @@ DEFAULT_WORKER_COUNT = 30
 # 直连 Steam 在部分网络下 TLS 握手可能超过 10s（实测 9.7s），12s 超时会误杀；放宽到 20s
 HTTP_TIMEOUT = 20
 
-# 注：这里曾有 RATE_LIMIT_MAX_REQUESTS / RATE_LIMIT_WINDOW_SECONDS（令牌桶 60 请求/5 分钟）。
-# 那两个常量全库零消费——真实的速度控制是「并发上限（DEFAULT_WORKER_COUNT）+ 429 全局熔断
-# + 重试指数退避」三层（见 crawler/http_client.py），没有任何主动限速器。常量留着会让人
-# 以为有限速阀可调，且 60 请求/5 分钟对 41 区 × 全库的抓取量级本就不成立——已删除。
+# 注：这里曾有 RATE_LIMIT_MAX_REQUESTS / RATE_LIMIT_WINDOW_SECONDS（令牌桶 60 请求/5 分钟），
+# 常量本身全库零消费被删过一次。browse 接口时代限流成为**主闸**（browse 按
+# country_code 返回各区数据、出口 IP 不参与判定，直连即标准形态；换 IP 规避
+# 风控的整套机制退役）——现行实测定线 200 发/5 分钟，实现与常量落在
+# crawler/rate_limit.py（http_client 与捆绑包刷新共享同一进程级窗口预算）。
 
 # 版本后缀关键词字典（key 统一小写匹配）
 EDITION_DICT = {

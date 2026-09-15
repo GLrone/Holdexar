@@ -38,8 +38,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKER_COUNT)
     parser.add_argument(
         "--proxy", default=None,
-        help=f"代理 URL（如 http://127.0.0.1:7897 或 socks5://...）；缺省读环境变量 "
-             f"{ENV_PREFIX}PROXY_URL，未设置则走策略引擎",
+        help=f"代理 URL（如 http://127.0.0.1:7897 或 socks5://...）；缺省直连——"
+             f"browse 接口按 country_code 返回各区数据，仅显式指定或环境变量 "
+             f"{ENV_PREFIX}PROXY_URL 时走代理（调试用）",
     )
     parser.add_argument(
         "--timeout", type=int, default=HTTP_TIMEOUT, help="单请求总超时秒数（默认 20）"
@@ -79,15 +80,13 @@ def _load_appids(args) -> list[tuple[int, str]]:
 
 
 async def async_main(args) -> int:
+    # 直连为标准形态：browse 按 country_code 返回各区数据、出口 IP 不参与
+    # 判定，加速器在系统网络层透明生效。代理仅显式指定时启用（调试通道）。
     proxy_url = args.proxy or os.environ.get(f"{ENV_PREFIX}PROXY_URL")
-    if proxy_url is None:
-        from app.domains.proxies.service import resolve_proxy_url
-
-        proxy_url = await resolve_proxy_url()
     if proxy_url:
-        logger.info("代理已启用: %s", proxy_url)
+        logger.info("代理已启用（显式指定）: %s", proxy_url)
     else:
-        logger.info("代理未配置，直连模式（网络慢时可用 --proxy http://127.0.0.1:7897）")
+        logger.info("直连模式（加速器由系统网络层透明生效，无需配置）")
 
     from app.domains.regions.service import effective_regions
 

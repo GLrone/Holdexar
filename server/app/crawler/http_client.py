@@ -1,10 +1,12 @@
-"""Steam HTTP 客户端：全局 429 熔断 + 指数退避 + 幻觉 429 清洗。
+"""Steam HTTP 客户端：全局限流 + 429 熔断 + 指数退避 + 幻觉 429 清洗。
 
 要点：
 - 内置静态 UA 池轮换
-- `Connection: close`（Per-AppID Session 配套：连接即用即断，
-  促使 Clash loadbalance 在下一个任务/请求换出口 IP，规避 429 风控）
-- 支持 per-request 代理注入（proxy_url）
+- 出网前过全局滑动窗口限流（200 发/5 分钟，rate_limit.py 进程级单例）
+  ——browse 接口按 country_code 参数返回各区价格、出口 IP 不参与数据
+  判定，直连即标准形态；限流取代旧的「多出口换 IP 规避风控」成为主闸
+- `Connection: close`：配合限流的匀速节奏，不留无谓的 keep-alive
+- 支持 per-request 代理注入（proxy_url；无代理时直连）
 """
 from __future__ import annotations
 
@@ -88,13 +90,13 @@ global_429_breaker = Global429CircuitBreaker()
 class SteamHttpClient:
     """带拦截器和重试机制的 HTTP 客户端。"""
 
-    def __init__(self, timeout: int = 12, max_retries: int = 4, proxy_url: str | None = None,
-                 failover_proxy_resolver=None):
+    def __init__(self, timeout: int = 12, max_retries: int = 4, proxy_url: str | None = None):
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.max_retries = max_retries
+        # 直连为标准形态（browse 接口按 country_code 返回各区数据，出口 IP
+        # 不参与判定；加速器在系统网络层透明生效，无需应用侧代理）。
+        # proxy_url 仅供调试通道显式指定（CLI --proxy / 环境变量）。
         self.proxy_url = proxy_url
-        # direct_first 失败换代理：直连失败/429 时调用，返回代理 URL（None=无可用代理）
-        self.failover_proxy_resolver = failover_proxy_resolver
         self._ua_index = random.randrange(len(_USER_AGENTS))
 
     def _get_headers(self, appid=None) -> dict[str, str]:
@@ -102,8 +104,7 @@ class SteamHttpClient:
         return {
             "Accept-Language": "en-US,en;q=0.9",
             "User-Agent": _USER_AGENTS[self._ua_index],
-            # 断连语义：配合 Per-AppID Session（每游戏独立 session 用完即毁），
-            # 不留 keep-alive，让 Clash 在下一个连接重新选出口
+            # 断连语义：匀速限流下不留 keep-alive，避免悬挂连接被中间层回收
             "Connection": "close",
         }
 
@@ -116,16 +117,19 @@ class SteamHttpClient:
     ):
         """GET 并解析 JSON。内置拦截：
 
-        1. 全局 429 熔断 → 所有请求阻塞等待冷却
-        2. 真 429 → 指数退避重试（3s, 6s, 12s, 24s）
-        3. 幻觉 429 → 状态码 429 但 body 含有效 JSON → 直接清洗返回
-        4. 网络超时/错误 → 重试（direct_first 配了 failover 时换代理再试）
-        5. 断网检测：传输层成败上报 NetworkChecker（达阈值 ping 确认，
+        1. 全局限流 → 200 发/5 分钟窗口内匀速发出（超出即等名额）
+        2. 全局 429 熔断 → 所有请求阻塞等待冷却
+        3. 真 429 → 指数退避重试（3s, 6s, 12s, 24s）
+        4. 幻觉 429 → 状态码 429 但 body 含有效 JSON → 直接清洗返回
+        5. 网络超时/错误 → 重试（直连为主，代理通道仅用户显式配置时启用）
+        6. 断网检测：传输层成败上报 NetworkChecker（达阈值 ping 确认，
            app_handler 守卫据此暂停而非写 missing 污染账本）
         """
         from .network_check import network_checker
+        from .rate_limit import steam_rate_limiter
 
         for attempt in range(self.max_retries):
+            await steam_rate_limiter.acquire()
             await global_429_breaker.wait_if_tripped()
 
             try:
@@ -177,25 +181,13 @@ class SteamHttpClient:
                         except Exception:
                             pass
 
-                        # 真 429 → 触发全局熔断
+                        # 真 429 → 触发全局熔断（限流是主闸，熔断兜底：
+                        # 上游代理/共享出口的偶发风控仍可能回 429）
                         await global_429_breaker.trip(
                             status_code=response.status,
                             response_body=body_text_429 or "<无法读取响应体>",
                             url=str(response.url),
                         )
-
-                        # direct_first 语义：真 429 说明出口被风控，换代理
-                        # 重试比干等冷却更快见效（Clash/池在跑时）
-                        if self.failover_proxy_resolver is not None and attempt < self.max_retries - 1:
-                            try:
-                                failover = await self.failover_proxy_resolver()
-                            except Exception:  # noqa: BLE001 —— 换代理失败回落退避
-                                failover = None
-                            if failover and failover != self.proxy_url:
-                                self.proxy_url = failover
-                                logger.info("[429换代理] 切换出口重试: %s", failover)
-                                await asyncio.sleep(1 + random.uniform(0, 1))
-                                continue
 
                         if attempt < self.max_retries - 1:
                             backoff = 3.0 * (2**attempt) + random.uniform(0, 1)
@@ -227,19 +219,8 @@ class SteamHttpClient:
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 # 传输层失败上报断网检测（达阈值触发 ping 确认——
-                # 本机断网时换代理无意义，等恢复才对）
+                # 本机断网时等待恢复才对，重试徒烧预算）
                 await network_checker.report_failure()
-                # direct_first 语义：直连传输失败 → 换代理重试
-                # （解析出口与当前相同 = 无处可换，沿用退避）
-                if self.failover_proxy_resolver is not None and attempt < self.max_retries - 1:
-                    try:
-                        failover = await self.failover_proxy_resolver()
-                    except Exception:  # noqa: BLE001
-                        failover = None
-                    if failover and failover != self.proxy_url:
-                        self.proxy_url = failover
-                        logger.info("[直连失败换代理] 切换出口重试: %s（%s）", failover, type(e).__name__)
-                        continue
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(1 + random.uniform(0, 1))
                     continue
