@@ -1,8 +1,10 @@
 """wishlist 域服务：账户绑定 / 愿望单同步 / 监控池管理（条目增删）。
 
-监控池三模块：愿望单与关注系统是叠加在监控条目之上的爬取第一优先级
-（wishlisted / manual 标记，见 domains.crawl 的队列排序），监控池管理
-（add_pool_items / remove_pool_items）负责监控条目的增删与批量操作——
+监控池四来源：愿望单/已购同步（账户）、星标关注（manual）、手动入池
+（manual_pool）、榜单发现源轮询落池（board_pool，ensure_board_pool）。
+愿望单与关注系统是叠加在监控条目之上的爬取第一优先级（wishlisted /
+manual 标记，见 domains.crawl 的队列排序），监控池管理（add_pool_items /
+remove_pool_items / ensure_board_pool）负责监控条目的增删与批量操作——
 池内所有游戏均为必须爬取的对象。
 
 数据源（对齐 07_user_misc/fetch_user_games.py）：
@@ -521,7 +523,11 @@ async def sync_account(steamid: str, auto_crawl: bool = True) -> dict:
                     row.wishlisted = False
                     if appid in owned_ids or not row.active:
                         continue
-                    if getattr(row, "manual", False) or getattr(row, "manual_pool", False):
+                    if (
+                        getattr(row, "manual", False)
+                        or getattr(row, "manual_pool", False)
+                        or getattr(row, "board_pool", False)
+                    ):
                         continue
                     if owned_failed and row.owned:
                         continue
@@ -601,7 +607,6 @@ async def sync_account(steamid: str, auto_crawl: bool = True) -> dict:
                                 "kind": "wishlist_sync_owned",
                             },
                         ],
-                        from_scheduler=True,  # 自动路径过代理闸门：无可用代理不自动爬
                     )
                 )
                 result["crawlTriggered"] = True
@@ -615,20 +620,18 @@ async def sync_account(steamid: str, auto_crawl: bool = True) -> dict:
                         appids=new_appids,
                         regions=owned_cfg,
                         kind="wishlist_sync_owned",
-                        from_scheduler=True,  # 自动路径过代理闸门
                     )
                 else:
                     await crawl_service.start_job(
                         scope="appids",
                         appids=new_appids,
                         kind="wishlist_sync",
-                        from_scheduler=True,  # 自动路径过代理闸门
                     )
                 result["crawlTriggered"] = True
             except ValueError as e:
-                # 代理闸门（无可用代理不自动爬）：静默跳过，下轮同步再探
+                # 空列表等参数性拒绝：静默跳过，下轮同步再探
                 result["crawlTriggered"] = False
-                logger.info("无可用代理，新增 %d 项未自动爬取（%s）", len(new_appids), e)
+                logger.info("新增 %d 项未自动爬取（%s）", len(new_appids), e)
             except RuntimeError:
                 result["crawlTriggered"] = False  # 已有任务运行，稍后手动触发
                 logger.info("已有爬取任务运行，新增 %d 项未自动爬取", len(new_appids))
@@ -642,7 +645,7 @@ async def list_items(steamid: str | None = None) -> list[dict]:
     名称/封面从 games 主档 LEFT JOIN 带出；新入池未爬的条目 games 无行
     （name/headerImage 为 None）——前端回落显示 appid。
     来源标记：wishlisted=愿望单成员 / followed=星标关注（manual）/
-    owned=已购 / manualPool=手动入池。
+    owned=已购 / manualPool=手动入池 / boardPool=榜单发现源落池。
     """
     from app.domains.games.models import Game
 
@@ -650,7 +653,7 @@ async def list_items(steamid: str | None = None) -> list[dict]:
     query = (
         select(
             wi.steamid, wi.appid, wi.added_at,
-            wi.owned, wi.manual, wi.wishlisted, wi.manual_pool,
+            wi.owned, wi.manual, wi.wishlisted, wi.manual_pool, wi.board_pool,
             Game.name, Game.name_en, Game.header_image,
         )
         .where(wi.active.is_(True))
@@ -678,6 +681,7 @@ async def list_items(steamid: str | None = None) -> list[dict]:
                 "followed": False,
                 "owned": False,
                 "manualPool": False,
+                "boardPool": False,
             }
         it["steamids"].append(row.steamid)
         # 来源标记按任一账户计（并集）：任一行落在该来源即标
@@ -685,6 +689,7 @@ async def list_items(steamid: str | None = None) -> list[dict]:
         it["followed"] = it["followed"] or bool(row.manual)
         it["owned"] = it["owned"] or bool(row.owned)
         it["manualPool"] = it["manualPool"] or bool(row.manual_pool)
+        it["boardPool"] = it["boardPool"] or bool(row.board_pool)
     return [merged[a] for a in sorted(merged)]
 
 
@@ -840,7 +845,8 @@ async def ownership(appids: list[int]) -> dict:
     无头像的账户为空串（前端落首字符占位）；无归属的 appid 不在结果里。
     - owned：主账户拥有；未配置主账户时任一账户拥有
     - family：非主账户的追踪账户拥有（家庭共享来源）
-    - wishlist：仅存在于愿望单
+    - wishlist：愿望单成员（wishlisted 标记）——手动入池/榜单落池等
+      普通监控条目不算愿望单归属、不出徽章（它们没有可展示的归属类型）
     """
     from app.domains.settings.service import get_value
     from app.domains.account import service as account_service
@@ -890,7 +896,7 @@ async def ownership(appids: list[int]) -> dict:
                 family_by.setdefault(row.appid, []).append(who)
             else:
                 owned_by.setdefault(row.appid, []).append(who)
-        else:
+        elif row.wishlisted:
             wished_by.setdefault(row.appid, []).append(who)
 
     def out(pairs: list[tuple[str, str]]) -> dict:
@@ -951,6 +957,94 @@ async def _refresh_item_counts(session, steamids: set[str]) -> None:
                 )
             ).scalar_one()
         )
+
+
+async def ensure_board_pool(appids: list[int]) -> dict:
+    """榜单发现源落池（持久监控）：本轮榜整批并入监控池。
+
+    - 无行：主账号身份新建 board_pool 条目——属普通监控条目（随全池轮
+      刷新），不产生愿望单/关注标记、不触发爬取（反哺链自行首爬）；
+    - 活跃行：跳过（不动既有来源标记；在池行顺手清移除标做状态一致性，
+      与 add_pool_items 同款防御，脱池行不触碰）；
+    - 脱池行（excluded 等全组非活跃）：跳过不复活——用户手动移出的榜单
+      游戏不被每轮榜单轮询洗回（重新手动添加才回到池）；
+    - 无绑定账户：ValueError（调用方按「跳过落池、反哺照常」处理）。
+
+    返回 {added, exists, skipped}。
+    """
+    clean: list[int] = []
+    seen: set[int] = set()
+    for a in appids:
+        try:
+            appid = int(a)
+        except (TypeError, ValueError):
+            continue
+        if appid > 0 and appid not in seen:
+            seen.add(appid)
+            clean.append(appid)
+    if not clean:
+        return {"added": 0, "exists": 0, "skipped": 0}
+
+    added = exists = skipped = 0
+    async with get_session_factory()() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(WishlistItem).where(WishlistItem.appid.in_(clean))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        by_appid: dict[int, list[WishlistItem]] = {}
+        for row in rows:
+            by_appid.setdefault(int(row.appid), []).append(row)
+
+        need_new = [a for a in clean if a not in by_appid]
+        new_steamid: str | None = None
+        if need_new:
+            new_steamid = await resolve_pool_steamid()
+            if not new_steamid:
+                raise ValueError("尚未绑定 SteamID64（榜单发现源无法落池）")
+            now = _naive(get_beijing_time_obj())
+            for a in need_new:
+                session.add(
+                    WishlistItem(
+                        steamid=new_steamid,
+                        appid=a,
+                        added_at=now,
+                        active=True,
+                        owned=False,
+                        manual=False,
+                        manual_pool=False,
+                        board_pool=True,
+                    )
+                )
+
+        for appid in clean:
+            group = by_appid.get(appid)
+            if group is None:
+                added += 1
+                continue
+            if any(r.active for r in group):
+                exists += 1
+                for r in group:
+                    if r.active:
+                        r.excluded = False  # 在池条目不应带移除标
+                continue
+            skipped += 1
+
+        await _refresh_item_counts(
+            session,
+            {r.steamid for r in rows} | ({new_steamid} if new_steamid else set()),
+        )
+        await session.commit()
+
+    if added or skipped:
+        logger.info(
+            "榜单落池：新增 %d / 已在池 %d / 已移除跳过 %d", added, exists, skipped
+        )
+    return {"added": added, "exists": exists, "skipped": skipped}
 
 
 async def add_pool_items(
@@ -1055,7 +1149,7 @@ async def add_pool_items(
             # 首爬：新增/恢复的条目若无 games 行（从未抓过），下轮全池刷新的
             # games 行侧看不到它——池内行本就排在全池 head，会随本轮一并抓。
             await crawl_service.start_job(
-                scope="appids", appids=touched, kind="pool_add", from_scheduler=True
+                scope="appids", appids=touched, kind="pool_add"
             )
             crawl_triggered = True
         except (RuntimeError, ValueError) as e:
