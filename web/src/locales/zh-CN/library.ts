@@ -13,8 +13,14 @@ const library = {
   'library.error.title': '加载失败',
   'library.error.network': '无法连接到服务器',
 
-  /* 空态 A：库本身为空（诊断监控池 + 爬虫状态） */
+  /* 空态 A：库本身为空（诊断监控池 + 爬虫 + 代理状态） */
   'library.empty.library.title': '游戏商店还是空的',
+  /* 代理诊断（resolve 出 null=直连）：自动抓价被闸门拦下的根因提示 */
+  'library.empty.library.noProxy':
+    '还没配置代理——自动抓价在没有代理时不会启动，价格数据进不来。',
+  'library.empty.library.goProxy': '去配置代理',
+  /* 监控池为空：手动导入的直达按钮（与 noPool1/2 同语义，点过去就对了） */
+  'library.empty.library.goImport': '去添加游戏',
   'library.empty.library.pool': '监控池有 {n} 款游戏，但还没有爬到价格数据。',
   'library.empty.library.crawling': '爬虫正在运行，抓取完成后会自动出现在这里。',
   'library.empty.library.startHint': '可前往「任务」页启动爬取，或稍等定时任务自动执行。',
