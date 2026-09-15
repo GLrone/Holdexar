@@ -1,6 +1,10 @@
-"""断网容错三件套测试：本机断网判定 / 代理池加权选择 / direct_first 失败换代理。
+"""断网容错三件套测试：本机断网判定 / 代理池加权选择 / 直连传输退避。
 
 不触真实网络——mock ping 与代理池；库隔离到临时文件。
+
+direct_first 失败换代理机制已随代理体系退役（browse 接口按
+country_code 返回各区数据，出口 IP 不参与判定，直连为标准形态）：
+传输失败只走退避重试，真 429 只走全局熔断 + 指数退避，不再切换出口。
 """
 import asyncio
 import sys
@@ -185,22 +189,17 @@ async def test_weighted_pick_all_dead_falls_back_round_robin(db, monkeypatch):
     assert url.startswith("http://10.0.0.1")
 
 
-# ─── direct_first 失败换代理 ─────────────────────────────────
+# ─── 直连传输退避（failover 换出口机制已退役） ───────────────
 
 
 @pytest.mark.asyncio
-async def test_failover_on_transport_error():
-    """直连传输失败 → resolver 取代理 → 换出口重试成功。"""
+async def test_transport_error_retries_then_succeeds(monkeypatch):
+    """直连传输失败 → 退避重试 → 后续成功（不切换出口：
+    browse 时代直连为标准形态，传输失败只等退避）。"""
     import aiohttp
 
     client = SteamHttpClient(timeout=2, max_retries=3, proxy_url=None)
-    switched = []
-
-    async def _resolver() -> str | None:
-        switched.append(1)
-        return "http://127.0.0.1:7897"
-
-    client.failover_proxy_resolver = _resolver
+    assert not hasattr(client, "failover_proxy_resolver"), "failover 机制已退役"
 
     calls = {"n": 0}
 
@@ -219,64 +218,23 @@ async def test_failover_on_transport_error():
     class FakeSession:
         def get(self, url, params=None, headers=None, timeout=None, proxy=None):
             calls["n"] += 1
-            # 第一次直连：传输层失败（模拟不可达）
-            # 第二次（已换代理）：成功
+            # 第一次：传输层失败（模拟抖动）；第二次（同一直连出口退避后）：成功
             if calls["n"] == 1:
                 raise aiohttp.ClientConnectionError("connection refused")
             return FakeResp()
 
     data = await client.get_json(FakeSession(), "https://store.example/api", appid=620)
     assert data is not None
-    assert client.proxy_url == "http://127.0.0.1:7897"
-    assert switched, "resolver 应被调用"
+    assert calls["n"] == 2, "退避后同出口重试成功，不切换出口"
+    assert client.proxy_url is None, "直连形态不得被改写成代理出口"
 
 
 @pytest.mark.asyncio
-async def test_failover_skipped_when_same_exit():
-    """resolver 返回与当前相同出口（无处可换）→ 沿用退避重试，不死循环。"""
-    import aiohttp
-
-    client = SteamHttpClient(timeout=2, max_retries=3, proxy_url="http://127.0.0.1:7897")
-
-    async def _resolver() -> str | None:
-        return "http://127.0.0.1:7897"  # 同一出口
-
-    client.failover_proxy_resolver = _resolver
-    network_check.network_checker = NetworkChecker()  # 隔离上报副作用
-
-    calls = {"n": 0}
-
-    class FakeSession:
-        def get(self, url, params=None, headers=None, timeout=None, proxy=None):
-            calls["n"] += 1
-            if calls["n"] <= 2:
-                raise aiohttp.ClientConnectionError("refused")
-            class FakeResp:
-                status = 200
-                async def json(self):
-                    return {"ok": True}
-                async def __aenter__(self):
-                    return self
-                async def __aexit__(self, *a):
-                    return False
-            return FakeResp()
-
-    data = await client.get_json(FakeSession(), "https://store.example/api", appid=1)
-    assert data == {"ok": True}
-    assert client.proxy_url == "http://127.0.0.1:7897"  # 未被同出口覆盖
-
-
-@pytest.mark.asyncio
-async def test_failover_on_429():
-    """真 429 → 熔断触发 + 换代理出口重试成功。"""
+async def test_429_trips_breaker_then_backoff_succeeds(monkeypatch):
+    """真 429 → 熔断触发 + 指数退避后重试成功（不再换出口）。"""
     client = SteamHttpClient(timeout=2, max_retries=3, proxy_url=None)
     from app.crawler.http_client import global_429_breaker
     await global_429_breaker.reset()
-
-    async def _resolver() -> str | None:
-        return "http://127.0.0.1:7897"
-
-    client.failover_proxy_resolver = _resolver
 
     calls = {"n": 0}
 
@@ -312,5 +270,5 @@ async def test_failover_on_429():
 
     data = await client.get_json(FakeSession(), "https://store.example/api", appid=620)
     assert data is not None
-    assert client.proxy_url == "http://127.0.0.1:7897"
+    assert client.proxy_url is None, "429 后不得切换出口（换出口机制已退役）"
     await global_429_breaker.reset()
