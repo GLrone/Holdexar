@@ -101,21 +101,12 @@ async def _seed(db):
 
 
 def _stub_start_env(monkeypatch, *, captured_specs=None):
-    """start_job 出网/区服/收尾钩子全打桩（不发任何真实请求、不触生产库）。"""
+    """start_job 出网/区服/收尾钩子全打桩（不发任何真实请求、不触生产库）。
+    直连形态下 start_job 不再解析代理——无代理桩可打。"""
     async def _regions(regions=None):
         return ["CN", "UA"]
 
     monkeypatch.setattr(crawl_service, "effective_regions", _regions)
-
-    async def _no_proxy():
-        return None
-
-    monkeypatch.setattr(crawl_service.proxies_service, "resolve_proxy_url", _no_proxy)
-
-    async def _strategy():
-        return {"strategy": "direct_only"}
-
-    monkeypatch.setattr(crawl_service.proxies_service, "get_strategy", _strategy)
 
     async def _value(key, default=None):
         return default
@@ -150,13 +141,8 @@ def _stub_start_env(monkeypatch, *, captured_specs=None):
 
 
 def _stub_bundle_tail(monkeypatch):
-    """链尾捆绑包存量刷新打桩：代理闸门放行 + refresh_bundles 短路
-    （真实实现会读生产代理配置并出网）。"""
-    async def _gate_ok():
-        return None
-
-    monkeypatch.setattr(crawl_service, "ensure_proxy_available", _gate_ok)
-
+    """链尾捆绑包存量刷新打桩：refresh_bundles 短路
+    （真实实现会出网）。"""
     from app.domains.bundles import refresh as bundles_refresh
 
     async def _noop_refresh():

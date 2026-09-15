@@ -216,6 +216,27 @@ async def _post_startup_chain() -> None:
     except Exception:  # noqa: BLE001
         logger.exception("[启动] 汇率历史缺口补齐失败（不阻塞启动）")
 
+    # 捆绑包列表预热：全量聚合（25.8k 包 / 14.1 万行区域价）+ 12MB 预序列化
+    # 是秒级重活，不预热则用户首次进捆绑包页要干等整段聚合。排在汇率兜底
+    # 之后——列表缓存按汇率指纹失效，先刷汇率才不会预热出一份随即作废的
+    # 缓存。失败只记日志：请求路径仍按需重算，功能不受影响。
+    from app.domains.bundles import service as bundles_service
+
+    # 排序快照全库重建（bundles.min_cny_fen/diff_fen/is_lowest）：与 games 排序
+    # 缓存同位——列表排序读快照列，不在请求期现算。必须早于列表预热（预热出的
+    # 是含快照字段的完整载荷）。
+    try:
+        rebuilt = await bundles_service.refresh_bundle_sort_cache()
+        logger.info("[启动] 捆绑包排序快照初始化完成：%d 个", rebuilt)
+    except Exception:  # noqa: BLE001
+        logger.exception("捆绑包排序快照初始化失败（不阻塞启动）")
+
+    try:
+        size = await bundles_service.warmup()
+        logger.info("[启动] 捆绑包列表预热完成（%.1f MB）", size / 1e6)
+    except Exception:  # noqa: BLE001
+        logger.exception("捆绑包列表预热失败（不阻塞启动）")
+
     # 调度器在收拾链跑完后才启动（链首说明的写锁竞态；空窗几秒~十几秒
     # 对 15min/6h 拍完全无感）
     start_scheduler()

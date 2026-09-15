@@ -69,7 +69,6 @@ async def _job_wishlist_sync() -> None:
             uniq = sorted(set(pending_new))
             results = await crawl_service.run_sequential(
                 [{"scope": "appids", "appids": uniq, "kind": "wishlist_sync"}],
-                from_scheduler=True,
             )
             if results:
                 logger.info("[定时] 账户同步收尾补爬 %d 个新增", len(uniq))
@@ -77,7 +76,7 @@ async def _job_wishlist_sync() -> None:
             logger.exception("[定时] 账户同步收尾补爬失败")
 
     # 未爬新增回补：同步入库了但从未获得过价格数据（绑定后进程重启中断、
-    # 代理闸门拦截、任务占用漏爬后 15min 内被再次跳过等），会留下
+    # 任务占用漏爬后 15min 内被再次跳过等），会留下
     # 「active=1 且 games 无行」的条目——这些是监控池第一优先级，用户绑定
     # 后看不到价格即体验为「首爬没跑」。每次同步收尾做一次存量对账（配额
     # 帽 _WISH_UNCRAWLED_BATCH 限批），漏多少补多少，直到清零。
@@ -93,7 +92,6 @@ async def _job_wishlist_sync() -> None:
                         "appids": appids,
                         "kind": "wishlist_sync",
                     }],
-                    from_scheduler=True,
                 )
                 if results:
                     logger.info("[定时] 未爬新增回补 %d 个（配额帽 %d）",
@@ -289,7 +287,6 @@ async def _job_price_repair() -> None:
         result = await crawl_service.run_sequential(
             [{"kind": "repair"}],
             missing_cooldown=4,
-            from_scheduler=True,
         )
         if result:
             logger.info("[修复] 失败记录修复完成：任务 %s", [r["id"] for r in result])
@@ -321,9 +318,8 @@ async def _job_price_refresh() -> None:
     purchase_options 落下的无价桩）随同一批请求完成首抓，与存量包的
     各区价/折扣一起跟着这张 6h 网格轮换（锚点即 Steam 折扣刷新时刻，
     折扣轮换后捆包/单买比较不失真）。捆绑包抓取只在链尾发生，不随
-    其他爬取运行触发；与主链过同一道代理前置闸门（无可用代理自动
-    跳过，等下一轮再探）；自带脏区行清理与单品甄别，异常只记日志，
-    不拖垮主链结果。
+    其他爬取运行触发；出网直连 + 与主链共享全局限流预算，异常只记
+    日志，不拖垮主链结果。
     """
     global _price_cycle_busy
     if not await price_auto_enabled():
@@ -343,7 +339,7 @@ async def _job_price_refresh() -> None:
         # 无欠账（ValueError）视为正常跳过；全池层单 job 一遍过，愿望单不再
         # 同轮双爬
         specs: list[dict] = [{"kind": "missing"}, {"scope": "pool"}]
-        results = await crawl_service.run_sequential(specs, from_scheduler=True)
+        results = await crawl_service.run_sequential(specs)
         if not results:
             logger.info("[定时] 池价格爬取：本轮无任务启动（占用/空列表）")
         else:
@@ -353,12 +349,9 @@ async def _job_price_refresh() -> None:
         # 继续让路；发现桩首抓并入同一次全量刷新，成败细节由
         # refresh_bundles 内部日志记录）
         try:
-            await crawl_service.ensure_proxy_available()
             from app.domains.bundles import refresh as bundles_refresh
 
             await bundles_refresh.refresh_bundles()
-        except ValueError as e:
-            logger.info("[定时] 捆绑包刷新跳过：%s", e)
         except Exception:  # noqa: BLE001
             logger.exception("[定时] 捆绑包刷新异常（不影响主链结果）")
     finally:
@@ -503,7 +496,13 @@ async def _job_bills_sync() -> None:
 def _make_board_job(
     board_key: str, backfill_limit: int = 100, record_preset: bool = False
 ):
-    """榜单发现源定时任务工厂：预热缓存 + 反哺爬取队列。
+    """榜单发现源定时任务工厂：预热缓存 + 落监控池 + 反哺爬取队列。
+
+    落池（boards.BOARDS[key].pool=True 的板：topsellers / popularnew /
+    comingsoon）：本轮榜整批并入持久监控池（wishlist_service.
+    ensure_board_pool）——榜单游戏成为随全池轮刷新的监控条目；无绑定
+    账户（ValueError）静默跳过，反哺照常。specials 属临时队列
+    （pool=False）：只补游戏商店差集，不落监控池。
 
     反哺限量（backfill_limit）：首跑特惠差集可达千级（封顶拉榜 5000 条），
     按 Steam 返回的热度序每轮限量消化（100 → specials 每 6h 一轮 = 400/天），
@@ -514,9 +513,7 @@ def _make_board_job(
     不改变反哺/爬取语义，失败只记日志。
 
     **不受 crawl.auto_price 总开关管**：反哺是监控队列的发现源（把榜单新
-    条目首爬入库），不是价格更新作业——关掉自动价格更新不应停掉发现；
-    无可用代理时仍由 run_sequential 的代理前置闸门拦下（自动路径直连
-    不许硬打 Steam）。
+    条目首爬入库），不是价格更新作业——关掉自动价格更新不应停掉发现。
     """
 
     async def _job() -> None:
@@ -534,6 +531,22 @@ def _make_board_job(
             logger.exception("[定时] %s 预热失败", board_key)
             return
 
+        # 落持久监控池：board.pool=True 的板本轮整批并入监控池（反复上榜
+        # 只补缺；已手动移除的条目不复活）。无账户/落池失败不阻断反哺。
+        if boards_mod.BOARDS[board_key].pool:
+            from app.domains.wishlist import service as wishlist_service
+
+            try:
+                landed = await wishlist_service.ensure_board_pool(appids)
+                logger.info(
+                    "[定时] %s 落监控池：新增 %d / 已在池 %d / 已移除跳过 %d",
+                    board_key, landed["added"], landed["exists"], landed["skipped"],
+                )
+            except ValueError as e:
+                logger.info("[定时] %s 未落监控池（%s）——反哺照常", board_key, e)
+            except Exception:  # noqa: BLE001
+                logger.exception("[定时] %s 落监控池失败（不阻断反哺）", board_key)
+
         if record_preset:
             from app.domains.games import preset as preset_mod
 
@@ -546,10 +559,7 @@ def _make_board_job(
         try:
             specs = await boards_mod.backfill_specs(board_key, limit=backfill_limit)
             if specs:
-                results = await crawl_service.run_sequential(
-                    specs,
-                    from_scheduler=True,
-                )
+                results = await crawl_service.run_sequential(specs)
                 logger.info("[定时] %s 反哺爬取完成：%s", board_key, [r["id"] for r in results])
         except Exception:  # noqa: BLE001
             logger.exception("[定时] %s 反哺爬取失败", board_key)
@@ -749,7 +759,6 @@ async def _job_coming_soon_retry() -> None:
         results = await crawl_service.run_sequential(
             [{"scope": "appids", "appids": [a for a, _ in pairs],
               "kind": "comingsoon_retry"}],
-            from_scheduler=True,
         )
         if results:
             logger.info("[定时] COMING_SOON 重探完成：%d 个候选", len(pairs))
