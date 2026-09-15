@@ -111,7 +111,20 @@ async def _fetch_er_api() -> dict[str, float] | None:
 
 
 async def refresh_rates() -> dict:
-    """刷新全部汇率。返回 {source, count, updated}。"""
+    """刷新全部汇率（原子刷新边界：汇率 + 全部 cny_fen + 两域排序快照）。
+
+    返回 {source, count, updated, recomputed}。
+
+    单事务语义（见 rates/snapshot.py 的模块说明）：
+        BEGIN
+          fx_rates / fx_rate_history
+          → 白名单清洗（幂等）
+          → recompute_cny_fen_all（本事务内的汇率快照，不读 get_rates 缓存）
+          → games 排序快照 / bundles 排序快照
+        COMMIT
+    GET 只可能读到旧快照或新快照，绝不出现「rates 新 / cny_fen 旧 / diff 旧」
+    的半刷新状态。任一步失败整体回滚——宁可汇率也不更新，也不留半态。
+    """
     rates = await _fetch_augmentedsteam()
     source = "augmentedsteam"
     if rates is None:
@@ -124,6 +137,8 @@ async def refresh_rates() -> dict:
     # 只写白名单币种（41 区货币 + TRY/ARS 预留）；UI 自选追踪仅影响前端展示，不影响抓取范围
     rates = {code: rate for code, rate in rates.items() if code in ALLOWED_CURRENCIES}
     now = _naive(get_beijing_time_obj())
+
+    from . import snapshot as snapshot_service
 
     async with get_session_factory()() as session:
         for code, rate in rates.items():
@@ -139,17 +154,32 @@ async def refresh_rates() -> dict:
             session.add(
                 FxRateHistory(currency_code=code, rate_to_cny=rate, source=source, fetched_at=now)
             )
-        await session.commit()
-        # 顺带清洗历史遗留的白名单外币种（每次刷新幂等执行）
+        # 白名单清洗并入同一事务（幂等）。原先排在 commit 之后、随会话关闭被
+        # 静默回滚——实际只靠启动链的 cleanup_disallowed 兜底
         await _delete_disallowed(session)
+        # ── 原子刷新边界：cny_fen 重算 + 两域排序快照 ──
+        recomputed = await snapshot_service.recompute_cny_fen_all(session)
+        await snapshot_service.rebuild_sort_snapshots(session)
+        await session.commit()
 
-    # 汇率变更后立即使 games 域的进程内缓存失效
+    # 进程内缓存在提交后失效（不得指向半刷新状态）
     from app.domains.games.service import invalidate_rates_cache
 
     invalidate_rates_cache()
+    from app.domains.bundles.service import invalidate_bundles_cache
 
-    logger.info("汇率已刷新：source=%s 共 %d 币种", source, len(rates))
-    return {"source": source, "count": len(rates), "fetchedAt": now.isoformat()}
+    invalidate_bundles_cache()
+
+    logger.info(
+        "汇率已刷新：source=%s 共 %d 币种（cny_fen 重算 games %d / bundles %d）",
+        source, len(rates), recomputed["games"], recomputed["bundles"],
+    )
+    return {
+        "source": source,
+        "count": len(rates),
+        "recomputed": recomputed,
+        "fetchedAt": now.isoformat(),
+    }
 
 
 STALE_THRESHOLD_HOURS = 12
