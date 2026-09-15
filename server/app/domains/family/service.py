@@ -1051,8 +1051,8 @@ async def _kick_uncrawled_games(appids: list[int]) -> None:
     价格「未收录」。这里把缺口 appid 送进爬取队列（kind="family_wishlist"），
     爬完名称/封面/CN 价自动补齐。
 
-    过代理闸门与任务互斥（from_scheduler=True / 任务占用抛错即放弃，下轮
-    同步与全池刷新仍是兜底）；30 分钟冷却防页面刷新重复触发。
+    任务互斥（占用抛错即放弃，下轮同步与全池刷新仍是兜底）；30 分钟冷却
+    防页面刷新重复触发。
     """
     global _wishlist_crawl_kick_at
     if not appids:
@@ -1067,10 +1067,10 @@ async def _kick_uncrawled_games(appids: list[int]) -> None:
         from app.domains.crawl import service as crawl_service
 
         await crawl_service.start_job(
-            scope="appids", appids=appids, kind="family_wishlist", from_scheduler=True
+            scope="appids", appids=appids, kind="family_wishlist"
         )
         logger.info("[family] 愿望单 %d 款未收录，已触发补爬", len(appids))
-    except Exception as e:  # noqa: BLE001 —— 闸门/任务占用/网络失败都静默
+    except Exception as e:  # noqa: BLE001 —— 任务占用/网络失败都静默
         logger.info("[family] 愿望单未收录补爬未触发（%d 款）：%s", len(appids), e)
 
 

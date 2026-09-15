@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import logging
 import re
 
 from sqlalchemy import select
@@ -18,6 +19,8 @@ from app.core.database import get_session_factory
 from app.crawler.utils import get_beijing_time_obj
 from app.domains.regions.models import CrawlRegion
 from app.domains.settings.models import AppSetting
+
+logger = logging.getLogger(__name__)
 
 # 已购游戏专用抓取区（app_settings KV）：
 # - None/缺省 = 跟随全局启用集（默认，行为与历史上完全一致）
@@ -136,6 +139,17 @@ async def set_enabled(codes: list[str] | None) -> None:
                 row.enabled = new_enabled
                 row.updated_at = now
         await session.commit()
+    # 追踪区集合变化 → 捆绑包排序快照（按追踪区过滤的派生列）整库重建：
+    # 快照只能在写侧算（GET 不得现算最低价/差价），列表缓存同步失效。
+    # 失败只记日志：快照沿用旧集合，等下次改动/下一轮刷新自愈。
+    try:
+        from app.domains.bundles import service as bundles_service
+
+        rebuilt = await bundles_service.refresh_bundle_sort_cache()
+        bundles_service.invalidate_bundles_cache()
+        logger.info("追踪区变更：捆绑包排序快照重建 %d 个", rebuilt)
+    except Exception:  # noqa: BLE001
+        logger.exception("追踪区变更后捆绑包排序快照重建失败（快照沿用旧集合）")
 
 
 async def effective_regions(explicit: list[str] | None) -> list[str]:
