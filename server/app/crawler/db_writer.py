@@ -731,6 +731,11 @@ class DbWriter:
                 rows = rows[:limit_rows]
             by_region: dict[str, list[int]] = {}
             for appid, region in rows:
+                # 空区行是「全球不可见」的尝试痕迹（回补层落账，无对应真实
+                # 区服），不是可补抓的欠账——发给 Steam 的 country_code 会是
+                # 空串，一发必 400。留在账本里走 fail_count 穷尽转 blocked。
+                if not region:
+                    continue
                 by_region.setdefault(region.lower(), []).append(int(appid))
             for cc, appids in by_region.items():
                 for i, start in enumerate(range(0, len(appids), DEFAULT_BATCH_SIZE), 1):
