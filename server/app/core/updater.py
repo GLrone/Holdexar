@@ -298,8 +298,10 @@ async def download_update(
                     if asset:
                         asset_url = asset["browser_download_url"]
 
-        # 通道链：镜像 + 本地代理发现（直连 GitHub 国内基本不可用）
-        attempts = clash_manager._download_attempts(None, None)
+        # 通道链：复用应用运行中的内核代理（runtime_port）+ 本地混合端口 + 镜像，
+        # 直连 GitHub 国内基本不可用——更新下载必须用应用自身可用的出口，否则全应用
+        # 只有这一处网络操作不走代理，表现为「检查更新能拿到清单、下载却卡死/失败」
+        attempts = clash_manager.runtime._download_attempts()
 
         zip_path = staging / "update.zip"
         staging.mkdir(parents=True, exist_ok=True)
