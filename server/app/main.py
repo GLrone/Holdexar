@@ -88,24 +88,26 @@ async def _autostart_clash() -> None:
         logger.exception("Clash 内核自启失败（不阻塞服务）")
 
 
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    settings = get_settings()
-    setup_logging(settings.data_dir)
-    await init_db()
+async def _post_startup_chain() -> None:
+    """监听后的「先开门，再收拾」链（约束见 AGENTS.md 启动链红线）。
 
-    # 资产种子并入（随包公共数据：汇率档案 + games 人工策划列；无种子文件时零开销）
+    每步独立 try/except，失败只留日志不拖垮后续步骤；**顺序有语义**
+    （种子合并先于标记刷新——种子价格历史是史低/永降的输入；内核就位
+    先于 Clash 自启——自启以内核存在为前提），与旧 lifespan 内联顺序
+    逐一对齐，不做乱序调度。跑完才 `start_scheduler()`：种子合并单事务
+    BEGIN IMMEDIATE 持锁可达十几秒，引擎连接的 busy_timeout 若先到期，
+    定时任务的钱包/愿望单写入会撞锁失败——调度器排在链尾即无竞态。
+    """
     from app.core.seed_assets import import_seed, merge_seed_incremental
 
     try:
         await import_seed()
     except Exception:  # noqa: BLE001
         logger.exception("资产种子导入失败（不阻塞启动）")
-
-    # 增量种子合并（按种子版本对全体用户生效，子通道各自独立 marker 幂等）：
-    # 人工列名单（XGP/Epic/HB/系列：缺行落 games 行，行带非空 updated_at
-    # 永不进孤儿补抓——监控只由愿望单驱动，名单 ≠ 监控）+ 价格历史切片
-    await merge_seed_incremental()
+    try:
+        await merge_seed_incremental()
+    except Exception:  # noqa: BLE001
+        logger.exception("增量种子合并失败（不阻塞启动）")
 
     # 家庭库后台预热：实时聚合要逐成员调 Steam HTTPS（代理、秒级起步），
     # 不预热的话每次启动后的首次打开都要干等。cached_family_library 自带
@@ -113,16 +115,17 @@ async def lifespan(_: FastAPI):
     # （无快照且实时不可用）只记日志，不影响启动。
     from app.domains.family import service as family_service
 
-    async def _warm_family_library() -> None:
-        try:
-            await family_service.cached_family_library()
-        except Exception:  # noqa: BLE001
-            logger.info("[family] 启动预热失败（无快照且实时聚合不可用），跳过")
-
-    asyncio.create_task(_warm_family_library())
+    try:
+        await family_service.cached_family_library()
+    except Exception:  # noqa: BLE001
+        logger.info("[family] 启动预热失败（无快照且实时聚合不可用），跳过")
 
     from app.domains.crawl.service import cleanup_orphan_jobs
-    await cleanup_orphan_jobs()
+
+    try:
+        await cleanup_orphan_jobs()
+    except Exception:  # noqa: BLE001
+        logger.exception("孤儿任务清理失败（不阻塞启动）")
 
     # 汇率白名单清洗：41 区货币集（+ TRY/ARS 预留）之外的历史币种数据清除
     from app.domains.rates import service as rates_service
@@ -189,52 +192,67 @@ async def lifespan(_: FastAPI):
 
     # Clash 内核随服务自启（常驻后台语义）：有内核 + 有 clash 订阅即拉起。
     # 服务重启后 proxy_first 策略才不会降级直连（Steam 域直连基本不可用）。
-    async def _autostart_and_health_check() -> None:
+    try:
         await _autostart_clash()
         # 启动体检（6h 门槛内跳过；本地软件不常驻，重启即检查点是设计语义）
-        from app.domains.proxies import service as proxies_service
-
-        try:
-            state = await proxies_service.maybe_run_clash_health_check()
-            if state == "checked":
-                logger.info("[启动体检] Clash 节点检测完成")
-        except Exception:  # noqa: BLE001
-            logger.exception("[启动体检] Clash 节点检测失败（不阻塞启动）")
-
-    asyncio.create_task(_autostart_and_health_check())
+        state = await proxies_service.maybe_run_clash_health_check()
+        if state == "checked":
+            logger.info("[启动体检] Clash 节点检测完成")
+    except Exception:  # noqa: BLE001
+        logger.exception("[启动体检] Clash 节点检测失败（不阻塞启动）")
 
     # 汇率启动兜底：错过每日 03:00 定点（关机/服务重启）时按快照龄补刷新，
     # 保证"每日自动抓取"承诺不因服务频繁重启落空（内含 >12h 阈值，幂等安全）
-    async def _rates_startup_check() -> None:
-        try:
-            await rates_service.refresh_if_stale()
-        except Exception:  # noqa: BLE001
-            logger.exception("[启动] 汇率过期检查失败（不阻塞启动）")
-        # 历史缺口补齐：建档以来错过的交易日按上一交易日值延续补行
-        # （幂等，零缺口零写入；关机漏刷的日子在这里补上）
-        try:
-            stats = await rates_service.backfill_history()
-            if stats["inserted"]:
-                logger.info("[启动] 汇率历史缺口补齐：插入 %d 行", stats["inserted"])
-        except Exception:  # noqa: BLE001
-            logger.exception("[启动] 汇率历史缺口补齐失败（不阻塞启动）")
+    try:
+        await rates_service.refresh_if_stale()
+    except Exception:  # noqa: BLE001
+        logger.exception("[启动] 汇率过期检查失败（不阻塞启动）")
+    # 历史缺口补齐：建档以来错过的交易日按上一交易日值延续补行
+    # （幂等，零缺口零写入；关机漏刷的日子在这里补上）
+    try:
+        stats = await rates_service.backfill_history()
+        if stats["inserted"]:
+            logger.info("[启动] 汇率历史缺口补齐：插入 %d 行", stats["inserted"])
+    except Exception:  # noqa: BLE001
+        logger.exception("[启动] 汇率历史缺口补齐失败（不阻塞启动）")
 
-    asyncio.create_task(_rates_startup_check())
-
+    # 调度器在收拾链跑完后才启动（链首说明的写锁竞态；空窗几秒~十几秒
+    # 对 15min/6h 拍完全无感）
     start_scheduler()
+    logger.info("[启动] 后台收拾链完成，服务已就绪（调度器已启动）")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """监听前只做「不收拾完就不能开门」的最小集，其余全部移交后台链。
+
+    监听前（阻塞端口监听，即用户等待时间）：
+    - `setup_logging`：任何后续报错都要有日志承接；
+    - `init_db`：建表 + 零登记层补列补索引 + 结构性迁移链——迁移改的是
+      表结构，监听后的请求会立刻读到这些表，新旧 schema 混存会让请求
+      踩到不存在的列；且迁移失败要留全栈日志并拦下启动，不能半途开门。
+
+    其余（种子并库/标记预计算/清洗/一次性迁移/内核/自启/调度器）全部
+    是幂等后台工作，一律走 `_post_startup_chain`，见其 docstring。
+    """
+    settings = get_settings()
+    setup_logging(settings.data_dir)
+    await init_db()
+
     # 数据目录布局入日志：本机支持多布局（系统数据目录 / 便携 / 存量便携），
     # 「数据跑哪去了」是最高频的排查问题，启动即亮明。
     from app.core.paths import LAYOUT_LABEL, describe_layout
 
     layout = describe_layout(settings.data_dir)
     logger.info(
-        "%s %s 启动：data=%s（%s）port=%d",
+        "%s %s 启动：data=%s（%s）port=%d（后台收拾链进行中，服务已监听）",
         APP_NAME,
         settings.version,
         settings.data_dir,
         LAYOUT_LABEL.get(layout, layout),
         settings.port,
     )
+    asyncio.create_task(_post_startup_chain())
     yield
     stop_scheduler()
     logger.info("%s 已停止", APP_NAME)

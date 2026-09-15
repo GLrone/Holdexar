@@ -545,7 +545,10 @@ def get_engine():
         # 让每个连接做完 checkpoint 都把 WAL 收回本限内。
         cursor.execute("PRAGMA journal_size_limit=67108864")
         cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.execute("PRAGMA busy_timeout=5000")
+        # 60s：种子历史合并单事务 BEGIN IMMEDIATE 持锁可达十几秒，引擎侧
+        # 连接等锁要扛过这个窗口（与 _merge_history_sync 自己的 60s 同宽）；
+        # 普通请求的锁竞争远短于此，不会白等
+        cursor.execute("PRAGMA busy_timeout=60000")
         cursor.close()
 
     return engine
