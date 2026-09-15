@@ -99,6 +99,20 @@ def _mock_fetch(monkeypatch, responses: list, proxy_url: str | None = None) -> _
     return session
 
 
+def _patch_pool_landing(monkeypatch, recorded: list | None = None) -> list:
+    """榜单落池打桩（ensure_board_pool）：防测试写入真实库，记录调用 appids。"""
+    from app.domains.wishlist import service as wishlist_service
+
+    calls = recorded if recorded is not None else []
+
+    async def _ensure(appids):
+        calls.append(list(appids))
+        return {"added": len(appids), "exists": 0, "skipped": 0}
+
+    monkeypatch.setattr(wishlist_service, "ensure_board_pool", _ensure)
+    return calls
+
+
 # ── 三源参数与终止条件 ────────────────────────────────────────
 
 
@@ -355,8 +369,8 @@ async def test_backfill_limit_and_empty(monkeypatch):
 async def test_scheduler_board_job_backfills_even_when_auto_price_off(monkeypatch):
     """crawl.auto_price 关闭 → 榜单反哺照常（监控队列发现源不是价格更新作业）。
 
-    接线断言：预热 → backfill_specs → run_sequential(from_scheduler=True)，
-    开关关闭不得让反哺停转（无代理时的拦截属代理闸门职责，另有用例）。
+    接线断言：预热 → backfill_specs → run_sequential，
+    开关关闭不得让反哺停转。
     """
     from app.core import scheduler as sched_mod
     from app.domains.crawl import service as crawl_service
@@ -380,12 +394,12 @@ async def test_scheduler_board_job_backfills_even_when_auto_price_off(monkeypatc
     monkeypatch.setattr(boards_mod, "backfill_specs", _specs)
     monkeypatch.setattr(crawl_service, "run_sequential", _run_sequential)
     monkeypatch.setattr(sched_mod, "price_auto_enabled", _auto_off)
+    _patch_pool_landing(monkeypatch)
 
     await sched_mod._make_board_job("topsellers")()
 
     assert calls, "开关关闭不得停掉榜单反哺（发现源常开）"
     assert calls[0][0][0]["kind"] == "top100_backfill"
-    assert calls[0][1].get("from_scheduler") is True, "反哺仍是自动路径，须过代理闸门"
 
 
 @pytest.mark.asyncio
@@ -409,6 +423,7 @@ async def test_scheduler_board_job_records_preset(monkeypatch):
     monkeypatch.setattr(boards_mod, "refresh_board", _refresh_board)
     monkeypatch.setattr(boards_mod, "backfill_specs", _specs)
     monkeypatch.setattr(preset_mod, "record_board", _record_board)
+    _patch_pool_landing(monkeypatch)
 
     await sched_mod._make_board_job("topsellers", record_preset=True)()
 
@@ -436,10 +451,92 @@ async def test_scheduler_board_job_other_boards_skip_preset(monkeypatch):
     monkeypatch.setattr(boards_mod, "refresh_board", _refresh_board)
     monkeypatch.setattr(boards_mod, "backfill_specs", _specs)
     monkeypatch.setattr(preset_mod, "record_board", _record_board)
+    _patch_pool_landing(monkeypatch)
 
     await sched_mod._make_board_job("popularnew")()
 
     assert recorded == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_board_job_lands_persistent_pool(monkeypatch):
+    """持久监控板（topsellers 等）：本轮榜整批落监控池（ensure_board_pool）。"""
+    from app.core import scheduler as sched_mod
+
+    async def _refresh_board(key: str) -> list[int]:
+        return [900201, 900202]
+
+    async def _specs(key: str, limit: int = 100):
+        return []
+
+    monkeypatch.setattr(boards_mod, "refresh_board", _refresh_board)
+    monkeypatch.setattr(boards_mod, "backfill_specs", _specs)
+    landed = _patch_pool_landing(monkeypatch)
+
+    await sched_mod._make_board_job("topsellers")()
+
+    assert landed == [[900201, 900202]]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_board_job_specials_stays_transient(monkeypatch):
+    """临时队列板（specials）：只反哺爬取，不落监控池。"""
+    from app.core import scheduler as sched_mod
+    from app.domains.crawl import service as crawl_service
+
+    async def _refresh_board(key: str) -> list[int]:
+        return [900211]
+
+    async def _specs(key: str, limit: int = 100):
+        return [{"scope": "appids", "appids": [900211], "kind": "specials_backfill"}]
+
+    calls: list = []
+
+    async def _run_sequential(specs, **kw):
+        calls.append(specs)
+        return [{"id": 1}]
+
+    monkeypatch.setattr(boards_mod, "refresh_board", _refresh_board)
+    monkeypatch.setattr(boards_mod, "backfill_specs", _specs)
+    monkeypatch.setattr(crawl_service, "run_sequential", _run_sequential)
+    landed = _patch_pool_landing(monkeypatch)
+
+    await sched_mod._make_board_job("specials")()
+
+    assert landed == [], "specials 属临时队列，不落监控池"
+    assert calls and calls[0][0]["kind"] == "specials_backfill"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_board_job_pool_failure_does_not_block_backfill(monkeypatch):
+    """落池失败（无绑定账户 ValueError）：不阻断反哺爬取。"""
+    from app.core import scheduler as sched_mod
+    from app.domains.crawl import service as crawl_service
+    from app.domains.wishlist import service as wishlist_service
+
+    async def _refresh_board(key: str) -> list[int]:
+        return [900221]
+
+    async def _specs(key: str, limit: int = 100):
+        return [{"scope": "appids", "appids": [900221], "kind": "top100_backfill"}]
+
+    calls: list = []
+
+    async def _run_sequential(specs, **kw):
+        calls.append(specs)
+        return [{"id": 1}]
+
+    async def _ensure_fail(appids):
+        raise ValueError("尚未绑定 SteamID64（榜单发现源无法落池）")
+
+    monkeypatch.setattr(boards_mod, "refresh_board", _refresh_board)
+    monkeypatch.setattr(boards_mod, "backfill_specs", _specs)
+    monkeypatch.setattr(crawl_service, "run_sequential", _run_sequential)
+    monkeypatch.setattr(wishlist_service, "ensure_board_pool", _ensure_fail)
+
+    await sched_mod._make_board_job("topsellers")()
+
+    assert calls and calls[0][0]["kind"] == "top100_backfill", "落池失败不得阻断反哺"
 
 
 # ── list_games 集成（真实本地库只读 + mock 热榜）──────────────
