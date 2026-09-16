@@ -313,8 +313,7 @@
 
 .cf-status-tip__row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
 
-/* 头像占位样式已随真头像接入删除：行内头像统一走 HlAvatar（size="sm" square，
-   无头像时组件自带首字符兜底），不再需要本文件手搓的字母圆片。 */
+/* 行内头像统一走 HlAvatar（size="sm" square，无头像时组件自带首字符兜底）。 */
 
 .cf-status-tip__name { white-space: nowrap; color: var(--text-primary); }
 

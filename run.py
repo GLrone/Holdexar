@@ -151,7 +151,7 @@ def build_web() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=f"{APP_NAME} 一键启动")
     parser.add_argument("--server", action="store_true", help="无窗口模式，仅启动本地服务")
-    parser.add_argument("--dev", action="store_true", help="加载 Vite 开发服务器 http://localhost:5173")
+    parser.add_argument("--dev", action="store_true", help="加载 Vite 开发服务器 http://localhost:8080")
     parser.add_argument("--build", action="store_true", help="强制重建前端产物")
     parser.add_argument("--port", default=DEFAULT_PORT, help=f"服务端口（默认 {DEFAULT_PORT}）")
     args = parser.parse_args()
@@ -167,7 +167,7 @@ def main() -> None:
     env = os.environ.copy()
     env[f"{ENV_PREFIX}PORT"] = str(args.port)
     if args.dev:
-        env[f"{ENV_PREFIX}DEV_URL"] = "http://localhost:5173"
+        env[f"{ENV_PREFIX}DEV_URL"] = "http://localhost:8080"
         print(f"[开发] 窗口将加载 {env[f'{ENV_PREFIX}DEV_URL']}（需确保 npm run dev 已运行）")
 
     print(f"[启动] {APP_NAME} · http://127.0.0.1:{args.port} · Ctrl+C 退出")

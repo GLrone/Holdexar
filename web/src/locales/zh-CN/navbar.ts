@@ -10,7 +10,8 @@
 
 const navbar = {
   /* 排序下拉：模块级常量表只存 key，显示文本在模板/computed 里现取 */
-  'navbar.sort.default': '⭐ 默认推荐',
+  'navbar.sort.default': '⭐ 默认排序',
+  'navbar.sort.smart': '🧠 智能排序',
   'navbar.sort.rating': '👍 好评优先',
   'navbar.sort.priceDiff': '💰 差价最大',
   'navbar.sort.discount': '🏷️ 折扣力度',

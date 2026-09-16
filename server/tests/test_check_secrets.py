@@ -100,7 +100,7 @@ def test_allows_synthetic_steam_cookie_fixtures(line):
         # scripts/fx_maintenance.py:70 —— 中文占位符，非真实密码
         '"postgresql://postgres:<本地旧库密码>@localhost:5432/holdexar_archive",',
         # desktop/main.py:8 —— 文档里的用法示例，不是凭据
-        "HOLDEXAR_DEV_URL=http://localhost:5173 python desktop/main.py",
+        "HOLDEXAR_DEV_URL=http://localhost:8080 python desktop/main.py",
     ],
 )
 def test_allows_bare_identifier_and_placeholder_mentions(line):
@@ -173,6 +173,53 @@ def test_mask_never_reveals_the_value():
 
 
 # ── 全树自检：任何新增特征若误伤既有代码，在这里立刻暴露 ──
+
+
+def test_cli_scope_parsing_is_python_version_independent():
+    """`--all` / `--staged` / 指定文件三种范围必须跨 Python 版本同判。
+
+    回归：位置参数曾与 `--staged`/`--all` 同挂一个
+    `add_mutually_exclusive_group`。3.11 上 argparse 把 `nargs="*"` 的位置
+    参数与 `--all` 判成互斥并退出 2（CI 的 3.11 矩阵条目整条红灯），
+    3.12 / 3.13 上同一份代码却放行——门禁的通过与否不该由解释器版本决定。
+    """
+    assert check_secrets.parse_args(["--all"]).all is True
+    assert check_secrets.parse_args(["--staged"]).staged is True
+    explicit = check_secrets.parse_args(["a.py", "b.py"])
+    assert explicit.paths == ["a.py", "b.py"]
+
+    for argv in ([], ["--all", "a.py"], ["--staged", "--all"]):
+        with pytest.raises(SystemExit) as excinfo:
+            check_secrets.parse_args(argv)
+        assert excinfo.value.code == 2, f"{argv} 应判为用法错误"
+
+
+def test_output_encoding_falls_back_when_stream_cannot_encode_chinese():
+    """控制台编码装不下中文时，门禁结论不得因 UnicodeEncodeError 判失败。
+
+    回归：GitHub Actions 的 windows-latest 上 Python 3.13 判定标准输出为
+    cp1252，零命中的成功路径打印 `[门禁] [OK] ...` 时抛
+    `UnicodeEncodeError`，以退出码 1 结束——门禁把「检查通过」报成了失败。
+    """
+    class _Stream:
+        def __init__(self, encoding):
+            self.encoding = encoding
+            self.reconfigured = None
+
+        def reconfigure(self, **kwargs):
+            self.reconfigured = kwargs
+
+    ascii_only = _Stream("cp1252")
+    utf8 = _Stream("utf-8")
+    stdout, stderr = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = ascii_only, utf8
+    try:
+        check_secrets._ensure_output_encoding()
+    finally:
+        sys.stdout, sys.stderr = stdout, stderr
+
+    assert ascii_only.reconfigured == {"encoding": "utf-8", "errors": "backslashreplace"}
+    assert utf8.reconfigured is None, "装得下中文的流不应被改写编码"
 
 
 def test_whole_tree_is_clean():

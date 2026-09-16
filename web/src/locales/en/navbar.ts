@@ -4,7 +4,8 @@ import type { MessageKey } from '../zh-CN'
 
 const navbar: Partial<Record<MessageKey, string>> = {
   /* Sort dropdown */
-  'navbar.sort.default': '⭐ Recommended',
+  'navbar.sort.default': '⭐ Default',
+  'navbar.sort.smart': '🧠 Smart',
   'navbar.sort.rating': '👍 Top rated',
   'navbar.sort.priceDiff': '💰 Biggest gap',
   'navbar.sort.discount': '🏷️ Deepest discount',

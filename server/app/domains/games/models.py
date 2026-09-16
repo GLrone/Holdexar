@@ -10,6 +10,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Float,
     Index,
     Integer,
     String,
@@ -52,6 +53,9 @@ class Game(Base):
     min_cny_fen: Mapped[int | None] = mapped_column(BigInteger)
     # diff_fen = CN 价 - COALESCE(最低, CN 价)（下限 0；无 CN 价时为 0）
     diff_fen: Mapped[int] = mapped_column(Integer, default=0)
+    # smart 排序评分预计算列（refresh_sort_cache 维护，公式见 scoring.py；
+    # 0~1 浮点，NULL=尚未计算——DESC 排序天然沉底）
+    smart_score: Mapped[float | None] = mapped_column(Float)
     is_adult: Mapped[bool] = mapped_column(Boolean, default=False)  # 成人内容
     is_visual_novel: Mapped[bool] = mapped_column(Boolean, default=False)  # 视觉小说
     release_date: Mapped[str | None] = mapped_column(String(50))

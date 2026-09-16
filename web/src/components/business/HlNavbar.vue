@@ -27,6 +27,7 @@ let scrollEl: HTMLElement | null = null
    显示文本一律在模板 / computed 里现取。 */
 const sortOptions: { key: SortKey; labelKey: MessageKey }[] = [
   { key: 'default', labelKey: 'navbar.sort.default' },
+  { key: 'smart', labelKey: 'navbar.sort.smart' },
   { key: 'rate', labelKey: 'navbar.sort.rating' },
   { key: 'diff', labelKey: 'navbar.sort.priceDiff' },
   { key: 'discount', labelKey: 'navbar.sort.discount' },
@@ -74,7 +75,9 @@ function handleSelectRegion(code: string) {
 function selectSort(key: SortKey) {
   store.sortBy = key
   showSortMenu.value = false
-  if (key === 'default') {
+  // 智能排序是默认态（「回到常态推荐」）：选它即回到全区最低视角。
+  // 旧算法（default）现为普通选项，不再触发重置。
+  if (key === 'smart') {
     store.region = ''
     store.filterMode = 'global'
   }
@@ -135,7 +138,7 @@ onBeforeUnmount(() => {
           <div ref="sortRef" class="region-dropdown">
             <button
               class="sort-dropdown-btn"
-              :class="{ active: store.sortBy !== 'default' }"
+              :class="{ active: store.sortBy !== 'smart' }"
               @click="showSortMenu = !showSortMenu"
             >
               {{ currentSortLabel }} ▼

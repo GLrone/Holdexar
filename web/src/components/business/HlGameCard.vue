@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { gamesApi, familyApi, type GameListItem, type GameVersionPrices, type LinkedBundle } from '@/api/client'
 import { compactRegionName, flagUrl } from '@/api/regions'
@@ -129,6 +129,8 @@ watch(
 const giftRegion = ref<string | null>(null)
 const giftPopupPos = ref<{ top: number; left: number } | null>(null)
 const giftPopupRef = ref<HTMLElement | null>(null)
+/** 赠礼弹窗的锚点行（被点的那条地区）；行被重挂（换版本）后即失效 */
+const giftAnchorRef = ref<HTMLElement | null>(null)
 
 // ─── 徽章体系（折扣/归属/标题三组徽章）───
 
@@ -399,23 +401,52 @@ function formatReviews(count: number): string {
   return t('gameCard.reviewCount', { n })
 }
 
-// ─── GPW 弹窗 ───
+// ─── GPW 弹窗 ──
 
+/** 弹窗实测宽度（未挂载时按 CSS 声明兜底：列表 360 / 柱状图 480）。
+ *  此前写死 320（CSS 早已是 360），右侧明明放得下也会误判翻到左边。 */
+function popoverWidth(): number {
+  return gpwPopoverRef.value?.offsetWidth || (activeTab.value === 'chart' ? 480 : 360)
+}
+
+/**
+ * 弹窗落位：**顶对齐卡片顶** + 贴卡片右侧（右侧放不下翻左侧）。
+ *
+ * 竖向**不夹视口**——夹住的话「贴着卡片」只在卡片处于屏幕上中部时成立：卡片落到
+ * 下半屏弹窗被上提一截，继续滚动又会被钉在屏幕边缘不动，用户看到的就是「滚轮一转，
+ * 弹窗就不贴着卡片了」。卡片滚到哪弹窗跟到哪（超出视口的部分交给弹窗自身的
+ * max-height 80vh + 内滚动），这才是「吸附」的完整语义。
+ *
+ * 坐标用文档坐标（rect + window.scrollY）：页面滚动发生在应用级滚动容器
+ * `.view-container` 里、文档自身不滚，所以跟随必须靠自己重算（见 onViewportChange）。
+ */
 function computePopoverPos() {
   if (!cardRef.value) return
   const rect = cardRef.value.getBoundingClientRect()
-  const popoverW = 320
+  const w = popoverWidth()
   let left = rect.right + 12 + window.scrollX
-  if (rect.right + 12 + popoverW > window.innerWidth) {
-    left = rect.left - popoverW - 12 + window.scrollX
+  if (rect.right + 12 + w > window.innerWidth) {
+    left = rect.left - w - 12 + window.scrollX
   }
   if (left < window.scrollX + 8) left = window.scrollX + 8
-  let top = rect.top + window.scrollY
-  const popoverH = 600
-  const maxTop = window.scrollY + window.innerHeight - popoverH - 10
-  if (top > maxTop) top = maxTop
-  if (top < window.scrollY + 10) top = window.scrollY + 10
-  popoverPos.value = { top, left }
+  popoverPos.value = { top: rect.top + window.scrollY, left }
+}
+
+/**
+ * 跟住卡片：滚动（含内层滚动容器）与视口变化时重算位置。
+ *
+ * scroll 事件不冒泡，所以在 document 上**捕获**阶段监听——一处覆盖 window 滚动
+ * 与任意内层滚动容器；弹窗自己内部的滚动（`.gpw-popover-body`）跳过，那种滚动
+ * 卡片没动、重算纯属白干。用文档坐标落位的弹窗在内层容器滚动时不会自己跟着走，
+ * 这就是「滚轮一转，弹窗就不贴着卡片了」的成因。
+ */
+function onViewportChange(e?: Event) {
+  if (!showGpw.value || !cardRef.value) return
+  if (e?.type === 'scroll' && e.target instanceof Node && gpwPopoverRef.value?.contains(e.target)) {
+    return
+  }
+  computePopoverPos()
+  computeGiftPopupPos()
 }
 
 function toggleGpw() {
@@ -424,11 +455,21 @@ function toggleGpw() {
     loadCdkForVersion()
     loadBundles()
     loadGpwVersions()
-  } else {
-    giftRegion.value = null
+    showGpw.value = true
+    // 挂载后按真实尺寸再校一次（打开前量不到 DOM，只能按兜底尺寸估）
+    void nextTick(() => {
+      if (showGpw.value) computePopoverPos()
+    })
+    return
   }
-  showGpw.value = !showGpw.value
+  giftRegion.value = null
+  showGpw.value = false
 }
+
+/** 列表 / 柱状图 tab 的宽度不同（360 / 480），切换后按新尺寸重排一次 */
+watch(activeTab, () => {
+  if (showGpw.value) void nextTick(computePopoverPos)
+})
 
 // ─── GPW 版本选择（同价格走势的 versionKey 语义）───
 const gpwVersionKey = ref(0)
@@ -630,11 +671,16 @@ function onDocClick(e: MouseEvent) {
 
 onMounted(() => {
   document.addEventListener('mousedown', onDocClick)
+  // 捕获阶段监听：一处覆盖 window 滚动与任意内层滚动容器（scroll 不冒泡）
+  document.addEventListener('scroll', onViewportChange, { capture: true, passive: true })
+  window.addEventListener('resize', onViewportChange)
   ownershipStore.ensure(props.game.appid)
   followsStore.ensure()
 })
 onBeforeUnmount(() => {
   document.removeEventListener('mousedown', onDocClick)
+  document.removeEventListener('scroll', onViewportChange, { capture: true })
+  window.removeEventListener('resize', onViewportChange)
   if (coverTimer) window.clearTimeout(coverTimer)
   if (statusTipTimer !== null) window.clearTimeout(statusTipTimer)
 })
@@ -769,6 +815,24 @@ const giftFriendReceiveRows = computed(() =>
     .sort((a, b) => (a.receiveFromFen ?? 0) - (b.receiveFromFen ?? 0)),
 )
 
+/** 赠礼弹窗落位：贴被点击的地区行右侧、顶对齐该行（口径同主弹窗：不夹视口，随滚动重算）。 */
+function computeGiftPopupPos() {
+  const anchor = giftAnchorRef.value
+  if (!giftRegion.value || !anchor?.isConnected) {
+    // 锚点行没了（换版本把行重挂了）：与其让它漂在旧位置，不如关掉
+    giftRegion.value = null
+    return
+  }
+  const rect = anchor.getBoundingClientRect()
+  const popupW = giftPopupRef.value?.offsetWidth || 380
+  let left = rect.right + 8 + window.scrollX
+  if (rect.right + 8 + popupW > window.innerWidth) {
+    left = rect.left - popupW - 8 + window.scrollX
+  }
+  if (left < window.scrollX + 8) left = window.scrollX + 8
+  giftPopupPos.value = { top: rect.top + window.scrollY, left }
+}
+
 function handleRegionClick(regionCode: string, e: MouseEvent) {
   e.stopPropagation()
   if (giftRegion.value === regionCode) {
@@ -776,20 +840,9 @@ function handleRegionClick(regionCode: string, e: MouseEvent) {
     return
   }
   void loadGiftFriends()
-  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
-  const popupW = 380
-  let left = rect.right + 8 + window.scrollX
-  if (rect.right + 8 + popupW > window.innerWidth) {
-    left = rect.left - popupW - 8 + window.scrollX
-  }
-  if (left < window.scrollX + 8) left = window.scrollX + 8
-  let top = rect.top + window.scrollY
-  const popupH = 500
-  const maxTop = window.scrollY + window.innerHeight - popupH - 10
-  if (top > maxTop) top = maxTop
-  if (top < window.scrollY + 10) top = window.scrollY + 10
-  giftPopupPos.value = { top, left }
+  giftAnchorRef.value = e.currentTarget as HTMLElement
   giftRegion.value = regionCode
+  computeGiftPopupPos()
 }
 
 function priceClass(rec: RegionPrice): string {
@@ -1087,10 +1140,6 @@ const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/asse
           <span v-if="diffYuan > 0" class="diff-badge positive">
             {{ t('gameCard.price.save', { amount: diffYuan }) }}
           </span>
-          <!-- 行内覆盖已删：.diff-badge 基座（hl-gamecard.css:493）本就是
-               var(--surface-chip-2)→var(--surface-chip) 渐变 + var(--text-on-fill) 文字，
-               这行 `#555/#fff/#666` 是同一徽章的第二套配色，且三色都不随主题。
-               bundles/Index.vue:563 的同名徽章一直走基座——此处是分叉的那一份。 -->
           <span v-else class="diff-badge">{{ t('gameCard.price.noDiff') }}</span>
         </div>
       </div>

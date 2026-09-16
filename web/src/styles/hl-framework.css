@@ -953,9 +953,7 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
   border-radius: 2px 2px 0 0;
 }
 .hl-tabs__body { padding: 14px 2px; font-size: 13px; color: var(--text-secondary); min-height: 60px; }
-/* `.hl-tabs__pane` 已删除：全项目零引用（HlTabs.vue 不渲染它，各视图也从未写过这个类名）。
-   它挂的那条 hlFadeUp 是「tab 面板切换有过渡」的假象来源——真正在切面板的地方
-   （family 十个 tab 等）是 display:none→block 瞬切，需要过渡的请用 HlPaneSwitch。 */
+/* 需要过渡的面板切换请用 HlPaneSwitch（display:none→block 瞬切的 tab 面板不带过渡）。 */
 
 /* Pagination */
 .hl-pagination { display: flex; align-items: center; gap: 4px; font-size: 13px; }
@@ -1196,9 +1194,7 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
    实测本机 WebView2 的合成路径下 backdrop-filter 只压暗不模糊（边缘能量恰好等于
    纯压暗的预测值），普通 filter 在软件渲染下同样有效。半径比站内小弹层的 8px 大，
    满屏尺度下 8px 糊感不足；补一点饱和度，色彩透过来才不灰成一片。
-   选择器按「外壳的直接子块」取（侧边栏 + 主列都在内），不写死组件根类名——
-   曾经写死 .app-shell__sidebar 而组件真实根类是 .hl-sidebar，结果侧边栏只被压暗
-   没被糊。遮罩自己排除在外。 */
+   选择器按「外壳的直接子块」取（侧边栏 + 主列都在内），不写死组件根类名；遮罩自己排除在外。 */
 .app-shell.is-curtained > :not(.hl-close-curtain) {
   filter: blur(16px) saturate(1.2);
   transition: filter calc(var(--duration-2) * var(--motion-scale)) var(--ease-inout);
@@ -1719,12 +1715,8 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
 .hl-icon-btn:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
 .hl-icon-btn svg { width: 17px; height: 17px; }
 
-/* 统计卡的样式已收进 components/ui/HlStat.vue 的 scoped 样式。
-   原先这里有一份 `.hl-stat` 全局定义，全项目**零引用**（活的那份在各视图里叫
-   fx-mini-stat / lib-stat / pa-kpi / vi-kpi / wl-kpi，共五套）。留着它就会出现
-   「.hl-stat 这个名字同时有全局与 scoped 两份定义」——scoped 那份带属性选择器、
-   特异性更高，全局这份永远不生效，是最难查的一类失效样式。
-   新组件把三档尺寸（sm/md/lg）与默认居中都写在组件内，全项目一处定义。 */
+/* 统计卡样式收在 components/ui/HlStat.vue 的 scoped 样式内：
+   三档尺寸（sm/md/lg）与默认居中都在组件里，全项目一处定义。 */
 
 /* ══════════ 横幅滚动 Banner Marquee ══════════ */
 .hl-banner {
@@ -1764,9 +1756,6 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
 .hl-banner.fast .hl-banner__track { animation-duration: 10s; }
 
 /* ══════════ 滚动列表容器（components/ui/HlScrollList.vue）══════════
-   本块此前是两份并存的东西：一份零引用的 `.hl-scroll-list*` 空壳，和
-   AnimatedList.vue 自带的 scoped `.scroll-list*`（真正在渲染的那份）。
-   两者本就是同一件东西，组件合并后样式合并到这里。
    高度由组件的 `maxHeight` prop 写进 `--list-max-h`，容器与滚动区同取一值。 */
 .hl-scroll-list-container {
   position: relative;
@@ -1849,11 +1838,7 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
   position: relative;
   display: inline-flex;
   align-items: center;
-  /* 原先这里有 --gn-color-1..8 一份 8 色板，与本组件 HlGooeyNav.vue 的 COLOR_VARS
-     逐字重复，且**全库零消费**（粒子取色是组件把 COLOR_VARS 直接写成行内
-     `--color`，见 .hl-gn-point { background: var(--color) }）。
-     同一份色板两个定义 = 改一处必漏另一处，故删掉 CSS 这一份，
-     只留组件里那份活的（已在 check-colors.mjs 的 ALLOW 登记）。 */
+  /* 粒子取色由组件注入行内 `--color`（见 .hl-gn-point）。 */
 }
 .hl-gooey-nav nav { display: flex; position: relative; transform: translate3d(0, 0, 0.01px); }
 .hl-gooey-nav ul {
@@ -2225,9 +2210,7 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
   animation-play-state: paused;
   transform: rotate(8deg) scale(1.08);
 }
-/* 品牌文字区宽度 = 232 − 14×2(sidebar padding) − 8×2(brand padding) − 36(logo) − 12(gap)
-   副标题（品牌名下的站点标语）已移除：腾出的位置给品牌名与收起按键，
-   品牌名因此放大加粗，不再需要为标语预留两行。 */
+/* 品牌文字区宽度 = 232 − 14×2(sidebar padding) − 8×2(brand padding) − 36(logo) − 12(gap) */
 .hl-sb-brand__txt { overflow: hidden; min-width: 0; }
 .hl-sb-brand__name {
   font-size: 17px;
@@ -2393,9 +2376,7 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
   box-shadow: 0 0 0 2px var(--bg-card);
 }
 .hl-sidebar.is-collapsed .hl-sb-dot { top: 8px; right: 8px; }
-/* 折叠态自绘 tooltip 已废止：气泡要溢出侧边栏就需 overflow: visible，
-   那会破坏 nav 的最小高度语义（见 .hl-sidebar.is-collapsed 注释——收起后
-   收拢钮被挤出视口的根因）。收起态条目提示改走原生 title（HlSideNav 模板）。 */
+/* 收起态条目提示走原生 title（HlSideNav 模板）。 */
 .hl-sidebar.is-collapsed .hl-sb-item__label { opacity: 0; width: 0; }
 .hl-sidebar.is-collapsed .hl-sb-item { justify-content: center; padding: 9px; }
 
@@ -2416,8 +2397,7 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
 .hl-sb-nav > :nth-child(14) { animation-delay: 0.7s; }
 .hl-sb-nav > :nth-child(n + 15) { animation-delay: 0.75s; }
 
-/* 底部收拢按键（.hl-sb-foot / .hl-sb-collapse-btn）已移除：导航项多时它会被
-   溢出内容顶出视口，收起后就没法再展开。收起/展开统一走头部品牌区。 */
+/* 收起/展开统一走头部品牌区。 */
 
 /* ══════════ 顶栏主题切换按键（纯图标）══════════ */
 .hl-theme-btn {
@@ -2678,8 +2658,7 @@ html.dark .hl-theme-btn svg { transform: rotate(180deg); }
   from { opacity: 0; }
   to { opacity: 1; }
 }
-/* hlPopIn / hlDialogIn 已删除：弹层与对话框改用 <Transition>（.hl-pop-* / .hl-dialog-pop-*），
-   这两条入场 animation 随之失去消费方——留着就是「改了过渡但旧动画仍在某处生效」的陷阱源。 */
+/* 弹层与对话框入场用 <Transition>（.hl-pop-* / .hl-dialog-pop-*）。 */
 @keyframes hlToastIn {
   from { opacity: 0; transform: translateY(-14px) scale(0.95); }
   to { opacity: 1; transform: none; }

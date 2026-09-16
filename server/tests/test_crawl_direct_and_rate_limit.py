@@ -74,6 +74,15 @@ def _crawl_env(monkeypatch):
 
     monkeypatch.setattr(settings_service, "get_value", _value)
 
+    # 出口 IP 统计打桩：无可用出口（直连形态）→ worker 数回退默认口径；
+    # 不桩会走真实 proxies 域会话工厂（触生产库）
+    import app.domains.proxies.service as proxies_service
+
+    async def _pool_stats():
+        return {"available": 0}
+
+    monkeypatch.setattr(proxies_service, "pool_stats", _pool_stats)
+
     async def _noop(*a, **kw):
         return 0
 

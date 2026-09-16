@@ -398,3 +398,33 @@ async def test_hide_family_sharing(_seed_family_filter, monkeypatch):
     monkeypatch.setattr(service, "_primary_steamid", _no_primary)
     ids = await _ids(hide_family_sharing=True)
     assert {APP_OWNED, APP_FAMILY, APP_NONE} <= ids
+
+
+@pytest.mark.asyncio
+async def test_flag_hl_three_states():
+    """flag=new/flat/nonhl 史低三态细分（实验池对照用；既有 hl/pp/any 语义不动）。
+
+    三条断言：各态返回项标记纯净、三态两两不重叠、三态总数恰为全库
+    （划分全集——漏一边或重复计入都会让总数对不上）。
+    """
+    new = await _fetch(flag="new", limit=100)
+    flat = await _fetch(flag="flat", limit=100)
+    nonhl = await _fetch(flag="nonhl", limit=100)
+
+    assert all(it["hlFlag"] == 1 for it in new["items"])
+    assert all(it["hlFlag"] == 2 for it in flat["items"])
+    assert all(it["hlFlag"] not in (1, 2) for it in nonhl["items"])
+
+    ids_new = {it["appid"] for it in new["items"]}
+    ids_flat = {it["appid"] for it in flat["items"]}
+    ids_non = {it["appid"] for it in nonhl["items"]}
+    assert not (ids_new & ids_flat)
+    assert not (ids_new & ids_non)
+    assert not (ids_flat & ids_non)
+
+    whole = await _fetch(limit=1)
+    assert new["total"] + flat["total"] + nonhl["total"] == whole["total"]
+
+    # 既有语义回归：hl 总数 = new + flat 总数（两态不相交，见上）
+    both = await _fetch(flag="hl", limit=1)
+    assert both["total"] == new["total"] + flat["total"]

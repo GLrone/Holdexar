@@ -218,13 +218,66 @@ def explicit(paths: list[str]) -> tuple[list[Finding], list[str]]:
     return findings, paths
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Holdexar 敏感面门禁")
-    group = parser.add_mutually_exclusive_group(required=True)
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """解析「范围」参数：`--staged` / `--all` / 指定文件，三选一。
+
+    **为什么不把位置参数塞进 `add_mutually_exclusive_group`**：那条写法在
+    Python 3.11 与 3.13 上行为不一致——3.12 起允许 `--all` 与 `nargs="*"`
+    的位置参数并存（位置参数取到空列表），3.11 却直接判定「argument paths:
+    not allowed with argument --all」并退出 2。CI 的 3.11 矩阵条目因此整个
+    红灯（实测：3.11.16 复现，3.12 / 3.13 不复现）。参数解析不能随解释器
+    版本改判定，故互斥改由下面这行显式校验承担，各版本行为一致。
+    """
+    parser = argparse.ArgumentParser(
+        prog="check_secrets.py",
+        description="Holdexar 敏感面门禁",
+        usage="%(prog)s [-h] (--staged | --all | <path>...)",
+    )
+    group = parser.add_mutually_exclusive_group()
     group.add_argument("--staged", action="store_true", help="只检查已暂存的改动（pre-commit）")
     group.add_argument("--all", action="store_true", help="扫描全部已跟踪文件（CI）")
-    group.add_argument("paths", nargs="*", default=None, help=argparse.SUPPRESS)
-    args = parser.parse_args()
+    parser.add_argument("paths", nargs="*", help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+
+    if sum((args.staged, args.all, bool(args.paths))) != 1:
+        parser.error("必须且只能指定一种范围：--staged / --all / <path>...")
+    return args
+
+
+def _ensure_output_encoding() -> None:
+    """输出编码兜底：控制台编码装不下中文时，把流切到 UTF-8。
+
+    GitHub Actions 的 windows-latest 上，Python 3.13 把标准输出判定为
+    cp1252（宿主继承的代码页，而非中文 Windows 的 cp936），打印
+    `[门禁] [OK] ...` 会抛 `UnicodeEncodeError: 'charmap' codec ...` 并
+    以退出码 1 结束——**门禁检查本身零命中，却让 CI 判成失败**（实测复现：
+    `PYTHONIOENCODING=cp1252`）。这里按流自身的编码能力决定是否切换：
+    cp936 能装下中文就原样保留（本机控制台正常），装不下才换 UTF-8，
+    避免把「本机读得通」换成「本机乱码」。
+    """
+    probe = "门禁"
+    for stream in (sys.stdout, sys.stderr):
+        encoding = getattr(stream, "encoding", None)
+        if not encoding:
+            continue
+        try:
+            probe.encode(encoding)
+        except (UnicodeEncodeError, LookupError):
+            pass
+        else:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (OSError, ValueError):
+            continue
+
+
+def main() -> int:
+    _ensure_output_encoding()
+    args = parse_args()
 
     if args.staged:
         findings, files = staged_added_lines()
@@ -236,9 +289,9 @@ def main() -> int:
         findings, files = explicit(args.paths)
         scope = f"指定文件（{len(files)} 个）"
 
-    # 输出一律用 cp936 可编码的字符：本机 Windows 控制台是 cp936，
-    # `✓`/`✗`（U+2713/U+2717）不在该字符集内，Python 会退化成字面 `✗`
-    # 打印出来。用 ASCII 标记，中英文在 cp936 与 UTF-8 下都能正常显示。
+    # 结论行只用 ASCII 标记（OK / FAIL）：`✓`/`✗`（U+2713/U+2717）在
+    # 中文控制台的 cp936 下同样打不出来，会退化成字面 `✗`。中文说明文字
+    # 由 _ensure_output_encoding() 兜底，不靠这里的字符选型回避。
     if not findings:
         print(f"[门禁] [OK] 敏感面检查通过 —— {scope}")
         return 0

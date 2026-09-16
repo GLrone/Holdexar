@@ -34,5 +34,5 @@ export function formatCnyFen(fen: number | null | undefined): string {
   return `¥${(fen / 100).toFixed(2)}`
 }
 
-export type SortKey = 'default' | 'rate' | 'diff' | 'discount' | 'top100' | 'new2026'
+export type SortKey = 'default' | 'smart' | 'rate' | 'diff' | 'discount' | 'top100' | 'new2026'
 export type FilterMode = 'global' | 'cheaper' | 'highdiff'

@@ -53,7 +53,8 @@ export default defineConfig({
     },
   },
   server: {
-    port: 5173,
+    // 避开 Windows 保留端口段（Hyper-V/WSL 常占 5141-5240 等），5173 落在该段内会 EACCES
+    port: 8080,
     proxy: {
       // 并行验证可 VITE_PROXY_TARGET 覆盖（默认 28765 主后端不动）
       '/api': process.env.VITE_PROXY_TARGET || 'http://127.0.0.1:28765',

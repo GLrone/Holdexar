@@ -55,6 +55,8 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         # 排序缓存预计算列（对齐 mv_game_sort_cache）
         "min_cny_fen": "BIGINT",
         "diff_fen": "INTEGER DEFAULT 0",
+        # smart 排序评分（refresh_sort_cache 维护；NULL=未计算）
+        "smart_score": "REAL",
         # 商店移除监控：下架判定时间戳 + 连续全 404 轮数
         "removed_at": "DATETIME",
         "removed_strikes": "INTEGER DEFAULT 0",

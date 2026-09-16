@@ -59,9 +59,7 @@ const ratesStore = useRatesStore()
 /** tooltip 主题化配色（api/chartTheme 统一出口；悬停提示窗红线配套） */
 const tipPalette = useTipPalette()
 
-/** 画布配色（网格 / 轴 / 轴文字 / 系列色，同出口）。
- *  此处曾有一份私有的 cssVar() 与一个从未被引用的 themeStore —— 私有副本正是本图
- *  8 处颜色写死成深色主题取值、切主题再不跟随的来源。 */
+/** 画布配色（网格 / 轴 / 轴文字 / 系列色，同出口）。 */
 const palette = useChartPalette()
 
 /** 追踪多选下拉的选项源（服务端白名单全集，与 CC_LIST 同序）。
@@ -70,9 +68,7 @@ const palette = useChartPalette()
 const currencyOptions = CURRENCIES
 
 /** HlSelect 格式币种选项（带国旗）。
- *  用 `api/selectOptions.ts` 的统一出口，不再本地复制一份：这里的 label 原先直接
- *  读 `c.zh`，与出口的 `currencyZh(c.code)` 是同一件事的两种写法，只是当时没人
- *  发现出口是死代码。出口的 label 现已随语言（currencyName）。 */
+ *  走 `api/selectOptions.ts` 的统一出口，label 随语言（currencyName）。 */
 const currencySelectOptions = computed<HlSelectOption[]>(() => buildCurrencyOptions())
 
 /** 自选追踪（localStorage 持久化；只影响展示，服务端始终抓取全量） */

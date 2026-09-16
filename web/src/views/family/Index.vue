@@ -14,8 +14,7 @@ import FamContrib from './tabs/FamContrib.vue'
 import FamHeat from './tabs/FamHeat.vue'
 import FamBuy from './tabs/FamBuy.vue'
 import FamWish from './tabs/FamWish.vue'
-// 价值洞察/成员洞察页签已移除；游玩动态已迁至游戏库页
-// （views/gamelib/tabs/GlPlay.vue，词条 famPlay.* 随迁）
+// 游玩动态在游戏库页（views/gamelib/tabs/GlPlay.vue，词条 famPlay.* 随迁）
 
 const regionsStore = useRegionsStore()
 const libStore = useFamilyStore()
@@ -887,11 +886,6 @@ const excludedBySteamid = computed(() => {
 }
 
 /* 标签卡 */
-/* `.tabs` / `.tabs__bar` / `.tabs__item` / `.tabs__body` 曾在这里——页签栏是本文件
-   手写的第三份实现（另两份是 `HlTabs` 组件与 bills 里手抄的 `.hl-segmented`），
-   已改回 `HlTabs`。`.tabs__pane { display:none } / .is-on { display:block }` 更早
-   一步就已删除：面板显隐由 `HlPaneSwitch` 的 `<Transition>` 接管。
-   只剩外面这层的位置微调。 */
 .fam-tabs { margin-top: 12px; }
 
 /* ── 拖拽排序 ── */

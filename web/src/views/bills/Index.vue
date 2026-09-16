@@ -447,8 +447,6 @@ onMounted(async () => {
               <div class="section-title">{{ t('bills.chart.title') }}</div>
               <div class="section-desc">{{ t('bills.chart.desc') }}</div>
             </div>
-            <!-- 此前是把 `.hl-segmented` / `.hl-segmented__item` 手抄一遍的等价实现，
-                 改回组件（HlSegmented 此前全项目零引用）。 -->
             <HlSegmented v-model="chartYear" :options="yearOptions" />
           </div>
           <VChart
