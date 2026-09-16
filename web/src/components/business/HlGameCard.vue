@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { gamesApi, familyApi, type GameListItem, type LinkedBundle } from '@/api/client'
+import { gamesApi, familyApi, type GameListItem, type GameVersionPrices, type LinkedBundle } from '@/api/client'
 import { compactRegionName, flagUrl } from '@/api/regions'
 import { normalizeAvatarUrl } from '@/api/avatar'
 import { useI18n, useLocaleFormat, type MessageKey } from '@/locales'
@@ -21,6 +21,8 @@ import {
 } from '@/lib/assetCache'
 import { useTrendDrawerStore } from '@/stores/trendDrawer'
 import { isPermChangeRecent } from '@/lib/priceFlag'
+import { selectableVariants, versionSelectOptions } from '@/lib/versions'
+import HlSelect from '@/components/ui/HlSelect.vue'
 import PriceTrendDrawer from './PriceTrendDrawer.vue'
 
 function formatCnyText(fen: number): string {
@@ -334,23 +336,6 @@ function isEnabledCode(code: string): boolean {
     : props.enabledRegions.includes(code)
 }
 
-const sortedRegions = computed(() =>
-  regionPrices.value
-    .filter((p) => !p.locked && isEnabledCode(p.code))
-    .sort((a, b) => a.cnyFen - b.cnyFen),
-)
-
-const chartRegions = computed(() =>
-  regionPrices.value
-    .filter((p) => isEnabledCode(p.code))
-    .sort((a, b) => {
-      if (a.locked && !b.locked) return -1
-      if (!a.locked && b.locked) return 1
-      if (a.locked && b.locked) return 0
-      return a.cnyFen - b.cnyFen
-    }),
-)
-
 const cnPriceFen = computed(() => props.game.basePriceFen ?? 0)
 
 /** 列表模式价格列固定 70px（国旗+奖牌占位），超过 4 字的地区名走简写。
@@ -436,31 +421,131 @@ function computePopoverPos() {
 function toggleGpw() {
   if (!showGpw.value) {
     computePopoverPos()
-    loadCdk()
+    loadCdkForVersion()
     loadBundles()
+    loadGpwVersions()
   } else {
     giftRegion.value = null
   }
   showGpw.value = !showGpw.value
 }
 
+// ─── GPW 版本选择（同价格走势的 versionKey 语义）───
+const gpwVersionKey = ref(0)
+const gpwVersions = ref<GameVersionPrices[] | null>(null)
+let gpwVersionsSeq = 0
+
+/** 标准版（value 0）与各变体；标准版的多个 sub 代际不重复成行，见 lib/versions.ts */
+const gpwVersionOptions = computed(() => versionSelectOptions(gpwVersions.value ?? [], t))
+
+const gpwHasMultipleVersions = computed(() => selectableVariants(gpwVersions.value ?? []).length > 0)
+
+const gpwSelectedVersion = computed(() => {
+  if (gpwVersionKey.value === 0 || !gpwVersions.value) return null
+  return gpwVersions.value.find((v) => v.subId === gpwVersionKey.value) ?? null
+})
+
+/** 版本感知的地区价格：选中具体版本时从版本数据取，否则回落标准版 `regionPrices` */
+const gpwDisplayPrices = computed<RegionPrice[]>(() => {
+  const ver = gpwSelectedVersion.value
+  if (!ver) return regionPrices.value
+  return regionsStore.metas.map((region) => {
+    const vrp = ver.regions[region.code.toUpperCase()]
+    const unavailable =
+      !vrp && (props.game.unavailableRegions || []).includes(region.code.toUpperCase())
+    const base = {
+      code: region.code.toLowerCase(),
+      name: region.name,
+      flag: flagUrl(region.code),
+      nativePrice: '-',
+      cnyFen: 0,
+      nativeCents: 0,
+      locked: true,
+      unavailable,
+    }
+    if (!vrp) return base
+    return {
+      ...base,
+      nativePrice: vrp.formatted,
+      cnyFen: vrp.cnyFen ?? 0,
+      nativeCents: vrp.cents,
+      locked: (vrp.cnyFen ?? 0) <= 0,
+    }
+  })
+})
+
+async function loadGpwVersions() {
+  const seq = ++gpwVersionsSeq
+  try {
+    const res = await gamesApi.versions(props.game.appid)
+    if (seq !== gpwVersionsSeq) return
+    gpwVersions.value = res.versions
+    // 如果当前选择的版本已不在列表 → 回落标准版
+    if (gpwVersionKey.value !== 0 && !res.versions.some((v) => v.subId === gpwVersionKey.value)) {
+      gpwVersionKey.value = 0
+    }
+  } catch {
+    if (seq === gpwVersionsSeq) gpwVersions.value = null
+  }
+}
+
+/** gpwRegions = 由版本数据决定展示内容，取代原先直取 regionPrices */
+const gpwRegions = computed(() => gpwDisplayPrices.value.filter((p) => isEnabledCode(p.code)))
+
+const sortedRegions = computed(() =>
+  gpwDisplayPrices.value
+    .filter((p) => !p.locked && isEnabledCode(p.code))
+    .sort((a, b) => a.cnyFen - b.cnyFen),
+)
+
+const chartRegions = computed(() =>
+  gpwDisplayPrices.value
+    .filter((p) => isEnabledCode(p.code))
+    .sort((a, b) => {
+      if (a.locked && !b.locked) return -1
+      if (!a.locked && b.locked) return 1
+      if (a.locked && b.locked) return 0
+      return a.cnyFen - b.cnyFen
+    }),
+)
+
+/** 切换版本 → 地区价格区块随 gpwDisplayPrices 联动，CDK 改取该版本的价格 */
+watch(gpwVersionKey, (subId, prev) => {
+  if (subId === prev || !showGpw.value) return
+  loadCdkForVersion()
+})
+
 // ─── CDK 第三方平台 ───
 
 const cdkLoading = ref(false)
 const cdkSteampy = ref<CdkPlatform | null>(null)
 const cdkCici = ref<CdkPlatform | null>(null)
-let cdkFetched = false
+/** 前端 per-version CDK 缓存（每个版本一分钟只请求一次外部接口） */
+const CDK_CACHE_TTL = 60_000
+const cdkVersionCache = new Map<string, { ts: number; steampy: CdkPlatform; cici: CdkPlatform }>()
 
-async function loadCdk() {
-  if (cdkFetched) return
-  cdkFetched = true
+/** 按当前选中版本查 CDK：标准版不传 subId（后端从库内解析），变体传各自 subId */
+function loadCdkForVersion() {
+  loadCdk(gpwVersionKey.value === 0 ? undefined : gpwVersionKey.value)
+}
+
+async function loadCdk(subId?: number) {
+  const key = subId !== undefined ? String(subId) : 'default'
+  const cached = cdkVersionCache.get(key)
+  if (cached && Date.now() - cached.ts < CDK_CACHE_TTL) {
+    cdkSteampy.value = cached.steampy
+    cdkCici.value = cached.cici
+    return
+  }
   cdkLoading.value = true
   try {
-    const res = await gamesApi.cdk(props.game.appid)
+    const res = await gamesApi.cdk(props.game.appid, subId)
+    const plat = { steampy: res.steampy, cici: res.steamcici }
+    cdkVersionCache.set(key, { ts: Date.now(), ...plat })
     cdkSteampy.value = res.steampy
     cdkCici.value = res.steamcici
   } catch {
-    cdkFetched = false
+    // 失败不清缓存：旧值还可展示
   } finally {
     cdkLoading.value = false
   }
@@ -490,11 +575,45 @@ function lowestRegionName(code: string): string {
   return regionsStore.regionName(code)
 }
 
+/**
+ * 换游戏时清掉**按游戏取数**的那几样：列表布局的卡片实例按 index 复用
+ * （HlScrollList 的 `:key="index"`，排序/筛选后同一实例会挂到另一款游戏上），
+ * 版本选择、CDK 结果与其临时缓存都只对上一款游戏成立——不清的话弹窗会先把
+ * 上一款的挂牌价/版本当成这一款的显示出来。家庭组赠礼数据不在此列（成员与
+ * 区服跟游戏无关，区价每次渲染现取）。
+ */
+watch(
+  () => props.game.appid,
+  () => {
+    gpwVersionKey.value = 0
+    gpwVersions.value = null
+    cdkVersionCache.clear()
+    cdkSteampy.value = null
+    cdkCici.value = null
+    bundlesFetched = false
+    linkedBundles.value = []
+    // 弹窗还开着（列表在弹窗下方重排）：立刻按新游戏重取，别停在空白/上一款的数据上
+    if (showGpw.value) {
+      loadCdkForVersion()
+      loadBundles()
+      loadGpwVersions()
+    }
+  },
+)
+
+/** 点击是否落在下拉选项弹层里。选项弹层由 HlSelect teleport 到 body，DOM 上
+ *  不在弹窗内（版本下拉的选项全在那儿）；不放行的话，点选项会先被 onDocClick
+ *  当成「外部点击」把整个弹窗关掉，选择永远落不了地。 */
+function isSelectPopup(target: EventTarget | null): boolean {
+  return target instanceof Element && target.closest('[data-hl-select-pop]') !== null
+}
+
 function onDocClick(e: MouseEvent) {
   if (!showGpw.value) return
   if (
     gpwPopoverRef.value &&
     !gpwPopoverRef.value.contains(e.target as Node) &&
+    !isSelectPopup(e.target) &&
     gpwBtnRef.value &&
     !gpwBtnRef.value.contains(e.target as Node)
   ) {
@@ -688,9 +807,6 @@ const validMax = computed(() => {
   const valid = regionPrices.value.filter((p) => !p.locked).map((p) => p.cnyFen)
   return valid.length > 0 ? Math.max(...valid) : 1
 })
-
-/** GPW 只展示「我」页启用的地区 */
-const gpwRegions = computed(() => regionPrices.value.filter((p) => isEnabledCode(p.code)))
 
 const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/assets/trophy_copper.png']
 </script>
@@ -1054,23 +1170,31 @@ const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/asse
         <div class="gpw-popover-body">
           <div class="gpw-popover-subhead">
             <span class="subhead-title">{{ t('gameCard.regionPrice.title') }}</span>
-            <div class="gpw-popover-tabs">
-              <button
-                class="gpw-tab-btn"
-                :class="{ active: activeTab === 'list' }"
-                :title="t('gameCard.tabs.list')"
-                @click="activeTab = 'list'"
-              >
-                <svg viewBox="0 0 24 24"><path d="M3 4h18v2H3V4zm0 7h18v2H3v-2zm0 7h18v2H3v-2z" /></svg>
-              </button>
-              <button
-                class="gpw-tab-btn"
-                :class="{ active: activeTab === 'chart' }"
-                :title="t('gameCard.tabs.chart')"
-                @click="activeTab = 'chart'"
-              >
-                <svg viewBox="0 0 24 24"><path d="M5 19h14v2H5v-2zm10-14h2v12h-2V5zm-4 4h2v8h-2V9zm-4 4h2v4H7v-4z" /></svg>
-              </button>
+            <div class="gpw-subhead-controls">
+              <HlSelect
+                v-if="gpwHasMultipleVersions"
+                v-model="gpwVersionKey"
+                :options="gpwVersionOptions"
+                class="gpw-version-select"
+              />
+              <div class="gpw-popover-tabs">
+                <button
+                  class="gpw-tab-btn"
+                  :class="{ active: activeTab === 'list' }"
+                  :title="t('gameCard.tabs.list')"
+                  @click="activeTab = 'list'"
+                >
+                  <svg viewBox="0 0 24 24"><path d="M3 4h18v2H3V4zm0 7h18v2H3v-2zm0 7h18v2H3v-2z" /></svg>
+                </button>
+                <button
+                  class="gpw-tab-btn"
+                  :class="{ active: activeTab === 'chart' }"
+                  :title="t('gameCard.tabs.chart')"
+                  @click="activeTab = 'chart'"
+                >
+                  <svg viewBox="0 0 24 24"><path d="M5 19h14v2H5v-2zm10-14h2v12h-2V5zm-4 4h2v8h-2V9zm-4 4h2v4H7v-4z" /></svg>
+                </button>
+              </div>
             </div>
           </div>
 

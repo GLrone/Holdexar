@@ -631,13 +631,13 @@ export const gamesApi = {
     request<{ results: GamePriceContextItem[] }>('POST', '/games/price-context-batch', { items }),
   bundles: (appid: number | string) =>
     request<{ bundles: LinkedBundle[] }>('GET', `/games/${appid}/bundles`),
-  cdk: (appid: number | string) =>
+  cdk: (appid: number | string, subId?: number) =>
     request<{
       appid: number
       subId: number | null
       steampy: { listed: boolean; price: string | null; url: string; error?: string }
       steamcici: { listed: boolean; price: string | null; url: string; error?: string }
-    }>('GET', `/games/${appid}/cdk`),
+    }>('GET', `/games/${appid}/cdk${subId !== undefined ? `?sub_id=${subId}` : ''}`),
   retryRemoved: (appid: number | string) =>
     request<{ ok: boolean; jobId: number | null; requeued: boolean; note?: string }>(
       'POST',

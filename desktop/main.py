@@ -1427,6 +1427,28 @@ _DIALOG_FONT_FAMILY = "Microsoft YaHei UI"  # 同网页 --font-sans 的中文回
 # 窗体圆角半径（无边框窗的圆滑轮廓，Region 裁切 + Paint 描边共用）
 _DIALOG_CORNER_RADIUS = 12
 
+# ── 弹窗幕布与出入场动效（数值对齐网页弹层档位）──────────────────────
+# 原生弹窗此前是「凭空出现的一块方片」：无遮罩、无出入场，用户注意不到弹窗
+# 出现。这里补两件，数值都对齐网页侧既有档位（不另立一套节奏）：
+#   ① 幕布：**页面级**遮罩（.hl-close-curtain，背靠背景 = --surface-mask +
+#      blur(8px)，同 .hl-overlay），由 _toggle_close_curtain 经后台线程调页面里的
+#      window.__hlxCloseCurtain 拉起。原生侧曾经自己开遮罩窗压住 WebView2，实测
+#      DWM 为此要整块重新合成、把弹窗上屏拖慢 ~600ms（拆解见 DEV_LOG 判例），
+#      页面自己的 backdrop-filter 零延迟、且只盖内容区不盖标题栏；
+#   ② 出入场：透明度 + 位移（自下浮入 / 反向沉出），时长与缓动对齐
+#      .hl-dialog-pop-* 的档位区间（170ms，--duration-2~3 之间；--ease-inout）。
+_ANIM_MS = 170            # 网页档位 --duration-2/3 之间；250ms 实测偏拖沓，压到 170
+_ANIM_TICK_MS = 15        # 帧间隔：约 60fps
+_ANIM_RISE = 16           # 入场位移（px）：自下方浮到位，出场反向沉出
+
+# 页面幕布开关脚本：显式返回布尔（页面没有挂载点 → false）。不能用
+# `!!(hook && hook(true))` 这种缩写——挂载点返回值是 undefined，`!!` 会把
+# 「已执行」也判成 false，探测结果就没法用了。
+_CURTAIN_JS = (
+    "(function () {{ if (!window.__hlxCloseCurtain) return false;"
+    " window.__hlxCloseCurtain({0}); return true; }})()"
+)
+
 # 双主题配色（色值对齐 tokens.css 两档）：深色 = html.dark 档，浅色 = :root 档。
 # 模块级 RGB 元组，绘制处经 _c()（Color.FromArgb(*palette[name])）取用。
 _DIALOG_THEMES: dict[str, dict] = {
@@ -1542,6 +1564,174 @@ def _style_surface(control) -> None:
         | ControlStyles.OptimizedDoubleBuffer,
         True,
     )
+
+
+def _attach_close_animation(dialog) -> None:
+    """给弹窗挂出入场动效：淡入 + 自下浮入 / 淡出 + 反向沉出。
+
+    入场在 Shown 之后起步——CenterParent/CenterScreen 的真实落点由系统在显示时
+    才算出来，位移必须基于那个落点。出场在 FormClosing 里拦一次：先取消本次关闭，
+    动效走完再真关。
+
+    **用户的选择必须自己接住**：关闭被拦下时 WinForms 会把 DialogResult 复位
+    （实测「最小化」的 Yes /「退出程序」的 No 都会被清成空），之后真关时
+    ShowDialog 只回 Cancel——两个按键点完等于「留在窗口」，表现为按了没反应。
+    故 FormClosing 里先把值存进 state，真关前放回去（赋值与随后 Close 一起把
+    选择带回 ShowDialog）。
+
+    动效是**装饰**：任何一步失败都必须退化成「弹窗照常开合」——入场失败恢复
+    不透明度 1，出场失败立即放行。绝不能把弹窗留在「不可见」或「关不掉」。
+    """
+    from System.Drawing import Point
+    from System.Windows.Forms import DialogResult, Timer
+
+    # 枚举的 None 成员在 Python 里写不出来（"None" 是关键字），只能 getattr 取；
+    # 取不到（单测替身）退化成 Python 的 None，「未选择」判定两边都落在同一个哨兵上。
+    unset_result = getattr(DialogResult, "None", None)
+
+    state: dict = {
+        "timer": None, "phase": "in", "step": 0, "base": None, "closed": False,
+        "result": None,  # 用户的选择（DialogResult）：关闭被拦时它会丢，这里存一份
+    }
+
+    def _stop() -> None:
+        timer = state["timer"]
+        state["timer"] = None
+        if timer is not None:
+            try:
+                timer.Stop()
+                timer.Dispose()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _place(k: float, phase: str) -> None:
+        """按进度 k（0..1）铺两条表面的终态：透明度 + 位移。"""
+        base = state["base"]
+        if phase == "in":
+            dialog.Opacity = k
+            offset = int(round(_ANIM_RISE * (1.0 - k)))
+        else:
+            dialog.Opacity = 1.0 - k
+            offset = int(round(_ANIM_RISE * k))
+        if base is not None:
+            dialog.Location = Point(base.X, base.Y + offset)
+
+    def _settle() -> None:
+        """终态：弹窗全不透明落回基准位，幕布满档。
+
+        透明度是必须到位的（否则弹窗隐形）；位置拿不到只当少一次位移，
+        不影响弹窗可用。
+        """
+        dialog.Opacity = 1.0
+        try:
+            base = state["base"] if state["base"] is not None else dialog.Location
+            state["base"] = base
+            dialog.Location = Point(base.X, base.Y)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _close_now() -> None:
+        """真关弹窗：放回用户的选择（被拦下的那次关闭把 DialogResult 清掉了），
+        再 Close()——ShowDialog 这才带得回 Yes / No，而不是清空后的 Cancel。"""
+        state["closed"] = True
+        if state["result"] is not None:
+            try:
+                dialog.DialogResult = state["result"]
+            except Exception:  # noqa: BLE001 —— 放不回也别把弹窗留在屏上
+                pass
+        try:
+            dialog.Close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    total_steps = max(1, _ANIM_MS // _ANIM_TICK_MS)
+
+    def _tick(sender, e) -> None:
+        try:
+            state["step"] += 1
+            t = min(1.0, state["step"] / total_steps)
+            k = t * t * (3.0 - 2.0 * t)  # smoothstep ≈ 网页 --ease-inout
+            _place(k, state["phase"])
+            if t < 1.0:
+                return
+            _stop()
+            if state["phase"] == "in":
+                _settle()
+            else:
+                _close_now()
+        except Exception:  # noqa: BLE001 —— 动效炸穿也要把弹窗开/关到位
+            _stop()
+            if state["phase"] == "in":
+                try:
+                    _settle()
+                except Exception:  # noqa: BLE001
+                    pass
+            elif not state["closed"]:
+                _close_now()
+
+    def _start(phase: str) -> None:
+        _stop()
+        state["phase"] = phase
+        state["step"] = 0
+        timer = Timer()
+        timer.Interval = _ANIM_TICK_MS
+        timer.Tick += _tick
+        state["timer"] = timer
+        timer.Start()
+
+    def _on_shown(sender, e) -> None:
+        try:
+            state["base"] = dialog.Location
+        except Exception:  # noqa: BLE001
+            state["base"] = None
+        if not _animations_enabled():
+            _settle()
+            return
+        try:
+            _place(0.0, "in")  # 先归零：显示瞬间可能已用实底画过一帧
+            _start("in")
+        except Exception:  # noqa: BLE001
+            _settle()
+
+    def _on_closing(sender, e) -> None:
+        # 动效走完的那次真关（_close_now 已置位）、系统关动画：直接放行
+        if state["closed"] or not _animations_enabled():
+            return
+        # DialogResult 还是「未选择」= 不是用户按键（程序化/system 路径），交给原流程
+        result = dialog.DialogResult
+        if result is unset_result or result == unset_result:
+            return
+        state["result"] = result  # 接住选择：本次关闭被拦后它会被 WinForms 复位
+        e.Cancel = True
+        try:
+            _place(0.0, "out")
+            _start("out")
+        except Exception:  # noqa: BLE001 —— 动效起不来就立刻放行，不留关不掉的窗
+            _close_now()
+
+    dialog.Shown += _on_shown
+    dialog.FormClosing += _on_closing
+    # 入场前先隐形（Shown 里再归零会闪一帧实底）；动效不可用时不留痕
+    if _animations_enabled():
+        dialog.Opacity = 0.0
+
+
+def _animations_enabled() -> bool:
+    """系统「在 Windows 中显示动画」开关（SPI_GETCLIENTAREAANIMATION）。
+
+    网页侧有 --motion-scale 总闸（reduced-motion 归零即瞬时到位），原生弹窗
+    不该绕过它：系统关动画时这里直接出终态——不做淡入、不做位移。
+    """
+    try:
+        import ctypes
+
+        value = ctypes.c_int(1)
+        ok = ctypes.windll.user32.SystemParametersInfoW(
+            0x1042, 0, ctypes.byref(value), 0  # SPI_GETCLIENTAREAANIMATION
+        )
+        return bool(value.value) if ok else True
+    except Exception:  # noqa: BLE001 —— 查询失败按开启处理
+        return True
 
 
 def _make_close_button(
@@ -1931,7 +2121,31 @@ def _build_close_dialog(owner=None, theme: str | None = None):
     }
 
 
-def _ask_close_intent(owner=None) -> str:
+def _toggle_close_curtain(window, on: bool) -> None:
+    """切页面级关窗幕布：给网页发 __hlxCloseCurtain(true/false)。
+
+    **必须后台线程派发**：pywebview 的 evaluate_js 是同步阻塞的（内部等
+    semaphore，回调还排回 UI 线程上下文），从关窗守卫（本身就在 UI 线程）直接
+    调会自锁。后台线程里调用是安全的——ExecuteScriptAsync 由 WebView2 自己派发
+    到渲染进程，页面渲染归合成器，全程不需要我们的消息泵。
+    """
+    if window is None:
+        return
+    script = _CURTAIN_JS.format("true" if on else "false")
+
+    def _dispatch() -> None:
+        try:
+            window.evaluate_js(script)
+        except Exception:  # noqa: BLE001 —— 页面没有挂载点/窗口已销毁都不影响关窗流程
+            pass
+
+    try:
+        threading.Thread(target=_dispatch, daemon=True).start()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _ask_close_intent(owner=None, window=None) -> str:
     """关窗意图询问：二选一（最小化到托盘 / 退出程序），同步模态对话框。
 
     返回 'minimize' / 'quit'。弹窗拿主窗口作 owner（居中其上、模态随主窗，
@@ -1942,10 +2156,20 @@ def _ask_close_intent(owner=None) -> str:
     同步弹窗是刻意的：closing 事件 handler 本就同步跑在 UI 线程
     （should_lock=True），pywebview 上游的 confirm_close 也在同一位置
     同步弹原生对话框——阻塞在对话框上正是拿用户决定的手段。
+
+    幕布（主窗上的遮罩窗）与出入场动效在这里一起装配：幕布先 Show 再
+    ShowDialog，两窗同随主窗，弹窗因被激活而在幕布之上。整条链任何一步失败都只是「没有幕布 / 没有动效」，
+    弹窗本身照常弹出。
     """
     dialog = None
     try:
-        dialog, mapping = _build_close_dialog(owner)
+        theme = _app_theme()
+        dialog, mapping = _build_close_dialog(owner, theme)
+        _toggle_close_curtain(window, True)  # 幕布先亮（页面侧渲染，与弹窗同拍）
+        try:
+            _attach_close_animation(dialog)
+        except Exception:  # noqa: BLE001
+            dialog.Opacity = 1.0  # 动效装配失败：弹窗必须看得见
         result = dialog.ShowDialog(owner) if owner is not None else dialog.ShowDialog()
         return mapping.get(result, "minimize")
     except Exception:  # noqa: BLE001 —— 问不出就按旧语义隐藏，不误杀进程
@@ -1956,6 +2180,7 @@ def _ask_close_intent(owner=None) -> str:
                 dialog.Dispose()
             except Exception:  # noqa: BLE001 —— 资源回收失败不影响流程
                 pass
+        _toggle_close_curtain(window, False)
 
 
 def _make_closing_guard(window):
@@ -1970,8 +2195,16 @@ def _make_closing_guard(window):
         if _tray_state["quit"]:
             return True  # 托盘「退出」：放行真关闭
         owner = getattr(window, "native", None)
-        intent = _ask_close_intent(owner)
+        intent = _ask_close_intent(owner, window)
         if intent == "quit":
+            # 先撤窗再放行：点「退出程序」窗口必须当场消失。放行真关闭之后的进程收尾
+            # （pythonnet/.NET 与 WebView2 的卸载，最小 pywebview 基线实测也要 ~2s）期间
+            # 窗口会继续留在屏幕上，用户看到的就是「弹窗关了、界面还停着一两秒」。
+            # 撤窗只收走可见面；真关闭照常走（closed 事件里 os._exit(0) 终结进程）。
+            try:
+                window.hide()
+            except Exception:  # noqa: BLE001
+                pass
             return True  # 放行真关闭：closed 事件里 os._exit(0) 终结进程
         if intent == "stay":
             return False  # 弹窗右上角 X：取消关闭，窗口原地不动

@@ -4,11 +4,11 @@ import { computed, ref, watch } from 'vue'
 import {
   gamesApi,
   type GameListItem,
-  type GameVersion,
   type GameVersionPrices,
   type HistoryPayload,
 } from '@/api/client'
 import { flagUrl, formatCnyFen } from '@/api/regions'
+import { isStandardVersion, selectableVariants, versionLabels, versionSelectOptions } from '@/lib/versions'
 import { useI18n, type MessageKey } from '@/locales'
 import { useRegionsStore } from '@/stores/regions'
 import { useFilterStore } from '@/stores/gamesFilter'
@@ -153,23 +153,21 @@ async function loadVersions() {
 
 const versionChips = computed(() => {
   const list = versionsAll.value ?? []
-  // 同后缀多 sub 消歧（对齐 versionOptions 的 #subId 规则）
-  const sigCount = new Map<string, number>()
-  for (const v of list) {
-    const sig = `${v.suffix ?? ''}|${v.isGold ? 1 : 0}`
-    sigCount.set(sig, (sigCount.get(sig) ?? 0) + 1)
-  }
-  return list.map((v) => {
-    const sig = `${v.suffix ?? ''}|${v.isGold ? 1 : 0}`
-    const dup = (sigCount.get(sig) ?? 0) > 1
-    let label: string
-    if (!v.suffix && !v.isGold) label = t('trendDrawer.version.standard')
-    else if (v.isGold && !v.suffix) label = t('trendDrawer.version.gold')
-    else label = v.suffix || `#${v.subId}`
-    if (dup) label += ` #${v.subId}`
-    const cell = v.regions[region.value.toUpperCase()] ?? null
-    return { subId: v.subId, label, isGold: v.isGold, price: cell }
-  })
+  const regionKey = region.value.toUpperCase()
+  const labelMap = versionLabels(list, t)
+  // 标准版占一条且指向 versionKey=0（跨 sub 代际的并集序列）——它横跨的多个
+  // sub 代际不各占一条；价格取其中任一有效区价（即当前在售那个 sub 的价）。
+  const standardCell =
+    list.filter(isStandardVersion).map((v) => v.regions[regionKey]).find(Boolean) ?? null
+  return [
+    { subId: 0, label: t('trendDrawer.version.standard'), isGold: false, price: standardCell },
+    ...selectableVariants(list).map((v) => ({
+      subId: v.subId,
+      label: labelMap.get(v.subId) ?? `#${v.subId}`,
+      isGold: v.isGold,
+      price: v.regions[regionKey] ?? null,
+    })),
+  ]
 })
 
 function selectVersion(subId: number) {
@@ -195,33 +193,11 @@ watch(region, () => {
 // 时间窗是纯前端开窗，不再触发回源
 watch(versionKey, () => load())
 
-function versionBaseLabel(v: GameVersion): string {
-  if (!v.suffix && !v.isGold) return t('trendDrawer.version.standard')
-  if (v.isGold && !v.suffix) return t('trendDrawer.version.gold')
-  return v.suffix || `#${v.subId}`
-}
+const hasMultipleVersions = computed(
+  () => selectableVariants(history.value?.versions ?? []).length > 0,
+)
 
-const hasMultipleVersions = computed(() => (history.value?.versions?.length ?? 0) > 1)
-
-const versionOptions = computed(() => {
-  const list = history.value?.versions ?? []
-  // 同签名（如同为无后缀非 gold）多 sub 时用 #subId 消歧（如 Portal 2 的 7877/8187）
-  const sigCount = new Map<string, number>()
-  for (const v of list) {
-    const sig = `${v.suffix ?? ''}|${v.isGold ? 1 : 0}`
-    sigCount.set(sig, (sigCount.get(sig) ?? 0) + 1)
-  }
-  const subs = list.map((v) => {
-    const sig = `${v.suffix ?? ''}|${v.isGold ? 1 : 0}`
-    const dup = (sigCount.get(sig) ?? 0) > 1
-    return {
-      value: v.subId ?? 0,
-      label: dup ? `${versionBaseLabel(v)} #${v.subId}` : versionBaseLabel(v),
-    }
-  })
-  // 标准版（缺省=无后缀非 gold 全部 sub 混合序列）作为首项，与 versionKey=0 对应
-  return [{ value: 0, label: t('trendDrawer.version.standardAll') }, ...subs]
-})
+const versionOptions = computed(() => versionSelectOptions(history.value?.versions ?? [], t))
 
 // ─── pc-header 当前价块（该地区现价，取自卡片 priceMatrix）───
 const currentCell = computed(() => {
