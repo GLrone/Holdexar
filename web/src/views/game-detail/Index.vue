@@ -8,9 +8,10 @@ import {
 } from '@/api/client'
 import { flagUrl, formatCnyFen } from '@/api/regions'
 import { isPermChangeRecent } from '@/lib/priceFlag'
+import { selectableVariants, versionSelectOptions } from '@/lib/versions'
 import { useRegionsStore } from '@/stores/regions'
 import { useI18n, useLocaleFormat, type MessageKey } from '@/locales'
-import HlSelect, { type HlSelectOption } from '@/components/ui/HlSelect.vue'
+import HlSelect from '@/components/ui/HlSelect.vue'
 import HlTable, { type HlTableColumn } from '@/components/ui/HlTable.vue'
 import HlButton from '@/components/ui/HlButton.vue'
 import HlChip from '@/components/ui/HlChip.vue'
@@ -324,31 +325,11 @@ async function load() {
 }
 
 // ── 版本切换（版本列表来自 history 响应 versions，随地区刷新）──
-const hasMultipleVersions = computed(() => (history.value?.versions?.length ?? 0) > 1)
+// 展示口径与卡片 GPW、走势抽屉同源（lib/versions.ts）：标准版只占一行，
+// 它横跨的多个 sub 代际不各占一行。
+const hasMultipleVersions = computed(() => selectableVariants(history.value?.versions ?? []).length > 0)
 
-const versionOptions = computed<HlSelectOption[]>(() => {
-  const list = history.value?.versions ?? []
-  // 同签名（如同为无后缀非 gold）多 sub 时用 #subId 消歧（与走势抽屉同规则）
-  const sigCount = new Map<string, number>()
-  for (const v of list) {
-    const sig = `${v.suffix ?? ''}|${v.isGold ? 1 : 0}`
-    sigCount.set(sig, (sigCount.get(sig) ?? 0) + 1)
-  }
-  const subs = list.map((v) => {
-    const sig = `${v.suffix ?? ''}|${v.isGold ? 1 : 0}`
-    const base = !v.suffix && !v.isGold
-      ? t('trendDrawer.version.standard')
-      : v.isGold && !v.suffix
-        ? t('trendDrawer.version.gold')
-        : (v.suffix || `#${v.subId}`)
-    return {
-      value: v.subId ?? 0,
-      label: (sigCount.get(sig) ?? 0) > 1 ? `${base} #${v.subId}` : base,
-    }
-  })
-  // 标准版（缺省=无后缀非 gold 并集序列）作为首项，与 historySubId=0 对应
-  return [{ value: 0, label: t('trendDrawer.version.standardAll') }, ...subs]
-})
+const versionOptions = computed(() => versionSelectOptions(history.value?.versions ?? [], t))
 
 async function loadHistory() {
   const seq = ++requestSeq
@@ -604,13 +585,21 @@ onMounted(load)
           <div class="gd-card gd-price-section" data-section="gameDetail.section.priceDetail">
             <div class="gd-price-header">
               <span class="gd-price-title">{{ t('gameDetail.section.priceDetail') }}</span>
-              <div v-if="medalItems.length" class="gd-medal-row">
-                <span class="gd-medal-label">{{ t('gameDetail.price.top3') }}</span>
-                <span v-for="m in medalItems" :key="m.code" class="gd-medal-item">
-                  <img :src="m.icon" class="bc-medal bc-medal--inline" :class="`medal-${medalItems.indexOf(m)}`" alt="medal" />
-                  {{ m.name }}
-                  <b>{{ formatCnyFen(m.cnyFen) }}</b>
-                </span>
+              <div class="gd-price-controls">
+                <HlSelect
+                  v-if="hasMultipleVersions"
+                  v-model="historySubId"
+                  :options="versionOptions"
+                  class="gd-price-version"
+                />
+                <div v-if="medalItems.length" class="gd-medal-row">
+                  <span class="gd-medal-label">{{ t('gameDetail.price.top3') }}</span>
+                  <span v-for="m in medalItems" :key="m.code" class="gd-medal-item">
+                    <img :src="m.icon" class="bc-medal bc-medal--inline" :class="`medal-${medalItems.indexOf(m)}`" alt="medal" />
+                    {{ m.name }}
+                    <b>{{ formatCnyFen(m.cnyFen) }}</b>
+                  </span>
+                </div>
               </div>
             </div>
             <HlTable
@@ -1158,6 +1147,13 @@ html:not(.dark) .gd-link-icon.steamdb { filter: invert(1); }
   font-weight: 600;
   color: var(--text-primary);
 }
+.gd-price-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.gd-price-version { width: 190px; }
+.gd-price-version :deep(.hl-select-wrap) { width: 100%; }
 .gd-medal-row {
   display: flex;
   align-items: center;
