@@ -69,7 +69,18 @@ def build_order_by(
 
     region_mode=True（选择了具体地区）：组内默认按该区差价 (cn.price - sr.cny_fen) 降序；
     其余排序按对应分支，前缀带 3-group。
+
+    sort=smart 例外：不挂 3-group 折扣前缀（硬分组正是 smart 要打破的东西），
+    评分是「CN 对全区最低」的视角，与所选地区无关；关注置顶由调用方前缀
+    保证（service.list_games 的 fav_order）。
     """
+    if sort == "smart":
+        return [
+            desc(cn.price.is_not(None) & (cn.price > 0)),
+            desc(g.smart_score),
+            desc(g.appid),
+        ]
+
     prefix = region_group_prefix(g, cn) if region_mode else []
 
     if region_mode and sr is not None:

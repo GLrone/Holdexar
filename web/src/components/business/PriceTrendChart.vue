@@ -677,11 +677,14 @@ watch(
    本文件与 rates/Index.vue 此前各持一份逐字相同的副本。 */
 
 /* ─ 全量走势缩略条＝时间窗控制器（pc-range 四段式）──
-   尺寸与形态沿用模块 F 的 pc-range 一套：标签行 10px 灰字、缩略图 36px、
-   滑块区用负 margin 完全压回缩略图上、信息行等宽字体；把手是「2px 强调色竖线 +
-   圆点」。差异只有两处，都是令牌化所需：暗幕色走 --surface-mask（模版写的是
-   rgba 字面量）、把手圆点阴影走 --shadow-sm。
-   preserveAspectRatio="none" 让图形横向铺满（viewBox 是 1000×44 的虚拟坐标系，
+   骨架沿用模块 F 的 pc-range 一套：标签行 10px 灰字、缩略图 36px、滑块区用
+   负 margin 完全压回缩略图上、信息行等宽字体。
+   控制层三件（暗幕 / 滑块 / 两端把手）在本文件里定形，一律走令牌：
+   · 暗幕 = --surface-mask（窗口外压暗，模版此处写的是 rgba 字面量）；
+   · 滑块 = 半透明强调色底 + 描边 + 居中抓握纹——窗口是可拖的实体，不是隐形命中层；
+   · 把手 = 实心强调色抓手块 + 两道竖向抓握纹（不用圆点，圆点在 36px 条上看不出
+     是抓手，也点不中）。
+   preserveAspectRatio="none" 让图形横向铺满（viewBox 是 1000×36 的虚拟坐标系，
    容器变窄也不重算几何）；笔画用 non-scaling-stroke 免被横向拉伸，
    拖拽换算永远走 getBoundingClientRect 的实际像素宽度，与 viewBox 无关。 */
 .pc-range-wrap {
@@ -723,12 +726,25 @@ watch(
   pointer-events: none;
 }
 
-/* 窗口本体：模版无此视觉，只作平移命中区（拖窗口不改跨度） */
+/* 窗口本体＝可拖的滑块（拇指）：半透明强调色底 + 描边 + 居中的抓握纹，
+   底下的走势仍看得见（不是盖死的不透明条）。拖动 = 平移，不改跨度。
+   抓握纹一段 13×10 的 1px 竖线排，居中不重复——窗口窄到放不下时自然截断。 */
 .pc-slider-window {
   position: absolute;
-  top: 0;
-  height: 36px;
-  background: transparent;
+  top: 4px;
+  height: 28px;
+  border-radius: 3px;
+  background-color: var(--accent-a15);
+  background-image: repeating-linear-gradient(
+    90deg,
+    var(--accent-a50) 0 1px,
+    transparent 1px 4px
+  );
+  background-size: 13px 10px;
+  background-position: center;
+  background-repeat: no-repeat;
+  border: 1px solid var(--accent-a30);
+  box-sizing: border-box;
   pointer-events: auto;
   cursor: grab;
 }
@@ -737,41 +753,29 @@ watch(
   cursor: grabbing;
 }
 
+/* 两端把手：实心强调色抓手块 + 两道竖向抓握纹（不是圆点）。
+   块比滑块高、外沿压住窗口边界，读起来是「这一段的两端 + 中间一段可拖」。
+   命中区就是块本身。 */
 .pc-slider-handle {
   position: absolute;
-  top: 0;
+  top: 2px;
   width: 10px;
-  height: 36px;
-  margin-left: -5px; /* 模版是 left 贴边界（线偏右 5px），这里把线对到边界上 */
+  height: 32px;
+  margin-left: -5px; /* 块心对准窗口边界 */
+  border-radius: 2px;
+  background-color: var(--accent);
+  background-image: repeating-linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--bg-card) 55%, transparent) 0 1px,
+    transparent 1px 3px
+  );
+  background-size: 5px 12px;
+  background-position: center;
+  background-repeat: no-repeat;
+  box-shadow: var(--shadow-sm);
   cursor: ew-resize;
   pointer-events: auto;
   z-index: 5;
-}
-
-.pc-slider-handle::before {
-  content: '';
-  position: absolute;
-  left: 50%;
-  top: 0;
-  transform: translateX(-50%);
-  width: 2px;
-  height: 100%;
-  background: var(--accent);
-  opacity: 0.7;
-}
-
-.pc-slider-handle::after {
-  content: '';
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  transform: translate(-50%, -50%);
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: var(--accent);
-  border: 2px solid var(--bg-card);
-  box-shadow: var(--shadow-sm);
 }
 
 .pc-range-info {

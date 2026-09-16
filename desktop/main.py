@@ -5,7 +5,7 @@
 用法：
     python desktop/main.py                # 桌面窗口模式
     python desktop/main.py --server       # 无窗口（仅本地服务）
-    HOLDEXAR_DEV_URL=http://localhost:5173 python desktop/main.py    # 加载 Vite 开发服务器
+    HOLDEXAR_DEV_URL=http://localhost:8080 python desktop/main.py    # 加载 Vite 开发服务器
 """
 from __future__ import annotations
 
@@ -1507,8 +1507,17 @@ def _app_theme() -> str:
             ).fetchone()
         finally:
             con.close()
-        if row and row[0] in ("dark", "light"):
-            return str(row[0])
+        if row and row[0] is not None:
+            # app_settings 存的是 JSON 编码值——前端写进去的是带引号的 "light"，
+            # 直接拿去比对字符串永远不中，弹窗会静默回落深色（用户实测报过
+            # 「主题色不跟主界面变」）。这里先按 JSON 解码，解不动再按裸值判。
+            value = str(row[0]).strip()
+            try:
+                value = str(json.loads(value))
+            except Exception:  # noqa: BLE001 —— 不是合法 JSON 就当裸值
+                value = value.strip().strip("\"'")
+            if value in ("dark", "light"):
+                return value
     except Exception:  # noqa: BLE001 —— 读不到按深色兜底
         pass
     return "dark"

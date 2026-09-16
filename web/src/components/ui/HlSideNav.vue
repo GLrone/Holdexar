@@ -40,9 +40,8 @@ withDefaults(
 const collapsed = defineModel<boolean>('collapsed', { default: false })
 
 /** 品牌区点击：收起态 = 展开（悬停时 logo 已换「侧边栏」图标）。
- *  展开态无动作（原「点击 logo 打开新手引导」已迁至「关于」页 logo）。
- *  收起/展开只保留品牌区这一处入口——旧底部收拢钮已移除：导航项一多它会
- *  被挤出视口，等于没有。
+ *  展开态无动作（「点击 logo 打开新手引导」的入口在「关于」页 logo）。
+ *  收起/展开只保留品牌区这一处入口。
  */
 function onBrandClick() {
   if (collapsed.value) collapsed.value = false
@@ -105,7 +104,6 @@ defineOptions({ name: 'HlSideNav' })
           </span>
           <HlIcon v-if="collapsed" name="sidebar" :size="18" class="hl-sb-brand__expand" />
         </div>
-        <!-- 副标题（STEAM 多区价格监控终端）已移除：腾出的位置给品牌名与收起键 -->
         <div class="hl-sb-brand__txt">
           <div class="hl-sb-brand__name">{{ brandName }}</div>
         </div>

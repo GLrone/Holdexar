@@ -5,6 +5,11 @@ import type { SortKey, FilterMode } from '@/api/regions'
 /**
  * 筛选状态 store。
  * ownership / 系列字段暂未接入数据源，保留结构位。
+ *
+ * 生命周期：本 store 只在**游戏商店页驻留期间**有效——离开页面时
+ * `resetForLeave()` 把搜索词与全部筛选清回默认（见 views/library 的
+ * onBeforeUnmount），下次进入是干净默认态，不会带回上一轮搜索结果。
+ * 布局模式与高级筛选面板开合属纯 UI 偏好，不在重置范围。
  */
 interface FilterState {
   search: string
@@ -45,6 +50,7 @@ interface FilterState {
   setFilter: (key: string, value: unknown) => void
   commitSearch: () => void
   resetFilters: () => void
+  resetForLeave: () => void
   activeFilterCount: () => number
 }
 
@@ -52,7 +58,8 @@ export const useFilterStore = defineStore('gamesFilter', {
   state: (): FilterState => ({
     search: '',
     committedSearch: '',
-    sortBy: 'default',
+    // 默认排序 = 智能推荐（新算法）；旧算法仍可从排序下拉手动选择
+    sortBy: 'smart',
     region: '',
     filterMode: 'global',
     layoutMode: 'grid',
@@ -90,7 +97,7 @@ export const useFilterStore = defineStore('gamesFilter', {
       this.committedSearch = this.search
     },
     resetFilters() {
-      this.sortBy = 'default'
+      this.sortBy = 'smart'
       this.region = ''
       this.filterMode = 'global'
       this.onlyDiscounted = false
@@ -118,6 +125,16 @@ export const useFilterStore = defineStore('gamesFilter', {
       this.giftFilter = false
       this.excludeDlc = true
       this.filterRegion = 'cn'
+    },
+
+    /** 离开游戏商店页时调用：搜索词 + 全部筛选 + 面板开合回默认。
+     *  「搜索结果只活在当前页面」——从侧边栏去别的页再回来，看到的是默认态，
+     *  而不是上一轮搜过的结果。布局模式（网格/列表）是纯外观偏好，保留。 */
+    resetForLeave() {
+      this.search = ''
+      this.committedSearch = ''
+      this.resetFilters()
+      this.showAdvancedFilter = false
     },
 
     activeFilterCount() {

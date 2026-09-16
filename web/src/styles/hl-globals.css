@@ -626,14 +626,9 @@
     gap: 8px;
 }
 
-/* `.spinner` 与 `@keyframes spin` 曾在这里——与 hl-framework.css 的 `.hl-spinner`
-   / `hlSpin` 是同一枚转圈的逐字两份（20px / 2px 环 / 0.8s linear / 同一组色）。
-   最后一处消费（library 无限滚动的「加载更多」）已改用 HlSpinner 组件，故删除。
-   至此全项目只剩 `hl-spinner` 一套实现，尺寸刻度：--xs 12 / --inline 14 / 默认 20。 */
+/* 全项目转圈只有 `hl-spinner` 一套实现，尺寸刻度：--xs 12 / --inline 14 / 默认 20。 */
 
-/* .empty-state 已彻底退场：此处与 tokens.css 曾各有一份同名定义，靠导入次序
-   分胜负（padding 80/24 vs 60/24），同一个类名两种表现。两份都已删，空态统一走
-   components/ui/HlEmpty.vue。 */
+/* 空态统一走 components/ui/HlEmpty.vue。 */
 
 /* ─── Skeleton loader ──────────────────────────────────────── */
 .skeleton {

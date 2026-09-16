@@ -190,11 +190,8 @@
   --accent-soft: rgba(28, 110, 164, 0.1);
   --accent-hover: #155d8f;
   /* ── 图表配色（三张 ECharts 图共用，出口见 api/chartTheme.ts）──
-     网格线 / 轴线（浅色底用深蓝低透明度）+ 轴文字 + 正负语义色。
-     此前图表直接借用 --text-muted 与 --accent/--danger，于是 rates/bills
-     两个文件把当时的深色取值抄成了字面量（#8f98a0 / #1c6ea4 / #e74c3c），
-     主题一切换就再不跟随——独立成 token 是为了让「图表该取哪个色」有唯一答案。
-     注意：曾有一个 --chart-area 在此定义，全库零消费，已删。 */
+     网格线 / 轴线（浅色底用深蓝低透明度）+ 轴文字 + 正负语义色；
+     独立成 token 是为了让「图表该取哪个色」有唯一答案。 */
   --chart-grid: rgba(28, 110, 164, 0.14);
   --chart-axis: rgba(28, 110, 164, 0.32);
   --chart-axis-label: #64778c;
@@ -287,11 +284,7 @@
   --el-tag-warning-border-color: transparent;
   --el-tag-warning-hover-color: #a96e0d;
 
-  /* ── 阴影（单一等级族 sm/md/lg/xl）──
-     曾有两套并存命名：--shadow-1..5 与 --shadow-sm/md/lg。收敛结果：
-     1/3/4 全库零消费（连定义带消费一起删）；2 的 3 处消费都是浮层
-     （Stepper 面板、地区/差异弹层），语义上本就该走 md；5 的 3 处是
-     ProductTour 聚光与 hl-dialog，取 xl。 */
+  /* ── 阴影（单一等级族 sm/md/lg/xl）── */
   --shadow-dot: 0 0 5px rgba(23, 32, 42, 0.25);
   --shadow-success: 0 4px 15px rgba(107, 154, 0, 0.32);
   --shadow-success-sm: 0 2px 5px rgba(107, 154, 0, 0.4);
@@ -1163,14 +1156,7 @@ html.dark {
   border-color: rgba(231, 76, 60, 0.3);
 }
 
-/* ── 空态 ──
-   本文件曾有一份 `.empty-state`，且 hl-globals.css 另有同名一份靠 main.ts 的
-   导入次序（tokens → hl-framework → globals）压过它，把 padding 改成 80px 24px 并
-   自带 h3/p 样式——同一个类名两种表现，改哪边都不确定生效。那份先删、h3/p 并入
-   本份；本轮再把本份也删掉：空态一律走 `components/ui/HlEmpty.vue`（样式在
-   hl-framework.css 的 `.hl-empty`），最后一处 `.empty-state__text` 裸用已迁完。
-   一并删掉的还有 `margin-bottom: 12px` 的 `.empty-state__icon`——HlEmpty 用
-   flex `gap` 排版，那个外边距没有对应物。 */
+/* ── 空态（一律走 `components/ui/HlEmpty.vue`，样式在 hl-framework.css 的 `.hl-empty`）── */
 
 /* 数字列 / 数值展示：等宽数字 + 右对齐。右对齐此前只活在
    game-detail/Index.vue 的局部共识里，没进 token、没进组件、没进文档。 */

@@ -255,7 +255,13 @@ onMounted(() => {
   load(true)
 })
 
-onBeforeUnmount(() => observer?.disconnect())
+onBeforeUnmount(() => {
+  observer?.disconnect()
+  // 先关闸再重置：重置会触发上面的 watch（store 变更），
+  // initialized=false 让回调直接跳过，避免卸载瞬间多发一次请求
+  initialized.value = false
+  store.resetForLeave()
+})
 </script>
 
 <template>

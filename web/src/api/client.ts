@@ -12,6 +12,31 @@ export class ApiError extends Error {
   }
 }
 
+/** FastAPI 错误 detail 拍平为人可读文本。
+ *  422 校验失败的 detail 是对象数组（{loc, msg, type}），直接 String()
+ *  会渲染成 "[object Object]"——错误提示要能一眼看懂（如「flag: String
+ *  should match pattern ...」，正是新前端 + 旧后端时最需要的线索）。 */
+function formatApiDetail(detail: unknown): string {
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail)) {
+    const parts = detail
+      .map((d) => {
+        if (typeof d === 'string') return d
+        if (d && typeof d === 'object') {
+          const item = d as { loc?: unknown[]; msg?: string }
+          // loc 首段是来源（query/body/path），去掉只留参数名
+          const loc = Array.isArray(item.loc) ? item.loc.slice(1).join('.') : ''
+          return [loc, item.msg ?? ''].filter(Boolean).join(': ')
+        }
+        return String(d)
+      })
+      .filter(Boolean)
+    return parts.join('; ') || `HTTP ${detail.length}`
+  }
+  if (detail && typeof detail === 'object') return JSON.stringify(detail)
+  return String(detail)
+}
+
 // ─── GET 时间窗缓存 + inflight 去重 ──────────────────────
 // 各视图 onMounted 无条件重拉是板块切换延迟的主因之一；这里在唯一请求
 // 出口收口：切换往返（< TTL）直接复用上次响应，并发同 URL 共享同一请求。
@@ -72,7 +97,7 @@ async function request<T>(
       let detail = `HTTP ${response.status}`
       try {
         const data = await response.json()
-        if (data?.detail) detail = String(data.detail)
+        if (data?.detail) detail = formatApiDetail(data.detail)
       } catch {
         /* 忽略解析失败 */
       }
@@ -407,6 +432,15 @@ export interface GameListItem {
   bundleCount: number | null
   /** 下架监控：非空 = 已判定下架（ISO）；null = 在售 */
   removedAt: string | null
+  /** smart 排序评分（0~1 加权和；公式见后端 scoring.py） */
+  smartScore?: number
+  /** smart 四因子拆解（实验池对照展示用；0~1 归一值） */
+  smartFactors?: {
+    save: number
+    quality: number
+    timing: number
+    familiarity: number
+  }
 }
 
 export interface GamesListPayload {

@@ -15,7 +15,7 @@ from sqlalchemy import or_, select
 
 from app.core.database import get_session_factory
 from app.core.events import bus
-from app.crawler.config import DEFAULT_WORKER_COUNT, HTTP_TIMEOUT
+from app.crawler.config import DEFAULT_WORKER_COUNT, HTTP_TIMEOUT, WORKERS_MAX
 from app.crawler.runner import CrawlRunConfig, run_crawl
 from app.domains.alerts import service as alerts_service
 from app.domains.crawl.models import CrawlJob
@@ -456,6 +456,54 @@ async def _backfill_pairs(limit: int = BACKFILL_DAILY_LIMIT) -> list[tuple[int, 
     return [(int(a), n or "") for a, n in rows]
 
 
+async def _resolve_worker_count() -> int:
+    """主轮 worker 数：按可用出口 IP 节点数开启（一个出口一个 worker）。
+
+    数据源 = proxies 域 pool_stats() 的 available（手动池可用 + Clash 在跑
+    订阅的存活出口 IP 去重数，「一个出口 IP 算一个」与仪表盘同口径）。
+    规则：workers = available，上限 WORKERS_MAX——出口少并发小（不把请求
+    全压在同几个出口上），出口多并发跟着开。
+
+    分支：
+    - 显式配置 crawl.workers（正整数）→ 尊重显式值，按出口数开不介入；
+    - available > 0 → 一个出口一个 worker，上限 WORKERS_MAX；
+    - available == 0 / 统计不可用 → DEFAULT_WORKER_COUNT（未配代理 / 内核
+      没跑的直连形态，行为与既有版本一致）。
+    """
+    from app.domains.settings.service import get_value
+
+    explicit = await get_value("crawl.workers")
+    if isinstance(explicit, (int, float)) and not isinstance(explicit, bool) and int(explicit) > 0:
+        logger.info("[worker 分类] 显式配置 crawl.workers=%d，不按出口数分类", int(explicit))
+        return int(explicit)
+
+    try:
+        from app.domains.proxies import service as proxies_service
+
+        available = int((await proxies_service.pool_stats()).get("available") or 0)
+    except Exception as e:  # noqa: BLE001 —— 统计失败不阻断爬取
+        logger.warning(
+            "[worker 分类] 出口 IP 统计失败（%s），回退 workers=%d", e, DEFAULT_WORKER_COUNT
+        )
+        return DEFAULT_WORKER_COUNT
+
+    if available <= 0:
+        logger.info(
+            "[worker 分类] 无可用出口 IP（直连形态）→ workers=%d（默认）",
+            DEFAULT_WORKER_COUNT,
+        )
+        return DEFAULT_WORKER_COUNT
+
+    workers = min(WORKERS_MAX, available)
+    logger.info(
+        "[worker 分类] 可用出口 IP %d → workers=%d（1 出口 1 worker，上限 %d）",
+        available,
+        workers,
+        WORKERS_MAX,
+    )
+    return workers
+
+
 async def start_job(
     scope: str = "appids",
     appids: list[int] | None = None,
@@ -510,9 +558,8 @@ async def start_job(
     # 直连为标准形态：browse 按 country_code 返回各区数据，出口 IP 不参与
     # 判定；加速器（一般用户常态）在系统网络层透明生效。请求频率由全局
     # 限流闸（rate_limit.py 200 发/5 分钟）统一约束，不再有代理前置条件。
-    from app.domains.settings.service import get_value
-
-    worker_count = await get_value("crawl.workers", DEFAULT_WORKER_COUNT) or DEFAULT_WORKER_COUNT
+    # worker 数按可用出口 IP 节点数分类开启（见 _resolve_worker_count）。
+    worker_count = await _resolve_worker_count()
     small_lane = kind in ("missing", "repair", "backfill")
     config = CrawlRunConfig(
         regions=effective,

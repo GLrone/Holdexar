@@ -657,3 +657,48 @@ def test_ask_close_intent_works_without_window(monkeypatch):
     _, _, sent_no, _ = _patch_winforms(monkeypatch)
     _SHOW_OUTCOME["value"] = sent_no
     assert desktop._ask_close_intent(object()) == "quit"
+
+
+# ─ 主题镜像读取（弹窗配色跟随主界面） ──────────────────────────────────────
+
+
+def _theme_db(tmp_path, raw):
+    """造一个只有 app_settings.ui.theme 的库，返回数据目录。"""
+    import sqlite3
+    from pathlib import Path
+
+    data_dir = Path(tmp_path)
+    db = data_dir / desktop.data_dir_filename(desktop.APP_SLUG)
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE app_settings (key TEXT PRIMARY KEY, value_json TEXT)")
+    if raw is not None:
+        con.execute("INSERT INTO app_settings VALUES ('ui.theme', ?)", (raw,))
+    con.commit()
+    con.close()
+    return data_dir
+
+
+def test_app_theme_reads_json_encoded_mirror(monkeypatch, tmp_path):
+    """镜像值是 JSON 编码的（前端 PUT 的是 "light" 带引号）——必须解码后再判。
+
+    历史缺陷：直接拿带引号的裸串比对 "dark"/"light" 永远不中，弹窗静默回落
+    深色，表现为「关闭弹窗的主题不跟主界面走」。
+    """
+    monkeypatch.setattr(desktop, "resolve_data_dir", lambda *a, **k: _theme_db(tmp_path, '"light"'))
+    assert desktop._app_theme() == "light"
+    monkeypatch.setattr(desktop, "resolve_data_dir", lambda *a, **k: _theme_db(tmp_path, '"dark"'))
+    assert desktop._app_theme() == "dark"
+
+
+def test_app_theme_fallbacks(monkeypatch, tmp_path):
+    """裸值/缺行/库损坏都不得炸：裸值认，缺行与坏库按深色兜底。"""
+    import sqlite3
+    monkeypatch.setattr(desktop, "resolve_data_dir", lambda *a, **k: _theme_db(tmp_path, "dark"))
+    assert desktop._app_theme() == "dark", "兼容无引号的裸值"
+    monkeypatch.setattr(desktop, "resolve_data_dir", lambda *a, **k: _theme_db(tmp_path, None))
+    assert desktop._app_theme() == "dark", "缺行回落深色"
+    def _boom(*a, **k):
+        raise sqlite3.OperationalError("no such table: app_settings")
+
+    monkeypatch.setattr(desktop, "resolve_data_dir", _boom)
+    assert desktop._app_theme() == "dark", "库读不了回落深色"

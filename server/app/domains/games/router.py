@@ -31,7 +31,9 @@ async def list_games(
     filterMode: str = Query("global"),
     onlyDiscounted: bool = False,
     isLowest: bool = False,
-    flag: str = Query("", pattern="^(|hl|pp|any)$"),
+    # 史低/永降标记过滤：hl=史低(新+平) pp=永降 any=并集（降价动态 feed）；
+    # new/flat/nonhl = 史低三态细分（新史低 / 平史低 / 非史低，实验池对照用）
+    flag: str = Query("", pattern="^(|hl|pp|any|new|flat|nonhl)$"),
     minRating: int = Query(0, ge=0, le=100),
     maxRating: int | None = Query(None, ge=0, le=100),
     minReviews: int = Query(0, ge=0),

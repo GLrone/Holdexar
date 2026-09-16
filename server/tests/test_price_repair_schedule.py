@@ -116,6 +116,15 @@ def _stub_start_env(monkeypatch, *, captured_specs=None):
 
     monkeypatch.setattr(settings_service, "get_value", _value)
 
+    # 出口 IP 统计打桩：无可用出口（直连形态）→ worker 数回退默认口径；
+    # 不桩会走真实 proxies 域会话工厂（触生产库）
+    import app.domains.proxies.service as proxies_service
+
+    async def _pool_stats():
+        return {"available": 0}
+
+    monkeypatch.setattr(proxies_service, "pool_stats", _pool_stats)
+
     # _execute 收尾钩子（提醒/史低/排序）模块级绑定各自服务的
     # get_session_factory——全部打桩防触生产库
     async def _noop(*a, **kw):

@@ -67,11 +67,14 @@ DEFAULT_WORKER_COUNT = 30
 # 直连 Steam 在部分网络下 TLS 握手可能超过 10s（实测 9.7s），12s 超时会误杀；放宽到 20s
 HTTP_TIMEOUT = 20
 
-# 注：这里曾有 RATE_LIMIT_MAX_REQUESTS / RATE_LIMIT_WINDOW_SECONDS（令牌桶 60 请求/5 分钟），
-# 常量本身全库零消费被删过一次。browse 接口时代限流成为**主闸**（browse 按
-# country_code 返回各区数据、出口 IP 不参与判定，直连即标准形态；换 IP 规避
-# 风控的整套机制退役）——现行实测定线 200 发/5 分钟，实现与常量落在
-# crawler/rate_limit.py（http_client 与捆绑包刷新共享同一进程级窗口预算）。
+# ── 主轮 worker 数：按可用出口 IP 节点数开启（crawl/service._resolve_worker_count）──
+# 口径 = proxies.pool_stats() 的 available：手动池可用 + Clash 在跑订阅的存活
+# 出口 IP 按「一个出口 IP 算一个」去重（多入口同落地只算一个）。
+# 规则：一个可用出口 IP 开一个 worker 参与并发，上限 WORKERS_MAX；无可用出口
+# 数据（未配代理 / 内核没跑，直连形态）回退 DEFAULT_WORKER_COUNT。
+WORKERS_MAX = 60
+
+# 请求频率主闸在 crawler/rate_limit.py（200 发/5 分钟，与捆绑包刷新共享窗口预算）。
 
 # 版本后缀关键词字典（key 统一小写匹配）
 EDITION_DICT = {

@@ -24,6 +24,13 @@ from sqlalchemy.orm import aliased
 from app.core.database import get_session_factory
 from app.crawler.utils import get_beijing_time_obj
 from app.domains.games.models import Game, Bundle, BundleRegionPrice, GameCurrentPrice, GamePriceHistory
+from app.domains.games.scoring import (
+    familiarity_score,
+    quality_score,
+    save_score,
+    smart_score,
+    timing_score,
+)
 from app.domains.games.sorting import build_order_by
 from app.domains.games.pricing import (
     DEFAULT_EXCHANGE_RATES,
@@ -253,8 +260,16 @@ def _build_filter_conditions(
     if only_xgp:
         conditions.append(g.xgp_tier.is_not(None))
     # [flag] 史低/永降标记过滤（降价动态 feed；refresh_hl_flags/refresh_pp_flags 维护）
+    # new/flat/nonhl：史低三态细分（hl_flag 语义见 refresh_hl_flags——
+    # 1=新史低 2=平史低 3=打折非史低 0=无标记；「非史低」= 1/2 之外）
     if flag == "hl":
         conditions.append(g.hl_flag.in_((1, 2)))
+    elif flag == "new":
+        conditions.append(g.hl_flag == 1)
+    elif flag == "flat":
+        conditions.append(g.hl_flag == 2)
+    elif flag == "nonhl":
+        conditions.append(g.hl_flag.not_in((1, 2)))
     elif flag == "pp":
         conditions.append(g.pp_flag == 1)
     elif flag == "any":
@@ -1463,19 +1478,68 @@ async def refresh_pp_flags(appids: list[int] | None = None) -> int:
     return len(updates)
 
 
+async def _refresh_smart_scores(session: AsyncSession, appids: list[int] | None) -> int:
+    """重算 games.smart_score（refresh_sort_cache 的组成部分）。
+
+    输入列 diff_fen / hl_flag 必须已刷新（启动链与爬取增量路径均保证
+    hl_flags → sort_cache 顺序）；CN 折扣左联取 ok 行，无行按无折扣计。
+    Python 侧算分（公式见 scoring.py），不依赖 SQLite 数学函数。
+    """
+    stmt = (
+        select(
+            Game.appid,
+            Game.diff_fen,
+            Game.positive_rate,
+            Game.review_count,
+            Game.hl_flag,
+            func.coalesce(GameCurrentPrice.discount_percent, 0),
+        )
+        .join(
+            GameCurrentPrice,
+            and_(
+                GameCurrentPrice.appid == Game.appid,
+                GameCurrentPrice.region_code == "CN",
+                GameCurrentPrice.price_status == "ok",
+            ),
+            isouter=True,
+        )
+    )
+    if appids is not None:
+        if not appids:
+            return 0
+        stmt = stmt.where(Game.appid.in_(appids))
+
+    rows = (await session.execute(stmt)).all()
+    if not rows:
+        return 0
+    await session.execute(
+        update(Game),
+        [
+            {
+                "appid": appid,
+                "smart_score": smart_score(diff, rate, reviews, hl, disc),
+            }
+            for appid, diff, rate, reviews, hl, disc in rows
+        ],
+    )
+    return len(rows)
+
+
 async def refresh_sort_cache(
     appids: list[int] | None = None, *, session: AsyncSession | None = None
 ) -> int:
-    """刷新 games.min_cny_fen / diff_fen 预计算列（对齐 mv_game_sort_cache 构建 SQL）。
+    """刷新 games.min_cny_fen / diff_fen / smart_score 预计算列（对齐 mv_game_sort_cache 构建 SQL）。
 
     appids=None 全库刷新（启动 / 汇率变更）；否则增量（爬取落库后调用，
     lowest 限定目标集合）。
-    语义：min_cny_fen = 非 CN 各区 ok 价最低（原始值，无则 NULL）；
-    diff_fen = MAX(CN 价 - COALESCE(最低, CN 价), 0)。
+    语义：min_cny_fen = 非 CN 各区 ok 价最低 CNY 分（原始值，无则 NULL）；
+    diff_fen = MAX(CN 价 - COALESCE(最低, CN 价), 0)；smart_score 由
+    diff_fen / hl_flag / 评测数据按 scoring.py 公式重算（本函数尾部）。
     需要 SQLite ≥ 3.33（UPDATE ... FROM）。
 
     session 注入时不自行提交——汇率原子刷新用它把「汇率 → cny_fen →
-    games sort → bundles sort」串进同一事务（GET 只可能读到旧快照或新快照）。
+    games sort → bundles sort」串进同一事务（GET 只可能读到旧快照或新快照；
+    smart_score 同事务落库，排序与展示差价不跨汇率基准）。
     """
     from sqlalchemy import bindparam, text
 
@@ -1506,10 +1570,12 @@ async def refresh_sort_cache(
 
     if session is not None:
         result = await session.execute(sql, params)
+        await _refresh_smart_scores(session, appids)
         return result.rowcount or 0
 
     async with get_session_factory()() as own:
         result = await own.execute(sql, params)
+        await _refresh_smart_scores(own, appids)
         await own.commit()
     return result.rowcount or 0
 
@@ -1568,6 +1634,15 @@ def _build_list_item(game: Game, cn_row: GameCurrentPrice | None, price_rows: li
         else None
     )
 
+    # smart 评分因子（与 games.smart_score 同公式同口径，scoring.py）——
+    # 展示期现算即可：每页 40 行的纯数学，无需回读落库值（落库值只服务 ORDER BY）
+    smart_factors = {
+        "save": round(save_score(game.diff_fen), 3),
+        "quality": round(quality_score(game.positive_rate, game.review_count), 3),
+        "timing": round(timing_score(game.hl_flag, discount), 2),
+        "familiarity": round(familiarity_score(game.review_count), 3),
+    }
+
     return {
         "appid": int(game.appid),
         "name": game.name,
@@ -1593,6 +1668,12 @@ def _build_list_item(game: Game, cn_row: GameCurrentPrice | None, price_rows: li
         "unavailableRegions": sorted(unavailable_regions),
         "hlFlag": game.hl_flag or 0,
         "ppFlag": game.pp_flag or 0,
+        # smart 评分（0~1 加权和）与四因子拆解（实验池对照展示用）
+        "smartScore": round(
+            smart_score(game.diff_fen, game.positive_rate, game.review_count, game.hl_flag, discount),
+            4,
+        ),
+        "smartFactors": smart_factors,
         # 最近一次原价跳变时刻：永降/永涨徽章 14 天时效判据（前端判定显隐）
         "ppChangedAt": game.pp_changed_at.isoformat() if game.pp_changed_at else None,
         "updatedAt": game.updated_at.isoformat() if game.updated_at else None,
