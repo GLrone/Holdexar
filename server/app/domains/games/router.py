@@ -150,9 +150,10 @@ async def game_bundles(appid: int):
 
 
 @router.get("/{appid}/cdk")
-async def game_cdk(appid: int):
-    """第三方平台 (SteamPY / SteamCICI) CDK 状态——跨域查价的终端化承接。"""
-    return await cdk_fetcher.fetch_cdk(appid)
+async def game_cdk(appid: int, sub_id: int | None = None):
+    """第三方平台 (SteamPY / SteamCICI) CDK 状态——跨域查价的终端化承接。
+    可选 sub_id 用于查询指定版本的价格，不传时自动解析标准版 sub_id。"""
+    return await cdk_fetcher.fetch_cdk(appid, sub_id=sub_id)
 
 
 @router.get("/{appid}")

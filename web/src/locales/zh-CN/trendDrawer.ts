@@ -1,9 +1,8 @@
 /* trendDrawer 词条 —— 价格走势抽屉（components/business/PriceTrendDrawer.vue）。
 
-   两处刻意的复用，改一条两边同步：
-   · 版本标签「标准版」/「Gold 版」在版本下拉与「全部版本」chips 里是同一件事
-     （共用 version.standard / version.gold）；带后缀的『标准版（全部）』是另
-     一语义（缺省 = 所有 sub 混合序列），单独成条。
+   一处刻意的复用，改一条三处同步：版本标签「标准版」/「Gold 版」在版本下拉、
+   详情页价格区块与「全部版本」chips 里是同一件事（共用 version.standard /
+   version.gold）——标准版横跨的多个 sub 代际由列表侧合并成一条，不再另立词条。
    · 「历史最低」同时是图例项与统计格标签，共用 legend.lowest。
 
    文案里带 {占位符} 的（header.subtitle / price.discount）**不要**在组件侧
@@ -19,7 +18,6 @@ const trendDrawer = {
   /* 版本标签 */
   'trendDrawer.version.standard': '标准版',
   'trendDrawer.version.gold': 'Gold 版',
-  'trendDrawer.version.standardAll': '标准版（全部）',
 
   /* 史低事件标记 */
   'trendDrawer.event.first': '首发',

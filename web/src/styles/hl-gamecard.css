@@ -670,9 +670,9 @@
 }
 
 .cdk-section-title {
-    font-size: 11px;
+    font-size: 12px;
     color: #ffcc00;
-    margin-bottom: 6px;
+    margin-bottom: 8px;
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -698,31 +698,31 @@
 .cdk-buttons-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 6px;
+    gap: 8px;
 }
 
 .cdk-btn {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: 6px;
     background: var(--surface-panel);
     border: 1px solid var(--row-border);
     color: var(--text-base);
-    padding: 6px 8px;
-    border-radius: 5px;
+    padding: 9px 12px;
+    border-radius: 6px;
     text-decoration: none;
-    font-size: 10px;
+    font-size: 12px;
     transition: all 0.2s;
 }
 
 .cdk-btn:hover { background: var(--row-border); }
 
-.cdk-icon { width: 12px; height: 12px; border-radius: 50%; }
+.cdk-icon { width: 16px; height: 16px; border-radius: 50%; }
 
 .cdk-status {
     margin-left: auto;
     color: var(--danger);
-    font-size: 9px;
+    font-size: 11px;
 }
 
 /* ==================== 图表视图 ==================== */
@@ -958,8 +958,8 @@
 
 .gpw-popover-subhead {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
+    flex-direction: column;
+    gap: 8px;
     margin-bottom: 12px;
 }
 
@@ -968,6 +968,18 @@
     font-weight: bold;
     color: var(--text-base);
 }
+
+.gpw-subhead-controls {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.gpw-version-select { width: 150px; }
+/* 触发器铺满固定宽的外壳（本文件是全局样式，`:deep()` 只对 SFC scoped 有效，
+   写在这儿会被浏览器当无效选择器整条丢弃） */
+.gpw-version-select .hl-select-wrap { width: 100%; }
 
 .gpw-popover-tabs {
     display: flex;

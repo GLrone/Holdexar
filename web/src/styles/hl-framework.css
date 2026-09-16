@@ -510,8 +510,11 @@
   top: calc(100% + 6px);
   left: 0;
   min-width: 200px;
-  /* 必须盖过 HlDrawer（z-index 101）——弹层 teleport 到 body，低于抽屉会被面板吞掉 */
-  z-index: 110;
+  /* 必须盖过 HlDrawer（z-index 101）——弹层 teleport 到 body，低于抽屉会被面板吞掉；
+     也必须盖过游戏卡的二级窗口 GPW 弹窗（990）——版本下拉就住在那个弹窗里，层级
+     不够时弹层被弹窗背景整块挡住，用户看到的现象是「点开下拉没有任何内容」。
+     上限仍低于站内 toast（9999）与卡片浮层（10000+）。 */
+  z-index: 1000;
   background: var(--bg-card);
   border: 1px solid var(--border-soft);
   border-radius: var(--radius);
@@ -1180,13 +1183,42 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
 .hl-popconfirm.is-show { opacity: 1; pointer-events: auto; --tip-y: 0px; }
 .hl-popconfirm__actions { display: flex; gap: 6px; justify-content: flex-end; margin-top: 9px; }
 
+/* 关窗幕布：桌面壳弹原生「最小化 / 退出程序」弹窗时铺的页面级遮罩。
+   由 window.__hlxCloseCurtain(bool) 驱动（App.vue）。盖住整个页面内容区，
+   窗口标题栏归原生窗口管；z-index 压过站内弹层，但低于 toast 9999。 */
+.hl-close-curtain {
+  position: fixed;
+  inset: 0;
+  background: var(--surface-mask);
+  z-index: 2000;
+}
+/* 毛玻璃由「内容自己模糊」实现，而不是遮罩的 backdrop-filter：
+   实测本机 WebView2 的合成路径下 backdrop-filter 只压暗不模糊（边缘能量恰好等于
+   纯压暗的预测值），普通 filter 在软件渲染下同样有效。半径比站内小弹层的 8px 大，
+   满屏尺度下 8px 糊感不足；补一点饱和度，色彩透过来才不灰成一片。
+   选择器按「外壳的直接子块」取（侧边栏 + 主列都在内），不写死组件根类名——
+   曾经写死 .app-shell__sidebar 而组件真实根类是 .hl-sidebar，结果侧边栏只被压暗
+   没被糊。遮罩自己排除在外。 */
+.app-shell.is-curtained > :not(.hl-close-curtain) {
+  filter: blur(16px) saturate(1.2);
+  transition: filter calc(var(--duration-2) * var(--motion-scale)) var(--ease-inout);
+}
+.hl-curtain-fade-enter-active,
+.hl-curtain-fade-leave-active {
+  transition: opacity calc(var(--duration-2) * var(--motion-scale)) var(--ease-inout);
+}
+.hl-curtain-fade-enter-from,
+.hl-curtain-fade-leave-to { opacity: 0; }
+
 /* Dialog / Drawer */
 .hl-overlay {
   position: fixed;
   inset: 0;
   background: var(--surface-mask);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
   /* 模态对话框必须盖过非模态抽屉（101）——抽屉内开 HlDialog 会被面板吞掉；
-     仍低于 HlSelect 弹层 110 与 toast 9999 */
+     仍低于 HlSelect 弹层 1000 与 toast 9999 */
   z-index: 102;
   display: flex;
   align-items: center;
@@ -1219,10 +1251,10 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
   transition: transform calc(var(--duration-3) * var(--motion-scale)) var(--ease-spring),
               opacity calc(var(--duration-3) * var(--motion-scale)) var(--ease-inout);
 }
-.hl-dialog-pop-enter-from .hl-dialog { opacity: 0; transform: translateY(20px) scale(0.96); }
+.hl-dialog-pop-enter-from .hl-dialog { opacity: 0; transform: translateY(28px) scale(0.95); }
 /* 出场位移与缩放都比入场小、曲线也换成普通缓出：关闭要「干脆」，入场才要「有分量」。
    （此处必须排在 -enter-from 之后，两者特异性相同，靠后者胜。） */
-.hl-dialog-pop-leave-to .hl-dialog { opacity: 0; transform: translateY(10px) scale(0.98); }
+.hl-dialog-pop-leave-to .hl-dialog { opacity: 0; transform: translateY(8px) scale(0.98); }
 .hl-dialog__head {
   display: flex;
   align-items: center;
@@ -1253,6 +1285,8 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
   position: fixed;
   inset: 0;
   background: var(--surface-mask);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
   z-index: 100;
 }
 /* 遮罩淡入淡出（Transition name="hl-drawer-fade"） */
@@ -1273,12 +1307,19 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
   flex-direction: column;
   z-index: 101;
 }
-/* 滑入/滑出（Transition name="hl-drawer-slide"）：全宽位移 + 主题缓动。
-   出/入都用急出缓收曲线，起步即大位移——收起动作肉眼明确（用户反馈过"收起不明显"） */
+/* 滑入/滑出（Transition name="hl-drawer-slide"）：全宽位移 + 透明度淡入淡出。
+   出/入都用急出缓收曲线，起步即大位移——收起动作肉眼明确（用户反馈过"收起不明显"）。
+   额外增加 opacity 过渡避免全不透明面板硬切入场。 */
 .hl-drawer-slide-enter-active,
-.hl-drawer-slide-leave-active { transition: transform calc(var(--duration-4) * var(--motion-scale)) var(--ease-out); }
+.hl-drawer-slide-leave-active {
+  transition: transform calc(var(--duration-4) * var(--motion-scale)) var(--ease-out),
+              opacity calc(var(--duration-2) * var(--motion-scale)) var(--ease-inout);
+}
 .hl-drawer-slide-enter-from,
-.hl-drawer-slide-leave-to { transform: translateX(100%); }
+.hl-drawer-slide-leave-to {
+  transform: translateX(100%);
+  opacity: 0;
+}
 
 /* ══════════ 板块 / 模块切换过渡（HlPaneSwitch）══════════
    用法见 components/ui/HlPaneSwitch.vue。
