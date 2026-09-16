@@ -1,6 +1,7 @@
 /* logs 词条 —— 运行日志页（views/logs/Index.vue）。
 
    「已复制」直接复用 common.copied（与按钮态同一件事），故此处没有该条。
+   正文复制走系统原生拖选 + Ctrl+C，不需要词条。
    行结构着色（`时间 [级别] logger: 消息`）是后端原样字符串，不迁。 */
 
 const logs = {
@@ -21,11 +22,8 @@ const logs = {
 
   /* 日志框 */
   'logs.empty': '暂无日志输出——后台爬取/汇率刷新/调度器运行时将实时打印到这里',
-  'logs.line.clickToCopy': '单击复制该行',
 
   /* 复制结果提示 */
-  'logs.copy.lineCopied': '已复制该行',
-  'logs.copy.failed': '复制失败',
   'logs.copy.failedHint': '复制失败——请在日志框内手动选择后 Ctrl+C',
 } as const
 

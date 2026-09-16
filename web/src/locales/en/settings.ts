@@ -104,6 +104,19 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.update.phaseVerifying': 'Verifying SHA256…',
   'settings.update.phaseExtracting': 'Extracting…',
   'settings.update.phaseProcessing': 'Working…',
+  /* Update behaviour switches (alerts / silent auto-update) */
+  'settings.update.notifyLabel': 'New version alerts',
+  'settings.update.notifyHint':
+    'Pop up a dialog and light a dot on "Me" in the sidebar when an update is found. Turn it off to stay silent — you can still check manually any time.',
+  'settings.update.notifyOn': 'New version alerts turned on',
+  'settings.update.notifyOff': 'New version alerts turned off — no more interruptions',
+  'settings.update.autoLabel': 'Silent auto-update',
+  'settings.update.autoHint':
+    'Download and verify new versions in the background with no popup; the update is applied the next time you start the app.',
+  'settings.update.autoOn': 'Silent auto-update turned on — downloads will run in the background',
+  'settings.update.autoOff': 'Silent auto-update turned off — downloads are manual again',
+  'settings.update.autoStarted': 'Downloading v{version} in the background — we will not interrupt you',
+  'settings.update.switchFailed': 'Could not save the setting — please try again',
 
   /* Guided-tour card (the tour copy itself lives in ProductTour.vue) */
   'settings.tour.desc': 'A spotlight walkthrough: bind an account → manage proxies → import games → set price alerts, highlighting the exact spot on screen at each step. It ran automatically on first launch — replay it any time.',
