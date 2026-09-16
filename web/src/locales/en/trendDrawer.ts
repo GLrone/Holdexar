@@ -12,7 +12,6 @@ const trendDrawer: Partial<Record<MessageKey, string>> = {
   /* Version labels */
   'trendDrawer.version.standard': 'Standard',
   'trendDrawer.version.gold': 'Gold Edition',
-  'trendDrawer.version.standardAll': 'Standard (all)',
 
   /* All-time-low event markers */
   'trendDrawer.event.first': 'First',

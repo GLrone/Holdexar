@@ -168,11 +168,59 @@ function fadeArea(color: string, top: number, bottom: number) {
   }
 }
 
+/** 全量走势缩略条的**底图几何**——这条缩略条同时就是时间窗控制器：
+ *  走势画在它身上，窗口暗幕与把手直接叠在这张走势图上（见模板的窗口控制层）。
+ *
+ *  此前这一层用的是 echarts dataZoom 内置的 dataBackground「数据影子」：它从该轴上
+ *  **第一条可用序列**里挑一条当代表（echarts 源码注释即 "Find a representative
+ *  series"），把该序列的**原始数据**画成一条不分级的折线，再按这条序列自身的极值
+ *  重新标定。于是缩略条的曲线既不是主图任何一条线的形状（主图是阶梯线、共享值域、
+ *  还有 Key 店线与史低线），也没有「它到底画的哪条序列」的确定语义——看图时就是一条
+ *  来路不明的曲线。
+ *
+ *  现在口径与所选版本 × 地区的主图完全一致：
+ *   · 同一批序列——Steam 阶梯线（step: 'end'）+ 幕布、Key 店横线、史低虚线；
+ *   · 同一值域——三条序列的并集极值（主图 y 轴吃的也是这批极值）；
+ *   · 恒为全量时间跨度——窗口只压暗不裁窄，条上永远看得到全部历史。
+ *  响应式 computed：切版本 / 切地区拿到新 payload 即重算，不需要额外同步。 */
+const THUMB_W = 1000
+/** 与 .pc-range-svg 的 CSS 高度一致（36px，模版尺寸）——y 坐标即像素，好对账 */
+const THUMB_H = 36
+const THUMB_VIEWBOX = `0 0 ${THUMB_W} ${THUMB_H}`
+
+const thumbGeo = computed(() => {
+  const ts = tsList.value
+  const vals = ys.value
+  const n = ts.length
+  if (!n) return null
+  const key = keyPriceYuan.value
+  const low = lowYuan.value
+  const all = [...vals, ...(key != null ? [key] : []), ...(low != null ? [low] : [])]
+  const vMin = Math.min(...all)
+  const vMax = Math.max(...all)
+  const vSpan = vMax - vMin
+  const t0 = ts[0]
+  const tSpan = ts[n - 1] - t0
+  const px = (tsv: number) => (tSpan > 0 ? ((tsv - t0) / tSpan) * THUMB_W : 0)
+  // 上下各留 3px，线不贴边；极值退化成一条水平线时落中线
+  const py = (v: number) => (vSpan > 0 ? THUMB_H - 3 - ((v - vMin) / vSpan) * (THUMB_H - 6) : THUMB_H / 2)
+  const r = (v: number) => Math.round(v * 100) / 100
+  // 阶梯线（与主图 step: 'end' 同形）：先横走到下一时刻，再竖跳到新价
+  let d = `M ${r(px(ts[0]))} ${r(py(vals[0]))}`
+  for (let i = 1; i < n; i++) d += ` L ${r(px(ts[i]))} ${r(py(vals[i - 1]))} L ${r(px(ts[i]))} ${r(py(vals[i]))}`
+  const area = `${d} L ${r(px(ts[n - 1]))} ${THUMB_H} L ${r(px(ts[0]))} ${THUMB_H} Z`
+  return {
+    line: d,
+    area,
+    keyY: key != null ? r(py(key)) : null,
+    lowY: low != null ? r(py(low)) : null,
+  }
+})
+
 const chartOption = computed(() => {
   const c = palette.value
   const tip = tipPalette.value
   const ps = pts.value
-  const n = ps.length
   const low = lowYuan.value
   const keyPrice = keyPriceYuan.value
   const series: Record<string, unknown>[] = [
@@ -236,7 +284,8 @@ const chartOption = computed(() => {
     backgroundColor: 'transparent',
     // rAF 被后台窗口限流时入场动画永停首帧（汇率图同款坑），直接关掉
     animation: false,
-    grid: { left: 12, right: 52, top: 16, bottom: 66 },
+    // 导航条视图已移出画布（见 dataZoom 注释），底部只留轴标签的位置
+    grid: { left: 12, right: 52, top: 16, bottom: 34 },
     // 悬停时贴在坐标轴上的指示线与标签框（走 tooltip 同款底/框；不配就走 echarts
     // 默认的灰底白字，两个主题下都突兀）
     axisPointer: axisPointerStyle(c, tip),
@@ -296,81 +345,186 @@ const chartOption = computed(() => {
     },
     dataZoom: [
       {
+        // 只见状态、不见视图：导航条的可视部分就是下方的全量走势缩略条本身
+        // （控制层画在那张走势图上，见 thumbGeo / winPct）。这里只留一个
+        // 不渲染的 dataZoom 承载窗口状态，接收 dispatchAction。
         type: 'slider',
+        show: false,
         xAxisIndex: 0,
-        left: 12,
-        right: 52,
-        bottom: 8,
-        height: 32,
-        // 时间轴下 startValue/endValue 是**时间戳**（不是索引）
-        startValue: windowStartTs(props.windowDays ?? 0),
-        endValue: tsList.value[n - 1],
         brushSelect: false,
-        borderColor: c.axis,
-        fillerColor: withAlpha(c.line, 0.14),
-        handleStyle: { color: c.line },
-        moveHandleStyle: { color: c.line },
-        dataBackground: {
-          lineStyle: { color: withAlpha(c.line, 0.35) },
-          areaStyle: { color: withAlpha(c.line, 0.1) },
-        },
-        selectedDataBackground: {
-          lineStyle: { color: c.line },
-          areaStyle: { color: withAlpha(c.line, 0.18) },
-        },
-        textStyle: { color: c.label, fontSize: 10 },
       },
     ],
     series,
   }
 })
 
-// ── 时间窗同步：父级预设 → 图表开窗；导航条拖拽 → 回传实际跨度 ──
+// ── 时间窗：缩略条即控制器（拖动把手改宽度 / 拖窗口平移 / 点暗幕跳转）──
+// 窗口状态由本组件持有（winStart/winEnd，ms），图表侧只被动接收 dispatchAction。
+// 窗口不再写进 option：option 每次重算（切主题、换 payload）都会重放其中的
+// startValue/endValue，用户拖出来的区间会被拽回「最后 N 天」的锚点。
 const chartRef = ref<{ dispatchAction: (action: Record<string, unknown>) => void } | null>(null)
-let applyingZoom = false
 
-function applyWindow() {
+/** 当前时间窗（ms），控制层的位置与暗幕都由它算 */
+const winStart = ref(0)
+const winEnd = ref(0)
+
+/** 缩略图 svg（描线入场用）与叠在它上面的滑块区（拖拽换算量它的实际像素宽度，
+ *  不能用 viewBox 宽度）——两者同宽同高、完全重合，见 .pc-slider-zone 的负 margin */
+const thumbRef = ref<SVGSVGElement | null>(null)
+const zoneRef = ref<HTMLElement | null>(null)
+
+function dispatchWindow() {
   const inst = chartRef.value
   if (!inst || !hasPoints.value) return
-  applyingZoom = true
-  inst.dispatchAction({
-    type: 'dataZoom',
-    startValue: windowStartTs(props.windowDays ?? 0),
-    endValue: tsList.value[pts.value.length - 1],
-  })
-  Promise.resolve().then(() => {
-    applyingZoom = false
-  })
+  inst.dispatchAction({ type: 'dataZoom', startValue: winStart.value, endValue: winEnd.value })
 }
 
-/** 导航条拖拽期 datazoom 会连续触发；逐次回传会让父级 windowDays 高频变化，
- *  每次都重放整幅描线（还会落进 revealChart 的打断窗口）。停手后回传一次。 */
-let zoomEmitTimer: number | undefined
-
-interface ZoomPayload {
-  startValue?: number
-  endValue?: number
+/** 父级给的是「跨度天数」，锚在最后一片切片上（与 windowStartTs 同一口径） */
+function applyWindow() {
+  const ts = tsList.value
+  if (!ts.length) return
+  winStart.value = windowStartTs(props.windowDays ?? 0)
+  winEnd.value = ts[ts.length - 1]
+  dispatchWindow()
 }
 
-function onZoom(e: unknown) {
-  if (applyingZoom) return // 自家 dispatch 的回声不回传
-  const ev = e as { batch?: ZoomPayload[] } & ZoomPayload
-  const z = ev.batch?.[0] ?? ev
-  // 时间轴下不能再用「百分比 → 索引」回推时间：百分比映射的是时间跨度，
-  // 而点数在跨度上分布不均（促销期密集），换算出的索引会指向错误的切片。
-  // 事件里已经带了时间戳形态的 startValue/endValue，直接取。
-  const t0 = typeof z?.startValue === 'number' ? z.startValue : null
-  const t1 = typeof z?.endValue === 'number' ? z.endValue : null
-  if (t0 == null || t1 == null) return
-  const days = Math.max(1, Math.round((t1 - t0) / 86400_000))
-  window.clearTimeout(zoomEmitTimer)
-  zoomEmitTimer = window.setTimeout(() => emit('window-change', days), 160)
-}
+/** 自 emit 回环：拖完回传的天数原样落回 props.windowDays，此时**不能**再按锚点
+ *  重开窗口——那会把用户刚拖到的历史区间拽回「最后 N 天」。消费一次即清。 */
+let lastEmittedDays: number | null = null
 
-watch(() => props.windowDays, () => nextTick(applyWindow))
+watch(
+  () => props.windowDays,
+  (d) => {
+    if (lastEmittedDays !== null && d === lastEmittedDays) {
+      lastEmittedDays = null
+      return
+    }
+    nextTick(applyWindow)
+  },
+)
 watch(() => props.payload, () => nextTick(applyWindow))
 onMounted(() => nextTick(applyWindow))
-onUnmounted(() => window.clearTimeout(zoomEmitTimer))
+
+/** 窗口在条上的占比（0..1）——与图形几何同一把时间尺子 */
+const winPct = computed(() => {
+  const ts = tsList.value
+  if (ts.length < 2) return { start: 0, end: 1 }
+  const t0 = ts[0]
+  const span = ts[ts.length - 1] - t0 || 1
+  const clamp = (v: number) => Math.max(0, Math.min(1, v))
+  const a = clamp((winStart.value - t0) / span)
+  const b = clamp((winEnd.value - t0) / span)
+  return { start: Math.min(a, b), end: Math.max(a, b) }
+})
+
+/** 标签行右端：当前窗口的起止月份 + 跨度（整段 =「全部」，否则月数） */
+const thumbRangeText = computed(() => {
+  const ts = tsList.value
+  if (ts.length < 2) return ''
+  const full = ts[ts.length - 1] - ts[0] || 1
+  const span = winEnd.value - winStart.value
+  return t('trendChart.thumb.range', {
+    start: fmtTick(winStart.value, true),
+    end: fmtTick(winEnd.value, true),
+    span:
+      span >= full * 0.999
+        ? t('trendChart.thumb.all')
+        : t('trendChart.thumb.months', {
+            n: Math.max(1, Math.round(span / (30.44 * 86400_000))),
+          }),
+  })
+})
+
+/** 信息行两端的锚点月份（与轴刻度同一 YYYY-MM 粒度） */
+const thumbStartLabel = computed(() => (tsList.value.length ? fmtTick(winStart.value, true) : ''))
+const thumbEndLabel = computed(() =>
+  tsList.value.length ? fmtTick(winEnd.value, true) : '',
+)
+
+type DragMode = 'left' | 'right' | 'pan'
+let drag: { mode: DragMode; x0: number; s0: number; e0: number; w: number } | null = null
+
+/** 拖拽中每帧都重算窗口：只发 dispatchAction，不重算 option（option 里没有窗口） */
+function onDragMove(ev: PointerEvent) {
+  const ts = tsList.value
+  if (!drag || ts.length < 2) return
+  const t0 = ts[0]
+  const t1 = ts[ts.length - 1]
+  const span = t1 - t0 || 1
+  const dt = ((ev.clientX - drag.x0) / drag.w) * span
+  // 最短窗口：两天（价格切片本身就是按天记的，再窄没有可读信息）
+  const minSpan = Math.min(span, Math.max(2 * 86400_000, span * 0.01))
+  if (drag.mode === 'pan') {
+    let s = drag.s0 + dt
+    let e = drag.e0 + dt
+    if (s < t0) {
+      e += t0 - s
+      s = t0
+    }
+    if (e > t1) {
+      s -= e - t1
+      e = t1
+    }
+    winStart.value = Math.max(t0, s)
+    winEnd.value = Math.min(t1, e)
+  } else if (drag.mode === 'left') {
+    winStart.value = Math.min(Math.max(t0, drag.s0 + dt), drag.e0 - minSpan)
+  } else {
+    winEnd.value = Math.max(Math.min(t1, drag.e0 + dt), drag.s0 + minSpan)
+  }
+  dispatchWindow()
+}
+
+function endDrag() {
+  if (!drag) return
+  drag = null
+  window.removeEventListener('pointermove', onDragMove)
+  window.removeEventListener('pointerup', endDrag)
+  window.removeEventListener('pointercancel', endDrag)
+  // 落点才回传（拖拽期逐帧回传会让父级 windowDays 高频变化、反复重放描线动画）
+  const days = Math.max(1, Math.round((winEnd.value - winStart.value) / 86400_000))
+  lastEmittedDays = days
+  emit('window-change', days)
+}
+
+function beginDrag(ev: PointerEvent, mode: DragMode) {
+  const el = zoneRef.value
+  if (!el || tsList.value.length < 2) return
+  const rect = el.getBoundingClientRect()
+  if (!rect.width) return
+  ev.preventDefault()
+  drag = { mode, x0: ev.clientX, s0: winStart.value, e0: winEnd.value, w: rect.width }
+  window.addEventListener('pointermove', onDragMove)
+  window.addEventListener('pointerup', endDrag)
+  window.addEventListener('pointercancel', endDrag)
+}
+
+/** 点窗口之外（滑块区里的暗幕是 pointer-events:none，点击落到缩略图本体上，
+ *  与模版 `.pc-range-svg{cursor:crosshair}` 同一语义）→ 窗口中心跳到该处、
+ *  跨度不变，随后可继续拖 = 平移 */
+function onStripDown(ev: PointerEvent) {
+  const el = zoneRef.value
+  const ts = tsList.value
+  if (!el || ts.length < 2) return
+  const rect = el.getBoundingClientRect()
+  if (!rect.width) return
+  const t0 = ts[0]
+  const t1 = ts[ts.length - 1]
+  const span = t1 - t0 || 1
+  const hit = t0 + Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width)) * span
+  const width = winEnd.value - winStart.value
+  const s = Math.max(t0, Math.min(t1 - width, hit - width / 2))
+  winStart.value = s
+  winEnd.value = s + width
+  dispatchWindow()
+  beginDrag(ev, 'pan')
+}
+
+onUnmounted(() => {
+  window.removeEventListener('pointermove', onDragMove)
+  window.removeEventListener('pointerup', endDrag)
+  window.removeEventListener('pointercancel', endDrag)
+})
 
 // ── 左→右描线入场：CSS clip-path 展开（文档时间线推进，后台标签页照样
 //    走完，规避 rAF 后台限流把入场动画永停首帧的坑；echarts 保持
@@ -413,10 +567,92 @@ watch(
       :style="{ height }"
       :option="chartOption"
       autoresize
-      @datazoom="onZoom"
     />
     <div v-else class="trend-chart__empty" :style="{ height }">
       <slot name="empty">{{ t('trendChart.empty') }}</slot>
+    </div>
+    <!-- 全量走势缩略条＝时间窗控制器（二合一）。结构与形态继承模块 F 的 pc-range
+         四段式：标签行 / 缩略图 / 叠在缩略图上的滑块区 / 区间信息行。
+         底图是所选版本 × 地区的**全部**时间跨度、与主图同一批序列与值域
+         （几何见 thumbGeo），随 payload 变更实时重算；滑块区就是窗口控制：
+         拖把手改跨度、拖窗口平移、点窗口外跳转。与主图共用一次左→右描线入场。 -->
+    <div v-if="hasPoints && thumbGeo" class="pc-range-wrap">
+      <div class="pc-range-label">
+        <span>{{ t('trendChart.thumb.title') }}</span>
+        <span>{{ thumbRangeText }}</span>
+      </div>
+      <svg
+        ref="thumbRef"
+        class="pc-range-svg"
+        :class="{ 'hl-chart-wipe': wipe }"
+        :viewBox="THUMB_VIEWBOX"
+        preserveAspectRatio="none"
+        aria-hidden="true"
+        @pointerdown.prevent="onStripDown"
+      >
+        <!-- z 序对齐主图：Key 店幕布 → Steam 幕布 → 史低虚线 → Key 店线 → Steam 线 -->
+        <rect
+          v-if="thumbGeo.keyY !== null"
+          class="tt-key-area"
+          x="0"
+          :y="thumbGeo.keyY"
+          :width="THUMB_W"
+          :height="Math.max(0, THUMB_H - thumbGeo.keyY)"
+        />
+        <path class="tt-steam-area" :d="thumbGeo.area" />
+        <line
+          v-if="thumbGeo.lowY !== null"
+          class="tt-low"
+          x1="0"
+          :y1="thumbGeo.lowY"
+          :x2="THUMB_W"
+          :y2="thumbGeo.lowY"
+        />
+        <line
+          v-if="thumbGeo.keyY !== null"
+          class="tt-key"
+          x1="0"
+          :y1="thumbGeo.keyY"
+          :x2="THUMB_W"
+          :y2="thumbGeo.keyY"
+        />
+        <path class="tt-steam" :d="thumbGeo.line" />
+      </svg>
+      <!-- 滑块区：负 margin 完全压在缩略图上（模版同款）。自身不拦点击，
+           只有把手与窗口命中层接收指针——点窗口外会落到下面的缩略图上。 -->
+      <div ref="zoneRef" class="pc-slider-zone">
+        <div
+          class="pc-slider-mask"
+          :style="{ left: '0%', width: `${winPct.start * 100}%` }"
+        />
+        <div
+          class="pc-slider-mask"
+          :style="{ left: `${winPct.end * 100}%`, width: `${(1 - winPct.end) * 100}%` }"
+        />
+        <div
+          class="pc-slider-window"
+          :style="{
+            left: `${winPct.start * 100}%`,
+            width: `${(winPct.end - winPct.start) * 100}%`,
+          }"
+          @pointerdown.prevent="beginDrag($event, 'pan')"
+        />
+        <div
+          class="pc-slider-handle"
+          :style="{ left: `${winPct.start * 100}%` }"
+          @pointerdown.prevent="beginDrag($event, 'left')"
+        />
+        <div
+          class="pc-slider-handle"
+          :style="{ left: `${winPct.end * 100}%` }"
+          @pointerdown.prevent="beginDrag($event, 'right')"
+        />
+      </div>
+      <div class="pc-range-info">
+        <span>{{ thumbStartLabel }}</span>
+        <span>{{ t('trendChart.thumb.hint') }}</span>
+        <span>{{ thumbEndLabel }}</span>
+      </div>
     </div>
     <!-- 图例（详情页大图随 key 线显示；抽屉窄图用自身的 pc-legend） -->
     <div v-if="hasPoints && withKeyLine" class="trend-chart__legend">
@@ -439,6 +675,147 @@ watch(
 
 /* 左→右描线入场的 keyframes 与降级已上移到 hl-framework.css（.hl-chart-wipe）：
    本文件与 rates/Index.vue 此前各持一份逐字相同的副本。 */
+
+/* ─ 全量走势缩略条＝时间窗控制器（pc-range 四段式）──
+   尺寸与形态沿用模块 F 的 pc-range 一套：标签行 10px 灰字、缩略图 36px、
+   滑块区用负 margin 完全压回缩略图上、信息行等宽字体；把手是「2px 强调色竖线 +
+   圆点」。差异只有两处，都是令牌化所需：暗幕色走 --surface-mask（模版写的是
+   rgba 字面量）、把手圆点阴影走 --shadow-sm。
+   preserveAspectRatio="none" 让图形横向铺满（viewBox 是 1000×44 的虚拟坐标系，
+   容器变窄也不重算几何）；笔画用 non-scaling-stroke 免被横向拉伸，
+   拖拽换算永远走 getBoundingClientRect 的实际像素宽度，与 viewBox 无关。 */
+.pc-range-wrap {
+  margin-top: 6px;
+  padding: 8px 4px 4px;
+}
+
+.pc-range-label {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 4px;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.pc-range-svg {
+  display: block;
+  width: 100%;
+  height: 36px;
+  cursor: crosshair;
+  touch-action: none; /* 触屏上拖把手不要被页面滚动抢走 */
+}
+
+.pc-slider-zone {
+  position: relative;
+  height: 36px;
+  margin-top: -36px;
+  /* 自身不拦指针：只有把手与窗口命中层接指针，其余位置落到底下的缩略图上
+     （模版里暗幕即 pointer-events:none，点击语义在 svg 的 crosshair 上） */
+  pointer-events: none;
+}
+
+/* 窗口外暗幕（模版 rgba(0,0,0,.35) → 令牌 --surface-mask） */
+.pc-slider-mask {
+  position: absolute;
+  top: 0;
+  height: 36px;
+  background: var(--surface-mask);
+  pointer-events: none;
+}
+
+/* 窗口本体：模版无此视觉，只作平移命中区（拖窗口不改跨度） */
+.pc-slider-window {
+  position: absolute;
+  top: 0;
+  height: 36px;
+  background: transparent;
+  pointer-events: auto;
+  cursor: grab;
+}
+
+.pc-slider-window:active {
+  cursor: grabbing;
+}
+
+.pc-slider-handle {
+  position: absolute;
+  top: 0;
+  width: 10px;
+  height: 36px;
+  margin-left: -5px; /* 模版是 left 贴边界（线偏右 5px），这里把线对到边界上 */
+  cursor: ew-resize;
+  pointer-events: auto;
+  z-index: 5;
+}
+
+.pc-slider-handle::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 0;
+  transform: translateX(-50%);
+  width: 2px;
+  height: 100%;
+  background: var(--accent);
+  opacity: 0.7;
+}
+
+.pc-slider-handle::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg-card);
+  box-shadow: var(--shadow-sm);
+}
+
+.pc-range-info {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+}
+
+.tt-steam {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.6;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.tt-steam-area {
+  fill: var(--accent);
+  fill-opacity: 0.12;
+  stroke: none;
+}
+
+.tt-key {
+  stroke: var(--success);
+  stroke-width: 1.2;
+  vector-effect: non-scaling-stroke;
+}
+
+.tt-key-area {
+  fill: var(--success);
+  fill-opacity: 0.1;
+  stroke: none;
+}
+
+.tt-low {
+  stroke: var(--warning);
+  stroke-width: 1.2;
+  stroke-dasharray: 6 4;
+  opacity: 0.75;
+  vector-effect: non-scaling-stroke;
+}
 
 .trend-chart__legend {
   display: flex;

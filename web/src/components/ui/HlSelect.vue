@@ -109,6 +109,7 @@ defineOptions({ name: 'HlSelect' })
           class="hl-dropdown-pop"
           :class="{ 'is-open-up': openUp }"
           style="position: fixed"
+          data-hl-select-pop
           :style="{
             top: pos.top + 'px',
             left: pos.left + 'px',

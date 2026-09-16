@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch, watchEffect } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch, watchEffect } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import { useAccountStore } from '@/stores/account'
@@ -29,6 +29,15 @@ import {
 const route = useRoute()
 const router = useRouter()
 
+/* 关窗幕布开关：桌面壳通过 window.__hlxCloseCurtain(bool) 驱动（后台线程派发，
+   见 desktop/main.py）。挂载点由 App 提供，壳里拿不到页面时静默放弃。 */
+const closeCurtain = ref(false)
+declare global {
+  interface Window {
+    __hlxCloseCurtain?: (on: boolean) => void
+  }
+}
+
 const crawl = useCrawlStatusStore()
 const settingsStore = useSettingsStore()
 const themeStore = useThemeStore()
@@ -44,6 +53,13 @@ onMounted(() => {
   setInterval(() => accountStore.load(), 60_000)
   // 与后端对齐更新状态：上次会话下载好却没重启的暂存，这次启动要弹「重启完成更新」
   void updaterStore.sync()
+  // 桌面壳的关窗幕布挂载点（页面卸载时撤掉，避免壳里拿到过期引用）
+  window.__hlxCloseCurtain = (on: boolean) => {
+    closeCurtain.value = on
+  }
+  onUnmounted(() => {
+    delete window.__hlxCloseCurtain
+  })
 })
 
 /* ── 更新已下载（暂存就绪）：拉起全局更新弹窗 ──
@@ -309,7 +325,7 @@ async function manualRefreshWallet() {
 </script>
 
 <template>
-  <div class="app-shell">
+  <div class="app-shell" :class="{ 'is-curtained': closeCurtain }">
     <!-- 侧边栏（HlSideNav：分组导航 + 收拢按键；收起态品牌区悬停换
          「侧边栏」图标，点击展开——新手引导入口已迁至「关于」页 logo） -->
     <HlSideNav
@@ -459,6 +475,16 @@ async function manualRefreshWallet() {
     <!-- 全局更新弹窗（检查/下载/校验/重启全在这里闭环；模糊幕布遮住底层页面）。
          更新模块已从设置页搬出——更新是应用级事务，不该塞在某个页签里。 -->
     <UpdateDialog />
+
+    <!-- 关窗幕布：桌面壳弹出「最小化 / 退出程序」原生弹窗前调用 __hlxCloseCurtain(true)
+         拉起（见 desktop/main.py 的 _toggle_close_curtain），弹窗落定后撤下。
+         为什么要放到页面里：原生壳里另开遮罩窗压在 WebView2 之上，DWM 要整块重新
+         合成，实测把弹窗上屏拖慢 ~600ms；页面侧零延迟，且只盖内容区不盖标题栏。
+         模糊由 .is-curtained 给内容加 filter: blur()（毛玻璃），本遮罩只管压暗：
+         backdrop-filter 在本机 WebView2 的合成路径下不生效（实测只暗不糊）。 -->
+    <Transition name="hl-curtain-fade">
+      <div v-if="closeCurtain" class="hl-close-curtain" />
+    </Transition>
   </div>
 </template>
 

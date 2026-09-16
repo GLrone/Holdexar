@@ -11,6 +11,14 @@ const trendChart: Partial<Record<MessageKey, string>> = {
      两处英文必须一致——否则详情页大图说 All-time low、抽屉里说 Lowest。 */
   'trendChart.legend.lowest': 'All-time low',
 
+  /* Range strip (all-time overview × time-window control). 「{n}-month span」写法
+     对 n=1 也成立，避免「1 months」这类单复数坑。 */
+  'trendChart.thumb.title': 'All-time trend overview',
+  'trendChart.thumb.hint': 'Drag the handles to pick the visible range',
+  'trendChart.thumb.all': 'All',
+  'trendChart.thumb.months': '{n}-month span',
+  'trendChart.thumb.range': '{start} → {end} ({span})',
+
   'trendChart.tip.lowNode': 'new low',
   'trendChart.tip.current': 'Current: ¥{v}',
   'trendChart.tip.currentWithOriginal': 'Current: ¥{v} ({original})',

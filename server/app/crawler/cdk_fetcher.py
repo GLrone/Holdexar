@@ -136,8 +136,8 @@ async def resolve_proxy_for_request() -> str | None:
 _CDK_TTL_SECONDS = 300
 _CDK_ERROR_TTL_SECONDS = 60
 _CDK_CACHE_MAX = 256
-_CDK_CACHE: dict[int, tuple[float, dict[str, Any]]] = {}
-_CDK_REFRESHING: set[int] = set()
+_CDK_CACHE: dict[int | tuple[int, int | None], tuple[float, dict[str, Any]]] = {}
+_CDK_REFRESHING: set[int | tuple[int, int | None]] = set()
 
 
 def invalidate_cdk_cache() -> None:
@@ -149,9 +149,10 @@ def _cdk_had_error(data: dict[str, Any]) -> bool:
     return bool(data.get("steampy", {}).get("error") or data.get("steamcici", {}).get("error"))
 
 
-async def _fetch_cdk_uncached(appid: int, proxy_url: str | None = None) -> dict[str, Any]:
-    """实时查询：sub 解析 + 双平台并发。"""
-    sub_id = await resolve_sub_id(appid)
+async def _fetch_cdk_uncached(appid: int, sub_id: int | None = None, proxy_url: str | None = None) -> dict[str, Any]:
+    """实时查询：sub 解析 + 双平台并发。sub_id 不传时从库内自动解析。"""
+    if sub_id is None:
+        sub_id = await resolve_sub_id(appid)
     proxy = proxy_url if proxy_url is not None else await resolve_proxy_for_request()
     steampy, cici = await asyncio.gather(
         fetch_steampy(appid, sub_id, proxy),
@@ -160,37 +161,37 @@ async def _fetch_cdk_uncached(appid: int, proxy_url: str | None = None) -> dict[
     return {"appid": appid, "subId": sub_id, "steampy": steampy, "steamcici": cici}
 
 
-async def fetch_cdk(appid: int, proxy_url: str | None = None) -> dict[str, Any]:
-    """查询双平台 CDK 状态（TTL 缓存优先）。sub_id 自动从库内解析。"""
+async def fetch_cdk(appid: int, sub_id: int | None = None, proxy_url: str | None = None) -> dict[str, Any]:
+    """查询双平台 CDK 状态（TTL 缓存优先）。sub_id 不传时从库内自动解析。"""
     now = time.monotonic()
-    cached = _CDK_CACHE.get(appid)
+    # 显式 sub_id 时以 (appid, sub_id) 为缓存键，否则以 appid 为键
+    cache_key = (appid, sub_id) if sub_id is not None else appid
+    cached = _CDK_CACHE.get(cache_key)
     if cached is not None:
         ts, data = cached
         ttl = _CDK_ERROR_TTL_SECONDS if _cdk_had_error(data) else _CDK_TTL_SECONDS
         if now - ts < ttl:
             return data
-        # 过期有旧值：立即回旧值，同 appid 的后台刷新只挂一个
-        if appid not in _CDK_REFRESHING:
-            _CDK_REFRESHING.add(appid)
+        # 过期有旧值：立即回旧值，同键的后台刷新只挂一个
+        if cache_key not in _CDK_REFRESHING:
+            _CDK_REFRESHING.add(cache_key)
 
-            async def _bg() -> None:
+            async def _bg(key=appid, sid=sub_id, ck=cache_key) -> None:
                 try:
-                    fresh = await _fetch_cdk_uncached(appid)
-                    _CDK_CACHE[appid] = (time.monotonic(), fresh)
+                    fresh = await _fetch_cdk_uncached(key, sid)
+                    _CDK_CACHE[ck] = (time.monotonic(), fresh)
                 except Exception:  # noqa: BLE001 —— 刷新失败保留旧值并前移时间戳
-                    # 不前移的话，过期条目会每个请求都触发一次注定失败的
-                    # 外网尝试（代理断时是常态），且是并发的。
-                    if appid in _CDK_CACHE:
-                        _CDK_CACHE[appid] = (time.monotonic(), _CDK_CACHE[appid][1])
+                    if ck in _CDK_CACHE:
+                        _CDK_CACHE[ck] = (time.monotonic(), _CDK_CACHE[ck][1])
                 finally:
-                    _CDK_REFRESHING.discard(appid)
+                    _CDK_REFRESHING.discard(ck)
 
             asyncio.create_task(_bg())
         return data
-    fresh = await _fetch_cdk_uncached(appid, proxy_url)
+    fresh = await _fetch_cdk_uncached(appid, sub_id, proxy_url)
     if len(_CDK_CACHE) >= _CDK_CACHE_MAX:
         _CDK_CACHE.pop(next(iter(_CDK_CACHE)))
-    _CDK_CACHE[appid] = (now, fresh)
+    _CDK_CACHE[cache_key] = (now, fresh)
     return fresh
 
 

@@ -20,6 +20,14 @@ const trendChart = {
   'trendChart.legend.keyStore': 'Key 店',
   'trendChart.legend.lowest': '历史最低',
 
+  /* 缩略导航条（全量走势缩略 × 时间窗控制二合一）。
+     range 是参数化整句：起止月份 + 跨度，跨度整段时是「全部」、否则是月数 */
+  'trendChart.thumb.title': '全局历史走势缩略',
+  'trendChart.thumb.hint': '拖拽滑块选择显示区间',
+  'trendChart.thumb.all': '全部',
+  'trendChart.thumb.months': '{n} 个月',
+  'trendChart.thumb.range': '{start} → {end}（{span}）',
+
   /* 悬停提示窗（echarts tooltip formatter 拼 HTML） */
   'trendChart.tip.lowNode': '史低节点',
   'trendChart.tip.current': '现价 ¥{v}',
