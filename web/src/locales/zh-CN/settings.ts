@@ -112,6 +112,7 @@ const settings = {
   'settings.update.networkPost': '手动下载。',
   'settings.update.noReleasePost': '查看。',
   'settings.update.upToDate': '已是最新版本（v{version}）。',
+  'settings.update.availableHint': '发现新版本 v{version}，点「检查更新」在弹窗里一键下载安装。',
   'settings.update.phaseDownloading': '下载中 {progress}',
   'settings.update.phaseVerifying': '校验 SHA256…',
   'settings.update.phaseExtracting': '解包中…',

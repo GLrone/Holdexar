@@ -174,6 +174,8 @@ async def test_download_and_pending_flow(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         updater, "staging_dir", lambda: tmp_path / "staging"
     )
+    # 用例用的是几百字节的假包：体积下限（防镜像错误页）在测试里归零
+    monkeypatch.setattr(updater, "_MIN_PACKAGE_BYTES", 0)
     from unittest.mock import AsyncMock
 
     monkeypatch.setattr(
@@ -224,6 +226,8 @@ async def test_download_uses_manifest_asset_name(tmp_path: Path, monkeypatch) ->
 
     monkeypatch.setattr(updater.httpx, "AsyncClient", _mock_client(handler))
     monkeypatch.setattr(updater, "staging_dir", lambda: tmp_path / "staging")
+    # 用例用的是几百字节的假包：体积下限（防镜像错误页）在测试里归零
+    monkeypatch.setattr(updater, "_MIN_PACKAGE_BYTES", 0)
     monkeypatch.setattr(
         "app.domains.proxies.clash_manager._download_attempts",
         lambda *_a, **_k: [(None, "直连")],
@@ -236,41 +240,143 @@ async def test_download_uses_manifest_asset_name(tmp_path: Path, monkeypatch) ->
 
 
 @pytest.mark.asyncio
-async def test_download_skips_slow_channel_and_sets_total_upfront(
+async def test_download_skips_missing_channel_before_downloading(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """通道速率考核换道 + 开跑即挂总量（进度条有分母）。
+    """探测阶段就排除「资产不存在」的通道（镜像 404），不浪费一次真实下载。
 
-    复现实测场景：首个镜像连上了却几乎不吐数据（40KB/s，整包拖近一小时），
-    用户看到的就是「进度条不动、像卡死」。规则：非末位通道有试跑期速率下限，
-    低于下限即换道；末位通道不考核（全网都慢也得让它下完）。
+    镜像 404 有两种成因：镜像没同步、或该版本压根没发。区分不出来，但代价
+    极低——探测是 1 字节 Range 请求；判断「全 404」= 版本没发，见下一条用例。
     """
     payload = tmp_path / "fake.zip"
     with zipfile.ZipFile(payload, "w") as zf:
         zf.writestr("Holdexar/Holdexar.exe", "MZ-fake")
+    data = payload.read_bytes()
 
-    calls: list[tuple[str, int, dict]] = []
+    # (url, 是否带 Range)：探测请求带 Range（1 字节）、正式下载不带
+    seen: list[tuple[str, bool]] = []
 
-    async def fake_stream(url, proxy, dest, expected_total=None, min_rate_bps=0):
-        calls.append((url, min_rate_bps, dict(updater.download_progress())))
-        if len(calls) < 3:
-            raise RuntimeError("通道过慢（0 KB/s < 128 KB/s），换下一通道")
-        shutil.copyfile(payload, dest)
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        seen.append((url, bool(request.headers.get("range"))))
+        if "ghfast.top" in url:
+            return httpx.Response(404)
+        return httpx.Response(200, content=data)
 
-    monkeypatch.setattr(updater, "_stream_to_file", fake_stream)
+    monkeypatch.setattr(updater.httpx, "AsyncClient", _mock_client(handler))
     monkeypatch.setattr(updater, "staging_dir", lambda: tmp_path / "staging")
+    # 用例用的是几百字节的假包：体积下限（防镜像错误页）在测试里归零
+    monkeypatch.setattr(updater, "_MIN_PACKAGE_BYTES", 0)
     monkeypatch.setattr(
         "app.domains.proxies.clash_manager._download_attempts",
         lambda *_a, **_k: [(None, "直连")],
     )
 
-    result = await updater.download_update("v0.2.0", None, "x.zip", expected_size=999)
-
+    result = await updater.download_update("v0.2.0", None, "x.zip", expected_size=len(data))
     assert result["ok"] is True
-    assert len(calls) == 3, "两条镜像都应被判慢换掉，最终落到直连"
-    assert [c[1] for c in calls] == [
-        updater._MIN_CHANNEL_RATE, updater._MIN_CHANNEL_RATE, 0,
-    ], "末位通道不做速率考核（否则全网都慢时会把所有通道试死）"
-    # 第一条通道的试跑期里，进度就必须带总量与 0%——否则进度条无从渲染
-    assert calls[0][2]["total"] == 999 and calls[0][2]["percent"] == 0
+    # 404 通道只出现在探测请求里（带 Range），不出现在正式下载里
+    assert [u for u, has_range in seen if "ghfast.top" in u and not has_range] == []
+    assert any("ghfast.top" in u for u, _ in seen), "该镜像也应被探测（而非凭空跳过）"
+    updater.clear_staging()
+
+
+@pytest.mark.asyncio
+async def test_download_asset_missing_fails_fast(tmp_path: Path, monkeypatch) -> None:
+    """全通道 404（release 还是草稿 / 资产被撤）→ AssetMissing + code=asset_missing。
+
+    旧实现串行试跑整条通道链（每通道最长 20s）才报错，用户看到的是「下载
+    永远下不动」。现在探测一轮（各通道并发、8s 上限）即定性。
+    """
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404)
+
+    monkeypatch.setattr(updater.httpx, "AsyncClient", _mock_client(handler))
+    monkeypatch.setattr(updater, "staging_dir", lambda: tmp_path / "staging")
+    # 用例用的是几百字节的假包：体积下限（防镜像错误页）在测试里归零
+    monkeypatch.setattr(updater, "_MIN_PACKAGE_BYTES", 0)
+    monkeypatch.setattr(
+        "app.domains.proxies.clash_manager._download_attempts",
+        lambda *_a, **_k: [(None, "直连")],
+    )
+
+    with pytest.raises(updater.AssetMissing):
+        await updater.download_update("v0.2.0", None, "x.zip", expected_size=1234)
+    progress = updater.download_progress()
+    assert progress["code"] == "asset_missing"
+    assert progress["running"] is False
+
+
+@pytest.mark.asyncio
+async def test_stream_to_file_resumes_with_range(tmp_path: Path, monkeypatch) -> None:
+    """换通道不丢已下部分：第二次请求带 `Range: bytes=N-` 续传。
+
+    125MB 的包每次换道都从 0 开始 = 永远下不完（实测痛点）。
+    """
+    dest = tmp_path / "update.zip.part"
+    dest.write_bytes(b"HEAD")
+    ranges: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        ranges.append(request.headers.get("range") or "")
+        return httpx.Response(206, content=b"TAIL", headers={
+            "content-range": "bytes 4-7/8",
+        })
+
+    monkeypatch.setattr(updater.httpx, "AsyncClient", _mock_client(handler))
+    await updater._stream_to_file("https://x/y.zip", None, dest, expected_total=8)
+
+    assert ranges == ["bytes=4-"]
+    assert dest.read_bytes() == b"HEADTAIL"
+
+
+@pytest.mark.asyncio
+async def test_stream_to_file_restarts_when_range_ignored(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """服务端不认 Range（回 200 整包）→ 必须从头写，否则追加出坏包。"""
+    dest = tmp_path / "update.zip.part"
+    dest.write_bytes(b"HEAD")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"FULL")
+
+    monkeypatch.setattr(updater.httpx, "AsyncClient", _mock_client(handler))
+    await updater._stream_to_file("https://x/y.zip", None, dest, expected_total=4)
+
+    assert dest.read_bytes() == b"FULL"
+
+
+@pytest.mark.asyncio
+async def test_download_respects_cancel(tmp_path: Path, monkeypatch) -> None:
+    """用户取消：下载循环在分片边界退出，返回 cancelled 而不是抛故障。"""
+    payload = tmp_path / "fake.zip"
+    with zipfile.ZipFile(payload, "w") as zf:
+        zf.writestr("Holdexar/Holdexar.exe", "MZ-fake")
+    data = payload.read_bytes()
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=data)
+
+    monkeypatch.setattr(updater.httpx, "AsyncClient", _mock_client(handler))
+    monkeypatch.setattr(updater, "staging_dir", lambda: tmp_path / "staging")
+    # 用例用的是几百字节的假包：体积下限（防镜像错误页）在测试里归零
+    monkeypatch.setattr(updater, "_MIN_PACKAGE_BYTES", 0)
+    monkeypatch.setattr(
+        "app.domains.proxies.clash_manager._download_attempts",
+        lambda *_a, **_k: [(None, "直连")],
+    )
+
+    # 探测刚落定即取消（download_update 开头会清旗标，必须在这之后置位）
+    real_probe = updater._probe_channels
+
+    async def probe_then_cancel(channels, fallback_total):
+        probes = await real_probe(channels, fallback_total)
+        updater._CANCEL["flag"] = True
+        return probes
+
+    monkeypatch.setattr(updater, "_probe_channels", probe_then_cancel)
+    result = await updater.download_update("v0.2.0", None, "x.zip", expected_size=len(data))
+    assert result["ok"] is False and result["cancelled"] is True
+    assert updater.download_progress()["code"] == "cancelled"
     updater.clear_staging()

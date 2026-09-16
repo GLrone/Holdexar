@@ -1975,6 +1975,15 @@ def _make_closing_guard(window):
             return True  # 放行真关闭：closed 事件里 os._exit(0) 终结进程
         if intent == "stay":
             return False  # 弹窗右上角 X：取消关闭，窗口原地不动
+        # 托盘没建起来时**不能 hide()**：窗口从屏幕与任务栏一起消失，又没有托盘
+        # 图标可召回——用户只能去任务管理器杀进程（实测：这正是「托盘里没有它、
+        # 任务管理器里却还活着」的成因）。退化成最小化，任务栏仍可点回来。
+        if _tray_state.get("tray") is None:
+            try:
+                window.minimize()
+            except Exception:  # noqa: BLE001
+                pass
+            return False
         try:
             window.hide()
         except Exception:  # noqa: BLE001

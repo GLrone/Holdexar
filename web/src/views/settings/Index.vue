@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import { currencyName } from '@/api/currencies'
 import {
@@ -7,7 +7,6 @@ import {
   systemApi,
   type SettingsPayload,
   type BackupItem,
-  type UpdateProgress,
 } from '@/api/client'
 import { useI18n, type MessageKey } from '@/locales'
 import { useAccountStore } from '@/stores/account'
@@ -177,19 +176,15 @@ async function removeBackup(name: string) {
   }
 }
 
-/* ── 应用更新（清单检查 → 下载暂存 → 重启换装）──
- * 换装发生在重启时（desktop 启动最早分支），页面只负责：检查/下载/进度
- * 展示/触发重启。数据目录在换装白名单内永不移动，更新不碰用户数据。
- * 检查结果存在 stores/updater（启动时也会查一次供侧栏红点用），
- * 本页读写同一份，避免「手动检查了但红点没反应」。 */
+/* ── 应用更新入口 ──
+ * 检查/下载/校验/重启全部在全局更新弹窗（components/business/UpdateDialog.vue）
+ * 里闭环；本页只保留「当前版本 + 入口按键」。数据目录在换装白名单内永不移动。
+ * 检查结果存在 stores/updater（启动时也会查一次供侧栏红点用），本页与弹窗
+ * 读写同一份，不会「这边检查了那边不知道」。 */
 const appVersion = ref('')
 const repoSlug = ref('')
 const updateInfo = computed(() => updaterStore.info)
 const updateChecking = computed(() => updaterStore.checking)
-/* 下载/进度/暂存三态都在 updater store（跨页存活）：切页回来进度续上、
-   不会重复发起下载（重复点会被后端 409 顶回，store 里已按「续看进度」处理） */
-const updateDownloading = computed(() => updaterStore.downloading)
-const updateProgress = computed(() => updaterStore.progress)
 const updatePendingTag = computed(() => updaterStore.pendingTag)
 
 /** 发布页地址（仓库标识由后端 /system/info 下发，前端不硬编码） */
@@ -197,48 +192,8 @@ const releasesUrl = computed(() =>
   repoSlug.value ? `https://github.com/${repoSlug.value}/releases` : '',
 )
 
-async function checkUpdate() {
-  const result = await updaterStore.check(true)
-  if (result?.reason === 'network') {
-    message.error(t('settings.toast.updateCheckFailed'))
-  }
-}
-
-/* 下载失败提示：进度进入「终态且带 error」时弹一次（成功提示由全局
-   「已下载，需重启」弹窗承担，见 App.vue 的 updateReady 弹窗） */
-let lastShownError = ''
-watch(
-  () => updaterStore.progress,
-  (p) => {
-    if (!p || p.running || !p.error || p.error === lastShownError) return
-    lastShownError = p.error
-    message.error(t('settings.toast.updateDownloadFailed', { error: p.error }))
-  },
-)
-
-async function downloadUpdate() {
-  const res = await updaterStore.download()
-  if (!res.ok && res.error && res.error !== 'no_tag') {
-    message.error(t('settings.toast.updateDownloadFailed', { error: res.error }))
-  }
-}
-
-async function cancelUpdate() {
-  try {
-    await updaterStore.cancel()
-    message.success(t('settings.toast.updateCancelled'))
-  } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
-  }
-}
-
-/** 重启换装：桌面壳 restart_app（pywebview 桥，走 updater store 的同一出口）；
-    浏览器态无桥提示手动 */
-async function restartForUpdate() {
-  const res = await updaterStore.restartForUpdate()
-  if (res.ok) return
-  if (res.unsupported) message.info(t('settings.toast.restartUnsupported'))
-  else message.error(res.error || t('settings.toast.restartFailed'))
+function openUpdateDialog() {
+  void updaterStore.openDialog()
 }
 
 async function load() {
@@ -802,9 +757,12 @@ onMounted(load)
         <div class="section-title">{{ t('settings.section.update') }}</div>
         <div class="section-desc">{{ t('settings.update.desc') }}</div>
 
+        <!-- 更新交互全在全局弹窗（模糊幕布）里闭环：本页只留入口 + 状态一句。
+             进度/下载/重启不再出现在这里——它们是应用级事务，塞在页签里时
+             用户切走再回来就得靠 store 续命，体感就是「点了没反应」。 -->
         <div class="settings-row">
           <div class="settings-row__line">
-            <HlButton art="outline" tone="blue" size="sm" :loading="updateChecking" :disabled="updateChecking || updateDownloading" @click="checkUpdate">
+            <HlButton art="outline" tone="blue" size="sm" :loading="updateChecking" @click="openUpdateDialog">
               <HlIcon v-if="!updateChecking" name="refresh" />
               {{ updateChecking ? t('settings.update.checking') : t('settings.update.check') }}
             </HlButton>
@@ -814,75 +772,27 @@ onMounted(load)
           </div>
         </div>
 
-        <!-- 暂存就绪：重启换装提示（下载完成后的主操作） -->
         <div v-if="updatePendingTag" class="settings-update-ready">
           <div class="settings-update-ready__text">
             {{ t('settings.update.pendingReady', { version: updatePendingTag.replace(/^v/, '') }) }}
           </div>
           <div class="settings-row__line">
-            <HlButton art="combo" tone="green" size="sm" @click="restartForUpdate">
+            <HlButton art="combo" tone="green" size="sm" @click="openUpdateDialog">
               <HlIcon name="check" />
               {{ t('settings.update.restartNow') }}
             </HlButton>
-            <HlButton variant="text" size="sm" @click="cancelUpdate">{{ t('settings.update.later') }}</HlButton>
           </div>
         </div>
 
-        <!-- 检查结果：有新版本 → 下载入口 + 更新日志 -->
-        <div v-else-if="updateInfo?.available" class="settings-row">
-          <div class="settings-row__line">
-            <HlButton art="combo" tone="green" size="sm" :loading="updateDownloading" :disabled="updateDownloading" @click="downloadUpdate">
-              <HlIcon v-if="!updateDownloading" name="download" />
-              {{ updateDownloading ? t('settings.update.downloading') : t('settings.update.download', { version: updateInfo.latest }) }}
-            </HlButton>
-            <span class="section-desc" style="display: inline; margin-left: 8px">
-              {{ updateInfo.sizeBytes ? fmtSize(updateInfo.sizeBytes) : '' }}
-            </span>
-            <span v-if="!updateInfo.sha256" class="section-desc" style="display: inline; margin-left: 8px">
-              {{ t('settings.update.noChecksum') }}
-            </span>
-          </div>
-          <div v-if="updateInfo.notes" class="settings-update-notes">{{ updateInfo.notes }}</div>
+        <div v-else-if="updateInfo?.available" class="section-desc">
+          {{ t('settings.update.availableHint', { version: updateInfo.latest }) }}
         </div>
-
-        <!-- 检查结果：无新版本 / 不可查 -->
+        <div v-else-if="updateInfo?.reason === 'network'" class="section-desc">
+          {{ t('settings.update.networkPre') }}
+          <a :href="releasesUrl" target="_blank">{{ t('settings.update.releasesPage') }}</a>{{ t('settings.update.networkPost') }}
+        </div>
         <div v-else-if="updateInfo" class="section-desc">
-          <template v-if="updateInfo.reason === 'network'">
-            {{ t('settings.update.networkPre') }}
-            <a :href="releasesUrl" target="_blank">{{ t('settings.update.releasesPage') }}</a>{{ t('settings.update.networkPost') }}
-          </template>
-          <template v-else-if="!updateInfo.current">
-            {{ t('settings.update.noReleasePre') }}
-            <a :href="releasesUrl" target="_blank">{{ t('settings.update.releasesPage') }}</a>{{ t('settings.update.noReleasePost') }}
-          </template>
-          <template v-else>
-            {{ t('settings.update.upToDate', { version: updateInfo.current }) }}
-          </template>
-        </div>
-
-        <!-- 下载进度 -->
-        <div v-if="updateProgress && (updateDownloading || updateProgress.running)" class="settings-update-progress">
-          <div class="settings-row__line">
-            <span class="section-desc">
-              {{
-                updateProgress.phase === 'download'
-                  ? t('settings.update.phaseDownloading', {
-                      progress:
-                        updateProgress.percent != null
-                          ? updateProgress.percent + '%'
-                          : fmtSize(updateProgress.received),
-                    })
-                  : updateProgress.phase === 'verify'
-                    ? t('settings.update.phaseVerifying')
-                    : updateProgress.phase === 'extract'
-                      ? t('settings.update.phaseExtracting')
-                      : t('settings.update.phaseProcessing')
-              }}
-            </span>
-          </div>
-          <div v-if="updateProgress.percent != null" class="settings-update-progress__bar">
-            <div class="settings-update-progress__fill" :style="{ width: updateProgress.percent + '%' }" />
-          </div>
+          {{ t('settings.update.upToDate', { version: updateInfo.current }) }}
         </div>
       </div>
 

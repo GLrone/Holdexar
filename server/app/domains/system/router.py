@@ -355,9 +355,14 @@ async def update_pending() -> dict:
 
 @router.post("/system/update-cancel")
 async def update_cancel() -> dict:
-    """放弃本次更新：清暂存目录（正在下载的进度由下次覆盖）。"""
+    """取消更新：下载中 → 中止下载（保留已下的续传基线，下次接着下）；
+    已就绪/无任务 → 清暂存目录。
+
+    旧实现在下载中直接 409 拒绝，前端「取消」按钮因此点不动——下载 125MB
+    时用户唯一的出路是等它失败。
+    """
     from app.core import updater
 
     if updater.download_progress().get("running"):
-        raise HTTPException(status_code=409, detail="下载进行中，请稍后再试")
+        return {**updater.cancel_download(), "cleared": False}
     return updater.clear_staging()

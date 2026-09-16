@@ -52,19 +52,30 @@ _ASSET_PATTERN = re.compile(rf"^{re.escape(APP_NAME)}-win64-v[\w.-]+\.zip$", re.
 # 与 scripts/build_manifest.py、scripts/publish_release.py 共用一份。
 # 固定 tag 下挂 latest.json：地址与版本号解耦，检查更新只读这一个文件。
 
-# 通道链：镜像优先，直连兜底（GitHub 资产直连在国内基本不可用）。
+# 镜像前缀（空串 = 直连 GitHub）：同一份资产的不同入口，与下面代理列表
+# 笛卡尔积成候选通道表。**全部并发探测**，谁先答且答得对就用谁。
 # 与 scripts/fetch_seed.py 的 _MIRRORS 同源，改动请两边对齐。
-_MIRRORS = ("https://ghfast.top/", "https://gh-proxy.com/", "")
+_MIRRORS = ("https://ghfast.top/", "https://gh-proxy.com/", "https://gh-proxy.net/", "")
 
 STAGING_DIR = "update-staging"  # data/ 下的暂存目录
 _PENDING_FILE = ".update-pending"  # 换装标记（staging 内 manifest.json 同目录）
 
-# 通道速率考核：镜像/直连的存在感差异极大（实测同一个 118MB 包，某镜像 40KB/s、
-# 直连 1.2MB/s——慢通道会让整包拖近一小时，用户看到的就是「进度条不动、像卡死」）。
-# 试跑期过后平均速率低于下限即判该通道为「慢」并换下一个；最后一个通道不做考核
-# （全网都慢时也得让它下完，不能把所有通道都试死）。
-_MIN_CHANNEL_RATE = 128 * 1024  # B/s
-_TRIAL_SECONDS = 20.0
+# 探测：候选通道各发一笔 `Range: bytes=0-0`（只读响应头，几十字节代价），一次并发
+# 同时判出「资产在不在」与「这条通道快不快」。旧实现是**串行试跑 20s 再换道**——
+# 资产本身 404 也要把整条链蹚完才报错，用户看到的就是「点了没反应」。
+_PROBE_TIMEOUT = 8.0
+# 传输停滞判定：连续这么久一个字节都没到即换道（旧值 45s，镜像半死连接会让进度条
+# 干等近一分钟才开始换道）。
+_STALL_TIMEOUT = 15.0
+# 速率考核：下载跑满 _TRIAL_SECONDS 后平均速率仍低于下限即换道；最后一个可用通道
+# 不考核（全网都慢也得让它下完，不能把所有通道都试死）。
+_MIN_CHANNEL_RATE = 64 * 1024  # B/s
+_TRIAL_SECONDS = 15.0
+# 续传落盘的临时名（.part：没校验通过前不得被当成完整包）
+_PART_NAME = "update.zip.part"
+# 安装包体积下限：小于它必然不是应用包（镜像对不存在的资产常回几百字节的
+# 200 错误页——把它当下载成功，用户会看到「校验失败」而不是「没这个包」）。
+_MIN_PACKAGE_BYTES = 1 * 1024 * 1024
 
 
 def staging_dir() -> Path:
@@ -234,6 +245,8 @@ def _plain_notes(body: str, limit: int = 1500) -> str:
 # 下载进度（模块级单例，对齐 clash_manager._KERNEL_PROGRESS 模式：
 # 下载协程写，轮询端点读，dict 原子替换免锁）
 _PROGRESS: dict = {}
+# 取消旗标（用户点「取消」置位；下载循环在分片边界自查退出）
+_CANCEL: dict = {"flag": False}
 
 
 def _progress_reset() -> None:
@@ -241,6 +254,8 @@ def _progress_reset() -> None:
     _PROGRESS.update({
         "running": False, "phase": None, "percent": None,
         "received": 0, "total": None, "error": None, "ok": False,
+        # code：机器可读的失败归因（前端按它给不同文案，不靠解析错误字符串）
+        "code": None, "speed": 0, "channel": None,
     })
 
 
@@ -250,6 +265,19 @@ def download_progress() -> dict:
     return dict(_PROGRESS)
 
 
+class AssetMissing(RuntimeError):
+    """发布资产不存在（HTTP 404）：版本尚未真正发布，或资产被撤下。
+
+    单独成类是为了把「网络不通」与「这个版本压根没包」分开——前者该重试，
+    后者重试一万次还是 404（实测：清单已发布、release 还是草稿时，客户端
+    对着 404 把整条通道链蹚完，用户看到的就是「下载永远下不动」）。
+    """
+
+
+class _Cancelled(RuntimeError):
+    """用户主动取消下载（内部信号，不冒泡到前端当故障展示）。"""
+
+
 async def download_update(
     tag: str,
     expected_sha256: str | None = None,
@@ -257,6 +285,13 @@ async def download_update(
     expected_size: int | None = None,
 ) -> dict:
     """下载 release zip 到 data/update-staging/ 并解包 + 校验。
+
+    三段式（先探、再下、后校验），与旧实现的最大区别是**先探**：
+      ① 并发向所有候选通道发 `Range: bytes=0-0`，一次判出「资产在不在」与
+         「通道快不快」；全通道 404 立即抛 AssetMissing（旧实现要串行试跑
+         整条链才报错，几十秒无反馈）；
+      ② 按探测延迟从快到慢下载，**带断点续传**（换通道不丢已下部分）；
+      ③ 停滞（_STALL_TIMEOUT 无字节）与速率考核双闸换道。
 
     asset_name：清单/检查结果给出的确切资产名。给了就直连下载，省掉一次
     API 反查（资产名含时间戳，猜不出来，只能反查或由清单提供）。
@@ -269,64 +304,90 @@ async def download_update(
     from app.domains.proxies import clash_manager
 
     _progress_reset()
-    # 开头就把总量挂上：通道试跑期（最长 ~20s）还没吐数据，进度条若没有分母
+    _CANCEL["flag"] = False
+    # 开头就把总量挂上：探测期（最长 ~8s）还没吐数据，进度条若没有分母
     # 就完全不动——用户看到的是「点了没反应」。清单体积兜出 0% 起步即可。
     _PROGRESS.update({
-        "running": True, "phase": "download", "received": 0,
+        "running": True, "phase": "probe", "received": 0,
         "total": expected_size or None,
         "percent": 0 if expected_size else None,
     })
 
     staging = staging_dir()
+    staging.mkdir(parents=True, exist_ok=True)
+    part = staging / _PART_NAME
+    # 续传基线：上次没下完的 .part 直接接着用（换通道/重开应用都不必从 0 开始）。
+    # 体积对不上说明是别的版本的残留，弃掉重来。
+    if part.is_file() and expected_size and part.stat().st_size > expected_size:
+        part.unlink(missing_ok=True)
+    _PROGRESS.update({"received": part.stat().st_size if part.is_file() else 0})
+
     try:
-        if asset_name:
-            asset_url = (
-                f"https://github.com/{GITHUB_REPO}/releases/download/{tag}/{asset_name}"
-            )
-        else:
-            # 无确切名：先按模式猜一个，再从 release 资产列表反查真名覆盖
-            asset_url = (
-                f"https://github.com/{GITHUB_REPO}/releases/download/{tag}/"
-                f"{APP_NAME}-win64-v{tag.lstrip('vV')}.zip"
-            )
-            async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-                resp = await client.get(
-                    f"https://api.github.com/repos/{GITHUB_REPO}/releases/tags/{tag}"
-                )
-                if resp.status_code == 200:
-                    asset = _pick_asset(resp.json().get("assets") or [])
-                    if asset:
-                        asset_url = asset["browser_download_url"]
+        asset_url = await _resolve_asset_url(tag, asset_name)
 
         # 通道链：复用应用运行中的内核代理（runtime_port）+ 本地混合端口 + 镜像，
         # 直连 GitHub 国内基本不可用——更新下载必须用应用自身可用的出口，否则全应用
         # 只有这一处网络操作不走代理，表现为「检查更新能拿到清单、下载却卡死/失败」
         attempts = clash_manager.runtime._download_attempts()
+        channels = _channel_plan(asset_url, attempts)
+        probes = await _probe_channels(channels, expected_size)
 
-        zip_path = staging / "update.zip"
-        staging.mkdir(parents=True, exist_ok=True)
-        # 通道链平铺成 (代理, 镜像) 组合；**最后一个不做速率考核**（全慢也得下完）
-        channels = [
-            (proxy, mirror) for proxy, _label in attempts for mirror in _MIRRORS
-        ]
+        # 「资产不存在」的两种成因一起判：**明确 404**（直连 GitHub 的判定）与
+        # **回了别的体积**（镜像对不存在的资产常回 200 + 几百字节的错误页——
+        # 实测 ghfast 对未发布资产返回 573 字节的 200，旧逻辑会把它当下载成功，
+        # 最后死在 SHA256 校验上，报的却是「校验失败」，真因被盖住）。
+        def _unusable(p: dict) -> bool:
+            return bool(p["missing"] or p["bogus"])
+
+        # 权威判定优先：GitHub 直连说 404 = 这个版本真没发（清单可能先于 release
+        # 发布）。镜像说 404 不作数——它可能只是没同步。
+        if any(p.get("direct") and p["missing"] for p in probes):
+            raise AssetMissing(f"版本 {tag} 的发布资产不存在（GitHub 返回 404）")
+        if probes and all(_unusable(p) for p in probes):
+            raise AssetMissing(f"版本 {tag} 的发布资产不可用（各通道 404 或体积不符）")
+
+        usable = [p for p in probes if not _unusable(p)] or probes
+        total = next((p["total"] for p in usable if p["total"]), expected_size)
+        _PROGRESS.update({
+            "phase": "download", "total": total or None,
+            "percent": round(part.stat().st_size * 100 / total) if total and part.is_file() else (0 if total else None),
+        })
+
         last_err: Exception | None = None
-        for idx, (proxy, mirror) in enumerate(channels):
-            url = mirror + asset_url if mirror else asset_url
+        for idx, probe in enumerate(usable):
+            baseline = part.stat().st_size if part.is_file() else 0
             try:
                 await _stream_to_file(
-                    url, proxy, zip_path, expected_size,
-                    min_rate_bps=0 if idx == len(channels) - 1 else _MIN_CHANNEL_RATE,
+                    probe["url"], probe["proxy"], part, total,
+                    min_rate_bps=0 if idx == len(usable) - 1 else _MIN_CHANNEL_RATE,
+                    label=probe["label"],
                 )
+                # 落盘后必过的完整性闸：拿到的字节数对不上（少了 / 明显不像
+                # 一个安装包）就当这条通道没干成活——**不进校验阶段**，否则
+                # 用户看到的是「校验失败」，真因（通道返回了垃圾）被盖住。
+                got = part.stat().st_size if part.is_file() else 0
+                if got < _MIN_PACKAGE_BYTES or (expected_size and got != expected_size):
+                    _truncate_to(part, baseline)
+                    raise RuntimeError(
+                        f"通道返回内容不完整（{got} 字节"
+                        + (f"/期望 {expected_size}" if expected_size else "")
+                        + "），换下一通道"
+                    )
                 break
+            except _Cancelled:
+                raise
             except Exception as e:  # noqa: BLE001 —— 换下一通道
                 logger.info(
                     "[更新] 通道不可用（%s）：%s",
-                    mirror or "直连",
+                    probe["label"],
                     e or type(e).__name__,  # httpx 超时的 str() 常为空，退回异常类型
                 )
                 last_err = e
         else:
             raise RuntimeError(f"所有下载通道均失败：{last_err}")
+
+        zip_path = staging / "update.zip"
+        part.replace(zip_path)
 
         # sha256 校验（有期望值才校验）
         if expected_sha256:
@@ -354,11 +415,144 @@ async def download_update(
         _PROGRESS.update({"ok": True, "running": False, "phase": "done", "percent": 100})
         logger.info("[更新] %s 已暂存至 %s（重启后换装）", tag, staging)
         return {"ok": True, "staging": str(staging), "tag": tag}
+    except _Cancelled:
+        part.unlink(missing_ok=True)
+        _PROGRESS.update({"running": False, "phase": None, "code": "cancelled",
+                          "error": "已取消下载"})
+        return {"ok": False, "cancelled": True}
+    except AssetMissing as e:
+        _PROGRESS.update({"running": False, "code": "asset_missing", "error": str(e)})
+        raise
     except Exception as e:  # noqa: BLE001
-        _PROGRESS.update({"running": False, "error": str(e)})
+        _PROGRESS.update({"running": False, "code": _error_code(e), "error": str(e)})
         raise
     finally:
         _PROGRESS["running"] = False
+
+
+def _error_code(err: Exception) -> str:
+    """失败归因（机器可读）：前端据此给不同文案，不靠解析错误字符串。"""
+    text = str(err) or type(err).__name__
+    if "SHA256" in text:
+        return "verify_failed"
+    if "所有下载通道" in text:
+        return "network"
+    return "error"
+
+
+async def _resolve_asset_url(tag: str, asset_name: str | None) -> str:
+    """确定资产下载地址：清单给了确切名就直连，否则回落到 API 反查。"""
+    if asset_name:
+        return f"https://github.com/{GITHUB_REPO}/releases/download/{tag}/{asset_name}"
+    guessed = (
+        f"https://github.com/{GITHUB_REPO}/releases/download/{tag}/"
+        f"{APP_NAME}-win64-v{tag.lstrip('vV')}.zip"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            resp = await client.get(
+                f"https://api.github.com/repos/{GITHUB_REPO}/releases/tags/{tag}"
+            )
+            if resp.status_code == 200:
+                asset = _pick_asset(resp.json().get("assets") or [])
+                if asset:
+                    return str(asset["browser_download_url"])
+    except Exception as e:  # noqa: BLE001 —— 反查失败按猜名继续（探测阶段会给出结论）
+        logger.info("[更新] 资产列表反查失败（%s），按命名规则直连", e)
+    return guessed
+
+
+def _channel_plan(asset_url: str, attempts: list[tuple]) -> list[dict]:
+    """候选通道表 = 出口（直连/内核代理/本地混合端口）× 镜像前缀。
+
+    `direct` 标出「既不经镜像、也不经代理」的那一条——它的判定是**权威的**：
+    GitHub 自己对它说 404，就是真没有这个资产（镜像说 404 可能只是没同步）。
+    """
+    plan: list[dict] = []
+    for proxy, label in attempts:
+        for mirror in _MIRRORS:
+            plan.append({
+                "label": f"{label}{'·镜像' if mirror else ''}",
+                "url": mirror + asset_url if mirror else asset_url,
+                "proxy": proxy,
+                "direct": not mirror and proxy is None,
+            })
+    return plan
+
+
+async def _probe_channels(channels: list[dict], fallback_total: int | None) -> list[dict]:
+    """并发探测全部候选通道：判资产存不存在 + 量延迟，可用者按延迟升序返回。
+
+    用 `Range: bytes=0-0` 而不是 HEAD：部分镜像对 HEAD 返回 403/405，Range
+    请求则是它们代理真实下载时走的那条路，探测结论与真实下载一致。
+    探不到的通道**不丢弃**，排到最后——全部探不到时总得有条路可试。
+    """
+    if not channels:
+        return []
+
+    async def one(channel: dict) -> dict:
+        started = time.monotonic()
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(_PROBE_TIMEOUT, connect=5),
+                proxy=channel["proxy"], follow_redirects=True,
+            ) as client:
+                async with client.stream(
+                    "GET", channel["url"], headers={"Range": "bytes=0-0"}
+                ) as resp:
+                    total = _total_from_headers(resp.headers, resp.status_code)
+                    # bogus：回了 200 但体积根本不是这个包（镜像的「没有此资产」
+                    # 错误页就是这样）——算作不可用，别拿它下。
+                    bogus = bool(
+                        (total and total < _MIN_PACKAGE_BYTES)
+                        or (fallback_total and total and total != fallback_total)
+                    )
+                    return {
+                        **channel,
+                        "status": resp.status_code,
+                        "total": total or fallback_total,
+                        # 404/410 = 资产不存在（不是通道问题）：快失败的依据
+                        "missing": resp.status_code in (404, 410),
+                        "bogus": bogus,
+                        "latency": time.monotonic() - started,
+                    }
+        except Exception as e:  # noqa: BLE001 —— 探不到按「慢」处理，排最后
+            return {
+                **channel, "status": None, "total": fallback_total,
+                "missing": False, "bogus": False, "latency": 9e9, "error": e,
+            }
+
+    results = await asyncio.gather(*(one(c) for c in channels))
+    return sorted(results, key=lambda r: r["latency"])
+
+
+def _truncate_to(path: Path, size: int) -> None:
+    """把续传文件截回某个字节数（本轮这条通道写进去的都作废）。
+
+    换通道后新内容会**追加**在同一文件上，若不先把坏字节截掉，几条通道的
+    响应会拼成一个永远校验不过的缝合怪。
+    """
+    try:
+        with path.open("r+b") as fh:
+            fh.truncate(size)
+    except Exception:  # noqa: BLE001 —— 截不动就整个删掉，宁可重下
+        path.unlink(missing_ok=True)
+
+
+def _total_from_headers(headers, status: int) -> int | None:
+    """从响应头取**整包**体积。
+
+    206（续传/范围响应）的总量在 content-range 的 `/total` 段；200 的总量才是
+    content-length。两者混用会把「1 字节探测响应」当成整包体积（实测踩过）。
+    """
+    content_range = headers.get("content-range") or ""
+    if "/" in content_range:
+        tail = content_range.rsplit("/", 1)[1]
+        return int(tail) if tail.isdigit() else None
+    if status == 206:
+        return None
+    raw = headers.get("content-length")
+    return int(raw) if raw and raw.isdigit() else None
 
 
 async def _stream_to_file(
@@ -367,41 +561,82 @@ async def _stream_to_file(
     dest: Path,
     expected_total: int | None = None,
     min_rate_bps: int = 0,
+    label: str | None = None,
 ) -> None:
-    """流式下载 + 进度上报。失败抛错（调用方换通道）。
+    """流式下载 + 断点续传 + 停滞/速率双闸换道。失败抛错（调用方换通道）。
 
-    读超时 45s：镜像常见「连上了但几乎不吐数据」的半死通道，300s 的读超时意味着
-    用户对着 0% 干等五分钟才轮到下一个通道（实测）。
-    min_rate_bps > 0 时做速率考核：试跑 _TRIAL_SECONDS 后平均速率仍低于下限即
-    判「过慢」抛错换道——只靠读超时抓不住「慢但在动」的通道（实测某镜像 40KB/s
-    能一直动，整包要一小时）。
+    - **续传**：带上已有字节数发 `Range: bytes=N-`；服务端回 200（不认 Range）
+      才从头下——不清零会把新流追加到旧文件后面，拼出一个校验必挂的坏包。
+    - **停滞闸**：任一字节到达间隔超过 _STALL_TIMEOUT 即判死（旧实现的 45s
+      读超时意味着「连上了但不吐数据」的半死通道能让进度条干等近一分钟）。
+    - **速率闸**：试跑 _TRIAL_SECONDS 后平均速率低于下限判「过慢」——只靠停滞
+      闸抓不住「慢但在动」的通道（实测某镜像 40KB/s 能一直动，整包要一小时）。
     """
+    resumed = dest.stat().st_size if dest.is_file() else 0
+    headers = {"Range": f"bytes={resumed}-"} if resumed else {}
+    timeout = httpx.Timeout(_STALL_TIMEOUT, connect=15)
     async with httpx.AsyncClient(
-        timeout=httpx.Timeout(45, connect=15), proxy=proxy, follow_redirects=True
+        timeout=timeout, proxy=proxy, follow_redirects=True
     ) as client:
-        async with client.stream("GET", url) as resp:
-            resp.raise_for_status()
-            # 总量：优先响应头；镜像分块响应不给 Content-Length 时回落清单体积
-            # （否则 percent 恒 None，前端进度条不动，看着像卡死）
-            total = int(resp.headers.get("content-length") or 0) or (expected_total or 0)
-            _PROGRESS.update({"total": total or None})
-            received = 0
+        async with client.stream("GET", url, headers=headers) as resp:
+            if resp.status_code not in (200, 206):
+                resp.raise_for_status()
+            if resp.status_code == 200:
+                resumed = 0  # 服务端不认 Range：必须从头下
+            total = _total_from_headers(resp.headers, resp.status_code) or expected_total
+            received = resumed
+            _PROGRESS.update({"total": total or None, "channel": label})
+
             started = time.monotonic()
-            with dest.open("wb") as f:
-                async for chunk in resp.aiter_bytes(1 << 20):
+            window_at = started
+            window_bytes = 0
+            with dest.open("ab" if received else "wb") as f:
+                chunks = resp.aiter_bytes(1 << 20)
+                while True:
+                    if _CANCEL["flag"]:
+                        raise _Cancelled("已取消下载")
+                    try:
+                        chunk = await asyncio.wait_for(
+                            chunks.__anext__(), timeout=_STALL_TIMEOUT
+                        )
+                    except StopAsyncIteration:  # noqa: PERF203 —— 流结束的正常出口
+                        break
+                    except asyncio.TimeoutError as e:
+                        raise RuntimeError(
+                            f"通道停滞（{_STALL_TIMEOUT:.0f}s 无数据），换下一通道"
+                        ) from e
                     f.write(chunk)
                     received += len(chunk)
+                    window_bytes += len(chunk)
+                    now = time.monotonic()
+                    if now - window_at >= 1.0:
+                        _PROGRESS.update({
+                            "speed": int(window_bytes / (now - window_at)),
+                        })
+                        window_at, window_bytes = now, 0
                     _PROGRESS.update({
                         "received": received,
                         "percent": round(received * 100 / total) if total else None,
                     })
                     if min_rate_bps:
-                        elapsed = time.monotonic() - started
-                        if elapsed >= _TRIAL_SECONDS and received / elapsed < min_rate_bps:
+                        elapsed = now - started
+                        if elapsed >= _TRIAL_SECONDS and (
+                            (received - resumed) / elapsed < min_rate_bps
+                        ):
                             raise RuntimeError(
-                                f"通道过慢（{received / elapsed / 1024:.0f} KB/s < "
+                                f"通道过慢（{(received - resumed) / elapsed / 1024:.0f} KB/s < "
                                 f"{min_rate_bps / 1024:.0f} KB/s），换下一通道"
                             )
+
+
+def cancel_download() -> dict:
+    """中止进行中的下载（前端「取消」）：置位旗标，下载循环下一个分片即退出。
+
+    不用 task.cancel()：协程被取消时中间态的 .part 会留成半截且无从收拾，
+    旗标让下载循环自己走到安全点再退出（已下部分保留，下次可续传）。
+    """
+    _CANCEL["flag"] = True
+    return {"cancelled": True}
 
 
 def _sha256_of(path: Path) -> str:
@@ -435,7 +670,14 @@ def pending_status() -> dict:
 
 
 def clear_staging() -> dict:
-    """放弃本次更新：清暂存目录（用户点「暂不更新」/换装失败回退）。"""
+    """放弃本次更新：清暂存目录（用户点「暂不更新」/换装失败回退）。
+
+    正在下载时同时置取消旗标——否则目录被清掉后下载协程还在往里写，
+    会在已删除的路径上重新造出半截 .part（下一次又启动成「有续传基线」）。
+    """
+    if _PROGRESS.get("running"):
+        cancel_download()
     staging = staging_dir()
     shutil.rmtree(staging, ignore_errors=True)
+    _progress_reset()
     return {"cleared": True}
