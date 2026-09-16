@@ -98,6 +98,8 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.update.networkPost': ' to download manually.',
   'settings.update.noReleasePost': ' for updates.',
   'settings.update.upToDate': 'You are on the latest version (v{version}).',
+  'settings.update.availableHint':
+    'v{version} is available — use "Check for updates" to download and install it from the update dialog.',
   'settings.update.phaseDownloading': 'Downloading {progress}',
   'settings.update.phaseVerifying': 'Verifying SHA256…',
   'settings.update.phaseExtracting': 'Extracting…',

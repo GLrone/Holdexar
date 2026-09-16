@@ -56,6 +56,8 @@ import regions from './regions'
 import epicFree from './epicFree'
 // ── Game Library page (views/gamelib/Index.vue and its tabs) ──
 import gamelib from './gamelib'
+// ── Global update modal (components/business/UpdateDialog.vue) ──
+import updateDialog from './updateDialog'
 
 const messages: Partial<Record<MessageKey, string>> = {
   ...common,
@@ -92,6 +94,7 @@ const messages: Partial<Record<MessageKey, string>> = {
   ...regions,
   ...epicFree,
   ...gamelib,
+  ...updateDialog,
 }
 
 export default messages
