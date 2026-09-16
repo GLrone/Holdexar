@@ -125,6 +125,10 @@ export interface SettingsPayload {
   auto_price: boolean
   /** 已主动提示过的版本号：启动告知按「一次一版本」去重的锚点 */
   update_notified: string
+  /** 新版本提示总开关：false = 有新版也不弹窗/不亮红点（只留手动检查） */
+  update_notify: boolean
+  /** 静默自动更新：true = 检测到新版本后台自动下载校验，不打扰，下次启动换装 */
+  update_auto: boolean
 }
 
 // ─── regions（区服元数据单一来源：服务端下发，前端零硬编码）───
@@ -159,6 +163,10 @@ export const settingsApi = {
     auto_price?: boolean
     /** 记录已主动提示过的版本号（启动告知去重用） */
     update_notified?: string
+    /** 新版本提示总开关 */
+    update_notify?: boolean
+    /** 静默自动更新开关 */
+    update_auto?: boolean
   }) => request<SettingsPayload>('PUT', '/settings', payload),
 }
 

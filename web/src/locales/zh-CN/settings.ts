@@ -117,6 +117,19 @@ const settings = {
   'settings.update.phaseVerifying': '校验 SHA256…',
   'settings.update.phaseExtracting': '解包中…',
   'settings.update.phaseProcessing': '处理中…',
+  /* 更新行为开关（提示 / 静默自动更新）：标签 + 说明 + 落定提示各一条 */
+  'settings.update.notifyLabel': '新版本提示',
+  'settings.update.notifyHint':
+    '发现新版本时弹窗提醒，并在侧栏「我」上亮红点。关闭后不再主动打扰，仍可随时手动检查。',
+  'settings.update.notifyOn': '已开启新版本提示',
+  'settings.update.notifyOff': '已关闭新版本提示，不再主动打扰',
+  'settings.update.autoLabel': '静默自动更新',
+  'settings.update.autoHint':
+    '发现新版本后在后台自动下载并校验，不弹窗；下次启动应用时自动完成更新。',
+  'settings.update.autoOn': '已开启静默自动更新，将在后台自动下载',
+  'settings.update.autoOff': '已关闭静默自动更新，改为手动下载',
+  'settings.update.autoStarted': '已开始后台下载 v{version}，完成前不会打扰你',
+  'settings.update.switchFailed': '设置保存失败，请重试',
 
   /* ── 新手教程卡片（导览正文在 ProductTour.vue，本页只有入口）── */
   'settings.tour.desc': '蒙层聚光式导览：绑定账号 → 代理管理 → 导入游戏 → 降价提醒，每步高亮界面具体位置点对点讲解。首次启动已自动展示过，可随时重新查看。',

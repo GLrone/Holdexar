@@ -2042,6 +2042,10 @@ def _open_window(app_url: str) -> None:
         "height": DEFAULT_SIZE[1],
         "min_size": MIN_SIZE,
         "js_api": DesktopApi(),
+        # 放开原生文本选择：pywebview 默认 text_select=False 会把 WebView2 的
+        # IsTextSelectionEnabled 显式关掉，窗口里任何文本都拖选不了（日志/报错
+        # 只能靠页面自绘按钮复制）。置 True 后与浏览器一致：拖选 + Ctrl+C。
+        "text_select": True,
     }
     try:
         window = webview.create_window(WINDOW_TITLE, html=_SPLASH_HTML, **kwargs)

@@ -35,6 +35,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import subprocess
 import sys
@@ -105,6 +106,32 @@ def release_exists(tag: str) -> bool:
     return proc.returncode == 0
 
 
+def release_is_draft(tag: str) -> bool:
+    """已存在且为草稿 → 覆盖上传后须补发为正发布，否则永远卡在 Draft：
+
+    Draft 不进仓库首页 Latest 简报、不带 Latest 徽章，只在 Release list 里
+    标「Draft」。版本 Release 一旦被建成 Draft（网页端手建 / 早年 `--draft`
+    残留），后续每次 `upload --clobber` 只往里塞文件、状态纹丝不动——这正是
+    beta.2「只看得见 Draft、看不到 Latest」的成因。检测到就 `release edit
+    --draft=false --latest` 转正。
+    """
+    try:
+        proc = subprocess.run(
+            ["gh", "release", "view", tag, "--json", "isDraft"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+    except OSError:
+        return False
+    if proc.returncode != 0:
+        return False
+    try:
+        return bool(json.loads(proc.stdout).get("isDraft", False))
+    except json.JSONDecodeError:
+        return False
+
+
 def pick_app_zip(version: str) -> Path:
     """应用包：优先精确匹配当前版本，否则取 release/ 内最新。"""
     exact = RELEASE / f"{APP_NAME}-win64-v{version}.zip"
@@ -164,6 +191,11 @@ def publish_version_release(
             ["gh", "release", "upload", tag, *[str(p) for p in artifacts], "--clobber"],
             dry,
         )
+        if release_is_draft(tag):
+            # 已存在却是草稿：补发为正发布并置 Latest，否则永远卡在 Draft，
+            # 不进首页 Latest 简报、不带 Latest 徽章（beta.2 事故同款）
+            print(f"[发布] {tag} 是草稿 → 补发为正发布并置 Latest")
+            run(["gh", "release", "edit", tag, "--draft=false", "--latest"], dry)
         return
     cmd = [
         "gh", "release", "create", tag,
