@@ -301,13 +301,35 @@ def test_guard_quit_intent_releases_close(monkeypatch):
 
 
 def test_guard_minimize_intent_hides_and_cancels(monkeypatch):
-    """守卫：意图 minimize → 隐藏窗口 + 返回 False（进程常驻）。"""
+    """守卫：意图 minimize 且托盘在位 → 隐藏窗口 + 返回 False（进程常驻）。"""
     monkeypatch.setattr(desktop, "_ask_close_intent", lambda owner=None: "minimize")
     hidden = []
-    window = SimpleNamespace(hide=lambda: hidden.append(1), native=None)
+    window = SimpleNamespace(hide=lambda: hidden.append(1), minimize=lambda: None, native=None)
     guard = desktop._make_closing_guard(window)
-    assert guard() is False
+    desktop._tray_state["tray"] = object()  # 托盘在位：隐藏后还有图标可召回
+    try:
+        assert guard() is False
+    finally:
+        desktop._tray_state["tray"] = None
     assert hidden == [1]
+
+
+def test_guard_minimize_without_tray_minimizes_to_taskbar(monkeypatch):
+    """托盘缺失时**不得** hide()：窗口从任务栏一起消失又无处召回，用户只能去
+    任务管理器杀进程（「托盘里没有它、任务管理器里却还活着」的成因）。
+
+    退化路径：最小化到任务栏——窗口还在，随时点得回来。"""
+    monkeypatch.setattr(desktop, "_ask_close_intent", lambda owner=None: "minimize")
+    hidden: list = []
+    minimized: list = []
+    window = SimpleNamespace(
+        hide=lambda: hidden.append(1), minimize=lambda: minimized.append(1), native=None
+    )
+    guard = desktop._make_closing_guard(window)
+    desktop._tray_state["tray"] = None
+    assert guard() is False
+    assert minimized == [1], "无托盘时必须最小化而不是隐藏"
+    assert not hidden
 
 
 def test_guard_stay_intent_keeps_window(monkeypatch):

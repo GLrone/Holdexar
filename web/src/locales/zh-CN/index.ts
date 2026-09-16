@@ -55,6 +55,8 @@ import regions from './regions'
 import epicFree from './epicFree'
 // ── 游戏库页（views/gamelib/Index.vue 及其页签）──
 import gamelib from './gamelib'
+// ── 全局更新弹窗（components/business/UpdateDialog.vue）──
+import updateDialog from './updateDialog'
 
 /** 全量中文词典 */
 export const messages = {
@@ -92,6 +94,7 @@ export const messages = {
   ...regions,
   ...epicFree,
   ...gamelib,
+  ...updateDialog,
 } as const
 
 export type MessageKey = keyof typeof messages
