@@ -11,12 +11,13 @@ import {
 import { useI18n, type MessageKey } from '@/locales'
 import { useAccountStore } from '@/stores/account'
 import { useRegionsStore } from '@/stores/regions'
+import { useSettingsStore } from '@/stores/settings'
 import { useUpdaterStore } from '@/stores/updater'
 import { friendCodeOf } from '@/utils/steamId'
 import CurrencyFlag from '@/components/CurrencyFlag.vue'
 import ProductTour from '@/components/ProductTour.vue'
 import RegionFlag from '@/components/RegionFlag.vue'
-import { HlButton, HlDialog, HlIcon, HlImg, HlSkeleton, message } from '@/components/ui'
+import { HlButton, HlDialog, HlIcon, HlImg, HlSkeleton, HlSwitch, message } from '@/components/ui'
 
 const { t } = useI18n()
 
@@ -194,6 +195,48 @@ const releasesUrl = computed(() =>
 
 function openUpdateDialog() {
   void updaterStore.openDialog()
+}
+
+/* ── 更新行为开关（新版本提示 / 静默自动更新）──
+ * 状态放 settings store（启动逻辑 App.vue 与侧栏红点都读同一份），本页只读写。
+ * null（未拉到）按「提示开 / 静默关」处理——与后端默认值一致，UI 不会闪错态。 */
+const settingsStore = useSettingsStore()
+const updateNotifyOn = computed(() => settingsStore.updateNotify !== false)
+const updateAutoOn = computed(() => settingsStore.updateAuto === true)
+const updatePrefsToggling = ref(false)
+
+async function toggleUpdateNotify(on: boolean) {
+  if (updatePrefsToggling.value) return
+  updatePrefsToggling.value = true
+  try {
+    const ok = await settingsStore.setUpdateNotify(on)
+    if (ok) message.success(t(on ? 'settings.update.notifyOn' : 'settings.update.notifyOff'))
+    else message.error(t('settings.update.switchFailed'))
+  } finally {
+    updatePrefsToggling.value = false
+  }
+}
+
+async function toggleUpdateAuto(on: boolean) {
+  if (updatePrefsToggling.value) return
+  updatePrefsToggling.value = true
+  // setUpdateAuto 内部吞异常并返回成败，这里不必再包一层 try
+  const ok = await settingsStore.setUpdateAuto(on)
+  updatePrefsToggling.value = false
+  if (!ok) {
+    message.error(t('settings.update.switchFailed'))
+    return
+  }
+  message.success(t(on ? 'settings.update.autoOn' : 'settings.update.autoOff'))
+  if (!on) return
+  /* 开启即兑现一次：立刻强制查一遍并起后台下载，而不是等下次启动。
+     check(true) 必须强制——两个开关此前都关时启动不查，本地可能压根没有结果。 */
+  void (async () => {
+    const res = await updaterStore.check(true)
+    if (!res?.available || !res.latest || updaterStore.pendingTag) return
+    await updaterStore.download()
+    message.info(t('settings.update.autoStarted', { version: res.latest }))
+  })()
 }
 
 async function load() {
@@ -415,7 +458,12 @@ function openSteamidIo() {
   window.open('https://steamid.io', '_blank', 'noopener noreferrer')
 }
 
-onMounted(load)
+onMounted(() => {
+  /* 更新开关存在 settings store（启动逻辑与侧栏红点共用）：本页也要保证它拉到过
+     ——深链直接进本页时 App 外壳虽会 load，但失败重试的兜底放在这里更稳。 */
+  void settingsStore.load()
+  void load()
+})
 </script>
 
 <template>
@@ -770,6 +818,36 @@ onMounted(load)
               {{ t('settings.update.currentVersion', { version: appVersion || '…' }) }}
             </span>
           </div>
+        </div>
+
+        <!-- 更新行为开关：提示 / 静默自动更新。两个开关独立——提示管「告知」，
+             静默管「后台下载」；静默开着时，提示只负责下载完成后的重启提醒。 -->
+        <div class="settings-row">
+          <div class="settings-row__line">
+            <HlSwitch
+              :model-value="updateNotifyOn"
+              accent
+              :disabled="updatePrefsToggling"
+              :label="t('settings.update.notifyLabel')"
+              :title="t('settings.update.notifyHint')"
+              @update:model-value="toggleUpdateNotify"
+            />
+          </div>
+          <div class="section-desc">{{ t('settings.update.notifyHint') }}</div>
+        </div>
+
+        <div class="settings-row">
+          <div class="settings-row__line">
+            <HlSwitch
+              :model-value="updateAutoOn"
+              accent
+              :disabled="updatePrefsToggling"
+              :label="t('settings.update.autoLabel')"
+              :title="t('settings.update.autoHint')"
+              @update:model-value="toggleUpdateAuto"
+            />
+          </div>
+          <div class="section-desc">{{ t('settings.update.autoHint') }}</div>
         </div>
 
         <div v-if="updatePendingTag" class="settings-update-ready">

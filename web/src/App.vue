@@ -49,11 +49,15 @@ onMounted(() => {
 /* ── 更新已下载（暂存就绪）：拉起全局更新弹窗 ──
    下载/暂存态都在 updater store（跨页存活、后端是唯一事实来源），所以下载在
    任何页面完成都会在这里浮现；用户关掉 = 稍后重启，更新包保留。
-   弹窗（模糊幕布）是更新模块的唯一交互面，重启按钮也在它里面。 */
+   弹窗（模糊幕布）是更新模块的唯一交互面，重启按钮也在它里面。
+   `updateNotify` 关 = 用户要求零打扰（静默更新模式）：不自动弹——
+   桌面壳下次启动会自己消费暂存目录完成换装，用户手动打开弹窗照样能看到。 */
 watch(
   () => updaterStore.pendingTag,
   (tag) => {
-    if (tag && !updaterStore.pendingDialogDismissed) void updaterStore.openDialog()
+    if (!tag || updaterStore.pendingDialogDismissed) return
+    if (settingsStore.updateNotify === false) return
+    void updaterStore.openDialog()
   },
 )
 
@@ -80,10 +84,15 @@ watch(
   { immediate: true },
 )
 
-/* ── 启动检查更新（主动告知）──
-   settings 拉到之后（拿 ui.update_notified 判「该版本是否已提示过」）查一次更新：
-   有新版 → 侧栏「我」项亮红点（跟随可用状态持续显示）+ 长 toast 提示一次。
-   toast 每个版本只弹一次（落 KV ui.update_notified），红点不受该标志影响。
+/* ── 启动检查更新（提示 / 静默自动更新）──
+   settings 拉到之后（拿两个更新开关 + 提示锚点）查一次更新，按用户设置分路：
+   · 静默自动更新开 → 有新版不提示，直接后台下载校验；桌面壳下次启动消费
+     暂存目录自动换装（浏览器态等用户手动重启）。「静默」就是全程无感。
+     若提示也开着，下载完成时仍会弹一次「已就绪，重启即可」——静默省掉的是
+     「发现版本」这一声吆喝，真正需要用户动手的时刻（重启）不能也瞒着。
+   · 只有提示开 → 侧栏「我」亮红点（跟随可用状态持续显示）+ 长 toast 一次
+     （每版本一次，落 KV ui.update_notified）。
+   · 两者都关 → 启动不查（省一次网络请求），用户仍可在设置页手动检查。
    首次启动会先弹导览蒙层，这里等导览关闭后再提示，避免两条提示打架。 */
 const updateNoticePending = ref(false)
 
@@ -96,13 +105,29 @@ function flushUpdateNotice() {
   void settingsStore.markUpdateNotified(latest)
 }
 
+/** 静默自动更新：后台起一次下载（已暂存/已在跑/用户跳过过则不起）。
+ *  失败不提示——静默模式的本分就是不打扰；失败详情留在 updater store，
+ *  用户手动打开更新弹窗时仍能看到原因与重试按钮。 */
+function startSilentUpdate(version: string) {
+  if (updaterStore.pendingTag || updaterStore.downloading) return
+  if (version === updaterStore.skipped) return
+  void updaterStore.download()
+}
+
 watch(
   () => settingsStore.loaded,
   async (isLoaded) => {
     if (!isLoaded) return
+    const notifyOn = settingsStore.updateNotify !== false
+    const autoOn = settingsStore.updateAuto === true
+    if (!notifyOn && !autoOn) return
     const result = await updaterStore.check()
     const latest = result?.latest
     if (!result?.available || !latest) return
+    if (autoOn) {
+      startSilentUpdate(latest)
+      return
+    }
     if (latest === settingsStore.updateNotified) return
     updateNoticePending.value = true
     // 延时让首屏稳定；若此刻导览已开，flush 会自行让位给导览关闭事件
@@ -151,12 +176,13 @@ const navGroups = computed<HlSideNavGroup[]>(() => [
     items: [
       { label: t('nav.toolbox'), to: '/toolbox', icon: 'setting' },
       { label: t('nav.logs'), to: '/logs', icon: 'terminal' },
-      // 「我」= 设置页，也是更新卡片的落点：有新版本时这里亮红点
+      // 「我」= 设置页，也是更新卡片的落点：有新版本且**提示开着**时这里亮红点
+      // （提示关了 = 用户要求零打扰，红点也不能留）
       {
         label: t('nav.me'),
         to: '/settings',
         icon: 'user',
-        dot: updaterStore.hasUpdate,
+        dot: updaterStore.hasUpdate && settingsStore.updateNotify !== false,
         dotTitle: t('update.navDot'),
       },
       { label: t('nav.about'), to: '/about', icon: 'info' },

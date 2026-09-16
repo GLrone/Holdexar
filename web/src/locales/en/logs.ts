@@ -22,11 +22,8 @@ const logs: Partial<Record<MessageKey, string>> = {
 
   /* Log box */
   'logs.empty': 'No log output yet — crawls, rate refreshes and the scheduler print here in real time',
-  'logs.line.clickToCopy': 'Click to copy this line',
 
   /* Copy result toasts */
-  'logs.copy.lineCopied': 'Line copied',
-  'logs.copy.failed': 'Copy failed',
   'logs.copy.failedHint': 'Copy failed — select the text manually and press Ctrl+C',
 }
 

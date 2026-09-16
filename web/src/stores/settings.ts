@@ -3,7 +3,7 @@ import { ref } from 'vue'
 
 import { settingsApi, type SettingsPayload } from '@/api/client'
 
-/** 应用设置（账户 + 新手教程标志 + 自动价格链开关 + 更新提示锚点）。区服配置已迁至 stores/regions（服务端下发 + crawl_regions 表）。 */
+/** 应用设置（账户 + 新手教程标志 + 自动价格链开关 + 更新提示锚点/提示开关/静默更新开关）。区服配置已迁至 stores/regions（服务端下发 + crawl_regions 表）。 */
 export const useSettingsStore = defineStore('settings', () => {
   const account = ref<SettingsPayload['account'] | null>(null)
   const loaded = ref(false)
@@ -13,6 +13,10 @@ export const useSettingsStore = defineStore('settings', () => {
   const autoPrice = ref<boolean | null>(null)
   /** 已主动提示过的版本号（'' = 从未提示；启动告知据此做「一次一版本」去重） */
   const updateNotified = ref('')
+  /** 新版本提示开关（null = 未拉到，UI 按开处理：提示默认开） */
+  const updateNotify = ref<boolean | null>(null)
+  /** 静默自动更新开关（null = 未拉到，UI 按关处理：默认不偷偷下载整包） */
+  const updateAuto = ref<boolean | null>(null)
 
   async function load() {
     if (loaded.value) return
@@ -22,6 +26,8 @@ export const useSettingsStore = defineStore('settings', () => {
       onboardingDone.value = s.onboarding_done
       autoPrice.value = s.auto_price
       updateNotified.value = s.update_notified
+      updateNotify.value = s.update_notify
+      updateAuto.value = s.update_auto
       loaded.value = true
     } catch {
       /* 静默 */
@@ -65,15 +71,47 @@ export const useSettingsStore = defineStore('settings', () => {
     }
   }
 
+  /** 新版本提示开关（返回是否成功；失败回滚本地态） */
+  async function setUpdateNotify(on: boolean) {
+    const prev = updateNotify.value
+    updateNotify.value = on
+    try {
+      const s = await settingsApi.update({ update_notify: on })
+      updateNotify.value = s.update_notify
+      return true
+    } catch {
+      updateNotify.value = prev
+      return false
+    }
+  }
+
+  /** 静默自动更新开关（返回是否成功；失败回滚本地态） */
+  async function setUpdateAuto(on: boolean) {
+    const prev = updateAuto.value
+    updateAuto.value = on
+    try {
+      const s = await settingsApi.update({ update_auto: on })
+      updateAuto.value = s.update_auto
+      return true
+    } catch {
+      updateAuto.value = prev
+      return false
+    }
+  }
+
   return {
     account,
     loaded,
     onboardingDone,
     autoPrice,
     updateNotified,
+    updateNotify,
+    updateAuto,
     load,
     markOnboardingDone,
     markUpdateNotified,
     setAutoPrice,
+    setUpdateNotify,
+    setUpdateAuto,
   }
 })

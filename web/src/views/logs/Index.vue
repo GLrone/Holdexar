@@ -8,7 +8,7 @@ import { HlButton, HlIcon, message } from '@/components/ui'
 /**
  * 运行日志：进入页面先拉环形缓冲最近 300 行，再经 SSE 续播增量。
  * 跟随滚动 = 贴底时新行自动滚到底；用户上翻即暂停跟随，「回到底部」一键恢复。
- * 复制：按钮复制全部缓冲；单击行复制该行（拖选时不误触发）。
+ * 复制：正文直接拖选后 Ctrl+C（拖选期间新日志不抢视口）；按钮复制全部缓冲。
  */
 
 const MAX_LINES = 1500 // 前端保留上限（超出丢最旧行，避免长驻页面内存增长）
@@ -36,10 +36,18 @@ function isAtBottom(): boolean {
   return el.scrollHeight - el.scrollTop - el.clientHeight < 24
 }
 
+/** 日志框内是否存在拖选中的文本（有选区时视口归用户，新行不许抢滚动） */
+function hasSelection(): boolean {
+  const sel = window.getSelection()
+  if (!sel || sel.isCollapsed) return false
+  const box = logBoxRef.value
+  return !!box && !!sel.anchorNode && box.contains(sel.anchorNode)
+}
+
 function push(line: string) {
   lines.value.push(line)
   if (lines.value.length > MAX_LINES) lines.value.splice(0, lines.value.length - MAX_LINES)
-  if (!paused.value) scrollToBottom()
+  if (!paused.value && !hasSelection()) scrollToBottom()
 }
 
 /** 滚动位置驱动跟随：离开底部即暂停，滚回底部自动恢复（scroll 在滚动生效后触发）*/
@@ -47,13 +55,14 @@ function onScroll() {
   paused.value = !isAtBottom()
 }
 
-/** 「回到底部并跟随」：滚到底并恢复跟随 */
+/** 「回到底部并跟随」：清除拖选（选区不清会继续压住跟随）→ 滚到底并恢复跟随 */
 function resumeFollow() {
+  window.getSelection()?.removeAllRanges()
   paused.value = false
   scrollToBottom()
 }
 
-/* ── 复制（按钮复制全部缓冲 / 单击行复制该行）── */
+/* ── 复制（正文拖选 + Ctrl+C / 按钮复制全部缓冲）── */
 
 const copiedAll = ref(false)
 
@@ -91,19 +100,6 @@ async function copyAll() {
   }
   copiedAll.value = true
   window.setTimeout(() => (copiedAll.value = false), 1500)
-}
-
-/**
- * 单击行复制该行：与拖选文本区分——mouseup 时窗口存在选区（拖蓝）
- * = 用户在手动选择，不触发复制；单击（无选区）才复制。
- */
-function onLineClick(line: string) {
-  const sel = window.getSelection()
-  if (sel && !sel.isCollapsed) return
-  void writeClipboard(line).then((ok) => {
-    if (ok) message.success(t('logs.copy.lineCopied'))
-    else message.error(t('logs.copy.failed'))
-  })
 }
 
 async function load() {
@@ -202,15 +198,9 @@ const levelCount = computed(() => {
       <div v-if="lines.length === 0" class="logs-empty">
         {{ t('logs.empty') }}
       </div>
-      <div
-        v-for="(line, i) in lines"
-        :key="i"
-        class="logs-line"
-        :class="`is-${levelOf(line)}`"
-        :title="t('logs.line.clickToCopy')"
-        @click="onLineClick(line)"
-        >{{ line }}</div
-      >
+      <div v-for="(line, i) in lines" :key="i" class="logs-line" :class="`is-${levelOf(line)}`">{{
+        line
+      }}</div>
     </div>
   </section>
 </template>
@@ -290,7 +280,10 @@ const levelCount = computed(() => {
   white-space: pre-wrap;
   word-break: break-all;
   color: var(--text-muted);
-  cursor: copy; /* 单击复制该行（拖选时 click 不触发，见 onLineClick） */
+  /* 拖选复制：文本选择交还系统原生行为（选中后 Ctrl+C），拖选期间新日志
+     不抢滚动（见 push），选完一段不会被滚走 */
+  cursor: text;
+  user-select: text;
 }
 
 .logs-line.is-warning {
