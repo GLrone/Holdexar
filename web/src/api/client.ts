@@ -908,12 +908,20 @@ export interface UpdateCheckResult {
 /** 下载/校验/解包进度（轮询） */
 export interface UpdateProgress {
   running: boolean
-  phase: 'download' | 'verify' | 'extract' | 'done' | null
+  /** probe = 并发探测通道（判资产在不在 + 量延迟），download/verify/extract/done 见名知义 */
+  phase: 'probe' | 'download' | 'verify' | 'extract' | 'done' | null
   percent: number | null
   received: number
   total: number | null
   error: string | null
   ok: boolean
+  /** 机器可读失败归因：asset_missing=该版本没包 / network=通道全挂 /
+   *  verify_failed=校验不过 / cancelled=用户取消 / error=其它 */
+  code: 'asset_missing' | 'network' | 'verify_failed' | 'cancelled' | 'error' | null
+  /** 瞬时速率（B/s，后端每秒刷新一次；0 = 暂无） */
+  speed: number
+  /** 当前通道名（"直连" / "直连·镜像" / "本地混合端口 7890"…） */
+  channel: string | null
 }
 
 /** 暂存就绪状态（「重启以完成更新」提示依据） */

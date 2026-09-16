@@ -13,8 +13,8 @@ import { ratesApi, type WalletSnapshot } from '@/api/client'
 import { buildRateMap, formatWalletCny, walletToCny, type RateMap } from '@/lib/walletCny'
 import { APP_NAME } from '@/appInfo'
 import ProductTour from '@/components/ProductTour.vue'
+import UpdateDialog from '@/components/business/UpdateDialog.vue'
 import {
-  HlDialog,
   HlIcon,
   HlImg,
   HlLangToggle,
@@ -46,20 +46,25 @@ onMounted(() => {
   void updaterStore.sync()
 })
 
-/* ── 更新已下载（暂存就绪）：全局重启提示 ──
+/* ── 更新已下载（暂存就绪）：拉起全局更新弹窗 ──
    下载/暂存态都在 updater store（跨页存活、后端是唯一事实来源），所以下载在
-   任何页面完成都会在这里浮现；用户关掉 = 稍后重启，更新包保留。 */
-const updateReadyOpen = computed(
-  () => !!updaterStore.pendingTag && !updaterStore.pendingDialogDismissed,
+   任何页面完成都会在这里浮现；用户关掉 = 稍后重启，更新包保留。
+   弹窗（模糊幕布）是更新模块的唯一交互面，重启按钮也在它里面。 */
+watch(
+  () => updaterStore.pendingTag,
+  (tag) => {
+    if (tag && !updaterStore.pendingDialogDismissed) void updaterStore.openDialog()
+  },
 )
 
-/** 重启换装（桌面壳桥；浏览器态提示手动重启） */
-async function restartForUpdate() {
-  const res = await updaterStore.restartForUpdate()
-  if (res.ok) return
-  if (res.unsupported) message.info(t('settings.toast.restartUnsupported'))
-  else message.error(res.error || t('settings.toast.restartError'))
-}
+/* 弹窗被关掉且暂存还在 = 用户选了「稍后重启」：本次会话不再自动重开
+   （更新包保留在 data/update-staging，下次启动仍会提示一次） */
+watch(
+  () => updaterStore.dialogOpen,
+  (visible) => {
+    if (!visible && updaterStore.pendingTag) updaterStore.dismissPendingDialog()
+  },
+)
 
 /* ── 首次启动产品导览 ──
    settings KV `ui.onboarding_done` 判定：标志拉取后为 false → 延时 800ms
@@ -425,31 +430,9 @@ async function manualRefreshWallet() {
     <!-- 首次启动产品导览（蒙层+聚光+教练标记气泡；settings KV 判定，自动弹出一次） -->
     <ProductTour v-model="onboardingOpen" />
 
-    <!-- 更新已下载（暂存就绪）：全局提示重启换装。放外壳而非设置页——
-         下载完成后用户可能在任何页面，进度/暂存态都在 updater store（跨页存活），
-         这里只负责「该重启了」这一句。关闭 = 稍后重启，更新包不丢弃。 -->
-    <HlDialog
-      :model-value="updateReadyOpen"
-      :title="t('shell.updateReady.title')"
-      width="420px"
-      @update:model-value="(v: boolean) => !v && updaterStore.dismissPendingDialog()"
-    >
-      <div class="update-ready">
-        <p class="update-ready__text">
-          {{ t('shell.updateReady.body', { version: updaterStore.pendingTag.replace(/^v/, '') }) }}
-        </p>
-        <p class="update-ready__hint">{{ t('shell.updateReady.hint') }}</p>
-      </div>
-      <template #footer>
-        <HlButton variant="text" @click="updaterStore.dismissPendingDialog()">
-          {{ t('shell.updateReady.later') }}
-        </HlButton>
-        <HlButton art="combo" tone="green" @click="restartForUpdate">
-          <HlIcon name="check" />
-          {{ t('shell.updateReady.restart') }}
-        </HlButton>
-      </template>
-    </HlDialog>
+    <!-- 全局更新弹窗（检查/下载/校验/重启全在这里闭环；模糊幕布遮住底层页面）。
+         更新模块已从设置页搬出——更新是应用级事务，不该塞在某个页签里。 -->
+    <UpdateDialog />
   </div>
 </template>
 

@@ -40,6 +40,13 @@ export const useUpdaterStore = defineStore('updater', () => {
   /** 全局「已下载，需重启」弹窗是否已被用户关掉（本次会话内不再打扰） */
   const pendingDialogDismissed = ref(false)
 
+  /** 全局更新弹窗（模糊幕布）是否展开：更新模块已从设置页搬到这里 */
+  const dialogOpen = ref(false)
+  /** 本次会话被用户跳过的版本（"跳过此版本"后不再自动提示） */
+  const skipped = ref('')
+  /** 最近一次失败（下载/校验/通道），弹窗按 code 给不同出路 */
+  const failure = ref<{ code: string; message: string } | null>(null)
+
   let timer: ReturnType<typeof setInterval> | null = null
 
   function stopPolling(): void {
@@ -61,7 +68,14 @@ export const useUpdaterStore = defineStore('updater', () => {
       downloading.value = false
       stopPolling()
       if (p.ok) {
+        failure.value = null
         await refreshPending()
+        return
+      }
+      // 跑完但没成：把后端给的结果翻成弹窗能用的失败态（code 优先，
+      // 兜底按 error 文案——老后端没有 code 字段时也不至于哑掉）
+      if (p.error || p.code) {
+        failure.value = { code: p.code || 'error', message: p.error || '' }
       }
     } catch {
       /* 轮询失败（切页/网络）：不停轮询也没意义，交给下次 sync 重置 */
@@ -118,6 +132,7 @@ export const useUpdaterStore = defineStore('updater', () => {
     const latest = info.value
     if (!latest?.tag) return { ok: false, error: 'no_tag' }
     downloading.value = true
+    failure.value = null
     try {
       await systemApi.updateDownload(
         latest.tag,
@@ -140,18 +155,42 @@ export const useUpdaterStore = defineStore('updater', () => {
     }
   }
 
-  /** 放弃本次更新：清暂存（后端删目录），前端状态一并复位 */
+  /** 取消/放弃本次更新：下载中 → 后端中止（保留续传基线），否则清暂存。
+   *  后端旧版对「下载中取消」回 409，这里忽略那个拒绝——取消是用户的明确意图，
+   *  不能因为后端不让就卡在按钮上。 */
   async function cancel(): Promise<void> {
-    await systemApi.updateCancel()
+    try {
+      await systemApi.updateCancel()
+    } catch {
+      /* 后端拒绝（旧版 409）也照常复位前端态 */
+    }
     stopPolling()
     progress.value = null
     downloading.value = false
+    failure.value = null
     pendingTag.value = ''
   }
 
   /** 关掉全局弹窗但保留暂存（「稍后重启」，更新包不被丢弃） */
   function dismissPendingDialog(): void {
     pendingDialogDismissed.value = true
+  }
+
+  /** 打开全局更新弹窗（设置页「检查更新」/侧栏红点的唯一出口）。
+   *  顺带把检查结果拉一次——弹窗不能靠「用户先进过某页才查过」碰运气。 */
+  async function openDialog(): Promise<void> {
+    dialogOpen.value = true
+    await check(true)
+  }
+
+  function closeDialog(): void {
+    dialogOpen.value = false
+  }
+
+  /** 跳过此版本：本次会话内不再提示（不删已下载的包） */
+  function skipVersion(version: string): void {
+    skipped.value = version
+    dialogOpen.value = false
   }
 
   /**
@@ -204,11 +243,17 @@ export const useUpdaterStore = defineStore('updater', () => {
     downloading,
     pendingTag,
     pendingDialogDismissed,
+    dialogOpen,
+    skipped,
+    failure,
     sync,
     refreshPending,
     download,
     cancel,
     dismissPendingDialog,
+    openDialog,
+    closeDialog,
+    skipVersion,
     restartForUpdate,
   }
 })
