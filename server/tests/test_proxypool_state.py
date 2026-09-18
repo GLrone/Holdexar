@@ -264,14 +264,18 @@ def test_dead_is_not_retired() -> None:
         (NODE_STALE, True, False, 3, NODE_RETIRED),
         (NODE_DEAD, False, False, 3, NODE_RETIRED),
         (NODE_RETIRED, False, False, 9, NODE_RETIRED),
-        # probe_ok=None：只按来源判，且未测不得把 DEAD / RETIRED 拉回 ACTIVE
+        # probe_ok=None：只按来源判。未测不得把 DEAD / RETIRED 拉回 ACTIVE；
+        # 无来源又无体检证据（NEW / DEAD）一律 DEAD——STALE 是池成员，其语义是
+        # 「订阅已不再返回 **但 仍通过健康验证**」，DEAD 从未通过体检。
         (NODE_NEW, True, None, 0, NODE_ACTIVE),
         (NODE_ACTIVE, True, None, 0, NODE_ACTIVE),
         (NODE_ACTIVE, False, None, 0, NODE_STALE),
-        (NODE_NEW, False, None, 0, NODE_STALE),
+        (NODE_NEW, False, None, 0, NODE_DEAD),
         (NODE_STALE, True, None, 0, NODE_STALE),
+        (NODE_STALE, False, None, 0, NODE_STALE),
         (NODE_DEAD, True, None, 0, NODE_DEAD),
-        (NODE_DEAD, False, None, 0, NODE_STALE),
+        (NODE_DEAD, False, None, 0, NODE_DEAD),
+        (NODE_RETIRED, True, None, 0, NODE_RETIRED),
         (NODE_RETIRED, False, None, 0, NODE_RETIRED),
     ],
 )
@@ -296,3 +300,24 @@ def test_evaluate_rejects_bad_threshold() -> None:
             NODE_STALE, source_seen=False, probe_ok=False,
             consecutive_failures=3, retire_after_failed_probes=0,
         )
+
+
+def test_dead_node_losing_its_last_source_stays_out_of_the_pool() -> None:
+    """失去最后一个来源，不得把一个不可用节点"升级"进池。
+
+    池成员 = NEW / ACTIVE / STALE。STALE 的语义是「订阅已不再返回 **但 仍通过
+    健康验证**」——它是"降权仍服务"，不是"来源没了"。若"来源消失"这一路把 DEAD
+    判成 STALE，则一个已被体检判定不可用的节点，**只因订阅不再提供它**就回到
+    流量池；NEW（从未体检）同理会被判成"历史上仍可工作"。
+    """
+    lost_source = dict(source_seen=False, probe_ok=None, consecutive_failures=0)
+    # 无来源 + 无体检证据：不得进池
+    assert evaluate_node_state(NODE_DEAD, **lost_source) == NODE_DEAD
+    assert evaluate_node_state(NODE_NEW, **lost_source) == NODE_DEAD
+    # 曾经通过体检的 ACTIVE / STALE 失去来源 → 降权保留（STALE 仍可服务）
+    assert evaluate_node_state(NODE_ACTIVE, **lost_source) == NODE_STALE
+    assert evaluate_node_state(NODE_STALE, **lost_source) == NODE_STALE
+    # 有来源也不能把 DEAD 拉回运行权重（既有语义，一并锁住）
+    assert evaluate_node_state(
+        NODE_DEAD, source_seen=True, probe_ok=None, consecutive_failures=0
+    ) == NODE_DEAD

@@ -154,15 +154,23 @@ def evaluate_node_state(
     - probe_ok True  → source_seen ? ACTIVE : STALE（成功的体检是最强证据）
     - probe_ok False → 达线且当前为 STALE / DEAD 才 RETIRED，否则 DEAD
     - probe_ok None  → 只按来源判：source_seen 且当前 NEW / ACTIVE 才 ACTIVE
-                       （避免未测节点从 DEAD / RETIRED 直接跃回运行权重）
+                       （避免未测节点从 DEAD / RETIRED 直接跃回运行权重）；
+                       无来源时，只有**通过过体检**的 ACTIVE / STALE 才降为 STALE，
+                       NEW / DEAD 一律 DEAD——STALE 是池成员，其语义是
+                       「订阅已不再返回 但 仍通过健康验证」，无来源又无体检证据的
+                       节点不得因为"订阅不再提供它"而进入流量池。
     """
     _check_threshold(retire_after_failed_probes)
 
     if probe_ok is None:
         if source_seen:
             target = NODE_ACTIVE if current in {NODE_NEW, NODE_ACTIVE} else current
-        else:
-            target = current if current in {NODE_STALE, NODE_RETIRED} else NODE_STALE
+        elif current in {NODE_ACTIVE, NODE_STALE}:
+            target = NODE_STALE
+        elif current == NODE_RETIRED:
+            target = NODE_RETIRED
+        else:  # NEW / DEAD：无来源又无体检证据，不进池
+            target = NODE_DEAD
         return _settle(current, target)
 
     if probe_ok:
