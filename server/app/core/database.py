@@ -386,6 +386,11 @@ async def _migrate_proxy_nodes_identity_split(conn) -> None:
 
     **只在确认表内无行时动结构**：这两列在 P1.1/P1.2 没有任何写入方，真出现
     行说明库不是本链预期的形态——宁可不动，也不删用户数据。
+
+    由此得到本步的**适用前提**（适用范围到此为止，不外推）：v7 只适用于
+    「从未在 P1.1/P1.2 代码下产出过 proxy_nodes 行」的库。开始写 proxy_nodes
+    行的代码落地之后，对这类库再做结构变更必须另立迁移（搬数据，而不是
+    DROP COLUMN），不能复用本步的跳过分支——那时它已永久失效。
     """
     from sqlalchemy import text
 
