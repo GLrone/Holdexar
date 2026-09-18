@@ -6,6 +6,12 @@ Registry 是事实源，pool 文件只是它的运行时产物：节点身份、
 节点身份的两个工具函数放模型层而非服务层，因为它们决定台账主键：
 `node_fingerprint` 判定「两个配置是否同一节点」，`make_runtime_name`
 判定「进池后叫什么」。
+
+身份模型（锁定，改它等于改主键语义）：
+- **节点身份 = `node_fingerprint`（整份配置的规范化哈希），全局唯一**；
+- **来源归属 = `ProxyNodeSource`**（订阅↔节点，多对多），一个节点可被多个订阅
+  同时提供，全部来源都不再提供时节点才允许离开运行集；
+- 端点（type/server/port）只是 diff 分类与检索线索，不参与身份判定。
 """
 from __future__ import annotations
 
@@ -13,7 +19,7 @@ import hashlib
 import json
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -48,7 +54,8 @@ def make_runtime_name(subscription_id: int | str, original_name: str, taken: set
     原始名绝不直接进池：执行器按 name 去重，重名节点会被静默丢弃，池文件
     写盘数与内核可见数之间会出现无从自察的差额。订阅前缀同时保证跨订阅
     同名节点互不遮蔽。首次登记时算一次即持久化，后续不重算——否则 lane
-    绑定会漂移。
+    绑定会漂移。`subscription_id` 传的是**首次引入该节点的来源**，此后即使
+    该来源撤掉这个节点、改名或它在别的订阅里叫别的名字，名字都不变。
     """
     base = f"{subscription_id}|{original_name}"
     candidate, suffix = base, 1
@@ -59,23 +66,39 @@ def make_runtime_name(subscription_id: int | str, original_name: str, taken: set
 
 
 class ProxyNode(Base):
-    """节点注册表行：一个唯一出口实现一条台账，跨订阅刷新不删节点、不丢历史。"""
+    """节点注册表行：一个唯一出口实现一条台账，跨订阅刷新不删节点、不丢历史。
+
+    **身份**：`fingerprint`（整份配置的规范化哈希）就是全局节点身份，故它
+    **全局唯一**——同一份配置被订阅 A/B/C 同时提供，账上只有这一行。
+    「谁在提供它」不在本表，见 `ProxyNodeSource`。
+
+    早期版本在本表挂了单列 `subscription_id`（NOT NULL）+ 全局唯一 fingerprint，
+    是一套自相矛盾的模型：同一配置的第二条订阅插不进来（撞唯一约束），而
+    「订阅 A 撤掉、订阅 B 仍在提供」又会被读成节点消失（把来源当身份）。身份
+    与来源必须分表，这正是 `ProxyNodeSource` 存在的理由。
+
+    节点离开运行集的条件是**所有来源都不再提供它**，不是某个订阅不再提供它。
+    `normalized_config` 是这条台账的事实副本；端点（type/server/port）只是检索
+    线索与 diff 分类依据，不参与身份判定——同端点换凭据/参数＝另一个节点
+    （另起一行；旧行靠来源流失 + 健康证据自然退休，不做跨血缘的凭据轮换推定）。
+    """
 
     __tablename__ = "proxy_nodes"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     node_id: Mapped[str] = mapped_column(String(64), unique=True)
-    subscription_id: Mapped[int] = mapped_column(Integer, index=True)
-    fingerprint: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    fingerprint: Mapped[str] = mapped_column(String(64), unique=True)
+    # 首次登记时铸造（<来源订阅>|<原名>，撞名加 #N），此后绝不重算：
+    # 重算会让已绑定的 lane / 池文件条目指向一个不存在的名字
     runtime_name: Mapped[str] = mapped_column(String(400), unique=True)
-    original_name: Mapped[str] = mapped_column(String(255))
     proxy_type: Mapped[str] = mapped_column(String(32))
     server: Mapped[str | None] = mapped_column(String(255))
     normalized_config: Mapped[dict | None] = mapped_column(JSON)
     state: Mapped[str] = mapped_column(String(16), default=NODE_NEW)
     first_seen: Mapped[datetime | None] = mapped_column(DateTime)
     last_seen: Mapped[datetime | None] = mapped_column(DateTime)
-    # 最后一次出现在订阅快照里的时刻 —— STALE 判定的来源证据
+    # 最后一次出现在**任一**订阅快照里的时刻（= 该节点全部来源 last_seen 的最大
+    # 值，冗余缓存，便于按单表筛 STALE 候选）——来源证据的事实源仍是 NodeSource
     last_source_seen: Mapped[datetime | None] = mapped_column(DateTime)
     last_l0_at: Mapped[datetime | None] = mapped_column(DateTime)
     last_l1_at: Mapped[datetime | None] = mapped_column(DateTime)
@@ -85,6 +108,33 @@ class ProxyNode(Base):
     consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
     # 业务容量：由 L2 真实批次测得；L0 的小负载延迟不参与（NULL=未测）
     capacity_score: Mapped[float | None] = mapped_column(Float)
+
+
+class ProxyNodeSource(Base):
+    """订阅↔节点 的来源关联（多对多）：节点生命周期的来源证据。
+
+    订阅刷新成功后，用「本订阅本次快照解析出的指纹集合」**整体替换**本订阅的
+    行：新指纹插入、仍在的刷新 `last_seen` / `original_name`、本订阅已不再提供
+    的删除。节点行本身不因此消失——只要还有别的来源提供它，它就是活的（`state`
+    由状态机按健康证据决定），这正是「A 订阅撤掉、B 订阅仍在提供」不会被误判成
+    节点消失的地方。
+
+    `original_name` 挂这里而不是 `ProxyNode`：同一个配置在不同订阅里叫什么都不
+    影响身份，但「订阅侧改名了」的观测与审计要按来源分别留痕。
+    `node_id` 不单建索引——下面的唯一约束索引以 node_id 为前导列，够用。
+    """
+
+    __tablename__ = "proxy_node_sources"
+    __table_args__ = (
+        UniqueConstraint("node_id", "subscription_id", name="ux_pns_node_sub"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    node_id: Mapped[str] = mapped_column(String(64))
+    subscription_id: Mapped[int] = mapped_column(Integer, index=True)
+    original_name: Mapped[str] = mapped_column(String(255))
+    first_seen: Mapped[datetime | None] = mapped_column(DateTime)
+    last_seen: Mapped[datetime | None] = mapped_column(DateTime)
 
 
 class ExitGroup(Base):

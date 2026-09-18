@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -286,7 +287,7 @@ async def test_v5_backfills_wishlist_member_flag(tmp_path: Path, monkeypatch) ->
 
     await database_module.init_db()
     try:
-        assert _user_version(db) == 5
+        assert _user_version(db) == database_module.SCHEMA_VERSION
         con = sqlite3.connect(str(db))
         try:
             cols = {r[1] for r in con.execute("PRAGMA table_info(wishlist_items)")}
@@ -302,3 +303,140 @@ async def test_v5_backfills_wishlist_member_flag(tmp_path: Path, monkeypatch) ->
         )
     finally:
         await engine.dispose()
+
+
+# ── v7：proxy_nodes 身份/来源分表 ────────────────────────────────────
+#
+# 早期 proxy_nodes 同时挂了单列 subscription_id（NOT NULL）与全局唯一
+# fingerprint：同一份配置被两个订阅提供时第二条插不进去（撞唯一约束），
+# 「订阅 A 撤掉、订阅 B 仍在提供」又会被读成节点消失（把来源当身份）。
+# 身份模型定死为「节点表只留身份 + 来源归属进 proxy_node_sources」，
+# 本步清理遗留列，并补齐指纹唯一性（老库是「有 index 无 unique」建的，
+# 唯一性其实没被约束）。两件事都只在表内无行时动，绝不删用户数据。
+
+_LEGACY_PROXY_NODES_DDL = (
+    "CREATE TABLE proxy_nodes ("
+    " id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,"
+    " node_id VARCHAR(64) NOT NULL,"
+    " subscription_id INTEGER NOT NULL,"
+    " fingerprint VARCHAR(64) NOT NULL,"
+    " runtime_name VARCHAR(400) NOT NULL,"
+    " original_name VARCHAR(255) NOT NULL,"
+    " proxy_type VARCHAR(32) NOT NULL,"
+    " server VARCHAR(255),"
+    " normalized_config JSON,"
+    " state VARCHAR(16),"
+    " first_seen DATETIME, last_seen DATETIME, last_source_seen DATETIME,"
+    " last_l0_at DATETIME, last_l1_at DATETIME, last_l2_at DATETIME,"
+    " exit_ip VARCHAR(64), exit_group_id INTEGER,"
+    " consecutive_failures INTEGER, capacity_score FLOAT,"
+    " UNIQUE (node_id), UNIQUE (runtime_name))"
+)
+# 遗留索引：普通（非唯一）指纹索引 + 两个依赖归属列的索引
+_LEGACY_PROXY_NODES_INDEXES = (
+    "CREATE INDEX ix_proxy_nodes_fingerprint ON proxy_nodes(fingerprint)",
+    "CREATE INDEX ix_proxy_nodes_subscription_id ON proxy_nodes(subscription_id)",
+    "CREATE INDEX ix_pn_sub_state ON proxy_nodes(subscription_id, state)",
+)
+
+
+def _columns_of(db: Path, table: str) -> set[str]:
+    con = sqlite3.connect(str(db))
+    try:
+        return {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+    finally:
+        con.close()
+
+
+def _indexes_of(db: Path, table: str) -> set[str]:
+    con = sqlite3.connect(str(db))
+    try:
+        return {r[1] for r in con.execute(f"PRAGMA index_list({table})")}
+    finally:
+        con.close()
+
+
+def _legacy_proxy_nodes_db(db: Path, monkeypatch, rows: list[tuple]):
+    """建一个「迁移前形态」的 proxy_nodes（带遗留列与遗留索引），可预置行。"""
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db.as_posix()}", echo=False)
+    monkeypatch.setattr(database_module, "get_engine", lambda: engine)
+    monkeypatch.setattr(
+        database_module,
+        "get_session_factory",
+        lambda: async_sessionmaker(engine, expire_on_commit=False),
+    )
+    con = sqlite3.connect(str(db))
+    try:
+        con.execute(_LEGACY_PROXY_NODES_DDL)
+        for ddl in _LEGACY_PROXY_NODES_INDEXES:
+            con.execute(ddl)
+        for row in rows:
+            con.execute(
+                "INSERT INTO proxy_nodes (node_id, subscription_id, fingerprint,"
+                " runtime_name, original_name, proxy_type, state)"
+                " VALUES (?,?,?,?,?,?,?)",
+                row,
+            )
+        con.commit()
+    finally:
+        con.close()
+    return engine
+
+
+@pytest.mark.asyncio
+async def test_v7_repairs_legacy_proxy_nodes(tmp_path: Path, monkeypatch) -> None:
+    """遗留库：清掉 NOT NULL 归属列（否则新模型插不进去）+ 补指纹唯一约束。"""
+    db = tmp_path / "legacy_nodes.db"
+    engine = _legacy_proxy_nodes_db(db, monkeypatch, [])
+
+    await database_module.init_db()
+    assert _user_version(db) == database_module.SCHEMA_VERSION
+
+    cols = _columns_of(db, "proxy_nodes")
+    assert not {"subscription_id", "original_name"} & cols, (
+        "遗留 NOT NULL 归属列没清掉——新模型的插入会直接撞 NOT NULL"
+    )
+    assert {"node_id", "fingerprint", "runtime_name", "state"} <= cols
+
+    indexes = _indexes_of(db, "proxy_nodes")
+    assert "ux_proxy_nodes_fingerprint" in indexes, "指纹唯一性没补上"
+    assert not {"ix_proxy_nodes_fingerprint", "ix_pn_sub_state",
+                "ix_proxy_nodes_subscription_id"} & indexes, "遗留索引没清掉"
+
+    # 行为验证：新模型的插入不再撞 NOT NULL，且同一指纹插不进第二行。
+    # （唯一性必须真被约束住，不能只是「有个索引」）
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "INSERT INTO proxy_nodes (node_id, fingerprint, runtime_name, proxy_type)"
+            " VALUES ('a', 'fp-1', '1|A', 'vmess')"
+        ))
+    with pytest.raises(IntegrityError):
+        async with engine.begin() as conn:
+            await conn.execute(text(
+                "INSERT INTO proxy_nodes (node_id, fingerprint, runtime_name, proxy_type)"
+                " VALUES ('b', 'fp-1', '1|B', 'vmess')"
+            ))
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_v7_skips_structural_change_when_legacy_table_has_rows(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """有行则整步跳过：遗留列不是本链预期形态，宁可不动也不删用户数据。"""
+    db = tmp_path / "legacy_nodes_with_rows.db"
+    engine = _legacy_proxy_nodes_db(
+        db, monkeypatch,
+        [("a", 1, "fp-1", "1|A", "A", "vmess", "ACTIVE")],
+    )
+
+    await database_module.init_db()
+
+    cols = _columns_of(db, "proxy_nodes")
+    assert {"subscription_id", "original_name"} <= cols, "有行时不得删列"
+    con = sqlite3.connect(str(db))
+    try:
+        assert con.execute("SELECT COUNT(*) FROM proxy_nodes").fetchone()[0] == 1
+    finally:
+        con.close()
+    await engine.dispose()
