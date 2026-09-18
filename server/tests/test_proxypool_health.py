@@ -332,8 +332,11 @@ async def test_working_node_gets_a_delay(tmp_data_dir, kernel_exe_path,
     assert obs.level == "L0" and obs.ok is True
     assert obs.latency_ms == outcome.delay_ms and obs.observed_at == NOW
 
-    assert PROBE_TARGET_URL.startswith("https://store.steampowered.com/"), (
-        "默认探测目标必须固定在与业务同域的 Steam URL，而不是公共 generate_204"
+    assert PROBE_TARGET_URL == "http://www.gstatic.com/generate_204", (
+        "L0 只证传输可用：目标必须是最轻的连通性探测，且不得是生产业务主机"
+    )
+    assert "steampowered" not in PROBE_TARGET_URL, (
+        "生产主机的抖动会被 L0 失败→DEAD 放大成节点误杀；业务可用性归 L2"
     )
 
 
