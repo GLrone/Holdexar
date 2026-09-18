@@ -163,9 +163,11 @@ _TABLE_EXTRA_INDEXES: dict[str, list[str]] = {
         "CREATE INDEX IF NOT EXISTS ix_pho_node_obs "
         "ON health_observations(node_id, observed_at)",
     ],
-    # proxypool：按订阅 + 状态筛运行池成员（pool 生成的主查询）
+    # proxypool：按状态筛运行池成员（pool 生成的主查询）。
+    # 不再有 (subscription_id, state) 复合索引：节点身份与订阅归属已分表
+    # （见 v7 与 proxypool.models.ProxyNodeSource），proxy_nodes 上没有订阅列
     "proxy_nodes": [
-        "CREATE INDEX IF NOT EXISTS ix_pn_sub_state ON proxy_nodes(subscription_id, state)",
+        "CREATE INDEX IF NOT EXISTS ix_pn_state ON proxy_nodes(state)",
     ],
 }
 
@@ -199,7 +201,7 @@ def _ensure_schema(sync_conn) -> None:
 #   2. _MIGRATIONS 追加 (版本号, 描述, SQL 列表)；SQL 须幂等（中断续跑 +
 #      用户库版本乱序防御），复杂逻辑可登记 async fn(engine) 同位元素
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 # 零小数货币（Steam 以整数计价）：旧捆绑包链路的除数表按 1 处理，与「统一存分」
 # 的新约定差 100 倍——v2 归一的目标集合
@@ -366,6 +368,68 @@ async def _migrate_gph_snapshot_unique(conn) -> None:
     logger.info("[迁移] game_price_history 幂等唯一索引 ux_gph_snapshot 已就绪")
 
 
+async def _migrate_proxy_nodes_identity_split(conn) -> None:
+    """v7：proxy_nodes 拆出来源关联，节点身份收敛为「全局唯一指纹」。
+
+    早期 proxy_nodes 同时挂了单列 `subscription_id`（NOT NULL）与全局唯一
+    `fingerprint`，这套模型自相矛盾：同一份配置被两个订阅提供时第二条插不进去
+    （撞唯一约束），而「订阅 A 撤掉、订阅 B 仍在提供」又会被读成节点消失（把
+    来源当身份）。身份模型定死为：`ProxyNode` 只留身份、来源归属进
+    `proxy_node_sources`（该表由 create_all 建，不在本步）。故本步清理遗留列。
+
+    三件事，全部幂等：
+    1. 删掉遗留归属列——新模型不写它们，留着会让每次插入直接撞 NOT NULL；
+    2. 先删依赖这些列的索引（SQLite 的 DROP COLUMN 不允许该列还在索引里）；
+    3. 补 `fingerprint` 全局唯一索引——存量库是早期「有 index 无 unique」的
+       模型建的（唯一性实际没被约束），新库由模型的 unique=True 直接给约束，
+       这一步对新库是空操作。
+
+    **只在确认表内无行时动结构**：这两列在 P1.1/P1.2 没有任何写入方，真出现
+    行说明库不是本链预期的形态——宁可不动，也不删用户数据。
+    """
+    from sqlalchemy import text
+
+    has_table = (
+        await conn.execute(
+            text("SELECT 1 FROM sqlite_master WHERE type='table' AND name='proxy_nodes'")
+        )
+    ).fetchone()
+    if not has_table:
+        return
+    columns = {
+        row[1]
+        for row in (await conn.execute(text("PRAGMA table_info(proxy_nodes)"))).fetchall()
+    }
+    if not columns:
+        return
+
+    rows = (await conn.execute(text("SELECT COUNT(*) FROM proxy_nodes"))).scalar_one()
+    if rows:
+        logger.warning(
+            "[迁移] proxy_nodes 已有 %d 行，跳过 v7 身份/来源分表的结构变更"
+            "（遗留列不是本链预期形态，不动用户数据）",
+            rows,
+        )
+        return
+
+    for index in (
+        "ix_pn_sub_state",             # (subscription_id, state)
+        "ix_proxy_nodes_subscription_id",
+        "ix_proxy_nodes_fingerprint",  # 旧的普通索引，由下面的唯一索引取代
+    ):
+        await conn.execute(text(f"DROP INDEX IF EXISTS {index}"))
+    for column in ("subscription_id", "original_name"):
+        if column in columns:
+            await conn.execute(text(f"ALTER TABLE proxy_nodes DROP COLUMN {column}"))
+    await conn.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_proxy_nodes_fingerprint"
+            " ON proxy_nodes(fingerprint)"
+        )
+    )
+    logger.info("[迁移] proxy_nodes 身份/来源分表完成：遗留归属列已清、指纹唯一性已补")
+
+
 # (目标版本, 说明, 迁移体)：迁移体 = SQL 语句列表，或 async callable(engine)
 _MIGRATIONS: list[tuple[int, str, object]] = [
     (2, "bundle_region_prices 零小数货币单位归一（元→分 + cny_fen 去虚高）",
@@ -392,6 +456,12 @@ _MIGRATIONS: list[tuple[int, str, object]] = [
          "UPDATE wishlist_items SET wishlisted = 1"
          " WHERE owned = 0 AND active = 1 AND manual = 0",
      ]),
+    # 版本号取 7 而非「顺着 +1 到 6」：本分支迁移链停在 v5，而主干已占用 v6
+    # （成就域明细表重建）。两边同用 v6 会在合并后撞成「两个 v6」，后一个被
+    # `target_version <= current` 永久跳过——迁移静默不执行，正是本步要修的
+    # 这类问题。链本身允许跳号（按 > current 取差额）。
+    (7, "proxy_nodes 身份/来源分表：清理遗留归属列 + 补 fingerprint 唯一索引",
+     _migrate_proxy_nodes_identity_split),
 ]
 
 
