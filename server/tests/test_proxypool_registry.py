@@ -252,3 +252,58 @@ async def test_rename_updates_source_name_only(tmp_data_dir) -> None:
     (src,) = await _sources_of(1)
     assert src.original_name == "香港主节点", "订阅侧的名称变化按来源分别留痕"
     assert src.last_seen == NOW
+
+
+# ── 7. last_source_seen 必须是「剩余来源的最大 last_seen」──────────
+@pytest.mark.asyncio
+async def test_last_source_seen_is_max_over_remaining_sources(tmp_data_dir) -> None:
+    """删除一个来源后，`last_source_seen` 仍等于剩余来源的最大 `last_seen`。
+
+    模型把它定义为「全部来源 `last_seen` 的最大值」。若在「本订阅撤掉、别的订阅
+    本轮没刷新」时直接写 `now`，就把节点的"最后见到"时刻凭空推到了本轮——
+    STALE 候选的新鲜度判断会因此失真。
+    """
+    await init_db()
+    x = _node("香港01", server="hk1.example.net")
+    t10 = datetime(2026, 9, 19, 10, 0, 0)
+    t12 = datetime(2026, 9, 19, 12, 0, 0)
+    t13 = datetime(2026, 9, 19, 13, 0, 0)
+
+    await _apply(_snap([x], subscription_id=1), now=t10)
+    await _apply(_snap([x], subscription_id=2), now=t12)
+    fp = node_fingerprint(x)
+    assert (await _node_row(fp)).last_source_seen == t12
+
+    # 13:00：订阅 1 刷新且不再提供 X，订阅 2 本轮没有刷新
+    await _apply(_snap([_node("别的")], subscription_id=1), now=t13)
+
+    row = await _node_row(fp)
+    assert row.last_source_seen == t12, (
+        "剩余来源最后见到它仍是 12:00，删除别的来源不得把它推成 13:00"
+    )
+    assert row.state == NODE_NEW, "订阅 2 仍提供它，状态不受影响"
+
+
+# ── 8. 同一份快照内的重复指纹只登记一条来源 ──────────────────────
+@pytest.mark.asyncio
+async def test_duplicate_fingerprint_in_one_snapshot_collapses(tmp_data_dir) -> None:
+    """同一份快照里的重复配置只算一条来源（`name` 不参与身份）。
+
+    来源语义是**集合**（`ProxyNodeSource(S) == {fingerprint(n) | n ∈ Snapshot(S)}`），
+    天然应去重；机场确实会返回重复配置（同线路两名）。逐条处理会撞
+    `UNIQUE(node_id, subscription_id)`——一个数据事实不该以数据库异常收场。
+    """
+    await init_db()
+    duplicated = [
+        _node("香港01", server="hk1.example.net"),
+        _node("香港01", server="hk1.example.net"),          # 字面重复
+        _node("香港高速01", server="hk1.example.net"),       # 同配置、换名（name 不参与指纹）
+    ]
+
+    result = await _apply(_snap(duplicated))
+
+    assert await _count(ProxyNode) == 1
+    assert await _count(ProxyNodeSource) == 1
+    assert result.created_nodes == (node_fingerprint(duplicated[0]),)
+    (src,) = await _sources_of(1)
+    assert src.original_name == "香港01", "重复时取确定性的首次出现值"

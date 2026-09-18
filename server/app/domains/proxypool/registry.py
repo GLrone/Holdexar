@@ -9,7 +9,9 @@
 1. **来源整体替换，不读 Diff**：本订阅的行按「本次快照的指纹集合」整体对齐——
    新指纹插入、仍在的刷新、已不再提供的删除。`apply_snapshot` 的签名里没有
    `Diff`：diff 是**有状态的**（语义依赖上一份基线被正确持久化），一次回滚就会让
-   误差固化并逐轮累积；快照替换是无状态的，每轮从完整事实重算。
+   误差固化并逐轮累积；快照替换是无状态的，每轮从完整事实重算。快照内的重复
+   指纹按**集合**去重（`name` 不参与身份，同一线路挂两个名字天然撞同一指纹），
+   首次出现的写法胜出——它是数据事实，不该以 `UNIQUE` 异常收场。
 2. **身份不重铸**：`runtime_name` 只在节点首次登记时铸造，此后任何刷新都不重算——
    重算会让已绑定的 lane / 池文件条目指向一个不存在的名字。第二名提供它的订阅
    直接复用该名字。
@@ -26,6 +28,7 @@
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -86,8 +89,10 @@ async def apply_snapshot(
     now: datetime,
 ) -> ApplyResult:
     """把订阅 `subscription_id` 的来源证据整体对齐到 `snapshot` 的事实。"""
-    desired = [(node_fingerprint(n), n) for n in snapshot.nodes]
-    desired_fp = {fp for fp, _ in desired}
+    desired: dict[str, Mapping] = {}
+    for node in snapshot.nodes:
+        desired.setdefault(node_fingerprint(node), node)
+    desired_fp = set(desired)
 
     existing = await _sources_of(session, subscription_id)
     taken = await _minted_names(session, subscription_id)
@@ -96,7 +101,7 @@ async def apply_snapshot(
     refreshed: list[str] = []
     touched: set[str] = set()
 
-    for fingerprint, node in desired:
+    for fingerprint, node in desired.items():
         original_name = str(node.get("name") or "")
 
         if fingerprint in existing:
@@ -175,8 +180,15 @@ async def apply_snapshot(
             .where(ProxyNodeSource.node_id == node_id)
         )
         if remaining:
-            # 至少有一个订阅本轮见到了它——只推进来源时间，不动状态
-            row.last_source_seen = now
+            # last_source_seen 的语义是「全部来源 last_seen 的最大值」——本轮本订阅
+            # 撤掉、别的订阅没刷新时绝不能写 now：那会把节点的"最后见到"时刻凭空
+            # 推到本轮，STALE 候选按新鲜度筛选会因此误判。
+            latest = await session.scalar(
+                select(func.max(ProxyNodeSource.last_seen)).where(
+                    ProxyNodeSource.node_id == node_id
+                )
+            )
+            row.last_source_seen = latest or now
             continue
         target = evaluate_node_state(
             row.state,
