@@ -66,6 +66,13 @@ class ProxySubscription(Base):
     deprecated: Mapped[bool] = mapped_column(Boolean, default=False)
     deprecated_at: Mapped[datetime | None] = mapped_column(DateTime)
     deprecated_reason: Mapped[str | None] = mapped_column(String(200))
+    # ── proxypool 抓取 / 快照元数据（仅增列，不影响既有代理链路）──
+    last_fetch_at: Mapped[datetime | None] = mapped_column(DateTime)
+    last_fetch_status: Mapped[str | None] = mapped_column(String(32))
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime)
+    last_error: Mapped[str | None] = mapped_column(String(500))
+    snapshot_sha256: Mapped[str | None] = mapped_column(String(64))
+    snapshot_version: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class ClashNode(Base):

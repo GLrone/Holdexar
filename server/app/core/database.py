@@ -102,10 +102,17 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "appid": "BIGINT",
     },
     # 订阅废弃终态（节点状态存储：>95% 不可用 → deprecated）
+    # + proxypool 抓取/快照元数据（订阅表是唯一入口，不再建第二套订阅表）
     "proxy_subscriptions": {
         "deprecated": "BOOLEAN DEFAULT 0",
         "deprecated_at": "DATETIME",
         "deprecated_reason": "VARCHAR(200)",
+        "last_fetch_at": "DATETIME",
+        "last_fetch_status": "VARCHAR(32)",
+        "last_success_at": "DATETIME",
+        "last_error": "VARCHAR(500)",
+        "snapshot_sha256": "VARCHAR(64)",
+        "snapshot_version": "INTEGER DEFAULT 0",
     },
     # account 域多账号在线状态（GetPlayerSummaries/miniprofile 双通道）
     "steam_accounts": {
@@ -150,6 +157,15 @@ _TABLE_EXTRA_INDEXES: dict[str, list[str]] = {
     # 节点状态账本按订阅取全量（test_clash_nodes UPSERT / 体检门槛查询）
     "clash_nodes": [
         "CREATE INDEX IF NOT EXISTS ix_clash_nodes_sub_name ON clash_nodes(subscription_id, name)",
+    ],
+    # proxypool：健康观测按节点取时间窗（批量写入，避免与 crawler 落库争抢）
+    "health_observations": [
+        "CREATE INDEX IF NOT EXISTS ix_pho_node_obs "
+        "ON health_observations(node_id, observed_at)",
+    ],
+    # proxypool：按订阅 + 状态筛运行池成员（pool 生成的主查询）
+    "proxy_nodes": [
+        "CREATE INDEX IF NOT EXISTS ix_pn_sub_state ON proxy_nodes(subscription_id, state)",
     ],
 }
 
@@ -519,6 +535,8 @@ async def init_db() -> None:
     from app.domains.wishlist import models as _wishlist_models  # noqa: F401
     from app.domains.family import models as _family_models  # noqa: F401
     from app.domains.account import models as _account_models  # noqa: F401
+    # proxypool：新表靠 import 注册到 Base.metadata，漏了 create_all 不会建
+    from app.domains.proxypool import models as _proxypool_models  # noqa: F401
 
     async with get_engine().begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
