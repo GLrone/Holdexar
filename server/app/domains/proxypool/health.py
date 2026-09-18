@@ -1,16 +1,20 @@
-"""P1.4-A：`/proxies/{name}/delay` 最小健康检测（L0）。
+"""P1.4-A：`/proxies/{name}/delay` 最小健康检测（L0 = 传输层）。
 
-本阶段只回答一个问题：
+三层职责必须分清，否则会变成「同一个业务接口测两遍」：
 
-> **这个节点经 Mihomo 发起一次真实 HTTP(S) 探测，能否在规定时间内拿到预期状态。**
+    L0 = 传输层     —— 这个节点能不能完成一次代理连接（本模块 `health_check_pool`）
+    L1 = 出口身份   —— 它的出口 IP 是什么（`exit_ip_check_pool`，只记录）
+    L2 = 业务层     —— 能不能完成 Holdexar 生产所需的 StoreBrowse 请求（只记录）
 
-不回答出口 IP（L1），也不回答能不能扛住爬虫业务（L2）——那两层各有自己的证据。
+**L0 不用生产业务接口当目标。** 实测生产主机 `api.steampowered.com` 的响应在
+1.2s~22s 之间抖动、且偶发超时（连它上面最轻的接口也 4/6 成功）；而 L0 失败会推进
+`state`，把生产业务接口当 L0 目标等于**把外部业务服务的抖动耦合进节点状态机**——
+一次网络抖动就能成片杀掉节点。业务可用性归 L2，那里失败不改状态。
 
-**探测目标不用公共 `generate_204`**：Holdexar 要的是「这个节点能不能访问我们真正
-依赖的 Steam 目标」，所以默认目标固定成同域的 Steam API（见 `PROBE_TARGET_URL`）。
-即便这一层成功，也**不等于**「爬虫一定可用」——真实业务请求是 L2 的事。
+L0 目标选的是最轻的连通性探测（204、无响应体、跨地区可达性好）。选型来自真内核
+`/delay` 的实测对比，不是凭经验拍一个公网地址。
 
-**观测形状取自真实内核实测，不是文档推演**（本机 mihomo 实测）：
+**探测形状取自真实内核实测**（本机 mihomo）：
 
     HTTP 200  {"delay": 2}                                     → 成功
     HTTP 503  {"message":"An error occurred in the delay test"} → 节点在、探测失败
@@ -44,11 +48,8 @@ from app.domains.proxypool.pool import pool_path
 from app.domains.proxypool.runtime import mixed_port_of
 from app.domains.proxypool.state import evaluate_node_state
 
-# 与业务同域的稳定探测目标（可覆盖；测试用本地目标，生产用这个）
-PROBE_TARGET_URL = (
-    "https://store.steampowered.com/api/appdetails"
-    "?appids=220&cc=us&l=english&filters=price_overview"
-)
+# L0 传输层目标：204、无响应体、请求最轻（选型见模块文档）
+PROBE_TARGET_URL = "http://www.gstatic.com/generate_204"
 
 PROBE_LEVEL = "L0"
 DEFAULT_TIMEOUT_MS = 5000
