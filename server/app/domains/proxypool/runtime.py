@@ -1,11 +1,13 @@
 """P1.3-C：池文件 → 内核运行时的**事实读取**与对账。
 
-这一层只做两件事，且刻意只做两件：
+这一层只做三件事，且刻意只做三件：
 
-1. 读内核运行时事实：`GET {controller}/proxies`，取出内核当前装载的代理名。
-2. 与 Registry / 池文件对账：**按名字空间比集合**，把差额记出来。
+1. **由池生成内核启动配置**（`prepare_runtime_config`）：`crawl-pool.yaml` 是只读
+   产物，内核实际启动用的另存为 `crawl-runtime.yaml`。
+2. 读内核运行时事实：`GET {controller}/proxies`，取出内核当前装载的代理名。
+3. 与 Registry / 池文件对账：**按名字空间比集合**，把差额记出来。
 
-它不启动内核、不写配置文件、不做发布与回滚——内核由既有的 `ClashRuntime` 负责
+它不启动内核、不做发布与回滚——内核由既有的 `ClashRuntime` 负责
 （`clash_manager`），本模块只消费 `start()` 之后暴露的控制器地址与密钥。
 
 **M 只能按 Registry 的名字空间取，不能数整个 JSON**：`/proxies` 里还混着内核内置
@@ -21,9 +23,14 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx
+import yaml
+
+from app.domains.proxypool.pool import PoolBuildError, pool_path
 
 # 内核内置的逻辑节点（不是池里的节点）。仅用于把 /proxies 里的「多出来的键」
 # 解释清楚；它们随内核版本可能变，所以**不**作为硬门禁参与 ok 判定。
@@ -36,6 +43,46 @@ DEFAULT_WAIT_TIMEOUT = 15.0
 
 class RuntimeUnreachableError(RuntimeError):
     """控制器在超时内不可用——通常意味着内核**没有起来**（配置解析 fatal）。"""
+
+
+RUNTIME_CONFIG_FILENAME = "crawl-runtime.yaml"
+
+
+def runtime_config_path(data_dir: Path) -> Path:
+    """内核启动配置的路径（与只读的池文件同目录、不同文件）。"""
+    return Path(data_dir) / "proxypool" / RUNTIME_CONFIG_FILENAME
+
+
+def prepare_runtime_config(data_dir: Path) -> Path:
+    """由 `crawl-pool.yaml` 生成 `crawl-runtime.yaml`——内核实际启动用的文件。
+
+    为什么必须分文件：`ClashRuntime.start()` 会把 `external-controller` / `secret`
+    **写回它收到的那个文件**。若直接启动池文件，池就不再等于 `build_pool` 校验过的
+    产物，而且下一次 `build_pool` 一覆盖就把控制器注入抹掉——而 P1.4 的健康检测
+    正依赖控制器，这个矛盾不能带进健康模块。
+
+    职责：
+    - `crawl-pool.yaml` = Registry 的纯运行集，**只读产物**，内核对它零写入；
+    - `crawl-runtime.yaml` = 临时、可重建的内核启动配置（控制器等运行期键由
+      `ClashRuntime.start()` 注入到这里）。
+
+    只把池里的 `proxies` 搬过来；运行期专属键（mixed-port / log-level /
+    proxy-groups 等）将来要加就加在这一层，不再回头污染池文件。
+    """
+    pool = pool_path(data_dir)
+    doc = yaml.safe_load(pool.read_text(encoding="utf-8"))
+    if not isinstance(doc, Mapping) or not isinstance(doc.get("proxies"), list):
+        raise PoolBuildError(f"池文件形态不对，无法生成运行配置：{pool}")
+
+    out = runtime_config_path(data_dir)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    text = yaml.safe_dump(
+        {"proxies": list(doc["proxies"])}, allow_unicode=True, sort_keys=False
+    )
+    tmp = out.with_suffix(".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(out)
+    return out
 
 
 @dataclass(frozen=True)

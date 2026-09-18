@@ -96,6 +96,9 @@ class ProxyNode(Base):
     normalized_config: Mapped[dict | None] = mapped_column(JSON)
     state: Mapped[str] = mapped_column(String(16), default=NODE_NEW)
     first_seen: Mapped[datetime | None] = mapped_column(DateTime)
+    # legacy / 暂不使用：登记时赋值，此后**不再推进**。来源时间的事实源是
+    # ProxyNodeSource.last_seen，来源总览是 last_source_seen，健康时间在
+    # last_l0/l1/l2_at——本列若也定义成「最近见到」，就会造出第二套时间真相。
     last_seen: Mapped[datetime | None] = mapped_column(DateTime)
     # 最后一次出现在**任一**订阅快照里的时刻（= 该节点全部来源 last_seen 的最大
     # 值，冗余缓存，便于按单表筛 STALE 候选）——来源证据的事实源仍是 NodeSource
