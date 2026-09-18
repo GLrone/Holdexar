@@ -29,7 +29,9 @@ from app.domains.proxypool.models import ProxyNode, node_fingerprint  # noqa: E4
 from app.domains.proxypool.pool import build_pool, pool_path  # noqa: E402
 from app.domains.proxypool.runtime import (  # noqa: E402
     RuntimeUnreachableError,
+    prepare_runtime_config,
     reconcile,
+    runtime_config_path,
     wait_proxy_names,
 )
 from app.domains.proxypool.state import (  # noqa: E402
@@ -142,7 +144,7 @@ async def test_kernel_loads_exactly_the_pool_nodes(
     assert registry_names == set(build.runtime_names), "池写入前：Registry 与池必须同集"
 
     observed = await _start_and_read(
-        clash_runtime, kernel_exe_path, pool_path(tmp_data_dir)
+        clash_runtime, kernel_exe_path, prepare_runtime_config(tmp_data_dir)
     )
     ledger = reconcile(
         registry_names=registry_names,
@@ -177,7 +179,7 @@ async def test_dead_and_retired_never_reach_the_kernel(
     assert build.written_count == 3, "DEAD / RETIRED 不该进池"
 
     observed = await _start_and_read(
-        clash_runtime, kernel_exe_path, pool_path(tmp_data_dir)
+        clash_runtime, kernel_exe_path, prepare_runtime_config(tmp_data_dir)
     )
     assert "1|dead.example.net" not in observed
     assert "1|retired.example.net" not in observed
@@ -236,5 +238,37 @@ async def test_unloadable_node_makes_the_kernel_die_not_shrink(
 
     with pytest.raises(RuntimeUnreachableError, match="不可用"):
         await _start_and_read(
-            clash_runtime, kernel_exe_path, config, timeout=8.0
+            clash_runtime, kernel_exe_path, prepare_runtime_config(tmp_data_dir),
+            timeout=8.0,
         )
+
+
+# ── 5. 池文件是只读产物，内核只吃由它生成的运行配置 ───────────────
+@pytest.mark.asyncio
+async def test_pool_file_is_never_touched_by_the_kernel(
+    tmp_data_dir, kernel_exe_path, clash_runtime
+) -> None:
+    """`ClashRuntime.start()` 会把 `external-controller` / `secret` **写回它收到
+    的文件**。把池文件直接交给它，池就不再等于 `build_pool` 校验过的产物，而且
+    下一次 `build_pool` 会把注入抹掉——P1.4 的健康检测要靠控制器，这个矛盾必须
+    在这里断开：池 = 纯运行集（只读），运行配置 = 临时可重建的内核启动文件。
+    """
+    await init_db()
+    await _add(NODE_ACTIVE, "1|香港01", server="hk1.example.net")
+    await _build(tmp_data_dir)
+
+    pool = pool_path(tmp_data_dir)
+    pool_bytes = pool.read_bytes()
+
+    config = prepare_runtime_config(tmp_data_dir)
+    assert config == runtime_config_path(tmp_data_dir)
+    assert config != pool
+    assert [p["name"] for p in
+            yaml.safe_load(config.read_text(encoding="utf-8"))["proxies"]] == ["1|香港01"]
+
+    await _start_and_read(clash_runtime, kernel_exe_path, config)
+
+    assert pool.read_bytes() == pool_bytes, "内核启动不得改动池文件一个字节"
+    text = config.read_text(encoding="utf-8")
+    assert "external-controller" in text, "控制器该由运行配置承载"
+    assert "secret" in text
