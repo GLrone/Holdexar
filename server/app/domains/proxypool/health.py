@@ -26,6 +26,9 @@ fragment 截断），503 才是节点本身不可用。名字进 path 一律 `qu
 """
 from __future__ import annotations
 
+import ipaddress
+import json
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domains.proxypool.models import HealthObservation, ProxyNode, ProxyNodeSource
 from app.domains.proxypool.pool import pool_path
+from app.domains.proxypool.runtime import mixed_port_of
 from app.domains.proxypool.state import evaluate_node_state
 
 # 与业务同域的稳定探测目标（可覆盖；测试用本地目标，生产用这个）
@@ -48,6 +52,18 @@ PROBE_TARGET_URL = (
 
 PROBE_LEVEL = "L0"
 DEFAULT_TIMEOUT_MS = 5000
+
+# ── L1：出口 IP ──────────────────────────────────────────────────
+L1_LEVEL = "L1"
+# 生产默认用公网 IP 回显服务（可覆盖）；测试换成本地目标
+EXIT_IP_TARGET_URL = "https://api.ipify.org?format=json"
+DEFAULT_L1_TIMEOUT = 15.0
+
+# L1 失败必须能区分「节点/选择失败」与「目标服务故障」——否则会建立一个
+# 「公网 IP 回显服务健康状态决定代理池健康」的错误系统。
+NODE_PROBE_FAILED = "NODE_PROBE_FAILED"
+TARGET_SERVICE_FAILED = "TARGET_SERVICE_FAILED"
+INVALID_IP_RESPONSE = "INVALID_IP_RESPONSE"
 
 NOT_FOUND_DETAIL = "内核里没有这个节点：名字没定位到（HTTP 404）"
 PROBE_FAILED_DETAIL = "内核探测失败"
@@ -174,6 +190,168 @@ async def health_check_pool(
             detail=result.detail,
             previous_state=previous,
             state=target,
+        ))
+
+    await session.flush()
+    return tuple(outcomes)
+
+
+# ══ L1：出口 IP ══════════════════════════════════════════════════
+# 路径（已实测）：PUT /proxies/GLOBAL 选中节点 → 经 mixed-port 发真实请求 →
+# 目标回显读回出口 IP。mixed-port 由运行配置携带（`prepare_runtime_config`），
+# 这里只读它，不做运行期 PATCH。
+#
+# **L1 首版只记录观测与 `exit_ip`，不碰 `state`**：连 `evaluate_node_state()` 都不
+# 调用。否则「ipify 503 → L1 fail → DEAD」就建立了「公网 IP 回显服务健康状态决定
+# 代理池健康」的错误系统。状态怎么消费，留给后面的规则层。
+
+
+@dataclass(frozen=True)
+class ExitIpResult:
+    """一次出口 IP 探测的原始结论。"""
+
+    runtime_name: str
+    ok: bool
+    exit_ip: str | None
+    detail: str
+    # 记录用；**不参与评分**——L0 的 `/delay` 与这里的业务请求耗时是两个量
+    latency_ms: int | None
+
+
+@dataclass(frozen=True)
+class ExitIpOutcome:
+    node_id: str
+    runtime_name: str
+    ok: bool
+    exit_ip: str | None
+    detail: str
+    latency_ms: int | None
+
+
+def _extract_ip(text: str) -> str | None:
+    """从回显响应里取出口 IP：兼容 JSON（ipify `format=json`）与纯文本。"""
+    candidate = text.strip()
+    if candidate.startswith("{"):
+        try:
+            payload = json.loads(candidate)
+        except ValueError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        candidate = str(payload.get("ip") or "").strip()
+    if not candidate:
+        return None
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        return None
+
+
+async def probe_exit_ip(
+    controller_url: str,
+    secret: str,
+    mixed_port: int,
+    runtime_name: str, *,
+    url: str = EXIT_IP_TARGET_URL,
+    timeout: float = DEFAULT_L1_TIMEOUT,
+) -> ExitIpResult:
+    """选中该节点，再经 mixed-port 发一次真实请求，读回它的出口 IP。
+
+    **必须串行调用**：`GLOBAL` 是全局选择器，切换是全局状态；并发探测会让
+    「这个出口 IP 属于哪个节点」不可信。这是测量正确性问题，不是性能问题。
+    """
+    headers = {"Authorization": f"Bearer {secret}"} if secret else {}
+    async with httpx.AsyncClient(timeout=timeout, headers=headers) as control:
+        try:
+            put = await control.put(
+                f"{controller_url}/proxies/GLOBAL", json={"name": runtime_name}
+            )
+            if put.status_code >= 400:
+                return ExitIpResult(runtime_name, False, None,
+                                    f"{NODE_PROBE_FAILED}: 选择节点失败"
+                                    f"（HTTP {put.status_code}）", None)
+            now = (await control.get(
+                f"{controller_url}/proxies/GLOBAL")).json().get("now")
+        except Exception as exc:  # noqa: BLE001
+            return ExitIpResult(runtime_name, False, None,
+                                f"{NODE_PROBE_FAILED}: 控制器不可达"
+                                f"（{type(exc).__name__}）", None)
+
+    if now != runtime_name:
+        # 归因不成立：此刻测到的 IP 不属于这个节点。宁可记失败，也不能记错归属。
+        return ExitIpResult(runtime_name, False, None,
+                            f"{NODE_PROBE_FAILED}: GLOBAL 的 now={now!r} "
+                            f"不是 {runtime_name!r}", None)
+
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(
+            proxy=f"http://127.0.0.1:{mixed_port}", timeout=timeout
+        ) as proxied:
+            resp = await proxied.get(url)
+    except Exception as exc:  # noqa: BLE001
+        return ExitIpResult(runtime_name, False, None,
+                            f"{TARGET_SERVICE_FAILED}: {type(exc).__name__}", None)
+    latency_ms = int((time.monotonic() - started) * 1000)
+
+    if resp.status_code != 200:
+        return ExitIpResult(runtime_name, False, None,
+                            f"{TARGET_SERVICE_FAILED}: HTTP {resp.status_code}",
+                            latency_ms)
+    exit_ip = _extract_ip(resp.text)
+    if exit_ip is None:
+        return ExitIpResult(runtime_name, False, None,
+                            f"{INVALID_IP_RESPONSE}: {resp.text.strip()[:60]!r}",
+                            latency_ms)
+    return ExitIpResult(runtime_name, True, exit_ip, "", latency_ms)
+
+
+async def exit_ip_check_pool(
+    session: AsyncSession, *,
+    data_dir: Path,
+    controller_url: str,
+    secret: str,
+    now: datetime,
+    url: str = EXIT_IP_TARGET_URL,
+    timeout: float = DEFAULT_L1_TIMEOUT,
+) -> tuple[ExitIpOutcome, ...]:
+    """对池内节点**串行**做一次 L1 出口 IP 观测。
+
+    成功 → `ProxyNode.exit_ip` + `HealthObservation(level="L1")`；
+    失败 → 只落观测与 `detail`，**不动 `exit_ip`、不动 `state`**（一次目标服务
+    故障不该擦掉已经观测到的出口事实）。
+    """
+    names = _pool_names(data_dir)
+    mixed_port = mixed_port_of(data_dir)
+    rows = await session.execute(
+        select(ProxyNode).where(ProxyNode.runtime_name.in_(names))
+    )
+    by_name = {row.runtime_name: row for row in rows.scalars()}
+
+    outcomes: list[ExitIpOutcome] = []
+    for name in names:  # 严格串行（见 probe_exit_ip）
+        node = by_name.get(name)
+        if node is None:
+            continue
+        result = await probe_exit_ip(controller_url, secret, mixed_port, name,
+                                     url=url, timeout=timeout)
+        if result.ok and result.exit_ip:
+            node.exit_ip = result.exit_ip
+        session.add(HealthObservation(
+            node_id=node.node_id,
+            level=L1_LEVEL,
+            ok=result.ok,
+            latency_ms=result.latency_ms,
+            detail=result.detail or None,
+            observed_at=now,
+        ))
+        outcomes.append(ExitIpOutcome(
+            node_id=node.node_id,
+            runtime_name=name,
+            ok=result.ok,
+            exit_ip=result.exit_ip,
+            detail=result.detail,
+            latency_ms=result.latency_ms,
         ))
 
     await session.flush()

@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import os
+import socket
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -272,3 +274,46 @@ async def test_pool_file_is_never_touched_by_the_kernel(
     text = config.read_text(encoding="utf-8")
     assert "external-controller" in text, "控制器该由运行配置承载"
     assert "secret" in text
+
+
+# ── 6. 运行期专属键只进运行配置，且 mixed-port 真被监听 ──────────
+@pytest.mark.asyncio
+async def test_runtime_config_carries_runtime_only_keys(
+    tmp_data_dir, kernel_exe_path, clash_runtime
+) -> None:
+    """`mode` / `mixed-port` / `bind-address` / `allow-lan` 属于运行配置这一层。
+
+    这条顺带拦一个结构性倒退：以后有人为了 L1 把运行参数直接塞回池文件。
+    """
+    await init_db()
+    await _add(NODE_ACTIVE, "1|香港01", server="hk1.example.net")
+    await _build(tmp_data_dir)
+    pool_bytes = pool_path(tmp_data_dir).read_bytes()
+
+    config = prepare_runtime_config(tmp_data_dir)
+    doc = yaml.safe_load(config.read_text(encoding="utf-8"))
+
+    assert doc["mode"] == "global", "L1 靠 GLOBAL 选择器切节点"
+    assert doc["allow-lan"] is False, "测出口 IP 不该把本机代理入口开给局域网"
+    assert doc["bind-address"] == "127.0.0.1"
+    port = doc["mixed-port"]
+    assert isinstance(port, int) and port > 0, "必须是动态分配的真实端口，不是 0"
+    bind_probe = socket.socket()
+    bind_probe.bind(("127.0.0.1", port))
+    bind_probe.close()
+    assert pool_path(tmp_data_dir).read_bytes() == pool_bytes, (
+        "运行期键不得回流进池文件——池只放 Registry 的运行集"
+    )
+
+    status = clash_runtime.start(str(kernel_exe_path), str(config))
+    await wait_proxy_names(status["controllerUrl"], clash_runtime.secret, timeout=15)
+
+    listening = False
+    for _ in range(40):
+        with socket.socket() as probe_sock:
+            probe_sock.settimeout(0.3)
+            if probe_sock.connect_ex(("127.0.0.1", port)) == 0:
+                listening = True
+                break
+        time.sleep(0.25)
+    assert listening, f"内核没有监听运行配置里的 mixed-port {port}"

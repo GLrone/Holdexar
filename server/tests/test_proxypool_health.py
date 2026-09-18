@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import socket
 import threading
@@ -28,7 +29,9 @@ from app.domains.proxies import clash_manager  # noqa: E402
 from app.domains.proxies.clash_manager import ClashRuntime  # noqa: E402
 from app.domains.proxies.kernel_release import kernel_filename  # noqa: E402
 from app.domains.proxypool.health import (  # noqa: E402
+    EXIT_IP_TARGET_URL,
     PROBE_TARGET_URL,
+    exit_ip_check_pool,
     health_check_pool,
     probe_node,
 )
@@ -72,15 +75,20 @@ def _pipe(a: socket.socket, b: socket.socket) -> None:
                 pass
 
 
-def _tunnel(conn: socket.socket) -> None:
+def _tunnel(conn: socket.socket, redirect_to: int | None = None) -> None:
     try:
         head = conn.recv(8192)
         if not head:
             return
         parts = head.split(b"\r\n", 1)[0].decode("latin-1").split()
         if len(parts) >= 2 and parts[0].upper() == "CONNECT":
-            host, _, port = parts[1].partition(":")
-            upstream = socket.create_connection((host, int(port)), timeout=5)
+            if redirect_to is not None:
+                # L1 用：忽略 CONNECT 目标，一律隧道到本节点专属回显，
+                # 让"每个节点有自己的出口身份"可证
+                upstream = socket.create_connection(("127.0.0.1", redirect_to), timeout=5)
+            else:
+                host, _, port = parts[1].partition(":")
+                upstream = socket.create_connection((host, int(port)), timeout=5)
             conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             threading.Thread(target=_pipe, args=(conn, upstream), daemon=True).start()
             _pipe(upstream, conn)
@@ -96,7 +104,8 @@ def _tunnel(conn: socket.socket) -> None:
 
 
 class _LocalConnectProxy:
-    def __init__(self) -> None:
+    def __init__(self, redirect_to: int | None = None) -> None:
+        self._redirect_to = redirect_to
         self._sock = socket.socket()
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind(("127.0.0.1", 0))
@@ -110,15 +119,48 @@ class _LocalConnectProxy:
                 conn, _ = self._sock.accept()
             except OSError:
                 return
-            threading.Thread(target=_tunnel, args=(conn,), daemon=True).start()
+            threading.Thread(target=_tunnel, args=(conn, self._redirect_to),
+                             daemon=True).start()
 
     def close(self) -> None:
         self._sock.close()
 
 
 class _Target(BaseHTTPRequestHandler):
+    """L0 的探测目标（只求 2xx）。"""
+
     def do_GET(self):  # noqa: N802
         self.send_response(204)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+class _Echo(BaseHTTPRequestHandler):
+    """模仿 ipify 的出口 IP 回显（每个节点一个，返回各自的合成 IP）。"""
+
+    fake_ip = "0.0.0.0"
+    hits: list[str] = []
+
+    def do_GET(self):  # noqa: N802
+        type(self).hits.append(self.path)
+        body = json.dumps({"ip": self.fake_ip}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+class _BrokenTarget(BaseHTTPRequestHandler):
+    """回显服务自身故障：用来证明 L1 失败不得归因给节点。"""
+
+    def do_GET(self):  # noqa: N802
+        self.send_response(503)
         self.end_headers()
 
     def log_message(self, *args):
@@ -170,17 +212,47 @@ def clash_runtime():
 
 @pytest.fixture
 def local_proxies():
-    """按需开本地 CONNECT 代理，每个返回一个独立端口。"""
+    """按需开本地 CONNECT 代理，每个返回一个独立端口。
+
+    `redirect_to` 给 L1 用：把该节点的一切流量固定隧道到自己专属的回显服务，
+    这样"选了 A 却拿到 B 的出口 IP"会立刻暴露。
+    """
     made: list[_LocalConnectProxy] = []
 
-    def new() -> int:
-        proxy = _LocalConnectProxy()
+    def new(redirect_to: int | None = None) -> int:
+        proxy = _LocalConnectProxy(redirect_to)
         made.append(proxy)
         return proxy.port
 
     yield new
     for proxy in made:
         proxy.close()
+
+
+@pytest.fixture
+def echoes():
+    """按需造出口 IP 回显服务，返回 (端口, 命中记录)。"""
+    made: list[ThreadingHTTPServer] = []
+
+    def new(fake_ip: str) -> tuple[int, list[str]]:
+        hits: list[str] = []
+        handler = type("_EchoX", (_Echo,), {"fake_ip": fake_ip, "hits": hits})
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        made.append(server)
+        return server.server_address[1], hits
+
+    yield new
+    for server in made:
+        server.shutdown()
+
+
+@pytest.fixture
+def broken_target():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _BrokenTarget)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield server.server_address[1]
+    server.shutdown()
 
 
 @pytest.fixture
@@ -349,3 +421,134 @@ async def test_probe_result_drives_state(tmp_data_dir, kernel_exe_path,
     assert await _state_of("1|已退休") == NODE_RETIRED, (
         "RETIRED 不参与本阶段：它不在池里、不会被探测，也就不会被一次成功自动复活"
     )
+
+
+# ══ P1.4-B：L1 出口 IP ═══════════════════════════════════════════
+# 本地回显是明文 HTTP，所以目标 URL 用 http://（https 会先握手 TLS，回显谈不了）。
+LOCAL_EXIT_TARGET = "http://exit-echo.invalid/"
+
+
+async def _l1(data_dir: Path, base: str, secret: str, target: str):
+    async with get_session_factory()() as s:
+        outcomes = await exit_ip_check_pool(
+            s, data_dir=data_dir, controller_url=base, secret=secret,
+            now=NOW, url=target,
+        )
+        await s.commit()
+        return outcomes
+
+
+async def _set_exit_ip(runtime_name: str, ip: str) -> None:
+    async with get_session_factory()() as s:
+        row = (await s.execute(
+            select(ProxyNode).where(ProxyNode.runtime_name == runtime_name)
+        )).scalar_one()
+        row.exit_ip = ip
+        await s.commit()
+
+
+async def _node(runtime_name: str) -> ProxyNode:
+    async with get_session_factory()() as s:
+        return (await s.execute(
+            select(ProxyNode).where(ProxyNode.runtime_name == runtime_name)
+        )).scalar_one()
+
+
+# ── L1-1. 单节点：选中它并拿到它专属的出口 IP ────────────────────
+@pytest.mark.asyncio
+async def test_l1_single_node_yields_its_own_exit_ip(
+    tmp_data_dir, kernel_exe_path, clash_runtime, local_proxies, echoes
+) -> None:
+    await init_db()
+    echo_port, hits = echoes("203.0.113.10")
+    await _add(NODE_ACTIVE, "1|香港01", port=local_proxies(echo_port))
+    base, secret = await _start_kernel(clash_runtime, kernel_exe_path, tmp_data_dir)
+
+    (outcome,) = await _l1(tmp_data_dir, base, secret, LOCAL_EXIT_TARGET)
+
+    assert outcome.ok, f"L1 应当成功，实际 detail={outcome.detail}"
+    assert outcome.exit_ip == "203.0.113.10"
+    assert hits, "请求没有经过该节点专属回显——说明没真的走出这个节点"
+    assert EXIT_IP_TARGET_URL.startswith("https://api.ipify.org"), (
+        "生产默认目标固定成公网 IP 回显服务；测试才换成本地目标"
+    )
+
+
+# ── L1-2. 串行切换：各节点的出口 IP 归属必须正确 ─────────────────
+@pytest.mark.asyncio
+async def test_l1_serial_switch_attributes_each_exit_ip(
+    tmp_data_dir, kernel_exe_path, clash_runtime, local_proxies, echoes
+) -> None:
+    """只有一个 GLOBAL 选择器，切换是全局状态——归因正确性是测量的前提。
+
+    两个节点各自隧道到**自己的**回显（不同合成出口 IP），所以"选了 A 却拿到 B 的
+    出口"会立刻暴露；若两个节点返回同一个出口，这条根本证不了。
+    """
+    await init_db()
+    echo_a, hits_a = echoes("203.0.113.10")
+    echo_b, hits_b = echoes("203.0.113.20")
+    await _add(NODE_ACTIVE, "1|香港01", port=local_proxies(echo_a))
+    await _add(NODE_ACTIVE, "2|usa: west #1", port=local_proxies(echo_b))
+    base, secret = await _start_kernel(clash_runtime, kernel_exe_path, tmp_data_dir)
+
+    outcomes = await _l1(tmp_data_dir, base, secret, LOCAL_EXIT_TARGET)
+
+    assert [(o.runtime_name, o.exit_ip) for o in outcomes] == [
+        ("1|香港01", "203.0.113.10"),
+        ("2|usa: west #1", "203.0.113.20"),
+    ]
+    assert len(hits_a) == 1 and len(hits_b) == 1, "各节点只该命中自己的回显一次"
+    assert await _node("1|香港01") is not None
+
+
+# ── L1-3. 回显服务自身故障：只记观测，绝不判节点死 ───────────────
+@pytest.mark.asyncio
+async def test_l1_target_service_failure_never_kills_the_node(
+    tmp_data_dir, kernel_exe_path, clash_runtime, local_proxies, broken_target
+) -> None:
+    await init_db()
+    await _add(NODE_ACTIVE, "1|香港01", port=local_proxies(broken_target))
+    await _set_exit_ip("1|香港01", "198.51.100.7")
+    base, secret = await _start_kernel(clash_runtime, kernel_exe_path, tmp_data_dir)
+
+    (outcome,) = await _l1(tmp_data_dir, base, secret, LOCAL_EXIT_TARGET)
+
+    assert not outcome.ok
+    assert "TARGET_SERVICE_FAILED" in outcome.detail, (
+        "回显服务 503 必须记成目标服务故障，不能记成节点故障"
+    )
+    assert outcome.exit_ip is None
+
+    node = await _node("1|香港01")
+    assert node.state == NODE_ACTIVE, "L1 失败首版不改 state——否则 ipify 503 会判节点 DEAD"
+    assert node.exit_ip == "198.51.100.7", "一次目标服务故障不得擦掉已观测到的出口事实"
+
+    async with get_session_factory()() as s:
+        obs = (await s.execute(select(HealthObservation))).scalar_one()
+    assert obs.level == "L1" and obs.ok is False and obs.detail
+
+
+# ── L1-4. 成功：落 L1 观测 + 出口 IP，不碰 state 与 L0 字段 ───────
+@pytest.mark.asyncio
+async def test_l1_success_records_observation_and_exit_ip_only(
+    tmp_data_dir, kernel_exe_path, clash_runtime, local_proxies, echoes
+) -> None:
+    await init_db()
+    echo_port, _ = echoes("203.0.113.10")
+    await _add(NODE_ACTIVE, "1|香港01", port=local_proxies(echo_port))
+    base, secret = await _start_kernel(clash_runtime, kernel_exe_path, tmp_data_dir)
+
+    (outcome,) = await _l1(tmp_data_dir, base, secret, LOCAL_EXIT_TARGET)
+
+    assert outcome.ok and outcome.exit_ip == "203.0.113.10"
+    node = await _node("1|香港01")
+    assert node.exit_ip == "203.0.113.10"
+    assert node.state == NODE_ACTIVE, "L1 只记录观测，状态归规则层"
+    assert node.last_l0_at is None, "L1 不得把耗时写进 L0 字段"
+    assert node.capacity_score is None and node.consecutive_failures == 0
+
+    async with get_session_factory()() as s:
+        rows = list((await s.execute(select(HealthObservation))).scalars())
+    assert len(rows) == 1, "L1 不该顺带跑一次 L0（那会污染 L0 的语义）"
+    assert rows[0].level == "L1" and rows[0].ok is True and rows[0].observed_at == NOW
+    assert rows[0].latency_ms is not None, "耗时记录下来，但首版不参与评分"
