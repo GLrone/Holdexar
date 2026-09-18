@@ -22,6 +22,7 @@ PASS / PASS-RULE 共 7 个），数总数会把 M 虚高。
 from __future__ import annotations
 
 import asyncio
+import socket
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -47,10 +48,39 @@ class RuntimeUnreachableError(RuntimeError):
 
 RUNTIME_CONFIG_FILENAME = "crawl-runtime.yaml"
 
+# 运行期专属键（只进运行配置，绝不回流进池文件）
+RUNTIME_MODE = "global"          # L1 靠 GLOBAL 选择器切节点，不需要 proxy-groups
+RUNTIME_BIND_ADDRESS = "127.0.0.1"  # 默认是 '*'：测出口 IP 不该把本机入口开给局域网
+
+
+class RuntimeConfigError(RuntimeError):
+    """运行配置不可用（例如缺 mixed-port）。"""
+
 
 def runtime_config_path(data_dir: Path) -> Path:
     """内核启动配置的路径（与只读的池文件同目录、不同文件）。"""
     return Path(data_dir) / "proxypool" / RUNTIME_CONFIG_FILENAME
+
+
+def _free_local_port() -> int:
+    """让系统分配一个空闲的本机 TCP 端口（L1 的代理入口）。
+
+    首版刻意**不做端口租约**：真撞上时内核会暴露失败（日志里不会出现
+    「Mixed proxy listening」），到真实使用中出现证据再决定要不要做端口管理。
+    """
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def mixed_port_of(data_dir: Path) -> int:
+    """读运行配置里的 mixed-port——L1 要经它发真实请求。"""
+    path = runtime_config_path(data_dir)
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    port = doc.get("mixed-port") if isinstance(doc, Mapping) else None
+    if not isinstance(port, int) or port <= 0:
+        raise RuntimeConfigError(f"运行配置里没有可用的 mixed-port：{path}")
+    return port
 
 
 def prepare_runtime_config(data_dir: Path) -> Path:
@@ -66,8 +96,10 @@ def prepare_runtime_config(data_dir: Path) -> Path:
     - `crawl-runtime.yaml` = 临时、可重建的内核启动配置（控制器等运行期键由
       `ClashRuntime.start()` 注入到这里）。
 
-    只把池里的 `proxies` 搬过来；运行期专属键（mixed-port / log-level /
-    proxy-groups 等）将来要加就加在这一层，不再回头污染池文件。
+    池里的 `proxies` 之外，再写运行期专属键：`mode: global`（L1 靠 GLOBAL 切节点，
+    不需要 proxy-groups）、`allow-lan: false` + `bind-address: 127.0.0.1`（默认是 `*`，
+    测出口 IP 不该把本机代理入口开给局域网）、`mixed-port: <动态空闲端口>`。
+    这些键**只**进运行配置，绝不回流进池文件。
     """
     pool = pool_path(data_dir)
     doc = yaml.safe_load(pool.read_text(encoding="utf-8"))
@@ -77,7 +109,15 @@ def prepare_runtime_config(data_dir: Path) -> Path:
     out = runtime_config_path(data_dir)
     out.parent.mkdir(parents=True, exist_ok=True)
     text = yaml.safe_dump(
-        {"proxies": list(doc["proxies"])}, allow_unicode=True, sort_keys=False
+        {
+            "mode": RUNTIME_MODE,
+            "allow-lan": False,
+            "bind-address": RUNTIME_BIND_ADDRESS,
+            "mixed-port": _free_local_port(),
+            "proxies": list(doc["proxies"]),
+        },
+        allow_unicode=True,
+        sort_keys=False,
     )
     tmp = out.with_suffix(".tmp")
     tmp.write_text(text, encoding="utf-8")
