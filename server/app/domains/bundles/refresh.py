@@ -758,9 +758,24 @@ async def _enqueue_new_bundle_apps() -> tuple[int, int]:
         regions = await enabled_regions()
         if regions:
             try:
-                config = CrawlRunConfig(regions=regions, workers=4)
-                stats = await run_crawl(crawl_pairs, config=config)
-                logger.info("[bundles] 新 appid 爬取完成：%s", {k: v for k, v in stats.items() if k != "elapsed_seconds"})
+                # 与 crawl 域同一条约束：每次 run 取一次当前 Runtime 地址；拿不到就
+                # **不启动**这次 run，绝不退回直连/旧订阅代理（占位行已落库，回补层消化）。
+                from app.core.config import get_settings as _get_settings
+                from app.domains.proxypool.runtime import current_runtime_proxy_url
+
+                proxy_url = current_runtime_proxy_url(
+                    _get_settings().data_dir
+                )
+                if proxy_url is None:
+                    logger.warning(
+                        "[bundles] 代理运行时不可用：本次新 appid 爬取未启动（不退回直连）"
+                    )
+                else:
+                    config = CrawlRunConfig(
+                        regions=regions, workers=4, proxy_url=proxy_url
+                    )
+                    stats = await run_crawl(crawl_pairs, config=config)
+                    logger.info("[bundles] 新 appid 爬取完成：%s", {k: v for k, v in stats.items() if k != "elapsed_seconds"})
             except Exception as e:  # noqa: BLE001
                 logger.warning("[bundles] 新 appid 爬取任务失败（占位行已落库，回补层会消化）: %s", e)
     return len(crawl_pairs), skipped

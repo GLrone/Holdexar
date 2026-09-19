@@ -431,6 +431,200 @@ async def test_maintenance_restores_global_from_current_pool(
     assert await _global_now(base, secret) == "1|A"
 
 
+# ══ P1.6-C：接线（cycle / 两个注入点 / fail closed）══════════════
+async def _cycle(session, data_dir, base, secret, runtime, exe, **kw):
+    from app.domains.proxypool.scheduling import run_proxypool_cycle
+
+    return await run_proxypool_cycle(
+        session, data_dir=data_dir, controller_url=base, secret=secret,
+        runtime=runtime, exe_path=str(exe), now=NOW,
+        l0_target_url=kw.get("l0_target_url"),
+        l1_url=kw.get("l1_url"), l2_url=kw.get("l2_url"),
+    )
+
+
+# ── 8. Scheduler 实际调用 proxypool cycle（单 job）────────────────
+@pytest.mark.asyncio
+async def test_scheduler_job_calls_proxypool_cycle(tmp_data_dir, monkeypatch) -> None:
+    from app.core import scheduler as core_scheduler
+    from app.domains.proxypool import scheduling as sched
+
+    await init_db()
+    await _add("1|A", port=_free_port())
+    async with get_session_factory()() as s:
+        await build_pool(s, data_dir=tmp_data_dir)
+    prepare_runtime_config(tmp_data_dir)      # 前置条件：池 Runtime 配置存在
+
+    calls: list[dict] = []
+
+    async def _fake_cycle(session, **kwargs):
+        calls.append(kwargs)
+        return sched.ProxypoolCycleResult(
+            l0=(), busy=False, rebuilt=None, maintenance=None
+        )
+
+    monkeypatch.setattr(sched, "run_proxypool_cycle", _fake_cycle)
+    await core_scheduler._job_proxypool_cycle()
+
+    assert calls and calls[0]["data_dir"] == tmp_data_dir
+
+
+# ── 9/10. 占线：L0 照跑改状态 + pending，但不重建/不 L1/L2 ────────
+@pytest.mark.asyncio
+async def test_cycle_while_busy_only_runs_l0(
+    tmp_data_dir, kernel_exe_path, proxy_runtime, redirect_proxies, probe_echo
+) -> None:
+    await init_db()
+    await _add("1|A", port=redirect_proxies(probe_echo))
+    await _add("1|B", port=redirect_proxies(probe_echo))
+    await _add("1|C", port=_free_port())
+    base, secret = await _boot(proxy_runtime, kernel_exe_path, tmp_data_dir)
+    pid_before, port_before = proxy_runtime.process.pid, proxy_runtime.port
+
+    begin_crawl("test-crawl")
+    async with get_session_factory()() as s:
+        result = await _cycle(
+            s, tmp_data_dir, base, secret, proxy_runtime, kernel_exe_path,
+            l0_target_url="http://probe.invalid/ip",
+            l1_url="http://probe.invalid/ip", l2_url="http://probe.invalid/browse",
+        )
+        await s.commit()
+    end_crawl()
+
+    assert await _state_of("1|C") == NODE_DEAD
+    assert rebuild_pending() is True
+    assert result.busy is True
+    assert result.rebuilt is None and result.maintenance is None, "占线时不重建、不 L1/L2"
+    assert proxy_runtime.process.pid == pid_before and proxy_runtime.port == port_before
+
+
+# ── 11/12. 空闲：消费 pending 真重建，之后才 L1/L2 并恢复 GLOBAL ──
+@pytest.mark.asyncio
+async def test_cycle_when_idle_rebuilds_then_maintains(
+    tmp_data_dir, kernel_exe_path, proxy_runtime, redirect_proxies, probe_echo
+) -> None:
+    await init_db()
+    await _add("1|A", port=redirect_proxies(probe_echo))
+    await _add("1|B", port=redirect_proxies(probe_echo))
+    await _add("1|C", port=_free_port())
+    base, secret = await _boot(proxy_runtime, kernel_exe_path, tmp_data_dir)
+    assert await _select(base, secret, "1|B") == "1|B"
+    old_port = proxy_runtime.port
+
+    async with get_session_factory()() as s:
+        first = await _cycle(
+            s, tmp_data_dir, base, secret, proxy_runtime, kernel_exe_path,
+            l0_target_url="http://probe.invalid/ip",
+            l1_url="http://probe.invalid/ip", l2_url="http://probe.invalid/browse",
+        )
+        await s.commit()
+
+    assert first.busy is False
+    assert first.rebuilt is not None, "空闲时该消费 pending 真重建"
+    assert first.rebuilt.mixed_port != old_port
+    assert first.rebuilt.selection == "1|B", "重建必须恢复 GLOBAL"
+    assert first.maintenance is not None
+    assert first.maintenance.selection == "1|B", "维护结束仍要是 B（只观察）"
+    assert await _global_now(first.rebuilt.controller_url, secret) == "1|B"
+    assert rebuild_pending() is False
+
+
+# ── 13/14. 两个 production run 拿到当前 Runtime（每 run 只取一次）──
+@pytest.mark.asyncio
+async def test_crawl_service_injects_current_runtime_per_run(
+    tmp_data_dir, kernel_exe_path, proxy_runtime, monkeypatch
+) -> None:
+    """run A 全程用端口 X；重建后 run B 用端口 Y——**不是** worker 各自取。"""
+    from app.domains.crawl import service as cs
+
+    await init_db()
+    await _add("1|A", port=_free_port())
+    base, secret = await _boot(proxy_runtime, kernel_exe_path, tmp_data_dir)
+    port_x = proxy_runtime.port
+
+    captured: list[str | None] = []
+
+    async def _stub_run_crawl(pairs, *, config, stop_event=None, pre_tasks=None):
+        captured.append(config.proxy_url)
+        return {"total": 1, "processed": 1, "success": 1, "failed": 0}
+
+    async def _regions(regions=None):
+        return regions or ["us"]
+
+    monkeypatch.setattr(cs, "run_crawl", _stub_run_crawl)
+    monkeypatch.setattr(cs, "effective_regions", _regions)
+
+    await cs.start_job(scope="appids", appids=[220], regions=["us"], kind="manual")
+    await cs._active.task
+    assert captured[-1] == f"http://127.0.0.1:{port_x}"
+
+    async with get_session_factory()() as s:
+        await rebuild_runtime(
+            s, data_dir=tmp_data_dir, controller_url=base, secret=secret,
+            runtime=proxy_runtime, exe_path=str(kernel_exe_path),
+        )
+        await s.commit()
+    port_y = proxy_runtime.port
+    assert port_y != port_x
+
+    await cs.start_job(scope="appids", appids=[220], regions=["us"], kind="manual")
+    await cs._active.task
+    assert captured[-1] == f"http://127.0.0.1:{port_y}", "新 run 必须用新端口"
+    assert len(set(captured)) == 2
+
+
+# ── 15/16. bundles 注入 + 两条路径 fail closed ───────────────────
+@pytest.mark.asyncio
+async def test_bundles_path_injects_runtime_and_fails_closed(
+    tmp_data_dir, kernel_exe_path, proxy_runtime, monkeypatch
+) -> None:
+    from app.domains.bundles import refresh as rf
+    from app.domains.games.models import Bundle
+    from app.domains.proxypool.runtime import RuntimeUnavailableError
+    from app.domains.crawl import service as cs
+
+    await init_db()
+    await _add("1|A", port=_free_port())
+    async with get_session_factory()() as s:
+        s.add(Bundle(bundle_id=900001, name="test-bundle", app_ids=[220]))
+        await s.commit()
+
+    captured: list[str | None] = []
+
+    async def _stub_run_crawl(pairs, *, config, stop_event=None, pre_tasks=None):
+        captured.append(config.proxy_url)
+        return {"total": 1, "processed": 1, "success": 1, "failed": 0}
+
+    async def _fake_type(*a, **k):
+        return ("game", "Test Game")
+
+    async def _regions(*a, **k):
+        return ["us"]
+
+    monkeypatch.setattr(rf, "_fetch_app_type", _fake_type)
+    monkeypatch.setattr("app.crawler.runner.run_crawl", _stub_run_crawl)
+    monkeypatch.setattr("app.domains.regions.service.enabled_regions", _regions)
+
+    # ① 没有池 Runtime → 拒绝启动（不直连、不退旧订阅代理）
+    await rf._enqueue_new_bundle_apps()
+    assert captured == [], "拿不到 Runtime 时不得启动 run"
+
+    # ② 有 Runtime → 注入当前地址
+    base, secret = await _boot(proxy_runtime, kernel_exe_path, tmp_data_dir)
+    await rf._enqueue_new_bundle_apps()
+    assert captured == [f"http://127.0.0.1:{proxy_runtime.port}"]
+
+    # ③ crawl 域同样 fail closed
+    async def _regions2(regions=None):
+        return regions or ["us"]
+
+    monkeypatch.setattr(cs, "effective_regions", _regions2)
+    monkeypatch.setattr(cs, "run_crawl", _stub_run_crawl)
+    proxy_runtime.stop()                       # Runtime 不可用
+    with pytest.raises(RuntimeUnavailableError):
+        await cs.start_job(scope="appids", appids=[220], regions=["us"])
+
+
 # ══ 6. 与老订阅 Runtime 真正隔离 ═════════════════════════════════
 @pytest.mark.asyncio
 async def test_proxypool_rebuild_leaves_subscription_runtime_alone(
