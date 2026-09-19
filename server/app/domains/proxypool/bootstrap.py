@@ -100,18 +100,26 @@ async def subscription_sources(session: AsyncSession) -> list[ProxySubscription]
 
 
 async def sync_subscriptions(
-    session: AsyncSession, *, data_dir: Path, now: datetime
+    session: AsyncSession, *, data_dir: Path, now: datetime,
+    kernel_proxy: str | None = None,
+    pool_proxy: str | None = None,
 ) -> SyncResult:
-    """订阅 → 快照 → Registry。**Runtime 层不参与，也拿不到 subscription URL。**"""
+    """订阅 → 快照 → Registry。**Runtime 层不参与，也拿不到 subscription URL。**
+
+    抓取走既有通道链语义：`direct → kernel_proxy → pool_proxy`。直连被墙/超时是常态，
+    所以 kernel_proxy（现有 Mihomo 内核的代理）是真实可用的第二通道——但它**只是订阅
+    获取的辅助通道**，绝不是 crawler 的代理，也不构成 proxypool Runtime 的回退。
+    """
     subs = await subscription_sources(session)
     before = await eligible_runtime_names(session)
     shas: dict[int, str] = {}
     counts: dict[int, int] = {}
     failures: dict[int, str] = {}
+    channels = build_channels(kernel_proxy=kernel_proxy, pool_proxy=pool_proxy)
 
     for sub in subs:
         try:
-            result = await fetch_subscription(str(sub.url), build_channels())
+            result = await fetch_subscription(str(sub.url), channels)
             nodes = parse_nodes(result.raw, result.fmt)
             snap = build_snapshot(sub.id, str(sub.url), result, nodes, now=now)
             await persist_snapshot(session, snap, data_dir=data_dir)
@@ -119,10 +127,11 @@ async def sync_subscriptions(
                 session, subscription_id=sub.id, snapshot=snap, now=now
             )
         except Exception as exc:  # noqa: BLE001 —— 单条订阅失败不阻断其它
-            failures[sub.id] = type(exc).__name__
+            message = str(exc)[:500] or type(exc).__name__
+            failures[sub.id] = message
             sub.last_fetch_at = now
             sub.last_fetch_status = "FAILED"
-            sub.last_error = str(exc)[:500]
+            sub.last_error = message
             continue
 
         # 投影必须在**快照落库成功之后**；事实源始终是 subscription_snapshots.sha256
@@ -181,6 +190,38 @@ def _artifact_names(data_dir: Path) -> tuple[str, ...]:
     return tuple(str(p["name"]) for p in doc.get("proxies", []) if isinstance(p, dict))
 
 
+def default_kernel_proxy() -> str | None:
+    """现有 Mihomo 内核（老 Clash）的混合入口——**仅作订阅获取的第二通道**。
+
+    直连被墙/超时是常态，而老 Clash 往往已经能出网。注意边界：它只是"帮我们下载订阅"
+    的外部条件，**不是 crawler 的代理**，也不构成 proxypool Runtime 的回退。
+    """
+    try:
+        from app.domains.proxies import clash_manager
+
+        status = clash_manager.runtime.status()
+        if status.get("running") and status.get("port"):
+            return f"http://127.0.0.1:{status['port']}"
+    except Exception:  # noqa: BLE001 —— 老 Clash 不在也不影响直连通道
+        return None
+    return None
+
+
+async def _no_pool_reason(session: AsyncSession, sync: SyncResult | None) -> str:
+    """"建不起来"的**真实原因**——三种情况不能混成同一句模糊话。"""
+    subs = await subscription_sources(session)
+    if not subs:
+        return "没有可 bootstrap 的订阅（proxy_subscriptions 里没有 clash 订阅）"
+    if sync is not None and sync.failures:
+        detail = "；".join(
+            f"sub {sid}: {msg}" for sid, msg in sorted(sync.failures.items())
+        )
+        return f"订阅抓取失败：{detail}"
+    if sync is not None and sync.subscription_count:
+        return "订阅抓取成功但没有产出可用节点（解析结果为空）"
+    return "无可用节点：无法 bootstrap"
+
+
 async def ensure_pool_runtime(
     session: AsyncSession, *,
     data_dir: Path,
@@ -189,6 +230,8 @@ async def ensure_pool_runtime(
     now: datetime,
     wait_timeout: float = DEFAULT_WAIT_TIMEOUT,
     skip_sync: bool = False,
+    kernel_proxy: str | None = None,
+    pool_proxy: str | None = None,
 ) -> BootstrapResult:
     """幂等原语：**只有没有可用 Runtime 时**才 bootstrap。
 
@@ -211,12 +254,19 @@ async def ensure_pool_runtime(
                 await eligible_runtime_names(session), "已有可用 Runtime（等锁期间建好）",
             )
 
+        sync: SyncResult | None = None
         if not skip_sync:
-            await sync_subscriptions(session, data_dir=data_dir, now=now)
+            sync = await sync_subscriptions(
+                session, data_dir=data_dir, now=now,
+                kernel_proxy=(
+                    default_kernel_proxy() if kernel_proxy is None else kernel_proxy
+                ),
+                pool_proxy=pool_proxy,
+            )
         if not await eligible_runtime_names(session):
             return BootstrapResult(
                 False, False, None, None, (),
-                "无可用节点/无订阅：无法 bootstrap（crawler 保持不可用）",
+                await _no_pool_reason(session, sync),
             )
 
         build = await build_pool(session, data_dir=data_dir)

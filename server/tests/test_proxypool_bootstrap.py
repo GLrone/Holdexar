@@ -229,7 +229,9 @@ async def test_no_subscription_cannot_bootstrap(tmp_data_dir, kernel_exe_path,
     result = await _ensure(tmp_data_dir, pool_runtime, kernel_exe_path)
 
     assert result.ready is False and result.bootstrapped is False
-    assert "无法 bootstrap" in result.detail
+    # 与"有订阅但抓取失败"必须是**不同**的原因（真实运行诊断需要区分）
+    assert "没有可 bootstrap 的订阅" in result.detail
+    assert "订阅抓取失败" not in result.detail
     with pytest.raises(Exception, match="代理运行时不可用"):
         require_runtime_proxy_url(tmp_data_dir)
 
