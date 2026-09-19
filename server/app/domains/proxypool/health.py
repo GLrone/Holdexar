@@ -43,6 +43,7 @@ import yaml
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.crawler.browse_store import StoreBrowseAPI, _to_int
 from app.domains.proxypool.models import HealthObservation, ProxyNode, ProxyNodeSource
 from app.domains.proxypool.pool import pool_path
 from app.domains.proxypool.runtime import mixed_port_of
@@ -65,6 +66,27 @@ DEFAULT_L1_TIMEOUT = 15.0
 NODE_PROBE_FAILED = "NODE_PROBE_FAILED"
 TARGET_SERVICE_FAILED = "TARGET_SERVICE_FAILED"
 INVALID_IP_RESPONSE = "INVALID_IP_RESPONSE"
+
+# ── L2：生产业务（StoreBrowse）────────────────────────────────────
+L2_LEVEL = "L2"
+DEFAULT_L2_TIMEOUT = 30.0
+BUSINESS_OK = "BUSINESS_OK"
+INVALID_BUSINESS_RESPONSE = "INVALID_BUSINESS_RESPONSE"
+# 与 crawler 生产探测同一个 appid / 区服（Half-Life 2，长期在售）
+DEFAULT_BUSINESS_APPID = 220
+BUSINESS_CC = "us"
+
+
+def business_probe_url(appid: int = DEFAULT_BUSINESS_APPID,
+                       cc: str = BUSINESS_CC) -> str:
+    """L2 的业务目标：**直接复用** crawler 的 StoreBrowse 契约。
+
+    不在这里另建一套 URL / 参数：生产打的是 `IStoreBrowseService/GetItems`
+    （`api.steampowered.com`），而旧探针打 `store.steampowered.com/api/appdetails`
+    ——两者不是同一个主机，可达性并不一致。若健康检测自己维护一套，crawler 改了
+    请求之后检测不会跟着改，就会出现「健康绿、真实 crawler 红」。
+    """
+    return StoreBrowseAPI.probe_url(cc, appid)
 
 NOT_FOUND_DETAIL = "内核里没有这个节点：名字没定位到（HTTP 404）"
 PROBE_FAILED_DETAIL = "内核探测失败"
@@ -248,6 +270,34 @@ def _extract_ip(text: str) -> str | None:
         return None
 
 
+async def _select_global(controller_url: str, secret: str, runtime_name: str,
+                         timeout: float) -> str | None:
+    """把 `GLOBAL` 切到指定节点。成功返回 None，失败返回 detail。
+
+    回读 `now` 是**归因正确性**的保证：若此刻 `GLOBAL` 不是目标节点，接下来测到的
+    任何东西都不属于它——宁可记失败，也不能把它人的结果记到这个节点名下。
+    L1 与 L2 共用这一步：切换是唯一的全局状态，两处逻辑必须一致。
+    """
+    headers = {"Authorization": f"Bearer {secret}"} if secret else {}
+    async with httpx.AsyncClient(timeout=timeout, headers=headers) as control:
+        try:
+            put = await control.put(
+                f"{controller_url}/proxies/GLOBAL", json={"name": runtime_name}
+            )
+            if put.status_code >= 400:
+                return (f"{NODE_PROBE_FAILED}: 选择节点失败"
+                        f"（HTTP {put.status_code}）")
+            now = (await control.get(
+                f"{controller_url}/proxies/GLOBAL")).json().get("now")
+        except Exception as exc:  # noqa: BLE001
+            return f"{NODE_PROBE_FAILED}: 控制器不可达（{type(exc).__name__}）"
+
+    if now != runtime_name:
+        return (f"{NODE_PROBE_FAILED}: GLOBAL 的 now={now!r} "
+                f"不是 {runtime_name!r}")
+    return None
+
+
 async def probe_exit_ip(
     controller_url: str,
     secret: str,
@@ -261,28 +311,9 @@ async def probe_exit_ip(
     **必须串行调用**：`GLOBAL` 是全局选择器，切换是全局状态；并发探测会让
     「这个出口 IP 属于哪个节点」不可信。这是测量正确性问题，不是性能问题。
     """
-    headers = {"Authorization": f"Bearer {secret}"} if secret else {}
-    async with httpx.AsyncClient(timeout=timeout, headers=headers) as control:
-        try:
-            put = await control.put(
-                f"{controller_url}/proxies/GLOBAL", json={"name": runtime_name}
-            )
-            if put.status_code >= 400:
-                return ExitIpResult(runtime_name, False, None,
-                                    f"{NODE_PROBE_FAILED}: 选择节点失败"
-                                    f"（HTTP {put.status_code}）", None)
-            now = (await control.get(
-                f"{controller_url}/proxies/GLOBAL")).json().get("now")
-        except Exception as exc:  # noqa: BLE001
-            return ExitIpResult(runtime_name, False, None,
-                                f"{NODE_PROBE_FAILED}: 控制器不可达"
-                                f"（{type(exc).__name__}）", None)
-
-    if now != runtime_name:
-        # 归因不成立：此刻测到的 IP 不属于这个节点。宁可记失败，也不能记错归属。
-        return ExitIpResult(runtime_name, False, None,
-                            f"{NODE_PROBE_FAILED}: GLOBAL 的 now={now!r} "
-                            f"不是 {runtime_name!r}", None)
+    failure = await _select_global(controller_url, secret, runtime_name, timeout)
+    if failure is not None:
+        return ExitIpResult(runtime_name, False, None, failure, None)
 
     started = time.monotonic()
     try:
@@ -351,6 +382,180 @@ async def exit_ip_check_pool(
             runtime_name=name,
             ok=result.ok,
             exit_ip=result.exit_ip,
+            detail=result.detail,
+            latency_ms=result.latency_ms,
+        ))
+
+    await session.flush()
+    return tuple(outcomes)
+
+
+# ══ L2：生产业务可用性 ═══════════════════════════════════════════
+# 回答的是「这个节点能不能真正完成 Holdexar 生产所需的 StoreBrowse 请求」：
+# HTTP 200 只是及格线，还要业务语义成立（信封 / AppID / success / 价格字段）。
+#
+# 判据全部取自**生产实测**，不是猜的：
+# - `success` 是整数 `1`（**不是布尔 true**）——所以这里显式拒绝 bool；
+# - `final_price_in_cents` 是**字符串** `"999"`——所以按 crawler 的 `_to_int` 语义
+#   解析，而不是要求 int。
+#
+# 与 L1 一致：**只记录观测，不碰 `state`、不擦 `exit_ip`、不碰 L0/L1 的时间戳**。
+# 业务目标 503 不得变成节点 DEAD——否则就是让外部业务服务的健康决定代理池的健康。
+
+
+@dataclass(frozen=True)
+class BusinessResult:
+    runtime_name: str
+    ok: bool
+    http_status: int | None
+    final_price_in_cents: int | None
+    detail: str
+    latency_ms: int | None
+
+
+@dataclass(frozen=True)
+class BusinessOutcome:
+    node_id: str
+    runtime_name: str
+    ok: bool
+    http_status: int | None
+    final_price_in_cents: int | None
+    detail: str
+    latency_ms: int | None
+
+
+def _validate_business(payload, appid: int) -> tuple[bool, str, int | None]:
+    """按生产 StoreBrowse 契约判定业务语义。返回 (是否成功, 不满足的原因, 价格)。"""
+    if not isinstance(payload, dict):
+        return False, "响应不是 JSON 对象", None
+    envelope = payload.get("response")
+    if not isinstance(envelope, dict):
+        return False, "缺少 response 信封", None
+    items = envelope.get("store_items")
+    if not isinstance(items, list):
+        return False, "store_items 不是 list", None
+
+    item = None
+    for candidate in items:
+        if not isinstance(candidate, dict):
+            continue
+        if appid in (_to_int(candidate.get("appid")), _to_int(candidate.get("id"))):
+            item = candidate
+            break
+    if item is None:
+        return False, f"store_items 里没有 appid={appid}", None
+
+    success = item.get("success")
+    # 生产实测是整数 1；布尔 true 属于契约不符（True == 1 会蒙混过关，故显式拒绝）
+    if isinstance(success, bool) or success != 1:
+        return False, f"success 不是整数 1（实际 {success!r}）", None
+
+    best = item.get("best_purchase_option")
+    if not isinstance(best, dict):
+        return False, "缺少 best_purchase_option", None
+
+    final = _to_int(best.get("final_price_in_cents"))
+    if final is None:
+        return False, ("final_price_in_cents 无法按 _to_int 语义解析"
+                       f"（实际 {best.get('final_price_in_cents')!r}）"), None
+    return True, "", final
+
+
+async def probe_business(
+    controller_url: str,
+    secret: str,
+    mixed_port: int,
+    runtime_name: str, *,
+    url: str | None = None,
+    appid: int = DEFAULT_BUSINESS_APPID,
+    timeout: float = DEFAULT_L2_TIMEOUT,
+) -> BusinessResult:
+    """选中该节点，经 mixed-port 打一次**生产 StoreBrowse** 业务请求。
+
+    `url` 不传就用 `business_probe_url(appid)`（与 crawler 同一契约）；测试传本地目标。
+    **必须串行调用**（同 L1：`GLOBAL` 是全局状态）。
+    """
+    target = url or business_probe_url(appid)
+
+    failure = await _select_global(controller_url, secret, runtime_name, timeout)
+    if failure is not None:
+        return BusinessResult(runtime_name, False, None, None, failure, None)
+
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(
+            proxy=f"http://127.0.0.1:{mixed_port}", timeout=timeout
+        ) as proxied:
+            resp = await proxied.get(target)
+    except Exception as exc:  # noqa: BLE001 —— 传输失败不归因给节点
+        return BusinessResult(runtime_name, False, None, None,
+                              f"{TARGET_SERVICE_FAILED}: {type(exc).__name__}", None)
+    latency_ms = int((time.monotonic() - started) * 1000)
+
+    if resp.status_code != 200:
+        return BusinessResult(runtime_name, False, resp.status_code, None,
+                              f"{TARGET_SERVICE_FAILED}: HTTP {resp.status_code}",
+                              latency_ms)
+    try:
+        payload = resp.json()
+    except ValueError:
+        return BusinessResult(runtime_name, False, 200, None,
+                              f"{INVALID_BUSINESS_RESPONSE}: 响应不是 JSON",
+                              latency_ms)
+
+    ok, reason, final = _validate_business(payload, appid)
+    if not ok:
+        return BusinessResult(runtime_name, False, 200, None,
+                              f"{INVALID_BUSINESS_RESPONSE}: {reason}", latency_ms)
+    return BusinessResult(
+        runtime_name, True, 200, final,
+        f"{BUSINESS_OK} appid={appid} final_price_in_cents={final}", latency_ms
+    )
+
+
+async def business_check_pool(
+    session: AsyncSession, *,
+    data_dir: Path,
+    controller_url: str,
+    secret: str,
+    now: datetime,
+    url: str | None = None,
+    appid: int = DEFAULT_BUSINESS_APPID,
+    timeout: float = DEFAULT_L2_TIMEOUT,
+) -> tuple[BusinessOutcome, ...]:
+    """对池内节点**串行**做一次 L2 业务观测。
+
+    只写 `HealthObservation(level="L2")`：不改 `state`、不擦 `exit_ip`、
+    不碰 `last_l0_at` / `last_l1_at` / `capacity_score`。
+    """
+    names = _pool_names(data_dir)
+    mixed_port = mixed_port_of(data_dir)
+    rows = await session.execute(
+        select(ProxyNode).where(ProxyNode.runtime_name.in_(names))
+    )
+    by_name = {row.runtime_name: row for row in rows.scalars()}
+
+    outcomes: list[BusinessOutcome] = []
+    for name in names:  # 严格串行（见 probe_business）
+        node = by_name.get(name)
+        if node is None:
+            continue
+        result = await probe_business(controller_url, secret, mixed_port, name,
+                                      url=url, appid=appid, timeout=timeout)
+        session.add(HealthObservation(
+            node_id=node.node_id,
+            level=L2_LEVEL,
+            ok=result.ok,
+            latency_ms=result.latency_ms,
+            detail=result.detail or None,
+            observed_at=now,
+        ))
+        outcomes.append(BusinessOutcome(
+            node_id=node.node_id,
+            runtime_name=name,
+            ok=result.ok,
+            http_status=result.http_status,
+            final_price_in_cents=result.final_price_in_cents,
             detail=result.detail,
             latency_ms=result.latency_ms,
         ))
