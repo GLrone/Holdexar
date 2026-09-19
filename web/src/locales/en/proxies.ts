@@ -181,7 +181,7 @@ const proxies: Partial<Record<MessageKey, string>> = {
   'proxies.jobs.stat.partial': 'Partial',
   'proxies.jobs.stat.failed': 'Failed',
   'proxies.jobs.stat.avgDuration': 'Avg duration',
-  'proxies.jobs.stat.poolExitIp': 'Pool exit IPs (unique)',
+  'proxies.jobs.stat.poolExitIp': 'Latest pool exit IPs (unique)',
   'proxies.jobs.col.time': 'Time',
   'proxies.jobs.col.status': 'Status',
   'proxies.jobs.col.tasks': 'Tasks',

@@ -269,6 +269,8 @@ class ProxyJobRun(Base):
 
     - **不按 HTTP 请求记账**。爬虫的计量单位是「任务 = 一区 × 一批 ≤400 appid」
       （`CrawlerScheduler.counts()`），所以字段是 `task_count`，不是 request_count。
+      `task_count` 的口径是**计划任务数**（`scheduler.total_target`）：中断的作业里
+      它可以大于 `success_count + error_count`（计划 2、完成 1 就记 2/1/0）。
     - 本轮运行时的身份是 `proxy_url`（`http://127.0.0.1:<mixed-port>`）+ `pool_sha256`
       （池文件内容哈希）——**没有 runtime_name，也没有写进库的 pool_generation**
       （`pool_generations` 至今无写入方），照实记能记到的。

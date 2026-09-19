@@ -188,7 +188,7 @@ const proxies = {
   'proxies.jobs.stat.partial': '部分失败',
   'proxies.jobs.stat.failed': '失败',
   'proxies.jobs.stat.avgDuration': '平均耗时',
-  'proxies.jobs.stat.poolExitIp': '池出口 IP（去重）',
+  'proxies.jobs.stat.poolExitIp': '最近一次池出口 IP（去重）',
   'proxies.jobs.col.time': '时间',
   'proxies.jobs.col.status': '状态',
   'proxies.jobs.col.tasks': '任务',
