@@ -105,14 +105,28 @@ def render_pool(nodes: Sequence[ProxyNode]) -> tuple[str, tuple[str, ...]]:
     return text, names
 
 
-async def build_pool(session: AsyncSession, *, data_dir: Path) -> PoolBuild:
-    """读 Registry → 渲染 → 三门禁 → 落盘 → 复读。"""
+async def eligible_nodes(session: AsyncSession) -> list[ProxyNode]:
+    """当前合格节点（池的输入集）。**只读、不落盘**。
+
+    维护事务要回答"此刻池里还有谁"（例如恢复 GLOBAL 时要判断原节点是否已出池），
+    不能为此写一次池文件——落盘是 `build_pool` 的职责。
+    """
     rows = await session.execute(
         select(ProxyNode)
         .where(ProxyNode.state.in_(sorted(POOL_ELIGIBLE_STATES)))
         .order_by(ProxyNode.id)
     )
-    eligible = [node for node in rows.scalars() if _is_complete(node)]
+    return [node for node in rows.scalars() if _is_complete(node)]
+
+
+async def eligible_runtime_names(session: AsyncSession) -> tuple[str, ...]:
+    """合格节点的运行名（顺序与 `build_pool` 一致：按主键）。"""
+    return tuple(node.runtime_name for node in await eligible_nodes(session))
+
+
+async def build_pool(session: AsyncSession, *, data_dir: Path) -> PoolBuild:
+    """读 Registry → 渲染 → 三门禁 → 落盘 → 复读。"""
+    eligible = await eligible_nodes(session)
     expected_count = len(eligible)
 
     text, names = render_pool(eligible)
