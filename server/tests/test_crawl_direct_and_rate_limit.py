@@ -121,33 +121,52 @@ async def _seed_target(db):
 
 
 @pytest.mark.asyncio
-async def test_start_job_direct_without_proxy(db, monkeypatch):
-    """无任何代理配置（无订阅/无节点/无本地端口）→ 任务照常启动
-    ——直连是标准形态，不再有代理前置条件。"""
+async def test_start_job_without_runtime_refuses_to_start(db, monkeypatch):
+    """受管爬取改为 fail closed：拿不到池 Runtime 就拒绝启动。
+
+    旧契约（"无代理 → 直连是标准形态"）已被 P1.6-C 取代：静默退直连会把"池坏了"
+    伪装成"爬取成功"。此测试随契约一起改，不是被删。
+    """
+    import app.domains.proxypool.runtime as pp_runtime
+    from app.domains.proxypool.runtime import RuntimeUnavailableError
+
     _crawl_env(monkeypatch)
-    result = await crawl_service.start_job(
-        scope="appids", appids=[998001], kind="scheduled"
-    )
-    assert result["count"] == 1
-    assert crawl_service._active is not None
-    await crawl_service._active.task
+    # 确定性：不看本机是否有池 Runtime，直接声明"不可用"
+    monkeypatch.setattr(pp_runtime, "current_runtime_proxy_url", lambda _d=None: None)
+    with pytest.raises(RuntimeUnavailableError):
+        await crawl_service.start_job(
+            scope="appids", appids=[998001], kind="scheduled"
+        )
+    assert crawl_service._active is None, "拒绝启动不得留下活动任务"
 
 
 @pytest.mark.asyncio
-async def test_run_sequential_runs_all_specs_without_proxy(db, monkeypatch):
-    """run_sequential 无代理时每个 spec 都正常启动（不再整链拦空）。"""
+async def test_run_sequential_without_runtime_starts_nothing(db, monkeypatch):
+    """无池 Runtime 时每个 spec 都启动不了（不再整链放行直连）。"""
+    import app.domains.proxypool.runtime as pp_runtime
+
     _crawl_env(monkeypatch)
+    monkeypatch.setattr(pp_runtime, "current_runtime_proxy_url", lambda _d=None: None)
     results = await crawl_service.run_sequential(
         [{"scope": "appids", "appids": [998001], "kind": "scheduled"}],
     )
-    assert len(results) == 1
+    assert results == []
+    assert crawl_service._active is None  # 链尾已清
     assert crawl_service._active is None  # 链尾已清
 
 
 @pytest.mark.asyncio
-async def test_repair_job_runs_without_proxy(db, monkeypatch):
-    """修复轮（5min 空闲档）无代理 → 照常启动 kind=repair job。"""
+async def test_repair_job_runs_with_runtime(db, monkeypatch):
+    """修复轮（5min 空闲档）在**有池 Runtime** 时照常启动 kind=repair job。
+
+    P1.6-C 起爬取前置条件变成"池 Runtime 可用"，所以这里给一个确定性的可用运行时；
+    "拿不到就拒绝"由 fail-closed 那两条覆盖。
+    """
+    import app.domains.proxypool.runtime as pp_runtime
+
     _crawl_env(monkeypatch)
+    monkeypatch.setattr(pp_runtime, "current_runtime_proxy_url",
+                        lambda _d=None: "http://127.0.0.1:1")
     await _seed_target(db)
     sched_mod._price_cycle_busy = False
     crawl_service._active = None
@@ -157,14 +176,18 @@ async def test_repair_job_runs_without_proxy(db, monkeypatch):
         rows = (await session.execute(
             __import__("sqlalchemy").select(CrawlJob)
         )).scalars().all()
-    assert [r.kind for r in rows] == ["repair"], "无代理时修复轮同样要能启动"
+    assert [r.kind for r in rows] == ["repair"], "有池 Runtime 时修复轮要能启动"
 
 
 @pytest.mark.asyncio
-async def test_price_refresh_runs_without_proxy(db, monkeypatch):
-    """主价格刷新轮无代理 → 两层链照常（missing 层启动），
+async def test_price_refresh_runs_with_runtime(db, monkeypatch):
+    """主价格刷新轮（有池 Runtime）两层链照常（missing 层启动），
     链尾捆绑包存量刷新跟进；重锚照常执行。"""
+    import app.domains.proxypool.runtime as pp_runtime
+
     _crawl_env(monkeypatch)
+    monkeypatch.setattr(pp_runtime, "current_runtime_proxy_url",
+                        lambda _d=None: "http://127.0.0.1:1")
     bundle_calls: list = []
     _stub_bundles_refresh(monkeypatch, bundle_calls)
     await _seed_target(db)
@@ -179,8 +202,8 @@ async def test_price_refresh_runs_without_proxy(db, monkeypatch):
             __import__("sqlalchemy").select(CrawlJob)
         )).scalars().all()
     kinds = [r.kind for r in rows]
-    assert "missing" in kinds, f"无代理时主轮 missing 层同样应启动：{kinds}"
-    assert bundle_calls, "无代理时链尾捆绑包存量刷新同样应执行"
+    assert "missing" in kinds, f"有池 Runtime 时主轮 missing 层应启动：{kinds}"
+    assert bundle_calls, "链尾捆绑包存量刷新应执行"
     assert sched_mod._price_cycle_busy is False, "busy 必须正常复位"
 
 
