@@ -253,6 +253,11 @@ def _crawler_idle() -> bool:
     """
     if _price_cycle_busy:
         return False
+    from app.crawler.occupancy import crawler_busy
+
+    # 统一占用：任何生产爬取（含 bundles 直调 run_crawl）都算"爬虫未结束工作"
+    if crawler_busy():
+        return False
     from app.domains.crawl import service as crawl_service
 
     handle = crawl_service._active

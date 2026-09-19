@@ -478,6 +478,12 @@ async def start_job(
     missing_cooldown 显式传值时覆盖 missing/repair 两类冷却。
     """
     global _active
+    from app.crawler.occupancy import crawler_busy
+
+    # 统一占用语义：bundles 链尾是直调 run_crawl 的（不登记 _active），只看
+    # _active 会漏掉它。在创建 job 之前就挡，避免留下一条"注定失败"的任务行。
+    if crawler_busy():
+        raise RuntimeError("已有爬取任务在运行")
     if _active is not None and not _active.task.done():
         raise RuntimeError("已有爬取任务在运行")
 
