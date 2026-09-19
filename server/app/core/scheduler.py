@@ -342,6 +342,36 @@ async def _job_proxypool_cycle() -> None:
         logger.exception("[定时] proxypool 周期异常")
 
 
+async def _job_proxypool_retention() -> None:
+    """proxypool 遥测保留（每日 04:35，紧随 04:30 的 WAL 收缩）。
+
+    删的是**观测**，不是身份：`proxy_job_runs` / `health_observations` /
+    `orchestration_events` / `subscription_snapshots` 按各自保留期分块清理；
+    `proxy_nodes` / `proxy_node_sources` / `pool_generations` 一行不碰。
+
+    为什么是独立定时任务：保留是**周期性**事务，不是启动一次性事务——本地软件
+    不常驻，放启动链会在长会话里永远不跑（也避免动那条登记过的链序）。删除按
+    5000 行一块、每块一个事务，防长事务持写锁跟爬取/调度抢锁；一轮最多 20 块，
+    删不完留给下一轮。异常只记日志。
+    """
+    from datetime import datetime
+
+    from app.core.database import get_session_factory
+    from app.domains.proxypool import retention as _ret
+
+    try:
+        async with get_session_factory()() as session:
+            result = await _ret.prune_telemetry(session, datetime.now())
+        logger.info(
+            "[定时] proxypool 保留清理：作业 %d / 健康观测 %d / 编排事件 %d / 快照 %d%s",
+            result.job_runs, result.health_observations,
+            result.orchestration_events, result.snapshots,
+            "（达块上限，剩余下轮继续）" if result.truncated else "",
+        )
+    except Exception:  # noqa: BLE001 —— 清理失败不拖垮调度器
+        logger.exception("[定时] proxypool 保留清理异常")
+
+
 async def _job_price_repair() -> None:
     """失败记录修复（5min 一轮）：扫全库 missing 失败记录定向重抓。
 
@@ -924,6 +954,12 @@ def start_scheduler() -> None:
     scheduler.add_job(_job_epic_free, "cron", hour=7, minute=10, id="epic_free")
     scheduler.add_job(_job_bartervg_bundles, "cron", hour=5, minute=40, id="bartervg_bundles")
     scheduler.add_job(_job_wal_truncate, "cron", hour=4, minute=30, id="wal_truncate")
+    # proxypool 遥测保留：每日 04:35（紧随 WAL 收缩，不与 04:30 的重活撞同一分钟）。
+    # 分块删除 + 单轮块上限在函数内部；max_instances=1 防叠轮。
+    scheduler.add_job(
+        _job_proxypool_retention, "cron", hour=4, minute=35, id="proxypool_retention",
+        max_instances=1, coalesce=True,
+    )
     scheduler.add_job(_job_backup, "interval", hours=24, id="auto_backup")
     # proxypool 周期：**只注册这一个**（L0 / pending 重建 / L1-L2 都在它内部按序发生）。
     # 池 Runtime 未就绪时函数内部自行跳过；max_instances=1 防上一轮未跑完又叠一轮。
@@ -948,7 +984,7 @@ def start_scheduler() -> None:
         asyncio.create_task(_job_bartervg_catchup())
     except RuntimeError:
         logger.warning("[调度] 无运行中事件循环，跳过 Barter.vg 启动补跑")
-    logger.info("调度器已启动（账户同步 15min / 池价格爬取锚点网格：Steam 折扣刷新锚 北京 01:00[夏令时]/02:00[冬令时] + 6h 步进，外部时间判定 DST / 捆绑包存量刷新随价格链 / 失败记录修复 5min 空闲档 / 汇率每日 03:00 / WAL 收缩每日 04:30 / Barter.vg bundle 计数每日 05:40 / 代理体检 6h / Clash 订阅重拉 30min 拍[6h 门槛·爬虫空闲档] / 钱包每分钟轮转 / 账单 30min / 热销榜 1h / 热门新品 24h / 特惠差集 6h / 即将推出 24h / CS 重探每日 10:00 / 自动备份 24h）")
+    logger.info("调度器已启动（账户同步 15min / 池价格爬取锚点网格：Steam 折扣刷新锚 北京 01:00[夏令时]/02:00[冬令时] + 6h 步进，外部时间判定 DST / 捆绑包存量刷新随价格链 / 失败记录修复 5min 空闲档 / 汇率每日 03:00 / WAL 收缩每日 04:30 / proxypool 保留清理每日 04:35 / Barter.vg bundle 计数每日 05:40 / 代理体检 6h / Clash 订阅重拉 30min 拍[6h 门槛·爬虫空闲档] / 钱包每分钟轮转 / 账单 30min / 热销榜 1h / 热门新品 24h / 特惠差集 6h / 即将推出 24h / CS 重探每日 10:00 / 自动备份 24h）")
 
 
 def stop_scheduler() -> None:
