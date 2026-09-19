@@ -21,6 +21,7 @@ import aiohttp
 from ..core.database import init_db
 from . import browse_store as bs
 from .config import DEFAULT_WORKER_COUNT, HTTP_TIMEOUT
+from .occupancy import begin_crawl, end_crawl
 from .http_client import SteamHttpClient
 from .router import CrawlerRouter
 from .scheduler import CrawlerScheduler
@@ -62,6 +63,27 @@ def _build_app_tasks(
 
 
 async def run_crawl(
+    appids: list[tuple[int, str]] | None,
+    *,
+    config: CrawlRunConfig,
+    stop_event: asyncio.Event | None = None,
+    pre_tasks: list[dict] | None = None,
+) -> dict:
+    """生产爬取入口：取得 crawler 占用后执行，结束（含异常）必定释放。
+
+    占用放在这里而不是调用方的 job 表上——bundles 链尾是**直调**本函数的，
+    只有把门禁落在执行入口，两条路径才会真正互斥。
+    """
+    begin_crawl("run_crawl")
+    try:
+        return await _run_crawl_locked(
+            appids, config=config, stop_event=stop_event, pre_tasks=pre_tasks
+        )
+    finally:
+        end_crawl()
+
+
+async def _run_crawl_locked(
     appids: list[tuple[int, str]] | None,
     *,
     config: CrawlRunConfig,
