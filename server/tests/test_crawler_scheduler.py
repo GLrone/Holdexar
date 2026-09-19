@@ -92,6 +92,38 @@ async def test_stop_event_cancels_workers_and_drains_queue():
 
 
 @pytest.mark.asyncio
+async def test_total_target_is_planned_not_completed():
+    """`total_target` = **计划**任务数（初始队列量），停止时完成数远小于它。
+
+    这是 `proxy_job_runs.task_count` 的输入不变量：台账取 `total_target`，取
+    `counts()[0]`（完成数）就会把「计划 10 个」记成「计划 2 个」——一条只跑了
+    两个任务的作业，会把「这次打算跑多少」这个事实永久改错。
+    """
+    started = asyncio.Event()
+    entered: list[int] = []
+
+    async def _slow(context: CrawlerContext) -> None:
+        entered.append(context.task["id"])
+        started.set()
+        await asyncio.sleep(30)
+
+    sched = _make_scheduler(_slow, workers=2)
+    run_task = asyncio.create_task(
+        sched.run([{"type": "app", "id": i} for i in range(10)], session=None)
+    )
+    await asyncio.wait_for(started.wait(), timeout=5)
+    await asyncio.sleep(0.05)  # 让两个 worker 都进到 handler 里
+    sched.stop_event.set()
+    await asyncio.wait_for(run_task, timeout=5)  # 不挂起即过
+
+    done = sched.counts()[0]
+    assert sched.total_target == 10, "计划数在 run() 里定死为初始任务量"
+    assert done < sched.total_target, "被停止时完成数必然小于计划数"
+    assert len(entered) <= 2, "只有 2 个 worker 真正开过工"
+    assert done <= len(entered), "完成的只可能是真正开过工的那些"
+
+
+@pytest.mark.asyncio
 async def test_failure_ledger_merged_into_fail_count():
     """browse 层失败账本并入对外口径：success = done − fail，不虚报全成。"""
     async def _app(context: CrawlerContext) -> None:

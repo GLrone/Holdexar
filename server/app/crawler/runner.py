@@ -123,7 +123,10 @@ async def run_crawl(
             run_id,
             status=status,
             now=datetime.now(),
-            task_count=int(stats.get("processed") or 0),
+            # `task_count` = 本次**计划**任务数（`scheduler.total_target` = 初始任务量），
+            # 不是已完成数：中断时计划 2、完成 1，台账必须记 2 —— 记 1 就等于篡改了
+            # 「这次一共打算跑多少」。已完成数由 success_count + error_count 表达。
+            task_count=int(stats.get("total") or 0),
             success_count=int(stats.get("success") or 0),
             error_count=int(stats.get("failed") or 0),
             error_summary=summary,

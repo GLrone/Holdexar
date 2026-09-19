@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 
 import pytest
@@ -547,8 +548,6 @@ async def test_run_crawl_records_failure_when_body_raises(tmp_data_dir, monkeypa
 @pytest.mark.asyncio
 async def test_run_crawl_interrupted_status_when_stopped(tmp_data_dir):
     """停止信号置位 → interrupted（不是 failed）。"""
-    import asyncio
-
     await init_db()
     stop = asyncio.Event()
     stop.set()
@@ -560,3 +559,49 @@ async def test_run_crawl_interrupted_status_when_stopped(tmp_data_dir):
     # 「没跑完」同时落进行级标记（与启动清理写的 interrupted 同一语义）
     assert rows[0].error_summary == {"by_error": {}, "interrupted": True}
     assert rows[0].finished_at is not None and rows[0].duration_ms is not None
+
+
+@pytest.mark.asyncio
+async def test_task_count_is_planned_not_completed(tmp_data_dir, monkeypatch):
+    """钉死 `task_count` 口径：**计划任务数**（`stats["total"]`），不是已完成数。
+
+    中断场景：计划 2、完成 1 → 台账必须是 task_count=2 / success_count=1 /
+    error_count=0。曾经取的是 `stats["processed"]`（done），会把它记成 1 ——
+    「这次一共打算跑几个」这个事实就被悄悄改掉了。这条测试就是让那个错误再也进不来。
+
+    这里刻意只钉 `run_crawl` 的**映射**（不做桩就是真跑）；「计划数 ≠ 完成数」这个
+    输入事实本身由 `test_crawler_scheduler.py::test_total_target_is_planned_not_completed` 钉。
+    """
+    await init_db()
+
+    import app.crawler.runner as runner_module
+
+    half = {
+        "total": 2,          # 计划 2
+        "processed": 1,      # 只完成 1
+        "success": 1,
+        "failed": 0,
+        "skipped_no_discount": 0,
+        "discount_ended": 0,
+        "elapsed_seconds": 3.0,
+    }
+
+    async def _stopped_after_first(*args, **kwargs):
+        return half
+
+    monkeypatch.setattr(runner_module, "_run_crawl_locked", _stopped_after_first)
+    stop = asyncio.Event()
+    stop.set()  # 完成 1 个之后被停止
+    stats = await run_crawl(
+        None, config=CrawlRunConfig(regions=["us"], workers=1), stop_event=stop
+    )
+    assert (stats["total"], stats["processed"]) == (2, 1), "输入事实：计划 2、完成 1"
+
+    async with get_session_factory()() as session:
+        row = (await session.execute(select(ProxyJobRun))).scalars().one()
+    assert row.task_count == 2, "台账必须记计划数，不是完成数"
+    assert row.success_count == 1
+    assert row.error_count == 0
+    assert row.status == jobruns.STATUS_INTERRUPTED
+    # 计划数 ≠ 完成数：这正是中断作业应有的形状，不能被「凑平」
+    assert row.task_count != row.success_count + row.error_count
