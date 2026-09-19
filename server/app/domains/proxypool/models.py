@@ -19,7 +19,17 @@ import hashlib
 import json
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -250,3 +260,61 @@ class OrchestrationEvent(Base):
     level: Mapped[str] = mapped_column(String(8))
     message: Mapped[str] = mapped_column(Text)
     payload_json: Mapped[dict | None] = mapped_column(JSON)
+
+
+class ProxyJobRun(Base):
+    """生产作业台账：一次真实 `run_crawl` = 一行，**只记事实，不下健康结论**。
+
+    边界（定稿见 `docs/PROXYPOOL_HANDOVER_P1.7_NEXT.md` §13/§14）：
+
+    - **不按 HTTP 请求记账**。爬虫的计量单位是「任务 = 一区 × 一批 ≤400 appid」
+      （`CrawlerScheduler.counts()`），所以字段是 `task_count`，不是 request_count。
+    - 本轮运行时的身份是 `proxy_url`（`http://127.0.0.1:<mixed-port>`）+ `pool_sha256`
+      （池文件内容哈希）——**没有 runtime_name，也没有写进库的 pool_generation**
+      （`pool_generations` 至今无写入方），照实记能记到的。
+    - `selected_node` / `node_exit_ip` 是**一等列而非 mapping**：运行时是
+      `mode: global` + 单个 mixed-port，一轮作业全程只有一个 GLOBAL 选中节点，
+      `error_summary` 里放 `by_node` 字典反而会让人以为一轮跑过很多节点。
+    - `active_subscription_id` 目前**恒为 NULL**：Active/Candidate 尚未实现，
+      当下的事实是「池内合格节点的全部来源订阅」→ `subscription_ids_json`。
+    - `error_summary` 只放**固定枚举**计数（见 `jobruns.ERROR_KINDS`），不放自由文本：
+      异常串可能带 URL/凭据，且长度无界。
+    - 主键 `id` 就是作业身份，**不另造 `run_id`**（两套身份是本项目明令禁止的形态）。
+    """
+
+    __tablename__ = "proxy_job_runs"
+    __table_args__ = (
+        Index("ix_pjr_node_started", "selected_node", "started_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # running | success | partial | failed | interrupted（由 jobruns 一处定义）
+    status: Mapped[str] = mapped_column(String(16), index=True)
+    # 预留触发来源（manual|scheduled|bundles|cli）；v1 一律 'crawl'（run_crawl 是唯一入口）
+    kind: Mapped[str] = mapped_column(String(16), default="crawl")
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime)
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    regions_json: Mapped[list | None] = mapped_column(JSON)
+    workers: Mapped[int | None] = mapped_column(Integer)
+    # 本轮固定使用的池入口（run 内不换端口）
+    proxy_url: Mapped[str | None] = mapped_column(String(120))
+    # 池文件内容哈希：回答「这一轮用的是哪一版池」，无需 generation 概念
+    pool_sha256: Mapped[str | None] = mapped_column(String(64))
+    pool_node_count: Mapped[int | None] = mapped_column(Integer)
+    # 池内**已知**出口 IP 去重数；NULL = 尚未探测（与「0 个出口」不是一回事）
+    pool_exit_ip_count: Mapped[int | None] = mapped_column(Integer)
+    # GLOBAL 选中节点的 runtime_name（run 开始时读控制器取得；读不到为 NULL）
+    selected_node: Mapped[str | None] = mapped_column(String(400))
+    node_exit_ip: Mapped[str | None] = mapped_column(String(64))
+    # 池内合格节点的全部来源订阅 + 各订阅最新 OK 快照（事实，不是「生产订阅」）
+    subscription_ids_json: Mapped[list | None] = mapped_column(JSON)
+    snapshot_ids_json: Mapped[list | None] = mapped_column(JSON)
+    # **v1 恒 NULL**：留给 Active/Candidate 落地后回填（不预留 pool_generation——
+    # 那个概念连事实源都还没有，等发布协议真落地再加列）
+    active_subscription_id: Mapped[int | None] = mapped_column(Integer)
+    task_count: Mapped[int | None] = mapped_column(Integer)
+    success_count: Mapped[int | None] = mapped_column(Integer)
+    error_count: Mapped[int | None] = mapped_column(Integer)
+    error_summary: Mapped[dict | None] = mapped_column(JSON)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime)

@@ -13,6 +13,7 @@ import asyncio
 import logging
 import time
 from collections import deque
+from collections.abc import Callable
 
 import aiohttp
 
@@ -35,6 +36,7 @@ class CrawlerScheduler:
     def __init__(
         self, router, http_client, db_writer, worker_count=30, stop_event=None,
         failure_ledger: list | None = None,
+        error_sink: Callable[[BaseException], None] | None = None,
     ):
         self.router = router
         self.http_client = http_client
@@ -42,6 +44,10 @@ class CrawlerScheduler:
         self.worker_count = worker_count
         self.queue: asyncio.Queue = asyncio.Queue()
         self.stop_event = stop_event or asyncio.Event()
+        # 错误分类回调（生产作业台账用）：worker 捕获到的异常在这里分类计数。
+        # **None = 不记账**（CLI/测试不必知道台账）。browse 层重试耗尽的失败不抛异常、
+        # 只进 failure_ledger，见 run_crawl 侧的补记。
+        self.error_sink = error_sink
 
         # 统计
         self.success_count = 0
@@ -143,6 +149,11 @@ class CrawlerScheduler:
                     self.total_processed += 1
                     self.fail_count += 1
                     self._completed_ids.add(str(task_id))
+                if self.error_sink is not None:
+                    try:
+                        self.error_sink(e)
+                    except Exception:  # noqa: BLE001 —— 记账回调绝不能拖垮 worker
+                        logger.exception("[Worker-%d] 错误分类回调异常", worker_id)
                 logger.error("[Worker-%d] %s:%s 异常: %s", worker_id, task_type, task_id, e)
             finally:
                 self.queue.task_done()

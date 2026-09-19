@@ -44,7 +44,12 @@ def active_job_id() -> int | None:
 
 
 async def cleanup_orphan_jobs() -> None:
-    """进程启动时把上一进程遗留的 running 任务标记为失败。"""
+    """进程启动时把上一进程遗留的 running 任务标记为失败。
+
+    **两本台账一起收口**：`crawl_jobs` 是任务视角，`proxy_job_runs` 是代理池作业
+    视角。只清前者会让生产作业台账挂着一条永远 `running` 的行——同一件"上次进程
+    中断"的事实，不能有两个说法。
+    """
     async with get_session_factory()() as session:
         rows = (
             await session.execute(
@@ -58,6 +63,15 @@ async def cleanup_orphan_jobs() -> None:
         if rows:
             await session.commit()
             logger.warning("清理了 %d 个中断任务", len(rows))
+
+    # fail-soft：台账收尾失败不影响启动（record_interrupted 自身也已兜异常）
+    from app.domains.proxypool import jobruns as proxypool_jobruns
+
+    marked = await proxypool_jobruns.record_interrupted()
+    if marked:
+        logger.warning(
+            "[proxypool] 上次进程中断遗留 %d 条生产作业已标记 interrupted", marked
+        )
 
 
 async def import_appids(appids: list[int]) -> dict:

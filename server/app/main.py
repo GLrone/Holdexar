@@ -25,6 +25,7 @@ from app.domains.family.router import router as family_router
 from app.domains.games.router import router as games_router
 from app.domains.metadata.router import router as metadata_router
 from app.domains.proxies.router import router as proxies_router
+from app.domains.proxypool.router import router as proxypool_router
 from app.domains.rates.router import router as rates_router
 from app.domains.redeem.router import router as redeem_router
 from app.domains.regions.router import router as regions_router
@@ -374,6 +375,8 @@ def create_app() -> FastAPI:
     app.include_router(wishlist_router, prefix="/api/v1")
     app.include_router(crawl_router, prefix="/api/v1")
     app.include_router(proxies_router, prefix="/api/v1")
+    # proxypool 只读面：生产作业台账（/proxies 页「生产作业」分节的数据源）
+    app.include_router(proxypool_router, prefix="/api/v1")
     app.include_router(alerts_router, prefix="/api/v1")
     app.include_router(rates_router, prefix="/api/v1")
     app.include_router(regions_router, prefix="/api/v1")
