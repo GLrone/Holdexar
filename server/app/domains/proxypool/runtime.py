@@ -53,6 +53,10 @@ RUNTIME_CONFIG_FILENAME = "crawl-runtime.yaml"
 # 运行期专属键（只进运行配置，绝不回流进池文件）
 RUNTIME_MODE = "global"          # L1 靠 GLOBAL 选择器切节点，不需要 proxy-groups
 RUNTIME_BIND_ADDRESS = "127.0.0.1"  # 默认是 '*'：测出口 IP 不该把本机入口开给局域网
+RUNTIME_CONTROLLER_HOST = "127.0.0.1"
+# 池 Runtime 自己的 controller 凭据（本机回环专用）。刻意**不随每次重建轮换**：
+# 轮换只会制造"拿旧凭据访问新实例"的陷阱，而 controller 的隔离靠端口就够。
+RUNTIME_CONTROLLER_SECRET = "holdexar-proxypool"
 
 
 class RuntimeConfigError(RuntimeError):
@@ -115,6 +119,11 @@ def prepare_runtime_config(data_dir: Path) -> Path:
             "mode": RUNTIME_MODE,
             "allow-lan": False,
             "bind-address": RUNTIME_BIND_ADDRESS,
+            # 自带 controller，**不依赖注入的共享默认端口**：老订阅内核若没有
+            # controller 行，`ensure_controller` 会给它注入 19090，恰好撞上本实例。
+            # 与 mixed-port 同一思路：各用各的动态端口。
+            "external-controller": f"{RUNTIME_CONTROLLER_HOST}:{_free_local_port()}",
+            "secret": RUNTIME_CONTROLLER_SECRET,
             "mixed-port": _free_local_port(),
             "proxies": list(doc["proxies"]),
         },
@@ -293,6 +302,28 @@ async def _put_global(
     async with httpx.AsyncClient(timeout=timeout, headers=_headers(secret)) as client:
         await client.put(f"{controller_url}/proxies/GLOBAL", json={"name": name})
         return (await client.get(f"{controller_url}/proxies/GLOBAL")).json().get("now")
+
+
+async def apply_global_selection(
+    controller_url: str, secret: str, name: str, *,
+    timeout: float = DEFAULT_SELECT_TIMEOUT,
+) -> str | None:
+    """把 `GLOBAL` 设为指定节点并回读确认（维护事务与重建共用同一动作）。"""
+    return await _put_global(controller_url, secret, name, timeout=timeout)
+
+
+def controller_endpoint_of(data_dir: Path) -> tuple[str, str]:
+    """读运行配置里**自带的** controller：返回 `(base_url, secret)`。
+
+    自带 controller 是本实例隔离的一部分——不读它就只能去猜注入的默认端口，
+    那个默认值是多个 Runtime 共用的。
+    """
+    path = runtime_config_path(data_dir)
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    addr = doc.get("external-controller") if isinstance(doc, Mapping) else None
+    if not isinstance(addr, str) or not addr.strip():
+        raise RuntimeConfigError(f"运行配置里没有 external-controller：{path}")
+    return f"http://{addr.strip()}", str(doc.get("secret") or "")
 
 
 async def rebuild_runtime(
