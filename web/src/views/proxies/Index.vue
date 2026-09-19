@@ -1,16 +1,33 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessageBox } from 'element-plus'
 
 import {
   proxiesApi,
+  proxypoolApi,
   type ClashNodeTestResult,
   type ClashStatus,
   type ProxyItem,
+  type ProxyJobRunItem,
+  type ProxyJobRunsPayload,
   type ProxyStrategy,
   type ProxySubscriptionItem,
 } from '@/api/client'
-import { HlButton, HlDialog, HlIcon, message } from '@/components/ui'
+import {
+  HlAlert,
+  HlButton,
+  HlDialog,
+  HlDrawer,
+  HlEmpty,
+  HlIcon,
+  HlPagination,
+  HlSkeleton,
+  HlStat,
+  HlTable,
+  HlTag,
+  message,
+  type HlTableColumn,
+} from '@/components/ui'
 import { useI18n, type MessageKey } from '@/locales'
 
 /**
@@ -547,9 +564,167 @@ async function runClashTest() {
   }
 }
 
+// ─── 生产作业（真实爬取作业台账：**只记事实，不下健康结论**）───
+// 数据来自 /api/v1/proxypool/job-runs：一次真实 run_crawl 一行。这里不做任何
+// 健康分/等级/判死的推导——阈值要等真实数据积累之后再谈。
+
+const jobRuns = ref<ProxyJobRunsPayload>({
+  summary: {
+    day: '',
+    runs: 0,
+    success: 0,
+    partial: 0,
+    failed: 0,
+    interrupted: 0,
+    running: 0,
+    avgDurationMs: null,
+    poolExitIpCount: null,
+  },
+  total: 0,
+  items: [],
+})
+const jobsLoading = ref(false)
+const jobsError = ref('')
+const jobsPage = ref(1)
+const JOB_PAGE_SIZE = 20
+const jobDetail = ref<ProxyJobRunItem | null>(null)
+const jobDetailOpen = ref(false)
+
+/** NULL ≠ 0：后端没这个事实就显示 —，绝不显示 0（与三值证据同一条原则） */
+const NONE = '—'
+
+function fmtCount(v: number | null | undefined): string {
+  return v === null || v === undefined ? NONE : String(v)
+}
+
+function fmtDuration(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined) return NONE
+  if (ms < 1000) return `${ms}ms`
+  const seconds = ms / 1000
+  if (seconds < 60) return `${seconds.toFixed(1)}s`
+  const minutes = Math.floor(seconds / 60)
+  return `${minutes}m${Math.round(seconds - minutes * 60)}s`
+}
+
+function fmtTime(iso: string | null): string {
+  return iso ? iso.slice(5, 19).replace('T', ' ') : NONE
+}
+
+function fmtSha(sha: string | null): string {
+  return sha ? `${sha.slice(0, 12)}…` : NONE
+}
+
+function fmtList(ids: number[]): string {
+  return ids.length ? ids.join(', ') : NONE
+}
+
+/** 池内运行名是 `<订阅>|<原名>`：窄列只显示原名，全名挂 title */
+function nodeShort(name: string | null): string {
+  if (!name) return NONE
+  const idx = name.indexOf('|')
+  return idx >= 0 ? name.slice(idx + 1) : name
+}
+
+/* 状态词与错误分类都**只存 key**，渲染期 t()（模块级常量存译文会把语言冻住） */
+const STATUS_KEYS: Record<string, MessageKey> = {
+  running: 'proxies.jobs.status.running',
+  success: 'proxies.jobs.status.success',
+  partial: 'proxies.jobs.status.partial',
+  failed: 'proxies.jobs.status.failed',
+  interrupted: 'proxies.jobs.status.interrupted',
+}
+const STATUS_TONES = {
+  running: 'info',
+  success: 'success',
+  partial: 'warning',
+  failed: 'danger',
+  interrupted: 'default',
+} as const
+const ERROR_KEYS: Record<string, MessageKey> = {
+  timeout: 'proxies.jobs.err.timeout',
+  connect: 'proxies.jobs.err.connect',
+  reset: 'proxies.jobs.err.reset',
+  proxy_error: 'proxies.jobs.err.proxy_error',
+  rate_limit: 'proxies.jobs.err.rate_limit',
+  http_4xx: 'proxies.jobs.err.http_4xx',
+  http_5xx: 'proxies.jobs.err.http_5xx',
+  tls: 'proxies.jobs.err.tls',
+  dns: 'proxies.jobs.err.dns',
+  ledger: 'proxies.jobs.err.ledger',
+  internal: 'proxies.jobs.err.internal',
+  other: 'proxies.jobs.err.other',
+}
+
+function statusLabel(status: string): string {
+  const key = STATUS_KEYS[status]
+  return key ? t(key) : status
+}
+
+function statusTone(status: string): 'default' | 'accent' | 'success' | 'danger' | 'warning' | 'info' {
+  return STATUS_TONES[status as keyof typeof STATUS_TONES] ?? 'default'
+}
+
+function errLabel(kind: string): string {
+  const key = ERROR_KEYS[kind]
+  return key ? t(key) : kind
+}
+
+/** 详情里的失败分类：只列非零项，顺序按后端枚举（ERROR_KEYS 的键序） */
+const jobErrors = computed<{ kind: string; label: string; count: number }[]>(() => {
+  const by = jobDetail.value?.byError
+  if (!by) return []
+  return Object.keys(ERROR_KEYS)
+    .filter((kind) => (by[kind] ?? 0) > 0)
+    .map((kind) => ({ kind, label: errLabel(kind), count: by[kind]! }))
+})
+
+const jobColumns = computed<HlTableColumn[]>(() => [
+  { key: 'time', label: t('proxies.jobs.col.time'), width: '112px' },
+  { key: 'status', label: t('proxies.jobs.col.status'), width: '88px' },
+  { key: 'tasks', label: t('proxies.jobs.col.tasks'), numeric: true, width: '72px' },
+  { key: 'success', label: t('proxies.jobs.col.success'), numeric: true, width: '72px' },
+  { key: 'failed', label: t('proxies.jobs.col.failed'), numeric: true, width: '72px' },
+  { key: 'duration', label: t('proxies.jobs.col.duration'), numeric: true, width: '88px' },
+  { key: 'node', label: t('proxies.jobs.col.node') },
+  { key: 'exitIp', label: t('proxies.jobs.col.exitIp'), width: '128px' },
+])
+
+/** HlTable 的 slot 行是 Record<string, unknown>：收敛成一个取值口 */
+function asRun(row: Record<string, unknown>): ProxyJobRunItem {
+  return row as unknown as ProxyJobRunItem
+}
+
+async function loadJobRuns() {
+  jobsLoading.value = true
+  jobsError.value = ''
+  try {
+    const offset = (jobsPage.value - 1) * JOB_PAGE_SIZE
+    jobRuns.value = await proxypoolApi.jobRuns(JOB_PAGE_SIZE, offset)
+  } catch (e) {
+    jobsError.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    jobsLoading.value = false
+  }
+}
+
+async function openJobRun(row: Record<string, unknown>) {
+  const item = asRun(row)
+  jobDetail.value = item
+  jobDetailOpen.value = true
+  try {
+    // 详情端点重取一行（列表里的快照可能已过期）
+    jobDetail.value = await proxypoolApi.jobRun(item.id)
+  } catch {
+    /* 拉不到就先用列表那一行渲染，不打断查看 */
+  }
+}
+
+watch(jobsPage, () => void loadJobRuns())
+
 onMounted(async () => {
   await load()
   void refreshTrafficQuiet() // 实时流量：进页即静默刷新（不阻塞首屏渲染）
+  void loadJobRuns() // 生产作业：与首屏并行拉，不阻塞渲染
 })
 </script>
 
@@ -921,6 +1096,197 @@ onMounted(async () => {
         <div v-if="!events.length" class="proxyx-console-line">{{ t('proxies.console.empty') }}</div>
       </div>
     </div>
+
+    <!-- 生产作业（真实爬取作业台账：只记事实，不下健康结论） -->
+    <div class="proxyx-section" data-section="proxies.section.jobs">
+      <div class="proxyx-section-header">
+        <div class="proxyx-section-title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+            <path d="M4 19V5" />
+            <path d="M4 19h16" />
+            <rect x="7" y="11" width="3" height="5" />
+            <rect x="12" y="8" width="3" height="8" />
+            <rect x="17" y="13" width="3" height="3" />
+          </svg>
+          <span>{{ t('proxies.section.jobs') }}</span>
+        </div>
+        <div class="proxyx-section-actions">
+          <span class="tag">{{ t('proxies.jobs.total', { n: jobRuns.total }) }}</span>
+          <HlButton
+            art="outline"
+            tone="blue"
+            size="sm"
+            :disabled="jobsLoading"
+            :loading="jobsLoading"
+            @click="loadJobRuns"
+          >
+            <HlIcon v-if="!jobsLoading" name="refresh" />
+            {{ t('proxies.jobs.refresh') }}
+          </HlButton>
+        </div>
+      </div>
+      <p class="pjobs-desc">{{ t('proxies.jobs.desc') }}</p>
+
+      <HlAlert v-if="jobsError" type="error" :title="t('proxies.jobs.loadFailed')" :desc="jobsError" />
+
+      <div v-else-if="jobsLoading && !jobRuns.items.length" class="pjobs-stats">
+        <HlSkeleton v-for="i in 6" :key="i" variant="card" height="72px" />
+      </div>
+
+      <template v-else>
+        <div class="pjobs-stats">
+          <HlStat size="sm" :label="t('proxies.jobs.stat.runs')" :value="jobRuns.summary.runs" />
+          <HlStat
+            size="sm"
+            tone="good"
+            :label="t('proxies.jobs.stat.success')"
+            :value="jobRuns.summary.success"
+          />
+          <HlStat
+            size="sm"
+            tone="warn"
+            :label="t('proxies.jobs.stat.partial')"
+            :value="jobRuns.summary.partial"
+          />
+          <HlStat
+            size="sm"
+            tone="bad"
+            :label="t('proxies.jobs.stat.failed')"
+            :value="jobRuns.summary.failed"
+          />
+          <HlStat
+            size="sm"
+            :label="t('proxies.jobs.stat.avgDuration')"
+            :value="fmtDuration(jobRuns.summary.avgDurationMs)"
+          />
+          <HlStat
+            size="sm"
+            :label="t('proxies.jobs.stat.poolExitIp')"
+            :value="fmtCount(jobRuns.summary.poolExitIpCount)"
+          />
+        </div>
+        <p v-if="jobRuns.summary.interrupted || jobRuns.summary.running" class="pjobs-extra">
+          {{
+            t('proxies.jobs.extra', {
+              interrupted: jobRuns.summary.interrupted,
+              running: jobRuns.summary.running,
+            })
+          }}
+        </p>
+
+        <div class="pjobs-table-wrap">
+          <HlTable
+            v-if="jobRuns.items.length"
+            :columns="jobColumns"
+            :rows="jobRuns.items"
+            :on-row-click="openJobRun"
+          >
+            <template #time="{ row }">{{ fmtTime(asRun(row).startedAt) }}</template>
+            <template #status="{ row }">
+              <HlTag :type="statusTone(asRun(row).status)">
+                {{ statusLabel(asRun(row).status) }}
+              </HlTag>
+            </template>
+            <template #tasks="{ row }">{{ fmtCount(asRun(row).taskCount) }}</template>
+            <template #success="{ row }">{{ fmtCount(asRun(row).successCount) }}</template>
+            <template #failed="{ row }">{{ fmtCount(asRun(row).errorCount) }}</template>
+            <template #duration="{ row }">{{ fmtDuration(asRun(row).durationMs) }}</template>
+            <template #node="{ row }">
+              <span :title="asRun(row).node ?? undefined">{{ nodeShort(asRun(row).node) }}</span>
+            </template>
+            <template #exitIp="{ row }">{{ asRun(row).nodeExitIp ?? NONE }}</template>
+          </HlTable>
+          <HlEmpty v-else :text="t('proxies.jobs.empty')" />
+        </div>
+
+        <div v-if="jobRuns.total > JOB_PAGE_SIZE" class="pjobs-pager">
+          <HlPagination v-model="jobsPage" :total="jobRuns.total" :page-size="JOB_PAGE_SIZE" />
+        </div>
+      </template>
+    </div>
+
+    <!-- 生产作业详情（已聚合数据：一轮只有一个节点/一个出口 IP，不做多行表） -->
+    <HlDrawer
+      v-model="jobDetailOpen"
+      :title="t('proxies.jobs.detail.title', { id: jobDetail?.id ?? '' })"
+      width="520px"
+      :top="56"
+    >
+      <div v-if="jobDetail" class="pjob-detail">
+        <div v-if="jobDetail.interrupted" class="pjob-note">
+          {{ t('proxies.jobs.detail.interrupted') }}
+        </div>
+        <dl class="pjob-grid">
+          <div class="pjob-row">
+            <dt>{{ t('proxies.jobs.detail.basic') }}</dt>
+            <dd>#{{ jobDetail.id }} · {{ statusLabel(jobDetail.status) }}</dd>
+          </div>
+          <div class="pjob-row">
+            <dt>{{ t('proxies.jobs.detail.startedAt') }}</dt>
+            <dd class="pjob-num">{{ fmtTime(jobDetail.startedAt) }}</dd>
+          </div>
+          <div class="pjob-row">
+            <dt>{{ t('proxies.jobs.detail.finishedAt') }}</dt>
+            <dd class="pjob-num">{{ fmtTime(jobDetail.finishedAt) }}</dd>
+          </div>
+          <div class="pjob-row">
+            <dt>{{ t('proxies.jobs.detail.duration') }}</dt>
+            <dd class="pjob-num">{{ fmtDuration(jobDetail.durationMs) }}</dd>
+          </div>
+          <div class="pjob-row">
+            <dt>{{ t('proxies.jobs.detail.node') }}</dt>
+            <dd>
+              <template v-if="jobDetail.node">
+                <span class="pjob-mono" :title="jobDetail.node">{{ jobDetail.node }}</span>
+                <span class="pjob-sub">{{ jobDetail.nodeExitIp ?? NONE }}</span>
+              </template>
+              <span v-else class="pjob-sub">{{ t('proxies.jobs.detail.nodeUnknown') }}</span>
+            </dd>
+          </div>
+          <div class="pjob-row">
+            <dt>{{ t('proxies.jobs.detail.proxyUrl') }}</dt>
+            <dd class="pjob-mono">{{ jobDetail.proxyUrl ?? NONE }}</dd>
+          </div>
+          <div class="pjob-row">
+            <dt>{{ t('proxies.jobs.detail.poolSha') }}</dt>
+            <dd class="pjob-mono">{{ fmtSha(jobDetail.poolSha256) }}</dd>
+          </div>
+          <div class="pjob-row">
+            <dt>{{ t('proxies.jobs.detail.poolNodes') }}</dt>
+            <dd class="pjob-num">{{ fmtCount(jobDetail.poolNodeCount) }}</dd>
+          </div>
+          <div class="pjob-row">
+            <dt>{{ t('proxies.jobs.detail.poolExitIps') }}</dt>
+            <dd class="pjob-num">{{ fmtCount(jobDetail.poolExitIpCount) }}</dd>
+          </div>
+          <div class="pjob-row">
+            <dt>{{ t('proxies.jobs.detail.subscriptions') }}</dt>
+            <dd class="pjob-num">{{ fmtList(jobDetail.subscriptionIds) }}</dd>
+          </div>
+          <div class="pjob-row">
+            <dt>{{ t('proxies.jobs.detail.snapshots') }}</dt>
+            <dd class="pjob-num">{{ fmtList(jobDetail.snapshotIds) }}</dd>
+          </div>
+        </dl>
+
+        <h4 class="pjob-h4">{{ t('proxies.jobs.detail.errors') }}</h4>
+        <p v-if="jobDetail.byError === null" class="pjob-none">
+          {{ t('proxies.jobs.detail.summaryMissing') }}
+        </p>
+        <template v-else>
+          <p v-if="jobDetail.errorSummaryTruncated" class="pjob-note">
+            {{ t('proxies.jobs.detail.truncated') }}
+          </p>
+          <div v-if="jobErrors.length" class="pjob-errs">
+            <div v-for="e in jobErrors" :key="e.kind" class="pjob-err">
+              <span>{{ e.label }}</span>
+              <span class="pjob-num pjob-num--count">{{ e.count }}</span>
+            </div>
+          </div>
+          <p v-else class="pjob-none">{{ t('proxies.jobs.detail.errorsNone') }}</p>
+        </template>
+      </div>
+    </HlDrawer>
 
     <!-- 内核下载进度弹窗（手动安装 / 保存订阅缺内核自动下载共用） -->
     <HlDialog v-model="kernelDialog" :title="t('proxies.kernel.dialogTitle')" :width="420" :mask-closable="false">
@@ -1537,5 +1903,133 @@ onMounted(async () => {
   color: var(--text-muted);
   font-size: 11.5px;
   line-height: 1.5;
+}
+
+/* ─── 生产作业（只记事实，不下健康结论）───
+   配色一律走 token：这里只表达"事实的分类"，不表达"好坏判定"——失败计数用
+   tone 只是让数字可扫读，页面里没有任何"亚健康/危险"之类的结论词。 */
+.pjobs-desc {
+  margin: 8px 0 14px;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.pjobs-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+
+.pjobs-extra {
+  margin: 0 0 var(--space-3);
+  color: var(--text-secondary);
+  font-size: 11.5px;
+}
+
+.pjobs-table-wrap {
+  margin-top: var(--space-2);
+}
+
+.pjobs-pager {
+  display: flex;
+  justify-content: center;
+  margin-top: var(--space-4);
+}
+
+.pjobs-table-wrap :deep(.hl-table tbody tr) {
+  cursor: pointer;
+}
+
+.pjob-detail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.pjob-grid {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+}
+
+.pjob-row {
+  display: grid;
+  grid-template-columns: 118px 1fr;
+  gap: var(--space-3);
+  align-items: baseline;
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.pjob-row dt {
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.pjob-row dd {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 12.5px;
+  word-break: break-all;
+}
+
+.pjob-num {
+  font-variant-numeric: tabular-nums;
+}
+
+.pjob-num--count {
+  color: var(--text-secondary);
+}
+
+.pjob-mono {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.pjob-sub {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.pjob-h4 {
+  margin: var(--space-2) 0 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.pjob-errs {
+  display: grid;
+  gap: 6px;
+}
+
+.pjob-err {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: 6px 10px;
+  border-radius: var(--radius-lg);
+  background: var(--surface-inset);
+  font-size: 12px;
+}
+
+.pjob-note {
+  padding: 8px 10px;
+  border-radius: var(--radius-lg);
+  background: var(--surface-inset);
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.pjob-none {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 11.5px;
 }
 </style>

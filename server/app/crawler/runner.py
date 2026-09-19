@@ -13,12 +13,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import aiohttp
 
 from ..core.database import init_db
+from ..domains.proxypool import jobruns
 from . import browse_store as bs
 from .config import DEFAULT_WORKER_COUNT, HTTP_TIMEOUT
 from .occupancy import begin_crawl, end_crawl
@@ -73,12 +77,79 @@ async def run_crawl(
 
     占用放在这里而不是调用方的 job 表上——bundles 链尾是**直调**本函数的，
     只有把门禁落在执行入口，两条路径才会真正互斥。
+
+    **生产作业台账也落在这里**（同一理由：这里是唯一入口，写在上层 job 表上会漏掉
+    bundles 直调与 CLI）。台账两笔写入（开始 `running` / 结束终态）全部 fail-soft：
+    记录失败只留日志，绝不改变爬取行为。
     """
     begin_crawl("run_crawl")
+    started_monotonic = time.monotonic()
+    summary = jobruns.new_error_summary()
+    run_id: int | None = None
     try:
-        return await _run_crawl_locked(
-            appids, config=config, stop_event=stop_event, pre_tasks=pre_tasks
+        # 台账要写库，建表必须先于记录（init_db 幂等且是 lru 化的连接入口；
+        # 原先它在 _run_crawl_locked 里，为让"作业开始"这一笔真的在开始时刻落下，提前到这里）
+        await init_db()
+        from ..core.config import get_settings
+
+        run_id = await jobruns.record_start(
+            proxy_url=config.proxy_url,
+            regions=config.regions,
+            workers=config.workers,
+            data_dir=Path(get_settings().data_dir),
+            now=datetime.now(),
         )
+        stats = await _run_crawl_locked(
+            appids,
+            config=config,
+            stop_event=stop_event,
+            pre_tasks=pre_tasks,
+            error_sink=lambda exc: jobruns.note_error(summary, exc),
+        )
+        # browse 层重试耗尽的失败从不抛到 worker、只进 failure_ledger（已并入
+        # stats["failed"]），分类上单独记一类，别混进 other
+        jobruns.note_ledger(summary, len(bs.FAILED_TASKS))
+        stopped = bool(stop_event is not None and stop_event.is_set())
+        if stopped:
+            # 「这次没跑完」是行级事实：手动停止与进程中断共用同一个标记，
+            # 与启动清理写进去的那条保持同一语义（状态列仍是 interrupted）
+            summary["interrupted"] = True
+        status = jobruns.classify_outcome(
+            int(stats.get("success") or 0),
+            int(stats.get("failed") or 0),
+            stopped=stopped,
+        )
+        await jobruns.record_finish(
+            run_id,
+            status=status,
+            now=datetime.now(),
+            task_count=int(stats.get("processed") or 0),
+            success_count=int(stats.get("success") or 0),
+            error_count=int(stats.get("failed") or 0),
+            error_summary=summary,
+            duration_ms=int((time.monotonic() - started_monotonic) * 1000),
+        )
+        return stats
+    except asyncio.CancelledError:
+        summary["interrupted"] = True
+        await jobruns.record_finish(
+            run_id,
+            status=jobruns.STATUS_INTERRUPTED,
+            now=datetime.now(),
+            error_summary=summary,
+            duration_ms=int((time.monotonic() - started_monotonic) * 1000),
+        )
+        raise
+    except Exception as exc:  # noqa: BLE001 —— 记完再抛，行为不变
+        jobruns.note_error(summary, exc)
+        await jobruns.record_finish(
+            run_id,
+            status=jobruns.STATUS_FAILED,
+            now=datetime.now(),
+            error_summary=summary,
+            duration_ms=int((time.monotonic() - started_monotonic) * 1000),
+        )
+        raise
     finally:
         end_crawl()
 
@@ -89,6 +160,7 @@ async def _run_crawl_locked(
     config: CrawlRunConfig,
     stop_event: asyncio.Event | None = None,
     pre_tasks: list[dict] | None = None,
+    error_sink: Callable[[BaseException], None] | None = None,
 ) -> dict:
     """执行一批 app 任务，返回统计 dict。
 
@@ -96,7 +168,6 @@ async def _run_crawl_locked(
     （补抓层的按区批量 app 任务，只装该区欠账行），
     两者可同时给（关注层 + 补抓层合并一批）。
     """
-    await init_db()
     bs.reset_run_state()
 
     # ── 区服配置：严格按配置爬取，无效配置直接失败，绝不静默回退全区（防"乱爬"）──
@@ -162,6 +233,7 @@ async def _run_crawl_locked(
         scheduler = CrawlerScheduler(
             router, http_client, db, worker_count=config.workers, stop_event=stop_event,
             failure_ledger=bs.FAILED_TASKS,
+            error_sink=error_sink,
         )
         await scheduler.run(tasks, session)
 
