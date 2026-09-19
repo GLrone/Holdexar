@@ -23,14 +23,20 @@ from pathlib import Path
 import pytest
 from sqlalchemy import select
 
+from app.crawler.browse_store import StoreBrowseAPI  # noqa: E402
 from app.core.config import get_settings  # noqa: E402
 from app.core.database import get_engine, get_session_factory, init_db  # noqa: E402
 from app.domains.proxies import clash_manager  # noqa: E402
 from app.domains.proxies.clash_manager import ClashRuntime  # noqa: E402
 from app.domains.proxies.kernel_release import kernel_filename  # noqa: E402
 from app.domains.proxypool.health import (  # noqa: E402
+    BUSINESS_OK,
     EXIT_IP_TARGET_URL,
+    INVALID_BUSINESS_RESPONSE,
     PROBE_TARGET_URL,
+    TARGET_SERVICE_FAILED,
+    business_check_pool,
+    business_probe_url,
     exit_ip_check_pool,
     health_check_pool,
     probe_node,
@@ -167,6 +173,39 @@ class _BrokenTarget(BaseHTTPRequestHandler):
         pass
 
 
+class _FakeStoreBrowse(BaseHTTPRequestHandler):
+    """假 StoreBrowse：返回**实测到的真实信封结构**（可换 payload / 状态码）。"""
+
+    payload: dict = {}
+    status = 200
+    hits: list[str] = []
+
+    def do_GET(self):  # noqa: N802
+        type(self).hits.append(self.path)
+        body = json.dumps(self.payload, ensure_ascii=False).encode()
+        self.send_response(self.status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+def _browse_payload(appid: int = 220, final: str = "999",
+                    success=1) -> dict:
+    """生产 GetItems 的真实结构：`success` 是整数 1，价格是**字符串**。"""
+    return {"response": {"store_items": [{
+        "id": appid, "appid": appid, "success": success,
+        "visible": True, "item_type": 0, "name": "Half-Life 2",
+        "best_purchase_option": {
+            "packageid": 36, "package_group": "default",
+            "final_price_in_cents": final,
+        },
+    }]}}
+
+
 def _closed_port() -> int:
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -253,6 +292,25 @@ def broken_target():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield server.server_address[1]
     server.shutdown()
+
+
+@pytest.fixture
+def fake_browse():
+    """按需造假 StoreBrowse，返回 (端口, 命中记录)。"""
+    made: list[ThreadingHTTPServer] = []
+
+    def new(payload: dict, status: int = 200) -> tuple[int, list[str]]:
+        hits: list[str] = []
+        handler = type("_BrowseX", (_FakeStoreBrowse,),
+                       {"payload": payload, "status": status, "hits": hits})
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        made.append(server)
+        return server.server_address[1], hits
+
+    yield new
+    for server in made:
+        server.shutdown()
 
 
 @pytest.fixture
@@ -555,3 +613,145 @@ async def test_l1_success_records_observation_and_exit_ip_only(
     assert len(rows) == 1, "L1 不该顺带跑一次 L0（那会污染 L0 的语义）"
     assert rows[0].level == "L1" and rows[0].ok is True and rows[0].observed_at == NOW
     assert rows[0].latency_ms is not None, "耗时记录下来，但首版不参与评分"
+
+
+# ══ P1.4-C：L2 业务可用性（生产 StoreBrowse 契约）═══════════════
+# 本地假服务是明文 HTTP，所以目标 URL 用 http://（https 会先握手 TLS）。
+LOCAL_BUSINESS_TARGET = "http://fake-browse.invalid/IStoreBrowseService/GetItems/v1/"
+
+
+async def _l2(data_dir: Path, base: str, secret: str, target: str):
+    async with get_session_factory()() as s:
+        outcomes = await business_check_pool(
+            s, data_dir=data_dir, controller_url=base, secret=secret,
+            now=NOW, url=target,
+        )
+        await s.commit()
+        return outcomes
+
+
+async def _l2_observations() -> list[HealthObservation]:
+    async with get_session_factory()() as s:
+        return list((await s.execute(select(HealthObservation))).scalars())
+
+
+# ── L2-1. 业务成功：只落观测，别的一律不碰 ──────────────────────
+@pytest.mark.asyncio
+async def test_l2_business_ok_records_observation_only(
+    tmp_data_dir, kernel_exe_path, clash_runtime, local_proxies, fake_browse
+) -> None:
+    await init_db()
+    browse_port, hits = fake_browse(_browse_payload(final="999"))
+    await _add(NODE_ACTIVE, "1|香港01", port=local_proxies(browse_port))
+    await _set_exit_ip("1|香港01", "198.51.100.7")
+    base, secret = await _start_kernel(clash_runtime, kernel_exe_path, tmp_data_dir)
+
+    (outcome,) = await _l2(tmp_data_dir, base, secret, LOCAL_BUSINESS_TARGET)
+
+    assert outcome.ok, f"业务应当成功，实际 detail={outcome.detail}"
+    assert outcome.http_status == 200
+    assert outcome.final_price_in_cents == 999, (
+        'final_price_in_cents 生产返回字符串 "999"，必须按 crawler _to_int 语义解析'
+    )
+    assert BUSINESS_OK in outcome.detail
+    assert hits, "业务请求没有经过该节点专属的假 StoreBrowse"
+
+    node = await _node("1|香港01")
+    assert node.state == NODE_ACTIVE, "L2 只记录观测，状态归规则层"
+    assert node.exit_ip == "198.51.100.7", "L2 不得擦掉 L1 观测到的出口事实"
+    assert node.last_l0_at is None and node.last_l1_at is None
+
+    (obs,) = await _l2_observations()
+    assert obs.level == "L2" and obs.ok is True and obs.observed_at == NOW
+    assert obs.latency_ms is not None
+
+    # 契约防回归：L2 目标必须就是生产 StoreBrowse 契约，不能在 health 里另建一套
+    assert business_probe_url(220) == StoreBrowseAPI.probe_url("us", 220)
+    assert "appdetails" not in business_probe_url(220)
+    assert "IStoreBrowseService" in business_probe_url(220)
+
+
+# ── L2-2. 串行切换：业务归因必须正确 ─────────────────────────────
+@pytest.mark.asyncio
+async def test_l2_serial_switch_attributes_business_response(
+    tmp_data_dir, kernel_exe_path, clash_runtime, local_proxies, fake_browse
+) -> None:
+    """两个节点各自隧道到自己的假 StoreBrowse，返回不同价格。
+
+    若两个节点最终都走了同一个出口，「A→999、B→1234」这条会立刻失败。
+    """
+    await init_db()
+    port_a, hits_a = fake_browse(_browse_payload(final="999"))
+    port_b, hits_b = fake_browse(_browse_payload(final="1234"))
+    await _add(NODE_ACTIVE, "1|香港01", port=local_proxies(port_a))
+    await _add(NODE_ACTIVE, "2|usa: west #1", port=local_proxies(port_b))
+    base, secret = await _start_kernel(clash_runtime, kernel_exe_path, tmp_data_dir)
+
+    outcomes = await _l2(tmp_data_dir, base, secret, LOCAL_BUSINESS_TARGET)
+
+    assert [(o.runtime_name, o.final_price_in_cents) for o in outcomes] == [
+        ("1|香港01", 999),
+        ("2|usa: west #1", 1234),
+    ]
+    assert len(hits_a) == 1 and len(hits_b) == 1, "各节点只该命中自己的假服务一次"
+
+
+# ── L2-3. 业务目标故障：不改变节点状态 ───────────────────────────
+@pytest.mark.asyncio
+async def test_l2_target_service_failure_never_changes_state(
+    tmp_data_dir, kernel_exe_path, clash_runtime, local_proxies, fake_browse
+) -> None:
+    await init_db()
+    browse_port, _ = fake_browse({"message": "boom"}, status=503)
+    await _add(NODE_ACTIVE, "1|香港01", port=local_proxies(browse_port))
+    await _set_exit_ip("1|香港01", "198.51.100.7")
+    base, secret = await _start_kernel(clash_runtime, kernel_exe_path, tmp_data_dir)
+
+    (outcome,) = await _l2(tmp_data_dir, base, secret, LOCAL_BUSINESS_TARGET)
+
+    assert not outcome.ok
+    assert TARGET_SERVICE_FAILED in outcome.detail
+    assert outcome.http_status == 503
+
+    node = await _node("1|香港01")
+    assert node.state == NODE_ACTIVE, (
+        "业务目标 503 不得判节点死——否则就是让外部服务状态决定代理池健康"
+    )
+    assert node.exit_ip == "198.51.100.7"
+
+    (obs,) = await _l2_observations()
+    assert obs.level == "L2" and obs.ok is False and obs.detail
+
+
+# ── L2-4. HTTP 200 但业务响应非法 ────────────────────────────────
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload,marker",
+    [
+        # 生产实测 success 是整数 1；写成布尔 true 就是契约不符
+        (_browse_payload(success=True), "success"),
+        # 价格字符串不可解析 → 必须走 _to_int 语义而不是 isinstance(int)
+        (_browse_payload(final="not-a-number"), "final_price_in_cents"),
+    ],
+)
+async def test_l2_invalid_business_response(
+    tmp_data_dir, kernel_exe_path, clash_runtime, local_proxies, fake_browse,
+    payload: dict, marker: str
+) -> None:
+    await init_db()
+    browse_port, _ = fake_browse(payload)
+    await _add(NODE_ACTIVE, "1|香港01", port=local_proxies(browse_port))
+    base, secret = await _start_kernel(clash_runtime, kernel_exe_path, tmp_data_dir)
+
+    (outcome,) = await _l2(tmp_data_dir, base, secret, LOCAL_BUSINESS_TARGET)
+
+    assert not outcome.ok, "HTTP 200 但业务契约不符，不能算成功"
+    assert outcome.http_status == 200
+    assert INVALID_BUSINESS_RESPONSE in outcome.detail
+    assert marker in outcome.detail, "detail 要指出是哪一条业务契约不满足"
+    assert outcome.final_price_in_cents is None
+
+    node = await _node("1|香港01")
+    assert node.state == NODE_ACTIVE
+    (obs,) = await _l2_observations()
+    assert obs.level == "L2" and obs.ok is False
