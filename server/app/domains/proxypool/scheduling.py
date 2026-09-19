@@ -156,3 +156,63 @@ async def run_pending_rebuild(
         session, data_dir=data_dir, controller_url=controller_url, secret=secret,
         runtime=runtime, exe_path=exe_path,
     )
+
+
+@dataclass(frozen=True)
+class ProxypoolCycleResult:
+    """一个调度周期的结果（供日志与测试断言）。"""
+
+    l0: tuple[HealthOutcome, ...]
+    busy: bool
+    rebuilt: RebuildResult | None
+    maintenance: MaintenanceResult | None
+
+
+async def run_proxypool_cycle(
+    session: AsyncSession, *,
+    data_dir: Path,
+    controller_url: str,
+    secret: str,
+    runtime: _KernelRuntime,
+    exe_path: str,
+    now: datetime,
+    l0_target_url: str | None = None,
+    l1_url: str | None = None,
+    l2_url: str | None = None,
+    appid: int = DEFAULT_BUSINESS_APPID,
+) -> ProxypoolCycleResult:
+    """一个周期的固定顺序：**先判断节点是否坏了，再决定重建，重建后才做依赖 GLOBAL 的维护。**
+
+    ① L0（可与 crawler 并行）
+    ② 重新判断占用：busy → 本轮到此为止（不重建、不 L1/L2、不切 GLOBAL）
+    ③ 空闲 → 消费 `rebuild_pending` 并重建
+    ④ 重建后确认 Runtime ready（新 controller/端口）
+    ⑤ 最后才 L1/L2——观察对象因此始终接近生产状态
+
+    顺序不能颠倒：若先 L1/L2，它们面对的还是"含已死节点"的旧 Runtime，没有意义。
+    """
+    l0 = await run_l0_cycle(
+        session, data_dir=data_dir, controller_url=controller_url, secret=secret,
+        now=now, target_url=l0_target_url,
+    )
+
+    if crawler_busy():
+        # L0 是唯一允许在 crawler 占线时运行的维护动作
+        return ProxypoolCycleResult(l0=l0, busy=True, rebuilt=None, maintenance=None)
+
+    rebuilt = await run_pending_rebuild(
+        session, data_dir=data_dir, controller_url=controller_url, secret=secret,
+        runtime=runtime, exe_path=exe_path,
+    )
+    if rebuilt is not None:
+        # 重建换掉了实例：后续维护必须用**新的** controller
+        controller_url = rebuilt.controller_url
+        secret = getattr(runtime, "secret", secret)
+
+    maintenance = await run_maintenance_cycle(
+        session, data_dir=data_dir, controller_url=controller_url, secret=secret,
+        now=now, l1_url=l1_url, l2_url=l2_url, appid=appid,
+    )
+    return ProxypoolCycleResult(
+        l0=l0, busy=False, rebuilt=rebuilt, maintenance=maintenance
+    )

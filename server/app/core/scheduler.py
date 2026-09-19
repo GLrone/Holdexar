@@ -264,6 +264,54 @@ def _crawler_idle() -> bool:
     return handle is None or handle.task.done()
 
 
+async def _job_proxypool_cycle() -> None:
+    """proxypool 周期：L0 → 占用判断 → 消费 pending 重建 → L1/L2。
+
+    **刻意只注册一个 job**：拆成三个独立定时任务会让 L0 / 维护 / 重建互相竞争
+    （occupancy 只挡得住 crawler，挡不住 proxypool 自己人）。阶段划分留在
+    `run_proxypool_cycle` 内部。
+
+    前置条件：必须已存在可用的池 Runtime（运行配置 + 内核在跑）。没有就跳过本轮——
+    bootstrap 不属于本阶段职责。
+    """
+    from datetime import datetime
+
+    from app.core.config import get_settings
+    from app.core.database import get_session_factory
+    from app.domains.proxies import clash_manager as _cm
+    from app.domains.proxypool import scheduling as _sched
+    from app.domains.proxypool.runtime import (
+        RuntimeConfigError, controller_endpoint_of,
+    )
+
+    data_dir = get_settings().data_dir
+    try:
+        base, secret = controller_endpoint_of(data_dir)
+    except (RuntimeConfigError, OSError) as e:
+        logger.info("[定时] proxypool 周期跳过：池 Runtime 尚未就绪（%s）", e)
+        return
+    try:
+        async with get_session_factory()() as session:
+            result = await _sched.run_proxypool_cycle(
+                session,
+                data_dir=data_dir,
+                controller_url=base,
+                secret=secret,
+                runtime=_cm.pool_runtime,
+                exe_path=str(_cm.kernel_exe(data_dir)),
+                now=datetime.now(),
+            )
+            await session.commit()
+        logger.info(
+            "[定时] proxypool 周期：L0 %d 项 | busy=%s | rebuilt=%s | 维护=%s",
+            len(result.l0), result.busy,
+            "是" if result.rebuilt else "否",
+            "跳过" if result.maintenance is None else "已执行",
+        )
+    except Exception:  # noqa: BLE001 —— 周期失败不拖垮调度器
+        logger.exception("[定时] proxypool 周期异常")
+
+
 async def _job_price_repair() -> None:
     """失败记录修复（5min 一轮）：扫全库 missing 失败记录定向重抓。
 
@@ -824,6 +872,12 @@ def start_scheduler() -> None:
     scheduler.add_job(_job_bartervg_bundles, "cron", hour=5, minute=40, id="bartervg_bundles")
     scheduler.add_job(_job_wal_truncate, "cron", hour=4, minute=30, id="wal_truncate")
     scheduler.add_job(_job_backup, "interval", hours=24, id="auto_backup")
+    # proxypool 周期：**只注册这一个**（L0 / pending 重建 / L1-L2 都在它内部按序发生）。
+    # 池 Runtime 未就绪时函数内部自行跳过；max_instances=1 防上一轮未跑完又叠一轮。
+    scheduler.add_job(
+        _job_proxypool_cycle, "interval", minutes=5, id="proxypool_cycle",
+        max_instances=1, coalesce=True,
+    )
     scheduler.start()
     # 外部时间纠偏探针（异步，10s 延时错开启动风暴）；无事件循环的
     # 同步上下文静默跳过——初锚已可用，首轮触发时重锚会再核对一次
