@@ -48,6 +48,14 @@ class RuntimeUnreachableError(RuntimeError):
     """控制器在超时内不可用——通常意味着内核**没有起来**（配置解析 fatal）。"""
 
 
+class RuntimeUnavailableError(RuntimeError):
+    """拿不到可用的池 Runtime 代理地址。
+
+    **Fail closed**：受管爬取在这种情况下必须拒绝启动，绝不静默退回直连或旧订阅
+    代理——否则"池坏了"会伪装成"爬取成功"，而且两套 Runtime 的隔离会被悄悄破坏。
+    """
+
+
 RUNTIME_CONFIG_FILENAME = "crawl-runtime.yaml"
 
 # 运行期专属键（只进运行配置，绝不回流进池文件）
@@ -390,3 +398,37 @@ async def rebuild_runtime(
         expected_count=build.expected_count,
         written_count=build.written_count,
     )
+
+
+# ══ 受管爬取的代理地址：拿不到就拒绝启动 ═════════════════════════
+# crawler 只该拿"当前运行时代理 URL"，不理解 GLOBAL / 重建 / 端口变化。而它**必须**
+# 拿到——拿不到就拒绝启动：静默退回直连（或旧订阅代理）会把"池坏了"伪装成"爬取成功"，
+# 并悄悄破坏两套 Runtime 的隔离。
+
+
+def current_runtime_proxy_url(data_dir: Path) -> str | None:
+    """当前 Runtime 的代理地址；不可用返回 `None`。
+
+    可用 = 运行配置里有 `mixed-port` **且该端口真的在监听**。只看配置不够：内核没起来
+    或入口还没就绪时，配置照样存在，而请求会直接 `ConnectError`。
+    """
+    try:
+        port = mixed_port_of(data_dir)
+    except (RuntimeConfigError, OSError):
+        # 连运行配置都没有（首次启动）也是"不可用"，不是异常
+        return None
+    with socket.socket() as sock:
+        sock.settimeout(0.3)
+        if sock.connect_ex(("127.0.0.1", port)) != 0:
+            return None
+    return f"http://127.0.0.1:{port}"
+
+
+def require_runtime_proxy_url(data_dir: Path) -> str:
+    """同 `current_runtime_proxy_url`，但拿不到就抛 `RuntimeUnavailableError`。"""
+    proxy_url = current_runtime_proxy_url(data_dir)
+    if proxy_url is None:
+        raise RuntimeUnavailableError(
+            "代理运行时不可用（没有可用的池 Runtime），本次爬取未启动"
+        )
+    return proxy_url
