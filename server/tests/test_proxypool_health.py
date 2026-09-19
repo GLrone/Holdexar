@@ -50,6 +50,7 @@ from app.domains.proxypool.models import (  # noqa: E402
 from app.domains.proxypool.pool import build_pool  # noqa: E402
 from app.domains.proxypool.runtime import (  # noqa: E402
     prepare_runtime_config,
+    wait_mixed_port,
     wait_proxy_names,
 )
 from app.domains.proxypool.state import (  # noqa: E402
@@ -348,6 +349,8 @@ async def _start_kernel(clash_runtime: ClashRuntime, exe: Path, data_dir: Path):
     status = clash_runtime.start(str(exe), str(prepare_runtime_config(data_dir)))
     base = status["controllerUrl"]
     await wait_proxy_names(base, clash_runtime.secret, timeout=15)
+    # 控制器就绪 ≠ 入口就绪：不等 mixed-port，紧接着的请求会 ConnectError
+    await wait_mixed_port(data_dir, timeout=15)
     return base, clash_runtime.secret
 
 
