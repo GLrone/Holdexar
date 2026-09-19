@@ -96,6 +96,10 @@ def chain_calls(monkeypatch):
     monkeypatch.setattr(
         proxies_service, "maybe_run_clash_health_check", step("clash_health")
     )
+    # 池 Runtime bootstrap：链内以 `core_scheduler._startup_pool_runtime()` 调用
+    monkeypatch.setattr(
+        sched_mod, "_startup_pool_runtime", step("pool_bootstrap")
+    )
     async def fake_backfill(dry_run: bool = False):
         calls.append("rates_backfill")
         return {"inserted": 0, "scanned": 0}
@@ -131,13 +135,13 @@ def chain_calls(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_chain_order_and_scheduler_last(db, chain_calls):
-    """全链顺序：种子 → … → 标记三连 → 内核 → 自启 → 汇率 → 捆绑包预热 → 调度器收尾。"""
+    """全链顺序：种子 → … → 标记三连 → 内核 → 自启 → **池 Runtime** → 汇率 → 捆绑包预热 → 调度器收尾。"""
     await main_mod._post_startup_chain()
     expected = [
         "import_seed", "merge_seeds", "family_warm", "orphan_cleanup",
         "rates_cleanup", "legacy_sub_migrate", "legacy_kv_migrate",
         "hl_flags", "pp_flags", "sort_cache",
-        "kernel_ensure", "clash_autostart", "clash_health",
+        "kernel_ensure", "clash_autostart", "clash_health", "pool_bootstrap",
         "rates_stale", "rates_backfill", "bundles_sort", "bundles_warm",
         "scheduler_start",
     ]
@@ -146,14 +150,20 @@ async def test_chain_order_and_scheduler_last(db, chain_calls):
 
 @pytest.mark.asyncio
 async def test_chain_survives_step_failure(db, chain_calls):
-    """种子合并炸了不拖垮后续：标记刷新照常、调度器照常启动。"""
+    """种子合并 / 标记刷新 / **池 Runtime bootstrap** 炸了都不拖垮后续。
+
+    池 bootstrap 失败必须只留日志：crawler 保持 fail-closed，但应用与调度器照常起来，
+    30min 后的订阅刷新才是下一次机会。
+    """
     chain_calls.errors["merge_seeds"] = RuntimeError("种子库损坏")
     chain_calls.errors["pp_flags"] = RuntimeError("窗口函数不兼容")
+    chain_calls.errors["pool_bootstrap"] = RuntimeError("池 Runtime 起不来")
     await main_mod._post_startup_chain()
     assert "scheduler_start" in chain_calls.calls
     assert "hl_flags" in chain_calls.calls
     assert "sort_cache" in chain_calls.calls
     assert "clash_autostart" in chain_calls.calls
+    assert "pool_bootstrap" in chain_calls.calls
 
 
 @pytest.mark.asyncio

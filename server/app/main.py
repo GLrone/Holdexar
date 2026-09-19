@@ -206,7 +206,10 @@ async def _post_startup_chain() -> None:
     # 30min 后的订阅刷新就是下一次机会。放在内核就位之后：bootstrap 需要内核可执行文件。
     from app.core import scheduler as core_scheduler
 
-    await core_scheduler._startup_pool_runtime()
+    try:
+        await core_scheduler._startup_pool_runtime()
+    except Exception:  # noqa: BLE001 —— 与链内其它步骤同约定：本步异常只留日志
+        logger.exception("[启动] 池 Runtime bootstrap 步骤异常（不阻塞启动）")
 
     # 汇率启动兜底：错过每日 03:00 定点（关机/服务重启）时按快照龄补刷新，
     # 保证"每日自动抓取"承诺不因服务频繁重启落空（内含 >12h 阈值，幂等安全）
