@@ -35,8 +35,12 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import yaml
+
 from app.domains.proxies.models import ProxySubscription
-from app.domains.proxypool.pool import build_pool, eligible_runtime_names
+from app.domains.proxypool.pool import (
+    build_pool, eligible_runtime_names, pool_path,
+)
 from app.domains.proxypool.registry import apply_snapshot
 from app.domains.proxypool.runtime import (
     DEFAULT_WAIT_TIMEOUT,
@@ -143,14 +147,16 @@ async def sync_subscriptions(
 
 
 async def runtime_ready(session: AsyncSession, *, data_dir: Path) -> bool:
-    """ready = 池非空 + 入口在听 + controller 可访问 + 对账通过。
+    """ready = 内核活着、入口在听、controller 可访问，且**与它启动时那份池产物一致**。
 
-    只看"运行配置文件存在"是不够的——文件在、内核没起来是最常见的假 ready。
+    刻意**不**要求"Registry == 内核"：池刚变脏（订阅带进新节点）正是等着 rebuild 的状态，
+    那时内核落后于 Registry 是正常的。若把这种状态判成 not ready，刷新链会误以为
+    "没有可用 Runtime"而重新 bootstrap，把一个本该 rebuild 的场景变成一次多余的内核重启。
     """
     if current_runtime_proxy_url(data_dir) is None:
         return False
-    names = await eligible_runtime_names(session)
-    if not names:
+    artifact = _artifact_names(data_dir)
+    if not artifact:
         return False
     try:
         base, secret = controller_endpoint_of(data_dir)
@@ -158,9 +164,21 @@ async def runtime_ready(session: AsyncSession, *, data_dir: Path) -> bool:
     except Exception:  # noqa: BLE001
         return False
     ledger = reconcile(
-        registry_names=set(names), pool_names=set(names), observed_names=observed
+        registry_names=set(artifact), pool_names=set(artifact),
+        observed_names=observed,
     )
     return ledger.ok
+
+
+def _artifact_names(data_dir: Path) -> tuple[str, ...]:
+    """内核启动时那份池产物（`crawl-pool.yaml`）里的名字。"""
+    try:
+        doc = yaml.safe_load(pool_path(data_dir).read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return ()
+    if not isinstance(doc, dict):
+        return ()
+    return tuple(str(p["name"]) for p in doc.get("proxies", []) if isinstance(p, dict))
 
 
 async def ensure_pool_runtime(
@@ -170,8 +188,13 @@ async def ensure_pool_runtime(
     exe_path: str,
     now: datetime,
     wait_timeout: float = DEFAULT_WAIT_TIMEOUT,
+    skip_sync: bool = False,
 ) -> BootstrapResult:
-    """幂等原语：**只有没有可用 Runtime 时**才 bootstrap。"""
+    """幂等原语：**只有没有可用 Runtime 时**才 bootstrap。
+
+    `skip_sync=True` 供"调用方刚刚自己同步过"的场景（订阅刷新链）：直接吃最新
+    Registry 建 Runtime，**不再重复抓一次订阅**。
+    """
     if await runtime_ready(session, data_dir=data_dir):
         base, _ = controller_endpoint_of(data_dir)
         return BootstrapResult(
@@ -188,8 +211,9 @@ async def ensure_pool_runtime(
                 await eligible_runtime_names(session), "已有可用 Runtime（等锁期间建好）",
             )
 
-        sync = await sync_subscriptions(session, data_dir=data_dir, now=now)
-        if not sync.pool_names:
+        if not skip_sync:
+            await sync_subscriptions(session, data_dir=data_dir, now=now)
+        if not await eligible_runtime_names(session):
             return BootstrapResult(
                 False, False, None, None, (),
                 "无可用节点/无订阅：无法 bootstrap（crawler 保持不可用）",
@@ -228,3 +252,74 @@ async def ensure_pool_runtime(
             True, True, f"http://127.0.0.1:{port}", base, build.runtime_names,
             "bootstrap 完成",
         )
+
+
+# ══ 订阅刷新链的分流 ═════════════════════════════════════════════
+# 判定"池变了"用的是 **Runtime Pool signature**，不是 Snapshot SHA：快照整体变了
+# （例如来源元数据、无关节点变化）但合格运行集没变时，重启内核毫无意义。
+
+
+async def pool_signature(session: AsyncSession) -> tuple[str, ...]:
+    """当前 Runtime 池的签名：eligible 节点的 `runtime_name` + 配置指纹。
+
+    只看**会进内核的东西**——所以 `state` 变化导致节点进出池会改变签名，而订阅侧
+    改名/换来源不会（`runtime_name` 铸造一次即固定、`name` 本来就不参与指纹）。
+    """
+    from app.domains.proxypool.models import node_fingerprint
+    from app.domains.proxypool.pool import eligible_nodes
+
+    nodes = await eligible_nodes(session)
+    return tuple(
+        f"{node.runtime_name}:{node_fingerprint(dict(node.normalized_config or {}))}"
+        for node in nodes
+    )
+
+
+@dataclass(frozen=True)
+class RefreshTriageResult:
+    synced: bool
+    pool_changed: bool
+    # none | bootstrapped | unavailable | rebuild_requested
+    action: str
+    bootstrap: BootstrapResult | None
+
+
+async def handle_subscription_refresh(
+    session: AsyncSession, *,
+    data_dir: Path,
+    runtime: _KernelRuntime,
+    exe_path: str,
+    now: datetime,
+) -> RefreshTriageResult:
+    """订阅刷新后的严格分流（**绝不在这里 stop/start Runtime**）：
+
+    - 同步失败 → 什么都不做：旧 Runtime 继续工作，没有 Runtime 就继续不可用；
+    - 没有可用 Runtime → `ensure_pool_runtime(skip_sync=True)`（吃刚同步好的 Registry，
+      不再重复抓订阅，也不产生多余的 pending 重建）；
+    - 有 Runtime 且池签名变了 → 只 `request_rebuild()`，重建交给 P1.6-C 空闲时消费；
+    - 有 Runtime 且签名没变 → 什么都不做。
+    """
+    from app.domains.proxypool.scheduling import request_rebuild
+
+    before = await pool_signature(session)
+    sync = await sync_subscriptions(session, data_dir=data_dir, now=now)
+    synced = bool(sync.snapshot_sha256)
+    if not synced:
+        return RefreshTriageResult(False, False, "none", None)
+
+    after = await pool_signature(session)
+    pool_changed = after != before
+
+    if not await runtime_ready(session, data_dir=data_dir):
+        boot = await ensure_pool_runtime(
+            session, data_dir=data_dir, runtime=runtime, exe_path=exe_path,
+            now=now, skip_sync=True,
+        )
+        return RefreshTriageResult(
+            True, pool_changed, "bootstrapped" if boot.ready else "unavailable", boot
+        )
+
+    if pool_changed:
+        request_rebuild()
+        return RefreshTriageResult(True, True, "rebuild_requested", None)
+    return RefreshTriageResult(True, False, "none", None)

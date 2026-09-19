@@ -201,6 +201,13 @@ async def _post_startup_chain() -> None:
     except Exception:  # noqa: BLE001
         logger.exception("[启动体检] Clash 节点检测失败（不阻塞启动）")
 
+    # 池 Runtime bootstrap：首次把「订阅 → Snapshot → Registry → Pool → Runtime」建起来。
+    # 幂等（已有可用 Runtime 直接返回）；**失败不阻塞启动**——crawler 保持 fail-closed，
+    # 30min 后的订阅刷新就是下一次机会。放在内核就位之后：bootstrap 需要内核可执行文件。
+    from app.core import scheduler as core_scheduler
+
+    await core_scheduler._startup_pool_runtime()
+
     # 汇率启动兜底：错过每日 03:00 定点（关机/服务重启）时按快照龄补刷新，
     # 保证"每日自动抓取"承诺不因服务频繁重启落空（内含 >12h 阈值，幂等安全）
     try:
