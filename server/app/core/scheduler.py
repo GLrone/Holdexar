@@ -264,6 +264,36 @@ def _crawler_idle() -> bool:
     return handle is None or handle.task.done()
 
 
+async def _startup_pool_runtime() -> None:
+    """启动链的一步：首次建立池 Runtime（bootstrap 原语）。
+
+    **失败绝不让应用启动失败**：没有订阅 / 下载失败 / 解析失败 / 内核起不来，都只是
+    "Runtime 不可用 → crawler 保持 fail-closed"，应用与调度器继续跑，30min 后的订阅
+    刷新就是下一次 bootstrap 机会。否则会把"失败下周期再试"的设计自己破坏掉。
+    """
+    from datetime import datetime
+
+    from app.core.config import get_settings
+    from app.core.database import get_session_factory
+    from app.domains.proxies import clash_manager as _cm
+    from app.domains.proxypool import bootstrap as _bs
+
+    try:
+        data_dir = get_settings().data_dir
+        async with get_session_factory()() as session:
+            result = await _bs.ensure_pool_runtime(
+                session, data_dir=data_dir, runtime=_cm.pool_runtime,
+                exe_path=str(_cm.kernel_exe(data_dir)), now=datetime.now(),
+            )
+            await session.commit()
+        logger.info(
+            "[启动] 池 Runtime：%s（%s）",
+            "ready" if result.ready else "unavailable", result.detail,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("[启动] 池 Runtime bootstrap 失败（应用继续运行，crawler 保持不可用）")
+
+
 async def _job_proxypool_cycle() -> None:
     """proxypool 周期：L0 → 占用判断 → 消费 pending 重建 → L1/L2。
 
@@ -470,6 +500,29 @@ async def _job_subscription_refresh() -> None:
             )
         except Exception:  # noqa: BLE001 —— 首检失败不影响重拉事实
             logger.exception("[定时] 订阅重拉后首检失败（可稍后手动检测）")
+
+    # 订阅刷新 → Snapshot/Registry → 池签名分流；**绝不在这里 stop/start 池 Runtime**
+    try:
+        from datetime import datetime
+
+        from app.core.config import get_settings
+        from app.core.database import get_session_factory
+        from app.domains.proxies import clash_manager as _cm
+        from app.domains.proxypool import bootstrap as _bs
+
+        data_dir = get_settings().data_dir
+        async with get_session_factory()() as session:
+            triage = await _bs.handle_subscription_refresh(
+                session, data_dir=data_dir, runtime=_cm.pool_runtime,
+                exe_path=str(_cm.kernel_exe(data_dir)), now=datetime.now(),
+            )
+            await session.commit()
+        logger.info(
+            "[定时] 订阅刷新后池分流：synced=%s pool_changed=%s action=%s",
+            triage.synced, triage.pool_changed, triage.action,
+        )
+    except Exception:  # noqa: BLE001 —— 分流失败不影响订阅重拉事实
+        logger.exception("[定时] 订阅刷新后池分流失败（下轮再试）")
 
 
 async def _job_proxy_health() -> None:
