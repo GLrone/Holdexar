@@ -16,7 +16,7 @@ from pathlib import Path
 import httpx
 import pytest
 import yaml
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.core.config import get_settings  # noqa: E402
 from app.core.database import get_engine, get_session_factory, init_db  # noqa: E402
@@ -351,3 +351,47 @@ async def test_concurrent_ensure_bootstraps_once(tmp_data_dir, kernel_exe_path,
     )
     assert all(r.ready for r in (first, second))
     assert pool_runtime.process is not None
+
+
+# ══ 10. 库层失败必须被记录，且不牵连同轮其它订阅（真实生产复现）═════
+@pytest.mark.asyncio
+async def test_sync_records_failure_without_crashing(tmp_data_dir, monkeypatch):
+    """真实生产复现：`persist_snapshot` flush 失败后，错误分支再去读会话里的
+    `sub.*` 会抛 `PendingRollbackError` ⇒ **失败本身没被记录**。
+
+    修复后要求：
+      - `SyncResult.failures` 带上失败原因；
+      - 失败落到订阅行（`last_fetch_status='FAILED'` + `last_error`）；
+      - savepoint 只回滚失败的那条订阅 → 同轮其它订阅照常落库。
+    """
+    await init_db()
+    bad = await _add_subscription("https://bad.invalid/x")
+    good = await _add_subscription("https://good.invalid/x")
+    _script_fetch([_node("ISO1", "10.7.7.1")], monkeypatch)
+
+    real_persist = bs.persist_snapshot
+    calls = {"n": 0}
+
+    async def _persist(session, snap, *, data_dir):
+        calls["n"] += 1
+        if calls["n"] == 1:  # 第一条订阅写入失败（等价于真实库缺列那次）
+            raise RuntimeError("no column named http_status")
+        return await real_persist(session, snap, data_dir=data_dir)
+
+    monkeypatch.setattr(bs, "persist_snapshot", _persist)
+
+    async with get_session_factory()() as s:
+        sync = await bs.sync_subscriptions(s, data_dir=tmp_data_dir, now=NOW)
+        await s.commit()
+
+    assert sync.failures == {bad: "no column named http_status"}
+    bad_row, good_row = await _sub_row(bad), await _sub_row(good)
+    assert bad_row.last_fetch_status == "FAILED", "失败必须被记录下来"
+    assert bad_row.last_error == "no column named http_status"
+    assert good_row.last_fetch_status == "OK" and good_row.snapshot_version == 1
+
+    # savepoint 隔离：失败那条没留下节点/来源，成功那条正常
+    async with get_session_factory()() as s:
+        n_nodes = await s.scalar(select(func.count()).select_from(ProxyNode))
+        n_src = await s.scalar(select(func.count()).select_from(ProxyNodeSource))
+    assert (n_nodes, n_src) == (1, 1), "失败条目不得留下半截写入，成功条目要落库"

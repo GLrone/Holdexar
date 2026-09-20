@@ -122,6 +122,13 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
     # 历史行无此列 → 读回为 NULL（调用方按"当前 URL 没有成功快照"fail-closed）。
     "subscription_snapshots": {
         "url": "VARCHAR(500)",
+        # 模型自 68b82e5（P1.1/P1.2 底座）起就有、但从未登记进本机制的历史缺列：
+        # 真实 holdexar-dev 库的该表由更早的停放期模型建成，缺这 3 列 →
+        # 首次真实同步 INSERT 直接报 "no column named http_status"。
+        # 登记后启动幂等补齐（该表当前 0 行 → 零数据风险）。
+        "http_status": "INTEGER",
+        "content_type": "VARCHAR(100)",
+        "source_channel": "VARCHAR(32)",
     },
     # account 域多账号在线状态（GetPlayerSummaries/miniprofile 双通道）
     "steam_accounts": {
