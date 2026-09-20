@@ -1,9 +1,9 @@
 /* famBuy 词条 —— 家庭组·购买动态页签（views/family/tabs/FamBuy.vue）。
 
-   术语沿用在先拍板的 A / B 表（英文侧逐字对齐，见 en/famBuy.ts）：
-   · 购入时间 → Acquired（B 表 / D5：中文「购入时间」「入库时间」是同一个字段
+   术语对齐表（英文侧逐字对齐，见 en/famBuy.ts）：
+   · 购入时间 → Acquired（中文「购入时间」「入库时间」是同一个字段
      rt_time_acquired，英文不许因都有「时间」二字就写成 Date）
-   · 购买者 → Buyer；拥有者 → Owners；快照数据 → Snapshot（B 表）
+   · 购买者 → Buyer；拥有者 → Owners；快照数据 → Snapshot
    · 完整账单分析 → 与 shell.nav.bills 的既有英文 Bills 同源
 
    两处刻意的写法：

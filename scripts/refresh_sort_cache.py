@@ -1,7 +1,7 @@
 """刷新 games 排序缓存预计算列（min_cny_fen / diff_fen）。
 
-对应原型 scripts/refresh_materialized_view.ts 的角色：
-MV 的物化列改为 games 表列后，本脚本即其手动维护入口。
+排序缓存是 games 表上的预计算列，本脚本是它的手动维护入口
+（服务层实现见 app.domains.games.service.refresh_sort_cache）。
 
 用法（项目根，用 server 虚拟环境）：
     server/.venv/Scripts/python.exe scripts/refresh_sort_cache.py              # 全库

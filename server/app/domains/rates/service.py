@@ -2,7 +2,7 @@
 
 数据源：
 1. augmentedsteam  https://api.augmentedsteam.com/rates/v1?to=CNY
-   → 实测响应为嵌套形态 {CUR: {"CNY": rate_to_cny}}；兼容旧平铺 {CUR: rate} 形态
+   → 响应为嵌套形态 {CUR: {"CNY": rate_to_cny}}；兼容平铺 {CUR: rate} 形态
 2. open.er-api     https://open.er-api.com/v6/latest/CNY           → rates 为 per-CNY，取倒数
 CNY 恒为 1.0。每次刷新写 fx_rates（UPSERT）+ fx_rate_history（INSERT）。
 """
@@ -154,8 +154,8 @@ async def refresh_rates() -> dict:
             session.add(
                 FxRateHistory(currency_code=code, rate_to_cny=rate, source=source, fetched_at=now)
             )
-        # 白名单清洗并入同一事务（幂等）。原先排在 commit 之后、随会话关闭被
-        # 静默回滚——实际只靠启动链的 cleanup_disallowed 兜底
+        # 白名单清洗并入同一事务（幂等）。排在 commit 之后会随会话关闭被
+        # 静默回滚——只剩启动链的 cleanup_disallowed 兜底
         await _delete_disallowed(session)
         # ── 原子刷新边界：cny_fen 重算 + 两域排序快照 ──
         recomputed = await snapshot_service.recompute_cny_fen_all(session)

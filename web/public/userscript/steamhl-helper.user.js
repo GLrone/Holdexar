@@ -2,7 +2,7 @@
 // @name         SteamHL助手
 // @namespace    http://tampermonkey.net/
 // @version      1.2.0
-// @description  配合本地 HTML 报告使用：实现跨域查价 + 本地收藏数据同步 + Steam API 代理 + Package 凭证持久化 + 家庭组愿望单同步 + Epic地区价格代理（TOP100热榜已迁移至后端）
+// @description  配合本地 HTML 报告使用：实现跨域查价 + 本地收藏数据同步 + Steam API 代理 + Package 凭证持久化 + 家庭组愿望单同步 + Epic地区价格代理
 // @author       GLrone
 // @match        file:///*.html
 // @match        *steamhl.com*
@@ -259,7 +259,7 @@
         }
     });
 
-    // 3. [V1.1.1] Package 凭证持久化 —— 接管 HTML 的 localStorage
+    // 3. Package 凭证持久化 —— 接管 HTML 的 localStorage
     window.addEventListener('SAVE_PACKAGE_DATA', function (e) {
         const { steamId, data } = e.detail || {};
         if (!steamId) {
@@ -381,7 +381,7 @@
         });
     });
 
-    // ==================== [V1.1.2] 数据自动同步 (UserData) ====================
+    // ==================== 数据自动同步 (UserData) ====================
     window.addEventListener('AUTO_SYNC_USERDATA_REQUEST', function (e) {
         console.log(`${LOG} 📡 收到网页端应用自动同步 userdata 请求`);
         const ts = new Date().getTime();
@@ -425,19 +425,18 @@
         });
     });
 
-    // ==================== [V1.2.0] TOP100 热榜已迁移至后端 ====================
-    // TOP100 热榜现在由后端脚本 sync_steam_top100.ts 定时拉取并缓存到 Redis。
-    // 前端通过 /api/v1/steam/top100 或 /api/v1/games?sort=top100 直接获取。
-    // 此处保留兼容监听器：如果旧版 HTML 仍发送 STEAM_FETCH_TOP100 事件，
-    // 返回空数据提示前端使用后端 API。
+    // ==================== TOP100 热榜兼容监听器 ====================
+    // TOP100 热榜由后端脚本定时拉取并缓存，前端经 /api/v1/steam/top100 或
+    // /api/v1/games?sort=top100 获取。此处仅兼容旧版 HTML 发出的
+    // STEAM_FETCH_TOP100 事件：返回空数据与 migrated 标记，引导其改走后端 API。
     window.addEventListener('STEAM_FETCH_TOP100', function (e) {
-        console.log(`${LOG} ℹ️ TOP100 已迁移至后端，请使用 /api/v1/steam/top100`);
+        console.log(`${LOG} ℹ️ TOP100 请使用后端 API /api/v1/steam/top100`);
         window.dispatchEvent(new CustomEvent('STEAM_TOP100_RESPONSE', {
             detail: { appIds: [], migrated: true }
         }));
     });
 
-    // ==================== 跨域价格查询（V1.1.3 原版逻辑，保持不变）====================
+    // ==================== 跨域价格查询 ====================
     /**
      * STEAMPY_REQUEST 事件格式: { appId, subId, containerId }
      * 同时触发 SteamPY 和 SteamCICI 两路查询，分别回传各自 RESPONSE 事件
@@ -513,7 +512,7 @@
         });
     });
 
-    // ==================== [V1.1.6] Epic 跨域多地区查价代理 ====================
+    // ==================== Epic 跨域多地区查价代理 ====================
     window.addEventListener('EPIC_PRICE_REQUEST', function (e) {
         const { gameName, containerId } = e.detail;
         if (!gameName) return;

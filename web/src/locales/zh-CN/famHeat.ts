@@ -1,9 +1,9 @@
 /* famHeat 词条 —— 家庭组·入库热力图页签（views/family/tabs/FamHeat.vue）。
 
    术语沿用 A / B 表（英文侧逐字对齐，见 en/famHeat.ts）：
-   · 入库 → acquisition / acquired（A 表 acquisition heatmap 同源）
-   · 快照数据 → Snapshot（B 表，代码 `fromSnapshot`）
-   · 家庭库 → family library（A 表 / D1）
+   · 入库 → acquisition / acquired（acquisition heatmap 同源）
+   · 快照数据 → Snapshot（代码 `fromSnapshot`）
+   · 家庭库 → family library
 
    三处刻意的写法：
    · 月份轴标签（原手写的 `2024年1月` / `1月`）不是词条，走
@@ -11,7 +11,7 @@
      英文 `Jan 2024` / `Jan`（U3）。`YYYY-MM-DD` 那串日期格式（`fmtKey`）保持
      原样：它在两种语言下是同一串 ISO 文本，语言中立，**有意不做词条**；
    · `famHeat.meta` 的行内 `<b>` 写在值里、组件侧 v-html 渲染（同 bills 的先例）。
-     日期区间与 `→` 留在组件侧：`→` 是纯符号（brief4 §5），且那两个日期由
+     日期区间与 `→` 留在组件侧：`→` 是纯符号，且那两个日期由
      `fmtKey` 就地截取，不做词条；
    · `famHeat.tip.day` 是**整句**（`{date} · 入库 {count} 款`），不是「日期 + 文案」
      两段拼接——英文语序不同。 */

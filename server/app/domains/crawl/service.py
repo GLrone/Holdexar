@@ -194,11 +194,18 @@ async def _active_wishlist_ids() -> tuple[list[int], set[int], set[int]]:
             ids.append(appid)
         if r.manual:
             manual_ids.add(appid)
+        if r.wishlisted:
+            wishlisted_ids.add(appid)
+    # 下架脱池（宽限期外）：Steam 愿望单对下架游戏仍返回条目，
     # 留着只会让每日价格刷新全 41 区空转打 404；
     # 永久免费同理脱池（价格事实已定，再爬是空转配额）
+    removed = await _excluded_removed_appids()
     free_marked = await _excluded_free_appids()
     excluded = removed | free_marked
     return [a for a in ids if a not in excluded], manual_ids, wishlisted_ids
+
+
+async def _resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tuple[int, str]]:
     """scope: appids（显式列表）| wishlist（全部活跃监控条目，含已购）
     | wishlist_only（活跃且非已购）| owned（活跃且已购）| pool（全池）。
     前四种按第一优先级（愿望单/关注）→ hot（打折/史低）→ appid 序排。
@@ -237,20 +244,28 @@ async def _active_wishlist_ids() -> tuple[list[int], set[int], set[int]]:
             if a in seen_ids:
                 continue
             seen_ids.add(a)
+            deduped_ids.append(a)
+        wl_ids = deduped_ids
+        # 下架脱池（宽限期外）：Steam 愿望单对下架游戏仍返回条目，
         # 留着只会让每日价格刷新全 41 区空转打 404；永久免费同理
         excluded = await _excluded_removed_appids() | await _excluded_free_appids()
         wl_ids = [a for a in wl_ids if a not in excluded]
+        return [
+            (a, "")
+            for a in await _wishlist_ordered(wl_ids, manual_ids, wishlisted_ids)
         ]
 
     if scope == "pool":
         # 全池 = 监控条目优先序（复用 wishlist 排序）在前 + 其余 games 行
-        # （下架脱池）appid 稳定序垫后。单 job 一遍过，不做分层——分层会让
-        # 愿望单同轮双爬，产出同价重复快照。
+        # （下架脱池、永久免费脱池）appid 稳定序垫后。单 job 一遍过——
+        # 愿望单同轮只爬一次，避免同价重复快照。
         async with get_session_factory()() as session:
             pool_rows = (
                 await session.execute(
                     select(Game.appid)
-                    .where(Game.removed_at.is_(None))
+                    .where(
+                        Game.removed_at.is_(None), Game.free_kind.is_(None)
+                    )
                     .order_by(Game.appid)
                 )
             ).scalars().all()

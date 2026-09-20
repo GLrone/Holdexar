@@ -1014,7 +1014,7 @@ html:not(.dark) .table th{color:var(--text-secondary)}
 .fp-btn--apply{background:linear-gradient(135deg,var(--success),var(--success-deep));color:var(--ink-on-fill)}
 .fp-btn--apply:hover{transform:translateY(-1px);box-shadow:0 4px 10px var(--success-a30)}
 
-/* ══ 高级筛选增强（迁移自 price-report 高级筛选面板，复用设计令牌）══ */
+/* ══ 高级筛选增强（复用设计令牌）══ */
 /* 史低状态：新史低=accent 蓝勾 / 平史低=success 绿勾 */
 .checkbox--hlnew.is-on .checkbox__box{background:var(--accent);border-color:var(--accent)}
 .checkbox--hlnew.is-on .checkbox__box::after{border-color:var(--on-accent-fill)}
@@ -5511,7 +5511,7 @@ function toast(type,msg){
 function toggleSwitch(el){el.classList.toggle('is-on')}
 function toggleCheck(el){el.classList.toggle('is-on')}
 
-/* 高级筛选面板（迁移自 price-report 高级筛选面板）交互原型 */
+/* 高级筛选面板交互 */
 function cfToggleFilterRegion(){document.getElementById('fpRegionPop').classList.toggle('show')}
 function cfPickRegion(el,flag,name){
   document.getElementById('fpRegionFlag').src=flag;

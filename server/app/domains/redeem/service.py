@@ -45,9 +45,8 @@ _HEADERS = {
 }
 
 # registerkey 错误码 → 中文语义。
-# ⚠️ 该表是社区实测语义，勿再按"官方文档"纠正——53=次数上限（30 分钟 10 次
-# 尝试窗口）不是锁区；测试打光配额后 5 个真 key 全返 53 曾被误判成锁区，
-# 教训：实测优先于推测。配额用尽时 Steam 不查 key 直接返 53，任何码都一样。
+# ️ 该表按社区语义，勿按"官方文档"纠正——53=次数上限（30 分钟 10 次
+# 尝试窗口）不是锁区；配额用尽时 Steam 不查 key 直接返 53，任何码都一样。
 _ERROR_CODES: dict[int, str] = {
     9: "已拥有",
     13: "地区限制",
@@ -194,8 +193,8 @@ async def activate_key(product_key: str) -> dict:
         sub_id, sub_name = _summary_from_receipt(data.get("purchase_receipt_info") or {})
         return {"status": "ok", "detail": "激活成功", "subId": sub_id, "subName": sub_name, "raw": raw_text}
 
-    # 错误码永远取 purchase_result_details（实测真 key 回执：success=2 是"失败"标记
-    # 不是错误码——{"success":2, "purchase_result_details":53}；同款只判
+    # 错误码永远取 purchase_result_details（真 key 回执里 success=2 是"失败"标记
+    # 不是错误码——{"success":2, "purchase_result_details":53}；只判
     # success==1，错误分类全靠 purchase_result_details）。receipt.result_detail 兜底。
     detail = data.get("purchase_result_details")
     receipt = data.get("purchase_receipt_info") or {}
@@ -284,7 +283,7 @@ async def add_free_license(subid: int) -> dict:
         return {"status": "fail", "detail": "领取节点被限流（429），请稍后再试或切换 Clash 节点"}
     # 302 = 提交被受理（跳转回结算页）；200 且 body 为 JSON 也算受理。
     # 200 但 HTML 多半是登录页/错误页（页面层会话校验拒绝，钱包模块同款）——不冒领。
-    # ⚠️ 实测：checkout 域重定向是**两跳**——第一跳 302 → checkout 页
+    # ⚠️ checkout 域重定向是**两跳**——第一跳 302 → checkout 页
     # （看似受理），第二跳 302 → **登录页**（页面层拒绝，license 根本没发）。
     # 只看第一跳 Location 会误报"已提交领取"；必须跟随整条链看终点是否登录页。
     if resp.status_code == 302:
@@ -339,7 +338,7 @@ async def quota_status() -> dict:
 
     附账号维度的激活计数（used/limit/steamid）：Steam 的 10 次/30 分钟限制
     作用于单个账号，切换绑定 Cookie（换号）即重计——前端以此驱动节奏 UI，
-    不再用全局计数（旧实现跨账号共享计数是错误语义）。
+    不能用全局计数（跨账号共享计数是错误语义）。
     """
     raw = await account_service.get_cookies()
     jar = parse_cookie_str(raw)

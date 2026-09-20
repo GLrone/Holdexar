@@ -1,13 +1,12 @@
-/* famLib 词条 —— 游戏库·家庭库页签（views/gamelib/tabs/FamilyLib.vue，
-   自 family 页迁入）。
+/* famLib 词条 —— 游戏库·家庭库页签（views/gamelib/tabs/FamilyLib.vue）。
 
-   术语沿用在先拍板的 A / B 表（英文侧逐字对齐，见 en/famLib.ts）：
-   · 未收录 → Not listed（A 表，gameCard.cdk.notListed）
-   · 独占 → Exclusive、多人共享 → Shared（B 表）
-   · 最近游玩 → Last played、时长 → playtime（B 表 / D5）
-   · 近30日活跃 → Acquired in last 30 days（D6：它统计的是 timeAcquired，
+   术语对齐表（英文侧逐字对齐，见 en/famLib.ts）：
+   · 未收录 → Not listed（与 gameCard.cdk.notListed 同源）
+   · 独占 → Exclusive、多人共享 → Shared
+   · 最近游玩 → Last played、时长 → playtime
+   · 近30日活跃 → Acquired in last 30 days（它统计的是 timeAcquired，
      名字里的「活跃」是误导，英文绝不能用 active）
-   · 独占贡献（全库口径）→ Exclusive titles（D4：与 FamContrib 的「随范围
+   · 独占贡献（全库口径）→ Exclusive titles（与 FamContrib 的「随范围
      变化的独占贡献」是两个口径，差异体现在英文上，中文侧保持原样）
 
    两处刻意的写法：

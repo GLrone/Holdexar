@@ -4,7 +4,7 @@
 - account.steam_id          SteamID64
 - account.steam_api_key     Steam Web API Key（用户自己的，明文只存本地库）
 
-区服配置已迁至 domains/regions（crawl_regions 表 + GET /api/v1/regions）。
+区服配置归 domains/regions（crawl_regions 表 + GET /api/v1/regions）。
 """
 from __future__ import annotations
 

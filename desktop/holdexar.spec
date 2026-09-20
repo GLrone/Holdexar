@@ -34,7 +34,7 @@ hiddenimports = [
     "uvicorn.protocols.websockets.websockets_impl",
     "uvicorn.lifespan.on",
     "app.main",
-    # SQLAlchemy asyncio 方言运行时动态加载 dbapi，静态分析收不到（L1 冒烟实证）
+    # SQLAlchemy asyncio 方言运行时动态加载 dbapi，静态分析收不到
     "aiosqlite",
     "greenlet",
     # pywebview Windows 动态选平台（EdgeChromium / winforms 登录窗 Cookie 通道）

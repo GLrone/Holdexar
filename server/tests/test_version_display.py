@@ -30,9 +30,9 @@ APPID = 995_001
 def test_suffix_real_option_text_forms():
     cases = [
         # (option_text, name_en, 期望 suffix)
-        # 生产实证：Far Cry 5 gold（552520 sub 252910）——大小写保留 Steam 原文
+        # 生产样本：Far Cry 5 gold（552520 sub 252910）——大小写保留 Steam 原文
         ("Far Cry 5 - Gold edition - ¥ 448.00", "Far Cry 5", "Gold edition"),
-        # 生产实证：Gourmet Edition（728880 sub 1066582）
+        # 生产样本：Gourmet Edition（728880 sub 1066582）
         ("Overcooked! 2 - Gourmet Edition - ¥ 189.99", "Overcooked! 2", "Gourmet Edition"),
         # 本体 sub：与 name_en 相同 → 标准版
         ("Overcooked! 2 - ¥ 98.00", "Overcooked! 2", ""),
@@ -58,13 +58,13 @@ def test_suffix_real_option_text_forms():
         ),
         # 数字开头但非价格的版本名不被误剥
         ("4 Deluxe - ¥ 98.00", "4 Deluxe", ""),
-        # E2E 实证（隔离实例抓 Portal 2）：RU 区卢布缩写尾巴
+        # E2E 样本（隔离实例抓 Portal 2）：RU 区卢布缩写尾巴
         ("Portal 2 - 385 руб.", "Portal 2", ""),
         ("Portal 2 - 1 199 руб.", "Portal 2", ""),
         # 波兰 zł / 欧洲 € 尾符号形态
         ("Portal 2 - 199,99 zł", "Portal 2", ""),
         ("Portal 2 - 42,00 €", "Portal 2", ""),
-        # VN 区 ₫ / 印尼 Rp 前缀缩写（E2E 实证漏网形态）
+        # VN 区 ₫ / 印尼 Rp 前缀缩写（E2E 形态）
         ("Portal 2 - 142.000₫", "Portal 2", ""),
         ("Portal 2 - Rp 90 999", "Portal 2", ""),
     ]

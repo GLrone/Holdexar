@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """IStoreBrowseService 捆绑包抓取验证探针（只读，不写库）。
 
-背景：app 链路已切到 IStoreBrowseService/GetItems/v1（批量 ≤400 × 单区），
-捆绑包仍走旧链路（bundles/refresh.py：逐区 ajaxresolvebundles / packagedetails，
-每包每区一发）。本探针验证新接口能否直查捆绑包、信息是否比旧链路更全。
+验证 IStoreBrowseService/GetItems/v1（批量 ≤400 × 单区）能否直查捆绑包、
+信息是否比现行 bundles/refresh.py 通道（逐区 ajaxresolvebundles /
+packagedetails，每包每区一发）更全。
 
 三种用法：
   1. 单点探测（默认，胡闹厨房两个包，覆盖真 Bundle 与 bundle-as-sub 两种身份）：

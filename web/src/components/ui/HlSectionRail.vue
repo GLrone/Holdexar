@@ -78,13 +78,13 @@ const { t } = useI18n()
 
 /* 分节标签：`data-section` 的值**优先按词条 key 解释**，取不到就原样显示。
  *
- * 为什么属性值放 key 而不是直接放译文：`data-section` 同时是 ProductTour 的
- * querySelector 目标。若写成 `:data-section="t('x.y')"`，锚点会随语言变——
- * 切语言后 ProductTour 的 `[data-section="批量导入"]` 就选不中，引导高亮**静默
- * 落空**。写 key 则锚点与语言无关，显示仍是译文的。
+ * 属性值放 key 而不是直接放译文：`data-section` 同时是 ProductTour 的
+ * querySelector 目标。写成 `:data-section="t('x.y')"` 会让锚点随语言变——
+ * 切语言后 ProductTour 的选择器就选不中，引导高亮**静默落空**。写 key 则锚点
+ * 与语言无关，显示仍是译文的。
  *
- * 兼容性：`t()` 的兜底链是「当前语言 → zh-CN → key 原文」，故尚未迁移的视图
- * （`data-section="添加提醒规则"`）不受影响，只是照原样显示——迁移可以逐文件做。
+ * 兼容性：`t()` 的兜底链是「当前语言 → zh-CN → key 原文」，故仍是中文原文的
+ * `data-section`（如 `data-section="添加提醒规则"`）不受影响，只是照原样显示。
  *
  * **在渲染期取**，不把结果写进 sections：那等于把语言冻在扫描那一刻，
  * 而这些分节是 MutationObserver 长期持有的（切语言后不会重扫）。 */

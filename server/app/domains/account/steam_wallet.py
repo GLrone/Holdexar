@@ -100,7 +100,7 @@ class WalletFetchError(RuntimeError):
 class WalletRateLimitedError(WalletFetchError):
     """Steam 节点级风控（429 限流 / 403 拒绝）：调用方应进长冷却，
     不适用普通指数退避——这是出口 IP 被盯上的信号，短期重试只会
-    加深风控印象（redeem 域 429 实测同款语义：换节点才有效）。"""
+    加深风控印象（redeem 域 429 同语义：换节点才有效）。"""
 
 
 class UnknownCurrencyError(WalletFetchError):
@@ -284,7 +284,7 @@ async def _region_from_history(
 async def _fetch_store_account(
     client: httpx.AsyncClient, cookies: dict[str, str]
 ) -> WalletInfo | None:
-    """通道零（实测最稳）：store 账户页三合一。
+    """通道零（最稳）：store 账户页三合一。
 
     登录态账户页头部渲染 `header_wallet_balance`（带币种符号的余额），
     页面钱包区块含 `"currency_code":<id>,"formatted_amount":"₹0.00"`。
@@ -434,10 +434,10 @@ def _has_ssl_error(message: str) -> bool:
 
 
 # ── 头像 URL 归一（CDN 域名轮换治理）──────────────────
-# Valve 多次轮换头像 CDN：akamaized.net（已死，DNS 不解析）→ queniuqe.com /
-# eccdnx.com（完美世界国服）→ fastly.steamstatic.com（现行，miniprofile 实测返回）。
-# 同一 hash 路径在所有域等价——统一归一到现行规范域，存量旧域 URL 就地自愈，
-# 全项目头像走同一个 URL（不显示/各页各源的问题在结构上消除）。
+# Valve 头像 CDN 多域并存：akamaized.net（已死，DNS 不解析）、queniuqe.com /
+# eccdnx.com（完美世界国服）、fastly.steamstatic.com（现行，miniprofile 返回）。
+# 同一 hash 路径在所有域等价——统一归一到现行规范域，旧域 URL 同样归一，
+# 全项目头像走同一个 URL。
 AVATAR_CANONICAL_HOST = "https://avatars.fastly.steamstatic.com/"
 _AVATAR_HOST_SUFFIXES = ("akamaized.net", "steamstatic.com", "queniuqe.com", "eccdnx.com")
 
@@ -462,8 +462,8 @@ def normalize_avatar_url(url: str | None) -> str:
 def parse_miniprofile(data: dict) -> dict:
     """miniprofile JSON → 昵称/头像/在线态（Steam 悬停卡同源数据）。
 
-    在线字段为**条件出现**：离线/隐身时无 `online`（真机离线实测：
-    只返回等级/徽章/背景/头像边框，无任何在线字段）——缺失即离线。
+    在线字段为**条件出现**：离线/隐身时无 `online`（只返回等级/徽章/
+    背景/头像边框，无任何在线字段）——缺失即离线。
     `in_game` 为对象（Steam 游戏）；非 Steam 游戏走 `in_nonsteam_game`。
     """
     def _in_game_name(d: dict) -> str:

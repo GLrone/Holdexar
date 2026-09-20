@@ -1,7 +1,7 @@
 """smart 排序评分（scoring.py）的公式验收。
 
-数值断言对齐 V1 拍板的对照表（对数压缩 / SteamDB 收缩 / timing 四档 /
-熟悉度封顶），调权重或常量时应同步这里的期望值。
+数值断言对齐评分对照表（对数压缩 / SteamDB 收缩 / timing 四档 / 熟悉度封顶），
+调权重或常量时应同步这里的期望值。
 """
 import pytest
 
@@ -102,9 +102,9 @@ class TestSmartScore:
         assert total == pytest.approx(expected, abs=1e-9)
 
     def test_product_example_ordering(self):
-        """拍板示例：C（高差价+新史低）> A（原价大作）≈ B（冷门新史低）。
+        """排序示例：C（高差价+新史低）> A（原价大作）≈ B（冷门新史低）。
 
-        A 不再被折扣硬墙压死（legacy 下 A 沉底），B 仍能凭时机进入同档——
+        A 不被折扣硬墙压死（硬前缀字典序下 A 沉底），B 仍能凭时机进入同档——
         smart 排序要保的两个平衡。
         """
         c = smart_score(8000, 9500, 5000, 1, 50)

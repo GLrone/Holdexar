@@ -1,8 +1,8 @@
 """rates 域调度兜底测试：refresh_if_stale 的过期判定与幂等行为。
 
-背景（汇率刷新事故）：fx_refresh 原为 interval 24h 从启动起算，
-本地服务频繁重启（单日 10+ 次）导致 24h 永远到不了点，"每日自动抓取"
-承诺落空。修复 = 每日 cron 03:00 + 启动时快照龄检查（>12h 即补刷）。
+被测语义：每日 cron 03:00 + 启动时快照龄检查（>12h 即补刷）。不能用
+「interval 24h 从启动起算」——本地服务频繁重启会让 24h 永远到不了点，
+「每日自动抓取」承诺落空。
 
 隔离：对齐 test_account_wallet.py —— monkeypatch 临时库 session factory，
 不触真实网络（refresh_rates 打桩，只测判定逻辑）。

@@ -168,7 +168,7 @@ async function save(item: BillCdkItem) {
     const next = { ...drafts.value }
     delete next[item.id]
     drafts.value = next
-    // 金额保持 toFixed(2)：换 fmt.money() 会引入千分位（1,234.00），显示与迁移前不同
+    // 金额保持 toFixed(2)：fmt.money() 会引入千分位（1,234.00），此处要原始两位小数
     message.success(t('bills.cdk.save.success', { name: item.name, amount: (fen / 100).toFixed(2) }))
     emit('changed')
   } catch (e) {

@@ -369,7 +369,7 @@ onBeforeUnmount(() => {
             :enabled-regions="regionsStore.enabledCodes"
           />
         </template>
-        <!-- 加载态随列表一起滚（旧实现挂在页面底部，列表内滚时永远看不到） -->
+        <!-- 加载态随列表一起滚（不能挂在页面底部，列表内滚时永远看不到） -->
         <template #footer>
           <div v-if="isFetchingNext || !hasNextPage" class="loading-sentinel">
             <template v-if="isFetchingNext">

@@ -5,7 +5,7 @@
    · Not listed —— A 表（gameCard.cdk.notListed 的既有英文）；
    · Exclusive / Shared —— B 表「独占」「多人共享」；
    · Last played / playtime —— B 表与 D5（Steam 官方字段措辞）；
-   · Family library —— A 表「家庭库」；D1 裁定它与 shared library 不是同一集合，
+   · Family library —— A 表「家庭库」；它与 shared library 不是同一集合，
      故本页提到「共享清单」时写 shared library，不与 family library 混用；
    · Acquired in last 30 days —— D6：该 KPI 数的是 timeAcquired（入库）而非游玩，
      中文名「近30日活跃」是误导，英文按真实口径写，不用 active；

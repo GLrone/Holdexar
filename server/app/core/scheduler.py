@@ -265,8 +265,8 @@ async def price_auto_enabled() -> bool:
 def _crawler_idle() -> bool:
     """爬虫当前无任务在跑（主价格刷新以 _price_cycle_busy 判定）。
 
-    探的是进程内任务表（crawl_service._active），非 6h 间隔——用户
-    拍板的门禁语义是「价格刷新爬虫已结束工作」。
+    探的是进程内任务表（crawl_service._active），非 6h 间隔——门禁语义是
+    「价格刷新爬虫已结束工作」。
     """
     if _price_cycle_busy:
         return False
@@ -316,7 +316,7 @@ async def _job_price_refresh() -> None:
     6h 步进）：两层串行 欠账补抓 → 全池（愿望单+已购优先序排前）。
 
     开头先重锚（下一格算好排队）再干活——长任务跑完后触发器不会覆盖
-    手改的 next_run_time（APScheduler 3.11 实证）；DST 切换日下一轮
+    手改的 next_run_time（APScheduler 3.11 行为）；DST 切换日下一轮
     探针自动把网格换到新锚点。
 
     修复线程让路：busy 标志在排干等待**之前**置位——等待窗口内修复
@@ -676,7 +676,11 @@ async def _job_backup() -> None:
     try:
         result = await core_backup.create_backup()
         logger.info(
+            "[定时] 自动备份完成：%s（%.1f MB，games=%d）",
+            result["name"], result["sizeBytes"] / 1024 / 1024, result["games"],
+        )
     except Exception as e:  # noqa: BLE001
+        logger.exception("[定时] 自动备份失败")
         # 系统告警：备份失败是「数据没有第二份」的信号，24h 冷却内只提醒一次
         try:
             from app.domains.alerts import service as alerts_service
@@ -694,9 +698,17 @@ async def _job_backup() -> None:
             )
         except Exception:  # noqa: BLE001
             logger.exception("[定时] 备份失败告警发送失败")
+
+
+async def _job_backup_catchup() -> None:
+    """启动补备：最新备份已过期（或压根没有）才补一份。
+
     判据是「备份龄」而不是「是否启动过」：`BACKUP_KEEP=5` 是「保留最近 5 份」
     而不是「每天一份」，不加判据会让一天重启五次把 5 个位子全占满、把真正
     有历史价值的日备挤掉。
+
+    延迟 5 分钟：启动期 init_db / 首轮爬取正在写库，此刻开 VACUUM INTO
+    既抢 IO 又让快照落在最没代表性的时刻（半空的库）。
     """
     from app.core import backup as core_backup
 
@@ -736,6 +748,14 @@ async def _job_hb_choice() -> None:
             )
         elif not result.get("skipped"):
             logger.info("[调度] HB 当月包标记：%s", result.get("machineName"))
+        # 新月包结案即发一封当月包清单（标签游标保证同月只发一封；
+        # 失败/未结案/跳过都不发，次日重试）
+        try:
+            from app.domains.alerts import service as alerts_service
+
+            await alerts_service.check_hb_choice(result)
+        except Exception:  # noqa: BLE001
+            logger.exception("[调度] HB 当月包邮件发送失败")
     except Exception:  # noqa: BLE001
         logger.exception("[调度] HB 当月包标记异常（次日自动重试）")
 
@@ -760,6 +780,14 @@ async def _job_epic_free() -> None:
                 "[调度] Epic 免费标记：窗口 %s 款，新标 %d 款",
                 result.get("window"), len(result.get("marked") or []),
             )
+        # 标记完成后发喜加一邮件（当期新条目才发；预告段只作展示，
+        # 转正后才自己发一封）
+        try:
+            from app.domains.alerts import service as alerts_service
+
+            await alerts_service.check_epic_free()
+        except Exception:  # noqa: BLE001
+            logger.exception("[调度] Epic 喜加一邮件发送失败")
     except Exception:  # noqa: BLE001
         logger.exception("[调度] Epic 免费标记异常（次日自动重试）")
 
@@ -894,8 +922,15 @@ def start_scheduler() -> None:
         return
     scheduler.add_job(_job_wishlist_sync, "interval", minutes=15, id="wishlist_sync")
     # 失败记录修复：5min 一轮，job 内部自判空闲（busy/任务表），占线即静默让路
+    scheduler.add_job(_job_price_repair, "interval", minutes=5, id="price_repair")
+    # 池价格爬取：interval 6h 只做兜底（与网格间距同宽——重锚链断裂
+    # 也不脱轨），真实节奏由 _reanchor_price_refresh 手改 next_run_time
     # 主导（job 内 modify 的排程不受触发器覆盖）
+    scheduler.add_job(
         _job_price_refresh_with_mails, "interval", hours=6, id="price_refresh",
+        next_run_time=local_next_grid()[0],
+        coalesce=True, misfire_grace_time=None,
+    )
     scheduler.add_job(_job_fx_refresh, "cron", hour=3, minute=0, id="fx_refresh")
     scheduler.add_job(_job_proxy_health, "interval", hours=6, id="proxy_health")
     # 订阅重拉：拍子给密一点（30min），真间隔靠 service 的 6h KV 门槛 +

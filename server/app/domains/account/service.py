@@ -62,7 +62,7 @@ WALLET_STALE_HOURS = 6
 # 递增退避表（分钟）：失败级别 0→1→2→3→4+ 依次映射，封顶 30min。
 # 单纯 Cookie 失效/网络抖动按此梯度冷却；429/403 风控信号另行直接
 # 进 30min 长冷却（_RATE_LIMIT_COOLDOWN_MINUTES）——出口 IP 被盯上时
-# 短间隔重试只会加深风控印象（redeem 域节点限流实测同款语义）。
+# 短间隔重试只会加深风控印象（redeem 域节点限流同语义）。
 _WALLET_BACKOFF_MINUTES = (2.0, 5.0, 15.0, 30.0)
 _RATE_LIMIT_COOLDOWN_MINUTES = 30.0
 

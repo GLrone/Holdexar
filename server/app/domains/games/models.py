@@ -49,7 +49,7 @@ class Game(Base):
     pp_changed_at: Mapped[datetime | None] = mapped_column(DateTime)
     # ── 排序缓存预计算列（refresh_sort_cache 维护）──
     # min_cny_fen = 非 CN 各区 ok 价的最低 CNY 分（原始值，无其他区价为 NULL；
-    # 查询侧用 COALESCE(min_cny_fen, cn.price) 表达原型的 lowest_prices CTE）
+    # 查询侧用 COALESCE(min_cny_fen, cn.price) 取最低价）
     min_cny_fen: Mapped[int | None] = mapped_column(BigInteger)
     # diff_fen = CN 价 - COALESCE(最低, CN 价)（下限 0；无 CN 价时为 0）
     diff_fen: Mapped[int] = mapped_column(Integer, default=0)
@@ -136,16 +136,15 @@ class GamePriceHistory(Base):
     sub_id: Mapped[int | None] = mapped_column(Integer)
     is_gold: Mapped[bool] = mapped_column(Boolean, default=False)
     version_suffix: Mapped[str | None] = mapped_column(String(100))
-    # bundle-as-sub 识别（2026-09 版本显示修复）：多 app 且名称未命中版本
-    # 关键词的 sub（如 Gourmet Edition）= 不支持补齐的捆绑包，从标准版
-    # 候选/史低计算/版本 chips 三处排除，并回填 bundles 表
     # bundle-as-sub 识别：多 app 且名称未命中版本关键词的 sub
     # （如 Gourmet Edition）= 不支持补齐的捆绑包，从标准版候选/史低计算/
+    # 版本 chips 三处排除，并回填 bundles 表
     is_bundle: Mapped[bool] = mapped_column(Boolean, default=False)
     price_status: Mapped[str] = mapped_column(String(20), default="ok")
     cny_fen: Mapped[int | None] = mapped_column(BigInteger)
     # 促销截止（browse active_discounts[0].discount_end_date，Unix 秒）；
     # 同族扩展列 discount_desc/bundle_id/bundle_discount_pct 不经 ORM，
+    # 由 attach_browse_extras 以裸 SQL 回贴
     discount_end_ts: Mapped[int | None] = mapped_column(Integer)
     snapshot_at: Mapped[datetime | None] = mapped_column(DateTime)
 

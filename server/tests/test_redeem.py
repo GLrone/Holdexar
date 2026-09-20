@@ -149,7 +149,7 @@ async def test_activate_key_already_owned(db, monkeypatch):
     )
     monkeypatch.setattr(
         redeem_service, "_post_steam",
-        # 真实回执形态（实测）：success=2 失败标记，错误码在 purchase_result_details
+        # 真实回执形态：success=2 失败标记，错误码在 purchase_result_details
         lambda *a, **k: _async(FakeResponse(payload={"success": 2, "purchase_result_details": 9}))(),
     )
     r = await redeem_service.activate_key("AAAAA-BBBBB-CCCCC")
@@ -159,7 +159,7 @@ async def test_activate_key_already_owned(db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_activate_key_rate_limited(db, monkeypatch):
-    """错误码 53 → fail，detail 为次数上限语义（实测表：53=次数上限，勿按官方文档改）。"""
+    """错误码 53 → fail，detail 为次数上限语义（错误码表：53=次数上限，勿按官方文档改）。"""
     await settings_service.set_value(
         "account.steam_cookies",
         "sessionid=abc123; steamLoginSecure=76561198000000001%7C%7Cjwt-token",

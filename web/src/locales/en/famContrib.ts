@@ -9,7 +9,7 @@
    · Exclusive contributions (filtered) —— D4：本页的独占数随范围控件变化，
      与 famLib.kpi.exclusive 的「全库口径」是两个数，英文上必须看得出差别；
    · X per member —— D3，`famContrib.kpi.perMember` 用 "Exclusive per member"，
-     不用 "per-capita"（D9 同时禁止 Contributors）。
+     不用 "per-capita"（禁止 Contributors）。
 
    档位提示是两条整句而不是「标签 + 计数」两段拼接：中英语序不同，`tierLabel()`
    的结果塞进占位符里英文会拼成残句。 */

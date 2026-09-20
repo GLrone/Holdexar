@@ -284,8 +284,8 @@ async def test_download_skips_missing_channel_before_downloading(
 async def test_download_asset_missing_fails_fast(tmp_path: Path, monkeypatch) -> None:
     """全通道 404（release 还是草稿 / 资产被撤）→ AssetMissing + code=asset_missing。
 
-    旧实现串行试跑整条通道链（每通道最长 20s）才报错，用户看到的是「下载
-    永远下不动」。现在探测一轮（各通道并发、8s 上限）即定性。
+    探测一轮（各通道并发、8s 上限）即定性；串行试跑整条通道链（每通道最长 20s）
+    才报错会让用户看到「下载永远下不动」。
     """
 
     def handler(_request: httpx.Request) -> httpx.Response:
@@ -311,7 +311,7 @@ async def test_download_asset_missing_fails_fast(tmp_path: Path, monkeypatch) ->
 async def test_stream_to_file_resumes_with_range(tmp_path: Path, monkeypatch) -> None:
     """换通道不丢已下部分：第二次请求带 `Range: bytes=N-` 续传。
 
-    125MB 的包每次换道都从 0 开始 = 永远下不完（实测痛点）。
+    125MB 的包每次换道都从 0 开始 = 永远下不完。
     """
     dest = tmp_path / "update.zip.part"
     dest.write_bytes(b"HEAD")

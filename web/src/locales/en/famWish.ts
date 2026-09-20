@@ -5,9 +5,9 @@
    （此处 ≥¥200、FamValue 写 ¥200+，且那边多一档「未定价」），**英文必须逐字一致**，
    故 band.gte200 两侧都写 '¥200+'——不受各自中文写法影响。
 
-   术语取自期 6 的 A / B 表：「折扣中」= On sale（A 表，同 trendDrawer.price.discount）、
-   「即将推出」= Coming soon（B 表）、「家庭库」= family library（A 表，小写）、
-   「未收录」= Not listed（A 表，同 gameCard.cdk.notListed）、「成员」= members（D9）。 */
+   术语：「折扣中」= On sale（同 trendDrawer.price.discount）、
+   「即将推出」= Coming soon、「家庭库」= family library（小写）、
+   「未收录」= Not listed（同 gameCard.cdk.notListed）、「成员」= members。 */
 
 import type { MessageKey } from '../zh-CN'
 

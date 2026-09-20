@@ -5,9 +5,9 @@ Cookie 绑定后自动拉取，前端不再有导入键。
 数据通道：
 - history：GET /account/history/ 首屏 → 页内 g_historyCursor →
   POST AjaxLoadMoreHistory（**deep form-encode**：cursor[wallet_txnid]=...&...&sessionid=...）；
-  传 JSON 游标返回 200 + 空 html —— 静默截断（实测根因）。
+  传 JSON 游标返回 200 + 空 html —— 静默截断。
 - licenses：服务端分页，GET /account/licenses/ 首屏 + 沿 a.license_paginator_next
-  的 href 逐页翻（旧版只抓首屏——超 50 条丢失，这里补全）。
+  的 href 逐页翻（只抓首屏会丢超 50 条的部分）。
 - avatar/nickname：store account 页头（miniprofile 公开通道）。
 """
 from __future__ import annotations
@@ -80,9 +80,8 @@ def _has_ssl_error(message: str) -> bool:
 
 # ── 登录页守门（redeem 域 _redirect_chain_hits_login 同语义）────────────
 # Cookie 过期/失效时 account/* 会被 302 到登录页（follow_redirects 终点即登录页）。
-# 此前无守门：登录页没有账单/许可表格 → 解析得 0 行"空报告"静默落库，
-# 空 import 按 id 倒序排最前，把真实旧快照整个遮住（实测
-# 「Cookie 过期后账单/入库许可证全空」的根因）。
+# 登录页没有账单/许可表格，照常解析会产出 0 行"空报告"——空 import 按 id
+# 倒序排最前，把真实的旧快照整个遮住，故登录页命中即中止。
 _LOGIN_TITLE_RE = re.compile(r"<title>(.*?)</title>", re.I | re.S)
 
 
@@ -381,8 +380,8 @@ _ACCOUNT_PULLDOWN_RE = re.compile(r'id="account_pulldown"[^>]*>([^<]*)<')
 
 
 # 头像域名字典：akamaized（旧）/（fastly.）steamstatic（现行）
-# ——账号页已迁 fastly.steamstatic.com，旧正则只认 akamaized
-# 导致 auto-sync 头像恒为空（昵称能抓到、头像静默跳过）
+# ——账号页用 fastly.steamstatic.com，只认 akamaized 会让 auto-sync
+# 头像恒为空（昵称能抓到、头像静默跳过）
 _AVATAR_URL_RE = re.compile(r'<img[^>]*src="(https://avatars\.[a-z.]+/[^"]+)"')
 
 
@@ -490,7 +489,7 @@ async def _fetch_history(
         await asyncio.sleep(_PAGE_DELAY)
 
     # 不做行级去重：同日多笔相同交易（市场批量/连续充值）是真实数据，
-    # 四元组合并会错杀（实测 531 行中 163 行页内真实重复、页间零重叠）。
+    # 四元组合并会错杀页内真实重复。
     # 翻页侧防重投喂由 cursor 链保证：响应 cursor 与请求相同 → 停（防死循环）。
     return rows
 
@@ -537,7 +536,7 @@ async def probe_history_first_screen(
 
 
 async def _fetch_licenses(client: httpx.AsyncClient) -> list[dict]:
-    """licenses 全量翻页（沿 license_paginator_next；旧版漏翻页，这里补全）。"""
+    """licenses 全量翻页（沿 license_paginator_next；只抓首屏会丢超 50 条的部分）。"""
     resp = await _get_html(client, LICENSES_URL)
     _ensure_account_page(resp, "游戏入库方式页")
     rows = parse_license_rows_from_html(resp.text)

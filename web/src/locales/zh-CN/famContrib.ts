@@ -1,10 +1,10 @@
 /* famContrib 词条 —— 家庭组·贡献分布页签（views/family/tabs/FamContrib.vue）。
 
    术语沿用 A / B 表（英文侧逐字对齐，见 en/famContrib.ts）：
-   · 贡献分布 → contribution split（A 表）
-   · 独占 → Exclusive、N人共享 → Shared by {n}、档位/分层 → tier（B 表）
-   · 入库 → acquisition / acquired、占比 → share（B 表）
-   · 家庭库 → family library（A 表 / D1：与 shared library 不是一个集合）
+   · 贡献分布 → contribution split
+   · 独占 → Exclusive、N人共享 → Shared by {n}、档位/分层 → tier
+   · 入库 → acquisition / acquired、占比 → share
+   · 家庭库 → family library（与 shared library 不是一个集合）
 
    三处刻意的写法：
    · 档位标签（`tierLabel`）与档位提示（`tierTip`）分开成两组 key，而不是把

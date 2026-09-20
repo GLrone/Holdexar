@@ -3,9 +3,9 @@
 覆盖 app/core/paths.py 的判定链——它是「升级不丢数据」的唯一入口，
 判定顺序错一步就是老用户库被当成新装（或反之）。
 
-开发态分支是本次改造的重点：过去开发态直接写工作树内的 `data/`，爬虫的库、日志、
-备份全落在 git 仓库里，一次 `git add -A` 就会把它们收进提交（本项目的一次真实
-泄漏事故正是这么发生的）。因此这里有一条硬断言：**开发态数据目录不得位于仓库工作树内**。
+开发态分支是重点：数据目录若落在工作树内，爬虫的库、日志、备份全进 git
+仓库，一次 `git add -A` 就会把它们收进提交。因此这里有一条硬断言：
+**开发态数据目录不得位于仓库工作树内**。
 """
 from __future__ import annotations
 
@@ -97,7 +97,7 @@ def test_dev_mode_uses_dev_machine_dir(fake_env, monkeypatch):
     resolved = paths.resolve_data_dir()
     assert resolved == fake_env["local"] / f"{paths.APP_SLUG}-dev"
     assert (resolved / "logs").is_dir()
-    # 硬约束：开发态数据目录绝不位于仓库工作树内（本次改造的根因防线）
+    # 硬约束：开发态数据目录绝不位于仓库工作树内
     assert not paths.is_inside(resolved, paths.PROJECT_ROOT)
 
 
@@ -166,8 +166,8 @@ def test_layout_labels(fake_env, monkeypatch):
 def test_layout_labels_unfrozen(fake_env, monkeypatch):
     """未打包时 portable / legacy / dev 三支都必须可达。
 
-    旧实现把 portable/legacy 的判定放在 `is_frozen()` 之后，导致未打包时这两支
-    永远走不到、统统被标成 dev——因为原测试只在 `_freeze` 下断言，一直没暴露。
+    portable/legacy 的判定必须先于 `is_frozen()`：放在其后未打包时这两支
+    永远走不到、统统被标成 dev。
     """
     _unfreeze(monkeypatch)
     assert paths.describe_layout(paths.resolve_data_dir()) == "dev-machine"

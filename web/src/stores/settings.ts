@@ -3,7 +3,7 @@ import { ref } from 'vue'
 
 import { settingsApi, type SettingsPayload } from '@/api/client'
 
-/** 应用设置（账户 + 新手教程标志 + 自动价格链开关 + 更新提示锚点/提示开关/静默更新开关）。区服配置已迁至 stores/regions（服务端下发 + crawl_regions 表）。 */
+/** 应用设置（账户 + 新手教程标志 + 自动价格链开关 + 更新提示锚点/提示开关/静默更新开关）。区服配置在 stores/regions（服务端下发 + crawl_regions 表）。 */
 export const useSettingsStore = defineStore('settings', () => {
   const account = ref<SettingsPayload['account'] | null>(null)
   const loaded = ref(false)

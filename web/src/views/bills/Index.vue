@@ -399,7 +399,7 @@ onMounted(async () => {
       </div>
 
       <!-- ═══ 账户切换 chips（每枚 chip 自带删除键：删除动作与账户成组，
-           原先所有删除键平铺在 chips 之后，与账户对不上号）═══ -->
+           不做集中平铺——集中时删除键与账户对不上号）═══ -->
       <div v-if="imports.length > 1" class="bills-accounts">
         <div v-for="imp in imports" :key="imp.id" class="bills-accounts__item">
           <button

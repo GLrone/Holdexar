@@ -84,8 +84,7 @@ export function inferBundleOwnership(
   // `account` 与上面两支一样给 null：**owned 分支的 account 从来不被读**。
   // 唯一的消费点 bundles/Index.vue 是三元的非 owned 支（`type === 'owned' ? … :
   // [account ?? '']`），owned 时走的是另一支，显示的是 `bundles.badge.owned`。
-  // 原先这里写的是中文字面量 `'我'`，它既不会被显示，又让本文件在
-  // no-hardcoded-cjk 里挂着一条命中——删掉它不改变任何显示。
+  // 这里不放中文字面量——它不会被显示，却会让本文件命中 no-hardcoded-cjk。
   return { type: 'owned', account: null }
 }
 

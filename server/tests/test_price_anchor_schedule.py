@@ -2,7 +2,7 @@
 
 规则：请求外部时间判定太平洋夏令时（timeapi.io dstActive；请求失败
 回落本地 zoneinfo）→ 夏令时锚点北京 01:00 / 冬令时 02:00 → 锚点 + 6h
-步进网格；job 每轮触发先 modify_job 自续约下一格（APScheduler 实证：
+步进网格；job 每轮触发先 modify_job 自续约下一格（APScheduler 行为：
 job 内手改的 next_run_time 不被触发器覆盖），interval 6h 仅兜底。
 
 隔离（对齐 test_rates_schedule.py）：不打真实网络（fetch_pacific_dst /
@@ -198,7 +198,7 @@ async def _fire_price_refresh_once(monkeypatch, is_dst: bool) -> datetime:
 
 @pytest.mark.asyncio
 async def test_price_refresh_self_renews_to_summer_grid(monkeypatch):
-    """自续约实证：触发后 next_run_time 落到锚点网格（整点 0 分 0 秒），
+    """自续约行为：触发后 next_run_time 落到锚点网格（整点 0 分 0 秒），
     而非 interval 兜底的 now+6h（带任意分钟秒）——可判别 modify 生效。"""
     nxt = await _fire_price_refresh_once(monkeypatch, is_dst=True)
     assert (nxt.minute, nxt.second, nxt.microsecond) == (0, 0, 0)

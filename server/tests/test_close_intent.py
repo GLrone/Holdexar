@@ -385,7 +385,7 @@ def test_guard_quit_intent_releases_close(monkeypatch):
     window = SimpleNamespace(hide=lambda: hidden.append(1), native=None)
     guard = desktop._make_closing_guard(window)
     assert guard() is True
-    assert hidden == [1], "退出路径必须先撤窗：放行后的进程收尾实测还要一两秒，窗口不能留屏上"
+    assert hidden == [1], "退出路径必须先撤窗：放行后的进程收尾还要一两秒，窗口不能留屏上"
 
 
 def test_guard_minimize_intent_hides_and_cancels(monkeypatch):
@@ -448,14 +448,13 @@ def test_guard_tray_quit_bypasses_dialog(monkeypatch):
 
 # ── 关窗幕布与出入场动效 ────────────────────────────────────────────────────
 #
-# 背景：弹窗原本「凭空出现」——没有遮罩、没有动效，用户注意不到弹窗出现。
-# 现由两件组成：① 页面级关窗幕布（.hl-close-curtain，网页 backdrop-filter 模糊，
-# 桌面壳经后台线程调 __hlxCloseCurtain 拉起）；② 原生弹窗自身的出入场（透明度
-# + 位移）。用例钉死四件事：幕布**必须后台线程派发**（evaluate_js 同步阻塞，
-# UI 线程直调会自锁）、关窗流程**无论走哪条路都撤幕布**、动效炸穿不得把弹窗
-# 留在「不可见」或「关不掉」、**用户的选择必须原样带回 ShowDialog**（关闭被
-# 拦下后 WinForms 会把 DialogResult 复位，延后真关时不放回去就只剩 Cancel——
-# 真机症状正是两个按键点完弹窗关了、程序什么都不做）。
+# 关窗幕布与出入场动效由两件组成：① 页面级关窗幕布（.hl-close-curtain，
+# 网页 backdrop-filter 模糊，桌面壳经后台线程调 __hlxCloseCurtain 拉起）；
+# ② 原生弹窗自身的出入场（透明度 + 位移）。用例钉死四件事：幕布**必须后台
+# 线程派发**（evaluate_js 同步阻塞，UI 线程直调会自锁）、关窗流程**无论走哪条
+# 路都撤幕布**、动效炸穿不得把弹窗留在「不可见」或「关不掉」、**用户的选择必须
+# 原样带回 ShowDialog**（关闭被拦下后 WinForms 会把 DialogResult 复位，延后真关
+# 时不放回去就只剩 Cancel——症状是两个按键点完弹窗关了、程序什么都不做）。
 
 
 def test_curtain_script_returns_explicit_boolean():
@@ -559,9 +558,8 @@ def test_exit_animation_cancels_close_then_closes(monkeypatch):
     dialog.FormClosing.fire(dialog, event)
     assert event.Cancel is True, "必须先拦住，等淡出走完"
     assert not dialog.closed
-    # WinForms 真行为：本次关闭被拦下后 DialogResult 被复位（实测按键的 Yes/No
-    # 都被清成空）。替身照此模拟一次——不模拟，「延后真关把选择丢了」这条
-    # 回归就测不出来（真机症状：两个按键点完弹窗关了、程序什么都不做）。
+    # WinForms 真行为：关闭被拦下后 DialogResult 被复位（Yes/No 都被清成空）。
+    # 替身照此模拟一次——不模拟，「延后真关把选择丢了」这条回归就测不出来。
     dialog.DialogResult = None
 
     timer = _FakeTimer.instances[-1]

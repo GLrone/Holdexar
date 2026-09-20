@@ -1,5 +1,5 @@
 <script setup lang="ts">
-/* 家庭愿望单（框架 wl-* 标准迁移）：7 KPI + 筛选 + 左仪表盘（分布/标签/价格环）+ 右列表。
+/* 家庭愿望单（框架 wl-*）：7 KPI + 筛选 + 左仪表盘（分布/标签/价格环）+ 右列表。
    数据源：GET /family/wishlist（wishlist_items × games 本地聚合，无需 Cookie）。 */
 import { computed, onMounted, ref } from 'vue'
 
@@ -41,7 +41,7 @@ onMounted(() => {
 
 /* 筛选档位——常量表只存 key（模块级常量存译文＝把语言冻在加载那一刻）。
    activeFilter 存的也是 key，filtered 用 key 比较：只换标签不改比较，
-   切语言就会丢掉选中态（原先比较的是中文串）。 */
+   切语言不会丢选中态（比较中文串会丢）。 */
 const FILTERS = [
   { key: 'all', labelKey: 'common.all' },
   { key: 'owned', labelKey: 'famWish.tag.familyOwned' },

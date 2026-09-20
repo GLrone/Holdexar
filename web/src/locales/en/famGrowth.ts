@@ -4,7 +4,7 @@
    措辞对齐：
    · acquisition / acquired —— B 表「入库」；playtime —— B 表「时长」；
    · family library —— A 表「家庭库」；
-   · 贡献最多 / 贡献最少 → Top / Lowest contributor（沿用 D9：成员一律
+   · 贡献最多 / 贡献最少 → Top / Lowest contributor（成员一律
      members 口径，不写 Contributors 之外的花样）。
 
    行内标记只有 `<b>` 与 `class="gr-top"` / `class="gr-low"`（强调色与等宽字在

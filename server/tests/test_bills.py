@@ -1,6 +1,6 @@
 """bills 域测试：解析器纯函数 + 真实样本端到端对账。
 
-对账基准来自两份真实账单转储的历史实测输出，本模块的解析行为必须与之
+对账基准来自两份真实账单转储，本模块的解析行为必须与之
 逐项一致。样本目录由环境变量 BILLS_SAMPLE_DIR 提供（未设置时相关用例
 自动 skip）。
 
@@ -217,7 +217,7 @@ def test_classify_type(tx_type, item, wallet_change, expected):
 
 
 def test_newformat_recharge_base_price_fallback():
-    """新 UI 充值行：total/wallet_change 空，金额在 base_price 列（后端抓取实测形态）。"""
+    """新 UI 充值行：total/wallet_change 空，金额在 base_price 列（后端抓取形态）。"""
     data = {
         "account": {"nickname": "t", "avatar_base64": ""},
         "history": [
@@ -459,7 +459,7 @@ def test_steam_fetch_full_chain_matches_exporter_format():
 @pytest.mark.parametrize(
     ("name", "game", "topup", "cdk", "spend", "refund"),
     [
-        # 基准：源脚本实测输出
+        # 基准：源脚本输出
         ("a", 143, 108, 140, 8442.51, 1435.42),
         ("b", 87, 41, 9, 4386.28, 1372.09),
     ],

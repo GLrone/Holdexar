@@ -43,11 +43,11 @@ export function walletToCny(wallet: WalletSnapshot | null, rates: RateMap): Wall
 /**
  * 换算值展示文本：¥x.xx（null → —；isCny 由调用方跳过根本不调）。
  *
- * 本模块是纯计算 + 一个出口，原本写死 `toLocaleString('zh-CN')`。改成走
- * `useLocaleFormat()` 的 `money` 后，它成为「金额格式」唯一可被门禁扫描的落点。
- * `useLocaleStore()` 在函数体内**惰性**取用：pinia 由 `app.use(pinia)` 安装时
- * 就 `setActivePinia`，故非 setup 环境（普通模块函数）也能解析到同一个实例；
- * 而放在模块顶层求值则会在安装前跑，直接抛错。
+ * 本模块是纯计算 + 一个出口，金额格式走 `useLocaleFormat()` 的 `money`，
+ * 使「金额格式」只有这一个可被门禁扫描的落点。`useLocaleStore()` 在函数体内
+ * **惰性**取用：pinia 由 `app.use(pinia)` 安装时就 `setActivePinia`，故非 setup
+ * 环境（普通模块函数）也能解析到同一个实例；放在模块顶层求值则会在安装前跑、
+ * 直接抛错。
  */
 export function formatWalletCny(amount: number | null): string {
   if (amount == null) return '—'

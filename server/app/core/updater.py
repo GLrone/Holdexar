@@ -61,11 +61,9 @@ STAGING_DIR = "update-staging"  # data/ 下的暂存目录
 _PENDING_FILE = ".update-pending"  # 换装标记（staging 内 manifest.json 同目录）
 
 # 探测：候选通道各发一笔 `Range: bytes=0-0`（只读响应头，几十字节代价），一次并发
-# 同时判出「资产在不在」与「这条通道快不快」。旧实现是**串行试跑 20s 再换道**——
-# 资产本身 404 也要把整条链蹚完才报错，用户看到的就是「点了没反应」。
+# 同时判出「资产在不在」与「这条通道快不快」。
 _PROBE_TIMEOUT = 8.0
-# 传输停滞判定：连续这么久一个字节都没到即换道（旧值 45s，镜像半死连接会让进度条
-# 干等近一分钟才开始换道）。
+# 传输停滞判定：连续这么久一个字节都没到即换道（不让进度条在半死连接上干等）。
 _STALL_TIMEOUT = 15.0
 # 速率考核：下载跑满 _TRIAL_SECONDS 后平均速率仍低于下限即换道；最后一个可用通道
 # 不考核（全网都慢也得让它下完，不能把所有通道都试死）。
@@ -269,7 +267,7 @@ class AssetMissing(RuntimeError):
     """发布资产不存在（HTTP 404）：版本尚未真正发布，或资产被撤下。
 
     单独成类是为了把「网络不通」与「这个版本压根没包」分开——前者该重试，
-    后者重试一万次还是 404（实测：清单已发布、release 还是草稿时，客户端
+    后者重试一万次还是 404（清单已发布、release 还是草稿时即如此：客户端
     对着 404 把整条通道链蹚完，用户看到的就是「下载永远下不动」）。
     """
 
@@ -286,10 +284,10 @@ async def download_update(
 ) -> dict:
     """下载 release zip 到 data/update-staging/ 并解包 + 校验。
 
-    三段式（先探、再下、后校验），与旧实现的最大区别是**先探**：
+    三段式（先探、再下、后校验）：
       ① 并发向所有候选通道发 `Range: bytes=0-0`，一次判出「资产在不在」与
-         「通道快不快」；全通道 404 立即抛 AssetMissing（旧实现要串行试跑
-         整条链才报错，几十秒无反馈）；
+         「通道快不快」；全通道 404 立即抛 AssetMissing（不串行蹚链，避免
+         几十秒无反馈）；
       ② 按探测延迟从快到慢下载，**带断点续传**（换通道不丢已下部分）；
       ③ 停滞（_STALL_TIMEOUT 无字节）与速率考核双闸换道。
 
@@ -333,9 +331,8 @@ async def download_update(
         probes = await _probe_channels(channels, expected_size)
 
         # 「资产不存在」的两种成因一起判：**明确 404**（直连 GitHub 的判定）与
-        # **回了别的体积**（镜像对不存在的资产常回 200 + 几百字节的错误页——
-        # 实测 ghfast 对未发布资产返回 573 字节的 200，旧逻辑会把它当下载成功，
-        # 最后死在 SHA256 校验上，报的却是「校验失败」，真因被盖住）。
+        # **回了别的体积**（镜像对不存在的资产常回 200 + 几百字节的错误页，
+        # 体积远小于真实资产，可据体积差提前判缺）。
         def _unusable(p: dict) -> bool:
             return bool(p["missing"] or p["bogus"])
 
@@ -543,7 +540,7 @@ def _total_from_headers(headers, status: int) -> int | None:
     """从响应头取**整包**体积。
 
     206（续传/范围响应）的总量在 content-range 的 `/total` 段；200 的总量才是
-    content-length。两者混用会把「1 字节探测响应」当成整包体积（实测踩过）。
+    content-length。两者混用会把「1 字节探测响应」当成整包体积。
     """
     content_range = headers.get("content-range") or ""
     if "/" in content_range:
@@ -567,10 +564,10 @@ async def _stream_to_file(
 
     - **续传**：带上已有字节数发 `Range: bytes=N-`；服务端回 200（不认 Range）
       才从头下——不清零会把新流追加到旧文件后面，拼出一个校验必挂的坏包。
-    - **停滞闸**：任一字节到达间隔超过 _STALL_TIMEOUT 即判死（旧实现的 45s
-      读超时意味着「连上了但不吐数据」的半死通道能让进度条干等近一分钟）。
+    - **停滞闸**：任一字节到达间隔超过 _STALL_TIMEOUT 即判死（长读超时意味着
+      「连上了但不吐数据」的半死通道能让进度条干等近一分钟）。
     - **速率闸**：试跑 _TRIAL_SECONDS 后平均速率低于下限判「过慢」——只靠停滞
-      闸抓不住「慢但在动」的通道（实测某镜像 40KB/s 能一直动，整包要一小时）。
+      闸抓不住「慢但在动」的通道（曾有镜像 40KB/s 能一直动，整包要一小时）。
     """
     resumed = dest.stat().st_size if dest.is_file() else 0
     headers = {"Range": f"bytes={resumed}-"} if resumed else {}

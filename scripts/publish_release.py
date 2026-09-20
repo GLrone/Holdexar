@@ -1,27 +1,23 @@
 """GitHub Releases 标准发布：版本 Release + 固定 tag 的更新清单。
 
-**为什么是两条 Release**：
-1. **版本 Release**（tag `v<版本>`）——用户看到的那条：release/ 下的**全部**
-   待分发产物（应用包 + 更新清单 + 资产种子 + 公共目录库模板 + 更新说明 +
-   Scoop 清单，缺件按「有则带」），带 changelog。这是「标准分发方式」里
-   人读的那一面。
-2. **清单 Release**（tag `updater`）——机器读的那一面：只挂一个 latest.json，
-   地址恒定不随版本变。客户端检查更新只读它（见 app/core/updater.py）。
-   注意必须 `--latest=false`：否则它会被 GitHub 标成 "Latest release"，
-   把 `releases/latest` API 与 RSS 都带偏。
+- **版本 Release**（tag `v<版本>`）：用户看到的那条，release/ 下**全部**
+  待分发产物（应用包 + 更新清单 + 资产种子 + 公共目录库模板 + Scoop 清单，
+  缺件按「有则带」），说明走 --notes-file。必须显式 `--latest`。
+- **清单 Release**（tag `updater`）：机器读的那面，只挂 latest.json，
+  地址恒定不随版本变（客户端检查更新只读它）。必须 `--latest=false`，
+  否则它会抢走 `releases/latest`。
 
 两条都幂等：已存在的 tag 走 `gh release upload --clobber`，重复发布不会失败。
 
 前置：先跑 scripts/build_release.py 出包（它会顺带生成清单）；
 本脚本只负责把产物推上 GitHub，不重新构建。
-
 本机没装 gh 也能用：`--dry-run` 会打印全部 gh 命令（含手工在网页端
 创建 Release 时需要照抄的标题/说明/资产清单）。
 
 用法（发布机，需已 `gh auth login`）：
     python scripts/publish_release.py --dry-run     # 只打印将执行的命令
     python scripts/publish_release.py               # 正式发布
-    python scripts/publish_release.py --prerelease  # 发预发布版（RC 用；见下）
+    python scripts/publish_release.py --prerelease  # 预发布标记留给真 RC（Beta 见下）
     python scripts/publish_release.py --scoop-dir D:\\scoop-bucket   # 顺带更新 Scoop 清单
 
 发 Beta 的推荐做法：标题写「Holdexar vX.Y.Z Beta」，**不加** --prerelease。
@@ -110,10 +106,9 @@ def release_is_draft(tag: str) -> bool:
     """已存在且为草稿 → 覆盖上传后须补发为正发布，否则永远卡在 Draft：
 
     Draft 不进仓库首页 Latest 简报、不带 Latest 徽章，只在 Release list 里
-    标「Draft」。版本 Release 一旦被建成 Draft（网页端手建 / 早年 `--draft`
-    残留），后续每次 `upload --clobber` 只往里塞文件、状态纹丝不动——这正是
-    beta.2「只看得见 Draft、看不到 Latest」的成因。检测到就 `release edit
-    --draft=false --latest` 转正。
+    标「Draft」。版本 Release 一旦被建成 Draft，后续每次 `upload --clobber`
+    只往里塞文件、状态纹丝不动。检测到就 `release edit --draft=false --latest`
+    转正。
     """
     try:
         proc = subprocess.run(
@@ -193,7 +188,7 @@ def publish_version_release(
         )
         if release_is_draft(tag):
             # 已存在却是草稿：补发为正发布并置 Latest，否则永远卡在 Draft，
-            # 不进首页 Latest 简报、不带 Latest 徽章（beta.2 事故同款）
+            # 不进首页 Latest 简报、不带 Latest 徽章
             print(f"[发布] {tag} 是草稿 → 补发为正发布并置 Latest")
             run(["gh", "release", "edit", tag, "--draft=false", "--latest"], dry)
         return

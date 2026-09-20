@@ -356,9 +356,9 @@ onMounted(() => {
               </div>
 
               <div v-if="openRows.has(tx.id)" class="bills-tx__detail">
-                <!-- 币种名走 currencyName（期 7 起随语言，中文侧仍取项目既有说法）；
+                <!-- 币种名走 currencyName（随语言，中文侧取项目既有说法）；
                      其余 dd 是后端数据（txType / 支付方式…）**原样显示**——那是
-                     服务端下发的字符串，前端没有它的双语对照表，不在本项目范围。 -->
+                     服务端下发的字符串，前端没有它的双语对照表。 -->
                 <dl class="bills-kv"><dt>{{ t('bills.ledger.detail.type') }}</dt><dd>{{ tx.txType }}</dd></dl>
                 <dl class="bills-kv"><dt>{{ t('bills.ledger.detail.currency') }}</dt><dd>{{ t('bills.currencyValue', { name: curName(tx.currency), code: tx.currency }) }}</dd></dl>
                 <dl class="bills-kv"><dt>{{ t('bills.ledger.detail.amount') }}</dt><dd>{{ fmtCur(tx) }}</dd></dl>

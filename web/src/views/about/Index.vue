@@ -19,7 +19,7 @@ const logo = computed(() =>
   themeStore.isDark ? '/assets/logo_dark.ico' : '/assets/logo_light.ico',
 )
 
-/* 新手引导重看入口：hero logo 点击打开（侧边栏 logo 的原入口已迁到本页） */
+/* 新手引导重看入口：hero logo 点击打开（侧边栏 logo 同为引导入口） */
 const tourOpen = ref(false)
 
 interface SystemInfo {
