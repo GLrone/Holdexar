@@ -53,7 +53,12 @@ const settings = {
 
   /* 绑定后的多账号列表 */
   'settings.steam.mismatchWarn': '当前账号的 SteamID 与上方保存的 SteamID64 不一致，请核对是否同一账号',
-  'settings.steam.syncError': '最近一次同步失败：{error}',
+  'settings.steam.syncOk': '同步正常',
+  'settings.steam.syncFail': '同步失败',
+  'settings.steam.syncIdle': '未同步',
+  'settings.steam.syncTipOk': '上次同步：{time}',
+  'settings.steam.syncTipFail': '上次同步失败：{time} · {error}',
+  'settings.steam.syncTipIdle': '尚未同步过钱包数据',
   'settings.steam.noNickname': '（未同步昵称）',
   'settings.steam.primary': '主账号',
   'settings.steam.active': '当前',
