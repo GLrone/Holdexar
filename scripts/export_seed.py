@@ -1,10 +1,9 @@
 """资产种子导出：生产库公共切片 → assets/seed/holdexar_seed.db。
 
 白名单制：只读五块公共数据（汇率快照 / 汇率历史 / games 人工策划列（含
-name 身份列）/ 预设游戏池清单 / game_price_history 价格历史切片），结构上
-不可能带出凭据表（账号 Cookie / 代理订阅 / 账单 / app_settings）。种子文件
-随包分发，启动时按数据性质走各并入通道：汇率走一次性导入，人工列名单、
-预设池与价格历史走按种子版本的独立合并通道（老用户库也并入）。
+name 身份列）/ 预设游戏池清单 / game_price_history 切片），结构上不可能
+带出凭据表。随包分发，启动时并入：汇率走一次性导入，人工列名单、预设池
+与价格历史走按种子版本的独立合并通道（老用户库也并入）。
 
 用法（发布机）：
     python scripts/export_seed.py                     # data/holdexar.db → assets/seed/
@@ -12,27 +11,17 @@ name 身份列）/ 预设游戏池清单 / game_price_history 价格历史切片
     python scripts/export_seed.py --history-days 0    # 价格历史不设窗口（全量）
     python scripts/build_release.py --refresh-seed    # 出包前自动重导
 
-去重键：fx_rate_history 按 (currency_code, fetched_at 原文)，同键保留
-id 最大（最新）一行——对齐 fx_maintenance 的「币种+日期」幂等语义；
-game_price_history 按 (appid, region_code, sub_id, is_gold, snapshot_at 原文)
-同键保留 id 最大一行（对齐写入侧 OR REPLACE 的逻辑键，price 不进键——
-同键不同价视为同一次快照的价格修正，留最新）；games_curated 只收任一
-人工列非空的行。
+去重键（同键保留 id 最大一行，对齐写入侧幂等口径）：fx_rate_history 按
+(currency_code, fetched_at 原文)；game_price_history 按 (appid, region_code,
+sub_id, is_gold, snapshot_at 原文)，price 不进键（同键不同价 = 同一次快照的
+价格修正）；games_curated 只收任一人工列非空的行。
 
-人工列名单（XGP 档位 / Epic 喜加一 / HB 慈善包 / 系列归属）随种子下发完整
-games 行（appid + name + 人工列）：合并侧对本地缺行的 appid 直接落行——
-名单开箱即查，但行带非空 updated_at，永远不会被孤儿补抓层捡去爬
-（监控范围只由愿望单驱动，名单 ≠ 监控）。
+人工列名单与预设池随种子下发完整 games 行：合并侧对本地缺行的 appid 直接
+落行（name 取种子），新用户开箱即有初始目录；名单行 updated_at 非空，不被
+孤儿补抓层捡去爬——监控范围只由愿望单驱动，名单 ≠ 监控。
 
-预设游戏池清单（preset_games：池页「导入文件」的关注数据 + 热销榜 5 页）
-随种子下发：上游由池添加通道与热销榜定时任务登记（见 games/preset.py）；
-导出侧以库内名字为准（COALESCE(games.name, preset_games.name)），两处都
-无名的行不进种子。合并侧对本地缺行的 appid 落完整 games 行（name 取
-种子）——新用户开箱即有初始游戏库，全池主轮随即覆盖其价格刷新。
-
-价格历史窗口：默认全量时间切片（0，不设窗口）；--history-days 仍可按天
-裁窗。合并通道按 (appid, region_code, sub_id, is_gold, snapshot_at) 幂等
-去重，老用户每次升级都并入最新切片。
+价格历史窗口：默认全量时间切片（0）；--history-days 可按天裁窗，合并通道
+按逻辑键幂等去重，老用户每次升级都并入最新切片。
 """
 from __future__ import annotations
 
@@ -55,8 +44,7 @@ CURATED_COLS = ("xgp_tier", "epic_date", "is_epic", "is_hb", "hb_data", "series_
 # name 是 games 表唯一 NOT NULL 的展示字段。与 CURATED_COLS 分列：覆写
 # 人工列时不碰 name（本地爬来的行名更准），INSERT 缺行时才用它
 CURATED_IDENTITY_COL = "name"
-# 价格历史窗口默认值（天）；0 = 全量时间切片（发行种子带完整历史，
-# 不为包体砍窗口；实测 3 年窗口外存量仅 ~5 万行，全量增量可忽略）
+# 价格历史窗口默认值（天）；0 = 全量时间切片（发行种子带完整历史，不为包体砍窗口）
 HISTORY_DAYS_DEFAULT = 0
 
 # game_price_history 种子列（不含自增 id：合并侧本地表自增）。列序即插入序，
@@ -267,8 +255,7 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Holdexar 资产种子导出")
-    # 默认源库走数据目录判定而非硬编码 `<仓库>/data/holdexar.db`：数据目录已与仓库
-    # 解耦，写死的相对路径在开发态会静默指向一个不存在的库，导出的种子会变旧而无人察觉。
+    # 默认源库走数据目录判定（数据目录与仓库解耦，随安装位置而定）
     default_db = resolve_data_dir() / "holdexar.db"
     parser.add_argument("--db", default=str(default_db), help=f"源库路径（默认 {default_db}）")
     parser.add_argument("--out", default=str(DEFAULT_OUT), help=f"种子输出路径（默认 {DEFAULT_OUT}）")

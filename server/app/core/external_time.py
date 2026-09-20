@@ -8,8 +8,8 @@
 DST 判定以「请求外部时间」为权威（用户明确要求）：timeapi.io 的
 America/Los_Angeles 端点直接返回 dstActive 布尔，不依赖本机 tzdata
 新鲜度。请求走 rates 同款策略代理优先（Steam 域直连被墙的默认姿势），
-代理失败再直连（timeapi.io 非 Steam 域，国内直连实测可达），全链
-失败回落本地 zoneinfo（tzdata 2025.3；打包产物已实证含
+代理失败再直连（timeapi.io 非 Steam 域，国内直连可达），全链
+失败回落本地 zoneinfo（tzdata 2025.3；打包产物含
 zoneinfo/america/Los_Angeles）。
 """
 from __future__ import annotations

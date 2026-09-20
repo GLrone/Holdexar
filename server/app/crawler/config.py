@@ -64,7 +64,7 @@ CC_LIST: list[tuple[str, str, str]] = [
 CIS_REGIONS = ["kz", "ua"]
 
 DEFAULT_WORKER_COUNT = 30
-# 直连 Steam 在部分网络下 TLS 握手可能超过 10s（实测 9.7s），12s 超时会误杀；放宽到 20s
+# 直连 Steam 在部分网络下 TLS 握手可能超过 10s，超时放宽到 20s
 HTTP_TIMEOUT = 20
 
 # ── 主轮 worker 数：按可用出口 IP 节点数开启（crawl/service._resolve_worker_count）──

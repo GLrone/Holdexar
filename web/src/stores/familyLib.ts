@@ -87,9 +87,9 @@ export const useFamilyStore = defineStore('familyLib', () => {
 
   async function load(force = false) {
     if (loading.value) return
-    // 已就绪且非强制刷新：直接复用。这个守卫原先只写在各 tab 组件里，
-    // 而 family 首页的 onMounted 每次进入都会调一次 load()——不加这行，
-    // 板块来回切就是一次次白等（后端快照兜底那 2s 的老路径）。
+    // 已就绪且非强制刷新：直接复用。守卫必须在这一层（各 tab 组件只写自己那份），
+    // 因为 family 首页的 onMounted 每次进入都会调一次 load()——不加这行，板块
+    // 来回切就是一次次白等（后端快照兜底那 2s 的路径）。
     if (ready.value && !force) return
     loading.value = true
     error.value = ''

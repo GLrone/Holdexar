@@ -1,6 +1,6 @@
-"""smart 排序评分（V1 公式，纯函数）。
+"""smart 排序评分（纯函数）。
 
-四个因子取代 legacy 的「史低优先度硬前缀」字典序——折扣从参赛资格
+四个因子取代「史低优先度硬前缀」字典序——折扣从参赛资格
 降级为加分项，原价但差价大的游戏凭省钱/质量/熟悉度回到前排：
 
   S_smart = 0.50*S_save + 0.28*S_quality + 0.14*S_timing + 0.08*S_familiarity
@@ -14,9 +14,9 @@
                                                            （N 已参与 quality，只做
                                                            「淡季不全是陌生游戏」的托底）
 
-timing 只认 hl_flag 分档，不再叠加 discount_percent——史低+90%off 是同一
+timing 只认 hl_flag 分档，不叠加 discount_percent——史低+90%off 是同一
 件事，不重复奖励（因子相关性）。pp_flag 是近期调价方向（新闻信号），
-与「长期低价」语义错位，V1 不参与。
+与「长期低价」语义错位，不参与评分。
 
 全部在 Python 侧计算（refresh_sort_cache 落库），不依赖 SQLite 数学函数
 ——打包产物捆绑的 sqlite 未验证 SQLITE_ENABLE_MATH_FUNCTIONS。
@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import math
 
-# ── 权重（V1 拍板值；调参改这里，不动公式）──
+# ── 权重（调参改这里，不动公式）──
 W_SAVE = 0.50
 W_QUALITY = 0.28
 W_TIMING = 0.14

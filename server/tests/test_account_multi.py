@@ -292,7 +292,7 @@ async def test_save_cookies_flags_mismatch_vs_bound_steamid(db):
 # ── Steam 真实在线状态（miniprofile 条件字段 / 官方批量映射）──
 
 def test_parse_miniprofile_offline_has_no_online_field():
-    """离线实测形态（真机好友码，已脱敏）：只有等级/徽章等，无 online 字段 → 离线。"""
+    """离线形态（真机好友码，已脱敏）：只有等级/徽章等，无 online 字段 → 离线。"""
     from app.domains.account.steam_wallet import parse_miniprofile
 
     offline = {

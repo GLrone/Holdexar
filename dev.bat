@@ -2,10 +2,10 @@
 setlocal
 title Holdexar (dev)
 
-rem Dev launcher - start.bat plus one guarantee: runtime data never lands in the
-rem git worktree. Data goes to %LOCALAPPDATA%\holdexar-dev, which is separate from
-rem the packaged app's %LOCALAPPDATA%\holdexar on purpose (a dev-mode schema
-rem migration must not be able to touch real user data).
+rem Dev launcher. Runtime data never lands in the git worktree: data goes to
+rem %LOCALAPPDATA%\holdexar-dev, which is separate from the packaged app's
+rem %LOCALAPPDATA%\holdexar on purpose (a dev-mode schema migration must not be
+rem able to touch real user data).
 rem The full resolution order lives in server\app\core\paths.py.
 
 cd /d "%~dp0"

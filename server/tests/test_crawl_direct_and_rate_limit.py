@@ -241,7 +241,7 @@ async def test_rate_limiter_window_slides(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_rate_limiter_steam_singleton_shape():
-    """进程单例形状：200 发 / 300s 窗口（实测定线）。"""
+    """进程单例形状：200 发 / 300s 窗口。"""
     assert steam_rate_limiter.max_requests == 200
     assert steam_rate_limiter.window_seconds == 300
 

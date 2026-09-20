@@ -1,12 +1,9 @@
 """SQLite 物理备份：VACUUM INTO 在线快照 + 三段式恢复。
 
-为什么是 VACUUM INTO（而不是直接 copy .db 文件）：
-- WAL 模式下直接 copy 主文件会丢 -wal 里已提交未 checkpoint 的事务
-  → 备份不最新；
-- 复制期间生产库仍在写入 → 页级撕裂，备份文件可能损坏不自洽；
-- VACUUM INTO 是 SQLite 官方在线备份语义：对源库只读、把已提交状态
-  （含 WAL 内容）完整快照到独立新文件，产出文件自洽可独立打开，
-  生产库写入全程不受阻。
+快照语义（VACUUM INTO）：对源库只读，把已提交状态（含 WAL 内容）完整快照到
+独立新文件，产出文件自洽可独立打开，生产库写入全程不受阻。直接 copy .db 主
+文件不满足这几点——WAL 模式下会丢 -wal 里已提交未 checkpoint 的事务，复制
+期间生产库仍在写入还会造成页级撕裂、备份文件可能不自洽。
 
 恢复三段式（防误恢复伤生产库）：
 1. 临时目录打开备份文件 + integrity_check + 表结构比对（与当前库同名表集合一致才继续）
@@ -97,7 +94,7 @@ def snapshot_to(src: Path, dest: Path) -> None:
     sqlite3 默认隔离模式会隐式开事务导致 OperationalError。
 
     公共入口：`create_backup` / `restore_backup` 的轮换档与 `database`
-    的迁移前快照共用这一份实现——「VACUUM 不能在事务内」这个坑只写一遍。
+    的迁移前快照共用这一份实现（VACUUM 不能在事务内执行，见上）。
     """
     conn = sqlite3.connect(src.as_posix(), timeout=30, isolation_level=None)
     try:

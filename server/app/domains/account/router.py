@@ -83,8 +83,7 @@ async def save_cookies(payload: SteamCookiesPayload) -> AccountStatus:
         logger.info("[account] Cookie 保存成功但首次抓取失败：%s", sync.get("error"))
 
     # 绑定后置全量拉取：后台任务**依次**抓全该账号数据，不阻塞绑定响应。
-    # 原先只主账号触发账单同步，愿望单/已购要等 15min 定时拍——用户看到的
-    # 是「绑了但游戏库/账单不来」。依次口径：
+    # 只主账号触发账单同步会使用户看到「绑了但游戏库/账单不来」。依次口径：
     #   ① 愿望单 + 已购库（sync_account：差异入库 + 新增条目按自动价格链
     #      开关即时首爬，与 15min 定时同步同口径）；
     #   ② 账单（跟随**主账号**：bills 表无 steamid 维度，混流即数据污染，

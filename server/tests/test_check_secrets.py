@@ -72,7 +72,7 @@ def test_detects_github_token():
     assert labels(scan_one(line)) == ["GitHub 令牌"]
 
 
-# ── 内容层：必须放过（这些是实测踩到过的误报，每条都对应一个真实文件）──
+# ── 内容层：必须放过（每条都对应一个真实文件形态）──
 
 
 @pytest.mark.parametrize(

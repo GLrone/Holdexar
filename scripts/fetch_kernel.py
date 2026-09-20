@@ -1,9 +1,8 @@
 """内核资产获取：把 mihomo 内核与 GeoIP 数据补进 assets/clash/（随包资产）。
 
-**为什么内核不进 git**：可执行文件约 45MB、GeoIP 数据约 30MB，且每次升版本都会
-变——入库等于每个版本往仓库历史里永久塞一份二进制。所以它与资产种子同走
-「随包资产」通道：发行包内置一份（spec datas 的 `clash/`），源码 clone 由 run.py
-首次启动调用本脚本补齐；发布机靠本脚本把 assets/clash/ 备齐，打包时随包分发。
+大体积、随版本变动的二进制不入 git，走「随包资产」通道：发行包内置一份
+（spec datas 的 `clash/`），源码 clone 由 run.py 首次启动调用本脚本补齐；
+发布机靠本脚本把 assets/clash/ 备齐，打包时随包分发。
 
 版本与地址常量在 `server/app/domains/proxies/kernel_release.py`（单一来源）：
 随包内核与运行时的网络下载兜底共用同一个版本号。

@@ -46,11 +46,8 @@ def _run(cmd: list[str], **kw) -> int:
 
 
 def ensure_venv() -> Path:
-    """server/.venv 存在则用之；缺失则用当前解释器自动创建后返回其 python。
-
-    新机首启场景（BAT 双击）没有任何人工介入，venv 必须自动建立，
-    否则依赖会装进系统 Python 污染全局。
-    """
+    """server/.venv 存在则用之；缺失则自动创建（新机 BAT 双击无人工介入，
+    避免依赖装进系统 Python）。"""
     if VENV_PY.is_file():
         return VENV_PY
     print("[环境] 未找到 server/.venv，自动创建虚拟环境 ...")
@@ -98,12 +95,9 @@ def ensure_npm() -> None:
 
 
 def ensure_seed(python: Path) -> None:
-    """资产种子（16 年汇率档案）：缺失则从 Release 资产补一份。
-
-    种子是 12MB 二进制，不进 git（见 scripts/fetch_seed.py 顶注），发布包内置、
-    源码 clone 走这里补齐。失败只警告不阻断——没有种子应用照常跑，只是汇率页
-    没有历史档案。
-    """
+    """资产种子（16 年汇率档案）：缺失则从 Release 资产补一份（不进 git，
+    见 scripts/fetch_seed.py）。失败只警告不阻断——没有种子只是汇率页
+    没有历史档案。"""
     seed = ROOT / "assets" / "seed" / "holdexar_seed.db"
     if seed.is_file():
         return
@@ -114,11 +108,8 @@ def ensure_seed(python: Path) -> None:
 
 
 def ensure_kernel(python: Path) -> None:
-    """随包内核资产（mihomo + GeoIP 数据）：缺失则从上游补一份。
-
-    与资产种子同样不进 git（二进制大文件），源码 clone 由这里补齐、发布包已
-    内置。失败只警告不阻断——代理页会显示「内核缺失」并且页内可一键安装。
-    """
+    """随包内核资产（mihomo + GeoIP 数据）：缺失则从上游补一份（不进 git）。
+    失败只警告不阻断——代理页可一键安装。"""
     if KERNEL_EXE.is_file():
         return
     print("[内核] 未找到随包 Clash 内核，尝试获取（mihomo + GeoIP 数据，约 80MB）…")
@@ -171,10 +162,9 @@ def main() -> None:
         print(f"[开发] 窗口将加载 {env[f'{ENV_PREFIX}DEV_URL']}（需确保 npm run dev 已运行）")
 
     print(f"[启动] {APP_NAME} · http://127.0.0.1:{args.port} · Ctrl+C 退出")
-    # 开发态防陈旧字节码：桌面端 main.py 改动后 Python 本应因 mtime 失配重编，
-    # 但实测出现过缓存未失效、加载到旧 bug 字节码（仍含 FromArgb(*Color) 之类
-    # 已修 bug）导致启动即崩的情况。每次启动清掉这批 .pyc，成本极低（模块很小），
-    # 重编只是几毫秒。打包态走 exe 自包含、不经由本路径，不受影响。
+    # 开发态防陈旧字节码：__pycache__ 缓存未失效时会加载到旧字节码导致启动即崩，
+    # 每次启动清掉这批 .pyc（模块很小，重编只是几毫秒）。打包态走 exe 自包含、
+    # 不经由本路径，不受影响。
     import glob as _glob
 
     for _p in _glob.glob(str(ROOT / "desktop" / "__pycache__" / "main*.pyc")):
@@ -185,10 +175,8 @@ def main() -> None:
     cmd = [str(python), str(ROOT / "desktop" / "main.py")]
     if args.server:
         cmd.append("--server")
-    # LAUNCHER_PID：桌面壳据此监视本进程——包装进程无论怎么死（任务管理器
-    # 强杀 / taskkill / 脚本超时收割），桌面壳随之退出。否则会留下孤儿实例
-    # 继续占着服务端口与单实例锁，下一次启动撞上「已在运行/端口被占用」，
-    # 用户看到的就是「应用无法启动」（实测复现过整条链路）。
+    # LAUNCHER_PID：桌面壳据此监视本进程——包装进程被硬杀时桌面壳随之退出，
+    # 不留孤儿实例占用服务端口与单实例锁。
     env[f"{ENV_PREFIX}LAUNCHER_PID"] = str(os.getpid())
     try:
         subprocess.run(cmd, cwd=str(ROOT), env=env, check=True)

@@ -230,16 +230,12 @@ const activeTab = ref('contrib')
  *  `tabItems` 每次渲染现取——模块级常量存译文会把语言冻在模块加载那一刻。 */
 const TAB_KEYS: { key: string; labelKey: MessageKey }[] = [
   { key: 'contrib', labelKey: 'family.tab.contrib' },
-  // 未迁移：本块为停用实现，回归时需一并 t() 化
-  // { key: 'growth', label: '增长趋势' },  // 暂时隐藏（与热力图信息重叠），代码保留待回归
   { key: 'heat', labelKey: 'family.tab.heat' },
   { key: 'buy', labelKey: 'family.tab.buy' },
   { key: 'wish', labelKey: 'family.tab.wish' },
-  // 游玩动态页签已迁至游戏库页（views/gamelib/tabs/GlPlay.vue），词条 famPlay.* 随迁
-  // 家庭库页签已迁至游戏库页（views/gamelib/tabs/FamilyLib.vue），词条 famLib.* 随迁
-  // 未迁移：本块为停用实现，回归时需一并 t() 化
-  // 共享冷却暂时隐藏：功能语义还没研究清楚，数据链路/模板代码保留，确认用途后再决定回归
-  // { key: 'cool', label: '共享冷却' },
+  // 游玩动态与家庭库两页签在游戏库页（views/gamelib/tabs/GlPlay.vue、
+  // views/gamelib/tabs/FamilyLib.vue），词条 famPlay.* / famLib.* 随之。
+  // 增长趋势与共享冷却为停用实现（语义待定），代码保留但不出现在 tab 列表。
 ]
 
 const tabItems = computed<HlTabItem[]>(() =>
@@ -379,19 +375,16 @@ onMounted(() => {
   void libStore.load()  // 家庭库聚合（tabs/成员统计共用；未绑 Cookie 时各 tab 诚实空态）
 })
 
-/* 首字母头像的两条渐变。原先各写死两个色值，而那两个色值**分别来自两套主题**：
-   `#66c0f4` 是深色 --accent、`#1c6ea4` 是浅色 --accent，于是这套渐变在两套主题下
-   都不对（浅色主题里挂着一个深色的亮青）。改走令牌后各自跟随主题：
+/* 首字母头像的两条渐变。走令牌以跟随主题：
    --accent-fill → --accent 是「浅一档 → 本色」，--purple → --purple-deep 同理。 */
 const avatarColors: Record<string, string> = {
   primary: 'linear-gradient(135deg, var(--accent-fill), var(--accent))',
   family: 'linear-gradient(135deg, var(--purple), var(--purple-deep))',
 }
 
-/* ── 贡献分布已迁独立组件 FamContrib.vue（堆叠条形+环形+近半年增量+范围切换）── */
+/* ─ 贡献分布（堆叠条形+环形+近半年增量+范围切换）在独立组件 FamContrib.vue ── */
 
-// 未迁移：本块为停用实现，回归时需一并 t() 化
-/* ── 共享冷却（真数据：GetSharedLibraryApps 排除清单）——tab 暂时隐藏（语义待研究），代码保留待回归 ──
+/* ── 共享冷却（真数据：GetSharedLibraryApps 排除清单）——tab 未启用（语义待定），代码保留 ─
 const shareableCount = computed(() => libStore.games.filter((g) => g.inSharedLib && !g.excluded).length)
 const excludedCount = computed(() => libStore.games.filter((g) => g.excluded).length)
 const excludedBySteamid = computed(() => {

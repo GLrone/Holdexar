@@ -8,9 +8,9 @@
   同一发响应白送，替掉 appdetails + appreviews 两次请求。**价格按请求参数
   country_code 判定**——出口 IP 不参与数据判定，直连与代理拿到同一份数据，
   这是直连成为标准形态、限流取代换 IP 规避风控的根因。
-- 原价直接取 original_price_in_cents（一手），不再用 `现价×100÷(100−折扣)` 反推
-  （Steam 先定价后折后取整，反推回不去——实测 699→698 / 22900→22833 这类偏差）。
-- 错误语义与旧链路一致：run 内退避重推 MAX_PARTIAL_RETRIES 次 → 仍失败写入
+- 原价直接取 original_price_in_cents（一手），不用 `现价×100÷(100−折扣)` 反推
+  （Steam 先定价后折后取整，反推回不去——699→698 / 22900→22833 这类偏差）。
+- 错误语义与其他链路一致：run 内退避重推 MAX_PARTIAL_RETRIES 次 → 仍失败写入
   missing 状态进补抓账本 → 由 generate_missing_tasks() 生成的按区批量任务
   在下个周期只补欠账区（穷尽转 blocked）。
 """
@@ -42,14 +42,14 @@ from app.crawler.utils import (
 logger = logging.getLogger(__name__)
 
 # ══════════════════════════════════════════════════════════════
-# 接口常量（实测定版）
-# ══════════════════════════════════════════════════════════════
+# 接口常量
+# ═══════════════════════════════════════════════════════════════
 
 BROWSE_URL = "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/"
 # 必须 GET（POST → 405）；input_json 只能放查询参数。
 # 最小转义：保留 `{}",:` 与数字/小写字母（全转义会让单发条数掉到 ~260）
 _URL_SAFE = '{}",:0123456789abcdefghijklmnopqrstuvwxyz-_.'
-# Steam 侧按 URL ~8KB 截断（实测 400 条 × 全字段 = 7.5KB 仍 200）——防御性再切
+# Steam 侧按 URL ~8KB 截断（400 条 × 全字段 = 7.5KB 仍 200）——防御性再切
 MAX_URL_LEN = 8000
 DEFAULT_BATCH_SIZE = 400
 
@@ -66,17 +66,17 @@ DATA_REQUEST_EXTRAS = {
     "include_coming_soon": True,  # → 即将推出标记
 }
 
-# browse 的 item.type 实测标定（对照生产 games.type 反查）：
-#   0=游戏 1=Demo 2=Mod 3=Tool 4=DLC 6=应用(如 Wallpaper Engine，旧链路按 GAME 收)
-#   14=游戏变体(如 CoD BO 多人在线包，旧链路按 GAME 收)；None+success=15 = 未收录
+# browse 的 item.type 标定：
+#   0=游戏 1=Demo 2=Mod 3=Tool 4=DLC 6=应用(如 Wallpaper Engine，按 GAME 收)
+#   14=游戏变体(如 CoD BO 多人在线包，按 GAME 收)；None+success=15 = 未收录
 _TYPE_TO_GAMES = {0: "GAME", 1: "DEMO", 2: "MOD", 3: "TOOL", 4: "DLC", 6: "GAME"}
 # 明确非游戏；未标定的编码一律按游戏收（宁可多收一个工具应用，不能漏游戏）
 GAME_TYPES = ("GAME", "DLC")
 ADULT_DESCRIPTOR_IDS = frozenset((3, 4))
 # descriptor 3 = Adult Only Sexual Content，4 = Frequent Nudity or Sexual Content
-# ——只认这两个为成人。实测反例：GTA5/Dota2/HuniePop 只有 5（General Mature
-# Content），赛博朋克 2077 是 [1,2,5]，旧链路（genres 含 Sexual Content/Nudity）
-# 对它们全部判 0；1/5 是主流游戏也带的普通成熟标记，算进去会误杀。
+# ——只认这两个为成人。反例：GTA5/Dota2/HuniePop 只有 5（General Mature
+# Content），赛博朋克 2077 是 [1,2,5]；1/5 是主流游戏也带的普通成熟标记，
+# 算进去会误杀。
 CAT_FAMILY_SHARING = 62          # categories.feature_categoryids 语义位
 CAT_TRADING_CARDS = 29
 
@@ -230,7 +230,14 @@ class StoreBrowseAPI:
                 **(DATA_REQUEST_EXTRAS if extras else {}),
             },
         }
+        qs = urllib.parse.urlencode(
+            {"input_json": json.dumps(body, separators=(",", ":"))}, safe=_URL_SAFE
+        )
         # ⚠ 坑：aiohttp 用 yarl 建 URL，会把 `{ } "` 再百分号编码一遍，
+        # 7.5KB 的 400 条 URL 被撑到 ~9.2KB → Steam 直接 400。encoded=True 声明
+        # 「已编码、别再动」，保住 400 条/发的硬限制。
+        return URL(f"{BROWSE_URL}?{qs}", encoded=True)
+
     @staticmethod
     def probe_url(cc: str = "us", appid: int = 220) -> str:
         """健康探针 URL：单 appid、不带 extras（最小负载）。
@@ -249,6 +256,9 @@ class StoreBrowseAPI:
             )
         )
 
+    @staticmethod
+    def build_url(appids: list[int], cc: str, lang: str, extras: bool = True) -> URL:
+        return StoreBrowseAPI.build_ids_url(
             [{"appid": int(a)} for a in appids], cc, lang, extras
         )
 
@@ -722,10 +732,10 @@ async def handle_browse_price_task(context) -> None:
     """任务入口：**任何**未预期异常都在这里兜住并重推，绝不让它逃到调度器。
 
     调度器 `_worker` 对 handler 抛出的异常只做 `fail_count += 1` 然后丢弃，
-    **不重推**（重推一律由 handler 自己 `context.queue.put` 完成，旧 app_handler
-    的各处重推点就是这个语义）。原先只有 fetch 那一发被 try 包着，`_follow_parent_apps`
-    里补发父 app 的那次请求是裸的——全量跑时 ru:4 就在那里抛了 ClientConnectorError
-    逃到调度器，整批 400 个 appid 的 RU 行永久丢失（RU 1848 行 vs 其他区 2248 行）。
+    **不重推**（重推一律由 handler 自己 `context.queue.put` 完成）。本函数覆盖
+    整条链——fetch 一发与 `_follow_parent_apps` 里补发父 app 的请求都在 try 内，
+    任一处异常逃到调度器都会让该批 appid 的行永久丢失（曾出现整批 400 个 appid
+    的 RU 行缺失）。
     """
     task = context.task
     task_id = task.get("id")
@@ -989,7 +999,7 @@ def _discover_bundles_from_item(item: dict | None) -> list[dict]:
     读**原始**选项（parse_options 的 default 组过滤对 bundle 选项无差别放行，
     但其产物丢掉了 must_purchase_as_set / included_game_count，这里要原始键）。
 
-    收录判据（垃圾实测来源：DLC 页的单 DLC sub / 每游戏页都有的本体 sub）：
+    收录判据（垃圾来源：DLC 页的单 DLC sub / 每游戏页都有的本体 sub）：
     - bundleid 键（真捆绑包）一律收；
     - packageid 键（sub 形态）仅当选项名 ≠ 条目名才收——同名即本体 sub
       （「游戏名 == 游戏名」）或单 DLC sub（DLC 页上「DLC 名 == DLC 名」），
@@ -999,7 +1009,7 @@ def _discover_bundles_from_item(item: dict | None) -> list[dict]:
     语义与形态同时落，判据随形态分流（与 _browse_row 同一套）：
     - bundleid 键：选项级 must_purchase_as_set 是权威语义；
     - packageid 键：sub 恒不可拆——游戏页 sub 选项的选项级
-      must_purchase_as_set 实测恒 False（131 个 sub 普查无一例外），
+      must_purchase_as_set 恒 False（131 个 sub 普查无一例外），
       不能照抄，由形态蕴含为 1。
     """
     if not item or item.get("success") != 1 or not item.get("visible"):

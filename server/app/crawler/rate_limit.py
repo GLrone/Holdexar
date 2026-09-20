@@ -1,11 +1,10 @@
 """出网请求频率闸门：滑动窗口 200 发 / 5 分钟，进程级全局单例。
 
-为什么限流是新的主闸：browse 接口按 country_code 参数返回各区价格，
-出口 IP 不再参与数据判定（直连与代理拿到的是同一份数据）——「多出口
-轮换 IP 规避风控」的整套机制（Per-AppID Session、429 换代理、断网
-探测分流）随之退役，取而代之的是**把请求频率压进 Steam 接受的窗口**
-（实测定线 200 发/5 分钟）：请求匀速发出，任何网络环境下（直连或
-加速器）都不触发风控。
+限流是主闸：browse 接口按 country_code 参数返回各区价格，出口 IP 不参与
+数据判定（直连与代理拿到的是同一份数据）——「多出口轮换 IP 规避风控」的
+机制（Per-AppID Session、429 换代理、断网探测分流）不再需要，取而代之的是
+**把请求频率压进 Steam 接受的窗口**（200 发/5 分钟）：请求匀速发出，任何
+网络环境下（直连或加速器）都不触发风控。
 
 覆盖面：全部打 Steam 的出网请求——爬虫主轮批量 / 元数据预取 / 补抓 /
 修复 / 孤儿回补（SteamHttpClient.get_json 收口）+ 捆绑包刷新
@@ -26,7 +25,7 @@ from collections import deque
 
 logger = logging.getLogger(__name__)
 
-# 窗口参数（实测定线，见 module docstring）
+# 窗口参数（见 module docstring）
 RATE_LIMIT_MAX_REQUESTS = 200
 RATE_LIMIT_WINDOW_SECONDS = 300
 

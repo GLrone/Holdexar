@@ -2,16 +2,8 @@
 /**
  * 可点选小标签（筛选 chip / 排序 chip / 时间范围 chip）。
  *
- * **为什么要有这个组件**：收敛前全项目有 4 处手写实现，其中两对是**逐字相同**的
- * 两份副本，只差类名——
- *
- * | 造型 | 副本一 | 副本二 |
- * |---|---|---|
- * | 胶囊（999px 圆角） | `.bill-chip`（`tabs-shared.css`，FamLicense / toolbox 用） | `.range-chip`（`PriceTrendDrawer` / `game-detail` 的走势区间） |
- * | 方角（5px 圆角） | `.lib-sort`（`tabs-shared.css`，FamBuy / FamLib 用） | `.wl-filter`（`FamWish`） |
- *
- * 后两份的声明**完全一致**（`font-size:11px; padding:4px 10px; border-radius:5px` +
- * 同一套 border/background/color/hover/is-on），改一处必漏另一处。
+ * 四种造型（胶囊：`.bill-chip` / `.range-chip` 同款；方角：`.lib-sort` /
+ * `.wl-filter` 同款）——收录进本组件后按 `shape` 取造型。
  *
  * **两个维度都按「外观」而非「用途」命名**：
  *   · `shape` 是造型（胶囊 vs 方角）。不叫 `variant` / `type`——那会诱导后来者
@@ -22,7 +14,7 @@
  *     悬停态与选中态两档一致——差异只在"没被选中、也没悬停"时。
  *
  * 不在这里的：`FamBuy` 的 `.buy-view-toggle` 是**内嵌分段**（容器自带底与内距、
- * 内部按钮是透明块），语义上属于 `HlSegmented`。它暂未迁移，因为 HlSegmented 目前
+ * 内部按钮是透明块），语义上属于 `HlSegmented`。它暂未纳入，因为 HlSegmented 目前
  * 只接受纯文本 `options`、没有图标插槽，而它那两个按钮是「图标 + 文字」。
  * 已登记为例外。
  */

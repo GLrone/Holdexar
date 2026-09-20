@@ -157,7 +157,7 @@ class TestOptionSelection:
 class TestIdentitySemanticsSplit:
     """形态（item_kind：链接/CDN 用）与购买语义（mps：是否必须整包）解耦。
 
-    实证：bundle 63575 形态是 bundle（item_type=2）但 Steam 在选项级明示
+    实例：bundle 63575 形态是 bundle（item_type=2）但 Steam 在选项级明示
     must_purchase_as_set=True——只看 item_type 会把「必须整包」错标成可补齐，
     反之只看选项 mps 又会把所有 sub 混淆（131 个 sub 选项级 mps 全 False）。
     """
@@ -187,7 +187,7 @@ class TestIdentitySemanticsSplit:
         assert row["item_kind"] == 0 and row["mps"] == 0
 
     def test_locked_region_casts_no_semantics_vote(self) -> None:
-        """锁区行（best 无选项）不投语义票：63575 的 ru 反对票实证场景。"""
+        """锁区行（best 无选项）不投语义票：63575 的 ru 反对票场景。"""
         item = _item(
             item_type=2,
             success=15,
@@ -263,7 +263,7 @@ class TestIdentitySemanticsSplit:
         from app.core.database import get_session_factory, init_db
         from app.domains.games.models import Bundle, BundleRegionPrice
 
-        bid = 990_433  # 单 DLC sub 桩（垃圾实测来源：Civ5 巴比伦类）
+        bid = 990_433  # 单 DLC sub 桩（垃圾来源：Civ5 巴比伦类）
         await init_db()
         try:
             async with get_session_factory()() as db:

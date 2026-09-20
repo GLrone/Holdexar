@@ -26,14 +26,11 @@ import httpx
 
 
 def _ensure_stdio() -> None:
-    """windowed 打包（console=False）/ pythonw 下无标准句柄：sys.stdout/stderr 为 None。
+    """补齐缺失的标准句柄（windowed 打包 / pythonw 下 sys.stdout/stderr 为 None）。
 
-    uvicorn 默认日志格式器初始化即调 sys.stdout.isatty()，None 下当场
-    AttributeError → dictConfig 包成 ValueError: Unable to configure
-    formatter 'default'，服务永远起不来。开发机从 shell 拉起会继承句柄，
-    掩盖此坑——冒烟必须 cmd start / Start-Process 脱离句柄才忠实。
-    换成 devnull 流后 print/flush/isatty/StreamHandler 后续全部安全；
-    控制台模式两流本就存在，原样不受影响。
+    uvicorn 日志格式器初始化即调 sys.stdout.isatty()，None 下抛错、服务
+    起不来；换成 devnull 流后 print/flush/isatty/StreamHandler 全部安全。
+    控制台模式两流本就存在，不受影响。
     """
     for name in ("stdout", "stderr"):
         if getattr(sys, name, None) is None:
@@ -65,14 +62,9 @@ _WEBVIEW2_REG_KEYS = (
 )
 _WEBVIEW2_DL_URL = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
 
-# 启动等待页：pywebview 内联 HTML（create_window(html=...)，零网络依赖）。
-# 窗口出现即显示转圈页，后端 health 就绪后由 _wait_and_navigate 整窗跳转
-# 真实应用——窗口初始化（CLR/WebView2 ~1s）与后端 lifespan（数秒，首装
-# 导入种子更久）并行重叠。等待页不能依赖后端：uvicorn 要等 lifespan 跑完
-# 才监听端口，此窗口期加载同源等待页一律连接被拒（WebView2 直接显示
-# 「网页加载失败」错误页，等页里的 JS 轮询根本没机会跑）；data-URL 方案
-# 又被 WebView2 跨源策略拦截对 127.0.0.1 的 fetch（双击冒烟实证卡死）。
-# 内联 html= 两者皆避：不经网络加载，也就没有加载失败可言。
+# 启动等待页：pywebview 内联 HTML（零网络依赖）。窗口初始化与后端 lifespan
+# 并行重叠，health 就绪后由 _wait_and_navigate 整窗跳转真实应用。
+# uvicorn 在 lifespan 完成前不监听端口，等待期只有内联 html= 可用。
 _SPLASH_HTML = (
     "<!doctype html><html><head><meta charset='utf-8'>"
     f"<title>{APP_NAME}</title>"
@@ -97,10 +89,7 @@ SERVER_PORT = int(os.environ.get(f"{ENV_PREFIX}PORT", "28765"))
 LOCK_PORT = int(os.environ.get(f"{ENV_PREFIX}LOCK_PORT", "28965"))
 # frozen 态服务端口被占时的自动扫描窗口（从默认端口起试 N 个）
 _PORT_SCAN_SPAN = 20
-# 健康检查等待上限。**不得低于首装导入耗时**：全新安装时随包资产种子
-# （23 万行汇率档案）单事务并入本地库实测约 25s，恰好压在旧值 25s 死线上
-# ——新用户第一次启动会看到「服务启动失败」误报弹窗（服务其实是好的）。
-# 90s 覆盖低端机/机械盘的更慢情形；服务真起不来时也只是晚点报错。
+# 健康检查等待上限：须覆盖首装时大数据量导入的耗时，兼顾低端机/机械盘。
 HEALTH_TIMEOUT = 90.0
 WINDOW_TITLE = APP_NAME
 DEFAULT_SIZE = (1280, 860)
@@ -121,10 +110,8 @@ def _acquire_lock() -> socket.socket | None:
 def _health_is_ours(response) -> bool:
     """健康响应身份校验：200 且载荷 app 字段等于本应用名才算本应用。
 
-    只看状态码会把「恰好占着同一端口的别的本地服务」误判成本应用
-    实例——唤醒分支随后会去置前/浏览器打开**对方的页面**。health
-    载荷自带 {"app": APP_NAME, ...}（system/router.py），比对字段
-    即锚定身份；非 JSON / 缺字段 / 异名一律视为外来占坑。
+    health 载荷自带 {"app": APP_NAME, ...}（system/router.py）；非 JSON /
+    缺字段 / 异名一律视为外来占坑，避免唤醒到同端口的他服务。
     """
     if getattr(response, "status_code", None) != 200:
         return False
@@ -135,14 +122,11 @@ def _health_is_ours(response) -> bool:
 
 
 def _probe_running(timeout_s: float = 8.0, quick: bool = False) -> bool:
-    """轮询主端口健康端点，判定是否真有本应用实例在跑。
+    """轮询主端口健康端点，判定是否真有本应用实例在跑（含身份校验）。
 
-    锁端口被外来程序占用 ≠ 已有实例，以健康端点为准（含**身份校验**，
-    见 _health_is_ours——端口撞车的别家应用不得被当成自己唤醒）；
-    留重试窗口覆盖"双击两次图标、前者还在启动中"的竞态。
-    quick=True 时单发一次（150ms 超时）——用于锁已被本进程持有、
-    本地回环请求一律 trust_env=False 直连（同 _wait_health 顶部说明）。
-    仅需排除竞态窗口的场景，避免正常冷启动路径白等数秒。
+    留重试窗口覆盖「双击两次、前者还在启动中」的竞态。quick=True 单发
+    一次（150ms 超时），用于锁已被本进程持有、仅需排除竞态窗口的场景。
+    本地回环一律 trust_env=False 直连（见 _wait_health）。
     """
     url = f"http://{SERVER_HOST}:{SERVER_PORT}/api/v1/health"
     if quick:
@@ -177,15 +161,11 @@ def _port_free(port: int) -> bool:
 def _negotiate_ports() -> None:
     """启动期端口协商：结果写回模块级 SERVER_PORT / LOCK_PORT。
 
-    - 服务端口被占：
-      * 探活命中 = 本应用另一实例已在跑 → 保持原值，main() 会走"已在运行"
-        分支（唤醒旧实例，不重复开）
-      * 探活未命中 = 外来程序占坑 → frozen 态自默认端口起 +1 扫描可用位
-        （绿色包普通用户无控制台可设环境变量，弹窗报错 = 软件坏了；
-        开发态保持报错退出语义，端口漂移会掩盖配置问题）
-    - 锁端口被占：先探活判定（真实例不会走到这里），未命中则依次尝试
-      备选锁位（模块级 _LOCK_FALLBACKS），全占则告警后让位——单实例
-      改由"服务端口探活"兜底判定。
+    - 服务端口被占：探活命中 = 本应用另一实例（main() 走唤醒分支）；
+      未命中 = 外来占坑 → frozen 态自默认端口起 +1 扫描可用位，
+      开发态报错退出（端口漂移会掩盖配置问题）。
+    - 锁端口被占：依次尝试备选锁位（_LOCK_FALLBACKS），全占则告警让位，
+      单实例改由服务端口探活兜底。
     """
     global SERVER_PORT, LOCK_PORT
     frozen = getattr(sys, "frozen", False)
@@ -242,13 +222,9 @@ def _start_server(ready: threading.Event, error_box: list[str]) -> None:
 def _watch_launcher() -> None:
     """包装进程（run.py）死亡 → 本进程随之退出：孤儿实例防线。
 
-    run.py 被硬杀（任务管理器 / taskkill / 脚本超时收割）时，Windows 不会
-    连带收割子进程——desktop/main.py 存活成无主实例，继续占着服务端口与
-    单实例锁，下一次启动便撞上「已在运行」或「端口被占用」，用户看到的
-    就是「应用无法启动」。控制台正常关闭本就走整树收割，这里兜的是硬杀
-    路径：watcher 线程等包装进程句柄，触发即整体退出。
-    直接拉起（无 LAUNCHER_PID 环境）不设防——打包态 exe、--server 独立
-    运行均属此类，本来就没有可监视的父进程。
+    Windows 硬杀父进程不连带收割子进程，无主实例会占住服务端口与单实例锁；
+    watcher 线程等包装进程句柄，触发即 os._exit。直接拉起（无 LAUNCHER_PID
+    环境，如打包态 exe、--server）不设防——本无可监视的父进程。
     """
     if os.name != "nt":
         return
@@ -328,12 +304,9 @@ def _app_icon() -> str | None:
 def _wait_health(timeout: float) -> bool:
     """轮询本机健康端点直到就绪/超时。
 
-    **本机回环请求必须 trust_env=False 直连**：httpx 在 Windows 上读注册表
-    系统代理（Clash/加速器类常开），且其 no-proxy 判定按逗号分隔——注册表
-    ProxyOverride 是分号分隔（localhost;127.*;…），整串被当成一个主机名，
-    127.0.0.1 的例外**形同虚设**。开着系统代理时，发往本机的 health 探测
-    会被转发到代理端口，服务明明已监听却探测不通——等待页永远转圈、
-    watchdog 误报"服务启动失败"（实测复现）。HTTP(S)_PROXY 环境变量同理。
+    本机回环请求必须 trust_env=False 直连：httpx 读注册表系统代理，且其
+    逗号分隔的 no-proxy 判定对 Windows 分号分隔的 ProxyOverride 无效，
+    本机探测会被转发到代理端口（HTTP(S)_PROXY 环境变量同理）。
     """
     deadline = time.time() + timeout
     url = f"http://{SERVER_HOST}:{SERVER_PORT}/api/v1/health"
@@ -352,9 +325,7 @@ def _wait_health(timeout: float) -> bool:
 def _server_port_listening() -> bool:
     """TCP 层探测服务端口是否真在监听（socket 直连，不经 httpx 代理层）。
 
-    watchdog 用它定位「health 超时」的责任方：TCP 通 + health 超时 =
-    服务活着、探测链路被拦（代理/TUN 类软件劫持本机回环的残留形态）；
-    TCP 不通 = 服务进程真没起来，走原始报错。
+    watchdog 用它区分「探测链路被代理/TUN 劫持」与「服务进程没起来」。
     """
     try:
         with socket.create_connection((SERVER_HOST, SERVER_PORT), timeout=2.0):
@@ -630,10 +601,9 @@ class DesktopApi:
             .replace("__KNOWN__", json.dumps(known, ensure_ascii=False))
         )
 
-    # 登录窗必需 Steam 域（探活集）：只探页面域不够——页面能从国内 CDN 打开
-    # ≠ 能登录。api.steampowered.com（IAuthenticationService，二维码轮询/密码
-    # 认证）与 community.steam-api.com（二维码确认 websocket）任一不通，页面
-    # 照常渲染但登录动作会永远挂起。
+    # 登录窗探活集：页面域国内 CDN 可达 ≠ 能登录。认证依赖
+    # api.steampowered.com（IAuthenticationService，二维码轮询/密码认证）与
+    # community.steam-api.com（二维码确认 websocket），任一不通登录动作就挂起。
     _LOGIN_PROBE_HOSTS = (
         "https://login.steampowered.com/jwt/refresh",
         "https://api.steampowered.com/ISteamWebAPIUtil/GetServerInfo/v1/",
@@ -643,10 +613,9 @@ class DesktopApi:
 
     @staticmethod
     def _sid_from_login_secure(value: str) -> str:
-        """steamLoginSecure 值 → SteamID64（`<sid>||<token>` 前段，兼容 URL 编码
-        %7C%7C；纯数字值直接判）。与服务端 steam_id_from_cookies 同口径，桌面
-        侧独立实现——登录窗要拿 ID 判"是哪个账号/新号还是换绑"，不能为这一步
-        import 服务端模块（打包态路径耦合）。
+        """steamLoginSecure 值 → SteamID64（`<sid>||<token>` 前段，兼容 URL
+        编码 %7C%7C；纯数字值直接判）。与服务端 steam_id_from_cookies 同口径，
+        桌面侧独立实现（打包态不 import 服务端模块）。
         """
         v = (value or "").strip()
         for sep in ("%7C%7C", "||"):
@@ -680,9 +649,8 @@ class DesktopApi:
     def restart_app(self) -> dict:
         """前端「重启以完成更新」入口：新进程拉起自己，本进程即刻退出。
 
-        js_api 调用在独立线程，os._exit 安全；重启后 main() 的
-        _handoff_pending_update 分支把换装交给暂存包的新 exe 执行
-        （见该函数 docstring：换装必须等旧进程退出，不能在跑着的进程里动目录）。
+        js_api 调用在独立线程，os._exit 安全；重启后由 main() 的
+        _handoff_pending_update 分支接管换装。
         """
         exe = Path(sys.executable) if getattr(sys, "frozen", False) else None
         if exe is None or not exe.is_file():
@@ -702,19 +670,15 @@ class DesktopApi:
         """选择登录窗网络通道，返回 (mode, proxy_url, full_ok)。
 
         mode：
-          - 'proxy'  : 引擎代理通过探活 → env 注入 --proxy-server
-          - 'direct' : 代理不可用但真直连通过 → env 注入 --no-proxy-server
-            （WebView2 默认继承系统代理；用户开着 Verge 系统代理且节点死时，
-            "直连回退"会悄悄变成死路由——强制绕过才是真直连）
-          - 'system' : 两通道连登录域都不通 → 不动任何参数，页面能否打开听
-            天由命（教程卡底部"换个节点"提示兜底）
-        full_ok：认证域全套通过。False = 只有登录域通（api/社区域仍被墙，
-        页面能开但登录会卡）——此时**不得**展示"已使用代理加速"气泡，半残
-        通道不邀功。
+          - 'proxy'  : 引擎代理探活通过 → 注入 --proxy-server
+          - 'direct' : 真直连通过 → 注入 --no-proxy-server（WebView2 默认
+            继承系统代理，须强制绕过才是真直连）
+          - 'system' : 两通道连登录域都不通 → 不动参数
+        full_ok：认证域全套通过；False = 仅登录域通，不得展示
+        「已使用代理加速」气泡（半残通道不邀功）。
 
-        顺序遵循 proxy_first：proxy 全套 → direct 全套 → proxy 登录域 →
-        direct 登录域 → system。探活目标用认证端点而非页面 URL（页面域国内
-        CDN 可达 ≠ 登录可用，第一版只探页面域正是这次误判根因）。
+        顺序：proxy 全套 → direct 全套 → proxy 登录域 → 直连登录域 → system。
+        探活目标用认证端点而非页面 URL（页面域可达 ≠ 登录可用）。
         """
         import logging as _logging
 
@@ -753,38 +717,22 @@ class DesktopApi:
         """打开 Steam 登录子窗口，轮询 Cookie；登录成功自动回传三件套。
 
         pywebview 5.4+ EdgeChromium（WebView2）后端可经 CookieManager 读到
-        httpOnly 的 steamLoginSecure——即 webapi_token 的 Cookie 载体。
-        轮询到即关窗返回；超时/用户关窗返回错误。js_api 调用在独立线程，
-        阻塞安全。
+        httpOnly 的 steamLoginSecure。轮询到即关窗返回；超时/用户关窗返回
+        错误。js_api 调用在独立线程，阻塞安全。
 
-        ⚠️ get_cookies 返回 SimpleCookie 列表（每个元素含一个 Morsel），
-        Morsel 的名字在 .key / ['name']，不在 .name——直接取 .name 会
-        全部落空、永远识别不到 steamLoginSecure（修过，勿回退）。
+        ⚠️ get_cookies 返回 SimpleCookie 列表，Morsel 的名字在 .key /
+        ['name']，不在 .name——直接取 .name 会全部落空。
 
-        通道选择（见 _resolve_login_channel）：开窗前对**认证域
-        全套**（login / api / community-api）并发探活选通道——proxy 全套 →
-        真直连全套 → proxy 登录域 → 直连登录域 → 系统默认。只探页面域不够：
-        store 页面国内 CDN 能开 ≠ 能登录（api.steampowered.com 直连被墙时
-        页面照常渲染但二维码轮询/密码认证永远挂起，首轮实测踩坑）。选 direct
-        时注入 --no-proxy-server 强制绕过系统代理。
+        通道选择见 _resolve_login_channel。窗内 UX 助手（代理气泡 / 验证
+        教程卡 / 已绑定账号侧栏 / 登录成功横幅）经 events.loaded +
+        evaluate_js 注入，见 _LOGIN_HELPER_JS；Cookie 命中即提取 SteamID64
+        （与服务端 steam_id_from_cookies 同口径），返回值带 steam_id 供
+        前端绑定提示复用。
 
-        窗内 UX 助手：代理**全套通过**时展示「已使用代理加速
-        网页加载」气泡（仅首次加载，降级通道不展示）；右下角常驻「登录验证
-        指南」教程卡（可 ✕ 关闭，关闭后本次登录窗不再重现）。经
-        events.loaded + evaluate_js 注入，见 _LOGIN_HELPER_JS。
-
-        教程卡进度感知 + 账号判定：卡内 1.2s 轮询登录页 DOM
-        锚点（password / 人机验证 / #authcode·#twofactorcode_entry / 成功钮），
-        实时高亮当前步骤；开窗前拉 /account/list 把已绑定账号列进卡侧栏，
-        登录的是哪个号一眼可比对；Cookie 命中即提取 SteamID64（steamLoginSecure
-        首段，与服务端 steam_id_from_cookies 同口径）展示「登录成功：<账号>，
-        正在回传」横幅后再关窗，返回值带 steam_id 供前端绑定提示复用。
-
-        技术约束：同一 user-data 目录下所有 WebView2 环境的浏览器参数必须
-        一致，主窗口已按直连参数创建 → 登录窗必须换独立 user-data 目录
-        才能带 --proxy-server 参数拉起自己的浏览器进程；pywebview 5.4 无
-        按窗口 storage API，临时换 winforms 模块级 cache_dir（5.4 实测源码
-        全局单值，升级 pywebview 需复核）。
+        同一 user-data 目录下所有 WebView2 环境的浏览器参数必须一致——
+        登录窗须换独立 user-data 目录才能带 --proxy-server 参数；pywebview
+        5.4 无按窗口 storage API，临时换 winforms 模块级 cache_dir（升级
+        pywebview 需复核）。
         """
         import logging as _logging
         import tempfile as _tempfile
@@ -1058,9 +1006,8 @@ def _remove_path(path: Path) -> None:
 def _staged_main_exe(payload: Path) -> Path | None:
     """暂存载荷的主程序：优先与本程序同名，否则取载荷根目录下的 exe。
 
-    用**载荷自己的 exe**而不是「当前进程的 exe 名」定位：用户可能给主程序改过名
-    （`Holdexar (1).exe`、带版本号的副本……），按当前名字硬找会把好好的更新包
-    判成「缺少主程序」而拒换。换装后的启动目标也随之取载荷那个文件名。
+    按载荷自己的 exe 定位（用户可能给主程序改过名），换装后的启动目标
+    也随之取该文件名。
     """
     candidates = sorted(p for p in payload.glob("*.exe") if p.is_file())
     if not candidates:
@@ -1072,12 +1019,9 @@ def _staged_main_exe(payload: Path) -> Path | None:
 def _staged_supports_helper(exe: Path) -> bool:
     """暂存包的新 exe 是否支持安全换装（`--apply-update`）。
 
-    为什么必须探测：换装要在**旧进程退出后**由暂存包的新 exe 执行；已发布的老
-    版本没有这个入口，硬换装只能走老逻辑——它在运行中的程序目录上对装载中的
-    `_internal` 做 `shutil.move`：`os.rename` 被 Windows 拒绝（WinError 5，实测），
-    `shutil.move` 遂静默降级为 copytree+rmtree，只复制得动未被占用的文件、再把
-    原目录删剩被占用的那些（实测 `_internal` 1319 个文件剩 32 个，安装半截化）。
-    探测失败即拒换：宁可不更新，也不能毁掉现装。
+    探不到即拒换：老版本没有换装入口，硬换装会在运行中的程序目录上做
+    `shutil.move`（rename 失败静默降级 copytree+rmtree），把安装毁成半截。
+    宁可不更新，不能毁掉现装。
     """
 
     try:
@@ -1118,12 +1062,9 @@ def _wait_pid_exit(pid: int, timeout: float = 180.0) -> None:
 def _handoff_pending_update() -> bool:
     """staging 就绪 → 把换装交给**暂存包的新 exe**，本进程随即退出。
 
-    为什么不在本进程里换装（v0.1.0 的老做法，实测毁安装）：本进程正从
-    `_internal` 装载 DLL，而该目录在运行中无法整体 `os.rename`（WinError 5）。
-    换装进程等本进程的句柄消失后再动文件，那时目录没有任何占用，改名与复制
-    都是普通操作。
-
-    返回 True = 已交接（调用方必须立即退出，别再起 uvicorn 与窗口）。
+    本进程正从 `_internal` 装载 DLL，运行中的目录无法整体改名；换装进程
+    等本进程句柄消失后再动文件。返回 True = 已交接（调用方必须立即退出，
+    别再起 uvicorn 与窗口）。
     """
     if not is_frozen():
         return False
@@ -1206,11 +1147,9 @@ def _restore_moved(moved: list[str], target: Path, old_dir: Path) -> None:
 def _swap_payload(staging: Path, target: Path) -> bool:
     """换装主体：旧条目让位 → 新载荷落位 → 校验 → 清暂存。返回是否成功。
 
-    只用两种搬运方式，别的一律不碰：
-    - 旧条目**只做 os.replace 改名**（同卷原子）。绝不用 `shutil.move`——它在
-      rename 失败时会静默降级成 copytree+rmtree，那正是毁安装的根源；
-    - 新载荷**复制**落位（暂存目录在系统盘、程序目录可能在别的盘，跨卷没法改名）。
-    任一步失败即整体回滚到原版本，程序目录始终保持可启动。
+    搬运规范：旧条目只做 os.replace 改名（同卷原子，禁止 shutil.move——
+    rename 失败会静默降级成 copytree+rmtree 毁安装）；新载荷复制落位
+    （暂存与目标可能跨卷）。任一步失败即整体回滚，程序目录始终保持可启动。
     """
 
     payload = staging / APP_NAME
@@ -1254,8 +1193,7 @@ def _swap_payload(staging: Path, target: Path) -> bool:
         _restore_moved(moved, target, old_dir)
         return False
 
-    # ④ 落位校验：少一个文件就是半截安装，宁可回滚
-    #   （计数含顶层文件本身——主程序漏算过一次，把正常换装误判成了半截）
+    # ④ 落位校验：少一个文件就是半截安装，宁可回滚（计数含顶层文件本身）
     want = sum(1 for p in payload.rglob("*") if p.is_file())
     got = sum(_count_tree(target / name) for name in landed)
     if got != want:
@@ -1318,11 +1256,9 @@ def _cleanup_old_dir_async(old_dir: Path) -> None:
 
 
 def _cleanup_staging_leftover() -> None:
-    """清理已消费的暂存目录残留。
+    """清理已消费的暂存目录残留（换装进程自身跑在暂存目录里，退出前删不干净）。
 
-    换装进程自己就跑在暂存目录里，它的 exe 与 DLL 在退出前删不掉——换装成功后
-    总会留下这一撮。判据是「没有 manifest」：带 manifest 的暂存是待换装的正经
-    包，一个字节都不许动。
+    判据是「没有 manifest」：带 manifest 的暂存是待换装的正经包，不许动。
     """
 
     staging = _data_dir() / "update-staging"
@@ -1347,10 +1283,8 @@ _tray_state: dict = {"quit": False, "tray": None}
 def _create_tray(window) -> object | None:
     """托盘图标：pythonnet/WinForms（pywebview winforms 后端自带依赖链）。
 
-    双击 / 菜单「显示主窗口」唤起；菜单「退出」才真退进程。常态下用户
-    点 X = 隐藏窗口，后端（uvicorn + 调度器）随进程常驻继续更新数据。
-    创建失败（理论上仅异常环境）返回 None：关窗守卫照常隐藏，恢复靠
-    再次启动唤醒（_focus_running_window 已覆盖隐藏窗口）。
+    双击 / 菜单「显示主窗口」唤起；菜单「退出」才真退进程；点 X = 隐藏窗口，
+    后端随进程常驻。创建失败返回 None：关窗守卫照常隐藏，恢复靠再次启动唤醒。
     """
     try:
         import clr
@@ -1428,22 +1362,15 @@ _DIALOG_FONT_FAMILY = "Microsoft YaHei UI"  # 同网页 --font-sans 的中文回
 _DIALOG_CORNER_RADIUS = 12
 
 # ── 弹窗幕布与出入场动效（数值对齐网页弹层档位）──────────────────────
-# 原生弹窗此前是「凭空出现的一块方片」：无遮罩、无出入场，用户注意不到弹窗
-# 出现。这里补两件，数值都对齐网页侧既有档位（不另立一套节奏）：
-#   ① 幕布：**页面级**遮罩（.hl-close-curtain，背靠背景 = --surface-mask +
-#      blur(8px)，同 .hl-overlay），由 _toggle_close_curtain 经后台线程调页面里的
-#      window.__hlxCloseCurtain 拉起。原生侧曾经自己开遮罩窗压住 WebView2，实测
-#      DWM 为此要整块重新合成、把弹窗上屏拖慢 ~600ms（拆解见 DEV_LOG 判例），
-#      页面自己的 backdrop-filter 零延迟、且只盖内容区不盖标题栏；
-#   ② 出入场：透明度 + 位移（自下浮入 / 反向沉出），时长与缓动对齐
-#      .hl-dialog-pop-* 的档位区间（170ms，--duration-2~3 之间；--ease-inout）。
-_ANIM_MS = 170            # 网页档位 --duration-2/3 之间；250ms 实测偏拖沓，压到 170
+# 幕布是页面级遮罩（.hl-close-curtain，同 .hl-overlay），由 _toggle_close_curtain
+# 调页面里的 window.__hlxCloseCurtain 拉起。出入场：透明度 + 位移，
+# 时长与缓动对齐 .hl-dialog-pop-* 档位（--ease-inout）。
+_ANIM_MS = 170            # 网页档位 --duration-2/3 之间
 _ANIM_TICK_MS = 15        # 帧间隔：约 60fps
 _ANIM_RISE = 16           # 入场位移（px）：自下方浮到位，出场反向沉出
 
-# 页面幕布开关脚本：显式返回布尔（页面没有挂载点 → false）。不能用
-# `!!(hook && hook(true))` 这种缩写——挂载点返回值是 undefined，`!!` 会把
-# 「已执行」也判成 false，探测结果就没法用了。
+# 页面幕布开关脚本：显式返回布尔（页面没有挂载点 → false）。
+# hook(true) 返回 undefined，不能用 !!(hook && hook(true)) 缩写。
 _CURTAIN_JS = (
     "(function () {{ if (!window.__hlxCloseCurtain) return false;"
     " window.__hlxCloseCurtain({0}); return true; }})()"
@@ -1508,9 +1435,8 @@ def _app_theme() -> str:
         finally:
             con.close()
         if row and row[0] is not None:
-            # app_settings 存的是 JSON 编码值——前端写进去的是带引号的 "light"，
-            # 直接拿去比对字符串永远不中，弹窗会静默回落深色（用户实测报过
-            # 「主题色不跟主界面变」）。这里先按 JSON 解码，解不动再按裸值判。
+            # app_settings 存的是 JSON 编码值（前端写进去的是带引号的 "light"），
+            # 先按 JSON 解码，解不动再按裸值判。
             value = str(row[0]).strip()
             try:
                 value = str(json.loads(value))
@@ -1524,12 +1450,10 @@ def _app_theme() -> str:
 
 
 def _brand_logo_path(theme: str = "dark") -> str | None:
-    """弹窗标题栏 logo：**深色面用浅色（白色线条）版**，浅色面用深色版。
+    """弹窗标题栏 logo：深色面用浅色（白线条）版，浅色面用深色版。
 
-    命名语义：logo_dark / logo_light 指「给哪种主题用」——logo_dark 是
-    深色主题下使用的白色线条版，logo_light 是浅色主题下的深色线条版，
-    反了会糊进底色里看不见。打包态前端产物收在 web/dist/assets/（vite
-    把 public/assets 原样复制），找不到回退窗口图标 _app_icon()。
+    logo_dark / logo_light 指「给哪种主题用」，反了会糊进底色。打包态
+    前端产物在 web/dist/assets/，找不到回退 _app_icon()。
     """
     name = "logo_light.ico" if theme == "light" else "logo_dark.ico"
     candidates: list[Path] = []
@@ -1562,8 +1486,7 @@ def _style_surface(control) -> None:
     """把控件切成自绘模式（无系统边框/背景，交给 Paint 事件画主题外观）。
 
     **必须用事件绑定而非 override OnPaint**：pythonnet 对 Python 子类的
-    虚方法分派不生效（实测 override 不被回调），CLR→Python 只有事件通路
-    （同托盘 NotifyIcon 的沉淀）。
+    虚方法分派不生效，CLR→Python 只有事件通路（托盘 NotifyIcon 同此）。
     """
     from System.Windows.Forms import ControlStyles
 
@@ -1578,18 +1501,14 @@ def _style_surface(control) -> None:
 def _attach_close_animation(dialog) -> None:
     """给弹窗挂出入场动效：淡入 + 自下浮入 / 淡出 + 反向沉出。
 
-    入场在 Shown 之后起步——CenterParent/CenterScreen 的真实落点由系统在显示时
-    才算出来，位移必须基于那个落点。出场在 FormClosing 里拦一次：先取消本次关闭，
-    动效走完再真关。
+    入场在 Shown 后起步（CenterParent 的落点显示时才定，位移须基于该
+    落点）；出场在 FormClosing 拦一次，动效走完再真关。
 
-    **用户的选择必须自己接住**：关闭被拦下时 WinForms 会把 DialogResult 复位
-    （实测「最小化」的 Yes /「退出程序」的 No 都会被清成空），之后真关时
-    ShowDialog 只回 Cancel——两个按键点完等于「留在窗口」，表现为按了没反应。
-    故 FormClosing 里先把值存进 state，真关前放回去（赋值与随后 Close 一起把
-    选择带回 ShowDialog）。
+    关闭被拦下时 WinForms 会把 DialogResult 复位、真关只回 Cancel（按键
+    等于按了没反应）——故先存 state，真关前放回（见 _close_now）。
 
-    动效是**装饰**：任何一步失败都必须退化成「弹窗照常开合」——入场失败恢复
-    不透明度 1，出场失败立即放行。绝不能把弹窗留在「不可见」或「关不掉」。
+    动效是装饰：任何一步失败都退化为弹窗照常开合（入场失败恢复不透明度
+    1，出场失败立即放行），绝不把弹窗留在不可见或关不掉的状态。
     """
     from System.Drawing import Point
     from System.Windows.Forms import DialogResult, Timer
@@ -1728,8 +1647,7 @@ def _attach_close_animation(dialog) -> None:
 def _animations_enabled() -> bool:
     """系统「在 Windows 中显示动画」开关（SPI_GETCLIENTAREAANIMATION）。
 
-    网页侧有 --motion-scale 总闸（reduced-motion 归零即瞬时到位），原生弹窗
-    不该绕过它：系统关动画时这里直接出终态——不做淡入、不做位移。
+    与网页侧 --motion-scale 总闸对齐：系统关动画时直接出终态。
     """
     try:
         import ctypes
@@ -1752,13 +1670,10 @@ def _make_close_button(
     fg_hover=None,
     hover_bg=None,
 ) -> object:
-    """右上角关闭键（圆滑设计覆盖层：圆形悬停底 + 细叉线）。
+    """右上角关闭键（圆形悬停底 + 细叉线，自绘覆盖系统方形 X）。
 
-    系统标题栏的方形 X 没有任何圆滑可调（DWM 只能染底色），故以自绘按键
-    覆盖：Label 载体（无 Button 的系统边框/焦点框残留），Paint 事件画
-    圆形悬停底与叉线；点击时手动置窗体 DialogResult，语义与
-    Button.DialogResult 一致。叉线/悬停色按主题传入（浅色面深叉线、深色面
-    浅叉线）。
+    Label 载体（无系统边框/焦点框），Paint 事件画悬停底与叉线；点击手动置
+    窗体 DialogResult（语义同 Button.DialogResult）。叉线/悬停色按主题传入。
     """
     from System.Drawing import Color, Point, Rectangle, Size, SolidBrush, Pen
     from System.Drawing.Drawing2D import SmoothingMode
@@ -1786,7 +1701,7 @@ def _make_close_button(
             # 圆形悬停底：hover 高亮是圆的，不是系统那种方块。
             # fg/fg_hover/hover_bg 已是 Color 对象（主题表经 _c() 转换后传入），
             # 直接用——对 Color 做 * 展开会抛「argument after * must be an
-            # iterable, not Color」并弹 CLR 异常对话框（实测）。
+            # iterable, not Color」并弹 CLR 异常对话框。
             g.FillEllipse(
                 SolidBrush(hover_bg),
                 Rectangle(0, 0, button.Width - 1, button.Height - 1),
@@ -1823,24 +1738,13 @@ def _make_close_button(
 def _build_close_dialog(owner=None, theme: str | None = None):
     """构建「最小化 / 退出程序」二选一对话框（WinForms 自绘，随应用主题）。
 
-    返回 (form, mapping)：mapping 把 ShowDialog 的 DialogResult 译成意图
-    （'minimize' / 'quit'；Cancel = 右上角圆滑关闭键，留在窗口不动）。系统
-    MessageBox 的按键文案只有是/否/确定/取消固定几组，出不了「最小化」
-    「退出程序」动作词，故整窗自绘。
-
-    外观（对齐主界面 + 逐条要求）：
-    - **随应用主题**：theme 缺省时读 app_settings 镜像（ui.theme，前端
-      apply() 初始化与每次切换都写），深浅两套配色对齐 tokens.css 两档；
-      标题栏 logo 也按面取版（深色面浅色线条版 / 浅色面深色线条版）；
-    - **无边框自绘标题栏**：logo + 标题 + 右上角圆滑关闭键（圆形悬停底 +
-      细叉线——系统方形 X 无圆滑可言，DWM 也只能染底色，故自绘覆盖）；
-    - **窗体圆角 + 描边**：无边框窗用 Region 裁圆滑轮廓，Paint 画 1px 描边；
-    - **按键圆角纯色双色**：安全动作（最小化）品牌蓝实底，终止动作（退出
-      程序）危险红实底——两色即两种动作性质；
-    - **无问号图标**；字号用像素单位（pt 是物理单位会随 DPI 放大，与像素
-      布局混用会「字大了框没大」）。
-    回车 = 最小化（AcceptButton，安全侧）；Esc = 留在窗口（KeyPreview +
-    KeyDown）。
+    返回 (form, mapping)：mapping 把 DialogResult 译成意图（'minimize' /
+    'quit'；Cancel = 留在窗口）。系统 MessageBox 出不了「最小化」「退出
+    程序」动作词，故整窗自绘。要点：theme 缺省读 app_settings 镜像
+    （ui.theme）；无边框自绘标题栏（logo + 圆滑关闭键）；Region 裁圆角 +
+    1px 描边；按键双色分工动作性质（最小化 = 品牌蓝 / 退出 = 危险红）；
+    字号用像素单位（pt 随 DPI 放大，与像素布局混用会失调）；回车 = 最小化
+    （AcceptButton，安全侧），Esc = 留在窗口（KeyPreview + KeyDown）。
     """
     import clr  # noqa: F401 —— pythonnet 装配件
 
@@ -1903,13 +1807,12 @@ def _build_close_dialog(owner=None, theme: str | None = None):
     ) -> WinButton:
         """圆角纯色按键（自绘）。
 
-        为什么不用 FlatStyle.Flat：它的方角 + 系统描边 + 深灰面色正是「按键
-        突兀」的来源，且没有可调的圆角。这里 UserPaint + Paint 事件自绘抗锯齿
-        圆角矩形——**不用 override OnPaint**：pythonnet 对 Python 子类的虚方法
-        分派不生效（实测 override 不被回调，事件绑定才是 CLR→Python 的既有
-        通路，同托盘 NotifyIcon）。DrawString 文字框必须 RectangleF（pythonnet
-        不做 Rectangle→RectangleF 隐式转换，传 Rectangle 会抛 CLR 异常）。
-        载体保留 Button：DialogResult / AcceptButton（回车默认）语义齐全。
+        不用 FlatStyle.Flat（方角 + 系统描边 + 固定面色，且无圆角可调），
+        也不用 override OnPaint——pythonnet 对 Python 子类的虚方法分派不生效，
+        事件绑定才是 CLR→Python 的通路（托盘 NotifyIcon 同此）。DrawString
+        文字框必须 RectangleF（pythonnet 不做 Rectangle→RectangleF 隐式转换，
+        传 Rectangle 会抛 CLR 异常）。载体保留 Button：DialogResult /
+        AcceptButton（回车默认）语义齐全。
         """
         btn = WinButton()
         btn.Text = text
@@ -1967,8 +1870,7 @@ def _build_close_dialog(owner=None, theme: str | None = None):
     dialog.Text = f"关闭 {APP_NAME}"
     # 无边框自绘：标题栏（logo/标题/圆滑关闭键）全部自绘，拖动转交系统
     # （WM_NCLBUTTONDOWN）。AutoScaleMode.None + 全程像素坐标（含字号），
-    # 不掺 DPI 换算——任何 DPI 下比例一致（换算方案在部分机器上把窗口撑歪
-    # 过，稳定优先一律不做）。
+    # 不做 DPI 换算。
     dialog.AutoScaleMode = getattr(AutoScaleMode, "None")
     dialog.FormBorderStyle = getattr(FormBorderStyle, "None")
     dialog.BackColor = _c("bg")
@@ -2133,10 +2035,8 @@ def _build_close_dialog(owner=None, theme: str | None = None):
 def _toggle_close_curtain(window, on: bool) -> None:
     """切页面级关窗幕布：给网页发 __hlxCloseCurtain(true/false)。
 
-    **必须后台线程派发**：pywebview 的 evaluate_js 是同步阻塞的（内部等
-    semaphore，回调还排回 UI 线程上下文），从关窗守卫（本身就在 UI 线程）直接
-    调会自锁。后台线程里调用是安全的——ExecuteScriptAsync 由 WebView2 自己派发
-    到渲染进程，页面渲染归合成器，全程不需要我们的消息泵。
+    必须后台线程派发：evaluate_js 同步阻塞（回调排回 UI 线程），从关窗
+    守卫（UI 线程）直接调会自锁。
     """
     if window is None:
         return
@@ -2157,18 +2057,10 @@ def _toggle_close_curtain(window, on: bool) -> None:
 def _ask_close_intent(owner=None, window=None) -> str:
     """关窗意图询问：二选一（最小化到托盘 / 退出程序），同步模态对话框。
 
-    返回 'minimize' / 'quit'。弹窗拿主窗口作 owner（居中其上、模态随主窗，
-    不会藏到别的窗口后面）；任何异常（pythonnet 缺失 / 无桌面会话 / owner
-    拿不到）一律降级 'minimize'——问不出意图时保持「点 X = 后台常驻」的
-    既定语义，绝不误杀进程。
-
-    同步弹窗是刻意的：closing 事件 handler 本就同步跑在 UI 线程
-    （should_lock=True），pywebview 上游的 confirm_close 也在同一位置
-    同步弹原生对话框——阻塞在对话框上正是拿用户决定的手段。
-
-    幕布（主窗上的遮罩窗）与出入场动效在这里一起装配：幕布先 Show 再
-    ShowDialog，两窗同随主窗，弹窗因被激活而在幕布之上。整条链任何一步失败都只是「没有幕布 / 没有动效」，
-    弹窗本身照常弹出。
+    返回 'minimize' / 'quit'；任何异常（pythonnet 缺失 / 无桌面会话）一律
+    降级 'minimize'（问不出意图时保持「点 X = 后台常驻」语义，不误杀进程）。
+    同步弹窗：closing handler 本就同步跑在 UI 线程，阻塞拿用户决定。幕布与
+    出入场动效在此装配，任一步失败只是少幕布/动效，弹窗照常弹出。
     """
     dialog = None
     try:
@@ -2206,10 +2098,9 @@ def _make_closing_guard(window):
         owner = getattr(window, "native", None)
         intent = _ask_close_intent(owner, window)
         if intent == "quit":
-            # 先撤窗再放行：点「退出程序」窗口必须当场消失。放行真关闭之后的进程收尾
-            # （pythonnet/.NET 与 WebView2 的卸载，最小 pywebview 基线实测也要 ~2s）期间
-            # 窗口会继续留在屏幕上，用户看到的就是「弹窗关了、界面还停着一两秒」。
-            # 撤窗只收走可见面；真关闭照常走（closed 事件里 os._exit(0) 终结进程）。
+            # 先撤窗再放行：点「退出程序」窗口必须当场消失，进程收尾期间窗口
+            # 不滞留屏幕。撤窗只收走可见面；真关闭照常走（closed 事件里
+            # os._exit(0) 终结进程）。
             try:
                 window.hide()
             except Exception:  # noqa: BLE001
@@ -2217,9 +2108,8 @@ def _make_closing_guard(window):
             return True  # 放行真关闭：closed 事件里 os._exit(0) 终结进程
         if intent == "stay":
             return False  # 弹窗右上角 X：取消关闭，窗口原地不动
-        # 托盘没建起来时**不能 hide()**：窗口从屏幕与任务栏一起消失，又没有托盘
-        # 图标可召回——用户只能去任务管理器杀进程（实测：这正是「托盘里没有它、
-        # 任务管理器里却还活着」的成因）。退化成最小化，任务栏仍可点回来。
+        # 托盘没建起来时**不能 hide()**：窗口从屏幕与任务栏一起消失且无入口
+        # 可召回。退化成最小化，任务栏仍可点回来。
         if _tray_state.get("tray") is None:
             try:
                 window.minimize()
@@ -2245,10 +2135,9 @@ def _on_window_ready(window, app_url: str) -> None:
 def _run_tray(window) -> None:
     """托盘线程入口（经 webview.start(func) 在窗口建好后拉起）。
 
-    NotifyIcon 是 WinForms 控件——必须晚于 pywebview 的
-    SetCompatibleTextRenderingDefault 创建（实测：早于它建控件会把
-    webview.start() 炸穿、整窗降级浏览器）。本线程自起 WinForms 消息泵
-    派发托盘菜单/双击事件；主泵归窗口，两泵互不干扰。
+    NotifyIcon 必须晚于 pywebview 的 SetCompatibleTextRenderingDefault
+    创建，早建会炸穿 webview.start()。本线程自起 WinForms 消息泵派发
+    托盘事件；主泵归窗口，两泵互不干扰。
     """
     tray = _create_tray(window)
     if tray is None:
@@ -2284,9 +2173,8 @@ def _open_window(app_url: str) -> None:
         "height": DEFAULT_SIZE[1],
         "min_size": MIN_SIZE,
         "js_api": DesktopApi(),
-        # 放开原生文本选择：pywebview 默认 text_select=False 会把 WebView2 的
-        # IsTextSelectionEnabled 显式关掉，窗口里任何文本都拖选不了（日志/报错
-        # 只能靠页面自绘按钮复制）。置 True 后与浏览器一致：拖选 + Ctrl+C。
+        # 放开原生文本选择：默认 text_select=False 会显式关掉 WebView2 的
+        # IsTextSelectionEnabled；置 True 后与浏览器一致（拖选 + Ctrl+C）。
         "text_select": True,
     }
     try:
@@ -2303,9 +2191,7 @@ def _open_window(app_url: str) -> None:
             # pywebview 5.x：icon 是 start() 的参数（create_window 无此参，
             # 传了会 TypeError 顶层炸穿兜底）
             start_kwargs["icon"] = icon
-        # 托盘与 health 跳转都在窗口建好后由 start(func) 拉起（时序原因见
-        # _run_tray：NotifyIcon 早于 start() 创建会炸穿 WinForms 初始化 →
-        # 整窗降级）
+        # 托盘与 health 跳转都在窗口建好后由 start(func) 拉起（时序见 _run_tray）
         webview.start(_on_window_ready, (window, app_url), **start_kwargs)  # 阻塞至窗口真关闭（仅托盘退出可达）
     except Exception as e:  # noqa: BLE001 —— 窗口创建/渲染层初始化失败一并降级浏览器
         _browser_fallback(app_url, f"窗口初始化失败：{e}")
@@ -2327,9 +2213,8 @@ def _focus_running_window() -> bool:
         hwnd = user32.FindWindowW(None, WINDOW_TITLE)
         if not hwnd:
             return False
-        # 托盘隐藏态 / 最小化态都先 SW_RESTORE（顺带修正：原 IsIconicWindow
-        # 不是 user32 的真实导出，恒抛 AttributeError 走降级，最小化窗口
-        # 只被前台化不被还原）
+        # 托盘隐藏态 / 最小化态都先 SW_RESTORE（IsIconic 判定；user32 无
+        # IsIconicWindow 导出，误用会恒抛 AttributeError 退化成只前台化不还原）
         if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
             user32.ShowWindow(hwnd, 9)  # SW_RESTORE
         user32.SetForegroundWindow(hwnd)
@@ -2341,18 +2226,11 @@ def _focus_running_window() -> bool:
 def _apply_webview2_static_args() -> None:
     """主窗口 WebView2 静态浏览器参数：禁组件更新与后台网络服务。
 
-    WebView2（EdgeChromium）运行时进程的 Chromium 组件更新器会创建 BITS
-    任务（msedgewebview2.exe 的 bits_service）。宿主 exe 无数字签名时，
-    杀软主动防御把这笔 BITS 创建归因到宿主头上——实测拦截弹窗「程序正在
-    创建 BITS 任务，可能造成系统关键文件被篡改」，建议用户阻止（阻止后
-    WebView2 组件更新失效，极端情况窗口渲染异常）。--disable-component-
-    update + --disable-background-networking 从源头关掉组件更新与后台
-    更新流量：BITS 任务不再创建，本地 UI 功能不受影响（本项目全部数据
-    走后端 httpx，WebView2 只渲染 127.0.0.1 页面）。
-
-    进程级固定：同一 user-data 目录下所有 WebView2 环境的浏览器参数必须
-    一致；登录窗（独立 user-data 目录）的暂存/还原逻辑与本值天然兼容
-    （saved_env 即本值，还原后主窗口参数不变）。
+    WebView2 组件更新器会创建 BITS 任务；宿主 exe 无数字签名时杀软会弹
+    拦截窗并建议阻止。两参数从源头关闭组件更新与后台流量，BITS 不再创建，
+    本地 UI 不受影响（本项目数据全走后端 httpx）。进程级固定：同一
+    user-data 目录下所有 WebView2 环境参数必须一致，登录窗（独立目录）
+    的暂存/还原与本值天然兼容。
     """
     key = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"
     if not os.environ.get(key):
@@ -2362,11 +2240,8 @@ def _apply_webview2_static_args() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=f"{APP_NAME} 桌面启动器")
     parser.add_argument("--server", action="store_true", help="无窗口模式，仅启动本地服务")
-    # 换装进程入口（内部用，见 _run_update_helper）：由**暂存包的新 exe** 带着
-    # 暂存目录/程序目录/旧进程 PID 拉起，等旧进程退出后完成换装。
-    # ⚠️ 这个选项**必须出现在 --help 里**：老版本启动时靠 `--help` 探测暂存包
-    # 是否支持安全换装（见 _staged_supports_helper）——用 SUPPRESS 藏起来会让
-    # 探测永远失败、所有更新包都被判成「不支持安全换装」。
+    # 换装进程入口（见 _run_update_helper）。⚠️ 必须出现在 --help 里：
+    # 老版本靠 --help 探测暂存包是否支持安全换装（见 _staged_supports_helper）。
     parser.add_argument(
         _HELPER_FLAG, action="store_true",
         help="执行待安装的更新后退出（由应用内更新流程自动调用）",

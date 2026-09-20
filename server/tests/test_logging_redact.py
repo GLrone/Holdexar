@@ -186,7 +186,7 @@ def installed_logging(tmp_path):
     清空必须发生在**测试体内**：pytest 的 logging 插件是在**调用测试函数时**
     才把捕获 handler 挂到 root 上的，fixture 阶段清空挡不住它；而 `setup_logging`
     开头的 `if root.handlers: return` 幂等守卫会让它直接早退——测试于是「通过」
-    却什么都没测到（这正是本文件第一版踩到的坑）。
+    却什么都没测到。
     """
     root = logging.getLogger()
     saved_handlers, saved_level = list(root.handlers), root.level

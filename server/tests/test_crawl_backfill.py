@@ -166,7 +166,7 @@ def test_genre_classification():
     """genres 分类语义：Sexual Content/Nudity → 成人；Visual Novel → 视觉小说。
 
     提取逻辑内嵌在 handle_app_task（元数据 Phase 后段），此处直接
-    验证同一判定式，防语义漂移。Steam genres description 实测小写形态。
+    验证同一判定式，防语义漂移。Steam genres description 为小写形态。
     """
     def classify(genres: list[str]) -> tuple[bool, bool]:
         descs = {g.lower() for g in genres}

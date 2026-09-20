@@ -34,7 +34,7 @@ export const useRegionsStore = defineStore('regions', () => {
    * **只有非中文**才走这里 + `Intl.DisplayNames`。四条覆盖都不是审美偏好：
    *
    * - `PK` / `PT`：CC_LIST 里这两条**不是国家**，是聚合区（南亚容灾区 / 欧元区）。
-   *   实测 `Intl.DisplayNames(['en-US'],{type:'region'})` 分别给出 "Pakistan" 与
+   *   `Intl.DisplayNames(['en-US'],{type:'region'})` 分别给出 "Pakistan" 与
    *   "Portugal"——语义直接错，会把「南亚」显示成「巴基斯坦」。
    * - `HK`：Intl 给 "Hong Kong SAR China"。CC_LIST 顶部有明文政策
    *   （中国香港、中国台湾为固有命名，不得改为变体），对应到英文就是取惯用的
@@ -71,7 +71,7 @@ export const useRegionsStore = defineStore('regions', () => {
   /**
    * `Intl.DisplayNames` 取区域名，**任何输入都返回 `string | null`、绝不抛**。
    *
-   * 三处都实测过（不是照文档推的）：
+   * 三处行为（`Intl.DisplayNames` 的实际表现）：
    *   `of('')` / `of('U')` / `of('USA1')` / `of('U$')` / `of('ZZZ')` → 抛 RangeError；
    *   `of('cn')` → 返回 `"cn"`（小写既不报错也不翻译，**原样回显**）；
    *   `of('CN')` → `"China"`。
@@ -90,7 +90,7 @@ export const useRegionsStore = defineStore('regions', () => {
   /**
    * 区名（当前语言）。
    *
-   * 中文：服务端下发的名字**原样**（含货币后缀），与迁移前逐字相同。
+   * 中文：服务端下发的名字**原样**（含货币后缀）。
    * 非中文：覆盖表 → `Intl.DisplayNames` → 服务端名字，再补上货币后缀
    *   （半角括号，与英文排版一致；中文侧的全角括号不动）。
    *

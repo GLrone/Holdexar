@@ -3,10 +3,10 @@
 三个子命令（可独立跑，`all` 串联；全部幂等，重跑安全）：
 
     python scripts/fx_maintenance.py import-pg   # PG 汇率档案 → 本地 fx_rate_history
-                                                 # （2010-04-09 → 2026-07-07，16 币种，约 8.9 万行）
+                                                 # （2010-04-09 → 2026-07-07，16 币种）
     python scripts/fx_maintenance.py import-fxjson  # fx_rates.json 档案 → 本地
-                                                 # （38 币种全量 2010-04-09 → 2026-04-07，~22 万行；
-                                                 #   PG 通道搬不动时的最优档案源，纯 json 读入）
+                                                 # （38 币种全量 2010-04-09 → 2026-04-07；
+                                                 #   PG 不可用时的档案源，纯 json 读入）
     python scripts/fx_maintenance.py update      # 实时刷新（augmentedsteam → er-api 容灾）
                                                  # 写 fx_rates 快照 + 今日历史行
     python scripts/fx_maintenance.py backfill    # 补齐 fx_rate_history 缺失日期
@@ -228,9 +228,8 @@ def import_fxdb(src: str = DEFAULT_FXDB) -> None:
 
 
 # ── import-fxjson：fx_rates.json 导出档案 → 本地 ─────
-# pg 档案的定期导出覆盖
-# 38 币种 × 2010-04-09 → 2026-04-07 全量工作日——比 PG 通道（16 币种）宽、
-# 且不依赖 PG 存活。幂等：只补缺失的（币种, 日），已有数据一律不动。
+# pg 档案的定期导出覆盖：币种比 PG 通道全、不依赖 PG 存活。
+# 幂等：只补缺失的（币种, 日），已有数据一律不动。
 # 纯标准库（json + sqlite3），系统 Python / venv 均可跑。
 
 

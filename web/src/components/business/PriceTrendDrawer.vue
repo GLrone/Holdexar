@@ -136,7 +136,7 @@ async function load() {
   }
 }
 
-// ─── 全版本区块（B1 拍板：全部版本收拢到抽屉，版本 × 地区连锁）───
+// ─── 全版本区块（全部版本收拢到抽屉，版本 × 地区连锁）───
 const versionsAll = ref<GameVersionPrices[] | null>(null)
 let versionsSeq = 0
 
@@ -386,7 +386,7 @@ watch(visible, (open) => {
       </div>
       </HlPaneSwitch>
 
-      <!-- 全部版本（B1 拍板：收拢到抽屉；点 chip = 版本 × 地区连锁切换） -->
+      <!-- 全部版本（收拢到抽屉；点 chip = 版本 × 地区连锁切换） -->
       <div
         v-if="versionChips.length"
         class="trend-drawer__versions"
@@ -464,9 +464,8 @@ watch(visible, (open) => {
   gap: 6px;
 }
 
-/* 史低事件点。原先是行内 style 写死 #2ed573 + rgba(46,213,115,.5)——那个绿在
-   token 表里根本不存在，而走势图上同一个「史低」语义的点用的是 --success，
-   一绿两源。改取令牌阶梯，主题切换随之跟随。 */
+/* 史低事件点。取令牌阶梯（--success）而非独立绿色字面量——走势图上同一个
+   「史低」语义的点也用 --success，两处同源，主题切换随之跟随。 */
 .pc-event-dot {
   display: inline-block;
   width: 6px;

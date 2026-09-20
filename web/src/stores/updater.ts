@@ -156,13 +156,13 @@ export const useUpdaterStore = defineStore('updater', () => {
   }
 
   /** 取消/放弃本次更新：下载中 → 后端中止（保留续传基线），否则清暂存。
-   *  后端旧版对「下载中取消」回 409，这里忽略那个拒绝——取消是用户的明确意图，
-   *  不能因为后端不让就卡在按钮上。 */
+   *  取消是用户的明确意图，后端拒绝（如 409）也照常复位前端态，不能因为
+   *  后端不让就卡在按钮上。 */
   async function cancel(): Promise<void> {
     try {
       await systemApi.updateCancel()
     } catch {
-      /* 后端拒绝（旧版 409）也照常复位前端态 */
+      /* 后端拒绝也照常复位前端态 */
     }
     stopPolling()
     progress.value = null

@@ -1,18 +1,8 @@
 """提交前敏感面门禁：路径 / 体积 / 凭据特征三重检查。
 
-**为什么放在 scripts/ 而不是内联进 .githooks/pre-commit**：
-同一份判定要同时被本地钩子与 CI 使用（本地钩子可以被 `--no-verify` 绕过，
-CI 不能）。两份实现必然漂移，而漂移的方向恰好是「一边拦得住、另一边拦不住」。
-正则写在 shell 里还要过三层转义，改一次错一次。这里做成单一来源，可 pytest 覆盖。
-
-**凭据特征为什么不写关键词而是写「值的形状」**：
-`steamLoginSecure`、`steam_api_key`、`smtp.password` 在 18 / 9 / 2 个**合法源码**
-文件里作为变量名或配置键出现（已实测）。裸关键词扫描会拦住正常提交，
-而一个会拦住合法提交的门禁最终一定会被 `--no-verify` 绕过——等于没有门禁。
-所以每条特征都要求「标识符 + 赋值 + 真实凭据的长度/字符集形状」。
-
-**绝不回显命中的值**：只打印标签、位置与掩码预览。门禁把密钥打印进 CI 日志
-本身就是一条新的泄漏路径。
+单一来源供 pre-commit 与 CI 共用，可 pytest 覆盖。凭据特征按「标识符 +
+赋值 + 值的形状」匹配（裸关键词会命中合法源码里的同名变量/配置键）；
+命中只打印标签、位置与掩码预览，绝不回显原值（门禁日志本身是泄漏路径）。
 
 用法：
     python scripts/check_secrets.py --staged      # pre-commit：只查本次暂存的改动
@@ -32,17 +22,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # 单文件体积上限：挡住误入库的 SQLite 库 / 构建产物 / 二进制大文件。
-# 这次事故里那份 23,351,296 字节的活库就是被这一条挡下的。
 MAX_FILE_BYTES = 5 * 1024 * 1024
 
 # ── 路径层：这些位置的任何文件都不该进版本库 ──
-# 与 .gitignore 是两道独立防线：.gitignore 靠「默认不跟踪」，这里是
-# 「即使被 -f 强加或 .gitignore 被改坏，也在提交那一刻拦住」。
-#
-# 第 1 组**必须锚定仓库根**（`^`，不写 `(?:^|/)`）：这些是本项目根目录下的
-# 目录名。写成「任意深度」会误伤 `web/src/views/logs/Index.vue` 这类正常源码
-# ——「logs」「release」作为业务视图目录名完全合法，已实测踩到过。
-# 嵌套位置的数据文件由第 2 组的扩展名规则兜住。
+# 与 .gitignore 互为独立防线（.gitignore 默认不跟踪；这里拦 -f 强加或
+# .gitignore 失效的提交）。第 1 组必须锚定仓库根（`^`）——「logs」「release」
+# 也是业务视图目录名，写成任意深度会误伤 `web/src/views/logs/Index.vue`；
+# 嵌套数据文件由第 2 组扩展名规则兜住。
 PATH_DENY: list[tuple[str, str]] = [
     (
         r"^(?:data|data\.old|logs|release|reference|reference-repos|secrets"
@@ -221,12 +207,8 @@ def explicit(paths: list[str]) -> tuple[list[Finding], list[str]]:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """解析「范围」参数：`--staged` / `--all` / 指定文件，三选一。
 
-    **为什么不把位置参数塞进 `add_mutually_exclusive_group`**：那条写法在
-    Python 3.11 与 3.13 上行为不一致——3.12 起允许 `--all` 与 `nargs="*"`
-    的位置参数并存（位置参数取到空列表），3.11 却直接判定「argument paths:
-    not allowed with argument --all」并退出 2。CI 的 3.11 矩阵条目因此整个
-    红灯（实测：3.11.16 复现，3.12 / 3.13 不复现）。参数解析不能随解释器
-    版本改判定，故互斥改由下面这行显式校验承担，各版本行为一致。
+    互斥由显式校验承担：`add_mutually_exclusive_group` 对「--all 与
+    nargs="*" 位置参数并存」的判定在 Python 3.11 与 3.12+ 上相反。
     """
     parser = argparse.ArgumentParser(
         prog="check_secrets.py",
@@ -245,15 +227,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _ensure_output_encoding() -> None:
-    """输出编码兜底：控制台编码装不下中文时，把流切到 UTF-8。
+    """输出编码兜底：控制台编码装不下中文时把流切到 UTF-8。
 
-    GitHub Actions 的 windows-latest 上，Python 3.13 把标准输出判定为
-    cp1252（宿主继承的代码页，而非中文 Windows 的 cp936），打印
-    `[门禁] [OK] ...` 会抛 `UnicodeEncodeError: 'charmap' codec ...` 并
-    以退出码 1 结束——**门禁检查本身零命中，却让 CI 判成失败**（实测复现：
-    `PYTHONIOENCODING=cp1252`）。这里按流自身的编码能力决定是否切换：
-    cp936 能装下中文就原样保留（本机控制台正常），装不下才换 UTF-8，
-    避免把「本机读得通」换成「本机乱码」。
+    按流自身编码能力判定——装得下就不动（避免本机控制台乱码），装不下
+    才切换（CI windows runner 的 cp1252 下打印中文会以退出码 1 失败）。
     """
     probe = "门禁"
     for stream in (sys.stdout, sys.stderr):
@@ -289,9 +266,7 @@ def main() -> int:
         findings, files = explicit(args.paths)
         scope = f"指定文件（{len(files)} 个）"
 
-    # 结论行只用 ASCII 标记（OK / FAIL）：`✓`/`✗`（U+2713/U+2717）在
-    # 中文控制台的 cp936 下同样打不出来，会退化成字面 `✗`。中文说明文字
-    # 由 _ensure_output_encoding() 兜底，不靠这里的字符选型回避。
+    # 结论行只用 ASCII 标记（OK / FAIL）：✓/✗ 在中文控制台 cp936 下打不出
     if not findings:
         print(f"[门禁] [OK] 敏感面检查通过 —— {scope}")
         return 0

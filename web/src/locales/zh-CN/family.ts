@@ -1,21 +1,21 @@
 /* family 词条 —— 家庭组主页（views/family/Index.vue）。5 个页签的宿主：
    角色徽章、成员列表、地区弹层、同步/添加成员链路。
 
-   中英对应关系遵循期 6 brief 的 A 表（既有已上线英文，逐字沿用）与 B 表
-   （本期新定术语），几个人并行迁 family 时不许各定各的：
+   中英对应关系分两组约定：A 组为既有已上线英文（逐字沿用），B 组为后定
+   新术语，几个人并行迁 family 时不许各定各的：
    · 家庭组 = Family（`family.role.family`，同 bundles.badge.family）
    · 家庭库 = family library（`family.section.module` / `family.tab.lib`）
-     ⚠️ 与「共享库 = shared library」不是同一个集合（D1）
+     ⚠️ 与「共享库 = shared library」不是同一个集合
    · 贡献分布 = contribution split / 入库热力图 = acquisition heatmap /
-     价值洞察 = value insights（A 表）
+     价值洞察 = value insights
    · 成员洞察 = Member insights / 购买动态 = Purchase activity /
-     游玩动态 = Play activity（B 表）
-   · 独占 = Exclusive / 时长 = playtime（B 表）
+     游玩动态 = Play activity
+   · 独占 = Exclusive / 时长 = playtime
    · 全部 = All —— 直接复用 `common.all`，不在这里再写一条
 
    几处有意的分工，改一条要看清楚：
    · `family.role.family`（徽章，短 'Family'）与 `family.role.familyMember`
-     （二级窗叙述，'family member'）是**刻意的长短分工**，不是重复（D8）。
+     （二级窗叙述，'family member'）是**刻意的长短分工**，不是重复。
    · `family.member.recent30` 中文写「近30日活跃」，但它统计的是 `timeAcquired`
      （入库）不是游玩——英文必须写 "Acquired in last 30 days"，**绝对不要用
      active**（D6）。中文侧保持原样不动。
@@ -25,7 +25,7 @@
    带 {占位符} 的词条**不要**在组件侧用 + 或模板字符串拼中文片段：中英语序
    不同，拼不出版行。`family.section.module` 同时喂 data-section 锚点与模块
    标题——锚点必须与语言无关（ProductTour 的 querySelector 才不会静默落空），
-   所以属性值写 key、HlSectionRail 读到后 t() 显示（期 5/6 统一改法）。 */
+   所以属性值写 key、HlSectionRail 读到后 t() 显示。 */
 
 const family = {
   /* 模块头（data-section 锚点 + 模块标题共用一条） */

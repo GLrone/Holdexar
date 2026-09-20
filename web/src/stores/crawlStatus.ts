@@ -10,8 +10,7 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
   const qsize = ref(0)
   const speed = ref(0)
   /* 任务目标量：后端在任务启动时定死（初始任务数），随进度事件下发。
-     旧实现曾用 done+qsize 拼总数——队列排干/逐层入队/重推都会让它波动，
-     看起来「总数跟着进度走」。 */
+     不能用 done+qsize 拼总数——队列排干/逐层入队/重推都会让它波动。 */
   const total = ref(0)
   const activeJobId = ref<number | null>(null)
   const lastEventAt = ref<string>('')

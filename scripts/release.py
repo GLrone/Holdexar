@@ -1,10 +1,8 @@
 """Holdexar 一键发版：版本号 → 敏感面门禁 → 构建 → 推送 GitHub Release → 复验。
 
-**为什么要有这个脚本**：一次发版原本要按顺序记住五件事（改版本号、过门禁、出包、
-推两条 Release、核对资产），漏掉任何一步都留下一个「半成品发布」——清单指向不
-存在的 zip、tag 打在上一个提交上、或者最糟的：带着凭据出包。本项目已经发生过一次
-「凭据随包公开」的事故，因此本脚本把把关放在**构建之前**，并把「发布必须对应一个
-已提交的树」做成硬约束而不是提示。
+本脚本是唯一发版入口：门禁放在构建之前，「发布必须对应一个已提交的树」
+是硬约束。绕过它手动跑 build_release.py + publish_release.py 就没有门禁
+与复验（两者仍可单独运行，各自支持 --dry-run）。
 
 流程（任一步失败即中止，绝不留下半个发布）：
 
@@ -15,9 +13,6 @@
     5. 构建   scripts/build_release.py（前端 → PyInstaller → 消毒 → zip → 清单）
     6. 发布   scripts/publish_release.py（版本 Release + updater 清单 Release）
     7. 复验   下载 latest.json，核对 schema / 版本 / sha256 与资产实际一致
-
-**本脚本是唯一发版入口。** 绕过它手动跑 build_release.py + publish_release.py
-就没有门禁与复验（两者仍可单独运行，各自支持 --dry-run）。
 
 用法（发布机，用 server/.venv 解释器运行）：
     python scripts/release.py --check                  # 只预检，不改任何东西
@@ -207,7 +202,7 @@ def secret_gate(dry: bool) -> None:
         die(
             "敏感面门禁命中（见上方明细）。发布已中止。\n"
             "       这层拦的是「凭据/大文件/用户数据进入发布产物或版本库」——\n"
-            "       本项目曾因同类问题把活库与密钥公开推送过一次，不要 --no-verify 跳过。"
+            "       宁可中止也不要 --no-verify 跳过。"
         )
 
 
@@ -242,8 +237,7 @@ def write_version(new: str) -> None:
 def check_stale_version_refs(version: str) -> None:
     """文档里仍写着旧版本号时给个提示（只提示，不拦）。
 
-    README 的版本徽章这类引用不会让构建失败，但会让页面长期显示错版本——
-    本项目的 README 就曾停留在 `v0.1.0-beta`。
+    README 的版本徽章这类引用不会让构建失败，但会让页面长期显示错版本。
     """
     stale: list[str] = []
     for path in (ROOT / "README.md", ROOT / "docs" / "DEV_LOG.md"):
@@ -260,9 +254,8 @@ def check_stale_version_refs(version: str) -> None:
 def commit_and_push(version: str, dry: bool, yes: bool) -> None:
     """版本号变更单独提交并推送。
 
-    **必须先推送**：`gh release create <tag>` 是在**远端**创建 tag，指向的提交
-    由远端默认分支决定。本地提交没推上去，tag 就会落在上一个提交上，
-    于是「下载到的 zip」与「tag 指向的源码」不是一回事。
+    必须先推送：`gh release create <tag>` 在远端建 tag、指向远端默认分支
+    的提交；本地未推送时 tag 会落在上一个提交，zip 与 tag 源码对不上。
     """
     tag = f"v{version}"
     print(f"\n── 提交并推送 {tag} ───────────────────────────")
@@ -301,11 +294,7 @@ def fetch_json(url: str) -> dict:
 
 
 def verify(version: str, dry: bool) -> None:
-    """复验线上清单：地址可达、schema 对得上、版本与校验值就是刚发的那份。
-
-    只在**远端**取，不看本地文件——本地那份本来就是我们自己写的，校验它证明
-    不了「用户下载到的是对的」。这一步才真正回答「发布成功了吗」。
-    """
+    """复验线上清单：地址可达、schema / 版本 / 校验值与本次产物一致（只取远端）。"""
     print(f"\n── 复验 ────────────────────────────────────────")
     manifest_url = (
         f"https://github.com/{GITHUB_REPO}/releases/download/{MANIFEST_TAG}/{MANIFEST_ASSET}"

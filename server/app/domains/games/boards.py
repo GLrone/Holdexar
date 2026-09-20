@@ -69,7 +69,7 @@ class Board:
     max_records: int = 100            # 拉榜封顶（总条数，含已在库的）
     max_requests: int = 5             # 最多批数（max_records / BATCH_SIZE 向上取整）
     empty_tolerance: int = 1          # 连续 N 批零新增 → 终止
-    # 反哺语义：True=只补 games 无行的（特惠拍板）；False=无行 or 挂名孤儿
+    # 反哺语义：True=只补 games 无行的（特惠）；False=无行 or 挂名孤儿
     # （updated_at NULL 且无价格行，topsellers 现行语义）
     uncrawled_only: bool = False
     backfill_kind: str = ""           # 爬取 spec kind 标签
@@ -112,10 +112,10 @@ BOARDS: dict[str, Board] = {
         key="specials",
         params={"specials": 1, "sort_by": "Global_Topsellers",
                 "hidef2p": 1, "category1": 998, "l": "english"},
-        max_records=5000,             # 拍板：封顶 5000（含在库）
+        max_records=5000,             # 封顶 5000（含在库）
         max_requests=50,
-        empty_tolerance=3,            # 拍板：连续 3 批零新增终止
-        uncrawled_only=True,          # 拍板：只补不在库的差集
+        empty_tolerance=3,            # 连续 3 批零新增终止
+        uncrawled_only=True,          # 只补不在库的差集
         backfill_kind="specials_backfill",
     ),
     # 即将推出（页面 filter=popularcomingsoon&os=win；与三源同走
@@ -136,7 +136,7 @@ BOARDS: dict[str, Board] = {
 }
 
 
-# ── 进程内缓存：热值 + stale 兜底，分板独立（对齐原型 Redis 双 key × 3 板）──
+# ── 进程内缓存：热值 + stale 兜底，分板独立（每个板一组热值/stale 双 key）──
 _board_state: dict[str, dict] = {
     key: {"cache": None, "cache_ts": 0.0, "stale": None, "stale_ts": 0.0}
     for key in BOARDS
@@ -294,7 +294,7 @@ async def backfill_specs(key: str, limit: int = 100) -> list[dict]:
     - False（topsellers/popularnew，现行语义）：games 无行（从未入库）
       **或** 挂名孤儿（updated_at NULL 且无任何价格行）。已有价格行
       （locked/missing 状态）的孤儿进 missing 账本通道，排除防双通道重复。
-    - True（specials，拍板约束）：**仅补 games 无行的差集**——挂名孤儿
+    - True（specials）：**仅补 games 无行的差集**——挂名孤儿
       一律留给 kind=backfill 回补层，特惠通道不碰在库行。
     - removed 复活语义（所有板统一）：removed_at 非空的在库游戏重新
       上榜 = 免费复活信号，一律反哺重爬（upsert 成功路径自动清标）。

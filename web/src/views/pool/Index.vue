@@ -759,7 +759,7 @@ onMounted(async () => {
       <div class="add-panel__file">
         <!-- 原生 file input（浏览器/WebView2 系统文件框）；隐藏本体，按钮触发。
              说明不放悬停气泡：按钮贴对话框左缘，气泡再宽也会被内容区裁掉左半
-             （实测复现）——长说明走 addHint 常驻，气泡形态只留给短句。 -->
+             ——长说明走 addHint 常驻，气泡形态只留给短句。 -->
         <input
           ref="fileInput"
           type="file"

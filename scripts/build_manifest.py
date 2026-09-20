@@ -1,18 +1,11 @@
 """更新清单生成：release/latest.json（分发机制的稳定入口）+ Scoop 渠道清单。
 
-**为什么要有清单**（客户端侧的实际收益）：
-- 检查更新从「打 api.github.com」变成「读一个小 json」——免 60 次/小时限速，
-  且 api.github.com 在国内比 release 资产更不可达
-- 清单挂在固定 tag（见 app_info.MANIFEST_TAG），地址恒定，不随版本号变化
-- 校验值与确切资产名随清单一并下发 → 下载端不必再反查 release 资产列表
-  （资产名带版本号，反查需要额外一次 API 调用）
-- 清单里的 assets[] 顺带声明了种子资产的体积与校验值，发布台账一处对齐
+清单挂在固定 tag（见 app_info.MANIFEST_TAG），校验值与确切资产名随清单
+一并下发，客户端检查更新不依赖 GitHub API；assets[] 同时声明种子资产的
+体积与校验值。清单 Release 用 `--latest=false` 创建，不会占用
+`releases/latest`，种子的 `releases/latest/download/` 通道不受影响。
 
-**为什么这不会打乱「源码用户取种子」**：种子走的是 `releases/latest/download/`，
-而清单 Release 用 `--latest=false` 创建，永远不会被 GitHub 标成 Latest release，
-所以 `releases/latest` 始终指向最新的正式版本发布（见 scripts/fetch_seed.py）。
-
-**产出**（两件）：
+产出：
 - release/latest.json         —— 上传到 tag `updater` 的 Release（版本 Release 也放一份）
 - release/scoop/holdexar.json —— Scoop 渠道清单，提交进 bucket 仓库即生效
 
@@ -138,11 +131,7 @@ def build_manifest(version: str, zip_path: Path) -> dict:
 
 
 def build_scoop(version: str, zip_path: Path, zip_sha: str) -> dict:
-    """Scoop 渠道清单（便携应用的天然归宿：解压即用、无安装器）。
-
-    checkver 直接读我们的 latest.json —— 渠道自动跟进不依赖 GitHub API，
-    这是清单机制顺带解决的第二个问题。
-    """
+    """Scoop 渠道清单：checkver 直接读 latest.json，渠道自动跟进不依赖 GitHub API。"""
     tag = f"v{version}"
     return {
         "$schema": "https://raw.githubusercontent.com/ScoopInstaller/Scoop/master/schema.json",

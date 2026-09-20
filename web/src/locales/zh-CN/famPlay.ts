@@ -1,7 +1,7 @@
 /* famPlay 词条 —— 游戏库·游玩页签（views/gamelib/tabs/GlPlay.vue，自 family 页迁入）。
 
    术语沿用 A / B 表（英文侧逐字对齐，见 en/famPlay.ts）：
-   · 时长 / 游玩时长 → playtime；总游玩时长 → Total playtime（D2：与
+   · 时长 / 游玩时长 → playtime；总游玩时长 → Total playtime（与
      `FamLib.kpi.playtime` 是同一个数，英文一律这一种写法；中文侧两张 KPI 卡的
      **标签**统一成「总游玩时长」，只改文案不动样式）
    · 人均 X → X per member（D3：英文补全被平均的量词，不许出现

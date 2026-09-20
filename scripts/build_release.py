@@ -69,12 +69,7 @@ def pick_python() -> Path:
 
 
 def app_version() -> str:
-    """版本号取自单一来源 app.core.app_info.APP_VERSION。
-
-    直接导入而非起子进程读 Settings：app_info 是**纯标准库**模块，本就为
-    「装依赖之前也能取到品牌/版本常量」而存在。走 Settings 还得先有 pydantic，
-    且子进程调用会把版本号解析失败变成一句看不懂的 stderr。
-    """
+    """版本号取自单一来源 app.core.app_info.APP_VERSION（纯标准库，装依赖前也可导入）。"""
     return APP_VERSION
 
 
@@ -94,9 +89,8 @@ def ensure_seed_dir() -> None:
 def ensure_clash_assets() -> None:
     """随包内核资产校验：mihomo、GeoIP 数据、上游许可原文缺一即中止出包。
 
-    内核随发行包分发（spec datas 的 `clash/`），所以它是**发布前提**而非可选项：
-    缺了它，包内代理会退化成「用户在代理页点一下、再联网下载」——那不是这次
-    改动承诺的分发形态（指定版本、随包即用）。
+    内核随发行包分发（spec datas 的 `clash/`）并指定版本随包即用，
+    所以它是**发布前提**而非可选项。
     """
     CLASH_DIR.mkdir(parents=True, exist_ok=True)
     # SOURCE.txt 随包资产自带来源/许可说明（GPL 合规：二进制旁要有许可与来源）
@@ -173,12 +167,9 @@ def sanitize() -> None:
 def make_zip(version: str) -> tuple[Path, str]:
     """压缩 onedir → release/Holdexar-win64-v<版本>.zip（包内根目录 Holdexar/）。
 
-    资产名**刻意不带时间戳**：固定的 `Holdexar-win64-v<版本>.zip` 让下载端
-    不必再反查 release 资产列表，也让 Scoop / winget 这类渠道的自动跟进
-    （checkver + autoupdate）能按版本号直接拼出 URL。同版本重复打包就地覆盖。
-
-    返回 (zip 路径, sha256)——校验值写进发布清单，由 scripts/build_manifest.py
-    收进 latest.json 后公布。
+    资产名不带时间戳：Scoop / winget 的自动跟进（checkver + autoupdate）按
+    版本号直接拼 URL，同版本重复打包就地覆盖。返回 (zip 路径, sha256)——
+    校验值由 scripts/build_manifest.py 收进 latest.json 后公布。
     """
     RELEASE.mkdir(parents=True, exist_ok=True)
     zip_path = RELEASE / f"{APP_NAME}-win64-v{version}.zip"
@@ -202,9 +193,9 @@ def make_zip(version: str) -> tuple[Path, str]:
 def stage_seed_asset() -> Path | None:
     """把种子另存为 release/ 下的**独立 Release 资产**。
 
-    发布包内已含一份（zip 用户零操作）；独立资产是给**源码 clone 用户**的：
-    run.py 首次启动时代码调 scripts/fetch_seed.py 从这里拉。种子不进 git
-    （12MB 二进制 × 每版本一份会撑爆仓库历史），只能靠 Release 资产分发。
+    发布包内已含一份（zip 用户零操作）；独立资产供**源码 clone 用户**的
+    run.py 首次启动经 scripts/fetch_seed.py 拉取——大体积二进制不入 git，
+    走 Release 资产分发。
     """
     if not SEED_DB.is_file():
         return None
@@ -279,8 +270,7 @@ def main() -> None:
     print(f"[完成] 应用包 sha256 {sha256}")
     write_release_body(version)
 
-    # 清单（latest.json + Scoop）统一由 build_manifest.py 生成——顺着跑一步，
-    # 免得「出包完成但忘了生成清单」这种半成品发布
+    # 清单（latest.json + Scoop）统一由 build_manifest.py 生成，顺跑一步防漏
     subprocess.check_call([str(python), str(ROOT / "scripts" / "build_manifest.py")])
 
 

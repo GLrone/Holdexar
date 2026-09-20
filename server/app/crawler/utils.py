@@ -120,14 +120,14 @@ def contains_chinese(text: str | None) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", text))
 
 
-# ── 价格段判定（41 区真实 option_text 尾巴全量枚举）──
-# 实证形态全集（appid 620 逐区抓取，勿按记忆补——按这个清单对齐）：
+# ── 价格段判定（各区 option_text 尾巴形态）──
+# 形态全集（勿按记忆补，按这个清单对齐）：
 #   ¥ 37.00 | 259 руб. | 1 850₸ | 169₴ | $5.49 USD | CLP$ 4.400 | P289.95
 #   1.95 KD | 21.95 SR | R 79.00 | 24.99 QR | RM23.50 | ฿189.00 | S/.22.00
 #   Mex$ 113.99 | S$10.00 | 29.00 AED | $U229 | COL$ 18.500 | ₩ 10,500
 #   NZ$ 12.39 | 35,99 zł | ₡4.600 | CDN$ 11.49 | 8,19€ | 72,00 kr | Rp 69 999
 #   120.000₫ | ₪36.95 | CHF 10.50 | HK$/NT$/A$/NZ$/R$ 变体 …
-#   瑞士速记 "CHF 25.--"（728880 CH E2E 实证，-- = 无零头；判非价会被
+#   瑞士速记 "CHF 25.--"（-- = 无零头；判非价会被
 #   strip(" -–—") 吃成 "CHF 25." 漏成版本名）
 _PRICE_TAIL_TOKENS = (
     r"руб\.?|р\.|kr|zł|Kč|Ft|дин|lei|лв|kn|ман\.?|Rp|KD|SR|QR|RM|"
@@ -162,13 +162,13 @@ def _is_price_segment(seg: str) -> bool:
 def extract_version_suffix(option_text: str | None, name_en: str | None) -> str:
     if not option_text:
         return ""
-    # 剥全部价格 span（旧逻辑只剥 original，打折态 final span 残留成第二段价格）
+    # 剥全部价格 span（只剥 original 会让打折态 final span 残留成第二段价格）
     cleaned = re.sub(r"<span[^>]*>.*?</span>", "", option_text, flags=re.IGNORECASE)
     cleaned = re.sub(r"<br\s*/?>", " ", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"<[^>]+>", "", cleaned)
     cleaned = cleaned.replace("\u00A0", " ").replace("&nbsp;", " ").strip()
-    # 按段剥价格尾巴（生产实证 "NAME - Edition - ¥ 448.00"；打折双价循环去）。
-    # 旧逻辑 rsplit(" - ")[-1] 把价格串当包名，版本提取 100% 静默失效
+    # 按段剥价格尾巴（生产样本 "NAME - Edition - ¥ 448.00"；打折双价循环去）。
+    # 不能用 rsplit(" - ")[-1] 取包名——那会把价格串当包名，版本提取静默失效
     segments = [s.strip() for s in cleaned.split(" - ")]
     while len(segments) > 1 and _is_price_segment(segments[-1]):
         segments.pop()

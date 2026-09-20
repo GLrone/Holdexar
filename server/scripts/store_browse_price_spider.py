@@ -274,7 +274,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help=f"并发 worker 数（worker 池模型同 app/crawler；默认 8，"
                         f"上限参考 {DEFAULT_WORKER_COUNT}）")
     p.add_argument("--batch-size", type=int, default=bs.DEFAULT_BATCH_SIZE,
-                   help="单请求 appid 条数（实测上限 400）")
+                   help="单请求 appid 条数（上限 400）")
     p.add_argument("--timeout", type=int, default=HTTP_TIMEOUT, help="单请求总超时秒（默认 20）")
     p.add_argument("--no-extras", action="store_true",
                    help="只请求基础项（关掉 release/assets/reviews/platforms/coming_soon）")

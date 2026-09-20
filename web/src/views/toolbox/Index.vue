@@ -236,7 +236,7 @@ async function startRedeem() {
   running.value = false
 
   /* 完成汇总气泡：全部成功 / 部分失败 / 全失败 三档。
-     原先的「主句 + 拼接后缀」按中英语序拼不出来，故每档各成一条参数化词条
+     每档各成一条参数化词条——「主句 + 拼接后缀」按中英语序拼不出来
      （带 skipped 的变体单列，见 zh-CN/toolbox.ts 的 done.*）。 */
   const skipped = keys.length - toActivate
   const params = { ok: ksOk.value, own: ksOwn.value, fail: ksFail.value, skipped }

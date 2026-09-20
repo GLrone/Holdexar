@@ -1,8 +1,8 @@
 <script setup lang="ts">
-/* BorderGlow —— 鼠标贴近卡片边缘时沿光标方向浮现的描边辉光（自 React Bits 移植）。
+/* BorderGlow —— 鼠标贴近卡片边缘时沿光标方向浮现的描边辉光。
  * 根节点即卡片表面：背景取主题 token（--bg-card），描边/圆角/阴影也走令牌，
- * 仅辉光与网格渐变边框为刻意设计色（不随主题变）。props 同原组件，新增
- * `light` 控制浅色表面下的辉光叠加模式。注释不保留 React 声明。 */
+ * 仅辉光与网格渐变边框为刻意设计色（不随主题变）。`light` 控制浅色表面下的
+ * 辉光叠加模式。 */
 import { ref, computed, onMounted } from 'vue'
 
 interface Props {

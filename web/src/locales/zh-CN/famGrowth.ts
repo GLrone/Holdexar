@@ -1,11 +1,11 @@
 /* famGrowth 词条 —— 家庭组·增长趋势页签（views/family/tabs/FamGrowth.vue）。
 
-   ⚠️ 该页签当前在 family/Index.vue 里被注释掉（不可达），本期仍照常迁移
-   （brief6 U4）：将来回归时词条现成，且门禁的 CJK 规则对它是 error 级。
+   ⚠️ 该页签当前在 family/Index.vue 里被注释掉（不可达），词条仍照常维护：
+   将来回归时词条现成，且门禁的 CJK 规则对它是 error 级。
 
-   术语沿用在先拍板的 B 表（英文侧逐字对齐，见 en/famGrowth.ts）：
+   术语对齐表（英文侧逐字对齐，见 en/famGrowth.ts）：
    · 入库（名/形）→ acquisition / acquired；时长 → playtime
-   · 家庭库 → family library（A 表）
+   · 家庭库 → family library
 
    行内 `<b>` 写在值里、组件侧 v-html 渲染（同 bills / rates 的先例）：
    按标记边界把「贡献最多: X (n)」拆成前缀 / 名字 / 括号三段，英文拼不出完整
