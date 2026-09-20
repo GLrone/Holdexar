@@ -44,7 +44,7 @@ from app.crawler.epic_free import (
     fetch_free_games,
     fetch_free_offers,
     fetch_mobile_breaker,
-    fetch_mobile_freebie,
+    resolve_mobile_freebie,
 )
 from app.domains.games.models import Game
 
@@ -820,8 +820,7 @@ async def import_epic_list(items: list[dict]) -> dict:
 # ─── Epic 白送展示链（仪表盘卡片）：促销端点 → 快照缓存 + 后台刷新 ──────
 # 与标记链（refresh_epic_free）分离：本链不做 storesearch、不落游戏行。
 # 缓存两层：进程内（热路径零 IO）+ app_settings 落库（进程重启后的数据源）。
-# 本地软件随开随关，进程内缓存在每次启动后都是空的——只靠它意味着每次启动
-# 首开仪表盘都要等一轮完整抓取（实测 5~10s，前端只能落骨架屏）。落库后冷启动
+# 本地软件随开随关，进程内缓存在每次启动后都是空的；落库快照让冷启动
 # 立即回上一份快照（stale 标记），后台静默刷新，前端短轮询到时自动覆盖。
 #
 # 取数顺序（stale-while-revalidate，对齐 family 域快照语义）：
@@ -872,19 +871,22 @@ async def _write_offers_snapshot(payload: dict) -> None:
 async def _fetch_offers_payload() -> dict | None:
     """现拉一轮完整展示链 → payload；PC 列表与移动端全失败返回 None。
 
-    移动白送与 PC 列表**独立取数**（任一成功即出卡；Epic 促销端点偶发
-    连接失败不该连累移动卡），GamerPower 自动源优先，失败降级 breaker。
-    立绘恒用 Epic 自家 breaker 图：高清且无防盗链（GamerPower 缩图在
-    站外 referer 下加载失败）；breaker 缺席时回落 GamerPower 图。
+    两路**并行独立取数**（促销端点 + CMS breaker 兜底图；Epic 促销端点
+    偶发连接失败不该连累移动卡），各拉取函数自带网络容错返回空/None，
+    gather 不需要异常兜底。移动白送从**促销端点元素**推导：当期白送谁在
+    android/ios sandbox 有 0 元 Claim 条目即本周移动白送（官方数据直出
+    真名/截止日/结账直链）；探测失败降级 breaker 立绘卡。封面优先游戏
+    自己的官方 keyImage（促销元素自带），缺图才落 breaker 营销图兜底。
     """
     proxy = await _strategy_proxy()
-    games = await fetch_free_offers(proxy=proxy)
-    raw_mobile = await fetch_mobile_freebie(proxy=proxy)
-    breaker = await fetch_mobile_breaker(proxy=proxy)
+    games, breaker = await asyncio.gather(
+        fetch_free_offers(proxy=proxy),
+        fetch_mobile_breaker(proxy=proxy),
+    )
+    raw_mobile = await resolve_mobile_freebie(games)
     if raw_mobile:
-        mobile = {**raw_mobile, "source": "gamerpower"}
-        # 封面优先用游戏自己的官方 keyImage（resolve 链带回）；缺图才落
-        # breaker 营销图兜底
+        mobile = {**raw_mobile, "source": "epic"}
+        # 封面优先用游戏自己的官方 keyImage；缺图才落 breaker 营销图兜底
         if not mobile.get("image") and breaker and breaker.get("image"):
             mobile["image"] = breaker["image"]
     elif breaker:
@@ -955,10 +957,7 @@ async def epic_free_offers(force: bool = False) -> dict:
     拉取失败不写缓存、返回 ok=False，前端保持上一份数据或落空态。
     """
     now = time.time()
-    if _epic_offers_cache["payload"] is None:
-        snapshot = await _read_offers_snapshot()
-        if snapshot:
-            _epic_offers_cache.update(snapshot)
+    await _ensure_offers_cache_hydrated()
     cached = _epic_offers_cache["payload"]
     if cached is not None and not force:
         if now - _epic_offers_cache["at"] < _EPIC_OFFERS_TTL_SECONDS:
@@ -976,6 +975,30 @@ async def epic_free_offers(force: bool = False) -> dict:
     if payload["offers"]:
         await _write_offers_snapshot(payload)
     return dict(payload)
+
+
+async def _ensure_offers_cache_hydrated() -> None:
+    """进程内存缓存为空时读落库快照补水（幂等；读失败按无缓存处理）。"""
+    if _epic_offers_cache["payload"] is None:
+        snapshot = await _read_offers_snapshot()
+        if snapshot:
+            _epic_offers_cache.update(snapshot)
+
+
+async def preheat_epic_offers() -> None:
+    """启动链预热：快照新鲜即零开销；过期只触发后台刷新（不 await 网络轮）。
+
+    排在收拾链尾：用户打开仪表盘时刷新多半已完成或近尾，卡片不再顶着
+    「刷新中」干等整段 Epic 抓取。刷新失败保留旧快照，请求路径的
+    stale-while-revalidate 语义不变。
+    """
+    await _ensure_offers_cache_hydrated()
+    fresh = (
+        _epic_offers_cache["payload"] is not None
+        and time.time() - _epic_offers_cache["at"] < _EPIC_OFFERS_TTL_SECONDS
+    )
+    if not fresh:
+        _start_offers_refresh()
 
 
 def get_beijing_now_iso() -> str:

@@ -36,7 +36,13 @@ let staleTimer: number | undefined
 let stalePolls = 0
 
 function scheduleStalePoll() {
-  if (staleTimer !== undefined || stalePolls >= STALE_POLL_MAX) return
+  if (staleTimer !== undefined) return
+  if (stalePolls >= STALE_POLL_MAX) {
+    // 轮询封顶仍未等到新数据：撤「刷新中」角标（旧数据保留，下个整点自刷），
+    // 不然角标会无限挂起，观感等同一直在加载
+    stale.value = false
+    return
+  }
   stalePolls += 1
   staleTimer = window.setTimeout(async () => {
     staleTimer = undefined
@@ -105,7 +111,7 @@ function statusText(o: EpicOffer): string {
   return t('epicFree.endsIn', { n })
 }
 
-/** 移动卡倒计时（GamerPower 源带截止日；breaker 兜底无日期不显示） */
+/** 移动卡倒计时（官方源带截止日；breaker 兜底无日期不显示） */
 const mobileEndText = computed(() => {
   const end = mobile.value?.end
   if (!end) return ''
@@ -204,7 +210,7 @@ onBeforeUnmount(() => {
         </div>
       </a>
 
-      <!-- 移动端白送：GamerPower 自动源（真名/日期/官方落地链），breaker 立绘兜底 -->
+      <!-- 移动端白送：官方当期促销探测（真名/日期/官方落地链），breaker 立绘兜底 -->
       <a
         v-if="mobile"
         class="epic-card epic-card--mobile"
