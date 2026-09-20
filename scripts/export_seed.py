@@ -109,15 +109,33 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
         fx_rates = src.execute(
             "SELECT currency_code, rate_to_cny, fetched_at FROM fx_rates"
         ).fetchall()
-        # 同键（币种+日期，对齐 fx_maintenance 幂等语义）保留最新（按 id 升序
-        # 遍历，dict 覆盖即末次胜出）
+        # 同键（币种 + 汇率代表日，canonical 语义）保留最新（按 id 升序遍历，
+        # dict 覆盖即末次胜出）；源库缺 canonical 列时回退旧列并从 fetched_at
+        # 推导（与 v8 迁移口径一致）
+        src_cols = {row[1] for row in src.execute("PRAGMA table_info(fx_rate_history)")}
+        if {"rate_date", "source_kind"} <= src_cols:
+            history_iter = src.execute(
+                "SELECT currency_code, rate_to_cny, source, fetched_at, rate_date, source_kind"
+                " FROM fx_rate_history ORDER BY id"
+            )
+        else:
+            history_iter = (
+                (cur, rate, source, fa, None, None)
+                for cur, rate, source, fa in src.execute(
+                    "SELECT currency_code, rate_to_cny, source, fetched_at"
+                    " FROM fx_rate_history ORDER BY id"
+                )
+            )
         history: dict[tuple, tuple] = {}
-        for cur, rate, source, fa in src.execute(
-            "SELECT currency_code, rate_to_cny, source, fetched_at "
-            "FROM fx_rate_history ORDER BY id"
-        ):
-            key = (str(cur), "" if fa is None else str(fa))
-            history[key] = (cur, rate, source, fa)
+        for cur, rate, source, fa, rd, kind in history_iter:
+            day = str(rd)[:10] if rd is not None else (str(fa)[:10] if fa is not None else "")
+            if not kind:
+                kind = (
+                    "carried"
+                    if str(source or "").lower() == "backfill"
+                    else "observed"
+                )
+            history[(str(cur), day)] = (cur, rate, source, fa, day or None, kind)
         curated = src.execute(
             f"SELECT appid, {CURATED_IDENTITY_COL}, {', '.join(CURATED_COLS)} FROM games "
             "WHERE xgp_tier IS NOT NULL OR epic_date IS NOT NULL OR is_epic = 1 "
@@ -159,7 +177,9 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
                     currency_code TEXT,
                     rate_to_cny REAL,
                     source TEXT,
-                    fetched_at TEXT
+                    fetched_at TEXT,
+                    rate_date TEXT,
+                    source_kind TEXT
                 );
                 CREATE TABLE games_curated (
                     appid INTEGER PRIMARY KEY,
@@ -198,8 +218,9 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
             )
             seed.executemany("INSERT INTO fx_rates VALUES (?, ?, ?)", fx_rates)
             seed.executemany(
-                "INSERT INTO fx_rate_history (currency_code, rate_to_cny, source, fetched_at) "
-                "VALUES (?, ?, ?, ?)",
+                "INSERT INTO fx_rate_history"
+                " (currency_code, rate_to_cny, source, fetched_at, rate_date, source_kind)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
                 list(history.values()),
             )
             seed.executemany(

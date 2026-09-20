@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from datetime import datetime, timedelta
 
 # ── 货币符号 → ISO（按符号长度降序，防止 "$" 抢先匹配 "CDN$"）──
 SYMBOL_MAP = sorted(
@@ -305,32 +304,6 @@ def parse_original_price(raw) -> float | None:
     if parsed is not None:
         return abs(parsed)
     return _num(str(raw))
-
-
-def get_rate_from_rows(
-    rows: list[tuple[str, float]], currency: str, date_str: str
-) -> float | None:
-    """从 (date, rate_cny) 行集查汇率：精确日 → 逐日回溯最多 15 天。
-
-    rows 需按日期升序传入（回溯时从最近可用日往回找）。
-    """
-    if currency == "CNY":
-        return 1.0
-    if not rows:
-        return None
-    by_day = {day: rate for day, rate in rows}
-    try:
-        base = datetime.strptime(date_str, "%Y-%m-%d")
-    except ValueError:
-        base = None
-    for delta in range(15):
-        if base is None:
-            key = date_str
-        else:
-            key = (base - timedelta(days=delta)).strftime("%Y-%m-%d")
-        if key in by_day:
-            return by_day[key]
-    return None
 
 
 def parse_report(data: dict) -> dict:

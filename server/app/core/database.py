@@ -154,6 +154,13 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
     "alert_events": {
         "price_cny": "BIGINT",
     },
+    # 汇率历史 canonical 语义列（数据回填与唯一索引在 v8 迁移链，见
+    # _migrate_fx_history_canonical；此处只保证老库列存在，迁移链信任本层先跑）
+    "fx_rate_history": {
+        "rate_date": "DATE",
+        "source_kind": "VARCHAR(12)",
+        "observed_at": "DATETIME",
+    },
 }
 
 # 增量索引（CREATE INDEX IF NOT EXISTS 幂等）
@@ -210,7 +217,7 @@ def _ensure_schema(sync_conn) -> None:
 #   2. _MIGRATIONS 追加 (版本号, 描述, SQL 列表)；SQL 须幂等（中断续跑 +
 #      用户库版本乱序防御），复杂逻辑可登记 async fn(engine) 同位元素
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # 零小数货币（Steam 以整数计价）：旧捆绑包链路的除数表按 1 处理，与「统一存分」
 # 的新约定差 100 倍——v2 归一的目标集合
@@ -430,6 +437,57 @@ async def _migrate_gph_snapshot_unique(conn) -> None:
     logger.info("[迁移] game_price_history 幂等唯一索引 ux_gph_snapshot 已就绪")
 
 
+async def _migrate_fx_history_canonical(conn) -> None:
+    """v8：fx_rate_history canonical 化（语义列回填 + 同日合并 + 唯一日索引）。
+
+    迁移后语义：
+    - `rate_date` = 汇率代表日（本步从存储日期取前 10 位回填；`fetched_at`
+      缺失的行留 NULL，不参与唯一约束）；
+    - `source_kind`：`source='backfill'` 的行是 forward-fill 延续值 → `carried`
+      （保留展示，但历史业务不再当真实观测消费）；其余来源（档案/实时）→
+      `observed`；
+    - 同日多行按日收语义合并：保留 `ORDER BY fetched_at, id` 升序的最大者
+      （与读取层 `rate_history()` 的日收口径逐字一致——迁移不改变任何既有读值；
+      计数见日志）；
+    - `(currency_code, rate_date)` 唯一索引落位，写入侧此后一律 UPSERT。
+    """
+    from sqlalchemy import text
+
+    await conn.execute(
+        text(
+            "UPDATE fx_rate_history SET rate_date = substr(fetched_at, 1, 10)"
+            " WHERE rate_date IS NULL AND fetched_at IS NOT NULL"
+        )
+    )
+    await conn.execute(
+        text(
+            "UPDATE fx_rate_history SET source_kind ="
+            " CASE WHEN source = 'backfill' THEN 'carried' ELSE 'observed' END"
+            " WHERE source_kind IS NULL"
+        )
+    )
+    dup = await conn.execute(
+        text(
+            "DELETE FROM fx_rate_history WHERE id IN ("
+            "  SELECT id FROM ("
+            "    SELECT id, ROW_NUMBER() OVER ("
+            "      PARTITION BY currency_code, rate_date"
+            "      ORDER BY fetched_at DESC, id DESC) AS rn"
+            "    FROM fx_rate_history WHERE rate_date IS NOT NULL"
+            "  ) WHERE rn > 1)"
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_frh_currency_date"
+            " ON fx_rate_history(currency_code, rate_date)"
+        )
+    )
+    removed = dup.rowcount or 0
+    if removed:
+        logger.info("[迁移:v8] 汇率历史同日合并：删除 %d 行（保留日收语义最后一行）", removed)
+
+
 # (目标版本, 说明, 迁移体)：迁移体 = SQL 语句列表，或 async callable(engine)
 _MIGRATIONS: list[tuple[int, str, object]] = [
     (2, "bundle_region_prices 零小数货币单位归一（元→分 + cny_fen 去虚高）",
@@ -463,6 +521,9 @@ _MIGRATIONS: list[tuple[int, str, object]] = [
     (7, "price_alerts 价格阈值口径归一（该区货币分 → 人民币分；触发比较改用"
         " cny_fen，外区规则与 ¥ 展示语义对齐）",
      _migrate_alert_targets_to_cny),
+    (8, "fx_rate_history canonical 化（rate_date/source_kind 回填 + 旧 backfill 行"
+        "改标 carried + 同日合并 + (currency_code, rate_date) 唯一索引）",
+     _migrate_fx_history_canonical),
 ]
 
 

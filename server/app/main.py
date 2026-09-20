@@ -215,14 +215,19 @@ async def _post_startup_chain() -> None:
         await rates_service.refresh_if_stale()
     except Exception:  # noqa: BLE001
         logger.exception("[启动] 汇率过期检查失败（不阻塞启动）")
-    # 历史缺口补齐：建档以来错过的交易日按上一交易日值延续补行
-    # （幂等，零缺口零写入；关机漏刷的日子在这里补上）
+    # 历史缺口扫描（纯本地，零网络）：只记录待修复规模；外网修复归每日
+    # 04:00 的 fx_history_repair——配置 Provider Key 后启动不烧任何配额
     try:
-        stats = await rates_service.backfill_history()
-        if stats["inserted"]:
-            logger.info("[启动] 汇率历史缺口补齐：插入 %d 行", stats["inserted"])
+        from app.domains.rates import history as rates_history
+
+        scan = await rates_history.scan_history_gaps()
+        if scan["windows"]:
+            logger.info(
+                "[启动] 汇率历史缺口 %d 个窗口 / %d 个 (币种,日) 待修复（交每日 04:00 修复任务）",
+                len(scan["windows"]), scan["totalPairs"],
+            )
     except Exception:  # noqa: BLE001
-        logger.exception("[启动] 汇率历史缺口补齐失败（不阻塞启动）")
+        logger.exception("[启动] 汇率历史缺口扫描失败（不阻塞启动）")
 
     # 捆绑包列表预热：全量聚合（25.8k 包 / 14.1 万行区域价）+ 12MB 预序列化
     # 是秒级重活，不预热则用户首次进捆绑包页要干等整段聚合。排在汇率兜底

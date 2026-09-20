@@ -19,13 +19,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.domains.bills.parser import (
     classify_type,
-    get_rate_from_rows,
     parse_date_cn,
     parse_money,
     parse_report,
     strip_gift_marks,
 )
 from app.domains.bills import service as bills_service
+from app.domains.rates.history import pick_observed_rate
 
 # 源样本目录（个人外部数据源，路径由环境变量 BILLS_SAMPLE_DIR 提供；未设置时对账用例 skip）
 BILLS_SAMPLE_DIR = Path(os.environ.get("BILLS_SAMPLE_DIR", ""))
@@ -85,10 +85,10 @@ def test_parse_date_cn(text, expected):
 def test_get_rate_backtrack():
     """精确日缺失 → 回溯 15 天内取最近可用日。"""
     rows = [("2026-01-01", 0.15), ("2026-01-08", 0.16)]
-    assert get_rate_from_rows(rows, "KZT", "2026-01-08") == 0.16
-    assert get_rate_from_rows(rows, "KZT", "2026-01-10") == 0.16   # 回溯 2 天
-    assert get_rate_from_rows(rows, "KZT", "2026-01-30") is None    # 超出 15 天
-    assert get_rate_from_rows(rows, "CNY", "2026-01-30") == 1.0
+    assert pick_observed_rate(rows, "KZT", "2026-01-08") == 0.16
+    assert pick_observed_rate(rows, "KZT", "2026-01-10") == 0.16   # 回溯 2 天
+    assert pick_observed_rate(rows, "KZT", "2026-01-30") is None    # 超出 15 天
+    assert pick_observed_rate(rows, "CNY", "2026-01-30") == 1.0
 
 
 def test_wallet_and_refund_classification():
@@ -520,11 +520,14 @@ async def _schema(db):
     yield
 
 
-async def _seed_fx(db, rows: list[tuple[str, float, str]]):
-    """种子汇率：rows = (currency, date, rate_cny) 写入 fx_rate_history。"""
+async def _seed_fx(db, rows: list[tuple[str, float, str]], kind: str = "observed"):
+    """种子汇率：rows = (currency, date, rate_cny) 写入 fx_rate_history。
+
+    `kind` 默认 observed（真实观测）；carried 用于验证历史延续值不被消费。
+    """
     from app.domains.rates.models import FxRateHistory
 
-    from datetime import datetime
+    from datetime import date as _date, datetime
 
     async with db() as session:
         for cur, day, rate in rows:
@@ -533,6 +536,8 @@ async def _seed_fx(db, rows: list[tuple[str, float, str]]):
                     currency_code=cur,
                     rate_to_cny=rate,
                     source="test",
+                    source_kind=kind,
+                    rate_date=_date.fromisoformat(day),
                     fetched_at=datetime.fromisoformat(f"{day} 12:00:00"),
                 )
             )
@@ -684,6 +689,28 @@ async def test_fx_backtrack_and_missing(db, monkeypatch):
     assert ov2["summary"]["fxMissing"] == 1
     imports = await bills_service.list_imports()
     assert len(imports) == 1  # 只剩覆盖后的新账
+
+
+@pytest.mark.asyncio
+async def test_fx_carried_not_consumed(db):
+    """carried（历史 forward-fill 延续值）不是真实观测：折算必须落空。
+
+    回归：即使 carried 行精确命中交易日期，也不得被当历史汇率消费——
+    cny_fen 置空（明示缺失），不入任何总额。
+    """
+    await _seed_fx(db, [("KZT", "2026-01-08", 0.015)], kind="carried")
+    data = {
+        "account": {"nickname": "carried", "avatar_base64": ""},
+        "history": [
+            {"date": "2026 年 1 月 8 日", "item": "Game A", "type": "购买",
+             "payment": "钱包", "total": "1000₸", "wallet_change": "-1000₸"},
+        ],
+        "licenses": [],
+    }
+    res = await bills_service.import_report(data, "carried.json")
+    assert res["fxMissing"] == 1
+    ov = await bills_service.overview(res["importId"])
+    assert ov["summary"]["spendFen"] == 0
 
 
 # ── sync_bills 调度语义（30min 周期 / 陈旧锁解死 / 失败等下一轮）──────────
