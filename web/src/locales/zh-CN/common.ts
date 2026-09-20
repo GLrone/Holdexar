@@ -29,6 +29,10 @@ const common = {
   'common.selectDate': '选择日期',
   'common.confirmTip': '确定执行该操作？',
 
+  /* 下拉弹层搜索（HlSelect searchable） */
+  'common.search': '搜索…',
+  'common.noMatch': '无匹配结果',
+
   /* 步进器（HlStepper）页脚与完成页 */
   'common.prev': '上一步',
   'common.next': '下一步',
@@ -39,8 +43,7 @@ const common = {
 
   /* 时长单位 —— 跨模块共用，故在 common 而不在任何一个 family 模块里。
      「h」不是语言中立的：中文写 `128h`，英文写 `128 hrs`。带 k 的简写同理
-     （KPI 卡里数字要短）。原先两个 tab 各自手写这两条，其中一处还把空格写成
-     `'k h'`，与另一处不一致——放到这里就是为了让它们只能有一份。 */
+     （KPI 卡里数字要短）。 */
   'common.hours': '{h}h',
   'common.hoursK': '{h}kh',
 

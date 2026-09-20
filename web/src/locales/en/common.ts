@@ -24,6 +24,10 @@ const common: Partial<Record<MessageKey, string>> = {
   'common.selectDate': 'Select date',
   'common.confirmTip': 'Run this action?',
 
+  /* Dropdown panel search (HlSelect searchable) */
+  'common.search': 'Search…',
+  'common.noMatch': 'No matches',
+
   'common.prev': 'Back',
   'common.next': 'Next',
   'common.finish': 'Finish',
