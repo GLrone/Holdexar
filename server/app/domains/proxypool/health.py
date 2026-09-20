@@ -24,9 +24,10 @@ L0 目标选的是最轻的连通性探测（204、无响应体、跨地区可�
 fragment 截断），503 才是节点本身不可用。名字进 path 一律 `quote(name, safe="")`。
 
 状态推进**只经由** `evaluate_node_state()`——本模块不自己写状态规则，也不硬改
-`state`。R1 版策略：`consecutive_failures=0`（失败计数与退休阈值是运营规则，归后面
-的阶段），所以探测失败一律 `DEAD`，不会因阈值 `RETIRED`；而 `RETIRED` 节点不在池里、
-根本不会被探测，因此**不会被一次成功自动复活**——复活规则还没定义，不能提前设计。
+`state`。连续失败计数在本模块维护（成功归零、失败累加）并作为状态机输入：它既是
+退休线（`RETIRED`）的判据，也是台账事实——`DEAD` 节点带着"连续失败过几次"的记录。
+`RETIRED` 节点不在池里、根本不会被探测，因此**不会被一次成功自动复活**——复活
+规则还没定义，不能提前设计。
 """
 from __future__ import annotations
 
@@ -189,12 +190,16 @@ async def health_check_pool(
             .where(ProxyNodeSource.node_id == node.node_id)
         )
         previous = node.state
+        # 连续失败计数：成功归零、失败累加。它既是状态机的输入（退休线判据），
+        # 也是台账事实——判 DEAD 的节点必须带着失败次数，不能留下"DEAD 且计数 0"。
+        failures = 0 if result.ok else (node.consecutive_failures or 0) + 1
+        node.consecutive_failures = failures
         # 唯一的状态决策入口：健康只提供证据，规则仍归状态机
         target = evaluate_node_state(
             previous,
             source_seen=bool(source_count),
             probe_ok=result.ok,
-            consecutive_failures=0,  # 失败计数/退休阈值 v1 不推进（运营规则，后续阶段）
+            consecutive_failures=failures,
         )
         node.state = target
         session.add(HealthObservation(
