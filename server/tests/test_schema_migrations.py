@@ -255,8 +255,10 @@ async def test_v4_skips_index_when_duplicates_exist(isolated_db: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_v5_backfills_wishlist_member_flag(tmp_path: Path, monkeypatch) -> None:
-    """存量库（v0）首启跑到 v5：活跃愿望单行回填 wishlisted=1，
-    关注/已购/脱池行不回填。**走真实迁移链**（v5 步骤就是生产那一条）。"""
+    """存量库（v0）首启跑到链尾：活跃愿望单行回填 wishlisted=1，
+    关注/已购/脱池行不回填。**走真实迁移链**（v5 步骤就是生产那一条）。
+    版本断言对齐 SCHEMA_VERSION——链上新增迁移不应让本用例误报
+    （曾因硬编码 == 5 而在 v6 加入时失败）。"""
     db = tmp_path / "legacy.db"
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{db.as_posix()}", echo=False
@@ -286,7 +288,7 @@ async def test_v5_backfills_wishlist_member_flag(tmp_path: Path, monkeypatch) ->
 
     await database_module.init_db()
     try:
-        assert _user_version(db) == 5
+        assert _user_version(db) == database_module.SCHEMA_VERSION
         con = sqlite3.connect(str(db))
         try:
             cols = {r[1] for r in con.execute("PRAGMA table_info(wishlist_items)")}
@@ -300,5 +302,79 @@ async def test_v5_backfills_wishlist_member_flag(tmp_path: Path, monkeypatch) ->
             "活跃且非已购非关注的行应回填为愿望单成员；关注/已购/脱池行不动。"
             f"实际 {rows}"
         )
+    finally:
+        await engine.dispose()
+
+
+# v7：price_alerts 的 price 类阈值口径归一（该区货币最小单位 → 人民币分）。
+# 旧行为下阈值与该区货币分直比（US 规则填 1000 = $10），前端与邮件却一律
+# 按 ¥ 展示——外区规则语义三方分裂；归一后与 crawl 落库的 cny_fen 同口径。
+
+
+@pytest.mark.asyncio
+async def test_v7_converts_price_targets_to_cny(tmp_path: Path, monkeypatch) -> None:
+    """存量库首启跑到链尾：US 1000（=$10）×7.25 → 7250 分；CNY 区 rate=1.0
+    数值不动；fx_rates 缺档的 JPY 走 DEFAULT_EXCHANGE_RATES 兜底；pct /
+    historic_low 不涉及货币不动；区码认不出的行跳过留原值。
+    **走真实迁移链**（v7 步骤就是生产那一条）。"""
+    db = tmp_path / "legacy.db"
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{db.as_posix()}", echo=False
+    )
+    monkeypatch.setattr(database_module, "get_engine", lambda: engine)
+    monkeypatch.setattr(
+        database_module,
+        "get_session_factory",
+        lambda: async_sessionmaker(engine, expire_on_commit=False),
+    )
+    # 迁移前形态：旧口径阈值行 + 汇率表（只放 USD，JPY 刻意缺档走兜底）
+    con = sqlite3.connect(str(db))
+    try:
+        con.execute(
+            "CREATE TABLE price_alerts ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT, appid BIGINT, region VARCHAR(10),"
+            " target_type VARCHAR(20), target_value FLOAT, active BOOLEAN,"
+            " created_at DATETIME, last_triggered_at DATETIME)"
+        )
+        con.execute(
+            "CREATE TABLE fx_rates ("
+            " currency_code VARCHAR(10) PRIMARY KEY, rate_to_cny FLOAT, fetched_at DATETIME)"
+        )
+        con.execute("INSERT INTO fx_rates VALUES ('USD', 7.25, NULL)")
+        con.executemany(
+            "INSERT INTO price_alerts (appid, region, target_type, target_value, active)"
+            " VALUES (?, ?, ?, ?, 1)",
+            [
+                (100, "US", "price", 1000.0),       # $10 → 7250 人民币分
+                (100, "CN", "price", 5000.0),       # ¥50 → 不变
+                (100, "JP", "price", 29900.0),      # 兜底 0.048 → 1435 分
+                (100, "US", "pct", 30.0),           # 折扣率，不动
+                (100, "US", "historic_low", None),  # 创新低，不动
+                (100, "ZZ", "price", 1000.0),       # 区码认不出，跳过留原值
+            ],
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    await database_module.init_db()
+    try:
+        assert _user_version(db) == database_module.SCHEMA_VERSION
+        con = sqlite3.connect(str(db))
+        try:
+            rows = {
+                (region, ttype): value
+                for region, ttype, value in con.execute(
+                    "SELECT region, target_type, target_value FROM price_alerts"
+                ).fetchall()
+            }
+        finally:
+            con.close()
+        assert rows[("US", "price")] == 7250.0, f"US 阈值应 ×7.25 归一为人民币分，实际 {rows}"
+        assert rows[("CN", "price")] == 5000.0, "CNY 区 rate=1.0，数值应不动"
+        assert rows[("JP", "price")] == 1435.0, "fx_rates 缺档应走 DEFAULT_EXCHANGE_RATES 兜底"
+        assert rows[("US", "pct")] == 30.0, "折扣率阈值不涉及货币，应不动"
+        assert rows[("US", "historic_low")] is None, "创新低无阈值，应不动"
+        assert rows[("ZZ", "price")] == 1000.0, "币种认不出的行应跳过留原值，不猜"
     finally:
         await engine.dispose()
