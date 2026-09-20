@@ -124,6 +124,9 @@ async def test_library_merge_and_aggregation(db, monkeypatch):
         monkeypatch,
         shared_apps=[
             {"appid": 620, "presence_count": 2},
+            # Steam 的 exclude_reason 字段**恒存在**，0 = Included（可共享）。
+            # 判「被排除」必须严格小于 0 才算排除，`is not None` 会误伤本款。
+            {"appid": 730, "presence_count": 1, "exclude_reason": 0},
             {"appid": 99999, "presence_count": 1, "exclude_reason": 2},  # 本地无行的游戏
         ],
         owned_by_member={
@@ -150,8 +153,8 @@ async def test_library_merge_and_aggregation(db, monkeypatch):
     assert by_sid[FRIEND]["ownedCount"] == 1
 
     games = {g["appid"]: g for g in data["games"]}
-    # 合并：620（共享）+ 570（仅已购）+ 99999（仅共享清单）
-    assert set(games) == {620, 570, 99999}
+    # 合并：620（共享）+ 570（仅已购）+ 730（共享·可共享）+ 99999（仅共享清单）
+    assert set(games) == {620, 570, 730, 99999}
 
     # 620：本地元数据 + CN 价 + 双人共享
     g620 = games[620]
@@ -176,6 +179,11 @@ async def test_library_merge_and_aggregation(db, monkeypatch):
     g99999 = games[99999]
     assert g99999["name"] is None
     assert g99999["excluded"] is True
+
+    # 730：exclude_reason=0 = Included → 可共享，不是「已排除」
+    g730 = games[730]
+    assert g730["inSharedLib"] is True
+    assert g730["excluded"] is False
 
     # 成员游玩序列（按近2周时长排序）
     p_primary = data["memberPlay"][PRIMARY]

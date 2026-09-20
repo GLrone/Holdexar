@@ -1,6 +1,6 @@
 """family 域服务：输入解析 → 家庭组发现 → 成员自动补齐。
 
-接口链（经真机实测验证的 Steam 公开端点）：
+接口链（Steam 公开端点）：
 - steamLoginSecure 的 JWT 即 webapi_token：`<steamid>||<token>` 后段，
   直接以 `?access_token=` 调 IFamilyGroupsService / IPlayerService —— 免 Web API Key；
 - GET IFamilyGroupsService/GetFamilyGroupForUser/v1/?access_token=&include_family_group_response=true
@@ -112,7 +112,7 @@ async def resolve_steamid(raw: str) -> dict:
 async def _profile_xml_preview(steamid: str) -> dict:
     """steamcommunity.com/profiles/<sid>/?xml=1 公开资料兜底（匿名可达，无需 Cookie）。
 
-    miniprofile 的匿名会话常返回**空 hash 头像**（实测：URL 形如
+    miniprofile 的匿名会话常返回**空 hash 头像**（URL 形如
     avatars…/.jpg，等于没拿到）——此时按用户主页 XML 接口补一轮：
     资料设为公开的成员返回 avatarFull/avatarMedium 与昵称；隐私非公开
     则该接口也不给头像（Steam 对未登录会话的隐私边界，落占位兜底）。
@@ -523,7 +523,9 @@ async def _fetch_shared_library(token: str, family_groupid: str) -> list[dict]:
     - rt_time_acquired：入库时间戳（秒）——热力图/增长趋势/购买动态/活跃分档的口径
     - owner_steamids：**按入库先后排序**（[0]=最早入库，at(-1)=最近入库=购买者）
     - presence_count：该 app 被多少成员拥有
-    - exclude_reason：非空即被排除出共享（冷却清单）
+    - exclude_reason：排除原因枚举，**0 = Included（可共享）**；字段恒存在，
+      判「被排除」必须比 0，不能用 `is not None`（那样会把 751 款可共享的
+      也标成已排除：实测 859 款分布为 0:751 / 3:73 / 1:29 / 10:6）
     """
     resp = await _steam_get(
         SHARED_LIBRARY_URL,
@@ -539,7 +541,7 @@ async def _fetch_shared_library(token: str, family_groupid: str) -> list[dict]:
             "appid": int(a["appid"]),
             "name": (a.get("name") or "").strip() or None,
             "presence": int(a.get("presence_count") or 0),
-            "excluded": a.get("exclude_reason") is not None,
+            "excluded": int(a.get("exclude_reason") or 0) != 0,
             "time_acquired": int(a.get("rt_time_acquired") or 0),
             "owners": [str(sid) for sid in (a.get("owner_steamids") or [])],
         })
@@ -988,9 +990,9 @@ async def cached_family_library() -> dict:
        供前端标注）+ 后台拉新，拉新成功后下一轮请求即为实时数据；
     4. 无任何快照（全新安装首开）：现拉（诚实加载态），失败如实报错。
 
-    ⚠️ 兜底/快照条目同样入缓存（TTL 更短，见 _SNAPSHOT_TTL_SECONDS）。原先
-    只有成功路径写缓存，Cookie 失效期间每个请求都要先付一次完整的失败
-    HTTPS 往返才回退快照，实测 2.1~3.3s/次——「板块切换 1-2 秒」的主因。
+    ⚠️ 兜底/快照条目同样入缓存（TTL 更短，见 _SNAPSHOT_TTL_SECONDS）。只让成功
+    路径写缓存的话，Cookie 失效期间每个请求都要先付一次完整的失败
+    HTTPS 往返才回退快照（2.1~3.3s/次）——这也是「板块切换 1-2 秒」的主因。
     """
     global _LIBRARY_CACHE
     now = datetime.utcnow()
