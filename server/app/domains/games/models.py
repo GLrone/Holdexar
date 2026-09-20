@@ -68,6 +68,13 @@ class Game(Base):
     # 重新上榜 = 免费复活信号（backfill_specs 反哺，upsert 成功自动清标）。
     removed_at: Mapped[datetime | None] = mapped_column(DateTime)
     removed_strikes: Mapped[int] = mapped_column(Integer, default=0)
+    # 免费态标记（db_writer 每轮爬取按价格行维护）：NULL=付费正常；
+    # 'f2p'=永久免费（is_free，无赠送包原价）；'promo'=限时赠送中（100% off，
+    # Steam free_to_keep）。两类都不进游戏商店列表/搜索（主门 price>0），
+    # f2p 由爬取收尾自动脱池，promo 上仪表盘「Steam 喜加一」模块
+    free_kind: Mapped[str | None] = mapped_column(String(10))
+    # 赠送结束 Unix 秒（Steam free_to_keep_ends）；仅 promo 态有值
+    promo_end_at: Mapped[int | None] = mapped_column(BigInteger)
     developers: Mapped[list | None] = mapped_column(JSON, default=list)
     publishers: Mapped[list | None] = mapped_column(JSON, default=list)
     positive_rate: Mapped[int | None] = mapped_column(Integer)  # 万分比 0-10000
@@ -100,6 +107,9 @@ class GameCurrentPrice(Base):
     # 仍失败则转 blocked 终态，由 mark_missing/补抓链路维护）
     fail_count: Mapped[int] = mapped_column(Integer, default=0)
     cny_fen: Mapped[int | None] = mapped_column(BigInteger)
+    # 促销截止（browse active_discounts[0].discount_end_date，Unix 秒）：
+    # 现价表每轮 UPSERT，始终跟随最新一轮抓取；NULL=无折扣/未带促销元数据
+    discount_end_ts: Mapped[int | None] = mapped_column(Integer)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime)
 
     __table_args__ = (
@@ -129,9 +139,14 @@ class GamePriceHistory(Base):
     # bundle-as-sub 识别（2026-09 版本显示修复）：多 app 且名称未命中版本
     # 关键词的 sub（如 Gourmet Edition）= 不支持补齐的捆绑包，从标准版
     # 候选/史低计算/版本 chips 三处排除，并回填 bundles 表
+    # bundle-as-sub 识别：多 app 且名称未命中版本关键词的 sub
+    # （如 Gourmet Edition）= 不支持补齐的捆绑包，从标准版候选/史低计算/
     is_bundle: Mapped[bool] = mapped_column(Boolean, default=False)
     price_status: Mapped[str] = mapped_column(String(20), default="ok")
     cny_fen: Mapped[int | None] = mapped_column(BigInteger)
+    # 促销截止（browse active_discounts[0].discount_end_date，Unix 秒）；
+    # 同族扩展列 discount_desc/bundle_id/bundle_discount_pct 不经 ORM，
+    discount_end_ts: Mapped[int | None] = mapped_column(Integer)
     snapshot_at: Mapped[datetime | None] = mapped_column(DateTime)
 
     __table_args__ = (
@@ -165,6 +180,7 @@ class Bundle(Base):
     # server_default：与 _TABLE_EXTRA_COLUMNS 的存量库 ALTER 口径一致，
     # 原始 SQL 插行（历史导入/迁移脚本）省略该列时也拿得到默认值
     diff_fen: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # 时机(限时叠加促销)+熟悉度(成员游戏评测规模)
     url: Mapped[str | None] = mapped_column(String(1024))
     app_ids: Mapped[list | None] = mapped_column(JSON, default=list)  # 包含的 Steam AppID 列表
     view_count: Mapped[int] = mapped_column(Integer, default=0)

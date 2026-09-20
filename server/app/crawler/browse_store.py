@@ -174,6 +174,8 @@ def _discount_meta(opt: dict) -> dict:
     desc = first.get("discount_description")
     return {
         "discount_end_ts": _to_int(first.get("discount_end_date")),
+        # 限时赠送（free_to_keep）的结束时间戳在选项自身，不在 active_discounts
+        "free_to_keep_ends": _to_int(opt.get("free_to_keep_ends")),
         "discount_desc": (str(desc)[:60] if desc else None),
         "bundle_id": _to_int(opt.get("bundleid")),
         "bundle_discount_pct": _to_int(opt.get("bundle_discount_pct")),
@@ -334,9 +336,13 @@ class StoreBrowseAPI:
     def evaluate(item: dict | None, name_en: str = "") -> tuple[str, list[dict] | None]:
         """item → (price_status, options)。
 
-        实测编码：
+        编码形态：
         - 未收录/锁区 → success=15 + visible=false
-        - 免费游戏   → is_free=true，**没有** purchase_options 键（不是空数组）
+        - 限时赠送   → is_free=true 且 is_free_temporarily=true（或赠送选项带
+          is_free_to_keep），purchase_options 含 0 价赠送包（original>0、
+          discount=100、free_to_keep_ends 结束时间戳）
+        - 免费游戏   → is_free=true（无 is_free_temporarily），**没有**
+          purchase_options 键（不是空数组）
         - 付费       → purchase_options[]（bundle 选项只有 bundleid、无 packageid）
         - 可见但无购买选项 → 该区不售。**判 locked 而非 missing**：missing 在库内
           语义是「抓取欠账」（进补抓账本、连失 5 次转 blocked），把「该区不卖」
@@ -346,6 +352,14 @@ class StoreBrowseAPI:
             return "locked", None
         if item.get("unvailable_for_country_restriction"):
             return "locked", None
+        # 限时赠送判定必须在 is_free 之前：赠送中（100% off / free_to_keep）的
+        # 条目 is_free 同样为 true，靠 is_free_temporarily /
+        # best_purchase_option.is_free_to_keep 区分；结束时间取选项的
+        # free_to_keep_ends（一手字段，精确到秒）
+        if item.get("is_free_temporarily") or (
+            item.get("best_purchase_option") or {}
+        ).get("is_free_to_keep"):
+            return "free_promo", StoreBrowseAPI.parse_options(item, name_en)
         if item.get("is_free"):
             return "free", None
         opts = StoreBrowseAPI.parse_options(item, name_en)
@@ -357,20 +371,22 @@ class StoreBrowseAPI:
     def parse_options(item: dict, name_en: str = "") -> list[dict]:
         """purchase_options[] → 旧链路 parse_all_sub_prices 的同款 dict 形状。
 
-        与旧实现的关键差异：原价直接取 original_price_in_cents（一手数据），
-        不再用 `price×100÷(100-discount)` 反推（Steam 先定价后折后取整，回不去）。
+        原价直接取 original_price_in_cents（一手数据）。
+        折扣价无法反推原价：Steam 先定价后折后取整。
         """
         # 版本后缀提取的基准名：调用方没给（补抓轮无预取、META 全空）时
         # 用条目自身名字兜底——价格批固定 english 语境，item.name 即英文名。
         # 缺了这层，豪华版等选项的后缀提取全部失效 → 全员伪装成标准版候选
         # → min(sub_id) 会把 sub 编号更小的豪华版选成现价
-        # （案例：女神异闻录４ 黄金版 deluxe 376686 < 标准 447601）
         if not name_en:
             name_en = item.get("name") or ""
         raw = item.get("purchase_options") or []
         if not raw:
             best = item.get("best_purchase_option")
             raw = [best] if best else []
+        # 赠送结束时间戳只在 best_purchase_option 上（purchase_options
+        # 各项不带），逐项回填
+        best_keep_ends = _to_int((item.get("best_purchase_option") or {}).get("free_to_keep_ends"))
         # 分组语义对齐旧链路 package_groups["default"]：有 default 就只取 default
         if any(o.get("package_group") == "default" for o in raw):
             raw = [o for o in raw if o.get("package_group") == "default"]
@@ -395,22 +411,25 @@ class StoreBrowseAPI:
             if discount <= 0 and price and original and original > price:
                 discount = round((original - price) / original * 100)
             name = opt.get("purchase_option_name") or ""
-            results.append(
-                {
-                    "price_cents": price if price else None,
-                    "original_cents": original if price else None,
-                    "is_gold": is_gold_edition(name),
-                    "discount_pct": discount,
-                    "sub_id": packageid if packageid else bundleid,
-                    # bundle 选项（packageid 缺席、只有 bundleid，如 Gori 慈善包）
-                    # → 送进 history 留档，但标记 is_bundle 让 db_writer 排除出
-                    # 「标准版」候选（绝不参与 current 落库）
-                    "is_bundle": bool(bundleid and not packageid),
-                    "version_suffix": extract_version_suffix(name, name_en),
-                    "option_name": name,
-                    **_discount_meta(opt),
-                }
-            )
+            row = {
+                # 0 价是合法现价（限时赠送）：保留而非置 None——置 None 会让
+                # db_writer 把赠送行降级 missing，赠送态从此进不了库
+                "price_cents": price,
+                "original_cents": original,
+                "is_gold": is_gold_edition(name),
+                "discount_pct": discount,
+                "sub_id": packageid if packageid else bundleid,
+                # bundle 选项（packageid 缺席、只有 bundleid，如 Gori 慈善包）
+                # → 送进 history 留档，但标记 is_bundle 让 db_writer 排除出
+                # 「标准版」候选（绝不参与 current 落库）
+                "is_bundle": bool(bundleid and not packageid),
+                "version_suffix": extract_version_suffix(name, name_en),
+                "option_name": name,
+                **_discount_meta(opt),
+            }
+            if row["free_to_keep_ends"] is None and best_keep_ends is not None:
+                row["free_to_keep_ends"] = best_keep_ends
+            results.append(row)
         return results
 
     @staticmethod
@@ -800,7 +819,7 @@ async def _browse_price_task_inner(context) -> None:
 
     currency = CURRENCY_BY_CC.get(cc, "USD")
     now_dt = get_beijing_time_obj()
-    counts = {"ok": 0, "locked": 0, "missing": 0, "skip": 0, "write_fail": 0}
+    counts = {"ok": 0, "free_promo": 0, "locked": 0, "missing": 0, "skip": 0, "write_fail": 0}
     _WRITE_STARTED.add(str(task_id))
 
     for appid in appids:
@@ -837,6 +856,13 @@ async def _browse_price_task_inner(context) -> None:
                 kept = [o for o in opts if (o.get("sub_id") or 0) in bench]
                 status, opts = ("ok", kept) if kept else ("locked", None)
 
+        # 赠送态但响应里拿不到 0 价赠送选项（异常响应）→ 按 missing 记账自愈
+        if status == "free_promo" and not any(
+            o.get("price_cents") == 0 and (o.get("original_cents") or 0) > 0
+            for o in (opts or [])
+        ):
+            status = "missing"
+
         if status == "ok" and opts:
             # 标准版候选只收「包」，bundle 选项仅在「该区一个包都没有」时才顶上。
             # 这一步必须在新抓取层做，不能指望 db_writer 的 is_bundle 过滤：
@@ -860,9 +886,37 @@ async def _browse_price_task_inner(context) -> None:
                     "version_suffix": o["version_suffix"] or None,
                     "is_bundle": o["is_bundle"],
                     "price_status": "ok",
+                    "discount_end_ts": o.get("discount_end_ts"),
                     "crawled_at": now_dt,
                 }
                 for o in opts
+            ]
+        elif status == "free_promo":
+            # 限时赠送：只取 0 价赠送选项构造现价行——付费包选项若一起下发，
+            # db_writer 的 min(sub_id) 会把付费价顶成现价；version_suffix 强制
+            # None（赠送包名 "…Limited Free Promotional Package" 会污染后缀
+            # 提取）；promo_end_ts 随行透传给 db_writer 维护 games.promo_end_at
+            # （仪表盘 Steam 喜加一模块的数据源）。价格行照常进 history——
+            # 降到 0 是真实价格事件，史低/排序缓存的 cny_fen>0 守卫天然排除
+            promo_opts = [
+                o for o in (opts or [])
+                if o.get("price_cents") == 0 and (o.get("original_cents") or 0) > 0
+            ]
+            prices_arr = [
+                {
+                    "appid": int(appid), "region_code": cc.upper(), "currency": currency,
+                    "price": 0, "original_price": o["original_cents"],
+                    "discount_percent": o.get("discount_pct") or 100,
+                    "sub_id": o.get("sub_id") or 0,
+                    "is_gold": False, "version_suffix": None,
+                    "is_bundle": False, "price_status": "ok", "crawled_at": now_dt,
+                    # promo_end_ts 随行透传给 db_writer 维护 games.promo_end_at
+                    # （仪表盘 Steam 喜加一模块的数据源）；discount_end_ts 同值
+                    # 落现价/历史（100% 折扣的截止即赠送截止）
+                    "promo_end_ts": o.get("free_to_keep_ends") or o.get("discount_end_ts"),
+                    "discount_end_ts": o.get("free_to_keep_ends") or o.get("discount_end_ts"),
+                }
+                for o in promo_opts
             ]
         elif status == "free":
             # 免费：与旧链路同语义（price=0 的 ok 记录进 current，不进 history）

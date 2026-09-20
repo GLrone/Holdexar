@@ -49,7 +49,7 @@ TOLERANCE_FEN = 500  # 5 元容差（分）
 # 游戏商店默认隐藏 DLC；白名单豁免个别确需常驻的 DLC（黄金树幽影 / 艾尔登法环）
 DLC_EXEMPT_APPIDS = frozenset({2778580})
 
-# ── 汇率进程内缓存（对齐原型 Redis 300s TTL）──
+# ── 汇率进程内缓存（300s TTL）──
 _RATES_TTL_SECONDS = 300.0
 _rates_cache: tuple[float, dict[str, float]] | None = None
 
@@ -175,12 +175,12 @@ def _build_filter_conditions(
     conditions: list = [g.name.is_not(None), g.name != ""]
 
     if is_locked:
-        # 锁国区：无 ok 状态的国区行（LEFT JOIN 后 appid 为空即不存在，对齐原型 cnJoinType=LEFT）
+        # 锁国区：无 ok 状态的国区行（LEFT JOIN 后 appid 为空即不存在）
         conditions.append(cn.appid.is_(None))
     else:
         conditions += [cn.price.is_not(None), cn.price > 0]
         # 近似全区最低（±5 元容差）= COALESCE(非CN最低, 国区价) >= 国区价 - 容差
-        # （等价旧版 NOT EXISTS 相关子查询；由预计算列表达 lowest_prices CTE）
+        # （由预计算列表达，等价于对 lowest_prices 的相关子查询）
         if region_code == "CN":
             conditions.append(func.coalesce(g.min_cny_fen, cn.price) >= cn.price - tolerance)
         if is_lowest:
@@ -323,7 +323,7 @@ def _build_base_stmt(
     region_code: str,
     is_locked: bool,
 ):
-    """基础查询组装（join 形态对齐原型：LOCKED 走 LEFT JOIN，其余 INNER）。"""
+    """基础查询组装（join 形态：LOCKED 走 LEFT JOIN，其余 INNER）。"""
     cn_join = and_(
         cn.appid == g.appid,
         cn.region_code == "CN",
@@ -442,7 +442,7 @@ async def list_games(
         exclude_dlc=exclude_dlc,
     )
 
-    # ── 基础查询（join 形态对齐原型：LOCKED 走 LEFT JOIN，其余 INNER）──
+    # ── 基础查询（join 形态：LOCKED 走 LEFT JOIN，其余 INNER）──
     base = _build_base_stmt(g=g, cn=cn, sr=sr, conditions=conditions,
                            region_code=region_code, is_locked=is_locked)
 
@@ -459,12 +459,12 @@ async def list_games(
         order = fav_order + build_order_by(g, cn, sort=sort, region_mode=has_region, sr=sr)
 
     async with get_session_factory()() as session:
-        # total 分离（对齐原型 COUNT(*) 独立查询）
+        # total 分离（COUNT(*) 独立查询）
         total = (
             await session.execute(select(func.count()).select_from(base.subquery()))
         ).scalar() or 0
 
-        # limit+1 探测 hasMore（对齐原型）
+        # limit+1 探测 hasMore
         rows = (
             await session.execute(base.order_by(*order).limit(limit + 1).offset(offset))
         ).all()
@@ -657,11 +657,13 @@ async def get_game_detail(appid: int) -> dict | None:
         if p.price_status in ("missing", "blocked"):
             unavailable_regions.append(code)
             continue
-        if p.price is None or int(p.price) <= 0:
+        if p.price is None:
             continue
         price_cents = int(p.price)
+        # price=0 = 免费游戏/限时赠送：合法现价照进矩阵（前端按 cents=0
+        # 显示「免费」而非锁区/暂无价格）
         cny_fen = int(p.cny_fen) if p.cny_fen is not None else None
-        if cny_fen is None:
+        if cny_fen is None and price_cents > 0:
             currency = p.currency or REGION_TO_CURRENCY.get(code)
             if currency:
                 cny_fen = convert_minor_to_cny_fen(price_cents, currency, rates)
@@ -670,6 +672,7 @@ async def get_game_detail(appid: int) -> dict | None:
             "cnyFen": cny_fen,
             "originalCents": int(p.original_price) if p.original_price is not None else None,
             "discount": p.discount_percent or 0,
+            "discountEndsAt": p.discount_end_ts,
             "currency": p.currency or REGION_TO_CURRENCY.get(code, "USD"),
         }
 
@@ -694,7 +697,8 @@ async def get_game_detail(appid: int) -> dict | None:
     lowest_cny_fen = None
     lowest_region_code = ""
     for code, data in price_map.items():
-        if code == "CN" or data["cnyFen"] is None:
+        # 0 价（免费）不参与最低区：全 0 时「最低区 ¥0.00」无展示意义
+        if code == "CN" or not data["cnyFen"]:
             continue
         if lowest_cny_fen is None or data["cnyFen"] < lowest_cny_fen:
             lowest_cny_fen = data["cnyFen"]
@@ -740,12 +744,18 @@ async def get_game_detail(appid: int) -> dict | None:
         "viewCount": game.view_count,
         # 下架监控：非空 = 已判定下架（前端角标依据）
         "removedAt": game.removed_at.isoformat() if game.removed_at else None,
+        # 免费态：f2p=永久免费 / promo=限时赠送中（前端价格区显示「免费」、
+        # 赠送徽章倒计时用）；NULL=付费正常
+        "freeKind": game.free_kind,
+        "promoEndAt": game.promo_end_at,
         "priceMatrix": price_matrix,
         # 爬过但未抓到价格的区（大写码，missing/blocked）：详情页与列表口径一致
         "unavailableRegions": sorted(unavailable_regions),
         "cnPriceCents": cn_price_cents,
         "cnCnyFen": cn_cny_fen,
         "cnDiscount": cn_discount,
+        # 国区折扣截止（Unix 秒；无折扣/未带促销元数据 = None）
+        "cnDiscountEndsAt": (cn_data["discountEndsAt"] if cn_data else None),
         "lowestCnyFen": lowest_cny_fen,
         "lowestRegionCode": lowest_region_code,
         "savingsFen": (
@@ -877,9 +887,9 @@ async def get_game_history(
     versions 为该 appid+region 库内 distinct 版本（前端下拉数据源）。
 
     标准版语义：**跨 sub 代际的标准版序列**。Steam 改包内容就换 sub_id，
-    只认单个 sub 会把换代之前的历史整段滤掉——实测 872410/CN 只出 2 个点
-    而库里 130 行（2021-02-27 起），全库 78 个 (appid, region) 对合计漏
-    2747 行，前端表现就是「只有今年的数据 / 时间轴中间断了」。因此：
+    只认单个 sub 会把换代之前的历史整段滤掉（872410/CN 只出 2 个点而库里
+    130 行，全库 78 个 (appid, region) 对合计漏 2747 行），前端表现就是
+    「只有今年的数据 / 时间轴中间断了」。因此：
 
         标准版 = 该区所有标准版行 ∪ 该区当前在售 sub 的所有行
 
@@ -1160,12 +1170,12 @@ async def get_price_context_batch(items: list[tuple[int, str]]) -> dict:
 
 
 async def get_game_versions(appid: int) -> dict:
-    """全版本 × 全区最新价（走势抽屉「全部版本」区块数据源，B1 拍板形态）。
+    """全版本 × 全区最新价（走势抽屉「全部版本」区块数据源）。
 
     聚合 history 每 (region_code, sub_id) 的最新 ok 行（snapshot_at 升序
     扫描后 dict 覆盖 = 最新胜出）；is_bundle 行剔除（捆绑包由详情页
-    「关联捆绑包」承接）。零迁移：版本列 sub_id/is_gold/version_suffix
-    既有 schema 早已存在，is_bundle 为本轮新增。
+    「关联捆绑包」承接）。版本列 sub_id/is_gold/version_suffix 用既有 schema，
+    is_bundle 为本功能新增列。
     """
     rates = await get_rates()
 
@@ -1503,6 +1513,9 @@ async def _refresh_smart_scores(session: AsyncSession, appids: list[int] | None)
             ),
             isouter=True,
         )
+        # 免费游戏（f2p/限时赠送）不参与评分：它们被商店主门 price>0
+        # 挡在列表之外，smart_score 只服务商店排序的可见集
+        .where(Game.free_kind.is_(None))
     )
     if appids is not None:
         if not appids:
@@ -1649,6 +1662,13 @@ def _build_list_item(game: Game, cn_row: GameCurrentPrice | None, price_rows: li
         "nameEn": game.name_en,
         "discount": discount,
         "discountLabel": f"-{discount}%" if discount > 0 else "",
+        # 国区折扣截止（browse active_discounts 下发的 Unix 秒；无折扣/本轮
+        # 未带促销元数据 = None，前端过期也不展示）
+        "discountEndsAt": (
+            int(cn_row.discount_end_ts)
+            if cn_row is not None and cn_row.discount_end_ts
+            else None
+        ),
         "positiveRate": (game.positive_rate / 100) if game.positive_rate is not None else None,
         "reviewCount": game.review_count,
         "isAdult": game.is_adult or False,
