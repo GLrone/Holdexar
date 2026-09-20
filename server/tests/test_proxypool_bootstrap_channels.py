@@ -22,7 +22,10 @@ from app.core.database import get_engine, get_session_factory, init_db  # noqa: 
 from app.domains.proxies import clash_manager  # noqa: E402
 from app.domains.proxies.clash_manager import ClashRuntime  # noqa: E402
 from app.domains.proxies.kernel_release import kernel_filename  # noqa: E402
-from app.domains.proxies.models import ProxySubscription  # noqa: E402
+from app.domains.proxies.models import (  # noqa: E402
+    ADMISSION_ACTIVE,
+    ProxySubscription,
+)
 from app.domains.proxypool import bootstrap as bs  # noqa: E402
 from app.domains.proxypool.subscription import (  # noqa: E402
     CHANNEL_DIRECT, CHANNEL_KERNEL, FORMAT_YAML, FetchResult,
@@ -76,9 +79,10 @@ def _node(name: str, server: str) -> dict:
 
 
 async def _sub() -> int:
+    """ACTIVE 订阅：本文件验的是「获准进入生产」的抓取/引导路径。"""
     async with get_session_factory()() as s:
         row = ProxySubscription(kind="clash", url="https://sub.invalid/x",
-                                created_at=NOW)
+                                created_at=NOW, admission_status=ADMISSION_ACTIVE)
         s.add(row)
         await s.commit()
         return row.id

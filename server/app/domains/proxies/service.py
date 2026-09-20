@@ -40,7 +40,14 @@ def _clash_test_lock() -> asyncio.Lock:
         _clash_test_locks[loop] = lock
     return lock
 from . import clash_manager
-from .models import ClashNode, Proxy, ProxyEvent, ProxySubscription
+from .models import (
+    ADMISSION_ACTIVE,
+    ADMISSION_CANDIDATE,
+    ClashNode,
+    Proxy,
+    ProxyEvent,
+    ProxySubscription,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -803,7 +810,12 @@ async def migrate_legacy_subscription() -> None:
         if not exists:
             session.add(
                 ProxySubscription(
-                    kind="clash", url=legacy.strip(), created_at=_naive(get_beijing_time_obj())
+                    kind="clash",
+                    url=legacy.strip(),
+                    created_at=_naive(get_beijing_time_obj()),
+                    # 旧 KV 迁移的是用户**原本就在用**的那条订阅：按 ACTIVE 兼容，
+                    # 不能因为本切片把历史订阅降级成候选（那会让生产池突然空掉）。
+                    admission_status=ADMISSION_ACTIVE,
                 )
             )
             await session.commit()
@@ -829,6 +841,16 @@ async def list_subscriptions(kind: str | None = None) -> list[dict]:
             "deprecated": bool(s.deprecated),
             "deprecatedAt": s.deprecated_at.isoformat() if s.deprecated_at else None,
             "deprecatedReason": s.deprecated_reason,
+            # 生产准入（**仅 proxypool 的 Clash 链有语义**）：
+            # - clash：NULL（ALTER 之前的历史行）与新行缺省都按候选之外的 ACTIVE 呈现，
+            #   新订阅由 add_subscription 显式写成 CANDIDATE；
+            # - 非 clash（plain）：没有 Candidate admission 生命周期，一律呈现 ACTIVE
+            #   ——历史行哪怕曾被写成 CANDIDATE 也在这里归正，不需要数据迁移。
+            "admissionStatus": (
+                (s.admission_status or ADMISSION_ACTIVE)
+                if s.kind == "clash"
+                else ADMISSION_ACTIVE
+            ),
         }
         for s in rows
     ]
@@ -862,7 +884,18 @@ async def add_subscription(kind: str, url: str, label: str | None = None) -> dic
 
     async with get_session_factory()() as session:
         sub = ProxySubscription(
-            kind=kind, url=url, label=label, created_at=_naive(get_beijing_time_obj())
+            kind=kind,
+            url=url,
+            label=label,
+            created_at=_naive(get_beijing_time_obj()),
+            # 生产准入（**仅 proxypool 的 Clash 链消费**）：
+            # - clash 新订阅 → CANDIDATE：只抓取 + 落快照，不进 Registry/生产池；
+            #   获准进生产走显式晋升（`POST /proxypool/subscriptions/{id}/promote`）；
+            # - plain 新订阅 → ACTIVE：它不存在 Candidate admission 生命周期，
+            #   节点直接进旧手工代理池（`import_plain_subscription`），不参与 proxypool。
+            admission_status=(
+                ADMISSION_CANDIDATE if kind == "clash" else ADMISSION_ACTIVE
+            ),
         )
         session.add(sub)
         await session.commit()

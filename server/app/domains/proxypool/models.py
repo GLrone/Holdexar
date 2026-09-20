@@ -239,6 +239,9 @@ class SubscriptionSnapshot(Base):
     format: Mapped[str] = mapped_column(String(16))
     # 原始字节按 sha 内容寻址落盘（订阅动辄数十 KB，不进库），这里只存路径
     raw_path: Mapped[str | None] = mapped_column(String(500))
+    # 这份内容是从哪个 URL 抓下来的（provenance）：订阅换链接后，旧链接的成功快照
+    # 不得被 `latest_snapshot(url=当前URL)` 选中。历史行无此列为 NULL。
+    url: Mapped[str | None] = mapped_column(String(500))
     node_count: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(16))
     http_status: Mapped[int | None] = mapped_column(Integer)

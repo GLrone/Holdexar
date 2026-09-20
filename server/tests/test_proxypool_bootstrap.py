@@ -23,7 +23,10 @@ from app.core.database import get_engine, get_session_factory, init_db  # noqa: 
 from app.domains.proxies import clash_manager  # noqa: E402
 from app.domains.proxies.clash_manager import ClashRuntime  # noqa: E402
 from app.domains.proxies.kernel_release import kernel_filename  # noqa: E402
-from app.domains.proxies.models import ProxySubscription  # noqa: E402
+from app.domains.proxies.models import (  # noqa: E402
+    ADMISSION_ACTIVE,
+    ProxySubscription,
+)
 from app.domains.proxypool import bootstrap as bs  # noqa: E402
 from app.domains.proxypool.models import (  # noqa: E402
     ProxyNode, ProxyNodeSource, SubscriptionSnapshot,
@@ -98,8 +101,14 @@ def _fetch_ok(nodes: list[dict]) -> FetchResult:
 
 
 async def _add_subscription(url: str = "https://sub.invalid/x") -> int:
+    """建一条 **ACTIVE** 订阅：本文件验的是「获准进入生产」那条路径。
+
+    （生产准入为 CANDIDATE 的路径见 `test_proxypool_admission.py`：候选只落快照。）
+    """
     async with get_session_factory()() as s:
-        sub = ProxySubscription(kind="clash", url=url, created_at=NOW)
+        sub = ProxySubscription(
+            kind="clash", url=url, created_at=NOW, admission_status=ADMISSION_ACTIVE
+        )
         s.add(sub)
         await s.commit()
         return sub.id

@@ -407,9 +407,12 @@ async def test_router_serves_real_rows_and_validates_params(tmp_data_dir):
     from app.domains.proxypool.router import router as proxypool_router
 
     await init_db()
+    # 走 HTTP 的一轮：概览按**真实 now** 取"今日"，所以数据必须落在真实今天，
+    # 不能用模块级固定日期（否则跨过午夜就假红——时间依赖的测试脆弱点）。
+    today = datetime.now()
     async with get_session_factory()() as session:
         row = ProxyJobRun(
-            status=jobruns.STATUS_SUCCESS, started_at=NOW, finished_at=NOW,
+            status=jobruns.STATUS_SUCCESS, started_at=today, finished_at=today,
             duration_ms=1234, task_count=4, success_count=4, error_count=0,
             proxy_url="http://127.0.0.1:45678", pool_node_count=3,
             pool_exit_ip_count=2, error_summary={"by_error": {}},
@@ -428,7 +431,7 @@ async def test_router_serves_real_rows_and_validates_params(tmp_data_dir):
         assert body["total"] == 1
         assert body["summary"]["runs"] == 1
         assert body["summary"]["success"] == 1
-        assert body["summary"]["day"] == NOW.date().isoformat()
+        assert body["summary"]["day"] == today.date().isoformat()
         assert body["items"][0]["taskCount"] == 4
         assert body["items"][0]["poolExitIpCount"] == 2
 
