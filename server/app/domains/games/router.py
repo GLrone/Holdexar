@@ -158,6 +158,19 @@ async def game_cdk(appid: int, sub_id: int | None = None):
     return await cdk_fetcher.fetch_cdk(appid, sub_id=sub_id)
 
 
+@router.get("/{appid}/series")
+async def game_series(appid: int):
+    """同系列游戏成员（GPW「同系列」区块数据源）。
+
+    无系列（未识别 / 落单）或游戏不存在 → 404，前端据此隐藏区块。"""
+    from . import series as series_mod
+
+    result = await series_mod.series_members(appid)
+    if result is None:
+        raise HTTPException(status_code=404, detail="未识别到同系列游戏")
+    return result
+
+
 @router.get("/{appid}")
 async def game_detail(appid: int):
     detail = await service.get_game_detail(appid)
