@@ -49,6 +49,10 @@ onMounted(() => {
   crawl.start()
   settingsStore.load()
   accountStore.load()
+  // 闲时预热成就殿堂视图 chunk（内含 echarts 大包）
+  const warmAchievements = () => { void import('./views/achievements/Index.vue') }
+  if ('requestIdleCallback' in window) requestIdleCallback(warmAchievements, { timeout: 5000 })
+  else setTimeout(warmAchievements, 2500)
   // 钱包快照轮询：后端每分钟轮转刷新，前端只读拉取最新快照（不打 Steam）
   setInterval(() => accountStore.load(), 60_000)
   // 与后端对齐更新状态：上次会话下载好却没重启的暂存，这次启动要弹「重启完成更新」
@@ -173,6 +177,7 @@ const navGroups = computed<HlSideNavGroup[]>(() => [
       { label: t('nav.library'), to: '/library', icon: 'store' },
       { label: t('nav.bundles'), to: '/bundles', icon: 'package' },
       { label: t('nav.gamelib'), to: '/gamelib', icon: 'gamepad' },
+      { label: t('nav.achievements'), to: '/achievements', icon: 'trophy' },
       { label: t('nav.family'), to: '/family', icon: 'home' },
       { label: t('nav.bills'), to: '/bills', icon: 'list' },
     ],
@@ -327,7 +332,7 @@ async function manualRefreshWallet() {
 <template>
   <div class="app-shell" :class="{ 'is-curtained': closeCurtain }">
     <!-- 侧边栏（HlSideNav：分组导航 + 收拢按键；收起态品牌区悬停换
-         「侧边栏」图标，点击展开——新手引导入口已迁至「关于」页 logo） -->
+         「侧边栏」图标，点击展开——新手引导入口在「关于」页 logo） -->
     <HlSideNav
       v-model:collapsed="collapsed"
       :groups="navGroups"
@@ -462,7 +467,9 @@ async function manualRefreshWallet() {
         <div class="view-container">
           <router-view v-slot="{ Component }">
             <transition name="route-fade" mode="out-in">
-              <component :is="Component" />
+              <keep-alive include="AchievementsHall">
+                <component :is="Component" />
+              </keep-alive>
             </transition>
           </router-view>
         </div>
@@ -478,10 +485,10 @@ async function manualRefreshWallet() {
 
     <!-- 关窗幕布：桌面壳弹出「最小化 / 退出程序」原生弹窗前调用 __hlxCloseCurtain(true)
          拉起（见 desktop/main.py 的 _toggle_close_curtain），弹窗落定后撤下。
-         为什么要放到页面里：原生壳里另开遮罩窗压在 WebView2 之上，DWM 要整块重新
-         合成，实测把弹窗上屏拖慢 ~600ms；页面侧零延迟，且只盖内容区不盖标题栏。
+         幕布放页面里而非原生壳另开遮罩窗：后者会让 DWM 整块重新合成，把弹窗
+         上屏拖慢 ~600ms；页面侧零延迟，且只盖内容区不盖标题栏。
          模糊由 .is-curtained 给内容加 filter: blur()（毛玻璃），本遮罩只管压暗：
-         backdrop-filter 在本机 WebView2 的合成路径下不生效（实测只暗不糊）。 -->
+         WebView2 的合成路径下 backdrop-filter 只压暗不模糊。 -->
     <Transition name="hl-curtain-fade">
       <div v-if="closeCurtain" class="hl-close-curtain" />
     </Transition>

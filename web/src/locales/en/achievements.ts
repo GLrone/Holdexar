@@ -1,0 +1,113 @@
+/* English 词典 · 成就殿堂（与 zh-CN/achievements.ts 同构，key 必须逐一对齐）。 */
+
+import type { MessageKey } from '../zh-CN'
+
+const achievements: Partial<Record<MessageKey, string>> = {
+  'achievements.section.overview': 'Overview',
+  'achievements.section.analysis': 'Analysis',
+  'achievements.section.highlights': 'Highlights',
+  'achievements.section.games': 'Game achievements',
+
+  'achievements.kpi.platinum': 'Platinum games',
+  'achievements.kpi.platinumSub': 'All achievements earned',
+  'achievements.kpi.games': 'Games with achievements',
+  'achievements.kpi.gamesSub': 'Games with an achievement system (incl. external)',
+  'achievements.kpi.total': 'Total achievements',
+  'achievements.kpi.totalSub': 'Across achievement games',
+  'achievements.kpi.unlocked': 'Achievements earned',
+  'achievements.kpi.unlockedSub': 'Unlocked achievements',
+  'achievements.kpi.rate': 'Completion rate',
+  'achievements.kpi.rateSub': 'Earned ÷ total achievements',
+  'achievements.kpi.playtime': 'Total playtime',
+  'achievements.kpi.playtimeSub': '{n} games played',
+  'achievements.kpi.externalHint':
+    'Outside your library (family sharing, etc.): {n} games · {u} achievements · {p} perfect',
+
+  'achievements.account.primary': 'Primary account',
+  'achievements.account.family': 'Family member',
+
+  'achievements.shelf.title': 'Platinum hall',
+  'achievements.shelf.hint': 'All achievements earned · newest first',
+  'achievements.shelf.date': 'Perfected {date}',
+  'achievements.shelf.empty': 'No platinum games yet',
+
+  'achievements.chart.rarityTitle': 'Rarity distribution',
+  'achievements.chart.rarityHint': 'Earned achievements by global unlock rate',
+  'achievements.chart.playtimeTitle': 'Top 10 by playtime',
+  'achievements.chart.playtimeHint': 'Unit: hours',
+  'achievements.chart.unlockTitle': 'Achievement unlocks',
+  'achievements.chart.unlockHint': 'Last 24 months · unlocks per month',
+  'achievements.chart.playtimeTooltip': '{name}: {h} hrs',
+  'achievements.chart.unlockTooltip': '{month}: {n} achievements',
+  'achievements.chart.rarityTooltip': '{tier}: {n} achievements',
+
+  'achievements.rarity.ultra': 'Ultra rare',
+  'achievements.rarity.very_rare': 'Very rare',
+  'achievements.rarity.rare': 'Rare',
+  'achievements.rarity.uncommon': 'Uncommon',
+  'achievements.rarity.common': 'Common',
+  'achievements.rarity.unknown': 'Unknown',
+
+  'achievements.rarest.title': 'Rarest achievements',
+  'achievements.rarest.hint': 'Your lowest global-percent unlocks',
+  'achievements.recent.title': 'Recent unlocks',
+  'achievements.recent.hint': 'Newest first',
+  'achievements.recent.empty': 'No unlocks recorded yet',
+  'achievements.near.title': 'Close to platinum',
+  'achievements.near.hint': 'Completion ≥ {pct}% · a few left to perfect',
+  'achievements.near.remaining': '{n} left',
+  'achievements.highlight.globalPct': '{pct}% global',
+  'achievements.highlight.rarestBadge': 'Rarest here',
+
+  'achievements.filter.trophy': 'With trophies',
+  'achievements.filter.platinum': 'Platinum',
+  'achievements.filter.progress': 'In progress',
+  'achievements.filter.external': 'Outside library',
+  'achievements.filter.all': 'All',
+  'achievements.sort.playtime': 'By playtime',
+  'achievements.sort.progress': 'By completion',
+  'achievements.sort.recent': 'By last played',
+  'achievements.sort.name': 'By name',
+  'achievements.search.placeholder': 'Search game name',
+  'achievements.list.count': '{n} games',
+  'achievements.list.shown': 'Showing {shown} of {total}',
+
+  'achievements.action.sync': 'Sync achievements',
+  'achievements.action.more': 'Show more ({n} left)',
+  'achievements.sync.stage.library': 'Fetching owned games',
+  'achievements.sync.stage.progress': 'Fetching achievement progress',
+  'achievements.sync.stage.details': 'Fetching achievement details',
+  'achievements.sync.running': '{stage} {done}/{total}',
+  'achievements.sync.current': 'Syncing: {name}',
+  'achievements.sync.failed': 'Sync failed: {error}',
+  'achievements.sync.lastSynced': 'Last synced {date}',
+
+  'achievements.list.unlockedOf': '{unlocked}/{total}',
+  'achievements.list.neverPlayed': 'Never played',
+  'achievements.list.platinumTag': 'Platinum',
+  'achievements.list.externalTag': 'External',
+  'achievements.list.externalHours': 'Playtime unknown',
+  'achievements.list.externalNoRecord': 'Not in your library',
+  'achievements.list.lastPlayed': 'Last played {date}',
+
+  'achievements.empty.noCredential': 'No Steam credential bound',
+  'achievements.empty.noCredentialHint':
+    'Bind your Steam cookie on the profile page to sync; with a Web API Key details come from official APIs and other accounts can be viewed too',
+  'achievements.empty.goSettings': 'Open profile settings',
+  'achievements.empty.noData': 'No achievement data yet',
+  'achievements.empty.noDataHint': 'Click "Sync achievements" to fetch your achievements and playtime',
+  'achievements.empty.noMatch': 'No matching games',
+  'achievements.empty.syncing': 'Syncing achievements and playtime…',
+
+  'achievements.drawer.unlockedOf': '{unlocked} / {total} unlocked',
+  'achievements.drawer.playtime': '{h} played',
+  'achievements.drawer.perfectDate': 'Perfected {date}',
+  'achievements.drawer.globalPct': '{pct}% of players own this',
+  'achievements.drawer.unlockAt': 'Unlocked {date}',
+  'achievements.drawer.locked': 'Locked',
+  'achievements.drawer.empty': 'No achievement data for this game (not synced or no achievement system)',
+  'achievements.drawer.groupUnlocked': '{n} unlocked',
+  'achievements.drawer.groupLocked': '{n} locked',
+}
+
+export default achievements

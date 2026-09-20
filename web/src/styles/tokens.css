@@ -126,14 +126,74 @@
      文字与强调色也必须恒定，不能跟随主题：浅色主题的 --success 是 #6b9a00
      （暗橄榄），压在黑蒙版上几乎看不见。
 
-     这一组正是为此而设。原先这五处各自写死字面量，且值恰好等于**深色主题**的
-     token 取值（#a4d007 = 深色 --success、#66c0f4 = 深色 --accent），于是被
-     「清剿硬编码主题色」一并扫出来——但它们的正确定性不是「抄错了令牌」，
-     而是「这里本来就该用与主题无关的定色」。登记在这里，语义才落得下。
+     这一组正是为此而设：压在常量深色面上的文字/强调色必须恒定，不随主题变。
+     它们的值接近深色主题的 token 取值（#a4d007 = 深色 --success、
+     #66c0f4 = 深色 --accent），但正确定性是「与主题无关的定色」，不是
+     「抄了令牌取值」——登记在这里语义才落得下。
      白字与次级白字已有 --text-on-fill / --text-on-scrim 覆盖，不重复登记。 */
   --accent-on-dark: #66c0f4; /* 深色面上的强调数值（价格、汇率） */
   --success-on-dark: #a4d007; /* 深色面上的「好」（史低 / 省钱 / 永降） */
   --danger-on-dark: #ff8a80; /* 深色面上的「差」（原价上调）；比 --danger 亮一档 */
+
+  /* ── 奖杯勋章（PSN 风，主题无关的金属定色）──
+     圆形勋章的三段金属渐变（-1 亮部/-2 中间/-3 暗部）+ 内环（-ring）+
+     徽记（-glyph）+ 扫光高光（--medal-sheen）。金属材质不随主题翻转
+     （同 --accent-on-dark 的定色语义），浅深两套下同值可读。 */
+  --medal-platinum-1: #f7fafd;
+  --medal-platinum-2: #ccd9e6;
+  --medal-platinum-3: #90a5bc;
+  --medal-platinum-ring: #eaf1f8;
+  --medal-platinum-glyph: #5c7186;
+  --medal-gold-1: #ffefad;
+  --medal-gold-2: #f5c84c;
+  --medal-gold-3: #bd871d;
+  --medal-gold-ring: #ffe9a0;
+  --medal-gold-glyph: #7a5210;
+  --medal-silver-1: #f4f7fb;
+  --medal-silver-2: #c6ced9;
+  --medal-silver-3: #8b97a7;
+  --medal-silver-ring: #e9eef4;
+  --medal-silver-glyph: #5d6978;
+  --medal-bronze-1: #f6cfa8;
+  --medal-bronze-2: #cf9a62;
+  --medal-bronze-3: #92602c;
+  --medal-bronze-ring: #f0d3b0;
+  --medal-bronze-glyph: #6b4418;
+  --medal-sheen: #ffffff;
+
+  /* ── 鎏金（白金殿堂卡片）：旋转边框的三段金 ── */
+  --gild-1: #f9e7b0;
+  --gild-2: #d4a842;
+  --gild-3: #8a6a1f;
+
+  /* ── 全卡扫光：金色光核 + 前沿冷/尾迹暖的淡彩（棱镜感）──
+     压在任意封面图上都成立，故为定色（不随主题变）；三色同族低饱和，
+     叠起来读作"一道白光带过一点彩色"。 */
+  --sheen-core: rgba(255, 231, 156, 0.72);
+  --sheen-cool: rgba(168, 226, 255, 0.20);
+  --sheen-warm: rgba(255, 186, 124, 0.24);
+
+  /* ── 展示卡（称号名片）──
+     深蓝紫渐变底 + 固定浅色文字：这是**刻意定的展示面**，浅色主题下也不翻白
+     （同「奖杯鎏金」「扫光」一类——展示卡的底是设计的一部分，不是页面底色的
+     派生）。故浅深两套给同一组值，前景色一并固定，避免浅色主题里出现
+     "深底 + 深字"。 */
+  --report-bg-1: #121a3c;
+  --report-bg-2: #241b46;
+  --report-bg-3: #3a1f4e;
+  --report-fg: #ffffff;
+  --report-fg-dim: rgba(255, 255, 255, 0.66);
+  --report-fg-faint: rgba(255, 255, 255, 0.34);
+  --report-line: rgba(255, 255, 255, 0.18);
+  --report-glass: rgba(255, 255, 255, 0.10);
+  /* 展示卡霓虹色板（同族定色：彼此可区分、压在深蓝紫底上都够亮） */
+  --report-neon-1: #ffd93d;
+  --report-neon-2: #56e1e9;
+  --report-neon-3: #7c8cff;
+  --report-neon-4: #ff8ecb;
+  --report-neon-5: #9dff6b;
+  --report-neon-6: #ffab5e;
+  --report-neon-7: #b98cff;
 
   /* ── 页面底与容器 ── */
   --bg-base: #f2f6fa;
@@ -213,9 +273,8 @@
   --rate-low: #c0392b;
   /* ── 紫色（家庭共享等特性徽章）── */
   --purple: #8e44ad;
-  /* 与 --success-deep / --accent-deep 同位的「深一档」端点，供渐变徽章取第二色标。
-     原先只有 --purple 一个色，家庭共享徽章的渐变只好写死 #9b59b6→#8e44ad，
-     而同排的 owned / wishlist 走的是 var(--success)/var(--success-deep) 配对。 */
+  /* 与 --success-deep / --accent-deep 同位的「深一档」端点，供渐变徽章取第二色标
+     （owned / wishlist 走的是 --success/--success-deep 配对，紫色同构）。 */
   --purple-deep: #7d3c98;
   --purple-a15: rgba(142, 68, 173, 0.12);
   --purple-a30: rgba(142, 68, 173, 0.28);
@@ -408,6 +467,24 @@
 
 /* ══════════ 深色主题令牌 ══════════ */
 html.dark {
+  /* 展示卡（称号名片）：浅深两套同值——它刻意不随主题翻白，
+     见浅色主题块里的同组注释 */
+  --report-bg-1: #121a3c;
+  --report-bg-2: #241b46;
+  --report-bg-3: #3a1f4e;
+  --report-fg: #ffffff;
+  --report-fg-dim: rgba(255, 255, 255, 0.66);
+  --report-fg-faint: rgba(255, 255, 255, 0.34);
+  --report-line: rgba(255, 255, 255, 0.18);
+  --report-glass: rgba(255, 255, 255, 0.10);
+  --report-neon-1: #ffd93d;
+  --report-neon-2: #56e1e9;
+  --report-neon-3: #7c8cff;
+  --report-neon-4: #ff8ecb;
+  --report-neon-5: #9dff6b;
+  --report-neon-6: #ffab5e;
+  --report-neon-7: #b98cff;
+
   /* ── 页面底与容器 ── */
   --bg-base: #0e1a27;
   --bg-card: #1b2838;

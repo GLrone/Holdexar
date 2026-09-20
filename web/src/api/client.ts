@@ -60,6 +60,7 @@ const NO_CACHE_PATHS = [
   '/system/update-progress', // 更新下载进度 800ms 轮询
   '/system/update-pending',
   '/proxies/clash/install/progress',
+  '/achievements/sync', // 成就同步进行中的快照轮询
   // Epic 卡片：新鲜度由后端快照缓存管理（过期即回旧数据 + 后台刷新），
   // 前端再叠 60s 时间窗会把 stale→fresh 的覆盖整个吞掉（轮询永远读旧响应）
   '/metadata/epic/offers',
@@ -1628,4 +1629,343 @@ export const metadataApi = {
   /** 当期 + 预告白送元素；后端快照缓存 30 分钟（冷启动先回快照 + 后台刷新） */
   epicOffers: (opts?: { noCache?: boolean }) =>
     request<EpicOffersPayload>('GET', '/metadata/epic/offers', undefined, opts),
+export interface AchievementSummary {
+  hasCredential: boolean
+  steamid: string
+  /** 白金（全成就）游戏数 */
+  platinum: number
+  /** 有成就系统的游戏数（含库外） */
+  gamesWithAchievements: number
+  /** 有游玩时长的游戏数 */
+  playedGames: number
+  totalAchievements: number
+  unlockedAchievements: number
+  completionRate: number
+  totalPlaytimeMin: number
+  /** 其中库外（家庭共享等）：游戏数 / 已获得成就数 / 白金数 */
+  externalGames: number
+  externalUnlocked: number
+  externalPlatinum: number
+  lastSyncedAt: string | null
+  /** 白金殿堂陈列（按达成日期新→旧） */
+  platinums: {
+    appid: number
+    name: string
+    headerImage: string
+    playtimeMin: number
+    total: number
+    /** 白金时刻 epoch 秒；0 = 未知 */
+    date: number
+    source: AchievementSource
+  }[]
+  /** 最稀有成就（已获得，按全服占比升序） */
+  rarest: AchievementRow[]
+  /** 最近解锁（按时间降序） */
+  recentUnlocks: AchievementRow[]
+  /** 接近白金（完成度 ≥ 门槛，按完成度降序） */
+  nearCompletion: {
+    appid: number
+    name: string
+    headerImage: string
+    unlocked: number
+    total: number
+    percent: number
+    remaining: number
+    playtimeMin: number
+    source: AchievementSource
+  }[]
+  /** 已获得成就的稀有度分布 */
+  rarityBuckets: { tier: RarityTier; count: number }[]
+  playtimeTop: { appid: number; name: string; playtimeMin: number }[]
+  unlockTimeline: { month: string; count: number }[]
+}
+
+/** 汇总模块里的成就行（最稀有 / 最近解锁共用） */
+export interface AchievementRow {
+  appid: number
+  name: string
+  imageName: string
+  icon: string | null
+  globalPercent: number | null
+  /** 解锁 epoch 秒 */
+  unlockTime: number
+  gameName: string
+}
+
+export type AchievementGameFilter = 'trophy' | 'platinum' | 'progress' | 'external' | 'all'
+export type AchievementGameSort = 'playtime' | 'progress' | 'recent' | 'name'
+
+export interface AchievementGameItem {
+  appid: number
+  name: string
+  headerImage: string | null
+  playtimeMin: number
+  lastPlayed: number
+  total: number
+  unlocked: number
+  /** 还差几枚（未解锁数） */
+  remaining: number
+  percent: number
+  platinum: boolean
+  source: AchievementSource
+  /** 是否在本人已购库里（false = 库外：家庭共享等，时长未知） */
+  owned: boolean
+}
+
+export interface AchievementGamesPayload {
+  games: AchievementGameItem[]
+  count: number
+}
+
+export interface AchievementItem {
+  imageName: string
+  name: string
+  description: string
+  icon: string | null
+  iconGray: string | null
+  /** 全服解锁占比 0~100；null = 未取到 */
+  globalPercent: number | null
+  rarity: RarityTier
+  achieved: boolean
+  /** 解锁 epoch 秒；0 = 未解锁 */
+  unlockTime: number
+}
+
+export interface AchievementDetailPayload extends AchievementGameItem {
+  /** 白金达成时刻 epoch 秒；0 = 未白金 */
+  perfectDate: number
+  achievements: AchievementItem[]
+}
+
+export interface AchievementSyncSnapshot {
+  running: boolean
+  ok?: boolean | null
+  stage?: string
+  done?: number
+  total?: number
+  current?: string
+  error?: string
+  startedAt?: string
+  syncedAt?: string
+  /** 本轮同步的目标账号（多账号下用于判断状态是否属于当前所选账号） */
+  steamid?: string
+}
+
+export const achievementsApi = {
+  summary: (steamid = '') =>
+    request<AchievementSummary>('GET', `/achievements/summary${toQuery({ steamid })}`),
+  /** 可切换账号清单（已绑账号 + 家庭成员；不含凭证） */
+  accounts: () => request<{ accounts: AchievementAccount[] }>('GET', '/achievements/accounts'),
+  games: (filter: AchievementGameFilter, sort: AchievementGameSort, q = '', steamid = '') =>
+    request<AchievementGamesPayload>(
+      'GET',
+      `/achievements/games${toQuery({ filter, sort, q, steamid })}`,
+    ),
+  gameDetail: (appid: number, steamid = '') =>
+    request<AchievementDetailPayload>('GET', `/achievements/games/${appid}${toQuery({ steamid })}`),
+  sync: (steamid = '') =>
+    request<AchievementSyncSnapshot>('POST', `/achievements/sync${toQuery({ steamid })}`),
+  syncStatus: () => request<AchievementSyncSnapshot>('GET', '/achievements/sync'),
+}
+
+// ─── 游戏生涯（称号 / 热力图 / 偏好画像 / 纪录 / 评语墙）──────────
+// 后端只吐原始度量：称号阈值、评分权重与全部文案在前端（lib/careerTitles.ts
+// 与词典），因此调阈值不用改接口。
+
+/** 生涯里反复出现的游戏摘要（封面图始终来自 store header_image） */
+export interface CareerGame {
+  appid: number
+  name: string
+  headerImage: string | null
+  playtimeMin: number
+  unlocked: number
+  total: number
+  platinum: boolean
+}
+
+/** 时长/偏好排行行（类型、开发商、发行商、系列） */
+export interface CareerTasteRow {
+  games: number
+  playtimeMin: number
+  platinum: number
+  genre?: string
+  name?: string
+}
+
+/** 生涯口味画像（雷达/条形/年代构成的数据源） */
+export interface CareerTasteProfile {
+  genres: (CareerTasteRow & { genre: string })[]
+  developers: (CareerTasteRow & { name: string })[]
+  publishers: (CareerTasteRow & { name: string })[]
+  series: (CareerTasteRow & { name: string })[]
+  decades: { decade: string; games: number; playtimeMin: number }[]
+  chineseGames: number
+  freshGames: number
+  avgReleaseYear: number
+  oldestGame: (CareerGame & { releaseDate: string }) | null
+  newestGame: (CareerGame & { releaseDate: string }) | null
+}
+
+/** 系列进度行（按 games.series_id 聚合，只含拥有 ≥2 款的系列） */
+export interface CareerSeriesRow {
+  /** 系列标识（games.series_id 原样；展示名见 name） */
+  seriesId: string
+  /** 展示名：成员展示名的最长公共汉字前缀，否则回落标识 */
+  name: string
+  owned: number
+  played: number
+  platinum: number
+  /** 系列内已全成就（unlocked ≥ total）的作品数 */
+  completed: number
+  /** 全拥有作品的成就账 */
+  unlocked: number
+  total: number
+  /** 只算已玩成员的成就账（进度条口径） */
+  playedUnlocked: number
+  playedTotal: number
+  playtimeMin: number
+  /** playedUnlocked / playedTotal，0~1；无已玩成员时为 0 */
+  progress: number
+  /** 系列封面：该系列时长最高的一款 */
+  topGame: CareerGame | null
+  /** 缺口最小的一款（0 < unlocked < total），最有行动价值的下一步 */
+  nextGame: (CareerGame & { unlocked: number; total: number; remaining: number }) | null
+}
+
+export interface CareerSeriesPayload {
+  rows: CareerSeriesRow[]
+  /** 拥有 ≥2 款的系列数 */
+  seriesTotal: number
+  /** 有系列标记的系列数（含单款） */
+  taggedTotal: number
+  /** 全白金系列数（每款都白金且至少一款） */
+  perfected: number
+}
+
+export interface CareerPayload {
+  hasCredential: boolean
+  steamid: string
+  lastSyncedAt: string | null
+  playtime: {
+    totalMin: number
+    playedGames: number
+    avgMin: number
+    medianMin: number
+    maxMin: number
+    maxGame: CareerGame | null
+    over10h: number
+    over20h: number
+    over50h: number
+    over100h: number
+    over200h: number
+    idleGames: number
+    untouchedGames: number
+    /** 六档时长分布（分档文案由前端按序取 key） */
+    histogram: number[]
+  }
+  trophy: {
+    total: number
+    unlocked: number
+    rate: number
+    gamesWithAchievements: number
+    perfect: number
+    platinumRate: number
+    rareCount: number
+    rareShare: number
+    /** 已解锁成就全服占比均值（越低越硬核） */
+    avgRarity: number
+    /** 每小时解锁数 */
+    perHour: number
+    rarity: Record<RarityTier, number>
+  }
+  platinum: {
+    count: number
+    avgMin: number
+    medianMin: number
+    fastest: (CareerGame & { date: number }) | null
+    slowest: (CareerGame & { date: number }) | null
+    genres: { genre: string; count: number }[]
+    spanDays: number
+    perYear: { year: number; count: number }[]
+    firstDate: number
+    lastDate: number
+  }
+  activity: {
+    /** 稀疏日表：'YYYY-MM-DD' → 当日解锁数 */
+    days: Record<string, number>
+    firstDate: string
+    lastDate: string
+    activeDays: number
+    totalUnlocks: number
+    currentStreak: number
+    longestStreak: number
+    longestStreakEnd: number
+    busiestDay: { date: string; count: number } | null
+    hourHistogram: number[]
+    weekdayHistogram: number[]
+    /** 7×24 展开的星期×时段矩阵（星期为主序） */
+    hourWeekday: number[]
+    monthly: { month: string; count: number }[]
+    maxGapDays: number
+    nightUnlocks: number
+    morningUnlocks: number
+    dayUnlocks: number
+    eveningUnlocks: number
+    weekendUnlocks: number
+    firstUnlock: (AchievementRow & { headerImage?: string }) | null
+    spanDays: number
+  }
+  yearly: { year: number; unlocks: number; games: number; platinum: number }[]
+  taste: CareerTasteProfile
+  series: CareerSeriesPayload
+  milestones: {
+    kind: 'count' | 'rarest'
+    index: number
+    at: number
+    name: string
+    icon: string
+    gameName: string
+    appid: number
+    headerImage?: string
+    globalPercent?: number
+  }[]
+  quotes: {
+    name: string
+    text: string
+    icon: string
+    globalPercent: number | null
+    appid: number
+    gameName: string
+  }[]
+  library: {
+    valueFen: number
+    pricedGames: number
+    costPerHourFen: number
+    avgPositiveRate: number
+    topValue: (CareerGame & { priceFen: number; positiveRate: number }) | null
+  }
+  records: {
+    fastestComplete: (CareerGame & { spanMin: number; spanSec: number; fromTime: number; toTime: number; unlocks: number }) | null
+    slowestComplete: (CareerGame & { spanMin: number; spanSec: number; fromTime: number; toTime: number; unlocks: number }) | null
+    marathonDay: { date: string; count: number } | null
+    busiestHour: number
+    mostUnlocksGame: (CareerGame & { unlocked: number }) | null
+    biggestPlatinum: (CareerGame & { date: number }) | null
+  }
+  spotlight: CareerGame[]
+  /** 开了坑没拿满的游戏（feed 未完待续墙） */
+  unfinished: (CareerGame & { remaining: number })[]
+  unfinishedCount: number
+  /** 有实际时长但最后一次启动最早的那批（feed 尘封角落） */
+  dormant: (CareerGame & { lastPlayed: number })[]
+  completedGames: number
+}
+
+export const careerApi = {
+  /** 生涯全量度量（一次读取喂满全部子模块）。
+   *  默认吃 60s 时间窗缓存（聚合不便宜），只有用户点「重新推导」才绕开。 */
+  career: (fresh = false, steamid = '') =>
+    request<CareerPayload>('GET', `/achievements/career${toQuery({ steamid })}`, undefined, {
+      noCache: fresh,
+    }),
 }

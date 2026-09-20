@@ -32,6 +32,11 @@ const router = createRouter({
       meta: titleKey('nav.gamelib'),
     },
     {
+      path: '/achievements',
+      component: () => import('@/views/achievements/Index.vue'),
+      meta: titleKey('nav.achievements'),
+    },
+    {
       path: '/game/:appid',
       component: () => import('@/views/game-detail/Index.vue'),
       meta: titleKey('nav.gameDetail'),
@@ -41,7 +46,7 @@ const router = createRouter({
       component: () => import('@/views/pool/Index.vue'),
       meta: titleKey('nav.pool'),
     },
-    // 旧愿望单页 URL（书签/外链）显式迁移到监控池，避免掉进 404 兜底
+    // 旧愿望单页 URL（书签/外链）重定向到监控池，避免掉进 404 兜底
     { path: '/wishlist', redirect: '/pool' },
     {
       path: '/bundles',

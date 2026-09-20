@@ -58,6 +58,10 @@ import epicFree from './epicFree'
 import gamelib from './gamelib'
 // ── Global update modal (components/business/UpdateDialog.vue) ──
 import updateDialog from './updateDialog'
+// ── Achievement hall (views/achievements/Index.vue and DetailDrawer.vue) ──
+import achievements from './achievements'
+// ── Game career (career/ children and interleaved sections of views/achievements/) ──
+import achievementsCareer from './achievementsCareer'
 
 const messages: Partial<Record<MessageKey, string>> = {
   ...common,
@@ -95,6 +99,8 @@ const messages: Partial<Record<MessageKey, string>> = {
   ...epicFree,
   ...gamelib,
   ...updateDialog,
+  ...achievements,
+  ...achievementsCareer,
 }
 
 export default messages
