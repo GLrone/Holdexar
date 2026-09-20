@@ -375,6 +375,36 @@ async def _job_price_refresh() -> None:
         _price_cycle_busy = False
 
 
+async def _job_price_refresh_with_mails() -> None:
+    """调度器注册入口：价格网格主轮 + 链尾邮件段。
+
+    邮件段刻意放在主轮 busy 窗口**之外**——SMTP 出网最长 20s/封，不该占住
+    `_price_cycle_busy` 让 5min 修复轮空等；邮件只读库 + 发信，不与爬取争锁。
+    包装层同时把「爬取链」与「出网邮件」解耦：任何直接调用主轮函数的地方
+    （测试、诊断脚本）都只跑爬取，不会因为在跑主轮而顺手发一封真邮件。
+    """
+    await _job_price_refresh()
+    await _send_price_cycle_mails()
+
+
+async def _send_price_cycle_mails() -> None:
+    """价格网格链尾邮件段：监控池折扣速报 → 捆绑包精选（串行、逐个兜异常）。
+
+    两封各自带游标 + 20h 频率闸（同一条只有折扣进一步加深才再发），
+    邮件异常只记日志，绝不影响轮次结果。
+    """
+    from app.domains.alerts import service as alerts_service
+
+    for label, send in (
+        ("监控池折扣速报", alerts_service.check_wishlist_deals),
+        ("捆绑包精选", alerts_service.check_bundle_deals),
+    ):
+        try:
+            await send()
+        except Exception:  # noqa: BLE001
+            logger.exception("[定时] %s 发送失败（不影响轮次结果）", label)
+
+
 async def _job_fx_refresh() -> None:
     """每日 03:00 定点刷新（cron 而非 interval：interval 从启动起算，
     本地服务频繁重启时 24h 永远到不了点，自动刷新形同虚设）。
@@ -457,6 +487,15 @@ async def _job_proxy_health() -> None:
             logger.info("[定时] Clash 节点体检完成")
     except Exception:  # noqa: BLE001
         logger.exception("[定时] Clash 节点体检失败")
+
+    # 体检后判定通道健康度：全灭 / 可用占比过低才发告警（12h 冷却，
+    # 未配置任何通道视为用户选择，不告警）
+    try:
+        from app.domains.alerts import service as alerts_service
+
+        await alerts_service.check_proxy_health()
+    except Exception:  # noqa: BLE001
+        logger.exception("[定时] 代理通道告警检查失败")
 
 
 async def _job_wallet_sync() -> None:
@@ -637,22 +676,27 @@ async def _job_backup() -> None:
     try:
         result = await core_backup.create_backup()
         logger.info(
-            "[定时] 自动备份完成：%s（%.1f MB，games=%d）",
-            result["name"], result["sizeBytes"] / 1024 / 1024, result["games"],
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception("[定时] 自动备份失败")
+    except Exception as e:  # noqa: BLE001
+        # 系统告警：备份失败是「数据没有第二份」的信号，24h 冷却内只提醒一次
+        try:
+            from app.domains.alerts import service as alerts_service
 
-
-async def _job_backup_catchup() -> None:
-    """启动补备：最新备份已过期（或压根没有）才补一份。
-
-    **为什么不能直接「开机必备一份」**：`BACKUP_KEEP=5` 是「保留最近 5 份」
-    而不是「每天一份」，开机就备会让一天重启五次把 5 个位子全占满、把真正
-    有历史价值的日备挤掉。所以判据是「备份龄」而不是「是否启动过」。
-
-    延迟 5 分钟：启动期 init_db / 首轮爬取正在写库，此刻开 VACUUM INTO
-    既抢 IO 又让快照落在最没代表性的时刻（半空的库）。
+            await alerts_service.send_system_alert(
+                kind="backup",
+                title="自动备份失败",
+                summary="本轮自动备份未能完成，数据库在线快照没有生成。",
+                rows=[
+                    ("失败原因", str(e)[:180] or e.__class__.__name__),
+                    ("发生时间", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                ],
+                level="danger",
+                hint="可在「设置 → 数据」页检查备份目录剩余空间与写入权限。",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("[定时] 备份失败告警发送失败")
+    判据是「备份龄」而不是「是否启动过」：`BACKUP_KEEP=5` 是「保留最近 5 份」
+    而不是「每天一份」，不加判据会让一天重启五次把 5 个位子全占满、把真正
+    有历史价值的日备挤掉。
     """
     from app.core import backup as core_backup
 
@@ -803,15 +847,8 @@ def start_scheduler() -> None:
         return
     scheduler.add_job(_job_wishlist_sync, "interval", minutes=15, id="wishlist_sync")
     # 失败记录修复：5min 一轮，job 内部自判空闲（busy/任务表），占线即静默让路
-    scheduler.add_job(_job_price_repair, "interval", minutes=5, id="price_repair")
-    # 池价格爬取：interval 6h 只做兜底（与网格间距同宽——重锚链断裂
-    # 也不脱轨），真实节奏由 _reanchor_price_refresh 手改 next_run_time
-    # 主导（实证：job 内 modify 的排程不受触发器覆盖）
-    scheduler.add_job(
-        _job_price_refresh, "interval", hours=6, id="price_refresh",
-        next_run_time=local_next_grid()[0],
-        coalesce=True, misfire_grace_time=None,
-    )
+    # 主导（job 内 modify 的排程不受触发器覆盖）
+        _job_price_refresh_with_mails, "interval", hours=6, id="price_refresh",
     scheduler.add_job(_job_fx_refresh, "cron", hour=3, minute=0, id="fx_refresh")
     scheduler.add_job(_job_proxy_health, "interval", hours=6, id="proxy_health")
     # 订阅重拉：拍子给密一点（30min），真间隔靠 service 的 6h KV 门槛 +

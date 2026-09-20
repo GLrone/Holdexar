@@ -375,9 +375,45 @@ async def _execute(
             logger.info("排序缓存已增量刷新 %d 款", refreshed)
         except Exception:  # noqa: BLE001
             logger.exception("排序缓存刷新失败（不影响任务）")
+        try:
+            # 系列归组：仅当库里有未识别行（series_id NULL）时才全库重算，
+            # 已扫过的库这步是零成本探测
+            if await games_series.has_unassigned():
+                refreshed = await games_series.refresh_series()
+                logger.info("系列归组已刷新 %d 款", refreshed)
+        except Exception:  # noqa: BLE001
+            logger.exception("系列归组刷新失败（不影响任务）")
+        try:
+            # 永久免费自动脱池：本轮爬到 free_kind='f2p' 的游戏移出监控池
+            # （价格事实已定，留在池里只会每轮空转配额）；promo 不脱，赠送
+            # 结束前要持续跟踪
+            from app.domains.wishlist import service as wishlist_service
+
+            released = await wishlist_service.release_free_games(crawled)
+            if released:
+                logger.info("永久免费自动脱池 %d 款", released)
+        except Exception:  # noqa: BLE001
+            logger.exception("免费游戏自动脱池失败（不影响任务）")
     except Exception as e:  # noqa: BLE001
         logger.exception("任务 %d 失败", job_id)
         await _finish_job(job_id, "failed", None, str(e))
+        # 系统异常告警：任务级失败（含定时价格网格轮）带 12h 冷却发一封，
+        # 连续失败不刷屏；告警自身异常不得影响任务状态收敛
+        try:
+            await alerts_service.send_system_alert(
+                kind="crawl",
+                title="爬取任务失败",
+                summary="本轮爬取任务异常终止，涉及的条目价格本轮不会更新。",
+                rows=[
+                    ("任务 ID", str(job_id)),
+                    ("失败原因", str(e)[:180] or e.__class__.__name__),
+                    ("发生时间", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                ],
+                level="danger",
+                hint="可在「任务」页手动重跑一次；连续失败请检查代理通道与网络。",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("爬取失败告警发送失败（不影响任务状态）")
     finally:
         global _active
         if _active and _active.id == job_id:
