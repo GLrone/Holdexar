@@ -45,6 +45,7 @@ export function regionSelectOptions(
  * 币种下拉选项。
  *
  * @param codes 可选币种子集（如追踪币种白名单）；缺省 = 全量币种表
+ * @param opts.withCode 名称后附 ISO 代号（弱化等宽小字），追踪多选场景用
  *
  * value = ISO 代号（USD / JPY …），label = **当前语言**的币种名。
  *
@@ -53,11 +54,15 @@ export function regionSelectOptions(
  * 照旧包一层 `computed(() => currencySelectOptions())` 即可——`t()` 在调用期
  * 读 locale store，computed 求值时即建立依赖。
  */
-export function currencySelectOptions(codes?: string[]): HlSelectOption[] {
+export function currencySelectOptions(
+  codes?: string[],
+  opts?: { withCode?: boolean },
+): HlSelectOption[] {
   const list = codes ? CURRENCIES.filter((c) => codes.includes(c.code)) : CURRENCIES
   return list.map((c) => ({
     value: c.code,
     label: currencyName(c.code),
     flag: currencyFlagUrl(c.code),
+    meta: opts?.withCode ? c.code : undefined,
   }))
 }

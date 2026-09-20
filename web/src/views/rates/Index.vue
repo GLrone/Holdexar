@@ -17,7 +17,7 @@ import {
 } from '@/api/client'
 import { useI18n } from '@/locales'
 import { message, HlButton, HlEmpty, HlIcon, HlInput } from '@/components/ui'
-import { CURRENCIES, currencyFlagUrl, currencyIndex, currencyName } from '@/api/currencies'
+import { CURRENCIES, currencyIndex, currencyName } from '@/api/currencies'
 import { currencySelectOptions as buildCurrencyOptions } from '@/api/selectOptions'
 import {
   axisPointerStyle,
@@ -62,14 +62,15 @@ const tipPalette = useTipPalette()
 /** 画布配色（网格 / 轴 / 轴文字 / 系列色，同出口）。 */
 const palette = useChartPalette()
 
-/** 追踪多选下拉的选项源（服务端白名单全集，与 CC_LIST 同序）。
- *  走 `el-select` 而非 HlSelect（HlSelect 暂无 multiple），故不复用上面的
- *  `currencySelectOptions`——那份的 value/label/flag 结构给 el-option 用不上。 */
-const currencyOptions = CURRENCIES
-
-/** HlSelect 格式币种选项（带国旗）。
+/** 追踪多选下拉的选项源（HlSelect 格式，带国旗；服务端白名单全集，与 CC_LIST 同序）。
  *  走 `api/selectOptions.ts` 的统一出口，label 随语言（currencyName）。 */
 const currencySelectOptions = computed<HlSelectOption[]>(() => buildCurrencyOptions())
+
+/** 追踪多选专用：在统一出口上追加 ISO 代号尾注（选项行右侧弱化小字）。
+ *  只有追踪列表需要代码列——历史/换算的单选走上面的无码版本。 */
+const trackedCurrencyOptions = computed<HlSelectOption[]>(() =>
+  buildCurrencyOptions(undefined, { withCode: true }),
+)
 
 /** 自选追踪（localStorage 持久化；只影响展示，服务端始终抓取全量） */
 const trackedModel = computed({
@@ -360,25 +361,15 @@ onMounted(async () => {
 
       <div class="tracked-row">
         <span class="tracked-row__label">{{ t('rates.tracked.label') }}</span>
-        <!-- 例外：HlSelect 暂不支持 multiple+filterable+collapse-tags，待增强后替换 -->
-        <el-select
+        <HlSelect
           v-model="trackedModel"
           class="tracked-row__select"
           multiple
-          filterable
-          collapse-tags
-          collapse-tags-tooltip
-          :max-collapse-tags="8"
+          searchable
+          :max-tags="8"
+          :options="trackedCurrencyOptions"
           :placeholder="t('rates.tracked.placeholder')"
-        >
-          <el-option v-for="c in currencyOptions" :key="c.code" :value="c.code" :label="currencyName(c.code)">
-            <span class="currency-option">
-              <img :src="currencyFlagUrl(c.code)" class="currency-option__flag" alt="" />
-              <span>{{ currencyName(c.code) }}</span>
-              <span class="currency-option__code">{{ c.code }}</span>
-            </span>
-          </el-option>
-        </el-select>
+        />
       </div>
 
       <div v-if="trackedCurrencies.length" class="rate-grid">
@@ -546,26 +537,6 @@ onMounted(async () => {
 .tracked-row__select {
   flex: 1;
   min-width: 0;
-}
-
-.currency-option {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.currency-option__flag {
-  width: 18px;
-  height: 13px;
-  border-radius: 2px;
-  object-fit: cover;
-  flex-shrink: 0;
-}
-
-.currency-option__code {
-  font-size: 11px;
-  color: var(--text-muted);
-  font-family: var(--font-mono);
 }
 
 /* ─── 汇率瓦片 ─── */
