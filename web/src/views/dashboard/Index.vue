@@ -36,6 +36,8 @@ import { useRatesStore } from '@/stores/rates'
 import RegionFlag from '@/components/RegionFlag.vue'
 import CurrencyFlag from '@/components/CurrencyFlag.vue'
 import EpicFreeCards from '@/components/business/EpicFreeCards.vue'
+import HbChoiceCards from '@/components/business/HbChoiceCards.vue'
+import SteamFreeCards from '@/components/business/SteamFreeCards.vue'
 
 const router = useRouter()
 const regionsStore = useRegionsStore()
@@ -449,6 +451,12 @@ onBeforeUnmount(() => {
 
     <!-- Epic 喜加一卡片组（当期在送 + 下周预告，每小时自刷，点击直达 Epic 商店页） -->
     <EpicFreeCards />
+
+    <!-- Steam 喜加一卡片组（正在赠送中的限时免费；无赠送时整块隐藏） -->
+    <SteamFreeCards />
+
+    <!-- HB 当月包卡片（Humble Choice 本月内容，点击进站内详情，头部官方页直达） -->
+    <HbChoiceCards />
 
     <!-- 主体区域 -->
     <div class="dashboard-main">

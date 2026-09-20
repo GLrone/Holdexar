@@ -94,12 +94,8 @@ const messages: Partial<Record<MessageKey, string>> = {
   ...famContrib,
   ...famGrowth,
   ...famHeat,
-  ...currencies,
-  ...regions,
-  ...epicFree,
-  ...gamelib,
-  ...updateDialog,
-  ...achievements,
+  ...steamFree,
+  ...hbChoice,
   ...achievementsCareer,
 }
 

@@ -38,6 +38,18 @@ async def refresh_hb_choice() -> dict:
     return await service.refresh_hb_choice()
 
 
+@router.get("/hb/offers")
+async def hb_choice_offers() -> dict:
+    """当月 HB Choice 游戏清单（仪表盘卡片数据源，纯本地库零外网）。"""
+    return await service.hb_choice_offers()
+
+
+@router.get("/steam/offers")
+async def steam_free_offers() -> dict:
+    """正在赠送中的 Steam 限时免费清单（仪表盘卡片数据源，纯本地库零外网）。"""
+    return await service.steam_free_offers()
+
+
 class EpicListItem(BaseModel):
     appid: int = Field(description="Steam AppID（数字或数字字符串）")
     free_start: str | None = Field(
