@@ -57,6 +57,10 @@ import epicFree from './epicFree'
 import gamelib from './gamelib'
 // ── 全局更新弹窗（components/business/UpdateDialog.vue）──
 import updateDialog from './updateDialog'
+// ── 成就殿堂（views/achievements/Index.vue 与 DetailDrawer.vue）──
+import achievements from './achievements'
+// ── 游戏生涯（views/achievements/ 的 career/ 子模块与穿插分节）──
+import achievementsCareer from './achievementsCareer'
 
 /** 全量中文词典 */
 export const messages = {
@@ -95,6 +99,8 @@ export const messages = {
   ...epicFree,
   ...gamelib,
   ...updateDialog,
+  ...achievements,
+  ...achievementsCareer,
 } as const
 
 export type MessageKey = keyof typeof messages

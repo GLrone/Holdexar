@@ -20,6 +20,7 @@ const shell = {
   'nav.dashboard': '仪表盘',
   'nav.library': '游戏商店',
   'nav.gamelib': '游戏库',
+  'nav.achievements': '成就殿堂',
   'nav.bundles': '捆绑包',
   'nav.pool': '监控池',
   'nav.family': '我的家庭组',

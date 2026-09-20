@@ -14,6 +14,7 @@ const shell: Partial<Record<MessageKey, string>> = {
   'nav.dashboard': 'Dashboard',
   'nav.library': 'Store',
   'nav.gamelib': 'Game Library',
+  'nav.achievements': 'Achievements',
   'nav.bundles': 'Bundles',
   'nav.pool': 'Watch pool',
   'nav.family': 'Family',
