@@ -24,7 +24,29 @@ const bundles: Partial<Record<MessageKey, string>> = {
   'bundles.head.total': '{n} bundles',
   'bundles.head.completable': '· {n} completable',
   'bundles.empty.noData': 'No bundle data',
+  'bundles.empty.noMatch': 'No matching bundles',
+  'bundles.nav.search': 'Search bundles… (Enter)',
   'bundles.list.loadMore': 'Load more ({n} remaining)',
+
+  /* Region dimension (diff re-anchored to the selected region) */
+  'bundles.regionMode.all': 'All',
+  'bundles.regionMode.cheaper': 'Cheaper there',
+  'bundles.regionMode.locked': 'Unavailable there',
+
+  /* Advanced filter (only dimensions with a bundle data source) */
+  'bundles.filter.section.basic': 'Purchase shape',
+  'bundles.filter.completableOnly': 'Completable only (no forced full set)',
+  'bundles.filter.cnLowestOnly': 'CN is lowest',
+  'bundles.filter.section.ownership': 'Ownership match',
+  'bundles.filter.hideOwned': 'Hide owned',
+  'bundles.filter.hideFamily': 'Hide family-shared',
+  'bundles.filter.section.price': 'Price (CN)',
+  'bundles.filter.price': 'CN price',
+  'bundles.filter.diffMinLabel': 'Min diff',
+  'bundles.filter.min': 'min',
+  'bundles.filter.max': 'max',
+  'bundles.filter.cny': '¥',
+  'bundles.filter.diffMinRegionHint': 'Region selected: measured against that region',
 
   /* Ownership badge on the cover */
   'bundles.badge.me': 'Me',

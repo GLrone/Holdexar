@@ -180,7 +180,10 @@ class Bundle(Base):
     # server_default：与 _TABLE_EXTRA_COLUMNS 的存量库 ALTER 口径一致，
     # 原始 SQL 插行（历史导入/迁移脚本）省略该列时也拿得到默认值
     diff_fen: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # smart 排序评分（0~1，refresh_bundle_sort_cache 维护；NULL=未计算）。
+    # 公式对齐 games/scoring.py 四因子：省钱(包差价)+质量(成员游戏评测)+
     # 时机(限时叠加促销)+熟悉度(成员游戏评测规模)
+    smart_score: Mapped[float | None] = mapped_column(Float)
     url: Mapped[str | None] = mapped_column(String(1024))
     app_ids: Mapped[list | None] = mapped_column(JSON, default=list)  # 包含的 Steam AppID 列表
     view_count: Mapped[int] = mapped_column(Integer, default=0)

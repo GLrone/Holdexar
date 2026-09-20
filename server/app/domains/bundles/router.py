@@ -4,7 +4,7 @@
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 
 from . import refresh, service
@@ -13,14 +13,17 @@ router = APIRouter(prefix="/bundles", tags=["bundles"])
 
 
 @router.get("")
-async def list_bundles():
-    """全量捆绑包（差价降序）。
+async def list_bundles(sort: str = Query("diff")):
+    """全量捆绑包列表。
 
-    返回服务端**预序列化**的 JSON（见 service.list_bundles_json）：15k 条
-    聚合结果的重复编码是每次请求 2s 级开销，编码结果随缓存指纹复用。
+    sort=diff（默认，差价降序）| smart（智能评分降序——games 商店同款四因子：
+    差价省钱 + 成员游戏质量 + 限时促销 + 评测规模，服务端预计算列）。
+    未知排序值回落 diff。返回服务端**预序列化**的 JSON（见
+    service.list_bundles_json）：15k 条聚合结果的重复编码是每次请求 2s 级
+    开销，编码结果随缓存指纹复用（按排序分槽）。
     """
     return Response(
-        content=await service.list_bundles_json(),
+        content=await service.list_bundles_json(sort),
         media_type="application/json",
     )
 

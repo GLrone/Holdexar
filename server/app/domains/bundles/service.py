@@ -1,14 +1,16 @@
 """捆绑包域服务：列表聚合 + 详情（补齐计算数据源）+ 排序快照维护。
 
 聚合语义：按 bundle_id 分组区域价 → 双产品隔离 → 追踪区过滤 → 以 app_ids
-最多的区为基准推算各区锁区游戏数；最低价/差价一律读 bundles 排序快照
-（min_cny_fen/diff_fen/is_lowest，由 refresh_bundle_sort_cache 在写时维护，
-与 games 的 refresh_sort_cache 同构）。
+最多的区为基准推算各区锁区游戏数；最低价/差价/smart 评分一律读 bundles
+排序快照（min_cny_fen/diff_fen/is_lowest/smart_score，由
+refresh_bundle_sort_cache 在写时维护，与 games 的 refresh_sort_cache 同构）。
 
 分层约束（排序快照 ≠ 请求期计算）：
 - 数据采集层：bundle_region_prices 原始价 + cny_fen（爬取/导入落库）；
-- 派生计算层：refresh_bundle_sort_cache → bundles.min_cny_fen/diff_fen/is_lowest；
-- 查询层：WHERE + ORDER BY diff_fen + LIMIT（SQL，见 _load_all_locked）。
+- 派生计算层：refresh_bundle_sort_cache →
+  bundles.min_cny_fen/diff_fen/is_lowest/smart_score；
+- 查询层：WHERE + ORDER BY（diff_fen | smart_score，排序参数）+ LIMIT
+  （SQL，见 _load_all_locked）。
 **任何 GET 不得现算排序所依赖的派生值**（GET → calculate cny / lowest /
 diff、Python sort 都视为架构倒退）；展示层的 lowestRegion/lowestCnyFen
 只是对快照的查表（全区最低 = min(国区价, 非国区最低快照)）。
@@ -33,6 +35,15 @@ from app.domains.games.pricing import (
     build_steam_header_url,
     format_minor_units,
 )
+from app.domains.games.scoring import (
+    W_FAMILIARITY,
+    W_QUALITY,
+    W_SAVE,
+    W_TIMING,
+    familiarity_score,
+    quality_score,
+    save_score,
+)
 from app.domains.games.service import get_rates
 
 # Steam 图片 CDN 三域同库：akamai 域国内直连可达（fastly 被墙/不稳定，
@@ -53,11 +64,22 @@ _IMG_CDN_REPLACEMENT = "https://shared.akamai.steamstatic.com"
 # 自动重算——两者都会改变聚合结果，且都是运行时可变的用户可见状态，不能只
 # 靠写失效）。
 # _LIST_JSON_CACHE 是列表的**预序列化 bytes**：FastAPI 的 dict 返回路径每次
-# 请求都要重跑 jsonable_encoder + JSON 编码（15k 条实测 2s 级），而两次请求
-# 之间内容并不变——编码一次、按指纹复用。三份缓存同源同失效、指纹一致。
+# 请求都要重跑 jsonable_encoder + JSON 编码（15k 条 2s 级），而两次请求
+# 之间内容并不变——编码一次、按指纹复用。三份缓存同源同失效、指纹一致；
+# 数据/列表缓存按 (指纹, 排序参数) 分键（smart/diff 各一份），JSON 缓存按
+# 键分槽（dict），切换排序不重复编码。
 _DATA_CACHE: tuple[tuple, tuple[list, dict[int, list], dict[str, float]]] | None = None
 _LIST_CACHE: tuple[tuple, list[dict]] | None = None
-_LIST_JSON_CACHE: tuple[tuple, bytes] | None = None
+_LIST_JSON_CACHE: dict[tuple, bytes] = {}
+
+# 列表排序参数（bundle 排序快照列）：diff = 差价降序（历史默认），
+# smart = 智能评分降序（games 商店同款四因子，见 _bundle_smart_score）
+_SORTS = ("diff", "smart")
+
+
+def _normalize_sort(sort: str | None) -> str:
+    """列表排序参数归一：仅接受 smart，其余（含空/未知）一律回落 diff。"""
+    return "smart" if sort == "smart" else "diff"
 
 # 并发互斥：启动预热与用户请求会在「缓存未建」时同时进来（页面开得比预热快
 # 是常态），没有锁就各自全量重算一遍（装载秒级 + 聚合秒级 ×2）。双检锁
@@ -79,14 +101,14 @@ def _list_fp(tracked: set[str] | None, rates: dict[str, float]) -> tuple:
 
 def invalidate_bundles_cache() -> None:
     """捆绑包数据变更后调用（refresh / import / 爬虫补包共用写入口已挂）。"""
-    global _DATA_CACHE, _LIST_CACHE, _LIST_JSON_CACHE
+    global _DATA_CACHE, _LIST_CACHE
     _DATA_CACHE = None
     _LIST_CACHE = None
-    _LIST_JSON_CACHE = None
+    _LIST_JSON_CACHE.clear()
 
 
 def _normalize_image(url: str | None) -> str | None:
-    """图片 CDN 域归一化：fastly/queniuqe → akamai（路径不变，实测同图可达）。"""
+    """图片 CDN 域归一化：fastly/queniuqe → akamai（路径不变，同图可达）。"""
     if not url:
         return None
     return _IMG_CDN_HOSTS.sub(_IMG_CDN_REPLACEMENT, url)
@@ -286,27 +308,74 @@ def _aggregate(
         "lowestRegion": lowest_code,
         "lowestCnyFen": lowest_cny_fen,
         "diffFen": int(bundle.diff_fen or 0),
+        # smart 评分随载荷下发：前端选区时用「save(该区差价) + 评分余量」做
+        # 地区重锚排序（余量 = 评分 − save(快照差价)，与地区无关的三因子和）
+        "smartScore": float(bundle.smart_score or 0.0),
     }
 
 
-# ── 排序快照（bundles.min_cny_fen/diff_fen/is_lowest）────────────────────
+# ── 排序快照（bundles.min_cny_fen/diff_fen/is_lowest/smart_score）────────
 # 铁律：排序所依赖的派生值一律在写时算好（本函数组），任何 GET 只读快照。
 _SNAPSHOT_TOLERANCE_FEN = 500  # 「国区 ≈ 追踪区最低」容差（±5 元，对齐 games isLowest）
 _SNAPSHOT_BATCH = 400  # 回写批量（SQLite 绑定变量上限内）
 
 
+def _bundle_smart_score(
+    diff_fen: int,
+    baseline_appids: list[int],
+    region_prices: dict[str, dict],
+    review_stats: dict[int, tuple[int | None, int | None]],
+) -> float:
+    """捆绑包 smart 评分（0~1）：四因子复刻 games/scoring.py，权重同构。
+
+    - S_save        = save_score(diff_fen)，同公式：外区相对国区的折算差价，
+                      对数压缩、¥200 封顶；
+    - S_quality     = 成员游戏质量均值（SteamDB 置信度收缩同公式）；
+                      无成员入库数据 = 0.5 中性（同游戏「无评测非差评」口径）；
+    - S_timing      = 限时叠加促销 1.0 / 常态 0。捆绑包无史低跟踪，促销信号 =
+                      现折扣超过结构化基础档（discount_percent >
+                      bundle_base_discount，Steam 促销期在档位折扣上额外叠加），
+                      促销中即最佳购买时机，不做分档；
+    - S_familiarity = 成员游戏评测规模均值（log10，10 万封顶，轻权重）。
+    """
+    s_save = save_score(diff_fen)
+    rated = [review_stats[a] for a in baseline_appids if a in review_stats]
+    if rated:
+        s_quality = sum(quality_score(p, n) for p, n in rated) / len(rated)
+        s_familiarity = sum(familiarity_score(n) for _, n in rated) / len(rated)
+    else:
+        s_quality, s_familiarity = 0.5, 0.0
+    promo = any(
+        rp["discountPercent"] > rp["baseDiscount"]
+        for rp in region_prices.values()
+        if rp["cnyFen"] is not None
+    )
+    s_timing = 1.0 if promo else 0.0
+    return (
+        W_SAVE * s_save
+        + W_QUALITY * s_quality
+        + W_TIMING * s_timing
+        + W_FAMILIARITY * s_familiarity
+    )
+
+
 def _snapshot_values(
-    bundle: Bundle, price_rows: list, tracked: set[str] | None
-) -> tuple[int | None, int, bool]:
-    """单包排序快照：min_cny_fen / diff_fen / is_lowest。
+    bundle: Bundle,
+    price_rows: list,
+    tracked: set[str] | None,
+    review_stats: dict[int, tuple[int | None, int | None]],
+) -> tuple[int | None, int, bool, list[int], float]:
+    """单包排序快照：min_cny_fen / diff_fen / is_lowest / 基准 appids / smart_score。
 
     与列表展示严格同源（_family_region_prices：双产品隔离 + 追踪区过滤）：
     - min_cny_fen = 非 CN 各区有价行最低 CNY 分（原始值，无则 NULL）；
     - diff_fen = MAX(国区价 − COALESCE(最低, 国区价), 0)（无国区价 = 0）；
     - is_lowest = 国区价 ≈ 追踪区最低（±5 元）——国区买即（近似）全球最低，
-      判据对齐 games 的 isLowest 筛选语义；无国区价（锁区/无数据）恒 False。
+      判据对齐 games 的 isLowest 筛选语义；无国区价（锁区/无数据）恒 False；
+    - smart_score = _bundle_smart_score（成员游戏 = 基准 appids 与 games 表
+      的交集，评测数据由 refresh 调用方一次装载传入）。
     """
-    region_prices, _ = _family_region_prices(bundle, price_rows, tracked)
+    region_prices, baseline_appids = _family_region_prices(bundle, price_rows, tracked)
     others = [
         rp["cnyFen"]
         for code, rp in region_prices.items()
@@ -315,21 +384,35 @@ def _snapshot_values(
     min_cny_fen = min(others) if others else None
     cn_cny_fen = region_prices.get("CN", {}).get("cnyFen")
     if cn_cny_fen is None:
-        return min_cny_fen, 0, False
+        return (
+            min_cny_fen,
+            0,
+            False,
+            baseline_appids,
+            _bundle_smart_score(0, baseline_appids, region_prices, review_stats),
+        )
     reference = min_cny_fen if min_cny_fen is not None else cn_cny_fen
     diff_fen = max(cn_cny_fen - reference, 0)
     is_lowest = reference >= cn_cny_fen - _SNAPSHOT_TOLERANCE_FEN
-    return min_cny_fen, diff_fen, is_lowest
+    return (
+        min_cny_fen,
+        diff_fen,
+        is_lowest,
+        baseline_appids,
+        _bundle_smart_score(diff_fen, baseline_appids, region_prices, review_stats),
+    )
 
 
 async def refresh_bundle_sort_cache(
     bundle_ids: list[int] | None = None, *, session: AsyncSession | None = None
 ) -> int:
-    """重算 bundles.min_cny_fen / diff_fen / is_lowest（列表排序快照）。
+    """重算 bundles.min_cny_fen / diff_fen / is_lowest / smart_score（列表排序快照）。
 
     bundle_ids=None 全库（启动 / 汇率变更 / 追踪区变更）；列表 = 增量
     （刷新链尾 / 单包导入）。口径同列表聚合（双产品隔离 + 追踪区过滤）——
     追踪区集合变化会改变最低价所在区，故追踪区变更必须整库重建。
+    smart_score 因子（成员游戏评测）随追踪区无关，但与 min/diff 同事务写入，
+    不做增量拆分。
 
     session 注入时不自行提交：汇率原子刷新用它把「汇率 → cny_fen →
     games sort → bundles sort」串进同一事务，GET 只可能读到旧快照或新快照。
@@ -378,45 +461,65 @@ async def _refresh_bundle_sort_cache(
         by_bundle.setdefault(p.bundle_id, []).append(p)
 
     tracked = await _tracked_region_codes()
+    # smart 评分的成员游戏评测数据：全表三列一次装载（后台重活，与 14.1 万行
+    # 价格装载同量级），逐包按基准 appids 查表
+    stat_rows = (
+        await db.execute(select(Game.appid, Game.positive_rate, Game.review_count))
+    ).all()
+    review_stats = {r.appid: (r.positive_rate, r.review_count) for r in stat_rows}
     updates = []
     for b in bundles:
-        min_fen, diff_fen, is_lowest = _snapshot_values(
-            b, by_bundle.get(b.bundle_id, []), tracked
+        min_fen, diff_fen, is_lowest, _baseline, smart = _snapshot_values(
+            b, by_bundle.get(b.bundle_id, []), tracked, review_stats
         )
         updates.append(
-            {"b": b.bundle_id, "m": min_fen, "d": diff_fen, "l": 1 if is_lowest else 0}
+            {
+                "b": b.bundle_id,
+                "m": min_fen,
+                "d": diff_fen,
+                "l": 1 if is_lowest else 0,
+                "s": smart,
+            }
         )
 
     sql = text(
-        "UPDATE bundles SET min_cny_fen = :m, diff_fen = :d, is_lowest = :l "
-        "WHERE bundle_id = :b"
+        "UPDATE bundles SET min_cny_fen = :m, diff_fen = :d, is_lowest = :l, "
+        "smart_score = :s WHERE bundle_id = :b"
     )
     for i in range(0, len(updates), _SNAPSHOT_BATCH):
         await db.execute(sql, updates[i : i + _SNAPSHOT_BATCH])
     return len(updates)
 
 
-async def _load_all() -> tuple[list, dict[int, list], dict[str, float]]:
+async def _load_all(sort: str = "diff") -> tuple[list, dict[int, list], dict[str, float]]:
+    sort = _normalize_sort(sort)
     global _DATA_CACHE
     rates = await get_rates()
     fp = _rates_fp(rates)
-    if _DATA_CACHE is not None and _DATA_CACHE[0] == fp:
+    key = (fp, sort)
+    if _DATA_CACHE is not None and _DATA_CACHE[0] == key:
         return _DATA_CACHE[1]
     async with _DATA_LOCK:
         # 双检：等锁期间别的协程可能已经建好
-        if _DATA_CACHE is not None and _DATA_CACHE[0] == fp:
+        if _DATA_CACHE is not None and _DATA_CACHE[0] == key:
             return _DATA_CACHE[1]
-        return await _load_all_locked(fp, rates)
+        return await _load_all_locked(key, rates, sort)
 
 
 async def _load_all_locked(
-    fp: tuple, rates: dict[str, float]
+    key: tuple, rates: dict[str, float], sort: str
 ) -> tuple[list, dict[int, list], dict[str, float]]:
     global _DATA_CACHE
     # Core 列查询（不构造 ORM 实体）：14.1 万行价格装载从 2.2s 降到亚秒级——
     # identity map 与实体构造对只读行是纯开销（这些行从不回写）。
-    # 排序在 SQL 层完成（ORDER BY 排序快照列 diff_fen DESC）——GET 不做
-    # Python sort；等价 id 序（bundle_id）保证同差价时分页/缓存稳定。
+    # 排序在 SQL 层完成（ORDER BY 排序快照列：diff_fen | smart_score DESC，
+    # 排序参数决定；smart_score NULL 排尾部——快照未重建的行不冒充前排）——
+    # GET 不做 Python sort；等价 id 序（bundle_id）保证同分/同差价时分页/缓存稳定。
+    order_by = (
+        (Bundle.smart_score.desc(), Bundle.bundle_id.asc())
+        if sort == "smart"
+        else (Bundle.diff_fen.desc(), Bundle.bundle_id.asc())
+    )
     async with get_session_factory()() as session:
         bundles = (
             await session.execute(
@@ -429,7 +532,8 @@ async def _load_all_locked(
                     Bundle.url,
                     Bundle.min_cny_fen,
                     Bundle.diff_fen,
-                ).order_by(Bundle.diff_fen.desc(), Bundle.bundle_id.asc())
+                    Bundle.smart_score,
+                ).order_by(*order_by)
             )
         ).all()
         price_rows = (
@@ -450,7 +554,7 @@ async def _load_all_locked(
     prices_by_bundle: dict[int, list] = {}
     for p in price_rows:
         prices_by_bundle.setdefault(p.bundle_id, []).append(p)
-    _DATA_CACHE = (fp, (bundles, prices_by_bundle, rates))
+    _DATA_CACHE = (key, (bundles, prices_by_bundle, rates))
     return _DATA_CACHE[1]
 
 
@@ -467,56 +571,70 @@ def _build_list_items(bundles, prices_by_bundle, tracked) -> list[dict]:
     return [i for i in items if i["regionPrices"]]
 
 
-async def list_bundles() -> list[dict]:
-    """全量捆绑包列表（差价降序）。
+async def list_bundles(sort: str = "diff") -> list[dict]:
+    """全量捆绑包列表（sort=diff 差价降序 | smart 评分降序）。
 
     区域价/最低价/差价按追踪区（crawl_regions 启用集）过滤——
     未启用任何区时全量展示（对齐游戏卡 GPW 语义）。
     聚合结果缓存（失效见 invalidate_bundles_cache + 汇率/追踪区指纹）；
     返回的是缓存对象，调用方只读（无改写方）。
     """
+    sort = _normalize_sort(sort)
     global _LIST_CACHE
     tracked = await _tracked_region_codes()
-    bundles, prices_by_bundle, rates = await _load_all()
+    bundles, prices_by_bundle, rates = await _load_all(sort)
     # tracked=None 是合法语义（未启用任何区 = 全量展示），指纹按空集归一
     fp = _list_fp(tracked, rates)
-    if _LIST_CACHE is not None and _LIST_CACHE[0] == fp:
+    key = (fp, sort)
+    if _LIST_CACHE is not None and _LIST_CACHE[0] == key:
         return _LIST_CACHE[1]
     async with _LIST_LOCK:
         # 双检：等锁期间（预热/并发请求）可能已经建好
-        if _LIST_CACHE is not None and _LIST_CACHE[0] == fp:
+        if _LIST_CACHE is not None and _LIST_CACHE[0] == key:
             return _LIST_CACHE[1]
         items = _build_list_items(bundles, prices_by_bundle, tracked)
-        _LIST_CACHE = (fp, items)
+        _LIST_CACHE = (key, items)
         return items
 
 
-async def list_bundles_json() -> bytes:
+async def list_bundles_json(sort: str = "diff") -> bytes:
     """列表的预序列化 UTF-8 JSON（路由出口用），内容与 list_bundles() 等值。
 
     差别只在**只编码一次**：FastAPI 对 dict 返回值每次请求都要重跑
-    jsonable_encoder + JSON 编码（15k 条聚合结果实测 2s 级），而列表内容
+    jsonable_encoder + JSON 编码（15k 条聚合结果 2s 级），而列表内容
     只在数据/汇率/追踪区变化时变——聚合与编码都按同一指纹缓存。
+    按排序分槽（dict）：smart/diff 两份共存，切换排序不再重复编码。
     """
-    global _LIST_JSON_CACHE
-    items = await list_bundles()
-    fp = _LIST_CACHE[0] if _LIST_CACHE is not None else ()
-    if _LIST_JSON_CACHE is not None and _LIST_JSON_CACHE[0] == fp:
-        return _LIST_JSON_CACHE[1]
-    payload = json.dumps(
+    sort = _normalize_sort(sort)
+    items = await list_bundles(sort)
+    key = _LIST_CACHE[0] if _LIST_CACHE is not None else None
+    # key 与本次排序不一致 = 并发请求刚切走了 _LIST_CACHE（内容正确但不缓存，
+    # 等 key 归位的那次请求补上编码缓存）
+    if key is not None and key[1] == sort:
+        cached = _LIST_JSON_CACHE.get(key)
+        if cached is not None:
+            return cached
+        payload = json.dumps(
+            {"bundles": items}, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        _LIST_JSON_CACHE[key] = payload
+        return payload
+    return json.dumps(
         {"bundles": items}, ensure_ascii=False, separators=(",", ":")
     ).encode("utf-8")
-    _LIST_JSON_CACHE = (fp, payload)
-    return payload
 
 
 async def warmup() -> int:
     """启动链预热（后台）：把首次全量聚合 + 序列化的秒级成本挪到开门之后。
 
-    返回预序列化载荷字节数（日志用）。调用方兜异常——预热失败只会让
-    用户首次进捆绑包页重新等一次聚合，不影响功能。
+    smart / diff 两种排序各暖一份（页内切换排序零等待）。返回预序列化
+    载荷总字节数（日志用）。调用方兜异常——预热失败只会让用户首次进
+    捆绑包页重新等一次聚合，不影响功能。
     """
-    return len(await list_bundles_json())
+    total = 0
+    for sort in _SORTS:
+        total += len(await list_bundles_json(sort))
+    return total
 
 
 async def get_bundle_detail(bundle_id: int) -> dict | None:
@@ -526,7 +644,8 @@ async def get_bundle_detail(bundle_id: int) -> dict | None:
     cny_fen（price_status=ok）。游戏未入库（games 表无行）时 name 为 None，
     前端回退 AppID 展示，且计算器按既定规则将无数据项自动排除。
     """
-    bundles, prices_by_bundle, _rates = await _load_all()
+    # 详情按 id 查表，与列表排序无关；固定走 diff 缓存（default 槽）
+    bundles, prices_by_bundle, _rates = await _load_all("diff")
     bundle = next((b for b in bundles if b.bundle_id == bundle_id), None)
     if bundle is None:
         return None

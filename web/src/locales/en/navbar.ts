@@ -17,7 +17,7 @@ const navbar: Partial<Record<MessageKey, string>> = {
   'navbar.region.locked': 'Region-locked',
 
   /* Region dropdown options */
-  'navbar.regionOption.allLowest': 'Lowest worldwide (auto FX)',
+  'navbar.regionOption.allLowest': 'Lowest worldwide',
   'navbar.regionOption.cn': 'China',
   'navbar.regionOption.locked': '🔒 Region-locked games',
 

@@ -13,11 +13,11 @@
  * 载体差异：PC 悬浮 popover / 移动端内联展开统一为非模态
  * HlDrawer（底层可交互，符合收口红线）；三级弹窗统一 HlDialog。
  */
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import { bundlesApi, ownershipApi, type BundleDetail, type BundleGame, type BundleSummary, type OwnershipInfo } from '@/api/client'
 import { regionSelectOptions } from '@/api/selectOptions'
-import { HlButton, HlDialog, HlDrawer, HlSelect, HlSkeleton } from '@/components/ui'
+import { HlButton, HlCheckbox, HlDialog, HlDrawer, HlSelect, HlSkeleton } from '@/components/ui'
 import RegionFlag from '@/components/RegionFlag.vue'
 import {
   autoExcludedAppIds,
@@ -36,8 +36,9 @@ import {
 } from '@/lib/assetCache'
 import { computeGiftingAnalysis, type GiftingAnalysis, type RegionPriceInfo } from '@/lib/gifting'
 import { vStagger } from '@/lib/stagger'
-import { useI18n } from '@/locales'
+import { useI18n, type MessageKey } from '@/locales'
 import { useRegionsStore } from '@/stores/regions'
+import { APP_SLUG } from '@/appInfo'
 
 const regionsStore = useRegionsStore()
 const { t } = useI18n()
@@ -50,18 +51,261 @@ const errorMsg = ref('')
 const ownershipMap = ref<Record<number, OwnershipInfo>>({})
 const ownershipByBid = ref<Record<number, ReturnType<typeof inferBundleOwnership>>>({})
 
+// ─── 导航栏（对齐游戏商店形态：搜索 + 排序下拉 + 地区维度 + 高级筛选 + 统计）───
+// 排序走服务端预计算列（smart=智能评分 / diff=差价）；搜索按包名前端过滤。
+// 无手动刷新键：路由切走再回来 onMounted 必然重新拉取，常驻刷新键无意义。
+type BundleSortKey = 'smart' | 'diff' | 'discount'
+const sortBy = ref<BundleSortKey>(
+  localStorage.getItem(`${APP_SLUG}.bundles.sort`) === 'diff' ? 'diff' : 'smart',
+)
+const showSortMenu = ref(false)
+const sortRef = ref<HTMLElement | null>(null)
+/* 常量只存词条 key：t() 在模块求值时算一次会把语言冻死，模板里现取 */
+const sortOptions: { key: BundleSortKey; labelKey: MessageKey }[] = [
+  { key: 'smart', labelKey: 'navbar.sort.smart' },
+  { key: 'diff', labelKey: 'navbar.sort.priceDiff' },
+  { key: 'discount', labelKey: 'navbar.sort.discount' },
+]
+const currentSortLabel = computed(
+  () => t(sortOptions.find((o) => o.key === sortBy.value)?.labelKey ?? 'navbar.sort.smart'),
+)
+
+const searchInput = ref('')
+const committedSearch = ref('')
+
+// ─── 地区维度：选区后差价重新锚定到该区（国区价 − 该区 cnyFen）。
+// 列表载荷自带全区 cnyFen，锚定换算/过滤在前端做，无需新快照列；
+// smart 评分保持服务端序——评分是「国区对全区最低」视角，与所选地区无关，
+// 与 games 商店「smart 不挂地区前缀」同一取舍。
+// 地区维度是**视图态不持久化**：切走再回来一律回默认（全区最低/全部）。
+type RegionMode = 'all' | 'cheaper' | 'locked'
+const region = ref('')
+const regionMode = ref<RegionMode>('all')
+/* 选项走 selectOptions 统一出口（旗帜由出口挂载，视图层不直连 flagUrl） */
+const regionOptions = computed(() => [
+  { value: '', label: t('navbar.regionOption.allLowest'), flag: undefined as string | undefined },
+  ...regionSelectOptions(regionsStore.enabledCodes.map((c) => c.toUpperCase())),
+])
+const activeRegionMeta = computed(() => regionOptions.value.find((o) => o.value === region.value))
+const regionLabel = computed(() => activeRegionMeta.value?.label ?? t('navbar.regionOption.allLowest'))
+const showRegionMenu = ref(false)
+const regionRef = ref<HTMLElement | null>(null)
+const regionModes: { key: RegionMode; labelKey: MessageKey }[] = [
+  { key: 'all', labelKey: 'bundles.regionMode.all' },
+  { key: 'cheaper', labelKey: 'bundles.regionMode.cheaper' },
+  { key: 'locked', labelKey: 'bundles.regionMode.locked' },
+]
+
+function selectRegion(code: string) {
+  showRegionMenu.value = false
+  if (code === region.value) return
+  region.value = code
+  renderLimit.value = RENDER_STEP
+  // 进地区维度即回顶：工具栏是吸顶层（z-index 9000），滚动中途选区会把它
+  // 钉在当前视口上、盖住正下方的卡片行（与游戏商店选排序回顶同一语义）
+  ;(document.querySelector('.view-container') as HTMLElement | null)?.scrollTo({
+    top: 0,
+    behavior: 'smooth',
+  })
+}
+
+function selectRegionMode(mode: RegionMode) {
+  regionMode.value = mode
+  renderLimit.value = RENDER_STEP
+}
+
+// ─── 高级筛选（复刻可实现的维度）：可补齐 / 国区最低 / 隐藏已拥有 /
+// 家庭共享 / 国区价格区间 / 差价下限（选区时锚定该区差价）。持久化 localStorage。 ───
+interface BundleFilters {
+  completableOnly: boolean
+  cnLowestOnly: boolean
+  hideOwned: boolean
+  hideFamily: boolean
+  priceMin: string
+  priceMax: string
+  diffMin: string
+}
+const DEFAULT_FILTERS: BundleFilters = {
+  completableOnly: false,
+  cnLowestOnly: false,
+  hideOwned: false,
+  hideFamily: false,
+  priceMin: '',
+  priceMax: '',
+  diffMin: '',
+}
+function loadFilters(): BundleFilters {
+  try {
+    return { ...DEFAULT_FILTERS, ...JSON.parse(localStorage.getItem(`${APP_SLUG}.bundles.filters`) ?? '{}') }
+  } catch {
+    return { ...DEFAULT_FILTERS }
+  }
+}
+const filters = ref<BundleFilters>(loadFilters())
+const filterOpen = ref(false)
+watch(
+  filters,
+  (v) => localStorage.setItem(`${APP_SLUG}.bundles.filters`, JSON.stringify(v)),
+  { deep: true },
+)
+const activeFilterCount = computed(() => {
+  const f = filters.value
+  const numeric = (s: string) => s !== '' && Number.isFinite(Number(s))
+  return (
+    (f.completableOnly ? 1 : 0) +
+    (f.cnLowestOnly ? 1 : 0) +
+    (f.hideOwned ? 1 : 0) +
+    (f.hideFamily ? 1 : 0) +
+    (numeric(f.priceMin) ? 1 : 0) +
+    (numeric(f.priceMax) ? 1 : 0) +
+    (numeric(f.diffMin) ? 1 : 0)
+  )
+})
+function setFilter<K extends keyof BundleFilters>(key: K, value: BundleFilters[K]) {
+  filters.value = { ...filters.value, [key]: value }
+  renderLimit.value = RENDER_STEP
+}
+function resetFilters() {
+  filters.value = { ...DEFAULT_FILTERS }
+  renderLimit.value = RENDER_STEP
+}
+
 // ─── 分批渲染：3,386 张卡片一次性挂载是页面打开慢的另一主因（数据接口
 // 已有服务端缓存），先渲 RENDER_STEP 张、点按钮续批。筛选/排序仍在全量
 // bundles 上做（纯 JS，微秒级），只有 DOM 挂载分批。───
 const RENDER_STEP = 120
 const renderLimit = ref(RENDER_STEP)
-const visibleBundles = computed(() => bundles.value.slice(0, renderLimit.value))
+/** 展示管道：地区锚定换算 → 地区模式过滤 → 高级筛选 → 选区 diff 排序时
+   按该区差价前端重排 → 搜索过滤 → 分批渲染切片 */
+const enrichedBundles = computed(() =>
+  bundles.value.map((b) => {
+    let regionDiff: number | null = null
+    let regionLocked = false
+    const code = region.value.toUpperCase()
+    if (code) {
+      const rp = b.regionPrices[code]
+      if (!rp || rp.cnyFen == null) regionLocked = true
+      else if (b.cnCnyFen != null) regionDiff = b.cnCnyFen - rp.cnyFen
+    }
+    return { b, regionDiff, regionLocked }
+  }),
+)
+const filteredBundles = computed(() => {
+  let rows = enrichedBundles.value
+  const code = region.value.toUpperCase()
+  if (code && regionMode.value === 'cheaper') {
+    rows = rows.filter((r) => r.regionDiff != null && r.regionDiff > 0)
+  } else if (code && regionMode.value === 'locked') {
+    rows = rows.filter((r) => r.regionLocked)
+  }
+  const f = filters.value
+  if (f.completableOnly) rows = rows.filter((r) => r.b.mustPurchaseAsSet === 0)
+  if (f.cnLowestOnly) rows = rows.filter((r) => r.b.lowestRegion === 'cn')
+  const own = ownershipByBid.value
+  if (f.hideOwned) rows = rows.filter((r) => own[r.b.bundleId]?.type !== 'owned')
+  if (f.hideFamily) rows = rows.filter((r) => own[r.b.bundleId]?.type !== 'family')
+  const numeric = (s: string) => (s !== '' && Number.isFinite(Number(s)) ? Number(s) : null)
+  const pMin = numeric(f.priceMin)
+  const pMax = numeric(f.priceMax)
+  const dMin = numeric(f.diffMin)
+  if (pMin != null) rows = rows.filter((r) => r.b.cnCnyFen != null && r.b.cnCnyFen >= pMin * 100)
+  if (pMax != null) rows = rows.filter((r) => r.b.cnCnyFen != null && r.b.cnCnyFen <= pMax * 100)
+  if (dMin != null) {
+    rows = rows.filter((r) => {
+      const d = code && r.regionDiff != null ? r.regionDiff : r.b.diffFen
+      return d >= dMin * 100
+    })
+  }
+  if (sortBy.value === 'discount') {
+    // 折扣力度：现折扣% 降序（选区=该区折扣，未选区=全区最大），同折扣按差价
+    rows = [...rows].sort(
+      (a, b) => discountOf(b.b) - discountOf(a.b) || b.b.diffFen - a.b.diffFen,
+    )
+  } else if (code && sortBy.value === 'diff') {
+    rows = [...rows].sort((a, b) => (b.regionDiff ?? -Infinity) - (a.regionDiff ?? -Infinity))
+  } else if (code && sortBy.value === 'smart') {
+    // 选区重锚：省钱因子按该区差价重算，其余三因子不变（真·因子驱动重排；
+    // 未选区保持服务端评分序——同一公式，二者等价）
+    rows = [...rows].sort(
+      (a, b) => anchoredSmart(b.b, b.regionDiff) - anchoredSmart(a.b, a.regionDiff),
+    )
+  }
+  const q = committedSearch.value
+  if (q) rows = rows.filter((r) => r.b.name.toLowerCase().includes(q))
+  return rows.map((r) => r.b)
+})
+const visibleBundles = computed(() => filteredBundles.value.slice(0, renderLimit.value))
+const completableCount = computed(
+  () => filteredBundles.value.filter((b) => b.mustPurchaseAsSet === 0).length,
+)
+
+function commitSearch() {
+  committedSearch.value = searchInput.value.trim().toLowerCase()
+  renderLimit.value = RENDER_STEP
+}
+
+// ─── 排序因子（与 games/scoring 同式，前端可算的都在这）───
+/** 省钱因子（games/scoring.save_score 同式）：diffFen 分 → 元，对数压缩 ¥200 封顶 */
+function saveScore(diffFen: number): number {
+  const yuan = Math.max(0, diffFen) / 100
+  return Math.min(1, Math.log1p(yuan / 20) / Math.log(11))
+}
+/** smart 评分的地区无关余量 = 评分 − save(快照差价)，即质量+时机+熟悉度三因子和 */
+function smartRest(b: BundleSummary): number {
+  return Math.max(0, (b.smartScore || 0) - saveScore(b.diffFen))
+}
+/** 选区视角的 smart 评分：省钱因子按该区差价重算，其余三因子与地区无关 */
+function anchoredSmart(b: BundleSummary, regionDiff: number | null): number {
+  return saveScore(regionDiff ?? 0) + smartRest(b)
+}
+/** 折扣力度因子：选区 = 该区现折扣%；未选区 = 各区最大现折扣 */
+function discountOf(b: BundleSummary): number {
+  const code = region.value.toUpperCase()
+  if (!code) return maxDiscount(b)
+  return b.regionPrices[code]?.discountPercent || 0
+}
+
+// ─── 布局模式（对齐游戏商店：网格 ⊞ / 列表 ☰，持久化）───
+// 列表行 = 封面 128×60 + 名称标签 + 国区价 / 最低区 / 差价单行铺开，
+// 复用网格卡的全部展示助手（fen / cheaperTop3 / diffOf / maxDiscount）。
+type BundleLayout = 'grid' | 'list'
+const layoutMode = ref<BundleLayout>(
+  localStorage.getItem(`${APP_SLUG}.bundles.layout`) === 'list' ? 'list' : 'grid',
+)
+function setLayout(mode: BundleLayout) {
+  layoutMode.value = mode
+  localStorage.setItem(`${APP_SLUG}.bundles.layout`, mode)
+}
+
+/** 卡片差价角标：未选区 = 服务端快照 diffFen（对全区最低）；选区 = 该区相对
+    国区的差价（与地区维度的过滤/排序同一锚点，展示与顺序不脱节） */
+function diffOf(b: BundleSummary): number {
+  const code = region.value.toUpperCase()
+  if (!code) return b.diffFen
+  const rp = b.regionPrices[code]
+  if (!rp || rp.cnyFen == null || b.cnCnyFen == null) return 0
+  return Math.max(b.cnCnyFen - rp.cnyFen, 0)
+}
+
+async function selectSort(key: BundleSortKey) {
+  showSortMenu.value = false
+  if (key === sortBy.value) return
+  sortBy.value = key
+  localStorage.setItem(`${APP_SLUG}.bundles.sort`, key)
+  renderLimit.value = RENDER_STEP
+  await load()
+}
+
+function onDocClick(e: MouseEvent) {
+  if (sortRef.value && !sortRef.value.contains(e.target as Node)) showSortMenu.value = false
+  if (regionRef.value && !regionRef.value.contains(e.target as Node)) showRegionMenu.value = false
+}
 
 async function load() {
   loading.value = true
   errorMsg.value = ''
   try {
-    const res = await bundlesApi.list()
+    const res = await bundlesApi.list(sortBy.value)
     bundles.value = res.bundles
     renderLimit.value = RENDER_STEP
     // 撞库推演：收集全部 appid 一次批量查归属
@@ -457,28 +701,321 @@ function showAgrGroup(group: { codes: string[]; aids: number[] }) {
   allGamesOpen.value = true
 }
 
-onMounted(load)
+onMounted(() => {
+  document.addEventListener('mousedown', onDocClick)
+  load()
+})
+onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
 </script>
 
 <template>
   <div class="bundles-view">
-    <div class="bundles-head">
-      <div class="bundles-stats">
-        {{ t('bundles.head.total', { n: bundles.length }) }}
-        <template v-if="bundles.length > 0">
-          {{ t('bundles.head.completable', { n: bundles.filter((b) => b.mustPurchaseAsSet === 0).length }) }}
-        </template>
+    <!-- 导航栏（对齐游戏商店形态：搜索 + 排序 + 地区维度 + 高级筛选 + 统计）。
+         复用全局 navbar 样式族；无手动刷新键——路由切走再回来 onMounted
+         必然重新拉取，常驻刷新键无意义。-->
+    <nav class="navbar">
+      <div class="nav-controls">
+        <input
+          v-model="searchInput"
+          type="text"
+          class="search-box"
+          style="flex: 1; min-width: 200px; max-width: none"
+          :placeholder="t('bundles.nav.search')"
+          @keydown.enter.prevent="commitSearch"
+        />
+
+        <div class="sort-buttons">
+          <!-- 排序下拉（智能评分 / 差价最大，服务端预计算列） -->
+          <div ref="sortRef" class="region-dropdown">
+            <button
+              class="sort-dropdown-btn"
+              :class="{ active: sortBy !== 'smart' }"
+              @click="showSortMenu = !showSortMenu"
+            >
+              {{ currentSortLabel }} ▼
+            </button>
+            <div class="region-dropdown-menu" :class="{ show: showSortMenu }">
+              <div
+                v-for="opt in sortOptions"
+                :key="opt.key"
+                class="region-option"
+                :class="{ active: sortBy === opt.key }"
+                @click="selectSort(opt.key)"
+              >
+                <span class="name">{{ t(opt.labelKey) }}</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 地区维度：选区后差价重新锚定到该区（卡片自带全区价格明细） -->
+          <div ref="regionRef" class="region-dropdown">
+            <button
+              class="region-dropdown-btn"
+              :class="{ active: !!region }"
+              @click="showRegionMenu = !showRegionMenu"
+            >
+              📉 {{ regionLabel }} ▼
+            </button>
+            <div class="region-dropdown-menu" :class="{ show: showRegionMenu }">
+              <div
+                v-for="opt in regionOptions"
+                :key="opt.value || 'all'"
+                class="region-option"
+                :class="{ active: region === opt.value }"
+                @click="selectRegion(opt.value)"
+              >
+                <img v-if="opt.flag" :src="opt.flag" class="flag" alt="" />
+                <span class="name">{{ opt.label }}</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 布局切换（网格 ⊞ / 列表 ☰） -->
+          <div class="layout-switch">
+            <button
+              class="layout-switch__btn"
+              :class="{ active: layoutMode === 'grid' }"
+              :title="t('navbar.layout.grid')"
+              @click="setLayout('grid')"
+            >
+              ⊞
+            </button>
+            <button
+              class="layout-switch__btn"
+              :class="{ active: layoutMode === 'list' }"
+              :title="t('navbar.layout.list')"
+              @click="setLayout('list')"
+            >
+              ☰
+            </button>
+          </div>
+        </div>
+
+        <span class="stats">
+          {{ t('bundles.head.total', { n: filteredBundles.length }) }}
+          <template v-if="filteredBundles.length > 0">
+            {{ t('bundles.head.completable', { n: completableCount }) }}
+          </template>
+        </span>
+
+        <!-- 高级筛选（复刻可实现的维度） -->
+        <button class="filter-main-btn" :class="{ active: filterOpen }" @click="filterOpen = !filterOpen">
+          {{ t('navbar.advancedFilter') }}
+          <span v-if="activeFilterCount > 0" class="filter-badge">{{ activeFilterCount }}</span>
+        </button>
       </div>
-      <HlButton variant="text" @click="load">{{ t('common.refresh') }}</HlButton>
+    </nav>
+
+    <!-- 地区子分类工具栏（选区后出现，对齐游戏商店交互） -->
+    <div v-if="region" class="filter-toolbar active">
+      <span class="filter-toolbar-label">
+        <img
+          v-if="activeRegionMeta?.flag"
+          :src="activeRegionMeta.flag"
+          style="width: 18px; height: 13px"
+          alt=""
+        />
+        {{ regionLabel }}
+      </span>
+      <button
+        v-for="m in regionModes"
+        :key="m.key"
+        class="filter-mode-btn"
+        :class="{ active: regionMode === m.key }"
+        @click="selectRegionMode(m.key)"
+      >
+        {{ t(m.labelKey) }}
+      </button>
+      <button class="filter-close-btn" @click="selectRegion('')">{{ t('common.clear') }}</button>
     </div>
+
+    <!-- 高级筛选抽屉（对齐游戏商店 hl-fp 标准结构，只放捆绑包有数据源的维度） -->
+    <HlDrawer v-model="filterOpen" :title="t('navbar.advancedFilter')" width="400px" :mask-closable="true">
+      <div class="hl-fp-body" style="padding: 0">
+        <div>
+          <div class="hl-fp-sec-title">{{ t('bundles.filter.section.basic') }}</div>
+          <div class="hl-fp-check">
+            <HlCheckbox
+              :model-value="filters.completableOnly"
+              :label="t('bundles.filter.completableOnly')"
+              @update:model-value="(v: boolean) => setFilter('completableOnly', v)"
+            />
+            <HlCheckbox
+              :model-value="filters.cnLowestOnly"
+              :label="t('bundles.filter.cnLowestOnly')"
+              @update:model-value="(v: boolean) => setFilter('cnLowestOnly', v)"
+            />
+          </div>
+        </div>
+
+        <div>
+          <div class="hl-fp-sec-title">{{ t('bundles.filter.section.ownership') }}</div>
+          <div class="hl-fp-check">
+            <HlCheckbox
+              :model-value="filters.hideOwned"
+              :label="t('bundles.filter.hideOwned')"
+              @update:model-value="(v: boolean) => setFilter('hideOwned', v)"
+            />
+            <HlCheckbox
+              :model-value="filters.hideFamily"
+              :label="t('bundles.filter.hideFamily')"
+              @update:model-value="(v: boolean) => setFilter('hideFamily', v)"
+            />
+          </div>
+        </div>
+
+        <div>
+          <div class="hl-fp-sec-title">{{ t('bundles.filter.section.price') }}</div>
+          <div class="hl-fp-inline">
+            <span>{{ t('bundles.filter.price') }}</span>
+            <input
+              type="number"
+              class="hl-fp-tol"
+              :value="filters.priceMin"
+              :placeholder="t('bundles.filter.min')"
+              min="0"
+              step="1"
+              @input="setFilter('priceMin', ($event.target as HTMLInputElement).value)"
+            />
+            <span>—</span>
+            <input
+              type="number"
+              class="hl-fp-tol"
+              :value="filters.priceMax"
+              :placeholder="t('bundles.filter.max')"
+              min="0"
+              step="1"
+              @input="setFilter('priceMax', ($event.target as HTMLInputElement).value)"
+            />
+            <span>{{ t('bundles.filter.cny') }}</span>
+          </div>
+          <div class="hl-fp-inline">
+            <span>{{ t('bundles.filter.diffMinLabel') }}</span>
+            <input
+              type="number"
+              class="hl-fp-tol"
+              :value="filters.diffMin"
+              :placeholder="t('bundles.filter.min')"
+              min="0"
+              step="1"
+              @input="setFilter('diffMin', ($event.target as HTMLInputElement).value)"
+            />
+            <span>{{ t('bundles.filter.cny') }}</span>
+            <span v-if="region" class="hl-fp-hint">{{ t('bundles.filter.diffMinRegionHint') }}</span>
+          </div>
+        </div>
+
+        <div style="margin-top: 12px">
+          <HlButton variant="text" size="sm" @click="resetFilters">{{ t('common.clear') }}</HlButton>
+        </div>
+      </div>
+    </HlDrawer>
 
     <div v-if="errorMsg" class="bundles-error">{{ errorMsg }}</div>
     <HlSkeleton v-else-if="loading" variant="card" :count="8" />
     <div v-else-if="bundles.length === 0" class="bundles-empty">
       {{ t('bundles.empty.noData') }}
     </div>
+    <div v-else-if="filteredBundles.length === 0" class="bundles-empty">
+      {{ t('bundles.empty.noMatch') }}
+    </div>
 
-    <div v-else v-stagger class="bundle-grid hl-stagger">
+    <template v-else>
+      <!-- 列表模式：单列紧凑行（对齐游戏商店列表几何：封面 128×60 通高 +
+           名称标签 + 国区价 / 最低区 / 差价 单行铺开），展示助手与网格卡同源 -->
+      <div v-if="layoutMode === 'list'" class="bundle-list">
+        <div
+          v-for="b in visibleBundles"
+          :key="b.bundleId"
+          class="bundle-list-row"
+          :class="{
+            owned: ownershipByBid[b.bundleId]?.type === 'owned',
+            family: ownershipByBid[b.bundleId]?.type === 'family',
+          }"
+          @click="toggleDrawer(b, $event)"
+        >
+          <div class="blr-cover">
+            <span class="cover-placeholder">📦</span>
+            <img
+              v-if="b.headerImage && !bundleDead(b)"
+              class="cover"
+              :src="bundleCover(b)"
+              :alt="b.name"
+              loading="lazy"
+              decoding="async"
+              @error="onCoverError($event, b)"
+              @load="onCoverLoad(b)"
+            />
+            <span v-if="maxDiscount(b) > 0" class="blr-discount">-{{ maxDiscount(b) }}%</span>
+          </div>
+
+          <div class="blr-main">
+            <div class="blr-name" :title="b.name">{{ b.name }}</div>
+            <div class="blr-tags">
+              <span
+                v-if="ownershipByBid[b.bundleId]?.type"
+                class="blr-own"
+                :class="ownershipByBid[b.bundleId]!.type"
+              >
+                {{ ownershipByBid[b.bundleId]!.type === 'owned' ? t('bundles.badge.owned') : t('bundles.badge.family') }}
+              </span>
+              <span
+                v-if="b.mustPurchaseAsSet === 0"
+                class="bundle-mps-tag completable"
+                :title="t('bundles.mps.completableTip')"
+              >{{ t('bundles.mps.completable') }}</span>
+              <span
+                v-else-if="b.mustPurchaseAsSet === 1"
+                class="bundle-mps-tag must-buy"
+                :title="t('bundles.mps.setOnlyTip')"
+              >{{ t('bundles.mps.setOnly') }}</span>
+              <span
+                v-if="(Object.values(b.regionPrices)[0]?.baseDiscount ?? 0) > 0"
+                class="bundle-base-discount-tag"
+              >{{ t('bundles.tag.baseDiscount', { pct: Object.values(b.regionPrices)[0].baseDiscount }) }}</span>
+            </div>
+          </div>
+
+          <div class="blr-col">
+            <span class="blr-label"><RegionFlag code="CN" /></span>
+            <span class="blr-value cn">{{ b.cnCnyFen != null ? fen(b.cnCnyFen) : t('bundles.price.none') }}</span>
+          </div>
+          <div class="blr-col">
+            <span class="blr-label">
+              <RegionFlag v-if="cheaperTop3(b).length > 0" :code="cheaperTop3(b)[0]![0]" />
+              <RegionFlag v-else-if="b.cnCnyFen != null" code="CN" />
+            </span>
+            <span class="blr-value lowest">
+              {{
+                cheaperTop3(b).length > 0
+                  ? fen(cheaperTop3(b)[0]![1].cnyFen)
+                  : b.cnCnyFen != null
+                    ? fen(lowestFen(b))
+                    : '—'
+              }}
+            </span>
+          </div>
+          <div class="blr-col">
+            <span class="blr-label">{{ t('bundles.price.diff') }}</span>
+            <span v-if="diffOf(b) > 0" class="diff-badge positive">
+              <span class="align-text-up">{{ t('bundles.price.save', { amt: fen(diffOf(b), 0) }) }}</span>
+            </span>
+            <span v-else class="diff-badge"><span class="align-text-up">{{ t('bundles.price.noDiff') }}</span></span>
+          </div>
+
+          <!-- 商店链接不触发行点击的详情抽屉：外层挡冒泡（<a> 本身不带事件，
+              收口规则禁止无 href 的 <a> 当按键） -->
+          <span class="blr-link" @click.stop>
+            <a class="steam-link" :href="b.url" target="_blank" rel="noreferrer">
+              <span class="steam-icon"></span>
+              {{ t('bundles.link.store') }}
+            </a>
+          </span>
+        </div>
+      </div>
+
+      <!-- 网格模式：原始布局（hl-stagger：逐卡级联入场，见 hl-framework.css） -->
+      <div v-else v-stagger class="bundle-grid hl-stagger">
       <div
         v-for="b in visibleBundles"
         :key="b.bundleId"
@@ -600,8 +1137,8 @@ onMounted(load)
             <div class="price-row">
               <span class="price-label">{{ t('bundles.price.diff') }}</span>
               <div class="price-diff">
-                <span v-if="b.diffFen > 0" class="diff-badge positive">
-                  <span class="align-text-up">{{ t('bundles.price.save', { amt: fen(b.diffFen, 0) }) }}</span>
+                <span v-if="diffOf(b) > 0" class="diff-badge positive">
+                  <span class="align-text-up">{{ t('bundles.price.save', { amt: fen(diffOf(b), 0) }) }}</span>
                 </span>
                 <span v-else class="diff-badge"><span class="align-text-up">{{ t('bundles.price.noDiff') }}</span></span>
               </div>
@@ -613,11 +1150,12 @@ onMounted(load)
           </HlButton>
         </div>
       </div>
-    </div>
+      </div>
+    </template>
 
-    <div v-if="!loading && bundles.length > visibleBundles.length" class="bundles-load-more">
+    <div v-if="!loading && filteredBundles.length > visibleBundles.length" class="bundles-load-more">
       <HlButton @click="renderLimit += RENDER_STEP">
-        {{ t('bundles.list.loadMore', { n: bundles.length - visibleBundles.length }) }}
+        {{ t('bundles.list.loadMore', { n: filteredBundles.length - visibleBundles.length }) }}
       </HlButton>
     </div>
 
@@ -1010,4 +1548,166 @@ onMounted(load)
 .agr-flag :deep(.region-flag__name) {
   display: none;
 }
+
+/* ─── 布局切换（⊞/☰）：类名与 HlNavbar 同款，但那份是组件 scoped 私有，
+     此处独立声明（几何一致，颜色走令牌） ─── */
+.layout-switch {
+  display: flex;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.layout-switch__btn {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 6px 10px;
+  font-size: 14px;
+  cursor: pointer;
+  transition: all var(--transition);
+}
+.layout-switch__btn + .layout-switch__btn {
+  border-left: 1px solid var(--border-soft);
+}
+.layout-switch__btn.active {
+  background: var(--accent-fill);
+  color: var(--on-accent-fill);
+}
+
+/* ─── 列表模式：单列紧凑行（几何对齐游戏商店列表：封面 128×60 通高）─── */
+.bundle-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.bundle-list-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 12px 6px 6px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md, 10px);
+  background: var(--bg-card);
+  cursor: pointer;
+  min-width: 0;
+}
+.bundle-list-row:hover {
+  border-color: var(--border-strong);
+}
+.bundle-list-row.owned {
+  border-color: var(--success, #27ae60);
+}
+.bundle-list-row.family {
+  border-color: var(--accent);
+}
+
+.blr-cover {
+  position: relative;
+  width: 128px;
+  height: 60px;
+  flex-shrink: 0;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--surface-inset, transparent);
+}
+.blr-cover .cover {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.blr-cover .cover-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  color: var(--text-faint);
+}
+.blr-discount {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--accent-fill);
+  color: var(--on-accent-fill);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.blr-main {
+  flex: 1 1 240px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.blr-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.blr-tags {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.blr-own {
+  padding: 0 6px;
+  border-radius: 4px;
+  font-size: 10.5px;
+  line-height: 16px;
+  border: 1px solid var(--success, #27ae60);
+  color: var(--success, #27ae60);
+}
+.blr-own.family {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* 价格三列：固定列宽（列位置跨行一致，不随内容漂移——对齐卡片统计列契约） */
+.blr-col {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.blr-col:nth-of-type(2) {
+  width: 96px;
+}
+.blr-col:nth-of-type(3) {
+  width: 96px;
+}
+.blr-col:nth-of-type(4) {
+  width: 88px;
+  align-items: flex-end;
+}
+.blr-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.blr-value {
+  font-size: 12.5px;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+.blr-value.lowest {
+  color: var(--success, #27ae60);
+  font-weight: 600;
+}
+.blr-link {
+  flex-shrink: 0;
+}
+
 </style>

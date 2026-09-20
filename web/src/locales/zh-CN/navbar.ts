@@ -3,9 +3,9 @@
    搜索 / 排序下拉 / 地区下拉 + 子分类工具栏 / 布局切换 / 高级筛选入口）。
 
    注意：'navbar.region.allLowest'（下拉按钮上的「无地区筛选」态，前缀另有
-   📉）与 'navbar.regionOption.allLowest'（下拉里的选项，带汇率说明）是两处
-   不同的显示文案，不是重复 key；同理 'navbar.region.locked'（按钮态，无锁
-   图标）与 'navbar.regionOption.locked'（下拉选项，整句含 🔒）。
+   📉）与 'navbar.regionOption.allLowest'（下拉里的选项）是按钮态与选项两个
+   位点的 key，当前文案相同但仍分开维护；同理 'navbar.region.locked'（按钮
+   态，无锁图标）与 'navbar.regionOption.locked'（下拉选项，整句含 🔒）。
    ════════════════════════════════════════════════════════════════════ */
 
 const navbar = {
@@ -23,7 +23,7 @@ const navbar = {
   'navbar.region.locked': '锁国区游戏',
 
   /* 地区下拉选项（动态地区名来自 regionsStore） */
-  'navbar.regionOption.allLowest': '全区最低 (汇率自动)',
+  'navbar.regionOption.allLowest': '全区最低',
   'navbar.regionOption.cn': '国区',
   'navbar.regionOption.locked': '🔒 锁国区游戏',
 
