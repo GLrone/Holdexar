@@ -332,3 +332,55 @@ async def test_zero_sub_id_does_not_widen_series():
         assert [p["cnyFen"] for p in r["points"]] == [10000]
     finally:
         await _cleanup(ZERO_APPID)
+
+
+FX_HIST_APPID = 990_004
+
+
+@pytest.mark.asyncio
+async def test_history_missing_cny_uses_historical_fx_only():
+    """历史快照缺 CNY：按 snapshot_at 的 observed 历史汇率补算；历史缺失即缺失。
+
+    回归：绝不用当前 fx_rates 快照折历史价格（隐性错误）——
+    有历史汇率的日子用历史值（0.015 → 1500 分而非当前 0.012 的 1200 分），
+    无历史汇率的日子保持缺失（0 = 无 CNY）。
+    """
+    from app.domains.rates.models import FxRate, FxRateHistory
+
+    day_hist = datetime(2026, 3, 10, 12, 0, 0)
+    day_missing = datetime(2026, 3, 11, 12, 0, 0)
+    async with get_session_factory()() as session:
+        session.add_all([
+            GamePriceHistory(
+                appid=FX_HIST_APPID, region_code="XTS", currency="XTS",
+                price=100_000, original_price=100_000, discount_percent=0,
+                sub_id=990_00401, is_gold=False, version_suffix=None,
+                price_status="ok", cny_fen=None, snapshot_at=day_hist,
+            ),
+            GamePriceHistory(
+                appid=FX_HIST_APPID, region_code="XTS", currency="XTS",
+                price=200_000, original_price=200_000, discount_percent=0,
+                sub_id=990_00401, is_gold=False, version_suffix=None,
+                price_status="ok", cny_fen=None, snapshot_at=day_missing,
+            ),
+            FxRateHistory(
+                currency_code="XTS", rate_to_cny=0.015, source="test",
+                source_kind="observed", rate_date=day_hist.date(),
+                fetched_at=day_hist,
+            ),
+            FxRate(currency_code="XTS", rate_to_cny=0.012, fetched_at=day_missing),
+        ])
+        await session.commit()
+    try:
+        r = await service.get_game_history(FX_HIST_APPID, region="xts")
+        by_ts = {p["timestamp"]: p["cnyFen"] for p in r["points"]}
+        assert by_ts[day_hist.isoformat()] == round(100_000 * 0.015)  # 历史 1500
+        assert by_ts[day_missing.isoformat()] == 0  # 历史缺失 → 不回落当前汇率
+    finally:
+        async with get_session_factory()() as session:
+            await session.execute(
+                delete(FxRateHistory).where(FxRateHistory.currency_code == "XTS")
+            )
+            await session.execute(delete(FxRate).where(FxRate.currency_code == "XTS"))
+            await session.commit()
+        await _cleanup(FX_HIST_APPID)

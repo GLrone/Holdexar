@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from sqlalchemy import and_, asc, desc, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -876,6 +876,44 @@ async def linked_bundles(appid: int) -> list[dict]:
     return items
 
 
+async def _fill_cny_fen_by_history(rows) -> dict[int, int]:
+    """对 cny_fen 缺失的行补算 CNY 分：用 snapshot_at **当日**的 observed 历史汇率。
+
+    返回 `{行 id: cny_fen}`；当日历史汇率缺失的行不补——绝不用当前汇率折算
+    历史价格（隐性错误）；补齐后仍无值的点在走势里按缺失呈现。行级一次批量
+    取数（按币种聚合窗口），不做逐点查询。
+    """
+    from app.domains.rates import history as rates_history
+
+    need_days: set[date] = set()
+    need_currencies: set[str] = set()
+    for r in rows:
+        if r.cny_fen is not None or r.price is None or r.price <= 0 or r.snapshot_at is None:
+            continue
+        currency = (r.currency or REGION_TO_CURRENCY.get(r.region_code.upper()) or "").upper()
+        if not currency:
+            continue
+        need_currencies.add(currency)
+        need_days.add(r.snapshot_at.date())
+    if not need_days:
+        return {}
+    fx_map = await rates_history.observed_rate_map(
+        need_currencies, min(need_days), max(need_days)
+    )
+    filled: dict[int, int] = {}
+    for r in rows:
+        if r.cny_fen is not None or r.price is None or r.price <= 0 or r.snapshot_at is None:
+            continue
+        currency = (r.currency or REGION_TO_CURRENCY.get(r.region_code.upper()) or "").upper()
+        if not currency:
+            continue
+        rate = fx_map.get((currency, r.snapshot_at.date().isoformat()))
+        if rate is None:
+            continue
+        filled[int(r.id)] = round(int(r.price) * rate)
+    return filled
+
+
 async def get_game_history(
     appid: int, region: str = "cn", days: int = 0, sub_id: int | None = None
 ) -> dict:
@@ -898,7 +936,6 @@ async def get_game_history(
     只在捆绑包 sub 下售卖的游戏，其区服唯一在售 sub 会被识别成 bundle-as-sub，
     若一并排除就会得到空图（全库 0 个区服只靠捆绑行活着，故此项不产生回归）。
     """
-    rates = await get_rates()
     region = region.lower()
 
     # 标准版判据（对齐 db_writer.py:187-192 的 is_standard）
@@ -996,14 +1033,13 @@ async def get_game_history(
 
     region_info = next((entry for entry in CC_LIST if entry[0] == region), None)
 
+    fx_filled = await _fill_cny_fen_by_history(rows)
     points = []
     for r in rows:
         price_cents = int(r.price) if r.price is not None else None
         cny_fen = int(r.cny_fen) if r.cny_fen is not None else None
-        if cny_fen is None and price_cents is not None and price_cents > 0:
-            currency = r.currency or REGION_TO_CURRENCY.get(region.upper())
-            if currency:
-                cny_fen = convert_minor_to_cny_fen(price_cents, currency, rates)
+        if cny_fen is None:
+            cny_fen = fx_filled.get(int(r.id))
         formatted = (
             format_minor_units(price_cents, region_info[2])
             if price_cents is not None and region_info
@@ -1128,15 +1164,13 @@ async def get_price_context(appid: int, date: str, region: str = "cn") -> dict:
             )
         ).scalars().all()
 
-    rates = await get_rates()
+    fx_filled = await _fill_cny_fen_by_history(rows)
     points: list[dict] = []
     for r in rows:
         price_cents = int(r.price) if r.price is not None else None
         cny_fen = int(r.cny_fen) if r.cny_fen is not None else None
-        if cny_fen is None and price_cents is not None and price_cents > 0:
-            currency = r.currency or REGION_TO_CURRENCY.get(region.upper())
-            if currency:
-                cny_fen = convert_minor_to_cny_fen(price_cents, currency, rates)
+        if cny_fen is None:
+            cny_fen = fx_filled.get(int(r.id))
         if not cny_fen or cny_fen <= 0:
             continue
         points.append(
