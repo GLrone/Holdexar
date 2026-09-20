@@ -41,13 +41,12 @@ from pathlib import Path
 from urllib.parse import quote
 
 import httpx
-import yaml
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.crawler.browse_store import StoreBrowseAPI, _to_int
 from app.domains.proxypool.models import HealthObservation, ProxyNode, ProxyNodeSource
-from app.domains.proxypool.pool import pool_path
+from app.domains.proxypool.pool import pool_file_names
 from app.domains.proxypool.runtime import mixed_port_of
 from app.domains.proxypool.state import NODE_DEAD, evaluate_node_state
 
@@ -160,8 +159,7 @@ async def probe_node(
 
 def _pool_names(data_dir: Path) -> tuple[str, ...]:
     """要探测的对象 = 池文件里的节点（`build_pool` 的三个门禁已经校验过它）。"""
-    doc = yaml.safe_load(pool_path(data_dir).read_text(encoding="utf-8"))
-    return tuple(str(proxy["name"]) for proxy in doc.get("proxies", []))
+    return pool_file_names(data_dir)
 
 
 async def _probe_and_record(

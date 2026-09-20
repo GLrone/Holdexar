@@ -269,16 +269,52 @@ async def ensure_pool_runtime(
     kernel_proxy: str | None = None,
     pool_proxy: str | None = None,
 ) -> BootstrapResult:
-    """幂等原语：**只有没有可用 Runtime 时**才 bootstrap。
+    """幂等原语：**池文件与合格集集合相等、且 Runtime 可达**才算"已有可用 Runtime"。
 
     `skip_sync=True` 供"调用方刚刚自己同步过"的场景（订阅刷新链）：直接吃最新
     Registry 建 Runtime，**不再重复抓一次订阅**。
+
+    Runtime 可达只说明内核在跑，不说明池文件是最新的：促升/合并新订阅会让 eligible
+    变化，而池文件要等一次重建才跟上。集合不一致时不声称 current，走既有重建链
+    （`request_rebuild` → `run_pending_rebuild` → `rebuild_runtime`）；占线时由它让路，
+    本轮如实返回"尚未 current"。比较用**集合**——数量相同但节点不同也必须重建。
     """
+    from app.domains.proxypool.pool import pool_file_names
+    from app.domains.proxypool.scheduling import request_rebuild, run_pending_rebuild
+
+    stale = set(await eligible_runtime_names(session)) != set(pool_file_names(data_dir))
+
     if await runtime_ready(session, data_dir=data_dir):
-        base, _ = controller_endpoint_of(data_dir)
+        base, secret = controller_endpoint_of(data_dir)
+        if not stale:
+            return BootstrapResult(
+                True, False, current_runtime_proxy_url(data_dir), base,
+                await eligible_runtime_names(session), "已有可用 Runtime",
+            )
+        # 可达但池文件落后：交给既有重建链，避免"复用一个过期池"
+        request_rebuild()
+        rebuilt = await run_pending_rebuild(
+            session, data_dir=data_dir, controller_url=base, secret=secret,
+            runtime=runtime, exe_path=exe_path,
+        )
+        if rebuilt is None:
+            return BootstrapResult(
+                False, False, current_runtime_proxy_url(data_dir), base,
+                await eligible_runtime_names(session),
+                "池文件与合格集不一致，本轮未重建（占线或重建让路）",
+            )
+        # 重建已执行：池文件此刻应已跟到合格集，才算 current
+        now_base, _ = controller_endpoint_of(data_dir)
+        if set(await eligible_runtime_names(session)) != set(pool_file_names(data_dir)):
+            return BootstrapResult(
+                False, True, current_runtime_proxy_url(data_dir), now_base,
+                await eligible_runtime_names(session),
+                "重建后池文件仍与合格集不一致",
+            )
         return BootstrapResult(
-            True, False, current_runtime_proxy_url(data_dir), base,
-            await eligible_runtime_names(session), "已有可用 Runtime",
+            True, True, current_runtime_proxy_url(data_dir), now_base,
+            await eligible_runtime_names(session),
+            "池文件落后于合格集，已按既有重建链重建",
         )
 
     async with _single_flight:
