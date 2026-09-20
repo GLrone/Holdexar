@@ -47,11 +47,15 @@ def db(tmp_path, monkeypatch):
     import app.core.database as database_module
 
     monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    # service/db_writer 均模块级 import factory——三处一起打桩
+    # service/db_writer/settings 均模块级 import factory——逐个打桩；
+    # settings 漏桩会让 price_auto_enabled 读真实库的总开关，
+    # 本机把 crawl.auto_price 关掉时主轮/修复轮全部提前返回
     monkeypatch.setattr(crawl_service, "get_session_factory", lambda: factory)
     import app.crawler.db_writer as dw
+    import app.domains.settings.service as settings_service
 
     monkeypatch.setattr(dw, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(settings_service, "get_session_factory", lambda: factory)
     return factory
 
 
