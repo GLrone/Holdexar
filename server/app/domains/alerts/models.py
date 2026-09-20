@@ -15,7 +15,8 @@ class PriceAlert(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     appid: Mapped[int] = mapped_column(BigInteger)
     region: Mapped[str] = mapped_column(String(10), default="CN")
-    # price: 当前价 <= target_value（分）| pct: 折扣率 >= target_value（%）| historic_low: 创新低
+    # price: 当前价折算人民币分 <= target_value（人民币分，与 crawl 的 cny_fen 同口径）
+    #        | pct: 折扣率 >= target_value（%）| historic_low: 创新低
     target_type: Mapped[str] = mapped_column(String(20), default="price")
     target_value: Mapped[float | None] = mapped_column(Float)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -30,6 +31,8 @@ class AlertEvent(Base):
     alert_id: Mapped[int] = mapped_column(Integer)
     appid: Mapped[int] = mapped_column(BigInteger)
     region: Mapped[str] = mapped_column(String(10))
-    price: Mapped[int | None] = mapped_column(BigInteger)  # 分
+    price: Mapped[int | None] = mapped_column(BigInteger)  # 触发时该区货币最小单位
+    # 触发时的人民币分（与 cny_fen 同源，历史行回看免再折算）
+    price_cny: Mapped[int | None] = mapped_column(BigInteger)
     triggered_at: Mapped[datetime | None] = mapped_column(DateTime)
     notified: Mapped[bool] = mapped_column(Boolean, default=False)

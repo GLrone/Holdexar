@@ -43,6 +43,11 @@ const alerts: Partial<Record<MessageKey, string>> = {
   'alerts.rules.removeConfirm': 'Delete rule #{id} ({name})?',
   'alerts.rules.confirmTitle': 'Confirm',
 
+  /* Amount input suffix unit + live conversion bubble for foreign-region rules
+     ({value} = formatted local amount, {name} = currency name) */
+  'alerts.rules.unitCny': 'CNY',
+  'alerts.rules.convertHint': '≈ {value} ({name})',
+
   /* Condition column (label and value form one sentence) */
   'alerts.rules.condPrice': 'Price ≤ {value}',
   'alerts.rules.condPct': 'Discount ≥ {value}%',
@@ -61,6 +66,9 @@ const alerts: Partial<Record<MessageKey, string>> = {
 
   /* Trigger history */
   'alerts.history.empty': 'No triggers yet',
+  'alerts.history.clearAll': 'Clear all',
+  'alerts.history.removeConfirm': 'Delete this trigger record for {name}?',
+  'alerts.history.clearConfirm': 'Clear all {count} trigger records? This cannot be undone.',
   'alerts.history.notifiedEmail': 'Sent',
   'alerts.history.notifiedInApp': 'In-app',
 
@@ -91,6 +99,8 @@ const alerts: Partial<Record<MessageKey, string>> = {
   'alerts.toast.disabled': 'Rule disabled',
   'alerts.toast.updated': 'Rule updated',
   'alerts.toast.removed': 'Rule #{id} deleted',
+  'alerts.toast.eventRemoved': 'Trigger record deleted',
+  'alerts.toast.historyCleared': 'Cleared {count} trigger records',
   'alerts.toast.smtpSaved': 'Email settings saved',
   'alerts.toast.testSent': 'Test email sent to {to} — check your inbox',
 }
