@@ -237,6 +237,22 @@ class StoreBrowseAPI:
         return URL(f"{BROWSE_URL}?{qs}", encoded=True)
 
     @staticmethod
+    def probe_url(cc: str = "us", appid: int = 220) -> str:
+        """健康探针 URL：单 appid、不带 extras（最小负载）。
+
+        与生产主链路**同主机、同路径、同编码**（`api.steampowered.com/IStoreBrowseService`）
+        ——体检可达性与生产可用性必须同一口径；220 = Half-Life 2，长期在售，
+        不命中下架分支。
+
+        返回 str 供 httpx 使用；生产链路自己走 yarl.URL(encoded=True)。
+        """
+        return str(
+            StoreBrowseAPI.build_ids_url(
+                [{"appid": int(appid)}], cc, "english", extras=False
+            )
+        )
+
+    @staticmethod
     def build_url(appids: list[int], cc: str, lang: str, extras: bool = True) -> URL:
         return StoreBrowseAPI.build_ids_url(
             [{"appid": int(a)} for a in appids], cc, lang, extras

@@ -507,6 +507,11 @@ async def _job_subscription_refresh() -> None:
 
     重拉带新配置（内核已重启）时接一次节点检测：新节点在账本里是空行，
     「存活 x/y」与仪表盘可用数否则会停在账本口径等下个 6h 体检窗口。
+
+    末尾的 proxypool 分流**与旧链路重拉结果解耦**：`maybe_refresh_active_clash_subscription`
+    的 `unknown_subscription`（内核启动文本里没有订阅 URL）只描述旧链路认不出在跑哪条订阅，
+    不构成 proxypool 的跳过理由——proxypool 按库里的 subscription + `admission_status`
+    + 当前 `subscription.url` 走自己的 sync。
     """
     from app.domains.proxies import service as proxies_service
 
@@ -517,19 +522,18 @@ async def _job_subscription_refresh() -> None:
         result = await proxies_service.maybe_refresh_active_clash_subscription()
     except Exception:  # noqa: BLE001
         logger.exception("[定时] Clash 订阅重拉异常")
-        return
-    if result.get("state") != "refreshed":
-        return
-    logger.info("[定时] Clash 订阅重拉完成：%s 节点", result.get("nodes"))
-    if result.get("restarted") and result.get("subscriptionId"):
-        try:
-            checked = await proxies_service.test_clash_nodes(result["subscriptionId"])
-            logger.info(
-                "[定时] 订阅重拉后首检：共 %s 节点，可用 %s",
-                checked.get("total"), checked.get("alive"),
-            )
-        except Exception:  # noqa: BLE001 —— 首检失败不影响重拉事实
-            logger.exception("[定时] 订阅重拉后首检失败（可稍后手动检测）")
+    else:
+        if result.get("state") == "refreshed":
+            logger.info("[定时] Clash 订阅重拉完成：%s 节点", result.get("nodes"))
+            if result.get("restarted") and result.get("subscriptionId"):
+                try:
+                    checked = await proxies_service.test_clash_nodes(result["subscriptionId"])
+                    logger.info(
+                        "[定时] 订阅重拉后首检：共 %s 节点，可用 %s",
+                        checked.get("total"), checked.get("alive"),
+                    )
+                except Exception:  # noqa: BLE001 —— 首检失败不影响重拉事实
+                    logger.exception("[定时] 订阅重拉后首检失败（可稍后手动检测）")
 
     # 订阅刷新 → Snapshot/Registry → 池签名分流；**绝不在这里 stop/start 池 Runtime**
     try:
