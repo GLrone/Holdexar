@@ -20,6 +20,7 @@ import httpx
 from sqlalchemy import delete, func, select
 
 from app.core.database import get_session_factory
+from app.crawler.browse_store import StoreBrowseAPI
 from app.crawler.utils import get_beijing_time_obj
 
 
@@ -44,10 +45,31 @@ from .models import ClashNode, Proxy, ProxyEvent, ProxySubscription
 
 logger = logging.getLogger(__name__)
 
-# 健康检查目标：真实 Steam 端点而非 ping
-TEST_URL = "https://store.steampowered.com/api/appdetails"
-TEST_PARAMS = {"appids": "220", "cc": "us", "l": "english", "filters": "price_overview"}
+# 健康检查目标：**生产抓取端点**（IStoreBrowseService/GetItems/v1），不是 ping
+# ——须与生产主链路（api.steampowered.com）同主机/同路径/同编码：探测别的目标
+# （如 store.steampowered.com/api/appdetails）时链路可达性与生产并不一致，
+# 体检通过不代表生产可用。探针取单 appid + 不带 extras（最小负载），
+# 编码约定由生产侧单一来源提供。
+TEST_URL = StoreBrowseAPI.probe_url()
+TEST_PARAMS = None  # 编码已内嵌在 TEST_URL（input_json 查询参数）
+# 走线日志的目标标签：TEST_URL 带 input_json 会超长（proxy_events.target 列 255）
+TEST_TARGET = "IStoreBrowseService/GetItems"
 TEST_TIMEOUT = 12.0
+
+
+def _steam_payload_ok(resp: httpx.Response) -> bool:
+    """生产端点响应是否「业务有效」：200 且 body 是 JSON 对象。
+
+    只判 200 会把风控 / Cloudflare 返回的 HTML 拦截页当成「通」——那正是
+    「体检通、生产不通」的一种形态。判 JSON 是最小成本的区分：内容结构再变
+    也是 dict（不误杀），HTML / 空体 / 非 JSON 一律判否。
+    """
+    if resp.status_code != 200:
+        return False
+    try:
+        return isinstance(resp.json(), dict)
+    except Exception:  # noqa: BLE001 —— 非 JSON 响应（拦截页 / 空体）
+        return False
 MAX_CONSECUTIVE_FAILURES = 5  # 连续失败自动禁用
 
 # ── 代理池加权选择（_weighted_pick）的参数 ──
@@ -391,8 +413,8 @@ async def update_subscription(
 async def refresh_subscription_traffic(sub_id: int) -> dict:
     """流量统计实时回填：轻量拉订阅响应头 subscription-userinfo。
 
-    面板流量随消耗实时增长，仅在内核启动时落库会滞后数十 GB（用户
-    实证 315 GB 停滞 vs 实际 318）。只更新 lastStats.traffic，不动
+    面板流量随消耗实时增长，仅在内核启动时落库会滞后数十 GB（曾见
+    315 GB 停滞 vs 实际 318）。只更新 lastStats.traffic，不动
     config.yaml、不重启内核；失败抛 ValueError 由路由转 400/502。
     """
     sub = await get_subscription(sub_id)
@@ -746,18 +768,21 @@ async def _check_single(proxy: Proxy) -> dict:
 
 
 async def _check(proxy: Proxy) -> tuple[str, int | None, str | None]:
-    """对真实 Steam 端点测延迟。返回 (status, latency_ms, error)。"""
+    """对生产抓取端点测延迟。返回 (status, latency_ms, error)。"""
     started = time.monotonic()
     status, latency, error = "failed", None, None
     try:
         async with httpx.AsyncClient(timeout=TEST_TIMEOUT, proxy=proxy.url()) as client:
             resp = await client.get(TEST_URL, params=TEST_PARAMS)
             latency = int((time.monotonic() - started) * 1000)
-            if resp.status_code == 200:
+            if _steam_payload_ok(resp):
                 status = "ok"
                 proxy.consecutive_failures = 0
             else:
-                error = f"HTTP {resp.status_code}"
+                error = (
+                    f"HTTP {resp.status_code}" if resp.status_code != 200
+                    else "非 JSON 响应（疑似风控拦截页）"
+                )
                 proxy.consecutive_failures += 1
     except Exception as e:  # noqa: BLE001
         latency = int((time.monotonic() - started) * 1000)
@@ -773,7 +798,7 @@ async def _check(proxy: Proxy) -> tuple[str, int | None, str | None]:
     proxy.last_checked_at = _naive(get_beijing_time_obj())
 
     await record_event(
-        kind="test", target=TEST_URL, proxy_label=proxy_label(proxy),
+        kind="test", target=TEST_TARGET, proxy_label=proxy_label(proxy),
         status_code=None, duration_ms=latency, error=error,
     )
     return status, latency, error
@@ -1015,7 +1040,7 @@ async def import_plain_subscription(sub_id: int, timeout: float = 30.0) -> dict:
         stats["checked"] = len(checked)
         stats["alive"] = sum(1 for r in checked if r.get("status") == "ok")
         logger.info(
-            "[导入体检] plain:%s 新增 %s 条，实测通过 %s/%s",
+            "[导入体检] plain:%s 新增 %s 条，实际通过 %s/%s",
             sub_id, added, stats["alive"], stats["checked"],
         )
     await mark_imported(sub_id, stats)
@@ -1161,10 +1186,14 @@ async def test_clash_nodes(subscription_id: int | None = None) -> dict:
         selector = groups[0]["name"] if groups else "GLOBAL"
 
         async def _probe_steam(client: httpx.AsyncClient) -> bool:
-            """Steam 端点存活探测（与手动代理池 _check 同一端点参数）。"""
+            """生产端点存活探测（与手动代理池 _check 同一端点与判据）。
+
+            判据 = 200 且 body 是 JSON 对象（见 _steam_payload_ok）——
+            节点真能服务生产流量才算活，风控拦截页不算。
+            """
             try:
                 resp = await client.get(TEST_URL, params=TEST_PARAMS, timeout=TEST_TIMEOUT)
-                return resp.status_code == 200
+                return _steam_payload_ok(resp)
             except Exception:  # noqa: BLE001
                 return False
 
