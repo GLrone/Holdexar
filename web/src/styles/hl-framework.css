@@ -1786,26 +1786,16 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
 
 /* 尾部哨兵（无限滚动观察点，HlScrollList 组件内常驻）。取 1px 而非 0——
    0 高元素在部分引擎里不产生交叉回调；视觉不可见，消费方的加载态走
-   #footer 插槽渲染在它前面。 */
-.hl-scroll-list__tail { height: 1px; }
-
-/* 进出视口的显隐。**用位移+透明度，不用 scale**：旧实现是 `scale(0.7)`，
-   缩放对前庭敏感用户不友好，且项目内其它出入场（.hl-pane-*、抽屉、弹层）
-   统一是位移这一套。时长挂 --motion-scale，系统级「减少动态效果」下归零。
-   注：这两个属性必须逐条给出时长——写成 `transition: all` 会让 .is-in 的
-   transform 与 opacity 之外的变化一并参与插值（如条目内容变化时的重排）。 */
-.hl-scroll-list__item {
-  opacity: 0;
-  transform: translateY(14px);
+/* 进出视口的显隐。**用位移+透明度，不用 scale**：缩放对前庭敏感用户不友好，
+   且项目内其它出入场（.hl-pane-*、抽屉、弹层）统一是位移这一套。时长挂
+   --motion-scale，系统级「减少动态效果」下归零。
+   注：这两个属性必须逐条给出时长——写成 `transition: all` 会让 data-entered 的
+   transform 与 opacity 之外的变化一并参与插值（如条目内容变化时的重排）。
+   入场标记用 data 属性而非 class：组件手工加的类会在 Vue 覆写 className 时被抹掉
+   （条目 class 绑定一变就触发），手加属性不受 patch 影响。 */
   transition:
     opacity calc(var(--duration-4) * var(--motion-scale)) var(--ease-out),
-    transform calc(var(--duration-4) * var(--motion-scale)) var(--ease-out);
-  cursor: pointer;
-}
-.hl-scroll-list__item.is-in { opacity: 1; transform: none; }
-
-/* 默认条目外观（consumer 未提供 #item 插槽时的兜底）。
-   `.is-selected` 有意不加样式：选中态要不要可见是消费方的事
+.hl-scroll-list__item[data-entered] { opacity: 1; transform: none; }
    （插槽的 `selected` 属性给了它这个信息），组件自作主张画个环，
    在「点卡片是打开详情」的列表里就是个去不掉的残留高亮。 */
 .hl-scroll-list__text {
