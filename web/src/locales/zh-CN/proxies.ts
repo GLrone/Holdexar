@@ -136,7 +136,7 @@ const proxies = {
   'proxies.plain.importing': '导入中…',
   'proxies.plain.importToast': '正在拉取订阅并导入节点…',
   'proxies.plain.imported': '导入完成：新增 {added} 条，跳过重复 {skipped} 条',
-  'proxies.plain.importedChecked': '导入完成：新增 {added} 条，跳过重复 {skipped} 条，实测可用 {alive}/{checked}',
+  'proxies.plain.importedChecked': '导入完成：新增 {added} 条，跳过重复 {skipped} 条，可用 {alive}/{checked}',
   'proxies.plain.lastImport': '上次导入 +{n}',
 
   /* 节点池 */

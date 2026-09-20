@@ -230,17 +230,25 @@ class StoreBrowseAPI:
                 **(DATA_REQUEST_EXTRAS if extras else {}),
             },
         }
-        qs = urllib.parse.urlencode(
-            {"input_json": json.dumps(body, separators=(",", ":"))}, safe=_URL_SAFE
-        )
-        # ⚠ 坑（实测）：aiohttp 用 yarl 建 URL，会把 `{ } "` 再百分号编码一遍，
-        # 7.5KB 的 400 条 URL 被撑到 ~9.2KB → Steam 直接 400。encoded=True 声明
-        # 「已编码、别再动」，保住 400 条/发的硬限制。
-        return URL(f"{BROWSE_URL}?{qs}", encoded=True)
-
+        # ⚠ 坑：aiohttp 用 yarl 建 URL，会把 `{ } "` 再百分号编码一遍，
     @staticmethod
-    def build_url(appids: list[int], cc: str, lang: str, extras: bool = True) -> URL:
-        return StoreBrowseAPI.build_ids_url(
+    def probe_url(cc: str = "us", appid: int = 220) -> str:
+        """健康探针 URL：单 appid、不带 extras（最小负载）。
+
+        **必须与生产主链路同主机、同路径、同编码**——生产打
+        `api.steampowered.com/IStoreBrowseService`，而旧探针打的是
+        `store.steampowered.com/api/appdetails`：两者不是同一个主机，
+        同一条链路对两者的可达性并不一致，体检通不代表生产可用。
+        220 = Half-Life 2，长期在售，不会命中下架分支。
+
+        返回 str 供 httpx 使用；生产链路自己走 yarl.URL(encoded=True)。
+        """
+        return str(
+            StoreBrowseAPI.build_ids_url(
+                [{"appid": int(appid)}], cc, "english", extras=False
+            )
+        )
+
             [{"appid": int(a)} for a in appids], cc, lang, extras
         )
 

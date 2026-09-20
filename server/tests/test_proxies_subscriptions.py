@@ -470,7 +470,7 @@ async def test_import_plain_checks_only_new_nodes(db, monkeypatch):
     assert stats["fetched"] == 3
     assert stats["added"] == 2
     assert stats["skipped"] == 1
-    assert stats["checked"] == 2  # 只实测新增行
+    assert stats["checked"] == 2  # 只检测新增行
     assert stats["alive"] == 1
     assert sorted(calls) == [("8.8.8.8", 3128), ("9.9.9.9", 1080)]
 
@@ -487,7 +487,7 @@ async def test_import_plain_checks_only_new_nodes(db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_import_plain_all_duplicates_no_check(db, monkeypatch):
-    """全部重复（added=0）：不触发任何实测，stats 不带 checked/alive 键。"""
+    """全部重复（added=0）：不触发任何检测，stats 不带 checked/alive 键。"""
     sub_id = await _add_sub(db, kind="plain")
     async with db() as session:
         session.add(Proxy(scheme="http", host="1.1.1.1", port=8080, enabled=True))
