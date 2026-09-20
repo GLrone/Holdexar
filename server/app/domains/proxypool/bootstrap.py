@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import yaml
 
 from app.domains.proxies.models import ProxySubscription
+from app.domains.proxypool.admission import is_admitted
 from app.domains.proxypool.pool import (
     build_pool, eligible_runtime_names, pool_path,
 )
@@ -65,6 +67,8 @@ from app.domains.proxypool.subscription import (
 
 _single_flight = asyncio.Lock()
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class SyncResult:
@@ -74,6 +78,9 @@ class SyncResult:
     pool_names: tuple[str, ...]
     pool_changed: bool
     failures: dict[int, str]
+    # 本次只落快照、**未进 Registry** 的订阅（生产准入为 CANDIDATE）。
+    # 事实留存（快照 + 字节），生产侧无感：不产生节点/来源、不进 eligible、不改签名。
+    skipped_candidates: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -106,6 +113,12 @@ async def sync_subscriptions(
 ) -> SyncResult:
     """订阅 → 快照 → Registry。**Runtime 层不参与，也拿不到 subscription URL。**
 
+    生产准入（见 `admission.py`）：**CANDIDATE 在落完快照后停止**——不调用
+    `apply_snapshot`，因此不产生 ProxyNode/ProxyNodeSource、不进 eligible/pool、
+    不改 `pool_signature`、不触发 rebuild、不进健康与作业台账的来源事实；
+    它的证据仍然完整（`subscription_snapshots` 行 + 内容寻址字节）。
+    ACTIVE 保持既有行为（persist → apply）。
+
     抓取走既有通道链语义：`direct → kernel_proxy → pool_proxy`。直连被墙/超时是常态，
     所以 kernel_proxy（现有 Mihomo 内核的代理）是真实可用的第二通道——但它**只是订阅
     获取的辅助通道**，绝不是 crawler 的代理，也不构成 proxypool Runtime 的回退。
@@ -115,6 +128,7 @@ async def sync_subscriptions(
     shas: dict[int, str] = {}
     counts: dict[int, int] = {}
     failures: dict[int, str] = {}
+    skipped: list[int] = []
     channels = build_channels(kernel_proxy=kernel_proxy, pool_proxy=pool_proxy)
 
     for sub in subs:
@@ -123,9 +137,21 @@ async def sync_subscriptions(
             nodes = parse_nodes(result.raw, result.fmt)
             snap = build_snapshot(sub.id, str(sub.url), result, nodes, now=now)
             await persist_snapshot(session, snap, data_dir=data_dir)
-            await apply_snapshot(
-                session, subscription_id=sub.id, snapshot=snap, now=now
-            )
+            # 准入判定必须**现读**：`subs` 是轮询开始时加载的，抓取可能耗时几十秒，
+            # 期间这条订阅可能已经被晋升（或本来就是候选）。用陈旧对象判定会出现：
+            # 同步落盘了更新的快照、却因为"当初是候选"而跳过 apply → 订阅已是 ACTIVE
+            # 而 Registry 仍停在旧快照。刷新一次再判，代价是一条 SELECT。
+            await session.refresh(sub)
+            if is_admitted(sub):
+                await apply_snapshot(
+                    session, subscription_id=sub.id, snapshot=snap, now=now
+                )
+            else:
+                skipped.append(sub.id)
+                logger.info(
+                    "[同步] 订阅 %s 为 CANDIDATE：快照已落盘（%s，%d 条），不进 Registry",
+                    sub.id, snap.sha256[:10], len(nodes),
+                )
         except Exception as exc:  # noqa: BLE001 —— 单条订阅失败不阻断其它
             message = str(exc)[:500] or type(exc).__name__
             failures[sub.id] = message
@@ -152,6 +178,7 @@ async def sync_subscriptions(
         pool_names=names,
         pool_changed=names != before,
         failures=failures,
+        skipped_candidates=tuple(skipped),
     )
 
 

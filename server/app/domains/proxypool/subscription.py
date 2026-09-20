@@ -450,6 +450,8 @@ async def persist_snapshot(session, snap: Snapshot, *, data_dir: Path
         sha256=snap.sha256,
         format=snap.fmt,
         raw_path=str(path),
+        # URL 是快照的 provenance：换链接后靠它把"旧链接的成功快照"排除掉
+        url=snap.url,
         node_count=snap.node_count,
         status="OK",
         http_status=snap.http_status,
@@ -471,17 +473,24 @@ async def latest_snapshot(
     行 → 读回 `raw_path` → 严格解码并重新解析节点。少了这个出口，每个调用方都会
     自己重拼一遍（并很容易拼丢严格解码、`node_count` 口径、sha 校验）。
 
+    - `url` 非空时**只认从该 URL 抓下来的成功快照**：订阅换链接等于换了一个机场
+      （见 `update_subscription`），旧链接的成功快照不得被当成当前订阅的事实——
+      否则会出现「订阅 url=B、Registry 却来自 Snapshot(A)」，而且返回的对象还会
+      谎报 `url=B`。当前 URL 没有成功快照 → `None`（调用方按「还需重新成功抓取」处理）；
     - 没有行 → `None`（首次订阅，调用方按「全部 ADDED」处理）；
     - 行在、字节读不回 / sha 对不上 / 已不可解析 → `SnapshotRecoveryError`
       （fail-closed，见该异常说明：静默当成没有上一份会让 REMOVED 判空）。
     """
-    row = await session.scalar(
+    stmt = (
         select(SubscriptionSnapshot)
         .where(SubscriptionSnapshot.subscription_id == subscription_id)
         .where(SubscriptionSnapshot.status == "OK")
         .order_by(SubscriptionSnapshot.id.desc())
         .limit(1)
     )
+    if url:
+        stmt = stmt.where(SubscriptionSnapshot.url == url)
+    row = await session.scalar(stmt)
     if row is None:
         return None
     if not row.raw_path:
@@ -511,7 +520,9 @@ async def latest_snapshot(
 
     return Snapshot(
         subscription_id=row.subscription_id,
-        url=url,
+        # 真实的来源 URL 来自快照行本身——不能回显调用方的入参，否则换链接后
+        # 会把旧链接的内容标成新链接（调用方无从察觉）
+        url=row.url or url,
         fetched_at=row.fetched_at or datetime.now(),
         http_status=row.http_status or 0,
         content_type=row.content_type or "",

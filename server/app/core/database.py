@@ -113,6 +113,15 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "last_error": "VARCHAR(500)",
         "snapshot_sha256": "VARCHAR(64)",
         "snapshot_version": "INTEGER DEFAULT 0",
+        # 生产准入（订阅级）：库层默认 ACTIVE —— **只为把已存在的历史行兼容成
+        # ACTIVE**；新行由模型默认 CANDIDATE（见 proxies/models.py 常量说明）。
+        "admission_status": "VARCHAR(16) DEFAULT 'ACTIVE'",
+    },
+    # 快照的**来源 URL**（provenance）：订阅可换链接，换链接后旧链接的成功快照
+    # 不得被当成当前订阅的事实（否则 URL=B 而 Registry 来自 Snapshot(A)）。
+    # 历史行无此列 → 读回为 NULL（调用方按"当前 URL 没有成功快照"fail-closed）。
+    "subscription_snapshots": {
+        "url": "VARCHAR(500)",
     },
     # account 域多账号在线状态（GetPlayerSummaries/miniprofile 双通道）
     "steam_accounts": {
