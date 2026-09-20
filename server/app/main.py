@@ -17,6 +17,7 @@ from app.core.database import init_db
 from app.core.logging import setup_logging
 from app.core.scheduler import start_scheduler, stop_scheduler
 from app.domains.account.router import router as account_router
+from app.domains.achievements.router import router as achievements_router
 from app.domains.alerts.router import router as alerts_router
 from app.domains.bills.router import router as bills_router
 from app.domains.bundles.router import router as bundles_router
@@ -360,6 +361,7 @@ def create_app() -> FastAPI:
     app.include_router(system_router, prefix="/api/v1")
     app.include_router(settings_router, prefix="/api/v1")
     app.include_router(games_router, prefix="/api/v1")
+    app.include_router(achievements_router, prefix="/api/v1")
     app.include_router(metadata_router, prefix="/api/v1")
     app.include_router(wishlist_router, prefix="/api/v1")
     app.include_router(crawl_router, prefix="/api/v1")

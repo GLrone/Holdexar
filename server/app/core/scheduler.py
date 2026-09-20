@@ -26,6 +26,23 @@ logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
 
 
+async def _job_achievements_sync() -> None:
+    """成就快照日刷（cron 05:20，错开 03:00 汇率与 04:30 WAL 收缩）：
+    已购时长 + 成就进度 + 明细增量。凭证缺失/Steam 拒绝只留日志——
+    成就页的手动同步与首次进入自动同步是主通道，定时只做保鲜。"""
+    from app.domains.achievements import service as achievements_service
+
+    try:
+        steamid, creds = await achievements_service.resolve_credentials()
+        if not steamid or not creds:
+            logger.info("[定时] 成就同步跳过：未绑定账号或无可用凭证")
+            return
+        snap = await achievements_service.start_sync()
+        logger.info("[定时] 成就同步已发起（running=%s）", snap.get("running"))
+    except Exception:  # noqa: BLE001 —— 已在进行中/通道失败不反复打扰
+        logger.info("[定时] 成就同步未发起（占用或通道不可用）")
+
+
 async def _job_wishlist_sync() -> None:
     """账户同步（15min）：池成员资格层——拉账户愿望单/已购、差异入库。
     新增条目的即时首爬受 crawl.auto_price 管辖：开 = 即时首爬（占用时
@@ -804,6 +821,7 @@ def start_scheduler() -> None:
     )
     scheduler.add_job(_job_wallet_sync, "interval", minutes=1, id="wallet_sync")
     scheduler.add_job(_job_bills_sync, "interval", minutes=30, id="bills_sync")
+    scheduler.add_job(_job_achievements_sync, "cron", hour=5, minute=20, id="achievements_sync")
     # 热销榜：发现面 5 页（500 条，其中前 100 条仍作 TOP100 展示序）；
     # 首轮反哺放宽到 500 一次补满初始游戏库，并登记预设池清单（随种子分发）
     scheduler.add_job(
