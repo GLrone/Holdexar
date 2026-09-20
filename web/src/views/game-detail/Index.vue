@@ -32,6 +32,7 @@ interface RegionRow {
   cnyFen: number
   discount: number
   locked: boolean
+  free: boolean // cents=0 的免费态（f2p/限时赠送）：显示「免费」而非锁区/¥0
 }
 
 const route = useRoute()
@@ -78,7 +79,9 @@ const regionRows = computed<RegionRow[]>(() => {
     nativePrice: cell[0],
     cnyFen: cell[1],
     discount: cell[3] ?? 0,
-    locked: !cell[1],
+    // cents=0 = 免费态（cny_fen 合法为 0）；locked 只剩 cnyFen 缺失且非免费的行
+    free: cell[2] === 0,
+    locked: !cell[1] && cell[2] !== 0,
   }))
   return rows.sort((a, b) => {
     if (a.locked !== b.locked) return a.locked ? 1 : -1
@@ -86,10 +89,10 @@ const regionRows = computed<RegionRow[]>(() => {
   })
 })
 
-/** 非 CN 有价区 CNY 升序前三（金/银/铜奖牌） */
+/** 非 CN 有价区 CNY 升序前三（金/银/铜奖牌；免费行不参与——全 0 时奖牌无意义） */
 const medalRegions = computed<string[]>(() =>
   regionRows.value
-    .filter((r) => r.code !== 'CN' && !r.locked)
+    .filter((r) => r.code !== 'CN' && !r.locked && !r.free)
     .slice(0, 3)
     .map((r) => r.code),
 )
@@ -111,15 +114,31 @@ const asRow = (row: unknown): RegionRow => row as RegionRow
 const tableRows = computed(() => regionRows.value as unknown as Record<string, unknown>[])
 
 /** 后端 chinese_support 的取值（crawler/utils.py detect_chinese_support 产出
-    '无中文' / '简体中文' / '繁体中文'）——这是**数据值不是文案**，该字段自身的中文化
-    属期 7 数据层，故不建词条、值原样渲染，这里只判它决定标签配色。
+    '无中文' / '简体中文' / '繁体中文'）——这是**数据值不是文案**：不建词条、
+    值原样渲染，这里只判它决定标签配色。
     用正则字面量而不是 `=== '无中文'`：双语红线的 no-hardcoded-cjk 把正则字面量
     排除在「文案」之外（规则判不了字符集里是数据还是文案），而同一个中文字符串写成
     字符串字面量会被判成待迁文案。语义与 `=== '无中文'` 完全等价。 */
 const NO_CHINESE = /^无中文$/
 
 const cnRow = computed(() => regionRows.value.find((r) => r.code === 'CN') ?? null)
-const lowestRow = computed(() => regionRows.value.find((r) => r.code !== 'CN' && !r.locked) ?? null)
+const lowestRow = computed(() => regionRows.value.find((r) => r.code !== 'CN' && !r.locked && !r.free) ?? null)
+/** 限时免费截止日（promoEndAt 为 Unix 秒） */
+const promoEndDate = computed(() => {
+  const ts = detail.value?.promoEndAt
+  if (!ts) return ''
+  const d = new Date(ts * 1000)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+})
+
+/** 国区折扣截止日（Unix 秒；无折扣/未带促销元数据/已过期不展示——
+ *  过期只在抓取间隙出现，下一轮爬取会把现价行刷成无折扣） */
+const discountEndDate = computed(() => {
+  const ts = detail.value?.cnDiscountEndsAt
+  if (!ts || ts * 1000 <= Date.now()) return ''
+  const d = new Date(ts * 1000)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+})
 const savingsYuan = computed(() => {
   if (!detail.value?.savingsFen) return 0
   return Math.round(detail.value.savingsFen / 100)
@@ -134,8 +153,8 @@ const PRICE_COLUMNS = computed<HlTableColumn[]>(() => [
   { key: 'discount', label: t('gameDetail.price.col.discount'), width: '70px' },
   { key: 'save', label: t('gameDetail.price.col.save'), width: '90px', numeric: true },
 ])
-/** 只剩例外要写：折扣列同样是数字，但居中比右对齐更好读。
- *  原先这张表把四列对齐全写在这张映射里——对齐规则本该是 HlTable 的默认值。 */
+/** 只剩例外要写：折扣列同样是数字，但居中比右对齐更好读（对齐规则默认由
+ *  HlTable 提供，这里只登记例外）。 */
 const PRICE_ALIGN = { discount: 'center' }
 
 function priceRowClass(row: Record<string, unknown>): string {
@@ -190,7 +209,7 @@ const genresList = computed(() =>
     .filter(Boolean),
 )
 
-// 全版本浏览收拢在卡片走势抽屉「全部版本」区块（B1 拍板）；本页走势按
+// 全版本浏览在卡片走势抽屉「全部版本」区块；本页走势按
 // component-framework.html 模块 F 权威模版：Steam 价 + Key 店走线 + 史低平线
 // + 缩略导航 + 四格统计 + 事件时间线
 
@@ -455,7 +474,7 @@ onMounted(load)
             <div class="gd-sum-item">
               <div class="gd-sum-label">{{ t('gameDetail.region.cn') }}</div>
               <div class="gd-sum-value cn">
-                {{ cnRow && !cnRow.locked ? formatCnyFen(cnRow.cnyFen) : '—' }}
+                {{ cnRow?.free ? t('gameDetail.price.free') : cnRow && !cnRow.locked ? formatCnyFen(cnRow.cnyFen) : '—' }}
               </div>
             </div>
             <div v-if="lowestRow" class="gd-sum-item">
@@ -471,12 +490,20 @@ onMounted(load)
           </div>
 
           <!-- 折扣/史低标签 -->
-          <div v-if="headerHlType > 0 || ppTagVisible" class="gd-header-badges">
+          <div v-if="headerHlType > 0 || ppTagVisible || detail.freeKind === 'promo'" class="gd-header-badges">
+            <!-- 限时免费（promo 态）：显示赠送截止日 -->
+            <span v-if="detail.freeKind === 'promo'" class="gd-pp-tag gd-free-tag">
+              {{ t('gameDetail.promo.active', { date: promoEndDate }) }}
+            </span>
             <div v-if="headerHlType > 0" class="discount-badge" :class="`hl-type-${headerHlType}`">
               -{{ detail.cnDiscount }}%
               <span v-if="headerHlType === 1" class="db-text">{{ t('gameDetail.hl.newLow') }}</span>
               <span v-if="headerHlType === 2" class="db-text">{{ t('gameDetail.hl.sameLow') }}</span>
             </div>
+            <!-- 折扣截止（卡片折扣徽章悬停气泡的同源信息，详情页直接展示） -->
+            <span v-if="headerHlType > 0 && discountEndDate" class="gd-pp-tag gd-discount-ends">
+              {{ t('gameDetail.discount.endsAt', { date: discountEndDate }) }}
+            </span>
             <!-- 永降/永涨只在 14 天时效窗内展示（ppChangedAt 起算）：打折中显示
                  永降会被读成「这个折扣是永降」，变化超 14 天不再常驻 -->
             <span v-if="detail.ppFlag === 1 && ppTagVisible" class="gd-pp-tag gd-pp-tag--down">
@@ -635,7 +662,10 @@ onMounted(load)
                 <span v-else class="gd-price-native">{{ asRow(row).nativePrice }}</span>
               </template>
               <template #cny="{ row }">
-                <span v-if="asRow(row).locked" class="gd-price-locked">
+                <span v-if="asRow(row).free" class="gd-price-free">
+                  {{ t('gameDetail.price.free') }}
+                </span>
+                <span v-else-if="asRow(row).locked" class="gd-price-locked">
                   {{ t('gameDetail.price.locked') }}
                 </span>
                 <span
@@ -754,7 +784,7 @@ onMounted(load)
             <HlEmpty v-else size="sm" icon="" :text="t('gameDetail.trend.empty')" />
           </div>
 
-          <!-- ⑤ 多版本 → 已收拢到卡片走势抽屉「全部版本」区块（B1 拍板） -->
+          <!-- ⑤ 多版本 → 在卡片走势抽屉「全部版本」区块 -->
 
           <!-- ⑥ 关联捆绑包 -->
           <div v-if="detail.linkedBundles.length" class="gd-section-plain" data-section="gameDetail.section.bundles">
@@ -954,12 +984,38 @@ onMounted(load)
   border: 1px solid color-mix(in srgb, var(--danger-on-dark) 30%, transparent);
 }
 
-/* 外链键 */
+/* 限时免费标签（promo 态）：绿色系对齐降价语义 */
+.gd-free-tag {
+  background: color-mix(in srgb, var(--success-on-dark) 15%, transparent);
+  color: var(--success-on-dark);
+  border: 1px solid color-mix(in srgb, var(--success-on-dark) 30%, transparent);
+}
+
+/* 折扣截止（同在封面蒙版上，恒暗面定色：中性白微透，不与史低徽章抢色） */
+.gd-discount-ends {
+  background: color-mix(in srgb, var(--text-on-scrim) 12%, transparent);
+  color: var(--text-on-scrim);
+  border: 1px solid color-mix(in srgb, var(--text-on-scrim) 28%, transparent);
+}
+
+/* 价格表「免费」单元格 */
+.gd-price-free {
+  font-weight: 700;
+  color: var(--success);
+}
+
+/* 外链键：绝对定位钉在封面右上角，不参与行内打包。头部是一条
+   align-items: flex-end 的贴底打包行（摘要/徽章 align-self: flex-end、
+   行撑满容器高才成立）——links 若留在流内，行内任一元素变宽（如折扣
+   截止标签）就会把它挤到第二行，行按自然高度自顶重排，摘要与徽章
+   随之漂离封面底。 */
 .gd-header-links {
   display: flex;
   gap: 8px;
   flex-shrink: 0;
-  align-self: flex-start;
+  position: absolute;
+  top: 0;
+  right: 24px;
 }
 
 /* 下架提示条（移除监控）：判定下架时头部展示 */
@@ -1437,6 +1493,6 @@ html:not(.dark) .gd-link-icon.steamdb { filter: invert(1); }
   .gd-header { height: 170px; }
   .gd-header-content { padding: 0 12px 12px; }
   .gd-header-title { font-size: 20px; }
-  .gd-header-links { flex-wrap: wrap; }
+  .gd-header-links { flex-wrap: wrap; right: 12px; }
 }
 </style>

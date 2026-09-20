@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { gamesApi, familyApi, type GameListItem, type GameVersionPrices, type LinkedBundle } from '@/api/client'
+import { gamesApi, familyApi, type GameListItem, type GameSeriesInfo, type GameVersionPrices, type LinkedBundle } from '@/api/client'
 import { compactRegionName, flagUrl } from '@/api/regions'
 import { normalizeAvatarUrl } from '@/api/avatar'
 import { useI18n, useLocaleFormat, type MessageKey } from '@/locales'
@@ -27,6 +27,13 @@ import PriceTrendDrawer from './PriceTrendDrawer.vue'
 
 function formatCnyText(fen: number): string {
   return `¥${(fen / 100).toFixed(2)}`
+}
+
+/** Unix 秒 → YYYY-MM-DD（ISO 文本中英同形，与 removedAt.slice 同一口径） */
+function formatDateTs(ts: number): string {
+  const d = new Date(ts * 1000)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
 }
 
 /** CDK 第三方平台状态（跨域查价的终端化承接，数据由后端 cdk_fetcher 提供）*/
@@ -75,12 +82,14 @@ const coverRef = ref<HTMLElement | null>(null)
 const gpwBtnRef = ref<HTMLElement | null>(null)
 const gpwPopoverRef = ref<HTMLElement | null>(null)
 const popoverPos = ref<{ top: number; left: number } | null>(null)
+/** 弹窗自身尺寸监听（内容异步到位后重算落位），随开关挂卸 */
+let popoverResizeObserver: ResizeObserver | null = null
 
 // ─── 封面加载：失败随机延时重试（标准规则，见 component-framework.html）───
 // 最多 4 次，每次 0.8–3.2s 随机退避。重试 URL 走 assetCache 的**稳定**形态
-// （原先拼 `Date.now()` 使每次重试都是全新 URL，浏览器缓存与 CDN 边缘缓存
-// 双双失效）。「已放弃」状态也记在模块级登记处而**不是**组件 ref：卡片会随
-// 列表重挂载，ref 归零会让一张下架封面在每次切板块时重跑 5 次注定 404 的往返。
+// （拼 `Date.now()` 会让每次重试都是全新 URL，浏览器缓存与 CDN 边缘缓存双双失效）。
+// 「已放弃」状态记在模块级登记处而**不是**组件 ref：卡片会随列表重挂载，ref
+// 归零会让一张下架封面在每次切板块时重跑 5 次注定 404 的往返。
 const coverSrc = ref(resolveAssetUrl(props.game.headerImage))
 const coverRetries = ref(0)
 /** 初值问登记处：重挂载时已知失效的封面直接落占位，一次网络都不发 */
@@ -158,6 +167,13 @@ const removedText = computed(() =>
     : '',
 )
 
+/** 折扣截止 tooltip（悬停折扣徽章弹出）：无数据或已过期（抓取间隙）不展示 */
+const discountEndsTip = computed(() => {
+  const ts = props.game.discountEndsAt
+  if (props.game.discount <= 0 || !ts || ts * 1000 <= Date.now()) return ''
+  return t('gameCard.discount.endsAt', { date: formatDateTs(ts) })
+})
+
 // ─── 左上角归属状态徽章 + 游戏归属弹窗（状态徽章 + 悬停弹窗）───
 
 /** 徽章类型 → 词条键 / 弹窗标题键 / 标题色 / 边框色（与账号悬停卡同源配色）*/
@@ -165,9 +181,8 @@ const STATUS_META: Record<
   OwnershipType,
   { badgeKey: MessageKey; titleKey: MessageKey; color: string; border: string }
 > = {
-  // 取令牌而非字面量：原先这三个色是**深色主题**的取值（#a4d007 / #b37feb / #66c0f4
-  // 正是 html.dark 下的 --success / --purple / --accent），抄下来后浅色主题下
-  // 归属/共享/愿望单三种徽章一直挂着深色的色。令牌写法在 :style 里同样生效。
+  // 取令牌而非字面量：色值走 CSS 变量才能跟随主题（写死 html.dark 下的取值
+  // 会让浅色主题下徽章一直挂着深色的色）。令牌写法在 :style 里同样生效。
   //
   // 文案同理**存键不存值**：常量表在模块加载时求值一次，直接写 t() 的结果会把
   // 语言冻死在首次加载那一刻（同 PriceTrendDrawer 的 RANGE_OPTIONS）。显示文本
@@ -279,12 +294,21 @@ function statusTipLeave() {
   }, 120)
 }
 
-/** 徽章悬停 tooltip（悬停跟随定位）*/
-const hoveredBadge = ref<{ text: string; left: number; top: number } | null>(null)
+/** 徽章悬停 tooltip（默认悬停跟随定位在徽章上方；below=true 落徽章下方——
+ *  折扣徽章贴封面顶，上方放不下。文本为空（无数据可展示）不弹。 */
+const hoveredBadge = ref<{ text: string; left: number; top: number; below?: boolean } | null>(null)
 
-function badgeEnter(e: MouseEvent, text: string) {
+function badgeEnter(e: MouseEvent, text: string, below = false) {
+  if (!text) return
   const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
-  hoveredBadge.value = { text, left: rect.left, top: rect.top }
+  let left = rect.left
+  if (left + 180 > window.innerWidth) left = window.innerWidth - 188
+  hoveredBadge.value = {
+    text,
+    left: Math.max(8, left),
+    top: below ? rect.bottom + 6 : rect.top,
+    below,
+  }
 }
 function badgeLeave() {
   hoveredBadge.value = null
@@ -300,6 +324,8 @@ interface RegionPrice {
   cnyFen: number
   nativeCents: number
   locked: boolean
+  /** cents=0 的免费态（f2p/限时赠送）：显示「免费」而非锁区/¥0.00 */
+  free: boolean
   /** 爬过但未抓到价格（missing/blocked）：黄框「待更新」，区别于真锁区 */
   unavailable: boolean
 }
@@ -318,6 +344,7 @@ const regionPrices = computed<RegionPrice[]>(() =>
       cnyFen: 0,
       nativeCents: 0,
       locked: true,
+      free: false,
       unavailable,
     }
     if (!cell) return base
@@ -326,10 +353,15 @@ const regionPrices = computed<RegionPrice[]>(() =>
       nativePrice: cell[0],
       cnyFen: cell[1],
       nativeCents: cell[2],
-      locked: cell[1] === -1 || cell[1] === 0,
+      // cnyFen=0 且 cents=0 = 免费态；cnyFen=0 但 cents>0 = 汇率缺失（沿用锁区显示）
+      free: cell[2] === 0,
+      locked: cell[1] === -1 || (cell[1] === 0 && cell[2] !== 0),
     }
   }),
 )
+
+const cnRegion = computed(() => regionPrices.value.find((r) => r.code === 'cn') ?? null)
+const cnFree = computed(() => cnRegion.value?.free ?? false)
 
 /** 「我」页启用的地区（未启用不进 GPW 与低价计算） */
 function isEnabledCode(code: string): boolean {
@@ -410,20 +442,30 @@ function popoverWidth(): number {
 }
 
 /**
- * 弹窗落位：**顶对齐卡片顶** + 贴卡片右侧（右侧放不下翻左侧）。
+ * 弹窗落位：网格模式**顶对齐卡片顶** + 贴卡片右侧（右侧放不下翻左侧）；
+ * 列表模式吸附「全区价格」按键**左侧**（右缘距按键左缘 8px、顶随按键顶）——
+ * 行高只有 60px 且通栏，贴卡片右侧必溢出→翻边→被夹到屏幕最左，弹窗与按键
+ * 隔着整行内容。
  *
  * 竖向**不夹视口**——夹住的话「贴着卡片」只在卡片处于屏幕上中部时成立：卡片落到
  * 下半屏弹窗被上提一截，继续滚动又会被钉在屏幕边缘不动，用户看到的就是「滚轮一转，
- * 弹窗就不贴着卡片了」。卡片滚到哪弹窗跟到哪（超出视口的部分交给弹窗自身的
- * max-height 80vh + 内滚动），这才是「吸附」的完整语义。
+ * 弹窗就不贴着卡片了」。锚点（卡片/按键）滚到哪弹窗跟到哪（超出视口的部分交给
+ * 弹窗自身的 max-height 80vh + 内滚动），这才是「吸附」的完整语义。
  *
  * 坐标用文档坐标（rect + window.scrollY）：页面滚动发生在应用级滚动容器
  * `.view-container` 里、文档自身不滚，所以跟随必须靠自己重算（见 onViewportChange）。
  */
 function computePopoverPos() {
   if (!cardRef.value) return
-  const rect = cardRef.value.getBoundingClientRect()
   const w = popoverWidth()
+  if (props.layoutMode === 'list' && gpwBtnRef.value) {
+    const btnRect = gpwBtnRef.value.getBoundingClientRect()
+    let left = btnRect.left - w - 8
+    if (left < window.scrollX + 8) left = window.scrollX + 8
+    popoverPos.value = { top: btnRect.top + window.scrollY, left }
+    return
+  }
+  const rect = cardRef.value.getBoundingClientRect()
   let left = rect.right + 12 + window.scrollX
   if (rect.right + 12 + w > window.innerWidth) {
     left = rect.left - w - 12 + window.scrollX
@@ -455,16 +497,35 @@ function toggleGpw() {
     loadCdkForVersion()
     loadBundles()
     loadGpwVersions()
+    loadSeries()
     showGpw.value = true
     // 挂载后按真实尺寸再校一次（打开前量不到 DOM，只能按兜底尺寸估）
     void nextTick(() => {
       if (showGpw.value) computePopoverPos()
+      watchPopoverResize()
     })
     return
   }
   giftRegion.value = null
   showGpw.value = false
 }
+
+/** 弹窗内容（CDK / 捆绑包 / 版本表 / 图片）异步到位会改变自身高度：满高后文档
+ *  被撑出滚动条、视口窄 8px，锚点整体平移而弹窗没跟着走——落位是在内容到位前
+ *  算的，差的就是这一截。尺寸一变即重算，弹窗才始终贴住锚点。 */
+function watchPopoverResize() {
+  popoverResizeObserver?.disconnect()
+  const el = gpwPopoverRef.value
+  if (!el) return
+  popoverResizeObserver = new ResizeObserver(() => {
+    if (showGpw.value) computePopoverPos()
+  })
+  popoverResizeObserver.observe(el)
+}
+
+watch(showGpw, (v) => {
+  if (!v) popoverResizeObserver?.disconnect()
+})
 
 /** 列表 / 柱状图 tab 的宽度不同（360 / 480），切换后按新尺寸重排一次 */
 watch(activeTab, () => {
@@ -530,7 +591,7 @@ async function loadGpwVersions() {
   }
 }
 
-/** gpwRegions = 由版本数据决定展示内容，取代原先直取 regionPrices */
+/** gpwRegions = 由版本数据决定展示内容（而非直取 regionPrices） */
 const gpwRegions = computed(() => gpwDisplayPrices.value.filter((p) => isEnabledCode(p.code)))
 
 const sortedRegions = computed(() =>
@@ -612,6 +673,43 @@ async function loadBundles() {
   }
 }
 
+// ─── 同系列游戏（GPW 区块，打开时懒加载）───
+
+const seriesInfo = ref<GameSeriesInfo | null>(null)
+const seriesLoading = ref(false)
+let seriesFetched = false
+
+async function loadSeries() {
+  if (seriesFetched) return
+  seriesFetched = true
+  seriesLoading.value = true
+  try {
+    seriesInfo.value = await gamesApi.seriesInfo(props.game.appid)
+  } catch {
+    // 404（未识别到系列）与其他失败同语义：不渲染区块
+    seriesInfo.value = null
+  } finally {
+    seriesLoading.value = false
+  }
+}
+
+/** 点系列成员：进详情页（GPW 弹窗随路由离开自然销毁） */
+function openSeriesMember(appid: number) {
+  if (appid === props.game.appid) return
+  showGpw.value = false
+  giftRegion.value = null
+  router.push(`/game/${appid}`)
+}
+
+/** 系列成员按「本作在前 + 国区现价升序」排：同系列比价先看在售的 */
+const seriesMembers = computed(() => {
+  const members = seriesInfo.value?.members ?? []
+  return [...members].sort((a, b) => {
+    if (a.isSelf !== b.isSelf) return a.isSelf ? -1 : 1
+    return (a.cnPriceFen ?? Number.MAX_SAFE_INTEGER) - (b.cnPriceFen ?? Number.MAX_SAFE_INTEGER)
+  })
+})
+
 function lowestRegionName(code: string): string {
   return regionsStore.regionName(code)
 }
@@ -633,11 +731,14 @@ watch(
     cdkCici.value = null
     bundlesFetched = false
     linkedBundles.value = []
+    seriesFetched = false
+    seriesInfo.value = null
     // 弹窗还开着（列表在弹窗下方重排）：立刻按新游戏重取，别停在空白/上一款的数据上
     if (showGpw.value) {
       loadCdkForVersion()
       loadBundles()
       loadGpwVersions()
+      loadSeries()
     }
   },
 )
@@ -681,6 +782,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('mousedown', onDocClick)
   document.removeEventListener('scroll', onViewportChange, { capture: true })
   window.removeEventListener('resize', onViewportChange)
+  popoverResizeObserver?.disconnect()
   if (coverTimer) window.clearTimeout(coverTimer)
   if (statusTipTimer !== null) window.clearTimeout(statusTipTimer)
 })
@@ -894,12 +996,17 @@ const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/asse
         {{ statusBadgeText }}<span class="sb-q">?</span>
       </div>
 
-      <!-- 折扣 & 史低标签（仅网格模式，列表模式进标题行） -->
+      <!-- 折扣 & 史低标签（仅网格模式，列表模式进标题行）；悬停弹折扣截止 -->
       <div
         v-if="game.discount > 0 && layoutMode !== 'list'"
         class="discount-badges-container"
       >
-        <div class="discount-badge" :class="`hl-type-${hlType}`">
+        <div
+          class="discount-badge"
+          :class="`hl-type-${hlType}`"
+          @mouseenter="badgeEnter($event, discountEndsTip, true)"
+          @mouseleave="badgeLeave"
+        >
           <span>-{{ game.discount }}%</span>
           <span class="db-text">{{ hlText }}</span>
         </div>
@@ -965,7 +1072,12 @@ const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/asse
           v-if="layoutMode === 'list' && game.discount > 0"
           style="display: flex; gap: 4px; align-items: center; margin-left: auto; padding-left: 8px; flex-shrink: 0"
         >
-          <div class="discount-badge" :class="`hl-type-${hlType}`">
+          <div
+            class="discount-badge"
+            :class="`hl-type-${hlType}`"
+            @mouseenter="badgeEnter($event, discountEndsTip, true)"
+            @mouseleave="badgeLeave"
+          >
             <span>-{{ game.discount }}%</span>
             <span class="db-text">{{ hlText }}</span>
           </div>
@@ -1106,8 +1218,8 @@ const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/asse
             <img :src="flagUrl('cn')" class="flag-icon" alt="CN" />
             {{ t('gameCard.price.cn') }}
           </span>
-          <span class="price-value cn">
-            {{ regionPrices.find((r) => r.code === 'cn')?.locked ? '—' : formatCnyText(cnPriceFen) }}
+          <span class="price-value cn" :class="{ 'is-free': cnFree }">
+            {{ cnFree ? t('gameCard.price.free') : regionPrices.find((r) => r.code === 'cn')?.locked ? '—' : formatCnyText(cnPriceFen) }}
           </span>
         </div>
 
@@ -1132,7 +1244,8 @@ const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/asse
             <img :src="flagUrl('cn')" class="flag-icon" alt="CN" />
             {{ t('gameCard.price.cnLowest') }}
           </span>
-          <span class="price-value lowest">¥{{ (cnPriceFen / 100).toFixed(2) }}</span>
+          <span v-if="cnFree" class="price-value lowest is-free">{{ t('gameCard.price.free') }}</span>
+          <span v-else class="price-value lowest">¥{{ (cnPriceFen / 100).toFixed(2) }}</span>
         </div>
 
         <div class="price-row">
@@ -1164,11 +1277,15 @@ const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/asse
     <Teleport to="body">
       <!-- 徽章浮字。原为十属性行内 style，其中 background 是深色 --surface-float 的取值、
            color 是 #fff、border 是深色 --row-border —— 浅色主题下白底浮窗配白字。
-           移入 .cf-badge-tip 走令牌，留行内只做定位。 -->
+           移入 .cf-badge-tip 走令牌，留行内只做定位。below 态落徽章下方，transform 复位。 -->
       <div
         v-if="hoveredBadge"
         class="cf-badge-tip"
-        :style="{ left: hoveredBadge.left + 'px', top: hoveredBadge.top - 4 + 'px' }"
+        :class="{ below: hoveredBadge.below }"
+        :style="{
+          left: hoveredBadge.left + 'px',
+          top: (hoveredBadge.below ? hoveredBadge.top : hoveredBadge.top - 4) + 'px',
+        }"
       >
         {{ hoveredBadge.text }}
       </div>
@@ -1271,6 +1388,7 @@ const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/asse
               <span v-if="rec.locked" class="locked">{{
                 rec.unavailable ? t('gameCard.region.pending') : t('gameCard.region.locked')
               }}</span>
+              <span v-else-if="rec.free" class="free-tag">{{ t('gameCard.price.free') }}</span>
               <div v-else class="prices">
                 <span class="orig">{{ rec.nativePrice }}</span>
                 <span class="cny" :class="priceClass(rec)">¥{{ (rec.cnyFen / 100).toFixed(2) }}</span>
@@ -1318,6 +1436,36 @@ const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/asse
                 :class="`medal-${sortedRegions.indexOf(rec)}`"
                 alt="medal"
               />
+            </div>
+          </div>
+
+          <!-- 同系列游戏（服务端名称聚类，打开 GPW 时懒加载；未识别到系列不渲染） -->
+          <div v-if="seriesInfo" class="series-section">
+            <div class="series-head">
+              <span class="series-title">🧬 {{ seriesInfo.seriesName }}</span>
+              <span class="series-count">{{ t('gameCard.series.count', { n: seriesMembers.length }) }}</span>
+            </div>
+            <div class="series-list">
+              <button
+                v-for="m in seriesMembers"
+                :key="m.appid"
+                class="series-item"
+                :class="{ self: m.isSelf }"
+                :title="m.isSelf ? undefined : t('gameCard.series.openTip')"
+                @click="openSeriesMember(m.appid)"
+              >
+                <HlImg :src="m.headerImage" :alt="m.name" class="series-cover" />
+                <span class="series-name">{{ m.name }}</span>
+                <span v-if="m.isSelf" class="series-self-chip">{{ t('gameCard.series.self') }}</span>
+                <span class="series-prices">
+                  <span v-if="m.cnPriceFen" class="series-cn">¥{{ (m.cnPriceFen / 100).toFixed(0) }}</span>
+                  <span v-else class="series-noprice">-</span>
+                  <span
+                    v-if="m.savingsFen > 0"
+                    class="series-save"
+                  >{{ t('gameCard.price.save', { amount: (m.savingsFen / 100).toFixed(0) }) }}</span>
+                </span>
+              </button>
             </div>
           </div>
 

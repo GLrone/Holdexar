@@ -256,10 +256,8 @@
 .status-badge.wishlist { background: linear-gradient(135deg, var(--accent), var(--accent-deep)); color: var(--ink-on-fill); }
 .status-badge .sb-q { font-size: 9px; opacity: .72; margin-left: 2px; font-weight: 400; }
 
-/* 徽章浮字（悬停状态的短提示）。原先写在 HlGameCard 模板的行内 style 里，
-   背景是深色 --surface-float 的取值 rgba(15,20,25,.95)、文字 #fff、描边是深色
-   --row-border——浅色主题下这三样凑成「白底白字」。移到这里与 .cf-status-tip 同源：
-   同一个浮层的两处配色不该一套走令牌、一套抄取值。 */
+/* 徽章浮字（悬停状态的短提示）。与 .cf-status-tip 同源：同一个浮层的两处配色
+   都走令牌，不抄 token 取值的字面量（抄深色取值会在浅色主题下凑成「白底白字」）。 */
 .cf-badge-tip {
     position: fixed;
     z-index: 10000;
@@ -278,6 +276,12 @@
 @keyframes cf-badge-tip-in {
     from { opacity: 0; }
     to { opacity: 1; }
+}
+
+/* 落徽章下方的变体（折扣徽章贴封面顶，上方放不下）：transform 复位，
+   top 值已按徽章 bottom + 6 给出 */
+.cf-badge-tip.below {
+    transform: none;
 }
 
 /* ==================== 游戏归属弹窗（悬停工具窗） ==================== */
@@ -518,9 +522,8 @@
     border-radius: 3px;
 }
 
-/* 省钱徽章：取「良好」语义色。原先写死 #27ae60→#1e8449 的祖母绿渐变——
-   其中 #1e8449 正是浅色 --rate-good 的取值，于是深色主题下这个徽章挂着浅色的绿。
-   令牌表里没有第二个祖母绿，渐变换成单色，语义回到 --rate-good。 */
+/* 省钱徽章：取「良好」语义色（--rate-good）。不用祖母绿渐变——令牌表里没有
+   第二个祖母绿，单色即语义。 */
 .diff-badge.positive { background: var(--rate-good); }
 
 /* ==================== 全区价格按钮 ==================== */
@@ -661,6 +664,79 @@
 .detail-item.unavailable-region .locked { color: var(--warning); }
 .bc-bar-group.unavailable-region .bc-bar { border: 1px solid var(--warning); }
 .bc-bar-group.unavailable-region .bc-bar-value { color: var(--warning); }
+
+/* ── 同系列区块（GPW 内，服务端名称聚类；未识别到系列不渲染）── */
+.series-section {
+    margin-top: 12px;
+    padding: 10px;
+    background: var(--accent-a08);
+    border-radius: 6px;
+    border: 1px solid var(--accent-a15);
+}
+.series-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+.series-title {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--accent);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.series-count {
+    flex-shrink: 0;
+    font-size: 10px;
+    color: var(--text-muted);
+}
+.series-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 216px;
+    overflow-y: auto;
+}
+.series-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px;
+    border-radius: 4px;
+    background: var(--surface-inset);
+    border: 1px solid var(--row-border);
+    cursor: pointer;
+    text-align: left;
+    transition: border-color calc(var(--duration-1) * var(--motion-scale));
+}
+.series-item:hover { border-color: var(--accent-a30); }
+.series-item.self { cursor: default; }
+.series-cover { width: 60px; height: 28px; border-radius: 3px; object-fit: cover; flex-shrink: 0; }
+.series-name {
+    flex: 1;
+    min-width: 0;
+    font-size: 11px;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.series-self-chip {
+    flex-shrink: 0;
+    font-size: 9px;
+    color: var(--accent);
+    background: var(--accent-a15);
+    padding: 1px 4px;
+    border-radius: 2px;
+}
+.series-prices { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.series-cn { font-size: 11px; font-weight: 600; color: var(--text-primary); }
+.series-noprice { font-size: 11px; color: var(--text-dim); }
+.series-save { font-size: 10px; font-weight: 700; color: var(--success); }
 
 .cdk-section-container {
     margin-top: 12px;
@@ -1076,6 +1152,16 @@
 .price-value.cheaper { color: var(--rate-good); }
 .price-value.expensive { color: var(--danger); }
 
+/* 免费态价格值（f2p/限时赠送，cents=0）：绿色对齐「省」语义 */
+.price-value.is-free { color: var(--success); }
+
+/* GPW 弹层免费单元格 */
+.free-tag {
+    color: var(--success) !important;
+    font-weight: 700 !important;
+    font-size: 11px;
+}
+
 .locked {
     color: var(--text-faint) !important;
     font-style: italic !important;
@@ -1321,9 +1407,8 @@
     flex: 1;
     display: grid;
     /* 1: Title, 2: Ratings, 3: SteamBtn, 4: PriceSection, 5: DetailsBtn
-       第 5 列按内容宽（全区价格 + 走势两键，flex 行内不换行）：原先固定 90px
-       装不下约 150px 的两键，居中溢出后左压差价列、右被卡片 overflow 裁掉
-       （「走势」按钮只露半个字的来源）。 */
+       第 5 列按内容宽（全区价格 + 走势两键，flex 行内不换行）：固定宽度装不下
+       约 150px 的两键，居中溢出后左压差价列、右被卡片 overflow 裁掉。 */
     grid-template-columns: minmax(120px, 1.2fr) minmax(100px, 1fr) 90px 220px minmax(156px, max-content);
     align-items: center;
     padding: 0 16px;

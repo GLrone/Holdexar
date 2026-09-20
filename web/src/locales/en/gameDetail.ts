@@ -24,6 +24,7 @@ const gameDetail: Partial<Record<MessageKey, string>> = {
   'gameDetail.summary.savings': 'You save',
   'gameDetail.hl.newLow': 'New low',
   'gameDetail.hl.sameLow': 'Ties low',
+  'gameDetail.discount.endsAt': 'Ends {date}',
   'gameDetail.pp.cut': 'Price cut',
   'gameDetail.pp.raise': 'Base price raised',
   'gameDetail.link.steamStore': 'Steam Store',
@@ -70,6 +71,8 @@ const gameDetail: Partial<Record<MessageKey, string>> = {
   'gameDetail.price.medalTip': 'All-region lowest price ranking (excluding CN)',
   'gameDetail.price.lowestTag': 'Lowest',
   'gameDetail.price.locked': 'Locked',
+  'gameDetail.price.free': 'Free',
+  'gameDetail.promo.active': 'Free until {date}',
   'gameDetail.price.save': 'Save ¥{amount}',
   'gameDetail.price.empty': 'No price data available',
 

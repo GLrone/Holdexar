@@ -401,6 +401,7 @@ export interface GameListItem {
   nameEn: string | null
   discount: number
   discountLabel: string
+  discountEndsAt?: number | null
   positiveRate: number | null
   reviewCount: number
   releaseDate: string
@@ -485,6 +486,9 @@ export interface LinkedBundle {
   diffFen: number
 }
 
+export interface GameSeriesMember {
+export interface GameSeriesInfo {
+  members: GameSeriesMember[]
 /** 捆绑包单区价格行（区键大写，来自 /bundles 列表聚合） */
 export interface BundleRegionPrice {
   priceMinor: number | null
@@ -547,6 +551,7 @@ export interface GameDetail extends GameListItem {
   cnPriceCents: number | null
   cnCnyFen: number | null
   cnDiscount: number
+  cnDiscountEndsAt?: number | null
   lowestRegionCode: string
   isAdult: boolean
   isVisualNovel: boolean
@@ -554,6 +559,8 @@ export interface GameDetail extends GameListItem {
   versions: GameVersion[]
   linkedBundles: LinkedBundle[]
   viewCount: number
+  freeKind: 'f2p' | 'promo' | null
+  promoEndAt: number | null
 }
 
 export interface HistoryPoint {
@@ -666,6 +673,8 @@ export const gamesApi = {
     request<{ results: GamePriceContextItem[] }>('POST', '/games/price-context-batch', { items }),
   bundles: (appid: number | string) =>
     request<{ bundles: LinkedBundle[] }>('GET', `/games/${appid}/bundles`),
+  seriesInfo: (appid: number | string) =>
+    request<GameSeriesInfo>('GET', `/games/${appid}/series`),
   cdk: (appid: number | string, subId?: number) =>
     request<{
       appid: number
