@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -43,6 +44,8 @@ from app.domains.proxypool.runtime import (
     rebuild_runtime,
     restore_selection,
 )
+
+logger = logging.getLogger(__name__)
 
 _pending = False
 
@@ -118,14 +121,25 @@ async def run_maintenance_cycle(
         return None
 
     previous = await current_global_selection(controller_url, secret)
-    l1 = await exit_ip_check_pool(
-        session, data_dir=data_dir, controller_url=controller_url, secret=secret,
-        now=now, **({"url": l1_url} if l1_url else {}),
-    )
-    l2 = await business_check_pool(
-        session, data_dir=data_dir, controller_url=controller_url, secret=secret,
-        now=now, appid=appid, **({"url": l2_url} if l2_url else {}),
-    )
+    # 每个探针各自兜异常：探针的程序异常不得逃到调度器——那会跳过调用方的 commit，
+    # 把本轮已经写好的 L0/L1 遥测一起回滚。异常只记日志、该层本轮无结果（空 tuple），
+    # 不改分类、不伪装成功。
+    try:
+        l1 = await exit_ip_check_pool(
+            session, data_dir=data_dir, controller_url=controller_url, secret=secret,
+            now=now, **({"url": l1_url} if l1_url else {}),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("[L1] 出口 IP 探针程序异常：本轮 L1 无结果")
+        l1 = ()
+    try:
+        l2 = await business_check_pool(
+            session, data_dir=data_dir, controller_url=controller_url, secret=secret,
+            now=now, appid=appid, **({"url": l2_url} if l2_url else {}),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("[L2] 业务探针程序异常：本轮 L2 无结果")
+        l2 = ()
 
     chosen = restore_selection(previous, await eligible_runtime_names(session))
     if chosen is not None:
