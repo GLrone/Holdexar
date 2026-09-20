@@ -29,7 +29,7 @@ const scope = ref<'appids' | 'wishlist'>('wishlist')
 
 /** 区服列表（服务端下发，含 enabled 状态）；null = 全部启用。
     作用：已购游戏抓取地区的全选/清空备选集与「跟随监控地区」计数
-    （监控地区的圈定已迁至监控池页，本页不再写 enabled 集）。 */
+    （监控地区的圈定在监控池页，本页不写 enabled 集）。 */
 const availableRegions = computed(() => regionsStore.list)
 /** 启用集现值（只读）：跟随态的已购抓取区数展示用 */
 const selectedCount = computed(() => regionsStore.enabledCodes.length)
@@ -347,6 +347,14 @@ const kindLabel = (kind: string) =>
     import: t('crawl.kind.import'),
     fav_import: t('crawl.kind.favImport'),
     pool_add: t('crawl.kind.poolAdd'),
+    family_wishlist: t('crawl.kind.familyWishlist'),
+    removed_retry: t('crawl.kind.removedRetry'),
+    comingsoon_retry: t('crawl.kind.comingsoonRetry'),
+    free_promo_retry: t('crawl.kind.freePromoRetry'),
+    top100_backfill: t('crawl.kind.top100Backfill'),
+    popularnew_backfill: t('crawl.kind.popularnewBackfill'),
+    specials_backfill: t('crawl.kind.specialsBackfill'),
+    comingsoon_backfill: t('crawl.kind.comingsoonBackfill'),
   })[kind] ?? kind
 
 // ── 账户设置弹窗：按账户开关已购同步（库太大的账户可关，只盯愿望单）──
@@ -615,7 +623,7 @@ onMounted(() => {
           <!-- 整句一条词条，两枚 <code> 由词条自带、v-html 渲染（见 zh-CN/crawl.ts 的说明：
            切成三段会把两个代码标识符钉死在固定位置，英文只能拼出 "A → B" 这种
            读成转换关系的写法，而原意是嵌套）。词条是应用自有静态文案（非用户输入），
-           v-html 无注入面；本处无 code 样式，<code> 走浏览器默认，与迁移前逐字相同。
+           v-html 无注入面；本处无 code 样式，<code> 走浏览器默认。
            vue/no-v-html 未启用（flat/essential 不含），与 HlBanner / bundles 同款写法。 -->
           <div class="section-desc" v-html="t('crawl.fav.desc')"></div>
         </div>
@@ -1069,7 +1077,7 @@ onMounted(() => {
 .fav-tut__steps {
   margin: 0 0 4px;
   /* 序号标记画在左 padding 区，且全局 reset 会收走 list-style——
-     两处都要显式给回，否则步骤没有编号（实测复现） */
+     两处都要显式给回，否则步骤没有编号 */
   padding-left: 20px;
   list-style: decimal;
   font-size: 12.5px;

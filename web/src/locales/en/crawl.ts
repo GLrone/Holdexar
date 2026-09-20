@@ -167,6 +167,14 @@ const crawl: Partial<Record<MessageKey, string>> = {
   'crawl.kind.import': 'Bulk import',
   'crawl.kind.favImport': 'Favorites import',
   'crawl.kind.poolAdd': 'Pool add',
+  'crawl.kind.familyWishlist': 'Family wishlist sync',
+  'crawl.kind.removedRetry': 'Delisted retry',
+  'crawl.kind.comingsoonRetry': 'Coming soon re-probe',
+  'crawl.kind.freePromoRetry': 'Free promo retry',
+  'crawl.kind.top100Backfill': 'Top sellers backfill',
+  'crawl.kind.popularnewBackfill': 'New releases backfill',
+  'crawl.kind.specialsBackfill': 'Specials backfill',
+  'crawl.kind.comingsoonBackfill': 'Coming soon backfill',
 }
 
 export default crawl

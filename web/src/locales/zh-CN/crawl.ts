@@ -28,7 +28,7 @@
 
 const crawl = {
   /* ── 分节锚点（data-section 属性值 + 可见区块标题共用）──
-     监控地区的圈定已迁至监控池页（pool.section.regions），本页不再有该分节。 */
+     监控地区的圈定在监控池页（pool.section.regions），本页没有该分节。 */
   'crawl.section.start': '启动爬取',
   'crawl.section.bundleImport': '捆绑包导入',
   'crawl.section.bulkImport': '批量导入', // ← ProductTour 契约，勿改字符串
@@ -129,7 +129,7 @@ const crawl = {
   'crawl.action.save': '保存',
 
   /* ── 区服计数（已购游戏抓取地区分节的「跟随」计数展示）──
-     圈定监控地区的完整分节已迁至监控池页（pool.regions.*），本页只留
+     圈定监控地区的完整分节在监控池页（pool.regions.*），本页只留
      这一条计数句式给已购分节的「自定义」态角标用。 */
   'crawl.regions.selected': '已选 {n} / {total} 区',
 
@@ -179,6 +179,14 @@ const crawl = {
   'crawl.kind.import': '批量导入',
   'crawl.kind.favImport': '收藏导入',
   'crawl.kind.poolAdd': '添加监控',
+  'crawl.kind.familyWishlist': '家庭愿望单同步',
+  'crawl.kind.removedRetry': '下架重试',
+  'crawl.kind.comingsoonRetry': '即将推出重探',
+  'crawl.kind.freePromoRetry': '免费促销重试',
+  'crawl.kind.top100Backfill': '热销榜回补',
+  'crawl.kind.popularnewBackfill': '热门新品回补',
+  'crawl.kind.specialsBackfill': '特惠榜回补',
+  'crawl.kind.comingsoonBackfill': '即将推出回补',
 } as const
 
 export default crawl
