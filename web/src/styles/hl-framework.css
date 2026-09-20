@@ -88,8 +88,8 @@
   cursor: pointer;
   position: relative;
   overflow: hidden;
-  /* 手写时长改走刻度并挂动效总闸（原先靠 @media 里 .hl-btn-art{transition:none}
-     一锅端降级，顺带把颜色过渡也砍了） */
+  /* 时长走刻度并挂动效总闸（不要用 @media 里 transition:none 一锅端降级，
+     那会连颜色过渡一起砍掉） */
   transition:
     transform calc(var(--duration-4) * var(--motion-scale)) var(--ease-spring),
     box-shadow calc(var(--duration-4) * var(--motion-scale)) ease,
@@ -505,6 +505,48 @@
 .hl-select-wrap__caret { color: var(--text-faint); transition: transform 0.25s var(--ease-spring); }
 .hl-select-wrap.is-open .hl-select-wrap__caret { transform: rotate(180deg); }
 .hl-select-wrap__caret svg { width: 14px; height: 14px; }
+/* 多选触发器：chips 流式换行，盒子随行数增高（单行时仍是 34px 基线） */
+.hl-select-wrap--multi { height: auto; min-height: 34px; flex-wrap: wrap; padding: 5px 12px; row-gap: 3px; }
+.hl-select-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 0 6px;
+  border: 1px solid var(--border-soft);
+  border-radius: 4px;
+  background: var(--bg-soft);
+  font-size: 11.5px;
+  line-height: 18px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.hl-select-tag__label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hl-select-tag img { width: 15px; height: 11px; border-radius: 2px; object-fit: cover; flex-shrink: 0; }
+.hl-select-tag--more { color: var(--text-muted); background: transparent; }
+.hl-select-wrap__val--empty { color: var(--text-muted); }
+/* 弹层内搜索栏（searchable）：sticky 钉在滚动面板顶部，
+   负外距盖住弹层自身 padding，滚动时选项从搜索栏底下穿过 */
+.hl-select-search {
+  position: sticky;
+  top: -6px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: -6px -6px 4px;
+  padding: 7px 10px;
+  background: var(--bg-card);
+  border-bottom: 1px solid var(--border-soft);
+}
+.hl-select-search svg { width: 13px; height: 13px; color: var(--text-faint); flex-shrink: 0; }
+.hl-select-search__input { flex: 1; min-width: 0; border: none; outline: none; background: transparent; color: var(--text-primary); font-size: 12.5px; }
+.hl-select-search__input::placeholder { color: var(--text-muted); }
+/* 名称后的弱化说明小字（币种 ISO 代号等）：行内紧跟名称，不推到行尾 */
+.hl-dropdown-item__meta { font-size: 11px; color: var(--text-muted); font-family: var(--font-mono); }
+/* 多选已选项行尾勾选标记（单选不加，保持既有单选形态） */
+.hl-dropdown-item__check { margin-left: auto; color: var(--select-selected-fg); flex-shrink: 0; }
+.hl-dropdown-empty { padding: 12px; text-align: center; font-size: 12.5px; color: var(--text-muted); }
 .hl-dropdown-pop {
   position: absolute;
   top: calc(100% + 6px);
@@ -1146,6 +1188,18 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
    那条特异性 0,3,0 高于本条 0,2,0，不必也不该在这里重复——弹层 pointer-events:none，
    自身根本收不到 hover）。 */
 .hl-popper.is-bottom { bottom: auto; top: calc(100% + 8px); --tip-y: -4px; }
+/* fixed 定位变体：溢出容器（el-table 单元格 / 滚动区）内 absolute 气泡会被
+   overflow:hidden 整体裁掉，fixed 后代不参与祖先裁剪。坐标由组件在悬停时
+   按宿主矩形写行内 left/top（视口坐标），这里只关掉基准定位；translate 的
+   --tip-x/--tip-y 位移与 hover 归零机制照常生效。z 抬过表头/表体内部层。 */
+.hl-popper.is-fixed {
+  position: fixed;
+  bottom: auto;
+  left: auto;
+  top: auto;
+  right: auto;
+  z-index: 90;
+}
 .hl-popper.is-bottom::after {
   top: auto;
   bottom: 100%;
@@ -1153,7 +1207,7 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
   border-bottom-color: var(--bg-card);
 }
 .hl-popper.is-bottom.is-dark::after { border-bottom-color: var(--surface-overlay-solid); }
-/* 右缘对齐：等价于原先的 transform: none（translate(0%,0) 是恒等变换） */
+/* 右缘对齐：translate(0%,0) 是恒等变换 */
 .hl-popper.is-end { left: auto; right: 0; --tip-x: 0%; }
 .hl-popper.is-end::after { left: auto; right: 12px; margin-left: 0; }
 .hl-popconfirm {
@@ -1191,9 +1245,9 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
   z-index: 2000;
 }
 /* 毛玻璃由「内容自己模糊」实现，而不是遮罩的 backdrop-filter：
-   实测本机 WebView2 的合成路径下 backdrop-filter 只压暗不模糊（边缘能量恰好等于
-   纯压暗的预测值），普通 filter 在软件渲染下同样有效。半径比站内小弹层的 8px 大，
-   满屏尺度下 8px 糊感不足；补一点饱和度，色彩透过来才不灰成一片。
+   WebView2 的合成路径下 backdrop-filter 只压暗不模糊，普通 filter 在软件渲染下
+   同样有效。半径比站内小弹层的 8px 大，满屏尺度下 8px 糊感不足；补一点饱和度，
+   色彩透过来才不灰成一片。
    选择器按「外壳的直接子块」取（侧边栏 + 主列都在内），不写死组件根类名；遮罩自己排除在外。 */
 .app-shell.is-curtained > :not(.hl-close-curtain) {
   filter: blur(16px) saturate(1.2);
@@ -1786,6 +1840,9 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
 
 /* 尾部哨兵（无限滚动观察点，HlScrollList 组件内常驻）。取 1px 而非 0——
    0 高元素在部分引擎里不产生交叉回调；视觉不可见，消费方的加载态走
+   #footer 插槽渲染在它前面。 */
+.hl-scroll-list__tail { height: 1px; }
+
 /* 进出视口的显隐。**用位移+透明度，不用 scale**：缩放对前庭敏感用户不友好，
    且项目内其它出入场（.hl-pane-*、抽屉、弹层）统一是位移这一套。时长挂
    --motion-scale，系统级「减少动态效果」下归零。
@@ -1793,9 +1850,18 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
    transform 与 opacity 之外的变化一并参与插值（如条目内容变化时的重排）。
    入场标记用 data 属性而非 class：组件手工加的类会在 Vue 覆写 className 时被抹掉
    （条目 class 绑定一变就触发），手加属性不受 patch 影响。 */
+.hl-scroll-list__item {
+  opacity: 0;
+  transform: translateY(14px);
   transition:
     opacity calc(var(--duration-4) * var(--motion-scale)) var(--ease-out),
+    transform calc(var(--duration-4) * var(--motion-scale)) var(--ease-out);
+  cursor: pointer;
+}
 .hl-scroll-list__item[data-entered] { opacity: 1; transform: none; }
+
+/* 默认条目外观（consumer 未提供 #item 插槽时的兜底）。
+   `.is-selected` 有意不加样式：选中态要不要可见是消费方的事
    （插槽的 `selected` 属性给了它这个信息），组件自作主张画个环，
    在「点卡片是打开详情」的列表里就是个去不掉的残留高亮。 */
 .hl-scroll-list__text {
@@ -2145,14 +2211,13 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
 .hl-sidebar.is-collapsed {
   width: var(--sidebar-collapsed);
   padding: 20px 10px;
-  /* 裁剪保持开启（继承基础规则）。旧实现为让折叠态 tooltip 溢出而放开
-     overflow——代价是导航项一多，nav 的自动最小高度回到内容高，把底部
-     收拢钮顶出视口，收起后再也点不回来（用户报告的「收起后无法打开」）。
-     tooltip 已改原生 title，这里恢复滚动语义。 */
+  /* 裁剪保持开启（继承基础规则）。放开 overflow 会让折叠态 tooltip 溢出，
+     代价是导航项一多，nav 的自动最小高度回到内容高，把底部收拢钮顶出视口，
+     收起后再也点不回来。tooltip 走原生 title，这里保持滚动语义。 */
 }
 
-/* 头部行：品牌（logo + 品牌名）+ 展开态收起按键。旧实现的收拢钮在侧边栏
-   底部，导航项一多就被挤出视口——入口收敛到头部，永远可达。 */
+/* 头部行：品牌（logo + 品牌名）+ 展开态收起按键。收拢钮放头部保证永远可达
+   （放侧边栏底部时导航项一多就被挤出视口）。 */
 .hl-sb-head {
   display: flex;
   align-items: center;
@@ -2693,12 +2758,12 @@ html.dark .hl-theme-btn svg { transform: rotate(180deg); }
 /* ══════════ 动效降级 ══════════
    两条路子，分工明确：
 
-   ① **有限时长**（transition / 有限次 animation）不再逐条列名字——时长一律写成
+   ① **有限时长**（transition / 有限次 animation）不逐条列名字——时长一律写成
       calc(var(--duration-N) * var(--motion-scale))，闸一关就瞬时完成。tokens.css
-      的 --transition 已挂闸，全库 99 处 `var(--transition)` 自动生效。原先那份
-      「逐条列出动画名」的清单既漏（route-fade / drawer / dialog / pop / marquee /
-      ProductTour 呼吸 / 钱包脉冲全在外面），又滥（.hl-btn { transition: none }
-      连悬停/聚焦的**颜色**过渡都一起去掉了——颜色变化不是位移，不该被砍）。
+      的 --transition 已挂闸，全库 `var(--transition)` 自动生效。
+      不用「逐条列出动画名」的清单：既漏（route-fade / drawer / dialog / pop /
+      marquee / 呼吸与脉冲类），又滥（`transition: none` 连悬停/聚焦的**颜色**
+      过渡都一起去掉了——颜色变化不是位移，不该被砍）。
    ② **循环动画**（infinite）仍在这里显式关掉：0s 时长 + infinite 会让浏览器空转。 */
 @media (prefers-reduced-motion: reduce) {
   .hl-banner__track,
