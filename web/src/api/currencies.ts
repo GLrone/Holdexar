@@ -1,11 +1,10 @@
 /**
  * 币种元数据：**结构**（代号 + 国旗所属地区码）与查表出口。
  *
- * ⚠️ 这里**没有币种名**——名字在词典里（`locales/zh-CN/currencies.ts` 的
- * `currencies.name.<CODE>`）。原先的 `zh` 字段已随期 7 迁走，理由见该文件头注：
- * 39 个中文字面量写在这里会让本文件永远出不了 `I18N_LEGACY_FILES`（eslint 的
- * CJK 规则整目录豁免 `src/locales/**`，却如实扫 `api/**`），而那份存量清单的
- * 约定是「删空即表示迁移完成、红线全面生效」。取名字一律走 `currencyName()`。
+ * 这里**没有币种名**——名字在词典里（`locales/zh-CN/currencies.ts` 的
+ * `currencies.name.<CODE>`）：中文字面量写在这里会让本文件无法通过 eslint 的
+ * CJK 规则（它整目录豁免 `src/locales/**`，却如实扫 `api/**`）。取名字一律走
+ * `currencyName()`。
  *
  * 单一来源对齐 `server/app/crawler/config.py` 的 CC_LIST（41 区 → 37 种唯一货币，
  * 按 CC_LIST 首次出现顺序排列）；末尾 TRY / ARS 为服务端永久保留币种
@@ -104,4 +103,42 @@ export function currencyFlagUrl(code: string): string {
 export function currencyIndex(code: string): number {
   const idx = CURRENCIES.findIndex((c) => c.code === code)
   return idx === -1 ? CURRENCIES.length : idx
+}
+
+// ── 本币金额格式化（换算气泡 / 悬停提示用）─────────────────────
+//
+// 与 `server/app/domains/games/pricing.py` 的 CURRENCY_SYMBOLS /
+// DISPLAY_DECIMALS / _SUFFIX_CURRENCIES 保持同构：前端只做「人民币分换算出
+// 的本币分 → 展示文本」这一步，字段源头以服务端为准。两边新增币种时同步改。
+
+const CURRENCY_SYMBOLS: Record<string, string> = {
+  CNY: '¥', RUB: '₽', KZT: '₸', UAH: '₴', USD: '$', VND: '₫', IDR: 'Rp',
+  INR: '₹', BRL: 'R$', CLP: '$', JPY: '¥', HKD: 'HK$', PHP: '₱', TWD: 'NT$',
+  KWD: 'KD', SAR: 'SR', ZAR: 'R', QAR: 'QR', MYR: 'RM', THB: '฿', PEN: 'S/',
+  MXN: 'MX$', SGD: 'S$', AED: 'AED', UYU: '$U', COP: 'COL$', KRW: '₩',
+  NZD: 'NZ$', PLN: 'zł', CRC: '₡', CAD: 'C$', AUD: 'A$', EUR: '€', GBP: '£',
+  NOK: 'kr', ILS: '₪', CHF: 'CHF',
+}
+
+/** 零小数货币（Steam 以整数计价，存分后显示回整数） */
+const ZERO_DECIMAL_CURRENCIES = new Set(['CLP', 'VND', 'IDR', 'JPY', 'KZT', 'UAH'])
+
+/** 符号后置的货币（如 "55.00 ₽" / "119,00 zł"） */
+const SUFFIX_CURRENCIES = new Set(['RUB', 'KZT', 'UAH', 'PLN', 'NOK'])
+
+/**
+ * 本币最小单位 → 展示文本（如 699 + USD → "$6.99"）。
+ * 与服务端 format_minor_units 同构：千分位逗号、零小数币种取整、后置符号。
+ */
+export function formatMinor(amountMinor: number | null | undefined, currency: string): string {
+  if (amountMinor === null || amountMinor === undefined || !Number.isFinite(amountMinor)) {
+    return ''
+  }
+  const code = currency.toUpperCase()
+  const symbol = CURRENCY_SYMBOLS[code] ?? ''
+  const major = amountMinor / 100
+  const num = ZERO_DECIMAL_CURRENCIES.has(code)
+    ? Math.round(major).toLocaleString('en-US')
+    : major.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  return SUFFIX_CURRENCIES.has(code) ? `${num} ${symbol}`.trim() : `${symbol}${num}`
 }

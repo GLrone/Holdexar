@@ -6,15 +6,19 @@ import { Delete, Edit, Plus, Search } from '@element-plus/icons-vue'
 
 import {
   alertsApi,
+  ratesApi,
   type AlertEventItem,
   type PriceAlertItem,
   type GameSearchResult,
 } from '@/api/client'
 import { formatCnyFen, flagUrl } from '@/api/regions'
+import { currencyName, formatMinor } from '@/api/currencies'
 import { useI18n } from '@/locales'
 import { useRegionsStore } from '@/stores/regions'
 import RegionFlag from '@/components/RegionFlag.vue'
 import HlSelect, { type HlSelectOption } from '@/components/ui/HlSelect.vue'
+import HlImg from '@/components/ui/HlImg.vue'
+import HlTooltip from '@/components/ui/HlTooltip.vue'
 import { HlEmpty, message } from '@/components/ui'
 
 const { t } = useI18n()
@@ -61,6 +65,67 @@ const targetText = computed(() => {
   if (form.targetType === 'price') return t('alerts.rules.hintPrice')
   return t('alerts.rules.hintPct')
 })
+
+// ─── 元 ↔ 该区货币换算（阈值统一按人民币元设置，外区规则悬停换算）───
+// 汇率取 GET /rates 现值（rateToCny = 1 单位外币兑人民币元）；拉取失败只
+// 是换算气泡不展示，规则增删改不受影响。
+const rateMap = ref<Map<string, number>>(new Map())
+
+const regionCurrencyMap = computed(() => {
+  const m = new Map<string, string>()
+  regionsStore.metas.forEach((r) => m.set(r.code.toUpperCase(), (r.currency || 'CNY').toUpperCase()))
+  return m
+})
+
+function regionCurrency(region: string): string {
+  return regionCurrencyMap.value.get(region.toUpperCase()) ?? 'CNY'
+}
+
+function isForeignRegion(region: string): boolean {
+  return regionCurrency(region) !== 'CNY'
+}
+
+/** 人民币分 → 该区货币最小单位（无汇率返回 null） */
+function cnyFenToLocal(cnyFen: number, region: string): number | null {
+  const rate = rateMap.value.get(regionCurrency(region))
+  return rate ? Math.round(cnyFen / rate) : null
+}
+
+/** 元输入的实时换算气泡：仅 price 类 + 外区 + 合法正数时非空 */
+function convertHint(region: string, type: string, valueStr: string): string {
+  if (type !== 'price' || !isForeignRegion(region)) return ''
+  const v = Number(valueStr)
+  if (!valueStr.trim() || !Number.isFinite(v) || v <= 0) return ''
+  const local = cnyFenToLocal(Math.round(v * 100), region)
+  if (local === null) return ''
+  const currency = regionCurrency(region)
+  return t('alerts.rules.convertHint', { value: formatMinor(local, currency), name: currencyName(currency) })
+}
+
+const addConvertHint = computed(() => convertHint(form.region, form.targetType, form.targetValue))
+const editConvertHint = computed(() =>
+  editingId.value === null ? '' : convertHint(editForm.region, editForm.targetType, editForm.targetValue),
+)
+
+/** 规则条件列的悬停换算文本（price 类外区规则：¥ 目标位 → 本币约价） */
+function ruleHoverText(row: PriceAlertItem): string {
+  if (row.targetType !== 'price' || row.targetValue === null || !isForeignRegion(row.region)) return ''
+  const local = cnyFenToLocal(row.targetValue, row.region)
+  if (local === null) return ''
+  const currency = regionCurrency(row.region)
+  return t('alerts.rules.convertHint', { value: formatMinor(local, currency), name: currencyName(currency) })
+}
+
+/** 历史行「当时价格」主文本：人民币快照优先，无快照的旧事件回退本币文本 */
+function eventPriceText(row: AlertEventItem): string {
+  if (row.priceCny !== null) return formatCnyFen(row.priceCny)
+  return row.priceText || '—'
+}
+
+/** 历史行「当时价格」悬停文本：外区且有人民币快照时展示本币原价 */
+function eventHoverText(row: AlertEventItem): string {
+  return row.priceCny !== null && isForeignRegion(row.region) ? row.priceText : ''
+}
 
 async function searchGames() {
   const q = searchQuery.value.trim()
@@ -113,11 +178,13 @@ async function add() {
     message.warning(t('alerts.toast.selectGameFirst'))
     return
   }
-  const value = form.targetValue.trim() === '' ? undefined : Number(form.targetValue)
+  let value = form.targetValue.trim() === '' ? undefined : Number(form.targetValue)
   if (form.targetType !== 'historic_low' && value === undefined) {
     message.warning(t('alerts.toast.enterTarget'))
     return
   }
+  // price 类按元输入 → 人民币分（阈值口径）；pct 保持百分数
+  if (form.targetType === 'price' && value !== undefined) value = Math.round(value * 100)
   try {
     await alertsApi.add(form.appid, form.region, form.targetType, value)
     message.success(t('alerts.toast.added'))
@@ -139,14 +206,53 @@ async function remove(alert: PriceAlertItem) {
   /* 游戏名兜底（AppID 串）与整句一起走 {name} 参数：不做「删除 #」+「规则（」+「）？」
      的片段拼接——中英括号形态与语序都不同，拼不出来。 */
   const name = alert.gameName || `AppID ${alert.appid}`
-  await ElMessageBox.confirm(
+  const ok = await ElMessageBox.confirm(
     t('alerts.rules.removeConfirm', { id: alert.id, name }),
     t('alerts.rules.confirmTitle'),
     { type: 'warning' },
-  )
-  await alertsApi.remove(alert.id)
-  message.success(t('alerts.toast.removed', { id: alert.id }))
-  await load()
+  ).then(() => true).catch(() => false)
+  if (!ok) return
+  try {
+    await alertsApi.remove(alert.id)
+    message.success(t('alerts.toast.removed', { id: alert.id }))
+    await load()
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+  }
+}
+
+// ─── 触发历史删除（单条 / 全部）───
+async function removeEvent(ev: AlertEventItem) {
+  const name = ev.gameName || `AppID ${ev.appid}`
+  const ok = await ElMessageBox.confirm(
+    t('alerts.history.removeConfirm', { name }),
+    t('alerts.rules.confirmTitle'),
+    { type: 'warning' },
+  ).then(() => true).catch(() => false)
+  if (!ok) return
+  try {
+    await alertsApi.removeEvent(ev.id)
+    message.success(t('alerts.toast.eventRemoved'))
+    await load()
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+  }
+}
+
+async function clearAllEvents() {
+  const ok = await ElMessageBox.confirm(
+    t('alerts.history.clearConfirm', { count: events.value.length }),
+    t('alerts.rules.confirmTitle'),
+    { type: 'warning' },
+  ).then(() => true).catch(() => false)
+  if (!ok) return
+  try {
+    const res = await alertsApi.clearEvents()
+    message.success(t('alerts.toast.historyCleared', { count: res.removed }))
+    await load()
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+  }
 }
 
 // ─── 编辑规则 ───
@@ -160,7 +266,11 @@ const editForm = reactive({
 function startEdit(alert: PriceAlertItem) {
   editingId.value = alert.id
   editForm.targetType = alert.targetType
-  editForm.targetValue = alert.targetValue !== null ? String(alert.targetValue) : ''
+  // price 类阈值以人民币分存储，编辑时回显为元；pct 原样回显
+  editForm.targetValue =
+    alert.targetValue !== null
+      ? String(alert.targetType === 'price' ? alert.targetValue / 100 : alert.targetValue)
+      : ''
   editForm.region = alert.region
 }
 
@@ -169,11 +279,13 @@ function cancelEdit() {
 }
 
 async function saveEdit(alert: PriceAlertItem) {
-  const value = editForm.targetValue.trim() === '' ? undefined : Number(editForm.targetValue)
+  let value = editForm.targetValue.trim() === '' ? undefined : Number(editForm.targetValue)
   if (editForm.targetType !== 'historic_low' && value === undefined) {
     message.warning(t('alerts.toast.enterTarget'))
     return
   }
+  // price 类按元输入 → 人民币分（阈值口径）；pct 保持百分数
+  if (editForm.targetType === 'price' && value !== undefined) value = Math.round(value * 100)
   try {
     await alertsApi.update(alert.id, {
       targetType: editForm.targetType,
@@ -269,6 +381,14 @@ async function testSmtp() {
 onMounted(() => {
   load()
   loadSmtp()
+  ratesApi
+    .list()
+    .then((res) => {
+      rateMap.value = new Map(res.rates.map((r) => [r.currency, r.rateToCny]))
+    })
+    .catch(() => {
+      /* 汇率不可用只影响换算气泡，页面其余功能不受影响 */
+    })
 })
 </script>
 
@@ -319,12 +439,14 @@ onMounted(() => {
       <div class="add-row">
         <HlSelect v-model="form.region" :options="regionSelectOptions" class="add-row__region" />
         <HlSelect v-model="form.targetType" :options="targetTypeOptions" class="add-row__type" />
-        <el-input
-          v-if="form.targetType !== 'historic_low'"
-          v-model="form.targetValue"
-          :placeholder="targetText"
-          class="add-row__value"
-        />
+        <!-- 外区 price 类输入时悬停出实时换算气泡（约 X.XX 该区货币）；气泡内容为空时 HlTooltip 不弹泡 -->
+        <HlTooltip v-if="form.targetType !== 'historic_low'" :content="addConvertHint">
+          <el-input v-model="form.targetValue" :placeholder="targetText" class="add-row__value">
+            <template #suffix>
+              <span class="unit-suffix">{{ form.targetType === 'price' ? t('alerts.rules.unitCny') : '%' }}</span>
+            </template>
+          </el-input>
+        </HlTooltip>
         <span v-else class="section-desc" style="display: inline; margin: 0">{{ targetText }}</span>
         <el-button type="primary" :icon="Plus" @click="add">{{ t('alerts.rules.add') }}</el-button>
       </div>
@@ -335,11 +457,16 @@ onMounted(() => {
       <div class="section-title">{{ t('alerts.section.list') }}</div>
       <el-table v-if="alerts.length" :data="alerts" style="width: 100%" size="small" v-loading="loading">
         <el-table-column prop="id" label="#" width="56" />
-        <el-table-column :label="t('alerts.table.game')" min-width="180">
+        <el-table-column :label="t('alerts.table.game')" min-width="240">
           <template #default="{ row }">
-            <a class="game-link" @click="router.push(`/game/${row.appid}`)">
-              {{ row.gameName || `AppID ${row.appid}` }} ↗
-            </a>
+            <div class="game-cell">
+              <HlImg :src="row.gameHeader" class="game-cover" :alt="row.gameName || String(row.appid)">
+                <template #fallback><span class="game-cover game-cover--empty" /></template>
+              </HlImg>
+              <a class="game-link" @click="router.push(`/game/${row.appid}`)">
+                {{ row.gameName || `AppID ${row.appid}` }} ↗
+              </a>
+            </div>
           </template>
         </el-table-column>
         <el-table-column label="AppID" width="120">
@@ -354,7 +481,11 @@ onMounted(() => {
         </el-table-column>
         <el-table-column :label="t('alerts.table.condition')" min-width="140">
           <template #default="{ row }">
-            <span v-if="row.targetType === 'price'">{{ t('alerts.rules.condPrice', { value: formatCnyFen(row.targetValue) }) }}</span>
+            <!-- 阈值默认按元展示；外区 price 类悬停显示该区货币换算约价。
+                 表格滚动容器裁剪 absolute 气泡，表内气泡走 fixed 定位 -->
+            <HlTooltip v-if="row.targetType === 'price'" :content="ruleHoverText(row)" fixed>
+              <span class="cond-text">{{ t('alerts.rules.condPrice', { value: formatCnyFen(row.targetValue) }) }}</span>
+            </HlTooltip>
             <span v-else-if="row.targetType === 'pct'">{{ t('alerts.rules.condPct', { value: row.targetValue }) }}</span>
             <span v-else>{{ t('alerts.rules.condHistoricLow') }}</span>
           </template>
@@ -385,13 +516,18 @@ onMounted(() => {
         <div class="edit-panel-title">{{ t('alerts.rules.editTitle', { id: editingId ?? '' }) }}</div>
         <div class="edit-row">
           <HlSelect v-model="editForm.targetType" :options="targetTypeOptions" class="edit-select" />
-          <el-input
-            v-if="editForm.targetType !== 'historic_low'"
-            v-model="editForm.targetValue"
-            size="small"
-            :placeholder="t('alerts.rules.targetValuePlaceholder')"
-            class="edit-input"
-          />
+          <HlTooltip v-if="editForm.targetType !== 'historic_low'" :content="editConvertHint">
+            <el-input
+              v-model="editForm.targetValue"
+              size="small"
+              :placeholder="t('alerts.rules.targetValuePlaceholder')"
+              class="edit-input"
+            >
+              <template #suffix>
+                <span class="unit-suffix">{{ editForm.targetType === 'price' ? t('alerts.rules.unitCny') : '%' }}</span>
+              </template>
+            </el-input>
+          </HlTooltip>
           <HlSelect v-model="editForm.region" :options="regionSelectOptions" class="edit-region" />
           <el-button size="small" type="primary" @click="saveEdit(alerts.find(a => a.id === editingId)!)">{{ t('alerts.rules.save') }}</el-button>
           <el-button size="small" @click="cancelEdit">{{ t('common.cancel') }}</el-button>
@@ -401,36 +537,63 @@ onMounted(() => {
 
     <!-- 触发历史 -->
     <div class="card section-card" data-section="alerts.section.history">
-      <div class="section-title">{{ t('alerts.section.history') }}</div>
+      <div class="history-head">
+        <div class="section-title">{{ t('alerts.section.history') }}</div>
+        <el-button
+          v-if="events.length"
+          size="small"
+          type="danger"
+          plain
+          :icon="Delete"
+          @click="clearAllEvents"
+        >
+          {{ t('alerts.history.clearAll') }}
+        </el-button>
+      </div>
       <el-table v-if="events.length" :data="events" style="width: 100%" size="small" max-height="280">
         <el-table-column :label="t('alerts.table.time')" width="160">
           <template #default="{ row }">{{ row.triggeredAt?.slice(5, 19).replace('T', ' ') }}</template>
         </el-table-column>
-        <el-table-column :label="t('alerts.table.game')" min-width="150">
+        <el-table-column :label="t('alerts.table.game')" min-width="230">
           <template #default="{ row }">
-            <a class="game-link" @click="router.push(`/game/${row.appid}`)">
-              {{ row.gameName || `AppID ${row.appid}` }} ↗
-            </a>
+            <div class="game-cell">
+              <HlImg :src="row.gameHeader" class="game-cover" :alt="row.gameName || String(row.appid)">
+                <template #fallback><span class="game-cover game-cover--empty" /></template>
+              </HlImg>
+              <a class="game-link" @click="router.push(`/game/${row.appid}`)">
+                {{ row.gameName || `AppID ${row.appid}` }} ↗
+              </a>
+            </div>
           </template>
         </el-table-column>
-        <el-table-column label="AppID" width="120">
+        <el-table-column label="AppID" width="110">
           <template #default="{ row }">
             <span class="appid-text">{{ row.appid }}</span>
           </template>
         </el-table-column>
-        <el-table-column :label="t('alerts.table.region')" width="120">
+        <el-table-column :label="t('alerts.table.region')" width="110">
           <template #default="{ row }">
             <RegionFlag :code="row.region" />
           </template>
         </el-table-column>
-        <el-table-column :label="t('alerts.table.priceThen')" width="120">
-          <template #default="{ row }">{{ formatCnyFen(row.price) }}</template>
+        <el-table-column :label="t('alerts.table.priceThen')" width="130">
+          <template #default="{ row }">
+            <!-- 人民币快照优先；外区行悬停看触发时的本币原价 -->
+            <HlTooltip :content="eventHoverText(row)" fixed>
+              <span class="hl-num">{{ eventPriceText(row) }}</span>
+            </HlTooltip>
+          </template>
         </el-table-column>
         <el-table-column :label="t('alerts.table.email')" width="80">
           <template #default="{ row }">
             <span class="tag" :class="row.notified ? 'tag--success' : ''">
               {{ row.notified ? t('alerts.history.notifiedEmail') : t('alerts.history.notifiedInApp') }}
             </span>
+          </template>
+        </el-table-column>
+        <el-table-column :label="t('alerts.table.actions')" width="70" align="right">
+          <template #default="{ row }">
+            <el-button size="small" type="danger" plain :icon="Delete" @click="removeEvent(row)" />
           </template>
         </el-table-column>
       </el-table>
@@ -614,6 +777,45 @@ onMounted(() => {
   font-family: var(--font-mono);
   font-size: 12px;
   color: var(--text-muted);
+}
+
+/* 游戏列：封面 + 名称链接（规则表 / 触发历史表共用） */
+.game-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.game-cover {
+  width: 92px;
+  height: 43px;
+  flex: none;
+  border-radius: 4px;
+  object-fit: cover;
+  display: block;
+  background: var(--accent-soft);
+}
+
+.game-cover--empty {
+  border: 1px solid var(--border-soft);
+}
+
+/* 金额输入框后缀单位（元 / %） */
+.unit-suffix {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.cond-text {
+  cursor: default;
+}
+
+.history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 
 .muted {

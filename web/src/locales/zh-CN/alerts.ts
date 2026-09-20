@@ -45,6 +45,10 @@ const alerts = {
   'alerts.rules.removeConfirm': '删除 #{id} 规则（{name}）？',
   'alerts.rules.confirmTitle': '确认',
 
+  /* 金额输入框后缀单位 + 外区规则的换算气泡（{value} 本币价文本，{name} 币种名） */
+  'alerts.rules.unitCny': '元',
+  'alerts.rules.convertHint': '约 {value}（{name}）',
+
   /* 条件列：标签与值合成为一句（「%」随句进词条，不在视图里拼） */
   'alerts.rules.condPrice': '价格 ≤ {value}',
   'alerts.rules.condPct': '折扣 ≥ {value}%',
@@ -63,6 +67,9 @@ const alerts = {
 
   /* ── 触发历史 ── */
   'alerts.history.empty': '暂无触发记录',
+  'alerts.history.clearAll': '清空全部',
+  'alerts.history.removeConfirm': '删除 {name} 的这条触发记录？',
+  'alerts.history.clearConfirm': '清空全部 {count} 条触发记录？此操作不可恢复。',
   'alerts.history.notifiedEmail': '已发',
   'alerts.history.notifiedInApp': '站内',
 
@@ -92,6 +99,8 @@ const alerts = {
   'alerts.toast.disabled': '规则已停用',
   'alerts.toast.updated': '规则已更新',
   'alerts.toast.removed': '已删除规则 #{id}',
+  'alerts.toast.eventRemoved': '已删除该条触发记录',
+  'alerts.toast.historyCleared': '已清空 {count} 条触发记录',
   'alerts.toast.smtpSaved': '邮件设置已保存',
   'alerts.toast.testSent': '测试邮件已发送到 {to}，请查收',
 } as const

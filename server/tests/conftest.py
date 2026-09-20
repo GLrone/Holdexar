@@ -41,6 +41,48 @@ def _sanitize_db_lru_caches():
         orig_engine.cache_clear()
         orig_factory.cache_clear()
 
+
+@pytest.fixture(autouse=True)
+def _block_outbound_smtp(monkeypatch):
+    """测试进程绝不发真实邮件：SMTP 传输层统一换成「只记录、不开连接」的假件。
+
+    邮件段挂在多个调度 job 的链尾（价格网格 / Epic 喜加一 / HB 当月包 /
+    备份失败 / 爬取失败告警），这些 job 会被测试直接调用；只要有一处忘了给
+    alerts 域打桩，本地开发库里**真实可用**的 SMTP 配置就会把邮件发到用户
+    邮箱——测试进程发信是必须从结构上杜绝的事故。
+
+    桩打在传输层而不是各个调用点：新增邮件类型不必再逐个测试补桩，漏桩的
+    最坏后果也只是「测试里发不出去」。需要断言邮件内容的用例
+    （test_alert_mails / test_notify_test_mail）自行 patch notify.smtplib
+    的两个类，函数级 patch 晚于本桩生效、覆盖本桩。
+    """
+    from app.domains.alerts import notify
+
+    class _NoNetworkSMTP:
+        """与 smtplib.SMTP* 同形的最小假件：不解析网络、不发任何字节。"""
+
+        def __init__(self, host, port, timeout=0):
+            self.host, self.port = host, port
+
+        def login(self, user, password):
+            return None
+
+        def starttls(self):
+            return None
+
+        def sendmail(self, from_addr, to_addrs, msg_string):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(notify.smtplib, "SMTP_SSL", _NoNetworkSMTP)
+    monkeypatch.setattr(notify.smtplib, "SMTP", _NoNetworkSMTP)
+
+
 # 本机私密配置（secrets/fx_maintenance.env，gitignored）：只设未存在的变量。
 # 真实样本文件名/外部档案路径经环境变量注入（git 里只有合成默认值）。
 _env_file = Path(__file__).resolve().parents[2] / "secrets" / "fx_maintenance.env"

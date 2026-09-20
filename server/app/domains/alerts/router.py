@@ -56,6 +56,19 @@ async def events(limit: int = 50):
     return await service.list_events(limit)
 
 
+@router.delete("/events/{event_id}")
+async def delete_event(event_id: int):
+    removed = await service.delete_event(event_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="触发记录不存在")
+    return {"removed": True}
+
+
+@router.delete("/events")
+async def clear_events():
+    return {"removed": await service.clear_events()}
+
+
 @router.get("/smtp")
 async def get_smtp():
     return await service.get_smtp_config()
