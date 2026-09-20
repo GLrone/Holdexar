@@ -326,6 +326,14 @@ async def _job_proxypool_cycle() -> None:
         logger.info("[定时] proxypool 周期跳过：池 Runtime 尚未就绪（%s）", e)
         return
     try:
+        # DEAD 恢复探测要打在**持有这些节点配置的内核**上：DEAD 不在池文件里，
+        # 池内核不认识它们的名字；旧链路内核跑的就是整条订阅，认识全部节点。
+        # 旧链路内核没在跑（controller_url 为空）时本项自动跳过。
+        legacy = _cm.runtime
+        legacy_controller = (
+            (legacy.controller_url, legacy.secret)
+            if getattr(legacy, "controller_url", None) else None
+        )
         async with get_session_factory()() as session:
             result = await _sched.run_proxypool_cycle(
                 session,
@@ -335,6 +343,7 @@ async def _job_proxypool_cycle() -> None:
                 runtime=_cm.pool_runtime,
                 exe_path=str(_cm.kernel_exe(data_dir)),
                 now=datetime.now(),
+                recovery_controller=legacy_controller,
             )
             await session.commit()
         logger.info(
