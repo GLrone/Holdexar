@@ -70,6 +70,9 @@ function handleSelectRegion(code: string) {
   store.region = code
   if (code.toLowerCase() === 'cn') store.filterMode = 'global' as FilterMode
   showRegionMenu.value = false
+  // 进地区维度即回顶：吸顶工具栏（z-index 9000）在滚动中途出现会钉在视口上
+  // 盖住正下方的卡片行——与选排序回顶同一语义
+  scrollEl?.scrollTo({ top: 0, behavior: 'smooth' })
 }
 
 function selectSort(key: SortKey) {
