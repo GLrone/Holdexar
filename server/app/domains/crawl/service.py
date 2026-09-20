@@ -21,6 +21,7 @@ from app.domains.alerts import service as alerts_service
 from app.domains.crawl.models import CrawlJob
 from app.domains.games.models import Game, GameCurrentPrice
 from app.domains.games import service as games_service
+from app.domains.games import series as games_series
 from app.domains.regions.service import effective_regions
 from app.domains.wishlist.models import WishlistItem
 
