@@ -102,6 +102,9 @@ def test_ensure_kernel_upgrades_stale_kernel(tmp_path: Path, monkeypatch) -> Non
     (clash_path / kernel_filename()).write_bytes(b"old-kernel")
     monkeypatch.setattr(clash_manager, "bundled_clash_dir", lambda: bundle)
     _fake_kernel_version(monkeypatch, "Mihomo Meta v1.19.20 windows amd64")
+    # 换装判据里的进程闸门与本用例无关（本机跑着内核时会被保守跳过）；
+    # 顶替掉才验得到版本比较本身
+    monkeypatch.setattr(clash_manager, "_kernel_process_alive", lambda: False)
 
     result = clash_manager.ensure_kernel(data_dir)
 

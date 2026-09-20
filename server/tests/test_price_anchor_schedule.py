@@ -167,6 +167,12 @@ async def _fire_price_refresh_once(monkeypatch, is_dst: bool) -> datetime:
 
     monkeypatch.setattr(external_time, "fetch_pacific_dst", _dst)
     monkeypatch.setattr(crawl_service_mod, "run_sequential", _spy_run)
+    # 自动价格总开关打桩：本文件验的是锚点自续约，不建库——
+    # 不桩会读真实数据目录的 crawl.auto_price，本机把它关掉时主轮直接返回
+    async def _auto_on() -> bool:
+        return True
+
+    monkeypatch.setattr(sched_mod, "price_auto_enabled", _auto_on)
 
     # 链尾捆绑包存量刷新打桩（真实实现出网 + 触生产库）
     from app.domains.bundles import refresh as bundles_refresh_mod
