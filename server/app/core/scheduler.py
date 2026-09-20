@@ -827,6 +827,53 @@ async def _job_coming_soon_retry() -> None:
         logger.exception("[定时] COMING_SOON 重探爬取失败")
 
 
+async def _job_free_promo_retry() -> None:
+    """限时赠送复查层（每 6h，限量 30 个）：
+
+    free_kind='promo' 且结束时刻已过（或 1h 内到期）的游戏重爬一次——
+    赠送结束 → 价格翻回正价、free_kind 由写库层清除，仪表盘喜加一模块
+    随之消失；Steam 延期 → promo_end_at 就地刷新。赠送游戏多数不在
+    监控池（特惠反哺临时通道入库），没有这层就永远停在赠送态。
+    """
+    from sqlalchemy import select
+
+    from app.core.database import get_session_factory
+    from app.crawler.utils import get_beijing_time_obj
+    from app.domains.crawl import service as crawl_service
+    from app.domains.games.models import Game
+
+    if not await price_auto_enabled():
+        return  # 自动价格更新关闭：复查也走爬取通道，一并停转
+    try:
+        now_ts = int(get_beijing_time_obj().timestamp())
+        async with get_session_factory()() as session:
+            rows = (
+                await session.execute(
+                    select(Game.appid)
+                    .where(
+                        Game.free_kind == "promo",
+                        Game.promo_end_at.is_not(None),
+                        Game.promo_end_at <= now_ts + 3600,
+                    )
+                    .order_by(Game.promo_end_at)
+                    .limit(30)
+                )
+            ).scalars().all()
+    except Exception:  # noqa: BLE001
+        logger.exception("[定时] 限时赠送复查候选查询失败")
+        return
+    appids = [int(r) for r in rows]
+    if not appids:
+        return
+    try:
+        await crawl_service.run_sequential(
+            [{"scope": "appids", "appids": appids, "kind": "free_promo_retry"}],
+        )
+        logger.info("[定时] 限时赠送复查完成：%d 个候选", len(appids))
+    except Exception:  # noqa: BLE001
+        logger.exception("[定时] 限时赠送复查爬取失败")
+
+
 async def _anchor_probe_after_start() -> None:
     """启动后外部时间纠偏探针：初锚是本地 zoneinfo 推算（同步上下文
     无法请求外网），异步请求外部时间权威源核对——非切换日两者恒一致，
@@ -869,6 +916,8 @@ def start_scheduler() -> None:
     scheduler.add_job(_make_board_job("specials"), "interval", hours=6, id="board_specials")
     scheduler.add_job(_make_board_job("comingsoon"), "interval", hours=24, id="board_comingsoon")
     scheduler.add_job(_job_coming_soon_retry, "cron", hour=10, minute=0, id="comingsoon_retry")
+    # 限时赠送复查：到期（或 1h 内到期）的 promo 重爬翻转状态；通常 0 候选
+    scheduler.add_job(_job_free_promo_retry, "interval", hours=6, id="free_promo_retry")
     scheduler.add_job(_job_hb_choice, "cron", hour=6, minute=40, id="hb_choice")
     scheduler.add_job(_job_epic_free, "cron", hour=7, minute=10, id="epic_free")
     scheduler.add_job(_job_bartervg_bundles, "cron", hour=5, minute=40, id="bartervg_bundles")
