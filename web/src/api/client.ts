@@ -61,7 +61,13 @@ const NO_CACHE_PATHS = [
   '/system/update-pending',
   '/proxies/clash/install/progress',
   '/achievements/sync', // 成就同步进行中的快照轮询
+  // Epic 卡片：新鲜度由后端快照缓存管理（过期即回旧数据 + 后台刷新），
+  // 前端再叠 60s 时间窗会把 stale→fresh 的覆盖整个吞掉（轮询永远读旧响应）
+  '/metadata/epic/offers',
   '/metadata/steam/offers', // Steam 喜加一：10min 轮询，赠送结束要立即消失
+]
+
+function isNoCachePath(path: string): boolean {
   return NO_CACHE_PATHS.some((p) => path === p || path.startsWith(`${p}?`) || path.startsWith(`${p}/`))
 }
 
@@ -396,6 +402,7 @@ export interface GameListItem {
   nameEn: string | null
   discount: number
   discountLabel: string
+  /** 国区折扣截止（Unix 秒；null=无折扣/未带促销元数据） */
   discountEndsAt?: number | null
   positiveRate: number | null
   reviewCount: number
@@ -481,9 +488,28 @@ export interface LinkedBundle {
   diffFen: number
 }
 
+/** 同系列成员（GPW「同系列」区块行，/games/{appid}/series） */
 export interface GameSeriesMember {
+  appid: number
+  name: string
+  headerImage: string
+  isSelf: boolean
+  type: string
+  cnPriceFen: number | null
+  cnOriginalFen: number | null
+  cnDiscount: number
+  lowestPriceFen: number | null
+  savingsFen: number
+}
+
+/** 同系列归组（服务端名称聚类维护，识别不到 = 404） */
 export interface GameSeriesInfo {
+  seriesId: string
+  /** 展示名：成员展示名公共汉字前缀，缺失回落 seriesId */
+  seriesName: string
   members: GameSeriesMember[]
+}
+
 /** 捆绑包单区价格行（区键大写，来自 /bundles 列表聚合） */
 export interface BundleRegionPrice {
   priceMinor: number | null
@@ -515,6 +541,9 @@ export interface BundleSummary {
   lowestRegion: string
   lowestCnyFen: number | null
   diffFen: number
+  /** smart 四因子评分（服务端预计算，0~1）。选区重锚排序用：
+      save(该区差价) + (smartScore − save(diffFen)) 即该区视角的评分 */
+  smartScore: number
 }
 
 export interface BundleGamePrice {
@@ -546,6 +575,7 @@ export interface GameDetail extends GameListItem {
   cnPriceCents: number | null
   cnCnyFen: number | null
   cnDiscount: number
+  /** 国区折扣截止（Unix 秒；null=无折扣/未带促销元数据） */
   cnDiscountEndsAt?: number | null
   lowestRegionCode: string
   isAdult: boolean
@@ -554,7 +584,9 @@ export interface GameDetail extends GameListItem {
   versions: GameVersion[]
   linkedBundles: LinkedBundle[]
   viewCount: number
+  /** 免费态：f2p=永久免费 / promo=限时赠送中；null=付费正常 */
   freeKind: 'f2p' | 'promo' | null
+  /** 赠送结束 Unix 秒（仅 promo 态有值） */
   promoEndAt: number | null
 }
 
@@ -668,6 +700,9 @@ export const gamesApi = {
     request<{ results: GamePriceContextItem[] }>('POST', '/games/price-context-batch', { items }),
   bundles: (appid: number | string) =>
     request<{ bundles: LinkedBundle[] }>('GET', `/games/${appid}/bundles`),
+  // 同系列成员（打开 GPW 时懒加载；404 = 未识别到系列，区块隐藏）。
+  // 方法名避开 series——eslint 图表契约规则按「含 series 键的对象」识别
+  // option，API 对象里出现这个键会误报
   seriesInfo: (appid: number | string) =>
     request<GameSeriesInfo>('GET', `/games/${appid}/series`),
   cdk: (appid: number | string, subId?: number) =>
@@ -687,8 +722,10 @@ export const gamesApi = {
 // ─── bundles（捆绑包浏览视图：列表聚合 + 补齐计算详情） ──────────────────
 
 export const bundlesApi = {
-  /** 全量捆绑包（差价降序） */
-  list: () => request<{ bundles: BundleSummary[] }>('GET', '/bundles'),
+  /** 全量捆绑包（sort=diff 差价降序 | smart 智能评分降序，服务端预计算列；
+   *  discount 折扣力度由前端排序，服务端按 diff 出底序） */
+  list: (sort: 'diff' | 'smart' | 'discount' = 'diff') =>
+    request<{ bundles: BundleSummary[] }>('GET', `/bundles${toQuery({ sort })}`),
   /** 单包详情：列表字段 + 包内游戏各区现价（补齐计算求和用） */
   detail: (bundleId: number | string) =>
     request<BundleDetail>('GET', `/bundles/${bundleId}`),
@@ -1248,7 +1285,10 @@ export interface PriceAlertItem {
   id: number
   appid: number
   gameName: string
+  /** 封面（库内 header_image，缺档由服务端回退 Steam CDN 拼图） */
+  gameHeader: string
   region: string
+  /** price 类 = 人民币分（阈值口径），pct 类 = 百分数 */
   targetType: string
   targetValue: number | null
   active: boolean
@@ -1261,8 +1301,15 @@ export interface AlertEventItem {
   alertId: number
   appid: number
   gameName: string
+  /** 封面（同规则列表口径） */
+  gameHeader: string
   region: string
+  /** 触发时该区货币最小单位（原始快照） */
   price: number | null
+  /** 触发时刻人民币分快照；旧事件无快照为 null（前端回退 priceText） */
+  priceCny: number | null
+  /** 本币价文本（如 "$59.99"），服务端按区币种格式化 */
+  priceText: string
   triggeredAt: string | null
   notified: boolean
 }
@@ -1275,6 +1322,10 @@ export const alertsApi = {
     request<PriceAlertItem>('PUT', `/alerts/${id}`, payload),
   remove: (id: number) => request<{ removed: boolean }>('DELETE', `/alerts/${id}`),
   events: (limit = 50) => request<AlertEventItem[]>('GET', `/alerts/events${toQuery({ limit })}`),
+  /** 删除单条触发历史 */
+  removeEvent: (id: number) => request<{ removed: boolean }>('DELETE', `/alerts/events/${id}`),
+  /** 清空全部触发历史，返回删除条数 */
+  clearEvents: () => request<{ removed: number }>('DELETE', '/alerts/events'),
   // SMTP 邮件设置
   getSmtp: () => request<SmtpConfig>('GET', '/alerts/smtp'),
   updateSmtp: (payload: SmtpConfigPayload) => request<SmtpConfig>('PUT', '/alerts/smtp', payload),
@@ -1334,13 +1385,8 @@ export type RateRange = '1mo' | '6mo' | '1y' | '5y' | '10y' | 'all'
  *
  * **存 `labelKey` 不存 `label`**：模块级常量只在模块加载时求值一次，值里写死
  * 译文会把语言冻在首次加载那一刻（冻结陷阱），写死 `t()` 同理。存 key、渲染期
- * `t(r.labelKey)` 现取，是这套东西的标准解法——`stores/familyLib.ts` 的
- * `statusKey`、各视图的 `*Key` 常量表都是同一形状。
- *
- * 期 7 之前这里存的是中文 `label`，rates/Index.vue 只好自带一份
- * `RANGE_LABEL_KEYS: Record<RateRange, MessageKey>` 把 id 映射回 key——同一份
- * 对应关系写两遍，其中一份还是中文硬编码（正是该视图 `no-hardcoded-cjk` 命中
- * 的来源之一）。期 7 把对应关系收回定义处，那份重复映射随之删除。
+ * `t(r.labelKey)` 现取——`stores/familyLib.ts` 的 `statusKey`、各视图的 `*Key`
+ * 常量表都是同一形状。对应关系只在此处定义一份，视图不另存映射。
  */
 export const RATE_RANGES: { id: RateRange; labelKey: MessageKey }[] = [
   { id: '1mo', labelKey: 'rates.range.oneMonth' },
@@ -1602,24 +1648,24 @@ export interface EpicOffer {
 }
 
 export interface EpicMobileOffer {
-  /** 游戏名（GamerPower 自动源）；null = breaker 兜底（名称在图里） */
+  /** 游戏名（sandbox 探测官方直出）；null = breaker 兜底（名称在图里） */
   title: string | null
-  /** 立绘（GamerPower 横图或 CMS breaker 图） */
+  /** 立绘（促销元素官方封面或 CMS breaker 图） */
   image: string
-  /** 领取入口：GamerPower 落地官方页 / 移动页兜底 */
+  /** 领取入口：sandbox 探测拼结账直链 / 移动页兜底 */
   url: string
   /** 截止日 YYYY-M-D（零填充；breaker 兜底时 null） */
   end: string | null
   /** 原价文案如 "$4.99"（划线展示） */
   worth: string | null
-  /** 数据来源：gamerpower=自动真名真链 / breaker=兜底立绘 */
-  source: 'gamerpower' | 'breaker'
+  /** 数据来源：epic=官方数据探测真名真链 / breaker=兜底立绘 */
+  source: 'epic' | 'breaker'
 }
 
 export interface EpicOffersPayload {
   ok: boolean
   offers: EpicOffer[]
-  /** 移动端每周白送（GamerPower 自动源，breaker 立绘兜底）；null = 未取到 */
+  /** 移动端每周白送（sandbox offers 探测，breaker 立绘兜底）；null = 未取到 */
   mobile: EpicMobileOffer | null
   /** 北京时间 ISO（卡片「更新于」；快照态为上次抓取时刻） */
   fetchedAt: string | null
@@ -1630,14 +1676,84 @@ export interface EpicOffersPayload {
 }
 
 export const metadataApi = {
+  /** 当期 + 预告白送元素；后端快照缓存 30 分钟（冷启动先回快照 + 后台刷新） */
+  epicOffers: (opts?: { noCache?: boolean }) =>
+    request<EpicOffersPayload>('GET', '/metadata/epic/offers', undefined, opts),
+  /** 当月 HB Choice 游戏清单（纯本地库读，零外网；ok=false = 尚未入库） */
   hbChoiceOffers: () => request<HbChoiceOffersPayload>('GET', '/metadata/hb/offers'),
+  /** 正在赠送中的 Steam 限时免费（纯本地库读；offers 空 = 无赠送，模块整块隐藏） */
   steamFreeOffers: () => request<SteamFreeOffersPayload>('GET', '/metadata/steam/offers'),
+}
+
 export interface SteamFreeOffer {
+  appid: number
+  name: string
+  /** Steam 横版封面 */
+  headerImage: string | null
+  /** 国区原价（分，赠送期划线展示） */
+  originalPriceFen: number | null
+  /** 赠送结束 Unix 秒（Steam free_to_keep_ends） */
+  endTs: number
+}
+
 export interface SteamFreeOffersPayload {
+  ok: boolean
   offers: SteamFreeOffer[]
+  /** 北京时间 ISO */
+  fetchedAt: string | null
+}
+
 export interface HbChoiceGame {
+  appid: number
+  /** games 行名（占位行 = HB 侧标题） */
+  name: string
+  /** Steam 横版封面；null = 占位行待回补（卡片渲染占位底） */
+  headerImage: string | null
+  /** 国区现价（分）；null = 无价格行 */
+  priceFen: number | null
+  /** 国区原价（分）；null = 无价格行 */
+  originalPriceFen: number | null
+  discount: number
+  /** 非 CN 区最低 CNY 分（games.min_cny_fen 预计算列）；null = 无 */
+  lowestCnyFen: number | null
+}
+
 export interface HbChoiceOffersPayload {
+  ok: boolean
+  /** 当月标签（与 games.hb_data 同一约定，如 "HB慈善包26年9月包"） */
+  label: string
+  machineName: string | null
+  productName: string | null
+  /** 当月包页（machineName 推导 /membership/{Month}-{Year}；无游标回落订阅主页） */
+  monthUrl: string
+  /** 跳过本月直达页（官方 secureArea，未登录跳登录页） */
+  skipUrl: string
+  settingsUrl: string
   games: HbChoiceGame[]
+  /** ok=false 时的原因文案 */
+  error?: string
+}
+
+// ─── 成就殿堂（奖杯）────────────────────────────────────
+
+export type RarityTier = 'ultra' | 'very_rare' | 'rare' | 'uncommon' | 'common' | 'unknown'
+
+/** 游戏行来源：owned=本号已购；shared=库外（家庭共享等）；manual=手动补录 */
+export type AchievementSource = 'owned' | 'shared' | 'manual'
+
+export interface AchievementAccount {
+  steamid: string
+  personaName: string
+  avatarUrl: string
+  isPrimary: boolean
+  isActive: boolean
+  /** bound=本地已绑账号（有 Cookie）；family=主账号所在家庭组成员 */
+  relation: 'bound' | 'family'
+}
+
+export interface AchievementSummary {
+  hasCredential: boolean
+  steamid: string
   /** 白金（全成就）游戏数 */
   platinum: number
   /** 有成就系统的游戏数（含库外） */
