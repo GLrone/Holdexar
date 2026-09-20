@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -24,6 +24,11 @@ from app.core.external_time import local_next_grid, probe_next_grid
 logger = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
+
+# 30 分钟重活的错峰位移：proxypool 周期固定在 5 分钟网格整点起跑，这两个 job 若与
+# 它同秒起跑会一起抢 SQLite 写锁（真实生产已出现 `database is locked`）。
+_REFRESH_STAGGER = timedelta(minutes=4)
+_BILLS_STAGGER = timedelta(minutes=2)
 
 
 async def _job_wishlist_sync() -> None:
@@ -940,10 +945,14 @@ def start_scheduler() -> None:
     # 订阅重拉：拍子给密一点（30min），真间隔靠 service 的 6h KV 门槛 +
     # 爬虫空闲门禁——占线错过一拍不消费门槛，下一拍补上
     scheduler.add_job(
-        _job_subscription_refresh, "interval", minutes=30, id="subscription_refresh"
+        _job_subscription_refresh, "interval", minutes=30, id="subscription_refresh",
+        next_run_time=datetime.now() + _REFRESH_STAGGER,
     )
     scheduler.add_job(_job_wallet_sync, "interval", minutes=1, id="wallet_sync")
-    scheduler.add_job(_job_bills_sync, "interval", minutes=30, id="bills_sync")
+    scheduler.add_job(
+        _job_bills_sync, "interval", minutes=30, id="bills_sync",
+        next_run_time=datetime.now() + _BILLS_STAGGER,
+    )
     # 热销榜：发现面 5 页（500 条，其中前 100 条仍作 TOP100 展示序）；
     # 首轮反哺放宽到 500 一次补满初始游戏库，并登记预设池清单（随种子分发）
     scheduler.add_job(

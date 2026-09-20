@@ -204,11 +204,16 @@ async def run_proxypool_cycle(
     ⑤ 最后才 L1/L2——观察对象因此始终接近生产状态
 
     顺序不能颠倒：若先 L1/L2，它们面对的还是"含已死节点"的旧 Runtime，没有意义。
+
+    **事务边界**：L0 独立提交一次，维护（重建 + L1/L2）再提交一次。L1/L2 要串行探
+    完池内节点，整段落在一个事务里会让写锁跨分钟被占住，同拍的订阅刷新/账单等 job
+    会撞满 `busy_timeout` 全部失败；分两段后每次持锁只到秒级。
     """
     l0 = await run_l0_cycle(
         session, data_dir=data_dir, controller_url=controller_url, secret=secret,
         now=now, target_url=l0_target_url,
     )
+    await session.commit()
 
     if crawler_busy():
         # L0 是唯一允许在 crawler 占线时运行的维护动作
