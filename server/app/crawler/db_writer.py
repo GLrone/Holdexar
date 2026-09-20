@@ -6,6 +6,7 @@ bundle / repair 写入方法随对应功能迁入。
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta
 
 from sqlalchemy import case, or_, select, text, update
@@ -35,6 +36,7 @@ _CURRENT_UPDATABLE = (
     "sub_id",
     "price_status",
     "cny_fen",
+    "discount_end_ts",
     "updated_at",
 )
 
@@ -47,6 +49,66 @@ MISSING_MAX_RETRIES = 5
 def _is_ok_price_row(price_cents: int | None) -> bool:
     """ok 行价格合法性：None 才是坏数据（0 = 免费游戏，合法）。"""
     return price_cents is not None
+
+
+# 测试入口命名（测试版/测试服/公测/Playtest 等）→ 不进监控池的判定词形。
+# 只认锚定的「测试入口」组合词——裸 beta/测试会误伤标题自带裸词的正经游戏。
+_TEST_ENTRY_RE = re.compile(
+    r"测试版|测试服|技术测试|封闭测试|公开测试|压力测试|内测|公测|封测|体验版"
+    r"|play[\s_-]?test|beta[\s_-]?test|closed[\s_-]?beta|open[\s_-]?beta"
+    r"|stress[\s_-]?test|tech[\s_-]?test",
+    re.IGNORECASE,
+)
+
+
+def _is_test_entry(name: str | None) -> bool:
+    """游戏名命中测试入口词形 → True（打 free_kind='beta'，随免费态一起脱池停爬）。"""
+    return bool(name) and bool(_TEST_ENTRY_RE.search(name))
+
+
+def _classify_free_kind(
+    prices_data: list[dict] | None,
+) -> tuple[str, int | None] | None:
+    """单区价格行 → (free_kind, promo_end_at)。
+
+    - probe = CN ok 行（锚区）；CN 无 ok 行时回退任意区 ok 行。
+    - probe price=0：original>0 → promo（限时赠送，结束时间取各行
+      promo_end_ts 最大值）；original=0 → f2p（永久免费）。
+    - probe price>0（付费）→ (None, None) 显式清标记——**仅当 CN 行在场**：
+      各区任务独立分类，区服促销不同步（CN 赠送中、他区正价）时，非 CN
+      任务不得抹掉 CN 刚打的 promo 标；CN 行缺席且 probe 付费 → None
+      （无信号，调用方不动标记）。
+    - 一条 ok 行都没有（纯 locked/missing 响应）→ None：下架/断网不该
+      抹掉免费态。
+    """
+    ok_rows = [
+        p
+        for p in (prices_data or [])
+        if p.get("price_status", "ok") == "ok" and p.get("price") is not None
+    ]
+    if not ok_rows:
+        return None
+
+    def _kind(row: dict) -> str | None:
+        if int(row["price"]) != 0:
+            return None
+        return "promo" if int(row.get("original_price") or 0) > 0 else "f2p"
+
+    cn_rows = [p for p in ok_rows if str(p.get("region_code", "")).upper() == "CN"]
+    probe = cn_rows[0] if cn_rows else ok_rows[0]
+    kind = _kind(probe)
+    if kind is None:
+        return (None, None) if cn_rows else None
+    if kind != "promo":
+        return ("f2p", None)
+    ends = [
+        int(p["promo_end_ts"])
+        for p in ok_rows
+        if int(p["price"]) == 0
+        and int(p.get("original_price") or 0) > 0
+        and p.get("promo_end_ts")
+    ]
+    return ("promo", max(ends) if ends else None)
 
 
 def _missing_ledger_bump() -> dict:
@@ -93,9 +155,11 @@ class DbWriter:
         self._fx_rates.setdefault("CNY", 1.0)
 
     def _compute_cny_fen(self, price_cents: int | None, currency: str) -> int | None:
-        """cny_fen = ROUND(price_cents * rate_to_cny)。"""
-        if price_cents is None or price_cents <= 0:
+        """cny_fen = ROUND(price_cents * rate_to_cny)；0 = 免费游戏，合法值。"""
+        if price_cents is None:
             return None
+        if int(price_cents) == 0:
+            return 0
         if not self._fx_rates:
             self._fx_rates = {"CNY": 1.0}
         rate = self._fx_rates.get(currency)
@@ -123,21 +187,38 @@ class DbWriter:
                         pass
                 game_values[k] = _naive(v) if isinstance(v, datetime) else v
 
+            free_state = _classify_free_kind(prices_data)
+            if free_state is not None:
+                game_values["free_kind"], game_values["promo_end_at"] = free_state
+            # 测试入口优先于价格分类：Beta/测试页常挂正价（页面透传本体价），
+            # 价格分类判不出免费态，只有命名能定性；'beta' 与 f2p/promo 同走
+            # free_kind 非空脱池机制
+            if _is_test_entry(str(game_values.get("name") or "")):
+                game_values["free_kind"] = "beta"
+                game_values["promo_end_at"] = None
+                free_state = ("beta", None)
+
             async with get_session_factory()() as session:
                 insert_game = sqlite_insert(Game).values(**game_values)
+                upsert_set = {
+                    c: getattr(insert_game.excluded, c)
+                    for c in (
+                        "name", "name_en", "type", "header_image", "store_url",
+                        "chinese_support", "family_sharing", "trading_cards",
+                        "release_date", "genres", "is_adult", "is_visual_novel",
+                        "developers", "publishers",
+                        "positive_rate", "positive_reviews", "review_count",
+                        "updated_at",
+                    )
+                }
+                if free_state is not None:
+                    # 字面量而非 excluded：无 ok 行信号时两键不进 set_——
+                    # 纯 locked/missing 响应绝不洗掉库内免费态
+                    upsert_set["free_kind"] = free_state[0]
+                    upsert_set["promo_end_at"] = free_state[1]
                 upsert_game = insert_game.on_conflict_do_update(
                     index_elements=[Game.appid],
-                    set_={
-                        c: getattr(insert_game.excluded, c)
-                        for c in (
-                            "name", "name_en", "type", "header_image", "store_url",
-                            "chinese_support", "family_sharing", "trading_cards",
-                            "release_date", "genres", "is_adult", "is_visual_novel",
-                            "developers", "publishers",
-                            "positive_rate", "positive_reviews", "review_count",
-                            "updated_at",
-                        )
-                    },
+                    set_=upsert_set,
                 )
                 await session.execute(upsert_game)
 
@@ -148,18 +229,17 @@ class DbWriter:
                     degraded_regions: set[str] = set()  # 本次门禁降级的区（需欠账结转）
 
                     # ── 历史差量门禁基线：该 appid 每个 (区, sub) 的最新快照。
-                    #    全池 6h 化后无门禁 = 价格未变也写快照（实测 ~27 万行/天
-                    #    纯冗余，2.9M 存量里绝大多数是这种）；走势图只需要变化点
-                    #    ——价格没变就没有新点，线是平的，语义不损。比较键含价
+                    #    价格未变不写快照（走势图只需要变化点——线是平的，
+                    #    语义不损）。比较键含价
                     #    三件套 + 版本后缀 + gold 标：折扣往返/价格修正/名称修正
                     #    都会正常产生新快照。现价表不受门禁影响，照常每轮刷新
                     #    （updated_at = 最新验证时刻）。
                     # ── 版本名防丢锚（同 sub_id 历史名）：browse 响应的 option
                     #    name 偶发缺失、档案导入行天生无名——空名行会被「标准
                     #    版」判据误收：历史图混入版本价，current 的 min(sub_id)
-                    #    选择还会让编号更小的豪华版顶替本体（黄金版 376686 <
-                    #    447601 实证）。sub_id 是恒定 SKU，版本名不随时间变：
-                    #    取该 appid 每个 sub 的最新非空名，本次为空的行沿用之。
+                    #    选择还会让编号更小的豪华版顶替本体。sub_id 是恒定 SKU，
+                    #    版本名不随时间变：取该 appid 每个 sub 的最新非空名，
+                    #    本次为空的行沿用之。
                     known_suffix: dict[int, str] = {}
                     rows_known = await session.execute(
                         text(
@@ -219,12 +299,18 @@ class DbWriter:
                             status = "missing"
                             degraded_regions.add(region)
                         cny_fen = (
-                            self._compute_cny_fen(price_cents, currency) if price_cents else None
+                            self._compute_cny_fen(price_cents, currency)
+                            if price_cents is not None
+                            else None
                         )
 
-                        # 所有有价格的版本写入 history（免费游戏 price=0 不进
-                        # history）；相对最新快照无变化的行不写（差量门禁）
-                        if status == "ok" and price_cents and price_cents > 0:
+                        # 所有有价格的版本写入 history；永久免费 price=0 不进
+                        # history（无价格事件），限时赠送 price=0+original>0 是
+                        # 真实价格事件照写——史低/排序缓存的 cny_fen>0 读侧守卫
+                        # 天然排除 0 价；相对最新快照无变化的行不写（差量门禁）
+                        if status == "ok" and price_cents is not None and (
+                            price_cents > 0 or (p.get("original_price") or 0) > 0
+                        ):
                             prev = latest_snapshots.get(
                                 (region, int(p.get("sub_id") or 0))
                             )
@@ -251,6 +337,7 @@ class DbWriter:
                                         "is_bundle": is_bundle,
                                         "price_status": status,
                                         "cny_fen": cny_fen,
+                                        "discount_end_ts": p.get("discount_end_ts"),
                                         "snapshot_at": now_dt,
                                     }
                                 )
@@ -274,6 +361,7 @@ class DbWriter:
                                     "sub_id": p.get("sub_id") or 0,
                                     "price_status": status,
                                     "cny_fen": cny_fen,
+                                    "discount_end_ts": p.get("discount_end_ts"),
                                     "updated_at": now_dt,
                                 }
                             )
@@ -317,8 +405,9 @@ class DbWriter:
                                 "sub_id": p.get("sub_id") or 0,
                                 "price_status": status,
                                 "cny_fen": self._compute_cny_fen(price_cents, currency)
-                                if price_cents
+                                if price_cents is not None
                                 else None,
+                                "discount_end_ts": p.get("discount_end_ts"),
                                 "updated_at": now_dt,
                             }
                         )
@@ -715,15 +804,21 @@ class DbWriter:
             async with get_session_factory()() as session:
                 # 下架脱池（宽限期内照常补抓——误判保险期；终态 404 不会
                 # 改善，穷尽重试转 blocked 后自然停，无需单独排除逻辑）
-                removed = (
-                    select(Game.appid).where(Game.removed_at.is_not(None))
+                # + 免费态排除（f2p/promo 的价格事实已定，欠账重试是空转）
+                excluded = (
+                    select(Game.appid).where(
+                        or_(
+                            Game.removed_at.is_not(None),
+                            Game.free_kind.is_not(None),
+                        )
+                    )
                 )
                 rows = (await session.execute(
                     select(GameCurrentPrice.appid, GameCurrentPrice.region_code)
                     .where(
                         GameCurrentPrice.price_status == "missing",
                         GameCurrentPrice.updated_at < cutoff,
-                        ~GameCurrentPrice.appid.in_(removed),
+                        ~GameCurrentPrice.appid.in_(excluded),
                     )
                     .order_by(GameCurrentPrice.updated_at)
                 )).all()
@@ -795,8 +890,8 @@ class DbWriter:
           从未入库的 appid 由消费方以"不在已爬集合"兜住。
 
         预检只能判断"要不要刷新"，不能替代首爬；无价格数据的游戏
-        被预检 skip 就是永久漏抓（空库上全新 appid 曾被预检
-        "两区均无打折"全 skip，620/570 实证）。
+        被预检 skip 就是永久漏抓（空库上全新 appid 会被预检
+        "两区均无打折"全 skip，如 620/570）。
         """
         try:
             async with get_session_factory()() as session:

@@ -6,7 +6,7 @@
 ⚠️ 用例针对**真实本地库**（只读）。库被清空（如重置数据）时前提不成立，
 模块级 skip 而非误报失败——数据重新导入后自动恢复执行。
 
-sort=top100 用例已迁至 test_top100.py（热榜数据源 mock，不再空集占位）。
+sort=top100 用例在 test_top100.py（热榜数据源 mock，不用空集占位）。
 """
 import sqlite3
 
@@ -153,7 +153,7 @@ async def test_region_ua_highdiff():
 
 @pytest.mark.asyncio
 async def test_region_locked_no_cn():
-    """LOCKED = 无国区 ok 价格行（原型行为，修复旧版恒空集 bug）。"""
+    """LOCKED = 无国区 ok 价格行（不能返回空集）。"""
     r = await _fetch(region="LOCKED")
     assert r["total"] > 0, "锁区列表不应为空"
     for item in r["items"]:

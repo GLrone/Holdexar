@@ -1,7 +1,7 @@
 """首爬漏爬回补层单元测试（mock，不触网）。
 
-背景（v0.1.0 实测事故语义）：绑定后 _post_bind_fetch 会触发 wishlist_sync
-首爬，但两种现实路径会让首爬「入库了却没爬」：
+被测场景：绑定后 _post_bind_fetch 会触发 wishlist_sync 首爬，两种路径会让
+首爬「入库了却没爬」：
 1. 任务被进程重启中断（crawl_jobs 留 failed=进程重启中断，价格零写入）；
 2. 任务占用漏爬后 15min 内再次撞上占用。
 

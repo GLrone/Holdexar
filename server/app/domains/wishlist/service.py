@@ -856,7 +856,7 @@ async def ownership(appids: list[int]) -> dict:
         return {"ownerships": {}}
     # 主账号跟随账户表（与家庭页 get_primary_steamid 同源），旧设置项只作回退——
     # 桌面登录绑定的账号只进账户表；只读设置项时「我」永不命中，owned/family
-    # 归属分类随之塌掉（实测：全家人的已购全标成 owned）
+    # 归属分类随之塌掉（全家人的已购会全标成 owned）
     primary = (await account_service.get_primary_steam_id()) or (
         (await get_value("account.steam_id", "")) or ""
     )
@@ -880,7 +880,7 @@ async def ownership(appids: list[int]) -> dict:
         if primary and a.steamid == primary:
             return "我", avatar
         # 名称三级兜底：备注名 → Steam 昵称 → steamid。缺 persona_name 时
-        # 无备注账户会把 ID 数串直接甩给用户（实测复现过）
+        # 无备注账户会把 ID 数串直接甩给用户
         return a.label or a.persona_name or a.steamid, avatar
 
     owned_by: dict[int, list[tuple[str, str]]] = {}
@@ -1223,3 +1223,59 @@ async def remove_pool_items(appids: list[int]) -> dict:
                 results.append({"appid": appid, "status": "missing", "detail": "不在监控池"})
                 missing += 1
     return {"results": results, "removed": removed, "missing": missing}
+
+
+async def release_free_games(appids: list[int]) -> int:
+    """永久免费自动脱池（爬取作业收尾调用）。
+
+    本轮爬到的 appid 中 free_kind='f2p' 的游戏，所有账户监控行一并
+    active=False + excluded=True + manual=False——语义与手动移除相同：
+    excluded 挡住 15min 同步复活与榜单落池复活，手动重加会清标（但
+    下次爬完写库层仍会标 f2p、收尾再次脱池）。promo 不在此列——赠送
+    会结束，必须留在监控里等到价格翻回正价。
+
+    返回实际脱池的 appid 数（爬前在池内的）。
+    """
+    clean: list[int] = []
+    for a in appids or []:
+        try:
+            appid = int(a)
+        except (TypeError, ValueError):
+            continue
+        if appid > 0 and appid not in clean:
+            clean.append(appid)
+    if not clean:
+        return 0
+
+    from app.domains.games.models import Game
+
+    async with get_session_factory()() as session:
+        free_ids = set(
+            (
+                await session.execute(
+                    select(Game.appid).where(
+                        Game.appid.in_(clean), Game.free_kind == "f2p"
+                    )
+                )
+            ).scalars().all()
+        )
+        if not free_ids:
+            return 0
+        rows = (
+            (
+                await session.execute(
+                    select(WishlistItem).where(WishlistItem.appid.in_(free_ids))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        active_ids = {int(r.appid) for r in rows if r.active}
+        for row in rows:
+            row.active = False
+            row.excluded = True
+            row.manual = False
+        if rows:
+            await _refresh_item_counts(session, {r.steamid for r in rows})
+        await session.commit()
+    return len(active_ids)
