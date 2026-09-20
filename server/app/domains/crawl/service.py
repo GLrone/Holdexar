@@ -193,15 +193,11 @@ async def _active_wishlist_ids() -> tuple[list[int], set[int], set[int]]:
             ids.append(appid)
         if r.manual:
             manual_ids.add(appid)
-        if r.wishlisted:
-            wishlisted_ids.add(appid)
-    # 下架脱池（宽限期外）：Steam 愿望单对下架游戏仍返回条目，
-    # 不排除则每日价格刷新全 41 区空转打 404
-    removed = await _excluded_removed_appids()
-    return [a for a in ids if a not in removed], manual_ids, wishlisted_ids
-
-
-async def _resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tuple[int, str]]:
+    # 留着只会让每日价格刷新全 41 区空转打 404；
+    # 永久免费同理脱池（价格事实已定，再爬是空转配额）
+    free_marked = await _excluded_free_appids()
+    excluded = removed | free_marked
+    return [a for a in ids if a not in excluded], manual_ids, wishlisted_ids
     """scope: appids（显式列表）| wishlist（全部活跃监控条目，含已购）
     | wishlist_only（活跃且非已购）| owned（活跃且已购）| pool（全池）。
     前四种按第一优先级（愿望单/关注）→ hot（打折/史低）→ appid 序排。
@@ -240,14 +236,9 @@ async def _resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tu
             if a in seen_ids:
                 continue
             seen_ids.add(a)
-            deduped_ids.append(a)
-        wl_ids = deduped_ids
-        # 下架脱池（宽限期外）：Steam 愿望单对下架游戏仍返回条目，
-        # 不排除则每日价格刷新全 41 区空转打 404
-        wl_ids = [a for a in wl_ids if a not in await _excluded_removed_appids()]
-        return [
-            (a, "")
-            for a in await _wishlist_ordered(wl_ids, manual_ids, wishlisted_ids)
+        # 留着只会让每日价格刷新全 41 区空转打 404；永久免费同理
+        excluded = await _excluded_removed_appids() | await _excluded_free_appids()
+        wl_ids = [a for a in wl_ids if a not in excluded]
         ]
 
     if scope == "pool":
@@ -453,6 +444,23 @@ async def _excluded_removed_appids() -> set[int]:
                 select(Game.appid).where(
                     Game.removed_at.is_not(None), Game.removed_at < cutoff
                 )
+            )
+        ).scalars().all()
+    return {int(r) for r in rows}
+
+
+async def _excluded_free_appids() -> set[int]:
+    """永久免费脱池名单：free_kind='f2p' 的 appid 集。
+
+    永久免费的价格事实已定（免费态由写库层每轮维护），任何自动通道
+    再爬都是空转配额；promo（限时赠送）**不在**此列——赠送会结束，
+    必须持续爬到价格翻回正价为止。scope=appids 直传不过滤（手动补爬
+    仍可显式指定）。
+    """
+    async with get_session_factory()() as session:
+        rows = (
+            await session.execute(
+                select(Game.appid).where(Game.free_kind == "f2p")
             )
         ).scalars().all()
     return {int(r) for r in rows}
