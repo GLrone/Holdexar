@@ -39,7 +39,29 @@ const bundles = {
   'bundles.head.total': '共 {n} 个捆绑包',
   'bundles.head.completable': '· 可补齐 {n} 个',
   'bundles.empty.noData': '暂无捆绑包数据',
+  'bundles.empty.noMatch': '没有匹配的捆绑包',
+  'bundles.nav.search': '搜索捆绑包… (Enter)',
   'bundles.list.loadMore': '加载更多（剩余 {n} 个）',
+
+  /* 地区维度（选区后差价重新锚定到该区） */
+  'bundles.regionMode.all': '全部',
+  'bundles.regionMode.cheaper': '该区更低',
+  'bundles.regionMode.locked': '该区无货',
+
+  /* 高级筛选（只放捆绑包有数据源的维度） */
+  'bundles.filter.section.basic': '购买形态',
+  'bundles.filter.completableOnly': '仅可补齐（不必整包）',
+  'bundles.filter.cnLowestOnly': '国区最低',
+  'bundles.filter.section.ownership': '撞库结果',
+  'bundles.filter.hideOwned': '隐藏已拥有',
+  'bundles.filter.hideFamily': '隐藏家庭可享',
+  'bundles.filter.section.price': '价格（国区）',
+  'bundles.filter.price': '国区价',
+  'bundles.filter.diffMinLabel': '差价下限',
+  'bundles.filter.min': '最小',
+  'bundles.filter.max': '最大',
+  'bundles.filter.cny': '元',
+  'bundles.filter.diffMinRegionHint': '已选地区：按该区相对国区差价计',
 
   /* 归属徽章（封面上的 status-badge；`我` 进 data-owners 属性） */
   'bundles.badge.me': '我',

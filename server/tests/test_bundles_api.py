@@ -5,7 +5,7 @@ game_current_prices（夹具清理，不污染真实库），验证：
 - 列表聚合：区键大写去重、基准 appids（app_ids 最多的区）、锁区数、
   最低价区、差价下限 0、mps 缺省 -1、差价降序；
 - 双产品隔离：双轨混写的异种 appids 行（同号 sub 污染）整行剔除，
-  不参与最低价/锁区（bundle 61597 数据事故防线）；
+  不参与最低价/锁区（bundle 61597 数据防线）；
 - 追踪区过滤：列表/详情按 crawl_regions 启用集过滤，南亚 PK/BD 双区
   同进同出（启用含 pk 才放行两行）；未启用任何区 = 全量；
 - 图片 CDN 域归一化：fastly/queniuqe → akamai，无封面时按 mps 分 bundle/sub 兜底；
@@ -513,3 +513,63 @@ async def test_detail_404():
         from app.domains.bundles.router import bundle_detail
 
         await bundle_detail(999_999)
+
+
+# ─── smart 排序评分（四因子复刻 games/scoring） ─────────────────────────
+
+BID_D = 990_104  # 大差价包：CN 200 元 / US 折算 80 元 → diff 120 元
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_seed")
+async def test_smart_score_snapshot_and_sort():
+    """smart 评分：refresh 写列 + 列表按评分降序；diff 排序不回归。
+
+    夹具游戏无评测数据 → 质量取中性 0.5、熟悉度 0；评分差由省钱因子
+    （差价对数压缩）拉开：BID_D（差 120 元）> BID_A/C（差 0）。
+    """
+    try:
+        async with get_session_factory()() as session:
+            session.add(
+                Bundle(
+                    bundle_id=BID_D, name="大差价包",
+                    must_purchase_as_set=0, app_ids=[APPID_1],
+                )
+            )
+            session.add_all(
+                [
+                    _bp(BID_D, "CN", 20000, 20000, [APPID_1]),
+                    _bp(BID_D, "US", 1200, 8000, [APPID_1]),
+                ]
+            )
+            await session.commit()
+        await service.refresh_bundle_sort_cache([BID_A, BID_D])
+        service.invalidate_bundles_cache()
+
+        async with get_session_factory()() as session:
+            row = (
+                await session.execute(select(Bundle).where(Bundle.bundle_id == BID_D))
+            ).scalar_one()
+        # 差价 120 元 → save≈0.81；质量中性 0.5 → 0.50*0.81+0.28*0.5 ≈ 0.55
+        assert row.smart_score is not None
+        assert 0.5 < row.smart_score < 0.6
+
+        items_smart = await service.list_bundles("smart")
+        # 真实库与合成包同场（测试跑在开发数据目录）：断言相对顺序而非绝对
+        # 第一——大差价包必须排在夹具零差价包（A/C）之前，两种排序一致
+        ids_smart = [i["bundleId"] for i in items_smart]
+        assert ids_smart.index(BID_D) < ids_smart.index(BID_A)
+        items_diff = await service.list_bundles("diff")
+        ids_diff = [i["bundleId"] for i in items_diff]
+        assert ids_diff.index(BID_D) < ids_diff.index(BID_A)
+        # 排序参数归一：未知值回落 diff，不抛错
+        ids_fallback = [i["bundleId"] for i in await service.list_bundles("bogus")]
+        assert ids_fallback.index(BID_D) < ids_fallback.index(BID_A)
+    finally:
+        service.invalidate_bundles_cache()
+        async with get_session_factory()() as session:
+            await session.execute(
+                delete(BundleRegionPrice).where(BundleRegionPrice.bundle_id == BID_D)
+            )
+            await session.execute(delete(Bundle).where(Bundle.bundle_id == BID_D))
+            await session.commit()

@@ -7,19 +7,18 @@ bundleid / packageid 与 appid 一样进 `ids` 数组，单区一发 ≤400 条�
 - **抓取区 = 监控启用区**（「我」页勾选，与游戏侧同一口径），不再全区全发；
   南亚（CC_LIST 的 pk 聚合位）按 Steam 实际拆巴基斯坦（pk）/ 孟加拉（bd）
   两个独立区各发一次、各落一行（展示层按追踪位合并放行、取两区更低价）。
-- **请求数**：旧链路每包每区一发（148 包 × 41 区 ≈ 6068 发）；新接口整表每区一发
-  （监控区数发，URL ≈3.4KB）。
+- **请求数**：整表每区一发（监控区数发，URL ≈3.4KB），而非每包每区一发。
 - **身份直给**：`item_type`（1=Sub / 2=Bundle）与 `store_url_path`（sub/… vs
-  bundle/…）即 Steam 权威身份，不再需要「us 区基准判定整包身份 → 全区沿用」的
+  bundle/…）即 Steam 权威身份，无需「us 区基准判定整包身份 → 全区沿用」的
   双轨探测（同号 sub/bundle 混写即该探测的失真场景）。
 - **价格单位统一为分**：直接取 `final_price_in_cents`，与 game_current_prices /
-  pricing.format_minor_units 的 cents 约定一致。旧链路 Bundle 轨靠解析
-  formatted_final_price 字符串（零小数货币落成「元」）、Package 轨落「分」——
-  同列两套单位，而 cny_fen 一律按无小数货币除数 1 折算，Sub 轨零小数货币行
-  cny_fen 遂虚高 100 倍（存量归一见 core/database 迁移 v2）。
+  pricing.format_minor_units 的 cents 约定一致。解析 formatted_final_price
+  字符串会把零小数货币落成「元」，与 Package 轨的「分」同列两套单位——而
+  cny_fen 一律按无小数货币除数 1 折算，Sub 轨零小数货币行 cny_fen 遂虚高
+  100 倍（存量归一见 core/database 迁移 v2）。
 - **锁区判定**：`visible=false` / `unvailable_for_country_restriction` 判 locked
-  （旧 packagedetails 对锁区 Sub 仍给价）。
-- 原价 `price_before_bundle_discount` 一手落库（旧 Bundle 轨没有 original_price）。
+  （packagedetails 对锁区 Sub 仍给价）。
+- 原价 `price_before_bundle_discount` 一手落库。
 
 出网直连（browse 接口按 country_code 返回各区数据，出口 IP 不参与判定；
 加速器在系统网络层透明生效）+ 全局限流（与 app 爬取链共享 200 发/5 分钟
@@ -47,7 +46,7 @@ from .service import invalidate_bundles_cache, refresh_bundle_sort_cache
 logger = logging.getLogger(__name__)
 
 APPDETAILS_URL = "https://store.steampowered.com/api/appdetails"
-# 符合 app 爬取标准的类型（与 app_handler 拍板一致：只抓 game/dlc）
+# 符合 app 爬取标准的类型（只抓 game/dlc）
 _CRAWLABLE_TYPES = {"game", "dlc"}
 # 每轮预检上限：appdetails 礼貌限速 + 刷新时长兜底（141 级候选全部逐检会
 # 把刷新拖成数分钟长事务）。未预检候选自然顺延下轮——已结案的自动跳过，
@@ -306,9 +305,9 @@ async def _fetch_bundle_regions(
 def _row_cny_fen(row: dict, rate_map: dict[str, float]) -> int | None:
     """分 → CNY 分：所有币种统一 cents，直接 × 汇率（与 games/pricing 同约定）。
 
-    旧实现对无小数货币（JPY/KRW/VND…）按除数 1 再 ×100，而新接口的
-    `*_in_cents` 对所有币种都是「分」——沿用旧式会把分当元再乘 100，
-    Sub 轨零小数货币行 cny_fen 虚高 100 倍（存量已由 core/database 迁移 v2 归位）。
+    无小数货币（JPY/KRW/VND…）不可按「除数 1 再 ×100」折算——`*_in_cents`
+    对所有币种都是「分」，那样会把分当元再乘 100，cny_fen 虚高 100 倍
+    （存量已由 core/database 迁移 v2 归位）。
     """
     price = row.get("price")
     if not price:
@@ -366,9 +365,9 @@ async def _upsert_bundle_rows(
     kind_votes = [r.get("item_kind") for r in regions if r.get("item_kind") in (0, 1)]
     kind_value = _majority(kind_votes)
     # 购买语义：Sub 形态恒不可拆；bundle 形态以选项级 must_purchase_as_set
-    # 为准（63575 实证：形态与语义解耦）。锁区行不投票（_browse_row 已滤），
-    # 有选项的区间偶发不一致（63575 的 ru 锁区曾是唯一反对票）由多数决归位。
-    # 全无票且库内 NULL/-1 时补 0（旧判据语义兜底）
+    # 为准（形态与语义解耦）。锁区行不投票（_browse_row 已滤），
+    # 有选项的区间偶发不一致由多数决归位。
+    # 全无票且库内 NULL/-1 时补 0（判据兜底）
     mps_votes = [r.get("mps") for r in regions if r.get("mps") in (0, 1)]
     mps_value = _majority(mps_votes)
 
