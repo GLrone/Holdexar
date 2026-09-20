@@ -60,6 +60,9 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         # 商店移除监控：下架判定时间戳 + 连续全 404 轮数
         "removed_at": "DATETIME",
         "removed_strikes": "INTEGER DEFAULT 0",
+        # 免费态：NULL=付费 / f2p=永久免费 / promo=限时赠送中；promo_end_at=结束 Unix 秒
+        "free_kind": "VARCHAR(10)",
+        "promo_end_at": "BIGINT",
     },
     "wishlist_items": {
         "owned": "BOOLEAN DEFAULT 0",
@@ -76,12 +79,20 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "board_pool": "BOOLEAN DEFAULT 0",
     },
     # 补抓账本：missing 状态的补抓尝试计数
+    # + 促销截止（browse active_discounts 下发，Unix 秒；每轮 UPSERT 跟随最新抓取）
     "game_current_prices": {
         "fail_count": "INTEGER DEFAULT 0",
+        "discount_end_ts": "INTEGER",
     },
     # bundle-as-sub 识别标记（版本显示修复）
+    # + browse 促销元数据四列（与 browse_store.GPH_EXTRA_COLUMNS 一一对应：
+    #   attach_browse_extras 回贴促销截止/促销类型/bundle 归属）
     "game_price_history": {
         "is_bundle": "BOOLEAN DEFAULT 0",
+        "discount_end_ts": "INTEGER",
+        "discount_desc": "VARCHAR(60)",
+        "bundle_id": "INTEGER",
+        "bundle_discount_pct": "INTEGER",
     },
     # 捆绑包形态列：链接/CDN 用（与购买语义 mps 解耦）
     # + 排序快照预计算列（对齐 games：min_cny_fen/diff_fen/is_lowest；
@@ -91,6 +102,8 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "min_cny_fen": "BIGINT",
         "diff_fen": "INTEGER DEFAULT 0",
         "is_lowest": "BOOLEAN DEFAULT 0",
+        # smart 排序评分（refresh_bundle_sort_cache 维护；NULL=未计算）
+        "smart_score": "REAL",
     },
     # bills 域新导出字段（Steam 消费历史分类器对齐）
     "bill_game_txs": {
@@ -128,6 +141,18 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
     # family_groups 游玩明细快照列（游玩动态的快照兜底数据源）
     "family_groups": {
         "play_json": "JSON",
+    },
+    # 成就域游戏行来源（owned=本号已购 / shared=家庭共享等库外来源 / manual=手动补录）
+    "achievement_games": {
+        "source": "VARCHAR(12) NOT NULL DEFAULT 'owned'",
+    },
+    # 成就定义的游戏内 API 名（Web API 明细通道按它直连解锁态；爬虫通道为空）
+    "achievement_defs": {
+        "apiname": "VARCHAR(160)",
+    },
+    # 触发事件的人民币分快照（触发时刻 cny_fen 同源落库，历史行回看免再折算）
+    "alert_events": {
+        "price_cny": "BIGINT",
     },
 }
 
@@ -185,7 +210,7 @@ def _ensure_schema(sync_conn) -> None:
 #   2. _MIGRATIONS 追加 (版本号, 描述, SQL 列表)；SQL 须幂等（中断续跑 +
 #      用户库版本乱序防御），复杂逻辑可登记 async fn(engine) 同位元素
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 # 零小数货币（Steam 以整数计价）：旧捆绑包链路的除数表按 1 处理，与「统一存分」
 # 的新约定差 100 倍——v2 归一的目标集合
@@ -196,7 +221,7 @@ async def _migrate_bundle_price_units(conn) -> None:
     """v2：bundle_region_prices 零小数货币单位归一（「元」→「分」+ cny_fen 去虚高）。
 
     旧抓取层对零小数货币（除数表按 1 处理）在**同一列**里混进了多套写法，且按行分布
-    （实测生产库 616 行里三种并存）：
+    （生产库中三种形态并存）：
 
     - 「元价 + fen=price×rate×100」：Bundle 轨解析 formatted_final_price 字符串落「元」，
       cny_fen 本就正确（元值×rate×100 = 分口径 CNY）→ 只需 price ×100；
@@ -306,18 +331,71 @@ async def _migrate_bundle_price_units(conn) -> None:
         )
 
 
+async def _migrate_alert_targets_to_cny(conn) -> None:
+    """v7：price_alerts 的 price 类阈值口径归一——该区货币最小单位 → 人民币分。
+
+    旧口径下阈值与 GameCurrentPrice.price（该区货币分）直比，而前端与邮件
+    一律按 ¥ 展示——外区规则「设的 $10、显示 ¥10、比较的也是 $10」，语义
+    三方分裂。归一后阈值 = 人民币分，与 crawl 落库的 cny_fen 同口径，触发
+    比较、展示、邮件一致；前端按元输入，悬停换算该区现价。
+
+    换算率取 fx_rates 现值，缺币种回退 DEFAULT_EXCHANGE_RATES，再缺的行
+    跳过计数（不猜）；CNY 区 rate=1.0 数值不动。pct / historic_low 不涉及
+    货币，不碰。事务内整体提交（迁移链每步一事务 + user_version 同事务落
+    账），重放只发生在整步回滚后，无需行级幂等判据。
+    """
+    from sqlalchemy import text
+
+    from app.domains.games.pricing import DEFAULT_EXCHANGE_RATES, REGION_TO_CURRENCY
+
+    rates = {
+        code: rate
+        for code, rate in (
+            await conn.execute(text("SELECT currency_code, rate_to_cny FROM fx_rates"))
+        ).all()
+        if rate
+    }
+    rows = (
+        await conn.execute(
+            text(
+                "SELECT id, region, target_value FROM price_alerts"
+                " WHERE target_type = 'price' AND target_value IS NOT NULL"
+            )
+        )
+    ).all()
+
+    converted = skipped = 0
+    for aid, region, value in rows:
+        currency = REGION_TO_CURRENCY.get(str(region or "").upper())
+        rate = rates.get(currency) if currency else None
+        if rate is None and currency:
+            rate = DEFAULT_EXCHANGE_RATES.get(currency)
+        if rate is None:
+            skipped += 1  # 区码/币种认不出：留原值留痕，不猜
+            continue
+        await conn.execute(
+            text("UPDATE price_alerts SET target_value = :v WHERE id = :id"),
+            {"v": round(float(value) * rate), "id": int(aid)},
+        )
+        converted += 1
+    if converted or skipped:
+        logger.info(
+            "[迁移:v7] 价格阈值口径归一（外币分→人民币分）：%d 条换算，%d 条缺汇率跳过",
+            converted, skipped,
+        )
+
+
 async def _migrate_gph_snapshot_unique(conn) -> None:
     """补建 game_price_history 的幂等唯一索引。
 
     写入侧（crawler/db_writer、历史导入脚本）用 `INSERT OR REPLACE` 去重，
-    靠的就是这个唯一索引——但它此前只手工建在开发库上，代码与 create_all 里都没
-    定义。于是**新装的库**表建出来没有它，OR REPLACE 退化成普通 INSERT：同一天
-    同一 sub 反复堆积，表现是走势图出现同日重复点、史低次数虚高、`count` 与库内
-    行数对不上（「数据对不上」的一类）。
+    靠的就是这个唯一索引。缺了它**新装的库**表建出来没有约束，OR REPLACE
+    退化成普通 INSERT：同一天同一 sub 反复堆积，表现是走势图出现同日重复点、
+    史低次数虚高、`count` 与库内行数对不上（「数据对不上」的一类）。
 
     表达式索引而非列索引：sub_id / price / is_gold 都可为空，而 SQLite 的唯一索引
     把每个 NULL 视为互不相等，直接索引这三列等于不约束——必须 COALESCE 归一。
-    与开发库上那份手工索引逐字一致，否则同名不同义会造成两库行为分叉。
+    索引定义与库内既有形态逐字一致，否则同名不同义会造成两库行为分叉。
 
     **非破坏性**：库内已有重复行时只告警、不建索引、更不删行。无索引的库本就在
     无约束地写入，静默删用户数据不可接受；重复行留待人工核对后再跑一次迁移收口。
@@ -364,20 +442,27 @@ _MIGRATIONS: list[tuple[int, str, object]] = [
          " WHERE item_kind IS NULL OR item_kind = -1",
      ]),
     (4, "game_price_history 幂等唯一索引 ux_gph_snapshot 补建"
-        "（写入侧靠 INSERT OR REPLACE 去重，此前该索引只手工建在开发库上、"
-        "代码与 create_all 里都没有，新库会退化成无约束插入）",
+        "（写入侧靠 INSERT OR REPLACE 去重，缺该索引时新库会退化成无约束插入）",
      _migrate_gph_snapshot_unique),
     (5, "wishlist_items 愿望单成员标记回填（监控池三模块语义："
         "愿望单与星标关注识别为爬取队列第一优先级）",
      [
-         # 存量活跃条目中 owned=0 且非星标关注的行均为愿望单同步来源——
-         # 手动入池功能此前不存在，无需区分；回填后未覆盖的行（manual=1）
-         # 已属第一优先级，其愿望单成员资格由下一次账户同步按真实愿望单
-         # 覆写补正（15min 一轮，自愈）。脱池行（active=0）不回填：
-         # 成员资格随下一次同步恢复入池时写入。
+         # 活跃条目中 owned=0 且非星标关注的行均为愿望单同步来源；回填后
+         # 未覆盖的行（manual=1）已属第一优先级，其愿望单成员资格由下一次
+         # 账户同步按真实愿望单覆写补正（15min 一轮，自愈）。脱池行
+         # （active=0）不回填：成员资格随下一次同步恢复入池时写入。
          "UPDATE wishlist_items SET wishlisted = 1"
          " WHERE owned = 0 AND active = 1 AND manual = 0",
      ]),
+    (6, "成就域明细表重建（采集通道改为公开社区页：行标识从 apiname 换为"
+        "图标资产名，旧两表仅在未发布版本中存在过，直接清掉由 create_all 重建）",
+     [
+         "DROP TABLE IF EXISTS game_achievements",
+         "DROP TABLE IF EXISTS player_achievements",
+     ]),
+    (7, "price_alerts 价格阈值口径归一（该区货币分 → 人民币分；触发比较改用"
+        " cny_fen，外区规则与 ¥ 展示语义对齐）",
+     _migrate_alert_targets_to_cny),
 ]
 
 
@@ -417,15 +502,14 @@ def sqlite_file_path() -> Path | None:
 async def _snapshot_before_migration(current: int, target: int) -> None:
     """迁移前落一份快照到 `<db>.pre-migration.bak`（每次覆盖，只留最近一份）。
 
-    **为什么必须有**：结构性迁移（数据回填 / 列拆并 / 表重建）不可逆。v2 那种
-    「元→分」的单位归一若跑错方向，用户整段价格史就变成错值，而此刻线上唯一
-    副本就是它自己；`BACKUP_KEEP` 轮转里的日备最多只能把损失缩到一天前。幂等
-    建索引这类步骤风险低，但迁移链是追加式的，下一条是什么无从预判——按统一
-    规则兜底，不为「这一步看起来安全」开例外。
+    **必须有**：结构性迁移（数据回填 / 列拆并 / 表重建）不可逆。单位归一那类
+    步骤若跑错方向，用户整段价格史就变成错值，而此刻线上唯一副本就是它自己；
+    `BACKUP_KEEP` 轮转里的日备最多只能把损失缩到一天前。幂等建索引这类步骤
+    风险低，但迁移链是追加式的，下一条是什么无从预判——按统一规则兜底，
+    不为「这一步看起来安全」开例外。
 
-    **为什么落在库文件旁边而不是 backups/**：备份目录有 `BACKUP_KEEP=5` 轮转，
-    语义是「用户可恢复的历史点」；迁移前快照的语义是「本次升级的回滚点」，
-    一次性、用完即弃。混进去会让临时库跑一次迁移就挤掉一份日备。
+    **落在库文件旁边**：迁移前快照是「本次升级的回滚点」，一次性、用完即弃，
+    不进 `backups/` 轮转（那是「用户可恢复的历史点」，`BACKUP_KEEP=5`）。
 
     **失败不阻断启动**：快照失败（库被独占、磁盘满）时迁移本身大概率也会失败
     并留全栈日志；在启动路径上因快照失败直接拒绝启动，比原问题更难自查。此处
@@ -510,6 +594,7 @@ async def _run_schema_migrations() -> None:
 async def init_db() -> None:
     """建表 + 基础种子数据。M1 用 create_all，首次 schema 变更前引入 Alembic。"""
     # 导入各域模型模块，确保表注册到 Base.metadata
+    from app.domains.achievements import models as _achievements_models  # noqa: F401
     from app.domains.alerts import models as _alerts_models  # noqa: F401
     from app.domains.bills import models as _bills_models  # noqa: F401
     from app.domains.crawl import models as _crawl_models  # noqa: F401
@@ -526,7 +611,7 @@ async def init_db() -> None:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_ensure_schema)
 
-    # 结构性迁移链（user_version 账本；v1 起步，当前空链零开销）
+    # 结构性迁移链（user_version 账本；v1 起步）
     await _run_schema_migrations()
 
     # 区服配置种子：CC_LIST → crawl_regions（含旧 crawl.enabled_regions 键迁移）
@@ -555,7 +640,7 @@ def get_engine():
         cursor = dbapi_conn.cursor()
         cursor.execute("PRAGMA journal_mode=WAL")
         # WAL 物理收缩：autocheckpoint 只把逻辑尾推回头部复用，文件物理大小
-        # 永远停在历史峰值（实测堆到与主库同量级的 474MB）。超限即截，
+        # 会停在增长过的峰值（可达与主库同量级）。超限即截，
         # 让每个连接做完 checkpoint 都把 WAL 收回本限内。
         cursor.execute("PRAGMA journal_size_limit=67108864")
         cursor.execute("PRAGMA foreign_keys=ON")
