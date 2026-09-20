@@ -34,6 +34,8 @@ P?AN.md
 /*.txt
 /dy
 /_*.png
+# Windows 保留设备名：POSIX 层 `> nul` 重定向会落成实体文件，挡住防误提交
+/nul
 # 根目录下划线开头的调研/实测残留脚本（本机专用，不入库）
 /_*.py
 # CDP 调试浏览器实例数据（含 Cookies/History，绝不入库）
@@ -135,6 +137,14 @@ scripts/_history_*.html
 server/scripts/_history_*.html
 # 价格历史抓取的一次性对拍转储，落在仓库根（如 history-now.json）
 /history-*.json
+
+# ── 一次性临时脚本与产物（_tmp_* / _gen_* 前缀，本机专用，不上传）──
+# 覆盖根目录散落的 _tmp_*.out/.err/临时目录，与 server/scripts/ 下的
+# _tmp_*.py 探测脚本、_gen_*.py 一次性生成器。
+/_tmp_*
+/_gen_*
+server/scripts/_tmp_*
+server/scripts/_gen_*
 
 # ── 一次性开发脚本（本机调试/基准/验证用，不上传）──
 # 刻意不写 `**/scripts/`：那会连 web/scripts/check-routes.mjs（构建门禁必需）一起扫掉。
