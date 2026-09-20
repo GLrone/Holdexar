@@ -25,7 +25,7 @@
      gameCard 模块的同义词条对齐（措辞沿用已有译法，不另起一套）。
 
    · 后端数据值（`detail.type` / `detail.chineseSupport` / 地区名与货币码）本身仍是
-     中文枚举，属期 7 数据层的范围；本模块只迁「标签」，值原样渲染。 */
+     中文枚举，属数据层词汇；本模块只迁「标签」，值原样渲染。 */
 
 const gameDetail = {
   /* ── 分节锚点（data-section 属性值）+ 同名区块标题 ── */
@@ -43,6 +43,7 @@ const gameDetail = {
   'gameDetail.summary.savings': '可省',
   'gameDetail.hl.newLow': '新史低',
   'gameDetail.hl.sameLow': '平史低',
+  'gameDetail.discount.endsAt': '折扣 {date} 截止',
   'gameDetail.pp.cut': '永降',
   'gameDetail.pp.raise': '原价上调',
   'gameDetail.link.steamStore': 'Steam 商店',
@@ -89,6 +90,8 @@ const gameDetail = {
   'gameDetail.price.medalTip': '全区最低价排名（非国区）',
   'gameDetail.price.lowestTag': '最低',
   'gameDetail.price.locked': '锁区',
+  'gameDetail.price.free': '免费',
+  'gameDetail.promo.active': '限时免费 · {date} 截止',
   'gameDetail.price.save': '省¥{amount}',
   'gameDetail.price.empty': '暂无有效价格数据',
 

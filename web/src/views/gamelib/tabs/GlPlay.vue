@@ -1,5 +1,5 @@
 <script setup lang="ts">
-/* 游玩动态（自 family 页迁入，框架 pa-* 标准迁移）：KPI + 成员折叠卡（近2周/总时长条 + 游戏格）。
+/* 游玩动态（框架 pa-*）：KPI + 成员折叠卡（近2周/总时长条 + 游戏格）。
    数据源：familyLib store（GetOwnedGames playtime_forever/2weeks 聚合）。 */
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
@@ -113,9 +113,8 @@ function maxTotal(): number {
           :value="fmtHours(kpi.avgRecent)"
           :sub="t('famPlay.kpi.members', { n: store.members.length })"
         />
-        <!-- 第四张的「数值」是**成员名**不是数字：原先为塞下长昵称写死 font-size:16px，
-             与同排另外三张的 24px 不成排。改走 HlStat 的 md 档（22px），超出交给
-             ellipsis，完整昵称放 title 悬停可见。 -->
+        <!-- 第四张的「数值」是**成员名**不是数字：走 HlStat 的 md 档（22px）与
+             同排三张成排，超出交给 ellipsis，完整昵称放 title 悬停可见。 -->
         <HlStat
           :color="PALETTE.pink"
           :style="{ borderColor: PALETTE.pink + '30' }"
@@ -187,9 +186,8 @@ function maxTotal(): number {
 <style scoped>
 .lib-empty { text-align: center; padding: 26px 16px; border: 1px dashed var(--border-soft); border-radius: var(--radius); background: var(--surface-inset); font-size: 12.5px; color: var(--text-secondary); }
 .pa-kpi-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 10px; }
-/* KPI 卡本体走 components/ui/HlStat.vue。原先四张卡的边框与数字色是**裸十六进制**
-   （#06cfbe / #fbbf24 / #54a0ff / #ec4899），此处改为 familyColors 的具名色
-   （PALETTE.teal / gold / blue / pink，取值逐字相同，不是改色）。 */
+/* KPI 卡本体走 components/ui/HlStat.vue。四张卡的边框与数字色取 familyColors 的
+   具名色（PALETTE.teal / gold / blue / pink），不写裸十六进制。 */
 .pa-kpi-row :deep(.hl-stat) { border-radius: 10px; }
 .pa-member-card { background: var(--surface-inset); border: 1px solid var(--line-1); border-left: 3px solid var(--accent); border-radius: 9px; padding: 10px 12px; margin-bottom: 8px; }
 .pa-member-header { display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; padding: 4px 6px; margin: -4px -6px; border-radius: 6px; transition: background 0.15s; }

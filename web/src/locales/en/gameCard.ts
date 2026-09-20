@@ -8,6 +8,9 @@ const gameCard: Partial<Record<MessageKey, string>> = {
   'gameCard.hl.sameLow': 'Ties low',
   'gameCard.hl.notLow': 'Not a low',
 
+  /* Discount badge hover tooltip */
+  'gameCard.discount.endsAt': 'Ends {date}',
+
   /* EPIC / HB badges */
   'gameCard.epic.given': 'EPIC gave it away on {date}',
   'gameCard.hb.bundle': 'HB bundle',
@@ -49,6 +52,7 @@ const gameCard: Partial<Record<MessageKey, string>> = {
 
   /* Price block */
   'gameCard.price.cn': 'CN',
+  'gameCard.price.free': 'Free',
   'gameCard.price.cnLowest': 'CN lowest',
   'gameCard.price.diff': 'Price gap',
   'gameCard.price.save': 'Save ¥{amount}',
@@ -71,6 +75,11 @@ const gameCard: Partial<Record<MessageKey, string>> = {
   'gameCard.region.locked': 'Locked',
 
   /* Linked bundles block */
+  /* ── Same-series block (server-side name clustering; hidden when unidentified) ── */
+  'gameCard.series.count': '{n} games',
+  'gameCard.series.self': 'This game',
+  'gameCard.series.openTip': 'View details',
+
   'gameCard.bundles.title': 'Linked bundles ({n})',
   'gameCard.bundles.completable': 'Can complete',
   'gameCard.bundles.cnPrice': 'CN ¥{amount}',

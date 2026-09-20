@@ -20,6 +20,9 @@ const gameCard = {
   'gameCard.hl.sameLow': '平史低',
   'gameCard.hl.notLow': '非史低',
 
+  /* ── 折扣徽章悬停气泡（截止日期随促销元数据下发，无数据不弹）── */
+  'gameCard.discount.endsAt': '折扣 {date} 结束',
+
   /* ── EPIC / HB 徽章（品牌词 EPIC 无日期时不建条，留在组件侧）── */
   'gameCard.epic.given': 'EPIC {date} 送过',
   'gameCard.hb.bundle': 'HB慈善包',
@@ -60,6 +63,7 @@ const gameCard = {
 
   /* ── 价格区 ── */
   'gameCard.price.cn': '国区',
+  'gameCard.price.free': '免费',
   'gameCard.price.cnLowest': '中国 最低',
   'gameCard.price.diff': '差价',
   'gameCard.price.save': '省¥{amount}',
@@ -79,6 +83,11 @@ const gameCard = {
   'gameCard.region.clickGiftTip': '点击查看赠礼分析',
   'gameCard.region.pending': '待更新',
   'gameCard.region.locked': '锁区',
+
+  /* ── 同系列区块（服务端名称聚类，未识别到不渲染）── */
+  'gameCard.series.count': '{n} 款',
+  'gameCard.series.self': '本作',
+  'gameCard.series.openTip': '查看详情',
 
   /* ── 关联捆绑包区块 ── */
   'gameCard.bundles.title': '关联捆绑包 ({n})',
