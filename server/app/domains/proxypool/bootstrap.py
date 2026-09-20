@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import yaml
@@ -132,32 +132,41 @@ async def sync_subscriptions(
     channels = build_channels(kernel_proxy=kernel_proxy, pool_proxy=pool_proxy)
 
     for sub in subs:
+        sub_id = sub.id  # 先取出来：savepoint 回滚后 ORM 对象会过期，不能再靠它
         try:
-            result = await fetch_subscription(str(sub.url), channels)
-            nodes = parse_nodes(result.raw, result.fmt)
-            snap = build_snapshot(sub.id, str(sub.url), result, nodes, now=now)
-            await persist_snapshot(session, snap, data_dir=data_dir)
-            # 准入判定必须**现读**：`subs` 是轮询开始时加载的，抓取可能耗时几十秒，
-            # 期间这条订阅可能已经被晋升（或本来就是候选）。用陈旧对象判定会出现：
-            # 同步落盘了更新的快照、却因为"当初是候选"而跳过 apply → 订阅已是 ACTIVE
-            # 而 Registry 仍停在旧快照。刷新一次再判，代价是一条 SELECT。
-            await session.refresh(sub)
-            if is_admitted(sub):
-                await apply_snapshot(
-                    session, subscription_id=sub.id, snapshot=snap, now=now
-                )
-            else:
-                skipped.append(sub.id)
-                logger.info(
-                    "[同步] 订阅 %s 为 CANDIDATE：快照已落盘（%s，%d 条），不进 Registry",
-                    sub.id, snap.sha256[:10], len(nodes),
-                )
+            # 每条订阅一个 SAVEPOINT：本条目的半截写入只回滚自己，
+            # 同轮其它订阅已完成的成果留在外层事务里
+            async with session.begin_nested():
+                result = await fetch_subscription(str(sub.url), channels)
+                nodes = parse_nodes(result.raw, result.fmt)
+                snap = build_snapshot(sub_id, str(sub.url), result, nodes, now=now)
+                await persist_snapshot(session, snap, data_dir=data_dir)
+                # 准入判定必须**现读**：`subs` 是轮询开始时加载的，抓取可能耗时几十秒，
+                # 期间这条订阅可能已经被晋升（或本来就是候选）。用陈旧对象判定会出现：
+                # 同步落盘了更新的快照、却因为"当初是候选"而跳过 apply → 订阅已是 ACTIVE
+                # 而 Registry 仍停在旧快照。刷新一次再判，代价是一条 SELECT。
+                await session.refresh(sub)
+                if is_admitted(sub):
+                    await apply_snapshot(
+                        session, subscription_id=sub_id, snapshot=snap, now=now
+                    )
+                else:
+                    skipped.append(sub_id)
+                    logger.info(
+                        "[同步] 订阅 %s 为 CANDIDATE：快照已落盘（%s，%d 条），不进 Registry",
+                        sub_id, snap.sha256[:10], len(nodes),
+                    )
         except Exception as exc:  # noqa: BLE001 —— 单条订阅失败不阻断其它
             message = str(exc)[:500] or type(exc).__name__
-            failures[sub.id] = message
-            sub.last_fetch_at = now
-            sub.last_fetch_status = "FAILED"
-            sub.last_error = message
+            # savepoint 已把本条目回滚掉；失败用 Core UPDATE 记录，**不碰已过期的 ORM
+            # 对象**——真实生产已复现：flush 失败后再读 sub.* 会抛 PendingRollbackError，
+            # 于是原始失败反而没有被记录下来。
+            await session.execute(
+                update(ProxySubscription)
+                .where(ProxySubscription.id == sub_id)
+                .values(last_fetch_at=now, last_fetch_status="FAILED", last_error=message)
+            )
+            failures[sub_id] = message
             continue
 
         # 投影必须在**快照落库成功之后**；事实源始终是 subscription_snapshots.sha256
