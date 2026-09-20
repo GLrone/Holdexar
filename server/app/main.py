@@ -154,8 +154,10 @@ async def _post_startup_chain() -> None:
     except Exception:  # noqa: BLE001
         logger.exception("旧单账号 Cookie 迁移失败（不阻塞启动）")
 
-    # 史低标记 + 永降标记 + 排序缓存预计算列全库初始化（秒级；爬取后另有增量刷新）
+    # 史低标记 + 永降标记 + 排序缓存预计算列 + 系列归组全库初始化
+    # （秒级；爬取后另有增量刷新）
     from app.domains.games import service as games_service
+    from app.domains.games import series as games_series
 
     try:
         refreshed = await games_service.refresh_hl_flags()
@@ -172,6 +174,11 @@ async def _post_startup_chain() -> None:
         logger.info("排序缓存初始化完成：%d 款", refreshed)
     except Exception:  # noqa: BLE001
         logger.exception("排序缓存初始化失败（不阻塞启动）")
+    try:
+        refreshed = await games_series.refresh_series()
+        logger.info("系列归组初始化完成：%d 款", refreshed)
+    except Exception:  # noqa: BLE001
+        logger.exception("系列归组初始化失败（不阻塞启动）")
 
     # 随包内核就位：mihomo 与 GeoIP 数据随发行包分发，复制进 data/clash/
     # （GeoIP 只补缺失；内核低版本时升级替换，见 clash_manager）。必须早于
@@ -223,20 +230,34 @@ async def _post_startup_chain() -> None:
     # 缓存。失败只记日志：请求路径仍按需重算，功能不受影响。
     from app.domains.bundles import service as bundles_service
 
-    # 排序快照全库重建（bundles.min_cny_fen/diff_fen/is_lowest）：与 games 排序
-    # 缓存同位——列表排序读快照列，不在请求期现算。必须早于列表预热（预热出的
-    # 是含快照字段的完整载荷）。
+    # 排序快照全库重建（bundles.min_cny_fen/diff_fen/is_lowest/smart_score）：
+    # 与 games 排序缓存同位——列表排序读快照列，不在请求期现算。必须早于列表
+    # 预热（预热出的是含快照字段的完整载荷）。
     try:
         rebuilt = await bundles_service.refresh_bundle_sort_cache()
         logger.info("[启动] 捆绑包排序快照初始化完成：%d 个", rebuilt)
     except Exception:  # noqa: BLE001
         logger.exception("捆绑包排序快照初始化失败（不阻塞启动）")
+    # 快照重建后强制失效聚合/序列化缓存：开门（health 200）到本步完成之间，
+    # 早到的请求会用「重建前」的快照行建缓存，指纹不变就一直是旧行——预热
+    # 拿到的是过期载荷。失效后预热必然以新快照重建。
+    bundles_service.invalidate_bundles_cache()
 
     try:
         size = await bundles_service.warmup()
         logger.info("[启动] 捆绑包列表预热完成（%.1f MB）", size / 1e6)
     except Exception:  # noqa: BLE001
         logger.exception("捆绑包列表预热失败（不阻塞启动）")
+
+    # Epic 喜加一快照预热：启动即后台拉新（不 await 网络轮），用户打开仪表盘
+    # 时刷新多半已完成；快照新鲜（30 分钟内）时零开销；失败只记日志，
+    # 请求路径仍有 stale-while-revalidate。
+    from app.domains.metadata import service as metadata_service
+
+    try:
+        await metadata_service.preheat_epic_offers()
+    except Exception:  # noqa: BLE001
+        logger.exception("Epic 快照预热失败（不阻塞启动）")
 
     # 调度器在收拾链跑完后才启动（链首说明的写锁竞态；空窗几秒~十几秒
     # 对 15min/6h 拍完全无感）
