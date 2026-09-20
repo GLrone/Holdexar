@@ -18,8 +18,10 @@
 const dashboard = {
   /* 分节锚点 + 区块标题 */
   'dashboard.section.overview': '概览',
+  'dashboard.section.steamFree': 'Steam 免费游戏',
   'dashboard.section.priceDrops': '降价速报',
   'dashboard.section.epicFree': 'Epic 喜加一',
+  'dashboard.section.hbChoice': 'HB 月包',
   'dashboard.section.spotlight': '新史低精选',
   'dashboard.section.priceMoves': '降价动态',
   'dashboard.section.rates': '主要汇率',

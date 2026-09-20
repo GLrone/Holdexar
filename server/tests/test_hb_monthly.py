@@ -20,7 +20,7 @@ from sqlalchemy import delete, select
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.database import get_session_factory, init_db  # noqa: E402
-from app.domains.games.models import Game  # noqa: E402
+from app.domains.games.models import Game, GameCurrentPrice  # noqa: E402
 from app.domains.metadata import service as hb  # noqa: E402
 from app.domains.settings.models import AppSetting  # noqa: E402
 
@@ -125,6 +125,70 @@ def test_pick_appid_playtest_normalized():
     assert hb._pick_appid("Eldtest Escape Playtest", hits) == 444
 
 
+def test_month_page_url_from_machine_name():
+    assert hb._month_page_url("september_2026_choice") == \
+        "https://www.humblebundle.com/membership/September-2026"
+    assert hb._month_page_url("july_2026_choice") == \
+        "https://www.humblebundle.com/membership/July-2026"
+    # 异形/缺失 machineName → 退回订阅主页（当月包同页可达）
+    assert hb._month_page_url("whatever") == hb._MEMBERSHIP_URL
+    assert hb._month_page_url(None) == hb._MEMBERSHIP_URL
+
+
+@pytest.mark.asyncio
+async def test_offers_payload_and_empty_month(monkeypatch):
+    """展示链：有游标 + 标记行 → ok 载荷（URL 推导/国区价/评价排序）；
+    游标指向查无标记行的月份 → ok=False 空态（2019 年在 HB 档案范围外，
+    真实库不会有该标签，断言与库内其他数据无关）。"""
+    from app.domains.settings.service import set_value
+
+    monkeypatch.setattr(hb, "_HB_STATE_KEY", TEST_STATE_KEY)
+    await set_value(TEST_STATE_KEY, {"machineName": MACHINE, "productName": PRODUCT})
+
+    async with get_session_factory()() as session:
+        existing = await session.get(Game, APP_EXISTING)
+        existing.hb_data = f"{OLD_LABEL}, {LABEL}"
+        existing.review_count = 500
+        # 先清价格行残留（前次运行中断可能已落库；真实库有同 appid 行同理）
+        await session.execute(
+            delete(GameCurrentPrice).where(
+                GameCurrentPrice.appid.in_([APP_NEW, APP_EXISTING])
+            )
+        )
+        session.add(
+            Game(appid=APP_NEW, name="Frosttest 2", is_hb=True,
+                 hb_data=LABEL, created_at=datetime_now())
+        )
+        session.add(GameCurrentPrice(
+            appid=APP_NEW, region_code="CN", currency="CNY",
+            price=14900, original_price=22900, discount_percent=35,
+            price_status="ok",
+        ))
+        session.add(GameCurrentPrice(
+            appid=APP_EXISTING, region_code="CN", currency="CNY",
+            price=9900, original_price=9900, discount_percent=0,
+            price_status="ok",
+        ))
+        await session.commit()
+
+    res = await hb.hb_choice_offers()
+    assert res["ok"] is True
+    assert res["label"] == LABEL
+    assert res["monthUrl"] == "https://www.humblebundle.com/membership/Septtest-2026"
+    assert res["skipUrl"].endswith("/user/skip-month")
+    by_id = {g["appid"]: g for g in res["games"]}
+    assert by_id[APP_NEW]["priceFen"] == 14900
+    assert by_id[APP_NEW]["discount"] == 35
+    assert by_id[APP_EXISTING]["name"] == "Keytest"
+    # 评价量多的在前（库内其余标记行可能混入，只断言合成行相对序）
+    ids = [g["appid"] for g in res["games"]]
+    assert ids.index(APP_EXISTING) < ids.index(APP_NEW)
+
+    await set_value(TEST_STATE_KEY, {"machineName": "september_2019_choice"})
+    empty = await hb.hb_choice_offers()
+    assert empty["ok"] is False
+
+
 # ─── 链路（真实落库 + 合成数据）──────────────────────────────────
 
 
@@ -148,10 +212,14 @@ async def _seed():
             )
         )
         await session.execute(
+            delete(GameCurrentPrice).where(
+                GameCurrentPrice.appid.in_([APP_NEW, APP_EXISTING, APP_UNRESOLVED])
+            )
+        )
+        await session.execute(
             delete(AppSetting).where(AppSetting.key == TEST_STATE_KEY)
         )
         await session.commit()
-
 
 def datetime_now():
     from app.crawler.utils import get_beijing_time_obj

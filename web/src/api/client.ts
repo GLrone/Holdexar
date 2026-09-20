@@ -61,12 +61,7 @@ const NO_CACHE_PATHS = [
   '/system/update-pending',
   '/proxies/clash/install/progress',
   '/achievements/sync', // 成就同步进行中的快照轮询
-  // Epic 卡片：新鲜度由后端快照缓存管理（过期即回旧数据 + 后台刷新），
-  // 前端再叠 60s 时间窗会把 stale→fresh 的覆盖整个吞掉（轮询永远读旧响应）
-  '/metadata/epic/offers',
-]
-
-function isNoCachePath(path: string): boolean {
+  '/metadata/steam/offers', // Steam 喜加一：10min 轮询，赠送结束要立即消失
   return NO_CACHE_PATHS.some((p) => path === p || path.startsWith(`${p}?`) || path.startsWith(`${p}/`))
 }
 
@@ -1635,12 +1630,14 @@ export interface EpicOffersPayload {
 }
 
 export const metadataApi = {
-  /** 当期 + 预告白送元素；后端快照缓存 30 分钟（冷启动先回快照 + 后台刷新） */
-  epicOffers: (opts?: { noCache?: boolean }) =>
-    request<EpicOffersPayload>('GET', '/metadata/epic/offers', undefined, opts),
-export interface AchievementSummary {
-  hasCredential: boolean
-  steamid: string
+  hbChoiceOffers: () => request<HbChoiceOffersPayload>('GET', '/metadata/hb/offers'),
+  steamFreeOffers: () => request<SteamFreeOffersPayload>('GET', '/metadata/steam/offers'),
+export interface SteamFreeOffer {
+export interface SteamFreeOffersPayload {
+  offers: SteamFreeOffer[]
+export interface HbChoiceGame {
+export interface HbChoiceOffersPayload {
+  games: HbChoiceGame[]
   /** 白金（全成就）游戏数 */
   platinum: number
   /** 有成就系统的游戏数（含库外） */

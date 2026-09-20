@@ -554,6 +554,156 @@ async def refresh_hb_choice() -> dict:
     }
 
 
+# ─── HB 当月包展示：仪表盘卡片数据源（纯本地库读，零外网）─────────────
+
+_SKIP_MONTH_URL = "https://www.humblebundle.com/user/skip-month"
+_HB_SETTINGS_URL = "https://www.humblebundle.com/user/settings"
+
+
+def _month_page_url(machine_name: str | None) -> str:
+    """september_2026_choice → https://www.humblebundle.com/membership/September-2026。
+
+    月份页 URL 与 activeContentMachineName 同构（英文月份名-年份，如
+    August-2026）；解析不出退回 /membership 订阅主页（当月包同页可达）。
+    """
+    m = re.match(r"^([a-z]+)_(\d{4})_choice$", machine_name or "")
+    if m and m.group(1).capitalize()[:3] in _MONTH_MAP:
+        return f"https://www.humblebundle.com/membership/{m.group(1).capitalize()}-{m.group(2)}"
+    return _MEMBERSHIP_URL
+
+
+async def hb_choice_offers() -> dict:
+    """当月 HB Choice 游戏清单（仪表盘卡片数据源，只读本地库零外网）。
+
+    当月标签取记账游标（与打标链同一事实源）；无游标（全新安装/抓取链
+    尚未结案）按北京时间猜当月，仍查不到行即 ok=False 空态。价格取国区
+    ok 行，口径与站内其余卡片一致（分为单位，前端 formatCnyFen 渲染）。
+    """
+    from app.crawler.utils import get_beijing_time_obj
+    from app.domains.games.models import GameCurrentPrice
+    from app.domains.settings.service import get_value
+
+    state = await get_value(_HB_STATE_KEY) or {}
+    machine = str(state.get("machineName") or "")
+    product = str(state.get("productName") or "")
+    if machine:
+        label = _choice_month_label(machine, product or None)
+    else:
+        now = get_beijing_time_obj()
+        label = f"HB慈善包{now.year % 100:02d}年{now.month}月包"
+
+    async with get_session_factory()() as session:
+        rows = (
+            await session.execute(
+                select(Game.appid, Game.name, Game.header_image, Game.min_cny_fen)
+                .where(Game.is_hb.is_(True), Game.hb_data.like(f"%{label}%"))
+                .order_by(func.coalesce(Game.review_count, 0).desc(), Game.appid)
+            )
+        ).all()
+        prices: dict[int, tuple] = {}
+        if rows:
+            price_rows = (
+                await session.execute(
+                    select(
+                        GameCurrentPrice.appid, GameCurrentPrice.price,
+                        GameCurrentPrice.original_price,
+                        GameCurrentPrice.discount_percent,
+                    ).where(
+                        GameCurrentPrice.appid.in_([r.appid for r in rows]),
+                        GameCurrentPrice.region_code == "CN",
+                        GameCurrentPrice.price_status == "ok",
+                    )
+                )
+            ).all()
+            prices = {int(p.appid): (p.price, p.original_price, p.discount_percent)
+                      for p in price_rows}
+
+    if not rows:
+        return {
+            "source": "hb-offers", "ok": False,
+            "error": "当月包尚未入库（等待每日抓取或手动触发 /metadata/hb/refresh）",
+        }
+
+    return {
+        "source": "hb-offers", "ok": True,
+        "machineName": machine or None,
+        "productName": product or None,
+        "label": label,
+        "monthUrl": _month_page_url(machine or None),
+        "skipUrl": _SKIP_MONTH_URL,
+        "settingsUrl": _HB_SETTINGS_URL,
+        "games": [
+            {
+                "appid": r.appid,
+                "name": r.name or str(r.appid),
+                "headerImage": r.header_image,
+                "priceFen": prices.get(int(r.appid), (None, None, 0))[0],
+                "originalPriceFen": prices.get(int(r.appid), (None, None, 0))[1],
+                "discount": prices.get(int(r.appid), (None, None, 0))[2] or 0,
+                "lowestCnyFen": r.min_cny_fen,
+            }
+            for r in rows
+        ],
+    }
+
+
+# ─── Steam 喜加一：限时赠送展示链（纯本地库零外网）────────────────────
+# 事实源 = games.free_kind='promo'（写库层每轮爬取按价格行维护）+
+# promo_end_at（Steam free_to_keep_ends，精确到秒）。发现面 = 特惠反哺
+# 与监控池内游戏转赠送；到期翻转由免费复查 job / 下一轮爬取完成，
+# 已过结束时刻的行直接不出（仪表盘「无赠送即整块隐藏」）。
+
+
+async def steam_free_offers() -> dict:
+    """正在赠送中的 Steam 限时免费清单（仪表盘卡片数据源，纯本地库零外网）。"""
+    from app.crawler.utils import get_beijing_time_obj
+    from app.domains.games.models import GameCurrentPrice
+
+    now_ts = int(get_beijing_time_obj().timestamp())
+    async with get_session_factory()() as session:
+        rows = (
+            await session.execute(
+                select(Game.appid, Game.name, Game.header_image, Game.promo_end_at)
+                .where(
+                    Game.free_kind == "promo",
+                    Game.promo_end_at.is_not(None),
+                    Game.promo_end_at > now_ts,
+                )
+                .order_by(Game.promo_end_at, Game.appid)
+            )
+        ).all()
+        prices: dict[int, int | None] = {}
+        if rows:
+            price_rows = (
+                await session.execute(
+                    select(
+                        GameCurrentPrice.appid, GameCurrentPrice.original_price
+                    ).where(
+                        GameCurrentPrice.appid.in_([r.appid for r in rows]),
+                        GameCurrentPrice.region_code == "CN",
+                        GameCurrentPrice.price_status == "ok",
+                    )
+                )
+            ).all()
+            prices = {int(p.appid): p.original_price for p in price_rows}
+
+    return {
+        "source": "steam-free",
+        "ok": True,
+        "fetchedAt": get_beijing_now_iso(),
+        "offers": [
+            {
+                "appid": r.appid,
+                "name": r.name or str(r.appid),
+                "headerImage": r.header_image,
+                "originalPriceFen": prices.get(int(r.appid)),
+                "endTs": int(r.promo_end_at),
+            }
+            for r in rows
+        ],
+    }
+
+
 # ─── Epic 喜加一：促销端点自动链 + 外部名单推送 ──────────────────────
 # 促销端点窗口只含当期+未来两周，无历史——历史深度由静态档案导入
 # （import_epic）与外部名单（import_epic_list，浏览器侧脚本推送）补足；

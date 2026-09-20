@@ -94,12 +94,8 @@ export const messages = {
   ...famContrib,
   ...famGrowth,
   ...famHeat,
-  ...currencies,
-  ...regions,
-  ...epicFree,
-  ...gamelib,
-  ...updateDialog,
-  ...achievements,
+  ...steamFree,
+  ...hbChoice,
   ...achievementsCareer,
 } as const
 
