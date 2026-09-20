@@ -8,12 +8,12 @@
  * 四处与本项目其它动效一致的约定：
  *  · 显隐用 `opacity + translateY`，**不用 scale**——缩放对前庭敏感用户不友好，
  *    且项目内其它出入场（.hl-pane-*、抽屉、弹层）都是位移+透明度这一套。
- *  · 入场动画**只播一次**（is-in 只加不撤）：连续滚动容器里「滚出淡出、滚回重播」
+ *  · 入场动画**只播一次**（data-entered 只加不撤）：连续滚动容器里「滚出淡出、滚回重播」
  *    会把视口内条目全推进过渡态，观感是列表发虚而非有动效。
  *  · 时长一律 `calc(var(--duration-N) * var(--motion-scale))`，开着系统级
  *    「减少动态效果」时 --motion-scale 归零 → 瞬时到位，不需要另写 media query。
- *  · 键盘导航**必须显式开启**，且只在本容器持有焦点时生效。旧实现挂在 window 上并
- *    对 Tab 做 preventDefault——只要列表在页面上，整页的 Tab 焦点顺序就被劫持。
+ *  · 键盘导航**必须显式开启**，且只在本容器持有焦点时生效。禁用挂 window + 对 Tab
+ *    做 preventDefault 的写法——只要列表在页面上，整页的 Tab 焦点顺序就被劫持。
  *
  * 无限滚动：滚动区末尾有常驻哨兵，接近底部时 emit `endReached`；加载态 / 到底
  * 提示由消费方放进 `#footer` 插槽（渲染在条目与哨兵之间，随内容一起滚）。
@@ -62,9 +62,12 @@ const bottomFade = ref(0)
 let observer: IntersectionObserver | null = null
 let tailObserver: IntersectionObserver | null = null
 
-/* 进出视口的显隐直接改 class，不进响应式：滚动时每帧都在切换，
+/* 进出视口的显隐直接改 DOM 属性，不进响应式：滚动时每帧都在切换，
    走 Set + 响应式会触发整列表重渲染。选中态是低频的，才留在 ref 里。
-   入场**只加不撤**（见文件头）：滚出的条目保持常亮，回滚不重播，连续滚动不闪。 */
+   入场**只加不撤**（见文件头）：滚出的条目保持常亮，回滚不重播，连续滚动不闪。
+   入场标记必须是 data 属性、不能是手工加的 class——Vue 对 class 绑定变化的
+   patch 是整串覆写 className，会把手加的类抹掉（条目被点选后 is-selected
+   变化即触发覆写，条目当场隐形且永不恢复）；vdom 之外的手工属性不受 patch 影响。 */
 function setupObserver() {
   observer?.disconnect()
   const root = scroller.value
@@ -72,7 +75,7 @@ function setupObserver() {
   observer = new IntersectionObserver(
     (entries) => {
       for (const e of entries) {
-        if (e.isIntersecting) e.target.classList.add('is-in')
+        if (e.isIntersecting) e.target.setAttribute('data-entered', '')
       }
     },
     { root, threshold: 0.01 },
