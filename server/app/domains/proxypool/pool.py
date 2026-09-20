@@ -56,6 +56,19 @@ def pool_path(data_dir: Path) -> Path:
     return Path(data_dir) / "proxypool" / POOL_FILENAME
 
 
+def pool_file_names(data_dir: Path) -> tuple[str, ...]:
+    """池文件当前写入的节点名（没有文件时返回空）。
+
+    这是**落盘产物**的读数，与 `eligible_nodes`（合格集）区分开：判断池文件有没有
+    跟上当前合格集要比**集合**，比数量会在"换了一个节点但数量相同"时漏判。
+    """
+    path = pool_path(data_dir)
+    if not path.is_file():
+        return ()
+    doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return tuple(str(entry.get("name")) for entry in (doc.get("proxies") or []))
+
+
 def _is_complete(node: ProxyNode) -> bool:
     """资格之外的「配置完整」：池里每一条都必须是内核装载得了的。"""
     if not node.runtime_name:
