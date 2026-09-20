@@ -39,7 +39,12 @@ const settings: Partial<Record<MessageKey, string>> = {
 
   /* Bound-account list */
   'settings.steam.mismatchWarn': 'This account has a different SteamID from the SteamID64 saved above — check that it is the same account',
-  'settings.steam.syncError': 'Last sync failed: {error}',
+  'settings.steam.syncOk': 'Synced',
+  'settings.steam.syncFail': 'Sync failed',
+  'settings.steam.syncIdle': 'Not synced',
+  'settings.steam.syncTipOk': 'Last synced: {time}',
+  'settings.steam.syncTipFail': 'Last sync failed at {time} · {error}',
+  'settings.steam.syncTipIdle': 'No wallet data synced yet',
   'settings.steam.noNickname': '(nickname not synced)',
   'settings.steam.primary': 'Primary',
   'settings.steam.active': 'Active',

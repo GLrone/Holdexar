@@ -7,6 +7,7 @@ import {
   systemApi,
   type SettingsPayload,
   type BackupItem,
+  type SteamAccountItem,
 } from '@/api/client'
 import { useI18n, type MessageKey } from '@/locales'
 import { useAccountStore } from '@/stores/account'
@@ -50,9 +51,30 @@ const mismatch = computed(() => accountStore.status?.mismatch ?? false)
 
 /** active 账号的钱包（顶层 wallet 与 active 一致） */
 const wallet = computed(() => accountStore.status?.wallet ?? null)
-const syncError = computed(
-  () => accountStore.status?.sync_error || wallet.value?.error || '',
-)
+
+/* 每账号同步状态：wallet_error 非空 = 最近一次同步失败（错误详情收进悬停
+   提示，不占行内空间）；无钱包快照 = 尚未同步。wallet.checked_at 在失败时
+   是失败尝试的时间，成功时是上次成功同步的时间。 */
+type SyncTone = 'ok' | 'fail' | 'idle'
+function syncStateOf(acc: SteamAccountItem): { tone: SyncTone; label: string; tip: string } {
+  if (!acc.wallet) {
+    return { tone: 'idle', label: t('settings.steam.syncIdle'), tip: t('settings.steam.syncTipIdle') }
+  }
+  const time = acc.wallet.checked_at ? acc.wallet.checked_at.replace('T', ' ').slice(0, 19) : ''
+  const error = acc.wallet_error || acc.wallet.error || ''
+  if (error) {
+    return {
+      tone: 'fail',
+      label: t('settings.steam.syncFail'),
+      tip: time ? t('settings.steam.syncTipFail', { time, error }) : t('settings.steam.syncFail'),
+    }
+  }
+  return {
+    tone: 'ok',
+    label: t('settings.steam.syncOk'),
+    tip: time ? t('settings.steam.syncTipOk', { time }) : t('settings.steam.syncOk'),
+  }
+}
 
 /* 绑定态身份展示：好友码（SteamID64 换算，统一出口）；缺失/异常时退化 */
 const boundIdentity = computed(() => {
@@ -513,29 +535,18 @@ onMounted(() => {
               <HlIcon v-if="!cookieSaving" name="check" />
               {{ t('settings.steam.bind') }}
             </HlButton>
-            <template v-else>
-              <HlButton
-                art="outline"
-                tone="green"
-                size="sm"
-                :disabled="cookieSaving"
-                :loading="cookieSaving"
-                @click="openRiskDialog('manual')"
-              >
-                <HlIcon v-if="!cookieSaving" name="check" />
-                {{ t('settings.steam.addAccount') }}
-              </HlButton>
-              <HlButton
-                variant="text"
-                size="sm"
-                :disabled="cookieSaving"
-                :loading="cookieSaving"
-                @click="resyncWallet"
-              >
-                <HlIcon v-if="!cookieSaving" name="refresh" />
-                {{ t('settings.steam.refreshBalance') }}
-              </HlButton>
-            </template>
+            <HlButton
+              v-else
+              art="outline"
+              tone="green"
+              size="sm"
+              :disabled="cookieSaving"
+              :loading="cookieSaving"
+              @click="openRiskDialog('manual')"
+            >
+              <HlIcon v-if="!cookieSaving" name="check" />
+              {{ t('settings.steam.addAccount') }}
+            </HlButton>
           </div>
 
           <!-- 获取 Cookie 分步引导（默认收起） -->
@@ -561,11 +572,14 @@ onMounted(() => {
 
         <!-- 绑定后展示：多账号列表（每个账号完整信息） -->
         <div v-if="hasCookie" class="account-summary">
+          <div class="account-summary__head">
+            <HlButton art="outline" tone="blue" size="sm" :disabled="cookieSaving" :loading="cookieSaving" @click="resyncWallet">
+              <HlIcon v-if="!cookieSaving" name="refresh" />
+              {{ t('settings.steam.refreshBalance') }}
+            </HlButton>
+          </div>
           <div v-if="mismatch" class="account-summary__warn">
             {{ t('settings.steam.mismatchWarn') }}
-          </div>
-          <div v-if="syncError" class="account-summary__warn">
-            {{ t('settings.steam.syncError', { error: syncError }) }}
           </div>
 
           <div class="account-list">
@@ -592,6 +606,12 @@ onMounted(() => {
                   }}</span>
                   <span v-if="acc.is_primary" class="account-badge account-badge--primary">{{ t('settings.steam.primary') }}</span>
                   <span v-if="acc.is_active" class="account-badge account-badge--active">{{ t('settings.steam.active') }}</span>
+                  <!-- 同步状态标记：悬停看最近同步时间（失败时附错误详情） -->
+                  <span
+                    class="account-badge"
+                    :class="`account-badge--sync-${syncStateOf(acc).tone}`"
+                    :title="syncStateOf(acc).tip"
+                  >{{ syncStateOf(acc).label }}</span>
                 </div>
                 <div class="account-row__friend">{{ t('settings.steam.friendCode', { code: acc.friend_code || t('settings.steam.unknown') }) }}</div>
               </div>
@@ -1061,6 +1081,12 @@ onMounted(() => {
   font-size: 13px;
 }
 
+/* 账号区头部工具行：刷新余额靠右（与行内操作列同侧） */
+.account-summary__head {
+  display: flex;
+  justify-content: flex-end;
+}
+
 /* ── 多账号列表行 ── */
 .account-list {
   display: flex;
@@ -1102,12 +1128,12 @@ onMounted(() => {
 }
 
 /* ── 列对齐契约（本组样式是账户行跨行对齐的全部依赖，改动前先读注释）──
-   行 = [头像 40px][身份 168px][统计 固定 6 列][操作 ≥160px]：
+   行 = [头像 40px][身份 224px][统计 固定 6 列][操作 ≥160px]：
    前两段定宽 → 统计区起点跨行一致；统计区内部是固定像素列 →
    列位置只由列序号决定，与内容长短无关。任何一段改回「内容驱动宽度」
-   （auto / 由内容撑的 min-width），错位立即复现（乌克兰 vs 印度行实测差 73px）。 */
+   （auto / 由内容撑的 min-width），错位立即复现（不同长度区名可差 ~70px）。 */
 .account-row__id {
-  flex: 0 0 168px;
+  flex: 0 0 224px;
   min-width: 0;
 }
 
@@ -1155,6 +1181,25 @@ onMounted(() => {
 .account-badge--active {
   color: var(--success, #27ae60);
   border: 1px solid var(--success, #27ae60);
+}
+
+/* 同步状态三态：正常亮绿、失败亮红、未同步虚线收灰 */
+.account-badge--sync-ok {
+  color: var(--success, #27ae60);
+  border: 1px solid var(--success, #27ae60);
+  cursor: help;
+}
+
+.account-badge--sync-fail {
+  color: var(--danger, #e74c3c);
+  border: 1px solid var(--danger, #e74c3c);
+  cursor: help;
+}
+
+.account-badge--sync-idle {
+  color: var(--text-muted);
+  border: 1px dashed var(--border-soft);
+  cursor: help;
 }
 
 /* 统计区：固定模板列（grid 定宽），列位置与内容长短无关。
