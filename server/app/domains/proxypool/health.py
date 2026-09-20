@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -48,13 +49,18 @@ from app.crawler.browse_store import StoreBrowseAPI, _to_int
 from app.domains.proxypool.models import HealthObservation, ProxyNode, ProxyNodeSource
 from app.domains.proxypool.pool import pool_path
 from app.domains.proxypool.runtime import mixed_port_of
-from app.domains.proxypool.state import evaluate_node_state
+from app.domains.proxypool.state import NODE_DEAD, evaluate_node_state
+
+logger = logging.getLogger(__name__)
 
 # L0 传输层目标：204、无响应体、请求最轻（选型见模块文档）
 PROBE_TARGET_URL = "http://www.gstatic.com/generate_204"
 
 PROBE_LEVEL = "L0"
 DEFAULT_TIMEOUT_MS = 5000
+# DEAD 恢复探测每轮上限：DEAD 不在池文件里，池内 L0 探不到它，没有这条路节点一旦
+# DEAD 就永久出局。分批轮转补探，且批小到不会把 L0 的写事务窗口拉长（写锁问题）。
+RECOVERY_BATCH_SIZE = 4
 
 # ── L1：出口 IP ──────────────────────────────────────────────────
 L1_LEVEL = "L1"
@@ -158,6 +164,60 @@ def _pool_names(data_dir: Path) -> tuple[str, ...]:
     return tuple(str(proxy["name"]) for proxy in doc.get("proxies", []))
 
 
+async def _probe_and_record(
+    session: AsyncSession, node: ProxyNode, *,
+    controller_url: str,
+    secret: str,
+    probe_name: str,
+    now: datetime,
+    url: str,
+    timeout_ms: int,
+) -> HealthOutcome:
+    """一次 L0 探测 + 落观测 + 推状态；池内探测与 DEAD 恢复探测共用同一条语义。
+
+    `probe_name` 是**执行探测的内核认识的名字**：池内节点用 `runtime_name`（池内核的
+    运行配置里就是它），DEAD 节点不在池文件里、池内核不认识，改用来源订阅名
+    （`ProxyNodeSource.original_name`）打到持有全量订阅节点的旧链路内核上。
+    """
+    result = await probe_node(controller_url, secret, probe_name,
+                              url=url, timeout_ms=timeout_ms)
+    source_count = await session.scalar(
+        select(func.count())
+        .select_from(ProxyNodeSource)
+        .where(ProxyNodeSource.node_id == node.node_id)
+    )
+    previous = node.state
+    # 连续失败计数：成功归零、失败累加。它既是状态机的输入（退休线判据），
+    # 也是台账事实——判 DEAD 的节点必须带着失败次数，不能留下"DEAD 且计数 0"。
+    failures = 0 if result.ok else (node.consecutive_failures or 0) + 1
+    node.consecutive_failures = failures
+    # 唯一的状态决策入口：健康只提供证据，规则仍归状态机
+    target = evaluate_node_state(
+        previous,
+        source_seen=bool(source_count),
+        probe_ok=result.ok,
+        consecutive_failures=failures,
+    )
+    node.state = target
+    session.add(HealthObservation(
+        node_id=node.node_id,
+        level=PROBE_LEVEL,
+        ok=result.ok,
+        latency_ms=result.delay_ms,
+        detail=result.detail or None,
+        observed_at=now,
+    ))
+    return HealthOutcome(
+        node_id=node.node_id,
+        runtime_name=node.runtime_name,
+        ok=result.ok,
+        delay_ms=result.delay_ms,
+        detail=result.detail,
+        previous_state=previous,
+        state=target,
+    )
+
+
 async def health_check_pool(
     session: AsyncSession, *,
     data_dir: Path,
@@ -182,45 +242,80 @@ async def health_check_pool(
             # 不静默造行，留给上面的对账去暴露。
             continue
 
-        result = await probe_node(controller_url, secret, name,
-                                  url=url, timeout_ms=timeout_ms)
-        source_count = await session.scalar(
-            select(func.count())
-            .select_from(ProxyNodeSource)
-            .where(ProxyNodeSource.node_id == node.node_id)
-        )
-        previous = node.state
-        # 连续失败计数：成功归零、失败累加。它既是状态机的输入（退休线判据），
-        # 也是台账事实——判 DEAD 的节点必须带着失败次数，不能留下"DEAD 且计数 0"。
-        failures = 0 if result.ok else (node.consecutive_failures or 0) + 1
-        node.consecutive_failures = failures
-        # 唯一的状态决策入口：健康只提供证据，规则仍归状态机
-        target = evaluate_node_state(
-            previous,
-            source_seen=bool(source_count),
-            probe_ok=result.ok,
-            consecutive_failures=failures,
-        )
-        node.state = target
-        session.add(HealthObservation(
-            node_id=node.node_id,
-            level=PROBE_LEVEL,
-            ok=result.ok,
-            latency_ms=result.delay_ms,
-            detail=result.detail or None,
-            observed_at=now,
-        ))
-        outcomes.append(HealthOutcome(
-            node_id=node.node_id,
-            runtime_name=name,
-            ok=result.ok,
-            delay_ms=result.delay_ms,
-            detail=result.detail,
-            previous_state=previous,
-            state=target,
+        outcomes.append(await _probe_and_record(
+            session, node, controller_url=controller_url, secret=secret,
+            probe_name=name, now=now, url=url, timeout_ms=timeout_ms,
         ))
 
     await session.flush()
+    return tuple(outcomes)
+
+
+async def recover_dead_nodes(
+    session: AsyncSession, *,
+    controller_url: str,
+    secret: str,
+    now: datetime,
+    url: str = PROBE_TARGET_URL,
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    batch: int = RECOVERY_BATCH_SIZE,
+) -> tuple[HealthOutcome, ...]:
+    """对 DEAD 节点分批做 L0 恢复探测：成功回 `ACTIVE` 并清零计数，失败保持 `DEAD` 并累加。
+
+    分批轮转：**已在累计失败的最先收口**（否则要等轮转一整圈才回到它，退休线在很长时间里
+    不可达），其余按「最久没有被探过」排序（`health_observations` 的最后一条），一次只取
+    `batch` 个——DEAD 不一次性全打出去，也不新建调度系统。成功使节点重新合格，
+    合格集变化由 `run_l0_cycle` 既有的 before/after 比较去请求重建。
+
+    `controller_url` 指向**持有这些节点配置的内核**（DEAD 不在池文件里，池内核不认识
+    它们的名字）。没有来源名的节点无法定位到内核里的配置，跳过不动它。
+    """
+    if batch <= 0:
+        return ()
+
+    last_probe = (
+        select(
+            HealthObservation.node_id.label("node_id"),
+            func.max(HealthObservation.observed_at).label("last_at"),
+        )
+        .group_by(HealthObservation.node_id)
+        .subquery()
+    )
+    source = (
+        select(
+            ProxyNodeSource.node_id.label("node_id"),
+            func.min(ProxyNodeSource.original_name).label("original_name"),
+        )
+        .group_by(ProxyNodeSource.node_id)
+        .subquery()
+    )
+    rows = (await session.execute(
+        select(ProxyNode, source.c.original_name)
+        .join(source, source.c.node_id == ProxyNode.node_id)
+        .outerjoin(last_probe, last_probe.c.node_id == ProxyNode.node_id)
+        .where(ProxyNode.state == NODE_DEAD)
+        .order_by(
+            ProxyNode.consecutive_failures.desc(),
+            last_probe.c.last_at.asc().nullsfirst(),
+            ProxyNode.node_id,
+        )
+        .limit(batch)
+    )).all()
+
+    outcomes: list[HealthOutcome] = []
+    for node, original_name in rows:
+        outcomes.append(await _probe_and_record(
+            session, node, controller_url=controller_url, secret=secret,
+            probe_name=str(original_name), now=now, url=url, timeout_ms=timeout_ms,
+        ))
+
+    await session.flush()
+    if outcomes:
+        recovered = sum(1 for o in outcomes if o.state != NODE_DEAD)
+        logger.info(
+            "[L0恢复] DEAD 补探 %d 个：成功 %d / 仍 DEAD %d",
+            len(outcomes), recovered, len(outcomes) - recovered,
+        )
     return tuple(outcomes)
 
 

@@ -34,6 +34,7 @@ from app.domains.proxypool.health import (
     business_check_pool,
     exit_ip_check_pool,
     health_check_pool,
+    recover_dead_nodes,
 )
 from app.domains.proxypool.pool import eligible_runtime_names
 from app.domains.proxypool.runtime import (
@@ -85,17 +86,28 @@ async def run_l0_cycle(
     secret: str,
     now: datetime,
     target_url: str | None = None,
+    recovery_controller: tuple[str, str] | None = None,
 ) -> tuple[HealthOutcome, ...]:
     """L0：传输层健康。**可与 crawl 并行**（不动 `GLOBAL`）。
 
     只做两件事：改 `state`；若合格集因此变化，置 `rebuild_pending`。
     重建交给空闲时的 `run_pending_rebuild()`——占线时绝不 stop 内核。
+
+    池内 L0 之外，还对 DEAD 节点分批做恢复探测（`recovery_controller` = 持有这些节点
+    配置的内核）：DEAD 不在池文件里，池内 L0 永远探不到它，没有这条路径节点一旦 DEAD
+    就永久出局、失败计数也停住。恢复成功使节点重新合格，合格集变化由下面的
+    before/after 比较去请求重建。
     """
     before = await eligible_runtime_names(session)
     outcomes = await health_check_pool(
         session, data_dir=data_dir, controller_url=controller_url, secret=secret,
         now=now, **({"url": target_url} if target_url else {}),
     )
+    if recovery_controller is not None:
+        await recover_dead_nodes(
+            session, controller_url=recovery_controller[0], secret=recovery_controller[1],
+            now=now, **({"url": target_url} if target_url else {}),
+        )
     if await eligible_runtime_names(session) != before:
         request_rebuild()
     return outcomes
@@ -194,6 +206,7 @@ async def run_proxypool_cycle(
     l1_url: str | None = None,
     l2_url: str | None = None,
     appid: int = DEFAULT_BUSINESS_APPID,
+    recovery_controller: tuple[str, str] | None = None,
 ) -> ProxypoolCycleResult:
     """一个周期的固定顺序：**先判断节点是否坏了，再决定重建，重建后才做依赖 GLOBAL 的维护。**
 
@@ -211,7 +224,7 @@ async def run_proxypool_cycle(
     """
     l0 = await run_l0_cycle(
         session, data_dir=data_dir, controller_url=controller_url, secret=secret,
-        now=now, target_url=l0_target_url,
+        now=now, target_url=l0_target_url, recovery_controller=recovery_controller,
     )
     await session.commit()
 
