@@ -406,10 +406,11 @@ async def _send_price_cycle_mails() -> None:
 
 
 async def _job_fx_refresh() -> None:
-    """每日 03:00 定点刷新（cron 而非 interval：interval 从启动起算，
-    本地服务频繁重启时 24h 永远到不了点，自动刷新形同虚设）。
+    """每日 03:00 定点刷新**当前汇率**（cron 而非 interval：interval 从启动
+    起算，本地服务频繁重启时 24h 永远到不了点，自动刷新形同虚设）。
 
     错过定点（如整夜关机）由启动链的 rates refresh_if_stale 兜底补刷新。
+    历史缺口修复是独立任务（_job_fx_history_repair），不挂在实时刷新里。
     """
     from app.domains.settings.service import get_value
     from app.domains.rates import service as rates_service
@@ -420,13 +421,57 @@ async def _job_fx_refresh() -> None:
         await rates_service.refresh_rates()
     except Exception:  # noqa: BLE001
         logger.exception("[定时] 汇率刷新失败")
-    # 刷新后顺手补历史缺口（幂等；无缺口零写入）
+
+
+async def _job_fx_history_repair() -> None:
+    """汇率历史修复（每日 04:00）：本地扫描 → Provider timeframe → 写 observed。
+
+    与 03:00 实时刷新彻底分离——修复走 Provider 配额（月度上限），不随
+    每日自动刷新消耗。四重门禁，不满足即静默跳过（不产生失败重试风暴）：
+
+    1. 存在缺口（本地 scan，零网络；无缺口直接返回）；
+    2. 爬虫空闲（历史修复与爬取共享出网预算）；
+    3. 已配置 Provider Key（缺失 = 功能未启用）；
+    4. 账期配额足够（repair 内部逐窗 quota guard 硬拦，剩余 0 绝不触网）。
+
+    单轮窗口上限（_FX_REPAIR_MAX_WINDOWS）限制单日额度消耗，剩余缺口
+    次轮续跑；失败/额度耗尽的真实原因记日志，等下一轮或下月自然恢复。
+    """
+    from app.domains.rates import history as rates_history
+    from app.domains.rates.providers.exchangerate_host import resolve_api_key
+
     try:
-        stats = await rates_service.backfill_history()
-        if stats["inserted"]:
-            logger.info("[定时] 汇率历史缺口补齐：插入 %d 行", stats["inserted"])
+        scan = await rates_history.scan_history_gaps()
     except Exception:  # noqa: BLE001
-        logger.exception("[定时] 汇率历史缺口补齐失败")
+        logger.exception("[定时] 汇率历史缺口扫描失败")
+        return
+    if not scan["windows"]:
+        return
+    if not _crawler_idle():
+        logger.info("[定时] 汇率历史修复跳过：爬虫占线（缺口 %d 个窗口待次轮）",
+                    len(scan["windows"]))
+        return
+    if not resolve_api_key():
+        return  # 未配置 Key：功能未启用，静默
+    try:
+        result = await rates_history.repair_history_gaps(max_windows=_FX_REPAIR_MAX_WINDOWS)
+        if result["status"] == "ok":
+            logger.info(
+                "[定时] 汇率历史修复：请求 %d 次 / 写入 %d 行 / 窗口 %d",
+                result["requests"], result["written"], len(result["windows"]),
+            )
+        elif result["status"] != "no_gaps":
+            logger.warning(
+                "[定时] 汇率历史修复中止：%s（%s）",
+                result["status"], result.get("error", ""),
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception("[定时] 汇率历史修复异常")
+
+
+# 历史修复单轮窗口上限：8 窗口/轮 ≈ 单日最多 8 次 Provider 请求
+# （跨月重置自然续跑；缺口极大时多日消化，不挤占当月全部额度）
+_FX_REPAIR_MAX_WINDOWS = 8
 
 
 async def _job_subscription_refresh() -> None:
@@ -932,6 +977,10 @@ def start_scheduler() -> None:
         coalesce=True, misfire_grace_time=None,
     )
     scheduler.add_job(_job_fx_refresh, "cron", hour=3, minute=0, id="fx_refresh")
+    # 汇率历史修复：与实时刷新分离的独立任务（配额账本 + 缺口 + 爬虫空闲门禁）
+    scheduler.add_job(
+        _job_fx_history_repair, "cron", hour=4, minute=0, id="fx_history_repair"
+    )
     scheduler.add_job(_job_proxy_health, "interval", hours=6, id="proxy_health")
     # 订阅重拉：拍子给密一点（30min），真间隔靠 service 的 6h KV 门槛 +
     # 爬虫空闲门禁——占线错过一拍不消费门槛，下一拍补上
@@ -975,7 +1024,7 @@ def start_scheduler() -> None:
         asyncio.create_task(_job_bartervg_catchup())
     except RuntimeError:
         logger.warning("[调度] 无运行中事件循环，跳过 Barter.vg 启动补跑")
-    logger.info("调度器已启动（账户同步 15min / 池价格爬取锚点网格：Steam 折扣刷新锚 北京 01:00[夏令时]/02:00[冬令时] + 6h 步进，外部时间判定 DST / 捆绑包存量刷新随价格链 / 失败记录修复 5min 空闲档 / 汇率每日 03:00 / WAL 收缩每日 04:30 / Barter.vg bundle 计数每日 05:40 / 代理体检 6h / Clash 订阅重拉 30min 拍[6h 门槛·爬虫空闲档] / 钱包每分钟轮转 / 账单 30min / 热销榜 1h / 热门新品 24h / 特惠差集 6h / 即将推出 24h / CS 重探每日 10:00 / 自动备份 24h）")
+    logger.info("调度器已启动（账户同步 15min / 池价格爬取锚点网格：Steam 折扣刷新锚 北京 01:00[夏令时]/02:00[冬令时] + 6h 步进，外部时间判定 DST / 捆绑包存量刷新随价格链 / 失败记录修复 5min 空闲档 / 汇率每日 03:00 + 历史修复每日 04:00[缺口·空闲·Key·配额四重门禁] / WAL 收缩每日 04:30 / Barter.vg bundle 计数每日 05:40 / 代理体检 6h / Clash 订阅重拉 30min 拍[6h 门槛·爬虫空闲档] / 钱包每分钟轮转 / 账单 30min / 热销榜 1h / 热门新品 24h / 特惠差集 6h / 即将推出 24h / CS 重探每日 10:00 / 自动备份 24h）")
 
 
 def stop_scheduler() -> None:

@@ -1,26 +1,32 @@
 """bills 域服务：导入 + 汇率换算 + 统计口径 + 查询。
 
 「实际消耗金额」口径：
-- 游戏交易按**交易当日**汇率（fx_rate_history 逐日档案，最多回溯 15 天）折 CNY；
+- 游戏交易按**交易当日**汇率（rates 域统一历史出口的 observed 行，最多回溯
+  15 天）折 CNY；
 - 档案缺失（币种/日期无行）则 cny_fen 置空：不入任何总额，明细行标「汇率缺失」
   ——绝不用当前汇率快照折历史交易（隐性错误）；
+- carried（历史 forward-fill 延续值）不是真实观测，不参与折算；
 - 净支出 = 购买总额 - 退款合计（退款 sign=-1 冲回）；
 - 赠礼额度 = 自购净额 - 送出礼物净额（退款归属 orig_is_gift 区分自购/送礼退款）；
 - 钱包充值单独成流水（不入游戏支出，防双计）；账户价值 = 自购净额 + CDK 手动计价合计。
+
+历史汇率修复（rates.history.repair_history_gaps）落库后会回调
+`revalue_affected`：受影响交易重算 fx_rate/cny_fen + 汇总重算，账单不会
+永久固化在首次导入时的错误汇率上。
 """
 from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
-from sqlalchemy import delete, select
+from sqlalchemy import case, delete, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.database import get_session_factory
 from app.crawler.utils import get_beijing_time_obj
 from .models import BillCdkGame, BillGameTx, BillImport, BillTopupTx
-from .parser import get_rate_from_rows, parse_report
+from .parser import parse_report
 
 logger = logging.getLogger(__name__)
 
@@ -30,45 +36,27 @@ def _fen(cny: float) -> int:
     return int(round(cny * 100))
 
 
-async def _load_fx_series(session, currency: str, start: str, end: str) -> list[tuple[str, float]]:
-    """取币种在 [start, end] 的日线档案（fetched_at 是完整时间戳，取 date 部分）。"""
-    from datetime import datetime
-
-    from app.domains.rates.models import FxRateHistory
-
-    rows = (
-        await session.execute(
-            select(FxRateHistory.fetched_at, FxRateHistory.rate_to_cny)
-            .where(FxRateHistory.currency_code == currency)
-            .where(FxRateHistory.fetched_at >= datetime.fromisoformat(f"{start} 00:00:00"))
-            .where(FxRateHistory.fetched_at <= datetime.fromisoformat(f"{end} 23:59:59"))
-            .order_by(FxRateHistory.fetched_at)
-        )
-    ).fetchall()
-    by_day: dict[str, float] = {}
-    for fetched_at, rate in rows:
-        if fetched_at is None:
-            continue
-        # 同日多行取最后一行（日收语义，对齐 rates.rate_history）
-        by_day[fetched_at.date().isoformat()] = rate
-    return sorted(by_day.items())
-
-
-async def _rate_for(session, currency: str, date: str, series_cache: dict) -> float | None:
-    """汇率解析：CNY=1；其余按日线档案（当日 → 最多回溯 15 天）。
+async def _rate_for(session, currency: str, day: str, series_cache: dict) -> float | None:
+    """汇率解析（observed 才有效）：CNY=1；其余当日 → 最多回溯 15 天。
 
     series_cache 按（币种, 年份）键控——同币种跨年交易各自加载对应年份窗口，
     窗口起点提前到上一年 12 月以覆盖跨年回溯。查不到 → None（明示缺失，不兜底）。
+    数据经 rates 域统一历史出口获取（carried 行不参与）。
     """
     if currency == "CNY":
         return 1.0
-    year = date[:4]
+    from app.domains.rates import history as rates_history
+
+    year = day[:4]
     cache_key = (currency, year)
     if cache_key not in series_cache:
-        series_cache[cache_key] = await _load_fx_series(
-            session, currency, f"{int(year) - 1}-12-01", f"{year}-12-31"
+        series_cache[cache_key] = await rates_history.load_observed_series(
+            session,
+            currency,
+            date(int(year) - 1, 12, 1),
+            date(int(year), 12, 31),
         )
-    return get_rate_from_rows(series_cache[cache_key], currency, date)
+    return rates_history.pick_observed_rate(series_cache[cache_key], currency, day)
 
 
 def _fx_note(tx: dict) -> str:
@@ -80,6 +68,107 @@ def _fx_note(tx: dict) -> str:
     if tx.get("is_gift"):
         notes.append("礼物")
     return " | ".join(notes)
+
+
+async def revalue_affected(touched: dict[str, set[date]]) -> dict:
+    """历史汇率修复后重估受影响账单：行级 fx_rate/cny_fen 重算 + 汇总重算。
+
+    touched = {币种: {被修复覆盖的日期}}。受影响交易 = 币种命中且交易日期落在
+    [覆盖起点 - 15 天回溯窗, 覆盖终点]；用与导入同一规则重算（observed 精确日
+    → 回溯 ≤ 15 天）——修复前落到 carried/缺失的交易在修复后自动获得真值，
+    修复改变了值的交易自动纠偏。汇总按全表现值重算（同一账单的其余行参与总额）。
+    幂等：重算结果只取决于当前 observed 数据。
+    """
+    if not touched:
+        return {"bills": 0, "transactions": 0}
+    currencies = sorted({str(c).upper() for c in touched})
+    all_days = [d for days in touched.values() for d in days]
+    lookback_start = (min(all_days) - timedelta(days=15)).isoformat()
+    span_end = max(all_days).isoformat()
+
+    async with get_session_factory()() as session:
+        game_rows = (
+            await session.execute(
+                select(BillGameTx).where(
+                    BillGameTx.currency.in_(currencies),
+                    BillGameTx.date >= lookback_start,
+                    BillGameTx.date <= span_end,
+                )
+            )
+        ).scalars().all()
+        topup_rows = (
+            await session.execute(
+                select(BillTopupTx).where(
+                    BillTopupTx.currency.in_(currencies),
+                    BillTopupTx.date >= lookback_start,
+                    BillTopupTx.date <= span_end,
+                )
+            )
+        ).scalars().all()
+        if not game_rows and not topup_rows:
+            return {"bills": 0, "transactions": 0}
+
+        series_cache: dict = {}
+        changed = 0
+        import_ids: set[int] = set()
+        for row in (*game_rows, *topup_rows):
+            rate = await _rate_for(session, row.currency, row.date, series_cache)
+            new_fen = None if rate is None else _fen(row.amount * row.sign * rate)
+            if rate != row.fx_rate or new_fen != row.cny_fen:
+                row.fx_rate = rate
+                row.cny_fen = new_fen
+                changed += 1
+            import_ids.add(int(row.import_id))
+
+        for imp_id in sorted(import_ids):
+            agg = (
+                await session.execute(
+                    select(
+                        func.coalesce(
+                            func.sum(
+                                case(
+                                    (BillGameTx.is_refund.is_(False),
+                                     func.coalesce(BillGameTx.cny_fen, 0)),
+                                    else_=0,
+                                )
+                            ),
+                            0,
+                        ),
+                        func.coalesce(
+                            func.sum(
+                                case(
+                                    (BillGameTx.is_refund.is_(True),
+                                     func.abs(func.coalesce(BillGameTx.cny_fen, 0))),
+                                    else_=0,
+                                )
+                            ),
+                            0,
+                        ),
+                        func.coalesce(
+                            func.sum(case((BillGameTx.cny_fen.is_(None), 1), else_=0)), 0
+                        ),
+                        func.coalesce(
+                            func.sum(case((BillGameTx.is_refund.is_(False), 1), else_=0)), 0
+                        ),
+                    ).where(BillGameTx.import_id == imp_id)
+                )
+            ).one()
+            spend, refund, fx_missing, orders = (int(v or 0) for v in agg)
+            imp = await session.get(BillImport, imp_id)
+            if imp is None:
+                continue
+            imp.game_spend_fen = spend
+            imp.game_refund_fen = refund
+            imp.game_net_fen = spend - refund
+            imp.fx_missing = fx_missing
+            imp.orders = orders
+        await session.commit()
+
+    logger.info(
+        "账单历史汇率重估：覆盖币种 %s，重算 %d 笔交易 / %d 个账单",
+        ",".join(currencies), changed, len(import_ids),
+    )
+    return {"bills": len(import_ids), "transactions": changed}
 
 
 async def import_report(data: dict, source_file: str = "") -> dict:

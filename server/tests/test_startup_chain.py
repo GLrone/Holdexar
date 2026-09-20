@@ -102,12 +102,22 @@ def chain_calls(monkeypatch):
     monkeypatch.setattr(
         proxies_service, "maybe_run_clash_health_check", step("clash_health")
     )
-    async def fake_backfill(dry_run: bool = False):
-        calls.append("rates_backfill")
-        return {"inserted": 0, "scanned": 0}
+
+    async def fake_gap_scan(**kwargs):
+        calls.append("rates_gap_scan")
+        return {"currencies": {}, "windows": [], "totalDays": 0, "totalPairs": 0,
+                "horizon": "2026-09-19"}
+
+    async def fake_gap_repair(**kwargs):
+        # 启动链不得触发外网历史修复（配置 Key 后启动烧配额是回归）
+        calls.append("rates_gap_repair")
+        raise AssertionError("启动链不得触发外网历史修复")
+
+    from app.domains.rates import history as rates_history_mod
 
     monkeypatch.setattr(rates_service, "refresh_if_stale", step("rates_stale"))
-    monkeypatch.setattr(rates_service, "backfill_history", fake_backfill)
+    monkeypatch.setattr(rates_history_mod, "scan_history_gaps", fake_gap_scan)
+    monkeypatch.setattr(rates_history_mod, "repair_history_gaps", fake_gap_repair)
 
     # 内核就位：真实实现是同步函数（链内走 asyncio.to_thread），桩保持同步签名
     def fake_ensure_kernel(data_dir):
@@ -144,10 +154,18 @@ async def test_chain_order_and_scheduler_last(db, chain_calls):
         "rates_cleanup", "legacy_sub_migrate", "legacy_kv_migrate",
         "hl_flags", "pp_flags", "sort_cache", "series_refresh",
         "kernel_ensure", "clash_autostart", "clash_health",
-        "rates_stale", "rates_backfill", "bundles_sort", "bundles_warm",
+        "rates_stale", "rates_gap_scan", "bundles_sort", "bundles_warm",
         "epic_preheat", "scheduler_start",
     ]
     assert chain_calls.calls == expected
+
+
+@pytest.mark.asyncio
+async def test_startup_chain_never_repairs_history(db, chain_calls):
+    """启动链只做本地缺口扫描，绝不触发外网历史修复（配额不被启动烧掉）。"""
+    await main_mod._post_startup_chain()
+    assert "rates_gap_scan" in chain_calls.calls
+    assert "rates_gap_repair" not in chain_calls.calls
 
 
 @pytest.mark.asyncio

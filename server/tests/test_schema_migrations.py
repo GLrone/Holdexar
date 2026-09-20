@@ -378,3 +378,67 @@ async def test_v7_converts_price_targets_to_cny(tmp_path: Path, monkeypatch) -> 
         assert rows[("ZZ", "price")] == 1000.0, "币种认不出的行应跳过留原值，不猜"
     finally:
         await engine.dispose()
+
+
+# v8：fx_rate_history canonical 化（rate_date/source_kind 回填 + 旧 backfill 行
+# 改标 carried + 同日按日收语义合并 + (currency_code, rate_date) 唯一索引）。
+
+
+@pytest.mark.asyncio
+async def test_v8_fx_history_canonical(tmp_path: Path, monkeypatch) -> None:
+    """存量库首启跑到链尾：语义列回填、backfill 行改标 carried、
+    同日多行合并保留最后一行、唯一日索引落位。**走真实迁移链**。"""
+    db = tmp_path / "legacy.db"
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{db.as_posix()}", echo=False
+    )
+    monkeypatch.setattr(database_module, "get_engine", lambda: engine)
+    monkeypatch.setattr(
+        database_module,
+        "get_session_factory",
+        lambda: async_sessionmaker(engine, expire_on_commit=False),
+    )
+    # 迁移前形态：旧列结构（无 rate_date/source_kind）+ 同日多行 + backfill 行
+    con = sqlite3.connect(str(db))
+    try:
+        con.execute(
+            "CREATE TABLE fx_rate_history ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " currency_code VARCHAR(10), rate_to_cny FLOAT,"
+            " source VARCHAR(30), fetched_at DATETIME)"
+        )
+        con.executemany(
+            "INSERT INTO fx_rate_history (currency_code, rate_to_cny, source, fetched_at)"
+            " VALUES (?, ?, ?, ?)",
+            [
+                ("XTS", 0.015, "backfill", "2026-01-05 00:00:00"),
+                ("XTS", 0.016, "steamhl_pg", "2026-01-06 00:00:00"),
+                ("XTS", 0.017, "augmentedsteam", "2026-01-06 12:00:00"),
+            ],
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    await database_module.init_db()
+    try:
+        assert _user_version(db) == database_module.SCHEMA_VERSION
+        con = sqlite3.connect(str(db))
+        try:
+            rows = con.execute(
+                "SELECT rate_date, rate_to_cny, source_kind FROM fx_rate_history"
+                " WHERE currency_code = 'XTS' ORDER BY rate_date"
+            ).fetchall()
+            idx = con.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+                " AND name='ux_frh_currency_date'"
+            ).fetchone()
+        finally:
+            con.close()
+        assert rows == [
+            ("2026-01-05", 0.015, "carried"),   # backfill 行 → carried（保留不删）
+            ("2026-01-06", 0.017, "observed"),  # 同日最后一行胜出（日收语义）
+        ], f"迁移结果不符：{rows}"
+        assert idx is not None, "唯一日索引 ux_frh_currency_date 未落位"
+    finally:
+        await engine.dispose()

@@ -183,9 +183,21 @@ async def _local_games_count() -> int:
         return (await session.execute(text("SELECT COUNT(*) FROM games"))).scalar_one()
 
 
-def _key(cur, fetched_at) -> tuple[str, str]:
-    """fx_rate_history 去重键：币种 + fetched_at 原文（对齐 fx_maintenance 币种+日期语义）。"""
-    return (str(cur), "" if fetched_at is None else str(fetched_at))
+def _canonical_key(cur, rate_date, fetched_at) -> tuple[str, str]:
+    """fx_rate_history canonical 去重键：币种 + 汇率代表日。
+
+    rate_date 缺（旧格式行）时取 fetched_at 原文前 10 位——与 v8 迁移的回填
+    口径一致（`(currency_code, rate_date)` 是 canonical 唯一键）。
+    """
+    day = "" if rate_date is None else str(rate_date)[:10]
+    if not day and fetched_at is not None:
+        day = str(fetched_at)[:10]
+    return (str(cur), day)
+
+
+def _seed_source_kind(source) -> str:
+    """种子行语义分层：backfill 延续值 → carried；档案/实时来源 → observed。"""
+    return "carried" if str(source or "").lower() == "backfill" else "observed"
 
 
 async def import_seed(seed_path: Path | None = None) -> dict | None:
@@ -216,42 +228,60 @@ async def import_seed(seed_path: Path | None = None) -> dict | None:
         logger.info("[种子] 库已有数据，跳过随包种子导入（version=%s）", version)
         return None
 
-    # 种子侧原文读出（sqlite3 直读无类型转换，保住 fetched_at 原格式）
+    # 种子侧原文读出（sqlite3 直读无类型转换，保住 fetched_at 原格式）；
+    # 种子格式双版本兼容：canonical 列存在时直读，缺失时回退 old 列并由
+    # fetched_at 推导 rate_date/source_kind（与 v8 迁移口径一致）
     src = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
     try:
         fx_rates = src.execute(
             "SELECT currency_code, rate_to_cny, fetched_at FROM fx_rates"
         ).fetchall()
-        history = src.execute(
-            "SELECT currency_code, rate_to_cny, source, fetched_at FROM fx_rate_history"
-        ).fetchall()
+        seed_cols = {row[1] for row in src.execute("PRAGMA table_info(fx_rate_history)")}
+        if {"rate_date", "source_kind"} <= seed_cols:
+            history = src.execute(
+                "SELECT currency_code, rate_to_cny, source, fetched_at, rate_date, source_kind"
+                " FROM fx_rate_history"
+            ).fetchall()
+        else:
+            history = [
+                (cur, rate, source, fa, None, None)
+                for cur, rate, source, fa in src.execute(
+                    "SELECT currency_code, rate_to_cny, source, fetched_at FROM fx_rate_history"
+                ).fetchall()
+            ]
     finally:
         src.close()
 
     async with get_session_factory()() as session:
-        # 汇率历史：现有键集合读原文 → Python 侧差集 → 批量 INSERT（幂等）。
-        # 不走 SQL 侧 NOT EXISTS：fx_rate_history 无 (currency, fetched_at) 索引，
-        # 23 万行 × 逐行子查询会退化为 O(n²)。
+        # 汇率历史：现有 canonical 键集合 → Python 侧差集 → 批量 INSERT（幂等）。
+        # 不走 SQL 侧 NOT EXISTS：fx_rate_history 无 (currency_code, rate_date) 之外
+        # 的可用索引，23 万行 × 逐行子查询会退化为 O(n²)。
         existing: set[tuple[str, str]] = set()
-        for cur, fa in await session.execute(
-            text("SELECT currency_code, fetched_at FROM fx_rate_history")
+        for cur, rd, fa in await session.execute(
+            text("SELECT currency_code, rate_date, fetched_at FROM fx_rate_history")
         ):
-            existing.add(_key(cur, fa))
-        new_rows = [
-            (cur, rate, source, fa)
-            for cur, rate, source, fa in history
-            if _key(cur, fa) not in existing
-        ]
+            existing.add(_canonical_key(cur, rd, fa))
+        # 种子侧同日多行先按日收语义收敛（后行胜出），再与本地差集
+        seed_rows: dict[tuple[str, str], dict] = {}
+        for cur, rate, source, fa, rd, kind in history:
+            day = str(rd)[:10] if rd is not None else (str(fa)[:10] if fa is not None else "")
+            seed_rows[(str(cur), day)] = {
+                "c": cur,
+                "r": rate,
+                "s": source,
+                "k": str(kind) if kind else _seed_source_kind(source),
+                "d": day or None,
+                "f": fa,
+            }
+        new_rows = [row for key, row in seed_rows.items() if key not in existing]
         if new_rows:
             await session.execute(
                 text(
-                    "INSERT INTO fx_rate_history (currency_code, rate_to_cny, source, fetched_at) "
-                    "VALUES (:c, :r, :s, :f)"
+                    "INSERT OR IGNORE INTO fx_rate_history"
+                    " (currency_code, rate_to_cny, source, source_kind, rate_date, fetched_at)"
+                    " VALUES (:c, :r, :s, :k, :d, :f)"
                 ),
-                [
-                    {"c": cur, "r": rate, "s": source, "f": fa}
-                    for cur, rate, source, fa in new_rows
-                ],
+                new_rows,
             )
 
         # 汇率快照 upsert（原文 fetched_at 直存，绕开 DateTime 类型对象化）

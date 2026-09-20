@@ -1,10 +1,14 @@
-"""rates 域服务：多源汇率刷新 + 查询。
+"""rates 域服务：当前汇率刷新（实时层）+ 查询。
 
 数据源：
 1. augmentedsteam  https://api.augmentedsteam.com/rates/v1?to=CNY
    → 响应为嵌套形态 {CUR: {"CNY": rate_to_cny}}；兼容平铺 {CUR: rate} 形态
 2. open.er-api     https://open.er-api.com/v6/latest/CNY           → rates 为 per-CNY，取倒数
-CNY 恒为 1.0。每次刷新写 fx_rates（UPSERT）+ fx_rate_history（INSERT）。
+CNY 恒为 1.0。每次刷新写 fx_rates（UPSERT）+ fx_rate_history
+（UPSERT：`(currency_code, rate_date)` 唯一，同日多次刷新收敛为最后一行）。
+
+**本模块只管实时层**：历史缺口修复 / 历史查询 / 依赖方重估一律走
+`rates/history.py`（Provider 细节见 `rates/providers/`）。
 """
 from __future__ import annotations
 
@@ -38,22 +42,10 @@ def _naive(dt: datetime) -> datetime:
 
 
 async def _client() -> httpx.AsyncClient:
-    """共享 HTTP 客户端：策略引擎优先（代理优先为默认），回落环境变量代理。
+    """共享 HTTP 客户端（代理优先；实现见 rates/http.py）。"""
+    from .http import open_client
 
-    Steam 域/汇率源直连在国内网络下基本不可用（成功属侥幸），代理优先。
-    """
-    proxy = None
-    try:
-        from app.domains.proxies import service as proxies_service
-
-        proxy = await proxies_service.resolve_proxy_url()
-    except Exception:  # noqa: BLE001
-        proxy = None
-    if proxy is None:
-        from app.crawler.proxy import resolve_proxy_url
-
-        proxy = resolve_proxy_url()
-    return httpx.AsyncClient(timeout=15, proxy=proxy) if proxy else httpx.AsyncClient(timeout=15)
+    return await open_client(15.0)
 
 
 async def _fetch_with_retry(url: str, attempts: int = 2) -> httpx.Response | None:
@@ -137,6 +129,7 @@ async def refresh_rates() -> dict:
     # 只写白名单币种（41 区货币 + TRY/ARS 预留）；UI 自选追踪仅影响前端展示，不影响抓取范围
     rates = {code: rate for code, rate in rates.items() if code in ALLOWED_CURRENCIES}
     now = _naive(get_beijing_time_obj())
+    today = now.date()
 
     from . import snapshot as snapshot_service
 
@@ -151,8 +144,29 @@ async def refresh_rates() -> dict:
                     set_={"rate_to_cny": stmt.excluded.rate_to_cny, "fetched_at": now},
                 )
             )
-            session.add(
-                FxRateHistory(currency_code=code, rate_to_cny=rate, source=source, fetched_at=now)
+            # 历史行 UPSERT（(currency_code, rate_date) 唯一）：同日多次刷新收敛为
+            # 最后一行——与日收语义的既有读值一致，表不再堆积同日多行
+            hist = sqlite_insert(FxRateHistory).values(
+                currency_code=code,
+                rate_to_cny=rate,
+                source=source,
+                source_kind="observed",
+                rate_date=today,
+                fetched_at=now,
+            )
+            await session.execute(
+                hist.on_conflict_do_update(
+                    index_elements=[
+                        FxRateHistory.currency_code,
+                        FxRateHistory.rate_date,
+                    ],
+                    set_={
+                        "rate_to_cny": hist.excluded.rate_to_cny,
+                        "source": hist.excluded.source,
+                        "source_kind": "observed",
+                        "fetched_at": hist.excluded.fetched_at,
+                    },
+                )
             )
         # 白名单清洗并入同一事务（幂等）。排在 commit 之后会随会话关闭被
         # 静默回滚——只剩启动链的 cleanup_disallowed 兜底
@@ -208,77 +222,6 @@ async def refresh_if_stale() -> bool:
         return False
 
 
-BACKFILL_SOURCE = "backfill"
-
-
-async def backfill_history(dry_run: bool = False) -> dict:
-    """历史缺口补齐：建档以来（该币种最早历史行日期）→ 今天，缺的交易日补行。
-
-    口径（fx 维护脚本 backfill 子命令已委托本函数，单一实现）：
-    - 只补周一~周五：外汇周末休市不造行，节假日同样无新报价、不造行；
-    - 值 = 该币种上一已有行的汇率延续（forward-fill，库内已有行作锚点；
-      同日多行按 id 取最后一行，与日线查询的日收语义一致）；
-    - 已有任意历史行的日期一律跳过；无历史行的币种无锚点，跳过（序列由
-      实时刷新从当天起建立）。
-    幂等：只补「零历史行」的日期，重复执行零写入。仅处理白名单币种。
-    返回 {"inserted": n, "currencies": {code: {count, first, last}}}。
-    """
-    async with get_session_factory()() as session:
-        # 原生 SQL 直读（ORM 对象化 20 万+ 行不可接受）；fetched_at 存储形态
-        # 混有 ORM datetime 文本与种子原文，统一按 ISO 前缀取日期部分
-        rows = (
-            await session.execute(
-                text(
-                    "SELECT currency_code, rate_to_cny, fetched_at "
-                    "FROM fx_rate_history ORDER BY id"
-                )
-            )
-        ).all()
-    anchor: dict[str, dict[date, float]] = {}
-    for code, rate, fa in rows:
-        if fa is None:
-            continue
-        anchor.setdefault(str(code), {})[date.fromisoformat(str(fa)[:10])] = rate
-
-    today = get_beijing_time_obj().date()
-    plan: list[dict] = []
-    detail: dict[str, dict[str, object]] = {}
-    for code, series in sorted(anchor.items()):
-        if code not in ALLOWED_CURRENCIES or not series:
-            continue
-        missing: list[tuple[date, float]] = []
-        last_rate: float | None = None
-        cursor = min(series)
-        while cursor <= today:
-            if cursor in series:
-                last_rate = series[cursor]
-            elif cursor.weekday() < 5 and last_rate is not None:
-                missing.append((cursor, last_rate))
-            cursor += timedelta(days=1)
-        if missing:
-            detail[code] = {
-                "count": len(missing),
-                "first": missing[0][0].isoformat(),
-                "last": missing[-1][0].isoformat(),
-            }
-            plan.extend(
-                {
-                    "currency_code": code,
-                    "rate_to_cny": rate,
-                    "source": BACKFILL_SOURCE,
-                    "fetched_at": datetime(d.year, d.month, d.day),
-                }
-                for d, rate in missing
-            )
-
-    if plan and not dry_run:
-        async with get_session_factory()() as session:
-            await session.execute(sqlite_insert(FxRateHistory), plan)
-            await session.commit()
-        logger.info("汇率历史缺口补齐：%d 币种 / %d 行", len(detail), len(plan))
-    return {"inserted": len(plan), "currencies": detail}
-
-
 async def list_rates() -> dict:
     async with get_session_factory()() as session:
         rows = (await session.execute(select(FxRate).order_by(FxRate.currency_code))).scalars().all()
@@ -305,10 +248,10 @@ RANGE_MONTHS: dict[str, int | None] = {
 
 
 async def rate_history(currency: str = "USD", limit: int = 0, range: str | None = None) -> list[dict]:
-    """日线序列：同日多行取最后一行（日收语义），按日期升序返回。
+    """日线序列：按 `rate_date` 升序，一币种一天一行（canonical）。
 
-    库内混存三类行：实时刷新（同日多行）、16 年档案导入、backfill 补齐行——
-    补齐行 id 大于实时行而日期更早，按 id 排序会乱序，故按日期聚合。
+    `(currency_code, rate_date)` 唯一索引保证同日只有一行；`sourceKind`
+    （observed/carried）随行返回——前端据此区分真实观测与历史延续值。
 
     range（六档）：1mo/6mo/1y/5y/10y/all，只保留窗口内尾部。
     默认无窗口（16 年全量），limit>0 时再取尾段 limit 天（向后兼容旧调用）。
@@ -317,16 +260,14 @@ async def rate_history(currency: str = "USD", limit: int = 0, range: str | None 
         rows = (
             await session.execute(
                 select(FxRateHistory)
-                .where(FxRateHistory.currency_code == currency.upper())
-                .order_by(FxRateHistory.fetched_at, FxRateHistory.id)
+                .where(
+                    FxRateHistory.currency_code == currency.upper(),
+                    FxRateHistory.rate_date.is_not(None),
+                )
+                .order_by(FxRateHistory.rate_date)
             )
         ).scalars().all()
-    by_day: dict[date, FxRateHistory] = {}
-    for r in rows:
-        if r.fetched_at is None:
-            continue
-        by_day[r.fetched_at.date()] = r
-    daily = list(by_day.items())
+    daily = [(r.rate_date, r) for r in rows]
     if range is not None:
         key = range.lower()
         months = RANGE_MONTHS.get(key)
@@ -334,7 +275,7 @@ async def rate_history(currency: str = "USD", limit: int = 0, range: str | None 
             raise ValueError(f"无效的时间范围: {range}")
         if months is not None:
             # 月数 → 天数折算（30.44 天/月），窗口过滤无需日历级月末精确
-            cutoff = date.today() - timedelta(days=round(months * 30.44))
+            cutoff = get_beijing_time_obj().date() - timedelta(days=round(months * 30.44))
             daily = [(d, r) for d, r in daily if d >= cutoff]
     if limit > 0:
         daily = daily[-limit:]
@@ -343,6 +284,7 @@ async def rate_history(currency: str = "USD", limit: int = 0, range: str | None 
             "date": d.isoformat(),
             "rateToCny": r.rate_to_cny,
             "source": r.source,
+            "sourceKind": r.source_kind,
             "fetchedAt": r.fetched_at.isoformat() if r.fetched_at else None,
         }
         for d, r in daily
