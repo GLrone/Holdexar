@@ -31,6 +31,8 @@ from app.domains.bundles import service as bundles_service
 from app.domains.crawl import service as crawl_service
 from app.domains.family import service as family_service
 from app.domains.games import service as games_service
+from app.domains.games import series as games_series
+from app.domains.metadata import service as metadata_service
 from app.domains.proxies import service as proxies_service
 from app.domains.rates import service as rates_service
 from app.core import seed_assets
@@ -80,8 +82,10 @@ def chain_calls(monkeypatch):
         ("hl_flags", games_service.refresh_hl_flags),
         ("pp_flags", games_service.refresh_pp_flags),
         ("sort_cache", games_service.refresh_sort_cache),
+        ("series_refresh", games_series.refresh_series),
         ("bundles_sort", bundles_service.refresh_bundle_sort_cache),
         ("bundles_warm", bundles_service.warmup),
+        ("epic_preheat", metadata_service.preheat_epic_offers),
     ]:
         # main 里是函数内局部 import 再以模块属性调用：桩必须挂在源模块上
         target = {"import_seed": seed_assets, "merge_seeds": seed_assets,
@@ -89,7 +93,9 @@ def chain_calls(monkeypatch):
                   "rates_cleanup": rates_service, "legacy_sub_migrate": proxies_service,
                   "legacy_kv_migrate": account_service, "hl_flags": games_service,
                   "pp_flags": games_service, "sort_cache": games_service,
-                  "bundles_sort": bundles_service, "bundles_warm": bundles_service}[name]
+                  "series_refresh": games_series,
+                  "bundles_sort": bundles_service, "bundles_warm": bundles_service,
+                  "epic_preheat": metadata_service}[name]
         monkeypatch.setattr(target, fn.__name__, step(name))
 
     monkeypatch.setattr(main_mod, "_autostart_clash", step("clash_autostart"))
@@ -131,15 +137,15 @@ def chain_calls(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_chain_order_and_scheduler_last(db, chain_calls):
-    """全链顺序：种子 → … → 标记三连 → 内核 → 自启 → 汇率 → 捆绑包预热 → 调度器收尾。"""
+    """全链顺序：种子 → … → 标记三连 + 系列归组 → 内核 → 自启 → 汇率 → 捆绑包预热 → Epic 预热 → 调度器收尾。"""
     await main_mod._post_startup_chain()
     expected = [
         "import_seed", "merge_seeds", "family_warm", "orphan_cleanup",
         "rates_cleanup", "legacy_sub_migrate", "legacy_kv_migrate",
-        "hl_flags", "pp_flags", "sort_cache",
+        "hl_flags", "pp_flags", "sort_cache", "series_refresh",
         "kernel_ensure", "clash_autostart", "clash_health",
         "rates_stale", "rates_backfill", "bundles_sort", "bundles_warm",
-        "scheduler_start",
+        "epic_preheat", "scheduler_start",
     ]
     assert chain_calls.calls == expected
 
