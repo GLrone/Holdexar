@@ -15,6 +15,7 @@ import json
 import logging
 import random
 import time
+from collections.abc import Sequence
 
 import aiohttp
 
@@ -87,32 +88,36 @@ class Global429CircuitBreaker:
 global_429_breaker = Global429CircuitBreaker()
 
 
-class LaneBreakers:
-    """多入口（lane）形态下的熔断账本：**每条 lane 各一个熔断器**。
+class ExitBreakers:
+    """多出口形态下的熔断账本：**每个出口 IP 各一个熔断器**。
 
-    单入口形态下任意 worker 收到真 429 会闸住整轮作业；多入口下应只闸住出问题的那条
-    lane（那个出口被上游风控），其余 lane 继续工作。按 lane 序号取用，lane 数为 0 时
-    退回进程级单例，单入口行为保持不变。
+    账本键是出口 IP：某个出口被上游风控（真 429）时只闸住这个出口，其它出口继续工作。
+    同出口上的多个 worker 共享同一个熔断器——它们是同一个 IP 的流量，风控也不会按
+    worker 区分。出口键为空时退回进程级单例，单入口行为保持不变。
     """
 
-    def __init__(self, lane_count: int) -> None:
-        self._breakers = [Global429CircuitBreaker() for _ in range(max(0, int(lane_count)))]
+    def __init__(self, exit_keys: Sequence[str]) -> None:
+        self._breakers = {
+            str(key): Global429CircuitBreaker()
+            for key in dict.fromkeys(str(k) for k in exit_keys if k)
+        }
 
-    def for_lane(self, index: int) -> Global429CircuitBreaker:
+    def for_exit(self, key: str | None) -> Global429CircuitBreaker:
         if not self._breakers:
             return global_429_breaker
-        return self._breakers[index % len(self._breakers)]
+        breaker = self._breakers.get(str(key or ""))
+        return breaker if breaker is not None else global_429_breaker
 
     @property
-    def lane_count(self) -> int:
+    def exit_count(self) -> int:
         return len(self._breakers)
 
 
 class SteamHttpClient:
     """带拦截器和重试机制的 HTTP 客户端。
 
-    `rate_limiter` / `breaker` 是**按入口注入**的：多入口运行时每个 worker 拿自己那条
-    lane 的预算与熔断器，互不影响；不传则用进程级单例（单入口行为）。
+    `rate_limiter` / `breaker` / `stats` 都是**按出口注入**的：多出口运行时每个 worker
+    拿自己那条出口的预算、熔断器与统计账本，互不影响；不传则用进程级单例（单入口行为）。
     """
 
     def __init__(
@@ -122,6 +127,8 @@ class SteamHttpClient:
         proxy_url: str | None = None,
         rate_limiter=None,
         breaker: Global429CircuitBreaker | None = None,
+        stats=None,
+        exit_key: str | None = None,
     ):
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.max_retries = max_retries
@@ -131,6 +138,8 @@ class SteamHttpClient:
         self.proxy_url = proxy_url
         self.rate_limiter = rate_limiter
         self.breaker = breaker
+        self.stats = stats
+        self.exit_key = exit_key
         self._ua_index = random.randrange(len(_USER_AGENTS))
 
     def _get_headers(self, appid=None) -> dict[str, str]:
@@ -141,6 +150,21 @@ class SteamHttpClient:
             # 断连语义：匀速限流下不留 keep-alive，避免悬挂连接被中间层回收
             "Connection": "close",
         }
+
+    def _record(self, outcome: str, started: float, url) -> None:
+        """把**一次真实发出的 HTTP 请求**的结果记进出口账本（未注入则什么都不做）。
+
+        记在每次尝试上而不是每次 `get_json` 调用上：重试多发的那几发同样占用了出口
+        与上游配额，统计必须看得见它们。
+        """
+        if self.stats is None:
+            return
+        self.stats.record(
+            exit_key=self.exit_key,
+            url=str(url),
+            outcome=outcome,
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
 
     async def get_json(
         self,
@@ -168,6 +192,7 @@ class SteamHttpClient:
         for attempt in range(self.max_retries):
             await rate_limiter.acquire()
             await breaker.wait_if_tripped()
+            started = time.monotonic()
 
             try:
                 async with session.get(
@@ -182,9 +207,11 @@ class SteamHttpClient:
                         try:
                             data = await response.json()
                             await breaker.reset()
+                            self._record("ok", started, url)
                             return data
                         except aiohttp.ContentTypeError:
                             # 200 但返回了 HTML 错误页
+                            self._record("other", started, url)
                             if attempt < self.max_retries - 1:
                                 await asyncio.sleep(1 + random.uniform(0, 1))
                                 continue
@@ -211,9 +238,11 @@ class SteamHttpClient:
                                     if (phantom_app.get("success")
                                             and isinstance(phantom_app.get("data"), dict)):
                                         await breaker.reset()
+                                        self._record("ok", started, url)
                                         return phantom_data
                                 elif not appid and isinstance(phantom_data.get("data"), dict):
                                     await breaker.reset()
+                                    self._record("ok", started, url)
                                     return phantom_data
                         except Exception:
                             pass
@@ -225,6 +254,7 @@ class SteamHttpClient:
                             response_body=body_text_429 or "<无法读取响应体>",
                             url=str(response.url),
                         )
+                        self._record("e429", started, url)
 
                         if attempt < self.max_retries - 1:
                             backoff = 3.0 * (2**attempt) + random.uniform(0, 1)
@@ -236,6 +266,7 @@ class SteamHttpClient:
 
                     elif response.status in (403, 404):
                         # 永久性封锁，不重试
+                        self._record("e4xx", started, url)
                         raise aiohttp.ClientResponseError(
                             response.request_info,
                             response.history,
@@ -244,6 +275,8 @@ class SteamHttpClient:
                         )
 
                     else:
+                        self._record("e5xx" if response.status >= 500 else "e4xx",
+                                     started, url)
                         if attempt < self.max_retries - 1:
                             await asyncio.sleep(1 + random.uniform(0, 1))
                             continue
@@ -258,6 +291,10 @@ class SteamHttpClient:
                 # 传输层失败上报断网检测（达阈值触发 ping 确认——
                 # 本机断网时等待恢复才对，重试徒烧预算）
                 await network_checker.report_failure()
+                self._record(
+                    "timeout" if isinstance(e, asyncio.TimeoutError) else "connect_error",
+                    started, url,
+                )
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(1 + random.uniform(0, 1))
                     continue

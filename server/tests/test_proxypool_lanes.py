@@ -18,8 +18,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from app.crawler.http_client import LaneBreakers, global_429_breaker
-from app.crawler.rate_limit import LaneRateLimits, steam_rate_limiter
+from app.crawler.http_client import ExitBreakers, global_429_breaker
+from app.crawler.rate_limit import ExitRateLimits, steam_rate_limiter
 from app.crawler.runner import CrawlRunConfig, build_worker_clients
 from app.domains.proxypool import runtime as rt
 from app.domains.proxypool.pool import POOL_FILENAME
@@ -252,34 +252,37 @@ def test_reconcile_still_flags_real_extra_nodes() -> None:
     assert not ledger.ok and ledger.unexpected == {"1|zzz"}
 
 
-# ── 5. 按入口分账：限流与熔断 ────────────────────────────────────
-def test_lane_rate_limits_split_total_budget() -> None:
-    limits = LaneRateLimits(4, max_requests=200, window_seconds=300)
-    assert limits.per_lane == 50, "总预算按 lane 均分，不随出口数放大"
-    assert limits.lane_count == 4
-    assert len({id(limits.for_lane(i)) for i in range(4)}) == 4
-    assert limits.for_lane(4) is limits.for_lane(0), "超出 lane 数按序号回绕共享"
+# ── 5. 按出口分账：限流与熔断 ────────────────────────────────────
+def test_exit_rate_limits_one_budget_per_exit() -> None:
+    limits = ExitRateLimits(["1.1.1.1", "2.2.2.2", "3.3.3.3"])
+    assert limits.exit_count == 3
+    assert limits.per_exit == 200, "每个出口各自拥有一份生产预算（不是按出口数均分）"
+    assert limits.for_exit("1.1.1.1") is not limits.for_exit("2.2.2.2")
+    assert limits.for_exit("1.1.1.1") is limits.for_exit("1.1.1.1")
 
 
-def test_lane_rate_limits_floor_at_one_request() -> None:
-    limits = LaneRateLimits(10, max_requests=4, window_seconds=300)
-    assert limits.per_lane == 1
+def test_exit_rate_limits_same_exit_shares_budget() -> None:
+    """同一出口出现两次（同出口放两个 worker）只得到一份预算，不放大额度。"""
+    limits = ExitRateLimits(["1.1.1.1", "1.1.1.1", "2.2.2.2"])
+    assert limits.exit_count == 2
+    assert limits.for_exit("1.1.1.1") is limits.for_exit("1.1.1.1")
 
 
-def test_lane_rate_limits_zero_lanes_uses_process_singleton() -> None:
-    limits = LaneRateLimits(0)
-    assert limits.lane_count == 0
-    assert limits.for_lane(0) is steam_rate_limiter, "单入口形态行为不变"
+def test_exit_rate_limits_zero_exits_uses_process_singleton() -> None:
+    limits = ExitRateLimits([])
+    assert limits.exit_count == 0
+    assert limits.for_exit(None) is steam_rate_limiter, "单入口形态行为不变"
 
 
-def test_lane_breakers_are_per_lane() -> None:
-    breakers = LaneBreakers(3)
-    assert len({id(breakers.for_lane(i)) for i in range(3)}) == 3
-    assert breakers.for_lane(3) is breakers.for_lane(0)
-    assert LaneBreakers(0).for_lane(0) is global_429_breaker
+def test_exit_breakers_are_per_exit() -> None:
+    breakers = ExitBreakers(["1.1.1.1", "2.2.2.2"])
+    assert breakers.exit_count == 2
+    assert breakers.for_exit("1.1.1.1") is not breakers.for_exit("2.2.2.2")
+    assert breakers.for_exit("1.1.1.1") is breakers.for_exit("1.1.1.1")
+    assert ExitBreakers([]).for_exit(None) is global_429_breaker
 
 
-# ── 6. worker → 入口绑定 ─────────────────────────────────────────
+# ── 6. worker → 出口绑定 ─────────────────────────────────────────
 def _dummy_client():
     from app.crawler.http_client import SteamHttpClient
 
@@ -288,19 +291,33 @@ def _dummy_client():
 
 def test_build_worker_clients_binds_one_lane_per_worker() -> None:
     urls = [f"http://127.0.0.1:{9000 + i}" for i in range(3)]
+    keys = ["1.1.1.1", "2.2.2.2", "3.3.3.3"]
     factory = build_worker_clients(
-        CrawlRunConfig(proxy_urls=urls), _dummy_client()
+        CrawlRunConfig(proxy_urls=urls, exit_keys=keys), _dummy_client()
     )
     assert factory is not None
     clients = [factory(i) for i in range(6)]
     assert [c.proxy_url for c in clients] == urls + urls, "按序号回绕绑定"
+    assert [c.exit_key for c in clients] == keys + keys
 
-    # 同一条 lane 上的 worker 共享同一份限流预算与熔断器（不会多开一份额度）
+    # 同一个出口上的 worker 共享同一份预算与熔断器（不会多开一份额度）
     assert clients[0].rate_limiter is clients[3].rate_limiter
     assert clients[0].breaker is clients[3].breaker
-    # 不同 lane 各自独立
+    # 不同出口各自独立
     assert clients[0].rate_limiter is not clients[1].rate_limiter
     assert clients[0].breaker is not clients[1].breaker
+
+
+def test_build_worker_clients_shares_budget_within_same_exit() -> None:
+    """一个出口放两个 worker：预算只有一份（上限不被 worker 数放大）。"""
+    urls = ["http://127.0.0.1:9001", "http://127.0.0.1:9002"]
+    factory = build_worker_clients(
+        CrawlRunConfig(proxy_urls=urls, exit_keys=["9.9.9.9", "9.9.9.9"]),
+        _dummy_client(),
+    )
+    a, b = factory(0), factory(1)
+    assert a.rate_limiter is b.rate_limiter
+    assert a.breaker is b.breaker
 
 
 def test_build_worker_clients_none_for_single_entry() -> None:
@@ -312,7 +329,18 @@ def test_build_worker_clients_none_for_single_entry() -> None:
 
 def test_build_worker_clients_single_lane_keeps_total_budget() -> None:
     factory = build_worker_clients(
+        CrawlRunConfig(proxy_urls=["http://127.0.0.1:9001"], exit_keys=["1.1.1.1"]),
+        _dummy_client(),
+    )
+    client = factory(0)
+    assert client.rate_limiter.max_requests == 200, "一条出口时预算仍是 200/5min"
+
+
+def test_build_worker_clients_without_exit_keys_falls_back_to_singleton() -> None:
+    """没有出口身份（旧调用方）时不编造 key，退回进程级单例。"""
+    factory = build_worker_clients(
         CrawlRunConfig(proxy_urls=["http://127.0.0.1:9001"]), _dummy_client()
     )
     client = factory(0)
-    assert client.rate_limiter.max_requests == 200, "一条 lane 时总额度仍是 200/5min"
+    assert client.exit_key is None
+    assert client.rate_limiter is steam_rate_limiter
