@@ -49,8 +49,10 @@ BROWSE_URL = "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/"
 # 必须 GET（POST → 405）；input_json 只能放查询参数。
 # 最小转义：保留 `{}",:` 与数字/小写字母（全转义会让单发条数掉到 ~260）
 _URL_SAFE = '{}",:0123456789abcdefghijklmnopqrstuvwxyz-_.'
-# Steam 侧按 URL ~8KB 截断（400 条 × 全字段 = 7.5KB 仍 200）——防御性再切
-MAX_URL_LEN = 8000
+# 单发 URL 长度上限：服务端按请求行长度拒绝，边界落在 6.5KB~6.8KB 之间
+# （340 条 / 6474 字节仍回 200；360 条 / 6834 字节回 414；400 条 / 7554 字节回 400，
+# 直连与经本地内核结果一致）。取 6000 留余量：请求行还含方法、路径与协议版本。
+MAX_URL_LEN = 6000
 DEFAULT_BATCH_SIZE = 400
 
 DATA_REQUEST_BASE = {
@@ -297,17 +299,41 @@ class StoreBrowseAPI:
     def _split_ids_by_url(
         id_specs: list[dict], cc: str, lang: str, extras: bool
     ) -> list[list[dict]]:
-        if len(id_specs) <= 1:
+        """按**构造出来的 URL 实际长度**切批，切点取「能装下的最长前缀」。
+
+        判据只能是最终 URL 的长度：单发条数不是安全量——同样 400 条，7 位 appid 拼出的
+        URL 比 5 位长得多，服务端按请求行长度拒绝（超限时回 414 / 400），而条数看不出来。
+        所以每批都真的把 URL 构造一次再量长度。
+
+        切点用「最长可行前缀」而不是对半折：对半会把 400 条切成 200+200，多发一倍请求；
+        前缀切法在同样的长度上限下能保住接近上限的批量。
+        """
+        total = len(id_specs)
+        if total <= 1:
+            return [id_specs] if id_specs else []
+        if StoreBrowseAPI._url_len(id_specs, cc, lang, extras) <= MAX_URL_LEN:
             return [id_specs]
-        url_len = len(
-            str(StoreBrowseAPI.build_ids_url(id_specs, cc, lang, extras))
+        # 二分找最长可行前缀（长度随条数单调不减）
+        low, high = 1, total - 1
+        best = 0
+        while low <= high:
+            mid = (low + high) // 2
+            if StoreBrowseAPI._url_len(id_specs[:mid], cc, lang, extras) <= MAX_URL_LEN:
+                best = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+        if best <= 0:
+            # 单条都超限：交给调用方失败，不静默丢 id
+            return [id_specs]
+        return [id_specs[:best]] + StoreBrowseAPI._split_ids_by_url(
+            id_specs[best:], cc, lang, extras
         )
-        if url_len <= MAX_URL_LEN:
-            return [id_specs]
-        mid = len(id_specs) // 2
-        return StoreBrowseAPI._split_ids_by_url(
-            id_specs[:mid], cc, lang, extras
-        ) + StoreBrowseAPI._split_ids_by_url(id_specs[mid:], cc, lang, extras)
+
+    @staticmethod
+    def _url_len(id_specs: list[dict], cc: str, lang: str, extras: bool) -> int:
+        """按生产编码真实构造一次 URL 并返回其长度（编码口径与发送时完全一致）。"""
+        return len(str(StoreBrowseAPI.build_ids_url(id_specs, cc, lang, extras)))
 
     @staticmethod
     async def fetch_batch(
