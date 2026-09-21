@@ -547,6 +547,10 @@ async def sync_account(steamid: str, auto_crawl: bool = True) -> dict:
         account.item_count = len(total_active)
         await session.commit()
 
+    # 账户同步会改写来源标记（成员资格覆写 / 反向核对停用），同步后按现状
+    # 重算 Tracking Source；排除状态不动（用户意图不由自动同步改写）
+    await _sync_monitoring(list(existing) + new_appids)
+
     result = {
         "steamid": steamid,
         "wishlistCount": len(wishlist),
@@ -959,6 +963,33 @@ async def _refresh_item_counts(session, steamids: set[str]) -> None:
         )
 
 
+async def _sync_monitoring(appids: list[int], *, exclusion: bool | None = None) -> None:
+    """监控条目变动后把 Tracking Source 同步到 monitoring 域。
+
+    wishlist_items 是来源的单一真相源：本函数只做「现状 → monitor_sources」
+    的幂等重算（多账户同 appid 取并集），排除状态另行由 `exclusion` 显式
+    控制——用户移除（True）/ 重新加入（False）/ 业务态脱池（None，不动）。
+    同步失败只记日志：监控池主链的增删已经落库，不能因监控层异常回滚。
+    """
+    clean = [int(a) for a in (appids or []) if isinstance(a, int) or str(a).isdigit()]
+    if not clean:
+        return
+    try:
+        from app.domains.monitoring import service as monitoring_service
+
+        if exclusion is not None:
+            for appid in clean:
+                await monitoring_service.set_exclusion(
+                    "game",
+                    appid,
+                    exclusion,
+                    "pool_removed" if exclusion else "pool_restored",
+                )
+        await monitoring_service.sync_game_sources(clean)
+    except Exception:  # noqa: BLE001
+        logger.exception("监控层同步失败（不影响监控池主链）：%d 项", len(clean))
+
+
 async def ensure_board_pool(appids: list[int]) -> dict:
     """榜单发现源落池（持久监控）：本轮榜整批并入监控池。
 
@@ -1039,6 +1070,8 @@ async def ensure_board_pool(appids: list[int]) -> dict:
             {r.steamid for r in rows} | ({new_steamid} if new_steamid else set()),
         )
         await session.commit()
+
+    await _sync_monitoring(clean)
 
     if added or skipped:
         logger.info(
@@ -1141,6 +1174,9 @@ async def add_pool_items(
             )
             await session.commit()
 
+    # 重新加入 = 用户明确要监控：解除排除后再按现状重算来源
+    await _sync_monitoring(clean, exclusion=False)
+
     crawl_triggered = False
     if auto_crawl and touched:
         from app.domains.crawl import service as crawl_service
@@ -1222,6 +1258,8 @@ async def remove_pool_items(appids: list[int]) -> dict:
             else:
                 results.append({"appid": appid, "status": "missing", "detail": "不在监控池"})
                 missing += 1
+    # 用户主动移出 = 排除监控（不是删除）：Catalog / 价格历史 / 来源全保留
+    await _sync_monitoring(clean, exclusion=True)
     return {"results": results, "removed": removed, "missing": missing}
 
 
@@ -1278,4 +1316,7 @@ async def release_free_games(appids: list[int]) -> int:
         if rows:
             await _refresh_item_counts(session, {r.steamid for r in rows})
         await session.commit()
+    # 永久免费是业务状态（free_kind），不是用户排除：只摘来源 → released，
+    # 不写 monitor_exclusions（解除排除后仍可回到监控，届时由下次爬取再判）
+    await _sync_monitoring(sorted(free_ids))
     return len(active_ids)

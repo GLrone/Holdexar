@@ -19,6 +19,7 @@ PRIMARY = "76561198000000001"
 @pytest.fixture
 def db(tmp_path, monkeypatch):
     import app.core.database as database_module
+    import app.domains.monitoring.service as monitoring_service
     import app.domains.wishlist.service as wishlist_service
 
     engine = create_async_engine(
@@ -27,6 +28,7 @@ def db(tmp_path, monkeypatch):
     factory = async_sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
     monkeypatch.setattr(crawl_service, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(monitoring_service, "get_session_factory", lambda: factory)
     # import_appids 会走 wishlist 域入池 + 主账户解析：一并打桩到测试库
     monkeypatch.setattr(wishlist_service, "get_session_factory", lambda: factory)
 
@@ -43,6 +45,7 @@ def db(tmp_path, monkeypatch):
 async def _schema(db):
     import app.domains.crawl.models  # noqa: F401
     import app.domains.games.models  # noqa: F401
+    import app.domains.monitoring.models  # noqa: F401
     import app.domains.wishlist.models  # noqa: F401
 
     async with db.kw["bind"].begin() as conn:
@@ -191,18 +194,19 @@ async def test_import_appids_writes_pool(db):
 
 
 @pytest.mark.asyncio
-async def test_pool_scope_orders_wishlist_first(db):
-    """pool=全池：愿望单/已购（manual 优先序）排头，其余 games 行 appid 序垫后；
-    下架行（removed_at）与 inactive 愿望单项不入池。"""
+async def test_pool_scope_orders_monitoring_first(db):
+    """pool=监控层：只有进入 Monitoring 的对象（关注 > 愿望单 > 已购序）；
+    其余 games 行归 catalog 层，不在 pool 里。"""
     from datetime import datetime
 
     from app.domains.games.models import Game
+    from app.domains.monitoring import service as monitoring_service
 
     async with db() as session:
         session.add_all(
             [
-                Game(appid=800, name="池内甲", updated_at=datetime.now()),
-                Game(appid=801, name="池内乙", updated_at=datetime.now()),
+                Game(appid=800, name="目录甲", updated_at=datetime.now()),
+                Game(appid=801, name="目录乙", updated_at=datetime.now()),
                 Game(appid=802, name="已下架", updated_at=datetime.now(),
                      removed_at=datetime.now()),
             ]
@@ -210,11 +214,14 @@ async def test_pool_scope_orders_wishlist_first(db):
         await session.commit()
     await _seed(db, 700, owned=False, active=True)   # manual 关注另行补
     await _seed(db, 701, owned=True, active=True)    # 已购
-    await _seed(db, 702, owned=True, active=False)   # inactive，无 games 行 → 不入池
+    await _seed(db, 702, owned=True, active=False)   # inactive → 无有效来源
     async with db() as session:
         row = await session.get(WishlistItem, (PRIMARY, 700))
         row.manual = True
         await session.commit()
+    await monitoring_service.sync_game_sources([700, 701, 702])
 
     pool = [a for a, _ in await crawl_service._resolve_scope_appids("pool", None)]
-    assert pool == [700, 701, 800, 801]  # manual 最先，愿望单次之，其余垫后
+    catalog = [a for a, _ in await crawl_service._resolve_scope_appids("catalog", None)]
+    assert pool == [700, 701]        # 关注最先，已购次之
+    assert catalog == [800, 801]     # 纯目录行（下架行剔除）
