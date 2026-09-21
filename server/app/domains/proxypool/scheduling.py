@@ -3,10 +3,10 @@
     Crawl 是 Runtime 的占用者；L1/L2 是维护者；rebuild 是破坏性操作。
     维护者只能在占用结束后做破坏性操作。
 
-三条边界，全部由实测事实决定（P1.4/P1.5）：
+三条边界：
 
 - **L0** 走 `/proxies/{name}/delay`，不改 `GLOBAL` → **可与 crawl 并行**；它只改 `state`，
-  池内容因此变脏时**只置 `rebuild_pending`**，绝不立即 stop 内核（P1.5 实测重启会打断
+  池内容因此变脏时**只置 `rebuild_pending`**，绝不立即 stop 内核（重建会打断
   在途请求）。
 - **L1/L2** 会 `PUT /proxies/GLOBAL` → 与 crawl 并行会改掉 crawler 的出口并让归因失真
   → **占线时直接跳过**（观察任务，不排队，避免积压成自己的调度负担）。跑完必须

@@ -4,7 +4,7 @@
 源目录 assets/clash → 打包后随资源目录），用户机器上不再检索本机装没装 Clash：
 内核由 ensure_kernel() 复制进 data/clash/，detect_kernel() 只认这一处。
 网络下载（download_kernel*）退居兜底，只服务两类场景：源码 clone 尚未补资产、
-用户手工删掉了 data/clash/ 里的可执行文件。
+用户手工移走 data/clash/ 里的可执行文件。
 
 订阅下载的链式引导：直连失败且内核已在跑时经本地混合端口重试。
 红线：本模块不内置任何订阅源，订阅 URL 只能来自用户设置。

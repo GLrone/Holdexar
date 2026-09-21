@@ -41,6 +41,9 @@ def tmp_data_dir(tmp_path, monkeypatch):
     get_engine.cache_clear()
     get_session_factory.cache_clear()
     yield tmp_path
+    # teardown 先还原环境再清缓存：monkeypatch 的还原发生在本夹具之后，
+    # 否则「缓存库 ≠ 当前配置库」判据判定相等，临时引擎会留给后续文件
+    os.environ.pop("HOLDEXAR_DATA_DIR", None)
     get_settings.cache_clear()
     get_engine.cache_clear()
     get_session_factory.cache_clear()

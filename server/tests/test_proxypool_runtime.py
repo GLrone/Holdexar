@@ -56,6 +56,9 @@ def tmp_data_dir(tmp_path, monkeypatch):
     get_engine.cache_clear()
     get_session_factory.cache_clear()
     yield tmp_path
+    # teardown 先还原环境再清缓存：monkeypatch 的还原发生在本夹具之后，
+    # 否则「缓存库 ≠ 当前配置库」判据判定相等，临时引擎会留给后续文件
+    os.environ.pop("HOLDEXAR_DATA_DIR", None)
     get_settings.cache_clear()
     get_engine.cache_clear()
     get_session_factory.cache_clear()
@@ -227,7 +230,7 @@ async def test_unloadable_node_makes_the_kernel_die_not_shrink(
 ) -> None:
     """真实观测到的成因：内核**不会**静默少加载，而是直接拒绝启动。
 
-    实测日志：`level=fatal msg="Parse config error: proxy 3: unsupport proxy type: ..."`
+    内核日志：`level=fatal msg="Parse config error: proxy 3: unsupport proxy type: ..."`
     所以「M < N」在本版内核里不可达，它的真身是「内核根本没起来」。这条断言把
     这个区别钉住：将来设计 reconcile 时必须先区分「没起来」与「起来了但不一样」。
     """
