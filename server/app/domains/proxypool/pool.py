@@ -24,10 +24,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
-from sqlalchemy import select
+from sqlalchemy import exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domains.proxypool.models import ProxyNode
+from app.domains.proxypool.models import ProxyNode, ProxyNodeSource
 from app.domains.proxypool.state import NODE_ACTIVE, NODE_NEW, NODE_STALE
 
 POOL_FILENAME = "crawl-pool.yaml"
@@ -123,10 +123,15 @@ async def eligible_nodes(session: AsyncSession) -> list[ProxyNode]:
 
     维护事务要回答"此刻池里还有谁"（例如恢复 GLOBAL 时要判断原节点是否已出池），
     不能为此写一次池文件——落盘是 `build_pool` 的职责。
+
+    合格 = 状态合格 + 配置完整 + **至少一个当前来源**：身份账本（`ProxyNode`）保留，
+    但没有任何订阅提供它的节点不该占运行位——订阅退出生产池后，只由它提供的节点
+    因此自然退出池，而仍被别的订阅提供的节点不受影响。
     """
     rows = await session.execute(
         select(ProxyNode)
         .where(ProxyNode.state.in_(sorted(POOL_ELIGIBLE_STATES)))
+        .where(exists().where(ProxyNodeSource.node_id == ProxyNode.node_id))
         .order_by(ProxyNode.id)
     )
     return [node for node in rows.scalars() if _is_complete(node)]
