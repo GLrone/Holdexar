@@ -1,7 +1,7 @@
 """games 域路由层参数校验测试：锁国区 region=locked 的 HTTP 层回归。
 
-背景：service 直调测试（test_games_query 的 region="LOCKED"）全绿，但 router
-的 Query(max_length=5) 把 6 字符的 "locked" 拒成 422——直调绕过校验层，
+service 直调测试（test_games_query 的 region="LOCKED"）会绕过校验层，
+而 router 的 Query(max_length=5) 把 6 字符的 "locked" 拒成 422——
 这类回归只有真实 HTTP 调用能拦住。本文件只挂 games 路由的最小 FastAPI 应用
 （不起完整 app.main 避免 lifespan 副作用），service 以桩替换，零 DB 依赖。
 """

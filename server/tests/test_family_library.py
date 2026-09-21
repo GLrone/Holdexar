@@ -30,7 +30,7 @@ def db(tmp_path, monkeypatch):
     monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
     monkeypatch.setattr(settings_service, "get_session_factory", lambda: factory)
     monkeypatch.setattr(family_service, "get_session_factory", lambda: factory)
-    # 多账号重构后 family 经 account_service.get_primary_cookies() 读表：
+    # family 经 account_service.get_primary_cookies() 读表：
     # 模块级 factory 引用必须单独打桩，否则直读生产库
     monkeypatch.setattr(account_service, "get_session_factory", lambda: factory)
     # miniprofile 头像兜底默认静默空（防单测触网）；验证头像链路的用例自行覆盖

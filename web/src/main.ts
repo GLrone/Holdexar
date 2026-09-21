@@ -62,10 +62,10 @@ localeStore.apply()
 // ① 不能用 `app.use(ElementPlus, { locale })`——那是启动期一次性求值，切了不变
 //    （全项目 34 处 el-table 都会漏中文）。改用 app.use(ElementPlus) 不带 options：
 //    EP 的 installer 是 `if (options) provideGlobalConfig(options, app, true)`，
-//    不传 options 就**不会**抢先写死那份模块级 globalConfig，留给我们写。
+//    不传 options 就**不会**抢先写死那份模块级 globalConfig，留给本处注册。
 // ② 命令式的 ElMessageBox / ElMessage 不走组件树 inject，读的正是这份模块级
 //    globalConfig，而它只在第一次 provideGlobalConfig 时写入——所以「第一次」必
-//    须是我们这一次，且写进去的是**响应式** context，切语言时确认框按钮也变。
+//    须落在本处调用，且写进去的是**响应式** context，切语言时确认框按钮也变。
 // ③ 放在 main.ts 而非 App.vue：视图层有「禁止直连 Element Plus」的红线
 //    （组件一律走 components/ui），而这里本就是 EP 的兼容层注册处。
 provideGlobalConfig(

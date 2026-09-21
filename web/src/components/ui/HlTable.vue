@@ -9,10 +9,9 @@ export interface HlTableColumn {
    * 数字列。声明后由组件统一右对齐 + 等宽数字（`tabular-nums`，纵向小数点对齐），
    * 调用方不必再写 `align` 映射。
    *
-   * **为什么是显式声明、不按 key 猜**：列 key 是**展示名**，常与数据字段无关——
+   * **显式声明而非按 key 猜**：列 key 是**展示名**，常与数据字段无关——
    * 本项目那张价格表的列 key 就叫 `native` / `cny` / `save`，按 key 后缀猜必然漏判。
-   * 「数字列右对齐」此前只活在 `game-detail/Index.vue` 一处手写的 `PRICE_ALIGN` 里，
-   * 新表格全靠自觉重写一遍；现在是组件默认值。
+   * 数字列右对齐是组件默认值，调用方无需手写 `PRICE_ALIGN` 一类映射。
    */
   numeric?: boolean
 }
