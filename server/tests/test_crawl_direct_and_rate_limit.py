@@ -1,14 +1,11 @@
 """自动爬取直连放行 + 全局限流测试。
 
-规则变更（browse 接口时代）：browse 按 country_code 参数返回各区价格，
-出口 IP 不参与数据判定——直连成为标准形态（一般用户的加速器在系统网络
-层透明生效，应用侧无需代理）。此前的「无可用代理不自动爬」前置闸门
-整体退役：自动路径（调度器价格刷新/失败修复/账户同步追加首爬/榜单
-反哺/CS 重探）无代理也照常启动，请求频率改由全局滑动窗口限流
+browse 按 country_code 参数返回各区价格，
+出口 IP 不参与数据判定——直连即标准形态（一般用户的加速器在系统网络
+层透明生效，应用侧无需代理）。「无可用代理不自动爬」前置闸门不适用此形态：
+自动路径（调度器价格刷新/失败修复/账户同步追加首爬/榜单
+反哺/CS 重探）无代理也照常启动，请求频率由全局滑动窗口限流
 （200 发/5 分钟，crawler/rate_limit.py）统一约束。
-
-历史背景：闸门是 appdetails 时代的产物——当时 Steam 域直连基本不可用，
-未保存订阅时自动任务直连全 41 区既浪费请求又拿不到数据。
 
 隔离：不出网、不触生产库（域服务模块级 import 的 factory 打桩）。
 """
@@ -32,6 +29,8 @@ from app.domains.crawl.models import CrawlJob
 from app.domains.games.models import Game, GameCurrentPrice
 from app.crawler.rate_limit import SlidingWindowRateLimiter, steam_rate_limiter
 from app.crawler.utils import get_beijing_time_obj
+# pool 作用域走 Monitoring 层：表要注册进 Base.metadata
+from app.domains.monitoring import models as _monitoring_models  # noqa: F401
 
 
 @pytest.fixture
@@ -44,6 +43,10 @@ def db(tmp_path, monkeypatch):
 
     monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
     monkeypatch.setattr(crawl_service, "get_session_factory", lambda: factory)
+    # monitoring 也是模块级 import 的 factory——漏桩会读到生产库
+    import app.domains.monitoring.service as monitoring_service
+
+    monkeypatch.setattr(monitoring_service, "get_session_factory", lambda: factory)
     import app.crawler.db_writer as dw
 
     monkeypatch.setattr(dw, "get_session_factory", lambda: factory)

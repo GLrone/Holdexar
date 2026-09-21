@@ -288,6 +288,10 @@ async def _job_price_repair() -> None:
     冷却 4min（< 轮转 5min）：上一轮刚标失败的区下一轮修复即可复访，
     不必等主轮 24h 冷却；不设 0 是防同轮内重复拾取。
 
+    归属边界：本轮启动的 job 不挂 Price Cycle（`cycle_id` 为 NULL）——修复
+    候选是全库 missing 账本，与某一轮的期望集没有确定性关联，不做时间
+    猜测式归属；归属留给按缺口单元承接的阶段。
+
     门禁三层：主价格刷新轮占线（busy）让路；任何爬取任务在跑让路
     （用户手动/愿望单同步/榜单反哺都算「爬虫未结束工作」）；无欠账
     （ValueError）静默跳过。撞锁（RuntimeError）静默——上轮修复还在
@@ -309,6 +313,132 @@ async def _job_price_repair() -> None:
             logger.info("[修复] 失败记录修复完成：任务 %s", [r["id"] for r in result])
     except Exception:  # noqa: BLE001
         logger.exception("[修复] 失败记录修复轮异常")
+
+
+async def _run_price_cycle(specs: list[dict]) -> None:
+    """价格网格主轮的 Cycle 驱动段：一个 Cycle 统管本轮全部 job。
+
+    三层 spec 语义不变——欠账补抓 → 监控层（pool：有来源且未排除的对象，
+    来源优先级排前）→ 目录层（catalog：games 主档减去监控层，价格库维护轮）。
+    两段分开是为了让「被监控的对象」与「库里存在的对象」不再互相推导；
+    catalog 排除监控层，同轮不会重复爬。空的 spec 视为正常跳过。
+
+    本轮每个 job 挂同一个 PriceCycle：planning 冻结期望集 → running 跑链 →
+    （结束时仍有待补欠账）repairing → finalizing → 终态。Cycle 记账失败
+    不阻断抓取——记账失败不该让用户少一轮价格；无 Cycle 时本轮照常跑完，
+    只是这一轮没有归属可查。
+    """
+    from app.domains.crawl import cycle as price_cycle
+    from app.domains.crawl import service as crawl_service
+
+    cycle_id: int | None = None
+    regions: list[str] | None = None
+    expected_units = 0
+    try:
+        cycle_id = await price_cycle.create("scheduled", "pool")
+    except Exception:  # noqa: BLE001
+        logger.exception("[周期] 本轮 Cycle 创建失败：抓取照常进行（本轮不挂 Cycle）")
+        cycle_id = None
+    if cycle_id is not None:
+        try:
+            regions, expected_units = await price_cycle.freeze_expected(cycle_id, specs)
+        except Exception:  # noqa: BLE001
+            # 冻结失败不影响抓取：本轮照跑，终态按「无区可爬 / 无期望集」收 failed
+            logger.exception("[周期] 本轮期望集冻结失败：抓取照常进行（本轮记 failed）")
+            regions = None
+
+    entered_repairing = False
+    try:
+        await price_cycle.advance(cycle_id, price_cycle.RUNNING)
+        results = await crawl_service.run_sequential(specs, cycle_id=cycle_id)
+        if not results:
+            logger.info("[定时] 池价格爬取：本轮无任务启动（占用/空列表）")
+        else:
+            logger.info("[定时] 池价格爬取链完成：%s", [r["id"] for r in results])
+        # 本轮结束时仍有待补欠账 → 本轮进入 repairing。补抓由既有 5min
+        # repair 通道承担（它扫全库账本，与本轮期望集没有确定性关联，job
+        # 暂不挂 Cycle），Cycle 只把「本轮确实遗留了未覆盖单元」记下来。
+        if cycle_id is not None and await crawl_service.has_pending_missing():
+            entered_repairing = await price_cycle.advance(
+                cycle_id, price_cycle.REPAIRING
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.exception("[周期] 本轮价格链异常")
+        await price_cycle.advance(cycle_id, price_cycle.FAILED, error=str(e)[:200])
+        await _record_cycle_stats(cycle_id)
+        return
+
+    if cycle_id is None:
+        return
+    jobs = await price_cycle.jobs_of(cycle_id)
+    terminal = (
+        price_cycle.FAILED
+        if regions is None
+        else price_cycle.decide_terminal(
+            [j["status"] for j in jobs],
+            expected_units=expected_units,
+            entered_repairing=entered_repairing,
+        )
+    )
+    if not await price_cycle.advance(cycle_id, price_cycle.FINALIZING):
+        return
+    # 事件检测排在本轮最终有效结果之上（finalizing 内、终态之前）：job 自己产生
+    # 事件会让「暂时失败→随后补抓成功」的单元先报不可用再报恢复
+    await _detect_cycle_events(cycle_id)
+    await price_cycle.advance(cycle_id, terminal)
+    logger.info(
+        "[周期] 价格刷新 Cycle %d → %s（job %d 个，期望 %d 单元）",
+        cycle_id, terminal, len(jobs), expected_units,
+    )
+    await _record_cycle_stats(cycle_id)
+
+
+async def _detect_cycle_events(cycle_id: int | None) -> None:
+    """Cycle finalizing：把本轮观察相对历史的变化写成 price_events。
+
+    检测失败只记日志：本轮抓取结果与统计已经落库，事件缺失不该影响它们。
+    """
+    if cycle_id is None:
+        return
+    try:
+        from app.domains.crawl import events as price_events
+
+        written = await price_events.detect(cycle_id)
+        if written:
+            logger.info(
+                "[周期] Cycle %d 价格事件 %d 条：%s",
+                cycle_id, len(written),
+                sorted({e["event_type"] for e in written}),
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception("[周期] Cycle %d 价格事件检测失败（不影响本轮结果）", cycle_id)
+
+
+async def _record_cycle_stats(cycle_id: int | None) -> None:
+    """Cycle 收敛后留下本轮生产统计（观测结果，不参与任何控制）。
+
+    统计失败只记日志：本轮抓取结果已经落库，统计缺失不该影响它。
+    """
+    if cycle_id is None:
+        return
+    try:
+        from app.domains.crawl import stats as price_stats
+
+        recorded = await price_stats.record_stats(cycle_id)
+        if recorded is not None:
+            logger.info(
+                "[周期] Cycle %d 统计：对象 %s/%s，单元 %s（ok %s / locked %s / 失败 %s / "
+                "未观察 %s），覆盖 %s（确认 %s），stale %s，耗时 %ss",
+                cycle_id,
+                recorded["targetsDone"], recorded["targetsTotal"],
+                recorded["unitsExpected"], recorded["unitsOk"],
+                recorded["unitsLocked"], recorded["unitsFailed"],
+                recorded["unitsUnobserved"], recorded["coverage"],
+                recorded["coverageConfirmed"], recorded["staleCount"],
+                recorded["durationSeconds"],
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception("[周期] Cycle %d 统计落库失败（不影响本轮抓取结果）", cycle_id)
 
 
 async def _job_price_refresh() -> None:
@@ -352,15 +482,12 @@ async def _job_price_refresh() -> None:
             if crawl_service._active is None or crawl_service._active.task.done():
                 break
             await asyncio.sleep(_DRAIN_POLL_SECONDS)
-        # 两层：欠账补抓 → 全池（愿望单+已购优先序排前，其余 games 行垫后）。
-        # 无欠账（ValueError）视为正常跳过；全池层单 job 一遍过，愿望单不再
-        # 同轮双爬
-        specs: list[dict] = [{"kind": "missing"}, {"scope": "pool"}]
-        results = await crawl_service.run_sequential(specs)
-        if not results:
-            logger.info("[定时] 池价格爬取：本轮无任务启动（占用/空列表）")
-        else:
-            logger.info("[定时] 池价格爬取链完成：%s", [r["id"] for r in results])
+        specs: list[dict] = [
+            {"kind": "missing"},
+            {"scope": "pool"},
+            {"scope": "catalog"},
+        ]
+        await _run_price_cycle(specs)
 
         # 链尾段：捆绑包刷新（游戏侧跑完才轮到它，busy 窗口内修复轮
         # 继续让路；发现桩首抓并入同一次全量刷新，成败细节由

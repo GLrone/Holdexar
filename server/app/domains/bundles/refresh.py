@@ -435,6 +435,31 @@ async def _upsert_bundle_rows(
         return True
 
 
+async def _blocked_bundle_ids() -> set[int]:
+    """不进刷新的包：用户排除（excluded）或已停止监控（released）。"""
+    try:
+        from app.domains.monitoring import service as monitoring_service
+
+        return await monitoring_service.blocked_ids("bundle")
+    except Exception:  # noqa: BLE001
+        logger.exception("[bundles] 监控状态读取失败（本次按全量刷新处理）")
+        return set()
+
+
+async def _attach_bundle_source(bundle_id: int) -> None:
+    """导入 = 用户明确意图：挂上 import 来源并解除排除。
+
+    与 Game 同一套生命周期——Bundle 不再是独立孤岛，排除 / 释放 / 重新
+    监控都走 monitoring 域。失败不影响导入结果（主档与价格已落库）。
+    """
+    try:
+        from app.domains.monitoring import service as monitoring_service
+
+        await monitoring_service.track("bundle", bundle_id, "import")
+    except Exception:  # noqa: BLE001
+        logger.exception("[bundles] 监控来源登记失败（不影响导入结果）")
+
+
 async def refresh_bundles() -> dict:
     """全量刷新捆绑包：库内所有包**监控区整表每区一发**（≤400 条）→ upsert。
 
@@ -448,18 +473,22 @@ async def refresh_bundles() -> dict:
     rate_map.setdefault("CNY", 1.0)
     ccs = await _bundle_fetch_ccs()
 
+    # 监控资格门：被排除 / 已停止监控的包不进刷新。没有监控记录的包照刷
+    # ——库内既有捆绑包默认参与，只有用户显式表达过「别再爬它」才退出。
+    blocked = await _blocked_bundle_ids()
+    stmt = select(
+        Bundle.bundle_id,
+        # 形态选键：item_kind 权威；v3 之前的行兜底沿用 mps 旧值
+        func.coalesce(Bundle.item_kind, Bundle.must_purchase_as_set),
+    )
+    if blocked:
+        stmt = stmt.where(Bundle.bundle_id.notin_(sorted(blocked)))
+    stmt = stmt.order_by(Bundle.bundle_id)
+
     async with get_session_factory()() as session:
         want = [
             (int(bid), kind)
-            for bid, kind in (
-                await session.execute(
-                    select(
-                        Bundle.bundle_id,
-                        # 形态选键：item_kind 权威；v3 之前的行兜底沿用 mps 旧值
-                        func.coalesce(Bundle.item_kind, Bundle.must_purchase_as_set),
-                    ).order_by(Bundle.bundle_id)
-                )
-            ).all()
+            for bid, kind in (await session.execute(stmt)).all()
         ]
         priced = {
             int(b)
@@ -610,6 +639,7 @@ async def import_bundle(text: str) -> dict:
         bundle_id, regions, rate_map, now, allow_singleton=True
     ):
         return {"ok": False, "detail": "落库失败"}
+    await _attach_bundle_source(bundle_id)
     logger.info("捆绑包导入完成：%s %d（%d 区价格）", kind, bundle_id, len(regions))
     result = {
         "ok": True,

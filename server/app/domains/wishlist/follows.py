@@ -19,7 +19,7 @@ from sqlalchemy import select, update
 from app.core.database import get_session_factory
 from app.crawler.utils import get_beijing_time_obj
 from .models import WishlistItem
-from .service import resolve_pool_steamid
+from .service import _sync_monitoring, resolve_pool_steamid
 
 
 async def followed_appids() -> list[int]:
@@ -75,6 +75,8 @@ async def follow(appid: int) -> dict:
                 )
             )
         await session.commit()
+    # 关注 = 用户显式要求监控：解除排除后按现状重算来源（挂上 favorite）
+    await _sync_monitoring([int(appid)], exclusion=False)
     return {"appid": int(appid), "followed": True}
 
 
@@ -87,4 +89,5 @@ async def unfollow(appid: int) -> dict:
             .values(manual=False)
         )
         await session.commit()
+    await _sync_monitoring([int(appid)])
     return {"appid": int(appid), "followed": False}
