@@ -34,11 +34,16 @@ const shell = {
   'nav.me': '我',
   'nav.about': '关于',
 
-  /* 顶栏爬取状态胶囊 */
-  'header.crawl': '爬取',
-  'header.crawlRunning': '进行中 {done}/{total}（成功 {ok} / 失败 {fail}）',
-  'header.crawlIdle': '空闲',
-  'header.crawlTip': '速度 {speed} t/s · 队列 {qsize}',
+  /* 顶栏价格更新状态胶囊：一个胶囊只表达一个产品结论——内部 job / 队列 /
+     速度 / worker / 代理一律不进这里，也不进普通 tooltip（技术诊断入口另说） */
+  'header.crawl': '等待更新',
+  'header.crawlRunning': '正在更新游戏价格 · {done}/{total}',
+  'header.crawlRunningBare': '正在更新游戏价格',
+  'header.crawlDone': '价格已更新 · {done}/{total}',
+  'header.crawlIdle': '价格已更新',
+  'header.crawlPartial': '部分更新 · {done}/{total}',
+  'header.crawlTip': '本次已更新 {done} 款 · {fail} 款稍后自动重试',
+  'header.crawlTipDone': '本次已更新 {done} 款',
 
   /* 顶栏钱包胶囊 + 余额弹层 */
   'wallet.bind': '绑定钱包',

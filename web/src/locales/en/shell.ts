@@ -28,10 +28,14 @@ const shell: Partial<Record<MessageKey, string>> = {
   'nav.me': 'Me',
   'nav.about': 'About',
 
-  'header.crawl': 'Crawl',
-  'header.crawlRunning': 'Running {done}/{total} (ok {ok} / fail {fail})',
-  'header.crawlIdle': 'Idle',
-  'header.crawlTip': 'Speed {speed} t/s · queue {qsize}',
+  'header.crawl': 'Waiting to update',
+  'header.crawlRunning': 'Updating game prices · {done}/{total}',
+  'header.crawlRunningBare': 'Updating game prices',
+  'header.crawlDone': 'Prices updated · {done}/{total}',
+  'header.crawlIdle': 'Prices updated',
+  'header.crawlPartial': 'Partly updated · {done}/{total}',
+  'header.crawlTip': 'Updated {done} games · {fail} will retry automatically',
+  'header.crawlTipDone': 'Updated {done} games',
 
   'wallet.bind': 'Bind wallet',
   'wallet.unboundTip': 'No Steam cookie bound — click to open the profile page',
