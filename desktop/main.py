@@ -52,7 +52,15 @@ else:
     _bundled_server = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / "server"
     if (_bundled_server / "app" / "main.py").is_file() and str(_bundled_server) not in sys.path:
         sys.path.insert(0, str(_bundled_server))
-from app.core.app_info import APP_NAME, APP_SLUG, ENV_PREFIX  # noqa: E402
+from app.core.app_info import (  # noqa: E402
+    APP_NAME,
+    APP_SLUG,
+    ENV_PREFIX,
+    HANDOFF_UNSUPPORTED_MARK,
+    STAGING_DIR_NAME,
+    STAGING_MANIFEST_NAME,
+    SWAP_FAILED_FLAG,
+)
 from app.core.paths import data_dir_filename, is_frozen, resolve_data_dir  # noqa: E402
 
 # WebView2 Runtime（Evergreen 固定产品 GUID）注册表探测 + 官方离线安装链
@@ -966,13 +974,17 @@ _UPDATE_KEEP = {
     "data",          # 用户数据（库/备份/导出/日志/种子暂存）
     "logs",          # 兼容旧目录名
     "__old__",       # 上一版程序备份（换装时刚移入的）
-    "update-staging",  # 暂存目录自身
+    STAGING_DIR_NAME,  # 暂存目录自身
 }
 
 # 换装助手入口标记：暂存包的新 exe 报出这个长选项才允许自动换装（见探测函数）
 _HELPER_FLAG = "--apply-update"
+# 暂存目录内的文件名（与后端 app/core/updater.py 同源常量，改名单点生效）
+_MANIFEST_NAME = STAGING_MANIFEST_NAME
 # 不支持安全换装的暂存包落盘标记：避免每次启动重复探测与弹窗
-_UNSUPPORTED_MARK = ".handoff-unsupported"
+_UNSUPPORTED_MARK = HANDOFF_UNSUPPORTED_MARK
+# 换装失败并已回滚的安装状态标记（落在数据目录，不随暂存目录被清理）
+_FAILED_MARK = SWAP_FAILED_FLAG
 
 
 def _update_log() -> Path:
@@ -990,6 +1002,16 @@ def _log_update(message: str) -> None:
             fh.write(line + "\n")
     except Exception:  # noqa: BLE001 —— 日志写不进去不阻断换装
         pass
+
+
+def _swap_failed_flag() -> Path:
+    """上次换装失败的安装状态标记。
+
+    落点是数据目录而非暂存目录：作废清理由下一次启动的现装进程执行（换装进程
+    跑在暂存目录里删不掉自己），标记若跟着暂存目录一起被清掉，`__old__`
+    恢复副本与「不再重试」两条判据会同时失效。
+    """
+    return _data_dir() / _FAILED_MARK
 
 
 def _remove_path(path: Path) -> None:
@@ -1069,9 +1091,16 @@ def _handoff_pending_update() -> bool:
     if not is_frozen():
         return False
 
-    staging = _data_dir() / "update-staging"
+    # 上次换装失败过：交接只会在旧进程退出后重演同一次失败，用户看到的是
+    # 「点了更新、应用关掉、版本没变」。标记是安装状态，只在重新下载解出
+    # 新暂存包时解除（见 app/core/updater.py）。
+    if _swap_failed_flag().is_file():
+        _log_update("上次换装失败已回滚，跳过自动换装，按现装启动")
+        return False
+
+    staging = _data_dir() / STAGING_DIR_NAME
     payload = staging / APP_NAME
-    manifest = staging / "manifest.json"
+    manifest = staging / _MANIFEST_NAME
     if not manifest.is_file() or not payload.is_dir():
         return False
     try:
@@ -1205,7 +1234,7 @@ def _swap_payload(staging: Path, target: Path) -> bool:
 
     # ⑤ 清标记与暂存：manifest 先删（重启不再触发换装），暂存目录尽力清——
     #   本进程就跑在暂存目录里，自己的 exe/DLL 删不掉，残留由新程序启动时收尾
-    (staging / "manifest.json").unlink(missing_ok=True)
+    (staging / _MANIFEST_NAME).unlink(missing_ok=True)
     shutil.rmtree(staging, ignore_errors=True)
     _log_update(f"换装完成：{got} 个文件落位，上一版在 {old_dir}")
     return True
@@ -1225,10 +1254,20 @@ def _run_update_helper(staging: Path, target: Path, wait_pid: int | None) -> Non
     time.sleep(1.5)  # 进程退出 ≠ 文件锁立刻消失，留一点收尾余量
 
     if not _swap_payload(staging, target):
-        _alert(
-            "[更新] 换装失败，已回滚到原版本（程序目录未被破坏，可直接使用）。\n\n"
-            f"详情见 {_update_log()}；也可到发布页下载新版压缩包手动解压覆盖。"
-        )
+        _mark_swap_failed(target)
+        # 先把窗口还给用户，再弹窗：MessageBoxW 是模态阻塞调用，排在拉起之前
+        # 会让现装一直回不来——用户不点确定，应用就停在「点更新后消失」。
+        _relaunch_after_failed_swap(target)
+        threading.Thread(
+            target=_alert,
+            args=(
+                "[更新] 换装失败，已回滚到原版本并重新打开应用。\n\n"
+                "本次暂存包不会自动重试（下次启动会清理掉）；"
+                "可到发布页下载新版压缩包手动解压覆盖。\n"
+                f"详情见 {_update_log()}",
+            ),
+            daemon=True,
+        ).start()
         return
 
     try:
@@ -1241,6 +1280,52 @@ def _run_update_helper(staging: Path, target: Path, wait_pid: int | None) -> Non
         _log_update("新版本已拉起")
     except Exception as e:  # noqa: BLE001 —— 新程序已就位，手动双击即可
         _log_update(f"拉起新版本失败：{e}（新程序已就位，可手动启动）")
+
+
+def _mark_swap_failed(target: Path) -> None:
+    """登记换装失败的安装状态。
+
+    本进程正跑在暂存载荷里，删不掉自己的目录；作废暂存由下一次启动的现装进程
+    （`_cleanup_staging_leftover`）执行，这里只落标记。
+    """
+    try:
+        _swap_failed_flag().write_text(
+            f"换装失败已回滚 target={target}\n", encoding="utf-8"
+        )
+    except Exception as e:  # noqa: BLE001 —— 标记写不进去不阻断回滚后的正常启动
+        _log_update(f"写换装失败标记失败：{e}")
+
+
+def _relaunch_after_failed_swap(target: Path) -> None:
+    """回滚完成后拉起现装。
+
+    换装进程是脱前台的：本进程退出而旧进程已先退出，不拉起就没有任何窗口，
+    用户面对的是「点了更新应用消失」。主程序定位沿用暂存载荷的同一条规则
+    （优先同名 exe，其次根目录任一 exe），用户改过主程序名也能拉起。
+    """
+    exe = _staged_main_exe(target)
+    if exe is None:
+        _log_update("回滚后未在程序目录找到主程序，请按弹窗提示手动恢复")
+        return
+    try:
+        subprocess.Popen(
+            [str(exe)],
+            cwd=str(target),
+            close_fds=True,
+            creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
+        )
+        _log_update(f"回滚完成，已拉起现装 {exe.name}")
+    except Exception as e:  # noqa: BLE001 —— 程序目录已回滚，手动双击即可
+        _log_update(f"拉起现装失败：{e}（程序目录已回滚，可手动启动）")
+
+
+def _should_clean_old_dir(old_dir: Path) -> bool:
+    """`__old__` 清理判据：存在，且没有换装失败标记。
+
+    失败标记在场说明 `__old__` 里可能还压着回滚没搬回去的原件，那是手工恢复的
+    唯一退路；清掉它会让「回滚没救回来」变成不可逆。
+    """
+    return old_dir.exists() and not _swap_failed_flag().is_file()
 
 
 def _cleanup_old_dir_async(old_dir: Path) -> None:
@@ -1256,13 +1341,17 @@ def _cleanup_old_dir_async(old_dir: Path) -> None:
 
 
 def _cleanup_staging_leftover() -> None:
-    """清理已消费的暂存目录残留（换装进程自身跑在暂存目录里，退出前删不干净）。
+    """清理已消费或已作废的暂存目录（换装进程自身跑在暂存目录里，退出前删不干净）。
 
-    判据是「没有 manifest」：带 manifest 的暂存是待换装的正经包，不许动。
+    判据是「没有 manifest」或「换装失败标记在场」：带 manifest 且未失败的暂存
+    是待换装的正经包，不许动。失败包由本进程（现装，不在暂存目录内）在这里删掉，
+    否则它会一直占着几百兆，且 manifest 留着会让前端一直报「已下载待重启」。
     """
 
-    staging = _data_dir() / "update-staging"
-    if not staging.is_dir() or (staging / "manifest.json").is_file():
+    staging = _data_dir() / STAGING_DIR_NAME
+    if not staging.is_dir():
+        return
+    if (staging / _MANIFEST_NAME).is_file() and not _swap_failed_flag().is_file():
         return
     shutil.rmtree(staging, ignore_errors=True)
 
@@ -2275,7 +2364,7 @@ def main() -> None:
     # 换装残留清理：已消费的暂存目录（无 manifest）+ 上一版程序备份 __old__
     _cleanup_staging_leftover()
     _stale_old_dir = _app_root() / "__old__"
-    if _stale_old_dir.exists():
+    if _should_clean_old_dir(_stale_old_dir):
         _cleanup_old_dir_async(_stale_old_dir)
 
     # 启动期端口协商（已运行实例检测在前）：被占自动避让/唤醒分流

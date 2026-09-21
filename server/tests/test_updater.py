@@ -48,10 +48,50 @@ def _mock_client(handler):
         ("0.2.0", "0.2", False),    # 长度不齐补 0
         ("1.0.0", "0.99.99", True),
         ("v0.3.0", "0.2.5", True),  # v 前缀
+        ("0.1.0-beta.2", "0.1.0", False),  # 预发布段更旧于同号正式版
+        ("0.1.0", "0.1.0-beta.2", True),
+        ("1.0.0-rc.1", "1.0.0", False),
+        ("0.1.0-rc.1", "0.1.0-beta.9", True),  # 字母标识按字典序
+        ("0.1.0-beta.2", "0.1.0-beta.1", True),
+        ("0.1.0-alpha", "0.1.0-alpha.1", False),  # 同前缀标识少的更旧
+        ("0.2.0-beta.1", "0.1.0", True),  # 主段先于预发布段
+        ("0.1.0+build.5", "0.1.0", False),  # 构建元数据不参与比较
     ],
 )
 def test_version_gt(latest: str, current: str, expect: bool) -> None:
     assert updater._version_gt(latest, current) is expect
+
+
+@pytest.mark.asyncio
+async def test_new_staging_clears_handoff_marks(tmp_path: Path, monkeypatch) -> None:
+    """新解出的暂存包清掉上一包的交接标记：重下同一版本仍可自动换装。"""
+    payload = tmp_path / "fake-release.zip"
+    with zipfile.ZipFile(payload, "w") as zf:
+        zf.writestr("Holdexar/Holdexar.exe", "MZ-fake")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=payload.read_bytes())
+
+    staging = tmp_path / "staging"
+    staging.mkdir(parents=True)
+    (staging / updater.HANDOFF_UNSUPPORTED_MARK).write_text("stale", encoding="utf-8")
+    (staging.parent / updater.SWAP_FAILED_FLAG).write_text("stale", encoding="utf-8")
+
+    monkeypatch.setattr(updater.httpx, "AsyncClient", _mock_client(handler))
+    monkeypatch.setattr(updater, "staging_dir", lambda: staging)
+    monkeypatch.setattr(updater, "_MIN_PACKAGE_BYTES", 0)
+    monkeypatch.setattr(
+        "app.domains.proxies.clash_manager._download_attempts",
+        lambda *_a, **_k: [(None, "直连")],
+    )
+
+    await updater.download_update(
+        "v0.2.0", expected_sha256=None, asset_name="fake-release.zip"
+    )
+
+    assert not (staging / updater.HANDOFF_UNSUPPORTED_MARK).exists()
+    assert not (staging.parent / updater.SWAP_FAILED_FLAG).exists()
+    assert updater.pending_status()["pending"] is True
 
 
 @pytest.mark.asyncio
