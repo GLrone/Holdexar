@@ -435,8 +435,8 @@ function formatReviews(count: number): string {
 
 // ─── GPW 弹窗 ──
 
-/** 弹窗实测宽度（未挂载时按 CSS 声明兜底：列表 360 / 柱状图 480）。
- *  此前写死 320（CSS 早已是 360），右侧明明放得下也会误判翻到左边。 */
+/** 弹窗量得宽度（未挂载时按 CSS 声明兜底：列表 360 / 柱状图 480）。
+ *  写死 320 会误判：CSS 声明是 360，右侧明明放得下也会翻到左边。 */
 function popoverWidth(): number {
   return gpwPopoverRef.value?.offsetWidth || (activeTab.value === 'chart' ? 480 : 360)
 }

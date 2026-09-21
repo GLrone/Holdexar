@@ -53,6 +53,19 @@ async def _cleanup_probes():
         await session.execute(
             delete(WishlistItem).where(WishlistItem.appid.in_(_PROBE_IDS))
         )
+        # 落池会经 monitoring 域登记来源，探针的监控行一并清理
+        from app.domains.monitoring.models import (
+            MonitorExclusion,
+            MonitorSource,
+            MonitorTarget,
+        )
+
+        for model in (MonitorSource, MonitorExclusion, MonitorTarget):
+            await session.execute(
+                delete(model).where(
+                    model.target_type == "game", model.target_id.in_(_PROBE_IDS)
+                )
+            )
         await session.commit()
 
 

@@ -524,8 +524,8 @@ async def _fetch_shared_library(token: str, family_groupid: str) -> list[dict]:
     - owner_steamids：**按入库先后排序**（[0]=最早入库，at(-1)=最近入库=购买者）
     - presence_count：该 app 被多少成员拥有
     - exclude_reason：排除原因枚举，**0 = Included（可共享）**；字段恒存在，
-      判「被排除」必须比 0，不能用 `is not None`（那样会把 751 款可共享的
-      也标成已排除：实测 859 款分布为 0:751 / 3:73 / 1:29 / 10:6）
+      判「被排除」必须比 0，不能用 `is not None`（那样会把可共享的
+      也标成已排除）
     """
     resp = await _steam_get(
         SHARED_LIBRARY_URL,

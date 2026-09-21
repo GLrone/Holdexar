@@ -582,8 +582,8 @@ const excludedBySteamid = computed(() => {
           增长趋势隐藏块结束 -->
 
           <!-- 共享冷却（真实数据：被 Steam 排除出共享库的成员/游戏）——tab 暂时隐藏（语义待研究），代码保留待回归。
-               原最外层是 `<div v-if="activeTab === 'cool'" class="tabs__pane is-on">`，随 v-if 链一并去掉了；
-               回归时补回它（或把整块做成 cool 的 PANES 条目），下方 `</template>` 之后的收尾已对齐。
+               回归时补回最外层 `<div v-if="activeTab === 'cool'" class="tabs__pane is-on">`（或把整块做成 cool 的 PANES 条目），
+               下方 `</template>` 之后的收尾已对齐。
           <div v-if="libStore.error || (!libStore.ready && libStore.loading)" class="lib-empty-tab">
           {{ libStore.error || '家庭库数据拉取中…' }}
           </div>

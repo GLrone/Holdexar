@@ -1112,7 +1112,7 @@ html.dark {
    必须显式定义带 duration 的 transition：无 CSS 时 Vue 靠 rAF 双帧判断
    "无过渡立即完成"，rAF 停摆（窗口不可见）即死锁——router-view 永久挂空。
    opacity+transform 双通道：任一属性有实际变化即可触发 transitionend，
-   防止"0→0 无变化"类边缘死锁（2026-09-09 导览自动翻页高频触发暴露）。 */
+   防止"0→0 无变化"类边缘死锁（导览自动翻页高频触发即属此类）。 */
 .route-fade-enter-active,
 .route-fade-leave-active {
   transition:

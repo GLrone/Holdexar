@@ -21,3 +21,5 @@ class CrawlJob(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime)
     error: Mapped[str | None] = mapped_column(Text)
+    # 所属价格刷新周期（NULL = 不挂周期：手动任务、暂不归属的修复轮、历史任务）
+    cycle_id: Mapped[int | None] = mapped_column(Integer)

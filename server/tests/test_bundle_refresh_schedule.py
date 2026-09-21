@@ -1,10 +1,11 @@
 """捆绑包刷新随价格链测试（链尾段接线语义，不出网不触库）。
 
-规则：捆绑包抓取只有一个自动通道——价格刷新链（6h 锚点网格）的两层
-串行 missing → pool（全池，愿望单优先序排前）在 run_sequential 内逐个
-await 跑完后，紧跟 bundles.refresh_bundles() 全量刷包；发现的捆绑包
-（无价桩）就在全量表内，随同一批请求首抓。其他爬取运行不再触发
-捆绑包抓取，开关关闭时整条链（含链尾）都不跑。
+规则：捆绑包抓取只有一个自动通道——价格刷新链（6h 锚点网格）的三层
+串行 missing → pool（监控层，来源优先级排前）→ catalog（目录层，减去
+监控层）在 run_sequential 内逐个 await 跑完后，紧跟
+bundles.refresh_bundles() 全量刷包；发现的捆绑包（无价桩）就在全量表内，
+随同一批请求首抓。其他爬取运行不再触发捆绑包抓取，开关关闭时整条链
+（含链尾）都不跑。
 
 隔离：run_sequential / refresh_bundles / 重锚 / 总开关全部打桩，
 只验证接线、顺序、异常隔离与开关门禁。
@@ -41,6 +42,15 @@ def _stub_chain_env(monkeypatch, *, events, auto=True):
 
     monkeypatch.setattr(crawl_service, "run_sequential", _run_sequential)
 
+    # 价格周期记账打桩：本文件不触库，Cycle 有独立出口（create 返回 None =
+    # 本轮不挂 Cycle，抓取照常）
+    import app.domains.crawl.cycle as cycle_mod
+
+    async def _no_cycle(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(cycle_mod, "create", _no_cycle)
+
     async def _refresh_bundles():
         events.append("bundles")
         return {
@@ -69,7 +79,7 @@ async def test_bundle_refresh_follows_game_chain(monkeypatch, _idle):
 
     await sched_mod._job_price_refresh()
 
-    assert events == [("chain", ["missing", "pool"]), "bundles"]
+    assert events == [("chain", ["missing", "pool", "catalog"]), "bundles"]
     assert sched_mod._price_cycle_busy is False
 
 
@@ -86,7 +96,7 @@ async def test_bundle_refresh_failure_does_not_break_job(monkeypatch, _idle):
     monkeypatch.setattr(bundles_refresh, "refresh_bundles", _boom)
 
     await sched_mod._job_price_refresh()  # 不抛
-    assert events == [("chain", ["missing", "pool"]), "bundles"]
+    assert events == [("chain", ["missing", "pool", "catalog"]), "bundles"]
     assert sched_mod._price_cycle_busy is False
 
 

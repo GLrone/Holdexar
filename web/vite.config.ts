@@ -9,10 +9,9 @@ import { defineConfig, type Plugin } from 'vite'
 /**
  * 工作树防线——路由先于视图落地时构建不再整体失败。
  *
- * 背景：router 挂了路由但 views 文件未建时，vite 静态解析 import
- * 会直接炸掉构建——本插件把缺失视图顶替为占位页，范围仅限 views 目录。
+ * router 挂了路由但 views 文件未建时，vite 静态解析 import 会直接炸掉构建。
  * 本插件把 src/views/** 下缺失的 .vue 引用自动顶替为
- * src/views/_stub/Missing.vue「施工中」占位，并打印构建警告。
+ * src/views/_stub/Missing.vue「施工中」占位，并打印构建警告——范围仅限 views 目录。
  *
  * 边界：只顶替 views 目录的 .vue——其他位置的缺失引用（组件/工具笔误）
  * 照常报错，不被静默掩盖。提交层防线见 npm run check:routes

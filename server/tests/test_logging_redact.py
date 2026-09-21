@@ -1,8 +1,8 @@
 """日志脱敏测试：`redact()` 的值抹除，以及过滤器在 logger 层级中的生效位置。
 
-**为什么值得单独一个测试文件**：本项目的日志曾把 Steam Web API Key 逐分钟写进
-`data/logs/holdexar.log`（`httpx` 在 INFO 级打印完整请求 URL，而 key 在查询串里）。
-脱敏一旦失效不会报错、不会崩，只会静默地继续泄漏——只有测试能守住。
+脱敏失效不会报错、不会崩，只会静默地继续泄漏——只有测试能守住。
+（日志是凭据外泄的通道之一：`httpx` 在 INFO 级打印完整请求 URL，key 就在
+查询串里。）
 
 其中 `test_filter_applies_to_child_logger` 是一条针对**具体实现陷阱**的回归防线：
 `logging.Logger.callHandlers()` 只遍历各级 logger 的 **handler**，不调用祖先 logger

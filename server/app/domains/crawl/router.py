@@ -8,6 +8,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.core.events import bus
+from . import coverage as coverage_service
+from . import cycle as cycle_service
+from . import events as events_service
+from . import freshness as freshness_service
 from . import service
 
 router = APIRouter(tags=["crawl"])
@@ -69,6 +73,71 @@ async def jobs(limit: int = Query(20, ge=1, le=100)):
 async def active():
     job_id = service.active_job_id()
     return {"activeJobId": job_id}
+
+
+@router.get("/crawl/cycles")
+async def cycles(limit: int = Query(10, ge=1, le=50)):
+    """最近若干轮价格刷新（新→旧），每行带本轮归属的 job。
+
+    回答「这一轮是哪个 Cycle / 现在什么状态 / 包含哪些 Job / 是否进过
+    repair / 什么时候结束 / 什么终态」；`cycle_id` 为 NULL 的历史任务与
+    暂不归属的修复轮不在任何 Cycle 的 jobs 里。
+    """
+    return await cycle_service.list_cycles(limit)
+
+
+# 新鲜度查询一次最多问多少个对象：避免一条请求把全池拉进来
+FRESHNESS_MAX_APPIDS = 200
+
+
+@router.get("/crawl/cycles/{cycle_id}/coverage")
+async def cycle_coverage(cycle_id: int):
+    """本轮覆盖率：分母来自 Cycle 冻结的期望集（不重查当前监控池）。
+
+    `coverage` = 拿到可购买价格的比例；`coverageConfirmed` = Steam 明确给了
+    答复（含锁区）的比例。两者是 Cycle 的观测结果，不是独立生命周期。
+    """
+    result = await coverage_service.cycle_coverage(cycle_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="周期不存在")
+    return result
+
+
+@router.get("/crawl/freshness")
+async def freshness(appid: list[int] = Query(default=[])):
+    """价格数据新鲜度：每个对象的最后观察时刻与档位（fresh / lagging / stale）。
+
+    观察时间来源是 `game_current_prices.updated_at`；没有任何价格记录的对象
+    两者为 null。与覆盖率是两个维度，不合并成综合评分。
+    """
+    appids = list(dict.fromkeys(int(a) for a in appid))
+    if not appids:
+        raise HTTPException(status_code=400, detail="缺少 appid 参数")
+    if len(appids) > FRESHNESS_MAX_APPIDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"一次最多查询 {FRESHNESS_MAX_APPIDS} 个 appid",
+        )
+    return {"items": await freshness_service.appid_freshness(appids)}
+
+
+@router.get("/crawl/price-events")
+async def price_events(
+    cycle_id: int | None = None,
+    appid: int | None = None,
+    event_type: str | None = None,
+    limit: int = Query(50, ge=1, le=500),
+):
+    """最近的价格事实事件（新→旧）。
+
+    事实记录，只读：没有确认、删除或状态流转。`region` 为 null 表示该事件由
+    游戏级对象表达（促销免费 / 下架），不属于单一区域。
+    """
+    if event_type is not None and event_type not in events_service.EVENT_TYPES:
+        raise HTTPException(status_code=400, detail=f"未知事件类型: {event_type}")
+    return await events_service.list_events(
+        cycle_id=cycle_id, appid=appid, event_type=event_type, limit=limit
+    )
 
 
 @router.get("/events/stream")
