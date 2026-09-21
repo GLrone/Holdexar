@@ -179,6 +179,10 @@ def _split_windows(start: date, end: date) -> list[tuple[date, date]]:
     return windows
 
 
+# 语义可信度：同一 (币种, 日) 多行并存时取更可信的一条
+_KIND_RANK = {"carried": 1, "derived": 2, "observed": 3}
+
+
 def _kind_from_source(source: object) -> str:
     """语义列缺失时的回退推导：backfill 延续值 → carried，其余 → observed。
 
@@ -188,10 +192,25 @@ def _kind_from_source(source: object) -> str:
     return "carried" if str(source or "").lower() == "backfill" else "observed"
 
 
-async def _load_marks() -> dict[str, dict[date, str]]:
-    """每币种 `{rate_date: source_kind}`（只读白名单币种；rate_date 缺失行跳过）。
+def _stronger_kind(current: str, incoming: str) -> str:
+    """同一 (币种, 日) 多行的取胜语义：observed > derived > carried（同级保留当前）。"""
+    if _KIND_RANK.get(incoming, 0) > _KIND_RANK.get(current, 0):
+        return incoming
+    return current
 
-    `source_kind` 为空的行按 `source` 推导（见 `_kind_from_source`）。
+
+async def _load_marks() -> dict[str, dict[date, str]]:
+    """每币种 `{day: source_kind}`（只读白名单币种）。
+
+    读取兼容新旧两代行格式——旧版本实例写入的行不带 canonical 列
+    （`rate_date` / `source_kind` 均为空）：
+
+    - 日期：`rate_date` 有值即用它，否则从 `fetched_at` 取日期部分推导
+      （两者都为空的行放弃）；
+    - 语义：`source_kind` 有值即用它，否则按 `source` 推导（见
+      `_kind_from_source`）；
+    - 冲突：同一 (币种, 日) 可能同时存在 canonical 行与旧格式行，
+      取更可信的一条（见 `_stronger_kind`）。
     """
     from .service import ALLOWED_CURRENCIES
 
@@ -199,21 +218,23 @@ async def _load_marks() -> dict[str, dict[date, str]]:
         rows = (
             await session.execute(
                 text(
-                    "SELECT currency_code, rate_date, source_kind, source"
-                    " FROM fx_rate_history WHERE rate_date IS NOT NULL"
+                    "SELECT currency_code, rate_date, fetched_at, source_kind, source"
+                    " FROM fx_rate_history"
                 )
             )
         ).all()
     marks: dict[str, dict[date, str]] = {}
-    for code, rate_date, kind, source in rows:
+    for code, rate_date, fetched_at, kind, source in rows:
         code = str(code).upper()
         if code not in ALLOWED_CURRENCIES:
             continue
-        day = _as_date(rate_date)
+        day = _as_date(rate_date) or _as_date(fetched_at)
         if day is None:
             continue
-        marks.setdefault(code, {})[day] = (
-            str(kind).lower() if kind else _kind_from_source(source)
+        resolved = str(kind).lower() if kind else _kind_from_source(source)
+        bucket = marks.setdefault(code, {})
+        bucket[day] = (
+            resolved if day not in bucket else _stronger_kind(bucket[day], resolved)
         )
     return marks
 
