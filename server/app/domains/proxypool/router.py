@@ -14,7 +14,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from app.core.config import get_settings
 from app.core.database import get_session_factory
-from app.domains.proxypool import jobruns
+from app.domains.proxypool import events, jobruns
 
 router = APIRouter(prefix="/proxypool", tags=["proxypool"])
 
@@ -61,6 +61,18 @@ async def promote_subscription(subscription_id: int):
         except PromotionError as e:
             await session.rollback()
             raise HTTPException(status_code=409, detail=str(e)) from e
+    # 事件在业务事务提交之后写：只有真的落库了的晋升才留痕（幂等空转不写）
+    if result.promoted:
+        await events.record(
+            events.KIND_SUBSCRIPTION_PROMOTED,
+            f"订阅 {result.subscription_id} 晋升 ACTIVE："
+            f"应用快照 {str(result.snapshot_sha256 or '')[:10]}，对齐节点 {result.applied_nodes}",
+            payload={
+                "subscriptionId": result.subscription_id,
+                "snapshotSha256": result.snapshot_sha256,
+                "appliedNodes": result.applied_nodes,
+            },
+        )
     return {
         "subscriptionId": result.subscription_id,
         "promoted": result.promoted,
@@ -88,6 +100,18 @@ async def exit_subscription(subscription_id: int):
         except PromotionError as e:
             await session.rollback()
             raise HTTPException(status_code=409, detail=str(e)) from e
+    # 退出会移除该订阅的全部来源行，节点状态随合格集口径变化——必须留痕，
+    # 否则事后只能看到「一批节点变成 DEAD/STALE」而找不到原因
+    if result.exited:
+        await events.record(
+            events.KIND_SUBSCRIPTION_EXITED,
+            f"订阅 {result.subscription_id} 退出生产池：移除来源 {result.removed_sources} 行",
+            level=events.LEVEL_WARN,
+            payload={
+                "subscriptionId": result.subscription_id,
+                "removedSources": result.removed_sources,
+            },
+        )
     return {
         "subscriptionId": result.subscription_id,
         "exited": result.exited,

@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import yaml
 
 from app.domains.proxies.models import ProxySubscription
+from app.domains.proxypool import events
 from app.domains.proxypool.admission import is_admitted
 from app.domains.proxypool.pool import (
     build_pool, eligible_runtime_names, pool_path,
@@ -165,6 +166,15 @@ async def sync_subscriptions(
                 update(ProxySubscription)
                 .where(ProxySubscription.id == sub_id)
                 .values(last_fetch_at=now, last_fetch_status="FAILED", last_error=message)
+            )
+            # 事件与 FAILED 投影同事务：两者说的是同一件事，一起提交或一起回滚
+            await events.record(
+                events.KIND_SUBSCRIPTION_FAILED,
+                f"订阅 {sub_id} 同步失败：{message}",
+                level=events.LEVEL_WARN,
+                payload={"subscriptionId": sub_id},
+                session=session,
+                now=now,
             )
             failures[sub_id] = message
             continue
@@ -356,6 +366,22 @@ async def ensure_pool_runtime(
             observed_names=observed,
         )
         if not ledger.ok:
+            await events.record(
+                events.KIND_RECONCILE_REJECTED,
+                f"bootstrap 对账拒绝：缺 {sorted(ledger.missing)}",
+                level=events.LEVEL_ERROR,
+                payload={
+                    "phase": "bootstrap",
+                    "registryCount": len(ledger.registry_names),
+                    "poolCount": len(ledger.pool_names),
+                    "runtimeCount": len(ledger.runtime_names),
+                    "missingCount": len(ledger.missing),
+                    "unexpectedCount": len(ledger.unexpected),
+                    "observedTotal": ledger.observed_total,
+                },
+                session=session,
+                now=now,
+            )
             return BootstrapResult(
                 False, True, None, base, build.runtime_names,
                 f"对账失败：缺 {sorted(ledger.missing)}",
