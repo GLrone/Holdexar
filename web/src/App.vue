@@ -13,6 +13,7 @@ import { ratesApi, type WalletSnapshot } from '@/api/client'
 import { buildRateMap, formatWalletCny, walletToCny, type RateMap } from '@/lib/walletCny'
 import { APP_NAME } from '@/appInfo'
 import ProductTour from '@/components/ProductTour.vue'
+import PriceStatusPill from '@/components/business/PriceStatusPill.vue'
 import UpdateDialog from '@/components/business/UpdateDialog.vue'
 import UpdateEntry from '@/components/business/UpdateEntry.vue'
 import {
@@ -234,17 +235,6 @@ watchEffect(() => {
   document.title = pageTitle.value
 })
 
-const crawlLabel = computed(() =>
-  crawl.running
-    ? t('header.crawlRunning', {
-        done: crawl.done,
-        total: crawl.total,
-        ok: crawl.ok,
-        fail: crawl.fail,
-      })
-    : t('header.crawlIdle'),
-)
-
 /* ── Steam 账户（顶栏余额胶囊 + 头像）──
    胶囊默认显示**主账号**余额；点击弹层展示全部绑定账号各自的余额，
    再点击关闭。未绑定时胶囊引导去「我」页。 */
@@ -347,17 +337,8 @@ async function manualRefreshWallet() {
         <h1 class="app-header__title">{{ pageTitle }}</h1>
 
         <div class="app-header__pills">
-          <!-- SSE 驱动：爬取状态胶囊 -->
-          <div
-            class="header-pill"
-            :title="t('header.crawlTip', { speed: crawl.speed, qsize: crawl.qsize })"
-          >
-            <HlIcon name="refresh" />
-            <span>{{ t('header.crawl') }}</span>
-            <span :style="{ color: crawl.running ? 'var(--accent)' : 'var(--success)' }">
-              {{ crawlLabel }}
-            </span>
-          </div>
+          <!-- 价格更新状态胶囊：只表达产品结论——内部 job / 队列 / 速度不进这里 -->
+          <PriceStatusPill />
 
           <!-- 更新提示胶囊：发现新版 / 下载中 / 待重启时才出现，悬停看更新内容、
                点击打开更新报告窗口（下载中改显百分比，弹窗关掉也看得见进度） -->
