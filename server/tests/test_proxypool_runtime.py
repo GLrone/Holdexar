@@ -33,9 +33,13 @@ from app.domains.proxypool.models import (  # noqa: E402
 from app.domains.proxypool.pool import build_pool, pool_path  # noqa: E402
 from app.domains.proxypool.runtime import (  # noqa: E402
     RuntimeUnreachableError,
+    align_lanes,
+    lane_proxy_urls,
+    mixed_port_of,
     prepare_runtime_config,
     reconcile,
     runtime_config_path,
+    wait_lane_ports,
     wait_proxy_names,
 )
 from app.domains.proxypool.state import (  # noqa: E402
@@ -324,3 +328,53 @@ async def test_runtime_config_carries_runtime_only_keys(
                 break
         time.sleep(0.25)
     assert listening, f"内核没有监听运行配置里的 mixed-port {port}"
+
+
+# ── 多入口（lane）：一个内核进程内开 N 个可独立选路的 listener ──────
+@pytest.mark.asyncio
+async def test_kernel_opens_one_listener_per_lane_and_selects_independently(
+    tmp_data_dir, kernel_exe_path, clash_runtime
+) -> None:
+    """真内核验收：每条 lane 一个入口，逐条设置选择互不影响，GLOBAL 入口并存。
+
+    这条覆盖的是「一个内核 = 多个受控出口工位」的结构本身：入口是否真的开出来
+    （`wait_lane_ports`）、lane 组是否可被控制器逐条选路并回读（`assign_lanes`）、
+    lane 组是否被对账正确识别为运行期条目（不是池外多余节点）。
+    """
+    await init_db()
+    names = []
+    for i in range(3):
+        runtime_name = f"1|n{i}.example.net"
+        names.append(runtime_name)
+        await _add(NODE_ACTIVE, runtime_name, server=f"n{i}.example.net")
+
+    build = await _build(tmp_data_dir)
+    assert list(build.runtime_names) == names
+
+    status = clash_runtime.start(str(kernel_exe_path), str(prepare_runtime_config(tmp_data_dir)))
+    base = status["controllerUrl"]
+    await wait_proxy_names(base, clash_runtime.secret, timeout=15)
+
+    ports = await wait_lane_ports(tmp_data_dir, timeout=15)
+    assert len(ports) == 3, "一个节点一条 lane"
+    assert lane_proxy_urls(tmp_data_dir) == [f"http://127.0.0.1:{p}" for p in ports]
+
+    # 走生产入口（align_lanes）：首启没有上次绑定，也必须把每条 lane 都绑上不同节点
+    aligned_ports, applied = await align_lanes(
+        data_dir=tmp_data_dir, controller_url=base, secret=clash_runtime.secret,
+        pool_names=build.runtime_names, previous=(),
+    )
+    assert tuple(aligned_ports) == ports
+    assert applied == names, "首启即须逐条绑定；留空会让所有 lane 走组内默认项"
+    assert len(set(applied)) == 3, "同一节点不得占两条 lane"
+
+    observed = await wait_proxy_names(base, clash_runtime.secret, timeout=15)
+    ledger = reconcile(
+        registry_names=set(build.runtime_names),
+        pool_names=set(build.runtime_names),
+        observed_names=observed,
+    )
+    assert ledger.ok, f"lane 组不该被当成池外节点：多 {sorted(ledger.unexpected)}"
+    assert "lane-0" in observed and "lane-2" in observed
+
+    assert mixed_port_of(tmp_data_dir) > 0, "GLOBAL 入口仍并存，维护路径不受影响"

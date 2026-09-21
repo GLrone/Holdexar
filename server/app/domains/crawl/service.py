@@ -535,19 +535,23 @@ async def start_job(
     worker_count = await get_value("crawl.workers", DEFAULT_WORKER_COUNT) or DEFAULT_WORKER_COUNT
     small_lane = kind in ("missing", "repair", "backfill")
 
-    # 受管爬取：**每次 run 只取一次**当前 Runtime 代理地址，整个 run 固定用它
-    # （P1.5 实测重建会换端口并打断在途请求，所以 run 内不换）。拿不到就拒绝启动——
+    # 受管爬取：**每次 run 只取一次**当前 Runtime 的入口集合，整个 run 固定用它
+    # （重建会换端口并打断在途请求，所以 run 内不换）。拿不到就拒绝启动——
     # 绝不静默退回直连或旧订阅代理（那会把"池坏了"伪装成"爬取成功"）。
+    #
+    # 多入口形态下每个 worker 固定绑一条 lane（`CrawlRunConfig.proxy_urls`）；
+    # `proxy_url` 取第一条，供不走 worker 的请求（元数据预取等）使用同一个池出口。
     from app.core.config import get_settings as _get_settings
-    from app.domains.proxypool.runtime import require_runtime_proxy_url
+    from app.domains.proxypool.runtime import require_lane_proxy_urls
 
-    proxy_url = require_runtime_proxy_url(_get_settings().data_dir)
+    proxy_urls = require_lane_proxy_urls(_get_settings().data_dir)
 
     config = CrawlRunConfig(
         regions=effective,
         workers=min(worker_count, MISSING_RECOVERY_WORKERS) if small_lane else worker_count,
         timeout=HTTP_TIMEOUT,
-        proxy_url=proxy_url,
+        proxy_url=proxy_urls[0],
+        proxy_urls=proxy_urls,
     )
     async with get_session_factory()() as session:
         job = CrawlJob(

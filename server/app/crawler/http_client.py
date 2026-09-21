@@ -87,16 +87,50 @@ class Global429CircuitBreaker:
 global_429_breaker = Global429CircuitBreaker()
 
 
-class SteamHttpClient:
-    """带拦截器和重试机制的 HTTP 客户端。"""
+class LaneBreakers:
+    """多入口（lane）形态下的熔断账本：**每条 lane 各一个熔断器**。
 
-    def __init__(self, timeout: int = 12, max_retries: int = 4, proxy_url: str | None = None):
+    单入口形态下任意 worker 收到真 429 会闸住整轮作业；多入口下应只闸住出问题的那条
+    lane（那个出口被上游风控），其余 lane 继续工作。按 lane 序号取用，lane 数为 0 时
+    退回进程级单例，单入口行为保持不变。
+    """
+
+    def __init__(self, lane_count: int) -> None:
+        self._breakers = [Global429CircuitBreaker() for _ in range(max(0, int(lane_count)))]
+
+    def for_lane(self, index: int) -> Global429CircuitBreaker:
+        if not self._breakers:
+            return global_429_breaker
+        return self._breakers[index % len(self._breakers)]
+
+    @property
+    def lane_count(self) -> int:
+        return len(self._breakers)
+
+
+class SteamHttpClient:
+    """带拦截器和重试机制的 HTTP 客户端。
+
+    `rate_limiter` / `breaker` 是**按入口注入**的：多入口运行时每个 worker 拿自己那条
+    lane 的预算与熔断器，互不影响；不传则用进程级单例（单入口行为）。
+    """
+
+    def __init__(
+        self,
+        timeout: int = 12,
+        max_retries: int = 4,
+        proxy_url: str | None = None,
+        rate_limiter=None,
+        breaker: Global429CircuitBreaker | None = None,
+    ):
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.max_retries = max_retries
         # 直连为标准形态（browse 接口按 country_code 返回各区数据，出口 IP
         # 不参与判定；加速器在系统网络层透明生效，无需应用侧代理）。
         # proxy_url 仅供调试通道显式指定（CLI --proxy / 环境变量）。
         self.proxy_url = proxy_url
+        self.rate_limiter = rate_limiter
+        self.breaker = breaker
         self._ua_index = random.randrange(len(_USER_AGENTS))
 
     def _get_headers(self, appid=None) -> dict[str, str]:
@@ -117,8 +151,8 @@ class SteamHttpClient:
     ):
         """GET 并解析 JSON。内置拦截：
 
-        1. 全局限流 → 200 发/5 分钟窗口内匀速发出（超出即等名额）
-        2. 全局 429 熔断 → 所有请求阻塞等待冷却
+        1. 限流 → 本入口的窗口预算内匀速发出（超出即等名额）；未注入时用进程级单例
+        2. 429 熔断 → 本入口的熔断器冷却期内阻塞等待；未注入时用进程级单例
         3. 真 429 → 指数退避重试（3s, 6s, 12s, 24s）
         4. 幻觉 429 → 状态码 429 但 body 含有效 JSON → 直接清洗返回
         5. 网络超时/错误 → 重试（直连为主，代理通道仅用户显式配置时启用）
@@ -128,9 +162,12 @@ class SteamHttpClient:
         from .network_check import network_checker
         from .rate_limit import steam_rate_limiter
 
+        rate_limiter = self.rate_limiter if self.rate_limiter is not None else steam_rate_limiter
+        breaker = self.breaker if self.breaker is not None else global_429_breaker
+
         for attempt in range(self.max_retries):
-            await steam_rate_limiter.acquire()
-            await global_429_breaker.wait_if_tripped()
+            await rate_limiter.acquire()
+            await breaker.wait_if_tripped()
 
             try:
                 async with session.get(
@@ -144,7 +181,7 @@ class SteamHttpClient:
                     if response.status == 200:
                         try:
                             data = await response.json()
-                            await global_429_breaker.reset()
+                            await breaker.reset()
                             return data
                         except aiohttp.ContentTypeError:
                             # 200 但返回了 HTML 错误页
@@ -173,17 +210,17 @@ class SteamHttpClient:
                                     phantom_app = phantom_data[str(appid)]
                                     if (phantom_app.get("success")
                                             and isinstance(phantom_app.get("data"), dict)):
-                                        await global_429_breaker.reset()
+                                        await breaker.reset()
                                         return phantom_data
                                 elif not appid and isinstance(phantom_data.get("data"), dict):
-                                    await global_429_breaker.reset()
+                                    await breaker.reset()
                                     return phantom_data
                         except Exception:
                             pass
 
-                        # 真 429 → 触发全局熔断（限流是主闸，熔断兜底：
-                        # 上游代理/共享出口的偶发风控仍可能回 429）
-                        await global_429_breaker.trip(
+                        # 真 429 → 触发本入口的熔断（限流是主闸，熔断兜底：
+                        # 上游代理或该出口的偶发风控仍可能回 429）
+                        await breaker.trip(
                             status_code=response.status,
                             response_body=body_text_429 or "<无法读取响应体>",
                             url=str(response.url),

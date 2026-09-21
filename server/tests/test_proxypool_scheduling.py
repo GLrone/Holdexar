@@ -534,18 +534,20 @@ async def test_cycle_when_idle_rebuilds_then_maintains(
 async def test_crawl_service_injects_current_runtime_per_run(
     tmp_data_dir, kernel_exe_path, proxy_runtime, monkeypatch
 ) -> None:
-    """run A 全程用端口 X；重建后 run B 用端口 Y——**不是** worker 各自取。"""
+    """run A 全程用一组 lane 端口；重建后 run B 用新的一组——**不是** worker 各自取。"""
     from app.domains.crawl import service as cs
+    from app.domains.proxypool.runtime import lane_proxy_urls
 
     await init_db()
     await _add("1|A", port=_free_port())
     base, secret = await _boot(proxy_runtime, kernel_exe_path, tmp_data_dir)
-    port_x = proxy_runtime.port
+    lanes_x = lane_proxy_urls(tmp_data_dir)
+    assert lanes_x, "多入口形态下 bootstrap 必须把 lane 入口开出来"
 
-    captured: list[str | None] = []
+    captured: list[list[str] | None] = []
 
     async def _stub_run_crawl(pairs, *, config, stop_event=None, pre_tasks=None):
-        captured.append(config.proxy_url)
+        captured.append(config.proxy_urls)
         return {"total": 1, "processed": 1, "success": 1, "failed": 0}
 
     async def _regions(regions=None):
@@ -556,7 +558,7 @@ async def test_crawl_service_injects_current_runtime_per_run(
 
     await cs.start_job(scope="appids", appids=[220], regions=["us"], kind="manual")
     await cs._active.task
-    assert captured[-1] == f"http://127.0.0.1:{port_x}"
+    assert captured[-1] == lanes_x, "一个 run 只取一次入口集合，整个 run 固定用它"
 
     async with get_session_factory()() as s:
         await rebuild_runtime(
@@ -564,13 +566,13 @@ async def test_crawl_service_injects_current_runtime_per_run(
             runtime=proxy_runtime, exe_path=str(kernel_exe_path),
         )
         await s.commit()
-    port_y = proxy_runtime.port
-    assert port_y != port_x
+    lanes_y = lane_proxy_urls(tmp_data_dir)
+    assert lanes_y and set(lanes_y) != set(lanes_x), "重建换掉整套 lane 端口"
 
     await cs.start_job(scope="appids", appids=[220], regions=["us"], kind="manual")
     await cs._active.task
-    assert captured[-1] == f"http://127.0.0.1:{port_y}", "新 run 必须用新端口"
-    assert len(set(captured)) == 2
+    assert captured[-1] == lanes_y, "新 run 必须用新的入口集合"
+    assert len({tuple(x or []) for x in captured}) == 2
 
 
 # ── 15/16. bundles 注入 + 两条路径 fail closed ───────────────────

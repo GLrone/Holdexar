@@ -60,12 +60,23 @@ class RuntimeUnavailableError(RuntimeError):
 RUNTIME_CONFIG_FILENAME = "crawl-runtime.yaml"
 
 # 运行期专属键（只进运行配置，绝不回流进池文件）
-RUNTIME_MODE = "global"          # L1 靠 GLOBAL 选择器切节点，不需要 proxy-groups
+RUNTIME_MODE = "global"          # GLOBAL 是维护入口；生产流量走 lane，不经过它
 RUNTIME_BIND_ADDRESS = "127.0.0.1"  # 默认是 '*'：测出口 IP 不该把本机入口开给局域网
 RUNTIME_CONTROLLER_HOST = "127.0.0.1"
 # 池 Runtime 自己的 controller 凭据（本机回环专用）。刻意**不随每次重建轮换**：
 # 轮换只会制造"拿旧凭据访问新实例"的陷阱，而 controller 的隔离靠端口就够。
 RUNTIME_CONTROLLER_SECRET = "holdexar-proxypool"
+
+# ── lane：一个内核进程内互不干扰的固定出口工位 ──────────────────
+# 结构 = 一个 `select` 组（成员是池内全部节点）+ 一个 mixed listener，listener 的
+# `proxy` 指向该组。组的当前选择由控制器逐条设置，因此切一条 lane 不改变其它 lane。
+#
+# GLOBAL 与 lane 的分工：GLOBAL 是维护入口（健康检查、人工查看、旧消费者），
+# lane 是生产入口。crawler 只拿 lane 地址，不碰任何选择器。
+LANE_GROUP_PREFIX = "lane-"
+# lane 数的上限：每条 lane 在内核里对应一个 listener 与一个组，数量随池规模走而不是
+# 固定值——出口多于上限时超额出口不占用工位（并发天花板由出口数与目标站共同决定）。
+MAX_LANES = 32
 
 
 class RuntimeConfigError(RuntimeError):
@@ -89,7 +100,7 @@ def _free_local_port() -> int:
 
 
 def mixed_port_of(data_dir: Path) -> int:
-    """读运行配置里的 mixed-port——L1 要经它发真实请求。"""
+    """读运行配置里的 mixed-port——GLOBAL 入口，维护路径经它发真实请求。"""
     path = runtime_config_path(data_dir)
     doc = yaml.safe_load(path.read_text(encoding="utf-8"))
     port = doc.get("mixed-port") if isinstance(doc, Mapping) else None
@@ -98,12 +109,105 @@ def mixed_port_of(data_dir: Path) -> int:
     return port
 
 
-def prepare_runtime_config(data_dir: Path) -> Path:
+def runtime_lane_ports(data_dir: Path) -> tuple[int, ...]:
+    """读运行配置里各 lane 的 listener 端口（按 lane 序号）。
+
+    端口读的是**配置**，不代表在监听——就绪判定见 `lane_proxy_urls`。
+    """
+    path = runtime_config_path(data_dir)
+    try:
+        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return ()
+    listeners = doc.get("listeners") if isinstance(doc, Mapping) else None
+    if not isinstance(listeners, list):
+        return ()
+    by_index: dict[int, int] = {}
+    for entry in listeners:
+        if not isinstance(entry, Mapping):
+            continue
+        name = str(entry.get("name") or "")
+        port = entry.get("port")
+        if not name.startswith(LANE_GROUP_PREFIX) or not isinstance(port, int) or port <= 0:
+            continue
+        tail = name[len(LANE_GROUP_PREFIX):].split("-", 1)[0]
+        if tail.isdigit():
+            by_index[int(tail)] = port
+    return tuple(by_index[i] for i in sorted(by_index))
+
+
+def _port_listening(port: int, timeout: float = 0.3) -> bool:
+    with socket.socket() as sock:
+        sock.settimeout(timeout)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def lane_proxy_urls(data_dir: Path) -> list[str]:
+    """生产入口：每条 lane 一个本机代理地址（按 lane 序号）。
+
+    **要么全给，要么不给**：worker 与 lane 的绑定按序号，部分就绪时把地址交出去会让
+    绑定整体错位（worker-3 落到另一条 lane 上），因此只要有任一 lane 入口没在听就返回
+    空列表，由调用方按「Runtime 不可用」处理（fail closed）。
+    """
+    ports = runtime_lane_ports(data_dir)
+    if not ports:
+        return []
+    for port in ports:
+        if not _port_listening(port):
+            return []
+    return [f"http://127.0.0.1:{port}" for port in ports]
+
+
+async def wait_lane_ports(
+    data_dir: Path, *, timeout: float = DEFAULT_WAIT_TIMEOUT
+) -> tuple[int, ...]:
+    """等到**全部** lane 入口都在监听，返回端口元组。
+
+    与 `wait_mixed_port` 同一理由（控制器就绪 ≠ 入口就绪），只是入口从一个变多个：
+    入口没起就把 URL 交给 crawler，每个 worker 都会立刻 `ConnectError`。
+    """
+    ports = runtime_lane_ports(data_dir)
+    if not ports:
+        raise RuntimeConfigError(f"运行配置里没有任何 lane listener：{runtime_config_path(data_dir)}")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if all(_port_listening(port) for port in ports):
+            return ports
+        await asyncio.sleep(0.05)
+    raise RuntimeUnreachableError(
+        f"lane 入口 {ports} 在 {timeout}s 内没有全部开始监听（控制器起来了但入口没起）"
+    )
+
+
+def lane_group_name(index: int) -> str:
+    return f"{LANE_GROUP_PREFIX}{index}"
+
+
+def is_lane_group(name: str) -> bool:
+    """名字是否为运行配置生成的 lane 组（`lane-<序号>`）。"""
+    if not name.startswith(LANE_GROUP_PREFIX):
+        return False
+    tail = name[len(LANE_GROUP_PREFIX):]
+    return tail.isdigit()
+
+
+def lane_count_for(pool_size: int, requested: int | None = None) -> int:
+    """由池规模决定开几条 lane：一个节点最多占一条工位，上限 `MAX_LANES`。
+
+    池为空返回 0——此时连 GLOBAL 入口都不该被当作可用出口（无节点必然回落 DIRECT）。
+    """
+    if pool_size <= 0:
+        return 0
+    n = pool_size if requested is None else requested
+    return max(0, min(MAX_LANES, pool_size, int(n)))
+
+
+def prepare_runtime_config(data_dir: Path, *, lanes: int | None = None) -> Path:
     """由 `crawl-pool.yaml` 生成 `crawl-runtime.yaml`——内核实际启动用的文件。
 
     为什么必须分文件：`ClashRuntime.start()` 会把 `external-controller` / `secret`
     **写回它收到的那个文件**。若直接启动池文件，池就不再等于 `build_pool` 校验过的
-    产物，而且下一次 `build_pool` 一覆盖就把控制器注入抹掉——而 P1.4 的健康检测
+    产物，而且下一次 `build_pool` 一覆盖就把控制器注入抹掉——而健康检测
     正依赖控制器，这个矛盾不能带进健康模块。
 
     职责：
@@ -111,15 +215,38 @@ def prepare_runtime_config(data_dir: Path) -> Path:
     - `crawl-runtime.yaml` = 临时、可重建的内核启动配置（控制器等运行期键由
       `ClashRuntime.start()` 注入到这里）。
 
-    池里的 `proxies` 之外，再写运行期专属键：`mode: global`（L1 靠 GLOBAL 切节点，
-    不需要 proxy-groups）、`allow-lan: false` + `bind-address: 127.0.0.1`（默认是 `*`，
-    测出口 IP 不该把本机代理入口开给局域网）、`mixed-port: <动态空闲端口>`。
+    池里的 `proxies` 之外，再写运行期专属键：
+    - `proxy-groups` + `listeners`：每条 lane 一个 `select` 组（成员 = 池内全部节点，
+      当前选择由控制器设置）+ 一个 mixed listener，listener 的 `proxy` 指向该组。
+      入口流量因此固定走指定组，与 GLOBAL 无关；
+    - `mode: global`：GLOBAL 仍是维护入口（健康检查按它逐节点探测）；
+    - `allow-lan: false` + `bind-address: 127.0.0.1`（默认是 `*`，测出口 IP 不该把
+      本机代理入口开给局域网）；
+    - `mixed-port: <动态空闲端口>`：GLOBAL 入口。
+
     这些键**只**进运行配置，绝不回流进池文件。
     """
     pool = pool_path(data_dir)
     doc = yaml.safe_load(pool.read_text(encoding="utf-8"))
     if not isinstance(doc, Mapping) or not isinstance(doc.get("proxies"), list):
         raise PoolBuildError(f"池文件形态不对，无法生成运行配置：{pool}")
+
+    names = [str(entry["name"]) for entry in doc["proxies"]]
+    n_lanes = lane_count_for(len(names), lanes)
+    groups = [
+        {"name": f"{LANE_GROUP_PREFIX}{i}", "type": "select", "proxies": list(names)}
+        for i in range(n_lanes)
+    ]
+    listeners = [
+        {
+            "name": f"{LANE_GROUP_PREFIX}{i}-in",
+            "type": "mixed",
+            "port": _free_local_port(),
+            "listen": RUNTIME_BIND_ADDRESS,
+            "proxy": f"{LANE_GROUP_PREFIX}{i}",
+        }
+        for i in range(n_lanes)
+    ]
 
     out = runtime_config_path(data_dir)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -135,6 +262,8 @@ def prepare_runtime_config(data_dir: Path) -> Path:
             "secret": RUNTIME_CONTROLLER_SECRET,
             "mixed-port": _free_local_port(),
             "proxies": list(doc["proxies"]),
+            "proxy-groups": groups,
+            "listeners": listeners,
         },
         allow_unicode=True,
         sort_keys=False,
@@ -228,6 +357,9 @@ def reconcile(
 
     只比数量是不够的：改名、错位、去重都能让数量对上而集合不同，而名字是池与
     内核之间唯一的对账钥匙。
+
+    内核可见集里除了内置逻辑节点，还有**运行配置自己生成的 lane 组**——它们是运行
+    期条目而不是"池外多出来的节点"，因此同样不参与 `unexpected` 判定。
     """
     registry = frozenset(registry_names)
     pool = frozenset(pool_names)
@@ -235,7 +367,7 @@ def reconcile(
 
     runtime_names = observed & pool
     missing = pool - observed
-    unexpected = observed - pool - BUILTIN_PROXY_NAMES
+    unexpected = observed - pool - BUILTIN_PROXY_NAMES - {n for n in observed if is_lane_group(n)}
 
     return RuntimeReconcile(
         registry_names=registry,
@@ -249,10 +381,13 @@ def reconcile(
 
 
 # ══ 池重建 + Runtime 选择恢复 ═════════════════════════════════════
-# `GLOBAL` 的选择权属于 Runtime，**不属于 crawler**：crawler 有 worker 池，而 `GLOBAL`
-# 是一个全局共享选择器——多个 worker 各自"请求前确保 GLOBAL 正确"会互相踩，直接破坏
-# L1/L2 已经建立的节点归因模型。所以由这里在一次重建后把选择恢复回去；crawler 只拿
-# "当前运行时代理 URL"，不理解选择、重启、重建与端口变化。
+# 选择器（`GLOBAL` 与各 lane 组）的选择权属于 Runtime，**不属于 crawler**：crawler 有
+# worker 池，而选择器是共享状态——多个 worker 各自"请求前确保选择正确"会互相踩。
+# 所以由这里在一次重建后把选择恢复回去；crawler 只拿"当前运行时代理地址"，
+# 不理解选择、重启、重建与端口变化。
+#
+# GLOBAL 与 lane 的差别在于**共享范围**：GLOBAL 全局共享，lane 组各自独立。
+# 因此生产流量走 lane（互不干扰），GLOBAL 留给维护路径。
 
 DEFAULT_SELECT_TIMEOUT = 10.0
 
@@ -270,7 +405,7 @@ class _KernelRuntime(Protocol):
 
 @dataclass(frozen=True)
 class RebuildResult:
-    proxy_url: str          # 给 crawler 用的"当前运行时代理 URL"
+    proxy_url: str          # GLOBAL 入口（维护路径与单入口消费者用）
     mixed_port: int
     controller_url: str
     pool_names: tuple[str, ...]
@@ -278,6 +413,8 @@ class RebuildResult:
     selection: str | None    # 恢复后的 GLOBAL
     expected_count: int
     written_count: int
+    lane_urls: tuple[str, ...] = ()       # 生产入口：每条 lane 一个本机地址
+    lane_nodes: tuple[str, ...] = ()      # 各 lane 绑定到的节点（按 lane 序号）
 
 
 def restore_selection(previous: str | None, available: Sequence[str]) -> str | None:
@@ -321,6 +458,108 @@ async def apply_global_selection(
     return await _put_global(controller_url, secret, name, timeout=timeout)
 
 
+def plan_lane_assignment(
+    previous: Sequence[str | None], available: Sequence[str], *, lanes: int
+) -> list[str | None]:
+    """分配每条 lane 绑定的节点：**同一节点不占两条 lane**，输出长度恒为 `lanes`。
+
+    `lanes` 必须显式给：它的事实源是运行配置里的 listener 条数，不是上一次的绑定
+    列表——首次启动时上次绑定为空，若按它定长度就会一条都不分配，各 lane 全留在
+    组内默认项上（所有 lane 走同一个节点，"多入口"静默退化成单出口）。
+
+    规则：
+    1. 上次绑定的节点仍在可用集里 → 原样保留（重建不该无故改动生产出口）；
+    2. 其余 lane 按可用集顺序补位，跳过已被占用的节点；
+    3. 可用节点不够 → 尾部 lane 记 `None`（**不重复绑同一节点**：两条 lane 绑同一
+       出口等于把并发重新压回一个 IP，正是 lane 要解决的问题）；
+    4. 可用节点多于 lane → 多余节点不占工位。
+
+    纯函数，不碰网络与文件，便于单独验证。
+    """
+    count = max(0, int(lanes))
+    used: set[str] = set()
+    plan: list[str | None] = []
+    for i in range(count):
+        node = previous[i] if i < len(previous) else None
+        if node and node in available and node not in used:
+            used.add(node)
+            plan.append(node)
+        else:
+            plan.append(None)
+    spare = [name for name in available if name not in used]
+    cursor = 0
+    for i, node in enumerate(plan):
+        if node is None and cursor < len(spare):
+            plan[i] = spare[cursor]
+            cursor += 1
+    return plan
+
+
+async def current_lane_selections(
+    controller_url: str, secret: str, count: int, *,
+    timeout: float = DEFAULT_SELECT_TIMEOUT,
+) -> list[str | None]:
+    """读各 lane 组当前的选择（按 lane 序号）。读不到记 `None`。"""
+    out: list[str | None] = []
+    try:
+        async with httpx.AsyncClient(timeout=timeout, headers=_headers(secret)) as client:
+            for i in range(count):
+                try:
+                    resp = await client.get(f"{controller_url}/proxies/{LANE_GROUP_PREFIX}{i}")
+                    out.append(resp.json().get("now"))
+                except Exception:  # noqa: BLE001 —— 单条读不到不影响其它 lane
+                    out.append(None)
+    except Exception:  # noqa: BLE001 —— 控制器不可达：当作"没有已知绑定"
+        return [None] * count
+    return out
+
+
+async def assign_lanes(
+    controller_url: str, secret: str, selections: Sequence[str | None], *,
+    timeout: float = DEFAULT_SELECT_TIMEOUT,
+) -> list[str | None]:
+    """逐条设置 lane 组的当前节点并回读确认，返回实际生效值。
+
+    回读不一致即抛 `RuntimeRebuildError`：lane 的选择没建立起来，该条 lane 的流量会
+    落到组内默认项（而不是被分配的节点），出口归因随之失真。
+    """
+    applied: list[str | None] = []
+    async with httpx.AsyncClient(timeout=timeout, headers=_headers(secret)) as client:
+        for i, node in enumerate(selections):
+            group = f"{LANE_GROUP_PREFIX}{i}"
+            if node is None:
+                applied.append(None)
+                continue
+            await client.put(f"{controller_url}/proxies/{group}", json={"name": node})
+            now = (await client.get(f"{controller_url}/proxies/{group}")).json().get("now")
+            if now != node:
+                raise RuntimeRebuildError(
+                    f"lane {i} 选择未成立：now={now!r}，期望 {node!r}"
+                )
+            applied.append(now)
+    return applied
+
+
+async def align_lanes(
+    *, data_dir: Path, controller_url: str, secret: str,
+    pool_names: Sequence[str], previous: Sequence[str | None] = (),
+    timeout: float = DEFAULT_WAIT_TIMEOUT,
+) -> tuple[tuple[int, ...], list[str | None]]:
+    """启动内核之后必须做的一件事：**等 lane 入口就绪并把绑定建立起来**。
+
+    内核起来时各 lane 组的默认选择是组内第一项——不建立绑定的后果是所有 lane 走
+    同一个节点，"多入口"退化成单出口而系统照样自称 ready。因此这一步与
+    `wait_mixed_port` 同级：不完成就不算 Runtime 可用。
+    """
+    lane_ports = runtime_lane_ports(data_dir)
+    if not lane_ports:
+        return (), []
+    ports = await wait_lane_ports(data_dir, timeout=timeout)
+    plan = plan_lane_assignment(previous, pool_names, lanes=len(ports))
+    applied = await assign_lanes(controller_url, secret, plan)
+    return ports, applied
+
+
 def controller_endpoint_of(data_dir: Path) -> tuple[str, str]:
     """读运行配置里**自带的** controller：返回 `(base_url, secret)`。
 
@@ -348,8 +587,9 @@ async def rebuild_runtime(
 
     顺序本身是契约的一部分：
 
-        capture previous GLOBAL → build_pool → prepare_runtime_config
-        → **显式 stop** → start → wait + reconcile → restore GLOBAL
+        capture previous GLOBAL / lane 绑定 → build_pool → prepare_runtime_config
+        → **显式 stop** → start → wait（控制器 / 入口 / lane 入口）+ reconcile
+        → restore GLOBAL → 重绑 lane
 
     `start()` 对已在跑的内核**不会重启**（除非传 `restart_if_changed`），所以 `stop()`
     不能省——否则会出现"配置文件里是新端口、实际跑的还是旧内核"。
@@ -358,6 +598,12 @@ async def rebuild_runtime(
         await current_global_selection(controller_url, secret)
         if controller_url else None
     )
+    # 上次各 lane 绑定的节点：重建时优先原样恢复，避免每次重建都换一遍生产出口
+    previous_lanes: list[str | None] = []
+    if controller_url:
+        previous_lanes = await current_lane_selections(
+            controller_url, secret, len(runtime_lane_ports(data_dir))
+        )
 
     build = await build_pool(session, data_dir=data_dir)
     config = prepare_runtime_config(data_dir)
@@ -367,7 +613,7 @@ async def rebuild_runtime(
     base = status["controllerUrl"]
     new_secret = getattr(runtime, "secret", secret)
     observed = await wait_proxy_names(base, new_secret, timeout=wait_timeout)
-    # 入口就绪晚于控制器就绪：不等它，交出去的 proxy_url 会立刻 ConnectError
+    # 入口就绪晚于控制器就绪：不等它，交出去的代理地址会立刻 ConnectError
     port = await wait_mixed_port(data_dir, timeout=wait_timeout)
 
     ledger = reconcile(
@@ -405,6 +651,11 @@ async def rebuild_runtime(
                 f"恢复 GLOBAL 失败：now={applied!r}，期望 {chosen!r}"
             )
 
+    lane_ports, lane_nodes = await align_lanes(
+        data_dir=data_dir, controller_url=base, secret=new_secret,
+        pool_names=build.runtime_names, previous=previous_lanes, timeout=wait_timeout,
+    )
+
     return RebuildResult(
         proxy_url=f"http://127.0.0.1:{port}",
         mixed_port=port,
@@ -414,6 +665,8 @@ async def rebuild_runtime(
         selection=chosen,
         expected_count=build.expected_count,
         written_count=build.written_count,
+        lane_urls=tuple(f"http://127.0.0.1:{p}" for p in lane_ports),
+        lane_nodes=tuple(node or "" for node in lane_nodes),
     )
 
 
@@ -449,3 +702,20 @@ def require_runtime_proxy_url(data_dir: Path) -> str:
             "代理运行时不可用（没有可用的池 Runtime），本次爬取未启动"
         )
     return proxy_url
+
+
+def require_lane_proxy_urls(data_dir: Path) -> list[str]:
+    """受管爬取的生产入口：每条 lane 一个地址，worker 按序号绑定。
+
+    降级边界只有一条：运行配置里**没有 lane**（旧产物）时退回同一个 Runtime 的
+    GLOBAL 入口——仍是池内出口，不构成"退回直连或旧订阅代理"。有 lane 但入口没全
+    就绪属于 Runtime 不可用，直接抛错（fail closed），不把半就绪的入口交出去。
+    """
+    if runtime_lane_ports(data_dir):
+        urls = lane_proxy_urls(data_dir)
+        if not urls:
+            raise RuntimeUnavailableError(
+                "代理运行时的 lane 入口没有全部就绪，本次爬取未启动"
+            )
+        return urls
+    return [require_runtime_proxy_url(data_dir)]
