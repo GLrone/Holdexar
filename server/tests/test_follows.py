@@ -1,10 +1,10 @@
 """关注列表（游戏卡星标）语义：follows API + games 列表关注置顶。
 
-关注 = wishlist_items.manual 条目（星标是唯一入口，导入不产生关注）：
-- follow：无行在主账号下新建 manual 条目；真愿望单行打 manual 标（追踪保留）
-- unfollow：只清 manual 标——真愿望单条目照常追踪，纯手动条目交由下次
-  账户同步的反向核对自然出池
-- 关注口径：任一账户的 manual 行都算（对齐 crawl/service 的 manual_ids）
+关注 = 用户显式监控来源 `monitor_sources(source="favorite")`，**不依赖 Steam
+账户**（与愿望单/已购来源平行）：
+- follow：挂 favorite 来源（无账户也生效）；不写 wishlist_items——那是 Steam
+  账户来源数据，不是本地用户身份模型
+- unfollow：只摘 favorite 来源，Steam 账户来源照常追踪
 - 列表排序：关注置顶（default / 地区模式共用 IN 布尔前缀，top100 为
   Python 重排首位键）
 
@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.core.database import get_session_factory
 from app.domains.games import service as games_service
 from app.domains.games.models import Game, GameCurrentPrice
+from app.domains.monitoring import service as monitoring
 from app.domains.monitoring.models import MonitorExclusion, MonitorSource, MonitorTarget
 from app.domains.wishlist import follows
 from app.domains.wishlist.models import WishlistItem
@@ -113,66 +114,60 @@ async def _rows(appid: int) -> list[WishlistItem]:
 
 
 @pytest.mark.asyncio
-async def test_follow_creates_manual_row_under_primary(monkeypatch):
-    """无行关注：主账号下新建 manual 条目，出现在关注清单里。"""
-    _stub_primary(monkeypatch, PRIMARY)
+async def test_follow_attaches_favorite_source_without_account(monkeypatch):
+    """无账户关注：只挂 favorite 来源，不伪造 Steam 账户行。"""
+    _stub_primary(monkeypatch, "")
     appid = PROBE[0]
     await _cleanup()
     try:
         res = await follows.follow(appid)
         assert res == {"appid": appid, "followed": True}
         assert appid in await follows.followed_appids()
-        rows = await _rows(appid)
-        assert len(rows) == 1
-        assert rows[0].steamid == PRIMARY
-        assert rows[0].manual is True and rows[0].active is True
+        assert await _rows(appid) == [], "关注不得写 wishlist_items"
+        assert await monitoring.sources_of("game", appid) == ["favorite"]
+        assert await monitoring.state_of("game", appid) == "active"
     finally:
         await _cleanup()
 
 
 @pytest.mark.asyncio
-async def test_follow_requires_binding_for_new_entry(monkeypatch):
-    """全新条目但无主账号：拒绝（与导入/已购追踪同一条身份要求），且不落行。"""
-    _stub_primary(monkeypatch, "")
+async def test_follow_is_account_independent(monkeypatch):
+    """关注与账户无关：换主账号后关注清单不变。"""
+    appid = PROBE[2]
     await _cleanup()
-    with pytest.raises(ValueError):
-        await follows.follow(PROBE[0])
-    assert await _rows(PROBE[0]) == []
+    try:
+        _stub_primary(monkeypatch, PRIMARY)
+        await follows.follow(appid)
+        assert appid in await follows.followed_appids()
+        _stub_primary(monkeypatch, OTHER)
+        assert appid in await follows.followed_appids()
+    finally:
+        await _cleanup()
 
 
 @pytest.mark.asyncio
-async def test_unfollow_keeps_wishlist_row(monkeypatch):
-    """真愿望单条目：加星 → manual=True；取消 → 只清标，行照常追踪。"""
+async def test_unfollow_only_detaches_favorite(monkeypatch):
+    """真愿望单条目：关注挂 favorite；取消只摘 favorite，账户来源照常追踪。"""
     _stub_primary(monkeypatch, PRIMARY)
     appid = PROBE[1]
     await _cleanup()
     async with get_session_factory()() as s:
-        s.add(WishlistItem(steamid=PRIMARY, appid=appid, active=True, manual=False))
+        s.add(WishlistItem(steamid=PRIMARY, appid=appid, active=True, wishlisted=True))
         await s.commit()
     try:
+        await monitoring.sync_game_sources([appid])  # 账号派生来源
         await follows.follow(appid)
-        rows = await _rows(appid)
-        assert len(rows) == 1  # 打标不是新建
-        assert rows[0].manual is True and rows[0].active is True
+        assert set(await monitoring.sources_of("game", appid)) == {
+            "family_wishlist",
+            "favorite",
+        }
 
         await follows.unfollow(appid)
-        rows = await _rows(appid)
-        assert len(rows) == 1
-        assert rows[0].manual is False and rows[0].active is True  # 追踪保留
+        assert await monitoring.sources_of("game", appid) == ["family_wishlist"]
+        assert await monitoring.state_of("game", appid) == "active"  # 追踪保留
         assert appid not in await follows.followed_appids()
-    finally:
-        await _cleanup()
-
-
-@pytest.mark.asyncio
-async def test_follow_counts_any_account(monkeypatch):
-    """关注口径 = 任一账户的 manual 行（对齐爬取池 manual_ids）。"""
-    _stub_primary(monkeypatch, OTHER)
-    appid = PROBE[2]
-    await _cleanup()
-    try:
-        await follows.follow(appid)  # OTHER 账户下的手动条目
-        assert appid in await follows.followed_appids()
+        rows = await _rows(appid)
+        assert len(rows) == 1 and rows[0].active is True
     finally:
         await _cleanup()
 

@@ -17,6 +17,7 @@ from app.core.database import get_session_factory
 from app.core.events import bus
 from app.crawler.config import DEFAULT_WORKER_COUNT, HTTP_TIMEOUT, WORKERS_MAX
 from app.crawler.runner import CrawlRunConfig, run_crawl
+from app.crawler.utils import get_beijing_time_obj
 from app.domains.alerts import service as alerts_service
 from app.domains.crawl import cycle as price_cycle
 from app.domains.crawl.models import CrawlJob
@@ -45,12 +46,23 @@ def active_job_id() -> int | None:
     return _active.id if _active else None
 
 
+# 进程启动时刻（模块导入即进程启动）：只用于识别「上一个进程遗留」的任务——
+# 后台收拾链可能晚于首个用户请求跑完，本进程监听后启动的任务不得被判为中断
+_PROCESS_STARTED_AT = get_beijing_time_obj().replace(tzinfo=None)
+
+
 async def cleanup_orphan_jobs() -> None:
     """进程启动时把上一进程遗留的 running 任务标记为失败。"""
     async with get_session_factory()() as session:
         rows = (
             await session.execute(
-                select(CrawlJob).where(CrawlJob.status == "running")
+                select(CrawlJob).where(
+                    CrawlJob.status == "running",
+                    or_(
+                        CrawlJob.started_at.is_(None),
+                        CrawlJob.started_at < _PROCESS_STARTED_AT,
+                    ),
+                )
             )
         ).scalars().all()
         for job in rows:
@@ -64,18 +76,13 @@ async def cleanup_orphan_jobs() -> None:
 
 
 async def import_appids(appids: list[int]) -> dict:
-    """批量导入监控池（任务页批量导入 / 收藏列表导入共用通道）。
+    """批量导入：加入本地游戏目录 + 分类，**不建立持续监控关系**。
 
-    导入 = 加入监控池 + 首爬入库：
-    - 合法 appid 一律入池（wishlist_service.add_pool_items：无行新建
-      manual_pool 条目、已脱池复活；真愿望单/已购/关注行原样保留来源标记；
-      需已绑定账户，否则 ValueError → 400）；
-    - 分类口径（对齐 boards.backfill_specs 的缺口判定）：
-      ok=待首爬 / own=已在库 / fail=无效——供前端对「新导入」触发首爬
-      （kind=import / fav_import）。
-
-    手动入池条目属普通监控条目（必爬，第二优先级）；要升到第一优先级
-    去游戏卡点星标关注，或在 Steam 愿望单里保留它。
+    - 只分类，不落任何监控来源：ok=待首爬 / own=已在库 / fail=无效
+      （分类口径对齐 boards.backfill_specs 的缺口判定），供前端对
+      「新导入」触发一次首爬（kind=import / fav_import）；
+    - 不要求绑定 Steam 账户、不写 wishlist_items——目录层与监控层分离：
+      目录 = Holdexar 知道这个游戏存在；持续监控只由用户显式关注建立。
     """
     results: list[dict] = []
     ok = own = fail = 0
@@ -116,19 +123,13 @@ async def import_appids(appids: list[int]) -> dict:
                 results.append({"appid": appid, "status": "ok", "detail": "待首爬入库"})
                 ok += 1
 
-    # 入池（manual_pool 条目）：首爬由前端对「新导入」触发，这里不自动开爬
-    pool: dict = {"added": 0, "restored": 0, "exists": 0}
-    if clean:
-        from app.domains.wishlist import service as wishlist_service
-
-        pool = await wishlist_service.add_pool_items(clean, auto_crawl=False)
+    # 目录层：导入不建立监控来源（无 active Monitoring source 是合法状态），
+    # 首爬由前端对「新导入」触发，这里不自动开爬
     return {
         "results": results,
         "ok": ok,
         "own": own,
         "fail": fail,
-        "poolAdded": pool.get("added", 0),
-        "poolRestored": pool.get("restored", 0),
     }
 
 

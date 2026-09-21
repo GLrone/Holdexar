@@ -61,7 +61,11 @@ async def import_apps(req: ImportRequest):
     """批量导入监控：只分类（ok 新导入 / own 已在库 / fail 无效），不落库表、
     不启动任务——爬取由前端对新导入触发。绝不写 wishlist_items：追踪池只
     收真实 Steam 同步条目与星标关注，导入的游戏仅作 games 库监控数据。"""
-    return await service.import_appids(req.appids)
+    try:
+        return await service.import_appids(req.appids)
+    except ValueError as e:
+        # 与池页 /pool/items 同款：业务约束不满足时给可读原因，不做未捕获 500
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/crawl/jobs")

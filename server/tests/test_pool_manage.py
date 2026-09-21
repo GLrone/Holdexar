@@ -14,11 +14,14 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.database import Base
+from app.domains.monitoring import service as monitoring
+from app.domains.monitoring.models import MonitorSource, MonitorTarget
 from app.domains.wishlist import service as wishlist_service
 from app.domains.wishlist.models import TrackedAccount, WishlistItem
 
@@ -30,6 +33,7 @@ def db(tmp_path, monkeypatch):
     import app.core.database as database_module
     import app.domains.crawl.service as crawl_service
     import app.domains.games.preset as preset_mod
+    import app.domains.monitoring.service as monitoring_service
 
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
@@ -39,6 +43,8 @@ def db(tmp_path, monkeypatch):
     monkeypatch.setattr(wishlist_service, "get_session_factory", lambda: factory)
     monkeypatch.setattr(crawl_service, "get_session_factory", lambda: factory)
     monkeypatch.setattr(preset_mod, "get_session_factory", lambda: factory)
+    # 关注/加入已改走 monitoring 层：同一测试库，绝不允许落到真实数据目录
+    monkeypatch.setattr(monitoring_service, "get_session_factory", lambda: factory)
 
     # persona 拉取（miniprofile）与家庭组快照：不触网 / 不依赖未建表
     async def fake_persona(steamid):
@@ -69,6 +75,7 @@ def _make_start_job_stub(calls: list[dict]):
 async def _schema(db):
     import app.domains.crawl.models  # noqa: F401
     import app.domains.games.models  # noqa: F401
+    import app.domains.monitoring.models  # noqa: F401
     import app.domains.wishlist.models  # noqa: F401
 
     async with db.kw["bind"].begin() as conn:
@@ -159,63 +166,82 @@ def _mock_owned(monkeypatch, games=()):
 
 
 @pytest.mark.asyncio
-async def test_add_new_item_creates_manual_pool_row(db, monkeypatch):
-    """无行添加：主账号下新建 manual_pool 条目（普通监控条目），计数刷新。"""
-    await _seed_account(db)
-    _mock_primary(monkeypatch, PRIMARY)
+async def test_add_new_item_attaches_manual_source_without_account(db, monkeypatch):
+    """无账户也能加入关注：只挂 manual 来源，不伪造 Steam 账户行。"""
+    _mock_primary(monkeypatch, None)  # 无绑定账户
 
     out = await wishlist_service.add_pool_items([620])
 
     assert out["added"] == 1 and out["restored"] == 0 and out["exists"] == 0
-    row = await _get_item(db, 620)
-    assert row is not None
-    assert row.active is True
-    assert row.manual_pool is True
-    assert row.wishlisted is False and row.manual is False and row.excluded is False
+    assert await _get_item(db, 620) is None, "本地加入不得伪造 wishlist_items 身份行"
     async with db() as session:
-        account = await session.get(TrackedAccount, PRIMARY)
-    assert account.item_count == 1
+        srcs = (
+            await session.execute(
+                select(MonitorSource.source).where(MonitorSource.target_id == 620)
+            )
+        ).scalars().all()
+        target = (
+            await session.execute(
+                select(MonitorTarget).where(MonitorTarget.target_id == 620)
+            )
+        ).scalar_one()
+    assert list(srcs) == ["manual"]
+    assert target.state == "active"
+    assert target.priority == 60  # 手动加入：第二优先级档
 
 
 @pytest.mark.asyncio
 async def test_add_restores_excluded_item(db, monkeypatch):
-    """已脱池条目添加：复活 + 清 excluded；愿望单成员标记原样保留。"""
+    """被排除（移出关注）后重新加入：解除排除 + 挂来源，Steam 侧事实不改写。"""
     await _seed_account(db)
     _mock_primary(monkeypatch, PRIMARY)
     await _seed_item(
         db, 620, active=False, wishlisted=True, excluded=True, manual=True
     )
+    await monitoring.ensure_source("game", 620, "manual")
+    await monitoring.set_exclusion("game", 620, True, "pool_removed")
 
     out = await wishlist_service.add_pool_items([620])
 
     assert out["restored"] == 1
     row = await _get_item(db, 620)
-    assert row.active is True and row.excluded is False
     assert row.wishlisted is True  # Steam 侧成员事实不因本地移除而改写
-    assert row.manual is True
+    assert await monitoring.state_of("game", 620) == "active"
+    assert await monitoring.is_excluded("game", 620) is False
 
 
 @pytest.mark.asyncio
 async def test_add_existing_item_reports_exists(db, monkeypatch):
-    """已在池条目：exists，不动来源标记。"""
+    """已带 manual 来源：exists，不重复计数、不重复挂来源。"""
     await _seed_account(db)
     _mock_primary(monkeypatch, PRIMARY)
-    await _seed_item(db, 620, active=True, owned=True)
+    await monitoring.ensure_source("game", 620, "manual")
 
     out = await wishlist_service.add_pool_items([620])
 
     assert out["exists"] == 1 and out["added"] == 0
-    row = await _get_item(db, 620)
-    assert row.owned is True and row.manual_pool is False
+    async with db() as session:
+        rows = (
+            await session.execute(
+                select(MonitorSource).where(MonitorSource.target_id == 620)
+            )
+        ).scalars().all()
+    assert [r.source for r in rows] == ["manual"]
 
 
 @pytest.mark.asyncio
-async def test_add_requires_bound_account(db, monkeypatch):
-    """无绑定账户且存在新条目：拒绝（条目行的身份是 steamid），且不落行。"""
-    _mock_primary(monkeypatch, None)
-    with pytest.raises(ValueError):
-        await wishlist_service.add_pool_items([620])
-    assert await _get_item(db, 620) is None
+async def test_add_account_source_item_keeps_other_sources(db, monkeypatch):
+    """已由愿望单来源监控的条目再加入关注：手动来源并存，不洗掉账号来源。"""
+    await _seed_account(db)
+    _mock_primary(monkeypatch, PRIMARY)
+    await _seed_item(db, 620, active=True, wishlisted=True)
+    await monitoring.sync_game_sources([620])
+
+    out = await wishlist_service.add_pool_items([620])
+
+    assert out["exists"] == 1
+    assert await monitoring.sources_of("game", 620) == ["family_wishlist", "manual"]
+    assert await monitoring.state_of("game", 620) == "active"
 
 
 @pytest.mark.asyncio
@@ -287,11 +313,11 @@ async def test_remove_deactivates_and_shields_sync(db, monkeypatch):
     assert row.active is False, "excluded 条目不得被同步复活"
     assert row.wishlisted is True
 
-    # 重新添加：复活并恢复第一优先级资格
+    # 重新添加：回到监控（wishlist_items 是账户来源数据，本地加入不改写它）
     out = await wishlist_service.add_pool_items([620])
     assert out["restored"] == 1
-    row = await _get_item(db, 620)
-    assert row.active is True and row.excluded is False
+    assert await monitoring.state_of("game", 620) == "active"
+    assert await monitoring.is_excluded("game", 620) is False
 
 
 @pytest.mark.asyncio
@@ -383,20 +409,20 @@ async def test_pool_priority_wishlist_and_follow_first(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_import_appids_adds_to_pool(db, monkeypatch):
-    """导入 = 入池 + 分类：合法 appid 落 manual_pool 条目，分类口径不变。"""
+async def test_import_appids_writes_no_monitoring(db, monkeypatch):
+    """导入只分类：不写 wishlist_items、不建监控来源（目录层与监控层解耦）。"""
     await _seed_account(db)
     _mock_primary(monkeypatch, PRIMARY)
     from app.domains.crawl import service as crawl_service
 
     out = await crawl_service.import_appids([620, 570, 0])
 
-    assert out["fail"] == 1
-    assert out["poolAdded"] == 2
-    row = await _get_item(db, 620)
-    assert row is not None and row.active is True and row.manual_pool is True
-    row = await _get_item(db, 570)
-    assert row is not None and row.active is True
+    assert out["fail"] == 1 and out["ok"] == 2
+    assert await _get_item(db, 620) is None
+    async with db() as session:
+        srcs = (await session.execute(select(MonitorSource))).scalars().all()
+        targets = (await session.execute(select(MonitorTarget))).scalars().all()
+    assert srcs == [] and targets == [], "导入不得建立持续监控关系"
 
 
 # ── 导入文件来源登记（预设池清单：随资产种子分发的出厂游戏集）──────

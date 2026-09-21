@@ -179,23 +179,24 @@ async def test_import_appids_classification(db):
 
 
 @pytest.mark.asyncio
-async def test_import_appids_writes_pool(db):
-    """导入 = 入池：合法 appid 落 manual_pool 条目（监控条目必爬）+ 分类口径不变。"""
+async def test_import_appids_writes_nothing(db):
+    """导入只分类：不写 wishlist_items、不建监控来源（目录层与监控层解耦）。"""
     from sqlalchemy import select
 
+    from app.domains.monitoring.models import MonitorSource
     from app.domains.wishlist.models import WishlistItem
 
     out = await crawl_service.import_appids([620, 570, 730])
-    assert out["poolAdded"] == 3
+    assert out["ok"] == 3 and out["own"] == 0
     async with db() as session:
         rows = (await session.execute(select(WishlistItem))).scalars().all()
-    assert {int(r.appid) for r in rows} == {620, 570, 730}
-    assert all(r.active and r.manual_pool and not r.manual for r in rows)
+        srcs = (await session.execute(select(MonitorSource))).scalars().all()
+    assert rows == [] and srcs == []
 
 
 @pytest.mark.asyncio
 async def test_pool_scope_orders_monitoring_first(db):
-    """pool=监控层：只有进入 Monitoring 的对象（关注 > 愿望单 > 已购序）；
+    """pool=监控层：只有进入 Monitoring 的对象（关注 > 已购序）；
     其余 games 行归 catalog 层，不在 pool 里。"""
     from datetime import datetime
 
@@ -212,14 +213,11 @@ async def test_pool_scope_orders_monitoring_first(db):
             ]
         )
         await session.commit()
-    await _seed(db, 700, owned=False, active=True)   # manual 关注另行补
-    await _seed(db, 701, owned=True, active=True)    # 已购
+    await _seed(db, 700, owned=False, active=True)   # 关注 = 用户显式来源
+    await _seed(db, 701, owned=True, active=True)    # 已购 = 账号派生来源
     await _seed(db, 702, owned=True, active=False)   # inactive → 无有效来源
-    async with db() as session:
-        row = await session.get(WishlistItem, (PRIMARY, 700))
-        row.manual = True
-        await session.commit()
-    await monitoring_service.sync_game_sources([700, 701, 702])
+    await monitoring_service.ensure_source("game", 700, "favorite")
+    await monitoring_service.sync_game_sources([701, 702])
 
     pool = [a for a, _ in await crawl_service._resolve_scope_appids("pool", None)]
     catalog = [a for a, _ in await crawl_service._resolve_scope_appids("catalog", None)]

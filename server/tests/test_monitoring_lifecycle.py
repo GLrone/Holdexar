@@ -129,6 +129,8 @@ async def test_pool_scope_orders_family_wishlist_before_second_priority(db):
     await _wl(db, 700, wishlisted=True)
     await _wl(db, 800, manual_pool=True)
     await monitoring.sync_game_sources([700, 800])
+    # 手动加入 = 用户显式来源（不再由 wishlist_items 的 manual_pool 派生）
+    await monitoring.ensure_source("game", 800, "manual")
 
     assert await crawl_service._resolve_scope_appids("pool", None) == [(700, ""), (800, "")]
 
@@ -140,9 +142,11 @@ async def test_pool_scope_orders_family_wishlist_before_second_priority(db):
 async def test_wishlist_removal_keeps_monitoring_when_manual_source_exists(db):
     await _wl(db, 700, wishlisted=True, manual_pool=True)
     await monitoring.sync_game_sources([700])
+    await monitoring.ensure_source("game", 700, "manual")
     assert await monitoring.sources_of("game", 700) == ["family_wishlist", "manual"]
 
-    # 从愿望单删除：wishlisted 标清零（同步反向核对的既有行为）
+    # 从愿望单删除：wishlisted 标清零（同步反向核对的既有行为）；
+    # 账号对账只收敛派生来源，用户显式来源不被洗掉 → 仍在监控
     await _wl(db, 700, wishlisted=False, manual_pool=True)
     assert (await monitoring.sync_game_sources([700]))[700] == "active"
     assert await monitoring.sources_of("game", 700) == ["manual"]
@@ -291,6 +295,8 @@ async def test_multi_account_same_appid_yields_single_target(db):
     await _wl(db, 700, SECOND, manual=True)
 
     await monitoring.sync_game_sources([700])
+    # 关注是用户显式来源（与 Steam 账户来源平行），由关注动作直接挂上
+    await monitoring.ensure_source("game", 700, "favorite")
 
     async with db() as session:
         targets = (
@@ -343,6 +349,7 @@ async def test_free_game_release_is_not_exclusion(db):
     await _game(db, 700, free_kind="f2p")
     await _wl(db, 700, manual_pool=True)
     await monitoring.sync_game_sources([700])
+    await monitoring.ensure_source("game", 700, "manual")
     assert await monitoring.state_of("game", 700) == "active"
 
     released = await wishlist_service.release_free_games([700])

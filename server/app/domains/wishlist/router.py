@@ -114,10 +114,10 @@ class PoolItemsRequest(BaseModel):
 
 @router.post("/pool/items")
 async def add_pool_items(req: PoolItemsRequest):
-    """批量添加监控条目（池页添加 / 导入文件 / 任务页导入共用）。
+    """批量加入关注（池页添加 / 导入文件共用）。
 
-    无行新建 manual_pool 条目（普通监控条目，不进愿望单/关注名单）；
-    已有行复活（含愿望单/已购/关注行）。返回逐条分类明细。
+    走 monitoring 层挂 manual 来源并解除排除——不要求绑定 Steam 账户，
+    也不写 wishlist_items（那是 Steam 账户来源数据）。返回逐条分类明细。
     """
     try:
         return await service.add_pool_items(req.appids, source=req.source)
@@ -127,11 +127,11 @@ async def add_pool_items(req: PoolItemsRequest):
 
 @router.post("/pool/items/remove")
 async def remove_pool_items(req: PoolItemsRequest):
-    """批量移除监控条目（脱池 + excluded 挡同步复活 + 清星标）。"""
+    """批量移出关注（摘用户来源 + 排除标挡账号同步复活 + 清星标）。"""
     return await service.remove_pool_items(req.appids)
 
 
-# ── 关注列表（游戏卡星标；manual 条目语义，见 follows.py 模块注释）──
+# ── 关注列表（游戏卡星标；favorite 来源语义，见 follows.py 模块注释）──
 
 
 @router.get("/follows")
@@ -142,7 +142,7 @@ async def followed_appids():
 
 @router.put("/follows/{appid}")
 async def follow_game(appid: int):
-    """关注：入追踪池 + 打 manual 标（爬取队列最优先，同步免疫）。"""
+    """关注：挂 favorite 来源（不需要绑定 Steam 账户）。"""
     try:
         return await follows.follow(appid)
     except ValueError as e:
@@ -151,5 +151,5 @@ async def follow_game(appid: int):
 
 @router.delete("/follows/{appid}")
 async def unfollow_game(appid: int):
-    """取消关注：只清 manual 标（真愿望单追踪保留，纯手动条目下次同步出池）。"""
+    """取消关注：只摘 favorite 来源（Steam 账户来源照常追踪）。"""
     return await follows.unfollow(appid)
