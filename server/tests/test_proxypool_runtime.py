@@ -27,7 +27,9 @@ from app.core.database import get_engine, get_session_factory, init_db  # noqa: 
 from app.domains.proxies import clash_manager  # noqa: E402
 from app.domains.proxies.clash_manager import ClashRuntime  # noqa: E402
 from app.domains.proxies.kernel_release import kernel_filename  # noqa: E402
-from app.domains.proxypool.models import ProxyNode, node_fingerprint  # noqa: E402
+from app.domains.proxypool.models import (  # noqa: E402
+    ProxyNode, ProxyNodeSource, node_fingerprint,
+)
 from app.domains.proxypool.pool import build_pool, pool_path  # noqa: E402
 from app.domains.proxypool.runtime import (  # noqa: E402
     RuntimeUnreachableError,
@@ -99,6 +101,11 @@ async def _add(state: str, runtime_name: str, *, server: str) -> None:
             node_id=fp, fingerprint=fp, runtime_name=runtime_name,
             proxy_type="ss", server=server, normalized_config=config, state=state,
             first_seen=NOW, last_seen=NOW, last_source_seen=NOW,
+        ))
+        # 合格集口径含「至少一个当前来源」：直接登记的行也要给一条来源
+        s.add(ProxyNodeSource(
+            node_id=fp, subscription_id=1, original_name=config["name"],
+            first_seen=NOW, last_seen=NOW,
         ))
         await s.commit()
 

@@ -23,11 +23,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domains.proxies.models import (
     ADMISSION_ACTIVE,
+    ADMISSION_CANDIDATE,
     ProxySubscription,
 )
 from app.domains.proxypool.models import SubscriptionSnapshot, node_fingerprint
@@ -67,6 +68,70 @@ def is_admitted(sub: ProxySubscription) -> bool:
     绝不因为本切片把历史订阅降级成候选。
     """
     return (sub.admission_status or ADMISSION_ACTIVE) == ADMISSION_ACTIVE
+
+
+@dataclass(frozen=True)
+class ExitResult:
+    """一次退出生产池的账目（`exited=False` = 本来就不在池里，幂等空转）。"""
+
+    subscription_id: int
+    exited: bool
+    detail: str
+    removed_sources: int
+
+
+async def exit_from_production(
+    session: AsyncSession,
+    *,
+    subscription_id: int,
+) -> ExitResult:
+    """把一个 ACTIVE 订阅撤出生产池：置回 CANDIDATE，并移除它的全部来源行。
+
+    **只 flush，不 commit**：与晋升同一套事务约定，提交归调用方。
+
+    事务顺序（不变量 `CANDIDATE ⇒ 它的来源行已全部移除`）：
+
+        取写串行化边界 → 读订阅行 → 删本订阅来源行 → 置 CANDIDATE
+
+    `ProxyNode` 身份账本一行不动：没有任何当前来源的节点由合格集口径自然退出池，
+    仍被别的订阅提供的节点不受影响。退出是**可逆**的——以后要重新进池再走一次
+    Promote（用当前 URL 的最新成功快照），不物理删除订阅行。
+    """
+    await lock_subscription_mutation(session, subscription_id)
+
+    sub = await session.get(ProxySubscription, subscription_id)
+    if sub is None:
+        raise PromotionError(f"订阅不存在：{subscription_id}")
+    if sub.kind != "clash":
+        raise PromotionError(f"订阅 {subscription_id} 不是 clash 订阅，没有生产准入语义")
+    if not is_admitted(sub):
+        return ExitResult(subscription_id, False, "本来就不在池里", 0)
+
+    # 退出会改 eligible 集合 → 用**既有规则**判断要不要重建（与同步/晋升同一条判据）。
+    # 函数内 import：`bootstrap` 反向依赖本模块的 `is_admitted`，模块级会成环。
+    from app.domains.proxypool.bootstrap import pool_signature
+    from app.domains.proxypool.models import ProxyNodeSource
+
+    before_sig = await pool_signature(session)
+    removed = int(await session.scalar(
+        select(func.count())
+        .select_from(ProxyNodeSource)
+        .where(ProxyNodeSource.subscription_id == subscription_id)
+    ) or 0)
+    await session.execute(
+        delete(ProxyNodeSource).where(ProxyNodeSource.subscription_id == subscription_id)
+    )
+    sub.admission_status = ADMISSION_CANDIDATE
+    await session.flush()
+
+    if await pool_signature(session) != before_sig:
+        request_rebuild()
+        logger.info(
+            "[准入] 订阅 %s 退出生产池：移除来源 %d 行，eligible 变化 → request_rebuild()",
+            subscription_id, removed,
+        )
+    logger.info("[准入] 订阅 %s 退出生产池（置回 CANDIDATE，来源行 %d）", subscription_id, removed)
+    return ExitResult(subscription_id, True, "已退出生产池（置回 CANDIDATE）", removed)
 
 
 async def promote_to_active(

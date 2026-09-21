@@ -69,3 +69,29 @@ async def promote_subscription(subscription_id: int):
         "appliedNodes": result.applied_nodes,
         "admissionStatus": "ACTIVE",
     }
+
+
+@router.post("/subscriptions/{subscription_id}/exit")
+async def exit_subscription(subscription_id: int):
+    """Active → 退出生产池：**同一事务**内置回 CANDIDATE 并移除该订阅的全部来源行。
+
+    不物理删除订阅行（以后可再 Promote）。`ProxyNode` 身份账本保留：没有任何当前
+    来源的节点按合格集口径自然退出池，仍被别的订阅提供的节点不受影响。
+    已是 CANDIDATE 时为幂等空转。
+    """
+    from app.domains.proxypool.admission import PromotionError, exit_from_production
+
+    async with get_session_factory()() as session:
+        try:
+            result = await exit_from_production(session, subscription_id=subscription_id)
+            await session.commit()
+        except PromotionError as e:
+            await session.rollback()
+            raise HTTPException(status_code=409, detail=str(e)) from e
+    return {
+        "subscriptionId": result.subscription_id,
+        "exited": result.exited,
+        "detail": result.detail,
+        "removedSources": result.removed_sources,
+        "admissionStatus": "CANDIDATE",
+    }

@@ -22,7 +22,7 @@ from sqlalchemy import select
 from app.core.config import get_settings  # noqa: E402
 from app.core.database import get_engine, get_session_factory, init_db  # noqa: E402
 from app.domains.proxypool import pool as pool_module  # noqa: E402
-from app.domains.proxypool.models import ProxyNode, node_fingerprint  # noqa: E402
+from app.domains.proxypool.models import ProxyNode, ProxyNodeSource, node_fingerprint  # noqa: E402
 from app.domains.proxypool.pool import (  # noqa: E402
     PoolBuildError,
     build_pool,
@@ -76,6 +76,11 @@ async def _add(state: str, runtime_name: str, *, server: str, name: str | None =
             proxy_type=str(cfg.get("type") or ""), server=cfg.get("server"),
             normalized_config=cfg, state=state,
             first_seen=NOW, last_seen=NOW, last_source_seen=NOW,
+        ))
+        # 合格集口径含「至少一个当前来源」：直接登记的行也要给一条来源
+        s.add(ProxyNodeSource(
+            node_id=fp, subscription_id=1, original_name=name or runtime_name,
+            first_seen=NOW, last_seen=NOW,
         ))
         await s.commit()
     return fp
