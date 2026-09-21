@@ -236,7 +236,7 @@ async def _round_robin(enabled: list[Proxy]) -> str:
 async def _weighted_pick(enabled: list[Proxy]) -> str:
     """按健康度加权随机取一条出口（策略引擎每批任务调用一次）。
 
-    为什么不用朴素轮询：轮询把已失败的出口和健康出口当等价，流量会继续平摊
+    加权而非朴素轮询：轮询把已失败的出口和健康出口当等价，流量会继续平摊
     到死节点上，直到它撞满禁用线——每次都先白烧几个请求才发现。加权让健康度
     直接决定流量分配：快节点多干活，正在降级的节点被迅速挤出。
 
@@ -561,10 +561,10 @@ async def refresh_clash_subscription(sub_id: int) -> dict:
 async def maybe_refresh_active_clash_subscription() -> dict:
     """定时重拉「内核正在跑的」Clash 订阅（间隔门槛 SUBSCRIPTION_REFRESH_HOURS）。
 
-    为什么必须定时重拉：机场节点列表会增删/改名/换入口，本地 config.yaml 不
+    定时重拉的必要性：机场节点列表会增删/改名/换入口，本地 config.yaml 不
     重拉就一直是旧节点集——6h 体检也只是反复测这批旧节点，新节点永远进不来。
 
-    为什么只重拉正在跑的那条：
+    只重拉正在跑的那条：
     - 没在跑的订阅没有流量走它，重拉只是白耗一次外网请求（下次启动内核时
       本来就会重下）；
     - config.yaml 是各订阅共用的缓存文件，重拉非在跑订阅会把这个文件换成

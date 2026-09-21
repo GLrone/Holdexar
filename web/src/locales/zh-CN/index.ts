@@ -2,9 +2,9 @@
    中文词典汇总。**zh-CN 是回退源，也是 `MessageKey` 的唯一推导来源**——
    新增词条先落这里，`en` 补译；缺译自动回退中文（见 locales/index.ts）。
 
-   为什么按模块拆文件：全量双语后这里会有上千条 key，单文件既不可维护也
+   词典按模块拆文件：全量双语后这里会有上千条 key，单文件既不可维护也
    必然在多人/多会话编辑时冲突。约定是**模块文件与视图/组件同构**：
-   `views/proxies/Index.vue` 的文案落 `zh-CN/proxies.ts`，迁移到哪个文件
+   `views/proxies/Index.vue` 的文案落 `zh-CN/proxies.ts`，迁到哪个文件
    就建哪个模块——这样「还有哪些模块没迁」一眼可见。
 
    新增一个模块只需两步：建 `<module>.ts`（`as const` 默认导出），在这里

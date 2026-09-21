@@ -2762,8 +2762,8 @@ html.dark .hl-theme-btn svg { transform: rotate(180deg); }
       calc(var(--duration-N) * var(--motion-scale))，闸一关就瞬时完成。tokens.css
       的 --transition 已挂闸，全库 `var(--transition)` 自动生效。
       不用「逐条列出动画名」的清单：既漏（route-fade / drawer / dialog / pop /
-      marquee / 呼吸与脉冲类），又滥（`transition: none` 连悬停/聚焦的**颜色**
-      过渡都一起去掉了——颜色变化不是位移，不该被砍）。
+      marquee / 呼吸与脉冲类），又滥（`transition: none` 会连悬停/聚焦的**颜色**
+      过渡一起砍掉——颜色变化不是位移，不该被砍）。
    ② **循环动画**（infinite）仍在这里显式关掉：0s 时长 + infinite 会让浏览器空转。 */
 @media (prefers-reduced-motion: reduce) {
   .hl-banner__track,

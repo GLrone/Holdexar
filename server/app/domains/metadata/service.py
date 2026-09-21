@@ -286,9 +286,8 @@ async def import_hb(source_dir: str | None = None) -> dict:
 
 
 # ─── HB 当月包：membership 页 → 游戏侧标记（无账本表）─────────────
-# 为什么不做月包表：月包的持久语义只有「哪些游戏进过哪个月的包」，
-# 落 games.is_hb/hb_data 即完备；整包存档属易失数据（往期页对未登录
-# 404），表化反而诱导依赖一份注定不全的存档。
+# 月包的持久语义只有「哪些游戏进过哪个月的包」，落 games.is_hb/hb_data 即完备；
+# 整包存档属易失数据（往期页对未登录 404），表化只会诱导依赖一份注定不全的存档。
 
 _MEMBERSHIP_URL = "https://www.humblebundle.com/membership"
 _STORESEARCH_URL = "https://store.steampowered.com/api/storesearch"

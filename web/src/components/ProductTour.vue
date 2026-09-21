@@ -226,13 +226,13 @@ const capturedStart = ref('/')
     2. 框右侧偏下/偏上 —— 下方/上方都放不下时贴右边（侧边栏窄目标的主位）
     3. 聚光框正上方
     4. 全放不下 → 居中（missed 同款）
-    高度两段式：首摆用 POP_H_EST 预算，气泡挂载后实测回填 popHeight，
-    placePop 复跑——实测值参与下一轮方向决策与夹取。 */
+    高度两段式：首摆用 POP_H_EST 预算，气泡挂载后量得回填 popHeight，
+    placePop 复跑——量得值参与下一轮方向决策与夹取。 */
 const POP_W = 440
 const POP_H_EST = 340
 const MARGIN = 14
 
-/** 气泡实测高度（0 = 未测，用预算值；挂载后 measurePop 回填） */
+/** 气泡量得高度（0 = 未量，用预算值；挂载后 measurePop 回填） */
 const popHeight = ref(0)
 const popEl = ref<HTMLElement | null>(null)
 
@@ -240,7 +240,7 @@ function currentPopH(): number {
   return popHeight.value > 0 ? popHeight.value : POP_H_EST
 }
 
-/** 气泡挂载/内容变化 → 实测高度回填 + 按实测值复摆（防溢出的第二段） */
+/** 气泡挂载/内容变化 → 量得高度回填 + 按量得值复摆（防溢出的第二段） */
 function measurePop() {
   const el = popEl.value
   if (!el) return
@@ -563,7 +563,7 @@ watch(
       box.value = { top: 0, left: 0, width: 0, height: 0 }
       stopStabilize()
     }
-    // 换步后气泡内容/方向可能变化：清预算 → 挂载后实测回填（两段式定位）
+    // 换步后气泡内容/方向可能变化：清预算 → 挂载后量得回填（两段式定位）
     popHeight.value = 0
     await nextTick()
     requestAnimationFrame(() => measurePop())

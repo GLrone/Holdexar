@@ -239,7 +239,7 @@ const latestDiscount = computed(() => latestPoint.value?.discount ?? 0)
 
 /** 抽屉最高处须低于整个导航层叠（吸顶 navbar + 可能出现的 filter-toolbar）。
     navbar 高度随布局变化（桌面 68px / 窄屏 50px），硬编码不可靠——
-    每次打开时实测层叠内最底元素的视口 bottom + 6px 间隙。 */
+    每次打开时量取层叠内最底元素的视口 bottom + 6px 间隙。 */
 const stackTop = ref(140)
 
 watch(visible, (open) => {

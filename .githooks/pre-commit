@@ -5,10 +5,11 @@
 # 40s 会导致提交被误判超时），重活全部移到 .githooks/pre-push。
 #   0. 敏感面门禁（路径 / 体积 / 凭据形状，只查暂存改动）——放最前：
 #      最便宜的一层，且失败时没必要再花时间跑后面任何检查
-#   1. 前端收口 lint（--cache 增量，error 级，见 web/eslint.config.mjs）
-#   2. 路由完整性（悬空引用拦截，/bills 事故防线）
-#   3. 词典完整性（拼错的 key / 缺译 / 孤儿词条，见 web/scripts/check-i18n.mjs）
-#   4. 旗帜素材完整性（CC_LIST 新区忘下载 /flags/{code}.png 即报错）
+#   1. 注释留痕门禁（暂存新增行的注释 / docstring，只拦新写入）
+#   2. 前端收口 lint（--cache 增量，error 级，见 web/eslint.config.mjs）
+#   3. 路由完整性（悬空引用拦截，/bills 事故防线）
+#   4. 词典完整性（拼错的 key / 缺译 / 孤儿词条，见 web/scripts/check-i18n.mjs）
+#   5. 旗帜素材完整性（CC_LIST 新区忘下载 /flags/{code}.png 即报错）
 #
 # 例外存量已在 eslint 豁免清单（web/eslint.config.mjs 的 LEGACY_FILES）镜像；
 # 新增例外 = 违规，先登记评审、再同步改豁免清单。
@@ -17,6 +18,12 @@ if ! { python scripts/check_secrets.py --staged || server/.venv/Scripts/python.e
   echo "✗ 敏感面检查未通过：命中项已在上方列出（只给位置与掩码，不回显值）。" >&2
   echo "  判定为误报时先跑 python scripts/check_secrets.py --all 确认全树仍零命中，" >&2
   echo "  再按脚本头部的「加新特征」流程调整规则；严禁 --no-verify 绕行。" >&2
+  exit 1
+fi
+echo "[pre-commit] 注释留痕门禁（暂存新增行的注释 / docstring，只拦新写入）..."
+if ! python scripts/check_dev_traces.py --staged; then
+  echo "✗ 注释留痕检查未通过：注释只写当前行为与约束，改动经过 / 方案取舍 /" >&2
+  echo "  验证数据不写入代码文件（改写为行为陈述，纯叙述才删）。" >&2
   exit 1
 fi
 echo "[pre-commit] 前端收口 lint（--cache 增量，--quiet 只报 error）..."
