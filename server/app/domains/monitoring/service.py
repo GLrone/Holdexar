@@ -61,6 +61,11 @@ _WISHLIST_SOURCE_FLAGS: tuple[tuple[str, str], ...] = (
     ("board_pool", "board"),
 )
 
+# 账号派生来源：由 wishlist_items（Steam 账户来源数据）对账产生，账号同步时
+# 按现状重算。用户显式来源（favorite / manual）与它们分属两个管理者——
+# 对账只收敛本集合内的种类，不会把用户自己挂的关注/手动入池洗掉。
+DERIVED_SOURCES: frozenset[str] = frozenset({"family_wishlist", "owned", "board"})
+
 # 单次批量同步的 appid 数（SQLite 变量数上限防御）
 _SYNC_CHUNK = 400
 
@@ -154,11 +159,18 @@ async def _recompute(session, target_type: str, target_id: int) -> str:
 # ── 对外：来源维护 ────────────────────────────────────────────
 
 
-async def sync_sources(target_type: str, desired: dict[int, set[str]]) -> dict[int, str]:
+async def sync_sources(
+    target_type: str,
+    desired: dict[int, set[str]],
+    *,
+    managed: set[str] | frozenset[str] | None = None,
+) -> dict[int, str]:
     """按给定来源集合幂等重算一批监控对象（多账户去重后的并集）。
 
-    `desired` 里没出现的来源一律停用；出现但尚未落行的新建。
-    返回 {target_id: 重算后的 state}。
+    `desired` 里没出现的来源一律停用——但只停用 `managed` 内的来源种类
+    （None = 全部）。账号派生来源（`DERIVED_SOURCES`）由账户对账管理；
+    用户显式来源（favorite / manual）由各自动作直接挂摘，不被对账覆盖。
+    出现但尚未落行的新建。返回 {target_id: 重算后的 state}。
     """
     if not desired:
         return {}
@@ -181,6 +193,8 @@ async def sync_sources(target_type: str, desired: dict[int, set[str]]) -> dict[i
         }
         for target_id, sources in desired.items():
             sources = {s for s in (sources or set()) if s}
+            if managed is not None:
+                sources = {s for s in sources if s in managed}
             current = {
                 src: row for (tid, src), row in existing.items() if tid == target_id
             }
@@ -203,12 +217,96 @@ async def sync_sources(target_type: str, desired: dict[int, set[str]]) -> dict[i
                     row.priority = _priority_of(src)
                     row.updated_at = now
             for src, row in current.items():
+                if managed is not None and src not in managed:
+                    continue
                 if src not in sources and row.active:
                     row.active = False
                     row.updated_at = now
             result[target_id] = await _recompute(session, target_type, target_id)
         await session.commit()
     return result
+
+
+async def ensure_source(target_type: str, target_id: int, source: str) -> str:
+    """确保某个来源为激活态，**不动该对象的其它来源**。
+
+    与 `attach_source` 的分工：attach 把来源集合收敛成只含这一个（切换来源
+    语义）；ensure 只加不减——用户显式动作（关注 / 手动入池）用它，免得
+    把 Steam 愿望单等来源顺手洗掉。
+    """
+    now = _now()
+    async with get_session_factory()() as session:
+        row = (
+            await session.execute(
+                select(MonitorSource).where(
+                    MonitorSource.target_type == target_type,
+                    MonitorSource.target_id == int(target_id),
+                    MonitorSource.source == source,
+                )
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            session.add(
+                MonitorSource(
+                    target_type=target_type,
+                    target_id=int(target_id),
+                    source=source,
+                    priority=_priority_of(source),
+                    active=True,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        elif not row.active:
+            row.active = True
+            row.priority = _priority_of(source)
+            row.updated_at = now
+        state = await _recompute(session, target_type, int(target_id))
+        await session.commit()
+    return state
+
+
+async def ids_with_source(target_type: str, source: str) -> list[int]:
+    """带某个激活来源的对象 id（升序去重）。"""
+    async with get_session_factory()() as session:
+        rows = (
+            await session.execute(
+                select(MonitorSource.target_id)
+                .where(
+                    MonitorSource.target_type == target_type,
+                    MonitorSource.source == source,
+                    MonitorSource.active.is_(True),
+                )
+                .distinct()
+                .order_by(MonitorSource.target_id)
+            )
+        ).all()
+    return [int(r[0]) for r in rows]
+
+
+async def sources_map(
+    target_type: str, target_ids: list[int]
+) -> dict[int, set[str]]:
+    """批量取激活来源集合（列表页派生「来源标记」用，避免逐条查询）。"""
+    clean = [int(t) for t in (target_ids or [])]
+    if not clean:
+        return {}
+    out: dict[int, set[str]] = {}
+    async with get_session_factory()() as session:
+        for i in range(0, len(clean), _SYNC_CHUNK):
+            chunk = clean[i : i + _SYNC_CHUNK]
+            rows = (
+                await session.execute(
+                    select(MonitorSource.target_id, MonitorSource.source).where(
+                        MonitorSource.target_type == target_type,
+                        MonitorSource.target_id.in_(chunk),
+                        MonitorSource.active.is_(True),
+                    )
+                )
+            ).all()
+            for tid, src in rows:
+                out.setdefault(int(tid), set()).add(str(src))
+    return out
 
 
 async def attach_source(target_type: str, target_id: int, source: str) -> str:
@@ -470,11 +568,13 @@ async def _hot_ids(target_type: str, ids: list[int]) -> set[int]:
 
 
 async def sync_game_sources(appids: list[int]) -> dict[int, str]:
-    """按 wishlist_items 现状重算这些 appid 的来源（幂等，可重复调用）。
+    """按 wishlist_items 现状重算这些 appid 的**账号派生来源**（幂等）。
 
     单一真相源是 wishlist_items：多账户同一 appid 的来源标记取并集
-    （「任一账户仍想要」= 来源有效），无 active 行的 appid 来源置空 →
-    released。排除状态不被本函数改写——它只由用户显式操作维护。
+    （「任一账户仍想要」= 来源有效），无 active 行的 appid 派生来源置空 →
+    仅剩用户显式来源时仍为 active。只收敛 `DERIVED_SOURCES`：用户自己挂的
+    关注 favorite / 手动入池 manual 不被账号对账改写。
+    排除状态不被本函数改写——它只由用户显式操作维护。
     """
     clean: list[int] = []
     seen: set[int] = set()
@@ -518,13 +618,14 @@ async def sync_game_sources(appids: list[int]) -> dict[int, str]:
                 desired[appid] = sources
     for appid in clean:
         desired.setdefault(appid, set())
-    return await sync_sources(TARGET_GAME, desired)
+    return await sync_sources(TARGET_GAME, desired, managed=DERIVED_SOURCES)
 
 
 async def sync_all_game_sources() -> int:
     """全库对账：wishlist_items 里出现过的 appid 全部重算一遍。
 
-    只在启动链 / 迁移后兜底用（迁移漏跑或监控表被清空的库）。
+    兜底入口（迁移漏跑或监控表被清空的库按需手工调用）；账号同步与池内增删
+    走 `sync_game_sources` 按 appid 增量对账。
     """
     from app.domains.wishlist.models import WishlistItem
 

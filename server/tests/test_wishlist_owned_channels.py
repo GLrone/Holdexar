@@ -25,6 +25,7 @@ from app.domains.wishlist.models import TrackedAccount, WishlistItem
 @pytest.fixture
 def db(tmp_path, monkeypatch):
     import app.core.database as database_module
+    import app.domains.monitoring.service as monitoring_service
 
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
@@ -32,6 +33,8 @@ def db(tmp_path, monkeypatch):
     factory = async_sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
     monkeypatch.setattr(wishlist_service, "get_session_factory", lambda: factory)
+    # list_items / list_appids 会并入 monitoring 层的显式来源：同一测试库
+    monkeypatch.setattr(monitoring_service, "get_session_factory", lambda: factory)
 
     # account 域 Cookie 读取不走测试库（其模块级 factory 引用未被打桩，
     # 会直读生产库）；所有用例显式 mock get_primary_cookies。
@@ -68,6 +71,8 @@ async def _schema(db):
     import app.domains.wishlist.models  # noqa: F401
     # games 主档：list_items 的 name/headerImage LEFT JOIN 源
     import app.domains.games.models  # noqa: F401
+    # monitoring 层：list_items 并入显式来源（favorite / manual）需要这两张表
+    import app.domains.monitoring.models  # noqa: F401
 
     async with db.kw["bind"].begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

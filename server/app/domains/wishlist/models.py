@@ -1,8 +1,11 @@
-"""wishlist 域模型：跟踪账户 + 监控条目（监控池任务队列）。
+"""wishlist 域模型：Steam 账户来源数据（跟踪账户 + 愿望单/已购成员事实）。
 
-监控条目是监控池（wishlist_items 的活跃行）的唯一承载：愿望单同步、
-已购同步、星标关注、监控池页手动添加四条来源都落在这里，全部必爬；
-其中愿望单成员（wishlisted）与星标关注（manual）是爬取队列的第一优先级。
+本表是 **Steam 账户来源数据**，不是本地用户身份模型：
+
+- 行身份 `(steamid, appid)`：来自 Steam 愿望单 / 已购 / 榜单发现源的成员事实；
+- 持续监控资格由 monitoring 域的来源表达——`favorite`（关注）与 `manual`
+  （手动加入）不依赖账户，与 `family_wishlist` / `owned` / `board` 平行；
+- 本表的来源布尔列只作账号对账的输入，不表达「用户是否在关注」。
 """
 from __future__ import annotations
 
@@ -37,20 +40,17 @@ class WishlistItem(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     # 该条目来自账户已购库（True=已拥有 / False=非已购）；同步时按已购列表覆写
     owned: Mapped[bool] = mapped_column(Boolean, default=False)
-    # 手动关注标记（游戏卡星标）：同步反向核对「愿望单已移除 → 停用」
-    # 时免疫——手动关注的存续不取决于 Steam 真实愿望单（账户同步 15min
-    # 高频后，无此标记的手动条目 15 分钟内即被洗掉）。
+    # 星标关注列：关注真相源是 monitoring 的 favorite 来源，本列只作账号同步
+    # 反向核对（愿望单已移除 → 停用）的输入，不派生监控来源。
     manual: Mapped[bool] = mapped_column(Boolean, default=False)
-    # 愿望单成员标记（Steam 愿望单同步来源）：爬取队列第一优先级（与关注
-    # 并列）；愿望单反向核对（Steam 侧已移除）时随成员资格清零。
+    # 愿望单成员标记（Steam 愿望单同步来源）：账号对账据此派生
+    # family_wishlist 来源；愿望单反向核对（Steam 侧已移除）时清零。
     wishlisted: Mapped[bool] = mapped_column(Boolean, default=False)
-    # 手动加入监控池（监控池页添加 / 任务页导入）：属普通监控条目——
-    # 不进愿望单成员标记、不产生关注；同步反向核对免疫（存续不取决于
-    # Steam 侧名单，否则手动条目入池 15 分钟内即被同步洗掉）。
+    # 手动加入列：加入真相源是 monitoring 的 manual 来源，本列不参与来源派生，
+    # 只作账号同步反向核对的输入。
     manual_pool: Mapped[bool] = mapped_column(Boolean, default=False)
-    # 手动移出监控池（监控池页删除）：同步复活（愿望单/已购仍在 Steam
-    # 名单里）一律被此标记挡住——否则用户删掉的条目 15 分钟内即被洗回来。
-    # 重新添加（add_pool_items / follow）时清标复活。
+    # 账号同步复活挡标（愿望单/已购仍在 Steam 名单时用）：与 monitoring 的
+    # 排除门配合——用户移出时落标，重新加入以 monitoring 解除排除为准。
     excluded: Mapped[bool] = mapped_column(Boolean, default=False)
     # 榜单发现源入池（topsellers/popularnew/comingsoon 轮询落池，见
     # wishlist_service.ensure_board_pool）：属普通监控条目（持久监控，

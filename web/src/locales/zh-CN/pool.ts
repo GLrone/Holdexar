@@ -103,7 +103,7 @@ const pool = {
   'pool.items.pendingName': '未抓取（新绑定条目）',
   'pool.items.noMatch': '未找到「{query}」—— 不在当前监控条目中。',
   'pool.items.noKindMatch': '当前类别下没有条目。',
-  'pool.items.empty': '暂无监控条目 —— 绑定账户并同步即可开始。',
+  'pool.items.empty': '还没有关注的游戏 —— 点「添加」粘贴游戏链接即可。',
 } as const
 
 export default pool

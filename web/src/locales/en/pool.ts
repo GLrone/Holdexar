@@ -93,7 +93,7 @@ const pool: Partial<Record<MessageKey, string>> = {
   'pool.items.pendingName': 'Not fetched yet (new entry)',
   'pool.items.noMatch': 'No match for “{query}” — not in the tracked items.',
   'pool.items.noKindMatch': 'No items in this category.',
-  'pool.items.empty': 'No tracked items yet — bind an account and sync to get started.',
+  'pool.items.empty': 'Nothing followed yet — hit Add and paste a game link.',
 }
 
 export default pool
