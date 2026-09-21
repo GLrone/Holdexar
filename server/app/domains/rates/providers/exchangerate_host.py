@@ -18,7 +18,7 @@ import asyncio
 import logging
 import os
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterable
 
@@ -92,6 +92,12 @@ class ExchangerateHostProvider:
         """按日期区间拉日线：{date: {currency: rate_to_cny}}。
 
         只含「Provider 返回且可交叉换算」的 (日期, 币种)；CNY 恒为 1.0。
+        写库前的一道完整性闸门：
+
+        - 窗口内**每一天**都必须返回，且每天都必须有可换算的 USDCNY；
+          缺日或某日缺 USDCNY → 整批判为不完整并抛 `ProviderError`
+          （宁可本轮不写、缺口留到下一轮，也不把半批数据报成成功）；
+        - 目标币种缺失不判失败：该币种当日不写，缺口继续保留（记日志）。
         """
         if end < start:
             raise ValueError(f"区间非法：{start} → {end}")
@@ -113,13 +119,35 @@ class ExchangerateHostProvider:
         if not isinstance(quotes, dict):
             raise ProviderError("响应缺少 quotes 结构")
         out: dict[date, dict[str, float]] = {}
-        for day_str, row in quotes.items():
-            day = _parse_day(day_str)
-            if day is None or not isinstance(row, dict):
-                continue
-            converted = _cross_to_cny(row, wanted)
-            if converted:
-                out[day] = converted
+        missing_days: list[date] = []
+        incomplete_days: list[date] = []
+        missing_codes: dict[str, int] = {}
+        day = start
+        while day <= end:
+            row = quotes.get(day.isoformat())
+            if not isinstance(row, dict):
+                missing_days.append(day)
+            elif not _has_usd_cny(row):
+                incomplete_days.append(day)
+            else:
+                converted = _cross_to_cny(row, wanted)
+                if converted:
+                    out[day] = converted
+                    for code in wanted:
+                        if code not in converted:
+                            missing_codes[code] = missing_codes.get(code, 0) + 1
+            day += timedelta(days=1)
+        if missing_days or incomplete_days:
+            sample = (missing_days or incomplete_days)[:3]
+            raise ProviderError(
+                f"响应不完整：{len(missing_days)} 天未返回、"
+                f"{len(incomplete_days)} 天无 USDCNY（示例 {sample}）"
+            )
+        if missing_codes:
+            logger.warning(
+                "timeframe 部分币种未返回（该币种当日不写、缺口保留）：%s",
+                sorted(missing_codes),
+            )
         return out
 
     async def fetch_historical(
@@ -199,6 +227,12 @@ def _classify_error(status_code: int, data: dict) -> ProviderError:
     if status_code == 429 or code in (104, 429) or "limit" in etype or "quota" in etype:
         return ProviderQuotaError(f"配额或频率上限：{detail}")
     return ProviderError(f"Provider 返回失败：{detail}")
+
+
+def _has_usd_cny(quotes: dict) -> bool:
+    """该日是否可交叉换算（USDCNY 是换算分子，缺失则整日不可用）。"""
+    value = quotes.get("USDCNY")
+    return isinstance(value, (int, float)) and value > 0
 
 
 def _parse_day(value: object) -> date | None:
