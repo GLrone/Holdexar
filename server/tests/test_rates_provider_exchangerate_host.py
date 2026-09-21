@@ -35,7 +35,15 @@ def test_cross_to_cny_math():
     assert out["KZT"] == pytest.approx(6.5 / 500.0)
     assert out["JPY"] == pytest.approx(6.5 / 150.0)
     assert "EUR" not in out  # 值为 0 → 跳过
-    assert "USD" not in out
+    assert "USD" not in out  # 未请求 base → 不还原
+
+
+def test_cross_to_cny_restores_base_usd():
+    """base 还原：请求含 USD 时 1 USD = USDCNY（否则 USD 日线永远无法收敛）。"""
+    out = erh._cross_to_cny(
+        {"USDCNY": 6.5, "USDKZT": 500.0}, {"KZT", "CNY"}, include_usd=True
+    )
+    assert out["USD"] == pytest.approx(6.5)
 
 
 def test_cross_to_cny_without_usdcny_is_empty():
@@ -88,6 +96,8 @@ async def test_fetch_timeframe_parses_quotes_and_params(monkeypatch):
 
     assert out[date(2026, 9, 18)]["KZT"] == pytest.approx(6.5 / 500.0)
     assert out[date(2026, 9, 18)]["CNY"] == 1.0
+    # base 还原：请求列表含 USD → 1 USD = USDCNY
+    assert out[date(2026, 9, 18)]["USD"] == pytest.approx(6.5)
     assert "EUR" not in out[date(2026, 9, 18)]  # 未请求的币种不返回
     assert out[date(2026, 9, 19)]["KZT"] == pytest.approx(6.51 / 501.0)
     assert captured["path"] == "/timeframe"
