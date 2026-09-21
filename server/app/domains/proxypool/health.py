@@ -224,16 +224,21 @@ async def health_check_pool(
     now: datetime,
     url: str = PROBE_TARGET_URL,
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    names: tuple[str, ...] | None = None,
 ) -> tuple[HealthOutcome, ...]:
-    """对池内每个节点做一次 L0 探测：落一条观测，并按状态机推进 `state`。"""
-    names = _pool_names(data_dir)
+    """对池内每个节点做一次 L0 探测：落一条观测，并按状态机推进 `state`。
+
+    `names` 不给就取池文件当前节点；给了就只探这些——供调用方**分块**调用并逐块提交，
+    把 L0 的写锁窗口限制在块内（整池一次提交会随池规模把写锁按住数分钟）。
+    """
+    targets = tuple(names) if names is not None else _pool_names(data_dir)
     rows = await session.execute(
-        select(ProxyNode).where(ProxyNode.runtime_name.in_(names))
+        select(ProxyNode).where(ProxyNode.runtime_name.in_(targets))
     )
     by_name = {row.runtime_name: row for row in rows.scalars()}
 
     outcomes: list[HealthOutcome] = []
-    for name in names:
+    for name in targets:
         node = by_name.get(name)
         if node is None:
             # 池里有、Registry 没有：这不该发生（reconcile 会先报差额）。

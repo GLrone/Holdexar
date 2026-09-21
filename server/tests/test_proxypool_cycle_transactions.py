@@ -8,6 +8,7 @@ from __future__ import annotations
 from datetime import datetime
 
 import pytest
+import yaml
 from sqlalchemy import func, select
 
 from app.core.config import get_settings
@@ -117,3 +118,35 @@ async def test_l0_writes_visible_to_other_connection_during_maintenance(
             select(HealthObservation.level, func.count())
             .group_by(HealthObservation.level))).all())
     assert levels == {"L0": 1, "L1": 1}, "两段写入都必须最终落库"
+
+
+@pytest.mark.asyncio
+async def test_l0_commits_in_chunks(tmp_data_dir, monkeypatch):
+    """池内 L0 按块提交：写锁窗口 = 一块的耗时，不随池规模线性增长。"""
+    rec = _Recorder()
+    chunks: list[tuple[str, ...]] = []
+
+    async def _fake_pool(session, **kw):  # noqa: ANN001
+        chunks.append(tuple(kw["names"]))
+        return ()
+
+    async def _empty(*a, **kw):
+        return ()
+
+    monkeypatch.setattr(sched, "health_check_pool", _fake_pool)
+    monkeypatch.setattr(sched, "eligible_runtime_names", _empty)
+    monkeypatch.setattr(sched, "request_rebuild", lambda: None)
+
+    names = [f"1|n{i}" for i in range(23)]
+    (tmp_data_dir / "proxypool").mkdir(parents=True, exist_ok=True)
+    (tmp_data_dir / "proxypool" / "crawl-pool.yaml").write_text(
+        yaml.safe_dump({"proxies": [{"name": n, "type": "http",
+                                     "server": "10.0.0.1", "port": 1} for n in names]}),
+        encoding="utf-8",
+    )
+
+    await sched.run_l0_cycle(rec, data_dir=tmp_data_dir, controller_url="http://127.0.0.1:9",
+                             secret="s", now=NOW)
+
+    assert [len(c) for c in chunks] == [10, 10, 3], f"分块应为 10/10/3，实际 {[len(c) for c in chunks]}"
+    assert rec.events == ["commit", "commit", "commit"], "每块后都要提交（写锁窗口受块约束）"

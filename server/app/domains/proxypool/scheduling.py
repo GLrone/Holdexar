@@ -36,7 +36,7 @@ from app.domains.proxypool.health import (
     health_check_pool,
     recover_dead_nodes,
 )
-from app.domains.proxypool.pool import eligible_runtime_names
+from app.domains.proxypool.pool import eligible_runtime_names, pool_file_names
 from app.domains.proxypool.runtime import (
     RebuildResult,
     _KernelRuntime,
@@ -47,6 +47,10 @@ from app.domains.proxypool.runtime import (
 )
 
 logger = logging.getLogger(__name__)
+
+# 池内 L0 每探这么多个节点提交一次：写锁窗口 = 一块的探测耗时，不随池规模线性增长。
+# 单块最坏情况（全部超时）≈ 10 × DEFAULT_TIMEOUT_MS，仍在 60s busy_timeout 之内。
+L0_COMMIT_EVERY = 10
 
 _pending = False
 
@@ -97,20 +101,30 @@ async def run_l0_cycle(
     配置的内核）：DEAD 不在池文件里，池内 L0 永远探不到它，没有这条路径节点一旦 DEAD
     就永久出局、失败计数也停住。恢复成功使节点重新合格，合格集变化由下面的
     before/after 比较去请求重建。
+
+    **写锁窗口**：池内探针按 `L0_COMMIT_EVERY` 分块，逐块提交——整池一次提交会随池规模
+    把写锁按住数分钟，同时段其它 job 的写入会撞满 `busy_timeout`。
     """
     before = await eligible_runtime_names(session)
-    outcomes = await health_check_pool(
-        session, data_dir=data_dir, controller_url=controller_url, secret=secret,
-        now=now, **({"url": target_url} if target_url else {}),
-    )
+    outcomes: list[HealthOutcome] = []
+    targets = pool_file_names(data_dir)
+    extra = {"url": target_url} if target_url else {}
+    for start in range(0, len(targets), L0_COMMIT_EVERY):
+        chunk = targets[start:start + L0_COMMIT_EVERY]
+        outcomes.extend(await health_check_pool(
+            session, data_dir=data_dir, controller_url=controller_url, secret=secret,
+            now=now, names=chunk, **extra,
+        ))
+        await session.commit()
     if recovery_controller is not None:
         await recover_dead_nodes(
             session, controller_url=recovery_controller[0], secret=recovery_controller[1],
-            now=now, **({"url": target_url} if target_url else {}),
+            now=now, **extra,
         )
+        await session.commit()
     if await eligible_runtime_names(session) != before:
         request_rebuild()
-    return outcomes
+    return tuple(outcomes)
 
 
 async def run_maintenance_cycle(
