@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sys
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import httpx
@@ -77,7 +77,7 @@ async def test_fetch_timeframe_parses_quotes_and_params(monkeypatch):
             "success": True,
             "quotes": {
                 "2026-09-18": {"USDCNY": 6.5, "USDKZT": 500.0, "USDEUR": 0.9},
-                "2026-09-19": {"USDKZT": 501.0},  # 缺 CNY → 整日不可换算
+                "2026-09-19": {"USDCNY": 6.51, "USDKZT": 501.0},
             },
         }
 
@@ -89,7 +89,7 @@ async def test_fetch_timeframe_parses_quotes_and_params(monkeypatch):
     assert out[date(2026, 9, 18)]["KZT"] == pytest.approx(6.5 / 500.0)
     assert out[date(2026, 9, 18)]["CNY"] == 1.0
     assert "EUR" not in out[date(2026, 9, 18)]  # 未请求的币种不返回
-    assert date(2026, 9, 19) not in out
+    assert out[date(2026, 9, 19)]["KZT"] == pytest.approx(6.51 / 501.0)
     assert captured["path"] == "/timeframe"
     params = captured["params"]
     # 生产实现必须用 currencies（symbols 被 Provider 静默忽略），base 锁 USD
@@ -126,12 +126,62 @@ async def test_fetch_timeframe_rejects_oversized_window(monkeypatch):
         await provider.fetch_timeframe(date(2025, 1, 1), date(2026, 1, 1), ["CNY"])
     with pytest.raises(ValueError):
         await provider.fetch_timeframe(date(2026, 9, 19), date(2026, 9, 18), ["CNY"])
-    # 365 天（含首尾）合法
+    # 365 天（含首尾）合法：返回完整 365 天即可用
     async def _fake_get(path, params):
-        return {"success": True, "quotes": {}}
+        return {
+            "success": True,
+            "quotes": {
+                (date(2025, 1, 1) + timedelta(days=i)).isoformat(): {
+                    "USDCNY": 6.5, "USDKZT": 500.0
+                }
+                for i in range(365)
+            },
+        }
 
     monkeypatch.setattr(provider, "_get", _fake_get)
-    assert await provider.fetch_timeframe(date(2025, 1, 1), date(2025, 12, 31), ["CNY"]) == {}
+    out = await provider.fetch_timeframe(date(2025, 1, 1), date(2025, 12, 31), ["KZT"])
+    assert len(out) == 365
+
+
+@pytest.mark.asyncio
+async def test_fetch_timeframe_rejects_incomplete_window(monkeypatch):
+    """完整性闸门：缺日 / 某日缺 USDCNY → 整批判失败（不把半批数据当成功）。"""
+    provider = _provider()
+
+    async def _missing_day(path, params):
+        return {
+            "success": True,
+            "quotes": {
+                "2026-09-18": {"USDCNY": 6.5, "USDKZT": 500.0},
+                "2026-09-20": {"USDCNY": 6.5, "USDKZT": 500.0},  # 9/19 未返回
+            },
+        }
+
+    monkeypatch.setattr(provider, "_get", _missing_day)
+    with pytest.raises(erh.ProviderError, match="响应不完整"):
+        await provider.fetch_timeframe(date(2026, 9, 18), date(2026, 9, 20), ["KZT"])
+
+    async def _missing_usd_cny(path, params):
+        return {"success": True, "quotes": {"2026-09-18": {"USDKZT": 500.0}}}
+
+    monkeypatch.setattr(provider, "_get", _missing_usd_cny)
+    with pytest.raises(erh.ProviderError, match="响应不完整"):
+        await provider.fetch_timeframe(date(2026, 9, 18), date(2026, 9, 18), ["KZT"])
+
+
+@pytest.mark.asyncio
+async def test_fetch_timeframe_allows_missing_currency_but_keeps_gap(monkeypatch):
+    """目标币种缺失不判失败：该币种当日不写，缺口继续保留。"""
+    provider = _provider()
+
+    async def _fake_get(path, params):
+        return {"success": True, "quotes": {"2026-09-18": {"USDCNY": 6.5}}}
+
+    monkeypatch.setattr(provider, "_get", _fake_get)
+    out = await provider.fetch_timeframe(
+        date(2026, 9, 18), date(2026, 9, 18), ["KZT", "RUB"]
+    )
+    assert out[date(2026, 9, 18)] == {"CNY": 1.0}  # KZT / RUB 缺失 → 不写、保留缺口
 
 
 @pytest.mark.asyncio
