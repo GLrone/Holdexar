@@ -40,6 +40,8 @@ def _sanitize_db_lru_caches():
     if not bind_url or bind_url != expected:
         orig_engine.cache_clear()
         orig_factory.cache_clear()
+    # settings 缓存同样会跨文件外溢（夹具在环境还原前清过、随后又被读回）
+    database_module.get_settings.cache_clear()
 
 
 @pytest.fixture(autouse=True)
