@@ -48,6 +48,7 @@ from app.domains.proxypool.registry import apply_snapshot
 from app.domains.proxypool.runtime import (
     DEFAULT_WAIT_TIMEOUT,
     _KernelRuntime,
+    align_lanes,
     apply_global_selection,
     controller_endpoint_of,
     current_global_selection,
@@ -396,6 +397,12 @@ async def ensure_pool_runtime(
                     False, True, None, base, build.runtime_names,
                     f"建立 GLOBAL 失败：now={applied!r}，期望 {chosen!r}",
                 )
+        # lane 入口就绪 + 逐条绑定：内核起来时各 lane 组默认选组内第一项，不建立绑定
+        # 就等于所有 lane 走同一个节点（"多入口"退化成单出口，系统却自称 ready）
+        await align_lanes(
+            data_dir=data_dir, controller_url=base, secret=secret,
+            pool_names=build.runtime_names, timeout=wait_timeout,
+        )
         return BootstrapResult(
             True, True, f"http://127.0.0.1:{port}", base, build.runtime_names,
             "bootstrap 完成",

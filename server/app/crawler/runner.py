@@ -37,10 +37,43 @@ logger = logging.getLogger(__name__)
 class CrawlRunConfig:
     regions: list[str] | None = None
     workers: int = DEFAULT_WORKER_COUNT
-    # 直连为标准形态（browse 按 country_code 返回各区数据）；proxy_url
-    # 仅供调试通道显式指定（CLI --proxy / 环境变量），生产路径不传
+    # 单入口代理（调试通道 / 单入口形态）；生产多入口形态用 proxy_urls
     proxy_url: str | None = None
+    # 多入口形态：每条 lane 一个本机代理地址，worker 按序号固定绑定
+    proxy_urls: list[str] | None = None
     timeout: int = HTTP_TIMEOUT
+
+
+def build_worker_clients(
+    config: "CrawlRunConfig", http_client: SteamHttpClient
+) -> Callable[[int], SteamHttpClient] | None:
+    """多入口形态下的 worker → 入口工厂：**一 worker 一条 lane，run 内固定**。
+
+    每条 lane 有自己的限流预算与熔断器（见 `rate_limit.LaneRateLimits` 与
+    `http_client.LaneBreakers`）：某个出口撞风控或撞窗口只影响绑在它上面的 worker，
+    其余 lane 继续跑。`proxy_urls` 为空（单入口形态）返回 `None`——调用方沿用共享
+    客户端，行为不变。
+    """
+    urls = [u for u in (config.proxy_urls or []) if u]
+    if not urls:
+        return None
+    from .http_client import LaneBreakers
+    from .rate_limit import LaneRateLimits
+
+    limits = LaneRateLimits(len(urls))
+    breakers = LaneBreakers(len(urls))
+
+    def factory(worker_id: int) -> SteamHttpClient:
+        idx = worker_id % len(urls)
+        return SteamHttpClient(
+            timeout=config.timeout,
+            max_retries=3,
+            proxy_url=urls[idx],
+            rate_limiter=limits.for_lane(idx),
+            breaker=breakers.for_lane(idx),
+        )
+
+    return factory
 
 
 def build_router() -> CrawlerRouter:
@@ -192,6 +225,7 @@ async def _run_crawl_locked(
     http_client = SteamHttpClient(
         timeout=config.timeout, max_retries=3, proxy_url=config.proxy_url
     )
+    client_factory = build_worker_clients(config, http_client)
     router = build_router()
 
     target_ids = [int(a) for a, _ in (appids or [])]
@@ -200,13 +234,14 @@ async def _run_crawl_locked(
     )
 
     logger.info(
-        "任务就绪：常规 %d + 预构建 %d | appids=%d regions=%s workers=%d proxy=%s",
+        "任务就绪：常规 %d + 预构建 %d | appids=%d regions=%s workers=%d 入口=%s",
         len(_build_app_tasks(target_ids, regions, bs.EXTRAS_ENABLED)),
         len(pre_tasks or []),
         len(target_ids),
         ",".join(regions),
         config.workers,
-        config.proxy_url or "直连",
+        f"{len(config.proxy_urls)} 条 lane" if client_factory
+        else (config.proxy_url or "直连"),
     )
 
     connector = aiohttp.TCPConnector(limit=config.workers * 2, ttl_dns_cache=60)
@@ -237,6 +272,7 @@ async def _run_crawl_locked(
             router, http_client, db, worker_count=config.workers, stop_event=stop_event,
             failure_ledger=bs.FAILED_TASKS,
             error_sink=error_sink,
+            client_factory=client_factory,
         )
         await scheduler.run(tasks, session)
 
