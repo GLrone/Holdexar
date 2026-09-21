@@ -14,6 +14,7 @@ import { buildRateMap, formatWalletCny, walletToCny, type RateMap } from '@/lib/
 import { APP_NAME } from '@/appInfo'
 import ProductTour from '@/components/ProductTour.vue'
 import UpdateDialog from '@/components/business/UpdateDialog.vue'
+import UpdateEntry from '@/components/business/UpdateEntry.vue'
 import {
   HlIcon,
   HlImg,
@@ -357,6 +358,10 @@ async function manualRefreshWallet() {
               {{ crawlLabel }}
             </span>
           </div>
+
+          <!-- 更新提示胶囊：发现新版 / 下载中 / 待重启时才出现，悬停看更新内容、
+               点击打开更新报告窗口（下载中改显百分比，弹窗关掉也看得见进度） -->
+          <UpdateEntry />
         </div>
 
         <div class="app-header__actions">

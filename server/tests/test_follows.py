@@ -21,12 +21,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.core.database import get_session_factory
 from app.domains.games import service as games_service
 from app.domains.games.models import Game, GameCurrentPrice
+from app.domains.monitoring.models import MonitorExclusion, MonitorSource, MonitorTarget
 from app.domains.wishlist import follows
 from app.domains.wishlist.models import WishlistItem
 
 PROBE = [99700301, 99700302, 99700303]
 PRIMARY = "76561199000000001"
 OTHER = "76561199000000002"
+
+
+async def _clean_monitoring(session) -> None:
+    """探针的监控行一并清理：follow/unfollow 会经 monitoring 域落来源。
+
+    复用调用方的会话——另开会话会在既有写事务之外争 SQLite 锁。
+    """
+    for model in (MonitorSource, MonitorExclusion, MonitorTarget):
+        await session.execute(
+            delete(model).where(
+                model.target_type == "game", model.target_id.in_(PROBE)
+            )
+        )
 
 
 async def _seed_games() -> None:
@@ -40,6 +54,7 @@ async def _seed_games() -> None:
             )
         )
         await s.execute(delete(WishlistItem).where(WishlistItem.appid.in_(PROBE)))
+        await _clean_monitoring(s)
         for i, appid in enumerate(PROBE):
             s.add(Game(appid=appid, name=f"follow-probe-{i}", min_cny_fen=8000 + i))
             s.add(GameCurrentPrice(
@@ -65,6 +80,7 @@ async def _cleanup() -> None:
             )
         )
         await s.execute(delete(WishlistItem).where(WishlistItem.appid.in_(PROBE)))
+        await _clean_monitoring(s)
         await s.commit()
 
 

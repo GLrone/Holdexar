@@ -34,6 +34,25 @@ from app.domains.games.models import (  # noqa: E402
     Game,
     GameCurrentPrice,
 )
+from app.domains.monitoring.models import (  # noqa: E402
+    MonitorExclusion,
+    MonitorSource,
+    MonitorTarget,
+)
+
+
+async def _clean_monitoring(session, bundle_ids: list[int]) -> None:
+    """导入会经 monitoring 域登记来源，探针包的监控行一并清理。
+
+    复用调用方的会话——另开会话会在既有写事务之外争 SQLite 锁。
+    """
+    for model in (MonitorSource, MonitorExclusion, MonitorTarget):
+        await session.execute(
+            delete(model).where(
+                model.target_type == "bundle", model.target_id.in_(bundle_ids)
+            )
+        )
+
 
 BID_A = 990_101  # 可补齐包（mps=0）
 BID_B = 990_102  # 无任何区域价 → 列表应过滤
@@ -251,6 +270,7 @@ async def test_import_bundle_upserts_and_enqueue(monkeypatch):
     async with get_session_factory()() as session:
         await session.execute(delete(BundleRegionPrice).where(BundleRegionPrice.bundle_id == BID_IMP))
         await session.execute(delete(Bundle).where(Bundle.bundle_id == BID_IMP))
+        await _clean_monitoring(session, [BID_IMP])
         await session.commit()
 
 
@@ -288,6 +308,7 @@ async def test_import_bundle_sub_and_errors(monkeypatch):
         assert b_row.must_purchase_as_set == 1
         await session.execute(delete(BundleRegionPrice).where(BundleRegionPrice.bundle_id == 990202))
         await session.execute(delete(Bundle).where(Bundle.bundle_id == 990202))
+        await _clean_monitoring(session, [990202])
         await session.commit()
     assert seen["force_package_sub"] is True
 

@@ -36,8 +36,12 @@ import httpx
 from app.core.app_info import (
     APP_NAME,
     GITHUB_REPO,
+    HANDOFF_UNSUPPORTED_MARK,
     MANIFEST_ASSET,
     MANIFEST_TAG,
+    STAGING_DIR_NAME,
+    STAGING_MANIFEST_NAME,
+    SWAP_FAILED_FLAG,
 )
 from app.core.config import get_settings
 
@@ -57,7 +61,7 @@ _ASSET_PATTERN = re.compile(rf"^{re.escape(APP_NAME)}-win64-v[\w.-]+\.zip$", re.
 # 与 scripts/fetch_seed.py 的 _MIRRORS 同源，改动请两边对齐。
 _MIRRORS = ("https://ghfast.top/", "https://gh-proxy.com/", "https://gh-proxy.net/", "")
 
-STAGING_DIR = "update-staging"  # data/ 下的暂存目录
+STAGING_DIR = STAGING_DIR_NAME  # data/ 下的暂存目录（desktop 侧读同名目录）
 _PENDING_FILE = ".update-pending"  # 换装标记（staging 内 manifest.json 同目录）
 
 # 探测：候选通道各发一笔 `Range: bytes=0-0`（只读响应头，几十字节代价），一次并发
@@ -208,23 +212,60 @@ async def _check_update_via_api() -> dict:
     }
 
 
-def _version_gt(a: str, b: str) -> bool:
-    """点分数字比较：a > b 才更新（0.1.0 < 0.2.0 < 0.10.0）。
+def _version_parts(version: str) -> tuple[list[int], list[tuple[int, object]]]:
+    """版本号 → (主段数字, 预发布段)。
 
-    非数字段按 0 处理；长度不齐补 0（0.2 == 0.2.0）。
+    主段只取数字（`v0.2` 与 `0.2` 同解）；预发布段在 `-` 之后、`+` 之前，
+    数字标识按数值比、字母标识按字典序比——两者分属不同类型，比较时先看类型位。
     """
-    def _parts(v: str) -> list[int]:
-        out = []
-        for seg in v.replace("-", ".").split("."):
-            digits = re.sub(r"\D", "", seg)
-            out.append(int(digits) if digits else 0)
-        return out
+    text = version.strip()
+    if "+" in text:
+        text = text.split("+", 1)[0]
+    release_text, _, pre_text = text.partition("-")
 
-    pa, pb = _parts(a), _parts(b)
-    length = max(len(pa), len(pb))
-    pa += [0] * (length - len(pa))
-    pb += [0] * (length - len(pb))
-    return pa > pb
+    release: list[int] = []
+    for seg in release_text.split("."):
+        digits = re.sub(r"\D", "", seg)
+        release.append(int(digits) if digits else 0)
+
+    pre: list[tuple[int, object]] = []
+    if pre_text:
+        for ident in pre_text.split("."):
+            if ident.isdigit():
+                pre.append((0, int(ident)))
+            elif ident:
+                pre.append((1, ident.lower()))
+    return release, pre
+
+
+def _version_gt(a: str, b: str) -> bool:
+    """a 是否比 b 新。
+
+    主段按点分数字逐段比（0.1.0 < 0.2.0 < 0.10.0），长度不齐补 0（0.2 == 0.2.0）。
+    主段相同时按预发布段判：**有预发布段的一侧更旧**（0.1.0-beta.2 < 0.1.0），
+    两侧都有则逐标识比（0.1.0-alpha < 0.1.0-beta.2 < 0.1.0-rc.1），
+    同前缀下标识少的更旧（0.1.0-alpha < 0.1.0-alpha.1）。
+    """
+    rel_a, pre_a = _version_parts(a)
+    rel_b, pre_b = _version_parts(b)
+
+    length = max(len(rel_a), len(rel_b))
+    rel_a += [0] * (length - len(rel_a))
+    rel_b += [0] * (length - len(rel_b))
+    if rel_a != rel_b:
+        return rel_a > rel_b
+
+    if not pre_a and not pre_b:
+        return False
+    if not pre_a:
+        return True  # a 是正式版、b 是预发布 → a 更新
+    if not pre_b:
+        return False  # a 是预发布、b 是正式版 → a 更旧
+
+    for got, want in zip(pre_a, pre_b):
+        if got != want:
+            return got > want
+    return len(pre_a) > len(pre_b)
 
 
 def _plain_notes(body: str, limit: int = 1500) -> str:
@@ -406,9 +447,14 @@ async def download_update(
             "sha256": expected_sha256,
             "ready": True,
         }
-        (staging / "manifest.json").write_text(
+        (staging / STAGING_MANIFEST_NAME).write_text(
             json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
         )
+        # 新暂存包重新具备交接资格：上一包的「不支持换装」标记随包作废，
+        # 上次换装失败的安装状态标记也一并解除——否则重新下载同一版本会被
+        # 旧标记一直挡在自动换装之外。
+        (staging / HANDOFF_UNSUPPORTED_MARK).unlink(missing_ok=True)
+        (staging.parent / SWAP_FAILED_FLAG).unlink(missing_ok=True)
         _PROGRESS.update({"ok": True, "running": False, "phase": "done", "percent": 100})
         logger.info("[更新] %s 已暂存至 %s（重启后换装）", tag, staging)
         return {"ok": True, "staging": str(staging), "tag": tag}

@@ -100,10 +100,9 @@ def mixed_port_of(data_dir: Path) -> int:
 def prepare_runtime_config(data_dir: Path) -> Path:
     """由 `crawl-pool.yaml` 生成 `crawl-runtime.yaml`——内核实际启动用的文件。
 
-    为什么必须分文件：`ClashRuntime.start()` 会把 `external-controller` / `secret`
-    **写回它收到的那个文件**。若直接启动池文件，池就不再等于 `build_pool` 校验过的
-    产物，而且下一次 `build_pool` 一覆盖就把控制器注入抹掉——而 P1.4 的健康检测
-    正依赖控制器，这个矛盾不能带进健康模块。
+    池文件与内核启动配置必须分开：`ClashRuntime.start()` 会把 `external-controller` /
+    `secret` **写回它收到的那个文件**。直接启动池文件会让池不再等于 `build_pool`
+    校验过的产物，且下一次 `build_pool` 覆盖会抹掉控制器注入（健康检测依赖控制器）。
 
     职责：
     - `crawl-pool.yaml` = Registry 的纯运行集，**只读产物**，内核对它零写入；

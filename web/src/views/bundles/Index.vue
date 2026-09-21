@@ -406,7 +406,7 @@ const fen = (v: number | null | undefined, digits = 2) =>
 
 // ─── 详情抽屉（全区价格 / 补齐状态 / 游戏列表 / AGR / 赠礼） ───
 const drawerOpen = ref(false)
-/** 抽屉最高处须低于吸顶 navbar（高度随布局 68/50px 变化），打开时以实测为准 */
+/** 抽屉最高处须低于吸顶 navbar（高度随布局 68/50px 变化），打开时以量得值为准 */
 const stackTop = ref(140)
 const drawerBundle = ref<BundleSummary | null>(null)
 const detail = ref<BundleDetail | null>(null)

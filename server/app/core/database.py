@@ -180,6 +180,28 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "source_kind": "VARCHAR(12)",
         "observed_at": "DATETIME",
     },
+    # 所属价格刷新周期（NULL = 不挂周期：手动任务 / 暂不归属的修复轮 / 历史任务）
+    "crawl_jobs": {
+        "cycle_id": "INTEGER",
+    },
+    # 价格周期的阶段时刻与生产统计（统计口径见 crawl/stats.py）：
+    # 统计列全为 NULL = 本轮没留下统计（未收敛 / 进程中断）
+    "price_cycles": {
+        "running_at": "DATETIME",
+        "finalizing_at": "DATETIME",
+        "targets_total": "INTEGER",
+        "targets_done": "INTEGER",
+        "units_expected": "INTEGER",
+        "units_ok": "INTEGER",
+        "units_locked": "INTEGER",
+        "units_failed": "INTEGER",
+        "units_unobserved": "INTEGER",
+        "coverage": "REAL",
+        "coverage_confirmed": "REAL",
+        "stale_count": "INTEGER",
+        "duration_seconds": "REAL",
+        "stage_ms_json": "JSON",
+    },
 }
 
 # 增量索引（CREATE INDEX IF NOT EXISTS 幂等）
@@ -213,6 +235,19 @@ _TABLE_EXTRA_INDEXES: dict[str, list[str]] = {
     "proxy_nodes": [
         "CREATE INDEX IF NOT EXISTS ix_pn_state ON proxy_nodes(state)",
     ],
+    # 周期归属回查：本轮挂了哪些 job
+    "crawl_jobs": [
+        "CREATE INDEX IF NOT EXISTS ix_crawl_jobs_cycle ON crawl_jobs(cycle_id)",
+    ],
+    # 事件幂等依据：同一轮同一单元的同一类事件只允许一条；
+    # region_code 可空，按 COALESCE 归一（SQLite 视多个 NULL 互不相等）
+    "price_events": [
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_price_event_identity "
+        "ON price_events(cycle_id, appid, COALESCE(region_code, ''), event_type)",
+        "CREATE INDEX IF NOT EXISTS ix_price_events_cycle ON price_events(cycle_id)",
+        "CREATE INDEX IF NOT EXISTS ix_price_events_appid "
+        "ON price_events(appid, occurred_at)",
+    ],
 }
 
 
@@ -245,7 +280,7 @@ def _ensure_schema(sync_conn) -> None:
 #   2. _MIGRATIONS 追加 (版本号, 描述, SQL 列表)；SQL 须幂等（中断续跑 +
 #      用户库版本乱序防御），复杂逻辑可登记 async fn(engine) 同位元素
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # 零小数货币（Steam 以整数计价）：旧捆绑包链路的除数表按 1 处理，与「统一存分」
 # 的新约定差 100 倍——v2 归一的目标集合
@@ -516,6 +551,98 @@ async def _migrate_fx_history_canonical(conn) -> None:
         logger.info("[迁移:v8] 汇率历史同日合并：删除 %d 行（保留日收语义最后一行）", removed)
 
 
+async def _migrate_monitoring_bootstrap(conn) -> None:
+    """v9：监控层初始化（wishlist 现状 → Tracking Source + Monitoring Target）。
+
+    只搬迁「当前确实在监控中」的对象：`wishlist_items` 活跃行按 appid 去重
+    后的来源标记（多账户同 appid 取并集，落一行）。**games 全表不搬迁**——
+    存在于 Catalog 不等于用户想监控它，整表初始化成 Monitoring 正是监控层要
+    排除的错误。
+
+    wishlist 侧被手动移出的行（active=0 且 excluded=1）落成 excluded；
+    永久免费（free_kind='f2p'）不在此列——那是业务状态，不是用户意图，
+    搬迁后由 crawl 层的 `_excluded_free_appids` 继续兜住。
+
+    幂等：全走 INSERT OR IGNORE + 按现状覆盖的 UPDATE，重跑不产生重复行。
+    """
+    from sqlalchemy import text
+
+    from app.crawler.utils import get_beijing_time_obj
+
+    now = get_beijing_time_obj().replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+
+    # 同一 appid 多账户取最高档：与 crawl 层既有排序档位一致（关注 > 愿望单
+    # > 手动入池 > 已购 > 榜单）
+    prio = (
+        "MAX(CASE WHEN COALESCE(manual, 0) = 1 THEN 100"
+        " WHEN COALESCE(wishlisted, 0) = 1 THEN 95"
+        " WHEN COALESCE(manual_pool, 0) = 1 THEN 60"
+        " WHEN COALESCE(owned, 0) = 1 THEN 40"
+        " WHEN COALESCE(board_pool, 0) = 1 THEN 20 ELSE 0 END)"
+    )
+
+    await conn.execute(
+        text(
+            "INSERT OR IGNORE INTO monitor_targets"
+            " (target_type, target_id, state, priority, created_at, updated_at, activated_at)"
+            f" SELECT 'game', appid, 'active', {prio}, :now, :now, :now"
+            " FROM wishlist_items WHERE active = 1 GROUP BY appid"
+        ),
+        {"now": now},
+    )
+
+    for flag, source, priority in (
+        ("manual", "favorite", 100),
+        ("wishlisted", "family_wishlist", 95),
+        ("manual_pool", "manual", 60),
+        ("owned", "owned", 40),
+        ("board_pool", "board", 20),
+    ):
+        await conn.execute(
+            text(
+                "INSERT OR IGNORE INTO monitor_sources"
+                " (target_type, target_id, source, priority, active, created_at, updated_at)"
+                f" SELECT 'game', appid, :source, {priority}, 1, :now, :now"
+                f" FROM wishlist_items WHERE active = 1 AND COALESCE({flag}, 0) = 1"
+                " GROUP BY appid"
+            ),
+            {"source": source, "now": now},
+        )
+        await conn.execute(
+            text(
+                "UPDATE monitor_sources SET active = 1, priority = :priority, updated_at = :now"
+                " WHERE target_type = 'game' AND source = :source AND target_id IN"
+                f" (SELECT appid FROM wishlist_items WHERE active = 1 AND COALESCE({flag}, 0) = 1)"
+            ),
+            {"source": source, "priority": priority, "now": now},
+        )
+
+    # 手动移出 = 用户排除（排除 free_kind='f2p'：那是业务状态脱池）
+    _removed_where = (
+        "active = 0 AND COALESCE(excluded, 0) = 1"
+        " AND appid NOT IN (SELECT appid FROM wishlist_items WHERE active = 1)"
+        " AND appid NOT IN (SELECT appid FROM games WHERE free_kind = 'f2p')"
+    )
+    await conn.execute(
+        text(
+            "INSERT OR IGNORE INTO monitor_targets"
+            " (target_type, target_id, state, priority, created_at, updated_at, excluded_at)"
+            " SELECT 'game', appid, 'excluded', 0, :now, :now, :now"
+            f" FROM wishlist_items WHERE {_removed_where} GROUP BY appid"
+        ),
+        {"now": now},
+    )
+    await conn.execute(
+        text(
+            "INSERT OR IGNORE INTO monitor_exclusions"
+            " (target_type, target_id, reason, active, created_at)"
+            " SELECT 'game', appid, 'wishlist_removed', 1, :now"
+            f" FROM wishlist_items WHERE {_removed_where} GROUP BY appid"
+        ),
+        {"now": now},
+    )
+
+
 # (目标版本, 说明, 迁移体)：迁移体 = SQL 语句列表，或 async callable(engine)
 _MIGRATIONS: list[tuple[int, str, object]] = [
     (2, "bundle_region_prices 零小数货币单位归一（元→分 + cny_fen 去虚高）",
@@ -552,6 +679,9 @@ _MIGRATIONS: list[tuple[int, str, object]] = [
     (8, "fx_rate_history canonical 化（rate_date/source_kind 回填 + 旧 backfill 行"
         "改标 carried + 同日合并 + (currency_code, rate_date) 唯一索引）",
      _migrate_fx_history_canonical),
+    (9, "监控层初始化（wishlist_items 现状 → monitor_sources / monitor_targets："
+        "家族愿望单与手动入池等既有来源搬迁为 Tracking Source，games 全表不搬迁）",
+     _migrate_monitoring_bootstrap),
 ]
 
 
@@ -686,8 +816,11 @@ async def init_db() -> None:
     from app.domains.achievements import models as _achievements_models  # noqa: F401
     from app.domains.alerts import models as _alerts_models  # noqa: F401
     from app.domains.bills import models as _bills_models  # noqa: F401
+    from app.domains.crawl import cycle as _crawl_cycle  # noqa: F401
+    from app.domains.crawl import events as _crawl_events  # noqa: F401
     from app.domains.crawl import models as _crawl_models  # noqa: F401
     from app.domains.games import models as _games_models  # noqa: F401
+    from app.domains.monitoring import models as _monitoring_models  # noqa: F401
     from app.domains.proxies import models as _proxies_models  # noqa: F401
     from app.domains.rates import models as _rates_models  # noqa: F401
     from app.domains.regions import models as _regions_models  # noqa: F401

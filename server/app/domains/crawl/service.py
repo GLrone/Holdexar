@@ -18,6 +18,7 @@ from app.core.events import bus
 from app.crawler.config import DEFAULT_WORKER_COUNT, HTTP_TIMEOUT, WORKERS_MAX
 from app.crawler.runner import CrawlRunConfig, run_crawl
 from app.domains.alerts import service as alerts_service
+from app.domains.crawl import cycle as price_cycle
 from app.domains.crawl.models import CrawlJob
 from app.domains.games.models import Game, GameCurrentPrice
 from app.domains.games import service as games_service
@@ -59,6 +60,7 @@ async def cleanup_orphan_jobs() -> None:
         if rows:
             await session.commit()
             logger.warning("清理了 %d 个中断任务", len(rows))
+    await price_cycle.cleanup_orphan_cycles()
 
 
 async def import_appids(appids: list[int]) -> dict:
@@ -169,53 +171,22 @@ async def _wishlist_ordered(
     )
 
 
-async def _active_wishlist_ids() -> tuple[list[int], set[int], set[int]]:
-    """活跃监控条目去重 appid（下架脱池后，保序）+ 关注集 + 愿望单集。"""
-    async with get_session_factory()() as session:
-        rows = (
-            await session.execute(
-                select(
-                    WishlistItem.appid, WishlistItem.manual, WishlistItem.wishlisted
-                )
-                .where(WishlistItem.active.is_(True))
-                .distinct()
-            )
-        ).all()
-    # 多账户同游戏多行：manual / wishlisted 按任一账户计；appid 去重保序
-    # （distinct 对多列组合去不干净——SQLite DISTINCT 各列组合不同即保留）
-    seen_ids: set[int] = set()
-    ids: list[int] = []
-    manual_ids: set[int] = set()
-    wishlisted_ids: set[int] = set()
-    for r in rows:
-        appid = int(r.appid)
-        if appid not in seen_ids:
-            seen_ids.add(appid)
-            ids.append(appid)
-        if r.manual:
-            manual_ids.add(appid)
-        if r.wishlisted:
-            wishlisted_ids.add(appid)
-    # 下架脱池（宽限期外）：Steam 愿望单对下架游戏仍返回条目，
-    # 留着只会让每日价格刷新全 41 区空转打 404；
-    # 永久免费同理脱池（价格事实已定，再爬是空转配额）
-    removed = await _excluded_removed_appids()
-    free_marked = await _excluded_free_appids()
-    excluded = removed | free_marked
-    return [a for a in ids if a not in excluded], manual_ids, wishlisted_ids
-
-
 async def _resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tuple[int, str]]:
     """scope: appids（显式列表）| wishlist（全部活跃监控条目，含已购）
-    | wishlist_only（活跃且非已购）| owned（活跃且已购）| pool（全池）。
+    | wishlist_only（活跃且非已购）| owned（活跃且已购）
+    | pool（监控层）| catalog（目录层）。
     前四种按第一优先级（愿望单/关注）→ hot（打折/史低）→ appid 序排。
 
     wishlist 含已购是历史合并路径（跟随模式沿用，不为拆分多付一次预检）；
     自定义已购区域时用 wishlist_only + owned 两个 job 分道抓取。
-    pool 为全池监控层：监控条目（愿望单/关注/已购/手动入池优先序）排前，
-    其余 games 行垫后——主轮 6h 网格的爬取范围（appdetails 逐行时代全池
-    不可行、browse 批量后 ~34 批/区/轮成本可忽略；存储代价由 db_writer
-    历史差量门禁兜住）。
+
+    pool 与 catalog 是两个不同的层，不是一个集合的两段：
+    - pool = Monitoring：monitor_targets 里 state=active 的对象，来源是
+      家族愿望单 / 关注 / 手动入池 / 已购 / 榜单，排除门在 state 上；
+    - catalog = Catalog：games 主档里未被业务状态（下架宽限期外、永久免费）
+      摘除的行，减去 pool 已覆盖的对象——价格库维护轮。
+    主轮 6h 网格两段都跑（先 pool 后 catalog），总覆盖与合并成一个 job 时
+    相同，但「谁被监控」与「库里有什么」不再互相推导。
     """
     if scope == "appids":
         return [(int(a), "") for a in (appids or [])]
@@ -256,9 +227,22 @@ async def _resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tu
         ]
 
     if scope == "pool":
-        # 全池 = 监控条目优先序（复用 wishlist 排序）在前 + 其余 games 行
-        # （下架脱池、永久免费脱池）appid 稳定序垫后。单 job 一遍过——
-        # 愿望单同轮只爬一次，避免同价重复快照。
+        # 监控池：只取 Monitoring 层（有有效来源且未被排除）。下架宽限期外
+        # 与永久免费是业务状态，在 crawl 侧再过滤一层——它们不写监控排除，
+        # 仍留在 monitor_targets 里。
+        from app.domains.monitoring import service as monitoring_service
+
+        ids = await monitoring_service.crawl_order("game")
+        if not ids:
+            return []
+        excluded = await _excluded_removed_appids() | await _excluded_free_appids()
+        return [(a, "") for a in ids if a not in excluded]
+
+    if scope == "catalog":
+        # 目录层：games 主档里未被业务状态摘除的行，减去 pool 已覆盖的对象
+        # （同轮不重复爬，避免同价重复快照）。appid 稳定序。
+        from app.domains.monitoring import service as monitoring_service
+
         async with get_session_factory()() as session:
             pool_rows = (
                 await session.execute(
@@ -269,13 +253,19 @@ async def _resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tu
                     .order_by(Game.appid)
                 )
             ).scalars().all()
-        wl_ids, manual_ids, wishlisted_ids = await _active_wishlist_ids()
-        head = await _wishlist_ordered(wl_ids, manual_ids, wishlisted_ids)
-        head_set = set(head)
-        rest = [int(a) for a in pool_rows if int(a) not in head_set]
-        return [(a, "") for a in head] + [(a, "") for a in rest]
+        monitored = set(await monitoring_service.active_ids("game"))
+        return [(int(a), "") for a in pool_rows if int(a) not in monitored]
 
     raise ValueError(f"未知 scope: {scope}")
+
+
+async def plan_scope_appids(scope: str, appids: list[int] | None = None) -> list[int]:
+    """本轮范围解析（Cycle planning 冻结期望集用）：只取对象 id 序列。
+
+    与 `_resolve_scope_appids` 同一出口，保证「本轮该刷谁」在冻结时刻与
+    执行时刻口径一致；空列表 / 未知 scope 照旧抛 ValueError 由调用方跳过。
+    """
+    return [int(a) for a, _ in await _resolve_scope_appids(scope, appids)]
 
 
 # 欠账补抓冷却（分钟）。池价格爬取 6h 一轮 → 冷却是重试节奏的主闸：
@@ -312,6 +302,13 @@ async def _missing_tasks(
     return await db.generate_missing_tasks(
         cooldown_minutes=cooldown_minutes, limit_rows=limit_rows
     )
+
+
+async def has_pending_missing(
+    cooldown_minutes: int = REPAIR_RETRY_COOLDOWN_MINUTES,
+) -> bool:
+    """是否存在待补抓欠账（Cycle 判定本轮是否遗留未覆盖单元的出口）。"""
+    return bool(await _missing_tasks(cooldown_minutes=cooldown_minutes, limit_rows=1))
 
 
 async def _load_job(job_id: int) -> CrawlJob | None:
@@ -570,8 +567,12 @@ async def start_job(
     regions: list[str] | None = None,
     kind: str = "manual",
     missing_cooldown: int | None = None,
+    cycle_id: int | None = None,
 ) -> dict:
     """启动爬取任务。返回任务摘要；已有任务运行时抛 RuntimeError。
+
+    cycle_id 非空时本 job 归属该价格刷新周期（PriceCycle 1:N CrawlJob）；
+    不传即为不挂周期的任务（手动任务、暂不归属的修复轮）。
 
     kind="missing" 为补抓层：忽略 scope/appids，从欠账账本生成
     按区分组的批量补抓任务（每发只装该区欠账行），低 worker，
@@ -648,6 +649,7 @@ async def start_job(
             mode="app",
             regions_json=effective,
             started_at=datetime.now(),
+            cycle_id=cycle_id,
         )
         session.add(job)
         await session.commit()
@@ -688,13 +690,15 @@ async def run_sequential(
     specs: list[dict],
     *,
     missing_cooldown: int | None = None,
+    cycle_id: int | None = None,
 ) -> list[dict]:
     """串行链式启动多个爬取任务（单任务模型下唯一的多 spec 方式）。
 
     specs: [{scope, appids?, regions?, kind?}, ...]，逐个 start_job 并
     await 其完成；已有任务运行（RuntimeError）或任务列表为空（ValueError）
     时跳过该 spec 继续下一个——链式触发的健壮性优先于严格性。
-    missing_cooldown 显式传值时透传给 missing/repair 类 spec。
+    missing_cooldown 显式传值时透传给 missing/repair 类 spec；cycle_id
+    非空时本轮启动的 job 全部挂到该价格刷新周期。
     """
     results: list[dict] = []
     for spec in specs:
@@ -705,6 +709,7 @@ async def run_sequential(
                 regions=spec.get("regions"),
                 kind=spec.get("kind", "scheduled"),
                 missing_cooldown=missing_cooldown,
+                cycle_id=cycle_id,
             )
         except (RuntimeError, ValueError) as e:
             logger.info("[链式] 跳过 %s：%s", spec.get("kind", spec.get("scope")), e)
@@ -729,6 +734,7 @@ async def list_jobs(limit: int = 20) -> list[dict]:
             "kind": j.kind,
             "status": j.status,
             "mode": j.mode,
+            "cycleId": j.cycle_id,
             "regions": j.regions_json,
             "stats": j.stats_json,
             "startedAt": j.started_at.isoformat() if j.started_at else None,

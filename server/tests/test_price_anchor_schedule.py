@@ -167,6 +167,14 @@ async def _fire_price_refresh_once(monkeypatch, is_dst: bool) -> datetime:
 
     monkeypatch.setattr(external_time, "fetch_pacific_dst", _dst)
     monkeypatch.setattr(crawl_service_mod, "run_sequential", _spy_run)
+    # 价格周期记账打桩：本文件不建库，Cycle 有独立出口（create 返回 None =
+    # 本轮不挂 Cycle，锚点自续约照验）
+    import app.domains.crawl.cycle as cycle_mod
+
+    async def _no_cycle(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(cycle_mod, "create", _no_cycle)
     # 自动价格总开关打桩：本文件验的是锚点自续约，不建库——
     # 不桩会读真实数据目录的 crawl.auto_price，本机把它关掉时主轮直接返回
     async def _auto_on() -> bool:

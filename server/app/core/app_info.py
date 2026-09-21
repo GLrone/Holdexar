@@ -26,5 +26,16 @@ MANIFEST_TAG = "updater"
 MANIFEST_ASSET = "latest.json"
 MANIFEST_SCHEMA = 1
 
+# 换装暂存落点与交接标记：desktop/main.py 与 app/core/updater.py 共用一份——
+# 写标记的一方与判标记的一方各写一套字符串，必然漂移成「落下去了但没判住」。
+# manifest = 暂存就绪待换装；unsupported = 该暂存包不支持安全换装（二者在暂存目录内）；
+# swap_failed = 上次换装失败并已回滚，同一安装不再自动换装——它描述的是**安装状态**
+# 而不是某个包，所以落在**数据目录**：换装进程跑在暂存目录里删不掉自己，
+# 而作废清理要等下一次启动由现装进程执行，标记不能被那次清理带走。
+STAGING_DIR_NAME = "update-staging"
+STAGING_MANIFEST_NAME = "manifest.json"
+HANDOFF_UNSUPPORTED_MARK = ".handoff-unsupported"
+SWAP_FAILED_FLAG = ".swap-failed"
+
 # 环境变量前缀（pydantic-settings 用；改品牌时如需改前缀在此同步）
 ENV_PREFIX = "HOLDEXAR_"

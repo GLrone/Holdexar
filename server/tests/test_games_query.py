@@ -1,4 +1,4 @@
-"""games 列表查询重构后的行为验收（三层兜底查表模式）。
+"""games 列表查询的行为验收（三层兜底查表模式）。
 
 以 priceMatrix（区服键控 {"CN": [formatted, cnyFen, cents, null]}）为独立事实源，
 验证每条 SQL 筛选的语义正确性；不依赖实现细节。
