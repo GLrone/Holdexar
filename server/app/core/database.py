@@ -121,6 +121,25 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "deprecated": "BOOLEAN DEFAULT 0",
         "deprecated_at": "DATETIME",
         "deprecated_reason": "VARCHAR(200)",
+        # proxypool 抓取/快照元数据（订阅表是唯一入口）
+        "last_fetch_at": "DATETIME",
+        "last_fetch_status": "VARCHAR(32)",
+        "last_success_at": "DATETIME",
+        "last_error": "VARCHAR(500)",
+        "snapshot_sha256": "VARCHAR(64)",
+        "snapshot_version": "INTEGER DEFAULT 0",
+        # 生产准入（订阅级）：库层默认 ACTIVE（读不到值的行按 ACTIVE 兼容）；
+        # 新行由模型默认 CANDIDATE（见 proxies/models.py 常量说明）
+        "admission_status": "VARCHAR(16) DEFAULT 'ACTIVE'",
+    },
+    # 快照的来源 URL（provenance）：订阅可换链接，换链接后旧链接的成功快照不得
+    # 被当成当前订阅的事实（否则 URL=B 而 Registry 来自 Snapshot(A)）。
+    # 读回 NULL 时调用方按「当前 URL 没有成功快照」fail-closed。
+    "subscription_snapshots": {
+        "url": "VARCHAR(500)",
+        "http_status": "INTEGER",
+        "content_type": "VARCHAR(100)",
+        "source_channel": "VARCHAR(32)",
     },
     # account 域多账号在线状态（GetPlayerSummaries/miniprofile 双通道）
     "steam_accounts": {
@@ -184,6 +203,15 @@ _TABLE_EXTRA_INDEXES: dict[str, list[str]] = {
     # 节点状态账本按订阅取全量（test_clash_nodes UPSERT / 体检门槛查询）
     "clash_nodes": [
         "CREATE INDEX IF NOT EXISTS ix_clash_nodes_sub_name ON clash_nodes(subscription_id, name)",
+    ],
+    # proxypool：健康观测按节点取时间窗
+    "health_observations": [
+        "CREATE INDEX IF NOT EXISTS ix_pho_node_obs "
+        "ON health_observations(node_id, observed_at)",
+    ],
+    # proxypool：按状态筛运行池成员（pool 生成的主查询）
+    "proxy_nodes": [
+        "CREATE INDEX IF NOT EXISTS ix_pn_state ON proxy_nodes(state)",
     ],
 }
 

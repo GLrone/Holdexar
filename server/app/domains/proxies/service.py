@@ -41,7 +41,14 @@ def _clash_test_lock() -> asyncio.Lock:
         _clash_test_locks[loop] = lock
     return lock
 from . import clash_manager
-from .models import ClashNode, Proxy, ProxyEvent, ProxySubscription
+from .models import (
+    ADMISSION_ACTIVE,
+    ADMISSION_CANDIDATE,
+    ClashNode,
+    Proxy,
+    ProxyEvent,
+    ProxySubscription,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -854,6 +861,13 @@ async def list_subscriptions(kind: str | None = None) -> list[dict]:
             "deprecated": bool(s.deprecated),
             "deprecatedAt": s.deprecated_at.isoformat() if s.deprecated_at else None,
             "deprecatedReason": s.deprecated_reason,
+            # 生产准入（仅 clash 链有语义）：clash 按库值（NULL 视为 ACTIVE），
+            # plain 一律 ACTIVE（它没有 Candidate admission 生命周期）
+            "admissionStatus": (
+                (s.admission_status or ADMISSION_ACTIVE)
+                if s.kind == "clash"
+                else ADMISSION_ACTIVE
+            ),
         }
         for s in rows
     ]
@@ -887,7 +901,13 @@ async def add_subscription(kind: str, url: str, label: str | None = None) -> dic
 
     async with get_session_factory()() as session:
         sub = ProxySubscription(
-            kind=kind, url=url, label=label, created_at=_naive(get_beijing_time_obj())
+            kind=kind,
+            url=url,
+            label=label,
+            created_at=_naive(get_beijing_time_obj()),
+            # 仅 clash 链消费：clash 新订阅 → CANDIDATE（只抓取+落快照，
+            # 不进 Registry/生产池，进生产走显式晋升）；plain → ACTIVE
+            admission_status=(ADMISSION_CANDIDATE if kind == "clash" else ADMISSION_ACTIVE),
         )
         session.add(sub)
         await session.commit()

@@ -586,6 +586,12 @@ async def start_job(
     missing_cooldown 显式传值时覆盖 missing/repair 两类冷却。
     """
     global _active
+    from app.crawler.occupancy import crawler_busy
+
+    # 统一占用语义：bundles 链尾是直调 run_crawl 的（不登记 _active），
+    # 只看 _active 会漏掉它。在创建 job 之前就挡，避免留下注定失败的任务行。
+    if crawler_busy():
+        raise RuntimeError("已有爬取任务在运行")
     if _active is not None and not _active.task.done():
         raise RuntimeError("已有爬取任务在运行")
 
@@ -621,10 +627,19 @@ async def start_job(
     # worker 数按可用出口 IP 节点数分类开启（见 _resolve_worker_count）。
     worker_count = await _resolve_worker_count()
     small_lane = kind in ("missing", "repair", "backfill")
+    # 受管爬取：每次 run 只取一次当前 Runtime 代理地址，整个 run 固定用它
+    # （重建会换端口并打断在途请求，所以 run 内不换）。拿不到就拒绝启动，
+    # 不静默退回直连或旧订阅代理。
+    from app.core.config import get_settings as _get_settings
+    from app.domains.proxypool.runtime import require_runtime_proxy_url
+
+    proxy_url = require_runtime_proxy_url(_get_settings().data_dir)
+
     config = CrawlRunConfig(
         regions=effective,
         workers=min(worker_count, MISSING_RECOVERY_WORKERS) if small_lane else worker_count,
         timeout=HTTP_TIMEOUT,
+        proxy_url=proxy_url,
     )
     async with get_session_factory()() as session:
         job = CrawlJob(
