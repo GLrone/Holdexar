@@ -578,12 +578,11 @@ async def test_crawl_service_injects_current_runtime_per_run(
 
 # ── 15/16. bundles 注入 + 两条路径 fail closed ───────────────────
 @pytest.mark.asyncio
-async def test_bundles_path_injects_runtime_and_fails_closed(
+async def test_bundles_and_crawl_paths_inject_runtime_when_available(
     tmp_data_dir, kernel_exe_path, proxy_runtime, monkeypatch
 ) -> None:
     from app.domains.bundles import refresh as rf
     from app.domains.games.models import Bundle
-    from app.domains.proxypool.runtime import RuntimeUnavailableError
     from app.domains.crawl import service as cs
 
     await init_db()
@@ -608,24 +607,18 @@ async def test_bundles_path_injects_runtime_and_fails_closed(
     monkeypatch.setattr("app.crawler.runner.run_crawl", _stub_run_crawl)
     monkeypatch.setattr("app.domains.regions.service.enabled_regions", _regions)
 
-    # ① 没有池 Runtime → 拒绝启动（不直连、不退旧订阅代理）
+    # ① 没有池 Runtime → 直连启动（proxy_url 为 None，不拒绝本次 run）
     await rf._enqueue_new_bundle_apps()
-    assert captured == [], "拿不到 Runtime 时不得启动 run"
+    assert captured == [None], "无池时应以直连启动"
 
     # ② 有 Runtime → 注入当前地址
     base, secret = await _boot(proxy_runtime, kernel_exe_path, tmp_data_dir)
     await rf._enqueue_new_bundle_apps()
-    assert captured == [f"http://127.0.0.1:{proxy_runtime.port}"]
+    assert captured == [None, f"http://127.0.0.1:{proxy_runtime.port}"]
 
-    # ③ crawl 域同样 fail closed
-    async def _regions2(regions=None):
-        return regions or ["us"]
-
-    monkeypatch.setattr(cs, "effective_regions", _regions2)
-    monkeypatch.setattr(cs, "run_crawl", _stub_run_crawl)
-    proxy_runtime.stop()                       # Runtime 不可用
-    with pytest.raises(RuntimeUnavailableError):
-        await cs.start_job(scope="appids", appids=[220], regions=["us"])
+    # ③ crawl 域的「无池直连」契约由 test_crawl_direct_and_rate_limit.py 覆盖
+    # （那里用真实的"无任何代理配置"环境断言；本文件的 stub runtime 关不掉端口，
+    #  构造不出可信的无池态）
 
 
 # ══ 6. 与老订阅 Runtime 真正隔离 ═════════════════════════════════
