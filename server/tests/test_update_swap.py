@@ -11,7 +11,9 @@
 2. 落位失败（复制抛错）→ 回滚，原安装完好可启动；
 3. 落位数量对不上（复制静默失败）→ 校验拦下并回滚；
 4. 暂存包能力探测：`--help` 里有换装入口才算支持；
-5. 老暂存包（无换装入口）→ 拒换，一个文件都不动，只落标记避免重复弹窗。
+5. 老暂存包（无换装入口）→ 拒换，一个文件都不动，只落标记避免重复弹窗；
+6. 换装失败 → 落失败标记 + 作废该暂存载荷 + 回滚后拉起现装；
+7. 失败标记在场 → 交接拒换（不重演同一次失败），且 `__old__` 恢复副本不被清理。
 """
 from __future__ import annotations
 
@@ -294,3 +296,157 @@ def test_handoff_skipped_in_dev_mode(tmp_path: Path, monkeypatch) -> None:
     """开发态不换装：`_app_root()` 是仓库根，动它就是毁工作树。"""
     monkeypatch.setattr(desktop, "is_frozen", lambda: False)
     assert desktop._handoff_pending_update() is False
+
+
+# ── 失败路径（标记 / 拉起次序 / 作废清理）──────────────────────────────
+
+
+class _SyncThread:
+    """后台线程改同步执行：用于断言「先拉起现装、再弹窗」的次序。
+
+    弹窗是模态阻塞调用，排在拉起之前就会把现装挡在对话框之后。
+    """
+
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
+
+    def start(self) -> None:
+        if self._target:
+            self._target(*self._args, **self._kwargs)
+
+
+def _prepare_failed_helper_case(
+    tmp_path: Path, monkeypatch, *, install: Path | None = None
+) -> tuple[Path, Path, Path, list]:
+    """合成「换装必然失败」的现场。
+
+    返回 (数据目录, 暂存目录, 安装目录, 事件序列)；事件序列按发生次序记录
+    ("spawn", exe) 与 ("alert", 文案)。
+    """
+    data_dir = tmp_path / "data"
+    staging = data_dir / "update-staging"
+    _make_payload(staging)
+    _stage_manifest(staging)
+    target = install if install is not None else _make_install(tmp_path / "install")
+    events: list[tuple[str, object]] = []
+
+    monkeypatch.setattr(desktop, "_data_dir", lambda: data_dir)
+    monkeypatch.setattr(desktop, "_swap_payload", lambda _s, _t: False)
+    monkeypatch.setattr(desktop, "_alert", lambda msg: events.append(("alert", msg)))
+    monkeypatch.setattr(
+        desktop.subprocess,
+        "Popen",
+        lambda cmd, **kwargs: events.append(("spawn", cmd[0])),
+    )
+    monkeypatch.setattr(desktop.threading, "Thread", _SyncThread)
+    return data_dir, staging, target, events
+
+
+def test_run_update_helper_failure_marks_then_relaunches(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """换装失败：落安装状态标记 → 先拉起现装 → 再弹窗（次序不能反）。"""
+    data_dir, staging, target, events = _prepare_failed_helper_case(tmp_path, monkeypatch)
+
+    desktop._run_update_helper(staging, target, None)
+
+    # 标记落在数据目录（不随暂存目录清理）
+    flag = data_dir / desktop._FAILED_MARK
+    assert flag.is_file()
+    assert str(target) in flag.read_text(encoding="utf-8")
+    # 拉起先于弹窗：反过来会把现装挡在模态对话框之后
+    assert [kind for kind, _ in events] == ["spawn", "alert"]
+    assert events[0][1] == str(target / EXE_NAME)
+    # 载荷留给下一次启动的现装进程清理（本进程跑在它里面，删不掉自己）
+    assert (staging / APP_NAME / EXE_NAME).exists()
+
+
+def test_run_update_helper_failure_without_target_exe(tmp_path: Path, monkeypatch) -> None:
+    """程序目录内没有主程序：只落标记与弹窗，不凭空拉起。"""
+    empty_install = tmp_path / "install"
+    empty_install.mkdir()
+    data_dir, staging, target, events = _prepare_failed_helper_case(
+        tmp_path, monkeypatch, install=empty_install
+    )
+
+    desktop._run_update_helper(staging, target, None)
+
+    assert (data_dir / desktop._FAILED_MARK).is_file()
+    assert [kind for kind, _ in events] == ["alert"]
+
+
+def test_handoff_refuses_after_failed_swap(tmp_path: Path, monkeypatch) -> None:
+    """失败标记在场：不再交接，否则每次启动都在旧进程退出后重演同一次失败。"""
+    data_dir = tmp_path / "data"
+    staging = data_dir / "update-staging"
+    _make_payload(staging)
+    _stage_manifest(staging)
+    (data_dir / desktop._FAILED_MARK).write_text("failed\n", encoding="utf-8")
+    install = _make_install(tmp_path / "install")
+    spawns: list = []
+
+    monkeypatch.setattr(desktop, "is_frozen", lambda: True)
+    monkeypatch.setattr(desktop, "_data_dir", lambda: data_dir)
+    monkeypatch.setattr(desktop, "_app_root", lambda: install)
+    monkeypatch.setattr(desktop, "_staged_supports_helper", lambda _exe: True)
+    monkeypatch.setattr(
+        desktop.subprocess, "Popen", lambda cmd, **kwargs: spawns.append((cmd, kwargs))
+    )
+
+    assert desktop._handoff_pending_update() is False
+    assert spawns == []
+    # 现装与暂存包都没被动过（作废清理归下一次启动）
+    assert (install / EXE_NAME).read_bytes() == b"old-exe"
+    assert (staging / APP_NAME / EXE_NAME).exists()
+
+
+def test_should_clean_old_dir_keeps_backup_after_failed_swap(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """失败标记在场时不清 `__old__`：回滚没搬回原件时它是手工恢复的唯一退路。"""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    old_dir = tmp_path / "install" / "__old__"
+    old_dir.mkdir(parents=True)
+    monkeypatch.setattr(desktop, "_data_dir", lambda: data_dir)
+
+    assert desktop._should_clean_old_dir(old_dir) is True
+    (data_dir / desktop._FAILED_MARK).write_text("failed\n", encoding="utf-8")
+    assert desktop._should_clean_old_dir(old_dir) is False
+    assert desktop._should_clean_old_dir(tmp_path / "absent") is False
+
+
+def test_cleanup_staging_leftover_removes_voided_package(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """失败标记在场：作废的暂存包被清掉（腾空间 + 不再报「已下载待重启」）。"""
+    data_dir = tmp_path / "data"
+    staging = data_dir / "update-staging"
+    _make_payload(staging)
+    _stage_manifest(staging)
+    monkeypatch.setattr(desktop, "_data_dir", lambda: data_dir)
+
+    # 未失败且带 manifest：待换装的正经包，不许动
+    desktop._cleanup_staging_leftover()
+    assert (staging / "manifest.json").is_file()
+
+    (data_dir / desktop._FAILED_MARK).write_text("failed\n", encoding="utf-8")
+    desktop._cleanup_staging_leftover()
+    assert not staging.exists()
+    # 标记本身在数据目录，清理带不走它
+    assert (data_dir / desktop._FAILED_MARK).is_file()
+
+
+def test_cleanup_staging_leftover_removes_consumed_staging(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """无 manifest 的暂存目录是已消费残留：启动即清。"""
+    data_dir = tmp_path / "data"
+    staging = data_dir / "update-staging"
+    _make_payload(staging)
+    monkeypatch.setattr(desktop, "_data_dir", lambda: data_dir)
+
+    desktop._cleanup_staging_leftover()
+    assert not staging.exists()
