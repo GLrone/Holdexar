@@ -27,6 +27,7 @@ from app.domains.games.router import router as games_router
 from app.domains.metadata.router import router as metadata_router
 from app.domains.monitoring.router import router as monitoring_router
 from app.domains.proxies.router import router as proxies_router
+from app.domains.proxypool.router import router as proxypool_router
 from app.domains.rates.router import router as rates_router
 from app.domains.redeem.router import router as redeem_router
 from app.domains.regions.router import router as regions_router
@@ -209,6 +210,16 @@ async def _post_startup_chain() -> None:
             logger.info("[启动体检] Clash 节点检测完成")
     except Exception:  # noqa: BLE001
         logger.exception("[启动体检] Clash 节点检测失败（不阻塞启动）")
+
+    # 池 Runtime bootstrap：首次把「订阅 → Snapshot → Registry → Pool → Runtime」建起来。
+    # 幂等（已有可用 Runtime 直接返回）；**失败不阻塞启动**——crawler 保持 fail-closed，
+    # 30min 后的订阅刷新就是下一次机会。放在内核就位之后：bootstrap 需要内核可执行文件。
+    from app.core import scheduler as core_scheduler
+
+    try:
+        await core_scheduler._startup_pool_runtime()
+    except Exception:  # noqa: BLE001 —— 与链内其它步骤同约定：本步异常只留日志
+        logger.exception("[启动] 池 Runtime bootstrap 步骤异常（不阻塞启动）")
 
     # 汇率启动兜底：错过每日 03:00 定点（关机/服务重启）时按快照龄补刷新，
     # 保证"每日自动抓取"承诺不因服务频繁重启落空（内含 >12h 阈值，幂等安全）
@@ -394,6 +405,8 @@ def create_app() -> FastAPI:
     app.include_router(wishlist_router, prefix="/api/v1")
     app.include_router(crawl_router, prefix="/api/v1")
     app.include_router(proxies_router, prefix="/api/v1")
+    # proxypool 只读面：生产作业台账与出口账本
+    app.include_router(proxypool_router, prefix="/api/v1")
     app.include_router(alerts_router, prefix="/api/v1")
     app.include_router(rates_router, prefix="/api/v1")
     app.include_router(regions_router, prefix="/api/v1")

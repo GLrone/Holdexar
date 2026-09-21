@@ -588,6 +588,12 @@ async def start_job(
     missing_cooldown 显式传值时覆盖 missing/repair 两类冷却。
     """
     global _active
+    # 统一占用语义：bundles 链尾是直调 run_crawl 的（不登记 _active），只看
+    # _active 会漏掉它。在创建 job 之前就挡，避免留下一条"注定失败"的任务行。
+    from app.crawler.occupancy import crawler_busy
+
+    if crawler_busy():
+        raise RuntimeError("已有爬取任务在运行")
     if _active is not None and not _active.task.done():
         raise RuntimeError("已有爬取任务在运行")
 
@@ -617,16 +623,38 @@ async def start_job(
         if not pairs:
             raise ValueError("任务列表为空")
         effective = await effective_regions(regions)
-    # 直连为标准形态：browse 按 country_code 返回各区数据，出口 IP 不参与
-    # 判定；加速器（一般用户常态）在系统网络层透明生效。请求频率由全局
-    # 限流闸（rate_limit.py 200 发/5 分钟）统一约束，不再有代理前置条件。
-    # worker 数按可用出口 IP 节点数分类开启（见 _resolve_worker_count）。
+    # 受管爬取：**每次 run 只取一次**当前 Runtime 的入口集合，整个 run 固定用它
+    # （重建会换端口并打断在途请求，所以 run 内不换）。拿不到就拒绝启动——
+    # 绝不静默退回直连或旧订阅代理（那会把"池坏了"伪装成"爬取成功"）。
+    #
+    # 容量单位是**独立出口 IP**：lane 数由 Runtime 按出口槽定好，这里把 worker 数
+    # 收敛到 `min(期望值, lane 数, MAX_CRAWL_WORKERS)`——一个出口一个 worker 是默认
+    # 形态，超出上限的出口不占工位（保持可用，等下一轮或替换故障出口）。
+    from app.core.config import get_settings as _get_settings
+    from app.domains.proxypool.exits import MAX_CRAWL_WORKERS
+    from app.domains.proxypool.runtime import lane_run_plan
+
     worker_count = await _resolve_worker_count()
     small_lane = kind in ("missing", "repair", "backfill")
+    run_plan = lane_run_plan(_get_settings().data_dir)
+    proxy_urls = run_plan["urls"]
+    planned_workers = (
+        min(worker_count, MISSING_RECOVERY_WORKERS) if small_lane else worker_count
+    )
+    effective_workers = max(1, min(planned_workers, len(proxy_urls), MAX_CRAWL_WORKERS))
+    if effective_workers != planned_workers:
+        logger.info(
+            "[容量] worker 收敛：期望 %d → %d（出口槽 %d，上限 %d）",
+            planned_workers, effective_workers, len(proxy_urls), MAX_CRAWL_WORKERS,
+        )
     config = CrawlRunConfig(
         regions=effective,
-        workers=min(worker_count, MISSING_RECOVERY_WORKERS) if small_lane else worker_count,
+        workers=effective_workers,
         timeout=HTTP_TIMEOUT,
+        proxy_url=proxy_urls[0],
+        proxy_urls=proxy_urls,
+        exit_keys=run_plan["exit_keys"],
+        exit_nodes=run_plan["nodes"],
     )
     async with get_session_factory()() as session:
         job = CrawlJob(
