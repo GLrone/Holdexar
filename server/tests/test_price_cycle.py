@@ -82,6 +82,13 @@ def _crawl_env(monkeypatch):
 
     monkeypatch.setattr(proxies_service, "pool_stats", _pool_stats)
 
+    # 受管爬取的前置条件是「池 Runtime 可用」（fail closed）：这里给一个确定性的
+    # 可用入口，断言的是周期编排本身，不是运行时可用性。
+    import app.domains.proxypool.runtime as pp_runtime
+
+    monkeypatch.setattr(pp_runtime, "current_runtime_proxy_url",
+                        lambda _d=None: "http://127.0.0.1:1")
+
     async def _noop(*a, **kw):
         return 0
 

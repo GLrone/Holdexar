@@ -22,12 +22,20 @@ import asyncio
 import logging
 import time
 from collections import deque
+from collections.abc import Sequence
 
 logger = logging.getLogger(__name__)
 
 # 窗口参数（见 module docstring）
 RATE_LIMIT_MAX_REQUESTS = 200
 RATE_LIMIT_WINDOW_SECONDS = 300
+
+# ── 按出口分账的预算 ────────────────────────────────────────────
+# 口径：**当前生产预算**，不是「服务端每 IP 硬限制」。这条线的真实归属（按出口
+# IP、按 endpoint，还是别的维度）要靠 `proxy_run_exits` 的作业统计回答，在那之前不
+# 写死结论。单入口形态仍走下面的进程级单例（`steam_rate_limiter`），行为不变。
+EXIT_REQUEST_BUDGET = RATE_LIMIT_MAX_REQUESTS
+EXIT_WINDOW_SECONDS = RATE_LIMIT_WINDOW_SECONDS
 
 
 class SlidingWindowRateLimiter:
@@ -82,7 +90,51 @@ class SlidingWindowRateLimiter:
         return self._waited_total
 
 
-# 进程级单例：爬虫各 worker + 捆绑包刷新共享同一份窗口预算
+# 进程级单例：单入口（GLOBAL 形态）下，爬虫各 worker + 捆绑包刷新共享同一份窗口预算
 steam_rate_limiter = SlidingWindowRateLimiter(
     RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_SECONDS
 )
+
+
+class ExitRateLimits:
+    """多出口形态下的限流账本：**每个出口 IP 一份预算，同出口的 worker 共享**。
+
+    账本键是出口 IP（不是 lane 序号、也不是 worker 序号）：同一个出口上放几个 worker
+    都只吃这一份预算，不会因为多开一个 worker 就凭空多出一份额度。这是「Per-Exit
+    Rate Budget」的落点——出口是容量单位，预算也必须挂在出口上。
+
+    总额度因此**随出口数增长**（N 个出口 = N × `EXIT_REQUEST_BUDGET`）。这是刻意的：
+    单入口时期的总闸掩盖了多出口能力，而每个出口各自面对上游的那条线才是它自己的事。
+    全局保护由 `http_client.global_429_breaker` 承担，它只处理确属全局异常的情形。
+
+    出口键为空（单入口形态）时退回进程级单例，行为不变。
+    """
+
+    def __init__(
+        self,
+        exit_keys: Sequence[str],
+        max_requests: int = EXIT_REQUEST_BUDGET,
+        window_seconds: float = EXIT_WINDOW_SECONDS,
+    ) -> None:
+        # dict.fromkeys 去重且保序：同一个出口出现在多条 lane 上时只有一份预算
+        self._limits = {
+            str(key): SlidingWindowRateLimiter(int(max_requests), window_seconds)
+            for key in dict.fromkeys(str(k) for k in exit_keys if k)
+        }
+
+    def for_exit(self, key: str | None) -> SlidingWindowRateLimiter:
+        if not self._limits:
+            return steam_rate_limiter
+        limit = self._limits.get(str(key or ""))
+        return limit if limit is not None else steam_rate_limiter
+
+    @property
+    def exit_count(self) -> int:
+        return len(self._limits)
+
+    @property
+    def per_exit(self) -> int:
+        """每个出口的窗口预算（同一数值，便于测试与日志断言）。"""
+        if not self._limits:
+            return RATE_LIMIT_MAX_REQUESTS
+        return next(iter(self._limits.values())).max_requests

@@ -4,8 +4,9 @@
 - 计数器周期日志
 - asyncio.Event 停止信号
 - 每个任务完成向 SSE 事件总线发布 crawl.progress
-- Per-AppID Session：每个 app 任务创建独立 aiohttp session，处理完销毁——迫使
-  Clash（loadbalance）在下一个任务换出口 IP，规避 429 风控
+- **worker ↔ 入口绑定**：多入口形态下每个 worker 在整个 run 内固定使用一条 lane
+  （`client_factory(worker_id)` 决定），不再所有 worker 挤同一个入口。Session 只
+  负责连接池生命周期，不承担"换出口"职责。
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import asyncio
 import logging
 import time
 from collections import deque
+from collections.abc import Callable
 
 import aiohttp
 
@@ -24,24 +26,36 @@ logger = logging.getLogger(__name__)
 
 _PROGRESS_LOG_EVERY = 25
 
-# Per-AppID Session 连接预算（TCPConnector 参数）
+# 每任务连接预算（TCPConnector 参数）
 _PER_TASK_CONNECTOR_LIMIT = 20
 _PER_TASK_DNS_CACHE = 60
 
 
 class CrawlerScheduler:
-    """基于 asyncio.Queue 的高可用任务调度器（生产者-消费者模型）。"""
+    """基于 asyncio.Queue 的高可用任务调度器（生产者-消费者模型）。
+
+    `client_factory(worker_id) -> SteamHttpClient` 可选：给了就每个 worker 用它取
+    自己的客户端（多入口形态，一 worker 一 lane）；不给则全体共用 `http_client`
+    （单入口形态，行为不变）。
+    """
 
     def __init__(
         self, router, http_client, db_writer, worker_count=30, stop_event=None,
         failure_ledger: list | None = None,
+        error_sink: Callable[[BaseException], None] | None = None,
+        client_factory: Callable[[int], object] | None = None,
     ):
         self.router = router
         self.http_client = http_client
         self.db_writer = db_writer
         self.worker_count = worker_count
+        self.client_factory = client_factory
         self.queue: asyncio.Queue = asyncio.Queue()
         self.stop_event = stop_event or asyncio.Event()
+        # 错误分类回调（生产作业台账用）：worker 捕获到的异常在这里分类计数。
+        # **None = 不记账**（CLI/测试不必知道台账）。browse 层重试耗尽的失败不抛异常、
+        # 只进 failure_ledger，见 run_crawl 侧的补记。
+        self.error_sink = error_sink
 
         # 统计
         self.success_count = 0
@@ -102,6 +116,12 @@ class CrawlerScheduler:
         )
 
     async def _worker(self, worker_id: int, session) -> None:
+        # 本 worker 固定使用的入口客户端：多入口形态下一 worker 一条 lane，
+        # 整个 run 不换（换入口由 Runtime 的重建/重绑负责，不在这里发生）
+        http_client = (
+            self.client_factory(worker_id) if self.client_factory is not None
+            else self.http_client
+        )
         while not self.stop_event.is_set():
             try:
                 task = await self.queue.get()
@@ -115,22 +135,19 @@ class CrawlerScheduler:
             task_type = task.get("type", "unknown")
             task_id = task.get("id", "unknown")
             try:
-                # ── Per-AppID Session：每个任务独立 session，处理完销毁 ──
-                # 迫使 Clash 换出口 IP 规避 429（每任务独立 session，
-                # Connection: close 由 http_client 头统一附加）
                 if task_type == "app":
                     connector = aiohttp.TCPConnector(
                         limit=_PER_TASK_CONNECTOR_LIMIT, ttl_dns_cache=_PER_TASK_DNS_CACHE
                     )
                     async with aiohttp.ClientSession(connector=connector) as task_session:
                         context = CrawlerContext(
-                            task, self.http_client, self.db_writer, task_session
+                            task, http_client, self.db_writer, task_session
                         )
                         context.queue = self.queue
                         context.stop_event = self.stop_event
                         await self.router.route(context)
                 else:
-                    context = CrawlerContext(task, self.http_client, self.db_writer, session)
+                    context = CrawlerContext(task, http_client, self.db_writer, session)
                     context.queue = self.queue
                     context.stop_event = self.stop_event
                     await self.router.route(context)
@@ -143,6 +160,11 @@ class CrawlerScheduler:
                     self.total_processed += 1
                     self.fail_count += 1
                     self._completed_ids.add(str(task_id))
+                if self.error_sink is not None:
+                    try:
+                        self.error_sink(e)
+                    except Exception:  # noqa: BLE001 —— 记账回调绝不能拖垮 worker
+                        logger.exception("[Worker-%d] 错误分类回调异常", worker_id)
                 logger.error("[Worker-%d] %s:%s 异常: %s", worker_id, task_type, task_id, e)
             finally:
                 self.queue.task_done()
