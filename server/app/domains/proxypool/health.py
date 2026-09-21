@@ -6,15 +6,15 @@
     L1 = 出口身份   —— 它的出口 IP 是什么（`exit_ip_check_pool`，只记录）
     L2 = 业务层     —— 能不能完成 Holdexar 生产所需的 StoreBrowse 请求（只记录）
 
-**L0 不用生产业务接口当目标。** 实测生产主机 `api.steampowered.com` 的响应在
+**L0 不用生产业务接口当目标。** 生产主机 `api.steampowered.com` 的响应在
 1.2s~22s 之间抖动、且偶发超时（连它上面最轻的接口也 4/6 成功）；而 L0 失败会推进
 `state`，把生产业务接口当 L0 目标等于**把外部业务服务的抖动耦合进节点状态机**——
 一次网络抖动就能成片杀掉节点。业务可用性归 L2，那里失败不改状态。
 
 L0 目标选的是最轻的连通性探测（204、无响应体、跨地区可达性好）。选型来自真内核
-`/delay` 的实测对比，不是凭经验拍一个公网地址。
+`/delay` 的响应对比，而不是凭经验选一个公网地址。
 
-**探测形状取自真实内核实测**（本机 mihomo）：
+**探测形状取自真实内核行为**（本机 mihomo）：
 
     HTTP 200  {"delay": 2}                                     → 成功
     HTTP 503  {"message":"An error occurred in the delay test"} → 节点在、探测失败
@@ -323,7 +323,7 @@ async def recover_dead_nodes(
 
 
 # ══ L1：出口 IP ══════════════════════════════════════════════════
-# 路径（已实测）：PUT /proxies/GLOBAL 选中节点 → 经 mixed-port 发真实请求 →
+# 路径：PUT /proxies/GLOBAL 选中节点 → 经 mixed-port 发真实请求 →
 # 目标回显读回出口 IP。mixed-port 由运行配置携带（`prepare_runtime_config`），
 # 这里只读它，不做运行期 PATCH。
 #
@@ -497,7 +497,7 @@ async def exit_ip_check_pool(
 # 回答的是「这个节点能不能真正完成 Holdexar 生产所需的 StoreBrowse 请求」：
 # HTTP 200 只是及格线，还要业务语义成立（信封 / AppID / success / 价格字段）。
 #
-# 判据全部取自**生产实测**，不是猜的：
+# 判据取自生产契约：
 # - `success` 是整数 `1`（**不是布尔 true**）——所以这里显式拒绝 bool；
 # - `final_price_in_cents` 是**字符串** `"999"`——所以按 crawler 的 `_to_int` 语义
 #   解析，而不是要求 int。
@@ -549,7 +549,7 @@ def _validate_business(payload, appid: int) -> tuple[bool, str, int | None]:
         return False, f"store_items 里没有 appid={appid}", None
 
     success = item.get("success")
-    # 生产实测是整数 1；布尔 true 属于契约不符（True == 1 会蒙混过关，故显式拒绝）
+    # 生产契约是整数 1；布尔 true 属于契约不符（True == 1 会蒙混过关，故显式拒绝）
     if isinstance(success, bool) or success != 1:
         return False, f"success 不是整数 1（实际 {success!r}）", None
 

@@ -1,6 +1,6 @@
 """真实生产暴露的 schema 缺列修复：登记 + 老库自愈。
 
-背景：真实 holdexar-dev 库的 `subscription_snapshots` 由更早的停放期模型建成，
+真实 holdexar-dev 库的 `subscription_snapshots` 由更早的停放期模型建成，
 缺 `http_status` / `content_type` / `source_channel`，而这三列**从未登记**进
 `_TABLE_EXTRA_COLUMNS` → 首次真实同步的 INSERT 直接报
 `table subscription_snapshots has no column named http_status`。
@@ -10,6 +10,8 @@
 2. 老形状的库跑一次 `init_db()` 就能被补齐，且补齐后 `persist_snapshot` 可成功写入。
 """
 from __future__ import annotations
+
+import os
 
 import sqlite3
 from datetime import datetime
@@ -52,6 +54,9 @@ def tmp_data_dir(tmp_path, monkeypatch):
     get_engine.cache_clear()
     get_session_factory.cache_clear()
     yield tmp_path
+    # teardown 先还原环境再清缓存：monkeypatch 的还原发生在本夹具之后，
+    # 否则「缓存库 ≠ 当前配置库」判据判定相等，临时引擎会留给后续文件
+    os.environ.pop("HOLDEXAR_DATA_DIR", None)
     get_settings.cache_clear()
     get_engine.cache_clear()
     get_session_factory.cache_clear()

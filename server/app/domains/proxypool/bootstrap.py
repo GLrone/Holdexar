@@ -229,7 +229,7 @@ def _artifact_names(data_dir: Path) -> tuple[str, ...]:
 def default_kernel_proxy() -> str | None:
     """现有 Mihomo 内核（老 Clash）的混合入口——**仅作订阅获取的第二通道**。
 
-    直连被墙/超时是常态，而老 Clash 往往已经能出网。注意边界：它只是"帮我们下载订阅"
+    直连被墙/超时是常态，而老 Clash 往往已经能出网。注意边界：它只是"替调用方下载订阅"
     的外部条件，**不是 crawler 的代理**，也不构成 proxypool Runtime 的回退。
     """
     try:

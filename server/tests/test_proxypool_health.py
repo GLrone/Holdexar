@@ -175,7 +175,7 @@ class _BrokenTarget(BaseHTTPRequestHandler):
 
 
 class _FakeStoreBrowse(BaseHTTPRequestHandler):
-    """假 StoreBrowse：返回**实测到的真实信封结构**（可换 payload / 状态码）。"""
+    """假 StoreBrowse：返回**真实信封结构**（可换 payload / 状态码）。"""
 
     payload: dict = {}
     status = 200
@@ -223,6 +223,9 @@ def tmp_data_dir(tmp_path, monkeypatch):
     get_engine.cache_clear()
     get_session_factory.cache_clear()
     yield tmp_path
+    # teardown 先还原环境再清缓存：monkeypatch 的还原发生在本夹具之后，
+    # 否则「缓存库 ≠ 当前配置库」判据判定相等，临时引擎会留给后续文件
+    os.environ.pop("HOLDEXAR_DATA_DIR", None)
     get_settings.cache_clear()
     get_engine.cache_clear()
     get_session_factory.cache_clear()
@@ -430,7 +433,7 @@ async def test_special_runtime_names_are_located(
 ) -> None:
     """`|` `:` `#` 空格 Unicode `/` `?` `&` `=` 都必须能定位到节点。
 
-    `#` 不编码会被当成 URL fragment 截断——实测那样请求会落到 404，而不是找到节点。
+    `#` 不编码会被当成 URL fragment 截断——那样请求会落到 404，而不是找到节点。
     """
     await init_db()
     names = ["1|香港01", "2|usa: west #1", "3|东京 ⚡", "4|a/b?c&d=e"]
@@ -731,7 +734,7 @@ async def test_l2_target_service_failure_never_changes_state(
 @pytest.mark.parametrize(
     "payload,marker",
     [
-        # 生产实测 success 是整数 1；写成布尔 true 就是契约不符
+        # 生产契约 success 是整数 1；写成布尔 true 就是契约不符
         (_browse_payload(success=True), "success"),
         # 价格字符串不可解析 → 必须走 _to_int 语义而不是 isinstance(int)
         (_browse_payload(final="not-a-number"), "final_price_in_cents"),

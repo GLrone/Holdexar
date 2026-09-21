@@ -167,6 +167,9 @@ def tmp_data_dir(tmp_path, monkeypatch):
     get_engine.cache_clear()
     get_session_factory.cache_clear()
     yield tmp_path
+    # teardown 先还原环境再清缓存：monkeypatch 的还原发生在本夹具之后，
+    # 否则「缓存库 ≠ 当前配置库」判据判定相等，临时引擎会留给后续文件
+    os.environ.pop("HOLDEXAR_DATA_DIR", None)
     get_settings.cache_clear()
     get_engine.cache_clear()
     get_session_factory.cache_clear()
@@ -361,7 +364,7 @@ async def test_pending_rebuild_consumed_when_idle(
 
     assert result is not None
     assert rebuild_pending() is False, "消费过就该清空"
-    assert result.mixed_port != old_mixed, "重建后端口必然变化（P1.5 实测）"
+    assert result.mixed_port != old_mixed, "重建后端口必然变化"
     assert result.selection == "1|B", "GLOBAL 必须恢复到重建前的选择"
     assert await _global_now(result.controller_url, secret) == "1|B"
     assert proxy_runtime.controller_url != old_controller
