@@ -349,6 +349,7 @@ async def test_history_missing_cny_uses_historical_fx_only():
 
     day_hist = datetime(2026, 3, 10, 12, 0, 0)
     day_missing = datetime(2026, 3, 11, 12, 0, 0)
+    day_stock = datetime(2026, 3, 12, 12, 0, 0)
     async with get_session_factory()() as session:
         session.add_all([
             GamePriceHistory(
@@ -363,10 +364,23 @@ async def test_history_missing_cny_uses_historical_fx_only():
                 sub_id=990_00401, is_gold=False, version_suffix=None,
                 price_status="ok", cny_fen=None, snapshot_at=day_missing,
             ),
+            # 存量 cny_fen：即使当日有历史汇率也不得重算（存量优先）
+            GamePriceHistory(
+                appid=FX_HIST_APPID, region_code="XTS", currency="XTS",
+                price=300_000, original_price=300_000, discount_percent=0,
+                sub_id=990_00401, is_gold=False, version_suffix=None,
+                price_status="ok", cny_fen=12345, snapshot_at=day_stock,
+            ),
             FxRateHistory(
                 currency_code="XTS", rate_to_cny=0.015, source="test",
                 source_kind="observed", rate_date=day_hist.date(),
                 fetched_at=day_hist,
+            ),
+            # day_stock 当日也有历史汇率：错误实现若重算存量会得 4500
+            FxRateHistory(
+                currency_code="XTS", rate_to_cny=0.015, source="test",
+                source_kind="observed", rate_date=day_stock.date(),
+                fetched_at=day_stock,
             ),
             FxRate(currency_code="XTS", rate_to_cny=0.012, fetched_at=day_missing),
         ])
@@ -376,6 +390,7 @@ async def test_history_missing_cny_uses_historical_fx_only():
         by_ts = {p["timestamp"]: p["cnyFen"] for p in r["points"]}
         assert by_ts[day_hist.isoformat()] == round(100_000 * 0.015)  # 历史 1500
         assert by_ts[day_missing.isoformat()] == 0  # 历史缺失 → 不回落当前汇率
+        assert by_ts[day_stock.isoformat()] == 12345  # 存量不重算
     finally:
         async with get_session_factory()() as session:
             await session.execute(

@@ -513,3 +513,128 @@ async def test_scheduler_job_runs_when_all_gates_pass(db, monkeypatch):
 
     await sched_mod._job_fx_history_repair()
     assert called and called[0]["max_windows"] == sched_mod._FX_REPAIR_MAX_WINDOWS
+
+
+# ── 修复链的边界行为：缺日整批不写 / 单币缺失 / 旧格式行收敛 ──────
+
+
+@pytest.mark.asyncio
+async def test_incomplete_window_writes_nothing_then_retries_next_run(db, monkeypatch):
+    """Provider 缺日（完整性闸门拒绝）→ 整批零写入；请求记入 quota 账本；
+    下一轮用完整数据仍能把这批缺口修掉（失败不吞缺口）。"""
+    await _seed_gap()
+    from app.domains.rates.providers import exchangerate_host as erh_mod
+
+    real_cls = erh_mod.ExchangerateHostProvider
+    # 9/3 故意缺 → 真实 fetch_timeframe 的完整性闸门应整批拒绝
+    incomplete = {
+        "success": True,
+        "quotes": {
+            "2026-09-02": {"USDCNY": 6.6, "USDXTS": 100.0},
+            "2026-09-04": {"USDCNY": 6.6, "USDXTS": 100.0},
+            "2026-09-05": {"USDCNY": 6.6, "USDXTS": 100.0},
+            "2026-09-06": {"USDCNY": 6.6, "USDXTS": 100.0},
+            "2026-09-07": {"USDCNY": 6.6, "USDXTS": 100.0},
+        },
+    }
+
+    class _Partial(real_cls):
+        async def _get(self, path, params):
+            return incomplete
+
+    monkeypatch.setattr(rates_history, "ExchangerateHostProvider", _Partial)
+    monkeypatch.setattr(rates_history, "resolve_api_key", lambda: "test-key")
+
+    first = await rates_history.repair_history_gaps(today=TODAY)
+    assert first["status"] == "provider_error"
+    assert first["written"] == 0  # 半批数据不落库
+    got = await _rows()
+    assert got["2026-09-02"] == (6.50, "carried")  # 原 carried 未动
+    usage = await rates_quota.get_usage(PROVIDER_NAME, rates_quota.key_fingerprint("test-key"))
+    assert usage["requestCount"] == 1  # 请求已记账（区分网络故障与配额）
+
+    full = {**incomplete["quotes"], "2026-09-03": {"USDCNY": 6.6, "USDXTS": 100.0}}
+
+    class _Full(real_cls):
+        async def _get(self, path, params):
+            return {"success": True, "quotes": full}
+
+    monkeypatch.setattr(rates_history, "ExchangerateHostProvider", _Full)
+    second = await rates_history.repair_history_gaps(today=TODAY)
+    assert second["status"] == "ok"
+    assert second["written"] == 5  # 9/2 carried + 9/3、9/4、9/6、9/7 缺（9/5 已有 observed）
+    got = await _rows()
+    assert got["2026-09-02"][1] == "observed"
+    assert got["2026-09-03"][0] == pytest.approx(0.066)
+
+
+@pytest.mark.asyncio
+async def test_missing_target_currency_writes_others_and_keeps_gap(db, monkeypatch):
+    """某目标币种 Provider 未返回不判失败：其它币种照写 observed，
+    缺失币种缺口保留（下一轮继续，不被静默吞掉）。"""
+    await _add_history(XTS, [("2026-09-01", 6.5, "observed")])
+    await _add_history("XTS2", [("2026-09-01", 0.5, "observed")])
+    monkeypatch.setattr(rates_service, "ALLOWED_CURRENCIES", frozenset({XTS, "XTS2"}))
+    calls: list = []
+    rows = {
+        d: {XTS: 6.5}
+        for d in (
+            date(2026, 9, 2), date(2026, 9, 3), date(2026, 9, 4),
+            date(2026, 9, 5), date(2026, 9, 6), date(2026, 9, 7),
+        )
+    }  # 全程只有 XTS，没有 XTS2
+    monkeypatch.setattr(rates_history, "ExchangerateHostProvider", _fake_provider(rows, calls))
+    monkeypatch.setattr(rates_history, "resolve_api_key", lambda: "test-key")
+
+    result = await rates_history.repair_history_gaps(today=TODAY)
+
+    assert result["status"] == "ok"
+    got = await _rows()
+    assert got["2026-09-02"][1] == "observed"  # XTS 照写
+    got2 = await _rows("XTS2")
+    assert got2 == {"2026-09-01": (0.5, "observed")}  # XTS2 一个都没写
+    scan = await rates_history.scan_history_gaps(today=TODAY)
+    assert scan["currencies"]["XTS2"]["missing"] == 6  # 缺口保留
+    assert "XTS" not in scan["currencies"]  # XTS 已修满
+
+
+@pytest.mark.asyncio
+async def test_legacy_rows_converge_to_observed_and_scan_clears(db, monkeypatch):
+    """旧格式行（无 canonical 列 + source=backfill）语义闭环：scan 推导为
+    carried → repair 写同日 observed → 同日多行取 observed，scan 不再列该日。
+    （物理上旧 NULL 行仍留在表中——真实环境体检项，不影响语义收敛。）"""
+    async with database_module.get_session_factory()() as session:
+        session.add_all(
+            [
+                FxRateHistory(
+                    currency_code=XTS, rate_to_cny=0.015, source="backfill",
+                    source_kind=None, rate_date=None,
+                    fetched_at=datetime(2026, 9, 2, 12, 0, 0),
+                ),
+                FxRateHistory(
+                    currency_code=XTS, rate_to_cny=0.015, source="backfill",
+                    source_kind=None, rate_date=None,
+                    fetched_at=datetime(2026, 9, 3, 12, 0, 0),
+                ),
+            ]
+        )
+        await session.commit()
+    scan1 = await rates_history.scan_history_gaps(today=TODAY)
+    assert scan1["currencies"][XTS]["carried"] == 2  # 无 canonical 列也识别为待修复
+
+    calls: list = []
+    rows = {
+        d: {XTS: 0.05}
+        for d in (date(2026, 9, 2), date(2026, 9, 3))
+    }
+    monkeypatch.setattr(rates_history, "ExchangerateHostProvider", _fake_provider(rows, calls))
+    monkeypatch.setattr(rates_history, "resolve_api_key", lambda: "test-key")
+
+    result = await rates_history.repair_history_gaps(today=TODAY)
+
+    assert result["status"] == "ok"
+    assert result["written"] == 2
+    scan2 = await rates_history.scan_history_gaps(today=TODAY)
+    info2 = scan2["currencies"].get(XTS, {})
+    assert info2.get("carried", 0) == 0  # 旧行语义已被 observed 取代
+    assert info2.get("missing", 0) == 4  # 9/4 ~ 9/7 仍缺（未修区间）

@@ -7,7 +7,8 @@
 - `/timeframe` 返回 `{success, timeframe, start_date, end_date, source, quotes}`，
   `quotes = {<date>: {"<BASE><CCY>": rate}}`，窗口上限 365 天；
 - `currencies` 是唯一生效的币种过滤参数（`symbols` 被静默忽略返回全量）；
-- `base` 锁定 USD（传 base=CNY 无效），CNY 价交叉换算：1 target = USDCNY / USDtarget；
+- `base` 锁定 USD（传 base=CNY 无效），CNY 价交叉换算：1 target = USDCNY / USDtarget，
+  USD（base 自身）还原为 USDCNY；
 - 非交易日（周末/假日）Provider 自做 carry 填充，逐日返回；
 - 缺 key 返回 HTTP 200 + `success:false`（只判状态码会误当成功）；
 - 响应 headers 无月度余量（仅 1 req/s 级限速）→ 本地节流 + 本地配额账本。
@@ -91,7 +92,8 @@ class ExchangerateHostProvider:
     ) -> dict[date, dict[str, float]]:
         """按日期区间拉日线：{date: {currency: rate_to_cny}}。
 
-        只含「Provider 返回且可交叉换算」的 (日期, 币种)；CNY 恒为 1.0。
+        只含「Provider 返回且可交叉换算」的 (日期, 币种)；CNY 恒为 1.0；
+        请求含 USD 时以 USDCNY 还原 base 自身。
         写库前的一道完整性闸门：
 
         - 窗口内**每一天**都必须返回，且每天都必须有可换算的 USDCNY；
@@ -103,7 +105,7 @@ class ExchangerateHostProvider:
             raise ValueError(f"区间非法：{start} → {end}")
         if (end - start).days + 1 > MAX_WINDOW_DAYS:
             raise ValueError(f"窗口超过 {MAX_WINDOW_DAYS} 天上限：{start} → {end}")
-        wanted = self._normalize_currencies(currencies)
+        wanted, wants_usd = self._normalize_currencies(currencies)
         if not wanted:
             return {}
         data = await self._get(
@@ -130,7 +132,7 @@ class ExchangerateHostProvider:
             elif not _has_usd_cny(row):
                 incomplete_days.append(day)
             else:
-                converted = _cross_to_cny(row, wanted)
+                converted = _cross_to_cny(row, wanted, include_usd=wants_usd)
                 if converted:
                     out[day] = converted
                     for code in wanted:
@@ -154,7 +156,7 @@ class ExchangerateHostProvider:
         self, day: date, currencies: Iterable[str]
     ) -> dict[str, float]:
         """单日历史：{currency: rate_to_cny}。"""
-        wanted = self._normalize_currencies(currencies)
+        wanted, wants_usd = self._normalize_currencies(currencies)
         if not wanted:
             return {}
         data = await self._get(
@@ -168,17 +170,24 @@ class ExchangerateHostProvider:
         quotes = data.get("quotes")
         if not isinstance(quotes, dict):
             raise ProviderError("响应缺少 quotes 结构")
-        return _cross_to_cny(quotes, wanted)
+        return _cross_to_cny(quotes, wanted, include_usd=wants_usd)
 
     # ── 内部件 ──
 
     @staticmethod
-    def _normalize_currencies(currencies: Iterable[str]) -> set[str]:
-        wanted = {str(c).strip().upper() for c in currencies if c}
-        wanted.discard("USD")  # base 自身不在返回里
-        if wanted:
+    def _normalize_currencies(currencies: Iterable[str]) -> tuple[set[str], bool]:
+        """→ (请求参数币种集合, 是否需要在输出里还原 base)。
+
+        `USD` 是 base：Provider 响应不含它（`USDCNY` 即其换算值），请求参数
+        里剔除；但调用方要 USD 时输出须补回（1 USD = USDCNY），否则 USD
+        日线永远写不进 observed、缺口永远无法收敛。
+        """
+        raw = {str(c).strip().upper() for c in currencies if c}
+        wants_usd = "USD" in raw
+        wanted = {c for c in raw if c != "USD"}
+        if wanted or wants_usd:
             wanted.add("CNY")  # 交叉换算分子，有目标币种才需要随请求
-        return wanted
+        return wanted, wants_usd
 
     async def _get(self, path: str, params: dict[str, str]) -> dict:
         from app.domains.rates.http import open_client
@@ -242,15 +251,20 @@ def _parse_day(value: object) -> date | None:
         return None
 
 
-def _cross_to_cny(quotes: dict, wanted: set[str]) -> dict[str, float]:
+def _cross_to_cny(
+    quotes: dict, wanted: set[str], *, include_usd: bool = False
+) -> dict[str, float]:
     """`{USDxxx: rate}` → `{xxx: rate_to_cny}`：1 target = USDCNY / USDtarget。
 
-    USDCNY 缺失或非法时整日不可换算（返回空 dict）；CNY 恒 1.0。
+    USDCNY 缺失或非法时整日不可换算（返回空 dict）；CNY 恒 1.0；
+    `include_usd=True` 时补回 base 自身（1 USD = USDCNY）。
     """
     usd_cny = quotes.get("USDCNY")
     if not isinstance(usd_cny, (int, float)) or usd_cny <= 0:
         return {}
     out: dict[str, float] = {}
+    if include_usd:
+        out["USD"] = float(usd_cny)
     if "CNY" in wanted:
         out["CNY"] = 1.0
     for code in wanted:
