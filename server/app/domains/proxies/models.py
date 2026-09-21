@@ -8,6 +8,18 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
 
+# ── 订阅级「生产准入」────────────────────────────────────────────────
+# 它只回答一个问题：**这条订阅的节点是否获准进入 Registry / 生产池**。
+# **不是**「当前内核在跑哪条订阅」，**不是** Runtime GLOBAL 的选择，也**不是**
+# 节点级健康（那是 `ProxyNode.state`）。
+# - `ACTIVE`   ：获准进入生产——`sync_subscriptions` 会把它 apply 进 Registry；
+# - `CANDIDATE`：新来源尚未获准——只抓取 + 落快照，不进 Registry
+#                （见 `domains/proxypool/admission.py`）。
+# 与 `deprecated`（旧来源的可用性弃用）**完全独立**：两者互不转换、互不跟随。
+ADMISSION_ACTIVE = "ACTIVE"
+ADMISSION_CANDIDATE = "CANDIDATE"
+ADMISSION_STATUSES = (ADMISSION_ACTIVE, ADMISSION_CANDIDATE)
+
 
 class Proxy(Base):
     __tablename__ = "proxies"
@@ -66,6 +78,20 @@ class ProxySubscription(Base):
     deprecated: Mapped[bool] = mapped_column(Boolean, default=False)
     deprecated_at: Mapped[datetime | None] = mapped_column(DateTime)
     deprecated_reason: Mapped[str | None] = mapped_column(String(200))
+    # 生产准入（见文件头常量说明）。**模型默认 CANDIDATE**：新行一律先当候选，
+    # 显式晋升才进生产——产品新增订阅走 `add_subscription`（显式 CANDIDATE）。
+    # 库层默认 `'ACTIVE'` 只服务历史行兼容（`_TABLE_EXTRA_COLUMNS` 的 ALTER 会把
+    # 已存在的行填成 ACTIVE）；旧 KV 迁移路径显式写 ACTIVE（用户原有在用订阅）。
+    admission_status: Mapped[str] = mapped_column(
+        String(16), default=ADMISSION_CANDIDATE, server_default=ADMISSION_ACTIVE
+    )
+    # ── proxypool 抓取 / 快照元数据（仅增列，不影响既有代理链路）──
+    last_fetch_at: Mapped[datetime | None] = mapped_column(DateTime)
+    last_fetch_status: Mapped[str | None] = mapped_column(String(32))
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime)
+    last_error: Mapped[str | None] = mapped_column(String(500))
+    snapshot_sha256: Mapped[str | None] = mapped_column(String(64))
+    snapshot_version: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class ClashNode(Base):
