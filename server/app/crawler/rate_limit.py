@@ -23,12 +23,20 @@ import asyncio
 import logging
 import time
 from collections import deque
+from collections.abc import Sequence
 
 logger = logging.getLogger(__name__)
 
 # 窗口参数（实测定线，见 module docstring）
 RATE_LIMIT_MAX_REQUESTS = 200
 RATE_LIMIT_WINDOW_SECONDS = 300
+
+# ── 按出口分账的预算 ────────────────────────────────────────────
+# 口径：**当前生产预算**，不是「Steam 官方每 IP 硬限制」。这条线的真实归属（按出口
+# IP、按 endpoint，还是别的维度）要靠 `proxy_run_exits` 的作业统计回答，在那之前不
+# 写死结论。单入口形态仍走下面的进程级单例（`steam_rate_limiter`），行为不变。
+EXIT_REQUEST_BUDGET = RATE_LIMIT_MAX_REQUESTS
+EXIT_WINDOW_SECONDS = RATE_LIMIT_WINDOW_SECONDS
 
 
 class SlidingWindowRateLimiter:
@@ -89,36 +97,45 @@ steam_rate_limiter = SlidingWindowRateLimiter(
 )
 
 
-class LaneRateLimits:
-    """多入口（lane）形态下的限流账本：**每条 lane 一份预算，同 lane 的 worker 共享**。
+class ExitRateLimits:
+    """多出口形态下的限流账本：**每个出口 IP 一份预算，同出口的 worker 共享**。
 
-    总额度不随出口数放大：`RATE_LIMIT_MAX_REQUESTS` 按 lane 数均分（向下取整，至少 1），
-    所有 lane 加起来仍等于单入口时的那条线。多出口在这一层换到的是**故障隔离**
-    （一条 lane 撞窗口不再拖住其它 lane）与出口分散，而不是更多总配额——总配额要放大，
-    得先有真实作业数据回答"这条线按出口算还是按 endpoint 算"。
+    账本键是出口 IP（不是 lane 序号、也不是 worker 序号）：同一个出口上放几个 worker
+    都只吃这一份预算，不会因为多开一个 worker 就凭空多出一份额度。这是「Per-Exit
+    Rate Budget」的落点——出口是容量单位，预算也必须挂在出口上。
 
-    按 lane 序号取用（`for_lane`），所以 worker 数多于 lane 数时它们共享同一份预算，
-    不会因为多开一个 worker 就凭空多出一份额度。
+    总额度因此**随出口数增长**（N 个出口 = N × `EXIT_REQUEST_BUDGET`）。这是刻意的：
+    单入口时期的总闸掩盖了多出口能力，而每个出口各自面对上游的那条线才是它自己的事。
+    全局保护由 `http_client.global_429_breaker` 承担，它只处理"确属全局异常"的情形。
+
+    出口键为空（单入口形态）时退回进程级单例，行为不变。
     """
 
     def __init__(
         self,
-        lane_count: int,
-        max_requests: int = RATE_LIMIT_MAX_REQUESTS,
-        window_seconds: float = RATE_LIMIT_WINDOW_SECONDS,
+        exit_keys: Sequence[str],
+        max_requests: int = EXIT_REQUEST_BUDGET,
+        window_seconds: float = EXIT_WINDOW_SECONDS,
     ) -> None:
-        count = max(0, int(lane_count))
-        self.per_lane = max(1, int(max_requests) // count) if count else int(max_requests)
-        self._limits = [
-            SlidingWindowRateLimiter(self.per_lane, window_seconds) for _ in range(count)
-        ]
+        # dict.fromkeys 去重且保序：同一个出口出现在多条 lane 上时只有一份预算
+        self._limits = {
+            str(key): SlidingWindowRateLimiter(int(max_requests), window_seconds)
+            for key in dict.fromkeys(str(k) for k in exit_keys if k)
+        }
 
-    def for_lane(self, index: int) -> SlidingWindowRateLimiter:
-        """第 `index` 条 lane 的预算；lane 数为 0（单入口形态）时退回进程级单例。"""
+    def for_exit(self, key: str | None) -> SlidingWindowRateLimiter:
         if not self._limits:
             return steam_rate_limiter
-        return self._limits[index % len(self._limits)]
+        limit = self._limits.get(str(key or ""))
+        return limit if limit is not None else steam_rate_limiter
 
     @property
-    def lane_count(self) -> int:
+    def exit_count(self) -> int:
         return len(self._limits)
+
+    @property
+    def per_exit(self) -> int:
+        """每个出口的窗口预算（同一数值，便于测试与日志断言）。"""
+        if not self._limits:
+            return RATE_LIMIT_MAX_REQUESTS
+        return next(iter(self._limits.values())).max_requests

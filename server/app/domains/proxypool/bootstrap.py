@@ -41,8 +41,9 @@ import yaml
 from app.domains.proxies.models import ProxySubscription
 from app.domains.proxypool import events
 from app.domains.proxypool.admission import is_admitted
+from app.domains.proxypool.exits import select_exit_slots
 from app.domains.proxypool.pool import (
-    build_pool, eligible_runtime_names, pool_path,
+    build_pool, eligible_nodes, eligible_runtime_names, pool_path,
 )
 from app.domains.proxypool.registry import apply_snapshot
 from app.domains.proxypool.runtime import (
@@ -353,7 +354,8 @@ async def ensure_pool_runtime(
             )
 
         build = await build_pool(session, data_dir=data_dir)
-        config = prepare_runtime_config(data_dir)
+        slots = select_exit_slots(await eligible_nodes(session))
+        config = prepare_runtime_config(data_dir, lanes=len(slots) or None)
         runtime.stop()
         status = runtime.start(exe_path, str(config))
         base = status["controllerUrl"]
@@ -401,7 +403,8 @@ async def ensure_pool_runtime(
         # 就等于所有 lane 走同一个节点（"多入口"退化成单出口，系统却自称 ready）
         await align_lanes(
             data_dir=data_dir, controller_url=base, secret=secret,
-            pool_names=build.runtime_names, timeout=wait_timeout,
+            pool_names=build.runtime_names, slots=slots or None,
+            timeout=wait_timeout,
         )
         return BootstrapResult(
             True, True, f"http://127.0.0.1:{port}", base, build.runtime_names,

@@ -236,7 +236,7 @@ async def test_rebuild_reconcile_rejection_writes_event_outside_caller_transacti
         return _Build()
 
     monkeypatch.setattr(rt, "build_pool", _build_pool)
-    monkeypatch.setattr(rt, "prepare_runtime_config", lambda _d: env / "c.runtime.yaml")
+    monkeypatch.setattr(rt, "prepare_runtime_config", lambda _d, **kw: env / "c.runtime.yaml")
     monkeypatch.setattr(rt, "wait_proxy_names", lambda *a, **kw: _empty())
     monkeypatch.setattr(rt, "wait_mixed_port", lambda *a, **kw: _port())
     monkeypatch.setattr(

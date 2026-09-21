@@ -539,19 +539,36 @@ async def start_job(
     # （重建会换端口并打断在途请求，所以 run 内不换）。拿不到就拒绝启动——
     # 绝不静默退回直连或旧订阅代理（那会把"池坏了"伪装成"爬取成功"）。
     #
-    # 多入口形态下每个 worker 固定绑一条 lane（`CrawlRunConfig.proxy_urls`）；
-    # `proxy_url` 取第一条，供不走 worker 的请求（元数据预取等）使用同一个池出口。
+    # 容量单位是**独立出口 IP**：lane 数已由 Runtime 按出口槽定好，这里把 worker 数
+    # 收敛到 `min(配置值, lane 数, MAX_CRAWL_WORKERS)`——一个出口一个 worker 是默认
+    # 形态，超出上限的出口不占工位（保持可用，等下一轮或替换故障出口）。
     from app.core.config import get_settings as _get_settings
-    from app.domains.proxypool.runtime import require_lane_proxy_urls
+    from app.domains.proxypool.exits import MAX_CRAWL_WORKERS
+    from app.domains.proxypool.runtime import lane_run_plan
 
-    proxy_urls = require_lane_proxy_urls(_get_settings().data_dir)
+    plan = lane_run_plan(_get_settings().data_dir)
+    proxy_urls = plan["urls"]
+    exit_keys = plan["exit_keys"]
+    exit_nodes = plan["nodes"]
+
+    planned_workers = (
+        min(worker_count, MISSING_RECOVERY_WORKERS) if small_lane else worker_count
+    )
+    effective_workers = max(1, min(planned_workers, len(proxy_urls), MAX_CRAWL_WORKERS))
+    if effective_workers != planned_workers:
+        logger.info(
+            "[容量] worker 收敛：配置/默认 %d → %d（出口槽 %d，上限 %d）",
+            planned_workers, effective_workers, len(proxy_urls), MAX_CRAWL_WORKERS,
+        )
 
     config = CrawlRunConfig(
         regions=effective,
-        workers=min(worker_count, MISSING_RECOVERY_WORKERS) if small_lane else worker_count,
+        workers=effective_workers,
         timeout=HTTP_TIMEOUT,
         proxy_url=proxy_urls[0],
         proxy_urls=proxy_urls,
+        exit_keys=exit_keys,
+        exit_nodes=exit_nodes,
     )
     async with get_session_factory()() as session:
         job = CrawlJob(

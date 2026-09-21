@@ -34,7 +34,13 @@ import yaml
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domains.proxypool import events
-from app.domains.proxypool.pool import PoolBuildError, build_pool, pool_path
+from app.domains.proxypool.exits import MAX_CRAWL_WORKERS, ExitSlot, select_exit_slots
+from app.domains.proxypool.pool import (
+    PoolBuildError,
+    build_pool,
+    eligible_nodes,
+    pool_path,
+)
 
 # 内核内置的逻辑节点（不是池里的节点）。仅用于把 /proxies 里的「多出来的键」
 # 解释清楚；它们随内核版本可能变，所以**不**作为硬门禁参与 ok 判定。
@@ -58,6 +64,9 @@ class RuntimeUnavailableError(RuntimeError):
 
 
 RUNTIME_CONFIG_FILENAME = "crawl-runtime.yaml"
+# lane 计划：本次 run 的「lane → 出口 IP → 节点」对照表，作为归因与诊断的事实来源。
+# 运行配置里只有组与 listener；出口 IP 不在内核配置里，必须自己留一份。
+LANE_PLAN_FILENAME = "crawl-lanes.yaml"
 
 # 运行期专属键（只进运行配置，绝不回流进池文件）
 RUNTIME_MODE = "global"          # GLOBAL 是维护入口；生产流量走 lane，不经过它
@@ -74,9 +83,9 @@ RUNTIME_CONTROLLER_SECRET = "holdexar-proxypool"
 # GLOBAL 与 lane 的分工：GLOBAL 是维护入口（健康检查、人工查看、旧消费者），
 # lane 是生产入口。crawler 只拿 lane 地址，不碰任何选择器。
 LANE_GROUP_PREFIX = "lane-"
-# lane 数的上限：每条 lane 在内核里对应一个 listener 与一个组，数量随池规模走而不是
-# 固定值——出口多于上限时超额出口不占用工位（并发天花板由出口数与目标站共同决定）。
-MAX_LANES = 32
+# lane 数的上限 = 生产 worker 上限（`exits.MAX_CRAWL_WORKERS`）：工位数与出口槽数同源，
+# 两处取不同数值会出现「选得出 60 个出口，却只开得出 32 个工位」这种半截容量。
+MAX_LANES = MAX_CRAWL_WORKERS
 
 
 class RuntimeConfigError(RuntimeError):
@@ -86,6 +95,46 @@ class RuntimeConfigError(RuntimeError):
 def runtime_config_path(data_dir: Path) -> Path:
     """内核启动配置的路径（与只读的池文件同目录、不同文件）。"""
     return Path(data_dir) / "proxypool" / RUNTIME_CONFIG_FILENAME
+
+
+def lane_plan_path(data_dir: Path) -> Path:
+    """lane 计划的路径（运行配置的旁挂产物，内核不读它）。"""
+    return Path(data_dir) / "proxypool" / LANE_PLAN_FILENAME
+
+
+def write_lane_plan(data_dir: Path, plan: Sequence[Mapping]) -> Path:
+    """原子写 lane 计划（先 `.tmp` 再 replace，避免半截文件）。"""
+    out = lane_plan_path(data_dir)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    text = yaml.safe_dump(
+        {"lanes": [dict(entry) for entry in plan]}, allow_unicode=True, sort_keys=False
+    )
+    tmp = out.with_suffix(".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(out)
+    return out
+
+
+def read_lane_plan(data_dir: Path) -> list[dict]:
+    """读 lane 计划；缺失或形态不对返回空列表（读不到就是读不到，不是异常）。"""
+    try:
+        doc = yaml.safe_load(lane_plan_path(data_dir).read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return []
+    entries = doc.get("lanes") if isinstance(doc, Mapping) else None
+    return [dict(e) for e in entries if isinstance(e, Mapping)] if isinstance(entries, list) else []
+
+
+def exit_ip_for_lane(data_dir: Path, index: int) -> str | None:
+    """第 `index` 条 lane 绑定的出口 IP（未记录 → None）。"""
+    for entry in read_lane_plan(data_dir):
+        try:
+            if int(entry.get("lane", -1)) == int(index):
+                value = entry.get("exitIp")
+                return str(value) if value else None
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _free_local_port() -> int:
@@ -415,6 +464,7 @@ class RebuildResult:
     written_count: int
     lane_urls: tuple[str, ...] = ()       # 生产入口：每条 lane 一个本机地址
     lane_nodes: tuple[str, ...] = ()      # 各 lane 绑定到的节点（按 lane 序号）
+    lane_exits: tuple[str, ...] = ()      # 各 lane 绑定的出口 IP（同序；容量单位）
 
 
 def restore_selection(previous: str | None, available: Sequence[str]) -> str | None:
@@ -543,6 +593,7 @@ async def assign_lanes(
 async def align_lanes(
     *, data_dir: Path, controller_url: str, secret: str,
     pool_names: Sequence[str], previous: Sequence[str | None] = (),
+    slots: Sequence["ExitSlot"] | None = None,
     timeout: float = DEFAULT_WAIT_TIMEOUT,
 ) -> tuple[tuple[int, ...], list[str | None]]:
     """启动内核之后必须做的一件事：**等 lane 入口就绪并把绑定建立起来**。
@@ -550,13 +601,40 @@ async def align_lanes(
     内核起来时各 lane 组的默认选择是组内第一项——不建立绑定的后果是所有 lane 走
     同一个节点，"多入口"退化成单出口而系统照样自称 ready。因此这一步与
     `wait_mixed_port` 同级：不完成就不算 Runtime 可用。
+
+    `slots` 给的是**出口槽表**（`exits.select_exit_slots` 的产物）：lane i 绑槽 i 的
+    代表节点。不给则退回「按池内顺序且互不重复」的分配（旧行为）。绑定成功后把
+    「lane → 出口 IP → 节点」写成 lane 计划——运行配置里没有出口 IP，归因只能靠它。
     """
     lane_ports = runtime_lane_ports(data_dir)
     if not lane_ports:
         return (), []
     ports = await wait_lane_ports(data_dir, timeout=timeout)
-    plan = plan_lane_assignment(previous, pool_names, lanes=len(ports))
+    if slots is not None:
+        plan: list[str | None] = [
+            (slots[i].runtime_name if i < len(slots) else None) for i in range(len(ports))
+        ]
+    else:
+        plan = plan_lane_assignment(previous, pool_names, lanes=len(ports))
     applied = await assign_lanes(controller_url, secret, plan)
+    plan_path = lane_plan_path(data_dir)
+    if slots is not None:
+        write_lane_plan(
+            data_dir,
+            [
+                {
+                    "lane": i,
+                    "port": ports[i],
+                    "exitIp": slots[i].exit_ip if i < len(slots) else None,
+                    "node": applied[i],
+                    "alternatives": list(slots[i].alternatives) if i < len(slots) else [],
+                }
+                for i in range(len(ports))
+            ],
+        )
+    elif plan_path.is_file():
+        # 退回分配时旧的出口对照已失效：删掉它，宁可没有也不要错的归因
+        plan_path.unlink(missing_ok=True)
     return ports, applied
 
 
@@ -606,7 +684,10 @@ async def rebuild_runtime(
         )
 
     build = await build_pool(session, data_dir=data_dir)
-    config = prepare_runtime_config(data_dir)
+    # 容量单位是**独立出口 IP**，不是节点数：槽数即本次 run 的 lane 数。
+    # 一个出口 IP 都没探到时退回按节点数开工位（池刚建好、尚未跑 L1 的形态）。
+    slots = select_exit_slots(await eligible_nodes(session))
+    config = prepare_runtime_config(data_dir, lanes=len(slots) or None)
 
     runtime.stop()
     status = runtime.start(exe_path, str(config))
@@ -653,7 +734,8 @@ async def rebuild_runtime(
 
     lane_ports, lane_nodes = await align_lanes(
         data_dir=data_dir, controller_url=base, secret=new_secret,
-        pool_names=build.runtime_names, previous=previous_lanes, timeout=wait_timeout,
+        pool_names=build.runtime_names, previous=previous_lanes,
+        slots=slots or None, timeout=wait_timeout,
     )
 
     return RebuildResult(
@@ -667,6 +749,7 @@ async def rebuild_runtime(
         written_count=build.written_count,
         lane_urls=tuple(f"http://127.0.0.1:{p}" for p in lane_ports),
         lane_nodes=tuple(node or "" for node in lane_nodes),
+        lane_exits=tuple(slot.exit_ip for slot in slots[:len(lane_ports)]),
     )
 
 
@@ -711,6 +794,60 @@ def require_lane_proxy_urls(data_dir: Path) -> list[str]:
     GLOBAL 入口——仍是池内出口，不构成"退回直连或旧订阅代理"。有 lane 但入口没全
     就绪属于 Runtime 不可用，直接抛错（fail closed），不把半就绪的入口交出去。
     """
+    if runtime_lane_ports(data_dir):
+        urls = lane_proxy_urls(data_dir)
+        if not urls:
+            raise RuntimeUnavailableError(
+                "代理运行时的 lane 入口没有全部就绪，本次爬取未启动"
+            )
+        return urls
+    return [require_runtime_proxy_url(data_dir)]
+
+
+def lane_bindings(data_dir: Path) -> list[dict]:
+    """本次 run 的 lane 绑定表：每条 lane 的地址、出口 IP、执行节点。
+
+    出口 IP 与节点取自 lane 计划（`crawl-lanes.yaml`）；没有计划时出口记 `None`——
+    宁可缺字段，也不要拿 lane 序号冒充出口身份。
+    """
+    urls = lane_proxy_urls(data_dir)
+    if not urls:
+        return []
+    plan = {int(e.get("lane", -1)): e for e in read_lane_plan(data_dir)}
+    bindings: list[dict] = []
+    for i, url in enumerate(urls):
+        entry = plan.get(i) or {}
+        exit_ip = entry.get("exitIp")
+        bindings.append({
+            "lane": i,
+            "url": url,
+            "exitIp": str(exit_ip) if exit_ip else None,
+            "node": str(entry["node"]) if entry.get("node") else None,
+        })
+    return bindings
+
+
+def lane_run_plan(data_dir: Path) -> dict:
+    """受管爬取一次 run 需要的入口三元组：地址 / 出口键 / 执行节点（三者同序）。
+
+    **唯一取值口**：生产路径与验证脚本都从这里取，避免"两处各自拼一遍"再次出现
+    「worker 拿到地址但没拿到出口身份」这类只在一侧发生的缺口。出口身份缺失时键退回
+    `lane:<序号>`——它仍能保证同出口共享一份预算（同一 lane 上的 worker 同键），
+    只是不跨 lane 合并同出口。
+    """
+    bindings = lane_bindings(data_dir)
+    if not bindings:
+        urls = require_lane_proxy_urls(data_dir)
+        bindings = [
+            {"lane": i, "url": url, "exitIp": None, "node": None}
+            for i, url in enumerate(urls)
+        ]
+    return {
+        "urls": [b["url"] for b in bindings],
+        "exit_keys": [b["exitIp"] or f"lane:{b['lane']}" for b in bindings],
+        "nodes": [b["node"] or "" for b in bindings],
+        "bindings": bindings,
+    }
     if runtime_lane_ports(data_dir):
         urls = lane_proxy_urls(data_dir)
         if not urls:

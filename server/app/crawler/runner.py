@@ -37,40 +37,51 @@ logger = logging.getLogger(__name__)
 class CrawlRunConfig:
     regions: list[str] | None = None
     workers: int = DEFAULT_WORKER_COUNT
-    # 单入口代理（调试通道 / 单入口形态）；生产多入口形态用 proxy_urls
+    # 单入口代理（调试通道 / 单入口形态）；生产多出口形态用 proxy_urls
     proxy_url: str | None = None
-    # 多入口形态：每条 lane 一个本机代理地址，worker 按序号固定绑定
+    # 多出口形态：每条 lane 一个本机代理地址，worker 按序号固定绑定
     proxy_urls: list[str] | None = None
+    # 与 proxy_urls 同序的出口 IP：限流、熔断与统计都按它记账（同出口的 worker 共享一份）
+    exit_keys: list[str] | None = None
+    # 与 proxy_urls 同序的节点运行名：出口账本要能追到"当时是哪个节点在执行"
+    exit_nodes: list[str] | None = None
     timeout: int = HTTP_TIMEOUT
 
 
 def build_worker_clients(
-    config: "CrawlRunConfig", http_client: SteamHttpClient
+    config: "CrawlRunConfig", http_client: SteamHttpClient, stats=None
 ) -> Callable[[int], SteamHttpClient] | None:
-    """多入口形态下的 worker → 入口工厂：**一 worker 一条 lane，run 内固定**。
+    """多出口形态下的 worker → 出口工厂：**一 worker 一条 lane，run 内固定**。
 
-    每条 lane 有自己的限流预算与熔断器（见 `rate_limit.LaneRateLimits` 与
-    `http_client.LaneBreakers`）：某个出口撞风控或撞窗口只影响绑在它上面的 worker，
-    其余 lane 继续跑。`proxy_urls` 为空（单入口形态）返回 `None`——调用方沿用共享
-    客户端，行为不变。
+    限流预算、429 熔断器、统计账本全部**按出口 IP** 取（同出口的多个 worker 共享同一
+    份）：某个出口撞风控或撞窗口只影响绑在它上面的 worker，其余出口继续跑；也保证
+    「一个出口放 N 个 worker」不会放大成 N 份额度。
+
+    `proxy_urls` 为空（单入口形态）返回 `None`——调用方沿用共享客户端，行为不变。
     """
     urls = [u for u in (config.proxy_urls or []) if u]
     if not urls:
         return None
-    from .http_client import LaneBreakers
-    from .rate_limit import LaneRateLimits
+    from .exit_stats import ExitStatsCollector  # noqa: F401 —— 类型提示用，保持同域可见
+    from .http_client import ExitBreakers
+    from .rate_limit import ExitRateLimits
 
-    limits = LaneRateLimits(len(urls))
-    breakers = LaneBreakers(len(urls))
+    keys = list(config.exit_keys or [])
+    exit_keys = [keys[i] if i < len(keys) else "" for i in range(len(urls))]
+    limits = ExitRateLimits(exit_keys)
+    breakers = ExitBreakers(exit_keys)
 
     def factory(worker_id: int) -> SteamHttpClient:
         idx = worker_id % len(urls)
+        key = exit_keys[idx]
         return SteamHttpClient(
             timeout=config.timeout,
             max_retries=3,
             proxy_url=urls[idx],
-            rate_limiter=limits.for_lane(idx),
-            breaker=breakers.for_lane(idx),
+            rate_limiter=limits.for_exit(key),
+            breaker=breakers.for_exit(key),
+            stats=stats,
+            exit_key=key or None,
         )
 
     return factory
@@ -118,6 +129,15 @@ async def run_crawl(
     begin_crawl("run_crawl")
     started_monotonic = time.monotonic()
     summary = jobruns.new_error_summary()
+    # 出口账本：内存累计，作业收尾一次性落库（不按请求写库）
+    from .exit_stats import ExitStatsCollector
+
+    exit_stats = ExitStatsCollector()
+    node_by_exit = {
+        str(k): str(v)
+        for k, v in zip(config.exit_keys or [], config.exit_nodes or [])
+        if k
+    }
     run_id: int | None = None
     try:
         # 台账要写库，建表必须先于记录（init_db 幂等且是 lru 化的连接入口；
@@ -138,10 +158,12 @@ async def run_crawl(
             stop_event=stop_event,
             pre_tasks=pre_tasks,
             error_sink=lambda exc: jobruns.note_error(summary, exc),
+            exit_stats=exit_stats,
         )
         # browse 层重试耗尽的失败从不抛到 worker、只进 failure_ledger（已并入
         # stats["failed"]），分类上单独记一类，别混进 other
         jobruns.note_ledger(summary, len(bs.FAILED_TASKS))
+        exit_stats.merge_into(summary)
         stopped = bool(stop_event is not None and stop_event.is_set())
         if stopped:
             # 「这次没跑完」是行级事实：手动停止与进程中断共用同一个标记，
@@ -165,6 +187,7 @@ async def run_crawl(
             error_summary=summary,
             duration_ms=int((time.monotonic() - started_monotonic) * 1000),
         )
+        await _write_exit_ledger(run_id, exit_stats, node_by_exit)
         return stats
     except asyncio.CancelledError:
         summary["interrupted"] = True
@@ -178,6 +201,7 @@ async def run_crawl(
         raise
     except Exception as exc:  # noqa: BLE001 —— 记完再抛，行为不变
         jobruns.note_error(summary, exc)
+        exit_stats.merge_into(summary)
         await jobruns.record_finish(
             run_id,
             status=jobruns.STATUS_FAILED,
@@ -185,9 +209,19 @@ async def run_crawl(
             error_summary=summary,
             duration_ms=int((time.monotonic() - started_monotonic) * 1000),
         )
+        await _write_exit_ledger(run_id, exit_stats, node_by_exit)
         raise
     finally:
         end_crawl()
+
+
+async def _write_exit_ledger(run_id, exit_stats, node_by_exit) -> None:
+    """出口账本落库（fail-soft：写不进去只记日志，不改作业结果）。"""
+    from ..domains.proxypool import exitstats
+
+    await exitstats.write_run_exits(
+        run_id=run_id, collector=exit_stats, node_by_exit=node_by_exit
+    )
 
 
 async def _run_crawl_locked(
@@ -197,6 +231,7 @@ async def _run_crawl_locked(
     stop_event: asyncio.Event | None = None,
     pre_tasks: list[dict] | None = None,
     error_sink: Callable[[BaseException], None] | None = None,
+    exit_stats=None,
 ) -> dict:
     """执行一批 app 任务，返回统计 dict。
 
@@ -225,7 +260,7 @@ async def _run_crawl_locked(
     http_client = SteamHttpClient(
         timeout=config.timeout, max_retries=3, proxy_url=config.proxy_url
     )
-    client_factory = build_worker_clients(config, http_client)
+    client_factory = build_worker_clients(config, http_client, stats=exit_stats)
     router = build_router()
 
     target_ids = [int(a) for a, _ in (appids or [])]

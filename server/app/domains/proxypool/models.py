@@ -182,6 +182,39 @@ class Lane(Base):
     last_switch_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
+class ProxyRunExit(Base):
+    """出口账本：一次作业 × 一个出口 IP × 一个端点 = 一行聚合。
+
+    回答的是「本次作业用了哪些出口、每个出口发了多少、怎么失败的」——这是判断限流归属
+    （按出口 IP / 按 endpoint / 别的维度）的唯一生产证据来源。
+
+    边界：**不按 HTTP 请求写库**。累计先发生在内存（`crawler/exit_stats.py`），作业收尾
+    一次性落成聚合行；`outcome` 是固定枚举，不放自由文本（异常串可能带 URL 与凭据，
+    且长度无界）。新表由 `create_all` 缺表即建，不产生迁移、不抬 `SCHEMA_VERSION`。
+    """
+
+    __tablename__ = "proxy_run_exits"
+    __table_args__ = (
+        Index("ix_pre_run_exit", "run_id", "exit_ip"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(Integer, index=True)  # proxy_job_runs.id
+    exit_ip: Mapped[str] = mapped_column(String(64))
+    endpoint: Mapped[str] = mapped_column(String(32))
+    node: Mapped[str | None] = mapped_column(String(400))  # 当时绑在该出口上的节点
+    requests: Mapped[int] = mapped_column(Integer, default=0)
+    success: Mapped[int] = mapped_column(Integer, default=0)
+    e429: Mapped[int] = mapped_column(Integer, default=0)
+    e4xx: Mapped[int] = mapped_column(Integer, default=0)
+    e5xx: Mapped[int] = mapped_column(Integer, default=0)
+    timeout: Mapped[int] = mapped_column(Integer, default=0)
+    connect_error: Mapped[int] = mapped_column(Integer, default=0)
+    other: Mapped[int] = mapped_column(Integer, default=0)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
 class PoolGeneration(Base):
     """池发布的版本号：写盘前落 PENDING，内核对账数相符才置 COMMITTED。"""
 
