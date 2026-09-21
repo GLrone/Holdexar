@@ -181,6 +181,56 @@ async def test_scan_treats_null_kind_by_source(db):
 
 
 @pytest.mark.asyncio
+async def test_scan_covers_legacy_rows_without_canonical_columns(db):
+    """旧版本实例写入的行不带 canonical 列（rate_date 为空）：日期从 fetched_at
+    推导、语义按 source 推导——这批发现在真实环境出现过，不得被静默漏掉。"""
+    async with database_module.get_session_factory()() as session:
+        session.add_all(
+            [
+                FxRateHistory(
+                    currency_code=XTS, rate_to_cny=0.015, source="backfill",
+                    source_kind=None, rate_date=None,
+                    fetched_at=datetime(2026, 9, 1, 12, 0, 0),
+                ),
+                FxRateHistory(
+                    currency_code=XTS, rate_to_cny=0.016, source="augmentedsteam",
+                    source_kind=None, rate_date=None,
+                    fetched_at=datetime(2026, 9, 2, 12, 0, 0),
+                ),
+            ]
+        )
+        await session.commit()
+    scan = await rates_history.scan_history_gaps(today=TODAY)
+    info = scan["currencies"][XTS]
+    assert info["first"] == "2026-09-01"  # 无 canonical 列的行也被识别
+    assert info["carried"] == 1  # backfill → carried（待修复）
+    assert info["missing"] == 5  # 9/3 ~ 9/7 缺行
+
+
+@pytest.mark.asyncio
+async def test_scan_prefers_observed_over_carried_same_day(db):
+    """同一 (币种, 日) 同时存在 canonical observed 与旧格式 carried 行 →
+    取 observed：旧延续行不得把已有真实观测日重新判成缺口。"""
+    await _add_history(
+        XTS, [("2026-09-01", 6.50, "observed")], source="augmentedsteam"
+    )
+    async with database_module.get_session_factory()() as session:
+        session.add(
+            FxRateHistory(
+                currency_code=XTS, rate_to_cny=9.99, source="backfill",
+                source_kind=None, rate_date=None,
+                fetched_at=datetime(2026, 9, 1, 23, 0, 0),
+            )
+        )
+        await session.commit()
+    scan = await rates_history.scan_history_gaps(today=TODAY)
+    info = scan["currencies"][XTS]
+    assert info["carried"] == 0
+    assert info["missing"] == 6  # 9/2 ~ 9/7
+    assert info["first"] == "2026-09-02"
+
+
+@pytest.mark.asyncio
 async def test_scan_window_split_over_365_days(db):
     """超 365 天的缺口拆成多窗口。"""
     await _add_history(XTS, [("2024-01-01", 6.5, "observed")])
@@ -357,7 +407,14 @@ async def test_repair_revalues_bills(db, monkeypatch):
         )
         await session.commit()
 
-    rows = {date(2026, 9, 3): {XTS: 0.05}}
+    # 完整性闸门要求：窗口内每天都要返回（含 USDCNY），故覆盖整个 [9/2, 9/7]
+    rows = {
+        day: {XTS: 0.05}
+        for day in (
+            date(2026, 9, 2), date(2026, 9, 3), date(2026, 9, 4),
+            date(2026, 9, 5), date(2026, 9, 6), date(2026, 9, 7),
+        )
+    }
     calls: list = []
     monkeypatch.setattr(rates_history, "ExchangerateHostProvider", _fake_provider(rows, calls))
     monkeypatch.setattr(rates_history, "resolve_api_key", lambda: "test-key")
