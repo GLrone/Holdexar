@@ -632,9 +632,11 @@ async def start_job(
     # （重建会换端口并打断在途请求，所以 run 内不换）。拿不到就拒绝启动，
     # 不静默退回直连或旧订阅代理。
     from app.core.config import get_settings as _get_settings
-    from app.domains.proxypool.runtime import require_runtime_proxy_url
+    from app.domains.proxypool.runtime import current_runtime_proxy_url
 
-    proxy_url = require_runtime_proxy_url(_get_settings().data_dir)
+    # 池 Runtime 可用时整 run 固定用它的代理；没有池（未建立 / 内核未起）则直连
+    # ——直连是标准形态，不构成拒绝启动的理由
+    proxy_url = current_runtime_proxy_url(_get_settings().data_dir)
 
     config = CrawlRunConfig(
         regions=effective,
