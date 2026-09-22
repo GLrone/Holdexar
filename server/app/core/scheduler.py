@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -636,6 +636,192 @@ async def _job_fx_history_repair() -> None:
 _FX_REPAIR_MAX_WINDOWS = 8
 
 
+# 30 分钟重活的错峰位移：proxypool 周期固定在 5 分钟网格整点起跑，这两个 job 若与
+# 它同秒起跑会一起抢 SQLite 写锁（真实生产已出现 `database is locked`）。
+_REFRESH_STAGGER = timedelta(minutes=4)
+_BILLS_STAGGER = timedelta(minutes=2)
+
+
+async def _startup_pool_runtime() -> None:
+    """启动链的一步：首次建立池 Runtime（bootstrap 原语）+ **首轮出口身份发现**。
+
+    **失败绝不让应用启动失败**：没有订阅 / 下载失败 / 解析失败 / 内核起不来，都只是
+    "Runtime 不可用 → crawler 保持 fail-closed"，应用与调度器继续跑，30min 后的订阅
+    刷新就是下一次 bootstrap 机会。否则会把"失败下周期再试"的设计自己破坏掉。
+
+    顺序是契约的一部分（本步在 `start_scheduler()` 之前，因此它跑完前不会有任何价格
+    刷新）：
+
+        bootstrap → Runtime ready → 有界 L1（建出口身份）
+                  → 出口集变化则重建（listener 数对齐出口槽）→ 交出 Runtime
+
+    少了中间两步，首次价格刷新会在"一个出口 IP 都没探到"的状态下开跑，容量模型退化
+    成按节点计（真实链路上出现过：首轮 job 的 `pool_exit_ip_count` 为 NULL）。
+    """
+    from datetime import datetime
+
+    from app.core.config import get_settings
+    from app.core.database import get_session_factory
+    from app.domains.proxies import clash_manager as _cm
+    from app.domains.proxypool import bootstrap as _bs
+    from app.domains.proxypool import scheduling as _sched
+    from app.domains.proxypool.exits import slot_signature
+    from app.domains.proxypool.runtime import controller_endpoint_of
+
+    try:
+        data_dir = get_settings().data_dir
+        exe_path = str(_cm.kernel_exe(data_dir))
+        async with get_session_factory()() as session:
+            result = await _bs.ensure_pool_runtime(
+                session, data_dir=data_dir, runtime=_cm.pool_runtime,
+                exe_path=exe_path, now=datetime.now(),
+            )
+            await session.commit()
+        logger.info(
+            "[启动] 池 Runtime：%s（%s）",
+            "ready" if result.ready else "unavailable", result.detail,
+        )
+        if not result.ready:
+            return
+
+        # ── 首轮出口身份发现：只探没有 exit_ip 的节点，有界（节点数 + 时间预算）──
+        before = await _exit_snapshot_or_empty()
+        if before:
+            return  # 库里已有出口身份（重启场景）：不重复探测，交给维护周期刷新
+        base, secret = controller_endpoint_of(data_dir)
+        async with get_session_factory()() as session:
+            outcomes = await _sched.run_startup_l1(
+                session, data_dir=data_dir, controller_url=base, secret=secret,
+                now=datetime.now(),
+            )
+            await session.commit()
+        logger.info(
+            "[启动] 首轮 L1 出口身份发现：探 %d 个节点，成功 %d 个",
+            len(outcomes), sum(1 for o in outcomes if o.ok),
+        )
+        after = await _exit_snapshot_or_empty()
+        if slot_signature(after) == slot_signature(before):
+            return
+        # 出口集变了：当前 listener 数是按"还没有出口身份"时的节点数开的，必须重建一次
+        # 才能让工位数与出口槽一致（重建在启动链内，门已开、后台执行）
+        from app.domains.proxypool.scheduling import request_rebuild, run_pending_rebuild
+
+        request_rebuild()
+        async with get_session_factory()() as session:
+            rebuilt = await run_pending_rebuild(
+                session, data_dir=data_dir, controller_url=base, secret=secret,
+                runtime=_cm.pool_runtime, exe_path=exe_path,
+            )
+            await session.commit()
+        if rebuilt is not None:
+            logger.info(
+                "[启动] 出口身份建立后重建 Runtime：%d lane / %d 个已知出口",
+                len(rebuilt.lane_urls), len(rebuilt.lane_exits),
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception("[启动] 池 Runtime bootstrap 失败（应用继续运行，crawler 保持不可用）")
+
+
+async def _exit_snapshot_or_empty() -> dict:
+    """当前出口身份快照；读不到返回空（启动链不该因观测失败而中断）。"""
+    from app.core.database import get_session_factory
+    from app.domains.proxypool.exits import exit_snapshot
+
+    try:
+        async with get_session_factory()() as session:
+            return await exit_snapshot(session)
+    except Exception:  # noqa: BLE001
+        logger.exception("[启动] 出口身份快照读取失败（按空处理）")
+        return {}
+
+
+async def _job_proxypool_cycle() -> None:
+    """proxypool 周期：L0 → 占用判断 → 消费 pending 重建 → L1/L2。
+
+    **刻意只注册一个 job**：拆成三个独立定时任务会让 L0 / 维护 / 重建互相竞争
+    （occupancy 只挡得住 crawler，挡不住 proxypool 自己人）。阶段划分留在
+    `run_proxypool_cycle` 内部。
+
+    前置条件：必须已存在可用的池 Runtime（运行配置 + 内核在跑）。没有就跳过本轮——
+    bootstrap 不属于本阶段职责。
+    """
+    from datetime import datetime
+
+    from app.core.config import get_settings
+    from app.core.database import get_session_factory
+    from app.domains.proxies import clash_manager as _cm
+    from app.domains.proxypool import scheduling as _sched
+    from app.domains.proxypool.runtime import (
+        RuntimeConfigError, controller_endpoint_of,
+    )
+
+    data_dir = get_settings().data_dir
+    try:
+        base, secret = controller_endpoint_of(data_dir)
+    except (RuntimeConfigError, OSError) as e:
+        logger.info("[定时] proxypool 周期跳过：池 Runtime 尚未就绪（%s）", e)
+        return
+    try:
+        # DEAD 恢复探测要打在**持有这些节点配置的内核**上：DEAD 不在池文件里，
+        # 池内核不认识它们的名字；旧链路内核跑的就是整条订阅，认识全部节点。
+        # 旧链路内核没在跑（controller_url 为空）时本项自动跳过。
+        legacy = _cm.runtime
+        legacy_controller = (
+            (legacy.controller_url, legacy.secret)
+            if getattr(legacy, "controller_url", None) else None
+        )
+        async with get_session_factory()() as session:
+            result = await _sched.run_proxypool_cycle(
+                session,
+                data_dir=data_dir,
+                controller_url=base,
+                secret=secret,
+                runtime=_cm.pool_runtime,
+                exe_path=str(_cm.kernel_exe(data_dir)),
+                now=datetime.now(),
+                recovery_controller=legacy_controller,
+            )
+            await session.commit()
+        logger.info(
+            "[定时] proxypool 周期：L0 %d 项 | busy=%s | rebuilt=%s | 维护=%s",
+            len(result.l0), result.busy,
+            "是" if result.rebuilt else "否",
+            "跳过" if result.maintenance is None else "已执行",
+        )
+    except Exception:  # noqa: BLE001 —— 周期失败不拖垮调度器
+        logger.exception("[定时] proxypool 周期异常")
+
+
+async def _job_proxypool_retention() -> None:
+    """proxypool 遥测保留（每日 04:35，紧随 04:30 的 WAL 收缩）。
+
+    删的是**观测**，不是身份：`proxy_job_runs` / `health_observations` /
+    `orchestration_events` / `subscription_snapshots` 按各自保留期分块清理；
+    `proxy_nodes` / `proxy_node_sources` / `pool_generations` 一行不碰。
+
+    为什么是独立定时任务：保留是**周期性**事务，不是启动一次性事务——本地软件
+    不常驻，放启动链会在长会话里永远不跑（也避免动那条登记过的链序）。删除按
+    5000 行一块、每块一个事务，防长事务持写锁跟爬取/调度抢锁；一轮最多 20 块，
+    删不完留给下一轮。异常只记日志。
+    """
+    from datetime import datetime
+
+    from app.core.database import get_session_factory
+    from app.domains.proxypool import retention as _ret
+
+    try:
+        async with get_session_factory()() as session:
+            result = await _ret.prune_telemetry(session, datetime.now())
+        logger.info(
+            "[定时] proxypool 保留清理：作业 %d / 健康观测 %d / 编排事件 %d / 快照 %d%s",
+            result.job_runs, result.health_observations,
+            result.orchestration_events, result.snapshots,
+            "（达块上限，剩余下轮继续）" if result.truncated else "",
+        )
+    except Exception:  # noqa: BLE001 —— 清理失败不拖垮调度器
+        logger.exception("[定时] proxypool 保留清理异常")
+
+
 async def _job_subscription_refresh() -> None:
     """Clash 订阅重拉（30min 一拍；真间隔由 service 侧 6h 门槛决定）。
 
@@ -658,19 +844,41 @@ async def _job_subscription_refresh() -> None:
         result = await proxies_service.maybe_refresh_active_clash_subscription()
     except Exception:  # noqa: BLE001
         logger.exception("[定时] Clash 订阅重拉异常")
-        return
-    if result.get("state") != "refreshed":
-        return
-    logger.info("[定时] Clash 订阅重拉完成：%s 节点", result.get("nodes"))
-    if result.get("restarted") and result.get("subscriptionId"):
-        try:
-            checked = await proxies_service.test_clash_nodes(result["subscriptionId"])
-            logger.info(
-                "[定时] 订阅重拉后首检：共 %s 节点，可用 %s",
-                checked.get("total"), checked.get("alive"),
+    else:
+        if result.get("state") == "refreshed":
+            logger.info("[定时] Clash 订阅重拉完成：%s 节点", result.get("nodes"))
+            if result.get("restarted") and result.get("subscriptionId"):
+                try:
+                    checked = await proxies_service.test_clash_nodes(result["subscriptionId"])
+                    logger.info(
+                        "[定时] 订阅重拉后首检：共 %s 节点，可用 %s",
+                        checked.get("total"), checked.get("alive"),
+                    )
+                except Exception:  # noqa: BLE001 —— 首检失败不影响重拉事实
+                    logger.exception("[定时] 订阅重拉后首检失败（可稍后手动检测）")
+
+    # 订阅刷新 → Snapshot/Registry → 池签名分流；**绝不在这里 stop/start 池 Runtime**
+    try:
+        from datetime import datetime
+
+        from app.core.config import get_settings
+        from app.core.database import get_session_factory
+        from app.domains.proxies import clash_manager as _cm
+        from app.domains.proxypool import bootstrap as _bs
+
+        data_dir = get_settings().data_dir
+        async with get_session_factory()() as session:
+            triage = await _bs.handle_subscription_refresh(
+                session, data_dir=data_dir, runtime=_cm.pool_runtime,
+                exe_path=str(_cm.kernel_exe(data_dir)), now=datetime.now(),
             )
-        except Exception:  # noqa: BLE001 —— 首检失败不影响重拉事实
-            logger.exception("[定时] 订阅重拉后首检失败（可稍后手动检测）")
+            await session.commit()
+        logger.info(
+            "[定时] 订阅刷新后池分流：synced=%s pool_changed=%s action=%s",
+            triage.synced, triage.pool_changed, triage.action,
+        )
+    except Exception:  # noqa: BLE001 —— 分流失败不影响订阅重拉事实
+        logger.exception("[定时] 订阅刷新后池分流失败（下轮再试）")
 
 
 async def _job_proxy_health() -> None:
@@ -1147,10 +1355,14 @@ def start_scheduler() -> None:
     # 订阅重拉：拍子给密一点（30min），真间隔靠 service 的 6h KV 门槛 +
     # 爬虫空闲门禁——占线错过一拍不消费门槛，下一拍补上
     scheduler.add_job(
-        _job_subscription_refresh, "interval", minutes=30, id="subscription_refresh"
+        _job_subscription_refresh, "interval", minutes=30, id="subscription_refresh",
+        next_run_time=datetime.now() + _REFRESH_STAGGER,
     )
     scheduler.add_job(_job_wallet_sync, "interval", minutes=1, id="wallet_sync")
-    scheduler.add_job(_job_bills_sync, "interval", minutes=30, id="bills_sync")
+    scheduler.add_job(
+        _job_bills_sync, "interval", minutes=30, id="bills_sync",
+        next_run_time=datetime.now() + _BILLS_STAGGER,
+    )
     scheduler.add_job(_job_achievements_sync, "cron", hour=5, minute=20, id="achievements_sync")
     # 热销榜：发现面 5 页（500 条，其中前 100 条仍作 TOP100 展示序）；
     # 首轮反哺放宽到 500 一次补满初始游戏库，并登记预设池清单（随种子分发）
@@ -1168,7 +1380,19 @@ def start_scheduler() -> None:
     scheduler.add_job(_job_epic_free, "cron", hour=7, minute=10, id="epic_free")
     scheduler.add_job(_job_bartervg_bundles, "cron", hour=5, minute=40, id="bartervg_bundles")
     scheduler.add_job(_job_wal_truncate, "cron", hour=4, minute=30, id="wal_truncate")
+    # proxypool 遥测保留：每日 04:35（紧随 WAL 收缩，不与 04:30 的重活撞同一分钟）。
+    # 分块删除 + 单轮块上限在函数内部；max_instances=1 防叠轮。
+    scheduler.add_job(
+        _job_proxypool_retention, "cron", hour=4, minute=35, id="proxypool_retention",
+        max_instances=1, coalesce=True,
+    )
     scheduler.add_job(_job_backup, "interval", hours=24, id="auto_backup")
+    # proxypool 周期：**只注册这一个**（L0 / pending 重建 / L1-L2 都在它内部按序发生）。
+    # 池 Runtime 未就绪时函数内部自行跳过；max_instances=1 防上一轮未跑完又叠一轮。
+    scheduler.add_job(
+        _job_proxypool_cycle, "interval", minutes=5, id="proxypool_cycle",
+        max_instances=1, coalesce=True,
+    )
     scheduler.start()
     # 外部时间纠偏探针（异步，10s 延时错开启动风暴）；无事件循环的
     # 同步上下文静默跳过——初锚已可用，首轮触发时重锚会再核对一次
