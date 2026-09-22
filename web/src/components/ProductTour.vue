@@ -14,19 +14,22 @@ import type { IconName } from '@/components/ui/icons'
    - 教练标记（Coachmark）：聚光框旁气泡，8 分向智能避让（优先下方/右上），
      永不与聚光框重叠、永不超出视口——高卡片不再遮挡按键
    - 焦点引导：靶点滚动进视野（聚光框完整可见优先），页面滚动/缩放实时跟随
-   顺序编排：先看成果再学配置——商店页（它是干什么的 + 数据从哪来）→ 代理 →
-     账号绑定 → 手动导入 → 价格提醒 → 收尾。
-     第 0 站停在商店页，配置类步骤标注「不配也能逛」。代理在配置链第 1 位
-     （不配代理 Steam 登录窗加载不出来、自动抓价也会被闸门拦下），顺序固定。
+   顺序编排：核心三步在前且零配置——商店（看什么）→ 导入（怎么加游戏）→
+     提醒（到价怎么通知）；代理与账号绑定是可选分支殿后，标题带「可选」。
+     直连是抓取的标准形态，代理只解决网络不畅（价格取不到 / 登录窗打不开），
+     文案不把代理写成抓价的前置条件。
    关闭兜底：打开即写 ui.onboarding_done 标志（幂等），关闭路径再补写一次。
 
    靶点选择器契约：
-   - 框架层：data-tour 属性（侧边栏项，HlSideNav 按 to 派生）
+   - 框架层：data-tour 属性（页面内锚点如 lib-empty；侧边栏项由 HlSideNav
+     按 to 派生，供侧栏类步骤取用）
    - 页面层：data-section 属性（分节卡片既有，零侵入复用）
      该属性的值是**词条 key**（如 `proxies.section.clash`）而不是译文：
-     锚点与语言无关，切语言时下面的选择器不会断。五个跨页步骤的 key 与视图侧
+     锚点与语言无关，切语言时下面的选择器不会断。四个跨页步骤的 key 与视图侧
      逐字对应，改名即静默选不中。
-   重开约定：打开时 step 强制归 0（左上角 logo / 设置页重看都从头走）。 */
+   重开约定：打开时 step 强制归 0（关于页 hero logo / 设置页「重看教程」都从头走）。
+   实例唯一：挂在 App.vue（导览要跨路由翻页，挂页面里的实例会被 router.push 卸载），
+   页面级入口只经 tour store 开合，不自己实例化。 */
 
 const model = defineModel<boolean>({ default: false })
 
@@ -77,74 +80,16 @@ const TOUR: TourStep[] = [
     ],
   },
   {
-    target: '[data-tour="sb-library"]',
-    titleKey: 'productTour.stepStore.title',
-    paras: [
-      { textKey: 'productTour.stepStore.p1' },
-      { emphKey: 'productTour.stepStore.emph', icon: 'store' },
-    ],
-    hintKey: 'productTour.stepStore.hint',
-    side: true,
-  },
-  {
     route: '/library',
-    // 空态卡 / 卡片网格二选一：同一站教「数据从哪来」，空库时聚光空态卡
-    //（正是要解释的场景），已有数据时聚光网格
+    // 空态卡 / 卡片网格二选一：空库时聚光空态卡（正是要解释的场景），已有数据时聚光网格
     target: ['[data-tour="lib-empty"]', '.card-grid'],
     titleKey: 'productTour.stepData.title',
     paras: [
-      { textKey: 'productTour.stepData.p1', params: { app: APP_NAME } },
+      { textKey: 'productTour.stepData.p1' },
       { textKey: 'productTour.stepData.p2' },
-      { emphKey: 'productTour.stepData.emph', icon: 'zap' },
-      { textKey: 'productTour.stepData.p3' },
+      { emphKey: 'productTour.stepData.emph' },
     ],
     hintKey: 'productTour.stepData.hint',
-  },
-  {
-    target: '[data-tour="sb-proxies"]',
-    titleKey: 'productTour.stepProxy.title',
-    paras: [
-      { emphKey: 'productTour.stepProxy.emph', icon: 'warning' },
-      { textKey: 'productTour.stepProxy.p1' },
-      { textKey: 'productTour.stepProxy.p2' },
-    ],
-    side: true,
-  },
-  {
-    route: '/proxies',
-    target: '[data-section="proxies.section.clash"]',
-    titleKey: 'productTour.stepClash.title',
-    paras: [
-      { textKey: 'productTour.stepClash.p1' },
-      { textKey: 'productTour.stepClash.p2' },
-      { textKey: 'productTour.stepClash.p3' },
-      { textKey: 'productTour.stepClash.p4' },
-    ],
-    hintKey: 'productTour.stepClash.hint',
-  },
-  {
-    target: '[data-tour="sb-settings"]',
-    titleKey: 'productTour.stepAccount.title',
-    paras: [{ textKey: 'productTour.stepAccount.p1' }],
-    side: true,
-  },
-  {
-    route: '/settings',
-    target: '[data-section="settings.section.steamAccount"]',
-    titleKey: 'productTour.stepBind.title',
-    paras: [
-      { emphKey: 'productTour.stepBind.emph', icon: 'zap' },
-      { textKey: 'productTour.stepBind.p1' },
-      { textKey: 'productTour.stepBind.p2' },
-      { textKey: 'productTour.stepBind.p3' },
-    ],
-    hintKey: 'productTour.stepBind.hint',
-  },
-  {
-    target: '[data-tour="sb-crawl"]',
-    titleKey: 'productTour.stepTasks.title',
-    paras: [{ textKey: 'productTour.stepTasks.p1' }],
-    side: true,
   },
   {
     route: '/crawl',
@@ -153,16 +98,9 @@ const TOUR: TourStep[] = [
     paras: [
       { textKey: 'productTour.stepImport.p1' },
       { textKey: 'productTour.stepImport.p2' },
-      { textKey: 'productTour.stepImport.p3' },
-      { emphKey: 'productTour.stepImport.emph', icon: 'zap' },
+      { emphKey: 'productTour.stepImport.emph' },
     ],
     hintKey: 'productTour.stepImport.hint',
-  },
-  {
-    target: '[data-tour="sb-alerts"]',
-    titleKey: 'productTour.stepAlerts.title',
-    paras: [{ textKey: 'productTour.stepAlerts.p1' }],
-    side: true,
   },
   {
     route: '/alerts',
@@ -171,15 +109,34 @@ const TOUR: TourStep[] = [
     paras: [
       { textKey: 'productTour.stepRules.p1' },
       { textKey: 'productTour.stepRules.p2' },
-      { emphKey: 'productTour.stepRules.emph', icon: 'zap' },
-      { textKey: 'productTour.stepRules.p3' },
+      { emphKey: 'productTour.stepRules.emph' },
     ],
-    hintKey: 'productTour.stepRules.hint',
+  },
+  {
+    route: '/proxies',
+    target: '[data-section="proxies.section.clash"]',
+    titleKey: 'productTour.stepProxy.title',
+    paras: [
+      { emphKey: 'productTour.stepProxy.emph' },
+      { textKey: 'productTour.stepProxy.p1' },
+      { textKey: 'productTour.stepProxy.p2' },
+    ],
+  },
+  {
+    route: '/settings',
+    target: '[data-section="settings.section.steamAccount"]',
+    titleKey: 'productTour.stepBind.title',
+    paras: [
+      { emphKey: 'productTour.stepBind.emph' },
+      { textKey: 'productTour.stepBind.p1' },
+      { textKey: 'productTour.stepBind.p2' },
+    ],
+    hintKey: 'productTour.stepBind.hint',
   },
   {
     titleKey: 'productTour.done.title',
     paras: [
-      { emphKey: 'productTour.done.emph', icon: 'check-circle' },
+      { emphKey: 'productTour.done.emph' },
       { textKey: 'productTour.done.p1' },
       { textKey: 'productTour.done.p2' },
       { textKey: 'productTour.done.p3', params: { app: APP_NAME } },
@@ -579,7 +536,7 @@ watch(model, async (v, was) => {
   if (v && !was) {
     step.value = 0
     capturedStart.value = route.fullPath
-    // 打开即写标志：导览入口长期在（左上角 logo / 我页「新手教程」），
+    // 打开即写标志：导览入口长期在（关于页 hero logo / 设置页「重看教程」），
     // 「看过一次就不再自动弹」比「必须点完才算完成」更贴合实际使用。
     void useSettingsStore().markOnboardingDone()
     return

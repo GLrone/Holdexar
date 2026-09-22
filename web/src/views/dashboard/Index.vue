@@ -3,24 +3,17 @@
  * 仪表盘 —— 库概况统计 + 新史低精选轮播 + 降价动态 + 汇率概览。
  * 聚合多个已有 API 数据，前端组合展示。
  */
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import {
-  Connection,
-  DataLine,
-  Discount,
-  Monitor,
-  PriceTag,
-  Refresh,
-  Select,
-} from '@element-plus/icons-vue'
+import { DataLine, Discount, PriceTag, Select } from '@element-plus/icons-vue'
 
 import {
   crawlApi,
   gamesApi,
+  invalidateGetCache,
   type GameListItem,
-  proxiesApi,
-  type ProxyPoolStats,
+  type PriceCycleItem,
+  type PriceEventItem,
   ratesApi,
   type RateItem,
   type SyncResult,
@@ -28,9 +21,14 @@ import {
 } from '@/api/client'
 import { formatCnyFen } from '@/api/regions'
 import { currencyName } from '@/api/currencies'
+import { APP_NAME } from '@/appInfo'
+import { parseAppRefs } from '@/lib/appidRefs'
 import { isPermChangeRecent } from '@/lib/priceFlag'
+import { EVENT_AGE_KEYS, ageHoursOf, eventToneOf, eventTypeLabelKey, summarizeCycle } from '@/lib/priceEvents'
+import { agePart, type TextPart } from '@/lib/priceDataView'
 import { useI18n, useLocaleFormat } from '@/locales'
-import { message, HlButton, HlCarousel, HlEmpty, HlImg } from '@/components/ui'
+import { message, HlButton, HlCarousel, HlEmpty, HlImg, HlTextarea } from '@/components/ui'
+import { useCrawlStatusStore } from '@/stores/crawlStatus'
 import { useRegionsStore } from '@/stores/regions'
 import { useRatesStore } from '@/stores/rates'
 import RegionFlag from '@/components/RegionFlag.vue'
@@ -42,6 +40,7 @@ import SteamFreeCards from '@/components/business/SteamFreeCards.vue'
 const router = useRouter()
 const regionsStore = useRegionsStore()
 const ratesStore = useRatesStore()
+const crawlStore = useCrawlStatusStore()
 const { t } = useI18n()
 /** 千分位走本地化出口（原 `toLocaleString('zh-CN')`）；函数在调用时读语言，
  *  放进模板表达式即可随语言重算。 */
@@ -52,7 +51,6 @@ const loading = ref(true)
 const totalGames = ref(0)
 const discountGames = ref(0)
 const monitoredGames = ref(0) // 受监控游戏数（愿望单 + 已购，wishlist 域 active 条目）
-const proxyStats = ref<ProxyPoolStats | null>(null)
 const priceMoves = ref<GameListItem[]>([])
 const spotlights = ref<GameListItem[]>([])
 /** 用户关注的游戏（愿望单追踪含已购）：展厅入选条件之一 */
@@ -64,47 +62,60 @@ const trackedRates = ref<RateItem[]>([])
 const fillRates = ref<RateItem[]>([])
 const errorMsg = ref('')
 
-// 系统信息（uptime 本地走秒：取数时刻 + 经过时间）
-const sysInfo = ref<{ app: string; version: string; uptime_seconds: number } | null>(null)
-const sysInfoFetchedAt = ref(0)
-const nowTick = ref(Date.now())
-let tickTimer: number | undefined
+// ─── 本轮更新（价格事件摘要）───
+// 事件数与游戏数不是一个量纲：摘要里分开给，不让「12 条变化」被读成「12 款游戏」。
+const CYCLE_EVENT_LIMIT = 200
+const latestCycle = ref<PriceCycleItem | null>(null)
+/** null = 没取到（不渲染区块）；[] = 取到了但本轮没有事件 */
+const cycleEvents = ref<PriceEventItem[] | null>(null)
 
-// ─── 计算属性 ───
-const uptimeText = computed(() => {
-  if (!sysInfo.value) return '—'
-  const base = Number(sysInfo.value.uptime_seconds)
-  if (!Number.isFinite(base)) return '—'
-  const sec = Math.floor(
-    base + Math.max(0, (nowTick.value - sysInfoFetchedAt.value) / 1000),
-  )
-  const h = Math.floor(sec / 3600)
-  const m = Math.floor((sec % 3600) / 60)
-  const s = sec % 60
-  // 三种粒度各是一条整句：中英量词/单位位置不同（「3 分 5 秒」/「3m 5s」），
-  // 拼 `${m} 分 ${s} 秒` 拼不出英文。t() 在 computed 求值期取，切语言即重算。
-  if (h > 0) return t('dashboard.uptime.hms', { h, m, s })
-  if (m > 0) return t('dashboard.uptime.ms', { m, s })
-  return t('dashboard.uptime.s', { s })
-})
+/** 已收敛的轮次才有完整的事件清单（正在跑的只能看到半截） */
+const SETTLED_CYCLE = new Set(['completed', 'partial', 'failed', 'cancelled'])
 
-// 代理可用副注：Clash 按出口 IP 计（一个出口 IP = 一个代理），手动池逐条计；
-// 未运行明示——0/0 多数是后端重启后 Clash 异步启动链没走完，不是代理全挂
-const proxyHint = computed(() => {
-  const s = proxyStats.value
-  if (!s) return ''
-  const parts: string[] = []
-  // 每段各自是完整短句，用 · 连接（不是同一句被拆开，故可分别取词条后 join）
-  parts.push(
-    s.clash.running
-      ? t('dashboard.proxy.clashRunning', { n: s.clash.okExitIps })
-      : t('dashboard.proxy.clashStopped'),
-  )
-  if (s.pool.total > 0) {
-    parts.push(t('dashboard.proxy.pool', { ok: s.pool.ok, total: s.pool.total }))
+async function loadCycleDigest() {
+  try {
+    const cycles = await crawlApi.cycles(1)
+    const latest = cycles[0] ?? null
+    latestCycle.value = latest
+    if (!latest) {
+      cycleEvents.value = []
+      return
+    }
+    cycleEvents.value = await crawlApi.priceEvents({ cycleId: latest.id, limit: CYCLE_EVENT_LIMIT })
+  } catch {
+    cycleEvents.value = null
   }
-  return parts.join(' · ')
+}
+
+const cycleDigest = computed(() => {
+  if (cycleEvents.value === null) return null
+  const summary = summarizeCycle(cycleEvents.value, CYCLE_EVENT_LIMIT)
+  const running = latestCycle.value ? !SETTLED_CYCLE.has(latestCycle.value.status) : false
+  const finishedAge: TextPart | null = running
+    ? null
+    : agePart(ageHoursOf(latestCycle.value?.finishedAt ?? null), EVENT_AGE_KEYS)
+  return {
+    ...summary,
+    running,
+    finishedAge,
+    rows: summary.counts.map((row) => ({
+      ...row,
+      labelKey: eventTypeLabelKey(row.type),
+      tone: eventToneOf(row.type),
+    })),
+  }
 })
+
+// 价格周期收敛 → 摘要随新数据重算（先失效缓存再重拉：cycles / price-events 都在
+// 60s 时间窗缓存里，不失效就会把刚结束的一轮读成上一轮）
+watch(
+  () => crawlStore.priceCycle?.cycleId ?? null,
+  (cycleId) => {
+    if (cycleId === null) return
+    invalidateGetCache('/crawl')
+    loadCycleDigest()
+  },
+)
 
 // ─── 数据加载 ───
 async function load() {
@@ -112,7 +123,7 @@ async function load() {
   errorMsg.value = ''
   try {
     // 并行请求所有数据源
-    const [gamesRes, feedRes, spotRes, ratesRes, proxiesRes, accountsRes, allGamesRes] =
+    const [gamesRes, feedRes, spotRes, ratesRes, accountsRes, allGamesRes] =
       await Promise.allSettled([
         gamesApi.list({ limit: 1, onlyDiscounted: true }),
         // 降价动态：全库史低/永降标记（与提醒规则无关），按最近变动排序；
@@ -121,7 +132,6 @@ async function load() {
         // 轮播精选：新史低按折扣力度排序（同样先多拉再展厅过滤取前 5）
         gamesApi.list({ flag: 'hl', sort: 'discount', limit: 30 }),
         ratesApi.list(),
-        proxiesApi.stats(),
         watchPoolApi.appids(),
         // 游戏总数（不含过滤）——曾挂在并行块外的串行尾巴上，白多一程
         gamesApi.list({ limit: 1 }),
@@ -171,22 +181,6 @@ async function load() {
               .filter((r) => !ratesStore.isTracked(r.currency))
               .slice(0, 10 - trackedRates.value.length)
     }
-
-    // 代理（出口 IP 口径：Clash 按出口 IP 去重，手动池逐条）
-    if (proxiesRes.status === 'fulfilled') {
-      proxyStats.value = proxiesRes.value
-    }
-
-    // 系统信息
-    try {
-      const resp = await fetch('/api/v1/info')
-      if (resp.ok) {
-        sysInfo.value = await resp.json()
-        sysInfoFetchedAt.value = Date.now()
-      }
-    } catch {
-      /* 静默 */
-    }
   } catch (e) {
     errorMsg.value = e instanceof Error ? e.message : String(e)
     message.error(errorMsg.value)
@@ -195,23 +189,11 @@ async function load() {
   }
 }
 
-// ─── 快捷操作（先启动对应动作，再跳转到页面看进度/结果）───
+// ─── 愿望单同步（空库首屏与正常态共用）───
 const starting = ref('')
 
 function failText(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
-}
-
-async function startCrawl() {
-  starting.value = 'crawl'
-  try {
-    const res = await crawlApi.run('wishlist')
-    message.success(t('dashboard.toast.crawlStarted', { id: res.id, count: res.count }))
-  } catch (e) {
-    message.error(failText(e))
-  }
-  router.push('/crawl')
-  starting.value = ''
 }
 
 async function syncAllWishlist() {
@@ -249,33 +231,9 @@ async function syncAllWishlist() {
   starting.value = ''
 }
 
-async function refreshRates() {
-  starting.value = 'rates'
-  try {
-    const res = await ratesApi.refresh()
-    message.success(t('dashboard.toast.ratesRefreshed', { count: res.count, source: res.source }))
-  } catch (e) {
-    message.error(failText(e))
-  }
-  router.push('/rates')
-  starting.value = ''
-}
-
 /** 迷你汇率行点击 → 汇率页并预选该币种（query 深链，汇率页承接并定位到走势板块） */
 function goRate(code: string) {
   router.push({ path: '/rates', query: { currency: code } })
-}
-
-async function checkProxies() {
-  starting.value = 'proxies'
-  try {
-    const res = await proxiesApi.clashHealthCheck(false)
-    message.success(t('dashboard.toast.proxyCheckStarted', { state: res.state }))
-  } catch (e) {
-    message.error(failText(e))
-  }
-  router.push('/proxies')
-  starting.value = ''
 }
 
 function fmtTime(t: string | null | undefined): string {
@@ -283,34 +241,92 @@ function fmtTime(t: string | null | undefined): string {
   return t.slice(5, 16).replace('T', ' ')
 }
 
-// ─── 代理统计自愈轮询 ───
-// Clash 状态是后端进程内单例：后端重启后走异步启动链（下载订阅→拉内核→
-// 体检），期间 stats 真实返回 0/0。仪表盘只在挂载时取一次快照会把这个
-// 窗口值钉死——轻量轮询 + 切回窗口即刷，让数字在内核起来后自动恢复。
-let statsTimer: number | undefined
+// ─── 空库首屏：全新实例只回答「第一步做什么」───
+/** 库里一款游戏都没有（有筛选条件不算，那时应显示「没有匹配结果」） */
+const isEmptyLibrary = computed(
+  () => !loading.value && errorMsg.value === '' && totalGames.value === 0,
+)
 
-async function refreshProxyStats() {
+/** 内联添加区：粘贴链接/整份列表 → 入池 → 对新导入触发首次获取价格 */
+const addOpen = ref(false)
+const addText = ref('')
+const addBusy = ref(false)
+const addMsg = ref('')
+/** 本轮刚添加的款数：>0 时欢迎卡改显「正在获取价格」，首爬收敛后自动重取 */
+const addedPending = ref(0)
+
+// 首爬收敛（爬取从跑到停）→ 重取一次：目录里有条目后欢迎卡自然消失
+watch(
+  () => crawlStore.running,
+  (now, before) => {
+    if (before && !now && addedPending.value > 0) {
+      addedPending.value = 0
+      void load()
+    }
+  },
+)
+
+async function submitAdd() {
+  const text = addText.value.trim()
+  if (!text || addBusy.value) return
+  const { appids } = parseAppRefs(text)
+  if (!appids.length) {
+    addMsg.value = t('dashboard.welcome.addNone')
+    return
+  }
+  addBusy.value = true
+  addMsg.value = ''
   try {
-    proxyStats.value = await proxiesApi.stats()
+    let added = 0
+    let owned = 0
+    const newIds: number[] = []
+    for (let i = 0; i < appids.length; i += 100) {
+      const r = await crawlApi.importApps(appids.slice(i, i + 100))
+      added += r.ok
+      owned += r.own
+      newIds.push(
+        ...r.results
+          .filter((it) => it.status === 'ok' && it.appid)
+          .map((it) => it.appid as number),
+      )
+    }
+    if (newIds.length) {
+      try {
+        // 新导入直接触发一次获取（与批量导入同款语义）；任务占用则留给后续刷新
+        await crawlApi.run('appids', newIds, 'import')
+      } catch {
+        /* 任务占用：不打断用户，价格由后续刷新补齐 */
+      }
+    }
+    if (added > 0) {
+      message.success(t('dashboard.welcome.added', { n: added }))
+      addText.value = ''
+      addOpen.value = false
+      addedPending.value = added
+      await load()
+    } else if (owned > 0) {
+      addMsg.value = t('dashboard.welcome.addOwned', { n: owned })
+      await load()
+    } else {
+      addMsg.value = t('dashboard.welcome.addNone')
+    }
   } catch {
-    /* 静默：下轮再试 */
+    // 导入不需要账户；失败只报结果与出路，不把后端原文甩给用户
+    addMsg.value = t('dashboard.welcome.addFailed')
+  } finally {
+    addBusy.value = false
   }
 }
 
-function startStatsPolling() {
-  stopStatsPolling()
-  statsTimer = window.setInterval(refreshProxyStats, 30_000)
-}
-
-function stopStatsPolling() {
-  if (statsTimer !== undefined) {
-    window.clearInterval(statsTimer)
-    statsTimer = undefined
+/** 空库时的「从 Steam 愿望单同步」：没绑账号就说明去哪绑 */
+async function syncFromWelcome() {
+  const accounts = await watchPoolApi.accounts().catch(() => [])
+  if (accounts.length === 0) {
+    message.warning(t('dashboard.toast.noAccounts'))
+    router.push('/settings')
+    return
   }
-}
-
-function onVisibilityChange() {
-  if (document.visibilityState === 'visible') refreshProxyStats()
+  await syncAllWishlist()
 }
 
 /** 国区价展示文本；无国区价返回 null */
@@ -340,24 +356,74 @@ const marqueeItems = computed(() =>
 onMounted(() => {
   regionsStore.load()
   load()
-  tickTimer = window.setInterval(() => {
-    nowTick.value = Date.now()
-  }, 1000)
-  startStatsPolling()
-  document.addEventListener('visibilitychange', onVisibilityChange)
-})
-
-onBeforeUnmount(() => {
-  if (tickTimer !== undefined) window.clearInterval(tickTimer)
-  stopStatsPolling()
-  document.removeEventListener('visibilitychange', onVisibilityChange)
+  loadCycleDigest()
 })
 </script>
 
 <template>
   <section class="dashboard-page">
-    <!-- 统计卡片 -->
-    <div class="stat-grid" data-section="dashboard.section.overview">
+    <!-- 空库首屏：全新实例先回答「第一步做什么」——添加游戏后整块消失。
+         这里只放用户动作与结果，不放代理 / 任务 / 队列 / 系统信息。 -->
+    <div v-if="isEmptyLibrary" class="card welcome-card">
+      <h2 class="welcome-card__title">{{ t('dashboard.welcome.title', { app: APP_NAME }) }}</h2>
+      <p class="welcome-card__ask">{{ t('dashboard.welcome.ask') }}</p>
+
+      <div class="welcome-card__actions">
+        <HlButton variant="primary" @click="addOpen = !addOpen">
+          {{ t('dashboard.welcome.paste') }}
+        </HlButton>
+        <HlButton
+          :loading="starting === 'wishlist'"
+          :disabled="starting !== ''"
+          @click="syncFromWelcome"
+        >
+          {{ t('dashboard.welcome.sync') }}
+        </HlButton>
+        <HlButton @click="router.push('/pool?add=1')">
+          {{ t('dashboard.welcome.import') }}
+        </HlButton>
+      </div>
+
+      <!-- 已添加、正在首爬：不等下一次刷新，也让用户看到系统接住了 -->
+      <p v-if="addedPending > 0" class="welcome-card__pending">
+        {{ t('dashboard.welcome.added', { n: addedPending }) }}
+      </p>
+
+      <!-- 内联粘贴区：粘贴即入池，并对新导入立刻取一次价格 -->
+      <div v-if="addOpen" class="welcome-card__add">
+        <HlTextarea
+          v-model="addText"
+          :rows="3"
+          :placeholder="t('dashboard.welcome.pasteHint')"
+        />
+        <div class="welcome-card__add-row">
+          <HlButton
+            variant="primary"
+            size="sm"
+            :loading="addBusy"
+            :disabled="addBusy || !addText.trim()"
+            @click="submitAdd"
+          >
+            {{ addBusy ? t('dashboard.welcome.adding') : t('dashboard.welcome.add') }}
+          </HlButton>
+          <HlButton variant="text" size="sm" :disabled="addBusy" @click="addOpen = false">
+            {{ t('common.cancel') }}
+          </HlButton>
+          <span v-if="addMsg" class="welcome-card__msg">{{ addMsg }}</span>
+        </div>
+      </div>
+
+      <div class="welcome-card__auto">
+        <span class="welcome-card__auto-title">{{ t('dashboard.welcome.autoTitle') }}</span>
+        <span class="welcome-card__auto-item">{{ t('dashboard.welcome.autoPrice') }}</span>
+        <span class="welcome-card__auto-item">{{ t('dashboard.welcome.autoRefresh') }}</span>
+        <span class="welcome-card__auto-item">{{ t('dashboard.welcome.autoEvent') }}</span>
+        <span class="welcome-card__auto-item">{{ t('dashboard.welcome.autoAlert') }}</span>
+      </div>
+    </div>
+
+    <!-- 统计卡片（库里有游戏后才出现） -->
+    <div v-if="!isEmptyLibrary" class="stat-grid" data-section="dashboard.section.overview">
       <div class="card stat-card" v-loading="loading">
         <div class="stat-card__icon stat-card__icon--blue">
           <el-icon :size="22"><DataLine /></el-icon>
@@ -385,19 +451,6 @@ onBeforeUnmount(() => {
         <div class="stat-card__body">
           <div class="stat-card__value">{{ monitoredGames }}</div>
           <div class="stat-card__label">{{ t('dashboard.stats.monitored') }}</div>
-        </div>
-      </div>
-
-      <div class="card stat-card" v-loading="loading">
-        <div class="stat-card__icon stat-card__icon--cyan">
-          <el-icon :size="22"><Connection /></el-icon>
-        </div>
-        <div class="stat-card__body">
-          <div class="stat-card__value">
-            {{ proxyStats ? `${proxyStats.available}/${proxyStats.total}` : '—' }}
-          </div>
-          <div class="stat-card__label">{{ t('dashboard.stats.proxyAvailable') }}</div>
-          <div v-if="proxyHint" class="stat-card__hint">{{ proxyHint }}</div>
         </div>
       </div>
     </div>
@@ -458,8 +511,8 @@ onBeforeUnmount(() => {
     <!-- HB 当月包卡片（Humble Choice 本月内容，点击进站内详情，头部官方页直达） -->
     <HbChoiceCards />
 
-    <!-- 主体区域 -->
-    <div class="dashboard-main">
+    <!-- 主体区域（库为空时整块不渲染：新史低/降价动态/汇率都还没有可看的东西） -->
+    <div v-if="!isEmptyLibrary" class="dashboard-main">
       <!-- 左列：新史低精选轮播 + 降价动态 -->
       <div class="dashboard-col">
         <!-- 新史低精选（自动轮播，hover 暂停） -->
@@ -517,6 +570,51 @@ onBeforeUnmount(() => {
               </div>
             </template>
           </HlCarousel>
+        </div>
+
+        <!-- 本轮更新：最近一轮价格刷新产生的事件摘要（事件数 ≠ 游戏数，分开说） -->
+        <div v-if="cycleDigest" class="card section-card" data-section="priceEvent.cycle.title">
+          <div class="section-header">
+            <div class="section-title">{{ t('priceEvent.cycle.title') }}</div>
+            <el-button size="small" text @click="router.push('/library')">
+              {{ t('priceEvent.cycle.more') }} →
+            </el-button>
+          </div>
+
+          <p v-if="cycleDigest.events === 0" class="cycle-digest__empty">
+            {{ cycleDigest.running ? t('priceEvent.cycle.running') : t('priceEvent.cycle.empty') }}
+          </p>
+          <div v-else class="cycle-digest">
+            <div class="cycle-digest__row">
+              <span v-if="cycleDigest.running" class="cycle-digest__running">
+                {{ t('priceEvent.cycle.running') }}
+              </span>
+              <span
+                v-for="row in cycleDigest.rows"
+                :key="row.type"
+                class="cycle-digest__item"
+                :class="`tone-${row.tone}`"
+              >
+                {{ t('priceEvent.cycle.item', { label: t(row.labelKey), n: row.count }) }}
+              </span>
+            </div>
+            <p class="cycle-digest__meta">
+              {{ t('priceEvent.cycle.eventsTotal', { n: cycleDigest.events }) }}
+              ·
+              {{ t('priceEvent.cycle.games', { n: cycleDigest.games }) }}
+              <template v-if="cycleDigest.truncated">
+                · {{ t('priceEvent.cycle.truncated', { n: CYCLE_EVENT_LIMIT }) }}
+              </template>
+              <template v-if="cycleDigest.finishedAge">
+                ·
+                {{
+                  t('priceEvent.cycle.finished', {
+                    time: t(cycleDigest.finishedAge.key, cycleDigest.finishedAge.params),
+                  })
+                }}
+              </template>
+            </p>
+          </div>
         </div>
 
         <!-- 降价动态（全库新史低/永降，按最近变动排序） -->
@@ -637,50 +735,6 @@ onBeforeUnmount(() => {
             </div>
           </div>
         </div>
-
-        <!-- 快捷操作：先启动动作再跳转 -->
-        <div class="card section-card" data-section="dashboard.section.quickActions">
-          <div class="section-title">
-            <el-icon><Refresh /></el-icon>
-            {{ t('dashboard.section.quickActions') }}
-          </div>
-          <div class="quick-actions">
-            <HlButton size="sm" block :disabled="starting !== ''" :loading="starting === 'crawl'" @click="startCrawl">
-              {{ t('dashboard.action.crawl') }}
-            </HlButton>
-            <HlButton size="sm" block :disabled="starting !== ''" :loading="starting === 'wishlist'" @click="syncAllWishlist">
-              {{ t('dashboard.action.syncWishlist') }}
-            </HlButton>
-            <HlButton size="sm" block :disabled="starting !== ''" :loading="starting === 'rates'" @click="refreshRates">
-              {{ t('dashboard.action.refreshRates') }}
-            </HlButton>
-            <HlButton size="sm" block :disabled="starting !== ''" :loading="starting === 'proxies'" @click="checkProxies">
-              {{ t('dashboard.action.checkProxies') }}
-            </HlButton>
-          </div>
-        </div>
-
-        <!-- 系统信息（右列末尾 = 右下角） -->
-        <div class="card section-card" data-section="dashboard.section.sysInfo">
-          <div class="section-title">
-            <el-icon><Monitor /></el-icon>
-            {{ t('dashboard.section.sysInfo') }}
-          </div>
-          <div class="sys-info">
-            <div class="sys-info__row">
-              <span class="muted">{{ t('dashboard.sys.app') }}</span>
-              <span>{{ sysInfo?.app || '—' }}</span>
-            </div>
-            <div class="sys-info__row">
-              <span class="muted">{{ t('dashboard.sys.version') }}</span>
-              <span>{{ sysInfo?.version || '—' }}</span>
-            </div>
-            <div class="sys-info__row">
-              <span class="muted">{{ t('dashboard.sys.uptime') }}</span>
-              <span>{{ uptimeText }}</span>
-            </div>
-          </div>
-        </div>
       </div>
     </div>
   </section>
@@ -732,11 +786,6 @@ onBeforeUnmount(() => {
   color: #ff9f43;
 }
 
-.stat-card__icon--cyan {
-  background: rgba(0, 191, 255, 0.15);
-  color: #00bfff;
-}
-
 .stat-card__value {
   font-size: 24px;
   font-weight: 700;
@@ -748,13 +797,6 @@ onBeforeUnmount(() => {
   font-size: 12px;
   color: var(--text-muted);
   margin-top: 2px;
-}
-
-.stat-card__hint {
-  font-size: 11px;
-  color: var(--text-muted);
-  margin-top: 2px;
-  opacity: 0.85;
 }
 
 /* ─── 主体布局 ─── */
@@ -915,6 +957,44 @@ onBeforeUnmount(() => {
   font-size: 13px;
   font-weight: 700;
   color: var(--success, #a4d007);
+}
+
+/* ─── 本轮更新（价格事件摘要；只做有限配色分组，不评分不排序）─── */
+.cycle-digest { display: flex; flex-direction: column; gap: 8px; }
+.cycle-digest__empty { margin: 0; font-size: 12.5px; color: var(--text-dim); }
+.cycle-digest__row { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+.cycle-digest__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.cycle-digest__item::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+.cycle-digest__item.tone-down::before { background: var(--rate-good); }
+.cycle-digest__item.tone-low::before { background: var(--accent); }
+.cycle-digest__item.tone-status::before { background: var(--warning); }
+.cycle-digest__item.tone-free::before { background: var(--success); }
+.cycle-digest__item.tone-removed::before { background: var(--danger); }
+.cycle-digest__running {
+  font-size: 12px;
+  color: var(--info);
+  border: 1px solid var(--accent-a30);
+  background: var(--accent-a10);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+.cycle-digest__meta {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-dim);
 }
 
 /* ─── 降价动态列表 ─── */
@@ -1176,27 +1256,72 @@ onBeforeUnmount(() => {
   opacity: 0.55;
 }
 
-/* ─── 系统信息 ─── */
-.sys-info {
+/* ─── 空库首屏（P-M1）─── */
+.welcome-card {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
+  padding: 26px 28px;
 }
 
-.sys-info__row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-size: 13px;
+.welcome-card__title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 700;
   color: var(--text-primary);
 }
 
-/* ─── 快捷操作（2×2 网格）─── */
-.quick-actions {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
+.welcome-card__ask {
+  margin: 0;
+  font-size: 15px;
+  color: var(--text-secondary);
+}
+
+.welcome-card__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.welcome-card__add {
+  display: flex;
+  flex-direction: column;
   gap: 8px;
   margin-top: 4px;
+}
+
+.welcome-card__add-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.welcome-card__msg {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.welcome-card__pending {
+  margin: 2px 0 0;
+  font-size: 13px;
+  color: var(--accent);
+}
+
+.welcome-card__auto {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+  margin-top: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.welcome-card__auto-title {
+  color: var(--text-muted);
 }
 
 .muted {

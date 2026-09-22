@@ -2,15 +2,28 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
+  crawlApi,
   gamesApi,
+  invalidateGetCache,
   type GameDetail,
   type HistoryPayload,
+  type PriceEventItem,
 } from '@/api/client'
+import { formatMinor } from '@/api/currencies'
 import { flagUrl, formatCnyFen } from '@/api/regions'
 import { isPermChangeRecent } from '@/lib/priceFlag'
+import { agePart } from '@/lib/priceDataView'
+import {
+  EVENT_AGE_KEYS,
+  eventViews,
+  stateFormatter,
+  type EventFormatters,
+} from '@/lib/priceEvents'
 import { selectableVariants, versionSelectOptions } from '@/lib/versions'
+import { useCrawlStatusStore } from '@/stores/crawlStatus'
 import { useRegionsStore } from '@/stores/regions'
 import { useI18n, useLocaleFormat, type MessageKey } from '@/locales'
+import RegionFlag from '@/components/RegionFlag.vue'
 import HlSelect from '@/components/ui/HlSelect.vue'
 import HlTable, { type HlTableColumn } from '@/components/ui/HlTable.vue'
 import HlButton from '@/components/ui/HlButton.vue'
@@ -317,6 +330,8 @@ const ratingTone = computed(() => {
 async function load() {
   loading.value = true
   errorMsg.value = ''
+  // 事件面与详情并行拉取：失败只是不渲染区块，不拖累详情页其余部分
+  void loadEvents()
   try {
     // 走势预热与详情并行:初始地区默认 cn。仅当详情到手后发现国区无价、
     // 需要改选初始地区时,才放弃预热结果、由 watch(historyRegion) 重拉
@@ -403,6 +418,55 @@ async function retryRemoved() {
     retrying.value = false
   }
 }
+
+// ── 最近价格变化（事件的唯一来源是 price_events）──
+// 事件判没判出来在后端，这里只做格式化：内部枚举翻标签、previous/current 拼成
+// 「之前 → 现在」。前端不据 priceMatrix / hlFlag 自行推断事件。
+// **null = 没取到**（不渲染区块，也不声称「没有变化」）；[] = 取到了但没有事件。
+
+const crawl = useCrawlStatusStore()
+const priceEvents = ref<PriceEventItem[] | null>(null)
+/** 单游戏级请求：一次拉当前游戏的最近事件，不按卡片轮询 */
+const EVENTS_LIMIT = 20
+
+const eventFmt: EventFormatters = {
+  price: (amountMinor, region) =>
+    formatMinor(amountMinor, regionsStore.metaByCode(region ?? '')?.currency ?? 'CNY'),
+  state: stateFormatter(t),
+}
+
+/** 展示时间来自事件自身的发生时刻（occurred_at），不是实体更新时间 */
+const eventList = computed(() =>
+  eventViews(priceEvents.value ?? [], eventFmt, (hours) => agePart(hours, EVENT_AGE_KEYS)),
+)
+
+async function loadEvents() {
+  try {
+    priceEvents.value = await crawlApi.priceEvents({ appid: appid.value, limit: EVENTS_LIMIT })
+  } catch {
+    priceEvents.value = null
+  }
+}
+
+/** 周期收敛后的静默重取：不动加载态（后台刷新不该把页面打回骨架屏） */
+async function refreshAfterCycle() {
+  invalidateGetCache('/games')
+  try {
+    detail.value = await gamesApi.detail(appid.value)
+  } catch {
+    /* 保留原数据 */
+  }
+  await loadEvents()
+}
+
+// 价格周期收敛 → 价格数据与事件面一起刷新（P6-A 的刷新链在这里续到事件面）
+watch(
+  () => crawl.priceCycle?.cycleId ?? null,
+  (cycleId) => {
+    if (cycleId !== null) refreshAfterCycle()
+  },
+)
+watch(appid, () => loadEvents())
 
 // 切地区 → 版本数据源随区变化，重置标准版再重拉全量历史
 watch(historyRegion, () => {
@@ -784,9 +848,37 @@ onMounted(load)
             <HlEmpty v-else size="sm" icon="" :text="t('gameDetail.trend.empty')" />
           </div>
 
-          <!-- ⑤ 多版本 → 在卡片走势抽屉「全部版本」区块 -->
+          <!-- ⑤ 最近价格变化：事实来自 price_events（前端只格式化，不重判事件） -->
+          <div v-if="priceEvents !== null" class="gd-card gd-section" data-section="priceEvent.title">
+            <div class="gd-section__header">
+              <div class="section-title">{{ t('priceEvent.title') }}</div>
+            </div>
+            <div v-if="priceEvents.length === 0" class="gd-events-empty">
+              {{ t('priceEvent.empty') }}
+            </div>
+            <ul v-else class="gd-events-list">
+              <li v-for="ev in eventList" :key="ev.id" class="gd-events-row" :class="`tone-${ev.tone}`">
+                <span class="gd-events-dot"></span>
+                <span class="gd-events-label">{{ t(ev.labelKey) }}</span>
+                <RegionFlag
+                  v-if="ev.region"
+                  :code="ev.region.toLowerCase()"
+                  compact
+                  class="gd-events-region"
+                />
+                <span v-if="ev.before || ev.after" class="gd-events-values">
+                  <span class="gd-events-from">{{ ev.before }}</span>
+                  <span class="gd-events-arrow">→</span>
+                  <span class="gd-events-to">{{ ev.after }}</span>
+                </span>
+                <span class="gd-events-time">{{ t(ev.age.key, ev.age.params) }}</span>
+              </li>
+            </ul>
+          </div>
 
-          <!-- ⑥ 关联捆绑包 -->
+          <!-- ⑥ 多版本 → 在卡片走势抽屉「全部版本」区块 -->
+
+          <!-- ⑦ 关联捆绑包 -->
           <div v-if="detail.linkedBundles.length" class="gd-section-plain" data-section="gameDetail.section.bundles">
             <div class="gd-plain-title">
               📦 {{ t('gameDetail.bundles.title', { n: detail.linkedBundles.length }) }}
@@ -1421,6 +1513,61 @@ html:not(.dark) .gd-link-icon.steamdb { filter: invert(1); }
   background: #2ed573;
   box-shadow: 0 0 6px rgba(46, 213, 115, 0.5);
   flex-shrink: 0;
+}
+
+/* ── ⑤ 最近价格变化（事件事实面；只做有限配色分组，不评分不排序）── */
+.gd-events-empty {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  padding: 4px 0 2px;
+}
+.gd-events-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.gd-events-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 0;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+}
+.gd-events-row + .gd-events-row { border-top: 1px solid var(--row-border); }
+.gd-events-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  flex-shrink: 0;
+}
+.gd-events-row.tone-down .gd-events-dot { background: var(--rate-good); }
+.gd-events-row.tone-low .gd-events-dot { background: var(--accent); }
+.gd-events-row.tone-status .gd-events-dot { background: var(--warning); }
+.gd-events-row.tone-free .gd-events-dot { background: var(--success); }
+.gd-events-row.tone-removed .gd-events-dot { background: var(--danger); }
+.gd-events-label { font-weight: 600; color: var(--text-primary); }
+.gd-events-region { font-size: 12px; color: var(--text-dim); }
+.gd-events-values {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-variant-numeric: tabular-nums;
+  min-width: 0;
+}
+.gd-events-from { color: var(--text-faint); text-decoration: line-through; }
+.gd-events-arrow { color: var(--text-faint); }
+.gd-events-to { color: var(--text-primary); font-weight: 600; }
+.gd-events-time {
+  margin-left: auto;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+@media (max-width: 768px) {
+  .gd-trend-stats { grid-template-columns: repeat(2, 1fr); }
 }
 
 @media (max-width: 768px) {

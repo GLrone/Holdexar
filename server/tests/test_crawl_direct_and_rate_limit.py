@@ -260,3 +260,14 @@ def test_scheduler_owned_jobs_no_gate_flag():
     src = inspect.getsource(sched_mod)
     assert "from_scheduler" not in src, "from_scheduler 闸门已退役，不得复活"
     assert src.count("run_sequential(") >= 5, "自动入口应不少于 5 处"
+
+# ── 通知层不在本文件范围（有独立测试）：不打真库、不发真邮件 ──
+import app.domains.notifications.service as _notification_service
+
+
+@pytest.fixture(autouse=True)
+def _no_notifications(monkeypatch):
+    async def _noop(cycle_id):
+        return {"created": 0, "sent": 0, "deferred": 0, "failed": 0}
+
+    monkeypatch.setattr(_notification_service, "dispatch", _noop)

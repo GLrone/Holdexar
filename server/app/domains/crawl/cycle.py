@@ -1,9 +1,7 @@
 """价格刷新周期（Price Refresh Cycle）：一轮价格刷新的生命周期与归属。
 
-`crawl_jobs` 是任务级对象（一次 start_job 一行），回答不了「这一轮该刷哪些
-对象、进行到哪、有没有跑完」。`PriceCycle` 是一级业务对象，与 CrawlJob 是
-1:N——本轮启动的每个 job 都挂 `cycle_id`，Cycle 自己的状态机是唯一的一级
-生命周期：
+`PriceCycle` 是一级业务对象，与 CrawlJob 是 1:N——本轮启动的每个 job 都挂
+`cycle_id`，Cycle 的状态机是唯一的一级生命周期：
 
     planning → running → repairing → finalizing
                                    → completed / partial / failed / cancelled
@@ -18,14 +16,14 @@
 - cancelled   本轮被用户停止
 
 期望集在 planning 落库后即冻结：此后监控池增删、区服配置变化都不改写本轮
-分母——覆盖率的分母必须可复现，不能事后重查当前监控池。
+分母——覆盖率的分母必须可复现。
 
-Repair 归属边界：既有 5min `price_repair` 定时任务扫全库 missing 账本，与
-本轮期望集没有确定性关联，其 job 的 `cycle_id` 保持 NULL（暂不归属）；
-Cycle 的 repairing 阶段只记录本轮确实遗留了欠账，不另发起抓取。
+Repair 归属边界：5min `price_repair` 扫全库 missing 账本，与本轮期望集没有
+确定性关联，其 job 的 `cycle_id` 保持 NULL（暂不归属）；Cycle 的 repairing
+只记录本轮确实遗留了欠账，不另发起抓取。
 
-状态只由本模块的 `advance` 写入；job / worker / scheduler 一律不得直接改
-Cycle 状态。
+状态只由本模块的 `advance` 写入；job / worker / scheduler 不得直接改 Cycle
+状态。
 """
 from __future__ import annotations
 

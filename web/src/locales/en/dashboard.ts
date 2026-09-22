@@ -15,24 +15,31 @@ const dashboard: Partial<Record<MessageKey, string>> = {
   'dashboard.section.spotlight': 'New-low picks',
   'dashboard.section.priceMoves': 'Price activity',
   'dashboard.section.rates': 'Key rates',
-  'dashboard.section.quickActions': 'Quick actions',
-  'dashboard.section.sysInfo': 'System info',
 
-  /* Stat tiles */
+  /* Stat tiles (the whole row is hidden while the store is empty) */
   'dashboard.stats.totalGames': 'Titles in the store',
   'dashboard.stats.discounts': 'On sale now',
   'dashboard.stats.monitored': 'Monitored games',
-  'dashboard.stats.proxyAvailable': 'Proxies up',
 
-  /* Uptime (three granularities) */
-  'dashboard.uptime.hms': '{h}h {m}m {s}s',
-  'dashboard.uptime.ms': '{m}m {s}s',
-  'dashboard.uptime.s': '{s}s',
-
-  /* Proxy stat sub-line (independent phrases joined by ·) */
-  'dashboard.proxy.clashRunning': 'Clash: {n} exits',
-  'dashboard.proxy.clashStopped': 'Clash not running',
-  'dashboard.proxy.pool': 'Pool {ok}/{total}',
+  /* Empty-store first screen: answers "what do I do first" */
+  'dashboard.welcome.title': 'Welcome to {app}',
+  'dashboard.welcome.ask': 'Which games do you want to watch?',
+  'dashboard.welcome.paste': 'Paste a game link',
+  'dashboard.welcome.sync': 'Sync from Steam wishlist',
+  'dashboard.welcome.import': 'Import a game list / file',
+  'dashboard.welcome.pasteHint':
+    'One link per line (Steam store / SteamDB link or plain AppID) — you can paste a whole list at once.',
+  'dashboard.welcome.add': 'Add',
+  'dashboard.welcome.adding': 'Adding…',
+  'dashboard.welcome.added': 'Added {n} — fetching prices for every region',
+  'dashboard.welcome.addOwned': '{n} already in your store',
+  'dashboard.welcome.addNone': 'No usable game found — check the links or AppIDs',
+  'dashboard.welcome.addFailed': 'Could not add right now — please try again.',
+  'dashboard.welcome.autoTitle': 'It will automatically',
+  'dashboard.welcome.autoPrice': 'fetch regional prices',
+  'dashboard.welcome.autoRefresh': 'refresh on schedule',
+  'dashboard.welcome.autoEvent': 'spot price drops',
+  'dashboard.welcome.autoAlert': 'alert you on target',
 
   /* Price-state badges (marquee / carousel / activity list) */
   'dashboard.badge.newLow': 'New low',
@@ -46,28 +53,14 @@ const dashboard: Partial<Record<MessageKey, string>> = {
   /* Card-corner link (the → arrow stays in the component) */
   'dashboard.action.viewAll': 'All',
 
-  /* Quick-action buttons */
-  'dashboard.action.crawl': 'Start crawl',
-  'dashboard.action.syncWishlist': 'Sync watch pool',
-  'dashboard.action.refreshRates': 'Refresh rates',
-  'dashboard.action.checkProxies': 'Check proxies',
-
-  /* Quick-action result toasts */
-  'dashboard.toast.crawlStarted': 'Crawl job #{id} started ({count} games)',
-  'dashboard.toast.noAccounts': 'No tracking account bound — bind one on the Watch pool page first',
+  /* Wishlist-sync result toasts */
+  'dashboard.toast.noAccounts': 'No Steam account yet — bind one to sync your wishlist',
   'dashboard.toast.synced': 'Synced {ok}/{total} accounts, {added} new games',
-  'dashboard.toast.crawlTriggerFailed': 'Could not start a crawl for the new items (a job may already be running) — try again later',
-  'dashboard.toast.ratesRefreshed': 'Rates refreshed: {count} currencies (source: {source})',
-  'dashboard.toast.proxyCheckStarted': 'Proxy health check started ({state})',
+  'dashboard.toast.crawlTriggerFailed': 'Could not start price fetching for the new items (a job may already be running) — it will retry later',
 
   /* Empty states */
   'dashboard.empty.noMoves': 'No price activity yet',
   'dashboard.empty.noRates': 'No rate data yet — pick currencies to track on the Rates page',
-
-  /* System-info rows */
-  'dashboard.sys.app': 'App',
-  'dashboard.sys.version': 'Version',
-  'dashboard.sys.uptime': 'Uptime',
 }
 
 export default dashboard

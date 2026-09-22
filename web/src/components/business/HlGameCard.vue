@@ -21,6 +21,7 @@ import {
 } from '@/lib/assetCache'
 import { useTrendDrawerStore } from '@/stores/trendDrawer'
 import { isPermChangeRecent } from '@/lib/priceFlag'
+import { priceDataView } from '@/lib/priceDataView'
 import { selectableVariants, versionSelectOptions } from '@/lib/versions'
 import HlSelect from '@/components/ui/HlSelect.vue'
 import PriceTrendDrawer from './PriceTrendDrawer.vue'
@@ -173,6 +174,19 @@ const discountEndsTip = computed(() => {
   if (props.game.discount <= 0 || !ts || ts * 1000 <= Date.now()) return ''
   return t('gameCard.discount.endsAt', { date: formatDateTs(ts) })
 })
+
+// ─── 价格数据状态（观察时间 / 新鲜度 / 本轮覆盖）───
+// 观察时间是**价格**维度，与 updatedAt（实体更新时间）不同源。覆盖率由后端按
+// Cycle 冻结的期望集算出，卡片只展示；措辞规则在 lib/priceDataView。
+const priceView = computed(() => priceDataView(props.game.priceData))
+const priceAgeText = computed(() => t(priceView.value.age.key, priceView.value.age.params))
+const coverageText = computed(() => {
+  const cov = priceView.value.coverage
+  return cov ? t(cov.key, cov.params) : ''
+})
+const priceDataTip = computed(() =>
+  priceView.value.tips.map((part) => t(part.key, part.params)).join(' · '),
+)
 
 // ─── 左上角归属状态徽章 + 游戏归属弹窗（状态徽章 + 悬停弹窗）───
 
@@ -1254,6 +1268,21 @@ const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/asse
             {{ t('gameCard.price.save', { amount: diffYuan }) }}
           </span>
           <span v-else class="diff-badge">{{ t('gameCard.price.noDiff') }}</span>
+        </div>
+
+        <div v-if="game.priceData" class="price-row">
+          <span class="price-label">{{ t('gameCard.priceData.label') }}</span>
+          <span
+            class="price-data"
+            :title="priceDataTip"
+            :class="[
+              priceView.freshness ? `is-${priceView.freshness}` : '',
+              priceView.coverage?.partial ? 'is-partial' : '',
+            ]"
+          >
+            <span>{{ priceAgeText }}</span>
+            <span v-if="coverageText" class="coverage">{{ coverageText }}</span>
+          </span>
         </div>
       </div>
 

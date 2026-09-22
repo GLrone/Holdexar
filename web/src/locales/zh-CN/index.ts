@@ -65,6 +65,8 @@ import updateDialog from './updateDialog'
 import achievements from './achievements'
 // ── 游戏生涯（views/achievements/ 的 career/ 子模块与穿插分节）──
 import achievementsCareer from './achievementsCareer'
+// ── 价格事件面（游戏详情「最近价格变化」+ 仪表盘「本轮更新」）──
+import priceEvent from './priceEvent'
 
 /** 全量中文词典 */
 export const messages = {
@@ -107,6 +109,7 @@ export const messages = {
   ...updateDialog,
   ...achievements,
   ...achievementsCareer,
+  ...priceEvent,
 } as const
 
 export type MessageKey = keyof typeof messages

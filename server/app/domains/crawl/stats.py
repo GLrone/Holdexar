@@ -1,37 +1,26 @@
 """价格刷新周期的生产统计：这一轮实际发生了什么。
 
 统计是 Cycle 的观测结果，写回 `price_cycles` 行本身（不建独立统计表），在
-Cycle 收敛时由调用方写一次。
+Cycle 收敛时由调用方写一次。数据来源只有三处，全部是已有事实：Cycle 行
+（冻结期望集、各阶段真实时刻、终态）、价格结果（`coverage.cycle_coverage`）、
+对象新鲜度（`freshness.appid_freshness`）。
 
-数据来源只有三处，全部是已有事实：
+口径（每个数字都能追溯到上面三处）：
 
-- Cycle 行：冻结期望集、各阶段真实时刻、终态
-- 价格结果：`game_current_prices`（经 `coverage.cycle_coverage`）
-- 对象新鲜度：`freshness.appid_freshness`
-
-统计口径（每个数字都能追溯到上面三处，不猜）：
-
-- `targetsTotal` / `targetsDone`：期望集对象数 / 「处理完」的对象数——
-  全部期望区服都拿到明确终态才算处理完（含 missing / blocked），
-  因此「处理完」不等于「成功」，`targetsDone` 满格 + `coverage` 不满可以同时成立
-- `unitsExpected` = 对象数 × 地区数；`unitsOk` / `unitsLocked` /
-  `unitsFailed`（= missing + blocked）/ `unitsUnobserved` 是五个桶
+- `targetsDone`：「处理完」的对象数——全部期望区服都拿到明确终态才算
+  （含 missing / blocked），因此「处理完」不等于「成功」
+- `unitsExpected` = 对象数 × 地区数；`unitsFailed` = missing + blocked
 - `coverage` = ok / expected；`coverageConfirmed` = (ok + locked) / expected
-- `staleCount`：对象级——价格记录的最后观察时刻已 ≥ `STALE_HOURS` 的对象数
-  （与 Freshness 同口径，不另立一套粒度）
-- `durationSeconds` = `finished_at` − `started_at`
-- `stageMs`：由 Cycle 行上的真实阶段时刻相减；**没进过的阶段记 0**，不估算
+- `staleCount`：对象级，与 Freshness 同口径（不另立粒度）
+- `durationSeconds` = `finished_at` − `started_at`；`stageMs` 由 Cycle 行的
+  真实阶段时刻相减，**没进过的阶段记 0**，不估算
 
-本轮不统计的指标（缺口，不伪造来源）：
+不统计 `retryCount` / `repairCount` / `errorKinds`：5min `price_repair` 的 job
+`cycle_id` 为 NULL，HTTP 重试计数只在进程内，错误只有 Job 级自由文本——没有
+能证明归属的来源，也不用时间窗口去推测、不新造错误分类。
 
-- `retryCount` / `repairCount`：5min `price_repair` 的 job `cycle_id` 为 NULL，
-  HTTP 重试与批次重推的计数只在进程内，不落库——没有能证明归属的来源，
-  也不用时间窗口去推测。
-- `errorKinds`：现有错误只有 Job 级自由文本 `crawl_jobs.error`，没有可稳定
-  归类的错误体系；不为统计新造一套分类，Job 级错误照旧保留在 job 行上。
-
-统计只描述事实，不驱动任何控制：调度周期、worker 数、重试与 repair 策略
-都不读取这里的数字。
+统计只描述事实，不驱动控制：调度周期、worker 数、重试与 repair 策略都不读
+这里的数字。
 """
 from __future__ import annotations
 

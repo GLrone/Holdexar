@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.core import scheduler as sched_mod
 from app.core.database import Base
 from app.domains.crawl import cycle as cycle_mod
+from app.domains.crawl import events as _events_mod  # noqa: F401  price_events 建表
 from app.domains.crawl import service as crawl_service
 from app.domains.crawl.cycle import PriceCycle
 from app.domains.crawl.models import CrawlJob
@@ -461,3 +462,89 @@ async def test_orphan_cycles_converged_on_startup(db):
             select(PriceCycle).where(PriceCycle.status.in_(cycle_mod.OPEN_STATES))
         )).scalars().all()
     assert left == []
+
+
+# ── 收敛广播（前端自动刷新的唯一触发源）──
+# 单位是 Cycle，不是 crawl_job：一轮里有多个 job，按 job 广播会把一次刷新放大
+# 成多次请求；被拒绝/重复的推进没有产生新结果，也不广播。
+
+
+def _capture_cycle_events(monkeypatch) -> list[dict]:
+    """只收价格周期广播：总线上同时还跑着 crawl.progress / job.* 的既有事件。"""
+    events: list[dict] = []
+
+    def _capture(event_type, **payload):
+        if event_type == "price_cycle.completed":
+            events.append(payload)
+
+    import app.core.events as events_mod
+
+    monkeypatch.setattr(events_mod.bus, "publish", _capture)
+    return events
+
+
+@pytest.mark.asyncio
+async def test_settle_broadcasts_once_with_cycle_id_and_status(db, monkeypatch):
+    """终态落库后广播一次 price_cycle.completed，载荷带 cycleId / status。"""
+    _crawl_env(monkeypatch)
+    await _seed_games(db, APPIDS)
+    events = _capture_cycle_events(monkeypatch)
+
+    await sched_mod._run_price_cycle([{"scope": "pool"}])
+
+    assert len(events) == 1, f"一轮只广播一次：{events}"
+    rows = await cycle_mod.list_cycles(5)
+    assert events[0]["cycleId"] == rows[0]["id"]
+    assert events[0]["status"] == rows[0]["status"] == cycle_mod.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_failed_round_also_broadcasts_its_terminal_status(db, monkeypatch):
+    """异常轮同样广播：客户端据此知道「这一轮结束了、数据可能变了」。"""
+    _crawl_env(monkeypatch)
+    await _seed_games(db, APPIDS)
+    events = _capture_cycle_events(monkeypatch)
+
+    async def _boom(specs, **kw):
+        raise RuntimeError("链炸了")
+
+    monkeypatch.setattr(crawl_service, "run_sequential", _boom)
+
+    await sched_mod._run_price_cycle([{"scope": "pool"}])
+
+    assert [p["status"] for p in events] == [cycle_mod.FAILED]
+
+
+@pytest.mark.asyncio
+async def test_rejected_and_repeated_settle_do_not_broadcast(db, monkeypatch):
+    """非法跃迁 / 终态再推：没有新结果的推进不广播（前端不白刷一遍）。"""
+    events = _capture_cycle_events(monkeypatch)
+    cid = await cycle_mod.create("scheduled", "pool")
+
+    assert not await sched_mod._settle_cycle(cid, cycle_mod.COMPLETED)
+    assert await sched_mod._settle_cycle(cid, cycle_mod.FAILED)
+    assert not await sched_mod._settle_cycle(cid, cycle_mod.FAILED)
+    assert not await sched_mod._settle_cycle(cid, cycle_mod.CANCELLED)
+
+    assert [p["status"] for p in events] == [cycle_mod.FAILED]
+
+
+@pytest.mark.asyncio
+async def test_settle_without_cycle_broadcasts_nothing(db, monkeypatch):
+    """本轮没挂 Cycle（记账失败）：没有可广播的归属。"""
+    events = _capture_cycle_events(monkeypatch)
+
+    assert not await sched_mod._settle_cycle(None, cycle_mod.FAILED)
+
+    assert events == []
+
+# ── 通知层不在本文件范围（有独立测试）：不打真库、不发真邮件 ──
+import app.domains.notifications.service as _notification_service
+
+
+@pytest.fixture(autouse=True)
+def _no_notifications(monkeypatch):
+    async def _noop(cycle_id):
+        return {"created": 0, "sent": 0, "deferred": 0, "failed": 0}
+
+    monkeypatch.setattr(_notification_service, "dispatch", _noop)

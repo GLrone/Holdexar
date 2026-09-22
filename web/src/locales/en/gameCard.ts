@@ -58,6 +58,21 @@ const gameCard: Partial<Record<MessageKey, string>> = {
   'gameCard.price.save': 'Save ¥{amount}',
   'gameCard.price.noDiff': 'Same price',
 
+  /* Price data status (observation time / freshness / this round's coverage).
+     Locked, failed and no-result-this-round must not share wording: locked is
+     not a failure, and no result is not "price unavailable". */
+  'gameCard.priceData.label': 'Price data',
+  'gameCard.priceData.justNow': 'updated just now',
+  'gameCard.priceData.minutesAgo': '{n} min ago',
+  'gameCard.priceData.hoursAgo': '{n} h ago',
+  'gameCard.priceData.daysAgo': '{n} d ago',
+  'gameCard.priceData.none': 'no price data yet',
+  'gameCard.priceData.coverageFull': 'coverage {ok}/{expected}',
+  'gameCard.priceData.coveragePartial': 'coverage {ok}/{expected}, incomplete',
+  'gameCard.priceData.tip.locked': '{n} region(s) locked',
+  'gameCard.priceData.tip.failed': '{n} region(s) failed',
+  'gameCard.priceData.tip.unobserved': '{n} region(s) with no result this round',
+
   /* Card action row */
   'gameCard.regionPrice.title': 'All regions',
   'gameCard.trend.tip': 'Price history',

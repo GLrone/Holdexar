@@ -9,7 +9,8 @@
   冬令时）+ 6h 步进网格（1/7/13/19 或 2/8/14/20）；每轮触发时用
   外部时间重算下一格（DST 切换日网格自动换轨重算）。启动时本地
   zoneinfo 初锚 + 异步外部时间纠偏探针；interval 6h 兜底（与网格
-  间距同宽——重锚链断裂也不脱轨）。三层串行 欠账补抓 → 关注层 → 孤儿回补
+  间距同宽——重锚链断裂也不脱轨）。三层串行 欠账补抓 → 监控层 → 目录层，
+  每轮由一个 PriceCycle 统管（`_run_price_cycle`）
 """
 from __future__ import annotations
 
@@ -364,7 +365,7 @@ async def _run_price_cycle(specs: list[dict]) -> None:
             )
     except Exception as e:  # noqa: BLE001
         logger.exception("[周期] 本轮价格链异常")
-        await price_cycle.advance(cycle_id, price_cycle.FAILED, error=str(e)[:200])
+        await _settle_cycle(cycle_id, price_cycle.FAILED, error=str(e)[:200])
         await _record_cycle_stats(cycle_id)
         return
 
@@ -385,12 +386,46 @@ async def _run_price_cycle(specs: list[dict]) -> None:
     # 事件检测排在本轮最终有效结果之上（finalizing 内、终态之前）：job 自己产生
     # 事件会让「暂时失败→随后补抓成功」的单元先报不可用再报恢复
     await _detect_cycle_events(cycle_id)
-    await price_cycle.advance(cycle_id, terminal)
+    await _settle_cycle(cycle_id, terminal)
     logger.info(
         "[周期] 价格刷新 Cycle %d → %s（job %d 个，期望 %d 单元）",
         cycle_id, terminal, len(jobs), expected_units,
     )
+    # 通知是 Cycle 收敛后的下游副作用：失败只影响候选状态，不影响终态与统计
+    await _notify_cycle_events(cycle_id)
     await _record_cycle_stats(cycle_id)
+
+
+async def _notify_cycle_events(cycle_id: int | None) -> None:
+    """Cycle 收敛后把本轮事件交给通知层（策略 → 候选 → 聚合摘要 → 邮件）。
+
+    失败只记日志：通知挂了不能让 Cycle 变 failed，更不能让用户少一轮价格。
+    """
+    if cycle_id is None:
+        return
+    try:
+        from app.domains.notifications import service as notification_service
+
+        await notification_service.dispatch(cycle_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("[周期] Cycle %d 通知投递失败（不影响本轮结果）", cycle_id)
+
+
+async def _settle_cycle(
+    cycle_id: int | None, terminal: str, error: str | None = None
+) -> bool:
+    """把 Cycle 收敛到终态，并广播 `price_cycle.completed`；返回是否真的收敛。
+
+    先落库终态再发事件：客户端收到事件后立刻重拉，读到的就是新数据。只广播
+    跃迁成功的那一次——非法/重复跃迁没有产生新结果，不该让前端白刷一遍列表。
+    """
+    from app.core.events import bus
+    from app.domains.crawl import cycle as price_cycle
+
+    if not await price_cycle.advance(cycle_id, terminal, error=error):
+        return False
+    bus.publish("price_cycle.completed", cycleId=cycle_id, status=terminal)
+    return True
 
 
 async def _detect_cycle_events(cycle_id: int | None) -> None:

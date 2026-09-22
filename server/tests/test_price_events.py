@@ -450,3 +450,25 @@ async def test_list_events_filters(db):
     assert len(await events_mod.list_events(event_type=events_mod.PRICE_DROP)) == 2
     assert await events_mod.list_events(event_type=events_mod.REMOVED) == []
     assert await events_mod.list_events(cycle_id=99999) == []
+
+
+@pytest.mark.asyncio
+async def test_list_orders_by_occurrence_not_insertion(db):
+    """展示序按事实发生时刻：写库序（id）与发生时刻可以不同。
+
+    cn 先写库但发生得更晚，ru 后写库但发生得更早——按 id 排会得到 RU 在前，
+    按 occurred_at 排必须 CN 在前。
+    """
+    cid = await _cycle(db, [APP], regions=("cn", "ru"))
+    await _hist(db, APP, "cn", price=19900, hours_ago=BEFORE)
+    await _hist(db, APP, "cn", price=5000, hours_ago=BEFORE + 1)
+    await _hist(db, APP, "cn", price=9900, original=19900, hours_ago=0.2)
+    await _cur(db, APP, "cn", price=9900, hours_ago=0.2)
+    await _hist(db, APP, "ru", price=19900, hours_ago=BEFORE)
+    await _hist(db, APP, "ru", price=5000, hours_ago=BEFORE + 1)
+    await _hist(db, APP, "ru", price=9900, original=19900, hours_ago=0.5)
+    await _cur(db, APP, "ru", price=9900, hours_ago=0.5)
+    await events_mod.detect(cid)
+
+    rows = await events_mod.list_events(cycle_id=cid)
+    assert [row["region"] for row in rows] == ["CN", "RU"]

@@ -12,21 +12,24 @@ const library: Partial<Record<MessageKey, string>> = {
   'library.error.network': 'Cannot reach the server',
 
   'library.empty.library.title': 'The store is still empty',
-  /* Proxy diagnosis (resolve returned null = direct): the usual reason auto-fetching is idle */
-  'library.empty.library.noProxy':
-    'No proxy is configured — automatic crawls will not start without one, so no price data comes in.',
+  /* Network hint: shown only when games were added but no data arrives.
+     A proxy is an improvement, not a prerequisite (direct connection is the
+     standard) — keep the wording hedged ("may", "usually"), no hard causality. */
+  'library.empty.library.netHint':
+    'No data for a long time? The current network may be struggling to reach Steam — setting up a proxy usually helps.',
   'library.empty.library.goProxy': 'Set up a proxy',
   /* Empty watch pool: one-tap jump to manual import */
   'library.empty.library.goImport': 'Add games',
   'library.empty.library.pool':
-    'The watch pool holds {n} games, but no price data has been crawled yet.',
-  'library.empty.library.crawling': 'A crawl is running — results will show up here once it finishes.',
+    'The watch pool holds {n} games, but no price data yet.',
+  'library.empty.library.crawling':
+    'Prices are updating — cards will show up here once it finishes.',
   'library.empty.library.startHint':
-    'Start a crawl from the Tasks page, or wait for the scheduled job to run.',
+    'Prices refresh on a fixed schedule; you can also trigger one update from the Tasks page.',
   'library.empty.library.noPool1':
-    'The watch pool has no games yet. Add AppIDs under Tasks → Bulk import,',
+    'Start by adding the games you want to compare:',
   'library.empty.library.noPool2':
-    'or bind a Steam account on the Watch pool page and sync — the crawler picks those up automatically.',
+    'Paste game links on the Tasks page; with a bound Steam account, your wishlist and owned games join automatically.',
   'library.empty.library.checking': 'Checking the watch pool…',
 
   'library.empty.filter.title': 'No matches',

@@ -109,3 +109,14 @@ async def test_bundle_refresh_respects_auto_price_switch(monkeypatch, _idle):
     await sched_mod._job_price_refresh()
 
     assert events == []
+
+# ── 通知层不在本文件范围（有独立测试）：不打真库、不发真邮件 ──
+import app.domains.notifications.service as _notification_service
+
+
+@pytest.fixture(autouse=True)
+def _no_notifications(monkeypatch):
+    async def _noop(cycle_id):
+        return {"created": 0, "sent": 0, "deferred": 0, "failed": 0}
+
+    monkeypatch.setattr(_notification_service, "dispatch", _noop)

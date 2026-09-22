@@ -13,27 +13,21 @@
    （表里存的是常量引用，不是译文，故不冻结）——品牌名改名时只动 appInfo。
 
    ⚠️ ProductTour 的 `target` 选择器里那四个 `data-section` 值是**契约**、
-   不是文案：`proxies.section.clash` / `settings.section.steamAccount` /
-   `crawl.section.bulkImport` / `alerts.section.rules`。它们既不出现在本文件，
-   也不该建词条——DOM 锚点与语言无关，建了反而多一个会漂移的来源。
-   四个视图侧写的是同一串字符串（见 .tmp-i18n-brief5.md 第一节）。
+   不是文案：`crawl.section.bulkImport` / `alerts.section.rules` /
+   `proxies.section.clash` / `settings.section.steamAccount`。它们既不出现在
+   本文件，也不该建词条——DOM 锚点与语言无关，建了反而多一个会漂移的来源。
+   四个视图侧写的是同一串字符串。
 
-   引导里点名的界面标签（英文侧逐字对齐的出处）：
-   · 游戏商店 → nav.library · 代理管理 → nav.proxies · 我 → nav.me
-     · 任务 → nav.crawl · 价格提醒 → nav.alerts · 监控池 → nav.pool
-     · 汇率 → nav.rates · 工具箱 → nav.toolbox
-   · 保存订阅 → proxies.sub.save · 自动安装内核 → proxies.kernel.autoDownload
-     · 启动 → proxies.clash.start · 检测节点（Steam 连通） → proxies.clash.testNodes
-     · 代理节点列表 → proxies.section.nodes
-     · 添加 Clash 订阅链接 → proxies.sub.clashPlaceholder（引导引其前缀）
-   · 登录并自动获取 → settings.steam.autoFetch
-     · 如何获取 Cookie → settings.steam.guideSummary（引导引其前缀）
-     · 新手教程 → settings.section.tour
-   · 导入监控 → crawl.bulk.import
-   · 搜索 → alerts.rules.search · 添加 → alerts.rules.add
-     · 价格 ≤ 目标 / 折扣 ≥ 目标 / 跌破历史最低 → alerts.rules.optionPrice
-       / optionPct / optionHistoricLow
-     · 邮件通知设置 → alerts.section.smtp · 触发历史 → alerts.section.history
+   文案口径（写给没接触过比价工具的人）：
+   · 只教主线（加游戏 → 看价格 → 设提醒），界面清单、进阶玩法（汇率 /
+     工具箱 / 邮件通知等）一律不进导览，留给用户自行探索；
+   · 直连是抓取的标准形态——代理只以「网络不畅时的改善手段」出现
+     （价格迟迟取不到 / 登录窗打不开），不写成任何功能的前置条件；
+   · 引导里点名的界面标签逐字取自各页词典：游戏商店 → nav.library ·
+     代理管理 → nav.proxies · 我 → nav.me · 导入监控 → crawl.bulk.import ·
+     价格 ≤ 目标 / 折扣 ≥ 目标 / 跌破历史最低 → alerts.rules.optionPrice
+     / optionPct / optionHistoricLow · 登录并自动获取 → settings.steam.autoFetch ·
+     新手教程 → settings.section.tour。
    引导底部的「上一步 / 下一步 / 完成」复用 common.prev / common.next
    / common.finish（与 HlStepper 同词条，非本模块自有文案）。
    ════════════════════════════════════════════════════════════════════ */
@@ -42,113 +36,72 @@ const productTour = {
   /* ── 开场卡（无聚光靶点）── */
   'productTour.intro.title': '欢迎来到 {app}',
   'productTour.intro.p1':
-    '这是一款 Steam 多区比价工具：把游戏的价格放到全球 40 多个区一起比，哪里便宜、降没降价，一目了然。',
+    '这是一款 Steam 多区比价工具：同一款游戏在全球 40 多个区的价格放在一起看，哪里便宜一目了然。',
   'productTour.intro.p2':
-    '先带你看看它长什么样，再教你把数据喂进来——全程跟着「下一步」走就行，随时可以跳过。',
+    '接下来用一分钟走一遍主线——添加游戏、看价格、设提醒，三步就能用起来。',
   'productTour.intro.p3':
-    '中途想离开，点「跳过导览」随时可以——到「关于」页点 {app} logo 能重新打开本导览。',
+    '中途随时可以点「跳过导览」；以后想重看，到「关于」页点 {app} logo 就行。',
 
-  /* ── 第 1 步 · 侧栏「游戏商店」── */
-  'productTour.stepStore.title': '第 1 步 · 先认识「游戏商店」',
-  'productTour.stepStore.p1':
-    '左边高亮的就是「游戏商店」（商店图标）——所有比价结果都陈列在这页：每张卡片是一款游戏，显示各区现价、折扣和历史最低。',
-  'productTour.stepStore.emph':
-    '现在进去看到的是空的也没关系：它是「展示橱窗」，你（或自动任务）抓回来的游戏才会出现在这里。',
-  'productTour.stepStore.hint':
-    '先学会看，再学喂数据——接下来两步就带你把数据弄进来。',
-
-  /* ── 第 2 步 · 商店页数据说明 ── */
-  'productTour.stepData.title': '第 2 步 · 商店为什么没数据、怎么来数据',
+  /* ── 第 1 步 · 商店页（比价结果看什么）── */
+  'productTour.stepData.title': '第 1 步 · 比价结果都在这里',
   'productTour.stepData.p1':
-    '如果你刚装好 {app}，这页是空的属于正常现象：价格数据不是天上掉下来的，要靠「爬取」从 Steam 各区商店一点点抓回来。',
+    '这是「游戏商店」：每张卡片是一款游戏，能看到它在全球各区的现价、折扣和历史最低价。',
   'productTour.stepData.p2':
-    '来数据的路有三条，每条都不用你动手写任何东西：',
+    '刚装好时这里是空的，很正常——价格要由系统自动去 Steam 取回来，先告诉它你关心哪些游戏，数据就会进来。',
   'productTour.stepData.emph':
-    '① 绑定 Steam 账号 → 愿望单和已购游戏自动进监控；② 在「任务」页粘贴游戏链接手动导入；③ 热销榜每小时自动补一批热门游戏。三条路抓回的都会出现在这里。',
-  'productTour.stepData.p3':
-    '价格每 6 小时自动刷新一轮，你不需要盯着——配好后面几步，剩下的交给它。',
+    '不用先配置任何东西，下一步就教你把游戏加进来。',
   'productTour.stepData.hint':
-    '空页上也会给出对应的引导按钮（比如「去配置代理」），跟着点就行。',
+    '加完游戏回到这里，卡片会自动出现。',
 
-  /* ── 第 3 步 · 侧栏「代理管理」── */
-  'productTour.stepProxy.title': '第 3 步 · 配置代理（自动抓取的前提）',
-  'productTour.stepProxy.emph':
-    '不配代理：手动导入照样能用，但登录窗可能加载不出、自动抓价会被直接拦下——空数据多半是它。',
-  'productTour.stepProxy.p1':
-    '国内直连 Steam 商店域名多数受限，所以想让数据自动来，代理是第一块积木。',
-  'productTour.stepProxy.p2':
-    '左边高亮的就是「代理管理」（显示器图标）。点「下一步」自动带你跳过去——没有机场订阅的话先跳过这步也行，回头再配。',
-
-  /* ── 第 4 步 · Clash 接入 ── */
-  'productTour.stepClash.title': '第 4 步 · 导入 Clash 订阅',
-  'productTour.stepClash.p1':
-    '① 把机场订阅链接粘贴到「添加 Clash 订阅链接」输入框（就是平时填在 Clash 客户端里的那条 https:// 链接，仅存本机）；',
-  'productTour.stepClash.p2': '② 点「保存订阅」——提示缺内核时点「自动安装内核」，等它装好即可；',
-  'productTour.stepClash.p3':
-    '③ 点「启动」拉起内置 Clash，系统自动检测哪些节点能真正连通 Steam（能通的才用于抓取）；',
-  'productTour.stepClash.p4':
-    '④ 之后可随时点「检测节点（Steam 连通）」复检，表格「Steam」列打勾的节点就是可用的。',
-  'productTour.stepClash.hint':
-    '没有机场订阅？本页下方「代理节点列表」支持手动添加单个节点或批量导入；暂时不配代理也可以继续浏览，但部分功能会缺数据。',
-
-  /* ── 第 5 步 · 侧栏「我」── */
-  'productTour.stepAccount.title': '第 5 步 · 前往账号绑定',
-  'productTour.stepAccount.p1':
-    '代理就绪后，来绑定 Steam 账号。左边高亮的是「我」（人像图标）——绑定入口在这个页面里。点「下一步」自动跳转。',
-
-  /* ── 第 6 步 · Steam 账户绑定 ── */
-  'productTour.stepBind.title': '第 6 步 · 绑定 Steam 账号',
-  'productTour.stepBind.emph':
-    '这是功能的地基：绑定后自动获取钱包余额（右上角胶囊显示）、愿望单、已购游戏库。',
-  'productTour.stepBind.p1': '① 点高亮卡片里的「登录并自动获取」按钮（带闪电图标）；',
-  'productTour.stepBind.p2':
-    '② 弹出 Steam 官方登录窗口（走刚配好的代理），输入账号密码，再按手机 Steam App 的提示确认（Steam Guard 验证）；',
-  'productTour.stepBind.p3': '③ 验证通过后窗口自动关闭、登录凭据自动回传——全程不用手动复制。',
-  'productTour.stepBind.hint':
-    '浏览器环境（非桌面端）没有自动获取按钮：点开本卡片「如何获取 Cookie」折叠项，里面有手动复制的 4 步引导。',
-
-  /* ── 第 7 步 · 侧栏「任务」── */
-  'productTour.stepTasks.title': '第 7 步 · 前往任务页',
-  'productTour.stepTasks.p1':
-    '左边高亮的是「任务」（循环箭头图标）——手动爬取、导入游戏都在这页（区服管理在「监控池」页）。点「下一步」自动跳转。',
-
-  /* ── 第 8 步 · 批量导入 ── */
-  'productTour.stepImport.title': '第 8 步 · 添加要监控的游戏',
-  'productTour.stepImport.p1': '最简单的入门方式——把想比价的游戏直接粘贴进来：',
+  /* ── 第 2 步 · 导入游戏（主线动作）── */
+  'productTour.stepImport.title': '第 2 步 · 把想比价的游戏加进来',
+  'productTour.stepImport.p1':
+    '在 Steam 商店打开一款游戏，复制浏览器地址栏里的链接。',
   'productTour.stepImport.p2':
-    '① 在 Steam 商店（store.steampowered.com）打开某款游戏，复制浏览器地址栏整条链接；',
-  'productTour.stepImport.p3':
-    '② 粘贴到高亮的批量导入框（一次可粘多条，一行一个，也支持 SteamDB 链接或直接填 AppID 数字）；',
+    '粘贴到这个输入框（一次可粘多条，一行一条），点「导入监控」。',
   'productTour.stepImport.emph':
-    '③ 点「导入监控」——识别出 AppID 后立即首次抓价入库，作为监控数据保存（不进愿望单与监控池）。',
+    '完成。之后价格每 6 小时自动更新一轮，不用你盯着。',
   'productTour.stepImport.hint':
-    '绑定过账号的话，愿望单和已购游戏其实已经自动进监控池（见「监控池」页）；手动导入只作监控数据——想持续盯价的游戏，到游戏卡点星标关注。',
+    '回到「游戏商店」页，等第一轮价格更新完卡片就会出现；想长期盯哪款，在卡片上点一下星标。',
 
-  /* ── 第 9 步 · 侧栏「价格提醒」── */
-  'productTour.stepAlerts.title': '第 9 步 · 前往价格提醒页',
-  'productTour.stepAlerts.p1':
-    '左边高亮的是「价格提醒」（铃铛图标）——设置"降到多少才通知我"。点「下一步」自动跳转。',
-
-  /* ── 第 10 步 · 添加提醒规则 ── */
-  'productTour.stepRules.title': '第 10 步 · 设置降价提醒',
+  /* ── 第 3 步 · 价格提醒（主线动作）── */
+  'productTour.stepRules.title': '第 3 步 · 降价了让它提醒你',
   'productTour.stepRules.p1':
-    '① 在高亮的搜索框输入游戏名（中英文都行），点「搜索」，在结果里点选目标游戏；',
+    '搜索并选中一款游戏，然后挑一个条件，比如「价格 ≤ 目标」——填一个你愿意出手的价；也可以选「折扣 ≥ 目标」或「跌破历史最低」。',
   'productTour.stepRules.p2':
-    '② 选区服（默认你的结算区）和条件：「价格 ≤ 目标」填一个你愿意出手的价（如 39.9）；「折扣 ≥ 目标」填折扣（如 75 表示 75 折）；「跌破历史最低」不用填数字；',
+    '点「添加」就完成了。之后每轮价格更新都会自动核对，一旦达标就会通知你。',
   'productTour.stepRules.emph':
-    '③ 点「添加」完成。价格每轮更新都会核对规则，达标自动触发通知。',
-  'productTour.stepRules.p3':
-    '通知方式：默认应用内通知；同页底部「邮件通知设置」配好 SMTP 后可收邮件。',
-  'productTour.stepRules.hint': '触发过的记录在同页「触发历史」分节随时可查。',
+    '提醒默认发在应用内，不用额外配置。',
+
+  /* ── 可选分支 · 代理（网络不畅时的改善手段）── */
+  'productTour.stepProxy.title': '可选 · 网络不畅时再配代理',
+  'productTour.stepProxy.emph':
+    '这一步可以整个跳过——系统默认直连就能取到价格，前面三步不依赖它。',
+  'productTour.stepProxy.p1':
+    '只有当价格迟迟取不到、或登录窗口打不开时，才值得到「代理管理」页配置代理。',
+  'productTour.stepProxy.p2':
+    '它支持粘贴订阅链接，按页面提示操作即可；具体细节等真正需要时再看这页的说明也不迟。',
+
+  /* ── 可选分支 · Steam 账号绑定（自动化增强）── */
+  'productTour.stepBind.title': '可选 · 绑定 Steam 账号',
+  'productTour.stepBind.emph':
+    '不绑定也完全不影响前面的功能——这只影响自动化程度。',
+  'productTour.stepBind.p1':
+    '绑定后，你的愿望单和已购游戏会自动进来持续跟踪比价，还能看到钱包余额。',
+  'productTour.stepBind.p2':
+    '点「登录并自动获取」按提示登录即可；如果登录窗口一直打不开，先去上一步配置代理。',
+  'productTour.stepBind.hint':
+    '找不到自动获取按钮时，这张卡片里有手动引导。',
 
   /* ── 收尾卡（无聚光靶点）── */
-  'productTour.done.title': '完成！你已经知道怎么用它了',
+  'productTour.done.title': '完成！主线就这三步',
   'productTour.done.emph':
-    '回顾这条链路：配代理 → 绑定账号 → 导入游戏 → 设提醒——配好之后全自动。',
-  'productTour.done.p1': '价格每 6 小时自动刷新、达标即通知、汇率自动同步，什么都不用盯。',
+    '添加游戏 → 看价格 → 设提醒——接下来系统自动运行。',
+  'productTour.done.p1': '价格每 6 小时自动更新、到价自动通知，什么都不用盯。',
   'productTour.done.p2':
-    '其他页面按需探索：「游戏商店」看全量资产和各区比价、「汇率」看多币种走势、「工具箱」有 CDK 批量激活等实用工具。',
-  'productTour.done.p3': '需要重看：到「关于」页点 {app} logo，或到「我」页「新手教程」分节。',
+    '其他功能（汇率、工具箱、我的家庭组等）不急着了解，用到了再去探索。',
+  'productTour.done.p3':
+    '想重看本导览：到「关于」页点 {app} logo，或到「我」页「新手教程」分节。',
 
   /* ── 浮层自身的控件 ── */
   'productTour.action.skip': '跳过导览',

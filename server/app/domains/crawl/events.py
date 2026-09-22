@@ -1,12 +1,12 @@
 """价格事实事件（Price Event）：本轮观察相对此前有效观察发生了什么变化。
 
-Observation = 本轮实际观察到了什么（`game_price_history` / `game_current_prices`）。
+Observation = 本轮实际观察到了什么（`game_price_history` / `game_current_prices`）；
 Event = 这次观察相对此前有效状态发生的变化（`price_events` 一行）。两者不混用：
-「RU = 99 RUB」是观察；「上一有效价 199 → 本次 99」才是事件。
+「RU = 99 RUB」是观察，「上一有效价 199 → 本次 99」才是事件。
 
 事件在 Cycle finalizing 阶段统一检测，建立在本轮**最终有效结果**之上，不由各个
 CrawlJob 自己产生——否则「本轮暂时失败、随后补抓成功」的单元会先报
-PRICE_UNAVAILABLE 再报 PRICE_RESTORED，产生无意义噪音。
+PRICE_UNAVAILABLE 再报 PRICE_RESTORED。各类型的判据见对应检测段的注释。
 
 三条判定前提：
 
@@ -20,34 +20,16 @@ PRICE_UNAVAILABLE 再报 PRICE_RESTORED，产生无意义噪音。
    状态事件」+「窗口前存在有效快照 ⇒ 当时为 ok」作为上一状态；两者都拿不到
    （首次观察的新单元）时不产生状态事件。
 
-本轮结果窗口与 Coverage 同口径：`[cycle.started_at, cycle.finished_at]`
-（未收敛取当前时刻）。窗口内并行的 5min repair / 手动抓取无法与本轮区分，
-这是 P3/P4 已记录的口径限制；来源不明的结果不额外制造事件。
-
-事件类型与判定（`→` 左为上一有效状态，右为本轮观察）：
-
-| 事件 | 粒度 | 判定 |
-|---|---|---|
-| `PRICE_DROP` | appid × region | 本轮有观察，窗口前最近有效快照价 > 本轮价（两者都 > 0） |
-| `PRICE_INCREASE` | appid × region | 同上，方向相反 |
-| `NEW_HISTORICAL_LOW` | appid × CN | 本轮写下新快照，价 < 窗口前所有有效快照的最低值 |
-| `HISTORICAL_LOW_MATCH` | appid × CN | 本轮写下新快照，价 == 窗口前最低值（从更高价回落） |
-| `PERMANENT_PRICE_CHANGE` | appid × CN | 本轮新快照的原价 ≠ 窗口前最近快照的原价 |
-| `REGION_LOCKED` | appid × region | `ok → locked` |
-| `REGION_UNLOCKED` | appid × region | `locked → ok` |
-| `PRICE_UNAVAILABLE` | appid × region | `ok / locked → missing / blocked` |
-| `PRICE_RESTORED` | appid × region | `missing / blocked → ok` |
-| `FREE_PROMO` | appid | 本轮写下促销快照（0 价 + 有原价），且窗口前最近快照不是促销 |
-| `REMOVED` | appid | `games.removed_at` 落在本轮窗口内（`NULL → 非空` 的那一刻） |
-
 价格比较用**该区货币的 `price`**，不用 `cny_fen`——后者会把汇率波动误判成价格
 变化；0 价（促销/永久免费）不参与涨跌判定，它属于 FREE_PROMO 的语义。
 
 `region_code` 为 NULL 表示该事件由游戏级对象表达（`free_kind` / `removed_at`
-存在 `games` 上），不属于单一区域；不拿 NULL 表示「没判断」。
+存在 `games` 上），不属于单一区域；不拿 NULL 表示「没判断」。历史低价与永降按
+CN 标准版判定（与 `hl_flag` / `pp_flag` 的计算对象一致），其 `region_code` 为 CN。
 
-历史低价与永降按 CN 标准版判定（与 `hl_flag` / `pp_flag` 的计算对象一致），
-故其 `region_code` 为 `CN`——证据发生在 CN。
+本轮结果窗口与 Coverage 同口径：`[cycle.started_at, cycle.finished_at]`
+（未收敛取当前时刻）。窗口内并行的 5min repair / 手动抓取区分不出来源，
+来源不明的结果不额外制造事件。
 """
 from __future__ import annotations
 
@@ -475,8 +457,16 @@ async def list_events(
     *, cycle_id: int | None = None, appid: int | None = None,
     event_type: str | None = None, limit: int = 50,
 ) -> list[dict]:
-    """最近的价格事件（新→旧）。事实记录：只读，没有确认/删除/状态。"""
-    stmt = select(PriceEvent).order_by(PriceEvent.id.desc()).limit(limit)
+    """最近的价格事件（新→旧）。事实记录：只读，没有确认/删除/状态。
+
+    排序按 `occurred_at`（事实发生时刻）而非 `id`：同一轮内事件按对象/地区顺序
+    写入，`id` 序与发生时刻不同序；`id` 只作同时刻的次序兜底。
+    """
+    stmt = (
+        select(PriceEvent)
+        .order_by(PriceEvent.occurred_at.desc(), PriceEvent.id.desc())
+        .limit(limit)
+    )
     if cycle_id is not None:
         stmt = stmt.where(PriceEvent.cycle_id == cycle_id)
     if appid is not None:

@@ -5,22 +5,20 @@
 import { computed, onMounted, ref } from 'vue'
 
 import { systemApi } from '@/api/client'
-import { APP_NAME, APP_SUBTITLE_KEY } from '@/appInfo'
+import { APP_NAME } from '@/appInfo'
 import { useI18n, type MessageKey } from '@/locales'
 import { useThemeStore } from '@/stores/theme'
+import { useTourStore } from '@/stores/tour'
 import { HlIcon } from '@/components/ui'
 import BorderGlow from '@/components/ui/BorderGlow.vue'
-import ProductTour from '@/components/ProductTour.vue'
 
 const { t } = useI18n()
 
 const themeStore = useThemeStore()
+const tour = useTourStore()
 const logo = computed(() =>
   themeStore.isDark ? '/assets/logo_dark.ico' : '/assets/logo_light.ico',
 )
-
-/* 新手引导重看入口：hero logo 点击打开（侧边栏 logo 同为引导入口） */
-const tourOpen = ref(false)
 
 interface SystemInfo {
   app: string
@@ -94,7 +92,7 @@ const CREDITS: { name: string; url: string; noteKey: MessageKey }[] = [
           type="button"
           class="about-hero__logo-btn"
           :title="t('about.logo.tourTitle')"
-          @click="tourOpen = true"
+          @click="tour.show()"
         >
           <img class="about-hero__logo" :src="logo" alt="" />
         </button>
@@ -113,7 +111,6 @@ const CREDITS: { name: string; url: string; noteKey: MessageKey }[] = [
               <HlIcon name="github" :size="20" />
             </a>
           </div>
-          <div class="about-hero__sub">{{ t(APP_SUBTITLE_KEY) }}</div>
           <p class="about-hero__desc">{{ t('about.hero.desc') }}</p>
         </div>
       </div>
@@ -208,8 +205,8 @@ const CREDITS: { name: string; url: string; noteKey: MessageKey }[] = [
       </div>
     </BorderGlow>
 
-    <!-- 产品导览浮层：hero logo 点击打开（与「我」页重看入口、首次启动自动弹同组件） -->
-    <ProductTour v-model="tourOpen" />
+    <!-- 产品导览浮层不在此页实例化：全局唯一实例挂 App.vue，跨路由存活；
+         hero logo 点击经 tour store 打开（见 script 顶部） -->
   </section>
 </template>
 
@@ -258,7 +255,6 @@ const CREDITS: { name: string; url: string; noteKey: MessageKey }[] = [
   transition: color calc(var(--duration-2, 0.18s) * var(--motion-scale, 1));
 }
 .about-hero__gh:hover { color: var(--accent); }
-.about-hero__sub { font-size: 13px; color: var(--text-muted); margin-top: 3px; }
 .about-hero__desc { font-size: 13px; color: var(--text-secondary); line-height: 1.9; margin: 12px 0 0; max-width: 720px; }
 .about-hero__desc b, .about-hero__desc strong { color: var(--text-primary); }
 
