@@ -501,7 +501,8 @@ async def test_cycle_while_busy_only_runs_l0(
 # ── 11/12. 空闲：消费 pending 真重建，之后才 L1/L2 并恢复 GLOBAL ──
 @pytest.mark.asyncio
 async def test_cycle_when_idle_rebuilds_then_maintains(
-    tmp_data_dir, kernel_exe_path, proxy_runtime, redirect_proxies, probe_echo
+    tmp_data_dir, kernel_exe_path, proxy_runtime, redirect_proxies, probe_echo,
+    monkeypatch
 ) -> None:
     await init_db()
     await _add("1|A", port=redirect_proxies(probe_echo))
@@ -510,6 +511,15 @@ async def test_cycle_when_idle_rebuilds_then_maintains(
     base, secret = await _boot(proxy_runtime, kernel_exe_path, tmp_data_dir)
     assert await _select(base, secret, "1|B") == "1|B"
     old_port = proxy_runtime.port
+
+    # 本用例断言的是「pending 被消费后保持空」这一条：L1 固定为空结果，
+    # 出口身份不变，因此不会因身份变化再次置位（那条由下面专门的用例覆盖）。
+    import app.domains.proxypool.scheduling as sched_mod
+
+    async def _no_l1(*a, **kw):
+        return ()
+
+    monkeypatch.setattr(sched_mod, "exit_ip_check_pool", _no_l1)
 
     async with get_session_factory()() as s:
         first = await _cycle(

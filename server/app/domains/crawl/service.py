@@ -627,26 +627,35 @@ async def start_job(
     # （重建会换端口并打断在途请求，所以 run 内不换）。拿不到就拒绝启动——
     # 绝不静默退回直连或旧订阅代理（那会把"池坏了"伪装成"爬取成功"）。
     #
-    # 容量单位是**独立出口 IP**：lane 数由 Runtime 按出口槽定好，这里把 worker 数
-    # 收敛到 `min(期望值, lane 数, MAX_CRAWL_WORKERS)`——一个出口一个 worker 是默认
-    # 形态，超出上限的出口不占工位（保持可用，等下一轮或替换故障出口）。
+    # 容量单位是**独立出口 IP**：入口集合由 `lane_run_plan` 用**当前出口身份快照**
+    # 就地收敛（`active_lanes ≤ 唯一出口数`），而不是照搬内核里的 listener 数——
+    # listener 数是上一次重建定下的，L1 之后出口身份还会变，两者之间有重建窗口。
+    # 收敛结果即本次 run 的**快照**：run 内不再变，后台维护改出口集只影响下一次 run。
     from app.core.config import get_settings as _get_settings
-    from app.domains.proxypool.exits import MAX_CRAWL_WORKERS
+    from app.domains.proxypool.exits import MAX_CRAWL_WORKERS, exit_snapshot
     from app.domains.proxypool.runtime import lane_run_plan
 
     worker_count = await _resolve_worker_count()
     small_lane = kind in ("missing", "repair", "backfill")
-    run_plan = lane_run_plan(_get_settings().data_dir)
-    proxy_urls = run_plan["urls"]
     planned_workers = (
         min(worker_count, MISSING_RECOVERY_WORKERS) if small_lane else worker_count
     )
+    data_dir = _get_settings().data_dir
+    async with get_session_factory()() as session:
+        snapshot = await exit_snapshot(session)
+    run_plan = lane_run_plan(
+        data_dir,
+        exit_by_node=snapshot,
+        max_lanes=min(planned_workers, MAX_CRAWL_WORKERS),
+    )
+    proxy_urls = run_plan["urls"]
     effective_workers = max(1, min(planned_workers, len(proxy_urls), MAX_CRAWL_WORKERS))
-    if effective_workers != planned_workers:
-        logger.info(
-            "[容量] worker 收敛：期望 %d → %d（出口槽 %d，上限 %d）",
-            planned_workers, effective_workers, len(proxy_urls), MAX_CRAWL_WORKERS,
-        )
+    logger.info(
+        "[容量] 出口槽：已知出口 %d | run 内 active lane %d（内核 listener %d）| "
+        "worker %d（期望 %d，上限 %d）",
+        len(snapshot), len(proxy_urls), run_plan.get("runtime_lanes", len(proxy_urls)),
+        effective_workers, planned_workers, MAX_CRAWL_WORKERS,
+    )
     config = CrawlRunConfig(
         regions=effective,
         workers=effective_workers,

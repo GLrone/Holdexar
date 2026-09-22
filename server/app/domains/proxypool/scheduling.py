@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +28,7 @@ from pathlib import Path
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.crawler.occupancy import crawler_busy
+from app.domains.proxypool.exits import exit_snapshot, slot_signature
 from app.domains.proxypool.health import (
     DEFAULT_BUSINESS_APPID,
     BusinessOutcome,
@@ -52,7 +54,62 @@ logger = logging.getLogger(__name__)
 # 单块最坏情况（全部超时）≈ 10 × DEFAULT_TIMEOUT_MS，仍在 60s busy_timeout 之内。
 L0_COMMIT_EVERY = 10
 
+# 首轮出口身份发现的上限：启动链里跑的是一次**有界** L1——整池串行探完才开门是
+# 不可接受的（本地软件的开箱体验优先），但"一个出口都没探到"会让首轮爬取退化到
+# 按节点计容量。上限取与生产 worker 上限同量级，够把容量模型建出来即可。
+STARTUP_L1_MAX_NODES = 60
+STARTUP_L1_BUDGET_SECONDS = 240.0
+
 _pending = False
+
+
+async def run_startup_l1(
+    session: AsyncSession, *,
+    data_dir: Path,
+    controller_url: str,
+    secret: str,
+    now: datetime,
+    target_url: str | None = None,
+    max_nodes: int = STARTUP_L1_MAX_NODES,
+    budget_seconds: float = STARTUP_L1_BUDGET_SECONDS,
+) -> tuple:
+    """首轮出口身份发现（有界）：只探**还没有出口 IP** 的池内节点。
+
+    目的只有一个：让 bootstrap 之后、第一次真实价格刷新之前，`ProxyNode.exit_ip`
+    已经有值，容量模型（一个出口一个工位）从首轮起就成立。它不是新的健康机制——
+    用的是同一条 L1 探针，只是限了节点数与时间预算，并按块提交把写锁窗口压在秒级。
+
+    已经有出口 IP 的节点**不重探**：它们的身份由 5 分钟一拍的维护周期负责刷新，
+    启动链不该重复付这份时间。
+    """
+    known = await _names_with_exit(session)
+    names = tuple(n for n in pool_file_names(data_dir) if n not in known)[
+        : max(0, int(max_nodes))
+    ]
+    if not names:
+        return ()
+    extra = {"url": target_url} if target_url else {}
+    outcomes: list = []
+    deadline = time.monotonic() + max(0.0, float(budget_seconds))
+    for start in range(0, len(names), L0_COMMIT_EVERY):
+        if time.monotonic() >= deadline:
+            logger.info(
+                "[首轮L1] 时间预算用尽（已探 %d/%d 个节点），其余交给维护周期",
+                len(outcomes), len(names),
+            )
+            break
+        chunk = names[start:start + L0_COMMIT_EVERY]
+        outcomes.extend(await exit_ip_check_pool(
+            session, data_dir=data_dir, controller_url=controller_url, secret=secret,
+            now=now, names=chunk, **extra,
+        ))
+        await session.commit()
+    return tuple(outcomes)
+
+
+async def _names_with_exit(session: AsyncSession) -> set[str]:
+    """已经有出口 IP 的合格节点名（启动链据此跳过重复探测）。"""
+    return set(await exit_snapshot(session))
 
 
 def request_rebuild() -> None:
@@ -147,6 +204,10 @@ async def run_maintenance_cycle(
         return None
 
     previous = await current_global_selection(controller_url, secret)
+    # L1 会刷新出口身份，而 listener 数在重建时就定死了：身份变了（同一出口被两条
+    # lane 绑、或某节点换了落地）就必须再收敛一次 listener 数，否则台账一直比当前
+    # 出口集多。运行期的不变量由 `select_run_lanes` 就地保证，这里负责让内核侧收敛。
+    exits_before = await exit_snapshot(session)
     # 每个探针各自兜异常：探针的程序异常不得逃到调度器——那会跳过调用方的 commit，
     # 把本轮已经写好的 L0/L1 遥测一起回滚。异常只记日志、该层本轮无结果（空 tuple），
     # 不改分类、不伪装成功。
@@ -166,6 +227,14 @@ async def run_maintenance_cycle(
     except Exception:  # noqa: BLE001
         logger.exception("[L2] 业务探针程序异常：本轮 L2 无结果")
         l2 = ()
+
+    exits_after = await exit_snapshot(session)
+    if slot_signature(exits_after) != slot_signature(exits_before):
+        request_rebuild()
+        logger.info(
+            "[L1] 出口身份变化：%d → %d 个已知出口，置 rebuild_pending（空闲时收敛 listener 数）",
+            len(exits_before), len(exits_after),
+        )
 
     chosen = restore_selection(previous, await eligible_runtime_names(session))
     if chosen is not None:

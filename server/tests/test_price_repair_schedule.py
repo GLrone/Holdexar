@@ -131,10 +131,25 @@ def _stub_start_env(monkeypatch, *, captured_specs=None):
 
     # 受管爬取的前置条件是「池 Runtime 可用」（fail closed）：这里给一个确定性的
     # 可用入口，断言的是周期编排本身，不是运行时可用性。
+    import app.domains.proxypool.exits as pp_exits
     import app.domains.proxypool.runtime as pp_runtime
 
     monkeypatch.setattr(pp_runtime, "current_runtime_proxy_url",
                         lambda _d=None: "http://127.0.0.1:1")
+
+    async def _snapshot(*_a, **_kw):
+        return {"n1": "1.1.1.1"}
+
+    monkeypatch.setattr(pp_exits, "exit_snapshot", _snapshot)
+
+    def _one_lane(_data_dir, **_kw):
+        binding = {"lane": 0, "url": "http://127.0.0.1:1",
+                   "exitIp": "1.1.1.1", "node": "n1"}
+        return {"urls": [binding["url"]], "exit_keys": [binding["exitIp"]],
+                "nodes": [binding["node"]], "bindings": [binding],
+                "runtime_lanes": 1, "known_exits": 1}
+
+    monkeypatch.setattr(pp_runtime, "lane_run_plan", _one_lane)
 
     # _execute 收尾钩子（提醒/史低/排序）模块级绑定各自服务的
     # get_session_factory——全部打桩防触生产库
