@@ -509,3 +509,14 @@ async def test_price_auto_enabled_allows_main_cycle(db, monkeypatch):
 
     assert states == [True], "开启态主轮必须照常开爬且 busy 置位"
     assert sched_mod._price_cycle_busy is False
+
+# ── 通知层不在本文件范围（有独立测试）：不打真库、不发真邮件 ──
+import app.domains.notifications.service as _notification_service
+
+
+@pytest.fixture(autouse=True)
+def _no_notifications(monkeypatch):
+    async def _noop(cycle_id):
+        return {"created": 0, "sent": 0, "deferred": 0, "failed": 0}
+
+    monkeypatch.setattr(_notification_service, "dispatch", _noop)

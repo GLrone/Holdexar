@@ -11,7 +11,8 @@
     "lint:gate": "eslint src --quiet",
     "check:routes": "node scripts/check-routes.mjs",
     "check:colors": "node scripts/check-colors.mjs",
-    "check:i18n": "node scripts/check-i18n.mjs"
+    "check:i18n": "node scripts/check-i18n.mjs",
+    "test": "node --test \"tests/*.test.ts\""
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.2",

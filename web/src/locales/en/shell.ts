@@ -3,8 +3,6 @@
 import type { MessageKey } from '../zh-CN'
 
 const shell: Partial<Record<MessageKey, string>> = {
-  'app.subtitle': 'Steam multi-region price terminal',
-
   'nav.gameDetail': 'Game details',
 
   'nav.group.overview': 'Overview',

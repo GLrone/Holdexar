@@ -66,6 +66,8 @@ import updateDialog from './updateDialog'
 import achievements from './achievements'
 // ── Game career (career/ children and interleaved sections of views/achievements/) ──
 import achievementsCareer from './achievementsCareer'
+// ── Price event surfaces (game detail "recent price changes" + dashboard digest) ──
+import priceEvent from './priceEvent'
 
 const messages: Partial<Record<MessageKey, string>> = {
   ...common,
@@ -107,6 +109,7 @@ const messages: Partial<Record<MessageKey, string>> = {
   ...updateDialog,
   ...achievements,
   ...achievementsCareer,
+  ...priceEvent,
 }
 
 export default messages

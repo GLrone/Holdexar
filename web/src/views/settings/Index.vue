@@ -3,8 +3,12 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import { currencyName } from '@/api/currencies'
 import {
+  notificationsApi,
   settingsApi,
   systemApi,
+  type NotificationPrefs,
+  type NotificationPrefsUpdate,
+  type NotificationStats,
   type SettingsPayload,
   type BackupItem,
   type SteamAccountItem,
@@ -13,12 +17,14 @@ import { useI18n, type MessageKey } from '@/locales'
 import { useAccountStore } from '@/stores/account'
 import { useRegionsStore } from '@/stores/regions'
 import { useSettingsStore } from '@/stores/settings'
+import { useTourStore } from '@/stores/tour'
 import { useUpdaterStore } from '@/stores/updater'
 import { friendCodeOf } from '@/utils/steamId'
 import CurrencyFlag from '@/components/CurrencyFlag.vue'
-import ProductTour from '@/components/ProductTour.vue'
 import RegionFlag from '@/components/RegionFlag.vue'
-import { HlButton, HlDialog, HlIcon, HlImg, HlSkeleton, HlSwitch, message } from '@/components/ui'
+import {
+  HlButton, HlDialog, HlIcon, HlImg, HlInput, HlSkeleton, HlSwitch, message,
+} from '@/components/ui'
 
 const { t } = useI18n()
 
@@ -29,8 +35,9 @@ const errorMsg = ref('')
 /* 更新检查结果与侧栏红点共用一份（App.vue 启动时也会查一次） */
 const updaterStore = useUpdaterStore()
 
-/* 产品导览手动重开（首次启动已自动弹过；App.vue 的自动弹与本入口共用组件） */
-const onboardingOpen = ref(false)
+/* 产品导览手动重开（首次启动已自动弹过）：开的是 App.vue 里那个全局实例，
+   本页不自己挂浮层——页面实例会被导览第一步的 router.push 卸载 */
+const tour = useTourStore()
 
 const steamId = ref('')
 const apiKeyInput = ref('')
@@ -480,11 +487,89 @@ function openSteamidIo() {
   window.open('https://steamid.io', '_blank', 'noopener noreferrer')
 }
 
+// ─── 价格事件通知 ─────────────────────────────────────────────
+// 类别是用户面分类（价格变化 / 历史低价 / 可购买状态 / 免费与下架），
+// 内部事件枚举不出现在界面上。通知默认关闭：SMTP 配好也不会自动开。
+
+const notifyPrefs = ref<NotificationPrefs | null>(null)
+const notifyStats = ref<NotificationStats | null>(null)
+const notifyBusy = ref(false)
+const notifyTesting = ref(false)
+
+async function loadNotifications() {
+  try {
+    const [prefs, stats] = await Promise.all([
+      notificationsApi.prefs(),
+      notificationsApi.stats(),
+    ])
+    notifyPrefs.value = prefs
+    notifyStats.value = stats
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+  }
+}
+
+async function patchNotifications(patch: NotificationPrefsUpdate) {
+  notifyBusy.value = true
+  try {
+    await notificationsApi.updatePrefs(patch)
+    await loadNotifications()
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+    // 失败回读：不让开关停在错的那一侧
+    await loadNotifications()
+  } finally {
+    notifyBusy.value = false
+  }
+}
+
+/** 通知是否真的可用——开关开了但出口没配好，界面必须说清楚 */
+const notifyReady = computed(() => !!notifyPrefs.value?.smtp.configured)
+
+const notifyStateKey = computed<MessageKey>(() => {
+  const prefs = notifyPrefs.value
+  if (!prefs) return 'settings.notification.off'
+  if (!prefs.smtp.configured) return 'settings.notification.smtpMissing'
+  if (!prefs.enabled) return 'settings.notification.off'
+  const last = prefs.lastDelivery
+  if (last?.status === 'delivered') return 'settings.notification.lastOk'
+  if (last?.status === 'failed') {
+    return last.retryable
+      ? 'settings.notification.lastRetryable'
+      : 'settings.notification.lastPermanent'
+  }
+  return 'settings.notification.on'
+})
+
+const notifyStateParams = computed<Record<string, string | number>>(() => {
+  const last = notifyPrefs.value?.lastDelivery
+  if (!last) return {}
+  return {
+    time: last.at ? last.at.slice(5, 16).replace('T', ' ') : '—',
+    reason: last.reason ?? '',
+    n: last.attempts ?? 0,
+  }
+})
+
+async function sendTestNotification() {
+  notifyTesting.value = true
+  try {
+    await notificationsApi.test()
+    message.success(t('settings.notification.testSent'))
+  } catch (e) {
+    // 400 = SMTP 配置 / 凭据错误：必须让用户看到，不能显示成功
+    message.error(e instanceof Error ? e.message : String(e))
+  } finally {
+    notifyTesting.value = false
+  }
+}
+
 onMounted(() => {
   /* 更新开关存在 settings store（启动逻辑与侧栏红点共用）：本页也要保证它拉到过
      ——深链直接进本页时 App 外壳虽会 load，但失败重试的兜底放在这里更稳。 */
   void settingsStore.load()
   void load()
+  void loadNotifications()
 })
 </script>
 
@@ -894,12 +979,131 @@ onMounted(() => {
         </div>
       </div>
 
+      <!-- 价格事件通知：总开关 + 用户类别 + 静默窗 + 出口状态 + 测试邮件。
+           类别是用户面分类，内部事件枚举不出现在这里。 -->
+      <div class="card settings-card" data-section="settings.section.notification">
+        <div class="section-title">{{ t('settings.section.notification') }}</div>
+        <div class="section-desc">{{ t('settings.notification.desc') }}</div>
+
+        <div class="settings-row">
+          <div class="settings-row__line">
+            <HlSwitch
+              :model-value="!!notifyPrefs?.enabled"
+              accent
+              :disabled="notifyBusy || !notifyPrefs"
+              :label="t('settings.notification.enabledLabel')"
+              @update:model-value="(on: boolean) => patchNotifications({ enabled: on })"
+            />
+          </div>
+          <div class="section-desc">{{ t('settings.notification.enabledHint') }}</div>
+        </div>
+
+        <div class="settings-row">
+          <div class="section-desc notify-cat-label">
+            {{ t('settings.notification.categoriesLabel') }}
+          </div>
+          <div class="settings-row__line notify-cats">
+            <HlSwitch
+              v-for="cat in notifyPrefs?.categories || []"
+              :key="cat.key"
+              :model-value="cat.enabled"
+              accent
+              :disabled="notifyBusy || !notifyPrefs?.enabled"
+              :label="cat.label"
+              @update:model-value="
+                (on: boolean) => patchNotifications({ categories: { [cat.key]: on } })
+              "
+            />
+          </div>
+          <div class="section-desc">{{ t('settings.notification.categoriesHint') }}</div>
+        </div>
+
+        <div class="settings-row">
+          <div class="settings-row__line">
+            <HlSwitch
+              :model-value="!!notifyPrefs?.quietEnabled"
+              accent
+              :disabled="notifyBusy || !notifyPrefs?.enabled"
+              :label="t('settings.notification.quietLabel')"
+              @update:model-value="(on: boolean) => patchNotifications({ quietEnabled: on })"
+            />
+          </div>
+          <div v-if="notifyPrefs?.quietEnabled" class="settings-row__line notify-times">
+            <HlInput
+              :model-value="notifyPrefs?.quietStart || '23:00'"
+              type="time"
+              :disabled="notifyBusy"
+              @update:model-value="(v: string) => patchNotifications({ quietStart: v })"
+            />
+            <span class="notify-times__sep">–</span>
+            <HlInput
+              :model-value="notifyPrefs?.quietEnd || '08:00'"
+              type="time"
+              :disabled="notifyBusy"
+              @update:model-value="(v: string) => patchNotifications({ quietEnd: v })"
+            />
+          </div>
+          <div class="section-desc">{{ t('settings.notification.quietHint') }}</div>
+        </div>
+
+        <div class="settings-row">
+          <div class="settings-row__line">
+            <HlSwitch
+              :model-value="!!notifyPrefs?.includeDetails"
+              accent
+              :disabled="notifyBusy || !notifyPrefs?.enabled"
+              :label="t('settings.notification.detailsLabel')"
+              @update:model-value="(on: boolean) => patchNotifications({ includeDetails: on })"
+            />
+          </div>
+        </div>
+
+        <!-- 状态：出口是否可用 + 最近一次投递结果（不展示任何凭据） -->
+        <div class="settings-row">
+          <div class="notify-status" :class="{ 'is-bad': !notifyReady }">
+            <span class="notify-status__dot" />
+            <span>{{ t(notifyStateKey, notifyStateParams) }}</span>
+          </div>
+          <div v-if="notifyPrefs?.smtp.configured" class="section-desc">
+            {{ t('settings.notification.smtpInfo', {
+              host: notifyPrefs.smtp.host,
+              port: notifyPrefs.smtp.port,
+              user: notifyPrefs.smtp.userMasked,
+            }) }}
+            <template v-if="!notifyPrefs.smtp.hasPassword">
+              · {{ t('settings.notification.smtpNoPassword') }}
+            </template>
+          </div>
+          <div v-if="notifyStats && notifyStats.total > 0" class="section-desc">
+            {{ t('settings.notification.stats', {
+              delivered: notifyStats.delivered,
+              failed: notifyStats.failed,
+              retryable: notifyStats.retryable,
+            }) }}
+          </div>
+        </div>
+
+        <div class="settings-row">
+          <div class="settings-row__line">
+            <HlButton
+              art="outline"
+              tone="green"
+              size="sm"
+              :loading="notifyTesting"
+              :disabled="notifyBusy"
+              @click="sendTestNotification"
+            >
+              {{ t('settings.notification.test') }}
+            </HlButton>
+          </div>
+        </div>
+      </div>
+
       <!-- 产品导览：首次启动自动展示过，这里手动重开（幂等） -->
       <div class="card settings-card" data-section="settings.section.tour">
         <div class="section-title">{{ t('settings.section.tour') }}</div>
         <div class="section-desc">{{ t('settings.tour.desc') }}</div>
-        <HlButton size="sm" @click="onboardingOpen = true">{{ t('settings.tour.replay') }}</HlButton>
-        <ProductTour v-model="onboardingOpen" />
+        <HlButton size="sm" @click="tour.show()">{{ t('settings.tour.replay') }}</HlButton>
       </div>
     </template>
 
@@ -1332,6 +1536,41 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+/* ── 通知区块 ── */
+.notify-cat-label {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.notify-cats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 22px;
+}
+.notify-times {
+  align-items: center;
+  gap: 8px;
+}
+.notify-times__sep {
+  color: var(--text-dim);
+}
+.notify-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+}
+.notify-status__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--rate-good);
+  flex-shrink: 0;
+}
+.notify-status.is-bad .notify-status__dot {
+  background: var(--danger);
 }
 
 .settings-update-ready__text {

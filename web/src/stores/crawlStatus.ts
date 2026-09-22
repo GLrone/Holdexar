@@ -1,6 +1,8 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 
+import { nextPriceCycle, type PriceCycleMark } from '@/lib/priceRefresh'
+
 /** 爬取状态（SSE 驱动）：顶栏胶囊 + 爬取任务页共用。 */
 export const useCrawlStatusStore = defineStore('crawlStatus', () => {
   const running = ref(false)
@@ -14,6 +16,10 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
   const total = ref(0)
   const activeJobId = ref<number | null>(null)
   const lastEventAt = ref<string>('')
+
+  /* 最近一次收敛的价格刷新周期（SSE price_cycle.completed）：库视图据此失效
+     列表缓存并原地重拉。按 cycleId 去重——同一轮重复到达不触发第二次请求。 */
+  const priceCycle = ref<PriceCycleMark | null>(null)
 
   let source: EventSource | null = null
   let started = false
@@ -53,6 +59,13 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
       }
     })
 
+    /* 价格周期收敛（completed / partial / failed / cancelled）。判定与去重在
+       lib/priceRefresh：同一轮重复到达不推进，页面不会重复请求。 */
+    source.addEventListener('price_cycle.completed', (e) => {
+      const next = nextPriceCycle(priceCycle.value, JSON.parse((e as MessageEvent).data))
+      if (next) priceCycle.value = next
+    })
+
     source.onerror = () => {
       // EventSource 自动重连
     }
@@ -68,6 +81,7 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
     total,
     activeJobId,
     lastEventAt,
+    priceCycle,
     start,
   }
 })

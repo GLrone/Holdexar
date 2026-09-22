@@ -225,3 +225,14 @@ async def test_price_refresh_self_renews_to_winter_grid(monkeypatch):
     nxt = await _fire_price_refresh_once(monkeypatch, is_dst=False)
     assert (nxt.minute, nxt.second, nxt.microsecond) == (0, 0, 0)
     assert nxt.hour in {2, 8, 14, 20}
+
+# ── 通知层不在本文件范围（有独立测试）：不打真库、不发真邮件 ──
+import app.domains.notifications.service as _notification_service
+
+
+@pytest.fixture(autouse=True)
+def _no_notifications(monkeypatch):
+    async def _noop(cycle_id):
+        return {"created": 0, "sent": 0, "deferred": 0, "failed": 0}
+
+    monkeypatch.setattr(_notification_service, "dispatch", _noop)

@@ -793,6 +793,7 @@ async def init_db() -> None:
     from app.domains.crawl import models as _crawl_models  # noqa: F401
     from app.domains.games import models as _games_models  # noqa: F401
     from app.domains.monitoring import models as _monitoring_models  # noqa: F401
+    from app.domains.notifications import models as _notification_models  # noqa: F401
     from app.domains.proxies import models as _proxies_models  # noqa: F401
     from app.domains.rates import models as _rates_models  # noqa: F401
     from app.domains.regions import models as _regions_models  # noqa: F401

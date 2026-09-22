@@ -2,10 +2,19 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
-import { crawlApi, gamesApi, proxiesApi, watchPoolApi, type GameListItem } from '@/api/client'
+import {
+  crawlApi,
+  gamesApi,
+  invalidateGetCache,
+  proxiesApi,
+  watchPoolApi,
+  type GameListItem,
+} from '@/api/client'
+import { useCrawlStatusStore } from '@/stores/crawlStatus'
 import { useFilterStore } from '@/stores/gamesFilter'
 import { useRegionsStore } from '@/stores/regions'
 import { canGift } from '@/lib/gifting'
+import { mergeItemsByAppid } from '@/lib/priceRefresh'
 import { vStagger } from '@/lib/stagger'
 import { useI18n, useLocaleFormat } from '@/locales'
 import HlNavbar from '@/components/business/HlNavbar.vue'
@@ -19,6 +28,7 @@ import { HlButton, HlEmpty, HlScrollList, HlSpinner } from '@/components/ui'
  * 系列区块重组（applySeriesBlocks）依赖 seriesId 数据源，暂为空转。
  */
 const store = useFilterStore()
+const crawl = useCrawlStatusStore()
 const regionsStore = useRegionsStore()
 const router = useRouter()
 // 千分位随界面语言：模板里每渲染一行都会重算，且 `fmt` 内部现读 locale，
@@ -116,6 +126,51 @@ async function load(reset: boolean) {
   }
 }
 
+// ─── 价格周期收敛后的原地刷新 ───
+let refreshing = false
+
+/** 重拉已加载区间，按 appid 就地替换条目数据。
+ *
+ * 触发单位是 Price Refresh Cycle（SSE price_cycle.completed），不是 crawl_job：
+ * 一轮里有多个 job，按 job 刷会把一次刷新放大成多次请求。
+ *
+ * 只换数据不换结构：条目顺序与数量、分页游标、滚动位置、卡片上的弹层与价格
+ * 走势抽屉都留在原地——重排列表会把这些交互状态一起卸载掉。重拉失败保留原
+ * 数据，不把页面打成错误态：后台刷新失败不该让用户以为库坏了。 */
+async function refreshInPlace() {
+  const target = items.value.length
+  if (!initialized.value || target === 0 || refreshing || isFetchingNext.value) return
+  refreshing = true
+  const fresh = new Map<number, GameListItem>()
+  try {
+    let after: string | null = null
+    for (;;) {
+      const res = await gamesApi.list({ ...baseParams(), limit: PAGE_SIZE, after })
+      for (const item of res.items) fresh.set(item.appid, item)
+      total.value = res.total
+      hasNextPage.value = res.hasMore
+      nextCursor.value = res.nextCursor
+      after = res.nextCursor
+      if (!res.hasMore || fresh.size >= target) break
+    }
+  } catch {
+    return
+  } finally {
+    refreshing = false
+  }
+  items.value = mergeItemsByAppid(items.value, fresh)
+}
+
+// 价格周期收敛 → 精确失效 games 缓存（不等下一次写操作全量清）→ 原地刷新
+watch(
+  () => crawl.priceCycle?.cycleId ?? null,
+  async (cycleId) => {
+    if (cycleId === null) return
+    invalidateGetCache('/games')
+    await refreshInPlace()
+  },
+)
+
 // 服务端维度变化 → 重新拉取
 watch(
   () => [
@@ -180,7 +235,7 @@ function passesAdvanced(g: GameListItem): boolean {
 
 const visibleGames = computed(() => items.value.filter(passesAdvanced))
 
-// ─── 空库诊断（total=0 时探测监控池、爬虫与代理，给引导文案）───
+// ─── 空库诊断（total=0 时探测监控池、更新状态与代理配置，给引导文案）───
 
 const emptyDiag = ref<{
   checked: boolean
@@ -211,8 +266,8 @@ watch(isLibraryEmpty, async (empty) => {
   if (active.status === 'fulfilled') {
     emptyDiag.value.crawlRunning = active.value.activeJobId !== null
   }
-  // 与后端自动任务同一判据（ensure_proxy_available）：resolve 出 null=直连
-  // = 自动抓价会被闸门拦下——「商店为什么没数据」最常见根因，空态点破它
+  // resolve 出 null = 直连（抓取的标准形态，不配代理照常更新价格）；
+  // 该字段只决定空态是否附带「网络受限可配代理改善」的提示
   if (proxy.status === 'fulfilled') {
     emptyDiag.value.proxyReady = proxy.value.proxyUrl !== null
   }
@@ -316,22 +371,26 @@ onBeforeUnmount(() => {
         icon=""
         data-tour="lib-empty"
       >
-        <!-- 库本身为空：诊断监控池与爬虫状态，给引导 -->
+        <!-- 库本身为空：诊断监控池与更新状态，给引导。分支按用户处境排序：
+             已加游戏（等更新 / 网络受限提示）→ 还没加游戏（去添加）。
+             代理不是抓价前提（直连为标准形态），只在「长时间没数据」时作为
+             可能的改善手段出现，文案留有余地 -->
         <template v-if="isLibraryEmpty">
           <h3>{{ t('library.empty.library.title') }}</h3>
-          <!-- 代理诊断行：无代理时点破「自动抓价被拦」这一最常见根因 -->
-          <template v-if="emptyDiag.checked && emptyDiag.proxyReady === false">
-            <p class="lib-empty-reason">{{ t('library.empty.library.noProxy') }}</p>
-            <div class="lib-empty-actions">
-              <HlButton size="sm" @click="router.push('/proxies')">
-                {{ t('library.empty.library.goProxy') }}
-              </HlButton>
-            </div>
-          </template>
-          <template v-else-if="emptyDiag.poolCount !== null && emptyDiag.poolCount > 0">
+          <template v-if="emptyDiag.poolCount !== null && emptyDiag.poolCount > 0">
             <p>{{ t('library.empty.library.pool', { n: emptyDiag.poolCount }) }}</p>
             <p v-if="emptyDiag.crawlRunning">{{ t('library.empty.library.crawling') }}</p>
-            <p v-else>{{ t('library.empty.library.startHint') }}</p>
+            <template v-else>
+              <p>{{ t('library.empty.library.startHint') }}</p>
+              <template v-if="emptyDiag.checked && emptyDiag.proxyReady === false">
+                <p class="lib-empty-reason">{{ t('library.empty.library.netHint') }}</p>
+                <div class="lib-empty-actions">
+                  <HlButton size="sm" @click="router.push('/proxies')">
+                    {{ t('library.empty.library.goProxy') }}
+                  </HlButton>
+                </div>
+              </template>
+            </template>
           </template>
           <template v-else-if="emptyDiag.checked">
             <p>{{ t('library.empty.library.noPool1') }}</p>

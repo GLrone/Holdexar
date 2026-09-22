@@ -23,6 +23,8 @@ from sqlalchemy.orm import aliased
 
 from app.core.database import get_session_factory
 from app.crawler.utils import get_beijing_time_obj
+from app.domains.crawl import coverage as coverage_service
+from app.domains.crawl import freshness as freshness_service
 from app.domains.games.models import Game, Bundle, BundleRegionPrice, GameCurrentPrice, GamePriceHistory
 from app.domains.games.scoring import (
     familiarity_score,
@@ -475,8 +477,16 @@ async def list_games(
         appid_list = [row[0].appid for row in rows]
         price_rows = await _load_page_prices(session, appid_list)
 
+    # 页级一次取齐本轮覆盖率：每页固定两条聚合查询，不按卡片数量增长
+    coverage_map = await coverage_service.latest_appid_coverage(appid_list) or {}
+
     items = [
-        _build_list_item(game, cn_row, price_rows.get(game.appid, []))
+        _build_list_item(
+            game,
+            cn_row,
+            price_rows.get(game.appid, []),
+            coverage_map.get(game.appid),
+        )
         for game, cn_row in rows
     ]
 
@@ -610,8 +620,11 @@ async def _list_games_top100(
     async with get_session_factory()() as session:
         price_rows = await _load_page_prices(session, appid_list)
 
+    coverage_map = await coverage_service.latest_appid_coverage(appid_list) or {}
     items = [
-        _build_list_item(game, cn_row, price_rows.get(game.appid, []))
+        _build_list_item(
+            game, cn_row, price_rows.get(game.appid, []), coverage_map.get(game.appid)
+        )
         for game, cn_row in page
     ]
 
@@ -1627,12 +1640,20 @@ async def refresh_sort_cache(
     return result.rowcount or 0
 
 
-def _build_list_item(game: Game, cn_row: GameCurrentPrice | None, price_rows: list) -> dict:
+def _build_list_item(
+    game: Game,
+    cn_row: GameCurrentPrice | None,
+    price_rows: list,
+    price_coverage: dict | None = None,
+) -> dict:
     """对齐 route.ts buildGameResponse。cn_row=None 为锁区（无国区行，LEFT JOIN）。
 
     cnyFen 只读快照列（cny_fen）：GET 不回算汇率——回算会与排序快照
     （diff_fen/min_cny_fen）落在不同汇率基准上，出现「排名说省 ¥20 /
     卡片算出来不是 ¥20」。缺失行由 recompute_cny_fen_all 在汇率刷新时补齐。
+
+    price_coverage 是本页一次取齐的本轮覆盖率（无 Cycle 归属的对象为 None）；
+    观察时刻取本对象价格行的 MAX(updated_at)，与 freshness 接口同口径。
     """
     base_cn_price = int(cn_row.price) if cn_row is not None and cn_row.price is not None else None
 
@@ -1731,6 +1752,17 @@ def _build_list_item(game: Game, cn_row: GameCurrentPrice | None, price_rows: li
         # 最近一次原价跳变时刻：永降/永涨徽章 14 天时效判据（前端判定显隐）
         "ppChangedAt": game.pp_changed_at.isoformat() if game.pp_changed_at else None,
         "updatedAt": game.updated_at.isoformat() if game.updated_at else None,
+        # 价格数据状态：observedAt/freshness 是价格观察时间（≠ updatedAt 的实体
+        # 更新时间）；coverage 只在有 Cycle 归属（属本轮期望集）时非空
+        "priceData": {
+            **freshness_service.freshness_of(
+                max(
+                    (p.updated_at for p in price_rows if p.updated_at is not None),
+                    default=None,
+                )
+            ),
+            "coverage": price_coverage,
+        },
         "familySharing": game.family_sharing or False,
         "tradingCards": game.trading_cards or False,
         "seriesId": game.series_id,

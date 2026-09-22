@@ -71,6 +71,16 @@ function isNoCachePath(path: string): boolean {
   return NO_CACHE_PATHS.some((p) => path === p || path.startsWith(`${p}?`) || path.startsWith(`${p}/`))
 }
 
+/** 精确失效：只清匹配 prefix 的时间窗条目（路径段前缀，与 NO_CACHE_PATHS 同规则）。
+ * 后台价格周期完成后由 SSE 触发——此时该拉新数据，但没有写操作可用来全量清。 */
+export function invalidateGetCache(prefix: string): void {
+  for (const key of [...getCache.keys()]) {
+    if (key === prefix || key.startsWith(`${prefix}?`) || key.startsWith(`${prefix}/`)) {
+      getCache.delete(key)
+    }
+  }
+}
+
 async function request<T>(
   method: string,
   path: string,
@@ -396,6 +406,36 @@ export const familyApi = {
 
 // ─── games ───────────────────────────────────────────────
 
+/** 本轮覆盖率（Cycle 冻结期望集口径；只对本轮期望集内的对象给出） */
+export interface PriceCoverage {
+  cycleId: number
+  cycleStatus: string
+  /** 本轮期望刷新的地区数（分母） */
+  expectedUnits: number
+  ok: number
+  /** 锁区：Steam 明确不卖，不是抓取失败 */
+  locked: number
+  /** 欠账待补抓 */
+  missing: number
+  blocked: number
+  /** 本轮窗口内没有结果：不是「价格不可用」 */
+  unobserved: number
+  coverage: number
+  coverageConfirmed: number
+}
+
+/** 价格数据状态。观察时间/新鲜度是**价格**维度，与 updatedAt（实体更新时间）不同源 */
+export interface PriceData {
+  /** 价格观察时刻（ISO，本对象价格行的 MAX(updated_at)）；null = 尚无价格行 */
+  observedAt: string | null
+  /** 距现在的时长（小时） */
+  ageHours: number | null
+  /** fresh <6h / lagging <12h / stale ≥12h（对象级，不按地区分档） */
+  freshness: 'fresh' | 'lagging' | 'stale' | null
+  /** null = 不属本轮期望集（无 Cycle 归属，不冒充 100%） */
+  coverage: PriceCoverage | null
+}
+
 export interface GameListItem {
   appid: number
   name: string
@@ -425,6 +465,8 @@ export interface GameListItem {
   ppChangedAt: string | null
   /** 库内最近变动时间（ISO，updated_at）；降价动态 feed 排序键 */
   updatedAt: string | null
+  /** 价格数据状态（列表接口下发；详情接口不带） */
+  priceData?: PriceData | null
   familySharing: boolean
   tradingCards: boolean
   xgpTier: string | null
@@ -929,6 +971,55 @@ export interface CrawlJob {
   error: string | null
 }
 
+/** 价格事实变化的类型：与后端 `crawl/events.py` 的 EVENT_TYPES 一一对应 */
+export const PRICE_EVENT_TYPES = [
+  'PRICE_DROP',
+  'PRICE_INCREASE',
+  'NEW_HISTORICAL_LOW',
+  'HISTORICAL_LOW_MATCH',
+  'PERMANENT_PRICE_CHANGE',
+  'REGION_LOCKED',
+  'REGION_UNLOCKED',
+  'PRICE_UNAVAILABLE',
+  'PRICE_RESTORED',
+  'FREE_PROMO',
+  'REMOVED',
+] as const
+
+export type PriceEventType = (typeof PRICE_EVENT_TYPES)[number]
+
+/**
+ * 一条价格事实变化（`price_events` 一行）。
+ * 只增不改、没有状态流转；语义（变化判没判出来）全在后端，前端不重判。
+ */
+export interface PriceEventItem {
+  id: number
+  cycleId: number
+  appid: number
+  /** 大写区码；null = 该事件由游戏级对象表达（促销免费 / 下架），不属单一地区 */
+  region: string | null
+  eventType: PriceEventType
+  /** 变化前的有效值；没有前值时为 null */
+  previous: Record<string, unknown> | null
+  current: Record<string, unknown> | null
+  /** 事实发生时刻（ISO）。展示时间只用它，不用实体更新时间 */
+  occurredAt: string | null
+}
+
+/** 一轮价格刷新（`price_cycles` 一行）；前端只看「最近一轮收敛没有」 */
+export interface PriceCycleItem {
+  id: number
+  kind: string
+  status: string
+  scope: string
+  expectedUnits: number
+  enteredRepairing: boolean
+  startedAt: string | null
+  finishedAt: string | null
+  error: string | null
+  stats: Record<string, number | null> | null
+}
+
 export const crawlApi = {
   run: (scope: string, appids?: number[], kind?: string) =>
     request<{ id: number; count: number; regions: string[] | null }>('POST', '/crawl/run', {
@@ -950,6 +1041,22 @@ export const crawlApi = {
       'POST',
       '/crawl/import',
       { appids },
+    ),
+  /** 价格刷新轮次（新→旧）；前端只用来看「最近一轮是否已收敛」 */
+  cycles: (limit = 1) => request<PriceCycleItem[]>('GET', `/crawl/cycles${toQuery({ limit })}`),
+  /**
+   * 价格事件：**唯一**的事件来源，事实记录只读。
+   * 事件类型与前后值都由后端判定，前端只做格式化展示，不据价格矩阵自行推断。
+   */
+  priceEvents: (params: { cycleId?: number; appid?: number; eventType?: string; limit?: number } = {}) =>
+    request<PriceEventItem[]>(
+      'GET',
+      `/crawl/price-events${toQuery({
+        cycle_id: params.cycleId,
+        appid: params.appid,
+        event_type: params.eventType,
+        limit: params.limit,
+      })}`,
     ),
 }
 
@@ -1375,6 +1482,79 @@ export interface RateHistoryItem {
   rateToCny: number
   source: string | null
   fetchedAt: string | null
+}
+
+// ─── notifications（价格事件通知）─────────────────────────────
+
+/** 通知类别：用户面分类，一个类别覆盖多个内部事件类型（内部枚举不出界面） */
+export interface NotificationCategory {
+  key: string
+  label: string
+  enabled: boolean
+  /** 该类别覆盖的内部事件类型数量（只用于展示说明） */
+  eventTypes: number
+}
+
+export interface NotificationPrefs {
+  enabled: boolean
+  quietEnabled: boolean
+  quietStart: string
+  quietEnd: string
+  includeDetails: boolean
+  /** 单条候选最多投递次数 */
+  maxAttempts: number
+  categories: NotificationCategory[]
+  /** SMTP 的可公开部分：不含密码 / 授权码 */
+  smtp: {
+    configured: boolean
+    host: string
+    port: number
+    userMasked: string
+    hasPassword: boolean
+    useSsl: boolean
+  }
+  lastDelivery: {
+    status: string
+    at: string | null
+    attempts: number
+    reason: string | null
+    retryable: boolean
+  } | null
+}
+
+export interface NotificationPrefsUpdate {
+  enabled?: boolean
+  quietEnabled?: boolean
+  quietStart?: string
+  quietEnd?: string
+  includeDetails?: boolean
+  /** 只传要改的类别，后端按已知类别合并 */
+  categories?: Record<string, boolean>
+}
+
+export interface NotificationStats {
+  total: number
+  delivered: number
+  pending: number
+  suppressed: number
+  sending: number
+  failed: number
+  /** 失败里还能再试的（临时故障且未到次数上限） */
+  retryable: number
+  /** 已经永久放弃的（凭据/配置错误或次数用尽） */
+  permanent: number
+  attempts: number
+  maxAttempts: number
+  byStatus: Record<string, { count: number; attempts: number }>
+}
+
+export const notificationsApi = {
+  prefs: () => request<NotificationPrefs>('GET', '/notifications/prefs'),
+  updatePrefs: (payload: NotificationPrefsUpdate) =>
+    request<{ ok: boolean; enabled: boolean }>('PUT', '/notifications/prefs', payload),
+  /** 连通性测试：与 Price Event / Candidate / Cycle 无关，不写任何业务数据 */
+  test: () => request<{ ok: boolean }>('POST', '/notifications/test'),
+  stats: () => request<NotificationStats>('GET', '/notifications/stats'),
 }
 
 /** 历史窗口档位（null = 全量 16 年档案） */

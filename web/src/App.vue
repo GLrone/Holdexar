@@ -7,6 +7,7 @@ import { useCrawlStatusStore } from '@/stores/crawlStatus'
 import { useLocaleStore } from '@/stores/locale'
 import { useSettingsStore } from '@/stores/settings'
 import { useThemeStore } from '@/stores/theme'
+import { useTourStore } from '@/stores/tour'
 import { useUpdaterStore } from '@/stores/updater'
 import { useI18n, type MessageKey } from '@/locales'
 import { ratesApi, type WalletSnapshot } from '@/api/client'
@@ -94,13 +95,14 @@ watch(
 
 /* ── 首次启动产品导览 ──
    settings KV `ui.onboarding_done` 判定：标志拉取后为 false → 延时 800ms
-   启动（等首屏渲染稳定，避免与页面骨架同时闪）。组件内任何关闭路径写标志。 */
-const onboardingOpen = ref(false)
+   启动（等首屏渲染稳定，避免与页面骨架同时闪）。组件内任何关闭路径写标志。
+   开关来自 tour store：关于页 / 设置页的重看入口与首屏自动弹共用同一实例。 */
+const tour = useTourStore()
 watch(
   () => settingsStore.onboardingDone,
   (done) => {
     if (done === false) {
-      setTimeout(() => (onboardingOpen.value = true), 800)
+      setTimeout(() => tour.show(), 800)
     }
   },
   { immediate: true },
@@ -119,7 +121,7 @@ watch(
 const updateNoticePending = ref(false)
 
 function flushUpdateNotice() {
-  if (!updateNoticePending.value || onboardingOpen.value) return
+  if (!updateNoticePending.value || tour.open) return
   const latest = updaterStore.info?.latest
   if (!latest) return
   updateNoticePending.value = false
@@ -158,7 +160,7 @@ watch(
   { immediate: true },
 )
 
-watch(onboardingOpen, (open) => {
+watch(tour.open, (open) => {
   if (!open && updateNoticePending.value) window.setTimeout(flushUpdateNotice, 800)
 })
 
@@ -462,8 +464,9 @@ async function manualRefreshWallet() {
       </main>
     </div>
 
-    <!-- 首次启动产品导览（蒙层+聚光+教练标记气泡；settings KV 判定，自动弹出一次） -->
-    <ProductTour v-model="onboardingOpen" />
+    <!-- 首次启动产品导览（蒙层+聚光+教练标记气泡；settings KV 判定，自动弹出一次）。
+         全局唯一实例：导览要跨路由翻页，挂页面里的实例会被 router.push 卸载 -->
+    <ProductTour v-model="tour.open" />
 
     <!-- 全局更新弹窗（检查/下载/校验/重启全在这里闭环；模糊幕布遮住底层页面）。
          更新模块已从设置页搬出——更新是应用级事务，不该塞在某个页签里。 -->

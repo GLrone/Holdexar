@@ -92,11 +92,16 @@ async def update_smtp_config(
     return await get_smtp_config()
 
 
-async def send_mail(subject: str, html_body: str) -> bool:
+async def send_mail_ex(subject: str, html_body: str) -> tuple[bool, str | None]:
+    """发一封邮件，返回 (是否成功, 失败原因)。
+
+    与 `send_mail` 是同一条投递路径，只是把失败原因交回调用方——通知层靠它
+    区分「临时网络错误（可有限重试）」与「凭据/配置错误（不该重试）」。
+    """
     cfg = await smtp_config()
     if not (cfg["host"] and cfg["user"] and cfg["password"] and cfg["to_addr"]):
         logger.info("SMTP 未配置，跳过邮件通知")
-        return False
+        return False, "SMTP 未配置"
     try:
         if cfg["use_ssl"]:
             server = smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=20)
@@ -111,10 +116,18 @@ async def send_mail(subject: str, html_body: str) -> bool:
             message["To"] = cfg["to_addr"]
             server.sendmail(cfg["user"], [cfg["to_addr"]], message.as_string())
         logger.info("邮件已发送: %s", subject)
-        return True
+        return True, None
     except Exception as e:  # noqa: BLE001
         logger.error("邮件发送失败: %s", e)
-        return False
+        # 返回里带上异常类型名：错误文本会被系统语言本地化（中文 Windows 的
+        # socket 错误是中文），只有类型名是与语言无关的稳定判据
+        return False, f"{type(e).__name__}: {e}"
+
+
+async def send_mail(subject: str, html_body: str) -> bool:
+    """发一封邮件；未配置或失败返回 False（既有调用方的契约不变）。"""
+    ok, _ = await send_mail_ex(subject, html_body)
+    return ok
 
 
 # ══════════════════════════════════════════════════════════════════

@@ -69,6 +69,21 @@ const gameCard = {
   'gameCard.price.save': '省¥{amount}',
   'gameCard.price.noDiff': '无差价',
 
+  /* ── 价格数据状态（观察时间 / 新鲜度 / 本轮覆盖）──
+     锁区、抓取失败、本轮没结果三者措辞必须分开：锁区不是失败，
+     没结果也不等于价格不可用。 */
+  'gameCard.priceData.label': '价格数据',
+  'gameCard.priceData.justNow': '刚刚更新',
+  'gameCard.priceData.minutesAgo': '{n} 分钟前',
+  'gameCard.priceData.hoursAgo': '{n} 小时前',
+  'gameCard.priceData.daysAgo': '{n} 天前',
+  'gameCard.priceData.none': '尚无价格数据',
+  'gameCard.priceData.coverageFull': '覆盖 {ok}/{expected}',
+  'gameCard.priceData.coveragePartial': '覆盖 {ok}/{expected}，未完整',
+  'gameCard.priceData.tip.locked': '{n} 个地区锁区',
+  'gameCard.priceData.tip.failed': '{n} 个地区抓取失败',
+  'gameCard.priceData.tip.unobserved': '{n} 个地区本轮未有结果',
+
   /* ── 卡片操作行（regionPrice.title 与 GPW 弹窗小标题同条）── */
   'gameCard.regionPrice.title': '全区价格',
   'gameCard.trend.tip': '价格历史走势',

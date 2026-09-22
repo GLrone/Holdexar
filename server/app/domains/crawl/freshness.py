@@ -4,15 +4,11 @@
 Freshness 说「手上的数据离现在多久」。两者可以任意组合（100% 覆盖 + stale、
 60% 覆盖 + fresh 都成立），因此不合并成任何综合评分。
 
-第一版只按年龄分档，观察时间来源是 `game_current_prices.updated_at`（当前最
-可用的观察时间来源）：
+观察时刻 = 该对象全部价格行的 MAX(updated_at)，按年龄分档（对象级，不按地区）：
 
     fresh    age < 6h       一个刷新网格内
     lagging  6h ≤ age < 12h
     stale    age ≥ 12h      与 crawler/config.STALE_HOURS 同口径
-
-不使用「属于最近一个 Cycle 就算 fresh」——价格行没有 `cycle_id`，那种归属
-关系不存在。也不新增 last_checked / freshness_score 等字段。
 """
 from __future__ import annotations
 

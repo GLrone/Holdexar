@@ -124,7 +124,7 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.update.switchFailed': 'Could not save the setting — please try again',
 
   /* Guided-tour card (the tour copy itself lives in ProductTour.vue) */
-  'settings.tour.desc': 'A spotlight walkthrough: bind an account → manage proxies → import games → set price alerts, highlighting the exact spot on screen at each step. It ran automatically on first launch — replay it any time.',
+  'settings.tour.desc': 'A spotlight walkthrough: add games → watch prices → set an alert — the three main steps, and the app is yours. Proxy and account binding are marked optional and can be skipped. It ran automatically on first launch — replay it any time.',
   'settings.tour.replay': 'Replay the tour',
 
   /* Result toasts */
@@ -181,6 +181,34 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.risk.leak4Rest': "Use 'Unbind all accounts' in settings to remove the stored credential.",
   'settings.risk.confirm': 'I understand, continue',
   'settings.risk.countdown': 'I understand ({n}s)',
+
+  /* Notifications (price-event notices; categories are user-facing, no internal enums) */
+  'settings.section.notification': 'Notifications',
+  'settings.notification.desc':
+    'Email yourself when a refresh produces price changes. Off by default — turning it on is your call.',
+  'settings.notification.enabledLabel': 'Enable price notifications',
+  'settings.notification.enabledHint':
+    'When off, nothing is queued and nothing builds up; turning it back on will not resend older changes.',
+  'settings.notification.categoriesLabel': 'Categories',
+  'settings.notification.categoriesHint':
+    'Event types are grouped into these four — switch one off to stop that kind of change.',
+  'settings.notification.quietLabel': 'Quiet hours',
+  'settings.notification.quietHint':
+    'Changes produced during quiet hours are not sent immediately — they ride along with the next refresh (never dropped).',
+  'settings.notification.detailsLabel': 'List each change in the email',
+  'settings.notification.smtpInfo': 'Outbox: {host}:{port} · {user}',
+  'settings.notification.smtpMissing': 'SMTP not configured — set your mailbox on the Price Alerts page',
+  'settings.notification.smtpNoPassword': 'No authorization code set',
+  'settings.notification.off': 'Notifications off',
+  'settings.notification.on': 'Notifications on — waiting for the next refresh',
+  'settings.notification.lastOk': 'Last email delivered ({time})',
+  'settings.notification.lastFailed': 'Last email failed: {reason}',
+  'settings.notification.lastRetryable': 'Temporary failure — will retry next refresh (attempt {n})',
+  'settings.notification.lastPermanent': 'Gave up retrying — check mailbox and authorization code',
+  'settings.notification.test': 'Send test email',
+  'settings.notification.testSent': 'Test email sent — check your inbox',
+  'settings.notification.stats':
+    'Delivered {delivered} · failed {failed} ({retryable} can retry)',
 }
 
 export default settings

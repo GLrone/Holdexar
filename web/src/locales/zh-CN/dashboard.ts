@@ -12,7 +12,7 @@
    · 「最低价区」同时是跑马灯与动态列表里 🏆 图标的 alt；
    · 「全部 →」的箭头留在组件侧，不进词条。
 
-   跑马灯/轮播的机会文案（uptime / proxyHint / toast）都是**参数化整句**：
+   空库首屏（welcome.*）只在库里一款游戏都没有时渲染，是**参数化整句**：
    中英语序与量词不同，拆成「标签 + 值」多条再拼拼不回去。 */
 
 const dashboard = {
@@ -25,24 +25,31 @@ const dashboard = {
   'dashboard.section.spotlight': '新史低精选',
   'dashboard.section.priceMoves': '降价动态',
   'dashboard.section.rates': '主要汇率',
-  'dashboard.section.quickActions': '快捷操作',
-  'dashboard.section.sysInfo': '系统信息',
 
-  /* 统计格 */
+  /* 统计格（空库时整块不渲染） */
   'dashboard.stats.totalGames': '游戏商店总量',
   'dashboard.stats.discounts': '当前打折',
   'dashboard.stats.monitored': '游戏监控',
-  'dashboard.stats.proxyAvailable': '代理可用',
 
-  /* 运行时长（三种粒度各成一条：秒/分秒/时分秒，中英量词不同） */
-  'dashboard.uptime.hms': '{h} 小时 {m} 分 {s} 秒',
-  'dashboard.uptime.ms': '{m} 分 {s} 秒',
-  'dashboard.uptime.s': '{s} 秒',
-
-  /* 代理统计副注（三段各自成句，用 · 连接——不是同一句被拆开） */
-  'dashboard.proxy.clashRunning': 'Clash {n} 出口',
-  'dashboard.proxy.clashStopped': 'Clash 未运行',
-  'dashboard.proxy.pool': '池 {ok}/{total}',
+  /* 空库首屏：只回答「第一步做什么」 */
+  'dashboard.welcome.title': '欢迎来到 {app}',
+  'dashboard.welcome.ask': '你想监控哪些游戏？',
+  'dashboard.welcome.paste': '粘贴游戏链接添加',
+  'dashboard.welcome.sync': '从 Steam 愿望单同步',
+  'dashboard.welcome.import': '导入游戏列表 / 文件',
+  'dashboard.welcome.pasteHint':
+    '一行一个链接（Steam 商店 / SteamDB 链接或 AppID 数字），也可以把整份列表一次粘进来。',
+  'dashboard.welcome.add': '添加',
+  'dashboard.welcome.adding': '添加中…',
+  'dashboard.welcome.added': '已添加 {n} 款，正在获取各区价格',
+  'dashboard.welcome.addOwned': '{n} 款已经在库里了',
+  'dashboard.welcome.addNone': '没识别出可用的游戏，检查一下链接或 AppID',
+  'dashboard.welcome.addFailed': '暂时没能添加，稍后再试一次。',
+  'dashboard.welcome.autoTitle': '系统会自动',
+  'dashboard.welcome.autoPrice': '获取各区价格',
+  'dashboard.welcome.autoRefresh': '定期更新',
+  'dashboard.welcome.autoEvent': '发现降价',
+  'dashboard.welcome.autoAlert': '到价提醒',
 
   /* 价格状态角标（跑马灯 / 轮播 / 动态列表共用） */
   'dashboard.badge.newLow': '新史低',
@@ -56,28 +63,14 @@ const dashboard = {
   /* 区块右上角入口（箭头 → 留在组件侧） */
   'dashboard.action.viewAll': '全部',
 
-  /* 快捷操作按钮 */
-  'dashboard.action.crawl': '开始爬取',
-  'dashboard.action.syncWishlist': '同步监控池',
-  'dashboard.action.refreshRates': '刷新汇率',
-  'dashboard.action.checkProxies': '代理检测',
-
-  /* 快捷操作的结果提示 */
-  'dashboard.toast.crawlStarted': '爬取任务 #{id} 已启动（{count} 款）',
-  'dashboard.toast.noAccounts': '未绑定追踪账户，请先在监控池页绑定',
+  /* 愿望单同步的结果提示 */
+  'dashboard.toast.noAccounts': '还没有绑定 Steam 账号——绑定后可以自动同步愿望单',
   'dashboard.toast.synced': '已同步 {ok}/{total} 个账户，新增 {added} 款',
-  'dashboard.toast.crawlTriggerFailed': '新增条目爬取触发失败（可能已有任务运行），可稍后手动开始',
-  'dashboard.toast.ratesRefreshed': '汇率已刷新：{count} 币种（来源 {source}）',
-  'dashboard.toast.proxyCheckStarted': '节点体检已触发（{state}）',
+  'dashboard.toast.crawlTriggerFailed': '新增条目获取价格触发失败（可能已有任务在跑），稍后会自动重试',
 
   /* 空态 */
   'dashboard.empty.noMoves': '暂无降价动态',
   'dashboard.empty.noRates': '暂无汇率数据（可在汇率页自选追踪币种）',
-
-  /* 系统信息行 */
-  'dashboard.sys.app': '应用',
-  'dashboard.sys.version': '版本',
-  'dashboard.sys.uptime': '运行时长',
 } as const
 
 export default dashboard

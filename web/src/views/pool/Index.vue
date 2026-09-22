@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 
 import { watchPoolApi, type PoolItemPayload, type TrackedAccount } from '@/api/client'
 import { useRegionsStore } from '@/stores/regions'
@@ -36,6 +36,7 @@ import {
    以及监控地区的圈定（自任务页迁入，同属监控域）。 */
 
 const router = useRouter()
+const route = useRoute()
 const { t } = useI18n()
 const regionsStore = useRegionsStore()
 
@@ -462,6 +463,8 @@ onMounted(async () => {
   enabledRegions.value = regionsStore.list.every((r) => r.enabled)
     ? null
     : regionsStore.list.filter((r) => r.enabled).map((r) => r.code)
+  // 空库首屏的「导入游戏列表 / 文件」直达：?add=1 直接开添加对话框
+  if (route.query.add === '1') addOpen.value = true
 })
 </script>
 

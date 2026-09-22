@@ -137,7 +137,7 @@ const settings = {
   'settings.update.switchFailed': '设置保存失败，请重试',
 
   /* ── 新手教程卡片（导览正文在 ProductTour.vue，本页只有入口）── */
-  'settings.tour.desc': '蒙层聚光式导览：绑定账号 → 代理管理 → 导入游戏 → 降价提醒，每步高亮界面具体位置点对点讲解。首次启动已自动展示过，可随时重新查看。',
+  'settings.tour.desc': '蒙层聚光式导览：添加游戏 → 看价格 → 设提醒，三步主线走完就能用起来；代理与账号绑定标为可选，可整个跳过。首次启动已自动展示过，可随时重新查看。',
   'settings.tour.replay': '重新查看导览',
 
   /* ── 结果提示（一条整句；中英语序不同，不拆片段）── */
@@ -192,6 +192,34 @@ const settings = {
   'settings.risk.leak4Rest': '回设置页「解绑全部账号」，清掉已保存的凭据。',
   'settings.risk.confirm': '我已知晓，继续绑定',
   'settings.risk.countdown': '我已知晓（{n}s）',
+
+  /* ── 通知（价格事件通知：类别是用户面分类，不含内部事件枚举）── */
+  'settings.section.notification': '通知',
+  'settings.notification.desc':
+    '价格刷新产生变化时自动发邮件；默认关闭，开启必须由你确认。',
+  'settings.notification.enabledLabel': '启用价格通知',
+  'settings.notification.enabledHint':
+    '关闭后不产生任何通知候选，也不会积压旧账；重新开启不会补发之前的变动。',
+  'settings.notification.categoriesLabel': '通知类别',
+  'settings.notification.categoriesHint':
+    '事件类型归到这四类中，关掉一类即不再通知该类变化。',
+  'settings.notification.quietLabel': '静默时间',
+  'settings.notification.quietHint':
+    '静默期内产生的变化不会立即发送，会随下一轮一并送达（不是丢弃）。',
+  'settings.notification.detailsLabel': '邮件里列出变化明细',
+  'settings.notification.smtpInfo': '出口：{host}:{port} · {user}',
+  'settings.notification.smtpMissing': '未配置 SMTP，请先到「价格提醒」页填写邮箱与授权码',
+  'settings.notification.smtpNoPassword': '未设置授权码',
+  'settings.notification.off': '通知未开启',
+  'settings.notification.on': '通知已开启，等待下一轮价格刷新',
+  'settings.notification.lastOk': '最近一次邮件已送出（{time}）',
+  'settings.notification.lastFailed': '最近一次邮件发送失败：{reason}',
+  'settings.notification.lastRetryable': '临时故障，下一轮会自动重试（已尝试 {n} 次）',
+  'settings.notification.lastPermanent': '已放弃重试，请检查邮箱与授权码',
+  'settings.notification.test': '发送测试邮件',
+  'settings.notification.testSent': '测试邮件已发送，请到收件箱确认',
+  'settings.notification.stats':
+    '已投递 {delivered} 条 · 失败 {failed} 条（其中 {retryable} 条可重试）',
 } as const
 
 export default settings

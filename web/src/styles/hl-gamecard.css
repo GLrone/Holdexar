@@ -505,6 +505,35 @@
 .price-value.cn { color: var(--accent); }
 .price-value.lowest { color: var(--success); }
 
+/* 价格数据状态（观察时间 + 本轮覆盖）。分档只改时间文字色，不给整行上色——
+   卡片里已有一处红绿语义（价格），两个信号挤在一起会互相削弱。 */
+.price-data {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--text-dim);
+}
+
+.price-data .coverage {
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: var(--surface-chip);
+    color: var(--text-on-fill);
+    font-weight: 600;
+}
+
+/* 未刷满：与「已刷满」在扫视层面可区分（数字本身已说明差多少） */
+.price-data.is-partial .coverage {
+    background: var(--warning-a15);
+    color: var(--warning);
+    border: 1px solid var(--warning-a30);
+}
+
+.price-data.is-fresh { color: var(--rate-good); }
+.price-data.is-lagging { color: var(--rate-mid); }
+.price-data.is-stale { color: var(--rate-low); }
+
 .flag-icon { width: 18px; height: 13px; border-radius: 2px; vertical-align: middle; }
 
 /* 差价徽章 */
