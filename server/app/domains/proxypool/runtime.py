@@ -827,13 +827,71 @@ def lane_bindings(data_dir: Path) -> list[dict]:
     return bindings
 
 
-def lane_run_plan(data_dir: Path) -> dict:
+def select_run_lanes(
+    bindings: Sequence[Mapping],
+    exit_by_node: Mapping[str, str] | None,
+    *,
+    max_lanes: int | None = None,
+) -> list[dict]:
+    """把内核里现有的 lane 收敛成**本次 run 的 active lane 表**（纯函数，可单测）。
+
+    不变量：**active lanes ≤ 当前唯一出口 IP 数**。内核的 listener 数是上一次重建时
+    定下的，而出口身份（L1）在之后还会被刷新——两者之间存在一个重建窗口，窗口期内
+    「lane 数」可能多于「当前唯一出口数」（同一出口被两条 lane 各绑一个节点）。
+    所以运行期不能直接相信台账（`crawl-lanes.yaml`），必须用**当前快照**重新收敛：
+
+    - 一个出口一条 lane：同一出口被多条 lane 绑定时只保留序号最小的那条（确定性）；
+    - 绑到「当前出口未知」的节点的 lane 一律不选（出口身份未知时它没有容量依据）；
+    - `max_lanes` 同时受配置 worker 上限与 `MAX_CRAWL_WORKERS` 约束，取最小；
+    - 输出顺序按 lane 序号升序，run 内固定不变。
+
+    `exit_by_node is None`（调用方读不到快照）保持旧行为：不收敛，原样返回。
+    快照为空（一个出口都没探到）时同样原样返回——那时退化为按节点计容量，键退回
+    `lane:<序号>`，这是兼容性设计，不是正常生产路径的默认状态。
+    """
+    if exit_by_node is None:
+        return [dict(b) for b in bindings]
+    known = {str(k): str(v) for k, v in exit_by_node.items() if v}
+    if not known:
+        return [dict(b) for b in bindings]
+
+    chosen: list[dict] = []
+    used_exits: set[str] = set()
+    for binding in sorted(bindings, key=lambda b: int(b.get("lane", 0))):
+        node = str(binding.get("node") or "")
+        exit_ip = known.get(node)
+        if not exit_ip:
+            # 该 lane 的执行节点当前没有出口身份：不占本次 run 的工位
+            continue
+        if exit_ip in used_exits:
+            # 同一出口的第二条 lane：容量上它不增加任何东西，剔除
+            continue
+        used_exits.add(exit_ip)
+        merged = dict(binding)
+        merged["exitIp"] = exit_ip
+        chosen.append(merged)
+
+    if max_lanes is not None:
+        chosen = chosen[: max(0, int(max_lanes))]
+    return chosen
+
+
+def lane_run_plan(
+    data_dir: Path,
+    *,
+    exit_by_node: Mapping[str, str] | None = None,
+    max_lanes: int | None = None,
+) -> dict:
     """受管爬取一次 run 需要的入口三元组：地址 / 出口键 / 执行节点（三者同序）。
 
-    **唯一取值口**：生产路径与验证脚本都从这里取，避免"两处各自拼一遍"再次出现
-    「worker 拿到地址但没拿到出口身份」这类只在一侧发生的缺口。出口身份缺失时键退回
-    `lane:<序号>`——它仍能保证同出口共享一份预算（同一 lane 上的 worker 同键），
-    只是不跨 lane 合并同出口。
+    **唯一取值口**：生产路径与验证脚本都从这里取。`exit_by_node` 是**当前**出口身份
+    快照（`ProxyNode.runtime_name -> exit_ip`）；给了就按 `select_run_lanes` 收敛成
+    本次 run 的 active lane 表（保证 `active_lanes ≤ 唯一出口数`），并把它作为
+    **run 级快照**返回——run 一旦开始，后台维护改了出口集也不会影响它：调用方拿到的是
+    一份已经定型的列表，`CrawlRunConfig.proxy_urls` 在 run 内不再变动。
+
+    出口身份缺失时键退回 `lane:<序号>`——它仍能保证同出口共享一份预算（同一 lane 上的
+    worker 同键），只是不跨 lane 合并同出口。
     """
     bindings = lane_bindings(data_dir)
     if not bindings:
@@ -842,17 +900,16 @@ def lane_run_plan(data_dir: Path) -> dict:
             {"lane": i, "url": url, "exitIp": None, "node": None}
             for i, url in enumerate(urls)
         ]
+    active = select_run_lanes(bindings, exit_by_node, max_lanes=max_lanes)
+    if not active:
+        # 收敛后一条都不剩（现有 listener 绑的节点全都没有出口身份）：保留全部入口，
+        # 走 `lane:<序号>` 键——宁可退化，也不让本次 run 无入口可用。
+        active = [dict(b) for b in bindings]
     return {
-        "urls": [b["url"] for b in bindings],
-        "exit_keys": [b["exitIp"] or f"lane:{b['lane']}" for b in bindings],
-        "nodes": [b["node"] or "" for b in bindings],
-        "bindings": bindings,
+        "urls": [b["url"] for b in active],
+        "exit_keys": [b["exitIp"] or f"lane:{b['lane']}" for b in active],
+        "nodes": [b["node"] or "" for b in active],
+        "bindings": active,
+        "runtime_lanes": len(bindings),
+        "known_exits": len({v for v in (exit_by_node or {}).values() if v}),
     }
-    if runtime_lane_ports(data_dir):
-        urls = lane_proxy_urls(data_dir)
-        if not urls:
-            raise RuntimeUnavailableError(
-                "代理运行时的 lane 入口没有全部就绪，本次爬取未启动"
-            )
-        return urls
-    return [require_runtime_proxy_url(data_dir)]

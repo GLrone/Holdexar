@@ -449,14 +449,19 @@ async def exit_ip_check_pool(
     now: datetime,
     url: str = EXIT_IP_TARGET_URL,
     timeout: float = DEFAULT_L1_TIMEOUT,
+    names: tuple[str, ...] | None = None,
 ) -> tuple[ExitIpOutcome, ...]:
     """对池内节点**串行**做一次 L1 出口 IP 观测。
 
     成功 → `ProxyNode.exit_ip` + `HealthObservation(level="L1")`；
     失败 → 只落观测与 `detail`，**不动 `exit_ip`、不动 `state`**（一次目标服务
     故障不该擦掉已经观测到的出口事实）。
+
+    `names` 不给就取池文件当前节点；给了就只探这些——供调用方做**有界**首轮探测
+    （启动链不能为了出口身份把整池串行探完才开门）。
     """
-    names = _pool_names(data_dir)
+    if names is None:
+        names = _pool_names(data_dir)
     mixed_port = mixed_port_of(data_dir)
     rows = await session.execute(
         select(ProxyNode).where(ProxyNode.runtime_name.in_(names))

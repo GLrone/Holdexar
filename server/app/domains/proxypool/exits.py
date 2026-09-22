@@ -20,7 +20,7 @@
 """
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -145,3 +145,28 @@ def slots_to_plan(slots: Sequence[ExitSlot], ports: Sequence[int]) -> list[dict]
             "alternatives": list(slot.alternatives),
         })
     return plan
+
+
+async def exit_snapshot(session) -> dict[str, str]:
+    """当前出口身份快照：`runtime_name -> exit_ip`（只收已知出口的合格节点）。
+
+    run 的容量由它决定，不由上一次重建时写下的 lane 计划决定——L1 会持续刷新出口
+    身份，两份数据之间必然存在重建窗口，运行期必须以快照为准。
+    """
+    from app.domains.proxypool.pool import eligible_nodes
+
+    return {
+        node.runtime_name: str(node.exit_ip)
+        for node in await eligible_nodes(session)
+        if node.exit_ip
+    }
+
+
+def slot_signature(exit_by_node: Mapping[str, str] | None) -> tuple[str, ...]:
+    """快照签名（`出口 IP | 节点` 排序后的元组）：判断"出口身份是否变了"。
+
+    只比集合不比数量：换了一个节点但出口数不变同样要收敛（listener 绑定已经过期）。
+    """
+    if not exit_by_node:
+        return ()
+    return tuple(sorted(f"{v}|{k}" for k, v in exit_by_node.items() if v))

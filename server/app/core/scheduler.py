@@ -608,11 +608,20 @@ _BILLS_STAGGER = timedelta(minutes=2)
 
 
 async def _startup_pool_runtime() -> None:
-    """启动链的一步：首次建立池 Runtime（bootstrap 原语）。
+    """启动链的一步：首次建立池 Runtime（bootstrap 原语）+ **首轮出口身份发现**。
 
     **失败绝不让应用启动失败**：没有订阅 / 下载失败 / 解析失败 / 内核起不来，都只是
     "Runtime 不可用 → crawler 保持 fail-closed"，应用与调度器继续跑，30min 后的订阅
     刷新就是下一次 bootstrap 机会。否则会把"失败下周期再试"的设计自己破坏掉。
+
+    顺序是契约的一部分（本步在 `start_scheduler()` 之前，因此它跑完前不会有任何价格
+    刷新）：
+
+        bootstrap → Runtime ready → 有界 L1（建出口身份）
+                  → 出口集变化则重建（listener 数对齐出口槽）→ 交出 Runtime
+
+    少了中间两步，首次价格刷新会在"一个出口 IP 都没探到"的状态下开跑，容量模型退化
+    成按节点计（真实链路上出现过：首轮 job 的 `pool_exit_ip_count` 为 NULL）。
     """
     from datetime import datetime
 
@@ -620,21 +629,75 @@ async def _startup_pool_runtime() -> None:
     from app.core.database import get_session_factory
     from app.domains.proxies import clash_manager as _cm
     from app.domains.proxypool import bootstrap as _bs
+    from app.domains.proxypool import scheduling as _sched
+    from app.domains.proxypool.exits import slot_signature
+    from app.domains.proxypool.runtime import controller_endpoint_of
 
     try:
         data_dir = get_settings().data_dir
+        exe_path = str(_cm.kernel_exe(data_dir))
         async with get_session_factory()() as session:
             result = await _bs.ensure_pool_runtime(
                 session, data_dir=data_dir, runtime=_cm.pool_runtime,
-                exe_path=str(_cm.kernel_exe(data_dir)), now=datetime.now(),
+                exe_path=exe_path, now=datetime.now(),
             )
             await session.commit()
         logger.info(
             "[启动] 池 Runtime：%s（%s）",
             "ready" if result.ready else "unavailable", result.detail,
         )
+        if not result.ready:
+            return
+
+        # ── 首轮出口身份发现：只探没有 exit_ip 的节点，有界（节点数 + 时间预算）──
+        before = await _exit_snapshot_or_empty()
+        if before:
+            return  # 库里已有出口身份（重启场景）：不重复探测，交给维护周期刷新
+        base, secret = controller_endpoint_of(data_dir)
+        async with get_session_factory()() as session:
+            outcomes = await _sched.run_startup_l1(
+                session, data_dir=data_dir, controller_url=base, secret=secret,
+                now=datetime.now(),
+            )
+            await session.commit()
+        logger.info(
+            "[启动] 首轮 L1 出口身份发现：探 %d 个节点，成功 %d 个",
+            len(outcomes), sum(1 for o in outcomes if o.ok),
+        )
+        after = await _exit_snapshot_or_empty()
+        if slot_signature(after) == slot_signature(before):
+            return
+        # 出口集变了：当前 listener 数是按"还没有出口身份"时的节点数开的，必须重建一次
+        # 才能让工位数与出口槽一致（重建在启动链内，门已开、后台执行）
+        from app.domains.proxypool.scheduling import request_rebuild, run_pending_rebuild
+
+        request_rebuild()
+        async with get_session_factory()() as session:
+            rebuilt = await run_pending_rebuild(
+                session, data_dir=data_dir, controller_url=base, secret=secret,
+                runtime=_cm.pool_runtime, exe_path=exe_path,
+            )
+            await session.commit()
+        if rebuilt is not None:
+            logger.info(
+                "[启动] 出口身份建立后重建 Runtime：%d lane / %d 个已知出口",
+                len(rebuilt.lane_urls), len(rebuilt.lane_exits),
+            )
     except Exception:  # noqa: BLE001
         logger.exception("[启动] 池 Runtime bootstrap 失败（应用继续运行，crawler 保持不可用）")
+
+
+async def _exit_snapshot_or_empty() -> dict:
+    """当前出口身份快照；读不到返回空（启动链不该因观测失败而中断）。"""
+    from app.core.database import get_session_factory
+    from app.domains.proxypool.exits import exit_snapshot
+
+    try:
+        async with get_session_factory()() as session:
+            return await exit_snapshot(session)
+    except Exception:  # noqa: BLE001
+        logger.exception("[启动] 出口身份快照读取失败（按空处理）")
+        return {}
 
 
 async def _job_proxypool_cycle() -> None:

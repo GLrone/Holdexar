@@ -55,9 +55,20 @@ def db(tmp_path, monkeypatch):
 
 @pytest_asyncio.fixture(autouse=True)
 async def _schema(db):
+    # 进程内运行状态跨文件不隔离：占用（crawler/occupancy）与活动任务句柄是模块级
+    # 状态，别的测试文件留下的占用会让这里的 start_job 正确地拒绝启动——那会把
+    # 「占用生效」误报成「周期没跑」。进来前先清干净（与 test_proxypool_scheduling
+    # 的同名约定一致）。
+    from app.crawler.occupancy import crawler_busy, end_crawl
+
+    if crawler_busy():
+        end_crawl()
+    crawl_service._active = None
     async with db.kw["bind"].begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield
+    if crawler_busy():
+        end_crawl()
     crawl_service._active = None
     sched_mod._price_cycle_busy = False
 
@@ -85,6 +96,29 @@ def _crawl_env(monkeypatch):
         return {"available": 0}
 
     monkeypatch.setattr(proxies_service, "pool_stats", _pool_stats)
+
+    # 受管爬取的前置条件是「池 Runtime 可用 + 本次 run 有 active lane」（fail closed）。
+    # 这里给一份确定性的单 lane 计划——本文件断言的是周期编排本身，不是出口容量发现
+    # （后者由 test_proxypool_run_plan / test_proxypool_capacity 覆盖）。
+    import app.domains.proxypool.exits as pp_exits
+    import app.domains.proxypool.runtime as pp_runtime
+
+    monkeypatch.setattr(pp_runtime, "current_runtime_proxy_url",
+                        lambda _d=None: "http://127.0.0.1:1")
+
+    async def _snapshot(*_a, **_kw):
+        return {"n1": "1.1.1.1"}
+
+    monkeypatch.setattr(pp_exits, "exit_snapshot", _snapshot)
+
+    def _one_lane(_data_dir, **_kw):
+        binding = {"lane": 0, "url": "http://127.0.0.1:1",
+                   "exitIp": "1.1.1.1", "node": "n1"}
+        return {"urls": [binding["url"]], "exit_keys": [binding["exitIp"]],
+                "nodes": [binding["node"]], "bindings": [binding],
+                "runtime_lanes": 1, "known_exits": 1}
+
+    monkeypatch.setattr(pp_runtime, "lane_run_plan", _one_lane)
 
     async def _noop(*a, **kw):
         return 0
@@ -144,6 +178,13 @@ async def test_start_job_without_runtime_refuses_to_start(db, monkeypatch):
     _crawl_env(monkeypatch)
     # 确定性：不看本机是否有池 Runtime，直接声明"不可用"
     monkeypatch.setattr(pp_runtime, "current_runtime_proxy_url", lambda _d=None: None)
+
+    def _no_runtime(_d, **_kw):
+        from app.domains.proxypool.runtime import RuntimeUnavailableError
+
+        raise RuntimeUnavailableError("代理运行时不可用，本次爬取未启动")
+
+    monkeypatch.setattr(pp_runtime, "lane_run_plan", _no_runtime)
     with pytest.raises(RuntimeUnavailableError):
         await crawl_service.start_job(
             scope="appids", appids=[998001], kind="scheduled"
@@ -158,6 +199,13 @@ async def test_run_sequential_without_runtime_starts_nothing(db, monkeypatch):
 
     _crawl_env(monkeypatch)
     monkeypatch.setattr(pp_runtime, "current_runtime_proxy_url", lambda _d=None: None)
+
+    def _no_runtime(_d, **_kw):
+        from app.domains.proxypool.runtime import RuntimeUnavailableError
+
+        raise RuntimeUnavailableError("代理运行时不可用，本次爬取未启动")
+
+    monkeypatch.setattr(pp_runtime, "lane_run_plan", _no_runtime)
     results = await crawl_service.run_sequential(
         [{"scope": "appids", "appids": [998001], "kind": "scheduled"}],
     )
