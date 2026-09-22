@@ -41,7 +41,14 @@ def _clash_test_lock() -> asyncio.Lock:
         _clash_test_locks[loop] = lock
     return lock
 from . import clash_manager
-from .models import ClashNode, Proxy, ProxyEvent, ProxySubscription
+from .models import (
+    ADMISSION_ACTIVE,
+    ADMISSION_CANDIDATE,
+    ClashNode,
+    Proxy,
+    ProxyEvent,
+    ProxySubscription,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -828,7 +835,9 @@ async def migrate_legacy_subscription() -> None:
         if not exists:
             session.add(
                 ProxySubscription(
-                    kind="clash", url=legacy.strip(), created_at=_naive(get_beijing_time_obj())
+                    kind="clash", url=legacy.strip(),
+                    created_at=_naive(get_beijing_time_obj()),
+                    admission_status=ADMISSION_ACTIVE,
                 )
             )
             await session.commit()
@@ -854,6 +863,16 @@ async def list_subscriptions(kind: str | None = None) -> list[dict]:
             "deprecated": bool(s.deprecated),
             "deprecatedAt": s.deprecated_at.isoformat() if s.deprecated_at else None,
             "deprecatedReason": s.deprecated_reason,
+            # 生产准入（见 models.py 常量说明）：
+            # - clash：行上的 admission_status，缺失按 ACTIVE 呈现（历史行兼容）；
+            #   新订阅由 add_subscription 显式写成 CANDIDATE；
+            # - 非 clash（plain）：没有 Candidate 生命周期，一律呈现 ACTIVE
+            #   ——历史行哪怕曾被写成 CANDIDATE 也在这里归正。
+            "admissionStatus": (
+                (s.admission_status or ADMISSION_ACTIVE)
+                if s.kind == "clash"
+                else ADMISSION_ACTIVE
+            ),
         }
         for s in rows
     ]
@@ -887,7 +906,12 @@ async def add_subscription(kind: str, url: str, label: str | None = None) -> dic
 
     async with get_session_factory()() as session:
         sub = ProxySubscription(
-            kind=kind, url=url, label=label, created_at=_naive(get_beijing_time_obj())
+            kind=kind, url=url, label=label, created_at=_naive(get_beijing_time_obj()),
+            # clash 走候选准入（默认 CANDIDATE，显式写清意图）；明文订阅没有候选
+            # 观察期，直接 ACTIVE。
+            admission_status=(
+                ADMISSION_CANDIDATE if kind == "clash" else ADMISSION_ACTIVE
+            ),
         )
         session.add(sub)
         await session.commit()

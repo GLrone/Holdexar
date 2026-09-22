@@ -121,6 +121,23 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "deprecated": "BOOLEAN DEFAULT 0",
         "deprecated_at": "DATETIME",
         "deprecated_reason": "VARCHAR(200)",
+        "last_fetch_at": "DATETIME",
+        "last_fetch_status": "VARCHAR(32)",
+        "last_success_at": "DATETIME",
+        "last_error": "VARCHAR(500)",
+        "snapshot_sha256": "VARCHAR(64)",
+        "snapshot_version": "INTEGER DEFAULT 0",
+        # 生产准入（订阅级）：库层默认 ACTIVE —— **只为把已存在的历史行兼容成
+        # ACTIVE**；新行由模型默认 CANDIDATE（见 proxies/models.py 常量说明）。
+        "admission_status": "VARCHAR(16) DEFAULT 'ACTIVE'",
+    },
+    "subscription_snapshots": {
+        "url": "VARCHAR(500)",
+        # 模型里有、但更早建成的库里缺这 3 列：不登记则首次真实同步 INSERT 直接
+        # 报 "no column named http_status"。登记后启动幂等补齐。
+        "http_status": "INTEGER",
+        "content_type": "VARCHAR(100)",
+        "source_channel": "VARCHAR(32)",
     },
     # account 域多账号在线状态（GetPlayerSummaries/miniprofile 双通道）
     "steam_accounts": {
@@ -795,6 +812,7 @@ async def init_db() -> None:
     from app.domains.monitoring import models as _monitoring_models  # noqa: F401
     from app.domains.notifications import models as _notification_models  # noqa: F401
     from app.domains.proxies import models as _proxies_models  # noqa: F401
+    from app.domains.proxypool import models as _proxypool_models  # noqa: F401
     from app.domains.rates import models as _rates_models  # noqa: F401
     from app.domains.regions import models as _regions_models  # noqa: F401
     from app.domains.settings import models as _settings_models  # noqa: F401

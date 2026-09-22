@@ -102,6 +102,8 @@ def chain_calls(monkeypatch):
     monkeypatch.setattr(
         proxies_service, "maybe_run_clash_health_check", step("clash_health")
     )
+    # 池 Runtime bootstrap：链内以模块属性调用（`core_scheduler._startup_pool_runtime`）
+    monkeypatch.setattr(sched_mod, "_startup_pool_runtime", step("pool_runtime"))
 
     async def fake_gap_scan(**kwargs):
         calls.append("rates_gap_scan")
@@ -147,13 +149,13 @@ def chain_calls(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_chain_order_and_scheduler_last(db, chain_calls):
-    """全链顺序：种子 → … → 标记三连 + 系列归组 → 内核 → 自启 → 汇率 → 捆绑包预热 → Epic 预热 → 调度器收尾。"""
+    """全链顺序：种子 → … → 标记三连 + 系列归组 → 内核 → 自启 → 池 Runtime → 汇率 → 捆绑包预热 → Epic 预热 → 调度器收尾。"""
     await main_mod._post_startup_chain()
     expected = [
         "import_seed", "merge_seeds", "family_warm", "orphan_cleanup",
         "rates_cleanup", "legacy_sub_migrate", "legacy_kv_migrate",
         "hl_flags", "pp_flags", "sort_cache", "series_refresh",
-        "kernel_ensure", "clash_autostart", "clash_health",
+        "kernel_ensure", "clash_autostart", "clash_health", "pool_runtime",
         "rates_stale", "rates_gap_scan", "bundles_sort", "bundles_warm",
         "epic_preheat", "scheduler_start",
     ]

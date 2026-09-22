@@ -778,3 +778,7 @@ class ClashRuntime:
 
 
 runtime = ClashRuntime()
+# 池专用实例：与订阅功能那个 `runtime` 是**两套东西**——配置目录、`-d`、
+# controller、mixed-port、生命周期互不相干。共用实例会让一次池重建停掉订阅内核
+# （反之亦然），所以隔离必须是结构性的，不靠调用方自觉。
+pool_runtime = ClashRuntime()
