@@ -38,7 +38,7 @@ const crawl = {
 
   /* ── 启动爬取 ── */
   'crawl.start.desc':
-    '区服来自「我」页配置；新游戏首次入库不走打折预检，刷新场景可用预检省请求。',
+    '区服来自「设置」页配置；新游戏首次入库不走打折预检，刷新场景可用预检省请求。',
   'crawl.start.scopeWishlist': '监控池全量',
   'crawl.start.scopeAppids': '指定 AppID',
   'crawl.start.appidsPlaceholder': '例如 620,105600',

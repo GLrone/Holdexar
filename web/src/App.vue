@@ -168,40 +168,37 @@ const logo = computed(() =>
   themeStore.isDark ? '/assets/logo_dark.ico' : '/assets/logo_light.ico',
 )
 
-/* ── 侧边栏：按框架页分类方式分组（总览 / 资产库 / 监控中心 / 系统）──
+/* ── 侧边栏：按用户目的分三组——核心四入口（找游戏 / 游戏库 / 我的关注 /
+   价格提醒）+ 首页不带组名直接置顶；「更多」收具体业务功能；「系统」收
+   技术 / 维护入口。工具箱不进一级导航，入口在设置页（次级入口）──
    computed 包裹：语言切换时导航文案随词典重算 */
 const navGroups = computed<HlSideNavGroup[]>(() => [
   {
-    label: t('nav.group.overview'),
-    items: [{ label: t('nav.dashboard'), to: '/dashboard', icon: 'dashboard' }],
-  },
-  {
-    label: t('nav.group.assets'),
     items: [
+      { label: t('nav.dashboard'), to: '/dashboard', icon: 'dashboard' },
       { label: t('nav.library'), to: '/library', icon: 'store' },
-      { label: t('nav.bundles'), to: '/bundles', icon: 'package' },
       { label: t('nav.gamelib'), to: '/gamelib', icon: 'gamepad' },
-      { label: t('nav.achievements'), to: '/achievements', icon: 'trophy' },
-      { label: t('nav.family'), to: '/family', icon: 'home' },
-      { label: t('nav.bills'), to: '/bills', icon: 'list' },
+      { label: t('nav.pool'), to: '/pool', icon: 'target' },
+      { label: t('nav.alerts'), to: '/alerts', icon: 'bell' },
     ],
   },
   {
-    label: t('nav.group.monitor'),
+    label: t('nav.group.more'),
     items: [
-      { label: t('nav.pool'), to: '/pool', icon: 'target' },
-      { label: t('nav.crawl'), to: '/crawl', icon: 'refresh' },
-      { label: t('nav.proxies'), to: '/proxies', icon: 'monitor' },
-      { label: t('nav.alerts'), to: '/alerts', icon: 'bell' },
-      { label: t('nav.rates'), to: '/rates', icon: 'chart' },
+      { label: t('nav.bundles'), to: '/bundles', icon: 'package' },
+      { label: t('nav.family'), to: '/family', icon: 'home' },
+      { label: t('nav.bills'), to: '/bills', icon: 'list' },
+      { label: t('nav.achievements'), to: '/achievements', icon: 'trophy' },
     ],
   },
   {
     label: t('nav.group.system'),
     items: [
-      { label: t('nav.toolbox'), to: '/toolbox', icon: 'setting' },
+      { label: t('nav.proxies'), to: '/proxies', icon: 'monitor' },
+      { label: t('nav.crawl'), to: '/crawl', icon: 'refresh' },
+      { label: t('nav.rates'), to: '/rates', icon: 'chart' },
       { label: t('nav.logs'), to: '/logs', icon: 'terminal' },
-      // 「我」= 设置页，也是更新卡片的落点：有新版本且**提示开着**时这里亮红点
+      // 「设置」= 设置页，也是更新卡片的落点：有新版本且**提示开着**时这里亮红点
       // （提示关了 = 用户要求零打扰，红点也不能留）
       {
         label: t('nav.me'),

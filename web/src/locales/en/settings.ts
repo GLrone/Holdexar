@@ -127,6 +127,10 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.tour.desc': 'A spotlight walkthrough: add games → watch prices → set an alert — the three main steps, and the app is yours. Proxy and account binding are marked optional and can be skipped. It ran automatically on first launch — replay it any time.',
   'settings.tour.replay': 'Replay the tour',
 
+  'settings.section.toolbox': 'Toolbox',
+  'settings.toolbox.desc': 'Bill summaries, bulk CDK activation and other helper tools.',
+  'settings.toolbox.open': 'Open Toolbox',
+
   /* Result toasts */
   'settings.toast.accountSwitched': 'Active account switched',
   'settings.toast.accountUnbound': 'Unbound {name}',

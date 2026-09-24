@@ -72,11 +72,11 @@ const toolbox = {
   /* 未绑 Cookie 引导块 */
   'toolbox.cdk.needCookie.title': '激活需要 Steam 登录态 Cookie',
   'toolbox.cdk.needCookie.hint':
-    '在「我」页绑定 Cookie（或用「登录并自动获取」）后，此处直接批量激活',
-  'toolbox.cdk.needCookie.action': '前往「我」页绑定',
+    '在「设置」页绑定 Cookie（或用「登录并自动获取」）后，此处直接批量激活',
+  'toolbox.cdk.needCookie.action': '前往「设置」页绑定',
   /* 模块头部状态胶囊（账号下拉缺席时）与激活前的进度兜底文案，同一句 */
-  'toolbox.cdk.quotaMissing': '尚未绑定 Steam Cookie，激活前请先在「我」页绑定（激活需要登录态）',
-  'toolbox.cdk.bindFirst': '请先在「我」页绑定 Steam Cookie 再激活',
+  'toolbox.cdk.quotaMissing': '尚未绑定 Steam Cookie，激活前请先在「设置」页绑定（激活需要登录态）',
+  'toolbox.cdk.bindFirst': '请先在「设置」页绑定 Steam Cookie 再激活',
 
   /* 左栏：输入与进度 */
   'toolbox.cdk.input.title': '激活码输入（每行一个）',
