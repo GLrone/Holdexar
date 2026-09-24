@@ -10,27 +10,29 @@ const shell = {
      没有侧边栏入口，只为标题而存在。 */
   'nav.gameDetail': '游戏详情',
 
-  /* 侧边导航（App.vue navGroups） */
-  'nav.group.overview': '总览',
-  'nav.group.assets': '资产库',
-  'nav.group.monitor': '监控中心',
+  /* 侧边导航（App.vue navGroups）：核心组不带组名——首页 + 四个用户心智入口
+     （找游戏=发现 / 游戏库=拥有 / 我的关注=持续关注 / 价格提醒=主动通知）直接
+     置顶；「更多」收具体业务功能；「系统」收技术 / 维护入口（允许实现词）。
+     只改用户面叫法，route / store / API 名一律不动 */
+  'nav.group.more': '更多',
   'nav.group.system': '系统',
   'nav.dashboard': '仪表盘',
-  'nav.library': '游戏商店',
+  'nav.library': '找游戏',
   'nav.gamelib': '游戏库',
-  'nav.achievements': '成就殿堂',
+  'nav.achievements': '成就',
   'nav.bundles': '捆绑包',
-  'nav.pool': '监控池',
-  'nav.family': '我的家庭组',
-  'nav.bills': '账单分析',
+  'nav.pool': '我的关注',
+  'nav.family': '家庭',
+  'nav.bills': '账单',
   'nav.crawl': '任务',
-  'nav.proxies': '代理管理',
+  'nav.proxies': '网络',
   'nav.alerts': '价格提醒',
   'nav.rates': '汇率',
-  'nav.toolbox': '工具箱',
-  'nav.logs': '运行日志',
-  'nav.me': '我',
+  'nav.logs': '日志',
+  'nav.me': '设置',
   'nav.about': '关于',
+  // 工具箱不进一级导航（设置页提供次级入口），词条留给页面标题与设置页入口
+  'nav.toolbox': '工具箱',
 
   /* 顶栏价格更新状态胶囊：一个胶囊只表达一个产品结论，不带数量——内部计数
      的口径是任务批次（1 批 = 1 地区 × ≤400 款），不是游戏数，不得以「款」
@@ -45,7 +47,7 @@ const shell = {
 
   /* 顶栏钱包胶囊 + 余额弹层 */
   'wallet.bind': '绑定钱包',
-  'wallet.unboundTip': '未绑定 Steam Cookie，点击前往「我」页绑定',
+  'wallet.unboundTip': '未绑定 Steam Cookie，点击前往「设置」页绑定',
   'wallet.titleMain': '主账号钱包余额：{balance}',
   'wallet.titleMore': '（点击查看全部账号余额）',
   'wallet.titleSynced': ' · 同步于 {time}',

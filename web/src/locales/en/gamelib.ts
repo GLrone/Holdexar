@@ -24,7 +24,7 @@ const gamelib = {
   'gamelib.empty.loading': 'Loading owned games…',
   'gamelib.empty.error': 'Failed to load: {err}',
   'gamelib.empty.noAccounts': 'No accounts to show yet',
-  'gamelib.empty.noAccountsHint': 'Bind a Steam Cookie on the Me page, or add members in the family group — owned games will show up here',
+  'gamelib.empty.noAccountsHint': 'Bind a Steam Cookie on the Settings page, or add members in the family group — owned games will show up here',
   'gamelib.empty.noGames': 'No owned games recorded for this account',
   'gamelib.empty.noGamesHint': 'Either not synced yet, or owned-game sync is off for this account',
   'gamelib.empty.noMatch': 'No games match the current filters',

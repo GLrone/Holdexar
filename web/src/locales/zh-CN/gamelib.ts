@@ -23,7 +23,7 @@ const gamelib = {
   'gamelib.empty.loading': '账户已购数据拉取中…',
   'gamelib.empty.error': '拉取失败：{err}',
   'gamelib.empty.noAccounts': '还没有可展示的账户',
-  'gamelib.empty.noAccountsHint': '在「我」页绑定 Steam Cookie，或在家庭组添加成员后，这里会汇总每个账号的拥有游戏',
+  'gamelib.empty.noAccountsHint': '在「设置」页绑定 Steam Cookie，或在家庭组添加成员后，这里会汇总每个账号的拥有游戏',
   'gamelib.empty.noGames': '该账号暂无已购游戏数据',
   'gamelib.empty.noGamesHint': '可能是尚未同步，或该账号的已购同步未开启',
   'gamelib.empty.noMatch': '没有符合筛选的游戏',

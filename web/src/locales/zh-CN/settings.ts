@@ -140,6 +140,11 @@ const settings = {
   'settings.tour.desc': '蒙层聚光式导览：添加游戏 → 看价格 → 设提醒，三步主线走完就能用起来；代理与账号绑定标为可选，可整个跳过。首次启动已自动展示过，可随时重新查看。',
   'settings.tour.replay': '重新查看导览',
 
+  /* 工具箱次级入口（工具箱已移出一级导航，设置页是其常驻入口） */
+  'settings.section.toolbox': '工具箱',
+  'settings.toolbox.desc': '账单消费摘要与 CDK 批量激活等辅助能力。',
+  'settings.toolbox.open': '打开工具箱',
+
   /* ── 结果提示（一条整句；中英语序不同，不拆片段）── */
   'settings.toast.accountSwitched': '已切换当前账号',
   'settings.toast.accountUnbound': '已解绑 {name}',

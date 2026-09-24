@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 
 import { currencyName } from '@/api/currencies'
 import {
@@ -38,6 +39,12 @@ const updaterStore = useUpdaterStore()
 /* 产品导览手动重开（首次启动已自动弹过）：开的是 App.vue 里那个全局实例，
    本页不自己挂浮层——页面实例会被导览第一步的 router.push 卸载 */
 const tour = useTourStore()
+
+/* 工具箱次级入口：工具箱已移出一级导航，这里是其常驻入口 */
+const router = useRouter()
+function openToolbox() {
+  void router.push('/toolbox')
+}
 
 const steamId = ref('')
 const apiKeyInput = ref('')
@@ -1104,6 +1111,14 @@ onMounted(() => {
         <div class="section-title">{{ t('settings.section.tour') }}</div>
         <div class="section-desc">{{ t('settings.tour.desc') }}</div>
         <HlButton size="sm" @click="tour.show()">{{ t('settings.tour.replay') }}</HlButton>
+      </div>
+
+      <!-- 工具箱次级入口：工具箱不进一级导航，页内能力（账单摘要 / CDK 激活）
+           从这里到达；路由与页面保留 -->
+      <div class="card settings-card" data-section="settings.section.toolbox">
+        <div class="section-title">{{ t('settings.section.toolbox') }}</div>
+        <div class="section-desc">{{ t('settings.toolbox.desc') }}</div>
+        <HlButton size="sm" @click="openToolbox">{{ t('settings.toolbox.open') }}</HlButton>
       </div>
     </template>
 

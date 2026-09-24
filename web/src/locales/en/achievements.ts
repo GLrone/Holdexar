@@ -92,7 +92,7 @@ const achievements: Partial<Record<MessageKey, string>> = {
 
   'achievements.empty.noCredential': 'No Steam credential bound',
   'achievements.empty.noCredentialHint':
-    'Bind your Steam cookie on the profile page to sync; with a Web API Key details come from official APIs and other accounts can be viewed too',
+    'Bind your Steam cookie on the Settings page to sync; with a Web API Key details come from official APIs and other accounts can be viewed too',
   'achievements.empty.goSettings': 'Open profile settings',
   'achievements.empty.noData': 'No achievement data yet',
   'achievements.empty.noDataHint': 'Click "Sync achievements" to fetch your achievements and playtime',

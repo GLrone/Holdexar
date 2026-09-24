@@ -64,11 +64,11 @@ const toolbox: Partial<Record<MessageKey, string>> = {
 
   'toolbox.cdk.needCookie.title': 'Activation needs a signed-in Steam cookie',
   'toolbox.cdk.needCookie.hint':
-    'Link a cookie on the Me page (or use “Sign in and fetch automatically”) and activate in bulk right here',
-  'toolbox.cdk.needCookie.action': 'Link it on the Me page',
+    'Link a cookie on the Settings page (or use “Sign in and fetch automatically”) and activate in bulk right here',
+  'toolbox.cdk.needCookie.action': 'Link it on the Settings page',
   'toolbox.cdk.quotaMissing':
-    'No Steam cookie linked yet — link one on the Me page before activating (activation needs a signed-in session)',
-  'toolbox.cdk.bindFirst': 'Link a Steam cookie on the Me page before activating',
+    'No Steam cookie linked yet — link one on the Settings page before activating (activation needs a signed-in session)',
+  'toolbox.cdk.bindFirst': 'Link a Steam cookie on the Settings page before activating',
 
   /* Input and progress */
   'toolbox.cdk.input.title': 'Activation keys (one per line)',

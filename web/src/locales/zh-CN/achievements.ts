@@ -102,8 +102,8 @@ const achievements = {
   /* ── 空态 ── */
   'achievements.empty.noCredential': '尚未绑定 Steam 凭证',
   'achievements.empty.noCredentialHint':
-    '在「我」页绑定 Steam Cookie 即可同步；配上 Web API Key 后明细走官方接口，还能查看其他账号的成就',
-  'achievements.empty.goSettings': '前往「我」页',
+    '在「设置」页绑定 Steam Cookie 即可同步；配上 Web API Key 后明细走官方接口，还能查看其他账号的成就',
+  'achievements.empty.goSettings': '前往「设置」页',
   'achievements.empty.noData': '还没有成就数据',
   'achievements.empty.noDataHint': '点击「同步成就」拉取你的成就与游玩时长',
   'achievements.empty.noMatch': '没有匹配的游戏',
