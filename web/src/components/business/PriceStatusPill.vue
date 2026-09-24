@@ -4,8 +4,9 @@
  * 部分更新 / 等待更新。
  *
  * 数据来源固定为两处：crawlStatus store（SSE 的运行数据）与「是否有过跑完的
- * 任务」。不新建状态体系，也不把内部 job / 队列 / 速度 / 代理放进主状态与
- * 普通 tooltip（技术诊断入口另说）。
+ * 任务」。store 计数的口径是任务批次（1 批 = 1 地区 × ≤400 款），不是游戏数，
+ * 因此主状态与 tooltip 都不展示数量。不新建状态体系，也不把内部 job / 队列 /
+ * 速度 / 代理放进主状态与普通 tooltip（技术诊断入口另说）。
  */
 import { computed, onMounted, ref, watch } from 'vue'
 
@@ -50,10 +51,10 @@ onMounted(async () => {
   }
 })
 
-const status = computed(() =>
+const kind = computed(() =>
   priceStatusOf({
     running: crawl.running,
-    done: crawl.done,
+    ok: crawl.ok,
     fail: crawl.fail,
     total: crawl.total,
     lastStatus: lastJobStatus.value,
@@ -62,18 +63,16 @@ const status = computed(() =>
 )
 
 const label = computed(() => {
-  const s = status.value
-  switch (s.kind) {
+  switch (kind.value) {
     case 'running':
-      return s.total > 0
-        ? t('header.crawlRunning', { done: s.done, total: s.total })
-        : t('header.crawlRunningBare')
+      return t('header.crawlRunning')
     case 'partial':
-      return t('header.crawlPartial', { done: s.done, total: s.total })
+      return t('header.crawlPartial')
     case 'done':
-      return t('header.crawlDone', { done: s.done, total: s.total })
     case 'idle':
-      return t('header.crawlIdle')
+      return t('header.crawlDone')
+    case 'waiting':
+      return t('header.crawl')
     default:
       return t('header.crawl')
   }
@@ -81,7 +80,7 @@ const label = computed(() => {
 
 /** 颜色只表达状态：进行中=强调色，部分=待处理色，已更新=正常色，未更新=弱化 */
 const color = computed(() => {
-  switch (status.value.kind) {
+  switch (kind.value) {
     case 'running':
       return 'var(--accent)'
     case 'partial':
@@ -94,17 +93,17 @@ const color = computed(() => {
   }
 })
 
-/** 悬停补充信息：只补结果与影响（数量 / 稍后自动重试），不补实现细节 */
+/** 悬停补充信息：只补结论与出路，不带数量（内部计数是批次口径，非游戏数） */
 const tip = computed(() => {
-  const s = status.value
-  if (s.kind === 'running') return ''
-  if (s.kind === 'partial') {
-    return s.retry > 0
-      ? t('header.crawlTip', { done: s.done, fail: s.retry })
-      : t('header.crawlTipDone', { done: s.done })
+  switch (kind.value) {
+    case 'partial':
+      return t('header.crawlTip')
+    case 'done':
+    case 'idle':
+      return t('header.crawlTipDone')
+    default:
+      return ''
   }
-  if (s.kind === 'done') return t('header.crawlTipDone', { done: s.done })
-  return ''
 })
 </script>
 
