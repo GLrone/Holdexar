@@ -5,82 +5,84 @@ import { priceStatusOf } from '../src/lib/headerStatus.ts'
 import en from '../src/locales/en/shell.ts'
 import zh from '../src/locales/zh-CN/shell.ts'
 
-const base = { running: false, done: 0, fail: 0, total: 0, hasHistory: false }
+const base = { running: false, ok: 0, fail: 0, total: 0, hasHistory: false }
 
-test('priceStatusOf：正在跑 → running（目标量未知时 total=0，标签退化为无分子分母）', () => {
-  assert.equal(priceStatusOf({ ...base, running: true }).kind, 'running')
+test('priceStatusOf：正在跑 → running（不产出任何数量）', () => {
+  assert.equal(priceStatusOf({ ...base, running: true }), 'running')
   assert.equal(
-    priceStatusOf({ ...base, running: true, done: 24, total: 71 }).kind,
+    priceStatusOf({ ...base, running: true, ok: 24, fail: 3, total: 71 }),
     'running',
   )
 })
 
-test('priceStatusOf：跑完且本轮零失败 → done（带本轮分子分母）', () => {
-  const s = priceStatusOf({ ...base, done: 71, total: 71, hasHistory: true })
-  assert.equal(s.kind, 'done')
-  assert.equal(s.done, 71)
-  assert.equal(s.total, 71)
-  assert.equal(s.retry, 0)
+test('priceStatusOf：全部成功 → done（success=5 failed=0 不得判成 partial）', () => {
+  assert.equal(priceStatusOf({ ...base, ok: 5, fail: 0, total: 5, hasHistory: true }), 'done')
+  assert.equal(priceStatusOf({ ...base, ok: 71, fail: 0, total: 71, hasHistory: true }), 'done')
 })
 
-test('priceStatusOf：跑完但有失败 → partial（不表达成「更新失败」，且给出稍后重试款数）', () => {
-  const s = priceStatusOf({ ...base, done: 68, total: 71, fail: 3, hasHistory: true })
-  assert.equal(s.kind, 'partial')
-  assert.equal(s.retry, 3)
-  assert.equal(s.done, 68)
+test('priceStatusOf：全部失败 → partial（success=0 failed=5 绝不得判成 done）', () => {
+  assert.equal(priceStatusOf({ ...base, ok: 0, fail: 5, total: 5, hasHistory: true }), 'partial')
+})
+
+test('priceStatusOf：部分失败 → partial（不表达成「更新失败」）', () => {
+  assert.equal(
+    priceStatusOf({ ...base, ok: 68, fail: 3, total: 71, hasHistory: true }),
+    'partial',
+  )
 })
 
 test('priceStatusOf：本轮没跑完就停了 → partial（不得声称「价格已更新」）', () => {
   assert.equal(
-    priceStatusOf({ ...base, done: 2, total: 4, lastStatus: 'stopped' }).kind,
+    priceStatusOf({ ...base, ok: 2, fail: 0, total: 4, lastStatus: 'stopped' }),
     'partial',
   )
   assert.equal(
-    priceStatusOf({ ...base, done: 2, total: 4, lastStatus: 'failed' }).kind,
+    priceStatusOf({ ...base, ok: 2, fail: 0, total: 4, lastStatus: 'failed' }),
     'partial',
   )
   // 同一个进度若无失败也无中断终态，才是完成
   assert.equal(
-    priceStatusOf({ ...base, done: 4, total: 4, lastStatus: 'done' }).kind,
+    priceStatusOf({ ...base, ok: 4, fail: 0, total: 4, lastStatus: 'done' }),
     'done',
   )
 })
 
+test('priceStatusOf：有失败但目标量未知也 → partial（不得回落成已更新/等待更新）', () => {
+  assert.equal(priceStatusOf({ ...base, ok: 0, fail: 3, total: 0, hasHistory: true }), 'partial')
+})
+
 test('priceStatusOf：活动过后（hasHistory）不得回落成 waiting', () => {
-  assert.equal(priceStatusOf({ ...base, hasHistory: true }).kind, 'idle')
+  assert.equal(priceStatusOf({ ...base, hasHistory: true }), 'idle')
   assert.equal(
-    priceStatusOf({ ...base, hasHistory: true, lastStatus: 'done' }).kind,
+    priceStatusOf({ ...base, hasHistory: true, lastStatus: 'done' }),
     'idle',
   )
-  assert.equal(priceStatusOf({ ...base, hasHistory: false }).kind, 'waiting')
+  assert.equal(priceStatusOf({ ...base, hasHistory: false }), 'waiting')
 })
 
 test('priceStatusOf：没有活动——有历史 → idle，从没跑过 → waiting', () => {
-  assert.equal(priceStatusOf({ ...base, hasHistory: true }).kind, 'idle')
-  assert.equal(priceStatusOf(base).kind, 'waiting')
+  assert.equal(priceStatusOf({ ...base, hasHistory: true }), 'idle')
+  assert.equal(priceStatusOf(base), 'waiting')
 })
 
-test('priceStatusOf：异常数值不产生负进度或 NaN 分母', () => {
-  const s = priceStatusOf({
-    running: false,
-    done: Number.NaN,
-    fail: -2,
-    total: Number.POSITIVE_INFINITY,
-    hasHistory: true,
-  })
-  assert.equal(s.done, 0)
-  assert.equal(s.retry, 0)
-  assert.equal(s.total, 0)
-  assert.equal(s.kind, 'idle')
+test('priceStatusOf：异常数值不改变结论，只返回状态字符串', () => {
+  assert.equal(
+    priceStatusOf({
+      running: false,
+      ok: Number.NaN,
+      fail: -2,
+      total: Number.POSITIVE_INFINITY,
+      hasHistory: true,
+    }),
+    'idle',
+  )
 })
 
-test('顶栏词条：主状态与补充信息不含内部术语（爬取 / 队列 / 速度 / worker / job / 代理）', () => {
+test('顶栏词条：主状态与补充信息不含内部术语与批次推导数量（爬取 / 队列 / 款 / games …）', () => {
   const keys = [
     'header.crawl',
     'header.crawlRunning',
-    'header.crawlRunningBare',
     'header.crawlDone',
-    'header.crawlIdle',
     'header.crawlPartial',
     'header.crawlTip',
     'header.crawlTipDone',
@@ -92,6 +94,8 @@ test('顶栏词条：主状态与补充信息不含内部术语（爬取 / 队�
     '空闲',
     '节点',
     '代理',
+    // 内部计数口径是任务批次，不是游戏数——不得以「款 / games」出现在用户面
+    '款',
     'crawl',
     'queue',
     'qsize',
@@ -100,6 +104,7 @@ test('顶栏词条：主状态与补充信息不含内部术语（爬取 / 队�
     'job',
     'proxy',
     'idle',
+    'games',
   ]
   for (const dict of [zh, en] as Record<string, string>[]) {
     for (const key of keys) {
@@ -108,7 +113,7 @@ test('顶栏词条：主状态与补充信息不含内部术语（爬取 / 队�
       for (const word of forbidden) {
         assert.ok(
           !value.includes(word),
-          `${key} 命中内部术语「${word}」：${value}`,
+          `${key} 命中禁词「${word}」：${value}`,
         )
       }
     }
