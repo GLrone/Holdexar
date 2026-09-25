@@ -40,6 +40,8 @@ def _sanitize_db_lru_caches():
     if not bind_url or bind_url != expected:
         orig_engine.cache_clear()
         orig_factory.cache_clear()
+    # settings 缓存同样会跨文件外溢（夹具在环境还原前清过、随后又被读回）
+    database_module.get_settings.cache_clear()
 
 
 @pytest.fixture(autouse=True)
@@ -93,3 +95,23 @@ if _env_file.is_file():
             continue
         _key, _, _value = _line.partition("=")
         os.environ.setdefault(_key.strip(), _value.strip())
+
+
+@pytest.fixture(autouse=True)
+def _db_caches_fresh_before_each(_sanitize_db_lru_caches):
+    """开测前再验一次：上一文件的 teardown 清缓存后仍可能留下指向临时目录
+    的缓存工厂（teardown 清缓存发生在环境还原之前，检查与还原的先后在
+    某些夹具组合下会漏）。发现缓存库 ≠ 当前配置库就地清除，本用例从
+    真实配置库重建。"""
+    from app.core import database as database_module
+
+    expected = str(database_module.get_settings().db_url)
+    bind = getattr(
+        getattr(database_module.get_session_factory(), "kw", {}),
+        "get",
+        lambda *_: None,
+    )("bind")
+    bind_url = str(getattr(bind, "url", "") or "")
+    if not bind_url or bind_url != expected:
+        database_module.get_engine.cache_clear()
+        database_module.get_session_factory.cache_clear()
