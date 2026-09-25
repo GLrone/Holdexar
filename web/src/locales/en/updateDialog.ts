@@ -3,7 +3,8 @@
 export default {
   'updateDialog.title': 'App Update',
   'updateDialog.entry': 'Update',
-  'updateDialog.entryTip': 'A new version is available — open the update report',
+  'updateDialog.entryTip': 'Check for app updates',
+  'updateDialog.checkNow': 'Check for updates',
   'updateDialog.notesTitle': "What's new in v{version}",
   'updateDialog.notesEmpty': 'This version ships no release notes',
   'updateDialog.releaseDate': 'Released {date}',
