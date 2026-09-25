@@ -134,7 +134,7 @@ Country.mmdb   数据来源 MaxMind GeoLite2
                This product includes GeoLite2 data created by MaxMind,
                available from https://www.maxmind.com
 
-mihomo 以独立进程运行（非链接、非派生），本项目自身以 MIT 分发；
+mihomo 以独立进程运行（非链接、非派生），本项目自身以 GPL-3.0 分发；
 对应源码即上游仓库上述地址，二进制未做任何修改。
 """
 

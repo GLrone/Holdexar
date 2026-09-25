@@ -55,9 +55,9 @@ a = Analysis(
         (os.path.join(ROOT, "assets", "clash"), "clash"),
         (os.path.join(SERVER, "app"), os.path.join("server", "app")),
         ("app.ico", "."),
-        # 许可与第三方声明随包分发：MIT 的正文要求「副本或实质部分中须包含版权
-        # 声明与许可」，包内那些 dist-info 只覆盖各自的依赖，本项目自己的 LICENSE
-        # 与聚合声明此前一个都没进包——等于发出去一份没有许可的软件。
+        # 许可与第三方声明随包分发：GPL-3.0 要求实体副本随附许可原文（§4），
+        # 包内那些 dist-info 只覆盖各自的依赖，本项目自己的 LICENSE 与聚合
+        # 声明必须单独入包，缺了等于发出去一份没有许可的软件。
         (os.path.join(ROOT, "LICENSE"), "."),
         (os.path.join(ROOT, "docs", "THIRD_PARTY_NOTICES.md"), "."),
     ],

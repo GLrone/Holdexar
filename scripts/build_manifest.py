@@ -140,7 +140,7 @@ def build_scoop(version: str, zip_path: Path, zip_sha: str) -> dict:
         "homepage": f"https://github.com/{GITHUB_REPO}",
         # 与本仓库 LICENSE 一致——渠道清单是公开的，声明错了等于对外发一份
         # 错误的许可证声明。
-        "license": "MIT",
+        "license": "GPL-3.0-only",
         "architecture": {
             "64bit": {
                 "url": asset_url(zip_path.name, tag),

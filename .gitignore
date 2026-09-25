@@ -18,7 +18,7 @@
 desktop/__pycache__/
 
 # ── 文档 ──
-# 上传的说明文档只保留 README.md 与 LICENSE（MIT），其余全部本地保留：
+# 上传的说明文档只保留 README.md 与 LICENSE（GPL-3.0），其余全部本地保留：
 # docs/ 整体屏蔽——DEV_LOG.md 含完整的绕行参数与内部档案，计划/交接/复盘
 # 文档同属内部资料；THIRD_PARTY_NOTICES.md 仍随发布包分发（构建合规所需），
 # 只是不再随仓库公开。AGENTS.md / CONTRIBUTING.md / SECURITY.md 同为本地
