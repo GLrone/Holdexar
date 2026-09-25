@@ -89,8 +89,17 @@ _ACCOUNT_STEAMID_RE = re.compile(
 # 这是账户真实商店区的权威信号（cookie 的 steamCountry 会被代理出口 IP 污染）。
 _REGION_NOTE_RE = re.compile(r"（([^，）]{2,6})、(\d{1,2})）")
 
-# 登录态 Steam Cookie 的最小集合（其余字段对余额查询无意义）
-_STEAM_COOKIE_KEYS = ("sessionid", "steamCountry", "steamLoginSecure")
+# 登录态 Steam Cookie 的最小集合（其余字段对余额查询无意义）。
+# steamRefresh_steam 是续期凭据：访问令牌（steamLoginSecure）寿命约 24 小时，
+# 丢掉它登录态就只能在一天内可用（续期见 session.py）；steamRememberLogin
+# 记录登录时是否勾选「记住我」，用于判断续期凭据为何缺席。
+_STEAM_COOKIE_KEYS = (
+    "sessionid",
+    "steamCountry",
+    "steamLoginSecure",
+    "steamRefresh_steam",
+    "steamRememberLogin",
+)
 
 
 class WalletFetchError(RuntimeError):
@@ -142,10 +151,12 @@ def parse_cookie_str(cookies_raw: str) -> dict[str, str]:
 
 
 def filter_login_cookies(cookies_raw: str) -> str:
-    """收窄为登录态三件套（sessionid / steamCountry / steamLoginSecure）。
+    """收窄为登录态 Cookie（sessionid / steamCountry / steamLoginSecure
+    / steamRefresh_steam / steamRememberLogin）。
 
     面积最小化：既避免无关 Cookie（浏览偏好等）入库，也便于用户粘贴整段
-    浏览器 Cookie 后自动规整。
+    浏览器 Cookie 后自动规整。续期凭据必须留下——只存访问令牌的登录态
+    24 小时后即失效，且无法自动恢复。
     """
     jar = parse_cookie_str(cookies_raw)
     keep = [f"{k}={jar[k]}" for k in _STEAM_COOKIE_KEYS if jar.get(k)]

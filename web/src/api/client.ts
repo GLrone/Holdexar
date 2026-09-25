@@ -240,6 +240,12 @@ export interface SteamAccountItem {
   bound_at: string | null
   wallet: WalletSnapshot | null
   wallet_error: string
+  /** 登录态是否已过期（访问令牌到期且未能自动续期；has_cookie 仍为真） */
+  session_expired: boolean
+  /** 访问令牌到期时刻（北京时间 ISO；null = 无法判定） */
+  session_expires_at: string | null
+  /** 是否留有自动续期凭据（登录时勾选「记住我」才有） */
+  session_has_refresh: boolean
   wishlist_count: number
   game_count: number
   /** 30 分钟窗口内已用激活次数（后端进程计数） */
@@ -265,6 +271,10 @@ export interface AccountStatus {
   accounts: SteamAccountItem[]
   /** 主账号 SteamID64（第一个绑定的） */
   primary_steam_id: string
+  /** 登录态：has_cookie 只表示"绑过"，能否继续用看下面三项 */
+  session_expired: boolean
+  session_expires_at: string | null
+  session_has_refresh: boolean
   /** 当前账号 Steam 真实在线状态（顶栏头像 dot 数据源） */
   is_online: boolean
   /** 当前账号正在玩的游戏名 */

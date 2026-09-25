@@ -313,6 +313,10 @@ async function manualRefreshWallet() {
   const w = accountStore.status?.wallet
   if (w?.check_ok) {
     message.success(t('wallet.toastRefreshed', { balance: w.balance_display }))
+  } else if (accountStore.status?.session_expired) {
+    // 登录态过期：能自愈的走续期提示，只有用户能解的才要求重新登录
+    if (accountStore.status?.session_has_refresh) message.error(t('wallet.toastRenewing'))
+    else message.error(t('wallet.toastExpired'))
   } else {
     message.error(accountStore.status?.sync_error || t('wallet.toastFailed'))
   }

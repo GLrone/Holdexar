@@ -34,7 +34,7 @@ const settings = {
   'settings.section.tour': '新手教程',
 
   /* ── Steam 账户绑定卡片 ── */
-  'settings.steam.desc': '绑定后展示钱包余额（右上角）与账号结算币种/地区。Cookie 仅保留 sessionid / steamCountry / steamLoginSecure 三项，明文只存本机数据库。',
+  'settings.steam.desc': '绑定后展示钱包余额（右上角）与账号结算币种/地区。Cookie 只保留登录态字段（含用于自动续期的 steamRefresh_steam），明文只存本机数据库。',
   'settings.steam.cookiePlaceholder': '粘贴含 steamLoginSecure 的 Cookie（支持整行 / 换行格式，自动整理）',
   'settings.steam.cookiePlaceholderBound': '当前账号已绑定（{identity}），粘贴其他账号可新增绑定',
   'settings.steam.autoFetch': '登录并自动获取',
@@ -49,10 +49,16 @@ const settings = {
   'settings.steam.guideStep2': '按 <kbd>F12</kbd> 打开开发者工具，切到 <b>网络（Network）</b> 标签，按 <kbd>F5</kbd> 刷新页面。',
   'settings.steam.guideStep3': '点击列表中<b>第一条请求</b>（通常是商店页本身），在右侧「请求标头（Request Headers）」里找到 <code>Cookie:</code> 开头的一整行，<b>右键 → 复制值</b>（很长，必须整行复制）。',
   'settings.steam.guideStep4': '回到本页粘贴到上方输入框点「绑定」。整行带 <code>Cookie:</code> 前缀、或从 Application → Cookies 里逐条复制的换行格式都能自动识别整理。',
-  'settings.steam.guideNotes': '只需 sessionid / steamCountry / steamLoginSecure 三项（保存时自动收窄，其余丢弃）；Cookie 明文只存本机数据库。浏览器退出 Steam 登录后绑定会失效，需重新绑定。',
+  'settings.steam.guideNotes': '登录态保留 sessionid / steamCountry / steamLoginSecure 与 steamRefresh_steam（续期凭据，登录 Steam 时勾选「记住我」才有）；保存时自动收窄，其余丢弃。Cookie 明文只存本机数据库。留有续期凭据时登录态自动续期，退出 Steam 登录后绑定才失效。',
 
   /* 绑定后的多账号列表 */
   'settings.steam.mismatchWarn': '当前账号的 SteamID 与上方保存的 SteamID64 不一致，请核对是否同一账号',
+  'settings.steam.sessionExpiredWarn': 'Steam 登录已过期，且没有自动续期凭据（登录 Steam 时未勾选「记住我」）：点上方「登录并自动获取」重新登录并勾选「记住我」，或按下方引导重新粘贴 Cookie。',
+  'settings.steam.sessionRenewingWarn': 'Steam 登录正在自动续期：通常几分钟内恢复，无需操作；若长时间如此，请点上方「登录并自动获取」重新登录。',
+  'settings.steam.syncExpired': '登录已过期',
+  'settings.steam.syncRenewing': '正在续期',
+  'settings.steam.syncTipExpired': 'Steam 登录已过期，需在设置页重新登录（「登录并自动获取」）',
+  'settings.steam.syncTipRenewing': 'Steam 登录已过期，正在自动续期（失败会自动重试）',
   'settings.steam.syncOk': '同步正常',
   'settings.steam.syncFail': '同步失败',
   'settings.steam.syncIdle': '未同步',
@@ -165,6 +171,7 @@ const settings = {
   'settings.toast.bindSuccess': '绑定成功，钱包余额 {balance}',
   'settings.toast.bindSyncFailed': 'Cookie 已保存，但抓取余额失败：{error}',
   'settings.toast.cookieSaved': 'Cookie 已保存',
+  'settings.toast.noRefreshToken': '已保存，但登录时未勾选「记住我」：这份登录态约一天后到期，请勾选后重新登录',
   'settings.toast.cookieEmpty': '请先粘贴 Cookie',
   'settings.toast.desktopOnly': '自动获取仅桌面窗口模式可用；浏览器环境请按下方引导手动粘贴',
   'settings.toast.loginOpened': '已打开 Steam 登录窗口，登录成功后会自动返回…',

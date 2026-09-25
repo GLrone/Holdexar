@@ -62,15 +62,34 @@ const accounts = computed(() => accountStore.accounts)
 const activeAccount = computed(() => accountStore.active)
 const hasCookie = computed(() => accountStore.status?.has_cookie ?? false)
 const mismatch = computed(() => accountStore.status?.mismatch ?? false)
+/** 当前账号登录态已过期（访问令牌到期）；是否还需用户动手看 session_has_refresh */
+const sessionExpired = computed(() => accountStore.status?.session_expired ?? false)
+/** 留有续期凭据：过期后系统会自行续期，用户不必立刻重新登录 */
+const sessionHasRefresh = computed(() => accountStore.status?.session_has_refresh ?? false)
 
 /** active 账号的钱包（顶层 wallet 与 active 一致） */
 const wallet = computed(() => accountStore.status?.wallet ?? null)
 
-/* 每账号同步状态：wallet_error 非空 = 最近一次同步失败（错误详情收进悬停
-   提示，不占行内空间）；无钱包快照 = 尚未同步。wallet.checked_at 在失败时
-   是失败尝试的时间，成功时是上次成功同步的时间。 */
+/* 每账号同步状态：登录过期优先于同步结果（过期的账号余额本就抓不到）；
+   wallet_error 非空 = 最近一次同步失败（错误详情收进悬停提示，不占行内空间）；
+   无钱包快照 = 尚未同步。wallet.checked_at 在失败时是失败尝试的时间，
+   成功时是上次成功同步的时间。 */
 type SyncTone = 'ok' | 'fail' | 'idle'
 function syncStateOf(acc: SteamAccountItem): { tone: SyncTone; label: string; tip: string } {
+  if (acc.session_expired) {
+    // 有续期凭据 = 系统自己在续，不需要用户动作（给中性态 + 兜底出路）
+    return acc.session_has_refresh
+      ? {
+          tone: 'idle',
+          label: t('settings.steam.syncRenewing'),
+          tip: t('settings.steam.syncTipRenewing'),
+        }
+      : {
+          tone: 'fail',
+          label: t('settings.steam.syncExpired'),
+          tip: t('settings.steam.syncTipExpired'),
+        }
+  }
   if (!acc.wallet) {
     return { tone: 'idle', label: t('settings.steam.syncIdle'), tip: t('settings.steam.syncTipIdle') }
   }
@@ -346,6 +365,10 @@ function reportBindResult() {
   } else {
     message.success(t('settings.toast.cookieSaved'))
   }
+  // 没有续期凭据 = 这份登录态约一天后到期（登录 Steam 时未勾选「记住我」）
+  if (status?.has_cookie && status.session_has_refresh === false) {
+    message.warning(t('settings.toast.noRefreshToken'))
+  }
 }
 
 /* ── 绑定风险弹窗 ────────────────────────────────────────────
@@ -480,6 +503,9 @@ async function resyncWallet() {
     await accountStore.sync()
     if (accountStore.status?.wallet?.check_ok) {
       message.success(t('settings.toast.walletRefreshed'))
+    } else if (accountStore.status?.session_expired) {
+      if (accountStore.status?.session_has_refresh) message.error(t('settings.steam.syncTipRenewing'))
+      else message.error(t('settings.steam.syncTipExpired'))
     } else {
       message.error(accountStore.status?.sync_error || t('settings.toast.walletRefreshFailed'))
     }
@@ -672,6 +698,9 @@ onMounted(() => {
           </div>
           <div v-if="mismatch" class="account-summary__warn">
             {{ t('settings.steam.mismatchWarn') }}
+          </div>
+          <div v-if="sessionExpired" class="account-summary__warn">
+            {{ sessionHasRefresh ? t('settings.steam.sessionRenewingWarn') : t('settings.steam.sessionExpiredWarn') }}
           </div>
 
           <div class="account-list">
