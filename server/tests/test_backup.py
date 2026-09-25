@@ -41,8 +41,9 @@ def data_env(tmp_path, monkeypatch):
         db_filename = "holdexar.db"
 
     monkeypatch.setattr(core_backup, "get_settings", lambda: _FakeSettings())
-    # 常数缩到 3 便于轮转测试
+    # 常数缩到 3 便于轮转测试；总量上限放大，让份数用例不被体积上限干扰
     monkeypatch.setattr(core_backup, "BACKUP_KEEP", 3)
+    monkeypatch.setattr(core_backup, "BACKUP_TOTAL_CAP_RATIO", 1e18)
     yield tmp_path, holder
     conn.close()
 
@@ -136,6 +137,23 @@ async def test_manual_backup_independent_of_auto_rotation(data_env, monkeypatch)
     assert len(names) == 4
     assert sum(1 for n in names if n.endswith("-manual.db")) == 1
     assert any("a3" in n for n in names)
+
+
+@pytest.mark.asyncio
+async def test_rotation_caps_total_size(data_env, monkeypatch):
+    """总量上限：主库体积×倍数封顶时只留最新的 BACKUP_MIN_KEEP 份。"""
+    tmp, _ = data_env
+    monkeypatch.setattr(core_backup, "BACKUP_TOTAL_CAP_RATIO", 2.0)
+    # 上限钉到 2KB：任何一份备份都会超——正好验证「至少保留 2 份」的下限
+    monkeypatch.setattr(core_backup, "_main_db_bytes", lambda: 1024)
+    seq = iter(range(10))
+    monkeypatch.setattr(core_backup, "_ts", lambda: f"20260101-0000{next(seq)}")
+    for i in range(4):
+        await core_backup.create_backup(label=f"c{i}")
+    names = [b["name"] for b in core_backup.list_backups()]
+    assert len(names) == 2
+    assert any("c3" in n for n in names)  # 最新一份必在
+    assert not any("c0" in n for n in names)  # 最老的被清
 
 
 @pytest.mark.asyncio
