@@ -7,7 +7,7 @@
 **本地 Steam 多区价格监控终端**
 
 [![Version](https://img.shields.io/badge/version-v0.1.0-orange)](../../releases)
-[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue?logo=python&logoColor=white)](https://www.python.org)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.13%2B-blue?logo=python&logoColor=white)](https://www.python.org)
 [![FastAPI](https://img.shields.io/badge/Backend-FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Vue 3](https://img.shields.io/badge/Frontend-Vue%203-42b883?logo=vuedotjs&logoColor=white)](https://vuejs.org)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D4?logo=windows&logoColor=white)](https://github.com)
@@ -141,7 +141,7 @@ scoop install holdexar
 
 ## 源码运行
 
-要求 Python ≥3.11、Node ≥ 20.19(或 ≥ 22.12;Vite 8 的 `engines` 要求):
+要求 Python ≥3.13、Node ≥ 20.19(或 ≥ 22.12;Vite 8 的 `engines` 要求):
 
 ```bash
 git clone https://github.com/GLrone/Holdexar.git

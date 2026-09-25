@@ -1,16 +1,13 @@
 #!/bin/sh
 # Holdexar 推送门禁 —— pre-push（配置：git config core.hooksPath .githooks）
 #
-# **策略（2026-09-26 用户拍板）**：本地只跑秒级敏感面检查，全量 pytest 交给
-# GitHub CI 在推送后自动执行（.github/workflows/ci.yml，windows runner 双
-# Python 版本矩阵 + 前端构建门禁）。此前本钩子跑全量 pytest，高负载下单轮
-# 46-52 分钟且失败还会拖出兜底第二轮——与云端 CI 完全重复，故瘦身。
-# 红线同步：AGENTS.md「提交脱敏红线」§5 的门禁判据改为「内容在云端 CI 跑
-# 全量」，本地不再重复执行；CI 红灯即事后告警，修复随下一个提交承载。
+# 只做全树敏感面检查（秒级）。全量 pytest 不在任何自动路径上：云端 CI 仅
+# 保留 Actions 页手动触发（.github/workflows/ci.yml，workflow_dispatch），
+# 常规验证由开发会话内的靶向测试与真实链路实测承担，发布前手动跑全量。
 
-echo "[pre-push] 敏感面检查（凭据 / 大文件 / 用户数据；全量测试由云端 CI 执行）..."
+echo "[pre-push] 敏感面检查（凭据 / 大文件 / 用户数据）..."
 if ! python scripts/check_secrets.py --all; then
   echo "✗ 敏感面检查未通过，推送止步。" >&2
   exit 1
 fi
-echo "[pre-push] ✓ 通过（全量测试在 GitHub CI 执行，结果见仓库 Actions 页）"
+echo "[pre-push] ✓ 通过"
