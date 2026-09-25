@@ -1,6 +1,7 @@
 # ── Agent / AI 工具目录（本机专用，绝不上传）──
 .zcode/
 .workbuddy/
+.codebuddy/
 .cursor/
 .claude/
 .aider*
@@ -107,6 +108,7 @@ data/
 
 # ── pytest 临时产物 ──
 .tmp-pytest/
+server/_*.txt
 
 # ── 机密 ──
 .env
