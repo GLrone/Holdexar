@@ -2296,3 +2296,71 @@ export const careerApi = {
       noCache: fresh,
     }),
 }
+
+// ─── proxypool 生产作业台账（/proxies 页「生产作业」分节）──────────────
+// 只读：一次真实爬取作业一行，只记事实，不带健康分/等级/判死结论。
+
+export type ProxyJobRunStatus = 'running' | 'success' | 'partial' | 'failed' | 'interrupted'
+
+export interface ProxyJobRunSummary {
+  /** 本地日历日（与 crawl_jobs.startedAt 同源） */
+  day: string
+  runs: number
+  success: number
+  partial: number
+  failed: number
+  interrupted: number
+  running: number
+  /** null = 当日还没有带耗时的作业（显示 —，**不是 0**） */
+  avgDurationMs: number | null
+  /** null = 池内出口 IP 尚未探测（显示 —，**不是 0**） */
+  poolExitIpCount: number | null
+}
+
+export interface ProxyJobRunItem {
+  id: number
+  status: ProxyJobRunStatus
+  kind: string
+  startedAt: string | null
+  finishedAt: string | null
+  durationMs: number | null
+  taskCount: number | null
+  successCount: number | null
+  errorCount: number | null
+  /** GLOBAL 选中节点（`<订阅>|<原名>`）；读不到为 null */
+  node: string | null
+  nodeExitIp: string | null
+  poolNodeCount: number | null
+  poolExitIpCount: number | null
+  poolSha256: string | null
+  proxyUrl: string | null
+  regions: string[]
+  workers: number | null
+  subscriptionIds: number[]
+  snapshotIds: number[]
+  /** Active/Candidate 尚未实现：现在恒为 null */
+  activeSubscriptionId: number | null
+  /** null = 此行没有错误汇总（与「零失败」不是一回事） */
+  byError: Record<string, number> | null
+  errorSummaryTruncated: boolean
+  interrupted: boolean
+}
+
+export interface ProxyJobRunsPayload {
+  summary: ProxyJobRunSummary
+  total: number
+  items: ProxyJobRunItem[]
+}
+
+export const proxypoolApi = {
+  jobRuns: (limit = 20, offset = 0) =>
+    request<ProxyJobRunsPayload>(
+      'GET',
+      `/proxypool/job-runs${toQuery({ limit, offset })}`,
+      undefined,
+      { noCache: true },
+    ),
+  jobRun: (id: number) =>
+    request<ProxyJobRunItem>('GET', `/proxypool/job-runs/${id}`, undefined, { noCache: true }),
+}
+
