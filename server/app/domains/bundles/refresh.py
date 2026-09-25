@@ -787,19 +787,27 @@ async def _enqueue_new_bundle_apps() -> tuple[int, int]:
         regions = await enabled_regions()
         if regions:
             try:
-                # 与 crawl 域同一条约束：每次 run 取一次当前 Runtime 地址；拿不到就
-                # **不启动**这次 run，绝不退回直连/旧订阅代理（占位行已落库，回补层消化）。
+                # 与 crawl 域同一条约束：走**爬取唯一取值口**（池有出口 + 有 lane +
+                # 逐位一致才交出地址），拿不到就**不启动**这次 run——
+                # 绝不退回直连/GLOBAL/旧订阅代理（占位行已落库，回补层消化）。
                 from app.core.config import get_settings as _get_settings
-                from app.domains.proxypool.runtime import current_runtime_proxy_url
+                from app.core.database import get_session_factory as _session_factory
+                from app.domains.proxypool.runtime import crawl_lane_plan
 
-                proxy_url = current_runtime_proxy_url(_get_settings().data_dir)
-                if proxy_url is None:
+                try:
+                    async with _session_factory()() as _session:
+                        plan = await crawl_lane_plan(
+                            _session, _get_settings().data_dir, max_lanes=4
+                        )
+                except Exception as exc:  # noqa: BLE001 —— 池未就绪即拒绝本次 run
+                    plan = None
                     logger.warning(
-                        "[bundles] 代理运行时不可用：本次新 appid 爬取未启动（不退回直连）"
+                        "[bundles] 代理运行时未就绪（%s）：本次新 appid 爬取未启动"
+                        "（不退回直连）", exc,
                     )
-                else:
+                if plan is not None:
                     config = CrawlRunConfig(
-                        regions=regions, workers=4, proxy_url=proxy_url
+                        regions=regions, workers=4, proxy_url=plan["urls"][0]
                     )
                     stats = await run_crawl(crawl_pairs, config=config)
                     logger.info(

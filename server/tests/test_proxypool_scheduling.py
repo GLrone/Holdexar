@@ -261,12 +261,30 @@ async def _state_of(runtime_name: str) -> str:
 
 
 async def _boot(runtime: ClashRuntime, exe: Path, data_dir: Path):
+    """与生产同序的启动：建池 → 由**出口槽数**定 lane 数 → 起内核 → 绑定 lane。
+
+    「按出口槽开 lane 并写 lane plan」是爬取 Ready 的一部分（严格取值口要求
+    lane 计划与当前出口快照逐位一致），所以桩也必须照做，否则测的是另一个形态。
+    """
+    from app.domains.proxypool.exits import select_exit_slots
+    from app.domains.proxypool.pool import eligible_nodes
+    from app.domains.proxypool.runtime import align_lanes
+
     async with get_session_factory()() as s:
-        await build_pool(s, data_dir=data_dir)
-    status = runtime.start(str(exe), str(prepare_runtime_config(data_dir)))
-    await wait_proxy_names(status["controllerUrl"], runtime.secret, timeout=20)
+        build = await build_pool(s, data_dir=data_dir)
+        slots = select_exit_slots(await eligible_nodes(s))
+    status = runtime.start(
+        str(exe), str(prepare_runtime_config(data_dir, lanes=len(slots) or None))
+    )
+    base = status["controllerUrl"]
+    await wait_proxy_names(base, runtime.secret, timeout=20)
     await wait_mixed_port(data_dir, timeout=20)
-    return status["controllerUrl"], runtime.secret
+    if slots:
+        await align_lanes(
+            data_dir=data_dir, controller_url=base, secret=runtime.secret,
+            pool_names=tuple(build.runtime_names), slots=slots, timeout=20,
+        )
+    return base, runtime.secret
 
 
 async def _global_now(base: str, secret: str) -> str | None:
@@ -282,6 +300,22 @@ async def _select(base: str, secret: str, name: str) -> str | None:
     ) as c:
         await c.put(f"{base}/proxies/GLOBAL", json={"name": name})
         return (await c.get(f"{base}/proxies/GLOBAL")).json().get("now")
+
+
+
+async def _set_exit_ip(runtime_name: str, exit_ip: str) -> None:
+    """给台账行补出口身份：**爬取 Ready 要求「池里有合格出口」**，
+    没有出口 IP 的节点不构成出口槽，严格取值口会（正确地）拒绝启动。"""
+    from sqlalchemy import select
+
+    from app.domains.proxypool.models import ProxyNode
+
+    async with get_session_factory()() as s:
+        node = (await s.execute(
+            select(ProxyNode).where(ProxyNode.runtime_name == runtime_name)
+        )).scalars().first()
+        node.exit_ip = exit_ip
+        await s.commit()
 
 
 # ══ 1. 两条 crawler 路径统一互斥 ═════════════════════════════════
@@ -550,6 +584,7 @@ async def test_crawl_service_injects_current_runtime_per_run(
 
     await init_db()
     await _add("1|A", port=_free_port())
+    await _set_exit_ip("1|A", "1.1.1.1")
     base, secret = await _boot(proxy_runtime, kernel_exe_path, tmp_data_dir)
     lanes_x = lane_proxy_urls(tmp_data_dir)
     assert lanes_x, "多入口形态下 bootstrap 必须把 lane 入口开出来"
@@ -592,11 +627,12 @@ async def test_bundles_path_injects_runtime_and_fails_closed(
 ) -> None:
     from app.domains.bundles import refresh as rf
     from app.domains.games.models import Bundle
-    from app.domains.proxypool.runtime import RuntimeUnavailableError
+    from app.domains.proxypool.runtime import RuntimeUnavailableError, lane_proxy_urls
     from app.domains.crawl import service as cs
 
     await init_db()
     await _add("1|A", port=_free_port())
+    await _set_exit_ip("1|A", "1.1.1.1")
     async with get_session_factory()() as s:
         s.add(Bundle(bundle_id=900001, name="test-bundle", app_ids=[220]))
         await s.commit()
@@ -621,10 +657,12 @@ async def test_bundles_path_injects_runtime_and_fails_closed(
     await rf._enqueue_new_bundle_apps()
     assert captured == [], "拿不到 Runtime 时不得启动 run"
 
-    # ② 有 Runtime → 注入当前地址
+    # ② 有 Runtime → 注入当前**lane**地址（不是 mixed-port/GLOBAL 入口）
     base, secret = await _boot(proxy_runtime, kernel_exe_path, tmp_data_dir)
     await rf._enqueue_new_bundle_apps()
-    assert captured == [f"http://127.0.0.1:{proxy_runtime.port}"]
+    assert captured == [lane_proxy_urls(tmp_data_dir)[0]], (
+        "bundles 也必须走爬取唯一取值口（lane），不得退回 GLOBAL 单入口"
+    )
 
     # ③ crawl 域同样 fail closed
     async def _regions2(regions=None):

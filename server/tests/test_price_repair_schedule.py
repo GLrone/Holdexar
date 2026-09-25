@@ -142,14 +142,14 @@ def _stub_start_env(monkeypatch, *, captured_specs=None):
 
     monkeypatch.setattr(pp_exits, "exit_snapshot", _snapshot)
 
-    def _one_lane(_data_dir, **_kw):
+    async def _one_lane(_session, _data_dir, **_kw):
         binding = {"lane": 0, "url": "http://127.0.0.1:1",
                    "exitIp": "1.1.1.1", "node": "n1"}
         return {"urls": [binding["url"]], "exit_keys": [binding["exitIp"]],
                 "nodes": [binding["node"]], "bindings": [binding],
                 "runtime_lanes": 1, "known_exits": 1}
 
-    monkeypatch.setattr(pp_runtime, "lane_run_plan", _one_lane)
+    monkeypatch.setattr(pp_runtime, "crawl_lane_plan", _one_lane)
 
     # _execute 收尾钩子（提醒/史低/排序）模块级绑定各自服务的
     # get_session_factory——全部打桩防触生产库
