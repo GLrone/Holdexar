@@ -113,6 +113,7 @@ async def sync_subscriptions(
     session: AsyncSession, *, data_dir: Path, now: datetime,
     kernel_proxy: str | None = None,
     pool_proxy: str | None = None,
+    only_auto: bool = False,
 ) -> SyncResult:
     """订阅 → 快照 → Registry。**Runtime 层不参与，也拿不到 subscription URL。**
 
@@ -122,11 +123,23 @@ async def sync_subscriptions(
     它的证据仍然完整（`subscription_snapshots` 行 + 内容寻址字节）。
     ACTIVE 保持既有行为（persist → apply）。
 
-    抓取走既有通道链语义：`direct → kernel_proxy → pool_proxy`。直连被墙/超时是常态，
-    所以 kernel_proxy（现有 Mihomo 内核的代理）是真实可用的第二通道——但它**只是订阅
-    获取的辅助通道**，绝不是 crawler 的代理，也不构成 proxypool Runtime 的回退。
+    抓取走既有通道链语义：`direct → kernel_proxy → pool_proxy → 本机混合端口`。
+    直连被墙/超时是常态，所以 kernel_proxy（现有 Mihomo 内核的代理）是真实可用的
+    第二通道——但它**只是订阅获取的辅助通道**，绝不是 crawler 的代理，也不构成
+    proxypool Runtime 的回退。`kernel_proxy` 不给就现取（老 Clash 在跑就用它），
+    避免调用方漏传时整条链只剩直连一条。
     """
+    if kernel_proxy is None:
+        kernel_proxy = default_kernel_proxy()
     subs = await subscription_sources(session)
+    if only_auto:
+        # 关掉自动更新的订阅不参与本轮：限时订阅只能在窗口内下载、下载后可长期
+        # 使用，每轮都撞一次注定失败的抓取只会刷出噪音 FAILED。手动重拉不受此限。
+        auto_subs = [s for s in subs if _auto_refresh_on(s)]
+        off = [s.id for s in subs if not _auto_refresh_on(s)]
+        if off:
+            logger.info("[同步] 跳过已关闭自动更新的订阅：%s", off)
+        subs = auto_subs
     before = await eligible_runtime_names(session)
     shas: dict[int, str] = {}
     counts: dict[int, int] = {}
@@ -236,6 +249,12 @@ def _artifact_names(data_dir: Path) -> tuple[str, ...]:
     if not isinstance(doc, dict):
         return ()
     return tuple(str(p["name"]) for p in doc.get("proxies", []) if isinstance(p, dict))
+
+
+def _auto_refresh_on(sub) -> bool:
+    """订阅是否参与定时刷新。列缺失（历史行未补列）按开处理。"""
+    value = getattr(sub, "auto_refresh", None)
+    return True if value is None else bool(value)
 
 
 def default_kernel_proxy() -> str | None:
@@ -460,7 +479,9 @@ async def handle_subscription_refresh(
     from app.domains.proxypool.scheduling import request_rebuild
 
     before = await pool_signature(session)
-    sync = await sync_subscriptions(session, data_dir=data_dir, now=now)
+    sync = await sync_subscriptions(
+        session, data_dir=data_dir, now=now, only_auto=True
+    )
     synced = bool(sync.snapshot_sha256)
     if not synced:
         return RefreshTriageResult(False, False, "none", None)

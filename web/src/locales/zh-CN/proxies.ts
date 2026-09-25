@@ -101,6 +101,8 @@ const proxies = {
   'proxies.sub.urlLabel': '订阅链接',
   'proxies.sub.urlPlaceholder': 'https://… 订阅链接',
   'proxies.sub.editSave': '保存',
+  'proxies.sub.autoLabel': '自动更新订阅',
+  'proxies.sub.autoHint': '关闭后不再定时重新拉取这条订阅（手动「重拉」仍可用）；限时订阅建议关闭',
   'proxies.sub.editTip': '修改链接后自动重新拉取（优先直连，直连失败自动改用已保存的可用代理）',
   'proxies.sub.edited': '订阅已更新',
   'proxies.sub.editedSynced': '订阅已更新并重新拉取（{parts}）',

@@ -1240,6 +1240,8 @@ export interface ProxySubscriptionItem {
   deprecated?: boolean
   deprecatedAt?: string | null
   deprecatedReason?: string | null
+  /** 自动更新订阅：false 时定时刷新跳过它，只保留手动重拉 */
+  autoRefresh?: boolean
 }
 
 export interface ClashNodeTestItem {
@@ -1329,7 +1331,7 @@ export const proxiesApi = {
   removeSubscription: (id: number) =>
     request<{ removed: boolean }>('DELETE', `/proxies/subscriptions/${id}`),
   /** 编辑订阅：改名 + 换链接（换链接的 clash 订阅保存即自动重拉，synced=true） */
-  updateSubscription: (id: number, payload: { label?: string; url?: string }) =>
+  updateSubscription: (id: number, payload: { label?: string; url?: string; autoRefresh?: boolean }) =>
     request<{
       id: number
       kind: 'clash' | 'plain'

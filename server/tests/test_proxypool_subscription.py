@@ -130,7 +130,7 @@ async def test_direct_success_does_not_touch_later_channels():
 async def test_direct_fails_then_kernel_succeeds():
     calls: list[str] = []
     result = await fetch_subscription(
-        SUB_URL, build_channels(kernel_proxy="http://127.0.0.1:1"),
+        SUB_URL, build_channels(kernel_proxy="http://127.0.0.1:1", local_proxies=[]),
         client_factory=_scripted({CHANNEL_DIRECT: (500, b""),
                                   CHANNEL_KERNEL: (200, _yaml_bytes([_node()]))},
                                  calls, []),
@@ -160,7 +160,8 @@ async def test_all_channels_fail_raises_fetch_failed():
     with pytest.raises(FetchFailedError) as exc:
         await fetch_subscription(
             SUB_URL, build_channels(kernel_proxy="http://127.0.0.1:1",
-                                    pool_proxy="http://127.0.0.1:2"),
+                                    pool_proxy="http://127.0.0.1:2",
+                                    local_proxies=[]),
             client_factory=_scripted({}, calls, []),
         )
     assert len(exc.value.attempts) == 3
@@ -477,7 +478,7 @@ async def test_invalid_utf8_is_channel_level_and_falls_through():
     """200 + 非法字节＝通道级问题：换下一通道，而不是拿替换字符硬解。"""
     calls: list[str] = []
     result = await fetch_subscription(
-        SUB_URL, build_channels(kernel_proxy="http://127.0.0.1:1"),
+        SUB_URL, build_channels(kernel_proxy="http://127.0.0.1:1", local_proxies=[]),
         client_factory=_scripted({CHANNEL_DIRECT: (200, _BAD_BYTES),
                                   CHANNEL_KERNEL: (200, _yaml_bytes([_node()]))},
                                  calls, []),
@@ -493,7 +494,7 @@ async def test_all_channels_invalid_utf8_raises_invalid_encoding():
     calls: list[str] = []
     with pytest.raises(InvalidEncodingError) as exc:
         await fetch_subscription(
-            SUB_URL, build_channels(kernel_proxy="http://127.0.0.1:1"),
+            SUB_URL, build_channels(kernel_proxy="http://127.0.0.1:1", local_proxies=[]),
             client_factory=_scripted({CHANNEL_DIRECT: (200, _BAD_BYTES),
                                       CHANNEL_KERNEL: (200, b"\xff\xfe\x00")},
                                      calls, []),
