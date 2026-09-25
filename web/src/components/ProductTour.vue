@@ -14,18 +14,17 @@ import type { IconName } from '@/components/ui/icons'
    - 教练标记（Coachmark）：聚光框旁气泡，8 分向智能避让（优先下方/右上），
      永不与聚光框重叠、永不超出视口——高卡片不再遮挡按键
    - 焦点引导：靶点滚动进视野（聚光框完整可见优先），页面滚动/缩放实时跟随
-   顺序编排：核心三步在前且零配置——商店（看什么）→ 导入（怎么加游戏）→
-     提醒（到价怎么通知）；代理与账号绑定是可选分支殿后，标题带「可选」。
-     直连是抓取的标准形态，代理只解决网络不畅（价格取不到 / 登录窗打不开），
-     文案不把代理写成抓价的前置条件。
+   顺序编排 = 用户主链：开场 → 找游戏 → 价格自动更新 → 我的关注 → 价格提醒 →
+     游戏库 → 收尾。只教「怎么使用」：添加游戏不要求 Steam 账号、代理不进
+     导览、任务页不进导览（系统层能力，用户无需学习）。
    关闭兜底：打开即写 ui.onboarding_done 标志（幂等），关闭路径再补写一次。
 
    靶点选择器契约：
-   - 框架层：data-tour 属性（页面内锚点如 lib-empty；侧边栏项由 HlSideNav
-     按 to 派生，供侧栏类步骤取用）
+   - 框架层：data-tour 属性（lib-empty = 找游戏空态卡；card-price = 游戏卡
+     价格区；gamelib-main = 游戏库主区；侧边栏项由 HlSideNav 按 to 派生）
    - 页面层：data-section 属性（分节卡片既有，零侵入复用）
-     该属性的值是**词条 key**（如 `proxies.section.clash`）而不是译文：
-     锚点与语言无关，切语言时下面的选择器不会断。四个跨页步骤的 key 与视图侧
+     该属性的值是**词条 key**（如 `pool.section.items`）而不是译文：
+     锚点与语言无关，切语言时下面的选择器不会断。跨页步骤的 key 与视图侧
      逐字对应，改名即静默选不中。
    重开约定：打开时 step 强制归 0（关于页 hero logo / 设置页「重看教程」都从头走）。
    实例唯一：挂在 App.vue（导览要跨路由翻页，挂页面里的实例会被 router.push 卸载），
@@ -74,7 +73,7 @@ const TOUR: TourStep[] = [
     titleKey: 'productTour.intro.title',
     params: { app: APP_NAME },
     paras: [
-      { textKey: 'productTour.intro.p1' },
+      { textKey: 'productTour.intro.p1', params: { app: APP_NAME } },
       { textKey: 'productTour.intro.p2' },
       { textKey: 'productTour.intro.p3', params: { app: APP_NAME } },
     ],
@@ -83,55 +82,53 @@ const TOUR: TourStep[] = [
     route: '/library',
     // 空态卡 / 卡片网格二选一：空库时聚光空态卡（正是要解释的场景），已有数据时聚光网格
     target: ['[data-tour="lib-empty"]', '.card-grid'],
-    titleKey: 'productTour.stepData.title',
+    titleKey: 'productTour.stepFind.title',
     paras: [
-      { textKey: 'productTour.stepData.p1' },
-      { textKey: 'productTour.stepData.p2' },
-      { emphKey: 'productTour.stepData.emph' },
+      { textKey: 'productTour.stepFind.p1' },
+      { textKey: 'productTour.stepFind.p2' },
+      { emphKey: 'productTour.stepFind.emph' },
     ],
-    hintKey: 'productTour.stepData.hint',
   },
   {
-    route: '/crawl',
-    target: '[data-section="crawl.section.bulkImport"]',
-    titleKey: 'productTour.stepImport.title',
+    route: '/library',
+    // 价格区 / 网格 / 空态卡按序取第一个命中：有数据聚光首卡价格区；
+    // 空库时价格区不存在，落到空态卡（「添加游戏」入口就在那张卡上）
+    target: ['[data-tour="card-price"]', '.card-grid', '[data-tour="lib-empty"]'],
+    titleKey: 'productTour.stepPrice.title',
     paras: [
-      { textKey: 'productTour.stepImport.p1' },
-      { textKey: 'productTour.stepImport.p2' },
-      { emphKey: 'productTour.stepImport.emph' },
+      { textKey: 'productTour.stepPrice.p1' },
+      { textKey: 'productTour.stepPrice.p2' },
+      { emphKey: 'productTour.stepPrice.emph' },
     ],
-    hintKey: 'productTour.stepImport.hint',
+  },
+  {
+    route: '/pool',
+    target: '[data-section="pool.section.items"]',
+    titleKey: 'productTour.stepFollow.title',
+    paras: [
+      { textKey: 'productTour.stepFollow.p1' },
+      { textKey: 'productTour.stepFollow.p2' },
+      { emphKey: 'productTour.stepFollow.emph' },
+    ],
   },
   {
     route: '/alerts',
     target: '[data-section="alerts.section.rules"]',
-    titleKey: 'productTour.stepRules.title',
+    titleKey: 'productTour.stepAlert.title',
     paras: [
-      { textKey: 'productTour.stepRules.p1' },
-      { textKey: 'productTour.stepRules.p2' },
-      { emphKey: 'productTour.stepRules.emph' },
+      { textKey: 'productTour.stepAlert.p1' },
+      { textKey: 'productTour.stepAlert.p2' },
+      { emphKey: 'productTour.stepAlert.emph' },
     ],
   },
   {
-    route: '/proxies',
-    target: '[data-section="proxies.section.clash"]',
-    titleKey: 'productTour.stepProxy.title',
+    route: '/gamelib',
+    target: '[data-tour="gamelib-main"]',
+    titleKey: 'productTour.stepGamelib.title',
     paras: [
-      { emphKey: 'productTour.stepProxy.emph' },
-      { textKey: 'productTour.stepProxy.p1' },
-      { textKey: 'productTour.stepProxy.p2' },
+      { textKey: 'productTour.stepGamelib.p1' },
+      { textKey: 'productTour.stepGamelib.p2' },
     ],
-  },
-  {
-    route: '/settings',
-    target: '[data-section="settings.section.steamAccount"]',
-    titleKey: 'productTour.stepBind.title',
-    paras: [
-      { emphKey: 'productTour.stepBind.emph' },
-      { textKey: 'productTour.stepBind.p1' },
-      { textKey: 'productTour.stepBind.p2' },
-    ],
-    hintKey: 'productTour.stepBind.hint',
   },
   {
     titleKey: 'productTour.done.title',

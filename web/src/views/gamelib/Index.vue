@@ -47,7 +47,8 @@ const PANES: Record<string, Component> = {
 </script>
 
 <template>
-  <section class="gamelib-page">
+  <!-- data-tour：产品导览「游戏库」步的聚光锚点 -->
+  <section class="gamelib-page" data-tour="gamelib-main">
     <HlTabs v-model="activeTab" :tabs="tabItems" class="gl-tabs">
       <HlPaneSwitch :pane-key="activeTab">
         <component :is="PANES[activeTab]" />
