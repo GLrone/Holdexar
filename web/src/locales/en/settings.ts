@@ -20,7 +20,7 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.section.tour': 'Guided tour',
 
   /* Steam account binding card */
-  'settings.steam.desc': 'Binding an account shows its wallet balance (top right) plus billing currency and region. Only three Cookie fields are kept — sessionid, steamCountry and steamLoginSecure — stored in plain text in the local database only.',
+  'settings.steam.desc': 'Binding an account shows its wallet balance (top right) plus billing currency and region. Only the sign-in Cookie fields are kept — including steamRefresh_steam, which renews the session automatically — stored in plain text in the local database only.',
   'settings.steam.cookiePlaceholder': 'Paste a Cookie containing steamLoginSecure (one long line or several lines — it is tidied up for you)',
   'settings.steam.cookiePlaceholderBound': 'The current account is bound ({identity}) — paste another to add it',
   'settings.steam.autoFetch': 'Sign in and fetch',
@@ -35,10 +35,16 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.steam.guideStep2': 'Press <kbd>F12</kbd> to open DevTools, switch to the <b>Network</b> tab, then press <kbd>F5</kbd> to reload the page.',
   'settings.steam.guideStep3': 'Click the <b>first request</b> in the list (usually the store page itself), find the one line that starts with <code>Cookie:</code> under Request Headers on the right, then <b>right-click → Copy value</b> (it is long — copy the whole line).',
   'settings.steam.guideStep4': 'Come back here, paste it into the field above and click “Bind”. Both the single line carrying the <code>Cookie:</code> prefix and the multi-line form copied row by row from Application → Cookies are recognized and tidied up automatically.',
-  'settings.steam.guideNotes': 'Only three fields are needed — sessionid, steamCountry and steamLoginSecure (anything else is dropped on save); the Cookie is stored in plain text in the local database only. Signing out of Steam in your browser invalidates the binding, so you will need to bind again.',
+  'settings.steam.guideNotes': 'The sign-in cookies kept are sessionid, steamCountry, steamLoginSecure and steamRefresh_steam (the renewal credential, present only if you ticked “Remember me” when signing in); anything else is dropped on save. The Cookie is stored in plain text in the local database only. With the renewal credential the session renews itself, so it only breaks once you sign out of Steam.',
 
   /* Bound-account list */
   'settings.steam.mismatchWarn': 'This account has a different SteamID from the SteamID64 saved above — check that it is the same account',
+  'settings.steam.sessionExpiredWarn': 'Steam sign-in has expired and there is no renewal credential (you did not tick "Remember me" when signing in): click "Sign in and fetch" above to sign in again and tick it, or re-paste the Cookie using the guide below.',
+  'settings.steam.sessionRenewingWarn': 'The Steam session is renewing itself: this usually recovers within minutes and needs no action; if it stays like this, click "Sign in and fetch" above to sign in again.',
+  'settings.steam.syncExpired': 'Sign-in expired',
+  'settings.steam.syncRenewing': 'Renewing',
+  'settings.steam.syncTipExpired': 'Steam sign-in has expired - sign in again from the settings page ("Sign in and fetch")',
+  'settings.steam.syncTipRenewing': 'Steam sign-in has expired and is renewing automatically (retries on failure)',
   'settings.steam.syncOk': 'Synced',
   'settings.steam.syncFail': 'Sync failed',
   'settings.steam.syncIdle': 'Not synced',
@@ -151,6 +157,7 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.toast.bindSuccess': 'Bound — wallet balance {balance}',
   'settings.toast.bindSyncFailed': 'Cookie saved, but fetching the balance failed: {error}',
   'settings.toast.cookieSaved': 'Cookie saved',
+  'settings.toast.noRefreshToken': 'Saved, but “Remember me” was not ticked when signing in: this session expires in about a day — tick it and sign in again.',
   'settings.toast.cookieEmpty': 'Paste a Cookie first',
   'settings.toast.desktopOnly': 'Auto-fetch works in the desktop window only — in a browser, follow the guide below and paste it manually',
   'settings.toast.loginOpened': 'Steam sign-in window opened — it returns here once you sign in…',

@@ -59,6 +59,8 @@ const shell = {
   'wallet.badgeCurrent': '当前',
   'wallet.toastRefreshed': '已刷新：{balance}',
   'wallet.toastFailed': '刷新失败，请稍后再试',
+  'wallet.toastExpired': 'Steam 登录已过期，请在「我」页重新登录',
+  'wallet.toastRenewing': 'Steam 登录正在自动续期，稍后会自动恢复',
 
   /* 顶栏头像 */
   'avatar.title': '我的 Steam 账号 · {name}',

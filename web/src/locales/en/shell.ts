@@ -44,6 +44,8 @@ const shell: Partial<Record<MessageKey, string>> = {
   'wallet.badgeCurrent': 'Active',
   'wallet.toastRefreshed': 'Refreshed: {balance}',
   'wallet.toastFailed': 'Refresh failed, please try again later',
+  'wallet.toastExpired': 'Steam sign-in has expired — sign in again on the profile page',
+  'wallet.toastRenewing': 'Steam sign-in is renewing itself and will recover shortly',
 
   'avatar.title': 'My Steam account · {name}',
   'avatar.defaultTitle': 'My Steam account',

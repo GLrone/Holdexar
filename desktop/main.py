@@ -361,7 +361,16 @@ class DesktopApi:
 
     _LOGIN_URL = "https://store.steampowered.com/login/"
     _LOGIN_TIMEOUT_S = 300
-    _COOKIE_KEYS = ("steamLoginSecure", "sessionid", "steamCountry")
+    # 登录态 Cookie：三件套 + 续期凭据。steamRefresh_steam 必须一并回传——
+    # steamLoginSecure 是约 24 小时寿命的访问令牌，只有续期凭据能让服务端
+    # 自动换发新令牌（勾选「记住我」时 Steam 才下发该 Cookie）。
+    _COOKIE_KEYS = (
+        "steamLoginSecure",
+        "sessionid",
+        "steamCountry",
+        "steamRefresh_steam",
+        "steamRememberLogin",
+    )
 
     # 登录窗 UX 助手注入脚本（evaluate_js，每次完整导航后在 events.loaded 重注入；
     # Steam 登录页 CSP default-src 带 'unsafe-inline'，DOM+CSSOM 注入不受限）。
@@ -722,7 +731,9 @@ class DesktopApi:
         return "system", None, False
 
     def start_steam_login(self) -> dict:
-        """打开 Steam 登录子窗口，轮询 Cookie；登录成功自动回传三件套。
+        """打开 Steam 登录子窗口，轮询 Cookie；登录成功自动回传登录态 Cookie。
+
+        回传集合见 _COOKIE_KEYS（三件套 + 续期凭据 steamRefresh_steam）。
 
         pywebview 5.4+ EdgeChromium（WebView2）后端可经 CookieManager 读到
         httpOnly 的 steamLoginSecure。轮询到即关窗返回；超时/用户关窗返回
@@ -879,6 +890,15 @@ class DesktopApi:
             try:
                 named = _extract(login_window.get_cookies() or [])
                 if named.get("steamLoginSecure"):
+                    # 续期凭据可能比访问令牌晚一步落到 cookie 罐：首次未见
+                    # steamRefresh_steam 时短等再回读一次并合并——缺它的登录态
+                    # 只能活到访问令牌到期（约 24 小时），且无法自动续期
+                    if not named.get("steamRefresh_steam"):
+                        _time.sleep(1.2)
+                        try:
+                            named = {**named, **_extract(login_window.get_cookies() or [])}
+                        except Exception:  # noqa: BLE001 —— 回读失败沿用首次快照
+                            pass
                     cookie_str = "; ".join(
                         f"{k}={named[k]}" for k in self._COOKIE_KEYS if named.get(k)
                     )

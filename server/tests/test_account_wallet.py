@@ -117,13 +117,22 @@ def test_parse_cookie_str_tolerates_paste_variants():
     assert narrowed == "sessionid=abc; steamCountry=CN%7C; steamLoginSecure=76561%7C%7Ctok"
 
 
-def test_filter_login_cookies_keeps_only_three_keys():
+def test_filter_login_cookies_keeps_login_set_and_refresh_credential():
+    """收窄口径 = 登录态 Cookie + 续期凭据；浏览器偏好类字段一律不入库。"""
     raw = (
         "sessionid=abc; steamCountry=CN%7C; steamLoginSecure=76561%7C%7Ctok; "
+        "steamRefresh_steam=76561%7C%7Cref; steamRememberLogin=true; "
         "browserid=x; Steam_Language=schinese"
     )
     kept = filter_login_cookies(raw)
-    assert kept == "sessionid=abc; steamCountry=CN%7C; steamLoginSecure=76561%7C%7Ctok"
+    assert kept == (
+        "sessionid=abc; steamCountry=CN%7C; steamLoginSecure=76561%7C%7Ctok; "
+        "steamRefresh_steam=76561%7C%7Cref; steamRememberLogin=true"
+    )
+    # 续期凭据缺席时收窄结果仍是合法登录态（只是寿命止于访问令牌到期）
+    assert "steamRefresh_steam" not in filter_login_cookies(
+        "sessionid=abc; steamLoginSecure=76561%7C%7Ctok"
+    )
 
 
 def test_has_login_cookie():

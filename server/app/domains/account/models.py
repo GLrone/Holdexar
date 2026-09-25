@@ -18,8 +18,10 @@ class SteamAccount(Base):
     __tablename__ = "steam_accounts"
 
     steam_id: Mapped[str] = mapped_column(String(20), primary_key=True)
-    # 登录三件套明文（sessionid / steamCountry / steamLoginSecure），仅本机库
-    cookies: Mapped[str] = mapped_column(String(2000), default="")
+    # 登录态明文（sessionid / steamCountry / steamLoginSecure 三件套 +
+    # steamRefresh_steam / steamRememberLogin 续期凭据），仅本机库；
+    # 访问令牌约 24 小时到期，续期靠这枚凭据换新（见 session.py）
+    cookies: Mapped[str] = mapped_column(String(4000), default="")
     persona_name: Mapped[str] = mapped_column(String(100), default="")
     avatar_url: Mapped[str] = mapped_column(String(300), default="")
     # 每账号独立钱包快照：{balance, balance_display, currency_code, region_code, ...}

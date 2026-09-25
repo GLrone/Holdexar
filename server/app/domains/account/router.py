@@ -36,6 +36,10 @@ class AccountStatus(BaseModel):
     message: str = ""
     accounts: list[dict] = []
     primary_steam_id: str = ""
+    # 登录态：has_cookie 只表示"绑过"，会话是否仍可用看下面三项
+    session_expires_at: str | None = None
+    session_expired: bool = False
+    session_has_refresh: bool = False
     # 当前账号 Steam 真实在线状态（顶栏头像 dot 数据源）
     is_online: bool = False
     in_game: str = ""

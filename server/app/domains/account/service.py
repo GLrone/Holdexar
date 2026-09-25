@@ -17,6 +17,7 @@ crawl_regions 表里反查区服 code（USD 多区时优先 us），这样钱包
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 
@@ -27,6 +28,12 @@ from app.crawler.utils import get_beijing_time_obj
 from app.domains.account.models import SteamAccount
 from app.domains.regions.models import CrawlRegion
 from app.domains.settings import service as settings_service
+from .session import (
+    SessionRefreshError,
+    refresh_login_cookies,
+    refresh_token_of,
+    session_freshness,
+)
 from .steam_wallet import (
     UnknownCurrencyError,
     WalletFetchError,
@@ -58,6 +65,20 @@ _ROTATION_JITTER_SECONDS = (1.0, 8.0)
 
 # 手动同步的钱包快照缓存有效期（小时）：超期后前端触发刷新
 WALLET_STALE_HOURS = 6
+
+# 登录态过期（无续期凭据）时的账号行错误：写进 wallet_error / sync_error
+# 供诊断，同时前端按 session_expired 标记渲染本地化文案
+SESSION_EXPIRED_MESSAGE = "Steam 登录已过期，请重新登录"
+
+# 有续期凭据但本轮续期失败（网络 / Steam 侧拒绝）：仍属可自愈失败，
+# 按普通退避继续重试，不升级成要求用户重新登录
+SESSION_RENEW_FAILED_MESSAGE = "Steam 登录已过期，正在自动续期（失败会自动重试）"
+
+# 绑定结果提示：Cookie 里没有续期凭据（登录 Steam 时未勾选「记住我」）时，
+# 登录态只能维持到访问令牌到期（约 24 小时）
+SESSION_NO_REFRESH_MESSAGE = (
+    "未检测到续期凭据：登录 Steam 时请勾选「记住我」，否则约一天后需重新登录"
+)
 
 # 递增退避表（分钟）：失败级别 0→1→2→3→4+ 依次映射，封顶 30min。
 # 单纯 Cookie 失效/网络抖动按此梯度冷却；429/403 风控信号另行直接
@@ -129,9 +150,74 @@ async def _all_accounts() -> list[SteamAccount]:
         return list(rows)
 
 
+# 登录态续期的进程内节流与串行（按 steamid）：
+# - 令牌健康时 ensure_live_session 只做一次本地 JWT 解码，零网络请求；
+# - 同一账号续期失败后 _SESSION_REFRESH_RETRY_SECONDS 内不再重试，避免
+#   钱包轮转与各消费方的取 Cookie 各自拉起一次续期；
+# - 锁保证并发调用只有一个真正发起续期，其余复用落库后的新 Cookie。
+_SESSION_REFRESH_RETRY_SECONDS = 600.0
+_session_refresh_at: dict[str, datetime] = {}
+_session_refresh_locks: dict[str, asyncio.Lock] = {}
+
+
 async def _get_row(steam_id: str) -> SteamAccount | None:
     async with get_session_factory()() as session:
         return await session.get(SteamAccount, steam_id)
+
+
+def _session_lock(steam_id: str) -> asyncio.Lock:
+    lock = _session_refresh_locks.get(steam_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _session_refresh_locks[steam_id] = lock
+    return lock
+
+
+async def _save_cookies_only(steam_id: str, cookies: str) -> None:
+    """只改账号行 Cookie（续期通道）：不动 active 归属与熔断状态。"""
+    async with get_session_factory()() as session:
+        row = await session.get(SteamAccount, steam_id)
+        if row is None:
+            return
+        row.cookies = cookies
+        await session.commit()
+
+
+async def ensure_live_session(steam_id: str, cookies: str) -> str:
+    """返回当前可用的登录 Cookie：临期/过期时先续期并落库，其余原样返回。
+
+    触发线由访问令牌的 exp 决定（见 session.session_freshness）。没有续期
+    凭据（登录时未勾选「记住我」）或续期失败时如实返回原 Cookie，由调用方
+    按登录过期处理——登录态失效不伪装成网络故障。
+    """
+    freshness = session_freshness(cookies)
+    if not (freshness["expired"] or freshness["expiring"]):
+        return cookies
+    if not freshness["has_refresh_token"]:
+        return cookies
+
+    async with _session_lock(steam_id):
+        # 等锁期间可能已被其它调用续期落库，取最新值重新判定
+        row = await _get_row(steam_id)
+        current = (row.cookies if row is not None else "") or cookies
+        freshness = session_freshness(current)
+        if not (freshness["expired"] or freshness["expiring"]):
+            return current
+        now = _naive_now()
+        last = _session_refresh_at.get(steam_id)
+        if last is not None and (now - last).total_seconds() < _SESSION_REFRESH_RETRY_SECONDS:
+            return current
+        _session_refresh_at[steam_id] = now
+        try:
+            renewed = await refresh_login_cookies(
+                current, proxy_url=await _strategy_proxy()
+            )
+        except SessionRefreshError as exc:
+            logger.warning("[account] 账号 %s 登录态续期失败：%s", steam_id, exc)
+            return current
+        await _save_cookies_only(steam_id, renewed)
+        logger.info("[account] 账号 %s 登录态已续期（换发新的访问令牌）", steam_id)
+        return renewed
 
 
 async def get_primary_account() -> SteamAccount | None:
@@ -172,20 +258,22 @@ async def get_cookies() -> str:
     """当前账号（active）的登录 Cookie；未绑定返回空串。
 
     所有消费方（bills/redeem/family/…）经此取 Cookie——切换账号即整体跟随。
+    返回值经 ensure_live_session：临期/过期且留有续期凭据时先换发新令牌，
+    消费方拿到的一律是本刻可用的登录态。
     """
     row = await get_active_account()
     if row is None:
         # 兼容回退：未迁移的旧部署（表空但 KV 有值）
         return (await settings_service.get_value(KEY_COOKIES, "")) or ""
-    return row.cookies or ""
+    return await ensure_live_session(row.steam_id, row.cookies or "")
 
 
 async def get_primary_cookies() -> str:
-    """主账号 Cookie（账单/家庭组等主账号语义消费方专用）。"""
+    """主账号 Cookie（账单/家庭组等主账号语义消费方专用）；语义同 get_cookies。"""
     row = await get_primary_account()
     if row is None:
         return (await settings_service.get_value(KEY_COOKIES, "")) or ""
-    return row.cookies or ""
+    return await ensure_live_session(row.steam_id, row.cookies or "")
 
 
 # ── 绑定 / 切换 / 删除 ──────────────────────────────────────
@@ -197,6 +285,8 @@ async def save_cookies(cookies_raw: str) -> dict:
     - 已有 SteamID → 更新该账号 Cookie（换绑/续期语义）；
     - 均置 is_active=True（其余账号取消 active）。
     - mismatch 校验保留：cookie SteamID 与手填 account.steam_id 主身份不一致时告警。
+    - 缺 steamRefresh_steam（登录时未勾选「记住我」）时在 message 里如实提示：
+      没有续期凭据，登录态只能维持到访问令牌约 24 小时到期。
     """
     raw = (cookies_raw or "").strip()
     if raw and "steamLoginSecure" not in raw:
@@ -206,6 +296,9 @@ async def save_cookies(cookies_raw: str) -> dict:
     cookie_sid = steam_id_from_cookies(filtered)
     if not cookie_sid:
         raise ValueError("无法从 Cookie 解析 SteamID64，请确认复制的是登录后的完整 Cookie")
+
+    # 续期凭据决定登录态能否跨过访问令牌的 24 小时寿命（见 session.py）
+    has_refresh = bool(refresh_token_of(filtered))
 
     bound_sid = (await settings_service.get_value(KEY_STEAM_ID, "")) or ""
     mismatch = bool(
@@ -247,10 +340,11 @@ async def save_cookies(cookies_raw: str) -> dict:
         "is_new": is_new,
         "bound_steam_id": bound_sid,
         "mismatch": mismatch,
+        "has_refresh": has_refresh,
         "message": (
             "Cookie 中的 SteamID 与已保存的 SteamID64 不一致，请核对账号"
             if mismatch
-            else ""
+            else ("" if has_refresh else SESSION_NO_REFRESH_MESSAGE)
         ),
     }
 
@@ -384,15 +478,29 @@ async def sync_wallet(*, force: bool = False) -> dict:
         if age_h < WALLET_STALE_HOURS:
             return {"ok": True, "cached": True, "wallet": snapshot}
 
+    # 登录态先行：临期/过期且留有续期凭据时先换发新令牌，续不上则如实报过期
+    cookies = await ensure_live_session(row.steam_id, row.cookies)
+    freshness = session_freshness(cookies)
+    if freshness["expired"]:
+        if not freshness["has_refresh_token"]:
+            await _save_wallet(row.steam_id, error=SESSION_EXPIRED_MESSAGE, now=now, frozen=True)
+            return {"ok": False, "status": "session_expired", "error": SESSION_EXPIRED_MESSAGE}
+        await _save_wallet(row.steam_id, error=SESSION_RENEW_FAILED_MESSAGE, now=now)
+        return {
+            "ok": False,
+            "status": "session_renew_failed",
+            "error": SESSION_RENEW_FAILED_MESSAGE,
+        }
+
     try:
-        info: WalletInfo = await fetch_wallet(row.cookies, proxy_url=await _strategy_proxy())
+        info: WalletInfo = await fetch_wallet(cookies, proxy_url=await _strategy_proxy())
     except UnknownCurrencyError as exc:
         await _save_wallet(row.steam_id, error=str(exc), now=now)
-        await _sync_profile_row(row.steam_id, row.cookies, now)  # 钱包失败不连坐资料
+        await _sync_profile_row(row.steam_id, cookies, now)  # 钱包失败不连坐资料
         return {"ok": False, "error": str(exc)}
     except WalletFetchError as exc:
         await _save_wallet(row.steam_id, error=str(exc), now=now)
-        await _sync_profile_row(row.steam_id, row.cookies, now)
+        await _sync_profile_row(row.steam_id, cookies, now)
         return {"ok": False, "error": str(exc)}
 
     # country_code 在 store account 通道承载 history 页地区名（中文），交判定层翻译
@@ -414,7 +522,7 @@ async def sync_wallet(*, force: bool = False) -> dict:
     await _save_wallet(row.steam_id, snapshot=snapshot, now=now)
 
     # 顺带补/换账户资料（头像/昵称）：无资料时拉取，静默失败
-    await _sync_profile_row(row.steam_id, row.cookies, now)
+    await _sync_profile_row(row.steam_id, cookies, now)
 
     return {"ok": True, "cached": False, "wallet": snapshot}
 
@@ -659,8 +767,32 @@ async def _sync_wallet_of(steam_id: str) -> dict:
     next_level = min(int(row.wallet_backoff_level or 0) + 1, len(_WALLET_BACKOFF_MINUTES))
     next_streak = int(row.wallet_fail_streak or 0) + 1
     will_freeze = next_streak >= _WALLET_BREAKER_FREEZE_AFTER
+    # 登录态先行：临期/过期且留有续期凭据时先换发新令牌（见 ensure_live_session）。
+    # 登录失效不是网络故障，故两种情况都不计入网络退避计数之外的误判：
+    # - 无续期凭据 = 只有用户重新登录能解 → 冻结自动轮转，不再打 Steam；
+    # - 有续期凭据但本轮续期失败 = 可自愈 → 按普通失败退避，下一轮继续尝试。
+    cookies = await ensure_live_session(steam_id, row.cookies)
+    freshness = session_freshness(cookies)
+    if freshness["expired"]:
+        if not freshness["has_refresh_token"]:
+            await _save_wallet(steam_id, error=SESSION_EXPIRED_MESSAGE, now=now, frozen=True)
+            if not row.wallet_frozen:
+                logger.warning(
+                    "[钱包轮转] 账号 %s 登录态已过期且无续期凭据，"
+                    "冻结自动刷新（等重新登录）", steam_id
+                )
+            return {"ok": False, "status": "session_expired", "error": SESSION_EXPIRED_MESSAGE}
+        await _save_wallet(
+            steam_id, error=SESSION_RENEW_FAILED_MESSAGE, now=now,
+            backoff_level=next_level, fail_streak=next_streak, frozen=will_freeze,
+        )
+        return {
+            "ok": False,
+            "status": "session_renew_failed",
+            "error": SESSION_RENEW_FAILED_MESSAGE,
+        }
     try:
-        info: WalletInfo = await fetch_wallet(row.cookies, proxy_url=await _strategy_proxy())
+        info: WalletInfo = await fetch_wallet(cookies, proxy_url=await _strategy_proxy())
     except UnknownCurrencyError as exc:
         await _save_wallet(steam_id, error=str(exc), now=now, backoff_level=next_level,
                            fail_streak=next_streak, frozen=will_freeze)
@@ -696,7 +828,7 @@ async def _sync_wallet_of(steam_id: str) -> dict:
     }
     await _save_wallet(steam_id, snapshot=snapshot, now=now, backoff_level=0,
                        fail_streak=0, frozen=False)
-    await _sync_profile_row(steam_id, row.cookies, now)
+    await _sync_profile_row(steam_id, cookies, now)
     return {"ok": True, "wallet": snapshot}
 
 
@@ -775,6 +907,7 @@ async def _account_payload(row: SteamAccount, primary_id: str, counts: dict) -> 
     """账号行的对外展示载荷（不含 Cookie 明文）。"""
     wallet = row.wallet_json if isinstance(row.wallet_json, dict) else None
     c = counts or {"wishlist_count": 0, "game_count": 0}
+    freshness = session_freshness(row.cookies or "")
     return {
         "steam_id": row.steam_id,
         "friend_code": _friend_code(row.steam_id),
@@ -786,6 +919,11 @@ async def _account_payload(row: SteamAccount, primary_id: str, counts: dict) -> 
         "wallet": wallet,
         "wallet_error": row.wallet_error or "",
         "wallet_frozen": bool(row.wallet_frozen),
+        # 登录态：expires_at 为访问令牌到期时刻（北京时间），expired 为本地
+        # 判定结果，has_refresh 表示是否留有可自动续期的凭据
+        "session_expires_at": freshness["expires_at"],
+        "session_expired": freshness["expired"],
+        "session_has_refresh": freshness["has_refresh_token"],
         "wishlist_count": c.get("wishlist_count", 0),
         "game_count": c.get("game_count", 0),
         "redeem_used": _account_usage(row.steam_id),
@@ -824,10 +962,14 @@ async def get_status() -> dict:
             "message": "",
             "accounts": [],
             "primary_steam_id": "",
+            "session_expires_at": None,
+            "session_expired": False,
+            "session_has_refresh": False,
         }
     bound_sid = (await settings_service.get_value(KEY_STEAM_ID, "")) or ""
     profile = {"persona_name": row.persona_name, "avatar_url": row.avatar_url,
                "steam_id": row.steam_id} if (row.persona_name or row.avatar_url) else None
+    freshness = session_freshness(row.cookies or "")
     return {
         "has_cookie": bool(row.cookies and "steamLoginSecure" in row.cookies),
         "cookie_steam_id": row.steam_id,
@@ -839,6 +981,10 @@ async def get_status() -> dict:
         "message": "",
         "accounts": accounts,
         "primary_steam_id": accounts[0]["steam_id"] if accounts else "",
+        # 登录态：has_cookie 只表示"绑过"，是否还能用由 expires_at/expired 决定
+        "session_expires_at": freshness["expires_at"],
+        "session_expired": freshness["expired"],
+        "session_has_refresh": freshness["has_refresh_token"],
         # 当前账号 Steam 真实在线状态（顶栏头像 dot 数据源）
         "is_online": bool(row.is_online),
         "in_game": row.in_game or "",
