@@ -226,11 +226,15 @@ async def clash_start(req: ClashStart):
 
 @router.post("/clash/test")
 async def clash_test():
-    """检测 Clash 订阅节点：节点状态机落库 + 订阅废弃判定 + selector 自愈。"""
-    try:
-        return await service.test_clash_nodes()
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    """启动 Clash 订阅节点检测：后台逐节点探测（状态机落库/废弃判定/
+    selector 自愈不变），立即返回会话进度快照；进度经 GET /clash/test/progress 轮询。"""
+    return service.clash_test_start()
+
+
+@router.get("/clash/test/progress")
+async def clash_test_progress():
+    """节点检测进度快照（后台会话；无会话时 phase=idle）。"""
+    return service.clash_test_progress() or {"phase": "idle"}
 
 
 @router.post("/clash/health_check")

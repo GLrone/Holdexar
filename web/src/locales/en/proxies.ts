@@ -71,7 +71,12 @@ const proxies: Partial<Record<MessageKey, string>> = {
 
   /* Clash node check */
   'proxies.clash.testNodes': 'Check nodes (Steam reachability)',
-  'proxies.clash.testing': 'Checking Steam reachability node by node (nodes in cooldown are skipped)…',
+  'proxies.clash.testingProgress': 'Checking {done}/{total}',
+  'proxies.clash.queued': 'Waiting for the current check…',
+  'proxies.clash.testFailed': 'Check failed',
+  'proxies.clash.collapse': 'Hide',
+  'proxies.clash.expand': 'Show',
+  'proxies.clash.cooldownSkipped': '{n} in cooldown skipped',
   'proxies.clash.testDone': 'Check complete: {alive}/{total} reach Steam',
   'proxies.clash.testDoneDeprecated': '{msg} — over 95% of its nodes are unusable, so it was marked deprecated (the backend will stop using it; delete or replace it manually)',
   'proxies.clash.aliveTag': 'Steam OK {alive}/{total}',

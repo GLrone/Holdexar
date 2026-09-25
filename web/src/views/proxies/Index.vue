@@ -4,8 +4,8 @@ import { ElMessageBox } from 'element-plus'
 
 import {
   proxiesApi,
-  type ClashNodeTestResult,
   type ClashStatus,
+  type ClashTestProgress,
   type ProxyItem,
   type ProxyStrategy,
   type ProxySubscriptionItem,
@@ -106,9 +106,19 @@ const editUrl = ref('')
 const editAutoRefresh = ref(true)
 const editingSub = ref(false)
 
-// Clash 节点检测（出口 IP 去重 → 存活 23/45）
-const clashTest = ref<ClashNodeTestResult | null>(null)
-const testingClash = ref(false)
+// Clash 节点检测（后台会话：出口 IP 去重 → 存活 N/M；轮询进度端点驱动按钮与面板）
+const clashTest = ref<ClashTestProgress | null>(null)
+const clashTestExpanded = ref(true)
+let clashTestPollTimer: ReturnType<typeof setInterval> | null = null
+const testingClash = computed(
+  () => clashTest.value?.phase === 'queued' || clashTest.value?.phase === 'running',
+)
+const clashTestPct = computed(() => {
+  const s = clashTest.value
+  if (!s || !s.toProbe) return 0
+  return Math.min(100, Math.round((s.probed / s.toProbe) * 100))
+})
+const clashTestSkipped = computed(() => clashTest.value?.cooldownSkipped ?? 0)
 
 const clashSubs = computed(() => subscriptions.value.filter((s) => s.kind === 'clash'))
 const plainSubs = computed(() => subscriptions.value.filter((s) => s.kind === 'plain'))
@@ -524,35 +534,73 @@ async function startClash() {
 async function stopClash() {
   await proxiesApi.clashStop()
   clashTest.value = null
+  stopClashTestPoll()
   message.success(t('proxies.clash.hasStopped'))
   clash.value = await proxiesApi.clashStatus()
 }
 
-async function runClashTest() {
-  testingClash.value = true
-  try {
-    message.info(t('proxies.clash.testing'))
-    clashTest.value = await proxiesApi.clashTest()
-    const msg = t('proxies.clash.testDone', {
-      alive: clashTest.value.alive,
-      total: clashTest.value.total,
-    })
-    if (clashTest.value.deprecated) {
-      message.error(t('proxies.clash.testDoneDeprecated', { msg }))
-    } else {
-      message.success(msg)
+function stopClashTestPoll() {
+  if (clashTestPollTimer) {
+    clearInterval(clashTestPollTimer)
+    clashTestPollTimer = null
+  }
+}
+
+/** 轮询一拍检测进度；终态收口（完成 toast / 废弃标记刷新 / 失败原因） */
+async function pollClashTestOnce() {
+  const snap = await proxiesApi.clashTestProgress()
+  if (!snap || snap.phase === 'idle') return
+  clashTest.value = snap
+  if (snap.phase === 'done' || snap.phase === 'failed') {
+    stopClashTestPoll()
+    if (snap.phase === 'done') {
+      const msg = t('proxies.clash.testDone', { alive: snap.alive, total: snap.total ?? 0 })
+      if (snap.deprecated) {
+        message.error(t('proxies.clash.testDoneDeprecated', { msg }))
+      } else {
+        message.success(msg)
+      }
+      await load() // 订阅列表刷新废弃标记
+    } else if (snap.error) {
+      message.error(snap.error)
     }
-    await load() // 订阅列表刷新废弃标记
+  }
+}
+
+function startClashTestPoll() {
+  stopClashTestPoll()
+  clashTestPollTimer = setInterval(() => {
+    pollClashTestOnce().catch(() => {
+      /* 轮询瞬断忽略，下轮再试 */
+    })
+  }, 1000)
+}
+
+/** 启动检测：后端立即返回会话快照，探测在后台推进；面板展开看逐节点过程 */
+async function runClashTest() {
+  try {
+    clashTest.value = await proxiesApi.clashTestStart()
+    clashTestExpanded.value = true
+    startClashTestPoll()
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e))
-  } finally {
-    testingClash.value = false
   }
 }
 
 onMounted(async () => {
   await load()
   void refreshTrafficQuiet() // 实时流量：进页即静默刷新（不阻塞首屏渲染）
+  // 进页恢复检测会话：进行中则续上轮询（离开页面检测照常推进），
+  // 最近一次结果直接展示；无会话（idle/请求失败）不显示面板
+  try {
+    const snap = await proxiesApi.clashTestProgress()
+    if (snap && snap.phase !== 'idle') {
+      clashTest.value = snap
+      if (snap.phase === 'queued' || snap.phase === 'running') startClashTestPoll()
+    }
+  } catch {
+    /* 进度不可得按无会话处理 */
+  }
 })
 </script>
 
@@ -614,23 +662,26 @@ onMounted(async () => {
           <span>{{ t('proxies.section.clash') }}</span>
         </div>
         <div class="proxyx-section-actions">
-          <span v-if="clashTest" class="tag" :class="clashTest.alive > 0 ? 'tag--success' : 'tag--danger'">
-            {{ t('proxies.clash.aliveTag', { alive: clashTest.alive, total: clashTest.total }) }}
-          </span>
-          <span v-if="clashTest && clashTest.alive < clashTest.total" class="tag">
-            {{ t('proxies.clash.uniqueExits', { n: clashTest.aliveUnique }) }}
-          </span>
           <HlButton
             v-if="clashTest || clash?.running"
             art="outline"
             tone="blue"
             size="sm"
             :disabled="testingClash || !clash?.running"
-            :loading="testingClash"
             :title="clash?.running ? '' : t('proxies.clash.notRunningTitle')"
             @click="runClashTest"
           >
-            {{ t(testingClash ? 'proxies.node.checking' : 'proxies.clash.testNodes') }}
+            <span v-if="clashTest && testingClash" class="pxtest-run">
+              <span v-if="clashTest.phase === 'running'" class="pxtest-run__bar">
+                <span class="pxtest-run__fill" :style="{ width: clashTestPct + '%' }" />
+              </span>
+              <span class="pxtest-run__label">{{
+                clashTest.phase === 'running'
+                  ? t('proxies.clash.testingProgress', { done: clashTest.probed, total: clashTest.toProbe ?? 0 })
+                  : t('proxies.clash.queued')
+              }}</span>
+            </span>
+            <template v-else>{{ t('proxies.clash.testNodes') }}</template>
           </HlButton>
         </div>
       </div>
@@ -744,8 +795,36 @@ onMounted(async () => {
           <span class="proxyx-hint">{{ t('proxies.clash.startHint') }}</span>
         </div>
 
-        <!-- Clash 节点检测结果（存活=Steam 端点 200；冷却期节点沿用账本状态） -->
-        <div v-if="clashTest" class="proxyx-table-wrap">
+        <!-- Clash 节点检测结果（存活=Steam 端点 200；冷却期节点沿用账本状态）。
+             收起只折叠展示，后台检测照常推进，再展开继续看逐节点过程 -->
+        <div v-if="clashTest && clashTest.phase !== 'idle'" class="proxyx-test-panel">
+          <div class="proxyx-test-panel__head">
+            <span v-if="clashTest.phase === 'failed'" class="tag tag--danger">
+              {{ t('proxies.clash.testFailed') }}
+            </span>
+            <span
+              v-else-if="clashTest.phase === 'done'"
+              class="tag"
+              :class="clashTest.alive > 0 ? 'tag--success' : 'tag--danger'"
+            >
+              {{ t('proxies.clash.aliveTag', { alive: clashTest.alive, total: clashTest.total ?? 0 }) }}
+            </span>
+            <span v-else class="tag">
+              {{ t('proxies.clash.testingProgress', { done: clashTest.probed, total: clashTest.toProbe ?? 0 }) }}
+            </span>
+            <span v-if="clashTest.phase === 'done' && clashTest.alive < (clashTest.total ?? 0)" class="tag">
+              {{ t('proxies.clash.uniqueExits', { n: clashTest.aliveUnique ?? 0 }) }}
+            </span>
+            <span v-if="clashTestSkipped > 0" class="tag">
+              {{ t('proxies.clash.cooldownSkipped', { n: clashTestSkipped }) }}
+            </span>
+            <span class="proxyx-test-panel__spring" />
+            <button class="pxbtn pxbtn--sm" @click="clashTestExpanded = !clashTestExpanded">
+              {{ t(clashTestExpanded ? 'proxies.clash.collapse' : 'proxies.clash.expand') }}
+            </button>
+          </div>
+          <div v-if="clashTest.phase === 'failed' && clashTest.error" class="proxyx-hint">{{ clashTest.error }}</div>
+          <div v-show="clashTestExpanded" class="proxyx-table-wrap">
           <table class="proxyx-table">
             <thead>
               <tr>
@@ -776,6 +855,7 @@ onMounted(async () => {
               </tr>
             </tbody>
           </table>
+          </div>
         </div>
       </div>
     </div>
@@ -1369,6 +1449,52 @@ onMounted(async () => {
 .proxyx-table-wrap {
   margin-top: 12px;
   overflow-x: auto;
+}
+
+/* 检测会话面板：状态标签行 + 收起/展开（收起只折叠展示，探测照常推进） */
+.proxyx-test-panel {
+  margin-top: 12px;
+}
+
+.proxyx-test-panel__head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.proxyx-test-panel__spring {
+  flex: 1;
+}
+
+/* 检测按钮内进度：细进度条 + 计数（探测是分钟级，只转圈会被当成卡死） */
+.pxtest-run {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 110px;
+}
+
+.pxtest-run__bar {
+  flex: 1;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--border-soft);
+  overflow: hidden;
+}
+
+.pxtest-run__fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width calc(var(--duration-2) * var(--motion-scale)) ease;
+}
+
+.pxtest-run__label {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .proxyx-table {
