@@ -44,6 +44,7 @@ from app.crawler.epic_free import (
     fetch_free_games,
     fetch_free_offers,
     fetch_mobile_breaker,
+    fetch_mobile_freebie,
     resolve_mobile_freebie,
 )
 from app.domains.games.models import Game
@@ -870,19 +871,20 @@ async def _write_offers_snapshot(payload: dict) -> None:
 async def _fetch_offers_payload() -> dict | None:
     """现拉一轮完整展示链 → payload；PC 列表与移动端全失败返回 None。
 
-    两路**并行独立取数**（促销端点 + CMS breaker 兜底图；Epic 促销端点
-    偶发连接失败不该连累移动卡），各拉取函数自带网络容错返回空/None，
-    gather 不需要异常兜底。移动白送从**促销端点元素**推导：当期白送谁在
-    android/ios sandbox 有 0 元 Claim 条目即本周移动白送（官方数据直出
-    真名/截止日/结账直链）；探测失败降级 breaker 立绘卡。封面优先游戏
-    自己的官方 keyImage（促销元素自带），缺图才落 breaker 营销图兜底。
+    三路**并行独立取数**（促销端点 + GamerPower 移动白送链 + CMS breaker
+    兜底图；Epic 促销端点偶发连接失败不该连累移动卡），各拉取函数自带
+    网络容错返回空/None，gather 不需要异常兜底。移动白送主发现链 =
+    GamerPower 真名 → 持久化查询解析 sandbox → 双端 0 元 Claim → 结账
+    直链；该链失败退探测 PC 白送元素池，再退 breaker 立绘卡。封面优先
+    游戏自己的官方 keyImage，缺图才落 breaker 营销图兜底。
     """
     proxy = await _strategy_proxy()
-    games, breaker = await asyncio.gather(
+    games, freebie, breaker = await asyncio.gather(
         fetch_free_offers(proxy=proxy),
+        fetch_mobile_freebie(proxy=proxy),
         fetch_mobile_breaker(proxy=proxy),
     )
-    raw_mobile = await resolve_mobile_freebie(games)
+    raw_mobile = freebie or await resolve_mobile_freebie(games, proxy)
     if raw_mobile:
         mobile = {**raw_mobile, "source": "epic"}
         # 封面优先用游戏自己的官方 keyImage；缺图才落 breaker 营销图兜底
