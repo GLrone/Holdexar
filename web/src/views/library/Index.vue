@@ -2,17 +2,11 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
-import {
-  crawlApi,
-  gamesApi,
-  invalidateGetCache,
-  proxiesApi,
-  watchPoolApi,
-  type GameListItem,
-} from '@/api/client'
+import { gamesApi, invalidateGetCache, type GameListItem } from '@/api/client'
 import { useCrawlStatusStore } from '@/stores/crawlStatus'
 import { useFilterStore } from '@/stores/gamesFilter'
 import { useRegionsStore } from '@/stores/regions'
+import { usePasteAdd } from '@/composables/usePasteAdd'
 import { canGift } from '@/lib/gifting'
 import { mergeItemsByAppid } from '@/lib/priceRefresh'
 import { vStagger } from '@/lib/stagger'
@@ -28,6 +22,7 @@ import { HlButton, HlEmpty, HlScrollList, HlSpinner } from '@/components/ui'
  * 系列区块重组（applySeriesBlocks）依赖 seriesId 数据源，暂为空转。
  */
 const store = useFilterStore()
+const crawlStatus = useCrawlStatusStore()
 const crawl = useCrawlStatusStore()
 const regionsStore = useRegionsStore()
 const router = useRouter()
@@ -96,6 +91,7 @@ function baseParams() {
       store.strictLowest && store.tolerance !== ''
         ? Math.max(0, Math.round(Number(store.tolerance || '0') * 100))
         : undefined,
+    wishlistPriority: store.wishlistPriority || undefined,
   }
 }
 
@@ -196,6 +192,7 @@ watch(
     store.diffType,
     store.strictLowest,
     store.tolerance,
+    store.wishlistPriority,
     store.excludeDlc,
   ],
   () => {
@@ -235,43 +232,41 @@ function passesAdvanced(g: GameListItem): boolean {
 
 const visibleGames = computed(() => items.value.filter(passesAdvanced))
 
-// ─── 空库诊断（total=0 时探测监控池、更新状态与代理配置，给引导文案）───
-
-const emptyDiag = ref<{
-  checked: boolean
-  poolCount: number | null
-  crawlRunning: boolean | null
-  proxyReady: boolean | null
-}>({ checked: false, poolCount: null, crawlRunning: null, proxyReady: null })
+// ─── 空态：区分「库里没有游戏」与「有条件但没匹配」───
 
 /** 服务端全空且无搜索词才算「库空」，有筛选条件时不算（走「没有匹配结果」） */
 const isLibraryEmpty = computed(
   () => initialized.value && !isError.value && total.value === 0 && !store.committedSearch,
 )
 
-watch(isLibraryEmpty, async (empty) => {
-  if (!empty || emptyDiag.value.checked) return
-  emptyDiag.value.checked = true
-  const [pool, active, proxy] = await Promise.allSettled([
-    watchPoolApi.accounts(),
-    crawlApi.active(),
-    proxiesApi.resolveProxy(),
-  ])
-  if (pool.status === 'fulfilled') {
-    emptyDiag.value.poolCount = pool.value.reduce(
-      (sum, acc) => sum + (acc.itemCount ?? 0),
-      0,
-    )
-  }
-  if (active.status === 'fulfilled') {
-    emptyDiag.value.crawlRunning = active.value.activeJobId !== null
-  }
-  // resolve 出 null = 直连（抓取的标准形态，不配代理照常更新价格）；
-  // 该字段只决定空态是否附带「网络受限可配代理改善」的提示
-  if (proxy.status === 'fulfilled') {
-    emptyDiag.value.proxyReady = proxy.value.proxyUrl !== null
-  }
+/** 本轮刚添加的款数：>0 时空态改显「正在获取价格」——新导入行要等首轮
+ *  取价补全后才出现在列表里，这个间隙必须让用户看到系统接住了 */
+const addedPending = ref(0)
+
+// 粘贴添加链（与仪表盘欢迎卡共用）：空库态直接添加，成功后列表自动出现
+const { addOpen, addText, addMsg, addBusy, submitAdd } = usePasteAdd({
+  onAdded: (added) => {
+    addedPending.value = added
+  },
+  onSettled: () => load(),
 })
+
+// 首爬收敛（爬取从跑到停）→ 重取一次：条目补全后空态自然消失
+watch(
+  () => crawlStatus.running,
+  (now, before) => {
+    if (before && !now && addedPending.value > 0) {
+      addedPending.value = 0
+      void load()
+    }
+  },
+)
+
+/** 清除搜索与筛选（「没有匹配结果」的出路）：搜索词 + 全部筛选回默认 */
+function clearFilters() {
+  store.resetForLeave()
+  void load()
+}
 
 // ─── 无限滚动 ───
 // 两种模式各有一个触发点：
@@ -363,50 +358,61 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <!-- 空状态（挂 data-tour：ProductTour「商店数据」步的聚光锚点——空态
+      <!-- 空状态（挂 data-tour：ProductTour「找游戏」步的聚光锚点——空态
            正是那步要教的场景。不用 data-section：那会被 HlSectionRail 扫成
-           分节刻度，商店页本无分节轨） -->
+           分节刻度，找游戏页本无分节轨）
+           两态分开：A 库里没有游戏（给添加动作）≠ C 有条件但没匹配（给清除入口）。
+           添加只进目录并自动取一次价格，不需要 Steam 账号，也不经过任务页 -->
       <HlEmpty
         v-if="!isLoading && !isError && visibleGames.length === 0 && initialized"
         icon=""
         data-tour="lib-empty"
       >
-        <!-- 库本身为空：诊断监控池与更新状态，给引导。分支按用户处境排序：
-             已加游戏（等更新 / 网络受限提示）→ 还没加游戏（去添加）。
-             代理不是抓价前提（直连为标准形态），只在「长时间没数据」时作为
-             可能的改善手段出现，文案留有余地 -->
-        <template v-if="isLibraryEmpty">
-          <h3>{{ t('library.empty.library.title') }}</h3>
-          <template v-if="emptyDiag.poolCount !== null && emptyDiag.poolCount > 0">
-            <p>{{ t('library.empty.library.pool', { n: emptyDiag.poolCount }) }}</p>
-            <p v-if="emptyDiag.crawlRunning">{{ t('library.empty.library.crawling') }}</p>
-            <template v-else>
-              <p>{{ t('library.empty.library.startHint') }}</p>
-              <template v-if="emptyDiag.checked && emptyDiag.proxyReady === false">
-                <p class="lib-empty-reason">{{ t('library.empty.library.netHint') }}</p>
-                <div class="lib-empty-actions">
-                  <HlButton size="sm" @click="router.push('/proxies')">
-                    {{ t('library.empty.library.goProxy') }}
-                  </HlButton>
-                </div>
-              </template>
-            </template>
-          </template>
-          <template v-else-if="emptyDiag.checked">
-            <p>{{ t('library.empty.library.noPool1') }}</p>
-            <p>{{ t('library.empty.library.noPool2') }}</p>
-            <div class="lib-empty-actions">
-              <HlButton size="sm" @click="router.push('/crawl')">
-                {{ t('library.empty.library.goImport') }}
-              </HlButton>
-            </div>
-          </template>
-          <p v-else>{{ t('library.empty.library.checking') }}</p>
-        </template>
-        <!-- 有筛选/搜索：常规无结果 -->
-        <template v-else>
+        <!-- 分支优先级：搜索/筛选无结果（C）优先于「刚添加」（B）——用户已在
+             搜索时，找到与否才是他当前的问题；无搜索时 B（刚添加）先于 A（没游戏） -->
+        <template v-if="!isLibraryEmpty">
           <h3>{{ t('library.empty.filter.title') }}</h3>
           <p>{{ t('library.empty.filter.hint') }}</p>
+          <div class="lib-empty-actions">
+            <HlButton size="sm" @click="clearFilters">
+              {{ t('library.empty.filter.clear') }}
+            </HlButton>
+          </div>
+        </template>
+        <template v-else-if="addedPending > 0">
+          <h3>{{ t('library.empty.library.pending') }}</h3>
+          <p>{{ t('library.empty.library.pendingHint') }}</p>
+        </template>
+        <template v-else>
+          <h3>{{ t('library.empty.library.title') }}</h3>
+          <p>{{ t('library.empty.library.hint') }}</p>
+          <div class="lib-empty-actions">
+            <HlButton size="sm" variant="primary" @click="addOpen = !addOpen">
+              {{ t('library.empty.library.paste') }}
+            </HlButton>
+            <HlButton size="sm" @click="router.push('/pool?add=1')">
+              {{ t('library.empty.library.import') }}
+            </HlButton>
+          </div>
+          <!-- 内联粘贴区：粘贴即入库并自动取价（与仪表盘欢迎卡同一链路） -->
+          <div v-if="addOpen" class="lib-empty-add">
+            <HlTextarea v-model="addText" :rows="3" :placeholder="t('dashboard.welcome.pasteHint')" />
+            <div class="lib-empty-actions" style="margin-top: 8px">
+              <HlButton
+                size="sm"
+                variant="primary"
+                :loading="addBusy"
+                :disabled="addBusy || !addText.trim()"
+                @click="submitAdd"
+              >
+                {{ addBusy ? t('dashboard.welcome.adding') : t('dashboard.welcome.add') }}
+              </HlButton>
+              <HlButton variant="text" size="sm" :disabled="addBusy" @click="addOpen = false">
+                {{ t('common.cancel') }}
+              </HlButton>
+              <span v-if="addMsg" class="lib-empty-msg">{{ addMsg }}</span>
+            </div>
+          </div>
         </template>
       </HlEmpty>
 
@@ -426,6 +432,7 @@ onBeforeUnmount(() => {
             :game="item as GameListItem"
             :layout-mode="'list'"
             :enabled-regions="regionsStore.enabledCodes"
+            :show-top3="store.top3Check"
           />
         </template>
         <!-- 加载态随列表一起滚（不能挂在页面底部，列表内滚时永远看不到） -->
@@ -452,6 +459,7 @@ onBeforeUnmount(() => {
           :game="game"
           :layout-mode="store.layoutMode"
           :enabled-regions="regionsStore.enabledCodes"
+          :show-top3="store.top3Check"
         />
       </div>
 
@@ -479,11 +487,15 @@ onBeforeUnmount(() => {
   gap: 8px;
   margin-top: 10px;
 }
-/* 代理诊断行：点破「没数据」的根因，视觉权重高于普通引导句 */
-.lib-empty-reason {
-  margin: 6px 0;
-  font-size: 13px;
-  line-height: 1.65;
+/* 内联粘贴区（空库态的添加动作展开处）与结果提示 */
+.lib-empty-add {
+  margin-top: 10px;
+  width: min(420px, 100%);
+  text-align: left;
+  margin-inline: auto;
+}
+.lib-empty-msg {
+  font-size: 12px;
   color: var(--text-secondary);
 }
 

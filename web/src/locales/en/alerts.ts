@@ -35,7 +35,7 @@ const alerts: Partial<Record<MessageKey, string>> = {
   'alerts.rules.hintPct': '%, e.g. 50 = 50% off or more',
 
   /* Rule list */
-  'alerts.rules.empty': 'No rules yet',
+  'alerts.rules.empty': 'No price alerts yet — add one and get told the moment a price hits.',
   'alerts.rules.never': 'Never',
   'alerts.rules.editTitle': 'Edit rule #{id}',
   'alerts.rules.targetValuePlaceholder': 'Target',
@@ -65,7 +65,7 @@ const alerts: Partial<Record<MessageKey, string>> = {
   'alerts.table.email': 'Email',
 
   /* Trigger history */
-  'alerts.history.empty': 'No triggers yet',
+  'alerts.history.empty': 'Triggered alerts will show up here.',
   'alerts.history.clearAll': 'Clear all',
   'alerts.history.removeConfirm': 'Delete this trigger record for {name}?',
   'alerts.history.clearConfirm': 'Clear all {count} trigger records? This cannot be undone.',

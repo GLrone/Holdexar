@@ -35,7 +35,7 @@ const alerts = {
   'alerts.rules.hintPct': '%（如 50 = 5 折以下）',
 
   /* ── 规则列表 ── */
-  'alerts.rules.empty': '暂无规则',
+  'alerts.rules.empty': '还没有价格提醒——添加一条，到价即通知。',
   'alerts.rules.never': '从未',
   'alerts.rules.editTitle': '编辑规则 #{id}',
   'alerts.rules.targetValuePlaceholder': '目标值',
@@ -66,7 +66,7 @@ const alerts = {
   'alerts.table.email': '邮件',
 
   /* ── 触发历史 ── */
-  'alerts.history.empty': '暂无触发记录',
+  'alerts.history.empty': '提醒触发后会出现在这里。',
   'alerts.history.clearAll': '清空全部',
   'alerts.history.removeConfirm': '删除 {name} 的这条触发记录？',
   'alerts.history.clearConfirm': '清空全部 {count} 条触发记录？此操作不可恢复。',
