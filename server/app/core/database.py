@@ -174,6 +174,12 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
     "alert_events": {
         "price_cny": "BIGINT",
     },
+    # 投递账本：已尝试次数（首次投递记 1）与最近一次失败原因原文
+    # （retryable 判定的输入）；已有行从 0 起算、无失败记录
+    "notification_candidates": {
+        "attempts": "INTEGER DEFAULT 0",
+        "last_error": "TEXT",
+    },
     # 汇率历史 canonical 语义列（数据回填与唯一索引在 v8 迁移链，见
     # _migrate_fx_history_canonical；此处只保证老库列存在，迁移链信任本层先跑）
     "fx_rate_history": {
