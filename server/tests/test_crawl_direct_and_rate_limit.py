@@ -111,14 +111,14 @@ def _crawl_env(monkeypatch):
 
     monkeypatch.setattr(pp_exits, "exit_snapshot", _snapshot)
 
-    def _one_lane(_data_dir, **_kw):
+    async def _one_lane(_session, _data_dir, **_kw):
         binding = {"lane": 0, "url": "http://127.0.0.1:1",
                    "exitIp": "1.1.1.1", "node": "n1"}
         return {"urls": [binding["url"]], "exit_keys": [binding["exitIp"]],
                 "nodes": [binding["node"]], "bindings": [binding],
                 "runtime_lanes": 1, "known_exits": 1}
 
-    monkeypatch.setattr(pp_runtime, "lane_run_plan", _one_lane)
+    monkeypatch.setattr(pp_runtime, "crawl_lane_plan", _one_lane)
 
     async def _noop(*a, **kw):
         return 0
@@ -179,12 +179,12 @@ async def test_start_job_without_runtime_refuses_to_start(db, monkeypatch):
     # 确定性：不看本机是否有池 Runtime，直接声明"不可用"
     monkeypatch.setattr(pp_runtime, "current_runtime_proxy_url", lambda _d=None: None)
 
-    def _no_runtime(_d, **_kw):
+    async def _no_runtime(_session, _d, **_kw):
         from app.domains.proxypool.runtime import RuntimeUnavailableError
 
         raise RuntimeUnavailableError("代理运行时不可用，本次爬取未启动")
 
-    monkeypatch.setattr(pp_runtime, "lane_run_plan", _no_runtime)
+    monkeypatch.setattr(pp_runtime, "crawl_lane_plan", _no_runtime)
     with pytest.raises(RuntimeUnavailableError):
         await crawl_service.start_job(
             scope="appids", appids=[998001], kind="scheduled"
@@ -200,12 +200,12 @@ async def test_run_sequential_without_runtime_starts_nothing(db, monkeypatch):
     _crawl_env(monkeypatch)
     monkeypatch.setattr(pp_runtime, "current_runtime_proxy_url", lambda _d=None: None)
 
-    def _no_runtime(_d, **_kw):
+    async def _no_runtime(_session, _d, **_kw):
         from app.domains.proxypool.runtime import RuntimeUnavailableError
 
         raise RuntimeUnavailableError("代理运行时不可用，本次爬取未启动")
 
-    monkeypatch.setattr(pp_runtime, "lane_run_plan", _no_runtime)
+    monkeypatch.setattr(pp_runtime, "crawl_lane_plan", _no_runtime)
     results = await crawl_service.run_sequential(
         [{"scope": "appids", "appids": [998001], "kind": "scheduled"}],
     )
@@ -280,7 +280,9 @@ async def test_rate_limiter_allows_within_window():
 @pytest.mark.asyncio
 async def test_rate_limiter_blocks_beyond_window(monkeypatch):
     """第 N+1 发阻塞：等到最旧一条出窗才放行（时间加速验证）。"""
-    lim = SlidingWindowRateLimiter(2, 0.3)
+    # 窗口取 1.2s：两次 acquire 之间的调度停顿（高负载下可达数百毫秒）必须
+    # 小于窗口本身，「窗口满必须等待」的前提才在任意负载下成立
+    lim = SlidingWindowRateLimiter(2, 1.2)
     await lim.acquire()
     await lim.acquire()
     # 窗口满：acquire 应阻塞到首发出窗（~0.3s）后放行
@@ -294,7 +296,7 @@ async def test_rate_limiter_blocks_beyond_window(monkeypatch):
     )
     await lim.acquire()
     assert sleeps, "窗口满时必须等待（测试中 sleep 被替换为记录）"
-    assert sleeps[0] <= 0.3 + 1e-6, "等待时长 = 最旧请求出窗剩余时间"
+    assert sleeps[0] <= 1.2 + 1e-6, "等待时长 = 最旧请求出窗剩余时间"
 
 
 @pytest.mark.asyncio
