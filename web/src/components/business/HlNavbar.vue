@@ -129,6 +129,7 @@ onBeforeUnmount(() => {
         <input
           type="text"
           class="search-box"
+          data-tour="nav-search"
           style="flex: 1; min-width: 200px; max-width: none"
           :placeholder="t('navbar.search.placeholder')"
           :value="store.search"

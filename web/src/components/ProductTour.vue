@@ -14,14 +14,16 @@ import type { IconName } from '@/components/ui/icons'
    - 教练标记（Coachmark）：聚光框旁气泡，8 分向智能避让（优先下方/右上），
      永不与聚光框重叠、永不超出视口——高卡片不再遮挡按键
    - 焦点引导：靶点滚动进视野（聚光框完整可见优先），页面滚动/缩放实时跟随
-   顺序编排 = 用户主链：开场 → 找游戏 → 价格自动更新 → 我的关注 → 价格提醒 →
-     游戏库 → 收尾。只教「怎么使用」：添加游戏不要求 Steam 账号、代理不进
-     导览、任务页不进导览（系统层能力，用户无需学习）。
+   顺序编排 = 用户主链：开场 → 找游戏 → 价格从哪来 → 我的关注 → 绑定账号（可选）→
+     收尾。只教「怎么使用」：价格数据由系统自动从 Steam 各区获取，来源与更新
+     周期必须在导览里讲清；添加游戏不要求 Steam 账号、代理不进导览、任务页
+     不进导览（系统层能力，用户无需学习）；提醒在收尾一句话带过，不单独设步。
    关闭兜底：打开即写 ui.onboarding_done 标志（幂等），关闭路径再补写一次。
 
    靶点选择器契约：
-   - 框架层：data-tour 属性（lib-empty = 找游戏空态卡；card-price = 游戏卡
-     价格区；gamelib-main = 游戏库主区；侧边栏项由 HlSideNav 按 to 派生）
+   - 框架层：data-tour 属性（nav-search = 找游戏页搜索框，网格/列表两种布局
+     都常驻；card-price = 游戏卡价格区；lib-empty = 找游戏空态卡；侧边栏项由
+     HlSideNav 按 to 派生）
    - 页面层：data-section 属性（分节卡片既有，零侵入复用）
      该属性的值是**词条 key**（如 `pool.section.items`）而不是译文：
      锚点与语言无关，切语言时下面的选择器不会断。跨页步骤的 key 与视图侧
@@ -80,8 +82,9 @@ const TOUR: TourStep[] = [
   },
   {
     route: '/library',
-    // 空态卡 / 卡片网格二选一：空库时聚光空态卡（正是要解释的场景），已有数据时聚光网格
-    target: ['[data-tour="lib-empty"]', '.card-grid'],
+    // 聚光搜索框：网格/列表两种布局下导航栏都常驻——聚光「找」这个动作本身，
+    // 不聚结果区（整片网格近全屏等于没聚，列表布局还没有网格容器）
+    target: '[data-tour="nav-search"]',
     titleKey: 'productTour.stepFind.title',
     paras: [
       { textKey: 'productTour.stepFind.p1' },
@@ -112,23 +115,15 @@ const TOUR: TourStep[] = [
     ],
   },
   {
-    route: '/alerts',
-    target: '[data-section="alerts.section.rules"]',
-    titleKey: 'productTour.stepAlert.title',
+    route: '/settings',
+    target: '[data-section="settings.section.steamAccount"]',
+    titleKey: 'productTour.stepBind.title',
     paras: [
-      { textKey: 'productTour.stepAlert.p1' },
-      { textKey: 'productTour.stepAlert.p2' },
-      { emphKey: 'productTour.stepAlert.emph' },
+      { emphKey: 'productTour.stepBind.emph' },
+      { textKey: 'productTour.stepBind.p1' },
+      { textKey: 'productTour.stepBind.p2' },
     ],
-  },
-  {
-    route: '/gamelib',
-    target: '[data-tour="gamelib-main"]',
-    titleKey: 'productTour.stepGamelib.title',
-    paras: [
-      { textKey: 'productTour.stepGamelib.p1' },
-      { textKey: 'productTour.stepGamelib.p2' },
-    ],
+    hintKey: 'productTour.stepBind.hint',
   },
   {
     titleKey: 'productTour.done.title',
@@ -538,7 +533,7 @@ watch(model, async (v, was) => {
     void useSettingsStore().markOnboardingDone()
     return
   }
-  if (!v || !was) return
+  if (v || !was) return
   invalidate()
   stopStabilize()
   offGlobal?.()
