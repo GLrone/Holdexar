@@ -48,7 +48,7 @@ from app.crawler.browse_store import StoreBrowseAPI, _to_int
 from app.domains.proxypool.models import HealthObservation, ProxyNode, ProxyNodeSource
 from app.domains.proxypool.pool import pool_file_names
 from app.domains.proxypool.runtime import mixed_port_of
-from app.domains.proxypool.state import NODE_DEAD, evaluate_node_state
+from app.domains.proxypool.state import NODE_DEAD, NODE_RETIRED, evaluate_node_state
 
 logger = logging.getLogger(__name__)
 
@@ -100,12 +100,19 @@ PROBE_FAILED_DETAIL = "内核探测失败"
 
 @dataclass(frozen=True)
 class ProbeResult:
-    """一次探测的原始结论。"""
+    """一次探测的原始结论。
+
+    `valid=False` 表示**这一探没有测到节点本身**（内核不认识这个名字、
+    控制器不可达）：它不是"经该节点访问国外网站超时"，因此不构成健康证据，
+    不能累加失败次数、更不能推进状态——否则一次换端口/时序错位就能把整池判死。
+    判"节点坏"的唯一依据是**经该节点发真实请求失败/超时**。
+    """
 
     runtime_name: str
     ok: bool
     delay_ms: int | None
     detail: str
+    valid: bool = True
 
 
 @dataclass(frozen=True)
@@ -137,11 +144,13 @@ async def probe_node(
                 params={"url": url, "timeout": timeout_ms},
             )
     except Exception as exc:  # noqa: BLE001 —— 控制器不可达是「内核没起来」的信号
+        # 控制器不可达 ≠ 节点坏：这一探根本没测到节点，不产生健康证据
         return ProbeResult(runtime_name, False, None,
-                           f"控制器请求异常：{type(exc).__name__}")
+                           f"控制器请求异常：{type(exc).__name__}", valid=False)
 
     if resp.status_code == 404:
-        return ProbeResult(runtime_name, False, None, NOT_FOUND_DETAIL)
+        # 内核不认识这个名字：探错了对象，不是节点访问国外网站超时
+        return ProbeResult(runtime_name, False, None, NOT_FOUND_DETAIL, valid=False)
     if resp.status_code != 200:
         return ProbeResult(runtime_name, False, None,
                            f"{PROBE_FAILED_DETAIL}（HTTP {resp.status_code}）")
@@ -185,6 +194,29 @@ async def _probe_and_record(
         .where(ProxyNodeSource.node_id == node.node_id)
     )
     previous = node.state
+    if not result.valid:
+        # 这一探没测到节点本身（内核不认识这个名字 / 控制器不可达）：只留观测，
+        # **不累加失败计数、不推进状态**。判"节点坏"的唯一依据是经该节点发真实
+        # 请求失败或超时；把"探不到对象"记成节点不健康会让一次换端口/时序错位
+        # 把整池判死。
+        session.add(HealthObservation(
+            node_id=node.node_id,
+            level=PROBE_LEVEL,
+            ok=False,
+            latency_ms=None,
+            detail=result.detail or None,
+            observed_at=now,
+        ))
+        return HealthOutcome(
+            node_id=node.node_id,
+            runtime_name=node.runtime_name,
+            ok=False,
+            delay_ms=None,
+            detail=result.detail,
+            previous_state=previous,
+            state=previous,
+        )
+
     # 连续失败计数：成功归零、失败累加。它既是状态机的输入（退休线判据），
     # 也是台账事实——判 DEAD 的节点必须带着失败次数，不能留下"DEAD 且计数 0"。
     failures = 0 if result.ok else (node.consecutive_failures or 0) + 1
@@ -296,7 +328,7 @@ async def recover_dead_nodes(
         select(ProxyNode, source.c.original_name)
         .join(source, source.c.node_id == ProxyNode.node_id)
         .outerjoin(last_probe, last_probe.c.node_id == ProxyNode.node_id)
-        .where(ProxyNode.state == NODE_DEAD)
+        .where(ProxyNode.state.in_((NODE_DEAD, NODE_RETIRED)))
         .order_by(
             ProxyNode.consecutive_failures.desc(),
             last_probe.c.last_at.asc().nullsfirst(),
@@ -314,10 +346,10 @@ async def recover_dead_nodes(
 
     await session.flush()
     if outcomes:
-        recovered = sum(1 for o in outcomes if o.state != NODE_DEAD)
+        still_out = sum(1 for o in outcomes if o.state in (NODE_DEAD, NODE_RETIRED))
         logger.info(
-            "[L0恢复] DEAD 补探 %d 个：成功 %d / 仍 DEAD %d",
-            len(outcomes), recovered, len(outcomes) - recovered,
+            "[L0恢复] 出池节点补探 %d 个：成功 %d / 仍未进池 %d",
+            len(outcomes), len(outcomes) - still_out, still_out,
         )
     return tuple(outcomes)
 
