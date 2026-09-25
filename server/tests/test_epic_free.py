@@ -201,12 +201,12 @@ def _claim_row(namespace: str, offer: str, end: str) -> dict:
 
 @pytest.mark.asyncio
 async def test_resolve_mobile_freebie(monkeypatch):
-    """促销元素 → 移动白送：Claim 判别 + 双端合并直链 + 截止日/原价/中文名。"""
+    """PC 白送元素池探测：Claim 判别 + 双端合并直链 + 截止日/原价/中文名。"""
     from app.crawler import epic_free as ef
 
     probed: list[tuple[str, str]] = []
 
-    def fake_offers(namespace, platform):
+    def fake_offers(namespace, platform, proxy=None):
         probed.append((namespace, platform))
         if namespace != "ns-live":
             return []
@@ -247,7 +247,7 @@ async def test_resolve_mobile_freebie_latest_end(monkeypatch):
     """多元素同时带 Claim：取截止日最晚者（排除上一期的尾巴）。"""
     from app.crawler import epic_free as ef
 
-    def fake_offers(namespace, platform):
+    def fake_offers(namespace, platform, proxy=None):
         ends = {"ns-old": "2026-09-17", "ns-new": "2026-09-24"}
         end = ends.get(namespace)
         return [_claim_row(namespace, f"{namespace}-offer", end)] if end else []
@@ -267,10 +267,166 @@ async def test_resolve_mobile_freebie_none(monkeypatch):
     """全无 Claim / 空元素列表 → None（调用方降级 breaker）。"""
     from app.crawler import epic_free as ef
 
-    monkeypatch.setattr(ef, "_sandbox_offers_sync", lambda ns, p: [])
+    monkeypatch.setattr(ef, "_sandbox_offers_sync", lambda ns, p, proxy=None: [])
     games = [_mobile_game("X", "ns-x")]
     assert await ef.resolve_mobile_freebie(games) is None
     assert await ef.resolve_mobile_freebie([]) is None
+
+
+# ─── 移动白送主发现链：GamerPower → 持久化查询 → 结账直链 ──────────────
+
+
+def test_parse_gamerpower_mobile():
+    """GamerPower 判别式：App 表述 + Game + 有效截止日；PC Epic 限免不误收。"""
+    from app.crawler.epic_free import parse_gamerpower_mobile
+
+    payload = [
+        {
+            "title": "Cardpocalypse (Mobile) Giveaway", "status": "Active", "type": "Game",
+            "description": "Cardpocalypse (Mobile version) is free until October 1 "
+                           "on the Epic Games Store App for iPhone, iPad, and Android.",
+            "image": "https://gp/img.jpg", "open_giveaway_url": "https://gp/open/x",
+            "published_date": "2026-09-24 11:19:31", "end_date": "2026-10-01 23:59:00",
+            "worth": "$4.99",
+        },
+        # PC 端 Epic 限免（描述无 App 字样）不误收
+        {
+            "title": "Some Game (Epic Games) Giveaway", "status": "Active", "type": "Game",
+            "description": "Claim it via Epic Games Store!", "open_giveaway_url": "https://gp/open/y",
+            "published_date": "2026-09-25 09:00:00", "end_date": "2026-10-02 23:59:00",
+        },
+        # key 赠品：无有效截止日不收
+        {
+            "title": "Keys Giveaway", "status": "Active", "type": "Game",
+            "description": "Keys for the Epic Games Store App users.",
+            "open_giveaway_url": "https://gp/open/z",
+            "published_date": "2026-09-26 09:00:00", "end_date": "N/A",
+        },
+        # 非在送不收
+        {
+            "title": "Expired (Mobile) Giveaway", "status": "Expired", "type": "Game",
+            "description": "Was free on the Epic Games Store App.",
+            "open_giveaway_url": "https://gp/open/w", "end_date": "2026-09-01 00:00:00",
+        },
+    ]
+    out = parse_gamerpower_mobile(payload)
+    assert out == {
+        "title": "Cardpocalypse", "image": "https://gp/img.jpg",
+        "url": "https://gp/open/x", "end": "2026-10-01", "worth": "$4.99",
+    }
+    assert parse_gamerpower_mobile([]) is None
+    assert parse_gamerpower_mobile({"error": 1}) is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_store_page_url(monkeypatch):
+    """标题 → 商品页 URL：搜索首条 offerId/sandboxId → catalogNs.pageSlug。"""
+    from app.crawler import epic_free as ef
+
+    async def fake_persisted(op, variables, sha, proxy=None):
+        if op == "primarySearchAutocomplete":
+            assert variables["keywords"] == "Some Game"
+            return {"data": {"Catalog": {"searchStore": {"elements": [
+                {"offerId": "off" * 8, "sandboxId": "sb" * 16, "title": "Some Game"},
+            ]}}}}
+        assert op == "getCatalogOffer"
+        assert variables["offerId"] == "off" * 8
+        return {"data": {"Catalog": {"catalogOffer": {
+            "catalogNs": {"mappings": [{"pageSlug": "some-game-android-52b29b"}]},
+            "keyImages": [
+                {"type": "Thumbnail", "url": "https://cdn/thumb.jpg"},
+                {"type": "OfferImageWide", "url": "https://cdn/wide.jpg"},
+            ],
+        }}}}
+
+    monkeypatch.setattr(ef, "_egs_persisted", fake_persisted)
+    page = await ef.resolve_store_page_url("Some Game")
+    assert page == {
+        "url": "https://store.epicgames.com/p/some-game-android-52b29b",
+        "image": "https://cdn/wide.jpg",
+    }
+
+
+@pytest.mark.asyncio
+async def test_resolve_store_page_url_none_paths(monkeypatch):
+    """搜索无命中/缺 slug 返回 None 或缺键（调用方回落 open 链）。"""
+    from app.crawler import epic_free as ef
+
+    async def no_hit(op, variables, sha, proxy=None):
+        return {"data": {"Catalog": {"searchStore": {"elements": []}}}}
+
+    monkeypatch.setattr(ef, "_egs_persisted", no_hit)
+    assert await ef.resolve_store_page_url("Unknown") is None
+
+    async def no_slug(op, variables, sha, proxy=None):
+        if op == "primarySearchAutocomplete":
+            return {"data": {"Catalog": {"searchStore": {"elements": [
+                {"offerId": "x", "sandboxId": "y"},
+            ]}}}}
+        return {"data": {"Catalog": {"catalogOffer": {
+            "keyImages": [{"type": "OfferImageWide", "url": "https://cdn/w2.jpg"}],
+        }}}}
+
+    monkeypatch.setattr(ef, "_egs_persisted", no_slug)
+    # 无 slug 但有官方封面：仍返回（url 缺由调用方回落 open 链）
+    assert await ef.resolve_store_page_url("Whatever") == {
+        "url": None, "image": "https://cdn/w2.jpg",
+    }
+
+
+@pytest.mark.asyncio
+async def test_resolve_mobile_checkout(monkeypatch):
+    """标题 → 结账直链：android/ios 两端 Claim 合并成单条 offers 查询串。"""
+    from app.crawler import epic_free as ef
+
+    async def fake_persisted(op, variables, sha, proxy=None):
+        return {"data": {"Catalog": {"searchStore": {"elements": [
+            {"offerId": "pc-offer", "sandboxId": "ns123", "title": "X"},
+        ]}}}}
+
+    def fake_offers(namespace, platform, proxy=None):
+        assert namespace == "ns123"
+        if platform == "android":
+            return [{"content": {"title": "X", "purchase": [{
+                "purchaseType": "Claim",
+                "price": {"decimalPrice": 0},
+                "purchasePayload": {"offerId": "and-offer", "sandboxId": "ns123"},
+                "discount": {"discountEndDate": "2026-10-01T15:00:00.000Z"},
+            }]}}]
+        return [{"content": {"purchase": [
+            {"purchaseType": "Purchase", "price": {"decimalPrice": 499},
+             "purchasePayload": {"offerId": "ios-paid", "sandboxId": "ns123"}},
+            {"purchaseType": "Claim", "price": {"decimalPrice": "0"},
+             "purchasePayload": {"offerId": "ios-free", "sandboxId": "ns123"}},
+        ]}}]
+
+    monkeypatch.setattr(ef, "_egs_persisted", fake_persisted)
+    monkeypatch.setattr(ef, "_sandbox_offers_sync", fake_offers)
+    out = await ef.resolve_mobile_checkout("X")
+    assert out["url"] == ("https://store.epicgames.com/purchase"
+                          "?offers=1-ns123-and-offer&offers=1-ns123-ios-free")
+    assert out["end"] == "2026-10-01"
+
+
+@pytest.mark.asyncio
+async def test_resolve_mobile_checkout_none(monkeypatch):
+    """无 Claim 条目 / 搜索无命中 → None（调用方回落商品页）。"""
+    from app.crawler import epic_free as ef
+
+    async def fake_persisted(op, variables, sha, proxy=None):
+        return {"data": {"Catalog": {"searchStore": {"elements": [
+            {"offerId": "pc", "sandboxId": "ns", "title": "X"},
+        ]}}}}
+
+    monkeypatch.setattr(ef, "_egs_persisted", fake_persisted)
+    monkeypatch.setattr(ef, "_sandbox_offers_sync", lambda ns, p, proxy=None: [])
+    assert await ef.resolve_mobile_checkout("X") is None
+
+    async def no_hit(op, variables, sha, proxy=None):
+        return {"data": {"Catalog": {"searchStore": {"elements": []}}}}
+
+    monkeypatch.setattr(ef, "_egs_persisted", no_hit)
+    assert await ef.resolve_mobile_checkout("Y") is None
 
 
 # ─── 自动链 ────────────────────────────────────────────────────────

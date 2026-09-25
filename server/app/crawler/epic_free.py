@@ -10,9 +10,13 @@
   英文标题；精确名首选必先命中，demo/原声带排其后）
 - 落库形态对齐 games.epic_date 现行语义「开始日期」单日期（非区间），
   存 UTC 日期原文（换班时刻 15/17:00 UTC，北京当日 23/次日 01）
-- 移动端每周白送与 PC 同属促销端点（每周四换班）：当期白送元素谁在
-  android/ios sandbox offers 有 0 元 Claim 条目即本周移动白送
-  （resolve_mobile_freebie），无命中降级 CMS 移动页 breaker 立绘兜底
+- 移动端每周白送是独立促销，且常不在促销端点元素里：发现链为
+  GamerPower android 限免（描述含 "epic games store app" 为 Epic 移动
+  白送专属表述）→ 商店持久化查询按真名解析 sandbox → sandbox offers
+  双端 0 元 Claim → 结账直链 purchase?offers（需浏览器 Epic 登录态，
+  未登录 400 Account id missing 属官方行为，登录后直达免费结算）；
+  GamerPower 失败退探测 PC 白送元素池（resolve_mobile_freebie），
+  再退 CMS 移动页 breaker 立绘兜底
 
 节流口径（对齐 boards.py 独立轻量会话）：单批拉一次促销端点 +
 每个未匹配标题一次 storesearch；间隔 500ms；不接爬虫主链路 429 熔断。
@@ -22,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -37,19 +42,42 @@ FREE_GAMES_URL = (
     "https://store-site-backend-static-ipv4.ak.epicgames.com/freeGamesPromotions"
 )
 # 移动端每周白送兜底信号：官方 CMS 移动页的 Free Giveaway breaker
-# （URL 固定、内容每周四换）。移动端与 PC 同属「每周四白送」计划，移动
-# 白送游戏同样出现在促销端点元素里，主判别走 sandbox Claim 探测，breaker
-# 只在探测失败时兜底出卡。
+# （URL 固定、内容每周四换）。主判别走 GamerPower 真名 → sandbox Claim
+# 结账直链链，breaker 只在自动源全失败时兜底出卡（仅营销图 + 移动页链接）。
 MOBILE_CMS_URL = (
     "https://store-content-ipv4.ak.epicgames.com/api/en-US/content/static/mobile"
 )
 EPIC_MOBILE_PAGE_URL = "https://store.epicgames.com/en-US/mobile"
-# 移动端判别数据源：egs-platform-service 公开 sandbox offers 接口（无需
-# 认证；UA 用 App 风格）。促销端点的当期白送元素谁在 android/ios 名下有
-# 0 元 Claim 条目，谁就是本周移动端白送——官方数据直出真名/截止日，
-# 结账直链当场拼装。
+# 移动白送自动源：GamerPower 公共 API 免登记，android 平台限免里收录
+# Epic 移动白送（真名/日期/open 跳转链；描述含 "Epic Games Store App"
+# 与 PC 端 Epic 限免及他站 key 赠品区分）。
+GAMERPOWER_ANDROID_URL = "https://www.gamerpower.com/api/giveaways?platform=android"
+# 移动端 Claim 判别数据源：egs-platform-service 公开 sandbox offers 接口
+# （无需认证；UA 用 App 风格）。任一 sandbox 在 android/ios 名下有 0 元
+# Claim 条目即当期移动白送 offer——官方数据直出 offerId/截止日，结账直链
+# 当场拼装；sandbox 来自 GamerPower 真名的持久化查询解析，GamerPower
+# 失败时退用促销端点白送元素的 namespace 逐个探测。
 EGS_PLATFORM_SERVICE = "https://egs-platform-service.store.epicgames.com"
 EGS_APP_UA = "EpicGamesStore/50102 Android/14"
+# 标题 → sandbox 解析：商店持久化查询（HTML 页有 CF，API GET 放行——
+# urllib + 浏览器 UA/Referer 头组合；指纹是过 CF 的关键，勿改 aiohttp）
+EGS_GRAPHQL_URL = "https://store.epicgames.com/graphql"
+EGS_SEARCH_HASH = "be4fe909f9a35f9704db7fed06fc4a47fc798ec0a6cbfa24d737aec2465904fa"
+EGS_OFFER_HASH = "0bd79d7aaf89de3693abb813eec8b664321fab84037cbb968730631c8afe9a9d"
+EGS_SEARCH_CATEGORY = (
+    "games/edition/base|bundles/games|games/edition|editors|addons|games/demo"
+    "|software/edition/base|games/experience|subscription"
+)
+# 持久化查询请求头：与放行组合一致（urllib 默认头序 + 浏览器 UA + Referer）
+_EGS_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://store.epicgames.com/en-US/",
+}
 STORESEARCH_URL = "https://store.steampowered.com/api/storesearch/"
 # 英文标题用于匹配（中文标题对 storesearch 无效；en-US 拉双语对照）
 EN_PARAMS = {"locale": "en-US", "country": "US"}
@@ -367,7 +395,166 @@ async def fetch_mobile_breaker(proxy: str | None = None,
             await session.close()
 
 
-def _sandbox_offers_sync(namespace: str, platform: str) -> list[dict]:
+def _urlopen(req: urllib.request.Request, proxy: str | None, timeout: int):
+    """代理优先的 urllib 打开器：代理失败（连接层）回落直连重试一次。
+
+    HTTPError（应用层响应，如 sandbox 无移动 offer 的 404）不重试——
+    那是有效响应，重试只会浪费一次请求。
+    """
+    openers: list[urllib.request.OpenerDirector] = []
+    if proxy:
+        openers.append(urllib.request.build_opener(urllib.request.ProxyHandler(
+            {"http": proxy, "https": proxy})))
+    openers.append(urllib.request.build_opener())
+    last: Exception | None = None
+    for opener in openers:
+        try:
+            return opener.open(req, timeout=timeout)
+        except urllib.error.HTTPError:
+            raise
+        except (urllib.error.URLError, OSError) as e:
+            last = e
+    assert last is not None
+    raise last
+
+
+def parse_gamerpower_mobile(payload: list | dict) -> dict | None:
+    """GamerPower android 限免 → 当期 Epic 移动白送 {title,image,url,end,worth}。
+
+    判别式：status Active + 描述含 "epic games store app"（移动 App 专属
+    表述——PC 端 Epic 限免只写 "via Epic Games Store"，他站 key 赠品不提）
+    + type 为 Game（排除 DLC/key 包）。同窗多条取最新发布。
+    """
+    entries = payload if isinstance(payload, list) else []
+    best: dict | None = None
+    best_published = ""
+    for g in entries:
+        if not isinstance(g, dict) or g.get("status") != "Active":
+            continue
+        if g.get("type") != "Game":
+            continue
+        desc = str(g.get("description") or "").lower()
+        if "epic games store app" not in desc:
+            continue
+        end_raw = str(g.get("end_date") or "")
+        if not end_raw or end_raw == "N/A":
+            continue
+        title = re.sub(r"\s*\(Mobile\)\s*Giveaway\s*$", "", str(g.get("title") or "")).strip()
+        if not title:
+            continue
+        published = str(g.get("published_date") or "")
+        if published <= best_published:
+            continue
+        best_published = published
+        best = {
+            "title": title,
+            "image": str(g.get("image") or ""),
+            "url": str(g.get("open_giveaway_url") or ""),
+            "end": end_raw[:10] or None,
+            "worth": str(g.get("worth") or "") or None,
+        }
+    return best
+
+
+async def _resolve_redirect(url: str, session: aiohttp.ClientSession,
+                            proxy: str | None = None) -> str:
+    """跟随跳转取最终落地 URL（官方领取页）；失败原样返回。"""
+    try:
+        async with session.get(url, headers=_HEADERS,
+                               allow_redirects=True, proxy=proxy) as resp:
+            final = str(resp.url)
+            return final if final.startswith("http") else url
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return url
+
+
+async def _egs_persisted(operation: str, variables: dict, sha: str,
+                         proxy: str | None = None) -> dict | None:
+    """商店持久化查询。走 urllib 线程：CF 按客户端指纹拦截，
+    aiohttp 403、urllib（同浏览器头）放行。阻塞调用丢线程池；
+    失败返回 None（调用方降级）。"""
+    return await asyncio.to_thread(_egs_persisted_sync, operation, variables, sha, proxy)
+
+
+def _egs_persisted_sync(operation: str, variables: dict, sha: str,
+                        proxy: str | None = None) -> dict | None:
+    url = EGS_GRAPHQL_URL + "?" + urllib.parse.urlencode({
+        "operationName": operation,
+        "variables": json.dumps(variables, separators=(",", ":")),
+        "extensions": json.dumps(
+            {"persistedQuery": {"version": 1, "sha256Hash": sha}},
+            separators=(",", ":"),
+        ),
+    })
+    req = urllib.request.Request(url, headers=_EGS_HEADERS)
+    try:
+        with _urlopen(req, proxy, 25) as resp:
+            if resp.status != 200:
+                logger.info("[epic-mobile] 商店查询 %s HTTP %d", operation, resp.status)
+                return None
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        logger.info("[epic-mobile] 商店查询 %s 失败（忽略）：%s", operation, e)
+        return None
+
+
+def _pick_key_image(offer: dict) -> str:
+    """catalogOffer.keyImages 里挑横版封面（与 PC 链同优先级）。"""
+    by_type: dict[str, str] = {}
+    first = ""
+    for img in offer.get("keyImages") or []:
+        url = img.get("url") or ""
+        if not url:
+            continue
+        by_type[img.get("type") or ""] = url
+        if not first:
+            first = url
+    for t in ("OfferImageWide", "DieselStoreFrontWide", "Thumbnail"):
+        if by_type.get(t):
+            return by_type[t]
+    return first
+
+
+async def resolve_store_page_url(title: str, proxy: str | None = None) -> dict | None:
+    """标题 → Epic 移动版商品页 {url, image}。
+
+    url = catalogNs.pageSlug（移动白送的目录命名空间页就是「免费/获取」
+    按钮所在页）；image = 同一响应里的官方 keyImage（游戏自己封面，
+    替代营销 breaker 图）。搜索无命中/结构变更返回 None（url/image
+    两键独立可用，缺谁补谁）。
+    """
+    ac = await _egs_persisted("primarySearchAutocomplete", {
+        "allowCountries": "CN",
+        "category": EGS_SEARCH_CATEGORY,
+        "count": 4,
+        "country": "CN",
+        "keywords": title,
+        "locale": "en-US",
+        "sortBy": None,
+        "sortDir": "DESC",
+    }, EGS_SEARCH_HASH, proxy)
+    elements = (((ac or {}).get("data") or {}).get("Catalog") or {}).get(
+        "searchStore", {}).get("elements") or []
+    if not elements:
+        return None
+    first = elements[0]
+    offer = await _egs_persisted("getCatalogOffer", {
+        "locale": "zh-CN", "country": "CN",
+        "offerId": first.get("offerId"), "sandboxId": first.get("sandboxId"),
+    }, EGS_OFFER_HASH, proxy)
+    catalog = (((offer or {}).get("data") or {}).get("Catalog") or {}).get("catalogOffer") or {}
+    slug = ((catalog.get("catalogNs") or {}).get("mappings") or [{}])[0].get("pageSlug")
+    image = _pick_key_image(catalog)
+    if not slug and not image:
+        return None
+    return {
+        "url": f"https://store.epicgames.com/p/{slug}" if slug else None,
+        "image": image or None,
+    }
+
+
+def _sandbox_offers_sync(namespace: str, platform: str,
+                         proxy: str | None = None) -> list[dict]:
     """namespace 下移动端全部 offer（公开接口无需认证；UA 用 APP 风格）。"""
     qs = urllib.parse.urlencode({
         "count": "10", "country": "US", "locale": "en-US",
@@ -379,7 +566,7 @@ def _sandbox_offers_sync(namespace: str, platform: str) -> list[dict]:
         "User-Agent": EGS_APP_UA, "Accept": "application/json",
     })
     try:
-        with urllib.request.urlopen(req, timeout=25) as resp:
+        with _urlopen(req, proxy, 25) as resp:
             if resp.status != 200:
                 logger.info("[epic-mobile] sandbox offers %s HTTP %d", platform, resp.status)
                 return []
@@ -412,23 +599,107 @@ def _parse_claim_offers(rows: list[dict], platform: str) -> list[dict]:
     return out
 
 
-async def resolve_mobile_freebie(games: list[EpicFreeGame]) -> dict | None:
-    """当期白送元素 → 移动端白送 {title,image,url,end,worth}；无命中返回 None。
+async def resolve_mobile_checkout(title: str, proxy: str | None = None) -> dict | None:
+    """标题 → 移动端白送结账直链 {url, end}。
 
-    判别式：PC 与移动同属「每周四白送」计划，移动白送游戏就在促销端点的
-    元素里——当期（非预告）元素逐个探测 sandbox offers，谁在 android/ios
-    名下有 0 元 Claim 条目，谁就是本周移动端白送（官方数据直出真名/
-    截止日/封面，不依赖第三方源）。多元素同时命中取截止日最晚者（排除
-    上一期的尾巴）。全无 Claim 返回 None（调用方降级 breaker）。
+    链路：搜索拿 namespace（=sandboxId）→ android/ios 两端 offers →
+    Claim 免费条目 → purchase?offers 结账直链（双端合并单链；需浏览器
+    Epic 登录态）。任一环失败返回 None（调用方回落商品页/open 链）。
+    """
+    ac = await _egs_persisted("primarySearchAutocomplete", {
+        "allowCountries": "CN",
+        "category": EGS_SEARCH_CATEGORY,
+        "count": 4,
+        "country": "CN",
+        "keywords": title,
+        "locale": "en-US",
+        "sortBy": None,
+        "sortDir": "DESC",
+    }, EGS_SEARCH_HASH, proxy)
+    elements = (((ac or {}).get("data") or {}).get("Catalog") or {}).get(
+        "searchStore", {}).get("elements") or []
+    namespace = (elements[0].get("sandboxId") if elements else None)
+    if not namespace:
+        return None
+    rows_android = await asyncio.to_thread(
+        _sandbox_offers_sync, namespace, "android", proxy)
+    rows_ios = await asyncio.to_thread(
+        _sandbox_offers_sync, namespace, "ios", proxy)
+    claims = (_parse_claim_offers(rows_android, "android")
+              + _parse_claim_offers(rows_ios, "ios"))
+    if not claims:
+        return None
+    parts = [f"1-{c['sandboxId']}-{c['offerId']}" for c in claims]
+    query = "&".join(f"offers={part}" for part in parts)
+    end = next((c["end"] for c in claims if c.get("end")), None)
+    return {"url": f"https://store.epicgames.com/purchase?{query}", "end": end}
+
+
+async def fetch_mobile_freebie(proxy: str | None = None,
+                               session: aiohttp.ClientSession | None = None) -> dict | None:
+    """当期移动白送真名 + 官方领取入口（GamerPower 自动源）。
+
+    url 优先结账直链（标题 → sandbox offers Claim 拼装），商品页次之，
+    open 链跳转兜底；封面用商品页响应里的官方 keyImage。解析失败/网络
+    失败返回 None（调用方退 PC 元素池探测与 breaker 兜底）。
+    """
+    owns_session = session is None
+    if owns_session:
+        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25))
+    try:
+        try:
+            async with session.get(GAMERPOWER_ANDROID_URL, headers=_HEADERS,
+                                   proxy=proxy) as resp:
+                if resp.status != 200:
+                    logger.info("[epic-mobile] GamerPower HTTP %d（本轮跳过）", resp.status)
+                    return None
+                payload = await resp.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+            logger.info("[epic-mobile] GamerPower 网络错误（忽略）：%s", e)
+            return None
+        freebie = parse_gamerpower_mobile(payload)
+        if not freebie:
+            return None
+        # 领取入口：结账直链优先，商品页次之，open 链跳转兜底；
+        # 封面用商品页响应里的官方 keyImage
+        checkout = await resolve_mobile_checkout(freebie["title"], proxy)
+        if checkout:
+            freebie["url"] = checkout["url"]
+            if not freebie.get("end") and checkout.get("end"):
+                freebie["end"] = checkout["end"]
+        page = await resolve_store_page_url(freebie["title"], proxy)
+        if page:
+            if page.get("image"):
+                freebie["image"] = page["image"]
+            if not checkout and page.get("url"):
+                freebie["url"] = page["url"]
+        if not checkout and (not page or not page.get("url")):
+            if freebie.get("url"):
+                freebie["url"] = await _resolve_redirect(freebie["url"], session, proxy)
+        return freebie
+    finally:
+        if owns_session:
+            await session.close()
+
+
+async def resolve_mobile_freebie(games: list[EpicFreeGame],
+                                 proxy: str | None = None) -> dict | None:
+    """PC 白送元素池 → 移动端白送 {title,image,url,end,worth}；无命中 None。
+
+    次选源：GamerPower 发现链失败时，退而探测促销端点当期白送元素的
+    namespace——个别白送游戏的移动 offer 与 PC 同 sandbox 时可在此命中
+    （当期非预告元素逐个探 sandbox offers，谁在 android/ios 名下有 0 元
+    Claim 条目谁入选；多元素命中取截止日最晚者）。全无 Claim 返回 None
+    （调用方降级 breaker）。
     """
     best: tuple[str, EpicFreeGame, list[dict]] | None = None
     for g in games:
         if g.upcoming or not g.namespace:
             continue
         rows_android = await asyncio.to_thread(
-            _sandbox_offers_sync, g.namespace, "android")
+            _sandbox_offers_sync, g.namespace, "android", proxy)
         rows_ios = await asyncio.to_thread(
-            _sandbox_offers_sync, g.namespace, "ios")
+            _sandbox_offers_sync, g.namespace, "ios", proxy)
         claims = (_parse_claim_offers(rows_android, "android")
                   + _parse_claim_offers(rows_ios, "ios"))
         if not claims:
