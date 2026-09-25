@@ -79,7 +79,12 @@ const proxies = {
 
   /* Clash 节点检测 */
   'proxies.clash.testNodes': '检测节点（Steam 连通）',
-  'proxies.clash.testing': '逐节点检测 Steam 连通性中（冷却期节点自动跳过，请耐心等待）…',
+  'proxies.clash.testingProgress': '检测中 {done}/{total}',
+  'proxies.clash.queued': '排队等待中…',
+  'proxies.clash.testFailed': '检测失败',
+  'proxies.clash.collapse': '收起',
+  'proxies.clash.expand': '展开',
+  'proxies.clash.cooldownSkipped': '冷却跳过 {n}',
   'proxies.clash.testDone': '检测完成：通 Steam {alive}/{total}',
   'proxies.clash.testDoneDeprecated': '{msg} —— 该订阅不可用节点超过 95%，已标记废弃（后端不再使用，请手动删除或更换）',
   'proxies.clash.aliveTag': '通 Steam {alive}/{total}',

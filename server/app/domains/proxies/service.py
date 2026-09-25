@@ -1142,7 +1142,111 @@ async def _active_clash_subscription_id(status: dict) -> int | None:
     return subs[-1].id if subs else None
 
 
+# ─── Clash 节点检测会话（进度快照）──────────────────────────────
+# 检测是分钟级串行探测，同步等响应会让界面长时间无反馈。每次检测
+# （手动/启动首检/定时体检同源）对应一份模块级会话快照：探测逐节点
+# 写入，前端经 GET /proxies/clash/test/progress 轮询。写入全部发生在
+# 串行锁持有期间（reset 在 impl 锁内首行，finalize 紧随 impl 返回、
+# 中间无 await），单事件循环下无竞态；读取只做拷贝。
+_clash_test_session: dict | None = None
+
+_SESSION_ACTIVE_PHASES = ("queued", "running")
+
+
+def _session_now() -> str:
+    return _naive(get_beijing_time_obj()).isoformat()
+
+
+def _clash_test_session_reset() -> None:
+    global _clash_test_session
+    _clash_test_session = {
+        "phase": "queued",
+        "total": None,
+        "toProbe": None,
+        "probed": 0,
+        "cooldownSkipped": 0,
+        "alive": 0,
+        "aliveUnique": None,
+        "selector": None,
+        "subscriptionId": None,
+        "deprecated": None,
+        "nodes": [],
+        "startedAt": _session_now(),
+        "finishedAt": None,
+        "error": None,
+    }
+
+
+def _clash_test_session_update(**fields) -> None:
+    if _clash_test_session is not None:
+        _clash_test_session.update(fields)
+
+
+def _clash_test_session_node(row: dict) -> None:
+    if _clash_test_session is None:
+        return
+    _clash_test_session["nodes"].append(row)
+    _clash_test_session["probed"] += 1
+    if row.get("alive"):
+        _clash_test_session["alive"] += 1
+
+
+def clash_test_progress() -> dict | None:
+    """当前/最近一次检测会话快照；无会话返回 None。"""
+    if _clash_test_session is None:
+        return None
+    snap = dict(_clash_test_session)
+    snap["nodes"] = [dict(n) for n in snap["nodes"]]
+    return snap
+
+
+def clash_test_start() -> dict:
+    """手动检测入口：已有进行中的会话则复用（手动/首检/体检同源），
+    否则落 queued 会话并拉起后台任务，立即返回快照（不等探测）。"""
+    if _clash_test_session and _clash_test_session["phase"] in _SESSION_ACTIVE_PHASES:
+        return clash_test_progress()
+    _clash_test_session_reset()
+    asyncio.get_running_loop().create_task(_clash_test_session_task())
+    return clash_test_progress()
+
+
+async def _clash_test_session_task() -> None:
+    try:
+        await test_clash_nodes()
+    except ValueError:
+        pass  # 失败原因（用户语言）已落会话，由进度端点带回
+    except Exception:  # noqa: BLE001
+        logger.exception("[Clash检测] 后台会话执行失败")
+
+
 async def test_clash_nodes(subscription_id: int | None = None) -> dict:
+    """检测 Clash 订阅节点（会话入口）：探测实现在 _test_clash_nodes_impl，
+    进度实时写入会话快照，成功/失败都收口到会话（phase=done/failed）。"""
+    if _clash_test_session is None:
+        _clash_test_session_reset()  # 体检/首检直调路径：等锁期间即有 queued 可看
+    try:
+        result = await _test_clash_nodes_impl(subscription_id)
+    except Exception as e:  # noqa: BLE001
+        _clash_test_session_update(
+            phase="failed", error=str(e) or "节点检测失败", finishedAt=_session_now()
+        )
+        raise
+    _clash_test_session_update(
+        phase="done",
+        total=result["total"],
+        probed=result["probed"],
+        alive=result["alive"],
+        aliveUnique=result["aliveUnique"],
+        selector=result["selector"],
+        subscriptionId=result["subscriptionId"],
+        deprecated=result["deprecated"],
+        nodes=result["nodes"],
+        finishedAt=_session_now(),
+    )
+    return result
+
+
+async def _test_clash_nodes_impl(subscription_id: int | None = None) -> dict:
     """检测 Clash 订阅节点：逐个切换 selector，经混合端口探测。
 
     - 存活判定 = Steam 端点 HTTP 200（与手动代理池同款探测目标；
@@ -1162,6 +1266,7 @@ async def test_clash_nodes(subscription_id: int | None = None) -> dict:
       （ms 为 Steam 请求延迟，不再混入 IP 探测耗时）
     """
     async with _clash_test_lock():
+        _clash_test_session_reset()
         status = clash_manager.runtime.status()
         if not status["running"]:
             raise ValueError("Clash 未运行：请先在 Clash 接入选择订阅并启动")
@@ -1218,6 +1323,16 @@ async def test_clash_nodes(subscription_id: int | None = None) -> dict:
         groups.sort(key=_group_score)
         selector = groups[0]["name"] if groups else "GLOBAL"
 
+        # 会话进入 running：总量/待测量/冷却跳过数一次落定，之后探测逐节点追加
+        _clash_test_session_update(
+            phase="running",
+            total=len(node_names),
+            toProbe=len(to_probe),
+            cooldownSkipped=len(node_names) - len(to_probe),
+            subscriptionId=sub_id,
+            selector=selector,
+        )
+
         async def _probe_steam(client: httpx.AsyncClient) -> bool:
             """生产端点存活探测（与手动代理池 _check 同一端点与判据）。
 
@@ -1254,10 +1369,14 @@ async def test_clash_nodes(subscription_id: int | None = None) -> dict:
                             json={"name": name},
                         )
                         if put.status_code >= 400:
-                            results.append({"name": name, "alive": False, "steamOk": False, "exitIp": None, "ms": None, "duplicate": False, "probed": False})
+                            row = {"name": name, "alive": False, "steamOk": False, "exitIp": None, "ms": None, "duplicate": False, "probed": False}
+                            results.append(row)
+                            _clash_test_session_node(row)
                             continue
                     except Exception:  # noqa: BLE001
-                        results.append({"name": name, "alive": False, "steamOk": False, "exitIp": None, "ms": None, "duplicate": False, "probed": False})
+                        row = {"name": name, "alive": False, "steamOk": False, "exitIp": None, "ms": None, "duplicate": False, "probed": False}
+                        results.append(row)
+                        _clash_test_session_node(row)
                         continue
 
                     started = time.monotonic()
@@ -1274,9 +1393,9 @@ async def test_clash_nodes(subscription_id: int | None = None) -> dict:
                     duplicate = bool(exit_ip and exit_ip in seen_exit_ips)
                     if exit_ip and not duplicate:
                         seen_exit_ips[exit_ip] = name
-                    results.append(
-                        {"name": name, "alive": alive, "steamOk": steam_ok, "exitIp": exit_ip, "ms": ms, "duplicate": duplicate, "probed": True}
-                    )
+                    row = {"name": name, "alive": alive, "steamOk": steam_ok, "exitIp": exit_ip, "ms": ms, "duplicate": duplicate, "probed": True}
+                    results.append(row)
+                    _clash_test_session_node(row)
             finally:
                 # 切回健康节点（selector 自愈见 _apply_node_results）+ 恢复原模式
                 if prev_mode is not None and prev_mode != "global":

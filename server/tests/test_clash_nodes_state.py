@@ -305,3 +305,124 @@ async def test_clash_nodes_waits_for_shared_lock(db, monkeypatch):
     with pytest.raises(ValueError, match="Clash 未运行"):
         await task  # 锁释放后放行，进入函数体立即因未运行报错
 
+
+
+# ─── 检测会话（后台执行 + 进度快照）─────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _fresh_test_session():
+    """会话是模块级单例：用例间清场，避免上一例的终态被本例的 start 复用。"""
+    proxies_service._clash_test_session = None
+    yield
+    proxies_service._clash_test_session = None
+
+
+def _impl_result(total=3, probed=1) -> dict:
+    return {
+        "total": total,
+        "probed": probed,
+        "alive": 1,
+        "aliveUnique": 1,
+        "selector": "GLOBAL",
+        "subscriptionId": None,
+        "deprecated": False,
+        "nodes": [_ok("n1")],
+    }
+
+
+@pytest.mark.asyncio
+async def test_clash_test_start_returns_before_probe_finishes(db, monkeypatch):
+    """启动即返：start 落会话拉后台任务立刻返回，探测中途就能读到逐节点进度。"""
+    release = asyncio.Event()
+
+    async def slow_impl(subscription_id=None):
+        proxies_service._clash_test_session_update(phase="running", total=3, toProbe=3)
+        proxies_service._clash_test_session_node(_ok("n1"))
+        await release.wait()
+        return _impl_result()
+
+    monkeypatch.setattr(proxies_service, "_test_clash_nodes_impl", slow_impl)
+    snap = proxies_service.clash_test_start()
+    assert snap["phase"] in ("queued", "running")
+
+    await asyncio.sleep(0.05)
+    mid = proxies_service.clash_test_progress()
+    assert mid["phase"] == "running"
+    assert mid["probed"] == 1
+    assert [n["name"] for n in mid["nodes"]] == ["n1"]
+
+    release.set()
+    await asyncio.sleep(0.05)
+    done = proxies_service.clash_test_progress()
+    assert done["phase"] == "done"
+    assert done["alive"] == 1
+    assert done["finishedAt"] is not None
+
+
+@pytest.mark.asyncio
+async def test_clash_test_start_reuses_active_session(db, monkeypatch):
+    """已有进行中的会话（首检/体检在跑）→ start 复用同一会话，不再叠加后台任务。"""
+    release = asyncio.Event()
+    calls = []
+
+    async def slow_impl(subscription_id=None):
+        calls.append(1)
+        await release.wait()
+        return _impl_result()
+
+    monkeypatch.setattr(proxies_service, "_test_clash_nodes_impl", slow_impl)
+    proxies_service.clash_test_start()
+    await asyncio.sleep(0.02)  # 让后台任务起跑、进入 impl
+    proxies_service.clash_test_start()  # 会话仍 active → 复用，不 spawn
+    release.set()
+    await asyncio.sleep(0.05)
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_clash_test_start_after_done_runs_new_session(db, monkeypatch):
+    """上一轮已 done → start 落新会话重新开测（终态不复用）。"""
+    async def quick_impl(subscription_id=None):
+        return _impl_result()
+
+    monkeypatch.setattr(proxies_service, "_test_clash_nodes_impl", quick_impl)
+    proxies_service._clash_test_session = {
+        "phase": "done", "total": 3, "toProbe": 3, "probed": 3, "cooldownSkipped": 0,
+        "alive": 1, "aliveUnique": 1, "selector": "GLOBAL", "subscriptionId": None,
+        "deprecated": False, "nodes": [], "startedAt": "x", "finishedAt": "x", "error": None,
+    }
+    snap = proxies_service.clash_test_start()
+    assert snap["phase"] in ("queued", "running")
+
+
+@pytest.mark.asyncio
+async def test_clash_test_session_failure_carries_user_language_error(db, monkeypatch):
+    """失败收口：impl 抛 ValueError → 会话 phase=failed，error 为用户语言原因。"""
+    async def boom(subscription_id=None):
+        raise ValueError("Clash 未运行：请先在 Clash 接入选择订阅并启动")
+
+    monkeypatch.setattr(proxies_service, "_test_clash_nodes_impl", boom)
+    snap = proxies_service.clash_test_start()
+    assert snap["phase"] in ("queued", "running")
+    await asyncio.sleep(0.05)
+    failed = proxies_service.clash_test_progress()
+    assert failed["phase"] == "failed"
+    assert "Clash 未运行" in failed["error"]
+    assert failed["finishedAt"] is not None
+
+
+@pytest.mark.asyncio
+async def test_clash_nodes_direct_call_finalizes_session(db, monkeypatch):
+    """体检/启动首检直调 test_clash_nodes 同样落会话——进度端点能看到它们的进度。"""
+    async def ok_impl(subscription_id=None):
+        proxies_service._clash_test_session_update(phase="running", total=1, toProbe=1)
+        proxies_service._clash_test_session_node(_ok("n1"))
+        return _impl_result(total=1, probed=1)
+
+    monkeypatch.setattr(proxies_service, "_test_clash_nodes_impl", ok_impl)
+    r = await proxies_service.test_clash_nodes()
+    assert r["total"] == 1
+    snap = proxies_service.clash_test_progress()
+    assert snap["phase"] == "done"
+    assert snap["probed"] == 1

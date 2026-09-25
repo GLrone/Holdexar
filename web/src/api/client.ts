@@ -60,6 +60,7 @@ const NO_CACHE_PATHS = [
   '/system/update-progress', // 更新下载进度 800ms 轮询
   '/system/update-pending',
   '/proxies/clash/install/progress',
+  '/proxies/clash/test', // 检测进度轮询（/proxies/clash/test/progress 由前缀规则覆盖）
   '/achievements/sync', // 成就同步进行中的快照轮询
   // Epic 卡片：新鲜度由后端快照缓存管理（过期即回旧数据 + 后台刷新），
   // 前端再叠 60s 时间窗会把 stale→fresh 的覆盖整个吞掉（轮询永远读旧响应）
@@ -1255,15 +1256,24 @@ export interface ClashNodeTestItem {
   cooling?: boolean
 }
 
-export interface ClashNodeTestResult {
-  total: number
+/** 节点检测会话快照：后台逐节点探测，phase 驱动按钮进度与结果面板。
+ *  idle = 当前进程无会话；queued = 已受理待开测（如前一轮体检占着串行锁）；
+ *  running = 探测中（nodes 逐节点追加）；done/failed 终态保留最近一次结果。 */
+export interface ClashTestProgress {
+  phase: 'idle' | 'queued' | 'running' | 'done' | 'failed'
+  total: number | null
+  toProbe: number | null
   probed: number
+  cooldownSkipped: number
   alive: number
-  aliveUnique: number
-  selector: string
+  aliveUnique: number | null
+  selector: string | null
   subscriptionId: number | null
-  deprecated: boolean
+  deprecated: boolean | null
   nodes: ClashNodeTestItem[]
+  startedAt: string | null
+  finishedAt: string | null
+  error: string | null
 }
 
 export interface ProxyEventItem {
@@ -1389,7 +1399,8 @@ export const proxiesApi = {
     }>('GET', '/proxies/clash/install/progress'),
   clashStart: (subscriptionId?: number) =>
     request<ClashStatus>('POST', '/proxies/clash/start', { subscriptionId }),
-  clashTest: () => request<ClashNodeTestResult>('POST', '/proxies/clash/test'),
+  clashTestStart: () => request<ClashTestProgress>('POST', '/proxies/clash/test'),
+  clashTestProgress: () => request<ClashTestProgress>('GET', '/proxies/clash/test/progress'),
   clashHealthCheck: (force = false) =>
     request<{ state: string; intervalHours: number }>(
       'POST',
