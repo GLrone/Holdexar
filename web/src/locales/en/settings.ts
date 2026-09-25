@@ -78,7 +78,7 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.account.save': 'Save',
 
   /* Backup card */
-  'settings.backup.desc': 'Online snapshot backups: no lock on the database file, no interruption to crawler writes, and every committed row included. One automatic backup per day, keeping the 5 most recent. Restoring is destructive — it replaces the whole database with the backup file, so verify first.',
+  'settings.backup.desc': 'Online snapshot backups: no lock on the database file, no interruption to crawler writes, and every committed row included. One automatic backup per day, keeping the 5 most recent; manual backups keep only the latest one and are never removed by automatic rotation. Restoring is destructive — it replaces the whole database with the backup file, so verify first.',
   'settings.backup.createNow': 'Back up now',
   'settings.backup.snapshotting': 'Snapshotting…',
   'settings.backup.count': '{n} backups',

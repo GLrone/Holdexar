@@ -104,6 +104,41 @@ async def test_rotation_keeps_recent(data_env):
 
 
 @pytest.mark.asyncio
+async def test_manual_backup_keeps_only_latest(data_env, monkeypatch):
+    """手动备份独立轮转：手动备份多次仅保留最新一份（-manual 标记）。"""
+    tmp, _ = data_env
+    seq = iter(range(10))
+    monkeypatch.setattr(core_backup, "_ts", lambda: f"20260101-0000{next(seq)}")
+    for _ in range(3):
+        await core_backup.create_backup(manual=True)
+    names = [b["name"] for b in core_backup.list_backups()]
+    assert len(names) == 1
+    assert names[0].endswith("-manual.db")
+    assert "-00002-manual.db" in names[0]  # 留的是最新那份
+
+
+@pytest.mark.asyncio
+async def test_manual_backup_independent_of_auto_rotation(data_env, monkeypatch):
+    """两类互不占位：自动轮转不清手动备份，手动替换只换手动。"""
+    tmp, _ = data_env
+    seq = iter(range(10))
+    monkeypatch.setattr(core_backup, "_ts", lambda: f"20260101-0000{next(seq)}")
+    for i in range(4):  # BACKUP_KEEP=3：第 4 份自动备份轮掉 a0
+        await core_backup.create_backup(label=f"a{i}")
+    await core_backup.create_backup(manual=True)
+    names = [b["name"] for b in core_backup.list_backups()]
+    assert len(names) == 4  # 3 自动 + 1 手动
+    assert not any("a0" in n for n in names)
+    assert sum(1 for n in names if n.endswith("-manual.db")) == 1
+    # 再手动一次：旧手动被顶替，自动 3 份原样
+    await core_backup.create_backup(manual=True)
+    names = [b["name"] for b in core_backup.list_backups()]
+    assert len(names) == 4
+    assert sum(1 for n in names if n.endswith("-manual.db")) == 1
+    assert any("a3" in n for n in names)
+
+
+@pytest.mark.asyncio
 async def test_path_traversal_rejected(data_env):
     """担忧③安全性：路径穿越/非法文件名一律拒绝。"""
     from app.core.backup import safe_backup_path
