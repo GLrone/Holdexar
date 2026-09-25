@@ -279,7 +279,7 @@ class SubscriptionSnapshot(Base):
     status: Mapped[str] = mapped_column(String(16))
     http_status: Mapped[int | None] = mapped_column(Integer)
     content_type: Mapped[str | None] = mapped_column(String(100))
-    # 抓取成功的通道名（direct / mihomo / proxypool）
+    # 抓取成功的通道名（direct / mihomo / proxypool / local）
     source_channel: Mapped[str | None] = mapped_column(String(32))
     error: Mapped[str | None] = mapped_column(Text)
     fetched_at: Mapped[datetime | None] = mapped_column(DateTime)
