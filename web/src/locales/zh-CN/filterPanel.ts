@@ -26,6 +26,7 @@ const filterPanel = {
   'filterPanel.basic.top3': '展示前三低价区',
   /* 同一勾选框内的补充说明，随布局模式出现；括号是文案的一部分 */
   'filterPanel.basic.top3ListHint': '(列表视图仅展示最低价)',
+  'filterPanel.basic.wishlistPriority': '关注和愿望单优先',
   'filterPanel.basic.strictLowest': '绝对低价',
   'filterPanel.basic.tolerance': '差价容错',
   'filterPanel.basic.toleranceUnit': '元',

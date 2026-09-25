@@ -38,6 +38,8 @@ interface FilterState {
   strictLowest: boolean
   tolerance: string
   top3Check: boolean
+  /** 关注和愿望单优先：关注恒置顶，开启后愿望单成员（含家庭愿望单）叠加置顶 */
+  wishlistPriority: boolean
   hlNew: boolean
   hlEqual: boolean
   hlNon: boolean
@@ -82,6 +84,7 @@ export const useFilterStore = defineStore('gamesFilter', {
     strictLowest: false,
     tolerance: '0',
     top3Check: true,
+    wishlistPriority: false,
     hlNew: false,
     hlEqual: false,
     hlNon: false,
@@ -119,6 +122,7 @@ export const useFilterStore = defineStore('gamesFilter', {
       this.strictLowest = false
       this.tolerance = '0'
       this.top3Check = true
+      this.wishlistPriority = false
       this.hlNew = false
       this.hlEqual = false
       this.hlNon = false
@@ -148,6 +152,7 @@ export const useFilterStore = defineStore('gamesFilter', {
       if (this.hideFamilySharing) count++
       if (this.strictLowest) count++
       if (!this.top3Check) count++
+      if (this.wishlistPriority) count++
       if (this.hlNew) count++
       if (this.hlEqual) count++
       if (this.hlNon) count++
