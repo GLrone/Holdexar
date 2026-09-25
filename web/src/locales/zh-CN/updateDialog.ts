@@ -4,7 +4,8 @@
 export default {
   'updateDialog.title': '应用更新',
   'updateDialog.entry': '更新',
-  'updateDialog.entryTip': '有新版本可用，点击查看更新报告',
+  'updateDialog.entryTip': '检测应用更新',
+  'updateDialog.checkNow': '检测更新',
   'updateDialog.notesTitle': 'v{version} 更新内容',
   'updateDialog.notesEmpty': '此版本未提供更新说明',
   'updateDialog.releaseDate': '发布于 {date}',
