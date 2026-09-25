@@ -1225,8 +1225,8 @@ const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/asse
         </a>
       </div>
 
-      <!-- 价格区 -->
-      <div class="price-section">
+      <!-- 价格区（data-tour：产品导览「价格自动更新」步的聚光锚点） -->
+      <div class="price-section" data-tour="card-price">
         <div class="price-row">
           <span class="price-label">
             <img :src="flagUrl('cn')" class="flag-icon" alt="CN" />
