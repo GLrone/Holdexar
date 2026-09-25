@@ -57,6 +57,8 @@ const props = defineProps<{
   layoutMode: 'grid' | 'list'
   /** 「我」页启用的地区（小写）；null = 全部 */
   enabledRegions?: string[] | null
+  /** 展示前三低价区（高级筛选面板开关）；false = 仅展示最低价区 */
+  showTop3?: boolean
 }>()
 
 const regionsStore = useRegionsStore()
@@ -397,7 +399,10 @@ const topRegions = computed(() => {
   const filtered = sortedRegions.value.filter(
     (p) => cnPriceFen.value === 0 || p.cnyFen < cnPriceFen.value,
   )
-  if (props.layoutMode === 'list' && filtered.length > 0) {
+  if (filtered.length === 0) return []
+  /* 列表模式固定单条（面板开关的 top3ListHint 说明）；网格模式随开关取前三或最低 */
+  const showSingle = props.layoutMode === 'list' || props.showTop3 === false
+  if (showSingle) {
     const minPrice = filtered[0]!.cnyFen
     const lowestList = filtered.filter((p) => p.cnyFen === minPrice)
     lowestList.sort((a, b) => a.code.localeCompare(b.code))
