@@ -714,6 +714,8 @@ export interface GamesListParams {
   toleranceFen?: number
   /** 绝对低价：最低区价实质低于国区（差价 > toleranceFen，缺省 0=严格任何分差） */
   strictLowest?: boolean
+  /** 关注和愿望单优先：关注恒置顶，开启后愿望单成员（含家庭愿望单）叠加置顶前缀 */
+  wishlistPriority?: boolean
   /** 游戏商店默认隐藏 DLC（白名单豁免个别常驻 DLC）；false = 含 DLC */
   excludeDlc?: boolean
 }

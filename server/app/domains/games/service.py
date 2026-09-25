@@ -125,6 +125,23 @@ async def _followed_appids() -> list[int]:
         return []
 
 
+async def _wishlist_appids() -> list[int]:
+    """愿望单成员集（追踪账户 wishlisted 行，含家庭愿望单派生源）；读不到按空集处理。"""
+    try:
+        from app.domains.wishlist.models import WishlistItem
+
+        async with get_session_factory()() as session:
+            rows = await session.execute(
+                select(WishlistItem.appid).where(
+                    WishlistItem.wishlisted.is_(True),
+                    WishlistItem.active.is_(True),
+                )
+            )
+            return sorted({row[0] for row in rows.all()})
+    except Exception:  # noqa: BLE001 —— 愿望单层故障不阻断列表
+        return []
+
+
 def _build_filter_conditions(
     *,
     g, cn, sr,
@@ -373,6 +390,7 @@ async def list_games(
     tolerance_fen: int | None = None,
     strict_lowest: bool = False,
     exclude_dlc: bool = False,
+    wishlist_priority: bool = False,
 ) -> dict:
     """游戏列表。返回 {items, total, hasMore, nextCursor}。
 
@@ -381,6 +399,7 @@ async def list_games(
       global: 该区价 < 国区-1元 且 该区价 ≈ 非 CN 全区最低价（默认±5元，tolerance_fen 可调）
       cheaper: 该区价 < 国区-1元
       highdiff: 国区未打折 且 国区-该区 >= 50元 且 该区价 ≈ 全区最低
+    - wishlist_priority：愿望单优先——关注恒置顶，其后叠加愿望单成员置顶前缀
     - 全部筛选/排序/分页在 SQL 完成；价格明细仅按页内 appid 拉取；
     - sort=top100 例外：热榜集 ≤100 条，SQL 全拉后 Python 按榜序
       重排 + 切片分页（SQLite 无 array_position 的等价实现，其余
@@ -411,6 +430,7 @@ async def list_games(
         tolerance_fen=tolerance_fen,
         strict_lowest=strict_lowest,
         exclude_dlc=exclude_dlc,
+        wishlist_priority=wishlist_priority,
     )
 
     offset = _decode_cursor(after)
@@ -449,16 +469,21 @@ async def list_games(
                            region_code=region_code, is_locked=is_locked)
 
     # ── 排序（统一在 sorting.py）──
-    # 关注置顶前缀（通用排序的第一优先级「收藏游戏置顶」）：关注集是
-    # 用户手工策展的小集合，IN 布尔降序即置顶；地区模式里它压过 3-group
-    # （priorityGroup「关注极致优先」的同位语义——愿望单优先开关本端
-    # 不存在，关注恒优先）。空集不注入，SQL 保持原样。
+    # 置顶前缀：关注恒第一（通用排序的「收藏游戏置顶」优先级——关注集是
+    # 用户手工策展的小集合，IN 布尔降序即置顶）；愿望单优先开关开启时在
+    # 关注之后叠加愿望单成员前缀（wishlisted 行含家庭愿望单派生源）。
+    # 地区模式里置顶前缀压过 3-group（priorityGroup「关注极致优先」的
+    # 同位语义）。空集不注入，SQL 保持原样。
     followed = await _followed_appids()
     fav_order = [desc(g.appid.in_(followed))] if followed else []
+    wish_order: list = []
+    if wishlist_priority:
+        wished = await _wishlist_appids()
+        wish_order = [desc(g.appid.in_(wished))] if wished else []
     if is_locked:
-        order = fav_order + [asc(func.coalesce(g.min_cny_fen, 999999)), desc(g.appid)]
+        order = fav_order + wish_order + [asc(func.coalesce(g.min_cny_fen, 999999)), desc(g.appid)]
     else:
-        order = fav_order + build_order_by(g, cn, sort=sort, region_mode=has_region, sr=sr)
+        order = fav_order + wish_order + build_order_by(g, cn, sort=sort, region_mode=has_region, sr=sr)
 
     async with get_session_factory()() as session:
         # total 分离（COUNT(*) 独立查询）
@@ -541,6 +566,7 @@ async def _list_games_top100(
     tolerance_fen: int | None = None,
     strict_lowest: bool = False,
     exclude_dlc: bool = False,
+    wishlist_priority: bool = False,
 ) -> dict:
     """TOP100 热销榜分支（sort=top100 的榜内过滤 + 榜序重排）。
 
@@ -591,14 +617,19 @@ async def _list_games_top100(
         rows = (await session.execute(base)).all()
 
     # ── 榜序重排（等价 array_position；榜外 appid 不会出现——IN 过滤保证）──
-    # 排序优先级对齐 buildCteOrderBy，关注置顶压过榜序（top100 分支的
+    # 排序优先级对齐 buildCteOrderBy，置顶前缀压过榜序（top100 分支的
     # 收藏第一优先级）：锁国区最低价 ASC（早退分支，压过榜序）
     # > 地区模式 3-group 前缀 + 组内榜序 > 纯榜序。
     followed = set(await _followed_appids())
+    wished = set(await _wishlist_appids()) if wishlist_priority else set()
     rank = {appid: i for i, appid in enumerate(appids)}
-    fav_key = lambda appid: appid not in followed  # noqa: E731 —— False(0)=关注在前
+
+    def _prio_key(appid: int) -> tuple[bool, bool]:
+        """置顶前缀：关注恒第一；愿望单优先开启时愿望单成员次之。"""
+        return (appid not in followed, wishlist_priority and appid not in wished)
+
     if is_locked:
-        rows.sort(key=lambda r: (fav_key(r[0].appid), int(r[0].min_cny_fen) if r[0].min_cny_fen is not None else 999999, -r[0].appid))
+        rows.sort(key=lambda r: (_prio_key(r[0].appid), int(r[0].min_cny_fen) if r[0].min_cny_fen is not None else 999999, -r[0].appid))
     elif has_region:
         def _group(row) -> int:
             game, cn_row = row
@@ -608,9 +639,9 @@ async def _list_games_top100(
                 return 1
             return 2
 
-        rows.sort(key=lambda r: (fav_key(r[0].appid), _group(r), rank[r[0].appid]))
+        rows.sort(key=lambda r: (_prio_key(r[0].appid), _group(r), rank[r[0].appid]))
     else:
-        rows.sort(key=lambda r: (fav_key(r[0].appid), rank[r[0].appid]))
+        rows.sort(key=lambda r: (_prio_key(r[0].appid), rank[r[0].appid]))
 
     total = len(rows)
     has_more = offset + limit < total

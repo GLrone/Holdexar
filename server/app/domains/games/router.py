@@ -50,6 +50,8 @@ async def list_games(
     diffType: str = Query("absolute", pattern="^(absolute|percent)$"),
     toleranceFen: int | None = Query(None, ge=0),
     strictLowest: bool = False,
+    # 愿望单优先：关注恒置顶，开启后愿望单成员（含家庭愿望单）叠加置顶前缀
+    wishlistPriority: bool = False,
     excludeDlc: bool = Query(False),
 ):
     return await service.list_games(
@@ -79,6 +81,7 @@ async def list_games(
         tolerance_fen=toleranceFen,
         strict_lowest=strictLowest,
         exclude_dlc=excludeDlc,
+        wishlist_priority=wishlistPriority,
     )
 
 

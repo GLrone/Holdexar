@@ -16,6 +16,7 @@ const filterPanel: Partial<Record<MessageKey, string>> = {
 
   'filterPanel.basic.top3': 'Show top 3 cheapest regions',
   'filterPanel.basic.top3ListHint': '(list view shows lowest price only)',
+  'filterPanel.basic.wishlistPriority': 'Followed & wishlisted first',
   'filterPanel.basic.strictLowest': 'Absolute lowest',
   'filterPanel.basic.tolerance': 'Diff tolerance',
   'filterPanel.basic.toleranceUnit': 'CNY',

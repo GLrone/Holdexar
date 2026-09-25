@@ -102,6 +102,11 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
               {{ t('filterPanel.basic.top3ListHint') }}
             </span>
           </HlCheckbox>
+          <HlCheckbox
+            :model-value="store.wishlistPriority"
+            :label="t('filterPanel.basic.wishlistPriority')"
+            @update:model-value="(v: boolean) => store.setFilter('wishlistPriority', v)"
+          />
         </div>
         <div class="hl-fp-inline">
           <HlCheckbox
