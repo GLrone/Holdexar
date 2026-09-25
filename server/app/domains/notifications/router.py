@@ -37,14 +37,15 @@ def _mask_account(user: str) -> str:
 
 async def _smtp_view() -> dict:
     """SMTP 配置的可公开部分（不含密码 / 授权码）。"""
+    # get_smtp_config 返回前端键形（toAddr / useSsl，密码已掩码）
     cfg = await get_smtp_config()
     return {
-        "configured": bool(cfg["to_addr"]) and bool(cfg["host"]),
+        "configured": bool(cfg["toAddr"]) and bool(cfg["host"]),
         "host": cfg["host"],
         "port": cfg["port"],
         "userMasked": _mask_account(cfg["user"] or ""),
         "hasPassword": bool(cfg["hasPassword"]),
-        "useSsl": bool(cfg["use_ssl"]),
+        "useSsl": bool(cfg["useSsl"]),
     }
 
 
