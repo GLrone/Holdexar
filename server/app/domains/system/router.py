@@ -200,9 +200,9 @@ class BackupCreate(BaseModel):
 
 @router.post("/system/backup")
 async def backup_create(req: BackupCreate) -> dict:
-    """立即备份（在线快照：不打断写入、含 WAL 已提交事务、产出独立自洽文件）。"""
+    """立即备份（手动档：在线快照不打断写入，独立轮转仅保留最新一份）。"""
     try:
-        return await create_backup_impl(req.label)
+        return await create_backup_impl(req.label, manual=True)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:

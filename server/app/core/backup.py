@@ -10,6 +10,9 @@
 2. 停调度器 + 停爬取任务 → 关闭引擎连接（释放文件句柄）
 3. 生产库三份轮换（.restoring/.rollback），替换后清陈旧 WAL、重建引擎
    → 失败自动回滚原库
+
+保留策略分两类轮转：自动备份保留最近 BACKUP_KEEP 份；手动备份（文件名带
+-manual 标记）单独轮转、仅保留最新一份——两类互不占位。
 """
 from __future__ import annotations
 
@@ -27,6 +30,7 @@ logger = logging.getLogger(__name__)
 BACKUP_KEEP = 5  # 保留最近 N 份，超出按时间从老到新自动清理
 _BACKUP_DIR_NAME = "backups"
 _LOCK_FILE = ".restore.lock"
+MANUAL_LABEL = "manual"  # 手动备份的文件名标记：独立轮转，仅保留最新一份
 
 
 def backup_dir() -> Path:
@@ -46,10 +50,12 @@ def _ts() -> str:
 # ─── 创建 / 校验 / 列表 ─────────────────────────────────────
 
 
-async def create_backup(label: str | None = None) -> dict:
+async def create_backup(label: str | None = None, manual: bool = False) -> dict:
     """在线快照备份（VACUUM INTO）：含 WAL 已提交事务，不阻塞写入。
 
-    产出文件名：holdexar-YYYYmmdd-HHMMSS[-label].db
+    manual=True 产出手动备份（文件名带 -manual 标记）：独立轮转、仅保留最新
+    一份，不占用自动备份的轮转位。
+    产出文件名：holdexar-YYYYmmdd-HHMMSS[-label][-manual].db
     返回 {path, sizeBytes, integrityOk, games}；备份失败抛 RuntimeError。
     """
     import asyncio
@@ -59,8 +65,12 @@ async def create_backup(label: str | None = None) -> dict:
         raise RuntimeError(f"数据库文件不存在: {src}")
     if label and not all(c.isalnum() or c in "-_" for c in label):
         raise ValueError("label 只允许字母数字和 -_")
-    name = f"{src.stem}-{_ts()}" + (f"-{label}" if label else "") + ".db"
-    dest = backup_dir() / name
+    name = f"{src.stem}-{_ts()}"
+    if label:
+        name += f"-{label}"
+    if manual and label != MANUAL_LABEL:
+        name += f"-{MANUAL_LABEL}"
+    dest = backup_dir() / (name + ".db")
     if dest.exists():
         raise RuntimeError(f"备份文件已存在（同秒重复备份？）: {dest.name}")
 
@@ -156,12 +166,25 @@ def list_backups() -> list[dict]:
     return items
 
 
+def _is_manual_backup(filename: str) -> bool:
+    return filename.endswith(f"-{MANUAL_LABEL}.db")
+
+
 def _rotate_old_backups() -> None:
-    """保留最近 BACKUP_KEEP 份，更老的删除。"""
+    """自动备份保留最近 BACKUP_KEEP 份；手动备份单独轮转，仅保留最新一份。
+
+    两类互不占位：手动备份是用户显式建立的安全点，不因自动轮转被清；
+    自动备份也不因手动备份的存在而少留。
+    """
     files = sorted(backup_dir().glob("*.db"), key=lambda x: x.stat().st_mtime, reverse=True)
-    for old in files[BACKUP_KEEP:]:
+    auto = [p for p in files if not _is_manual_backup(p.name)]
+    manual = [p for p in files if _is_manual_backup(p.name)]
+    for old in auto[BACKUP_KEEP:]:
         old.unlink(missing_ok=True)
         logger.info("[备份] 轮转清理：%s", old.name)
+    for old in manual[1:]:
+        old.unlink(missing_ok=True)
+        logger.info("[备份] 手动备份轮转（仅保留最新一份）：%s", old.name)
 
 
 # ─── 恢复（三段式，防误恢复伤生产库）──────────────────────────
