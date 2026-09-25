@@ -96,14 +96,14 @@ def _crawl_env(monkeypatch):
 
     monkeypatch.setattr(pp_exits, "exit_snapshot", _snapshot)
 
-    def _one_lane(_data_dir, **_kw):
+    async def _one_lane(_session, _data_dir, **_kw):
         binding = {"lane": 0, "url": "http://127.0.0.1:1",
                    "exitIp": "1.1.1.1", "node": "n1"}
         return {"urls": [binding["url"]], "exit_keys": [binding["exitIp"]],
                 "nodes": [binding["node"]], "bindings": [binding],
                 "runtime_lanes": 1, "known_exits": 1}
 
-    monkeypatch.setattr(pp_runtime, "lane_run_plan", _one_lane)
+    monkeypatch.setattr(pp_runtime, "crawl_lane_plan", _one_lane)
 
     async def _noop(*a, **kw):
         return 0

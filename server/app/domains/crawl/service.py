@@ -627,13 +627,13 @@ async def start_job(
     # （重建会换端口并打断在途请求，所以 run 内不换）。拿不到就拒绝启动——
     # 绝不静默退回直连或旧订阅代理（那会把"池坏了"伪装成"爬取成功"）。
     #
-    # 容量单位是**独立出口 IP**：入口集合由 `lane_run_plan` 用**当前出口身份快照**
-    # 就地收敛（`active_lanes ≤ 唯一出口数`），而不是照搬内核里的 listener 数——
-    # listener 数是上一次重建定下的，L1 之后出口身份还会变，两者之间有重建窗口。
-    # 收敛结果即本次 run 的**快照**：run 内不再变，后台维护改出口集只影响下一次 run。
+    # 容量单位是**独立出口 IP**：入口集合由 `crawl_lane_plan` 用**当前出口槽快照**
+    # 校验后给出（池里有出口 + 有 lane + 两者逐位一致），任一不满足即拒绝启动——
+    # **绝不**回退 GLOBAL / 直连 / 旧订阅代理。收敛结果即本次 run 的**快照**：
+    # run 内不再变，后台维护改出口集只影响下一次 run。
     from app.core.config import get_settings as _get_settings
-    from app.domains.proxypool.exits import MAX_CRAWL_WORKERS, exit_snapshot
-    from app.domains.proxypool.runtime import lane_run_plan
+    from app.domains.proxypool.exits import MAX_CRAWL_WORKERS
+    from app.domains.proxypool.runtime import crawl_lane_plan
 
     worker_count = await _resolve_worker_count()
     small_lane = kind in ("missing", "repair", "backfill")
@@ -642,18 +642,16 @@ async def start_job(
     )
     data_dir = _get_settings().data_dir
     async with get_session_factory()() as session:
-        snapshot = await exit_snapshot(session)
-    run_plan = lane_run_plan(
-        data_dir,
-        exit_by_node=snapshot,
-        max_lanes=min(planned_workers, MAX_CRAWL_WORKERS),
-    )
+        run_plan = await crawl_lane_plan(
+            session, data_dir, max_lanes=min(planned_workers, MAX_CRAWL_WORKERS)
+        )
     proxy_urls = run_plan["urls"]
     effective_workers = max(1, min(planned_workers, len(proxy_urls), MAX_CRAWL_WORKERS))
     logger.info(
         "[容量] 出口槽：已知出口 %d | run 内 active lane %d（内核 listener %d）| "
         "worker %d（期望 %d，上限 %d）",
-        len(snapshot), len(proxy_urls), run_plan.get("runtime_lanes", len(proxy_urls)),
+        run_plan.get("known_exits", 0), len(proxy_urls),
+        run_plan.get("runtime_lanes", len(proxy_urls)),
         effective_workers, planned_workers, MAX_CRAWL_WORKERS,
     )
     config = CrawlRunConfig(

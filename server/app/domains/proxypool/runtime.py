@@ -876,12 +876,106 @@ def select_run_lanes(
     return chosen
 
 
+def lane_plan_consistency(
+    bindings: Sequence[Mapping], slots: Sequence[ExitSlot]
+) -> tuple[bool, str]:
+    """lane 计划与**当前出口槽快照**是否一致（纯函数，返回 `(是否一致, 原因)`）。
+
+    一致性必须是**逐位相等**，不能只看数量：
+    - 计划里每条 lane 绑的节点，正是该位次当前出口槽的代表节点；
+    - 记录在计划里的出口 IP，正是该节点当前的出口 IP；
+    - 长度相等——计划比快照**多**出 lane（真实现象：33 个出口却挂了 34 条 lane）时，
+      多出来的那条绑的出口在快照里不存在，交出去就是把流量交给一个身份不明的出口。
+
+    不一致时不交出任何地址：由调用方置 `rebuild_pending`（下一拍空闲时重建收敛），
+    本次爬取拒绝启动——宁可晚一轮爬，也不能让出口身份不明的 lane 服务生产。
+    """
+    if not slots:
+        return False, "池内没有合格出口（无出口槽）"
+    if not bindings:
+        return False, "运行配置里没有 lane（未生成 lane plan 或 listener 未就绪）"
+    if len(bindings) != len(slots):
+        return False, f"lane 数 {len(bindings)} ≠ 当前出口槽数 {len(slots)}"
+    for i, (binding, slot) in enumerate(zip(bindings, slots)):
+        node = str(binding.get("node") or "")
+        exit_ip = binding.get("exitIp")
+        if node != slot.runtime_name or exit_ip != slot.exit_ip:
+            return False, (
+                f"lane {i} 绑的是 {node!r}/{exit_ip!r}，"
+                f"当前出口槽是 {slot.runtime_name!r}/{slot.exit_ip!r}"
+            )
+    return True, ""
+
+
+async def exit_slot_snapshot(session) -> list[ExitSlot]:
+    """当前出口槽快照（顺序与 `select_exit_slots` 一致，即重建时的 lane 位次）。"""
+    from app.domains.proxypool.pool import eligible_nodes
+
+    return select_exit_slots(await eligible_nodes(session))
+
+
+def _notify_rebuild() -> None:
+    """置 `rebuild_pending`（下一拍空闲时收敛）。惰性引用调度层，避免反向依赖。"""
+    try:
+        from app.domains.proxypool.scheduling import request_rebuild
+
+        request_rebuild()
+    except Exception:  # noqa: BLE001 —— 通知失败不影响"拒绝启动"这个结论
+        pass
+
+
+async def crawl_lane_plan(
+    session, data_dir: Path, *, max_lanes: int | None = None
+) -> dict:
+    """**爬取唯一取值口**：只有「有池 + 有 lane + 两者逐位一致」才交出地址。
+
+    把两种状态严格分开（这是生产红线的落点）：
+
+        Mihomo Runtime Running   —— 维护/健康路径关心：进程在跑、控制器可达、
+                                    mixed-port 在听（`current_runtime_proxy_url`）。
+        Crawl Runtime Ready      —— 爬取关心：**池里有合格出口、有 lane、lane 与出口
+                                    快照逐位一致、入口真的在听**。
+
+    只有后者成立才返回 URL；任一条件不满足即抛 `RuntimeUnavailableError`，
+    **绝不**回退 GLOBAL、回退直连、回退旧订阅代理——那三种回退都会把"池坏了"
+    伪装成"爬取成功"，并在出口身份不明的情况下把生产流量送出去。
+    """
+    slots = await exit_slot_snapshot(session)
+    bindings = lane_bindings(data_dir)
+    ok, why = lane_plan_consistency(bindings, slots)
+    if not ok:
+        _notify_rebuild()
+        raise RuntimeUnavailableError(
+            f"代理运行时未就绪（{why}）：本次爬取未启动"
+        )
+    known = {slot.runtime_name: slot.exit_ip for slot in slots}
+    active = select_run_lanes(bindings, known, max_lanes=max_lanes)
+    if not active:
+        _notify_rebuild()
+        raise RuntimeUnavailableError(
+            "代理运行时的 lane 与当前出口集没有可用交集：本次爬取未启动"
+        )
+    return {
+        "urls": [b["url"] for b in active],
+        "exit_keys": [b["exitIp"] or f"lane:{b['lane']}" for b in active],
+        "nodes": [b["node"] or "" for b in active],
+        "bindings": active,
+        "runtime_lanes": len(bindings),
+        "known_exits": len({v for v in known.values() if v}),
+    }
+
+
 def lane_run_plan(
     data_dir: Path,
     *,
     exit_by_node: Mapping[str, str] | None = None,
     max_lanes: int | None = None,
 ) -> dict:
+    """**非生产**取值口（诊断 / 验证脚本用）：不做一致性校验，空快照时退回按节点计。
+
+    生产爬取一律走 `crawl_lane_plan()`——它会校验「池 / lane / 出口快照」三者一致并
+    fail closed。本函数保留给诊断与脚本，避免把校验逻辑复制成第二套。
+    """
     """受管爬取一次 run 需要的入口三元组：地址 / 出口键 / 执行节点（三者同序）。
 
     **唯一取值口**：生产路径与验证脚本都从这里取。`exit_by_node` 是**当前**出口身份
