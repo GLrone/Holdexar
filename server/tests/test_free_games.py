@@ -29,7 +29,9 @@ from app.crawler.db_writer import DbWriter, _classify_free_kind
 from app.domains.games.models import Game, GameCurrentPrice, GamePriceHistory
 
 APPID = 997_001
-PROMO_END = 1_790_182_800  # Space Menace 的 free_to_keep_ends
+# 截止时刻相对「现在」取未来值：服务端按 promo_end_at > now 过滤，
+# 写死绝对时刻必然随真实日期滑入过去
+PROMO_END = int(__import__("time").time()) + 86_400
 
 
 @pytest.fixture
@@ -55,6 +57,7 @@ def db(tmp_path, monkeypatch):
 async def _schema(db):
     import app.domains.crawl.models  # noqa: F401
     import app.domains.games.models  # noqa: F401
+    import app.domains.monitoring.models  # noqa: F401（release 流程查 monitor_sources）
     import app.domains.rates.models  # noqa: F401
     import app.domains.wishlist.models  # noqa: F401
 
