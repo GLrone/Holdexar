@@ -101,9 +101,11 @@ const pool = {
 
   /* ── 条目格子与空态 ── */
   'pool.items.pendingName': '未抓取（新绑定条目）',
-  'pool.items.noMatch': '未找到「{query}」—— 不在当前监控条目中。',
-  'pool.items.noKindMatch': '当前类别下没有条目。',
-  'pool.items.empty': '还没有关注的游戏 —— 点「添加」粘贴游戏链接即可。',
+  'pool.items.noMatch': '未找到「{query}」——不在当前关注列表中。',
+  'pool.items.noKindMatch': '这个类别下还没有游戏。',
+  /* Steam 账户区空态：账号能力专属（绑定后愿望单/已购自动进关注），不冒充全局前置 */
+  'pool.accounts.empty': '还没有绑定 Steam 账号——绑定后，愿望单和已购游戏会自动进入关注。',
+  'pool.items.empty': '还没有关注任何游戏——到「找游戏」页点卡片上的星标关注，或点上方「添加条目」。',
 } as const
 
 export default pool

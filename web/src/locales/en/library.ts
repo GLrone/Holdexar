@@ -11,29 +11,21 @@ const library: Partial<Record<MessageKey, string>> = {
   'library.error.title': 'Could not load the library',
   'library.error.network': 'Cannot reach the server',
 
-  'library.empty.library.title': 'The store is still empty',
-  /* Network hint: shown only when games were added but no data arrives.
-     A proxy is an improvement, not a prerequisite (direct connection is the
-     standard) — keep the wording hedged ("may", "usually"), no hard causality. */
-  'library.empty.library.netHint':
-    'No data for a long time? The current network may be struggling to reach Steam — setting up a proxy usually helps.',
-  'library.empty.library.goProxy': 'Set up a proxy',
-  /* Empty watch pool: one-tap jump to manual import */
-  'library.empty.library.goImport': 'Add games',
-  'library.empty.library.pool':
-    'The watch pool holds {n} games, but no price data yet.',
-  'library.empty.library.crawling':
-    'Prices are updating — cards will show up here once it finishes.',
-  'library.empty.library.startHint':
-    'Prices refresh on a fixed schedule; you can also trigger one update from the Tasks page.',
-  'library.empty.library.noPool1':
-    'Start by adding the games you want to compare:',
-  'library.empty.library.noPool2':
-    'Paste game links on the Tasks page; with a bound Steam account, your wishlist and owned games join automatically.',
-  'library.empty.library.checking': 'Checking the watch pool…',
+  /* Empty state A: no games in the catalog (P-M5) — user actions and results
+     only; adding shares the dashboard paste flow, bulk import lives on Following */
+  /* Empty state B: just added, prices not in yet (freshly imported rows appear
+     after the first fetch completes) — the system has it handled, say so */
+  'library.empty.library.pending': 'Fetching prices',
+  'library.empty.library.pendingHint': 'Added — the game will show up here on its own.',
+  'library.empty.library.title': 'No games yet',
+  'library.empty.library.hint': 'Add a game and the system will fetch prices for every region automatically.',
+  'library.empty.library.paste': 'Paste game links',
+  'library.empty.library.import': 'Import a game list',
 
-  'library.empty.filter.title': 'No matches',
-  'library.empty.filter.hint': 'Try a different search or price filter.',
+  /* Empty state C: search/filter active but nothing matched (distinct from “no games”) */
+  'library.empty.filter.title': 'No games match these conditions',
+  'library.empty.filter.hint': 'Try a different search term, or clear the filters.',
+  'library.empty.filter.clear': 'Clear search & filters',
 
   'library.loadingMore': 'Loading more...',
   'library.end': 'You have reached the end',

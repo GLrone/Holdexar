@@ -543,7 +543,7 @@ onMounted(async () => {
         <HlEmpty
           v-if="!accounts.length"
           icon=""
-          :text="t('pool.items.empty')"
+          :text="t('pool.accounts.empty')"
         />
       </template>
     </div>

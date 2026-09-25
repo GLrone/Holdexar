@@ -80,9 +80,9 @@ const gameCard = {
   'gameCard.priceData.none': '尚无价格数据',
   'gameCard.priceData.coverageFull': '覆盖 {ok}/{expected}',
   'gameCard.priceData.coveragePartial': '覆盖 {ok}/{expected}，未完整',
-  'gameCard.priceData.tip.locked': '{n} 个地区锁区',
-  'gameCard.priceData.tip.failed': '{n} 个地区抓取失败',
-  'gameCard.priceData.tip.unobserved': '{n} 个地区本轮未有结果',
+  'gameCard.priceData.tip.locked': '{n} 个地区不售卖（锁区）',
+  'gameCard.priceData.tip.failed': '{n} 个地区暂时没拿到，稍后自动重试',
+  'gameCard.priceData.tip.unobserved': '{n} 个地区还在获取中',
 
   /* ── 卡片操作行（regionPrice.title 与 GPW 弹窗小标题同条）── */
   'gameCard.regionPrice.title': '全区价格',

@@ -22,12 +22,12 @@ import {
 import { formatCnyFen } from '@/api/regions'
 import { currencyName } from '@/api/currencies'
 import { APP_NAME } from '@/appInfo'
-import { parseAppRefs } from '@/lib/appidRefs'
 import { isPermChangeRecent } from '@/lib/priceFlag'
 import { EVENT_AGE_KEYS, ageHoursOf, eventToneOf, eventTypeLabelKey, summarizeCycle } from '@/lib/priceEvents'
 import { agePart, type TextPart } from '@/lib/priceDataView'
 import { useI18n, useLocaleFormat } from '@/locales'
 import { message, HlButton, HlCarousel, HlEmpty, HlImg, HlTextarea } from '@/components/ui'
+import { usePasteAdd } from '@/composables/usePasteAdd'
 import { useCrawlStatusStore } from '@/stores/crawlStatus'
 import { useRegionsStore } from '@/stores/regions'
 import { useRatesStore } from '@/stores/rates'
@@ -249,11 +249,16 @@ const isEmptyLibrary = computed(
 
 /** 内联添加区：粘贴链接/整份列表 → 入池 → 对新导入触发首次获取价格 */
 const addOpen = ref(false)
-const addText = ref('')
-const addBusy = ref(false)
-const addMsg = ref('')
 /** 本轮刚添加的款数：>0 时欢迎卡改显「正在获取价格」，首爬收敛后自动重取 */
 const addedPending = ref(0)
+
+// 粘贴添加链（与找游戏空态共用）：成功后欢迎卡切「正在获取价格」并重取列表
+const { addText, addMsg, addBusy, submitAdd } = usePasteAdd({
+  onAdded: (added) => {
+    addedPending.value = added
+  },
+  onSettled: () => load(),
+})
 
 // 首爬收敛（爬取从跑到停）→ 重取一次：目录里有条目后欢迎卡自然消失
 watch(
@@ -265,58 +270,6 @@ watch(
     }
   },
 )
-
-async function submitAdd() {
-  const text = addText.value.trim()
-  if (!text || addBusy.value) return
-  const { appids } = parseAppRefs(text)
-  if (!appids.length) {
-    addMsg.value = t('dashboard.welcome.addNone')
-    return
-  }
-  addBusy.value = true
-  addMsg.value = ''
-  try {
-    let added = 0
-    let owned = 0
-    const newIds: number[] = []
-    for (let i = 0; i < appids.length; i += 100) {
-      const r = await crawlApi.importApps(appids.slice(i, i + 100))
-      added += r.ok
-      owned += r.own
-      newIds.push(
-        ...r.results
-          .filter((it) => it.status === 'ok' && it.appid)
-          .map((it) => it.appid as number),
-      )
-    }
-    if (newIds.length) {
-      try {
-        // 新导入直接触发一次获取（与批量导入同款语义）；任务占用则留给后续刷新
-        await crawlApi.run('appids', newIds, 'import')
-      } catch {
-        /* 任务占用：不打断用户，价格由后续刷新补齐 */
-      }
-    }
-    if (added > 0) {
-      message.success(t('dashboard.welcome.added', { n: added }))
-      addText.value = ''
-      addOpen.value = false
-      addedPending.value = added
-      await load()
-    } else if (owned > 0) {
-      addMsg.value = t('dashboard.welcome.addOwned', { n: owned })
-      await load()
-    } else {
-      addMsg.value = t('dashboard.welcome.addNone')
-    }
-  } catch {
-    // 导入不需要账户；失败只报结果与出路，不把后端原文甩给用户
-    addMsg.value = t('dashboard.welcome.addFailed')
-  } finally {
-    addBusy.value = false
-  }
-}
 
 /** 空库时的「从 Steam 愿望单同步」：没绑账号就说明去哪绑 */
 async function syncFromWelcome() {

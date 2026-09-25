@@ -69,9 +69,9 @@ const gameCard: Partial<Record<MessageKey, string>> = {
   'gameCard.priceData.none': 'no price data yet',
   'gameCard.priceData.coverageFull': 'coverage {ok}/{expected}',
   'gameCard.priceData.coveragePartial': 'coverage {ok}/{expected}, incomplete',
-  'gameCard.priceData.tip.locked': '{n} region(s) locked',
-  'gameCard.priceData.tip.failed': '{n} region(s) failed',
-  'gameCard.priceData.tip.unobserved': '{n} region(s) with no result this round',
+  'gameCard.priceData.tip.locked': '{n} region(s) do not sell this game (locked)',
+  'gameCard.priceData.tip.failed': '{n} region(s) not fetched yet — will retry automatically',
+  'gameCard.priceData.tip.unobserved': '{n} region(s) still being fetched',
 
   /* Card action row */
   'gameCard.regionPrice.title': 'All regions',

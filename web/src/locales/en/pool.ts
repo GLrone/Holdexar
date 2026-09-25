@@ -91,9 +91,11 @@ const pool: Partial<Record<MessageKey, string>> = {
 
   /* Item grid and empty states */
   'pool.items.pendingName': 'Not fetched yet (new entry)',
-  'pool.items.noMatch': 'No match for “{query}” — not in the tracked items.',
-  'pool.items.noKindMatch': 'No items in this category.',
-  'pool.items.empty': 'Nothing followed yet — hit Add and paste a game link.',
+  'pool.items.noMatch': 'No match for “{query}” — not in the followed list.',
+  'pool.items.noKindMatch': 'No games in this category.',
+  /* Steam account section empty: account-scoped prompt, never a global prerequisite */
+  'pool.accounts.empty': 'No Steam account bound yet — bind one and your wishlist and owned games will join Following automatically.',
+  'pool.items.empty': 'Nothing followed yet — star a game on Find Games, or use “Add” above.',
 }
 
 export default pool
