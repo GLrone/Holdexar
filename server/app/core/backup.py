@@ -11,7 +11,8 @@
 3. 生产库三份轮换（.restoring/.rollback），替换后清陈旧 WAL、重建引擎
    → 失败自动回滚原库
 
-保留策略分两类轮转：自动备份保留最近 BACKUP_KEEP 份；手动备份（文件名带
+保留策略分两类轮转：自动备份份数 ≤ BACKUP_KEEP 且总量 ≤ 主库体积 ×
+BACKUP_TOTAL_CAP_RATIO（至少保留 BACKUP_MIN_KEEP 份）；手动备份（文件名带
 -manual 标记）单独轮转、仅保留最新一份——两类互不占位。
 """
 from __future__ import annotations
@@ -27,7 +28,9 @@ from .config import get_settings
 
 logger = logging.getLogger(__name__)
 
-BACKUP_KEEP = 5  # 保留最近 N 份，超出按时间从老到新自动清理
+BACKUP_KEEP = 5  # 自动备份最大份数
+BACKUP_MIN_KEEP = 2  # 总量受限时仍强制保留的最少份数
+BACKUP_TOTAL_CAP_RATIO = 2.0  # 自动备份总量上限 = 主库体积 × 该倍数
 _BACKUP_DIR_NAME = "backups"
 _LOCK_FILE = ".restore.lock"
 MANUAL_LABEL = "manual"  # 手动备份的文件名标记：独立轮转，仅保留最新一份
@@ -170,8 +173,17 @@ def _is_manual_backup(filename: str) -> bool:
     return filename.endswith(f"-{MANUAL_LABEL}.db")
 
 
+def _main_db_bytes() -> int:
+    try:
+        return _db_path().stat().st_size
+    except OSError:
+        return 0
+
+
 def _rotate_old_backups() -> None:
-    """自动备份保留最近 BACKUP_KEEP 份；手动备份单独轮转，仅保留最新一份。
+    """自动备份轮转受双重上限：份数 ≤ BACKUP_KEEP，总量 ≤ 主库体积 ×
+    BACKUP_TOTAL_CAP_RATIO；无论上限多紧至少保留 BACKUP_MIN_KEEP 份。
+    手动备份单独轮转，仅保留最新一份。
 
     两类互不占位：手动备份是用户显式建立的安全点，不因自动轮转被清；
     自动备份也不因手动备份的存在而少留。
@@ -179,9 +191,18 @@ def _rotate_old_backups() -> None:
     files = sorted(backup_dir().glob("*.db"), key=lambda x: x.stat().st_mtime, reverse=True)
     auto = [p for p in files if not _is_manual_backup(p.name)]
     manual = [p for p in files if _is_manual_backup(p.name)]
-    for old in auto[BACKUP_KEEP:]:
-        old.unlink(missing_ok=True)
-        logger.info("[备份] 轮转清理：%s", old.name)
+
+    cap = BACKUP_TOTAL_CAP_RATIO * _main_db_bytes()
+
+    kept, total = 0, 0
+    for p in auto:
+        size = p.stat().st_size
+        if kept >= BACKUP_MIN_KEEP and (kept >= BACKUP_KEEP or total + size > cap):
+            p.unlink(missing_ok=True)
+            logger.info("[备份] 轮转清理：%s", p.name)
+            continue
+        kept += 1
+        total += size
     for old in manual[1:]:
         old.unlink(missing_ok=True)
         logger.info("[备份] 手动备份轮转（仅保留最新一份）：%s", old.name)
