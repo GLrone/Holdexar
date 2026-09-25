@@ -48,6 +48,7 @@ class SubscriptionAdd(BaseModel):
 class SubscriptionUpdate(BaseModel):
     label: str | None = None  # 订阅名称；空串清名
     url: str | None = None  # 订阅链接；变更时 clash 订阅自动重拉
+    autoRefresh: bool | None = None  # 自动更新开关；False = 定时刷新跳过，只手动重拉
 
 
 @router.get("")
@@ -306,9 +307,11 @@ async def delete_subscription(sub_id: int):
 
 @router.put("/subscriptions/{sub_id}")
 async def update_subscription(sub_id: int, req: SubscriptionUpdate):
-    """编辑订阅：改名 + 换链接（换链接的 clash 订阅保存即自动重拉）。"""
+    """编辑订阅：改名 + 换链接 + 自动更新开关（换链接的 clash 订阅保存即自动重拉）。"""
     try:
-        return await service.update_subscription(sub_id, req.label, req.url)
+        return await service.update_subscription(
+            sub_id, req.label, req.url, req.autoRefresh
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

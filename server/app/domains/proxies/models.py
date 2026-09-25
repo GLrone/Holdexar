@@ -92,6 +92,11 @@ class ProxySubscription(Base):
     last_error: Mapped[str | None] = mapped_column(String(500))
     snapshot_sha256: Mapped[str | None] = mapped_column(String(64))
     snapshot_version: Mapped[int] = mapped_column(Integer, default=0)
+    # 自动更新订阅：False = 定时刷新跳过它，只保留手动重拉。
+    # 限时订阅（只在窗口内可下载、下载后长期可用）关掉即不再每轮撞失败。
+    auto_refresh: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="1"
+    )
 
 
 class ClashNode(Base):

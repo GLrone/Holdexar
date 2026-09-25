@@ -364,9 +364,10 @@ async def update_subscription_label(sub_id: int, label: str) -> dict:
 
 
 async def update_subscription(
-    sub_id: int, label: str | None = None, url: str | None = None
+    sub_id: int, label: str | None = None, url: str | None = None,
+    auto_refresh: bool | None = None,
 ) -> dict:
-    """编辑订阅：改名 + 换链接；链接变更的 clash 订阅**保存即自动重拉**。
+    """编辑订阅：改名 + 换链接 + 自动更新开关；链接变更的 clash 订阅**保存即自动重拉**。
 
     链接是订阅的唯一身份——换了链接等于换了一个机场，磁盘上的 config.yaml
     与 clash_nodes 账本都还属于旧链接，不重拉就一直对不上。重拉通道同
@@ -386,6 +387,8 @@ async def update_subscription(
             raise ValueError("订阅不存在")
         if label is not None:
             sub.label = (label or "").strip() or None
+        if auto_refresh is not None:
+            sub.auto_refresh = bool(auto_refresh)
         url_changed = False
         if url is not None:
             new_url = (url or "").strip()
@@ -398,6 +401,8 @@ async def update_subscription(
         result: dict = {
             "id": sub.id, "kind": sub.kind, "url": sub.url,
             "label": sub.label, "synced": False,
+            "autoRefresh": bool(sub.auto_refresh)
+            if sub.auto_refresh is not None else True,
         }
     if url_changed and result["kind"] == "clash":
         try:
@@ -873,6 +878,10 @@ async def list_subscriptions(kind: str | None = None) -> list[dict]:
                 if s.kind == "clash"
                 else ADMISSION_ACTIVE
             ),
+            # 自动更新：False 时定时刷新跳过它（手动重拉照常）
+            "autoRefresh": bool(s.auto_refresh)
+            if s.auto_refresh is not None
+            else True,
         }
         for s in rows
     ]

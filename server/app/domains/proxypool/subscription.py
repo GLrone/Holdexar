@@ -60,6 +60,7 @@ SOURCE_DETERMINED_FORMATS = frozenset({
 CHANNEL_DIRECT = "direct"
 CHANNEL_KERNEL = "mihomo"
 CHANNEL_POOL = "proxypool"
+CHANNEL_LOCAL = "local"
 
 
 # ── 错误类型（稳定、可断言）──────────────────────────────────────
@@ -268,17 +269,44 @@ def build_channels(
     *,
     kernel_proxy: str | None = None,
     pool_proxy: str | None = None,
+    local_proxies: list[str] | None = None,
 ) -> list[Channel]:
-    """直连 → 现有 Mihomo 内核 → proxypool 已可用代理。
+    """直连 → 现有 Mihomo 内核 → proxypool 已可用代理 → 本机在听的常见混合端口。
 
-    后两通道未就绪时**自然跳过**：P1.2 不得依赖尚未落地的 P1.3 池。
+    面板域名多被墙、直连失败是常态，**只留直连一条通道等于把订阅刷新交给运气**：
+    通道耗尽时快照停止更新，订阅提供的节点随之判定退休、池再也建不起来。
+    因此这条链与内核下载保持同一套语义（`clash_manager._download_attempts`），
+    出口优先级也一样——自己管理、自己体检过的出口（内核 / 池）排在借道用户
+    自启 Clash 的本地混合端口之前。
+
+    后三通道未就绪时**自然跳过**（内核没跑、池为空、本地端口没在听）。
+    `local_proxies=None` 即现探本机常见混合端口；传列表可显式指定（测试用）。
     """
     channels = [Channel(CHANNEL_DIRECT, None)]
     if kernel_proxy:
         channels.append(Channel(CHANNEL_KERNEL, kernel_proxy))
     if pool_proxy:
         channels.append(Channel(CHANNEL_POOL, pool_proxy))
+    if local_proxies is None:
+        local_proxies = _local_mixed_proxies(kernel_proxy)
+    for url in local_proxies:
+        if url and url not in [c.proxy for c in channels]:
+            channels.append(Channel(CHANNEL_LOCAL, url))
     return channels
+
+
+def _local_mixed_proxies(kernel_proxy: str | None) -> list[str]:
+    """本机在听的常见混合端口（借道用户自启的 Clash / Verge）。探活失败即无。"""
+    try:
+        from app.domains.proxies import clash_manager
+
+        exclude = None
+        if kernel_proxy:
+            tail = kernel_proxy.rsplit(":", 1)[-1]
+            exclude = int(tail) if tail.isdigit() else None
+        return clash_manager.local_mixed_channels(exclude)
+    except Exception:  # noqa: BLE001 —— 借道口只是加成，探不到就不加
+        return []
 
 
 def default_client_factory(channel: Channel, *, timeout: float = DEFAULT_FETCH_TIMEOUT

@@ -130,6 +130,9 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         # 生产准入（订阅级）：库层默认 ACTIVE —— **只为把已存在的历史行兼容成
         # ACTIVE**；新行由模型默认 CANDIDATE（见 proxies/models.py 常量说明）。
         "admission_status": "VARCHAR(16) DEFAULT 'ACTIVE'",
+        # 自动更新订阅：0 = 只手动重拉。限时订阅（只能在其窗口内下载、下载后
+        # 可长期使用）关掉它，就不会每轮定时刷新都去撞一次注定失败的抓取。
+        "auto_refresh": "BOOLEAN DEFAULT 1",
     },
     "subscription_snapshots": {
         "url": "VARCHAR(500)",

@@ -294,6 +294,23 @@ def _port_reachable(port: int, host: str = "127.0.0.1", timeout: float = 0.3) ->
         return False
 
 
+# 本机常见混合端口：7890 是旧版默认，7897 是 Verge 默认
+LOCAL_MIXED_PORTS: tuple[int, ...] = (7890, 7897)
+
+
+def local_mixed_channels(exclude_port: int | None = None) -> list[str]:
+    """本机**在听**的常见混合端口，供下载与订阅抓取借道。
+
+    只探"端口在听"——出口是否可用无人担保，所以调用方一律把它排在自己
+    管理、自己体检过的出口之后。
+    """
+    return [
+        f"http://127.0.0.1:{port}"
+        for port in LOCAL_MIXED_PORTS
+        if port != exclude_port and _port_reachable(port)
+    ]
+
+
 def _download_attempts(
     runtime_port: int | None = None, proxy_url: str | list[str] | None = None
 ) -> list[tuple[str | None, str]]:
@@ -320,7 +337,7 @@ def _download_attempts(
     for url in saved:
         if url and url not in [a[0] for a in attempts]:
             attempts.append((url, "经已保存代理"))
-    for port in (7890, 7897):
+    for port in LOCAL_MIXED_PORTS:
         if port == runtime_port:
             continue
         if _port_reachable(port):

@@ -93,6 +93,8 @@ const proxies: Partial<Record<MessageKey, string>> = {
   'proxies.sub.urlLabel': 'Subscription URL',
   'proxies.sub.urlPlaceholder': 'https://… subscription URL',
   'proxies.sub.editSave': 'Save',
+  'proxies.sub.autoLabel': 'Auto-update subscription',
+  'proxies.sub.autoHint': 'When off, this subscription is no longer re-fetched on schedule (manual re-fetch still works); recommended for time-limited subscriptions',
   'proxies.sub.editTip': 'Saving a new URL re-fetches it automatically (direct first; if that fails, a saved working proxy is used)',
   'proxies.sub.edited': 'Subscription updated',
   'proxies.sub.editedSynced': 'Subscription updated and re-fetched ({parts})',

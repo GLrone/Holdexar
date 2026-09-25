@@ -103,6 +103,7 @@ const editDialog = ref(false)
 const editSub = ref<ProxySubscriptionItem | null>(null)
 const editLabel = ref('')
 const editUrl = ref('')
+const editAutoRefresh = ref(true)
 const editingSub = ref(false)
 
 // Clash 节点检测（出口 IP 去重 → 存活 23/45）
@@ -236,6 +237,7 @@ function openEditSubscription(sub: ProxySubscriptionItem) {
   editSub.value = sub
   editLabel.value = sub.label ?? ''
   editUrl.value = sub.url
+  editAutoRefresh.value = sub.autoRefresh !== false
   editDialog.value = true
 }
 
@@ -253,6 +255,7 @@ async function saveEditSubscription() {
     const res = await proxiesApi.updateSubscription(sub.id, {
       label: editLabel.value,
       url,
+      autoRefresh: editAutoRefresh.value,
     })
     editDialog.value = false
     if (res.synced) {
@@ -960,6 +963,13 @@ onMounted(async () => {
           <span class="sed__label">{{ t('proxies.sub.urlLabel') }}</span>
           <input v-model="editUrl" class="pxinput mono" :placeholder="t('proxies.sub.urlPlaceholder')" />
         </label>
+        <!-- 自动更新开关：限时订阅（只在窗口内可下载、下载后长期可用）关掉它，
+             定时刷新不再每轮撞一次注定失败的抓取；手动重拉照常可用。 -->
+        <div class="sed__row">
+          <span class="sed__label">{{ t('proxies.sub.autoLabel') }}</span>
+          <HlSwitch v-model="editAutoRefresh" accent :label="t('proxies.sub.autoLabel')" />
+        </div>
+        <p class="sed__tip">{{ t('proxies.sub.autoHint') }}</p>
         <p class="sed__tip">{{ t('proxies.sub.editTip') }}</p>
       </div>
       <template #footer>
