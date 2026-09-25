@@ -565,3 +565,32 @@ async def test_smtp_unconfigured_creates_no_candidates(db, monkeypatch):
     result = await notification_service.dispatch(cid)
     assert result["created"] == 0
     assert await _candidates(db) == []
+
+
+@pytest.mark.asyncio
+async def test_prefs_endpoint_smtp_view(db, monkeypatch):
+    """路由层 get_prefs 端到端：_smtp_view 的取键与 get_smtp_config 的
+    camelCase 返回（toAddr / useSsl）对齐，键形漂移即整页 500。"""
+    from app.domains.notifications import router as notif_router
+
+    async def _front_smtp():
+        return {
+            "host": "smtp.example.com",
+            "port": 465,
+            "user": "sender@example.com",
+            "password": "s***r",
+            "hasPassword": True,
+            "toAddr": "owner@example.com",
+            "useSsl": True,
+        }
+
+    monkeypatch.setattr(notif_router, "get_session_factory", lambda: db)
+    monkeypatch.setattr(notif_router, "get_smtp_config", _front_smtp)
+
+    payload = await notif_router.get_prefs()
+    assert payload["smtp"]["configured"] is True
+    assert payload["smtp"]["host"] == "smtp.example.com"
+    assert payload["smtp"]["userMasked"].endswith("@example.com")
+    assert payload["smtp"]["useSsl"] is True
+    assert payload["smtp"]["hasPassword"] is True
+    assert "password" not in payload["smtp"]
