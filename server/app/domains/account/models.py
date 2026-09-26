@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, Integer, String
+from sqlalchemy import JSON, Boolean, DateTime, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -18,10 +18,11 @@ class SteamAccount(Base):
     __tablename__ = "steam_accounts"
 
     steam_id: Mapped[str] = mapped_column(String(20), primary_key=True)
-    # 登录态明文（sessionid / steamCountry / steamLoginSecure 三件套 +
-    # steamRefresh_steam / steamRememberLogin 续期凭据），仅本机库；
-    # 访问令牌约 24 小时到期，续期靠这枚凭据换新（见 session.py）
-    cookies: Mapped[str] = mapped_column(String(4000), default="")
+    # 登录态凭据（sessionid / steamCountry / steamLoginSecure 三件套 +
+    # steamRefresh_steam / steamRememberLogin 续期凭据）：落库即 AES-256-GCM
+    # 密文（enc1: 前缀，secretbox 按机器派生密钥），消费时解密，明文不出库
+    # 不出日志。访问令牌约 24 小时到期，续期靠这枚凭据换新（见 session.py）
+    cookies: Mapped[str] = mapped_column(Text, default="")
     persona_name: Mapped[str] = mapped_column(String(100), default="")
     avatar_url: Mapped[str] = mapped_column(String(300), default="")
     # 每账号独立钱包快照：{balance, balance_display, currency_code, region_code, ...}

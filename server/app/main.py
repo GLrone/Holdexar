@@ -157,6 +157,13 @@ async def _post_startup_chain() -> None:
     except Exception:  # noqa: BLE001
         logger.exception("旧单账号 Cookie 迁移失败（不阻塞启动）")
 
+    # 存量明文凭据静态加密（幂等）：账号 Cookie 行与凭据类设置键封装为
+    # AES-256-GCM 密文，读取侧使用时解密；已带密文前缀的原样跳过
+    try:
+        await account_service.seal_credentials_at_rest()
+    except Exception:  # noqa: BLE001 —— 读取侧兼容明文，本步失败不阻塞启动
+        logger.exception("存量凭据静态加密失败（不阻塞启动）")
+
     # 史低标记 + 永降标记 + 排序缓存预计算列 + 系列归组全库初始化
     # （秒级；爬取后另有增量刷新）
     from app.domains.games import service as games_service

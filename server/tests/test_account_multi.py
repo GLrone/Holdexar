@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.core import secretbox
 from app.core.database import Base
 from app.domains.account import service as account_service
 from app.domains.account.steam_wallet import _from_raw_amounts
@@ -34,6 +35,9 @@ def db(tmp_path, monkeypatch):
     monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
     monkeypatch.setattr(account_service, "get_session_factory", lambda: factory)
     monkeypatch.setattr(settings_service, "get_session_factory", lambda: factory)
+    # 凭据密封的密钥材料（secret.salt）隔离到临时目录，不落开发数据目录
+    monkeypatch.setattr(secretbox, "_data_dir", lambda: tmp_path)
+    secretbox.clear_key_cache()
     return factory
 
 

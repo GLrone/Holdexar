@@ -37,6 +37,9 @@ hiddenimports = [
     # SQLAlchemy asyncio 方言运行时动态加载 dbapi，静态分析收不到
     "aiosqlite",
     "greenlet",
+    # 凭据静态加密（secretbox：AES-256-GCM；rust 后端随内置 hook 收集，
+    # 显式登记防漏）
+    "cryptography",
     # pywebview Windows 动态选平台（EdgeChromium / winforms 登录窗 Cookie 通道）
     "webview.platforms.edgechromium",
     "webview.platforms.winforms",

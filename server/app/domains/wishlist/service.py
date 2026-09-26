@@ -140,9 +140,9 @@ async def _resolve_steamid(raw: str) -> str:
         return str(steamid)
 
     # 4. 自定义 URL（完整 URL 或纯 vanity name）
-    from app.domains.settings.service import get_value
+    from app.domains.settings.service import get_secret_value
 
-    api_key = (await get_value("account.steam_api_key", "")) or ""
+    api_key = (await get_secret_value("account.steam_api_key", "")) or ""
     vanity_match = re.search(r"steamcommunity\.com/id/([^/]+)", raw)
     vanity = vanity_match.group(1) if vanity_match else raw
 
@@ -264,9 +264,9 @@ async def fetch_owned_games(steamid: str) -> tuple[list[dict], str | None]:
         except OwnedFetchError as e:
             logger.warning("已购拉取 JWT 通道失败（%s），回退 WebAPI Key", e)
 
-    from app.domains.settings.service import get_value
+    from app.domains.settings.service import get_secret_value
 
-    api_key = (await get_value("account.steam_api_key", "")) or ""
+    api_key = (await get_secret_value("account.steam_api_key", "")) or ""
     if not api_key:
         raise OwnedFetchError("已购拉取不可用：未绑定 Steam Cookie，且未配置 Web API Key")
     games = await fetch_owned_games_via_key(steamid, api_key)

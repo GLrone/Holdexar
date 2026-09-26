@@ -23,7 +23,9 @@ from datetime import datetime
 
 from sqlalchemy import func, select
 
+from app.core import secretbox
 from app.core.database import get_session_factory
+from app.core.secretbox import SecretBoxError
 from app.crawler.utils import get_beijing_time_obj
 from app.domains.account.models import SteamAccount
 from app.domains.regions.models import CrawlRegion
@@ -59,6 +61,54 @@ KEY_STEAM_ID = "account.steam_id"
 
 # 结算币种反查区服时，多区共用币种固定取的"基准区"
 _CURRENCY_PRIMARY_REGION = {"USD": "us"}
+
+# 登录凭据的静态加密用途串（secretbox 按此派生独立密钥）
+_CREDENTIAL_PURPOSE = "steam-cookies"
+
+
+def _seal_credential(plaintext: str) -> str:
+    """登录凭据落库前封装（AES-256-GCM；空串原样返回）。"""
+    return secretbox.encrypt_secret(plaintext, _CREDENTIAL_PURPOSE)
+
+
+def _stored_credential(row: SteamAccount) -> str:
+    """账号行凭据密文 → 当前可用明文（使用时解密）。
+
+    密文解不开（库文件被单独拷走 / 整机迁移后派生密钥不同）返回空串：
+    凭据属主语义，行内密文保留，重新登录覆盖后即恢复；存量明文（尚未走
+    启动加密步骤）原样可用。
+    """
+    value = row.cookies or ""
+    if not secretbox.is_encrypted(value):
+        return value
+    try:
+        return secretbox.decrypt_secret(value, _CREDENTIAL_PURPOSE)
+    except SecretBoxError:
+        logger.warning("[account] 账号 %s 凭据无法在本机解密，按无凭据处理", row.steam_id)
+        return ""
+
+
+def _row_session_freshness(row: SteamAccount) -> dict:
+    """账号行登录态新鲜度。
+
+    密文解不开时按「已过期且无续期凭据」呈现——此时凭据实际不可用，
+    用户面与真实过期同出路（提示重新登录），不把坏密文当健康登录态。
+    """
+    value = row.cookies or ""
+    if secretbox.is_encrypted(value):
+        try:
+            plain = secretbox.decrypt_secret(value, _CREDENTIAL_PURPOSE)
+        except SecretBoxError:
+            return {
+                "expires_at": None,
+                "expired": True,
+                "expiring": True,
+                "seconds_left": 0,
+                "has_refresh_token": False,
+            }
+    else:
+        plain = value
+    return session_freshness(plain)
 
 # 每分钟轮转时每账号抓取前的随机延时区间（秒）：多账号错峰，避免同刻齐发
 _ROTATION_JITTER_SECONDS = (1.0, 8.0)
@@ -174,12 +224,12 @@ def _session_lock(steam_id: str) -> asyncio.Lock:
 
 
 async def _save_cookies_only(steam_id: str, cookies: str) -> None:
-    """只改账号行 Cookie（续期通道）：不动 active 归属与熔断状态。"""
+    """只改账号行 Cookie（续期通道）：不动 active 归属与熔断状态；落库密封。"""
     async with get_session_factory()() as session:
         row = await session.get(SteamAccount, steam_id)
         if row is None:
             return
-        row.cookies = cookies
+        row.cookies = _seal_credential(cookies)
         await session.commit()
 
 
@@ -197,9 +247,9 @@ async def ensure_live_session(steam_id: str, cookies: str) -> str:
         return cookies
 
     async with _session_lock(steam_id):
-        # 等锁期间可能已被其它调用续期落库，取最新值重新判定
+        # 等锁期间可能已被其它调用续期落库，取最新值（解密）重新判定
         row = await _get_row(steam_id)
-        current = (row.cookies if row is not None else "") or cookies
+        current = (_stored_credential(row) if row is not None else "") or cookies
         freshness = session_freshness(current)
         if not (freshness["expired"] or freshness["expiring"]):
             return current
@@ -265,7 +315,7 @@ async def get_cookies() -> str:
     if row is None:
         # 兼容回退：未迁移的旧部署（表空但 KV 有值）
         return (await settings_service.get_value(KEY_COOKIES, "")) or ""
-    return await ensure_live_session(row.steam_id, row.cookies or "")
+    return await ensure_live_session(row.steam_id, _stored_credential(row))
 
 
 async def get_primary_cookies() -> str:
@@ -273,7 +323,7 @@ async def get_primary_cookies() -> str:
     row = await get_primary_account()
     if row is None:
         return (await settings_service.get_value(KEY_COOKIES, "")) or ""
-    return await ensure_live_session(row.steam_id, row.cookies or "")
+    return await ensure_live_session(row.steam_id, _stored_credential(row))
 
 
 # ── 绑定 / 切换 / 删除 ──────────────────────────────────────
@@ -312,7 +362,7 @@ async def save_cookies(cookies_raw: str) -> dict:
         if row is None:
             row = SteamAccount(steam_id=cookie_sid, bound_at=now)
             session.add(row)
-        row.cookies = filtered
+        row.cookies = _seal_credential(filtered)
         row.is_active = True
         # active 移交：其余账号取消
         others = (
@@ -462,7 +512,8 @@ async def sync_wallet(*, force: bool = False) -> dict:
     （计数清零后重试，成败都不回冻结态——再挂了由轮转从零重新升级）。
     """
     row = await get_active_account()
-    if row is None or not row.cookies or "steamLoginSecure" not in row.cookies:
+    stored = _stored_credential(row) if row is not None else ""
+    if row is None or not stored or "steamLoginSecure" not in stored:
         return {"ok": False, "status": "no_cookie", "error": "尚未绑定 Steam Cookie"}
 
     if force and (row.wallet_frozen or int(row.wallet_fail_streak or 0) > 0):
@@ -479,7 +530,7 @@ async def sync_wallet(*, force: bool = False) -> dict:
             return {"ok": True, "cached": True, "wallet": snapshot}
 
     # 登录态先行：临期/过期且留有续期凭据时先换发新令牌，续不上则如实报过期
-    cookies = await ensure_live_session(row.steam_id, row.cookies)
+    cookies = await ensure_live_session(row.steam_id, stored)
     freshness = session_freshness(cookies)
     if freshness["expired"]:
         if not freshness["has_refresh_token"]:
@@ -760,7 +811,8 @@ async def _sync_wallet_of(steam_id: str) -> dict:
     等手动刷新余额或换绑解锁。
     """
     row = await _get_row(steam_id)
-    if row is None or not row.cookies or "steamLoginSecure" not in row.cookies:
+    stored = _stored_credential(row) if row is not None else ""
+    if row is None or not stored or "steamLoginSecure" not in stored:
         return {"ok": False, "status": "no_cookie", "error": "尚未绑定 Steam Cookie"}
 
     now = _naive_now()
@@ -771,7 +823,7 @@ async def _sync_wallet_of(steam_id: str) -> dict:
     # 登录失效不是网络故障，故两种情况都不计入网络退避计数之外的误判：
     # - 无续期凭据 = 只有用户重新登录能解 → 冻结自动轮转，不再打 Steam；
     # - 有续期凭据但本轮续期失败 = 可自愈 → 按普通失败退避，下一轮继续尝试。
-    cookies = await ensure_live_session(steam_id, row.cookies)
+    cookies = await ensure_live_session(steam_id, stored)
     freshness = session_freshness(cookies)
     if freshness["expired"]:
         if not freshness["has_refresh_token"]:
@@ -907,7 +959,7 @@ async def _account_payload(row: SteamAccount, primary_id: str, counts: dict) -> 
     """账号行的对外展示载荷（不含 Cookie 明文）。"""
     wallet = row.wallet_json if isinstance(row.wallet_json, dict) else None
     c = counts or {"wishlist_count": 0, "game_count": 0}
-    freshness = session_freshness(row.cookies or "")
+    freshness = _row_session_freshness(row)
     return {
         "steam_id": row.steam_id,
         "friend_code": _friend_code(row.steam_id),
@@ -969,9 +1021,10 @@ async def get_status() -> dict:
     bound_sid = (await settings_service.get_value(KEY_STEAM_ID, "")) or ""
     profile = {"persona_name": row.persona_name, "avatar_url": row.avatar_url,
                "steam_id": row.steam_id} if (row.persona_name or row.avatar_url) else None
-    freshness = session_freshness(row.cookies or "")
+    freshness = _row_session_freshness(row)
     return {
-        "has_cookie": bool(row.cookies and "steamLoginSecure" in row.cookies),
+        # has_cookie 只表示「绑过」（行内有凭据，含密文）；能不能用看 freshness
+        "has_cookie": bool(row.cookies),
         "cookie_steam_id": row.steam_id,
         "bound_steam_id": bound_sid,
         "mismatch": bool(bound_sid and bound_sid != row.steam_id),
@@ -1049,7 +1102,7 @@ async def migrate_legacy_kv() -> int:
             return 0
         row = SteamAccount(
             steam_id=cookie_sid,
-            cookies=raw,
+            cookies=_seal_credential(raw),
             persona_name="",
             avatar_url="",
             wallet_json=await settings_service.get_value(KEY_WALLET, None),
@@ -1072,3 +1125,28 @@ async def migrate_legacy_kv() -> int:
     await settings_service.set_value(KEY_PROFILE, None)
     logger.info("[account] 旧单账号 Cookie 已迁移至多账号表：%s", cookie_sid)
     return 1
+
+
+# ── 存量明文凭据静态加密（启动幂等步骤）──────────────────────
+
+async def seal_credentials_at_rest() -> int:
+    """明文凭据封装为密文（`enc1:` 前缀）：账号 Cookie 行 + 凭据类设置键。
+
+    幂等：带密文前缀的行 / 键跳过。读取侧对存量明文兼容（_stored_credential
+    与 get_secret_value 均按前缀分流），本步骤失败不阻塞启动、不阻塞使用。
+    返回本次封装的条目数。
+    """
+    sealed = 0
+    async with get_session_factory()() as session:
+        rows = ((await session.execute(select(SteamAccount))).scalars().all())
+        for row in rows:
+            value = row.cookies or ""
+            if not value or secretbox.is_encrypted(value):
+                continue
+            row.cookies = _seal_credential(value)
+            sealed += 1
+        await session.commit()
+    sealed += await settings_service.seal_secret_values()
+    if sealed:
+        logger.info("[account] 存量明文凭据已加密落库（%d 条）", sealed)
+    return sealed

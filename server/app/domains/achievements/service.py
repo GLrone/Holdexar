@@ -132,7 +132,7 @@ async def resolve_credentials(target: str | None = None) -> tuple[str, list[tupl
     if not steamid:
         return "", []
     creds: list[tuple[str, str]] = []
-    api_key = (await settings_service.get_value("account.steam_api_key", "")) or ""
+    api_key = (await settings_service.get_secret_value("account.steam_api_key", "")) or ""
     if api_key:
         creds.append(("key", api_key))
     try:
