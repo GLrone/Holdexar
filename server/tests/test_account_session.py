@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.database import Base
+from app.core.secretbox import decrypt_secret, is_encrypted
 from app.domains.account import service as account_service
 from app.domains.account import session as session_module
 from app.domains.account.models import SteamAccount
@@ -260,6 +261,11 @@ def db(tmp_path, monkeypatch):
     factory = async_sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
     monkeypatch.setattr(account_service, "get_session_factory", lambda: factory)
+    # 凭据密封的密钥材料（secret.salt）隔离到临时目录，不落开发数据目录
+    from app.core import secretbox
+
+    monkeypatch.setattr(secretbox, "_data_dir", lambda: tmp_path)
+    secretbox.clear_key_cache()
     return factory
 
 
@@ -311,7 +317,9 @@ async def test_ensure_live_session_renews_expiring_cookie(db, monkeypatch):
     out = await account_service.ensure_live_session(A, old)
 
     assert parse_cookie_str(out)["steamLoginSecure"] == new_access
-    assert (await _row(A)).cookies == out          # 续期结果落库，消费方共享
+    sealed = (await _row(A)).cookies
+    assert is_encrypted(sealed)                 # 续期结果密封落库
+    assert decrypt_secret(sealed, "steam-cookies") == out  # 消费方解密共享
     assert session_freshness(out)["expired"] is False
 
 

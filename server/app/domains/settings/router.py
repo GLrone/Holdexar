@@ -54,7 +54,7 @@ class SettingsPayload(BaseModel):
 @router.get("")
 async def get_settings() -> SettingsPayload:
     steam_id = await service.get_value("account.steam_id", "")
-    api_key = await service.get_value("account.steam_api_key", "")
+    api_key = await service.get_secret_value("account.steam_api_key", "")
     onboarding_done = await service.get_value("ui.onboarding_done", False)
     auto_price = await service.get_value("crawl.auto_price", True)
     update_notified = await service.get_value("ui.update_notified", "")
@@ -87,7 +87,7 @@ async def update_settings(payload: SettingsUpdate) -> SettingsPayload:
             key = payload.account.steam_api_key.strip()
             # 前端掩码回显（****xxxx）不回写，避免把掩码存成真值
             if key and not key.startswith("****"):
-                await service.set_value("account.steam_api_key", key)
+                await service.set_secret_value("account.steam_api_key", key)
 
     if payload.onboarding_done is not None:
         await service.set_value("ui.onboarding_done", bool(payload.onboarding_done))

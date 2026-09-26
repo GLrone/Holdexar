@@ -13,6 +13,9 @@ sqlalchemy[asyncio]>=2.0.43,<2.1
 aiosqlite>=0.20,<1.0
 alembic>=1.13,<2.0
 
+# Credential encryption at rest (AES-256-GCM + HKDF, app/core/secretbox)
+cryptography>=42,<52
+
 # Crawler & external requests
 aiohttp>=3.10,<4.0
 aiohttp-socks>=0.9,<1.0
