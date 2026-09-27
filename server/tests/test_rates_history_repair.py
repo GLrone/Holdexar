@@ -5,7 +5,7 @@
 2. timeframe 窗口批量修复：缺失日与 carried 日写 observed、周末照常落行
    （数据由 Provider 决定，不维护工作日历）、已有 observed 永不重拉；
 3. 幂等（二跑零写入）、dry-run（零触网零写入）；
-4. quota guard（账期用尽绝不出网）、Provider 失败即停；
+4. Provider 失败即停（不重试风暴）；
 5. 修复后账单重估（bills.revalue_affected：行级 fx 重算 + 汇总重算）；
 6. 调度任务门禁（爬虫占线跳过）。
 
@@ -30,14 +30,9 @@ from app.core import database as database_module  # noqa: E402
 from app.domains.bills import service as bills_service  # noqa: E402
 from app.domains.bills.models import BillGameTx, BillImport  # noqa: E402
 from app.domains.rates import history as rates_history  # noqa: E402
-from app.domains.rates import quota as rates_quota  # noqa: E402
 from app.domains.rates import service as rates_service  # noqa: E402
-from app.domains.rates.models import FxProviderUsage, FxRateHistory  # noqa: E402
-from app.domains.rates.providers.exchangerate_host import (  # noqa: E402
-    PROVIDER_NAME,
-    ProviderError,
-    ProviderQuotaError,
-)
+from app.domains.rates.models import FxRateHistory  # noqa: E402
+from app.domains.rates.providers.bing_currency import ProviderError  # noqa: E402
 
 XTS = "XTS"  # 合成币种（ISO 测试码；白名单由夹具收窄为 {XTS}）
 TODAY = date(2026, 9, 8)  # 周二；horizon = 9/7
@@ -52,7 +47,7 @@ async def db(tmp_path, monkeypatch):
     factory = async_sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(database_module, "get_engine", lambda: engine)
     monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    for mod in (rates_history, rates_quota, rates_service, bills_service):
+    for mod in (rates_history, rates_service, bills_service):
         monkeypatch.setattr(mod, "get_session_factory", lambda: factory)
     async with engine.begin() as conn:
         await conn.run_sync(database_module.Base.metadata.create_all)
@@ -64,11 +59,6 @@ async def db(tmp_path, monkeypatch):
         )
     # 白名单收窄为合成币种（scan/repair 只处理白名单币种）
     monkeypatch.setattr(rates_service, "ALLOWED_CURRENCIES", frozenset({XTS}))
-    # 账期限额固定（真实限额另有 quota 断言；此处避免触 settings 表）
-    async def _limit() -> int:
-        return 100
-
-    monkeypatch.setattr(rates_quota, "monthly_limit", _limit)
     yield factory
     await engine.dispose()
 
@@ -107,12 +97,9 @@ async def _rows(code: str = XTS) -> dict[str, tuple[float, str]]:
 
 
 def _fake_provider(rows: dict[date, dict[str, float]], calls: list[tuple[date, date]]):
-    """生成打桩 Provider 类：按合成数据返回窗口内行，记录调用区间。"""
+    """生成打桩 Provider 实例：按合成数据返回窗口内行，记录调用区间。"""
 
     class _Fake:
-        def __init__(self, api_key: str, **kwargs) -> None:
-            pass
-
         async def fetch_timeframe(self, start: date, end: date, currencies):
             calls.append((start, end))
             return {
@@ -121,7 +108,7 @@ def _fake_provider(rows: dict[date, dict[str, float]], calls: list[tuple[date, d
                 if start <= day <= end
             }
 
-    return _Fake
+    return _Fake()
 
 
 async def _seed_gap() -> None:
@@ -255,8 +242,7 @@ async def test_repair_writes_observed_and_replaces_carried(db, monkeypatch):
         date(2026, 9, 6): {XTS: 6.55},  # 周日（Provider 也返回）
         date(2026, 9, 7): {XTS: 6.56},
     }
-    monkeypatch.setattr(rates_history, "ExchangerateHostProvider", _fake_provider(rows, calls))
-    monkeypatch.setattr(rates_history, "resolve_api_key", lambda: "test-key")
+    monkeypatch.setattr(rates_history, "_new_bing_provider", lambda: _fake_provider(rows, calls))
 
     result = await rates_history.repair_history_gaps(today=TODAY)
 
@@ -281,8 +267,7 @@ async def test_repair_idempotent_second_run(db, monkeypatch):
         [date(2026, 9, 2), date(2026, 9, 3), date(2026, 9, 4),
          date(2026, 9, 5), date(2026, 9, 6), date(2026, 9, 7)]
     )}
-    monkeypatch.setattr(rates_history, "ExchangerateHostProvider", _fake_provider(rows, calls))
-    monkeypatch.setattr(rates_history, "resolve_api_key", lambda: "test-key")
+    monkeypatch.setattr(rates_history, "_new_bing_provider", lambda: _fake_provider(rows, calls))
 
     first = await rates_history.repair_history_gaps(today=TODAY)
     assert first["written"] == 5
@@ -296,8 +281,7 @@ async def test_repair_idempotent_second_run(db, monkeypatch):
 async def test_repair_dry_run_no_network_no_write(db, monkeypatch):
     await _seed_gap()
     calls: list = []
-    monkeypatch.setattr(rates_history, "ExchangerateHostProvider", _fake_provider({}, calls))
-    monkeypatch.setattr(rates_history, "resolve_api_key", lambda: "test-key")
+    monkeypatch.setattr(rates_history, "_new_bing_provider", lambda: _fake_provider({}, calls))
 
     result = await rates_history.repair_history_gaps(today=TODAY, dry_run=True)
 
@@ -309,80 +293,44 @@ async def test_repair_dry_run_no_network_no_write(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_repair_no_key_skips(db, monkeypatch):
-    await _seed_gap()
-    monkeypatch.setattr(rates_history, "resolve_api_key", lambda: None)
-    result = await rates_history.repair_history_gaps(today=TODAY)
-    assert result["status"] == "no_key"
-    assert result["written"] == 0
-
-
-@pytest.mark.asyncio
-async def test_quota_guard_blocks_network(db, monkeypatch):
-    """账期用尽：quota guard 在触网前拦截（剩余 0 绝不发请求）。"""
+async def test_repair_keyless_primary_runs_without_key(db, monkeypatch):
+    """主源免 Key：无任何 Key 也照常修复（不再有 no_key 短路）。"""
     await _seed_gap()
     calls: list = []
-    monkeypatch.setattr(rates_history, "ExchangerateHostProvider", _fake_provider({}, calls))
-    monkeypatch.setattr(rates_history, "resolve_api_key", lambda: "test-key")
-    fp = rates_quota.key_fingerprint("test-key")
-    async with database_module.get_session_factory()() as session:
-        session.add(
-            FxProviderUsage(
-                provider=PROVIDER_NAME,
-                key_fingerprint=fp,
-                period=rates_quota.current_period(),
-                request_count=100,
-                request_limit=100,
-            )
-        )
-        await session.commit()
+    rows = {
+        d: {XTS: 6.5}
+        for d in (date(2026, 9, 2), date(2026, 9, 3), date(2026, 9, 4),
+                  date(2026, 9, 5), date(2026, 9, 6), date(2026, 9, 7))
+    }
+    monkeypatch.setattr(rates_history, "_new_bing_provider", lambda: _fake_provider(rows, calls))
 
     result = await rates_history.repair_history_gaps(today=TODAY)
 
-    assert result["status"] == "quota_exhausted"
-    assert calls == []  # 绝不出网
-    assert result["written"] == 0
+    assert result["status"] == "ok"
+    assert result["written"] == 5
+
+
 
 
 @pytest.mark.asyncio
-async def test_provider_error_stops_and_ledgers(db, monkeypatch):
-    """Provider 失败即停（不重试风暴），失败记入账本 last_error。"""
+async def test_provider_error_stops(db, monkeypatch):
+    """Provider 失败 → provider_error 即停（不重试风暴，缺口留到下一轮）。"""
     await _seed_gap()
 
-    class _Boom:
-        def __init__(self, api_key: str, **kwargs) -> None:
-            pass
+    class _BingDown:
+        async def fetch_timeframe(self, start: date, end: date, currencies):
+            raise ProviderError("主源模拟故障")
 
-        async def fetch_timeframe(self, start, end, currencies):
-            raise ProviderError("模拟网络故障")
-
-    monkeypatch.setattr(rates_history, "ExchangerateHostProvider", _Boom)
-    monkeypatch.setattr(rates_history, "resolve_api_key", lambda: "test-key")
+    monkeypatch.setattr(rates_history, "_new_bing_provider", lambda: _BingDown())
 
     result = await rates_history.repair_history_gaps(today=TODAY)
 
     assert result["status"] == "provider_error"
-    usage = await rates_quota.get_usage(PROVIDER_NAME, rates_quota.key_fingerprint("test-key"))
-    assert usage["requestCount"] == 1
-    assert "模拟网络故障" in (usage["lastError"] or "")
+    assert result["written"] == 0
 
 
-@pytest.mark.asyncio
-async def test_repair_quota_error_from_provider(db, monkeypatch):
-    await _seed_gap()
 
-    class _Quota:
-        def __init__(self, api_key: str, **kwargs) -> None:
-            pass
 
-        async def fetch_timeframe(self, start, end, currencies):
-            raise ProviderQuotaError("HTTP 429 code=104")
-
-    monkeypatch.setattr(rates_history, "ExchangerateHostProvider", _Quota)
-    monkeypatch.setattr(rates_history, "resolve_api_key", lambda: "test-key")
-
-    result = await rates_history.repair_history_gaps(today=TODAY)
-    assert result["status"] == "quota_exhausted"
 
 
 # ── 依赖方重估 ───────────────────────────────────────────
@@ -416,8 +364,7 @@ async def test_repair_revalues_bills(db, monkeypatch):
         )
     }
     calls: list = []
-    monkeypatch.setattr(rates_history, "ExchangerateHostProvider", _fake_provider(rows, calls))
-    monkeypatch.setattr(rates_history, "resolve_api_key", lambda: "test-key")
+    monkeypatch.setattr(rates_history, "_new_bing_provider", lambda: _fake_provider(rows, calls))
 
     result = await rates_history.repair_history_gaps(today=TODAY)
 
@@ -478,7 +425,8 @@ async def test_scheduler_job_skips_when_crawler_busy(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_scheduler_job_skips_without_key(db, monkeypatch):
+async def test_scheduler_job_runs_without_key(db, monkeypatch):
+    """主源免 Key：无 Key 也运行（不再有 Key 门禁）。"""
     await _seed_gap()
     called: list = []
 
@@ -488,12 +436,9 @@ async def test_scheduler_job_skips_without_key(db, monkeypatch):
 
     monkeypatch.setattr(rates_history, "repair_history_gaps", _fake_repair)
     monkeypatch.setattr(sched_mod, "_crawler_idle", lambda: True)
-    import app.domains.rates.providers.exchangerate_host as erh_mod
-
-    monkeypatch.setattr(erh_mod, "resolve_api_key", lambda: None)
 
     await sched_mod._job_fx_history_repair()
-    assert called == []  # 未配置 Key → 静默跳过
+    assert called and called[0]["max_windows"] == sched_mod._FX_REPAIR_MAX_WINDOWS
 
 
 @pytest.mark.asyncio
@@ -507,9 +452,6 @@ async def test_scheduler_job_runs_when_all_gates_pass(db, monkeypatch):
 
     monkeypatch.setattr(rates_history, "repair_history_gaps", _fake_repair)
     monkeypatch.setattr(sched_mod, "_crawler_idle", lambda: True)
-    import app.domains.rates.providers.exchangerate_host as erh_mod
-
-    monkeypatch.setattr(erh_mod, "resolve_api_key", lambda: "k")
 
     await sched_mod._job_fx_history_repair()
     assert called and called[0]["max_windows"] == sched_mod._FX_REPAIR_MAX_WINDOWS
@@ -518,54 +460,6 @@ async def test_scheduler_job_runs_when_all_gates_pass(db, monkeypatch):
 # ── 修复链的边界行为：缺日整批不写 / 单币缺失 / 旧格式行收敛 ──────
 
 
-@pytest.mark.asyncio
-async def test_incomplete_window_writes_nothing_then_retries_next_run(db, monkeypatch):
-    """Provider 缺日（完整性闸门拒绝）→ 整批零写入；请求记入 quota 账本；
-    下一轮用完整数据仍能把这批缺口修掉（失败不吞缺口）。"""
-    await _seed_gap()
-    from app.domains.rates.providers import exchangerate_host as erh_mod
-
-    real_cls = erh_mod.ExchangerateHostProvider
-    # 9/3 故意缺 → 真实 fetch_timeframe 的完整性闸门应整批拒绝
-    incomplete = {
-        "success": True,
-        "quotes": {
-            "2026-09-02": {"USDCNY": 6.6, "USDXTS": 100.0},
-            "2026-09-04": {"USDCNY": 6.6, "USDXTS": 100.0},
-            "2026-09-05": {"USDCNY": 6.6, "USDXTS": 100.0},
-            "2026-09-06": {"USDCNY": 6.6, "USDXTS": 100.0},
-            "2026-09-07": {"USDCNY": 6.6, "USDXTS": 100.0},
-        },
-    }
-
-    class _Partial(real_cls):
-        async def _get(self, path, params):
-            return incomplete
-
-    monkeypatch.setattr(rates_history, "ExchangerateHostProvider", _Partial)
-    monkeypatch.setattr(rates_history, "resolve_api_key", lambda: "test-key")
-
-    first = await rates_history.repair_history_gaps(today=TODAY)
-    assert first["status"] == "provider_error"
-    assert first["written"] == 0  # 半批数据不落库
-    got = await _rows()
-    assert got["2026-09-02"] == (6.50, "carried")  # 原 carried 未动
-    usage = await rates_quota.get_usage(PROVIDER_NAME, rates_quota.key_fingerprint("test-key"))
-    assert usage["requestCount"] == 1  # 请求已记账（区分网络故障与配额）
-
-    full = {**incomplete["quotes"], "2026-09-03": {"USDCNY": 6.6, "USDXTS": 100.0}}
-
-    class _Full(real_cls):
-        async def _get(self, path, params):
-            return {"success": True, "quotes": full}
-
-    monkeypatch.setattr(rates_history, "ExchangerateHostProvider", _Full)
-    second = await rates_history.repair_history_gaps(today=TODAY)
-    assert second["status"] == "ok"
-    assert second["written"] == 5  # 9/2 carried + 9/3、9/4、9/6、9/7 缺（9/5 已有 observed）
-    got = await _rows()
-    assert got["2026-09-02"][1] == "observed"
-    assert got["2026-09-03"][0] == pytest.approx(0.066)
 
 
 @pytest.mark.asyncio
@@ -583,8 +477,7 @@ async def test_missing_target_currency_writes_others_and_keeps_gap(db, monkeypat
             date(2026, 9, 5), date(2026, 9, 6), date(2026, 9, 7),
         )
     }  # 全程只有 XTS，没有 XTS2
-    monkeypatch.setattr(rates_history, "ExchangerateHostProvider", _fake_provider(rows, calls))
-    monkeypatch.setattr(rates_history, "resolve_api_key", lambda: "test-key")
+    monkeypatch.setattr(rates_history, "_new_bing_provider", lambda: _fake_provider(rows, calls))
 
     result = await rates_history.repair_history_gaps(today=TODAY)
 
@@ -627,8 +520,7 @@ async def test_legacy_rows_converge_to_observed_and_scan_clears(db, monkeypatch)
         d: {XTS: 0.05}
         for d in (date(2026, 9, 2), date(2026, 9, 3))
     }
-    monkeypatch.setattr(rates_history, "ExchangerateHostProvider", _fake_provider(rows, calls))
-    monkeypatch.setattr(rates_history, "resolve_api_key", lambda: "test-key")
+    monkeypatch.setattr(rates_history, "_new_bing_provider", lambda: _fake_provider(rows, calls))
 
     result = await rates_history.repair_history_gaps(today=TODAY)
 

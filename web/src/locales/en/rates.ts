@@ -29,6 +29,13 @@ const rates: Partial<Record<MessageKey, string>> = {
   /* History */
   'rates.history.title': '{code} history',
   'rates.history.empty': 'No {code} history yet — it builds up as rates refresh daily.',
+  'rates.sourceCaption': 'Data sources: {sources}',
+  'rates.source.bing': 'Bing FX rates (LSEG data)',
+  'rates.source.steam': 'Steam community data (AugmentedSteam)',
+  'rates.source.erapi': 'Exchangerate-API',
+  'rates.source.exh': 'Exchangerate.host',
+  'rates.source.seed': 'Bundled history archive',
+  'rates.source.other': 'Other sources',
 
   /* Time-range chips (mapped from RATE_RANGES ids) */
   'rates.range.oneMonth': '1M',

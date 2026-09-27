@@ -1,4 +1,4 @@
-"""汇率维护脚本：16 年档案导入 + 缺口扫描与真实修复 + 实时更新。
+"""汇率维护脚本：历史档案导入 + 缺口扫描与真实修复 + 实时更新。
 
 子命令（可独立跑；导入类幂等，重跑安全）：
 
@@ -10,10 +10,9 @@
     python scripts/fx_maintenance.py update      # 实时刷新（augmentedsteam → er-api 容灾）
                                                  # 写 fx_rates 快照 + 今日历史行
     python scripts/fx_maintenance.py gaps        # 本地缺口扫描（零网络）：缺行日 ∪ carried 日
-    python scripts/fx_maintenance.py repair      # 真实修复：Provider timeframe 批量拉取写 observed
+    python scripts/fx_maintenance.py repair      # 真实修复：Provider 拉取写 observed
     python scripts/fx_maintenance.py repair --dry-run
     python scripts/fx_maintenance.py repair --start 2026-07-01 --end 2026-09-01
-    python scripts/fx_maintenance.py quota       # Provider 配额账期状态
     python scripts/fx_maintenance.py cleanup     # 白名单外币种数据清洗
     python scripts/fx_maintenance.py all         # import-pg → update → gaps
 
@@ -22,7 +21,6 @@
 - 数据由 Provider 决定：窗口内逐日返回（含周末/假日），不维护工作日历；
 - 缺失日与 carried 日写为 observed；已有 observed 的日期永不重拉；修复后
   自动重估受影响账单（bills.revalue_affected）。
-- 需要 ERH_API_KEY（secrets/fx_maintenance.env 或环境变量）。
 
 解释器：import-pg 需要 psycopg2（系统 Python）；其余子命令走后端服务层，
 需 server/.venv。venv 无 psycopg2 时用系统 Python 跑 import-pg、venv 跑
@@ -48,22 +46,6 @@ from sqlalchemy import delete  # noqa: E402
 from app.core.database import get_session_factory, init_db  # noqa: E402
 
 
-def _load_local_env() -> None:
-    """本机私密配置（secrets/fx_maintenance.env，gitignored）：KEY=VALUE 逐行，
-    只设尚未存在的环境变量，不覆盖显式传入的。"""
-    env_file = Path(__file__).resolve().parents[1] / "secrets" / "fx_maintenance.env"
-    if not env_file.is_file():
-        return
-    for line in env_file.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        os.environ.setdefault(key.strip(), value.strip())
-
-
-_load_local_env()
-from app.domains.rates import quota as rates_quota  # noqa: E402
 from app.domains.rates import history as rates_history  # noqa: E402
 from app.domains.rates.models import FxRate, FxRateHistory  # noqa: E402
 from app.domains.rates.service import (  # noqa: E402
@@ -344,27 +326,6 @@ async def repair(
         print(f"[repair] 账单重估：{rv.get('bills', 0)} 个账单 / {rv.get('transactions', 0)} 笔交易")
 
 
-async def quota_cmd() -> None:
-    await init_db()
-    from app.domains.rates.providers.exchangerate_host import PROVIDER_NAME, resolve_api_key
-
-    key = resolve_api_key()
-    if not key:
-        print("[quota] 未配置 ERH_API_KEY（secrets/fx_maintenance.env 或环境变量），修复任务不会出网")
-        return
-    fp = rates_quota.key_fingerprint(key)
-    status = await rates_quota.quota_status(PROVIDER_NAME, fp)
-    print(
-        f"[quota] {status['provider']} 账期 {status['period']}："
-        f"{status['requestCount']}/{status['requestLimit']} 次"
-        f"（剩余 {status['remaining']}）{'　已耗尽' if status['exhausted'] else ''}"
-    )
-    if status["lastRequestedAt"]:
-        print(f"[quota] 最近请求：{status['lastRequestedAt']}")
-    if status["lastError"]:
-        print(f"[quota] 最近错误：{status['lastError']}")
-
-
 # ── 附带：白名单清洗（与服务层 cleanup_disallowed 同语义） ──
 
 
@@ -384,7 +345,7 @@ def main() -> None:
         "command",
         choices=[
             "import-pg", "import-fxdb", "import-fxjson",
-            "update", "gaps", "repair", "quota", "cleanup", "all",
+            "update", "gaps", "repair", "cleanup", "all",
         ],
         help="见模块 docstring",
     )
@@ -416,8 +377,6 @@ def main() -> None:
         asyncio.run(gaps())
     elif args.command == "repair":
         asyncio.run(repair(args.dry_run, args.start, args.end))
-    elif args.command == "quota":
-        asyncio.run(quota_cmd())
     elif args.command == "cleanup":
         asyncio.run(cleanup())
     else:
