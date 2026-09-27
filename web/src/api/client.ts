@@ -471,6 +471,10 @@ export interface PriceData {
   coverage: PriceCoverage | null
 }
 
+/** 捆绑包价格数据状态：与 PriceData 同口径（观察时刻/新鲜度分档），无
+    coverage——捆绑包不属价格刷新 Cycle 的期望集 */
+export type BundlePriceData = Omit<PriceData, 'coverage'>
+
 export interface GameListItem {
   appid: number
   name: string
@@ -623,6 +627,9 @@ export interface BundleSummary {
   /** smart 四因子评分（服务端预计算，0~1）。选区重锚排序用：
       save(该区差价) + (smartScore − save(diffFen)) 即该区视角的评分 */
   smartScore: number
+  /** 价格数据状态（观察时刻/新鲜度，与游戏卡同口径）；列表聚合是缓存载荷，
+      ageHours/freshness 冻结在构建时刻——展示期以 observedAt 现算为准 */
+  priceData?: BundlePriceData | null
 }
 
 export interface BundleGamePrice {

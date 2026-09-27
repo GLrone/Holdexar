@@ -47,6 +47,17 @@ export function agePart(
   return { key: keys.days, params: { n: Math.floor(ageHours / 24) } }
 }
 
+export type FreshnessBucket = 'fresh' | 'lagging' | 'stale'
+
+/** 新鲜度色档（对象级）。阈值与后端 freshness.py 同一契约：
+    fresh <6h / lagging <12h / stale ≥12h，两边必须同步改。
+    独立于 agePart 的展示分档——这是后端同名的档位口径，供色档使用。 */
+export function freshnessBucket(ageHours: number): FreshnessBucket {
+  if (ageHours < 6) return 'fresh'
+  if (ageHours < 12) return 'lagging'
+  return 'stale'
+}
+
 
 export interface CoverageView extends TextPart {
   /** 未刷满：文案已点明「未完整」，样式据此上色 */

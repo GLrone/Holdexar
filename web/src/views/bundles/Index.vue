@@ -34,7 +34,9 @@ import {
   markAssetOk,
   resolveAssetUrl,
 } from '@/lib/assetCache'
-import { computeGiftingAnalysis, type GiftingAnalysis, type RegionPriceInfo } from '@/lib/gifting'
+import { canGift, computeGiftingAnalysis, type GiftingAnalysis, type RegionPriceInfo } from '@/lib/gifting'
+import { agePart, freshnessBucket } from '@/lib/priceDataView'
+import { ageHoursOf } from '@/lib/priceEvents'
 import { vStagger } from '@/lib/stagger'
 import { useI18n, type MessageKey } from '@/locales'
 import { useRegionsStore } from '@/stores/regions'
@@ -488,6 +490,17 @@ function lowestFen(b: BundleSummary): number | null {
     .map((rp) => rp.cnyFen)
     .filter((v): v is number => v != null)
   return vals.length > 0 ? Math.min(...vals) : null
+}
+
+/** 价格数据状态 → 新鲜度展示（时间文字 + 色档），与游戏卡同词条同色档。
+ *  聚合载荷是服务端缓存，priceData 的 ageHours/freshness 冻结在缓存构建
+ *  时刻；observedAt 是不变事实，距今时长与色档必须现算才与文字一致。
+ *  无观察时刻（旧行未落 crawled_at）返回 null，不渲染。 */
+function bundleAge(b: BundleSummary): { text: string; bucket: string } | null {
+  const hours = ageHoursOf(b.priceData?.observedAt)
+  if (hours === null) return null
+  const part = agePart(hours)
+  return { text: t(part.key, part.params), bucket: freshnessBucket(hours) }
 }
 
 /** 前三名奖牌（对齐游戏卡 TROPHIES：金银铜） */
@@ -1177,6 +1190,12 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
                 v-if="(Object.values(b.regionPrices)[0]?.baseDiscount ?? 0) > 0"
                 class="bundle-base-discount-tag"
               >{{ t('bundles.tag.baseDiscount', { pct: Object.values(b.regionPrices)[0].baseDiscount }) }}</span>
+              <!-- 价格数据新鲜度（与游戏卡同词条同色档）：观察时刻前端现算，不足 1 小时出分钟级 -->
+              <span
+                v-if="bundleAge(b)"
+                class="blr-fresh"
+                :class="`is-${bundleAge(b)!.bucket}`"
+              >{{ t('gameCard.priceData.label') }} {{ bundleAge(b)!.text }}</span>
             </div>
           </div>
 
@@ -1375,6 +1394,11 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
                 </span>
                 <span v-else class="diff-badge"><span class="align-text-up">{{ t('bundles.price.noDiff') }}</span></span>
               </div>
+            </div>
+            <!-- 价格数据新鲜度（与游戏卡价格区末行同款：词条、色档、分钟级分档全对齐） -->
+            <div v-if="bundleAge(b)" class="price-row">
+              <span class="price-label">{{ t('gameCard.priceData.label') }}</span>
+              <span class="price-data" :class="`is-${bundleAge(b)!.bucket}`">{{ bundleAge(b)!.text }}</span>
             </div>
           </div>
 
@@ -1932,6 +1956,15 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
   border-color: var(--accent);
   color: var(--accent);
 }
+/* 价格数据新鲜度 chip：色档走游戏卡 price-data 同一套令牌（绿=新鲜/黄=滞后/红=陈旧） */
+.blr-fresh {
+  font-size: 10.5px;
+  line-height: 16px;
+  color: var(--text-muted);
+}
+.blr-fresh.is-fresh { color: var(--rate-good); }
+.blr-fresh.is-lagging { color: var(--rate-mid); }
+.blr-fresh.is-stale { color: var(--rate-low); }
 
 /* 价格三列：固定列宽（列位置跨行一致，不随内容漂移——对齐卡片统计列契约） */
 .blr-col {
