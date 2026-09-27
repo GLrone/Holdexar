@@ -32,6 +32,7 @@ import HlIcon from './HlIcon.vue'
 import HlImg from './HlImg.vue'
 import HlInput from './HlInput.vue'
 import HlInputNumber from './HlInputNumber.vue'
+import HlIsland from './HlIsland.vue'
 import HlLangToggle from './HlLangToggle.vue'
 import HlPagination from './HlPagination.vue'
 import HlPaneSwitch from './HlPaneSwitch.vue'
@@ -103,6 +104,7 @@ export {
   HlImg,
   HlInput,
   HlInputNumber,
+  HlIsland,
   HlLangToggle,
   HlPagination,
   HlPaneSwitch,
@@ -158,6 +160,7 @@ export default function install(app: App) {
   app.component('HlImg', HlImg)
   app.component('HlInput', HlInput)
   app.component('HlInputNumber', HlInputNumber)
+  app.component('HlIsland', HlIsland)
   app.component('HlLangToggle', HlLangToggle)
   app.component('HlPagination', HlPagination)
   app.component('HlChip', HlChip)

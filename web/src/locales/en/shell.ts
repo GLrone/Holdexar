@@ -25,13 +25,6 @@ const shell: Partial<Record<MessageKey, string>> = {
   'nav.about': 'About',
   'nav.toolbox': 'Toolbox',
 
-  'header.crawl': 'Waiting to update',
-  'header.crawlRunning': 'Updating game prices',
-  'header.crawlDone': 'Prices updated',
-  'header.crawlPartial': 'Partly updated',
-  'header.crawlTip': 'Some regions are not updated yet; the system will retry automatically',
-  'header.crawlTipDone': 'Update finished',
-
   'wallet.bind': 'Bind wallet',
   'wallet.unboundTip': 'No Steam cookie bound — click to open Settings',
   'wallet.titleMain': 'Primary wallet balance: {balance}',

@@ -1,24 +1,34 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
+import { storeToRefs } from 'pinia'
 import { ElMessageBox } from 'element-plus'
 
 import {
   proxiesApi,
   type ClashNodeTestItem,
   type ClashStatus,
-  type ClashTestProgress,
   type ProxyItem,
   type ProxyStrategy,
   type ProxySubscriptionItem,
 } from '@/api/client'
 import { HlButton, HlDialog, HlIcon, HlSwitch, message } from '@/components/ui'
 import { useI18n, type MessageKey } from '@/locales'
+import { useProxyTasksStore } from '@/stores/proxyTasks'
 
 /**
  * 代理 IP 池管理 —— 页内分四区：策略卡片网格 / 分区区块 / 节点表格 / 走线控制台。
  * 订阅链接（Clash 机场订阅 / 明文商业代理订阅）长期保存在本地库，按方式区分，可存多条。
  */
 const { t } = useI18n()
+const proxyTasks = useProxyTasksStore()
+const {
+  clashTest: clashTestSnap,
+  kernelDownloading,
+  kernelProgress,
+  kernelPhase,
+  kernelVia,
+  kernelSource,
+} = storeToRefs(proxyTasks)
 const items = ref<ProxyItem[]>([])
 const subscriptions = ref<ProxySubscriptionItem[]>([])
 const strategy = ref<ProxyStrategy>({ strategy: 'proxy_first', clashPort: 7890 })
@@ -33,57 +43,24 @@ const singleInput = ref('')
 const installing = ref(false)
 const starting = ref(false)
 
-// 内核下载进度弹窗（保存订阅缺内核自动下载 / 手动安装共用）
+// 内核下载进度弹窗（保存订阅缺内核自动下载 / 手动安装共用）：
+// 进度数据与轮询在 proxyTasks store（跨页存活、灵动岛同步展示），弹窗是本页 UI
 const kernelDialog = ref(false)
-const kernelProgress = ref(0)
-const kernelPhase = ref('')
-const kernelVia = ref('')
-const kernelSource = ref('')
-const kernelDownloading = ref(false)
-let kernelPollTimer: ReturnType<typeof setInterval> | null = null
 
-/** 轮询内核下载进度直到完成/失败（进度端点由后端模块级状态提供） */
-async function pollKernelProgress() {
-  try {
-    const p = await proxiesApi.clashInstallProgress()
-    kernelProgress.value = p.percent ?? 0
-    kernelPhase.value = p.phase ?? ''
-    kernelVia.value = p.via ? t('proxies.kernel.viaWrap', { via: p.via }) : ''
-    kernelSource.value = (p.source ?? '').replace(/^https?:\/\//, '').replace(/\/$/, '')
-    if (p.error) {
-      stopKernelPoll()
-      message.error(t('proxies.kernel.downloadFailed', { error: p.error }))
-      kernelDialog.value = false
-    } else if (p.ok && !p.running) {
-      stopKernelPoll()
-      kernelProgress.value = 100
-      message.success(t('proxies.kernel.downloadDone'))
-      setTimeout(() => (kernelDialog.value = false), 600)
-    }
-  } catch {
-    /* 轮询瞬断忽略，下轮再试 */
-  }
-}
-
-function startKernelPoll() {
-  kernelDownloading.value = true
+/** 发起下载监控：进度与轮询在 store，弹窗是本页 UI，一并打开 */
+function beginKernelWatchDialog() {
   kernelDialog.value = true
-  kernelProgress.value = 0
-  // 阶段名由后端轮询回填；这里的初始态留空，模板用 t() 兜底显示「准备下载」，
-  // 免得把语言冻在「点下按钮那一刻」的 ref 里（见 brief 冻结陷阱）
-  kernelPhase.value = ''
-  kernelVia.value = ''
-  kernelSource.value = ''
-  kernelPollTimer = setInterval(pollKernelProgress, 800)
+  proxyTasks.beginKernelWatch()
 }
 
-function stopKernelPoll() {
-  kernelDownloading.value = false
-  if (kernelPollTimer) {
-    clearInterval(kernelPollTimer)
-    kernelPollTimer = null
+// 下载收场（成功/失败）后弹窗稍候自关：给终态帧留一点可读时间
+watch(kernelDownloading, (on, was) => {
+  if (was && !on) {
+    window.setTimeout(() => {
+      if (!kernelDownloading.value) kernelDialog.value = false
+    }, 600)
   }
-}
+})
 
 // 订阅管理（双方式）
 const selectedClashSubId = ref<number | null>(null)
@@ -110,9 +87,8 @@ async function onClashSubChange(sub: ProxySubscriptionItem) {
       // 接上切换首检的进度轮询（结果面板自动亮起）
       const snap = await proxiesApi.clashTestProgress()
       if (snap && (snap.phase === 'queued' || snap.phase === 'running')) {
-        clashTest.value = snap
+        proxyTasks.adoptTest(snap)
         clashTestExpanded.value = true
-        startClashTestPoll()
       }
     }
   } catch (e) {
@@ -142,10 +118,11 @@ const editUrl = ref('')
 const editAutoRefresh = ref(true)
 const editingSub = ref(false)
 
-// Clash 节点检测（后台会话：出口 IP 去重 → 存活 N/M；轮询进度端点驱动按钮与面板）
-const clashTest = ref<ClashTestProgress | null>(null)
+// Clash 节点检测（后台会话：出口 IP 去重 → 存活 N/M）。会话快照、进度轮询与
+// 结果消息都在 proxyTasks store（跨页存活、灵动岛同步展示）；本组件承载面板
+// 渲染与展开态
+const clashTest = clashTestSnap
 const clashTestExpanded = ref(true)
-let clashTestPollTimer: ReturnType<typeof setInterval> | null = null
 const testingClash = computed(
   () => clashTest.value?.phase === 'queued' || clashTest.value?.phase === 'running',
 )
@@ -269,7 +246,7 @@ async function addSubscription(kind: 'clash' | 'plain') {
   // Clash 订阅：内核缺失时后端自动下载（进度弹窗轮询 /clash/install/progress）
   const needKernelWatch =
     kind === 'clash' && !clash.value?.kernel.found && !kernelDownloading.value
-  if (needKernelWatch) startKernelPoll()
+  if (needKernelWatch) beginKernelWatchDialog()
   try {
     const sub = await proxiesApi.addSubscription(kind, url)
     if (kind === 'clash') {
@@ -304,7 +281,7 @@ async function addSubscription(kind: 'clash' | 'plain') {
     subFailError.value = e instanceof Error ? e.message : String(e)
     subFailDialog.value = true
   } finally {
-    if (needKernelWatch) stopKernelPoll()
+    if (needKernelWatch) proxyTasks.stopKernelWatch()
     kernelDialog.value = false
     busy.value = false
   }
@@ -585,10 +562,10 @@ async function testAll() {
 
 async function installKernel() {
   installing.value = true
-  startKernelPoll()
+  beginKernelWatchDialog()
   try {
     const res = await proxiesApi.clashInstall()
-    stopKernelPoll()
+    proxyTasks.stopKernelWatch()
     if (res.ok) {
       kernelProgress.value = 100
       message.success(t('proxies.kernel.installOk', { version: res.version ?? '' }))
@@ -599,7 +576,7 @@ async function installKernel() {
     }
     clash.value = await proxiesApi.clashStatus()
   } catch (e) {
-    stopKernelPoll()
+    proxyTasks.stopKernelWatch()
     kernelDialog.value = false
     message.error(e instanceof Error ? e.message : String(e))
   } finally {
@@ -648,74 +625,34 @@ async function startClash() {
 
 async function stopClash() {
   await proxiesApi.clashStop()
-  clashTest.value = null
-  stopClashTestPoll()
+  proxyTasks.clearTest()
   message.success(t('proxies.clash.hasStopped'))
   clash.value = await proxiesApi.clashStatus()
 }
 
-function stopClashTestPoll() {
-  if (clashTestPollTimer) {
-    clearInterval(clashTestPollTimer)
-    clashTestPollTimer = null
-  }
-}
-
-/** 轮询一拍检测进度；终态收口（完成 toast / 废弃标记刷新 / 失败原因） */
-async function pollClashTestOnce() {
-  const snap = await proxiesApi.clashTestProgress()
-  if (!snap || snap.phase === 'idle') return
-  clashTest.value = snap
-  if (snap.phase === 'done' || snap.phase === 'failed') {
-    stopClashTestPoll()
-    if (snap.phase === 'done') {
-      const msg = t('proxies.clash.testDone', { alive: snap.alive, total: snap.total ?? 0 })
-      if (snap.deprecated) {
-        message.error(t('proxies.clash.testDoneDeprecated', { msg }))
-      } else {
-        message.success(msg)
-      }
-      await load() // 订阅列表刷新废弃标记
-    } else if (snap.error) {
-      message.error(snap.error)
-    }
-  }
-}
-
-function startClashTestPoll() {
-  stopClashTestPoll()
-  clashTestPollTimer = setInterval(() => {
-    pollClashTestOnce().catch(() => {
-      /* 轮询瞬断忽略，下轮再试 */
-    })
-  }, 1000)
-}
-
 /** 启动检测：后端立即返回会话快照，探测在后台推进；面板展开看逐节点过程 */
 async function runClashTest() {
-  try {
-    clashTest.value = await proxiesApi.clashTestStart()
-    clashTestExpanded.value = true
-    startClashTestPoll()
-  } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
-  }
+  clashTestExpanded.value = true
+  await proxyTasks.startTest()
 }
+
+/** 检测收场后的订阅列表刷新：废弃标记是会话快照的派生量，落在页面数据侧 */
+watch(
+  () => clashTest.value?.phase,
+  async (phase, prev) => {
+    if (phase === 'done' && prev && prev !== 'done') await load()
+  },
+)
 
 onMounted(async () => {
   await load()
   void refreshTrafficQuiet() // 实时流量：进页即静默刷新（不阻塞首屏渲染）
-  // 进页恢复检测会话：进行中则续上轮询（离开页面检测照常推进），
+  // 进页恢复检测会话：进行中则续上轮询与灵动岛任务位（离开页面检测照常推进），
   // 最近一次结果直接展示；无会话（idle/请求失败）不显示面板
-  try {
-    const snap = await proxiesApi.clashTestProgress()
-    if (snap && snap.phase !== 'idle') {
-      clashTest.value = snap
-      if (snap.phase === 'queued' || snap.phase === 'running') startClashTestPoll()
-    }
-  } catch {
-    /* 进度不可得按无会话处理 */
-  }
+  void proxyTasks.attach()
+  // 内核下载进行中（手动安装 / 保存订阅触发）：续上进度弹窗与任务位
+  await proxyTasks.attachKernel()
+  if (kernelDownloading.value) kernelDialog.value = true
 })
 </script>
 

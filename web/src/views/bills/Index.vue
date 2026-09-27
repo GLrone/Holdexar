@@ -21,16 +21,12 @@ import {
   message,
   type HlTabItem,
 } from '@/components/ui'
-import {
-  billsApi,
-  type BillImportItem,
-  type BillOverview,
-  type BillSyncSnapshot,
-} from '@/api/client'
+import { billsApi, type BillImportItem, type BillOverview } from '@/api/client'
 import { normalizeAvatarUrl } from '@/api/avatar'
 import { axisPointerStyle, revealChart, useChartPalette, useTipPalette } from '@/api/chartTheme'
 import { useI18n, useLocaleFormat } from '@/locales'
 import { useAccountStore } from '@/stores/account'
+import { useBillsSyncStore } from '@/stores/billsSync'
 import LedgerTab from './LedgerTab.vue'
 import TopupTab from './TopupTab.vue'
 import CdkTab from './CdkTab.vue'
@@ -100,74 +96,19 @@ async function selectImport(id: number) {
   await loadOverview()
 }
 
-/* ── 同步（后端用 Cookie 在线拉全量，不再走文件导入）── */
-const syncing = ref(false)
-const syncSnapshot = ref<BillSyncSnapshot | null>(null)
-
-async function loadSyncStatus() {
-  try {
-    syncSnapshot.value = await billsApi.syncStatus()
-  } catch {
-    syncSnapshot.value = null
-  }
-}
-
-/* 进度气泡：后端把翻页阶段写进同步快照（GET /bills/sync），这里 1s 轮询喂给
-   气泡文本。Steam 游标翻页不预告总页数，条带只表达「活着」，实数走文本。 */
-let progressToast: ReturnType<typeof message.progress> | null = null
-let progressTimer: number | null = null
-
-function stopProgressPolling() {
-  if (progressTimer !== null) {
-    clearInterval(progressTimer)
-    progressTimer = null
-  }
-  progressToast?.close()
-  progressToast = null
-}
-onUnmounted(stopProgressPolling)
-
-function syncStageText(snap: BillSyncSnapshot): string {
-  if (snap.stage === 'history') {
-    return t('bills.sync.stageHistory', { pages: snap.pages ?? 0, rows: snap.rows ?? 0 })
-  }
-  if (snap.stage === 'licenses') return t('bills.sync.stageLicenses')
-  if (snap.stage === 'import') return t('bills.sync.stageImport')
-  return t('bills.sync.stageIdentity')
-}
+/* ── 同步（后端用 Cookie 在线拉全量，不再走文件导入）──
+   生命周期在 billsSync store：进度轮询、灵动岛任务位、结果消息都在那里，
+   切页不中断；本组件只在收场后刷新账册数据（已卸载时 Vue 写死引用无害）。 */
+const billsSync = useBillsSyncStore()
+const syncing = computed(() => billsSync.syncing)
+const syncSnapshot = computed(() => billsSync.snapshot)
 
 async function syncNow() {
-  if (syncing.value) return
-  syncing.value = true
-  progressToast = message.progress(t('bills.sync.stageIdentity'))
-  progressTimer = window.setInterval(async () => {
-    try {
-      const snap = await billsApi.syncStatus()
-      if (snap.running) progressToast?.update(syncStageText(snap))
-    } catch {
-      /* 单次轮询失败不打断同步，下一秒再取 */
-    }
-  }, 1000)
-  try {
-    const res = await billsApi.syncBills()
-    message.success(
-      t('bills.sync.success', {
-        nickname: res.nickname,
-        bills: res.gameTxs,
-        cdk: res.cdkGames,
-        rows: res.historyRows,
-      }),
-    )
-    await loadImports(false)
-    activeId.value = res.importId
-    await loadOverview()
-  } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
-  } finally {
-    stopProgressPolling()
-    syncing.value = false
-    await loadSyncStatus()
-  }
+  const res = await billsSync.syncNow()
+  if (!res) return
+  await loadImports(false)
+  activeId.value = res.importId
+  await loadOverview()
 }
 
 async function removeImport(item: BillImportItem) {
@@ -332,7 +273,8 @@ onMounted(async () => {
   try {
     await loadImports()
     await loadOverview()
-    await loadSyncStatus()
+    // 同步进行中（含定时任务自动同步）：续上灵动岛进度展示
+    void billsSync.attach()
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e))
   }
@@ -349,7 +291,12 @@ onMounted(async () => {
              （同 bundles.calc.excludeHint 先例）。按强调边界切三段再拼，
              英文拼不出完整句子。 -->
         <p class="bills-empty__text" v-html="t('bills.empty.desc')"></p>
-        <HlButton variant="primary" :disabled="syncing" :loading="syncing" @click="syncNow">
+        <HlButton
+          variant="primary"
+          :disabled="syncing || !!syncSnapshot?.running"
+          :loading="syncing"
+          @click="syncNow"
+        >
           <HlIcon v-if="!syncing" name="refresh" /> {{ syncing ? t('bills.sync.inProgress') : t('bills.sync.cta') }}
         </HlButton>
       </HlEmpty>
@@ -392,7 +339,12 @@ onMounted(async () => {
             class="tag tag--warning bills-sync-note"
             :title="t('bills.sync.errorRetry', { error: syncSnapshot.error })"
           >{{ t('bills.sync.lastFailed') }}</div>
-          <HlButton variant="primary" :disabled="syncing" :loading="syncing" @click="syncNow">
+          <HlButton
+            variant="primary"
+            :disabled="syncing || !!syncSnapshot?.running"
+            :loading="syncing"
+            @click="syncNow"
+          >
             <HlIcon v-if="!syncing" name="refresh" /> {{ syncing ? t('bills.sync.inProgress') : t('bills.sync.ctaShort') }}
           </HlButton>
         </div>

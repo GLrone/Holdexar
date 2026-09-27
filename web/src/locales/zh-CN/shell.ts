@@ -35,17 +35,6 @@ const shell = {
   // 工具箱不进一级导航（设置页提供次级入口），词条留给页面标题与设置页入口
   'nav.toolbox': '工具箱',
 
-  /* 顶栏价格更新状态胶囊：一个胶囊只表达一个产品结论，不带数量——内部计数
-     的口径是任务批次（1 批 = 1 地区 × ≤400 款），不是游戏数，不得以「款」
-     进入用户面；内部 job / 队列 / 速度 / worker / 代理也不进这里（技术诊断
-     入口另说） */
-  'header.crawl': '等待更新',
-  'header.crawlRunning': '正在更新游戏价格',
-  'header.crawlDone': '价格已更新',
-  'header.crawlPartial': '部分更新',
-  'header.crawlTip': '部分地区价格暂未更新，系统会稍后自动重试',
-  'header.crawlTipDone': '本次更新已完成',
-
   /* 顶栏钱包胶囊 + 余额弹层 */
   'wallet.bind': '绑定钱包',
   'wallet.unboundTip': '未绑定 Steam Cookie，点击前往「设置」页绑定',

@@ -384,9 +384,10 @@ async def sync_bills(*, force: bool = False) -> dict:
 
     snapshot: dict | None = await settings_service.get_value(KEY_BILLS_SYNC, None)
     now = get_beijing_time_obj().replace(tzinfo=None)
-    if not force and snapshot and snapshot.get("running"):
+    if snapshot and snapshot.get("running"):
         # running 卡死超过一个同步周期 → 进程中途被杀的死锁，放行重试；
         # 周期内则保持 busy 语义（上一轮还在跑，不叠加第二份全量翻页）。
+        # 手动同步与绑定后首拉（force=True）同样受管：重复触发在这里收口。
         since = snapshot.get("since")
         stale = False
         if since:

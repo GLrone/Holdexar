@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
+import { storeToRefs } from 'pinia'
 import { HlButton, HlChip, HlIcon, HlSelect, HlStat, HlTooltip, message } from '@/components/ui'
-import { redeemApi, billsApi, type BillImportItem, type BillOverview } from '@/api/client'
+import { billsApi, type BillImportItem, type BillOverview } from '@/api/client'
 import { useAccountStore } from '@/stores/account'
+import { CDK_ACT_LIMIT, useCdkRedeemStore, type KeyStatus } from '@/stores/cdkRedeem'
 import { useI18n, useLocaleFormat, type MessageKey } from '@/locales'
 
 const router = useRouter()
@@ -30,8 +32,7 @@ async function switchAccount(steamId: string) {
   try {
     await accountStore.setActive(steamId)
     // 切号即重计：会话增量作废，以后端该账号计数为新基数
-    usedSession.value = []
-    await loadQuota()
+    await cdk.resetSession()
     message.success(t('toolbox.account.switched'))
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e))
@@ -41,111 +42,43 @@ onMounted(() => {
   void accountStore.load()
 })
 
-/* ───────── CDK 批量激活（真实 Steam 激活端点，登录态 Cookie 通道）───────── */
-type KeyStatus = 'wait' | 'doing' | 'ok' | 'own' | 'fail'
-interface KeyRow {
-  code: string
-  status: KeyStatus
-}
-interface ResultRow {
-  /** 对应的激活码原文（结果行与左栏队列按序号一一对应的锚点） */
-  code: string
-  status: KeyStatus
-  detail: string
-  subId: string
-  subName: string
-  /** Steam 返回原文（点开"原文"核对） */
-  raw: string
-}
+/* ───────── CDK 批量激活（真实 Steam 激活端点，登录态 Cookie 通道）─────────
+   状态与激活循环整体在 cdkRedeem store：批次可达数分钟，切页不中断，
+   灵动岛任务位展示进度与完成汇总；本组件只承载面板渲染与瞬时 UI 态。 */
+const cdk = useCdkRedeemStore()
+const {
+  keyArea,
+  keyQueue,
+  resultRows,
+  batchNo,
+  batchTotal,
+  progressKey,
+  progressCount,
+  progressPct,
+  ksOk,
+  ksFail,
+  ksOwn,
+  running,
+  quotaReady,
+  quotaMsg,
+  usedCount,
+  nearLimit,
+} = storeToRefs(cdk)
+const ACT_LIMIT = CDK_ACT_LIMIT
 
-const BATCH_SIZE = 9
-const BATCH_WAIT = 20000
-const ACT_LIMIT = 10
-const ACT_WINDOW = 30 * 60 * 1000
-
-const keyArea = ref('')
-const keyQueue = ref<KeyRow[]>([])
-const resultRows = ref<ResultRow[]>([])
-/** 批次进度：「批次 n / N」。**state 只存数字，句子在模板里 t() 现取**——
- *  把渲染好的句子写进 ref（如原 `ref('批次 1 / 1')`）会把语言冻在赋值那一刻，
- *  而本页所有赋值都发生在异步回调里，切语言后挂着的文字不会跟着变。 */
-const batchNo = ref(1)
-const batchTotal = ref(1)
-/** 进度文案同理：只存词条 key，模板 t(progressKey) 现取 */
-const progressKey = ref<MessageKey>('toolbox.cdk.progress.ready')
-const progressCount = ref('0 / 0')
-const progressPct = ref(0)
-const ksOk = ref(0)
-const ksFail = ref(0)
-const ksOwn = ref(0)
-const running = ref(false)
-const copied = ref(false)
-const quotaReady = ref(true)
-/** 未绑 Cookie 提示的**词条 key**（'' = 无提示）；显示文案见下面的 quotaMsg */
-const quotaMsgKey = ref<'' | MessageKey>('')
-const quotaMsg = computed(() => (quotaMsgKey.value ? t(quotaMsgKey.value) : ''))
-/** 当前绑定账号（激活计数按账号独立，切号即重计） */
-const quotaSteamId = ref('')
-/** 账号维度已用次数：后端为准 + 本会话内增量（页内多批激活即时累计） */
-const usedBase = ref(0)
-const usedSession = ref<number[]>([])
 /** 结果行展开原文的索引（-1 = 全收起） */
 const rawOpenIdx = ref(-1)
+const copied = ref(false)
 
-/** 30 分钟窗口内本账号已用激活次数（后端基数 + 页内会话增量） */
-const usedCount = computed(() => {
-  const now = Date.now()
-  // 回调参数原名 t，与 useI18n 的 t 同名会遮蔽；改名以免误用（纯改名）
-  const sess = usedSession.value.filter((ts) => now - ts < ACT_WINDOW).length
-  return usedBase.value + sess
-})
-const nearLimit = computed(() => usedCount.value >= ACT_LIMIT - 2)
+watch(keyArea, () => cdk.renderKeyQueue())
 
-/** 智能识别激活码：从任意大段文本中提取 5-5-5（及多段）格式密钥，中间连字符不可省略 */
-function parseKeys() {
-  const text = keyArea.value.trim().toUpperCase()
-  const reg = /([0-9A-Z]{5}-){2,4}[0-9A-Z]{5}/g
-  const keys: string[] = []
-  let m: RegExpExecArray | null
-  while ((m = reg.exec(text)) !== null) {
-    keys.push(m[0])
-  }
-  return keys
-}
-
-/** 输入即渲染左栏队列 + 右栏等待行 */
-function renderKeyQueue() {
-  const keys = parseKeys()
-  keyQueue.value = keys.map((k) => ({ code: k, status: 'wait' as KeyStatus }))
-  resultRows.value = keys.map((k) => ({ code: k, status: 'wait' as KeyStatus, detail: '', subId: '', subName: '', raw: '' }))
-  progressCount.value = `0 / ${keys.length}`
-  batchNo.value = 1
-  batchTotal.value = Math.max(1, Math.ceil(keys.length / BATCH_SIZE))
-}
-watch(keyArea, renderKeyQueue)
-
-async function loadQuota() {
-  try {
-    const q = await redeemApi.quota()
-    quotaReady.value = q.hasCookie && q.hasSessionId
-    quotaMsgKey.value = quotaReady.value ? '' : 'toolbox.cdk.quotaMissing'
-    // 换绑账号 → 会话增量作废、以后端计数为新基数
-    if (q.steamId !== quotaSteamId.value) {
-      quotaSteamId.value = q.steamId
-      usedSession.value = []
-    }
-    usedBase.value = q.used
-  } catch {
-    quotaMsgKey.value = ''
-  }
-}
 onMounted(() => {
-  renderKeyQueue()
-  void loadQuota()
+  cdk.renderKeyQueue()
+  void cdk.loadQuota()
 })
 
 /** 队列状态 → 词条 key（常量表存 key 不存译文：模块级常量只求值一次，会把语言冻住） */
-const QUEUE_LABEL_KEY: Record<KeyStatus, MessageKey> = {
+const QUEUE_LABEL_KEY: Record<string, MessageKey> = {
   wait: 'toolbox.cdk.status.wait',
   doing: 'toolbox.cdk.status.doing',
   ok: 'toolbox.cdk.status.queueOk',
@@ -157,117 +90,8 @@ function queueLabel(s: KeyStatus): string {
   return t(QUEUE_LABEL_KEY[s])
 }
 
-/** 真实激活：同批单码并发提交（9 个 ajax 齐发，回执即到即渲染），
- *  批间 20s（Steam 30 分钟 10 次限制节奏，账号计数前端驱动） */
-async function startRedeem() {
-  if (running.value) return
-  const keys = parseKeys()
-  if (keys.length === 0) return
-  if (!quotaReady.value) {
-    progressKey.value = quotaMsgKey.value || 'toolbox.cdk.progress.noCookie'
-    message.warning(t('toolbox.cdk.bindFirst'))
-    return
-  }
-  const available = ACT_LIMIT - usedCount.value
-  if (available <= 0) {
-    progressKey.value = 'toolbox.cdk.progress.limitReached'
-    return
-  }
-  const toActivate = Math.min(keys.length, available)
-  running.value = true
-  progressPct.value = 0
-  progressKey.value = 'toolbox.cdk.progress.running'
-  let done = 0
-  const totalBatches = Math.ceil(toActivate / BATCH_SIZE)
-
-  for (let b = 0; b < totalBatches; b++) {
-    const start = b * BATCH_SIZE
-    const batch = keys.slice(start, start + BATCH_SIZE)
-    batchNo.value = b + 1
-    batchTotal.value = totalBatches
-
-    // 每个码一个独立请求并发发出——谁先回来谁先上屏，不等整批
-    const tasks = batch.map(async (code, i) => {
-      const qi = start + i
-      if (keyQueue.value[qi]) keyQueue.value[qi]!.status = 'doing'
-      if (resultRows.value[qi]) resultRows.value[qi]!.status = 'doing'
-      let r: { status: string; detail: string; subId: string; subName: string; raw?: string }
-      try {
-        const res = await redeemApi.activateKeys([code])
-        r = res.results[0] ?? {
-          status: 'fail',
-          // 事件回调里取词条：这一行是本次激活的即时回执，不跨语言切换长驻
-          detail: t('toolbox.cdk.failNoResult'),
-          subId: '',
-          subName: '',
-          raw: '',
-        }
-      } catch (e) {
-        r = { status: 'fail', detail: e instanceof Error ? e.message : String(e), subId: '', subName: '', raw: '' }
-      }
-      const st = (r.status === 'ok' || r.status === 'own' ? r.status : 'fail') as KeyStatus
-      usedSession.value.push(Date.now())
-      if (keyQueue.value[qi]) keyQueue.value[qi]!.status = st
-      if (resultRows.value[qi]) {
-        resultRows.value[qi] = {
-          code,
-          status: st,
-          detail: r.detail || '——',
-          subId: r.subId || '',
-          subName: r.subName || '',
-          raw: r.raw || '',
-        }
-      }
-      if (st === 'ok') ksOk.value++
-      else if (st === 'own') ksOwn.value++
-      else ksFail.value++
-      done++
-      progressPct.value = Math.round((done / toActivate) * 100)
-      progressCount.value = `${done} / ${toActivate}`
-    })
-    await Promise.all(tasks)
-
-    if (b < totalBatches - 1) {
-      progressKey.value = 'toolbox.cdk.progress.batchWait'
-      await new Promise((r) => setTimeout(r, BATCH_WAIT))
-    }
-  }
-  progressKey.value = 'toolbox.cdk.progress.done'
-  running.value = false
-
-  /* 完成汇总气泡：全部成功 / 部分失败 / 全失败 三档。
-     每档各成一条参数化词条——「主句 + 拼接后缀」按中英语序拼不出来
-     （带 skipped 的变体单列，见 zh-CN/toolbox.ts 的 done.*）。 */
-  const skipped = keys.length - toActivate
-  const params = { ok: ksOk.value, own: ksOwn.value, fail: ksFail.value, skipped }
-  if (ksFail.value === 0) {
-    message.success(t(skipped > 0 ? 'toolbox.cdk.done.okSkipped' : 'toolbox.cdk.done.ok', params))
-  } else if (ksOk.value + ksOwn.value > 0) {
-    message.warning(
-      t(skipped > 0 ? 'toolbox.cdk.done.partialSkipped' : 'toolbox.cdk.done.partial', params),
-    )
-  } else {
-    message.error(
-      t(skipped > 0 ? 'toolbox.cdk.done.allFailedSkipped' : 'toolbox.cdk.done.allFailed', params),
-    )
-  }
-}
-
-function resetRedeem() {
-  usedSession.value = []
-  keyQueue.value = []
-  resultRows.value = []
-  rawOpenIdx.value = -1
-  progressPct.value = 0
-  progressKey.value = 'toolbox.cdk.progress.ready'
-  ksOk.value = 0
-  ksFail.value = 0
-  ksOwn.value = 0
-  running.value = false
-  copied.value = false
-  void loadQuota()
-  renderKeyQueue()
-}
+const startRedeem = () => cdk.startRedeem()
+const resetRedeem = () => cdk.resetRedeem()
 
 /** 复制所有 SubID + 版本名（一行一个） */
 function copyResults() {
@@ -562,11 +386,13 @@ onMounted(() => void loadBills())
           <div class="fx-module__title">{{ t('toolbox.section.cdk') }}</div>
           <div class="fx-module__sub">{{ t('toolbox.cdk.subtitle') }}</div>
         </div>
-        <!-- 账号切换：激活/免费领取跟随当前账号，切号即换 Cookie + 配额重计 -->
+        <!-- 账号切换：激活/免费领取跟随当前账号，切号即换 Cookie + 配额重计；
+             激活进行中锁死（中途换 Cookie 会把同一批请求打到另一个账号上） -->
         <HlSelect
           v-if="accountOptions.length"
           v-model="activeSteamId"
           :options="accountOptions"
+          :disabled="running"
           style="margin-left: auto; min-width: 210px"
           @update:model-value="switchAccount"
         />
@@ -590,7 +416,7 @@ onMounted(() => void loadBills())
               <HlIcon v-if="!running" name="play" />
               {{ t('toolbox.cdk.start') }}
             </HlButton>
-            <HlButton art="outline" tone="dark" size="sm" @click="resetRedeem">{{ t('toolbox.cdk.reset') }}</HlButton>
+            <HlButton art="outline" tone="dark" size="sm" :disabled="running" @click="resetRedeem">{{ t('toolbox.cdk.reset') }}</HlButton>
             <span class="cdk-batch-indicator" style="margin-left: auto">{{ t('toolbox.cdk.batch.label', { current: batchNo, total: batchTotal }) }}</span>
           </div>
           <div class="key-progress"><i :style="{ width: progressPct + '%' }"></i></div>
