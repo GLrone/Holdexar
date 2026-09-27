@@ -75,6 +75,11 @@ HEADER_URL_TMPL = "https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/hea
 LANG = "schinese"
 SYNC_KEY = "achievements.sync_state"
 SYNC_STALE_MINUTES = 30
+# 库内快照陈旧阈值：GET summary 命中更旧的快照时后台自动补拉（本轮仍回库内
+# 初版，新数据随下一轮同步落库）；定时同步每天一次，这里兜住白天打开页面的场景
+SYNC_WARM_MAX_AGE_HOURS = 6
+# 自动补拉节流窗：同步失败时 syncedAt 不推进，避免每次 GET 都重试一轮全量
+SYNC_WARM_RETRY_MINUTES = 10
 PROGRESS_BATCH = 100
 API_RETRIES = 3  # Web API 网络类失败的同通道重试次数
 # 社区页请求最小间隔（秒）：逐游戏两页、全量 380 款约 10 分钟
@@ -776,6 +781,41 @@ async def start_sync(target: str | None = None) -> dict:
     return await sync_status()
 
 
+_last_warm_attempt = 0.0
+
+
+async def _warm_sync_later(steamid: str) -> None:
+    try:
+        await start_sync(steamid)
+    except Exception:  # noqa: BLE001 —— 预热失败静默：进行中 / 无凭证 / 网络失败都不影响本次响应
+        pass
+
+
+def _maybe_warm_sync(steamid: str, creds: list[tuple[str, str]], snapshot: dict) -> None:
+    """快照陈旧时后台自动补拉：本轮仍返回库内初版，新数据随下一轮同步落库，
+    由前端的同步轮询收尾重拉呈现。只对本账号自己的快照生效，节流窗内静默。
+    """
+    global _last_warm_attempt
+    now = time.monotonic()
+    if now - _last_warm_attempt < SYNC_WARM_RETRY_MINUTES * 60:
+        return
+    if not steamid or not creds or snapshot.get("running"):
+        return
+    if (snapshot.get("steamid") or steamid) != steamid:
+        return
+    synced_at = snapshot.get("syncedAt") or ""
+    if not synced_at:
+        return  # 从未同步过：首次同步由前端「首次进入自动同步」负责
+    try:
+        age = datetime.now(timezone.utc) - datetime.fromisoformat(synced_at)
+    except ValueError:
+        return
+    if age <= timedelta(hours=SYNC_WARM_MAX_AGE_HOURS):
+        return
+    _last_warm_attempt = now
+    asyncio.create_task(_warm_sync_later(steamid))
+
+
 async def _run_sync(steamid: str) -> None:
     try:
         await _sync_all(steamid)
@@ -1342,6 +1382,7 @@ async def get_summary(target: str | None = None) -> dict:
         ],
         "unlockTimeline": timeline,
     })
+    _maybe_warm_sync(steamid, creds, snapshot)
     return base
 
 

@@ -163,15 +163,20 @@ export const useAchievementsStore = defineStore('achievements', () => {
     loading.value = true
     error.value = ''
     try {
-      summary.value = await achievementsApi.summary(account.value)
-      writeSnapshot(summaryKey(), SNAPSHOT.version, summary.value)
-      await refreshGames()
+      // KPI 与列表互不依赖，并行取回（骨架屏时长 = 较快者决定呈现，两者都到才撤）
+      const [summaryData, gamesPayload] = await Promise.all([
+        achievementsApi.summary(account.value),
+        achievementsApi.games('all', 'name', '', account.value),
+      ])
+      summary.value = summaryData
+      writeSnapshot(summaryKey(), SNAPSHOT.version, summaryData)
+      allGames.value = gamesPayload.games
       // 首次进入自动同步：有凭证但从未同步过（会话内只补一次）
       if (
         !kicked.value &&
         !syncing.value &&
-        summary.value.hasCredential &&
-        !summary.value.lastSyncedAt
+        summaryData.hasCredential &&
+        !summaryData.lastSyncedAt
       ) {
         kicked.value = true
         void startSync()
