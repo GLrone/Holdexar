@@ -33,10 +33,37 @@ class ProxyUpdate(BaseModel):
 class StrategyUpdate(BaseModel):
     strategy: str | None = None
     clashPort: int | None = None
+    # 内核随服务自启开关（None = 不变）
+    autostart: bool | None = None
+    # 自动节点体检开关（None = 不变；手动检测不受闸）
+    healthAuto: bool | None = None
 
 
 class ClashStart(BaseModel):
     subscriptionId: int | None = None  # proxy_subscriptions.kind=clash；缺省用最近一条
+
+
+class ClashSwitch(BaseModel):
+    subscriptionId: int
+
+
+def _spawn_first_check(sub_id: int, *, probe_all: bool = True) -> None:
+    """后台首检：订阅内容变化（启动/切换/重拉生效）后检测一次写账本
+    （订阅废弃判定/selector 自愈都在里面）；缺省全量探测（probe_all）——
+    首检要给「这条订阅现在到底能不能用」的完整结论；串行锁与手动检测/
+    定时体检互斥。"""
+
+    async def _first_check() -> None:
+        try:
+            r = await service.test_clash_nodes(sub_id, probe_all=probe_all)
+            logger.info(
+                "[订阅首检] Clash 订阅 %s：共 %s 节点，可用 %s",
+                sub_id, r.get("total"), r.get("alive"),
+            )
+        except Exception:  # noqa: BLE001 —— 首检失败不影响内核已生效的事实
+            logger.exception("[订阅首检] Clash 节点检测失败（可稍后手动检测）")
+
+    asyncio.get_running_loop().create_task(_first_check())
 
 
 class SubscriptionAdd(BaseModel):
@@ -164,7 +191,6 @@ async def clash_start(req: ClashStart):
     subs = await service.list_subscriptions("clash")
     if not subs:
         raise HTTPException(status_code=400, detail="尚未保存 Clash 订阅链接，请先添加")
-    usable = [s for s in subs if not s["deprecated"]]
     if req.subscriptionId is not None:
         sub = next((s for s in subs if s["id"] == req.subscriptionId), None)
         if sub is None:
@@ -175,55 +201,102 @@ async def clash_start(req: ClashStart):
                 detail=f"该订阅已废弃（{sub['deprecatedReason'] or '不可用节点超过 95%'}），"
                 "后端不再使用；如需恢复请先检测节点确认恢复达标，或手动删除该订阅",
             )
-    else:
-        if not usable:
-            raise HTTPException(
-                status_code=400,
-                detail="全部 Clash 订阅已废弃（不可用节点超过 95%），请在订阅区手动删除或更换订阅",
-            )
-        sub = usable[-1]
+
+    # 取配置按候选遍历：请求的订阅取不到（链接失效且无本地缓存）时依次
+    # 降级到其余可用订阅，内核起不来不允许是「下载失败」一个原因
+    try:
+        picked = await service.resolve_startable_clash(
+            settings.data_dir, req.subscriptionId,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    sub = picked["subscription"]
     sub_id = sub["id"]
     sub_url = sub["url"]
 
     try:
-        meta = await clash_manager.runtime.download_subscription(
-            sub_url, settings.data_dir, await service._saved_proxy_candidates()
+        status = await clash_manager.runtime.ensure_running(
+            detect["path"], picked["configPath"], subscription_url=sub_url
         )
-        status = clash_manager.runtime.start(detect["path"], meta["path"])
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"订阅下载失败: {e}")
+    except Exception as e:  # noqa: BLE001 —— 配置已到手，起不来是内核侧问题
+        raise HTTPException(status_code=502, detail=f"内核启动失败: {e}")
 
     # 流量/节点数落库（启动即顺手回填）；订阅名只补空位——已有名称不覆写
-    if meta.get("title"):
-        await service._apply_subscription_name(sub_id, str(meta["title"]))
-    if meta.get("userinfo"):
+    if picked.get("title"):
+        await service._apply_subscription_name(sub_id, str(picked["title"]))
+    if picked.get("userinfo"):
         await service.mark_imported(
             sub_id,
-            {"traffic": meta["userinfo"], "nodes": meta.get("nodes"),
-             "cached": meta.get("cached", False)},
+            {"traffic": picked["userinfo"], "nodes": picked.get("nodes"),
+             "cached": picked.get("cached", False)},
         )
     await service.record_event(
         kind="clash", target="subscription", proxy_label=f"clash:{status.get('port')}"
     )
 
-    # ── 启动即首检（新订阅入库自动校验标记可用节点）──
-    # 后台任务跑全量节点检测（71 节点约 1-2 分钟），不阻塞启动响应；
-    # 结果写 clash_nodes 账本（订阅废弃判定/selector 自愈都在里面）。
-    # 串行锁保证与手动「检测节点」/定时体检互斥。
-    async def _first_check() -> None:
-        try:
-            r = await service.test_clash_nodes(sub_id)
-            logger.info(
-                "[启动首检] Clash 订阅 %s：共 %s 节点，可用 %s",
-                sub_id, r.get("total"), r.get("alive"),
-            )
-        except Exception:  # noqa: BLE001 —— 首检失败不影响内核已启动的事实
-            logger.exception("[启动首检] Clash 节点检测失败（可稍后手动检测）")
+    # ── 启动即首检：后台全量检测写账本，不阻塞启动响应 ──
+    _spawn_first_check(sub_id)
+    fallback_from = None
+    if picked["attempts"]:
+        first = picked["attempts"][0]
+        fallback_from = {"id": first["id"], "label": first["label"]}
+    return {
+        **status,
+        "nodes": picked.get("nodes"),
+        "usedCache": picked.get("cached", False),
+        "subscription": {"id": sub_id, "label": sub["label"]},
+        "fallbackFrom": fallback_from,
+    }
 
-    asyncio.get_running_loop().create_task(_first_check())
-    return {**status, "nodes": meta.get("nodes"), "usedCache": meta.get("cached", False)}
+
+@router.post("/clash/switch")
+async def clash_switch(req: ClashSwitch):
+    """切换运行中内核的订阅：控制器热重载生效，内核进程不动（与
+    Clash Verge Rev 的换配置路径同款）。内核未运行时无需切换——「启动」
+    会直接使用当前选中的订阅；废弃订阅不可切换。切换成功后后台首检。"""
+    status = clash_manager.runtime.status()
+    if not status["running"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Clash 未运行：点「启动」拉起内核，启动时将使用选中的订阅",
+        )
+    subs = await service.list_subscriptions("clash")
+    sub = next((s for s in subs if s["id"] == req.subscriptionId), None)
+    if sub is None:
+        raise HTTPException(status_code=404, detail="指定的订阅不存在")
+    if sub["deprecated"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"该订阅已废弃（{sub['deprecatedReason'] or '不可用节点超过 95%'}），后端不再使用",
+        )
+    if clash_manager.runtime.running_subscription_is(sub["url"]):
+        return {"switched": False, **status}
+
+    settings = get_settings()
+    detect = clash_manager.detect_kernel(settings.data_dir)
+    if not detect["found"]:
+        raise HTTPException(status_code=400, detail="未找到内核，请先安装")
+    # 每订阅各存一份配置缓存：有缓存直接热重载（秒级），无缓存才下载；
+    # 热重载持检测串行锁——切换若打断正在跑的首检，旧首检会对着新配置
+    # 探测、整轮误判失败污染账本。
+    sub_cache = clash_manager.subscription_config_path(settings.data_dir, sub["id"])
+    try:
+        if not sub_cache.is_file():
+            await clash_manager.runtime.download_subscription(
+                sub["url"], settings.data_dir, await service._saved_proxy_candidates(),
+                target_path=sub_cache,
+            )
+        async with service._clash_test_lock():
+            new_status = await clash_manager.runtime.ensure_running(
+                detect["path"], str(sub_cache), subscription_url=sub["url"]
+            )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"切换失败: {e}")
+
+    _spawn_first_check(sub["id"], probe_all=True)
+    return {"switched": True, **new_status}
 
 
 @router.post("/clash/test")
@@ -350,7 +423,7 @@ async def sync_subscription(sub_id: int):
 
         async def _post_sync_check() -> None:
             try:
-                r = await service.test_clash_nodes(sub_id)
+                r = await service.test_clash_nodes(sub_id, probe_all=True)
                 logger.info(
                     "[刷新首检] Clash 订阅 %s：共 %s 节点，可用 %s",
                     sub_id, r.get("total"), r.get("alive"),

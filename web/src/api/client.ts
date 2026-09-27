@@ -1236,15 +1236,32 @@ export interface ProxyItem {
 export interface ProxyStrategy {
   strategy: string
   clashPort: number
+  /** 内核随服务自启开关（undefined = 未拉到，UI 按开处理） */
+  autostart?: boolean
+  /** 自动节点体检开关（undefined = 未拉到，UI 按开处理） */
+  healthAuto?: boolean
 }
 
 export interface ClashStatus {
   running: boolean
   port: number | null
   configPath: string | null
+  /** 内核当前跑的订阅 URL（启动/切换时登记）——检测结果归属的事实源 */
+  subscriptionUrl: string | null
   kernel: { found: boolean; path: string | null; builtin: boolean }
   version: string | null
   kernelDir: string
+  /** 启动响应扩展：实际拉起内核用的订阅（候选遍历后胜出的那条） */
+  subscription?: { id: number; label: string | null }
+  /** 启动响应扩展：非空 = 请求的订阅取不到配置，已降级到其他订阅启动 */
+  fallbackFrom?: { id: number; label: string | null } | null
+}
+
+/** 选中订阅即切换（内核热重载，进程不动）；switched=false = 本就在跑这条 */
+export interface ClashSwitchResult {
+  switched: boolean
+  subscriptionUrl: string | null
+  port: number | null
 }
 
 export interface ProxySubscriptionItem {
@@ -1425,6 +1442,8 @@ export const proxiesApi = {
     }>('GET', '/proxies/clash/install/progress'),
   clashStart: (subscriptionId?: number) =>
     request<ClashStatus>('POST', '/proxies/clash/start', { subscriptionId }),
+  clashSwitch: (subscriptionId: number) =>
+    request<ClashSwitchResult>('POST', '/proxies/clash/switch', { subscriptionId }),
   clashTestStart: () => request<ClashTestProgress>('POST', '/proxies/clash/test'),
   clashTestProgress: () => request<ClashTestProgress>('GET', '/proxies/clash/test/progress'),
   clashHealthCheck: (force = false) =>

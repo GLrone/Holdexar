@@ -42,8 +42,9 @@ logger = logging.getLogger(__name__)
 async def _autostart_clash() -> None:
     """Clash 内核随服务自启（后台任务，不阻塞 lifespan）。
 
-    有内置内核 + 已存 clash 订阅才拉起；下载失败自动回退本地缓存
-    config.yaml——开机即有代理可用，proxy_first 不降级直连。
+    有内置内核 + 已存 clash 订阅才拉起；取配置按候选遍历：某条订阅下载
+    失败且无本地缓存时降级到下一条可用订阅（本地缓存照常可用）——开机
+    即有代理，proxy_first 不降级直连。
     """
     try:
         from app.domains.proxies import clash_manager, service as proxies_service
@@ -68,15 +69,20 @@ async def _autostart_clash() -> None:
             else:
                 logger.info("无 Clash 订阅，跳过内核自启")
             return
-        sub_url = usable[-1]["url"]
+        # 取配置按候选遍历（新→旧）：某条订阅链接失效且无本地缓存时降级到
+        # 下一条，内核起不来不允许是「下载失败」一个原因——节点好不好交给
+        # 启动后的首检与定时体检
         try:
-            meta = await clash_manager.runtime.download_subscription(sub_url, settings.data_dir)
-            config_path = meta["path"]
-        except Exception as e:  # noqa: BLE001 —— 下载全败且无缓存时才放弃
-            logger.warning("自启订阅下载失败：%s", e)
+            picked = await proxies_service.resolve_startable_clash(settings.data_dir)
+        except ValueError as e:
+            logger.warning("内核自启放弃：%s", e)
             return
-        status = clash_manager.runtime.start(detect["path"], config_path)
-        # 账本收敛：自启下载的是最新订阅内容，已下线/改名节点的旧行随启动清理
+        sub = picked["subscription"]
+        config_path = picked["configPath"]
+        status = await clash_manager.runtime.ensure_running(
+            detect["path"], config_path, subscription_url=sub["url"]
+        )
+        # 账本收敛：启动用的是上面这份配置内容，已下线/改名节点的旧行随启动清理
         # （订阅名不再自动回填——手动改名，见 proxies 域）
         try:
             from pathlib import Path
@@ -86,7 +92,7 @@ async def _autostart_clash() -> None:
             )
             if names:
                 pruned = await proxies_service.prune_clash_node_ledger(
-                    usable[-1]["id"], set(names)
+                    sub["id"], set(names)
                 )
                 if pruned:
                     logger.info("[Clash自启] 账本收敛：删除 %d 个已下线节点行", pruned)
@@ -233,6 +239,14 @@ async def _post_startup_chain() -> None:
         await core_scheduler._startup_pool_runtime()
     except Exception:  # noqa: BLE001 —— 与链内其它步骤同约定：本步异常只留日志
         logger.exception("[启动] 池 Runtime bootstrap 步骤异常（不阻塞启动）")
+
+    # 订阅同步（下载后置）：内核就位不等订阅下载——冷启动直接吃持久化 Registry
+    # 起核，本步在 Runtime 就位后全量拉一遍订阅；池签名变化就地消费一次重建
+    # （热重载优先）。失败不阻塞启动，30min 刷新是下一次机会。
+    try:
+        await core_scheduler._startup_subscription_sync()
+    except Exception:  # noqa: BLE001 —— 与链内其它步骤同约定：本步异常只留日志
+        logger.exception("[启动] 订阅同步步骤异常（不阻塞启动）")
 
     # 汇率启动兜底：错过每日 03:00 定点（关机/服务重启）时按快照龄补刷新，
     # 保证"每日自动抓取"承诺不因服务频繁重启落空（内含 >12h 阈值，幂等安全）

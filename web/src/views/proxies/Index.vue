@@ -4,6 +4,7 @@ import { ElMessageBox } from 'element-plus'
 
 import {
   proxiesApi,
+  type ClashNodeTestItem,
   type ClashStatus,
   type ClashTestProgress,
   type ProxyItem,
@@ -86,6 +87,41 @@ function stopKernelPoll() {
 
 // 订阅管理（双方式）
 const selectedClashSubId = ref<number | null>(null)
+const switchingSub = ref(false)
+/** 内核当前跑的订阅 id：radio 重复选它时免打扰，切换失败时回弹锚点 */
+const runningSubId = computed(() => {
+  const url = clash.value?.subscriptionUrl
+  if (!url) return null
+  return clashSubs.value.find((s) => s.url === url)?.id ?? null
+})
+
+/** 选中即切换：内核在跑 → 热重载切到所选订阅（气泡提示，内核进程不动）；
+ *  内核没跑 → 只记录选择，「启动」会直接用它。 */
+async function onClashSubChange(sub: ProxySubscriptionItem) {
+  if (!clash.value?.running) return
+  if (switchingSub.value || sub.id === runningSubId.value) return
+  switchingSub.value = true
+  try {
+    message.loading(t('proxies.clash.switching', { name: sub.label || sub.url }))
+    const res = await proxiesApi.clashSwitch(sub.id)
+    if (res.switched) {
+      message.success(t('proxies.clash.switched', { name: sub.label || sub.url }))
+      clash.value = await proxiesApi.clashStatus()
+      // 接上切换首检的进度轮询（结果面板自动亮起）
+      const snap = await proxiesApi.clashTestProgress()
+      if (snap && (snap.phase === 'queued' || snap.phase === 'running')) {
+        clashTest.value = snap
+        clashTestExpanded.value = true
+        startClashTestPoll()
+      }
+    }
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+    if (runningSubId.value != null) selectedClashSubId.value = runningSubId.value
+  } finally {
+    switchingSub.value = false
+  }
+}
 const newClashSubUrl = ref('')
 const newPlainSubUrl = ref('')
 const addingClashSub = ref(false)
@@ -119,6 +155,54 @@ const clashTestPct = computed(() => {
   return Math.min(100, Math.round((s.probed / s.toProbe) * 100))
 })
 const clashTestSkipped = computed(() => clashTest.value?.cooldownSkipped ?? 0)
+/** 本次检测归属的订阅（内核启动时选中的那条）——结果面板明示，避免「测的哪条」歧义 */
+const clashTestSubLabel = computed(() => {
+  const id = clashTest.value?.subscriptionId
+  if (id == null) return ''
+  const sub = clashSubs.value.find((s) => s.id === id)
+  return sub?.label || sub?.url || ''
+})
+
+/** 同出口收敛：该出口 IP 的节点折叠到代表行下（展开才显示）。
+ *  代表行择优 = 本次检测存活优先 → 未冷却（非账本沿用）优先 → 本次延迟低者
+ *  优先，都不可用保持出现序——出口 IP 与 Steam 存活是两个独立探测，「拿到
+ *  IP 但 Steam 判死」的节点不得凭出现序占住展示位。 */
+interface GroupedTestRow { key: string; primary: ClashNodeTestItem; children: ClashNodeTestItem[] }
+function repRank(n: ClashNodeTestItem): [number, number, number] {
+  return [n.alive ? 0 : 1, n.cooling ? 1 : 0, n.ms ?? Number.MAX_SAFE_INTEGER]
+}
+function repRankLess(a: [number, number, number], b: [number, number, number]): boolean {
+  return a[0] !== b[0] ? a[0] < b[0] : a[1] !== b[1] ? a[1] < b[1] : a[2] < b[2]
+}
+const expandedExits = ref(new Set<string>())
+const groupedTestNodes = computed<GroupedTestRow[]>(() => {
+  const rows: GroupedTestRow[] = []
+  const byIp = new Map<string, GroupedTestRow>()
+  for (const n of clashTest.value?.nodes ?? []) {
+    if (!n.exitIp) {
+      rows.push({ key: `solo-${rows.length}`, primary: n, children: [] })
+      continue
+    }
+    const g = byIp.get(n.exitIp)
+    if (!g) {
+      const fresh = { key: n.exitIp, primary: n, children: [] }
+      byIp.set(n.exitIp, fresh)
+      rows.push(fresh)
+    } else if (repRankLess(repRank(n), repRank(g.primary))) {
+      g.children.unshift(g.primary) // 被换下的原代表行排在子行最前
+      g.primary = n
+    } else {
+      g.children.push(n)
+    }
+  }
+  return rows
+})
+function toggleExitGroup(ip: string) {
+  const next = new Set(expandedExits.value)
+  if (next.has(ip)) next.delete(ip)
+  else next.add(ip)
+  expandedExits.value = next
+}
 
 const clashSubs = computed(() => subscriptions.value.filter((s) => s.kind === 'clash'))
 const plainSubs = computed(() => subscriptions.value.filter((s) => s.kind === 'plain'))
@@ -542,7 +626,18 @@ async function startClash() {
   starting.value = true
   try {
     const status = await proxiesApi.clashStart(selectedClashSubId.value ?? undefined)
-    message.success(t('proxies.clash.started', { port: status.port }))
+    if (status.fallbackFrom) {
+      // 请求的订阅取不到节点配置，后端已自动换其他订阅拉起内核
+      message.warning(
+        t('proxies.clash.startedFallback', {
+          from: status.fallbackFrom.label ?? `#${status.fallbackFrom.id}`,
+          to: status.subscription?.label ?? status.subscription?.id ?? '',
+          port: status.port,
+        }),
+      )
+    } else {
+      message.success(t('proxies.clash.started', { port: status.port }))
+    }
     clash.value = await proxiesApi.clashStatus()
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e))
@@ -777,7 +872,8 @@ onMounted(async () => {
               type="radio"
               :value="sub.id"
               name="clash-sub"
-              :disabled="sub.deprecated"
+              :disabled="sub.deprecated || switchingSub"
+              @change="onClashSubChange(sub)"
             />
             <span v-if="sub.deprecated" class="tag tag--danger proxyx-sub-deprecated" :title="sub.deprecatedReason ?? ''">
               {{ t('proxies.sub.deprecated') }}
@@ -822,8 +918,9 @@ onMounted(async () => {
           <HlButton
             art="outline"
             size="sm"
-            :disabled="starting || !clash?.kernel.found || clashSubs.length === 0"
+            :disabled="starting || clash?.running || !clash?.kernel.found || clashSubs.length === 0"
             :loading="starting"
+            :title="clash?.running ? t('proxies.clash.startRunningTitle') : ''"
             @click="startClash"
           >
             <HlIcon v-if="!starting" name="play" />
@@ -832,13 +929,18 @@ onMounted(async () => {
           <HlButton art="outline" tone="dark" size="sm" :disabled="!clash?.running" @click="stopClash">
             {{ t('proxies.clash.stop') }}
           </HlButton>
-          <span class="proxyx-hint">{{ t('proxies.clash.startHint') }}</span>
+          <span class="proxyx-hint">{{
+            t(clash?.running ? 'proxies.clash.startHintRunning' : 'proxies.clash.startHint')
+          }}</span>
         </div>
 
         <!-- Clash 节点检测结果（存活=Steam 端点 200；冷却期节点沿用账本状态）。
              收起只折叠展示，后台检测照常推进，再展开继续看逐节点过程 -->
         <div v-if="clashTest && clashTest.phase !== 'idle'" class="proxyx-test-panel">
           <div class="proxyx-test-panel__head">
+            <span v-if="clashTestSubLabel" class="tag">
+              {{ t('proxies.clash.testSubTag', { name: clashTestSubLabel }) }}
+            </span>
             <span v-if="clashTest.phase === 'failed'" class="tag tag--danger">
               {{ t('proxies.clash.testFailed') }}
             </span>
@@ -876,23 +978,56 @@ onMounted(async () => {
               </tr>
             </thead>
             <tbody>
-              <tr v-for="n in clashTest.nodes" :key="n.name">
-                <td class="mono">{{ n.name }}<span v-if="n.duplicate" class="tag" style="margin-left: 6px">{{ t('proxies.clash.sameExit') }}</span></td>
-                <td class="mono">{{ n.exitIp ?? '—' }}</td>
-                <td>
-                  <span class="tag" :class="n.alive ? 'tag--success' : 'tag--danger'">
-                    {{ t(n.alive ? 'proxies.clash.reachable' : 'proxies.clash.unreachable') }}
-                  </span>
-                </td>
-                <td>
-                  <span v-if="n.cooling" class="tag" :title="t('proxies.clash.coolingTitle')">
-                    {{ t('proxies.clash.cooling') }}
-                  </span>
-                  <span v-else-if="n.alive" class="tag tag--success">{{ t('proxies.clash.healthy') }}</span>
-                  <span v-else class="tag tag--danger">{{ t('proxies.clash.unavailable') }}</span>
-                </td>
-                <td class="mono">{{ n.ms !== null ? `${n.ms}ms` : '—' }}</td>
-              </tr>
+              <template v-for="g in groupedTestNodes" :key="g.key">
+                <tr>
+                  <td class="mono">
+                    {{ g.primary.name }}
+                    <button
+                      v-if="g.children.length"
+                      class="pxbtn pxbtn--sm proxyx-exit-toggle"
+                      @click="toggleExitGroup(g.key)"
+                    >
+                      {{ t('proxies.clash.sameExitGroup', { n: g.children.length }) }}
+                    </button>
+                  </td>
+                  <td class="mono">{{ g.primary.exitIp ?? '—' }}</td>
+                  <td>
+                    <span class="tag" :class="g.primary.alive ? 'tag--success' : 'tag--danger'">
+                      {{ t(g.primary.alive ? 'proxies.clash.reachable' : 'proxies.clash.unreachable') }}
+                    </span>
+                  </td>
+                  <td>
+                    <span v-if="g.primary.cooling" class="tag" :title="t('proxies.clash.coolingTitle')">
+                      {{ t('proxies.clash.cooling') }}
+                    </span>
+                    <span v-else-if="g.primary.alive" class="tag tag--success">{{ t('proxies.clash.healthy') }}</span>
+                    <span v-else class="tag tag--danger">{{ t('proxies.clash.unavailable') }}</span>
+                  </td>
+                  <td class="mono">{{ g.primary.ms !== null ? `${g.primary.ms}ms` : '—' }}</td>
+                </tr>
+                <tr
+                  v-for="c in g.children"
+                  v-show="expandedExits.has(g.key)"
+                  :key="`${g.key}-${c.name}`"
+                  class="proxyx-exit-child"
+                >
+                  <td class="mono">{{ c.name }}</td>
+                  <td class="mono">{{ c.exitIp ?? '—' }}</td>
+                  <td>
+                    <span class="tag" :class="c.alive ? 'tag--success' : 'tag--danger'">
+                      {{ t(c.alive ? 'proxies.clash.reachable' : 'proxies.clash.unreachable') }}
+                    </span>
+                  </td>
+                  <td>
+                    <span v-if="c.cooling" class="tag" :title="t('proxies.clash.coolingTitle')">
+                      {{ t('proxies.clash.cooling') }}
+                    </span>
+                    <span v-else-if="c.alive" class="tag tag--success">{{ t('proxies.clash.healthy') }}</span>
+                    <span v-else class="tag tag--danger">{{ t('proxies.clash.unavailable') }}</span>
+                  </td>
+                  <td class="mono">{{ c.ms !== null ? `${c.ms}ms` : '—' }}</td>
+                </tr>
+              </template>
             </tbody>
           </table>
           </div>
@@ -1541,6 +1676,16 @@ onMounted(async () => {
   font-size: 12px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+
+/* 同出口收敛：子行缩进降调，展开开关贴在主行节点名后 */
+.proxyx-exit-toggle {
+  margin-left: 6px;
+}
+
+.proxyx-exit-child td:first-child {
+  padding-left: 24px;
+  color: var(--text-muted);
 }
 
 .proxyx-table {
