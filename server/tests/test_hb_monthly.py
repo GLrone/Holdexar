@@ -6,7 +6,9 @@
 - steam 条目打标（is_hb + hb_data 月份标签），非 steam 条目跳过；
 - 缺行占位 updated_at NULL（回补池判据），已有行保留旧标记并逗号续写；
 - 解析失败条目进 unresolved 不阻塞其余条目；
-- machine_name 未变时幂等跳过（app_settings 记账）。
+- machine_name 未变时幂等跳过（app_settings 记账）；
+- 补价通道：无任何价格行的标记行进首爬候选，已有价格行（missing 状态）
+  的归补抓账本不进，空候选不发起爬取。
 """
 import html
 import json
@@ -313,3 +315,60 @@ async def test_refresh_records_state_and_skips_when_resolved(monkeypatch):
     async with get_session_factory()() as session:
         row = await session.get(Game, APP_UNRESOLVED)
         assert row is not None and row.hb_data == LABEL
+
+
+@pytest.mark.asyncio
+async def test_unpriced_hb_appids_filters_priced():
+    """候选查询两通道判据：无任何价格行的标记行进候选；已有价格行
+    （missing 状态）的归补抓账本不进（合成 appid 断言，容忍库内真实行）。"""
+    async with get_session_factory()() as session:
+        # 合成行重建（前序用例 teardown 会清掉）+ 清价格残留
+        session.add(Game(appid=APP_NEW, name="Frosttest 2", is_hb=True,
+                         hb_data=LABEL, created_at=datetime_now()))
+        await session.execute(
+            delete(GameCurrentPrice).where(
+                GameCurrentPrice.appid.in_([APP_NEW, APP_EXISTING])
+            )
+        )
+        # APP_EXISTING 留一条 missing 状态价格行：归补抓账本，不进候选
+        session.add(GameCurrentPrice(
+            appid=APP_EXISTING, region_code="CN", currency="CNY",
+            price=None, price_status="missing",
+        ))
+        await session.commit()
+
+    appids = await hb.unpriced_hb_appids()
+    assert APP_NEW in appids
+    assert APP_EXISTING not in appids
+
+
+@pytest.mark.asyncio
+async def test_backfill_hb_prices_trigger(monkeypatch):
+    """触发行为：候选为空不发起爬取；候选非空以 appids spec 进
+    run_sequential（kind=hb_backfill），返回任务 id。"""
+    from app.domains.crawl import service as crawl_service
+
+    calls: list[list[dict]] = []
+
+    async def fake_run_sequential(specs, **_):
+        calls.append(specs)
+        return [{"id": 7}]
+
+    monkeypatch.setattr(crawl_service, "run_sequential", fake_run_sequential)
+
+    async def fake_unpriced(limit=60):
+        return [APP_NEW, APP_EXISTING]
+
+    monkeypatch.setattr(hb, "unpriced_hb_appids", fake_unpriced)
+    res = await hb.backfill_hb_prices()
+    assert res["started"] is True and res["jobId"] == 7
+    assert calls[0][0]["kind"] == "hb_backfill"
+    assert calls[0][0]["appids"] == [APP_NEW, APP_EXISTING]
+
+    async def fake_unpriced_empty(limit=60):
+        return []
+
+    monkeypatch.setattr(hb, "unpriced_hb_appids", fake_unpriced_empty)
+    res2 = await hb.backfill_hb_prices()
+    assert res2["pending"] == 0 and res2["started"] is False
+    assert len(calls) == 1

@@ -92,7 +92,11 @@ const settings = {
   'settings.account.save': '保存',
 
   /* ── 数据备份卡片 ── */
-  'settings.backup.desc': '在线快照备份：不占用数据库文件、不打断爬取写入，完整包含所有已提交数据。每天自动备份一次，总量不超过主库体积的 2 倍（至少保留 2 份）；手动备份单独保留最新 1 份，不会被自动轮转清除。恢复为危险操作——将用备份文件整体替换当前数据库，执行前请先校验。',
+  'settings.backup.desc': '在线快照备份：不占用数据库文件、不打断爬取写入，完整包含所有已提交数据。总量不超过主库体积的 2 倍（至少保留 2 份）；手动备份单独保留最新 1 份，不会被自动轮转清除。恢复为危险操作——将用备份文件整体替换当前数据库，执行前请先校验。',
+  'settings.backup.autoLabel': '每日自动备份',
+  'settings.backup.autoHint': '每天自动创建一次数据库快照并按保留策略轮转；关闭后只在你点「立即备份」时创建',
+  'settings.backup.autoOn': '已开启每日自动备份',
+  'settings.backup.autoOff': '已关闭每日自动备份，请记得定期手动备份',
   'settings.backup.createNow': '立即备份',
   'settings.backup.snapshotting': '快照中…',
   'settings.backup.count': '共 {n} 份',

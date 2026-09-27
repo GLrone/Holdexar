@@ -40,17 +40,25 @@ def db(tmp_path, monkeypatch):
 
 
 def payload_stub(**overrides):
-    """SettingsUpdate 桩：默认全 None（不改任何键），按需覆盖。"""
-    values = {
-        "account": None,
-        "onboarding_done": None,
-        "auto_price": None,
-        "update_notified": None,
-        "update_notify": None,
-        "update_auto": None,
-        "theme": None,
-    }
+    """SettingsUpdate 桩：默认全 None（不改任何键），按需覆盖。
+
+    类上挂 `__getattr__` 兜底返回 None——路由新增可选字段时本桩不必逐个跟补。
+    """
+    values = dict.fromkeys(
+        (
+            "account",
+            "onboarding_done",
+            "auto_price",
+            "backup_auto",
+            "update_notified",
+            "update_notify",
+            "update_auto",
+            "theme",
+        ),
+        None,
+    )
     values.update(overrides)
+    values.setdefault("__getattr__", lambda self, name: None)
     return type("P", (), values)()
 
 

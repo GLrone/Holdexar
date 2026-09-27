@@ -37,7 +37,7 @@ from datetime import datetime
 from pathlib import Path
 
 import aiohttp
-from sqlalchemy import case, func, select, update
+from sqlalchemy import case, func, or_, select, update
 
 from app.core.database import get_session_factory
 from app.crawler.epic_free import (
@@ -647,6 +647,59 @@ async def hb_choice_offers() -> dict:
     }
 
 
+async def unpriced_hb_appids(limit: int = 60) -> list[int]:
+    """已标记 HB 但一行价格都没有的 appid（补价通道候选集）。
+
+    两通道判据与孤儿回补层同源：**无任何价格行**的才归本通道首爬；
+    已有价格行（missing/blocked 状态）的归补抓账本，这里再抓属双通道
+    重复。下架与永久免费（价格事实已定）不补。按 appid 升序限量。
+    """
+    from app.domains.games.models import GameCurrentPrice
+
+    has_price = (
+        select(GameCurrentPrice.appid)
+        .where(GameCurrentPrice.appid == Game.appid)
+        .exists()
+    )
+    async with get_session_factory()() as session:
+        rows = (
+            await session.execute(
+                select(Game.appid)
+                .where(
+                    Game.is_hb.is_(True),
+                    ~has_price,
+                    Game.removed_at.is_(None),
+                    or_(Game.free_kind.is_(None), Game.free_kind != "f2p"),
+                )
+                .order_by(Game.appid)
+                .limit(limit)
+            )
+        ).scalars().all()
+    return [int(a) for a in rows]
+
+
+async def backfill_hb_prices() -> dict:
+    """已标记未取价的 HB 游戏补一次首爬（标记 ≠ 取价）。
+
+    对齐导入/目录恢复语义：目录行 + 一次性首爬。走既有爬取管线
+    （run_sequential 单任务模型）：撞锁 / 池未就绪由链式层跳过留日志，
+    不阻塞标记链，下一轮（每日调度或手动刷新）重试；首爬落价后不再
+    进候选集（幂等）。
+    """
+    from app.domains.crawl import service as crawl_service
+
+    appids = await unpriced_hb_appids()
+    if not appids:
+        return {"source": "hb-backfill", "ok": True, "pending": 0, "started": False}
+    results = await crawl_service.run_sequential(
+        [{"scope": "appids", "appids": appids, "kind": "hb_backfill"}]
+    )
+    return {
+        "source": "hb-backfill", "ok": True, "pending": len(appids),
+        "started": bool(results), "jobId": results[0]["id"] if results else None,
+    }
+
+
 # ─── Steam 喜加一：限时赠送展示链（纯本地库零外网）────────────────────
 # 事实源 = games.free_kind='promo'（写库层每轮爬取按价格行维护）+
 # promo_end_at（Steam free_to_keep_ends，精确到秒）。发现面 = 特惠反哺
@@ -960,6 +1013,12 @@ async def epic_free_offers(force: bool = False) -> dict:
     now = time.time()
     await _ensure_offers_cache_hydrated()
     cached = _epic_offers_cache["payload"]
+    if not force and not await _epic_fetch_enabled():
+        # 「Epic 免费游戏」开关关闭：只回已有快照，不触发任何联网刷新
+        # （force=True 的手动刷新不受影响）
+        if cached is not None:
+            return {**cached, "cached": True, "stale": True}
+        return {"source": "epic-offers", "ok": False, "offers": [], "mobile": None, "fetchedAt": None}
     if cached is not None and not force:
         if now - _epic_offers_cache["at"] < _EPIC_OFFERS_TTL_SECONDS:
             return {**cached, "cached": True, "stale": False}
@@ -986,6 +1045,13 @@ async def _ensure_offers_cache_hydrated() -> None:
             _epic_offers_cache.update(snapshot)
 
 
+async def _epic_fetch_enabled() -> bool:
+    """「Epic 免费游戏」抓取开关（KV `fetch.epic_free`，默认开）。"""
+    from app.domains.settings.service import get_value
+
+    return bool(await get_value("fetch.epic_free", True))
+
+
 async def preheat_epic_offers() -> None:
     """启动链预热：快照新鲜即零开销；过期只触发后台刷新（不 await 网络轮）。
 
@@ -994,6 +1060,8 @@ async def preheat_epic_offers() -> None:
     stale-while-revalidate 语义不变。
     """
     await _ensure_offers_cache_hydrated()
+    if not await _epic_fetch_enabled():
+        return  # 开关关闭：预热不触网，卡片回落到已有快照
     fresh = (
         _epic_offers_cache["payload"] is not None
         and time.time() - _epic_offers_cache["at"] < _EPIC_OFFERS_TTL_SECONDS

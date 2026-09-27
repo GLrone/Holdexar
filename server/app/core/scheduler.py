@@ -216,6 +216,22 @@ async def _stamp_uncrawled_missing(appids: list[int]) -> int:
     return wrote
 
 
+async def price_refresh_interval_hours() -> int:
+    """价格刷新网格步长（KV `crawl.price_interval_hours`，小时，默认 6）。
+
+    用户在「自动抓取」页调整；非正数/超界一律夹取到 1..72，脏值回落默认。
+    只改网格步长，锚点小时（Steam 每日刷新对齐）不变；保存后由设置路由
+    触发一次重锚即生效。
+    """
+    from app.domains.settings.service import get_value
+
+    try:
+        hours = int(await get_value("crawl.price_interval_hours", 6))
+    except (TypeError, ValueError):
+        return 6
+    return max(1, min(72, hours))
+
+
 async def _reanchor_price_refresh(reason: str) -> None:
     """用外部时间重算 price_refresh 下一格并重锚（自续约核心）。
 
@@ -223,13 +239,18 @@ async def _reanchor_price_refresh(reason: str) -> None:
     仍会把 job 拉起来，再走一次本函数即可恢复网格。
     """
     try:
-        nxt, hour, is_dst, source = await probe_next_grid()
+        hours = await price_refresh_interval_hours()
+        nxt, hour, is_dst, source = await probe_next_grid(timedelta(hours=hours))
         scheduler.modify_job("price_refresh", next_run_time=nxt)
         logger.info(
-            "[调度] price_refresh 重锚（%s）→ %s 锚点 %02d:00 %s 网格（DST=%s，源=%s）",
-            reason, nxt.strftime("%m-%d %H:%M"), hour,
-            "/".join(f"{(hour + 6 * i) % 24:02d}" for i in range(4)),
-            is_dst, source,
+            "[调度] price_refresh 重锚（%s）→ %s 锚点 %02d:00 %s 网格（步长 %dh，DST=%s，源=%s）",
+            reason,
+            nxt.strftime("%m-%d %H:%M"),
+            hour,
+            "/".join(f"{(hour + hours * i) % 24:02d}" for i in range(4)),
+            hours,
+            is_dst,
+            source,
         )
     except Exception:  # noqa: BLE001
         logger.exception("[调度] price_refresh 重锚失败（%s）——保留现有排程", reason)
@@ -261,6 +282,14 @@ async def price_auto_enabled() -> bool:
     from app.domains.settings.service import get_value
 
     return bool(await get_value("crawl.auto_price", True))
+
+
+async def content_fetch_enabled(key: str) -> bool:
+    """内容抓取源开关（KV `fetch.*`，默认开）。False = 该源定时任务到点即让路，
+    已有数据保留展示，手动刷新不受影响。设置面在「自动抓取」页。"""
+    from app.domains.settings.service import get_value
+
+    return bool(await get_value(key, True))
 
 
 def _crawler_idle() -> bool:
@@ -586,22 +615,23 @@ async def _job_fx_refresh() -> None:
 
 
 async def _job_fx_history_repair() -> None:
-    """汇率历史修复（每日 04:00）：本地扫描 → Provider timeframe → 写 observed。
+    """汇率历史修复（每日 04:00）：本地扫描 → Provider 拉取 → 写 observed。
 
-    与 03:00 实时刷新彻底分离——修复走 Provider 配额（月度上限），不随
-    每日自动刷新消耗。四重门禁，不满足即静默跳过（不产生失败重试风暴）：
+    与 03:00 实时刷新彻底分离，不随每日自动刷新消耗。单源免 Key
+    （bing.currencyapi），无任何配置即可运行。三重门禁，不满足即静默跳过
+    （不产生失败重试风暴）：
 
-    1. 存在缺口（本地 scan，零网络；无缺口直接返回）；
-    2. 爬虫空闲（历史修复与爬取共享出网预算）；
-    3. 已配置 Provider Key（缺失 = 功能未启用）；
-    4. 账期配额足够（repair 内部逐窗 quota guard 硬拦，剩余 0 绝不触网）。
+    1. 「汇率历史补全」开关开启；
+    2. 存在缺口（本地 scan，零网络；无缺口直接返回）；
+    3. 爬虫空闲（历史修复与爬取共享出网预算）。
 
-    单轮窗口上限（_FX_REPAIR_MAX_WINDOWS）限制单日额度消耗，剩余缺口
-    次轮续跑；失败/额度耗尽的真实原因记日志，等下一轮或下月自然恢复。
+    单轮窗口上限（_FX_REPAIR_MAX_WINDOWS）限制单日出网规模，剩余缺口
+    次轮续跑；失败的真实原因记日志，等下一轮自然恢复。
     """
     from app.domains.rates import history as rates_history
-    from app.domains.rates.providers.exchangerate_host import resolve_api_key
 
+    if not await content_fetch_enabled("fetch.fx_history"):
+        return  # 「汇率历史补全」开关关闭
     try:
         scan = await rates_history.scan_history_gaps()
     except Exception:  # noqa: BLE001
@@ -613,8 +643,6 @@ async def _job_fx_history_repair() -> None:
         logger.info("[定时] 汇率历史修复跳过：爬虫占线（缺口 %d 个窗口待次轮）",
                     len(scan["windows"]))
         return
-    if not resolve_api_key():
-        return  # 未配置 Key：功能未启用，静默
     try:
         result = await rates_history.repair_history_gaps(max_windows=_FX_REPAIR_MAX_WINDOWS)
         if result["status"] == "ok":
@@ -887,6 +915,8 @@ async def _job_proxy_health() -> None:
     Clash 侧真正的节流靠 clash_nodes 账本 last_checked_at 的 6h 门槛
     （跨重启有效——本地软件不常驻）；APScheduler 间隔只是兜底频率。
     """
+    if not await content_fetch_enabled("proxy.health_auto"):
+        return  # 「自动节点体检」开关关闭：定时全测与 Clash 节点检测一并停转
     from app.domains.proxies import service as proxies_service
 
     proxies = await proxies_service.list_proxies(enabled_only=True)
@@ -991,6 +1021,8 @@ def _make_board_job(
         from app.domains.crawl import service as crawl_service
         from app.domains.games import boards as boards_mod
 
+        if not await content_fetch_enabled("fetch.boards"):
+            return  # 「Steam 榜单」开关关闭：发现源停转，落池与反哺一并跳过
         try:
             appids = await boards_mod.refresh_board(board_key)
             if appids:
@@ -1086,6 +1118,8 @@ async def _job_backup() -> None:
     `now + 24h`，所以只跑 8 小时就关机的用法永远等不到它——那一半由
     `_job_backup_catchup` 在启动后补。
     """
+    if not await content_fetch_enabled("backup.auto"):
+        return  # 「每日自动备份」开关关闭：定时与启动补备一并停转，手动备份不受影响
     from app.core import backup as core_backup
 
     try:
@@ -1149,7 +1183,9 @@ async def _job_backup_catchup() -> None:
 async def _job_hb_choice() -> None:
     """当月 HB Choice 游戏侧标记（每日幂等：membership 页 machine_name
     未变即跳过，新月包出现才解析+打标；无登录态拿不到往期页，错过
-    当月即漏，因此按日检查而非按月）。"""
+    当月即漏，因此按日检查而非按月）+ 已标记未取价补首爬。"""
+    if not await content_fetch_enabled("fetch.hb_choice"):
+        return  # 「Humble Choice」开关关闭：当月包核对停转，已有标记保留
     from app.domains.metadata import service as metadata_service
 
     try:
@@ -1173,12 +1209,24 @@ async def _job_hb_choice() -> None:
             logger.exception("[调度] HB 当月包邮件发送失败")
     except Exception:  # noqa: BLE001
         logger.exception("[调度] HB 当月包标记异常（次日自动重试）")
+    # 已标记未取价的 HB 游戏补首爬（标记 ≠ 取价；打标失败不挡补价）。
+    # 撞锁/池未就绪由链式层跳过留日志，次日重试；走爬取通道，auto_price
+    # 关闭时与 comingsoon/free_promo 重试层一并停转。
+    try:
+        if await price_auto_enabled():
+            backfill = await metadata_service.backfill_hb_prices()
+            if backfill.get("pending"):
+                logger.info("[调度] HB 已标记未取价补爬：%s", backfill)
+    except Exception:  # noqa: BLE001
+        logger.exception("[调度] HB 取价补爬异常（不影响标记结果）")
 
 
 async def _job_epic_free() -> None:
     """Epic 喜加一窗口标记（每日幂等：已标记 appid 直接跳过；窗口只含
     当期+预告，历史深度由静态档案/外部名单导入补足，漏跑一日由
     后续轮次自然补齐）。"""
+    if not await content_fetch_enabled("fetch.epic_free"):
+        return  # 「Epic 免费游戏」开关关闭：喜加一标记停转，已有标记保留
     from app.domains.metadata import service as metadata_service
 
     try:
@@ -1210,6 +1258,8 @@ async def _job_epic_free() -> None:
 async def _job_bartervg_bundles() -> None:
     """Barter.vg bundle 计数全量刷新（48h 新鲜度闸内跳过；计数只增，
     差量写入幂等，档案拉取失败保留库内旧值）。"""
+    if not await content_fetch_enabled("fetch.bundle_counts"):
+        return  # 「捆绑包资料」开关关闭：进包计数刷新停转（启动补跑同闸）
     from app.domains.metadata import service as metadata_service
 
     try:
@@ -1338,8 +1388,10 @@ def start_scheduler() -> None:
     scheduler.add_job(_job_wishlist_sync, "interval", minutes=15, id="wishlist_sync")
     # 失败记录修复：5min 一轮，job 内部自判空闲（busy/任务表），占线即静默让路
     scheduler.add_job(_job_price_repair, "interval", minutes=5, id="price_repair")
-    # 池价格爬取：interval 6h 只做兜底（与网格间距同宽——重锚链断裂
-    # 也不脱轨），真实节奏由 _reanchor_price_refresh 手改 next_run_time
+    # 池价格爬取：interval 6h 只做兜底（重锚链断裂也不脱轨；真实步长由
+    # 设置 crawl.price_interval_hours 决定，初锚的 6h 网格点在启动 10s
+    # 纠偏探针处按用户步长重算，注册期同步上下文读不到 KV）
+    # 真实节奏由 _reanchor_price_refresh 手改 next_run_time
     # 主导（job 内 modify 的排程不受触发器覆盖）
     scheduler.add_job(
         _job_price_refresh_with_mails, "interval", hours=6, id="price_refresh",

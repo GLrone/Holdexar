@@ -47,6 +47,11 @@ async def _autostart_clash() -> None:
     """
     try:
         from app.domains.proxies import clash_manager, service as proxies_service
+        from app.domains.settings.service import get_value
+
+        if not await get_value("proxy.autostart", True):
+            logger.info("「内核自启」开关已关闭，跳过 Clash 内核自启")
+            return
 
         settings = get_settings()
         detect = clash_manager.detect_kernel(settings.data_dir)

@@ -59,6 +59,11 @@ const router = createRouter({
       meta: titleKey('nav.crawl'),
     },
     {
+      path: '/fetch',
+      component: () => import('@/views/fetch/Index.vue'),
+      meta: titleKey('nav.fetch'),
+    },
+    {
       path: '/proxies',
       component: () => import('@/views/proxies/Index.vue'),
       meta: titleKey('nav.proxies'),

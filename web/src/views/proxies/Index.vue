@@ -10,7 +10,7 @@ import {
   type ProxyStrategy,
   type ProxySubscriptionItem,
 } from '@/api/client'
-import { HlButton, HlDialog, HlIcon, message } from '@/components/ui'
+import { HlButton, HlDialog, HlIcon, HlSwitch, message } from '@/components/ui'
 import { useI18n, type MessageKey } from '@/locales'
 
 /**
@@ -391,6 +391,26 @@ async function saveClashPort() {
   }
 }
 
+/* ── 自动维护开关（内核自启 / 自动节点体检）──
+   随 GET /proxies 的 strategy 一并下发；undefined（未拉到）按开处理，
+   与后端默认值一致。手动「检测节点」走 force 路径，不受体检开关影响。 */
+const switchesSaving = ref(false)
+
+async function toggleProxySwitch(field: 'autostart' | 'healthAuto', on: boolean) {
+  if (switchesSaving.value) return
+  switchesSaving.value = true
+  const prev = strategy.value[field]
+  strategy.value[field] = on
+  try {
+    strategy.value = await proxiesApi.setStrategy({ [field]: on } as Partial<ProxyStrategy>)
+  } catch {
+    strategy.value[field] = prev
+    message.error(t('proxies.auto.failed'))
+  } finally {
+    switchesSaving.value = false
+  }
+}
+
 async function addSingle() {
   const raw = singleInput.value.trim()
   if (!raw) return
@@ -709,6 +729,26 @@ onMounted(async () => {
               @change="saveClashPort"
             />
           </span>
+        </div>
+
+        <!-- 自动维护开关：内核随服务自启 / 定期节点体检（手动检测不受闸） -->
+        <div class="proxyx-clash-row proxyx-clash-switches">
+          <HlSwitch
+            :model-value="strategy.autostart !== false"
+            accent
+            :disabled="switchesSaving"
+            :label="t('proxies.auto.autostartLabel')"
+            :title="t('proxies.auto.autostartHint')"
+            @update:model-value="(on: boolean) => toggleProxySwitch('autostart', on)"
+          />
+          <HlSwitch
+            :model-value="strategy.healthAuto !== false"
+            accent
+            :disabled="switchesSaving"
+            :label="t('proxies.auto.healthLabel')"
+            :title="t('proxies.auto.healthHint')"
+            @update:model-value="(on: boolean) => toggleProxySwitch('healthAuto', on)"
+          />
         </div>
 
         <div class="proxyx-clash-row">
@@ -1227,6 +1267,12 @@ onMounted(async () => {
   margin-left: auto;
   font-size: 12px;
   color: var(--text-muted);
+}
+
+/* 自动维护开关行（内核自启 / 定期体检）：两枚开关横向排布 */
+.proxyx-clash-switches {
+  margin-top: 10px;
+  gap: 22px;
 }
 
 /* .pxinput 自带 min-width:220/flex:1（表单全宽输入基准，文件更靠后、同 specificity 层叠必胜）

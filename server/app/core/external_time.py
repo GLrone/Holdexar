@@ -37,16 +37,17 @@ def anchor_hour(is_dst: bool) -> int:
     return 1 if is_dst else 2
 
 
-def next_grid_time(now: datetime, anchor: int) -> datetime:
-    """锚点 + 6h 步进网格中严格晚于 now 的下一时刻（now 须为北京 aware）。
+def next_grid_time(now: datetime, anchor: int, step: timedelta = GRID_STEP) -> datetime:
+    """锚点 + step 步进网格中严格晚于 now 的下一时刻（now 须为北京 aware）。
 
+    步长默认 6h；用户在「自动抓取」页可调（调度器读设置后传入）。
     DST 切换日锚点 1↔2 漂移时网格整体重算：切换前的最后一格与
-    切换后新网格的首格间隔不再是精确 6h（秋季 1h/春季 5h，每年各一次），
-    之后恢复 6h 步进。
+    切换后新网格的首格间隔不再是精确 step（秋季偏短/春季偏长，每年各一次），
+    之后恢复常规步进。
     """
     base = now.replace(hour=anchor, minute=0, second=0, microsecond=0)
     while base <= now:
-        base += GRID_STEP
+        base += step
     return base
 
 
@@ -121,17 +122,21 @@ async def fetch_pacific_dst() -> tuple[bool, str]:
     return is_dst, "zoneinfo"
 
 
-async def probe_next_grid() -> tuple[datetime, int, bool, str]:
+async def probe_next_grid(
+    step: timedelta = GRID_STEP,
+) -> tuple[datetime, int, bool, str]:
     """外部时间判 DST → 锚点 → 下一网格时刻。调度器自续约的单一入口。
 
     返回 (下一网格时刻[北京 aware], 锚点小时, 是否夏令时, 判定来源)。
     """
     is_dst, source = await fetch_pacific_dst()
     hour = anchor_hour(is_dst)
-    return next_grid_time(datetime.now(BEIJING_TZ), hour), hour, is_dst, source
+    return next_grid_time(datetime.now(BEIJING_TZ), hour, step), hour, is_dst, source
 
 
-def local_next_grid() -> tuple[datetime, int, bool, str]:
+def local_next_grid(
+    step: timedelta = GRID_STEP,
+) -> tuple[datetime, int, bool, str]:
     """启动初锚（同步零网络）：本地 zoneinfo 判 DST → 下一网格时刻。
 
     start_scheduler 同步上下文无法 await 外部请求，先用本地推算立即
@@ -140,4 +145,9 @@ def local_next_grid() -> tuple[datetime, int, bool, str]:
     """
     is_dst = datetime.now(PACIFIC_TZ).dst() != timedelta(0)
     hour = anchor_hour(is_dst)
-    return next_grid_time(datetime.now(BEIJING_TZ), hour), hour, is_dst, "zoneinfo(启动初锚)"
+    return (
+        next_grid_time(datetime.now(BEIJING_TZ), hour, step),
+        hour,
+        is_dst,
+        "zoneinfo(启动初锚)",
+    )
