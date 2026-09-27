@@ -138,7 +138,7 @@ async def probe_node(
     headers = {"Authorization": f"Bearer {secret}"} if secret else {}
     path = quote(runtime_name, safe="")  # `#` 不编码会被当成 fragment 截断整个 path
     try:
-        async with httpx.AsyncClient(timeout=client_timeout, headers=headers) as client:
+        async with httpx.AsyncClient(trust_env=False, timeout=client_timeout, headers=headers) as client:
             resp = await client.get(
                 f"{controller_url}/proxies/{path}/delay",
                 params={"url": url, "timeout": timeout_ms},
@@ -246,6 +246,38 @@ async def _probe_and_record(
         previous_state=previous,
         state=target,
     )
+
+
+async def latest_l0_delays(session: AsyncSession) -> dict[str, int]:
+    """每个节点最近一次**成功** L0 探测的延迟（node_id → ms）。
+
+    出口槽排序的延迟事实源：缺条目 = 没测过或没成功过（排序按未测处理，
+    不凭空造默认值）。只取 ok=True 的观测——失败观测的 latency_ms 是空的
+    或是目标服务耗时，不构成「这个节点多快」的证据。
+    """
+    latest = (
+        select(
+            HealthObservation.node_id.label("node_id"),
+            func.max(HealthObservation.observed_at).label("mx"),
+        )
+        .where(HealthObservation.level == PROBE_LEVEL, HealthObservation.ok.is_(True))
+        .group_by(HealthObservation.node_id)
+        .subquery()
+    )
+    rows = await session.execute(
+        select(HealthObservation.node_id, HealthObservation.latency_ms)
+        .join(
+            latest,
+            (latest.c.node_id == HealthObservation.node_id)
+            & (latest.c.mx == HealthObservation.observed_at),
+        )
+        .where(HealthObservation.level == PROBE_LEVEL, HealthObservation.ok.is_(True))
+    )
+    return {
+        node_id: int(ms)
+        for node_id, ms in rows.all()
+        if isinstance(ms, int) and ms > 0
+    }
 
 
 async def health_check_pool(
@@ -414,7 +446,7 @@ async def _select_global(controller_url: str, secret: str, runtime_name: str,
     L1 与 L2 共用这一步：切换是唯一的全局状态，两处逻辑必须一致。
     """
     headers = {"Authorization": f"Bearer {secret}"} if secret else {}
-    async with httpx.AsyncClient(timeout=timeout, headers=headers) as control:
+    async with httpx.AsyncClient(trust_env=False, timeout=timeout, headers=headers) as control:
         try:
             put = await control.put(
                 f"{controller_url}/proxies/GLOBAL", json={"name": runtime_name}
@@ -452,7 +484,7 @@ async def probe_exit_ip(
 
     started = time.monotonic()
     try:
-        async with httpx.AsyncClient(
+        async with httpx.AsyncClient(trust_env=False, 
             proxy=f"http://127.0.0.1:{mixed_port}", timeout=timeout
         ) as proxied:
             resp = await proxied.get(url)
@@ -623,7 +655,7 @@ async def probe_business(
 
     started = time.monotonic()
     try:
-        async with httpx.AsyncClient(
+        async with httpx.AsyncClient(trust_env=False, 
             proxy=f"http://127.0.0.1:{mixed_port}", timeout=timeout
         ) as proxied:
             resp = await proxied.get(target)

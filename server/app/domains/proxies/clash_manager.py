@@ -11,11 +11,13 @@
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import logging
 import re
 import shutil
+import socket
 import subprocess
 import urllib.parse
 import zipfile
@@ -23,6 +25,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import httpx
+import yaml
 
 from app.core.app_info import APP_SLUG
 from app.core.config import get_settings
@@ -314,23 +317,24 @@ def local_mixed_channels(exclude_port: int | None = None) -> list[str]:
 def _download_attempts(
     runtime_port: int | None = None, proxy_url: str | list[str] | None = None
 ) -> list[tuple[str | None, str]]:
-    """下载通道链：直连 → 本内核代理 → 项目保存的可用代理 → 本地常见混合端口。
+    """下载通道链：本内核代理 → 项目保存的可用代理 → 本地常见混合端口 → 直连。
 
     订阅/内核下载全是"鸡生蛋"场景：首次添加订阅时本内核必然没跑
-    （无 config.yaml 起不来），面板域名又多被墙——直连是唯一通道时
-    必挂。
+    （无 config.yaml 起不来），面板域名又多被墙——此时直连是唯一通道，
+    排序自然退化为「只有直连」。
 
-    **直连永远是第一条**：订阅面板绝大多数时候直连就能拿到，先走代理
-    等于把一次稳定的本地往返换成一次听天由命的外网往返。代理只在直连
-    失败后才登场，且**项目自己保存的可用代理（内核端口/代理池）排在外
-    部混合端口之前**——自己管理、自己体检过的出口优先于借道用户自启的
-    Verge（后者只探端口在听，出口是否可用无人担保）。
+    **代理通道排在前、直连垫底**：订阅面板域名绝大多数时候直连不通，
+    直连打头意味着每次刷新都先等满一次超时；经自己管理的出口（内核 /
+    体检过的已保存代理）取订阅与 Clash Verge Rev 的「经当前代理更新」
+    同向。已保存代理排在本机混合端口之前——自己管理、自己体检过的
+    出口优先于借道用户自启的 Verge（后者只探端口在听，出口是否可用
+    无人担保）。
 
     `proxy_url` 可传单个 URL，也可传 URL 列表（逐个作为后续通道）。
     传列表是给「项目保存的可用代理」用的：池里挑一条也可能它自己正
     失效，一次只试一条等于把「借道」变成掷骰子。
     """
-    attempts: list[tuple[str | None, str]] = [(None, "直连")]
+    attempts: list[tuple[str | None, str]] = []
     if runtime_port:
         attempts.append((f"http://127.0.0.1:{runtime_port}", "经内核代理"))
     saved = [proxy_url] if isinstance(proxy_url, str) else list(proxy_url or [])
@@ -342,6 +346,10 @@ def _download_attempts(
             continue
         if _port_reachable(port):
             attempts.append((f"http://127.0.0.1:{port}", f"本地混合端口 {port}"))
+    # 直连放最后：订阅面板域名多数被墙，直连通常要等满超时才轮到下一条通道，
+    # 排在最前会让每次刷新都白等（与 Clash Verge Rev「经当前代理更新订阅」同向）。
+    # 内核没跑（首次添加订阅）时前几条通道自然缺席，直连即唯一通道。
+    attempts.append((None, "直连"))
     return attempts
 
 
@@ -414,7 +422,7 @@ def _download_zip_kernel(
     total = None
     with httpx.stream(
         "GET", url, timeout=httpx.Timeout(120, connect=10),
-        follow_redirects=True,
+        follow_redirects=True, trust_env=False,
         proxy=proxy if proxy else None,
     ) as resp:
         resp.raise_for_status()
@@ -487,7 +495,7 @@ def download_kernel_linux(data_dir: Path) -> dict:
         for mirror in _MIRRORS:
             url = mirror + base if mirror else base
             try:
-                resp = httpx.get(url, timeout=120, follow_redirects=True)
+                resp = httpx.get(url, timeout=120, follow_redirects=True, trust_env=False)
                 resp.raise_for_status()
                 target.write_bytes(gzip.decompress(resp.content))
                 target.chmod(0o755)
@@ -526,40 +534,227 @@ CONTROLLER_PORT = 19090
 CONTROLLER_SECRET = APP_SLUG
 
 
-def ensure_controller(config_text: str) -> tuple[str, str, str]:
-    """确保订阅 yaml 开启 external-controller（RESTful API），返回 (text, base_url, secret)。
+def resolve_controller(config_text: str) -> tuple[str, str]:
+    """解析本次启动的控制器端点，返回 (base_url, secret)。
 
-    已有配置则沿用（解析 host:port 与 secret）；没有则注入本地默认值。
+    控制器只经内核命令行参数（-ext-ctl / -secret）下发——配置文件里的
+    external-controller / secret 行一律不信任也不改写：订阅 yaml 自带的
+    控制器行可能指向已被占用的端口，沿用会让所有控制通信打到占用者的
+    内核上（PUT /configs 会把配置灌进运行中的其他内核进程，必须写自有内核的端点）。
+    端口被占时从 CONTROLLER_PORT 起避让扫描（内核对「绑定失败但继续跑」
+    的行为只打日志不退出，必须启动前保证端口空闲）。
     """
     match = re.search(r"^external-controller\s*:\s*['\"]?([^'\"\n#]+)", config_text, re.MULTILINE)
     secret_match = re.search(r"^secret\s*:\s*['\"]?([^'\"\n#]+)", config_text, re.MULTILINE)
+    secret = secret_match.group(1).strip() if secret_match else CONTROLLER_SECRET
+    port: int | None = None
     if match:
         addr = match.group(1).strip()
-        if not addr.startswith("127.0.0.1") and not addr.startswith("0.0.0.0"):
-            # 控制器不在本机的情况少见；统一按 host:port 拼 URL
-            pass
-        secret = secret_match.group(1).strip() if secret_match else ""
-        return config_text, f"http://{addr}", secret
+        m = re.search(r":(\d+)\s*$", addr)
+        if m:
+            candidate = int(m.group(1))
+            if candidate > 0 and _port_free(candidate):
+                port = candidate
+    if port is None:
+        port = CONTROLLER_PORT
+        while not _port_free(port):
+            port += 1
+    return f"http://127.0.0.1:{port}", secret
 
-    injection = (
-        f"\nexternal-controller: 127.0.0.1:{CONTROLLER_PORT}\n"
-        f"secret: {CONTROLLER_SECRET}\n"
-    )
-    return config_text.rstrip() + "\n" + injection, f"http://127.0.0.1:{CONTROLLER_PORT}", CONTROLLER_SECRET
+
+CONFIG_TEST_TIMEOUT = 15.0
+
+
+def validate_config(exe_path: str, config_path: str, work_dir: Path) -> None:
+    """启动前用内核 `-t` 校验配置（不启动进程），不合法抛 ValueError。
+
+    -d 必须给 geo 数据已就位的真实内核目录：`-t` 遇到 GEOIP 规则而目录里
+    没有 MMDB 时会现场联网下载并长时间阻塞（20s 量级不返回），独立临时目录不可用。
+    校验通过（退出码 0）正常放行；被拒（退出码非 0）抛出内核的 error 行；
+    校验超时视为不可校验（geo 缺失触发下载的场景），放行启动由内核自行处理。
+    """
+    try:
+        result = subprocess.run(
+            [exe_path, "-t", "-f", config_path, "-d", str(work_dir)],
+            capture_output=True, timeout=CONFIG_TEST_TIMEOUT,
+            encoding="utf-8", errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("内核配置校验超时（geo 下载可能在进行），放行启动")
+        return
+    if result.returncode == 0:
+        return
+    lines = [
+        line.split("level=error", 1)[1].strip()
+        for line in ((result.stdout or "") + (result.stderr or "")).splitlines()
+        if "level=error" in line
+    ]
+    detail = "；".join(lines[:5]) or f"退出码 {result.returncode}"
+    raise ValueError(f"内核拒绝配置（-t 校验未通过）：{detail}")
 
 
 def config_unchanged(startup_text: str | None, disk_text: str) -> bool:
     """内核启动文本与磁盘配置是否等价（重启开关的判据）。
 
-    config.yaml 是「下载到的原始订阅文本 + 启动时注入的 external-controller」，
-    而重拉下载写回磁盘的是**原始文本**（没有注入段）——直接字符串比较会把
-    「机场内容其实没变」判成变了，每次重拉都白重启一次内核（在跑的连接全断）。
-    这里先补注入再比，语义回到「内容真的变了才重启」。
+    比较对象是**订阅内容视图**（`_subscription_view`）：双方都剥掉探测 lane
+    （端口分配随本机占用态变化，不属于订阅内容）再比 yaml 结构。语义是
+    「订阅内容真的变了才重启」，格式变化与端口漂移都不触发重启。
     """
     if startup_text == disk_text:
         return True
-    normalized, _url, _secret = ensure_controller(disk_text)
-    return startup_text == normalized
+    a = _subscription_view(startup_text or "")
+    b = _subscription_view(disk_text)
+    if a is None or b is None:
+        return False
+    return a == b
+
+
+def _subscription_view(config_text: str) -> dict | None:
+    """配置的订阅内容视图：剥掉探测 lane 后的 yaml 结构（等价比较用）。"""
+    try:
+        doc = yaml.safe_load(config_text)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(doc, dict):
+        return None
+    view = dict(doc)
+    for key in ("proxy-groups", "listeners"):
+        entries = view.get(key)
+        if isinstance(entries, list):
+            kept = [
+                e for e in entries
+                if not (isinstance(e, dict) and str(e.get("name", "")).startswith(PROBE_LANE_PREFIX))
+            ]
+            if kept:
+                view[key] = kept
+            else:
+                view.pop(key, None)  # 剥空的键与「本就没有」等价
+    return view
+
+
+# ─── 探测 lane（节点检测的并行通道）────────────────────────────
+# 与池内核的 lane 同一形态：一个 select 组 + 一个 mixed listener，listener 的
+# `proxy` 指向本组。组选择是组内状态、互不干扰，探测经 listener 直达所选节点
+# （绕过规则引擎与 GLOBAL）——节点检测因此无需切 selector、无需切 mode，可
+# PROBE_LANE_COUNT 路并发。组用 include-all：成员随内核当前节点集自动变化，
+# 注入内容与订阅内容无关，配置比较时剥掉即可。
+PROBE_LANE_PREFIX = "HlProbeLane"
+PROBE_LANE_COUNT = 20
+# 端口从固定基址起确定性分配：同占用态 → 同端口。避开默认混合口/控制器段与
+# Windows 临时端口段（49152+，池内核 listener 落在那里）。
+PROBE_LANE_PORT_BASE = 20000
+PROBE_LANE_PORT_SPAN = 1000
+
+
+def _port_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def _port_listening(port: int) -> bool:
+    """端口有进程在听（connect 探测）——热重载后校验 lane listener 存活用。"""
+    with socket.socket() as sock:
+        sock.settimeout(0.3)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _alloc_probe_ports(count: int, *, avoid: set[int]) -> list[int]:
+    """确定性扫空闲端口；凑不满 count 就给多少用多少（空列表 = 不注入）。"""
+    ports: list[int] = []
+    candidate = PROBE_LANE_PORT_BASE
+    ceiling = PROBE_LANE_PORT_BASE + PROBE_LANE_PORT_SPAN
+    while len(ports) < count and candidate < ceiling:
+        if candidate not in avoid and _port_free(candidate):
+            ports.append(candidate)
+        candidate += 1
+    return ports
+
+
+def inject_probe_lanes(config_text: str) -> str:
+    """把探测 lane 注入内核配置（幂等）：剔除本前缀旧条目后追加
+    PROBE_LANE_COUNT 组 `select`(include-all) + 同数 mixed listener。
+    端口避让本配置自己的混合口与控制器口。不可解析的配置原样返回；
+    一个端口都分不到时不动配置（检测退回串行路径）。"""
+    try:
+        doc = yaml.safe_load(config_text)
+    except yaml.YAMLError:
+        return config_text
+    if not isinstance(doc, dict):
+        return config_text
+    avoid: set[int] = set()
+    mixed = doc.get("mixed-port")
+    if isinstance(mixed, int):
+        avoid.add(mixed)
+    controller = str(doc.get("external-controller") or "")
+    m = re.search(r":(\d+)\s*$", controller)
+    if m:
+        avoid.add(int(m.group(1)))
+    ports = _alloc_probe_ports(PROBE_LANE_COUNT, avoid=avoid)
+    if not ports:
+        return config_text
+    groups = [
+        g for g in (doc.get("proxy-groups") or [])
+        if not (isinstance(g, dict) and str(g.get("name", "")).startswith(PROBE_LANE_PREFIX))
+    ]
+    listeners = [
+        l for l in (doc.get("listeners") or [])
+        if not (isinstance(l, dict) and str(l.get("name", "")).startswith(PROBE_LANE_PREFIX))
+    ]
+    for i, port in enumerate(ports, start=1):
+        group_name = f"{PROBE_LANE_PREFIX}-{i}"
+        groups.append({"name": group_name, "type": "select", "include-all": True})
+        listeners.append({
+            "name": f"{group_name}-in",
+            "type": "mixed",
+            "port": port,
+            "listen": "127.0.0.1",
+            "proxy": group_name,
+        })
+    doc["proxy-groups"] = groups
+    doc["listeners"] = listeners
+    return yaml.safe_dump(doc, allow_unicode=True, sort_keys=False)
+
+
+def subscription_config_path(data_dir: Path, sub_id: int) -> Path:
+    """每条订阅各存一份配置缓存（data/clash/clash-sub-{id}.yaml）。
+
+    切换订阅因此只是「本地缓存文件热重载」，不再现场下载——下载只属于
+    重拉/首次使用。共享单缓存文件会被任何一次下载覆写，是「切换卡住」
+    与「配置互相覆盖」的根源。
+    """
+    return kernel_dir(data_dir) / f"clash-sub-{sub_id}.yaml"
+
+
+def parse_probe_lanes(config_text: str) -> list[tuple[str, int]]:
+    """从内核配置读出探测 lane（组名, listener 端口），按注入序返回。"""
+    try:
+        doc = yaml.safe_load(config_text)
+    except yaml.YAMLError:
+        return []
+    if not isinstance(doc, dict):
+        return []
+    listeners = doc.get("listeners")
+    if not isinstance(listeners, list):
+        return []
+    lanes: list[tuple[str, int]] = []
+    for entry in listeners:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name", ""))
+        proxy = str(entry.get("proxy", ""))
+        port = entry.get("port")
+        if (
+            name.startswith(PROBE_LANE_PREFIX)
+            and proxy.startswith(PROBE_LANE_PREFIX)
+            and isinstance(port, int)
+        ):
+            lanes.append((proxy, port))
+    lanes.sort(key=lambda lane: lane[0])
+    return lanes
 
 
 # 非真实节点（控制器逻辑节点/内置）
@@ -595,6 +790,14 @@ def parse_node_names(config_text: str) -> list[str]:
     return names
 
 
+class _ReloadRejected(ValueError):
+    """内核明确拒载新配置（HTTP 4xx）或新配置本身不合法。
+
+    与「热重载通路故障」不同档：配置被拒时内核还好好跑着旧配置，
+    正确动作是回滚磁盘、保留运行实例、把原因报给用户——回退重启只会
+    让内核载着同一份坏配置起不来。"""
+
+
 class ClashRuntime:
     """本地内核进程的启动 / 停止 / 状态。进程内单例。"""
 
@@ -604,6 +807,13 @@ class ClashRuntime:
         self.config_path: str | None = None
         self.controller_url: str | None = None
         self.secret: str = ""
+        # 本次启动归属的订阅 URL——「内核在跑哪条订阅」的事实源。配置文本里
+        # 不含订阅 URL（机场 yaml 是纯配置），靠文本匹配永远认不出来。
+        self.subscription_url: str | None = None
+        # 本次启动实际注入并生效的探测 lane（组名, 端口）——检测通道的事实源。
+        # 不从磁盘配置读：订阅下载会在启动后把 config.yaml 覆写回原始文本
+        # （内核在内存里照常跑着注入后的配置），磁盘内容不可信。
+        self.probe_lanes: list[tuple[str, int]] = []
         self._startup_text: str | None = None  # 启动时的配置文本（重启判定用）
 
     def status(self) -> dict:
@@ -613,6 +823,7 @@ class ClashRuntime:
             "port": self.port,
             "configPath": self.config_path,
             "controllerUrl": self.controller_url if running else None,
+            "subscriptionUrl": self.subscription_url if running else None,
         }
 
     def _kill_orphans(self, exe_path: str, config_path: str) -> int:
@@ -647,57 +858,205 @@ class ClashRuntime:
             logger.info("已清理 %d 个残留 Clash 内核进程", killed)
         return killed
 
-    def start(self, exe_path: str, config_path: str, *, restart_if_changed: bool = False) -> dict:
+    def start(
+        self, exe_path: str, config_path: str, *,
+        restart_if_changed: bool = False,
+        inject_lanes: bool = True,
+        subscription_url: str | None = None,
+    ) -> dict:
         """启动内核。restart_if_changed：已在跑但配置文件内容较启动时
-        有变化 → 重启生效（免重启刷新订阅节点用）；内容没变沿用实例。"""
+        有变化 → 重启生效（免重启刷新订阅节点用）；内容没变沿用实例。
+        inject_lanes：注入探测 lane（节点检测的 20 并发通道）；池内核有
+        自己的 lane 体系，传 False 保持其运行配置与对账口径纯净。
+        subscription_url：本次启动归属的订阅（「在跑哪条」的事实源，
+        检测归属与订阅重拉的重启开关都认它）。"""
         if self.status()["running"]:
             if not restart_if_changed:
-                return self.status()
-            disk_text = Path(config_path).read_text(encoding="utf-8", errors="ignore")
-            if self.config_path == config_path and config_unchanged(
-                self._startup_text, disk_text
-            ):
-                return self.status()
-            self.stop()
+                # 已在跑：同订阅（或调用方未带归属）幂等返回；带了**不同**的
+                # 订阅 URL = 用户要求切换订阅 → 停掉当前实例，走下方完整启动
+                target = (subscription_url or "").strip()
+                if not target or self.subscription_url == target:
+                    return self.status()
+                logger.info(
+                    "切换订阅：当前跑 %s，按 %s 重启内核",
+                    self.subscription_url, target,
+                )
+                self.stop()
+            else:
+                disk_text = Path(config_path).read_text(encoding="utf-8", errors="ignore")
+                if self.config_path == config_path and config_unchanged(
+                    self._startup_text, disk_text
+                ):
+                    return self.status()
+                self.stop()
         try:
             self._kill_orphans(exe_path, config_path)
         except Exception as e:  # noqa: BLE001 —— 清理失败不阻断启动（psutil 缺失等）
             logger.warning("残留内核清理跳过：%s", e)
         try:
             ensure_kernel_files(Path(config_path).parent)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001 —— 清理失败不阻断启动（psutil 缺失等）
             logger.warning("随包内核资产补齐失败：%s", e)
         config_text = Path(config_path).read_text(encoding="utf-8", errors="ignore")
+        validate_config(exe_path, config_path, Path(config_path).parent)
         self.port = parse_mixed_port(config_text)
-        # 注入/解析 external-controller，供节点检测（出口 IP / 存活）使用
-        text, controller_url, secret = ensure_controller(config_text)
-        if text != config_text:
-            Path(config_path).write_text(text, encoding="utf-8")
-        self.controller_url = controller_url
-        self.secret = secret
+        # 控制器经命令行参数下发（-ext-ctl / -secret）：优先级高于配置文件，
+        # 配置里订阅自带的控制器行不再构成劫持面，文件本身保持订阅原样
+        self.controller_url, self.secret = resolve_controller(config_text)
+        controller_addr = self.controller_url.split("://", 1)[-1]
+        self.probe_lanes = []
+        text = config_text
+        if inject_lanes:
+            text = inject_probe_lanes(config_text)
+            self.probe_lanes = parse_probe_lanes(text)
+            if text != config_text:
+                Path(config_path).write_text(text, encoding="utf-8")
         self.config_path = config_path
-        self._startup_text = text  # 注入 controller 后的最终文本（与磁盘一致）
+        self.subscription_url = (subscription_url or "").strip() or None
+        self._startup_text = text if inject_lanes else config_text
+        # stdout/stderr 追加到内核目录的 kernel.log：内核对控制器绑定失败等
+        # 异常只打日志不退出，没有这份日志这些失败完全不可见
+        log_path = Path(config_path).parent / "kernel.log"
+        log_file = open(log_path, "ab")  # noqa: SIM115 —— 句柄随子进程存活，父进程不持有
         self.process = subprocess.Popen(
-            [exe_path, "-f", config_path, "-d", str(Path(config_path).parent)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            [exe_path, "-f", config_path, "-d", str(Path(config_path).parent),
+             "-ext-ctl", controller_addr, "-secret", self.secret],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
         )
-        logger.info("Clash 内核已启动 pid=%s port=%d controller=%s", self.process.pid, self.port, controller_url)
+        log_file.close()
+        logger.info(
+            "Clash 内核已启动 pid=%s port=%d controller=%s",
+            self.process.pid, self.port, self.controller_url,
+        )
         return self.status()
 
     def running_subscription_is(self, sub_url: str) -> bool:
-        """内核当前运行的配置是否来自该订阅 URL。
+        """内核当前跑的是否该订阅（按启动时记录的订阅 URL 判定）。
 
-        订阅刷新的重启开关用：config.yaml 是共用缓存，重下后文件内容
-        已变——只有「内核启动文本里含该 URL」才是真正在跑这条订阅，
-        此时重启才不会把内核悄悄切到另一条订阅上。
+        订阅刷新的重启开关用：config.yaml 是共用缓存、会被后续任何一次下载
+        覆盖，文件本身不是依据——「在跑哪条」的事实源是启动时登记的
+        subscription_url，此时重启才不会把内核悄悄切到另一条订阅上。
         """
+        target = (sub_url or "").strip()
         return bool(
             self.status()["running"]
-            and self._startup_text
-            and (sub_url or "").strip()
-            and (sub_url or "").strip() in self._startup_text
+            and self.subscription_url
+            and target
+            and self.subscription_url == target
         )
+
+    def note_pool_config_reloaded(self, config_path: str) -> None:
+        """池配置热重载后的**账目同步**：进程没动，但本实例记账的启动配置
+        / 文本 / mixed-port 已随新配置变化。由池重建编排层在热通道成功后
+        调用；controller/secret 不用更新（热重载沿用现役端点，两者不变）。"""
+        text = Path(config_path).read_text(encoding="utf-8", errors="ignore")
+        self.config_path = config_path
+        self._startup_text = text
+        self.port = parse_mixed_port(text)
+
+    def _running_kernel_text(self, config_path: str) -> tuple[str, str]:
+        """给**运行中**内核热重载用的配置文本：做合法性预检（YAML 可解析
+        + 有节点段），不合法抛 _ReloadRejected——坏配置不该走到内核面前。
+        返回 (注入 lane 后文本, 写盘前的文件原内容)：拒载回滚恢复的是**这个
+        文件自己**被覆盖前的内容——每订阅各存一份缓存后，目标文件与运行中
+        订阅经常不是同一条，用运行文本回滚会把别的订阅内容写进这份缓存。
+        控制器不需写入文本：端点由启动时的命令行参数固定，热重载不会把它
+        搬回配置文件里的值（PUT /configs 之后控制器仍保持在命令行端点）。"""
+        prev_file_text = ""
+        if Path(config_path).is_file():
+            prev_file_text = Path(config_path).read_text(encoding="utf-8", errors="ignore")
+        text = prev_file_text
+        try:
+            doc = yaml.safe_load(text)
+        except yaml.YAMLError as e:
+            raise _ReloadRejected(f"新配置不是合法 YAML：{e}") from None
+        if not isinstance(doc, dict) or not (doc.get("proxies") or doc.get("proxy-providers")):
+            raise _ReloadRejected("新配置没有 proxies / proxy-providers 段")
+        text = inject_probe_lanes(text)
+        Path(config_path).write_text(text, encoding="utf-8")
+        return text, prev_file_text
+
+    async def _verify_reloaded(self, injected_text: str) -> None:
+        """热重载生效性校验：控制器活着 + 新配置的节点真的出现在内核里 +
+        探测 lane 端口在听。任一不满足抛异常，调用方回退进程重启。"""
+        headers = {"Authorization": f"Bearer {self.secret}"} if self.secret else {}
+        async with httpx.AsyncClient(timeout=8, headers=headers, trust_env=False) as client:
+            version = await client.get(f"{self.controller_url}/version")
+            if version.status_code != 200:
+                raise RuntimeError(f"重载后控制器不可用（HTTP {version.status_code}）")
+            resp = await client.get(f"{self.controller_url}/proxies")
+            resp.raise_for_status()
+            observed = set((resp.json() or {}).get("proxies", {}).keys())
+        expected = parse_node_names(injected_text)
+        missing = [n for n in expected if n not in observed]
+        if expected and missing:
+            raise RuntimeError(f"重载后内核缺 {len(missing)} 个新配置节点（如 {missing[0]!r}）")
+        lanes = parse_probe_lanes(injected_text)
+        if lanes and not any(_port_listening(port) for _g, port in lanes):
+            raise RuntimeError("重载后探测 lane 端口无一在听")
+
+    async def ensure_running(
+        self, exe_path: str, config_path: str, *, subscription_url: str | None = None,
+    ) -> dict:
+        """确保内核跑着指定订阅的配置：没跑就启动；在跑时**热重载**生效
+        （切换订阅 / 同订阅内容更新都走控制器 PUT /configs，内核进程不动——
+        与 Clash Verge Rev 的换配置路径同款）；控制器不可达或重载校验不通过
+        才回退进程重启。返回 status + {started, reloaded} 两个标记。"""
+        sub_url = (subscription_url or "").strip() or None
+        if not self.status()["running"]:
+            status = self.start(exe_path, config_path, subscription_url=sub_url)
+            return {**status, "started": True, "reloaded": False}
+
+        same_sub = bool(sub_url and self.subscription_url == sub_url)
+        if same_sub and self.config_path == config_path and config_unchanged(
+            self._startup_text,
+            Path(config_path).read_text(encoding="utf-8", errors="ignore"),
+        ):
+            # 同订阅且订阅内容没变：不重载（幂等）
+            return {**self.status(), "started": False, "reloaded": False}
+
+        prev_file_text = ""
+        wrote = False
+        try:
+            injected, prev_file_text = self._running_kernel_text(config_path)
+            wrote = True
+            headers = {"Authorization": f"Bearer {self.secret}"} if self.secret else {}
+            async with httpx.AsyncClient(timeout=15, headers=headers, trust_env=False) as client:
+                put = await client.put(
+                    f"{self.controller_url}/configs?force=true",
+                    json={"path": config_path},
+                )
+                if put.status_code >= 300:
+                    raise _ReloadRejected(f"内核拒绝新配置（HTTP {put.status_code}）")
+            await self._verify_reloaded(injected)
+        except _ReloadRejected as e:
+            # 内核明确拒载 / 配置本身不合法：把目标文件回滚到本进程写入前的
+            # 内容，内核继续跑旧配置——回退重启只会载着同一份坏配置起不来。
+            # 预检阶段（写盘前）被拒时文件本来就没动，无需回滚。
+            if wrote:
+                if prev_file_text:
+                    Path(config_path).write_text(prev_file_text, encoding="utf-8")
+                else:
+                    Path(config_path).unlink(missing_ok=True)  # 本次新建的缓存，删掉
+            logger.warning("热重载被拒，已保留当前运行配置：%s", e)
+            raise ValueError(str(e)) from None
+        except Exception as e:  # noqa: BLE001 —— 通路故障才回退进程重启
+            logger.warning("配置热重载失败（%s：%s），回退内核重启", type(e).__name__, e)
+            self.stop()
+            status = self.start(exe_path, config_path, subscription_url=sub_url)
+            return {**status, "started": True, "reloaded": False}
+
+        self.config_path = config_path
+        self._startup_text = injected
+        self.port = parse_mixed_port(injected)
+        self.probe_lanes = parse_probe_lanes(injected)
+        self.subscription_url = sub_url or self.subscription_url
+        logger.info(
+            "内核配置已热重载：subscription=%s port=%d（进程未重启）",
+            self.subscription_url, self.port,
+        )
+        return {**self.status(), "started": False, "reloaded": True}
 
     def stop(self) -> dict:
         if self.process is not None and self.process.poll() is None:
@@ -709,6 +1068,8 @@ class ClashRuntime:
             logger.info("Clash 内核已停止")
         self.process = None
         self.controller_url = None
+        self.subscription_url = None
+        self.probe_lanes = []
         self._startup_text = None
         return self.status()
 
@@ -733,7 +1094,7 @@ class ClashRuntime:
             try:
                 async with httpx.AsyncClient(
                     timeout=20, proxy=attempt_proxy, follow_redirects=True,
-                    headers=_SUB_HEADERS,
+                    headers=_SUB_HEADERS, trust_env=False,
                 ) as client:
                     resp = await client.get(sub_url)
                     resp.raise_for_status()
@@ -742,48 +1103,80 @@ class ClashRuntime:
                 logger.warning("订阅头拉取失败（%s）：%s", label, e)
         return None
 
-    async def download_subscription(self, sub_url: str, data_dir: Path, proxy_url: str | list[str] | None = None) -> dict:
-        """下载用户订阅 yaml 到 data/clash/config.yaml。
+    async def download_subscription(
+        self, sub_url: str, data_dir: Path, proxy_url: str | list[str] | None = None,
+        *, target_path: Path | None = None,
+    ) -> dict:
+        """下载用户订阅 yaml 到缓存文件（缺省 data/clash/config.yaml；每条
+        订阅各存一份时由调用方传 `target_path`，切换订阅因此只是本地文件
+        热重载，不再现场下载）。
 
-        通道链（_download_attempts）：**直连优先**，失败后依次经本内核代理、
-        本地混合端口、以及调用方传入的已保存可用代理（可多条）。订阅面板
-        域名多数被墙，直连成功纯属侥幸——但侥幸仍是第一选择，代理是兜底
-        而不是默认路径。
-        全部失败回退上次成功下载的本地缓存。
+        通道（_download_attempts）：经内核代理 → 已保存代理 → 本地混合端口
+        → 直连，**各通道并发竞速**——第一个拿到有效配置的通道获胜、其余
+        取消。顺序逐个试会让被墙通道的超时串行累加（一次刷新卡几分钟）。
+        全部通道失败回退上次成功下载的本地缓存。
         返回 {path, title, userinfo, nodes, cached}；title 取自 profile-title
         响应头（订阅名），userinfo 为 subscription-userinfo 流量头原文。
         """
-        path = kernel_dir(data_dir) / "config.yaml"
+        path = target_path or kernel_dir(data_dir) / "config.yaml"
         attempts = self._download_attempts(proxy_url)
-        last_err: Exception | None = None
-        for attempt_proxy, label in attempts:
-            try:
-                async with httpx.AsyncClient(
-                    timeout=60, proxy=attempt_proxy, follow_redirects=True,
-                    headers=_SUB_HEADERS,
-                ) as client:
-                    resp = await client.get(sub_url)
-                    resp.raise_for_status()
-                    text = resp.text
+
+        async def _fetch(proxy: str | None) -> tuple[str, httpx.Response]:
+            async with httpx.AsyncClient(
+                timeout=45, proxy=proxy, follow_redirects=True,
+                headers=_SUB_HEADERS, trust_env=False,
+            ) as client:
+                resp = await client.get(sub_url)
+                resp.raise_for_status()
+                text = resp.text
                 if "proxies:" not in text and "proxy-providers:" not in text:
                     raise ValueError("订阅内容不是有效的 Clash 配置（缺少 proxies 段）")
-                nodes = parse_node_names(text)
-                if not nodes and "proxy-providers:" not in text:
+                if not parse_node_names(text) and "proxy-providers:" not in text:
                     raise ValueError("订阅内容解析到 0 个节点，疑似面板返回异常页")
-                path.write_text(text, encoding="utf-8")
-                # 自动取名链：profile-title → Content-Disposition → URL 末段
-                title = subscription_auto_name(resp.headers, sub_url)
-                userinfo = resp.headers.get("subscription-userinfo")
-                logger.info(
-                    "订阅下载成功（%s）：%d 节点，面板名=%s", label, len(nodes), title
+                try:
+                    yaml.safe_load(text)
+                except yaml.YAMLError as e:
+                    # 竞速下截断的响应体也能通过前两道字符串检查——YAML 完整
+                    # 解析是最后一道闸，坏响应在通道内淘汰，不进缓存
+                    raise ValueError(f"订阅内容 YAML 不完整（{e}）") from None
+                return text, resp
+
+        tasks = {
+            asyncio.create_task(_fetch(proxy)): (proxy, label)
+            for proxy, label in attempts
+        }
+        pending = set(tasks)
+        last_err: Exception | None = None
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
                 )
-                return {
-                    "path": str(path), "title": title, "userinfo": userinfo,
-                    "nodes": len(nodes), "cached": False,
-                }
-            except Exception as e:  # noqa: BLE001 —— 逐通道降级
-                last_err = e
-                logger.warning("订阅下载失败（%s）：%s", label, e)
+                for task in done:
+                    proxy, label = tasks[task]
+                    try:
+                        text, resp = task.result()
+                    except Exception as e:  # noqa: BLE001 —— 单通道失败不影响竞速
+                        last_err = e
+                        logger.warning("订阅下载失败（%s）：%s", label, e)
+                        continue
+                    for t in pending:
+                        t.cancel()
+                    nodes = parse_node_names(text)
+                    path.write_text(text, encoding="utf-8")
+                    # 自动取名链：profile-title → Content-Disposition → URL 末段
+                    title = subscription_auto_name(resp.headers, sub_url)
+                    userinfo = resp.headers.get("subscription-userinfo")
+                    logger.info(
+                        "订阅下载成功（%s）：%d 节点，面板名=%s", label, len(nodes), title
+                    )
+                    return {
+                        "path": str(path), "title": title, "userinfo": userinfo,
+                        "nodes": len(nodes), "cached": False,
+                    }
+        finally:
+            for t in pending:
+                t.cancel()
         if path.is_file():
             logger.warning("订阅全部通道失败，回退本地缓存 %s", path)
             cached_text = path.read_text(encoding="utf-8", errors="ignore")

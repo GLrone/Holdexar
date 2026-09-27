@@ -14,9 +14,9 @@
 - **槽数封顶 `MAX_CRAWL_WORKERS`，不是出口池容量**：出口多于上限时只选前 N 个执行，
   其余保持可用、不占工位，供后续调度或替换故障出口。
 
-排序刻意保持可解释、无随机：同一份输入永远给出同一份槽位表，否则每次作业都在换出口，
-连接池反复重建、生产统计失去连续性、排障无从下手。第一版只用现有事实（节点状态、
-出口 IP、三层健康时间戳、主键），不引入容量评分。
+排序保持可解释、无随机：同一份输入永远给出同一份槽位表，否则每次作业都在换出口，
+连接池反复重建、生产统计失去连续性、排障无从下手。排序事实 = 节点状态、**最近 L0
+延迟**（低延迟优先）、三层健康时间戳、出口 IP、主键；不引入综合容量评分。
 """
 from __future__ import annotations
 
@@ -66,10 +66,17 @@ def _time_key(value: datetime | None) -> float:
     return value.timestamp() if isinstance(value, datetime) else float("-inf")
 
 
-def _node_rank(node: ProxyNode) -> tuple:
-    """同出口内选代表节点的顺序：状态 → 最近业务成功 → 最近出口确认 → 主键。"""
+def _delay_key(delay_ms: int | None) -> float:
+    """延迟排序键：低延迟在前；未测/未成功（None）排在同状态已测节点之后。"""
+    return float(delay_ms) if isinstance(delay_ms, int) and delay_ms > 0 else float("inf")
+
+
+def _node_rank(node: ProxyNode, delays: Mapping[str, int | None] | None) -> tuple:
+    """同出口内选代表节点的顺序：状态 → 最近 L0 延迟（低者优先）→
+    最近业务成功 → 最近出口确认 → 主键。"""
     return (
         _STATE_RANK.get(node.state, 9),
+        _delay_key(delays.get(str(node.node_id)) if delays else None),
         -_time_key(node.last_l2_at),
         -_time_key(node.last_l1_at),
         int(node.id or 0),
@@ -87,21 +94,29 @@ def group_exit_candidates(nodes: Iterable[ProxyNode]) -> dict[str, list[ProxyNod
 
 
 def select_exit_slots(
-    nodes: Sequence[ProxyNode], *, max_workers: int = MAX_CRAWL_WORKERS
+    nodes: Sequence[ProxyNode], *,
+    max_workers: int = MAX_CRAWL_WORKERS,
+    delays: Mapping[str, int | None] | None = None,
 ) -> list[ExitSlot]:
     """合格节点 → 出口槽表（每个出口一个槽，最多 `max_workers` 个）。
 
+    `delays`：node_id → 最近一次成功 L0 探测延迟（`health.latest_l0_delays`）；
+    不给则所有节点按未测处理，排序退化为纯状态/时间口径。
+
     排序口径（全部来自现有事实，可复现）：
-    1. 出口内先按 `_node_rank` 定出代表节点与候选顺序；
-    2. 出口之间按「代表节点的状态排名、最近业务成功时间、出口 IP」升/降序；
+    1. 出口内先按 `_node_rank` 定出代表节点与候选顺序——同状态下低延迟节点
+       优先当代表（它才是真正扛这条 lane 流量的人）；
+    2. 出口之间按「代表节点的状态排名、最近 L0 延迟、最近业务成功时间、出口 IP」
+       升/降序——同状态下延迟低的出口先拿工位；
     3. 取前 `max_workers` 个出口。
 
-    稳定性的意义：同一份池在两次作业之间给出同一份槽位表，出口集合不会无故漂移。
+    稳定性的意义：同一份池在两次作业之间给出同一份槽位表，出口集合不会无故漂移
+    （延迟事实更新导致的位次变化是「按测量换更快出口」，不是漂移）。
     """
     groups = group_exit_candidates(nodes)
     ranked: list[tuple[tuple, ExitSlot]] = []
     for exit_ip, members in groups.items():
-        ordered = sorted(members, key=_node_rank)
+        ordered = sorted(members, key=lambda n: _node_rank(n, delays))
         head = ordered[0]
         slot = ExitSlot(
             exit_ip=exit_ip,
@@ -111,6 +126,7 @@ def select_exit_slots(
         )
         sort_key = (
             _STATE_RANK.get(head.state, 9),
+            _delay_key(delays.get(str(head.node_id)) if delays else None),
             -_time_key(head.last_l2_at),
             -_time_key(head.last_l1_at),
             exit_ip,

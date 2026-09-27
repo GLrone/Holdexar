@@ -1,32 +1,29 @@
-"""P1.5：池重建 + Runtime 恢复的编排契约（3 条）。
+"""P1.5：池重建 + Runtime 恢复的编排契约（4 条）。
 
-契约（每一步都必须真实发生）：
+契约（每一步都必须真实发生）。生效通道两段式，**先热后冷**：
 
     capture previous GLOBAL
-      → build_pool() → prepare_runtime_config()
-      → 显式 stop() → 显式 start()
-      → wait controller + reconcile
-      → restore GLOBAL：previous ∈ 新池 ? previous : 新池[0]
-      → 返回新的 runtime proxy URL
+      → build_pool() → 选出口槽
+      → 热通道（控制器可达）：钉定端点生成新配置 → PUT /configs → wait
+        + reconcile → restore GLOBAL → 重绑 lane —— 进程不动、端口不变
+      → 热通道未通过 → 冷通道：prepare（全新端口）→ 显式 stop() → 显式 start()
+        → wait controller + reconcile → restore GLOBAL → 重绑 lane
 
-三条约束：
+四条约束：
 1. 原节点仍在池中 → 恢复它，不做无意义切换；
 2. 原节点已出池 → 内核自己会落到 `DIRECT`，编排层必须 PUT 新池第一项；
-3. 在途请求 → 重建是**破坏性**的（只把这一事实钉住，不在这里决定调度策略）。
+3. 冷通道（进程重启）：旧入口端口随进程消亡（新连接被拒），新端口立即可用，
+   GLOBAL 恢复——用**不可达的控制器**强制走冷通道来钉住这条路径；
+4. 热通道：内核进程不变、mixed-port 沿用、新池节点真的进核（`hot_applied=True`）。
 
-不测（本批边界）：失败 1/2/3 次阈值、固定 mixed-port、运行中请求迁移、
-crawler 自动重选 GLOBAL、Generation/rollback、worker lease、健康排序。
-
-第 3 条用**受控慢目标**（本地回显 /slow 会阻塞并用 Event 通知"已收到"），
-不依赖真实 Steam 的网络时序——否则测试会变成时间竞争。
+不测（本批边界）：失败 1/2/3 次阈值、运行中请求迁移、crawler 自动重选 GLOBAL、
+Generation/rollback、worker lease、健康排序、空转闸（归调度层测试）。
 """
 from __future__ import annotations
 
-import asyncio
 import os
-import socket
 import threading
-import time
+import socket
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -50,10 +47,17 @@ from app.domains.proxypool.runtime import (  # noqa: E402
 from app.domains.proxypool.state import NODE_ACTIVE, NODE_DEAD  # noqa: E402
 
 NOW = datetime(2026, 9, 19, 12, 0, 0)
-SLOW_SECONDS = 5.0
 
 
-# ── 本地夹具：CONNECT 跳板 + 可控慢回显 ─────────────────────────
+def _closed_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+# ── 本地夹具：CONNECT 跳板（mihomo 的 http 节点出站走 CONNECT 隧道）──
 def _pipe(a: socket.socket, b: socket.socket) -> None:
     try:
         while True:
@@ -72,7 +76,7 @@ def _pipe(a: socket.socket, b: socket.socket) -> None:
 
 
 class _RedirectProxy:
-    """本地 CONNECT 代理：忽略目标，一律隧道到本地回显。"""
+    """本地 CONNECT 代理：忽略目标，一律隧道到指定回显端口。"""
 
     def __init__(self, redirect_to: int) -> None:
         self._redirect_to = redirect_to
@@ -115,32 +119,14 @@ class _RedirectProxy:
                     except OSError:
                         pass
 
-    def close(self) -> None:
-        self._sock.close()
-
 
 class _Echo(BaseHTTPRequestHandler):
-    """/slow 会阻塞并通知"已收到"；其余路径立即 204。"""
-
-    received: threading.Event
-
     def do_GET(self):  # noqa: N802
-        if self.path.startswith("/slow"):
-            type(self).received.set()
-            time.sleep(SLOW_SECONDS)
         self.send_response(204)
         self.end_headers()
 
     def log_message(self, *args):
         pass
-
-
-def _closed_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 # ── fixtures ─────────────────────────────────────────────────────
@@ -178,30 +164,6 @@ def clash_runtime():
     runtime.stop()
 
 
-@pytest.fixture
-def redirect_proxies():
-    made: list[_RedirectProxy] = []
-
-    def new(redirect_to: int) -> int:
-        proxy = _RedirectProxy(redirect_to)
-        made.append(proxy)
-        return proxy.port
-
-    yield new
-    for proxy in made:
-        proxy.close()
-
-
-@pytest.fixture
-def slow_echo():
-    received = threading.Event()
-    handler = type("_EchoX", (_Echo,), {"received": received})
-    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    yield server.server_address[1], received
-    server.shutdown()
-
-
 # ── 数据与编排辅助 ───────────────────────────────────────────────
 async def _add(runtime_name: str, *, port: int, state: str = NODE_ACTIVE) -> None:
     config = {"name": runtime_name.split("|", 1)[-1], "type": "http",
@@ -234,7 +196,7 @@ async def _build(data_dir: Path):
 async def _boot(runtime: ClashRuntime, exe: Path, data_dir: Path):
     """首次启动（等价于探针里的初始态）。"""
     await _build(data_dir)
-    status = runtime.start(str(exe), str(prepare_runtime_config(data_dir)))
+    status = runtime.start(str(exe), str(prepare_runtime_config(data_dir)), inject_lanes=False)
     await wait_proxy_names(status["controllerUrl"], runtime.secret, timeout=20)
     await wait_mixed_port(data_dir, timeout=20)
     return status["controllerUrl"], runtime.secret
@@ -318,29 +280,58 @@ async def test_rebuild_falls_back_when_selected_node_left_pool(
     )
 
 
-# ── 3. 在途请求被重建打断；新端口立即可用 ────────────────────────
+# ── 3. 冷通道：旧入口随进程消亡，新入口立即可用 ──────────────────
 @pytest.mark.asyncio
-async def test_rebuild_interrupts_inflight_request(
-    tmp_data_dir, kernel_exe_path, clash_runtime, redirect_proxies, slow_echo
+async def test_cold_rebuild_replaces_endpoints(
+    tmp_data_dir, kernel_exe_path, clash_runtime
+) -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Echo)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    redirect = _RedirectProxy(server.server_address[1])
+    try:
+        await init_db()
+        await _add("1|A", port=redirect.port)
+        base, secret = await _boot(clash_runtime, kernel_exe_path, tmp_data_dir)
+        assert await _select(base, secret, "1|A") == "1|A"
+        old_port = clash_runtime.port
+
+        # 控制器指向一个必然不可达的端口 → 热通道前置探测失败 → 强制走冷通道
+        result = await _rebuild(clash_runtime, kernel_exe_path, tmp_data_dir,
+                                "http://127.0.0.1:1", secret)
+        assert result.hot_applied is False, "控制器不可达必须走冷通道（进程重启）"
+
+        assert result.mixed_port != old_port, "冷通道以全新端口重启内核"
+        with pytest.raises(httpx.HTTPError):
+            await _get_through(old_port, "http://probe.invalid/x", timeout=5)
+        fresh = await _get_through(result.mixed_port, "http://probe.invalid/x",
+                                   timeout=20)
+        assert fresh.status_code == 204, "重建后新端口必须立即可用"
+        assert await _global_now(result.controller_url, secret) == "1|A"
+    finally:
+        server.shutdown()
+
+
+# ── 4. 热通道：进程不动、端口沿用、新池真的进核 ──────────────────
+@pytest.mark.asyncio
+async def test_hot_rebuild_keeps_process_and_port(
+    tmp_data_dir, kernel_exe_path, clash_runtime
 ) -> None:
     await init_db()
-    echo_port, received = slow_echo
-    await _add("1|A", port=redirect_proxies(echo_port))
+    await _add("1|A", port=_closed_port())
+    await _add("1|B", port=_closed_port())
     base, secret = await _boot(clash_runtime, kernel_exe_path, tmp_data_dir)
-    assert await _select(base, secret, "1|A") == "1|A"
+    assert await _select(base, secret, "1|B") == "1|B"
+    pid_before = clash_runtime.process.pid
+    port_before = clash_runtime.port
 
-    inflight = asyncio.create_task(
-        _get_through(clash_runtime.port, "http://probe.invalid/slow", timeout=40)
-    )
-    assert await asyncio.to_thread(received.wait, 8), "慢目标始终没收到请求"
-
+    # 池扩容一个节点：重建的唯一差异是池内容，热通道应把它加载进现役进程
+    await _add("1|C", port=_closed_port())
     result = await _rebuild(clash_runtime, kernel_exe_path, tmp_data_dir, base, secret)
 
-    # 重建必然打断在途请求——这是事实，不是调度策略
-    with pytest.raises(httpx.HTTPError):
-        await inflight
-
-    fresh = await _get_through(result.mixed_port, "http://probe.invalid/fast",
-                               timeout=20)
-    assert fresh.status_code == 204, "重建后新端口必须立即可用"
-    assert await _global_now(result.controller_url, secret) == "1|A"
+    assert result.hot_applied is True, "控制器可达时必须走热通道"
+    assert clash_runtime.process.pid == pid_before, "热通道不得重启内核进程"
+    assert result.mixed_port == port_before, "热通道沿用现役 mixed-port，入口 URL 不变"
+    assert result.controller_url == base, "热通道沿用现役 controller"
+    assert result.pool_names == ("1|A", "1|B", "1|C"), "新池节点必须真的进核"
+    assert result.selection == "1|B", "GLOBAL 恢复契约与冷通道一致"
+    assert await _global_now(result.controller_url, secret) == "1|B"
