@@ -47,6 +47,10 @@ const gameCard = {
   'gameCard.follow.tip': '关注 / 取消关注',
   'gameCard.follow.fail': '关注操作失败',
 
+  /* ── 商店页动作按钮（storeAction prop 决定显隐；点击上报事件，API 由页面处理）── */
+  'gameCard.action.remove': '移出商店',
+  'gameCard.action.restore': '恢复到商店',
+
   /* ── 评测：好评率（null 落 rating.none）与评测数（量级由组件侧定）── */
   'gameCard.rating.positive': '好评{rate}',
   'gameCard.rating.none': '好评暂无',

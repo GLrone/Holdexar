@@ -9,7 +9,7 @@ import { useLocaleStore } from '@/stores/locale'
 import { useRegionsStore } from '@/stores/regions'
 import { useOwnershipStore, type OwnershipType } from '@/stores/ownership'
 import { useFollowsStore } from '@/stores/follows'
-import { message } from '@/components/ui'
+import { message, HlIcon } from '@/components/ui'
 import { computeGiftingAnalysis, giftPayAmountFen, isReceiverPriced, type GiftingAnalysis, type RegionPriceInfo } from '@/lib/gifting'
 import {
   ASSET_RETRY_MAX,
@@ -59,7 +59,12 @@ const props = defineProps<{
   enabledRegions?: string[] | null
   /** 展示前三低价区（高级筛选面板开关）；false = 仅展示最低价区 */
   showTop3?: boolean
+  /** 商店页动作按钮（星标旁）：remove = 移出商店，restore = 恢复（已移除视图）；
+   *  不传 = 不渲染（其他页面不受影响）。点击只上报事件，API 由页面侧处理 */
+  storeAction?: 'remove' | 'restore'
 }>()
+
+const emit = defineEmits<{ (e: 'storeAction'): void }>()
 
 const regionsStore = useRegionsStore()
 const ownershipStore = useOwnershipStore()
@@ -409,6 +414,17 @@ const topRegions = computed(() => {
     return [lowestList[0]!]
   }
   return filtered.slice(0, 3)
+})
+
+/**
+ * 网格 + 前三低价模式下低价区固定占三行槽位：不足的槽位渲染空占位行，
+ * 卡片高度不随低价区数量（0~3）变化。列表与「仅最低价」模式恒单行，无需占位；
+ * 无低价区时的兜底行（国区即最低）按一行内容计。
+ */
+const regionRowPlaceholders = computed(() => {
+  if (props.layoutMode === 'list' || props.showTop3 === false) return 0
+  const contentRows = topRegions.value.length > 0 ? topRegions.value.length : 1
+  return Math.max(0, 3 - contentRows)
 })
 
 const lowestPriceFen = computed(() =>
@@ -989,6 +1005,7 @@ const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/asse
   <div
     ref="cardRef"
     class="game-card"
+    data-tour="game-card"
     :class="[statusClass, { 'list-layout': layoutMode === 'list', favorite: isFollowed }]"
   >
     <!-- 封面（点击进入详情；加载失败随机延时重试，全部失败显示占位） -->
@@ -1140,6 +1157,16 @@ const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/asse
           <span class="star-empty">☆</span>
           <span class="star-filled">★</span>
         </button>
+        <!-- 商店页移除/恢复动作（storeAction 决定显隐，星标旁同形态） -->
+        <button
+          v-if="storeAction"
+          class="star-btn store-action-btn"
+          :class="{ 'is-restore': storeAction === 'restore' }"
+          :title="t(storeAction === 'remove' ? 'gameCard.action.remove' : 'gameCard.action.restore')"
+          @click.stop="emit('storeAction')"
+        >
+          <HlIcon :name="storeAction === 'remove' ? 'delete' : 'refresh'" :size="14" />
+        </button>
       </div>
 
       <div class="tags-row">
@@ -1230,8 +1257,8 @@ const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/asse
         </a>
       </div>
 
-      <!-- 价格区（data-tour：产品导览价格步的聚光锚点） -->
-      <div class="price-section" data-tour="card-price">
+      <!-- 价格区 -->
+      <div class="price-section">
         <div class="price-row">
           <span class="price-label">
             <img :src="flagUrl('cn')" class="flag-icon" alt="CN" />
@@ -1266,6 +1293,15 @@ const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/asse
           <span v-if="cnFree" class="price-value lowest is-free">{{ t('gameCard.price.free') }}</span>
           <span v-else class="price-value lowest">¥{{ (cnPriceFen / 100).toFixed(2) }}</span>
         </div>
+
+        <!-- 低价区不足三行时空占位行：填满三行槽位，网格内卡片等高 -->
+        <template v-if="regionRowPlaceholders > 0">
+          <div
+            v-for="i in regionRowPlaceholders"
+            :key="`price-ph-${i}`"
+            class="price-row price-row-blank"
+          ></div>
+        </template>
 
         <div class="price-row">
           <span class="price-label">{{ t('gameCard.price.diff') }}</span>

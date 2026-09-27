@@ -421,6 +421,22 @@
    现成的 auto 边距推手，都不在时补这份，避免星标贴着标题） */
 .game-card .star-btn.star-push { margin-left: auto; }
 
+/* 商店页移除/恢复按钮（HlGameCard storeAction，星标旁同形态）：
+   移除 = danger 面，恢复 = 中性面 */
+.store-action-btn {
+    background: var(--danger-a15);
+    color: var(--danger);
+}
+.store-action-btn:hover {
+    background: var(--danger-a30);
+    transform: scale(1.1);
+}
+.store-action-btn.is-restore {
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    border: 1px solid var(--border-soft);
+}
+
 /* ==================== 标签行 ==================== */
 .tags-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; align-items: center; }
 
@@ -500,6 +516,10 @@
 
 .price-row { display: flex; justify-content: space-between; align-items: center; padding: 5px 0; }
 .price-row:not(:last-child) { border-bottom: 1px solid var(--row-border); }
+/* 低价区空占位行：不可见内容撑出与真实价格行等高的行框，分隔线透明——
+   职责只有把不足三行的低价区槽位填满，让卡片高度向满三行对齐 */
+.price-row.price-row-blank { border-bottom-color: transparent; }
+.price-row.price-row-blank::after { content: '\00a0'; font-size: 13px; }
 .price-label { font-size: 11px; color: var(--text-dim); display: flex; align-items: center; gap: 5px; }
 .price-value { font-size: 13px; font-weight: 600; }
 .price-value.cn { color: var(--accent); }

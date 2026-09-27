@@ -1239,7 +1239,7 @@ async def add_pool_items(
     }
 
 
-async def remove_pool_items(appids: list[int]) -> dict:
+async def remove_pool_items(appids: list[int], *, reason: str = "pool_removed") -> dict:
     """批量移除监控条目（从「我的关注」移除）。
 
     - 摘掉用户显式来源（manual / favorite）并把对象置为排除：excluded 挡住
@@ -1248,6 +1248,8 @@ async def remove_pool_items(appids: list[int]) -> dict:
     - 历史 wishlist_items 行一并脱池并清星标标（Steam 账户来源数据，仅供
       账号同步对账）；
     - 移除不是删除：Catalog / 价格历史 / 来源行全保留。
+    - reason：监控排除登记缘由（默认 pool_removed；目录移除链路传
+      catalog_removed，恢复侧据以判定哪些排除可随恢复解除）。
 
     返回 {results, removed, missing}：removed 以 appid 计，missing 为当前
     未被监控的 appid 数。
@@ -1291,7 +1293,7 @@ async def remove_pool_items(appids: list[int]) -> dict:
             if user_source:
                 for src in user_source:
                     await monitoring_service.detach_source("game", appid, src)
-            await monitoring_service.set_exclusion("game", appid, True, "pool_removed")
+            await monitoring_service.set_exclusion("game", appid, True, reason)
             if user_source or appid in had_active_row or states.get(appid) == "active":
                 results.append({"appid": appid, "status": "removed", "detail": "已移出关注"})
                 removed += 1

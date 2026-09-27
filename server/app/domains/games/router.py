@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.crawler import cdk_fetcher
 
@@ -53,6 +53,8 @@ async def list_games(
     # 愿望单优先：关注恒置顶，开启后愿望单成员（含家庭愿望单）叠加置顶前缀
     wishlistPriority: bool = False,
     excludeDlc: bool = Query(False),
+    # 目录移除（假删除）作用域：默认隐藏已移除款；true 只出已移除款（恢复视图）
+    removed: bool = False,
 ):
     return await service.list_games(
         sort=sort,
@@ -82,6 +84,7 @@ async def list_games(
         strict_lowest=strictLowest,
         exclude_dlc=excludeDlc,
         wishlist_priority=wishlistPriority,
+        removed=removed,
     )
 
 
@@ -189,3 +192,21 @@ async def retry_removed(appid: int):
         return await service.retry_removed_game(appid)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+class GameIdsRequest(BaseModel):
+    """目录移除/恢复批量请求（单批上限 500，前端超出时分批调用）。"""
+
+    appids: list[int] = Field(min_length=1, max_length=500)
+
+
+@router.post("/remove")
+async def remove_games(req: GameIdsRequest):
+    """批量移出游戏商店（假删除）：列表隐藏 + 停止价格刷新，可在「已移除」视图恢复。"""
+    return await service.remove_games(req.appids)
+
+
+@router.post("/restore")
+async def restore_games(req: GameIdsRequest):
+    """批量恢复被移除的游戏（删移除账本行即回到商店）。"""
+    return await service.restore_games(req.appids)

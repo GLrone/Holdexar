@@ -742,6 +742,8 @@ export interface GamesListParams {
   wishlistPriority?: boolean
   /** 游戏商店默认隐藏 DLC（白名单豁免个别常驻 DLC）；false = 含 DLC */
   excludeDlc?: boolean
+  /** 目录移除作用域：false/缺省 = 常规列表（隐藏已移除款）；true = 只出已移除款（恢复视图） */
+  removed?: boolean
 }
 
 function toQuery(params: Record<string, unknown>): string {
@@ -796,21 +798,45 @@ export const gamesApi = {
       'POST',
       `/games/${appid}/retry-removed`,
     ),
+  /** 批量移出游戏商店（假删除：列表隐藏 + 停止取价；单批上限 500，超出分批调） */
+  remove: (appids: number[]) =>
+    request<{ removed: number; missing: number }>('POST', '/games/remove', { appids }),
+  /** 批量恢复被移除的游戏（回到商店并补一次取价；单批上限 500，超出分批调） */
+  restore: (appids: number[]) =>
+    request<{ restored: number; missing: number }>('POST', '/games/restore', { appids }),
 }
 
 // ─── bundles（捆绑包浏览视图：列表聚合 + 补齐计算详情） ──────────────────
 
 export const bundlesApi = {
   /** 全量捆绑包（sort=diff 差价降序 | smart 智能评分降序，服务端预计算列；
-   *  discount 折扣力度由前端排序，服务端按 diff 出底序） */
-  list: (sort: 'diff' | 'smart' | 'discount' = 'diff') =>
-    request<{ bundles: BundleSummary[] }>('GET', `/bundles${toQuery({ sort })}`),
+   *  discount 折扣力度由前端排序，服务端按 diff 出底序）。
+   *  removed=true 只出已移除/已排除的包（恢复视图） */
+  list: (sort: 'diff' | 'smart' | 'discount' = 'diff', removed = false) =>
+    request<{ bundles: BundleSummary[] }>(
+      'GET',
+      `/bundles${toQuery({ sort, removed: removed || undefined })}`,
+    ),
   /** 单包详情：列表字段 + 包内游戏各区现价（补齐计算求和用） */
   detail: (bundleId: number | string) =>
     request<BundleDetail>('GET', `/bundles/${bundleId}`),
   /** 导入捆绑包/Sub：Steam 商店或 SteamDB 链接（/bundle/ 或 /sub/）、裸 ID */
   importBundle: (text: string) =>
     request<BundleImportResult>('POST', '/bundles/import', { text }),
+  /** 当前关注的包 id 全集（升序；卡片星标状态一次性整表拉取） */
+  follows: () => request<{ bundleIds: number[] }>('GET', '/bundles/follows'),
+  /** 关注一个包（挂 favorite 来源，列表置顶） */
+  follow: (bundleId: number) =>
+    request<{ bundleId: number; followed: boolean }>('PUT', `/bundles/${bundleId}/follow`),
+  /** 取消关注：只摘 favorite 来源 */
+  unfollow: (bundleId: number) =>
+    request<{ bundleId: number; followed: boolean }>('DELETE', `/bundles/${bundleId}/follow`),
+  /** 移除一个包：列表隐藏 + 退出刷新（可在已移除视图恢复） */
+  remove: (bundleId: number) =>
+    request<{ removed: boolean; bundleId: number }>('POST', `/bundles/${bundleId}/remove`),
+  /** 恢复被移除的包（只解除移除链路所挂的排除） */
+  restore: (bundleId: number) =>
+    request<{ restored: boolean; bundleId: number }>('POST', `/bundles/${bundleId}/restore`),
 }
 
 /** POST /bundles/import 结果 */
@@ -1359,7 +1385,7 @@ export const proxiesApi = {
   remove: (id: number) => request<{ removed: boolean }>('DELETE', `/proxies/${id}`),
   test: (id: number) => request<ProxyItem>('POST', `/proxies/${id}/test`),
   testAll: () => request<{ items: ProxyItem[] }>('POST', '/proxies/test_all'),
-  setStrategy: (payload: ProxyStrategy) =>
+  setStrategy: (payload: Partial<ProxyStrategy>) =>
     request<ProxyStrategy>('PUT', '/proxies/strategy', payload),
   events: (limit = 100) => request<ProxyEventItem[]>('GET', `/proxies/events${toQuery({ limit })}`),
   // 订阅（clash / plain 双方式，长期保存）

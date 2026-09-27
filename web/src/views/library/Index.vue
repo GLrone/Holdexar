@@ -14,7 +14,17 @@ import { useI18n, useLocaleFormat } from '@/locales'
 import HlNavbar from '@/components/business/HlNavbar.vue'
 import HlFilterPanel from '@/components/business/HlFilterPanel.vue'
 import HlGameCard from '@/components/business/HlGameCard.vue'
-import { HlButton, HlEmpty, HlScrollList, HlSpinner } from '@/components/ui'
+import {
+  HlButton,
+  HlCheckbox,
+  HlEmpty,
+  HlIcon,
+  HlPopconfirm,
+  HlScrollList,
+  HlSpinner,
+  HlUndoToast,
+  message,
+} from '@/components/ui'
 
 /**
  * 库视图完整实现：Navbar + 高级筛选 + 卡片网格 +
@@ -92,6 +102,8 @@ function baseParams() {
         ? Math.max(0, Math.round(Number(store.tolerance || '0') * 100))
         : undefined,
     wishlistPriority: store.wishlistPriority || undefined,
+    // 已移除视图：列表只出被移除的款（目录移除账本作用域，恢复入口）
+    removed: removedView.value || undefined,
   }
 }
 
@@ -268,6 +280,144 @@ function clearFilters() {
   void load()
 }
 
+// ─── 目录移除（假删除）：浏览中逐卡移除 / 批量整理 / 已移除视图恢复 ───
+// 移除 = 商店列表隐藏 + 停止取价（服务端账本），价格历史保留，随时可恢复；
+// 前端本地同步剔除条目并调 total，不打断滚动位置与分页游标。
+
+const manageMode = ref(false)
+const selected = ref<Set<number>>(new Set())
+const removing = ref(false)
+const removedView = ref(false)
+
+/** 卡片动作按钮：管理模式下整卡即选择（按钮不渲染）；已移除视图换恢复 */
+const cardAction = computed(() => {
+  if (manageMode.value) return undefined
+  return removedView.value ? ('restore' as const) : ('remove' as const)
+})
+
+function toggleManage() {
+  manageMode.value = !manageMode.value
+  if (!manageMode.value) selected.value = new Set()
+}
+
+function toggleRemovedView() {
+  removedView.value = !removedView.value
+  if (removedView.value && manageMode.value) {
+    manageMode.value = false
+    selected.value = new Set()
+  }
+  void load(true)
+}
+
+/** 管理模式下整卡即切换勾选（capture 阶段拦下，卡片自身的跳转/星标不再触发） */
+function toggleSelect(appid: number, e: Event) {
+  if (!manageMode.value) return
+  e.preventDefault()
+  e.stopPropagation()
+  const next = new Set(selected.value)
+  if (next.has(appid)) next.delete(appid)
+  else next.add(appid)
+  selected.value = next
+}
+
+const allLoadedSelected = computed(
+  () => visibleGames.value.length > 0 && visibleGames.value.every((g) => selected.value.has(g.appid)),
+)
+
+function toggleSelectLoaded() {
+  selected.value = allLoadedSelected.value
+    ? new Set()
+    : new Set(visibleGames.value.map((g) => g.appid))
+}
+
+/** 分批调用（服务端单批上限 500，对齐池端点按 100 一批） */
+async function removeIds(ids: number[]) {
+  let removed = 0
+  for (let i = 0; i < ids.length; i += 100) {
+    const r = await gamesApi.remove(ids.slice(i, i + 100))
+    removed += r.removed
+  }
+  return removed
+}
+
+async function restoreIds(ids: number[]) {
+  let restored = 0
+  for (let i = 0; i < ids.length; i += 100) {
+    const r = await gamesApi.restore(ids.slice(i, i + 100))
+    restored += r.restored
+  }
+  return restored
+}
+
+function dropLocal(ids: number[]) {
+  const idSet = new Set(ids)
+  items.value = items.value.filter((g) => !idSet.has(g.appid))
+}
+
+// ── 撤销条：最近一次移除的款可一键恢复（6 秒后收起；「已移除」视图常驻出路）──
+const undoIds = ref<number[] | null>(null)
+let undoTimer: ReturnType<typeof setTimeout> | null = null
+
+function showUndo(ids: number[]) {
+  undoIds.value = ids
+  if (undoTimer) clearTimeout(undoTimer)
+  undoTimer = setTimeout(() => {
+    undoIds.value = null
+  }, 6000)
+}
+
+async function undoRemove() {
+  const ids = undoIds.value
+  if (!ids) return
+  undoIds.value = null
+  try {
+    await restoreIds(ids)
+    await load(true)
+  } catch {
+    message.error(t('library.removed.restoreFail'))
+  }
+}
+
+/** 卡片动作（星标旁按钮）：常规视图 = 移出商店，已移除视图 = 恢复 */
+async function onCardAction(appid: number) {
+  if (removedView.value) {
+    try {
+      await restoreIds([appid])
+      dropLocal([appid])
+      total.value = Math.max(0, total.value - 1)
+      message.success(t('library.removed.restoreResult', { n: 1 }))
+    } catch {
+      message.error(t('library.removed.restoreFail'))
+    }
+    return
+  }
+  try {
+    const removed = await removeIds([appid])
+    dropLocal([appid])
+    total.value = Math.max(0, total.value - removed)
+    if (removed > 0) showUndo([appid])
+  } catch {
+    message.error(t('library.removed.fail'))
+  }
+}
+
+async function removeSelected() {
+  const ids = [...selected.value]
+  if (!ids.length) return
+  removing.value = true
+  try {
+    const removed = await removeIds(ids)
+    dropLocal(ids)
+    selected.value = new Set()
+    total.value = Math.max(0, total.value - removed)
+    if (removed > 0) showUndo(ids)
+  } catch {
+    message.error(t('library.removed.fail'))
+  } finally {
+    removing.value = false
+  }
+}
+
 // ─── 无限滚动 ───
 // 两种模式各有一个触发点：
 // · 列表模式：列表在 HlScrollList 内部滚动，加载哨兵挂在滚动区末尾（#footer
@@ -327,6 +477,47 @@ onBeforeUnmount(() => {
 
     <!-- 主内容区 -->
     <div class="container">
+      <!-- 目录整理工具条：批量整理（多选移除）与已移除视图（恢复入口） -->
+      <div v-if="!isError" class="lib-toolbar">
+        <HlButton
+          v-if="!removedView"
+          size="sm"
+          :variant="manageMode ? 'primary' : 'default'"
+          @click="toggleManage"
+        >
+          <HlIcon name="edit" :size="14" />
+          {{ manageMode ? t('library.manage.done') : t('library.manage') }}
+        </HlButton>
+        <HlButton size="sm" :variant="removedView ? 'primary' : 'default'" @click="toggleRemovedView">
+          <HlIcon name="delete" :size="14" />
+          {{ t('library.removed.view') }}
+        </HlButton>
+        <span v-if="removedView" class="lib-toolbar__hint">{{ t('library.removed.emptyHint') }}</span>
+      </div>
+
+      <!-- 管理模式操作条：多选 + 批量移除（与关注页同一形态） -->
+      <div v-if="manageMode && !removedView" class="lib-manage-bar">
+        <span class="lib-manage-bar__count">{{ t('library.manage.selected', { n: selected.size }) }}</span>
+        <HlButton size="sm" @click="toggleSelectLoaded">
+          {{ allLoadedSelected ? t('library.manage.unselectAll') : t('library.manage.selectAll') }}
+        </HlButton>
+        <HlButton size="sm" :disabled="!selected.size" @click="selected = new Set()">
+          {{ t('library.manage.clearSelection') }}
+        </HlButton>
+        <HlPopconfirm
+          :text="t('library.manage.removeConfirm', { n: selected.size })"
+          :confirm-label="t('common.confirm')"
+          :cancel-label="t('common.cancel')"
+          @confirm="removeSelected"
+        >
+          <HlButton variant="danger" size="sm" :disabled="!selected.size" :loading="removing">
+            <HlIcon name="delete" :size="14" />
+            {{ t('library.manage.removeSelected') }}
+          </HlButton>
+        </HlPopconfirm>
+        <span class="lib-manage-bar__hint">{{ t('library.manage.hint') }}</span>
+      </div>
+
       <!-- 错误状态 -->
       <HlEmpty v-if="isError" icon="" style="--pane-pad: 40px 24px">
         <h3>{{ t('library.error.title') }}</h3>
@@ -368,9 +559,14 @@ onBeforeUnmount(() => {
         icon=""
         data-tour="lib-empty"
       >
-        <!-- 分支优先级：搜索/筛选无结果（C）优先于「刚添加」（B）——用户已在
-             搜索时，找到与否才是他当前的问题；无搜索时 B（刚添加）先于 A（没游戏） -->
-        <template v-if="!isLibraryEmpty">
+        <!-- 分支优先级：已移除视图空态（有专属出路说明）→ 搜索/筛选无结果（C）
+             优先于「刚添加」（B）——用户已在搜索时，找到与否才是他当前的问题；
+             无搜索时 B（刚添加）先于 A（没游戏） -->
+        <template v-if="removedView && total === 0 && !store.committedSearch">
+          <h3>{{ t('library.removed.empty') }}</h3>
+          <p>{{ t('library.removed.emptyHint') }}</p>
+        </template>
+        <template v-else-if="!isLibraryEmpty">
           <h3>{{ t('library.empty.filter.title') }}</h3>
           <p>{{ t('library.empty.filter.hint') }}</p>
           <div class="lib-empty-actions">
@@ -428,12 +624,25 @@ onBeforeUnmount(() => {
         @end-reached="onEndReached"
       >
         <template #item="{ item }">
-          <HlGameCard
-            :game="item as GameListItem"
-            :layout-mode="'list'"
-            :enabled-regions="regionsStore.enabledCodes"
-            :show-top3="store.top3Check"
-          />
+          <div
+            class="lib-item-wrap"
+            :class="{ 'is-managed': manageMode, 'is-selected': manageMode && selected.has(item.appid) }"
+            @click.capture="toggleSelect(item.appid, $event)"
+          >
+            <HlGameCard
+              :game="item as GameListItem"
+              :layout-mode="'list'"
+              :enabled-regions="regionsStore.enabledCodes"
+              :show-top3="store.top3Check"
+              :store-action="cardAction"
+              @store-action="onCardAction(item.appid)"
+            />
+            <HlCheckbox
+              v-if="manageMode"
+              :model-value="selected.has(item.appid)"
+              class="lib-item-check"
+            />
+          </div>
         </template>
         <!-- 加载态随列表一起滚（不能挂在页面底部，列表内滚时永远看不到） -->
         <template #footer>
@@ -453,14 +662,27 @@ onBeforeUnmount(() => {
         v-stagger
         class="card-grid hl-stagger"
       >
-        <HlGameCard
+        <div
           v-for="game in visibleGames"
           :key="game.appid"
-          :game="game"
-          :layout-mode="store.layoutMode"
-          :enabled-regions="regionsStore.enabledCodes"
-          :show-top3="store.top3Check"
-        />
+          class="lib-item-wrap"
+          :class="{ 'is-managed': manageMode, 'is-selected': manageMode && selected.has(game.appid) }"
+          @click.capture="toggleSelect(game.appid, $event)"
+        >
+          <HlGameCard
+            :game="game"
+            :layout-mode="store.layoutMode"
+            :enabled-regions="regionsStore.enabledCodes"
+            :show-top3="store.top3Check"
+            :store-action="cardAction"
+            @store-action="onCardAction(game.appid)"
+          />
+          <HlCheckbox
+            v-if="manageMode"
+            :model-value="selected.has(game.appid)"
+            class="lib-item-check"
+          />
+        </div>
       </div>
 
       <!-- 无限滚动哨兵（仅网格模式；列表模式的哨兵在 HlScrollList 滚动区末尾） -->
@@ -476,10 +698,75 @@ onBeforeUnmount(() => {
         <template v-else-if="!hasNextPage">{{ t('library.end') }}</template>
       </div>
     </div>
+
+    <!-- 撤销条：最近一次移除的款可一键恢复（6 秒后收起；「已移除」视图是常驻出路） -->
+    <HlUndoToast
+      :show="undoIds != null"
+      :text="t('library.removed.toast', { n: undoIds?.length ?? 0 })"
+      @undo="undoRemove"
+    />
   </div>
 </template>
 
 <style scoped>
+/* 目录整理工具条：批量整理 / 已移除视图切换 + 恢复视图的说明 */
+.lib-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.lib-toolbar__hint {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+/* 管理模式操作条（多选 + 批量移除；与关注页 manage-bar 同形态） */
+.lib-manage-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+}
+.lib-manage-bar__count {
+  font-size: 13px;
+  font-weight: 600;
+  margin-right: 4px;
+}
+.lib-manage-bar__hint {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-left: auto;
+}
+
+/* 卡片包裹层：管理模式下整卡即选择（capture 拦截），勾选角标 + 选中描边 */
+.lib-item-wrap {
+  position: relative;
+  border-radius: 12px;
+}
+/* 网格行内等高：网格单元拉伸到行高，卡片填满单元——低价区行已固定三槽
+   （HlGameCard 空占位行），标签换行等残余内容差由拉伸吸收，底缘不参差。
+   列表模式的包裹层在 HlScrollList 内、不在 .card-grid 下，不受影响 */
+.card-grid .lib-item-wrap .game-card {
+  height: 100%;
+}
+.lib-item-wrap.is-selected {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.lib-item-check {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 3;
+  pointer-events: none;
+}
+
 /* 空态引导按钮行（去配代理 / 去导入游戏）：HlEmpty slot 内的横向排布 */
 .lib-empty-actions {
   display: flex;

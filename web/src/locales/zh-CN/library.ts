@@ -33,6 +33,25 @@ const library = {
   /* 无限滚动哨兵 */
   'library.loadingMore': '加载更多...',
   'library.end': '已经到底了',
+
+  /* ── 目录移除（假删除）：浏览中逐卡移除 + 批量整理 + 已移除视图恢复 ──
+     用户词汇只用「移除 / 恢复」；账本、排除等实现细节不进文案 */
+  'library.manage': '批量整理',
+  'library.manage.done': '完成整理',
+  'library.manage.selected': '已选 {n} 款',
+  'library.manage.selectAll': '全选已加载',
+  'library.manage.unselectAll': '取消全选',
+  'library.manage.clearSelection': '清除选择',
+  'library.manage.removeSelected': '移除所选',
+  'library.manage.removeConfirm': '移除所选 {n} 款游戏？之后可在「已移除」里恢复。',
+  'library.manage.hint': '点卡片勾选，一次移除不再想要的款。',
+  'library.removed.view': '已移除',
+  'library.removed.empty': '没有移除过游戏',
+  'library.removed.emptyHint': '浏览时点卡片上的移除按钮，移除的游戏会收进这里，随时可恢复。',
+  'library.removed.toast': '已移除 {n} 款',
+  'library.removed.restoreResult': '已恢复 {n} 款',
+  'library.removed.fail': '移除失败，请重试',
+  'library.removed.restoreFail': '恢复失败，请重试',
 } as const
 
 export default library

@@ -7,6 +7,7 @@ const common: Partial<Record<MessageKey, string>> = {
   'common.loading': 'Loading…',
   'common.confirm': 'Confirm',
   'common.cancel': 'Cancel',
+  'common.undo': 'Undo',
   'common.close': 'Close',
   'common.retry': 'Retry',
   'common.refresh': 'Refresh',

@@ -36,6 +36,11 @@ const gameCard: Partial<Record<MessageKey, string>> = {
   'gameCard.follow.tip': 'Follow / unfollow',
   'gameCard.follow.fail': 'Failed to update follow',
 
+  /* Store-page action buttons (shown via the storeAction prop; the card only
+     emits, the page owns the API calls) */
+  'gameCard.action.remove': 'Remove from store',
+  'gameCard.action.restore': 'Restore to store',
+
   /* Rating and review count */
   'gameCard.rating.positive': '{rate} positive',
   'gameCard.rating.none': 'No rating',

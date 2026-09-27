@@ -57,6 +57,7 @@ import HlTag from './HlTag.vue'
 import HlTextarea from './HlTextarea.vue'
 import HlThemeToggle from './HlThemeToggle.vue'
 import HlTimeline from './HlTimeline.vue'
+import HlUndoToast from './HlUndoToast.vue'
 import HlTooltip from './HlTooltip.vue'
 import HlTopbarAvatar from './HlTopbarAvatar.vue'
 import HlTree from './HlTree.vue'
@@ -127,6 +128,7 @@ export {
   HlTextarea,
   HlThemeToggle,
   HlTimeline,
+  HlUndoToast,
   HlTooltip,
   HlTopbarAvatar,
   HlTree,
@@ -182,6 +184,7 @@ export default function install(app: App) {
   app.component('HlTextarea', HlTextarea)
   app.component('HlThemeToggle', HlThemeToggle)
   app.component('HlTimeline', HlTimeline)
+  app.component('HlUndoToast', HlUndoToast)
   app.component('HlTooltip', HlTooltip)
   app.component('HlTopbarAvatar', HlTopbarAvatar)
   app.component('HlTree', HlTree)
