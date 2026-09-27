@@ -9,6 +9,7 @@ const common = {
   'common.loading': '加载中…',
   'common.confirm': '确定',
   'common.cancel': '取消',
+  'common.undo': '撤销',
   'common.close': '关闭',
   'common.retry': '重试',
   'common.refresh': '刷新',

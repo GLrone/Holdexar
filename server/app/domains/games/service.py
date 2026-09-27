@@ -13,11 +13,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import and_, asc, desc, func, or_, select, update
+from sqlalchemy import and_, asc, delete, desc, func, or_, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -25,7 +27,14 @@ from app.core.database import get_session_factory
 from app.crawler.utils import get_beijing_time_obj
 from app.domains.crawl import coverage as coverage_service
 from app.domains.crawl import freshness as freshness_service
-from app.domains.games.models import Game, Bundle, BundleRegionPrice, GameCurrentPrice, GamePriceHistory
+from app.domains.games.models import (
+    Game,
+    Bundle,
+    BundleRegionPrice,
+    CatalogRemoval,
+    GameCurrentPrice,
+    GamePriceHistory,
+)
 from app.domains.games.scoring import (
     familiarity_score,
     quality_score,
@@ -48,8 +57,14 @@ from app.crawler.config import CC_LIST
 
 TOLERANCE_FEN = 500  # 5 元容差（分）
 
+logger = logging.getLogger(__name__)
+
 # 游戏商店默认隐藏 DLC；白名单豁免个别确需常驻的 DLC（黄金树幽影 / 艾尔登法环）
 DLC_EXEMPT_APPIDS = frozenset({2778580})
+
+# 目录移除（假删除）挂的监控排除 reason：恢复时只解除本链路所挂的排除，
+# 用户在维护面板显式设置的排除语义不被恢复动作洗掉
+REMOVAL_EXCLUSION_REASON = "catalog_removed"
 
 # ── 汇率进程内缓存（300s TTL）──
 _RATES_TTL_SECONDS = 300.0
@@ -172,6 +187,7 @@ def _build_filter_conditions(
     tolerance_fen: int | None = None,
     strict_lowest: bool = False,
     exclude_dlc: bool = False,
+    removed_only: bool = False,
 ) -> list:
     """WHERE 条件构建（list_games 与 top100 分支共用同一套筛选语义）。
 
@@ -189,6 +205,8 @@ def _build_filter_conditions(
     tolerance_fen：「该区价 ≈ 全区最低价」容差（分）；None 用默认 5 元。
     strict_lowest：绝对低价——最低区价 < 国区价 − tolerance（差价容错的
     反向语义：最低区必须实质低于国区，而非"近似相等也放行"）。
+    removed_only：目录移除（假删除）作用域——False（默认）隐藏已移除款，
+    True 只出已移除款（商店页「已移除」视图的恢复入口）。
     """
     tolerance = TOLERANCE_FEN if tolerance_fen is None else tolerance_fen
     conditions: list = [g.name.is_not(None), g.name != ""]
@@ -332,6 +350,11 @@ def _build_filter_conditions(
             )
         )
 
+    # 目录移除（假删除）作用域：catalog_removals 行存在与否即过滤判据，
+    # 主列表与 top100 分支共用（两条分支都经本函数构建 WHERE）
+    removed_sq = select(CatalogRemoval.appid)
+    conditions.append(g.appid.in_(removed_sq) if removed_only else g.appid.not_in(removed_sq))
+
     return conditions
 
 
@@ -391,6 +414,7 @@ async def list_games(
     strict_lowest: bool = False,
     exclude_dlc: bool = False,
     wishlist_priority: bool = False,
+    removed: bool = False,
 ) -> dict:
     """游戏列表。返回 {items, total, hasMore, nextCursor}。
 
@@ -431,6 +455,7 @@ async def list_games(
         strict_lowest=strict_lowest,
         exclude_dlc=exclude_dlc,
         wishlist_priority=wishlist_priority,
+        removed=removed,
     )
 
     offset = _decode_cursor(after)
@@ -462,6 +487,7 @@ async def list_games(
         tolerance_fen=tolerance_fen,
         strict_lowest=strict_lowest,
         exclude_dlc=exclude_dlc,
+        removed_only=removed,
     )
 
     # ── 基础查询（join 形态：LOCKED 走 LEFT JOIN，其余 INNER）──
@@ -567,6 +593,7 @@ async def _list_games_top100(
     strict_lowest: bool = False,
     exclude_dlc: bool = False,
     wishlist_priority: bool = False,
+    removed: bool = False,
 ) -> dict:
     """TOP100 热销榜分支（sort=top100 的榜内过滤 + 榜序重排）。
 
@@ -609,6 +636,7 @@ async def _list_games_top100(
         tolerance_fen=tolerance_fen,
         strict_lowest=strict_lowest,
         exclude_dlc=exclude_dlc,
+        removed_only=removed,
     )
     base = _build_base_stmt(g=g, cn=cn, sr=sr, conditions=conditions,
                             region_code=region_code, is_locked=is_locked)
@@ -1839,3 +1867,111 @@ async def retry_removed_game(appid: int) -> dict:
     except (RuntimeError, ValueError) as e:
         # 已有任务在跑 / 空列表：清标已生效，下一轮关注层刷新自然带上
         return {"ok": True, "jobId": None, "requeued": False, "note": str(e)}
+
+
+# ── 目录移除（假删除）：商店列表隐藏 + 停止价格刷新，可恢复 ──────────
+
+
+def _clean_appids(appids: list[int]) -> list[int]:
+    """入参规整：正整数、去重、保序。"""
+    clean: list[int] = []
+    for a in appids:
+        try:
+            appid = int(a)
+        except (TypeError, ValueError):
+            continue
+        if appid > 0 and appid not in clean:
+            clean.append(appid)
+    return clean
+
+
+async def remove_games(appids: list[int]) -> dict:
+    """批量移出游戏商店（假删除）。
+
+    - catalog_removals 落行（幂等，重复移除保留首次时刻），仅对目录里
+      实际存在的 appid 生效；
+    - 复用「移出关注」语义（remove_pool_items）：摘用户来源 + 挂监控排除
+      挡账号同步复活 + 清星标——「不要这款游戏」在商店与关注两层同时生效；
+      监控排除同时让爬取主链跳过它，价格刷新自然停止；
+    - games 行与价格历史全保留，恢复（restore_games 删行）即原样回到商店。
+
+    返回 {removed, missing}：removed 以落在目录里的 appid 计，missing 为
+    目录中不存在的 appid 数。
+    """
+    clean = _clean_appids(appids)
+    if not clean:
+        return {"removed": 0, "missing": 0}
+
+    async with get_session_factory()() as session:
+        known = set(
+            (
+                await session.execute(select(Game.appid).where(Game.appid.in_(clean)))
+            ).scalars()
+        )
+        targets = [a for a in clean if a in known]
+        if targets:
+            await session.execute(
+                sqlite_insert(CatalogRemoval)
+                .values(
+                    [
+                        {
+                            "appid": a,
+                            "reason": "user_removed",
+                            "removed_at": get_beijing_time_obj().replace(tzinfo=None),
+                        }
+                        for a in targets
+                    ]
+                )
+                .on_conflict_do_nothing(index_elements=[CatalogRemoval.appid])
+            )
+            await session.commit()
+
+    if targets:
+        from app.domains.wishlist import service as wishlist_service
+
+        await wishlist_service.remove_pool_items(
+            targets, reason=REMOVAL_EXCLUSION_REASON
+        )
+    return {"removed": len(targets), "missing": len(clean) - len(targets)}
+
+
+async def restore_games(appids: list[int]) -> dict:
+    """批量恢复被移除的游戏（删 catalog_removals 行即回到商店）。
+
+    移除时挂的监控排除只解除 reason=catalog_removed 的（本链路所挂）；
+    维护面板里用户显式设置的排除语义保留。解除后对恢复款补一次取价
+    （对齐导入语义：目录行 + 一次性首爬），仍被排除挡下的 appid 由爬取
+    主链的排除检查跳过。
+
+    返回 {restored, missing}：restored 以实际删行的 appid 计。
+    """
+    clean = _clean_appids(appids)
+    if not clean:
+        return {"restored": 0, "missing": 0}
+
+    async with get_session_factory()() as session:
+        result = await session.execute(
+            delete(CatalogRemoval).where(CatalogRemoval.appid.in_(clean))
+        )
+        await session.commit()
+    restored = result.rowcount or 0
+
+    from app.domains.monitoring import service as monitoring_service
+
+    recrawl: list[int] = []
+    for appid in clean:
+        reason = await monitoring_service.exclusion_reason("game", appid)
+        if reason is None or reason == REMOVAL_EXCLUSION_REASON:
+            await monitoring_service.set_exclusion("game", appid, False, "catalog_restored")
+            recrawl.append(appid)
+
+    if recrawl:
+        from app.domains.crawl import service as crawl_service
+
+        try:
+            await crawl_service.start_job(scope="appids", appids=recrawl, kind="catalog_restore")
+        except (RuntimeError, ValueError) as e:
+            # 已有任务在跑 / 空列表：恢复已生效，取价留给下一轮手动刷新
+            logger.info("目录恢复 %d 款未自动取价（%s）", len(recrawl), e)
+
+    return {"restored": restored, "missing": len(clean) - restored}

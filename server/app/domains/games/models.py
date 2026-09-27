@@ -204,6 +204,9 @@ class BundleRegionPrice(Base):
     bundle_base_discount: Mapped[int] = mapped_column(Integer, default=0)
     price_status: Mapped[str] = mapped_column(String(20), default="ok")
     cny_fen: Mapped[int | None] = mapped_column(BigInteger)
+    # 促销截止（browse active_discounts[0].discount_end_date，Unix 秒）：
+    # 每轮刷新随价格行覆盖写入；NULL=无促销/本轮未下发促销元数据
+    discount_end_ts: Mapped[int | None] = mapped_column(Integer)
     app_ids: Mapped[list | None] = mapped_column(JSON, default=list)
     crawled_at: Mapped[datetime | None] = mapped_column(DateTime)
 
@@ -235,3 +238,19 @@ class PresetGame(Base):
     __table_args__ = (
         Index("ix_preset_source", "source"),
     )
+
+
+class CatalogRemoval(Base):
+    """目录移除账本（假删除）：用户从游戏商店移除的游戏登记于此。
+
+    行存在 = 商店列表隐藏（列表查询按本表过滤）+ 停止价格刷新（移除同时
+    挂监控排除，爬取主链跳过排除对象）；games 行与价格历史全保留——恢复
+    （删行）后原样回到商店。不物理删行：目录行的写入链路有多条（爬取主链、
+    回补、捆绑包连带、账号同步），物理删会在这些链路上复活并牵连级联清理。
+    """
+
+    __tablename__ = "catalog_removals"
+
+    appid: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    reason: Mapped[str | None] = mapped_column(String(200))
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime)

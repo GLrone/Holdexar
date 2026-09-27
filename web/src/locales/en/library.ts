@@ -29,6 +29,26 @@ const library: Partial<Record<MessageKey, string>> = {
 
   'library.loadingMore': 'Loading more...',
   'library.end': 'You have reached the end',
+
+  /* Catalog removal (soft delete): per-card removal while browsing + bulk
+     tidy-up + a Removed view for restoring. User-facing words are
+     “remove / restore” only; ledger and exclusion internals stay internal */
+  'library.manage': 'Tidy up',
+  'library.manage.done': 'Done',
+  'library.manage.selected': '{n} selected',
+  'library.manage.selectAll': 'Select loaded',
+  'library.manage.unselectAll': 'Deselect all',
+  'library.manage.clearSelection': 'Clear selection',
+  'library.manage.removeSelected': 'Remove selected',
+  'library.manage.removeConfirm': 'Remove {n} selected games? You can restore them any time under “Removed”.',
+  'library.manage.hint': 'Click cards to select, then remove the ones you no longer want in one go.',
+  'library.removed.view': 'Removed',
+  'library.removed.empty': 'Nothing removed yet',
+  'library.removed.emptyHint': 'Games you remove while browsing are kept here and can be restored any time.',
+  'library.removed.toast': 'Removed {n}',
+  'library.removed.restoreResult': 'Restored {n}',
+  'library.removed.fail': 'Remove failed — try again',
+  'library.removed.restoreFail': 'Restore failed — try again',
 }
 
 export default library

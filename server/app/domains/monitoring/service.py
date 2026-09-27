@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from app.core.database import get_session_factory
 from app.domains.monitoring.models import (
@@ -408,6 +408,24 @@ async def is_excluded(target_type: str, target_id: int) -> bool:
         ).scalar_one_or_none() is not None
 
 
+async def exclusion_reason(target_type: str, target_id: int) -> str | None:
+    """当前 active 排除的 reason；无 active 排除时 None。
+
+    供恢复类动作判定「这条排除是不是自己挂的」——只解除本链路所挂的
+    排除，用户显式设置的排除语义不被洗掉。
+    """
+    async with get_session_factory()() as session:
+        return (
+            await session.execute(
+                select(MonitorExclusion.reason).where(
+                    MonitorExclusion.target_type == target_type,
+                    MonitorExclusion.target_id == int(target_id),
+                    MonitorExclusion.active.is_(True),
+                )
+            )
+        ).scalar_one_or_none()
+
+
 async def track(target_type: str, target_id: int, source: str = "manual") -> str:
     """重新监控：清排除 + 挂来源。排除是资格门，只有显式动作能打开。"""
     await set_exclusion(target_type, target_id, False)
@@ -417,6 +435,52 @@ async def track(target_type: str, target_id: int, source: str = "manual") -> str
 async def stop(target_type: str, target_id: int) -> str:
     """停止监控：摘掉全部来源（保留排除语义，Catalog 与价格历史不动）。"""
     return await detach_all_sources(target_type, target_id)
+
+
+async def forget(target_type: str, target_id: int) -> bool:
+    """抹掉对象的监控记录（target 行 + 来源历史），回到「无记录」基线。
+
+    只服务「无记录即默认参与」的对象语义——捆绑包没有监控记录时默认
+    参与整表刷新，取消关注后不得停留在 released（released 会把它挡在
+    刷新候选集之外）。有激活来源或激活排除时拒绝执行（调用方语义错误）；
+    排除历史行保留（排除/解除可回溯）。
+    """
+    tid = int(target_id)
+    async with get_session_factory()() as session:
+        active_source = (
+            await session.execute(
+                select(MonitorSource.id).where(
+                    MonitorSource.target_type == target_type,
+                    MonitorSource.target_id == tid,
+                    MonitorSource.active.is_(True),
+                )
+            )
+        ).scalar_one_or_none()
+        active_exclusion = (
+            await session.execute(
+                select(MonitorExclusion.id).where(
+                    MonitorExclusion.target_type == target_type,
+                    MonitorExclusion.target_id == tid,
+                    MonitorExclusion.active.is_(True),
+                )
+            )
+        ).scalar_one_or_none()
+        if active_source is not None or active_exclusion is not None:
+            return False
+        await session.execute(
+            delete(MonitorSource).where(
+                MonitorSource.target_type == target_type,
+                MonitorSource.target_id == tid,
+            )
+        )
+        await session.execute(
+            delete(MonitorTarget).where(
+                MonitorTarget.target_type == target_type,
+                MonitorTarget.target_id == tid,
+            )
+        )
+        await session.commit()
+    return True
 
 
 # ── 对外：状态查询 ────────────────────────────────────────────
