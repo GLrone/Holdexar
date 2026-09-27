@@ -24,12 +24,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session_factory
+from app.domains.crawl import freshness as freshness_service
 from app.domains.games.models import Bundle, BundleRegionPrice, Game, GameCurrentPrice
 from app.domains.games.pricing import (
     build_steam_header_url,
@@ -105,6 +107,28 @@ def invalidate_bundles_cache() -> None:
     _DATA_CACHE = None
     _LIST_CACHE = None
     _LIST_JSON_CACHE.clear()
+
+
+async def _bundle_blocked_ids() -> set[int]:
+    """用户已移除/已排除的包（monitoring released + excluded，与刷新候选集同口径）。"""
+    try:
+        from app.domains.monitoring import service as monitoring_service
+
+        return await monitoring_service.blocked_ids("bundle")
+    except Exception:  # noqa: BLE001
+        logger.exception("[bundles] 监控状态读取失败（列表按全量展示处理）")
+        return set()
+
+
+async def _bundle_followed_ids() -> set[int]:
+    """星标关注的包（monitoring favorite 来源，升序去重）。"""
+    try:
+        from app.domains.monitoring import service as monitoring_service
+
+        return set(await monitoring_service.ids_with_source("bundle", "favorite"))
+    except Exception:  # noqa: BLE001
+        logger.exception("[bundles] 关注状态读取失败（列表按无置顶处理）")
+        return set()
 
 
 def _normalize_image(url: str | None) -> str | None:
@@ -314,6 +338,16 @@ def _aggregate(
         # smart 评分随载荷下发：前端选区时用「save(该区差价) + 评分余量」做
         # 地区重锚排序（余量 = 评分 − save(快照差价)，与地区无关的三因子和）
         "smartScore": float(bundle.smart_score or 0.0),
+        # 价格数据状态（观察时刻/新鲜度分档）：观察时刻 = 该包全部价格行的
+        # MAX(crawled_at)，与 games 的 priceData 同口径（被观察过即算，不按
+        # 价格有无过滤）；无 coverage——捆绑包不属价格刷新 Cycle 的期望集，
+        # 不冒充覆盖率。
+        "priceData": freshness_service.freshness_of(
+            max(
+                (p.crawled_at for p in price_rows if p.crawled_at is not None),
+                default=None,
+            )
+        ),
     }
 
 
@@ -454,6 +488,7 @@ async def _refresh_bundle_sort_cache(
                 BundleRegionPrice.currency,
                 BundleRegionPrice.discount_percent,
                 BundleRegionPrice.bundle_base_discount,
+                BundleRegionPrice.discount_end_ts,
                 BundleRegionPrice.cny_fen,
                 BundleRegionPrice.app_ids,
             ).where(BundleRegionPrice.bundle_id.in_(ids))
@@ -549,8 +584,10 @@ async def _load_all_locked(
                     BundleRegionPrice.currency,
                     BundleRegionPrice.discount_percent,
                     BundleRegionPrice.bundle_base_discount,
+                    BundleRegionPrice.discount_end_ts,
                     BundleRegionPrice.cny_fen,
                     BundleRegionPrice.app_ids,
+                    BundleRegionPrice.crawled_at,
                 )
             )
         ).all()
@@ -574,18 +611,29 @@ def _build_list_items(bundles, prices_by_bundle, tracked) -> list[dict]:
     return [i for i in items if i["regionPrices"]]
 
 
-async def list_bundles(sort: str = "diff") -> list[dict]:
+async def list_bundles(sort: str = "diff", *, removed: bool = False) -> list[dict]:
     """全量捆绑包列表（sort=diff 差价降序 | smart 评分降序）。
 
     区域价/最低价/差价按追踪区（crawl_regions 启用集）过滤——
     未启用任何区时全量展示（对齐游戏卡 GPW 语义）。
     聚合结果缓存（失效见 invalidate_bundles_cache + 汇率/追踪区指纹）；
     返回的是缓存对象，调用方只读（无改写方）。
+
+    监控作用域（removed 参数）：
+    - False（默认）：隐藏用户已移除/已排除的包（monitoring 的
+      released + excluded 集合，与刷新候选集同一口径），关注过的包
+      置顶（组内保持 SQL 排序的稳定分区，不重排）；
+    - True：只出已移除/已排除的包（恢复视图），不走聚合缓存。
     """
     sort = _normalize_sort(sort)
     global _LIST_CACHE
     tracked = await _tracked_region_codes()
     bundles, prices_by_bundle, rates = await _load_all(sort)
+    if removed:
+        blocked = await _bundle_blocked_ids()
+        return _build_list_items(
+            [b for b in bundles if b.bundle_id in blocked], prices_by_bundle, tracked
+        )
     # tracked=None 是合法语义（未启用任何区 = 全量展示），指纹按空集归一
     fp = _list_fp(tracked, rates)
     key = (fp, sort)
@@ -595,7 +643,16 @@ async def list_bundles(sort: str = "diff") -> list[dict]:
         # 双检：等锁期间（预热/并发请求）可能已经建好
         if _LIST_CACHE is not None and _LIST_CACHE[0] == key:
             return _LIST_CACHE[1]
+        blocked = await _bundle_blocked_ids()
+        if blocked:
+            bundles = [b for b in bundles if b.bundle_id not in blocked]
         items = _build_list_items(bundles, prices_by_bundle, tracked)
+        followed = await _bundle_followed_ids()
+        if followed:
+            # 关注置顶 = 稳定分区（关注组 / 其余组各自保持 SQL 排序），不重排
+            items = [i for i in items if i["bundleId"] in followed] + [
+                i for i in items if i["bundleId"] not in followed
+            ]
         _LIST_CACHE = (key, items)
         return items
 
@@ -696,34 +753,6 @@ async def get_bundle_detail(bundle_id: int) -> dict | None:
 
     summary["games"] = games
     return summary
-async def _bundle_blocked_ids() -> set[int]:
-    """用户已移除/已排除的包（monitoring released + excluded，与刷新候选集同口径）。"""
-    try:
-        from app.domains.monitoring import service as monitoring_service
-
-        return await monitoring_service.blocked_ids("bundle")
-    except Exception:  # noqa: BLE001
-        logger.exception("[bundles] 监控状态读取失败（列表按全量展示处理）")
-        return set()
-
-
-async def _bundle_followed_ids() -> set[int]:
-    """星标关注的包（monitoring favorite 来源，升序去重）。"""
-    try:
-        from app.domains.monitoring import service as monitoring_service
-
-        return set(await monitoring_service.ids_with_source("bundle", "favorite"))
-    except Exception:  # noqa: BLE001
-        logger.exception("[bundles] 关注状态读取失败（列表按无置顶处理）")
-        return set()
-
-
-
-    监控作用域（removed 参数）：
-    - False（默认）：隐藏用户已移除/已排除的包（monitoring 的
-      released + excluded 集合，与刷新候选集同一口径），关注过的包
-      置顶（组内保持 SQL 排序的稳定分区，不重排）；
-    - True：只出已移除/已排除的包（恢复视图），不走聚合缓存。
 
 
 # ── 用户面动作：移除 / 恢复 / 关注（复用 monitoring 的 bundle 生命周期）──
