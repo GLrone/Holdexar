@@ -1660,7 +1660,7 @@ export const notificationsApi = {
   stats: () => request<NotificationStats>('GET', '/notifications/stats'),
 }
 
-/** 历史窗口档位（null = 全量 16 年档案） */
+/** 历史窗口档位（null = 档案全量） */
 export type RateRange = '1mo' | '6mo' | '1y' | '5y' | '10y' | 'all'
 
 /**
