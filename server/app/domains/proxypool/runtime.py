@@ -22,6 +22,7 @@ PASS / PASS-RULE 共 7 个），数总数会把 M 虚高。
 from __future__ import annotations
 
 import asyncio
+import logging
 import socket
 import time
 from collections.abc import Mapping, Sequence
@@ -86,6 +87,8 @@ LANE_GROUP_PREFIX = "lane-"
 # lane 数的上限 = 生产 worker 上限（`exits.MAX_CRAWL_WORKERS`）：工位数与出口槽数同源，
 # 两处取不同数值会出现「选得出 60 个出口，却只开得出 32 个工位」这种半截容量。
 MAX_LANES = MAX_CRAWL_WORKERS
+
+logger = logging.getLogger(__name__)
 
 
 class RuntimeConfigError(RuntimeError):
@@ -251,7 +254,52 @@ def lane_count_for(pool_size: int, requested: int | None = None) -> int:
     return max(0, min(MAX_LANES, pool_size, int(n)))
 
 
-def prepare_runtime_config(data_dir: Path, *, lanes: int | None = None) -> Path:
+def _pinned_runtime_endpoints(data_dir: Path) -> dict | None:
+    """读**现役**运行配置里可被热重载沿用的端点（controller / mixed-port / lane 端口）。
+
+    热重载不能换控制器（重载后内核仍监听原 controller 端口），沿用 mixed-port 与
+    既有 lane 端口则让所有已交出的入口 URL 继续有效。没有现役配置（首次启动、
+    文件缺失或不可解析）→ `None`，此时热重载没有可沿用的端点，调用方必须走冷通道。
+    """
+    path = runtime_config_path(data_dir)
+    if not path.is_file():
+        return None
+    try:
+        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (yaml.YAMLError, OSError):
+        return None
+    if not isinstance(doc, Mapping):
+        return None
+    controller = doc.get("external-controller")
+    if not isinstance(controller, str) or not controller.strip():
+        return None
+    try:
+        mixed_port = int(doc.get("mixed-port"))
+    except (TypeError, ValueError):
+        return None
+    old_lane_ports: dict[int, int] = {}
+    for entry in (doc.get("listeners") or []):
+        if not isinstance(entry, Mapping):
+            continue
+        name = str(entry.get("name") or "")
+        port = entry.get("port")
+        # 只认池 lane（`lane-<序号>-in`）；探测 lane（HlProbeLane-*）等其它 listener
+        # 的端口仍在被现役内核占用，钉进新配置只会撞车
+        if not name.startswith(LANE_GROUP_PREFIX) or not isinstance(port, int) or port <= 0:
+            continue
+        tail = name[len(LANE_GROUP_PREFIX):].split("-", 1)[0]
+        if tail.isdigit():
+            old_lane_ports[int(tail)] = port
+    return {
+        "controller": controller.strip(),
+        "secret": str(doc.get("secret") or ""),
+        "mixed_port": mixed_port,
+        "lane_ports": [old_lane_ports[i] for i in sorted(old_lane_ports)],
+    }
+
+
+def prepare_runtime_config(data_dir: Path, *, lanes: int | None = None,
+                           pin_running: bool = False) -> Path:
     """由 `crawl-pool.yaml` 生成 `crawl-runtime.yaml`——内核实际启动用的文件。
 
     为什么必须分文件：`ClashRuntime.start()` 会把 `external-controller` / `secret`
@@ -273,8 +321,19 @@ def prepare_runtime_config(data_dir: Path, *, lanes: int | None = None) -> Path:
       本机代理入口开给局域网）；
     - `mixed-port: <动态空闲端口>`：GLOBAL 入口。
 
+    `pin_running=True`（热重载通道）：controller / secret / mixed-port / 既有 lane
+    端口全部沿用**现役运行配置**的值——热重载后内核仍监听原端点，所有已交出的
+    URL 继续有效；超出既有数量的 lane 才分配新端口。没有现役配置可沿用时抛
+    `RuntimeConfigError`（热重载的前提不成立，调用方走冷通道）。
+
     这些键**只**进运行配置，绝不回流进池文件。
     """
+    pinned = _pinned_runtime_endpoints(data_dir) if pin_running else None
+    if pin_running and pinned is None:
+        raise RuntimeConfigError(
+            "热重载要求沿用现役运行配置的端点，但现役配置缺失或不可解析"
+        )
+
     pool = pool_path(data_dir)
     doc = yaml.safe_load(pool.read_text(encoding="utf-8"))
     if not isinstance(doc, Mapping) or not isinstance(doc.get("proxies"), list):
@@ -286,11 +345,14 @@ def prepare_runtime_config(data_dir: Path, *, lanes: int | None = None) -> Path:
         {"name": f"{LANE_GROUP_PREFIX}{i}", "type": "select", "proxies": list(names)}
         for i in range(n_lanes)
     ]
+    old_lane_ports = pinned["lane_ports"] if pinned else []
     listeners = [
         {
             "name": f"{LANE_GROUP_PREFIX}{i}-in",
             "type": "mixed",
-            "port": _free_local_port(),
+            "port": (
+                old_lane_ports[i] if i < len(old_lane_ports) else _free_local_port()
+            ),
             "listen": RUNTIME_BIND_ADDRESS,
             "proxy": f"{LANE_GROUP_PREFIX}{i}",
         }
@@ -304,12 +366,15 @@ def prepare_runtime_config(data_dir: Path, *, lanes: int | None = None) -> Path:
             "mode": RUNTIME_MODE,
             "allow-lan": False,
             "bind-address": RUNTIME_BIND_ADDRESS,
-            # 自带 controller，**不依赖注入的共享默认端口**：老订阅内核若没有
-            # controller 行，`ensure_controller` 会给它注入 19090，恰好撞上本实例。
-            # 与 mixed-port 同一思路：各用各的动态端口。
-            "external-controller": f"{RUNTIME_CONTROLLER_HOST}:{_free_local_port()}",
-            "secret": RUNTIME_CONTROLLER_SECRET,
-            "mixed-port": _free_local_port(),
+            # 自带 controller，**不依赖共享默认端口**：19090 起的默认段是各
+            # 内核实例的公共候选，池实例必须与其隔离。与 mixed-port 同一思路：
+            # 各用各的动态端口。
+            "external-controller": (
+                pinned["controller"] if pinned
+                else f"{RUNTIME_CONTROLLER_HOST}:{_free_local_port()}"
+            ),
+            "secret": pinned["secret"] if pinned else RUNTIME_CONTROLLER_SECRET,
+            "mixed-port": pinned["mixed_port"] if pinned else _free_local_port(),
             "proxies": list(doc["proxies"]),
             "proxy-groups": groups,
             "listeners": listeners,
@@ -380,7 +445,7 @@ async def wait_proxy_names(
     deadline = time.monotonic() + timeout
     last = "控制器始终没有响应"
     headers = _headers(secret)
-    async with httpx.AsyncClient(timeout=3.0, headers=headers) as client:
+    async with httpx.AsyncClient(trust_env=False, timeout=3.0, headers=headers) as client:
         while time.monotonic() < deadline:
             try:
                 resp = await client.get(f"{base_url}/proxies")
@@ -465,6 +530,7 @@ class RebuildResult:
     lane_urls: tuple[str, ...] = ()       # 生产入口：每条 lane 一个本机地址
     lane_nodes: tuple[str, ...] = ()      # 各 lane 绑定到的节点（按 lane 序号）
     lane_exits: tuple[str, ...] = ()      # 各 lane 绑定的出口 IP（同序；容量单位）
+    hot_applied: bool = False             # True = 热重载生效（进程未重启、端口未变）
 
 
 def restore_selection(previous: str | None, available: Sequence[str]) -> str | None:
@@ -484,7 +550,7 @@ async def current_global_selection(
 ) -> str | None:
     """读当前 `GLOBAL`。控制器不可达 → `None`（当作"没有已知选择"）。"""
     try:
-        async with httpx.AsyncClient(timeout=timeout, headers=_headers(secret)) as client:
+        async with httpx.AsyncClient(trust_env=False, timeout=timeout, headers=_headers(secret)) as client:
             resp = await client.get(f"{controller_url}/proxies/GLOBAL")
             return resp.json().get("now")
     except Exception:  # noqa: BLE001 —— 读不到就不恢复，由 fallback 接手
@@ -495,7 +561,7 @@ async def _put_global(
     controller_url: str, secret: str, name: str, *,
     timeout: float = DEFAULT_SELECT_TIMEOUT,
 ) -> str | None:
-    async with httpx.AsyncClient(timeout=timeout, headers=_headers(secret)) as client:
+    async with httpx.AsyncClient(trust_env=False, timeout=timeout, headers=_headers(secret)) as client:
         await client.put(f"{controller_url}/proxies/GLOBAL", json={"name": name})
         return (await client.get(f"{controller_url}/proxies/GLOBAL")).json().get("now")
 
@@ -506,6 +572,38 @@ async def apply_global_selection(
 ) -> str | None:
     """把 `GLOBAL` 设为指定节点并回读确认（维护事务与重建共用同一动作）。"""
     return await _put_global(controller_url, secret, name, timeout=timeout)
+
+
+async def controller_alive(
+    controller_url: str, secret: str, *, timeout: float = 2.0
+) -> bool:
+    """控制器是否可达（GET /version）。热重载通道的前置探测。"""
+    try:
+        async with httpx.AsyncClient(trust_env=False, 
+            timeout=timeout, headers=_headers(secret)
+        ) as client:
+            return (await client.get(f"{controller_url}/version")).status_code == 200
+    except Exception:  # noqa: BLE001 —— 连不上就是不可达，由调用方走冷通道
+        return False
+
+
+async def reload_runtime_config(
+    controller_url: str, secret: str, config_path: str, *, timeout: float = 15.0
+) -> None:
+    """让**在跑的内核**加载新配置（`PUT /configs?force=true`），进程不动。
+
+    内核会重载 proxies / proxy-groups / listeners（含端口重绑）。非 2xx 视为
+    内核拒绝这份配置；加载是否真的成立（节点集合、入口监听）由调用方的对账
+    与等待步骤确认，任何一步不过都回退冷通道。
+    """
+    async with httpx.AsyncClient(trust_env=False, timeout=timeout, headers=_headers(secret)) as client:
+        resp = await client.put(
+            f"{controller_url}/configs?force=true", json={"path": config_path}
+        )
+        if resp.status_code >= 300:
+            raise RuntimeRebuildError(
+                f"内核拒绝热重载新配置（HTTP {resp.status_code}）：{config_path}"
+            )
 
 
 def plan_lane_assignment(
@@ -552,7 +650,7 @@ async def current_lane_selections(
     """读各 lane 组当前的选择（按 lane 序号）。读不到记 `None`。"""
     out: list[str | None] = []
     try:
-        async with httpx.AsyncClient(timeout=timeout, headers=_headers(secret)) as client:
+        async with httpx.AsyncClient(trust_env=False, timeout=timeout, headers=_headers(secret)) as client:
             for i in range(count):
                 try:
                     resp = await client.get(f"{controller_url}/proxies/{LANE_GROUP_PREFIX}{i}")
@@ -574,7 +672,7 @@ async def assign_lanes(
     落到组内默认项（而不是被分配的节点），出口归因随之失真。
     """
     applied: list[str | None] = []
-    async with httpx.AsyncClient(timeout=timeout, headers=_headers(secret)) as client:
+    async with httpx.AsyncClient(trust_env=False, timeout=timeout, headers=_headers(secret)) as client:
         for i, node in enumerate(selections):
             group = f"{LANE_GROUP_PREFIX}{i}"
             if node is None:
@@ -661,16 +759,18 @@ async def rebuild_runtime(
     exe_path: str,
     wait_timeout: float = DEFAULT_WAIT_TIMEOUT,
 ) -> RebuildResult:
-    """一次完整的池重建 + Runtime 恢复。
+    """一次完整的池重建 + Runtime 恢复。生效通道两段式（**先热后冷**）：
 
-    顺序本身是契约的一部分：
+        capture previous GLOBAL / lane 绑定 → build_pool → 选出口槽
+        → 热通道（控制器可达时）：钉定端点生成新配置 → PUT /configs → wait
+          + reconcile → restore GLOBAL → 重绑 lane —— 进程不动、端口不变
+        → 热通道不可用或任何一步未通过 → 冷通道：prepare（全新端口）→
+          **显式 stop** → start → wait + reconcile → restore GLOBAL → 重绑 lane
 
-        capture previous GLOBAL / lane 绑定 → build_pool → prepare_runtime_config
-        → **显式 stop** → start → wait（控制器 / 入口 / lane 入口）+ reconcile
-        → restore GLOBAL → 重绑 lane
-
-    `start()` 对已在跑的内核**不会重启**（除非传 `restart_if_changed`），所以 `stop()`
-    不能省——否则会出现"配置文件里是新端口、实际跑的还是旧内核"。
+    冷通道里 `start()` 对已在跑的内核**不会重启**（除非传 `restart_if_changed`），
+    所以 `stop()` 不能省——否则会出现"配置文件里是新端口、实际跑的还是旧内核"。
+    热通道不经过 `start()`，不存在该竞态；两条通道的对账、选择恢复与 lane 绑定
+    契约完全一致。
     """
     previous = (
         await current_global_selection(controller_url, secret)
@@ -686,11 +786,28 @@ async def rebuild_runtime(
     build = await build_pool(session, data_dir=data_dir)
     # 容量单位是**独立出口 IP**，不是节点数：槽数即本次 run 的 lane 数。
     # 一个出口 IP 都没探到时退回按节点数开工位（池刚建好、尚未跑 L1 的形态）。
-    slots = select_exit_slots(await eligible_nodes(session))
+    from app.domains.proxypool.health import latest_l0_delays
+
+    slots = select_exit_slots(
+        await eligible_nodes(session), delays=await latest_l0_delays(session)
+    )
+
+    if controller_url and await controller_alive(controller_url, secret):
+        try:
+            return await _hot_apply_rebuild(
+                data_dir=data_dir, controller_url=controller_url, secret=secret,
+                runtime=runtime, build=build, slots=slots, previous=previous,
+                previous_lanes=previous_lanes, wait_timeout=wait_timeout,
+            )
+        except Exception as exc:  # noqa: BLE001 —— 热通道任何一步未通过都回退冷通道
+            logger.warning(
+                "池配置热重载未通过（%s：%s），回退进程重启", type(exc).__name__, exc
+            )
+
     config = prepare_runtime_config(data_dir, lanes=len(slots) or None)
 
     runtime.stop()
-    status = runtime.start(exe_path, str(config))
+    status = runtime.start(exe_path, str(config), inject_lanes=False)
     base = status["controllerUrl"]
     new_secret = getattr(runtime, "secret", secret)
     observed = await wait_proxy_names(base, new_secret, timeout=wait_timeout)
@@ -750,6 +867,76 @@ async def rebuild_runtime(
         lane_urls=tuple(f"http://127.0.0.1:{p}" for p in lane_ports),
         lane_nodes=tuple(node or "" for node in lane_nodes),
         lane_exits=tuple(slot.exit_ip for slot in slots[:len(lane_ports)]),
+    )
+
+
+async def _hot_apply_rebuild(
+    *,
+    data_dir: Path,
+    controller_url: str,
+    secret: str,
+    runtime: _KernelRuntime,
+    build,
+    slots: list["ExitSlot"],
+    previous: str | None,
+    previous_lanes: list[str | None],
+    wait_timeout: float,
+) -> RebuildResult:
+    """热通道：新池配置交给**在跑的内核**加载（`PUT /configs`），进程与端点都不动。
+
+    配置由 `prepare_runtime_config(pin_running=True)` 生成——controller / secret /
+    mixed-port / 既有 lane 端口全部沿用现役值，重载后所有已交出的入口 URL 继续
+    有效。对账在这里失败**不落**编排事件：它不是终态，调用方会立即回退冷通道
+    再走一遍完整流程。
+    """
+    config = prepare_runtime_config(data_dir, lanes=len(slots) or None, pin_running=True)
+    await reload_runtime_config(controller_url, secret, str(config))
+    observed = await wait_proxy_names(controller_url, secret, timeout=wait_timeout)
+    # 入口就绪晚于控制器就绪（重载会重绑 listener）：不等它，交出去的地址会 ConnectError
+    port = await wait_mixed_port(data_dir, timeout=wait_timeout)
+
+    ledger = reconcile(
+        registry_names=set(build.runtime_names),
+        pool_names=set(build.runtime_names),
+        observed_names=observed,
+    )
+    if not ledger.ok:
+        raise RuntimeRebuildError(
+            f"热重载后对账失败：缺 {sorted(ledger.missing)}，多 {sorted(ledger.unexpected)}"
+        )
+
+    chosen = restore_selection(previous, build.runtime_names)
+    if chosen is not None:
+        applied = await _put_global(controller_url, secret, chosen)
+        if applied != chosen:
+            raise RuntimeRebuildError(
+                f"恢复 GLOBAL 失败：now={applied!r}，期望 {chosen!r}"
+            )
+
+    lane_ports, lane_nodes = await align_lanes(
+        data_dir=data_dir, controller_url=controller_url, secret=secret,
+        pool_names=build.runtime_names, previous=previous_lanes,
+        slots=slots or None, timeout=wait_timeout,
+    )
+    note = getattr(runtime, "note_pool_config_reloaded", None)
+    if note is not None:
+        # 内核实例的账目（config_path / startup 文本 / mixed-port）随新配置同步，
+        # 否则后续 status()/stop() 读到的是重载前的旧值
+        note(str(config))
+
+    return RebuildResult(
+        proxy_url=f"http://127.0.0.1:{port}",
+        mixed_port=port,
+        controller_url=controller_url,
+        pool_names=tuple(build.runtime_names),
+        previous_selection=previous,
+        selection=chosen,
+        expected_count=build.expected_count,
+        written_count=build.written_count,
+        lane_urls=tuple(f"http://127.0.0.1:{p}" for p in lane_ports),
+        lane_nodes=tuple(node or "" for node in lane_nodes),
+        lane_exits=tuple(slot.exit_ip for slot in slots[:len(lane_ports)]),
+        hot_applied=True,
     )
 
 
@@ -909,9 +1096,12 @@ def lane_plan_consistency(
 
 async def exit_slot_snapshot(session) -> list[ExitSlot]:
     """当前出口槽快照（顺序与 `select_exit_slots` 一致，即重建时的 lane 位次）。"""
+    from app.domains.proxypool.health import latest_l0_delays
     from app.domains.proxypool.pool import eligible_nodes
 
-    return select_exit_slots(await eligible_nodes(session))
+    return select_exit_slots(
+        await eligible_nodes(session), delays=await latest_l0_delays(session)
+    )
 
 
 def _notify_rebuild() -> None:

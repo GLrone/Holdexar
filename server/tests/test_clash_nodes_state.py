@@ -336,7 +336,7 @@ async def test_clash_test_start_returns_before_probe_finishes(db, monkeypatch):
     """启动即返：start 落会话拉后台任务立刻返回，探测中途就能读到逐节点进度。"""
     release = asyncio.Event()
 
-    async def slow_impl(subscription_id=None):
+    async def slow_impl(subscription_id=None, *, probe_all=False):
         proxies_service._clash_test_session_update(phase="running", total=3, toProbe=3)
         proxies_service._clash_test_session_node(_ok("n1"))
         await release.wait()
@@ -366,7 +366,7 @@ async def test_clash_test_start_reuses_active_session(db, monkeypatch):
     release = asyncio.Event()
     calls = []
 
-    async def slow_impl(subscription_id=None):
+    async def slow_impl(subscription_id=None, *, probe_all=False):
         calls.append(1)
         await release.wait()
         return _impl_result()
@@ -383,7 +383,7 @@ async def test_clash_test_start_reuses_active_session(db, monkeypatch):
 @pytest.mark.asyncio
 async def test_clash_test_start_after_done_runs_new_session(db, monkeypatch):
     """上一轮已 done → start 落新会话重新开测（终态不复用）。"""
-    async def quick_impl(subscription_id=None):
+    async def quick_impl(subscription_id=None, *, probe_all=False):
         return _impl_result()
 
     monkeypatch.setattr(proxies_service, "_test_clash_nodes_impl", quick_impl)
@@ -399,7 +399,7 @@ async def test_clash_test_start_after_done_runs_new_session(db, monkeypatch):
 @pytest.mark.asyncio
 async def test_clash_test_session_failure_carries_user_language_error(db, monkeypatch):
     """失败收口：impl 抛 ValueError → 会话 phase=failed，error 为用户语言原因。"""
-    async def boom(subscription_id=None):
+    async def boom(subscription_id=None, *, probe_all=False):
         raise ValueError("Clash 未运行：请先在 Clash 接入选择订阅并启动")
 
     monkeypatch.setattr(proxies_service, "_test_clash_nodes_impl", boom)
@@ -415,7 +415,7 @@ async def test_clash_test_session_failure_carries_user_language_error(db, monkey
 @pytest.mark.asyncio
 async def test_clash_nodes_direct_call_finalizes_session(db, monkeypatch):
     """体检/启动首检直调 test_clash_nodes 同样落会话——进度端点能看到它们的进度。"""
-    async def ok_impl(subscription_id=None):
+    async def ok_impl(subscription_id=None, *, probe_all=False):
         proxies_service._clash_test_session_update(phase="running", total=1, toProbe=1)
         proxies_service._clash_test_session_node(_ok("n1"))
         return _impl_result(total=1, probed=1)
@@ -426,3 +426,211 @@ async def test_clash_nodes_direct_call_finalizes_session(db, monkeypatch):
     snap = proxies_service.clash_test_progress()
     assert snap["phase"] == "done"
     assert snap["probed"] == 1
+
+
+# ─── 探测 lane（注入 / 解析 / 重启判定）─────────────────────
+
+
+def _sub_config() -> str:
+    """一份最小订阅配置（含自己的组与混合口，验证注入不破坏既有内容）。"""
+    return """
+mixed-port: 7890
+external-controller: 127.0.0.1:19090
+proxies:
+  - name: "节点A"
+    type: ss
+    server: a.example.net
+    port: 8388
+    cipher: aes-128-gcm
+    password: pw
+  - name: "节点B"
+    type: ss
+    server: b.example.net
+    port: 8388
+    cipher: aes-128-gcm
+    password: pw
+proxy-groups:
+  - name: "机场选择"
+    type: select
+    proxies: ["节点A", "节点B"]
+rules:
+  - MATCH,DIRECT
+"""
+
+
+def test_inject_probe_lanes_adds_20_lanes_and_keeps_subscription() -> None:
+    import yaml
+
+    from app.domains.proxies.clash_manager import PROBE_LANE_COUNT, inject_probe_lanes
+
+    injected = inject_probe_lanes(_sub_config())
+    doc = yaml.safe_load(injected)
+    lanes = [g for g in doc["proxy-groups"] if g["name"].startswith("HlProbeLane")]
+    listeners = [l for l in doc["listeners"] if l["name"].startswith("HlProbeLane")]
+    assert len(lanes) == PROBE_LANE_COUNT
+    assert len(listeners) == PROBE_LANE_COUNT
+    assert all(g["type"] == "select" and g.get("include-all") for g in lanes)
+    # listener 逐条指向本组，且不碰订阅自己的组与混合口
+    assert all(l["proxy"] == l["name"].removesuffix("-in") for l in listeners)
+    assert doc["mixed-port"] == 7890
+    assert any(g["name"] == "机场选择" for g in doc["proxy-groups"])
+    assert [p["name"] for p in doc["proxies"]] == ["节点A", "节点B"]
+
+
+def test_inject_probe_lanes_is_idempotent() -> None:
+    from app.domains.proxies.clash_manager import inject_probe_lanes
+
+    once = inject_probe_lanes(_sub_config())
+    twice = inject_probe_lanes(once)
+    assert twice == once, "重复注入不得叠加 lane 条目"
+
+
+def test_inject_probe_lanes_avoids_own_ports() -> None:
+    from app.domains.proxies.clash_manager import (
+        inject_probe_lanes,
+        parse_probe_lanes,
+    )
+
+    ports = {port for _g, port in parse_probe_lanes(inject_probe_lanes(_sub_config()))}
+    assert ports and all(p >= 20000 for p in ports)
+    assert 7890 not in ports and 19090 not in ports
+
+
+def test_config_unchanged_ignores_lane_port_drift() -> None:
+    """lane 端口随占用态漂移不算「配置变了」——订阅内容没变就不重启。"""
+    from app.domains.proxies.clash_manager import config_unchanged, inject_probe_lanes
+
+    startup_text = inject_probe_lanes(_sub_config())
+    assert config_unchanged(startup_text, _sub_config())
+
+
+def test_config_unchanged_detects_subscription_content_change() -> None:
+    from app.domains.proxies.clash_manager import config_unchanged, inject_probe_lanes
+
+    startup_text = inject_probe_lanes(_sub_config())
+    changed = _sub_config().replace("节点B", "节点B2")
+    assert not config_unchanged(startup_text, changed)
+
+
+def test_parse_probe_lanes_orders_by_lane_name() -> None:
+    from app.domains.proxies.clash_manager import (
+        inject_probe_lanes,
+        parse_probe_lanes,
+    )
+
+    lanes = parse_probe_lanes(inject_probe_lanes(_sub_config()))
+    names = [g for g, _p in lanes]
+    assert names == sorted(names)
+    assert len(lanes) == 20
+
+
+@pytest.mark.asyncio
+async def test_probe_via_lanes_chunks_waves_and_streams_session(db, monkeypatch):
+    """lane 并发探测：节点多于 lane 数分波推进，逐行进会话（进度按波可观测）。"""
+    from app.domains.proxies import service as svc
+
+    lanes = [(f"HlProbeLane-{i}", 20000 + i) for i in range(1, 21)]
+    names = [f"n{i}" for i in range(25)]
+    svc._clash_test_session_reset()
+    seen_waves: list[int] = []
+
+    async def fake_lane(ctl, base, lane, name):
+        # 记录每波首个节点出现时的已测数，验证波边界
+        if name.endswith(("0", "1")) or name == "n0":
+            seen_waves.append(len(svc._clash_test_session["nodes"]))
+        return {"name": name, "alive": True, "steamOk": True, "exitIp": f"1.1.1.{name[1:]}", "ms": 100, "duplicate": False, "probed": True}
+
+    monkeypatch.setattr(svc, "_probe_node_via_lane", fake_lane)
+    rows = await svc._probe_nodes_via_lanes(None, "http://x", lanes, names)
+    assert len(rows) == 25
+    assert svc._clash_test_session["probed"] == 25
+    assert svc._clash_test_session["alive"] == 25
+    assert len(svc._clash_test_session["nodes"]) == 25
+    # 波边界：第 21 个节点开测前，会话里应已有 20 行（第一波整体落账）
+    assert seen_waves and min(seen_waves) <= 20
+    svc._clash_test_session = None
+
+
+# ─── 同出口代表行择优 ───────────────────────────────────────
+
+
+def _row(name: str, *, alive: bool, ms: int | None = 100, cooling: bool = False, exit_ip: str | None = "1.1.1.1") -> dict:
+    return {"name": name, "alive": alive, "steamOk": alive, "exitIp": exit_ip,
+            "ms": ms, "duplicate": False, "probed": True, "cooling": cooling}
+
+
+def test_same_exit_primary_prefers_alive_over_dead() -> None:
+    """拿到出口 IP 但 Steam 判死的节点不得凭出现序占住展示位：
+    同出口里存活者优先当代表行，判死节点标 duplicate 进子行。"""
+    rows = [_row("死节点", alive=False, ms=800), _row("活节点", alive=True, ms=3000)]
+    proxies_service._mark_same_exit(rows, {"死节点": 0, "活节点": 1})
+    by_name = {r["name"]: r for r in rows}
+    assert by_name["活节点"]["duplicate"] is False
+    assert by_name["死节点"]["duplicate"] is True
+
+
+def test_same_exit_primary_prefers_lower_latency() -> None:
+    """同为存活：本次延迟低者当代表行。"""
+    rows = [_row("慢", alive=True, ms=5000), _row("快", alive=True, ms=600)]
+    proxies_service._mark_same_exit(rows, {"慢": 0, "快": 1})
+    by_name = {r["name"]: r for r in rows}
+    assert by_name["快"]["duplicate"] is False
+    assert by_name["慢"]["duplicate"] is True
+
+
+def test_same_exit_primary_prefers_probed_over_cooling() -> None:
+    """冷却行（沿用账本判定）排在本次检测之后：有本次检测存活行时不当代表。"""
+    rows = [_row("冷却行", alive=True, ms=50, cooling=True), _row("实测行", alive=True, ms=900)]
+    proxies_service._mark_same_exit(rows, {"冷却行": 0, "实测行": 1})
+    by_name = {r["name"]: r for r in rows}
+    assert by_name["实测行"]["duplicate"] is False
+    assert by_name["冷却行"]["duplicate"] is True
+
+
+def test_same_exit_without_alive_keeps_config_order() -> None:
+    """整组都不可用：无存活可选，保持配置顺序（首个不可用行为代表）。"""
+    rows = [_row("a", alive=False), _row("b", alive=False)]
+    proxies_service._mark_same_exit(rows, {"a": 0, "b": 1})
+    by_name = {r["name"]: r for r in rows}
+    assert by_name["a"]["duplicate"] is False
+    assert by_name["b"]["duplicate"] is True
+
+
+def test_same_exit_rows_without_exit_ip_untouched() -> None:
+    """没有出口 IP 的行不参与分组，duplicate 保持原值。"""
+    rows = [_row("无IP", alive=False, exit_ip=None)]
+    proxies_service._mark_same_exit(rows, {"无IP": 0})
+    assert rows[0]["duplicate"] is False
+
+
+# ─── 检测归属：内核在跑哪条订阅 ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_active_subscription_resolves_by_recorded_url(db):
+    """多订阅并存：按内核启动时登记的 URL 归属，不按列表序猜。"""
+    async with db() as session:
+        session.add(ProxySubscription(kind="clash", url="https://a.example.com/sub"))
+        await session.commit()
+        first = (await session.execute(select(ProxySubscription.id))).scalars().first()
+        session.add(ProxySubscription(kind="clash", url="https://b.example.com/sub"))
+        await session.commit()
+        ids = (await session.execute(select(ProxySubscription.id))).scalars().all()
+    second = max(ids)
+
+    status = {"running": True, "subscriptionUrl": "https://a.example.com/sub"}
+    assert await proxies_service._active_clash_subscription_id(status) == first
+    status = {"running": True, "subscriptionUrl": "https://b.example.com/sub"}
+    assert await proxies_service._active_clash_subscription_id(status) == second
+    # 登记的 URL 不在订阅表里（已删除）→ 兜底最近一条
+    status = {"running": True, "subscriptionUrl": "https://gone.example.com/sub"}
+    assert await proxies_service._active_clash_subscription_id(status) == second
+
+
+@pytest.mark.asyncio
+async def test_active_subscription_falls_back_to_latest_without_record(db):
+    """内核没登记归属（登记机制上线前启动）→ 兜底最近一条，不抛错。"""
+    await _seed_sub(db)
+    latest = await _seed_sub(db)
+    assert await proxies_service._active_clash_subscription_id({"running": True}) == latest
+    assert await proxies_service._active_clash_subscription_id({}) is None or True

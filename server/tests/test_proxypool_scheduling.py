@@ -1,4 +1,4 @@
-"""P1.6-B：调度边界（7 条）。
+"""P1.6-B：调度边界（9 条）。
 
 把 P1.6-A 摸到的现状固化成契约：
 
@@ -7,13 +7,16 @@
 
 1. 两条 crawler 路径统一互斥（`start_job` 与 bundles 直调 `run_crawl` 共用同一占用语义）
 2. crawl 占线时 L0 照跑、只改状态、置 `rebuild_pending`，**不重启内核**
-3. crawl 结束后空闲时消费 pending → rebuild → 新端口 + GLOBAL 恢复
+3. crawl 结束后空闲时消费 pending → rebuild（热通道：进程与入口端口都不动）
+   → GLOBAL 恢复；目标与现状一致的空转请求被闸下，合格集已空而 Runtime 活着
+   时不物化空池
 4. crawl 占线时 L1/L2 **直接跳过**（不排队、不动 GLOBAL）
 5. L1/L2 是 capture → probe → restore 事务（恢复读**当前**池，不用开始时缓存的列表）
 6. proxypool Runtime 与老订阅 Runtime 真正隔离（不碰对方进程/端口）
 7. proxypool 的 controller 端口不依赖共享默认值 19090（不与其他 Runtime 撞）
 
-不测（本批边界）：固定 mixed-port、失败 1/2/3 次阈值、运行中请求切换。
+不测（本批边界）：失败 1/2/3 次阈值、运行中请求切换、热通道失败回退冷通道
+（归 rebuild 编排测试）。
 """
 from __future__ import annotations
 
@@ -42,7 +45,7 @@ from app.domains.proxies.kernel_release import kernel_filename  # noqa: E402
 from app.domains.proxypool.models import (  # noqa: E402
     ProxyNode, ProxyNodeSource, node_fingerprint,
 )
-from app.domains.proxypool.pool import build_pool, pool_path  # noqa: E402
+from app.domains.proxypool.pool import build_pool, pool_file_names, pool_path  # noqa: E402
 from app.domains.proxypool.runtime import (  # noqa: E402
     prepare_runtime_config, rebuild_runtime, runtime_config_path, wait_mixed_port,
     wait_proxy_names,
@@ -368,7 +371,7 @@ async def test_l0_while_busy_marks_pending_without_restart(
     end_crawl()
 
 
-# ══ 3. 空闲时消费 pending → rebuild ══════════════════════════════
+# ══ 3. 空闲时消费 pending → rebuild（热通道：进程与端口都不动） ═══
 @pytest.mark.asyncio
 async def test_pending_rebuild_consumed_when_idle(
     tmp_data_dir, kernel_exe_path, proxy_runtime
@@ -381,6 +384,7 @@ async def test_pending_rebuild_consumed_when_idle(
     assert await _select(base, secret, "1|B") == "1|B"
     old_mixed = proxy_runtime.port
     old_controller = proxy_runtime.controller_url
+    pid_before = proxy_runtime.process.pid
 
     await _set_state("1|C", NODE_DEAD)
     request_rebuild()
@@ -395,10 +399,65 @@ async def test_pending_rebuild_consumed_when_idle(
 
     assert result is not None
     assert rebuild_pending() is False, "消费过就该清空"
-    assert result.mixed_port != old_mixed, "重建后端口必然变化（P1.5 实测）"
+    assert result.hot_applied is True, "控制器可达时空闲重建走热通道"
+    assert proxy_runtime.process.pid == pid_before, "热通道不重启内核进程"
+    assert result.mixed_port == old_mixed, "热通道沿用现役入口端口"
+    assert result.controller_url == old_controller, "热通道沿用现役 controller"
+    assert result.pool_names == ("1|A", "1|B"), "死节点必须出池"
     assert result.selection == "1|B", "GLOBAL 必须恢复到重建前的选择"
     assert await _global_now(result.controller_url, secret) == "1|B"
-    assert proxy_runtime.controller_url != old_controller
+
+
+# ══ 3b. 空转闸：目标与现状一致 → 重建跳过，内核不受扰 ════════════
+@pytest.mark.asyncio
+async def test_rebuild_skipped_when_target_unchanged(
+    tmp_data_dir, kernel_exe_path, proxy_runtime
+) -> None:
+    await init_db()
+    await _add("1|A", port=_free_port())
+    await _add("1|B", port=_free_port())
+    base, secret = await _boot(proxy_runtime, kernel_exe_path, tmp_data_dir)
+    pid_before = proxy_runtime.process.pid
+
+    request_rebuild()  # 池与 lane 计划均无变化：纯空转的重建请求
+    async with get_session_factory()() as s:
+        result = await run_pending_rebuild(
+            s, data_dir=tmp_data_dir, controller_url=base, secret=secret,
+            runtime=proxy_runtime, exe_path=str(kernel_exe_path),
+        )
+        await s.commit()
+
+    assert result is None, "目标与现状一致：重建必须被闸下"
+    assert rebuild_pending() is False, "消费语义不变（请求被消费掉）"
+    assert proxy_runtime.process.pid == pid_before, "空转重建不得扰动内核"
+
+
+# ══ 3c. 空转闸：合格集已空而 Runtime 活着 → 拒绝物化空池 ═════════
+@pytest.mark.asyncio
+async def test_rebuild_refuses_empty_pool_while_runtime_alive(
+    tmp_data_dir, kernel_exe_path, proxy_runtime
+) -> None:
+    await init_db()
+    await _add("1|A", port=_free_port())
+    await _add("1|B", port=_free_port())
+    base, secret = await _boot(proxy_runtime, kernel_exe_path, tmp_data_dir)
+    pid_before = proxy_runtime.process.pid
+
+    await _set_state("1|A", NODE_DEAD)
+    await _set_state("1|B", NODE_DEAD)
+    request_rebuild()
+    async with get_session_factory()() as s:
+        result = await run_pending_rebuild(
+            s, data_dir=tmp_data_dir, controller_url=base, secret=secret,
+            runtime=proxy_runtime, exe_path=str(kernel_exe_path),
+        )
+        await s.commit()
+
+    assert result is None, "合格集为空且 Runtime 在跑：不得物化空池"
+    assert proxy_runtime.process.pid == pid_before, "现役内核必须保留"
+    assert set(pool_file_names(tmp_data_dir)) == {"1|A", "1|B"}, (
+        "池文件保持原样：内核继续跑旧池，等订阅恢复后按非空重建跟进"
+    )
 
 
 # ══ 4. 占线时 L1/L2 直接跳过 ═════════════════════════════════════
@@ -565,7 +624,8 @@ async def test_cycle_when_idle_rebuilds_then_maintains(
 
     assert first.busy is False
     assert first.rebuilt is not None, "空闲时该消费 pending 真重建"
-    assert first.rebuilt.mixed_port != old_port
+    assert first.rebuilt.hot_applied is True, "控制器可达时重建走热通道"
+    assert first.rebuilt.mixed_port == old_port, "热通道沿用现役入口端口"
     assert first.rebuilt.selection == "1|B", "重建必须恢复 GLOBAL"
     assert first.maintenance is not None
     assert first.maintenance.selection == "1|B", "维护结束仍要是 B（只观察）"
@@ -578,7 +638,8 @@ async def test_cycle_when_idle_rebuilds_then_maintains(
 async def test_crawl_service_injects_current_runtime_per_run(
     tmp_data_dir, kernel_exe_path, proxy_runtime, monkeypatch
 ) -> None:
-    """run A 全程用一组 lane 端口；重建后 run B 用新的一组——**不是** worker 各自取。"""
+    """run A 全程用一组 lane 端口；重建后入口集合变化，run B 重新取一次——**不是**
+    worker 各自取。热通道沿用既有 lane 端口，新增出口才追加新工位。"""
     from app.domains.crawl import service as cs
     from app.domains.proxypool.runtime import lane_proxy_urls
 
@@ -605,6 +666,9 @@ async def test_crawl_service_injects_current_runtime_per_run(
     await cs._active.task
     assert captured[-1] == lanes_x, "一个 run 只取一次入口集合，整个 run 固定用它"
 
+    # 新增一个**不同出口 IP** 的节点 → 重建后出口槽 1 → 2，lane 追加一条工位
+    await _add("1|B", port=_free_port())
+    await _set_exit_ip("1|B", "2.2.2.2")
     async with get_session_factory()() as s:
         await rebuild_runtime(
             s, data_dir=tmp_data_dir, controller_url=base, secret=secret,
@@ -612,11 +676,12 @@ async def test_crawl_service_injects_current_runtime_per_run(
         )
         await s.commit()
     lanes_y = lane_proxy_urls(tmp_data_dir)
-    assert lanes_y and set(lanes_y) != set(lanes_x), "重建换掉整套 lane 端口"
+    assert lanes_y and set(lanes_y) != set(lanes_x), "出口槽增长后入口集合必须变化"
+    assert lanes_x[0] in lanes_y, "热通道沿用既有 lane 端口，既有工位不变"
 
     await cs.start_job(scope="appids", appids=[220], regions=["us"], kind="manual")
     await cs._active.task
-    assert captured[-1] == lanes_y, "新 run 必须用新的入口集合"
+    assert captured[-1] == lanes_y, "新 run 必须用当前的入口集合"
     assert len({tuple(x or []) for x in captured}) == 2
 
 
@@ -745,7 +810,8 @@ async def test_proxypool_controller_port_is_dedicated(
     assert doc.get("secret"), "自带 secret，避免与别的实例共用凭据"
     assert config == runtime_config_path(tmp_data_dir)
 
-    # 现实场景：老 Runtime 的配置没有 external-controller → ensure_controller 注入 19090
+    # 现实场景：老 Runtime 的配置没有 external-controller → 启动时按共享默认
+    # 端口（19090 起避让）解析控制器，经命令行参数下发生效
     legacy_dir = tmp_data_dir / "clash"
     legacy_dir.mkdir(parents=True, exist_ok=True)
     legacy_mixed = _free_port()

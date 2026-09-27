@@ -7,6 +7,15 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+# 本机开着系统代理时，httpx 的 trust_env 会把**环回地址**的请求也交给
+# 代理（httpx 不读注册表代理的「绕过本地」名单）→ 内核 controller 探测
+# 拿到代理的 502，整批内核用例假失败。测试进程一律直连。
+os.environ.setdefault("NO_PROXY", "*")
+os.environ.setdefault("no_proxy", "*")
+for _proxy_key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                   "http_proxy", "https_proxy", "all_proxy"):
+    os.environ.pop(_proxy_key, None)
+
 
 @pytest.fixture(autouse=True)
 def _sanitize_db_lru_caches():

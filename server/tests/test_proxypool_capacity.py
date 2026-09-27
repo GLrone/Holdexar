@@ -162,3 +162,60 @@ def test_empty_pool_yields_no_slots() -> None:
     assert select_exit_slots([]) == []
     assert select_exit_slots([_node(0, exit_ip=None)]) == []
     assert slots_to_plan([], []) == []
+
+# ── 6. 延迟优先 ──────────────────────────────────────────────────
+def test_lower_delay_exit_takes_slot_first() -> None:
+    """同状态下延迟低的出口先拿工位（工作 IP 按延迟择优）。"""
+    nodes = [
+        _node(1, exit_ip="10.0.0.1", l2=NOW),
+        _node(2, exit_ip="10.0.0.2", l2=NOW),
+        _node(3, exit_ip="10.0.0.3", l2=NOW),
+    ]
+    delays = {"n1": 800, "n2": 120, "n3": 450}
+    slots = select_exit_slots(nodes, delays=delays)
+    assert [s.node_id for s in slots] == ["n2", "n3", "n1"], "120ms < 450ms < 800ms"
+
+
+def test_unmeasured_exit_ranks_after_measured_within_same_state() -> None:
+    """同状态下没测过延迟的出口排在已测之后（None 不凭空当最快）。"""
+    nodes = [
+        _node(1, exit_ip="10.0.0.1", l2=NOW),
+        _node(2, exit_ip="10.0.0.2", l2=NOW),
+    ]
+    delays = {"n1": 900}
+    slots = select_exit_slots(nodes, delays=delays)
+    assert [s.node_id for s in slots] == ["n1", "n2"]
+
+
+def test_state_rank_outranks_delay() -> None:
+    """状态优先于延迟：ACTIVE 慢出口仍先于 NEW 快出口（健康是底线）。"""
+    nodes = [
+        _node(1, exit_ip="10.0.0.1", state=NODE_NEW, l2=NOW),
+        _node(2, exit_ip="10.0.0.2", state=NODE_ACTIVE, l2=NOW),
+    ]
+    delays = {"n1": 50, "n2": 900}
+    slots = select_exit_slots(nodes, delays=delays)
+    assert [s.node_id for s in slots] == ["n2", "n1"]
+
+
+def test_low_delay_member_becomes_exit_representative() -> None:
+    """同出口多节点：延迟低者当代表节点（真正扛 lane 流量的人），其余为候选。"""
+    nodes = [
+        _node(1, exit_ip="10.0.0.1", l2=NOW),
+        _node(2, exit_ip="10.0.0.1", l2=NOW),
+    ]
+    delays = {"n1": 700, "n2": 90}
+    slots = select_exit_slots(nodes, delays=delays)
+    assert len(slots) == 1
+    assert slots[0].node_id == "n2"
+    assert slots[0].alternatives == ("1|node1",)
+
+
+def test_without_delays_ordering_falls_back_to_time_keys() -> None:
+    """不传延迟表 → 退回状态/时间口径（旧行为不回归）。"""
+    nodes = [
+        _node(1, exit_ip="10.0.0.1", l2=NOW - timedelta(minutes=5)),
+        _node(2, exit_ip="10.0.0.2", l2=NOW),
+    ]
+    slots = select_exit_slots(nodes)
+    assert [s.node_id for s in slots] == ["n2", "n1"]

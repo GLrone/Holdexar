@@ -11,11 +11,12 @@
 - **L1/L2** 会 `PUT /proxies/GLOBAL` → 与 crawl 并行会改掉 crawler 的出口并让归因失真
   → **占线时直接跳过**（观察任务，不排队，避免积压成自己的调度负担）。跑完必须
   **恢复 GLOBAL**，否则每轮维护都会偷偷改生产出口。
-- **rebuild** stop/start 内核 → 只能空闲时做；请求先落成 `rebuild_pending`，
-  空闲时消费。
+- **rebuild** 优先热重载（`PUT /configs`，进程不动、端口不变），控制器不可达或
+  重载未通过才回退 stop/start；请求先落成 `rebuild_pending`，空闲时消费。
 
 `rebuild_pending` 是**可合并的信号**（`false→true`、`true→true`），代表"当前 Runtime 的
-池内容已脏，需要一次重建"，不是 L0 专属，也不做计数。
+池内容已脏，需要一次重建"，不是 L0 专属，也不做计数。消费侧另有**空转闸**：目标与
+现状完全一致、或合格集已空而 Runtime 还活着时，重建被跳过（见 `run_pending_rebuild`）。
 """
 from __future__ import annotations
 
@@ -28,7 +29,7 @@ from pathlib import Path
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.crawler.occupancy import crawler_busy
-from app.domains.proxypool.exits import exit_snapshot, slot_signature
+from app.domains.proxypool.exits import exit_snapshot, select_exit_slots, slot_signature
 from app.domains.proxypool.health import (
     DEFAULT_BUSINESS_APPID,
     BusinessOutcome,
@@ -36,16 +37,21 @@ from app.domains.proxypool.health import (
     business_check_pool,
     exit_ip_check_pool,
     health_check_pool,
+    latest_l0_delays,
     recover_dead_nodes,
 )
-from app.domains.proxypool.pool import eligible_runtime_names, pool_file_names
+from app.domains.proxypool.pool import eligible_nodes, eligible_runtime_names, pool_file_names
 from app.domains.proxypool.runtime import (
     RebuildResult,
     _KernelRuntime,
     apply_global_selection,
     current_global_selection,
+    current_runtime_proxy_url,
+    lane_count_for,
+    read_lane_plan,
     rebuild_runtime,
     restore_selection,
+    runtime_lane_ports,
 )
 
 logger = logging.getLogger(__name__)
@@ -244,6 +250,50 @@ async def run_maintenance_cycle(
     )
 
 
+async def _rebuild_skip_reason(session: AsyncSession, *, data_dir: Path) -> str | None:
+    """消费 pending 后判断这次重建是否还值得动手。返回跳过原因；`None` = 动手。
+
+    两类空转都在这里拦下：
+    - **目标未变**（合格集 = 池文件、lane 计划 = 当前出口槽、入口都活着）——
+      重建是纯扰动，产出与现状完全相同的池，还要折腾一次内核；
+    - **合格集已空而 Runtime 还活着**——物化空池只会杀掉在跑的内核，而爬取
+      本就按 DB 快照 fail-closed（`crawl_lane_plan` 看不到出口槽），把内核留着
+      等订阅恢复才是对的。池文件与合格集在此刻允许不一致。
+
+    Runtime 不可达时**不跳过**（返回 `None`）：重建也是"内核掉了把它拉起来"的
+    恢复路径。闸内任何读取异常一律放行重建（宁多动一次，不漏一次真重建）。
+    """
+    try:
+        alive = current_runtime_proxy_url(data_dir) is not None
+        eligible = set(await eligible_runtime_names(session))
+        if alive and not eligible:
+            return "合格集为空且 Runtime 在跑：拒绝物化空池（保留现核等订阅恢复）"
+        if set(pool_file_names(data_dir)) != eligible:
+            return None
+        ports = runtime_lane_ports(data_dir)
+        slots = select_exit_slots(
+            await eligible_nodes(session), delays=await latest_l0_delays(session)
+        )
+        # 期望 lane 数必须与重建的口径一致（`len(slots) or None` 走 lane_count_for），
+        # 否则闸会放过/误伤与重建产物不同的现状
+        expected_lanes = lane_count_for(len(eligible), len(slots) or None)
+        if len(ports) != expected_lanes:
+            return None
+        plan = {int(e.get("lane", -1)): e for e in read_lane_plan(data_dir)}
+        for i, slot in enumerate(slots):
+            entry = plan.get(i) or {}
+            node = str(entry.get("node") or "")
+            exit_ip = str(entry["exitIp"]) if entry.get("exitIp") else None
+            if node != slot.runtime_name or exit_ip != slot.exit_ip:
+                return None
+        if alive:
+            return "池与 lane 计划均与现状一致：重建无目标差异"
+        return None
+    except Exception:  # noqa: BLE001 —— 闸 itself 故障时放行重建，不拦真需求
+        logger.exception("[重建] 空转闸读取异常，按需重建处理")
+        return None
+
+
 async def run_pending_rebuild(
     session: AsyncSession, *,
     data_dir: Path,
@@ -256,10 +306,18 @@ async def run_pending_rebuild(
 
     占线或无待重建 → `None`（什么都不做，绝不 stop 内核）。消费发生在**动手之前**：
     重建过程中新产生的 pending 属于下一次重建，不会被这次吞掉。
+
+    动手前先过空转闸（`_rebuild_skip_reason`）：目标与现状一致、或合格集已空而
+    Runtime 还活着 → 跳过并返回 `None`；重建生效优先走热重载通道（见
+    `rebuild_runtime`），失败自动回退进程重启。
     """
     if crawler_busy():
         return None
     if not take_rebuild_pending():
+        return None
+    skip = await _rebuild_skip_reason(session, data_dir=data_dir)
+    if skip is not None:
+        logger.info("[重建] 跳过本次重建：%s", skip)
         return None
     return await rebuild_runtime(
         session, data_dir=data_dir, controller_url=controller_url, secret=secret,

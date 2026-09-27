@@ -132,7 +132,7 @@ async def _build(data_dir: Path):
 
 async def _start_and_read(runtime: ClashRuntime, exe: Path, config: Path,
                           *, timeout: float = 15.0) -> frozenset[str]:
-    status = runtime.start(str(exe), str(config))
+    status = runtime.start(str(exe), str(config), inject_lanes=False)
     assert status["controllerUrl"], "内核启动后必须注入/解析出控制器地址"
     return await wait_proxy_names(
         status["controllerUrl"], runtime.secret, timeout=timeout
@@ -316,7 +316,7 @@ async def test_runtime_config_carries_runtime_only_keys(
         "运行期键不得回流进池文件——池只放 Registry 的运行集"
     )
 
-    status = clash_runtime.start(str(kernel_exe_path), str(config))
+    status = clash_runtime.start(str(kernel_exe_path), str(config), inject_lanes=False)
     await wait_proxy_names(status["controllerUrl"], clash_runtime.secret, timeout=15)
 
     listening = False
@@ -351,7 +351,7 @@ async def test_kernel_opens_one_listener_per_lane_and_selects_independently(
     build = await _build(tmp_data_dir)
     assert list(build.runtime_names) == names
 
-    status = clash_runtime.start(str(kernel_exe_path), str(prepare_runtime_config(tmp_data_dir)))
+    status = clash_runtime.start(str(kernel_exe_path), str(prepare_runtime_config(tmp_data_dir)), inject_lanes=False)
     base = status["controllerUrl"]
     await wait_proxy_names(base, clash_runtime.secret, timeout=15)
 

@@ -42,6 +42,7 @@ from app.domains.proxies.models import ProxySubscription
 from app.domains.proxypool import events
 from app.domains.proxypool.admission import is_admitted
 from app.domains.proxypool.exits import select_exit_slots
+from app.domains.proxypool.health import latest_l0_delays
 from app.domains.proxypool.pool import (
     build_pool, eligible_nodes, eligible_runtime_names, pool_path,
 )
@@ -358,7 +359,11 @@ async def ensure_pool_runtime(
             )
 
         sync: SyncResult | None = None
-        if not skip_sync:
+        if not skip_sync and not await eligible_runtime_names(session):
+            # 只有 Registry 为空（真·首建：全新安装，或全部订阅从未拉成过）才在
+            # 起核前拉订阅——内核就位不等网络。Registry 有货（重启场景，库是
+            # 持久化的）直接吃现存合格集起核；订阅下载交给启动链后位的同步步骤
+            # 与 30min 刷新，池变化经 rebuild_pending → 重建（热重载优先）跟进。
             sync = await sync_subscriptions(
                 session, data_dir=data_dir, now=now,
                 kernel_proxy=(
@@ -373,10 +378,12 @@ async def ensure_pool_runtime(
             )
 
         build = await build_pool(session, data_dir=data_dir)
-        slots = select_exit_slots(await eligible_nodes(session))
+        slots = select_exit_slots(
+            await eligible_nodes(session), delays=await latest_l0_delays(session)
+        )
         config = prepare_runtime_config(data_dir, lanes=len(slots) or None)
         runtime.stop()
-        status = runtime.start(exe_path, str(config))
+        status = runtime.start(exe_path, str(config), inject_lanes=False)
         base = status["controllerUrl"]
         secret = getattr(runtime, "secret", "")
         observed = await wait_proxy_names(base, secret, timeout=wait_timeout)
