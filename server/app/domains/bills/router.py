@@ -27,6 +27,9 @@ async def sync_bills() -> dict:
     result = await service.sync_bills(force=True)
     if result.get("status") == "no_cookie":
         raise HTTPException(409, "尚未绑定 Steam Cookie，无法同步账单")
+    if result.get("status") == "busy":
+        # 已有同步在跑（含定时任务）：不报错，前端按「续看进度」处理
+        return result
     if not result.get("ok"):
         raise HTTPException(502, f"账单同步失败：{result.get('error', '未知错误')}")
     return result

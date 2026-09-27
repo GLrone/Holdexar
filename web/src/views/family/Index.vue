@@ -125,26 +125,13 @@ async function loadFamily() {
   }
 }
 
-/* ── 同步家庭组：主账号 Cookie → GetFamilyGroupForUser → 成员自动补齐 ── */
-const syncing = ref(false)
+/* ── 同步家庭组：主账号 Cookie → GetFamilyGroupForUser → 成员自动补齐 ──
+   生命周期在 familyLib store（重入防护 + 完成消息入灵动岛）；这里只负责
+   同步成功后刷新页面自己的成员清单 */
+const syncing = computed(() => libStore.syncing)
 async function syncFamily() {
-  syncing.value = true
-  message.loading(t('family.action.syncing'))
-  try {
-    const r = await familyApi.sync()
-    if (r.joined) {
-      const groupName = r.familyName || t('family.group.unnamed')
-      message.success(t('family.sync.success', { name: groupName, n: r.members.length }))
-      void libStore.load(true)  // 家庭组变了：强制重拉家庭库聚合
-    } else {
-      message.info(r.message || t('family.sync.notJoined'))
-    }
-    await loadFamily()
-  } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
-  } finally {
-    syncing.value = false
-  }
+  const groupName = await libStore.syncFamily()
+  if (groupName) await loadFamily()
 }
 
 /* ── 添加成员输入框：好友码/SteamID64 实时解析预览 ── */

@@ -120,7 +120,7 @@ async def save_cookies(payload: SteamCookiesPayload) -> AccountStatus:
                     "[account] 绑定后账单同步：history %s 行 / licenses %s 行",
                     r.get("historyRows"), r.get("licenseRows"),
                 )
-            elif r.get("status") != "no_cookie":
+            elif r.get("status") not in ("no_cookie", "busy"):
                 logger.info("[account] 绑定后账单同步失败：%s", r.get("error"))
         except Exception:  # noqa: BLE001 —— 失败由 30min 定时同步兜底
             logger.exception("[account] 绑定后账单同步异常（定时任务将兜底）")

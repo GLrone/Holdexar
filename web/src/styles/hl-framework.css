@@ -1437,95 +1437,7 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
 .pc-event-tag{font-size:10px;padding:2px 8px;border-radius:3px;background:var(--surface-chip-2);color:var(--text-muted);display:flex;align-items:center;gap:4px}
 .pc-event-tag .pc-event-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
 
-/* Message / Notification */
-.hl-toast-box {
-  position: fixed;
-  top: 20px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 9999;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 8px;
-  pointer-events: none;
-}
-.hl-toast {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 17px;
-  font-size: 13px;
-  background: var(--surface-overlay-solid);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow-lg);
-  color: var(--text-primary);
-  animation: hlToastIn calc(var(--duration-3) * var(--motion-scale)) var(--ease-spring);
-  pointer-events: auto;
-  backdrop-filter: blur(12px);
-}
-.hl-toast.is-leave { animation: hlToastOut calc(var(--duration-2) * var(--motion-scale)) var(--ease-inout) forwards; }
-.hl-toast__icon { display: inline-flex; font-weight: 700; font-style: normal; }
-.hl-toast--success .hl-toast__icon { color: var(--success); }
-.hl-toast--error .hl-toast__icon { color: var(--danger); }
-.hl-toast--warning .hl-toast__icon { color: var(--warning); }
-.hl-toast--info .hl-toast__icon { color: var(--info); }
-/* 进度气泡（message.progress）：细进度条换行铺满。总量未知的长任务
-   （账单翻页）拿不到百分比，条带往复滑动只表达「活着」，进度实数走文本。 */
-.hl-toast--progress { max-width: 340px; flex-wrap: wrap; }
-.hl-toast__bar {
-  position: relative;
-  flex-basis: 100%;
-  height: 3px;
-  margin-top: 2px;
-  border-radius: 2px;
-  overflow: hidden;
-  background: var(--surface-track);
-}
-.hl-toast__bar::before {
-  content: '';
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 0;
-  width: 40%;
-  border-radius: 2px;
-  background: var(--accent);
-  animation: hlToastBarSlide 1.4s var(--ease-inout) infinite;
-}
-@keyframes hlToastBarSlide {
-  from { transform: translateX(-100%); }
-  to { transform: translateX(350%); }
-}
-/* 循环动画按动效红线显式关停（不走 --motion-scale：0s + infinite 会空转） */
-@media (prefers-reduced-motion: reduce) {
-  .hl-toast__bar::before { animation: none; }
-}
-.hl-notification {
-  width: 330px;
-  background: var(--bg-card);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-lg);
-  padding: 14px 16px;
-}
-.hl-notification__title {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text-primary);
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-.hl-notification__title button {
-  background: none;
-  border: none;
-  color: var(--text-muted);
-  cursor: pointer;
-  font-size: 14px;
-}
-.hl-notification__content { font-size: 12.5px; color: var(--text-muted); margin-top: 6px; line-height: 1.6; }
+/* Message 消息面由 components/ui/HlIsland.vue 承担（顶部悬浮胶囊），样式随组件 scoped */
 
 /* Skeleton / Empty / Spinner / Backtop / Descriptions */
 .hl-skeleton {
@@ -1549,11 +1461,9 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
   animation: hlSpin 0.8s linear infinite;
   flex-shrink: 0;
 }
-/* 按键/气泡内置小号转圈（hl-btn 与 hl-toast 均为 flex gap 布局，无需外距） */
+/* 按键内置小号转圈（hl-btn 为 flex gap 布局，无需外距） */
 .hl-spinner--inline { width: 14px; height: 14px; }
-/* `--xs` 取代了 `.hl-toast__spin`：那个类把本块的四行声明逐字又抄了一遍，只把尺寸
-   改成 12px（toast 由 message.ts 命令式创建，够不着 scoped 样式，当年就另起了个类）。
-   现在 message.ts 直接写 `hl-spinner hl-spinner--xs`，一套实现一个尺寸刻度。 */
+/* 小号转圈：按键与岛内内联的尺寸刻度 */
 .hl-spinner--xs { width: 12px; height: 12px; }
 .hl-btn--sm .hl-spinner--inline,
 .hl-btn-art--sm .hl-spinner--inline { width: 12px; height: 12px; }

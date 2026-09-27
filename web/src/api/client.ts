@@ -1810,6 +1810,8 @@ export interface BillSyncResult {
   warnings: string[]
   replaced?: number
   ok?: boolean
+  /** busy = 已有同步在跑（含定时任务），本次未重复发起 */
+  status?: string
   historyRows?: number
   licenseRows?: number
 }

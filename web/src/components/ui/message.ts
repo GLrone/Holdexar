@@ -1,76 +1,65 @@
 /* ════════════════════════════════════════════════════════════════════
-   message.ts — 全局 Message（Toast）服务
-   替代 ElMessage 的框架内实现；视图层唯一入口：
+   message.ts — 全局 Message 服务
+   视图层唯一入口：
      import { message } from '@/components/ui'
      message.success('已保存') / message.error('连接超时')
-   异步进行中反馈：message.loading('获取中…') 显示持久气泡，
-   任意结果消息（success/error/warning/info）弹出时自动顶替退场。
-   末位 duration 可调显示时长（缺省 2400ms）。
+   本模块只负责入队，气泡渲染由 HlIsland.vue 承担（顶部悬浮胶囊）。
+   进行中反馈：message.loading('获取中…') 占住展示槽位，
+   任意结果消息（success/error/warning/info）入队时就地顶替。
+   末位可传显示时长（缺省 2400ms），或传选项对象附带详情 / 重试 / 跳转。
    ════════════════════════════════════════════════════════════════════ */
+
+import { dropNotice, pushNotice, updateNotice } from './island'
 
 export type MessageType = 'success' | 'error' | 'warning' | 'info'
 
-const GLYPH: Record<MessageType, string> = {
-  success: '✓',
-  error: '✕',
-  warning: '!',
-  info: 'i',
+/** 结果消息的可选补充：展开面正文、原地重试、详情跳转 */
+export interface MessageOptions {
+  /** 显示时长（ms） */
+  duration?: number
+  /** 展开态正文，一句话说清发生了什么 */
+  detail?: string
+  /** 展开态「重试」动作的回调；不给则该按钮不出现 */
+  retry?: () => void
+  /** 展开态详情动作的跳转目标路由；不给则按语义给默认落点 */
+  to?: string
+  /** 详情动作按钮文案 */
+  toLabel?: string
 }
 
-let box: HTMLElement | null = null
-let loadingEl: HTMLElement | null = null
+const DEFAULT_DURATION = 2400
 
-function ensureBox(): HTMLElement {
-  if (box && document.body.contains(box)) return box
-  box = document.createElement('div')
-  box.className = 'hl-toast-box'
-  document.body.appendChild(box)
-  return box
+function normalize(opts?: number | MessageOptions): MessageOptions {
+  return typeof opts === 'number' ? { duration: opts } : (opts ?? {})
 }
 
-function leave(el: HTMLElement) {
-  el.classList.add('is-leave')
-  window.setTimeout(() => el.remove(), 220)
+function show(type: MessageType, text: string, opts?: number | MessageOptions): number {
+  const o = normalize(opts)
+  return pushNotice({
+    tone: type,
+    text,
+    detail: o.detail ?? '',
+    sticky: false,
+    duration: o.duration ?? DEFAULT_DURATION,
+    retry: o.retry ?? null,
+    to: o.to ?? '',
+    toLabel: o.toLabel ?? '',
+  })
 }
 
-function dismissLoading() {
-  const el = loadingEl
-  loadingEl = null
-  if (el) leave(el)
-}
-
-function show(type: MessageType, text: string, duration = 2400) {
-  dismissLoading()
-  const el = document.createElement('div')
-  el.className = `hl-toast hl-toast--${type}`
-  el.setAttribute('role', 'status')
-  const icon = document.createElement('i')
-  icon.className = 'hl-toast__icon'
-  icon.textContent = GLYPH[type]
-  el.appendChild(icon)
-  el.appendChild(document.createTextNode(text))
-  ensureBox().appendChild(el)
-  window.setTimeout(() => {
-    el.classList.add('is-leave')
-    window.setTimeout(() => el.remove(), 220)
-  }, duration)
-}
-
-/** 进行中气泡：不自动消失，等结果消息顶替（或手动调用返回的关闭函数） */
-function showLoading(text: string): () => void {
-  dismissLoading()
-  const el = document.createElement('div')
-  el.className = 'hl-toast hl-toast--loading'
-  el.setAttribute('role', 'status')
-  const spin = document.createElement('i')
-  spin.className = 'hl-spinner hl-spinner--xs'
-  el.appendChild(spin)
-  el.appendChild(document.createTextNode(text))
-  ensureBox().appendChild(el)
-  loadingEl = el
-  return () => {
-    if (loadingEl === el) dismissLoading()
-  }
+/** 进行中气泡：不自动收起，等结果消息顶替（或手动调用返回的关闭函数） */
+function showLoading(text: string, detail = ''): () => void {
+  const id = pushNotice({
+    tone: 'progress',
+    text,
+    detail,
+    sticky: true,
+    duration: 0,
+    retry: null,
+    to: '',
+    toLabel: '',
+  })
+  return () => dropNotice(id)
 }
 
 /** 进度气泡句柄：update 换文案（轮询方携带实时数字），close 主动收场 */
@@ -79,41 +68,30 @@ export interface ProgressToast {
   close: () => void
 }
 
-/** 进度气泡：转圈 + 可更新文本 + 细进度条。给总量未知的长任务用
- *  （如账单翻页）——条带往复滑动表示「活着」，进度实数走文本；
- *  与 loading 同占一个槽位，结果消息弹出时同样自动顶替退场。 */
-function showProgress(text: string): ProgressToast {
-  dismissLoading()
-  const el = document.createElement('div')
-  el.className = 'hl-toast hl-toast--loading hl-toast--progress'
-  el.setAttribute('role', 'status')
-  const spin = document.createElement('i')
-  spin.className = 'hl-spinner hl-spinner--xs'
-  el.appendChild(spin)
-  const label = document.createElement('span')
-  label.textContent = text
-  el.appendChild(label)
-  const bar = document.createElement('i')
-  bar.className = 'hl-toast__bar'
-  el.appendChild(bar)
-  ensureBox().appendChild(el)
-  loadingEl = el
+/** 进度气泡：可更新文本的进行中项，占住展示槽位直至主动收场 */
+function showProgress(text: string, detail = ''): ProgressToast {
+  const id = pushNotice({
+    tone: 'progress',
+    text,
+    detail,
+    sticky: true,
+    duration: 0,
+    retry: null,
+    to: '',
+    toLabel: '',
+  })
   return {
-    update: (next: string) => {
-      label.textContent = next
-    },
-    close: () => {
-      if (loadingEl === el) dismissLoading()
-    },
+    update: (next: string) => updateNotice(id, next),
+    close: () => dropNotice(id),
   }
 }
 
 export const message = {
-  /** duration 缺省 2400ms；需要用户看清的长文本提示可显式加长 */
-  success: (text: string, duration?: number) => show('success', text, duration),
-  error: (text: string, duration?: number) => show('error', text, duration),
-  warning: (text: string, duration?: number) => show('warning', text, duration),
-  info: (text: string, duration?: number) => show('info', text, duration),
+  /** 末位传 number 为显示时长；传对象可附带详情 / 重试 / 跳转 */
+  success: (text: string, opts?: number | MessageOptions) => show('success', text, opts),
+  error: (text: string, opts?: number | MessageOptions) => show('error', text, opts),
+  warning: (text: string, opts?: number | MessageOptions) => show('warning', text, opts),
+  info: (text: string, opts?: number | MessageOptions) => show('info', text, opts),
   loading: showLoading,
   progress: showProgress,
 }

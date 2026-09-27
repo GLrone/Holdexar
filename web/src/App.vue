@@ -14,12 +14,12 @@ import { ratesApi, type WalletSnapshot } from '@/api/client'
 import { buildRateMap, formatWalletCny, walletToCny, type RateMap } from '@/lib/walletCny'
 import { APP_NAME } from '@/appInfo'
 import ProductTour from '@/components/ProductTour.vue'
-import PriceStatusPill from '@/components/business/PriceStatusPill.vue'
 import UpdateDialog from '@/components/business/UpdateDialog.vue'
 import UpdateEntry from '@/components/business/UpdateEntry.vue'
 import {
   HlIcon,
   HlImg,
+  HlIsland,
   HlLangToggle,
   HlSectionRail,
   HlSideNav,
@@ -171,15 +171,17 @@ const logo = computed(() =>
   themeStore.isDark ? '/assets/logo_dark.ico' : '/assets/logo_light.ico',
 )
 
-/* ── 侧边栏：按用户目的分三组——核心四入口（找游戏 / 游戏库 / 我的关注 /
-   价格提醒）+ 首页不带组名直接置顶；「更多」收具体业务功能；「系统」收
-   技术 / 维护入口。工具箱不进一级导航，入口在设置页（次级入口）──
+/* ── 侧边栏：按用户目的分三组——首页不带组名直接置顶，找游戏 /
+   捆绑包 / 游戏库 / 我的关注 / 价格提醒同属浏览与追踪入口；「更多」
+   收具体业务功能；「系统」收技术 / 维护入口。工具箱不进一级导航，
+   入口在设置页（次级入口）──
    computed 包裹：语言切换时导航文案随词典重算 */
 const navGroups = computed<HlSideNavGroup[]>(() => [
   {
     items: [
       { label: t('nav.dashboard'), to: '/dashboard', icon: 'dashboard' },
       { label: t('nav.library'), to: '/library', icon: 'store' },
+      { label: t('nav.bundles'), to: '/bundles', icon: 'package' },
       { label: t('nav.gamelib'), to: '/gamelib', icon: 'gamepad' },
       { label: t('nav.pool'), to: '/pool', icon: 'target' },
       { label: t('nav.alerts'), to: '/alerts', icon: 'bell' },
@@ -188,7 +190,6 @@ const navGroups = computed<HlSideNavGroup[]>(() => [
   {
     label: t('nav.group.more'),
     items: [
-      { label: t('nav.bundles'), to: '/bundles', icon: 'package' },
       { label: t('nav.family'), to: '/family', icon: 'home' },
       { label: t('nav.bills'), to: '/bills', icon: 'list' },
       { label: t('nav.achievements'), to: '/achievements', icon: 'trophy' },
@@ -199,6 +200,7 @@ const navGroups = computed<HlSideNavGroup[]>(() => [
     items: [
       { label: t('nav.proxies'), to: '/proxies', icon: 'monitor' },
       { label: t('nav.crawl'), to: '/crawl', icon: 'refresh' },
+      { label: t('nav.fetch'), to: '/fetch', icon: 'download' },
       { label: t('nav.rates'), to: '/rates', icon: 'chart' },
       { label: t('nav.logs'), to: '/logs', icon: 'terminal' },
       // 「设置」= 设置页，也是更新卡片的落点：有新版本且**提示开着**时这里亮红点
@@ -473,6 +475,10 @@ async function manualRefreshWallet() {
     <!-- 全局更新弹窗（检查/下载/校验/重启全在这里闭环；模糊幕布遮住底层页面）。
          更新模块已从设置页搬出——更新是应用级事务，不该塞在某个页签里。 -->
     <UpdateDialog />
+
+    <!-- 灵动岛消息面：顶部悬浮的独立胶囊，状态 / 消息 / 任务 / 详情四态就地切换。
+         全局唯一实例——要跨路由存活，挂页面里的实例会被 router.push 卸载 -->
+    <HlIsland />
 
     <!-- 关窗幕布：桌面壳弹出「最小化 / 退出程序」原生弹窗前调用 __hlxCloseCurtain(true)
          拉起（见 desktop/main.py 的 _toggle_close_curtain），弹窗落定后撤下。

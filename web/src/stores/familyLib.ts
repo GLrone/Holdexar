@@ -8,6 +8,8 @@ import {
   type FamilyLibraryPayload,
   type FamilyMemberPlayEntry,
 } from '@/api/client'
+import { message } from '@/components/ui'
+import { useI18n } from '@/locales'
 import { normalizeAvatarUrl } from '@/api/avatar'
 
 /**
@@ -16,6 +18,7 @@ import { normalizeAvatarUrl } from '@/api/avatar'
  * tabs 各自渲染空态；refresh() 强制重拉（后端绕过 5 分钟缓存）。
  */
 export const useFamilyStore = defineStore('familyLib', () => {
+  const { t } = useI18n()
   const data = ref<FamilyLibraryPayload | null>(null)
   const loading = ref(false)
   const error = ref('')
@@ -145,6 +148,34 @@ export const useFamilyStore = defineStore('familyLib', () => {
     return [...map.entries()].sort((a, b) => a[0].localeCompare(b[0]))
   })
 
+  /* ── 家庭组同步（主账号 Cookie → GetFamilyGroupForUser → 成员自动补齐）──
+     生命周期在 store：请求进行中重进页面不再发起第二份（重入防护），
+     完成消息照常入灵动岛。 */
+  const syncing = ref(false)
+
+  /** 同步成功返回家庭组名（发起页面据此刷新本地成员清单）；未变更返回 null */
+  async function syncFamily(): Promise<string | null> {
+    if (syncing.value) return null
+    syncing.value = true
+    message.loading(t('family.action.syncing'))
+    try {
+      const r = await familyApi.sync()
+      if (r.joined) {
+        const groupName = r.familyName || t('family.group.unnamed')
+        message.success(t('family.sync.success', { name: groupName, n: r.members.length }))
+        void load(true) // 家庭组变了：强制重拉家庭库聚合
+        return groupName
+      }
+      message.info(r.message || t('family.sync.notJoined'))
+      return null
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : String(e))
+      return null
+    } finally {
+      syncing.value = false
+    }
+  }
+
   return {
     data,
     loading,
@@ -164,5 +195,7 @@ export const useFamilyStore = defineStore('familyLib', () => {
     monthlyAcquired,
     fromSnapshot,
     load,
+    syncing,
+    syncFamily,
   }
 })
