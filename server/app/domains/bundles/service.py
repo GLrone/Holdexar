@@ -198,7 +198,7 @@ def _family_region_prices(
     memo 挂在行主键上且只活在本次调用里（局部字典，不占常驻内存）。
 
     返回 (region_prices, baseline_appids)；条目字段：
-    priceMinor/currency/discountPercent/baseDiscount/cnyFen/appIds。
+    priceMinor/currency/discountPercent/baseDiscount/discountEndsAt/cnyFen/appIds。
     """
     parsed_aids: dict[int, list[int]] = {}
 
@@ -236,6 +236,9 @@ def _family_region_prices(
             # cny_fen 是当前价快照的完整字段（爬取/导入写库时落值，
             # 汇率变更由 recompute_cny_fen_all 重算）——不在这里现算
             "cnyFen": int(p.cny_fen) if p.cny_fen is not None else None,
+            # 促销截止（Unix 秒，browse active_discounts 下发；NULL=无促销）。
+            # 已过期行随展示层时间守卫隐藏——抓取间隙促销结束属正常滞留
+            "discountEndsAt": int(p.discount_end_ts) if p.discount_end_ts else None,
             "appIds": aids,
         }
         # 源数据存在大小写并存的同区行（如 jp/JP）：有价者优先，其余丢弃，

@@ -105,6 +105,10 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         # smart 排序评分（refresh_bundle_sort_cache 维护；NULL=未计算）
         "smart_score": "REAL",
     },
+    # 捆绑包区域价促销截止（browse active_discounts 下发的 Unix 秒；NULL=无促销）
+    "bundle_region_prices": {
+        "discount_end_ts": "INTEGER",
+    },
     # bills 域新导出字段（Steam 消费历史分类器对齐）
     "bill_game_txs": {
         "wallet_balance": "VARCHAR(60) DEFAULT ''",
@@ -225,7 +229,7 @@ _TABLE_EXTRA_INDEXES: dict[str, list[str]] = {
         "CREATE INDEX IF NOT EXISTS ix_bundles_diff_fen ON bundles(diff_fen DESC)",
     ],
     # 汇率历史按币种取尾段（rate_history WHERE currency ORDER BY id DESC），
-    # 导入 16 年档案（约 9 万行）后走此复合索引
+    # 汇率档案批量导入后走此复合索引
     "fx_rate_history": [
         "CREATE INDEX IF NOT EXISTS ix_frh_currency_id ON fx_rate_history(currency_code, id)",
     ],

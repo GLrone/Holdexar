@@ -344,6 +344,34 @@ async def test_diff_floor_zero_and_order():
 
 
 @pytest.mark.asyncio
+async def test_list_price_data_freshness():
+    """priceData：观察时刻 = 全部价格行 MAX(crawled_at)（不按价格有无过滤）；
+    无任何 crawled_at 的包三值全 null——「没有数据」不冒充「数据很旧」。"""
+    from datetime import datetime, timedelta
+
+    now = datetime.now()
+    async with get_session_factory()() as session:
+        rows = (
+            await session.execute(
+                select(BundleRegionPrice).where(BundleRegionPrice.bundle_id == BID_A)
+            )
+        ).scalars().all()
+        for i, r in enumerate(rows):
+            r.crawled_at = now - timedelta(hours=2 + i)
+        await session.commit()
+    service.invalidate_bundles_cache()
+    items = await service.list_bundles()
+    a = next(i for i in items if i["bundleId"] == BID_A)
+    pd = a["priceData"]
+    assert pd["observedAt"] is not None
+    assert 1.9 < pd["ageHours"] < 2.1  # MAX 取最晚行（2 小时前）
+    assert pd["freshness"] == "fresh"
+    assert "coverage" not in pd  # 捆绑包无 Cycle 归属，不给覆盖率
+    c = next(i for i in items if i["bundleId"] == BID_C)
+    assert c["priceData"] == {"observedAt": None, "ageHours": None, "freshness": None}
+
+
+@pytest.mark.asyncio
 async def test_sort_snapshot_materialized():
     """排序快照列：写时重建（双产品隔离 + 追踪区过滤），列表/详情只读快照。"""
     written = await service.refresh_bundle_sort_cache([BID_A, BID_B, BID_C])

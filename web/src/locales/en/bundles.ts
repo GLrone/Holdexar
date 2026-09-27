@@ -74,6 +74,9 @@ const bundles: Partial<Record<MessageKey, string>> = {
   'bundles.drawer.lockedBadge': '{n} locked',
   'bundles.drawer.locked': 'Region locked',
 
+  /* Promo end (shared by discount badge tooltip + drawer region row) */
+  'bundles.promo.endsAt': 'Ends {date}',
+
   /* Gifting analysis */
   'bundles.gift.head': '🎁 Gifting target: {region}',
   'bundles.gift.collapse': 'Collapse',

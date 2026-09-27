@@ -191,6 +191,10 @@ def _browse_row(
     discount = _to_int(opt.get("discount_pct")) or 0
     if not discount and original and price and original > price:
         discount = round((original - price) * 100 / original)
+    # 促销截止：active_discounts[0] 是当前叠加在基础档上的限时促销
+    # （bundle_discount_pct 是无时限的结构档），Unix 秒；无促销 = None
+    active_discounts = opt.get("active_discounts") or []
+    discount_end_ts = _to_int(active_discounts[0].get("discount_end_date")) if active_discounts else None
     item_type = item.get("item_type")
     # 形态（链接/CDN 用）：item_type 1=Sub / 2=Bundle，Steam 权威
     item_kind = 1 if item_type == 1 else (0 if item_type == 2 else None)
@@ -215,6 +219,7 @@ def _browse_row(
         "currency": _CC_CURRENCY.get(cc),
         "discount_percent": discount,
         "bundle_base_discount": _to_int(opt.get("bundle_discount_pct")) or 0,
+        "discount_end_ts": discount_end_ts,
         "app_ids": [
             int(a) for a in (item.get("included_appids") or []) if str(a).isdigit()
         ],
@@ -413,6 +418,7 @@ async def _upsert_bundle_rows(
             existing.original_price = r.get("original_price")
             existing.discount_percent = r.get("discount_percent") or 0
             existing.bundle_base_discount = r.get("bundle_base_discount") or 0
+            existing.discount_end_ts = r.get("discount_end_ts")
             existing.price_status = r.get("price_status", "ok")
             existing.app_ids = r.get("app_ids") or []
             existing.crawled_at = now

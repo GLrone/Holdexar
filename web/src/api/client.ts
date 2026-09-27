@@ -594,6 +594,8 @@ export interface BundleRegionPrice {
   discountPercent: number
   /** 整包基础折扣 %（补齐时额外优惠） */
   baseDiscount: number
+  /** 促销截止（Unix 秒；null=无促销/未下发促销元数据） */
+  discountEndsAt?: number | null
   cnyFen: number | null
   /** 该区实际包含的 AppID（锁区检测依据） */
   appIds: number[]
