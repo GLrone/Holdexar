@@ -14,7 +14,7 @@
  * 分节由视图层声明（data-section="分节名"），本组件自动发现；
  * MutationObserver 兜住晚挂载分节（game-detail 接口返回后才渲染等）。
  */
-import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { nextTick, onBeforeUnmount, onMounted, ref, useId, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useI18n, type MessageKey } from '@/locales'
 
@@ -70,6 +70,78 @@ let stickyTimer: number | undefined
 /* 悬停弹窗（cf-status-tip 同款：跟随光标、鼠标离开/滚动即收） */
 const tip = ref<{ label: string; x: number; y: number } | null>(null)
 let tipHideTimer: number | undefined
+
+/* ── 跳转临时聚光：点段定位后目标分节亮 FLASH_MS（导览同款视觉）──
+   非模态：整个聚光层 pointer-events: none，聚光期间底层照常可点可滚。
+   rAF 逐帧量靶点矩形，平滑滚动途中聚光框/镂空一直咬住分节，落地即就位。 */
+const FLASH_MS = 500
+
+const flash = ref<{ el: HTMLElement } | null>(null)
+const flashBox = ref({ top: 0, left: 0, width: 0, height: 0 })
+const flashViewport = ref({ w: 0, h: 0 })
+/** 靶点首次量到才显示镂空/描边（量到前只暗化，不闪空框） */
+const flashVisible = ref(false)
+const flashFading = ref(false)
+const flashMaskId = useId()
+let flashRaf: number | null = null
+let flashHideTimer: number | undefined
+let flashFadeTimer: number | undefined
+
+function startFlash(el: HTMLElement) {
+  endFlash(false)
+  flashViewport.value = { w: window.innerWidth, h: window.innerHeight }
+  flash.value = { el }
+  flashVisible.value = false
+  flashFading.value = false
+  const started = performance.now()
+  const step = () => {
+    const f = flash.value
+    if (!f) return
+    if (!f.el.isConnected) {
+      endFlash(true)
+      return
+    }
+    const r = f.el.getBoundingClientRect()
+    if (r.width > 0 && r.height > 0) {
+      flashVisible.value = true
+      flashBox.value = {
+        top: r.top - 6,
+        left: r.left - 6,
+        width: r.width + 12,
+        height: r.height + 12,
+      }
+    }
+    if (performance.now() - started >= FLASH_MS) {
+      endFlash(true)
+      return
+    }
+    flashRaf = requestAnimationFrame(step)
+  }
+  flashRaf = requestAnimationFrame(step)
+  // 兜底清理：页面隐藏（rAF 冻结）时也能保证聚光层最终移除
+  flashHideTimer = window.setTimeout(() => endFlash(true), FLASH_MS + 800)
+}
+
+function endFlash(fade: boolean) {
+  if (flashRaf != null) {
+    cancelAnimationFrame(flashRaf)
+    flashRaf = null
+  }
+  window.clearTimeout(flashHideTimer)
+  if (!flash.value) return
+  if (fade) {
+    flashFading.value = true
+    window.clearTimeout(flashFadeTimer)
+    flashFadeTimer = window.setTimeout(() => {
+      flash.value = null
+      flashFading.value = false
+    }, 400)
+  } else {
+    // 换靶点重挂：不淡出，直接让位
+    flash.value = null
+    flashFading.value = false
+  }
+}
 
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)')
 const route = useRoute()
@@ -234,6 +306,8 @@ function jump(i: number) {
     behavior: reducedMotion.matches ? 'auto' : 'smooth',
     block: 'start',
   })
+  // 临时聚光：滚动途中就亮起，帮用户在落定前就锁定目标分节
+  startFlash(s.el)
 }
 
 /** 悬停弹窗：段按键右侧、垂直居中对齐（cf-status-tip 同款视觉），离开 120ms 后收起 */
@@ -290,6 +364,7 @@ onBeforeUnmount(() => {
   window.clearTimeout(mutationTimer)
   window.clearTimeout(stickyTimer)
   window.clearTimeout(tipHideTimer)
+  endFlash(false)
   if (rafId != null) cancelAnimationFrame(rafId)
   rafId = null
 })
@@ -343,4 +418,115 @@ defineOptions({ name: 'HlSectionRail' })
       {{ tip.label }}
     </div>
   </Teleport>
+
+  <!-- 跳转临时聚光：导览同款「蒙层暗化 + 镂空 + 呼吸描边」，FLASH_MS 后淡出。
+       整层 pointer-events: none（非模态），聚光期间底层照常可点可滚 -->
+  <Teleport to="body">
+    <div
+      v-if="flash"
+      class="hl-flash"
+      :class="{ 'is-fading': flashFading }"
+      aria-hidden="true"
+    >
+      <svg class="hl-flash__mask" :width="flashViewport.w" :height="flashViewport.h">
+        <defs>
+          <mask :id="flashMaskId">
+            <rect fill="#fff" x="0" y="0" :width="flashViewport.w" :height="flashViewport.h" />
+            <template v-if="flashVisible">
+              <rect
+                fill="#000"
+                fill-opacity="0.55"
+                :x="flashBox.left"
+                :y="flashBox.top"
+                :width="Math.max(flashBox.width, 0)"
+                :height="Math.max(flashBox.height, 0)"
+                rx="12"
+              />
+              <rect
+                fill="#000"
+                :x="flashBox.left + 4"
+                :y="flashBox.top + 4"
+                :width="Math.max(flashBox.width - 8, 0)"
+                :height="Math.max(flashBox.height - 8, 0)"
+                rx="9"
+              />
+            </template>
+          </mask>
+        </defs>
+        <rect
+          class="hl-flash__dim"
+          x="0"
+          y="0"
+          :width="flashViewport.w"
+          :height="flashViewport.h"
+          :mask="`url(#${flashMaskId})`"
+        />
+      </svg>
+      <div
+        v-if="flashVisible"
+        class="hl-flash__frame"
+        :style="{
+          top: `${flashBox.top}px`,
+          left: `${flashBox.left}px`,
+          width: `${flashBox.width}px`,
+          height: `${flashBox.height}px`,
+        }"
+      />
+    </div>
+  </Teleport>
 </template>
+
+<style scoped>
+/* ═══ 跳转临时聚光（导览同款视觉；非模态：全层 pointer-events 放行）═══ */
+.hl-flash {
+  position: fixed;
+  inset: 0;
+  /* 低于 ProductTour（2000）：导览开着时轮不到本效果出场 */
+  z-index: 1990;
+  pointer-events: none;
+  transition: opacity calc(var(--duration-3) * var(--motion-scale)) var(--ease-inout);
+}
+
+.hl-flash.is-fading {
+  opacity: 0;
+}
+
+.hl-flash__mask {
+  position: absolute;
+  inset: 0;
+}
+
+.hl-flash__dim {
+  fill: rgb(0 0 0 / 0.62);
+}
+
+/* 描边框：呼吸发光。位置不加过渡——逐帧贴着滚动中的靶点走，
+   与镂空保持逐帧同位（导览的弹簧过渡是「定位后展示」语义，这里跟手优先） */
+.hl-flash__frame {
+  position: absolute;
+  border: 2px solid var(--accent);
+  border-radius: 12px;
+  animation: hl-flash-breath 2.4s ease-in-out infinite;
+}
+
+@keyframes hl-flash-breath {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 4px color-mix(in srgb, var(--accent) 20%, transparent),
+      0 0 22px color-mix(in srgb, var(--accent) 45%, transparent);
+  }
+  50% {
+    box-shadow:
+      0 0 0 7px color-mix(in srgb, var(--accent) 30%, transparent),
+      0 0 36px color-mix(in srgb, var(--accent) 60%, transparent);
+  }
+}
+
+/* 循环动画在减弱动态下必须显式关断（0s + infinite 会让浏览器空转） */
+@media (prefers-reduced-motion: reduce) {
+  .hl-flash__frame {
+    animation: none;
+  }
+}
+</style>

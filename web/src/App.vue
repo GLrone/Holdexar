@@ -450,7 +450,10 @@ async function manualRefreshWallet() {
         <HlSectionRail />
         <div class="view-container">
           <router-view v-slot="{ Component }">
-            <transition name="route-fade" mode="out-in">
+            <!-- :duration 显式定时收尾：过渡被打断（out-in + KeepAlive 高频换装）
+                 或 transitionend 丢失时，enter/leave 类靠定时器强制摘除，
+                 不然 router-view 会永久停在中间态、新视图挂不进来 -->
+            <transition name="route-fade" mode="out-in" :duration="200">
               <keep-alive include="AchievementsHall">
                 <component :is="Component" />
               </keep-alive>

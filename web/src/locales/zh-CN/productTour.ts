@@ -15,7 +15,7 @@
    ⚠️ ProductTour 的 `target` 选择器里的 `data-section` 值是**契约**、
    不是文案：`pool.section.items` / `settings.section.steamAccount`。它们既不
    出现在本文件，也不该建词条——DOM 锚点与语言无关，建了反而多一个会漂移的
-   来源。视图侧写的是同一串字符串。`data-tour` 值（nav-search / card-price /
+   来源。视图侧写的是同一串字符串。`data-tour` 值（nav-search / game-card /
    lib-empty）同属契约，不需要词条。
 
    文案口径（按用户主链教学）：

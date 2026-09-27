@@ -108,6 +108,13 @@ const ALLOW = [
       '同一个元素上的 `fill="#000"` / `fill-opacity="0.55"` 同理。换成 var(--text-on-fill) ' +
       '只是碰巧同值，语义完全错位，而且一旦哪个主题把该 token 调暗，聚光镂空就会跟着漏。',
   },
+  {
+    file: 'src/components/ui/HlSectionRail.vue',
+    colors: ['#ffffff'],
+    reason:
+      '跳转临时聚光的 SVG `<mask>` `fill="#fff"`——与 ProductTour.vue 同一款聚光镂空，' +
+      '同为遮罩强度语义（白=显示、黑=遮住），不是颜色。换令牌语义错位且主题调暗会漏光。',
+  },
 ]
 
 /*
