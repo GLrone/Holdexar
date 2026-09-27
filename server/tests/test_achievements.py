@@ -1204,3 +1204,41 @@ async def test_wall_caps_and_drops_oldest(career):
     assert notes[0]["text"] == "第 5 条"          # 最旧的 5 条被丢
     assert notes[-1]["text"] == f"第 {career.WALL_MAX + 4} 条"
     assert len(await career.list_wall()) == career.WALL_MAX
+
+@pytest.mark.asyncio
+async def test_summary_warm_sync_on_stale_snapshot(monkeypatch):
+    """快照陈旧且无同步进行中 → 后台自动补拉一次；新鲜 / 别号 / 节流窗内不触发。"""
+    import asyncio as _asyncio
+    from datetime import timezone
+
+    warm_calls: list[str] = []
+
+    async def _fake_start_sync(target=None):
+        warm_calls.append(target or "")
+
+    monkeypatch.setattr(achievements_service, "start_sync", _fake_start_sync)
+    monkeypatch.setattr(achievements_service, "_last_warm_attempt", 0.0)
+
+    creds = [("steamRefresh_steam", "token")]
+    stale = {
+        "running": False,
+        "steamid": PRIMARY,
+        "syncedAt": (datetime.now(timezone.utc) - timedelta(hours=7)).isoformat(),
+    }
+    fresh = {**stale, "syncedAt": datetime.now(timezone.utc).isoformat()}
+    other_account = {**stale, "steamid": "76561198000000009"}
+    running = {**stale, "running": True}
+
+    achievements_service._maybe_warm_sync(PRIMARY, creds, fresh)
+    achievements_service._maybe_warm_sync(PRIMARY, creds, other_account)
+    achievements_service._maybe_warm_sync(PRIMARY, creds, running)
+    await _asyncio.sleep(0)
+    assert warm_calls == []  # 新鲜 / 别号快照 / 同步进行中都不触发
+
+    achievements_service._maybe_warm_sync(PRIMARY, creds, stale)
+    await _asyncio.sleep(0)
+    assert warm_calls == [PRIMARY]  # 陈旧快照触发一次补拉
+
+    achievements_service._maybe_warm_sync(PRIMARY, creds, stale)
+    await _asyncio.sleep(0)
+    assert warm_calls == [PRIMARY]  # 节流窗内不重复触发

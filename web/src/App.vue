@@ -52,10 +52,11 @@ onMounted(() => {
   crawl.start()
   settingsStore.load()
   accountStore.load()
-  // 闲时预热成就殿堂视图 chunk（内含 echarts 大包）
+  // 闲时预热成就殿堂视图 chunk（内含 echarts 大包）：只在浏览器空闲时跑、
+  // 不设强制期限——首屏加载与请求链完成前不与当前页争抢
   const warmAchievements = () => { void import('./views/achievements/Index.vue') }
-  if ('requestIdleCallback' in window) requestIdleCallback(warmAchievements, { timeout: 5000 })
-  else setTimeout(warmAchievements, 2500)
+  if ('requestIdleCallback' in window) requestIdleCallback(warmAchievements)
+  else setTimeout(warmAchievements, 10_000)
   // 钱包快照轮询：后端每分钟轮转刷新，前端只读拉取最新快照（不打 Steam）
   setInterval(() => accountStore.load(), 60_000)
   // 与后端对齐更新状态：上次会话下载好却没重启的暂存，这次启动要弹「重启完成更新」
