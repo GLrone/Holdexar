@@ -161,7 +161,9 @@ watch(
   { immediate: true },
 )
 
-watch(tour.open, (open) => {
+/* tour.open 必须走 getter：tour 是 setup store，pinia 会把返回的 ref 解包成
+   普通值，直接传 `tour.open` 拿到的是求值当时的布尔常量，watch 建立不了依赖。 */
+watch(() => tour.open, (open) => {
   if (!open && updateNoticePending.value) window.setTimeout(flushUpdateNotice, 800)
 })
 
