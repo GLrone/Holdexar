@@ -339,16 +339,11 @@ async function manualRefreshWallet() {
       <header class="app-header">
         <h1 class="app-header__title">{{ pageTitle }}</h1>
 
-        <div class="app-header__pills">
-          <!-- 价格更新状态胶囊：只表达产品结论——内部 job / 队列 / 速度不进这里 -->
-          <PriceStatusPill />
-
+        <div class="app-header__actions">
           <!-- 更新提示胶囊：发现新版 / 下载中 / 待重启时才出现，悬停看更新内容、
                点击打开更新报告窗口（下载中改显百分比，弹窗关掉也看得见进度） -->
           <UpdateEntry />
-        </div>
 
-        <div class="app-header__actions">
           <!-- 语言切换（中/EN）：文案显示目标语言，与主题钮同属外观组 -->
           <HlLangToggle :locale="localeStore.locale" @toggle="localeStore.toggle()" />
 
