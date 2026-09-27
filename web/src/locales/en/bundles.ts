@@ -115,3 +115,19 @@ const bundles: Partial<Record<MessageKey, string>> = {
 }
 
 export default bundles
+  'bundles.badge.wishlist': 'Wishlist',
+
+  /* ── Card actions: star follow / remove (soft delete, undoable & restorable) ──
+     User-facing words are “follow / remove / restore” only */
+  'bundles.follow.tip': 'Follow / unfollow',
+  'bundles.follow.fail': 'Failed to update follow',
+  'bundles.action.remove': 'Remove this bundle',
+  'bundles.action.restore': 'Restore this bundle',
+  'bundles.removed.view': 'Removed',
+  'bundles.removed.empty': 'Nothing removed yet',
+  'bundles.removed.emptyHint': 'Bundles you remove while browsing are kept here and can be restored any time.',
+  'bundles.removed.toast': 'Removed {n}',
+  'bundles.restored.toast': 'Restored {n}',
+  'bundles.removed.fail': 'Remove failed — try again',
+  'bundles.restored.fail': 'Restore failed — try again',
+  'bundles.restored.protected': 'Excluded manually — not restored',

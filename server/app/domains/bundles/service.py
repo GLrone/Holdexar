@@ -693,3 +693,117 @@ async def get_bundle_detail(bundle_id: int) -> dict | None:
 
     summary["games"] = games
     return summary
+async def _bundle_blocked_ids() -> set[int]:
+    """用户已移除/已排除的包（monitoring released + excluded，与刷新候选集同口径）。"""
+    try:
+        from app.domains.monitoring import service as monitoring_service
+
+        return await monitoring_service.blocked_ids("bundle")
+    except Exception:  # noqa: BLE001
+        logger.exception("[bundles] 监控状态读取失败（列表按全量展示处理）")
+        return set()
+
+
+async def _bundle_followed_ids() -> set[int]:
+    """星标关注的包（monitoring favorite 来源，升序去重）。"""
+    try:
+        from app.domains.monitoring import service as monitoring_service
+
+        return set(await monitoring_service.ids_with_source("bundle", "favorite"))
+    except Exception:  # noqa: BLE001
+        logger.exception("[bundles] 关注状态读取失败（列表按无置顶处理）")
+        return set()
+
+
+
+    监控作用域（removed 参数）：
+    - False（默认）：隐藏用户已移除/已排除的包（monitoring 的
+      released + excluded 集合，与刷新候选集同一口径），关注过的包
+      置顶（组内保持 SQL 排序的稳定分区，不重排）；
+    - True：只出已移除/已排除的包（恢复视图），不走聚合缓存。
+
+
+# ── 用户面动作：移除 / 恢复 / 关注（复用 monitoring 的 bundle 生命周期）──
+
+# 移除链路挂的排除 reason：恢复时只解除本链路所挂的排除，维护面板里
+# 用户显式设置的排除语义不被恢复动作洗掉
+REMOVAL_EXCLUSION_REASON = "bundle_removed"
+
+logger = logging.getLogger(__name__)
+
+
+async def remove_bundle(bundle_id: int) -> dict:
+    """移除捆绑包：列表隐藏 + 退出刷新（包行与区域价保留）。
+
+    stop 摘掉全部用户来源（含星标），set_exclusion 挂 bundle_removed 排除
+    ——排除与释放两态都在刷新候选集之外，整表刷新不会把它洗回来；重新
+    导入（refresh.import_bundle 的 track）同样解除排除。
+    """
+    bid = int(bundle_id)
+    async with get_session_factory()() as session:
+        row = (
+            await session.execute(select(Bundle.bundle_id).where(Bundle.bundle_id == bid))
+        ).scalar_one_or_none()
+    if row is None:
+        raise KeyError(f"捆绑包 {bid} 不存在")
+
+    from app.domains.monitoring import service as monitoring_service
+
+    await monitoring_service.stop("bundle", bid)
+    await monitoring_service.set_exclusion("bundle", bid, True, REMOVAL_EXCLUSION_REASON)
+    invalidate_bundles_cache()
+    return {"removed": True, "bundleId": bid}
+
+
+async def restore_bundle(bundle_id: int) -> dict:
+    """恢复被移除的包：只对本链路所挂的排除（reason=bundle_removed）生效。
+
+    恢复走与重新导入同一条 track 通道（挂 import 来源 + 解除排除）——
+    移除的 stop 已把目标置为 released（无来源态同样不进刷新），只解排除
+    回不到刷新候选集。维护面板里用户显式设置的排除/停止监控语义保留。
+    """
+    bid = int(bundle_id)
+    from app.domains.monitoring import service as monitoring_service
+
+    reason = await monitoring_service.exclusion_reason("bundle", bid)
+    if reason != REMOVAL_EXCLUSION_REASON:
+        return {"restored": False, "bundleId": bid}
+    await monitoring_service.track("bundle", bid, "import")
+    invalidate_bundles_cache()
+    return {"restored": True, "bundleId": bid}
+
+
+async def follow_bundle(bundle_id: int) -> dict:
+    """关注一个包：挂 favorite 来源（不需要 Steam 账户），列表置顶。"""
+    bid = int(bundle_id)
+    from app.domains.monitoring import service as monitoring_service
+
+    # 关注 = 用户显式要求盯住它：解除「别再爬它」后挂来源（与游戏星标同语义）
+    await monitoring_service.set_exclusion("bundle", bid, False, "followed")
+    await monitoring_service.ensure_source("bundle", bid, "favorite")
+    invalidate_bundles_cache()
+    return {"bundleId": bid, "followed": True}
+
+
+async def unfollow_bundle(bundle_id: int) -> dict:
+    """取消关注：只摘 favorite 来源（导入来源与排除标不动）。
+
+    星标是唯一激活来源时，摘除后回到「无记录」基线（forget）——捆绑包
+    无记录即默认参与刷新，停留在 released 会被挡在刷新候选集之外。
+    """
+    bid = int(bundle_id)
+    from app.domains.monitoring import service as monitoring_service
+
+    sources = await monitoring_service.sources_map("bundle", [bid])
+    await monitoring_service.detach_source("bundle", bid, "favorite")
+    if sources.get(bid, set()) == {"favorite"}:
+        await monitoring_service.forget("bundle", bid)
+    invalidate_bundles_cache()
+    return {"bundleId": bid, "followed": False}
+
+
+async def followed_bundle_ids() -> list[int]:
+    """当前关注的包 id（升序）。"""
+    from app.domains.monitoring import service as monitoring_service
+
+    return await monitoring_service.ids_with_source("bundle", "favorite")
