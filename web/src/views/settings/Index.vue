@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
 import { currencyName } from '@/api/currencies'
@@ -24,7 +24,7 @@ import { friendCodeOf } from '@/utils/steamId'
 import CurrencyFlag from '@/components/CurrencyFlag.vue'
 import RegionFlag from '@/components/RegionFlag.vue'
 import {
-  HlButton, HlDialog, HlIcon, HlImg, HlInput, HlSkeleton, HlSwitch, message,
+  HlButton, HlCheckbox, HlDialog, HlIcon, HlImg, HlInput, HlSkeleton, HlSwitch, message,
 } from '@/components/ui'
 
 const { t } = useI18n()
@@ -372,14 +372,14 @@ function reportBindResult() {
 }
 
 /* ── 绑定风险弹窗 ────────────────────────────────────────────
-   每次绑定动作（手动粘贴 / 桌面端一键登录）都会先弹，确定键带 5s 倒计时
-   强制停留阅读；确定后才继续原流程——'auto' 才是「后续的登录窗口」
-   （桌面端 start_steam_login 子窗口），'manual' 继续提交已粘贴的 Cookie。 */
+   每次绑定动作（手动粘贴 / 桌面端一键登录）都会先弹；标红同意勾选框
+   勾选后确定键才可用，每次打开重新勾选、不做停留时长强制。确定后才
+   继续原流程——'auto' 才是「后续的登录窗口」（桌面端 start_steam_login
+   子窗口），'manual' 继续提交已粘贴的 Cookie。 */
 type RiskNextAction = 'auto' | 'manual'
-const RISK_CONFIRM_DELAY_SECONDS = 5
 
 /* 弹窗正文条目：每条 = 加粗关键词(lead) + 短说明(rest)，扫加粗词即可抓住重点；
-   首条（凭据明文保存）是核心风险，danger 色强调。常量只存词条 key 不存译文
+   首条（凭据加密保存）是核心风险，danger 色强调。常量只存词条 key 不存译文
    （模块常量只求值一次，存译文会把语言冻在加载那一刻）。 */
 interface RiskItem {
   lead: MessageKey
@@ -400,42 +400,21 @@ const LEAK_ITEMS: RiskItem[] = [
 ]
 const riskDialogOpen = ref(false)
 const riskNextAction = ref<RiskNextAction>('manual')
-const riskCountdown = ref(RISK_CONFIRM_DELAY_SECONDS)
-let riskTimer: ReturnType<typeof setInterval> | null = null
-
-function stopRiskCountdown() {
-  if (riskTimer !== null) {
-    clearInterval(riskTimer)
-    riskTimer = null
-  }
-}
-
-function startRiskCountdown() {
-  stopRiskCountdown()
-  riskCountdown.value = RISK_CONFIRM_DELAY_SECONDS
-  riskTimer = setInterval(() => {
-    riskCountdown.value--
-    if (riskCountdown.value <= 0) stopRiskCountdown()
-  }, 1000)
-}
+// 标红同意勾选：未勾选时确定键禁用；每次打开弹窗重置，逐次确认
+const riskConsent = ref(false)
 
 function openRiskDialog(action: RiskNextAction) {
   riskNextAction.value = action
+  riskConsent.value = false
   riskDialogOpen.value = true
-  startRiskCountdown()
 }
 
 function riskConfirm() {
-  if (riskCountdown.value > 0) return
+  if (!riskConsent.value) return
   riskDialogOpen.value = false
   if (riskNextAction.value === 'auto') void autoFetchCookie()
   else void bindCookie()
 }
-
-watch(riskDialogOpen, (open) => {
-  if (!open) stopRiskCountdown()
-})
-onBeforeUnmount(stopRiskCountdown)
 
 async function bindCookie() {
   const raw = normalizeCookieRaw(cookieInput.value)
@@ -1151,8 +1130,9 @@ onMounted(() => {
       </div>
     </template>
 
-    <!-- 绑定风险弹窗：每次绑定动作（手动/自动）都会弹出，确定键 5s 倒计时；
-         确定后才继续——'auto' 打开 Steam 登录子窗口，'manual' 提交已粘贴的 Cookie -->
+    <!-- 绑定风险弹窗：每次绑定动作（手动/自动）都会弹出，标红同意勾选后
+         确定键才可用；确定后才继续——'auto' 打开 Steam 登录子窗口，'manual'
+         提交已粘贴的 Cookie -->
     <HlDialog
       v-model="riskDialogOpen"
       :title="t('settings.risk.title')"
@@ -1174,18 +1154,17 @@ onMounted(() => {
             <span class="risk-body__rest">{{ t(it.rest) }}</span>
           </li>
         </ol>
+        <HlCheckbox v-model="riskConsent" class="risk-consent">
+          <span class="risk-consent__text">{{ t('settings.risk.consent') }}</span>
+        </HlCheckbox>
       </div>
       <template #footer>
         <HlButton variant="text" size="sm" @click="riskDialogOpen = false">
           {{ t('common.cancel') }}
         </HlButton>
-        <HlButton art="outline" tone="green" size="sm" :disabled="riskCountdown > 0" @click="riskConfirm">
-          <HlIcon v-if="riskCountdown <= 0" name="check" />
-          {{
-            riskCountdown > 0
-              ? t('settings.risk.countdown', { n: riskCountdown })
-              : t('settings.risk.confirm')
-          }}
+        <HlButton art="outline" tone="green" size="sm" :disabled="!riskConsent" @click="riskConfirm">
+          <HlIcon v-if="riskConsent" name="check" />
+          {{ t('settings.risk.confirm') }}
         </HlButton>
       </template>
     </HlDialog>
@@ -1235,6 +1214,17 @@ onMounted(() => {
 
 .risk-body__list li.is-danger .risk-body__lead {
   color: var(--danger);
+}
+
+/* 标红同意勾选：勾选后确定键才可用（每次打开重新勾选） */
+.risk-consent {
+  margin-top: 12px;
+}
+
+.risk-consent__text {
+  color: var(--danger);
+  font-weight: 600;
+  line-height: 1.6;
 }
 
 .settings-page {

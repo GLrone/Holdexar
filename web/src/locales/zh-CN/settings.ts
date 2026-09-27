@@ -34,7 +34,7 @@ const settings = {
   'settings.section.tour': '新手教程',
 
   /* ── Steam 账户绑定卡片 ── */
-  'settings.steam.desc': '绑定后展示钱包余额（右上角）与账号结算币种/地区。Cookie 只保留登录态字段（含用于自动续期的 steamRefresh_steam），明文只存本机数据库。',
+  'settings.steam.desc': '绑定后展示钱包余额（右上角）与账号结算币种/地区。Cookie 只保留登录态字段（含用于自动续期的 steamRefresh_steam），加密后只存本机数据库。',
   'settings.steam.cookiePlaceholder': '粘贴含 steamLoginSecure 的 Cookie（支持整行 / 换行格式，自动整理）',
   'settings.steam.cookiePlaceholderBound': '当前账号已绑定（{identity}），粘贴其他账号可新增绑定',
   'settings.steam.autoFetch': '登录并自动获取',
@@ -49,7 +49,7 @@ const settings = {
   'settings.steam.guideStep2': '按 <kbd>F12</kbd> 打开开发者工具，切到 <b>网络（Network）</b> 标签，按 <kbd>F5</kbd> 刷新页面。',
   'settings.steam.guideStep3': '点击列表中<b>第一条请求</b>（通常是商店页本身），在右侧「请求标头（Request Headers）」里找到 <code>Cookie:</code> 开头的一整行，<b>右键 → 复制值</b>（很长，必须整行复制）。',
   'settings.steam.guideStep4': '回到本页粘贴到上方输入框点「绑定」。整行带 <code>Cookie:</code> 前缀、或从 Application → Cookies 里逐条复制的换行格式都能自动识别整理。',
-  'settings.steam.guideNotes': '登录态保留 sessionid / steamCountry / steamLoginSecure 与 steamRefresh_steam（续期凭据，登录 Steam 时勾选「记住我」才有）；保存时自动收窄，其余丢弃。Cookie 明文只存本机数据库。留有续期凭据时登录态自动续期，退出 Steam 登录后绑定才失效。',
+  'settings.steam.guideNotes': '登录态保留 sessionid / steamCountry / steamLoginSecure 与 steamRefresh_steam（续期凭据，登录 Steam 时勾选「记住我」才有）；保存时自动收窄，其余丢弃。Cookie 加密后只存本机数据库。留有续期凭据时登录态自动续期，退出 Steam 登录后绑定才失效。',
 
   /* 绑定后的多账号列表 */
   'settings.steam.mismatchWarn': '当前账号的 SteamID 与上方保存的 SteamID64 不一致，请核对是否同一账号',
@@ -86,7 +86,7 @@ const settings = {
   'settings.account.steamIdPlaceholder': '例如 76561198000000000',
   'settings.account.lookup': '查询',
   'settings.account.applyFree': '免费申请',
-  'settings.account.apiKeyHint': '已购游戏同步需要 · 明文仅存本机数据库',
+  'settings.account.apiKeyHint': '已购游戏同步需要 · 加密仅存本机数据库',
   'settings.account.apiKeyPlaceholder': '输入 API Key',
   'settings.account.apiKeyPlaceholderSet': '已配置（{mask}），留空则保持不变',
   'settings.account.save': '保存',
@@ -181,12 +181,12 @@ const settings = {
   'settings.toast.fetching': '获取中…',
   'settings.toast.walletRefreshed': '已刷新',
   'settings.toast.walletRefreshFailed': '刷新失败',
-  // ── 绑定风险弹窗（每次绑定动作必弹；确定键 5s 倒计时）──
+  // ── 绑定风险弹窗（每次绑定动作必弹；标红同意勾选后确定键才可用）──
   // 条目成对存 key：Lead = 加粗关键词，Rest = 短说明（差异化排版，见 Index.vue RISK_ITEMS）
   'settings.risk.title': '绑定 Steam 账户前必读',
   'settings.risk.bodyTitle': '风险须知',
-  'settings.risk.item1Lead': '凭据明文保存',
-  'settings.risk.item1Rest': 'Steam 登录 Cookie 明文存进本机数据库，等同把账号交给本应用。',
+  'settings.risk.item1Lead': '凭据加密保存',
+  'settings.risk.item1Rest': 'Steam 登录 Cookie 加密存进本机数据库（密钥绑定本机），等同把账号交给本应用。',
   'settings.risk.item2Lead': '仅限本机使用',
   'settings.risk.item2Rest': '凭据不上传任何服务器，只服务钱包、愿望单、库同步等本地功能。',
   'settings.risk.item3Lead': '本机可被读取',
@@ -202,8 +202,8 @@ const settings = {
   'settings.risk.leak3Rest': '检查登录、交易与市场记录，发现异常立即联系 Steam 客服。',
   'settings.risk.leak4Lead': '解绑清凭据',
   'settings.risk.leak4Rest': '回设置页「解绑全部账号」，清掉已保存的凭据。',
-  'settings.risk.confirm': '我已知晓，继续绑定',
-  'settings.risk.countdown': '我已知晓（{n}s）',
+  'settings.risk.consent': '我已知晓上述风险，同意在本机保存 Steam 登录凭据',
+  'settings.risk.confirm': '继续绑定',
 
   /* ── 通知（价格事件通知：类别是用户面分类，不含内部事件枚举）── */
   'settings.section.notification': '通知',
