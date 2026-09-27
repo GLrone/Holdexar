@@ -126,3 +126,19 @@ const bundles = {
 } as const
 
 export default bundles
+  'bundles.badge.wishlist': '愿望单',
+
+  /* ── 卡片动作：星标关注 / 移除（假删除，可撤销可恢复）──
+     用户词汇只用「关注 / 移除 / 恢复」；监控来源、排除标等实现细节不进文案 */
+  'bundles.follow.tip': '关注 / 取消关注',
+  'bundles.follow.fail': '关注操作失败',
+  'bundles.action.remove': '移除这个包',
+  'bundles.action.restore': '恢复这个包',
+  'bundles.removed.view': '已移除',
+  'bundles.removed.empty': '没有移除过包',
+  'bundles.removed.emptyHint': '浏览时点卡片上的移除按钮，移除的包会收进这里，随时可恢复。',
+  'bundles.removed.toast': '已移除 {n} 个包',
+  'bundles.restored.toast': '已恢复 {n} 个包',
+  'bundles.removed.fail': '移除失败，请重试',
+  'bundles.restored.fail': '恢复失败，请重试',
+  'bundles.restored.protected': '此包已被手动排除，未恢复',

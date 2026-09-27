@@ -5,18 +5,21 @@
  * 数据链：GET /metadata/hb/offers（纯本地库读：记账游标 → 当月标签 →
  * games.is_hb 标记行 + 国区价）→ 挂载即拉 + 每小时轻刷（抓取链每日跑，
  * 库内标记到位后卡片自动浮出）。游戏卡点击进站内详情页；头部「跳过本月 /
- * 前往月包」是官方页直达外链。
+ * 前往月包」是官方页直达外链。归属徽章（已拥有/家庭共享/愿望单）走
+ * ownership 批量接口，与游戏库同源配色与词条。
  */
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
 import { metadataApi, type HbChoiceGame } from '@/api/client'
 import { formatCnyFen } from '@/api/regions'
-import { useI18n } from '@/locales'
+import { useI18n, type MessageKey } from '@/locales'
+import { useOwnershipStore, type OwnershipInfo, type OwnershipType } from '@/stores/ownership'
 import { HlEmpty, HlImg, HlSkeleton } from '@/components/ui'
 
 const router = useRouter()
 const { t } = useI18n()
+const ownershipStore = useOwnershipStore()
 
 const games = ref<HbChoiceGame[]>([])
 const label = ref('')
@@ -34,12 +37,45 @@ async function load() {
       monthUrl.value = res.monthUrl
       skipUrl.value = res.skipUrl
       state.value = 'ok'
+      // 归属徽章按需取数：同帧合并为一次批量请求（与游戏库同 store 缓存）
+      games.value.forEach((g) => ownershipStore.ensure(g.appid))
     } else if (games.value.length === 0) {
       state.value = 'failed'
     }
   } catch {
     if (games.value.length === 0) state.value = 'failed'
   }
+}
+
+// ─── 归属徽章（与游戏库 status-badge 同源词条/配色；存 key 渲染期 t()）───
+
+const STATUS_BADGE_KEYS: Record<OwnershipType, MessageKey> = {
+  owned: 'gameCard.status.owned',
+  family: 'gameCard.status.family',
+  wishlist: 'gameCard.status.wishlist',
+}
+const STATUS_TITLE_KEYS: Record<OwnershipType, MessageKey> = {
+  owned: 'gameCard.status.ownedTitle',
+  family: 'gameCard.status.familyTitle',
+  wishlist: 'gameCard.status.wishlistTitle',
+}
+
+function ownershipOf(g: HbChoiceGame): OwnershipInfo | null {
+  return ownershipStore.map[g.appid] ?? null
+}
+
+/** 多账号共同愿望单 → 愿望单 +N（口径同游戏库） */
+function badgeText(o: OwnershipInfo): string {
+  if (o.type === 'wishlist' && o.owners.length > 1) {
+    return t('gameCard.status.wishlistMore', { n: o.owners.length - 1 })
+  }
+  return t(STATUS_BADGE_KEYS[o.type])
+}
+
+/** 悬停提示：归属维度 + 账号名（仪表盘轻量形态，native title） */
+function badgeTip(o: OwnershipInfo): string {
+  const owners = o.owners.length > 0 ? o.owners.join('、') : t('gameCard.owner.unknown')
+  return `${t(STATUS_TITLE_KEYS[o.type])}：${owners}`
 }
 
 const HOUR_MS = 3_600_000
@@ -104,6 +140,14 @@ onBeforeUnmount(() => {
         <div class="hb-card__media">
           <HlImg class="hb-card__img" :src="g.headerImage" :alt="g.name" loading="lazy" />
           <span v-if="g.discount > 0" class="hb-card__off">-{{ g.discount }}%</span>
+          <!-- 归属徽章（已拥有/家庭共享/愿望单）：与游戏库 status-badge 同源，
+               悬停 native title 给归属账号 -->
+          <span
+            v-if="ownershipOf(g)"
+            class="hb-card__status"
+            :class="ownershipOf(g)!.type"
+            :title="badgeTip(ownershipOf(g)!)"
+          >{{ badgeText(ownershipOf(g)!) }}</span>
         </div>
         <div class="hb-card__body">
           <span class="hb-card__name">{{ g.name }}</span>
@@ -249,6 +293,35 @@ onBeforeUnmount(() => {
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.04em;
+}
+
+/* 归属徽章（右上角，与左上折扣徽章对称）：配色口径同游戏库 status-badge
+   （owned=绿 / family=紫 / wishlist=品牌蓝），令牌跟随双主题 */
+.hb-card__status {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 1;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: help;
+}
+
+.hb-card__status.owned {
+  background: var(--success-a15);
+  color: var(--success);
+}
+
+.hb-card__status.family {
+  background: var(--purple-a15);
+  color: var(--purple);
+}
+
+.hb-card__status.wishlist {
+  background: var(--accent-a15);
+  color: var(--accent);
 }
 
 .hb-card__body {

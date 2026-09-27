@@ -277,6 +277,83 @@ function setLayout(mode: BundleLayout) {
   localStorage.setItem(`${APP_SLUG}.bundles.layout`, mode)
 }
 
+// ─── 卡片动作：星标关注 / 移除（假删除，可撤销可恢复）───
+// 关注 = monitoring 的 favorite 来源（服务端列表关注置顶）；移除 = 列表
+// 隐藏 + 退出刷新，价格数据保留，「已移除」视图随时恢复。
+
+const followedIds = ref<Set<number>>(new Set())
+const removedView = ref(false)
+const undoBid = ref<number | null>(null)
+let undoTimer: ReturnType<typeof setTimeout> | null = null
+
+function toggleRemovedView() {
+  removedView.value = !removedView.value
+  undoBid.value = null
+  renderLimit.value = RENDER_STEP
+  void load()
+}
+
+async function onToggleFollow(b: BundleSummary) {
+  const wasFollowed = followedIds.value.has(b.bundleId)
+  try {
+    if (wasFollowed) await bundlesApi.unfollow(b.bundleId)
+    else await bundlesApi.follow(b.bundleId)
+    const next = new Set(followedIds.value)
+    if (wasFollowed) next.delete(b.bundleId)
+    else next.add(b.bundleId)
+    followedIds.value = next
+  } catch {
+    message.error(t('bundles.follow.fail'))
+  }
+}
+
+async function onRemoveCard(b: BundleSummary) {
+  try {
+    await bundlesApi.remove(b.bundleId)
+  } catch {
+    message.error(t('bundles.removed.fail'))
+    return
+  }
+  bundles.value = bundles.value.filter((x) => x.bundleId !== b.bundleId)
+  const next = new Set(followedIds.value)
+  next.delete(b.bundleId)
+  followedIds.value = next
+  undoBid.value = b.bundleId
+  if (undoTimer) clearTimeout(undoTimer)
+  undoTimer = setTimeout(() => {
+    undoBid.value = null
+  }, 6000)
+}
+
+async function undoRemove() {
+  const bid = undoBid.value
+  if (bid == null) return
+  undoBid.value = null
+  try {
+    await bundlesApi.restore(bid)
+    message.success(t('bundles.restored.toast', { n: 1 }))
+    await load()
+  } catch {
+    message.error(t('bundles.restored.fail'))
+  }
+}
+
+async function onRestoreCard(b: BundleSummary) {
+  try {
+    const r = await bundlesApi.restore(b.bundleId)
+    // 用户在维护面板手动排除的包不被恢复动作洗掉：卡片留在已移除视图
+    if (!r.restored) {
+      message.warning(t('bundles.restored.protected'))
+      return
+    }
+  } catch {
+    message.error(t('bundles.restored.fail'))
+    return
+  }
+  bundles.value = bundles.value.filter((x) => x.bundleId !== b.bundleId)
+  message.success(t('bundles.restored.toast', { n: 1 }))
+}
+
 /** 卡片差价角标：未选区 = 服务端快照 diffFen（对全区最低）；选区 = 该区相对
     国区的差价（与地区维度的过滤/排序同一锚点，展示与顺序不脱节） */
 function diffOf(b: BundleSummary): number {
@@ -305,9 +382,18 @@ async function load() {
   loading.value = true
   errorMsg.value = ''
   try {
-    const res = await bundlesApi.list(sortBy.value)
+    const res = await bundlesApi.list(sortBy.value, removedView.value)
     bundles.value = res.bundles
     renderLimit.value = RENDER_STEP
+    // 星标状态一次性整表拉取（恢复视图没有星标动作，不拉）
+    if (!removedView.value) {
+      try {
+        const f = await bundlesApi.follows()
+        followedIds.value = new Set(f.bundleIds)
+      } catch {
+        followedIds.value = new Set()
+      }
+    }
     // 撞库推演：收集全部 appid 一次批量查归属
     const allIds = [...new Set(bundles.value.flatMap((b) => b.appIds))]
     if (allIds.length > 0) {
@@ -463,6 +549,7 @@ async function openDrawer(b: BundleSummary) {
   detailError.value = ''
   if (detailCache.has(b.bundleId)) {
     detail.value = detailCache.get(b.bundleId)!
+    void ensureOwnershipForGames(detail.value.games)
     return
   }
   detailLoading.value = true
@@ -470,11 +557,34 @@ async function openDrawer(b: BundleSummary) {
     const res = await bundlesApi.detail(b.bundleId)
     detail.value = res
     detailCache.set(b.bundleId, res)
+    void ensureOwnershipForGames(res.games)
   } catch (e) {
     detail.value = null
     detailError.value = e instanceof Error ? e.message : String(e)
   } finally {
     detailLoading.value = false
+  }
+}
+
+/** 抽屉/弹窗的逐游戏归属徽章数据：页级批量只覆盖前 200 个 appid，
+ *  打开抽屉时对本包成员补拉缺失项（单批 ≤200，服务端截断） */
+async function ensureOwnershipForGames(games: BundleGame[]) {
+  const need = games
+    .map((g) => g.appid)
+    .filter((id) => !ownershipMap.value[id])
+    .slice(0, 200)
+  if (!need.length) return
+  try {
+    const own = await ownershipApi.batch(need)
+    ownershipMap.value = {
+      ...ownershipMap.value,
+      ...Object.fromEntries(
+        Object.entries(own.ownerships).map(([k, v]) => [Number(k), v]),
+      ),
+    }
+    refreshOwnershipBadges()
+  } catch {
+    // 归属数据缺失时徽章不渲染，不阻断抽屉
   }
 }
 
@@ -505,6 +615,15 @@ function gameStatusClass(game: BundleGame): string {
   if (info?.type === 'family') return 'bgc-family'
   if (info?.type === 'wishlist') return 'bgc-wishlist'
   return ''
+}
+
+/** 封面左上角归属角标（已拥有 / 家庭组 / 愿望单）；无归属不渲染 */
+function gameBadge(game: BundleGame): { cls: string; key: MessageKey } | null {
+  const info = ownershipMap.value[game.appid]
+  if (info?.type === 'owned') return { cls: 'owned', key: 'bundles.badge.owned' }
+  if (info?.type === 'family') return { cls: 'family', key: 'bundles.badge.family' }
+  if (info?.type === 'wishlist') return { cls: 'wishlist', key: 'bundles.badge.wishlist' }
+  return null
 }
 
 /** 游戏名 + 归属徽标（模板里现取，故 t() 进来即可；含前导空格的词条见词典）。 */
@@ -789,6 +908,15 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
               ☰
             </button>
           </div>
+
+          <!-- 已移除视图切换（恢复入口；撤销条过期后的常驻出路） -->
+          <button
+            class="sort-dropdown-btn"
+            :class="{ active: removedView }"
+            @click="toggleRemovedView"
+          >
+            {{ t('bundles.removed.view') }}
+          </button>
         </div>
 
         <span class="stats">
@@ -1069,6 +1197,35 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
         <div class="info">
           <div class="title-row">
             <h3 class="game-title" :title="b.name">{{ b.name }}</h3>
+            <!-- 星标关注 / 移除（恢复视图换成恢复键）；点击不冒泡进详情抽屉 -->
+            <div class="bundle-actions">
+              <button
+                v-if="!removedView"
+                class="star-btn"
+                :class="{ active: followedIds.has(b.bundleId) }"
+                :title="t('bundles.follow.tip')"
+                @click.stop="onToggleFollow(b)"
+              >
+                <span class="star-empty">☆</span>
+                <span class="star-filled">★</span>
+              </button>
+              <button
+                v-if="!removedView"
+                class="star-btn store-action-btn"
+                :title="t('bundles.action.remove')"
+                @click.stop="onRemoveCard(b)"
+              >
+                <HlIcon name="delete" :size="14" />
+              </button>
+              <button
+                v-else
+                class="star-btn store-action-btn is-restore"
+                :title="t('bundles.action.restore')"
+                @click.stop="onRestoreCard(b)"
+              >
+                <HlIcon name="refresh" :size="14" />
+              </button>
+            </div>
           </div>
 
           <div class="tags-row">
@@ -1415,10 +1572,33 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
         </div>
       </div>
     </HlDialog>
+
+    <!-- 撤销条：最近一次移除的包可一键恢复（6 秒后收起；「已移除」视图是常驻出路） -->
+    <HlUndoToast
+      :show="undoBid != null"
+      :text="t('bundles.removed.toast', { n: 1 })"
+      @undo="undoRemove"
+    />
   </div>
 </template>
 
 <style scoped>
+/* 卡片动作组（星标关注 / 移除 / 恢复）：标题行右推，按钮形态复用
+   hl-gamecard.css 的 .star-btn / .store-action-btn（卡片同挂 .game-card 类） */
+.bundle-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+/* 列表行：名称 + 动作组一行铺开（动作组挤不下的窄行允许名称截断） */
+.blr-name-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
 .bundles-view {
   padding: 16px 18px 40px;
 }
