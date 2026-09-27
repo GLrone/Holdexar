@@ -20,7 +20,7 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.section.tour': 'Guided tour',
 
   /* Steam account binding card */
-  'settings.steam.desc': 'Binding an account shows its wallet balance (top right) plus billing currency and region. Only the sign-in Cookie fields are kept — including steamRefresh_steam, which renews the session automatically — stored in plain text in the local database only.',
+  'settings.steam.desc': 'Binding an account shows its wallet balance (top right) plus billing currency and region. Only the sign-in Cookie fields are kept — including steamRefresh_steam, which renews the session automatically — stored encrypted in the local database only.',
   'settings.steam.cookiePlaceholder': 'Paste a Cookie containing steamLoginSecure (one long line or several lines — it is tidied up for you)',
   'settings.steam.cookiePlaceholderBound': 'The current account is bound ({identity}) — paste another to add it',
   'settings.steam.autoFetch': 'Sign in and fetch',
@@ -35,7 +35,7 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.steam.guideStep2': 'Press <kbd>F12</kbd> to open DevTools, switch to the <b>Network</b> tab, then press <kbd>F5</kbd> to reload the page.',
   'settings.steam.guideStep3': 'Click the <b>first request</b> in the list (usually the store page itself), find the one line that starts with <code>Cookie:</code> under Request Headers on the right, then <b>right-click → Copy value</b> (it is long — copy the whole line).',
   'settings.steam.guideStep4': 'Come back here, paste it into the field above and click “Bind”. Both the single line carrying the <code>Cookie:</code> prefix and the multi-line form copied row by row from Application → Cookies are recognized and tidied up automatically.',
-  'settings.steam.guideNotes': 'The sign-in cookies kept are sessionid, steamCountry, steamLoginSecure and steamRefresh_steam (the renewal credential, present only if you ticked “Remember me” when signing in); anything else is dropped on save. The Cookie is stored in plain text in the local database only. With the renewal credential the session renews itself, so it only breaks once you sign out of Steam.',
+  'settings.steam.guideNotes': 'The sign-in cookies kept are sessionid, steamCountry, steamLoginSecure and steamRefresh_steam (the renewal credential, present only if you ticked “Remember me” when signing in); anything else is dropped on save. The Cookie is stored encrypted in the local database only. With the renewal credential the session renews itself, so it only breaks once you sign out of Steam.',
 
   /* Bound-account list */
   'settings.steam.mismatchWarn': 'This account has a different SteamID from the SteamID64 saved above — check that it is the same account',
@@ -72,7 +72,7 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.account.steamIdPlaceholder': 'e.g. 76561198000000000',
   'settings.account.lookup': 'Look up',
   'settings.account.applyFree': 'Get one free',
-  'settings.account.apiKeyHint': 'Required for owned-games sync · stored in plain text in the local database only',
+  'settings.account.apiKeyHint': 'Required for owned-games sync · stored encrypted in the local database only',
   'settings.account.apiKeyPlaceholder': 'Enter your API Key',
   'settings.account.apiKeyPlaceholderSet': 'Configured ({mask}) — leave blank to keep it',
   'settings.account.save': 'Save',
@@ -167,13 +167,13 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.toast.fetching': 'Fetching…',
   'settings.toast.walletRefreshed': 'Refreshed',
   'settings.toast.walletRefreshFailed': 'Refresh failed',
-  // Binding risk dialog (pops up on every binding action; 5s confirm countdown)
+  // Binding risk dialog (pops up on every binding action; confirm enabled only after the red consent tick)
   // Items come in key pairs: Lead = bolded keyword, Rest = short explanation.
   'settings.risk.title': 'Read before binding a Steam account',
   'settings.risk.bodyTitle': 'Risk notice',
-  'settings.risk.item1Lead': 'Credential stored in plain text',
+  'settings.risk.item1Lead': 'Credential stored encrypted',
   'settings.risk.item1Rest':
-    'Your Steam login Cookie is saved unencrypted in the local database — as effective as handing the account to this app.',
+    'Your Steam login Cookie is stored encrypted in the local database (key bound to this machine) — as effective as handing the account to this app.',
   'settings.risk.item2Lead': 'Local use only',
   'settings.risk.item2Rest': 'Never uploaded to any server; only local features (wallet, wishlist, library sync).',
   'settings.risk.item3Lead': 'Readable from this machine',
@@ -190,8 +190,9 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.risk.leak3Rest': 'Check sign-ins, trades and market history; contact Steam Support if anything looks wrong.',
   'settings.risk.leak4Lead': 'Unbind and clear it here',
   'settings.risk.leak4Rest': "Use 'Unbind all accounts' in settings to remove the stored credential.",
-  'settings.risk.confirm': 'I understand, continue',
-  'settings.risk.countdown': 'I understand ({n}s)',
+  'settings.risk.consent':
+    'I understand the risks above and agree to store my Steam login credential on this machine',
+  'settings.risk.confirm': 'Continue',
 
   /* Notifications (price-event notices; categories are user-facing, no internal enums) */
   'settings.section.notification': 'Notifications',
