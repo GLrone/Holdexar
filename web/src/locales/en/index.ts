@@ -68,6 +68,10 @@ import achievements from './achievements'
 import achievementsCareer from './achievementsCareer'
 // ── Price event surfaces (game detail "recent price changes" + dashboard digest) ──
 import priceEvent from './priceEvent'
+// ── Auto Fetch page (views/fetch/Index.vue, per-source switches) ──
+import fetchPage from './fetch'
+// ── Dynamic-island message surface (components/ui/HlIsland.vue) ──
+import island from './island'
 
 const messages: Partial<Record<MessageKey, string>> = {
   ...common,
@@ -110,9 +114,8 @@ const messages: Partial<Record<MessageKey, string>> = {
   ...achievements,
   ...achievementsCareer,
   ...priceEvent,
+  ...fetchPage,
+  ...island,
 }
 
 export default messages
-// ── Auto Fetch page (views/fetch/Index.vue, per-source switches) ──
-import fetchPage from './fetch'
-  ...fetchPage,
