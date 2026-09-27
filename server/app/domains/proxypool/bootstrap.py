@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import yaml
 
 from app.domains.proxies.models import ProxySubscription
+from app.domains.proxies.subscription_secret import UNREADABLE_MESSAGE, open_url
 from app.domains.proxypool import events
 from app.domains.proxypool.admission import is_admitted
 from app.domains.proxypool.exits import select_exit_slots
@@ -154,9 +155,15 @@ async def sync_subscriptions(
             # 每条订阅一个 SAVEPOINT：本条目的半截写入只回滚自己，
             # 同轮其它订阅已完成的成果留在外层事务里
             async with session.begin_nested():
-                result = await fetch_subscription(str(sub.url), channels)
+                sub_url = open_url(sub.url)
+                if not sub_url:
+                    # 链接解不开（密钥属主机绑定）：本轮跳过并留原因，不伪装成抓取失败
+                    skipped.append(sub_id)
+                    failures[sub_id] = UNREADABLE_MESSAGE
+                    continue
+                result = await fetch_subscription(sub_url, channels)
                 nodes = parse_nodes(result.raw, result.fmt)
-                snap = build_snapshot(sub_id, str(sub.url), result, nodes, now=now)
+                snap = build_snapshot(sub_id, sub_url, result, nodes, now=now)
                 await persist_snapshot(session, snap, data_dir=data_dir)
                 # 准入判定必须**现读**：`subs` 是轮询开始时加载的，抓取可能耗时几十秒，
                 # 期间这条订阅可能已经被晋升（或本来就是候选）。用陈旧对象判定会出现：

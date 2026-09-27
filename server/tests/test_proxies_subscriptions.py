@@ -15,8 +15,10 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.core import secretbox
 from app.core.database import Base
 from app.domains.proxies import clash_manager, service as proxies_service
+from app.domains.proxies.subscription_secret import open_url
 from app.domains.proxies.models import ClashNode, Proxy, ProxySubscription
 
 SUB_URL = "https://example.com/sub?token=abc"
@@ -127,7 +129,8 @@ async def test_update_subscription_url_change_triggers_sync(db, monkeypatch):
     assert res["nodes"] == 7
     assert res["traffic"] == USERINFO
     assert res["label"] == "新名字"
-    assert (await _get_sub(db, sub_id)).url == "https://example.com/sub?token=xyz"
+    assert secretbox.is_encrypted((await _get_sub(db, sub_id)).url)
+    assert open_url((await _get_sub(db, sub_id)).url) == "https://example.com/sub?token=xyz"
 
 
 @pytest.mark.asyncio
@@ -175,7 +178,8 @@ async def test_update_subscription_sync_failure_keeps_changes(db, monkeypatch):
     assert "自动重拉失败" in res["warning"]
     row = await _get_sub(db, sub_id)
     assert row.label == "新名字"
-    assert row.url == "https://example.com/sub?token=xyz"
+    assert secretbox.is_encrypted(row.url)
+    assert open_url(row.url) == "https://example.com/sub?token=xyz"
 
 
 @pytest.mark.asyncio
