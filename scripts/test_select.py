@@ -9,7 +9,8 @@
 
 选测范围 = 改动模块 + 在代码上导入它的模块一路向上（服务依赖链）。
 数据产物关联不算依赖：A 的输出落库后被 B 读取，不构成 B 的测试义务。
-影响面无界的文件（conftest / 全局配置 / 依赖清单）不做局部选测，直接判全量。
+影响面无界的文件（conftest / 全局配置 / 依赖清单）不当场跑全量：判地基改动，
+当场只跑 L2 冒烟并登记，全量回归归发布门（发版时独立后台进程一次跑完）。
 """
 from __future__ import annotations
 
@@ -27,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 APP_DIR = ROOT / "server" / "app"
 TESTS_DIR = ROOT / "server" / "tests"
 
-# 这些文件被全部模块依赖：改动即影响面无界，局部选测是假安全
+# 这些文件被全部模块依赖：改动即影响面无界——当场验收走 L2 冒烟，全量归发布门
 FULL_BLAST = {
     "server/tests/conftest.py",
     "server/app/core/config.py",
@@ -233,8 +234,9 @@ def main() -> int:
         server_changed = [p for p in rel_changed if p.startswith("server/") or p in SCRIPT_TESTS]
         hit_full = [p for p in rel_changed if p in FULL_BLAST]
         if hit_full:
-            print(f"[全量] 影响面无界（命中地基文件）：{', '.join(hit_full)}")
-            print("执行：python -m pytest -q")
+            print(f"[地基] 命中地基文件：{', '.join(hit_full)}")
+            print("当场不跑全量。验收：python scripts/test_select.py --smoke --run")
+            print("并登记「本轮含地基改动」——本周期发布门全量不可跳过。")
             return 0
         if not server_changed:
             print(f"[选测] 改动均不涉后端（{len(web_only)} 个前端/文档文件 → 走构建门禁），无后端测试可跑。")
