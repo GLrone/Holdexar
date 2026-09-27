@@ -25,6 +25,7 @@ const shell = {
   'nav.family': '家庭',
   'nav.bills': '账单',
   'nav.crawl': '任务',
+  'nav.fetch': '自动抓取',
   'nav.proxies': '网络',
   'nav.alerts': '价格提醒',
   'nav.rates': '汇率',

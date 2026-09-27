@@ -111,7 +111,9 @@ async def proxy_stats():
 @router.put("/strategy")
 async def set_strategy(req: StrategyUpdate):
     try:
-        await service.set_strategy(req.strategy, req.clashPort)
+        await service.set_strategy(
+            req.strategy, req.clashPort, req.autostart, req.healthAuto
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return await service.get_strategy()

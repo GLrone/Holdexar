@@ -39,6 +39,13 @@ const proxies: Partial<Record<MessageKey, string>> = {
   'proxies.port.invalid': 'Port must be an integer between 1024 and 65535',
   'proxies.port.updated': 'Clash port updated',
 
+  /* Auto-maintenance switches (kernel autostart / periodic health check; manual tests bypass) */
+  'proxies.auto.autostartLabel': 'Start kernel with the app',
+  'proxies.auto.autostartHint': 'Launches the Clash kernel automatically when Holdexar starts; when off, start it manually from this page',
+  'proxies.auto.healthLabel': 'Automatic node health check',
+  'proxies.auto.healthHint': 'Checks node availability periodically and refreshes routing; when off, use "Test nodes" anytime for a manual check',
+  'proxies.auto.failed': 'Save failed, please retry',
+
   /* Kernel download / install */
   'proxies.kernel.dialogTitle': 'Downloading kernel',
   'proxies.kernel.phasePrepare': 'Preparing download',

@@ -115,3 +115,6 @@ export const messages = {
 export type MessageKey = keyof typeof messages
 
 export default messages
+// ── 自动抓取页（views/fetch/Index.vue，内容源开关）──
+import fetchPage from './fetch'
+  ...fetchPage,

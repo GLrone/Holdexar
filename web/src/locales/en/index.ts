@@ -113,3 +113,6 @@ const messages: Partial<Record<MessageKey, string>> = {
 }
 
 export default messages
+// ── Auto Fetch page (views/fetch/Index.vue, per-source switches) ──
+import fetchPage from './fetch'
+  ...fetchPage,

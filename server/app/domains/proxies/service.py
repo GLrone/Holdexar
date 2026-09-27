@@ -129,10 +129,18 @@ async def get_strategy() -> dict:
     return {
         "strategy": strategy,
         "clashPort": await get_value("proxy.clash_port", 7890),
+        # 内核自启 / 自动节点体检开关（默认开；体检的 force 手动路径不受闸）
+        "autostart": bool(await get_value("proxy.autostart", True)),
+        "healthAuto": bool(await get_value("proxy.health_auto", True)),
     }
 
 
-async def set_strategy(strategy: str | None = None, clash_port: int | None = None) -> None:
+async def set_strategy(
+    strategy: str | None = None,
+    clash_port: int | None = None,
+    autostart: bool | None = None,
+    health_auto: bool | None = None,
+) -> None:
     from app.domains.settings.service import set_value
 
     if strategy is not None:
@@ -141,6 +149,10 @@ async def set_strategy(strategy: str | None = None, clash_port: int | None = Non
         await set_value("proxy.strategy", strategy)
     if clash_port is not None:
         await set_value("proxy.clash_port", clash_port)
+    if autostart is not None:
+        await set_value("proxy.autostart", bool(autostart))
+    if health_auto is not None:
+        await set_value("proxy.health_auto", bool(health_auto))
 
 
 async def _local_clash_alive() -> bool:
@@ -1687,6 +1699,10 @@ async def maybe_run_clash_health_check(force: bool = False) -> str:
     本地软件不常驻运行——APScheduler 间隔只是兜底，真正的节流靠
     clash_nodes 账本的 last_checked_at（跨重启有效）。返回执行状态。
     """
+    from app.domains.settings.service import get_value
+
+    if not force and not await get_value("proxy.health_auto", True):
+        return "disabled"  # 「自动节点体检」开关关闭：定时路径让路，手动检测（force）照常
     if not clash_manager.runtime.status()["running"]:
         return "clash_not_running"
     async with get_session_factory()() as session:

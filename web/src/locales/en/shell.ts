@@ -16,6 +16,7 @@ const shell: Partial<Record<MessageKey, string>> = {
   'nav.family': 'Family',
   'nav.bills': 'Bills',
   'nav.crawl': 'Tasks',
+  'nav.fetch': 'Auto Fetch',
   'nav.proxies': 'Network',
   'nav.alerts': 'Price Alerts',
   'nav.rates': 'Rates',

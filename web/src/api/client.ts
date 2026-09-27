@@ -161,6 +161,8 @@ export interface SettingsPayload {
   onboarding_done: boolean
   /** 自动价格链总开关：false = 定时爬价与失败修复停转，只留手动爬取 */
   auto_price: boolean
+  /** 每日自动备份开关：false = 只留手动备份（启动补备同闸） */
+  backup_auto: boolean
   /** 已主动提示过的版本号：启动告知按「一次一版本」去重的锚点 */
   update_notified: string
   /** 新版本提示总开关：false = 有新版也不弹窗/不亮红点（只留手动检查） */
@@ -193,12 +195,31 @@ export const regionsApi = {
 
 // ─── settings ────────────────────────────────────────────
 
+export interface FetchSettingsPayload {
+  /** Epic 免费游戏：每日核对 + 首页卡片 */
+  epic_free: boolean
+  /** Humble Choice 当月包核对 */
+  hb_choice: boolean
+  /** Steam 榜单四板（热销/特惠/新品/即将推出） */
+  boards: boolean
+  /** 第三方档案进包计数 */
+  bundle_counts: boolean
+  /** 汇率每日自动更新 */
+  fx_auto: boolean
+  /** 汇率历史缺口修复 */
+  fx_history: boolean
+  /** 价格刷新网格步长（小时，1..72，默认 6） */
+  price_interval_hours: number
+}
+
 export const settingsApi = {
   get: () => request<SettingsPayload>('GET', '/settings'),
   update: (payload: {
     account?: { steam_id?: string; steam_api_key?: string }
     onboarding_done?: boolean
     auto_price?: boolean
+    /** 每日自动备份开关 */
+    backup_auto?: boolean
     /** 记录已主动提示过的版本号（启动告知去重用） */
     update_notified?: string
     /** 新版本提示总开关 */
@@ -206,6 +227,9 @@ export const settingsApi = {
     /** 静默自动更新开关 */
     update_auto?: boolean
   }) => request<SettingsPayload>('PUT', '/settings', payload),
+  getFetch: () => request<FetchSettingsPayload>('GET', '/settings/fetch'),
+  updateFetch: (payload: Partial<FetchSettingsPayload>) =>
+    request<FetchSettingsPayload>('PUT', '/settings/fetch', payload),
 }
 
 // ─── account（Steam 账户绑定 / 钱包余额）────────────────────

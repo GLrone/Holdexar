@@ -258,7 +258,21 @@ function openUpdateDialog() {
 const settingsStore = useSettingsStore()
 const updateNotifyOn = computed(() => settingsStore.updateNotify !== false)
 const updateAutoOn = computed(() => settingsStore.updateAuto === true)
+const backupAutoOn = computed(() => settingsStore.backupAuto !== false)
 const updatePrefsToggling = ref(false)
+const backupToggling = ref(false)
+
+async function toggleBackupAuto(on: boolean) {
+  if (backupToggling.value) return
+  backupToggling.value = true
+  try {
+    const ok = await settingsStore.setBackupAuto(on)
+    if (ok) message.success(t(on ? 'settings.backup.autoOn' : 'settings.backup.autoOff'))
+    else message.error(t('settings.update.switchFailed'))
+  } finally {
+    backupToggling.value = false
+  }
+}
 
 async function toggleUpdateNotify(on: boolean) {
   if (updatePrefsToggling.value) return
@@ -297,26 +311,33 @@ async function toggleUpdateAuto(on: boolean) {
 async function load() {
   loading.value = true
   errorMsg.value = ''
+  /* 六个数据来源互不依赖：主表单数据先发出，其余并行跟进，骨架屏只等主数据；
+     账户 / 备份列表 / 更新状态各自吞错，到数即填对应卡片，不阻塞页面 */
+  const main = settingsApi.get()
+  void accountStore.load()
+  void loadBackups()
+  void loadUpdateInfo()
   try {
-    const data: SettingsPayload = await settingsApi.get()
+    const data: SettingsPayload = await main
     steamId.value = data.account.steam_id
     apiKeyMasked.value = data.account.steam_api_key
     hasApiKey.value = data.account.has_api_key
-    await accountStore.load()
-    await loadBackups()
-    /* 版本信息 + 与后端对齐更新状态（暂存/进行中的下载；失败静默不阻塞设置页） */
-    try {
-      const info = await systemApi.info()
-      appVersion.value = info.version
-      repoSlug.value = info.repo
-      await updaterStore.sync()
-    } catch {
-      /* 更新状态拉不到不影响设置页 */
-    }
   } catch (e) {
     errorMsg.value = e instanceof Error ? e.message : String(e)
   } finally {
     loading.value = false
+  }
+}
+
+async function loadUpdateInfo() {
+  /* 版本信息 + 与后端对齐更新状态（暂存/进行中的下载；失败静默不阻塞设置页） */
+  try {
+    const info = await systemApi.info()
+    appVersion.value = info.version
+    repoSlug.value = info.repo
+    await updaterStore.sync()
+  } catch {
+    /* 更新状态拉不到不影响设置页 */
   }
 }
 
@@ -851,6 +872,20 @@ onMounted(() => {
       <div class="card settings-card" data-section="settings.section.backup">
         <div class="section-title">{{ t('settings.section.backup') }}</div>
         <div class="section-desc">{{ t('settings.backup.desc') }}</div>
+
+        <div class="settings-row">
+          <div class="settings-row__line">
+            <HlSwitch
+              :model-value="backupAutoOn"
+              accent
+              :disabled="backupToggling"
+              :label="t('settings.backup.autoLabel')"
+              :title="t('settings.backup.autoHint')"
+              @update:model-value="toggleBackupAuto"
+            />
+          </div>
+          <div class="section-desc">{{ t('settings.backup.autoHint') }}</div>
+        </div>
 
         <div class="settings-row">
           <div class="settings-row__line">

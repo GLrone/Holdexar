@@ -11,6 +11,8 @@ export const useSettingsStore = defineStore('settings', () => {
   const onboardingDone = ref<boolean | null>(null)
   /** 自动价格链开关（null = 未拉到，UI 按开处理；定时爬价 + 失败修复的总闸） */
   const autoPrice = ref<boolean | null>(null)
+  /** 每日自动备份开关（null = 未拉到，UI 按开处理；启动补备同闸） */
+  const backupAuto = ref<boolean | null>(null)
   /** 已主动提示过的版本号（'' = 从未提示；启动告知据此做「一次一版本」去重） */
   const updateNotified = ref('')
   /** 新版本提示开关（null = 未拉到，UI 按开处理：提示默认开） */
@@ -25,6 +27,7 @@ export const useSettingsStore = defineStore('settings', () => {
       account.value = s.account
       onboardingDone.value = s.onboarding_done
       autoPrice.value = s.auto_price
+      backupAuto.value = s.backup_auto
       updateNotified.value = s.update_notified
       updateNotify.value = s.update_notify
       updateAuto.value = s.update_auto
@@ -71,6 +74,20 @@ export const useSettingsStore = defineStore('settings', () => {
     }
   }
 
+  /** 每日自动备份开关（返回是否成功；失败回滚本地态） */
+  async function setBackupAuto(on: boolean) {
+    const prev = backupAuto.value
+    backupAuto.value = on
+    try {
+      const s = await settingsApi.update({ backup_auto: on })
+      backupAuto.value = s.backup_auto
+      return true
+    } catch {
+      backupAuto.value = prev
+      return false
+    }
+  }
+
   /** 新版本提示开关（返回是否成功；失败回滚本地态） */
   async function setUpdateNotify(on: boolean) {
     const prev = updateNotify.value
@@ -104,6 +121,7 @@ export const useSettingsStore = defineStore('settings', () => {
     loaded,
     onboardingDone,
     autoPrice,
+    backupAuto,
     updateNotified,
     updateNotify,
     updateAuto,
@@ -111,6 +129,7 @@ export const useSettingsStore = defineStore('settings', () => {
     markOnboardingDone,
     markUpdateNotified,
     setAutoPrice,
+    setBackupAuto,
     setUpdateNotify,
     setUpdateAuto,
   }
