@@ -205,6 +205,10 @@ async def refresh_if_stale() -> bool:
     interval 调度从启动起算，服务频繁重启时 24h 永远到不了点——
     启动时检查最后快照龄，超过阈值（半天）就补一次，保证"每日自动抓取"承诺。
     """
+    from app.domains.settings.service import get_value
+
+    if not await get_value("crawl.auto_refresh_rates", True):
+        return False  # 「汇率更新」开关关闭：启动兜底与定时刷新同闸，手动刷新不受影响
     async with get_session_factory()() as session:
         row = (await session.execute(select(func.max(FxRate.fetched_at)))).scalar()
     if row is None:
@@ -254,7 +258,7 @@ async def rate_history(currency: str = "USD", limit: int = 0, range: str | None 
     （observed/carried）随行返回——前端据此区分真实观测与历史延续值。
 
     range（六档）：1mo/6mo/1y/5y/10y/all，只保留窗口内尾部。
-    默认无窗口（16 年全量），limit>0 时再取尾段 limit 天（向后兼容旧调用）。
+    默认无窗口（档案全量），limit>0 时再取尾段 limit 天（向后兼容旧调用）。
     """
     async with get_session_factory()() as session:
         rows = (

@@ -177,6 +177,28 @@ const yDomain = computed(() => {
 /** 点密度：稀疏窗口（≤240 点）显示节点圆点，密集窗口关 symbol（节点互相叠死） */
 const showSymbols = computed(() => history.value.length <= 240)
 
+/** 数据来源标注：行级 source 翻译成人话，按新→旧首次出现排序；未识别来源归「其他」 */
+const SOURCE_KEYS: Record<string, string> = {
+  'bing.currencyapi': 'rates.source.bing',
+  'augmentedsteam': 'rates.source.steam',
+  'er-api': 'rates.source.erapi',
+  'exchangerate.host': 'rates.source.exh',
+  'seed': 'rates.source.seed',
+  'steamhl_pg': 'rates.source.seed',
+  'backfill': 'rates.source.seed',
+}
+
+const sourceCaption = computed(() => {
+  const seen: string[] = []
+  for (let i = history.value.length - 1; i >= 0; i--) {
+    const src = history.value[i].source
+    if (!src) continue
+    const label = t(SOURCE_KEYS[src] ?? 'rates.source.other')
+    if (!seen.includes(label)) seen.push(label)
+  }
+  return seen.join(' · ')
+})
+
 const chartOption = computed(() => {
   const c = palette.value
   const tip = tipPalette.value
@@ -431,6 +453,9 @@ onMounted(async () => {
           })
         "
       />
+      <div v-if="sourceCaption" class="history-source">
+        {{ t('rates.sourceCaption', { sources: sourceCaption }) }}
+      </div>
     </div>
 
     <div class="card section-card" data-section="rates.section.convert">
@@ -632,6 +657,12 @@ onMounted(async () => {
   width: 100%;
   height: 280px;
   margin-top: 12px;
+}
+
+.history-source {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
 }
 
 /* 图表左→右展开的 keyframes 与降级已上移到 hl-framework.css（.hl-chart-wipe）：

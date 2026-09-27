@@ -46,22 +46,3 @@ class FxRateHistory(Base):
     # Provider 有明确观察时刻时记录（EOD 源为数据日收盘时刻；无则 NULL）
     observed_at: Mapped[datetime | None] = mapped_column(DateTime)
 
-
-class FxProviderUsage(Base):
-    """Provider 配额账本（月度）：换 Key / 换月份 / 换 Provider 各自一行。
-
-    响应 headers 不暴露月度余量（Provider 只暴露 1 req/s 级限速），本地记账是唯一
-    手段。`key_fingerprint` 是 Key 的哈希指纹——Key 明文只留在
-    `secrets/fx_maintenance.env`，不进库、不进 git。
-    """
-
-    __tablename__ = "fx_provider_usage"
-
-    provider: Mapped[str] = mapped_column(String(40), primary_key=True)
-    key_fingerprint: Mapped[str] = mapped_column(String(24), primary_key=True)
-    period: Mapped[str] = mapped_column(String(7), primary_key=True)  # YYYY-MM
-    request_count: Mapped[int] = mapped_column(Integer, default=0)
-    request_limit: Mapped[int | None] = mapped_column(Integer)
-    last_requested_at: Mapped[datetime | None] = mapped_column(DateTime)
-    last_remaining: Mapped[int | None] = mapped_column(Integer)
-    last_error: Mapped[str | None] = mapped_column(String(500))

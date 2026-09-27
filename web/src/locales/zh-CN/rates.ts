@@ -38,6 +38,13 @@ const rates = {
   /* 历史走势 */
   'rates.history.title': '{currency} 历史走势',
   'rates.history.empty': '暂无 {currency} 历史记录 —— 随每日自动刷新积累。',
+  'rates.sourceCaption': '数据来源：{sources}',
+  'rates.source.bing': '必应汇率（LSEG 数据）',
+  'rates.source.steam': 'Steam 社区数据（AugmentedSteam）',
+  'rates.source.erapi': 'Exchangerate-API',
+  'rates.source.exh': 'Exchangerate.host',
+  'rates.source.seed': '随包历史档案',
+  'rates.source.other': '其他来源',
 
   /* 时间范围 chips（按 RATE_RANGES 的 id 映射，见文件头） */
   'rates.range.oneMonth': '1月',

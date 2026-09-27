@@ -12,8 +12,8 @@ Bills / Games / 维护脚本一律走本模块，不直接读 `fx_rate_history`�
 修复原则：
 - 缺口由本地扫描确定（缺行日 ∪ carried 日），数据由 Provider 决定——不维护
   工作日历、不跳过周末、不猜节假日；
-- 先本地 scan → 日期区间合并 → 每窗 ≤ 365 天一次 timeframe（一次请求覆盖
-  全窗口 × 全币种）→ 校验 → 只写缺失日与 carried 日（observed 日永不重拉）；
+- 先本地 scan → 日期区间合并 → 每窗一次 Provider 拉取 → 校验 → 只写缺失日
+  与 carried 日（observed 日永不重拉）；单源 bing.currencyapi（免 Key）；
 - 外网失败 / 额度不足即停：不重试风暴、不造假数据。
 """
 from __future__ import annotations
@@ -28,22 +28,21 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from app.core.database import get_session_factory
 from app.crawler.utils import get_beijing_time_obj
 from .models import FxRateHistory
-from .providers.exchangerate_host import (
-    MAX_WINDOW_DAYS,
-    PROVIDER_NAME,
-    ExchangerateHostProvider,
-    ProviderAuthError,
+from .providers.bing_currency import (
+    PROVIDER_NAME as BING_PROVIDER_NAME,
+    BingCurrencyProvider,
     ProviderError,
-    ProviderQuotaError,
-    resolve_api_key,
 )
-from . import quota
 
 logger = logging.getLogger(__name__)
 
 # 缺口日聚类阈值：相邻待修复日间隔 ≤ 该值并入同一窗口段（多拉几天数据零成本，
 # 换来更少的请求数）；超过则各自成段。
 _CLUSTER_GAP_DAYS = 7
+
+# 修复窗口上限：批次化单窗数据量（Bing 按币种请求，窗口大小不影响请求数，
+# 批次语义保留用于逐窗落账与失败定位）
+MAX_WINDOW_DAYS = 365
 
 
 def _as_date(value: object) -> date | None:
@@ -352,7 +351,7 @@ async def _write_observed(data: dict[date, dict[str, float]]) -> tuple[int, dict
                 {
                     "currency_code": code,
                     "rate_to_cny": float(rate),
-                    "source": PROVIDER_NAME,
+                    "source": BING_PROVIDER_NAME,
                     "source_kind": "observed",
                     "rate_date": day,
                     "fetched_at": now,
@@ -404,6 +403,10 @@ async def revalue_dependents(touched: dict[str, set[date]]) -> dict:
     return result
 
 
+def _new_bing_provider() -> BingCurrencyProvider:
+    return BingCurrencyProvider()
+
+
 async def repair_history_gaps(
     *,
     dry_run: bool = False,
@@ -412,14 +415,14 @@ async def repair_history_gaps(
     start: date | None = None,
     end: date | None = None,
 ) -> dict:
-    """拉取真实历史修复缺口：scan → 窗口分批 → timeframe → 写 observed → 重估。
+    """拉取真实历史修复缺口：scan → 窗口分批 → Provider 拉取 → 写 observed → 重估。
 
     - `dry_run`：只出计划不触网不写库；
     - `max_windows`：单轮最多消费的窗口数（调度侧节流用；None = 不限，仍受
       quota guard 硬拦）；
     - `start`/`end`：限定修复区间（运维用）；
-    - 任一次外网失败即停（不重试风暴）：配额不足 → `quota_exhausted`，
-      Key 无效 → `auth_error`，其它 → `provider_error`。
+    - 主源免 Key（bing.currencyapi），无任何配置即可修复。任一次外网失败
+      即停（不重试风暴）→ `provider_error`。
     """
     scan = await scan_history_gaps(today=today, start=start, end=end)
     windows = scan["windows"]
@@ -435,41 +438,21 @@ async def repair_history_gaps(
     if not windows:
         return result
 
-    key = resolve_api_key()
-    if not key:
-        return {**result, "status": "no_key"}
-
     planned = windows if max_windows is None else windows[: max(0, max_windows)]
     if dry_run:
         return {**result, "status": "dry_run", "planned": planned}
 
-    fp = quota.key_fingerprint(key)
-    limit = await quota.monthly_limit()
-    provider = ExchangerateHostProvider(key)
+    bing = _new_bing_provider()
     from .service import ALLOWED_CURRENCIES
 
     targets = sorted(ALLOWED_CURRENCIES)
     touched: dict[str, set[date]] = {}
     for window in planned:
-        if not await quota.can_request(PROVIDER_NAME, fp, limit=limit):
-            result["status"] = "quota_exhausted"
-            break
         start = date.fromisoformat(window["start"])
         end = date.fromisoformat(window["end"])
         try:
-            data = await provider.fetch_timeframe(start, end, targets)
-        except ProviderQuotaError as e:
-            await quota.record_request(PROVIDER_NAME, fp, limit=limit, status="error", error=str(e)[:400])
-            result["status"] = "quota_exhausted"
-            result["error"] = str(e)[:200]
-            break
-        except ProviderAuthError as e:
-            await quota.record_request(PROVIDER_NAME, fp, limit=limit, status="error", error=str(e)[:400])
-            result["status"] = "auth_error"
-            result["error"] = str(e)[:200]
-            break
+            data = await bing.fetch_timeframe(start, end, targets)
         except ProviderError as e:
-            await quota.record_request(PROVIDER_NAME, fp, limit=limit, status="error", error=str(e)[:400])
             result["status"] = "provider_error"
             result["error"] = str(e)[:200]
             break
@@ -477,7 +460,6 @@ async def repair_history_gaps(
             result["status"] = "provider_error"
             result["error"] = str(e)[:200]
             break
-        await quota.record_request(PROVIDER_NAME, fp, limit=limit)
         written, part_touched = await _write_observed(data)
         result["requests"] += 1
         result["written"] += written
