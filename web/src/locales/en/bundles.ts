@@ -24,9 +24,14 @@ const bundles: Partial<Record<MessageKey, string>> = {
   'bundles.head.total': '{n} bundles',
   'bundles.head.completable': '· {n} completable',
   'bundles.empty.noData': 'No bundle data',
+  'bundles.empty.noDataHint': 'Bundle data is not ready yet; check back later.',
   'bundles.empty.noMatch': 'No matching bundles',
+  'bundles.empty.filterHint': 'Try a different search term, or clear the filters.',
+  'bundles.empty.filterClear': 'Clear search & filters',
+  'bundles.error.title': 'Failed to load bundles',
   'bundles.nav.search': 'Search bundles… (Enter)',
-  'bundles.list.loadMore': 'Load more ({n} remaining)',
+  'bundles.list.loadingMore': 'Loading more...',
+  'bundles.list.end': 'You have reached the end',
 
   /* Region dimension (diff re-anchored to the selected region) */
   'bundles.regionMode.all': 'All',
@@ -42,7 +47,9 @@ const bundles: Partial<Record<MessageKey, string>> = {
   'bundles.filter.hideFamily': 'Hide family-shared',
   'bundles.filter.section.price': 'Price (CN)',
   'bundles.filter.price': 'CN price',
-  'bundles.filter.diffMinLabel': 'Min diff',
+  'bundles.filter.onlyDiscounted': 'Discounted only',
+  'bundles.filter.giftOnly': 'Giftable across regions only',
+  'bundles.filter.diffType': 'Diff unit',
   'bundles.filter.min': 'min',
   'bundles.filter.max': 'max',
   'bundles.filter.cny': '¥',
@@ -52,6 +59,7 @@ const bundles: Partial<Record<MessageKey, string>> = {
   'bundles.badge.me': 'Me',
   'bundles.badge.owned': 'Owned',
   'bundles.badge.family': 'Family',
+  'bundles.badge.wishlist': 'Wishlist',
 
   /* Card price block */
   'bundles.tag.baseDiscount': 'Base discount {pct}%',
@@ -115,10 +123,6 @@ const bundles: Partial<Record<MessageKey, string>> = {
 
   /* Region-lock mask */
   'bundles.mask.regionLocked': '🔒 Locked',
-}
-
-export default bundles
-  'bundles.badge.wishlist': 'Wishlist',
 
   /* ── Card actions: star follow / remove (soft delete, undoable & restorable) ──
      User-facing words are “follow / remove / restore” only */
@@ -134,3 +138,6 @@ export default bundles
   'bundles.removed.fail': 'Remove failed — try again',
   'bundles.restored.fail': 'Restore failed — try again',
   'bundles.restored.protected': 'Excluded manually — not restored',
+}
+
+export default bundles
