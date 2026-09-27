@@ -20,6 +20,7 @@ from urllib.parse import quote
 import httpx
 from sqlalchemy import delete, func, select
 
+from app.core import secretbox
 from app.core.database import get_session_factory
 from app.crawler.browse_store import StoreBrowseAPI
 from app.crawler.utils import get_beijing_time_obj
@@ -50,6 +51,7 @@ from .models import (
     ProxyEvent,
     ProxySubscription,
 )
+from .subscription_secret import UNREADABLE_MESSAGE, open_url, seal_url
 
 logger = logging.getLogger(__name__)
 
@@ -373,7 +375,7 @@ async def update_subscription_label(sub_id: int, label: str) -> dict:
             raise ValueError("订阅不存在")
         sub.label = label or None
         await session.commit()
-        return {"id": sub.id, "kind": sub.kind, "url": sub.url, "label": sub.label}
+        return {"id": sub.id, "kind": sub.kind, "url": open_url(sub.url), "label": sub.label}
 
 
 async def update_subscription(
@@ -407,12 +409,13 @@ async def update_subscription(
             new_url = (url or "").strip()
             if not new_url.lower().startswith(("http://", "https://")):
                 raise ValueError("订阅链接必须是 http(s) URL")
-            if new_url != sub.url:
-                sub.url = new_url
+            # 链接是身份：比对与落库都在明文口径（行内是密文，开封比较）
+            if new_url != open_url(sub.url):
+                sub.url = seal_url(new_url)
                 url_changed = True
         await session.commit()
         result: dict = {
-            "id": sub.id, "kind": sub.kind, "url": sub.url,
+            "id": sub.id, "kind": sub.kind, "url": open_url(sub.url),
             "label": sub.label, "synced": False,
             "autoRefresh": bool(sub.auto_refresh)
             if sub.auto_refresh is not None else True,
@@ -447,6 +450,9 @@ async def refresh_subscription_traffic(sub_id: int) -> dict:
         raise ValueError("订阅不存在")
     if sub.kind != "clash":
         raise ValueError("该订阅不是 Clash 订阅（面板流量头仅机场订阅有）")
+    sub_url = open_url(sub.url)
+    if not sub_url:
+        raise ValueError(UNREADABLE_MESSAGE)
     try:
         proxy = None
         try:
@@ -454,7 +460,7 @@ async def refresh_subscription_traffic(sub_id: int) -> dict:
         except Exception:  # noqa: BLE001
             proxy = None
         headers = await clash_manager.runtime.fetch_subscription_headers(
-            sub.url, proxy_url=proxy
+            sub_url, proxy_url=proxy
         )
     except ValueError:
         raise
@@ -504,13 +510,16 @@ async def refresh_clash_subscription(sub_id: int) -> dict:
         raise ValueError("订阅不存在")
     if sub.kind != "clash":
         raise ValueError("该订阅不是 Clash 订阅（kind=clash）")
+    sub_url = open_url(sub.url)
+    if not sub_url:
+        raise ValueError(UNREADABLE_MESSAGE)
     label = sub.label
     from app.core.config import get_settings
 
     settings = get_settings()
     try:
         meta = await clash_manager.runtime.download_subscription(
-            sub.url, settings.data_dir, await _saved_proxy_candidates(),
+            sub_url, settings.data_dir, await _saved_proxy_candidates(),
             target_path=clash_manager.subscription_config_path(settings.data_dir, sub_id),
         )
     except ValueError:
@@ -560,10 +569,10 @@ async def refresh_clash_subscription(sub_id: int) -> dict:
     # restarted 字段语义 = 「新配置已生效」：热重载（内核不动）或进程重启都算
     restarted = False
     detect = clash_manager.detect_kernel(settings.data_dir)
-    if clash_manager.runtime.running_subscription_is(sub.url) and detect["found"]:
+    if clash_manager.runtime.running_subscription_is(sub_url) and detect["found"]:
         try:
             outcome = await clash_manager.runtime.ensure_running(
-                detect["path"], meta["path"], subscription_url=sub.url,
+                detect["path"], meta["path"], subscription_url=sub_url,
             )
             restarted = bool(outcome.get("reloaded") or outcome.get("started"))
         except Exception:  # noqa: BLE001 —— 更新失败保留旧内核运行
@@ -903,18 +912,17 @@ async def migrate_legacy_subscription() -> None:
     if not legacy:
         return
     async with get_session_factory()() as session:
-        exists = (
+        rows = (
             await session.execute(
-                select(ProxySubscription).where(
-                    ProxySubscription.kind == "clash",
-                    ProxySubscription.url == legacy.strip(),
-                )
+                select(ProxySubscription).where(ProxySubscription.kind == "clash")
             )
-        ).scalar()
+        ).scalars().all()
+        # 行内是密文（或存量明文），去重比对走解密口径
+        exists = any(open_url(r.url) == legacy.strip() for r in rows)
         if not exists:
             session.add(
                 ProxySubscription(
-                    kind="clash", url=legacy.strip(),
+                    kind="clash", url=seal_url(legacy.strip()),
                     created_at=_naive(get_beijing_time_obj()),
                     admission_status=ADMISSION_ACTIVE,
                 )
@@ -934,7 +942,8 @@ async def list_subscriptions(kind: str | None = None) -> list[dict]:
         {
             "id": s.id,
             "kind": s.kind,
-            "url": s.url,
+            # 面板展示用明文（本地管理 UI 自有语义）；行内存的是密文
+            "url": open_url(s.url),
             "label": s.label,
             "createdAt": s.created_at.isoformat() if s.created_at else None,
             "lastImportedAt": s.last_imported_at.isoformat() if s.last_imported_at else None,
@@ -989,7 +998,7 @@ async def add_subscription(kind: str, url: str, label: str | None = None) -> dic
 
     async with get_session_factory()() as session:
         sub = ProxySubscription(
-            kind=kind, url=url, label=label, created_at=_naive(get_beijing_time_obj()),
+            kind=kind, url=seal_url(url), label=label, created_at=_naive(get_beijing_time_obj()),
             # clash 走候选准入（默认 CANDIDATE，显式写清意图）；明文订阅没有候选
             # 观察期，直接 ACTIVE。
             admission_status=(
@@ -1091,6 +1100,9 @@ async def import_plain_subscription(sub_id: int, timeout: float = 30.0) -> dict:
         raise ValueError("订阅不存在")
     if sub.kind != "plain":
         raise ValueError("该订阅不是明文代理订阅（kind=plain）")
+    sub_url = open_url(sub.url)
+    if not sub_url:
+        raise ValueError(UNREADABLE_MESSAGE)
     # 订阅源直连大多被墙：代理优先（内核在跑走内核，其次池，最后直连）
     proxy = None
     try:
@@ -1098,7 +1110,7 @@ async def import_plain_subscription(sub_id: int, timeout: float = 30.0) -> dict:
     except Exception:  # noqa: BLE001
         proxy = None
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, proxy=proxy, trust_env=False) as client:
-        resp = await client.get(sub.url)
+        resp = await client.get(sub_url)
         resp.raise_for_status()
         text = resp.text
 
@@ -1153,7 +1165,7 @@ async def import_plain_subscription(sub_id: int, timeout: float = 30.0) -> dict:
         )
     await mark_imported(sub_id, stats)
     await record_event(
-        kind="import", target=sub.url, proxy_label=f"plain:{sub_id}", error=None
+        kind="import", target=sub_url, proxy_label=f"plain:{sub_id}", error=None
     )
     return stats
 
@@ -1201,7 +1213,8 @@ async def _active_clash_subscription_id(status: dict) -> int | None:
     active_url = (status.get("subscriptionUrl") or "").strip()
     if active_url:
         for s in subs:
-            if s.url.strip() == active_url:
+            # 行内是密文，与内核登记的明文归属按解密口径比对
+            if open_url(s.url) == active_url:
                 return s.id
     return subs[-1].id if subs else None
 
@@ -2013,3 +2026,35 @@ async def recent_events(limit: int = 200) -> list[dict]:
         }
         for e in rows
     ]
+
+
+# ─── 存量明文订阅链接静态加密（启动幂等步骤）──────────────────
+
+async def seal_subscription_urls() -> int:
+    """明文订阅链接封装为密文（`enc1:` 前缀）：订阅表 + 快照 provenance 列。
+
+    幂等：带密文前缀或空值的行跳过。读取侧对存量明文兼容（open_url 按
+    前缀分流），本步骤失败不阻塞启动、不阻塞使用。返回封装条目数。
+    """
+    from app.domains.proxypool.models import SubscriptionSnapshot
+
+    sealed = 0
+    async with get_session_factory()() as session:
+        subs = (await session.execute(select(ProxySubscription))).scalars().all()
+        for row in subs:
+            value = row.url or ""
+            if not value or secretbox.is_encrypted(value):
+                continue
+            row.url = seal_url(value)
+            sealed += 1
+        snaps = (await session.execute(select(SubscriptionSnapshot))).scalars().all()
+        for row in snaps:
+            value = row.url or ""
+            if not value or secretbox.is_encrypted(value):
+                continue
+            row.url = seal_url(value)
+            sealed += 1
+        await session.commit()
+    if sealed:
+        logger.info("[proxies] 存量明文订阅链接已加密落库（%d 条）", sealed)
+    return sealed

@@ -31,6 +31,7 @@ import yaml
 from sqlalchemy import select
 
 from app.domains.proxies.kernel_release import MIHOMO_VERSION
+from app.domains.proxies.subscription_secret import open_url, seal_url, url_matches
 from app.domains.proxypool.models import SubscriptionSnapshot, node_fingerprint
 
 # UA 必须与内核拉取 provider 时同款：面板按 UA 分流订阅格式，不含 clash 关键字会
@@ -478,8 +479,9 @@ async def persist_snapshot(session, snap: Snapshot, *, data_dir: Path
         sha256=snap.sha256,
         format=snap.fmt,
         raw_path=str(path),
-        # URL 是快照的 provenance：换链接后靠它把"旧链接的成功快照"排除掉
-        url=snap.url,
+        # URL 是快照的 provenance（落库密封，读取侧开封比对）：换链接后靠它
+        # 把"旧链接的成功快照"排除掉
+        url=seal_url(snap.url),
         node_count=snap.node_count,
         status="OK",
         http_status=snap.http_status,
@@ -514,11 +516,20 @@ async def latest_snapshot(
         .where(SubscriptionSnapshot.subscription_id == subscription_id)
         .where(SubscriptionSnapshot.status == "OK")
         .order_by(SubscriptionSnapshot.id.desc())
-        .limit(1)
     )
     if url:
-        stmt = stmt.where(SubscriptionSnapshot.url == url)
-    row = await session.scalar(stmt)
+        # 行内存的是密封 URL（provenance 加密），SQL 等值比较不可用——
+        # 按新到旧逐行开封比对，取第一条「当前 URL 抓的」成功快照
+        matched: SubscriptionSnapshot | None = None
+        for row in (await session.scalars(stmt)).all():
+            if url_matches(row.url, url):
+                matched = row
+                break
+        if matched is None:
+            return None
+        row = matched
+    else:
+        row = await session.scalar(stmt.limit(1))
     if row is None:
         return None
     if not row.raw_path:
@@ -548,9 +559,9 @@ async def latest_snapshot(
 
     return Snapshot(
         subscription_id=row.subscription_id,
-        # 真实的来源 URL 来自快照行本身——不能回显调用方的入参，否则换链接后
-        # 会把旧链接的内容标成新链接（调用方无从察觉）
-        url=row.url or url,
+        # 真实的来源 URL 来自快照行本身（开封）——不能回显调用方的入参，否则
+        # 换链接后会把旧链接的内容标成新链接（调用方无从察觉）
+        url=open_url(row.url) or url,
         fetched_at=row.fetched_at or datetime.now(),
         http_status=row.http_status or 0,
         content_type=row.content_type or "",

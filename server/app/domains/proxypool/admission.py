@@ -31,6 +31,7 @@ from app.domains.proxies.models import (
     ADMISSION_CANDIDATE,
     ProxySubscription,
 )
+from app.domains.proxies.subscription_secret import UNREADABLE_MESSAGE, open_url
 from app.domains.proxypool.models import SubscriptionSnapshot, node_fingerprint
 from app.domains.proxypool.registry import apply_snapshot, lock_subscription_mutation
 from app.domains.proxypool.scheduling import request_rebuild
@@ -167,7 +168,9 @@ async def promote_to_active(
     if is_admitted(sub):
         return PromotionResult(subscription_id, False, "已是 ACTIVE", None, 0)
 
-    url = str(sub.url)
+    url = open_url(sub.url)
+    if not url:
+        raise PromotionError(UNREADABLE_MESSAGE)
     try:
         snap = await latest_snapshot(session, subscription_id, url=url)
     except SnapshotRecoveryError as exc:
