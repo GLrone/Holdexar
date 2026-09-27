@@ -323,29 +323,75 @@ async def test_prune_ledger_empty_names_is_noop(db):
 
 @pytest.mark.asyncio
 async def test_running_subscription_is(db, monkeypatch):
-    """重启开关只在「内核启动文本含该订阅 URL」时放行——config.yaml 共用，
-    重拉非当前订阅不能把内核悄悄切过去。"""
+    """重启开关只认「启动时登记的订阅 URL」——config.yaml 共用且会被任何一次
+    下载覆写，文件本身不是依据；重拉非当前订阅不能把内核悄悄切过去。"""
     runtime = clash_manager.runtime
     monkeypatch.setattr(
         runtime, "status",
         lambda: {"running": True, "port": 7890, "configPath": "x"},
     )
 
-    runtime._startup_text = f"mixed-port: 7890\nproxies:\n  - name: A\n{SUB_URL}\n"
+    runtime.subscription_url = SUB_URL
     assert runtime.running_subscription_is(SUB_URL) is True
     assert runtime.running_subscription_is("https://other.com/sub") is False
 
-    runtime._startup_text = "proxies: []"  # URL 不在配置文本里
+    runtime.subscription_url = None  # 旧内核没登记归属
     assert runtime.running_subscription_is(SUB_URL) is False
 
     monkeypatch.setattr(
         runtime, "status",
         lambda: {"running": False, "port": None, "configPath": None},
     )
-    runtime._startup_text = f"proxies:\n{SUB_URL}"
+    runtime.subscription_url = SUB_URL
     assert runtime.running_subscription_is(SUB_URL) is False  # 没跑不放行
 
-    runtime._startup_text = None  # 恢复，不污染进程内单例
+    runtime.subscription_url = None  # 恢复，不污染进程内单例
+
+
+@pytest.mark.asyncio
+async def test_start_switches_subscription_when_running(monkeypatch, tmp_path):
+    """内核已在跑时点「启动」换了订阅 → 停旧实例按新订阅重启，不是幂等早退
+    （否则界面怎么换选订阅，检测永远测的是自启拉起的那条）。"""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "mixed-port: 17890\nproxies:\n  - name: A\n    type: ss\n"
+        "    server: s.example.net\n    port: 8388\n    cipher: aes-128-gcm\n    password: p\n",
+        encoding="utf-8",
+    )
+
+    class _FakeProc:
+        pid = 111
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(clash_manager.subprocess, "Popen", lambda *a, **kw: _FakeProc())
+    monkeypatch.setattr(clash_manager.ClashRuntime, "_kill_orphans", lambda self, exe, cfgp: 0)
+    monkeypatch.setattr(clash_manager, "ensure_kernel_files", lambda d: None)
+
+    r = clash_manager.ClashRuntime()
+    r.start("exe", str(cfg), subscription_url="https://a.example/sub")
+    assert r.subscription_url == "https://a.example/sub"
+    first = r.process
+
+    r.start("exe", str(cfg), subscription_url="https://b.example/sub")
+    assert r.subscription_url == "https://b.example/sub", "不同订阅必须切换"
+    assert r.process is not first, "切换 = 停旧起新"
+
+    same = r.process
+    r.start("exe", str(cfg), subscription_url="https://b.example/sub")
+    assert r.process is same, "同订阅幂等：沿用运行中的实例"
+    r.stop()
+    assert r.subscription_url is None
 
 
 
@@ -589,7 +635,7 @@ async def test_add_subscription_auto_names_when_label_empty(db, monkeypatch):
     """保存订阅（clash，未填名）：验证下载成功 → 自动名落库；
     手动填名时机场名不抢命名权。下载桩带 Content-Disposition。"""
 
-    async def fake_download(sub_url, data_dir, proxy_url=None):
+    async def fake_download(sub_url, data_dir, proxy_url=None, *, target_path=None):
         return {
             "path": "/tmp/x.yaml", "title": "机场名.yaml",
             "userinfo": USERINFO, "nodes": 3, "cached": False,
@@ -623,7 +669,7 @@ async def test_add_subscription_no_title_keeps_null(db, monkeypatch):
     """三级取名全空（如 token 末段也取不到）：label 保持 null——
     不落假名，前端回落显示 URL。"""
 
-    async def fake_download(sub_url, data_dir, proxy_url=None):
+    async def fake_download(sub_url, data_dir, proxy_url=None, *, target_path=None):
         return {"path": "/tmp/x.yaml", "title": None, "userinfo": None,
                 "nodes": 3, "cached": False}
 
@@ -637,3 +683,378 @@ async def test_add_subscription_no_title_keeps_null(db, monkeypatch):
 
     out = await proxies_service.add_subscription("clash", SUB_URL, None)
     assert out["label"] is None
+
+
+# ─── 热重载切换（内核进程不动）──────────────────────────────
+
+_MINI_CONFIG = (
+    "mixed-port: 17890\nproxies:\n  - name: A节点\n    type: ss\n"
+    "    server: s.example.net\n    port: 8388\n    cipher: aes-128-gcm\n    password: p\n"
+)
+_MINI_CONFIG_B = _MINI_CONFIG.replace("A节点", "B节点").replace("17890", "17891")
+
+
+class _FakeResp:
+    def __init__(self, status_code, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 300:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class _FakeControllerClient:
+    """假控制器：PUT /configs 收款、/version 200、/proxies 只认给定节点集。"""
+
+    known: set[str] = set()
+    puts: list[str] = []
+
+    def __init__(self, **kw):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def put(self, url, **kw):
+        type(self).puts.append(url)
+        return _FakeResp(204)
+
+    async def get(self, url, **kw):
+        if url.endswith("/version"):
+            return _FakeResp(200, {"version": "fake"})
+        return _FakeResp(200, {"proxies": {name: {} for name in type(self).known}})
+
+
+def _patch_kernel_launch(monkeypatch):
+    class _FakeProc:
+        pid = 111
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(clash_manager.subprocess, "Popen", lambda *a, **kw: _FakeProc())
+    monkeypatch.setattr(clash_manager.ClashRuntime, "_kill_orphans", lambda self, exe, cfgp: 0)
+    monkeypatch.setattr(clash_manager, "ensure_kernel_files", lambda d: None)
+
+
+@pytest.mark.asyncio
+async def test_ensure_running_switches_via_hot_reload(monkeypatch, tmp_path):
+    """在跑时换订阅：控制器 PUT /configs 热重载生效——进程对象不变、归属翻转、
+    配置文件带注入段。与 Clash Verge Rev 的换配置路径同形态。"""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(_MINI_CONFIG, encoding="utf-8")
+    _patch_kernel_launch(monkeypatch)
+
+    r = clash_manager.ClashRuntime()
+    r.start("exe", str(cfg), subscription_url="https://a.example/sub")
+    first_proc = r.process
+
+    cfg.write_text(_MINI_CONFIG_B, encoding="utf-8")
+    _FakeControllerClient.known = {"B节点", "GLOBAL", "DIRECT", "REJECT", "COMPATIBLE", "Pass"}
+    _FakeControllerClient.puts = []
+    monkeypatch.setattr(clash_manager.httpx, "AsyncClient", _FakeControllerClient)
+    # lane 端口存活是真 socket 探测，单测无真内核——桩掉，真内核场景由隔离实例验证覆盖
+    monkeypatch.setattr(clash_manager, "_port_listening", lambda port: True)
+
+    outcome = await r.ensure_running("exe", str(cfg), subscription_url="https://b.example/sub")
+    assert outcome["reloaded"] is True and outcome["started"] is False
+    assert r.process is first_proc, "热重载不换进程"
+    assert r.subscription_url == "https://b.example/sub"
+    assert r.port == 17891, "混合端口跟随新配置"
+    assert any("/configs" in u for u in _FakeControllerClient.puts)
+    text = Path(cfg).read_text(encoding="utf-8")
+    assert "HlProbeLane" in text and "external-controller" in text
+    r.stop()
+
+
+@pytest.mark.asyncio
+async def test_ensure_running_falls_back_to_restart_when_reload_fails(monkeypatch, tmp_path):
+    """控制器拒绝热重载 → 回退停旧起新（进程换新、归属正确），不把用户留在旧配置。"""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(_MINI_CONFIG, encoding="utf-8")
+    _patch_kernel_launch(monkeypatch)
+
+    class _RefusingClient:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def put(self, url, **kw):
+            raise httpx.ConnectError("controller down")
+
+    r = clash_manager.ClashRuntime()
+    r.start("exe", str(cfg), subscription_url="https://a.example/sub")
+    first_proc = r.process
+    cfg.write_text(_MINI_CONFIG_B, encoding="utf-8")
+    monkeypatch.setattr(clash_manager.httpx, "AsyncClient", _RefusingClient)
+
+    outcome = await r.ensure_running("exe", str(cfg), subscription_url="https://b.example/sub")
+    assert outcome["started"] is True and outcome["reloaded"] is False
+    assert r.process is not first_proc, "回退路径 = 停旧起新"
+    assert r.subscription_url == "https://b.example/sub"
+    r.stop()
+
+
+@pytest.mark.asyncio
+async def test_ensure_running_same_subscription_unchanged_is_idle(monkeypatch, tmp_path):
+    """同订阅且内容没变：不发起热重载（零控制器调用），幂等返回。"""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(_MINI_CONFIG, encoding="utf-8")
+    _patch_kernel_launch(monkeypatch)
+
+    r = clash_manager.ClashRuntime()
+    r.start("exe", str(cfg), subscription_url="https://a.example/sub")
+    _FakeControllerClient.puts = []
+    monkeypatch.setattr(clash_manager.httpx, "AsyncClient", _FakeControllerClient)
+
+    outcome = await r.ensure_running("exe", str(cfg), subscription_url="https://a.example/sub")
+    assert outcome["reloaded"] is False and outcome["started"] is False
+    assert _FakeControllerClient.puts == [], "内容没变不打控制器"
+    r.stop()
+
+
+# ─── 下载通道顺序（代理优先，直连垫底）──────────────────────
+
+
+def test_download_attempts_proxy_channels_before_direct(monkeypatch):
+    """内核在跑、有已存代理、本地口可达 → 直连排最后（订阅域名直连多数
+    被墙，直连打头会让每次刷新都先白等一次超时）。"""
+    monkeypatch.setattr(clash_manager, "LOCAL_MIXED_PORTS", (7897,))
+    monkeypatch.setattr(clash_manager, "_port_reachable", lambda port: port == 7897)
+    attempts = clash_manager._download_attempts(
+        runtime_port=17890, proxy_url=["http://1.2.3.4:8080"]
+    )
+    labels = [label for _proxy, label in attempts]
+    assert labels == ["经内核代理", "经已保存代理", "本地混合端口 7897", "直连"]
+
+
+def test_download_attempts_direct_only_without_kernel(monkeypatch):
+    """首次添加订阅（内核没跑、无已存代理）→ 直连是唯一通道。"""
+    monkeypatch.setattr(clash_manager, "LOCAL_MIXED_PORTS", ())
+    attempts = clash_manager._download_attempts(runtime_port=None, proxy_url=None)
+    assert attempts == [(None, "直连")]
+
+
+# ─── 热重载被拒：保留运行内核，不重启陪葬 ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_ensure_running_reload_rejected_keeps_running_kernel(monkeypatch, tmp_path):
+    """内核明确拒载（HTTP 4xx）：磁盘回滚到运行配置、内核进程不动、
+    报用户语言错误——回退重启只会载着同一份坏配置起不来。"""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(_MINI_CONFIG, encoding="utf-8")
+    _patch_kernel_launch(monkeypatch)
+
+    class _RefusingKernel:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def put(self, url, **kw):
+            return _FakeResp(400)
+
+    r = clash_manager.ClashRuntime()
+    r.start("exe", str(cfg), subscription_url="https://a.example/sub")
+    first_proc = r.process
+
+    # 重拉已把新下载写入缓存文件（真实流程），内核随后拒载：
+    cfg.write_text(_MINI_CONFIG_B, encoding="utf-8")
+    monkeypatch.setattr(clash_manager.httpx, "AsyncClient", _RefusingKernel)
+
+    with pytest.raises(ValueError, match="内核拒绝新配置"):
+        await r.ensure_running("exe", str(cfg), subscription_url="https://b.example/sub")
+
+    assert r.process is first_proc, "拒载不重启：内核继续跑旧配置"
+    assert r.subscription_url == "https://a.example/sub", "归属不翻转"
+    # 回滚 = 文件恢复到本进程写入前的内容（B 的原始下载，无注入段）
+    assert cfg.read_text(encoding="utf-8") == _MINI_CONFIG_B
+
+
+@pytest.mark.asyncio
+async def test_ensure_running_rejects_malformed_config_before_kernel(monkeypatch, tmp_path):
+    """新配置连 YAML 都不是：预检直接拒绝，不写盘、不碰内核、不重启。"""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(_MINI_CONFIG, encoding="utf-8")
+    _patch_kernel_launch(monkeypatch)
+
+    r = clash_manager.ClashRuntime()
+    r.start("exe", str(cfg), subscription_url="https://a.example/sub")
+    first_proc = r.process
+
+    broken = "proxies:\n  - {name:Broken, type: ss\n"
+    cfg.write_text(broken, encoding="utf-8")
+
+    class _NeverClient:
+        def __init__(self, **kw):
+            raise AssertionError("坏配置不该走到控制器")
+
+    monkeypatch.setattr(clash_manager.httpx, "AsyncClient", _NeverClient)
+
+    with pytest.raises(ValueError, match="合法 YAML"):
+        await r.ensure_running("exe", str(cfg), subscription_url="https://b.example/sub")
+
+    assert r.process is first_proc
+    assert r.subscription_url == "https://a.example/sub"
+    assert cfg.read_text(encoding="utf-8") == broken, "预检在写盘前拒绝：文件保持原样"
+
+
+# ─── 启动候选遍历（订阅失效不连累内核启动）──────────────────
+
+
+async def _add_labeled_sub(db, *, label: str, url: str = SUB_URL,
+                           deprecated: bool = False) -> int:
+    async with db() as session:
+        sub = ProxySubscription(
+            kind="clash", url=url, label=label, deprecated=deprecated,
+        )
+        session.add(sub)
+        await session.commit()
+        return sub.id
+
+
+@pytest.mark.asyncio
+async def test_resolve_startable_falls_back_to_other_subscription(db, monkeypatch, tmp_path):
+    """请求的订阅取不到配置（下载失败且无缓存）→ 降级到其余可用订阅拉起；
+    被淘汰候选记入 attempts 供前端提示。"""
+    dead = await _add_labeled_sub(db, label="快冲云", url="https://example.com/dead")
+    live = await _add_labeled_sub(db, label="SakuraCat")
+
+    async def fake_download(sub_url, data_dir, proxy_url=None, *, target_path=None):
+        if "dead" in sub_url:
+            raise RuntimeError("Client error '404 Not Found'")
+        return {"path": str(target_path), "title": None, "userinfo": None,
+                "nodes": 3, "cached": False}
+
+    async def no_saved_proxies():
+        return []
+
+    monkeypatch.setattr(
+        proxies_service.clash_manager.runtime, "download_subscription", fake_download
+    )
+    monkeypatch.setattr(proxies_service, "_saved_proxy_candidates", no_saved_proxies)
+
+    picked = await proxies_service.resolve_startable_clash(tmp_path, requested_id=dead)
+    assert picked["subscription"]["id"] == live
+    assert picked["configPath"].endswith(f"clash-sub-{live}.yaml")
+    assert [a["id"] for a in picked["attempts"]] == [dead]
+    assert "404" in picked["attempts"][0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_startable_all_fail_raises_aggregated(db, monkeypatch, tmp_path):
+    """所有候选都取不到配置 → ValueError 聚合各候选失败原因（面向用户）。"""
+    id_a = await _add_labeled_sub(db, label="甲机场")
+    id_b = await _add_labeled_sub(db, label="乙机场")
+
+    async def fake_download(sub_url, data_dir, proxy_url=None, *, target_path=None):
+        raise RuntimeError("Client error '404 Not Found'")
+
+    async def no_saved_proxies():
+        return []
+
+    monkeypatch.setattr(
+        proxies_service.clash_manager.runtime, "download_subscription", fake_download
+    )
+    monkeypatch.setattr(proxies_service, "_saved_proxy_candidates", no_saved_proxies)
+
+    with pytest.raises(ValueError) as ei:
+        await proxies_service.resolve_startable_clash(tmp_path)
+    msg = str(ei.value)
+    assert "所有可用订阅都取不到配置" in msg
+    assert "甲机场" in msg and "乙机场" in msg
+    assert {id_a, id_b}  # 两条都进了候选（顺序断言在下方用例）
+
+
+@pytest.mark.asyncio
+async def test_resolve_startable_skips_deprecated_and_orders_newest_first(
+    db, monkeypatch, tmp_path,
+):
+    """无指定订阅：候选按新→旧排序、废弃行剔除；只有排头可成功时选中排头。"""
+    await _add_labeled_sub(db, label="老订阅")
+    await _add_labeled_sub(db, label="新死的", deprecated=True)
+    newest = await _add_labeled_sub(db, label="新可用")
+    called: list[int] = []
+
+    async def fake_download(sub_url, data_dir, proxy_url=None, *, target_path=None):
+        # 记录调用顺序：无法从 url 反推 id，借 target_path 文件名取候选 id
+        sub_id = int(Path(target_path).stem.split("-")[-1])
+        called.append(sub_id)
+        if called[-1] != newest:
+            raise RuntimeError("Client error '404 Not Found'")
+        return {"path": str(target_path), "title": None, "userinfo": None,
+                "nodes": 3, "cached": False}
+
+    async def no_saved_proxies():
+        return []
+
+    monkeypatch.setattr(
+        proxies_service.clash_manager.runtime, "download_subscription", fake_download
+    )
+    monkeypatch.setattr(proxies_service, "_saved_proxy_candidates", no_saved_proxies)
+
+    picked = await proxies_service.resolve_startable_clash(tmp_path)
+    assert picked["subscription"]["id"] == newest
+    assert called[0] == newest, "无指定时先试最新的可用订阅"
+
+
+@pytest.mark.asyncio
+async def test_download_subscription_cache_fallback_when_all_channels_fail(
+    monkeypatch, tmp_path,
+):
+    """全部下载通道失败且该订阅有本地缓存 → 用缓存启动语义成立（cached=True）；
+    无缓存才抛最后一错。这是「订阅失效不让内核起不来」的兜底一环。"""
+    r = clash_manager.ClashRuntime()
+
+    class _DownClient:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, **kw):
+            raise httpx.ConnectError("all channels down")
+
+    monkeypatch.setattr(clash_manager.httpx, "AsyncClient", _DownClient)
+
+    cache = clash_manager.kernel_dir(tmp_path) / "config.yaml"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(_MINI_CONFIG, encoding="utf-8")
+
+    meta = await r.download_subscription("https://dead.example/sub", tmp_path)
+    assert meta["cached"] is True
+    assert meta["nodes"] == 1
+
+    empty_dir = tmp_path / "fresh"
+    with pytest.raises(httpx.ConnectError):
+        await r.download_subscription("https://dead.example/sub", empty_dir)

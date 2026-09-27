@@ -66,8 +66,8 @@ async def _seed_sub(db, *, url: str = SUB_URL, deprecated: bool = False) -> int:
         return sub.id
 
 
-def _stub_runtime(monkeypatch, tmp_path, *, startup_text: str | None) -> Path:
-    """内核状态桩：磁盘配置 + 启动文本（running_subscription_is 的事实源）。"""
+def _stub_runtime(monkeypatch, tmp_path, *, subscription_url: str | None) -> Path:
+    """内核状态桩：磁盘配置 + 启动登记的订阅 URL（running_subscription_is 的事实源）。"""
     cfg = tmp_path / "config.yaml"
     cfg.write_text(_config_text(), encoding="utf-8")
     monkeypatch.setattr(
@@ -76,16 +76,17 @@ def _stub_runtime(monkeypatch, tmp_path, *, startup_text: str | None) -> Path:
         lambda: {
             "running": True, "port": 7890, "configPath": str(cfg),
             "controllerUrl": "http://127.0.0.1:19090",
+            "subscriptionUrl": subscription_url,
         },
     )
-    monkeypatch.setattr(clash_manager.runtime, "_startup_text", startup_text)
+    monkeypatch.setattr(clash_manager.runtime, "subscription_url", subscription_url)
     # 内核重启分支要真起进程，测试里不碰——统一按「内核目录不可用」跳过
     monkeypatch.setattr(clash_manager, "detect_kernel", lambda d: {"found": False})
     return cfg
 
 
 def _stub_download(monkeypatch, cfg: Path, calls: list) -> None:
-    async def _fake_download(url, data_dir, proxy_url=None):
+    async def _fake_download(url, data_dir, proxy_url=None, *, target_path=None):
         calls.append(url)
         cfg.write_text(_config_text(), encoding="utf-8")
         return {
@@ -104,11 +105,11 @@ async def _refresh_state() -> str:
 # ─── 重启判定去噪（配置等价比较）────────────────────────────
 
 
-def test_config_unchanged_ignores_controller_injection():
-    """磁盘是「原始下载文本」、启动文本是「原始 + 注入 controller」——
+def test_config_unchanged_ignores_probe_lane_injection():
+    """磁盘是「原始下载文本」、启动文本是「原始 + 注入探测 lane」——
     等价判定必须看穿注入，否则每次重拉都白重启一次内核。"""
     raw = _config_text()
-    injected, _url, _secret = clash_manager.ensure_controller(raw)
+    injected = clash_manager.inject_probe_lanes(raw)
     assert injected != raw  # 注入确实发生（前置条件）
 
     assert clash_manager.config_unchanged(injected, raw) is True
@@ -125,7 +126,7 @@ async def test_refresh_throttled_inside_interval(db, monkeypatch, tmp_path):
     """门槛内（刚拉过）不重拉：连下载都不发起。"""
     await _seed_sub(db)
     calls: list = []
-    cfg = _stub_runtime(monkeypatch, tmp_path, startup_text=_config_text())
+    cfg = _stub_runtime(monkeypatch, tmp_path, subscription_url=SUB_URL)
     _stub_download(monkeypatch, cfg, calls)
 
     await settings_service.set_value(
@@ -141,7 +142,7 @@ async def test_refresh_runs_after_interval(db, monkeypatch, tmp_path):
     """门槛过期（>6h）→ 真重拉：配置下载、流水留痕、门槛消费。"""
     sub_id = await _seed_sub(db)
     calls: list = []
-    cfg = _stub_runtime(monkeypatch, tmp_path, startup_text=_config_text())
+    cfg = _stub_runtime(monkeypatch, tmp_path, subscription_url=SUB_URL)
     _stub_download(monkeypatch, cfg, calls)
 
     stale = get_beijing_time_obj().replace(tzinfo=None) - timedelta(hours=7)
@@ -188,10 +189,10 @@ async def test_refresh_skips_when_kernel_not_running(db, monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_refresh_skips_unknown_subscription(db, monkeypatch, tmp_path):
-    """认不出内核在跑哪条（启动文本里查不到任何订阅 URL）→ 不猜、不动。"""
+    """认不出内核在跑哪条（启动时未登记订阅 URL）→ 不猜、不动。"""
     await _seed_sub(db)
     calls: list = []
-    cfg = _stub_runtime(monkeypatch, tmp_path, startup_text="proxies:\n  - name: A\n")
+    cfg = _stub_runtime(monkeypatch, tmp_path, subscription_url=None)
     _stub_download(monkeypatch, cfg, calls)
 
     assert await _refresh_state() == "unknown_subscription"
@@ -203,7 +204,7 @@ async def test_refresh_skips_when_all_deprecated(db, monkeypatch, tmp_path):
     """订阅全被废弃（后端已不选用）：不拉，也不消费门槛。"""
     await _seed_sub(db, deprecated=True)
     calls: list = []
-    cfg = _stub_runtime(monkeypatch, tmp_path, startup_text=_config_text())
+    cfg = _stub_runtime(monkeypatch, tmp_path, subscription_url=SUB_URL)
     _stub_download(monkeypatch, cfg, calls)
 
     assert await _refresh_state() == "no_subscription"
@@ -217,7 +218,7 @@ async def test_refresh_picks_subscription_actually_running(db, monkeypatch, tmp_
     idle_id = await _seed_sub(db, url="https://example.com/other")
 
     calls: list = []
-    cfg = _stub_runtime(monkeypatch, tmp_path, startup_text=_config_text())
+    cfg = _stub_runtime(monkeypatch, tmp_path, subscription_url=SUB_URL)
     _stub_download(monkeypatch, cfg, calls)
 
     assert await _refresh_state() == "refreshed"
@@ -237,9 +238,9 @@ async def test_refresh_picks_subscription_actually_running(db, monkeypatch, tmp_
 async def test_refresh_auto_names_when_label_empty(db, monkeypatch, tmp_path):
     """本行无名：拉到面板名（profile-title 等）→ 落库本地保存并回传。"""
     sub_id = await _seed_sub(db)
-    cfg = _stub_runtime(monkeypatch, tmp_path, startup_text=_config_text())
+    cfg = _stub_runtime(monkeypatch, tmp_path, subscription_url=SUB_URL)
 
-    async def _fake_download(url, data_dir, proxy_url=None):
+    async def _fake_download(url, data_dir, proxy_url=None, *, target_path=None):
         cfg.write_text(_config_text(), encoding="utf-8")
         return {
             "path": str(cfg), "title": "面板机场名", "userinfo": USERINFO,
@@ -259,9 +260,9 @@ async def test_refresh_auto_names_when_label_empty(db, monkeypatch, tmp_path):
 async def test_refresh_keeps_user_label(db, monkeypatch, tmp_path):
     """本行已有名称（用户手改过）：重拉永不覆写——名字是用户的资产。"""
     sub_id = await _seed_sub(db)
-    cfg = _stub_runtime(monkeypatch, tmp_path, startup_text=_config_text())
+    cfg = _stub_runtime(monkeypatch, tmp_path, subscription_url=SUB_URL)
 
-    async def _fake_download(url, data_dir, proxy_url=None):
+    async def _fake_download(url, data_dir, proxy_url=None, *, target_path=None):
         cfg.write_text(_config_text(), encoding="utf-8")
         return {
             "path": str(cfg), "title": "面板机场名", "userinfo": USERINFO,
@@ -292,9 +293,9 @@ async def test_refresh_uses_saved_proxies_after_direct(db, monkeypatch, tmp_path
         await session.commit()
 
     seen_proxy_args: list = []
-    cfg = _stub_runtime(monkeypatch, tmp_path, startup_text=_config_text())
+    cfg = _stub_runtime(monkeypatch, tmp_path, subscription_url=SUB_URL)
 
-    async def _fake_download(url, data_dir, proxy_url=None):
+    async def _fake_download(url, data_dir, proxy_url=None, *, target_path=None):
         seen_proxy_args.append(proxy_url)
         cfg.write_text(_config_text(), encoding="utf-8")
         return {
@@ -319,10 +320,10 @@ async def test_refresh_uses_saved_proxies_after_direct(db, monkeypatch, tmp_path
 async def test_refresh_failure_retries_next_tick(db, monkeypatch, tmp_path):
     """拉取失败：门槛不消费（下一拍继续试），错误不冒泡到调度。"""
     await _seed_sub(db)
-    cfg = _stub_runtime(monkeypatch, tmp_path, startup_text=_config_text())
+    cfg = _stub_runtime(monkeypatch, tmp_path, subscription_url=SUB_URL)
     attempts: list = []
 
-    async def _failing(url, data_dir, proxy_url=None):
+    async def _failing(url, data_dir, proxy_url=None, *, target_path=None):
         attempts.append(url)
         raise ValueError("订阅下载失败: 全部通道不可用")
 
@@ -451,7 +452,7 @@ async def test_refresh_bad_gate_value_treated_as_expired(db, monkeypatch, tmp_pa
     """门槛值不是合法时间（手改/旧格式）：当作过期照拉，不炸。"""
     await _seed_sub(db)
     calls: list = []
-    cfg = _stub_runtime(monkeypatch, tmp_path, startup_text=_config_text())
+    cfg = _stub_runtime(monkeypatch, tmp_path, subscription_url=SUB_URL)
     _stub_download(monkeypatch, cfg, calls)
 
     await settings_service.set_value(GATE_KEY, "not-a-timestamp")
