@@ -22,8 +22,8 @@ import type { IconName } from '@/components/ui/icons'
 
    靶点选择器契约：
    - 框架层：data-tour 属性（nav-search = 找游戏页搜索框，网格/列表两种布局
-     都常驻；card-price = 游戏卡价格区；lib-empty = 找游戏空态卡；侧边栏项由
-     HlSideNav 按 to 派生）
+     都常驻；game-card = 游戏卡根元素，首张即靶点；lib-empty = 找游戏空态卡；
+     侧边栏项由 HlSideNav 按 to 派生）
    - 页面层：data-section 属性（分节卡片既有，零侵入复用）
      该属性的值是**词条 key**（如 `pool.section.items`）而不是译文：
      锚点与语言无关，切语言时下面的选择器不会断。跨页步骤的 key 与视图侧
@@ -94,9 +94,10 @@ const TOUR: TourStep[] = [
   },
   {
     route: '/library',
-    // 价格区 / 网格 / 空态卡按序取第一个命中：有数据聚光首卡价格区；
-    // 空库时价格区不存在，落到空态卡（「添加游戏」入口就在那张卡上）
-    target: ['[data-tour="card-price"]', '.card-grid', '[data-tour="lib-empty"]'],
+    // 整卡 / 网格 / 空态卡按序取第一个命中：有数据聚光首张完整卡（封面+价格，
+    // 只聚价格区会把卡片上半截留暗处，看起来像聚错了）；空库时落到空态卡
+    // （「添加游戏」入口就在那张卡上）
+    target: ['[data-tour="game-card"]', '.card-grid', '[data-tour="lib-empty"]'],
     titleKey: 'productTour.stepPrice.title',
     paras: [
       { textKey: 'productTour.stepPrice.p1' },
@@ -140,6 +141,19 @@ const step = ref(0)
 const current = computed(() => TOUR[step.value])
 const isIntro = computed(() => !current.value.target)
 const isLast = computed(() => step.value === TOUR.length - 1)
+
+/** 预取各步路由的懒加载组件：开场卡的几秒停留正好覆盖块下载——
+    不预取时首次跨页要等整块拉完才挂载新视图，第一步的聚光会干等。 */
+function prefetchStepRoutes() {
+  for (const s of TOUR) {
+    if (!s.route) continue
+    for (const m of router.resolve(s.route).matched) {
+      for (const comp of Object.values(m.components ?? {})) {
+        if (typeof comp === 'function') void (comp as () => Promise<unknown>)()
+      }
+    }
+  }
+}
 
 /* ── 段落类型判定（{ textKey } 普通段 / { emphKey } 强调段）──
    取文案一律在渲染期 t()：表里存的是 key，故切语言即重渲染。 */
@@ -204,7 +218,9 @@ const popStyle = computed(() => {
   const vw = viewport.value.w
   const vh = viewport.value.h
   const w = Math.min(POP_W, vw - MARGIN * 2)
-  if (isIntro.value || missed.value || popPlacement.value === 'center') {
+  // waiting（靶点未挂载）同样居中：干等时气泡吊在左上角读起来像坏掉了，
+  // 居中 + 角标转圈明确表达「定位中」，靶点出现后再落位。
+  if (isIntro.value || missed.value || waiting.value || popPlacement.value === 'center') {
     const cw = Math.min(480, vw - MARGIN * 2)
     return { top: '50%', left: '50%', transform: 'translate(-50%, -50%)', width: `${cw}px`, maxWidth: `${cw}px` }
   }
@@ -528,6 +544,7 @@ watch(model, async (v, was) => {
   if (v && !was) {
     step.value = 0
     capturedStart.value = route.fullPath
+    prefetchStepRoutes()
     // 打开即写标志：导览入口长期在（关于页 hero logo / 设置页「重看教程」），
     // 「看过一次就不再自动弹」比「必须点完才算完成」更贴合实际使用。
     void useSettingsStore().markOnboardingDone()
@@ -683,6 +700,15 @@ onUnmounted(() => {
     </div>
   </Teleport>
 </template>
+
+<style>
+/* 导览靶点的滚动留位：聚焦上滚腾位（scrollIntoView block:start）的落点
+   会被 sticky 顶栏（应用条 + 页工具栏约 130px）盖住，scroll-margin 让
+   靶点停在顶栏下缘，不把靶点顶部藏进顶栏背后。 */
+[data-tour] {
+  scroll-margin-top: 140px;
+}
+</style>
 
 <style scoped>
 .pt-tour {
