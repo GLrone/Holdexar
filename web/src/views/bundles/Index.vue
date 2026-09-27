@@ -427,6 +427,51 @@ function maxDiscount(b: BundleSummary): number {
   return Math.max(0, ...Object.values(b.regionPrices).map((r) => r.discountPercent || 0))
 }
 
+/** 任一外区与国区间可互送（canGift：双方有价且未锁区即可，新政策不限倍率） */
+function isBundleGiftable(b: BundleSummary): boolean {
+  const cn = b.cnCnyFen
+  if (cn == null || cn <= 0) return false
+  return Object.entries(b.regionPrices).some(([rpCode, rp]) => {
+    if (rpCode === 'CN') return false
+    return canGift(cn, rp.cnyFen) || canGift(rp.cnyFen, cn)
+  })
+}
+
+/** Unix 秒 → YYYY-MM-DD（ISO 文本中英同形，与游戏卡 formatDateTs 同口径） */
+function fmtTsDate(ts: number): string {
+  const d = new Date(ts * 1000)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
+
+/** 区行促销截止（仅未过期；过期 = 抓取间隙促销已结束，不展示） */
+function promoEndTs(rp: BundleSummary['regionPrices'][string] | undefined): number | null {
+  const ts = rp?.discountEndsAt
+  return ts && ts * 1000 > Date.now() ? ts : null
+}
+
+/** 折扣角标 tooltip：角标 = 全区最大折扣，取命中区里最早的截止（保守值） */
+function discountEndsTip(b: BundleSummary): string {
+  const max = maxDiscount(b)
+  if (max <= 0) return ''
+  const ends = Object.values(b.regionPrices)
+    .filter((rp) => (rp.discountPercent || 0) === max)
+    .map((rp) => promoEndTs(rp))
+    .filter((v): v is number => v != null)
+  return ends.length ? t('bundles.promo.endsAt', { date: fmtTsDate(Math.min(...ends)) }) : ''
+}
+
+/** 抽屉促销截止（全区最早截止的展示级汇总；逐区精确值由折扣角标 tooltip 承载，
+    区域行内不放——内联日期会把地区名挤成省略号） */
+const drawerPromoEnd = computed(() => {
+  const b = drawerBundle.value
+  if (!b) return ''
+  const ends = Object.values(b.regionPrices)
+    .map((rp) => promoEndTs(rp))
+    .filter((v): v is number => v != null)
+  return ends.length ? fmtTsDate(Math.min(...ends)) : ''
+})
+
 /** 比国区便宜的前三区（升序）；国区自己最低时走"国区最低"行 */
 const cheaperTop3 = (b: BundleSummary) => {
   const cn = b.cnCnyFen
@@ -1074,11 +1119,42 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
               @error="onCoverError($event, b)"
               @load="onCoverLoad(b)"
             />
-            <span v-if="maxDiscount(b) > 0" class="blr-discount">-{{ maxDiscount(b) }}%</span>
+            <span v-if="maxDiscount(b) > 0" class="blr-discount" :title="discountEndsTip(b)">-{{ maxDiscount(b) }}%</span>
           </div>
 
           <div class="blr-main">
-            <div class="blr-name" :title="b.name">{{ b.name }}</div>
+            <div class="blr-name-row">
+              <div class="blr-name" :title="b.name">{{ b.name }}</div>
+              <!-- 星标关注 / 移除（恢复视图换成恢复键），与网格卡同一组动作 -->
+              <div class="bundle-actions">
+                <button
+                  v-if="!removedView"
+                  class="star-btn"
+                  :class="{ active: followedIds.has(b.bundleId) }"
+                  :title="t('bundles.follow.tip')"
+                  @click.stop="onToggleFollow(b)"
+                >
+                  <span class="star-empty">☆</span>
+                  <span class="star-filled">★</span>
+                </button>
+                <button
+                  v-if="!removedView"
+                  class="star-btn store-action-btn"
+                  :title="t('bundles.action.remove')"
+                  @click.stop="onRemoveCard(b)"
+                >
+                  <HlIcon name="delete" :size="14" />
+                </button>
+                <button
+                  v-else
+                  class="star-btn store-action-btn is-restore"
+                  :title="t('bundles.action.restore')"
+                  @click.stop="onRestoreCard(b)"
+                >
+                  <HlIcon name="refresh" :size="14" />
+                </button>
+              </div>
+            </div>
             <div class="blr-tags">
               <span
                 v-if="ownershipByBid[b.bundleId]?.type"
@@ -1181,7 +1257,7 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
             @load="onCoverLoad(b)"
           />
           <div v-if="maxDiscount(b) > 0" class="discount-badges-container">
-            <span class="discount-badge">-{{ maxDiscount(b) }}%</span>
+            <span class="discount-badge" :title="discountEndsTip(b)">-{{ maxDiscount(b) }}%</span>
           </div>
           <!-- BundleID 徽标 = SteamDB 外链：链接形态走 itemKind（sub / bundle），
                与购买语义（mustPurchaseAsSet）解耦——bundle 形态但必须整包的包真实存在。
@@ -1350,6 +1426,10 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
           {{ t('bundles.drawer.lockHint') }}
         </div>
 
+        <div v-if="drawerPromoEnd" class="bd-promo-note">
+          {{ t('bundles.promo.endsAt', { date: drawerPromoEnd }) }}
+        </div>
+
         <HlSkeleton v-if="detailLoading" variant="text" :count="1" :rows="5" />
         <div v-else-if="detailError" class="bundles-error">
           {{ t('bundles.drawer.detailError', { err: detailError }) }}
@@ -1361,6 +1441,7 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
             :key="code"
             class="bd-price-item"
             :class="{
+              'cn-region': code.toLowerCase() === 'cn',
               'lowest-region': code.toLowerCase() === drawerBundle!.lowestRegion,
               'partial-lock': (drawerBundle!.regionPrices[code]?.lockedCount ?? 0) > 0,
             }"

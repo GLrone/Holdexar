@@ -89,6 +89,9 @@ const bundles = {
   'bundles.drawer.lockedBadge': '{n}锁',
   'bundles.drawer.locked': '锁区',
 
+  /* 促销截止（折扣角标 tooltip + 抽屉区域行共用） */
+  'bundles.promo.endsAt': '折扣 {date} 结束',
+
   /* 赠礼地区分析 */
   'bundles.gift.head': '🎁 以「{region}」为赠礼目标',
   'bundles.gift.collapse': '收起',
