@@ -39,9 +39,14 @@ const bundles = {
   'bundles.head.total': '共 {n} 个捆绑包',
   'bundles.head.completable': '· 可补齐 {n} 个',
   'bundles.empty.noData': '暂无捆绑包数据',
+  'bundles.empty.noDataHint': '捆绑包数据尚未就绪，稍后再来看',
   'bundles.empty.noMatch': '没有匹配的捆绑包',
+  'bundles.empty.filterHint': '试试调整搜索词，或清除筛选条件。',
+  'bundles.empty.filterClear': '清除搜索与筛选',
+  'bundles.error.title': '列表加载失败',
   'bundles.nav.search': '搜索捆绑包… (Enter)',
-  'bundles.list.loadMore': '加载更多（剩余 {n} 个）',
+  'bundles.list.loadingMore': '加载更多...',
+  'bundles.list.end': '已经到底了',
 
   /* 地区维度（选区后差价重新锚定到该区） */
   'bundles.regionMode.all': '全部',
@@ -57,7 +62,9 @@ const bundles = {
   'bundles.filter.hideFamily': '隐藏家庭可享',
   'bundles.filter.section.price': '价格（国区）',
   'bundles.filter.price': '国区价',
-  'bundles.filter.diffMinLabel': '差价下限',
+  'bundles.filter.onlyDiscounted': '仅显示有折扣',
+  'bundles.filter.giftOnly': '仅显示可跨区送礼',
+  'bundles.filter.diffType': '差价单位',
   'bundles.filter.min': '最小',
   'bundles.filter.max': '最大',
   'bundles.filter.cny': '元',
@@ -67,6 +74,7 @@ const bundles = {
   'bundles.badge.me': '我',
   'bundles.badge.owned': '已拥有',
   'bundles.badge.family': '家庭组',
+  'bundles.badge.wishlist': '愿望单',
 
   /* 卡片价格区 */
   'bundles.tag.baseDiscount': '基础折扣 {pct}%',
@@ -126,10 +134,6 @@ const bundles = {
 
   /* 锁区蒙层 */
   'bundles.mask.regionLocked': '🔒锁区',
-} as const
-
-export default bundles
-  'bundles.badge.wishlist': '愿望单',
 
   /* ── 卡片动作：星标关注 / 移除（假删除，可撤销可恢复）──
      用户词汇只用「关注 / 移除 / 恢复」；监控来源、排除标等实现细节不进文案 */
@@ -145,3 +149,6 @@ export default bundles
   'bundles.removed.fail': '移除失败，请重试',
   'bundles.restored.fail': '恢复失败，请重试',
   'bundles.restored.protected': '此包已被手动排除，未恢复',
+} as const
+
+export default bundles

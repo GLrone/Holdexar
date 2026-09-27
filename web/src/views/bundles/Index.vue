@@ -17,7 +17,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import { bundlesApi, ownershipApi, type BundleDetail, type BundleGame, type BundleSummary, type OwnershipInfo } from '@/api/client'
 import { regionSelectOptions } from '@/api/selectOptions'
-import { HlButton, HlCheckbox, HlDialog, HlDrawer, HlSelect, HlSkeleton } from '@/components/ui'
+import { HlButton, HlCheckbox, HlDialog, HlDrawer, HlEmpty, HlIcon, HlSelect, HlSkeleton, HlSpinner, HlUndoToast, message } from '@/components/ui'
 import RegionFlag from '@/components/RegionFlag.vue'
 import {
   autoExcludedAppIds,
@@ -116,25 +116,35 @@ function selectRegionMode(mode: RegionMode) {
   renderLimit.value = RENDER_STEP
 }
 
-// ─── 高级筛选（复刻可实现的维度）：可补齐 / 国区最低 / 隐藏已拥有 /
-// 家庭共享 / 国区价格区间 / 差价下限（选区时锚定该区差价）。持久化 localStorage。 ───
+// ─── 高级筛选：可补齐 / 国区最低 / 仅有折扣 / 隐藏已拥有 / 家庭共享 /
+// 国区价格区间 / 差价区间（绝对值或占国区价百分比，选区时锚定该区差价）/
+// 仅可跨区送礼。持久化 localStorage。 ───
 interface BundleFilters {
   completableOnly: boolean
   cnLowestOnly: boolean
+  onlyDiscounted: boolean
   hideOwned: boolean
   hideFamily: boolean
   priceMin: string
   priceMax: string
   diffMin: string
+  diffMax: string
+  /** 差价区间单位：absolute = 元；percent = 差价占国区价的百分数 */
+  diffType: 'absolute' | 'percent'
+  giftOnly: boolean
 }
 const DEFAULT_FILTERS: BundleFilters = {
   completableOnly: false,
   cnLowestOnly: false,
+  onlyDiscounted: false,
   hideOwned: false,
   hideFamily: false,
   priceMin: '',
   priceMax: '',
   diffMin: '',
+  diffMax: '',
+  diffType: 'absolute',
+  giftOnly: false,
 }
 function loadFilters(): BundleFilters {
   try {
@@ -156,11 +166,14 @@ const activeFilterCount = computed(() => {
   return (
     (f.completableOnly ? 1 : 0) +
     (f.cnLowestOnly ? 1 : 0) +
+    (f.onlyDiscounted ? 1 : 0) +
     (f.hideOwned ? 1 : 0) +
     (f.hideFamily ? 1 : 0) +
+    (f.giftOnly ? 1 : 0) +
     (numeric(f.priceMin) ? 1 : 0) +
     (numeric(f.priceMax) ? 1 : 0) +
-    (numeric(f.diffMin) ? 1 : 0)
+    (numeric(f.diffMin) ? 1 : 0) +
+    (numeric(f.diffMax) ? 1 : 0)
   )
 })
 function setFilter<K extends keyof BundleFilters>(key: K, value: BundleFilters[K]) {
@@ -172,9 +185,15 @@ function resetFilters() {
   renderLimit.value = RENDER_STEP
 }
 
+/* 差价区间单位选项（与游戏商店高级筛选同一组词条） */
+const diffTypeOptions = computed(() => [
+  { value: 'absolute', label: t('filterPanel.diff.absolute') },
+  { value: 'percent', label: t('filterPanel.diff.percent') },
+])
+
 // ─── 分批渲染：3,386 张卡片一次性挂载是页面打开慢的另一主因（数据接口
-// 已有服务端缓存），先渲 RENDER_STEP 张、点按钮续批。筛选/排序仍在全量
-// bundles 上做（纯 JS，微秒级），只有 DOM 挂载分批。───
+// 已有服务端缓存），先渲 RENDER_STEP 张、滚动接近底部自动续批。筛选/排序
+// 仍在全量 bundles 上做（纯 JS，微秒级），只有 DOM 挂载分批。───
 const RENDER_STEP = 120
 const renderLimit = ref(RENDER_STEP)
 /** 展示管道：地区锚定换算 → 地区模式过滤 → 高级筛选 → 选区 diff 排序时
@@ -203,6 +222,7 @@ const filteredBundles = computed(() => {
   const f = filters.value
   if (f.completableOnly) rows = rows.filter((r) => r.b.mustPurchaseAsSet === 0)
   if (f.cnLowestOnly) rows = rows.filter((r) => r.b.lowestRegion === 'cn')
+  if (f.onlyDiscounted) rows = rows.filter((r) => maxDiscount(r.b) > 0)
   const own = ownershipByBid.value
   if (f.hideOwned) rows = rows.filter((r) => own[r.b.bundleId]?.type !== 'owned')
   if (f.hideFamily) rows = rows.filter((r) => own[r.b.bundleId]?.type !== 'family')
@@ -210,14 +230,27 @@ const filteredBundles = computed(() => {
   const pMin = numeric(f.priceMin)
   const pMax = numeric(f.priceMax)
   const dMin = numeric(f.diffMin)
+  const dMax = numeric(f.diffMax)
   if (pMin != null) rows = rows.filter((r) => r.b.cnCnyFen != null && r.b.cnCnyFen >= pMin * 100)
   if (pMax != null) rows = rows.filter((r) => r.b.cnCnyFen != null && r.b.cnCnyFen <= pMax * 100)
-  if (dMin != null) {
+  if (dMin != null || dMax != null) {
+    const asPercent = f.diffType === 'percent'
     rows = rows.filter((r) => {
-      const d = code && r.regionDiff != null ? r.regionDiff : r.b.diffFen
-      return d >= dMin * 100
+      const base = code && r.regionDiff != null ? r.regionDiff : r.b.diffFen
+      if (asPercent) {
+        // 百分比口径：差价相对国区价的百分数；国区无价则无从计比
+        if (r.b.cnCnyFen == null || r.b.cnCnyFen <= 0) return false
+        const pct = (base / r.b.cnCnyFen) * 100
+        if (dMin != null && pct < dMin) return false
+        if (dMax != null && pct > dMax) return false
+        return true
+      }
+      if (dMin != null && base < dMin * 100) return false
+      if (dMax != null && base > dMax * 100) return false
+      return true
     })
   }
+  if (f.giftOnly) rows = rows.filter((r) => isBundleGiftable(r.b))
   if (sortBy.value === 'discount') {
     // 折扣力度：现折扣% 降序（选区=该区折扣，未选区=全区最大），同折扣按差价
     rows = [...rows].sort(
@@ -245,6 +278,43 @@ function commitSearch() {
   committedSearch.value = searchInput.value.trim().toLowerCase()
   renderLimit.value = RENDER_STEP
 }
+
+/** 清除搜索与筛选（「没有匹配」空态的出路）：搜索词 + 全部筛选回默认 */
+function clearAllFilters() {
+  searchInput.value = ''
+  committedSearch.value = ''
+  resetFilters()
+}
+
+// ─── 滚动自动续批 ───
+// 哨兵进入视口下缘 200px 预判区即扩一批渲染。数据全量在前端，扩批只是
+// DOM 挂载、无请求；观察根是页面滚动容器 .view-container，网格与列表
+// 两种布局共用同一哨兵。
+const sentinel = ref<HTMLElement | null>(null)
+let observer: IntersectionObserver | null = null
+let scrollEl: HTMLElement | null = null
+
+const hasMoreToRender = computed(
+  () => filteredBundles.value.length > visibleBundles.value.length,
+)
+
+function handleObserver(entries: IntersectionObserverEntry[]) {
+  const [entry] = entries
+  if (entry?.isIntersecting && hasMoreToRender.value) renderLimit.value += RENDER_STEP
+}
+
+function setupObserver() {
+  observer?.disconnect()
+  if (!sentinel.value) return
+  observer = new IntersectionObserver(handleObserver, {
+    root: scrollEl,
+    rootMargin: '200px',
+    threshold: 0,
+  })
+  observer.observe(sentinel.value)
+}
+
+watch(sentinel, () => setupObserver())
 
 // ─── 排序因子（与 games/scoring 同式，前端可算的都在这）───
 /** 省钱因子（games/scoring.save_score 同式）：diffFen 分 → 元，对数压缩 ¥200 封顶 */
@@ -880,9 +950,13 @@ function showAgrGroup(group: { codes: string[]; aids: number[] }) {
 
 onMounted(() => {
   document.addEventListener('mousedown', onDocClick)
+  scrollEl = document.querySelector('.view-container')
   load()
 })
-onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
+onBeforeUnmount(() => {
+  document.removeEventListener('mousedown', onDocClick)
+  observer?.disconnect()
+})
 </script>
 
 <template>
@@ -1031,6 +1105,11 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
               :label="t('bundles.filter.cnLowestOnly')"
               @update:model-value="(v: boolean) => setFilter('cnLowestOnly', v)"
             />
+            <HlCheckbox
+              :model-value="filters.onlyDiscounted"
+              :label="t('bundles.filter.onlyDiscounted')"
+              @update:model-value="(v: boolean) => setFilter('onlyDiscounted', v)"
+            />
           </div>
         </div>
 
@@ -1076,7 +1155,11 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
             <span>{{ t('bundles.filter.cny') }}</span>
           </div>
           <div class="hl-fp-inline">
-            <span>{{ t('bundles.filter.diffMinLabel') }}</span>
+            <span>{{ t('bundles.filter.diffType') }}</span>
+            <HlSelect v-model="filters.diffType" :options="diffTypeOptions" style="width: 140px" />
+          </div>
+          <div class="hl-fp-inline">
+            <span>{{ t('bundles.price.diff') }}</span>
             <input
               type="number"
               class="hl-fp-tol"
@@ -1086,8 +1169,25 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
               step="1"
               @input="setFilter('diffMin', ($event.target as HTMLInputElement).value)"
             />
-            <span>{{ t('bundles.filter.cny') }}</span>
-            <span v-if="region" class="hl-fp-hint">{{ t('bundles.filter.diffMinRegionHint') }}</span>
+            <span>—</span>
+            <input
+              type="number"
+              class="hl-fp-tol"
+              :value="filters.diffMax"
+              :placeholder="t('bundles.filter.max')"
+              min="0"
+              step="1"
+              @input="setFilter('diffMax', ($event.target as HTMLInputElement).value)"
+            />
+            <span>{{ filters.diffType === 'percent' ? '%' : t('bundles.filter.cny') }}</span>
+          </div>
+          <div v-if="region" class="hl-fp-hint">{{ t('bundles.filter.diffMinRegionHint') }}</div>
+          <div class="hl-fp-check" style="margin-top: 8px">
+            <HlCheckbox
+              :model-value="filters.giftOnly"
+              :label="t('bundles.filter.giftOnly')"
+              @update:model-value="(v: boolean) => setFilter('giftOnly', v)"
+            />
           </div>
         </div>
 
@@ -1097,14 +1197,30 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
       </div>
     </HlDrawer>
 
-    <div v-if="errorMsg" class="bundles-error">{{ errorMsg }}</div>
+    <!-- 失败 / 空态分支：失败给重试、无匹配给清除出口（对齐游戏商店空态机） -->
+    <HlEmpty v-if="errorMsg" icon="">
+      <h3>{{ t('bundles.error.title') }}</h3>
+      <p>{{ errorMsg }}</p>
+      <div class="bundles-empty-actions">
+        <HlButton size="sm" @click="load()">{{ t('common.retry') }}</HlButton>
+      </div>
+    </HlEmpty>
     <HlSkeleton v-else-if="loading" variant="card" :count="8" />
-    <div v-else-if="bundles.length === 0" class="bundles-empty">
-      {{ t('bundles.empty.noData') }}
-    </div>
-    <div v-else-if="filteredBundles.length === 0" class="bundles-empty">
-      {{ t('bundles.empty.noMatch') }}
-    </div>
+    <HlEmpty v-else-if="bundles.length === 0 && removedView" icon="">
+      <h3>{{ t('bundles.removed.empty') }}</h3>
+      <p>{{ t('bundles.removed.emptyHint') }}</p>
+    </HlEmpty>
+    <HlEmpty v-else-if="bundles.length === 0" icon="">
+      <h3>{{ t('bundles.empty.noData') }}</h3>
+      <p>{{ t('bundles.empty.noDataHint') }}</p>
+    </HlEmpty>
+    <HlEmpty v-else-if="filteredBundles.length === 0" icon="">
+      <h3>{{ t('bundles.empty.noMatch') }}</h3>
+      <p>{{ t('bundles.empty.filterHint') }}</p>
+      <div class="bundles-empty-actions">
+        <HlButton size="sm" @click="clearAllFilters">{{ t('bundles.empty.filterClear') }}</HlButton>
+      </div>
+    </HlEmpty>
 
     <template v-else>
       <!-- 列表模式：单列紧凑行（对齐游戏商店列表几何：封面 128×60 通高 +
@@ -1410,10 +1526,13 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
       </div>
     </template>
 
-    <div v-if="!loading && filteredBundles.length > visibleBundles.length" class="bundles-load-more">
-      <HlButton @click="renderLimit += RENDER_STEP">
-        {{ t('bundles.list.loadMore', { n: filteredBundles.length - visibleBundles.length }) }}
-      </HlButton>
+    <!-- 无限滚动哨兵：接近底部自动续批，网格/列表两种布局共用 -->
+    <div v-if="!errorMsg && !loading && filteredBundles.length > 0" ref="sentinel" class="loading-sentinel">
+      <template v-if="hasMoreToRender">
+        <HlSpinner />
+        {{ t('bundles.list.loadingMore') }}
+      </template>
+      <template v-else>{{ t('bundles.list.end') }}</template>
     </div>
 
     <!-- 全区价格详情抽屉（非模态，底层可交互） -->
@@ -1555,6 +1674,7 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
               :class="gameStatusClass(g)"
               :title="gameTitle(g)"
             >
+              <span v-if="gameBadge(g)" class="bgc-badge" :class="gameBadge(g)!.cls">{{ t(gameBadge(g)!.key) }}</span>
               <HlImg
                 :src="g.headerImage"
                 :alt="g.name ?? ''"
@@ -1640,6 +1760,7 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
             style="cursor: pointer"
             @click="toggleExclude(g.appid)"
           >
+            <span v-if="gameBadge(g)" class="bgc-badge" :class="gameBadge(g)!.cls">{{ t(gameBadge(g)!.key) }}</span>
             <HlImg
               :src="g.headerImage"
               :alt="g.name ?? ''"
@@ -1664,9 +1785,10 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
           v-for="{ game, missing } in allGames"
           :key="game.appid"
           class="bundle-game-card"
-          :class="gameStatusClass(game)"
+          :class="[gameStatusClass(game), { 'is-locked-dim': missing }]"
           :title="gameTitle(game)"
         >
+          <span v-if="gameBadge(game)" class="bgc-badge" :class="gameBadge(game)!.cls">{{ t(gameBadge(game)!.key) }}</span>
           <HlImg
             :src="game.headerImage"
             :alt="game.name ?? ''"
@@ -1713,24 +1835,22 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
   justify-content: space-between;
   margin-bottom: 14px;
 }
-.bundles-load-more {
-  display: flex;
-  justify-content: center;
-  margin: 18px 0 26px;
-}
 .bundles-stats {
   font-size: 13px;
   color: var(--text-secondary);
 }
 /* `.bundles-loading` 随加载态改骨架屏删除（描述文字不再是「加载中…」样式） */
-.bundles-empty,
 .bundles-error {
   text-align: center;
   padding: 40px 0;
-  color: var(--text-muted);
-}
-.bundles-error {
   color: var(--danger);
+}
+/* 空态/失败态 HlEmpty 内的动作按钮行（清除筛选 / 重试） */
+.bundles-empty-actions {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 10px;
 }
 .lowest-flag {
   font-size: 10px;
