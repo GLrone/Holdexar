@@ -95,7 +95,7 @@ def ensure_npm() -> None:
 
 
 def ensure_seed(python: Path) -> None:
-    """资产种子（16 年汇率档案）：缺失则从 Release 资产补一份（不进 git，
+    """资产种子（历史汇率档案）：缺失则从 Release 资产补一份（不进 git，
     见 scripts/fetch_seed.py）。失败只警告不阻断——没有种子只是汇率页
     没有历史档案。"""
     seed = ROOT / "assets" / "seed" / "holdexar_seed.db"

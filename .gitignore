@@ -181,3 +181,11 @@ server/_tmp_verify_data/
 # ── 本会话临时/调研残留（不入库）──
 /_tmp_close_smoke/
 /holdexar-dev/
+
+# R2 上传凭据与上传工具（维护机本机文件，不入库；公共仓库不含发布侧上传链路）
+.r2.env
+scripts/upload_cloud_packs.py
+
+# ── 工具会话残留（自动化 CLI 工作目录与构建缓存，不入库）──
+.playwright-cli/
+server/.vite/

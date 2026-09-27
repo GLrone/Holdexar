@@ -155,7 +155,7 @@ python run.py --dev      # 对接 Vite 热更新开发
 python run.py --port N   # 指定端口
 ```
 
-首次运行会自动补齐公共数据种子(16 年历史汇率与价格历史切片,约 288MB):种子是二进制大文件,不进 git,由 `run.py` 从 Release 资产拉取。没网也不影响启动,只是【汇率】页没有历史档案,之后重跑 `python scripts/fetch_seed.py` 即可。
+首次运行会自动补齐公共数据种子(历史汇率与价格历史切片,约 288MB):种子是二进制大文件,不进 git,由 `run.py` 从 Release 资产拉取。没网也不影响启动,只是【汇率】页没有历史档案,之后重跑 `python scripts/fetch_seed.py` 即可。
 
 随包的还有 Clash 内核(mihomo + GeoIP 数据,约 72MB,版本固定):同为二进制不入库,由 `run.py` 调用 `python scripts/fetch_kernel.py` 从上游补齐;获取失败也不阻断启动,【代理】页会显示「内核缺失」并提供一键安装入口。
 
