@@ -382,7 +382,13 @@ def _mount_spa(app: FastAPI, dist) -> None:
     # uvicorn 在 lifespan 完成前不监听端口，后端同源等待页在窗口期必然
     # 连接被拒，等待逻辑只有放在不依赖网络的进程内页面才能成立。
 
-    @app.get("/{full_path:path}", include_in_schema=False)
+    # 兜底必须接受全部 HTTP 方法：只挂 GET 时，打到未知 API 路径的 POST/PUT
+    # 会以「路径匹配、方法不符」回 405，把「接口不存在」伪装成「方法不对」。
+    @app.api_route(
+        "/{full_path:path}",
+        methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"],
+        include_in_schema=False,
+    )
     async def spa_fallback(full_path: str) -> FileResponse:
         if full_path.startswith(("api/", "docs", "redoc", "openapi.json")):
             raise HTTPException(status_code=404)
