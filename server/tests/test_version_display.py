@@ -67,6 +67,17 @@ def test_suffix_real_option_text_forms():
         # VN 区 ₫ / 印尼 Rp 前缀缩写（E2E 形态）
         ("Portal 2 - 142.000₫", "Portal 2", ""),
         ("Portal 2 - Rp 90 999", "Portal 2", ""),
+        # 冒号连接形态（官方名: 版本名）——与空格连接并存，只认空格时
+        # 冒号 sub 提取落空被当标准版
+        (
+            "SONIC X SHADOW GENERATIONS: Digital Deluxe Upgrade",
+            "SONIC X SHADOW GENERATIONS",
+            "Digital Deluxe Upgrade",
+        ),
+        # 全角冒号连接
+        ("女神异闻录5：皇家版", "女神异闻录5", "皇家版"),
+        # 冒号连接 + 价格尾巴混排
+        ("Game Name: Gold Edition - ¥ 298.00", "Game Name", "Gold Edition"),
     ]
     for opt, name_en, expected in cases:
         got = extract_version_suffix(opt, name_en)
