@@ -199,6 +199,25 @@ async def test_flag_filter():
     r = await _fetch(flag="any", limit=40)
     for item in r["items"]:
         assert item["hlFlag"] in (1, 2) or item["ppFlag"] == 1
+    # any = 降价动态 feed，与仪表盘徽章三态同口径：每行必须可打徽章——
+    # hl 1/2 恒可；纯 pp 行要未打折且 pp_changed_at 在 14 天窗内
+    # （窗外跳变前端不出永降徽章，混入即成无徽章原价行）。时刻为
+    # naive 北京时间（refresh_pp_flags 写入口径）。
+    from datetime import datetime, timedelta
+
+    from app.crawler.utils import get_beijing_time_obj
+    from app.domains.games.service import PP_FLAG_WINDOW_DAYS
+
+    window_start = get_beijing_time_obj() - timedelta(days=PP_FLAG_WINDOW_DAYS)
+    for item in r["items"]:
+        if item["hlFlag"] in (1, 2):
+            continue
+        assert item["ppFlag"] == 1
+        changed = item.get("ppChangedAt")
+        assert changed, "纯 pp 行必须有跳变时刻（无时刻 = 前端不出徽章）"
+        changed_dt = datetime.fromisoformat(str(changed).replace(" ", "T")).replace(tzinfo=None)
+        assert changed_dt >= window_start, "纯 pp 行跳变必须落在时效窗内"
+        assert (item.get("discount") or 0) == 0, "纯 pp 行必须未打折（打折行前端不出永降徽章）"
 
 
 @pytest.mark.asyncio
