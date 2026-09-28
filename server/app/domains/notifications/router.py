@@ -198,3 +198,18 @@ async def stats():
         "maxAttempts": MAX_ATTEMPTS,
         "byStatus": counts,
     }
+
+
+@router.get("/notifications/facts")
+async def fact_notices(
+    afterId: int | None = Query(default=None, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
+):
+    """内容链事实通知的增量出口（灵动岛轮询）。
+
+    afterId 缺省 = 只对齐：回空增量与 latestId，消费端记下游标后从
+    后续轮询开始取增量（升级后的第一轮不回放历史事实）。
+    """
+    from app.domains.notifications import facts as facts_service
+
+    return await facts_service.list_facts(after_id=afterId, limit=limit)

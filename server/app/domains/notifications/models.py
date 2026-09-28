@@ -1,17 +1,39 @@
-"""通知域模型：价格事件的通知候选。
+"""通知域模型：价格事件的通知候选 + 内容链事实通知。
 
 `price_events` 是事实（只增不改、没有渠道状态）；候选表达「这个事实经过用户
 策略判断后具备通知资格」。**通知状态只落在候选上，绝不回写事件**——同一个
 事实可以不通知、可以进邮件、可以进摘要，事实本身不被渠道状态污染。
+
+`fact_notices` 是内容链（HB 当月包 / Epic 喜加一）的事实变化记录：变更判定在
+数据链路里做一次（metadata 域两链的记账/快照替换点），灵动岛与后续渠道各自
+消费同一行事实，不再各判一遍。
 """
 from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, Index, Integer, String, Text
+from sqlalchemy import DateTime, Index, Integer, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
+
+
+class FactNotice(Base):
+    """一条内容链事实变化。只增不改：没有确认/删除/状态流转。
+
+    身份 = `fact_key`（如 ``hb_choice:september_2026_choice``）：同一事实重复
+    进入（调度重跑 / 手动触发 / 快照重拉）落不进第二行。`data` 存消费方参数
+    （标签、数量、条目名等），文案由消费端按 `source`/`kind` 翻译。
+    """
+
+    __tablename__ = "fact_notices"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(24))
+    kind: Mapped[str] = mapped_column(String(24))
+    fact_key: Mapped[str] = mapped_column(Text, unique=True)
+    data: Mapped[dict | None] = mapped_column(JSON)
+    occurred_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
 class NotificationCandidate(Base):

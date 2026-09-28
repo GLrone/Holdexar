@@ -27,6 +27,11 @@ const island: Partial<Record<MessageKey, string>> = {
   'island.ago.minutes': '{n} min ago',
   'island.ago.hours': '{n} h ago',
   'island.ago.days': '{n} d ago',
+
+  'island.fact.hbChanged': 'Humble Choice monthly bundle refreshed: {label}',
+  'island.fact.hbChangedDetail': '{count} games redeemable on Steam this month; see the dashboard card',
+  'island.fact.epicRotation': 'Epic free games rotated: {count} new',
+  'island.fact.epicRotationDetail': 'Now free to claim: {titles}',
 }
 
 export default island
