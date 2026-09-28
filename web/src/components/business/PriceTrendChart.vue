@@ -3,7 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
 import { LineChart } from 'echarts/charts'
-import { DataZoomComponent, GridComponent, TooltipComponent } from 'echarts/components'
+import { DataZoomComponent, GridComponent, MarkPointComponent, TooltipComponent } from 'echarts/components'
 import VChart from 'vue-echarts'
 
 import { gamesApi, type HistoryPayload } from '@/api/client'
@@ -15,12 +15,12 @@ import {
   withAlpha,
 } from '@/api/chartTheme'
 import { useI18n } from '@/locales'
-use([CanvasRenderer, LineChart, GridComponent, TooltipComponent, DataZoomComponent])
+use([CanvasRenderer, LineChart, GridComponent, TooltipComponent, DataZoomComponent, MarkPointComponent])
 
 /**
  * 价格历史走势图 —— component-framework.html 模块 F 权威模版：
  * Steam 价阶梯线 + Key 店走线（绿色）+ 史低黄色平虚线 + 面积幕布渐变
- * （贴线处不透明 → 向下淡出）+ 史低节点绿点光晕 + 底部全局缩略导航条。
+ * （贴线处不透明 → 向下淡出）+ 史低节点绿圈锚点 + 底部全局缩略导航条。
  * Key 店现价来自 /games/{appid}/cdk（SteamPY/SteamCICI 实时查价，无历史
  * 序列 → 以「当前价横线」呈现，与库内史低平线同一形态语义）。
  * 卡片抽屉 / 详情页共用。数据须为全量序列（接口 days=0），时间窗由
@@ -97,15 +97,14 @@ const lowYuan = computed(() => {
   const v = ys.value
   return v.length ? Math.min(...v) : null
 })
-/** 史低节点：价格刷新全序列最低值的拐点（tooltip 標「史低节点」用） */
-const lowEventIdx = computed(() => {
+/** 史低节点：值贴在史低线上的变化点——首次触底与后续回贴/持续贴线都算
+ *  （tooltip 标「史低节点」用；判定与 lowYuan 同一把尺，y 值逐字节相等） */
+const lowTouchIdx = computed(() => {
+  const low = lowYuan.value
   const set = new Set<number>()
-  let min = Infinity
-  pts.value.forEach((p, i) => {
-    if (p.cnyFen && p.cnyFen > 0 && p.cnyFen < min) {
-      set.add(i)
-      min = p.cnyFen
-    }
+  if (low == null) return set
+  ys.value.forEach((v, i) => {
+    if (v === low) set.add(i)
   })
   return set
 })
@@ -236,18 +235,20 @@ const chartOption = computed(() => {
       lineStyle: { color: c.line, width: 2 },
       itemStyle: { color: c.line },
       areaStyle: { color: fadeArea(c.line, 0.1, 0) },
-      // 史低节点绿点光晕：价格刷新全序列最低值的拐点（tooltip 同标注）
+      // 史低节点锚点：绿描边镂空圆，套在贴史低线的变化点上（tooltip 同标注）。
+      // 孔用卡片底色实心填：圆心正压在阶梯线与史低虚线的交点上，透明孔会让
+      // 两条线从圈内穿过，读不出「环」；底色孔把它们在圈内截断。
       markPoint: {
         symbol: 'circle',
-        symbolSize: 11,
+        symbolSize: 9,
         animation: false,
         itemStyle: {
-          color: c.success,
-          borderColor: withAlpha(c.success, 0.3),
-          borderWidth: 5,
+          color: tip.bg,
+          borderColor: c.success,
+          borderWidth: 2,
         },
         label: { show: false },
-        data: [...lowEventIdx.value].map((i) => ({
+        data: [...lowTouchIdx.value].map((i) => ({
           coord: [tsList.value[i], ys.value[i]],
         })),
       },
@@ -307,7 +308,7 @@ const chartOption = computed(() => {
         let html = `<b>${(p.timestamp ?? '').slice(0, 16).replace('T', ' ')}</b>`
         // 与图上 markPoint 同色（此前这里写死 #2ed573，而那个点用的是 --success——
         // 同一语义两个绿，且 #2ed573 在 token 表里根本不存在）
-        if (lowEventIdx.value.has(i))
+        if (lowTouchIdx.value.has(i))
           html += ` · <span style="color:${c.success}">${t('trendChart.tip.lowNode')}</span>`
         // 现价一行：带原价时合并成**一条**带占位符的词条（`现价 ¥9.99（¥19.99）`），
         // 不拆成「标签 + 原价」两段拼——英文的括号与语序都不同，拼不出来
