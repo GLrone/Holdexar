@@ -103,3 +103,35 @@ async def test_failure_ledger_merged_into_fail_count():
     done, ok, fails = sched.counts()
     assert (done, fails) == (1, 2)
     assert ok == 0  # max(0, done - fails)
+
+
+@pytest.mark.asyncio
+async def test_progress_events_all_published_before_run_returns():
+    """run() 返回时全部 crawl.progress 必须已发布到总线。
+
+    收尾方（_finish_job 的 job.status）在 run() 返回之后才发布——末条进度
+    若压在它后面到达，客户端会把已收束的任务重新置回运行态，进度条卡死
+    100% 直到下一个任务的事件来纠正。worker 数 = 任务数时末条进度与收尾
+    最容易同拍，是最紧的排序窗口。
+    """
+    from app.core.events import bus
+
+    total = 6
+
+    async def _app(context: CrawlerContext) -> None:
+        await asyncio.sleep(0.01)
+
+    queue = bus.subscribe()
+    try:
+        sched = _make_scheduler(_app, workers=total)
+        await sched.run([{"type": "app", "id": i} for i in range(total)], session=None)
+    finally:
+        bus.unsubscribe(queue)
+
+    progress = []
+    while not queue.empty():
+        event = queue.get_nowait()
+        if event.type == "crawl.progress":
+            progress.append(event.payload)
+    assert progress, "run() 返回前应已发布进度事件"
+    assert progress[-1]["done"] == total, "run() 返回时末条进度必须已发布"

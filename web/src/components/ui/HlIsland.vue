@@ -129,16 +129,21 @@ const taskText = computed(() => {
   const n = current.value
   if (n && n.sticky) return n.text
   if (activeTask.value) return activeTask.value.text
-  return t('island.task.running', { done: crawl.done, total: crawl.total })
+  return t('island.task.running', { done: progDone.value, total: progTotal.value })
 })
+
+/* 进度口径：轮次累计优先——一轮价格刷新由多个任务段串成，按轮累计使进度与
+   百分比在轮内单调推进；非轮次任务（手动抓取 / 修复）用当前任务段计数 */
+const progDone = computed(() => crawl.roundProgress?.done ?? crawl.done)
+const progTotal = computed(() => crawl.roundProgress?.total ?? crawl.total)
 
 /** 定量进度百分比；给不到总量时返回 null（改走滑动条） */
 const taskPercent = computed<number | null>(() => {
   const n = current.value
   if (n && n.sticky) return null
   if (activeTask.value) return activeTask.value.percent
-  if (!crawl.total) return null
-  return Math.min(100, Math.round((crawl.done / crawl.total) * 100))
+  if (!progTotal.value) return null
+  return Math.min(100, Math.round((progDone.value / progTotal.value) * 100))
 })
 
 /** 头部行「取消任务」键只对爬取任务成立：注册任务与消息气泡没有对应端点 */

@@ -1,5 +1,8 @@
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
+
+import { crawlApi } from '@/api/client'
+import { CYCLE_ACTIVE } from '@/lib/headerStatus'
 
 import { nextPriceCycle, type PriceCycleMark } from '@/lib/priceRefresh'
 
@@ -20,6 +23,46 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
   /* 最近一次收敛的价格刷新周期（SSE price_cycle.completed）：库视图据此失效
      列表缓存并原地重拉。按 cycleId 去重——同一轮重复到达不触发第二次请求。 */
   const priceCycle = ref<PriceCycleMark | null>(null)
+
+  /* 一轮价格刷新由多个任务段串行组成；进度按轮累计（段与段之间不清零），
+     岛上的进度条与百分比在轮内单调推进。轮次未激活时（手动抓取、修复等
+     独立任务）进度退回当前任务段的计数口径。 */
+  const roundDone = ref(0)
+  const roundTotal = ref(0)
+  const roundTracking = ref(false)
+
+  /** 轮内累计进度（含在跑任务段的实时计数）；null = 当前无轮次口径 */
+  const roundProgress = computed(() => {
+    if (!roundTracking.value) return null
+    const liveDone = running.value ? done.value : 0
+    const liveTotal = running.value ? total.value : 0
+    return { done: roundDone.value + liveDone, total: roundTotal.value + liveTotal }
+  })
+
+  /* 以最近一轮的记账状态核对轮次是否在跑，并把该轮已收尾任务段的完成量补进
+     累计（页面半途打开时，前几段的量从这里补齐）。查询失败保持现状。 */
+  async function syncRoundScope() {
+    try {
+      const [cycle] = await crawlApi.cycles(1)
+      if (!cycle || !CYCLE_ACTIVE.has(cycle.status)) {
+        roundTracking.value = false
+        return
+      }
+      const jobs = await crawlApi.jobs(10)
+      let finishedDone = 0
+      let finishedTotal = 0
+      for (const job of jobs) {
+        if (job.cycleId !== cycle.id) continue
+        finishedDone += job.stats?.processed ?? 0
+        finishedTotal += job.stats?.total ?? 0
+      }
+      roundDone.value = finishedDone
+      roundTotal.value = finishedTotal
+      roundTracking.value = true
+    } catch {
+      /* 拉不到轮次不改现有展示 */
+    }
+  }
 
   let source: EventSource | null = null
   let started = false
@@ -49,11 +92,17 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
       ok.value = 0
       fail.value = 0
       total.value = 0
+      void syncRoundScope()
     })
 
     source.addEventListener('job.status', (e) => {
       const data = JSON.parse((e as MessageEvent).data)
       if (['done', 'failed', 'stopped'].includes(data.status)) {
+        /* 任务段收尾并入轮次累计；轮内下一段起算时不清零 */
+        if (roundTracking.value) {
+          roundDone.value += done.value
+          roundTotal.value += total.value
+        }
         running.value = false
         activeJobId.value = null
       }
@@ -63,12 +112,19 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
        lib/priceRefresh：同一轮重复到达不推进，页面不会重复请求。 */
     source.addEventListener('price_cycle.completed', (e) => {
       const next = nextPriceCycle(priceCycle.value, JSON.parse((e as MessageEvent).data))
-      if (next) priceCycle.value = next
+      if (next) {
+        priceCycle.value = next
+        roundTracking.value = false
+        roundDone.value = 0
+        roundTotal.value = 0
+      }
     })
 
     source.onerror = () => {
       // EventSource 自动重连
     }
+
+    void syncRoundScope()
   }
 
   return {
@@ -82,6 +138,7 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
     activeJobId,
     lastEventAt,
     priceCycle,
+    roundProgress,
     start,
   }
 })

@@ -167,7 +167,9 @@ class CrawlerScheduler:
                         logger.exception("[Worker-%d] 错误分类回调异常", worker_id)
                 logger.error("[Worker-%d] %s:%s 异常: %s", worker_id, task_type, task_id, e)
             finally:
-                self.queue.task_done()
+                # 进度事件必须先于 task_done 发布：join() 一放行，run() 的收尾
+                # 路径（job.status）就会出站；末条进度若压在它后面，客户端会把
+                # 已收束的任务重新置回运行态，进度条卡死在 100%。
                 await self._record_speed()
                 if self.total_processed % _PROGRESS_LOG_EVERY == 0:
                     done, ok, fails = self._derived_counts()
@@ -180,6 +182,7 @@ class CrawlerScheduler:
                         self._get_speed(),
                     )
                 self._publish_progress()
+                self.queue.task_done()
 
     async def run(self, initial_tasks: list[dict], session) -> None:
         """将初始任务打入队列，启动 workers，等待队列清空（含动态追加任务）。

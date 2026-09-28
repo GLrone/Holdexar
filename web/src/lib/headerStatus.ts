@@ -38,7 +38,7 @@ export interface PriceStatusInput {
 }
 
 /** 轮次已建行但尚未收束：此间实时计数还没跟上，结论按「正在更新」给 */
-const CYCLE_ACTIVE = new Set(['planning', 'running', 'repairing', 'finalizing'])
+export const CYCLE_ACTIVE = new Set(['planning', 'running', 'repairing', 'finalizing'])
 
 /** 未收敛的轮次终态：跑完了但没拿满，或中途失败 / 取消——都不得声称「价格已更新」 */
 const CYCLE_UNCONVERGED = new Set(['failed', 'partial', 'cancelled', 'stopped'])
