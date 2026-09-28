@@ -165,6 +165,18 @@ def clash_runtime():
 
 
 # ── 数据与编排辅助 ───────────────────────────────────────────────
+async def _set_exit_ip(runtime_name: str, exit_ip: str) -> None:
+    """模拟机场轮换出口：同一节点的出口 IP 换成新值。"""
+    from sqlalchemy import select as _select
+
+    async with get_session_factory()() as s:
+        node = (await s.execute(
+            _select(ProxyNode).where(ProxyNode.runtime_name == runtime_name)
+        )).scalar_one()
+        node.exit_ip = exit_ip
+        await s.commit()
+
+
 async def _add(runtime_name: str, *, port: int, state: str = NODE_ACTIVE) -> None:
     config = {"name": runtime_name.split("|", 1)[-1], "type": "http",
               "server": "127.0.0.1", "port": port}
@@ -335,3 +347,37 @@ async def test_hot_rebuild_keeps_process_and_port(
     assert result.pool_names == ("1|A", "1|B", "1|C"), "新池节点必须真的进核"
     assert result.selection == "1|B", "GLOBAL 恢复契约与冷通道一致"
     assert await _global_now(result.controller_url, secret) == "1|B"
+
+# ── 5. 出口轮换漂移：crawl_lane_plan 启动时就地收敛，进程不动 ────
+@pytest.mark.asyncio
+async def test_lane_plan_drift_recovers_inline(
+    tmp_data_dir, kernel_exe_path, clash_runtime
+) -> None:
+    """机场轮换出口 → lane 计划与出口快照失配 → 取值口就地热收敛
+    （重写计划、对齐 lane），本次调用直接拿到一致的入口，进程不动。"""
+    from app.domains.proxypool import runtime as rt
+
+    await init_db()
+    await _add("1|A", port=_closed_port())
+    base, secret = await _boot(clash_runtime, kernel_exe_path, tmp_data_dir)
+    await _set_exit_ip("1|A", "1.1.1.1")
+    await _build(tmp_data_dir)
+    async with get_session_factory()() as s:
+        slots = await rt.exit_slot_snapshot(s)
+        names = tuple(n.runtime_name for n in await rt.eligible_nodes(s))
+        await rt.align_lanes(
+            data_dir=tmp_data_dir, controller_url=base, secret=secret,
+            pool_names=list(names), slots=slots, timeout=20,
+        )
+    pid_before = clash_runtime.process.pid
+
+    # 机场轮换：同一节点出口 IP 换新 → lane 计划立刻失配
+    await _set_exit_ip("1|A", "2.2.2.2")
+    async with get_session_factory()() as s:
+        plan = await rt.crawl_lane_plan(
+            s, data_dir=tmp_data_dir, runtime=clash_runtime,
+        )
+        await s.commit()
+
+    assert list(plan["exit_keys"]) == ["2.2.2.2"], "收敛后必须拿到轮换后的新出口"
+    assert clash_runtime.process.pid == pid_before, "收敛走热通道，进程不动"

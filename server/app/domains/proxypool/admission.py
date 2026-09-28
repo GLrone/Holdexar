@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -234,3 +235,45 @@ async def promote_to_active(
     return PromotionResult(
         subscription_id, True, "晋升完成（快照已进 Registry）", snap.sha256, applied
     )
+
+
+# 健康自动转正的门槛：最近一次体检有可用节点即视为健康。准入的判断依据是
+# 体检事实，不是人工点头——用户导入订阅即意图投产；不健康的订阅不转正，
+# 其死节点也永远成不了出口槽（池内体检持续剔除）。
+AUTO_ADMIT_MIN_ALIVE = 1
+
+
+async def auto_admit_healthy_candidate(
+    session: AsyncSession,
+    *,
+    subscription_id: int,
+    data_dir: Path,
+    now: datetime,
+) -> PromotionResult | None:
+    """候选订阅的健康自动转正：订阅最近一次体检有可用节点（≥ AUTO_ADMIT_MIN_ALIVE）
+    就直接晋升进池；体检无可用节点（或还没体检过）的订阅保持候选。
+
+    复用 `promote_to_active`（同一事务语义：只 flush 不 commit，由调用方提交）；
+    晋升失败（快照未就绪 / 换链接后当前 URL 还没重抓成功等）时保持候选原样返回
+    `None`——快照与状态不能被半截转正污染，等下一次体检 / 同步再试。
+    """
+    sub = await session.get(ProxySubscription, subscription_id)
+    if sub is None or is_admitted(sub):
+        return None
+    stats = sub.last_stats if isinstance(sub.last_stats, Mapping) else {}
+    try:
+        alive = int(stats.get("alive") or 0)
+    except (TypeError, ValueError):
+        alive = 0
+    if alive < AUTO_ADMIT_MIN_ALIVE:
+        return None
+    try:
+        return await promote_to_active(
+            session, subscription_id=subscription_id, data_dir=data_dir, now=now
+        )
+    except Exception as exc:  # noqa: BLE001 —— 转正不成保持候选原样，等下一轮再试
+        logger.warning(
+            "[准入] 订阅 %s 体检健康（可用 %d）但暂不能转正：%s",
+            subscription_id, alive, exc,
+        )
+        return None

@@ -27,7 +27,11 @@ import yaml
 from sqlalchemy import exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domains.proxypool.models import ProxyNode, ProxyNodeSource
+from app.domains.proxypool.models import (
+    ProxyNode,
+    ProxyNodeSource,
+    is_info_placeholder,
+)
 from app.domains.proxypool.state import NODE_ACTIVE, NODE_NEW, NODE_STALE
 
 POOL_FILENAME = "crawl-pool.yaml"
@@ -127,6 +131,8 @@ async def eligible_nodes(session: AsyncSession) -> list[ProxyNode]:
     合格 = 状态合格 + 配置完整 + **至少一个当前来源**：身份账本（`ProxyNode`）保留，
     但没有任何订阅提供它的节点不该占运行位——订阅退出生产池后，只由它提供的节点
     因此自然退出池，而仍被别的订阅提供的节点不受影响。
+    信息占位节点（机场公告位）即使已混入账本也**永不合格**——它们不是可用的
+    代理端点。
     """
     rows = await session.execute(
         select(ProxyNode)
@@ -134,7 +140,10 @@ async def eligible_nodes(session: AsyncSession) -> list[ProxyNode]:
         .where(exists().where(ProxyNodeSource.node_id == ProxyNode.node_id))
         .order_by(ProxyNode.id)
     )
-    return [node for node in rows.scalars() if _is_complete(node)]
+    return [
+        node for node in rows.scalars()
+        if _is_complete(node) and not is_info_placeholder(node.runtime_name)
+    ]
 
 
 async def eligible_runtime_names(session: AsyncSession) -> tuple[str, ...]:

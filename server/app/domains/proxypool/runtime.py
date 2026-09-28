@@ -27,6 +27,7 @@ import socket
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -1114,8 +1115,88 @@ def _notify_rebuild() -> None:
         pass
 
 
+async def hot_reconverge(
+    session, *, data_dir: Path, runtime=None,
+    wait_timeout: float = DEFAULT_WAIT_TIMEOUT,
+) -> bool:
+    """爬取启动前的**同步收敛**：出口身份漂移（机场轮换出口 / 换节点清单）时，
+    在启动路径上就地走一次**热通道**重建——重算池与 lane、`PUT /configs`、
+    恢复选择与绑定——让本次 run 直接拿到与现状一致的入口，而不是等下一个
+    维护拍再让用户重试。
+
+    只走热通道（进程不动、端口不变）；控制器不可达或热通道未通过返回
+    `False`，由调用方按原 fail-closed 语义拒绝启动。
+    """
+    try:
+        base, secret = controller_endpoint_of(data_dir)
+    except (RuntimeConfigError, OSError):
+        return False
+    if not await controller_alive(base, secret):
+        return False
+    try:
+        build = await build_pool(session, data_dir=data_dir)
+        from app.domains.proxypool.health import latest_l0_delays
+
+        slots = select_exit_slots(
+            await eligible_nodes(session), delays=await latest_l0_delays(session)
+        )
+        previous = await current_global_selection(base, secret)
+        previous_lanes = await current_lane_selections(
+            base, secret, len(runtime_lane_ports(data_dir))
+        )
+        await _hot_apply_rebuild(
+            data_dir=data_dir, controller_url=base, secret=secret,
+            runtime=runtime, build=build, slots=slots, previous=previous,
+            previous_lanes=previous_lanes, wait_timeout=wait_timeout,
+        )
+        logger.info(
+            "[收敛] 启动前热通道收敛完成：出口槽 %d / 池 %d 节点",
+            len(slots), len(build.runtime_names),
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 —— 收敛不成走原 fail-closed 拒绝
+        logger.warning("[收敛] 启动前热通道收敛未通过：%s", exc)
+        return False
+
+
+# 启动收敛里就地补探的 L1 节点上限：串行探针每个数秒，封顶把启动等待压在
+# 半分钟级；探不完的余下节点交维护周期（rebuild_pending 已置）
+LANE_RECOVERY_L1_NODES = 12
+
+
+async def _recover_lane_plan(
+    session, *, data_dir: Path, runtime, slots: list[ExitSlot],
+) -> None:
+    """lane 计划/出口槽失配时的**就地恢复**，失败静默（调用方重查后按原样拒绝）：
+
+    ① 槽位为空而合格节点尚未探出口 → 补一轮**有界** L1（≤ LANE_RECOVERY_L1_NODES）；
+    ② 热通道重建：池、lane 计划、绑定全部对齐当前现状（进程不动）。
+    """
+    try:
+        base, secret = controller_endpoint_of(data_dir)
+    except (RuntimeConfigError, OSError):
+        return
+    if not await controller_alive(base, secret):
+        return
+
+    if not slots:
+        from app.domains.proxypool.health import exit_ip_check_pool
+
+        pending = [n.runtime_name for n in await eligible_nodes(session)
+                   if not n.exit_ip][:LANE_RECOVERY_L1_NODES]
+        if pending:
+            logger.info("[收敛] 出口槽为空：就地补探 %d 个合格节点的出口身份", len(pending))
+            await exit_ip_check_pool(
+                session, data_dir=data_dir, controller_url=base, secret=secret,
+                now=datetime.now(), names=tuple(pending),
+            )
+            await session.commit()
+
+    await hot_reconverge(session, data_dir=data_dir, runtime=runtime)
+
+
 async def crawl_lane_plan(
-    session, data_dir: Path, *, max_lanes: int | None = None
+    session, data_dir: Path, *, max_lanes: int | None = None, runtime=None,
 ) -> dict:
     """**爬取唯一取值口**：只有「有池 + 有 lane + 两者逐位一致」才交出地址。
 
@@ -1126,13 +1207,22 @@ async def crawl_lane_plan(
         Crawl Runtime Ready      —— 爬取关心：**池里有合格出口、有 lane、lane 与出口
                                     快照逐位一致、入口真的在听**。
 
-    只有后者成立才返回 URL；任一条件不满足即抛 `RuntimeUnavailableError`，
-    **绝不**回退 GLOBAL、回退直连、回退旧订阅代理——那三种回退都会把"池坏了"
-    伪装成"爬取成功"，并在出口身份不明的情况下把生产流量送出去。
+    机场轮换出口 / 换节点清单会让 lane 计划与出口快照短暂失配——失配时先在
+    启动路径上**就地收敛**（`_recover_lane_plan`：有界补探 + 热通道重建，
+    进程不动），收敛后重查；仍不一致才拒绝（fail-closed）。
+
+    任一条件不满足即抛 `RuntimeUnavailableError`，**绝不**回退 GLOBAL、回退
+    直连、回退旧订阅代理——那三种回退都会把"池坏了"伪装成"爬取成功"，并在
+    出口身份不明的情况下把生产流量送出去。
     """
     slots = await exit_slot_snapshot(session)
     bindings = lane_bindings(data_dir)
     ok, why = lane_plan_consistency(bindings, slots)
+    if not ok:
+        await _recover_lane_plan(session, data_dir=data_dir, runtime=runtime, slots=slots)
+        slots = await exit_slot_snapshot(session)
+        bindings = lane_bindings(data_dir)
+        ok, why = lane_plan_consistency(bindings, slots)
     if not ok:
         _notify_rebuild()
         raise RuntimeUnavailableError(

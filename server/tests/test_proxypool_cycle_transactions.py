@@ -31,14 +31,40 @@ def tmp_data_dir(tmp_path, monkeypatch):
     get_session_factory.cache_clear()
 
 
+class _EmptyResult:
+    """空查询结果：对齐步骤的只读查询在假 session 上按空表处理。"""
+
+    def scalars(self):
+        return self
+
+    def all(self):
+        return []
+
+    def __iter__(self):
+        return iter([])
+
+
 class _Recorder:
-    """只记录 commit 顺序的假 session（各阶段都被替换掉，不需要真 DB）。"""
+    """只记录 commit 顺序的假 session（各阶段都被替换掉，不需要真 DB）。
+
+    周期开头还有两账本对齐的只读查询（来源补回 / 体检账本），假 session 按空表
+    返回，使这些步骤以零写入的空转形态通过而不改变 commit 序列。
+    """
 
     def __init__(self) -> None:
         self.events: list[str] = []
 
     async def commit(self) -> None:
         self.events.append("commit")
+
+    async def execute(self, *args, **kwargs) -> _EmptyResult:
+        return _EmptyResult()
+
+    async def scalars(self, *args, **kwargs) -> list:
+        return []
+
+    def add(self, *args, **kwargs) -> None:
+        return None
 
 
 @pytest.mark.asyncio

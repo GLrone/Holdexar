@@ -32,7 +32,11 @@ from sqlalchemy import select
 
 from app.domains.proxies.kernel_release import MIHOMO_VERSION
 from app.domains.proxies.subscription_secret import open_url, seal_url, url_matches
-from app.domains.proxypool.models import SubscriptionSnapshot, node_fingerprint
+from app.domains.proxypool.models import (
+    SubscriptionSnapshot,
+    is_info_placeholder,
+    node_fingerprint,
+)
 
 # UA 必须与内核拉取 provider 时同款：面板按 UA 分流订阅格式，不含 clash 关键字会
 # 回落 base64 节点表，个别机场（已验证）对非 clash UA 直接 404。
@@ -400,7 +404,11 @@ def parse_nodes(raw: bytes, fmt: str) -> list[dict]:
     if isinstance(doc.get("proxy-providers"), dict) and not doc.get("proxies"):
         raise UnsupportedFormatError(FORMAT_PROVIDER_YAML)
     px = doc.get("proxies")
-    nodes = [p for p in px if isinstance(p, dict) and p.get("name")] if isinstance(px, list) else []
+    nodes = [
+        p for p in px
+        if isinstance(p, dict) and p.get("name")
+        and not is_info_placeholder(str(p["name"]))
+    ] if isinstance(px, list) else []
     if not nodes:
         raise EmptyNodeSetError(fmt)
     return nodes

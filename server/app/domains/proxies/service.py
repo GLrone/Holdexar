@@ -579,6 +579,10 @@ async def refresh_clash_subscription(sub_id: int) -> dict:
             logger.exception("[订阅刷新] 内核配置更新失败（沿用运行中的实例）")
     if not meta.get("cached"):
         await _mark_refreshed(sub_id)
+
+    # 重拉成功 → 池子学新内容：autoRefresh 关闭的订阅（限时订阅）不在周期
+    # 同步里，池子学新链接只走这条路（拉取 → 落快照 → 体检健康的候选自动转正）
+    asyncio.get_running_loop().create_task(_pool_sync_single(sub_id))
     return {
         "id": sub_id,
         "label": label,
@@ -590,6 +594,30 @@ async def refresh_clash_subscription(sub_id: int) -> dict:
         "restarted": restarted,
         "prunedLedger": pruned,
     }
+
+
+async def _pool_sync_single(sub_id: int) -> None:
+    """重拉成功后喂池子：拉取 → 落快照 → 体检健康的候选自动转正。
+
+    autoRefresh 关闭的订阅（限时订阅）不在周期同步里，池子学新链接只走
+    这条路。失败只留日志：下一次重拉是下一次机会。"""
+    try:
+        from app.core.config import get_settings
+        from app.core.database import get_session_factory
+        from app.domains.proxypool import bootstrap as _bs
+
+        async with get_session_factory()() as session:
+            result = await _bs.sync_subscriptions(
+                session, data_dir=get_settings().data_dir,
+                now=datetime.now(), only_sub_id=sub_id,
+            )
+            await session.commit()
+        logger.info(
+            "[池同步] 订阅 %s 重拉后池同步完成（转正即进池；保持候选 %d / 失败 %d）",
+            sub_id, len(result.skipped), len(result.failures),
+        )
+    except Exception:  # noqa: BLE001 —— 喂池失败不影响重拉事实
+        logger.exception("[池同步] 订阅 %s 重拉后池同步失败", sub_id)
 
 
 async def resolve_startable_clash(data_dir: Path, requested_id: int | None = None) -> dict:
@@ -1612,6 +1640,33 @@ async def _test_clash_nodes_impl(
             sub_id, ledger, results, node_names, now
         )
 
+        # ── 体检 → 池账本对齐：体检通过的健康出口节点立即进入池容量 ──
+        # 本轮结果 + 已落库的全部订阅结论一起对齐。体检探的是生产端点（L2）与
+        # 出口 IP（L1），比池内 L0 更强：命中节点按成功证据复活，出口 IP 直接
+        # 落进池账本，合格集/出口集变化只置既有的 rebuild_pending。
+        try:
+            from app.core.database import get_session_factory
+            from app.domains.proxypool.bridge import ingest_ledger, ingest_node_check
+            from app.domains.proxypool.scheduling import request_rebuild
+
+            async with get_session_factory()() as session:
+                fresh = await ingest_node_check(
+                    session, subscription_id=sub_id, results=results, now=now
+                )
+                ledger_hit = await ingest_ledger(session, now=now)
+                await session.commit()
+            if fresh.changed or ledger_hit.changed:
+                request_rebuild()
+            logger.info(
+                "[体检→池] 本轮命中 %d（复活 %d / 新出口 %d）| 账本命中 %d"
+                "（复活 %d / 新出口 %d，陈久跳过 %d）| 本轮未匹配 %d",
+                fresh.matched, fresh.activated, fresh.exit_ips_added,
+                ledger_hit.matched, ledger_hit.activated, ledger_hit.exit_ips_added,
+                ledger_hit.skipped_stale, len(fresh.unmatched),
+            )
+        except Exception:  # noqa: BLE001 —— 对齐失败不改体检结论
+            logger.exception("[体检→池] 体检结果对齐池账本失败（不影响节点账本）")
+
         # ── selector 自愈：当前选中节点已死 → 切最快健康节点 ──
         try:
             healthy = sorted(
@@ -1902,7 +1957,10 @@ async def maybe_run_clash_health_check(force: bool = False) -> str:
         if elapsed < timedelta(hours=HEALTH_INTERVAL_HOURS):
             return "throttled"
     try:
-        await test_clash_nodes()
+        # 体检覆盖订阅**全部**节点：冷却期节点同样重测。20 并发探测下全量成本很低，
+        # 而「只探上一拍没冷却的那部分」会让被跳过节点的结论停留在过去，池容量随
+        # 冷却轮转无谓收缩。
+        await test_clash_nodes(probe_all=True)
         return "checked"
     except ValueError:
         return "skipped"

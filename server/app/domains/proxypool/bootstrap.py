@@ -41,7 +41,7 @@ import yaml
 from app.domains.proxies.models import ProxySubscription
 from app.domains.proxies.subscription_secret import UNREADABLE_MESSAGE, open_url
 from app.domains.proxypool import events
-from app.domains.proxypool.admission import is_admitted
+from app.domains.proxypool.admission import auto_admit_healthy_candidate, is_admitted
 from app.domains.proxypool.exits import select_exit_slots
 from app.domains.proxypool.health import latest_l0_delays
 from app.domains.proxypool.pool import (
@@ -116,6 +116,7 @@ async def sync_subscriptions(
     kernel_proxy: str | None = None,
     pool_proxy: str | None = None,
     only_auto: bool = False,
+    only_sub_id: int | None = None,
 ) -> SyncResult:
     """订阅 → 快照 → Registry。**Runtime 层不参与，也拿不到 subscription URL。**
 
@@ -134,7 +135,11 @@ async def sync_subscriptions(
     if kernel_proxy is None:
         kernel_proxy = default_kernel_proxy()
     subs = await subscription_sources(session)
-    if only_auto:
+    if only_sub_id is not None:
+        # 单订阅口径（手动重拉喂池子）：无视 autoRefresh 开关——用户点了重拉
+        # 就是明确要这条订阅的最新内容进池
+        subs = [s for s in subs if s.id == only_sub_id]
+    elif only_auto:
         # 关掉自动更新的订阅不参与本轮：限时订阅只能在窗口内下载、下载后可长期
         # 使用，每轮都撞一次注定失败的抓取只会刷出噪音 FAILED。手动重拉不受此限。
         auto_subs = [s for s in subs if _auto_refresh_on(s)]
@@ -175,11 +180,23 @@ async def sync_subscriptions(
                         session, subscription_id=sub_id, snapshot=snap, now=now
                     )
                 else:
-                    skipped.append(sub_id)
-                    logger.info(
-                        "[同步] 订阅 %s 为 CANDIDATE：快照已落盘（%s，%d 条），不进 Registry",
-                        sub_id, snap.sha256[:10], len(nodes),
+                    # 候选订阅的健康自动转正：最近一次体检有可用节点即进池，
+                    # 准入依据是体检事实而不是人工点头（快照刚落盘，转正 apply 的就是它）
+                    admitted = await auto_admit_healthy_candidate(
+                        session, subscription_id=sub_id, data_dir=data_dir, now=now
                     )
+                    if admitted is not None:
+                        logger.info(
+                            "[同步] 订阅 %s 体检健康（可用 %s）→ 自动转正进池（快照 %s，%d 条）",
+                            sub_id, (sub.last_stats or {}).get("alive"),
+                            snap.sha256[:10], len(nodes),
+                        )
+                    else:
+                        skipped.append(sub_id)
+                        logger.info(
+                            "[同步] 订阅 %s 保持候选（体检无可用节点或未体检）：快照已落盘（%s，%d 条），不进 Registry",
+                            sub_id, snap.sha256[:10], len(nodes),
+                        )
         except Exception as exc:  # noqa: BLE001 —— 单条订阅失败不阻断其它
             message = str(exc)[:500] or type(exc).__name__
             # savepoint 已把本条目回滚掉；失败用 Core UPDATE 记录，**不碰已过期的 ORM
