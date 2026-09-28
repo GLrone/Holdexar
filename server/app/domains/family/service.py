@@ -243,6 +243,73 @@ async def _fetch_player_details(token: str, steamids: list[str]) -> dict[str, di
     return out
 
 
+async def _fetch_member_countries(steamids: list[str]) -> dict[str, str]:
+    """成员资料国家（ISteamUser/GetPlayerSummaries 的 loccountrycode）。
+
+    该端点是成员国家（ISO 两字码）的唯一权威来源，需要 Steam Web API Key
+    （设置项 account.steam_api_key，可选）：未配置 Key / 网络 / Key 失效时
+    返回 {}，成员地区判定落到「未设置」，不阻断同步。
+    """
+    if not steamids:
+        return {}
+    # 凭据键经 get_secret_value 读取（落库为密文，get_value 只回密文本体）
+    api_key = (await settings_service.get_secret_value("account.steam_api_key", "")) or ""
+    if not api_key:
+        return {}
+    try:
+        from app.domains.account.steam_wallet import fetch_player_states
+
+        states = await fetch_player_states(
+            steamids, api_key, proxy_url=await _strategy_proxy()
+        )
+    except Exception:  # noqa: BLE001 —— 国家补齐失败不阻断同步
+        logger.info("[family] 成员资料国家获取失败（不阻断同步）")
+        return {}
+    return {
+        sid: s["country"]
+        for sid, s in states.items()
+        if s.get("country")
+    }
+
+
+# 资料国家读路径回填的冷却：网络断/限流时不让每次 status 都空烧外网
+_COUNTRY_BACKOFF_SECONDS = 600
+_country_backoff_until: datetime | None = None
+
+
+async def _backfill_member_countries(row: FamilyGroup) -> None:
+    """成员资料国家缺失时的读路径自愈（status 专用）。
+
+    同步时的国家拉取只有一次机会，赶上网络抖动/限流就缺失到下次同步；
+    这里在 status 读路径低频补齐（10 分钟冷却，失败静默），拿到即写回
+    快照，下次 status 直接命中。
+    """
+    global _country_backoff_until
+    members = [
+        m for m in (row.members_json or [])
+        if isinstance(m, dict) and m.get("steamid")
+    ]
+    if not members or all(m.get("loccountrycode") for m in members):
+        return
+    now = datetime.utcnow()
+    if now < (_country_backoff_until or now):
+        return
+    countries = await _fetch_member_countries([str(m["steamid"]) for m in members])
+    if not countries:
+        _country_backoff_until = now + timedelta(seconds=_COUNTRY_BACKOFF_SECONDS)
+        return
+    for m in members:
+        m["loccountrycode"] = m.get("loccountrycode") or countries.get(str(m["steamid"]))
+    try:
+        async with get_session_factory()() as session:
+            fresh = await session.get(FamilyGroup, row.steamid)
+            if fresh is not None:
+                fresh.members_json = members
+                await session.commit()
+    except Exception:  # noqa: BLE001 —— 写回失败不影响本次返回
+        logger.exception("[family] 成员资料国家写回失败")
+
+
 async def fetch_member_owned_games(token: str, steamid: str) -> list[dict]:
     """拉某成员已购库（家庭组内公开资料即可读，access_token 通道免 Key）。"""
     try:
@@ -280,32 +347,23 @@ async def get_primary_steamid() -> str:
     raise ValueError("尚未绑定 Steam Cookie，无法发现家庭组（请先在「我」页绑定）")
 
 
-async def sync_family_group() -> dict:
-    """用主账号 Cookie 的 webapi_token 拉家庭组并自动补齐成员。
+async def _sync_group_for_account(steam_id: str, cookies: str, now: datetime) -> dict:
+    """单账号家庭组发现：拉组 → 成员档案补齐 → 成员入追踪 → 快照按账号落行。
 
-    - 成员自动写入 tracked_accounts（kinds: wishlist+owned），复用既有同步链路；
-    - 快照落 family_groups 表（前端家庭页数据源）；
-    - 返回 {joined, familyName, members: [{steamid, role, personaName, avatarUrl}]}。
+    返回 {steamid, joined, familyName?, memberCount?}；Cookie 无 webapi_token
+    或 Steam 请求失败向上抛，由 sync_family_group 按账号隔离。
     """
-    # 主账号 Cookie（家庭组跟随主账号，不随当前账号切换）
-    from app.domains.account import service as account_service
-
-    cookies = await account_service.get_primary_cookies()
     token = extract_webapi_token(cookies)
     if not token:
         raise ValueError("Cookie 中无法提取 webapi_token，请重新绑定 Steam Cookie")
 
-    primary = await get_primary_steamid()
     group = await _fetch_family_group(token)
-    now = datetime.utcnow()
-
     if not group.get("joined"):
-        await _save_group(primary, {
+        await _save_group(steam_id, {
             "joined": False, "fetch_ok": True, "error": None, "members": [],
             "family_name": None, "family_groupid": None,
         }, now)
-        return {"joined": False, "steamid": primary,
-                "message": "当前账号未加入家庭组（Steam 官方上限 6 人，可在 Steam 客户端创建/加入）"}
+        return {"steamid": steam_id, "joined": False, "memberCount": 0}
 
     raw_members: list[dict] = group["members"]
     details = await _fetch_player_details(
@@ -319,7 +377,13 @@ async def sync_family_group() -> dict:
             "role": m.get("role", ""),
             "personaName": d.get("persona_name", ""),
             "avatarUrl": _norm_avatar(d.get("avatar_url", "")),
+            "loccountrycode": None,
         })
+
+    # 成员资料国家（地区判定源，见 _fetch_member_countries；失败留空不阻断）
+    countries = await _fetch_member_countries([m["steamid"] for m in members])
+    for m in members:
+        m["loccountrycode"] = countries.get(m["steamid"])
 
     # GetPlayerLinkDetails 的 public_data 已不返 avatar URL（只剩 sha_digest_avatar
     # 摘要），缺头像/昵称的成员走 miniprofile 通道补齐（失败静默，不阻断同步）
@@ -333,19 +397,51 @@ async def sync_family_group() -> dict:
             m["avatarUrl"] = m["avatarUrl"] or _norm_avatar(p.get("avatarUrl", ""))
 
     await _sync_members_to_accounts(members, now)
-    await _save_group(primary, {
+    await _save_group(steam_id, {
         "joined": True, "fetch_ok": True, "error": None, "members": members,
         "family_name": group.get("family_name"), "family_groupid": group["family_groupid"],
     }, now)
 
-    logger.info("家庭组同步成功：%s %d 人", group.get("family_name"), len(members))
-    return {
-        "joined": True,
-        "steamid": primary,
-        "familyGroupid": group["family_groupid"],
-        "familyName": group.get("family_name"),
-        "members": members,
-    }
+    logger.info("家庭组同步成功：%s（%s）%d 人",
+                group.get("family_name"), steam_id, len(members))
+    return {"steamid": steam_id, "joined": True,
+            "familyName": group.get("family_name"), "memberCount": len(members)}
+
+
+async def sync_family_group(steam_id: str | None = None) -> dict:
+    """家庭组发现（多账号）：默认遍历全部绑定账号，steam_id 指定时只同步该账号。
+
+    - 每账号独立成败：单账号 Cookie 失效只记该条 error，不拖垮其他账号；
+    - 成员自动写入 tracked_accounts（kinds: wishlist+owned），多组成员按
+      steamid 去重，愿望单/已购/监控池按账号维度自然并集；
+    - 快照按账号落行（family_groups 主键即 steamid，一组一行）；
+    - 返回 {results: [...], synced, joined, failed}。
+    """
+    from app.domains.account import service as account_service
+
+    if steam_id:
+        cookies = await account_service.get_cookies_of(steam_id)
+        if not cookies or "steamLoginSecure" not in cookies:
+            raise ValueError(f"账号 {steam_id} 无可用登录 Cookie，请先绑定")
+        targets = [(steam_id, cookies)]
+    else:
+        targets = await account_service.list_bound_cookies()
+    if not targets:
+        raise ValueError("尚未绑定 Steam Cookie，无法发现家庭组（请先在「我」页绑定）")
+
+    now = datetime.utcnow()
+    results: list[dict] = []
+    for sid, cookies in targets:
+        try:
+            results.append(await _sync_group_for_account(sid, cookies, now))
+        except Exception as e:  # noqa: BLE001 —— 单账号失败隔离
+            # 异常 str 可能为空（部分网络异常无消息）：类型名保底，失败必须可读
+            logger.warning("[family] 账号 %s 家庭组同步失败：%s", sid, e)
+            results.append({"steamid": sid, "joined": False,
+                            "error": (str(e) or type(e).__name__)[:200]})
+    joined = sum(1 for r in results if r.get("joined"))
+    failed = sum(1 for r in results if "error" in r)
+    return {"results": results, "synced": len(results), "joined": joined, "failed": failed}
 
 
 async def _save_group(primary: str, snap: dict, now: datetime) -> None:
@@ -413,6 +509,8 @@ async def _sync_members_to_accounts(members: list[dict], now: datetime) -> None:
 
 # app_settings 键：成员地区持久化 {steamid: region_code}（家庭页手动选择的落点）
 KEY_MEMBER_REGIONS = "family.member_regions"
+# 一次性清洗标记：首轮清掉历史整表落库写入的「cn」兜底条目后置位
+KEY_REGION_LEGACY_CLEANUP = "family.region_legacy_cleanup"
 
 
 # miniprofile 补齐失败的节流窗口：网络断时不让每个 status 请求都空烧外网
@@ -420,8 +518,8 @@ _AVATAR_BACKOFF_SECONDS = 60
 _avatar_backoff_until: datetime | None = None
 
 
-async def _backfill_member_avatars(members: list[dict], primary: str) -> list[dict]:
-    """成员头像/昵称兜底补齐（读路径自愈，get_status 专用）。
+async def _backfill_member_avatars(members: list[dict], owner_sid: str) -> list[dict]:
+    """成员头像/昵称兜底补齐（读路径自愈，组 payload 构建专用）。
 
     存量快照的头像缺失有两种成因：GetPlayerLinkDetails 的 public_data 早已
     不返 avatar URL（同步时 miniprofile 补齐又失败过）、或 members_json 里
@@ -465,7 +563,7 @@ async def _backfill_member_avatars(members: list[dict], primary: str) -> list[di
     # 写回快照（只更 members_json；失败不影响本次返回，下次再自愈）
     try:
         async with get_session_factory()() as session:
-            row = await session.get(FamilyGroup, primary)
+            row = await session.get(FamilyGroup, owner_sid)
             if row is not None:
                 row.members_json = members
                 await session.commit()
@@ -476,42 +574,200 @@ async def _backfill_member_avatars(members: list[dict], primary: str) -> list[di
 
 
 async def get_status() -> dict:
-    """家庭页数据：主账号 + 家庭组快照（无则 joined=False）。
+    """家庭页数据（多账号多组）：每个绑定账号一条组记录 + 跨组成员并集。
 
-    附加字段：
-    - walletRegion：主账号 Cookie 钱包派生的结算地区（币种反查 crawl_regions），
-      前端用于「主账号地区自动切换」；无钱包快照时为 None。
-    - memberRegions：各成员手动选择的地区（持久化），前端恢复现场。
+    - groups[i].members 附带服务端判定的 region/regionSource（判定链见
+      _resolve_member_regions），前端与赠礼弹窗直接取用、不再自行推导；
+    - 顶层 members = 各已加入组成员按 steamid 去重的并集（跨组消费方用）；
+    - walletRegion：主账号钱包结算区（读账号行快照）。
     """
-    try:
-        primary = await get_primary_steamid()
-    except ValueError as e:
-        return {"bound": False, "message": str(e), "members": []}
+    from app.domains.account import service as account_service
+
+    accounts = await account_service.list_accounts()
+    if not accounts:
+        return {
+            "bound": False,
+            "message": "尚未绑定 Steam 账号（请在「我」页绑定后同步家庭组）",
+            "primarySteamid": "",
+            "groups": [],
+            "members": [],
+            "memberRegions": {},
+        }
+
+    rows: dict[str, FamilyGroup] = {}
+    async with get_session_factory()() as session:
+        for a in accounts:
+            row = await session.get(FamilyGroup, a["steam_id"])
+            if row is not None:
+                rows[a["steam_id"]] = row
+
+    # 资料国家回填先行（写回快照），随后的 profile 映射才能取到
+    for row in rows.values():
+        await _backfill_member_countries(row)
+
+    saved_regions = await settings_service.get_value(KEY_MEMBER_REGIONS, None)
+    manual = (
+        {str(k): str(v) for k, v in saved_regions.items()}
+        if isinstance(saved_regions, dict) else {}
+    )
+    manual = await _cleanup_legacy_member_regions(manual)
+    wallet = await account_service.wallet_regions()
+
+    # 资料国家：各组 members_json 的 loccountrycode（同步时随成员档案落库）
+    profile: dict[str, str] = {}
+    for row in rows.values():
+        for m in (row.members_json or []):
+            if isinstance(m, dict) and m.get("steamid") and m.get("loccountrycode"):
+                profile.setdefault(str(m["steamid"]), str(m["loccountrycode"]))
+
+    all_sids: list[str] = []
+    for row in rows.values():
+        all_sids += [
+            str(m.get("steamid")) for m in (row.members_json or []) if m.get("steamid")
+        ]
+    for a in accounts:
+        if a["steam_id"] not in all_sids:
+            all_sids.append(a["steam_id"])
+    resolved = await _resolve_member_regions(all_sids, manual, wallet, profile)
+
+    groups: list[dict] = []
+    flat: dict[str, dict] = {}
+    for a in accounts:
+        sid = a["steam_id"]
+        row = rows.get(sid)
+        members = await _group_members_payload(row, resolved) if row else []
+        groups.append({
+            "steamid": sid,
+            "accountName": a.get("persona_name") or "",
+            "synced": row is not None,
+            "joined": bool(row.member_count) if row else None,
+            "familyName": row.family_name if row else None,
+            "familyGroupid": row.family_groupid if row else None,
+            "updatedAt": row.updated_at.isoformat() if row and row.updated_at else None,
+            "lastError": row.last_error if row else None,
+            "members": members,
+        })
+        for m in members:
+            flat.setdefault(m["steamid"], m)
+
+    primary_sid = accounts[0]["steam_id"]
+    healed = await settings_service.get_value(KEY_MEMBER_REGIONS, None)
+    return {
+        "bound": True,
+        "primarySteamid": primary_sid,
+        "steamid": primary_sid,
+        "joined": any(g["joined"] for g in groups),
+        "walletRegion": wallet.get(primary_sid),
+        "memberRegions": healed if isinstance(healed, dict) else {},
+        "groups": groups,
+        "members": list(flat.values()),
+        "message": None,
+        "lastError": rows[primary_sid].last_error if primary_sid in rows else None,
+    }
+
+
+def _country_to_region(country: str | None, valid: set[str]) -> str | None:
+    """资料国家（ISO 3166-1 两字码）→ 区服 code（小写）；不在区服表内为 None。"""
+    code = (country or "").strip().lower()
+    return code if code in valid else None
+
+
+async def _region_code_set() -> set[str]:
+    """区服 code 全集（小写）——资料国家映射的合法性边界。"""
+    from app.domains.regions.models import CrawlRegion
 
     async with get_session_factory()() as session:
-        row = await session.get(FamilyGroup, primary)
-    wallet = await settings_service.get_value("account.wallet_snapshot", None)
-    saved_regions = await settings_service.get_value(KEY_MEMBER_REGIONS, None)
-    wallet_region = (
-        wallet.get("region_code") if isinstance(wallet, dict) else None
-    ) or None
-    member_regions = saved_regions if isinstance(saved_regions, dict) else {}
+        rows = (await session.execute(select(CrawlRegion.code))).all()
+    return {str(r[0]).strip().lower() for r in rows if r[0]}
 
-    base = {
-        "bound": True,
-        "steamid": primary,
-        "familyName": row.family_name if row else None,
-        "familyGroupid": row.family_groupid if row else None,
-        "members": await _backfill_member_avatars(list(row.members_json or []), primary) if row else [],
-        "lastError": row.last_error if row else None,
-        "updatedAt": row.updated_at.isoformat() if row and row.updated_at else None,
-        "walletRegion": wallet_region,
-        "memberRegions": member_regions,
-    }
-    if row is None:
-        return {**base, "joined": False,
-                "members": [], "message": "尚未同步家庭组（点「同步家庭组」开始）"}
-    return {**base, "joined": bool(row.member_count)}
+
+async def _cleanup_legacy_member_regions(manual: dict[str, str]) -> dict[str, str]:
+    """memberRegions 一次性清洗：非绑定成员的「cn」条目不是手动意图。
+
+    成员地区的上报口径是逐成员合并，而历史数据是整表快照——未动手的成员
+    也带上了当时的 cn 兜底值。首轮把非绑定成员的 cn 条目清掉（绑定账号由
+    钱包结算区覆盖，无需清洗），此后 KV 里只存真手动值，不再清洗。
+    """
+    if not manual:
+        return manual
+    done = await settings_service.get_value(KEY_REGION_LEGACY_CLEANUP, False)
+    if done:
+        return manual
+    from app.domains.account import service as account_service
+
+    bound_ids = {a["steam_id"] for a in await account_service.list_accounts()}
+    cleaned = {k: v for k, v in manual.items() if v != "cn" or k in bound_ids}
+    await settings_service.set_value(KEY_REGION_LEGACY_CLEANUP, True)
+    if cleaned != manual:
+        await settings_service.set_value(KEY_MEMBER_REGIONS, cleaned)
+        logger.info("[family] 成员地区一次性清洗：%d 条兜底值移除", len(manual) - len(cleaned))
+    return cleaned
+
+
+async def _resolve_member_regions(
+    sids: list[str],
+    manual: dict[str, str],
+    wallet: dict[str, str],
+    profile: dict[str, str],
+) -> dict[str, dict]:
+    """成员地区判定（服务端单点，家庭页与赠礼弹窗共用）。
+
+    判定链：手动选择 > 钱包结算区（绑定账号快照，权威）> 资料国家
+    （loccountrycode 命中区服表才用）> 未设置（None，不兜底国区）。
+    memberRegions 中与钱包/资料判定矛盾的「cn」条目不作为手动意图——按
+    派生值呈现并从 KV 清除；其余条目一律尊重。返回 {steamid: {region,
+    regionSource}}。
+    """
+    valid = await _region_code_set()
+    resolved: dict[str, dict] = {}
+    stale: list[str] = []
+    for sid in sids:
+        m = (manual.get(sid) or "").strip().lower()
+        w = (wallet.get(sid) or "").strip().lower()
+        p = _country_to_region(profile.get(sid), valid)
+        derived = w or p
+        if m and m != "cn":
+            resolved[sid] = {"region": m, "regionSource": "manual"}
+            continue
+        if m == "cn" and derived and derived != m:
+            stale.append(sid)
+            m = ""
+        if w:
+            resolved[sid] = {"region": w, "regionSource": "wallet"}
+        elif p:
+            resolved[sid] = {"region": p, "regionSource": "profile"}
+        else:
+            resolved[sid] = {"region": m or None, "regionSource": "manual" if m else None}
+    if stale:
+        try:
+            await settings_service.set_value(
+                KEY_MEMBER_REGIONS,
+                {k: v for k, v in manual.items() if k not in stale},
+            )
+            logger.info("[family] 成员地区兜底残留清除 %d 个", len(stale))
+        except Exception:  # noqa: BLE001 —— 写回失败不影响本次返回
+            logger.exception("[family] 成员地区残留清除写库失败")
+    return resolved
+
+
+async def _group_members_payload(row: FamilyGroup, resolved: dict[str, dict]) -> list[dict]:
+    """组内成员 payload：头像/昵称兜底补齐 + 判定地区附加。"""
+    members = await _backfill_member_avatars(list(row.members_json or []), row.steamid)
+    out: list[dict] = []
+    for m in members:
+        if not isinstance(m, dict) or not m.get("steamid"):
+            continue
+        sid = str(m["steamid"])
+        r = resolved.get(sid) or {}
+        out.append({
+            "steamid": sid,
+            "role": str(m.get("role", "")),
+            "personaName": m.get("personaName", "") or m.get("persona_name", ""),
+            "avatarUrl": m.get("avatarUrl", "") or m.get("avatar_url", ""),
+            "region": r.get("region"),
+            "regionSource": r.get("regionSource"),
+        })
+    return out
 
 
 # ─── 家庭共享库（GetSharedLibraryApps + 成员游玩聚合）──────────
@@ -548,19 +804,20 @@ async def _fetch_shared_library(token: str, family_groupid: str) -> list[dict]:
     return out
 
 
-async def fetch_family_library() -> dict:
+async def fetch_family_library(steam_id: str | None = None) -> dict:
     """家庭库全量数据（共享库 ∪ 成员已购/游玩聚合 + games 表元数据/CN 价）。
 
-    链路：主账号 Cookie → GetFamilyGroupForUser（组 id+成员）→
+    steam_id 缺省 = 主账号；多账号下每组各拉各的（该账号 Cookie → 其所在组）。
+    链路：账号 Cookie → GetFamilyGroupForUser（组 id+成员）→
     GetSharedLibraryApps（共享清单）→ 每成员 GetOwnedGames（appid+rtime_last_played+
     playtime_forever，含 include_appinfo=1：Steam 直接带 name 作兜底；其他成员
     只回 appid 时 name 为 None）→ games 表 LEFT JOIN 补名称/封面/CN 现价/史低
     （name 双兜底：games 表名 or Steam 返回名）。
     """
-    # 主账号 Cookie（家庭库跟随主账号）
     from app.domains.account import service as account_service
 
-    cookies = await account_service.get_primary_cookies()
+    owner = steam_id or await get_primary_steamid()
+    cookies = await account_service.get_cookies_of(owner)
     token = extract_webapi_token(cookies)
     if not token:
         raise ValueError("Cookie 中无法提取 webapi_token，请重新绑定 Steam Cookie")
@@ -658,14 +915,10 @@ async def fetch_family_library() -> dict:
     # GetPlayerLinkDetails 的 public_data 早已不返 avatar URL（见下方同步链路
     # 同款注释），头像从 family_groups.members_json（同步时 miniprofile 补齐过）
     # 合并；仍缺的走 miniprofile 实时补（失败静默）
-    try:
-        _primary = await get_primary_steamid()
-    except ValueError:
-        _primary = ""
     _fam_row = None
-    if _primary:
+    if owner:
         async with get_session_factory()() as session:
-            _fam_row = await session.get(FamilyGroup, _primary)
+            _fam_row = await session.get(FamilyGroup, owner)
     _saved = {
         str(m.get("steamid")): m
         for m in ((_fam_row.members_json if _fam_row else None) or [])
@@ -728,10 +981,10 @@ async def fetch_family_library() -> dict:
     # 游玩明细随组档案落库（play_json）：库快照表只有 app 级字段，成员游玩
     # 明细此前不落盘——实时聚合一失败、落到快照兜底路径，memberPlay 恒空，
     # 游玩动态就只剩空态（「经常失败」的另一半）。成功即存，兜底也有数据。
-    if _primary and member_play:
+    if owner and member_play:
         try:
             async with get_session_factory()() as session:
-                row = await session.get(FamilyGroup, _primary)
+                row = await session.get(FamilyGroup, owner)
                 if row is not None:
                     row.play_json = member_play
                     await session.commit()
@@ -847,13 +1100,16 @@ async def _upsert_library_snapshot(family_groupid: str, games: list[dict]) -> No
     logger.info("[family] 家庭库快照已落库：%d app（组 %s）", len(games), family_groupid)
 
 
-async def _library_from_snapshot(family_groupid: str | None = None) -> dict | None:
+async def _library_from_snapshot(
+    family_groupid: str | None = None, owner_sid: str | None = None
+) -> dict | None:
     """从快照表重建家庭库 payload（实时聚合失败/启动首开时的兜底数据源）。
 
     返回与 fetch_family_library 同构的 dict（memberPlay 从 family_groups
     的 play_json 快照合并——实时聚合成功时随组落库，兜底路径也有游玩数据）；
     无快照/未指定组且无任何组时返回 None。
-    成员档案从 family_groups 快照读（members_json 内含 persona/avatar）。
+    成员档案从 family_groups 快照读（owner_sid 缺省主账号；members_json 内含
+    persona/avatar）。
     """
     from .models import FamilyLibrarySnapshot
 
@@ -874,12 +1130,12 @@ async def _library_from_snapshot(family_groupid: str | None = None) -> dict | No
         groupid = rows[0].family_groupid
 
         # 成员档案（family_groups 快照；_save_group 存 camelCase 字段）。
-        # 完全离线可用：主账号读不到（Cookie 摘除/账号表空）时跳过档案，
+        # 完全离线可用：账号读不到（Cookie 摘除/账号表空）时跳过档案，
         # 由快照 owners 全集推成员身份（无名档，前端用 steamid 尾号展示）。
         members_out: list[dict] = []
         fam_row = None
         try:
-            primary = await get_primary_steamid()
+            primary = owner_sid or await get_primary_steamid()
         except ValueError:
             primary = ""
         if primary:
@@ -955,33 +1211,36 @@ async def _library_from_snapshot(family_groupid: str | None = None) -> dict | No
     }
 
 
-def _start_library_refresh() -> None:
-    """后台拉新（幂等：已在刷则跳过）。成功替换缓存；失败保留旧条目并把
-    时间戳前移——否则过期条目会**每个请求**都触发一次注定失败的 HTTPS
-    尝试（Cookie 失效时是常态），白白占用代理配额。"""
+def _start_library_refresh(steam_id: str) -> None:
+    """后台拉新（幂等：同账号已在刷则跳过）。成功替换该账号缓存；失败保留
+    旧条目并把时间戳前移——否则过期条目会**每个请求**都触发一次注定失败的
+    HTTPS 尝试（Cookie 失效时是常态），白白占用代理配额。"""
     global _LIBRARY_REFRESHING, _LIBRARY_REFRESH_TASK
 
-    if _LIBRARY_REFRESHING:
+    if steam_id in _LIBRARY_REFRESHING:
         return
-    _LIBRARY_REFRESHING = True
+    _LIBRARY_REFRESHING.add(steam_id)
 
     async def _bg() -> None:
-        global _LIBRARY_CACHE, _LIBRARY_REFRESHING
         try:
-            _LIBRARY_CACHE = (datetime.utcnow(), await fetch_family_library())
+            _LIBRARY_CACHE[steam_id] = (
+                datetime.utcnow(), await fetch_family_library(steam_id),
+            )
         except Exception as e:  # noqa: BLE001 —— 后台刷新失败保留旧条目
             logger.info("[family] 后台刷新失败（保留现缓存）：%s", e)
-            if _LIBRARY_CACHE:
-                _LIBRARY_CACHE = (datetime.utcnow(), _LIBRARY_CACHE[1])
+            old = _LIBRARY_CACHE.get(steam_id)
+            if old:
+                _LIBRARY_CACHE[steam_id] = (datetime.utcnow(), old[1])
         finally:
-            _LIBRARY_REFRESHING = False
+            _LIBRARY_REFRESHING.discard(steam_id)
 
-    _LIBRARY_REFRESH_TASK = asyncio.create_task(_bg())
+    _LIBRARY_REFRESH_TASK[steam_id] = asyncio.create_task(_bg())
 
 
-async def cached_family_library() -> dict:
+async def cached_family_library(steam_id: str | None = None) -> dict:
     """家庭库快照（进程内 TTL 缓存，stale-while-revalidate）——前端 tabs 共用。
 
+    缓存按账号分键（多账号 = 多家庭组，各拉各的）；steam_id 缺省 = 主账号。
     取数顺序（修复「首开等 HTTPS」——实时聚合要逐成员调 GetOwnedGames，
     代理 HTTPS 秒级起步，首开不能干等）：
     1. 内存缓存 <TTL：直接回；
@@ -994,38 +1253,50 @@ async def cached_family_library() -> dict:
     路径写缓存的话，Cookie 失效期间每个请求都要先付一次完整的失败
     HTTPS 往返才回退快照（2.1~3.3s/次）——这也是「板块切换 1-2 秒」的主因。
     """
-    global _LIBRARY_CACHE
+    sid = steam_id or await get_primary_steamid()
     now = datetime.utcnow()
-    if _LIBRARY_CACHE:
+    cached = _LIBRARY_CACHE.get(sid)
+    if cached:
         # 快照命中的条目用更短的 TTL：快照是陈旧数据，而失败往往是瞬时的
         ttl = (
             _SNAPSHOT_TTL_SECONDS
-            if _LIBRARY_CACHE[1].get("fromSnapshot")
+            if cached[1].get("fromSnapshot")
             else _LIVE_TTL_SECONDS
         )
-        age = (now - _LIBRARY_CACHE[0]).total_seconds()
+        age = (now - cached[0]).total_seconds()
         if age < ttl:
-            return _LIBRARY_CACHE[1]
-        _start_library_refresh()
-        return _LIBRARY_CACHE[1]
-    snap = await _library_from_snapshot()
-    if snap is not None:
-        _LIBRARY_CACHE = (now, snap)
-        _start_library_refresh()
-        return snap
+            return cached[1]
+        _start_library_refresh(sid)
+        return cached[1]
+
+    # 快照兜底只认本账号所在组：组行存在但未加入（无 groupid）时不许回落
+    # 到其他组的快照，直接走实时拉取（未加入的报错语义由其如实给出）
+    groupid: str | None = None
+    async with get_session_factory()() as session:
+        row = await session.get(FamilyGroup, sid)
+    if row is not None:
+        groupid = row.family_groupid
+    if groupid:
+        snap = await _library_from_snapshot(groupid, owner_sid=sid)
+        if snap is not None:
+            _LIBRARY_CACHE[sid] = (now, snap)
+            _start_library_refresh(sid)
+            return snap
     try:
-        data = await fetch_family_library()
-        _LIBRARY_CACHE = (now, data)
+        data = await fetch_family_library(sid)
+        _LIBRARY_CACHE[sid] = (now, data)
         return data
     except Exception as e:  # noqa: BLE001 —— 无快照可兜底，如实上抛
         logger.warning("[family] 实时聚合失败且无快照可兜底：%s", e)
         raise
 
 
-def invalidate_library_cache() -> None:
-    """清空家庭库缓存（强制刷新入口用）。"""
-    global _LIBRARY_CACHE
-    _LIBRARY_CACHE = None
+def invalidate_library_cache(steam_id: str | None = None) -> None:
+    """清空家庭库缓存（强制刷新入口用）；steam_id 指定时只清该账号。"""
+    if steam_id:
+        _LIBRARY_CACHE.pop(steam_id, None)
+    else:
+        _LIBRARY_CACHE.clear()
 
 
 # 实时聚合成活时的缓存时长
@@ -1035,9 +1306,9 @@ _LIVE_TTL_SECONDS = 300
 # 密集重复请求，又不会让 Cookie 修好后继续吃陈旧数据太久。
 _SNAPSHOT_TTL_SECONDS = 60
 
-_LIBRARY_CACHE: tuple[datetime, dict] | None = None
-_LIBRARY_REFRESHING: bool = False
-_LIBRARY_REFRESH_TASK: asyncio.Task | None = None  # 防 create_task 被 GC 提前取消
+_LIBRARY_CACHE: dict[str, tuple[datetime, dict]] = {}
+_LIBRARY_REFRESHING: set[str] = set()
+_LIBRARY_REFRESH_TASK: dict[str, asyncio.Task] = {}  # 防 create_task 被 GC 提前取消
 
 
 # 未收录补爬节流：同一批缺口不因页面反复刷新而重复起任务
@@ -1076,24 +1347,24 @@ async def _kick_uncrawled_games(appids: list[int]) -> None:
         logger.info("[family] 愿望单未收录补爬未触发（%d 款）：%s", len(appids), e)
 
 
-async def family_wishlist() -> dict:
+async def family_wishlist(steam_id: str | None = None) -> dict:
     """家庭成员愿望单聚合（wishlist_items × games 表本地 join，无需 Cookie）。
 
-    数据源：family_groups 快照成员的 active 且未购（owned=False）愿望单行，
-    按 appid 聚合想要人数；games 表补名称/封面/类型/发行日/CN 现价/折扣。
-    未同步家庭组时回退全部 tracked_accounts（含主账户，行为诚实标注）。
+    数据源：steam_id 所在组快照成员（缺省主账号）的 active 且未购（owned=False）
+    愿望单行，按 appid 聚合想要人数；games 表补名称/封面/类型/发行日/CN 现价/
+    折扣。组未同步时回退全部 tracked_accounts（含绑定账号，行为诚实标注）。
     """
     from app.domains.wishlist.models import WishlistItem
 
     try:
-        primary = await get_primary_steamid()
+        owner = steam_id or await get_primary_steamid()
     except ValueError:
-        primary = ""
+        owner = ""
     members: list[str] = []
     family_name: str | None = None
-    if primary:
+    if owner:
         async with get_session_factory()() as session:
-            row = await session.get(FamilyGroup, primary)
+            row = await session.get(FamilyGroup, owner)
         if row and row.members_json:
             members = [str(m.get("steamid")) for m in row.members_json if m.get("steamid")]
             family_name = row.family_name
@@ -1150,13 +1421,21 @@ async def family_wishlist() -> dict:
 
 
 async def save_member_regions(regions: dict[str, str]) -> dict:
-    """保存成员地区选择（家庭页手动切换的持久化落点）。
+    """合并保存成员地区选择（家庭页手动切换的持久化落点）。
 
-    regions 形如 {"76561198...": "in"}；值为空串的键剔除（清除该成员覆盖）。
+    regions 形如 {"76561198...": "region_code"}，按键合并进存量 KV：值非空
+    覆写，空串清除该成员覆盖（前端只上报被改动的成员，不做整表提交）。
     """
-    cleaned = {str(k): str(v) for k, v in (regions or {}).items() if str(v or "").strip()}
-    await settings_service.set_value(KEY_MEMBER_REGIONS, cleaned)
-    return cleaned
+    saved = await settings_service.get_value(KEY_MEMBER_REGIONS, None)
+    merged: dict[str, str] = dict(saved) if isinstance(saved, dict) else {}
+    for k, v in (regions or {}).items():
+        value = str(v or "").strip()
+        if value:
+            merged[str(k)] = value
+        else:
+            merged.pop(str(k), None)
+    await settings_service.set_value(KEY_MEMBER_REGIONS, merged)
+    return merged
 
 
 async def get_member_regions() -> dict:

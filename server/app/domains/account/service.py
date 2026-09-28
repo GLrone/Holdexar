@@ -326,6 +326,47 @@ async def get_primary_cookies() -> str:
     return await ensure_live_session(row.steam_id, _stored_credential(row))
 
 
+async def get_cookies_of(steam_id: str) -> str:
+    """指定账号的当前可用登录 Cookie（家庭组/家庭库等按账号消费方专用）。
+
+    语义同 get_cookies：临期/过期且留有续期凭据时先换发新令牌；账号不存在
+    或无凭据返回空串，由消费方按「未绑定」处理。
+    """
+    row = await _get_row(steam_id)
+    if row is None:
+        return ""
+    return await ensure_live_session(row.steam_id, _stored_credential(row))
+
+
+async def list_bound_cookies() -> list[tuple[str, str]]:
+    """全部绑定账号的 (steam_id, 当前可用 Cookie)（多账号消费方逐账号取用）。
+
+    每账号独立续期；无凭据行跳过（该账号不参与家庭组等发现链路）。
+    """
+    out: list[tuple[str, str]] = []
+    for row in await _all_accounts():
+        stored = _stored_credential(row)
+        if not stored or "steamLoginSecure" not in stored:
+            continue
+        out.append((row.steam_id, await ensure_live_session(row.steam_id, stored)))
+    return out
+
+
+async def wallet_regions() -> dict[str, str]:
+    """各绑定账号钱包快照派生的结算区 {steamid: region_code}。
+
+    结算币种是唯一真源（_derive_region 反查区服），无快照/未判定的账号
+    不在表内。成员地区判定的权威输入之一。
+    """
+    out: dict[str, str] = {}
+    for row in await _all_accounts():
+        wallet = row.wallet_json if isinstance(row.wallet_json, dict) else None
+        code = (wallet or {}).get("region_code")
+        if code:
+            out[row.steam_id] = str(code)
+    return out
+
+
 # ── 绑定 / 切换 / 删除 ──────────────────────────────────────
 
 async def save_cookies(cookies_raw: str) -> dict:

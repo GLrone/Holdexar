@@ -880,22 +880,20 @@ function friendRegionFen(code: string): number | null {
   return rp.cnyFen
 }
 
-/** 家庭组快照（成员 + 各自区服 + 主账号钱包区）——赠礼弹窗首次打开时拉一次 */
+/** 家庭组快照（跨组成员并集 + 服务端判定区服）——赠礼弹窗首次打开时拉一次 */
 async function loadGiftFriends() {
   if (giftFriendsFetched) return
   giftFriendsFetched = true
   try {
     const st = await familyApi.status()
-    if (!st.joined || !st.members?.length) {
+    if (!st.members?.length) {
       giftFriends.value = []
       return
     }
-    const saved = st.memberRegions ?? {}
-    const walletRegion = st.walletRegion || ''
-    const rows: FriendGiftRow[] = st.members.map((m, i) => {
-      // 区服优先级对齐 family/Index.vue：主账号钱包判定 > 手动选择 > 默认 cn
-      const isPrimary = (st.steamid && m.steamid === st.steamid) || i === 0
-      const region = (isPrimary && walletRegion) || saved[m.steamid] || 'cn'
+    const rows: FriendGiftRow[] = st.members.map((m) => {
+      // 地区判定在服务端（手动 > 钱包结算区 > 资料国家）；未设置的成员
+      // 赠礼计价退国区基准（页面上仍可去家庭页手动指定）
+      const region = m.region || 'cn'
       return {
         steamid: m.steamid,
         name: m.personaName || '',
@@ -909,7 +907,7 @@ async function loadGiftFriends() {
         receiveReceiverPriced: false,
       }
     })
-    const primaryRow = rows.find((r) => r.steamid === st.steamid) ?? rows[0]!
+    const primaryRow = rows.find((r) => r.steamid === (st.primarySteamid || st.steamid)) ?? rows[0]!
     giftPrimarySteamid.value = primaryRow.steamid
     const primaryFen = friendRegionFen(primaryRow.region)
     for (const r of rows) {

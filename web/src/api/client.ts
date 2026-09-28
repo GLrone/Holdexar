@@ -334,19 +334,45 @@ export interface FamilyMemberItem {
   role: string
   personaName: string
   avatarUrl: string
+  /** 服务端判定的地区（手动 > 钱包结算区 > 资料国家）；null = 未设置 */
+  region: string | null
+  regionSource: 'manual' | 'wallet' | 'profile' | null
+}
+
+/** 一个绑定账号的家庭组记录（家庭组跟随该账号的 Cookie 发现） */
+export interface FamilyGroupStatus {
+  steamid: string
+  accountName: string
+  /** 是否同步过家庭组（false = 尚无快照行） */
+  synced: boolean
+  /** true=已加入 / false=确认未加入 / null=未同步 */
+  joined: boolean | null
+  familyName: string | null
+  familyGroupid: string | null
+  updatedAt: string | null
+  lastError: string | null
+  members: FamilyMemberItem[]
+}
+
+export interface FamilySyncResultItem {
+  steamid: string
+  joined: boolean
+  familyName?: string
+  memberCount?: number
+  error?: string
 }
 
 export interface FamilyStatus {
   bound: boolean
-  joined: boolean | null
+  primarySteamid: string
   steamid?: string
-  familyName?: string | null
-  familyGroupid?: string | null
+  /** 各已加入组成员按 steamid 去重的并集（赠礼等跨组消费方直接取用） */
   members: FamilyMemberItem[]
+  groups: FamilyGroupStatus[]
+  joined?: boolean
   message?: string
   lastError?: string | null
-  updatedAt?: string | null
-  /** 主账号 Cookie 钱包派生的结算地区（null=无快照） */
+  /** 主账号钱包结算区（兼容字段；成员地区以 members[].region 为准） */
   walletRegion?: string | null
   /** 成员手动选择的地区（持久化恢复现场） */
   memberRegions?: Record<string, string>
@@ -425,8 +451,11 @@ export interface FamilyWishlistPayload {
 export const familyApi = {
   resolve: (input: string) =>
     request<FamilyResolveResult>('GET', `/family/resolve${toQuery({ input })}`),
-  sync: () =>
-    request<{ joined: boolean; steamid?: string; familyName?: string | null; members: FamilyMemberItem[]; message?: string }>('POST', '/family/sync'),
+  sync: (steamId?: string) =>
+    request<{ results: FamilySyncResultItem[]; synced: number; joined: number; failed: number }>(
+      'POST',
+      `/family/sync${toQuery(steamId ? { steam_id: steamId } : {})}`,
+    ),
   status: () => request<FamilyStatus>('GET', '/family/status'),
   saveMemberRegions: (regions: Record<string, string>) =>
     request<{ ok: boolean; memberRegions: Record<string, string> }>(
@@ -434,9 +463,21 @@ export const familyApi = {
       '/family/member-regions',
       { regions },
     ),
-  library: () => request<FamilyLibraryPayload>('GET', '/family/library'),
-  refreshLibrary: () => request<FamilyLibraryPayload>('POST', '/family/library/refresh'),
-  wishlist: () => request<FamilyWishlistPayload>('GET', '/family/wishlist'),
+  library: (steamId?: string) =>
+    request<FamilyLibraryPayload>(
+      'GET',
+      `/family/library${toQuery(steamId ? { steam_id: steamId } : {})}`,
+    ),
+  refreshLibrary: (steamId?: string) =>
+    request<FamilyLibraryPayload>(
+      'POST',
+      `/family/library/refresh${toQuery(steamId ? { steam_id: steamId } : {})}`,
+    ),
+  wishlist: (steamId?: string) =>
+    request<FamilyWishlistPayload>(
+      'GET',
+      `/family/wishlist${toQuery(steamId ? { steam_id: steamId } : {})}`,
+    ),
 }
 
 // ─── games ───────────────────────────────────────────────

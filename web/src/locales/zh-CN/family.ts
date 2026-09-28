@@ -61,12 +61,18 @@ const family = {
   'family.regionPop.search': '搜索地区（名称 / 代码）…',
   'family.regionPop.empty': '没有匹配的地区',
 
-  /* 同步家庭组 */
+  /* 同步家庭组（多账号逐个发现） */
   'family.action.syncing': '同步中…',
   'family.action.sync': '⟳ 同步家庭组',
-  'family.sync.success': '家庭组「{name}」同步成功，{n} 名成员已自动追踪',
-  'family.sync.notJoined': '当前账号未加入家庭组',
+  'family.sync.all': '已同步 {n} 个家庭组，成员已自动追踪',
+  'family.sync.none': '绑定的账号均未加入 Steam 家庭组',
+  'family.sync.partial': '已同步 {joined} 个家庭组；{failed} 个账号同步失败，可稍后重试',
   'family.group.unnamed': '未命名',
+  'family.group.notJoined': '该账号未加入任何 Steam 家庭组（官方上限 6 人，可在 Steam 客户端创建或加入）',
+  'family.group.notSynced': '该账号尚未同步家庭组——点「同步家庭组」开始',
+
+  /* 成员地区（服务端判定：手动 > 钱包结算区 > 资料国家；未设置不兜底国区） */
+  'family.member.regionUnset': '地区未设置',
 
   /* 添加成员 */
   'family.add.placeholder': '添加成员：Steam 好友码（如 998167239）或 SteamID64，输入即识别',

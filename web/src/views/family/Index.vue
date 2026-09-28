@@ -1,12 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, type Component } from 'vue'
+import { computed, onMounted, ref, watch, type Component } from 'vue'
 import { flagUrl } from '@/api/regions'
 import { useRegionsStore } from '@/stores/regions'
 import { useFamilyStore } from '@/stores/familyLib'
-import { familyApi, watchPoolApi, type FamilyMemberItem } from '@/api/client'
+import { familyApi, watchPoolApi, type FamilyGroupStatus, type FamilyMemberItem } from '@/api/client'
 import { normalizeAvatarUrl } from '@/api/avatar'
 import { useI18n, type MessageKey } from '@/locales'
-import { HlPaneSwitch, HlTabs, message } from '@/components/ui'
+import { HlPaneSwitch, HlSelect, HlTabs, message } from '@/components/ui'
 import type { HlSelectOption, HlTabItem } from '@/components/ui'
 import FamContrib from './tabs/FamContrib.vue'
 // 增长趋势暂时隐藏：与入库热力图信息重叠，代码保留待回归
@@ -28,20 +28,62 @@ interface FamilyMember {
   avatarUrl: string
   role: 'primary' | 'family'
   friendCode: string
-  region: string
+  /** 服务端判定地区（手动 > 钱包 > 资料国家）；null = 未设置 */
+  region: string | null
+  regionSource: string | null
   contribution: number
   exclusive: number
   recent30: number
 }
 
 const members = ref<FamilyMember[]>([])
-const familyName = ref('')
 const familyBound = ref(false)
 const familyMessage = ref('')
 /** 家庭状态是否已成功取回。用于 onMounted 去重：本页每次进入都会重挂载，
  *  没有这个标记就会重打一次 /family/status（见下方 onMounted 的注释）。
  *  只在**成功**后置位——失败时留待下次进入重试。 */
 const familyLoaded = ref(false)
+
+/* ── 多家庭组：每个绑定账号一组，组切换连带成员清单与库聚合（store）── */
+const groups = ref<FamilyGroupStatus[]>([])
+const activeGroupSid = ref('')
+
+const activeGroup = computed(
+  () => groups.value.find((g) => g.steamid === activeGroupSid.value) ?? null,
+)
+const familyName = computed(() => activeGroup.value?.familyName || '')
+
+/** 组切换下拉（仅多组时出现）：组名 · 归属账号，组名缺失退「未命名」 */
+const groupOptions = computed<HlSelectOption[]>(() =>
+  groups.value.map((g) => ({
+    label: `${g.familyName || t('family.group.unnamed')} · ${g.accountName || g.steamid.slice(-4)}`,
+    value: g.steamid,
+  })),
+)
+
+/** 成员清单跟随当前组（region/regionSource 由服务端判定链给出） */
+function syncMembersFromGroup() {
+  const g = activeGroup.value
+  members.value = (g?.members ?? []).map((m: FamilyMemberItem, i: number) => ({
+    id: i + 1,
+    steamid: m.steamid,
+    name: m.personaName || '',
+    avatar: '',
+    avatarUrl: normalizeAvatarUrl(m.avatarUrl),
+    role: m.steamid === g?.steamid ? 'primary' : 'family',
+    friendCode: String(BigInt(m.steamid) - 76561197960265728n),
+    region: m.region,
+    regionSource: m.regionSource,
+    contribution: 0,
+    exclusive: 0,
+    recent30: 0,
+  }))
+}
+
+watch(activeGroupSid, () => {
+  syncMembersFromGroup()
+  void libStore.setActiveGroup(activeGroupSid.value)
+})
 
 /* ── 成员真实统计（familyLib store：独占贡献/近30日入库/库价值）──
    近30日 = 入库口径（timeAcquired，入库口径取 timeAcquired——lastPlayed 是游玩不是入库） */
@@ -79,45 +121,19 @@ function roleNarrative(m: FamilyMember) {
   return m.role === 'primary' ? t('family.role.primary') : t('family.role.familyMember')
 }
 
-/* ── 真数据源：GET /family/status（家庭组快照）── */
+/* ── 真数据源：GET /family/status（多账号多组）── */
 async function loadFamily() {
   try {
     const st = await familyApi.status()
     familyBound.value = st.bound
     familyMessage.value = st.message || ''
-    familyName.value = st.familyName || ''
-    // 主账号 Cookie 钱包派生的结算地区（币种反查区服，如 INR→印度）
-    const walletRegion = st.walletRegion || ''
-    const savedRegions = st.memberRegions || {}
-    if (st.members?.length) {
-      members.value = st.members.map((m: FamilyMemberItem, i: number) => {
-        // 地区优先级：钱包判定（仅 Cookie 归属主账号）> 手动选择持久化 > 默认 cn。
-        // 注意 Steam role 1=成年 2=儿童（全家多人都是 1），主账号唯一判定 =
-        // status.steamid（Cookie 归属账户），不能用 role。
-        const manual = savedRegions[m.steamid]
-        const isPrimary = (st.steamid && m.steamid === st.steamid) || i === 0
-        let region = manual || 'cn'
-        if (isPrimary && walletRegion) region = walletRegion
-        return {
-          id: i + 1,
-          steamid: m.steamid,
-          name: m.personaName || '',
-          avatar: '',
-          avatarUrl: normalizeAvatarUrl(m.avatarUrl),
-          role: isPrimary ? 'primary' : 'family',
-          friendCode: String(BigInt(m.steamid) - 76561197960265728n),
-          region,
-          contribution: 0,
-          exclusive: 0,
-          recent30: 0,
-        }
-      })
-      normalizeRoles()
-      // 主账号按钱包结算区自动对齐后，同步落库（保持 memberRegions 一致）
-      if (walletRegion && members.value[0]?.region === walletRegion) {
-        void persistRegions()
-      }
+    groups.value = st.groups ?? []
+    libStore.setGroups(groups.value)
+    if (!activeGroupSid.value || !groups.value.some((g) => g.steamid === activeGroupSid.value)) {
+      activeGroupSid.value = groups.value.find((g) => g.joined)?.steamid
+        ?? groups.value[0]?.steamid ?? ''
     }
+    syncMembersFromGroup()
     // 只在成功路径置位：失败时留 false，下次进入本页会重试
     familyLoaded.value = true
   } catch (e) {
@@ -125,13 +141,12 @@ async function loadFamily() {
   }
 }
 
-/* ── 同步家庭组：主账号 Cookie → GetFamilyGroupForUser → 成员自动补齐 ──
-   生命周期在 familyLib store（重入防护 + 完成消息入灵动岛）；这里只负责
-   同步成功后刷新页面自己的成员清单 */
+/* ── 同步家庭组（多账号逐个发现）── 生命周期在 familyLib store（重入防护
+   + 汇总消息）；完成后整页状态（组列表/成员/地区判定）重取 */
 const syncing = computed(() => libStore.syncing)
 async function syncFamily() {
-  const groupName = await libStore.syncFamily()
-  if (groupName) await loadFamily()
+  await libStore.syncFamily()
+  await loadFamily()
 }
 
 /* ── 添加成员输入框：好友码/SteamID64 实时解析预览 ── */
@@ -194,7 +209,8 @@ async function confirmAddMember() {
       avatarUrl: normalizeAvatarUrl(p.avatarUrl),
       role: 'family',
       friendCode: String(BigInt(p.steamid) - 76561197960265728n),
-      region: 'cn',
+      region: null,
+      regionSource: null,
       contribution: 0,
       exclusive: 0,
       recent30: 0,
@@ -330,16 +346,16 @@ function closeRegionPop() {
 
 function chooseRegion(m: FamilyMember, code: string | number) {
   m.region = String(code)
+  m.regionSource = 'manual'
   closeRegionPop()
-  void persistRegions()
+  void persistRegion(m.steamid, m.region)
 }
 
-/** 成员地区落库（手动切换 / 主账号钱包自动对齐后调用；失败静默不扰交互） */
-async function persistRegions() {
+/** 成员地区落库：只上报被改动的成员（后端按键合并；失败静默不扰交互）。
+    地区的自动判定（钱包/资料国家）在服务端完成，这里只落真手动值。 */
+async function persistRegion(sid: string, region: string | null) {
   try {
-    await familyApi.saveMemberRegions(
-      Object.fromEntries(members.value.map((m) => [m.steamid, m.region])),
-    )
+    await familyApi.saveMemberRegions({ [sid]: region ?? '' })
   } catch {
     /* 静默：下次切换重试 */
   }
@@ -443,20 +459,31 @@ const excludedBySteamid = computed(() => {
             </div>
           </div>
           <div class="fam-row__side">
-            <!-- 地区选择触发钮（二级窗见下方） -->
+            <!-- 地区选择触发钮（服务端判定地区；未设置 = 无旗文本态，二级窗见下方） -->
             <button
               type="button"
               class="fam-region-btn"
-              :class="{ 'is-open': popMember?.id === m.id }"
+              :class="{ 'is-open': popMember?.id === m.id, 'is-unset': !m.region }"
               @click.stop="openRegionPop(m, $event)"
             >
-              <img :src="flagUrl(m.region)" :alt="m.region" />
-              {{ regionName(m.region) }}
+              <template v-if="m.region">
+                <img :src="flagUrl(m.region)" :alt="m.region" />
+                {{ regionName(m.region) }}
+              </template>
+              <template v-else>{{ t('family.member.regionUnset') }}</template>
               <span class="car">▼</span>
             </button>
             <span class="fam-del" :title="t('family.member.remove')" @click="removeMember(m.id)">✕</span>
           </div>
         </div>
+      </div>
+
+      <!-- 组级状态提示（常驻）：确认未加入 / 尚未同步——不再是无声空列表 -->
+      <div v-if="familyBound && activeGroup && activeGroup.joined === false" class="fam-hint">
+        {{ t('family.group.notJoined') }}
+      </div>
+      <div v-else-if="familyBound && activeGroup && !activeGroup.synced" class="fam-hint">
+        {{ t('family.group.notSynced') }}
       </div>
 
       <!-- 地区选择二级窗：宽度 ≤ 模块宽；头部=正在修改的成员；搜索实时过滤；网格自适应 -->
@@ -480,7 +507,10 @@ const excludedBySteamid = computed(() => {
           <div class="fam-region-pop__who">
             <div class="fam-region-pop__name">{{ memberName(popMember) }}</div>
             <div class="fam-region-pop__sub">
-              {{ t('family.regionPop.who', { role: roleNarrative(popMember), region: regionName(popMember.region) }) }}
+              {{ t('family.regionPop.who', {
+                role: roleNarrative(popMember),
+                region: popMember.region ? regionName(popMember.region) : t('family.member.regionUnset'),
+              }) }}
             </div>
           </div>
         </div>
@@ -511,13 +541,19 @@ const excludedBySteamid = computed(() => {
       <!-- 未绑 Cookie / 未同步的引导横幅 -->
       <div v-if="familyMessage" class="fam-hint">{{ familyMessage }}</div>
 
-      <!-- 同步家庭组 + 添加成员（真数据链路入口） -->
+      <!-- 同步家庭组 + 组切换（多组时） + 添加成员（真数据链路入口） -->
       <div class="fam-add-row">
         <button class="fam-sync" :disabled="syncing" :aria-busy="syncing || undefined" @click="syncFamily">
           <span v-if="syncing" class="hl-spinner hl-spinner--inline" aria-hidden="true" />
           {{ syncing ? t('family.action.syncing') : t('family.action.sync') }}
         </button>
-        <span v-if="familyName" class="fam-group-tag">{{ familyName }}</span>
+        <HlSelect
+          v-if="groups.length > 1"
+          v-model="activeGroupSid"
+          :options="groupOptions"
+          class="fam-group-select"
+        />
+        <span v-else-if="familyName" class="fam-group-tag">{{ familyName }}</span>
         <input
           class="pxinput fam-add-input"
           :placeholder="t('family.add.placeholder')"
@@ -873,6 +909,17 @@ const excludedBySteamid = computed(() => {
 .fam-row[draggable]:active { cursor: grabbing; }
 .fam-row.is-dragging { opacity: 0.4; }
 .fam-row.is-dragover { box-shadow: inset 0 2px 0 var(--accent); }
+
+/* ── 地区触发钮：未设置 = 无旗虚线态（不冒充国区） ── */
+.fam-region-btn.is-unset {
+  border-style: dashed;
+  color: var(--text-faint);
+}
+
+/* ── 组切换下拉（多账号多组时出现在同步钮旁） ── */
+.fam-group-select {
+  width: 230px;
+}
 
 /* ── 地区触发钮 ── */
 .fam-region-btn {

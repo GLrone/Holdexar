@@ -46,12 +46,18 @@ const family: Partial<Record<MessageKey, string>> = {
   'family.regionPop.search': 'Search regions (name / code)…',
   'family.regionPop.empty': 'No matching regions',
 
-  /* Sync family group */
+  /* Sync family group (multi-account discovery) */
   'family.action.syncing': 'Syncing…',
   'family.action.sync': '⟳ Sync family group',
-  'family.sync.success': 'Family “{name}” synced — {n} members now tracked',
-  'family.sync.notJoined': 'This account has not joined a family group',
+  'family.sync.all': 'Synced {n} family group(s) — members now tracked',
+  'family.sync.none': 'None of the bound accounts is in a Steam family',
+  'family.sync.partial': 'Synced {joined} family group(s); {failed} account(s) failed — retry later',
   'family.group.unnamed': 'Unnamed',
+  'family.group.notJoined': 'This account is not in any Steam family (max 6 members — create or join one in the Steam client)',
+  'family.group.notSynced': 'Family not synced for this account yet — hit “Sync family group” to start',
+
+  /* Member region (server-resolved: manual > wallet > profile country; no CN fallback) */
+  'family.member.regionUnset': 'Region unset',
 
   /* Add member */
   'family.add.placeholder': 'Add member: Steam friend code (e.g. 998167239) or SteamID64 — resolved as you type',
