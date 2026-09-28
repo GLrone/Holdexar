@@ -169,6 +169,55 @@ export const useProxyTasksStore = defineStore('proxyTasks', () => {
     }
   }
 
+  /* ── 全部订阅更新（store 承载：切页不丢进度，灵动岛同步展示） ── */
+  const syncAll = ref<{ done: number; total: number } | null>(null)
+  const SYNC_ALL_KEY = 'sub-sync-all'
+
+  /**
+   * 顺序重拉全部 Clash 订阅：循环体在 store 里跑，离开页面照常推进，
+   * 灵动岛任务位全程展示「正在更新订阅 done/total」。单条失败不中断，
+   * 收口给汇总气泡。返回失败条数（0 = 全部成功）。
+   */
+  async function startSyncAll(
+    subs: { id: number; label: string | null }[],
+  ): Promise<number> {
+    if (syncAll.value !== null || subs.length === 0) return 0
+    syncAll.value = { done: 0, total: subs.length }
+    beginTask(
+      SYNC_ALL_KEY,
+      t('proxies.sub.syncAllRunning', { done: 0, total: subs.length }),
+      { percent: 0, to: '/proxies' },
+    )
+    let failed = 0
+    for (let i = 0; i < subs.length; i++) {
+      updateTask(
+        SYNC_ALL_KEY,
+        t('proxies.sub.syncAllRunning', { done: i, total: subs.length }),
+        Math.round((i / subs.length) * 100),
+      )
+      try {
+        await proxiesApi.syncSubscription(subs[i].id)
+      } catch (e) {
+        failed += 1
+        message.error(
+          t('proxies.sub.syncAllOneFailed', {
+            name: subs[i].label ?? `#${subs[i].id}`,
+            error: e instanceof Error ? e.message : String(e),
+          }),
+        )
+      }
+      syncAll.value = { done: i + 1, total: subs.length }
+    }
+    endTask(SYNC_ALL_KEY)
+    if (failed === 0) {
+      message.success(t('proxies.sub.syncAllDone', { total: subs.length }))
+    } else {
+      message.error(t('proxies.sub.syncAllPartial', { failed }))
+    }
+    syncAll.value = null
+    return failed
+  }
+
   return {
     clashTest,
     kernelDownloading,
@@ -176,12 +225,14 @@ export const useProxyTasksStore = defineStore('proxyTasks', () => {
     kernelPhase,
     kernelVia,
     kernelSource,
+    syncAll,
     adoptTest,
     attach,
     startTest,
     clearTest,
     beginKernelWatch,
     startKernelWatch,
+    startSyncAll,
     stopKernelWatch,
     attachKernel,
   }
