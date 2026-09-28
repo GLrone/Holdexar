@@ -167,25 +167,22 @@ async def _run_transfer(
     raise SessionRefreshError(f"Cookie 下发失败：{last}")
 
 
-async def refresh_login_cookies(
-    cookies_raw: str, *, proxy_url: str | None = None, timeout: float = REFRESH_TIMEOUT
+async def web_cookies_from_refresh_token(
+    refresh_token: str,
+    steam_id: str,
+    *,
+    proxy_url: str | None = None,
+    timeout: float = REFRESH_TIMEOUT,
+    inherited: dict[str, str] | None = None,
 ) -> str:
-    """用续期凭据换一组新的 web Cookie，返回整串（键序与入库口径一致）。
+    """用续期凭据走 finalize 两跳换一组 web Cookie，返回整串（键序与入库口径一致）。
 
-    失败一律抛 SessionRefreshError：调用方保持原 Cookie，并把「登录已过期」
-    交给用户面处理，不把续期失败混进网络故障计数。Steam 可能同时轮换续期
-    凭据，新值一并落库（旧值随后失效）。
+    入参是裸 JWT 凭据与 SteamID64；inherited 携带沿用值（steamCountry /
+    steamRememberLogin）。Steam 可能同时轮换续期凭据，新值一并写入结果；
+    未轮换时凭据本身（`<steamid>||<JWT>` 形态）充当 steamRefresh_steam。
+    失败一律抛 SessionRefreshError。
     """
-    jar = parse_cookie_str(cookies_raw)
-    refresh_token = refresh_token_of(cookies_raw)
-    if not refresh_token:
-        raise SessionRefreshError("缺少续期凭据 steamRefresh_steam（登录时未勾选「记住我」）")
-    steam_id = steam_id_from_cookies(cookies_raw) or _owner_and_token(
-        jar.get(REFRESH_COOKIE, "")
-    )[0]
-    if not steam_id:
-        raise SessionRefreshError("无法从 Cookie 解析 SteamID64")
-
+    inherited = inherited or {}
     session_id = secrets.token_hex(12)
     async with httpx.AsyncClient(
         timeout=timeout, proxy=proxy_url, follow_redirects=True
@@ -231,11 +228,45 @@ async def refresh_login_cookies(
     if not access_value:
         raise SessionRefreshError("续期响应未下发新的 steamLoginSecure")
 
+    refresh_value = values.get(REFRESH_COOKIE) or inherited.get(REFRESH_COOKIE, "")
+    if not refresh_value:
+        # finalize 未轮换凭据时，传入的 nonce 即长命续期凭据
+        refresh_value = f"{steam_id}||{refresh_token}"
     merged = {
         SESSION_COOKIE: session_id,
-        COUNTRY_COOKIE: jar.get(COUNTRY_COOKIE, ""),
+        COUNTRY_COOKIE: inherited.get(COUNTRY_COOKIE, ""),
         ACCESS_COOKIE: access_value,
-        REFRESH_COOKIE: values.get(REFRESH_COOKIE) or jar.get(REFRESH_COOKIE, ""),
-        REMEMBER_COOKIE: jar.get(REMEMBER_COOKIE, ""),
+        REFRESH_COOKIE: refresh_value,
+        REMEMBER_COOKIE: inherited.get(REMEMBER_COOKIE, ""),
     }
     return "; ".join(f"{k}={v}" for k, v in merged.items() if v)
+
+
+async def refresh_login_cookies(
+    cookies_raw: str, *, proxy_url: str | None = None, timeout: float = REFRESH_TIMEOUT
+) -> str:
+    """用本地存储 Cookie 里的续期凭据换一组新的 web Cookie。
+
+    失败一律抛 SessionRefreshError：调用方保持原 Cookie，并把「登录已过期」
+    交给用户面处理，不把续期失败混进网络故障计数。
+    """
+    jar = parse_cookie_str(cookies_raw)
+    refresh_token = refresh_token_of(cookies_raw)
+    if not refresh_token:
+        raise SessionRefreshError("缺少续期凭据 steamRefresh_steam（登录时未勾选「记住我」）")
+    steam_id = steam_id_from_cookies(cookies_raw) or _owner_and_token(
+        jar.get(REFRESH_COOKIE, "")
+    )[0]
+    if not steam_id:
+        raise SessionRefreshError("无法从 Cookie 解析 SteamID64")
+    return await web_cookies_from_refresh_token(
+        refresh_token,
+        steam_id,
+        proxy_url=proxy_url,
+        timeout=timeout,
+        inherited={
+            COUNTRY_COOKIE: jar.get(COUNTRY_COOKIE, ""),
+            REFRESH_COOKIE: jar.get(REFRESH_COOKIE, ""),
+            REMEMBER_COOKIE: jar.get(REMEMBER_COOKIE, ""),
+        },
+    )

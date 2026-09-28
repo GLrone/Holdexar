@@ -4,13 +4,12 @@
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from . import service
+from . import login, service
 
 logger = logging.getLogger(__name__)
 
@@ -63,9 +62,8 @@ async def list_accounts() -> list[dict]:
 async def save_cookies(payload: SteamCookiesPayload) -> AccountStatus:
     """绑定 / 换绑 Cookie（upsert 账号 + 置当前账号）并拉起全量数据拉取。
 
-    新 SteamID = 新增账号；已有 SteamID = 该账号换绑 Cookie。均置为当前账号。
-    绑定响应内同步试抓钱包（顶栏余额要立刻可见），随后**后台依次**拉全
-    该账号数据（愿望单/已购 → 账单），见 `_post_bind_fetch`。
+    完整绑定链见 `service.bind_account`（落库 → 追踪注册 → 立即试抓钱包
+    → 后台全量拉取），与账号密码登录共用。
     """
     raw = (payload.cookies or "").strip()
     if not raw:
@@ -74,62 +72,15 @@ async def save_cookies(payload: SteamCookiesPayload) -> AccountStatus:
         raise HTTPException(400, "Cookie 中缺少 steamLoginSecure，请复制登录后的完整 Cookie")
 
     try:
-        result = await service.save_cookies(raw)
+        bound = await service.bind_account(raw)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
-    # 注册愿望单追踪（游戏数/愿望单数计数来源；失败不阻断）
-    await service.after_bind(result["steam_id"])
-
-    # 立即试抓（失败不阻断保存：可能只是当前网络不通）
-    sync = await service.sync_wallet(force=True)
-    if not sync.get("ok"):
-        logger.info("[account] Cookie 保存成功但首次抓取失败：%s", sync.get("error"))
-
-    # 绑定后置全量拉取：后台任务**依次**抓全该账号数据，不阻塞绑定响应。
-    # 只主账号触发账单同步会使用户看到「绑了但游戏库/账单不来」。依次口径：
-    #   ① 愿望单 + 已购库（sync_account：差异入库 + 新增条目按自动价格链
-    #      开关即时首爬，与 15min 定时同步同口径）；
-    #   ② 账单（跟随**主账号**：bills 表无 steamid 维度，混流即数据污染，
-    #      绑二号/切号不触发；主账号换绑时重拉一次）。
-    steam_id = result["steam_id"]
-    is_primary = steam_id == await service.get_primary_steam_id()
-
-    async def _post_bind_fetch() -> None:
-        try:
-            from app.core.scheduler import price_auto_enabled
-            from app.domains.wishlist import service as wishlist_service
-
-            auto_crawl = await price_auto_enabled()
-            r = await wishlist_service.sync_account(steam_id, auto_crawl=auto_crawl)
-            logger.info(
-                "[account] 绑定后同步 %s：愿望单新增 %s 款 / 已购新增 %s 款（活跃 %s）",
-                steam_id, r.get("added"), r.get("addedOwned"), r.get("active"),
-            )
-        except Exception:  # noqa: BLE001 —— 失败由 15min 定时同步兜底
-            logger.exception("[account] 绑定后愿望单/已购同步异常（定时任务将兜底）")
-
-        if not is_primary:
-            return
-        try:
-            from app.domains.bills import service as bills_service
-
-            r = await bills_service.sync_bills(force=True)
-            if r.get("ok"):
-                logger.info(
-                    "[account] 绑定后账单同步：history %s 行 / licenses %s 行",
-                    r.get("historyRows"), r.get("licenseRows"),
-                )
-            elif r.get("status") not in ("no_cookie", "busy"):
-                logger.info("[account] 绑定后账单同步失败：%s", r.get("error"))
-        except Exception:  # noqa: BLE001 —— 失败由 30min 定时同步兜底
-            logger.exception("[account] 绑定后账单同步异常（定时任务将兜底）")
-
-    asyncio.get_running_loop().create_task(_post_bind_fetch())
-
     status = await service.get_status()
-    status["sync_error"] = "" if sync.get("ok") else sync.get("error", "未知错误")
-    status["message"] = result.get("message", "")
+    status["sync_error"] = (
+        "" if bound["sync"].get("ok") else bound["sync"].get("error", "未知错误")
+    )
+    status["message"] = bound["result"].get("message", "")
     return AccountStatus(**status)
 
 
@@ -167,3 +118,45 @@ async def sync_wallet() -> AccountStatus:
     status = await service.get_status()
     status["sync_error"] = "" if sync.get("ok") else sync.get("error", "未知错误")
     return AccountStatus(**status)
+
+
+# ── 应用内账号密码登录（Steam 认证 API 通道，见 login.py） ─────────────────
+
+
+class LoginStartPayload(BaseModel):
+    account_name: str
+    password: str
+
+
+class LoginCodePayload(BaseModel):
+    code: str
+
+
+@router.post("/login/start")
+async def login_start(payload: LoginStartPayload) -> dict:
+    """发起账号密码登录；成功后经二次验证与轮询自动完成绑定（登录即生效）。"""
+    result = await login.start_login(payload.account_name, payload.password)
+    if result.get("busy"):
+        raise HTTPException(409, result.get("error", "已有登录进行中"))
+    return result
+
+
+@router.get("/login/status")
+async def login_status() -> dict:
+    """当前登录会话状态快照（前端轮询）。"""
+    return login.login_status()
+
+
+@router.post("/login/code")
+async def login_code(payload: LoginCodePayload) -> dict:
+    """提交 Steam Guard 验证码（手机令牌或邮箱验证码）。"""
+    result = await login.submit_guard_code(payload.code)
+    if not result.get("ok") and result.get("state", {}).get("state") != login.STATE_AWAITING_CODE:
+        raise HTTPException(409, result.get("error", "当前没有等待验证码的登录"))
+    return result
+
+
+@router.post("/login/cancel")
+async def login_cancel() -> dict:
+    """取消当前登录会话。"""
+    return login.cancel_login()

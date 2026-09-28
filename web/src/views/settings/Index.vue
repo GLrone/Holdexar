@@ -1,12 +1,14 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
 import { currencyName } from '@/api/currencies'
 import {
+  accountLoginApi,
   notificationsApi,
   settingsApi,
   systemApi,
+  type LoginSessionState,
   type NotificationPrefs,
   type NotificationPrefsUpdate,
   type NotificationStats,
@@ -393,11 +395,11 @@ function reportBindResult() {
 }
 
 /* ── 绑定风险弹窗 ────────────────────────────────────────────
-   每次绑定动作（手动粘贴 / 桌面端一键登录）都会先弹；标红同意勾选框
+   每次绑定动作（账号密码登录 / 手动粘贴）都会先弹；标红同意勾选框
    勾选后确定键才可用，每次打开重新勾选、不做停留时长强制。确定后才
-   继续原流程——'auto' 才是「后续的登录窗口」（桌面端 start_steam_login
-   子窗口），'manual' 继续提交已粘贴的 Cookie。 */
-type RiskNextAction = 'auto' | 'manual'
+   继续原流程——'login' 走应用内账号密码登录，'manual' 提交已粘贴的
+   Cookie。 */
+type RiskNextAction = 'login' | 'manual'
 
 /* 弹窗正文条目：每条 = 加粗关键词(lead) + 短说明(rest)，扫加粗词即可抓住重点；
    首条（凭据加密保存）是核心风险，danger 色强调。常量只存词条 key 不存译文
@@ -412,6 +414,7 @@ const RISK_ITEMS: RiskItem[] = [
   { lead: 'settings.risk.item2Lead', rest: 'settings.risk.item2Rest' },
   { lead: 'settings.risk.item3Lead', rest: 'settings.risk.item3Rest' },
   { lead: 'settings.risk.item4Lead', rest: 'settings.risk.item4Rest' },
+  { lead: 'settings.risk.item5Lead', rest: 'settings.risk.item5Rest' },
 ]
 const LEAK_ITEMS: RiskItem[] = [
   { lead: 'settings.risk.leak1Lead', rest: 'settings.risk.leak1Rest' },
@@ -433,7 +436,7 @@ function openRiskDialog(action: RiskNextAction) {
 function riskConfirm() {
   if (!riskConsent.value) return
   riskDialogOpen.value = false
-  if (riskNextAction.value === 'auto') void autoFetchCookie()
+  if (riskNextAction.value === 'login') void startPasswordLogin()
   else void bindCookie()
 }
 
@@ -455,46 +458,138 @@ async function bindCookie() {
   }
 }
 
-/* 桌面端自动抓取：弹出 Steam 登录子窗口，登录成功后由 pywebview
-   读取 WebView2 Cookie（含 httpOnly 的 steamLoginSecure）自动回传。
-   steam_id/is_new 是桌面端从 steamLoginSecure 解析的账号判定结果
-   （登录的是哪个号 / 新账号还是已有账号换绑）。 */
-type SteamLoginResult = { ok: boolean; cookies?: string; error?: string; steam_id?: string; is_new?: boolean }
-const desktopApi = (): { startSteamLogin?: () => Promise<SteamLoginResult> } | undefined =>
-  (window as unknown as { pywebview?: { api?: { start_steam_login?: () => Promise<SteamLoginResult> } } })
-    .pywebview?.api
+/* ── 应用内账号密码登录：后端直调 Steam 认证 API，状态机经 /account/login/*
+   轮询驱动；登录成功即由后端完成绑定（钱包试抓 + 全量数据后台拉取）。
+   会话在后端存续，切页回来凭 status 快照恢复界面。 ── */
+const loginAccount = ref('')
+const loginPassword = ref('')
+const loginState = ref<LoginSessionState | null>(null)
+const loginCodeInput = ref('')
+const loginCodeError = ref('')
+const loginCodeAccepted = ref(false)
+let loginTimer: number | null = null
 
-async function autoFetchCookie() {
-  const api = desktopApi()
-  if (!api?.start_steam_login) {
-    message.info(t('settings.toast.desktopOnly'))
-    return
-  }
-  cookieSaving.value = true
-  message.info(t('settings.toast.loginOpened'))
-  try {
-    const res = await api.start_steam_login()
-    if (res?.ok && res.cookies) {
-      // 已识别身份时先亮"是哪个号"（新账号 vs 换绑），绑定结果随后汇报
-      if (res.steam_id) {
-        const shortId = res.steam_id.slice(-10)
-        message.info(
-          res.is_new === false
-            ? t('settings.toast.rebindDetected', { id: shortId })
-            : t('settings.toast.accountRecognized', { id: shortId }),
-        )
-      }
-      await accountStore.bindCookies(normalizeCookieRaw(res.cookies))
-      reportBindResult()
-    } else {
-      message.warning(res?.error || t('settings.toast.cookieFetchFailed'))
-    }
-  } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
-  } finally {
-    cookieSaving.value = false
+const LOGIN_BUSY_STATES = new Set(['signing', 'awaiting_code', 'awaiting_confirmation', 'finalizing'])
+const loginActive = computed(() => !!loginState.value && LOGIN_BUSY_STATES.has(loginState.value.state))
+
+function stopLoginPolling() {
+  if (loginTimer !== null) {
+    window.clearInterval(loginTimer)
+    loginTimer = null
   }
 }
+
+function startLoginPolling() {
+  stopLoginPolling()
+  loginTimer = window.setInterval(void refreshLoginState, 1000)
+}
+
+async function refreshLoginState() {
+  try {
+    const st = await accountLoginApi.status()
+    loginState.value = st
+    if (st.state === 'done') {
+      stopLoginPolling()
+      message.success(t('settings.steam.loginDone'))
+      loginAccount.value = ''
+      loginCodeInput.value = ''
+      loginCodeError.value = ''
+      loginCodeAccepted.value = false
+      await accountStore.load()
+      window.setTimeout(() => {
+        if (loginState.value?.state === 'done') loginState.value = null
+      }, 4000)
+    } else if (st.state === 'idle') {
+      stopLoginPolling()
+      loginState.value = null
+    }
+  } catch {
+    /* 轮询单次网络抖动不打断登录，下一轮重试 */
+  }
+}
+
+async function startPasswordLogin() {
+  if (!loginAccount.value.trim() || !loginPassword.value) {
+    message.warning(t('settings.steam.loginAccountPlaceholder'))
+    return
+  }
+  loginState.value = { ...emptyLoginState, state: 'signing' }
+  try {
+    const res = await accountLoginApi.start(loginAccount.value.trim(), loginPassword.value)
+    loginPassword.value = ''
+    loginState.value = res.state
+    if (res.busy) {
+      message.warning(t('settings.steam.loginBusy'))
+      await refreshLoginState()
+    } else if (res.ok) {
+      startLoginPolling()
+    } else if (res.state.state === 'failed') {
+      stopLoginPolling()
+    }
+  } catch (e) {
+    loginState.value = null
+    message.error(e instanceof Error ? e.message : String(e))
+  }
+}
+
+const emptyLoginState: LoginSessionState = {
+  state: 'idle',
+  message: '',
+  error: '',
+  code_hint: '',
+  started_at: '',
+  updated_at: '',
+}
+
+async function submitLoginCode() {
+  if (!loginCodeInput.value.trim()) return
+  loginCodeError.value = ''
+  try {
+    const res = await accountLoginApi.code(loginCodeInput.value)
+    loginState.value = res.state
+    if (res.ok) {
+      loginCodeInput.value = ''
+      loginCodeAccepted.value = true
+    } else {
+      loginCodeError.value = res.error || ''
+    }
+  } catch (e) {
+    loginCodeError.value = e instanceof Error ? e.message : String(e)
+  }
+}
+
+async function cancelLoginFlow() {
+  stopLoginPolling()
+  try {
+    await accountLoginApi.cancel()
+  } catch {
+    /* 取消失败无需阻断界面复位 */
+  }
+  loginState.value = null
+  loginCodeInput.value = ''
+  loginCodeError.value = ''
+  loginCodeAccepted.value = false
+}
+
+const loginStateTip = computed(() => {
+  const st = loginState.value
+  if (!st) return ''
+  if (st.state === 'signing') return t('settings.steam.loginSigning')
+  if (st.state === 'awaiting_confirmation') {
+    return loginCodeAccepted.value
+      ? t('settings.steam.loginConfirmWaitCode')
+      : t('settings.steam.loginConfirmWait')
+  }
+  if (st.state === 'finalizing') return t('settings.steam.loginFinalizing')
+  if (st.state === 'done') return t('settings.steam.loginDone')
+  return ''
+})
+
+const loginCodeHint = computed(() =>
+  loginState.value?.code_hint === 'email'
+    ? t('settings.steam.loginCodeHintEmail')
+    : t('settings.steam.loginCodeHintTotp'),
+)
 
 async function resyncWallet() {
   cookieSaving.value = true
@@ -603,7 +698,13 @@ onMounted(() => {
   void settingsStore.load()
   void load()
   void loadNotifications()
+  /* 登录会话在后端存续：进页先对状态快照，进行中就恢复状态卡并续上轮询 */
+  void refreshLoginState().then(() => {
+    if (loginActive.value) startLoginPolling()
+  })
 })
+
+onUnmounted(stopLoginPolling)
 </script>
 
 <template>
@@ -622,6 +723,77 @@ onMounted(() => {
         <div class="section-title">{{ t('settings.section.steamAccount') }}</div>
         <div class="section-desc">{{ t('settings.steam.desc') }}</div>
 
+        <!-- 应用内账号密码登录：后端直调 Steam 认证 API，二次验证与应用内完成 -->
+        <div class="settings-row login-block">
+          <div class="settings-row__line">
+            <HlInput
+              v-model="loginAccount"
+              :placeholder="t('settings.steam.loginAccountPlaceholder')"
+              :disabled="loginActive"
+              class="login-block__input"
+            />
+            <HlInput
+              v-model="loginPassword"
+              type="password"
+              :placeholder="t('settings.steam.loginPassword')"
+              :disabled="loginActive"
+              class="login-block__input"
+              @keydown.enter="openRiskDialog('login')"
+            />
+            <HlButton
+              art="outline"
+              tone="blue"
+              size="sm"
+              :disabled="loginActive || cookieSaving"
+              :loading="loginActive"
+              @click="openRiskDialog('login')"
+            >
+              <HlIcon v-if="!loginActive" name="zap" />
+              {{ t('settings.steam.autoFetch') }}
+            </HlButton>
+          </div>
+
+          <!-- 登录状态卡：进行中 / 失败各有形态，成功后自动收起 -->
+          <div v-if="loginState && loginState.state !== 'idle'" class="login-state" :class="`is-${loginState.state}`">
+            <template v-if="loginState.state === 'awaiting_code'">
+              <div class="login-state__title">{{ t('settings.steam.loginCodeTitle') }}</div>
+              <div class="login-state__hint">{{ loginCodeHint }}</div>
+              <div class="settings-row__line">
+                <HlInput
+                  v-model="loginCodeInput"
+                  :placeholder="t('settings.steam.loginCodePlaceholder')"
+                  class="login-block__code"
+                  @keydown.enter="submitLoginCode"
+                />
+                <HlButton art="outline" tone="green" size="sm" @click="submitLoginCode">
+                  {{ t('settings.steam.loginCodeSubmit') }}
+                </HlButton>
+                <HlButton variant="text" size="sm" @click="cancelLoginFlow">
+                  {{ t('settings.steam.loginCancel') }}
+                </HlButton>
+              </div>
+              <div v-if="loginCodeError" class="login-state__error">{{ loginCodeError }}</div>
+            </template>
+
+            <template v-else-if="loginState.state === 'failed'">
+              <div class="login-state__error">{{ loginState.error }}</div>
+              <HlButton variant="text" size="sm" @click="cancelLoginFlow">
+                {{ t('settings.steam.loginFailedRetry') }}
+              </HlButton>
+            </template>
+
+            <template v-else>
+              <div class="login-state__hint">
+                <span class="login-state__spin" aria-hidden="true"></span>
+                {{ loginStateTip }}
+              </div>
+              <HlButton variant="text" size="sm" @click="cancelLoginFlow">
+                {{ t('settings.steam.loginCancel') }}
+              </HlButton>
+            </template>
+          </div>
+        </div>
+
         <div class="settings-row">
           <label class="hl-form-label">Steam Cookie</label>
           <div class="settings-row__line">
@@ -636,11 +808,6 @@ onMounted(() => {
               "
               style="max-width: 420px"
             />
-            <!-- 桌面端一键登录抓取：风险须知确认后才打开 Steam 登录子窗口 -->
-            <HlButton art="outline" tone="blue" size="sm" :disabled="cookieSaving" :loading="cookieSaving" @click="openRiskDialog('auto')">
-              <HlIcon v-if="!cookieSaving" name="zap" />
-              {{ t('settings.steam.autoFetch') }}
-            </HlButton>
             <HlButton
               v-if="!hasCookie"
               art="outline"
@@ -1352,6 +1519,80 @@ onMounted(() => {
 .account-summary__warn {
   color: var(--danger, #e74c3c);
   font-size: 13px;
+}
+
+/* ── 应用内账号密码登录 ── */
+.login-block {
+  gap: 8px;
+}
+
+.login-block__input {
+  max-width: 200px;
+}
+
+.login-block__code {
+  max-width: 140px;
+}
+
+/* 状态卡：左侧色条区分语义（蓝=进行中，绿=成功，红=失败） */
+.login-state {
+  border: 1px solid var(--border-soft, rgba(255, 255, 255, 0.12));
+  border-left: 3px solid var(--primary, #4a90d9);
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+  font-size: 13px;
+}
+
+.login-state.is-done {
+  border-left-color: var(--success, #4caf7d);
+}
+
+.login-state.is-failed {
+  border-left-color: var(--danger, #e74c3c);
+}
+
+.login-state__title {
+  font-weight: 700;
+}
+
+.login-state__hint {
+  color: var(--text-secondary, inherit);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.login-state__error {
+  color: var(--danger, #e74c3c);
+}
+
+/* 等待指示点：三拍呼吸，reduced-motion 下静止（总闸归零同样瞬时） */
+.login-state__spin {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--primary, #4a90d9);
+  animation: login-pulse calc(var(--duration-3, 1.2s) * var(--motion-scale, 1)) infinite;
+}
+
+@keyframes login-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .login-state__spin {
+    animation: none;
+  }
 }
 
 /* 账号区头部工具行：刷新余额靠右（与行内操作列同侧） */
