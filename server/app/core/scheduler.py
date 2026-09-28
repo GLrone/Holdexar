@@ -1055,13 +1055,15 @@ def _make_board_job(
 
     落池（boards.BOARDS[key].pool=True 的板：topsellers / popularnew /
     comingsoon）：本轮榜整批并入持久监控池（wishlist_service.
-    ensure_board_pool）——榜单游戏成为随全池轮刷新的监控条目；无绑定
-    账户（ValueError）静默跳过，反哺照常。specials 属临时队列
-    （pool=False）：只补游戏商店差集，不落监控池。
+    ensure_board_pool）——榜单游戏成为随全池轮刷新的监控条目（直挂
+    监控层 board 来源，不落账户名下、不要求绑定账户）。
 
-    反哺限量（backfill_limit）：首跑特惠差集可达千级（封顶拉榜 5000 条），
-    按 Steam 返回的热度序每轮限量消化（100 → specials 每 6h 一轮 = 400/天），
-    避免单轮 run_sequential 跑几千个 appid 挤占任务锁。
+    specials 不走本工厂：特惠+热门榜的去重爬取随价格轮尾段进行
+    （`_price_refresh_specs` 的 specials 段），避免与独立 job 双爬。
+
+    反哺限量（backfill_limit）：首跑反哺可达千级（热销榜封顶拉 500 条），
+    按 Steam 返回的热度序每轮限量消化，避免单轮 run_sequential 跑几千个
+    appid 挤占任务锁。
 
     record_preset=True（热销榜）：本轮榜整批登记进预设池清单
     （games/preset.py，随资产种子分发的初始游戏库来源之一）；登记只记档，
@@ -1089,7 +1091,7 @@ def _make_board_job(
             return
 
         # 落持久监控池：board.pool=True 的板本轮整批并入监控池（反复上榜
-        # 只补缺；已手动移除的条目不复活）。无账户/落池失败不阻断反哺。
+        # 只补缺；已手动移除的条目不复活）。落池失败不阻断反哺。
         if boards_mod.BOARDS[board_key].pool:
             from app.domains.wishlist import service as wishlist_service
 
@@ -1099,8 +1101,6 @@ def _make_board_job(
                     "[定时] %s 落监控池：新增 %d / 已在池 %d / 已移除跳过 %d",
                     board_key, landed["added"], landed["exists"], landed["skipped"],
                 )
-            except ValueError as e:
-                logger.info("[定时] %s 未落监控池（%s）——反哺照常", board_key, e)
             except Exception:  # noqa: BLE001
                 logger.exception("[定时] %s 落监控池失败（不阻断反哺）", board_key)
 

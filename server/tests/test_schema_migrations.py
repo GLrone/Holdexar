@@ -442,3 +442,162 @@ async def test_v8_fx_history_canonical(tmp_path: Path, monkeypatch) -> None:
         assert idx is not None, "唯一日索引 ux_frh_currency_date 未落位"
     finally:
         await engine.dispose()
+
+
+# v10：wishlist_items 项目旗标行退役（榜单落池 / 手动入池真身归监控层）。
+# 监控真身在 monitor_targets / monitor_sources / monitor_exclusions，账户侧
+# 统计（愿望单数 / 条目数）只认 Steam 账户事实行——项目旗标行清洗后，
+# 账户卡不再被榜单批次虚增。
+
+
+@pytest.mark.asyncio
+async def test_v10_retires_pool_flags(tmp_path: Path, monkeypatch) -> None:
+    """v9 时代存量库（user_version=9）首启补跑 v10：纯项目行删除（监控
+    真身补齐）、混合行只清旗标、移除行落排除、条目数重算。
+    **走真实迁移链**（v10 步骤就是生产那一条）。"""
+    db = tmp_path / "legacy.db"
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{db.as_posix()}", echo=False
+    )
+    monkeypatch.setattr(database_module, "get_engine", lambda: engine)
+    monkeypatch.setattr(
+        database_module,
+        "get_session_factory",
+        lambda: async_sessionmaker(engine, expire_on_commit=False),
+    )
+    # 迁移前形态：v9 时代库——项目旗标行挂在账户名下，版本账本停在 9
+    con = sqlite3.connect(str(db))
+    try:
+        con.execute(
+            "CREATE TABLE wishlist_items ("
+            " steamid VARCHAR(20), appid BIGINT, added_at DATETIME,"
+            " active BOOLEAN, owned BOOLEAN, manual BOOLEAN,"
+            " wishlisted BOOLEAN, manual_pool BOOLEAN, excluded BOOLEAN,"
+            " board_pool BOOLEAN, PRIMARY KEY (steamid, appid))"
+        )
+        con.execute(
+            "CREATE TABLE tracked_accounts ("
+            " steamid VARCHAR(20) PRIMARY KEY, item_count INTEGER)"
+        )
+        con.execute("INSERT INTO tracked_accounts VALUES ('1', 6)")
+        con.executemany(
+            "INSERT INTO wishlist_items VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("1", 100, 1, 0, 0, 1, 0, 0, 0),  # 纯愿望单：保留
+                ("1", 200, 1, 0, 0, 0, 0, 0, 1),  # 纯榜单：删行 + board 来源补齐
+                ("1", 300, 1, 1, 0, 0, 0, 0, 1),  # 已购 + 榜单混合：留行清旗标
+                ("1", 400, 0, 0, 0, 0, 0, 1, 1),  # 用户移出的榜单行：删行 + 排除
+                ("1", 500, 1, 0, 0, 0, 1, 0, 0),  # 纯手动入池：删行 + manual 来源
+                ("1", 600, 1, 0, 1, 0, 0, 0, 1),  # 星标 + 榜单混合：留行清旗标
+            ],
+        )
+        con.execute("PRAGMA user_version = 9")
+        con.commit()
+    finally:
+        con.close()
+
+    await database_module.init_db()
+    try:
+        assert _user_version(db) == database_module.SCHEMA_VERSION
+        con = sqlite3.connect(str(db))
+        try:
+            rows = {
+                r[0]: r[1:]
+                for r in con.execute(
+                    "SELECT appid, active, owned, manual, wishlisted,"
+                    " manual_pool, board_pool FROM wishlist_items"
+                ).fetchall()
+            }
+            board_sources = {
+                r[0]: r[1]
+                for r in con.execute(
+                    "SELECT target_id, active FROM monitor_sources"
+                    " WHERE source = 'board'"
+                ).fetchall()
+            }
+            manual_sources = {
+                r[0]
+                for r in con.execute(
+                    "SELECT target_id FROM monitor_sources WHERE source = 'manual'"
+                ).fetchall()
+            }
+            exclusions = {
+                r[0]
+                for r in con.execute(
+                    "SELECT target_id FROM monitor_exclusions WHERE active = 1"
+                ).fetchall()
+            }
+            states = {
+                r[0]: r[1]
+                for r in con.execute(
+                    "SELECT target_id, state FROM monitor_targets"
+                ).fetchall()
+            }
+            item_count = con.execute(
+                "SELECT item_count FROM tracked_accounts WHERE steamid = '1'"
+            ).fetchone()[0]
+        finally:
+            con.close()
+
+        # 混合行保留且旗标清零；纯项目行删除
+        assert set(rows) == {100, 300, 600}
+        assert rows[300][4] == 0 and rows[300][1] == 1, "已购行只清榜单旗标"
+        assert rows[600][4] == 0 and rows[600][2] == 1, "星标行只清榜单旗标"
+        assert rows[100][3] == 1, "愿望单事实行不动"
+        # 监控真身：项目条目全部补齐（来源激活），移除行落排除
+        assert states == {
+            200: "active", 300: "active",
+            500: "active", 600: "active", 400: "excluded",
+        }
+        assert board_sources == {200: 1, 300: 1, 600: 1}
+        assert 500 in manual_sources
+        assert exclusions == {400}
+        # 条目数回归账户事实口径：活跃账户行 100/300/600
+        assert item_count == 3
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_v11_adds_cycle_coverage_snapshot_column(tmp_path: Path, monkeypatch) -> None:
+    """v10 时代存量库（user_version=10）首启补跑 v11：price_cycles 补
+    coverage_json 列；**新装库**（create_all 已带列）重放不撞重复列名。
+    **走真实迁移链**（v11 步骤就是生产那一条）。"""
+    db = tmp_path / "legacy.db"
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{db.as_posix()}", echo=False
+    )
+    monkeypatch.setattr(database_module, "get_engine", lambda: engine)
+    monkeypatch.setattr(
+        database_module,
+        "get_session_factory",
+        lambda: async_sessionmaker(engine, expire_on_commit=False),
+    )
+    # 迁移前形态：v10 时代库——price_cycles 无 coverage_json，版本账本停在 10
+    con = sqlite3.connect(str(db))
+    try:
+        con.execute(
+            "CREATE TABLE price_cycles ("
+            " id INTEGER PRIMARY KEY, kind VARCHAR(20), status VARCHAR(20),"
+            " scope VARCHAR(20), expected_json JSON, specs_json JSON,"
+            " started_at DATETIME, running_at DATETIME, repairing_at DATETIME,"
+            " finalizing_at DATETIME, finished_at DATETIME, error TEXT)"
+        )
+        con.execute("PRAGMA user_version = 10")
+        con.commit()
+    finally:
+        con.close()
+
+    await database_module.init_db()
+    try:
+        assert _user_version(db) == database_module.SCHEMA_VERSION
+        con = sqlite3.connect(str(db))
+        try:
+            cols = {r[1] for r in con.execute("PRAGMA table_info(price_cycles)")}
+            assert "coverage_json" in cols
+            # 幂等重放：第二次 init_db 不得因列已存在而抛错
+        finally:
+            con.close()
+        await database_module.init_db()
+    finally:
+        await engine.dispose()

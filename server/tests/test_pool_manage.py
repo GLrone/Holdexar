@@ -1,13 +1,14 @@
 """监控池管理单元测试：条目增删（池页/导入）+ 愿望单成员标记 +
-同步免疫（excluded / manual_pool / board_pool）+ 榜单落池 +
-爬取第一优先级（mock，不触网）。
+同步免疫（excluded 挡复活）+ 榜单落池 + 爬取第一优先级（mock，不触网）。
 
-监控池四来源语义：
-- 监控条目 = wishlist_items 活跃行（池内所有游戏均为必须爬取的对象）；
+监控池两路来源语义：
+- 账户同步：wishlist_items 活跃行（Steam 账户事实，愿望单/已购）；
+- 项目自加：星标关注 / 手动入池 / 榜单落池直挂 monitor_sources 来源，
+  不落账户名下；
 - 愿望单（wishlisted）与星标关注（manual）是叠加其上的爬取第一优先级；
 - 监控池管理（add_pool_items / remove_pool_items / ensure_board_pool）
-  负责增删与批量操作，移除以 excluded 挡同步复活（Steam 名单仍在时也
-  不会被 15min 同步洗回来）；榜单落池（board_pool）同理不被轮询洗回。
+  负责增删与批量操作，移除以排除挡同步复活（Steam 名单仍在时也不会
+  被 15min 同步洗回来）；榜单条目移除后不被轮询洗回。
 """
 import sys
 from pathlib import Path
@@ -496,74 +497,93 @@ async def test_add_pool_items_without_source_no_preset(db, monkeypatch):
 # ── 榜单发现源落池（ensure_board_pool）─────────────────────
 
 
-@pytest.mark.asyncio
-async def test_ensure_board_pool_lands_new_items(db, monkeypatch):
-    """无行：主账号下新建 board_pool 条目（普通监控条目），计数刷新。"""
-    await _seed_account(db)
-    _mock_primary(monkeypatch, PRIMARY)
+async def _get_source(db, appid, source) -> MonitorSource | None:
+    async with db() as session:
+        return (
+            await session.execute(
+                select(MonitorSource).where(
+                    MonitorSource.target_type == "game",
+                    MonitorSource.target_id == appid,
+                    MonitorSource.source == source,
+                )
+            )
+        ).scalar_one_or_none()
 
+
+@pytest.mark.asyncio
+async def test_ensure_board_pool_lands_board_sources(db):
+    """落池真身直挂监控层 board 来源：不落 wishlist 行、不要求绑定账户。"""
     out = await wishlist_service.ensure_board_pool([620, 570])
 
     assert out == {"added": 2, "exists": 0, "skipped": 0}
-    row = await _get_item(db, 620)
-    assert row is not None
-    assert row.active is True
-    assert row.board_pool is True
-    assert row.manual_pool is False and row.manual is False and row.wishlisted is False
-    async with db() as session:
-        account = await session.get(TrackedAccount, PRIMARY)
-    assert account.item_count == 2
+    src = await _get_source(db, 620, "board")
+    assert src is not None and src.active is True and src.priority == 20
+    assert await _get_item(db, 620) is None, "榜单落池不写 wishlist_items 行"
 
 
 @pytest.mark.asyncio
-async def test_ensure_board_pool_skips_existing_and_removed(db, monkeypatch):
-    """活跃行 exists 跳过（来源标记不动）；已移除（excluded）不复活。"""
-    await _seed_account(db)
-    _mock_primary(monkeypatch, PRIMARY)
-    await _seed_item(db, 620, active=True, owned=True)  # 已在池（已购来源）
-    await _seed_item(db, 570, active=False, excluded=True, manual_pool=True)
+async def test_ensure_board_pool_skips_existing_and_removed(db):
+    """已在池（任何来源）exists 跳过；用户移除过的（排除在案）不复活。"""
+    await wishlist_service.ensure_board_pool([620])  # 榜单条目已在池
+    await monitoring.ensure_source("game", 570, "owned")  # 已购条目已在池
+    await monitoring.ensure_source("game", 99901, "board")
+    await monitoring.detach_source("game", 99901, "board")  # 用户移出
+    await monitoring.set_exclusion("game", 99901, True, "pool_removed")
 
-    out = await wishlist_service.ensure_board_pool([620, 570, 99901])
+    out = await wishlist_service.ensure_board_pool([620, 570, 99901, 88801])
 
-    assert out == {"added": 1, "exists": 1, "skipped": 1}
-    row = await _get_item(db, 620)
-    assert row.owned is True and row.board_pool is False, "既有来源标记不被覆写"
-    row = await _get_item(db, 570)
-    assert row.active is False and row.excluded is True, "手动移除的条目不得被轮询洗回"
-    row = await _get_item(db, 99901)
-    assert row is not None and row.active is True and row.board_pool is True
+    assert out == {"added": 1, "exists": 2, "skipped": 1}
+    assert await _get_source(db, 570, "board") is None, "已在池条目不重复挂榜来源"
+    src = await _get_source(db, 99901, "board")
+    assert src is not None and src.active is False, "移除的榜单条目不得复活"
+    new_src = await _get_source(db, 88801, "board")
+    assert new_src is not None and new_src.active is True
 
 
 @pytest.mark.asyncio
-async def test_ensure_board_pool_requires_account(db, monkeypatch):
-    """无绑定账户且有新条目：拒绝且不落行（调用方按「跳过落池」处理）。"""
-    _mock_primary(monkeypatch, None)
-    with pytest.raises(ValueError):
-        await wishlist_service.ensure_board_pool([620])
-    assert await _get_item(db, 620) is None
+async def test_ensure_board_pool_without_account(db):
+    """无绑定账户：榜单落池照常直挂监控层（不以账户身份落行）。"""
+    out = await wishlist_service.ensure_board_pool([620])
+
+    assert out == {"added": 1, "exists": 0, "skipped": 0}
+    src = await _get_source(db, 620, "board")
+    assert src is not None and src.active is True
 
 
 @pytest.mark.asyncio
 async def test_board_pool_immune_to_deactivation(db, monkeypatch):
-    """榜单落池条目：不在 Steam 愿望单也不被同步停用（对照组普通条目照停）。"""
+    """榜单条目（只挂监控层来源）与账户同步无关；对照组普通条目照停。"""
     await _seed_account(db)
-    await _seed_item(db, 620, active=True, board_pool=True)
-    await _seed_item(db, 570, active=True)  # 对照：普通条目
+    await wishlist_service.ensure_board_pool([620])
+    await _seed_item(db, 570, active=True)  # 对照：普通账户条目
 
     _mock_wishlist(monkeypatch, [{"appid": 99801, "added_at": None}])
     _mock_owned(monkeypatch, [])
     await wishlist_service.sync_account(PRIMARY, auto_crawl=False)
 
-    assert (await _get_item(db, 620)).active is True, "board_pool 条目应免疫停用"
+    src = await _get_source(db, 620, "board")
+    assert src is not None and src.active is True, "榜单条目不随账户同步波动"
     assert (await _get_item(db, 570)).active is False
 
 
 @pytest.mark.asyncio
-async def test_list_items_reports_board_pool_source(db, monkeypatch):
-    """监控条目列表带 boardPool 来源标记（池页类别分类的数据源）。"""
-    await _seed_account(db)
-    await _seed_item(db, 620, active=True, board_pool=True)
-    await _seed_item(db, 570, active=True, manual_pool=True)
+async def test_remove_pool_items_detaches_board_source(db):
+    """移除榜单条目：摘 board 来源并排除在案（轮询不复活）。"""
+    await wishlist_service.ensure_board_pool([620])
+
+    out = await wishlist_service.remove_pool_items([620])
+
+    assert out["removed"] == 1
+    src = await _get_source(db, 620, "board")
+    assert src is not None and src.active is False
+    assert await monitoring.state_of("game", 620) == "excluded"
+
+
+@pytest.mark.asyncio
+async def test_list_items_reports_board_pool_source(db):
+    """监控条目列表带 boardPool/manualPool 来源标记（池页类别分类的数据源）。"""
+    await wishlist_service.ensure_board_pool([620])  # 榜单条目（无 wishlist 行）
+    await wishlist_service.add_pool_items([570])  # 手动条目
 
     out = await wishlist_service.list_items()
 

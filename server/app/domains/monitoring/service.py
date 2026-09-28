@@ -43,28 +43,28 @@ logger = logging.getLogger(__name__)
 # 星标关注与家族愿望单同属第一优先级组（关注略先），手动入池 / 已购 /
 # 导入 / 榜单属第二优先级——沿用监控条目排序的既有档位。
 SOURCE_PRIORITY: dict[str, int] = {
-    "favorite": 100,         # 星标关注（wishlist_items.manual）
+    "favorite": 100,         # 星标关注（follows 直挂）
     "family_wishlist": 95,   # 家族 / 多账号愿望单（wishlist_items.wishlisted）
-    "manual": 60,            # 手动入池 / 任务页导入（wishlist_items.manual_pool）
+    "manual": 60,            # 手动入池（add_pool_items 直挂）
     "owned": 40,             # 已购同步（wishlist_items.owned）
     "import": 30,            # 捆绑包导入（bundles/refresh.import_bundle）
-    "board": 20,             # 榜单发现源落池（wishlist_items.board_pool）
+    "board": 20,             # 榜单发现源落池（ensure_board_pool 直挂）
 }
 DEFAULT_SOURCE_PRIORITY = 10
 
-# wishlist_items 的来源布尔列 → monitoring source（多账户同 appid 去重后取并集）
+# wishlist_items 的来源布尔列 → monitoring source（多账户同 appid 去重后取并
+# 集）。项目自加来源（favorite / manual / board）由各自动作直写监控层，不在
+# 账户对账的输入之列。
 _WISHLIST_SOURCE_FLAGS: tuple[tuple[str, str], ...] = (
     ("manual", "favorite"),
     ("wishlisted", "family_wishlist"),
-    ("manual_pool", "manual"),
     ("owned", "owned"),
-    ("board_pool", "board"),
 )
 
 # 账号派生来源：由 wishlist_items（Steam 账户来源数据）对账产生，账号同步时
-# 按现状重算。用户显式来源（favorite / manual）与它们分属两个管理者——
-# 对账只收敛本集合内的种类，不会把用户自己挂的关注/手动入池洗掉。
-DERIVED_SOURCES: frozenset[str] = frozenset({"family_wishlist", "owned", "board"})
+# 按现状重算。用户显式来源（favorite / manual）与榜单落池（board）各有直接
+# 管理者——对账只收敛本集合内的种类，不会把它们洗掉。
+DERIVED_SOURCES: frozenset[str] = frozenset({"family_wishlist", "owned"})
 
 # 单次批量同步的 appid 数（SQLite 变量数上限防御）
 _SYNC_CHUNK = 400

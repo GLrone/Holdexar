@@ -50,11 +50,6 @@ def db(tmp_path, monkeypatch):
     for mod in (database_module, monitoring, wishlist_service, crawl_service, preset_mod):
         monkeypatch.setattr(mod, "get_session_factory", lambda: factory)
 
-    async def _primary():
-        return PRIMARY
-
-    monkeypatch.setattr(wishlist_service, "resolve_pool_steamid", _primary)
-
     async def _no_start(**kwargs):
         return {"id": 1, "scope": kwargs.get("scope"), "count": 0}
 
