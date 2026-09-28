@@ -175,18 +175,21 @@ def extract_version_suffix(option_text: str | None, name_en: str | None) -> str:
     package_name = " - ".join(s for s in segments if s).strip()
     if not package_name:
         return ""
-    if not name_en or package_name.lower() == name_en.lower():
+    if not name_en:
         return ""
-    if package_name.lower().startswith(name_en.lower() + " "):
-        suffix = package_name[len(name_en) :].strip()
-        return suffix.strip(" -–—").strip()
-    if package_name.lower().startswith(name_en.lower() + " - "):
-        suffix = package_name[len(name_en) + 3 :].strip()
-        return suffix.strip(" -–—").strip()
+    pkg_lower = package_name.lower()
+    name_lower = name_en.lower()
+    if pkg_lower == name_lower:
+        return ""
+    # 官方名 + 连接符（空格 / 半全角冒号）之后的片段即版本名。两种连接形态
+    # 并存于 Steam 选项名，只认空格会让冒号连接的 sub 提取落空，被「无后缀」
+    # 判成标准版混进标准版序列（加购 SKU 的低价点因此污染历史走势）
+    for sep in (" ", ":", "："):
+        if pkg_lower.startswith(name_lower + sep):
+            return package_name[len(name_en) + len(sep) :].strip(" -–—:：").strip()
 
     # 兜底：关键词搜索
     edition_patterns = sorted(EDITION_DICT.keys(), key=len, reverse=True)
-    pkg_lower = package_name.lower()
     for edition_key in edition_patterns:
         if edition_key in pkg_lower:
             return " ".join(
