@@ -285,8 +285,10 @@
   /* 与 --success-deep / --accent-deep 同位的「深一档」端点，供渐变徽章取第二色标
      （owned / wishlist 走的是 --success/--success-deep 配对，紫色同构）。 */
   --purple-deep: #7d3c98;
+  --purple-a08: rgba(142, 68, 173, 0.08);
   --purple-a15: rgba(142, 68, 173, 0.12);
   --purple-a30: rgba(142, 68, 173, 0.28);
+  --purple-a60: rgba(142, 68, 173, 0.58);
 
   /* ── 品牌色透明度阶梯 ── */
   --accent-a08: rgba(28, 110, 164, 0.08);
@@ -581,8 +583,10 @@ html.dark {
   /* ── 紫色（家庭共享等特性徽章）── */
   --purple: #b37feb;
   --purple-deep: #9b6ad9;
+  --purple-a08: rgba(179, 127, 235, 0.08);
   --purple-a15: rgba(179, 127, 235, 0.15);
   --purple-a30: rgba(179, 127, 235, 0.3);
+  --purple-a60: rgba(179, 127, 235, 0.6);
 
   /* ── 品牌色透明度阶梯 ── */
   --accent-a08: rgba(102, 192, 244, 0.08);
