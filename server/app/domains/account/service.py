@@ -440,6 +440,79 @@ async def save_cookies(cookies_raw: str) -> dict:
     }
 
 
+async def _post_bind_fetch(steam_id: str, is_primary: bool) -> None:
+    """绑定后全量拉取（后台依次）：愿望单/已购 → 家庭组 → 账单（仅主账号）。
+
+    只主账号触发账单同步会使用户看到「绑了但游戏库/账单不来」。依次口径：
+      ① 愿望单 + 已购库（sync_account：差异入库 + 新增条目按自动价格链
+         开关即时首爬，与 15min 定时同步同口径）；
+      ② 家庭组（跟随**本账号**：成员自动入追踪，多账号各自成组）；
+      ③ 账单（跟随**主账号**：bills 表无 steamid 维度，混流即数据污染，
+         绑二号/切号不触发；主账号换绑时重拉一次）。
+    """
+    try:
+        from app.core.scheduler import price_auto_enabled
+        from app.domains.wishlist import service as wishlist_service
+
+        auto_crawl = await price_auto_enabled()
+        r = await wishlist_service.sync_account(steam_id, auto_crawl=auto_crawl)
+        logger.info(
+            "[account] 绑定后同步 %s：愿望单新增 %s 款 / 已购新增 %s 款（活跃 %s）",
+            steam_id, r.get("added"), r.get("addedOwned"), r.get("active"),
+        )
+    except Exception:  # noqa: BLE001 —— 失败由 15min 定时同步兜底
+        logger.exception("[account] 绑定后愿望单/已购同步异常（定时任务将兜底）")
+
+    # 家庭组跟随本账号：绑定即发现（成员自动入追踪，愿望单/已购/监控池随之
+    # 生效）；失败不阻断，下次手动同步继续兜底
+    try:
+        from app.domains.family import service as family_service
+
+        r = await family_service.sync_family_group(steam_id)
+        logger.info(
+            "[account] 绑定后家庭组同步 %s：joined=%s failed=%s",
+            steam_id, r.get("joined"), r.get("failed"),
+        )
+    except Exception:  # noqa: BLE001 —— 单账号失败隔离，不拖垮绑定流程
+        logger.exception("[account] 绑定后家庭组同步异常（下次同步兜底）")
+
+    if not is_primary:
+        return
+    try:
+        from app.domains.bills import service as bills_service
+
+        r = await bills_service.sync_bills(force=True)
+        if r.get("ok"):
+            logger.info(
+                "[account] 绑定后账单同步：history %s 行 / licenses %s 行",
+                r.get("historyRows"), r.get("licenseRows"),
+            )
+        elif r.get("status") not in ("no_cookie", "busy"):
+            logger.info("[account] 绑定后账单同步失败：%s", r.get("error"))
+    except Exception:  # noqa: BLE001 —— 失败由 30min 定时同步兜底
+        logger.exception("[account] 绑定后账单同步异常（定时任务将兜底）")
+
+
+async def bind_account(cookies_raw: str) -> dict:
+    """绑定 / 换绑完整流程：凭据落库即生效，无中间确认态。
+
+    应用内账号密码登录与手动 Cookie 绑定共用此入口：
+    落库 → 愿望单追踪注册 → 立即试抓钱包（顶栏余额立刻可见，失败不阻断）→
+    后台依次拉全该账号数据（愿望单/已购 → 账单）。
+    返回 {"result": save_cookies 结果, "sync": 钱包试抓结果}。
+    """
+    result = await save_cookies(cookies_raw)
+    # 注册愿望单追踪（游戏数/愿望单数计数来源；失败不阻断）
+    await after_bind(result["steam_id"])
+    sync = await sync_wallet(force=True)
+    if not sync.get("ok"):
+        logger.info("[account] 绑定完成但首次抓取失败：%s", sync.get("error"))
+    steam_id = result["steam_id"]
+    is_primary = steam_id == await get_primary_steam_id()
+    asyncio.get_running_loop().create_task(_post_bind_fetch(steam_id, is_primary))
+    return {"result": result, "sync": sync}
+
+
 async def set_active(steam_id: str) -> dict:
     """切换当前账号（全局唯一 active）。账号不存在时 ValueError。"""
     async with get_session_factory()() as session:

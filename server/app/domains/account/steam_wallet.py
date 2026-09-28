@@ -499,11 +499,13 @@ def parse_miniprofile(data: dict) -> dict:
 async def fetch_player_states(
     steam_ids: list[str], api_key: str, *, proxy_url: str | None = None
 ) -> dict[str, dict]:
-    """官方在线状态批量查询（ISteamUser/GetPlayerSummaries/v2）。
+    """官方账号状态批量查询（ISteamUser/GetPlayerSummaries/v2）。
 
-    一次最多 100 个 SteamID；返回 {steamid: {state, in_game}}：
+    一次最多 100 个 SteamID；返回 {steamid: {state, in_game, country}}：
     - personastate：0=离线 1=在线 2=忙碌 3=离开 4=打盹 5=想交易 6=想一起玩；
     - 游戏中附 gameextrainfo（游戏名）；
+    - country = loccountrycode（资料国家 ISO 两字码；未填写/私有为空串），
+      成员地区判定的资料国家来源；
     - 响应中缺失的 steamid = 离线（私密档案也如此）。
     网络/Key 失败返回 {}（调用方回退 miniprofile 的 online 兜底）。
     """
@@ -530,7 +532,11 @@ async def fetch_player_states(
             state = int(p.get("personastate") or 0)
         except (TypeError, ValueError):
             state = 0
-        out[sid] = {"state": state, "in_game": str(p.get("gameextrainfo") or "").strip()}
+        out[sid] = {
+            "state": state,
+            "in_game": str(p.get("gameextrainfo") or "").strip(),
+            "country": str(p.get("loccountrycode") or "").strip().upper(),
+        }
     return out
 
 

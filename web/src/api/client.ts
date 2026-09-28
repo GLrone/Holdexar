@@ -320,6 +320,42 @@ export const accountApi = {
   sync: () => request<AccountStatus>('POST', '/account/sync'),
 }
 
+/** 应用内账号密码登录的会话状态快照（后端状态机，见 /account/login/*） */
+export interface LoginSessionState {
+  state:
+    | 'idle'
+    | 'signing'
+    | 'awaiting_code'
+    | 'awaiting_confirmation'
+    | 'finalizing'
+    | 'done'
+    | 'failed'
+  message: string
+  error: string
+  /** awaiting_code 时的验证码来源提示：email = 邮箱验证码，totp = 手机令牌 */
+  code_hint: '' | 'email' | 'totp'
+  started_at: string
+  updated_at: string
+}
+
+export const accountLoginApi = {
+  /** 发起登录；后端 409 = 已有登录进行中（busy） */
+  start: (accountName: string, password: string) =>
+    request<{ ok: boolean; busy?: boolean; state: LoginSessionState; error?: string }>(
+      'POST',
+      '/account/login/start',
+      { account_name: accountName, password },
+    ),
+  status: () => request<LoginSessionState>('GET', '/account/login/status', undefined, { noCache: true }),
+  code: (code: string) =>
+    request<{ ok: boolean; state: LoginSessionState; error?: string }>(
+      'POST',
+      '/account/login/code',
+      { code },
+    ),
+  cancel: () => request<{ ok: boolean; state: LoginSessionState }>('POST', '/account/login/cancel'),
+}
+
 // ─── family（Steam 家庭组发现 / 成员管理）─────────────────
 
 export interface FamilyResolveResult {
