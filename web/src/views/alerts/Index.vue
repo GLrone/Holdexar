@@ -495,17 +495,17 @@ onMounted(() => {
             <el-switch :model-value="row.active" @change="toggle(row)" />
           </template>
         </el-table-column>
-        <el-table-column :label="t('alerts.table.lastTriggered')" width="170">
-          <template #default="{ row }">
-            <span class="muted">{{ row.lastTriggeredAt?.slice(5, 19).replace('T', ' ') ?? t('alerts.rules.never') }}</span>
-          </template>
-        </el-table-column>
         <el-table-column :label="t('alerts.table.actions')" width="120" align="right">
           <template #default="{ row }">
             <div class="action-btns">
               <el-button size="small" plain :icon="Edit" @click="startEdit(row)" />
               <el-button size="small" type="danger" plain :icon="Delete" @click="remove(row)" />
             </div>
+          </template>
+        </el-table-column>
+        <el-table-column :label="t('alerts.table.lastTriggered')" width="170">
+          <template #default="{ row }">
+            <span class="muted">{{ row.lastTriggeredAt?.slice(5, 19).replace('T', ' ') ?? t('alerts.rules.never') }}</span>
           </template>
         </el-table-column>
       </el-table>
