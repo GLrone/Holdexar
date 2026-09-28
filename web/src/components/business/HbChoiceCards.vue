@@ -5,8 +5,8 @@
  * 数据链：GET /metadata/hb/offers（纯本地库读：记账游标 → 当月标签 →
  * games.is_hb 标记行 + 国区价）→ 挂载即拉 + 每小时轻刷（抓取链每日跑，
  * 库内标记到位后卡片自动浮出）。游戏卡点击进站内详情页；头部「跳过本月 /
- * 前往月包」是官方页直达外链。归属徽章（已拥有/家庭共享/愿望单）走
- * ownership 批量接口，与游戏库同源配色与词条。
+ * 前往月包」是官方页直达外链。归属徽章与卡片归属边框（已拥有/家庭共享/
+ * 愿望单）走 ownership 批量接口，与游戏库同源配色与词条。
  */
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
@@ -134,6 +134,7 @@ onBeforeUnmount(() => {
         v-for="g in games"
         :key="g.appid"
         class="hb-card"
+        :class="ownershipOf(g)?.type"
         :title="g.name"
         @click="router.push(`/game/${g.appid}`)"
       >
@@ -253,6 +254,24 @@ onBeforeUnmount(() => {
   transform: translateY(-2px);
   border-color: var(--accent);
   box-shadow: var(--shadow-sm);
+}
+
+/* 归属边框（与游戏库 game-card 同一套口径：2px 同色描边 + 同色系渐变底，
+   令牌跟随双主题）。置于 :hover 之后：同特异性下后声明胜出，悬停抬升
+   不改变归属描边色。 */
+.hb-card.owned {
+  border: 2px solid var(--success-a60);
+  background: linear-gradient(135deg, var(--surface-overlay-panel), var(--success-a08));
+}
+
+.hb-card.family {
+  border: 2px solid var(--purple-a60);
+  background: linear-gradient(135deg, var(--surface-overlay-panel), var(--purple-a08));
+}
+
+.hb-card.wishlist {
+  border: 2px solid var(--accent-a50);
+  background: linear-gradient(135deg, var(--surface-overlay-panel), var(--accent-a08));
 }
 
 .hb-card__media {

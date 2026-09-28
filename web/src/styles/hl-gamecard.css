@@ -49,8 +49,8 @@
 }
 
 .game-card.family {
-    border: 2px solid rgba(155, 89, 182, 0.6);
-    background: linear-gradient(135deg, var(--surface-overlay-panel), rgba(155, 89, 182, 0.08));
+    border: 2px solid var(--purple-a60);
+    background: linear-gradient(135deg, var(--surface-overlay-panel), var(--purple-a08));
 }
 
 .game-card.wishlist {
@@ -223,8 +223,8 @@
 }
 
 .game-card.family {
-    border: 2px solid rgba(155, 89, 182, 0.6);
-    background: linear-gradient(135deg, var(--surface-overlay-panel), rgba(155, 89, 182, 0.08));
+    border: 2px solid var(--purple-a60);
+    background: linear-gradient(135deg, var(--surface-overlay-panel), var(--purple-a08));
 }
 
 .game-card.wishlist {
