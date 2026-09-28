@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import re
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
 from sqlalchemy import case, or_, select, text, update
@@ -27,6 +28,22 @@ from .config import STALE_HOURS
 from .utils import get_beijing_time_obj, is_near_steam_refresh
 
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def _session_scope(session):
+    """批量写传入共享 session：不提交、不关闭；未传则开自有 session 并在退出时关闭。"""
+    if session is not None:
+        yield session
+    else:
+        async with get_session_factory()() as own:
+            yield own
+
+
+def _chunks(items: list, size: int):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
 
 _CURRENT_UPDATABLE = (
     "currency",
@@ -167,11 +184,19 @@ class DbWriter:
             return None
         return round(int(price_cents) * rate)
 
-    async def upsert_game_and_prices(self, game_data: dict, prices_data: list[dict] | None) -> bool:
-        """写入游戏元数据 + 区域价格。
+    async def upsert_game_and_prices(
+        self,
+        game_data: dict,
+        prices_data: list[dict] | None,
+        *,
+        baseline: tuple[dict, dict] | None = None,
+        session=None,
+        commit: bool = True,
+    ) -> bool:
+        """写入游戏元数据 + 区域价格（默认单款独占事务）。
 
-        - 标准版价格 → game_current_prices (UPSERT)
-        - 全版本价格 → game_price_history (INSERT)
+        传入共享 session 与已取好的基线时（批量写入口 upsert_task_batch 的用法）
+        本方法不提交、不关闭 session，提交与收尾由批量入口统一负责。
         """
         try:
             now_dt = _naive(game_data.get("updated_at") or get_beijing_time_obj())
@@ -198,7 +223,11 @@ class DbWriter:
                 game_values["promo_end_at"] = None
                 free_state = ("beta", None)
 
-            async with get_session_factory()() as session:
+            async with _session_scope(session) as session:
+                if baseline is None:
+                    baseline = await self._load_baseline(
+                        session, int(game_data.get("appid") or 0)
+                    )
                 insert_game = sqlite_insert(Game).values(**game_values)
                 upsert_set = {
                     c: getattr(insert_game.excluded, c)
@@ -240,44 +269,9 @@ class DbWriter:
                     #    选择还会让编号更小的豪华版顶替本体。sub_id 是恒定 SKU，
                     #    版本名不随时间变：取该 appid 每个 sub 的最新非空名，
                     #    本次为空的行沿用之。
-                    known_suffix: dict[int, str] = {}
-                    rows_known = await session.execute(
-                        text(
-                            "SELECT sub_id, version_suffix FROM ("
-                            "  SELECT sub_id, version_suffix, ROW_NUMBER() OVER ("
-                            "    PARTITION BY sub_id ORDER BY snapshot_at DESC, id DESC"
-                            "  ) AS rn FROM game_price_history"
-                            "  WHERE appid = :appid AND sub_id > 0"
-                            "        AND version_suffix IS NOT NULL AND version_suffix != ''"
-                            ") WHERE rn = 1"
-                        ),
-                        {"appid": int(game_data.get("appid") or 0)},
-                    )
-                    for r in rows_known:
-                        known_suffix[int(r[0])] = str(r[1])
-
-                    latest_snapshots: dict[tuple[str, int], tuple] = {}
-                    rows_latest = await session.execute(
-                        text(
-                            "SELECT region_code, sub_id, price, original_price, "
-                            "discount_percent, version_suffix, is_gold FROM ("
-                            "SELECT region_code, sub_id, price, original_price, "
-                            "discount_percent, version_suffix, is_gold, snapshot_at, "
-                            "ROW_NUMBER() OVER (PARTITION BY region_code, sub_id "
-                            "ORDER BY snapshot_at DESC, id DESC) AS rn "
-                            "FROM game_price_history WHERE appid = :appid"
-                            ") WHERE rn = 1"
-                        ),
-                        {"appid": int(game_data.get("appid") or 0)},
-                    )
-                    for r in rows_latest:
-                        sub_id_int = int(r[1] or 0)
-                        # prev 基线与本次写入用同一套回填名：差量门禁不因
-                        # 「丢名→回名」的名称修正误触发冗余快照
-                        suffix_baseline = r[5] or known_suffix.get(sub_id_int) or None
-                        latest_snapshots[(r[0], sub_id_int)] = (
-                            r[2], r[3], r[4], suffix_baseline, bool(r[6]),
-                        )
+                    # 基线（该 appid 最新快照 + 版本名回填）由调用方取好：
+                    # 批量写把「每 appid 两条窗口函数扫 history」压成每批一次
+                    known_suffix, latest_snapshots = baseline
 
                     for p in prices_data:
                         region = p.get("region_code", "").upper()
@@ -463,6 +457,8 @@ class DbWriter:
                             sqlite_insert(GamePriceHistory).values(history_batch)
                         )
 
+                if not commit:
+                    return True
                 await session.commit()
                 # 复活清标：抓到数据 = 商店健在。removed_at 非空时由榜单
                 # 复活通道反哺至此，清除后恢复关注层监控（在 with 外调用，
@@ -478,6 +474,116 @@ class DbWriter:
         except Exception as e:
             logger.error("写入失败: %s", e)
             return False
+
+    async def _load_baseline(self, session, appid: int):
+        """单 appid 的最新快照基线（版本名回填 + 差量门禁 prev）。
+
+        读必须与写同一 session：新开连接在测试的库上读不到未提交/另一端写入。
+        """
+        known, latest = await self._query_baselines(session, [appid])
+        return known.get(appid, {}), latest.get(appid, {})
+
+    async def _query_baselines(self, session, appids: list[int]):
+        """批量取基线：一次 IN 查询覆盖整批，取代逐 appid 扫 history 窗口函数。"""
+        known: dict[int, dict[int, str]] = {}
+        latest: dict[int, dict[tuple[str, int], tuple]] = {}
+        ids = [int(a) for a in dict.fromkeys(appids) if a]
+        for chunk in _chunks(ids, 400):
+            params = {f"a{i}": v for i, v in enumerate(chunk)}
+            placeholders = ",".join(f":a{i}" for i in range(len(chunk)))
+            rows_known = await session.execute(
+                text(
+                    "SELECT appid, sub_id, version_suffix FROM ("
+                    "  SELECT appid, sub_id, version_suffix, ROW_NUMBER() OVER ("
+                    "    PARTITION BY appid, sub_id ORDER BY snapshot_at DESC, id DESC"
+                    "  ) AS rn FROM game_price_history"
+                    f"  WHERE appid IN ({placeholders}) AND sub_id > 0"
+                    "        AND version_suffix IS NOT NULL AND version_suffix != ''"
+                    ") WHERE rn = 1"
+                ),
+                params,
+            )
+            for r in rows_known:
+                known.setdefault(int(r[0]), {})[int(r[1])] = str(r[2])
+        for chunk in _chunks(ids, 400):
+            params = {f"a{i}": v for i, v in enumerate(chunk)}
+            placeholders = ",".join(f":a{i}" for i in range(len(chunk)))
+            rows_latest = await session.execute(
+                text(
+                    "SELECT appid, region_code, sub_id, price, original_price, "
+                    "discount_percent, version_suffix, is_gold FROM ("
+                    "SELECT appid, region_code, sub_id, price, original_price, "
+                    "discount_percent, version_suffix, is_gold, snapshot_at, "
+                    "ROW_NUMBER() OVER (PARTITION BY appid, region_code, sub_id "
+                    "ORDER BY snapshot_at DESC, id DESC) AS rn "
+                    f"FROM game_price_history WHERE appid IN ({placeholders})"
+                    ") WHERE rn = 1"
+                ),
+                params,
+            )
+            for r in rows_latest:
+                aid = int(r[0])
+                sub_id_int = int(r[2] or 0)
+                # prev 基线与本次写入用同一套回填名：差量门禁不因
+                # 「丢名→回名」的名称修正误触发冗余快照
+                suffix_baseline = r[6] or known.get(aid, {}).get(sub_id_int) or None
+                latest.setdefault(aid, {})[(r[1], sub_id_int)] = (
+                    r[3], r[4], r[5], suffix_baseline, bool(r[7]),
+                )
+        return known, latest
+
+    async def upsert_task_batch(
+        self, entries: list[tuple[dict, list[dict] | None]]
+    ) -> list[bool]:
+        """一区一批（≤400 款）一次事务写完：一批一次基线查询 + 一次 commit。
+
+        逐 appid 各开事务会让 history 基线查询与 commit 数随「款数 × 区数」
+        线性膨胀；这里折进同一事务，单款用 SAVEPOINT 隔离失败，返回逐款成败。
+        """
+        results = [False] * len(entries)
+        if not entries:
+            return results
+        try:
+            async with get_session_factory()() as session:
+                known, latest = await self._query_baselines(
+                    session, [int(g.get("appid") or 0) for g, _ in entries]
+                )
+                for i, (game_data, prices_data) in enumerate(entries):
+                    aid = int(game_data.get("appid") or 0)
+                    sp = await session.begin_nested()
+                    try:
+                        ok = await self.upsert_game_and_prices(
+                            game_data,
+                            prices_data,
+                            baseline=(known.get(aid, {}), latest.get(aid, {})),
+                            session=session,
+                            commit=False,
+                        )
+                    except Exception as e:  # noqa: BLE001 —— 单款失败不拖垮整批
+                        logger.error("批量写入单款失败 appid=%s: %s", aid, e)
+                        ok = False
+                    if ok:
+                        await sp.commit()
+                    else:
+                        await sp.rollback()
+                    results[i] = ok
+                await session.commit()
+        except Exception as e:
+            logger.error("批量写入失败: %s", e)
+            return [False] * len(entries)
+        # 提交后再跑复活清标 / 种子补挂：与单写入口同序，不叠在未提交事务里
+        for i, (game_data, _) in enumerate(entries):
+            if not results[i]:
+                continue
+            aid = int(game_data.get("appid") or 0)
+            if not aid:
+                continue
+            try:
+                await self.clear_removed_mark(aid)
+                await seed_assets.apply_curated(aid)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("批量写入收尾失败 appid=%s: %s", aid, e)
+        return results
 
     async def ensure_game_exists(self, appid: int, name: str = "") -> None:
         """确保 games 表有记录（满足外键约束）。"""

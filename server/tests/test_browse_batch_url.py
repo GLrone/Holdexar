@@ -73,3 +73,27 @@ def test_split_uses_longest_prefix_not_halving() -> None:
 def test_limit_is_below_measured_server_rejection() -> None:
     """上限必须低于服务端真实拒绝线（6834 字节回 414）。"""
     assert bs.MAX_URL_LEN < 6834
+
+
+def test_batches_are_maximal_no_wasted_tail() -> None:
+    """贪心装批：非末发每发都顶到 URL 上限，不得留下装不满的小尾巴。
+
+    判据用「再加一条就超限」证明每发是极大批：某发若还能装下下一条，
+    说明装批没收满，白多发一次请求。
+    """
+    appids = list(range(5000000, 5002000))  # 2000 个 7 位 appid
+    batches = bs.StoreBrowseAPI.plan_batches(appids, "us", "english", True, 400)
+    assert sum(len(b) for b in batches) == len(appids)
+    for i, batch in enumerate(batches[:-1]):
+        next_id = batches[i + 1][0]
+        assert _url_len(_specs(batch + [next_id])) > bs.MAX_URL_LEN, (
+            f"第 {i} 发只有 {len(batch)} 条却还能再装一条：装批没收满"
+        )
+
+
+def test_greedy_packing_uses_full_capacity() -> None:
+    """7 位 appid 每发装到 300 条以上（容量约 313），而不是 400 切两发后的约 200。"""
+    appids = list(range(5000000, 5005000))
+    batches = bs.StoreBrowseAPI.plan_batches(appids, "us", "english", True, 400)
+    assert min(len(b) for b in batches[:-1]) >= 300
+    assert len(batches) <= 17  # ceil(5000 / 313) = 16，留一发余量

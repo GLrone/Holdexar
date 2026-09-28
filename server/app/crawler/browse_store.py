@@ -140,11 +140,6 @@ def _naive(dt: datetime | None) -> datetime | None:
     return dt
 
 
-def chunks(seq: list, n: int):
-    for i in range(0, len(seq), n):
-        yield seq[i : i + n]
-
-
 def _fmt_release_ts(ts) -> str:
     ts = _to_int(ts)
     if not ts or ts <= 0:
@@ -281,7 +276,15 @@ class StoreBrowseAPI:
     def plan_id_batches(
         id_specs: list[dict], cc: str, lang: str, extras: bool, batch_size: int
     ) -> list[list[dict]]:
-        """plan_batches 的通用版：id 规格（bundleid/packageid）分批。"""
+        """plan_batches 的通用版：id 规格（bundleid/packageid）分批。
+
+        **贪心装满每一发**：URL 长度 = 固定前缀 + Σ元素长度 + (条数-1)，对条数仿射，
+        逐条累加即可判定，不必逐批构造 URL。批边界同时受 URL 上限与 batch_size
+        条数上限约束；真实先撞到的是 URL 上限（7 位 appid 约 313 条）。
+
+        先按条数切块再逐块按 URL 切，会在每块尾部留下装不满的小发（400 块切成
+        313+87，等效每发只装约 200 条）；贪心装批把每发都顶到上限为止。
+        """
         seen: set[str] = set()
         uniq: list[dict] = []
         for spec in id_specs:
@@ -290,45 +293,27 @@ class StoreBrowseAPI:
                 continue
             seen.add(key)
             uniq.append(dict(spec))
+        if not uniq:
+            return []
+        base_len = StoreBrowseAPI._url_len([], cc, lang, extras)
+        budget = MAX_URL_LEN - base_len
         out: list[list[dict]] = []
-        for chunk in chunks(uniq, batch_size):
-            out.extend(StoreBrowseAPI._split_ids_by_url(chunk, cc, lang, extras))
-        return out
-
-    @staticmethod
-    def _split_ids_by_url(
-        id_specs: list[dict], cc: str, lang: str, extras: bool
-    ) -> list[list[dict]]:
-        """按**构造出来的 URL 实际长度**切批，切点取「能装下的最长前缀」。
-
-        判据只能是最终 URL 的长度：单发条数不是安全量——同样 400 条，7 位 appid 拼出的
-        URL 比 5 位长得多，服务端按请求行长度拒绝（超限时回 414 / 400），而条数看不出来。
-        所以每批都真的把 URL 构造一次再量长度。
-
-        切点用「最长可行前缀」而不是对半折：对半会把 400 条切成 200+200，多发一倍请求；
-        前缀切法在同样的长度上限下能保住接近上限的批量。
-        """
-        total = len(id_specs)
-        if total <= 1:
-            return [id_specs] if id_specs else []
-        if StoreBrowseAPI._url_len(id_specs, cc, lang, extras) <= MAX_URL_LEN:
-            return [id_specs]
-        # 二分找最长可行前缀（长度随条数单调不减）
-        low, high = 1, total - 1
-        best = 0
-        while low <= high:
-            mid = (low + high) // 2
-            if StoreBrowseAPI._url_len(id_specs[:mid], cc, lang, extras) <= MAX_URL_LEN:
-                best = mid
-                low = mid + 1
+        current: list[dict] = []
+        used = 0  # 当前发的 Σ元素长度 + 已产生的分隔符数 = URL 超出 base 的部分
+        for spec in uniq:
+            elem = len(json.dumps(spec, separators=(",", ":")))
+            add = elem if not current else elem + 1
+            if current and (used + add > budget or len(current) >= batch_size):
+                out.append(current)
+                current = [spec]
+                used = elem
             else:
-                high = mid - 1
-        if best <= 0:
-            # 单条都超限：交给调用方失败，不静默丢 id
-            return [id_specs]
-        return [id_specs[:best]] + StoreBrowseAPI._split_ids_by_url(
-            id_specs[best:], cc, lang, extras
-        )
+                # 单条自身就超限时留在自己一发里，不静默丢 id
+                current.append(spec)
+                used += add
+        if current:
+            out.append(current)
+        return out
 
     @staticmethod
     def _url_len(id_specs: list[dict], cc: str, lang: str, extras: bool) -> int:
@@ -705,6 +690,46 @@ class BrowseDbWriter(DbWriter):
         except Exception as e:  # noqa: BLE001 —— 扩展字段不阻断主链路
             logger.warning("[browse] 扩展字段落库失败 %s/%s: %s", appid, cc, e)
 
+    async def attach_browse_extras_batch(self, entries) -> None:
+        """一批扩展字段一次事务回贴（entries = (appid, cc, now_dt, extras_by_sub)）。
+
+        逐 appid 各开事务会把批内 commit 数放大到批大小，这里折进同一事务一次提交。
+        """
+        rows = [
+            (int(appid), cc, now_dt, extras_by_sub)
+            for appid, cc, now_dt, extras_by_sub in entries
+            if extras_by_sub
+        ]
+        if not rows or not await self._extras_columns_present():
+            return
+        try:
+            async with get_session_factory()() as session:
+                for appid, cc, now_dt, extras_by_sub in rows:
+                    params = [
+                        {
+                            "e": opt.get("discount_end_ts"),
+                            "d": opt.get("discount_desc"),
+                            "b": opt.get("bundle_id"),
+                            "bd": opt.get("bundle_discount_pct"),
+                            "a": appid,
+                            "r": cc.upper(),
+                            "s": int(sub_id),
+                            "t": _naive(now_dt),
+                        }
+                        for sub_id, opt in extras_by_sub.items()
+                    ]
+                    await session.execute(
+                        text(
+                            "UPDATE game_price_history SET discount_end_ts=:e, "
+                            "discount_desc=:d, bundle_id=:b, bundle_discount_pct=:bd "
+                            "WHERE appid=:a AND region_code=:r AND sub_id=:s AND snapshot_at=:t"
+                        ),
+                        params,
+                    )
+                await session.commit()
+        except Exception as e:  # noqa: BLE001 —— 扩展字段不阻断主链路
+            logger.warning("[browse] 扩展字段批量落库失败: %s", e)
+
 
 # ══════════════════════════════════════════════════════════════
 # 任务处理器
@@ -865,6 +890,7 @@ async def _browse_price_task_inner(context) -> None:
     now_dt = get_beijing_time_obj()
     counts = {"ok": 0, "free_promo": 0, "locked": 0, "missing": 0, "skip": 0, "write_fail": 0}
     _WRITE_STARTED.add(str(task_id))
+    pending_writes: list[tuple] = []
 
     for appid in appids:
         meta = META.get(appid)
@@ -991,23 +1017,34 @@ async def _browse_price_task_inner(context) -> None:
         if game_data is None:  # 元数据与库内原值双缺 → 不造空行
             counts["skip"] += 1
             continue
-        wrote_ok = await context.db_writer.upsert_game_and_prices(game_data, prices_arr)
-        if not wrote_ok:
-            counts["write_fail"] += 1
-            await context.db_writer.mark_region_status(appid, cc, "missing")
-            continue
+        pending_writes.append((appid, game_data, prices_arr, status, opts))
 
-        if status == "ok" and opts:
-            extras = {o["sub_id"]: o for o in opts if o.get("sub_id")}
-            await context.db_writer.attach_browse_extras(appid, cc, now_dt, extras)
-
-        # ── 捆绑包发现（purchase_options 白送）：游戏条目的购买选项里每条
-        #    捆绑包选项都带 bundleid/packageid + must_purchase_as_set。库里
-        #    没有的包写发现桩（无价 + updated_at NULL），随下一次 6h 主轮
-        #    链尾的全量刷新整区抓价——跨厂 bundle（旧 appdetails 包列表
-        #    探测覆盖不到）由此入账。已入库的包不动（不覆盖完整主档）。
-        #    失败只计数不抛：发现是副产物，绝不拖垮主价格链路。
-        if not DRY_RUN:
+    # 整批一次事务落库：一批一次基线查询 + 一次 commit（逐 appid 各开事务会
+    # 让 1600 万行 history 的基线扫描与提交数按「款数 × 区数」膨胀）
+    if pending_writes:
+        results = await context.db_writer.upsert_task_batch(
+            [(g, p) for _, g, p, _, _ in pending_writes]
+        )
+        extra_entries: list[tuple] = []
+        for (appid, game_data, prices_arr, status, opts), ok in zip(
+            pending_writes, results
+        ):
+            if not ok:
+                counts["write_fail"] += 1
+                await context.db_writer.mark_region_status(appid, cc, "missing")
+                continue
+            if status == "ok" and opts:
+                extra_entries.append(
+                    (
+                        appid,
+                        cc,
+                        now_dt,
+                        {o["sub_id"]: o for o in opts if o.get("sub_id")},
+                    )
+                )
+            # ── 捆绑包发现（purchase_options 白送）：只在写入成功后收。
+            #    没有的包写发现桩（无价 + updated_at NULL），随主轮链尾整区抓价；
+            #    失败只计数不抛：发现是副产物，绝不拖垮主价格链路。
             try:
                 found = _discover_bundles_from_item(items.get(appid))
                 if found:
@@ -1015,6 +1052,8 @@ async def _browse_price_task_inner(context) -> None:
                     BUNDLES_DISCOVERED += len(found)
             except Exception as e:  # noqa: BLE001
                 logger.debug("[browse] %s 捆绑包发现落库失败: %s", task_id, e)
+        if extra_entries:
+            await context.db_writer.attach_browse_extras_batch(extra_entries)
 
     logger.debug("[browse] %s 计数 %s", task_id, counts)
 
