@@ -66,6 +66,7 @@ const NO_CACHE_PATHS = [
   // 前端再叠 60s 时间窗会把 stale→fresh 的覆盖整个吞掉（轮询永远读旧响应）
   '/metadata/epic/offers',
   '/metadata/steam/offers', // Steam 喜加一：10min 轮询，赠送结束要立即消失
+  '/notifications/facts', // 内容链事实通知 60s 轮询（增量游标语义）
 ]
 
 function isNoCachePath(path: string): boolean {
@@ -1738,6 +1739,30 @@ export const notificationsApi = {
   /** 连通性测试：与 Price Event / Candidate / Cycle 无关，不写任何业务数据 */
   test: () => request<{ ok: boolean }>('POST', '/notifications/test'),
   stats: () => request<NotificationStats>('GET', '/notifications/stats'),
+  /** 内容链事实通知（灵动岛轮询）：afterId 缺省 = 只对齐游标不回历史 */
+  facts: (afterId?: number) =>
+    request<FactNoticeBatch>(
+      'GET',
+      afterId != null ? `/notifications/facts?afterId=${afterId}` : '/notifications/facts',
+      undefined,
+      { noCache: true },
+    ),
+}
+
+/** 一条内容链事实变化（HB 当月包换新 / Epic 喜加一轮换）。文案由前端按
+ *  source+kind 映射词条现译，后端只发结构化事实。 */
+export interface FactNotice {
+  id: number
+  source: 'hb_choice' | 'epic_free' | string
+  kind: 'bundle_changed' | 'free_rotation' | string
+  /** 消费参数：HB = {label, productName, count}；Epic = {count, titles[]} */
+  data: { label?: string; productName?: string; count?: number; titles?: string[] } | null
+  occurredAt: string | null
+}
+
+export interface FactNoticeBatch {
+  latestId: number
+  items: FactNotice[]
 }
 
 /** 历史窗口档位（null = 档案全量） */

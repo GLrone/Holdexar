@@ -34,6 +34,12 @@ const island = {
   'island.ago.minutes': '{n} 分钟前',
   'island.ago.hours': '{n} 小时前',
   'island.ago.days': '{n} 天前',
+
+  /* 内容链事实通知（服务端判定事实变化，岛上消费展示） */
+  'island.fact.hbChanged': 'Humble Choice 当月包已换新：{label}',
+  'island.fact.hbChangedDetail': '本月 {count} 款 Steam 可兑换，清单见仪表盘卡片',
+  'island.fact.epicRotation': 'Epic 喜加一轮换：新增 {count} 款免费',
+  'island.fact.epicRotationDetail': '正在免费领取：{titles}',
 } as const
 
 export default island

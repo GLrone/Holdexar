@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 
 import { useAccountStore } from '@/stores/account'
 import { useCrawlStatusStore } from '@/stores/crawlStatus'
+import { useFactNoticesStore } from '@/stores/factNotices'
 import { useLocaleStore } from '@/stores/locale'
 import { useSettingsStore } from '@/stores/settings'
 import { useThemeStore } from '@/stores/theme'
@@ -42,6 +43,7 @@ declare global {
 }
 
 const crawl = useCrawlStatusStore()
+const factNotices = useFactNoticesStore()
 const settingsStore = useSettingsStore()
 const themeStore = useThemeStore()
 const localeStore = useLocaleStore()
@@ -50,6 +52,8 @@ const updaterStore = useUpdaterStore()
 const { t } = useI18n()
 onMounted(() => {
   crawl.start()
+  // 内容链事实通知（HB 当月包 / Epic 喜加一）：60s 轮询增量上岛
+  factNotices.start()
   settingsStore.load()
   accountStore.load()
   // 闲时预热成就殿堂视图 chunk（内含 echarts 大包）：只在浏览器空闲时跑、

@@ -543,6 +543,19 @@ async def refresh_hb_choice() -> dict:
             "marked": len(marked),
         },
     )
+    # 新月包结案即事实变化（轮次游标 machine 已保证唯一）→ 岛上消息消费
+    from app.domains.notifications import facts as facts_service
+
+    await facts_service.record_fact(
+        source="hb_choice",
+        kind="bundle_changed",
+        fact_key=f"hb_choice:{machine}",
+        data={
+            "label": label,
+            "productName": parsed["productName"],
+            "count": len(marked),
+        },
+    )
     logger.info(
         "[hb-choice] %s 打标完成：%d 款（%s），已记账",
         machine, len(marked), label,
@@ -764,6 +777,67 @@ async def steam_free_offers() -> dict:
 # epic_date（先到的日期视为首次赠送事实，后到不回写）。
 
 _EPIC_DATE_RE = re.compile(r"(\d{4})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})\s*日?")
+
+
+def _offer_identity(offer: dict) -> str | None:
+    """当期条目键：appid 优先，无 appid 用标题小写（与邮件通道同口径）。"""
+    appid = offer.get("appid")
+    if appid:
+        return f"appid:{int(appid)}"
+    title = str(offer.get("title") or "").strip().lower()
+    return f"title:{title}" if title else None
+
+
+def _current_offer_identities(payload: dict | None) -> set[str]:
+    """payload 的当期（非预告）条目键集。"""
+    if not isinstance(payload, dict):
+        return set()
+    out: set[str] = set()
+    for offer in payload.get("offers") or []:
+        if not isinstance(offer, dict) or offer.get("upcoming"):
+            continue
+        identity = _offer_identity(offer)
+        if identity:
+            out.add(identity)
+    return out
+
+
+async def _publish_epic_rotation(old_payload: dict | None, new_payload: dict) -> None:
+    """当期集合与上一份快照比对 → 轮换事实（灵动岛消费）。
+
+    新增条目非空才落行，fact_key = 新增键集——同一批新增重复刷新只落一行；
+    首份快照不落（没有「之前」就没有「变了」）。落行失败由 record_fact
+    自行兜底，不影响快照链。
+    """
+    old_keys = _current_offer_identities(old_payload)
+    if not old_keys:
+        return
+    fresh = [
+        offer
+        for offer in new_payload.get("offers") or []
+        if isinstance(offer, dict)
+        and not offer.get("upcoming")
+        and (identity := _offer_identity(offer)) is not None
+        and identity not in old_keys
+    ]
+    if not fresh:
+        return
+    identities = sorted(_offer_identity(offer) or "" for offer in fresh)
+    from app.domains.notifications import facts as facts_service
+
+    await facts_service.record_fact(
+        source="epic_free",
+        kind="free_rotation",
+        fact_key=f"epic_free:{'|'.join(identities)}",
+        data={
+            "count": len(fresh),
+            "titles": [
+                str(offer.get("titleCn") or offer.get("title") or "").strip()
+                for offer in fresh
+            ][:8],
+        },
+    )
+
 
 
 def _norm_epic_date(raw: str) -> str | None:
@@ -989,6 +1063,8 @@ def _start_offers_refresh() -> None:
             if payload is None:
                 logger.info("[epic-offers] 后台刷新全失败（保留旧快照）")
                 return
+            # 快照替换即当期集合可能变化：先比对落事实，再覆盖缓存
+            await _publish_epic_rotation(_epic_offers_cache["payload"], payload)
             _epic_offers_cache["payload"] = payload
             _epic_offers_cache["at"] = time.time()
             # PC 列表失败时只出移动卡，不写快照——下次启动重试 Epic
@@ -1029,6 +1105,8 @@ async def epic_free_offers(force: bool = False) -> dict:
     payload = await _fetch_offers_payload()
     if payload is None:
         return {"source": "epic-offers", "ok": False, "offers": [], "mobile": None, "fetchedAt": None}
+    # 快照替换即当期集合可能变化：先比对落事实，再覆盖缓存
+    await _publish_epic_rotation(_epic_offers_cache["payload"], payload)
     _epic_offers_cache["payload"] = payload
     _epic_offers_cache["at"] = time.time()
     # PC 列表失败时只出移动卡，不写快照——下次启动重试 Epic
