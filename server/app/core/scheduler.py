@@ -1457,6 +1457,86 @@ async def _job_free_promo_retry() -> None:
         logger.exception("[定时] 限时赠送复查爬取失败")
 
 
+# ── 启动新鲜度补偿 ──
+# 判定口径：池内 active 游戏对象中，24h 内有过价格观察的占比。占比低于
+# _STARTUP_STALE_SHARE（长时间停机、出口空窗导致整轮丢失后重启等）即视为
+# 池数据整体过期，把 price_refresh 首轮从下一个网格点提前到启动后
+# _STARTUP_KICK_DELAY_SECONDS；该轮照常走 PriceCycle 统计，跑完由
+# 「轮转重锚」归位网格，日常节奏不变。按占比而非全池最新观察龄判定：
+# 手动爬取等零星成功会抬高最新龄，掩盖池整体过期的状态。
+_STARTUP_STALE_HOURS = 24
+_STARTUP_STALE_SHARE = 0.5
+_STARTUP_KICK_DELAY_SECONDS = 120
+
+
+async def _pool_fresh_ratio() -> tuple[int, float] | None:
+    """池内 active 游戏对象中 _STARTUP_STALE_HOURS 内有价格观察的占比。
+
+    观察判定与地区无关：任一区的价格行足够新即算该对象新鲜。
+    空池（无 active 监控对象）返回 None——无池即无补偿对象。
+    """
+    from sqlalchemy import func, select
+
+    from app.core.database import get_session_factory
+    from app.domains.games.models import GameCurrentPrice
+    from app.domains.monitoring.models import MonitorTarget
+
+    cutoff = datetime.now() - timedelta(hours=_STARTUP_STALE_HOURS)
+    pool_where = (
+        MonitorTarget.target_type == "game",
+        MonitorTarget.state == "active",
+    )
+    async with get_session_factory()() as session:
+        total = await session.scalar(
+            select(func.count()).select_from(MonitorTarget).where(*pool_where)
+        )
+        if not total:
+            return None
+        fresh = await session.scalar(
+            select(func.count()).select_from(MonitorTarget).where(
+                *pool_where,
+                MonitorTarget.target_id.in_(
+                    select(GameCurrentPrice.appid).where(
+                        GameCurrentPrice.updated_at >= cutoff
+                    )
+                ),
+            )
+        )
+    return int(total), int(fresh or 0) / int(total)
+
+
+async def _kick_stale_price_refresh() -> None:
+    """池数据整体过期时，把 price_refresh 首轮提前到启动后两分钟。
+
+    网格点本身已近在眼前（≤ 提前时刻）时不改排程——正常轮即刻就是补偿。
+    自动价格链总开关关闭时整个补偿停转。
+    """
+    if not await price_auto_enabled():
+        return
+    ratio = await _pool_fresh_ratio()
+    if ratio is None or ratio[1] >= _STARTUP_STALE_SHARE:
+        return
+    total, share = ratio
+    job = scheduler.get_job("price_refresh")
+    if job is None:
+        return
+    earliest = datetime.now().astimezone() + timedelta(
+        seconds=_STARTUP_KICK_DELAY_SECONDS
+    )
+    current = job.next_run_time
+    if current is not None and current <= earliest:
+        return
+    scheduler.modify_job("price_refresh", next_run_time=earliest)
+    logger.info(
+        "[调度] 启动新鲜度补偿：池内 %d 个对象 24h 内有观察的占 %d%%（门槛 %d%%），"
+        "price_refresh 提前至 %s（跑完由轮转重锚归位网格）",
+        total,
+        round(share * 100),
+        round(_STARTUP_STALE_SHARE * 100),
+        earliest.strftime("%m-%d %H:%M"),
+    )
+
+
 async def _anchor_probe_after_start() -> None:
     """启动后外部时间纠偏探针：初锚是本地 zoneinfo 推算（同步上下文
     无法请求外网），异步请求外部时间权威源核对——非切换日两者恒一致，
@@ -1464,10 +1544,13 @@ async def _anchor_probe_after_start() -> None:
 
     服务频繁重启是常态，10s 延时避免启动风暴撞网；启动后第一格
     网格最远 6h，第一轮 price_refresh 触发时还会再重锚一次（双保险）。
+    重锚尾随启动新鲜度补偿：池数据整体过期时把首轮提前
+    （见 _kick_stale_price_refresh）。
     """
     try:
         await asyncio.sleep(10)
         await _reanchor_price_refresh("启动纠偏探针")
+        await _kick_stale_price_refresh()
     except Exception:  # noqa: BLE001
         logger.exception("[调度] 启动纠偏探针异常（不阻塞启动）")
 
