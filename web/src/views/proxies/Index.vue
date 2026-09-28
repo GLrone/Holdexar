@@ -28,6 +28,7 @@ const {
   kernelPhase,
   kernelVia,
   kernelSource,
+  syncAll,
 } = storeToRefs(proxyTasks)
 const items = ref<ProxyItem[]>([])
 const subscriptions = ref<ProxySubscriptionItem[]>([])
@@ -381,6 +382,18 @@ async function syncSubscription(sub: ProxySubscriptionItem) {
   } finally {
     syncingSubId.value = null
   }
+}
+
+/** 全部更新：顺序重拉每条订阅；进度在 proxyTasks store（切页不丢），
+ * 灵动岛任务位全程展示，完成后回到本页自动刷新列表 */
+const syncAllRunning = computed(() => syncAll.value !== null)
+
+async function syncAllSubscriptions() {
+  if (syncAllRunning.value) return
+  await proxyTasks.startSyncAll(
+    clashSubs.value.map((s) => ({ id: s.id, label: s.label })),
+  )
+  await load()
 }
 
 /** 废弃订阅显性确认：删除前提示其处于废弃状态（不可用 >95%） */
@@ -797,6 +810,22 @@ onMounted(async () => {
         </div>
 
         <!-- Clash 订阅（长期保存，可多条；废弃订阅红标置灰，方便快速定位） -->
+        <div class="proxyx-sub-toolbar">
+          <HlButton
+            art="outline"
+            tone="blue"
+            size="sm"
+            :disabled="syncAllRunning"
+            :loading="syncAllRunning"
+            @click="syncAllSubscriptions"
+          >
+            <HlIcon v-if="!syncAllRunning" name="refresh" />
+            {{ t(syncAllRunning ? 'proxies.sub.syncAllRunningLabel' : 'proxies.sub.syncAll') }}
+          </HlButton>
+          <span v-if="syncAll" class="proxyx-hint">
+            {{ t('proxies.sub.syncAllRunning', { done: syncAll.done, total: syncAll.total }) }}
+          </span>
+        </div>
         <div class="proxyx-sub-list">
           <label
             v-for="sub in clashSubs"
@@ -823,7 +852,7 @@ onMounted(async () => {
             </span>
             <div class="proxyx-sub-actions">
               <button class="pxbtn pxbtn--sm" @click.prevent="openEditSubscription(sub)">{{ t('proxies.sub.edit') }}</button>
-              <button class="pxbtn pxbtn--sm" :disabled="syncingSubId === sub.id" :aria-busy="syncingSubId === sub.id || undefined" @click.prevent="syncSubscription(sub)">
+              <button class="pxbtn pxbtn--sm" :disabled="syncingSubId === sub.id || syncAllRunning" :aria-busy="syncingSubId === sub.id || undefined" @click.prevent="syncSubscription(sub)">
                 <span v-if="syncingSubId === sub.id" class="hl-spinner hl-spinner--inline" aria-hidden="true" />
                 {{ t(syncingSubId === sub.id ? 'proxies.sub.syncing' : 'proxies.sub.refetch') }}
               </button>
@@ -1366,6 +1395,14 @@ onMounted(async () => {
   font-size: 11.5px;
   color: var(--text-muted);
   word-break: break-all;
+}
+
+/* 订阅列表工具行（全部更新按键） */
+.proxyx-sub-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  justify-content: flex-end;
 }
 
 /* 订阅列表（双方式共用） */
