@@ -29,6 +29,7 @@ from pathlib import Path
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.crawler.occupancy import crawler_busy
+from app.domains.proxypool.bridge import ingest_ledger, rebind_missing_sources
 from app.domains.proxypool.exits import exit_snapshot, select_exit_slots, slot_signature
 from app.domains.proxypool.health import (
     DEFAULT_BUSINESS_APPID,
@@ -168,6 +169,24 @@ async def run_l0_cycle(
     **写锁窗口**：池内探针按 `L0_COMMIT_EVERY` 分块，逐块提交——整池一次提交会随池规模
     把写锁按住数分钟，同时段其它 job 的写入会撞满 `busy_timeout`。
     """
+    # 两账本对齐（体检 → 池）：先按已准入订阅的最新成功快照补回缺失的来源关联
+    # （缺来源在合格集口径里等于出局，不补回就永久不可探），再把已落库的节点体检
+    # 结论按来源推进池账本。前沿放在合格集快照之前——复活节点带来的合格集变化由
+    # 下面的 before/after 比较照常请求重建，不新增调度、不新增信号。
+    # 对齐失败只记日志：它是维护动作，不得拖垮 L0 与重建判定。
+    try:
+        repaired = await rebind_missing_sources(session, now=now)
+        if repaired:
+            logger.info("[来源补回] 订阅 %s 的来源关联按最新快照补齐", list(repaired))
+        ingested = await ingest_ledger(session, now=now)
+        if ingested.changed:
+            logger.info(
+                "[体检→池] 账本对齐：命中 %d（复活 %d / 新出口 %d，陈久跳过 %d）",
+                ingested.matched, ingested.activated, ingested.exit_ips_added,
+                ingested.skipped_stale,
+            )
+    except Exception:  # noqa: BLE001 —— 对齐失败不阻断 L0 与重建判定
+        logger.exception("[体检→池] 两账本对齐失败（本轮跳过）")
     before = await eligible_runtime_names(session)
     outcomes: list[HealthOutcome] = []
     targets = pool_file_names(data_dir)

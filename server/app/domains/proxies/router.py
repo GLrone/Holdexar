@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -13,6 +14,34 @@ from . import clash_manager, service
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/proxies", tags=["proxies"])
+
+
+async def _auto_promote_after_check(sub_id: int, alive: int) -> None:
+    """首检健康（可用节点 ≥ 1）即转正——与同步侧的自动准入同一把尺子。
+    快照尚未落库（刚导入、同步拍还没轮到）时晋升会失败：账本里的可用数
+    已写好，下一拍同步落快照时自动转正，这里只记日志不重试。"""
+
+    from app.core.database import get_session_factory
+    from app.domains.proxypool.admission import promote_to_active
+
+    if alive < 1:
+        return
+    try:
+        async with get_session_factory()() as session:
+            result = await promote_to_active(
+                session, subscription_id=sub_id,
+                data_dir=get_settings().data_dir, now=datetime.now(),
+            )
+            await session.commit()
+        if result.promoted:
+            logger.info(
+                "[准入] 订阅 %s 首检健康（可用 %d）→ 自动转正进池", sub_id, alive
+            )
+    except Exception as e:  # noqa: BLE001 —— 转正不成本身不构成首检失败
+        logger.info(
+            "[准入] 订阅 %s 首检健康（可用 %d）但暂不能转正（%s）；等同步落快照后自动转正",
+            sub_id, alive, e,
+        )
 
 
 class ProxyAdd(BaseModel):
@@ -60,6 +89,7 @@ def _spawn_first_check(sub_id: int, *, probe_all: bool = True) -> None:
                 "[订阅首检] Clash 订阅 %s：共 %s 节点，可用 %s",
                 sub_id, r.get("total"), r.get("alive"),
             )
+            await _auto_promote_after_check(sub_id, int(r.get("alive") or 0))
         except Exception:  # noqa: BLE001 —— 首检失败不影响内核已生效的事实
             logger.exception("[订阅首检] Clash 节点检测失败（可稍后手动检测）")
 

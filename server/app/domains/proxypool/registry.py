@@ -57,8 +57,10 @@ from app.domains.proxypool.models import (
     ProxyNode,
     ProxyNodeSource,
     SubscriptionSnapshot,
+    is_info_placeholder,
     make_runtime_name,
     node_fingerprint,
+    subscription_code,
 )
 from app.domains.proxypool.state import NODE_NEW, evaluate_node_state
 from app.domains.proxypool.subscription import Snapshot
@@ -120,6 +122,47 @@ async def _sources_of(session: AsyncSession, subscription_id: int) -> dict[str, 
     return {fingerprint: node_id for node_id, fingerprint in rows.all()}
 
 
+async def _inheritable_exit_ip(session: AsyncSession, node: Mapping) -> str | None:
+    """旧化身**已知的出口 IP**：机场频繁改写节点条目（重排序 / 换入口服务器 /
+    换内容版本号 `#N`），指纹与端点键都可能变，但**节点名主干**（去掉版本后缀）
+    是机场自己的节点身份——同一主干的新化身继承旧化身的出口身份，避免每轮
+    内容更新后池子裸探一轮、空窗期内爬取全拒。端点键相同也认（改名的情形）。
+
+    只认**最近 seen** 的同主干化身；同主干都没有已知出口时返回 `None`（交给 L1 正常
+    探测）。这是把已知事实带过内容更替，出口是否仍成立由 L1 持续复核。"""
+    name = str(node.get("name") or "")
+    base = _name_base(name)
+    server = node.get("server")
+    endpoint = (str(node.get("type") or ""), str(server or ""), str(node.get("port") or ""))
+    if not base and not all(endpoint):
+        return None
+    rows = await session.execute(
+        select(ProxyNode).order_by(ProxyNode.last_seen.desc())
+    )
+    fallback: str | None = None
+    for cand in rows.scalars():
+        if not cand.exit_ip:
+            continue
+        cand_base = _name_base(str((cand.normalized_config or {}).get("name") or ""))
+        cand_endpoint = (
+            str(cand.proxy_type or ""),
+            str(cand.server or ""),
+            str((cand.normalized_config or {}).get("port") or ""),
+        )
+        if base and cand_base == base:
+            return cand.exit_ip
+        if fallback is None and all(endpoint) and cand_endpoint == endpoint:
+            fallback = cand.exit_ip
+    return fallback
+
+
+def _name_base(name: str) -> str:
+    """节点名主干：去掉机场内容版本后缀（`…#23` → `…`）与空白。"""
+    import re
+
+    return re.sub(r"#\d+\s*$", "", name).strip()
+
+
 async def apply_snapshot(
     session: AsyncSession,
     *,
@@ -157,11 +200,16 @@ async def apply_snapshot(
 
     desired: dict[str, Mapping] = {}
     for node in snapshot.nodes:
+        # 信息占位节点（旧快照重放仍可能携带）不进 Registry——它们不是代理端点
+        if is_info_placeholder(str(node.get("name") or "")):
+            continue
         desired.setdefault(node_fingerprint(node), node)
     desired_fp = set(desired)
 
     existing = await _sources_of(session, subscription_id)
     taken = await _minted_names(session, subscription_id)
+    # 本订阅的特征码：写进每一条来源关联，体检结果据此对齐回池账本
+    code = subscription_code(subscription_id)
 
     created: list[str] = []
     refreshed: list[str] = []
@@ -181,6 +229,7 @@ async def apply_snapshot(
                 )
             ).scalar_one()
             source.original_name = original_name
+            source.source_code = code
             source.last_seen = now
             refreshed.append(fingerprint)
             touched.add(node_id)
@@ -206,6 +255,10 @@ async def apply_snapshot(
                 first_seen=now,
                 last_seen=now,
                 last_source_seen=now,
+                # 端点身份相同的旧节点携带着**已知的出口身份**：机场改名单 /
+                # 换内容版本号（指纹变、type|server|port 不变）时把 exit_ip 继承
+                # 过来——否则每次内容更新都要裸探一轮，空窗期内爬取全部被拒
+                exit_ip=await _inheritable_exit_ip(session, node),
             )
             session.add(row)
             created.append(fingerprint)
@@ -215,6 +268,7 @@ async def apply_snapshot(
                 node_id=row.node_id,
                 subscription_id=subscription_id,
                 original_name=original_name,
+                source_code=code,
                 first_seen=now,
                 last_seen=now,
             )

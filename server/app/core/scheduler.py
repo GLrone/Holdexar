@@ -751,11 +751,12 @@ async def _startup_pool_runtime() -> None:
 
 
 async def _startup_subscription_sync() -> None:
-    """启动链的一步：订阅全量同步（排在池 Runtime 就位**之后**）。
+    """启动链的一步：订阅同步（排在池 Runtime 就位**之后**，只刷自动更新的订阅）。
 
     内核就位不等订阅下载——bootstrap 冷路径直接吃持久化 Registry 起核，本步
-    再全量拉一遍（含关闭自动更新的订阅：手动重拉语义不受限）。池签名变化 →
-    置 `rebuild_pending` 并就地消费一次（热重载优先，启动期 crawler 必然空闲）；
+    按 30min 刷新同一口径拉一遍（`only_auto=True`：限时订阅关了自动更新就不
+    在启动时撞死链，换链接后的重拉是用户的手动动作）。池签名变化 → 置
+    `rebuild_pending` 并就地消费一次（热重载优先，启动期 crawler 必然空闲）；
     Runtime 尚不可用时不消费——把它拉起来是 bootstrap 的职责，交给 30min 刷新
     的 `ensure_pool_runtime`。失败只留日志：下一拍订阅刷新是下一次机会。
     """
@@ -772,7 +773,9 @@ async def _startup_subscription_sync() -> None:
         data_dir = get_settings().data_dir
         async with get_session_factory()() as session:
             before = await _bs.pool_signature(session)
-            sync = await _bs.sync_subscriptions(session, data_dir=data_dir, now=datetime.now())
+            sync = await _bs.sync_subscriptions(
+                session, data_dir=data_dir, now=datetime.now(), only_auto=True
+            )
             await session.commit()
             after = await _bs.pool_signature(session)
         failed = len(sync.failures)

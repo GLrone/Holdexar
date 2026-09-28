@@ -191,8 +191,12 @@ async def test_recovery_batch_is_limited_and_oldest_first(env, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_recovery_prioritises_nodes_already_accumulating(env, monkeypatch):
-    """已在累计失败的节点先收口：否则要等轮转一整圈才回到它，退休线长期不可达。"""
+async def test_recovery_rotates_by_least_recently_probed(env, monkeypatch):
+    """轮转次序只由「上次被探的时刻」决定，累计失败次数不插队。
+
+    慢性失败节点若永远排最前，其余节点要等轮转一整圈才回到它，回收集的
+    覆盖率会长期为零——轮转的职责是让每个出池节点都被碰到。
+    """
     await init_db()
     await _add_node(node_id="fresh", state=NODE_DEAD, failures=0,
                     last_probe=NOW - timedelta(hours=5))
@@ -205,6 +209,6 @@ async def test_recovery_prioritises_nodes_already_accumulating(env, monkeypatch)
         )
         await s.commit()
 
-    assert probed == ["sub-failing"], "累计中的先探，才能走到既有退休终点"
-    assert (await _node("failing")).consecutive_failures == 2
-    assert (await _node("fresh")).consecutive_failures == 0, "未选中节点不得被回填"
+    assert probed == ["sub-fresh"], "最久没探过的先来，与累计失败次数无关"
+    assert (await _node("fresh")).consecutive_failures == 1
+    assert (await _node("failing")).consecutive_failures == 1, "未选中节点不得被回填"

@@ -58,8 +58,9 @@ PROBE_TARGET_URL = "http://www.gstatic.com/generate_204"
 PROBE_LEVEL = "L0"
 DEFAULT_TIMEOUT_MS = 5000
 # DEAD 恢复探测每轮上限：DEAD 不在池文件里，池内 L0 探不到它，没有这条路节点一旦
-# DEAD 就永久出局。分批轮转补探，且批小到不会把 L0 的写事务窗口拉长（写锁问题）。
-RECOVERY_BATCH_SIZE = 4
+# DEAD 就永久出局。分批轮转补探；批大小同时受 L0 写事务窗口约束，取值以「一轮能
+# 覆盖可回收集的显著比例」为准，不随池规模无限放大。
+RECOVERY_BATCH_SIZE = 24
 
 # ── L1：出口 IP ──────────────────────────────────────────────────
 L1_LEVEL = "L1"
@@ -329,10 +330,10 @@ async def recover_dead_nodes(
 ) -> tuple[HealthOutcome, ...]:
     """对 DEAD 节点分批做 L0 恢复探测：成功回 `ACTIVE` 并清零计数，失败保持 `DEAD` 并累加。
 
-    分批轮转：**已在累计失败的最先收口**（否则要等轮转一整圈才回到它，退休线在很长时间里
-    不可达），其余按「最久没有被探过」排序（`health_observations` 的最后一条），一次只取
-    `batch` 个——DEAD 不一次性全打出去，也不新建调度系统。成功使节点重新合格，
-    合格集变化由 `run_l0_cycle` 既有的 before/after 比较去请求重建。
+    分批轮转：按「最久没有被探过」排序（`health_observations` 的最后一条），一次只取
+    `batch` 个——退休线不可达的慢性失败节点若永远排在最前，其余节点要等轮转一整圈才
+    回到，回收覆盖率会长期为零。DEAD 不一次性全打出去，也不新建调度系统。成功使节点
+    重新合格，合格集变化由 `run_l0_cycle` 既有的 before/after 比较去请求重建。
 
     `controller_url` 指向**持有这些节点配置的内核**（DEAD 不在池文件里，池内核不认识
     它们的名字）。没有来源名的节点无法定位到内核里的配置，跳过不动它。
@@ -362,7 +363,6 @@ async def recover_dead_nodes(
         .outerjoin(last_probe, last_probe.c.node_id == ProxyNode.node_id)
         .where(ProxyNode.state.in_((NODE_DEAD, NODE_RETIRED)))
         .order_by(
-            ProxyNode.consecutive_failures.desc(),
             last_probe.c.last_at.asc().nullsfirst(),
             ProxyNode.node_id,
         )

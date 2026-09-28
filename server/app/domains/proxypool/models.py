@@ -44,6 +44,21 @@ _IGNORE_FOR_FP = frozenset({
     "dialer-proxy", "interface-name", "routing-mark",
 })
 
+# 机场信息占位节点的名称特征：它们是机场公告位（剩余流量 / 到期 / 官网 / 套餐
+# / 重置等），不是可用的代理端点——进了池会占出口工位、污染 GLOBAL 选择、
+# 让出口探测记下垃圾归属；且内容随订阅更新漂移（「剩余流量：31.01 GB」每次
+# 拉取都变），同名会反复重生。
+_INFO_NAME_PATTERNS = (
+    "剩余", "到期", "过期", "官网", "套餐", "重置",
+    "有效期", "可用设备", "防失联", "失联",
+)
+
+
+def is_info_placeholder(name: str) -> bool:
+    """节点名是否为机场信息占位节点（非可用代理端点，不得进池）。"""
+    text = str(name or "")
+    return any(p in text for p in _INFO_NAME_PATTERNS)
+
 
 def node_fingerprint(config: dict) -> str:
     """节点指纹：剔除消费侧噪声后规范化 JSON 的 sha256。
@@ -73,6 +88,16 @@ def make_runtime_name(subscription_id: int | str, original_name: str, taken: set
         suffix += 1
         candidate = f"{base}#{suffix}"
     return candidate
+
+
+def subscription_code(subscription_id: int | str) -> str:
+    """订阅来源特征码：`sd<订阅 id>`。
+
+    节点来源关联上的稳定短标识——体检结果、池账本与界面都按它指认「这个节点
+    是哪条订阅提供的」。id 在订阅表内唯一，因此同机场的两条订阅（哪怕节点
+    完全重名）各有各的码，不会互相当成对方。
+    """
+    return f"sd{int(subscription_id)}"
 
 
 class ProxyNode(Base):
@@ -146,6 +171,8 @@ class ProxyNodeSource(Base):
     node_id: Mapped[str] = mapped_column(String(64))
     subscription_id: Mapped[int] = mapped_column(Integer, index=True)
     original_name: Mapped[str] = mapped_column(String(255))
+    # 来源特征码（`sd<订阅 id>`）：体检结果按它对齐回池账本，跨订阅同名节点可区分
+    source_code: Mapped[str] = mapped_column(String(32), default="")
     first_seen: Mapped[datetime | None] = mapped_column(DateTime)
     last_seen: Mapped[datetime | None] = mapped_column(DateTime)
 
