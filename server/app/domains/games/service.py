@@ -57,6 +57,10 @@ from app.crawler.config import CC_LIST
 
 TOLERANCE_FEN = 500  # 5 元容差（分）
 
+# 永降徽章时效窗（天）：与前端 priceFlag 的 PP_FLAG_WINDOW_DAYS 同一产品语义，
+# 降价动态 feed 的 SQL 过滤按它收口——窗外跳变的 pp 行前端不打徽章
+PP_FLAG_WINDOW_DAYS = 14
+
 logger = logging.getLogger(__name__)
 
 # 游戏商店默认隐藏 DLC；白名单豁免个别确需常驻的 DLC（黄金树幽影 / 艾尔登法环）
@@ -310,7 +314,23 @@ def _build_filter_conditions(
     elif flag == "pp":
         conditions.append(g.pp_flag == 1)
     elif flag == "any":
-        conditions.append(or_(g.hl_flag.in_((1, 2)), g.pp_flag == 1))
+        # 降价动态 feed 与徽章三态同口径（仪表盘两处徽章 v-if 是判据源头）：
+        # 史低行恒入（前端必有新史低/平史低徽章）；永降行只收时效窗内的
+        # 跳变且不打折——窗外跳变或打折中的 pp 行前端都不打永降徽章，
+        # 混进 feed 即成无徽章原价行（板块失真）。pp_changed_at 与
+        # refresh_pp_flags 写入同钟基（naive 北京时间），窗口起点用同一时钟。
+        conditions.append(
+            or_(
+                g.hl_flag.in_((1, 2)),
+                and_(
+                    g.pp_flag == 1,
+                    func.coalesce(cn.discount_percent, 0) == 0,
+                    g.pp_changed_at.is_not(None),
+                    g.pp_changed_at
+                    >= get_beijing_time_obj() - timedelta(days=PP_FLAG_WINDOW_DAYS),
+                ),
+            )
+        )
     if top100_appids is not None:
         # [Top100] 榜内过滤（appid 集合注入）
         conditions.append(g.appid.in_(top100_appids))
