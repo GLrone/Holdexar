@@ -24,6 +24,7 @@ import { isPermChangeRecent } from '@/lib/priceFlag'
 import { priceDataView } from '@/lib/priceDataView'
 import { selectableVariants, versionSelectOptions } from '@/lib/versions'
 import HlSelect from '@/components/ui/HlSelect.vue'
+import RegionFlag from '@/components/RegionFlag.vue'
 import PriceTrendDrawer from './PriceTrendDrawer.vue'
 
 function formatCnyText(fen: number): string {
@@ -746,10 +747,6 @@ const seriesMembers = computed(() => {
     return (a.cnPriceFen ?? Number.MAX_SAFE_INTEGER) - (b.cnPriceFen ?? Number.MAX_SAFE_INTEGER)
   })
 })
-
-function lowestRegionName(code: string): string {
-  return regionsStore.regionName(code)
-}
 
 /**
  * 换游戏时清掉**按游戏取数**的那几样：列表布局的卡片实例按 index 复用
@@ -1584,7 +1581,7 @@ const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/asse
                     v-if="b.lowestPriceFen !== null"
                     :style="{ fontSize: '10px', color: b.diffFen > 0 ? 'var(--success)' : 'var(--text-muted)' }"
                   >
-                    {{ lowestRegionName(b.lowestRegion) }} ¥{{ (b.lowestPriceFen / 100).toFixed(0) }}
+                    <RegionFlag :code="b.lowestRegion" compact /> ¥{{ (b.lowestPriceFen / 100).toFixed(0) }}
                   </span>
                   <span
                     v-if="b.diffFen > 0"
