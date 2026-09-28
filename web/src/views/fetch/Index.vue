@@ -94,6 +94,15 @@ async function toggle(key: keyof FetchSettingsPayload, on: boolean) {
   if (ok) message.success(t(on ? 'fetch.toast.on' : 'fetch.toast.off'))
 }
 
+/** 目录层随价格更新开关：只落偏好，改动从下一轮价格更新生效 */
+async function toggleCatalog(on: boolean) {
+  if (saving.value) return
+  savingKey.value = 'catalog_refresh'
+  const ok = await save({ catalog_refresh: on })
+  savingKey.value = null
+  if (ok) message.success(t(on ? 'fetch.catalog.toastOn' : 'fetch.catalog.toastOff'))
+}
+
 async function changeInterval(raw: string | number) {
   if (saving.value) return
   const hours = Number(raw)
@@ -180,6 +189,20 @@ onMounted(load)
           />
         </div>
         <p class="fetch-row__desc">{{ t('fetch.interval.desc') }}</p>
+      </div>
+
+      <div class="fetch-row">
+        <div class="fetch-row__line">
+          <span class="fetch-row__label">{{ t('fetch.catalog.label') }}</span>
+          <HlSwitch
+            :model-value="prefs.catalog_refresh"
+            accent
+            :disabled="saving"
+            :label="t('fetch.catalog.label')"
+            @update:model-value="toggleCatalog"
+          />
+        </div>
+        <p class="fetch-row__desc">{{ t('fetch.catalog.desc') }}</p>
       </div>
 
       <div v-for="row in ROWS" :key="row.key" class="fetch-row">
