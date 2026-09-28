@@ -1,11 +1,11 @@
 """wishlist 域服务：账户绑定 / 愿望单同步 / 监控池管理（条目增删）。
 
-监控池四来源：愿望单/已购同步（账户）、星标关注（manual）、手动入池
-（manual_pool）、榜单发现源轮询落池（board_pool，ensure_board_pool）。
-愿望单与关注系统是叠加在监控条目之上的爬取第一优先级（wishlisted /
-manual 标记，见 domains.crawl 的队列排序），监控池管理（add_pool_items /
-remove_pool_items / ensure_board_pool）负责监控条目的增删与批量操作——
-池内所有游戏均为必须爬取的对象。
+监控池两路来源：账户同步（愿望单/已购，落 wishlist_items 活跃行）与
+项目自加（星标关注、手动入池、榜单落池，直挂 monitor_sources，不落
+账户名下）。愿望单与关注系统是叠加在监控条目之上的爬取第一优先级
+（wishlisted / manual 标记，见 domains.crawl 的队列排序），监控池管理
+（add_pool_items / remove_pool_items / ensure_board_pool）负责监控条目的
+增删与批量操作——池内所有游戏均为必须爬取的对象。
 
 数据源（对齐 07_user_misc/fetch_user_games.py）：
 - 愿望单 IWishlistService/GetWishlist/v1 —— 免 Key，公开资料可读
@@ -994,25 +994,13 @@ async def ownership(appids: list[int]) -> dict:
 
 # ── 监控池管理：监控条目的添加 / 移除 ──────────────────────────
 #
-# 监控池 = wishlist_items 的活跃行（监控条目），池内所有游戏均为必须
-# 爬取的对象；愿望单（wishlisted）与星标关注（manual）是叠加在监控条目
-# 之上的爬取第一优先级。本节的增删操作与账户同步的差异：
-# - 添加不要求 Steam 侧名单变化（manual_pool 条目），但要求绑定账户
-#   （条目行的主键身份是 steamid）；
-# - 移除以 excluded 挡同步复活——Steam 愿望单/已购侧仍在名单时，15min
-#   一轮的账户同步不会把用户删掉的条目洗回来。
-
-
-async def resolve_pool_steamid() -> str:
-    """新监控条目的落行身份：主账号优先，回退设置页手填。"""
-    from app.domains.account import service as account_service
-
-    primary = await account_service.get_primary_steam_id()
-    if primary:
-        return primary
-    from app.domains.settings.service import get_value
-
-    return ((await get_value("account.steam_id", "")) or "").strip()
+# 监控池对象两路落点：账户同步写 wishlist_items 活跃行（Steam 账户事实）；
+# 项目自加直挂 monitor_sources 来源（不落任何账户名下，不要求绑定账户）。
+# 池内所有游戏均为必须爬取的对象；愿望单（wishlisted）与星标关注
+# （manual）是叠加在监控条目之上的爬取第一优先级。本节的增删操作与
+# 账户同步的差异：
+# - 移除以 monitor_exclusions 挡复活——Steam 愿望单/已购侧仍在名单时，
+#   15min 一轮的账户同步不会把用户删掉的条目洗回来。
 
 
 async def _refresh_item_counts(session, steamids: set[str]) -> None:
@@ -1065,13 +1053,14 @@ async def _sync_monitoring(appids: list[int], *, exclusion: bool | None = None) 
 async def ensure_board_pool(appids: list[int]) -> dict:
     """榜单发现源落池（持久监控）：本轮榜整批并入监控池。
 
-    - 无行：主账号身份新建 board_pool 条目——属普通监控条目（随全池轮
-      刷新），不产生愿望单/关注标记、不触发爬取（反哺链自行首爬）；
-    - 活跃行：跳过（不动既有来源标记；在池行顺手清移除标做状态一致性，
-      与 add_pool_items 同款防御，脱池行不触碰）；
-    - 脱池行（excluded 等全组非活跃）：跳过不复活——用户手动移出的榜单
-      游戏不被每轮榜单轮询洗回（重新手动添加才回到池）；
-    - 无绑定账户：ValueError（调用方按「跳过落池、反哺照常」处理）。
+    真身直写监控层（monitor_sources 的 board 来源），不落任何 Steam 账户
+    名下——账户事实与条目数不被榜单批次虚增，也不要求已绑定账户；条目
+    随全池轮刷新，首爬由同批反哺链完成。
+
+    - 无 board 来源：挂 board 来源入池；
+    - 已在池：跳过（不动其它来源）；
+    - 用户移除过的（board 来源已摘除或排除在案）：跳过不复活——重新
+      手动添加才回到池。
 
     返回 {added, exists, skipped}。
     """
@@ -1088,62 +1077,55 @@ async def ensure_board_pool(appids: list[int]) -> dict:
     if not clean:
         return {"added": 0, "exists": 0, "skipped": 0}
 
+    from app.domains.monitoring import service as monitoring_service
+    from app.domains.monitoring.models import MonitorExclusion, MonitorSource
+
     added = exists = skipped = 0
     async with get_session_factory()() as session:
-        rows = (
-            (
+        board_rows = {
+            int(r.target_id): bool(r.active)
+            for r in (
                 await session.execute(
-                    select(WishlistItem).where(WishlistItem.appid.in_(clean))
-                )
-            )
-            .scalars()
-            .all()
-        )
-        by_appid: dict[int, list[WishlistItem]] = {}
-        for row in rows:
-            by_appid.setdefault(int(row.appid), []).append(row)
-
-        need_new = [a for a in clean if a not in by_appid]
-        new_steamid: str | None = None
-        if need_new:
-            new_steamid = await resolve_pool_steamid()
-            if not new_steamid:
-                raise ValueError("尚未绑定 SteamID64（榜单发现源无法落池）")
-            now = _naive(get_beijing_time_obj())
-            for a in need_new:
-                session.add(
-                    WishlistItem(
-                        steamid=new_steamid,
-                        appid=a,
-                        added_at=now,
-                        active=True,
-                        owned=False,
-                        manual=False,
-                        manual_pool=False,
-                        board_pool=True,
+                    select(MonitorSource.target_id, MonitorSource.active).where(
+                        MonitorSource.target_type == "game",
+                        MonitorSource.source == "board",
+                        MonitorSource.target_id.in_(clean),
                     )
                 )
+            ).all()
+        }
+        excluded_ids = {
+            int(r[0])
+            for r in (
+                await session.execute(
+                    select(MonitorExclusion.target_id).where(
+                        MonitorExclusion.target_type == "game",
+                        MonitorExclusion.target_id.in_(clean),
+                        MonitorExclusion.active.is_(True),
+                    )
+                )
+            ).all()
+        }
 
-        for appid in clean:
-            group = by_appid.get(appid)
-            if group is None:
-                added += 1
-                continue
-            if any(r.active for r in group):
-                exists += 1
-                for r in group:
-                    if r.active:
-                        r.excluded = False  # 在池条目不应带移除标
-                continue
+    states = await monitoring_service.states_of("game", clean)
+
+    for appid in clean:
+        if appid in excluded_ids or states.get(appid) == "excluded":
             skipped += 1
-
-        await _refresh_item_counts(
-            session,
-            {r.steamid for r in rows} | ({new_steamid} if new_steamid else set()),
-        )
-        await session.commit()
-
-    await _sync_monitoring(clean)
+            continue
+        if states.get(appid) == "active":
+            exists += 1
+            continue
+        board_active = board_rows.get(appid)
+        if board_active:
+            exists += 1
+            continue
+        if board_active is not None:
+            # board 来源已被摘（用户移出 / 业务态脱池）——轮询不复活
+            skipped += 1
+            continue
+        await monitoring_service.ensure_source("game", appid, "board")
+        added += 1
 
     if added or skipped:
         logger.info(
@@ -1242,9 +1224,9 @@ async def add_pool_items(
 async def remove_pool_items(appids: list[int], *, reason: str = "pool_removed") -> dict:
     """批量移除监控条目（从「我的关注」移除）。
 
-    - 摘掉用户显式来源（manual / favorite）并把对象置为排除：excluded 挡住
-      账号同步复活——Steam 愿望单/已购侧仍在名单时，15min 一轮的账号同步
-      不会把用户移出的条目洗回来；
+    - 摘掉该对象的所有可摘来源（manual / favorite / board）并置为排除：
+      excluded 挡住账号同步复活——Steam 愿望单/已购侧仍在名单时，15min
+      一轮的账号同步不会把用户移出的条目洗回来；
     - 历史 wishlist_items 行一并脱池并清星标标（Steam 账户来源数据，仅供
       账号同步对账）；
     - 移除不是删除：Catalog / 价格历史 / 来源行全保留。
@@ -1289,7 +1271,9 @@ async def remove_pool_items(appids: list[int], *, reason: str = "pool_removed") 
             await session.commit()
 
         for appid in clean:
-            user_source = sources.get(appid, set()) & {"manual", "favorite"}
+            # 榜单来源一并摘：board 由落池动作直管，不经账号对账，移除时
+            # 须显式摘除（配合排除挡住榜单轮询复活）
+            user_source = sources.get(appid, set()) & {"manual", "favorite", "board"}
             if user_source:
                 for src in user_source:
                     await monitoring_service.detach_source("game", appid, src)

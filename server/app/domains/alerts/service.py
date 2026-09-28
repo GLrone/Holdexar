@@ -481,11 +481,11 @@ def _pick_region_row(prices: list[dict], owner_region: str) -> dict:
 
 
 async def check_wishlist_deals() -> list[dict]:
-    """监控池折扣速报：池内（愿望单 / 星标 / 手动入池）出现新折扣即通报。
+    """监控池折扣速报：池内（愿望单 / 星标）出现新折扣即通报。
 
-    监控范围＝用户主动关注的条目；榜单发现入池（board_pool）是发现面、
-    已拥有的条目是推荐无用面，两者都不参与。命中非空才发信，且只挑折扣
-    最深的 DEAL_PICKS 款。
+    监控范围＝wishlist_items 账户事实行里的主动关注条目；榜单发现入池
+    （board 来源）是发现面、已拥有的条目是推荐无用面，两者都不参与。
+    命中非空才发信，且只挑折扣最深的 DEAL_PICKS 款。
 
     去重是双重闸：同类速报 20h 上限（价格网格 6h 一轮 → 每天最多一封）＋
     逐款折扣游标（同一款只有折扣进一步加深才再次上榜）。游标随本轮候选
@@ -511,10 +511,11 @@ async def check_wishlist_deals() -> list[dict]:
                 .where(
                     WishlistItem.active.is_(True),
                     WishlistItem.owned.is_(False),
+                    # 愿望单成员 / 星标关注（账户事实行）；项目自加条目不落
+                    # 此表，折扣速报的候选面随账户事实走
                     or_(
                         WishlistItem.wishlisted.is_(True),
                         WishlistItem.manual.is_(True),
-                        WishlistItem.manual_pool.is_(True),
                     ),
                     GameCurrentPrice.price_status == "ok",
                     GameCurrentPrice.discount_percent >= DEAL_MIN_DISCOUNT,

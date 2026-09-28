@@ -93,6 +93,9 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "discount_desc": "VARCHAR(60)",
         "bundle_id": "INTEGER",
         "bundle_discount_pct": "INTEGER",
+        # 所属 Steam 活动周期标签（steam_events.event_key；观测写入时打标 +
+        # 同步后按窗口回贴，NULL = 不属于任何已知活动窗口）
+        "steam_event_key": "VARCHAR(60)",
     },
     # 捆绑包形态列：链接/CDN 用（与购买语义 mps 解耦）
     # + 排序快照预计算列（对齐 games：min_cny_fen/diff_fen/is_lowest；
@@ -137,6 +140,11 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         # 自动更新订阅：0 = 只手动重拉。限时订阅（只能在其窗口内下载、下载后
         # 可长期使用）关掉它，就不会每轮定时刷新都去撞一次注定失败的抓取。
         "auto_refresh": "BOOLEAN DEFAULT 1",
+    },
+    # 订阅来源特征码：节点来源关联上挂的稳定短标识（sd<订阅 id>），
+    # 体检结果按它对齐回池账本，同机场多订阅也互不混淆
+    "proxy_node_sources": {
+        "source_code": "VARCHAR(32) NOT NULL DEFAULT ''",
     },
     "subscription_snapshots": {
         "url": "VARCHAR(500)",
@@ -282,7 +290,7 @@ def _ensure_schema(sync_conn) -> None:
 #   2. _MIGRATIONS 追加 (版本号, 描述, SQL 列表)；SQL 须幂等（中断续跑 +
 #      用户库版本乱序防御），复杂逻辑可登记 async fn(engine) 同位元素
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
 
 # 零小数货币（Steam 以整数计价）：旧捆绑包链路的除数表按 1 处理，与「统一存分」
 # 的新约定差 100 倍——v2 归一的目标集合
@@ -645,6 +653,148 @@ async def _migrate_monitoring_bootstrap(conn) -> None:
     )
 
 
+async def _migrate_pool_flags_retire(conn) -> None:
+    """v10：项目旗标行退役（wishlist_items 回归纯 Steam 账户事实表）。
+
+    榜单落池（board_pool）与手动入池（manual_pool）条目的真身在监控层
+    （monitor_targets / monitor_sources / monitor_exclusions），wishlist_items
+    里的旗标行此后不再承担任何语义——落池动作直写监控层，不再落账户名下；
+    账户侧统计（愿望单数 / 条目数）随之回归真实 Steam 事实。
+
+    清洗顺序（先行后清）：
+    - 补齐监控层：仍带项目旗标的行按 v9 同款 INSERT OR IGNORE 补
+      targets / sources / exclusions（已升级过 v9 的库重跑无副作用）；
+    - 混合行（同时带 wishlisted / owned / 星标旗标）：只清项目旗标，行保留
+      ——Steam 侧事实不动；
+    - 纯项目行（除项目旗标外全空）：删除。
+    幂等：重跑时已无项目旗标行，各段空转；item_count 为全量重算，结果恒同。
+    """
+    from sqlalchemy import text
+
+    from app.crawler.utils import get_beijing_time_obj
+
+    now = get_beijing_time_obj().replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+
+    prio = (
+        "MAX(CASE WHEN COALESCE(manual, 0) = 1 THEN 100"
+        " WHEN COALESCE(wishlisted, 0) = 1 THEN 95"
+        " WHEN COALESCE(manual_pool, 0) = 1 THEN 60"
+        " WHEN COALESCE(owned, 0) = 1 THEN 40"
+        " WHEN COALESCE(board_pool, 0) = 1 THEN 20 ELSE 0 END)"
+    )
+    _project_flag = "(COALESCE(board_pool, 0) = 1 OR COALESCE(manual_pool, 0) = 1)"
+
+    # 1) 活跃项目行 → 监控层真身补齐
+    await conn.execute(
+        text(
+            "INSERT OR IGNORE INTO monitor_targets"
+            " (target_type, target_id, state, priority, created_at, updated_at, activated_at)"
+            f" SELECT 'game', appid, 'active', {prio}, :now, :now, :now"
+            f" FROM wishlist_items WHERE active = 1 AND {_project_flag} GROUP BY appid"
+        ),
+        {"now": now},
+    )
+    for flag, source, priority in (
+        ("manual_pool", "manual", 60),
+        ("board_pool", "board", 20),
+    ):
+        await conn.execute(
+            text(
+                "INSERT OR IGNORE INTO monitor_sources"
+                " (target_type, target_id, source, priority, active, created_at, updated_at)"
+                f" SELECT 'game', appid, :source, {priority}, 1, :now, :now"
+                f" FROM wishlist_items WHERE active = 1 AND COALESCE({flag}, 0) = 1"
+                " GROUP BY appid"
+            ),
+            {"source": source, "now": now},
+        )
+        await conn.execute(
+            text(
+                "UPDATE monitor_sources SET active = 1, priority = :priority, updated_at = :now"
+                " WHERE target_type = 'game' AND source = :source AND target_id IN"
+                f" (SELECT appid FROM wishlist_items WHERE active = 1 AND COALESCE({flag}, 0) = 1)"
+            ),
+            {"source": source, "priority": priority, "now": now},
+        )
+
+    # 2) 非活跃项目行（用户手动移出）→ 排除真身补齐（排除 free_kind='f2p'：
+    #    那是业务状态脱池，不是用户意图）
+    _removed_where = (
+        "active = 0 AND COALESCE(excluded, 0) = 1"
+        f" AND {_project_flag}"
+        " AND appid NOT IN (SELECT appid FROM wishlist_items WHERE active = 1)"
+        " AND appid NOT IN (SELECT appid FROM games WHERE free_kind = 'f2p')"
+    )
+    await conn.execute(
+        text(
+            "INSERT OR IGNORE INTO monitor_targets"
+            " (target_type, target_id, state, priority, created_at, updated_at, excluded_at)"
+            " SELECT 'game', appid, 'excluded', 0, :now, :now, :now"
+            f" FROM wishlist_items WHERE {_removed_where} GROUP BY appid"
+        ),
+        {"now": now},
+    )
+    await conn.execute(
+        text(
+            "INSERT OR IGNORE INTO monitor_exclusions"
+            " (target_type, target_id, reason, active, created_at)"
+            " SELECT 'game', appid, 'wishlist_removed', 1, :now"
+            f" FROM wishlist_items WHERE {_removed_where} GROUP BY appid"
+        ),
+        {"now": now},
+    )
+
+    # 3) 混合行清项目旗标（Steam 侧事实行保留），纯项目行删除
+    _has_account_fact = (
+        "(COALESCE(wishlisted, 0) = 1 OR COALESCE(owned, 0) = 1 OR COALESCE(manual, 0) = 1)"
+    )
+    await conn.execute(
+        text(
+            "UPDATE wishlist_items SET board_pool = 0"
+            f" WHERE COALESCE(board_pool, 0) = 1 AND {_has_account_fact}"
+        )
+    )
+    await conn.execute(
+        text(
+            "UPDATE wishlist_items SET manual_pool = 0"
+            f" WHERE COALESCE(manual_pool, 0) = 1 AND {_has_account_fact}"
+        )
+    )
+    await conn.execute(
+        text(
+            "DELETE FROM wishlist_items"
+            f" WHERE {_project_flag}"
+            " AND COALESCE(wishlisted, 0) = 0 AND COALESCE(owned, 0) = 0"
+            " AND COALESCE(manual, 0) = 0"
+        )
+    )
+
+    # 4) 受影响账户条目数重算（全量重算，追踪账户个位数，成本可忽略）
+    await conn.execute(
+        text(
+            "UPDATE tracked_accounts SET item_count = ("
+            " SELECT COUNT(*) FROM wishlist_items wi"
+            " WHERE wi.steamid = tracked_accounts.steamid AND wi.active = 1)"
+        )
+    )
+
+
+async def _migrate_cycle_coverage_snapshot(conn) -> None:
+    """price_cycles 补 coverage_json 列（幂等：列已存在即跳过）。
+
+    新装库经 create_all 建表时已带模型列，直接 ALTER 会撞重复列名；
+    存量库无该列，补上后由收敛统计冻结填充。
+    """
+    from sqlalchemy import text
+
+    cols = await conn.execute(text("PRAGMA table_info(price_cycles)"))
+    existing = {row[1] for row in cols}
+    if "coverage_json" not in existing:
+        await conn.execute(
+            text("ALTER TABLE price_cycles ADD COLUMN coverage_json JSON")
+        )
+
+
 # (目标版本, 说明, 迁移体)：迁移体 = SQL 语句列表，或 async callable(engine)
 _MIGRATIONS: list[tuple[int, str, object]] = [
     (2, "bundle_region_prices 零小数货币单位归一（元→分 + cny_fen 去虚高）",
@@ -684,6 +834,13 @@ _MIGRATIONS: list[tuple[int, str, object]] = [
     (9, "监控层初始化（wishlist_items 现状 → monitor_sources / monitor_targets："
         "家族愿望单与手动入池等既有来源搬迁为 Tracking Source，games 全表不搬迁）",
      _migrate_monitoring_bootstrap),
+    (10, "wishlist_items 项目旗标行退役（榜单落池/手动入池真身归监控层，"
+         "账户统计回归真实 Steam 事实）",
+     _migrate_pool_flags_retire),
+    (11, "price_cycles 对象级覆盖快照列（收敛时冻结 per-appid 五桶计数，"
+         "卡片覆盖改读快照——当前价表行随周期外写入滚动覆盖，旧轮窗口在活表上"
+         "不可复现，按窗口现算会把已收敛轮的覆盖率算成假塌陷）",
+     _migrate_cycle_coverage_snapshot),
 ]
 
 
@@ -829,6 +986,7 @@ async def init_db() -> None:
     from app.domains.rates import models as _rates_models  # noqa: F401
     from app.domains.regions import models as _regions_models  # noqa: F401
     from app.domains.settings import models as _settings_models  # noqa: F401
+    from app.domains.steam_events import models as _steam_events_models  # noqa: F401
     from app.domains.wishlist import models as _wishlist_models  # noqa: F401
     from app.domains.family import models as _family_models  # noqa: F401
     from app.domains.account import models as _account_models  # noqa: F401
