@@ -33,6 +33,7 @@ from app.domains.rates.router import router as rates_router
 from app.domains.redeem.router import router as redeem_router
 from app.domains.regions.router import router as regions_router
 from app.domains.settings.router import router as settings_router
+from app.domains.steam_events.router import router as steam_events_router
 from app.domains.system.router import router as system_router
 from app.domains.wishlist.router import router as wishlist_router
 
@@ -310,6 +311,16 @@ async def _post_startup_chain() -> None:
     except Exception:  # noqa: BLE001
         logger.exception("Epic 快照预热失败（不阻塞启动）")
 
+    # Steam 活动日历兜底同步：错过每日 05:00 定点时按快照龄补（>72h 才真正
+    # 抓取，幂等安全）；活动窗口是价格观测行周期标签的来源，排在调度器启动
+    # 前可让首轮观测带上标签。失败只记日志，旧数据继续展示。
+    try:
+        from app.domains.steam_events import service as steam_events_service
+
+        await steam_events_service.refresh_if_stale()
+    except Exception:  # noqa: BLE001
+        logger.exception("[启动] Steam 活动日历兜底同步失败（不阻塞启动）")
+
     # 调度器在收拾链跑完后才启动（链首说明的写锁竞态；空窗几秒~十几秒
     # 对 15min/6h 拍完全无感）
     start_scheduler()
@@ -456,6 +467,7 @@ def create_app() -> FastAPI:
     app.include_router(bills_router, prefix="/api/v1")
     app.include_router(family_router, prefix="/api/v1")
     app.include_router(redeem_router, prefix="/api/v1")
+    app.include_router(steam_events_router, prefix="/api/v1")
 
     dist = settings.web_dist_dir
     if (dist / "index.html").is_file():

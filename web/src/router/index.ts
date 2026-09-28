@@ -99,6 +99,11 @@ const router = createRouter({
       meta: titleKey('nav.bills'),
     },
     {
+      path: '/events',
+      component: () => import('@/views/events/Index.vue'),
+      meta: titleKey('nav.events'),
+    },
+    {
       path: '/settings',
       component: () => import('@/views/settings/Index.vue'),
       meta: titleKey('nav.me'),

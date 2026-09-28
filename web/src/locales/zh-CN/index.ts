@@ -71,6 +71,8 @@ import priceEvent from './priceEvent'
 import fetchPage from './fetch'
 // ── 灵动岛消息面（components/ui/HlIsland.vue，与组件同构）──
 import island from './island'
+// ── Steam 活动日历（views/events/Index.vue 与 SteamEventCountdown 卡片）──
+import steamEvents from './steamEvents'
 
 /** 全量中文词典 */
 export const messages = {
@@ -116,6 +118,7 @@ export const messages = {
   ...priceEvent,
   ...fetchPage,
   ...island,
+  ...steamEvents,
 } as const
 
 export type MessageKey = keyof typeof messages

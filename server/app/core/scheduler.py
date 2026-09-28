@@ -1328,6 +1328,23 @@ async def _job_epic_free() -> None:
         logger.exception("[调度] Epic 免费标记异常（次日自动重试）")
 
 
+async def _job_steam_events_sync() -> None:
+    """Steam 官方活动日历同步（每日一拍；校验门不过则保留旧数据）。
+    活动窗口是价格观测行周期标签的来源，回贴随同步幂等执行。"""
+    if not await content_fetch_enabled("fetch.steam_events"):
+        return  # 「Steam 活动日历」开关关闭：同步停转，已有数据保留展示
+    from app.domains.steam_events import service as steam_events_service
+
+    try:
+        result = await steam_events_service.sync()
+        logger.info(
+            "[调度] Steam 活动日历同步：%d 个活动（回贴价格观测 %d 行）",
+            result.get("count", 0), result.get("backfilled", 0),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("[调度] Steam 活动日历同步异常（次日自动重试）")
+
+
 async def _job_bartervg_bundles() -> None:
     """Barter.vg bundle 计数全量刷新（48h 新鲜度闸内跳过；计数只增，
     差量写入幂等，档案拉取失败保留库内旧值）。"""
@@ -1504,6 +1521,10 @@ def start_scheduler() -> None:
     scheduler.add_job(_job_free_promo_retry, "interval", hours=6, id="free_promo_retry")
     scheduler.add_job(_job_hb_choice, "cron", hour=6, minute=40, id="hb_choice")
     scheduler.add_job(_job_epic_free, "cron", hour=7, minute=10, id="epic_free")
+    # Steam 活动日历：官方文档页低频变更，每日一拍足够；05:00 避开已占分钟
+    scheduler.add_job(
+        _job_steam_events_sync, "cron", hour=5, minute=0, id="steam_events_sync"
+    )
     scheduler.add_job(_job_bartervg_bundles, "cron", hour=5, minute=40, id="bartervg_bundles")
     scheduler.add_job(_job_wal_truncate, "cron", hour=4, minute=30, id="wal_truncate")
     # proxypool 遥测保留：每日 04:35（紧随 WAL 收缩，不与 04:30 的重活撞同一分钟）。

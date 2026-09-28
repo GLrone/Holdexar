@@ -24,6 +24,7 @@ const shell = {
   'nav.pool': '我的关注',
   'nav.family': '家庭',
   'nav.bills': '账单',
+  'nav.events': '活动日历',
   'nav.crawl': '任务',
   'nav.fetch': '自动抓取',
   'nav.proxies': '网络',

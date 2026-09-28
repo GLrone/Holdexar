@@ -35,6 +35,7 @@ import RegionFlag from '@/components/RegionFlag.vue'
 import CurrencyFlag from '@/components/CurrencyFlag.vue'
 import EpicFreeCards from '@/components/business/EpicFreeCards.vue'
 import HbChoiceCards from '@/components/business/HbChoiceCards.vue'
+import SteamEventCountdown from '@/components/business/SteamEventCountdown.vue'
 import SteamFreeCards from '@/components/business/SteamFreeCards.vue'
 
 const router = useRouter()
@@ -454,6 +455,9 @@ onMounted(() => {
         </div>
       </div>
     </div>
+
+    <!-- Steam 活动倒计时卡（下一个大促/游戏节，秒级跳动；与日历页共享数据） -->
+    <SteamEventCountdown />
 
     <!-- Epic 喜加一卡片组（当期在送 + 下周预告，每小时自刷，点击直达 Epic 商店页） -->
     <EpicFreeCards />

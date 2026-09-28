@@ -323,6 +323,10 @@ class DbWriter:
                             ):
                                 pass  # 与最新快照完全一致：跳过，不产生冗余行
                             else:
+                                from app.domains.steam_events import (
+                                    service as steam_events_service,
+                                )
+
                                 history_batch.append(
                                     {
                                         "appid": p["appid"],
@@ -338,6 +342,9 @@ class DbWriter:
                                         "price_status": status,
                                         "cny_fen": cny_fen,
                                         "discount_end_ts": p.get("discount_end_ts"),
+                                        "steam_event_key": await steam_events_service.active_event_key_at(
+                                            now_dt
+                                        ),
                                         "snapshot_at": now_dt,
                                     }
                                 )

@@ -35,6 +35,7 @@ from app.domains.games import series as games_series
 from app.domains.metadata import service as metadata_service
 from app.domains.proxies import service as proxies_service
 from app.domains.rates import service as rates_service
+from app.domains.steam_events import service as steam_events_service
 from app.core import seed_assets
 
 import app.main as main_mod
@@ -88,6 +89,7 @@ def chain_calls(monkeypatch):
         ("bundles_sort", bundles_service.refresh_bundle_sort_cache),
         ("bundles_warm", bundles_service.warmup),
         ("epic_preheat", metadata_service.preheat_epic_offers),
+        ("steam_events_warm", steam_events_service.refresh_if_stale),
     ]:
         # main 里是函数内局部 import 再以模块属性调用：桩必须挂在源模块上
         target = {"import_seed": seed_assets, "merge_seeds": seed_assets,
@@ -98,7 +100,8 @@ def chain_calls(monkeypatch):
                   "pp_flags": games_service, "sort_cache": games_service,
                   "series_refresh": games_series,
                   "bundles_sort": bundles_service, "bundles_warm": bundles_service,
-                  "epic_preheat": metadata_service}[name]
+                  "epic_preheat": metadata_service,
+                  "steam_events_warm": steam_events_service}[name]
         monkeypatch.setattr(target, fn.__name__, step(name))
 
     monkeypatch.setattr(main_mod, "_autostart_clash", step("clash_autostart"))
@@ -154,7 +157,7 @@ def chain_calls(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_chain_order_and_scheduler_last(db, chain_calls):
-    """全链顺序：种子 → … → 标记三连 + 系列归组 → 内核 → 自启 → 池 Runtime → 订阅同步 → 汇率 → 捆绑包预热 → Epic 预热 → 调度器收尾。"""
+    """全链顺序：种子 → … → 标记三连 + 系列归组 → 内核 → 自启 → 池 Runtime → 订阅同步 → 汇率 → 捆绑包预热 → Epic 预热 → 活动日历 → 调度器收尾。"""
     await main_mod._post_startup_chain()
     expected = [
         "import_seed", "merge_seeds", "family_warm", "orphan_cleanup",
@@ -164,7 +167,7 @@ async def test_chain_order_and_scheduler_last(db, chain_calls):
         "kernel_ensure", "clash_autostart", "clash_health", "pool_runtime",
         "subscription_sync",
         "rates_stale", "rates_gap_scan", "bundles_sort", "bundles_warm",
-        "epic_preheat", "scheduler_start",
+        "epic_preheat", "steam_events_warm", "scheduler_start",
     ]
     assert chain_calls.calls == expected
 

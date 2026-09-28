@@ -2523,3 +2523,44 @@ export const proxypoolApi = {
     request<ProxyJobRunItem>('GET', `/proxypool/job-runs/${id}`, undefined, { noCache: true }),
 }
 
+// ─── Steam 官方活动日历（季节大促 / Next Fest / 主题 Fest）───
+
+export type SteamEventCategory = 'seasonal_sale' | 'next_fest' | 'themed_fest'
+
+export interface SteamEventItem {
+  /** 稳定标识（不随界面语言漂移；价格历史周期标签同源） */
+  key: string
+  category: SteamEventCategory
+  nameEn: string
+  nameZh: string | null
+  /** 活动日（PT 口径，YYYY-MM-DD） */
+  start: string
+  end: string
+  /** 精确 Unix 起止（活动页上线后由商店页元数据补齐；null = 暂无） */
+  preciseStartTs: number | null
+  preciseEndTs: number | null
+  storeUrl: string | null
+}
+
+export interface SteamEventsPayload {
+  events: SteamEventItem[]
+  /** 正在进行中（今天落在窗口内） */
+  live: SteamEventItem[]
+  /** 最近一个尚未开始的活动；null = 无未来活动 */
+  next: SteamEventItem | null
+  /** 上次成功同步时刻（北京时间 ISO）；null = 尚未同步过 */
+  fetchedAt: string | null
+  /** true = 数据已超 7 天未同步（同步源不可达或开关关闭） */
+  stale: boolean
+}
+
+export const steamEventsApi = {
+  list: () => request<SteamEventsPayload>('GET', '/steam-events'),
+  sync: () => request<{ count: number; backfilled: number; fetchedAt: string }>(
+    'POST',
+    '/steam-events/sync',
+    undefined,
+    { noCache: true },
+  ),
+}
+

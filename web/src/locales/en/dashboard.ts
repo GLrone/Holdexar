@@ -8,6 +8,7 @@ import type { MessageKey } from '../zh-CN'
 const dashboard: Partial<Record<MessageKey, string>> = {
   /* Section anchors + card titles */
   'dashboard.section.overview': 'Overview',
+  'dashboard.section.steamEvent': 'Event countdown',
   'dashboard.section.steamFree': 'Steam free games',
   'dashboard.section.priceDrops': 'Price drops',
   'dashboard.section.epicFree': 'Epic Free Games',

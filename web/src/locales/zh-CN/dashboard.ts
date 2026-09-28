@@ -18,6 +18,7 @@
 const dashboard = {
   /* 分节锚点 + 区块标题 */
   'dashboard.section.overview': '概览',
+  'dashboard.section.steamEvent': '活动倒计时',
   'dashboard.section.steamFree': 'Steam 免费游戏',
   'dashboard.section.priceDrops': '降价速报',
   'dashboard.section.epicFree': 'Epic 喜加一',
