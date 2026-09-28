@@ -175,7 +175,7 @@ async def _wishlist_ordered(
 async def _resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tuple[int, str]]:
     """scope: appids（显式列表）| wishlist（全部活跃监控条目，含已购）
     | wishlist_only（活跃且非已购）| owned（活跃且已购）
-    | pool（监控层）| catalog（目录层）。
+    | pool（监控层）| catalog（目录层）| specials（特惠榜尾段）。
     前四种按第一优先级（愿望单/关注）→ hot（打折/史低）→ appid 序排。
 
     wishlist 含已购是历史合并路径（跟随模式沿用，不为拆分多付一次预检）；
@@ -256,6 +256,39 @@ async def _resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tu
             ).scalars().all()
         monitored = set(await monitoring_service.active_ids("game"))
         return [(int(a), "") for a in pool_rows if int(a) not in monitored]
+
+    if scope == "specials":
+        # 特惠榜尾段：Steam 特惠+热门榜（翻页 5000 封顶）去重后垫在价格
+        # 轮最后——与 pool/catalog 两段重合的对象不重复爬，尾段只剩榜单
+        # 独有的差集（多为不在库的新面孔，爬取落库即完成目录发现）。
+        # 榜单内容走三级缓存（热 1h → miss 实时拉取 → stale 兜底）。
+        from app.domains.games import boards as games_boards
+        from app.domains.monitoring import service as monitoring_service
+        from app.domains.settings.service import get_value as _kv
+
+        if not await _kv("fetch.boards", True):
+            return []
+        board_ids = await games_boards.get_board("specials")
+        excluded = await _excluded_removed_appids() | await _excluded_free_appids()
+        known = set(await monitoring_service.active_ids("game"))
+        async with get_session_factory()() as session:
+            catalog_rows = (
+                await session.execute(
+                    select(Game.appid).where(
+                        Game.removed_at.is_(None), Game.free_kind.is_(None)
+                    )
+                )
+            ).scalars().all()
+        known.update(int(a) for a in catalog_rows)
+        seen: set[int] = set()
+        out: list[tuple[int, str]] = []
+        for a in board_ids:
+            appid = int(a)
+            if appid in seen or appid in known or appid in excluded:
+                continue
+            seen.add(appid)
+            out.append((appid, ""))
+        return out
 
     raise ValueError(f"未知 scope: {scope}")
 

@@ -210,6 +210,8 @@ export interface FetchSettingsPayload {
   fx_history: boolean
   /** 价格刷新网格步长（小时，1..72，默认 6） */
   price_interval_hours: number
+  /** 目录层随价格更新：True = 每轮价格更新带上未关注的目录游戏；下一轮生效 */
+  catalog_refresh: boolean
 }
 
 export const settingsApi = {

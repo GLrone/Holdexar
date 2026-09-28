@@ -505,9 +505,32 @@ async def _record_cycle_stats(cycle_id: int | None) -> None:
         logger.exception("[周期] Cycle %d 统计落库失败（不影响本轮抓取结果）", cycle_id)
 
 
+async def _price_refresh_specs() -> list[dict]:
+    """价格轮队列组成（每轮开工时现读开关，改开关不打断在跑的轮）：
+
+    - 常驻两段：欠账补抓 → 监控层（pool：有来源且未排除的对象）；
+    - 目录层（catalog：games 主档减监控层）随 KV `crawl.catalog_refresh`
+      决定是否带上——打开后未关注的目录游戏与监控对象同轮同频刷新；
+    - 特惠榜尾段（specials：Steam 特惠+热门榜翻页队列去重后垫底）恒在
+      列，与 pool/catalog 重合的对象不重复爬，尾段只剩榜单独有差集；
+      「自动抓取」页 Steam 榜单源关闭时该段为空。
+    """
+    from app.domains.settings.service import get_value
+
+    specs: list[dict] = [
+        {"kind": "missing"},
+        {"scope": "pool"},
+    ]
+    if await get_value("crawl.catalog_refresh", False):
+        specs.append({"scope": "catalog"})
+    specs.append({"scope": "specials", "kind": "specials_backfill"})
+    return specs
+
+
 async def _job_price_refresh() -> None:
     """池价格爬取（锚点网格：北京 01/07/13/19 夏令时 · 02/08/14/20 冬令时，
-    6h 步进）：两层串行 欠账补抓 → 全池（愿望单+已购优先序排前）。
+    6h 步进）：串行链 欠账补抓 → 全池（愿望单+已购优先序排前），目录层与
+    特惠榜尾段按 `_price_refresh_specs` 的开关口径决定是否带上。
 
     开头先重锚（下一格算好排队）再干活——长任务跑完后触发器不会覆盖
     手改的 next_run_time（APScheduler 3.11 行为）；DST 切换日下一轮
@@ -546,11 +569,7 @@ async def _job_price_refresh() -> None:
             if crawl_service._active is None or crawl_service._active.task.done():
                 break
             await asyncio.sleep(_DRAIN_POLL_SECONDS)
-        specs: list[dict] = [
-            {"kind": "missing"},
-            {"scope": "pool"},
-            {"scope": "catalog"},
-        ]
+        specs = await _price_refresh_specs()
         await _run_price_cycle(specs)
 
         # 链尾段：捆绑包刷新（游戏侧跑完才轮到它，busy 窗口内修复轮
@@ -1477,7 +1496,8 @@ def start_scheduler() -> None:
         "interval", hours=1, id="board_topsellers",
     )
     scheduler.add_job(_make_board_job("popularnew"), "interval", hours=24, id="board_popularnew")
-    scheduler.add_job(_make_board_job("specials"), "interval", hours=6, id="board_specials")
+    # specials 不设独立 job：特惠+热门榜的去重爬取随价格轮尾段进行
+    # （`_price_refresh_specs`），与内部队列重合的对象不重复爬
     scheduler.add_job(_make_board_job("comingsoon"), "interval", hours=24, id="board_comingsoon")
     scheduler.add_job(_job_coming_soon_retry, "cron", hour=10, minute=0, id="comingsoon_retry")
     # 限时赠送复查：到期（或 1h 内到期）的 promo 重爬翻转状态；通常 0 候选
@@ -1516,7 +1536,7 @@ def start_scheduler() -> None:
         asyncio.create_task(_job_bartervg_catchup())
     except RuntimeError:
         logger.warning("[调度] 无运行中事件循环，跳过 Barter.vg 启动补跑")
-    logger.info("调度器已启动（账户同步 15min / 池价格爬取锚点网格：Steam 折扣刷新锚 北京 01:00[夏令时]/02:00[冬令时] + 6h 步进，外部时间判定 DST / 捆绑包存量刷新随价格链 / 失败记录修复 5min 空闲档 / 汇率每日 03:00 + 历史修复每日 04:00[缺口·空闲·Key·配额四重门禁] / WAL 收缩每日 04:30 / Barter.vg bundle 计数每日 05:40 / 代理体检 6h / Clash 订阅重拉 30min 拍[6h 门槛·爬虫空闲档] / 钱包每分钟轮转 / 账单 30min / 热销榜 1h / 热门新品 24h / 特惠差集 6h / 即将推出 24h / CS 重探每日 10:00 / 自动备份 24h）")
+    logger.info("调度器已启动（账户同步 15min / 池价格爬取锚点网格：Steam 折扣刷新锚 北京 01:00[夏令时]/02:00[冬令时] + 6h 步进[目录层随开关·特惠榜尾段恒随轮] / 外部时间判定 DST / 捆绑包存量刷新随价格链 / 失败记录修复 5min 空闲档 / 汇率每日 03:00 + 历史修复每日 04:00[缺口·空闲·Key·配额四重门禁] / WAL 收缩每日 04:30 / Barter.vg bundle 计数每日 05:40 / 代理体检 6h / Clash 订阅重拉 30min 拍[6h 门槛·爬虫空闲档] / 钱包每分钟轮转 / 账单 30min / 热销榜 1h / 热门新品 24h / 即将推出 24h / CS 重探每日 10:00 / 自动备份 24h）")
 
 
 def stop_scheduler() -> None:

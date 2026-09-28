@@ -29,6 +29,11 @@ const fetchPage: Partial<Record<MessageKey, string>> = {
     'How often game prices refresh automatically. Shorter means fresher prices but more network traffic. No effect while automatic price updates are off on the Tasks page.',
   'fetch.interval.hours': 'Every {n} h',
   'fetch.interval.toast': 'Updated: prices now refresh every {n} hours',
+  'fetch.catalog.label': 'Include unfollowed games',
+  'fetch.catalog.desc':
+    "When on, every price refresh also fetches current prices for library games you don't follow and that aren't delisted (the price update interval applies to them equally). The Steam specials chart is deduplicated and crawled last, only picking up games the library doesn't have yet. Takes effect from the next price refresh.",
+  'fetch.catalog.toastOn': 'On: unfollowed games join the next price refresh',
+  'fetch.catalog.toastOff': 'Off: unfollowed games drop out from the next price refresh',
   'fetch.reset': 'Reset to defaults',
   'fetch.reset.toast': 'Defaults restored: all sources on, prices refresh every 6 hours',
   'fetch.toast.on': 'Automatic updates turned on',

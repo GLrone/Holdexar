@@ -30,6 +30,11 @@ const fetchPage = {
     '多久自动刷新一次各游戏的价格。间隔越短，价格越新鲜，联网也越频繁。「任务」页的自动价格更新关闭时，这项不生效。',
   'fetch.interval.hours': '每 {n} 小时',
   'fetch.interval.toast': '已更新：价格每 {n} 小时自动刷新一次',
+  'fetch.catalog.label': '未关注游戏一并更新',
+  'fetch.catalog.desc':
+    '打开后，每次价格更新会一并获取游戏库里没在关注、也没下架游戏的现价（价格更新间隔对它们同样生效）。Steam 特惠榜去重后排在每轮最后，只补榜上多出来的新游戏。改动从下一轮价格更新起生效。',
+  'fetch.catalog.toastOn': '已开启：下一次价格更新起，未关注游戏一并刷新',
+  'fetch.catalog.toastOff': '已关闭：下一次价格更新起不再带上未关注游戏',
   'fetch.reset': '恢复默认',
   'fetch.reset.toast': '已恢复默认：全部内容源开启，价格每 6 小时刷新',
   'fetch.toast.on': '已开启自动更新',

@@ -78,6 +78,9 @@ class FetchSettingsPayload(BaseModel):
     fx_history: bool = True
     # 价格刷新网格步长（小时）；夹取 1..72，默认 6
     price_interval_hours: int = 6
+    # 目录层随价格更新：True = 每轮价格更新带上未关注的目录游戏
+    # （特惠榜尾段恒随轮）；改动从下一轮生效，不打断在跑的轮
+    catalog_refresh: bool = False
 
 
 class FetchSettingsUpdate(BaseModel):
@@ -88,6 +91,7 @@ class FetchSettingsUpdate(BaseModel):
     fx_auto: bool | None = None
     fx_history: bool | None = None
     price_interval_hours: int | None = None
+    catalog_refresh: bool | None = None
 
 
 @router.get("")
@@ -167,6 +171,9 @@ async def _read_fetch_settings() -> FetchSettingsPayload:
         )
     except (TypeError, ValueError):
         pass
+    payload.catalog_refresh = bool(
+        await service.get_value("crawl.catalog_refresh", False)
+    )
     return payload
 
 
@@ -195,4 +202,7 @@ async def update_fetch_settings(payload: FetchSettingsUpdate) -> FetchSettingsPa
                 )
         except Exception:  # noqa: BLE001 —— 重锚触发失败不阻塞保存
             pass
+    if payload.catalog_refresh is not None:
+        # 只落偏好：价格轮每轮开工时现读，改动从下一轮生效
+        await service.set_value("crawl.catalog_refresh", bool(payload.catalog_refresh))
     return await _read_fetch_settings()
