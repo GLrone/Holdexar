@@ -37,6 +37,10 @@ const gameDetail: Partial<Record<MessageKey, string>> = {
   'gameDetail.removed.requeued': 'Recrawl queued — refresh in a moment',
   'gameDetail.removed.cleared': 'Flag cleared — the next monitoring round will pick it up',
 
+  /* No-store-data banner (shares the Recheck action with the delisted one) */
+  'gameDetail.storeMissing.tag': 'No store data yet',
+  'gameDetail.storeMissing.busy': 'Recrawl did not start — the next refresh will pick it up',
+
   /* Info sidebar */
   'gameDetail.info.basic': 'Basic info',
   'gameDetail.info.type': 'Type: {type}',

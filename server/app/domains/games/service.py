@@ -836,6 +836,9 @@ async def get_game_detail(appid: int) -> dict | None:
         "viewCount": game.view_count,
         # 下架监控：非空 = 已判定下架（前端角标依据）
         "removedAt": game.removed_at.isoformat() if game.removed_at else None,
+        # 商店数据缺失：现价矩阵完全为空（无任何可用观察行）——详情页
+        # 「重新探测」横幅的另一显隐依据，与下架对象共用同一入口
+        "storeDataMissing": not price_map,
         # 免费态：f2p=永久免费 / promo=限时赠送中（前端价格区显示「免费」、
         # 赠送徽章倒计时用）；NULL=付费正常
         "freeKind": game.free_kind,
@@ -1857,11 +1860,13 @@ def _build_list_item(
 
 
 async def retry_removed_game(appid: int) -> dict:
-    """手动复探下架游戏：清标 + 立即后台重爬（复活通道之一）。
+    """手动复探：清下架标记 + 立即后台重爬（复活通道之一）。
 
-    下架判定可能误判（Steam 抖动/临时封禁），重新上架也存在——详情页
-    「重新探测」入口调这里。清标让游戏立刻回到关注层池子（宽限期判据
-    removed_at 已空，天然放行）；后台 run 异步跑，不阻塞请求。
+    服务详情页「重新探测」入口的两类对象：下架游戏（判定可能误判——
+    Steam 抖动/临时封禁，重新上架也存在——清标让游戏立刻回到关注层
+    池子，宽限期判据 removed_at 已空天然放行）与无商店数据游戏
+    （现价矩阵为空，清标为空操作，重爬补齐首次观察）。
+    后台 run 异步跑，不阻塞请求。
     返回任务启动摘要；已有任务运行时只清标不启动（下一轮价格刷新
     自然会带上它——脱池判据已解除）。
     """
