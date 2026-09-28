@@ -537,6 +537,9 @@ export interface PriceCoverage {
   unobserved: number
   coverage: number
   coverageConfirmed: number
+  /** 区级问题明细（大写区码 → locked/missing/blocked/unobserved），只含非 ok 区；
+      旧格式快照无此键——悬停点名问题地区的依据 */
+  regions?: Record<string, string>
 }
 
 /** 价格数据状态。观察时间/新鲜度是**价格**维度，与 updatedAt（实体更新时间）不同源 */

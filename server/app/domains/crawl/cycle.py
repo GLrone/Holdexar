@@ -106,6 +106,10 @@ class PriceCycle(Base):
     units_unobserved: Mapped[int | None] = mapped_column(Integer)
     coverage: Mapped[float | None] = mapped_column(Float)
     coverage_confirmed: Mapped[float | None] = mapped_column(Float)
+    # 对象级覆盖快照：{"<appid>": {"ok":n,"locked":n,"missing":n,"blocked":n,
+    # "unobserved":n}}，收敛时冻结。卡片覆盖读它而非窗口现算——当前价表的行
+    # 会随周期外写入滚动覆盖，旧窗口在活表上不可复现。
+    coverage_json: Mapped[dict | None] = mapped_column(JSON)
     # 对象级：价格记录的最后观察时刻已 ≥ STALE_HOURS 的对象数（与 Freshness 同口径）
     stale_count: Mapped[int | None] = mapped_column(Integer)
     duration_seconds: Mapped[float | None] = mapped_column(Float)
@@ -316,6 +320,7 @@ async def write_stats(cycle_id: int, stats: dict) -> bool:
         cycle.units_unobserved = stats["unitsUnobserved"]
         cycle.coverage = stats["coverage"]
         cycle.coverage_confirmed = stats["coverageConfirmed"]
+        cycle.coverage_json = stats.get("perAppid")
         cycle.stale_count = stats["staleCount"]
         cycle.duration_seconds = stats["durationSeconds"]
         cycle.stage_ms_json = stats["stageMs"]

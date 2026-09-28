@@ -87,7 +87,8 @@ async def _add_prices(db, rows):
         await session.commit()
 
 
-async def _add_cycle(db, status, appids, regions, started_at, finished_at):
+async def _add_cycle(db, status, appids, regions, started_at, finished_at, per_appid=None):
+    """建一轮 Cycle；per_appid 传入时等价「收敛统计已冻结对象级覆盖快照」。"""
     async with db() as session:
         cycle = PriceCycle(
             kind="scheduled",
@@ -96,10 +97,21 @@ async def _add_cycle(db, status, appids, regions, started_at, finished_at):
             expected_json={"appids": list(appids), "regions": list(regions)},
             started_at=started_at,
             finished_at=finished_at,
+            coverage_json=per_appid,
         )
         session.add(cycle)
         await session.commit()
         return cycle.id
+
+
+def _snap(appid, *, ok=0, locked=0, missing=0, blocked=0):
+    """单个对象的五桶快照；未给出的桶按全 unobserved 补齐。"""
+    return {
+        str(appid): {
+            "ok": ok, "locked": locked, "missing": missing, "blocked": blocked,
+            "unobserved": len(REGIONS) - ok - locked - missing - blocked,
+        }
+    }
 
 
 async def _items(appids, region=""):
@@ -141,7 +153,8 @@ async def test_partial_coverage_counts_each_bucket(db):
         _row(880001, "ua", "missing", now - timedelta(hours=1)),
         # in 区没有任何行 → 未观察
     ])
-    await _add_cycle(db, "partial", IN_SCOPE, REGIONS, started, now)
+    await _add_cycle(db, "partial", IN_SCOPE, REGIONS, started, now,
+                     per_appid=_snap(880001, ok=3, missing=1))
 
     cov = (await _item(880001))["priceData"]["coverage"]
     assert cov["expectedUnits"] == 5
@@ -159,7 +172,8 @@ async def test_full_coverage_reaches_one(db):
     await _add_prices(db, [
         _row(880002, r, "ok", now - timedelta(hours=1)) for r in REGIONS
     ])
-    await _add_cycle(db, "completed", IN_SCOPE, REGIONS, now - timedelta(hours=2), now)
+    await _add_cycle(db, "completed", IN_SCOPE, REGIONS, now - timedelta(hours=2), now,
+                     per_appid=_snap(880002, ok=5))
 
     cov = (await _item(880002))["priceData"]["coverage"]
     assert cov["ok"] == 5
@@ -180,7 +194,8 @@ async def test_locked_counts_as_confirmed_but_not_coverage(db):
         _row(880001, "ua", "locked", now - timedelta(hours=1)),
         _row(880001, "in", "locked", now - timedelta(hours=1)),
     ])
-    await _add_cycle(db, "partial", IN_SCOPE, REGIONS, now - timedelta(hours=2), now)
+    await _add_cycle(db, "partial", IN_SCOPE, REGIONS, now - timedelta(hours=2), now,
+                     per_appid=_snap(880001, ok=3, locked=2))
 
     cov = (await _item(880001))["priceData"]["coverage"]
     assert cov["locked"] == 2
@@ -190,7 +205,8 @@ async def test_locked_counts_as_confirmed_but_not_coverage(db):
 
 @pytest.mark.asyncio
 async def test_out_of_window_rows_count_as_no_result(db):
-    """窗口外的行等于本轮没结果（上界让历史轮次数值不随之后刷新变大）。"""
+    """已收敛轮被周期外写入滚出窗口、又没有冻结快照（存量轮）：
+    卡片不给覆盖率——不显示已知不可复现的塌陷值；新鲜度照给。"""
     now = datetime.now()
     await _seed(db, [880001])
     await _add_prices(db, [
@@ -198,12 +214,10 @@ async def test_out_of_window_rows_count_as_no_result(db):
     ])
     await _add_cycle(db, "partial", IN_SCOPE, REGIONS, now - timedelta(hours=2), now)
 
-    cov = (await _item(880001))["priceData"]["coverage"]
-    assert cov["ok"] == 0
-    assert cov["unobserved"] == 5
-    assert cov["coverage"] == 0.0
+    data = (await _item(880001))["priceData"]
+    assert data["coverage"] is None
     # 但价格数据本身仍在：新鲜度是另一个维度
-    assert (await _item(880001))["priceData"]["freshness"] == "fresh"
+    assert data["freshness"] == "fresh"
 
 
 @pytest.mark.asyncio
@@ -214,7 +228,8 @@ async def test_non_monitored_object_has_no_coverage(db):
     await _add_prices(db, [
         _row(OUT_OF_SCOPE, r, "ok", now - timedelta(hours=1)) for r in REGIONS
     ])
-    await _add_cycle(db, "completed", IN_SCOPE, REGIONS, now - timedelta(hours=2), now)
+    await _add_cycle(db, "completed", IN_SCOPE, REGIONS, now - timedelta(hours=2), now,
+                     per_appid=_snap(880001, ok=5))
 
     price_data = (await _item(OUT_OF_SCOPE))["priceData"]
     assert price_data["coverage"] is None
@@ -232,7 +247,8 @@ async def test_monitored_object_in_mix_gets_coverage_and_others_do_not(db):
     ] + [
         _row(OUT_OF_SCOPE, r, "ok", now - timedelta(hours=1)) for r in REGIONS
     ])
-    await _add_cycle(db, "completed", IN_SCOPE, REGIONS, now - timedelta(hours=2), now)
+    await _add_cycle(db, "completed", IN_SCOPE, REGIONS, now - timedelta(hours=2), now,
+                     per_appid=_snap(880001, ok=5))
 
     items = await _items([880001, OUT_OF_SCOPE])
     assert items[0]["priceData"]["coverage"]["coverage"] == 1.0
@@ -288,7 +304,8 @@ async def test_latest_settled_cycle_wins_and_open_one_is_ignored(db):
         _row(880001, r, "ok", now - timedelta(minutes=30)) for r in REGIONS
     ])
     old = await _add_cycle(
-        db, "completed", IN_SCOPE, REGIONS, now - timedelta(hours=6), now - timedelta(hours=4)
+        db, "completed", IN_SCOPE, REGIONS, now - timedelta(hours=6), now - timedelta(hours=4),
+        per_appid=_snap(880001, ok=5),
     )
     # 更近的一轮还在跑：不采用
     await _add_cycle(db, "running", IN_SCOPE, REGIONS, now - timedelta(hours=1), None)
@@ -335,7 +352,8 @@ async def test_list_page_takes_coverage_once_per_page(db, monkeypatch):
     ] + [
         _row(880002, r, "ok", now - timedelta(hours=1)) for r in REGIONS
     ])
-    await _add_cycle(db, "completed", IN_SCOPE, REGIONS, now - timedelta(hours=2), now)
+    await _add_cycle(db, "completed", IN_SCOPE, REGIONS, now - timedelta(hours=2), now,
+                     per_appid={**_snap(880001, ok=5), **_snap(880002, ok=5)})
 
     original = coverage_mod.latest_appid_coverage
     seen: list[list[int]] = []

@@ -183,9 +183,11 @@ const discountEndsTip = computed(() => {
 })
 
 // ─── 价格数据状态（观察时间 / 新鲜度 / 本轮覆盖）───
-// 观察时间是**价格**维度，与 updatedAt（实体更新时间）不同源。覆盖率由后端按
-// Cycle 冻结的期望集算出，卡片只展示；措辞规则在 lib/priceDataView。
-const priceView = computed(() => priceDataView(props.game.priceData))
+// 观察时间是**价格**维度，与 updatedAt（实体更新时间）不同源。覆盖率由后端
+// 冻结的快照算出，卡片只展示；未刷满才出覆盖标签，悬停逐区点名问题地区。
+const priceView = computed(() =>
+  priceDataView(props.game.priceData, regionsStore.regionName),
+)
 const priceAgeText = computed(() => t(priceView.value.age.key, priceView.value.age.params))
 const coverageText = computed(() => {
   const cov = priceView.value.coverage
