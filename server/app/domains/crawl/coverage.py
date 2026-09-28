@@ -66,17 +66,57 @@ def _scan(
     regions: set[str],
     started_at: datetime | None,
     window_end: datetime,
+    *,
+    regions_by_appid: dict[int, dict[str, str]] | None = None,
 ) -> None:
     """价格行累加进「每个对象各桶的单元数」。
 
     所有消费方共用这一处判定，覆盖率在不同粒度上不会算出两套数字。
+    regions_by_appid 传入时同步记录「区 → 观察状态」（收敛冻结区级明细用）。
     """
     for appid, region_code, price_status, updated_at in rows:
         region = str(region_code).strip().lower()
         if region not in regions or not _in_window(updated_at, started_at, window_end):
             continue
         buckets = per_appid.setdefault(int(appid), {b: 0 for b in BUCKETS})
-        buckets[_bucket_of(price_status)] += 1
+        status = _bucket_of(price_status)
+        buckets[status] += 1
+        if regions_by_appid is not None:
+            regions_by_appid.setdefault(int(appid), {})[region] = status
+
+
+def _snapshot_entry(
+    buckets: dict[str, int] | None,
+    observed: dict[str, str] | None,
+    expected_regions: set[str],
+) -> dict:
+    """对象级快照条目（收敛冻结的格式）：五桶计数 + 区级明细。
+
+    regions 只记**非 ok** 的区（大写码 → locked/missing/blocked），本轮没有
+    观察到任何行的区记成 unobserved——卡片悬停点名问题地区的数据源。
+    """
+    entry = {b: (buckets or {}).get(b, 0) for b in BUCKETS if b != "unobserved"}
+    entry["unobserved"] = len(expected_regions) - sum(entry.values())
+    seen = observed or {}
+    problems = {r.upper(): st for r, st in seen.items() if st != "ok"}
+    for r in expected_regions:
+        if r not in seen:
+            problems[r.upper()] = "unobserved"
+    entry["regions"] = problems
+    return entry
+
+
+def _read_snapshot_entry(
+    raw: dict | None, per_unit: int, expected_regions: set[str]
+) -> dict:
+    """读已冻结的快照条目：计数与区明细照存取用，缺区明细（旧格式条目）
+    记空表——前端没有点名数据时退回计数措辞，不虚构区名。"""
+    if raw is None:
+        return _snapshot_entry(None, None, expected_regions)
+    entry = {b: raw.get(b, 0) for b in BUCKETS if b != "unobserved"}
+    entry["unobserved"] = raw.get("unobserved", per_unit - sum(entry.values()))
+    entry["regions"] = dict(raw.get("regions") or {})
+    return entry
 
 
 def _result(
@@ -87,11 +127,12 @@ def _result(
     *,
     targets_total: int = 0,
     targets_done: int = 0,
+    per_appid: dict[str, dict[str, int]] | None = None,
 ) -> dict:
     """计数 → 覆盖率结果。期望集为空时两个比值为 null（0/0 无意义）。"""
     ok = counts["ok"]
     confirmed = ok + counts["locked"]
-    return {
+    result = {
         "cycleId": cycle_id,
         "status": status,
         "targetsTotal": targets_total,
@@ -109,10 +150,23 @@ def _result(
             round(confirmed / expected_units, 4) if expected_units else None
         ),
     }
+    if per_appid is not None:
+        result["perAppid"] = per_appid
+    return result
 
 
-async def cycle_coverage(cycle_id: int) -> dict | None:
-    """本轮覆盖率；Cycle 不存在返回 None。"""
+async def cycle_coverage(cycle_id: int, *, per_appid: bool = False) -> dict | None:
+    """本轮覆盖率；Cycle 不存在返回 None。
+
+    证据来源是**收敛时冻结在 Cycle 行上的对象级快照**（coverage_json）：
+    `game_current_prices` 是当前价表，行会随任何周期外写入（手动抓取 / repair /
+    下一轮进行中）滚动覆盖 updated_at，旧窗口在活表上不可复现——按窗口现算会把
+    已收敛轮的覆盖率改成 0/5 之类的假塌陷。快照缺失（冻结机制上线前的存量轮）
+    才按窗口现算，数字可能已被周期外写入污染。
+
+    per_appid=True 时附带 `"perAppid"`：每个对象的五桶计数（键为 appid 字符串，
+    JSON 落库用）——收敛统计冻结快照走的就是这个出口。
+    """
     async with get_session_factory()() as session:
         cycle = await session.get(PriceCycle, cycle_id)
         if cycle is None:
@@ -124,16 +178,24 @@ async def cycle_coverage(cycle_id: int) -> dict | None:
         # 历史 Cycle 的覆盖率才不会随之后的刷新变大。
         window_end = cycle.finished_at or datetime.now()
         expected = dict(cycle.expected_json or {})
+        snapshot_raw = dict(cycle.coverage_json or {})
 
     appids = [int(a) for a in (expected.get("appids") or [])]
     # 区服码大小写不敏感：期望集来自 regions 域（小写 code），
     # game_current_prices.region_code 落库是大写，直接比会整批漏配
     regions = {str(r).strip().lower() for r in (expected.get("regions") or [])}
-    expected_units = len(appids) * len(regions)
+    per_unit = len(regions)
+    expected_units = len(appids) * per_unit
     if expected_units == 0:
         return _result(cycle_id, cycle_status, 0, {b: 0 for b in BUCKETS})
 
-    per_appid: dict[int, dict[str, int]] = {}
+    if snapshot_raw:
+        return _result_from_snapshot(
+            cycle_id, cycle_status, appids, per_unit, snapshot_raw, regions
+        )
+
+    buckets_by_appid: dict[int, dict[str, int]] = {}
+    regions_by_appid: dict[int, dict[str, str]] = {}
     async with get_session_factory()() as session:
         for start in range(0, len(appids), _CHUNK):
             rows = (
@@ -146,15 +208,23 @@ async def cycle_coverage(cycle_id: int) -> dict | None:
                     ).where(GameCurrentPrice.appid.in_(appids[start : start + _CHUNK]))
                 )
             ).all()
-            _scan(per_appid, rows, regions, started_at, window_end)
+            _scan(
+                buckets_by_appid,
+                rows,
+                regions,
+                started_at,
+                window_end,
+                regions_by_appid=regions_by_appid,
+            )
 
     counts = {
-        b: sum(buckets.get(b, 0) for buckets in per_appid.values()) for b in BUCKETS
+        b: sum(buckets.get(b, 0) for buckets in buckets_by_appid.values())
+        for b in BUCKETS
     }
     counts["unobserved"] = expected_units - sum(counts.values())
     # 「处理完」= 该对象的每个期望区服都拿到一条结果（每个单元最多一行）
     targets_done = sum(
-        1 for a in appids if sum(per_appid.get(int(a), {}).values()) >= len(regions)
+        1 for a in appids if sum(buckets_by_appid.get(int(a), {}).values()) >= per_unit
     )
     return _result(
         cycle_id,
@@ -163,6 +233,51 @@ async def cycle_coverage(cycle_id: int) -> dict | None:
         counts,
         targets_total=len(appids),
         targets_done=targets_done,
+        per_appid=(
+            {
+                str(a): _snapshot_entry(
+                    buckets_by_appid.get(int(a)),
+                    regions_by_appid.get(int(a)),
+                    regions,
+                )
+                for a in appids
+            }
+            if per_appid
+            else None
+        ),
+    )
+
+
+def _result_from_snapshot(
+    cycle_id: int,
+    cycle_status: str,
+    appids: list[int],
+    per_unit: int,
+    snapshot_raw: dict,
+    regions: set[str],
+) -> dict:
+    """冻结快照 → 覆盖率结果。分母取 Cycle 期望集（权威），计数取快照桶；
+    期望集里缺快照条目的对象按全 unobserved 计（不应发生，防御性兜底）。"""
+    snaps = {
+        a: _read_snapshot_entry(snapshot_raw.get(str(a)), per_unit, regions)
+        for a in appids
+    }
+    counts = {
+        b: sum(snap[b] for snap in snaps.values())
+        for b in BUCKETS
+        if b != "unobserved"
+    }
+    counts["unobserved"] = len(appids) * per_unit - sum(counts.values())
+    # 快照里 unobserved > 0 的对象即未处理完（其余四桶合计不满期望区数）
+    targets_done = sum(1 for snap in snaps.values() if snap["unobserved"] == 0)
+    return _result(
+        cycle_id,
+        cycle_status,
+        len(appids) * per_unit,
+        counts,
+        targets_total=len(appids),
+        targets_done=targets_done,
+        per_appid={str(a): snaps[a] for a in appids},
     )
 
 
@@ -175,6 +290,13 @@ async def latest_appid_coverage(appids: list[int]) -> dict[int, dict] | None:
 
     取「已收敛」而非最新一个：正在跑的 Cycle 拿的是半截数字，卡片上会长时间
     显示一个看起来像坏掉的覆盖率。
+
+    证据**只**来自收敛时冻结在 Cycle 行上的对象级快照（coverage_json）：
+    `game_current_prices` 是当前价表，行会随任何周期外写入（手动抓取 / repair /
+    下一轮进行中）滚动覆盖 updated_at，旧窗口在活表上不可复现——按窗口现算会把
+    已收敛轮的覆盖率改成 0/5 之类的假塌陷（观察时间却是新鲜的，两行自相矛盾）。
+    最新已收敛轮没有快照（冻结机制上线前的存量轮）时**不返回数字**：宁可暂时
+    不显示覆盖，也不显示已知不可复现的塌陷值；下一轮收敛冻结后自动恢复。
     """
     if not appids:
         return None
@@ -192,47 +314,31 @@ async def latest_appid_coverage(appids: list[int]) -> dict[int, dict] | None:
             return None
         cycle_id = int(cycle.id)
         cycle_status = cycle.status
-        started_at = cycle.started_at
-        window_end = cycle.finished_at or datetime.now()
         expected = dict(cycle.expected_json or {})
+        snapshot_raw = dict(cycle.coverage_json or {})
 
     regions = {str(r).strip().lower() for r in (expected.get("regions") or [])}
-    in_scope = sorted({int(a) for a in (expected.get("appids") or [])} & wanted)
     per_unit = len(regions)
-    if not in_scope or per_unit == 0:
+    if not snapshot_raw or per_unit == 0:
         return None
-
-    per_appid: dict[int, dict[str, int]] = {}
-    async with get_session_factory()() as session:
-        for start in range(0, len(in_scope), _CHUNK):
-            rows = (
-                await session.execute(
-                    select(
-                        GameCurrentPrice.appid,
-                        GameCurrentPrice.region_code,
-                        GameCurrentPrice.price_status,
-                        GameCurrentPrice.updated_at,
-                    ).where(
-                        GameCurrentPrice.appid.in_(in_scope[start : start + _CHUNK])
-                    )
-                )
-            ).all()
-            _scan(per_appid, rows, regions, started_at, window_end)
-
-    result: dict[int, dict] = {}
-    for appid in in_scope:
-        buckets = per_appid.get(appid, {b: 0 for b in BUCKETS})
-        ok = buckets["ok"]
-        result[appid] = {
+    return {
+        int(appid): {
             "cycleId": cycle_id,
             "cycleStatus": cycle_status,
             "expectedUnits": per_unit,
-            "ok": ok,
-            "locked": buckets["locked"],
-            "missing": buckets["missing"],
-            "blocked": buckets["blocked"],
-            "unobserved": per_unit - sum(buckets.values()),
-            "coverage": round(ok / per_unit, 4),
-            "coverageConfirmed": round((ok + buckets["locked"]) / per_unit, 4),
+            "ok": buckets.get("ok", 0),
+            "locked": buckets.get("locked", 0),
+            "missing": buckets.get("missing", 0),
+            "blocked": buckets.get("blocked", 0),
+            "unobserved": buckets.get("unobserved", 0),
+            "coverage": round(buckets.get("ok", 0) / per_unit, 4),
+            "coverageConfirmed": round(
+                (buckets.get("ok", 0) + buckets.get("locked", 0)) / per_unit, 4
+            ),
+            # 区级问题明细（大写码 → locked/missing/blocked/unobserved）：
+            # 卡片悬停点名问题地区；旧格式快照无此键，前端退回计数措辞
+            "regions": dict(buckets.get("regions") or {}),
         }
-    return result
+        for appid, buckets in snapshot_raw.items()
+        if int(appid) in wanted
+    }

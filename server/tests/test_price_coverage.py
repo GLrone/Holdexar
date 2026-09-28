@@ -23,6 +23,7 @@ from app.domains.crawl import coverage as coverage_mod
 from app.domains.crawl import cycle as cycle_mod
 from app.domains.crawl import freshness as freshness_mod
 from app.domains.crawl import router as crawl_router
+from app.domains.crawl import stats as stats_mod
 from app.domains.crawl.cycle import PriceCycle
 from app.domains.games.models import Game, GameCurrentPrice
 
@@ -36,7 +37,7 @@ def db(tmp_path, monkeypatch):
         f"sqlite+aiosqlite:///{(tmp_path / 't.db').as_posix()}", echo=False
     )
     factory = async_sessionmaker(engine, expire_on_commit=False)
-    for module in (cycle_mod, coverage_mod, freshness_mod):
+    for module in (cycle_mod, coverage_mod, freshness_mod, stats_mod):
         monkeypatch.setattr(module, "get_session_factory", lambda: factory)
     return factory
 
@@ -379,3 +380,125 @@ async def test_freshness_endpoint_dedupes(db):
     await _price(db, APP_A, "cn", "ok", hours_ago=1.0)
     payload = await crawl_router.freshness(appid=[APP_A, APP_A])
     assert [i["appid"] for i in payload["items"]] == [APP_A]
+
+
+# ── 对象级覆盖快照（收敛冻结，卡片读取的唯一证据源）──
+
+
+@pytest.mark.asyncio
+async def test_convergence_freezes_per_appid_snapshot(db):
+    """收敛统计冻结每个对象的五桶计数进 Cycle 行，latest 读快照。"""
+    cid = await _make_cycle(db, [APP_A, APP_B], REGIONS, started_hours_ago=2.0)
+    await _price(db, APP_A, "cn", "ok", hours_ago=1.8)
+    await _price(db, APP_A, "ru", "locked", hours_ago=1.8)
+    await _price(db, APP_B, "cn", "ok", hours_ago=1.8)
+    await _close_cycle(db, cid, hours_ago=1.0)
+
+    stats = await stats_mod.record_stats(cid)
+    snap = stats["perAppid"]
+    assert snap[str(APP_A)] == {
+        "ok": 1, "locked": 1, "missing": 0, "blocked": 0, "unobserved": 0,
+        "regions": {"RU": "locked"},
+    }
+    # 没观察到的区进 regions，标 unobserved——悬停点名问题地区的依据
+    assert snap[str(APP_B)] == {
+        "ok": 1, "locked": 0, "missing": 0, "blocked": 0, "unobserved": 1,
+        "regions": {"RU": "unobserved"},
+    }
+
+    cov = await coverage_mod.latest_appid_coverage([APP_A, APP_B])
+    assert cov[APP_A]["ok"] == 1 and cov[APP_A]["locked"] == 1
+    assert cov[APP_A]["expectedUnits"] == 2
+    assert cov[APP_A]["regions"] == {"RU": "locked"}
+    assert cov[APP_B]["unobserved"] == 1
+    assert cov[APP_B]["regions"] == {"RU": "unobserved"}
+
+
+@pytest.mark.asyncio
+async def test_snapshot_survives_out_of_cycle_writes(db):
+    """周期外写入（手动抓取 / repair）不改变已收敛轮的对象覆盖。
+
+    活表行被推出收敛窗口后，窗口现算会塌成整对象 unobserved；
+    卡片读冻结快照，数字保持收敛时刻的事实。
+    """
+    cid = await _make_cycle(db, [APP_A], REGIONS, started_hours_ago=2.0)
+    await _price(db, APP_A, "cn", "ok", hours_ago=1.8)
+    await _price(db, APP_A, "ru", "locked", hours_ago=1.8)
+    await _close_cycle(db, cid, hours_ago=1.0)
+    await stats_mod.record_stats(cid)
+
+    # 周期外抓取：全部区的行被覆盖更新为 missing、时刻推到收敛窗口之外
+    for region in REGIONS:
+        await _touch_price(db, APP_A, region, "missing", hours_ago=0.0)
+
+    cov = await coverage_mod.latest_appid_coverage([APP_A])
+    assert cov[APP_A]["ok"] == 1
+    assert cov[APP_A]["locked"] == 1
+    assert cov[APP_A]["unobserved"] == 0
+    assert cov[APP_A]["coverageConfirmed"] == 1.0
+
+
+async def _touch_price(db, appid, region, status, *, hours_ago: float = 0.0) -> None:
+    """周期外写入的活表语义：同一 (appid, region) 行被覆盖更新（时刻推到当下）。"""
+    from sqlalchemy import update
+
+    async with db() as session:
+        await session.execute(
+            update(GameCurrentPrice)
+            .where(
+                GameCurrentPrice.appid == appid,
+                GameCurrentPrice.region_code == region,
+            )
+            .values(
+                price_status=status,
+                price=None if status != "ok" else 9900,
+                updated_at=datetime.now() - timedelta(hours=hours_ago),
+            )
+        )
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_latest_coverage_without_snapshot_returns_none(db):
+    """最新已收敛轮没有冻结快照（冻结机制上线前的存量轮）→ 不返回数字。
+
+    活表行已随周期外写入滚出旧窗口，窗口现算只会得到假塌陷（0/5 + 新鲜
+    观察时间自相矛盾）；宁可不显示覆盖，也不显示已知不可复现的值。
+    """
+    cid = await _make_cycle(db, [APP_A], REGIONS, started_hours_ago=2.0)
+    await _price(db, APP_A, "cn", "ok", hours_ago=1.8)
+    await _close_cycle(db, cid, hours_ago=1.0)
+
+    assert await coverage_mod.latest_appid_coverage([APP_A]) is None
+
+
+@pytest.mark.asyncio
+async def test_cycle_coverage_reads_snapshot_over_window(db):
+    """轮详情覆盖率同样快照优先：快照在，周期外写入不改已收敛轮的数字。"""
+    cid = await _make_cycle(db, [APP_A], REGIONS, started_hours_ago=2.0)
+    await _price(db, APP_A, "cn", "ok", hours_ago=1.8)
+    await _price(db, APP_A, "ru", "locked", hours_ago=1.8)
+    await _close_cycle(db, cid, hours_ago=1.0)
+    await stats_mod.record_stats(cid)
+
+    for region in REGIONS:
+        await _touch_price(db, APP_A, region, "missing", hours_ago=0.0)
+
+    result = await coverage_mod.cycle_coverage(cid)
+    assert (result["ok"], result["locked"]) == (1, 1)
+    assert result["unobserved"] == 0
+    assert result["targetsDone"] == 1
+    assert result["perAppid"][str(APP_A)]["locked"] == 1
+
+
+@pytest.mark.asyncio
+async def test_snapshot_excludes_objects_outside_expected_set(db):
+    """不在期望集内的对象照旧拿不到覆盖——快照只回答本轮该刷的对象。"""
+    cid = await _make_cycle(db, [APP_A], REGIONS, started_hours_ago=2.0)
+    await _price(db, APP_A, "cn", "ok", hours_ago=1.8)
+    await _price(db, APP_A, "ru", "ok", hours_ago=1.8)
+    await _close_cycle(db, cid, hours_ago=1.0)
+    await stats_mod.record_stats(cid)
+
+    cov = await coverage_mod.latest_appid_coverage([APP_A, APP_B])
+    assert APP_A in cov and APP_B not in cov

@@ -82,11 +82,13 @@ const gameCard = {
   'gameCard.priceData.hoursAgo': '{n} 小时前',
   'gameCard.priceData.daysAgo': '{n} 天前',
   'gameCard.priceData.none': '尚无价格数据',
-  'gameCard.priceData.coverageFull': '覆盖 {ok}/{expected}',
   'gameCard.priceData.coveragePartial': '覆盖 {ok}/{expected}，未完整',
   'gameCard.priceData.tip.locked': '{n} 个地区不售卖（锁区）',
   'gameCard.priceData.tip.failed': '{n} 个地区暂时没拿到，稍后自动重试',
   'gameCard.priceData.tip.unobserved': '{n} 个地区还在获取中',
+  'gameCard.priceData.tipRegion.locked': '{region}：不售卖（锁区）',
+  'gameCard.priceData.tipRegion.failed': '{region}：暂时没拿到，稍后自动重试',
+  'gameCard.priceData.tipRegion.unobserved': '{region}：还在获取中',
 
   /* ── 卡片操作行（regionPrice.title 与 GPW 弹窗小标题同条）── */
   'gameCard.regionPrice.title': '全区价格',

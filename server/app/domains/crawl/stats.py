@@ -85,7 +85,7 @@ async def cycle_stats(cycle_id: int) -> dict | None:
             else None
         )
 
-    coverage = await coverage_mod.cycle_coverage(cycle_id)
+    coverage = await coverage_mod.cycle_coverage(cycle_id, per_appid=True)
     if coverage is None:
         return None
     fresh = await freshness_mod.appid_freshness(appids)
@@ -99,6 +99,8 @@ async def cycle_stats(cycle_id: int) -> dict | None:
         "unitsUnobserved": coverage["unobserved"],
         "coverage": coverage["coverage"],
         "coverageConfirmed": coverage["coverageConfirmed"],
+        # 对象级五桶明细：冻结进 Cycle 行 coverage_json，卡片覆盖的唯一证据源
+        "perAppid": coverage.get("perAppid"),
         "staleCount": sum(1 for f in fresh if f["freshness"] == "stale"),
         "durationSeconds": duration,
         "stageMs": stages,
