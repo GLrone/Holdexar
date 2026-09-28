@@ -1,11 +1,15 @@
-"""自动爬取直连放行 + 全局限流测试。
+"""自动爬取的策略形态 + 全局限流测试。
 
-browse 按 country_code 参数返回各区价格，
-出口 IP 不参与数据判定——直连即标准形态（一般用户的加速器在系统网络
-层透明生效，应用侧无需代理）。「无可用代理不自动爬」前置闸门不适用此形态：
-自动路径（调度器价格刷新/失败修复/账户同步追加首爬/榜单
-反哺/CS 重探）无代理也照常启动，请求频率由全局滑动窗口限流
+browse 按 country_code 参数返回各区价格，出口 IP 不参与数据判定——
+直连与代理拿到同一份数据，请求频率由全局滑动窗口限流
 （200 发/5 分钟，crawler/rate_limit.py）统一约束。
+
+形态分界：
+- **直连策略（显式选择）**：作业托管到用户本机网络环境（加速器 / Clash
+  Verge 等本地代理的通道即实际出口），池子不可用也照常启动——它是用户
+  显式选的形态，不是池坏了的静默兜底；worker 收在 DIRECT_MODE_WORKERS。
+- **其余策略（含默认代理优先）**：fail closed——拿不到池 Runtime 就拒绝
+  启动，绝不静默退直连（那会把「池坏了」伪装成「爬取成功」）。
 
 隔离：不出网、不触生产库（域服务模块级 import 的 factory 打桩）。
 """
@@ -262,6 +266,50 @@ async def test_price_refresh_runs_with_runtime(db, monkeypatch):
     assert "missing" in kinds, f"有池 Runtime 时主轮 missing 层应启动：{kinds}"
     assert bundle_calls, "链尾捆绑包存量刷新应执行"
     assert sched_mod._price_cycle_busy is False, "busy 必须正常复位"
+
+
+# ── 直连策略（显式选择）：托管本机网络环境，不问池子 ──
+
+
+@pytest.mark.asyncio
+async def test_direct_strategy_crawls_without_pool(db, monkeypatch):
+    """直连策略显式选中：池子不可用也照常启动，config 不带任何代理。
+
+    与 fail-closed 的分界：直连是用户显式选的策略，不是池坏了的静默兜底。
+    worker 收在 DIRECT_MODE_WORKERS（单出口下多 worker 只是在全局闸前排队）。"""
+    import app.domains.proxypool.runtime as pp_runtime
+    import app.domains.settings.service as settings_service
+
+    _crawl_env(monkeypatch)
+
+    async def _direct_value(key, default=None):
+        if key == "proxy.strategy":
+            return "direct_only"
+        return default
+
+    monkeypatch.setattr(settings_service, "get_value", _direct_value)
+
+    async def _no_lane(_session, _d, **_kw):
+        raise AssertionError("直连形态不得询问池子 lane 计划")
+
+    monkeypatch.setattr(pp_runtime, "crawl_lane_plan", _no_lane)
+    monkeypatch.setattr(pp_runtime, "current_runtime_proxy_url", lambda _d=None: None)
+
+    captured: list = []
+
+    async def _capture_run_crawl(pairs, *, config, stop_event=None, pre_tasks=None):
+        captured.append(config)
+        return {"total": len(pairs or []) + len(pre_tasks or []), "processed": 0}
+
+    monkeypatch.setattr(crawl_service, "run_crawl", _capture_run_crawl)
+
+    await crawl_service.start_job(scope="appids", appids=[998001], kind="scheduled")
+    assert crawl_service._active is not None, "直连形态：池子不可用也必须能启动"
+    await crawl_service._active.task
+    assert captured, "直连形态下 run_crawl 必须被调用"
+    cfg = captured[0]
+    assert cfg.proxy_url is None and not cfg.proxy_urls, "直连形态不带任何代理"
+    assert cfg.workers == crawl_service.DIRECT_MODE_WORKERS
 
 
 # ── 全局滑动窗口限流 ──
