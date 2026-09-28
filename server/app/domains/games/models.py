@@ -146,6 +146,9 @@ class GamePriceHistory(Base):
     # 同族扩展列 discount_desc/bundle_id/bundle_discount_pct 不经 ORM，
     # 由 attach_browse_extras 以裸 SQL 回贴
     discount_end_ts: Mapped[int | None] = mapped_column(Integer)
+    # 所属 Steam 活动周期标签（steam_events.event_key；观测写入时打标 +
+    # 同步后按窗口回贴；PT 活动日归属口径，边界误差至多一天）
+    steam_event_key: Mapped[str | None] = mapped_column(String(60))
     snapshot_at: Mapped[datetime | None] = mapped_column(DateTime)
 
     __table_args__ = (

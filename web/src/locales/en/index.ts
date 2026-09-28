@@ -72,6 +72,8 @@ import priceEvent from './priceEvent'
 import fetchPage from './fetch'
 // ── Dynamic-island message surface (components/ui/HlIsland.vue) ──
 import island from './island'
+// ── Steam event calendar (views/events/Index.vue + SteamEventCountdown card) ──
+import steamEvents from './steamEvents'
 
 const messages: Partial<Record<MessageKey, string>> = {
   ...common,
@@ -116,6 +118,7 @@ const messages: Partial<Record<MessageKey, string>> = {
   ...priceEvent,
   ...fetchPage,
   ...island,
+  ...steamEvents,
 }
 
 export default messages

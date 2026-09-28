@@ -44,11 +44,12 @@ test('系统组命名固定（网络 / 任务 / 汇率 / 日志 / 设置 / 关�
   assert.equal((en as Record<string, string>)['nav.me'], 'Settings')
 })
 
-test('更多组命名固定（捆绑包 / 家庭 / 账单 / 成就）', () => {
+test('更多组命名固定（捆绑包 / 家庭 / 账单 / 活动日历 / 成就）', () => {
   const moreZh: Record<string, string> = {
     'nav.bundles': '捆绑包',
     'nav.family': '家庭',
     'nav.bills': '账单',
+    'nav.events': '活动日历',
     'nav.achievements': '成就',
   }
   for (const [key, value] of Object.entries(moreZh)) {
@@ -67,6 +68,7 @@ test('一级导航词条不含实现词（监控池 / 代理 / 爬取 / 节点 /
     'nav.bundles',
     'nav.family',
     'nav.bills',
+    'nav.events',
     'nav.achievements',
     'nav.proxies',
     'nav.crawl',

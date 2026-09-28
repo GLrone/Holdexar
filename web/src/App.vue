@@ -192,6 +192,7 @@ const navGroups = computed<HlSideNavGroup[]>(() => [
     items: [
       { label: t('nav.family'), to: '/family', icon: 'home' },
       { label: t('nav.bills'), to: '/bills', icon: 'list' },
+      { label: t('nav.events'), to: '/events', icon: 'calendar' },
       { label: t('nav.achievements'), to: '/achievements', icon: 'trophy' },
     ],
   },
