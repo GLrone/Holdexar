@@ -790,7 +790,8 @@ async def refresh_online_states(rows: list[SteamAccount] | None = None) -> dict:
     rows = rows if rows is not None else await _all_accounts()
     if not rows:
         return {"ok": False, "status": "no_account"}
-    api_key = (await settings_service.get_value("account.steam_api_key", "")) or ""
+    # 凭据键经 get_secret_value 读取（落库为密文，get_value 只回密文本体）
+    api_key = (await settings_service.get_secret_value("account.steam_api_key", "")) or ""
     if not api_key:
         return {"ok": False, "status": "no_key"}
 
