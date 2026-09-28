@@ -3,6 +3,7 @@ import { computed, ref } from 'vue'
 
 import {
   familyApi,
+  type FamilyGroupStatus,
   type FamilyLibGame,
   type FamilyLibMember,
   type FamilyLibraryPayload,
@@ -14,14 +15,43 @@ import { normalizeAvatarUrl } from '@/api/avatar'
 
 /**
  * 家庭共享库共享数据源：family 页各 tab 的统一真数据后端快照。
- * load() 失败时记录 message（未绑 Cookie / 未加入家庭组 → 诚实引导），
- * tabs 各自渲染空态；refresh() 强制重拉（后端绕过 5 分钟缓存）。
+ * 多账号 = 多家庭组：groups 为各绑定账号的组记录，activeSteamId 指向当前
+ * 查看的组，库聚合按组拉取（后端按账号分键缓存）。load() 失败时记录
+ * message（未绑 Cookie / 未加入家庭组 → 诚实引导），tabs 各自渲染空态。
  */
 export const useFamilyStore = defineStore('familyLib', () => {
   const { t } = useI18n()
   const data = ref<FamilyLibraryPayload | null>(null)
   const loading = ref(false)
   const error = ref('')
+
+  /* ── 多家庭组：组列表 + 当前查看组 ── */
+  const groups = ref<FamilyGroupStatus[]>([])
+  const activeSteamId = ref('')
+  /** data 归属的组账号（切换组后旧数据作废，防串组展示） */
+  const dataSteamId = ref('')
+
+  const activeGroup = computed(
+    () => groups.value.find((g) => g.steamid === activeSteamId.value) ?? null,
+  )
+
+  /** 记录组列表；当前组失效（未同步/被移除）时回落到首个已加入组 */
+  function setGroups(list: FamilyGroupStatus[]) {
+    groups.value = list
+    if (!activeSteamId.value || !list.some((g) => g.steamid === activeSteamId.value)) {
+      activeSteamId.value = list.find((g) => g.joined)?.steamid ?? list[0]?.steamid ?? ''
+      dataSteamId.value = '' // 组变了：旧库数据作废
+    }
+  }
+
+  /** 切换当前组并按组重拉家庭库（同组重复调用是 no-op） */
+  async function setActiveGroup(sid: string) {
+    if (!sid || sid === activeSteamId.value) return
+    activeSteamId.value = sid
+    data.value = null
+    dataSteamId.value = ''
+    await load()
+  }
 
   // 成员头像 URL 就地归一（旧快照可能是已死/轮换 CDN 域）——7 个 tab 同源
   const members = computed<FamilyLibMember[]>(() =>
@@ -90,14 +120,18 @@ export const useFamilyStore = defineStore('familyLib', () => {
 
   async function load(force = false) {
     if (loading.value) return
-    // 已就绪且非强制刷新：直接复用。守卫必须在这一层（各 tab 组件只写自己那份），
-    // 因为 family 首页的 onMounted 每次进入都会调一次 load()——不加这行，板块
-    // 来回切就是一次次白等（后端快照兜底那 2s 的路径）。
-    if (ready.value && !force) return
+    // 已就绪（数据归属当前组）且非强制刷新：直接复用。守卫必须在这一层
+    // （各 tab 组件只写自己那份），因为 family 首页的 onMounted 每次进入
+    // 都会调一次 load()——不加这行，板块来回切就是一次次白等。
+    if (!force && dataSteamId.value === activeSteamId.value && ready.value) return
+    const target = activeSteamId.value
     loading.value = true
     error.value = ''
     try {
-      data.value = force ? await familyApi.refreshLibrary() : await familyApi.library()
+      data.value = force
+        ? await familyApi.refreshLibrary(target || undefined)
+        : await familyApi.library(target || undefined)
+      dataSteamId.value = target
     } catch (e) {
       error.value = e instanceof Error ? e.message : String(e)
       if (!data.value) data.value = null
@@ -148,29 +182,27 @@ export const useFamilyStore = defineStore('familyLib', () => {
     return [...map.entries()].sort((a, b) => a[0].localeCompare(b[0]))
   })
 
-  /* ── 家庭组同步（主账号 Cookie → GetFamilyGroupForUser → 成员自动补齐）──
-     生命周期在 store：请求进行中重进页面不再发起第二份（重入防护），
-     完成消息照常入灵动岛。 */
+  /* ── 家庭组同步（多账号：遍历绑定账号逐个发现 → 成员自动补齐）──
+     生命周期在 store：请求进行中重进页面不再发起第二份（重入防护）。 */
   const syncing = ref(false)
 
-  /** 同步成功返回家庭组名（发起页面据此刷新本地成员清单）；未变更返回 null */
-  async function syncFamily(): Promise<string | null> {
-    if (syncing.value) return null
+  /** 同步全部绑定账号的家庭组；结果按 汇总toast 呈现（部分失败如实说） */
+  async function syncFamily(): Promise<void> {
+    if (syncing.value) return
     syncing.value = true
     message.loading(t('family.action.syncing'))
     try {
       const r = await familyApi.sync()
-      if (r.joined) {
-        const groupName = r.familyName || t('family.group.unnamed')
-        message.success(t('family.sync.success', { name: groupName, n: r.members.length }))
-        void load(true) // 家庭组变了：强制重拉家庭库聚合
-        return groupName
+      if (r.failed > 0) {
+        message.warning(t('family.sync.partial', { joined: r.joined, failed: r.failed }))
+      } else if (r.joined > 0) {
+        message.success(t('family.sync.all', { n: r.joined }))
+      } else {
+        message.info(t('family.sync.none'))
       }
-      message.info(r.message || t('family.sync.notJoined'))
-      return null
+      await load(true) // 成员可能变了：强制重拉当前组的家庭库聚合
     } catch (e) {
       message.error(e instanceof Error ? e.message : String(e))
-      return null
     } finally {
       syncing.value = false
     }
@@ -181,6 +213,11 @@ export const useFamilyStore = defineStore('familyLib', () => {
     loading,
     error,
     ready,
+    groups,
+    activeSteamId,
+    activeGroup,
+    setGroups,
+    setActiveGroup,
     members,
     games,
     memberPlay,

@@ -1,7 +1,8 @@
 <script setup lang="ts">
 /* 家庭愿望单（框架 wl-*）：7 KPI + 筛选 + 左仪表盘（分布/标签/价格环）+ 右列表。
-   数据源：GET /family/wishlist（wishlist_items × games 本地聚合，无需 Cookie）。 */
-import { computed, onMounted, ref } from 'vue'
+   数据源：GET /family/wishlist（wishlist_items × games 本地聚合，无需 Cookie），
+   按当前查看的家庭组取数（store.activeSteamId，多账号多组跟随组切换）。 */
+import { computed, onMounted, ref, watch } from 'vue'
 
 import { HlButton, HlChip, HlIcon, HlStat } from '@/components/ui'
 import { familyApi, type FamilyWishlistItem, type FamilyWishlistPayload } from '@/api/client'
@@ -25,8 +26,13 @@ async function load(force = false) {
   error.value = ''
   try {
     // 走 cachedGet：本 tab 由 v-if 切换，每次切回来都会重挂载并重下 302 KB。
-    // 「刷新」按钮传 force=true 绕过复用窗口。
-    payload.value = await cachedGet('family.wishlist', () => familyApi.wishlist(), { force })
+    // 缓存键带组账号（多组各一份）；「刷新」按钮传 force=true 绕过复用窗口。
+    const sid = store.activeSteamId
+    payload.value = await cachedGet(
+      `family.wishlist:${sid || 'primary'}`,
+      () => familyApi.wishlist(sid || undefined),
+      { force },
+    )
     loadedAt.value = fmt.time(new Date())
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
@@ -37,6 +43,11 @@ async function load(force = false) {
 onMounted(() => {
   void load()
   if (!store.ready) void store.load()  // 家庭已有（owned 命中）交叉核对用
+})
+// 组切换：换数据源重取（清旧组数据，避免串组展示）
+watch(() => store.activeSteamId, () => {
+  payload.value = null
+  void load(true)
 })
 
 /* 筛选档位——常量表只存 key（模块级常量存译文＝把语言冻在加载那一刻）。
