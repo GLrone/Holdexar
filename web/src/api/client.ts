@@ -1115,6 +1115,7 @@ export interface CrawlJob {
   kind: string
   status: string
   mode: string | null
+  cycleId: number | null
   regions: string[] | null
   stats: Record<string, number> | null
   startedAt: string | null
