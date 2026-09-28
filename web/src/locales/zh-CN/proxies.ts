@@ -32,7 +32,7 @@ const proxies = {
   'proxies.strategy.proxyFirst.label': '代理优先（推荐）',
   'proxies.strategy.proxyFirst.desc': 'Clash 在跑走 Clash<br><small>否则代理池轮询，最后直连</small>',
   'proxies.strategy.directOnly.label': '直连',
-  'proxies.strategy.directOnly.desc': '全部走本机网络<br><small>不使用任何代理</small>',
+  'proxies.strategy.directOnly.desc': '作业托管到本机网络环境（加速器 / Clash Verge 的通道即实际出口）<br><small>价格作业也走本机 · 限速 200 次/5 分钟</small>',
   'proxies.strategy.directFirst.label': '直连优先',
   'proxies.strategy.directFirst.desc': '本机优先<br><small>失败时换代理重试</small>',
   'proxies.strategy.proxyOnly.label': '完全走代理',

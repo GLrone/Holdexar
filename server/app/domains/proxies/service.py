@@ -1,9 +1,13 @@
 """proxies 域服务：代理池 CRUD / 健康检查 / 策略引擎 / 走线日志。
 
 策略（存 app_settings: proxy.strategy）：
-- direct_only  默认直连
-- direct_first 直连（预留 M4 后续：失败换代理重试）
-- proxy_only   从启用代理轮询取一个用于整个任务
+- proxy_first   代理优先（默认）：Clash 在跑走 Clash → 代理池轮询 → 本地
+                混合端口 → 直连
+- direct_only   直连：作业托管到用户本机网络环境——加速器 / Clash Verge 等
+                本地代理的通道即实际出口；价格作业在此形态下也走本机，
+                频率由 crawler 全局限流闸（200 发/5 分钟）统一约束
+- direct_first  直连优先，失败换代理重试
+- proxy_only    从启用代理轮询取一个用于整个任务
 """
 from __future__ import annotations
 
@@ -115,9 +119,9 @@ async def get_strategy() -> dict:
     from app.domains.settings.service import get_value, set_value
 
     strategy = await get_value("proxy.strategy", None)
-    if strategy is None or strategy == "direct_only":
-        # 默认策略升级：Steam 域直连基本不可用（成功属侥幸），
-        # 代理优先成为默认；存量 direct_only 一次性迁移。
+    if strategy is None:
+        # 默认策略升级：Steam 域裸直连基本不可用（成功属侥幸），代理优先成为默认；
+        # 直连是显式选择（用户本机有加速器 / Clash Verge 等托管通道时选它）
         strategy = "proxy_first"
         await set_value("proxy.strategy", strategy)
     if strategy in ("pinned", "clash"):

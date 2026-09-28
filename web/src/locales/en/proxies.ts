@@ -24,7 +24,7 @@ const proxies: Partial<Record<MessageKey, string>> = {
   'proxies.strategy.proxyFirst.label': 'Proxy first (recommended)',
   'proxies.strategy.proxyFirst.desc': 'Clash when running<br><small>otherwise rotate the pool, then go direct</small>',
   'proxies.strategy.directOnly.label': 'Direct only',
-  'proxies.strategy.directOnly.desc': 'All traffic on the local network<br><small>no proxy at all</small>',
+  'proxies.strategy.directOnly.desc': 'Jobs run on your local network (game booster / Clash Verge tunnel is the actual exit)<br><small>price jobs included · rate-capped at 200 req/5 min</small>',
   'proxies.strategy.directFirst.label': 'Direct first',
   'proxies.strategy.directFirst.desc': 'Local first<br><small>retry through a proxy on failure</small>',
   'proxies.strategy.proxyOnly.label': 'Proxy only',

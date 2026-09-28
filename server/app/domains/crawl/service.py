@@ -428,6 +428,10 @@ async def _execute(
 # 补抓层专用：定向小流量通道，低 worker 防 429 风暴（STT"稀缺配额单独通道"）
 MISSING_RECOVERY_WORKERS = 6
 
+# 直连形态的 worker 上限：单出口（用户本机网络环境），请求速率由全局滑动窗口闸
+# （200 发/5 分钟）统一约束，多 worker 只是在闸前排队，不提高吞吐
+DIRECT_MODE_WORKERS = 4
+
 
 # 孤儿回补层：每日价格刷新第三层消化挂名孤儿（updated_at IS NULL），
 # 当日限量防挤占——779 级欠账按此配额多日自然消化，不阻塞关注层
@@ -641,28 +645,51 @@ async def start_job(
         min(worker_count, MISSING_RECOVERY_WORKERS) if small_lane else worker_count
     )
     data_dir = _get_settings().data_dir
-    async with get_session_factory()() as session:
-        run_plan = await crawl_lane_plan(
-            session, data_dir, max_lanes=min(planned_workers, MAX_CRAWL_WORKERS)
+
+    from app.domains.settings.service import get_value
+
+    if (await get_value("proxy.strategy", "proxy_first")) == "direct_only":
+        # 直连策略：价格作业**托管到用户本机网络环境**——加速器 / Clash Verge
+        # 等本地代理的通道即实际出口，池子状态与此形态无关（空池也能作业）。
+        # 频率由 crawler 的全局滑动窗口闸（200 发/5 分钟）统一约束，多 worker
+        # 只是在闸前排队，不提高请求速率，因此 worker 数收在小额。
+        effective_workers = min(planned_workers, DIRECT_MODE_WORKERS)
+        logger.info(
+            "[容量] 直连形态：作业托管到本机网络环境（加速器 / 本地代理的通道即实际出口）"
+            "| worker %d | 频率闸 200 发/5 分钟",
+            effective_workers,
         )
-    proxy_urls = run_plan["urls"]
-    effective_workers = max(1, min(planned_workers, len(proxy_urls), MAX_CRAWL_WORKERS))
-    logger.info(
-        "[容量] 出口槽：已知出口 %d | run 内 active lane %d（内核 listener %d）| "
-        "worker %d（期望 %d，上限 %d）",
-        run_plan.get("known_exits", 0), len(proxy_urls),
-        run_plan.get("runtime_lanes", len(proxy_urls)),
-        effective_workers, planned_workers, MAX_CRAWL_WORKERS,
-    )
-    config = CrawlRunConfig(
-        regions=effective,
-        workers=effective_workers,
-        timeout=HTTP_TIMEOUT,
-        proxy_url=proxy_urls[0],
-        proxy_urls=proxy_urls,
-        exit_keys=run_plan["exit_keys"],
-        exit_nodes=run_plan["nodes"],
-    )
+        config = CrawlRunConfig(
+            regions=effective,
+            workers=effective_workers,
+            timeout=HTTP_TIMEOUT,
+        )
+    else:
+        from app.domains.proxies import clash_manager as _cm
+
+        async with get_session_factory()() as session:
+            run_plan = await crawl_lane_plan(
+                session, data_dir, max_lanes=min(planned_workers, MAX_CRAWL_WORKERS),
+                runtime=_cm.pool_runtime,
+            )
+        proxy_urls = run_plan["urls"]
+        effective_workers = max(1, min(planned_workers, len(proxy_urls), MAX_CRAWL_WORKERS))
+        logger.info(
+            "[容量] 出口槽：已知出口 %d | run 内 active lane %d（内核 listener %d）| "
+            "worker %d（期望 %d，上限 %d）",
+            run_plan.get("known_exits", 0), len(proxy_urls),
+            run_plan.get("runtime_lanes", len(proxy_urls)),
+            effective_workers, planned_workers, MAX_CRAWL_WORKERS,
+        )
+        config = CrawlRunConfig(
+            regions=effective,
+            workers=effective_workers,
+            timeout=HTTP_TIMEOUT,
+            proxy_url=proxy_urls[0],
+            proxy_urls=proxy_urls,
+            exit_keys=run_plan["exit_keys"],
+            exit_nodes=run_plan["nodes"],
+        )
     async with get_session_factory()() as session:
         job = CrawlJob(
             kind=kind,
