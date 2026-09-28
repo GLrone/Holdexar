@@ -392,7 +392,7 @@ async function loadHistory() {
   }
 }
 
-/** 下架复探：清标 + 后台重爬（误判自愈 / 重新上架复活） */
+/** 复探：清下架标记 + 后台重爬（误判自愈 / 重新上架复活 / 无商店数据补首爬） */
 const retrying = ref(false)
 /** 复探结果：**state 只存词条 key**（'' = 无提示），文字在模板里 t() 现取——
  *  把译好的句子写进 ref 会把语言冻在赋值那一刻（赋值只发生在异步回调里）。 */
@@ -403,7 +403,7 @@ const retryNote = computed(() =>
   retryNoteErr.value ? retryNoteErr.value : retryNoteKey.value ? t(retryNoteKey.value) : '',
 )
 async function retryRemoved() {
-  if (!detail.value?.removedAt || retrying.value) return
+  if ((!detail.value?.removedAt && !detail.value?.storeDataMissing) || retrying.value) return
   retrying.value = true
   retryNoteKey.value = ''
   retryNoteErr.value = ''
@@ -411,7 +411,9 @@ async function retryRemoved() {
     const res = await gamesApi.retryRemoved(appid.value)
     retryNoteKey.value = res.requeued
       ? 'gameDetail.removed.requeued'
-      : 'gameDetail.removed.cleared'
+      : detail.value?.removedAt
+        ? 'gameDetail.removed.cleared'
+        : 'gameDetail.storeMissing.busy'
   } catch (e) {
     retryNoteErr.value = e instanceof Error ? e.message : String(e)
   } finally {
@@ -590,10 +592,12 @@ onMounted(load)
             </a>
           </div>
 
-          <!-- 下架提示（移除监控）：判定下架时展示，附手动复探入口 -->
-          <div v-if="detail.removedAt" class="gd-removed-banner">
-            <span class="gd-removed-tag">{{ t('gameDetail.removed.tag') }}</span>
-            <span class="gd-removed-date">
+          <!-- 下架 / 无商店数据提示：两类对象共用「重新探测」入口 -->
+          <div v-if="detail.removedAt || detail.storeDataMissing" class="gd-removed-banner">
+            <span class="gd-removed-tag">
+              {{ t(detail.removedAt ? 'gameDetail.removed.tag' : 'gameDetail.storeMissing.tag') }}
+            </span>
+            <span v-if="detail.removedAt" class="gd-removed-date">
               {{ t('gameDetail.removed.judged', { date: detail.removedAt.slice(0, 10) }) }}
             </span>
             <HlButton variant="text" :disabled="retrying" :loading="retrying" @click="retryRemoved">
@@ -903,7 +907,7 @@ onMounted(load)
                   <div class="gd-bundle-meta">
                     <span :class="b.mustPurchaseAsSet === 0 ? 'gd-bm-complete' : ''">{{ bundleMustText(b.mustPurchaseAsSet) }}</span>
                     <span v-if="b.priceCny !== null && b.lowestPriceFen !== null" class="gd-bundle-price">
-                      {{ regionName(b.lowestRegion) }} ¥{{ (b.lowestPriceFen / 100).toFixed(2) }}
+                      <RegionFlag :code="b.lowestRegion" compact /> ¥{{ (b.lowestPriceFen / 100).toFixed(2) }}
                     </span>
                   </div>
                 </div>

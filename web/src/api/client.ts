@@ -757,6 +757,8 @@ export interface GameDetail extends GameListItem {
   freeKind: 'f2p' | 'promo' | null
   /** 赠送结束 Unix 秒（仅 promo 态有值） */
   promoEndAt: number | null
+  /** 现价矩阵完全为空（无任何可用观察行）——「重新探测」横幅显隐依据 */
+  storeDataMissing: boolean
 }
 
 export interface HistoryPoint {
