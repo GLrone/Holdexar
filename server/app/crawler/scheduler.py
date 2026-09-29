@@ -30,6 +30,10 @@ _PROGRESS_LOG_EVERY = 25
 _PER_TASK_CONNECTOR_LIMIT = 20
 _PER_TASK_DNS_CACHE = 60
 
+# 死通道冷却秒数：绑在连续连接失败出口上的 worker 暂停拉任务的间隔，
+# 到期放一发探测（成功即复位恢复，见 SteamHttpClient.lane_unhealthy）
+_LANE_COOLDOWN_SECONDS = 60
+
 
 class CrawlerScheduler:
     """基于 asyncio.Queue 的高可用任务调度器（生产者-消费者模型）。
@@ -116,13 +120,33 @@ class CrawlerScheduler:
         )
 
     async def _worker(self, worker_id: int, session) -> None:
-        # 本 worker 固定使用的入口客户端：多入口形态下一 worker 一条 lane，
+        # 本 worker 固定使用的入口客户端：多出口形态下一 worker 一条 lane，
         # 整个 run 不换（换入口由 Runtime 的重建/重绑负责，不在这里发生）
         http_client = (
             self.client_factory(worker_id) if self.client_factory is not None
             else self.http_client
         )
+        # 冷却到期后放行一个任务作探测的通行证（探测请求成功即复位通道健康）
+        lane_probe_due = False
         while not self.stop_event.is_set():
+            # 死通道冷却：多出口形态下，本 worker 绑定的出口连续连接失败
+            # 即暂停拉任务，让健康出口消化队列；冷却到期放一发探测（拉一个
+            # 任务真跑一次），请求一旦成功即复位恢复。全部出口同坏时任务
+            # 仍会经重推耗尽进失败台账，队列照常收敛——只降速，不停摆
+            if (
+                self.client_factory is not None
+                and not lane_probe_due
+                and getattr(http_client, "lane_unhealthy", False)
+            ):
+                try:
+                    await asyncio.wait_for(
+                        self.stop_event.wait(), timeout=_LANE_COOLDOWN_SECONDS
+                    )
+                except asyncio.TimeoutError:
+                    lane_probe_due = True  # 冷却到期：本轮放行一个任务作探测
+                    continue
+                break
+            lane_probe_due = False
             try:
                 task = await self.queue.get()
             except asyncio.CancelledError:

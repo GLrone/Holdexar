@@ -272,3 +272,55 @@ async def test_429_trips_breaker_then_backoff_succeeds(monkeypatch):
     assert data is not None
     assert client.proxy_url is None, "429 后不得切换出口（换出口机制已退役）"
     await global_429_breaker.reset()
+
+
+# ─── 通道健康：连接建立失败不上同出口重试（换出口交由 handler 重推） ───────────
+
+
+@pytest.mark.asyncio
+async def test_connect_establish_error_raises_immediately():
+    """连接建立失败是通道侧故障：同出口内重试只会把超时预算烧在坏出口上，
+    立即上抛交 handler 重推换出口；连续达到阈值后通道标记不可用，请求
+    成功即复位。"""
+    import aiohttp
+
+    client = SteamHttpClient(timeout=2, max_retries=3, proxy_url=None)
+
+    class FakeConnectFail(aiohttp.ClientConnectorError):
+        """免构造 ConnectionKey 的连接建立失败（只验证分类与重试路径）。"""
+
+        def __init__(self) -> None:
+            Exception.__init__(self, "connection refused")
+
+    calls = {"n": 0}
+
+    class FailSession:
+        def get(self, url, params=None, headers=None, timeout=None, proxy=None):
+            calls["n"] += 1
+            raise FakeConnectFail()
+
+    for _ in range(3):
+        with pytest.raises(aiohttp.ClientConnectorError):
+            await client.get_json(FailSession(), "https://store.example/api", appid=620)
+    assert calls["n"] == 3, "每次失败只发一发，不得在同出口内重试"
+    assert client.lane_unhealthy, "连续三次连接失败 → 通道不可用"
+
+    class FakeResp:
+        status = 200
+
+        async def json(self):
+            return {"620": {"success": True}}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class OkSession:
+        def get(self, url, params=None, headers=None, timeout=None, proxy=None):
+            return FakeResp()
+
+    data = await client.get_json(OkSession(), "https://store.example/api", appid=620)
+    assert data is not None
+    assert not client.lane_unhealthy, "请求成功复位通道健康"
