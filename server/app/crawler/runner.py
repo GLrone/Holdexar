@@ -267,6 +267,9 @@ async def _run_crawl_locked(
     tasks: list[dict] = list(pre_tasks or []) + _build_app_tasks(
         target_ids, regions, bs.EXTRAS_ENABLED
     )
+    # kz/ua 批次排最前：它们的 purchase_options 顺路填充 RU 基线（本设计不再
+    # 有独立的 CIS 预取请求），ru 批次写库前等基线就绪（见 browse_store 门）
+    tasks.sort(key=lambda t: t.get("region") not in bs.CIS_REGIONS)
 
     logger.info(
         "任务就绪：常规 %d + 预构建 %d | appids=%d regions=%s workers=%d 入口=%s",
@@ -281,25 +284,36 @@ async def _run_crawl_locked(
 
     connector = aiohttp.TCPConnector(limit=config.workers * 2, ttl_dns_cache=60)
     async with aiohttp.ClientSession(connector=connector) as session:
-        # ── 预取：元数据（schinese/english 两轮，跨回退区补齐）+ RU CIS 基准 ──
+        # ── 预取：只补库内没有的对象（首爬新面孔）──
+        # 已知对象（games 表有行，PRESERVED 已整表加载）不再走网络预取：
+        # 价格轮对它们只需 appid + 库内名字核对，元数据由 handler 回退
+        # PRESERVED（type 过滤 / name_en 版本后缀提取 / 建行原值保留）。
+        # 整轮两语言全量预取会把 worker 启动挡在分钟级串行请求之后。
+        # RU 基线不再预取：由本轮 kz/ua 批次顺路采集（kz/ua 本来就要跑），
+        # 上一轮的基线缓存覆盖「ru 先于 kz/ua 落库」的窗口。
         if target_ids:
-            zh = await bs.prefetch_lang(
-                session, http_client, target_ids, "schinese", bs.EXTRAS_ENABLED,
-                bs.DEFAULT_BATCH_SIZE,
-            )
-            en = await bs.prefetch_lang(
-                session, http_client, target_ids, "english", bs.EXTRAS_ENABLED,
-                bs.DEFAULT_BATCH_SIZE,
-            )
-            for aid in target_ids:
-                if aid in zh or aid in en:
-                    bs.META[aid] = bs.StoreBrowseAPI.build_meta(zh.get(aid), en.get(aid))
-            logger.info("[预取] 元数据覆盖 %d/%d", len(bs.META), len(target_ids))
-            if "ru" in regions:
-                await bs.prefetch_cis(
-                    session, http_client, target_ids, bs.EXTRAS_ENABLED,
+            unknown = [a for a in target_ids if a not in bs.PRESERVED]
+            if unknown:
+                zh = await bs.prefetch_lang(
+                    session, http_client, unknown, "schinese", bs.EXTRAS_ENABLED,
                     bs.DEFAULT_BATCH_SIZE,
                 )
+                en = await bs.prefetch_lang(
+                    session, http_client, unknown, "english", bs.EXTRAS_ENABLED,
+                    bs.DEFAULT_BATCH_SIZE,
+                )
+                for aid in unknown:
+                    if aid in zh or aid in en:
+                        bs.META[aid] = bs.StoreBrowseAPI.build_meta(zh.get(aid), en.get(aid))
+                logger.info(
+                    "[预取] 元数据覆盖 %d/%d（网络预取 %d 款，库内原值 %d 款）",
+                    len(bs.META), len(target_ids), len(unknown),
+                    len(target_ids) - len(unknown),
+                )
+        bs.load_cis_cache(Path(get_settings().data_dir))
+        bs.register_cis_pending(
+            [t["id"] for t in tasks if t.get("region") in bs.CIS_REGIONS]
+        )
 
         # failure_ledger：browse 层重试耗尽的批次只记账本不抛异常，调度器
         # 对外口径（进度事件与这里的返回统计）必须把账本并入「失败」
@@ -310,6 +324,7 @@ async def _run_crawl_locked(
             client_factory=client_factory,
         )
         await scheduler.run(tasks, session)
+        bs.save_cis_cache(Path(get_settings().data_dir))
 
         done, ok, failed = scheduler.counts()
         return {

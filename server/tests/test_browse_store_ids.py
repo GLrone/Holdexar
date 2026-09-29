@@ -67,3 +67,52 @@ def test_plan_id_batches_shapes() -> None:
         "us", "english", True, 10,
     )
     assert batches == [[{"bundleid": 1}, {"bundleid": 2}, {"packageid": 3}]]
+
+
+def test_cis_cache_roundtrip(tmp_path) -> None:
+    """CIS 基线缓存：save → load 跨进程回环（基线现由 kz/ua 批次顺路采集，
+    缓存只覆盖「ru 先于 kz/ua 落库」窗口与冷启动）。"""
+    from app.crawler import browse_store as bs
+
+    try:
+        bs.CIS_SUBS[620] = {111, 222}
+        bs.CIS_SUBS_TS[620] = 12345.0
+        bs.save_cis_cache(tmp_path)
+        assert (tmp_path / bs.CIS_CACHE_FILENAME).is_file()
+
+        bs.CIS_SUBS.clear()
+        bs.CIS_SUBS_TS.clear()
+        bs.load_cis_cache(tmp_path)
+        assert bs.CIS_SUBS[620] == {111, 222}
+        assert bs.CIS_SUBS_TS[620] == 12345.0
+
+        # 损坏文件 = 无基线：不抛、不污染现有状态
+        (tmp_path / bs.CIS_CACHE_FILENAME).write_text("{broken", encoding="utf-8")
+        bs.load_cis_cache(tmp_path)
+        assert bs.CIS_SUBS[620] == {111, 222}
+    finally:
+        bs.CIS_SUBS.clear()
+        bs.CIS_SUBS_TS.clear()
+
+
+def test_cis_gate_lifecycle() -> None:
+    """RU 基线门：登记 kz/ua 批次后关门，批次逐个释放、清空即放行；
+    无 kz/ua 批次的运行默认放行。"""
+    import asyncio
+
+    from app.crawler import browse_store as bs
+
+    try:
+        bs.reset_run_state()
+        assert bs.CIS_GATE.is_set(), "无 kz/ua 批次时默认放行"
+
+        bs.register_cis_pending(["kz:1", "ua:1", "ua:2"])
+        assert not bs.CIS_GATE.is_set(), "登记后关门"
+        bs.cis_batch_fetched("ua:1")
+        assert not bs.CIS_GATE.is_set(), "还有批次未采完"
+        bs.cis_batch_fetched("kz:1")
+        bs.cis_batch_fetched("ua:2")
+        assert bs.CIS_GATE.is_set(), "全部采完（含穷尽失败）即放行"
+    finally:
+        bs.CIS_PENDING.clear()
+        bs.CIS_GATE.set()
