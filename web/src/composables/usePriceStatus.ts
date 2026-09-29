@@ -1,10 +1,14 @@
 /* ════════════════════════════════════════════════════════════════════
    usePriceStatus.ts — 价格更新状态（灵动岛空闲态与它展开面的数据源）
-   一个结论只表达一件事：正在更新 / 价格已更新 / 更新未完成 / 等待更新。
+   一个结论只表达一件事：正在更新 / 价格已更新 / 更新未完成 / 等待更新 /
+   价格未更新。
 
    结论以**刷新轮次**为准：最近一轮的终态决定这轮收敛没有，最近一次真正写入
    价格的轮次收尾时刻决定数据有多旧。store 只补运行中的实时计数。
    轮次与批次的计数口径都不是游戏数，故对外不给任何数量。
+
+   空闲结论只在数据已旧（stale）时占岛：距上次成功写入未超出静默窗口就保持
+   静默，岛体让位给消息与任务；从未写入过视同已旧。
    ════════════════════════════════════════════════════════════════════ */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
@@ -15,6 +19,9 @@ import { useCrawlStatusStore } from '@/stores/crawlStatus'
 
 /** 扫描的轮次条数：够越过近期连续未收敛的轮次，回看到最近一次真正写入的轮次 */
 const CYCLE_SCAN = 20
+
+/** 数据静默窗口：距上次成功写入不超过该时长即视为新鲜，空闲结论不占岛 */
+const FRESH_WINDOW_MS = 6 * 60 * 60 * 1000
 
 /** 相对时长的重算间隔：分钟档要跟着走，不能让「N 小时前」停在旧值 */
 const AGO_TICK_MS = 60_000
@@ -77,6 +84,14 @@ export function usePriceStatus() {
 
   const hasHistory = computed(() => sawActivity.value || lastUpdatedAt.value !== null)
 
+  /** 数据是否已旧：从未写入过，或距上次成功写入已超出静默窗口 */
+  const stale = computed(() => {
+    const at = lastUpdatedAt.value
+    if (!at) return true
+    const ms = now.value - new Date(at).getTime()
+    return !Number.isFinite(ms) || ms > FRESH_WINDOW_MS
+  })
+
   const kind = computed(() =>
     priceStatusOf({
       running: crawl.running,
@@ -93,16 +108,16 @@ export function usePriceStatus() {
       case 'running':
         return t('island.price.running')
       case 'partial':
-        return t('island.price.partial')
+        return stale.value ? t('island.price.stale') : t('island.price.partial')
       case 'done':
       case 'idle':
-        return t('island.price.done')
+        return stale.value ? t('island.price.stale') : t('island.price.done')
       default:
         return t('island.price.waiting')
     }
   })
 
-  /** 颜色只表达状态：进行中=强调色，未收敛=待处理色，已更新=正常色，未更新=弱化 */
+  /** 颜色只表达状态：进行中=强调色，数据已旧/未收敛=待处理色，已更新=正常色，未写入=弱化 */
   const color = computed(() => {
     switch (kind.value) {
       case 'running':
@@ -111,7 +126,7 @@ export function usePriceStatus() {
         return 'var(--warning)'
       case 'done':
       case 'idle':
-        return 'var(--success)'
+        return stale.value ? 'var(--warning)' : 'var(--success)'
       default:
         return 'var(--text-muted)'
     }
@@ -124,7 +139,7 @@ export function usePriceStatus() {
         return t('island.price.tip')
       case 'done':
       case 'idle':
-        return t('island.price.tipDone')
+        return stale.value ? '' : t('island.price.tipDone')
       default:
         return ''
     }
@@ -147,5 +162,5 @@ export function usePriceStatus() {
   /** 展开态正文：数据有多旧。给不出写入时刻时留空，岛体随之收短 */
   const detail = computed(() => (ago.value ? t('island.price.updatedAt', { time: ago.value }) : ''))
 
-  return { kind, label, color, tip, detail }
+  return { kind, label, color, tip, detail, stale }
 }

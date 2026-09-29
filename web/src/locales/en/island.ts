@@ -1,6 +1,9 @@
 /* island keys — the dynamic-island message surface (components/ui/HlIsland.vue).
    Holds the island's own fixed actions, task copy, and the idle-state price
-   conclusion. Message bodies come from the caller and stay out of the lexicon. */
+   conclusion. The idle price conclusion only occupies the island while the
+   data is stale (last successful write over 6h old, or nothing written yet);
+   with fresh data and no messages the island retracts entirely. Message bodies
+   come from the caller and stay out of the lexicon. */
 import type { MessageKey } from '../zh-CN'
 
 const island: Partial<Record<MessageKey, string>> = {
@@ -19,6 +22,7 @@ const island: Partial<Record<MessageKey, string>> = {
   'island.price.running': 'Updating game prices',
   'island.price.done': 'Prices updated',
   'island.price.partial': 'Update incomplete',
+  'island.price.stale': 'Prices not updated',
   'island.price.tip': 'Some regions are not updated yet; the system will retry automatically',
   'island.price.tipDone': 'Update finished',
 
