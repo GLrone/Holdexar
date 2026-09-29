@@ -79,7 +79,7 @@ async def test_bundle_refresh_follows_game_chain(monkeypatch, _idle):
 
     await sched_mod._job_price_refresh()
 
-    assert events == [("chain", ["missing", "pool", "catalog"]), "bundles"]
+    assert events == [("chain", ["missing", "pool", "catalog", "specials_backfill"]), "bundles"]
     assert sched_mod._price_cycle_busy is False
 
 
@@ -96,7 +96,7 @@ async def test_bundle_refresh_failure_does_not_break_job(monkeypatch, _idle):
     monkeypatch.setattr(bundles_refresh, "refresh_bundles", _boom)
 
     await sched_mod._job_price_refresh()  # 不抛
-    assert events == [("chain", ["missing", "pool", "catalog"]), "bundles"]
+    assert events == [("chain", ["missing", "pool", "catalog", "specials_backfill"]), "bundles"]
     assert sched_mod._price_cycle_busy is False
 
 
