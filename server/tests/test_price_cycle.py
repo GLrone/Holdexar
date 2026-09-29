@@ -51,6 +51,22 @@ def db(tmp_path, monkeypatch):
     import app.domains.monitoring.service as monitoring_service
 
     monkeypatch.setattr(monitoring_service, "get_session_factory", lambda: factory)
+    # 收尾链的系列归组 / 免费脱池也在本文件任务路径上（现已转后台）：
+    # 同样模块级 import 了 factory，漏了就会读写生产库
+    import app.domains.games.series as games_series
+    import app.domains.wishlist.service as wishlist_service
+
+    monkeypatch.setattr(games_series, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(wishlist_service, "get_session_factory", lambda: factory)
+    # 周期收尾的事件检测 / 通知投递 / 统计落库同样模块级 import factory——
+    # 生产实例在跑时漏一个就是每测一次 60s busy_timeout 等锁
+    import app.domains.crawl.events as crawl_events
+    import app.domains.crawl.stats as crawl_stats
+    import app.domains.notifications.service as notification_service
+
+    monkeypatch.setattr(crawl_events, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(crawl_stats, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(notification_service, "get_session_factory", lambda: factory)
     return factory
 
 
