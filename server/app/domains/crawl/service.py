@@ -363,31 +363,15 @@ async def _finish_job(job_id: int, status: str, stats: dict | None = None, error
     bus.publish("job.status", job_id=job_id, status=status, error=error)
 
 
-async def _execute(
-    job_id: int,
-    appid_pairs: list[tuple[int, str]] | None,
-    config: CrawlRunConfig,
-    stop_event: asyncio.Event,
-    pre_tasks: list[dict] | None = None,
-) -> None:
-    started = time.monotonic()
-    try:
-        stats = await run_crawl(
-            appid_pairs, config=config, stop_event=stop_event, pre_tasks=pre_tasks
-        )
-        stats["elapsed_seconds"] = round(time.monotonic() - started, 1)
-        status = "stopped" if stop_event.is_set() else "done"
-        await _finish_job(job_id, status, stats)
-        logger.info("任务 %d 结束（%s）：%s", job_id, status, stats)
+# 后台标记链的强引用集：create_task 产物只有被持有时才不会被 GC
+_post_crawl_tasks: set[asyncio.Task] = set()
 
-        if stop_event.is_set():
-            # 手动停止：跳过提醒检查 / 史低刷新 / 排序缓存（对未爬完的数据无意义）
-            return
 
-        # 爬取落库后触发价格提醒检查 + 史低标记刷新（失败不影响任务状态）
-        crawled = [aid for aid, _ in (appid_pairs or [])] + [
-            t["id"] for t in (pre_tasks or [])
-        ]
+def _spawn_post_crawl_chain(crawled: list[int]) -> None:
+    """任务收尾下游链转后台：提醒 → 史低 → 新史低邮件 → 永降 → 排序缓存
+    → 系列归组 → 免费脱池。串行顺序与前台版一致，逐段兜异常不影响任务状态。
+    """
+    async def _chain() -> None:
         try:
             await alerts_service.check_appids(crawled)
         except Exception:  # noqa: BLE001
@@ -432,6 +416,40 @@ async def _execute(
                 logger.info("永久免费自动脱池 %d 款", released)
         except Exception:  # noqa: BLE001
             logger.exception("免费游戏自动脱池失败（不影响任务）")
+
+    task = asyncio.create_task(_chain())
+    _post_crawl_tasks.add(task)
+    task.add_done_callback(_post_crawl_tasks.discard)
+
+
+async def _execute(
+    job_id: int,
+    appid_pairs: list[tuple[int, str]] | None,
+    config: CrawlRunConfig,
+    stop_event: asyncio.Event,
+    pre_tasks: list[dict] | None = None,
+) -> None:
+    started = time.monotonic()
+    try:
+        stats = await run_crawl(
+            appid_pairs, config=config, stop_event=stop_event, pre_tasks=pre_tasks
+        )
+        stats["elapsed_seconds"] = round(time.monotonic() - started, 1)
+        status = "stopped" if stop_event.is_set() else "done"
+        await _finish_job(job_id, status, stats)
+        logger.info("任务 %d 结束（%s）：%s", job_id, status, stats)
+
+        if stop_event.is_set():
+            # 手动停止：跳过提醒检查 / 史低刷新 / 排序缓存（对未爬完的数据无意义）
+            return
+
+        # 爬取落库后的下游链整段转后台：任务状态不等它。史低/永降/排序都是
+        # 派生数据（晚几秒可见；进程退出丢一轮由下一轮重算自愈），提前释放
+        # 的是抓取占用与任务收尾时长
+        crawled = [aid for aid, _ in (appid_pairs or [])] + [
+            t["id"] for t in (pre_tasks or [])
+        ]
+        _spawn_post_crawl_chain(crawled)
     except Exception as e:  # noqa: BLE001
         logger.exception("任务 %d 失败", job_id)
         await _finish_job(job_id, "failed", None, str(e))
