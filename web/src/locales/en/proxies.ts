@@ -144,6 +144,7 @@ const proxies: Partial<Record<MessageKey, string>> = {
   'proxies.sub.emptyClash': 'No Clash subscription yet — add one below; it is kept locally and pulled on start',
   'proxies.sub.allDeprecated': 'All subscriptions are deprecated (over 95% of nodes unusable) — the backend has stopped using them; delete or replace them manually',
   'proxies.sub.clashPlaceholder': 'Add a Clash subscription link (https://… airport subscription, stored locally only)',
+  'proxies.sub.poolHint': 'All subscription nodes feed the crawl exit pool automatically — no per-subscription picking; the single select is for kernel start and manual switching',
   'proxies.sub.failTitle': 'Could not save subscription',
   'proxies.sub.failTip': 'Turn on a proxy first (e.g. Clash Verge on your desktop, or this app\'s Clash kernel), then click Retry to save the subscription again',
 

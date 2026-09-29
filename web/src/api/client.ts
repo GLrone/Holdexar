@@ -1380,6 +1380,8 @@ export interface ClashStatus {
   kernel: { found: boolean; path: string | null; builtin: boolean }
   version: string | null
   kernelDir: string
+  /** 用户最近一次显式选中的订阅（点选/切换/启动成功都落库）——回显与启动缺省同源 */
+  selectedSubscriptionId: number | null
   /** 启动响应扩展：实际拉起内核用的订阅（候选遍历后胜出的那条） */
   subscription?: { id: number; label: string | null }
   /** 启动响应扩展：非空 = 请求的订阅取不到配置，已降级到其他订阅启动 */
@@ -1573,6 +1575,9 @@ export const proxiesApi = {
     request<ClashStatus>('POST', '/proxies/clash/start', { subscriptionId }),
   clashSwitch: (subscriptionId: number) =>
     request<ClashSwitchResult>('POST', '/proxies/clash/switch', { subscriptionId }),
+  /** 内核未运行时记录订阅行点选（跨页面与重启保留，启动缺省用它） */
+  clashSelect: (subscriptionId: number) =>
+    request<{ selected: number }>('POST', '/proxies/clash/select', { subscriptionId }),
   clashTestStart: () => request<ClashTestProgress>('POST', '/proxies/clash/test'),
   clashTestProgress: () => request<ClashTestProgress>('GET', '/proxies/clash/test/progress'),
   clashHealthCheck: (force = false) =>

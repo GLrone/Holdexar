@@ -76,14 +76,25 @@ class ClashSwitch(BaseModel):
     subscriptionId: int
 
 
+class ClashSelect(BaseModel):
+    subscriptionId: int
+
+
 def _spawn_first_check(sub_id: int, *, probe_all: bool = True) -> None:
     """后台首检：订阅内容变化（启动/切换/重拉生效）后检测一次写账本
     （订阅废弃判定/selector 自愈都在里面）；缺省全量探测（probe_all）——
     首检要给「这条订阅现在到底能不能用」的完整结论；串行锁与手动检测/
-    定时体检互斥。"""
+    定时体检互斥。账本在复用窗口内已有全量结论时跳过（来回切换订阅
+    不重复探测），手动检测与定时路径不受此门约束。"""
 
     async def _first_check() -> None:
         try:
+            if await service.clash_nodes_fresh(sub_id):
+                logger.info(
+                    "[订阅首检] Clash 订阅 %s：账本 %d 分钟内已检测，沿用现有结论",
+                    sub_id, service.FIRST_CHECK_REUSE_MINUTES,
+                )
+                return
             r = await service.test_clash_nodes(sub_id, probe_all=probe_all)
             logger.info(
                 "[订阅首检] Clash 订阅 %s：共 %s 节点，可用 %s",
@@ -193,6 +204,7 @@ async def clash_status():
         "kernel": detect,
         "version": version,
         "kernelDir": str(clash_manager.kernel_dir(settings.data_dir)),
+        "selectedSubscriptionId": await service.remembered_clash_sub_id(),
     }
 
 
@@ -260,6 +272,9 @@ async def clash_start(req: ClashStart):
             {"traffic": picked["userinfo"], "nodes": picked.get("nodes"),
              "cached": picked.get("cached", False)},
         )
+    # 这次启动用的订阅落为「用户最近一次显式选中」——前端回显与下次启动
+    # 缺省同源（降级启到别的订阅时也以实际结果为准）
+    await service.remember_selected_clash_sub(sub_id)
     await service.record_event(
         kind="clash", target="subscription", proxy_label=f"clash:{status.get('port')}"
     )
@@ -326,7 +341,20 @@ async def clash_switch(req: ClashSwitch):
         raise HTTPException(status_code=502, detail=f"切换失败: {e}")
 
     _spawn_first_check(sub["id"], probe_all=True)
+    # 切换成功即「用户最近一次显式选中」，前端回显与下次启动缺省同源
+    await service.remember_selected_clash_sub(sub["id"])
     return {"switched": True, **new_status}
+
+
+@router.post("/clash/select")
+async def clash_select(req: ClashSelect):
+    """内核未运行时记录订阅行点选：落库跨页面与重启保留，供「启动」缺省
+    与前端回显。内核在跑时点选走 /clash/switch（选中即切换），不经这里。"""
+    subs = await service.list_subscriptions("clash")
+    if not any(s["id"] == req.subscriptionId for s in subs):
+        raise HTTPException(status_code=404, detail="指定的订阅不存在")
+    await service.remember_selected_clash_sub(req.subscriptionId)
+    return {"selected": req.subscriptionId}
 
 
 @router.post("/clash/test")

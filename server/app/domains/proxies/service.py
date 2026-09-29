@@ -98,12 +98,54 @@ SUBSCRIPTION_REFRESH_HOURS = 6  # 订阅重拉间隔（与节点体检同拍，�
 DEAD_MAX_FAILS = 10  # 累计失败 → dead 终态
 REVIVE_PASSES_REQUIRED = 3  # dead 复活需连续 3-of-3 测通过
 SUBSCRIPTION_DEPRECATE_RATIO = 0.95  # 不可用节点占比 >95% → 订阅废弃
+FIRST_CHECK_REUSE_MINUTES = 5  # 启动/切换触发的首检复用窗口：窗口内检测过就沿用账本，不重测
 # 失败冷却递增（分钟）：30min → 1h → 2h → 4h → 8h → 24h 封顶
 _FAIL_COOLDOWN_MINUTES = [30, 60, 120, 240, 480, 1440]
 
 
 def _naive(dt: datetime) -> datetime:
     return dt.replace(tzinfo=None) if dt.tzinfo else dt
+
+
+async def clash_nodes_fresh(sub_id: int) -> bool:
+    """该订阅的节点账本是否在 FIRST_CHECK_REUSE_MINUTES 内有过检测。
+
+    判据唯一来源是 clash_nodes.last_checked_at（跨重启有效），与 6h 体检
+    门槛同一把尺；窗口内账本就是「这条订阅现在能不能用」的现成结论，
+    首检不再全量重测。账本为空或结论过期返回 False，首检照跑。
+    """
+    async with get_session_factory()() as session:
+        row = await session.execute(
+            select(func.max(ClashNode.last_checked_at)).where(
+                ClashNode.subscription_id == sub_id
+            )
+        )
+        latest = row.scalar()
+    if latest is None:
+        return False
+    elapsed = _naive(get_beijing_time_obj()) - latest
+    return elapsed < timedelta(minutes=FIRST_CHECK_REUSE_MINUTES)
+
+
+# 用户最近一次显式选中的 Clash 订阅（点选行 / 切换 / 启动成功都落这里）：
+# 内核未运行时跨页面与重启保留点选，启动（含自启）缺省用它，前端回显同源
+SELECTED_CLASH_SUB_KEY = "proxy.selected_clash_sub_id"
+
+
+async def remember_selected_clash_sub(sub_id: int) -> None:
+    from app.domains.settings.service import set_value
+
+    await set_value(SELECTED_CLASH_SUB_KEY, int(sub_id))
+
+
+async def remembered_clash_sub_id() -> int | None:
+    from app.domains.settings.service import get_value
+
+    raw = await get_value(SELECTED_CLASH_SUB_KEY, None)
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def proxy_label(p: Proxy | None) -> str:
@@ -627,10 +669,18 @@ async def _pool_sync_single(sub_id: int) -> None:
 async def resolve_startable_clash(data_dir: Path, requested_id: int | None = None) -> dict:
     """挑一条「现在就能把内核拉起来」的 Clash 订阅，返回其配置文件路径。
 
-    候选顺序：请求的那条在前，其余非废弃 Clash 订阅按新→旧跟后。每条先
-    在线下载（download_subscription 内部自带「全部通道失败回退该订阅本地
-    缓存」），因此一条候选被淘汰当且仅当**既下载不了、本地又没有它的缓存**
-    ——订阅链接失效不该连累内核起不来，节点好不好交给体检与废弃判定。
+    候选顺序：请求的那条在前，其余非废弃 Clash 订阅按新→旧跟后；无显式
+    请求时，「用户最近一次显式选中」（落库 KV，点选/切换/启动成功都会写）
+    按请求对待。每条先在线下载（download_subscription 内部自带「全部通道
+    失败回退该订阅本地缓存」）。
+
+    **在线取到的配置优先于本地缓存回退**：缓存命中只代表曾经下载成功过，不代表
+    这条订阅现在活着。无指定订阅时把缓存回退的候选留作兜底继续往下找，否则内核会
+    被一条已失效订阅的旧缓存粘住——在线能取到的订阅永远轮不到，定时重拉随后也
+    只会反复读这份旧缓存。显式指定的订阅（requested_id）尊重用户选择，命中即返回。
+
+    一条候选被淘汰当且仅当**既下载不了、本地又没有它的缓存**——订阅链接失效不该
+    连累内核起不来，节点好不好交给体检与废弃判定。
     返回 {subscription, configPath, title, userinfo, nodes, cached, attempts}，
     attempts 记录被淘汰候选的失败原因；全军覆没抛 ValueError（文案面向
     用户，聚合各候选原因）。
@@ -641,13 +691,20 @@ async def resolve_startable_clash(data_dir: Path, requested_id: int | None = Non
             "没有可用的 Clash 订阅（全部已废弃或尚未添加），"
             "请在订阅区手动删除或更换订阅"
         )
+    if requested_id is None:
+        # 无显式请求时吃落库的「用户最近一次显式选中」（点选/切换/启动成功
+        # 都会写）；那条已被删除则自然落空，按原候选序兜底
+        requested_id = await remembered_clash_sub_id()
     if requested_id is not None:
         ordered = [s for s in subs if s["id"] == requested_id]
         ordered += [s for s in reversed(subs) if s["id"] != requested_id]
     else:
         ordered = list(reversed(subs))
+    # 无指定订阅时允许"缓存只作兜底"；显式指定则命中即用（尊重用户选择）
+    defer_cached = requested_id is None
     proxy_candidates = await _saved_proxy_candidates()
     attempts: list[dict] = []
+    cached_fallback: dict | None = None
     for sub in ordered:
         cache_path = clash_manager.subscription_config_path(data_dir, sub["id"])
         try:
@@ -663,7 +720,7 @@ async def resolve_startable_clash(data_dir: Path, requested_id: int | None = Non
                 sub["label"] or sub["url"], sub["id"], e,
             )
             continue
-        return {
+        entry = {
             "subscription": sub,
             "configPath": meta["path"],
             "title": meta.get("title"),
@@ -672,6 +729,18 @@ async def resolve_startable_clash(data_dir: Path, requested_id: int | None = Non
             "cached": bool(meta.get("cached", False)),
             "attempts": attempts,
         }
+        if defer_cached and entry["cached"]:
+            if cached_fallback is None:
+                cached_fallback = entry
+                logger.info(
+                    "[启动候选] 订阅 %s（id=%s）只能读到本地缓存，"
+                    "留作兜底并继续找能在线取到的候选",
+                    sub["label"] or sub["url"], sub["id"],
+                )
+            continue
+        return entry
+    if cached_fallback is not None:
+        return cached_fallback
     detail = "；".join(
         f"{a['label'] or ('id=' + str(a['id']))}：{a['error']}" for a in attempts
     )

@@ -152,6 +152,7 @@ const proxies = {
   'proxies.sub.emptyClash': '尚无 Clash 订阅 —— 下方添加后长期保存，启动时自动拉取',
   'proxies.sub.allDeprecated': '全部订阅已废弃（不可用节点超过 95%）—— 后端不再使用，请手动删除或更换订阅',
   'proxies.sub.clashPlaceholder': '添加 Clash 订阅链接（https://… 机场订阅，仅存本地）',
+  'proxies.sub.poolHint': '所有订阅的可用节点自动汇入抓取出口池，无需逐条选择；单选仅用于启动内核与手动切换',
   'proxies.sub.failTitle': '保存订阅失败',
   'proxies.sub.failTip': '建议先开启代理（如桌面 Clash Verge / 本应用的 Clash 内核），再点击「重试」重新保存订阅',
 

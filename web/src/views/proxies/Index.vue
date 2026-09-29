@@ -76,7 +76,14 @@ const runningSubId = computed(() => {
 /** 选中即切换：内核在跑 → 热重载切到所选订阅（气泡提示，内核进程不动）；
  *  内核没跑 → 只记录选择，「启动」会直接用它。 */
 async function onClashSubChange(sub: ProxySubscriptionItem) {
-  if (!clash.value?.running) return
+  if (!clash.value?.running) {
+    try {
+      await proxiesApi.clashSelect(sub.id)
+    } catch {
+      // 落库失败不影响本次选择；回显以后端 selectedSubscriptionId 为准
+    }
+    return
+  }
   if (switchingSub.value || sub.id === runningSubId.value) return
   switchingSub.value = true
   try {
@@ -225,11 +232,16 @@ async function load() {
     items.value = data.items
     strategy.value = data.strategy
     subscriptions.value = data.subscriptions
-    if (selectedClashSubId.value === null && clashSubs.value.length > 0) {
-      selectedClashSubId.value = clashSubs.value[clashSubs.value.length - 1]!.id
-    }
     events.value = await proxiesApi.events(80)
     clash.value = await proxiesApi.clashStatus()
+    // 选中态回显链：内核在跑的订阅 → 落库的最近显式选中 → 列表最近一条
+    // （与后端启动缺省同源）；已删订阅不算数
+    if (selectedClashSubId.value === null && clashSubs.value.length > 0) {
+      const remembered = clash.value?.selectedSubscriptionId
+      const known = remembered != null && clashSubs.value.some((s) => s.id === remembered)
+      selectedClashSubId.value =
+        runningSubId.value ?? (known ? remembered! : clashSubs.value[clashSubs.value.length - 1]!.id)
+    }
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e))
   } finally {
@@ -253,6 +265,12 @@ async function addSubscription(kind: 'clash' | 'plain') {
     if (kind === 'clash') {
       newClashSubUrl.value = ''
       selectedClashSubId.value = sub.id
+      // 新订阅即用户的最新显式选择，落库与回显/启动缺省同源
+      try {
+        await proxiesApi.clashSelect(sub.id)
+      } catch {
+        // 落库失败不影响本次选择；回显以后端 selectedSubscriptionId 为准
+      }
       const bits = [
         sub.nodes != null
           ? t('proxies.sub.savedNodes', { nodes: sub.nodes })
@@ -826,6 +844,7 @@ onMounted(async () => {
             {{ t('proxies.sub.syncAllRunning', { done: syncAll.done, total: syncAll.total }) }}
           </span>
         </div>
+        <p class="proxyx-hint proxyx-sub-pool-hint">{{ t('proxies.sub.poolHint') }}</p>
         <div class="proxyx-sub-list">
           <label
             v-for="sub in clashSubs"
@@ -1403,6 +1422,11 @@ onMounted(async () => {
   align-items: center;
   gap: 10px;
   justify-content: flex-end;
+}
+
+/* 订阅区出口池说明 */
+.proxyx-sub-pool-hint {
+  margin: 8px 0;
 }
 
 /* 订阅列表（双方式共用） */
