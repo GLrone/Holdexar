@@ -120,6 +120,10 @@ class SteamHttpClient:
     拿自己那条出口的预算、熔断器与统计账本，互不影响；不传则用进程级单例（单入口行为）。
     """
 
+    # 连续连接建立失败达到该值即视为通道不可用（调度器据此让绑在此出口上的
+    # worker 进入冷却，任务由健康出口消化）
+    LANE_FAIL_THRESHOLD = 3
+
     def __init__(
         self,
         timeout: int = 12,
@@ -141,6 +145,12 @@ class SteamHttpClient:
         self.stats = stats
         self.exit_key = exit_key
         self._ua_index = random.randrange(len(_USER_AGENTS))
+        self._consec_connect_errors = 0
+
+    @property
+    def lane_unhealthy(self) -> bool:
+        """本出口是否已连续连接失败到不可用（仅多出口形态被调度器消费）。"""
+        return self._consec_connect_errors >= self.LANE_FAIL_THRESHOLD
 
     def _get_headers(self, appid=None) -> dict[str, str]:
         self._ua_index = (self._ua_index + 1) % len(_USER_AGENTS)
@@ -157,6 +167,8 @@ class SteamHttpClient:
         记在每次尝试上而不是每次 `get_json` 调用上：重试多发的那几发同样占用了出口
         与上游配额，统计必须看得见它们。
         """
+        if outcome == "ok":
+            self._consec_connect_errors = 0
         if self.stats is None:
             return
         self.stats.record(
@@ -295,6 +307,12 @@ class SteamHttpClient:
                     "timeout" if isinstance(e, asyncio.TimeoutError) else "connect_error",
                     started, url,
                 )
+                # 连接建立失败是通道侧故障：同出口上重试只会把超时预算烧在
+                # 同一个坏出口上，立即上抛交给重推换出口（成功路径在
+                # _record("ok") 里复位计数）
+                if isinstance(e, aiohttp.ClientConnectorError):
+                    self._consec_connect_errors += 1
+                    raise
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(1 + random.uniform(0, 1))
                     continue

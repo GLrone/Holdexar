@@ -135,3 +135,39 @@ async def test_progress_events_all_published_before_run_returns():
             progress.append(event.payload)
     assert progress, "run() 返回前应已发布进度事件"
     assert progress[-1]["done"] == total, "run() 返回时末条进度必须已发布"
+
+
+@pytest.mark.asyncio
+async def test_unhealthy_lane_worker_parks_then_recovers(monkeypatch):
+    """死通道冷却：lane_unhealthy 的 worker 暂停拉任务，冷却到期放一发探测，
+    通道恢复后队列照常消化（只降速，不停摆）。"""
+    from app.crawler import scheduler as scheduler_mod
+
+    monkeypatch.setattr(scheduler_mod, "_LANE_COOLDOWN_SECONDS", 0.05)
+
+    class _LaneClient:
+        """lane_unhealthy 可控的假客户端（真实标记由 SteamHttpClient 维护）。"""
+
+        def __init__(self) -> None:
+            self.unhealthy = True
+
+        @property
+        def lane_unhealthy(self) -> bool:
+            return self.unhealthy
+
+    client = _LaneClient()
+    record: list = []
+
+    async def _app(context: CrawlerContext) -> None:
+        record.append(context.task["id"])
+        client.unhealthy = False  # 探测任务成功 → 通道恢复（真实路径是请求成功复位计数）
+
+    router = CrawlerRouter()
+    router.handle("app")(_app)
+    sched = CrawlerScheduler(
+        router, _FakeClient(), None, worker_count=1,
+        stop_event=asyncio.Event(), client_factory=lambda _wid: client,
+    )
+    await sched.run([{"type": "app", "id": "A"}], session=None)
+    assert record == ["A"], "冷却到期探测放行，任务最终被消费"
+    assert sched.counts() == (1, 1, 0)
