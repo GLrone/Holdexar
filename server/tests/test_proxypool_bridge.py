@@ -120,6 +120,46 @@ async def _observations(node_id: str) -> list[HealthObservation]:
 
 
 @pytest.mark.asyncio
+async def test_check_matches_runtime_name_without_source(env):
+    """来源关联缺失但身份行仍在时，体检结果按 runtime_name「订阅id|原名」也要命中。
+
+    订阅抓取失败 / 来源关联丢过一拍的行在池账本里没有 ProxyNodeSource，只按来源名
+    匹配会让这类「手动体检已证明健康」的节点全部落空、进不了池。
+    """
+    await init_db()
+    async with get_session_factory()() as s:
+        s.add(
+            ProxyNode(
+                node_id="n9",
+                fingerprint="n9",
+                runtime_name="4|香港-直连#1",
+                proxy_type="http",
+                server="10.0.0.1",
+                normalized_config=dict(CONFIG),
+                state=NODE_DEAD,
+                consecutive_failures=2,
+                first_seen=NOW,
+                last_seen=NOW,
+                last_source_seen=NOW,
+            )
+        )
+        await s.commit()
+
+    results = [{"name": "香港-直连#1", "alive": True, "exitIp": "1.2.3.4", "ms": 80}]
+    async with get_session_factory()() as s:
+        outcome = await B.ingest_node_check(
+            s, subscription_id=4, results=results, now=NOW
+        )
+        await s.commit()
+
+    assert outcome.matched == 1, "按运行名必须命中"
+    assert outcome.activated == 1, "命中的健康节点必须复活进池"
+    node = await _node("n9")
+    assert node.state == NODE_ACTIVE
+    assert node.exit_ip == "1.2.3.4"
+
+
+@pytest.mark.asyncio
 async def test_check_promotes_dead_node_and_carries_exit_ip(env):
     """一次成功体检把 DEAD 节点推回 ACTIVE，并带上出口 IP 与 L1/L2 观测。"""
     await init_db()

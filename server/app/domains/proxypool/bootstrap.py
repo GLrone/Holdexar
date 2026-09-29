@@ -154,19 +154,42 @@ async def sync_subscriptions(
     skipped: list[int] = []
     channels = build_channels(kernel_proxy=kernel_proxy, pool_proxy=pool_proxy)
 
+    # ── 并发下载（纯 I/O），落库仍串行（SQLite 单写者）──
+    # 串行下载会被任意一条慢/失效订阅拖住：失效订阅要逐通道试满超时，后面的订阅
+    # 只能干等；各订阅的抓取互相独立，先并发取回，再按原顺序串行落库（savepoint /
+    # 事件 / 投影语义完全不变）。订阅条数是个位数量级，一次性小扇出不设池。
+    sub_urls: dict[int, str] = {}
+    fetched: dict[int, object] = {}
+
+    async def _prefetch(sub) -> None:
+        url = open_url(sub.url)
+        sub_urls[sub.id] = url
+        if not url:
+            return
+        try:
+            fetched[sub.id] = await fetch_subscription(url, channels)
+        except Exception as exc:  # noqa: BLE001 —— 失败在下方按订阅记账
+            fetched[sub.id] = exc
+
+    await asyncio.gather(*(_prefetch(s) for s in subs))
+
     for sub in subs:
         sub_id = sub.id  # 先取出来：savepoint 回滚后 ORM 对象会过期，不能再靠它
         try:
             # 每条订阅一个 SAVEPOINT：本条目的半截写入只回滚自己，
             # 同轮其它订阅已完成的成果留在外层事务里
             async with session.begin_nested():
-                sub_url = open_url(sub.url)
+                sub_url = sub_urls.get(sub_id) or ""
                 if not sub_url:
                     # 链接解不开（密钥属主机绑定）：本轮跳过并留原因，不伪装成抓取失败
                     skipped.append(sub_id)
                     failures[sub_id] = UNREADABLE_MESSAGE
                     continue
-                result = await fetch_subscription(sub_url, channels)
+                result = fetched.get(sub_id)
+                if isinstance(result, Exception):
+                    raise result
+                if result is None:  # 预取缺失（不可达）：按失败记账，不静默丢
+                    raise RuntimeError("订阅下载未返回结果")
                 nodes = parse_nodes(result.raw, result.fmt)
                 snap = build_snapshot(sub_id, sub_url, result, nodes, now=now)
                 await persist_snapshot(session, snap, data_dir=data_dir)

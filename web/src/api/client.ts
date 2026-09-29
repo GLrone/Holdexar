@@ -2555,6 +2555,26 @@ export interface ProxyJobRunsPayload {
   items: ProxyJobRunItem[]
 }
 
+/** 单次作业的出口聚合行（按出口 × 端点记账） */
+export interface ProxyRunExitRow {
+  exitIp: string
+  endpoint: string
+  node: string | null
+  requests: number
+  success: number
+  e429: number
+  e4xx: number
+  e5xx: number
+  timeout: number
+  connectError: number
+  other: number
+  durationMs: number
+}
+
+export interface ProxyJobRunDetail extends ProxyJobRunItem {
+  exits: ProxyRunExitRow[]
+}
+
 export const proxypoolApi = {
   jobRuns: (limit = 20, offset = 0) =>
     request<ProxyJobRunsPayload>(
@@ -2564,7 +2584,12 @@ export const proxypoolApi = {
       { noCache: true },
     ),
   jobRun: (id: number) =>
-    request<ProxyJobRunItem>('GET', `/proxypool/job-runs/${id}`, undefined, { noCache: true }),
+    request<ProxyJobRunDetail>(
+      'GET',
+      `/proxypool/job-runs/${id}`,
+      undefined,
+      { noCache: true },
+    ),
 }
 
 // ─── Steam 官方活动日历（季节大促 / Next Fest / 主题 Fest）───
@@ -2607,4 +2632,3 @@ export const steamEventsApi = {
     { noCache: true },
   ),
 }
-

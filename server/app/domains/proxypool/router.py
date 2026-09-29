@@ -14,7 +14,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from app.core.config import get_settings
 from app.core.database import get_session_factory
-from app.domains.proxypool import events, jobruns
+from app.domains.proxypool import events, exitstats, jobruns
 
 router = APIRouter(prefix="/proxypool", tags=["proxypool"])
 
@@ -37,6 +37,7 @@ async def job_run_detail(run_id: int):
         payload = await jobruns.get_run(session, run_id)
     if payload is None:
         raise HTTPException(status_code=404, detail="作业记录不存在")
+    payload["exits"] = await exitstats.run_exit_rows(run_id)
     return payload
 
 
