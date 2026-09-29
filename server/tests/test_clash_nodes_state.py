@@ -634,3 +634,83 @@ async def test_active_subscription_falls_back_to_latest_without_record(db):
     latest = await _seed_sub(db)
     assert await proxies_service._active_clash_subscription_id({"running": True}) == latest
     assert await proxies_service._active_clash_subscription_id({}) is None or True
+
+
+# ─── 首检复用窗口（启动/切换触发的全量检测不重复跑）──────────
+
+
+@pytest.mark.asyncio
+async def test_clash_nodes_fresh_within_reuse_window(db):
+    """窗口内检测过 → fresh（首检沿用账本结论）。"""
+    sub_id = await _seed_sub(db)
+    now = proxies_service._naive(proxies_service.get_beijing_time_obj())
+    await proxies_service._apply_node_results(sub_id, {}, [_ok("n1")], ["n1"], now)
+    assert await proxies_service.clash_nodes_fresh(sub_id) is True
+
+
+@pytest.mark.asyncio
+async def test_clash_nodes_stale_beyond_reuse_window(db):
+    """超过复用窗口 → not fresh（首检照跑）。"""
+    sub_id = await _seed_sub(db)
+    now = proxies_service._naive(proxies_service.get_beijing_time_obj())
+    stale = now - timedelta(minutes=proxies_service.FIRST_CHECK_REUSE_MINUTES + 1)
+    await proxies_service._apply_node_results(sub_id, {}, [_ok("n1")], ["n1"], stale)
+    assert await proxies_service.clash_nodes_fresh(sub_id) is False
+
+
+@pytest.mark.asyncio
+async def test_clash_nodes_fresh_false_without_ledger(db):
+    """账本为空（新订阅没测过）→ not fresh，首检必须真跑。"""
+    sub_id = await _seed_sub(db)
+    assert await proxies_service.clash_nodes_fresh(sub_id) is False
+
+
+@pytest.mark.asyncio
+async def test_spawn_first_check_skips_when_ledger_fresh(db, monkeypatch):
+    """账本在复用窗口内 → _spawn_first_check 不触发探测（来回切换订阅不重测）。"""
+    from app.domains.proxies import router as proxies_router
+
+    sub_id = await _seed_sub(db)
+    now = proxies_service._naive(proxies_service.get_beijing_time_obj())
+    await proxies_service._apply_node_results(sub_id, {}, [_ok("n1")], ["n1"], now)
+
+    called: list[int] = []
+
+    async def fail_probe(sid, probe_all=True):
+        called.append(sid)
+        return {"total": 1, "alive": 1}
+
+    async def no_promote(sid, alive):
+        return None
+
+    monkeypatch.setattr(proxies_router.service, "test_clash_nodes", fail_probe)
+    monkeypatch.setattr(proxies_router, "_auto_promote_after_check", no_promote)
+
+    proxies_router._spawn_first_check(sub_id)
+    for _ in range(6):
+        await asyncio.sleep(0.01)
+    assert called == [], "窗口内账本已有全量结论，不得重复探测"
+
+
+@pytest.mark.asyncio
+async def test_spawn_first_check_runs_when_ledger_stale(db, monkeypatch):
+    """账本过期/为空 → _spawn_first_check 照常触发全量探测。"""
+    from app.domains.proxies import router as proxies_router
+
+    sub_id = await _seed_sub(db)
+    called: list[int] = []
+
+    async def fail_probe(sid, probe_all=True):
+        called.append(sid)
+        return {"total": 1, "alive": 1}
+
+    async def no_promote(sid, alive):
+        return None
+
+    monkeypatch.setattr(proxies_router.service, "test_clash_nodes", fail_probe)
+    monkeypatch.setattr(proxies_router, "_auto_promote_after_check", no_promote)
+
+    proxies_router._spawn_first_check(sub_id)
+    for _ in range(6):
+        await asyncio.sleep(0.01)
+    assert called == [sub_id]

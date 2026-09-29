@@ -20,6 +20,7 @@ from app.core.database import Base
 from app.domains.proxies import clash_manager, service as proxies_service
 from app.domains.proxies.subscription_secret import open_url
 from app.domains.proxies.models import ClashNode, Proxy, ProxySubscription
+from app.domains.settings import service as settings_service
 
 SUB_URL = "https://example.com/sub?token=abc"
 USERINFO = "upload=100; download=300; total=500; expire=2524608000"
@@ -40,6 +41,8 @@ def db(tmp_path, monkeypatch):
     factory = async_sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
     monkeypatch.setattr(proxies_service, "get_session_factory", lambda: factory)
+    # 启动候选读「最近显式选中」KV，settings 会话同样打桩到本库
+    monkeypatch.setattr(settings_service, "get_session_factory", lambda: factory)
     return factory
 
 
@@ -1026,6 +1029,105 @@ async def test_resolve_startable_skips_deprecated_and_orders_newest_first(
     picked = await proxies_service.resolve_startable_clash(tmp_path)
     assert picked["subscription"]["id"] == newest
     assert called[0] == newest, "无指定时先试最新的可用订阅"
+
+
+@pytest.mark.asyncio
+async def test_resolve_startable_prefers_fresh_over_stale_cache(db, monkeypatch, tmp_path):
+    """最新那条已失效、只能读到本地缓存时不得粘住启动：继续找能在线取到的新鲜配置。
+
+    缓存命中只说明曾经下载成功过；若直接返回，内核会被旧缓存钉死在一条死订阅上，
+    在线可用的订阅永远轮不到，定时重拉也只会反复读这份旧缓存。
+    """
+    fresh = await _add_labeled_sub(db, label="在线可用", url="https://example.com/fresh")
+    stale = await _add_labeled_sub(db, label="失效但有缓存", url="https://example.com/stale")
+    called: list[int] = []
+
+    async def fake_download(sub_url, data_dir, proxy_url=None, *, target_path=None):
+        sub_id = int(Path(target_path).stem.split("-")[-1])
+        called.append(sub_id)
+        return {
+            "path": str(target_path), "title": None, "userinfo": None, "nodes": 3,
+            "cached": "stale" in sub_url,
+        }
+
+    async def no_saved_proxies():
+        return []
+
+    monkeypatch.setattr(
+        proxies_service.clash_manager.runtime, "download_subscription", fake_download
+    )
+    monkeypatch.setattr(proxies_service, "_saved_proxy_candidates", no_saved_proxies)
+
+    picked = await proxies_service.resolve_startable_clash(tmp_path)
+    assert picked["subscription"]["id"] == fresh, "必须选能在线取到的，而不是更新的缓存"
+    assert picked["cached"] is False
+    assert called[0] == stale, "先试最新那条（只能读缓存）"
+
+
+@pytest.mark.asyncio
+async def test_resolve_startable_uses_cache_only_when_nothing_fresh(
+    db, monkeypatch, tmp_path,
+):
+    """全部候选都只能读缓存时仍要能拉起内核：返回第一条缓存回退候选。"""
+    first = await _add_labeled_sub(db, label="甲", url="https://example.com/a")
+    newest = await _add_labeled_sub(db, label="乙", url="https://example.com/b")
+
+    async def fake_download(sub_url, data_dir, proxy_url=None, *, target_path=None):
+        return {"path": str(target_path), "title": None, "userinfo": None,
+                "nodes": 3, "cached": True}
+
+    async def no_saved_proxies():
+        return []
+
+    monkeypatch.setattr(
+        proxies_service.clash_manager.runtime, "download_subscription", fake_download
+    )
+    monkeypatch.setattr(proxies_service, "_saved_proxy_candidates", no_saved_proxies)
+
+    picked = await proxies_service.resolve_startable_clash(tmp_path)
+    assert picked["cached"] is True
+    assert picked["subscription"]["id"] == newest, "无新鲜候选时按新→旧取第一条缓存"
+    assert first != newest
+
+
+@pytest.mark.asyncio
+async def test_resolve_startable_honors_remembered_selection(db, monkeypatch, tmp_path):
+    """无显式请求时吃落库的「最近显式选中」：用户点选过的订阅先试，不再默认最新；
+    指向已删除订阅时自然落空，按新→旧兜底。"""
+    older = await _add_labeled_sub(db, label="甲机场", url="https://example.com/a")
+    newest = await _add_labeled_sub(db, label="乙机场", url="https://example.com/b")
+    called: list[int] = []
+
+    async def fake_download(sub_url, data_dir, proxy_url=None, *, target_path=None):
+        sub_id = int(Path(target_path).stem.split("-")[-1])
+        called.append(sub_id)
+        return {"path": str(target_path), "title": None, "userinfo": None,
+                "nodes": 3, "cached": False}
+
+    async def no_saved_proxies():
+        return []
+
+    monkeypatch.setattr(
+        proxies_service.clash_manager.runtime, "download_subscription", fake_download
+    )
+    monkeypatch.setattr(proxies_service, "_saved_proxy_candidates", no_saved_proxies)
+
+    await proxies_service.remember_selected_clash_sub(older)
+    picked = await proxies_service.resolve_startable_clash(tmp_path)
+    assert picked["subscription"]["id"] == older, "用户点选过的订阅先试"
+    assert called[0] == older
+
+    await proxies_service.remember_selected_clash_sub(9999)
+    picked = await proxies_service.resolve_startable_clash(tmp_path)
+    assert picked["subscription"]["id"] == newest, "落库选择失效时按新→旧兜底"
+
+
+@pytest.mark.asyncio
+async def test_remembered_selection_roundtrip(db):
+    """点选 KV 读写回路：缺省 None，写入后原样读回。"""
+    assert await proxies_service.remembered_clash_sub_id() is None
+    await proxies_service.remember_selected_clash_sub(7)
+    assert await proxies_service.remembered_clash_sub_id() == 7
 
 
 @pytest.mark.asyncio
