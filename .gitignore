@@ -109,6 +109,8 @@ data/
 # ── pytest 临时产物 ──
 .tmp-pytest/
 server/_*.txt
+# 写通道闸基准测试的本机临时库与脚本（server/_bench_write.py / _bench.db*）
+server/_bench*
 
 # ── 机密 ──
 .env
@@ -189,3 +191,5 @@ scripts/upload_cloud_packs.py
 # ── 工具会话残留（自动化 CLI 工作目录与构建缓存，不入库）──
 .playwright-cli/
 server/.vite/
+# ZCode 工具的本机排除清单（镜像 .gitignore，工具自动同步生成）
+/.zcodeignore
