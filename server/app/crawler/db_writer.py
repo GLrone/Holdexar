@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
@@ -14,7 +15,7 @@ from sqlalchemy import case, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core import seed_assets
-from app.core.database import get_session_factory
+from app.core.database import get_session_factory, write_slot
 from app.domains.games.models import (
     Bundle,
     BundleRegionPrice,
@@ -45,6 +46,11 @@ def _chunks(items: list, size: int):
         yield items[i : i + size]
 
 
+def _ms_since(t0: float) -> int:
+    """写账计时：perf_counter 起点至今的毫秒数。"""
+    return round((time.perf_counter() - t0) * 1000)
+
+
 _CURRENT_UPDATABLE = (
     "currency",
     "price",
@@ -61,6 +67,10 @@ _CURRENT_UPDATABLE = (
 # 只有 status=ok 且 price=None 才是"成功响应里的坏数据"；连续补抓失败上限，
 # 超过即终态化（blocked），防止"该区根本无货"被当成可重试错误死磕。
 MISSING_MAX_RETRIES = 5
+
+# 批量 INSERT 的行数分块：SQLite 默认绑定变量上限 32766（15 列史行 ≈ 2184 行），
+# 400 款 × 多区多版本的全量史行一次 values() 会越限、整批炸到慢路径
+_INSERT_CHUNK_ROWS = 2000
 
 
 def _is_ok_price_row(price_cents: int | None) -> bool:
@@ -184,6 +194,206 @@ class DbWriter:
             return None
         return round(int(price_cents) * rate)
 
+    @staticmethod
+    def _normalize_game_row(game_data: dict, prices_data: list[dict] | None) -> tuple[dict, tuple | None]:
+        """games 行归一化 + 免费态/Beta 分类（单款写与批量写共用）。
+
+        返回 (game_values, free_state)：free_state 非空时两键进 upsert set_
+        （executemany 下以 excluded 引用逐行携带）；None 时不进——纯
+        locked/missing 响应绝不洗掉库内免费态。
+        """
+        now_dt = _naive(game_data.get("updated_at") or get_beijing_time_obj())
+        game_values = {}
+        for k, v in game_data.items():
+            # DateTime 列（updated_at/created_at）防串格式：isoformat 字符串
+            # （T 分隔，E2E mock 载荷）转 naive datetime——否则与空格分隔行
+            # 混排，SQLite 字符串比较会让 T 格式行在 ORDER BY 里恒压顶
+            if k in ("updated_at", "created_at") and isinstance(v, str):
+                try:
+                    v = datetime.fromisoformat(v)
+                except ValueError:
+                    pass
+            game_values[k] = _naive(v) if isinstance(v, datetime) else v
+
+        free_state = _classify_free_kind(prices_data)
+        # 测试入口优先于价格分类：Beta/测试页常挂正价（页面透传本体价），
+        # 价格分类判不出免费态，只有命名能定性；'beta' 与 f2p/promo 同走
+        # free_kind 非空脱池机制
+        if _is_test_entry(str(game_values.get("name") or "")):
+            free_state = ("beta", None)
+        if free_state is not None:
+            game_values["free_kind"], game_values["promo_end_at"] = free_state
+        game_values["updated_at"] = now_dt
+        return game_values, free_state
+
+    def _plan_price_rows(
+        self,
+        prices_data: list[dict],
+        baseline: tuple[dict, dict],
+        now_dt,
+        event_key: str | None,
+    ) -> tuple[list[dict], list[dict], set[str], set[str]]:
+        """价格决策（纯函数，无 IO）：差量门禁 / 版本名回填 / 标准版选择。
+
+        单款写与批量写共用这一份决策——历史差量、欠账结转、现价行形状
+        只有这一处定义。返回 (current_rows, history_rows, ok_regions,
+        degraded_regions)。活动快照标签由调用方按批求值传入（同一观测
+        时刻本就该是同一个 key）。
+        """
+        known_suffix, latest_snapshots = baseline
+        history_batch: list[dict] = []
+        standard_candidates: dict[str, list[dict]] = {}
+        degraded_regions: set[str] = set()  # 本次门禁降级的区（需欠账结转）
+
+        # ── 历史差量门禁基线：该 appid 每个 (区, sub) 的最新快照。
+        #    价格未变不写快照（走势图只需要变化点——线是平的，语义不损）。
+        #    比较键含价三件套 + 版本后缀 + gold 标：折扣往返/价格修正/名称
+        #    修正都会正常产生新快照。现价表不受门禁影响，照常每轮刷新
+        #    （updated_at = 最新验证时刻）。
+        # ── 版本名防丢锚（同 sub_id 历史名）：browse 响应的 option name
+        #    偶发缺失、档案导入行天生无名——空名行会被「标准版」判据误收：
+        #    历史图混入版本价，current 的 min(sub_id) 选择还会让编号更小的
+        #    豪华版顶替本体。sub_id 是恒定 SKU，版本名不随时间变：取该
+        #    appid 每个 sub 的最新非空名，本次为空的行沿用之。
+        for p in prices_data:
+            region = p.get("region_code", "").upper()
+            price_cents = p.get("price")
+            currency = p.get("currency", "")
+            is_gold = p.get("is_gold", False)
+            version_suffix = p.get("version_suffix")
+            # 丢名行沿用同 sub_id 的历史名（known_suffix），与
+            # prev 基线同口径——标准版判定 / 差量比较全部一致
+            if not version_suffix:
+                version_suffix = known_suffix.get(
+                    int(p.get("sub_id") or 0)
+                ) or None
+            is_bundle = p.get("is_bundle", False)
+            status = p.get("price_status", "ok")
+            # 质量门禁：ok 但无价格 = 成功响应里的坏数据（如 gold 版
+            # 无 sub 价格），降级 missing 进账本走补抓自愈
+            if status == "ok" and not _is_ok_price_row(price_cents):
+                status = "missing"
+                degraded_regions.add(region)
+            cny_fen = (
+                self._compute_cny_fen(price_cents, currency)
+                if price_cents is not None
+                else None
+            )
+
+            # 所有有价格的版本写入 history；永久免费 price=0 不进
+            # history（无价格事件），限时赠送 price=0+original>0 是
+            # 真实价格事件照写——史低/排序缓存的 cny_fen>0 读侧守卫
+            # 天然排除 0 价；相对最新快照无变化的行不写（差量门禁）
+            if status == "ok" and price_cents is not None and (
+                price_cents > 0 or (p.get("original_price") or 0) > 0
+            ):
+                prev = latest_snapshots.get(
+                    (region, int(p.get("sub_id") or 0))
+                )
+                if prev == (
+                    price_cents,
+                    p.get("original_price"),
+                    p.get("discount_percent", 0),
+                    version_suffix,
+                    is_gold,
+                ):
+                    pass  # 与最新快照完全一致：跳过，不产生冗余行
+                else:
+                    history_batch.append(
+                        {
+                            "appid": p["appid"],
+                            "region_code": region,
+                            "currency": currency,
+                            "price": price_cents,
+                            "original_price": p.get("original_price"),
+                            "discount_percent": p.get("discount_percent", 0),
+                            "sub_id": p.get("sub_id") or 0,
+                            "is_gold": is_gold,
+                            "version_suffix": version_suffix,
+                            "is_bundle": is_bundle,
+                            "price_status": status,
+                            "cny_fen": cny_fen,
+                            "discount_end_ts": p.get("discount_end_ts"),
+                            "steam_event_key": event_key,
+                            "snapshot_at": now_dt,
+                        }
+                    )
+
+            # 标准版候选: 非 gold 且无版本后缀且非捆绑包
+            # （bundle-as-sub 与标准版无法从价格区分，靠 A4 识别标记隔离）
+            is_standard = (
+                (not is_gold)
+                and (not version_suffix or version_suffix == "")
+                and not is_bundle
+            )
+            if is_standard:
+                standard_candidates.setdefault(region, []).append(
+                    {
+                        "appid": p["appid"],
+                        "region_code": region,
+                        "currency": currency,
+                        "price": price_cents,
+                        "original_price": p.get("original_price"),
+                        "discount_percent": p.get("discount_percent", 0),
+                        "sub_id": p.get("sub_id") or 0,
+                        "price_status": status,
+                        "cny_fen": cny_fen,
+                        "discount_end_ts": p.get("discount_end_ts"),
+                        "updated_at": now_dt,
+                    }
+                )
+
+        # 每个区域选标准版写入 current：优先有价（ok+price 有值）行——
+        # 该区任何版本有价就算有数；全部无价才落 missing 状态行
+        current_batch: list[dict] = []
+        seen_regions: set[str] = set()
+        for region, candidates in standard_candidates.items():
+            priced = [c for c in candidates if c["price"] is not None]
+            current_batch.append(
+                min(priced or candidates, key=lambda x: x.get("sub_id") or 0)
+            )
+            seen_regions.add(region)
+
+        # 无标准版的区域（locked/blocked/missing）也写入 current 作为状态；
+        # 逆序遍历：同区多行降级时以最后一条为准（降级常因版本无价
+        # 整组发生，末行即最新尝试的状态）
+        for p in reversed(prices_data):
+            region = p.get("region_code", "").upper()
+            if region in seen_regions:
+                continue
+            seen_regions.add(region)
+            # 门禁降级行的实时状态在主循环里已算过，重算保持独立
+            raw_status = p.get("price_status", "ok")
+            price_cents = p.get("price")
+            status = (
+                "missing"
+                if raw_status == "ok" and not _is_ok_price_row(price_cents)
+                else raw_status
+            )
+            currency = p.get("currency", "")
+            current_batch.append(
+                {
+                    "appid": p["appid"],
+                    "region_code": region,
+                    "currency": currency,
+                    "price": price_cents,
+                    "original_price": p.get("original_price"),
+                    "discount_percent": p.get("discount_percent", 0),
+                    "sub_id": p.get("sub_id") or 0,
+                    "price_status": status,
+                    "cny_fen": self._compute_cny_fen(price_cents, currency)
+                    if price_cents is not None
+                    else None,
+                    "discount_end_ts": p.get("discount_end_ts"),
+                    "updated_at": now_dt,
+                }
+            )
+
+        ok_regions = {
+            row["region_code"] for row in current_batch if row["price_status"] == "ok"
+        }
+        return current_batch, history_batch, ok_regions, degraded_regions
+
     async def upsert_game_and_prices(
         self,
         game_data: dict,
@@ -195,33 +405,13 @@ class DbWriter:
     ) -> bool:
         """写入游戏元数据 + 区域价格（默认单款独占事务）。
 
-        传入共享 session 与已取好的基线时（批量写入口 upsert_task_batch 的用法）
-        本方法不提交、不关闭 session，提交与收尾由批量入口统一负责。
+        传入共享 session 与已取好的基线时（批量写慢路径的用法）本方法不
+        提交、不关闭 session，提交与收尾由批量入口统一负责。价格决策走
+        `_plan_price_rows`（与批量快路径同一份）。
         """
         try:
-            now_dt = _naive(game_data.get("updated_at") or get_beijing_time_obj())
-            game_values = {}
-            for k, v in game_data.items():
-                # DateTime 列（updated_at/created_at）防串格式：isoformat 字符串
-                # （T 分隔，E2E mock 载荷）转 naive datetime——否则与空格分隔行
-                # 混排，SQLite 字符串比较会让 T 格式行在 ORDER BY 里恒压顶
-                if k in ("updated_at", "created_at") and isinstance(v, str):
-                    try:
-                        v = datetime.fromisoformat(v)
-                    except ValueError:
-                        pass
-                game_values[k] = _naive(v) if isinstance(v, datetime) else v
-
-            free_state = _classify_free_kind(prices_data)
-            if free_state is not None:
-                game_values["free_kind"], game_values["promo_end_at"] = free_state
-            # 测试入口优先于价格分类：Beta/测试页常挂正价（页面透传本体价），
-            # 价格分类判不出免费态，只有命名能定性；'beta' 与 f2p/promo 同走
-            # free_kind 非空脱池机制
-            if _is_test_entry(str(game_values.get("name") or "")):
-                game_values["free_kind"] = "beta"
-                game_values["promo_end_at"] = None
-                free_state = ("beta", None)
+            game_values, free_state = self._normalize_game_row(game_data, prices_data)
+            now_dt = game_values["updated_at"]
 
             async with _session_scope(session) as session:
                 if baseline is None:
@@ -252,166 +442,18 @@ class DbWriter:
                 await session.execute(upsert_game)
 
                 if prices_data:
-                    current_batch: list[dict] = []
-                    history_batch: list[dict] = []
-                    standard_candidates: dict[str, list[dict]] = {}
-                    degraded_regions: set[str] = set()  # 本次门禁降级的区（需欠账结转）
+                    from app.domains.steam_events import (
+                        service as steam_events_service,
+                    )
 
-                    # ── 历史差量门禁基线：该 appid 每个 (区, sub) 的最新快照。
-                    #    价格未变不写快照（走势图只需要变化点——线是平的，
-                    #    语义不损）。比较键含价
-                    #    三件套 + 版本后缀 + gold 标：折扣往返/价格修正/名称修正
-                    #    都会正常产生新快照。现价表不受门禁影响，照常每轮刷新
-                    #    （updated_at = 最新验证时刻）。
-                    # ── 版本名防丢锚（同 sub_id 历史名）：browse 响应的 option
-                    #    name 偶发缺失、档案导入行天生无名——空名行会被「标准
-                    #    版」判据误收：历史图混入版本价，current 的 min(sub_id)
-                    #    选择还会让编号更小的豪华版顶替本体。sub_id 是恒定 SKU，
-                    #    版本名不随时间变：取该 appid 每个 sub 的最新非空名，
-                    #    本次为空的行沿用之。
-                    # 基线（该 appid 最新快照 + 版本名回填）由调用方取好：
-                    # 批量写把「每 appid 两条窗口函数扫 history」压成每批一次
-                    known_suffix, latest_snapshots = baseline
-
-                    for p in prices_data:
-                        region = p.get("region_code", "").upper()
-                        price_cents = p.get("price")
-                        currency = p.get("currency", "")
-                        is_gold = p.get("is_gold", False)
-                        version_suffix = p.get("version_suffix")
-                        # 丢名行沿用同 sub_id 的历史名（known_suffix），与
-                        # prev 基线同口径——标准版判定 / 差量比较全部一致
-                        if not version_suffix:
-                            version_suffix = known_suffix.get(
-                                int(p.get("sub_id") or 0)
-                            ) or None
-                        is_bundle = p.get("is_bundle", False)
-                        status = p.get("price_status", "ok")
-                        # 质量门禁：ok 但无价格 = 成功响应里的坏数据（如 gold 版
-                        # 无 sub 价格），降级 missing 进账本走补抓自愈
-                        if status == "ok" and not _is_ok_price_row(price_cents):
-                            status = "missing"
-                            degraded_regions.add(region)
-                        cny_fen = (
-                            self._compute_cny_fen(price_cents, currency)
-                            if price_cents is not None
-                            else None
+                    current_batch, history_batch, ok_regions, degraded_regions = (
+                        self._plan_price_rows(
+                            prices_data,
+                            baseline,
+                            now_dt,
+                            await steam_events_service.active_event_key_at(now_dt),
                         )
-
-                        # 所有有价格的版本写入 history；永久免费 price=0 不进
-                        # history（无价格事件），限时赠送 price=0+original>0 是
-                        # 真实价格事件照写——史低/排序缓存的 cny_fen>0 读侧守卫
-                        # 天然排除 0 价；相对最新快照无变化的行不写（差量门禁）
-                        if status == "ok" and price_cents is not None and (
-                            price_cents > 0 or (p.get("original_price") or 0) > 0
-                        ):
-                            prev = latest_snapshots.get(
-                                (region, int(p.get("sub_id") or 0))
-                            )
-                            if prev == (
-                                price_cents,
-                                p.get("original_price"),
-                                p.get("discount_percent", 0),
-                                version_suffix,
-                                is_gold,
-                            ):
-                                pass  # 与最新快照完全一致：跳过，不产生冗余行
-                            else:
-                                from app.domains.steam_events import (
-                                    service as steam_events_service,
-                                )
-
-                                history_batch.append(
-                                    {
-                                        "appid": p["appid"],
-                                        "region_code": region,
-                                        "currency": currency,
-                                        "price": price_cents,
-                                        "original_price": p.get("original_price"),
-                                        "discount_percent": p.get("discount_percent", 0),
-                                        "sub_id": p.get("sub_id") or 0,
-                                        "is_gold": is_gold,
-                                        "version_suffix": version_suffix,
-                                        "is_bundle": is_bundle,
-                                        "price_status": status,
-                                        "cny_fen": cny_fen,
-                                        "discount_end_ts": p.get("discount_end_ts"),
-                                        "steam_event_key": await steam_events_service.active_event_key_at(
-                                            now_dt
-                                        ),
-                                        "snapshot_at": now_dt,
-                                    }
-                                )
-
-                        # 标准版候选: 非 gold 且无版本后缀且非捆绑包
-                        # （bundle-as-sub 与标准版无法从价格区分，靠 A4 识别标记隔离）
-                        is_standard = (
-                            (not is_gold)
-                            and (not version_suffix or version_suffix == "")
-                            and not is_bundle
-                        )
-                        if is_standard:
-                            standard_candidates.setdefault(region, []).append(
-                                {
-                                    "appid": p["appid"],
-                                    "region_code": region,
-                                    "currency": currency,
-                                    "price": price_cents,
-                                    "original_price": p.get("original_price"),
-                                    "discount_percent": p.get("discount_percent", 0),
-                                    "sub_id": p.get("sub_id") or 0,
-                                    "price_status": status,
-                                    "cny_fen": cny_fen,
-                                    "discount_end_ts": p.get("discount_end_ts"),
-                                    "updated_at": now_dt,
-                                }
-                            )
-
-                    # 每个区域选标准版写入 current：优先有价（ok+price 有值）行——
-                    # 该区任何版本有价就算有数；全部无价才落 missing 状态行
-                    seen_regions: set[str] = set()
-                    for region, candidates in standard_candidates.items():
-                        priced = [c for c in candidates if c["price"] is not None]
-                        current_batch.append(
-                            min(priced or candidates, key=lambda x: x.get("sub_id") or 0)
-                        )
-                        seen_regions.add(region)
-
-                    # 无标准版的区域（locked/blocked/missing）也写入 current 作为状态；
-                    # 逆序遍历：同区多行降级时以最后一条为准（降级常因版本无价
-                    # 整组发生，末行即最新尝试的状态）
-                    appid_int = int(game_data.get("appid") or next(iter(prices_data))["appid"])
-                    for p in reversed(prices_data):
-                        region = p.get("region_code", "").upper()
-                        if region in seen_regions:
-                            continue
-                        seen_regions.add(region)
-                        # 门禁降级行的实时状态在主循环里已算过，重算保持独立
-                        raw_status = p.get("price_status", "ok")
-                        price_cents = p.get("price")
-                        status = (
-                            "missing"
-                            if raw_status == "ok" and not _is_ok_price_row(price_cents)
-                            else raw_status
-                        )
-                        currency = p.get("currency", "")
-                        current_batch.append(
-                            {
-                                "appid": p["appid"],
-                                "region_code": region,
-                                "currency": currency,
-                                "price": price_cents,
-                                "original_price": p.get("original_price"),
-                                "discount_percent": p.get("discount_percent", 0),
-                                "sub_id": p.get("sub_id") or 0,
-                                "price_status": status,
-                                "cny_fen": self._compute_cny_fen(price_cents, currency)
-                                if price_cents is not None
-                                else None,
-                                "discount_end_ts": p.get("discount_end_ts"),
-                                "updated_at": now_dt,
-                            }
-                        )
+                    )
 
                     if current_batch:
                         insert_cp = sqlite_insert(GameCurrentPrice)
@@ -427,10 +469,8 @@ class DbWriter:
 
                         # 补抓成功结转清账：本批有 ok 价的区 fail_count 归零
                         # （missing → 补抓成功 → 回 ok 的欠账闭环）
-                        ok_regions = {
-                            row["region_code"] for row in current_batch if row["price_status"] == "ok"
-                        }
-                        if ok_regions:
+                        appid_int = int(game_data.get("appid") or 0)
+                        if ok_regions and appid_int:
                             await session.execute(
                                 update(GameCurrentPrice)
                                 .where(
@@ -484,73 +524,263 @@ class DbWriter:
         return known.get(appid, {}), latest.get(appid, {})
 
     async def _query_baselines(self, session, appids: list[int]):
-        """批量取基线：一次 IN 查询覆盖整批，取代逐 appid 扫 history 窗口函数。"""
+        """批量取基线：每个 (appid, region) 只取最新一趟快照。
+
+        按 ux_gph_snapshot 的 (appid, region_code, snapshot_at) 前缀做组内
+        MAX 直取顶趟快照，免掉窗口函数对整段历史的排序——这条查询每批写库
+        前各跑一次，是写路径上最大的固定开销。一趟快照的行同时派生版本名
+        基线（known）：子版本名与地区无关，顶趟快照里出现的 (appid, sub_id)
+        后缀即当前基线；已从最新一趟消失的 sub 不再留旧值当 prev。
+        """
         known: dict[int, dict[int, str]] = {}
         latest: dict[int, dict[tuple[str, int], tuple]] = {}
         ids = [int(a) for a in dict.fromkeys(appids) if a]
         for chunk in _chunks(ids, 400):
             params = {f"a{i}": v for i, v in enumerate(chunk)}
             placeholders = ",".join(f":a{i}" for i in range(len(chunk)))
-            rows_known = await session.execute(
+            rows = await session.execute(
                 text(
-                    "SELECT appid, sub_id, version_suffix FROM ("
-                    "  SELECT appid, sub_id, version_suffix, ROW_NUMBER() OVER ("
-                    "    PARTITION BY appid, sub_id ORDER BY snapshot_at DESC, id DESC"
-                    "  ) AS rn FROM game_price_history"
-                    f"  WHERE appid IN ({placeholders}) AND sub_id > 0"
-                    "        AND version_suffix IS NOT NULL AND version_suffix != ''"
-                    ") WHERE rn = 1"
+                    "SELECT h.appid, h.region_code, h.sub_id, h.price, "
+                    "h.original_price, h.discount_percent, h.version_suffix, "
+                    "h.is_gold FROM game_price_history h JOIN ("
+                    "  SELECT appid, region_code, MAX(snapshot_at) AS ms"
+                    "  FROM game_price_history"
+                    f"  WHERE appid IN ({placeholders}) GROUP BY appid, region_code"
+                    ") t ON h.appid = t.appid AND h.region_code = t.region_code"
+                    " AND h.snapshot_at = t.ms"
                 ),
                 params,
             )
-            for r in rows_known:
-                known.setdefault(int(r[0]), {})[int(r[1])] = str(r[2])
-        for chunk in _chunks(ids, 400):
-            params = {f"a{i}": v for i, v in enumerate(chunk)}
-            placeholders = ",".join(f":a{i}" for i in range(len(chunk)))
-            rows_latest = await session.execute(
-                text(
-                    "SELECT appid, region_code, sub_id, price, original_price, "
-                    "discount_percent, version_suffix, is_gold FROM ("
-                    "SELECT appid, region_code, sub_id, price, original_price, "
-                    "discount_percent, version_suffix, is_gold, snapshot_at, "
-                    "ROW_NUMBER() OVER (PARTITION BY appid, region_code, sub_id "
-                    "ORDER BY snapshot_at DESC, id DESC) AS rn "
-                    f"FROM game_price_history WHERE appid IN ({placeholders})"
-                    ") WHERE rn = 1"
-                ),
-                params,
-            )
-            for r in rows_latest:
+            for r in rows:
                 aid = int(r[0])
                 sub_id_int = int(r[2] or 0)
-                # prev 基线与本次写入用同一套回填名：差量门禁不因
-                # 「丢名→回名」的名称修正误触发冗余快照
-                suffix_baseline = r[6] or known.get(aid, {}).get(sub_id_int) or None
+                suffix = r[6] or None
                 latest.setdefault(aid, {})[(r[1], sub_id_int)] = (
-                    r[3], r[4], r[5], suffix_baseline, bool(r[7]),
+                    r[3], r[4], r[5], suffix, bool(r[7]),
                 )
+                if suffix:
+                    known.setdefault(aid, {})[sub_id_int] = str(suffix)
         return known, latest
 
     async def upsert_task_batch(
         self, entries: list[tuple[dict, list[dict] | None]]
     ) -> list[bool]:
-        """一区一批（≤400 款）一次事务写完：一批一次基线查询 + 一次 commit。
+        """一区一批（≤400 款）一次事务写完：基线一次 + 决策纯函数化 +
+        四条批量语句（games / current / 欠账结转 / history）。
 
-        逐 appid 各开事务会让 history 基线查询与 commit 数随「款数 × 区数」
-        线性膨胀；这里折进同一事务，单款用 SAVEPOINT 隔离失败，返回逐款成败。
+        决策逻辑与单款写共用 `_plan_price_rows`；批内任意语句失败整批回退
+        `_upsert_task_batch_slow` 逐款隔离写（慢 ~10 倍，只兜坏批）。
         """
+        results = [True] * len(entries)
+        if not entries:
+            return results
+        _t0 = time.perf_counter()
+        # 写闸在取连接之前：排队等闸的批次不占连接池，读请求不被写侧挤占
+        async with write_slot():
+            try:
+                async with get_session_factory()() as session:
+                    _tc = time.perf_counter()
+                    await session.connection()
+                    pool_ms = _ms_since(_tc)
+                    _tb = time.perf_counter()
+                    known, latest = await self._query_baselines(
+                        session, [int(g.get("appid") or 0) for g, _ in entries]
+                    )
+                    baseline_ms = _ms_since(_tb)
+                    from app.domains.steam_events import (
+                        service as steam_events_service,
+                    )
+
+                    event_keys: dict = {}
+                    game_groups: dict[bool, list[dict]] = {True: [], False: []}
+                    plans: list[tuple[int, dict, list, list, set, set]] = []
+                    for i, (game_data, prices_data) in enumerate(entries):
+                        aid = int(game_data.get("appid") or 0)
+                        game_values, _ = self._normalize_game_row(game_data, prices_data)
+                        # free_state 键是否存在（而非值真假）决定 upsert set_ 键集：
+                        # (None, None) 是「付费显式清免费标记」信号，键在值空——
+                        # 两类行混进同一 executemany 会因键集不均触发编译错误
+                        game_groups["free_kind" in game_values].append(game_values)
+                        now_dt = game_values["updated_at"]
+                        if now_dt not in event_keys:
+                            event_keys[now_dt] = (
+                                await steam_events_service.active_event_key_at(now_dt)
+                            )
+                        plans.append(
+                            (i, aid, prices_data, now_dt, event_keys[now_dt], (known.get(aid, {}), latest.get(aid, {})))
+                        )
+
+                    insert_game = sqlite_insert(Game)
+                    game_ms = lockwait_ms = current_ms = ledger_ms = history_ms = 0
+                    commit_ms = 0
+                    base_set = {
+                        c: getattr(insert_game.excluded, c)
+                        for c in (
+                            "name", "name_en", "type", "header_image", "store_url",
+                            "chinese_support", "family_sharing", "trading_cards",
+                            "release_date", "genres", "is_adult", "is_visual_novel",
+                            "developers", "publishers",
+                            "positive_rate", "positive_reviews", "review_count",
+                            "updated_at",
+                        )
+                    }
+                    for has_free, rows in game_groups.items():
+                        if not rows:
+                            continue
+                        # excluded 必须取自带 values 的同一语句对象：跨对象引用
+                        # 会把 set_ 渲染成裸绑定参数（编译期即拒）
+                        stmt = insert_game.values(rows)
+                        upsert_set = {
+                            c: getattr(stmt.excluded, c)
+                            for c in (
+                                "name", "name_en", "type", "header_image", "store_url",
+                                "chinese_support", "family_sharing", "trading_cards",
+                                "release_date", "genres", "is_adult", "is_visual_novel",
+                                "developers", "publishers",
+                                "positive_rate", "positive_reviews", "review_count",
+                                "updated_at",
+                            )
+                        }
+                        if has_free:
+                            upsert_set["free_kind"] = stmt.excluded.free_kind
+                            upsert_set["promo_end_at"] = stmt.excluded.promo_end_at
+                        _tg = time.perf_counter()
+                        await session.execute(
+                            stmt.on_conflict_do_update(
+                                index_elements=[Game.appid],
+                                set_=upsert_set,
+                            )
+                        )
+                        _gd = _ms_since(_tg)
+                        game_ms += _gd
+                        # SQLite 写锁在事务首条写语句处获取：首写耗时含等锁时长，
+                        # 即 lockwait 的观测口径；commit 耗时含 WAL EXCLUSIVE 段
+                        if not lockwait_ms:
+                            lockwait_ms = _gd
+
+                    all_current: list[dict] = []
+                    all_history: list[dict] = []
+                    ok_groups: dict[frozenset, list[int]] = {}
+                    degraded_groups: dict[frozenset, list[int]] = {}
+                    for i, aid, prices_data, now_dt, event_key, baseline in plans:
+                        if not prices_data:
+                            continue
+                        current_rows, history_rows, ok_regions, degraded_regions = (
+                            self._plan_price_rows(
+                                prices_data, baseline, now_dt, event_key
+                            )
+                        )
+                        all_current.extend(current_rows)
+                        all_history.extend(history_rows)
+                        if ok_regions:
+                            ok_groups.setdefault(frozenset(ok_regions), []).append(aid)
+                        if degraded_regions:
+                            degraded_groups.setdefault(frozenset(degraded_regions), []).append(aid)
+
+                    if all_current:
+                        insert_cp = sqlite_insert(GameCurrentPrice)
+                        _tp = time.perf_counter()
+                        for chunk in _chunks(all_current, _INSERT_CHUNK_ROWS):
+                            await session.execute(
+                                insert_cp.values(chunk).on_conflict_do_update(
+                                    index_elements=[
+                                        GameCurrentPrice.appid,
+                                        GameCurrentPrice.region_code,
+                                    ],
+                                    set_={c: getattr(insert_cp.excluded, c) for c in _CURRENT_UPDATABLE},
+                                )
+                            )
+                        current_ms = _ms_since(_tp)
+                        # 补抓成功结转清账：本批有 ok 价的区 fail_count 归零
+                        # （missing → 补抓成功 → 回 ok 的欠账闭环）；按「区集合相同
+                        # 的款」分组成 IN 更新，避免 appid × 区的笛卡尔积误清
+                        for regions, aids in ok_groups.items():
+                            _tl = time.perf_counter()
+                            await session.execute(
+                                update(GameCurrentPrice)
+                                .where(
+                                    GameCurrentPrice.appid.in_(aids),
+                                    GameCurrentPrice.region_code.in_(regions),
+                                )
+                                .values(fail_count=0)
+                            )
+                            ledger_ms += _ms_since(_tl)
+                        # 欠账结转：门禁降级行计一次失败（递增 + 穷尽转 blocked）。
+                        # 常规 upsert 不带 fail_count（避免误清），账本专门走 bump。
+                        for regions, aids in degraded_groups.items():
+                            _tl = time.perf_counter()
+                            await session.execute(
+                                update(GameCurrentPrice)
+                                .where(
+                                    GameCurrentPrice.appid.in_(aids),
+                                    GameCurrentPrice.region_code.in_(regions),
+                                )
+                                .values(**_missing_ledger_bump())
+                            )
+                            ledger_ms += _ms_since(_tl)
+
+                    if all_history:
+                        _th = time.perf_counter()
+                        for chunk in _chunks(all_history, _INSERT_CHUNK_ROWS):
+                            await session.execute(
+                                sqlite_insert(GamePriceHistory).values(chunk)
+                            )
+                        history_ms = _ms_since(_th)
+                    _tm = time.perf_counter()
+                    await session.commit()
+                    commit_ms = _ms_since(_tm)
+            except Exception:
+                logger.exception("批量写快路径失败，整批回退逐款隔离写（%d 款）", len(entries))
+                return await self._upsert_task_batch_slow(entries)
+            # 提交后再跑复活清标 / 种子补挂：与单写入口同序，不叠在未提交事务里
+            ok_ids = [
+                int(game_data.get("appid") or 0)
+                for i, (game_data, _) in enumerate(entries)
+                if results[i] and int(game_data.get("appid") or 0)
+            ]
+            _tp = time.perf_counter()
+            await self.clear_removed_marks_batch(ok_ids)
+            for aid in ok_ids:
+                try:
+                    await seed_assets.apply_curated(aid)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("批量写入收尾失败 appid=%s: %s", aid, e)
+            post_ms = _ms_since(_tp)
+            logger.info(
+                "[写账] 批 apps=%d baseline=%dms pool=%dms game=%dms current=%dms "
+                "ledger=%dms history=%dms commit=%dms post=%dms lockwait=%dms total=%dms",
+                len(entries), baseline_ms, pool_ms, game_ms, current_ms, ledger_ms,
+                history_ms, commit_ms, post_ms, lockwait_ms, _ms_since(_t0),
+            )
+            return results
+
+    async def _upsert_task_batch_slow(
+        self, entries: list[tuple[dict, list[dict] | None]]
+    ) -> list[bool]:
+        """逐款隔离写（回退路径）：一批一次基线 + 单款 SAVEPOINT，单款失败
+        不拖垮整批。快路径的任何批级异常都退到这里；运行在快路径已持有的
+        写闸内，不自取闸（闸可重入计数为 2，重取会放大并发写事务）。"""
         results = [False] * len(entries)
         if not entries:
             return results
+        _t0 = time.perf_counter()
         try:
             async with get_session_factory()() as session:
+                _tc = time.perf_counter()
+                await session.connection()
+                pool_ms = _ms_since(_tc)
+                _tb = time.perf_counter()
                 known, latest = await self._query_baselines(
                     session, [int(g.get("appid") or 0) for g, _ in entries]
                 )
+                baseline_ms = _ms_since(_tb)
+                savepoint_ms = apps_ms = 0
                 for i, (game_data, prices_data) in enumerate(entries):
                     aid = int(game_data.get("appid") or 0)
+                    _ts = time.perf_counter()
                     sp = await session.begin_nested()
+                    savepoint_ms += _ms_since(_ts)
+                    _ta = time.perf_counter()
                     try:
                         ok = await self.upsert_game_and_prices(
                             game_data,
@@ -562,27 +792,38 @@ class DbWriter:
                     except Exception as e:  # noqa: BLE001 —— 单款失败不拖垮整批
                         logger.error("批量写入单款失败 appid=%s: %s", aid, e)
                         ok = False
+                    apps_ms += _ms_since(_ta)
                     if ok:
                         await sp.commit()
                     else:
                         await sp.rollback()
                     results[i] = ok
+                _tm = time.perf_counter()
                 await session.commit()
+                commit_ms = _ms_since(_tm)
         except Exception as e:
             logger.error("批量写入失败: %s", e)
             return [False] * len(entries)
         # 提交后再跑复活清标 / 种子补挂：与单写入口同序，不叠在未提交事务里
-        for i, (game_data, _) in enumerate(entries):
-            if not results[i]:
-                continue
-            aid = int(game_data.get("appid") or 0)
-            if not aid:
-                continue
+        ok_ids = [
+            int(game_data.get("appid") or 0)
+            for i, (game_data, _) in enumerate(entries)
+            if results[i] and int(game_data.get("appid") or 0)
+        ]
+        _tp = time.perf_counter()
+        await self.clear_removed_marks_batch(ok_ids)
+        for aid in ok_ids:
             try:
-                await self.clear_removed_mark(aid)
                 await seed_assets.apply_curated(aid)
             except Exception as e:  # noqa: BLE001
                 logger.warning("批量写入收尾失败 appid=%s: %s", aid, e)
+        post_ms = _ms_since(_tp)
+        logger.info(
+            "[写账] 慢批 apps=%d baseline=%dms pool=%dms savepoint=%dms apps=%dms "
+            "commit=%dms post=%dms total=%dms",
+            len(entries), baseline_ms, pool_ms, savepoint_ms, apps_ms,
+            commit_ms, post_ms, _ms_since(_t0),
+        )
         return results
 
     async def ensure_game_exists(self, appid: int, name: str = "") -> None:
@@ -866,6 +1107,44 @@ class DbWriter:
                     logger.info("[下架监控] %s 复活（重新有数据），清除下架标记", appid)
         except Exception as e:
             logger.error("clear_removed_mark 失败: %s", e)
+
+    async def clear_removed_marks_batch(self, appids: list[int]) -> int:
+        """批量复活清标（爬虫批量路径）：整批一次 SELECT + 一次 UPDATE。
+
+        单款版每批要开 400 个会话逐款主键读；此处只碰真正带标记的行，
+        返回清标数。
+        """
+        ids = [int(a) for a in dict.fromkeys(appids) if a]
+        if not ids:
+            return 0
+        try:
+            async with get_session_factory()() as session:
+                rows = (
+                    await session.execute(
+                        select(Game.appid).where(
+                            Game.appid.in_(ids),
+                            or_(
+                                Game.removed_at.is_not(None),
+                                Game.removed_strikes != 0,
+                            ),
+                        )
+                    )
+                ).scalars().all()
+                if not rows:
+                    return 0
+                await session.execute(
+                    update(Game)
+                    .where(Game.appid.in_(rows))
+                    .values(removed_at=None, removed_strikes=0)
+                )
+                await session.commit()
+                logger.info(
+                    "[下架监控] %d 款复活（重新有数据），清除下架标记", len(rows)
+                )
+                return len(rows)
+        except Exception as e:
+            logger.error("clear_removed_marks_batch 失败: %s", e)
+            return 0
 
     async def coming_soon_retry_pairs(self, cooldown_days: int, limit: int) -> list[tuple[int, str]]:
         """COMING_SOON 重探候选：updated_at 冷却期满的暂缓行，appid 升序限量。

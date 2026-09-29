@@ -28,7 +28,7 @@ from pathlib import Path
 from sqlalchemy import text
 from yarl import URL
 
-from app.core.database import get_session_factory
+from app.core.database import get_session_factory, write_slot
 from app.crawler.config import CIS_REGIONS, CC_LIST
 from app.crawler.db_writer import DbWriter
 from app.crawler.http_client import SteamRateLimitError
@@ -703,30 +703,31 @@ class BrowseDbWriter(DbWriter):
         if not rows or not await self._extras_columns_present():
             return
         try:
-            async with get_session_factory()() as session:
-                for appid, cc, now_dt, extras_by_sub in rows:
-                    params = [
-                        {
-                            "e": opt.get("discount_end_ts"),
-                            "d": opt.get("discount_desc"),
-                            "b": opt.get("bundle_id"),
-                            "bd": opt.get("bundle_discount_pct"),
-                            "a": appid,
-                            "r": cc.upper(),
-                            "s": int(sub_id),
-                            "t": _naive(now_dt),
-                        }
-                        for sub_id, opt in extras_by_sub.items()
-                    ]
-                    await session.execute(
-                        text(
-                            "UPDATE game_price_history SET discount_end_ts=:e, "
-                            "discount_desc=:d, bundle_id=:b, bundle_discount_pct=:bd "
-                            "WHERE appid=:a AND region_code=:r AND sub_id=:s AND snapshot_at=:t"
-                        ),
-                        params,
-                    )
-                await session.commit()
+            async with write_slot():
+                async with get_session_factory()() as session:
+                    for appid, cc, now_dt, extras_by_sub in rows:
+                        params = [
+                            {
+                                "e": opt.get("discount_end_ts"),
+                                "d": opt.get("discount_desc"),
+                                "b": opt.get("bundle_id"),
+                                "bd": opt.get("bundle_discount_pct"),
+                                "a": appid,
+                                "r": cc.upper(),
+                                "s": int(sub_id),
+                                "t": _naive(now_dt),
+                            }
+                            for sub_id, opt in extras_by_sub.items()
+                        ]
+                        await session.execute(
+                            text(
+                                "UPDATE game_price_history SET discount_end_ts=:e, "
+                                "discount_desc=:d, bundle_id=:b, bundle_discount_pct=:bd "
+                                "WHERE appid=:a AND region_code=:r AND sub_id=:s AND snapshot_at=:t"
+                            ),
+                            params,
+                        )
+                    await session.commit()
         except Exception as e:  # noqa: BLE001 —— 扩展字段不阻断主链路
             logger.warning("[browse] 扩展字段批量落库失败: %s", e)
 

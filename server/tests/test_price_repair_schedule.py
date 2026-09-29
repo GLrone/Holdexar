@@ -61,6 +61,10 @@ def db(tmp_path, monkeypatch):
 
 @pytest_asyncio.fixture(autouse=True)
 async def _schema(db):
+    # 价格写入路径会查 steam_events（活动日历快照标签）——单跑本文件时
+    # 没有别处 import 该模型，显式导入建表，消除与其他文件的顺序依赖
+    import app.domains.steam_events.models  # noqa: F401
+
     async with db.kw["bind"].begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
