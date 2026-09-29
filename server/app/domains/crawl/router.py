@@ -22,6 +22,9 @@ class CrawlRunRequest(BaseModel):
     appids: list[int] | None = None
     regions: list[str] | None = None
     kind: str = "manual"  # manual | missing | backfill（定时层专用 kind 亦可显式触发）
+    # missing/repair 补抓冷却覆盖（分钟）；None=通道默认（missing 24h / repair 4min），
+    # 0=立即补——「立即补抓失败地区」入口用它跳过冷却
+    cooldown: int | None = None
 
 
 @router.post("/crawl/run")
@@ -37,6 +40,7 @@ async def run(req: CrawlRunRequest):
             appids=req.appids,
             regions=req.regions,
             kind=req.kind,
+            missing_cooldown=req.cooldown,
         )
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))

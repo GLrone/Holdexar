@@ -46,14 +46,19 @@ const crawl = {
   'crawl.start.running': '任务进行中…',
   'crawl.start.invalidAppids': '请输入有效的 AppID（逗号分隔）',
   'crawl.start.started': '任务 #{id} 已启动（{count} 个目标）',
+  'crawl.start.repair': '立即补抓失败地区',
+  'crawl.start.repairTip':
+    '不等自动补抓周期，立即按区批量重抓最近更新中失败的价格；本轮补抓仍失败的批次照常记账，留待下一轮自动恢复',
+  'crawl.start.repairStarted': '补抓任务 #{id} 已启动（{count} 个地区批次）',
   'crawl.stop.button': '停止',
   'crawl.stop.requested': '已请求停止',
   'crawl.stop.none': '没有运行中的任务',
   'crawl.jobs.refresh': '刷新任务记录',
 
-  /* 实时进度（SSE）：一条整句，分隔符在词条内 */
+  /* 实时进度（SSE）：一条整句，分隔符在词条内。done/total 是批次口径
+     （1 批 = 1 区 × ≤400 款），速度按批次/分钟显示 */
   'crawl.progress.meta':
-    '已处理 {done} · 成功 {ok} · 失败 {fail} · 队列 {qsize} · {speed} t/s',
+    '已处理 {done}/{total} · 成功 {ok} · 失败 {fail} · 队列 {qsize} · {speed} 批/分',
 
   /* 自动价格链开关 */
   'crawl.autoPrice.label': '自动价格更新',
