@@ -21,7 +21,6 @@ import logging
 from datetime import date, datetime, timedelta
 
 from sqlalchemy import case, delete, func, select
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.database import get_session_factory
 from app.crawler.utils import get_beijing_time_obj
@@ -359,6 +358,44 @@ async def _latest_known_tx_date() -> str | None:
 _BILLS_SYNC_STALE_AFTER = timedelta(minutes=30)
 
 
+async def _with_live_session_retry(run):
+    """执行一次账单抓取动作；store 会话衰减（登录页）时强制换发新会话重试。
+
+    run 接收 Cookie 串返回结果。换发走 account 主账本（ensure_live_session
+    force=True：令牌未过期但 finalize 注册的商店会话已失效的场景），换不出
+    新值（无凭据 / 节流 / 换发失败）则原错误上抛，由调用方按既有失败语义处理。
+    """
+    from app.domains.account import service as account_service
+    from . import steam_fetch
+
+    cookies = await get_primary_cookies_fallback()
+    try:
+        return await run(cookies)
+    except steam_fetch.StoreSessionExpiredError:
+        from app.domains.account.steam_wallet import steam_id_from_cookies
+
+        steam_id = steam_id_from_cookies(cookies)
+        fresh = (
+            await account_service.ensure_live_session(steam_id, cookies, force=True)
+            if steam_id
+            else cookies
+        )
+        if fresh == cookies:
+            raise
+        logger.info("[bills] 主账号 %s store 会话衰减，已换发新会话重试", steam_id)
+        return await run(fresh)
+
+
+async def get_primary_cookies_fallback() -> str:
+    """账单 Cookie 取值口径（与 sync_bills 一致）：主账号优先，回退当前账号。"""
+    from app.domains.account import service as account_service
+
+    cookies = await account_service.get_primary_cookies()
+    if not cookies or "steamLoginSecure" not in cookies:
+        cookies = await account_service.get_cookies()
+    return cookies or ""
+
+
 async def sync_bills(*, force: bool = False) -> dict:
     """从 Steam 在线拉全量账单 + 许可并落库（后端常驻在线拉取）。
 
@@ -404,9 +441,12 @@ async def sync_bills(*, force: bool = False) -> dict:
     # 首屏探测：无新交易 → 本轮跳过（写探测跳过快照，等下一周期再探）
     if not force:
         try:
-            has_new = await steam_fetch.probe_new_transactions(
-                cookies, known_latest_date=await _latest_known_tx_date(),
-                proxy_url=await account_service._strategy_proxy(),
+            known_latest = await _latest_known_tx_date()
+            proxy_url = await account_service._strategy_proxy()
+            has_new = await _with_live_session_retry(
+                lambda ck: steam_fetch.probe_new_transactions(
+                    ck, known_latest_date=known_latest, proxy_url=proxy_url
+                )
             )
         except steam_fetch.SteamFetchError as exc:
             # Cookie 失效等硬错误：写错误快照（与全量失败同语义），等下一轮
@@ -435,9 +475,11 @@ async def sync_bills(*, force: bool = False) -> dict:
             logger.debug("账单同步进度写入失败", exc_info=True)
 
     try:
-        report = await steam_fetch.fetch_full_report(
-            cookies, proxy_url=await account_service._strategy_proxy(),
-            on_progress=_progress,
+        proxy_url = await account_service._strategy_proxy()
+        report = await _with_live_session_retry(
+            lambda ck: steam_fetch.fetch_full_report(
+                ck, proxy_url=proxy_url, on_progress=_progress
+            )
         )
         # 空报告门禁：0 账单 + 0 许可说明解析层根本没拿到数据（登录页守门
         # 漏网/Steam 改版清空表格），落库会生成空 import 遮住真实旧快照。
