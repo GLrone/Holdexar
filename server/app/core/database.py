@@ -1023,11 +1023,19 @@ def get_engine():
     def _sqlite_pragma(dbapi_conn, _record):
         cursor = dbapi_conn.cursor()
         cursor.execute("PRAGMA journal_mode=WAL")
+        # WAL 的标准搭配：NORMAL 下 commit 不再逐笔 fsync（进程崩溃不丢数据，
+        # 断电最多丢最近几笔——价格数据下一轮自动重爬，可接受）
+        cursor.execute("PRAGMA synchronous=NORMAL")
         # WAL 物理收缩：autocheckpoint 只把逻辑尾推回头部复用，文件物理大小
         # 会停在增长过的峰值（可达与主库同量级）。超限即截，
         # 让每个连接做完 checkpoint 都把 WAL 收回本限内。
         cursor.execute("PRAGMA journal_size_limit=67108864")
         cursor.execute("PRAGMA foreign_keys=ON")
+        # 256MB 页缓存（默认 2MB）+ mmap 读路径：GB 级库上基线查询与批量
+        # upsert 的索引下探优先命中进程内，省去逐页读盘
+        cursor.execute("PRAGMA cache_size=-262144")
+        cursor.execute("PRAGMA mmap_size=1073741824")
+        cursor.execute("PRAGMA temp_store=MEMORY")
         # 60s：种子历史合并单事务 BEGIN IMMEDIATE 持锁可达十几秒，引擎侧
         # 连接等锁要扛过这个窗口（与 _merge_history_sync 自己的 60s 同宽）；
         # 普通请求的锁竞争远短于此，不会白等
@@ -1040,6 +1048,42 @@ def get_engine():
 @lru_cache
 def get_session_factory() -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(get_engine(), expire_on_commit=False)
+
+
+# ── 写通道闸（SQLite 单写者约束）─────────────────────────────────────
+# SQLite 同一时刻只允许一个写事务：多 worker 并发落库时写锁排队膨胀到分钟级
+# （busy_timeout 吸收不掉持续进站的写者）、写会话占满连接池、读请求 checkout
+# 超时。写入口以 write_slot() 过闸，把并发写事务收敛到 WRITE_SLOTS 个。
+# 串行依赖的全局状态 = SQLite 单写者；WAL 读并发不受此闸约束。
+WRITE_SLOTS = 2
+
+_write_gates: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
+
+
+class _WriteSlot:
+    """async with write_slot() 的闸体；闸在连接池取连接之前，排队者不占池。"""
+
+    def __init__(self) -> None:
+        self._gate: asyncio.Semaphore | None = None
+
+    async def __aenter__(self) -> None:
+        loop = asyncio.get_running_loop()
+        gate = _write_gates.get(loop)
+        if gate is None:
+            gate = asyncio.Semaphore(WRITE_SLOTS)
+            _write_gates[loop] = gate
+        self._gate = gate
+        await gate.acquire()
+
+    async def __aexit__(self, *exc: object) -> None:
+        if self._gate is not None:
+            self._gate.release()
+            self._gate = None
+
+
+def write_slot() -> _WriteSlot:
+    """写事务并发闸：`async with write_slot():` 包住「取连接 → 提交」全程。"""
+    return _WriteSlot()
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
