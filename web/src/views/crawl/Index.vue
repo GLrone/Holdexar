@@ -272,8 +272,8 @@ async function loadJobs() {
       : [...(regionsStore.ownedRegions ?? [])]
     jobs.value = await crawlApi.jobs(30)
     const active = await crawlApi.active()
-    if (active.activeJobId && !crawl.running) {
-      // 页面刷新后 SSE 尚无事件：以服务端为准
+    if ((active.activeJobId || active.busy) && !crawl.running) {
+      // 页面刷新后 SSE 尚无事件：以服务端为准（busy 含不建任务行的直调抓取）
       crawl.running = true
     }
   } catch (e) {

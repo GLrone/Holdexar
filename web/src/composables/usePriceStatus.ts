@@ -19,6 +19,9 @@ const CYCLE_SCAN = 20
 /** 相对时长的重算间隔：分钟档要跟着走，不能让「N 小时前」停在旧值 */
 const AGO_TICK_MS = 60_000
 
+/** 轮次快照的重拉间隔：收尾有事件驱动重读，这里兜的是 SSE 断线丢事件的底 */
+const CYCLE_RESYNC_MS = 5 * 60_000
+
 export function usePriceStatus() {
   const crawl = useCrawlStatusStore()
   const { t } = useI18n()
@@ -33,6 +36,7 @@ export function usePriceStatus() {
   const now = ref(Date.now())
 
   let ticker: number | undefined
+  let resyncTicker: number | undefined
 
   async function loadCycles() {
     try {
@@ -61,10 +65,14 @@ export function usePriceStatus() {
     ticker = window.setInterval(() => {
       now.value = Date.now()
     }, AGO_TICK_MS)
+    resyncTicker = window.setInterval(() => {
+      void loadCycles()
+    }, CYCLE_RESYNC_MS)
   })
 
   onBeforeUnmount(() => {
     if (ticker !== undefined) window.clearInterval(ticker)
+    if (resyncTicker !== undefined) window.clearInterval(resyncTicker)
   })
 
   const hasHistory = computed(() => sawActivity.value || lastUpdatedAt.value !== null)

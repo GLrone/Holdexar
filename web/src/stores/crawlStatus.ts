@@ -67,10 +67,26 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
   let source: EventSource | null = null
   let started = false
 
+  /** SSE 断线重连后事件可能有缺口（收尾事件丢失会让「进行中」标志卡住）：
+      连接建立即以执行占用的 REST 账本对账；轮次快照的重读由 running 的
+      watch 链与消费方的定时兜底完成。 */
+  async function resyncRunning() {
+    try {
+      const a = await crawlApi.active()
+      running.value = a.busy === true || a.activeJobId !== null
+    } catch {
+      /* 拉不到占用账本，保持现状 */
+    }
+  }
+
   function start() {
     if (started) return
     started = true
     source = new EventSource('/api/v1/events/stream')
+
+    source.onopen = () => {
+      void resyncRunning()
+    }
 
     source.addEventListener('crawl.progress', (e) => {
       running.value = true
@@ -106,6 +122,12 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
         running.value = false
         activeJobId.value = null
       }
+    })
+
+    /* 生产爬取入口空闲：bundles 链尾等直调路径不建 job 行、没有 job.status
+       收尾事件，进度事件置起的「进行中」靠这一条拉回 */
+    source.addEventListener('crawl.idle', () => {
+      running.value = false
     })
 
     /* 价格周期收敛（completed / partial / failed / cancelled）。判定与去重在
