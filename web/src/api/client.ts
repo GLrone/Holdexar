@@ -1179,16 +1179,22 @@ export interface PriceCycleItem {
 }
 
 export const crawlApi = {
-  run: (scope: string, appids?: number[], kind?: string) =>
+  stop: (jobId?: number) =>
+    request<{ stopped: boolean }>('POST', '/crawl/stop', jobId ? { jobId } : {}),
+  jobs: (limit = 20) => request<CrawlJob[]>('GET', `/crawl/jobs${toQuery({ limit })}`),
+  active: () =>
+    request<{ activeJobId: number | null; busy?: boolean }>('GET', '/crawl/active'),
+  /**
+   * 启动爬取。cooldown = missing/repair 补抓冷却覆盖（分钟），0 = 立即补，
+   * 不传 = 通道默认（补抓失败地区入口传 0，其余调用方不传）。
+   */
+  run: (scope: string, appids?: number[], kind?: string, cooldown?: number) =>
     request<{ id: number; count: number; regions: string[] | null }>('POST', '/crawl/run', {
       scope,
       appids,
       kind,
+      cooldown,
     }),
-  stop: (jobId?: number) =>
-    request<{ stopped: boolean }>('POST', '/crawl/stop', jobId ? { jobId } : {}),
-  jobs: (limit = 20) => request<CrawlJob[]>('GET', `/crawl/jobs${toQuery({ limit })}`),
-  active: () => request<{ activeJobId: number | null }>('GET', '/crawl/active'),
   /**
    * 批量导入监控池：后端入池（manual_pool 条目）+ 分类（ok 待首爬 / own 已在库 /
    * fail 无效）；首爬由调用方对新导入（status=ok）触发。复用 RedeemBatchResult

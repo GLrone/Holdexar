@@ -75,8 +75,17 @@ async def jobs(limit: int = Query(20, ge=1, le=100)):
 
 @router.get("/crawl/active")
 async def active():
+    """当前活动任务与爬取占用。
+
+    `activeJobId` 来自 job 表句柄（只有走 start_job 的路径才登记）；
+    `busy` 来自执行入口占用（bundles 链尾直调 run_crawl 不建 job 行，
+    只看 job 句柄会把这条在跑的生产爬取漏报成空闲）。订阅端断线重连后
+    拿它对账「抓取进行中」标志。
+    """
+    from app.crawler.occupancy import crawler_busy
+
     job_id = service.active_job_id()
-    return {"activeJobId": job_id}
+    return {"activeJobId": job_id, "busy": job_id is not None or crawler_busy()}
 
 
 @router.get("/crawl/cycles")

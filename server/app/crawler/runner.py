@@ -213,6 +213,11 @@ async def run_crawl(
         raise
     finally:
         end_crawl()
+        # 占用释放广播： bundles 链尾等直调路径不建 job 行、没有 job.status
+        # 收尾事件，订阅端据此把「抓取进行中」的实时标志拉回空闲
+        from ..core.events import bus
+
+        bus.publish("crawl.idle")
 
 
 async def _write_exit_ledger(run_id, exit_stats, node_by_exit) -> None:
