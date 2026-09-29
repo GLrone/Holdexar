@@ -66,6 +66,31 @@ _SEP = re.compile(r"[:：\-–—]")
 _CLUST_MIN_MEMBER = 2
 _SERIES_ID_MAX = 100
 
+# 官定同系的名称改写表：外传/姐妹作的官方名不以系列词开头（系列词在
+# 分隔符之后或仅在名尾），前缀类规则拿不到证据，这里按「token 串前缀 →
+# 系列词」改写其 token 序列开头，让公共前缀规则照常生效。
+# 键是归一 token 串的前缀（不是前两个词），避免 "world of" 一类泛用
+# 起手误吞无关系列（World of Warcraft ≠ Final Fantasy）。
+_FORCED_SERIES_PREFIX = (
+    ("crisis core final fantasy", ("final", "fantasy")),
+    ("lightning returns", ("final", "fantasy")),
+    ("stranger of paradise final fantasy", ("final", "fantasy")),
+    ("world of final fantasy", ("final", "fantasy")),
+    ("ender lilies", ("ender", "series")),
+    ("ender magnolia", ("ender", "series")),
+)
+
+
+def _series_tokens(name_en: str | None, name: str) -> list[str]:
+    """参与系列判定的英文 token 序列：归一 token，命中改写表时以系列词
+    置换开头（置换量 = 键的词数）。"""
+    toks = _en_tokens(name_en or name)
+    joined = " ".join(toks)
+    for head, series in _FORCED_SERIES_PREFIX:
+        if joined.startswith(head):
+            return list(series) + toks[len(head.split()):]
+    return toks
+
 
 def _en_tokens(name: str) -> list[str]:
     """英文名 → 归一小写词序列（非字母数字断开，罗马数字归一）。
@@ -134,8 +159,8 @@ def is_same_series(
     name1: str, en1: str | None, name2: str, en2: str | None
 ) -> bool:
     """两个名字是否同系列（宁缺毋滥，任一规则命中即算）。"""
-    t1 = _en_tokens(en1 or name1)
-    t2 = _en_tokens(en2 or name2)
+    t1 = _series_tokens(en1, name1)
+    t2 = _series_tokens(en2, name2)
     c1 = _cn_chars(name1)
     c2 = _cn_chars(name2)
     en1_all = name1 if not (en1 or "").strip() else en1
@@ -238,7 +263,7 @@ class _Member:
         self.appid = appid
         self.name = name
         self.name_en = name_en
-        self.toks = _en_tokens(name_en or name)
+        self.toks = _series_tokens(name_en, name)
         self.cn = _cn_chars(name)
 
 
