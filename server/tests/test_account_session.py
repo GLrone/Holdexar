@@ -19,6 +19,7 @@ from app.core.secretbox import decrypt_secret, is_encrypted
 from app.domains.account import service as account_service
 from app.domains.account import session as session_module
 from app.domains.account.models import SteamAccount
+from app.domains.account.steam_wallet import _from_raw_amounts
 from app.domains.account.session import (
     SessionRefreshError,
     access_token_expires_at,
@@ -212,6 +213,59 @@ async def test_refresh_login_cookies_requires_refresh_credential():
 
 
 @pytest.mark.asyncio
+async def test_refresh_transfer_timeout_error_carries_type(monkeypatch):
+    """transfer 全部超时（异常消息为空）时报错仍带异常类型，不产空串错误。"""
+    import httpx as real_httpx
+
+    calls: list = []
+
+    responses = {
+        session_module.FINALIZE_URL: _finalize_ok(),
+        TRANSFER_URL: real_httpx.ReadTimeout(""),
+    }
+    fake = types.SimpleNamespace(
+        AsyncClient=lambda **_kw: _FakeClient(responses, calls),
+        HTTPError=session_module.httpx.HTTPError,
+        TransportError=session_module.httpx.TransportError,
+    )
+    monkeypatch.setattr(session_module, "httpx", fake)
+
+    with pytest.raises(SessionRefreshError, match="ReadTimeout"):
+        await refresh_login_cookies(cookie_str(access_exp=time.time() - 10))
+    transfer_calls = [c for c in calls if c[0] == TRANSFER_URL]
+    assert len(transfer_calls) == 4  # 瞬断不轻弃：4 次尝试
+
+
+@pytest.mark.asyncio
+async def test_refresh_prefers_store_domain_access_token(monkeypatch):
+    """各域 settoken 各发各的域内令牌，合并结果以商店域为准，不被后位域覆盖。"""
+    calls: list = []
+    store_access = access_value(exp=time.time() + _DAY)
+    tv_access = f"{A}%7C%7C{_jwt({'sub': A, 'aud': ['web:steamtv'], 'exp': time.time() + _DAY})}"
+    responses = {
+        session_module.FINALIZE_URL: _FakeResponse(
+            json_body={
+                "transfer_info": [
+                    {"url": "https://steam.tv/login/settoken", "params": {"auth": "t"}},
+                    {"url": "https://store.steampowered.com/login/settoken", "params": {"auth": "s"}},
+                ]
+            }
+        ),
+        "https://steam.tv/login/settoken": _FakeResponse(
+            set_cookie=[f"steamLoginSecure={tv_access}; Path=/"]
+        ),
+        "https://store.steampowered.com/login/settoken": _FakeResponse(
+            set_cookie=[f"steamLoginSecure={store_access}; Path=/"]
+        ),
+    }
+    _patch_httpx(monkeypatch, responses, calls)
+
+    out = await refresh_login_cookies(cookie_str(access_exp=time.time() - 10))
+
+    assert parse_cookie_str(out)["steamLoginSecure"] == store_access
+
+
+@pytest.mark.asyncio
 async def test_refresh_login_cookies_surfaces_steam_error(monkeypatch):
     calls: list = []
     _patch_httpx(
@@ -321,6 +375,66 @@ async def test_ensure_live_session_renews_expiring_cookie(db, monkeypatch):
     assert is_encrypted(sealed)                 # 续期结果密封落库
     assert decrypt_secret(sealed, "steam-cookies") == out  # 消费方解密共享
     assert session_freshness(out)["expired"] is False
+
+
+@pytest.mark.asyncio
+async def test_ensure_live_session_force_renews_healthy_cookie(db, monkeypatch):
+    """force=True（登录页命中场景）：令牌未到期也强制换发并落库。"""
+    healthy = cookie_str(access_exp=time.time() + 3 * _DAY)
+    await _seed(A, healthy)
+    renewed = cookie_str(access_exp=time.time() + _DAY)
+    calls: list[str] = []
+
+    async def _fake_renew(current, **_kw):
+        calls.append(current)
+        return renewed
+
+    monkeypatch.setattr(account_service, "refresh_login_cookies", _fake_renew)
+
+    out = await account_service.ensure_live_session(A, healthy, force=True)
+
+    assert out == renewed
+    assert calls == [healthy]
+    assert decrypt_secret((await _row(A)).cookies, "steam-cookies") == renewed
+
+
+@pytest.mark.asyncio
+async def test_ensure_live_session_force_without_credential_returns_original(db):
+    healthy = cookie_str(access_exp=time.time() + 3 * _DAY, with_refresh=False)
+    await _seed(A, healthy)
+    out = await account_service.ensure_live_session(A, healthy, force=True)
+    assert out == healthy
+
+
+@pytest.mark.asyncio
+async def test_wallet_sync_retries_after_store_session_decay(db, monkeypatch):
+    """登录页自愈：store 会话衰减专型错误 → 强制换发新会话 → 新 Cookie 重试成功。"""
+    from app.domains.account.steam_wallet import StoreSessionExpiredError
+
+    healthy = cookie_str(access_exp=time.time() + 3 * _DAY)
+    await _seed(A, healthy)
+    renewed = cookie_str(access_exp=time.time() + _DAY)
+
+    async def _fake_renew(current, **_kw):
+        return renewed
+
+    monkeypatch.setattr(account_service, "refresh_login_cookies", _fake_renew)
+
+    seen: list[str] = []
+
+    async def _fake_fetch(cookies, *, verify=None, proxy_url=None):
+        seen.append(parse_cookie_str(cookies)["steamLoginSecure"])
+        if len(seen) == 1:
+            raise StoreSessionExpiredError("商店账户页把我们送回了登录页")
+        return _from_raw_amounts(100, 0, 1, "US")
+
+    monkeypatch.setattr(account_service, "fetch_wallet", _fake_fetch)
+
+    result = await account_service._sync_wallet_of(A)
+
+    assert result["ok"] is True
+    assert len(seen) == 2
+    assert seen[0] != seen[1]  # 重试携带的是换发后的新 Cookie
 
 
 @pytest.mark.asyncio

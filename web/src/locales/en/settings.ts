@@ -34,6 +34,8 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.steam.loginCodeHintTotp': 'Open the Steam Guard page in the Steam mobile app and enter the current 5-digit code',
   'settings.steam.loginCodePlaceholder': '5-digit code',
   'settings.steam.loginCodeSubmit': 'Submit code',
+  'settings.steam.loginSwitchCode': 'Enter a code instead',
+  'settings.steam.loginBackToConfirm': 'Back to app confirmation',
   'settings.steam.loginConfirmWait': 'Confirm this sign-in in the Steam mobile app — waiting…',
   'settings.steam.loginConfirmWaitCode': 'Code accepted — finishing sign-in…',
   'settings.steam.loginFinalizing': 'Establishing your session…',

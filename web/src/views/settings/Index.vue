@@ -467,6 +467,9 @@ const loginState = ref<LoginSessionState | null>(null)
 const loginCodeInput = ref('')
 const loginCodeError = ref('')
 const loginCodeAccepted = ref(false)
+/* 等待确认态下的输码切换：手机验证器账号默认走「手机上确认」，此开关
+   对应登录页「改为输入代码」的备选路径；回到等待/登录结束即复位 */
+const loginCodeMode = ref(false)
 let loginTimer: number | null = null
 
 const LOGIN_BUSY_STATES = new Set(['signing', 'awaiting_code', 'awaiting_confirmation', 'finalizing'])
@@ -490,6 +493,7 @@ async function refreshLoginState() {
     loginState.value = st
     if (st.state === 'done') {
       stopLoginPolling()
+      loginCodeMode.value = false
       message.success(t('settings.steam.loginDone'))
       loginAccount.value = ''
       loginCodeInput.value = ''
@@ -501,6 +505,7 @@ async function refreshLoginState() {
       }, 4000)
     } else if (st.state === 'idle') {
       stopLoginPolling()
+      loginCodeMode.value = false
       loginState.value = null
     }
   } catch {
@@ -514,6 +519,7 @@ async function startPasswordLogin() {
     return
   }
   loginState.value = { ...emptyLoginState, state: 'signing' }
+  loginCodeMode.value = false
   try {
     const res = await accountLoginApi.start(loginAccount.value.trim(), loginPassword.value)
     loginPassword.value = ''
@@ -550,6 +556,7 @@ async function submitLoginCode() {
     if (res.ok) {
       loginCodeInput.value = ''
       loginCodeAccepted.value = true
+      loginCodeMode.value = false
     } else {
       loginCodeError.value = res.error || ''
     }
@@ -569,6 +576,7 @@ async function cancelLoginFlow() {
   loginCodeInput.value = ''
   loginCodeError.value = ''
   loginCodeAccepted.value = false
+  loginCodeMode.value = false
 }
 
 const loginStateTip = computed(() => {
@@ -583,6 +591,15 @@ const loginStateTip = computed(() => {
   if (st.state === 'finalizing') return t('settings.steam.loginFinalizing')
   if (st.state === 'done') return t('settings.steam.loginDone')
   return ''
+})
+
+/* 输码块的呈现条件：邮箱/令牌码形态直接呈现；确认形态账号经「改为输入
+   验证码」切换后复用同一块（对应登录页「改为输入代码」的备选路径） */
+const showLoginCodeEntry = computed(() => {
+  const st = loginState.value
+  if (!st) return false
+  if (st.state === 'awaiting_code') return true
+  return st.state === 'awaiting_confirmation' && loginCodeMode.value
 })
 
 const loginCodeHint = computed(() =>
@@ -755,7 +772,7 @@ onUnmounted(stopLoginPolling)
 
           <!-- 登录状态卡：进行中 / 失败各有形态，成功后自动收起 -->
           <div v-if="loginState && loginState.state !== 'idle'" class="login-state" :class="`is-${loginState.state}`">
-            <template v-if="loginState.state === 'awaiting_code'">
+            <template v-if="showLoginCodeEntry">
               <div class="login-state__title">{{ t('settings.steam.loginCodeTitle') }}</div>
               <div class="login-state__hint">{{ loginCodeHint }}</div>
               <div class="settings-row__line">
@@ -767,6 +784,14 @@ onUnmounted(stopLoginPolling)
                 />
                 <HlButton art="outline" tone="green" size="sm" @click="submitLoginCode">
                   {{ t('settings.steam.loginCodeSubmit') }}
+                </HlButton>
+                <HlButton
+                  v-if="loginState.state === 'awaiting_confirmation'"
+                  variant="text"
+                  size="sm"
+                  @click="loginCodeMode = false"
+                >
+                  {{ t('settings.steam.loginBackToConfirm') }}
                 </HlButton>
                 <HlButton variant="text" size="sm" @click="cancelLoginFlow">
                   {{ t('settings.steam.loginCancel') }}
@@ -787,9 +812,19 @@ onUnmounted(stopLoginPolling)
                 <span class="login-state__spin" aria-hidden="true"></span>
                 {{ loginStateTip }}
               </div>
-              <HlButton variant="text" size="sm" @click="cancelLoginFlow">
-                {{ t('settings.steam.loginCancel') }}
-              </HlButton>
+              <div class="settings-row__line">
+                <HlButton
+                  v-if="loginState.state === 'awaiting_confirmation' && loginState.code_available && !loginCodeAccepted"
+                  variant="text"
+                  size="sm"
+                  @click="loginCodeMode = true"
+                >
+                  {{ t('settings.steam.loginSwitchCode') }}
+                </HlButton>
+                <HlButton variant="text" size="sm" @click="cancelLoginFlow">
+                  {{ t('settings.steam.loginCancel') }}
+                </HlButton>
+              </div>
             </template>
           </div>
         </div>

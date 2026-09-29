@@ -48,6 +48,8 @@ const settings = {
   'settings.steam.loginCodeHintTotp': '打开手机 Steam App 的 Steam Guard 页，填入当前 5 位令牌',
   'settings.steam.loginCodePlaceholder': '5 位验证码',
   'settings.steam.loginCodeSubmit': '提交验证码',
+  'settings.steam.loginSwitchCode': '改为输入验证码',
+  'settings.steam.loginBackToConfirm': '返回等待确认',
   'settings.steam.loginConfirmWait': '请在手机 Steam App 上确认本次登录，等待中…',
   'settings.steam.loginConfirmWaitCode': '验证码已接受，正在完成登录…',
   'settings.steam.loginFinalizing': '正在建立登录态…',

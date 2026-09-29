@@ -272,7 +272,7 @@ async def test_fetch_wallet_falls_back_on_ssl_error(monkeypatch):
         calls.append(verify_flag)
         if verify_flag:
             raise steam_wallet.WalletFetchError(
-                "无法获取 Steam 钱包余额：_fetch_market_wallet: SSLError: certificate verify failed"
+                "无法获取 Steam 钱包余额：_fetch_store_account: SSLError: certificate verify failed"
             )
         return _from_raw_amounts(100, 0, 1, "US")
 
@@ -291,7 +291,7 @@ async def test_fetch_wallet_no_fallback_on_plain_network_error(monkeypatch):
     async def fake_try(verify_flag, cookies, proxy_url=None):
         calls.append(verify_flag)
         raise steam_wallet.WalletFetchError(
-            "无法获取 Steam 钱包余额：_fetch_market_wallet: ConnectTimeout: timed out"
+            "无法获取 Steam 钱包余额：_fetch_store_account: ConnectTimeout: timed out"
         )
 
     monkeypatch.setattr(steam_wallet, "_try_channels", fake_try)
@@ -309,7 +309,7 @@ async def test_fetch_wallet_explicit_verify_skips_fallback(monkeypatch):
     async def fake_try(verify_flag, cookies, proxy_url=None):
         calls.append(verify_flag)
         raise steam_wallet.WalletFetchError(
-            "无法获取 Steam 钱包余额：_fetch_market_wallet: SSLError: self-signed certificate"
+            "无法获取 Steam 钱包余额：_fetch_store_account: SSLError: self-signed certificate"
         )
 
     monkeypatch.setattr(steam_wallet, "_try_channels", fake_try)
@@ -320,7 +320,7 @@ async def test_fetch_wallet_explicit_verify_skips_fallback(monkeypatch):
     assert calls == [False]  # 显式指定时只跑一次
 
 
-# ── store account 通道（2026-09 新增，fixture 取自真实页面结构）───
+# ── store account 通道（fixture 取自真实页面结构）───
 
 from app.domains.account.steam_wallet import (  # noqa: E402
     _ACCOUNT_BALANCE_RE,
@@ -333,8 +333,10 @@ from app.domains.account.steam_wallet import (  # noqa: E402
 
 # 实网 store/account 页关键片段（INR 账户）：
 _ACCOUNT_PAGE_FIXTURE = """
-<a class="global_action_link" id="header_wallet_balance"
-   href="https://store.steampowered.com/account/store_transactions/">₹ 137.30</a>
+<div class="accountRow accountBalance">
+    <div class="accountData price">₹ 137.30</div>
+    <div class="accountLabel">Wallet Balance</div>
+</div>
 <a href="https://steamcommunity.com/profiles/76561198454168600/"
    class="user_avatar playerAvatar offline" aria-label="查看您的个人资料">
 &quot;subtotal&quot;:{&quot;amount_in_cents&quot;:&quot;0&quot;,&quot;currency_code&quot;:24,&quot;formatted_amount&quot;:&quot;\u20b90.00&quot;},&quot;is_valid&quot;:1
@@ -342,9 +344,15 @@ _ACCOUNT_PAGE_FIXTURE = """
 
 
 class _FakeResp:
-    def __init__(self, text: str, status_code: int = 200):
+    def __init__(
+        self,
+        text: str,
+        status_code: int = 200,
+        url: str = "https://store.steampowered.com/account/",
+    ):
         self.text = text
         self.status_code = status_code
+        self.url = url
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -352,13 +360,19 @@ class _FakeResp:
 
 
 class _FakeClient:
-    """通道 HTTP 依赖的最小替身：account 页命中 fixture，history 抓不到即静默。"""
+    """通道 HTTP 依赖的最小替身：account 页命中 fixture，history 抓不到即静默。
 
-    def __init__(self, pages: dict[str, str]):
+    页面值可给 _FakeResp（自定义 url，供登录页判定用例）。
+    """
+
+    def __init__(self, pages: dict):
         self._pages = pages
 
     async def get(self, url, **_kw):
-        return _FakeResp(self._pages.get(url, ""))
+        page = self._pages.get(url, "")
+        if isinstance(page, _FakeResp):
+            return page
+        return _FakeResp(page)
 
 
 def test_account_page_regexes_against_real_structure():
@@ -406,6 +420,26 @@ async def test_fetch_store_account_parses_inr_wallet():
 
 
 @pytest.mark.asyncio
+async def test_fetch_store_account_link_wrapped_price_variant():
+    """页面变体：price 元素带前置属性且金额包在链接里（USD 账户的页面形态）。"""
+    from app.domains.account import steam_wallet as w
+
+    variant = (
+        '<div class="accountRow accountBalance">'
+        '<div data-tooltip-text="点击查看消费和钱包历史记录" class="accountData price">'
+        '<a href="https://store.steampowered.com/account/history/">$0.00 USD</a></div>'
+        '<div class="accountLabel">Wallet Balance</div></div>'
+        '&quot;subtotal&quot;:{&quot;amount_in_cents&quot;:&quot;0&quot;,'
+        '&quot;currency_code&quot;:1,&quot;formatted_amount&quot;:&quot;$0.00&quot;}'
+    )
+    client = _FakeClient({w.ACCOUNT_URL: variant})
+    info = await _fetch_store_account(client, {})
+    assert info is not None
+    assert info.currency_code == "USD"
+    assert info.balance == 0.0
+
+
+@pytest.mark.asyncio
 async def test_fetch_store_account_symbol_mismatch_raises():
     from app.domains.account import steam_wallet as w
 
@@ -413,6 +447,20 @@ async def test_fetch_store_account_symbol_mismatch_raises():
     broken = _ACCOUNT_PAGE_FIXTURE.replace("currency_code&quot;:24", "currency_code&quot;:1")
     client = _FakeClient({w.ACCOUNT_URL: broken})
     with pytest.raises(Exception, match="不一致"):
+        await _fetch_store_account(client, {})
+
+
+@pytest.mark.asyncio
+async def test_fetch_store_account_login_redirect_raises_session_expired():
+    """重定向链终点是登录页 = store 会话衰减，抛专型错误供上层换发重试。"""
+    from app.domains.account import steam_wallet as w
+
+    login_page = _FakeResp(
+        "<html><title>登录</title></html>",
+        url="https://store.steampowered.com/login/?redir=account%2F",
+    )
+    client = _FakeClient({w.ACCOUNT_URL: login_page})
+    with pytest.raises(w.StoreSessionExpiredError):
         await _fetch_store_account(client, {})
 
 
