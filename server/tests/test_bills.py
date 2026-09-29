@@ -781,6 +781,43 @@ class _FakeReport:
 
 
 @pytest.mark.asyncio
+async def test_sync_bills_retries_after_store_session_decay(db, monkeypatch):
+    """登录页（store 会话衰减）→ 强制换发新 Cookie → 重试成功，不落错误快照。"""
+    from app.domains.account import service as account_service
+    from app.domains.account.steam_wallet import StoreSessionExpiredError
+
+    renewed = "steamLoginSecure=76561198123456789%7C%7Cfresh"
+    state = {"n": 0}
+
+    async def fetch():
+        state["n"] += 1
+        if state["n"] == 1:
+            raise StoreSessionExpiredError("商店账户页把我们送回了登录页")
+        return _FakeReport()
+
+    store: dict = {}
+    calls = _patch_sync_env(monkeypatch, store, fetch)
+
+    async def fake_numeric_primary():
+        return "steamLoginSecure=76561198123456789%7C%7Ctok; steamRefresh_steam=76561198123456789%7C%7Cref"
+
+    monkeypatch.setattr(account_service, "get_primary_cookies", fake_numeric_primary)
+
+    async def fake_ensure(steam_id, cookies, *, force=False):
+        assert force is True
+        return renewed
+
+    monkeypatch.setattr(account_service, "ensure_live_session", fake_ensure)
+
+    res = await bills_service.sync_bills(force=True)
+
+    assert res["ok"] is True
+    assert len(calls) == 2
+    assert calls[0]["cookies"] != renewed
+    assert calls[1]["cookies"] == renewed  # 重试携带换发后的新 Cookie
+
+
+@pytest.mark.asyncio
 async def test_sync_bills_busy_within_cycle(db, monkeypatch):
     """周期内 running=True → busy 跳过，不叠加第二份全量翻页。"""
     from app.crawler.utils import get_beijing_time_obj
@@ -1097,7 +1134,7 @@ def test_login_page_gate_normal_page_passes():
 
 @pytest.mark.asyncio
 async def test_fetch_history_login_page_raises():
-    """Cookie 过期 → Steam 返回登录页 → 抛 SteamFetchError（不再静默产空报告）。"""
+    """store 会话衰减 → Steam 返回登录页 → 抛专型错误（上层换发新会话重试）。"""
     from app.domains.bills import steam_fetch
 
     class _LoginClient:
@@ -1107,5 +1144,5 @@ async def test_fetch_history_login_page_raises():
                 url="https://store.steampowered.com/login/?redir=account%2Fhistory%2F",
             )
 
-    with pytest.raises(steam_fetch.SteamFetchError, match="登录页"):
+    with pytest.raises(steam_fetch.StoreSessionExpiredError, match="登录页"):
         await steam_fetch._fetch_history(_LoginClient())

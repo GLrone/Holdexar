@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 import httpx
 
 from app.domains.account.steam_wallet import (
+    StoreSessionExpiredError,
     WalletFetchError,
     parse_cookie_str,
 )
@@ -95,8 +96,11 @@ def _is_login_page(resp: httpx.Response) -> bool:
 
 def _ensure_account_page(resp: httpx.Response, where: str) -> None:
     if _is_login_page(resp):
-        raise SteamFetchError(
-            f"{where}返回登录页：Cookie 已过期/失效，请到「我」页重新绑定后再同步"
+        # 专型错误：调用方借此强制换发新会话重试（区别于 SteamFetchError 的
+        # 终态失败——令牌未过期时衰减的商店会话可以自愈）
+        raise StoreSessionExpiredError(
+            f"{where}返回登录页：商店会话已失效，Cookie 已过期/失效，"
+            "请到「我」页重新绑定后再同步"
         )
 
 
