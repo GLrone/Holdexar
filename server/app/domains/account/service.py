@@ -37,10 +37,10 @@ from .session import (
     session_freshness,
 )
 from .steam_wallet import (
+    StoreSessionExpiredError,
     UnknownCurrencyError,
     WalletFetchError,
     WalletInfo,
-    WalletRateLimitedError,
     fetch_player_states,
     fetch_profile,
     fetch_wallet,
@@ -233,15 +233,17 @@ async def _save_cookies_only(steam_id: str, cookies: str) -> None:
         await session.commit()
 
 
-async def ensure_live_session(steam_id: str, cookies: str) -> str:
+async def ensure_live_session(steam_id: str, cookies: str, *, force: bool = False) -> str:
     """返回当前可用的登录 Cookie：临期/过期时先续期并落库，其余原样返回。
 
-    触发线由访问令牌的 exp 决定（见 session.session_freshness）。没有续期
-    凭据（登录时未勾选「记住我」）或续期失败时如实返回原 Cookie，由调用方
-    按登录过期处理——登录态失效不伪装成网络故障。
+    触发线由访问令牌的 exp 决定（见 session.session_freshness）；force=True
+    跳过 exp 判定强制换发——供「商店页面被弹回登录页」的会话衰减场景
+    （StoreSessionExpiredError，令牌未过期但商店会话已失效）使用。
+    没有续期凭据（登录时未勾选「记住我」）或续期失败时如实返回原 Cookie，
+    由调用方按登录过期处理——登录态失效不伪装成网络故障。
     """
     freshness = session_freshness(cookies)
-    if not (freshness["expired"] or freshness["expiring"]):
+    if not force and not (freshness["expired"] or freshness["expiring"]):
         return cookies
     if not freshness["has_refresh_token"]:
         return cookies
@@ -251,7 +253,7 @@ async def ensure_live_session(steam_id: str, cookies: str) -> str:
         row = await _get_row(steam_id)
         current = (_stored_credential(row) if row is not None else "") or cookies
         freshness = session_freshness(current)
-        if not (freshness["expired"] or freshness["expiring"]):
+        if not force and not (freshness["expired"] or freshness["expiring"]):
             return current
         now = _naive_now()
         last = _session_refresh_at.get(steam_id)
@@ -268,6 +270,22 @@ async def ensure_live_session(steam_id: str, cookies: str) -> str:
         await _save_cookies_only(steam_id, renewed)
         logger.info("[account] 账号 %s 登录态已续期（换发新的访问令牌）", steam_id)
         return renewed
+
+
+async def _fetch_wallet_with_live_session(steam_id: str, cookies: str) -> WalletInfo:
+    """钱包抓取 + 登录页自愈：store 会话被服务端衰减时强制换发新会话重试一次。
+
+    重试仍弹登录页（fresh == cookies：无凭据 / 触发节流 / 换发失败）则按
+    原错误上抛，由调用方走既有失败退避语义。
+    """
+    try:
+        return await fetch_wallet(cookies, proxy_url=await _strategy_proxy())
+    except StoreSessionExpiredError:
+        fresh = await ensure_live_session(steam_id, cookies, force=True)
+        if fresh == cookies:
+            raise
+        logger.info("[account] 账号 %s store 会话衰减，已换发新会话重试钱包抓取", steam_id)
+        return await fetch_wallet(fresh, proxy_url=await _strategy_proxy())
 
 
 async def get_primary_account() -> SteamAccount | None:
@@ -658,7 +676,7 @@ async def sync_wallet(*, force: bool = False) -> dict:
         }
 
     try:
-        info: WalletInfo = await fetch_wallet(cookies, proxy_url=await _strategy_proxy())
+        info: WalletInfo = await _fetch_wallet_with_live_session(row.steam_id, cookies)
     except UnknownCurrencyError as exc:
         await _save_wallet(row.steam_id, error=str(exc), now=now)
         await _sync_profile_row(row.steam_id, cookies, now)  # 钱包失败不连坐资料
@@ -959,7 +977,7 @@ async def _sync_wallet_of(steam_id: str) -> dict:
             "error": SESSION_RENEW_FAILED_MESSAGE,
         }
     try:
-        info: WalletInfo = await fetch_wallet(cookies, proxy_url=await _strategy_proxy())
+        info: WalletInfo = await _fetch_wallet_with_live_session(steam_id, cookies)
     except UnknownCurrencyError as exc:
         await _save_wallet(steam_id, error=str(exc), now=now, backoff_level=next_level,
                            fail_streak=next_streak, frozen=will_freeze)

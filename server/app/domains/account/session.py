@@ -15,6 +15,13 @@ exp 判断剩余寿命，临期或过期时用续期凭据换一组新的 web Co
     POST https://login.steampowered.com/jwt/finalizelogin → {transfer_info: [...]}
     POST <transfer_info[].url>（表单带 steamID + params） → Set-Cookie: steamLoginSecure
 
+令牌按域签发：finalizelogin 会为 store / community / help / checkout / steam.tv
+各发一枚 aud 不同的 steamLoginSecure（web:store / web:community / …），互不通用。
+本应用入库口径取 **store 域令牌**（与手贴浏览器商店 Cookie 一致）——现有全部
+Cookie 消费点都在 store 与 api.steampowered.com（api 接受 store 令牌作
+access_token）；若未来出现 community 域登录态消费点，须经 finalizelogin 的
+community settoken 单独取令牌，不得复用 store 令牌。
+
 exp 只用于本地判断「要不要提前续期」，不做签名校验——令牌真伪由 Steam 在
 实际请求时判定。
 """
@@ -25,8 +32,8 @@ import base64
 import json
 import logging
 import secrets
-from datetime import datetime, timedelta, timezone
-from urllib.parse import unquote
+from datetime import datetime, timezone
+from urllib.parse import unquote, urlsplit
 
 import httpx
 
@@ -54,8 +61,15 @@ FINALIZE_HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
 REFRESH_TIMEOUT = 20.0
-_TRANSFER_ATTEMPTS = 3
-_TRANSFER_RETRY_SECONDS = 0.5
+_TRANSFER_ATTEMPTS = 4
+_TRANSFER_RETRY_SECONDS = 1.0
+# finalize 第一跳的瞬断重发（代理节点抖动下整段续期链的成败所在）
+_TRANSIENT_RETRY_ATTEMPTS = 3
+_TRANSIENT_RETRY_BACKOFF_S = 0.8
+# 各域 settoken 下发的 steamLoginSecure 逐域不同（JWT aud：web:store /
+# web:community / web:steamtv…），合并为单串时以商店域令牌为准——与手贴
+# 浏览器商店 Cookie 的既有口径一致，其余域不覆盖已取到的值
+_LOGIN_SECURE_HOST_PRIORITY = ("store.steampowered.com", "steamcommunity.com")
 
 
 class SessionRefreshError(RuntimeError):
@@ -146,6 +160,25 @@ def _set_cookie_values(headers) -> dict[str, str]:
     return out
 
 
+async def _post_with_transient_retry(
+    client: httpx.AsyncClient, *, files: dict
+) -> httpx.Response:
+    """finalize 单发 + 瞬断重发：仅传输层失败（连接/读写中断）时重试。
+
+    请求未达对端即可安全重发；响应已返回后的错误不重试。
+    """
+    last_exc: Exception | None = None
+    for attempt in range(_TRANSIENT_RETRY_ATTEMPTS):
+        try:
+            return await client.post(FINALIZE_URL, headers=FINALIZE_HEADERS, files=files)
+        except httpx.TransportError as exc:
+            last_exc = exc
+            if attempt + 1 < _TRANSIENT_RETRY_ATTEMPTS:
+                await asyncio.sleep(_TRANSIENT_RETRY_BACKOFF_S * (attempt + 1))
+    assert last_exc is not None
+    raise last_exc
+
+
 async def _run_transfer(
     client: httpx.AsyncClient, url: str, form: dict[str, str]
 ) -> dict[str, str]:
@@ -163,8 +196,9 @@ async def _run_transfer(
         except (httpx.HTTPError, SessionRefreshError) as exc:
             last = exc
             if attempt + 1 < _TRANSFER_ATTEMPTS:
-                await asyncio.sleep(_TRANSFER_RETRY_SECONDS)
-    raise SessionRefreshError(f"Cookie 下发失败：{last}")
+                await asyncio.sleep(_TRANSFER_RETRY_SECONDS * (attempt + 1))
+    detail = f"{type(last).__name__}: {last}" if last is not None else "unknown"
+    raise SessionRefreshError(f"Cookie 下发失败（{detail}）")
 
 
 async def web_cookies_from_refresh_token(
@@ -188,9 +222,8 @@ async def web_cookies_from_refresh_token(
         timeout=timeout, proxy=proxy_url, follow_redirects=True
     ) as client:
         try:
-            resp = await client.post(
-                FINALIZE_URL,
-                headers=FINALIZE_HEADERS,
+            resp = await _post_with_transient_retry(
+                client,
                 files={
                     "nonce": (None, refresh_token),
                     "sessionid": (None, session_id),
@@ -215,6 +248,7 @@ async def web_cookies_from_refresh_token(
 
         # finalize 自身也可能下发新的续期凭据（steamRefresh_steam）
         values = _set_cookie_values(resp.headers)
+        login_secure_by_host: dict[str, str] = {}
         for transfer in transfers:
             if not isinstance(transfer, dict) or not transfer.get("url"):
                 continue
@@ -222,7 +256,15 @@ async def web_cookies_from_refresh_token(
             form = {"steamID": steam_id}
             if isinstance(params, dict):
                 form.update({str(k): str(v) for k, v in params.items()})
-            values.update(await _run_transfer(client, str(transfer["url"]), form))
+            got = await _run_transfer(client, str(transfer["url"]), form)
+            host = urlsplit(str(transfer["url"])).netloc
+            if ACCESS_COOKIE in got:
+                login_secure_by_host.setdefault(host, got[ACCESS_COOKIE])
+            values.update(got)
+        for host in (*_LOGIN_SECURE_HOST_PRIORITY, *login_secure_by_host):
+            if host in login_secure_by_host:
+                values[ACCESS_COOKIE] = login_secure_by_host[host]
+                break
 
     access_value = values.get(ACCESS_COOKIE, "")
     if not access_value:

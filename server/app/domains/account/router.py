@@ -149,9 +149,13 @@ async def login_status() -> dict:
 
 @router.post("/login/code")
 async def login_code(payload: LoginCodePayload) -> dict:
-    """提交 Steam Guard 验证码（手机令牌或邮箱验证码）。"""
+    """提交 Steam Guard 验证码（手机令牌或邮箱验证码）。
+
+    无进行中的输码会话返回 409；验证码错误等可重试失败原样下发，
+    由登录状态卡就地展示。
+    """
     result = await login.submit_guard_code(payload.code)
-    if not result.get("ok") and result.get("state", {}).get("state") != login.STATE_AWAITING_CODE:
+    if not result.get("ok") and result.get("no_session"):
         raise HTTPException(409, result.get("error", "当前没有等待验证码的登录"))
     return result
 

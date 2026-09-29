@@ -1,15 +1,14 @@
-"""Steam 钱包余额/结算币种抓取（独立实现，双通道容错）。
+"""Steam 钱包余额/结算币种抓取（账户页单通道）。
 
-通道一：社区市场页 https://steamcommunity.com/market/ 内嵌的
-g_rgWalletInfo JS 对象，含余额、延迟余额、币种 ID、钱包国家码。
-通道二：商店购物车页 data-store_user_config 中的 webapi_token（JWT），
-调 IWalletService/GetWalletDetails 拿同构数据。两通道任一成功即返回。
+数据源：登录态商店账户页 https://store.steampowered.com/account/——
+余额渲染在 `div.accountBalance` 的 `div.accountData.price`（带币种符号），
+同页 data-store_user_config 内嵌购物车小计（currency_code 数字 ID +
+formatted_amount），与余额符号交叉验证防误配。
 
-抓取目标页均为 Steam 公开页面结构，此处仅消费客观字段。
+抓取目标页为 Steam 公开页面结构，此处仅消费客观字段。
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
 from dataclasses import dataclass
@@ -18,15 +17,10 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-MARKET_URL = "https://steamcommunity.com/market/"
 ACCOUNT_URL = "https://store.steampowered.com/account/"
 HISTORY_URL = "https://store.steampowered.com/account/history/"
-CART_URL = "https://store.steampowered.com/cart/"
-WALLET_API_URL = "https://api.steampowered.com/IWalletService/GetWalletDetails/v1"
 
-MARKET_TIMEOUT = 15.0
-CART_TIMEOUT = 15.0
-WALLET_API_TIMEOUT = 15.0
+FETCH_TIMEOUT = 15.0
 
 # Steam 钱包币种 ID（wallet_currency 整数）→ ISO 代号与符号。
 # 清单来自 Steam 官方页面实际返回的枚举值，与本项目 crawl_regions 的
@@ -78,9 +72,13 @@ _HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
 
-# 市场页 g_rgWalletInfo = {...};（单层对象字面量，贪婪到 "};")
-_WALLET_INFO_RE = re.compile(r"g_rgWalletInfo\s*=\s*(\{.+?\})\s*;", re.DOTALL)
-_ACCOUNT_BALANCE_RE = re.compile(r'id="header_wallet_balance"[^>]*>([^<]+)</a>')
+# 账户页余额：accountBalance 区块的 price 元素。页面存在两种渲染变体
+# （纯文本 "S$0.00" / 链接包裹 "<a>$0.00 USD</a>"、price 元素可带前置属性），
+# 故按区块定位后剥内层标签取文本。
+_ACCOUNT_BALANCE_RE = re.compile(
+    r'class="accountRow accountBalance">\s*<div[^>]*class="accountData price"[^>]*>(.*?)</div>',
+    re.DOTALL,
+)
 _ACCOUNT_CURRENCY_RE = re.compile(r"&quot;currency_code&quot;:(\d+),&quot;formatted_amount&quot;:&quot;([^&]+)&quot;")
 _ACCOUNT_STEAMID_RE = re.compile(
     r'steamcommunity\.com/profiles/(\d{17,})/"[^>]*user_avatar'
@@ -103,7 +101,21 @@ _STEAM_COOKIE_KEYS = (
 
 
 class WalletFetchError(RuntimeError):
-    """余额抓取失败（两通道均未返回有效数据）。"""
+    """余额抓取失败（账户页未取到有效数据）。"""
+
+
+class StoreSessionExpiredError(WalletFetchError):
+    """store 会话被服务端衰减：页面被弹回登录页。
+
+    访问令牌（JWT）本身未过期，但 finalize 注册的商店会话数十分钟不用即
+    失效。消费方应强制换发新会话
+    （account_service.ensure_live_session(force=True)）后重试一次。
+    """
+
+
+def is_login_page(resp: httpx.Response) -> bool:
+    """重定向链终点是否落在登录页（store 会话失效的服务端表现）。"""
+    return "/login/" in str(resp.url)
 
 
 class WalletRateLimitedError(WalletFetchError):
@@ -206,73 +218,6 @@ def _from_raw_amounts(
     )
 
 
-async def _fetch_market_wallet(
-    client: httpx.AsyncClient, cookies: dict[str, str]
-) -> WalletInfo | None:
-    """通道一：社区市场页 g_rgWalletInfo。"""
-    resp = await client.get(MARKET_URL, headers=_HEADERS, cookies=cookies)
-    resp.raise_for_status()
-    match = _WALLET_INFO_RE.search(resp.text)
-    if not match:
-        return None
-    try:
-        data = json.loads(match.group(1))
-    except json.JSONDecodeError:
-        return None
-    if data.get("success") != 1 and "wallet_balance" not in data:
-        return None
-    currency_id = int(data.get("wallet_currency") or 0)
-    if currency_id <= 0:
-        return None
-    return _from_raw_amounts(
-        int(data.get("wallet_balance") or 0),
-        int(data.get("wallet_delayed_balance") or 0),
-        currency_id,
-        _normalize_country(data.get("wallet_country")),
-    )
-
-
-async def _fetch_wallet_api(
-    client: httpx.AsyncClient, cookies: dict[str, str]
-) -> WalletInfo | None:
-    """通道二：cart 页 webapi_token → IWalletService/GetWalletDetails。"""
-    resp = await client.get(CART_URL, headers=_HEADERS, cookies=cookies)
-    resp.raise_for_status()
-    # data-store_user_config 为 HTML 转义的 JSON 属性
-    attr = re.search(r'data-store_user_config="([^"]+)"', resp.text)
-    if not attr:
-        return None
-    try:
-        config = json.loads(
-            attr.group(1)
-            .replace("&quot;", '"')
-            .replace("&amp;", "&")
-            .replace("&#x27;", "'")
-        )
-    except json.JSONDecodeError:
-        return None
-    token = (config.get("webapi_token") or "").strip()
-    if not token:
-        return None
-    api_resp = await client.get(
-        WALLET_API_URL, headers=_HEADERS, params={"access_token": token}
-    )
-    if api_resp.status_code != 200:
-        return None
-    data = api_resp.json().get("response", {})
-    currency_id = int(data.get("currency") or 0)
-    if currency_id <= 0:
-        return None
-    return _from_raw_amounts(
-        int(data.get("balance") or 0),
-        int(data.get("delayed_balance") or 0),
-        currency_id,
-        _normalize_country(
-            data.get("country") or data.get("wallet_country") or data.get("country_code")
-        ),
-    )
-
-
 async def _region_from_history(
     client: httpx.AsyncClient, cookies: dict[str, str]
 ) -> str:
@@ -295,15 +240,18 @@ async def _region_from_history(
 async def _fetch_store_account(
     client: httpx.AsyncClient, cookies: dict[str, str]
 ) -> WalletInfo | None:
-    """通道零（最稳）：store 账户页三合一。
+    """登录态商店账户页三合一：余额 + 币种 + 页面归属账户。
 
-    登录态账户页头部渲染 `header_wallet_balance`（带币种符号的余额），
-    页面钱包区块含 `"currency_code":<id>,"formatted_amount":"₹0.00"`。
-    符号与币种 id 双源交叉验证，避免仅凭符号硬映射。
-    未登录页面无余额元素 → 返回 None 交给下一通道。
+    余额渲染在 `div.accountBalance` 的 `div.accountData.price`（带币种符号）；
+    同页 data-store_user_config 内嵌购物车小计含
+    `"currency_code":<id>,"formatted_amount":"S$0.00"`。符号与币种 id
+    双源交叉验证，避免仅凭符号硬映射。
+    未登录页面无余额元素 → 返回 None 交给上层按失败处理。
     """
     resp = await client.get(ACCOUNT_URL, headers=_HEADERS, cookies=cookies)
     resp.raise_for_status()
+    if is_login_page(resp):
+        raise StoreSessionExpiredError("商店账户页把我们送回了登录页")
     text = resp.text
     bal = _ACCOUNT_BALANCE_RE.search(text)
     cur = _ACCOUNT_CURRENCY_RE.search(text)
@@ -316,7 +264,7 @@ async def _fetch_store_account(
     # formatted_amount（如 "₹0.00"）与余额符号须一致，防误配；
     # 页面里符号是 unicode 转义（\u20b9）：latin-1 编码回字节后按
     # unicode_escape 解（直接 encode().decode() 会把 UTF-8 字节当 latin-1 出 mojibake）
-    raw_balance = bal.group(1).strip()
+    raw_balance = re.sub(r"<[^>]+>", "", bal.group(1)).strip()
     amount = _parse_money(raw_balance)
     if amount is None:
         return None
@@ -377,22 +325,22 @@ def _parse_money(text: str) -> float | None:
 async def _try_channels(
     verify_flag: bool, cookies: dict[str, str], proxy_url: str | None = None
 ) -> WalletInfo:
-    """按序跑双通道；verify=False 用于本机自签证书加速器场景。
+    """跑钱包抓取；verify=False 用于本机自签证书加速器场景。
 
-    任一通道命中 429/403 立即上抛 WalletRateLimitedError（不再试余下
-    通道——节点被风控时三通道同命运，连环硬打只会加深印象）。
+    命中 429/403 上抛 WalletRateLimitedError——节点被风控时连环硬打只会
+    加深印象（redeem 域 429 同语义：换节点才有效）。
     """
     errors: list[str] = []
     async with httpx.AsyncClient(
-        timeout=MARKET_TIMEOUT, verify=verify_flag, follow_redirects=True, proxy=proxy_url
+        timeout=FETCH_TIMEOUT, verify=verify_flag, follow_redirects=True, proxy=proxy_url
     ) as client:
-        for channel in (_fetch_store_account, _fetch_market_wallet, _fetch_wallet_api):
+        for channel in (_fetch_store_account,):
             try:
                 info = await channel(client, cookies)
                 if info is not None:
                     return info
-            except UnknownCurrencyError:
-                raise
+            except (UnknownCurrencyError, StoreSessionExpiredError):
+                raise  # 专型错误直穿：币种缺失 / 会话衰减各自有上层处置
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code in (429, 403):
                     raise WalletRateLimitedError(

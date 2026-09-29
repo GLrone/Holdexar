@@ -337,6 +337,8 @@ export interface LoginSessionState {
   error: string
   /** awaiting_code 时的验证码来源提示：email = 邮箱验证码，totp = 手机令牌 */
   code_hint: '' | 'email' | 'totp'
+  /** 会话是否具备可输码形态（等待确认态下可切换为输码） */
+  code_available?: boolean
   started_at: string
   updated_at: string
 }

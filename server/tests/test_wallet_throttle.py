@@ -259,8 +259,10 @@ async def test_rate_limit_goes_long_cooldown(db, monkeypatch):
     """429 信号：直接顶格 30min 冷却（不走 2→5→15 递增梯度）。"""
     from app.crawler.utils import get_beijing_time_obj
 
+    from app.domains.account.steam_wallet import WalletRateLimitedError
+
     async def limited_fetch(cookies, *, verify=None, proxy_url=None):
-        raise account_service.WalletRateLimitedError(
+        raise WalletRateLimitedError(
             "Steam 节点风控（HTTP 429，_fetch_store_account）——请切换 Clash 节点或稍后再试"
         )
 
@@ -429,8 +431,10 @@ async def test_breaker_slow_lane_keeps_rate_limit_floor(db, monkeypatch):
     """慢车道内的 429 信号仍按 30min 风控冷却——熔断不削弱风控退避。"""
     from app.crawler.utils import get_beijing_time_obj
 
+    from app.domains.account.steam_wallet import WalletRateLimitedError
+
     async def limited_fetch(cookies, *, verify=None, proxy_url=None):
-        raise account_service.WalletRateLimitedError("Steam 节点风控（HTTP 429）")
+        raise WalletRateLimitedError("Steam 节点风控（HTTP 429）")
 
     monkeypatch.setattr(account_service, "fetch_wallet", limited_fetch)
     await account_service.save_cookies(cookie(A))
