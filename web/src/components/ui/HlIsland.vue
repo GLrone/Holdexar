@@ -20,7 +20,8 @@ import {
 
 /**
  * 灵动岛消息面：顶部悬浮的独立胶囊，四态就地撑开与收拢。
- *   idle     —— 价格更新状态，点击展开看结论与数据有多旧
+ *   idle     —— 价格更新结论，仅在数据已旧时占岛；无消息无任务且数据新鲜时
+ *               整枚收回，不占常驻位
  *   notice   —— 单行消息，宽度随文案伸缩
  *   task     —— 进行中项（消息 / 全局注册任务 / 爬取任务），带定量/滑动进度条
  *   expanded —— 详情与动作；无消息无任务时展开的是价格状态面
@@ -48,6 +49,7 @@ const {
   color: priceColor,
   tip: priceTip,
   detail: priceDetail,
+  stale: priceStale,
 } = usePriceStatus()
 
 const TONE_ICON: Record<IslandTone, string> = {
@@ -123,6 +125,9 @@ const mode = computed<'idle' | 'notice' | 'task' | 'expanded'>(() => {
 
 /** 没有消息也没有任务：岛上承载的是价格更新结论（空闲态与它的展开面共用） */
 const showingPrice = computed(() => !current.value && !taskActive.value && !activeTask.value)
+
+/** 收回判据：有消息、有任务或数据已旧才显示岛体；无消息无任务且数据新鲜时整枚离场 */
+const visible = computed(() => mode.value !== 'idle' || priceStale.value)
 
 /** 任务态文案：进行中消息优先，其次注册任务，最后爬取任务 */
 const taskText = computed(() => {
@@ -351,19 +356,21 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocDown))
 </script>
 
 <template>
-  <div
-    ref="rootEl"
-    class="hl-island"
-    :class="[`hl-island--${mode}`, { 'is-stacked': headStacked }]"
-    :style="islandStyle"
-    role="status"
-    aria-live="polite"
-    :aria-label="t('island.label')"
-    :title="mode === 'idle' ? priceTip || undefined : undefined"
-    @mouseenter="setHovered(true)"
-    @mouseleave="setHovered(false)"
-    @click="onIslandClick"
-  >
+  <Transition name="island-retract">
+    <div
+      v-if="visible"
+      ref="rootEl"
+      class="hl-island"
+      :class="[`hl-island--${mode}`, { 'is-stacked': headStacked }]"
+      :style="islandStyle"
+      role="status"
+      aria-live="polite"
+      :aria-label="t('island.label')"
+      :title="mode === 'idle' ? priceTip || undefined : undefined"
+      @mouseenter="setHovered(true)"
+      @mouseleave="setHovered(false)"
+      @click="onIslandClick"
+    >
     <div class="hl-island__body">
       <!-- 头部行：四态共用一组元素，展开只换布局，不换实例 -->
       <div class="hl-island__row">
@@ -462,7 +469,8 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocDown))
         <i v-for="n in deckDepth" :key="n" />
       </span>
     </Transition>
-  </div>
+    </div>
+  </Transition>
 </template>
 
 <style scoped>
@@ -856,6 +864,20 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocDown))
 .island-deck-enter-from,
 .island-deck-leave-to {
   opacity: 0;
+}
+
+/* 收回与浮出：无消息且数据新鲜时整枚离场；位移 + 透明度，居中位移全程保留 */
+.island-retract-enter-active,
+.island-retract-leave-active {
+  transition:
+    opacity calc(var(--duration-4) * var(--motion-scale)) var(--ease-out),
+    transform calc(var(--duration-4) * var(--motion-scale)) var(--ease-island);
+}
+
+.island-retract-enter-from,
+.island-retract-leave-to {
+  opacity: 0;
+  transform: translateX(-50%) translateY(-12px);
 }
 
 /* 循环与一次性入场动画按动效红线显式关停：--motion-scale 只作用于 transition */
