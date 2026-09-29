@@ -36,13 +36,19 @@ const crawl: Partial<Record<MessageKey, string>> = {
   'crawl.start.running': 'Running…',
   'crawl.start.invalidAppids': 'Enter valid AppIDs (comma-separated)',
   'crawl.start.started': 'Job #{id} started ({count} targets)',
+  'crawl.start.repair': 'Retry failed regions now',
+  'crawl.start.repairTip':
+    "Skip the automatic retry cycle and re-fetch the regions that failed in recent updates right away; batches that fail again stay in the ledger for the next automatic round",
+  'crawl.start.repairStarted': 'Retry job #{id} started ({count} region batches)',
   'crawl.stop.button': 'Stop',
   'crawl.stop.requested': 'Stop requested',
   'crawl.stop.none': 'No job is running',
   'crawl.jobs.refresh': 'Refresh job history',
 
-  /* Live progress (SSE) */
-  'crawl.progress.meta': 'Done {done} · OK {ok} · Failed {fail} · Queued {qsize} · {speed} t/s',
+  /* Live progress (SSE). done/total counts batches (1 batch = 1 region × ≤400 apps);
+     speed is shown per minute */
+  'crawl.progress.meta':
+    'Done {done}/{total} · OK {ok} · Failed {fail} · Queued {qsize} · {speed} batches/min',
 
   /* Auto price chain */
   'crawl.autoPrice.label': 'Auto price updates',

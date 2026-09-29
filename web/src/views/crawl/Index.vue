@@ -317,6 +317,19 @@ async function stop() {
   }
 }
 
+/** 立即补抓失败地区：跳过自动补抓的冷却与空闲档，把账本里已过期的
+    失败批次按区批量重抓一轮；本轮仍失败的批次照常记账，留待下一轮 */
+async function repairNow() {
+  try {
+    const res = await crawlApi.run('appids', undefined, 'repair', 0)
+    message.success(t('crawl.start.repairStarted', { id: res.id, count: res.count }))
+    crawl.running = true
+    await loadJobs()
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+  }
+}
+
 const statusLabel = (status: string) =>
   (
     {
@@ -516,6 +529,16 @@ onMounted(() => {
           <HlIcon name="pause" />
           {{ t('crawl.stop.button') }}
         </HlButton>
+        <HlButton
+          art="outline"
+          size="sm"
+          :disabled="crawl.running"
+          :title="t('crawl.start.repairTip')"
+          @click="repairNow"
+        >
+          <HlIcon name="download" />
+          {{ t('crawl.start.repair') }}
+        </HlButton>
         <HlButton variant="default" :title="t('crawl.jobs.refresh')" @click="loadJobs">
           <HlIcon name="refresh" />
         </HlButton>
@@ -532,10 +555,11 @@ onMounted(() => {
           {{
             t('crawl.progress.meta', {
               done: crawl.done,
+              total: crawl.total,
               ok: crawl.ok,
               fail: crawl.fail,
               qsize: crawl.qsize,
-              speed: crawl.speed,
+              speed: (crawl.speed * 60).toFixed(1),
             })
           }}
         </div>
