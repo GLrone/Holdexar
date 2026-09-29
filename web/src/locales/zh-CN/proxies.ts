@@ -23,6 +23,7 @@ const proxies = {
   'proxies.section.clash': 'Clash 接入',
   'proxies.section.nodes': '代理节点列表',
   'proxies.section.console': '走线控制台',
+  'proxies.section.jobruns': '作业台账',
 
   /* Hero */
   'proxies.hero.title': '代理 IP 池管理',
@@ -201,6 +202,22 @@ const proxies = {
   /* 走线控制台 */
   'proxies.console.count': '{n} 条',
   'proxies.console.empty': '暂无走线记录',
+
+  /* 作业台账（维护面板）：每次真实出网作业一行，含任务记录不收录的捆绑包直调 */
+  'proxies.jobruns.title': '作业台账',
+  'proxies.jobruns.today': '今日 {n} 次',
+  'proxies.jobruns.refresh': '刷新台账',
+  'proxies.jobruns.empty': '暂无作业记录',
+  'proxies.jobruns.tasks': '任务',
+  'proxies.jobruns.okShort': '成功',
+  'proxies.jobruns.errShort': '失败',
+  'proxies.jobruns.noExits': '该次作业没有出口明细',
+  'proxies.jobruns.exitLine': '{ok}/{total} 成功 · 连接失败 {conn} · 超时 {to}',
+  'proxies.jobruns.status.running': '进行中',
+  'proxies.jobruns.status.success': '成功',
+  'proxies.jobruns.status.partial': '部分成功',
+  'proxies.jobruns.status.failed': '失败',
+  'proxies.jobruns.status.interrupted': '已中断',
 
   /* 动作与弹窗（本模块内复用；与 common 无同值项） */
   'proxies.action.delete': '删除',

@@ -5,9 +5,12 @@ import { ElMessageBox } from 'element-plus'
 
 import {
   proxiesApi,
+  proxypoolApi,
   type ClashNodeTestItem,
   type ClashStatus,
   type ProxyItem,
+  type ProxyJobRunsPayload,
+  type ProxyRunExitRow,
   type ProxyStrategy,
   type ProxySubscriptionItem,
 } from '@/api/client'
@@ -74,7 +77,7 @@ const runningSubId = computed(() => {
 })
 
 /** 选中即切换：内核在跑 → 热重载切到所选订阅（气泡提示，内核进程不动）；
- *  内核没跑 → 只记录选择，「启动」会直接用它。 */
+ *  内核没跑 → 点选落库（跨页面与重启保留），「启动」会直接用它。 */
 async function onClashSubChange(sub: ProxySubscriptionItem) {
   if (!clash.value?.running) {
     try {
@@ -678,6 +681,7 @@ watch(
 onMounted(async () => {
   await load()
   void refreshTrafficQuiet() // 实时流量：进页即静默刷新（不阻塞首屏渲染）
+  void loadJobRuns() // 作业台账：进页即拉（不阻塞首屏渲染）
   // 进页恢复检测会话：进行中则续上轮询与灵动岛任务位（离开页面检测照常推进），
   // 最近一次结果直接展示；无会话（idle/请求失败）不显示面板
   void proxyTasks.attach()
@@ -685,6 +689,61 @@ onMounted(async () => {
   await proxyTasks.attachKernel()
   if (kernelDownloading.value) kernelDialog.value = true
 })
+
+/* ── 作业台账（proxy_job_runs）：每次真实出网作业一行，含捆绑包直调等
+   任务记录里没有的行；行点击展开该次的出口 × 端点聚合——排障看失败
+   集中在哪条出口 ── */
+const jobRuns = ref<ProxyJobRunsPayload | null>(null)
+const jobRunsLoading = ref(false)
+const expandedRunId = ref<number | null>(null)
+const runExits = ref<Record<number, ProxyRunExitRow[]>>({})
+
+/* 状态只渲染不推导：key 存模块常量，译文渲染期取（与后端 STATUS_* 一一对应） */
+const JOB_RUN_STATUS_KEYS: Record<string, string> = {
+  running: 'proxies.jobruns.status.running',
+  success: 'proxies.jobruns.status.success',
+  partial: 'proxies.jobruns.status.partial',
+  failed: 'proxies.jobruns.status.failed',
+  interrupted: 'proxies.jobruns.status.interrupted',
+}
+
+function jobRunStatusLabel(status: string): string {
+  const key = JOB_RUN_STATUS_KEYS[status]
+  return key ? t(key as MessageKey) : status
+}
+
+async function loadJobRuns() {
+  jobRunsLoading.value = true
+  try {
+    jobRuns.value = await proxypoolApi.jobRuns(30)
+  } catch {
+    /* 读不到台账不拦页面其余部分 */
+  } finally {
+    jobRunsLoading.value = false
+  }
+}
+
+async function toggleRun(id: number) {
+  if (expandedRunId.value === id) {
+    expandedRunId.value = null
+    return
+  }
+  expandedRunId.value = id
+  if (!runExits.value[id]) {
+    try {
+      const detail = await proxypoolApi.jobRun(id)
+      runExits.value = { ...runExits.value, [id]: detail.exits }
+    } catch {
+      runExits.value = { ...runExits.value, [id]: [] }
+    }
+  }
+}
+
+function jobRunDuration(ms: number | null): string {
+  if (ms == null) return '—'
+  const s = Math.round(ms / 1000)
+  return s < 90 ? `${s}s` : `${Math.floor(s / 60)}m${s % 60}s`
+}
 </script>
 
 <template>
@@ -1162,6 +1221,61 @@ onMounted(async () => {
           <span class="m">{{ e.error ?? `${e.durationMs ?? '—'}ms` }}</span>
         </div>
         <div v-if="!events.length" class="proxyx-console-line">{{ t('proxies.console.empty') }}</div>
+      </div>
+    </div>
+
+    <!-- 作业台账：每次真实出网作业一行（含捆绑包直调等任务记录里没有的行），
+         行点击展开出口 × 端点聚合——排障看失败集中在哪条出口 -->
+    <div class="proxyx-section" data-section="proxies.section.jobruns">
+      <div class="proxyx-section-header">
+        <div class="proxyx-section-title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+            <path d="M3 3v18h18" />
+            <path d="M7 15l4-6 4 3 5-8" />
+          </svg>
+          <span>{{ t('proxies.jobruns.title') }}</span>
+        </div>
+        <div class="proxyx-section-actions">
+          <span v-if="jobRuns" class="tag">{{ t('proxies.jobruns.today', { n: jobRuns.summary.runs }) }}</span>
+          <HlButton variant="default" size="sm" :title="t('proxies.jobruns.refresh')" @click="loadJobRuns">
+            <HlIcon name="refresh" />
+          </HlButton>
+        </div>
+      </div>
+      <div class="proxyx-console">
+        <div v-for="r in jobRuns?.items ?? []" :key="r.id" class="jr-item">
+          <HlButton variant="text" class="jr-row" @click="toggleRun(r.id)">
+            <span class="t">{{ r.startedAt?.slice(5, 16).replace('T', ' ') }}</span>
+            <span class="k" :class="`is-${r.status}`">{{ jobRunStatusLabel(r.status) }}</span>
+            <span class="p">{{ r.kind }} · {{ r.workers ?? '—' }}w</span>
+            <span class="m">
+              {{ r.taskCount ?? '—' }} {{ t('proxies.jobruns.tasks') }} ·
+              {{ t('proxies.jobruns.okShort') }} {{ r.successCount ?? '—' }} ·
+              {{ t('proxies.jobruns.errShort') }} {{ r.errorCount ?? '—' }} ·
+              {{ jobRunDuration(r.durationMs) }}
+            </span>
+          </HlButton>
+          <div v-if="expandedRunId === r.id" class="jr-exits">
+            <div
+              v-for="e in runExits[r.id] ?? []"
+              :key="e.exitIp + e.endpoint"
+              class="proxyx-console-line"
+              :class="{ err: e.connectError + e.timeout + e.e429 + e.e4xx + e.e5xx > e.success }"
+            >
+              <span class="t">{{ e.exitIp }}</span>
+              <span class="k">{{ e.endpoint }}</span>
+              <span class="m">
+                {{ t('proxies.jobruns.exitLine', { ok: e.success, total: e.requests, conn: e.connectError, to: e.timeout }) }}
+              </span>
+            </div>
+            <div v-if="!(runExits[r.id] ?? []).length" class="proxyx-console-line">
+              {{ t('proxies.jobruns.noExits') }}
+            </div>
+          </div>
+        </div>
+        <div v-if="!jobRunsLoading && !(jobRuns?.items ?? []).length" class="proxyx-console-line">
+          {{ t('proxies.jobruns.empty') }}
+        </div>
       </div>
     </div>
 
@@ -1783,6 +1897,50 @@ onMounted(async () => {
 
 .proxyx-console-line.err .m {
   color: var(--danger);
+}
+
+/* 作业台账：行可点击展开出口聚合 */
+.jr-item {
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.jr-item:last-child {
+  border-bottom: none;
+}
+
+.jr-row {
+  display: flex;
+  gap: 12px;
+  width: 100%;
+  padding: 3px 0;
+  white-space: nowrap;
+  text-align: left;
+}
+
+.jr-row .k {
+  font-weight: 600;
+}
+
+.jr-row .k.is-success {
+  color: var(--success);
+}
+
+.jr-row .k.is-partial,
+.jr-row .k.is-interrupted {
+  color: var(--warning);
+}
+
+.jr-row .k.is-failed {
+  color: var(--danger);
+}
+
+.jr-row .k.is-running {
+  color: var(--accent);
+}
+
+.jr-exits {
+  padding: 2px 0 6px 10px;
+  border-top: 1px dashed var(--border-soft);
 }
 
 .proxyx-console-line .t {

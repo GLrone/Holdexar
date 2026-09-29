@@ -81,6 +81,13 @@ async def _load_index(
     运行名索引服务「体检直接读池内核配置」的形态——那时体检拿到的名字已经是
     runtime_name，按来源名匹配不到。
     """
+    # by_runtime 覆盖**全部身份行**：来源关联缺失的节点（订阅抓取失败、来源关联
+    # 丢过一拍）仍必须能被体检结论按运行名命中，否则手动体检证明健康的节点永远
+    # 进不了池——身份行的可见性不能挂在「有没有来源关联」上。
+    by_runtime: dict[str, ProxyNode] = {
+        str(node.runtime_name): node
+        for node in (await session.execute(select(ProxyNode))).scalars()
+    }
     rows = (
         await session.execute(
             select(ProxyNodeSource, ProxyNode).join(
@@ -89,10 +96,8 @@ async def _load_index(
         )
     ).all()
     by_source: dict[tuple[int, str], ProxyNode] = {}
-    by_runtime: dict[str, ProxyNode] = {}
     for source, node in rows:
         by_source[(int(source.subscription_id), str(source.original_name))] = node
-        by_runtime[str(node.runtime_name)] = node
     return by_source, by_runtime
 
 
@@ -102,9 +107,19 @@ def _match(
     subscription_id: int,
     name: str,
 ) -> ProxyNode | None:
-    """把体检结果里的一个节点名定位到池账本行；定位不到返回 None。"""
+    """把体检结果里的一个节点名定位到池账本行；定位不到返回 None。
+
+    名称有两套口径，必须都试：体检给的是**订阅原名**，池账本的 runtime_name
+    形如「订阅id|原名」。只按来源名匹配，会让「来源关联缺失但身份行在」或
+    「体检内核报的是运行名」的结论全部落空——手动体检出健康节点却进不了池。
+    """
+    sub = int(subscription_id)
     for key in _name_keys(name):
-        node = by_source.get((int(subscription_id), key))
+        node = by_source.get((sub, key))
+        if node is not None:
+            return node
+    for key in _name_keys(name):
+        node = by_runtime.get(f"{sub}|{key}")
         if node is not None:
             return node
     node = by_runtime.get(name)

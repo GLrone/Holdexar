@@ -15,6 +15,7 @@ const proxies: Partial<Record<MessageKey, string>> = {
   'proxies.section.clash': 'Clash setup',
   'proxies.section.nodes': 'Proxy nodes',
   'proxies.section.console': 'Routing console',
+  'proxies.section.jobruns': 'Job runs',
 
   /* Hero */
   'proxies.hero.title': 'Proxy IP pool',
@@ -144,7 +145,7 @@ const proxies: Partial<Record<MessageKey, string>> = {
   'proxies.sub.emptyClash': 'No Clash subscription yet — add one below; it is kept locally and pulled on start',
   'proxies.sub.allDeprecated': 'All subscriptions are deprecated (over 95% of nodes unusable) — the backend has stopped using them; delete or replace them manually',
   'proxies.sub.clashPlaceholder': 'Add a Clash subscription link (https://… airport subscription, stored locally only)',
-  'proxies.sub.poolHint': 'All subscription nodes feed the crawl exit pool automatically — no per-subscription picking; the single select is for kernel start and manual switching',
+  'proxies.sub.poolHint': 'Usable nodes from all subscriptions feed the crawl exit pool automatically — no per-subscription picking; the selection is only for starting or manually switching the kernel',
   'proxies.sub.failTitle': 'Could not save subscription',
   'proxies.sub.failTip': 'Turn on a proxy first (e.g. Clash Verge on your desktop, or this app\'s Clash kernel), then click Retry to save the subscription again',
 
@@ -194,7 +195,23 @@ const proxies: Partial<Record<MessageKey, string>> = {
   'proxies.console.count': '{n} entries',
   'proxies.console.empty': 'No routing records yet',
 
-  /* Actions and dialogs (module-local; nothing shares a value with common) */
+    /* Job runs (maintenance panel): one row per real outbound job, incl. direct-call runs not covered by job records */
+  'proxies.jobruns.title': 'Job runs',
+  'proxies.jobruns.today': '{n} today',
+  'proxies.jobruns.refresh': 'Refresh job runs',
+  'proxies.jobruns.empty': 'No job runs yet',
+  'proxies.jobruns.tasks': 'tasks',
+  'proxies.jobruns.okShort': 'OK',
+  'proxies.jobruns.errShort': 'failed',
+  'proxies.jobruns.noExits': 'No exit details for this run',
+  'proxies.jobruns.exitLine': '{ok}/{total} ok · connect errors {conn} · timeouts {to}',
+  'proxies.jobruns.status.running': 'Running',
+  'proxies.jobruns.status.success': 'Success',
+  'proxies.jobruns.status.partial': 'Partial',
+  'proxies.jobruns.status.failed': 'Failed',
+  'proxies.jobruns.status.interrupted': 'Interrupted',
+
+/* Actions and dialogs (module-local; nothing shares a value with common) */
   'proxies.action.delete': 'Delete',
   'proxies.dialog.confirm': 'Confirm',
 }

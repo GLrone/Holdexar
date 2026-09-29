@@ -395,3 +395,65 @@ async def test_sync_records_failure_without_crashing(tmp_data_dir, monkeypatch):
         n_nodes = await s.scalar(select(func.count()).select_from(ProxyNode))
         n_src = await s.scalar(select(func.count()).select_from(ProxyNodeSource))
     assert (n_nodes, n_src) == (1, 1), "失败条目不得留下半截写入，成功条目要落库"
+
+
+# ─── 订阅下载并发：一条慢/失效订阅不得拖住其余 ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_sync_subscriptions_downloads_concurrently(tmp_data_dir, monkeypatch):
+    """订阅下载并发进行：串行会被任意一条慢/失效订阅拖住，后面的只能干等。
+
+    失效订阅要逐通道试满超时，串行下整轮耗时等于各条之和。
+    """
+    await init_db()
+    await _add_subscription("https://a.invalid/1")
+    await _add_subscription("https://b.invalid/2")
+    await _add_subscription("https://c.invalid/3")
+
+    live = 0
+    peak = 0
+
+    async def fake_fetch(url, channels, **kwargs):
+        nonlocal live, peak
+        live += 1
+        peak = max(peak, live)
+        try:
+            await asyncio.sleep(0.05)
+            return _fetch_ok([_node(f"n-{url[-1]}", "10.0.0.1")])
+        finally:
+            live -= 1
+
+    monkeypatch.setattr(bs, "fetch_subscription", fake_fetch)
+
+    async with get_session_factory()() as s:
+        sync = await bs.sync_subscriptions(s, data_dir=tmp_data_dir, now=NOW)
+        await s.commit()
+
+    assert sync.subscription_count == 3
+    assert peak >= 2, f"订阅下载没有并发（峰值 {peak}）"
+
+
+@pytest.mark.asyncio
+async def test_sync_subscriptions_one_failure_does_not_block_others(
+    tmp_data_dir, monkeypatch,
+):
+    """一条订阅抓取失败不阻断其余订阅：逐条独立记账，其余照常落快照。"""
+    await init_db()
+    await _add_subscription("https://ok1.invalid/1")
+    await _add_subscription("https://bad.invalid/2")
+    await _add_subscription("https://ok2.invalid/3")
+
+    async def fake_fetch(url, channels, **kwargs):
+        if "bad" in url:
+            raise RuntimeError("Client error '404 Not Found'")
+        return _fetch_ok([_node(f"n{url[-1]}", "10.0.0.1")])
+
+    monkeypatch.setattr(bs, "fetch_subscription", fake_fetch)
+
+    async with get_session_factory()() as s:
+        sync = await bs.sync_subscriptions(s, data_dir=tmp_data_dir, now=NOW)
+        await s.commit()
+
+    assert len(sync.failures) == 1, "只有失败那条被记账"
+    assert len(sync.snapshot_sha256) == 2, "其余两条照常落快照"
