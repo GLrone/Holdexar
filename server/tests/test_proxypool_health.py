@@ -475,16 +475,13 @@ async def test_probe_result_drives_state(tmp_data_dir, kernel_exe_path,
     base, secret = await _start_kernel(clash_runtime, kernel_exe_path, tmp_data_dir)
     await _health(tmp_data_dir, base, secret, probe_target)
 
-    assert await _state_of("1|新可用") == NODE_ACTIVE
-    assert await _state_of("1|新不可用") == NODE_DEAD
-    assert await _state_of("1|活不可用") == NODE_DEAD
-    assert await _state_of("1|旧可用") == NODE_ACTIVE
-    assert await _state_of("1|旧可用但无来源") == NODE_STALE, (
-        "无来源的 STALE 即使探测成功也不该被提升为 ACTIVE——它已经没有任何订阅在提供"
-    )
-    assert await _state_of("1|已退休") == NODE_RETIRED, (
-        "RETIRED 不参与本阶段：它不在池里、不会被探测，也就不会被一次成功自动复活"
-    )
+    # L0 已降级为纯记录：传输可达性不再推进状态，生死归 L2 业务探测
+    assert await _state_of("1|新可用") == NODE_NEW
+    assert await _state_of("1|新不可用") == NODE_NEW
+    assert await _state_of("1|活不可用") == NODE_ACTIVE
+    assert await _state_of("1|旧可用") == NODE_STALE
+    assert await _state_of("1|旧可用但无来源") == NODE_STALE
+    assert await _state_of("1|已退休") == NODE_RETIRED
 
 
 # ══ P1.4-B：L1 出口 IP ═══════════════════════════════════════════

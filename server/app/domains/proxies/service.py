@@ -1673,7 +1673,7 @@ async def _test_clash_nodes_impl(
             return 99
 
         groups.sort(key=_group_score)
-        selector = groups[0]["name"] if groups else "GLOBAL"
+        selector = (str(groups[0].get("name") or "") or "GLOBAL") if groups else "GLOBAL"
 
         # 会话进入 running：总量/待测量/冷却跳过数一次落定，之后探测逐节点追加
         _clash_test_session_update(
@@ -1720,13 +1720,31 @@ async def _test_clash_nodes_impl(
         try:
             from app.core.database import get_session_factory
             from app.domains.proxypool.bridge import ingest_ledger, ingest_node_check
+            from app.domains.proxypool.models import HealthRun
             from app.domains.proxypool.scheduling import request_rebuild
 
             async with get_session_factory()() as session:
+                # 手动体检的运行台账：独立计时 + 节点级汇总（前端「本次体检耗时」
+                # 的唯一事实源），逐节点观测经 run_id 归属
+                run = HealthRun(
+                    channel="manual", subscription_id=sub_id,
+                    started_at=now, total=len(results),
+                    steam_ok=sum(1 for r in results if r.get("alive")),
+                    failed=sum(1 for r in results if not r.get("alive")),
+                    ip_known=len({r["exitIp"] for r in results
+                                  if r.get("alive") and r.get("exitIp")}),
+                )
+                session.add(run)
+                await session.flush()
                 fresh = await ingest_node_check(
-                    session, subscription_id=sub_id, results=results, now=now
+                    session, subscription_id=sub_id, results=results, now=now,
+                    run_id=run.id,
                 )
                 ledger_hit = await ingest_ledger(session, now=now)
+                run.finished_at = datetime.now()
+                run.duration_ms = int(
+                    (run.finished_at - run.started_at).total_seconds() * 1000
+                )
                 await session.commit()
             if fresh.changed or ledger_hit.changed:
                 request_rebuild()

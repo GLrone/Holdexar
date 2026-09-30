@@ -17,6 +17,62 @@ from app.domains.proxypool.models import ProxyRunExit
 logger = logging.getLogger(__name__)
 
 
+async def _writeback_production_evidence(
+    session: AsyncSession,
+    rows: list[dict],
+    mapping: dict[str, str],
+    now: datetime | None,
+) -> None:
+    """生产结果回写节点健康账本（统一账本的第三条写入通道）。
+
+    「能不能访问 Steam」= 经该出口是否拿到 Steam 的任何响应：success>0 或
+    e429/e5xx>0 都算传输成功（429/5xx 是 Steam 侧响应，不罚节点）；整行零响应
+    且全是超时/连不上才是节点失败证据（fail-fast 判死，可被下一轮成功复活）。
+    """
+    from sqlalchemy import select
+
+    from app.domains.proxypool.models import ProxyNode, ProxyNodeSource
+    from app.domains.proxypool.state import evaluate_node_state
+
+    by_node: dict[str, dict] = {}
+    for row in rows:
+        node_id = mapping.get(str(row.get("exit_ip") or ""))
+        if not node_id:
+            continue
+        agg = by_node.setdefault(node_id, {"ok": 0, "noresp": 0})
+        ok = int(row.get("success") or 0) + int(row.get("e429") or 0)             + int(row.get("e5xx") or 0)
+        if ok > 0:
+            agg["ok"] += 1
+        elif int(row.get("timeout") or 0) + int(row.get("connect_error") or 0) > 0:
+            agg["noresp"] += 1
+    if not by_node:
+        return
+    node_rows = (await session.execute(
+        select(ProxyNode).where(ProxyNode.node_id.in_(by_node))
+    )).scalars().all()
+    sourced = set((await session.execute(
+        select(ProxyNodeSource.node_id).where(ProxyNodeSource.node_id.in_(by_node))
+    )).scalars().all())
+    stamp = now or datetime.now()
+    for node in node_rows:
+        agg = by_node[node.node_id]
+        if agg["ok"] > 0:
+            node.consecutive_failures = 0
+            node.state = evaluate_node_state(
+                node.state, source_seen=node.node_id in sourced,
+                probe_ok=True, consecutive_failures=0,
+            )
+            node.last_l2_at = stamp
+        elif agg["noresp"] > 0:
+            failures = (node.consecutive_failures or 0) + 1
+            node.consecutive_failures = failures
+            node.state = evaluate_node_state(
+                node.state, source_seen=node.node_id in sourced,
+                probe_ok=False, consecutive_failures=failures,
+            )
+            node.last_l2_at = stamp
+
+
 async def record_run_exits(
     session: AsyncSession,
     *,
@@ -32,6 +88,7 @@ async def record_run_exits(
     if not run_id or not rows:
         return 0
     mapping = node_by_exit or {}
+    await _writeback_production_evidence(session, rows, mapping, now)
     for row in rows:
         exit_ip = str(row.get("exit_ip") or "")
         session.add(ProxyRunExit(

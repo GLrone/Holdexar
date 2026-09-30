@@ -43,6 +43,7 @@ LEDGER_FRESH_HOURS = 72
 
 # 观测明细标签（HealthObservation.detail 是固定枚举，不放自由文本）
 CLASH_STEAM_OK_DETAIL = "CLASH_STEAM_OK"
+CLASH_STEAM_FAIL_DETAIL = "CLASH_STEAM_FAIL"
 CLASH_EXIT_IP_DETAIL = "CLASH_EXIT_IP"
 
 
@@ -165,6 +166,8 @@ def _write_observations(
     exit_ip: str | None,
     latency_ms: int | None,
     now: datetime,
+    run_id: int | None = None,
+    channel: str = "manual",
 ) -> None:
     """成功的体检落两条观测：L2 真实业务 +（有出口 IP 时）L1 出口身份。"""
     session.add(
@@ -175,6 +178,8 @@ def _write_observations(
             latency_ms=latency_ms if isinstance(latency_ms, int) else None,
             detail=CLASH_STEAM_OK_DETAIL,
             observed_at=now,
+            run_id=run_id,
+            channel=channel,
         )
     )
     if exit_ip:
@@ -186,8 +191,25 @@ def _write_observations(
                 latency_ms=None,
                 detail=CLASH_EXIT_IP_DETAIL,
                 observed_at=now,
+                run_id=run_id,
+                channel=channel,
             )
         )
+
+
+def _apply_steam_failure(node: ProxyNode, *, now: datetime) -> bool:
+    """一次 Steam 业务失败证据：失败计数 +1，状态机按 fail-fast 判死
+    （回 ACTIVE 靠恢复轮或下一轮成功证据——失败不写墓碑）。"""
+    failures = (node.consecutive_failures or 0) + 1
+    node.consecutive_failures = failures
+    target = evaluate_node_state(
+        node.state, source_seen=True, probe_ok=False,
+        consecutive_failures=failures,
+    )
+    changed = target != node.state
+    node.state = target
+    node.last_l2_at = now
+    return changed
 
 
 async def ingest_node_check(
@@ -196,20 +218,21 @@ async def ingest_node_check(
     subscription_id: int,
     results: list[dict],
     now: datetime,
+    run_id: int | None = None,
+    channel: str = "manual",
 ) -> IngestionResult:
-    """把一轮体检的存活节点对齐进池账本。
+    """把一轮体检结果对齐进池账本。
 
     results 是 test_clash_nodes 的逐节点结果（含 name / alive / exitIp / ms）。
-    只处理存活节点——失败不在这里降级，池内 L0/L2 自有状态机；体检的价值是
-    「证明它现在能服务生产流量」。
+    存活节点按成功证据推进（复活 + 出口 IP 落账）；失败节点是**同一把
+    Steam 判据下的失败证据**——失败计数 +1 并由状态机判死（与 L2 业务探测
+    同一语义，可被下一轮成功或恢复轮复活），不是只记不罚的第二套账。
     """
     by_source, by_runtime = await _load_index(session)
     outcome = IngestionResult()
     code = subscription_code(subscription_id)
 
     for row in results:
-        if not row.get("alive"):
-            continue
         name = str(row.get("name") or "")
         node = _match(by_source, by_runtime, int(subscription_id), name)
         if node is None:
@@ -219,6 +242,23 @@ async def ingest_node_check(
         outcome.matched += 1
         exit_ip = row.get("exitIp")
         latency_ms = row.get("ms")
+        if not row.get("alive"):
+            _apply_steam_failure(node, now=now)
+            session.add(
+                HealthObservation(
+                    node_id=node.node_id,
+                    level=L2_LEVEL,
+                    ok=False,
+                    latency_ms=latency_ms if isinstance(latency_ms, int) else None,
+                    detail=CLASH_STEAM_FAIL_DETAIL,
+                    observed_at=now,
+                    run_id=run_id,
+                    channel=channel,
+                )
+            )
+            row["sourceCode"] = code
+            row["poolState"] = node.state
+            continue
         state_changed, exit_added = _apply_success(
             node, exit_ip=exit_ip, latency_ms=latency_ms, now=now
         )
@@ -228,7 +268,8 @@ async def ingest_node_check(
             outcome.exit_ips_added += 1
         if state_changed or exit_added:
             _write_observations(
-                session, node, exit_ip=exit_ip, latency_ms=latency_ms, now=now
+                session, node, exit_ip=exit_ip, latency_ms=latency_ms, now=now,
+                run_id=run_id, channel=channel,
             )
         row["sourceCode"] = code
         row["poolState"] = node.state

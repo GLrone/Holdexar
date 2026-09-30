@@ -286,6 +286,33 @@ class HealthObservation(Base):
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     detail: Mapped[str | None] = mapped_column(Text)
     observed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    # 归属哪次体检运行（NULL = 不挂 run 的零散观测）；channel 区分写入通道
+    run_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    channel: Mapped[str | None] = mapped_column(String(16))
+    target: Mapped[str | None] = mapped_column(String(500))
+
+
+class HealthRun(Base):
+    """一次体检运行的台账：独立计时与汇总，前端展示的「本次体检耗时/健康数」
+    以此为准，不用任何单节点 latency 冒充整体耗时。
+
+    duration_ms = 本轮真实墙钟耗时；total / steam_ok / ip_known / failed 是本轮
+    节点级结论的汇总快照——逐节点明细在 health_observations（按 run_id 归属）。
+    channel：scheduled（维护周期）/ manual（前端订阅体检）。
+    """
+
+    __tablename__ = "health_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    channel: Mapped[str] = mapped_column(String(16), index=True)
+    subscription_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime)
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    total: Mapped[int] = mapped_column(Integer, default=0)
+    steam_ok: Mapped[int] = mapped_column(Integer, default=0)
+    ip_known: Mapped[int] = mapped_column(Integer, default=0)
+    failed: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class SubscriptionSnapshot(Base):

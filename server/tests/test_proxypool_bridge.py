@@ -216,7 +216,8 @@ async def test_check_matches_runtime_name_and_name_base(env):
 
 @pytest.mark.asyncio
 async def test_check_does_not_demote_on_failure(env):
-    """体检失败不在桥接层降级；池内状态机是唯一降级入口。"""
+    """体检失败是同一把 Steam 判据下的失败证据：计数 +1 并 fail-fast 判死
+    （exit_ip 不擦除，复活靠下一轮成功或恢复轮）。"""
     await init_db()
     await _add_node("n4", NODE_ACTIVE, sub_id=1, name="sub-a", exit_ip="1.1.1.1")
 
@@ -229,10 +230,11 @@ async def test_check_does_not_demote_on_failure(env):
         )
         await s.commit()
 
-    assert outcome.matched == 0
+    assert outcome.matched == 1
     node = await _node("n4")
-    assert node.state == NODE_ACTIVE
-    assert node.exit_ip == "1.1.1.1"
+    assert node.state == NODE_DEAD
+    assert node.consecutive_failures == 1
+    assert node.exit_ip == "1.1.1.1", "失败证据不擦出口事实"
 
 
 @pytest.mark.asyncio
