@@ -35,6 +35,8 @@ import aiohttp
 from sqlalchemy import delete, func, select
 
 from app.core import database as _database
+from app.core.database import WritePriority, get_session_factory
+from app.core.database import write_gate
 from app.crawler import browse_store as bs
 from app.crawler.config import CC_LIST
 from app.domains.games.models import Bundle, BundleRegionPrice, Game
@@ -75,6 +77,10 @@ _CC_CURRENCY.update(
 )
 # 新接口请求参数（语言固定 english：名称与 app 链路同口径，区域价与语言无关）
 BROWSE_LANG = "english"
+
+# 全表刷新的分片数：整表 × 监控区一发约占限流预算 30 分钟以上，切成
+# N 片按小时轮换（每轮链尾只跑一片），N 小时完成一次全表轮换
+_BUNDLE_REFRESH_SHARDS = 3
 BROWSE_TIMEOUT = 20
 
 
@@ -365,7 +371,7 @@ async def _upsert_bundle_rows(
     baseline_appids = baseline.get("app_ids") or []
     if not allow_singleton and len(set(baseline_appids)) < 2:
         # 单品：删净既有主档/区域价（发现桩经链尾刷新抓价后到此甄别）
-        async with get_session_factory()() as db:
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as db:
             await db.execute(
                 delete(BundleRegionPrice).where(
                     BundleRegionPrice.bundle_id == bundle_id)
@@ -387,7 +393,7 @@ async def _upsert_bundle_rows(
     mps_votes = [r.get("mps") for r in regions if r.get("mps") in (0, 1)]
     mps_value = _majority(mps_votes)
 
-    async with get_session_factory()() as db:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as db:
         row = (
             await db.execute(select(Bundle).where(Bundle.bundle_id == bundle_id))
         ).scalar_one_or_none()
@@ -520,6 +526,21 @@ async def refresh_bundles() -> dict:
     pending_ids = {bid for bid, _kind in want if bid not in priced}
 
     now = datetime.utcnow()
+    # 分片轮转：全表 × 监控区整表一发约上千发，占满限流预算 30 分钟以上——
+    # 刷新挂在主轮链尾，跑不完就被下一次重启杀掉，表时间长期停在偶尔跑完的
+    # 那一轮。按 bundle_id 固定取模分片、每小时换一片：每轮只刷一片（约
+    # 1/3 表，限流预算内稳稳跑完）+ 全部无价桩（首抓不随分片等待），
+    # N 片小时数内完成一次全表轮换；bundle_id 取模让新包始终落在固定片，
+    # 不会因表增删漂移而漏刷。
+    shard_count = _BUNDLE_REFRESH_SHARDS
+    shard = int(now.timestamp() // 3600) % shard_count
+    shard_ids = {bid for bid, _ in want if bid % shard_count == shard}
+    want = [w for w in want if w[0] in shard_ids or w[0] in pending_ids]
+    logger.info(
+        "[bundles] 本轮分片 %d/%d：刷新 %d 个包（无价桩 %d 个随轮全刷）",
+        shard + 1, shard_count, len(want), len(pending_ids),
+    )
+
     updated_bundles = 0
     updated_prices = 0
 
