@@ -1050,17 +1050,20 @@ async def _sync_monitoring(appids: list[int], *, exclusion: bool | None = None) 
         logger.exception("监控层同步失败（不影响监控池主链）：%d 项", len(clean))
 
 
-async def ensure_board_pool(appids: list[int]) -> dict:
-    """榜单发现源落池（持久监控）：本轮榜整批并入监控池。
+async def ensure_board_pool(appids: list[int], *, source: str = "board") -> dict:
+    """发现源落池（持久监控）：本轮榜整批并入监控池。
 
-    真身直写监控层（monitor_sources 的 board 来源），不落任何 Steam 账户
-    名下——账户事实与条目数不被榜单批次虚增，也不要求已绑定账户；条目
-    随全池轮刷新，首爬由同批反哺链完成。
+    真身直写监控层（`source` 指定来源），不落任何 Steam 账户名下——账户事实
+    与条目数不被榜单批次虚增，也不要求已绑定账户；条目随全池轮刷新，首爬由
+    同批反哺链完成。
 
-    - 无 board 来源：挂 board 来源入池；
+    source 默认 "board" = Steam 官方榜单落池（scheduler 的榜单 job）。**不同
+    发现源必须传不同的 source**：落池去向、去重、摘除都按 source 记，共用一个
+    标签会让两个来源互相串味，也会污染「按该标签判定」的下游因子。
+
+    - 无该来源：挂该来源入池；
     - 已在池：跳过（不动其它来源）；
-    - 用户移除过的（board 来源已摘除或排除在案）：跳过不复活——重新
-      手动添加才回到池。
+    - 用户移除过的（该来源已摘除或排除在案）：跳过不复活——重新手动添加才回到池。
 
     返回 {added, exists, skipped}。
     """
@@ -1082,13 +1085,13 @@ async def ensure_board_pool(appids: list[int]) -> dict:
 
     added = exists = skipped = 0
     async with get_session_factory()() as session:
-        board_rows = {
+        src_rows = {
             int(r.target_id): bool(r.active)
             for r in (
                 await session.execute(
                     select(MonitorSource.target_id, MonitorSource.active).where(
                         MonitorSource.target_type == "game",
-                        MonitorSource.source == "board",
+                        MonitorSource.source == source,
                         MonitorSource.target_id.in_(clean),
                     )
                 )
@@ -1116,20 +1119,21 @@ async def ensure_board_pool(appids: list[int]) -> dict:
         if states.get(appid) == "active":
             exists += 1
             continue
-        board_active = board_rows.get(appid)
-        if board_active:
+        src_active = src_rows.get(appid)
+        if src_active:
             exists += 1
             continue
-        if board_active is not None:
-            # board 来源已被摘（用户移出 / 业务态脱池）——轮询不复活
+        if src_active is not None:
+            # 该来源已被摘（用户移出 / 业务态脱池）——轮询不复活
             skipped += 1
             continue
-        await monitoring_service.ensure_source("game", appid, "board")
+        await monitoring_service.ensure_source("game", appid, source)
         added += 1
 
     if added or skipped:
         logger.info(
-            "榜单落池：新增 %d / 已在池 %d / 已移除跳过 %d", added, exists, skipped
+            "发现源落池（%s）：新增 %d / 已在池 %d / 已移除跳过 %d",
+            source, added, exists, skipped,
         )
     return {"added": added, "exists": exists, "skipped": skipped}
 

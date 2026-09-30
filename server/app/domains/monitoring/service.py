@@ -49,6 +49,10 @@ SOURCE_PRIORITY: dict[str, int] = {
     "owned": 40,             # 已购同步（wishlist_items.owned）
     "import": 30,            # 捆绑包导入（bundles/refresh.import_bundle）
     "board": 20,             # 榜单发现源落池（ensure_board_pool 直挂）
+    # 外部社区「最受期待」榜落池（admin 侧脚本经 ensure_board_pool(source=...) 推）。
+    # 与 board 同档但**必须是独立来源**：board 只代表 Steam 官方榜单，两者共用
+    # 一个标签会让 Steam 榜单判定（games.steam_board）被外部清单污染。
+    "anticipated": 20,
 }
 DEFAULT_SOURCE_PRIORITY = 10
 
