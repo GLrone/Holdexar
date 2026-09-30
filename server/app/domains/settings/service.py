@@ -19,7 +19,7 @@ from app.crawler.utils import get_beijing_time_obj
 
 # 凭据类设置键：落库即 AES-256-GCM 密文（secretbox 按机器派生密钥），
 # 读取时解密；存量明文由启动加密步骤（seal_secret_values）封装
-SECRET_KEYS = ("account.steam_api_key",)
+SECRET_KEYS = ("account.steam_api_key", "pilot.llm.api_key")
 
 
 def _secret_purpose(key: str) -> str:
