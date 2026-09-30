@@ -6,6 +6,7 @@ import { useAccountStore } from '@/stores/account'
 import { useCrawlStatusStore } from '@/stores/crawlStatus'
 import { useFactNoticesStore } from '@/stores/factNotices'
 import { useLocaleStore } from '@/stores/locale'
+import { usePilotStore } from '@/stores/pilot'
 import { useSettingsStore } from '@/stores/settings'
 import { useThemeStore } from '@/stores/theme'
 import { useTourStore } from '@/stores/tour'
@@ -16,6 +17,7 @@ import { buildRateMap, formatWalletCny, walletToCny, type RateMap } from '@/lib/
 import { walletSyncOk, walletSyncedAt } from '@/lib/walletSync'
 import { APP_NAME } from '@/appInfo'
 import ProductTour from '@/components/ProductTour.vue'
+import HlPilotDrawer from '@/components/business/HlPilotDrawer.vue'
 import UpdateDialog from '@/components/business/UpdateDialog.vue'
 import UpdateEntry from '@/components/business/UpdateEntry.vue'
 import {
@@ -49,6 +51,7 @@ const settingsStore = useSettingsStore()
 const themeStore = useThemeStore()
 const localeStore = useLocaleStore()
 const accountStore = useAccountStore()
+const pilotStore = usePilotStore()
 const updaterStore = useUpdaterStore()
 const { t } = useI18n()
 onMounted(() => {
@@ -353,6 +356,11 @@ async function manualRefreshWallet() {
         <h1 class="app-header__title">{{ pageTitle }}</h1>
 
         <div class="app-header__actions">
+          <!-- 领航员：全局问答入口（找游戏 / 游戏详情也有带上下文的入口） -->
+          <button class="header-pill" :title="t('pilot.title')" @click="pilotStore.openPilot()">
+            {{ t('pilot.title') }}
+          </button>
+
           <!-- 更新提示胶囊：发现新版 / 下载中 / 待重启时才出现，悬停看更新内容、
                点击打开更新报告窗口（下载中改显百分比，弹窗关掉也看得见进度） -->
           <UpdateEntry />
@@ -483,6 +491,9 @@ async function manualRefreshWallet() {
     <!-- 全局更新弹窗（检查/下载/校验/重启全在这里闭环；模糊幕布遮住底层页面）。
          更新模块已从设置页搬出——更新是应用级事务，不该塞在某个页签里。 -->
     <UpdateDialog />
+
+    <!-- 领航台：领航员问答抽屉（全局唯一实例；顶栏 / 找游戏 / 游戏详情三处入口共开） -->
+    <HlPilotDrawer v-model="pilotStore.open" :game="pilotStore.game" />
 
     <!-- 灵动岛消息面：顶部悬浮的独立胶囊，状态 / 消息 / 任务 / 详情四态就地切换。
          全局唯一实例——要跨路由存活，挂页面里的实例会被 router.push 卸载 -->

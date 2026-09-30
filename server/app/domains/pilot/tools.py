@@ -97,25 +97,120 @@ async def search_games(question: str, query: str | None = None) -> list[dict]:
 
 
 async def recommend_games(question: str) -> list[dict]:
-    """推荐意图：问句里解析属性条件（打折 / 好评 / 价格上限 / 《书名号》名称），
-    组合成 list_games 筛选——自然语言整句不能当名称去搜。"""
+    """推荐意图（确定性回退路径）：问句里解析属性条件（打折 / 好评 / 价格
+    上限 / 《书名号》名称），组合成 list_games 筛选——自然语言整句不能当
+    名称去搜。"""
     q = (question or "").strip()
     m = _PRICE_TAG_RE.search(q)
     only_discounted = any(w in q for w in ("打折", "折扣", "特惠", "特卖", "降价"))
     min_rating = 80 if any(w in q for w in ("好评", "口碑", "评价高")) else 0
-    max_price = None
+    max_price_yuan = None
     nm = _PRICE_NUM_RE.search(q)
     if nm and any(w in q for w in ("以内", "以下", "不超过", "块内", "预算")):
-        max_price = int(nm.group(1)) * 100
-    result = await games_service.list_games(
-        sort="default",
-        limit=_FIND_LIMIT,
+        max_price_yuan = float(nm.group(1))
+    return await recommend_games_by_filters(
         q=m.group(1) if m else None,
         only_discounted=only_discounted,
         min_rating=min_rating,
-        max_price=max_price,
+        max_price_yuan=max_price_yuan,
+    )
+
+
+async def recommend_games_by_filters(
+    *,
+    q: str | None = None,
+    only_discounted: bool = False,
+    min_rating: int = 0,
+    max_price_yuan: float | None = None,
+) -> list[dict]:
+    """按结构化条件挑库内游戏（agent 工具与回退路径共用）。"""
+    result = await games_service.list_games(
+        sort="default",
+        limit=_FIND_LIMIT,
+        q=(q or "").strip() or None,
+        only_discounted=only_discounted,
+        min_rating=min_rating,
+        max_price=int(max_price_yuan * 100) if max_price_yuan else None,
     )
     return [_game_item(it) for it in result.get("items", [])]
+
+
+def tool_specs() -> list[dict]:
+    """agent 循环的工具表（OpenAI function 格式）。
+
+    写工具只有加关注 / 设提醒两个单对象可逆动作——白名单即风险门；
+    批量 / 删除 / 停用类操作不设工具，模型无从调用。"""
+    return [
+        {"type": "function", "function": {
+            "name": "search_games",
+            "description": "在用户游戏库内按名称检索游戏，返回候选（含 appid、现价、折扣、好评率）",
+            "parameters": {"type": "object", "properties": {
+                "q": {"type": "string", "description": "游戏名称关键词"},
+            }, "required": ["q"]},
+        }},
+        {"type": "function", "function": {
+            "name": "get_price_briefing",
+            "description": "取某游戏的价格事实：国区现价、历史最低、近一年区间",
+            "parameters": {"type": "object", "properties": {
+                "appid": {"type": "integer", "description": "游戏 AppID"},
+            }, "required": ["appid"]},
+        }},
+        {"type": "function", "function": {
+            "name": "recommend_games",
+            "description": "按条件从用户库内挑游戏，可组合：打折中 / 好评率下限 / 价格上限（元）",
+            "parameters": {"type": "object", "properties": {
+                "only_discounted": {"type": "boolean", "description": "只看打折中的游戏"},
+                "min_rating": {"type": "integer", "description": "好评率下限（0-100）"},
+                "max_price_yuan": {"type": "number", "description": "现价上限（人民币元）"},
+            }},
+        }},
+        {"type": "function", "function": {
+            "name": "add_follow",
+            "description": "把某游戏加入用户关注（持续追踪价格）。仅当用户明确要求关注该游戏时调用",
+            "parameters": {"type": "object", "properties": {
+                "appid": {"type": "integer", "description": "游戏 AppID"},
+            }, "required": ["appid"]},
+        }},
+        {"type": "function", "function": {
+            "name": "create_price_alert",
+            "description": "为中国区创建价格提醒。仅当用户明确要求提醒时调用；用户给出具体价格用 price 类型，用户说史低提醒用 historic_low 类型",
+            "parameters": {"type": "object", "properties": {
+                "appid": {"type": "integer", "description": "游戏 AppID"},
+                "target_type": {"type": "string", "enum": ["price", "historic_low"]},
+                "target_value_yuan": {"type": "number", "description": "price 类必填，人民币元"},
+            }, "required": ["appid", "target_type"]},
+        }},
+    ]
+
+
+async def execute_tool(name: str, arguments: dict, *, guarded: bool = False) -> dict:
+    """工具执行分发。写工具受守卫复核：问句含批量 / 删除 / 停用语义时
+    拒绝执行（返回 kind=denied，由模型向用户解释）。"""
+    if name == "search_games":
+        items = await search_games(str(arguments.get("q") or ""), query=str(arguments.get("q") or ""))
+        return {"kind": "games", "items": items}
+    if name == "get_price_briefing":
+        facts = await price_facts(int(arguments.get("appid") or 0))
+        return facts or {"kind": "empty", "note": "no_data"}
+    if name == "recommend_games":
+        items = await recommend_games_by_filters(
+            only_discounted=bool(arguments.get("only_discounted")),
+            min_rating=int(arguments.get("min_rating") or 0),
+            max_price_yuan=arguments.get("max_price_yuan"),
+        )
+        return {"kind": "games", "items": items}
+    if name == "add_follow":
+        if guarded:
+            return {"kind": "denied", "note": "guarded"}
+        return await monitor_add(int(arguments.get("appid") or 0))
+    if name == "create_price_alert":
+        if guarded:
+            return {"kind": "denied", "note": "guarded"}
+        ttype = arguments.get("target_type") or "price"
+        yuan = arguments.get("target_value_yuan")
+        fen = int(float(yuan) * 100) if yuan is not None else None
+        return await alert_add(int(arguments.get("appid") or 0), target_type=ttype, target_value_fen=fen)
+    return {"kind": "unknown_tool"}
 
 
 def extract_title(question: str) -> str | None:

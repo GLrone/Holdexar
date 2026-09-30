@@ -246,6 +246,12 @@ export interface PilotConfigPayload {
   usage_month: number
 }
 
+/** 领航员入口的游戏上下文（游戏详情页进入时携带） */
+export interface PilotGameContext {
+  appid: number
+  name: string
+}
+
 /** 事实摘要（cnyFen 单位为分）：kind=price 单游戏价格事实 / kind=games 候选列表 */
 export interface PilotPriceFacts {
   kind: 'price'
@@ -310,8 +316,10 @@ export const pilotApi = {
 }
 
 export interface PilotStreamEvent {
-  type: 'thinking' | 'answer' | 'facts' | 'done' | 'error'
+  type: 'thinking' | 'answer' | 'tool' | 'facts' | 'done' | 'error'
   delta?: string
+  name?: string
+  summary?: string
   facts?: PilotFacts | null
   answer?: string
   thinking?: string | null
@@ -1302,6 +1310,9 @@ export interface PriceCycleItem {
   status: string
   scope: string
   expectedUnits: number
+  /** 轮批次总账：分母 = 建轮冻结的预估（欠账段不在内），done = 已收尾段已处理量 */
+  batchesExpected: number | null
+  batchesDone: number | null
   enteredRepairing: boolean
   startedAt: string | null
   finishedAt: string | null
