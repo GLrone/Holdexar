@@ -17,7 +17,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import time
+from collections import deque
 from collections.abc import AsyncIterator
+from enum import IntEnum
 from functools import lru_cache
 from pathlib import Path
 
@@ -1019,7 +1022,7 @@ async def init_db() -> None:
 
     from app.domains.rates.models import FxRate
 
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         existing = await session.scalar(select(FxRate).where(FxRate.currency_code == "CNY"))
         if existing is None:
             session.add(FxRate(currency_code="CNY", rate_to_cny=1.0))
@@ -1061,40 +1064,187 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(get_engine(), expire_on_commit=False)
 
 
-# ── 写通道闸（SQLite 单写者约束）─────────────────────────────────────
-# SQLite 同一时刻只允许一个写事务：多 worker 并发落库时写锁排队膨胀到分钟级
-# （busy_timeout 吸收不掉持续进站的写者）、写会话占满连接池、读请求 checkout
-# 超时。写入口以 write_slot() 过闸，把并发写事务收敛到 WRITE_SLOTS 个。
-# 串行依赖的全局状态 = SQLite 单写者；WAL 读并发不受此闸约束。
-WRITE_SLOTS = 2
+# ── 全局写入调度器（SQLite 单写者约束）───────────────────────────────
+# SQLite 同一时刻只允许一个写事务；WAL 下读并发不受此约束。全部写事务经
+# 全部写事务经 write_gate() 进入调度，任何绕过闸的写事务都会在文件锁层
+# 与其他写者互撞（busy_timeout 60s 吸收不掉持续进站的写者）。
+# 调度规则：交互写（用户操作）优先于后台批量；后台大批次分段提交让出写者，
+# 用户写不被整批堵住。串行依赖的全局状态 = SQLite 单写者，同一任务内嵌套
+# 过闸（批量回退路径、工具函数复用）按重入处理——单任务顺序事务不破坏单写者。
 
-_write_gates: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
+
+class WritePriority(IntEnum):
+    """写事务调度优先级：值小者先获得写者。"""
+
+    INTERACTIVE = 0   # 用户操作：设置/账号/钱包/关注/提醒/账单手动同步
+    BACKGROUND = 10   # 后台批量：价格落库/体检台账/元数据/定时维护
 
 
-class _WriteSlot:
-    """async with write_slot() 的闸体；闸在连接池取连接之前，排队者不占池。"""
+class _SchedulerMetrics:
+    """按优先级累计的等待/持闸指标（进程内观测用）。"""
+
+    __slots__ = ("count", "wait_max_ms", "wait_last_ms", "hold_max_ms", "hold_last_ms")
 
     def __init__(self) -> None:
-        self._gate: asyncio.Semaphore | None = None
+        self.count = 0
+        self.wait_max_ms = 0.0
+        self.wait_last_ms = 0.0
+        self.hold_max_ms = 0.0
+        self.hold_last_ms = 0.0
+
+    def observe_wait(self, wait_ms: float) -> None:
+        self.count += 1
+        self.wait_last_ms = wait_ms
+        self.wait_max_ms = max(self.wait_max_ms, wait_ms)
+
+    def observe_hold(self, hold_ms: float) -> None:
+        self.hold_last_ms = hold_ms
+        self.hold_max_ms = max(self.hold_max_ms, hold_ms)
+
+
+_WAIT_WARN_MS = {WritePriority.INTERACTIVE: 1000.0, WritePriority.BACKGROUND: 15000.0}
+_HOLD_WARN_MS = 5000.0
+
+
+class WriteScheduler:
+    """单写者闸 + 交互优先排队。同一事件循环一份（见 _schedulers）。
+
+    闸状态只认 `owner`（当前持闸任务）：同任务嵌套过闸按重入放行（批量回退、
+    工具函数复用），跨任务严格互斥；写者位空出时交互队列先于后台队列拿到移交。
+    排队者在拿到写者位之前不占连接池。
+    """
+
+    def __init__(self) -> None:
+        self._owner: asyncio.Task | None = None
+        self._owner_priority: WritePriority | None = None
+        self._depth = 0
+        self._hold_started = 0.0
+        self._waiters: dict[WritePriority, deque[tuple[asyncio.Task, asyncio.Future[None]]]] = {
+            WritePriority.INTERACTIVE: deque(),
+            WritePriority.BACKGROUND: deque(),
+        }
+        self.metrics = {
+            WritePriority.INTERACTIVE: _SchedulerMetrics(),
+            WritePriority.BACKGROUND: _SchedulerMetrics(),
+        }
+
+    def snapshot(self) -> dict:
+        """当前排队与占用状态（诊断输出用）。"""
+        return {
+            "busy": self._owner is not None,
+            "depth": self._depth,
+            "waiting_interactive": len(self._waiters[WritePriority.INTERACTIVE]),
+            "waiting_background": len(self._waiters[WritePriority.BACKGROUND]),
+        }
+
+    async def acquire(self, priority: WritePriority) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        if self._owner is task:
+            self._depth += 1
+            return
+        t0 = time.perf_counter()
+        if self._owner is None and not any(self._waiters.values()):
+            self._grant(task, priority)
+            self._observe_wait(priority, t0)
+            return
+        fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._waiters[priority].append((task, fut))
+        try:
+            await fut
+        except asyncio.CancelledError:
+            # 闸可能在取消送达前已移交本任务（fut 已写入结果）：代为释放，
+            # 否则写者位停在已消失的任务名下，后续写者全部饿死。
+            if fut.done() and not fut.cancelled():
+                self._owner = None
+                self._owner_priority = None
+                self._depth = 0
+                self._handoff()
+            else:
+                try:
+                    self._waiters[priority].remove((task, fut))
+                except ValueError:
+                    pass
+            raise
+        self._observe_wait(priority, t0)
+
+    def release(self) -> None:
+        self._depth -= 1
+        if self._depth > 0:
+            return
+        if self._owner_priority is not None:
+            hold_ms = (time.perf_counter() - self._hold_started) * 1000
+            self.metrics[self._owner_priority].observe_hold(hold_ms)
+            if hold_ms > _HOLD_WARN_MS:
+                logger.warning(
+                    "写调度：%s 写事务持闸 %.1fs（%s）",
+                    self._owner_priority.name, hold_ms / 1000, self.snapshot(),
+                )
+        self._owner = None
+        self._owner_priority = None
+        self._handoff()
+
+    def _grant(self, task: asyncio.Task, priority: WritePriority) -> None:
+        self._owner = task
+        self._owner_priority = priority
+        self._depth = 1
+        self._hold_started = time.perf_counter()
+
+    def _handoff(self) -> None:
+        """写者位空出：交互队列优先，其次后台队列；被取消的排队者跳过。"""
+        for prio in (WritePriority.INTERACTIVE, WritePriority.BACKGROUND):
+            queue = self._waiters[prio]
+            while queue:
+                task, fut = queue.popleft()
+                if fut.done():
+                    continue
+                self._grant(task, prio)
+                fut.set_result(None)
+                return
+
+    def _observe_wait(self, priority: WritePriority, t0: float) -> None:
+        wait_ms = (time.perf_counter() - t0) * 1000
+        self.metrics[priority].observe_wait(wait_ms)
+        if wait_ms > _WAIT_WARN_MS[priority]:
+            logger.warning(
+                "写调度：%s 写事务排队 %.1fs 才拿到写者位（%s）",
+                priority.name, wait_ms / 1000, self.snapshot(),
+            )
+
+
+_schedulers: dict[asyncio.AbstractEventLoop, WriteScheduler] = {}
+
+
+def _scheduler_for_loop() -> WriteScheduler:
+    loop = asyncio.get_running_loop()
+    scheduler = _schedulers.get(loop)
+    if scheduler is None:
+        scheduler = WriteScheduler()
+        _schedulers[loop] = scheduler
+    return scheduler
+
+
+class _WriteGate:
+    """async with write_gate() 的闸体：包住「首条写语句 → 提交」全程。"""
+
+    def __init__(self, priority: WritePriority) -> None:
+        self._priority = priority
+        self._scheduler: WriteScheduler | None = None
 
     async def __aenter__(self) -> None:
-        loop = asyncio.get_running_loop()
-        gate = _write_gates.get(loop)
-        if gate is None:
-            gate = asyncio.Semaphore(WRITE_SLOTS)
-            _write_gates[loop] = gate
-        self._gate = gate
-        await gate.acquire()
+        self._scheduler = _scheduler_for_loop()
+        await self._scheduler.acquire(self._priority)
 
     async def __aexit__(self, *exc: object) -> None:
-        if self._gate is not None:
-            self._gate.release()
-            self._gate = None
+        if self._scheduler is not None:
+            self._scheduler.release()
+            self._scheduler = None
 
 
-def write_slot() -> _WriteSlot:
-    """写事务并发闸：`async with write_slot():` 包住「取连接 → 提交」全程。"""
-    return _WriteSlot()
+def write_gate(priority: WritePriority = WritePriority.BACKGROUND) -> _WriteGate:
+    """写事务闸：包住会话的「首条写语句 → 提交」区间，会话由调用方自建
+    （各域经自身 `get_session_factory` 导入取连接，测试接缝保持不变）。"""
+    return _WriteGate(priority)
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
