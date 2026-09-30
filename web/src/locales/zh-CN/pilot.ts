@@ -29,7 +29,7 @@ const pilot = {
   'pilot.facts.price': '《{name}》国区现价 {price}{discount}，史低 {lowest}。近一年：最低 {ymin} ／ 最高 {ymax}（{count} 条价格观测）。',
   'pilot.facts.price_noyear': '《{name}》国区现价 {price}{discount}，史低 {lowest}。',
   'pilot.facts.discount': '（-{discount}%）',
-  'pilot.facts.gamesTitle': '库内可能相关的游戏：',
+  'pilot.facts.gamesTitle': '库内智能排序前列：',
   'pilot.facts.noLowest': '暂无史低数据',
   'pilot.candidate.price': '现价 {price}',
   'pilot.candidate.pick': '第{n}个',

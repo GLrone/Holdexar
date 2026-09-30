@@ -123,9 +123,12 @@ async def recommend_games_by_filters(
     min_rating: int = 0,
     max_price_yuan: float | None = None,
 ) -> list[dict]:
-    """按结构化条件挑库内游戏（agent 工具与回退路径共用）。"""
+    """按结构化条件挑库内游戏（agent 工具与回退路径共用）。
+
+    排序用库内智能排序（scoring 已算好的 smartScore）——推荐就是推荐，
+    不回退到目录默认序。"""
     result = await games_service.list_games(
-        sort="default",
+        sort="smart",
         limit=_FIND_LIMIT,
         q=(q or "").strip() or None,
         only_discounted=only_discounted,
