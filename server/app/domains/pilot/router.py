@@ -47,7 +47,7 @@ async def update_config(payload: PilotConfigUpdate) -> PilotConfigPayload:
 @router.post("/ask")
 async def ask(payload: AskRequest) -> AskResponse:
     try:
-        result = await service.ask(payload.question, payload.appid)
+        result = await service.ask(payload.question, payload.appid, payload.session_id)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     except Exception as e:  # noqa: BLE001
@@ -61,7 +61,7 @@ async def ask_stream(payload: AskRequest):
 
     async def gen():
         try:
-            async for event in service.ask_stream(payload.question, payload.appid):
+            async for event in service.ask_stream(payload.question, payload.appid, payload.session_id):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         except Exception:  # noqa: BLE001 — 流已开始，HTTP 状态无法再改，帧内报错
             yield f'data: {json.dumps({"type": "error", "reason": "server_error"}, ensure_ascii=False)}\n\n'

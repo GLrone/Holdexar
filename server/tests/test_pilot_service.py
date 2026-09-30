@@ -1,10 +1,23 @@
 """pilot 意图路由与问答编排单测（LLM 以替身注入，不触网、不依赖真实库）。"""
+import json
+import time
+
 import pytest
 
 from app.domains.pilot import config as pilot_config
 from app.domains.pilot import intent as pilot_intent
 from app.domains.pilot import service
 from app.domains.pilot.llm import PilotLlmError
+
+
+def _recording(executed, result):
+    """monitor_add/alert_add 替身工厂：记录收到的 appid 并返回固定回执。"""
+
+    async def _fn(appid):
+        executed.append(appid)
+        return {**result, "appid": appid}
+
+    return _fn
 
 _CFG = {
     "enabled": True,
@@ -287,7 +300,71 @@ class TestAskFlow:
                            {"appid": 2, "name": "B", "cnyFen": 200, "discount": 0,
                             "positiveRate": None, "reviewCount": 0}]),
         )
-        resp = await service.ask("把里奥的宝藏加进关注")
+        resp = await service.ask("把里奥的宝藏加进关注", session_id="s-amb")
         assert resp["source"] == "facts"
         assert resp["reason"] == "need_target"
         assert resp["facts"]["kind"] == "games"
+
+    @pytest.mark.asyncio
+    async def test_session_pending_candidate_ordinal_executes(self, monkeypatch):
+        calls = {}
+        _patch_ready(monkeypatch, calls=calls)
+        monkeypatch.setattr(service.pilot_tools, "search_games", _async_return([]))
+
+        async def fake_monitor(appid):
+            return {"action": "monitor_add", "appid": appid, "name": "候选B", "state": "active"}
+
+        executed = []
+        monkeypatch.setattr(
+            service.pilot_tools,
+            "monitor_add",
+            _recording(executed, {"action": "monitor_add", "name": "候选B", "state": "active"}),
+        )
+        service._sessions["s-ord"] = {
+            "ts": time.monotonic(),
+            "candidates": [
+                {"appid": 1, "name": "候选A"},
+                {"appid": 2, "name": "候选B"},
+            ],
+            "pending_action": "monitor_add",
+        }
+        resp = await service.ask("第二个", session_id="s-ord")
+        assert executed == [2]
+        assert resp["facts"]["kind"] == "action"
+
+    @pytest.mark.asyncio
+    async def test_session_pronoun_uses_last_game(self, monkeypatch):
+        calls = {}
+        _patch_ready(monkeypatch, calls=calls)
+        monkeypatch.setattr(service.pilot_tools, "search_games", _async_return([]))
+
+        async def fake_monitor(appid):
+            return {"action": "monitor_add", "appid": appid, "name": "巫师 3：狂猎", "state": "active"}
+
+        executed = []
+        monkeypatch.setattr(
+            service.pilot_tools,
+            "monitor_add",
+            _recording(executed, {"action": "monitor_add", "name": "巫师 3：狂猎", "state": "active"}),
+        )
+        service._sessions["s-pro"] = {
+            "ts": time.monotonic(),
+            "last_game": {"appid": 292030, "name": "巫师 3：狂猎"},
+        }
+        resp = await service.ask("把它加进关注", session_id="s-pro")
+        assert executed == [292030]
+        assert resp["facts"]["kind"] == "action"
+
+    @pytest.mark.asyncio
+    async def test_decision_log_written(self, monkeypatch, tmp_path):
+        _patch_ready(monkeypatch)
+        monkeypatch.setattr(
+            service, "resolve_data_dir", lambda: tmp_path
+        )
+        monkeypatch.setattr(service.pilot_tools, "search_games", _async_return([]))
+        await service.ask("今天天气怎么样", session_id="s-log")
+        log = tmp_path / "pilot" / "decisions.jsonl"
+        assert log.is_file()
+        entry = json.loads(log.read_text(encoding="utf-8").splitlines()[-1])
+        assert entry["question"] == "今天天气怎么样"
+        assert entry["intent"] == pilot_intent.CHAT
