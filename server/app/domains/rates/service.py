@@ -13,16 +13,16 @@ CNY 恒为 1.0。每次刷新写 fx_rates（UPSERT）+ fx_rate_history
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 
 import httpx
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from app.core.database import get_session_factory
+from app.core.database import WritePriority, get_session_factory
+from app.core.database import write_gate
 from app.crawler.config import CC_LIST
 from app.crawler.utils import get_beijing_time_obj
-from app.domains.games.pricing import DEFAULT_EXCHANGE_RATES
 from .models import FxRate, FxRateHistory
 
 logger = logging.getLogger(__name__)
@@ -133,7 +133,7 @@ async def refresh_rates() -> dict:
 
     from . import snapshot as snapshot_service
 
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         for code, rate in rates.items():
             stmt = sqlite_insert(FxRate).values(
                 currency_code=code, rate_to_cny=rate, fetched_at=now
@@ -310,7 +310,7 @@ async def cleanup_disallowed() -> tuple[int, int]:
 
     启动时调用一次；refresh_rates 落库后也会顺带执行，保证幂等。
     """
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         removed = await _delete_disallowed(session)
         if any(removed):
             await session.commit()

@@ -21,7 +21,7 @@ import aiohttp
 
 from app.core.events import bus
 
-from .router import CrawlerContext, CrawlerRouter
+from .router import CrawlerContext
 
 logger = logging.getLogger(__name__)
 

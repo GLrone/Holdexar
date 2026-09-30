@@ -12,7 +12,8 @@ from __future__ import annotations
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core import secretbox
-from app.core.database import get_session_factory
+from app.core.database import WritePriority, get_session_factory
+from app.core.database import write_gate
 from app.core.secretbox import SecretBoxError
 from app.domains.settings.models import AppSetting
 from app.crawler.utils import get_beijing_time_obj
@@ -37,14 +38,14 @@ async def delete_value(key: str) -> None:
     """删除键（下架功能的设置项清账用，不存在时静默）。"""
     from sqlalchemy import delete
 
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         await session.execute(delete(AppSetting).where(AppSetting.key == key))
         await session.commit()
 
 
 async def set_value(key: str, value) -> None:
     now = get_beijing_time_obj().replace(tzinfo=None)
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         stmt = sqlite_insert(AppSetting).values(
             key=key, value_json=value, updated_at=now
         )

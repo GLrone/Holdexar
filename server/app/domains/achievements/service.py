@@ -44,7 +44,8 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from sqlalchemy import delete, func, select
 
-from app.core.database import get_session_factory
+from app.core.database import WritePriority, get_session_factory
+from app.core.database import write_gate
 from app.domains.account import service as account_service
 from app.domains.achievements.models import AchievementDef, AchievementGame, AchievementState
 from app.domains.family.service import (
@@ -953,7 +954,7 @@ async def _sync_all(target: str = "") -> None:
 
 
 async def _apply_owned(steamid: str, owned: list[dict]) -> None:
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         rows = {
             r.appid: r
             for r in (
@@ -991,7 +992,7 @@ async def _apply_progress(
     而「已购但没成就」是既有口径（`filter=all` 能看到），保持原样。
     """
     names = external_names or {}
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         rows = {
             r.appid: r
             for r in (
@@ -1025,7 +1026,7 @@ async def _prune_external(steamid: str, candidates: set[int]) -> int:
     其既有解锁账与明细是这个应用里唯一留存的副本，不做静默清理。
     """
     removed = 0
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         rows = (
             (
                 await session.execute(
@@ -1098,7 +1099,7 @@ async def _sync_game(steamid: str, row: AchievementGame, creds: list[tuple[str, 
             await _apply_defs(appid, defs)
             row.total_achievements = len(defs)
             row.schema_synced_at = datetime.utcnow()
-            async with get_session_factory()() as session:
+            async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
                 await session.merge(row)
                 await session.commit()
 
@@ -1109,7 +1110,7 @@ async def _sync_game(steamid: str, row: AchievementGame, creds: list[tuple[str, 
         html = await _community_get(PLAYER_PAGE.format(steamid=steamid, appid=appid), {"l": LANG})
         page_rows = parse_player_page(html, appid) if html else []
 
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         defs_rows = (
             (
                 await session.execute(
@@ -1174,7 +1175,7 @@ async def _sync_game(steamid: str, row: AchievementGame, creds: list[tuple[str, 
 
 
 async def _apply_defs(appid: int, defs: list[dict]) -> None:
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         existing = {
             d.image_name: d
             for d in (

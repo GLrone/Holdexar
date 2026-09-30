@@ -18,7 +18,8 @@ from datetime import date, datetime, timedelta
 from sqlalchemy import func, select, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from app.core.database import get_session_factory
+from app.core.database import WritePriority, get_session_factory
+from app.core.database import write_gate
 from app.crawler.utils import get_beijing_time_obj
 from . import parser
 from .models import SteamEvent
@@ -174,7 +175,7 @@ async def sync() -> dict:
             for e in rows
         ]
 
-        async with get_session_factory()() as session:
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             for row in prepared:
                 stmt = sqlite_insert(SteamEvent).values(**row)
                 stmt = stmt.on_conflict_do_update(
@@ -218,7 +219,7 @@ def _write_snapshot(lang: str, raw: str) -> None:
 async def _backfill_price_history(rows: list[dict]) -> int:
     """按活动窗口回贴价格观测行的周期标签（只补 NULL 行，幂等）。"""
     total = 0
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         for row in rows:
             window_start = f"{row['start_date'].isoformat()} 00:00:00"
             window_end = (

@@ -26,7 +26,8 @@ from app.core.backup import (
     backup_dir,
 )
 from app.core.config import get_settings
-from app.core.database import get_session_factory
+from app.core.database import WritePriority, get_session_factory
+from app.core.database import write_gate
 from app.core.logging import ring_log_handler
 from app.domains.games.models import Game, GameCurrentPrice, GamePriceHistory
 
@@ -85,7 +86,7 @@ async def import_legacy(req: LegacyImport) -> dict:
         conn.close()
 
     games_upserted = 0
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         for row in games:
             stmt = sqlite_insert(Game).values(
                 appid=int(row["appid"]),

@@ -25,7 +25,8 @@ import httpx
 from sqlalchemy import delete, func, select
 
 from app.core import secretbox
-from app.core.database import get_session_factory
+from app.core.database import WritePriority, get_session_factory
+from app.core.database import write_gate
 from app.crawler.browse_store import StoreBrowseAPI
 from app.crawler.utils import get_beijing_time_obj
 
@@ -400,7 +401,7 @@ async def _apply_subscription_name(sub_id: int, name: str) -> str | None:
     name = (name or "").strip()[:100]
     if not name:
         return None
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         sub = await session.get(ProxySubscription, sub_id)
         if sub is None:
             return None
@@ -415,7 +416,7 @@ async def update_subscription_label(sub_id: int, label: str) -> dict:
     """订阅手动改名（订阅名不再自动回填——面板 profile-title 覆盖面窄，
     且回填时机零散；名字由用户自己维护，空串可清名）。"""
     label = (label or "").strip()
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         sub = await session.get(ProxySubscription, sub_id)
         if sub is None:
             raise ValueError("订阅不存在")
@@ -442,7 +443,7 @@ async def update_subscription(
     返回 {id, kind, url, label, synced, nodes?, traffic?, alive?, total?,
     restarted?, warning?}；synced=true 表示本次确实重拉过。
     """
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         sub = await session.get(ProxySubscription, sub_id)
         if sub is None:
             raise ValueError("订阅不存在")
@@ -529,7 +530,7 @@ async def _mark_refreshed(sub_id: int) -> None:
     from app.domains.settings.service import set_value
 
     now = _naive(get_beijing_time_obj())
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         sub = await session.get(ProxySubscription, sub_id)
         if sub is not None:
             sub.last_imported_at = now
@@ -649,10 +650,9 @@ async def _pool_sync_single(sub_id: int) -> None:
     这条路。失败只留日志：下一次重拉是下一次机会。"""
     try:
         from app.core.config import get_settings
-        from app.core.database import get_session_factory
         from app.domains.proxypool import bootstrap as _bs
 
-        async with get_session_factory()() as session:
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             result = await _bs.sync_subscriptions(
                 session, data_dir=get_settings().data_dir,
                 now=datetime.now(), only_sub_id=sub_id,
@@ -876,7 +876,7 @@ async def add_proxy(
         raise ValueError("host/port 不能为空")
     if scheme not in ("http", "socks5"):
         raise ValueError(f"不支持的协议: {scheme}")
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         proxy = Proxy(
             label=label, scheme=scheme, host=host, port=int(port),
             username=username, password=password, enabled=True,
@@ -910,7 +910,7 @@ def _parse_proxy_url(url: str) -> tuple[str, str, int, str | None, str | None]:
 
 
 async def update_proxy(proxy_id: int, *, enabled: bool | None = None, label: str | None = None) -> dict:
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         proxy = await session.get(Proxy, proxy_id)
         if proxy is None:
             raise ValueError("代理不存在")
@@ -924,7 +924,7 @@ async def update_proxy(proxy_id: int, *, enabled: bool | None = None, label: str
 
 
 async def delete_proxy(proxy_id: int) -> bool:
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         proxy = await session.get(Proxy, proxy_id)
         if proxy is None:
             return False
@@ -936,7 +936,7 @@ async def delete_proxy(proxy_id: int) -> bool:
 # ─── 健康检查 ────────────────────────────────────────────────
 
 async def test_proxy(proxy_id: int) -> dict:
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         proxy = await session.get(Proxy, proxy_id)
         if proxy is None:
             raise ValueError("代理不存在")
@@ -956,7 +956,7 @@ async def test_all() -> list[dict]:
 
 
 async def _check_single(proxy: Proxy) -> dict:
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         fresh = await session.get(Proxy, proxy.id)
         result = await _check(fresh)
         await session.commit()
@@ -1012,7 +1012,7 @@ async def migrate_legacy_subscription() -> None:
     legacy = await get_value("proxy.subscription_url")
     if not legacy:
         return
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         rows = (
             await session.execute(
                 select(ProxySubscription).where(ProxySubscription.kind == "clash")
@@ -1097,7 +1097,7 @@ async def add_subscription(kind: str, url: str, label: str | None = None) -> dic
                 "可稍后重试，或手动放置 mihomo 内核到 data/clash/"
             )
 
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         sub = ProxySubscription(
             kind=kind, url=seal_url(url), label=label, created_at=_naive(get_beijing_time_obj()),
             # clash 走候选准入（默认 CANDIDATE，显式写清意图）；明文订阅没有候选
@@ -1142,7 +1142,7 @@ async def add_subscription(kind: str, url: str, label: str | None = None) -> dic
 async def delete_subscription(sub_id: int) -> bool:
     """删除订阅 + 级联清理账本（clash_nodes 按 subscription_id 挂靠，
     订阅没了节点行就是纯孤儿数据，一并删除防止永久累积）。"""
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         sub = await session.get(ProxySubscription, sub_id)
         if sub is None:
             return False
@@ -1160,7 +1160,7 @@ async def get_subscription(sub_id: int) -> ProxySubscription | None:
 
 
 async def mark_imported(sub_id: int, stats: dict) -> None:
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         sub = await session.get(ProxySubscription, sub_id)
         if sub is None:
             return
@@ -1226,7 +1226,7 @@ async def import_plain_subscription(sub_id: int, timeout: float = 30.0) -> dict:
     existing = {(p.host, p.port, p.username or "") for p in await list_proxies()}
     existing_before_add = set(existing)
     added = skipped = 0
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         for item in parsed:
             key = (item["host"], item["port"], item["username"] or "")
             if key in existing:
@@ -1718,12 +1718,11 @@ async def _test_clash_nodes_impl(
         # 出口 IP（L1），比池内 L0 更强：命中节点按成功证据复活，出口 IP 直接
         # 落进池账本，合格集/出口集变化只置既有的 rebuild_pending。
         try:
-            from app.core.database import get_session_factory
             from app.domains.proxypool.bridge import ingest_ledger, ingest_node_check
             from app.domains.proxypool.models import HealthRun
             from app.domains.proxypool.scheduling import request_rebuild
 
-            async with get_session_factory()() as session:
+            async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
                 # 手动体检的运行台账：独立计时 + 节点级汇总（前端「本次体检耗时」
                 # 的唯一事实源），逐节点观测经 run_id 归属
                 run = HealthRun(
@@ -1808,7 +1807,7 @@ async def prune_clash_node_ledger(sub_id: int, current_names: set[str] | None = 
         current_names = set(clash_manager.parse_node_names(text))
     if not current_names:
         return 0
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         result = await session.execute(
             delete(ClashNode).where(
                 ClashNode.subscription_id == sub_id,
@@ -1898,7 +1897,7 @@ async def _apply_node_results(
     alive_count = 0
     unique_ips: set[str] = set()
 
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         # 节点存在性以订阅当前内容为准：新节点 INSERT，已有节点 UPDATE
         existing = {
             n.name: n
@@ -1983,7 +1982,7 @@ async def _apply_node_results(
 
 async def _merge_last_stats(sub_id: int, **fields) -> None:
     """订阅 last_stats 局部合并（不动其他键）——流量/存活回填共用出口。"""
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         sub = await session.get(ProxySubscription, sub_id)
         if sub is None:
             return
@@ -2002,7 +2001,7 @@ async def _evaluate_subscription_deprecation(sub_id: int, alive_count: int, tota
     if total <= 0:
         return False
     unusable_ratio = 1 - (alive_count / total)
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         sub = await session.get(ProxySubscription, sub_id)
         if sub is None:
             return False
@@ -2142,7 +2141,7 @@ async def record_event(
     status_code: int | None = None, duration_ms: int | None = None, error: str | None = None,
 ) -> None:
     try:
-        async with get_session_factory()() as session:
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             session.add(
                 ProxyEvent(
                     ts=_naive(get_beijing_time_obj()), kind=kind, target=target,
@@ -2188,7 +2187,7 @@ async def seal_subscription_urls() -> int:
     from app.domains.proxypool.models import SubscriptionSnapshot
 
     sealed = 0
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         subs = (await session.execute(select(ProxySubscription))).scalars().all()
         for row in subs:
             value = row.url or ""

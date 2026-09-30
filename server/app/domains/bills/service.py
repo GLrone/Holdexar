@@ -22,7 +22,8 @@ from datetime import date, datetime, timedelta
 
 from sqlalchemy import case, delete, func, select
 
-from app.core.database import get_session_factory
+from app.core.database import WritePriority, get_session_factory
+from app.core.database import write_gate
 from app.crawler.utils import get_beijing_time_obj
 from .models import BillCdkGame, BillGameTx, BillImport, BillTopupTx
 from .parser import parse_report
@@ -85,7 +86,7 @@ async def revalue_affected(touched: dict[str, set[date]]) -> dict:
     lookback_start = (min(all_days) - timedelta(days=15)).isoformat()
     span_end = max(all_days).isoformat()
 
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         game_rows = (
             await session.execute(
                 select(BillGameTx).where(
@@ -177,7 +178,7 @@ async def import_report(data: dict, source_file: str = "") -> dict:
     """
     parsed = parse_report(data)
 
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         # 同昵称旧账单替换（昵称为空时跳过——避免误清其他匿名账单）
         nickname = parsed["account"]["nickname"]
         replaced = 0
@@ -544,7 +545,7 @@ async def list_imports() -> list[dict]:
 
 async def delete_import(import_id: int) -> dict:
     """删除一份账单及其全部行级数据。"""
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         for model in (BillGameTx, BillTopupTx, BillCdkGame):
             await session.execute(delete(model).where(model.import_id == import_id))
         res = await session.execute(delete(BillImport).where(BillImport.id == import_id))
@@ -846,7 +847,7 @@ async def cdk_games(
 
 async def set_cdk_price(cdk_id: int, manual_fen: int | None) -> dict:
     """录入/清除一个 CDK/礼物的手动实付价（分）。"""
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         row = await session.get(BillCdkGame, cdk_id)
         if row is None:
             raise KeyError(f"CDK 条目 {cdk_id} 不存在")

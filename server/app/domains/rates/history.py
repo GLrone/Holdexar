@@ -25,7 +25,8 @@ from typing import Iterable
 from sqlalchemy import select, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from app.core.database import get_session_factory
+from app.core.database import WritePriority, get_session_factory
+from app.core.database import write_gate
 from app.crawler.utils import get_beijing_time_obj
 from .models import FxRateHistory
 from .providers.bing_currency import (
@@ -361,7 +362,7 @@ async def _write_observed(data: dict[date, dict[str, float]]) -> tuple[int, dict
             touched.setdefault(code, set()).add(day)
     if not values:
         return 0, {}
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         stmt = sqlite_insert(FxRateHistory).values(values)
         await session.execute(
             stmt.on_conflict_do_update(

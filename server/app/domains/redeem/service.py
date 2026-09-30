@@ -21,13 +21,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from urllib.parse import quote
 
 import httpx
 
 from app.domains.account import service as account_service
 from app.domains.account.steam_wallet import parse_cookie_str
-from app.domains.settings import service as settings_service
 
 logger = logging.getLogger(__name__)
 

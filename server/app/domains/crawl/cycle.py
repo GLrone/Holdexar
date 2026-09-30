@@ -33,7 +33,7 @@ from datetime import datetime
 from sqlalchemy import DateTime, Float, Index, Integer, String, Text, JSON, select
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.core.database import Base, get_session_factory, write_slot
+from app.core.database import Base, WritePriority, get_session_factory, write_gate
 from app.domains.crawl.models import CrawlJob
 
 logger = logging.getLogger(__name__)
@@ -130,11 +130,11 @@ class PriceCycle(Base):
 async def create(kind: str, scope: str = "") -> int:
     """创建 Cycle（planning）。返回 cycle_id。
 
-    写事务过 write_slot 闸：定时任务（体检/钱包）密集写库时不过闸的 commit
-    会在 SQLite 写锁上排到 busy_timeout 超时，整轮价格刷新就没了归属。
+    写事务过写调度器：不过闸的 commit 会在 SQLite 写锁上排到
+    busy_timeout 超时，整轮价格刷新就没了归属。
     """
-    async with write_slot():
-        async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND):
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             cycle = PriceCycle(
                 kind=kind, status=PLANNING, scope=scope, started_at=datetime.now()
             )
@@ -189,8 +189,8 @@ async def freeze_expected(cycle_id: int, specs: list[dict]) -> tuple[list[str] |
                 appids.append(appid)
     batches_expected *= len(regions)
 
-    async with write_slot():
-        async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND):
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             cycle = await session.get(PriceCycle, cycle_id)
             if cycle is not None:
                 cycle.expected_json = {"appids": appids, "regions": regions}
@@ -209,8 +209,8 @@ async def advance(cycle_id: int | None, status: str, *, error: str | None = None
     """
     if cycle_id is None:
         return False
-    async with write_slot():
-        async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND):
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             cycle = await session.get(PriceCycle, cycle_id)
             if cycle is None:
                 return False
@@ -336,8 +336,8 @@ async def write_stats(cycle_id: int, stats: dict) -> bool:
     统计是观测结果，不参与控制：任何读取面（调度、重试、worker 数）都不得
     以这些数字作为输入。
     """
-    async with write_slot():
-        async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND):
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             cycle = await session.get(PriceCycle, cycle_id)
             if cycle is None:
                 return False
@@ -388,7 +388,7 @@ async def cleanup_orphan_cycles() -> int:
     与 `cleanup_orphan_jobs` 同一步骤：遗留的 running Cycle 若不清，
     「这一轮跑到哪了」永远无解（状态卡在中间态、finished_at 空着）。
     """
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         rows = (
             await session.execute(
                 select(PriceCycle).where(PriceCycle.status.in_(OPEN_STATES))
