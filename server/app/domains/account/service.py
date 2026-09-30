@@ -699,6 +699,8 @@ async def sync_wallet(*, force: bool = False) -> dict:
         "country_code": info.country_code,
         "steam_id": info.steam_id,  # store account 通道的页面归属账户
         "checked_at": now.isoformat(),
+        # 上次成功获取余额的时刻（失败不覆盖）；前端显示层用它判「同步成功缓存窗」
+        "ok_at": now.isoformat(),
         "check_ok": True,
         "error": "",
     }
@@ -722,6 +724,9 @@ async def _save_wallet(
 ) -> None:
     """落账号行的钱包快照/错误（失败时保留旧余额字段，只翻 check_ok/error）。
 
+    ok_at 是「上次成功获取余额」的时刻：成功快照随 checked_at 一并写入，
+    失败改写时原样保留（旧快照无 ok_at 且 check_ok=True 时取其 checked_at），
+    供前端显示层做同步成功缓存窗判定。
     backoff_level：显式传值时覆盖写（成功清零 / 失败递增由调用方算好）；
     None = 不动（保留现有级别）。fail_streak / frozen 同语义（熔断计数与
     冻结终态），同样只由调用方算好传入。
@@ -742,8 +747,11 @@ async def _save_wallet(
                 row.wallet_frozen = frozen
         else:
             old = row.wallet_json if isinstance(row.wallet_json, dict) else {}
+            ok_at = old.get("ok_at") or (
+                old.get("checked_at") if old.get("check_ok") else None
+            )
             row.wallet_json = {**old, "check_ok": False, "error": error,
-                               "checked_at": now.isoformat()}
+                               "checked_at": now.isoformat(), "ok_at": ok_at}
             row.wallet_error = error[:300]
             if backoff_level is not None:
                 row.wallet_backoff_level = backoff_level

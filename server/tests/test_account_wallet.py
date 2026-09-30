@@ -242,6 +242,32 @@ async def test_sync_wallet_without_cookie_is_soft_skip():
 
 
 @pytest.mark.asyncio
+async def test_sync_wallet_failure_preserves_ok_at(monkeypatch):
+    """失败改写保留上次成功时刻（ok_at）：前端显示层缓存窗的事实来源。"""
+    async def fake_ok(cookies, *, verify=None, proxy_url=None):
+        return _from_raw_amounts(20000, 0, 23, "CN")
+
+    async def fake_fail(cookies, *, verify=None, proxy_url=None):
+        raise account_service.WalletFetchError("模拟网络失败")
+
+    monkeypatch.setattr(account_service, "fetch_wallet", fake_ok)
+    await account_service.save_cookies("steamLoginSecure=76561198123456789%7C%7Ct")
+    ok_wallet = (await account_service.sync_wallet(force=True))["wallet"]
+    assert ok_wallet["check_ok"] is True
+    ok_at = ok_wallet["ok_at"]
+
+    monkeypatch.setattr(account_service, "fetch_wallet", fake_fail)
+    assert (await account_service.sync_wallet(force=True))["ok"] is False
+
+    wallet = (await account_service.get_status())["wallet"]
+    assert wallet["check_ok"] is False
+    assert wallet["error"] == "模拟网络失败"
+    assert wallet["ok_at"] == ok_at  # 成功时刻原样保留
+    assert wallet["checked_at"] != ok_at  # checked_at 是失败尝试时间
+    assert wallet["balance_display"] == "¥200.00"  # 旧余额字段保留
+
+
+@pytest.mark.asyncio
 async def test_save_cookies_flags_mismatch(monkeypatch):
     async def fake_fetch(cookies, *, verify=None, proxy_url=None):
         return _from_raw_amounts(1, 0, 1, "US")
