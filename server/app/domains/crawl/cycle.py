@@ -33,7 +33,7 @@ from datetime import datetime
 from sqlalchemy import DateTime, Float, Index, Integer, String, Text, JSON, select
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.core.database import Base, get_session_factory
+from app.core.database import Base, get_session_factory, write_slot
 from app.domains.crawl.models import CrawlJob
 
 logger = logging.getLogger(__name__)
@@ -85,11 +85,19 @@ class PriceCycle(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime)
     # 进入各阶段的真实时刻（NULL = 本轮没进过该阶段）；阶段耗时由它们相减得出
     running_at: Mapped[datetime | None] = mapped_column(DateTime)
-    # 进入 repairing 的时刻（NULL = 本轮结束时没有待补欠账）
+    # 本轮结束时仍有待补欠账（NULL = 本轮没进过该阶段）
     repairing_at: Mapped[datetime | None] = mapped_column(DateTime)
     finalizing_at: Mapped[datetime | None] = mapped_column(DateTime)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime)
     error: Mapped[str | None] = mapped_column(Text)
+
+    # 轮批次总账（任务页的「总队列」口径，1 批 = 1 区 × 一发批量）：
+    # expected 在 planning 冻结（各带 scope 段按款数 ÷ 单发容量向上取整 × 区数，
+    # 补抓欠账段启动时才可知、不含在内）；done 跑动中随 job 收尾重算（各 job
+    # 已处理批次之和）。分母是预估——批量切分还受 URL 预算影响，取显示层
+    # max(预估, 已启动段精确 count) 兜底，进度条不会倒挂。
+    batches_expected: Mapped[int | None] = mapped_column(Integer)
+    batches_done: Mapped[int | None] = mapped_column(Integer)
 
     # ── 生产统计（Cycle 收敛时写入，全为 NULL = 本轮没有留下统计）──
     # 口径见 crawl/stats.py：计数来自冻结期望集 + 本轮价格结果，
@@ -120,14 +128,19 @@ class PriceCycle(Base):
 
 
 async def create(kind: str, scope: str = "") -> int:
-    """创建 Cycle（planning）。返回 cycle_id。"""
-    async with get_session_factory()() as session:
-        cycle = PriceCycle(
-            kind=kind, status=PLANNING, scope=scope, started_at=datetime.now()
-        )
-        session.add(cycle)
-        await session.commit()
-        return cycle.id
+    """创建 Cycle（planning）。返回 cycle_id。
+
+    写事务过 write_slot 闸：定时任务（体检/钱包）密集写库时不过闸的 commit
+    会在 SQLite 写锁上排到 busy_timeout 超时，整轮价格刷新就没了归属。
+    """
+    async with write_slot():
+        async with get_session_factory()() as session:
+            cycle = PriceCycle(
+                kind=kind, status=PLANNING, scope=scope, started_at=datetime.now()
+            )
+            session.add(cycle)
+            await session.commit()
+            return cycle.id
 
 
 async def freeze_expected(cycle_id: int, specs: list[dict]) -> tuple[list[str] | None, int]:
@@ -139,7 +152,13 @@ async def freeze_expected(cycle_id: int, specs: list[dict]) -> tuple[list[str] |
 
     地区走 `crawl_service.effective_regions`——与本轮 job 实际使用的区服
     同源，冻结口径与执行口径不可能分叉。
+
+    顺带冻结轮批次总账（batches_expected）：各带 scope 段按段款数 ÷ 单发
+    容量向上取整 × 区数。这是任务页「总队列」的分母——补抓欠账段的对象数
+    启动时才可知，不含在内；批量切分还受 URL 预算影响，显示层以
+    max(预估, 已启动段精确 count) 兜底。
     """
+    from app.crawler.browse_store import DEFAULT_BATCH_SIZE
     from app.domains.crawl import service as crawl_service
 
     try:
@@ -150,6 +169,7 @@ async def freeze_expected(cycle_id: int, specs: list[dict]) -> tuple[list[str] |
 
     appids: list[int] = []
     seen: set[int] = set()
+    batches_expected = 0
     for spec in specs:
         scope = spec.get("scope")
         if not scope:
@@ -161,17 +181,22 @@ async def freeze_expected(cycle_id: int, specs: list[dict]) -> tuple[list[str] |
             # 同款容忍——跳过该阶段，不让它掀翻整轮记账
             logger.info("[周期] 阶段 %s 范围解析跳过：%s", scope, e)
             continue
+        # 批次按段算：pool 与 catalog 的对象互斥，并集会低估桶数
+        batches_expected += -(-len(resolved) // DEFAULT_BATCH_SIZE)
         for appid in resolved:
             if appid not in seen:
                 seen.add(appid)
                 appids.append(appid)
+    batches_expected *= len(regions)
 
-    async with get_session_factory()() as session:
-        cycle = await session.get(PriceCycle, cycle_id)
-        if cycle is not None:
-            cycle.expected_json = {"appids": appids, "regions": regions}
-            cycle.specs_json = [dict(s) for s in specs]
-            await session.commit()
+    async with write_slot():
+        async with get_session_factory()() as session:
+            cycle = await session.get(PriceCycle, cycle_id)
+            if cycle is not None:
+                cycle.expected_json = {"appids": appids, "regions": regions}
+                cycle.specs_json = [dict(s) for s in specs]
+                cycle.batches_expected = batches_expected
+                await session.commit()
     return regions, len(appids) * len(regions)
 
 
@@ -184,34 +209,35 @@ async def advance(cycle_id: int | None, status: str, *, error: str | None = None
     """
     if cycle_id is None:
         return False
-    async with get_session_factory()() as session:
-        cycle = await session.get(PriceCycle, cycle_id)
-        if cycle is None:
-            return False
-        current = cycle.status
-        if current in TERMINAL_STATES:
-            logger.info(
-                "[周期] Cycle %d 已终态（%s），忽略推进到 %s", cycle_id, current, status
-            )
-            return False
-        if status not in _TRANSITIONS.get(current, ()):
-            logger.warning(
-                "[周期] Cycle %d 拒绝非法跃迁 %s → %s", cycle_id, current, status
-            )
-            return False
-        cycle.status = status
-        now = datetime.now()
-        if status == RUNNING:
-            cycle.running_at = now
-        elif status == REPAIRING:
-            cycle.repairing_at = now
-        elif status == FINALIZING:
-            cycle.finalizing_at = now
-        if error is not None:
-            cycle.error = error
-        if status in TERMINAL_STATES:
-            cycle.finished_at = now
-        await session.commit()
+    async with write_slot():
+        async with get_session_factory()() as session:
+            cycle = await session.get(PriceCycle, cycle_id)
+            if cycle is None:
+                return False
+            current = cycle.status
+            if current in TERMINAL_STATES:
+                logger.info(
+                    "[周期] Cycle %d 已终态（%s），忽略推进到 %s", cycle_id, current, status
+                )
+                return False
+            if status not in _TRANSITIONS.get(current, ()):
+                logger.warning(
+                    "[周期] Cycle %d 拒绝非法跃迁 %s → %s", cycle_id, current, status
+                )
+                return False
+            cycle.status = status
+            now = datetime.now()
+            if status == RUNNING:
+                cycle.running_at = now
+            elif status == REPAIRING:
+                cycle.repairing_at = now
+            elif status == FINALIZING:
+                cycle.finalizing_at = now
+            if error is not None:
+                cycle.error = error
+            if status in TERMINAL_STATES:
+                cycle.finished_at = now
+            await session.commit()
     return True
 
 
@@ -288,6 +314,9 @@ def _to_dict(cycle: PriceCycle) -> dict:
         "status": cycle.status,
         "scope": cycle.scope,
         "expectedUnits": expected_units(cycle.expected_json),
+        # 轮批次总账：分母（冻结预估）与已收尾段的完成量——任务页的「总队列」
+        "batchesExpected": cycle.batches_expected,
+        "batchesDone": cycle.batches_done,
         "enteredRepairing": cycle.repairing_at is not None,
         "startedAt": cycle.started_at.isoformat() if cycle.started_at else None,
         "runningAt": cycle.running_at.isoformat() if cycle.running_at else None,
@@ -307,24 +336,25 @@ async def write_stats(cycle_id: int, stats: dict) -> bool:
     统计是观测结果，不参与控制：任何读取面（调度、重试、worker 数）都不得
     以这些数字作为输入。
     """
-    async with get_session_factory()() as session:
-        cycle = await session.get(PriceCycle, cycle_id)
-        if cycle is None:
-            return False
-        cycle.targets_total = stats["targetsTotal"]
-        cycle.targets_done = stats["targetsDone"]
-        cycle.units_expected = stats["unitsExpected"]
-        cycle.units_ok = stats["unitsOk"]
-        cycle.units_locked = stats["unitsLocked"]
-        cycle.units_failed = stats["unitsFailed"]
-        cycle.units_unobserved = stats["unitsUnobserved"]
-        cycle.coverage = stats["coverage"]
-        cycle.coverage_confirmed = stats["coverageConfirmed"]
-        cycle.coverage_json = stats.get("perAppid")
-        cycle.stale_count = stats["staleCount"]
-        cycle.duration_seconds = stats["durationSeconds"]
-        cycle.stage_ms_json = stats["stageMs"]
-        await session.commit()
+    async with write_slot():
+        async with get_session_factory()() as session:
+            cycle = await session.get(PriceCycle, cycle_id)
+            if cycle is None:
+                return False
+            cycle.targets_total = stats["targetsTotal"]
+            cycle.targets_done = stats["targetsDone"]
+            cycle.units_expected = stats["unitsExpected"]
+            cycle.units_ok = stats["unitsOk"]
+            cycle.units_locked = stats["unitsLocked"]
+            cycle.units_failed = stats["unitsFailed"]
+            cycle.units_unobserved = stats["unitsUnobserved"]
+            cycle.coverage = stats["coverage"]
+            cycle.coverage_confirmed = stats["coverageConfirmed"]
+            cycle.coverage_json = stats.get("perAppid")
+            cycle.stale_count = stats["staleCount"]
+            cycle.duration_seconds = stats["durationSeconds"]
+            cycle.stage_ms_json = stats["stageMs"]
+            await session.commit()
     return True
 
 

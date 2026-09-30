@@ -11,9 +11,9 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, text
 
-from app.core.database import get_session_factory
+from app.core.database import get_session_factory, write_slot
 from app.core.events import bus
 from app.crawler.config import DEFAULT_WORKER_COUNT, HTTP_TIMEOUT, WORKERS_MAX
 from app.crawler.runner import CrawlRunConfig, run_crawl
@@ -351,15 +351,34 @@ async def _load_job(job_id: int) -> CrawlJob | None:
 
 
 async def _finish_job(job_id: int, status: str, stats: dict | None = None, error: str | None = None) -> None:
-    async with get_session_factory()() as session:
-        job = await session.get(CrawlJob, job_id)
-        if job is None:
-            return
-        job.status = status
-        job.stats_json = stats
-        job.finished_at = datetime.now()
-        job.error = error
-        await session.commit()
+    async with write_slot():
+        async with get_session_factory()() as session:
+            job = await session.get(CrawlJob, job_id)
+            if job is None:
+                return
+            job.status = status
+            # stats=None（异常收尾）保留启动时落的初始账本——分母不能丢
+            job.stats_json = stats if stats is not None else job.stats_json
+            job.finished_at = datetime.now()
+            job.error = error
+            if job.cycle_id is not None:
+                # 轮批次完成账：挂轮各 job 的已处理量之和，收尾一拍重算
+                # （不增量累加——停止/失败后的重跑会把同一批计两次）。
+                # 先 flush 本 job 的统计再聚合，原生 SQL 才能看到本笔。
+                from app.domains.crawl.cycle import PriceCycle
+
+                await session.flush()
+                row = await session.execute(
+                    text(
+                        "SELECT COALESCE(SUM(json_extract(stats_json, '$.processed')), 0) "
+                        "FROM crawl_jobs WHERE cycle_id = :cid"
+                    ),
+                    {"cid": job.cycle_id},
+                )
+                cycle = await session.get(PriceCycle, job.cycle_id)
+                if cycle is not None:
+                    cycle.batches_done = int(row.scalar_one())
+            await session.commit()
     bus.publish("job.status", job_id=job_id, status=status, error=error)
 
 
@@ -743,18 +762,32 @@ async def start_job(
             exit_keys=run_plan["exit_keys"],
             exit_nodes=run_plan["nodes"],
         )
-    async with get_session_factory()() as session:
-        job = CrawlJob(
-            kind=kind,
-            status="running",
-            mode="app",
-            regions_json=effective,
-            started_at=datetime.now(),
-            cycle_id=cycle_id,
-        )
-        session.add(job)
-        await session.commit()
-        job_id = job.id
+    # 任务行落库过 write_slot 闸：定时写者（体检台账/钱包轮转）密集时不过闸的
+    # commit 会在 SQLite 写锁上排满 busy_timeout 超时——主轮建不出任务行，用户
+    # 手动启动的任务也迟迟建不出来（表现为「任务启动很慢/整轮崩」）。
+    # 轮账本的精确批次：count 的两个成分在建行前都已知（pairs / pre_tasks
+    # 均已解析），随行落库——任务页的轮级「总队列」从启动一刻就有这一段的
+    # 精确分母，不再等收尾统计。
+    pre_rows = sum(
+        len(t["appids"]) if "appids" in t else 1 for t in (pre_tasks or [])
+    )
+    count = len(pairs) + pre_rows
+    # 口径与 run_crawl 的收尾统计一致：pool/catalog 段 = 批量桶数，
+    # missing/repair 段 = 欠账行数（每行一发）
+    async with write_slot():
+        async with get_session_factory()() as session:
+            job = CrawlJob(
+                kind=kind,
+                status="running",
+                mode="app",
+                regions_json=effective,
+                started_at=datetime.now(),
+                cycle_id=cycle_id,
+                stats_json={"total": count, "processed": 0, "success": 0, "failed": 0},
+            )
+            session.add(job)
+            await session.commit()
+            job_id = job.id
 
     stop_event = asyncio.Event()
     task = asyncio.create_task(
@@ -762,12 +795,6 @@ async def start_job(
     )
     _active = JobHandle(id=job_id, task=task, stop_event=stop_event)
 
-    # 口径按欠账行数计（appid × 区）：批量补抓一发装该区 ≤400 行，同一
-    # appid 的多区欠账各算一行；兼容形状缺 appids 键的按 1 行计
-    pre_rows = sum(
-        len(t["appids"]) if "appids" in t else 1 for t in (pre_tasks or [])
-    )
-    count = len(pairs) + pre_rows
     bus.publish("job.started", job_id=job_id, scope=scope, count=count, regions=effective)
     logger.info(
         "任务 %d 已启动：kind=%s scope=%s 共 %d 项（预构建补抓 %d 发 / %d 行）",
