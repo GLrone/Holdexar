@@ -36,10 +36,11 @@ from app.domains.games.models import (
     GamePriceHistory,
 )
 from app.domains.games.scoring import (
-    familiarity_score,
     quality_score,
     save_score,
+    series_score,
     smart_score,
+    steam_board_score,
     timing_score,
 )
 from app.domains.games.sorting import build_order_by
@@ -1618,11 +1619,12 @@ async def refresh_pp_flags(appids: list[int] | None = None) -> int:
 
 
 async def _refresh_smart_scores(session: AsyncSession, appids: list[int] | None) -> int:
-    """重算 games.smart_score（refresh_sort_cache 的组成部分）。
+    """重算 games.smart_score / games.steam_board（refresh_sort_cache 的组成部分）。
 
     输入列 diff_fen / hl_flag 必须已刷新（启动链与爬取增量路径均保证
     hl_flags → sort_cache 顺序）；CN 折扣左联取 ok 行，无行按无折扣计。
-    Python 侧算分（公式见 scoring.py），不依赖 SQLite 数学函数。
+    steam_board 快照随 smart_score 同事务写入（系列认知度由既有 series_id
+    现读，不落列）。Python 侧算分（公式见 scoring.py），不依赖 SQLite 数学函数。
     """
     stmt = (
         select(
@@ -1632,6 +1634,7 @@ async def _refresh_smart_scores(session: AsyncSession, appids: list[int] | None)
             Game.review_count,
             Game.hl_flag,
             func.coalesce(GameCurrentPrice.discount_percent, 0),
+            Game.series_id,
         )
         .join(
             GameCurrentPrice,
@@ -1654,14 +1657,29 @@ async def _refresh_smart_scores(session: AsyncSession, appids: list[int] | None)
     rows = (await session.execute(stmt)).all()
     if not rows:
         return 0
+    # 认知度信号读各自的既有账本（一次批量装载，不逐行查）：Steam 官方榜单
+    # （monitor_sources source='board'）/ 系列（既有 series_id）。快照列与 smart_score
+    # 同事务刷新——GET 侧只读快照，展示与 ORDER BY 不会读到两套口径。
+    from app.domains.monitoring.service import active_source_appids
+
+    steam_board = await active_source_appids("board", session)
     await session.execute(
         update(Game),
         [
             {
                 "appid": appid,
-                "smart_score": smart_score(diff, rate, reviews, hl, disc),
+                "steam_board": appid in steam_board,
+                "smart_score": smart_score(
+                    diff,
+                    rate,
+                    reviews,
+                    hl,
+                    disc,
+                    steam_board=appid in steam_board,
+                    series=bool(series_id),
+                ),
             }
-            for appid, diff, rate, reviews, hl, disc in rows
+            for appid, diff, rate, reviews, hl, disc, series_id in rows
         ],
     )
     return len(rows)
@@ -1790,7 +1808,8 @@ def _build_list_item(
         "save": round(save_score(game.diff_fen), 3),
         "quality": round(quality_score(game.positive_rate, game.review_count), 3),
         "timing": round(timing_score(game.hl_flag, discount), 2),
-        "familiarity": round(familiarity_score(game.review_count), 3),
+        "steamBoard": round(steam_board_score(game.steam_board), 3),
+        "series": round(series_score(bool(game.series_id)), 3),
     }
 
     return {
@@ -1825,9 +1844,17 @@ def _build_list_item(
         "unavailableRegions": sorted(unavailable_regions),
         "hlFlag": game.hl_flag or 0,
         "ppFlag": game.pp_flag or 0,
-        # smart 评分（0~1 加权和）与四因子拆解（实验池对照展示用）
+        # smart 评分（0~1 加权和）与五因子拆解（实验池对照展示用）
         "smartScore": round(
-            smart_score(game.diff_fen, game.positive_rate, game.review_count, game.hl_flag, discount),
+            smart_score(
+                game.diff_fen,
+                game.positive_rate,
+                game.review_count,
+                game.hl_flag,
+                discount,
+                steam_board=bool(game.steam_board),
+                series=bool(game.series_id),
+            ),
             4,
         ),
         "smartFactors": smart_factors,

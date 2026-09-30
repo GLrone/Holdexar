@@ -1,22 +1,30 @@
 """smart 排序评分（纯函数）。
 
-四个因子取代「史低优先度硬前缀」字典序——折扣从参赛资格
-降级为加分项，原价但差价大的游戏凭省钱/质量/熟悉度回到前排：
+五个因子取代「史低优先度硬前缀」字典序——折扣从参赛资格降级为加分项，
+原价但差价大的游戏凭省钱/质量回到前排；两个认知度信号（Steam 官方榜单 /
+系列 IP）把「玩家认识的名字」往前拉：
 
-  S_smart = 0.50*S_save + 0.28*S_quality + 0.14*S_timing + 0.08*S_familiarity
+  S_smart = 0.50*S_save + 0.25*S_quality + 0.10*S_timing
+          + 0.11*S_steam_board + 0.04*S_series
 
   S_save        = min(1, ln(1+D/20) / ln(11))            D = 差价（元），¥200 封顶
   S_quality     = p - (p-0.5)·2^(-log10(N+1))            SteamDB 置信度收缩；
                                                            N=0 时定义 0.5（无数据 = 中性，
                                                            不是差评）
   S_timing      = 原价 0 / 普通折扣 0.35 / 平史低 0.75 / 新史低 1.00
-  S_familiarity = min(1, log10(N+1) / log10(100001))     10 万评测封顶，刻意轻权重
-                                                           （N 已参与 quality，只做
-                                                           「淡季不全是陌生游戏」的托底）
+  S_steam_board = 上过 Steam 官方榜单 1.0 / 否则 0.0      账本 = monitor_sources
+                                                           source='board'（热销 / 热门
+                                                           新品 / 即将推出轮询落池）
+  S_series      = 属于某个游戏系列 1.0 / 否则 0.0          账本 = games.series_id
 
-timing 只认 hl_flag 分档，不叠加 discount_percent——史低+90%off 是同一
-件事，不重复奖励（因子相关性）。pp_flag 是近期调价方向（新闻信号），
-与「长期低价」语义错位，不参与评分。
+两个认知度信号都**不用本作的 review_count**：N 已进 quality（置信度收缩），
+认知度再用一次 N，就是同一信号被二次加权，识别不出「玩家一看名字就认识的
+经典 IP」——知名系列新作评测可能只有几千却认知极高，冷门独立游戏评测三千
+五百却无人识。「上没上过榜 / 是不是某个 IP 的一员」才是认知度的口径。
+
+timing 只认 hl_flag 分档，不叠加 discount_percent——史低+90%off 是同一件事，
+不重复奖励（因子相关性）。pp_flag 是近期调价方向（新闻信号），与「长期低价」
+语义错位，不参与评分。
 
 全部在 Python 侧计算（refresh_sort_cache 落库），不依赖 SQLite 数学函数
 ——打包产物捆绑的 sqlite 未验证 SQLITE_ENABLE_MATH_FUNCTIONS。
@@ -27,15 +35,13 @@ import math
 
 # ── 权重（调参改这里，不动公式）──
 W_SAVE = 0.50
-W_QUALITY = 0.28
-W_TIMING = 0.14
-W_FAMILIARITY = 0.08
+W_QUALITY = 0.25
+W_TIMING = 0.10
+W_STEAM_BOARD = 0.11
+W_SERIES = 0.04
 
 # S_save：对数压缩。差价 ¥20 起价值感陡增，¥200 之后边际价值趋零
 # 归一化分母 = ln(1 + 200/20) = ln(11)
-
-# S_familiarity：10 万评测 = 熟悉度满分
-FAMILIAR_CAP_REVIEWS = 100000
 
 # S_timing 四档（键 = hl_flag）
 TIMING_FLAT_LOW = 0.75  # 平史低
@@ -71,10 +77,14 @@ def timing_score(hl_flag: int | None, discount_percent: int | None) -> float:
     return TIMING_DISCOUNT
 
 
-def familiarity_score(review_count: int | None) -> float:
-    """熟悉度因子：评测规模的对数，10 万封顶。刻意轻权重（quality 已用了 N）。"""
-    n = review_count or 0
-    return min(1.0, math.log10(n + 1) / math.log10(FAMILIAR_CAP_REVIEWS + 1))
+def steam_board_score(on_board: bool | None) -> float:
+    """Steam 官方榜单因子：上过榜单（monitor_sources source='board'）= 1.0。"""
+    return 1.0 if on_board else 0.0
+
+
+def series_score(in_series: bool | None) -> float:
+    """系列 / IP 因子：属于某个游戏系列（games.series_id 非空）= 1.0。"""
+    return 1.0 if in_series else 0.0
 
 
 def smart_score(
@@ -83,11 +93,19 @@ def smart_score(
     review_count: int | None,
     hl_flag: int | None,
     discount_percent: int | None,
+    *,
+    steam_board: bool | None = False,
+    series: bool | None = False,
 ) -> float:
-    """V1 综合分（0~1）。四因子加权，无隐藏项。"""
+    """V1 综合分（0~1）。五因子加权，无隐藏项。
+
+    steam_board / series = 两个认知度开关（各自快照列，见 refresh_sort_cache）；
+    缺省 False = 未认知，不影响前三个因子的公式与权重。
+    """
     return (
         W_SAVE * save_score(diff_fen)
         + W_QUALITY * quality_score(positive_rate, review_count)
         + W_TIMING * timing_score(hl_flag, discount_percent)
-        + W_FAMILIARITY * familiarity_score(review_count)
+        + W_STEAM_BOARD * steam_board_score(steam_board)
+        + W_SERIES * series_score(series)
     )

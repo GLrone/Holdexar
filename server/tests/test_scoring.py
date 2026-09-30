@@ -1,20 +1,22 @@
 """smart 排序评分（scoring.py）的公式验收。
 
-数值断言对齐评分对照表（对数压缩 / SteamDB 收缩 / timing 四档 / 熟悉度封顶），
-调权重或常量时应同步这里的期望值。
+数值断言对齐评分对照表（对数压缩 / SteamDB 收缩 / timing 四档 / 两个认知度
+信号），调权重或常量时应同步这里的期望值。
 """
 import pytest
 
 from app.domains.games.scoring import (
-    familiarity_score,
     quality_score,
     save_score,
+    series_score,
     smart_score,
+    steam_board_score,
     timing_score,
-    W_SAVE,
     W_QUALITY,
+    W_SAVE,
+    W_SERIES,
+    W_STEAM_BOARD,
     W_TIMING,
-    W_FAMILIARITY,
 )
 
 
@@ -72,34 +74,53 @@ class TestTimingScore:
         assert timing_score(None, None) == 0.0
 
 
-class TestFamiliarityScore:
-    """S_familiarity：log10(N+1)/log10(100001)，10 万封顶。"""
+class TestRecognitionScores:
+    """两个认知度信号：命中 = 1.0 / 未命中（含 None）= 0.0（与评测规模解耦）。"""
 
-    def test_scale(self):
-        assert familiarity_score(0) == 0.0
-        assert familiarity_score(1000) == pytest.approx(0.600, abs=1e-3)
-        assert familiarity_score(100000) == 1.0
-        assert familiarity_score(10**7) == 1.0  # 封顶
+    def test_steam_board(self):
+        assert steam_board_score(True) == 1.0
+        assert steam_board_score(False) == 0.0
+        assert steam_board_score(None) == 0.0
 
-    def test_none(self):
-        assert familiarity_score(None) == 0.0
+    def test_series(self):
+        assert series_score(True) == 1.0
+        assert series_score(False) == 0.0
+        assert series_score(None) == 0.0
 
 
 class TestSmartScore:
     """加权和：因子各自正确时总和 = Σ w_i·S_i。"""
 
     def test_weights_sum_to_one(self):
-        assert W_SAVE + W_QUALITY + W_TIMING + W_FAMILIARITY == pytest.approx(1.0)
+        assert (
+            W_SAVE + W_QUALITY + W_TIMING + W_STEAM_BOARD + W_SERIES
+        ) == pytest.approx(1.0)
 
     def test_total_is_weighted_sum(self):
-        total = smart_score(5000, 9500, 5000, 1, 50)
+        total = smart_score(5000, 9500, 5000, 1, 50, steam_board=True, series=True)
         expected = (
             W_SAVE * save_score(5000)
             + W_QUALITY * quality_score(9500, 5000)
             + W_TIMING * timing_score(1, 50)
-            + W_FAMILIARITY * familiarity_score(5000)
+            + W_STEAM_BOARD * steam_board_score(True)
+            + W_SERIES * series_score(True)
         )
         assert total == pytest.approx(expected, abs=1e-9)
+
+    def test_each_recognition_flag_adds_its_weight(self):
+        # 两个认知度开关各自只贡献自己的权重，互不串味
+        base = smart_score(5000, 9500, 5000, 1, 50)
+        assert smart_score(5000, 9500, 5000, 1, 50, steam_board=True) - base == (
+            pytest.approx(W_STEAM_BOARD, abs=1e-9)
+        )
+        assert smart_score(5000, 9500, 5000, 1, 50, series=True) - base == (
+            pytest.approx(W_SERIES, abs=1e-9)
+        )
+
+    def test_flags_default_off(self):
+        assert smart_score(5000, 9500, 5000, 1, 50) == smart_score(
+            5000, 9500, 5000, 1, 50, steam_board=False, series=False
+        )
 
     def test_product_example_ordering(self):
         """排序示例：C（高差价+新史低）> A（原价大作）≈ B（冷门新史低）。

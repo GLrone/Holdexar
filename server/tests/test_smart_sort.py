@@ -92,7 +92,7 @@ async def test_legacy_puts_discounted_first():
 
 @pytest.mark.asyncio
 async def test_smart_breaks_discount_wall():
-    """smart 下 P1 反超：原价但差价/质量/熟悉度俱佳的款回到前排。"""
+    """smart 下 P1 反超：原价但差价/质量俱佳的款回到前排。"""
     await _seed()
     try:
         ids = await _probe_ids("smart")
@@ -109,17 +109,62 @@ async def test_smart_score_persisted_and_exposed():
         res = await games_service.list_games(sort="smart", limit=100, q="smart-probe")
         by_id = {it["appid"]: it for it in res["items"]}
         p1 = by_id[P1]
+        # 探针未入任何认知度账本 → 两个认知度因子全 0
         expected = smart_score(3000, 9700, 200000, 0, 0)
         assert p1["smartScore"] == pytest.approx(expected, abs=1e-4)
-        # 四因子拆解：save(¥30)>0 / quality 高 / timing=0（原价）/ familiarity=1
+        # 五因子拆解：save(¥30)>0 / quality 高 / timing=0（原价）/ 两个认知度全 0
         f = p1["smartFactors"]
         assert f["save"] > 0.3 and f["quality"] > 0.9
-        assert f["timing"] == 0.0 and f["familiarity"] == 1.0
+        assert f["timing"] == 0.0
+        assert f["steamBoard"] == 0.0 and f["series"] == 0.0
         # 打折款的 timing 拿满、save 几乎为 0——两款的差异来路一目了然
         p2 = by_id[P2]
         assert p2["smartFactors"]["timing"] == 1.0
         assert p2["smartFactors"]["save"] < 0.05
     finally:
+        await _cleanup()
+
+
+@pytest.mark.asyncio
+async def test_steam_board_source_drives_board_factor():
+    """Steam 榜单接线验收：monitor_sources 有 board 来源 → steam_board 因子 1.0，
+    smart_score 恰好抬高 W_STEAM_BOARD（其余因子不动）。"""
+    from app.domains.games.scoring import W_STEAM_BOARD
+    from app.domains.monitoring.models import MonitorSource
+
+    def _board_row_del():
+        return delete(MonitorSource).where(
+            MonitorSource.target_type == "game",
+            MonitorSource.target_id == P1,
+            MonitorSource.source == "board",
+        )
+
+    await _seed()
+    try:
+        async with get_session_factory()() as s:
+            await s.execute(_board_row_del())
+            s.add(
+                MonitorSource(
+                    target_type="game",
+                    target_id=P1,
+                    source="board",
+                    priority=20,
+                    active=True,
+                )
+            )
+            await s.commit()
+        await games_service.refresh_sort_cache([P1, P2])
+
+        res = await games_service.list_games(sort="smart", limit=100, q="smart-probe")
+        by_id = {it["appid"]: it for it in res["items"]}
+        p1 = by_id[P1]
+        assert p1["smartFactors"]["steamBoard"] == 1.0
+        base = smart_score(3000, 9700, 200000, 0, 0)
+        assert p1["smartScore"] == pytest.approx(base + W_STEAM_BOARD, abs=1e-4)
+    finally:
+        async with get_session_factory()() as s:
+            await s.execute(_board_row_del())
+            await s.commit()
         await _cleanup()
 
 

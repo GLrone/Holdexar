@@ -38,13 +38,15 @@ from app.domains.games.pricing import (
     format_minor_units,
 )
 from app.domains.games.scoring import (
-    W_FAMILIARITY,
     W_QUALITY,
     W_SAVE,
+    W_SERIES,
+    W_STEAM_BOARD,
     W_TIMING,
-    familiarity_score,
     quality_score,
     save_score,
+    series_score,
+    steam_board_score,
 )
 from app.domains.games.service import get_rates
 
@@ -362,8 +364,11 @@ def _bundle_smart_score(
     baseline_appids: list[int],
     region_prices: dict[str, dict],
     review_stats: dict[int, tuple[int | None, int | None]],
+    *,
+    steam_board: set[int],
+    series: set[int],
 ) -> float:
-    """捆绑包 smart 评分（0~1）：四因子复刻 games/scoring.py，权重同构。
+    """捆绑包 smart 评分（0~1）：五因子复刻 games/scoring.py，权重同构。
 
     - S_save        = save_score(diff_fen)，同公式：外区相对国区的折算差价，
                       对数压缩、¥200 封顶；
@@ -373,15 +378,19 @@ def _bundle_smart_score(
                       现折扣超过结构化基础档（discount_percent >
                       bundle_base_discount，Steam 促销期在档位折扣上额外叠加），
                       促销中即最佳购买时机，不做分档；
-    - S_familiarity = 成员游戏评测规模均值（log10，10 万封顶，轻权重）。
+    - 两个认知度信号 = 成员游戏命中率的均值，口径与 games 同源（各自独立账本）：
+      S_steam_board / S_series = 成员上过 Steam 官方榜单 / 属于某个系列的比例。
     """
     s_save = save_score(diff_fen)
-    rated = [review_stats[a] for a in baseline_appids if a in review_stats]
-    if rated:
-        s_quality = sum(quality_score(p, n) for p, n in rated) / len(rated)
-        s_familiarity = sum(familiarity_score(n) for _, n in rated) / len(rated)
+    known = [a for a in baseline_appids if a in review_stats]
+    if known:
+        n = len(known)
+        s_quality = sum(quality_score(*review_stats[a]) for a in known) / n
+        s_steam = sum(steam_board_score(a in steam_board) for a in known) / n
+        s_series = sum(series_score(a in series) for a in known) / n
     else:
-        s_quality, s_familiarity = 0.5, 0.0
+        s_quality = 0.5
+        s_steam = s_series = 0.0
     promo = any(
         rp["discountPercent"] > rp["baseDiscount"]
         for rp in region_prices.values()
@@ -392,7 +401,8 @@ def _bundle_smart_score(
         W_SAVE * s_save
         + W_QUALITY * s_quality
         + W_TIMING * s_timing
-        + W_FAMILIARITY * s_familiarity
+        + W_STEAM_BOARD * s_steam
+        + W_SERIES * s_series
     )
 
 
@@ -401,6 +411,9 @@ def _snapshot_values(
     price_rows: list,
     tracked: set[str] | None,
     review_stats: dict[int, tuple[int | None, int | None]],
+    *,
+    steam_board: set[int],
+    series: set[int],
 ) -> tuple[int | None, int, bool, list[int], float]:
     """单包排序快照：min_cny_fen / diff_fen / is_lowest / 基准 appids / smart_score。
 
@@ -409,8 +422,8 @@ def _snapshot_values(
     - diff_fen = MAX(国区价 − COALESCE(最低, 国区价), 0)（无国区价 = 0）；
     - is_lowest = 国区价 ≈ 追踪区最低（±5 元）——国区买即（近似）全球最低，
       判据对齐 games 的 isLowest 筛选语义；无国区价（锁区/无数据）恒 False；
-    - smart_score = _bundle_smart_score（成员游戏 = 基准 appids 与 games 表
-      的交集，评测数据由 refresh 调用方一次装载传入）。
+    - smart_score = _bundle_smart_score（成员游戏 = 基准 appids 与 games 表的
+      交集，评测数据与三个认知度集合由 refresh 调用方一次装载传入）。
     """
     region_prices, baseline_appids = _family_region_prices(bundle, price_rows, tracked)
     others = [
@@ -426,7 +439,14 @@ def _snapshot_values(
             0,
             False,
             baseline_appids,
-            _bundle_smart_score(0, baseline_appids, region_prices, review_stats),
+            _bundle_smart_score(
+                0,
+                baseline_appids,
+                region_prices,
+                review_stats,
+                steam_board=steam_board,
+                series=series,
+            ),
         )
     reference = min_cny_fen if min_cny_fen is not None else cn_cny_fen
     diff_fen = max(cn_cny_fen - reference, 0)
@@ -436,7 +456,14 @@ def _snapshot_values(
         diff_fen,
         is_lowest,
         baseline_appids,
-        _bundle_smart_score(diff_fen, baseline_appids, region_prices, review_stats),
+        _bundle_smart_score(
+            diff_fen,
+            baseline_appids,
+            region_prices,
+            review_stats,
+            steam_board=steam_board,
+            series=series,
+        ),
     )
 
 
@@ -499,16 +526,28 @@ async def _refresh_bundle_sort_cache(
         by_bundle.setdefault(p.bundle_id, []).append(p)
 
     tracked = await _tracked_region_codes()
-    # smart 评分的成员游戏评测数据：全表三列一次装载（后台重活，与 14.1 万行
-    # 价格装载同量级），逐包按基准 appids 查表
+    # smart 评分的成员游戏评测 / 认知度数据：全表一次装载（后台重活，与 14.1 万行
+    # 价格装载同量级），逐包按基准 appids 查表。两个认知度集合各读自己的既有账本
+    # （monitor_sources board / games.series_id），不另算。
+    from app.domains.monitoring.service import active_source_appids
+
     stat_rows = (
-        await db.execute(select(Game.appid, Game.positive_rate, Game.review_count))
+        await db.execute(
+            select(Game.appid, Game.positive_rate, Game.review_count, Game.series_id)
+        )
     ).all()
     review_stats = {r.appid: (r.positive_rate, r.review_count) for r in stat_rows}
+    series_appids = {r.appid for r in stat_rows if r.series_id}
+    board_appids = await active_source_appids("board", db)
     updates = []
     for b in bundles:
         min_fen, diff_fen, is_lowest, _baseline, smart = _snapshot_values(
-            b, by_bundle.get(b.bundle_id, []), tracked, review_stats
+            b,
+            by_bundle.get(b.bundle_id, []),
+            tracked,
+            review_stats,
+            steam_board=board_appids,
+            series=series_appids,
         )
         updates.append(
             {
