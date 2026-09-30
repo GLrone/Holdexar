@@ -56,9 +56,18 @@ const crawl = {
   'crawl.jobs.refresh': '刷新任务记录',
 
   /* 实时进度（SSE）：一条整句，分隔符在词条内。done/total 是批次口径
-     （1 批 = 1 区 × ≤400 款），速度按批次/分钟显示 */
+     （1 批 = 1 区 × ≤400 款）；价格主轮跑动中为轮内累计——多段串行
+     （监控池 → 未关注目录 → 特惠榜）合成一个总队列；ok/fail/qsize/speed
+     仍是当前任务段的实时计数。速度按批次/分钟显示 */
   'crawl.progress.meta':
     '已处理 {done}/{total} · 成功 {ok} · 失败 {fail} · 队列 {qsize} · {speed} 批/分',
+
+  /* 系统侧活动（不是任务，任务列表看不到） */
+  'crawl.sys.starting': '正在启动任务：后端在登记队列与排定出口，稍等片刻',
+  'crawl.sys.maintenance':
+    '系统体检进行中：正在逐个检测代理通道，价格抓取会自动让路，无需操作',
+  'crawl.sys.throttled':
+    '正在排队等发送窗口：{n} 个请求在限流队列中，任务会自动继续',
 
   /* 自动价格链开关 */
   'crawl.autoPrice.label': '自动价格更新',
