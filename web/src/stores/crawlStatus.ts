@@ -50,14 +50,17 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
       }
       const jobs = await crawlApi.jobs(10)
       let finishedDone = 0
-      let finishedTotal = 0
+      let startedTotal = 0
       for (const job of jobs) {
         if (job.cycleId !== cycle.id) continue
         finishedDone += job.stats?.processed ?? 0
-        finishedTotal += job.stats?.total ?? 0
+        startedTotal += job.stats?.total ?? 0
       }
       roundDone.value = finishedDone
-      roundTotal.value = finishedTotal
+      /* 分母 = 建轮冻结的轮批次总账与已启动段精确 count 的较大者：冻结预估
+         不含补抓欠账段、批量切分也可能比预估细，启动后以精确值兜底——两者
+         都齐了总数不再随段启动跳变，「总队列」从建轮起可见 */
+      roundTotal.value = Math.max(cycle.batchesExpected ?? 0, startedTotal)
       roundTracking.value = true
     } catch {
       /* 拉不到轮次不改现有展示 */

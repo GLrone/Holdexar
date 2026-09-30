@@ -13,7 +13,7 @@ from datetime import datetime
 
 from sqlalchemy import or_, select, text
 
-from app.core.database import get_session_factory, write_slot
+from app.core.database import WritePriority, get_session_factory, write_gate
 from app.core.events import bus
 from app.crawler.config import DEFAULT_WORKER_COUNT, HTTP_TIMEOUT, WORKERS_MAX
 from app.crawler.runner import CrawlRunConfig, run_crawl
@@ -53,7 +53,7 @@ _PROCESS_STARTED_AT = get_beijing_time_obj().replace(tzinfo=None)
 
 async def cleanup_orphan_jobs() -> None:
     """进程启动时把上一进程遗留的 running 任务标记为失败。"""
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         rows = (
             await session.execute(
                 select(CrawlJob).where(
@@ -351,8 +351,8 @@ async def _load_job(job_id: int) -> CrawlJob | None:
 
 
 async def _finish_job(job_id: int, status: str, stats: dict | None = None, error: str | None = None) -> None:
-    async with write_slot():
-        async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND):
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             job = await session.get(CrawlJob, job_id)
             if job is None:
                 return
@@ -762,20 +762,20 @@ async def start_job(
             exit_keys=run_plan["exit_keys"],
             exit_nodes=run_plan["nodes"],
         )
-    # 任务行落库过 write_slot 闸：定时写者（体检台账/钱包轮转）密集时不过闸的
-    # commit 会在 SQLite 写锁上排满 busy_timeout 超时——主轮建不出任务行，用户
-    # 手动启动的任务也迟迟建不出来（表现为「任务启动很慢/整轮崩」）。
-    # 轮账本的精确批次：count 的两个成分在建行前都已知（pairs / pre_tasks
-    # 均已解析），随行落库——任务页的轮级「总队列」从启动一刻就有这一段的
-    # 精确分母，不再等收尾统计。
-    pre_rows = sum(
-        len(t["appids"]) if "appids" in t else 1 for t in (pre_tasks or [])
-    )
-    count = len(pairs) + pre_rows
-    # 口径与 run_crawl 的收尾统计一致：pool/catalog 段 = 批量桶数，
-    # missing/repair 段 = 欠账行数（每行一发）
-    async with write_slot():
-        async with get_session_factory()() as session:
+    # 任务行落库过写调度器：定时写者（体检台账/钱包轮转）密集时不过闸的
+    # commit 会在 SQLite 写锁上排队到超时——主轮建不出任务行，用户手动启动
+    # 的任务也迟迟建不出来。
+    # 轮账本的初始批次：与 run_crawl 收尾统计同口径（total_target = 初始任务数）
+    # —— browse 批量段是「区数 × 款数÷单发容量」的桶数，补抓段是 pre_tasks
+    # 的发数（行数只是日志口径），口径错位会让进度条永远跑不满。
+    from app.crawler.browse_store import DEFAULT_BATCH_SIZE
+
+    if pre_tasks:
+        initial_total = len(pre_tasks)
+    else:
+        initial_total = -(-len(pairs) // DEFAULT_BATCH_SIZE) * len(effective)
+    async with write_gate(WritePriority.BACKGROUND):
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             job = CrawlJob(
                 kind=kind,
                 status="running",
@@ -783,7 +783,9 @@ async def start_job(
                 regions_json=effective,
                 started_at=datetime.now(),
                 cycle_id=cycle_id,
-                stats_json={"total": count, "processed": 0, "success": 0, "failed": 0},
+                stats_json={
+                    "total": initial_total, "processed": 0, "success": 0, "failed": 0,
+                },
             )
             session.add(job)
             await session.commit()
@@ -795,6 +797,11 @@ async def start_job(
     )
     _active = JobHandle(id=job_id, task=task, stop_event=stop_event)
 
+    # 事件与日志沿用「项数」口径（款数/行数），初始账本的桶口径见上
+    pre_rows = sum(
+        len(t["appids"]) if "appids" in t else 1 for t in (pre_tasks or [])
+    )
+    count = len(pairs) + pre_rows
     bus.publish("job.started", job_id=job_id, scope=scope, count=count, regions=effective)
     logger.info(
         "任务 %d 已启动：kind=%s scope=%s 共 %d 项（预构建补抓 %d 发 / %d 行）",
