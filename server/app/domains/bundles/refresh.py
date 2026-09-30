@@ -34,7 +34,7 @@ from datetime import datetime
 import aiohttp
 from sqlalchemy import delete, func, select
 
-from app.core.database import get_session_factory
+from app.core import database as _database
 from app.crawler import browse_store as bs
 from app.crawler.config import CC_LIST
 from app.domains.games.models import Bundle, BundleRegionPrice, Game
@@ -42,6 +42,17 @@ from app.domains.games.pricing import convert_minor_to_cny_fen
 from app.domains.games.service import get_rates
 
 from .service import invalidate_bundles_cache, refresh_bundle_sort_cache
+
+
+def get_session_factory():
+    """晚绑定取会话工厂。
+
+    模块级 `from ... import get_session_factory` 会把工厂对象**在导入那一刻**
+    钉死：本模块是惰性导入的（各入口函数内 import），若导入恰逢工厂被替换
+    （测试夹具给临时库打桩），本模块就永久持有那个库的连接工厂，读写全部
+    落到错误的库。经模块属性每次现取，导入时机不再影响取到谁。
+    """
+    return _database.get_session_factory()
 
 logger = logging.getLogger(__name__)
 

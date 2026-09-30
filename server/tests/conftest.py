@@ -36,19 +36,16 @@ def _sanitize_db_lru_caches():
 
     orig_engine = database_module.get_engine
     orig_factory = database_module.get_session_factory
-    expected = str(database_module.get_settings().db_url)
+    # 无条件清：条件式判断（比 bind 与当前配置）在夹具还原次序下会漏判——
+    # 「patch 期间被惰性导入的模块把 tmp 工厂捕获为自己的直接引用」正是它漏掉
+    # 的形态，漏判后果是整批用例静默读写上一个用例的库。清缓存的代价（每用例
+    # 重建一个引擎对象）远低于假失败排查成本。
+    orig_engine.cache_clear()
+    orig_factory.cache_clear()
+    database_module.get_settings.cache_clear()
     yield
-    try:
-        factory = orig_factory()
-    except Exception:  # noqa: BLE001 —— 取不到工厂：保守清除
-        orig_engine.cache_clear()
-        orig_factory.cache_clear()
-        return
-    bind = getattr(getattr(factory, "kw", {}), "get", lambda *_: None)("bind")
-    bind_url = str(getattr(bind, "url", "") or "")
-    if not bind_url or bind_url != expected:
-        orig_engine.cache_clear()
-        orig_factory.cache_clear()
+    orig_engine.cache_clear()
+    orig_factory.cache_clear()
     # settings 缓存同样会跨文件外溢（夹具在环境还原前清过、随后又被读回）
     database_module.get_settings.cache_clear()
 
@@ -108,19 +105,10 @@ if _env_file.is_file():
 
 @pytest.fixture(autouse=True)
 def _db_caches_fresh_before_each(_sanitize_db_lru_caches):
-    """开测前再验一次：上一文件的 teardown 清缓存后仍可能留下指向临时目录
-    的缓存工厂（teardown 清缓存发生在环境还原之前，检查与还原的先后在
-    某些夹具组合下会漏）。发现缓存库 ≠ 当前配置库就地清除，本用例从
-    真实配置库重建。"""
+    """开测前再清一次，与 `_sanitize_db_lru_caches` 同源：两级净化都无条件执行，
+    覆盖「惰性导入模块捕获旧工厂」这类判不出、只能清干净的形态。"""
     from app.core import database as database_module
 
-    expected = str(database_module.get_settings().db_url)
-    bind = getattr(
-        getattr(database_module.get_session_factory(), "kw", {}),
-        "get",
-        lambda *_: None,
-    )("bind")
-    bind_url = str(getattr(bind, "url", "") or "")
-    if not bind_url or bind_url != expected:
-        database_module.get_engine.cache_clear()
-        database_module.get_session_factory.cache_clear()
+    database_module.get_engine.cache_clear()
+    database_module.get_session_factory.cache_clear()
+    database_module.get_settings.cache_clear()
