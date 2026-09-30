@@ -7,6 +7,7 @@ import {
   type PilotAskResponse,
   type PilotFacts,
   type PilotGameFacts,
+  type PilotGameFactsItem,
   type PilotPriceFacts,
 } from '@/api/client'
 import { formatCnyFen } from '@/api/regions'
@@ -16,11 +17,11 @@ import HlDrawer from '@/components/ui/HlDrawer.vue'
 import HlTextarea from '@/components/ui/HlTextarea.vue'
 
 /**
- * 领航台：领航员的提问面板（找游戏页主入口 / 游戏详情页带对象入口）。
- * 多轮堆叠：每轮问答（问句 + 结果）保留在会话视图里可回看；
- * 候选追问轮的行可直接点选执行（同一会话内待定动作接管）。
- * thinking 通道 = 推理模型思维链，仅流式期间实时展示；
- * 回退原因 reason 是机器码，翻成用户语言在这层做。
+ * 领航台：领航员的提问面板（顶栏 / 找游戏 / 游戏详情三处入口共开）。
+ * 多轮堆叠：每轮问答（问句 + 回答 + 结构化卡片）保留可回看；
+ * 卡片 = agent 工具取到的结构化数据（games / price / action），
+ * 前端用项目组件渲染——游戏行可点进详情、价格走航报格式、动作带回执出口。
+ * thinking 通道仅流式期间实时展示；回退原因 reason 是机器码，这层翻用户语言。
  */
 const props = defineProps<{
   modelValue: boolean
@@ -46,6 +47,7 @@ interface Turn {
   reasonKey?: MessageKey
   items?: TurnItem[]
   followLink?: boolean
+  cards?: PilotFacts[]
   cached?: boolean
 }
 
@@ -79,7 +81,7 @@ function fen(v: number | null | undefined): string {
   return typeof v === 'number' && v > 0 ? formatCnyFen(v) : '—'
 }
 
-function actionText(f: PilotActionFacts): string {
+function actionReceipt(f: PilotActionFacts): string {
   if (f.action === 'monitor_add') return t('pilot.action.monitor', { name: f.name ?? '—' })
   if (f.targetType === 'historic_low') return t('pilot.action.alertLow', { name: f.name ?? '—' })
   return t('pilot.action.alertPrice', { name: f.name ?? '—', price: fen(f.targetValueFen) })
@@ -102,22 +104,41 @@ function priceBriefing(f: PilotPriceFacts): string {
 }
 
 function buildTurn(q: string, e: PilotAskResponse): Turn {
-  const f = e.facts ?? null
-  if (e.source === 'llm') return { q, kind: 'answer', text: e.answer || '' }
-  if (e.source === 'facts' && f?.kind === 'action') {
-    return { q, kind: 'action', text: actionText(f), followLink: f.action === 'monitor_add' }
-  }
-  if (e.source === 'facts' && f?.kind === 'price') return { q, kind: 'price', text: priceBriefing(f) }
-  if (e.source === 'facts' && f?.kind === 'games') {
-    return {
-      q,
-      kind: e.reason === 'need_target' ? 'candidates' : 'games',
-      items: f.items.map((it) => ({ name: it.name, cnyFen: it.cnyFen, discount: it.discount })),
-      reasonKey: e.reason === 'need_target' ? 'pilot.reason.need_target' : undefined,
+  const cards = (e.cards ?? []).filter(Boolean)
+  if (e.source === 'llm') return { q, kind: 'answer', text: e.answer || '', cards }
+  if (e.source === 'facts') {
+    if (cards.length) {
+      const first = cards[0]
+      if (first.kind === 'action') {
+        return { q, kind: 'action', text: actionReceipt(first), followLink: first.action === 'monitor_add', cards }
+      }
+      if (first.kind === 'price') return { q, kind: 'price', text: priceBriefing(first), cards }
+      return { q, kind: 'games', items: cardsGameItems(first), cards }
+    }
+    if (e.facts?.kind === 'action') {
+      return { q, kind: 'action', text: actionReceipt(e.facts), followLink: e.facts.action === 'monitor_add' }
+    }
+    if (e.facts?.kind === 'price') return { q, kind: 'price', text: priceBriefing(e.facts) }
+    if (e.facts?.kind === 'games') {
+      return {
+        q,
+        kind: e.reason === 'need_target' ? 'candidates' : 'games',
+        items: e.facts.items.map((it) => ({ name: it.name, cnyFen: it.cnyFen, discount: it.discount })),
+        reasonKey: e.reason === 'need_target' ? 'pilot.reason.need_target' : undefined,
+      }
     }
   }
   if (e.source === 'guide') return { q, kind: 'guide' }
   return { q, kind: 'reason', reasonKey: (e.reason && REASON_KEYS[e.reason]) || 'pilot.error' }
+}
+
+function cardsGameItems(f: PilotFacts): TurnItem[] {
+  if (f.kind !== 'games') return []
+  return f.items.map((it: PilotGameFactsItem) => ({
+    name: it.name,
+    cnyFen: it.cnyFen,
+    discount: it.discount,
+  }))
 }
 
 async function scrollBottom() {
@@ -132,6 +153,7 @@ async function ask(text?: string) {
   streaming.value = true
   liveThinking.value = ''
   liveAnswer.value = ''
+  liveTools.value = []
   let done: PilotAskResponse | null = null
   let failed = false
   try {
@@ -145,7 +167,7 @@ async function ask(text?: string) {
       } else if (e.type === 'done') {
         done = e as PilotAskResponse
       } else if (e.type === 'error') {
-        done = { answer: '', thinking: null, source: 'none', reason: e.reason ?? 'llm_failed', facts: null, cached: false }
+        done = { answer: '', thinking: null, source: 'none', reason: e.reason ?? 'llm_failed', facts: null, cards: [], cached: false }
       }
     })
   } catch {
@@ -154,7 +176,7 @@ async function ask(text?: string) {
   turns.value.push(
     failed
       ? { q, kind: 'reason', reasonKey: 'pilot.error' }
-      : buildTurn(q, done ?? { answer: '', thinking: null, source: 'none', reason: 'llm_failed', facts: null, cached: false }),
+      : buildTurn(q, done ?? { answer: '', thinking: null, source: 'none', reason: 'llm_failed', facts: null, cards: [], cached: false }),
   )
   streaming.value = false
   liveThinking.value = ''
@@ -221,7 +243,22 @@ function pickCandidate(turn: Turn, index: number) {
             </button>
           </div>
 
-          <div v-else-if="turn.kind === 'games'" class="pilot-briefing">
+          <div v-else-if="turn.kind === 'action' && turn.text" class="pilot-briefing">
+            <div class="pilot-briefing__title">{{ t('pilot.action.done') }}</div>
+            <p class="pilot-briefing__text">
+              {{ turn.text }}
+              <router-link v-if="turn.followLink" class="pilot-guide__link" to="/pool">
+                {{ t('pilot.action.toFollows') }}
+              </router-link>
+            </p>
+          </div>
+
+          <div v-else-if="turn.kind === 'price' && turn.text" class="pilot-briefing">
+            <div class="pilot-briefing__title">{{ t('pilot.briefing') }}</div>
+            <p class="pilot-briefing__text">{{ turn.text }}</p>
+          </div>
+
+          <div v-else-if="turn.kind === 'games' && turn.items" class="pilot-briefing">
             <div class="pilot-briefing__title">{{ t('pilot.facts.gamesTitle') }}</div>
             <ul class="pilot-games">
               <li v-for="(g, gi) in turn.items" :key="gi" class="pilot-games__item">
@@ -233,22 +270,7 @@ function pickCandidate(turn: Turn, index: number) {
             </ul>
           </div>
 
-          <div v-else-if="turn.kind === 'action'" class="pilot-briefing">
-            <div class="pilot-briefing__title">{{ t('pilot.action.done') }}</div>
-            <p class="pilot-briefing__text">
-              {{ turn.text }}
-              <router-link v-if="turn.followLink" class="pilot-guide__link" to="/pool">
-                {{ t('pilot.action.toFollows') }}
-              </router-link>
-            </p>
-          </div>
-
-          <div v-else-if="turn.kind === 'price'" class="pilot-briefing">
-            <div class="pilot-briefing__title">{{ t('pilot.briefing') }}</div>
-            <p class="pilot-briefing__text">{{ turn.text }}</p>
-          </div>
-
-          <p v-else-if="turn.kind === 'answer'" class="pilot-answer">{{ turn.text }}</p>
+          <p v-else-if="turn.kind === 'answer' && turn.text" class="pilot-answer">{{ turn.text }}</p>
 
           <div v-else-if="turn.kind === 'guide'" class="pilot-guide">
             <p class="pilot-guide__title">{{ t('pilot.guide.title') }}</p>
@@ -256,6 +278,43 @@ function pickCandidate(turn: Turn, index: number) {
             <p>{{ t('pilot.guide.alert') }}</p>
             <router-link class="pilot-guide__link" to="/library">{{ t('pilot.guide.link') }}</router-link>
           </div>
+
+          <!-- agent 轮的结构化卡片：回答之后渲染（组件复用数据层） -->
+          <template v-if="turn.cards?.length && turn.kind === 'answer'">
+            <div v-for="(c, ci) in turn.cards" :key="`c${ci}`" class="pilot-briefing">
+              <template v-if="c.kind === 'games'">
+                <div class="pilot-briefing__title">{{ t('pilot.facts.gamesTitle') }}</div>
+                <router-link
+                  v-for="g in c.items"
+                  :key="g.appid"
+                  class="pilot-cand"
+                  :to="`/game/${g.appid}`"
+                >
+                  <span class="pilot-cand__name">{{ g.name }}</span>
+                  <span class="pilot-cand__meta">
+                    {{ fen(g.cnyFen) }}<template v-if="g.discount"> · -{{ g.discount }}%</template>
+                  </span>
+                </router-link>
+              </template>
+              <template v-else-if="c.kind === 'price'">
+                <div class="pilot-briefing__title">{{ t('pilot.briefing') }}</div>
+                <p class="pilot-briefing__text">{{ priceBriefing(c) }}</p>
+              </template>
+              <template v-else-if="c.kind === 'action'">
+                <div class="pilot-briefing__title">{{ t('pilot.action.done') }}</div>
+                <p class="pilot-briefing__text">
+                  {{ actionReceipt(c) }}
+                  <router-link
+                    v-if="c.action === 'monitor_add'"
+                    class="pilot-guide__link"
+                    to="/pool"
+                  >
+                    {{ t('pilot.action.toFollows') }}
+                  </router-link>
+                </p>
+              </template>
+            </div>
+          </template>
         </div>
 
         <div v-if="streaming" class="pilot-turn">
@@ -412,6 +471,15 @@ function pickCandidate(turn: Turn, index: number) {
   word-break: break-word;
 }
 
+.pilot-tool {
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: var(--bg-card);
+  border: 1px solid var(--border-soft);
+}
+
 .pilot-answer {
   margin: 0;
   padding: 12px;
@@ -450,15 +518,6 @@ function pickCandidate(turn: Turn, index: number) {
   background: var(--bg-card);
   cursor: pointer;
   text-align: left;
-}
-
-.pilot-tool {
-  padding: 6px 12px;
-  border-radius: 8px;
-  font-size: 12px;
-  color: var(--text-secondary);
-  background: var(--bg-card);
-  border: 1px solid var(--border-soft);
 }
 
 .pilot-cand + .pilot-cand {

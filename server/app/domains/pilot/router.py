@@ -18,14 +18,19 @@ router = APIRouter(prefix="/pilot", tags=["pilot"])
 
 async def _config_payload() -> PilotConfigPayload:
     cfg = await pilot_config.load_config()
+    usage = await pilot_config.usage_month()
     return PilotConfigPayload(
         protocol=cfg["protocol"],
         enabled=cfg["enabled"],
         base_url=cfg["base_url"],
         model=cfg["model"],
+        models=cfg["models"],
         has_api_key=bool(cfg["api_key"]),
         monthly_cap=cfg["monthly_cap"],
-        usage_month=await pilot_config.usage_month(),
+        usage_inp=usage["inp"],
+        usage_out=usage["out"],
+        usage_calls=usage["calls"],
+        usage_total=usage["total"],
     )
 
 

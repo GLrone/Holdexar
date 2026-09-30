@@ -72,7 +72,11 @@ const pilot = {
   'pilot.settings.api_key': 'API Key',
   'pilot.settings.api_key_hint': '加密存储；留空表示不修改',
   'pilot.settings.monthly_cap': '每月 token 上限',
-  'pilot.settings.usage': '本月已用 {tokens} tokens',
+  'pilot.settings.usage': '本月已用 {total} tokens（输入 {inp} / 输出 {out} · {calls} 次调用）',
+  'pilot.model.testing': '测试中…',
+  'pilot.model.testOk': '连通 {ms}ms',
+  'pilot.model.rowTest': '测试',
+  'pilot.model.rowRemove': '删除',
   'pilot.settings.save': '保存领航员设置',
   'pilot.settings.saved': '已保存',
 } as const

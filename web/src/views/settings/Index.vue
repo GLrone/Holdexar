@@ -63,7 +63,6 @@ const pilotModel = ref('')
 const pilotApiKeyInput = ref('')
 const pilotHasApiKey = ref(false)
 const pilotCapText = ref('500000')
-const pilotUsage = ref(0)
 const modelDialogOpen = ref(false)
 const modelDialogPick = ref('')
 const modelDialogCustom = ref('')
@@ -76,10 +75,45 @@ function openModelDialog() {
   modelDialogOpen.value = true
 }
 
+function addModelToList(name: string) {
+  const m = name.trim()
+  if (m && !pilotModels.value.includes(m)) pilotModels.value = [...pilotModels.value, m]
+}
+
+function removeModelFromList(name: string) {
+  pilotModels.value = pilotModels.value.filter((m) => m !== name)
+  if (modelDialogPick.value === name) modelDialogPick.value = ''
+  delete modelStatus.value[name]
+}
+
+async function testModel(name: string) {
+  modelStatus.value = { ...modelStatus.value, [name]: { state: 'testing' } }
+  try {
+    const key = pilotApiKeyInput.value.trim()
+    const r = await pilotApi.test({
+      protocol: pilotProtocol.value,
+      base_url: pilotBaseUrl.value.trim(),
+      model: name,
+      ...(key ? { api_key: key } : {}),
+    })
+    modelStatus.value = {
+      ...modelStatus.value,
+      [name]: r.ok ? { state: 'ok', ms: r.latency_ms } : { state: 'fail', reason: r.reason ?? 'server_error' },
+    }
+  } catch {
+    modelStatus.value = { ...modelStatus.value, [name]: { state: 'fail', reason: 'unreachable' } }
+  }
+}
+
 function confirmModelDialog() {
   if (!modelDialogPick.value) return
   pilotModel.value = modelDialogPick.value
   modelDialogOpen.value = false
+}
+
+function testFailText(reason?: string): string {
+  const fk = `pilot.test.fail.${reason ?? 'server_error'}` as MessageKey
+  return t(fk)
 }
 
 async function testPilotConn() {
@@ -108,6 +142,8 @@ async function testPilotConn() {
 }
 const pilotModels = ref<string[]>([])
 const pilotDetecting = ref(false)
+const modelStatus = ref<Record<string, { state: 'testing' | 'ok' | 'fail'; ms?: number; reason?: string }>>({})
+const pilotUsage = ref({ inp: 0, out: 0, calls: 0, total: 0 })
 /* 协议选项存 value 不存文案（切语言跟随）；地址占位随协议变化 */
 const pilotProtocolOptions = computed(() => [
   { value: 'openai', label: t('pilot.proto.openai') },
@@ -128,7 +164,7 @@ async function detectPilot() {
       ...(key ? { api_key: key } : {}),
     })
     pilotProtocol.value = r.protocol
-    pilotModels.value = r.models || []
+    pilotModels.value = r.models?.length ? r.models : pilotModels.value
     if (!pilotModel.value && r.models?.length) pilotModel.value = r.models[0]
     if (r.key_valid === false) {
       message.error(t('pilot.detect.keybad'))
@@ -150,10 +186,13 @@ async function loadPilot() {
     pilotEnabled.value = cfg.enabled
     pilotProtocol.value = cfg.protocol || 'openai'
     pilotBaseUrl.value = cfg.base_url
-    pilotModel.value = cfg.model
+    if (!pilotModel.value) pilotModel.value = cfg.model
+    pilotModels.value = cfg.models || []
     pilotHasApiKey.value = cfg.has_api_key
     pilotCapText.value = String(cfg.monthly_cap)
-    pilotUsage.value = cfg.usage_month
+    pilotUsage.value = {
+      inp: cfg.usage_inp, out: cfg.usage_out, calls: cfg.usage_calls, total: cfg.usage_total,
+    }
   } catch {
     /* 领航员配置拉不到不影响设置页其余部分 */
   }
@@ -168,11 +207,15 @@ async function savePilot() {
       enabled: pilotEnabled.value,
       base_url: pilotBaseUrl.value.trim(),
       model: pilotModel.value.trim(),
+      models: pilotModels.value,
       ...(key ? { api_key: key } : {}),
       monthly_cap: Number(pilotCapText.value) || 0,
     })
     pilotHasApiKey.value = cfg.has_api_key
-    pilotUsage.value = cfg.usage_month
+    pilotModels.value = cfg.models || pilotModels.value
+    pilotUsage.value = {
+      inp: cfg.usage_inp, out: cfg.usage_out, calls: cfg.usage_calls, total: cfg.usage_total,
+    }
     pilotApiKeyInput.value = ''
     message.success(t('pilot.settings.saved'))
   } catch (e) {
@@ -1266,7 +1309,12 @@ onUnmounted(stopLoginPolling)
               style="max-width: 420px"
             />
             <span class="section-desc" style="display: inline; margin-left: 8px">
-              {{ t('pilot.settings.usage', { tokens: pilotUsage }) }}
+              {{ t('pilot.settings.usage', {
+                total: pilotUsage.total,
+                inp: pilotUsage.inp,
+                out: pilotUsage.out,
+                calls: pilotUsage.calls,
+              }) }}
             </span>
           </div>
         </div>
@@ -1303,23 +1351,45 @@ onUnmounted(stopLoginPolling)
           </div>
           <div class="section-desc">{{ t('pilot.model.dialogHint') }}</div>
           <div v-if="pilotModels.length" class="pilot-model-list">
-            <button
+            <div
               v-for="m in pilotModels"
               :key="m"
-              type="button"
               class="pilot-model-row"
               :class="{ 'is-pick': modelDialogPick === m }"
               @click="modelDialogPick = m"
             >
-              {{ m }}
-            </button>
+              <span class="pilot-model-row__name">{{ m }}</span>
+              <span v-if="modelStatus[m]?.state === 'testing'" class="pilot-model-row__status">
+                {{ t('pilot.model.testing') }}
+              </span>
+              <span
+                v-else-if="modelStatus[m]?.state === 'ok'"
+                class="pilot-model-row__status is-ok"
+              >
+                {{ t('pilot.model.testOk', { ms: modelStatus[m]?.ms }) }}
+              </span>
+              <span
+                v-else-if="modelStatus[m]?.state === 'fail'"
+                class="pilot-model-row__status is-fail"
+              >
+                {{ testFailText(modelStatus[m]?.reason) }}
+              </span>
+              <span class="pilot-model-row__ops">
+                <HlButton size="sm" variant="text" :disabled="modelStatus[m]?.state === 'testing'" @click.stop="testModel(m)">
+                  {{ t('pilot.model.rowTest') }}
+                </HlButton>
+                <HlButton size="sm" variant="text" @click.stop="removeModelFromList(m)">
+                  {{ t('pilot.model.rowRemove') }}
+                </HlButton>
+              </span>
+            </div>
           </div>
           <div class="settings-row__line">
             <HlInput v-model="modelDialogCustom" :placeholder="t('pilot.model.custom')" style="flex: 1" />
             <HlButton
               size="sm"
               :disabled="!modelDialogCustom.trim()"
-              @click="modelDialogPick = modelDialogCustom.trim()"
+              @click="addModelToList(modelDialogCustom.trim()); modelDialogPick = modelDialogCustom.trim(); modelDialogCustom = ''"
             >
               {{ t('pilot.model.customAdd') }}
             </HlButton>
@@ -2239,5 +2309,38 @@ onUnmounted(stopLoginPolling)
 .pilot-model-row.is-pick {
   border-color: var(--accent);
   background: var(--accent-a08);
+}
+
+.pilot-model-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pilot-model-row__name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pilot-model-row__status {
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.pilot-model-row__status.is-ok {
+  color: var(--accent);
+}
+
+.pilot-model-row__status.is-fail {
+  color: var(--danger, #e5484d);
+}
+
+.pilot-model-row__ops {
+  display: flex;
+  align-items: center;
+  gap: 2px;
 }
 </style>

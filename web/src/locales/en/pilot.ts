@@ -72,7 +72,11 @@ const pilot = {
   'pilot.settings.api_key': 'API Key',
   'pilot.settings.api_key_hint': 'Stored encrypted; leave blank to keep the current one',
   'pilot.settings.monthly_cap': 'Monthly token cap',
-  'pilot.settings.usage': '{tokens} tokens used this month',
+  'pilot.settings.usage': '{total} tokens this month (in {inp} / out {out} · {calls} calls)',
+  'pilot.model.testing': 'Testing…',
+  'pilot.model.testOk': 'OK {ms}ms',
+  'pilot.model.rowTest': 'Test',
+  'pilot.model.rowRemove': 'Remove',
   'pilot.settings.save': 'Save Pilot settings',
   'pilot.settings.saved': 'Saved',
 } as const
