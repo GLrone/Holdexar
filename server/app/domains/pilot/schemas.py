@@ -9,9 +9,13 @@ class PilotConfigPayload(BaseModel):
     enabled: bool
     base_url: str
     model: str
+    models: list[str] = []
     has_api_key: bool
     monthly_cap: int
-    usage_month: int
+    usage_inp: int = 0
+    usage_out: int = 0
+    usage_calls: int = 0
+    usage_total: int = 0
 
 
 class PilotConfigUpdate(BaseModel):
@@ -21,6 +25,7 @@ class PilotConfigUpdate(BaseModel):
     enabled: bool | None = None
     base_url: str | None = None
     model: str | None = None
+    models: list[str] | None = None
     api_key: str | None = None
     monthly_cap: int | None = None
 
@@ -71,4 +76,6 @@ class AskResponse(BaseModel):
     source: str
     reason: str | None = None
     facts: dict | None = None
+    """本轮工具取到的结构化卡片（games / price / action），供前端组件渲染。"""
+    cards: list = []
     cached: bool = False

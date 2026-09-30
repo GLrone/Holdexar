@@ -163,6 +163,18 @@ def _tool_summary(name: str, result: dict) -> str:
     return name
 
 
+def _card_of(tool_name: str, result: dict) -> dict | None:
+    """工具结果 → 前端可渲染的结构化卡片（组件复用的数据层）。"""
+    kind = result.get("kind")
+    if kind == "games" and result.get("items"):
+        return {"kind": "games", "items": result["items"][:5]}
+    if kind == "price":
+        return {k: v for k, v in result.items() if k != "kind"} | {"kind": "price"}
+    if kind == "action":
+        return {"kind": "action", **result}
+    return None
+
+
 async def _agent_stream(question: str, appid: int | None, session: dict, cfg: dict):
     """agent 循环（流式）。产出与 ask_stream 相同的事件形态，另加
     {"type": "tool", "name":..., "summary":...} 工具执行事件。"""
@@ -175,6 +187,7 @@ async def _agent_stream(question: str, appid: int | None, session: dict, cfg: di
     think_all: list[str] = []
     usage_total = [0, 0]
     tool_log: list[str] = []
+    cards: list[dict] = []
     last_game: dict | None = None
     reason: str | None = None
 
@@ -226,6 +239,9 @@ async def _agent_stream(question: str, appid: int | None, session: dict, cfg: di
             summary = _tool_summary(t["name"], result)
             tool_log.append(summary)
             yield {"type": "tool", "name": t["name"], "summary": summary}
+            card = _card_of(t["name"], result)
+            if card is not None and card not in cards:
+                cards.append(card)
             if t["name"] in ("add_follow", "create_price_alert") and result.get("appid"):
                 last_game = {"appid": result["appid"], "name": result.get("name")}
             messages.append({
@@ -237,7 +253,7 @@ async def _agent_stream(question: str, appid: int | None, session: dict, cfg: di
     answer = "".join(answer_all)
     thinking = "".join(think_all) or None
     if usage_total != [0, 0]:
-        await pilot_config.add_usage(usage_total[0] + usage_total[1])
+        await pilot_config.add_usage(usage_total[0], usage_total[1])
     if session is not None:
         session["turns"].append(messages[1:])
         if last_game:
@@ -249,6 +265,7 @@ async def _agent_stream(question: str, appid: int | None, session: dict, cfg: di
         "source": "llm",
         "reason": reason,
         "facts": None,
+        "cards": cards[:6],
         "tools": tool_log,
     }
 
@@ -267,7 +284,7 @@ async def ask(question: str, appid: int | None = None, session_id: str | None = 
                        "question": q, "intent": intent, "mode": "fallback",
                        "source": resp["source"], "reason": resp["reason"], "cached": False})
         return {**resp, "cached": False}
-    if (await pilot_config.usage_month()) >= cfg["monthly_cap"]:
+    if pilot_config.over_cap(await pilot_config.usage_month(), cfg["monthly_cap"]):
         resp = await _fallback_deterministic(q, appid, session, intent)
         resp["reason"] = "cap_reached" if resp["source"] != "guide" else resp["reason"]
         _log_decision({"ts": get_beijing_time_obj().isoformat(timespec="seconds"),
@@ -298,11 +315,13 @@ async def ask_stream(question: str, appid: int | None = None, session_id: str | 
     intent = pilot_intent.route(q)
     cfg = await pilot_config.load_config()
 
-    if not pilot_config.llm_ready(cfg) or (await pilot_config.usage_month()) >= cfg["monthly_cap"]:
-        cap = pilot_config.llm_ready(cfg) and (await pilot_config.usage_month()) >= cfg["monthly_cap"]
+    usage_now = await pilot_config.usage_month()
+    cap = pilot_config.over_cap(usage_now, cfg["monthly_cap"])
+    if not pilot_config.llm_ready(cfg) or cap:
         resp = await _fallback_deterministic(q, appid, session, intent)
         if cap and resp["source"] != "guide":
             resp["reason"] = "cap_reached"
+        resp["cards"] = [resp["facts"]] if resp.get("facts") else []
         _log_decision({"ts": get_beijing_time_obj().isoformat(timespec="seconds"),
                        "question": q, "intent": intent, "mode": "fallback",
                        "source": resp["source"], "reason": resp["reason"], "cached": False})

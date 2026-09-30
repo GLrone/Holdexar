@@ -46,11 +46,12 @@ def _patch_ready(
 ):
     """agent 路径替身：chat_stream 产出脚本化事件序列；fail 时抛错。"""
     monkeypatch.setattr(pilot_config, "load_config", _async_return(cfg or _CFG))
-    monkeypatch.setattr(pilot_config, "usage_month", _async_return(usage))
+    usage_dict = usage if isinstance(usage, dict) else {"inp": 0, "out": 0, "calls": 0, "total": usage}
+    monkeypatch.setattr(pilot_config, "usage_month", _async_return(usage_dict))
     store = usage_store if usage_store is not None else {}
 
-    async def _add(n):
-        store["tokens"] = store.get("tokens", 0) + n
+    async def _add(inp, out):
+        store["tokens"] = store.get("tokens", 0) + inp + out
 
     monkeypatch.setattr(pilot_config, "add_usage", _add)
     if fail:
@@ -134,6 +135,8 @@ class TestAgentLoop:
         assert executed == [("get_price_briefing", 292030, False)]
         assert done["tools"] == ["get_price_briefing: 测试游戏"]
         assert usage["tokens"] == 120
+        # 工具结果沉淀为结构化卡片（前端组件渲染数据层）
+        assert done["cards"] == [{"kind": "price", **{**_FACTS, "appid": 292030}}]
 
     @pytest.mark.asyncio
     async def test_write_guard_denies_execution(self, monkeypatch):
@@ -196,7 +199,7 @@ class TestFallback:
 
     @pytest.mark.asyncio
     async def test_cap_degrades_to_facts(self, monkeypatch):
-        _patch_ready(monkeypatch, usage=1000)
+        _patch_ready(monkeypatch, usage={"inp": 1000, "out": 0, "calls": 1, "total": 1000})
         monkeypatch.setattr(service.pilot_tools, "price_facts", _async_return(dict(_FACTS)))
         resp = await service.ask("这游戏值不值得入手", appid=1)
         assert resp["source"] == "facts"

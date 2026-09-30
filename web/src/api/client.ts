@@ -242,9 +242,13 @@ export interface PilotConfigPayload {
   enabled: boolean
   base_url: string
   model: string
+  models: string[]
   has_api_key: boolean
   monthly_cap: number
-  usage_month: number
+  usage_inp: number
+  usage_out: number
+  usage_calls: number
+  usage_total: number
 }
 
 /** 领航员入口的游戏上下文（游戏详情页进入时携带） */
@@ -300,6 +304,8 @@ export interface PilotAskResponse {
   /** 回退机器码（llm_off / cap_reached / llm_failed / no_data），用户语言由前端翻 */
   reason: string | null
   facts: PilotFacts | null
+  /** 本轮工具取到的结构化卡片（games / price / action），组件渲染数据层 */
+  cards: PilotFacts[]
   cached: boolean
 }
 
