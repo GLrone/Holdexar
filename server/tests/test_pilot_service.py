@@ -61,9 +61,19 @@ def _record_usage(store):
 
 
 class TestIntentRoute:
+    def test_write_intents(self):
+        assert pilot_intent.route("把双人成行加进关注") == pilot_intent.ADD_MONITOR
+        assert pilot_intent.route("关注一下 DAVE THE DIVER") == pilot_intent.ADD_MONITOR
+        assert pilot_intent.route("星露谷物语低于 48 块提醒我") == pilot_intent.CREATE_ALERT
+        assert pilot_intent.route("打五折的话提醒我一声") == pilot_intent.CREATE_ALERT
+
+    def test_guard_blocks_write(self):
+        assert pilot_intent.route("清空所有提醒规则") != pilot_intent.CREATE_ALERT
+        assert pilot_intent.route("批量移除监控对象") != pilot_intent.ADD_MONITOR
+
     def test_how_to(self):
-        assert pilot_intent.route("把双人成行加进关注") == pilot_intent.HOW_TO
-        assert pilot_intent.route("星露谷物语低于 48 块提醒我") == pilot_intent.HOW_TO
+        assert pilot_intent.route("怎么设置价格提醒") == pilot_intent.HOW_TO
+        assert pilot_intent.route("在哪加关注") == pilot_intent.HOW_TO
 
     def test_price(self):
         assert pilot_intent.route("赛博朋克2077 现在史低多少") == pilot_intent.PRICE_ANALYSIS
@@ -211,3 +221,73 @@ class TestAskFlow:
         assert done["type"] == "done"
         assert done["source"] == "facts"
         assert done["reason"] == "llm_failed"
+
+    @pytest.mark.asyncio
+    async def test_write_monitor_executes(self, monkeypatch):
+        calls = {}
+        _patch_ready(monkeypatch, calls=calls)
+        monkeypatch.setattr(
+            service.pilot_tools,
+            "search_games",
+            _async_return([{"appid": 7, "name": "双人成行", "cnyFen": 9800, "discount": 0,
+                            "positiveRate": 0.96, "reviewCount": 80000}]),
+        )
+
+        async def fake_monitor(appid):
+            return {"action": "monitor_add", "appid": appid, "name": "双人成行", "state": "active"}
+
+        monkeypatch.setattr(service.pilot_tools, "monitor_add", fake_monitor)
+        resp = await service.ask("把双人成行加进关注")
+        assert resp["source"] == "llm"
+        assert resp["facts"]["kind"] == "action"
+        assert resp["facts"]["appid"] == 7
+
+    @pytest.mark.asyncio
+    async def test_write_alert_threshold_parsed(self, monkeypatch):
+        _patch_ready(monkeypatch)
+        monkeypatch.setattr(
+            service.pilot_tools,
+            "search_games",
+            _async_return([{"appid": 8, "name": "星露谷物语", "cnyFen": 4800, "discount": 0,
+                            "positiveRate": 0.98, "reviewCount": 90000}]),
+        )
+        seen = {}
+
+        async def fake_alert(appid, *, target_type, target_value_fen):
+            seen["args"] = (appid, target_type, target_value_fen)
+            return {"action": "alert_add", "appid": appid, "name": "星露谷物语",
+                    "targetType": target_type, "targetValueFen": target_value_fen}
+
+        monkeypatch.setattr(service.pilot_tools, "alert_add", fake_alert)
+        resp = await service.ask("星露谷物语低于 48 块提醒我")
+        assert seen["args"] == (8, "price", 4800)
+        assert resp["source"] == "llm"
+        assert resp["facts"]["kind"] == "action"
+
+    @pytest.mark.asyncio
+    async def test_alert_without_threshold_becomes_guide(self, monkeypatch):
+        _patch_ready(monkeypatch)
+        monkeypatch.setattr(
+            service.pilot_tools,
+            "search_games",
+            _async_return([{"appid": 8, "name": "星露谷物语", "cnyFen": 4800, "discount": 0,
+                            "positiveRate": 0.98, "reviewCount": 90000}]),
+        )
+        resp = await service.ask("星露谷物语低于心里价位提醒我")
+        assert resp["source"] == "guide"
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_write_returns_candidates(self, monkeypatch):
+        _patch_ready(monkeypatch)
+        monkeypatch.setattr(
+            service.pilot_tools,
+            "search_games",
+            _async_return([{"appid": 1, "name": "A", "cnyFen": 100, "discount": 0,
+                            "positiveRate": None, "reviewCount": 0},
+                           {"appid": 2, "name": "B", "cnyFen": 200, "discount": 0,
+                            "positiveRate": None, "reviewCount": 0}]),
+        )
+        resp = await service.ask("把里奥的宝藏加进关注")
+        assert resp["source"] == "facts"
+        assert resp["reason"] == "need_target"
+        assert resp["facts"]["kind"] == "games"

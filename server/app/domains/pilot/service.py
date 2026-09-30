@@ -65,12 +65,17 @@ def _user_message(question: str, facts: dict | None) -> str:
 async def _prepare(question: str, appid: int | None) -> tuple[str, dict | None]:
     """共享前置：意图路由 + 工具取事实。
 
-    返回 (stage, payload)：stage ∈ guide / facts / none / chat；facts 形态
-    下 payload 为事实 dict，其余为 None。
+    返回 (stage, payload)：stage ∈ guide / facts / none / chat / write；
+    facts 形态下 payload 为事实 dict，write 形态下为 {"action": 动作名}，
+    其余为 None。
     """
     intent = pilot_intent.route(question)
     if intent == pilot_intent.HOW_TO:
         return "guide", None
+    if intent == pilot_intent.ADD_MONITOR:
+        return "write", {"action": "monitor_add"}
+    if intent == pilot_intent.CREATE_ALERT:
+        return "write", {"action": "alert_add"}
     if intent == pilot_intent.PRICE_ANALYSIS:
         target = appid
         if target is None:
@@ -126,6 +131,45 @@ async def _respond(*, question: str, facts: dict | None, is_chat: bool) -> dict:
     return _empty("facts", reason, facts)
 
 
+async def _resolve_write(
+    question: str, appid: int | None, action: str
+) -> tuple[str, dict | None]:
+    """写动作解析与执行（风险门之后的确定性路径）。
+
+    返回 (stage2, payload)：
+    - ("done", action 事实)   已执行；
+    - ("facts", 候选列表)     问句未唯一点名游戏，给候选让模型追问；
+    - ("guide", None)         提醒缺阈值等不可臆造的条件；
+    - ("none", None)          库内无此游戏。
+    """
+    title = pilot_tools.extract_title(question)
+    if title:
+        queries = [title]
+    else:
+        queries = pilot_tools.clean_query_tokens(question) or [question]
+    matches: list[dict] = []
+    for query in queries:
+        matches = await pilot_tools.search_games(question, query=query)
+        if matches:
+            break
+    target = appid
+    if target is None:
+        if len(matches) == 1:
+            target = matches[0]["appid"]
+        elif matches:
+            return "facts", {"kind": "games", "items": matches}
+        else:
+            return "none", None
+    if action == "alert_add":
+        target_type, value = pilot_tools.extract_alert(question)
+        if target_type == "price" and value is None:
+            return "guide", None
+        result = await pilot_tools.alert_add(target, target_type=target_type, target_value_fen=value)
+    else:
+        result = await pilot_tools.monitor_add(target)
+    return "done", {"kind": "action", **result}
+
+
 async def ask(question: str, appid: int | None = None) -> dict:
     q = (question or "").strip()
     if not q:
@@ -138,6 +182,16 @@ async def ask(question: str, appid: int | None = None) -> dict:
     stage, facts = await _prepare(q, appid)
     if stage == "guide":
         resp = _empty("guide", None, None)
+    elif stage == "write":
+        stage2, payload = await _resolve_write(q, appid, facts["action"])
+        if stage2 == "done":
+            resp = await _respond(question=q, facts=payload, is_chat=False)
+        elif stage2 == "facts":
+            resp = _empty("facts", "need_target", payload)
+        elif stage2 == "guide":
+            resp = _empty("guide", None, None)
+        else:
+            resp = _empty("none", "no_data", None)
     elif stage == "none":
         resp = _empty("none", "no_data", None)
     else:
@@ -170,11 +224,25 @@ async def ask_stream(question: str, appid: int | None = None):
         return
 
     stage, facts = await _prepare(q, appid)
-    if facts is not None:
+    if facts is not None and stage != "write":
         yield {"type": "facts", "facts": facts}
 
     if stage == "guide":
         resp = _empty("guide", None, None)
+        _cache_put(cache_key, resp)
+        yield {"type": "done", **resp}
+        return
+    if stage == "write":
+        stage2, payload = await _resolve_write(q, appid, facts["action"])
+        if stage2 == "done":
+            # 写确认是短句，走非流式解读即可
+            resp = await _respond(question=q, facts=payload, is_chat=False)
+        elif stage2 == "facts":
+            resp = _empty("facts", "need_target", payload)
+        elif stage2 == "guide":
+            resp = _empty("guide", None, None)
+        else:
+            resp = _empty("none", "no_data", None)
         _cache_put(cache_key, resp)
         yield {"type": "done", **resp}
         return

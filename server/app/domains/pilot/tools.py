@@ -9,11 +9,28 @@ import re
 import statistics
 
 from app.crawler.utils import get_beijing_time_obj
+from app.domains.alerts import service as alerts_service
 from app.domains.games import service as games_service
+from app.domains.monitoring import service as monitoring_service
 
 _FIND_LIMIT = 5
 _PRICE_TAG_RE = re.compile(r"《(.+?)》")
 _PRICE_NUM_RE = re.compile(r"(\d+)\s*(?:块|元)")
+_THRESH_RE = re.compile(r"(?:低于|以下|跌到|跌至|降至)\s*(\d+(?:\.\d+)?)")
+# 写意图对象解析：剥掉意图/条件词后的 token 逐个试搜（整句 LIKE 必然零命中）
+_QUERY_CLEAN_RE = re.compile(
+    r"把|将|帮我|请|加进关注|加入关注|关注一下|关注|低于|以下|跌到|跌至|降至|史低"
+    r"|打折|降价|提醒|告诉我|一声|到价|块|元|的|了|吗|呢|就|时"
+)
+
+
+def clean_query_tokens(question: str) -> list[str]:
+    """问句清洗后的搜索词：先整句清洗，再拆 token（滤掉纯数字与单字）。"""
+    cleaned = _QUERY_CLEAN_RE.sub(" ", question or "").strip()
+    if not cleaned:
+        return []
+    tokens = [t for t in cleaned.split() if len(t) >= 2 and not t.isdigit()]
+    return [cleaned] + [t for t in tokens if t != cleaned]
 
 
 def _game_item(it: dict) -> dict:
@@ -70,10 +87,11 @@ async def price_facts(appid: int) -> dict | None:
     }
 
 
-async def search_games(question: str) -> list[dict]:
-    """按问句原文做库内名称检索（价格意图找对象用，不触发抓取）。"""
+async def search_games(question: str, query: str | None = None) -> list[dict]:
+    """按问句或显式词做库内名称检索（价格意图找对象 / 写意图解析对象用，
+    不触发抓取）。"""
     result = await games_service.list_games(
-        sort="default", limit=_FIND_LIMIT, q=(question or "").strip() or None
+        sort="default", limit=_FIND_LIMIT, q=(query or question or "").strip() or None
     )
     return [_game_item(it) for it in result.get("items", [])]
 
@@ -98,3 +116,48 @@ async def recommend_games(question: str) -> list[dict]:
         max_price=max_price,
     )
     return [_game_item(it) for it in result.get("items", [])]
+
+
+def extract_title(question: str) -> str | None:
+    """问句里《书名号》中的游戏名（写意图解析对象的优先词）。"""
+    m = _PRICE_TAG_RE.search(question or "")
+    return m.group(1) if m else None
+
+
+def extract_alert(question: str) -> tuple[str, float | None]:
+    """解析提醒条件。返回 (target_type, target_value_fen)：史低类无值；
+    价格类按「低于 N 块/元」取 N×100 分；解析不出数值返回 price + None
+    （调用方转指引，不臆造阈值）。"""
+    q = question or ""
+    if "史低" in q:
+        return "historic_low", None
+    m = _THRESH_RE.search(q)
+    if m:
+        return "price", int(float(m.group(1)) * 100)
+    return "price", None
+
+
+async def monitor_add(appid: int) -> dict:
+    """关注游戏：1:1 映射 monitoring.track（manual 来源 = 用户手动加入）。"""
+    state = await monitoring_service.track("game", appid, "manual")
+    detail = await games_service.get_game_detail(appid)
+    return {
+        "action": "monitor_add",
+        "appid": appid,
+        "name": detail.get("name") if detail else None,
+        "state": state,
+    }
+
+
+async def alert_add(appid: int, *, target_type: str, target_value_fen: float | None) -> dict:
+    """设价格提醒：1:1 映射 alerts_service.add_alert（中国区，price=分 / historic_low）。"""
+    alert = await alerts_service.add_alert(appid, "CN", target_type, target_value_fen)
+    detail = await games_service.get_game_detail(appid)
+    return {
+        "action": "alert_add",
+        "appid": appid,
+        "name": detail.get("name") if detail else None,
+        "targetType": target_type,
+        "targetValueFen": target_value_fen,
+        "alertId": alert.get("id") if alert else None,
+    }

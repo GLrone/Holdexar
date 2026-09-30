@@ -272,7 +272,19 @@ export interface PilotGameFacts {
   items: PilotGameFactsItem[]
 }
 
-export type PilotFacts = PilotPriceFacts | PilotGameFacts
+/** 写动作回执（Phase 2 白名单：monitor_add / alert_add，均为单对象可逆动作） */
+export interface PilotActionFacts {
+  kind: 'action'
+  action: 'monitor_add' | 'alert_add'
+  appid: number
+  name: string | null
+  state?: string
+  targetType?: string
+  targetValueFen?: number | null
+  alertId?: number | null
+}
+
+export type PilotFacts = PilotPriceFacts | PilotGameFacts | PilotActionFacts
 
 export interface PilotAskResponse {
   /** LLM 回答原文；facts / guide / none 形态下为空串，展示层按 source 渲染 */
