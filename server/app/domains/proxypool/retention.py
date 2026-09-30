@@ -28,6 +28,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.database import WritePriority, write_gate
 from app.domains.proxypool.models import SubscriptionSnapshot
 
 logger = logging.getLogger(__name__)
@@ -69,13 +70,14 @@ def _cutoff(now: datetime, days: int) -> datetime:
 async def _delete_chunked(
     session: AsyncSession, sql: str, params: dict, *, chunk: int, max_chunks: int
 ) -> tuple[int, bool]:
-    """按块删除，每块一个事务。返回 (删除总数, 是否还有剩)。"""
+    """按块删除，每块一个事务（过写调度器，块间写者位空出）。返回 (删除总数, 是否还有剩)。"""
     deleted = 0
     for _ in range(max(1, int(max_chunks))):
-        result = await session.execute(
-            text(sql), {**params, "chunk": int(chunk)}
-        )
-        await session.commit()
+        async with write_gate(WritePriority.BACKGROUND):
+            result = await session.execute(
+                text(sql), {**params, "chunk": int(chunk)}
+            )
+            await session.commit()
         affected = int(result.rowcount or 0)
         deleted += affected
         if affected < int(chunk):

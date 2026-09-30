@@ -26,7 +26,8 @@ from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_session_factory
+from app.core.database import WritePriority, get_session_factory
+from app.core.database import write_gate
 from app.domains.proxypool.models import OrchestrationEvent
 
 logger = logging.getLogger(__name__)
@@ -72,7 +73,7 @@ async def record(
             # 事务边界归调用方：这里只 add，不 commit
             session.add(row)
             return True
-        async with get_session_factory()() as own:
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as own:
             own.add(row)
             await own.commit()
         return True

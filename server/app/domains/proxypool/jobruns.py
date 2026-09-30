@@ -27,7 +27,8 @@ from pathlib import Path
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_session_factory
+from app.core.database import WritePriority, get_session_factory
+from app.core.database import write_gate
 from app.domains.proxypool.models import (
     ProxyJobRun,
     ProxyNode,
@@ -336,7 +337,7 @@ async def record_start(
     kind: str = "crawl",
 ) -> int | None:
     try:
-        async with get_session_factory()() as session:
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             run_id = await start_run(
                 session,
                 proxy_url=proxy_url,
@@ -367,7 +368,7 @@ async def record_finish(
     if run_id is None:
         return
     try:
-        async with get_session_factory()() as session:
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             await finish_run(
                 session,
                 run_id,
@@ -387,7 +388,7 @@ async def record_finish(
 async def record_interrupted(now: datetime | None = None) -> int:
     """启动清理入口：返回被标记的作业数；失败只记日志。"""
     try:
-        async with get_session_factory()() as session:
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             marked = await mark_interrupted_runs(session, now or datetime.now())
             await session.commit()
         return marked

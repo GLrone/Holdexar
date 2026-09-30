@@ -5,6 +5,7 @@ L1/L2 要串行探完池内节点，整段落在一个未提交事务里会让 S
 """
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime
 
 import pytest
@@ -13,8 +14,9 @@ from sqlalchemy import func, select
 
 from app.core.config import get_settings
 from app.core.database import get_engine, get_session_factory, init_db
+from app.domains.proxypool import health as health_mod
 from app.domains.proxypool import scheduling as sched
-from app.domains.proxypool.models import HealthObservation
+from app.domains.proxypool.models import HealthObservation, ProxyNode
 
 NOW = datetime(2026, 9, 20, 22, 0, 0)
 
@@ -148,7 +150,10 @@ async def test_l0_writes_visible_to_other_connection_during_maintenance(
 
 @pytest.mark.asyncio
 async def test_l0_commits_in_chunks(tmp_data_dir, monkeypatch):
-    """池内 L0 按块提交：写锁窗口 = 一块的耗时，不随池规模线性增长。"""
+    """池内 L0 按块提交：写锁窗口 = 一块的耗时，不随池规模线性增长。
+
+    两账本对齐自身也是写事务（过写调度器提交一次），其后每块各提交一次。
+    """
     rec = _Recorder()
     chunks: list[tuple[str, ...]] = []
 
@@ -175,4 +180,119 @@ async def test_l0_commits_in_chunks(tmp_data_dir, monkeypatch):
                              secret="s", now=NOW)
 
     assert [len(c) for c in chunks] == [10, 10, 3], f"分块应为 10/10/3，实际 {[len(c) for c in chunks]}"
-    assert rec.events == ["commit", "commit", "commit"], "每块后都要提交（写锁窗口受块约束）"
+    assert rec.events == ["commit"] * 4, f"对齐 1 次 + 每块 1 次提交，实际 {rec.events}"
+
+
+def _write_lock_free(timeout: float = 2.0) -> bool:
+    """另一条连接能否立即拿到写锁（外部 sqlite3 连接，2 秒 busy_timeout）。"""
+    db_path = get_settings().db_url.removeprefix("sqlite+aiosqlite:///")
+    conn = sqlite3.connect(db_path, timeout=timeout)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("ROLLBACK")
+        return True
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_maintenance_probe_holds_no_write_lock_across_probes(
+    tmp_data_dir, monkeypatch
+):
+    """维护探测的写锁不得跨网络探测段：探针进行中与恢复 GLOBAL 时，
+    另一条连接必须能立即写（否则同拍写者排队甚至撞满 busy_timeout）。"""
+    await init_db()
+
+    during: dict[str, bool] = {}
+
+    async def fake_l1(session, **kw):  # noqa: ANN001
+        during["l1"] = _write_lock_free()
+        return ()
+
+    async def fake_l2(session, **kw):  # noqa: ANN001
+        during["l2"] = _write_lock_free()
+        return ()
+
+    async def fake_current(*a, **kw):
+        return "1|node-a"
+
+    async def fake_apply(controller_url, secret, chosen):
+        during["apply"] = _write_lock_free()
+
+    async def fake_names(*a, **kw):
+        return ("1|node-a",)
+
+    async def fake_snapshot(*a, **kw):
+        return ()
+
+    monkeypatch.setattr(sched, "crawler_busy", lambda: False)
+    monkeypatch.setattr(sched, "exit_ip_check_pool", fake_l1)
+    monkeypatch.setattr(sched, "business_check_pool", fake_l2)
+    monkeypatch.setattr(sched, "current_global_selection", fake_current)
+    monkeypatch.setattr(sched, "apply_global_selection", fake_apply)
+    monkeypatch.setattr(sched, "eligible_runtime_names", fake_names)
+    monkeypatch.setattr(sched, "exit_snapshot", fake_snapshot)
+
+    async with get_session_factory()() as s:
+        result = await sched.run_maintenance_cycle(
+            s, data_dir=tmp_data_dir, controller_url="http://127.0.0.1:9",
+            secret="s", now=NOW,
+        )
+        await s.commit()
+
+    assert result is not None
+    assert during["l1"], "L1 探测进行中写锁必须已放开（run 行已先行提交）"
+    assert during["l2"], "L2 探测进行中写锁必须已放开（L1 返回前已提交）"
+    assert during["apply"], "恢复 GLOBAL（网络调用）前写锁必须已放开（收尾已提交）"
+
+
+@pytest.mark.asyncio
+async def test_probe_pools_return_committed_session(tmp_data_dir, monkeypatch):
+    """两个探测池函数返回前必须提交：会话零脏对象交还，调用方后续只读查询
+    不会 autoflush 出横跨网络等待的写事务。"""
+    await init_db()
+    (tmp_data_dir / "proxypool").mkdir(parents=True, exist_ok=True)
+    (tmp_data_dir / "proxypool" / "crawl-pool.yaml").write_text(
+        yaml.safe_dump({"proxies": [
+            {"name": "1|n1", "type": "http", "server": "10.0.0.1", "port": 1},
+        ]}),
+        encoding="utf-8",
+    )
+    async with get_session_factory()() as s:
+        s.add(ProxyNode(
+            node_id="fp-n1", fingerprint="fp-n1", runtime_name="1|n1",
+            proxy_type="http", server="10.0.0.1",
+            normalized_config={"name": "n1"},
+            state="NEW", first_seen=NOW, last_seen=NOW, last_source_seen=NOW,
+        ))
+        await s.commit()
+
+    async def fake_probe_exit_ip(controller_url, secret, mixed_port, name, **kw):
+        return health_mod.ExitIpResult(
+            runtime_name=name, ok=True, exit_ip="203.0.113.9",
+            detail="ok", latency_ms=1,
+        )
+
+    async def fake_probe_business(controller_url, secret, mixed_port, name, **kw):
+        return health_mod.BusinessResult(
+            runtime_name=name, ok=True, http_status=200,
+            final_price_in_cents=999, detail="ok", latency_ms=1,
+        )
+
+    monkeypatch.setattr(health_mod, "mixed_port_of", lambda data_dir: 0)
+    monkeypatch.setattr(health_mod, "probe_exit_ip", fake_probe_exit_ip)
+    monkeypatch.setattr(health_mod, "probe_business", fake_probe_business)
+
+    async with get_session_factory()() as s:
+        l1 = await health_mod.exit_ip_check_pool(
+            s, data_dir=tmp_data_dir, controller_url="http://127.0.0.1:9",
+            secret="s", now=NOW, names=("1|n1",),
+        )
+        assert l1 and not s.in_transaction(), "L1 池函数返回前必须提交"
+        l2 = await health_mod.business_check_pool(
+            s, data_dir=tmp_data_dir, controller_url="http://127.0.0.1:9",
+            secret="s", now=NOW,
+        )
+        assert l2 and not s.in_transaction(), "L2 池函数返回前必须提交"

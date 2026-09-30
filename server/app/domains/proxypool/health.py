@@ -42,6 +42,7 @@ import httpx
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.database import WritePriority, write_gate
 from app.crawler.browse_store import StoreBrowseAPI, _to_int
 from app.domains.proxypool.models import HealthObservation, ProxyNode, ProxyNodeSource
 from app.domains.proxypool.pool import pool_file_names
@@ -176,7 +177,7 @@ def _pool_names(data_dir: Path) -> tuple[str, ...]:
     return pool_file_names(data_dir)
 
 
-async def _probe_and_record(
+async def _probe_and_decide(
     session: AsyncSession, node: ProxyNode, *,
     controller_url: str,
     secret: str,
@@ -185,8 +186,12 @@ async def _probe_and_record(
     url: str,
     timeout_ms: int,
     state_push: bool = True,
-) -> HealthOutcome:
-    """一次传输层探测 + 落观测；是否推进状态由 `state_push` 决定。
+) -> tuple[HealthOutcome, dict, tuple[int, str] | None]:
+    """一次传输层探测 + 结论判定（**零写入**）；是否推进状态由 `state_push` 决定。
+
+    返回 `(结论, 观测行参数, 待应用状态变更)`：探测的网络等待与源计数读不得
+    压着未提交写事务（会话有挂起写入时这次读会 autoflush 出闸外写锁），观测
+    与状态变更由调用方在写调度器内落库。
 
     **池内 L0 巡检传 `state_push=False`（纯记录）**：传输层可达性不再是节点生死
     判据——生死归 Steam 业务探测（`business_check_pool`）与恢复探测。`state_push=True`
@@ -203,37 +208,41 @@ async def _probe_and_record(
         .where(ProxyNodeSource.node_id == node.node_id)
     )
     previous = node.state
+    observation = dict(
+        node_id=node.node_id,
+        level=PROBE_LEVEL,
+        ok=False,
+        latency_ms=None,
+        detail=result.detail or None,
+        observed_at=now,
+        channel="scheduled",
+        target=url,
+    )
     if not result.valid:
         # 这一探没测到节点本身（内核不认识这个名字 / 控制器不可达）：只留观测，
         # **不累加失败计数、不推进状态**。判"节点坏"的唯一依据是经该节点发真实
         # 请求失败或超时；把"探不到对象"记成节点不健康会让一次换端口/时序错位
         # 把整池判死。
-        session.add(HealthObservation(
-            node_id=node.node_id,
-            level=PROBE_LEVEL,
-            ok=False,
-            latency_ms=None,
-            detail=result.detail or None,
-            observed_at=now,
-            channel="scheduled",
-            target=url,
-        ))
-        return HealthOutcome(
-            node_id=node.node_id,
-            runtime_name=node.runtime_name,
-            ok=False,
-            delay_ms=None,
-            detail=result.detail,
-            previous_state=previous,
-            state=previous,
+        return (
+            HealthOutcome(
+                node_id=node.node_id,
+                runtime_name=node.runtime_name,
+                ok=False,
+                delay_ms=None,
+                detail=result.detail,
+                previous_state=previous,
+                state=previous,
+            ),
+            observation,
+            None,
         )
 
     state = previous
+    mutations: tuple[int, str] | None = None
     if state_push:
         # 连续失败计数：成功归零、失败累加。它既是状态机的输入（退休线判据），
         # 也是台账事实——判 DEAD 的节点必须带着失败次数，不能留下"DEAD 且计数 0"。
         failures = 0 if result.ok else (node.consecutive_failures or 0) + 1
-        node.consecutive_failures = failures
         # 唯一的状态决策入口：健康只提供证据，规则仍归状态机
         target = evaluate_node_state(
             previous,
@@ -241,26 +250,21 @@ async def _probe_and_record(
             probe_ok=result.ok,
             consecutive_failures=failures,
         )
-        node.state = target
+        mutations = (failures, target)
         state = target
-    session.add(HealthObservation(
-        node_id=node.node_id,
-        level=PROBE_LEVEL,
-        ok=result.ok,
-        latency_ms=result.delay_ms,
-        detail=result.detail or None,
-        observed_at=now,
-        channel="scheduled",
-        target=url,
-    ))
-    return HealthOutcome(
-        node_id=node.node_id,
-        runtime_name=node.runtime_name,
-        ok=result.ok,
-        delay_ms=result.delay_ms,
-        detail=result.detail,
-        previous_state=previous,
-        state=state,
+    observation.update(ok=result.ok, latency_ms=result.delay_ms)
+    return (
+        HealthOutcome(
+            node_id=node.node_id,
+            runtime_name=node.runtime_name,
+            ok=result.ok,
+            delay_ms=result.delay_ms,
+            detail=result.detail,
+            previous_state=previous,
+            state=state,
+        ),
+        observation,
+        mutations,
     )
 
 
@@ -310,8 +314,10 @@ async def health_check_pool(
 
     节点生死判据已归 Steam 业务探测（`business_check_pool`）：传输层可达性只回答
     「这条线通不通」，继续拿它判生死会让 gstatic 通而 Steam 不通的节点被误杀。
-    `names` 不给就取池文件当前节点；给了就只探这些——供调用方**分块**调用并逐块提交，
-    把 L0 的写锁窗口限制在块内（整池一次提交会随池规模把写锁按住数分钟）。
+    `names` 不给就取池文件当前节点；给了就只探这些——供调用方**分块**调用。
+
+    探测（网络）与落库分离：全部探完后在写调度器内一次性落库提交——写事务
+    不跨网络等待，节点间的源计数读也不会 autoflush 出闸外写锁。
     """
     targets = tuple(names) if names is not None else _pool_names(data_dir)
     rows = await session.execute(
@@ -320,6 +326,7 @@ async def health_check_pool(
     by_name = {row.runtime_name: row for row in rows.scalars()}
 
     outcomes: list[HealthOutcome] = []
+    observations: list[dict] = []
     for name in targets:
         node = by_name.get(name)
         if node is None:
@@ -327,13 +334,18 @@ async def health_check_pool(
             # 不静默造行，留给上面的对账去暴露。
             continue
 
-        outcomes.append(await _probe_and_record(
+        outcome, observation, _mutations = await _probe_and_decide(
             session, node, controller_url=controller_url, secret=secret,
             probe_name=name, now=now, url=url, timeout_ms=timeout_ms,
             state_push=False,
-        ))
+        )
+        outcomes.append(outcome)
+        observations.append(observation)
 
-    await session.flush()
+    async with write_gate(WritePriority.BACKGROUND):
+        for observation in observations:
+            session.add(HealthObservation(**observation))
+        await session.commit()
     return tuple(outcomes)
 
 
@@ -390,14 +402,25 @@ async def recover_dead_nodes(
 
     probe_url = url or business_probe_url()
     outcomes: list[HealthOutcome] = []
+    pending: list[tuple[ProxyNode, dict, tuple[int, str] | None]] = []
     for node, original_name in rows:
-        outcomes.append(await _probe_and_record(
+        outcome, observation, mutations = await _probe_and_decide(
             session, node, controller_url=controller_url, secret=secret,
             probe_name=str(original_name), now=now, url=probe_url,
             timeout_ms=timeout_ms,
-        ))
+        )
+        outcomes.append(outcome)
+        pending.append((node, observation, mutations))
 
-    await session.flush()
+    # 探测（网络）与落库分离：状态变更与观测在写调度器内一次落库提交
+    async with write_gate(WritePriority.BACKGROUND):
+        for node, observation, mutations in pending:
+            if mutations is not None:
+                failures, target = mutations
+                node.consecutive_failures = failures
+                node.state = target
+            session.add(HealthObservation(**observation))
+        await session.commit()
     if outcomes:
         still_out = sum(1 for o in outcomes if o.state in (NODE_DEAD, NODE_RETIRED))
         logger.info(
@@ -544,6 +567,9 @@ async def exit_ip_check_pool(
     失败 → 只落观测与 `detail`，**不动 `exit_ip`、不动 `state`**（一次目标服务
     故障不该擦掉已经观测到的出口事实）。
 
+    探测（网络）与落库分离：按 `PROBE_COMMIT_EVERY` 分块，块内先探完，再在
+    写调度器内一次性落库提交——写事务不跨网络等待，写者位在块间空出。
+
     `names` 不给就取池文件当前节点；给了就只探这些——供调用方做**有界**首轮探测
     （启动链不能为了出口身份把整池串行探完才开门）。
     """
@@ -556,37 +582,40 @@ async def exit_ip_check_pool(
     by_name = {row.runtime_name: row for row in rows.scalars()}
 
     outcomes: list[ExitIpOutcome] = []
-    for i, name in enumerate(names, start=1):  # 严格串行（见 probe_exit_ip）
-        node = by_name.get(name)
-        if node is None:
-            continue
-        result = await probe_exit_ip(controller_url, secret, mixed_port, name,
-                                     url=url, timeout=timeout)
-        if result.ok and result.exit_ip:
-            node.exit_ip = result.exit_ip
-        session.add(HealthObservation(
-            node_id=node.node_id,
-            level=L1_LEVEL,
-            ok=result.ok,
-            latency_ms=result.latency_ms,
-            detail=result.detail or None,
-            observed_at=now,
-            run_id=run_id,
-            channel=channel,
-            target=url,
-        ))
-        outcomes.append(ExitIpOutcome(
-            node_id=node.node_id,
-            runtime_name=name,
-            ok=result.ok,
-            exit_ip=result.exit_ip,
-            detail=result.detail,
-            latency_ms=result.latency_ms,
-        ))
-        if i % PROBE_COMMIT_EVERY == 0:
+    for start in range(0, len(names), PROBE_COMMIT_EVERY):
+        chunk = names[start : start + PROBE_COMMIT_EVERY]
+        probed: list[tuple[ProxyNode, ExitIpResult]] = []
+        for name in chunk:  # 严格串行（见 probe_exit_ip）
+            node = by_name.get(name)
+            if node is None:
+                continue
+            result = await probe_exit_ip(controller_url, secret, mixed_port, name,
+                                         url=url, timeout=timeout)
+            probed.append((node, result))
+            outcomes.append(ExitIpOutcome(
+                node_id=node.node_id,
+                runtime_name=name,
+                ok=result.ok,
+                exit_ip=result.exit_ip,
+                detail=result.detail,
+                latency_ms=result.latency_ms,
+            ))
+        async with write_gate(WritePriority.BACKGROUND):
+            for node, result in probed:
+                if result.ok and result.exit_ip:
+                    node.exit_ip = result.exit_ip
+                session.add(HealthObservation(
+                    node_id=node.node_id,
+                    level=L1_LEVEL,
+                    ok=result.ok,
+                    latency_ms=result.latency_ms,
+                    detail=result.detail or None,
+                    observed_at=now,
+                    run_id=run_id,
+                    channel=channel,
+                    target=url,
+                ))
             await session.commit()
-
-    await session.flush()
     return tuple(outcomes)
 
 
@@ -745,57 +774,60 @@ async def business_check_pool(
     by_name = {row.runtime_name: row for row in rows.scalars()}
 
     outcomes: list[BusinessOutcome] = []
-    for i, name in enumerate(names, start=1):  # 严格串行（见 probe_business）
-        node = by_name.get(name)
-        if node is None:
-            continue
-        result = await probe_business(controller_url, secret, mixed_port, name,
-                                      url=url, appid=appid, timeout=timeout)
-        # 生死证据判定：None = 不构成节点证据（选不中节点是探针基础设施问题）。
-        # 拿到 Steam 侧响应（200 / 429 / 503 等）= 传输成功，Steam 故障不罚节点；
-        # 502/504 是**代理链网关错误**（mihomo 上游链失败时本地生成，Steam 正常
-        # 不回裸 502/504）——与超时/连不上同归节点失败证据。
-        if result.ok:
-            probe_ok: bool | None = True
-        elif result.http_status in (502, 504):
-            probe_ok = False
-        elif result.http_status is not None:
-            probe_ok = True
-        elif result.detail.startswith(NODE_PROBE_FAILED):
-            probe_ok = None
-        else:  # 经节点发请求超时/连不上：节点失败证据
-            probe_ok = False
-        if probe_ok is not None:
-            failures = 0 if probe_ok else (node.consecutive_failures or 0) + 1
-            node.consecutive_failures = failures
-            node.state = evaluate_node_state(
-                node.state,
-                source_seen=True,  # 池文件成员 = 来源在场
-                probe_ok=probe_ok,
-                consecutive_failures=failures,
-            )
-        session.add(HealthObservation(
-            node_id=node.node_id,
-            level=L2_LEVEL,
-            ok=result.ok,
-            latency_ms=result.latency_ms,
-            detail=result.detail or None,
-            observed_at=now,
-            run_id=run_id,
-            channel=channel,
-            target=target_url,
-        ))
-        outcomes.append(BusinessOutcome(
-            node_id=node.node_id,
-            runtime_name=name,
-            ok=result.ok,
-            http_status=result.http_status,
-            final_price_in_cents=result.final_price_in_cents,
-            detail=result.detail,
-            latency_ms=result.latency_ms,
-        ))
-        if i % PROBE_COMMIT_EVERY == 0:
+    for start in range(0, len(names), PROBE_COMMIT_EVERY):
+        chunk = names[start : start + PROBE_COMMIT_EVERY]
+        probed: list[tuple[ProxyNode, BusinessResult]] = []
+        for name in chunk:  # 严格串行（见 probe_business）
+            node = by_name.get(name)
+            if node is None:
+                continue
+            result = await probe_business(controller_url, secret, mixed_port, name,
+                                          url=url, appid=appid, timeout=timeout)
+            probed.append((node, result))
+            outcomes.append(BusinessOutcome(
+                node_id=node.node_id,
+                runtime_name=name,
+                ok=result.ok,
+                http_status=result.http_status,
+                final_price_in_cents=result.final_price_in_cents,
+                detail=result.detail,
+                latency_ms=result.latency_ms,
+            ))
+        async with write_gate(WritePriority.BACKGROUND):
+            for node, result in probed:
+                # 生死证据判定：None = 不构成节点证据（选不中节点是探针基础设施问题）。
+                # 拿到 Steam 侧响应（200 / 429 / 503 等）= 传输成功，Steam 故障不罚节点；
+                # 502/504 是**代理链网关错误**（mihomo 上游链失败时本地生成，Steam 正常
+                # 不回裸 502/504）——与超时/连不上同归节点失败证据。
+                if result.ok:
+                    probe_ok: bool | None = True
+                elif result.http_status in (502, 504):
+                    probe_ok = False
+                elif result.http_status is not None:
+                    probe_ok = True
+                elif result.detail.startswith(NODE_PROBE_FAILED):
+                    probe_ok = None
+                else:  # 经节点发请求超时/连不上：节点失败证据
+                    probe_ok = False
+                if probe_ok is not None:
+                    failures = 0 if probe_ok else (node.consecutive_failures or 0) + 1
+                    node.consecutive_failures = failures
+                    node.state = evaluate_node_state(
+                        node.state,
+                        source_seen=True,  # 池文件成员 = 来源在场
+                        probe_ok=probe_ok,
+                        consecutive_failures=failures,
+                    )
+                session.add(HealthObservation(
+                    node_id=node.node_id,
+                    level=L2_LEVEL,
+                    ok=result.ok,
+                    latency_ms=result.latency_ms,
+                    detail=result.detail or None,
+                    observed_at=now,
+                    run_id=run_id,
+                    channel=channel,
+                    target=target_url,
+                ))
             await session.commit()
-
-    await session.flush()
     return tuple(outcomes)

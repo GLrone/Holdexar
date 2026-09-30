@@ -213,8 +213,8 @@ async def test_identity_tables_never_pruned(tmp_data_dir):
         )
         await session.execute(
             text(
-                "INSERT INTO proxy_node_sources (node_id, subscription_id, original_name, first_seen, last_seen) "
-                "VALUES ('n1', 1, 'A', :at, :at)"
+                "INSERT INTO proxy_node_sources (node_id, subscription_id, original_name, source_code, first_seen, last_seen) "
+                "VALUES ('n1', 1, 'A', 'ss', :at, :at)"
             ),
             {"at": NOW - timedelta(days=500)},
         )
