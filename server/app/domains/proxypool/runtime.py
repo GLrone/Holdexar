@@ -11,10 +11,10 @@
 （`clash_manager`），本模块只消费 `start()` 之后暴露的控制器地址与密钥。
 
 **M 只能按 Registry 的名字空间取，不能数整个 JSON**：`/proxies` 里还混着内核内置
-的逻辑节点（实测本版为 DIRECT / REJECT / REJECT-DROP / GLOBAL / COMPATIBLE /
+的逻辑节点（本版内核为 DIRECT / REJECT / REJECT-DROP / GLOBAL / COMPATIBLE /
 PASS / PASS-RULE 共 7 个），数总数会把 M 虚高。
 
-关于「内核少加载了几个节点」：实测本版内核对**重复名**与**不认的协议**都是
+内核对**重复名**与**不认的协议**都是
 `level=fatal` 直接拒绝启动，而不是静默跳过。所以真实世界里 `M < N` 的常见真身是
 「内核根本没起来」——`wait_proxy_names` 因此把「不可达」单独抛成
 `RuntimeUnreachableError`，与「起来了但集合不同」严格区分。
@@ -303,7 +303,7 @@ def prepare_runtime_config(data_dir: Path, *, lanes: int | None = None,
                            pin_running: bool = False) -> Path:
     """由 `crawl-pool.yaml` 生成 `crawl-runtime.yaml`——内核实际启动用的文件。
 
-    为什么必须分文件：`ClashRuntime.start()` 会把 `external-controller` / `secret`
+    必须分文件：`ClashRuntime.start()` 会把 `external-controller` / `secret`
     **写回它收到的那个文件**。若直接启动池文件，池就不再等于 `build_pool` 校验过的
     产物，而且下一次 `build_pool` 一覆盖就把控制器注入抹掉——而健康检测
     正依赖控制器，这个矛盾不能带进健康模块。
@@ -440,7 +440,7 @@ async def wait_proxy_names(
 ) -> frozenset[str]:
     """轮询控制器直到 `/proxies` 可用，返回其中全部代理名。
 
-    内核是异步进程：`Popen` 返回不代表控制器已监听（实测约 20ms 起来，但不能假定）。
+    内核是异步进程：`Popen` 返回不代表控制器已监听。
     超时抛 `RuntimeUnreachableError`，并且要说清这是「没起来」而不是「少节点」。
     """
     deadline = time.monotonic() + timeout
@@ -538,7 +538,7 @@ def restore_selection(previous: str | None, available: Sequence[str]) -> str | N
     """重建后恢复 `GLOBAL`：优先原节点，它不在新池则取新池第一项（确定性，不排序）。
 
     只依赖「上次选择 + 新池」两个输入。内核自己会恢复仍存在于配置中的选择、节点消失
-    则回退 `DIRECT`，但那是**内核的内部行为**，不作为本层的契约——它变了我们也不改。
+    则回退 `DIRECT`，但那是**内核的内部行为**，不作为本层的契约，它的变化不约束本层。
     """
     if previous and previous in available:
         return previous
