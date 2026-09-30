@@ -73,6 +73,8 @@ import fetchPage from './fetch'
 import island from './island'
 // ── Steam 活动日历（views/events/Index.vue 与 SteamEventCountdown 卡片）──
 import steamEvents from './steamEvents'
+// ── 领航员（components/business/HlPilotDrawer.vue 与设置页领航员卡）──
+import pilot from './pilot'
 
 /** 全量中文词典 */
 export const messages = {
@@ -119,6 +121,7 @@ export const messages = {
   ...fetchPage,
   ...island,
   ...steamEvents,
+  ...pilot,
 } as const
 
 export type MessageKey = keyof typeof messages

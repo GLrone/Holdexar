@@ -7,6 +7,7 @@ import {
   accountLoginApi,
   notificationsApi,
   settingsApi,
+  pilotApi,
   systemApi,
   type LoginSessionState,
   type NotificationPrefs,
@@ -53,6 +54,52 @@ const steamId = ref('')
 const apiKeyInput = ref('')
 const apiKeyMasked = ref('')
 const hasApiKey = ref(false)
+
+/* ── 领航员（pilot）：AI 解读服务配置（key 密文落库，留空不改） ── */
+const pilotEnabled = ref(false)
+const pilotBaseUrl = ref('')
+const pilotModel = ref('')
+const pilotApiKeyInput = ref('')
+const pilotHasApiKey = ref(false)
+const pilotCapText = ref('500000')
+const pilotUsage = ref(0)
+const pilotSaving = ref(false)
+
+async function loadPilot() {
+  try {
+    const cfg = await pilotApi.getConfig()
+    pilotEnabled.value = cfg.enabled
+    pilotBaseUrl.value = cfg.base_url
+    pilotModel.value = cfg.model
+    pilotHasApiKey.value = cfg.has_api_key
+    pilotCapText.value = String(cfg.monthly_cap)
+    pilotUsage.value = cfg.usage_month
+  } catch {
+    /* 领航员配置拉不到不影响设置页其余部分 */
+  }
+}
+
+async function savePilot() {
+  pilotSaving.value = true
+  try {
+    const key = pilotApiKeyInput.value.trim()
+    const cfg = await pilotApi.updateConfig({
+      enabled: pilotEnabled.value,
+      base_url: pilotBaseUrl.value.trim(),
+      model: pilotModel.value.trim(),
+      ...(key ? { api_key: key } : {}),
+      monthly_cap: Number(pilotCapText.value) || 0,
+    })
+    pilotHasApiKey.value = cfg.has_api_key
+    pilotUsage.value = cfg.usage_month
+    pilotApiKeyInput.value = ''
+    message.success(t('pilot.settings.saved'))
+  } catch (e) {
+    errorMsg.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    pilotSaving.value = false
+  }
+}
 
 /* ── Steam 多账户绑定（Cookie → 钱包余额 / 结算地区 / 愿望单与游戏计数）── */
 const accountStore = useAccountStore()
@@ -719,6 +766,7 @@ onMounted(() => {
   void settingsStore.load()
   void load()
   void loadNotifications()
+  void loadPilot()
   /* 登录会话在后端存续：进页先对状态快照，进行中就恢复状态卡并续上轮询 */
   void refreshLoginState().then(() => {
     if (loginActive.value) startLoginPolling()
@@ -1069,6 +1117,70 @@ onUnmounted(stopLoginPolling)
             <HlButton art="outline" tone="green" size="sm" :disabled="saving" :loading="saving" @click="save">
               <HlIcon v-if="!saving" name="check" />
               {{ t('settings.account.save') }}
+            </HlButton>
+          </div>
+        </div>
+      </div>
+
+      <!-- 领航员（AI 解读服务配置） -->
+      <div class="card settings-card" data-section="pilot.settings.title">
+        <div class="section-title">{{ t('pilot.settings.title') }}</div>
+        <div class="section-desc">{{ t('pilot.settings.desc') }}</div>
+
+        <div class="settings-row">
+          <div class="settings-row__line">
+            <HlSwitch v-model="pilotEnabled" accent :label="t('pilot.settings.enabled')" />
+          </div>
+          <div class="settings-row__line">
+            <HlInput
+              v-model="pilotBaseUrl"
+              :placeholder="t('pilot.settings.base_url')"
+              style="max-width: 420px"
+            />
+          </div>
+          <div class="settings-row__line">
+            <HlInput
+              v-model="pilotModel"
+              :placeholder="t('pilot.settings.model')"
+              style="max-width: 420px"
+            />
+          </div>
+          <div class="settings-row__line">
+            <HlInput
+              v-model="pilotApiKeyInput"
+              show-password
+              :placeholder="
+                pilotHasApiKey
+                  ? t('pilot.settings.api_key_hint')
+                  : t('pilot.settings.api_key')
+              "
+              style="max-width: 420px"
+            />
+          </div>
+          <div class="settings-row__line">
+            <HlInput
+              v-model="pilotCapText"
+              :placeholder="t('pilot.settings.monthly_cap')"
+              style="max-width: 420px"
+            />
+            <span class="section-desc" style="display: inline; margin-left: 8px">
+              {{ t('pilot.settings.usage', { tokens: pilotUsage }) }}
+            </span>
+          </div>
+        </div>
+
+        <div class="settings-row">
+          <div class="settings-row__line">
+            <HlButton
+              art="outline"
+              tone="blue"
+              size="sm"
+              :disabled="pilotSaving"
+              :loading="pilotSaving"
+              @click="savePilot"
+            >
+              <HlIcon name="check" />
+              {{ t('pilot.settings.save') }}
             </HlButton>
           </div>
         </div>
