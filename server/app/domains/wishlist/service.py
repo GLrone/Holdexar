@@ -23,7 +23,8 @@ from datetime import datetime
 import httpx
 from sqlalchemy import func, select
 
-from app.core.database import get_session_factory
+from app.core.database import WritePriority, get_session_factory
+from app.core.database import write_gate
 from app.crawler.utils import get_beijing_time_obj
 from .models import TrackedAccount, WishlistItem
 
@@ -104,7 +105,7 @@ async def _backfill_personas(steamids: list[str]) -> None:
         try:
             persona = await _fetch_persona(sid)
             if persona.get("persona_name") or persona.get("avatar_url"):
-                async with get_session_factory()() as session:
+                async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
                     account = await session.get(TrackedAccount, sid)
                     if account is not None:
                         _apply_persona(account, persona)
@@ -347,7 +348,7 @@ async def list_accounts() -> list[dict]:
     if pending:
         from app.domains.account.steam_wallet import normalize_avatar_url
 
-        async with get_session_factory()() as session:
+        async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
             for account, (name, avatar) in pending:
                 row = await session.get(TrackedAccount, account.steamid)
                 if row is None:
@@ -383,7 +384,7 @@ async def add_account(steamid_or_vanity: str, label: str = "", kinds: dict | Non
     now = _naive(get_beijing_time_obj())
     # 绑定即抓昵称/头像（愿望单页账户行展示；失败不阻断绑定）
     persona = await _fetch_persona(steamid)
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         existing = await session.get(TrackedAccount, steamid)
         if existing:
             raise ValueError(f"账户已存在: {steamid}")
@@ -402,7 +403,7 @@ async def add_account(steamid_or_vanity: str, label: str = "", kinds: dict | Non
 
 
 async def remove_account(steamid: str) -> bool:
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         account = await session.get(TrackedAccount, steamid)
         if account is None:
             return False
@@ -425,6 +426,7 @@ async def sync_account(steamid: str, auto_crawl: bool = True) -> dict:
     关闭后不再覆写 owned 标记，已有已购条目回落为愿望单条目。
     新增条目在 auto_crawl=True 且无任务运行时自动触发爬取。
     """
+    # 取数段（无写闸）：账号校验 + 三路网络拉取 + 基线读，全部不持写者位
     async with get_session_factory()() as session:
         account = await session.get(TrackedAccount, steamid)
         if account is None:
@@ -443,6 +445,9 @@ async def sync_account(steamid: str, auto_crawl: bool = True) -> dict:
             owned_error = str(e)
             logger.warning("已购拉取失败（%s），本次保留既有 owned 标记", e)
 
+        # 昵称/头像随手刷新（Steam 昵称会改；拉取失败静默保留旧值）
+        persona = await _fetch_persona(steamid)
+
         existing = {
             int(r.appid): r
             for r in (
@@ -452,100 +457,101 @@ async def sync_account(steamid: str, auto_crawl: bool = True) -> dict:
             ).scalars()
         }
 
-        now = _naive(get_beijing_time_obj())
-        new_appids: list[int] = []
-        new_owned_appids: list[int] = []
+        # 落库段（过写调度器）：成员资格覆写 + 欠账 reconcile 一次事务提交
+        async with write_gate(WritePriority.BACKGROUND):
+            now = _naive(get_beijing_time_obj())
+            new_appids: list[int] = []
+            new_owned_appids: list[int] = []
 
-        for it in wishlist:
-            appid = it["appid"]
-            added = it.get("added_at")
-            added_dt = (
-                datetime.fromtimestamp(int(added)) if added else now
-            )
-            row = existing.get(appid)
-            if row is None:
-                session.add(
-                    WishlistItem(
-                        steamid=steamid, appid=appid, added_at=_naive(added_dt),
-                        active=True, wishlisted=True,
-                    )
+            for it in wishlist:
+                appid = it["appid"]
+                added = it.get("added_at")
+                added_dt = (
+                    datetime.fromtimestamp(int(added)) if added else now
                 )
-                new_appids.append(appid)
-            else:
-                # 成员资格覆写：Steam 愿望单现存条目一律标愿望单（爬取第一
-                # 优先级）；excluded（本地手动移除）行不复活——用户删掉的
-                # 条目不能 15 分钟后被同步洗回来，成员标记照常记录
-                # （Steam 侧事实），重新添加时经成员标记恢复优先级。
-                row.wishlisted = True
-                if not row.active and not row.excluded:
-                    row.active = True
-
-        # 已购并入任务池（active 标记，kinds 按账户开关——任务页「已购游戏抓取
-        # ·账户设置」可关掉库太大的账户，只盯愿望单）
-        kinds = dict(account.kinds_json or {"wishlist": True, "owned": True})
-        owned_failed = bool(kinds.get("owned")) and owned_error is not None
-        owned_synced = bool(kinds.get("owned")) and owned_error is None
-        owned_ids = {g["appid"] for g in owned} if owned_synced else set()
-        if owned_synced and owned:
-            for g in owned:
-                row = existing.get(g["appid"])
+                row = existing.get(appid)
                 if row is None:
                     session.add(
                         WishlistItem(
-                            steamid=steamid,
-                            appid=g["appid"],
-                            added_at=now,
-                            active=True,
-                            owned=True,
+                            steamid=steamid, appid=appid, added_at=_naive(added_dt),
+                            active=True, wishlisted=True,
                         )
                     )
-                    new_owned_appids.append(g["appid"])
-                    new_appids.append(g["appid"])
-                elif not row.active and not row.excluded:
-                    row.active = True
+                    new_appids.append(appid)
+                else:
+                    # 成员资格覆写：Steam 愿望单现存条目一律标愿望单（爬取第一
+                    # 优先级）；excluded（本地手动移除）行不复活——用户删掉的
+                    # 条目不能 15 分钟后被同步洗回来，成员标记照常记录
+                    # （Steam 侧事实），重新添加时经成员标记恢复优先级。
+                    row.wishlisted = True
+                    if not row.active and not row.excluded:
+                        row.active = True
 
-        # 已购标记覆写：以本次 GetOwnedGames 结果为准（库转私有时回落为愿望单条目）。
-        # 通道失败时 owned_synced 已置 False，跳过覆写——标记保留到下次成功同步。
-        if owned_synced:
-            for appid, row in existing.items():
-                row.owned = appid in owned_ids
+            # 已购并入任务池（active 标记，kinds 按账户开关——任务页「已购游戏抓取
+            # ·账户设置」可关掉库太大的账户，只盯愿望单）
+            kinds = dict(account.kinds_json or {"wishlist": True, "owned": True})
+            owned_failed = bool(kinds.get("owned")) and owned_error is not None
+            owned_synced = bool(kinds.get("owned")) and owned_error is None
+            owned_ids = {g["appid"] for g in owned} if owned_synced else set()
+            if owned_synced and owned:
+                for g in owned:
+                    row = existing.get(g["appid"])
+                    if row is None:
+                        session.add(
+                            WishlistItem(
+                                steamid=steamid,
+                                appid=g["appid"],
+                                added_at=now,
+                                active=True,
+                                owned=True,
+                            )
+                        )
+                        new_owned_appids.append(g["appid"])
+                        new_appids.append(g["appid"])
+                    elif not row.active and not row.excluded:
+                        row.active = True
 
-        # 愿望单里已移除的且非已购 → active=0（已购条目常驻任务池，不随愿望单移除停用）。
-        # 例外：通道失败时已购状态未知，已购行保守保留，等下次成功同步再判定；
-        # 手动来源条目免疫——星标关注（manual）与手动入池（manual_pool）的
-        # 存续不取决于 Steam 真实愿望单（账户同步 15min 高频后，无免疫的
-        # 手动条目 15 分钟内即被反向核对洗掉）。
-        wished_ids = {it["appid"] for it in wishlist}
-        if wishlist:
-            for appid, row in existing.items():
-                if appid not in wished_ids:
-                    # 成员资格覆写：Steam 侧已移除 → 清愿望单标
-                    row.wishlisted = False
-                    if appid in owned_ids or not row.active:
-                        continue
-                    if (
-                        getattr(row, "manual", False)
-                        or getattr(row, "manual_pool", False)
-                        or getattr(row, "board_pool", False)
-                    ):
-                        continue
-                    if owned_failed and row.owned:
-                        continue
-                    row.active = False
+            # 已购标记覆写：以本次 GetOwnedGames 结果为准（库转私有时回落为愿望单条目）。
+            # 通道失败时 owned_synced 已置 False，跳过覆写——标记保留到下次成功同步。
+            if owned_synced:
+                for appid, row in existing.items():
+                    row.owned = appid in owned_ids
 
-        total_active = (
-            await session.execute(
-                select(WishlistItem.appid).where(
-                    WishlistItem.steamid == steamid, WishlistItem.active.is_(True)
+            # 愿望单里已移除的且非已购 → active=0（已购条目常驻任务池，不随愿望单移除停用）。
+            # 例外：通道失败时已购状态未知，已购行保守保留，等下次成功同步再判定；
+            # 手动来源条目免疫——星标关注（manual）与手动入池（manual_pool）的
+            # 存续不取决于 Steam 真实愿望单（账户同步 15min 高频后，无免疫的
+            # 手动条目 15 分钟内即被反向核对洗掉）。
+            wished_ids = {it["appid"] for it in wishlist}
+            if wishlist:
+                for appid, row in existing.items():
+                    if appid not in wished_ids:
+                        # 成员资格覆写：Steam 侧已移除 → 清愿望单标
+                        row.wishlisted = False
+                        if appid in owned_ids or not row.active:
+                            continue
+                        if (
+                            getattr(row, "manual", False)
+                            or getattr(row, "manual_pool", False)
+                            or getattr(row, "board_pool", False)
+                        ):
+                            continue
+                        if owned_failed and row.owned:
+                            continue
+                        row.active = False
+
+            total_active = (
+                await session.execute(
+                    select(WishlistItem.appid).where(
+                        WishlistItem.steamid == steamid, WishlistItem.active.is_(True)
+                    )
                 )
-            )
-        ).all()
+            ).all()
 
-        # 昵称/头像随手刷新（Steam 昵称会改；拉取失败静默保留旧值）
-        _apply_persona(account, await _fetch_persona(steamid))
-        account.last_sync_at = now
-        account.item_count = len(total_active)
-        await session.commit()
+            _apply_persona(account, persona)
+            account.last_sync_at = now
+            account.item_count = len(total_active)
+            await session.commit()
 
     # 账户同步会改写来源标记（成员资格覆写 / 反向核对停用），同步后按现状
     # 重算 Tracking Source；排除状态不动（用户意图不由自动同步改写）
@@ -901,7 +907,7 @@ async def update_kinds(steamid: str, kinds_patch: dict) -> dict:
 
     下次同步生效：关闭后该账户不再拉取/覆写已购库（已有条目回落愿望单条目）。
     """
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         account = await session.get(TrackedAccount, steamid)
         if account is None:
             raise ValueError(f"账户不存在: {steamid}")
@@ -1256,7 +1262,7 @@ async def remove_pool_items(appids: list[int], *, reason: str = "pool_removed") 
         states = await monitoring_service.states_of("game", clean)
         sources = await monitoring_service.sources_map("game", clean)
 
-        async with get_session_factory()() as session:
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             rows = (
                 (
                     await session.execute(
@@ -1315,7 +1321,7 @@ async def release_free_games(appids: list[int]) -> int:
 
     from app.domains.games.models import Game
 
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         free_ids = set(
             (
                 await session.execute(
