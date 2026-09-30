@@ -149,6 +149,7 @@ server/scripts/_history_*.html
 /_gen_*
 server/scripts/_tmp_*
 server/scripts/_gen_*
+/_probe_laya/
 
 # ── 一次性开发脚本（本机调试/基准/验证用，不上传）──
 # 刻意不写 `**/scripts/`：那会连 web/scripts/check-routes.mjs（构建门禁必需）一起扫掉。
