@@ -1,4 +1,5 @@
 """pilot 意图路由、agent 工具循环与降级路径单测（LLM 以替身注入，不触网、不依赖真实库）。"""
+import asyncio
 import json
 
 import pytest
@@ -344,3 +345,32 @@ class TestProtocolAdapters:
     def test_effective_base_url(self):
         assert pilot_llm.effective_base_url("anthropic", "") == "https://api.anthropic.com"
         assert pilot_llm.effective_base_url("openai", "https://api.deepseek.com/v1") == "https://api.deepseek.com/v1"
+
+
+class TestNavigate:
+    @pytest.mark.asyncio
+    async def test_navigate_card_emitted(self, monkeypatch):
+        _patch_ready(
+            monkeypatch,
+            stream=[
+                ("tool_calls", [{"id": "t1", "name": "navigate", "arguments": {"target": "alerts"}}]),
+                ("answer", "已打开。"),
+            ],
+        )
+        executed = []
+        monkeypatch.setattr(
+            service.pilot_tools,
+            "execute_tool",
+            _tool_stub(executed, {"kind": "navigate", "target": "alerts", "path": "/alerts"}),
+        )
+        events = [e async for e in service.ask_stream("打开价格提醒", session_id="s-nav")]
+        done = events[-1]
+        assert done["type"] == "done" and done["source"] == "llm"
+        assert {"kind": "navigate", "target": "alerts", "path": "/alerts"} in done["cards"]
+
+    @pytest.mark.asyncio
+    async def test_navigate_unknown_target_rejected(self):
+        from app.domains.pilot import tools as pilot_tools_mod
+
+        result = await pilot_tools_mod.execute_tool("navigate", {"target": "etc/passwd"})
+        assert result["path"] == ""

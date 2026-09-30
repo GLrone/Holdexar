@@ -172,6 +172,8 @@ def _card_of(tool_name: str, result: dict) -> dict | None:
         return {k: v for k, v in result.items() if k != "kind"} | {"kind": "price"}
     if kind == "action":
         return {"kind": "action", **result}
+    if kind == "navigate" and result.get("path"):
+        return {"kind": "navigate", "target": result["target"], "path": result["path"]}
     return None
 
 

@@ -138,6 +138,29 @@ async def recommend_games_by_filters(
     return [_game_item(it) for it in result.get("items", [])]
 
 
+# 导航目标白名单：target 键 → 站内路径（agent 导航工具的目标集，
+# 与 web 路由表同名对齐；不在表内的目标一律拒绝执行）
+NAV_TARGETS = {
+    "dashboard": "/dashboard",
+    "library": "/library",
+    "gamelib": "/gamelib",
+    "follows": "/pool",
+    "bundles": "/bundles",
+    "alerts": "/alerts",
+    "events": "/events",
+    "achievements": "/achievements",
+    "family": "/family",
+    "bills": "/bills",
+    "rates": "/rates",
+    "toolbox": "/toolbox",
+    "crawl": "/crawl",
+    "proxies": "/proxies",
+    "fetch": "/fetch",
+    "logs": "/logs",
+    "settings": "/settings",
+}
+
+
 def tool_specs() -> list[dict]:
     """agent 循环的工具表（OpenAI function 格式）。
 
@@ -175,6 +198,18 @@ def tool_specs() -> list[dict]:
             }, "required": ["appid"]},
         }},
         {"type": "function", "function": {
+            "name": "navigate",
+            "description": "跳转到用户想查看的模块页面。target 取值（用户说法 → target）："
+                           "仪表盘=dashboard、找游戏=library、游戏库=gamelib、我的关注=follows、"
+                           "捆绑包=bundles、价格提醒=alerts、活动日历=events、成就=achievements、"
+                           "家庭=family、账单=bills、汇率=rates、工具箱=toolbox、任务=crawl、"
+                           "网络=proxies、自动抓取=fetch、日志=logs、设置=settings。"
+                           "仅当用户表达想查看/打开某模块时调用",
+            "parameters": {"type": "object", "properties": {
+                "target": {"type": "string", "description": "模块标识，取上方取值列表之一"},
+            }, "required": ["target"]},
+        }},
+        {"type": "function", "function": {
             "name": "create_price_alert",
             "description": "为中国区创建价格提醒。仅当用户明确要求提醒时调用；用户给出具体价格用 price 类型，用户说史低提醒用 historic_low 类型",
             "parameters": {"type": "object", "properties": {
@@ -202,6 +237,12 @@ async def execute_tool(name: str, arguments: dict, *, guarded: bool = False) -> 
             max_price_yuan=arguments.get("max_price_yuan"),
         )
         return {"kind": "games", "items": items}
+    if name == "navigate":
+        target = str(arguments.get("target") or "")
+        path = NAV_TARGETS.get(target)
+        if not path:
+            return {"kind": "navigate", "target": "", "path": ""}
+        return {"kind": "navigate", "target": target, "path": path}
     if name == "add_follow":
         if guarded:
             return {"kind": "denied", "note": "guarded"}

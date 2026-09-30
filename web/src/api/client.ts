@@ -295,7 +295,14 @@ export interface PilotActionFacts {
   alertId?: number | null
 }
 
-export type PilotFacts = PilotPriceFacts | PilotGameFacts | PilotActionFacts
+/** 导航卡：agent 跳转模块（target 为模块键，path 为站内路由） */
+export interface PilotNavigateFacts {
+  kind: 'navigate'
+  target: string
+  path: string
+}
+
+export type PilotFacts = PilotPriceFacts | PilotGameFacts | PilotActionFacts | PilotNavigateFacts
 
 export interface PilotAskResponse {
   /** LLM 回答原文；facts / guide / none 形态下为空串，展示层按 source 渲染 */
