@@ -401,3 +401,100 @@ async def chat_stream(
     except (httpx.HTTPError, TypeError, ValueError) as e:
         logger.warning("pilot LLM 流式调用失败（%s）: %r", protocol, e)
         raise PilotLlmError(str(e)) from e
+
+
+# ── 服务商智能识别：网址 + 密钥 → 协议 / 服务商 / 可用模型清单 ──────────
+# host 指纹表给协议与服务商默认值（对齐「目录服务商免配置」的思路）；
+# 真实模型清单以端点探测为准（GET 各协议模型列表），比静态目录新鲜。
+
+_KNOWN_HOSTS: list[tuple[str, str, str, list[str]]] = [
+    ("api.deepseek.com", "openai", "DeepSeek", ["deepseek-chat", "deepseek-reasoner"]),
+    ("api.moonshot.cn", "openai", "Kimi", []),
+    ("api.moonshot.ai", "openai", "Kimi", []),
+    ("dashscope.aliyuncs.com", "openai", "通义千问", []),
+    ("open.bigmodel.cn", "openai", "智谱 GLM", []),
+    ("api.siliconflow.cn", "openai", "硅基流动", []),
+    ("openrouter.ai", "openai", "OpenRouter", []),
+    ("api.groq.com", "openai", "Groq", []),
+    ("api.x.ai", "openai", "Grok", []),
+    ("api.openai.com", "openai", "OpenAI", []),
+    ("api.anthropic.com", "anthropic", "Anthropic", []),
+    ("generativelanguage.googleapis.com", "gemini", "Gemini", []),
+    (":11434", "ollama", "Ollama 本地", []),
+]
+
+
+def match_host(base_url: str) -> tuple[str, str, list[str]] | None:
+    """host 指纹 → (协议, 服务商, 推荐模型)；未命中返回 None。"""
+    raw = (base_url or "").lower()
+    if not raw:
+        return None
+    for host_key, protocol, vendor, models in _KNOWN_HOSTS:
+        if host_key in raw:
+            return protocol, vendor, models
+    return None
+
+
+def _parse_model_list(protocol: str, payload: dict) -> list[str]:
+    if protocol in ("openai", "anthropic"):
+        return sorted(str(m["id"]) for m in payload.get("data") or [] if m.get("id"))
+    if protocol == "gemini":
+        names = (m.get("name") for m in payload.get("models") or [])
+        return sorted(str(n).split("/")[-1] for n in names if n)
+    if protocol == "ollama":
+        return sorted(str(m["name"]) for m in payload.get("models") or [] if m.get("name"))
+    return []
+
+
+def _list_models_url(protocol: str, base: str) -> tuple[str, dict]:
+    base = base.rstrip("/")
+    if protocol == "openai":
+        return base + "/models", {"Authorization": "Bearer {key}"}
+    if protocol == "anthropic":
+        return base + "/v1/models", {"x-api-key": "{key}", "anthropic-version": "2023-06-01"}
+    if protocol == "gemini":
+        return base + "/v1beta/models", {"x-goog-api-key": "{key}"}
+    return base + "/api/tags", {}
+
+
+async def list_models(protocol: str, base_url: str, api_key: str) -> list[str]:
+    """探测该账号可用的模型清单（短超时 GET；异常上抛由调用方处置）。"""
+    url_t, headers_t = _list_models_url(protocol, base_url)
+    url = url_t
+    headers = {k: v.replace("{key}", api_key) for k, v in headers_t.items()}
+    async with _client(base_url) as client:
+        resp = await client.get(url, headers=headers)
+        resp.raise_for_status()
+        return _parse_model_list(protocol, resp.json())
+
+
+async def detect_provider(base_url: str, api_key: str, protocol_hint: str | None = None) -> dict:
+    """网址 + 密钥 → 协议 / 服务商 / 可用模型清单 / 密钥有效性。
+
+    协议判定：显式提示 > host 指纹 > 缺省 openai（第三方网关多为兼容形态）。
+    模型清单以端点探测为准，探测失败回退 host 表推荐值；密钥有效性只在
+    探测拿到明确 401/403 时判 False，网络失败记 None（未知，不冤枉密钥）。"""
+    hit = match_host(base_url)
+    protocol = protocol_hint or (hit[0] if hit else "openai")
+    vendor = hit[1] if hit else ""
+    suggested = hit[2] if hit else []
+    base = effective_base_url(protocol, base_url)
+
+    key_valid: bool | None = None
+    models = suggested
+    try:
+        models = await list_models(protocol, base, api_key)
+        key_valid = True
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code in (401, 403):
+            key_valid = False
+    except httpx.HTTPError:
+        key_valid = None
+
+    return {
+        "protocol": protocol,
+        "vendor": vendor,
+        "models": models,
+        "suggested": suggested,
+        "key_valid": key_valid,
+    }

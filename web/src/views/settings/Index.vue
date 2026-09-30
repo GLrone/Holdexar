@@ -64,6 +64,8 @@ const pilotApiKeyInput = ref('')
 const pilotHasApiKey = ref(false)
 const pilotCapText = ref('500000')
 const pilotUsage = ref(0)
+const pilotModels = ref<string[]>([])
+const pilotDetecting = ref(false)
 /* 协议选项存 value 不存文案（切语言跟随）；地址占位随协议变化 */
 const pilotProtocolOptions = computed(() => [
   { value: 'openai', label: t('pilot.proto.openai') },
@@ -74,6 +76,31 @@ const pilotProtocolOptions = computed(() => [
 const pilotBaseUrlPlaceholder = computed(() =>
   t(`pilot.proto.base_${pilotProtocol.value}` as MessageKey))
 const pilotSaving = ref(false)
+
+async function detectPilot() {
+  pilotDetecting.value = true
+  try {
+    const key = pilotApiKeyInput.value.trim()
+    const r = await pilotApi.detect({
+      base_url: pilotBaseUrl.value.trim(),
+      ...(key ? { api_key: key } : {}),
+    })
+    pilotProtocol.value = r.protocol
+    pilotModels.value = r.models || []
+    if (!pilotModel.value && r.models?.length) pilotModel.value = r.models[0]
+    if (r.key_valid === false) {
+      message.error(t('pilot.detect.keybad'))
+    } else if (r.models?.length) {
+      message.success(t('pilot.detect.ok', { vendor: r.vendor || t('pilot.title'), n: r.models.length }))
+    } else {
+      message.info(t('pilot.detect.nomodels', { vendor: r.vendor || t('pilot.title') }))
+    }
+  } catch {
+    message.error(t('pilot.detect.unreachable'))
+  } finally {
+    pilotDetecting.value = false
+  }
+}
 
 async function loadPilot() {
   try {
@@ -1154,11 +1181,26 @@ onUnmounted(stopLoginPolling)
             <HlInput
               v-model="pilotBaseUrl"
               :placeholder="pilotBaseUrlPlaceholder"
-              style="max-width: 420px"
+              style="max-width: 340px"
             />
+            <HlButton
+              size="sm"
+              :disabled="!pilotBaseUrl.trim() || pilotDetecting"
+              :loading="pilotDetecting"
+              @click="detectPilot"
+            >
+              {{ t('pilot.detect.button') }}
+            </HlButton>
           </div>
           <div class="settings-row__line">
+            <HlSelect
+              v-if="pilotModels.length"
+              v-model="pilotModel"
+              :options="pilotModels.map((m) => ({ value: m, label: m }))"
+              style="max-width: 420px"
+            />
             <HlInput
+              v-else
               v-model="pilotModel"
               :placeholder="t('pilot.settings.model')"
               style="max-width: 420px"

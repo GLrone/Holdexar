@@ -7,8 +7,10 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from . import config as pilot_config
+from . import llm as pilot_llm
 from . import service
-from .schemas import AskRequest, AskResponse, PilotConfigPayload, PilotConfigUpdate
+from .schemas import (AskRequest, AskResponse, DetectRequest, DetectResponse,
+                      PilotConfigPayload, PilotConfigUpdate)
 
 router = APIRouter(prefix="/pilot", tags=["pilot"])
 
@@ -43,6 +45,22 @@ async def update_config(payload: PilotConfigUpdate) -> PilotConfigPayload:
         return await _config_payload()
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@router.post("/detect")
+async def detect(payload: DetectRequest) -> DetectResponse:
+    """网址 + 密钥 → 协议 / 服务商 / 可用模型清单（智能识别）。
+
+    密钥缺省时使用已保存的密钥（识别已存配置）。"""
+    api_key = payload.api_key
+    if not api_key:
+        cfg = await pilot_config.load_config()
+        api_key = cfg.get("api_key") or ""
+    try:
+        result = await pilot_llm.detect_provider(payload.base_url, api_key, payload.protocol)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return DetectResponse(**result)
 
 
 @router.post("/ask")

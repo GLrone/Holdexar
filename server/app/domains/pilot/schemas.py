@@ -25,6 +25,20 @@ class PilotConfigUpdate(BaseModel):
     monthly_cap: int | None = None
 
 
+class DetectRequest(BaseModel):
+    base_url: str = ""
+    api_key: str = ""
+    protocol: str | None = None
+
+
+class DetectResponse(BaseModel):
+    protocol: str
+    vendor: str
+    models: list[str]
+    suggested: list[str]
+    key_valid: bool | None = None
+
+
 class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=500)
     appid: int | None = None
