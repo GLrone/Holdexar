@@ -96,7 +96,7 @@ def build_router() -> CrawlerRouter:
 def _build_app_tasks(
     appids: list[int], regions: list[str], extras: bool
 ) -> list[dict]:
-    """appid 集 → 每区分批任务（1 任务 = 1 区 × ≤400 appid）。"""
+    """appid 集 → 每区分批任务（1 任务 = 1 区 × ≤300 appid）。"""
     tasks: list[dict] = []
     for cc in regions:
         for i, batch in enumerate(
@@ -272,9 +272,6 @@ async def _run_crawl_locked(
     tasks: list[dict] = list(pre_tasks or []) + _build_app_tasks(
         target_ids, regions, bs.EXTRAS_ENABLED
     )
-    # kz/ua 批次排最前：它们的 purchase_options 顺路填充 RU 基线（本设计不再
-    # 有独立的 CIS 预取请求），ru 批次写库前等基线就绪（见 browse_store 门）
-    tasks.sort(key=lambda t: t.get("region") not in bs.CIS_REGIONS)
 
     logger.info(
         "任务就绪：常规 %d + 预构建 %d | appids=%d regions=%s workers=%d 入口=%s",
@@ -294,8 +291,6 @@ async def _run_crawl_locked(
         # 价格轮对它们只需 appid + 库内名字核对，元数据由 handler 回退
         # PRESERVED（type 过滤 / name_en 版本后缀提取 / 建行原值保留）。
         # 整轮两语言全量预取会把 worker 启动挡在分钟级串行请求之后。
-        # RU 基线不再预取：由本轮 kz/ua 批次顺路采集（kz/ua 本来就要跑），
-        # 上一轮的基线缓存覆盖「ru 先于 kz/ua 落库」的窗口。
         if target_ids:
             unknown = [a for a in target_ids if a not in bs.PRESERVED]
             if unknown:
@@ -315,11 +310,6 @@ async def _run_crawl_locked(
                     len(bs.META), len(target_ids), len(unknown),
                     len(target_ids) - len(unknown),
                 )
-        bs.load_cis_cache(Path(get_settings().data_dir))
-        bs.register_cis_pending(
-            [t["id"] for t in tasks if t.get("region") in bs.CIS_REGIONS]
-        )
-
         # failure_ledger：browse 层重试耗尽的批次只记账本不抛异常，调度器
         # 对外口径（进度事件与这里的返回统计）必须把账本并入「失败」
         scheduler = CrawlerScheduler(
@@ -329,7 +319,6 @@ async def _run_crawl_locked(
             client_factory=client_factory,
         )
         await scheduler.run(tasks, session)
-        bs.save_cis_cache(Path(get_settings().data_dir))
 
         done, ok, failed = scheduler.counts()
         return {

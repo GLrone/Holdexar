@@ -29,7 +29,7 @@ from sqlalchemy import text
 from yarl import URL
 
 from app.core.database import get_session_factory, write_slot
-from app.crawler.config import CIS_REGIONS, CC_LIST
+from app.crawler.config import CC_LIST
 from app.crawler.db_writer import DbWriter
 from app.crawler.http_client import SteamRateLimitError
 from app.crawler.network_check import network_checker
@@ -93,11 +93,6 @@ CURRENCY_BY_CC = {cc: cur for cc, _, cur in CC_LIST}
 # ══════════════════════════════════════════════════════════════
 
 META: dict[int, dict] = {}          # appid → browse 元数据
-CIS_SUBS: dict[int, set[int]] = {}  # appid → kz/ua 在售 subid 集（RU 基准过滤）
-# 基准填充时刻（time.time 挂钟，随缓存文件跨进程持久）：由本轮 kz/ua 批次
-# 顺路采集刷新（kz/ua 本来就要跑），缓存文件只覆盖「ru 先于 kz/ua 落库」窗口
-CIS_SUBS_TS: dict[int, float] = {}
-CIS_CACHE_FILENAME = "crawler-cis-cache.json"
 PRESERVED: dict[int, dict] = {}     # appid → 库内原值（browse 拿不到的列）
 FAILED_TASKS: list[str] = []
 NO_OPTIONS_COUNT = 0                # 「可见但无购买选项」计数（判 locked）
@@ -107,24 +102,12 @@ FOLLOW_PARENT = True
 EXTRAS_ENABLED = True
 DRY_RUN = False
 
-# RU 基线就绪门：本轮 kz/ua 批次采集完成前，ru 批次不落库（防假 subid 混进现价）。
-# 默认放行——没有登记 kz/ua 批次的运行（补抓、单区手动、直调 handler 的测试）
-# 不等待；runner 每轮 reset 后再按批次登记关门
-CIS_GATE: asyncio.Event = asyncio.Event()
-CIS_GATE.set()
-CIS_GATE_WAIT_SECONDS = 45
-CIS_PENDING: set[str] = set()
-
 # 已进入落库循环的批次（兜底路径据此判断「本批是否一行都没写」）
 _WRITE_STARTED: set[str] = set()
 
 
 def reset_run_state() -> None:
-    """每轮 crawl 开始前清空运行态（防上一轮残留串味）。
-
-    CIS_SUBS 例外：跨轮复用，本轮 kz/ua 批次顺路刷新；基线就绪门默认
-    放行（本轮没有 kz/ua 批次时 ru 不等待），runner 登记批次后再关。
-    """
+    """每轮 crawl 开始前清空运行态（防上一轮残留串味）。"""
     global NO_OPTIONS_COUNT, PARENT_FOLLOWED
     META.clear()
     PRESERVED.clear()
@@ -132,71 +115,6 @@ def reset_run_state() -> None:
     _WRITE_STARTED.clear()
     NO_OPTIONS_COUNT = 0
     PARENT_FOLLOWED = 0
-    CIS_PENDING.clear()
-    CIS_GATE.set()
-
-
-def register_cis_pending(task_ids: list[str]) -> None:
-    """runner 建队后登记本轮全部 kz/ua 批次；ru 批次等它们采完基线再落库。"""
-    CIS_PENDING.update(str(t) for t in task_ids)
-    if CIS_PENDING:
-        CIS_GATE.clear()
-
-
-def cis_batch_fetched(task_id: str) -> None:
-    """一个 kz/ua 批次已采集基线（或穷尽失败）：移出等待集，空则放行 ru。"""
-    CIS_PENDING.discard(str(task_id))
-    if not CIS_PENDING:
-        CIS_GATE.set()
-
-
-async def wait_cis_ready(stop_event=None) -> None:
-    """ru 批次落库前等 kz/ua 基线采集完成；45s 上限防死等（超时按现有
-    基线落库，缺基线的 appid 走既有「无基准不过滤」回退）。"""
-    if CIS_GATE.is_set():
-        return
-    try:
-        await asyncio.wait_for(CIS_GATE.wait(), timeout=CIS_GATE_WAIT_SECONDS)
-    except asyncio.TimeoutError:
-        logger.warning(
-            "[RU 基线] 等待 kz/ua 采集超 %ds，按现有基线落库（缺基准的 appid 不过滤）",
-            CIS_GATE_WAIT_SECONDS,
-        )
-    if stop_event is not None and stop_event.is_set():
-        return
-
-
-def load_cis_cache(data_dir) -> None:
-    """跨进程恢复 CIS 基线（冷启动零预取的前提）。
-
-    文件缺失 / 损坏 = 当作没有基线，走增量预取，任何异常不影响爬取。
-    """
-    path = Path(data_dir) / CIS_CACHE_FILENAME
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        subs = data.get("subs") or {}
-        stamps = data.get("ts") or {}
-        for aid_str, values in subs.items():
-            aid = int(aid_str)
-            CIS_SUBS.setdefault(aid, set()).update(int(s) for s in values)
-            CIS_SUBS_TS[aid] = float(stamps.get(aid_str) or 0.0)
-    except (OSError, ValueError, TypeError, AttributeError):
-        return
-
-
-def save_cis_cache(data_dir) -> None:
-    """基线落盘（临时文件原子替换）；写失败只留日志，不影响爬取。"""
-    path = Path(data_dir) / CIS_CACHE_FILENAME
-    payload = {
-        "subs": {str(a): sorted(s) for a, s in CIS_SUBS.items()},
-        "ts": {str(a): t for a, t in CIS_SUBS_TS.items()},
-    }
-    try:
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload), encoding="utf-8")
-        tmp.replace(path)
-    except OSError:
-        logger.warning("[预取] CIS 基线缓存写盘失败（不影响本轮爬取）")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -884,17 +802,14 @@ async def handle_browse_price_task(context) -> None:
     task_id = task.get("id")
     cc = task.get("region")
     appids: list[int] = task.get("appids") or []
-    # kz/ua 批次握住 RU 基线门位直至终态（重推中不放行，防 ru 用残缺基线落库）
-    held = False
     try:
-        held = await _browse_price_task_inner(context)
+        await _browse_price_task_inner(context)
         return
     except Exception as e:  # noqa: BLE001 —— 兜底：任何异常都不得逃到调度器
         retries = task.get("retries", 0)
         if network_checker.is_offline:
             if not await _wait_network_online(context):
                 return
-            held = True
             await context.queue.put(dict(task))
             return
         if retries < MAX_PARTIAL_RETRIES:
@@ -904,7 +819,6 @@ async def handle_browse_price_task(context) -> None:
                 task_id, type(e).__name__, delay, retries + 1,
             )
             await asyncio.sleep(delay)
-            held = True
             await context.queue.put({**task, "retries": retries + 1})
             return
         # 穷尽：若本批一行都没写（异常发生在落库循环之前），整批记 missing
@@ -920,14 +834,12 @@ async def handle_browse_price_task(context) -> None:
         FAILED_TASKS.append(str(task_id))
     finally:
         _WRITE_STARTED.discard(str(task_id))
-        if cc in CIS_REGIONS and not held:
-            cis_batch_fetched(task_id)
 
 
 async def _browse_price_task_inner(context) -> bool:
     """browse 价格任务：一发批量（单区 × ≤400 appid）→ 逐 appid 落库。
 
-    返回 True = 任务已重推仍待重跑（RU 基线门位保持握住）；False = 已终态
+    返回 True = 任务已重推仍待重跑；False = 已终态
     （成功 / 穷尽 / 丢弃）。退避重推 / 断网守卫 / 欠账语义保持一致。
     """
     global PARENT_FOLLOWED, NO_OPTIONS_COUNT
@@ -971,9 +883,6 @@ async def _browse_price_task_inner(context) -> bool:
         FAILED_TASKS.append(str(task_id))
         return False
 
-    # ru 批次落库前等 kz/ua 基线采集（本轮 kz/ua 批次排最前、先抓完先填充）
-    if cc == "ru":
-        await wait_cis_ready(context.stop_event)
 
     # ── 子 app 跟父：type=14 / related_items.parent_appid 的条目自身没有购买
     #    选项（如 42710 "CoD: BO - Multiplayer" 之于 42700）。旧链路 appdetails
@@ -1014,9 +923,6 @@ async def _browse_price_task_inner(context) -> bool:
             (meta or {}).get("name_en") or (keep or {}).get("name_en") or "",
         )
 
-        # kz/ua 批次顺路采集 RU 基线（复用本批响应，零额外请求）
-        if cc in CIS_REGIONS:
-            _cis_fill(appid, opts if status == "ok" else None)
         if status == "locked" and _visible_without_options(items.get(appid)):
             NO_OPTIONS_COUNT += 1
 
@@ -1035,14 +941,6 @@ async def _browse_price_task_inner(context) -> bool:
             counts["skip"] += 1
             continue
 
-        # ── RU 区 CIS 基准过滤 ──
-        # 旧链路走 appdetails 五区探测拿「基准 subid」；browse 直接用 kz/ua 的
-        # purchase_options 当基准集：ru 在售 sub 必须落在基准集内，否则视为锁区
-        if cc == "ru" and status == "ok" and opts:
-            bench = CIS_SUBS.get(appid) or set()
-            if bench:
-                kept = [o for o in opts if (o.get("sub_id") or 0) in bench]
-                status, opts = ("ok", kept) if kept else ("locked", None)
 
         # 赠送态但响应里拿不到 0 价赠送选项（异常响应）→ 按 missing 记账自愈
         if status == "free_promo" and not any(
@@ -1137,10 +1035,6 @@ async def _browse_price_task_inner(context) -> bool:
             continue
         pending_writes.append((appid, game_data, prices_arr, status, opts))
 
-    # kz/ua 批次：基线已随本批响应填好，此刻即放行 ru——不等写库终态
-    # （写库走串行队，等终态会让 ru 白等整条队列）
-    if cc in CIS_REGIONS:
-        cis_batch_fetched(task_id)
 
     # 整批一次事务落库：一批一次基线查询 + 一次 commit（逐 appid 各开事务会
     # 让 1600 万行 history 的基线扫描与提交数按「款数 × 区数」膨胀）
@@ -1231,7 +1125,7 @@ def _discover_bundles_from_item(item: dict | None) -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════
-# 预取：元数据 + CIS 基准
+# 预取：元数据
 # ══════════════════════════════════════════════════════════════
 
 
@@ -1273,9 +1167,3 @@ async def prefetch_lang(
     return out
 
 
-def _cis_fill(appid: int, opts: list[dict] | None) -> None:
-    """kz/ua 批次顺路采集 RU 基线：在售 subid 集 → CIS_SUBS（零额外请求）。"""
-    subs = {o["sub_id"] for o in (opts or []) if o.get("sub_id")}
-    if subs:
-        CIS_SUBS.setdefault(appid, set()).update(subs)
-    CIS_SUBS_TS[appid] = time.time()
