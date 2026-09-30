@@ -8,9 +8,11 @@ import {
   type PilotFacts,
   type PilotGameFacts,
   type PilotGameFactsItem,
+  type PilotNavigateFacts,
   type PilotPriceFacts,
 } from '@/api/client'
 import { formatCnyFen } from '@/api/regions'
+import { useRouter } from 'vue-router'
 import { useI18n, type MessageKey } from '@/locales'
 import HlButton from '@/components/ui/HlButton.vue'
 import HlDrawer from '@/components/ui/HlDrawer.vue'
@@ -29,6 +31,7 @@ const props = defineProps<{
 }>()
 const emit = defineEmits<{ (e: 'update:modelValue', v: boolean): void }>()
 const { t } = useI18n()
+const router = useRouter()
 
 const visible = computed({
   get: () => props.modelValue,
@@ -85,6 +88,39 @@ function actionReceipt(f: PilotActionFacts): string {
   if (f.action === 'monitor_add') return t('pilot.action.monitor', { name: f.name ?? '—' })
   if (f.targetType === 'historic_low') return t('pilot.action.alertLow', { name: f.name ?? '—' })
   return t('pilot.action.alertPrice', { name: f.name ?? '—', price: fen(f.targetValueFen) })
+}
+
+function navModuleName(target: string): string {
+  const key = `pilot.nav.${target}` as MessageKey
+  return t(key)
+}
+
+/** 聚焦框：主内容区外圈亮环，2.2s 后淡出移除 */
+function focusMainRegion() {
+  const el = document.querySelector('.app-shell__main')
+  if (!el) return
+  const r = el.getBoundingClientRect()
+  const ring = document.createElement('div')
+  ring.style.cssText = [
+    'position:fixed', `top:${r.top - 6}px`, `left:${r.left - 6}px`,
+    `width:${r.width + 12}px`, `height:${r.height + 12}px`,
+    'border:2px solid var(--accent)', 'border-radius:14px',
+    'box-shadow:0 0 0 4px var(--accent-a15), 0 0 24px var(--accent-a15)',
+    'pointer-events:none', 'z-index:60',
+    'transition:opacity 0.5s', 'opacity:1',
+  ].join(';')
+  document.body.appendChild(ring)
+  setTimeout(() => {
+    ring.style.opacity = '0'
+    setTimeout(() => ring.remove(), 600)
+  }, 1800)
+}
+
+/** 导航卡生效：跳转模块 + 聚焦框（抽屉保持打开，模块在底层切换） */
+function applyNavigate(f: PilotNavigateFacts) {
+  if (!f.path) return
+  void router.push(f.path)
+  setTimeout(focusMainRegion, 700)
 }
 
 function priceBriefing(f: PilotPriceFacts): string {
@@ -173,11 +209,14 @@ async function ask(text?: string) {
   } catch {
     failed = true
   }
-  turns.value.push(
-    failed
-      ? { q, kind: 'reason', reasonKey: 'pilot.error' }
-      : buildTurn(q, done ?? { answer: '', thinking: null, source: 'none', reason: 'llm_failed', facts: null, cards: [], cached: false }),
-  )
+  const turn = failed
+    ? { q, kind: 'reason', reasonKey: 'pilot.error' } as Turn
+    : buildTurn(q, done ?? { answer: '', thinking: null, source: 'none', reason: 'llm_failed', facts: null, cards: [], cached: false })
+  turns.value.push(turn)
+  // 导航卡生效：取本轮最后一张，跳模块并打聚焦框
+  const navCards = (turn.cards ?? []).filter((c): c is PilotNavigateFacts => c.kind === 'navigate' && Boolean(c.path))
+  const lastNav = navCards[navCards.length - 1]
+  if (lastNav) applyNavigate(lastNav)
   streaming.value = false
   liveThinking.value = ''
   liveAnswer.value = ''
@@ -280,6 +319,18 @@ function pickCandidate(turn: Turn, index: number) {
           </div>
 
           <!-- agent 轮的结构化卡片：回答之后渲染（组件复用数据层） -->
+          <template v-if="turn.cards?.length">
+            <div
+              v-for="(c, ci) in turn.cards.filter((x) => x.kind === 'navigate')"
+              :key="`n${ci}`"
+              class="pilot-briefing"
+            >
+              <div class="pilot-briefing__title">{{ t('pilot.nav.doneTitle') }}</div>
+              <p class="pilot-briefing__text">
+                {{ t('pilot.nav.done', { module: navModuleName((c as PilotNavigateFacts).target) }) }}
+              </p>
+            </div>
+          </template>
           <template v-if="turn.cards?.length && turn.kind === 'answer'">
             <div v-for="(c, ci) in turn.cards" :key="`c${ci}`" class="pilot-briefing">
               <template v-if="c.kind === 'games'">
