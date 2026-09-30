@@ -6,9 +6,9 @@ import type { SortKey, FilterMode } from '@/api/regions'
  * 筛选状态 store。
  * ownership / 系列字段暂未接入数据源，保留结构位。
  *
- * 生命周期：本 store 只在**游戏商店页驻留期间**有效——离开页面时
- * `resetForLeave()` 把搜索词与全部筛选清回默认（见 views/library 的
- * onBeforeUnmount），下次进入是干净默认态，不会带回上一轮搜索结果。
+ * 生命周期：游戏商店页常驻 keep-alive（组件 name: LibraryFinder），搜索词与
+ * 全部筛选跨「去详情再返回」与跨切页保留；`resetForLeave()` 只在组件真正
+ * 销毁（移出缓存）时兜底清回默认，用户随时可用「清除筛选」主动归零。
  * 布局模式与高级筛选面板开合属纯 UI 偏好，不在重置范围。
  */
 interface FilterState {

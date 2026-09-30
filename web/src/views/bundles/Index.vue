@@ -13,7 +13,7 @@
  * 载体差异：PC 悬浮 popover / 移动端内联展开统一为非模态
  * HlDrawer（底层可交互，符合收口红线）；三级弹窗统一 HlDialog。
  */
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, watch } from 'vue'
 
 import { bundlesApi, ownershipApi, type BundleDetail, type BundleGame, type BundleSummary, type OwnershipInfo } from '@/api/client'
 import { regionSelectOptions } from '@/api/selectOptions'
@@ -55,7 +55,7 @@ const ownershipByBid = ref<Record<number, ReturnType<typeof inferBundleOwnership
 
 // ─── 导航栏（对齐游戏商店形态：搜索 + 排序下拉 + 地区维度 + 高级筛选 + 统计）───
 // 排序走服务端预计算列（smart=智能评分 / diff=差价）；搜索按包名前端过滤。
-// 无手动刷新键：路由切走再回来 onMounted 必然重新拉取，常驻刷新键无意义。
+// 无手动刷新键：切回页面由 onActivated 静默重拉保鲜，常驻刷新键无意义。
 type BundleSortKey = 'smart' | 'diff' | 'discount'
 const sortBy = ref<BundleSortKey>(
   localStorage.getItem(`${APP_SLUG}.bundles.sort`) === 'diff' ? 'diff' : 'smart',
@@ -79,7 +79,7 @@ const committedSearch = ref('')
 // 列表载荷自带全区 cnyFen，锚定换算/过滤在前端做，无需新快照列；
 // smart 评分保持服务端序——评分是「国区对全区最低」视角，与所选地区无关，
 // 与 games 商店「smart 不挂地区前缀」同一取舍。
-// 地区维度是**视图态不持久化**：切走再回来一律回默认（全区最低/全部）。
+// 地区维度是**视图态**：跟随页面实例在 keep-alive 中保留，切回不再回默认。
 type RegionMode = 'all' | 'cheaper' | 'locked'
 const region = ref('')
 const regionMode = ref<RegionMode>('all')
@@ -450,13 +450,17 @@ function onDocClick(e: MouseEvent) {
   if (regionRef.value && !regionRef.value.contains(e.target as Node)) showRegionMenu.value = false
 }
 
-async function load() {
-  loading.value = true
-  errorMsg.value = ''
+/** silent = 静默保鲜（keep-alive 切回时）：不闪骨架屏、不重置渲染批数，
+ *  失败保留原数据不把页面打成错误态 */
+async function load(silent = false) {
+  if (!silent) {
+    loading.value = true
+    errorMsg.value = ''
+  }
   try {
     const res = await bundlesApi.list(sortBy.value, removedView.value)
     bundles.value = res.bundles
-    renderLimit.value = RENDER_STEP
+    if (!silent) renderLimit.value = RENDER_STEP
     // 星标状态一次性整表拉取（恢复视图没有星标动作，不拉）
     if (!removedView.value) {
       try {
@@ -480,7 +484,7 @@ async function load() {
     }
     refreshOwnershipBadges()
   } catch (e) {
-    errorMsg.value = e instanceof Error ? e.message : String(e)
+    if (!silent) errorMsg.value = e instanceof Error ? e.message : String(e)
   } finally {
     loading.value = false
   }
@@ -948,6 +952,27 @@ function showAgrGroup(group: { codes: string[]; aids: number[] }) {
   allGamesOpen.value = true
 }
 
+/* keep-alive 常驻（往返游戏详情不丢筛选与滚动）：本页没有推送刷新链，
+   切回时静默重拉一次保鲜。网格滚动容器是 App 层的 .view-container（全局一份），
+   切走即被后续页面改写，离开前记录、切回后还原。 */
+defineOptions({ name: 'BundlesView' })
+let everActivated = false
+let savedScrollTop = 0
+onActivated(() => {
+  if (!everActivated) {
+    everActivated = true
+    return
+  }
+  nextTick(() => {
+    const el = document.querySelector('.view-container')
+    if (el) el.scrollTop = savedScrollTop
+  })
+  void load(true)
+})
+onDeactivated(() => {
+  savedScrollTop = document.querySelector('.view-container')?.scrollTop ?? 0
+})
+
 onMounted(() => {
   document.addEventListener('mousedown', onDocClick)
   scrollEl = document.querySelector('.view-container')
@@ -962,8 +987,8 @@ onBeforeUnmount(() => {
 <template>
   <div class="bundles-view">
     <!-- 导航栏（对齐游戏商店形态：搜索 + 排序 + 地区维度 + 高级筛选 + 统计）。
-         复用全局 navbar 样式族；无手动刷新键——路由切走再回来 onMounted
-         必然重新拉取，常驻刷新键无意义。-->
+         复用全局 navbar 样式族；无手动刷新键——切回页面由 onActivated
+         静默重拉保鲜，常驻刷新键无意义。-->
     <nav class="navbar">
       <div class="nav-controls">
         <input

@@ -475,7 +475,8 @@ async function manualRefreshWallet() {
                  或 transitionend 丢失时，enter/leave 类靠定时器强制摘除，
                  不然 router-view 会永久停在中间态、新视图挂不进来 -->
             <transition name="route-fade" mode="out-in" :duration="200">
-              <keep-alive include="AchievementsHall">
+              <!-- include 以逗号切分且不 trim，逗号后不能留空格 -->
+              <keep-alive include="AchievementsHall,LibraryFinder,BundlesView">
                 <component :is="Component" />
               </keep-alive>
             </transition>
