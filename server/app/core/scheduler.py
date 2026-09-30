@@ -268,6 +268,10 @@ _price_cycle_busy = False
 _DRAIN_POLL_SECONDS = 10
 _DRAIN_MAX_POLLS = 60  # 60 × 10s = 10min 上限，超时放行（走撞锁跳过语义）
 
+# 链内让路重试：开链后仍被同拍任务挤占（修复拍/榜单反哺/促销重试逐个
+# 抢走单任务爬虫）时的每拍等待秒数
+_SPEC_YIELD_WAIT_SECONDS = 30
+
 
 async def price_auto_enabled() -> bool:
     """自动价格链总开关（KV `crawl.auto_price`，默认开）。
@@ -381,6 +385,17 @@ async def _run_price_cycle(specs: list[dict]) -> None:
     try:
         await price_cycle.advance(cycle_id, price_cycle.RUNNING)
         results = await crawl_service.run_sequential(specs, cycle_id=cycle_id)
+        if not results and specs:
+            # 主轮整点常与 5min 修复拍 / 榜单反哺 / 免费促销重试同拍，单任务
+            # 爬虫被先到者占住时各 spec 会被逐个跳过——直接记 failed 等于让
+            # 主轮替别人的占用背锅。让路等待后再试一次（有界，两拍 × 30s），
+            # 仍被占才按空结果走终态判定。
+            for _ in range(2):
+                await asyncio.sleep(_SPEC_YIELD_WAIT_SECONDS)
+                handle = crawl_service._active
+                if handle is None or handle.task.done():
+                    break
+            results = await crawl_service.run_sequential(specs, cycle_id=cycle_id)
         if not results:
             logger.info("[定时] 池价格爬取：本轮无任务启动（占用/空列表）")
         else:
@@ -400,29 +415,37 @@ async def _run_price_cycle(specs: list[dict]) -> None:
 
     if cycle_id is None:
         return
-    jobs = await price_cycle.jobs_of(cycle_id)
-    terminal = (
-        price_cycle.FAILED
-        if regions is None
-        else price_cycle.decide_terminal(
-            [j["status"] for j in jobs],
-            expected_units=expected_units,
-            entered_repairing=entered_repairing,
+    # 收尾段（job 汇总 → finalizing → 事件 → 终态 → 通知 → 统计）必须兜异常：
+    # 这些库操作撞上写锁竞争时若异常外逃，Cycle 行会永久停在中间态——直到
+    # 下次进程重启才被孤儿清理收尸，期间前端「这轮跑到哪了」永远无解。
+    try:
+        jobs = await price_cycle.jobs_of(cycle_id)
+        terminal = (
+            price_cycle.FAILED
+            if regions is None
+            else price_cycle.decide_terminal(
+                [j["status"] for j in jobs],
+                expected_units=expected_units,
+                entered_repairing=entered_repairing,
+            )
         )
-    )
-    if not await price_cycle.advance(cycle_id, price_cycle.FINALIZING):
-        return
-    # 事件检测排在本轮最终有效结果之上（finalizing 内、终态之前）：job 自己产生
-    # 事件会让「暂时失败→随后补抓成功」的单元先报不可用再报恢复
-    await _detect_cycle_events(cycle_id)
-    await _settle_cycle(cycle_id, terminal)
-    logger.info(
-        "[周期] 价格刷新 Cycle %d → %s（job %d 个，期望 %d 单元）",
-        cycle_id, terminal, len(jobs), expected_units,
-    )
-    # 通知是 Cycle 收敛后的下游副作用：失败只影响候选状态，不影响终态与统计
-    await _notify_cycle_events(cycle_id)
-    await _record_cycle_stats(cycle_id)
+        if not await price_cycle.advance(cycle_id, price_cycle.FINALIZING):
+            return
+        # 事件检测排在本轮最终有效结果之上（finalizing 内、终态之前）：job 自己产生
+        # 事件会让「暂时失败→随后补抓成功」的单元先报不可用再报恢复
+        await _detect_cycle_events(cycle_id)
+        await _settle_cycle(cycle_id, terminal)
+        logger.info(
+            "[周期] 价格刷新 Cycle %d → %s（job %d 个，期望 %d 单元）",
+            cycle_id, terminal, len(jobs), expected_units,
+        )
+        # 通知是 Cycle 收敛后的下游副作用：失败只影响候选状态，不影响终态与统计
+        await _notify_cycle_events(cycle_id)
+        await _record_cycle_stats(cycle_id)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("[周期] Cycle %d 收尾异常：兜底收敛为 failed", cycle_id)
+        await _settle_cycle(cycle_id, price_cycle.FAILED, error=str(e)[:200])
+        await _record_cycle_stats(cycle_id)
 
 
 async def _notify_cycle_events(cycle_id: int | None) -> None:
