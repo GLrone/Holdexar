@@ -7,6 +7,7 @@ tmp 目录独立 SQLite 的工厂——不读写开发库 data/holdexar.db，也
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -344,6 +345,104 @@ async def test_fetch_wallet_explicit_verify_skips_fallback(monkeypatch):
             "steamLoginSecure=76561198000000000%7C%7Ct", verify=False
         )
     assert calls == [False]  # 显式指定时只跑一次
+
+
+# ── 进程级客户端缓存（连接复用 / 自愈重建 / jar 隔离）────────
+
+
+@pytest.fixture
+def _wallet_cache_reset():
+    from app.domains.account import steam_wallet as w
+
+    w._client_cache.clear()
+    yield
+    w._client_cache.clear()
+
+
+def _wallet_handler(
+    calls: list[dict],
+    *,
+    fail_first_request: bool = False,
+    set_cookie_first: bool = False,
+):
+    """账户页通道替身：可选首请求炸连接层 / 首响应带 Set-Cookie。"""
+    state = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append({"url": str(request.url), "cookie": request.headers.get("cookie", "")})
+        n = state["n"]
+        state["n"] += 1
+        if n == 0 and fail_first_request:
+            raise httpx.ConnectError("boom", request=request)
+        resp = httpx.Response(200, text=_ACCOUNT_PAGE_FIXTURE)
+        if n == 0 and set_cookie_first:
+            resp.headers["Set-Cookie"] = "junk=1; Path=/"
+        return resp
+
+    return handler
+
+
+def _patch_new_client(monkeypatch, created: list, handler) -> None:
+    from app.domains.account import steam_wallet as w
+
+    def factory(proxy_url, verify, timeout):
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            timeout=timeout,
+            verify=verify,
+            follow_redirects=True,
+            proxy=proxy_url,
+        )
+        created.append(client)
+        return client
+
+    monkeypatch.setattr(w, "_new_client", factory)
+
+
+@pytest.mark.asyncio
+async def test_wallet_client_reused_across_calls(monkeypatch, _wallet_cache_reset):
+    """两次抓取共用同一缓存客户端——连接建立是单次开销，不逐轮重做。"""
+    from app.domains.account import steam_wallet as w
+
+    calls: list[dict] = []
+    created: list = []
+    _patch_new_client(monkeypatch, created, _wallet_handler(calls))
+    cookies = "steamLoginSecure=76561198454168600%7C%7Ct"
+    await w.fetch_wallet(cookies)
+    await w.fetch_wallet(cookies)
+    assert len(created) == 1
+    assert sum(1 for c in calls if c["url"].endswith("/account/")) == 2
+
+
+@pytest.mark.asyncio
+async def test_wallet_rebuilds_client_after_transport_error(monkeypatch, _wallet_cache_reset):
+    """连接层错误丢弃缓存、重建连接后整轮重试一次，成功即返回。"""
+    from app.domains.account import steam_wallet as w
+
+    calls: list[dict] = []
+    created: list = []
+    _patch_new_client(monkeypatch, created, _wallet_handler(calls, fail_first_request=True))
+    info = await w.fetch_wallet("steamLoginSecure=76561198454168600%7C%7Ct")
+    assert info.balance == 137.30
+    assert len(created) == 2
+
+
+@pytest.mark.asyncio
+async def test_wallet_response_cookies_not_carried_over(monkeypatch, _wallet_cache_reset):
+    """响应 Set-Cookie 不进后续请求：登录态只认调用方显式传入的 Cookie。"""
+    from app.domains.account import steam_wallet as w
+
+    calls: list[dict] = []
+    created: list = []
+    _patch_new_client(monkeypatch, created, _wallet_handler(calls, set_cookie_first=True))
+    cookies = "steamLoginSecure=76561198454168600%7C%7Ct"
+    await w.fetch_wallet(cookies)
+    await w.fetch_wallet(cookies)
+    account_calls = [c for c in calls if c["url"].endswith("/account/")]
+    assert len(account_calls) == 2
+    for c in account_calls:
+        assert "junk=1" not in c["cookie"]
+        assert "steamLoginSecure" in c["cookie"]
 
 
 # ── store account 通道（fixture 取自真实页面结构）───

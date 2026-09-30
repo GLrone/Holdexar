@@ -24,7 +24,11 @@ from datetime import datetime
 from sqlalchemy import func, select
 
 from app.core import secretbox
-from app.core.database import get_session_factory
+from app.core.database import (
+    WritePriority,
+    get_session_factory,
+    write_gate,
+)
 from app.core.secretbox import SecretBoxError
 from app.crawler.utils import get_beijing_time_obj
 from app.domains.account.models import SteamAccount
@@ -225,7 +229,7 @@ def _session_lock(steam_id: str) -> asyncio.Lock:
 
 async def _save_cookies_only(steam_id: str, cookies: str) -> None:
     """只改账号行 Cookie（续期通道）：不动 active 归属与熔断状态；落库密封。"""
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         row = await session.get(SteamAccount, steam_id)
         if row is None:
             return
@@ -415,7 +419,7 @@ async def save_cookies(cookies_raw: str) -> dict:
     )
 
     now = _naive_now()
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         row = await session.get(SteamAccount, cookie_sid)
         is_new = row is None
         if row is None:
@@ -533,7 +537,7 @@ async def bind_account(cookies_raw: str) -> dict:
 
 async def set_active(steam_id: str) -> dict:
     """切换当前账号（全局唯一 active）。账号不存在时 ValueError。"""
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         row = await session.get(SteamAccount, steam_id)
         if row is None:
             raise ValueError(f"账号不存在: {steam_id}")
@@ -558,7 +562,7 @@ async def set_active(steam_id: str) -> dict:
 
 async def remove_account(steam_id: str) -> dict:
     """删除指定账号。删除 active 时回退剩余首个（即新主账号）。"""
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         row = await session.get(SteamAccount, steam_id)
         if row is None:
             raise ValueError(f"账号不存在: {steam_id}")
@@ -732,7 +736,7 @@ async def _save_wallet(
     冻结终态），同样只由调用方算好传入。
     """
     now = now or _naive_now()
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         row = await session.get(SteamAccount, steam_id)
         if row is None:
             return
@@ -766,7 +770,7 @@ async def _save_wallet(
 async def _reset_wallet_breaker(steam_id: str) -> None:
     """熔断解锁（手动刷新余额 / 换绑 Cookie）：冻结、连续失败计数、
     退避级别一并清零——用户显式介入后从零重计，不带着旧账进新一轮。"""
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         row = await session.get(SteamAccount, steam_id)
         if row is None:
             return
@@ -795,15 +799,17 @@ async def _sync_profile_row(steam_id: str, cookies: str, now: datetime) -> None:
         row = await session.get(SteamAccount, steam_id)
         if row is None:
             return
+        # 取数段（无写闸）：网络拉取不持写者位
         fetched = await fetch_profile(steam_id, proxy_url=await _strategy_proxy())
-        if fetched.get("persona_name") and not row.persona_name:
-            row.persona_name = fetched["persona_name"]
-        new_avatar = fetched.get("avatar_url", "")
-        if new_avatar and new_avatar != row.avatar_url:
-            row.avatar_url = new_avatar
-        row.is_online = bool(fetched.get("online"))
-        row.in_game = (fetched.get("in_game_name") or "")[:200]
-        await session.commit()
+        async with write_gate(WritePriority.INTERACTIVE):
+            if fetched.get("persona_name") and not row.persona_name:
+                row.persona_name = fetched["persona_name"]
+            new_avatar = fetched.get("avatar_url", "")
+            if new_avatar and new_avatar != row.avatar_url:
+                row.avatar_url = new_avatar
+            row.is_online = bool(fetched.get("online"))
+            row.in_game = (fetched.get("in_game_name") or "")[:200]
+            await session.commit()
 
 
 async def refresh_online_states(rows: list[SteamAccount] | None = None) -> dict:
@@ -826,7 +832,7 @@ async def refresh_online_states(rows: list[SteamAccount] | None = None) -> dict:
     )
     if not states:
         return {"ok": False, "status": "fetch_failed"}
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         for r in rows:
             s = states.get(r.steam_id)
             if s is None:  # 响应缺失 = 离线（私密档案同款语义）
@@ -1027,7 +1033,7 @@ async def _sync_wallet_of(steam_id: str) -> dict:
 
 async def clear_cookies() -> None:
     """解绑全部（清账号表 + 旧 KV；手填 SteamID64 / API Key 不动）。"""
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         rows = (
             (
                 await session.execute(select(SteamAccount))
@@ -1235,7 +1241,7 @@ async def migrate_legacy_kv() -> int:
     if not cookie_sid:
         return 0
 
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         existing = await session.get(SteamAccount, cookie_sid)
         if existing is not None:
             # 表里已有该账号（多账号时代再回到旧部署不会发生，防御式跳过）
@@ -1278,7 +1284,7 @@ async def seal_credentials_at_rest() -> int:
     返回本次封装的条目数。
     """
     sealed = 0
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         rows = ((await session.execute(select(SteamAccount))).scalars().all())
         for row in rows:
             value = row.cookies or ""
