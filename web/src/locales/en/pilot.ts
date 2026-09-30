@@ -29,7 +29,7 @@ const pilot = {
   'pilot.facts.price': '{name} (CN region) now {price}{discount}, all-time low {lowest}. Past year: low {ymin} / high {ymax} ({count} observations).',
   'pilot.facts.price_noyear': '{name} (CN region) now {price}{discount}, all-time low {lowest}.',
   'pilot.facts.discount': ' (-{discount}%)',
-  'pilot.facts.gamesTitle': 'Related games in the library:',
+  'pilot.facts.gamesTitle': 'Top of the library smart sort:',
   'pilot.facts.noLowest': 'no all-time-low data yet',
   'pilot.candidate.price': 'now {price}',
   'pilot.candidate.pick': '#{n}',
