@@ -305,6 +305,12 @@ export interface PilotAskResponse {
 
 export const pilotApi = {
   getConfig: () => request<PilotConfigPayload>('GET', '/pilot/config'),
+  test: (payload: { protocol?: string; base_url?: string; api_key?: string; model?: string }) =>
+    request<{ ok: boolean; latency_ms: number; model: string; reply: string; reason: string | null; detail: string }>(
+      'POST',
+      '/pilot/test',
+      payload,
+    ),
   detect: (payload: { base_url?: string; api_key?: string; protocol?: string }) =>
     request<{ protocol: string; vendor: string; models: string[]; suggested: string[]; key_valid: boolean | null }>(
       'POST',

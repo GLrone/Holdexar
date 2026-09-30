@@ -64,6 +64,48 @@ const pilotApiKeyInput = ref('')
 const pilotHasApiKey = ref(false)
 const pilotCapText = ref('500000')
 const pilotUsage = ref(0)
+const modelDialogOpen = ref(false)
+const modelDialogPick = ref('')
+const modelDialogCustom = ref('')
+const pilotTesting = ref(false)
+const pilotTestOk = ref<{ ms: number } | null>(null)
+
+function openModelDialog() {
+  modelDialogPick.value = pilotModel.value
+  modelDialogCustom.value = ''
+  modelDialogOpen.value = true
+}
+
+function confirmModelDialog() {
+  if (!modelDialogPick.value) return
+  pilotModel.value = modelDialogPick.value
+  modelDialogOpen.value = false
+}
+
+async function testPilotConn() {
+  pilotTesting.value = true
+  pilotTestOk.value = null
+  try {
+    const key = pilotApiKeyInput.value.trim()
+    const r = await pilotApi.test({
+      protocol: pilotProtocol.value,
+      base_url: pilotBaseUrl.value.trim(),
+      model: pilotModel.value,
+      ...(key ? { api_key: key } : {}),
+    })
+    if (r.ok) {
+      pilotTestOk.value = { ms: r.latency_ms }
+      message.success(t('pilot.test.ok', { ms: r.latency_ms }))
+    } else {
+      const fk = `pilot.test.fail.${r.reason ?? 'server_error'}` as MessageKey
+      message.error(t(fk))
+    }
+  } catch {
+    message.error(t('pilot.test.fail.unreachable'))
+  } finally {
+    pilotTesting.value = false
+  }
+}
 const pilotModels = ref<string[]>([])
 const pilotDetecting = ref(false)
 /* 协议选项存 value 不存文案（切语言跟随）；地址占位随协议变化 */
@@ -1193,18 +1235,17 @@ onUnmounted(stopLoginPolling)
             </HlButton>
           </div>
           <div class="settings-row__line">
-            <HlSelect
-              v-if="pilotModels.length"
-              v-model="pilotModel"
-              :options="pilotModels.map((m) => ({ value: m, label: m }))"
-              style="max-width: 420px"
-            />
-            <HlInput
-              v-else
-              v-model="pilotModel"
-              :placeholder="t('pilot.settings.model')"
-              style="max-width: 420px"
-            />
+            <span class="section-desc">{{ t('pilot.model.current') }}</span>
+            <HlChip shape="soft" :on="Boolean(pilotModel)">{{ pilotModel || t('pilot.model.none') }}</HlChip>
+            <HlButton size="sm" @click="openModelDialog">{{ t('pilot.model.edit') }}</HlButton>
+            <HlButton
+              size="sm"
+              :disabled="!pilotBaseUrl.trim() || !pilotModel || pilotTesting"
+              :loading="pilotTesting"
+              @click="testPilotConn"
+            >
+              {{ t('pilot.test.button') }}
+            </HlButton>
           </div>
           <div class="settings-row__line">
             <HlInput
@@ -1246,6 +1287,50 @@ onUnmounted(stopLoginPolling)
           </div>
         </div>
       </div>
+
+      <!-- 模型编辑窗口：识别清单单选 / 自定义模型名 -->
+      <HlDialog v-model="modelDialogOpen" :title="t('pilot.model.dialogTitle')" width="480px">
+        <div class="pilot-model-dialog">
+          <div class="settings-row__line">
+            <HlButton
+              size="sm"
+              :disabled="!pilotBaseUrl.trim() || pilotDetecting"
+              :loading="pilotDetecting"
+              @click="detectPilot"
+            >
+              {{ t('pilot.detect.button') }}
+            </HlButton>
+          </div>
+          <div class="section-desc">{{ t('pilot.model.dialogHint') }}</div>
+          <div v-if="pilotModels.length" class="pilot-model-list">
+            <button
+              v-for="m in pilotModels"
+              :key="m"
+              type="button"
+              class="pilot-model-row"
+              :class="{ 'is-pick': modelDialogPick === m }"
+              @click="modelDialogPick = m"
+            >
+              {{ m }}
+            </button>
+          </div>
+          <div class="settings-row__line">
+            <HlInput v-model="modelDialogCustom" :placeholder="t('pilot.model.custom')" style="flex: 1" />
+            <HlButton
+              size="sm"
+              :disabled="!modelDialogCustom.trim()"
+              @click="modelDialogPick = modelDialogCustom.trim()"
+            >
+              {{ t('pilot.model.customAdd') }}
+            </HlButton>
+          </div>
+          <div class="settings-row__line">
+            <HlButton variant="primary" size="sm" :disabled="!modelDialogPick" @click="confirmModelDialog">
+              {{ t('pilot.model.confirm') }}
+            </HlButton>
+          </div>
+        </div>
+      </HlDialog>
 
       <!-- 数据备份（VACUUM INTO 在线快照） -->
       <div class="card settings-card" data-section="settings.section.backup">
@@ -2131,5 +2216,28 @@ onUnmounted(stopLoginPolling)
   border-radius: 2px;
   background: var(--accent);
   transition: width 0.3s ease;
+}
+.pilot-model-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.pilot-model-row {
+  padding: 8px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--bg-card);
+  color: var(--text-primary);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.pilot-model-row.is-pick {
+  border-color: var(--accent);
+  background: var(--accent-a08);
 }
 </style>

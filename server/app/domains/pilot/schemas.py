@@ -39,6 +39,24 @@ class DetectResponse(BaseModel):
     key_valid: bool | None = None
 
 
+class TestRequest(BaseModel):
+    """连通性测试：字段缺省时回落到已存配置。"""
+
+    protocol: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    model: str | None = None
+
+
+class TestResponse(BaseModel):
+    ok: bool
+    latency_ms: int
+    model: str = ""
+    reply: str = ""
+    reason: str | None = None
+    detail: str = ""
+
+
 class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=500)
     appid: int | None = None
