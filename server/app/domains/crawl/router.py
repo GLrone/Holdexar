@@ -79,17 +79,29 @@ async def jobs(limit: int = Query(20, ge=1, le=100)):
 
 @router.get("/crawl/active")
 async def active():
-    """当前活动任务与爬取占用。
+    """当前活动任务、爬取占用与系统侧活动。
 
     `activeJobId` 来自 job 表句柄（只有走 start_job 的路径才登记）；
     `busy` 来自执行入口占用（bundles 链尾直调 run_crawl 不建 job 行，
     只看 job 句柄会把这条在跑的生产爬取漏报成空闲）。订阅端断线重连后
     拿它对账「抓取进行中」标志。
+
+    `maintenance` = 池体检（L1/L2 整池串行探测）在跑——它不是 CrawlJob，
+    任务列表看不到；任务页据此显示「体检进行中」。`throttled` = 正在
+    全局限流窗口外排队的请求数——任务已启动但请求还没放行时，任务页
+    据此显示「排队等发送窗口」而不是让用户以为卡死。
     """
     from app.crawler.occupancy import crawler_busy
+    from app.crawler.rate_limit import steam_rate_limiter
+    from app.domains.proxypool import scheduling as pool_scheduling
 
     job_id = service.active_job_id()
-    return {"activeJobId": job_id, "busy": job_id is not None or crawler_busy()}
+    return {
+        "activeJobId": job_id,
+        "busy": job_id is not None or crawler_busy(),
+        "maintenance": pool_scheduling.maintenance_running(),
+        "throttled": steam_rate_limiter.waiting,
+    }
 
 
 @router.get("/crawl/cycles")

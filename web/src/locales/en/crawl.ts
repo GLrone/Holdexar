@@ -46,9 +46,18 @@ const crawl: Partial<Record<MessageKey, string>> = {
   'crawl.jobs.refresh': 'Refresh job history',
 
   /* Live progress (SSE). done/total counts batches (1 batch = 1 region × ≤400 apps);
-     speed is shown per minute */
+     during a price round they accumulate across its chained segments as one total
+     queue; ok/fail/qsize/speed stay per-segment live counts. Speed is per minute */
   'crawl.progress.meta':
     'Done {done}/{total} · OK {ok} · Failed {fail} · Queued {qsize} · {speed} batches/min',
+
+  /* System-side activity (not a job; invisible in the job list) */
+  'crawl.sys.starting':
+    'Starting the job: the backend is enqueuing work and assigning exits — one moment',
+  'crawl.sys.maintenance':
+    'System health check in progress: proxy channels are being tested one by one; price crawling yields automatically — no action needed',
+  'crawl.sys.throttled':
+    'Waiting for send window: {n} requests queued by the rate limiter; the job will continue automatically',
 
   /* Auto price chain */
   'crawl.autoPrice.label': 'Auto price updates',

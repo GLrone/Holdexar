@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
 import {
   crawlApi,
@@ -234,10 +234,23 @@ async function doImportApps() {
   }
 }
 
+/* 进度按轮累计（roundProgress）：价格主轮是多段串行（监控池 → 未关注目录 →
+   特惠榜），段级计数会让「总队列」看不到——轮激活时分母分子都用轮账本，
+   手动/修复等独立任务（无轮次归属）退回当前任务段的计数口径 */
 const progressPercent = computed(() => {
+  const rp = crawl.roundProgress
+  if (rp) {
+    return rp.total === 0 ? 0 : Math.round((rp.done / rp.total) * 100)
+  }
   const total = crawl.total || crawl.done + crawl.qsize
   if (!crawl.running || total === 0) return 0
   return Math.round((crawl.done / total) * 100)
+})
+
+const progressCounts = computed(() => {
+  const rp = crawl.roundProgress
+  if (rp) return { done: rp.done, total: rp.total }
+  return { done: crawl.done, total: crawl.total }
 })
 
 // ── 自动价格链启停（只想手动抓的用户关这里：定时爬价 + 失败修复停转）──
@@ -271,11 +284,7 @@ async function loadJobs() {
       ? []
       : [...(regionsStore.ownedRegions ?? [])]
     jobs.value = await crawlApi.jobs(30)
-    const active = await crawlApi.active()
-    if ((active.activeJobId || active.busy) && !crawl.running) {
-      // 页面刷新后 SSE 尚无事件：以服务端为准（busy 含不建任务行的直调抓取）
-      crawl.running = true
-    }
+    await loadActive()
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e))
   } finally {
@@ -283,7 +292,31 @@ async function loadJobs() {
   }
 }
 
+// ── 系统侧活动（体检 / 限流排队）：不是任务，任务列表看不到，单独轮询 ──
+const maintenance = ref(false)
+const throttled = ref(0)
+
+async function loadActive() {
+  try {
+    const active = await crawlApi.active()
+    if ((active.activeJobId || active.busy) && !crawl.running) {
+      // 页面刷新后 SSE 尚无事件：以服务端为准（busy 含不建任务行的直调抓取）
+      crawl.running = true
+    }
+    maintenance.value = active.maintenance ?? false
+    throttled.value = active.throttled ?? 0
+  } catch {
+    /* 读不到就保持上一次的显示，不打断页面 */
+  }
+}
+
+/* 启动请求进行中：POST /crawl/run 在后端要解析对象、排出口、落任务行，
+   慢时数秒——这段真空期按键必须转圈，否则用户不知道点没点上 */
+const starting = ref(false)
+
 async function start() {
+  if (starting.value) return
+  starting.value = true
   try {
     let appids: number[] | undefined
     if (scope.value === 'appids') {
@@ -303,6 +336,8 @@ async function start() {
     await loadJobs()
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e))
+  } finally {
+    starting.value = false
   }
 }
 
@@ -320,6 +355,8 @@ async function stop() {
 /** 立即补抓失败地区：跳过自动补抓的冷却与空闲档，把账本里已过期的
     失败批次按区批量重抓一轮；本轮仍失败的批次照常记账，留待下一轮 */
 async function repairNow() {
+  if (starting.value) return
+  starting.value = true
   try {
     const res = await crawlApi.run('appids', undefined, 'repair', 0)
     message.success(t('crawl.start.repairStarted', { id: res.id, count: res.count }))
@@ -327,6 +364,8 @@ async function repairNow() {
     await loadJobs()
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e))
+  } finally {
+    starting.value = false
   }
 }
 
@@ -474,9 +513,17 @@ async function copyTutText(text: string) {
   }
 }
 
+let activeTicker: number | undefined
+
 onMounted(() => {
   void loadJobs()
   void settingsStore.load()
+  // 体检/排队是分钟级过程：任务页开着时低频对账「系统在干嘛」
+  activeTicker = window.setInterval(() => void loadActive(), 10_000)
+})
+
+onBeforeUnmount(() => {
+  if (activeTicker !== undefined) window.clearInterval(activeTicker)
 })
 </script>
 
@@ -521,8 +568,14 @@ onMounted(() => {
 
       <div class="start-row">
         <!-- 艺术按键方案二（outline）：启动 = 暖橙 / 停止 = 深色，见 component-framework.html -->
-        <HlButton art="outline" size="sm" :disabled="crawl.running" :loading="crawl.running" @click="start">
-          <HlIcon v-if="!crawl.running" name="play" />
+        <HlButton
+          art="outline"
+          size="sm"
+          :disabled="crawl.running || starting"
+          :loading="crawl.running || starting"
+          @click="start"
+        >
+          <HlIcon v-if="!(crawl.running || starting)" name="play" />
           {{ crawl.running ? t('crawl.start.running') : t('crawl.start.button') }}
         </HlButton>
         <HlButton art="outline" tone="dark" size="sm" :disabled="!crawl.running" @click="stop">
@@ -532,7 +585,7 @@ onMounted(() => {
         <HlButton
           art="outline"
           size="sm"
-          :disabled="crawl.running"
+          :disabled="crawl.running || starting"
           :title="t('crawl.start.repairTip')"
           @click="repairNow"
         >
@@ -542,6 +595,22 @@ onMounted(() => {
         <HlButton variant="default" :title="t('crawl.jobs.refresh')" @click="loadJobs">
           <HlIcon name="refresh" />
         </HlButton>
+      </div>
+
+      <!-- 系统侧活动：体检不是任务，排队中的请求还没开始产出进度，
+           启动请求在后端登记任务的真空期也要有交代 -->
+      <div v-if="maintenance || starting || throttled > 0" class="sys-status">
+        <span v-if="starting" class="sys-status__item">
+          <HlIcon name="refresh" />
+          {{ t('crawl.sys.starting') }}
+        </span>
+        <span v-if="maintenance" class="sys-status__item">
+          <HlIcon name="refresh" />
+          {{ t('crawl.sys.maintenance') }}
+        </span>
+        <span v-if="throttled > 0" class="sys-status__item">
+          {{ t('crawl.sys.throttled', { n: throttled }) }}
+        </span>
       </div>
 
       <!-- 实时进度（SSE）-->
@@ -554,8 +623,8 @@ onMounted(() => {
         <div class="progress-box__meta">
           {{
             t('crawl.progress.meta', {
-              done: crawl.done,
-              total: crawl.total,
+              done: progressCounts.done,
+              total: progressCounts.total,
               ok: crawl.ok,
               fail: crawl.fail,
               qsize: crawl.qsize,
@@ -939,6 +1008,21 @@ onMounted(() => {
   font-size: 12px;
   color: var(--text-muted);
   word-break: break-all;
+}
+
+.sys-status {
+  margin-top: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.sys-status__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
 }
 
 .progress-box {
