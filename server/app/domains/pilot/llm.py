@@ -387,11 +387,14 @@ async def chat_stream(
     model: str,
     messages: list[dict],
     tools: list[dict] | None = None,
+    max_tokens: int | None = None,
 ):
     """按协议构造请求并流式解析，产出统一事件（见模块 docstring）。"""
     if protocol not in _PARSE:
         raise PilotLlmError(f"未知协议: {protocol}")
     url, headers, body = _REQUEST[protocol](base_url, api_key, model, messages, tools)
+    if max_tokens:
+        body["max_tokens"] = max_tokens
     try:
         async with _client(base_url) as client:
             async with client.stream("POST", url, json=body, headers=headers) as resp:
