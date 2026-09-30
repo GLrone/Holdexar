@@ -66,6 +66,12 @@ L1_LEVEL = "L1"
 EXIT_IP_TARGET_URL = "https://api.ipify.org?format=json"
 DEFAULT_L1_TIMEOUT = 15.0
 
+# L1/L2 整池探测的落账分块：每探这么多节点提交一次。整池一个事务会从首个写入
+# （体检台账 run 行 flush）起按住 SQLite 写锁，直到整轮探测结束——L1+L2 串行
+# 探完全池可达分钟级，期间全部其他写者（价格链建任务、钱包轮转…）被饿死到
+# busy_timeout 超时。分块后写锁窗口 = 一块的落账耗时（毫秒级），网络等待不持锁。
+PROBE_COMMIT_EVERY = 10
+
 # L1 失败必须能区分「节点/选择失败」与「目标服务故障」——否则会建立一个
 # 「公网 IP 回显服务健康状态决定代理池健康」的错误系统。
 NODE_PROBE_FAILED = "NODE_PROBE_FAILED"
@@ -178,9 +184,13 @@ async def _probe_and_record(
     now: datetime,
     url: str,
     timeout_ms: int,
+    state_push: bool = True,
 ) -> HealthOutcome:
-    """一次 L0 探测 + 落观测 + 推状态；池内探测与 DEAD 恢复探测共用同一条语义。
+    """一次传输层探测 + 落观测；是否推进状态由 `state_push` 决定。
 
+    **池内 L0 巡检传 `state_push=False`（纯记录）**：传输层可达性不再是节点生死
+    判据——生死归 Steam 业务探测（`business_check_pool`）与恢复探测。`state_push=True`
+    只用于 DEAD 恢复探测（目标已是 Steam 端点）：成功回 ACTIVE、失败累加计数。
     `probe_name` 是**执行探测的内核认识的名字**：池内节点用 `runtime_name`（池内核的
     运行配置里就是它），DEAD 节点不在池文件里、池内核不认识，改用来源订阅名
     （`ProxyNodeSource.original_name`）打到持有全量订阅节点的旧链路内核上。
@@ -205,6 +215,8 @@ async def _probe_and_record(
             latency_ms=None,
             detail=result.detail or None,
             observed_at=now,
+            channel="scheduled",
+            target=url,
         ))
         return HealthOutcome(
             node_id=node.node_id,
@@ -216,18 +228,21 @@ async def _probe_and_record(
             state=previous,
         )
 
-    # 连续失败计数：成功归零、失败累加。它既是状态机的输入（退休线判据），
-    # 也是台账事实——判 DEAD 的节点必须带着失败次数，不能留下"DEAD 且计数 0"。
-    failures = 0 if result.ok else (node.consecutive_failures or 0) + 1
-    node.consecutive_failures = failures
-    # 唯一的状态决策入口：健康只提供证据，规则仍归状态机
-    target = evaluate_node_state(
-        previous,
-        source_seen=bool(source_count),
-        probe_ok=result.ok,
-        consecutive_failures=failures,
-    )
-    node.state = target
+    state = previous
+    if state_push:
+        # 连续失败计数：成功归零、失败累加。它既是状态机的输入（退休线判据），
+        # 也是台账事实——判 DEAD 的节点必须带着失败次数，不能留下"DEAD 且计数 0"。
+        failures = 0 if result.ok else (node.consecutive_failures or 0) + 1
+        node.consecutive_failures = failures
+        # 唯一的状态决策入口：健康只提供证据，规则仍归状态机
+        target = evaluate_node_state(
+            previous,
+            source_seen=bool(source_count),
+            probe_ok=result.ok,
+            consecutive_failures=failures,
+        )
+        node.state = target
+        state = target
     session.add(HealthObservation(
         node_id=node.node_id,
         level=PROBE_LEVEL,
@@ -235,6 +250,8 @@ async def _probe_and_record(
         latency_ms=result.delay_ms,
         detail=result.detail or None,
         observed_at=now,
+        channel="scheduled",
+        target=url,
     ))
     return HealthOutcome(
         node_id=node.node_id,
@@ -243,7 +260,7 @@ async def _probe_and_record(
         delay_ms=result.delay_ms,
         detail=result.detail,
         previous_state=previous,
-        state=target,
+        state=state,
     )
 
 
@@ -289,8 +306,10 @@ async def health_check_pool(
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
     names: tuple[str, ...] | None = None,
 ) -> tuple[HealthOutcome, ...]:
-    """对池内每个节点做一次 L0 探测：落一条观测，并按状态机推进 `state`。
+    """对池内每个节点做一次 L0 传输探测：只落观测，**不推状态**。
 
+    节点生死判据已归 Steam 业务探测（`business_check_pool`）：传输层可达性只回答
+    「这条线通不通」，继续拿它判生死会让 gstatic 通而 Steam 不通的节点被误杀。
     `names` 不给就取池文件当前节点；给了就只探这些——供调用方**分块**调用并逐块提交，
     把 L0 的写锁窗口限制在块内（整池一次提交会随池规模把写锁按住数分钟）。
     """
@@ -311,6 +330,7 @@ async def health_check_pool(
         outcomes.append(await _probe_and_record(
             session, node, controller_url=controller_url, secret=secret,
             probe_name=name, now=now, url=url, timeout_ms=timeout_ms,
+            state_push=False,
         ))
 
     await session.flush()
@@ -322,11 +342,12 @@ async def recover_dead_nodes(
     controller_url: str,
     secret: str,
     now: datetime,
-    url: str = PROBE_TARGET_URL,
+    url: str | None = None,
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
     batch: int = RECOVERY_BATCH_SIZE,
 ) -> tuple[HealthOutcome, ...]:
-    """对 DEAD 节点分批做 L0 恢复探测：成功回 `ACTIVE` 并清零计数，失败保持 `DEAD` 并累加。
+    """对 DEAD 节点分批做恢复探测：目标默认 **Steam 业务端点**（与生死判据同一标准），
+    成功回 `ACTIVE` 并清零计数，失败保持 `DEAD` 并累加。
 
     分批轮转：按「最久没有被探过」排序（`health_observations` 的最后一条），一次只取
     `batch` 个——退休线不可达的慢性失败节点若永远排在最前，其余节点要等轮转一整圈才
@@ -367,11 +388,13 @@ async def recover_dead_nodes(
         .limit(batch)
     )).all()
 
+    probe_url = url or business_probe_url()
     outcomes: list[HealthOutcome] = []
     for node, original_name in rows:
         outcomes.append(await _probe_and_record(
             session, node, controller_url=controller_url, secret=secret,
-            probe_name=str(original_name), now=now, url=url, timeout_ms=timeout_ms,
+            probe_name=str(original_name), now=now, url=probe_url,
+            timeout_ms=timeout_ms,
         ))
 
     await session.flush()
@@ -512,6 +535,8 @@ async def exit_ip_check_pool(
     url: str = EXIT_IP_TARGET_URL,
     timeout: float = DEFAULT_L1_TIMEOUT,
     names: tuple[str, ...] | None = None,
+    run_id: int | None = None,
+    channel: str = "scheduled",
 ) -> tuple[ExitIpOutcome, ...]:
     """对池内节点**串行**做一次 L1 出口 IP 观测。
 
@@ -531,7 +556,7 @@ async def exit_ip_check_pool(
     by_name = {row.runtime_name: row for row in rows.scalars()}
 
     outcomes: list[ExitIpOutcome] = []
-    for name in names:  # 严格串行（见 probe_exit_ip）
+    for i, name in enumerate(names, start=1):  # 严格串行（见 probe_exit_ip）
         node = by_name.get(name)
         if node is None:
             continue
@@ -546,6 +571,9 @@ async def exit_ip_check_pool(
             latency_ms=result.latency_ms,
             detail=result.detail or None,
             observed_at=now,
+            run_id=run_id,
+            channel=channel,
+            target=url,
         ))
         outcomes.append(ExitIpOutcome(
             node_id=node.node_id,
@@ -555,6 +583,8 @@ async def exit_ip_check_pool(
             detail=result.detail,
             latency_ms=result.latency_ms,
         ))
+        if i % PROBE_COMMIT_EVERY == 0:
+            await session.commit()
 
     await session.flush()
     return tuple(outcomes)
@@ -692,26 +722,58 @@ async def business_check_pool(
     url: str | None = None,
     appid: int = DEFAULT_BUSINESS_APPID,
     timeout: float = DEFAULT_L2_TIMEOUT,
+    run_id: int | None = None,
+    channel: str = "scheduled",
 ) -> tuple[BusinessOutcome, ...]:
-    """对池内节点**串行**做一次 L2 业务观测。
+    """对池内节点**串行**做一次 L2 业务观测——**节点生死判据的唯一定时来源**。
 
-    只写 `HealthObservation(level="L2")`：不改 `state`、不擦 `exit_ip`、
-    不碰 `last_l0_at` / `last_l1_at` / `capacity_score`。
+    状态语义：「能不能访问 Steam」= 经该节点的请求是否拿到 Steam 的 HTTP 响应。
+    拿到任何响应（200 / 429 / 503）都算传输成功——Steam 侧故障不罚节点（否则
+    Steam 一抖整池陪葬）；只有超时/连不上归为节点失败证据，喂 `evaluate_node_state`
+    （连续 3 次达退休线）。200 但契约不符是业务质量观测，记录不罚——契约变化
+    不该杀节点。不擦 `exit_ip`、不碰 `last_l0_at` / `last_l1_at` / `capacity_score`。
     """
+    target_url = url or business_probe_url(appid)
     names = _pool_names(data_dir)
-    mixed_port = mixed_port_of(data_dir)
+    try:
+        mixed_port = mixed_port_of(data_dir)
+    except Exception:  # noqa: BLE001 —— 运行配置缺失（单测环境）：端口缺省，探针自会失败
+        mixed_port = 0
     rows = await session.execute(
         select(ProxyNode).where(ProxyNode.runtime_name.in_(names))
     )
     by_name = {row.runtime_name: row for row in rows.scalars()}
 
     outcomes: list[BusinessOutcome] = []
-    for name in names:  # 严格串行（见 probe_business）
+    for i, name in enumerate(names, start=1):  # 严格串行（见 probe_business）
         node = by_name.get(name)
         if node is None:
             continue
         result = await probe_business(controller_url, secret, mixed_port, name,
                                       url=url, appid=appid, timeout=timeout)
+        # 生死证据判定：None = 不构成节点证据（选不中节点是探针基础设施问题）。
+        # 拿到 Steam 侧响应（200 / 429 / 503 等）= 传输成功，Steam 故障不罚节点；
+        # 502/504 是**代理链网关错误**（mihomo 上游链失败时本地生成，Steam 正常
+        # 不回裸 502/504）——与超时/连不上同归节点失败证据。
+        if result.ok:
+            probe_ok: bool | None = True
+        elif result.http_status in (502, 504):
+            probe_ok = False
+        elif result.http_status is not None:
+            probe_ok = True
+        elif result.detail.startswith(NODE_PROBE_FAILED):
+            probe_ok = None
+        else:  # 经节点发请求超时/连不上：节点失败证据
+            probe_ok = False
+        if probe_ok is not None:
+            failures = 0 if probe_ok else (node.consecutive_failures or 0) + 1
+            node.consecutive_failures = failures
+            node.state = evaluate_node_state(
+                node.state,
+                source_seen=True,  # 池文件成员 = 来源在场
+                probe_ok=probe_ok,
+                consecutive_failures=failures,
+            )
         session.add(HealthObservation(
             node_id=node.node_id,
             level=L2_LEVEL,
@@ -719,6 +781,9 @@ async def business_check_pool(
             latency_ms=result.latency_ms,
             detail=result.detail or None,
             observed_at=now,
+            run_id=run_id,
+            channel=channel,
+            target=target_url,
         ))
         outcomes.append(BusinessOutcome(
             node_id=node.node_id,
@@ -729,6 +794,8 @@ async def business_check_pool(
             detail=result.detail,
             latency_ms=result.latency_ms,
         ))
+        if i % PROBE_COMMIT_EVERY == 0:
+            await session.commit()
 
     await session.flush()
     return tuple(outcomes)

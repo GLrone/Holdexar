@@ -199,6 +199,13 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "source_kind": "VARCHAR(12)",
         "observed_at": "DATETIME",
     },
+    # 健康观测的归属列：run_id 挂体检运行台账（health_runs），channel 区分
+    # scheduled / manual 写入通道，target 记录本次探测的实际目标 URL
+    "health_observations": {
+        "run_id": "INTEGER",
+        "channel": "VARCHAR(16)",
+        "target": "VARCHAR(500)",
+    },
     # 所属价格刷新周期（NULL = 不挂周期：手动任务 / 暂不归属的修复轮 / 历史任务）
     "crawl_jobs": {
         "cycle_id": "INTEGER",
@@ -220,6 +227,8 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "stale_count": "INTEGER",
         "duration_seconds": "REAL",
         "stage_ms_json": "JSON",
+        "batches_expected": "INTEGER",
+        "batches_done": "INTEGER",
     },
 }
 

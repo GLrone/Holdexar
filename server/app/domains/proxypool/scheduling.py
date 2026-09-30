@@ -33,6 +33,7 @@ from app.domains.proxypool.bridge import ingest_ledger, rebind_missing_sources
 from app.domains.proxypool.exits import exit_snapshot, select_exit_slots, slot_signature
 from app.domains.proxypool.health import (
     DEFAULT_BUSINESS_APPID,
+    PROBE_COMMIT_EVERY,
     BusinessOutcome,
     HealthOutcome,
     business_check_pool,
@@ -41,6 +42,7 @@ from app.domains.proxypool.health import (
     latest_l0_delays,
     recover_dead_nodes,
 )
+from app.domains.proxypool.models import HealthRun
 from app.domains.proxypool.pool import eligible_nodes, eligible_runtime_names, pool_file_names
 from app.domains.proxypool.runtime import (
     RebuildResult,
@@ -57,9 +59,9 @@ from app.domains.proxypool.runtime import (
 
 logger = logging.getLogger(__name__)
 
-# 池内 L0 每探这么多个节点提交一次：写锁窗口 = 一块的探测耗时，不随池规模线性增长。
-# 单块最坏情况（全部超时）≈ 10 × DEFAULT_TIMEOUT_MS，仍在 60s busy_timeout 之内。
-L0_COMMIT_EVERY = 10
+# 池内 L0 每探这么多个节点提交一次：写锁窗口 = 一块的落账耗时，不随池规模线性
+# 增长。与 L1/L2 内部分块（health.PROBE_COMMIT_EVERY）同值同源。
+L0_COMMIT_EVERY = PROBE_COMMIT_EVERY
 
 # 首轮出口身份发现的上限：启动链里跑的是一次**有界** L1——整池串行探完才开门是
 # 不可接受的（本地软件的开箱体验优先），但"一个出口都没探到"会让首轮爬取退化到
@@ -68,6 +70,14 @@ STARTUP_L1_MAX_NODES = 60
 STARTUP_L1_BUDGET_SECONDS = 240.0
 
 _pending = False
+# L1/L2 体检探测进行中（跨整池串行探测，可达分钟级）。给任务页「系统在干嘛」
+# 提供读口——体检不是 CrawlJob，任务列表看不到它。
+_maintenance_running = False
+
+
+def maintenance_running() -> bool:
+    """体检（L1/L2 整池探测）当前是否在跑。"""
+    return _maintenance_running
 
 
 async def run_startup_l1(
@@ -228,7 +238,35 @@ async def run_maintenance_cycle(
     if crawler_busy():
         return None
 
+    global _maintenance_running
+    _maintenance_running = True
+    try:
+        return await _maintenance_probe(
+            session, data_dir=data_dir, controller_url=controller_url,
+            secret=secret, now=now, l1_url=l1_url, l2_url=l2_url, appid=appid,
+        )
+    finally:
+        _maintenance_running = False
+
+
+async def _maintenance_probe(
+    session: AsyncSession, *,
+    data_dir: Path,
+    controller_url: str,
+    secret: str,
+    now: datetime,
+    l1_url: str | None,
+    l2_url: str | None,
+    appid: int,
+) -> MaintenanceResult:
+    """维护探测主体（`run_maintenance_cycle` 的占用标志包络之内）。"""
     previous = await current_global_selection(controller_url, secret)
+    # 本轮体检的运行台账：独立计时（duration_ms）+ 节点级结论汇总，前端展示
+    # 「本次体检耗时 / 健康数」以此为准；逐节点观测按 run_id 归属。
+    run = HealthRun(channel="scheduled", started_at=now)
+    session.add(run)
+    await session.flush()
+    before_eligible = await eligible_runtime_names(session)
     # L1 会刷新出口身份，而 listener 数在重建时就定死了：身份变了（同一出口被两条
     # lane 绑、或某节点换了落地）就必须再收敛一次 listener 数，否则台账一直比当前
     # 出口集多。运行期的不变量由 `select_run_lanes` 就地保证，这里负责让内核侧收敛。
@@ -239,7 +277,7 @@ async def run_maintenance_cycle(
     try:
         l1 = await exit_ip_check_pool(
             session, data_dir=data_dir, controller_url=controller_url, secret=secret,
-            now=now, **({"url": l1_url} if l1_url else {}),
+            now=now, run_id=run.id, **({"url": l1_url} if l1_url else {}),
         )
     except Exception:  # noqa: BLE001
         logger.exception("[L1] 出口 IP 探针程序异常：本轮 L1 无结果")
@@ -247,11 +285,22 @@ async def run_maintenance_cycle(
     try:
         l2 = await business_check_pool(
             session, data_dir=data_dir, controller_url=controller_url, secret=secret,
-            now=now, appid=appid, **({"url": l2_url} if l2_url else {}),
+            now=now, appid=appid, run_id=run.id, **({"url": l2_url} if l2_url else {}),
         )
     except Exception:  # noqa: BLE001
         logger.exception("[L2] 业务探针程序异常：本轮 L2 无结果")
         l2 = ()
+    run.total = len(l2)
+    run.steam_ok = sum(1 for o in l2 if getattr(o, "ok", False))
+    run.ip_known = sum(1 for o in l1
+                       if getattr(o, "ok", False) and getattr(o, "exit_ip", None))
+    run.failed = run.total - run.steam_ok
+    run.finished_at = datetime.now()
+    run.duration_ms = int((run.finished_at - run.started_at).total_seconds() * 1000)
+    # L2 现在喂节点状态机：合格集可能因判死/复活而变化，与 L0 周期同款
+    # before/after 比较请求重建，不另立信号。
+    if await eligible_runtime_names(session) != before_eligible:
+        request_rebuild()
 
     exits_after = await exit_snapshot(session)
     if slot_signature(exits_after) != slot_signature(exits_before):

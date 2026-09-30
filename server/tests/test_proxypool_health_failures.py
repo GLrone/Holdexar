@@ -61,14 +61,21 @@ async def _prepare(data_dir, *, state: str = "NEW", failures: int = 0) -> None:
 
 
 async def _probe(data_dir, monkeypatch, ok: bool):
-    async def fake_probe(controller_url, secret, runtime_name, *, url=None, timeout_ms=None):
-        return H.ProbeResult(runtime_name=runtime_name, ok=ok,
-                             delay_ms=5 if ok else None,
-                             detail="" if ok else "内核探测失败（HTTP 503）")
+    # 生死判据已归 L2 业务探测：状态驱动走 business_check_pool（L0 只记录）
+    async def fake_probe_business(controller_url, secret, mixed_port, runtime_name,
+                                  *, url=None, appid=None, timeout=None):
+        if ok:
+            return H.BusinessResult(runtime_name=runtime_name, ok=True,
+                                    http_status=200, final_price_in_cents=999,
+                                    detail=H.BUSINESS_OK, latency_ms=5)
+        return H.BusinessResult(runtime_name=runtime_name, ok=False,
+                                http_status=None, final_price_in_cents=None,
+                                detail=f"{H.TARGET_SERVICE_FAILED}: ConnectTimeout",
+                                latency_ms=None)
 
-    monkeypatch.setattr(H, "probe_node", fake_probe)
+    monkeypatch.setattr(H, "probe_business", fake_probe_business)
     async with get_session_factory()() as s:
-        outcomes = await H.health_check_pool(
+        outcomes = await H.business_check_pool(
             s, data_dir=data_dir, controller_url="http://127.0.0.1:9",
             secret="s", now=NOW,
         )

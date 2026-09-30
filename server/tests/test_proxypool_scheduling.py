@@ -363,8 +363,8 @@ async def test_l0_while_busy_marks_pending_without_restart(
         )
         await s.commit()
 
-    assert await _state_of("1|C") == NODE_DEAD, "L0 该改状态（可与 crawl 并行）"
-    assert rebuild_pending() is True, "池内容脏了 → 只置信号，不立即重建"
+    assert await _state_of("1|C") == NODE_ACTIVE, "L0 已降级纯记录：占线巡检不推进状态"
+    assert rebuild_pending() is False, "L0 已降级纯记录：巡检本身不再弄脏合格集"
     assert proxy_runtime.process.pid == pid_before, "占线时绝不能重启内核"
     assert proxy_runtime.port == port_before
     assert len(outcomes) == 3
@@ -388,7 +388,7 @@ async def test_pending_rebuild_consumed_when_idle(
 
     await _set_state("1|C", NODE_DEAD)
     request_rebuild()
-    assert rebuild_pending() is True
+    assert rebuild_pending() is True, "request_rebuild 置位"
 
     async with get_session_factory()() as s:
         result = await run_pending_rebuild(
@@ -487,9 +487,33 @@ async def test_maintenance_skips_while_busy(
 # ══ 5. L1/L2 是 capture → probe → restore 事务 ═══════════════════
 @pytest.mark.asyncio
 async def test_maintenance_restores_global_from_current_pool(
-    tmp_data_dir, kernel_exe_path, proxy_runtime, redirect_proxies, probe_echo
+    tmp_data_dir, kernel_exe_path, proxy_runtime, redirect_proxies, probe_echo,
+    monkeypatch
 ) -> None:
     await init_db()
+    from app.domains.proxypool import health as _hm
+
+    async def _ok_business(controller_url, secret, mixed_port, runtime_name, *,
+                           url=None, appid=None, timeout=None):
+        return _hm.BusinessResult(runtime_name=runtime_name, ok=True,
+                                  http_status=200, final_price_in_cents=999,
+                                  detail=_hm.BUSINESS_OK, latency_ms=5)
+
+    monkeypatch.setattr(_hm, "probe_business", _ok_business)
+    # 第二轮 L2 跳过：B 被手动置 DEAD 后，一次业务失败即判死的 fail-fast 语义
+    # 没法让 B「活着但不在池」，跳过本轮 L2 才能单测 restore 的落位规则
+    import app.domains.proxypool.scheduling as _sched
+
+    _orig_l2 = _sched.business_check_pool
+    _l2_calls = {"n": 0}
+
+    async def _skip_second_l2(session, **kw):
+        _l2_calls["n"] += 1
+        if _l2_calls["n"] >= 2:
+            return ()
+        return await _orig_l2(session, **kw)
+
+    monkeypatch.setattr(_sched, "business_check_pool", _skip_second_l2)
     await _add("1|A", port=redirect_proxies(probe_echo))
     await _add("1|B", port=redirect_proxies(probe_echo))
     await _add("1|C", port=redirect_proxies(probe_echo))
@@ -584,8 +608,8 @@ async def test_cycle_while_busy_only_runs_l0(
         await s.commit()
     end_crawl()
 
-    assert await _state_of("1|C") == NODE_DEAD
-    assert rebuild_pending() is True
+    assert await _state_of("1|C") == NODE_ACTIVE, "L0 纯记录：占线巡检不判死"
+    assert rebuild_pending() is False, "占线轮只有 L0：纯记录不置重建信号"
     assert result.busy is True
     assert result.rebuilt is None and result.maintenance is None, "占线时不重建、不 L1/L2"
     assert proxy_runtime.process.pid == pid_before and proxy_runtime.port == port_before
@@ -622,14 +646,28 @@ async def test_cycle_when_idle_rebuilds_then_maintains(
         )
         await s.commit()
 
+    # 第一轮：L2 经死端口节点 C 的链路拿不到 Steam 响应（mihomo 回 502 网关错）
+    # → C 判死、合格集变化 → 置 pending；重建步在 maintenance 之前，本轮不消费
     assert first.busy is False
-    assert first.rebuilt is not None, "空闲时该消费 pending 真重建"
-    assert first.rebuilt.hot_applied is True, "控制器可达时重建走热通道"
-    assert first.rebuilt.mixed_port == old_port, "热通道沿用现役入口端口"
-    assert first.rebuilt.selection == "1|B", "重建必须恢复 GLOBAL"
-    assert first.maintenance is not None
-    assert first.maintenance.selection == "1|B", "维护结束仍要是 B（只观察）"
-    assert await _global_now(first.rebuilt.controller_url, secret) == "1|B"
+    assert first.rebuilt is None, "本轮只置位（重建步在 maintenance 之前）"
+    assert rebuild_pending() is True, "L2 判死改变合格集 → 置重建信号"
+    assert await _state_of("1|C") == NODE_DEAD
+
+    async with get_session_factory()() as s:
+        second = await _cycle(
+            s, tmp_data_dir, base, secret, proxy_runtime, kernel_exe_path,
+            l0_target_url="http://probe.invalid/ip",
+            l1_url="http://probe.invalid/ip", l2_url="http://probe.invalid/browse",
+        )
+        await s.commit()
+
+    assert second.rebuilt is not None, "空闲时该消费 pending 真重建"
+    assert second.rebuilt.hot_applied is True, "控制器可达时重建走热通道"
+    assert second.rebuilt.mixed_port == old_port, "热通道沿用现役入口端口"
+    assert second.rebuilt.selection == "1|B", "重建必须恢复 GLOBAL"
+    assert second.maintenance is not None
+    assert second.maintenance.selection == "1|B", "维护结束仍要是 B（只观察）"
+    assert await _global_now(second.rebuilt.controller_url, secret) == "1|B"
     assert rebuild_pending() is False
 
 
