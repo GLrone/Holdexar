@@ -321,16 +321,18 @@ export interface PilotStreamEvent {
 }
 
 /** 流式问答：SSE 帧解析（data: JSON / data: [DONE]），事件逐个回调。
- *  thinking 通道 = 推理模型思维链增量；普通模型只有 answer 通道。 */
+ *  thinking 通道 = 推理模型思维链增量；普通模型只有 answer 通道。
+ *  sessionId 串起同一次开舱内的追问与指代（候选待定 / 上一款游戏）。 */
 export async function askPilotStream(
   question: string,
   appid: number | undefined,
+  sessionId: string | undefined,
   onEvent: (e: PilotStreamEvent) => void,
 ): Promise<void> {
   const resp = await fetch(`${BASE}/pilot/ask/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question, appid }),
+    body: JSON.stringify({ question, appid, session_id: sessionId }),
   })
   if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`)
   const reader = resp.body.getReader()

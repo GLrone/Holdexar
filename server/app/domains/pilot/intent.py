@@ -45,6 +45,11 @@ def _looks_like_alert(q: str) -> bool:
     return has_channel and has_condition
 
 
+def is_guarded(question: str) -> bool:
+    """问句是否命中写工具守卫词（供服务层在会话待定接管时复核）。"""
+    return any(w in (question or "") for w in _GUARD_WORDS)
+
+
 def route(question: str) -> str:
     q = (question or "").strip()
     if not q:

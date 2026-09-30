@@ -26,6 +26,8 @@ class PilotConfigUpdate(BaseModel):
 class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=500)
     appid: int | None = None
+    # 领航台会话 id：前端每次开抽屉生成一次，同一会话内追问/指代靠它串起
+    session_id: str | None = Field(default=None, max_length=64)
 
 
 class AskResponse(BaseModel):

@@ -13,8 +13,11 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 
+from app.core.paths import resolve_data_dir
+from app.crawler.utils import get_beijing_time_obj
 from app.domains.pilot import config as pilot_config
 from app.domains.pilot import intent as pilot_intent
 from app.domains.pilot import llm as pilot_llm
@@ -62,41 +65,155 @@ def _user_message(question: str, facts: dict | None) -> str:
     )
 
 
-async def _prepare(question: str, appid: int | None) -> tuple[str, dict | None]:
+# ── 领航台会话（P1.5 循环）：进程内轻状态，仅支撑追问与指代解析，
+#    进程重启即失效——会话不承载任何需要持久的业务数据。
+
+_SESSION_TTL_S = 1800
+_SESSION_MAX = 50
+_sessions: dict[str, dict] = {}
+
+_ORDINAL_RE = re.compile(r"第\s*([一二三四五1-9])\s*个?")
+_ORDINAL_CN = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5}
+_PRONOUNS = ("它", "这个游戏", "这游戏", "该游戏", "此游戏", "这款")
+
+
+def _ordinal_index(text: str) -> int | None:
+    m = _ORDINAL_RE.search(text or "")
+    if not m:
+        return None
+    ch = m.group(1)
+    return _ORDINAL_CN.get(ch) or (int(ch) if ch.isdigit() else None)
+
+
+def _session_get(session_id: str | None) -> dict | None:
+    if not session_id:
+        return None
+    st = _sessions.get(session_id)
+    if st is None:
+        return None
+    if time.monotonic() - st["ts"] > _SESSION_TTL_S:
+        _sessions.pop(session_id, None)
+        return None
+    st["ts"] = time.monotonic()
+    return st
+
+
+def _session_get_or_create(session_id: str) -> dict:
+    st = _sessions.get(session_id)
+    if st is None:
+        if len(_sessions) >= _SESSION_MAX:
+            oldest = min(_sessions, key=lambda k: _sessions[k]["ts"])
+            _sessions.pop(oldest, None)
+        st = {"ts": time.monotonic()}
+        _sessions[session_id] = st
+    st["ts"] = time.monotonic()
+    return st
+
+
+def _session_store_candidates(session: dict | None, items: list[dict], action: str) -> None:
+    if not session or not items:
+        return
+    session["candidates"] = items
+    session["pending_action"] = action
+
+
+def _session_store_game(session: dict | None, appid: int, name: str | None) -> None:
+    if not session or not appid:
+        return
+    session["last_game"] = {"appid": appid, "name": name}
+
+
+def _session_resolve_target(question: str, session: dict | None, action: str) -> dict | None:
+    """会话解析：待定候选的序数/名称命中，或指代最近一次聊到的游戏。
+
+    只在常规检索零命中时作为回退调用；返回 {appid, name} 或 None。
+    """
+    if session is None:
+        return None
+    cands = session.get("candidates") or []
+    if cands and session.get("pending_action") == action:
+        idx = _ordinal_index(question)
+        if idx and 1 <= idx <= len(cands):
+            return cands[idx - 1]
+        for c in cands:
+            name = c.get("name") or ""
+            if name and len(name) >= 2 and name in question:
+                return c
+    if any(p in (question or "") for p in _PRONOUNS):
+        last = session.get("last_game")
+        if last:
+            return {"appid": last["appid"], "name": last.get("name")}
+    return None
+
+
+def _log_decision(entry: dict) -> None:
+    """罗盘数据飞轮：问答轮次追加落盘（JSONL，shadow）。
+
+    只追加、无读取方、失败静默——飞轮不依赖日志，日志也不阻塞问答。
+    数据供未来自训决策引擎做意图标注与动作结果回归。
+    """
+    try:
+        base = resolve_data_dir() / "pilot"
+        base.mkdir(parents=True, exist_ok=True)
+        with (base / "decisions.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+async def _prepare(question: str, appid: int | None, session: dict | None) -> tuple[str, dict | None, str]:
     """共享前置：意图路由 + 工具取事实。
 
-    返回 (stage, payload)：stage ∈ guide / facts / none / chat / write；
-    facts 形态下 payload 为事实 dict，write 形态下为 {"action": 动作名}，
-    其余为 None。
+    返回 (stage, payload, intent)：stage ∈ guide / facts / none / chat /
+    write；facts 形态下 payload 为事实 dict，write 形态下为
+    {"action": 动作名}，其余为 None。
     """
     intent = pilot_intent.route(question)
+    if session and not pilot_intent.is_guarded(question):
+        # 待定动作接管：上一轮刚追问过候选，本轮是序数/名称应答 → 直接执行
+        pending = session.get("pending_action")
+        if pending and session.get("candidates") and (
+            _ordinal_index(question)
+            or any(
+                (c.get("name") and len(c["name"]) >= 2 and c["name"] in question)
+                for c in session["candidates"]
+            )
+        ):
+            return "write", {"action": pending}, intent
     if intent == pilot_intent.HOW_TO:
-        return "guide", None
+        return "guide", None, intent
     if intent == pilot_intent.ADD_MONITOR:
-        return "write", {"action": "monitor_add"}
+        return "write", {"action": "monitor_add"}, intent
     if intent == pilot_intent.CREATE_ALERT:
-        return "write", {"action": "alert_add"}
+        return "write", {"action": "alert_add"}, intent
     if intent == pilot_intent.PRICE_ANALYSIS:
         target = appid
         if target is None:
             matches = await pilot_tools.search_games(question)
             if len(matches) == 1:
                 target = matches[0]["appid"]
+            elif not matches:
+                ref = _session_resolve_target(question, session, "")
+                if ref:
+                    target = ref["appid"]
         facts = await pilot_tools.price_facts(target) if target else None
+        if facts is not None:
+            _session_store_game(session, target, facts.get("name"))
+            return "facts", facts, intent
         if facts is None:
             # 问句没点名到具体游戏：回退属性筛选给候选，让模型带着候选作答，
             # 而不是用 no_data 把主入口的问句顶回来
             items = await pilot_tools.recommend_games(question)
             if items:
-                return "facts", {"kind": "games", "items": items}
-            return "none", None
-        return "facts", facts
+                return "facts", {"kind": "games", "items": items}, intent
+            return "none", None, intent
+        return "facts", facts, intent
     if intent == pilot_intent.FIND_GAMES:
         items = await pilot_tools.recommend_games(question)
         if not items:
-            return "none", None
-        return "facts", {"kind": "games", "items": items}
-    return "chat", None
+            return "none", None, intent
+        return "facts", {"kind": "games", "items": items}, intent
+    return "chat", None, intent
 
 
 def _empty(source: str, reason: str | None, facts: dict | None) -> dict:
@@ -132,7 +249,7 @@ async def _respond(*, question: str, facts: dict | None, is_chat: bool) -> dict:
 
 
 async def _resolve_write(
-    question: str, appid: int | None, action: str
+    question: str, appid: int | None, action: str, session: dict | None
 ) -> tuple[str, dict | None]:
     """写动作解析与执行（风险门之后的确定性路径）。
 
@@ -148,18 +265,30 @@ async def _resolve_write(
     else:
         queries = pilot_tools.clean_query_tokens(question) or [question]
     matches: list[dict] = []
+    used_query = ""
     for query in queries:
         matches = await pilot_tools.search_games(question, query=query)
         if matches:
+            used_query = query
             break
+    if matches:
+        # 名称子串会同时命中续作（如「里奥的宝藏」与「…2」）：查询词与
+        # 游戏名完全一致的候选优先，避免歧义误判
+        exact = [m for m in matches if (m.get("name") or "") == used_query]
+        if exact:
+            matches = exact
     target = appid
     if target is None:
         if len(matches) == 1:
             target = matches[0]["appid"]
-        elif matches:
+        elif len(matches) > 1:
+            _session_store_candidates(session, matches, action)
             return "facts", {"kind": "games", "items": matches}
         else:
-            return "none", None
+            ref = _session_resolve_target(question, session, action)
+            if ref is None:
+                return "none", None
+            target = ref["appid"]
     if action == "alert_add":
         target_type, value = pilot_tools.extract_alert(question)
         if target_type == "price" and value is None:
@@ -167,23 +296,28 @@ async def _resolve_write(
         result = await pilot_tools.alert_add(target, target_type=target_type, target_value_fen=value)
     else:
         result = await pilot_tools.monitor_add(target)
+    if session is not None:
+        session.pop("candidates", None)
+        session.pop("pending_action", None)
+        _session_store_game(session, target, result.get("name"))
     return "done", {"kind": "action", **result}
 
 
-async def ask(question: str, appid: int | None = None) -> dict:
+async def ask(question: str, appid: int | None = None, session_id: str | None = None) -> dict:
     q = (question or "").strip()
     if not q:
         raise ValueError("empty question")
-    cache_key = (q, appid or 0)
+    session = _session_get_or_create(session_id) if session_id else None
+    cache_key = (q, appid or 0, session_id or "")
     cached = _cache_get(cache_key)
     if cached is not None:
         return {**cached, "cached": True}
 
-    stage, facts = await _prepare(q, appid)
+    stage, facts, intent = await _prepare(q, appid, session)
     if stage == "guide":
         resp = _empty("guide", None, None)
     elif stage == "write":
-        stage2, payload = await _resolve_write(q, appid, facts["action"])
+        stage2, payload = await _resolve_write(q, appid, facts["action"], session)
         if stage2 == "done":
             resp = await _respond(question=q, facts=payload, is_chat=False)
         elif stage2 == "facts":
@@ -198,10 +332,17 @@ async def ask(question: str, appid: int | None = None) -> dict:
         resp = await _respond(question=q, facts=facts, is_chat=stage == "chat")
 
     _cache_put(cache_key, resp)
+    _log_decision({
+        "ts": get_beijing_time_obj().isoformat(timespec="seconds"),
+        "question": q, "intent": intent, "stage": stage,
+        "source": resp["source"], "reason": resp["reason"],
+        "appid": appid, "factsKind": (facts or {}).get("kind") if isinstance(facts, dict) else None,
+        "cached": False,
+    })
     return {**resp, "cached": False}
 
 
-async def ask_stream(question: str, appid: int | None = None):
+async def ask_stream(question: str, appid: int | None = None, session_id: str | None = None):
     """流式编排。事件形态：
     {"type": "thinking" | "answer", "delta": str} 增量；
     {"type": "facts", "facts": dict} 事实就绪；
@@ -212,7 +353,8 @@ async def ask_stream(question: str, appid: int | None = None):
     if not q:
         yield {"type": "error", "reason": "bad_request"}
         return
-    cache_key = (q, appid or 0)
+    session = _session_get_or_create(session_id) if session_id else None
+    cache_key = (q, appid or 0, session_id or "")
     cached = _cache_get(cache_key)
     if cached is not None:
         out = {**cached, "cached": True}
@@ -223,7 +365,7 @@ async def ask_stream(question: str, appid: int | None = None):
         yield {"type": "done", **out}
         return
 
-    stage, facts = await _prepare(q, appid)
+    stage, facts, intent = await _prepare(q, appid, session)
     if facts is not None and stage != "write":
         yield {"type": "facts", "facts": facts}
 
@@ -233,7 +375,7 @@ async def ask_stream(question: str, appid: int | None = None):
         yield {"type": "done", **resp}
         return
     if stage == "write":
-        stage2, payload = await _resolve_write(q, appid, facts["action"])
+        stage2, payload = await _resolve_write(q, appid, facts["action"], session)
         if stage2 == "done":
             # 写确认是短句，走非流式解读即可
             resp = await _respond(question=q, facts=payload, is_chat=False)
@@ -244,6 +386,13 @@ async def ask_stream(question: str, appid: int | None = None):
         else:
             resp = _empty("none", "no_data", None)
         _cache_put(cache_key, resp)
+        _log_decision({
+            "ts": get_beijing_time_obj().isoformat(timespec="seconds"),
+            "question": q, "intent": intent, "stage": stage,
+            "source": resp["source"], "reason": resp["reason"],
+            "appid": appid, "factsKind": (facts or {}).get("kind") if isinstance(facts, dict) else None,
+            "cached": False,
+        })
         yield {"type": "done", **resp}
         return
     if stage == "none":
@@ -290,6 +439,14 @@ async def ask_stream(question: str, appid: int | None = None):
                 "facts": facts,
             }
             _cache_put(cache_key, resp)
+            _log_decision({
+                "ts": get_beijing_time_obj().isoformat(timespec="seconds"),
+                "question": q, "intent": intent, "stage": stage,
+                "source": resp["source"], "reason": None,
+                "appid": appid, "factsKind": (facts or {}).get("kind") if isinstance(facts, dict) else None,
+                "cached": False,
+                "usage": usage,
+            })
             yield {"type": "done", **resp, "cached": False}
             return
         except pilot_llm.PilotLlmError:
