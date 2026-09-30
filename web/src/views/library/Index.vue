@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
 import { gamesApi, invalidateGetCache, type GameListItem } from '@/api/client'
@@ -458,10 +458,31 @@ onMounted(() => {
   load(true)
 })
 
+/* keep-alive 常驻（往返游戏详情不丢列表、筛选与滚动）：网格模式的滚动容器是
+   App 层的 .view-container（全局一份），切走即被后续页面改写，离开前记录、
+   切回后还原；列表模式的滚动在 HlScrollList 内部，实例保留即自动保留。 */
+defineOptions({ name: 'LibraryFinder' })
+let savedScrollTop = 0
+let everActivated = false
+onActivated(() => {
+  if (!everActivated) {
+    everActivated = true
+    return
+  }
+  nextTick(() => {
+    const el = document.querySelector('.view-container')
+    if (el) el.scrollTop = savedScrollTop
+  })
+})
+onDeactivated(() => {
+  savedScrollTop = document.querySelector('.view-container')?.scrollTop ?? 0
+})
+
 onBeforeUnmount(() => {
   observer?.disconnect()
-  // 先关闸再重置：重置会触发上面的 watch（store 变更），
-  // initialized=false 让回调直接跳过，避免卸载瞬间多发一次请求
+  // keep-alive 下切走不卸载，这里只在组件真正销毁（移出缓存）时兜底：
+  // 先关闸再重置——重置会触发上面的 watch（store 变更），initialized=false
+  // 让回调直接跳过，避免销毁瞬间多发一次请求
   initialized.value = false
   store.resetForLeave()
 })
