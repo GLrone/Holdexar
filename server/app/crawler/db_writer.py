@@ -15,10 +15,13 @@ from sqlalchemy import case, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core import seed_assets
-from app.core.database import get_session_factory, write_slot
+from app.core.database import (
+    WritePriority,
+    get_session_factory,
+    write_gate,
+)
 from app.domains.games.models import (
     Bundle,
-    BundleRegionPrice,
     Game,
     GameCurrentPrice,
     GamePriceHistory,
@@ -29,6 +32,9 @@ from .config import STALE_HOURS
 from .utils import get_beijing_time_obj, is_near_steam_refresh
 
 logger = logging.getLogger(__name__)
+
+# 一段事务最多写入的款数：写者位按段交还，交互写可在段间插入
+_BATCH_WRITE_CHUNK = 100
 
 
 @asynccontextmanager
@@ -413,7 +419,11 @@ class DbWriter:
             game_values, free_state = self._normalize_game_row(game_data, prices_data)
             now_dt = game_values["updated_at"]
 
-            async with _session_scope(session) as session:
+            # 单款独占事务过写调度器；批量慢路径传入共享 session 时按重入放行
+            async with (
+                write_gate(WritePriority.BACKGROUND),
+                _session_scope(session) as session,
+            ):
                 if baseline is None:
                     baseline = await self._load_baseline(
                         session, int(game_data.get("appid") or 0)
@@ -565,18 +575,31 @@ class DbWriter:
     async def upsert_task_batch(
         self, entries: list[tuple[dict, list[dict] | None]]
     ) -> list[bool]:
-        """一区一批（≤400 款）一次事务写完：基线一次 + 决策纯函数化 +
-        四条批量语句（games / current / 欠账结转 / history）。
+        """一区一批（≤400 款）写完：拆 ~100 款的段逐段过写调度器提交。
 
-        决策逻辑与单款写共用 `_plan_price_rows`；批内任意语句失败整批回退
-        `_upsert_task_batch_slow` 逐款隔离写（慢 ~10 倍，只兜坏批）。
+        每段独立事务（基线一次 + 决策纯函数化 + 四条批量语句 games / current /
+        欠账结转 / history），段与段之间写者位空出——交互写（设置/钱包/账号）
+        无需等整批写完。决策逻辑与单款写共用 `_plan_price_rows`；段内任意语句
+        失败整段回退 `_upsert_task_batch_slow` 逐款隔离写（慢 ~10 倍，只兜坏段）。
         """
         results = [True] * len(entries)
         if not entries:
             return results
+        for start in range(0, len(entries), _BATCH_WRITE_CHUNK):
+            chunk = entries[start : start + _BATCH_WRITE_CHUNK]
+            results[start : start + len(chunk)] = await self._write_task_chunk(chunk)
+        return results
+
+    async def _write_task_chunk(
+        self, entries: list[tuple[dict, list[dict] | None]]
+    ) -> list[bool]:
+        """单段写入（≤_BATCH_WRITE_CHUNK 款）一次事务写完。"""
+        results = [True] * len(entries)
+        if not entries:
+            return results
         _t0 = time.perf_counter()
-        # 写闸在取连接之前：排队等闸的批次不占连接池，读请求不被写侧挤占
-        async with write_slot():
+        # 写调度器在取连接之前：排队等写者位的段不占连接池，读请求不被写侧挤占
+        async with write_gate(WritePriority.BACKGROUND):
             try:
                 async with get_session_factory()() as session:
                     _tc = time.perf_counter()
@@ -730,81 +753,83 @@ class DbWriter:
                     await session.commit()
                     commit_ms = _ms_since(_tm)
             except Exception:
-                logger.exception("批量写快路径失败，整批回退逐款隔离写（%d 款）", len(entries))
+                logger.exception("批量写快路径失败，整段回退逐款隔离写（%d 款）", len(entries))
                 return await self._upsert_task_batch_slow(entries)
-            # 提交后再跑复活清标 / 种子补挂：与单写入口同序，不叠在未提交事务里
-            ok_ids = [
-                int(game_data.get("appid") or 0)
-                for i, (game_data, _) in enumerate(entries)
-                if results[i] and int(game_data.get("appid") or 0)
-            ]
-            _tp = time.perf_counter()
-            await self.clear_removed_marks_batch(ok_ids)
-            for aid in ok_ids:
-                try:
-                    await seed_assets.apply_curated(aid)
-                except Exception as e:  # noqa: BLE001
-                    logger.warning("批量写入收尾失败 appid=%s: %s", aid, e)
-            post_ms = _ms_since(_tp)
-            logger.info(
-                "[写账] 批 apps=%d baseline=%dms pool=%dms game=%dms current=%dms "
-                "ledger=%dms history=%dms commit=%dms post=%dms lockwait=%dms total=%dms",
-                len(entries), baseline_ms, pool_ms, game_ms, current_ms, ledger_ms,
-                history_ms, commit_ms, post_ms, lockwait_ms, _ms_since(_t0),
-            )
-            return results
+        # 收尾（复活清标 / 种子补挂）在写者位之外执行：各自过调度器的小事务，
+        # 交互写可在段间插入；收尾不叠在未提交事务里
+        ok_ids = [
+            int(game_data.get("appid") or 0)
+            for i, (game_data, _) in enumerate(entries)
+            if results[i] and int(game_data.get("appid") or 0)
+        ]
+        _tp = time.perf_counter()
+        await self.clear_removed_marks_batch(ok_ids)
+        for aid in ok_ids:
+            try:
+                await seed_assets.apply_curated(aid)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("批量写入收尾失败 appid=%s: %s", aid, e)
+        post_ms = _ms_since(_tp)
+        logger.info(
+            "[写账] 段 apps=%d baseline=%dms pool=%dms game=%dms current=%dms "
+            "ledger=%dms history=%dms commit=%dms post=%dms lockwait=%dms total=%dms",
+            len(entries), baseline_ms, pool_ms, game_ms, current_ms, ledger_ms,
+            history_ms, commit_ms, post_ms, lockwait_ms, _ms_since(_t0),
+        )
+        return results
 
     async def _upsert_task_batch_slow(
         self, entries: list[tuple[dict, list[dict] | None]]
     ) -> list[bool]:
-        """逐款隔离写（回退路径）：一批一次基线 + 单款 SAVEPOINT，单款失败
-        不拖垮整批。快路径的任何批级异常都退到这里；运行在快路径已持有的
-        写闸内，不自取闸（闸可重入计数为 2，重取会放大并发写事务）。"""
+        """逐款隔离写（回退路径）：一整批基线一次 + 单款 SAVEPOINT，单款失败
+        不拖垮整段。快路径的任何段级异常都退到这里；调用方已持写者位时按
+        重入放行，闸在会话关与提交处交还。"""
         results = [False] * len(entries)
         if not entries:
             return results
         _t0 = time.perf_counter()
-        try:
-            async with get_session_factory()() as session:
-                _tc = time.perf_counter()
-                await session.connection()
-                pool_ms = _ms_since(_tc)
-                _tb = time.perf_counter()
-                known, latest = await self._query_baselines(
-                    session, [int(g.get("appid") or 0) for g, _ in entries]
-                )
-                baseline_ms = _ms_since(_tb)
-                savepoint_ms = apps_ms = 0
-                for i, (game_data, prices_data) in enumerate(entries):
-                    aid = int(game_data.get("appid") or 0)
-                    _ts = time.perf_counter()
-                    sp = await session.begin_nested()
-                    savepoint_ms += _ms_since(_ts)
-                    _ta = time.perf_counter()
-                    try:
-                        ok = await self.upsert_game_and_prices(
-                            game_data,
-                            prices_data,
-                            baseline=(known.get(aid, {}), latest.get(aid, {})),
-                            session=session,
-                            commit=False,
-                        )
-                    except Exception as e:  # noqa: BLE001 —— 单款失败不拖垮整批
-                        logger.error("批量写入单款失败 appid=%s: %s", aid, e)
-                        ok = False
-                    apps_ms += _ms_since(_ta)
-                    if ok:
-                        await sp.commit()
-                    else:
-                        await sp.rollback()
-                    results[i] = ok
-                _tm = time.perf_counter()
-                await session.commit()
-                commit_ms = _ms_since(_tm)
-        except Exception as e:
-            logger.error("批量写入失败: %s", e)
-            return [False] * len(entries)
-        # 提交后再跑复活清标 / 种子补挂：与单写入口同序，不叠在未提交事务里
+        async with write_gate(WritePriority.BACKGROUND):
+            try:
+                async with get_session_factory()() as session:
+                    _tc = time.perf_counter()
+                    await session.connection()
+                    pool_ms = _ms_since(_tc)
+                    _tb = time.perf_counter()
+                    known, latest = await self._query_baselines(
+                        session, [int(g.get("appid") or 0) for g, _ in entries]
+                    )
+                    baseline_ms = _ms_since(_tb)
+                    savepoint_ms = apps_ms = 0
+                    for i, (game_data, prices_data) in enumerate(entries):
+                        aid = int(game_data.get("appid") or 0)
+                        _ts = time.perf_counter()
+                        sp = await session.begin_nested()
+                        savepoint_ms += _ms_since(_ts)
+                        _ta = time.perf_counter()
+                        try:
+                            ok = await self.upsert_game_and_prices(
+                                game_data,
+                                prices_data,
+                                baseline=(known.get(aid, {}), latest.get(aid, {})),
+                                session=session,
+                                commit=False,
+                            )
+                        except Exception as e:  # noqa: BLE001 —— 单款失败不拖垮整批
+                            logger.error("批量写入单款失败 appid=%s: %s", aid, e)
+                            ok = False
+                        apps_ms += _ms_since(_ta)
+                        if ok:
+                            await sp.commit()
+                        else:
+                            await sp.rollback()
+                        results[i] = ok
+                    _tm = time.perf_counter()
+                    await session.commit()
+                    commit_ms = _ms_since(_tm)
+            except Exception as e:
+                logger.error("批量写入失败: %s", e)
+                return [False] * len(entries)
+        # 收尾（复活清标 / 种子补挂）在写者位之外执行，各自过调度器
         ok_ids = [
             int(game_data.get("appid") or 0)
             for i, (game_data, _) in enumerate(entries)
@@ -829,7 +854,7 @@ class DbWriter:
     async def ensure_game_exists(self, appid: int, name: str = "") -> None:
         """确保 games 表有记录（满足外键约束）。"""
         try:
-            async with get_session_factory()() as session:
+            async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
                 stmt = sqlite_insert(Game).values(
                     appid=int(appid), name=name,
                     created_at=_naive(get_beijing_time_obj()),
@@ -867,7 +892,7 @@ class DbWriter:
         其他来源（PG 导入/页面渠道）的字段不覆盖。
         """
         try:
-            async with get_session_factory()() as session:
+            async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
                 stmt = sqlite_insert(Bundle).values(
                     bundle_id=int(bundle_id),
                     name=name or f"Bundle_{bundle_id}",
@@ -903,7 +928,7 @@ class DbWriter:
         if not discoveries:
             return 0
         try:
-            async with get_session_factory()() as session:
+            async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
                 ids = [int(d["bundle_id"]) for d in discoveries]
                 known = set(
                     (await session.execute(
@@ -944,7 +969,7 @@ class DbWriter:
         处只写 type/时间戳两列，不碰其他元数据（名字保持挂名值）。
         """
         try:
-            async with get_session_factory()() as session:
+            async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
                 stmt = sqlite_insert(Game).values(
                     appid=int(appid),
                     name=f"AppID_{appid}",
@@ -975,7 +1000,7 @@ class DbWriter:
         """
         try:
             now_dt = _naive(get_beijing_time_obj())
-            async with get_session_factory()() as session:
+            async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
                 if status == "missing":
                     # 首次插入 fail_count=1；已有行则 DO UPDATE 里旧值+1
                     stmt = sqlite_insert(GameCurrentPrice).values(
@@ -1045,7 +1070,7 @@ class DbWriter:
         只写 type/时间戳，不碰其他元数据（名字保持挂名值）。
         """
         try:
-            async with get_session_factory()() as session:
+            async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
                 stmt = sqlite_insert(Game).values(
                     appid=int(appid),
                     name=f"AppID_{appid}",
@@ -1077,7 +1102,7 @@ class DbWriter:
         无"曾经有数据"事实，不走下架判定（走回补/重探池）。返回是否已转终态。
         """
         try:
-            async with get_session_factory()() as session:
+            async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
                 row = await session.get(Game, int(appid))
                 if row is None or row.updated_at is None:
                     return False
@@ -1098,7 +1123,7 @@ class DbWriter:
         只清 removed 两列；strikes 归零让下次下架判定重新从零计数。
         """
         try:
-            async with get_session_factory()() as session:
+            async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
                 row = await session.get(Game, int(appid))
                 if row is not None and (row.removed_at is not None or row.removed_strikes):
                     row.removed_at = None
@@ -1118,7 +1143,7 @@ class DbWriter:
         if not ids:
             return 0
         try:
-            async with get_session_factory()() as session:
+            async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
                 rows = (
                     await session.execute(
                         select(Game.appid).where(
