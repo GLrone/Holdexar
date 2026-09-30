@@ -322,23 +322,62 @@ def _parse_money(text: str) -> float | None:
         return None
 
 
+# 进程级客户端缓存（键 = 出口代理 × 证书校验 × 超时）：代理连接的建立
+# （CONNECT + TLS 握手）是单次开销，复用后请求走已建隧道，延迟与失败率
+# 都从「每轮握手」级降为「偶发建连」级。客户端随进程存活；池中连接失效
+# 时由连接类失败路径丢弃重建（_try_channels 的自愈重试）。
+# 响应 Set-Cookie 一律不采用——每次取用前清空 jar，登录态始终以调用方
+# 显式传入的 Cookie 为准，不与 Steam 响应下发的会话字段串味。
+_client_cache: dict[tuple[str | None, bool, float], httpx.AsyncClient] = {}
+
+
+def _new_client(
+    proxy_url: str | None, verify: bool, timeout: float
+) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        timeout=timeout, verify=verify, follow_redirects=True, proxy=proxy_url
+    )
+
+
+async def _borrow_client(
+    proxy_url: str | None, verify: bool, timeout: float, *, fresh: bool = False
+) -> httpx.AsyncClient:
+    """取缓存客户端；fresh=True 丢弃旧实例重建（内核重启/出口切换后
+    池中连接全死，由连接类失败路径触发）。"""
+    key = (proxy_url, verify, timeout)
+    client = _client_cache.get(key)
+    if client is not None and not fresh:
+        client.cookies.clear()
+        return client
+    if client is not None:
+        _client_cache.pop(key, None)
+        await client.aclose()
+    client = _new_client(proxy_url, verify, timeout)
+    _client_cache[key] = client
+    return client
+
+
 async def _try_channels(
     verify_flag: bool, cookies: dict[str, str], proxy_url: str | None = None
 ) -> WalletInfo:
     """跑钱包抓取；verify=False 用于本机自签证书加速器场景。
 
-    命中 429/403 上抛 WalletRateLimitedError——节点被风控时连环硬打只会
-    加深印象（redeem 域 429 同语义：换节点才有效）。
+    客户端经 _borrow_client 复用；连接层错误（建连失败/读超时/断链）丢弃
+    缓存、重建连接后整轮重试一次——隧道级故障重连即可恢复。HTTP 状态
+    错误不属连接层：命中 429/403 上抛 WalletRateLimitedError——节点被
+    风控时连环硬打只会加深印象（redeem 域 429 同语义：换节点才有效）。
     """
     errors: list[str] = []
-    async with httpx.AsyncClient(
-        timeout=FETCH_TIMEOUT, verify=verify_flag, follow_redirects=True, proxy=proxy_url
-    ) as client:
+    retried = False
+    for attempt in (0, 1):
+        if attempt > 0 and not retried:
+            break
+        client = await _borrow_client(
+            proxy_url, verify_flag, FETCH_TIMEOUT, fresh=attempt > 0
+        )
         for channel in (_fetch_store_account,):
             try:
                 info = await channel(client, cookies)
-                if info is not None:
-                    return info
             except (UnknownCurrencyError, StoreSessionExpiredError):
                 raise  # 专型错误直穿：币种缺失 / 会话衰减各自有上层处置
             except httpx.HTTPStatusError as exc:
@@ -349,16 +388,23 @@ async def _try_channels(
                     ) from exc
                 errors.append(f"{channel.__name__}: {type(exc).__name__}: {exc}")
                 logger.debug("钱包通道失败（verify=%s）%s", verify_flag, errors[-1])
+            except httpx.TransportError as exc:
+                errors.append(f"{channel.__name__}: {type(exc).__name__}: {exc}")
+                logger.debug("钱包通道失败（verify=%s）%s", verify_flag, errors[-1])
+                retried = attempt == 0
             except Exception as exc:  # noqa: BLE001 通道间容错，最后统一抛
                 errors.append(f"{channel.__name__}: {type(exc).__name__}: {exc}")
                 logger.debug("钱包通道失败（verify=%s）%s", verify_flag, errors[-1])
+            else:
+                if info is not None:
+                    return info
     raise WalletFetchError(
         "无法获取 Steam 钱包余额（Cookie 失效或网络不通）：" + "；".join(errors)
     )
 
 
 async def fetch_wallet(cookies_raw: str, *, verify: bool | None = None, proxy_url: str | None = None) -> WalletInfo:
-    """双通道抓取钱包余额与结算币种；任一成功即返回。
+    """经账户页通道抓取钱包余额与结算币种。
 
     verify 显式传值时只按该值跑一次；默认先严格校验，遇到 SSL 证书
     错误时降级跳过校验重试一次——本机用 Steam 加速器（hosts 劫持 +
@@ -460,14 +506,14 @@ async def fetch_player_states(
     if not steam_ids or not api_key:
         return {}
     try:
-        async with httpx.AsyncClient(timeout=15, proxy=proxy_url) as client:
-            resp = await client.get(
-                "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/",
-                params={"key": api_key, "steamids": ",".join(steam_ids)},
-            )
-            if resp.status_code != 200:
-                return {}
-            players = (resp.json().get("response") or {}).get("players") or []
+        client = await _borrow_client(proxy_url, True, 15.0)
+        resp = await client.get(
+            "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/",
+            params={"key": api_key, "steamids": ",".join(steam_ids)},
+        )
+        if resp.status_code != 200:
+            return {}
+        players = (resp.json().get("response") or {}).get("players") or []
     except Exception:  # noqa: BLE001
         logger.debug("GetPlayerSummaries 拉取失败", exc_info=True)
         return {}
@@ -506,19 +552,19 @@ async def fetch_profile(
         return empty
 
     async def _get(verify_flag: bool) -> dict:
-        async with httpx.AsyncClient(timeout=10, verify=verify_flag, proxy=proxy_url) as client:
-            resp = await client.get(
-                f"https://steamcommunity.com/miniprofile/{friend_code}/json",
-                headers=_HEADERS,
-            )
-            if resp.status_code != 200:
-                return {}
-            parsed = parse_miniprofile(resp.json())
-            avatar = parsed["avatar_url"]
-            if avatar and "_medium" in avatar:
-                avatar = avatar.replace("_medium", "_full")
-            parsed["avatar_url"] = normalize_avatar_url(avatar)
-            return parsed
+        client = await _borrow_client(proxy_url, verify_flag, 10.0)
+        resp = await client.get(
+            f"https://steamcommunity.com/miniprofile/{friend_code}/json",
+            headers=_HEADERS,
+        )
+        if resp.status_code != 200:
+            return {}
+        parsed = parse_miniprofile(resp.json())
+        avatar = parsed["avatar_url"]
+        if avatar and "_medium" in avatar:
+            avatar = avatar.replace("_medium", "_full")
+        parsed["avatar_url"] = normalize_avatar_url(avatar)
+        return parsed
 
     for verify_flag in ([verify] if verify is not None else [True, False]):
         try:
