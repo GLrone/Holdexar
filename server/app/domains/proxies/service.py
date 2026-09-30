@@ -652,7 +652,7 @@ async def _pool_sync_single(sub_id: int) -> None:
         from app.core.config import get_settings
         from app.domains.proxypool import bootstrap as _bs
 
-        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+        async with write_gate(WritePriority.BACKGROUND, label="subscription_sync"), get_session_factory()() as session:
             result = await _bs.sync_subscriptions(
                 session, data_dir=get_settings().data_dir,
                 now=datetime.now(), only_sub_id=sub_id,

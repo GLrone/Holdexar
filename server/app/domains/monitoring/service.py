@@ -201,7 +201,7 @@ async def sync_sources(
         return {}
     now = _now()
     result: dict[int, str] = {}
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND, label="monitoring"), get_session_factory()() as session:
         targets = list(desired)
         existing = {
             (int(r.target_id), r.source): r
@@ -260,7 +260,7 @@ async def ensure_source(target_type: str, target_id: int, source: str) -> str:
     把 Steam 愿望单等来源顺手洗掉。
     """
     now = _now()
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE, label="monitoring"), get_session_factory()() as session:
         row = (
             await session.execute(
                 select(MonitorSource).where(
@@ -341,7 +341,7 @@ async def attach_source(target_type: str, target_id: int, source: str) -> str:
 
 async def detach_source(target_type: str, target_id: int, source: str) -> str:
     """摘掉一个来源；最后一个来源摘掉后状态转 released。"""
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE, label="monitoring"), get_session_factory()() as session:
         row = (
             await session.execute(
                 select(MonitorSource).where(
@@ -361,7 +361,7 @@ async def detach_source(target_type: str, target_id: int, source: str) -> str:
 
 async def detach_all_sources(target_type: str, target_id: int) -> str:
     """摘掉全部来源（「停止监控」）：对象留在 Catalog，状态转 released。"""
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE, label="monitoring"), get_session_factory()() as session:
         rows = (
             await session.execute(
                 select(MonitorSource).where(
@@ -388,7 +388,7 @@ async def set_exclusion(
 ) -> str:
     """设置 / 解除排除。解除时行保留（只翻 active + 记 cleared_at）。"""
     target_id = int(target_id)
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE, label="monitoring"), get_session_factory()() as session:
         row = (
             await session.execute(
                 select(MonitorExclusion).where(
@@ -471,7 +471,7 @@ async def forget(target_type: str, target_id: int) -> bool:
     排除历史行保留（排除/解除可回溯）。
     """
     tid = int(target_id)
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE, label="monitoring"), get_session_factory()() as session:
         active_source = (
             await session.execute(
                 select(MonitorSource.id).where(

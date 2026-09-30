@@ -342,7 +342,7 @@ async def health_check_pool(
         outcomes.append(outcome)
         observations.append(observation)
 
-    async with write_gate(WritePriority.BACKGROUND):
+    async with write_gate(WritePriority.BACKGROUND, label="health_observation"):
         for observation in observations:
             session.add(HealthObservation(**observation))
         await session.commit()
@@ -413,7 +413,7 @@ async def recover_dead_nodes(
         pending.append((node, observation, mutations))
 
     # 探测（网络）与落库分离：状态变更与观测在写调度器内一次落库提交
-    async with write_gate(WritePriority.BACKGROUND):
+    async with write_gate(WritePriority.BACKGROUND, label="health_recovery"):
         for node, observation, mutations in pending:
             if mutations is not None:
                 failures, target = mutations
@@ -600,7 +600,7 @@ async def exit_ip_check_pool(
                 detail=result.detail,
                 latency_ms=result.latency_ms,
             ))
-        async with write_gate(WritePriority.BACKGROUND):
+        async with write_gate(WritePriority.BACKGROUND, label="health_observation"):
             for node, result in probed:
                 if result.ok and result.exit_ip:
                     node.exit_ip = result.exit_ip
@@ -793,7 +793,7 @@ async def business_check_pool(
                 detail=result.detail,
                 latency_ms=result.latency_ms,
             ))
-        async with write_gate(WritePriority.BACKGROUND):
+        async with write_gate(WritePriority.BACKGROUND, label="health_observation"):
             for node, result in probed:
                 # 生死证据判定：None = 不构成节点证据（选不中节点是探针基础设施问题）。
                 # 拿到 Steam 侧响应（200 / 429 / 503 等）= 传输成功，Steam 故障不罚节点；

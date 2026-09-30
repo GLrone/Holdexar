@@ -1192,7 +1192,6 @@ async def _recover_lane_plan(
                 session, data_dir=data_dir, controller_url=base, secret=secret,
                 now=datetime.now(), names=tuple(pending),
             )
-            await session.commit()
 
     await hot_reconverge(session, data_dir=data_dir, runtime=runtime)
 

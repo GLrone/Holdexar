@@ -109,6 +109,45 @@ async def test_cancelled_waiter_does_not_stall_gate():
 
 
 @pytest.mark.asyncio
+async def test_cancelled_after_handoff_releases_gate():
+    """移交已落、等待者尚未恢复时被取消：闸必须由取消路径代为释放。
+
+    这是最危险的取消竞态窗口——fut 已 set_result（闸名下已写到该任务）、
+    任务却再也不会从 acquire 恢复。代释放分支缺失会让写者位永久停在
+    已消失的任务上，后续所有写者饿死。
+    """
+    s = WriteScheduler()
+    await s.acquire(WritePriority.BACKGROUND)
+
+    async def waiter():
+        await s.acquire(WritePriority.BACKGROUND)
+        s.release()
+
+    t = asyncio.create_task(waiter())
+    await asyncio.sleep(0.02)
+    assert s.snapshot()["waiting_background"] == 1
+    # 主任务主动释放：移交发生（fut 已写入结果），但等待者要等事件循环
+    # 下一步才会恢复——在它恢复前取消，正好落进竞态窗口
+    s.release()
+    t.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t
+    assert not s.snapshot()["busy"], "闸不能停在已消失的任务名下"
+    await asyncio.wait_for(s.acquire(WritePriority.BACKGROUND), 1)
+    s.release()
+
+
+@pytest.mark.asyncio
+async def test_label_flows_to_owner():
+    """label 随排队移交落到持闸者（诊断日志按归属输出）。"""
+    s = WriteScheduler()
+    await s.acquire(WritePriority.BACKGROUND, "price_batch")
+    assert s._owner_label == "price_batch"
+    s.release()
+    assert s._owner_label is None
+
+
+@pytest.mark.asyncio
 async def test_metrics_recorded():
     """每次过闸留下等待/持闸耗时观测。"""
     s = WriteScheduler()
@@ -118,3 +157,18 @@ async def test_metrics_recorded():
     assert m.count == 1
     assert m.wait_last_ms >= 0
     assert m.hold_last_ms >= 0
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_reports_owner_and_metrics():
+    """诊断快照：占用归属（优先级+label）与分优先级指标同框输出。"""
+    s = WriteScheduler()
+    await s.acquire(WritePriority.INTERACTIVE, "wallet_save")
+    d = s.diagnostics()
+    assert d["busy"] and d["owner_priority"] == "INTERACTIVE"
+    assert d["owner_label"] == "wallet_save"
+    assert d["metrics"]["INTERACTIVE"]["count"] >= 1
+    assert d["metrics"]["BACKGROUND"]["count"] == 0
+    s.release()
+    d2 = s.diagnostics()
+    assert not d2["busy"] and d2["owner_label"] is None

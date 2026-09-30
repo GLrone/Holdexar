@@ -26,7 +26,7 @@ from app.core.backup import (
     backup_dir,
 )
 from app.core.config import get_settings
-from app.core.database import WritePriority, get_session_factory
+from app.core.database import WritePriority, get_session_factory, write_scheduler_diagnostics
 from app.core.database import write_gate
 from app.core.logging import ring_log_handler
 from app.domains.games.models import Game, GameCurrentPrice, GamePriceHistory
@@ -56,6 +56,16 @@ async def info() -> dict:
         # 发布仓库（owner/repo）：前端拼发布页/问题反馈链接的唯一来源
         "repo": GITHUB_REPO,
     }
+
+
+@router.get("/system/write-scheduler")
+async def write_scheduler() -> dict:
+    """写调度器诊断：谁在持闸、谁在排队、等待/持闸耗时指标。
+
+    排障第③层出口（前端消费归运行控制面阶段七）：写事务被堵时取证用，
+    回答「是谁在堵、堵了多久」，不进用户面主流程。
+    """
+    return write_scheduler_diagnostics()
 
 
 class LegacyImport(BaseModel):
