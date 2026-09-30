@@ -4,6 +4,7 @@ import { computed, ref } from 'vue'
 import {
   askPilotStream,
   type PilotAskResponse,
+  type PilotActionFacts,
   type PilotFacts,
   type PilotGameFacts,
   type PilotPriceFacts,
@@ -49,6 +50,7 @@ const REASON_KEYS: Record<string, MessageKey> = {
   cap_reached: 'pilot.reason.cap_reached',
   llm_failed: 'pilot.reason.llm_failed',
   no_data: 'pilot.reason.no_data',
+  need_target: 'pilot.reason.need_target',
 }
 
 async function ask() {
@@ -100,6 +102,17 @@ const priceFacts = computed(() =>
 const gameFacts = computed(() =>
   finalFacts.value?.kind === 'games' ? (finalFacts.value as PilotGameFacts) : null,
 )
+const actionFacts = computed(() =>
+  finalFacts.value?.kind === 'action' ? (finalFacts.value as PilotActionFacts) : null,
+)
+
+const actionText = computed(() => {
+  const f = actionFacts.value
+  if (!f) return ''
+  if (f.action === 'monitor_add') return t('pilot.action.monitor', { name: f.name ?? '—' })
+  if (f.targetType === 'historic_low') return t('pilot.action.alertLow', { name: f.name ?? '—' })
+  return t('pilot.action.alertPrice', { name: f.name ?? '—', price: fen(f.targetValueFen) })
+})
 
 const briefing = computed(() => {
   const f = priceFacts.value
@@ -184,6 +197,11 @@ const briefing = computed(() => {
           </div>
           <p v-if="answer" class="pilot-answer">{{ answer }}</p>
         </template>
+
+        <div v-else-if="finalSource === 'facts' && actionFacts" class="pilot-briefing">
+          <div class="pilot-briefing__title">{{ t('pilot.briefing') }}</div>
+          <p class="pilot-briefing__text">{{ actionText }}</p>
+        </div>
 
         <div v-else-if="finalSource === 'facts'" class="pilot-briefing">
           <div class="pilot-briefing__title">{{ t('pilot.briefing') }}</div>
