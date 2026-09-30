@@ -18,13 +18,13 @@ import asyncio
 import logging
 import re
 from datetime import datetime, timedelta
-from urllib.parse import quote, unquote
+from urllib.parse import unquote
 
 import httpx
 from sqlalchemy import select
 
-from app.core.database import get_session_factory
-from app.crawler.utils import get_beijing_time_obj
+from app.core.database import WritePriority, get_session_factory
+from app.core.database import write_gate
 from app.domains.settings import service as settings_service
 
 from .models import FamilyGroup
@@ -301,7 +301,7 @@ async def _backfill_member_countries(row: FamilyGroup) -> None:
     for m in members:
         m["loccountrycode"] = m.get("loccountrycode") or countries.get(str(m["steamid"]))
     try:
-        async with get_session_factory()() as session:
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             fresh = await session.get(FamilyGroup, row.steamid)
             if fresh is not None:
                 fresh.members_json = members
@@ -445,7 +445,7 @@ async def sync_family_group(steam_id: str | None = None) -> dict:
 
 
 async def _save_group(primary: str, snap: dict, now: datetime) -> None:
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         row = await session.get(FamilyGroup, primary)
         if row is None:
             row = FamilyGroup(steamid=primary)
@@ -469,7 +469,7 @@ async def _sync_members_to_accounts(members: list[dict], now: datetime) -> None:
     """
     from app.domains.wishlist.models import TrackedAccount
 
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         existing = {
             r.steamid: r
             for r in (
@@ -562,7 +562,7 @@ async def _backfill_member_avatars(members: list[dict], owner_sid: str) -> list[
 
     # 写回快照（只更 members_json；失败不影响本次返回，下次再自愈）
     try:
-        async with get_session_factory()() as session:
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             row = await session.get(FamilyGroup, owner_sid)
             if row is not None:
                 row.members_json = members
@@ -881,7 +881,7 @@ async def fetch_family_library(steam_id: str | None = None) -> dict:
     if steam_name_by_app:
         from app.domains.games.models import Game as GameRow
 
-        async with get_session_factory()() as session:
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             existing = {
                 r[0]: r[1] for r in (
                     await session.execute(
@@ -983,7 +983,7 @@ async def fetch_family_library(steam_id: str | None = None) -> dict:
     # 游玩动态就只剩空态（「经常失败」的另一半）。成功即存，兜底也有数据。
     if owner and member_play:
         try:
-            async with get_session_factory()() as session:
+            async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
                 row = await session.get(FamilyGroup, owner)
                 if row is not None:
                     row.play_json = member_play
@@ -1075,7 +1075,7 @@ async def _upsert_library_snapshot(family_groupid: str, games: list[dict]) -> No
     from .models import FamilyLibrarySnapshot
 
     now = datetime.utcnow()
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         for g in games:
             snap = await session.get(FamilyLibrarySnapshot, (g["appid"], family_groupid))
             if snap is None:

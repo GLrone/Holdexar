@@ -49,7 +49,6 @@ from sqlalchemy import select, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.config import get_settings
-from app.core.database import get_session_factory
 from app.domains.games.models import Game
 from app.domains.settings.models import AppSetting
 
@@ -157,7 +156,9 @@ async def apply_curated(appid: int, seed_path: Path | None = None) -> None:
         if not row:
             return
         sets = ", ".join(f"{c} = :{c}" for c in CURATED_COLS)
-        async with get_session_factory()() as session:
+        from app.core.database import WritePriority, write_gate
+
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             await session.execute(
                 text(f"UPDATE games SET {sets} WHERE appid = :appid"),
                 {**row, "appid": int(appid)},
@@ -252,7 +253,9 @@ async def import_seed(seed_path: Path | None = None) -> dict | None:
     finally:
         src.close()
 
-    async with get_session_factory()() as session:
+    from app.core.database import WritePriority, write_gate
+
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         # 汇率历史：现有 canonical 键集合 → Python 侧差集 → 批量 INSERT（幂等）。
         # 不走 SQL 侧 NOT EXISTS：fx_rate_history 无 (currency_code, rate_date) 之外
         # 的可用索引，23 万行 × 逐行子查询会退化为 O(n²)。
@@ -506,7 +509,9 @@ async def merge_curated_seed(seed_path: Path | None = None) -> dict | None:
     except ValueError:
         stamped = datetime.now()
 
-    async with get_session_factory()() as session:
+    from app.core.database import WritePriority, write_gate
+
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         present = {
             int(a)
             for (a,) in await session.execute(
@@ -606,7 +611,9 @@ async def merge_preset_seed(seed_path: Path | None = None) -> dict | None:
     except ValueError:
         stamped = datetime.now()
 
-    async with get_session_factory()() as session:
+    from app.core.database import WritePriority, write_gate
+
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         present = {
             int(a)
             for (a,) in await session.execute(

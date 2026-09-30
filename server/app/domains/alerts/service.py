@@ -9,7 +9,8 @@ import httpx
 from sqlalchemy import func, or_, select
 
 from app.core.app_info import APP_NAME
-from app.core.database import get_session_factory
+from app.core.database import WritePriority, get_session_factory
+from app.core.database import write_gate
 from app.crawler.config import APPDETAILS_URL
 from app.crawler.utils import get_beijing_time_obj
 from app.domains.account import service as account_service
@@ -112,7 +113,7 @@ async def add_alert(
         raise ValueError(f"未知提醒类型: {target_type}")
     if target_type in ("price", "pct") and target_value is None:
         raise ValueError("该类型需要目标值")
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         alert = PriceAlert(
             appid=appid,
             region=region.upper(),
@@ -139,7 +140,7 @@ async def update_alert(
     target_value 口径同 add_alert：price 类 = 人民币分，pct 类 = 百分数。
     改区不改值——阈值即人民币目标位，换区后继续按同一人民币口径比较。
     """
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         alert = await session.get(PriceAlert, alert_id)
         if alert is None:
             raise ValueError("提醒不存在")
@@ -158,7 +159,7 @@ async def update_alert(
 
 
 async def delete_alert(alert_id: int) -> bool:
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         alert = await session.get(PriceAlert, alert_id)
         if alert is None:
             return False
@@ -182,7 +183,7 @@ async def check_appids(appids: list[int]) -> list[dict]:
     triggered: list[dict] = []
     now = _naive(get_beijing_time_obj())
 
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         alerts = (
             await session.execute(
                 select(PriceAlert).where(
@@ -267,7 +268,7 @@ async def check_appids(appids: list[int]) -> list[dict]:
             f"{APP_NAME} 降价提醒：{len(triggered)} 条触发",
             notify.alert_mail_html(triggered),
         )
-        async with get_session_factory()() as session:
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             await session.execute(
                 AlertEvent.__table__.update().where(
                     AlertEvent.triggered_at == now
@@ -951,7 +952,7 @@ async def send_system_alert(
 
 async def delete_event(event_id: int) -> bool:
     """删除单条触发历史。"""
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         event = await session.get(AlertEvent, event_id)
         if event is None:
             return False
@@ -962,7 +963,7 @@ async def delete_event(event_id: int) -> bool:
 
 async def clear_events() -> int:
     """清空全部触发历史，返回删除条数。"""
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         result = await session.execute(AlertEvent.__table__.delete())
         await session.commit()
         return int(result.rowcount or 0)

@@ -15,7 +15,8 @@ from datetime import datetime
 from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from app.core.database import get_session_factory
+from app.core.database import WritePriority, get_session_factory
+from app.core.database import write_gate
 from app.domains.alerts.notify import send_mail_ex, smtp_config
 from app.domains.crawl import events as events_service
 from app.domains.crawl import service as crawl_service
@@ -102,7 +103,7 @@ async def _create_candidates(
     """事件 → 候选（幂等：同一事实对同一收件人只有一条，重复处理不新增）。"""
     now = datetime.now()
     created = 0
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         for event in events:
             decision = decide(
                 event_type=event["eventType"],
@@ -161,7 +162,7 @@ async def _undelivered() -> list[NotificationCandidate]:
 async def _claim(candidates: list[NotificationCandidate]) -> None:
     """投递前占位：sending + 计数。单写者串行，无需分布式锁。"""
     now = datetime.now()
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         for candidate in candidates:
             row = await session.get(NotificationCandidate, candidate.id)
             if row is None:
@@ -179,7 +180,7 @@ async def _settle(
     error: str | None = None,
 ) -> None:
     now = datetime.now()
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         for candidate in candidates:
             row = await session.get(NotificationCandidate, candidate.id)
             if row is None:

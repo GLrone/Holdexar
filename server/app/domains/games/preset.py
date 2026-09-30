@@ -21,7 +21,8 @@ from datetime import datetime
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from app.core.database import get_session_factory
+from app.core.database import WritePriority, get_session_factory
+from app.core.database import write_gate
 from app.domains.games.models import Game, PresetGame
 
 logger = logging.getLogger(__name__)
@@ -65,7 +66,7 @@ async def record_imported(appids: list[int], source: str) -> int:
     if not clean or not src:
         return 0
 
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         existing = {
             int(a)
             for (a,) in await session.execute(
@@ -98,7 +99,7 @@ async def record_board(appids: list[int], source: str = BOARD_SOURCE) -> int:
     if not clean:
         return 0
 
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         await session.execute(delete(PresetGame).where(PresetGame.source == source))
         names = await _names_of(session, clean)
         now = datetime.now()

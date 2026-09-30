@@ -28,7 +28,7 @@ from pathlib import Path
 from sqlalchemy import text
 from yarl import URL
 
-from app.core.database import get_session_factory, write_slot
+from app.core.database import WritePriority, get_session_factory, write_gate
 from app.crawler.config import CC_LIST
 from app.crawler.db_writer import DbWriter
 from app.crawler.http_client import SteamRateLimitError
@@ -652,18 +652,19 @@ class BrowseDbWriter(DbWriter):
         from app.core.config import get_settings
 
         db_path = Path(get_settings().data_dir) / "holdexar.db"
-        conn = _sq.connect(db_path.as_posix())
-        try:
-            existing = {r[1] for r in conn.execute("PRAGMA table_info(game_price_history)")}
-            for name, ddl in GPH_EXTRA_COLUMNS.items():
-                if name not in existing:
-                    conn.execute(
-                        f"ALTER TABLE game_price_history ADD COLUMN {name} {ddl}"
-                    )
-                    logger.info("[browse] game_price_history += %s", name)
-            conn.commit()
-        finally:
-            conn.close()
+        async with write_gate(WritePriority.BACKGROUND):
+            conn = _sq.connect(db_path.as_posix())
+            try:
+                existing = {r[1] for r in conn.execute("PRAGMA table_info(game_price_history)")}
+                for name, ddl in GPH_EXTRA_COLUMNS.items():
+                    if name not in existing:
+                        conn.execute(
+                            f"ALTER TABLE game_price_history ADD COLUMN {name} {ddl}"
+                        )
+                        logger.info("[browse] game_price_history += %s", name)
+                conn.commit()
+            finally:
+                conn.close()
         type(self)._extras_ready = None
 
     async def attach_browse_extras(
@@ -688,7 +689,7 @@ class BrowseDbWriter(DbWriter):
             for sub_id, opt in extras_by_sub.items()
         ]
         try:
-            async with get_session_factory()() as session:
+            async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
                 await session.execute(
                     text(
                         "UPDATE game_price_history SET discount_end_ts=:e, "
@@ -714,8 +715,8 @@ class BrowseDbWriter(DbWriter):
         if not rows or not await self._extras_columns_present():
             return
         try:
-            async with write_slot():
-                async with get_session_factory()() as session:
+            async with write_gate(WritePriority.BACKGROUND):
+                async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
                     for appid, cc, now_dt, extras_by_sub in rows:
                         params = [
                             {

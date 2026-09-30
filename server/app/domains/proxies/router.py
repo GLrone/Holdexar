@@ -17,17 +17,18 @@ router = APIRouter(prefix="/proxies", tags=["proxies"])
 
 
 async def _auto_promote_after_check(sub_id: int, alive: int) -> None:
+    from app.core.database import WritePriority
+    from app.core.database import write_gate
     """首检健康（可用节点 ≥ 1）即转正——与同步侧的自动准入同一把尺子。
     快照尚未落库（刚导入、同步拍还没轮到）时晋升会失败：账本里的可用数
     已写好，下一拍同步落快照时自动转正，这里只记日志不重试。"""
 
-    from app.core.database import get_session_factory
     from app.domains.proxypool.admission import promote_to_active
 
     if alive < 1:
         return
     try:
-        async with get_session_factory()() as session:
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             result = await promote_to_active(
                 session, subscription_id=sub_id,
                 data_dir=get_settings().data_dir, now=datetime.now(),

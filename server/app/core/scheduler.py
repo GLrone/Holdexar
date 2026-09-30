@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app.core.external_time import local_next_grid, probe_next_grid
+from app.core.database import WritePriority, get_session_factory, write_gate
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +179,7 @@ async def _stamp_uncrawled_missing(appids: list[int]) -> int:
 
     now = get_beijing_time_obj().replace(tzinfo=None)
     wrote = 0
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         # 只挑仍然整行缺失的（回补成功建行的跳过）
         still_missing = (
             await session.execute(
@@ -741,7 +742,7 @@ async def _startup_pool_runtime() -> None:
     try:
         data_dir = get_settings().data_dir
         exe_path = str(_cm.kernel_exe(data_dir))
-        async with get_session_factory()() as session:
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             result = await _bs.ensure_pool_runtime(
                 session, data_dir=data_dir, runtime=_cm.pool_runtime,
                 exe_path=exe_path, now=datetime.now(),
@@ -759,7 +760,7 @@ async def _startup_pool_runtime() -> None:
         if before:
             return  # 库里已有出口身份（重启场景）：不重复探测，交给维护周期刷新
         base, secret = controller_endpoint_of(data_dir)
-        async with get_session_factory()() as session:
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             outcomes = await _sched.run_startup_l1(
                 session, data_dir=data_dir, controller_url=base, secret=secret,
                 now=datetime.now(),
@@ -777,7 +778,7 @@ async def _startup_pool_runtime() -> None:
         from app.domains.proxypool.scheduling import request_rebuild, run_pending_rebuild
 
         request_rebuild()
-        async with get_session_factory()() as session:
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             rebuilt = await run_pending_rebuild(
                 session, data_dir=data_dir, controller_url=base, secret=secret,
                 runtime=_cm.pool_runtime, exe_path=exe_path,
@@ -813,7 +814,7 @@ async def _startup_subscription_sync() -> None:
 
     try:
         data_dir = get_settings().data_dir
-        async with get_session_factory()() as session:
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             before = await _bs.pool_signature(session)
             sync = await _bs.sync_subscriptions(
                 session, data_dir=data_dir, now=datetime.now(), only_auto=True
@@ -832,7 +833,7 @@ async def _startup_subscription_sync() -> None:
             )
             return
         _sched.request_rebuild()
-        async with get_session_factory()() as session:
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             rebuilt = await _sched.run_pending_rebuild(
                 session, data_dir=data_dir, controller_url=base, secret=secret,
                 runtime=_cm.pool_runtime, exe_path=str(_cm.kernel_exe(data_dir)),
@@ -894,7 +895,7 @@ async def _job_proxypool_cycle() -> None:
             (legacy.controller_url, legacy.secret)
             if getattr(legacy, "controller_url", None) else None
         )
-        async with get_session_factory()() as session:
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             result = await _sched.run_proxypool_cycle(
                 session,
                 data_dir=data_dir,
@@ -991,7 +992,7 @@ async def _job_subscription_refresh() -> None:
         from app.domains.proxypool import bootstrap as _bs
 
         data_dir = get_settings().data_dir
-        async with get_session_factory()() as session:
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             triage = await _bs.handle_subscription_refresh(
                 session, data_dir=data_dir, runtime=_cm.pool_runtime,
                 exe_path=str(_cm.kernel_exe(data_dir)), now=datetime.now(),

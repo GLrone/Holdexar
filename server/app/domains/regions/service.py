@@ -15,7 +15,8 @@ import re
 from sqlalchemy import select
 
 from app.crawler.config import CC_LIST
-from app.core.database import get_session_factory
+from app.core.database import WritePriority, get_session_factory
+from app.core.database import write_gate
 from app.crawler.utils import get_beijing_time_obj
 from app.domains.regions.models import CrawlRegion
 from app.domains.settings.models import AppSetting
@@ -44,7 +45,7 @@ async def ensure_seeded() -> None:
     """启动种子：CC_LIST → crawl_regions（新 code 补行、已有行刷新展示名/币种）；
     顺带迁移旧 app_settings 键。"""
     now = get_beijing_time_obj().replace(tzinfo=None)
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         rows = (await session.execute(select(CrawlRegion))).scalars().all()
         existing = {r.code: r for r in rows}
 
@@ -131,7 +132,7 @@ async def set_enabled(codes: list[str] | None) -> None:
         if bad:
             raise ValueError(f"未知区服代码: {', '.join(sorted(bad))}")
     now = get_beijing_time_obj().replace(tzinfo=None)
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         rows = (await session.execute(select(CrawlRegion))).scalars().all()
         for row in rows:
             new_enabled = row.code in wanted

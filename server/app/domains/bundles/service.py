@@ -30,7 +30,8 @@ import re
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_session_factory
+from app.core.database import WritePriority, get_session_factory
+from app.core.database import write_gate
 from app.domains.crawl import freshness as freshness_service
 from app.domains.games.models import Bundle, BundleRegionPrice, Game, GameCurrentPrice
 from app.domains.games.pricing import (
@@ -484,7 +485,7 @@ async def refresh_bundle_sort_cache(
     """
     if session is not None:
         return await _refresh_bundle_sort_cache(bundle_ids, session)
-    async with get_session_factory()() as own:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as own:
         written = await _refresh_bundle_sort_cache(bundle_ids, own)
         await own.commit()
     return written

@@ -22,7 +22,8 @@ from difflib import SequenceMatcher
 
 from sqlalchemy import and_, or_, select, update
 
-from app.core.database import get_session_factory
+from app.core.database import WritePriority, get_session_factory
+from app.core.database import write_gate
 from app.domains.games.models import Game
 
 # 参与聚类的类型：正作才有「系列」语义；DLC/DEMO/MOD 等不聚（否则每款
@@ -419,7 +420,7 @@ async def refresh_series() -> int:
     CPU 聚类放线程池，不占事件循环；写回按主键批量 executemany 单事务
     提交。幂等：结果不变的行零写入。
     """
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         rows = (
             (
                 await session.execute(
