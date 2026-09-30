@@ -21,10 +21,11 @@ from app.core.database import get_engine, get_session_factory, init_db
 from app.domains.proxies.models import ProxySubscription
 from app.domains.proxypool import admission as adm
 from app.domains.proxypool import bootstrap as bs
-from app.domains.proxypool import events, router as pp_router
+from app.core import orchestration as events
+from app.domains.proxypool import router as pp_router
 from app.domains.proxypool import runtime as rt
+from app.core.orchestration import OrchestrationEvent
 from app.domains.proxypool.models import (
-    OrchestrationEvent,
     ProxyNode,
     ProxyNodeSource,
 )
@@ -218,7 +219,7 @@ class _FakeRuntime:
     def stop(self):
         return None
 
-    def start(self, exe_path, config_path):
+    def start(self, exe_path, config_path, inject_lanes=True):
         return {"controllerUrl": "http://127.0.0.1:1"}
 
 

@@ -339,17 +339,7 @@ class SubscriptionSnapshot(Base):
     fetched_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
-class OrchestrationEvent(Base):
-    """编排事件流水：订阅失败、对账拒绝、lane 切换等一律留痕可回溯。"""
-
-    __tablename__ = "orchestration_events"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    ts: Mapped[datetime | None] = mapped_column(DateTime)
-    kind: Mapped[str] = mapped_column(String(50), index=True)
-    level: Mapped[str] = mapped_column(String(8))
-    message: Mapped[str] = mapped_column(Text)
-    payload_json: Mapped[dict | None] = mapped_column(JSON)
+# 编排事件（orchestration_events）已提升为跨域共享层：app/core/orchestration.py
 
 
 class ProxyJobRun(Base):

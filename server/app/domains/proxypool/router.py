@@ -15,7 +15,8 @@ from fastapi import APIRouter, HTTPException, Query
 from app.core.config import get_settings
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
-from app.domains.proxypool import events, exitstats, jobruns
+from app.core import orchestration as events
+from app.domains.proxypool import exitstats, jobruns
 
 router = APIRouter(prefix="/proxypool", tags=["proxypool"])
 
