@@ -473,11 +473,21 @@ async def _settle_cycle(
     跃迁成功的那一次——非法/重复跃迁没有产生新结果，不该让前端白刷一遍列表。
     """
     from app.core.events import bus
+    from app.core.orchestration import KIND_PRICE_CYCLE_FINISHED, LEVEL_ERROR, LEVEL_INFO, record
     from app.domains.crawl import cycle as price_cycle
 
     if not await price_cycle.advance(cycle_id, terminal, error=error):
         return False
     bus.publish("price_cycle.completed", cycleId=cycle_id, status=terminal)
+    # 事实留痕（独立会话，fail-soft）：进程重启后仍能回答「上一轮价格刷新何时、
+    # 以何种终态收敛、失败原因是什么」；SSE 广播只覆盖在线时刻。
+    if cycle_id is not None:
+        await record(
+            KIND_PRICE_CYCLE_FINISHED,
+            error or f"价格刷新轮 #{cycle_id} 收敛：{terminal}",
+            level=LEVEL_ERROR if error else LEVEL_INFO,
+            payload={"cycle_id": cycle_id, "status": terminal},
+        )
     return True
 
 
