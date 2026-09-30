@@ -92,6 +92,46 @@ async def update_smtp_config(
     return await get_smtp_config()
 
 
+def _smtp_login(server: smtplib.SMTP, user: str, password: str) -> None:
+    """单次 AUTH 登录：取服务器通告机制中优先级最高的一个（CRAM-MD5 > PLAIN
+    > LOGIN），被拒时把服务器返回的拒绝码原样上抛。
+
+    smtplib.login 的逐机制循环共用同一条连接：首个 AUTH 被 535 拒绝后继续
+    在这条连接上换机制重试，部分 SMTP 服务（QQ 邮箱）会直接断开连接，
+    循环只能以 SMTPServerDisconnected 收场，服务器 535 里的真实拒绝原因
+    随断线丢失。单次 AUTH 让拒绝原因直达调用方；凭据被拒时换任何机制
+    都不会成功，跳过重试没有代价。
+    """
+    server.ehlo_or_helo_if_needed()
+    if not server.has_extn("auth"):
+        raise smtplib.SMTPNotSupportedError("SMTP AUTH extension not supported by server.")
+    advertised = server.esmtp_features.get("auth", "").split()
+    mechanisms = [m for m in ("CRAM-MD5", "PLAIN", "LOGIN") if m in advertised]
+    if not mechanisms:
+        raise smtplib.SMTPException("No suitable authentication method found.")
+    # auth_plain / auth_login / auth_cram_md5 都从 server.user / server.password 取凭据
+    server.user, server.password = user, password
+    # 只发一次 AUTH：取优先级最高的可用机制。auth() 非 235/503 即抛
+    # SMTPAuthenticationError，拒绝原因直达调用方；返回即成功。被拒后在
+    # 同一条连接上换机制重试会被部分服务商直接断线，原因随断线丢失。
+    mechanism = mechanisms[0]
+    server.auth(mechanism, getattr(server, "auth_" + mechanism.lower().replace("-", "_")))
+
+
+def _smtp_auth_reason(e: smtplib.SMTPAuthenticationError) -> str:
+    """AUTH 被拒 → 用户可读原因 + 可执行下一步（服务器原文附在末尾备查）。"""
+    detail = (
+        e.smtp_error.decode("utf-8", errors="replace")
+        if isinstance(e.smtp_error, bytes)
+        else str(e.smtp_error)
+    )
+    return (
+        f"邮箱拒绝登录（{e.smtp_code}）：请核对授权码是否为当前有效值，"
+        "并确认邮箱设置里已开启 IMAP/SMTP 服务；若刚连续失败过，几分钟后再试。"
+        f"（服务器回复：{detail}）"
+    )
+
+
 async def send_mail_ex(subject: str, html_body: str) -> tuple[bool, str | None]:
     """发一封邮件，返回 (是否成功, 失败原因)。
 
@@ -109,7 +149,7 @@ async def send_mail_ex(subject: str, html_body: str) -> tuple[bool, str | None]:
             server = smtplib.SMTP(cfg["host"], cfg["port"], timeout=20)
             server.starttls()
         with server:
-            server.login(cfg["user"], cfg["password"])
+            _smtp_login(server, cfg["user"], cfg["password"])
             message = MIMEText(html_body, "html", "utf-8")
             message["Subject"] = Header(subject, "utf-8")
             message["From"] = formataddr((APP_NAME, cfg["user"]))
@@ -117,6 +157,10 @@ async def send_mail_ex(subject: str, html_body: str) -> tuple[bool, str | None]:
             server.sendmail(cfg["user"], [cfg["to_addr"]], message.as_string())
         logger.info("邮件已发送: %s", subject)
         return True, None
+    except smtplib.SMTPAuthenticationError as e:
+        reason = f"SMTPAuthenticationError: {_smtp_auth_reason(e)}"
+        logger.error("邮件认证被拒: %s", reason)
+        return False, reason
     except Exception as e:  # noqa: BLE001
         logger.error("邮件发送失败: %s", e)
         # 返回里带上异常类型名：错误文本会被系统语言本地化（中文 Windows 的
@@ -962,7 +1006,7 @@ async def send_test_mail(
             server = smtplib.SMTP(host, port, timeout=20)
             server.starttls()
         with server:
-            server.login(user, password)
+            _smtp_login(server, user, password)
             message = MIMEText(html, "html", "utf-8")
             message["Subject"] = Header(subject, "utf-8")
             message["From"] = formataddr((APP_NAME, user))
@@ -972,6 +1016,9 @@ async def send_test_mail(
         return {"ok": True}
     except ValueError:
         raise
+    except smtplib.SMTPAuthenticationError as e:
+        logger.warning("连通性测试认证被拒: %s %s", e.smtp_code, e.smtp_error)
+        raise ValueError(_smtp_auth_reason(e)) from e
     except Exception as e:  # noqa: BLE001 — SMTP 错误原文回传前端
         logger.warning("连通性测试失败: %s", e)
         raise ValueError(f"连接失败：{e}") from e

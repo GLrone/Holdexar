@@ -422,6 +422,9 @@ async def test_retryable_classification(db):
     # 中文 Windows 会把 socket 错误本地化，必须也能认出来
     assert notification_service.retryable("ConnectionRefusedError: [WinError 10061] 由于目标计算机积极拒绝，无法连接。") is True
     assert notification_service.retryable("SMTPAuthenticationError: 535 Authentication failed") is False
+    # send_mail_ex 对认证拒绝的新格式 reason（类型名 + 535）必须落在永久失败
+    assert notification_service.retryable(
+        "SMTPAuthenticationError: 邮箱拒绝登录（535）：请核对授权码（服务器回复：Login fail）") is False
     assert notification_service.retryable("SMTPSenderRefused: 553 mailbox unavailable") is False
     assert notification_service.retryable("SMTP 未配置") is False
     assert notification_service.retryable(None) is False
