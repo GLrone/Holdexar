@@ -16,6 +16,7 @@ router = APIRouter(prefix="/pilot", tags=["pilot"])
 async def _config_payload() -> PilotConfigPayload:
     cfg = await pilot_config.load_config()
     return PilotConfigPayload(
+        protocol=cfg["protocol"],
         enabled=cfg["enabled"],
         base_url=cfg["base_url"],
         model=cfg["model"],

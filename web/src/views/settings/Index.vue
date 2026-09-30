@@ -28,7 +28,7 @@ import { walletSyncOk, walletSyncedAt } from '@/lib/walletSync'
 import CurrencyFlag from '@/components/CurrencyFlag.vue'
 import RegionFlag from '@/components/RegionFlag.vue'
 import {
-  HlButton, HlCheckbox, HlDialog, HlIcon, HlImg, HlInput, HlSkeleton, HlSwitch, message,
+  HlButton, HlCheckbox, HlDialog, HlIcon, HlImg, HlInput, HlSelect, HlSkeleton, HlSwitch, message,
 } from '@/components/ui'
 
 const { t } = useI18n()
@@ -57,18 +57,29 @@ const hasApiKey = ref(false)
 
 /* ── 领航员（pilot）：AI 解读服务配置（key 密文落库，留空不改） ── */
 const pilotEnabled = ref(false)
+const pilotProtocol = ref('openai')
 const pilotBaseUrl = ref('')
 const pilotModel = ref('')
 const pilotApiKeyInput = ref('')
 const pilotHasApiKey = ref(false)
 const pilotCapText = ref('500000')
 const pilotUsage = ref(0)
+/* 协议选项存 value 不存文案（切语言跟随）；地址占位随协议变化 */
+const pilotProtocolOptions = computed(() => [
+  { value: 'openai', label: t('pilot.proto.openai') },
+  { value: 'anthropic', label: t('pilot.proto.anthropic') },
+  { value: 'gemini', label: t('pilot.proto.gemini') },
+  { value: 'ollama', label: t('pilot.proto.ollama') },
+])
+const pilotBaseUrlPlaceholder = computed(() =>
+  t(`pilot.proto.base_${pilotProtocol.value}` as MessageKey))
 const pilotSaving = ref(false)
 
 async function loadPilot() {
   try {
     const cfg = await pilotApi.getConfig()
     pilotEnabled.value = cfg.enabled
+    pilotProtocol.value = cfg.protocol || 'openai'
     pilotBaseUrl.value = cfg.base_url
     pilotModel.value = cfg.model
     pilotHasApiKey.value = cfg.has_api_key
@@ -84,6 +95,7 @@ async function savePilot() {
   try {
     const key = pilotApiKeyInput.value.trim()
     const cfg = await pilotApi.updateConfig({
+      protocol: pilotProtocol.value,
       enabled: pilotEnabled.value,
       base_url: pilotBaseUrl.value.trim(),
       model: pilotModel.value.trim(),
@@ -1132,9 +1144,16 @@ onUnmounted(stopLoginPolling)
             <HlSwitch v-model="pilotEnabled" accent :label="t('pilot.settings.enabled')" />
           </div>
           <div class="settings-row__line">
+            <HlSelect
+              v-model="pilotProtocol"
+              :options="pilotProtocolOptions"
+              style="max-width: 420px"
+            />
+          </div>
+          <div class="settings-row__line">
             <HlInput
               v-model="pilotBaseUrl"
-              :placeholder="t('pilot.settings.base_url')"
+              :placeholder="pilotBaseUrlPlaceholder"
               style="max-width: 420px"
             />
           </div>

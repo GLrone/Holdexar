@@ -6,9 +6,11 @@ import pytest
 from app.domains.pilot import config as pilot_config
 from app.domains.pilot import intent as pilot_intent
 from app.domains.pilot import service
+from app.domains.pilot import llm as pilot_llm
 from app.domains.pilot.llm import PilotLlmError
 
 _CFG = {
+    "protocol": "openai",
     "enabled": True,
     "base_url": "http://127.0.0.1:9/v1",
     "model": "test-model",
@@ -264,3 +266,78 @@ class TestFlywheel:
         assert entry["question"] == "今天天气怎么样"
         assert entry["intent"] == pilot_intent.CHAT
         assert entry["mode"] == "fallback"
+
+
+class TestProtocolAdapters:
+    """各协议流解析的罐头帧单测（不触网）。"""
+
+    async def _collect(self, gen):
+        return [e async for e in gen]
+
+    @pytest.mark.asyncio
+    async def test_anthropic_parse(self):
+        frames = [
+            "data: " + json.dumps({"type": "message_start", "message": {"usage": {"input_tokens": 10}}}),
+            "data: " + json.dumps({"type": "content_block_delta", "index": 0,
+                                   "delta": {"type": "thinking_delta", "thinking": "思考"}}),
+            "data: " + json.dumps({"type": "content_block_delta", "index": 1,
+                                   "delta": {"type": "text_delta", "text": "答案"}}),
+            "data: " + json.dumps({"type": "content_block_start", "index": 2,
+                                   "content_block": {"type": "tool_use", "id": "tu1", "name": "search_games"}}),
+            "data: " + json.dumps({"type": "content_block_delta", "index": 2,
+                                   "delta": {"type": "input_json_delta", "partial_json": "{\"q\": \"x\"}"}}),
+            "data: " + json.dumps({"type": "message_delta", "delta": {"stop_reason": "tool_use"},
+                                   "usage": {"output_tokens": 5}}),
+        ]
+
+        async def lines():
+            for f in frames:
+                yield f
+
+        events = [e async for e in pilot_llm._anthropic_parse(lines())]
+        kinds = [k for k, _ in events]
+        assert kinds[0] == "thinking" and kinds[1] == "answer"
+        tool = [d for k, d in events if k == "tool_calls"][0]
+        assert tool[0]["name"] == "search_games" and tool[0]["arguments"] == {"q": "x"}
+        assert ("usage", (10, 5)) in events
+
+    @pytest.mark.asyncio
+    async def test_gemini_parse(self):
+        frame = "data: " + json.dumps({"candidates": [{"content": {"parts": [
+            {"text": "思考", "thought": True},
+            {"functionCall": {"name": "get_price_briefing", "args": {"appid": 1}}},
+        ]}}], "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5}})
+
+        async def lines():
+            yield frame
+
+        events = [e async for e in pilot_llm._gemini_parse(lines())]
+        kinds = [k for k, _ in events]
+        assert kinds[0] == "thinking"
+        tool = [d for k, d in events if k == "tool_calls"][0]
+        assert tool[0]["name"] == "get_price_briefing" and tool[0]["arguments"] == {"appid": 1}
+        assert ("usage", (10, 5)) in events
+
+    @pytest.mark.asyncio
+    async def test_ollama_parse(self):
+        lines = [
+            json.dumps({"message": {"thinking": "想"}}),
+            json.dumps({"message": {"tool_calls": [{"function": {"name": "add_follow", "arguments": {"appid": 3}}}]}},
+                       ensure_ascii=False),
+            json.dumps({"done": True, "prompt_eval_count": 7, "eval_count": 3}),
+        ]
+
+        async def it():
+            for l in lines:
+                yield l
+
+        events = [e async for e in pilot_llm._ollama_parse(it())]
+        kinds = [k for k, _ in events]
+        assert kinds[0] == "thinking"
+        tool = [d for k, d in events if k == "tool_calls"][0]
+        assert tool[0]["name"] == "add_follow" and tool[0]["arguments"] == {"appid": 3}
+        assert ("usage", (7, 3)) in events
+
+    def test_effective_base_url(self):
+        assert pilot_llm.effective_base_url("anthropic", "") == "https://api.anthropic.com"
+        assert pilot_llm.effective_base_url("openai", "https://api.deepseek.com/v1") == "https://api.deepseek.com/v1"

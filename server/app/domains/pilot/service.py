@@ -182,7 +182,8 @@ async def _agent_stream(question: str, appid: int | None, session: dict, cfg: di
         round_answer: list[str] = []
         tool_calls = None
         async for kind, delta in pilot_llm.chat_stream(
-            base_url=cfg["base_url"],
+            protocol=cfg["protocol"],
+            base_url=pilot_llm.effective_base_url(cfg["protocol"], cfg["base_url"]),
             api_key=cfg["api_key"],
             model=cfg["model"],
             messages=messages,
@@ -332,8 +333,11 @@ async def ask_stream(question: str, appid: int | None = None, session_id: str | 
 
     if result is None:
         result = _empty("none", "llm_failed", None)
-    _log_decision({"ts": get_beijing_time_obj().isoformat(timespec="seconds"),
-                   "question": q, "intent": intent, "mode": "agent",
-                   "source": result["source"], "reason": result["reason"],
-                   "tools": result.get("tools") or [], "cached": False})
+    _log_decision({
+        "ts": get_beijing_time_obj().isoformat(timespec="seconds"),
+        "question": q, "intent": intent, "mode": "agent",
+        "protocol": cfg["protocol"],
+        "source": result["source"], "reason": result["reason"],
+        "tools": result.get("tools") or [], "cached": False,
+    })
     yield {"type": "done", **result}
