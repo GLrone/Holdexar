@@ -1,0 +1,134 @@
+"""pilot LLM 客户端：OpenAI 兼容 chat/completions 调用（非流式 + 流式双形态）。
+
+provider 无关：base_url + api_key + model 三项即可接入任何 OpenAI 兼容
+服务。流式形态区分 thinking / answer 双通道——reasoning_content 增量进
+thinking 通道（DeepSeek 系推理模型），content 增量进 answer 通道，普通
+模型只有 answer 通道。网络/协议异常统一收敛为 PilotLlmError，由服务层
+转用户语言提示，原始原因只进日志。
+"""
+from __future__ import annotations
+
+import json
+import logging
+from urllib.parse import urlsplit
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+_TIMEOUT_S = 45.0
+_MAX_OUTPUT_TOKENS = 700
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _client(base_url: str) -> httpx.AsyncClient:
+    """回环地址（自建/本地网关）绕过系统代理——httpx trust_env 会把环回
+    请求也交给代理，代理对回环返回 502；外部地址照常跟随环境代理。"""
+    return httpx.AsyncClient(timeout=_TIMEOUT_S, trust_env=not _is_loopback(base_url))
+
+
+class PilotLlmError(RuntimeError):
+    """LLM 调用失败（网络 / 非 2xx / 响应形态不符）。"""
+
+
+def _is_loopback(base_url: str) -> bool:
+    return urlsplit(base_url).hostname in _LOOPBACK_HOSTS
+
+
+def _payload(base_url: str) -> str:
+    return base_url.rstrip("/") + "/chat/completions"
+
+
+def _body(model: str, system: str, user: str, *, stream: bool) -> dict:
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.4,
+        "max_tokens": _MAX_OUTPUT_TOKENS,
+        "stream": stream,
+    }
+    if stream:
+        # 思维链 token 计入用量台账的前提：让 provider 在流末尾回传 usage
+        body["stream_options"] = {"include_usage": True}
+    return body
+
+
+async def chat_complete(
+    *, base_url: str, api_key: str, model: str, system: str, user: str
+) -> tuple[str, int, int]:
+    """单次补全。返回 (回答文本, 输入 tokens, 输出 tokens)。"""
+    try:
+        async with _client(base_url) as client:
+            resp = await client.post(
+                _payload(base_url),
+                json=_body(model, system, user, stream=False),
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            resp.raise_for_status()
+            body = resp.json()
+        text = body["choices"][0]["message"]["content"]
+        usage = body.get("usage") or {}
+        return (
+            str(text).strip(),
+            int(usage.get("prompt_tokens") or 0),
+            int(usage.get("completion_tokens") or 0),
+        )
+    except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as e:
+        logger.warning("pilot LLM 调用失败: %r", e)
+        raise PilotLlmError(str(e)) from e
+
+
+async def chat_complete_stream(
+    *, base_url: str, api_key: str, model: str, system: str, user: str
+):
+    """流式补全。逐段产出 ("thinking" | "answer", 文本增量)，末尾产出
+    ("usage", (输入 tokens, 输出 tokens))——provider 不回 usage 时省略该段，
+    用量台账当次少记（宁少勿多）。"""
+    try:
+        async with _client(base_url) as client:
+            async with client.stream(
+                "POST",
+                _payload(base_url),
+                json=_body(model, system, user, stream=True),
+                headers={"Authorization": f"Bearer {api_key}"},
+            ) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[len("data:"):].strip()
+                    if not data:
+                        continue
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    usage = chunk.get("usage")
+                    if usage:
+                        yield (
+                            "usage",
+                            (
+                                int(usage.get("prompt_tokens") or 0),
+                                int(usage.get("completion_tokens") or 0),
+                            ),
+                        )
+                        continue
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+                    think = delta.get("reasoning_content")
+                    if think:
+                        yield ("thinking", str(think))
+                    content = delta.get("content")
+                    if content:
+                        yield ("answer", str(content))
+    except (httpx.HTTPError, TypeError, ValueError) as e:
+        logger.warning("pilot LLM 流式调用失败: %r", e)
+        raise PilotLlmError(str(e)) from e
