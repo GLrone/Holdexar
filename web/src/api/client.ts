@@ -235,6 +235,117 @@ export const settingsApi = {
     request<FetchSettingsPayload>('PUT', '/settings/fetch', payload),
 }
 
+// ─── pilot（领航员：比价助手问答）────────────────────────
+
+export interface PilotConfigPayload {
+  enabled: boolean
+  base_url: string
+  model: string
+  has_api_key: boolean
+  monthly_cap: number
+  usage_month: number
+}
+
+/** 事实摘要（cnyFen 单位为分）：kind=price 单游戏价格事实 / kind=games 候选列表 */
+export interface PilotPriceFacts {
+  kind: 'price'
+  appid: number
+  name: string | null
+  positiveRate: number | null
+  reviewCount: number | null
+  cn: { cnyFen: number | null; discount: number } | null
+  lowest: { cnyFen: number; snapshotAt: string | null } | null
+  year: { minFen: number; maxFen: number; medianFen: number; count: number } | null
+}
+
+export interface PilotGameFactsItem {
+  appid: number
+  name: string | null
+  cnyFen: number | null
+  discount: number | null
+  positiveRate: number | null
+  reviewCount: number | null
+}
+
+export interface PilotGameFacts {
+  kind: 'games'
+  items: PilotGameFactsItem[]
+}
+
+export type PilotFacts = PilotPriceFacts | PilotGameFacts
+
+export interface PilotAskResponse {
+  /** LLM 回答原文；facts / guide / none 形态下为空串，展示层按 source 渲染 */
+  answer: string
+  source: 'llm' | 'facts' | 'guide' | 'none'
+  /** 回退机器码（llm_off / cap_reached / llm_failed / no_data），用户语言由前端翻 */
+  reason: string | null
+  facts: PilotFacts | null
+  cached: boolean
+}
+
+export const pilotApi = {
+  getConfig: () => request<PilotConfigPayload>('GET', '/pilot/config'),
+  updateConfig: (payload: {
+    enabled?: boolean
+    base_url?: string
+    model?: string
+    api_key?: string
+    monthly_cap?: number
+  }) => request<PilotConfigPayload>('PUT', '/pilot/config', payload),
+  ask: (question: string, appid?: number) =>
+    request<PilotAskResponse>('POST', '/pilot/ask', { question, appid }),
+}
+
+export interface PilotStreamEvent {
+  type: 'thinking' | 'answer' | 'facts' | 'done' | 'error'
+  delta?: string
+  facts?: PilotFacts | null
+  answer?: string
+  thinking?: string | null
+  source?: PilotAskResponse['source']
+  reason?: string | null
+  cached?: boolean
+}
+
+/** 流式问答：SSE 帧解析（data: JSON / data: [DONE]），事件逐个回调。
+ *  thinking 通道 = 推理模型思维链增量；普通模型只有 answer 通道。 */
+export async function askPilotStream(
+  question: string,
+  appid: number | undefined,
+  onEvent: (e: PilotStreamEvent) => void,
+): Promise<void> {
+  const resp = await fetch(`${BASE}/pilot/ask/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question, appid }),
+  })
+  if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`)
+  const reader = resp.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    let idx: number
+    while ((idx = buf.indexOf('\n\n')) >= 0) {
+      const raw = buf.slice(0, idx)
+      buf = buf.slice(idx + 2)
+      for (const line of raw.split('\n')) {
+        if (!line.startsWith('data:')) continue
+        const data = line.slice(5).trim()
+        if (!data || data === '[DONE]') continue
+        try {
+          onEvent(JSON.parse(data) as PilotStreamEvent)
+        } catch {
+          /* 坏帧跳过，不影响后续 */
+        }
+      }
+    }
+  }
+}
+
 // ─── account（Steam 账户绑定 / 钱包余额）────────────────────
 
 export interface WalletSnapshot {
@@ -245,7 +356,10 @@ export interface WalletSnapshot {
   currency_id: number
   region_code: string
   country_code: string
+  /** 最近一次尝试时刻（成功失败都写） */
   checked_at: string | null
+  /** 上次成功获取余额的时刻（失败改写时保留；显示层缓存窗判定用） */
+  ok_at?: string | null
   check_ok: boolean
   error: string
 }
@@ -604,12 +718,13 @@ export interface GameListItem {
   removedAt: string | null
   /** smart 排序评分（0~1 加权和；公式见后端 scoring.py） */
   smartScore?: number
-  /** smart 四因子拆解（实验池对照展示用；0~1 归一值） */
+  /** smart 五因子拆解（实验池对照展示用；0~1 归一值） */
   smartFactors?: {
     save: number
     quality: number
     timing: number
-    familiarity: number
+    steamBoard: number
+    series: number
   }
 }
 
@@ -1185,7 +1300,14 @@ export const crawlApi = {
     request<{ stopped: boolean }>('POST', '/crawl/stop', jobId ? { jobId } : {}),
   jobs: (limit = 20) => request<CrawlJob[]>('GET', `/crawl/jobs${toQuery({ limit })}`),
   active: () =>
-    request<{ activeJobId: number | null; busy?: boolean }>('GET', '/crawl/active'),
+    request<{
+      activeJobId: number | null
+      busy?: boolean
+      /** 池体检（整池串行探测）进行中——不是任务，任务列表看不到 */
+      maintenance?: boolean
+      /** 正在限流窗口外排队的请求数（>0 = 任务启动后请求还没放行） */
+      throttled?: number
+    }>('GET', '/crawl/active'),
   /**
    * 启动爬取。cooldown = missing/repair 补抓冷却覆盖（分钟），0 = 立即补，
    * 不传 = 通道默认（补抓失败地区入口传 0，其余调用方不传）。

@@ -74,6 +74,8 @@ import fetchPage from './fetch'
 import island from './island'
 // ── Steam event calendar (views/events/Index.vue + SteamEventCountdown card) ──
 import steamEvents from './steamEvents'
+// ── Pilot assistant (components/business/HlPilotDrawer.vue + settings Pilot card) ──
+import pilot from './pilot'
 
 const messages: Partial<Record<MessageKey, string>> = {
   ...common,
@@ -119,6 +121,7 @@ const messages: Partial<Record<MessageKey, string>> = {
   ...fetchPage,
   ...island,
   ...steamEvents,
+  ...pilot,
 }
 
 export default messages

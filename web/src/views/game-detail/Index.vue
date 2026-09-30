@@ -32,6 +32,7 @@ import HlEmpty from '@/components/ui/HlEmpty.vue'
 import HlImg from '@/components/ui/HlImg.vue'
 import HlSkeleton from '@/components/ui/HlSkeleton.vue'
 import PriceTrendChart from '@/components/business/PriceTrendChart.vue'
+import HlPilotDrawer from '@/components/business/HlPilotDrawer.vue'
 
 /** 价格奖牌（金/银/铜 = 非 CN 最低价前三，与卡片 GPW 同一规则） */
 const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/assets/trophy_copper.png']
@@ -58,6 +59,12 @@ const { t } = useI18n()
 const appid = computed(() => Number(route.params.appid))
 
 const detail = ref<GameDetail | null>(null)
+
+/* 领航台：领航员问答入口（价格区「问领航员」按钮） */
+const pilotOpen = ref(false)
+const pilotGame = computed(() =>
+  detail.value ? { appid: detail.value.appid, name: detail.value.name } : null,
+)
 const loading = ref(true)
 const errorMsg = ref('')
 
@@ -687,6 +694,9 @@ onMounted(load)
                   :options="versionOptions"
                   class="gd-price-version"
                 />
+                <HlButton variant="text" class="gd-pilot-btn" @click="pilotOpen = true">
+                  {{ t('pilot.ask.entry') }}
+                </HlButton>
                 <div v-if="medalItems.length" class="gd-medal-row">
                   <span class="gd-medal-label">{{ t('gameDetail.price.top3') }}</span>
                   <span v-for="m in medalItems" :key="m.code" class="gd-medal-item">
@@ -917,6 +927,7 @@ onMounted(load)
         </div>
       </div>
     </template>
+    <HlPilotDrawer v-model="pilotOpen" :game="pilotGame" />
   </section>
 </template>
 
