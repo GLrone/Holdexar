@@ -1,15 +1,15 @@
-"""pilot 服务：领航台问答编排。
+"""pilot 服务：领航台问答编排（agent 循环内核）。
 
-流程：确定性意图路由 → 只读工具取事实 → LLM 解读 → 回答。LLM 未配置、
-调用失败或月度用量超限时回退事实摘要（source=facts），回退原因以机器码
-（reason）下发、由前端翻成用户语言；提示本身（answer）只来自 LLM 或为
-空，不在这里拼用户文案。
+调度机理（agent 循环模型）：模型是驾驶员——每轮把会话
+消息 + 工具表交给 LLM 流式输出（thinking / answer / tool_calls），工具
+由服务层执行后把结果回灌进消息，循环直到模型给出终答或步数上限。
 
-提供两种消费形态，共用同一前置（_prepare）与缓存：
-- ask()          非流式，一次返回完整结果；
-- ask_stream()   流式，thinking / answer 双通道增量 + facts + done 事件
-                 （thinking 通道承载推理模型的思维链，普通模型无此通道）。
-"""
+风险门（确定性，与模型无关）：工具白名单只有加关注 / 设提醒两个单对象
+可逆动作；问句命中守卫词（批量 / 删除 / 停用类）时写工具拒绝执行。
+
+降级路径：LLM 未配置 / 超限 / 失败时回退确定性事实摘要（source=facts）
+与指引（source=guide），回退原因以机器码（reason）下发、前端翻成用户
+语言。罗盘数据飞轮：每轮问答追加 decisions.jsonl（shadow）。"""
 from __future__ import annotations
 
 import json
@@ -23,79 +23,22 @@ from app.domains.pilot import intent as pilot_intent
 from app.domains.pilot import llm as pilot_llm
 from app.domains.pilot import tools as pilot_tools
 
-_CACHE_TTL_S = 600
-_CACHE_MAX = 200
-_cache: dict[tuple, tuple[dict, float]] = {}
+_MAX_STEPS = 6
+_SESSION_TTL_S = 1800
+_SESSION_MAX = 50
+_SESSION_MAX_TURNS = 6
+_sessions: dict[str, dict] = {}
 
 _SYSTEM_PROMPT = (
     "你是「领航员」，Holdexar 的游戏比价助手。回答规则：\n"
-    "- 只依据提供的事实作答，不编造价格、日期或评价数据；\n"
+    "- 优先调用工具获取真实数据（检索、价格事实、推荐、加关注、设提醒），"
+    "不编造价格、日期或评价数据；\n"
+    "- 用户要求关注 / 设提醒时，先确认是哪一款（必要时用检索工具），再调用"
+    "对应工具执行，执行后用一句话确认结果；\n"
     "- 事实不足时直说不足，并建议用户在应用内查看对应页面；\n"
     "- 用简体中文，简洁分点，先结论后依据；\n"
     "- 涉及购买建议时，说明当前价与史低、近一年区间的关系作为依据。"
 )
-
-
-def _cache_get(key: tuple) -> dict | None:
-    hit = _cache.get(key)
-    if hit is None:
-        return None
-    resp, ts = hit
-    if time.monotonic() - ts > _CACHE_TTL_S:
-        _cache.pop(key, None)
-        return None
-    return resp
-
-
-def _cache_put(key: tuple, resp: dict) -> None:
-    if len(_cache) >= _CACHE_MAX:
-        oldest = min(_cache, key=lambda k: _cache[k][1])
-        _cache.pop(oldest, None)
-    _cache[key] = (resp, time.monotonic())
-
-
-def _user_message(question: str, facts: dict | None) -> str:
-    if facts is None:
-        return question
-    return (
-        "事实数据（JSON，cnyFen 单位为分）：\n"
-        + json.dumps(facts, ensure_ascii=False, separators=(",", ":"))
-        + "\n\n用户问题："
-        + question
-    )
-
-
-# ── 领航台会话（P1.5 循环）：进程内轻状态，仅支撑追问与指代解析，
-#    进程重启即失效——会话不承载任何需要持久的业务数据。
-
-_SESSION_TTL_S = 1800
-_SESSION_MAX = 50
-_sessions: dict[str, dict] = {}
-
-_ORDINAL_RE = re.compile(r"第\s*([一二三四五1-9])\s*个?")
-_ORDINAL_CN = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5}
-_PRONOUNS = ("它", "这个游戏", "这游戏", "该游戏", "此游戏", "这款")
-
-
-def _ordinal_index(text: str) -> int | None:
-    m = _ORDINAL_RE.search(text or "")
-    if not m:
-        return None
-    ch = m.group(1)
-    return _ORDINAL_CN.get(ch) or (int(ch) if ch.isdigit() else None)
-
-
-def _session_get(session_id: str | None) -> dict | None:
-    if not session_id:
-        return None
-    st = _sessions.get(session_id)
-    if st is None:
-        return None
-    if time.monotonic() - st["ts"] > _SESSION_TTL_S:
-        _sessions.pop(session_id, None)
-        return None
-    st["ts"] = time.monotonic()
-    return st
 
 
 def _session_get_or_create(session_id: str) -> dict:
@@ -104,46 +47,24 @@ def _session_get_or_create(session_id: str) -> dict:
         if len(_sessions) >= _SESSION_MAX:
             oldest = min(_sessions, key=lambda k: _sessions[k]["ts"])
             _sessions.pop(oldest, None)
-        st = {"ts": time.monotonic()}
+        st = {"ts": time.monotonic(), "turns": [], "last_game": None}
         _sessions[session_id] = st
     st["ts"] = time.monotonic()
     return st
 
 
-def _session_store_candidates(session: dict | None, items: list[dict], action: str) -> None:
-    if not session or not items:
-        return
-    session["candidates"] = items
-    session["pending_action"] = action
+def _session_history(session: dict | None) -> list[dict]:
+    """会话消息历史：按轮取最近若干轮，轮内消息保持 assistant/tool 配对完整。"""
+    if not session:
+        return []
+    turns = session.get("turns") or []
+    return [m for t in turns[-_SESSION_MAX_TURNS:] for m in t]
 
 
 def _session_store_game(session: dict | None, appid: int, name: str | None) -> None:
     if not session or not appid:
         return
     session["last_game"] = {"appid": appid, "name": name}
-
-
-def _session_resolve_target(question: str, session: dict | None, action: str) -> dict | None:
-    """会话解析：待定候选的序数/名称命中，或指代最近一次聊到的游戏。
-
-    只在常规检索零命中时作为回退调用；返回 {appid, name} 或 None。
-    """
-    if session is None:
-        return None
-    cands = session.get("candidates") or []
-    if cands and session.get("pending_action") == action:
-        idx = _ordinal_index(question)
-        if idx and 1 <= idx <= len(cands):
-            return cands[idx - 1]
-        for c in cands:
-            name = c.get("name") or ""
-            if name and len(name) >= 2 and name in question:
-                return c
-    if any(p in (question or "") for p in _PRONOUNS):
-        last = session.get("last_game")
-        if last:
-            return {"appid": last["appid"], "name": last.get("name")}
-    return None
 
 
 def _log_decision(entry: dict) -> None:
@@ -161,31 +82,44 @@ def _log_decision(entry: dict) -> None:
         pass
 
 
-async def _prepare(question: str, appid: int | None, session: dict | None) -> tuple[str, dict | None, str]:
-    """共享前置：意图路由 + 工具取事实。
+def _empty(source: str, reason: str | None, facts: dict | None) -> dict:
+    return {"answer": "", "thinking": None, "source": source, "reason": reason, "facts": facts}
 
-    返回 (stage, payload, intent)：stage ∈ guide / facts / none / chat /
-    write；facts 形态下 payload 为事实 dict，write 形态下为
-    {"action": 动作名}，其余为 None。
-    """
-    intent = pilot_intent.route(question)
-    if session and not pilot_intent.is_guarded(question):
-        # 待定动作接管：上一轮刚追问过候选，本轮是序数/名称应答 → 直接执行
-        pending = session.get("pending_action")
-        if pending and session.get("candidates") and (
-            _ordinal_index(question)
-            or any(
-                (c.get("name") and len(c["name"]) >= 2 and c["name"] in question)
-                for c in session["candidates"]
-            )
-        ):
-            return "write", {"action": pending}, intent
+
+async def _fallback_deterministic(
+    question: str, appid: int | None, session: dict | None, intent: str
+) -> dict:
+    """无 LLM 时的确定性回退：指引 / 价格与推荐事实 / 通知无数据。
+
+    问句解析逻辑与 agent 路径一致（守卫词、阈值、对象解析），仅不做模型
+    叙述——回答文本始终由前端模板渲染，后端不拼用户文案。"""
     if intent == pilot_intent.HOW_TO:
-        return "guide", None, intent
-    if intent == pilot_intent.ADD_MONITOR:
-        return "write", {"action": "monitor_add"}, intent
+        return _empty("guide", None, None)
     if intent == pilot_intent.CREATE_ALERT:
-        return "write", {"action": "alert_add"}, intent
+        title = pilot_tools.extract_title(question)
+        matches = await pilot_tools.search_games(question, query=title) if title \
+            else await pilot_tools.search_games(question)
+        if len(matches) == 1:
+            target_type, value = pilot_tools.extract_alert(question)
+            if target_type == "price" and value is None:
+                return _empty("guide", None, None)
+            result = await pilot_tools.alert_add(
+                matches[0]["appid"], target_type=target_type, target_value_fen=value
+            )
+            return _empty("facts", None, {"kind": "action", **result})
+        if matches:
+            return _empty("facts", "need_target", {"kind": "games", "items": matches})
+        return _empty("none", "no_data", None)
+    if intent == pilot_intent.ADD_MONITOR:
+        title = pilot_tools.extract_title(question)
+        matches = await pilot_tools.search_games(question, query=title) if title \
+            else await pilot_tools.search_games(question)
+        if len(matches) == 1:
+            result = await pilot_tools.monitor_add(matches[0]["appid"])
+            return _empty("facts", None, {"kind": "action", **result})
+        if matches:
+            return _empty("facts", "need_target", {"kind": "games", "items": matches})
+        return _empty("none", "no_data", None)
     if intent == pilot_intent.PRICE_ANALYSIS:
         target = appid
         if target is None:
@@ -193,160 +127,166 @@ async def _prepare(question: str, appid: int | None, session: dict | None) -> tu
             if len(matches) == 1:
                 target = matches[0]["appid"]
             elif not matches:
-                ref = _session_resolve_target(question, session, "")
-                if ref:
+                ref = session.get("last_game") if session else None
+                if ref and any(p in question for p in ("它", "这游戏", "该游戏", "这款")):
                     target = ref["appid"]
         facts = await pilot_tools.price_facts(target) if target else None
         if facts is not None:
             _session_store_game(session, target, facts.get("name"))
-            return "facts", facts, intent
-        if facts is None:
-            # 问句没点名到具体游戏：回退属性筛选给候选，让模型带着候选作答，
-            # 而不是用 no_data 把主入口的问句顶回来
-            items = await pilot_tools.recommend_games(question)
-            if items:
-                return "facts", {"kind": "games", "items": items}, intent
-            return "none", None, intent
-        return "facts", facts, intent
+            return _empty("facts", None, facts)
+        items = await pilot_tools.recommend_games(question)
+        if items:
+            return _empty("facts", "need_target", {"kind": "games", "items": items})
+        return _empty("none", "no_data", None)
     if intent == pilot_intent.FIND_GAMES:
         items = await pilot_tools.recommend_games(question)
         if not items:
-            return "none", None, intent
-        return "facts", {"kind": "games", "items": items}, intent
-    return "chat", None, intent
+            return _empty("none", "no_data", None)
+        return _empty("facts", None, {"kind": "games", "items": items})
+    return _empty("none", "llm_off", None)
 
 
-def _empty(source: str, reason: str | None, facts: dict | None) -> dict:
-    return {"answer": "", "thinking": None, "source": source, "reason": reason, "facts": facts}
+def _tool_summary(name: str, result: dict) -> str:
+    """工具事件的上屏摘要（机器码 + 最小数据，前端不翻译这个字段）。"""
+    if result.get("kind") == "denied":
+        return f"{name}: denied"
+    if name == "search_games":
+        return f"search_games: {len(result.get('items') or [])} hits"
+    if name == "recommend_games":
+        return f"recommend_games: {len(result.get('items') or [])} hits"
+    if name == "get_price_briefing":
+        return f"get_price_briefing: {result.get('name') or 'no_data'}"
+    if name == "add_follow":
+        return f"add_follow: {result.get('name') or result.get('appid')}"
+    if name == "create_price_alert":
+        return f"create_price_alert: {result.get('name') or result.get('appid')}"
+    return name
 
 
-async def _respond(*, question: str, facts: dict | None, is_chat: bool) -> dict:
-    """非流式 LLM 消费；未配置/失败/超限时按语义回退。"""
-    cfg = await pilot_config.load_config()
-    ready = pilot_config.llm_ready(cfg)
-    over_cap = ready and (await pilot_config.usage_month()) >= cfg["monthly_cap"]
-    if is_chat and not ready:
-        return _empty("none", "llm_off", None)
-    reason = None
-    if ready and not over_cap:
-        try:
-            answer, prompt_tokens, completion_tokens = await pilot_llm.chat_complete(
-                base_url=cfg["base_url"],
-                api_key=cfg["api_key"],
-                model=cfg["model"],
-                system=_SYSTEM_PROMPT,
-                user=_user_message(question, facts),
-            )
-            await pilot_config.add_usage(prompt_tokens + completion_tokens)
-            return {"answer": answer, "thinking": None, "source": "llm", "reason": None, "facts": facts}
-        except pilot_llm.PilotLlmError:
-            reason = "llm_failed"
-    elif over_cap:
-        reason = "cap_reached"
-    if is_chat:
-        return _empty("none", reason or "llm_off", None)
-    return _empty("facts", reason, facts)
+async def _agent_stream(question: str, appid: int | None, session: dict, cfg: dict):
+    """agent 循环（流式）。产出与 ask_stream 相同的事件形态，另加
+    {"type": "tool", "name":..., "summary":...} 工具执行事件。"""
+    messages: list[dict] = [{"role": "system", "content": _SYSTEM_PROMPT}]
+    messages += _session_history(session)
+    user_msg = question if not appid else f"{question}（用户当前正在看 AppID {appid} 的游戏详情）"
+    messages.append({"role": "user", "content": user_msg})
 
+    answer_all: list[str] = []
+    think_all: list[str] = []
+    usage_total = [0, 0]
+    tool_log: list[str] = []
+    last_game: dict | None = None
+    reason: str | None = None
 
-async def _resolve_write(
-    question: str, appid: int | None, action: str, session: dict | None
-) -> tuple[str, dict | None]:
-    """写动作解析与执行（风险门之后的确定性路径）。
+    for _step in range(_MAX_STEPS):
+        round_answer: list[str] = []
+        tool_calls = None
+        async for kind, delta in pilot_llm.chat_stream(
+            base_url=cfg["base_url"],
+            api_key=cfg["api_key"],
+            model=cfg["model"],
+            messages=messages,
+            tools=pilot_tools.tool_specs(),
+        ):
+            if kind == "usage":
+                usage_total[0] += delta[0]
+                usage_total[1] += delta[1]
+                continue
+            if kind == "tool_calls":
+                tool_calls = delta
+                continue
+            (think_all if kind == "thinking" else answer_all).append(delta)
+            if kind == "answer":
+                round_answer.append(delta)
+            yield {"type": kind, "delta": delta}
 
-    返回 (stage2, payload)：
-    - ("done", action 事实)   已执行；
-    - ("facts", 候选列表)     问句未唯一点名游戏，给候选让模型追问；
-    - ("guide", None)         提醒缺阈值等不可臆造的条件；
-    - ("none", None)          库内无此游戏。
-    """
-    title = pilot_tools.extract_title(question)
-    if title:
-        queries = [title]
-    else:
-        queries = pilot_tools.clean_query_tokens(question) or [question]
-    matches: list[dict] = []
-    used_query = ""
-    for query in queries:
-        matches = await pilot_tools.search_games(question, query=query)
-        if matches:
-            used_query = query
+        if not tool_calls:
+            # 终答轮：assistant 消息回写进会话历史（下一轮模型可见上文）
+            messages.append({"role": "assistant", "content": "".join(round_answer) or None})
             break
-    if matches:
-        # 名称子串会同时命中续作（如「里奥的宝藏」与「…2」）：查询词与
-        # 游戏名完全一致的候选优先，避免歧义误判
-        exact = [m for m in matches if (m.get("name") or "") == used_query]
-        if exact:
-            matches = exact
-    target = appid
-    if target is None:
-        if len(matches) == 1:
-            target = matches[0]["appid"]
-        elif len(matches) > 1:
-            _session_store_candidates(session, matches, action)
-            return "facts", {"kind": "games", "items": matches}
-        else:
-            ref = _session_resolve_target(question, session, action)
-            if ref is None:
-                return "none", None
-            target = ref["appid"]
-    if action == "alert_add":
-        target_type, value = pilot_tools.extract_alert(question)
-        if target_type == "price" and value is None:
-            return "guide", None
-        result = await pilot_tools.alert_add(target, target_type=target_type, target_value_fen=value)
-    else:
-        result = await pilot_tools.monitor_add(target)
+
+        # 模型要求调工具：assistant 消息（含 tool_calls）入列，执行后回灌
+        messages.append({
+            "role": "assistant",
+            "content": "".join(round_answer) or None,
+            "tool_calls": [
+                {
+                    "id": t["id"],
+                    "type": "function",
+                    "function": {"name": t["name"], "arguments": json.dumps(t["arguments"], ensure_ascii=False)},
+                }
+                for t in tool_calls
+            ],
+        })
+        for t in tool_calls:
+            result = await pilot_tools.execute_tool(
+                t["name"], t["arguments"], guarded=pilot_intent.is_guarded(question)
+            )
+            summary = _tool_summary(t["name"], result)
+            tool_log.append(summary)
+            yield {"type": "tool", "name": t["name"], "summary": summary}
+            if t["name"] in ("add_follow", "create_price_alert") and result.get("appid"):
+                last_game = {"appid": result["appid"], "name": result.get("name")}
+            messages.append({
+                "role": "tool",
+                "tool_call_id": t["id"] or f"{t['name']}-{len(messages)}",
+                "content": json.dumps(result, ensure_ascii=False),
+            })
+
+    answer = "".join(answer_all)
+    thinking = "".join(think_all) or None
+    if usage_total != [0, 0]:
+        await pilot_config.add_usage(usage_total[0] + usage_total[1])
     if session is not None:
-        session.pop("candidates", None)
-        session.pop("pending_action", None)
-        _session_store_game(session, target, result.get("name"))
-    return "done", {"kind": "action", **result}
+        session["turns"].append(messages[1:])
+        if last_game:
+            _session_store_game(session, last_game["appid"], last_game.get("name"))
+    yield {
+        "type": "done",
+        "answer": answer,
+        "thinking": thinking,
+        "source": "llm",
+        "reason": reason,
+        "facts": None,
+        "tools": tool_log,
+    }
 
 
 async def ask(question: str, appid: int | None = None, session_id: str | None = None) -> dict:
+    """非流式入口（SSE 之外的消费形态 / 测试用）。"""
     q = (question or "").strip()
     if not q:
         raise ValueError("empty question")
     session = _session_get_or_create(session_id) if session_id else None
-    cache_key = (q, appid or 0, session_id or "")
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return {**cached, "cached": True}
-
-    stage, facts, intent = await _prepare(q, appid, session)
-    if stage == "guide":
-        resp = _empty("guide", None, None)
-    elif stage == "write":
-        stage2, payload = await _resolve_write(q, appid, facts["action"], session)
-        if stage2 == "done":
-            resp = await _respond(question=q, facts=payload, is_chat=False)
-        elif stage2 == "facts":
-            resp = _empty("facts", "need_target", payload)
-        elif stage2 == "guide":
-            resp = _empty("guide", None, None)
-        else:
-            resp = _empty("none", "no_data", None)
-    elif stage == "none":
-        resp = _empty("none", "no_data", None)
-    else:
-        resp = await _respond(question=q, facts=facts, is_chat=stage == "chat")
-
-    _cache_put(cache_key, resp)
-    _log_decision({
-        "ts": get_beijing_time_obj().isoformat(timespec="seconds"),
-        "question": q, "intent": intent, "stage": stage,
-        "source": resp["source"], "reason": resp["reason"],
-        "appid": appid, "factsKind": (facts or {}).get("kind") if isinstance(facts, dict) else None,
-        "cached": False,
-    })
-    return {**resp, "cached": False}
+    intent = pilot_intent.route(q)
+    cfg = await pilot_config.load_config()
+    if not pilot_config.llm_ready(cfg):
+        resp = await _fallback_deterministic(q, appid, session, intent)
+        _log_decision({"ts": get_beijing_time_obj().isoformat(timespec="seconds"),
+                       "question": q, "intent": intent, "mode": "fallback",
+                       "source": resp["source"], "reason": resp["reason"], "cached": False})
+        return {**resp, "cached": False}
+    if (await pilot_config.usage_month()) >= cfg["monthly_cap"]:
+        resp = await _fallback_deterministic(q, appid, session, intent)
+        resp["reason"] = "cap_reached" if resp["source"] != "guide" else resp["reason"]
+        _log_decision({"ts": get_beijing_time_obj().isoformat(timespec="seconds"),
+                       "question": q, "intent": intent, "mode": "fallback",
+                       "source": resp["source"], "reason": resp["reason"], "cached": False})
+        return {**resp, "cached": False}
+    result: dict | None = None
+    async for event in ask_stream(q, appid, session_id):
+        if event["type"] == "done":
+            result = event
+    if result is None:
+        result = _empty("none", "llm_failed", None)
+    return {**result, "cached": False}
 
 
 async def ask_stream(question: str, appid: int | None = None, session_id: str | None = None):
     """流式编排。事件形态：
     {"type": "thinking" | "answer", "delta": str} 增量；
-    {"type": "facts", "facts": dict} 事实就绪；
-    {"type": "done", ...结果字段（含 cached）} 终态；
+    {"type": "tool", "name": str, "summary": str} 工具执行；
+    {"type": "done", ...结果字段} 终态；
     {"type": "error", "reason": str} 前置异常。
     """
     q = (question or "").strip()
@@ -354,121 +294,46 @@ async def ask_stream(question: str, appid: int | None = None, session_id: str | 
         yield {"type": "error", "reason": "bad_request"}
         return
     session = _session_get_or_create(session_id) if session_id else None
-    cache_key = (q, appid or 0, session_id or "")
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        out = {**cached, "cached": True}
-        if out.get("thinking"):
-            yield {"type": "thinking", "delta": out["thinking"]}
-        if out.get("answer"):
-            yield {"type": "answer", "delta": out["answer"]}
-        yield {"type": "done", **out}
-        return
-
-    stage, facts, intent = await _prepare(q, appid, session)
-    if facts is not None and stage != "write":
-        yield {"type": "facts", "facts": facts}
-
-    if stage == "guide":
-        resp = _empty("guide", None, None)
-        _cache_put(cache_key, resp)
-        yield {"type": "done", **resp}
-        return
-    if stage == "write":
-        stage2, payload = await _resolve_write(q, appid, facts["action"], session)
-        if stage2 == "done":
-            # 写确认是短句，走非流式解读即可
-            resp = await _respond(question=q, facts=payload, is_chat=False)
-        elif stage2 == "facts":
-            resp = _empty("facts", "need_target", payload)
-        elif stage2 == "guide":
-            resp = _empty("guide", None, None)
-        else:
-            resp = _empty("none", "no_data", None)
-        _cache_put(cache_key, resp)
-        _log_decision({
-            "ts": get_beijing_time_obj().isoformat(timespec="seconds"),
-            "question": q, "intent": intent, "stage": stage,
-            "source": resp["source"], "reason": resp["reason"],
-            "appid": appid, "factsKind": (facts or {}).get("kind") if isinstance(facts, dict) else None,
-            "cached": False,
-        })
-        yield {"type": "done", **resp}
-        return
-    if stage == "none":
-        resp = _empty("none", "no_data", None)
-        _cache_put(cache_key, resp)
-        yield {"type": "done", **resp}
-        return
-    is_chat = stage == "chat"
-
+    intent = pilot_intent.route(q)
     cfg = await pilot_config.load_config()
-    ready = pilot_config.llm_ready(cfg)
-    over_cap = ready and (await pilot_config.usage_month()) >= cfg["monthly_cap"]
-    if is_chat and not ready:
-        resp = _empty("none", "llm_off", None)
-        _cache_put(cache_key, resp)
+
+    if not pilot_config.llm_ready(cfg) or (await pilot_config.usage_month()) >= cfg["monthly_cap"]:
+        cap = pilot_config.llm_ready(cfg) and (await pilot_config.usage_month()) >= cfg["monthly_cap"]
+        resp = await _fallback_deterministic(q, appid, session, intent)
+        if cap and resp["source"] != "guide":
+            resp["reason"] = "cap_reached"
+        _log_decision({"ts": get_beijing_time_obj().isoformat(timespec="seconds"),
+                       "question": q, "intent": intent, "mode": "fallback",
+                       "source": resp["source"], "reason": resp["reason"], "cached": False})
         yield {"type": "done", **resp}
         return
 
-    reason: str | None = None
-    if ready and not over_cap:
-        answer_parts: list[str] = []
-        think_parts: list[str] = []
-        usage: tuple[int, int] | None = None
-        try:
-            async for kind, delta in pilot_llm.chat_complete_stream(
-                base_url=cfg["base_url"],
-                api_key=cfg["api_key"],
-                model=cfg["model"],
-                system=_SYSTEM_PROMPT,
-                user=_user_message(q, facts),
-            ):
-                if kind == "usage":
-                    usage = delta
-                    continue
-                (think_parts if kind == "thinking" else answer_parts).append(delta)
-                yield {"type": kind, "delta": delta}
-            if usage:
-                await pilot_config.add_usage(usage[0] + usage[1])
-            resp = {
-                "answer": "".join(answer_parts),
-                "thinking": "".join(think_parts) or None,
-                "source": "llm",
-                "reason": None,
-                "facts": facts,
-            }
-            _cache_put(cache_key, resp)
-            _log_decision({
-                "ts": get_beijing_time_obj().isoformat(timespec="seconds"),
-                "question": q, "intent": intent, "stage": stage,
-                "source": resp["source"], "reason": None,
-                "appid": appid, "factsKind": (facts or {}).get("kind") if isinstance(facts, dict) else None,
-                "cached": False,
-                "usage": usage,
-            })
-            yield {"type": "done", **resp, "cached": False}
+    result: dict | None = None
+    try:
+        async for event in _agent_stream(q, appid, session, cfg):
+            if event["type"] == "tool":
+                yield event
+                continue
+            if event["type"] == "done":
+                result = event
+                continue
+            yield event
+    except pilot_llm.PilotLlmError:
+        # 循环内已流出的内容不收回；无流出时降级为确定性事实
+        if result is None:
+            resp = await _fallback_deterministic(q, appid, session, intent)
+            resp["reason"] = "llm_failed" if resp["source"] != "guide" else resp["reason"]
+            _log_decision({"ts": get_beijing_time_obj().isoformat(timespec="seconds"),
+                           "question": q, "intent": intent, "mode": "fallback",
+                           "source": resp["source"], "reason": resp["reason"], "cached": False})
+            yield {"type": "done", **resp}
             return
-        except pilot_llm.PilotLlmError:
-            reason = "llm_failed"
-            # 已流出的内容不收回：标记降级原因后终止，前端按原因补提示
-            if answer_parts or think_parts:
-                resp = {
-                    "answer": "".join(answer_parts),
-                    "thinking": "".join(think_parts) or None,
-                    "source": "llm",
-                    "reason": "llm_failed",
-                    "facts": facts,
-                }
-                _cache_put(cache_key, resp)
-                yield {"type": "done", **resp}
-                return
-    elif over_cap:
-        reason = "cap_reached"
+        result["reason"] = "llm_failed"
 
-    if is_chat:
-        resp = _empty("none", reason or "llm_off", None)
-    else:
-        resp = _empty("facts", reason, facts)
-    _cache_put(cache_key, resp)
-    yield {"type": "done", **resp}
+    if result is None:
+        result = _empty("none", "llm_failed", None)
+    _log_decision({"ts": get_beijing_time_obj().isoformat(timespec="seconds"),
+                   "question": q, "intent": intent, "mode": "agent",
+                   "source": result["source"], "reason": result["reason"],
+                   "tools": result.get("tools") or [], "cached": False})
+    yield {"type": "done", **result}

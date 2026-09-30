@@ -21,6 +21,7 @@ import {
 } from '@/lib/priceEvents'
 import { selectableVariants, versionSelectOptions } from '@/lib/versions'
 import { useCrawlStatusStore } from '@/stores/crawlStatus'
+import { usePilotStore } from '@/stores/pilot'
 import { useRegionsStore } from '@/stores/regions'
 import { useI18n, useLocaleFormat, type MessageKey } from '@/locales'
 import RegionFlag from '@/components/RegionFlag.vue'
@@ -32,7 +33,6 @@ import HlEmpty from '@/components/ui/HlEmpty.vue'
 import HlImg from '@/components/ui/HlImg.vue'
 import HlSkeleton from '@/components/ui/HlSkeleton.vue'
 import PriceTrendChart from '@/components/business/PriceTrendChart.vue'
-import HlPilotDrawer from '@/components/business/HlPilotDrawer.vue'
 
 /** 价格奖牌（金/银/铜 = 非 CN 最低价前三，与卡片 GPW 同一规则） */
 const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/assets/trophy_copper.png']
@@ -60,11 +60,8 @@ const appid = computed(() => Number(route.params.appid))
 
 const detail = ref<GameDetail | null>(null)
 
-/* 领航台：领航员问答入口（价格区「问领航员」按钮） */
-const pilotOpen = ref(false)
-const pilotGame = computed(() =>
-  detail.value ? { appid: detail.value.appid, name: detail.value.name } : null,
-)
+/* 领航台：详情页入口带游戏上下文（全局单例抽屉经 store 开启） */
+const pilotStore = usePilotStore()
 const loading = ref(true)
 const errorMsg = ref('')
 
@@ -694,7 +691,7 @@ onMounted(load)
                   :options="versionOptions"
                   class="gd-price-version"
                 />
-                <HlButton variant="text" class="gd-pilot-btn" @click="pilotOpen = true">
+                <HlButton variant="text" class="gd-pilot-btn" @click="pilotStore.openPilot({ appid: detail.appid, name: detail.name })">
                   {{ t('pilot.ask.entry') }}
                 </HlButton>
                 <div v-if="medalItems.length" class="gd-medal-row">
@@ -927,7 +924,6 @@ onMounted(load)
         </div>
       </div>
     </template>
-    <HlPilotDrawer v-model="pilotOpen" :game="pilotGame" />
   </section>
 </template>
 

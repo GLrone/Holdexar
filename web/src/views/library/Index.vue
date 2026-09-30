@@ -5,6 +5,7 @@ import { useRouter } from 'vue-router'
 import { gamesApi, invalidateGetCache, type GameListItem } from '@/api/client'
 import { useCrawlStatusStore } from '@/stores/crawlStatus'
 import { useFilterStore } from '@/stores/gamesFilter'
+import { usePilotStore } from '@/stores/pilot'
 import { useRegionsStore } from '@/stores/regions'
 import { usePasteAdd } from '@/composables/usePasteAdd'
 import { canGift } from '@/lib/gifting'
@@ -14,7 +15,6 @@ import { useI18n, useLocaleFormat } from '@/locales'
 import HlNavbar from '@/components/business/HlNavbar.vue'
 import HlFilterPanel from '@/components/business/HlFilterPanel.vue'
 import HlGameCard from '@/components/business/HlGameCard.vue'
-import HlPilotDrawer from '@/components/business/HlPilotDrawer.vue'
 import {
   HlButton,
   HlCheckbox,
@@ -37,8 +37,8 @@ const crawlStatus = useCrawlStatusStore()
 const crawl = useCrawlStatusStore()
 const regionsStore = useRegionsStore()
 const router = useRouter()
-// 领航台：找游戏页主入口（不带游戏对象，自由问答）
-const pilotOpen = ref(false)
+// 领航台：找游戏页主入口（全局单例抽屉，经 store 开启）
+const pilotStore = usePilotStore()
 // 千分位随界面语言：模板里每渲染一行都会重算，且 `fmt` 内部现读 locale，
 // 故切语言即重渲染（详见 locales/format.ts 的说明）
 const fmt = useLocaleFormat()
@@ -478,14 +478,11 @@ onBeforeUnmount(() => {
     <!-- 高级筛选面板：外壳常驻（内部 v-if 控制挂载），否则外层 v-if 瞬间卸载会吞掉 HlDrawer 的滑出动画 -->
     <HlFilterPanel />
 
-    <!-- 领航台：领航员问答（找游戏页主入口，不带游戏对象） -->
-    <HlPilotDrawer v-model="pilotOpen" />
-
     <!-- 主内容区 -->
     <div class="container">
       <!-- 目录整理工具条：批量整理（多选移除）与已移除视图（恢复入口） -->
       <div v-if="!isError" class="lib-toolbar">
-        <HlButton size="sm" variant="primary" @click="pilotOpen = true">
+        <HlButton size="sm" variant="primary" @click="pilotStore.openPilot()">
           {{ t('pilot.ask.entry') }}
         </HlButton>
         <HlButton

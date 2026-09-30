@@ -53,6 +53,7 @@ const question = ref('')
 const streaming = ref(false)
 const liveThinking = ref('')
 const liveAnswer = ref('')
+const liveTools = ref<string[]>([])
 const turns = ref<Turn[]>([])
 // 会话 id：每次开舱重新生成——同一开舱内的追问（候选序数 / 指代）靠它串起
 const sessionId = ref('')
@@ -139,6 +140,8 @@ async function ask(text?: string) {
         liveThinking.value += e.delta
       } else if (e.type === 'answer' && e.delta) {
         liveAnswer.value += e.delta
+      } else if (e.type === 'tool' && e.summary) {
+        liveTools.value.push(e.summary)
       } else if (e.type === 'done') {
         done = e as PilotAskResponse
       } else if (e.type === 'error') {
@@ -156,6 +159,7 @@ async function ask(text?: string) {
   streaming.value = false
   liveThinking.value = ''
   liveAnswer.value = ''
+  liveTools.value = []
   void scrollBottom()
 }
 
@@ -259,8 +263,11 @@ function pickCandidate(turn: Turn, index: number) {
             <div class="pilot-thinking__head">{{ t('pilot.thinking.live') }}</div>
             <p class="pilot-thinking__text">{{ liveThinking }}</p>
           </div>
+          <div v-for="(toolLine, ti) in liveTools" :key="ti" class="pilot-tool">{{ toolLine }}</div>
           <p v-if="liveAnswer" class="pilot-answer">{{ liveAnswer }}</p>
-          <div v-if="!liveThinking && !liveAnswer" class="pilot-loading">{{ t('pilot.loading') }}</div>
+          <div v-if="!liveThinking && !liveAnswer && !liveTools.length" class="pilot-loading">
+            {{ t('pilot.loading') }}
+          </div>
         </div>
       </div>
 
@@ -443,6 +450,15 @@ function pickCandidate(turn: Turn, index: number) {
   background: var(--bg-card);
   cursor: pointer;
   text-align: left;
+}
+
+.pilot-tool {
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: var(--bg-card);
+  border: 1px solid var(--border-soft);
 }
 
 .pilot-cand + .pilot-cand {
