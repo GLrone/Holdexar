@@ -719,17 +719,19 @@ async def start_job(
         from app.domains.proxies import clash_manager as _cm
 
         async with get_session_factory()() as session:
+            # max_lanes 不传：run 拿走全部 active lane（≤MAX_LANES）——多出的
+            # 部分即待用出口池；worker 数由下面的 effective_workers 单独钳在 60
             run_plan = await crawl_lane_plan(
-                session, data_dir, max_lanes=min(planned_workers, MAX_CRAWL_WORKERS),
-                runtime=_cm.pool_runtime,
+                session, data_dir, runtime=_cm.pool_runtime,
             )
         proxy_urls = run_plan["urls"]
         effective_workers = max(1, min(planned_workers, len(proxy_urls), MAX_CRAWL_WORKERS))
         logger.info(
-            "[容量] 出口槽：已知出口 %d | run 内 active lane %d（内核 listener %d）| "
-            "worker %d（期望 %d，上限 %d）",
+            "[容量] 出口槽：已知出口 %d | active lane %d（内核 listener %d，"
+            "其中待用 %d）| worker %d（期望 %d，上限 %d）",
             run_plan.get("known_exits", 0), len(proxy_urls),
             run_plan.get("runtime_lanes", len(proxy_urls)),
+            max(0, len(proxy_urls) - effective_workers),
             effective_workers, planned_workers, MAX_CRAWL_WORKERS,
         )
         config = CrawlRunConfig(

@@ -85,9 +85,11 @@ RUNTIME_CONTROLLER_SECRET = "holdexar-proxypool"
 # GLOBAL 与 lane 的分工：GLOBAL 是维护入口（健康检查、人工查看、旧消费者），
 # lane 是生产入口。crawler 只拿 lane 地址，不碰任何选择器。
 LANE_GROUP_PREFIX = "lane-"
-# lane 数的上限 = 生产 worker 上限（`exits.MAX_CRAWL_WORKERS`）：工位数与出口槽数同源，
-# 两处取不同数值会出现「选得出 60 个出口，却只开得出 32 个工位」这种半截容量。
-MAX_LANES = MAX_CRAWL_WORKERS
+# lane 数与 worker 数**不同源**：worker 上限（`exits.MAX_CRAWL_WORKERS`=60）是
+# **同时干活的岗位数**，lane 数是**出口兵源**——lane 多于 worker 时，多出的那批
+# 就是待用出口：某个 lane 的出口连续失败被隔离后，worker 从待用池换一条继续干活，
+# 岗位数不掉。上限取 2 倍岗位数：备用池够厚，内核 listener 与配置体积仍有界。
+MAX_LANES = MAX_CRAWL_WORKERS * 2
 
 logger = logging.getLogger(__name__)
 

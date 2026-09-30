@@ -4,7 +4,8 @@
 - N worker 并发消费 + 队列排干后 run() 正常收尾、计数口径正确；
 - handler 动态重推（context.queue.put）会被继续消费，done 按任务 id 去重；
 - stop_event 置位：取消 worker、排干剩余队列、run() 不挂起；
-- failure_ledger 并入「失败」（browse 层重试耗尽的账本不计入就是假数字）。
+- failure_ledger 并入「失败」（browse 层重试耗尽的账本不计入就是假数字）；
+- 岗位池（Coordinator）：worker 逐任务租借 lane、坏 lane 隔离换岗、待用池顶替。
 """
 import asyncio
 import sys
@@ -135,6 +136,47 @@ async def test_progress_events_all_published_before_run_returns():
             progress.append(event.payload)
     assert progress, "run() 返回前应已发布进度事件"
     assert progress[-1]["done"] == total, "run() 返回时末条进度必须已发布"
+
+
+@pytest.mark.asyncio
+async def test_worker_switches_to_spare_lane_on_dead_neighbour(monkeypatch):
+    """岗位池换岗：一条 lane 坏掉时 worker 换到待用 lane 继续干活，岗位数不掉。
+
+    worker_count=1、lane_count=3（2 条待用）：首个租到的 lane 立即标记不健康，
+    后续任务必须由待用 lane 完成——不得因为坏 lane 卡住队列。
+    """
+    from app.crawler import scheduler as scheduler_mod
+
+    monkeypatch.setattr(scheduler_mod, "_LANE_COOLDOWN_SECONDS", 999.0)
+
+    class _LaneClient:
+        def __init__(self, unhealthy: bool) -> None:
+            self.unhealthy = unhealthy
+
+        @property
+        def lane_unhealthy(self) -> bool:
+            return self.unhealthy
+
+    dead, spare = _LaneClient(True), _LaneClient(False)
+    clients = [dead, spare]
+    used: list = []
+
+    async def _app(context: CrawlerContext) -> None:
+        used.append(getattr(context.http_client, "unhealthy", None))
+
+    router = CrawlerRouter()
+    router.handle("app")(_app)
+    sched = CrawlerScheduler(
+        router, _FakeClient(), None, worker_count=1,
+        stop_event=asyncio.Event(), client_factory=lambda i: clients[i],
+        lane_count=2,
+    )
+    await sched.run([{"type": "app", "id": "A"}, {"type": "app", "id": "B"}],
+                    session=None)
+
+    assert used == [False, False], "坏 lane 被隔离后由待用 lane 完成全部任务"
+    assert dead in sched._cooldown_lanes, "坏 lane 进冷却区等待探测复活"
+    assert spare not in sched._cooldown_lanes, "健康 lane 仍在岗位池"
 
 
 @pytest.mark.asyncio

@@ -1,10 +1,11 @@
-"""Steam HTTP 客户端：全局限流 + 429 熔断 + 指数退避 + 幻觉 429 清洗。
+"""Steam HTTP 客户端：按出口限流 + 429 熔断 + 指数退避 + 幻觉 429 清洗。
 
 要点：
 - 内置静态 UA 池轮换
-- 出网前过全局滑动窗口限流（200 发/5 分钟，rate_limit.py 进程级单例）
-  ——browse 接口按 country_code 参数返回各区价格、出口 IP 不参与数据
-  判定，直连即标准形态；限流取代旧的「多出口换 IP 规避风控」成为主闸
+- 出网前过**本出口**的滑动窗口限流（200 发/300s/出口 IP，rate_limit.py
+  ExitRateLimits 按 worker 注入）——browse 接口按 country_code 参数返回
+  各区价格、出口 IP 不参与数据判定，直连即标准形态；未注入出口限流器的
+  调用方（非 lane 通道）退回进程级单例
 - `Connection: close`：配合限流的匀速节奏，不留无谓的 keep-alive
 - 支持 per-request 代理注入（proxy_url；无代理时直连）
 """

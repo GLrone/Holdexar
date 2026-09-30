@@ -101,7 +101,7 @@ def test_runtime_config_lane_count_follows_pool_size(tmp_path) -> None:
         (0, None, 0),
         (1, None, 1),
         (3, None, 3),
-        (100, None, rt.MAX_LANES),
+        (rt.MAX_LANES + 20, None, rt.MAX_LANES),
         (100, 4, 4),
         (2, 9, 2),
         (3, 0, 0),

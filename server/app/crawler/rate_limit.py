@@ -1,15 +1,20 @@
-"""出网请求频率闸门：滑动窗口 200 发 / 5 分钟，进程级全局单例。
+"""出网请求频率闸门：滑动窗口 200 发 / 300s，**按出口 IP 一份预算**。
 
 限流是主闸：browse 接口按 country_code 参数返回各区价格，出口 IP 不参与
-数据判定（直连与代理拿到的是同一份数据）——「多出口轮换 IP 规避风控」的
-机制（Per-AppID Session、429 换代理、断网探测分流）不再需要，取而代之的是
-**把请求频率压进 Steam 接受的窗口**（200 发/5 分钟）：请求匀速发出，任何
-网络环境下（直连或加速器）都不触发风控。
+数据判定（直连与代理拿到的是同一份数据）。多出口形态下每个出口 IP 各自
+面对上游的那条频率线：出口身份由 proxypool 的 lane 绑定决定（一 worker
+一 lane，run 内固定，不做按任务轮换），**总预算随出口数增长**
+（N 出口 = N × 200 发/300s），窗口满的等待只拖住绑在该出口上的 worker，
+其余出口照常出力。
 
 覆盖面：全部打 Steam 的出网请求——爬虫主轮批量 / 元数据预取 / 补抓 /
 修复 / 孤儿回补（SteamHttpClient.get_json 收口）+ 捆绑包刷新
 （refresh_bundles / 单包导入）。账户同步、CDK 查价等非 browse 通道
 不在 Steam 爬取预算内，不受此闸管辖。
+
+非 lane 通道（捆绑包刷新等无出口注入的调用方）没有出口键，退回进程级
+单例 steam_rate_limiter 共享同一份预算——「窗口满」日志来自这些通道时，
+与 lane 爬取的 per-exit 预算无关。
 
 实现：asyncio.Lock 保护的 monotonic 时间戳队列。超窗的旧时间戳在
 每次取号时清理；窗口满时按「最旧一条出窗时刻 + 窗口长」计算等待，
@@ -47,6 +52,7 @@ class SlidingWindowRateLimiter:
         self._timestamps: deque[float] = deque()
         self._lock = asyncio.Lock()
         self._waited_total = 0.0  # 累计限流等待秒数（收尾日志观测用）
+        self._waiting = 0  # 当前在窗口外排队的请求数（任务页「排队等发送窗口」读口）
 
     async def acquire(self) -> None:
         """取一个请求名额；窗口满时阻塞到有名额释放。
@@ -67,18 +73,27 @@ class SlidingWindowRateLimiter:
                 # 窗口满：最旧一条出窗的时刻 = 最早可发的时刻
                 wait = self._timestamps[0] + self.window_seconds - now
                 self._waited_total += max(wait, 0.0)
+                self._waiting += 1
             if wait > 0:
                 logger.info(
                     "[限流] 窗口满（%d 发/%ds），等待 %.1fs 后放行",
                     self.max_requests, self.window_seconds, wait,
                 )
-                await asyncio.sleep(wait)
+                try:
+                    await asyncio.sleep(wait)
+                finally:
+                    self._waiting = max(self._waiting - 1, 0)
             # 睡醒后递归重取：等待期间其他 worker 可能已把名额抢走
             await self.acquire()
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 —— 限流器故障不得拖垮爬取
             logger.exception("[限流] 限流器异常，本请求放行")
+
+    @property
+    def waiting(self) -> int:
+        """当前在窗口外排队的请求数（0 = 所有请求即取即发）。"""
+        return self._waiting
 
     def reset(self) -> None:
         """清空窗口（测试隔离用）。"""
