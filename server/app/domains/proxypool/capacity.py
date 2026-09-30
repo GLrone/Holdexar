@@ -34,7 +34,6 @@ import ctypes
 import json
 import os
 import platform
-import socket
 import subprocess
 import sys
 import threading

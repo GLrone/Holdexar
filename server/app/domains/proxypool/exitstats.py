@@ -12,6 +12,8 @@ from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.database import get_session_factory, write_gate
+
 from app.domains.proxypool.models import ProxyRunExit
 
 logger = logging.getLogger(__name__)
@@ -120,9 +122,9 @@ async def write_run_exits(
 ) -> int:
     """从 `ExitStatsCollector` 落库；任何异常只记日志。"""
     try:
-        from app.core.database import get_session_factory
+        from app.core.database import WritePriority
 
-        async with get_session_factory()() as session:
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
             return await record_run_exits(
                 session, run_id=run_id, rows=collector.rows(),
                 node_by_exit=node_by_exit, now=now,

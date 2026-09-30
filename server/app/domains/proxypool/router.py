@@ -13,7 +13,8 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query
 
 from app.core.config import get_settings
-from app.core.database import get_session_factory
+from app.core.database import WritePriority, get_session_factory
+from app.core.database import write_gate
 from app.domains.proxypool import events, exitstats, jobruns
 
 router = APIRouter(prefix="/proxypool", tags=["proxypool"])
@@ -50,7 +51,7 @@ async def promote_subscription(subscription_id: int):
     """
     from app.domains.proxypool.admission import PromotionError, promote_to_active
 
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         try:
             result = await promote_to_active(
                 session,
@@ -94,7 +95,7 @@ async def exit_subscription(subscription_id: int):
     """
     from app.domains.proxypool.admission import PromotionError, exit_from_production
 
-    async with get_session_factory()() as session:
+    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         try:
             result = await exit_from_production(session, subscription_id=subscription_id)
             await session.commit()

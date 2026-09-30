@@ -972,7 +972,7 @@ def require_runtime_proxy_url(data_dir: Path) -> str:
     proxy_url = current_runtime_proxy_url(data_dir)
     if proxy_url is None:
         raise RuntimeUnavailableError(
-            "代理运行时不可用（没有可用的池 Runtime），本次爬取未启动"
+            "代理通道尚未就绪：内核还在拉起出口，等十几秒再点一次启动"
         )
     return proxy_url
 
@@ -988,7 +988,7 @@ def require_lane_proxy_urls(data_dir: Path) -> list[str]:
         urls = lane_proxy_urls(data_dir)
         if not urls:
             raise RuntimeUnavailableError(
-                "代理运行时的 lane 入口没有全部就绪，本次爬取未启动"
+                "代理通道尚未就绪：内核还在拉起出口，等十几秒再点一次启动"
             )
         return urls
     return [require_runtime_proxy_url(data_dir)]
@@ -1227,15 +1227,22 @@ async def crawl_lane_plan(
         ok, why = lane_plan_consistency(bindings, slots)
     if not ok:
         _notify_rebuild()
+        # 技术细节（缺什么/差多少）进日志；用户面只给结论与下一步——
+        # 未生成 lane plan / listener 未就绪是刚启动时的正常形态，池空是
+        # 订阅侧问题，两者给出的出路不同
+        logger.warning("[爬取拒绝] 运行时就绪闸未通过：%s", why)
+        starting_up = "lane" in why
         raise RuntimeUnavailableError(
-            f"代理运行时未就绪（{why}）：本次爬取未启动"
+            "代理通道还在启动：内核正在拉起出口，等十几秒再点一次启动"
+            if starting_up
+            else "代理池里暂时没有可用出口：到「网络」页确认订阅与节点状态后再试"
         )
     known = {slot.runtime_name: slot.exit_ip for slot in slots}
     active = select_run_lanes(bindings, known, max_lanes=max_lanes)
     if not active:
         _notify_rebuild()
         raise RuntimeUnavailableError(
-            "代理运行时的 lane 与当前出口集没有可用交集：本次爬取未启动"
+            "代理池里暂时没有可用出口：到「网络」页确认订阅与节点状态后再试"
         )
     return {
         "urls": [b["url"] for b in active],

@@ -100,7 +100,7 @@ async def test_case1_runtime_running_but_empty_pool_is_unavailable(tmp_path) -> 
                 await rt.crawl_lane_plan(session, tmp_path, max_lanes=4)
         finally:
             await session.close()
-        assert "没有合格出口" in str(ei.value)
+        assert "没有可用出口" in str(ei.value)
     finally:
         for s in holders:
             s.close()

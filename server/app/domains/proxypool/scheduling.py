@@ -28,6 +28,7 @@ from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.database import WritePriority, write_gate
 from app.crawler.occupancy import crawler_busy
 from app.domains.proxypool.bridge import ingest_ledger, rebind_missing_sources
 from app.domains.proxypool.exits import exit_snapshot, select_exit_slots, slot_signature
@@ -184,25 +185,31 @@ async def run_l0_cycle(
     # 结论按来源推进池账本。前沿放在合格集快照之前——复活节点带来的合格集变化由
     # 下面的 before/after 比较照常请求重建，不新增调度、不新增信号。
     # 对齐失败只记日志：它是维护动作，不得拖垮 L0 与重建判定。
-    try:
-        repaired = await rebind_missing_sources(session, now=now)
-        if repaired:
-            logger.info("[来源补回] 订阅 %s 的来源关联按最新快照补齐", list(repaired))
-        ingested = await ingest_ledger(session, now=now)
-        if ingested.changed:
-            logger.info(
-                "[体检→池] 账本对齐：命中 %d（复活 %d / 新出口 %d，陈久跳过 %d）",
-                ingested.matched, ingested.activated, ingested.exit_ips_added,
-                ingested.skipped_stale,
-            )
-    except Exception:  # noqa: BLE001 —— 对齐失败不阻断 L0 与重建判定
-        logger.exception("[体检→池] 两账本对齐失败（本轮跳过）")
+    # 对齐是写事务：过写调度器提交，随后的合格集读才不会把挂起写入
+    # autoflush 到闸外。
+    async with write_gate(WritePriority.BACKGROUND):
+        try:
+            repaired = await rebind_missing_sources(session, now=now)
+            if repaired:
+                logger.info("[来源补回] 订阅 %s 的来源关联按最新快照补齐", list(repaired))
+            ingested = await ingest_ledger(session, now=now)
+            if ingested.changed:
+                logger.info(
+                    "[体检→池] 账本对齐：命中 %d（复活 %d / 新出口 %d，陈久跳过 %d）",
+                    ingested.matched, ingested.activated, ingested.exit_ips_added,
+                    ingested.skipped_stale,
+                )
+            await session.commit()
+        except Exception:  # noqa: BLE001 —— 对齐失败不阻断 L0 与重建判定
+            logger.exception("[体检→池] 两账本对齐失败（本轮跳过）")
+            await session.rollback()
     before = await eligible_runtime_names(session)
     outcomes: list[HealthOutcome] = []
     targets = pool_file_names(data_dir)
     extra = {"url": target_url} if target_url else {}
     for start in range(0, len(targets), L0_COMMIT_EVERY):
         chunk = targets[start:start + L0_COMMIT_EVERY]
+        # 探测与落库的分离在 health_check_pool 内部完成（内部过闸提交）
         outcomes.extend(await health_check_pool(
             session, data_dir=data_dir, controller_url=controller_url, secret=secret,
             now=now, names=chunk, **extra,
@@ -265,15 +272,21 @@ async def _maintenance_probe(
     # 「本次体检耗时 / 健康数」以此为准；逐节点观测按 run_id 归属。
     run = HealthRun(channel="scheduled", started_at=now)
     session.add(run)
-    await session.flush()
+    # run 行即刻提交：探测是分钟级串行网络段，写事务若从这里一直开到探测循环的
+    # 首个分块提交，SQLite 写锁会被按住 10 个探测的时长（慢节点日可达数百秒），
+    # 同拍的价格落库/钱包/设置写入全部排队甚至撞满 busy_timeout。观测行的归属
+    # 只依赖 run.id，run 行先落库不影响一致性。
+    async with write_gate(WritePriority.BACKGROUND):
+        await session.flush()
+        await session.commit()
     before_eligible = await eligible_runtime_names(session)
     # L1 会刷新出口身份，而 listener 数在重建时就定死了：身份变了（同一出口被两条
     # lane 绑、或某节点换了落地）就必须再收敛一次 listener 数，否则台账一直比当前
     # 出口集多。运行期的不变量由 `select_run_lanes` 就地保证，这里负责让内核侧收敛。
     exits_before = await exit_snapshot(session)
-    # 每个探针各自兜异常：探针的程序异常不得逃到调度器——那会跳过调用方的 commit，
-    # 把本轮已经写好的 L0/L1 遥测一起回滚。异常只记日志、该层本轮无结果（空 tuple），
-    # 不改分类、不伪装成功。
+    # 每个探针各自兜异常：探针的程序异常不得逃出维护事务——那会跳过收尾提交，
+    # 把本轮已写好的遥测留在未提交事务里。异常只记日志、该层本轮无结果（空
+    # tuple），不改分类、不伪装成功；已提交的观测不受影响。
     try:
         l1 = await exit_ip_check_pool(
             session, data_dir=data_dir, controller_url=controller_url, secret=secret,
@@ -297,6 +310,10 @@ async def _maintenance_probe(
     run.failed = run.total - run.steam_ok
     run.finished_at = datetime.now()
     run.duration_ms = int((run.finished_at - run.started_at).total_seconds() * 1000)
+    # 收尾提交放在恢复 GLOBAL（网络调用）之前：节点状态与观测此时已齐，
+    # 写锁不得跨网络段持有。
+    async with write_gate(WritePriority.BACKGROUND):
+        await session.commit()
     # L2 现在喂节点状态机：合格集可能因判死/复活而变化，与 L0 周期同款
     # before/after 比较请求重建，不另立信号。
     if await eligible_runtime_names(session) != before_eligible:
@@ -427,9 +444,11 @@ async def run_proxypool_cycle(
 
     顺序不能颠倒：若先 L1/L2，它们面对的还是"含已死节点"的旧 Runtime，没有意义。
 
-    **事务边界**：L0 独立提交一次，维护（重建 + L1/L2）再提交一次。L1/L2 要串行探
-    完池内节点，整段落在一个事务里会让写锁跨分钟被占住，同拍的订阅刷新/账单等 job
-    会撞满 `busy_timeout` 全部失败；分两段后每次持锁只到秒级。
+    **事务边界**：L0 独立提交一次；维护段（重建 + L1/L2）的写事务不跨网络段——
+    run 行即落即提交，两个探测池函数返回前提交，收尾提交在恢复 GLOBAL 之前。
+    L1/L2 串行探完池内节点是分钟级网络等待，任何一段开在未提交事务里都会把
+    SQLite 写锁按住数个探测的时长，同拍的订阅刷新/账单/价格落库等 job 会撞满
+    `busy_timeout` 全部失败。每次持锁只到单块提交的毫秒级。
     """
     l0 = await run_l0_cycle(
         session, data_dir=data_dir, controller_url=controller_url, secret=secret,
