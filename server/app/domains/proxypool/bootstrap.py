@@ -40,7 +40,7 @@ import yaml
 
 from app.domains.proxies.models import ProxySubscription
 from app.domains.proxies.subscription_secret import UNREADABLE_MESSAGE, open_url
-from app.domains.proxypool import events
+from app.core import orchestration as events
 from app.domains.proxypool.admission import auto_admit_healthy_candidate, is_admitted
 from app.domains.proxypool.exits import select_exit_slots
 from app.domains.proxypool.health import latest_l0_delays

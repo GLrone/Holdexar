@@ -35,7 +35,7 @@ import httpx
 import yaml
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domains.proxypool import events
+from app.core import orchestration as events
 from app.domains.proxypool.exits import MAX_CRAWL_WORKERS, ExitSlot, select_exit_slots
 from app.domains.proxypool.pool import (
     PoolBuildError,

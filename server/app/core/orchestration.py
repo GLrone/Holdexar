@@ -1,11 +1,12 @@
-"""编排事件流水（`orchestration_events`）：生产生命周期的事实留痕。
+"""编排事件流水（`orchestration_events`）：生产生命周期的事实留痕（跨域共享层）。
 
 这个模块只做一件事：把生产路径上**已经发生**的事实写成一行事件。它不判对错、
-不聚合、不参与任何决策——事件是给事后还原用的，不是生产依赖。
+不聚合、不参与任何决策——事件是给事后还原用的，不是生产依赖。与
+`core/events.py`（进程内事件总线 → SSE）分工：那边管实时传播，这边管
+进程重启后仍可回溯的事实留痕。
 
-事件类型是固定枚举，一处定义（本模块常量）：
-订阅同步失败、订阅晋升、订阅退出、对账拒绝。新增类型前先确认真实生产路径存在，
-不为「看起来完整」预先造类型。
+事件类型是固定枚举，一处定义（本模块常量），按产生域分组。新增类型前先确认
+真实生产路径存在，不为「看起来完整」预先造类型。
 
 两类写入形态，同一个函数按调用方给不给 session 分流：
 
@@ -24,19 +25,22 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import JSON, DateTime, Integer, String, Text
+from sqlalchemy.orm import Mapped, mapped_column
 
-from app.core.database import WritePriority, get_session_factory
-from app.core.database import write_gate
-from app.domains.proxypool.models import OrchestrationEvent
+from app.core.database import Base, WritePriority, get_session_factory, write_gate
 
 logger = logging.getLogger(__name__)
 
-# ── 事件类型（固定枚举）────────────────────────────────────────────
+
+# ── 事件类型（固定枚举，按产生域分组）──────────────────────────────
+# proxypool 域
 KIND_SUBSCRIPTION_FAILED = "subscription_failed"
 KIND_SUBSCRIPTION_PROMOTED = "subscription_promoted"
 KIND_SUBSCRIPTION_EXITED = "subscription_exited"
 KIND_RECONCILE_REJECTED = "reconcile_rejected"
+# 价格刷新周期（crawl 域）
+KIND_PRICE_CYCLE_FINISHED = "price_cycle_finished"
 
 # ── 级别 ──────────────────────────────────────────────────────────
 LEVEL_INFO = "INFO"
@@ -47,13 +51,30 @@ LEVEL_ERROR = "ERROR"
 _MESSAGE_MAX = 1000
 
 
+class OrchestrationEvent(Base):
+    """编排事件流水：生产生命周期状态变化的事实留痕，可回溯、可关联。
+
+    关联约定（运行控制面计划 §四）：主键 id 即事件身份，不另造 event_id；
+    关联信息（cycle_id / appid / 订阅 id 等）放 payload_json，不另设列。
+    """
+
+    __tablename__ = "orchestration_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ts: Mapped[datetime | None] = mapped_column(DateTime)
+    kind: Mapped[str] = mapped_column(String(50), index=True)
+    level: Mapped[str] = mapped_column(String(8))
+    message: Mapped[str] = mapped_column(Text)
+    payload_json: Mapped[dict | None] = mapped_column(JSON)
+
+
 async def record(
     kind: str,
     message: str,
     *,
     level: str = LEVEL_INFO,
     payload: dict | None = None,
-    session: AsyncSession | None = None,
+    session=None,
     now: datetime | None = None,
 ) -> bool:
     """追加一行事件。返回是否写成功；任何异常都只记日志。
