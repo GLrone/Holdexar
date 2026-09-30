@@ -13,6 +13,7 @@ import { useUpdaterStore } from '@/stores/updater'
 import { useI18n, type MessageKey } from '@/locales'
 import { ratesApi, type WalletSnapshot } from '@/api/client'
 import { buildRateMap, formatWalletCny, walletToCny, type RateMap } from '@/lib/walletCny'
+import { walletSyncOk, walletSyncedAt } from '@/lib/walletSync'
 import { APP_NAME } from '@/appInfo'
 import ProductTour from '@/components/ProductTour.vue'
 import UpdateDialog from '@/components/business/UpdateDialog.vue'
@@ -272,12 +273,14 @@ function walletCnyLabel(w: WalletSnapshot | null): string {
 
 const walletTitle = computed(() => {
   if (!wallet.value) return t('wallet.unboundTip')
-  const at = wallet.value.checked_at
-    ? t('wallet.titleSynced', { time: wallet.value.checked_at.slice(11, 16) })
-    : ''
-  const err = wallet.value.error ? ` · ${wallet.value.error}` : ''
+  const at = walletSyncedAt(wallet.value)
+  const atLabel = at ? t('wallet.titleSynced', { time: at.slice(11, 16) }) : ''
+  // 缓存窗内视为同步成功：不把窗外才该呈现的失败错误缀进标题
+  const err = walletSyncOk(wallet.value) || !wallet.value.error
+    ? ''
+    : ` · ${wallet.value.error}`
   const more = accountStore.accounts.length > 1 ? t('wallet.titleMore') : ''
-  return t('wallet.titleMain', { balance: wallet.value.balance_display }) + more + at + err
+  return t('wallet.titleMain', { balance: wallet.value.balance_display }) + more + atLabel + err
 })
 
 /* 余额弹层（点击胶囊展开 / 再点关闭；点外部也关闭） */
@@ -321,7 +324,7 @@ async function manualRefreshWallet() {
   if (accountStore.syncing) return
   await accountStore.sync()
   const w = accountStore.status?.wallet
-  if (w?.check_ok) {
+  if (walletSyncOk(w)) {
     message.success(t('wallet.toastRefreshed', { balance: w.balance_display }))
   } else if (accountStore.status?.session_expired) {
     // 登录态过期：能自愈的走续期提示，只有用户能解的才要求重新登录
