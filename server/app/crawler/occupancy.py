@@ -1,6 +1,6 @@
 """crawler 执行占用：所有**生产**爬取路径共用一个占用语义。
 
-为什么要落在执行入口而不是调用方的 job 表上：`run_crawl` 才是唯一的生产执行入口
+占用语义落在执行入口而不是调用方的 job 表上：`run_crawl` 才是唯一的生产执行入口
 （手动任务走 crawl 域、bundles 链尾**直调**、CLI 调试），而 `crawl_service._active`
 只登记了走 `start_job` 的那一条——只看它，bundles 那条直调路径就是盲区，会出现
 "手动 30 worker + bundles 4 worker 同时跑"。

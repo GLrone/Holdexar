@@ -103,7 +103,7 @@ class EmptyNodeSetError(SnapshotError):
 class InvalidEncodingError(SnapshotError):
     """正文不是合法 UTF-8：明确失败，不生成快照、不碰 Registry。
 
-    为什么不能 `decode("utf-8", "replace")` 兜过去：替换字符（U+FFFD）会把「通道
+    不能 `decode("utf-8", "replace")` 兜过去：替换字符（U+FFFD）会把「通道
     塞了二进制垃圾 / 编码换了」洗成一段看起来合法的 YAML，非法字节于是静默流进
     Registry，事后无从追溯是哪一步引入的。这里刻意与 html 劫持**同档**处理：
     属通道级问题 → 换下一通道；全部通道都拿不到合法 UTF-8 才失败。
@@ -197,8 +197,8 @@ class Snapshot:
 class NodeUpdate:
     """端点未变、配置已变的节点：旧指纹被这条新配置**取代**了。
 
-    为什么必须把旧指纹显式带出来：`removed` 从 P1.2.1 起不再包含「被取代」的旧
-    指纹（见 `compute_diff`），旧指纹只能从这里取。P1.3 需要它把来源关联与健康
+    旧指纹必须显式带出来：`removed` 不包含「被取代」的旧
+    指纹（见 `compute_diff`），旧指纹只能从这里取。搬历史的一方需要它把来源关联与健康
     /容量历史从旧行搬到新行——没有它就只剩「新登记一条 + 旧行靠来源流失自然
     退休」，同一逻辑节点的历史会被腰斩。
 
@@ -471,13 +471,13 @@ async def persist_snapshot(session, snap: Snapshot, *, data_dir: Path
                            ) -> SubscriptionSnapshot:
     """把快照落盘 + 写库。**调用方负责事务边界**：这里只 flush，绝不 commit。
 
-    为什么底层不吃事务：P1.3 要求「快照元数据 + Registry 变更 + generation 推进」
-    在同一个事务里原子落地，helper 自己 commit 会让后面两者无法纳入边界；更糟的
+    底层不吃事务：「快照元数据 + Registry 变更 + generation 推进」
+    要在同一个事务里原子落地，helper 自己 commit 会让后面两者无法纳入边界；更糟的
     是它会把调用方会话里**其它** pending 行一起提交掉——提交一个自己都不知道
     存在的写集，回滚时那部分永远回不来。
 
     落盘排在 flush 之前：文件是幂等的内容寻址写入，事务回滚后留个孤儿文件（由
-    P1.9 的 GC 规则按 raw_path 引用回收）远好过「事务提交了但原始字节没落盘」
+    GC 规则按 raw_path 引用回收）远好过「事务提交了但原始字节没落盘」
     ——后者会让 `latest_snapshot()` 永远恢复不出基线。
     本函数不碰 Registry。
     """

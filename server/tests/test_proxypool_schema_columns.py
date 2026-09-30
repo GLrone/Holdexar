@@ -1,9 +1,8 @@
-"""真实生产暴露的 schema 缺列修复：登记 + 老库自愈。
+"""schema 缺列登记 + 老库自愈。
 
-背景：真实 holdexar-dev 库的 `subscription_snapshots` 由更早的停放期模型建成，
-缺 `http_status` / `content_type` / `source_channel`，而这三列**从未登记**进
-`_TABLE_EXTRA_COLUMNS` → 首次真实同步的 INSERT 直接报
-`table subscription_snapshots has no column named http_status`。
+`subscription_snapshots` 的 `http_status` / `content_type` / `source_channel`
+三列必须登记进 `_TABLE_EXTRA_COLUMNS`：老形状的库缺列时，首次同步的
+INSERT 直接报 `table subscription_snapshots has no column named http_status`。
 
 本文件钉两件事：
 1. 这 3 列确实登记在 `_TABLE_EXTRA_COLUMNS["subscription_snapshots"]`（防被误删）；

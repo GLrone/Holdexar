@@ -175,7 +175,7 @@ class _BrokenTarget(BaseHTTPRequestHandler):
 
 
 class _FakeStoreBrowse(BaseHTTPRequestHandler):
-    """假 StoreBrowse：返回**实测到的真实信封结构**（可换 payload / 状态码）。"""
+    """假 StoreBrowse：返回与线上一致的信封结构（可换 payload / 状态码）。"""
 
     payload: dict = {}
     status = 200
@@ -430,7 +430,7 @@ async def test_special_runtime_names_are_located(
 ) -> None:
     """`|` `:` `#` 空格 Unicode `/` `?` `&` `=` 都必须能定位到节点。
 
-    `#` 不编码会被当成 URL fragment 截断——实测那样请求会落到 404，而不是找到节点。
+    `#` 不编码会被当成 URL fragment 截断，请求落到 404 而不是找到节点。
     """
     await init_db()
     names = ["1|香港01", "2|usa: west #1", "3|东京 ⚡", "4|a/b?c&d=e"]
@@ -731,7 +731,7 @@ async def test_l2_target_service_failure_never_changes_state(
 @pytest.mark.parametrize(
     "payload,marker",
     [
-        # 生产实测 success 是整数 1；写成布尔 true 就是契约不符
+        # success 契约是整数 1；写成布尔 true 就是契约不符
         (_browse_payload(success=True), "success"),
         # 价格字符串不可解析 → 必须走 _to_int 语义而不是 isinstance(int)
         (_browse_payload(final="not-a-number"), "final_price_in_cents"),

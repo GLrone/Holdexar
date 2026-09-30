@@ -900,8 +900,8 @@ async def _job_proxypool_retention() -> None:
     `orchestration_events` / `subscription_snapshots` 按各自保留期分块清理；
     `proxy_nodes` / `proxy_node_sources` / `pool_generations` 一行不碰。
 
-    为什么是独立定时任务：保留是**周期性**事务，不是启动一次性事务——本地软件
-    不常驻，放启动链会在长会话里永远不跑（也避免动那条登记过的链序）。删除按
+    独立定时任务而非启动链一步：保留是**周期性**事务，不是启动一次性事务——本地软件
+    不常驻，放启动链会在长会话里永远不跑。删除按
     5000 行一块、每块一个事务，防长事务持写锁跟爬取/调度抢锁；一轮最多 20 块，
     删不完留给下一轮。异常只记日志。
     """

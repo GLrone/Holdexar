@@ -141,7 +141,7 @@ async def run_crawl(
     run_id: int | None = None
     try:
         # 台账要写库，建表必须先于记录（init_db 幂等且是 lru 化的连接入口；
-        # 原先它在 _run_crawl_locked 里，为让"作业开始"这一笔真的在开始时刻落下，提前到这里）
+        # 在这里调用才能让"作业开始"这一笔真的在开始时刻落下）
         await init_db()
         from ..core.config import get_settings
 

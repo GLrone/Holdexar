@@ -229,9 +229,9 @@ def test_reconcile_reports_missing_and_ignores_builtins() -> None:
 async def test_unloadable_node_makes_the_kernel_die_not_shrink(
     tmp_data_dir, kernel_exe_path, clash_runtime
 ) -> None:
-    """真实观测到的成因：内核**不会**静默少加载，而是直接拒绝启动。
+    """内核**不会**静默少加载，而是直接拒绝启动。
 
-    实测日志：`level=fatal msg="Parse config error: proxy 3: unsupport proxy type: ..."`
+    fatal 日志形如 `level=fatal msg="Parse config error: proxy 3: unsupport proxy type: ..."`
     所以「M < N」在本版内核里不可达，它的真身是「内核根本没起来」。这条断言把
     这个区别钉住：将来设计 reconcile 时必须先区分「没起来」与「起来了但不一样」。
     """
