@@ -23,6 +23,7 @@ import { useSettingsStore } from '@/stores/settings'
 import { useTourStore } from '@/stores/tour'
 import { useUpdaterStore } from '@/stores/updater'
 import { friendCodeOf } from '@/utils/steamId'
+import { walletSyncOk, walletSyncedAt } from '@/lib/walletSync'
 import CurrencyFlag from '@/components/CurrencyFlag.vue'
 import RegionFlag from '@/components/RegionFlag.vue'
 import {
@@ -71,11 +72,13 @@ const sessionHasRefresh = computed(() => accountStore.status?.session_has_refres
 
 /** active 账号的钱包（顶层 wallet 与 active 一致） */
 const wallet = computed(() => accountStore.status?.wallet ?? null)
+/** 账户摘要的同步时刻：缓存窗内取上次成功时刻，窗外取最近尝试时刻 */
+const walletMetaTime = computed(() => (wallet.value ? walletSyncedAt(wallet.value) : null))
 
 /* 每账号同步状态：登录过期优先于同步结果（过期的账号余额本就抓不到）；
-   wallet_error 非空 = 最近一次同步失败（错误详情收进悬停提示，不占行内空间）；
-   无钱包快照 = 尚未同步。wallet.checked_at 在失败时是失败尝试的时间，
-   成功时是上次成功同步的时间。 */
+   同步成功走显示缓存窗：上次成功获取余额（wallet.ok_at）在 10 分钟内即按
+   成功呈现（余额本身是窗内的真实数据），窗外的失败才如实显示；
+   无钱包快照 = 尚未同步。 */
 type SyncTone = 'ok' | 'fail' | 'idle'
 function syncStateOf(acc: SteamAccountItem): { tone: SyncTone; label: string; tip: string } {
   if (acc.session_expired) {
@@ -95,19 +98,20 @@ function syncStateOf(acc: SteamAccountItem): { tone: SyncTone; label: string; ti
   if (!acc.wallet) {
     return { tone: 'idle', label: t('settings.steam.syncIdle'), tip: t('settings.steam.syncTipIdle') }
   }
-  const time = acc.wallet.checked_at ? acc.wallet.checked_at.replace('T', ' ').slice(0, 19) : ''
+  const time = walletSyncedAt(acc.wallet)
+  const timeText = time ? time.replace('T', ' ').slice(0, 19) : ''
   const error = acc.wallet_error || acc.wallet.error || ''
-  if (error) {
+  if (error && !walletSyncOk(acc.wallet)) {
     return {
       tone: 'fail',
       label: t('settings.steam.syncFail'),
-      tip: time ? t('settings.steam.syncTipFail', { time, error }) : t('settings.steam.syncFail'),
+      tip: timeText ? t('settings.steam.syncTipFail', { time: timeText, error }) : t('settings.steam.syncFail'),
     }
   }
   return {
     tone: 'ok',
     label: t('settings.steam.syncOk'),
-    tip: time ? t('settings.steam.syncTipOk', { time }) : t('settings.steam.syncOk'),
+    tip: timeText ? t('settings.steam.syncTipOk', { time: timeText }) : t('settings.steam.syncOk'),
   }
 }
 
@@ -381,7 +385,7 @@ function reportBindResult() {
   const status = accountStore.status
   if (status?.mismatch) {
     message.error(status.message || t('settings.toast.cookieMismatch'))
-  } else if (status?.wallet?.check_ok) {
+  } else if (walletSyncOk(status?.wallet)) {
     message.success(t('settings.toast.bindSuccess', { balance: status.wallet.balance_display }))
   } else if (status?.sync_error) {
     message.warning(t('settings.toast.bindSyncFailed', { error: status.sync_error }))
@@ -613,7 +617,7 @@ async function resyncWallet() {
   message.loading(t('settings.toast.fetching'))
   try {
     await accountStore.sync()
-    if (accountStore.status?.wallet?.check_ok) {
+    if (walletSyncOk(accountStore.status?.wallet)) {
       message.success(t('settings.toast.walletRefreshed'))
     } else if (accountStore.status?.session_expired) {
       if (accountStore.status?.session_has_refresh) message.error(t('settings.steam.syncTipRenewing'))
@@ -1004,10 +1008,10 @@ onUnmounted(stopLoginPolling)
             </div>
           </div>
 
-          <div v-if="wallet?.checked_at" class="account-summary__meta">
+          <div v-if="walletMetaTime" class="account-summary__meta">
             {{
               t('settings.steam.syncMeta', {
-                time: wallet.checked_at.replace('T', ' ').slice(0, 19),
+                time: walletMetaTime.replace('T', ' ').slice(0, 19),
               })
             }}
           </div>
