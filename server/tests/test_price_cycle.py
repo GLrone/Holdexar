@@ -28,6 +28,7 @@ from app.domains.crawl.models import CrawlJob
 from app.domains.games.models import Game, GameCurrentPrice
 # pool / catalog 作用域现在走 Monitoring 层：表要注册进 Base.metadata
 from app.domains.monitoring import models as _monitoring_models  # noqa: F401
+from app.core.orchestration import KIND_PRICE_CYCLE_FINISHED, OrchestrationEvent
 from app.domains.monitoring.models import MonitorTarget
 
 APPIDS = (760001, 760002)
@@ -51,6 +52,10 @@ def db(tmp_path, monkeypatch):
     import app.domains.monitoring.service as monitoring_service
 
     monkeypatch.setattr(monitoring_service, "get_session_factory", lambda: factory)
+    import app.core.orchestration as orchestration_mod
+
+    # 编排事件独立会话形态也经模块级 factory，漏打桩会把测试事件写进生产库
+    monkeypatch.setattr(orchestration_mod, "get_session_factory", lambda: factory)
     # 收尾链的系列归组 / 免费脱池也在本文件任务路径上（现已转后台）：
     # 同样模块级 import 了 factory，漏了就会读写生产库
     import app.domains.games.series as games_series
@@ -646,6 +651,18 @@ async def test_settle_broadcasts_once_with_cycle_id_and_status(db, monkeypatch):
     rows = await cycle_mod.list_cycles(5)
     assert events[0]["cycleId"] == rows[0]["id"]
     assert events[0]["status"] == rows[0]["status"] == cycle_mod.COMPLETED
+
+    # 编排事件留痕：终态收敛同步落 orchestration_events（进程重启后仍可回溯）
+    import app.core.database as database_module
+
+    async with database_module.get_session_factory()() as s:
+        evs = (await s.execute(
+            select(OrchestrationEvent).where(
+                OrchestrationEvent.kind == KIND_PRICE_CYCLE_FINISHED)
+        )).scalars().all()
+    assert len(evs) == 1, f"一轮终态只留一行编排事件：{len(evs)}"
+    assert evs[0].payload_json["cycle_id"] == rows[0]["id"]
+    assert evs[0].payload_json["status"] == cycle_mod.COMPLETED
 
 
 @pytest.mark.asyncio
