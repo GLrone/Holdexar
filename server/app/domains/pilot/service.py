@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import json
-import re
 import time
 
 from app.core.paths import resolve_data_dir
@@ -178,8 +177,14 @@ def _card_of(tool_name: str, result: dict) -> dict | None:
 
 
 async def _agent_stream(question: str, appid: int | None, session: dict, cfg: dict):
-    """agent 循环（流式）。产出与 ask_stream 相同的事件形态，另加
-    {"type": "tool", "name":..., "summary":...} 工具执行事件。"""
+    """agent 循环（流式）。事件形态与 ask_stream 一致，另加工具执行事件：
+
+    {"type": "tool_start", "name":..., "label":...}  工具开始执行（前端置运行态）；
+    {"type": "tool", "name":..., "label":..., "status":..., "data":...}
+                                                      工具执行完毕（结构化步骤）。
+
+    label/status/data 由 tools.tool_step 产出（词条键片段 + 最小插值数据）；
+    done 事件携带全量 steps，前端历史轮按它还原时间线。"""
     messages: list[dict] = [{"role": "system", "content": _SYSTEM_PROMPT}]
     messages += _session_history(session)
     user_msg = question if not appid else f"{question}（用户当前正在看 AppID {appid} 的游戏详情）"
@@ -189,6 +194,7 @@ async def _agent_stream(question: str, appid: int | None, session: dict, cfg: di
     think_all: list[str] = []
     usage_total = [0, 0]
     tool_log: list[str] = []
+    steps: list[dict] = []
     cards: list[dict] = []
     last_game: dict | None = None
     reason: str | None = None
@@ -235,12 +241,15 @@ async def _agent_stream(question: str, appid: int | None, session: dict, cfg: di
             ],
         })
         for t in tool_calls:
+            meta_label = pilot_tools.TOOL_META.get(t["name"], {}).get("label") or t["name"]
+            yield {"type": "tool_start", "name": t["name"], "label": meta_label}
             result = await pilot_tools.execute_tool(
                 t["name"], t["arguments"], guarded=pilot_intent.is_guarded(question)
             )
-            summary = _tool_summary(t["name"], result)
-            tool_log.append(summary)
-            yield {"type": "tool", "name": t["name"], "summary": summary}
+            step = pilot_tools.tool_step(t["name"], result)
+            steps.append(step)
+            tool_log.append(_tool_summary(t["name"], result))
+            yield {"type": "tool", "name": t["name"], **step}
             card = _card_of(t["name"], result)
             if card is not None and card not in cards:
                 cards.append(card)
@@ -268,6 +277,7 @@ async def _agent_stream(question: str, appid: int | None, session: dict, cfg: di
         "reason": reason,
         "facts": None,
         "cards": cards[:6],
+        "steps": steps,
         "tools": tool_log,
     }
 
@@ -305,8 +315,9 @@ async def ask(question: str, appid: int | None = None, session_id: str | None = 
 async def ask_stream(question: str, appid: int | None = None, session_id: str | None = None):
     """流式编排。事件形态：
     {"type": "thinking" | "answer", "delta": str} 增量；
-    {"type": "tool", "name": str, "summary": str} 工具执行；
-    {"type": "done", ...结果字段} 终态；
+    {"type": "tool_start", "name": str, "label": str} 工具开始执行；
+    {"type": "tool", "name": str, "label": str, "status": str, "data": dict} 工具执行完毕；
+    {"type": "done", ...结果字段, "steps": list} 终态（steps = 本轮时间线全量）；
     {"type": "error", "reason": str} 前置异常。
     """
     q = (question or "").strip()

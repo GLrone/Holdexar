@@ -1,6 +1,8 @@
-"""pilot 只读工具：复用 games 域服务取事实，不自建查询、不写库。
+"""pilot 工具层：agent 循环取数与写动作的执行点。
 
-产出紧凑事实（几百字节级）供模板摘要与 LLM 解读共用；全量数据仍由
+读工具复用 games 域服务取紧凑事实（几百字节级，供模板摘要与 LLM 解读
+共用）；写工具 1:1 映射既有用户动作（关注 = monitoring.track，
+提醒 = alerts_service.add_alert），守卫词命中即拒绝。全量数据仍由
 既有接口承载，领航台不重复暴露完整列表。
 """
 from __future__ import annotations
@@ -159,6 +161,56 @@ NAV_TARGETS = {
     "logs": "/logs",
     "settings": "/settings",
 }
+
+
+# 工具注册表元数据：机器名 → 用户面步骤词条片段（label 与 i18n key
+# `pilot.step.{label}` 对应）。机器名只进模型协议与日志，不进用户面。
+TOOL_META: dict[str, dict] = {
+    "search_games": {"label": "search"},
+    "get_price_briefing": {"label": "price"},
+    "recommend_games": {"label": "recommend"},
+    "add_follow": {"label": "follow"},
+    "create_price_alert": {"label": "alert"},
+    "navigate": {"label": "navigate"},
+}
+
+
+def tool_step(name: str, result: dict) -> dict:
+    """工具执行结果 → 时间线步骤条目。
+
+    返回 {label, status, data}：label 对应前端词条键片段；status 取
+    ok / empty / denied；data 只装词条插值所需的最小数据（结果计数、
+    对象名、导航目标）。判定走数据层，前端不复制这套语义。"""
+    if result.get("kind") == "denied":
+        return {"label": "denied", "status": "denied", "data": {}}
+    if name == "search_games" or name == "recommend_games":
+        items = result.get("items") or []
+        label = "search" if name == "search_games" else "recommend"
+        return {
+            "label": label,
+            "status": "ok" if items else "empty",
+            "data": {"count": len(items)},
+        }
+    if name == "get_price_briefing":
+        return {
+            "label": "price",
+            "status": "ok" if result.get("kind") == "price" else "empty",
+            "data": {"name": result.get("name")},
+        }
+    if name == "add_follow" or name == "create_price_alert":
+        label = "follow" if name == "add_follow" else "alert"
+        return {
+            "label": label,
+            "status": "ok" if result.get("appid") else "empty",
+            "data": {"name": result.get("name")},
+        }
+    if name == "navigate":
+        return {
+            "label": "navigate",
+            "status": "ok" if result.get("path") else "empty",
+            "data": {"target": result.get("target") or ""},
+        }
+    return {"label": TOOL_META.get(name, {}).get("label", name), "status": "ok", "data": {}}
 
 
 def tool_specs() -> list[dict]:

@@ -304,6 +304,14 @@ export interface PilotNavigateFacts {
 
 export type PilotFacts = PilotPriceFacts | PilotGameFacts | PilotActionFacts | PilotNavigateFacts
 
+/** agent 时间线步骤：label 对应词条键 `pilot.step.{label}`，data 供词条插值。
+ *  status = ok / empty / denied；running 只存在于流式过程中的本地态。 */
+export interface PilotStep {
+  label: string
+  status: 'ok' | 'empty' | 'denied' | 'running'
+  data: { count?: number; name?: string | null; target?: string }
+}
+
 export interface PilotAskResponse {
   /** LLM 回答原文；facts / guide / none 形态下为空串，展示层按 source 渲染 */
   answer: string
@@ -313,6 +321,8 @@ export interface PilotAskResponse {
   facts: PilotFacts | null
   /** 本轮工具取到的结构化卡片（games / price / action），组件渲染数据层 */
   cards: PilotFacts[]
+  /** 本轮 agent 时间线全量（后端 tools.tool_step 产出）；降级路径为空 */
+  steps?: PilotStep[]
   cached: boolean
 }
 
@@ -343,15 +353,19 @@ export const pilotApi = {
 }
 
 export interface PilotStreamEvent {
-  type: 'thinking' | 'answer' | 'tool' | 'facts' | 'done' | 'error'
+  type: 'thinking' | 'answer' | 'tool_start' | 'tool' | 'facts' | 'done' | 'error'
   delta?: string
   name?: string
-  summary?: string
+  /** tool / tool_start 事件的步骤词条片段与终态（见 PilotStep） */
+  label?: string
+  status?: PilotStep['status']
+  data?: PilotStep['data']
   facts?: PilotFacts | null
   answer?: string
   thinking?: string | null
   source?: PilotAskResponse['source']
   reason?: string | null
+  steps?: PilotStep[]
   cached?: boolean
 }
 

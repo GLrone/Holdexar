@@ -6,10 +6,10 @@ import {
   type PilotActionFacts,
   type PilotAskResponse,
   type PilotFacts,
-  type PilotGameFacts,
   type PilotGameFactsItem,
   type PilotNavigateFacts,
   type PilotPriceFacts,
+  type PilotStep,
 } from '@/api/client'
 import { formatCnyFen } from '@/api/regions'
 import { useRouter } from 'vue-router'
@@ -20,10 +20,9 @@ import HlTextarea from '@/components/ui/HlTextarea.vue'
 
 /**
  * 领航台：领航员的提问面板（顶栏 / 找游戏 / 游戏详情三处入口共开）。
- * 多轮堆叠：每轮问答（问句 + 回答 + 结构化卡片）保留可回看；
- * 卡片 = agent 工具取到的结构化数据（games / price / action），
- * 前端用项目组件渲染——游戏行可点进详情、价格走航报格式、动作带回执出口。
- * thinking 通道仅流式期间实时展示；回退原因 reason 是机器码，这层翻用户语言。
+ * 时间线形态：每轮问答 = 问句 + agent 过程时间线（tool_start/tool 事件逐帧
+ * 驱动，done.steps 全量回填历史）+ 回答 + 结构化卡片；工具机器名不出用户面，
+ * 步骤文案由 `pilot.step.{label}` 词条渲染。thinking 以折叠态保留在历史轮。
  */
 const props = defineProps<{
   modelValue: boolean
@@ -52,13 +51,17 @@ interface Turn {
   followLink?: boolean
   cards?: PilotFacts[]
   cached?: boolean
+  steps: PilotStep[]
+  think?: string
+  thinkOpen?: boolean
 }
 
 const question = ref('')
 const streaming = ref(false)
 const liveThinking = ref('')
+const liveThinkOpen = ref(true)
 const liveAnswer = ref('')
-const liveTools = ref<string[]>([])
+const liveSteps = ref<PilotStep[]>([])
 const turns = ref<Turn[]>([])
 // 会话 id：每次开舱重新生成——同一开舱内的追问（候选序数 / 指代）靠它串起
 const sessionId = ref('')
@@ -139,33 +142,56 @@ function priceBriefing(f: PilotPriceFacts): string {
   })
 }
 
-function buildTurn(q: string, e: PilotAskResponse): Turn {
+/** 步骤条目 → 用户语言一行：词条基础文案 + 最小插值（计数 / 对象名 / 模块名）。 */
+function stepText(s: PilotStep): string {
+  if (s.status === 'denied') return t('pilot.step.denied')
+  const parts: string[] = [t(`pilot.step.${s.label}` as MessageKey)]
+  if (s.status === 'empty') {
+    parts.push(t('pilot.step.empty'))
+  } else if (typeof s.data.count === 'number') {
+    parts.push(t('pilot.step.hits', { count: s.data.count }))
+  } else if (s.label === 'navigate' && s.data.target) {
+    parts.push(navModuleName(s.data.target))
+  } else if (s.data.name) {
+    parts.push(t('pilot.step.target', { name: s.data.name }))
+  }
+  return parts.join(' · ')
+}
+
+function buildTurn(q: string, e: PilotAskResponse, liveStepSnapshot: PilotStep[]): Turn {
   const cards = (e.cards ?? []).filter(Boolean)
-  if (e.source === 'llm') return { q, kind: 'answer', text: e.answer || '', cards }
+  const base = {
+    q,
+    steps: e.steps ?? liveStepSnapshot.map((s) => ({ ...s, data: { ...s.data } })),
+    think: e.thinking || undefined,
+    thinkOpen: false,
+  }
+  if (e.source === 'llm') return { q, kind: 'answer', text: e.answer || '', cards, ...base }
   if (e.source === 'facts') {
     if (cards.length) {
       const first = cards[0]
       if (first.kind === 'action') {
-        return { q, kind: 'action', text: actionReceipt(first), followLink: first.action === 'monitor_add', cards }
+        return { q, kind: 'action', text: actionReceipt(first), followLink: first.action === 'monitor_add', cards, ...base }
       }
-      if (first.kind === 'price') return { q, kind: 'price', text: priceBriefing(first), cards }
-      return { q, kind: 'games', items: cardsGameItems(first), cards }
+      if (first.kind === 'price') return { q, kind: 'price', text: priceBriefing(first), cards, ...base }
+      return { q, kind: 'games', items: cardsGameItems(first), cards, ...base }
     }
     if (e.facts?.kind === 'action') {
-      return { q, kind: 'action', text: actionReceipt(e.facts), followLink: e.facts.action === 'monitor_add' }
+      return { q, kind: 'action', text: actionReceipt(e.facts), followLink: e.facts.action === 'monitor_add', ...base }
     }
-    if (e.facts?.kind === 'price') return { q, kind: 'price', text: priceBriefing(e.facts) }
+    if (e.facts?.kind === 'price') return { q, kind: 'price', text: priceBriefing(e.facts), ...base }
     if (e.facts?.kind === 'games') {
       return {
         q,
         kind: e.reason === 'need_target' ? 'candidates' : 'games',
         items: e.facts.items.map((it) => ({ name: it.name, cnyFen: it.cnyFen, discount: it.discount })),
         reasonKey: e.reason === 'need_target' ? 'pilot.reason.need_target' : undefined,
+        ...base,
       }
     }
   }
-  if (e.source === 'guide') return { q, kind: 'guide' }
-  return { q, kind: 'reason', reasonKey: (e.reason && REASON_KEYS[e.reason]) || 'pilot.error' }
+  if (e.source === 'guide') return { q, kind: 'guide', ...base }
+  return { q, kind: 'reason', reasonKey: (e.reason && REASON_KEYS[e.reason]) || 'pilot.error', ...base }
 }
 
 function cardsGameItems(f: PilotFacts): TurnItem[] {
@@ -188,8 +214,9 @@ async function ask(text?: string) {
   if (!text) question.value = ''
   streaming.value = true
   liveThinking.value = ''
+  liveThinkOpen.value = true
   liveAnswer.value = ''
-  liveTools.value = []
+  liveSteps.value = []
   let done: PilotAskResponse | null = null
   let failed = false
   try {
@@ -198,8 +225,18 @@ async function ask(text?: string) {
         liveThinking.value += e.delta
       } else if (e.type === 'answer' && e.delta) {
         liveAnswer.value += e.delta
-      } else if (e.type === 'tool' && e.summary) {
-        liveTools.value.push(e.summary)
+      } else if (e.type === 'tool_start') {
+        liveSteps.value.push({ label: e.label ?? '', status: 'running', data: {} })
+      } else if (e.type === 'tool') {
+        // 回填最后一个运行态步骤；无运行态（如重放）直接追加
+        const pending = [...liveSteps.value].reverse().find((s) => s.status === 'running')
+        if (pending) {
+          pending.label = e.label ?? pending.label
+          pending.status = e.status ?? 'ok'
+          pending.data = e.data ?? {}
+        } else {
+          liveSteps.value.push({ label: e.label ?? '', status: e.status ?? 'ok', data: e.data ?? {} })
+        }
       } else if (e.type === 'done') {
         done = e as PilotAskResponse
       } else if (e.type === 'error') {
@@ -209,9 +246,10 @@ async function ask(text?: string) {
   } catch {
     failed = true
   }
+  const stepSnapshot = liveSteps.value.map((s) => ({ ...s, data: { ...s.data } }))
   const turn = failed
-    ? { q, kind: 'reason', reasonKey: 'pilot.error' } as Turn
-    : buildTurn(q, done ?? { answer: '', thinking: null, source: 'none', reason: 'llm_failed', facts: null, cards: [], cached: false })
+    ? { q, kind: 'reason', reasonKey: 'pilot.error', steps: stepSnapshot } as Turn
+    : buildTurn(q, done ?? { answer: '', thinking: null, source: 'none', reason: 'llm_failed', facts: null, cards: [], cached: false }, stepSnapshot)
   turns.value.push(turn)
   // 导航卡生效：取本轮最后一张，跳模块并打聚焦框
   const navCards = (turn.cards ?? []).filter((c): c is PilotNavigateFacts => c.kind === 'navigate' && Boolean(c.path))
@@ -220,7 +258,7 @@ async function ask(text?: string) {
   streaming.value = false
   liveThinking.value = ''
   liveAnswer.value = ''
-  liveTools.value = []
+  liveSteps.value = []
   void scrollBottom()
 }
 
@@ -259,6 +297,30 @@ function pickCandidate(turn: Turn, index: number) {
       <div ref="scrollBox" class="pilot-turns">
         <div v-for="(turn, i) in turns" :key="i" class="pilot-turn">
           <p class="pilot-turn__q">{{ turn.q }}</p>
+
+          <!-- agent 过程时间线：done.steps 全量回填，历史轮保持可回看 -->
+          <div v-if="turn.think || turn.steps.length" class="pilot-steps">
+            <button
+              v-if="turn.think"
+              type="button"
+              class="pilot-step pilot-step--toggle"
+              :class="{ 'is-open': turn.thinkOpen }"
+              @click="turn.thinkOpen = !turn.thinkOpen"
+            >
+              <span class="pilot-step__dot" aria-hidden="true"></span>
+              <span class="pilot-step__text">{{ t('pilot.thinking') }}</span>
+            </button>
+            <p v-if="turn.think && turn.thinkOpen" class="pilot-think-body">{{ turn.think }}</p>
+            <div
+              v-for="(s, si) in turn.steps"
+              :key="si"
+              class="pilot-step"
+              :class="`is-${s.status}`"
+            >
+              <span class="pilot-step__dot" aria-hidden="true"></span>
+              <span class="pilot-step__text">{{ stepText(s) }}</span>
+            </div>
+          </div>
 
           <div v-if="turn.kind === 'reason'" class="pilot-reason">
             {{ turn.reasonKey ? t(turn.reasonKey) : '' }}
@@ -369,13 +431,30 @@ function pickCandidate(turn: Turn, index: number) {
         </div>
 
         <div v-if="streaming" class="pilot-turn">
-          <div v-if="liveThinking" class="pilot-thinking is-live">
-            <div class="pilot-thinking__head">{{ t('pilot.thinking.live') }}</div>
-            <p class="pilot-thinking__text">{{ liveThinking }}</p>
+          <div v-if="liveThinking || liveSteps.length" class="pilot-steps is-live">
+            <button
+              v-if="liveThinking"
+              type="button"
+              class="pilot-step pilot-step--toggle"
+              :class="{ 'is-open': liveThinkOpen }"
+              @click="liveThinkOpen = !liveThinkOpen"
+            >
+              <span class="pilot-step__dot" aria-hidden="true"></span>
+              <span class="pilot-step__text">{{ t('pilot.thinking.live') }}</span>
+            </button>
+            <p v-if="liveThinking && liveThinkOpen" class="pilot-think-body is-live">{{ liveThinking }}</p>
+            <div
+              v-for="(s, si) in liveSteps"
+              :key="`l${si}`"
+              class="pilot-step"
+              :class="`is-${s.status}`"
+            >
+              <span class="pilot-step__dot" aria-hidden="true"></span>
+              <span class="pilot-step__text">{{ stepText(s) }}</span>
+            </div>
           </div>
-          <div v-for="(toolLine, ti) in liveTools" :key="ti" class="pilot-tool">{{ toolLine }}</div>
           <p v-if="liveAnswer" class="pilot-answer">{{ liveAnswer }}</p>
-          <div v-if="!liveThinking && !liveAnswer && !liveTools.length" class="pilot-loading">
+          <div v-if="!liveThinking && !liveAnswer && !liveSteps.length" class="pilot-loading">
             {{ t('pilot.loading') }}
           </div>
         </div>
@@ -490,45 +569,106 @@ function pickCandidate(turn: Turn, index: number) {
   border: 1px dashed var(--border-soft);
 }
 
-.pilot-thinking {
+.pilot-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
   border: 1px solid var(--border-soft);
   border-radius: 8px;
   background: var(--bg-card);
-  overflow: hidden;
 }
 
-.pilot-thinking.is-live {
+.pilot-steps.is-live {
   border-style: dashed;
 }
 
-.pilot-thinking__head {
-  display: block;
-  width: 100%;
-  text-align: left;
-  padding: 6px 12px;
+.pilot-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: 12px;
+  line-height: 1.5;
   color: var(--text-secondary);
-  background: transparent;
-  border: none;
+  text-align: left;
 }
 
-.pilot-thinking__text {
+.pilot-step--toggle {
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+.pilot-step__dot {
+  flex: none;
+  width: 12px;
+  text-align: center;
+}
+
+.pilot-step__dot::before {
+  content: '';
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--success);
+  vertical-align: middle;
+}
+
+.pilot-step--toggle .pilot-step__dot::before {
+  display: none;
+}
+
+.pilot-step--toggle .pilot-step__dot::after {
+  content: '▸';
+  font-size: 10px;
+  color: var(--text-secondary);
+  vertical-align: middle;
+}
+
+.pilot-step--toggle.is-open .pilot-step__dot::after {
+  content: '▾';
+}
+
+.pilot-step.is-empty .pilot-step__dot::before {
+  background: var(--text-secondary);
+  opacity: 0.45;
+}
+
+.pilot-step.is-denied .pilot-step__dot::before {
+  background: var(--warning);
+}
+
+.pilot-step.is-running .pilot-step__dot::before {
+  background: var(--accent);
+  animation: pilot-dot-pulse calc(var(--duration-4) * var(--motion-scale)) ease-in-out infinite alternate;
+}
+
+@keyframes pilot-dot-pulse {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pilot-step.is-running .pilot-step__dot::before {
+    animation: none;
+  }
+}
+
+.pilot-think-body {
   margin: 0;
-  padding: 0 12px 10px;
+  padding: 2px 0 2px 20px;
   font-size: 12px;
   line-height: 1.7;
   color: var(--text-secondary);
   white-space: pre-wrap;
   word-break: break-word;
-}
-
-.pilot-tool {
-  padding: 6px 12px;
-  border-radius: 8px;
-  font-size: 12px;
-  color: var(--text-secondary);
-  background: var(--bg-card);
-  border: 1px solid var(--border-soft);
 }
 
 .pilot-answer {

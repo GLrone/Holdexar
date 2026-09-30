@@ -130,11 +130,18 @@ class TestAgentLoop:
         )
         events = [e async for e in service.ask_stream("这游戏值得入手吗", session_id="s1")]
         kinds = [e["type"] for e in events]
-        assert "tool" in kinds
+        assert "tool_start" in kinds and "tool" in kinds
+        started = [e for e in events if e["type"] == "tool_start"][0]
+        assert started["name"] == "get_price_briefing" and started["label"] == "price"
+        tool_ev = [e for e in events if e["type"] == "tool"][0]
+        assert tool_ev["label"] == "price" and tool_ev["status"] == "ok"
+        assert tool_ev["data"] == {"name": "测试游戏"}
         done = events[-1]
         assert done["type"] == "done" and done["source"] == "llm"
         assert executed == [("get_price_briefing", 292030, False)]
         assert done["tools"] == ["get_price_briefing: 测试游戏"]
+        # 时间线随 done 全量下发（前端历史轮按它还原过程）
+        assert done["steps"] == [{"label": "price", "status": "ok", "data": {"name": "测试游戏"}}]
         assert usage["tokens"] == 120
         # 工具结果沉淀为结构化卡片（前端组件渲染数据层）
         assert done["cards"] == [{"kind": "price", **{**_FACTS, "appid": 292030}}]
@@ -156,9 +163,44 @@ class TestAgentLoop:
         )
         events = [e async for e in service.ask_stream("批量把所有游戏加进关注")]
         tool_events = [e for e in events if e["type"] == "tool"]
-        assert tool_events and "denied" in tool_events[0]["summary"]
+        assert tool_events and tool_events[0]["status"] == "denied"
+        assert tool_events[0]["label"] == "denied"
         done = events[-1]
         assert done["type"] == "done" and done["source"] == "llm"
+        assert done["steps"] == [{"label": "denied", "status": "denied", "data": {}}]
+
+    @pytest.mark.asyncio
+    async def test_steps_accumulate_across_rounds(self, monkeypatch):
+        _patch_ready(monkeypatch)
+        scripts = [
+            [("tool_calls", [{"id": "t1", "name": "search_games", "arguments": {"q": "x"}}])],
+            [("tool_calls", [{"id": "t2", "name": "get_price_briefing", "arguments": {"appid": 7}}])],
+            [("answer", "完成")],
+        ]
+        rounds = {"n": 0}
+
+        async def _rounds(**kw):
+            for item in scripts[rounds["n"]]:
+                yield item
+            rounds["n"] += 1
+
+        monkeypatch.setattr(service.pilot_llm, "chat_stream", _rounds)
+
+        async def _multi(name, arguments, guarded=False):
+            if name == "search_games":
+                return {"kind": "games", "items": [{"appid": i} for i in range(3)]}
+            return {**_FACTS, "appid": arguments.get("appid")}
+
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _multi)
+        events = [e async for e in service.ask_stream("找一款试试", session_id="s-steps")]
+        pairs = [(e["type"], e.get("label")) for e in events if e["type"] in ("tool_start", "tool")]
+        assert pairs == [("tool_start", "search"), ("tool", "search"),
+                         ("tool_start", "price"), ("tool", "price")]
+        done = events[-1]
+        assert done["steps"] == [
+            {"label": "search", "status": "ok", "data": {"count": 3}},
+            {"label": "price", "status": "ok", "data": {"name": "测试游戏"}},
+        ]
 
     @pytest.mark.asyncio
     async def test_session_history_reaches_model(self, monkeypatch):

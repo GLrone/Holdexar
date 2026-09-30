@@ -78,4 +78,6 @@ class AskResponse(BaseModel):
     facts: dict | None = None
     """本轮工具取到的结构化卡片（games / price / action），供前端组件渲染。"""
     cards: list = []
+    """本轮 agent 时间线（tools.tool_step 产出）；降级路径为空列表。"""
+    steps: list = []
     cached: bool = False
