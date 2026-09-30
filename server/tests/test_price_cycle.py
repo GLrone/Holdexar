@@ -381,6 +381,118 @@ async def test_chain_exception_lands_on_failed(db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_finalization_exception_lands_on_failed(db, monkeypatch):
+    """收尾段异常：兜底收敛 failed，Cycle 不僵死在中间态等重启收尸。"""
+    _crawl_env(monkeypatch)
+    await _seed_games(db, APPIDS)
+
+    async def _boom(cycle_id):
+        raise RuntimeError("收尾撞锁")
+
+    monkeypatch.setattr(cycle_mod, "jobs_of", _boom)
+
+    await sched_mod._run_price_cycle([{"scope": "pool"}])
+
+    # 断言不走 list_cycles（它内部也调 jobs_of，已被桩住）
+    async with db() as session:
+        row = (await session.execute(
+            select(PriceCycle).order_by(PriceCycle.id.desc())
+        )).scalars().first()
+    assert row is not None
+    assert row.status == cycle_mod.FAILED
+    assert row.error
+    assert row.status not in cycle_mod.OPEN_STATES
+
+
+@pytest.mark.asyncio
+async def test_occupied_specs_yield_and_retry_once(db, monkeypatch):
+    """主轮被同拍任务挤占：空结果让路重试一次，不整轮背锅 failed。"""
+    _crawl_env(monkeypatch)
+    await _seed_games(db, APPIDS)
+    monkeypatch.setattr(sched_mod, "_SPEC_YIELD_WAIT_SECONDS", 0)
+
+    real_run = crawl_service.run_sequential
+    calls = {"n": 0}
+
+    async def _occupied_then_free(specs, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return []
+        return await real_run(specs, **kw)
+
+    monkeypatch.setattr(crawl_service, "run_sequential", _occupied_then_free)
+
+    await sched_mod._run_price_cycle([{"scope": "pool"}])
+
+    assert calls["n"] == 2, "空结果必须触发一次让路重试"
+    jobs = await _job_rows(db)
+    assert jobs, "重试后任务真实启动并挂到本轮 Cycle"
+    rows = await cycle_mod.list_cycles(5)
+    assert rows and rows[0]["jobs"], "重试启动的 job 归属本轮 Cycle"
+
+
+# ── 轮批次总账（任务页「总队列」）──
+
+
+@pytest.mark.asyncio
+async def test_freeze_records_batch_ledger(db, monkeypatch):
+    """建轮冻结时落轮批次总账分母：各段款数 ÷ 单发容量 × 区数。"""
+    _crawl_env(monkeypatch)
+    await _seed_games(db, APPIDS)
+
+    await sched_mod._run_price_cycle([{"scope": "pool"}])
+
+    rows = await cycle_mod.list_cycles(5)
+    assert rows and rows[0]["batchesExpected"] is not None
+    # pool 段 2 款 = 1 桶 × 2 区（CN/UA）= 2 批
+    assert rows[0]["batchesExpected"] == 2
+
+
+@pytest.mark.asyncio
+async def test_finish_job_recomputes_round_done(db, monkeypatch):
+    """任务收尾重算轮批次完成量：挂轮各 job 已处理量之和，不增量累加。"""
+    _crawl_env(monkeypatch)
+    cid = await cycle_mod.create("scheduled", "pool")
+
+    async with db() as session:
+        j1 = CrawlJob(kind="scheduled", status="running", mode="app",
+                      started_at=datetime.now(), cycle_id=cid,
+                      stats_json={"total": 5, "processed": 0})
+        j2 = CrawlJob(kind="scheduled", status="running", mode="app",
+                      started_at=datetime.now(), cycle_id=cid,
+                      stats_json={"total": 4, "processed": 0})
+        session.add_all([j1, j2])
+        await session.commit()
+        j1_id, j2_id = j1.id, j2.id
+
+    await crawl_service._finish_job(
+        j1_id, "done", {"total": 5, "processed": 3, "success": 3, "failed": 0}
+    )
+    await crawl_service._finish_job(
+        j2_id, "done", {"total": 4, "processed": 2, "success": 2, "failed": 0}
+    )
+
+    async with db() as session:
+        cycle = await session.get(PriceCycle, cid)
+    assert cycle is not None and cycle.batches_done == 5, "两段 processed 之和"
+
+
+@pytest.mark.asyncio
+async def test_start_job_records_initial_batch_total(db, monkeypatch):
+    """任务行启动即落精确批次账本（stats.total），不等收尾统计。"""
+    _crawl_env(monkeypatch)
+    await _seed_games(db, APPIDS)
+
+    await sched_mod._run_price_cycle([{"scope": "pool"}])
+
+    jobs = await _job_rows(db)
+    assert jobs, "本轮应启动 pool 段任务"
+    assert all((j.stats_json or {}).get("total") for j in jobs), (
+        "启动即有分母，轮级总队列不缺当前段"
+    )
+
+
+@pytest.mark.asyncio
 async def test_no_enabled_region_fails_cycle_but_chain_still_attempted(
     db, monkeypatch,
 ):
