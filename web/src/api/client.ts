@@ -238,6 +238,7 @@ export const settingsApi = {
 // ─── pilot（领航员：比价助手问答）────────────────────────
 
 export interface PilotConfigPayload {
+  protocol: string
   enabled: boolean
   base_url: string
   model: string
@@ -305,6 +306,7 @@ export interface PilotAskResponse {
 export const pilotApi = {
   getConfig: () => request<PilotConfigPayload>('GET', '/pilot/config'),
   updateConfig: (payload: {
+    protocol?: string
     enabled?: boolean
     base_url?: string
     model?: string

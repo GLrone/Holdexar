@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 
 
 class PilotConfigPayload(BaseModel):
+    protocol: str
     enabled: bool
     base_url: str
     model: str
@@ -16,6 +17,7 @@ class PilotConfigPayload(BaseModel):
 class PilotConfigUpdate(BaseModel):
     """api_key 缺省 = 不改动；显式空串 = 清空（router 按 fields_set 区分）。"""
 
+    protocol: str | None = None
     enabled: bool | None = None
     base_url: str | None = None
     model: str | None = None
