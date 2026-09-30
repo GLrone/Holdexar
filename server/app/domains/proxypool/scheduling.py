@@ -121,7 +121,6 @@ async def run_startup_l1(
             session, data_dir=data_dir, controller_url=controller_url, secret=secret,
             now=now, names=chunk, **extra,
         ))
-        await session.commit()
     return tuple(outcomes)
 
 
@@ -214,13 +213,11 @@ async def run_l0_cycle(
             session, data_dir=data_dir, controller_url=controller_url, secret=secret,
             now=now, names=chunk, **extra,
         ))
-        await session.commit()
     if recovery_controller is not None:
         await recover_dead_nodes(
             session, controller_url=recovery_controller[0], secret=recovery_controller[1],
             now=now, **extra,
         )
-        await session.commit()
     if await eligible_runtime_names(session) != before:
         request_rebuild()
     return tuple(outcomes)
@@ -276,7 +273,7 @@ async def _maintenance_probe(
     # 首个分块提交，SQLite 写锁会被按住 10 个探测的时长（慢节点日可达数百秒），
     # 同拍的价格落库/钱包/设置写入全部排队甚至撞满 busy_timeout。观测行的归属
     # 只依赖 run.id，run 行先落库不影响一致性。
-    async with write_gate(WritePriority.BACKGROUND):
+    async with write_gate(WritePriority.BACKGROUND, label="health_observation"):
         await session.flush()
         await session.commit()
     before_eligible = await eligible_runtime_names(session)
@@ -312,7 +309,7 @@ async def _maintenance_probe(
     run.duration_ms = int((run.finished_at - run.started_at).total_seconds() * 1000)
     # 收尾提交放在恢复 GLOBAL（网络调用）之前：节点状态与观测此时已齐，
     # 写锁不得跨网络段持有。
-    async with write_gate(WritePriority.BACKGROUND):
+    async with write_gate(WritePriority.BACKGROUND, label="health_observation"):
         await session.commit()
     # L2 现在喂节点状态机：合格集可能因判死/复活而变化，与 L0 周期同款
     # before/after 比较请求重建，不另立信号。
@@ -454,7 +451,10 @@ async def run_proxypool_cycle(
         session, data_dir=data_dir, controller_url=controller_url, secret=secret,
         now=now, target_url=l0_target_url, recovery_controller=recovery_controller,
     )
-    await session.commit()
+    # L0 段的提交边界（docstring「L0 独立提交一次」）：池函数已内部过闸提交，
+    # 此处兜住任何未在内部提交的 L0 段写入，维护开始前写锁必已放开
+    async with write_gate(WritePriority.BACKGROUND):
+        await session.commit()
 
     if crawler_busy():
         # L0 是唯一允许在 crawler 占线时运行的维护动作

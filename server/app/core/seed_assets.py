@@ -49,6 +49,7 @@ from sqlalchemy import select, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.config import get_settings
+from app.core.database import WritePriority, get_session_factory, write_gate
 from app.domains.games.models import Game
 from app.domains.settings.models import AppSetting
 
@@ -430,7 +431,11 @@ async def merge_history_seed(seed_path: Path | None = None) -> dict | None:
     if db_file is None:  # 内存库 / 非文件库：无从合并（测试直接调 _merge_history_sync）
         return None
 
-    stats = await asyncio.to_thread(_merge_history_sync, db_file, path, version)
+    # 线程池内的原生 sqlite 写事务也在写调度器管辖内：闸在事件循环侧持住
+    # （持有期 = 整个合并事务，启动链顺序位保证此时无其他写者），跑在
+    # 线程池里的原生连接不再是无主写者。
+    async with write_gate(WritePriority.BACKGROUND, label="seed_history_merge"):
+        stats = await asyncio.to_thread(_merge_history_sync, db_file, path, version)
     if not stats:
         # 种子不含价格历史表（schema 1 旧种子）：静默，待下个 schema 2+ 种子再并
         return None

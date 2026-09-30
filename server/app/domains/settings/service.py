@@ -38,14 +38,14 @@ async def delete_value(key: str) -> None:
     """删除键（下架功能的设置项清账用，不存在时静默）。"""
     from sqlalchemy import delete
 
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE, label="settings"), get_session_factory()() as session:
         await session.execute(delete(AppSetting).where(AppSetting.key == key))
         await session.commit()
 
 
 async def set_value(key: str, value) -> None:
     now = get_beijing_time_obj().replace(tzinfo=None)
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE, label="settings"), get_session_factory()() as session:
         stmt = sqlite_insert(AppSetting).values(
             key=key, value_json=value, updated_at=now
         )

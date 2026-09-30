@@ -736,7 +736,7 @@ async def _save_wallet(
     冻结终态），同样只由调用方算好传入。
     """
     now = now or _naive_now()
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE, label="wallet_save"), get_session_factory()() as session:
         row = await session.get(SteamAccount, steam_id)
         if row is None:
             return
@@ -801,7 +801,7 @@ async def _sync_profile_row(steam_id: str, cookies: str, now: datetime) -> None:
             return
         # 取数段（无写闸）：网络拉取不持写者位
         fetched = await fetch_profile(steam_id, proxy_url=await _strategy_proxy())
-        async with write_gate(WritePriority.INTERACTIVE):
+        async with write_gate(WritePriority.INTERACTIVE, label="account_sync"):
             if fetched.get("persona_name") and not row.persona_name:
                 row.persona_name = fetched["persona_name"]
             new_avatar = fetched.get("avatar_url", "")
@@ -832,7 +832,7 @@ async def refresh_online_states(rows: list[SteamAccount] | None = None) -> dict:
     )
     if not states:
         return {"ok": False, "status": "fetch_failed"}
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE, label="account_sync"), get_session_factory()() as session:
         for r in rows:
             s = states.get(r.steam_id)
             if s is None:  # 响应缺失 = 离线（私密档案同款语义）

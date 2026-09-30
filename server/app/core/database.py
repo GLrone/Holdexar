@@ -1066,11 +1066,15 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
 
 # ── 全局写入调度器（SQLite 单写者约束）───────────────────────────────
 # SQLite 同一时刻只允许一个写事务；WAL 下读并发不受此约束。全部写事务经
-# 全部写事务经 write_gate() 进入调度，任何绕过闸的写事务都会在文件锁层
-# 与其他写者互撞（busy_timeout 60s 吸收不掉持续进站的写者）。
+# write_gate() 进入调度，任何绕过闸的写事务都会在文件锁层与其他写者互撞
+# （busy_timeout 60s 吸收不掉持续进站的写者）。机械防线见
+# scripts/check_write_paths.py（裸 commit/flush/裸 SQL 写入进不了仓库）。
 # 调度规则：交互写（用户操作）优先于后台批量；后台大批次分段提交让出写者，
 # 用户写不被整批堵住。串行依赖的全局状态 = SQLite 单写者，同一任务内嵌套
 # 过闸（批量回退路径、工具函数复用）按重入处理——单任务顺序事务不破坏单写者。
+# 互斥边界：调度器按事件循环各持一份（见 _schedulers），互斥范围 = 单个
+# event loop 内的任务；跨线程的独立 event loop、独立进程不在其管辖内
+# （跨进程一致性由 SQLite 文件锁与运行约束兜底，如启动链种子合并例外）。
 
 
 class WritePriority(IntEnum):
@@ -1106,6 +1110,11 @@ _WAIT_WARN_MS = {WritePriority.INTERACTIVE: 1000.0, WritePriority.BACKGROUND: 15
 _HOLD_WARN_MS = 5000.0
 
 
+def _label_suffix(label: str | None) -> str:
+    """告警日志的归属后缀：无标签时保持原日志形态。"""
+    return f" {label}" if label else ""
+
+
 class WriteScheduler:
     """单写者闸 + 交互优先排队。同一事件循环一份（见 _schedulers）。
 
@@ -1117,9 +1126,10 @@ class WriteScheduler:
     def __init__(self) -> None:
         self._owner: asyncio.Task | None = None
         self._owner_priority: WritePriority | None = None
+        self._owner_label: str | None = None
         self._depth = 0
         self._hold_started = 0.0
-        self._waiters: dict[WritePriority, deque[tuple[asyncio.Task, asyncio.Future[None]]]] = {
+        self._waiters: dict[WritePriority, deque[tuple[asyncio.Task, asyncio.Future[None], str | None]]] = {
             WritePriority.INTERACTIVE: deque(),
             WritePriority.BACKGROUND: deque(),
         }
@@ -1133,11 +1143,29 @@ class WriteScheduler:
         return {
             "busy": self._owner is not None,
             "depth": self._depth,
+            "owner_priority": self._owner_priority.name if self._owner_priority is not None else None,
+            "owner_label": self._owner_label,
             "waiting_interactive": len(self._waiters[WritePriority.INTERACTIVE]),
             "waiting_background": len(self._waiters[WritePriority.BACKGROUND]),
         }
 
-    async def acquire(self, priority: WritePriority) -> None:
+    def diagnostics(self) -> dict:
+        """诊断快照：占用归属 + 排队 + 分优先级等待/持闸指标（诊断端点用）。"""
+        return {
+            **self.snapshot(),
+            "metrics": {
+                prio.name: {
+                    "count": m.count,
+                    "wait_last_ms": round(m.wait_last_ms, 1),
+                    "wait_max_ms": round(m.wait_max_ms, 1),
+                    "hold_last_ms": round(m.hold_last_ms, 1),
+                    "hold_max_ms": round(m.hold_max_ms, 1),
+                }
+                for prio, m in self.metrics.items()
+            },
+        }
+
+    async def acquire(self, priority: WritePriority, label: str | None = None) -> None:
         task = asyncio.current_task()
         assert task is not None
         if self._owner is task:
@@ -1145,11 +1173,11 @@ class WriteScheduler:
             return
         t0 = time.perf_counter()
         if self._owner is None and not any(self._waiters.values()):
-            self._grant(task, priority)
-            self._observe_wait(priority, t0)
+            self._grant(task, priority, label)
+            self._observe_wait(priority, label, t0)
             return
         fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        self._waiters[priority].append((task, fut))
+        self._waiters[priority].append((task, fut, label))
         try:
             await fut
         except asyncio.CancelledError:
@@ -1158,15 +1186,16 @@ class WriteScheduler:
             if fut.done() and not fut.cancelled():
                 self._owner = None
                 self._owner_priority = None
+                self._owner_label = None
                 self._depth = 0
                 self._handoff()
             else:
                 try:
-                    self._waiters[priority].remove((task, fut))
+                    self._waiters[priority].remove((task, fut, label))
                 except ValueError:
                     pass
             raise
-        self._observe_wait(priority, t0)
+        self._observe_wait(priority, label, t0)
 
     def release(self) -> None:
         self._depth -= 1
@@ -1177,16 +1206,20 @@ class WriteScheduler:
             self.metrics[self._owner_priority].observe_hold(hold_ms)
             if hold_ms > _HOLD_WARN_MS:
                 logger.warning(
-                    "写调度：%s 写事务持闸 %.1fs（%s）",
-                    self._owner_priority.name, hold_ms / 1000, self.snapshot(),
+                    "写调度：%s%s 写事务持闸 %.1fs（%s）",
+                    self._owner_priority.name, _label_suffix(self._owner_label),
+                    hold_ms / 1000, self.snapshot(),
                 )
         self._owner = None
         self._owner_priority = None
+        self._owner_label = None
         self._handoff()
 
-    def _grant(self, task: asyncio.Task, priority: WritePriority) -> None:
+    def _grant(self, task: asyncio.Task, priority: WritePriority,
+               label: str | None = None) -> None:
         self._owner = task
         self._owner_priority = priority
+        self._owner_label = label
         self._depth = 1
         self._hold_started = time.perf_counter()
 
@@ -1195,20 +1228,23 @@ class WriteScheduler:
         for prio in (WritePriority.INTERACTIVE, WritePriority.BACKGROUND):
             queue = self._waiters[prio]
             while queue:
-                task, fut = queue.popleft()
+                entry = queue.popleft()
+                task, fut, label = entry
                 if fut.done():
                     continue
-                self._grant(task, prio)
+                self._grant(task, prio, label)
                 fut.set_result(None)
                 return
 
-    def _observe_wait(self, priority: WritePriority, t0: float) -> None:
+    def _observe_wait(self, priority: WritePriority, label: str | None,
+                      t0: float) -> None:
         wait_ms = (time.perf_counter() - t0) * 1000
         self.metrics[priority].observe_wait(wait_ms)
         if wait_ms > _WAIT_WARN_MS[priority]:
             logger.warning(
-                "写调度：%s 写事务排队 %.1fs 才拿到写者位（%s）",
-                priority.name, wait_ms / 1000, self.snapshot(),
+                "写调度：%s%s 写事务排队 %.1fs 才拿到写者位（%s）",
+                priority.name, _label_suffix(label), wait_ms / 1000,
+                self.snapshot(),
             )
 
 
@@ -1227,13 +1263,14 @@ def _scheduler_for_loop() -> WriteScheduler:
 class _WriteGate:
     """async with write_gate() 的闸体：包住「首条写语句 → 提交」全程。"""
 
-    def __init__(self, priority: WritePriority) -> None:
+    def __init__(self, priority: WritePriority, label: str | None) -> None:
         self._priority = priority
+        self._label = label
         self._scheduler: WriteScheduler | None = None
 
     async def __aenter__(self) -> None:
         self._scheduler = _scheduler_for_loop()
-        await self._scheduler.acquire(self._priority)
+        await self._scheduler.acquire(self._priority, self._label)
 
     async def __aexit__(self, *exc: object) -> None:
         if self._scheduler is not None:
@@ -1241,10 +1278,21 @@ class _WriteGate:
             self._scheduler = None
 
 
-def write_gate(priority: WritePriority = WritePriority.BACKGROUND) -> _WriteGate:
+def write_gate(
+    priority: WritePriority = WritePriority.BACKGROUND,
+    label: str | None = None,
+) -> _WriteGate:
     """写事务闸：包住会话的「首条写语句 → 提交」区间，会话由调用方自建
-    （各域经自身 `get_session_factory` 导入取连接，测试接缝保持不变）。"""
-    return _WriteGate(priority)
+    （各域经自身 `get_session_factory` 导入取连接，测试接缝保持不变）。
+
+    label 标注写事务归属（如 price_batch / wallet_save），随排队/持闸
+    告警日志输出，直接回答「是谁在堵」。"""
+    return _WriteGate(priority, label)
+
+
+def write_scheduler_diagnostics() -> dict:
+    """当前事件循环写调度器的诊断快照（写者被堵时的取证出口）。"""
+    return _scheduler_for_loop().diagnostics()
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
