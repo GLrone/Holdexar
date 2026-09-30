@@ -80,6 +80,26 @@ def _priority_of(source: str) -> int:
     return SOURCE_PRIORITY.get(source, DEFAULT_SOURCE_PRIORITY)
 
 
+async def active_source_appids(source: str, session=None) -> set[int]:
+    """当前挂在该来源下的 game appid 集合（active=1）。
+
+    认知度因子「Steam 官方榜单」（source='board'）从既有来源账本读取——
+    monitor_sources 是「谁在监控它」的唯一事实源，榜单认知度不另立账本。
+    查询走 ix_monitor_source_lookup(source, active)。
+    """
+    stmt = select(MonitorSource.target_id).where(
+        MonitorSource.target_type == TARGET_GAME,
+        MonitorSource.source == source,
+        MonitorSource.active.is_(True),
+    )
+    if session is not None:
+        rows = (await session.execute(stmt)).all()
+    else:
+        async with get_session_factory()() as own:
+            rows = (await own.execute(stmt)).all()
+    return {int(r[0]) for r in rows}
+
+
 # ── 内部：行维护 + 状态重算 ────────────────────────────────────
 
 

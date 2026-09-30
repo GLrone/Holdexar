@@ -57,6 +57,8 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "diff_fen": "INTEGER DEFAULT 0",
         # smart 排序评分（refresh_sort_cache 维护；NULL=未计算）
         "smart_score": "REAL",
+        # 认知度快照（refresh_sort_cache 维护；见 scoring.py）
+        "steam_board": "BOOLEAN DEFAULT 0",
         # 商店移除监控：下架判定时间戳 + 连续全 404 轮数
         "removed_at": "DATETIME",
         "removed_strikes": "INTEGER DEFAULT 0",
