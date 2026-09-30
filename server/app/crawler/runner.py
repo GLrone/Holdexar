@@ -94,15 +94,23 @@ def build_router() -> CrawlerRouter:
 
 
 def _build_app_tasks(
-    appids: list[int], regions: list[str], extras: bool
+    appids: list[int], regions: list[str], extras: bool, workers: int = 0
 ) -> list[dict]:
-    """appid 集 → 每区分批任务（1 任务 = 1 区 × ≤300 appid）。"""
+    """appid 集 → 每区分批任务（1 任务 = 1 区 × ≤300 appid）。
+
+    批大小生成顺序：本轮有效 worker 数 → 目标批 = appids × 区数 ÷ workers
+    （任务总数 ≈ worker 数，每个 worker 都有任务在飞，削单请求长尾对整轮
+    的拖累）→ 300 条上限收口 → URL 长度兜底再切（plan_batches）。各区共用
+    同一 size，跨区批次的 appids 保持对齐。
+    """
+    n = len(appids)
+    size = bs.DEFAULT_BATCH_SIZE
+    if workers > 0 and regions and n:
+        size = max(1, min(size, -(-n * len(regions) // workers)))
     tasks: list[dict] = []
     for cc in regions:
         for i, batch in enumerate(
-            bs.StoreBrowseAPI.plan_batches(
-                appids, cc, "english", extras, bs.DEFAULT_BATCH_SIZE
-            )
+            bs.StoreBrowseAPI.plan_batches(appids, cc, "english", extras, size)
         ):
             tasks.append(
                 {"type": "app", "id": f"{cc}:{i + 1}", "region": cc, "appids": batch}
@@ -269,13 +277,14 @@ async def _run_crawl_locked(
     router = build_router()
 
     target_ids = [int(a) for a, _ in (appids or [])]
-    tasks: list[dict] = list(pre_tasks or []) + _build_app_tasks(
-        target_ids, regions, bs.EXTRAS_ENABLED
+    built_tasks = _build_app_tasks(
+        target_ids, regions, bs.EXTRAS_ENABLED, config.workers
     )
+    tasks: list[dict] = list(pre_tasks or []) + built_tasks
 
     logger.info(
         "任务就绪：常规 %d + 预构建 %d | appids=%d regions=%s workers=%d 入口=%s",
-        len(_build_app_tasks(target_ids, regions, bs.EXTRAS_ENABLED)),
+        len(built_tasks),
         len(pre_tasks or []),
         len(target_ids),
         ",".join(regions),
@@ -317,6 +326,9 @@ async def _run_crawl_locked(
             failure_ledger=bs.FAILED_TASKS,
             error_sink=error_sink,
             client_factory=client_factory,
+            # 入口总数即出口兵源数：大于 worker 数时多出的部分是待用出口池，
+            # 被隔离的 lane 由它们顶替（worker 岗位数不掉）
+            lane_count=len(config.proxy_urls or []) or None,
         )
         await scheduler.run(tasks, session)
 

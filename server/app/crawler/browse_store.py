@@ -53,7 +53,9 @@ _URL_SAFE = '{}",:0123456789abcdefghijklmnopqrstuvwxyz-_.'
 # （340 条 / 6474 字节仍回 200；360 条 / 6834 字节回 414；400 条 / 7554 字节回 400，
 # 直连与经本地内核结果一致）。取 6000 留余量：请求行还含方法、路径与协议版本。
 MAX_URL_LEN = 6000
-DEFAULT_BATCH_SIZE = 400
+# 单发条数上限：7 位 appid 每条约 12 字符，6.5KB 边界折算 ~313 条即拒收——
+# 取 300 留余量；URL 长度兜底再切仍由 plan_id_batches 负责（spec 更长时收紧）
+DEFAULT_BATCH_SIZE = 300
 
 DATA_REQUEST_BASE = {
     "include_basic_info": True,

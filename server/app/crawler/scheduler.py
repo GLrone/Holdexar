@@ -4,9 +4,10 @@
 - 计数器周期日志
 - asyncio.Event 停止信号
 - 每个任务完成向 SSE 事件总线发布 crawl.progress
-- **worker ↔ 入口绑定**：多入口形态下每个 worker 在整个 run 内固定使用一条 lane
-  （`client_factory(worker_id)` 决定），不再所有 worker 挤同一个入口。Session 只
-  负责连接池生命周期，不承担"换出口"职责。
+- **岗位池（Coordinator 的 lane 管理）**：`client_factory(i)` 物化全部 lane（含待用
+  出口）；worker 每个任务前从池里租一条健康 lane，用完归还——worker 协程整个 run
+  不销毁。lane 连续失败即隔离进冷却区（到期放一发探测任务验证通道），worker 立刻
+  换下一条健康 lane 继续领任务：死出口拖不住岗位，岗位数由池中健康 lane 数托底。
 """
 from __future__ import annotations
 
@@ -38,9 +39,8 @@ _LANE_COOLDOWN_SECONDS = 60
 class CrawlerScheduler:
     """基于 asyncio.Queue 的高可用任务调度器（生产者-消费者模型）。
 
-    `client_factory(worker_id) -> SteamHttpClient` 可选：给了就每个 worker 用它取
-    自己的客户端（多入口形态，一 worker 一 lane）；不给则全体共用 `http_client`
-    （单入口形态，行为不变）。
+    `client_factory(i) -> SteamHttpClient` 可选：给了就按 lane 序号取客户端（多入口
+    形态的岗位池）；不给则全体共用 `http_client`（单入口形态，行为不变）。
     """
 
     def __init__(
@@ -48,12 +48,22 @@ class CrawlerScheduler:
         failure_ledger: list | None = None,
         error_sink: Callable[[BaseException], None] | None = None,
         client_factory: Callable[[int], object] | None = None,
+        lane_count: int | None = None,
     ):
         self.router = router
         self.http_client = http_client
         self.db_writer = db_writer
         self.worker_count = worker_count
         self.client_factory = client_factory
+        # 出口兵源条数（默认 = worker 数）：可大于 worker_count——多出的即待用出口
+        self.lane_count = lane_count
+        # 岗位池（Coordinator 的 lane 管理）：run 时由 factory 物化全部 lane，
+        # worker 逐任务租借；lane_unhealthy → 隔离进冷却区，到期放一条探测。
+        # worker 协程不销毁——没有岗位就等，岗位回来立刻继续领任务。
+        self._lanes: list = []
+        self._cooldown_lanes: list = []
+        self._cooldown_until: dict[int, float] = {}
+        self._lanes_ready = False
         self.queue: asyncio.Queue = asyncio.Queue()
         self.stop_event = stop_event or asyncio.Event()
         # 错误分类回调（生产作业台账用）：worker 捕获到的异常在这里分类计数。
@@ -119,34 +129,83 @@ class CrawlerScheduler:
             speed=round(self._get_speed(), 2),
         )
 
+    def _materialize_lanes(self) -> None:
+        """run 开始时物化岗位池：一条 lane 一个客户端（出口预算随客户端走）。
+
+        lane 数取 `lane_count`（默认 worker 数）：大于 worker 数时多出的入口即
+        **待用出口池**——被隔离的 lane 由它们顶替，岗位数不掉。
+        """
+        if self.client_factory is not None and not self._lanes_ready:
+            count = self.lane_count or self.worker_count
+            self._lanes = [self.client_factory(i) for i in range(count)]
+            self._lanes_ready = True
+
+    def _sweep_unhealthy(self) -> None:
+        """把池里已被标记不健康的 lane 扫进冷却区——否则它们既不派活也拿不到
+        冷却复活探测，永久卡死在岗位池里。"""
+        for lane in list(self._lanes):
+            if getattr(lane, "lane_unhealthy", False):
+                self._lanes.remove(lane)
+                if lane not in self._cooldown_lanes:
+                    self._cooldown_lanes.append(lane)
+                    self._cooldown_until[id(lane)] = (
+                        time.monotonic() + _LANE_COOLDOWN_SECONDS
+                    )
+
+    def _acquire_lane(self):
+        """从岗位池取一条 lane，返回 (lane, is_probe)；无可用岗位返回 (None, False)。
+
+        冷却到期的 lane 以**探路位**返回（`is_probe=True`）：它此刻仍带 unhealthy
+        标记，但正因如此才要放一个真任务去验证通道——调用方不得立即再隔离它，
+        否则形成「隔离→到期→再隔离」的空转死锁。
+        """
+        self._sweep_unhealthy()
+        for lane in self._lanes:
+            self._lanes.remove(lane)
+            return lane, False
+        now = time.monotonic()
+        for lane in list(self._cooldown_lanes):
+            if now >= self._cooldown_until.pop(id(lane), 0.0):
+                self._cooldown_lanes.remove(lane)
+                return lane, True
+        return None, False
+
+    def _quarantine_lane(self, lane) -> None:
+        """lane 连续失败 → 移出岗位池进冷却区，到期自动回来接受探测。"""
+        if lane in self._lanes:
+            self._lanes.remove(lane)
+        if lane not in self._cooldown_lanes:
+            self._cooldown_lanes.append(lane)
+            self._cooldown_until[id(lane)] = time.monotonic() + _LANE_COOLDOWN_SECONDS
+
+    def _release_lane(self, lane) -> None:
+        if lane not in self._lanes and lane not in self._cooldown_lanes:
+            self._lanes.append(lane)
+        self._sweep_unhealthy()
+
     async def _worker(self, worker_id: int, session) -> None:
-        # 本 worker 固定使用的入口客户端：多出口形态下一 worker 一条 lane，
-        # 整个 run 不换（换入口由 Runtime 的重建/重绑负责，不在这里发生）
+        # Coordinator 岗位模型：worker 不再终身绑定 lane。每个任务前从岗位池
+        # 租一条健康 lane；lane_unhealthy → 隔离进冷却区并立刻换下一条——
+        # 死节点拖不住 worker，任务队列由健康岗位继续消化。
         http_client = (
             self.client_factory(worker_id) if self.client_factory is not None
             else self.http_client
         )
-        # 冷却到期后放行一个任务作探测的通行证（探测请求成功即复位通道健康）
-        lane_probe_due = False
         while not self.stop_event.is_set():
-            # 死通道冷却：多出口形态下，本 worker 绑定的出口连续连接失败
-            # 即暂停拉任务，让健康出口消化队列；冷却到期放一发探测（拉一个
-            # 任务真跑一次），请求一旦成功即复位恢复。全部出口同坏时任务
-            # 仍会经重推耗尽进失败台账，队列照常收敛——只降速，不停摆
-            if (
-                self.client_factory is not None
-                and not lane_probe_due
-                and getattr(http_client, "lane_unhealthy", False)
-            ):
-                try:
-                    await asyncio.wait_for(
-                        self.stop_event.wait(), timeout=_LANE_COOLDOWN_SECONDS
-                    )
-                except asyncio.TimeoutError:
-                    lane_probe_due = True  # 冷却到期：本轮放行一个任务作探测
+            if self.client_factory is not None:
+                http_client, is_probe = self._acquire_lane()
+                if http_client is None:
+                    # 全部岗位在隔离/租出：等岗位回来或停止（队列由别的岗位消化）
+                    try:
+                        await asyncio.wait_for(
+                            self.stop_event.wait(), timeout=1.0
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        continue
+                if not is_probe and getattr(http_client, "lane_unhealthy", False):
+                    self._quarantine_lane(http_client)
                     continue
-                break
-            lane_probe_due = False
             try:
                 task = await self.queue.get()
             except asyncio.CancelledError:
@@ -194,6 +253,8 @@ class CrawlerScheduler:
                 # 进度事件必须先于 task_done 发布：join() 一放行，run() 的收尾
                 # 路径（job.status）就会出站；末条进度若压在它后面，客户端会把
                 # 已收束的任务重新置回运行态，进度条卡死在 100%。
+                if self.client_factory is not None:
+                    self._release_lane(http_client)
                 await self._record_speed()
                 if self.total_processed % _PROGRESS_LOG_EVERY == 0:
                     done, ok, fails = self._derived_counts()
@@ -216,6 +277,7 @@ class CrawlerScheduler:
         """
         total_initial = len(initial_tasks)
         self.total_target = total_initial
+        self._materialize_lanes()
         for task in initial_tasks:
             await self.queue.put(task)
 
