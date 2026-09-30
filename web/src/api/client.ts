@@ -305,6 +305,12 @@ export interface PilotAskResponse {
 
 export const pilotApi = {
   getConfig: () => request<PilotConfigPayload>('GET', '/pilot/config'),
+  detect: (payload: { base_url?: string; api_key?: string; protocol?: string }) =>
+    request<{ protocol: string; vendor: string; models: string[]; suggested: string[]; key_valid: boolean | null }>(
+      'POST',
+      '/pilot/detect',
+      payload,
+    ),
   updateConfig: (payload: {
     protocol?: string
     enabled?: boolean
