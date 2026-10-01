@@ -150,9 +150,10 @@ async def test_l0_writes_visible_to_other_connection_during_maintenance(
 
 @pytest.mark.asyncio
 async def test_l0_commits_in_chunks(tmp_data_dir, monkeypatch):
-    """池内 L0 按块提交：写锁窗口 = 一块的耗时，不随池规模线性增长。
+    """池内 L0 按块探测：写锁窗口 = 池函数内部一次落库，不随池规模线性增长。
 
-    两账本对齐自身也是写事务（过写调度器提交一次），其后每块各提交一次。
+    探测与落库的分离在 health_check_pool 内完成；两账本对齐自身也是写事务
+    （调用方会话过写调度器提交一次）。
     """
     rec = _Recorder()
     chunks: list[tuple[str, ...]] = []
@@ -180,7 +181,9 @@ async def test_l0_commits_in_chunks(tmp_data_dir, monkeypatch):
                              secret="s", now=NOW)
 
     assert [len(c) for c in chunks] == [10, 10, 3], f"分块应为 10/10/3，实际 {[len(c) for c in chunks]}"
-    assert rec.events == ["commit"] * 4, f"对齐 1 次 + 每块 1 次提交，实际 {rec.events}"
+    # 分块提交已收敛进 health_check_pool 内部（自闸自提交）；调用方会话只承担
+    # 两账本对齐这一次提交
+    assert rec.events == ["commit"], f"调用方只剩对齐提交，实际 {rec.events}"
 
 
 def _write_lock_free(timeout: float = 2.0) -> bool:
