@@ -986,6 +986,8 @@ async def _run_schema_migrations() -> None:
 async def init_db() -> None:
     """建表 + 基础种子数据。M1 用 create_all，首次 schema 变更前引入 Alembic。"""
     # 导入各域模型模块，确保表注册到 Base.metadata
+    from app.core import orchestration as _core_orchestration  # noqa: F401
+    from app.domains.agent import models as _agent_models  # noqa: F401
     from app.domains.achievements import models as _achievements_models  # noqa: F401
     from app.domains.alerts import models as _alerts_models  # noqa: F401
     from app.domains.bills import models as _bills_models  # noqa: F401

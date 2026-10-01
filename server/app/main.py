@@ -17,6 +17,7 @@ from app.core.database import init_db
 from app.core.logging import setup_logging
 from app.core.scheduler import start_scheduler, stop_scheduler
 from app.domains.account.router import router as account_router
+from app.domains.agent.router import router as agent_router
 from app.domains.achievements.router import router as achievements_router
 from app.domains.alerts.router import router as alerts_router
 from app.domains.bills.router import router as bills_router
@@ -324,6 +325,13 @@ async def _post_startup_chain() -> None:
 
     # 调度器在收拾链跑完后才启动（链首说明的写锁竞态；空窗几秒~十几秒
     # 对 15min/6h 拍完全无感）
+    # Agent 孤儿 run 收尸：执行者随上轮进程消失，未终态 run 不可能再推进
+    try:
+        from app.domains.agent import service as agent_service
+
+        await agent_service.reconcile_orphan_runs()
+    except Exception:  # noqa: BLE001
+        logger.exception("[启动] Agent run 收尸失败（不阻塞启动）")
     start_scheduler()
     logger.info("[启动] 后台收拾链完成，服务已就绪（调度器已启动）")
 
@@ -449,6 +457,7 @@ def create_app() -> FastAPI:
         return response
 
     app.include_router(system_router, prefix="/api/v1")
+    app.include_router(agent_router, prefix="/api/v1")
     app.include_router(settings_router, prefix="/api/v1")
     app.include_router(games_router, prefix="/api/v1")
     app.include_router(achievements_router, prefix="/api/v1")
