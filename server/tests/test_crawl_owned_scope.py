@@ -67,9 +67,9 @@ async def test_scope_split_selection(db):
     await _seed(db, 620, owned=True)     # 已购
     await _seed(db, 730, owned=True, active=False)  # 已购但已停用
 
-    wl = [a for a, _ in await crawl_service._resolve_scope_appids("wishlist", None)]
-    only = [a for a, _ in await crawl_service._resolve_scope_appids("wishlist_only", None)]
-    owned = [a for a, _ in await crawl_service._resolve_scope_appids("owned", None)]
+    wl = [a for a, _ in await crawl_service.resolve_scope_appids("wishlist", None)]
+    only = [a for a, _ in await crawl_service.resolve_scope_appids("wishlist_only", None)]
+    owned = [a for a, _ in await crawl_service.resolve_scope_appids("owned", None)]
 
     assert wl == [570, 620]       # 历史合并路径：含已购、排除 inactive
     assert only == [570]          # 拆分：非已购
@@ -80,9 +80,9 @@ async def test_scope_split_selection(db):
 async def test_scope_owned_empty_list_semantics(db):
     """无已购条目时 owned scope 返回空（上层 ValueError 跳过该 job）。"""
     await _seed(db, 570, owned=False)
-    owned = await crawl_service._resolve_scope_appids("owned", None)
+    owned = await crawl_service.resolve_scope_appids("owned", None)
     assert owned == []
-    only = await crawl_service._resolve_scope_appids("wishlist_only", None)
+    only = await crawl_service.resolve_scope_appids("wishlist_only", None)
     assert [a for a, _ in only] == [570]
 
 
@@ -123,7 +123,7 @@ async def test_manual_priority_over_hot_and_rest(db):
     await _seed_manual(db, 100, owned=False, manual=True)    # 关注，非 hot
     await _seed_manual(db, 500, owned=True, manual=True)     # 关注已购
 
-    ordered = [a for a, _ in await crawl_service._resolve_scope_appids("wishlist", None)]
+    ordered = [a for a, _ in await crawl_service.resolve_scope_appids("wishlist", None)]
     assert ordered == [100, 500, 300, 400, 200], (
         "期望 [manual 关注（100,500 按 appid）] → [hot（300,400）] → [普通 200]，"
         f"实际 {ordered}"
@@ -135,7 +135,7 @@ async def test_all_manual_sorted_stably(db):
     """全关注池：三档塌缩为一档，按 appid 稳定序（不报错、无空段）。"""
     for aid in (930, 210, 640):
         await _seed_manual(db, aid, manual=True)
-    ordered = [a for a, _ in await crawl_service._resolve_scope_appids("wishlist", None)]
+    ordered = [a for a, _ in await crawl_service.resolve_scope_appids("wishlist", None)]
     assert ordered == [210, 640, 930]
 
 
@@ -149,7 +149,7 @@ async def test_manual_from_any_account_counts(db):
             WishlistItem(steamid=PRIMARY, appid=800, active=True, owned=False, manual=False),
         ])
         await session.commit()
-    ordered = [a for a, _ in await crawl_service._resolve_scope_appids("wishlist", None)]
+    ordered = [a for a, _ in await crawl_service.resolve_scope_appids("wishlist", None)]
     assert ordered == [700, 800]
 
 
@@ -219,7 +219,7 @@ async def test_pool_scope_orders_monitoring_first(db):
     await monitoring_service.ensure_source("game", 700, "favorite")
     await monitoring_service.sync_game_sources([701, 702])
 
-    pool = [a for a, _ in await crawl_service._resolve_scope_appids("pool", None)]
-    catalog = [a for a, _ in await crawl_service._resolve_scope_appids("catalog", None)]
+    pool = [a for a, _ in await crawl_service.resolve_scope_appids("pool", None)]
+    catalog = [a for a, _ in await crawl_service.resolve_scope_appids("catalog", None)]
     assert pool == [700, 701]        # 关注最先，已购次之
     assert catalog == [800, 801]     # 纯目录行（下架行剔除）

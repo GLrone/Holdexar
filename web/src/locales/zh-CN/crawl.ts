@@ -38,14 +38,16 @@ const crawl = {
 
   /* ── 启动爬取 ── */
   'crawl.start.desc':
-    '区服来自「设置」页配置；新游戏首次入库不走打折预检，刷新场景可用预检省请求。',
-  'crawl.start.scopeWishlist': '监控池全量',
+    '「全部游戏」与自动价格更新同一条队列：先关注与愿望单，再游戏库全部未下架游戏，最后 Steam 特惠榜新面孔。区服来自「设置」页配置；新游戏首次入库不走打折预检，刷新场景可用预检省请求。',
+  'crawl.start.scopeAll': '全部游戏',
+  'crawl.start.scopeWishlist': '愿望单与已关注',
   'crawl.start.scopeAppids': '指定 AppID',
   'crawl.start.appidsPlaceholder': '例如 620,105600',
   'crawl.start.button': '启动任务',
   'crawl.start.running': '任务进行中…',
   'crawl.start.invalidAppids': '请输入有效的 AppID（逗号分隔）',
-  'crawl.start.started': '任务 #{id} 已启动（{count} 个目标）',
+  'crawl.start.started': '任务 #{id} 已启动（{count} 款游戏）',
+  'crawl.start.startedQueue': '全量抓取已启动：本轮 {n} 款游戏排队抓取',
   'crawl.start.repair': '立即补抓失败地区',
   'crawl.start.repairTip':
     '不等自动补抓周期，立即按区批量重抓最近更新中失败的价格；本轮补抓仍失败的批次照常记账，留待下一轮自动恢复',

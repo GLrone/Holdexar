@@ -61,7 +61,8 @@ async def test_fetch_settings_defaults_and_roundtrip(tmp_data_dir):
         "fx_auto": True,
         "fx_history": True,
         "price_interval_hours": 6,
-        "catalog_refresh": False,
+        # 目录层（未关注游戏 + 特惠榜差值段）默认随轮
+        "catalog_refresh": True,
     }
 
     await update_fetch_settings(FetchSettingsUpdate(epic_free=False, fx_auto=False))

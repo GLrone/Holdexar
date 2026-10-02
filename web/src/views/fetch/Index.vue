@@ -123,6 +123,7 @@ async function resetDefaults() {
     bundle_counts: true,
     fx_auto: true,
     fx_history: true,
+    catalog_refresh: true,
     price_interval_hours: 6,
   })
   savingKey.value = null

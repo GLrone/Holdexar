@@ -18,7 +18,9 @@ router = APIRouter(tags=["crawl"])
 
 
 class CrawlRunRequest(BaseModel):
-    scope: str = "appids"  # appids | wishlist | wishlist_only | owned | pool（全池，愿望单优先序排前）
+    scope: str = "appids"
+    # all（默认全队列：与自动价格轮同组成，后台串行链）| appids | wishlist
+    # | wishlist_only | owned | pool（全池，愿望单优先序排前）
     appids: list[int] | None = None
     regions: list[str] | None = None
     kind: str = "manual"  # manual | missing | backfill（定时层专用 kind 亦可显式触发）
@@ -35,6 +37,8 @@ async def run(req: CrawlRunRequest):
 
         req.regions = await owned_regions()
     try:
+        if req.scope == "all":
+            return await service.start_full_queue()
         return await service.start_job(
             scope=req.scope,
             appids=req.appids,

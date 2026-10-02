@@ -1385,6 +1385,18 @@ export const crawlApi = {
       kind,
       cooldown,
     }),
+  /** 启动默认全队列（scope=all）：与自动价格轮同组成，后台串行链立即受理。
+      受理前后端预解析各段款数，全空直接 400（用户语言）；
+      total = pool+catalog+specials 款数和（missing 段是欠账存在性 0/1） */
+  runAll: () =>
+    request<{
+      queued: boolean
+      scope: string
+      total: number
+      segments: { name: string; count: number }[]
+    }>('POST', '/crawl/run', {
+      scope: 'all',
+    }),
   /**
    * 批量导入监控池：后端入池（manual_pool 条目）+ 分类（ok 待首爬 / own 已在库 /
    * fail 无效）；首爬由调用方对新导入（status=ok）触发。复用 RedeemBatchResult
