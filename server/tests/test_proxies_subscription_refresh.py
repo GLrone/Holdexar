@@ -7,6 +7,7 @@
 范围说明：内核重启的进程操作（subprocess）不在本文件内真跑——只验证接线与
 判定，重启分支沿用既有手动链路的行为。
 """
+import asyncio
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -465,3 +466,45 @@ def test_now_is_naive_iso_roundtrip():
     """门槛写入格式（naive ISO）能被解析回来——写入侧与读取侧同一口径。"""
     now = get_beijing_time_obj().replace(tzinfo=None)
     assert datetime.fromisoformat(now.isoformat()) == now
+
+
+@pytest.mark.asyncio
+async def test_refresh_holds_test_lock_during_lifecycle_change(db, monkeypatch, tmp_path):
+    """订阅刷新的内核生命周期段必须持 _clash_test_lock：热重载/stop·start
+    若与在途探测重叠，被切断的探测会把节点误记失败写进账本（与手动切换
+    订阅同一条互斥规则）。"""
+    await _seed_sub(db)
+    calls: list = []
+    cfg = _stub_runtime(monkeypatch, tmp_path, subscription_url=SUB_URL)
+    _stub_download(monkeypatch, cfg, calls)
+    # 内核目录命中：让 ensure_running 分支真实执行（_stub_runtime 默认未命中）
+    monkeypatch.setattr(
+        clash_manager, "detect_kernel", lambda d: {"found": True, "path": "kernel"}
+    )
+    lock_probe: dict = {}
+
+    async def _fake_ensure_running(exe, cfg_path, *, subscription_url=None):
+        lock = proxies_service._clash_test_lock()
+        lock_probe["held"] = lock.locked()
+        try:
+            # 探测侧视角：生命周期变更进行中，拿锁必须等到它结束
+            await asyncio.wait_for(lock.acquire(), timeout=0.05)
+            lock_probe["contended"] = False
+            lock.release()
+        except asyncio.TimeoutError:
+            lock_probe["contended"] = True
+        return {"started": True, "reloaded": False}
+
+    monkeypatch.setattr(
+        clash_manager.runtime, "ensure_running", _fake_ensure_running
+    )
+
+    stale = get_beijing_time_obj().replace(tzinfo=None) - timedelta(hours=7)
+    await settings_service.set_value(GATE_KEY, stale.isoformat())
+
+    out = await proxies_service.maybe_refresh_active_clash_subscription()
+    assert out["state"] == "refreshed"
+    assert out["restarted"] is True
+    assert lock_probe == {"held": True, "contended": True}, (
+        "ensure_running 段必须持检测串行锁，且期间探测侧拿不到锁"
+    )
