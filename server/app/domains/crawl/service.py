@@ -398,6 +398,20 @@ async def _finish_job(job_id: int, status: str, stats: dict | None = None, error
 _post_crawl_tasks: set[asyncio.Task] = set()
 
 
+def _crawled_appids(
+    appid_pairs: list[tuple[int, str]] | None, pre_tasks: list[dict] | None
+) -> list[int]:
+    """本轮实际爬到的对象 id（收尾下游链的输入，全部是 int appid）。
+
+    常规段来自 (appid, region) 对；补抓段（missing/repair）的任务 id 是
+    「区:补n」批次标签不是 appid，真实对象在每发的 appids 列表里——
+    收尾链（提醒/史低/永降/排序/脱池）按 appid 消费，喂标签等于整段空转。
+    """
+    return [aid for aid, _ in (appid_pairs or [])] + [
+        a for t in (pre_tasks or []) for a in t.get("appids", [])
+    ]
+
+
 def _spawn_post_crawl_chain(crawled: list[int]) -> None:
     """任务收尾下游链转后台：提醒 → 史低 → 新史低邮件 → 永降 → 排序缓存
     → 系列归组 → 免费脱池。串行顺序与前台版一致，逐段兜异常不影响任务状态。
@@ -477,9 +491,7 @@ async def _execute(
         # 爬取落库后的下游链整段转后台：任务状态不等它。史低/永降/排序都是
         # 派生数据（晚几秒可见；进程退出丢一轮由下一轮重算自愈），提前释放
         # 的是抓取占用与任务收尾时长
-        crawled = [aid for aid, _ in (appid_pairs or [])] + [
-            t["id"] for t in (pre_tasks or [])
-        ]
+        crawled = _crawled_appids(appid_pairs, pre_tasks)
         _spawn_post_crawl_chain(crawled)
     except Exception as e:  # noqa: BLE001
         logger.exception("任务 %d 失败", job_id)

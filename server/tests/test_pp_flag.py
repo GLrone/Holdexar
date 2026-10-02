@@ -205,3 +205,24 @@ async def test_pp_changed_at_ignores_discount_price_moves(db):
     await games_service.refresh_pp_flags([1000])
     assert await _flag(db, 1000) == 0
     assert await _changed_at(db, 1000) is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_pp_flags_accepts_missing_batch_flattened_appids(db):
+    """旧故障回归：补抓段经 _crawled_appids 展开后的对象列表直接进
+    refresh_pp_flags——字符串批次标签已被源头剔除，不再 ValueError。"""
+    from app.domains.crawl.service import _crawled_appids
+
+    async with db() as session:
+        session.add(Game(appid=6001, name="G6001"))
+        session.add(_current(6001, original=5900, price=4200, discount=30))
+        session.add(_history(6001, original=6900, days_ago=10))
+        await session.commit()
+
+    pre_tasks = [
+        {"type": "app", "id": "kz:补1", "region": "kz", "appids": [6001]},
+        {"type": "app", "id": "tr:补1", "region": "tr", "appids": [6001]},
+    ]
+    refreshed = await games_service.refresh_pp_flags(_crawled_appids([], pre_tasks))
+    assert refreshed >= 1
+    assert await _flag(db, 6001) == 1  # 原价台阶 6900 → 5900 = 永降
