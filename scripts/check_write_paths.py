@@ -31,6 +31,9 @@ ALLOW: dict[tuple[str, str], tuple[frozenset[str], str]] = {
     ("core/seed_assets.py", "_merge_history_sync"): (
         frozenset({"commit", "execute"}),
         "线程池原生连接合并（调用点已 write_gate 包裹，见 import_seed）"),
+    ("core/seed_assets.py", "_merge_current_prices_sync"): (
+        frozenset({"commit", "execute"}),
+        "线程池原生连接现价快照合并（调用点已 write_gate 包裹，与 _merge_history_sync 同形态）"),
     ("core/backup.py", "restore_backup"): (
         frozenset({"execute"}),
         "恢复通道（独占进程内执行，整库重建）"),

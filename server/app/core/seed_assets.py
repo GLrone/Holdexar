@@ -25,16 +25,24 @@
 - **价格历史合并**（merge_history_seed，独立 marker）：纯追加型快照数据，
   老用户库也并入——本地写入（用户自己的爬虫时间线）与种子时间线的键空间
   天然错开，合并 = 补充发布者时间线 + 同键行以种子覆盖价格列。
+- **现价快照合并**（merge_current_seed，独立 marker）：games_catalog 目录行
+  （有现价的游戏主档最小列集）+ game_current_prices 全区现价行，老用户库
+  也并入。games 主档只补缺行（updated_at 记种子版本）；现价按 **appid 粒度**
+  并入——本地没有任何该 appid 现价行才整包插入，本地爬过的游戏一个区都不
+  覆盖（现价是「最近一次观测」的派生态，种子快照不得回拨本地更新价）。
+  新用户开箱即有全量目录与现价，找游戏页首屏就有数据。
 
-种子内五段数据语义：
+种子内七段数据语义：
 - fx_rate_history 按 (currency_code, fetched_at原文) 去重追加
 - fx_rates 快照 INSERT OR REPLACE（种子带最新快照）
 - games_curated 人工列覆写 + 缺行落行（详见 merge_curated_seed）
 - preset_games 缺行落行（详见 merge_preset_seed）
 - game_price_history 按逻辑键 (appid, region_code, sub_id, is_gold,
   snapshot_at原文) 同键覆盖价格列、缺键插入（详见 merge_history_seed）
+- games_catalog 缺行落行（详见 merge_current_seed）
+- game_current_prices 按 appid 粒度整包插入（详见 merge_current_seed）
 
-merge_seed_incremental 是后三条通道的统一入口（lifespan 调用）。
+merge_seed_incremental 是后四条通道的统一入口（lifespan 调用）。
 """
 from __future__ import annotations
 
@@ -76,11 +84,29 @@ CURATED_MARKER_KEY = "seed.curated_imported_version"
 # 预设游戏池合并 marker：预设按种子版本对全体用户生效（详见模块 docstring）
 PRESET_MARKER_KEY = "seed.preset_imported_version"
 
+# 现价快照合并 marker：现价快照按种子版本对全体用户生效（详见模块 docstring）
+CURRENT_MARKER_KEY = "seed.current_imported_version"
+
 # game_price_history 种子列（与 export_seed.py 的 GPH_COLS 同序同集，不含自增 id）
 GPH_COLS = (
     "appid", "region_code", "currency", "price", "original_price",
     "discount_percent", "sub_id", "is_gold", "version_suffix", "is_bundle",
     "price_status", "cny_fen", "snapshot_at",
+)
+# game_current_prices 种子列（与 export_seed.py 的 GCP_COLS 同序同集）；
+# 列全集显式带出，合并侧直插不依赖库内默认值
+GCP_COLS = (
+    "appid", "region_code", "currency", "price", "original_price",
+    "discount_percent", "sub_id", "price_status", "fail_count", "cny_fen",
+    "discount_end_ts", "updated_at",
+)
+# games 主档种子列（现价快照通道自带目录行；与 export_seed.py 的 GC_COLS
+# 同序同集）。排序缓存列由启动链标记三连重算，人工列走 games_curated 通道
+GC_COLS = (
+    "appid", "name", "name_en", "type", "header_image", "family_sharing",
+    "trading_cards", "is_adult", "is_visual_novel", "release_date", "genres",
+    "positive_rate", "positive_reviews", "review_count", "view_count",
+    "removed_at", "free_kind",
 )
 # 合并时「覆盖对应列」的覆盖范围：价格取值列。键列（appid/region_code/
 # snapshot_at/sub_id/is_gold）定义行的身份，形态列（version_suffix/is_bundle）
@@ -446,6 +472,163 @@ async def merge_history_seed(seed_path: Path | None = None) -> dict | None:
     return stats
 
 
+# ── 现价快照合并（独立通道：老用户库也生效）─────────────────────────────
+
+
+def _merge_current_prices_sync(db_file: Path, seed_file: Path, version: str) -> int:
+    """原生 sqlite3 现价快照并入（同步函数，调用方放线程池）。
+
+    ATTACH + 集合式 SQL（几十万行 ORM 对象化开销不可接受）；appid 粒度
+    让位本地观测——本地没有该 appid 任何现价行才整包插入种子行，本地爬过
+    的游戏一个区都不覆盖（现价是「最近一次观测」的派生态，种子快照不得
+    回拨本地更新价）。GCP_COLS 是显式全集：本地库（含全新 create_all 建出
+    的 NOT NULL 无默认列）不依赖列默认值即可直插。
+    """
+    con = sqlite3.connect(str(db_file), timeout=60.0, isolation_level=None)
+    try:
+        con.execute("PRAGMA busy_timeout=60000")
+        con.execute("PRAGMA synchronous=OFF")
+        con.execute("PRAGMA cache_size=-65536")
+        try:
+            con.execute(
+                "ATTACH DATABASE ? AS seed", (f"file:{seed_file.as_posix()}?mode=ro",)
+            )
+        except sqlite3.OperationalError:
+            con.execute("ATTACH DATABASE ? AS seed", (str(seed_file),))
+        has_gcp = con.execute(
+            "SELECT 1 FROM seed.sqlite_master "
+            "WHERE type='table' AND name='game_current_prices'"
+        ).fetchone()
+        if not has_gcp:
+            return -1
+        gcp_cols = ", ".join(GCP_COLS)
+        gcp_seed_cols = ", ".join(f"s.{c}" for c in GCP_COLS)
+        con.execute("BEGIN IMMEDIATE")
+        inserted = con.execute(
+            f"INSERT INTO main.game_current_prices ({gcp_cols}) "
+            f"SELECT {gcp_seed_cols} FROM seed.game_current_prices AS s "
+            "WHERE NOT EXISTS ("
+            "  SELECT 1 FROM main.game_current_prices l WHERE l.appid = s.appid)"
+        ).rowcount
+        con.commit()
+        return inserted
+    finally:
+        con.close()
+
+
+async def _seed_catalog_rows(path: Path) -> list[dict] | None:
+    """种子 games_catalog → 行字典列表；无该表（schema 4 及以前）返回 None。
+
+    主档落行走 ORM（与人工列名单通道同型）：现役模型的 Mapped[bool]/int
+    列在全新 create_all 建出的库上是 NOT NULL 且无库内默认值，Python 端
+    默认值（hl_flag=0 等）必须由 ORM 补齐，裸 SQL 列名直插会撞约束。
+    """
+    if not path.is_file():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        try:
+            has = con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='games_catalog'"
+            ).fetchone()
+            if not has:
+                return None
+            cols = ", ".join(GC_COLS)
+            rows = con.execute(f"SELECT {cols} FROM games_catalog").fetchall()
+        finally:
+            con.close()
+    except sqlite3.OperationalError:
+        return None
+    except Exception as e:  # noqa: BLE001 —— 坏种子等同无快照
+        logger.warning("种子现价目录读取失败（忽略）：%s", e)
+        return None
+    return [dict(zip(GC_COLS, row)) for row in rows]
+
+
+async def merge_current_seed(seed_path: Path | None = None) -> dict | None:
+    """现价快照种子并入本地库。返回统计 dict；无种子 / 已合并 / 无可并数据返回 None。
+
+    独立于其他通道：判定只看自己的 marker（按种子版本），不做 games 行数
+    判定——老用户库是本通道的主要服务对象（补齐本地从未爬过的游戏）。
+    games 主档只补缺行（updated_at 记种子版本，本地行一个字段都不动）；
+    现价按 appid 粒度并入（本地爬过的游戏不回拨）。新用户开箱即有全量
+    目录与现价，找游戏页首屏就有数据。启动链序上先于标记三连：并完现价
+    即被排序缓存重建覆盖。
+    调用方（lifespan）负责 try/except 不阻塞启动。
+    """
+    path = seed_path or seed_db_path()
+    meta = read_seed_meta(path)
+    version = str(meta.get("version", "")) if meta else ""
+    if not path.is_file() or not version:
+        return None
+
+    from app.domains.settings import service as settings_service
+
+    marker = await settings_service.get_value(CURRENT_MARKER_KEY)
+    if marker == version:
+        return None
+
+    try:
+        stamped = datetime.fromisoformat(version)
+    except ValueError:
+        stamped = datetime.now()
+
+    catalog = await _seed_catalog_rows(path)
+    if catalog is None and not path.is_file():
+        return None
+
+    from app.core.database import sqlite_file_path
+
+    db_file = sqlite_file_path()
+    if db_file is None:  # 内存库 / 非文件库：无从合并
+        return None
+
+    # ── games 主档缺行落行（ORM，吃 Python 端列默认值）──
+    games_inserted = 0
+    if catalog:
+        from sqlalchemy import select as _select
+
+        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+            present = {
+                int(a)
+                for (a,) in await session.execute(
+                    _select(Game.appid).where(
+                        Game.appid.in_([int(row["appid"]) for row in catalog])
+                    )
+                )
+            }
+            missing = [row for row in catalog if int(row["appid"]) not in present]
+            if missing:
+                # 分块受 SQLite 变量上限约束：每行 ~40 列，500 行 ≈ 2 万变量
+                for i in range(0, len(missing), 500):
+                    chunk = [
+                        {**row, "updated_at": stamped} for row in missing[i:i + 500]
+                    ]
+                    await session.execute(sqlite_insert(Game).values(chunk))
+                games_inserted = len(missing)
+            await session.commit()
+
+    # ── 现价快照并入（ATTACH 集合式）+ marker 同事务 ──
+    # 线程池内的原生 sqlite 写事务也在写调度器管辖内：闸在事件循环侧持住
+    # （与价格历史合并同理由），跑在线程池里的原生连接不再是无主写者。
+    async with write_gate(WritePriority.BACKGROUND, label="seed_current_merge"):
+        prices_inserted = await asyncio.to_thread(
+            _merge_current_prices_sync, db_file, path, version
+        )
+    if prices_inserted < 0:
+        # 种子不含现价快照表（schema 4 及以前）：静默，待下个 schema 5+ 种子再并
+        return None
+
+    from app.domains.settings import service as settings_service
+
+    await settings_service.set_value(CURRENT_MARKER_KEY, version)
+    logger.info(
+        "[种子] 现价快照合并完成 v%s：目录行 %s 款 / 现价 %s 行",
+        version, games_inserted, prices_inserted,
+    )
+    return {"games": games_inserted, "prices": prices_inserted}
+
+
 # ── 人工列名单合并（独立通道：老用户库也生效）─────────────────────────────
 
 
@@ -642,14 +825,15 @@ async def merge_preset_seed(seed_path: Path | None = None) -> dict | None:
 
 
 async def merge_seed_incremental(seed_path: Path | None = None) -> dict | None:
-    """按种子版本对全体用户生效的增量通道统一入口：人工列名单 + 预设池 + 价格历史。
+    """按种子版本对全体用户生效的增量通道统一入口：人工列名单 + 预设池 + 价格历史 + 现价快照。
 
-    三条子通道各自有 marker、各自幂等、互不拖累（任一失败只记日志，
-    其余照常执行，失败方下次启动自动重试）。三者都无事发生才返回 None。
+    四条子通道各自有 marker、各自幂等、互不拖累（任一失败只记日志，
+    其余照常执行，失败方下次启动自动重试）。全部无事发生才返回 None。
     """
     curated = None
     preset = None
     history = None
+    current = None
     try:
         curated = await merge_curated_seed(seed_path)
     except Exception:  # noqa: BLE001
@@ -662,6 +846,10 @@ async def merge_seed_incremental(seed_path: Path | None = None) -> dict | None:
         history = await merge_history_seed(seed_path)
     except Exception:  # noqa: BLE001
         logger.exception("价格历史种子合并失败（不阻塞启动）")
-    if curated is None and preset is None and history is None:
+    try:
+        current = await merge_current_seed(seed_path)
+    except Exception:  # noqa: BLE001
+        logger.exception("现价快照种子合并失败（不阻塞启动）")
+    if curated is None and preset is None and history is None and current is None:
         return None
-    return {"curated": curated, "preset": preset, "history": history}
+    return {"curated": curated, "preset": preset, "history": history, "current": current}
