@@ -40,6 +40,7 @@ const bundles: Partial<Record<MessageKey, string>> = {
 
   /* Advanced filter (only dimensions with a bundle data source) */
   'bundles.filter.section.basic': 'Purchase shape',
+  'bundles.filter.followedOnly': 'Followed only',
   'bundles.filter.completableOnly': 'Completable only (no forced full set)',
   'bundles.filter.cnLowestOnly': 'CN is lowest',
   'bundles.filter.section.ownership': 'Ownership match',

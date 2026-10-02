@@ -864,12 +864,12 @@ export interface BundleRegionPrice {
   /** 促销截止（Unix 秒；null=无促销/未下发促销元数据） */
   discountEndsAt?: number | null
   cnyFen: number | null
-  /** 该区实际包含的 AppID（锁区检测依据） */
-  appIds: number[]
-  /** 相对基准区缺失的游戏数（部分锁区） */
-  lockedCount: number
-  /** 服务端按 minor units + 币种格式化的展示字符串 */
-  formatted: string
+  /** 该区实际包含的 AppID（锁区检测依据）。**仅详情下发** */
+  appIds?: number[]
+  /** 相对基准区缺失的游戏数（部分锁区）。**仅详情下发** */
+  lockedCount?: number
+  /** 服务端按 minor units + 币种格式化的展示字符串。**仅详情下发** */
+  formatted?: string
 }
 
 export interface BundleSummary {

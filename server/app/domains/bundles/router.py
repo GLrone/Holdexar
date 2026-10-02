@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
 
 from . import refresh, service
@@ -14,7 +14,7 @@ router = APIRouter(prefix="/bundles", tags=["bundles"])
 
 
 @router.get("")
-async def list_bundles(sort: str = Query("diff"), removed: bool = False):
+async def list_bundles(request: Request, sort: str = Query("diff"), removed: bool = False):
     """全量捆绑包列表。
 
     sort=diff（默认，差价降序）| smart（智能评分降序——games 商店同款四因子：
@@ -23,11 +23,21 @@ async def list_bundles(sort: str = Query("diff"), removed: bool = False):
     service.list_bundles_json）：15k 条聚合结果的重复编码是每次请求 2s 级
     开销，编码结果随缓存指纹复用（按排序分槽）。
 
+    客户端声明 gzip 时下发预压缩变体（service.list_bundles_gzip_json）并显式
+    带 Content-Encoding：传输压缩中间件见响应已有编码即原样透传，不再收齐
+    整包重压一次。
+
     removed=true 只出已移除/已排除的包（恢复视图，普通 dict 序列化——
     恢复集小，不走 15k 全量的预序列化缓存槽）。
     """
     if removed:
         return {"bundles": await service.list_bundles(sort, removed=True)}
+    if "gzip" in (request.headers.get("accept-encoding") or ""):
+        return Response(
+            content=await service.list_bundles_gzip_json(sort),
+            media_type="application/json",
+            headers={"Content-Encoding": "gzip", "Vary": "Accept-Encoding"},
+        )
     return Response(
         content=await service.list_bundles_json(sort),
         media_type="application/json",

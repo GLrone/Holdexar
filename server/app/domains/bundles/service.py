@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 import re
+import zlib
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -73,9 +74,13 @@ _IMG_CDN_REPLACEMENT = "https://shared.akamai.steamstatic.com"
 # 之间内容并不变——编码一次、按指纹复用。三份缓存同源同失效、指纹一致；
 # 数据/列表缓存按 (指纹, 排序参数) 分键（smart/diff 各一份），JSON 缓存按
 # 键分槽（dict），切换排序不重复编码。
+# _LIST_GZIP_CACHE 是同一份载荷的**预压缩 bytes**（见 list_bundles_gzip_json）：
+# 传输压缩中间件对非流式响应必须收齐整包才开始下发，50MB 级载荷会把响应起送
+# 从毫秒推到秒级；预压缩把这份 CPU 挪到缓存构建时一次，请求期只读 bytes。
 _DATA_CACHE: tuple[tuple, tuple[list, dict[int, list], dict[str, float]]] | None = None
 _LIST_CACHE: tuple[tuple, list[dict]] | None = None
 _LIST_JSON_CACHE: dict[tuple, bytes] = {}
+_LIST_GZIP_CACHE: dict[tuple, bytes] = {}
 
 # 列表排序参数（bundle 排序快照列）：diff = 差价降序（历史默认），
 # smart = 智能评分降序（games 商店同款四因子，见 _bundle_smart_score）
@@ -110,6 +115,7 @@ def invalidate_bundles_cache() -> None:
     _DATA_CACHE = None
     _LIST_CACHE = None
     _LIST_JSON_CACHE.clear()
+    _LIST_GZIP_CACHE.clear()
 
 
 async def _bundle_blocked_ids() -> set[int]:
@@ -638,16 +644,30 @@ async def _load_all_locked(
     return _DATA_CACHE[1]
 
 
+# 列表投影剥掉的区级字段：抽屉与补齐计算器才消费，列表渲染零引用。
+# 逐区 appIds（锁区检测依据）+ lockedCount（相对基准区缺几款）+ formatted
+# （服务端格式化串）合计约占全量载荷的 28%。
+_LIST_REGION_DROP = ("appIds", "lockedCount", "formatted")
+
+
 def _build_list_items(bundles, prices_by_bundle, tracked) -> list[dict]:
     """全量聚合 + 剔除追踪区内无价包（列表与其 JSON 出口共用）。
 
     顺序 = 加载查询的 SQL ORDER BY（排序快照 diff_fen DESC）——不做
     Python sort（GET → Python sort 是架构倒退）。
+
+    列表是**投影视图**：逐区剥掉只有抽屉/计算器消费的字段
+    （_LIST_REGION_DROP），那些消费点一律改读详情（get_bundle_detail 走完整
+    聚合）。列表与详情因此不再是同一份区表。
     """
     items = [
         _aggregate(b, prices_by_bundle.get(b.bundle_id, []), tracked)
         for b in bundles
     ]
+    for item in items:
+        for rp in item["regionPrices"].values():
+            for key in _LIST_REGION_DROP:
+                rp.pop(key, None)
     return [i for i in items if i["regionPrices"]]
 
 
@@ -724,16 +744,48 @@ async def list_bundles_json(sort: str = "diff") -> bytes:
     ).encode("utf-8")
 
 
+def _gzip_payload(payload: bytes) -> bytes:
+    """载荷预压缩（level 6）。
+
+    9（zlib 默认）在 50MB 级 JSON 上是秒级 CPU，压缩比只高约 4%——6 是压缩率
+    与单次构建 CPU 的平衡点。成本只落在缓存构建时（启动预热含此步），不在
+    请求期。zlib.compress 带 wbits 一把产出 gzip 流，无流式收尾步骤。
+    """
+    return zlib.compress(payload, 6, 16 + zlib.MAX_WBITS)
+
+
+async def list_bundles_gzip_json(sort: str = "diff") -> bytes:
+    """列表载荷的 gzip 变体（与 list_bundles_json 同内容、同指纹、同失效）。
+
+    传输压缩中间件对非流式响应必须收齐整包才开始下发，50MB 级载荷会把响应
+    起送从毫秒推到秒级——列表是**预序列化缓存载荷**，压缩一步同样按缓存槽
+    复用即可。路由按 Accept-Encoding 在原始/压缩两份中选择。
+    """
+    sort = _normalize_sort(sort)
+    payload = await list_bundles_json(sort)
+    key = _LIST_CACHE[0] if _LIST_CACHE is not None else None
+    if key is not None and key[1] == sort:
+        cached = _LIST_GZIP_CACHE.get(key)
+        if cached is not None:
+            return cached
+        compressed = _gzip_payload(payload)
+        _LIST_GZIP_CACHE[key] = compressed
+        return compressed
+    return _gzip_payload(payload)
+
+
 async def warmup() -> int:
     """启动链预热（后台）：把首次全量聚合 + 序列化的秒级成本挪到开门之后。
 
-    smart / diff 两种排序各暖一份（页内切换排序零等待）。返回预序列化
+    smart / diff 两种排序各暖一份（页内切换排序零等待），压缩变体一并预热
+    （否则首次带 Accept-Encoding 的请求要现付预压缩 CPU）。返回预序列化
     载荷总字节数（日志用）。调用方兜异常——预热失败只会让用户首次进
     捆绑包页重新等一次聚合，不影响功能。
     """
     total = 0
     for sort in _SORTS:
         total += len(await list_bundles_json(sort))
+        await list_bundles_gzip_json(sort)
     return total
 
 
@@ -846,7 +898,7 @@ async def restore_bundle(bundle_id: int) -> dict:
 
 
 async def follow_bundle(bundle_id: int) -> dict:
-    """关注一个包：挂 favorite 来源（不需要 Steam 账户），列表置顶。"""
+    """关注一个包：挂 favorite 来源（不需要 Steam 账户），列表置顶并进入刷新集。"""
     bid = int(bundle_id)
     from app.domains.monitoring import service as monitoring_service
 
@@ -860,8 +912,8 @@ async def follow_bundle(bundle_id: int) -> dict:
 async def unfollow_bundle(bundle_id: int) -> dict:
     """取消关注：只摘 favorite 来源（导入来源与排除标不动）。
 
-    星标是唯一激活来源时，摘除后回到「无记录」基线（forget）——捆绑包
-    无记录即默认参与刷新，停留在 released 会被挡在刷新候选集之外。
+    星标是唯一激活来源时，摘除后回到「无记录」基线（forget）——刷新集
+    只收监控层在册的包，无记录即不随轮刷新，价格停留在最后一次快照。
     """
     bid = int(bundle_id)
     from app.domains.monitoring import service as monitoring_service

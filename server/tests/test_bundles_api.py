@@ -321,14 +321,17 @@ async def test_list_aggregation():
     assert a["name"] == "测试补齐包"
     assert set(a["regionPrices"].keys()) == {"CN", "JP", "US"}  # jp/JP 去重
     assert a["regionPrices"]["JP"]["cnyFen"] == 15000  # 大写行有价，胜出
-    assert a["regionPrices"]["US"]["lockedCount"] == 1  # 缺 APPID_3
-    assert a["regionPrices"]["CN"]["lockedCount"] == 0
+    # 锁区数 / formatted 属详情报文（列表是投影视图，不携带这三个区级字段）
+    assert "lockedCount" not in a["regionPrices"]["US"]
+    detail = await service.get_bundle_detail(BID_A)
+    assert detail["regionPrices"]["US"]["lockedCount"] == 1  # 缺 APPID_3
+    assert detail["regionPrices"]["CN"]["lockedCount"] == 0
     assert a["appIds"] == [APPID_1, APPID_2, APPID_3]
     assert a["mustPurchaseAsSet"] == 0
     # 最低 = JP 15000 分，CN 10000 分 → JP 更贵? 不，CN 100 < JP 150 → 最低 CN，差价 0
     assert a["lowestRegion"] == "cn"
     assert a["diffFen"] == 0
-    assert a["regionPrices"]["CN"]["formatted"].startswith("¥")
+    assert detail["regionPrices"]["CN"]["formatted"].startswith("¥")
     # 无价包被过滤
     assert all(i["bundleId"] != BID_B for i in items)
 
@@ -515,8 +518,8 @@ async def test_dual_product_isolation():
     assert c["lowestRegion"] == "cn"
     assert c["lowestCnyFen"] == 20000
     assert set(c["regionPrices"].keys()) == {"CN"}
-    assert c["regionPrices"]["CN"]["lockedCount"] == 0
     assert c["appIds"] == [APPID_1, APPID_2, APPID_3]
+    assert (await service.get_bundle_detail(BID_C))["regionPrices"]["CN"]["lockedCount"] == 0
 
 
 @pytest.mark.asyncio

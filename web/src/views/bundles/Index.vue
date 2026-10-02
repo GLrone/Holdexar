@@ -120,6 +120,7 @@ function selectRegionMode(mode: RegionMode) {
 // 国区价格区间 / 差价区间（绝对值或占国区价百分比，选区时锚定该区差价）/
 // 仅可跨区送礼。持久化 localStorage。 ───
 interface BundleFilters {
+  followedOnly: boolean
   completableOnly: boolean
   cnLowestOnly: boolean
   onlyDiscounted: boolean
@@ -134,6 +135,7 @@ interface BundleFilters {
   giftOnly: boolean
 }
 const DEFAULT_FILTERS: BundleFilters = {
+  followedOnly: false,
   completableOnly: false,
   cnLowestOnly: false,
   onlyDiscounted: false,
@@ -164,6 +166,7 @@ const activeFilterCount = computed(() => {
   const f = filters.value
   const numeric = (s: string) => s !== '' && Number.isFinite(Number(s))
   return (
+    (f.followedOnly ? 1 : 0) +
     (f.completableOnly ? 1 : 0) +
     (f.cnLowestOnly ? 1 : 0) +
     (f.onlyDiscounted ? 1 : 0) +
@@ -191,9 +194,10 @@ const diffTypeOptions = computed(() => [
   { value: 'percent', label: t('filterPanel.diff.percent') },
 ])
 
-// ─── 分批渲染：3,386 张卡片一次性挂载是页面打开慢的另一主因（数据接口
-// 已有服务端缓存），先渲 RENDER_STEP 张、滚动接近底部自动续批。筛选/排序
-// 仍在全量 bundles 上做（纯 JS，微秒级），只有 DOM 挂载分批。───
+// ─── 分批渲染：先渲 RENDER_STEP 张、滚动接近底部自动续批。列表形态是
+// 「前端全量管道」——全量载荷取回后筛选/排序都在前端算，批次只切 DOM 挂载；
+// 数据取回、解析与筛选都发生在切片之前，属首屏关键路径，不随分批而变小。
+// 挂载窗口同时是归属取数窗口（见 loadOwnership）。───
 const RENDER_STEP = 120
 const renderLimit = ref(RENDER_STEP)
 /** 展示管道：地区锚定换算 → 地区模式过滤 → 高级筛选 → 选区 diff 排序时
@@ -220,6 +224,7 @@ const filteredBundles = computed(() => {
     rows = rows.filter((r) => r.regionLocked)
   }
   const f = filters.value
+  if (f.followedOnly) rows = rows.filter((r) => followedIds.value.has(r.b.bundleId))
   if (f.completableOnly) rows = rows.filter((r) => r.b.mustPurchaseAsSet === 0)
   if (f.cnLowestOnly) rows = rows.filter((r) => r.b.lowestRegion === 'cn')
   if (f.onlyDiscounted) rows = rows.filter((r) => maxDiscount(r.b) > 0)
@@ -287,9 +292,9 @@ function clearAllFilters() {
 }
 
 // ─── 滚动自动续批 ───
-// 哨兵进入视口下缘 200px 预判区即扩一批渲染。数据全量在前端，扩批只是
-// DOM 挂载、无请求；观察根是页面滚动容器 .view-container，网格与列表
-// 两种布局共用同一哨兵。
+// 哨兵进入视口下缘 200px 预判区即扩一批渲染。捆绑包数据全量已在前端，扩批
+// 不重新取列表；新进窗口的包会补拉一次归属（见 loadOwnership）。观察根是
+// 页面滚动容器 .view-container，网格与列表两种布局共用同一哨兵。
 const sentinel = ref<HTMLElement | null>(null)
 let observer: IntersectionObserver | null = null
 let scrollEl: HTMLElement | null = null
@@ -450,6 +455,69 @@ function onDocClick(e: MouseEvent) {
   if (regionRef.value && !regionRef.value.contains(e.target as Node)) showRegionMenu.value = false
 }
 
+/** 星标全集（升序）。与列表请求互不依赖，并发发出；失败只丢星标，不影响
+    列表可用性。恢复视图没有星标动作，不拉。 */
+async function loadFollows() {
+  try {
+    const f = await bundlesApi.follows()
+    followedIds.value = new Set(f.bundleIds)
+  } catch {
+    followedIds.value = new Set()
+  }
+}
+
+/** 单次归属查询的 appid 上限（服务端按 ids[:200] 截断） */
+const OWNERSHIP_BATCH = 200
+
+/** 批量查归属并入 ownershipMap；返回是否有新条目落地。
+    归属读的是本地库（/ownership 不发外部请求），按上限切开并发发。 */
+async function fetchOwnership(appids: number[]): Promise<boolean> {
+  const batches: number[][] = []
+  for (let i = 0; i < appids.length; i += OWNERSHIP_BATCH) {
+    batches.push(appids.slice(i, i + OWNERSHIP_BATCH))
+  }
+  const results = await Promise.all(
+    batches.map((ids) => ownershipApi.batch(ids).catch(() => null)),
+  )
+  const merged = { ...ownershipMap.value }
+  let landed = false
+  for (const r of results) {
+    if (!r) continue
+    for (const [k, v] of Object.entries(r.ownerships)) {
+      merged[Number(k)] = v
+      landed = true
+    }
+  }
+  if (landed) ownershipMap.value = merged
+  return landed
+}
+
+/** 归属数据补齐：只取**当前已挂载窗口**的包。
+    全量摊平所有包的 appid 是双输——摊平本身要逐个触碰响应式代理，结果还必然
+    被服务端 200 上限截断，命中的是「数组前 200 个 appid」而不是「屏幕上那几屏
+    的包」。改按已挂载窗口取；续批后新进窗口的包由 visibleBundles 的 watcher
+    增量补拉。 */
+async function loadOwnership() {
+  const need = new Set<number>()
+  for (const b of visibleBundles.value) {
+    for (const appid of b.appIds) {
+      if (!ownershipMap.value[appid]) need.add(appid)
+    }
+  }
+  if (need.size === 0) return
+  if (await fetchOwnership([...need])) refreshOwnershipBadges(visibleBundles.value)
+}
+
+/** 重算指定包的撞库结论，并入 ownershipByBid（增量，不重扫全量）。
+    未被覆盖的包不出徽章——归属是卡片附加状态，缺失时不冒充结论。 */
+function refreshOwnershipBadges(targets: BundleSummary[]) {
+  const next = { ...ownershipByBid.value }
+  for (const b of targets) {
+    next[b.bundleId] = inferBundleOwnership(b.appIds, null, ownershipMap.value)
+  }
+  ownershipByBid.value = next
+}
+
 /** silent = 静默保鲜（keep-alive 切回时）：不闪骨架屏、不重置渲染批数，
  *  失败保留原数据不把页面打成错误态 */
 async function load(silent = false) {
@@ -457,32 +525,14 @@ async function load(silent = false) {
     loading.value = true
     errorMsg.value = ''
   }
+  // 星标与列表互不依赖：并发发出，不排进首屏关键路径。
+  // 归属（撞库徽章数据）同样不是列表可用性的前置——由 visibleBundles 的
+  // watcher 在列表落地后按窗口增量补，骨架屏只等列表这一件事。
+  if (!removedView.value) void loadFollows()
   try {
     const res = await bundlesApi.list(sortBy.value, removedView.value)
     bundles.value = res.bundles
     if (!silent) renderLimit.value = RENDER_STEP
-    // 星标状态一次性整表拉取（恢复视图没有星标动作，不拉）
-    if (!removedView.value) {
-      try {
-        const f = await bundlesApi.follows()
-        followedIds.value = new Set(f.bundleIds)
-      } catch {
-        followedIds.value = new Set()
-      }
-    }
-    // 撞库推演：收集全部 appid 一次批量查归属
-    const allIds = [...new Set(bundles.value.flatMap((b) => b.appIds))]
-    if (allIds.length > 0) {
-      try {
-        const own = await ownershipApi.batch(allIds.slice(0, 200))
-        ownershipMap.value = Object.fromEntries(
-          Object.entries(own.ownerships).map(([k, v]) => [Number(k), v]),
-        )
-      } catch {
-        ownershipMap.value = {}
-      }
-    }
-    refreshOwnershipBadges()
   } catch (e) {
     if (!silent) errorMsg.value = e instanceof Error ? e.message : String(e)
   } finally {
@@ -490,13 +540,11 @@ async function load(silent = false) {
   }
 }
 
-function refreshOwnershipBadges() {
-  const next: Record<number, ReturnType<typeof inferBundleOwnership>> = {}
-  for (const b of bundles.value) {
-    next[b.bundleId] = inferBundleOwnership(b.appIds, null, ownershipMap.value)
-  }
-  ownershipByBid.value = next
-}
+/* 挂载窗口变化（续批 / 换筛选 / 换地区）后，为新进窗口的包补拉归属。
+   窗口内容不变时是一次空转扫描；已在 ownershipMap 里的 appid 不重复请求。 */
+watch(visibleBundles, () => {
+  void loadOwnership()
+})
 
 /** 差价降幅角标：各区折扣最大值 */
 function maxDiscount(b: BundleSummary): number {
@@ -650,10 +698,16 @@ const drawerCodes = computed(() =>
     : [],
 )
 
-const hasPartialLock = computed(
-  () =>
-    !!drawerBundle.value &&
-    drawerCodes.value.some((c) => (drawerBundle.value!.regionPrices[c]?.lockedCount ?? 0) > 0),
+/** 抽屉的区表**取详情**：列表是投影视图，区级 appIds / lockedCount /
+    formatted 只在详情报文里下发（列表渲染零引用这三个字段）。价格网格本就
+    等在 detailLoading 之后，故详情必已到手。 */
+const detailRegionPrices = computed(() => detail.value?.regionPrices ?? {})
+
+/** 补齐计算器的区表：同上，取详情（appIds 是排除后求和的分区依据）。 */
+const calcRegionPrices = computed(() => calcDetail.value?.regionPrices ?? {})
+
+const hasPartialLock = computed(() =>
+  drawerCodes.value.some((c) => (detailRegionPrices.value[c]?.lockedCount ?? 0) > 0),
 )
 
 /** 该区有可展示的价格（行存在但全空 = 锁区） */
@@ -698,26 +752,15 @@ async function openDrawer(b: BundleSummary) {
   }
 }
 
-/** 抽屉/弹窗的逐游戏归属徽章数据：页级批量只覆盖前 200 个 appid，
- *  打开抽屉时对本包成员补拉缺失项（单批 ≤200，服务端截断） */
+/** 抽屉/弹窗的逐游戏归属徽章数据：页级只覆盖已挂载窗口，打开抽屉时对本包
+ *  成员补拉缺失项（分批发，单批 ≤200 服务端截断）。 */
 async function ensureOwnershipForGames(games: BundleGame[]) {
-  const need = games
-    .map((g) => g.appid)
-    .filter((id) => !ownershipMap.value[id])
-    .slice(0, 200)
+  const need = games.map((g) => g.appid).filter((id) => !ownershipMap.value[id])
   if (!need.length) return
-  try {
-    const own = await ownershipApi.batch(need)
-    ownershipMap.value = {
-      ...ownershipMap.value,
-      ...Object.fromEntries(
-        Object.entries(own.ownerships).map(([k, v]) => [Number(k), v]),
-      ),
-    }
-    refreshOwnershipBadges()
-  } catch {
-    // 归属数据缺失时徽章不渲染，不阻断抽屉
-  }
+  // 归属数据缺失时徽章不渲染，不阻断抽屉
+  if (!(await fetchOwnership(need))) return
+  const open = drawerBundle.value
+  if (open) refreshOwnershipBadges([open])
 }
 
 /** 再点同包收回（抽屉开合开关语义）。
@@ -775,14 +818,13 @@ function gameTitle(game: BundleGame): string {
 
 const drawerGames = computed(() => (detail.value?.games ?? []).slice(0, 4))
 
-/** 地区 AppID 差异分组（各区 appids 签名分组，>1 组才展示） */
+/** 地区 AppID 差异分组（各区 appids 签名分组，>1 组才展示）。区表取详情。 */
 const agrGroups = computed(() => {
-  const b = drawerBundle.value
-  if (!b) return []
   const groups: Record<string, { codes: string[]; aids: number[] }> = {}
-  for (const [code, rp] of Object.entries(b.regionPrices)) {
-    const key = [...rp.appIds].sort((x, y) => x - y).join(',')
-    if (!groups[key]) groups[key] = { codes: [], aids: rp.appIds }
+  for (const [code, rp] of Object.entries(detailRegionPrices.value)) {
+    const aids = rp.appIds ?? []
+    const key = [...aids].sort((x, y) => x - y).join(',')
+    if (!groups[key]) groups[key] = { codes: [], aids }
     groups[key].codes.push(code)
   }
   return Object.values(groups).sort((a, c) => c.aids.length - a.aids.length)
@@ -839,9 +881,9 @@ const calcGames = computed(() => {
   const b = calcBundle.value
   const d = calcDetail.value
   if (!b || !d || !calcRegion.value) return []
-  const rp = b.regionPrices[calcRegion.value.toUpperCase()]
+  const rp = calcRegionPrices.value[calcRegion.value.toUpperCase()]
   if (!rp) return []
-  const aids = new Set(rp.appIds.map(Number))
+  const aids = new Set((rp.appIds ?? []).map(Number))
   return d.games.filter((g) => aids.has(g.appid))
 })
 
@@ -1120,6 +1162,11 @@ onBeforeUnmount(() => {
         <div>
           <div class="hl-fp-sec-title">{{ t('bundles.filter.section.basic') }}</div>
           <div class="hl-fp-check">
+            <HlCheckbox
+              :model-value="filters.followedOnly"
+              :label="t('bundles.filter.followedOnly')"
+              @update:model-value="(v: boolean) => setFilter('followedOnly', v)"
+            />
             <HlCheckbox
               :model-value="filters.completableOnly"
               :label="t('bundles.filter.completableOnly')"
@@ -1611,7 +1658,7 @@ onBeforeUnmount(() => {
             :class="{
               'cn-region': code.toLowerCase() === 'cn',
               'lowest-region': code.toLowerCase() === drawerBundle!.lowestRegion,
-              'partial-lock': (drawerBundle!.regionPrices[code]?.lockedCount ?? 0) > 0,
+              'partial-lock': (detailRegionPrices[code]?.lockedCount ?? 0) > 0,
             }"
             :title="t('bundles.drawer.giftTooltip', { region: regionsStore.regionName(code) })"
             @click="toggleGift(code)"
@@ -1619,7 +1666,7 @@ onBeforeUnmount(() => {
             <RegionFlag :code="code" class="bd-region" />
             <div class="bd-prices">
               <template v-if="hasPrice(code)">
-                <span class="bd-orig">{{ drawerBundle!.regionPrices[code].formatted }}</span>
+                <span class="bd-orig">{{ detailRegionPrices[code]?.formatted }}</span>
                 <span
                   class="bd-cny"
                   :class="{
@@ -1636,11 +1683,11 @@ onBeforeUnmount(() => {
                   {{ fen(drawerBundle!.regionPrices[code].cnyFen) }}
                 </span>
                 <span
-                  v-if="(drawerBundle!.regionPrices[code].lockedCount ?? 0) > 0"
+                  v-if="(detailRegionPrices[code]?.lockedCount ?? 0) > 0"
                   class="bd-locked"
-                  :title="t('bundles.drawer.lockedTip', { n: drawerBundle!.regionPrices[code].lockedCount })"
+                  :title="t('bundles.drawer.lockedTip', { n: detailRegionPrices[code]?.lockedCount ?? 0 })"
                 >
-                  {{ t('bundles.drawer.lockedBadge', { n: drawerBundle!.regionPrices[code].lockedCount }) }}
+                  {{ t('bundles.drawer.lockedBadge', { n: detailRegionPrices[code]?.lockedCount ?? 0 }) }}
                 </span>
               </template>
               <span v-else class="bd-locked">{{ t('bundles.drawer.locked') }}</span>
