@@ -905,6 +905,10 @@ async def _browse_price_task_inner(context) -> bool:
     counts = {"ok": 0, "free_promo": 0, "locked": 0, "missing": 0, "skip": 0, "write_fail": 0}
     _WRITE_STARTED.add(str(task_id))
     pending_writes: list[tuple] = []
+    # 「看见了但不落价」的目标：批量失败整批记 missing 时可能误标过它们，
+    # 这些陈欠行没有任何爬取路径会再写（跳过分支永不 bump），不清就是
+    # 补抓通道每拍重拾的死账——统一收集，落库段一次性清除
+    cleared_missing: list[tuple[int, str]] = []
 
     for appid in appids:
         meta = META.get(appid)
@@ -918,6 +922,7 @@ async def _browse_price_task_inner(context) -> bool:
                 await context.db_writer.mark_non_game_type(
                     appid, str((meta or {}).get("type_label") or eff_type)
                 )
+                cleared_missing.append((appid, cc))
                 counts["skip"] += 1
                 continue
 
@@ -934,13 +939,16 @@ async def _browse_price_task_inner(context) -> bool:
         if meta and meta.get("coming_soon") and status == "missing":
             if not DRY_RUN:
                 await context.db_writer.mark_coming_soon(appid)
+            cleared_missing.append((appid, cc))
             counts["skip"] += 1
             continue
 
         # 已知行未发售（库内 release_date 在未来）且判定 missing：跳过落账即可，
         # 不走 mark_coming_soon——那会把 import 分类覆写成 COMING_SOON。
-        # 日期过后自然恢复定价。
+        # 日期过后自然恢复定价。误标的 missing 陈欠行一并清除（否则补抓
+        # 每拍重拾、永不收敛）。
         if status == "missing" and keep and _release_in_future(keep.get("release_date")):
+            cleared_missing.append((appid, cc))
             counts["skip"] += 1
             continue
 
@@ -1034,6 +1042,7 @@ async def _browse_price_task_inner(context) -> bool:
 
         game_data = build_game_data(appid, meta, now_dt)
         if game_data is None:  # 元数据与库内原值双缺 → 不造空行
+            cleared_missing.append((appid, cc))
             counts["skip"] += 1
             continue
         pending_writes.append((appid, game_data, prices_arr, status, opts))
@@ -1074,6 +1083,9 @@ async def _browse_price_task_inner(context) -> bool:
                 logger.debug("[browse] %s 捆绑包发现落库失败: %s", task_id, e)
         if extra_entries:
             await context.db_writer.attach_browse_extras_batch(extra_entries)
+
+    if cleared_missing and not DRY_RUN:
+        await context.db_writer.clear_missing_regions(cleared_missing)
 
     logger.debug("[browse] %s 计数 %s", task_id, counts)
     return False

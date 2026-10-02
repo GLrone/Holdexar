@@ -240,3 +240,83 @@ async def test_generate_missing_tasks_batches_by_region():
             )
             await session.execute(delete(Game).where(Game.appid.in_(batch_ids)))
             await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_generate_missing_tasks_includes_free_state_rows():
+    """免费态（f2p/beta）的 missing 行必须可被补抓拾取。
+
+    旧实现按 free_kind 排除欠账，而免费态对象同样不在 pool/catalog
+    爬取集合里——账本行成为无消费路径的死账。拾取后
+    由补抓写出真实状态（ok-0 / locked），穷尽兜底不变。"""
+    from app.domains.games.models import Game as _Game
+
+    appid = 997_101
+    now = datetime.now()
+    async with get_session_factory()() as session:
+        session.add(_Game(appid=appid, name="免费态欠账游戏", free_kind="f2p",
+                          created_at=now, updated_at=now))
+        session.add(_price(appid, "CN", "missing", None, fail_count=1,
+                           updated_at=now - timedelta(hours=2)))
+        await session.commit()
+    try:
+        db = DbWriter()
+        tasks = await db.generate_missing_tasks(cooldown_minutes=10)
+        picked = [a for t in tasks for a in t["appids"]]
+        assert appid in picked
+    finally:
+        async with get_session_factory()() as session:
+            await session.execute(delete(GameCurrentPrice).where(GameCurrentPrice.appid == appid))
+            await session.execute(delete(Game).where(Game.appid == appid))
+            await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_generate_missing_tasks_clears_empty_region_rows():
+    """空区行（region_code=''）即拾即清：无对应真实区服、没有 bump 路径，
+    留在账本只会永久占位。"""
+    appid = 997_102
+    now = datetime.now()
+    async with get_session_factory()() as session:
+        session.add(_price(appid, "", "missing", None, fail_count=1,
+                           updated_at=now - timedelta(hours=2)))
+        await session.commit()
+    try:
+        db = DbWriter()
+        tasks = await db.generate_missing_tasks(cooldown_minutes=10)
+        assert all(t["region"] for t in tasks)
+        async with get_session_factory()() as session:
+            row = await session.get(GameCurrentPrice, (appid, ""))
+        assert row is None
+    finally:
+        async with get_session_factory()() as session:
+            await session.execute(delete(GameCurrentPrice).where(GameCurrentPrice.appid == appid))
+            await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_clear_missing_regions_deletes_only_missing():
+    """clear_missing_regions 只删 missing 状态行：ok 行与历史不动。"""
+    db = DbWriter()
+    await db.clear_missing_regions([])  # 空表安全
+
+    async with get_session_factory()() as session:
+        session.add(_price(APPID, "RU", "ok", 10000))
+        await session.commit()
+    try:
+        cleared = await db.clear_missing_regions([(APPID, "ru")])
+        assert cleared == 0
+        async with get_session_factory()() as session:
+            row = await session.get(GameCurrentPrice, (APPID, "RU"))
+        assert row is not None and row.price_status == "ok"
+
+        await db.mark_region_status(APPID, "ru", "missing")
+        cleared = await db.clear_missing_regions([(APPID, "ru")])
+        assert cleared == 1
+        async with get_session_factory()() as session:
+            row = await session.get(GameCurrentPrice, (APPID, "RU"))
+        assert row is None
+    finally:
+        async with get_session_factory()() as session:
+            await session.execute(delete(GameCurrentPrice).where(GameCurrentPrice.appid == APPID))
+            await session.commit()
