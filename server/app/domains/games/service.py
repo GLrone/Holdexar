@@ -18,7 +18,7 @@ import re
 import time
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import and_, asc, delete, desc, func, or_, select, update
+from sqlalchemy import and_, asc, bindparam, delete, desc, func, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -1397,11 +1397,70 @@ async def get_game_versions(appid: int) -> dict:
     return {"versions": versions}
 
 
+# 新史低判定参数。同价带 0.1 元：导入的历史价快照只精确到角且进一
+# （如 9207 分记成 9210），现价与既往最低差在带内视作同一价位；新低期
+# 自折扣期起点起 NEW_LOW_ERA_DAYS 天内持续记新史低，超期回落平史低。
+LOW_EQUAL_BAND_FEN = 10
+NEW_LOW_ERA_DAYS = 30
+
+# 折扣期解析：h = 国区标准版历史（口径与 prior 相同，价格按 0.1 元取整）；
+# cur = 现价取整；lastdiff = 最近一次「非现价」快照；era = 现价在其之后
+# 的连续同价快照段起点（即折扣期起点）及其之前的最低价。
+_ERA_INFO_SQL = text(
+    """
+    WITH h AS (
+        SELECT appid, snapshot_at, cny_fen,
+               CAST(ROUND(cny_fen / 10.0) AS INTEGER) AS norm_fen
+        FROM game_price_history
+        WHERE appid IN :hids
+          AND region_code = 'CN'
+          AND price_status = 'ok'
+          AND cny_fen IS NOT NULL AND cny_fen > 0
+          AND (is_gold = 0 OR is_gold IS NULL)
+          AND (version_suffix IS NULL OR version_suffix = '')
+          AND (is_bundle = 0 OR is_bundle IS NULL)
+    ),
+    cur AS (
+        SELECT appid, CAST(ROUND(cny_fen / 10.0) AS INTEGER) AS cur_norm
+        FROM game_current_prices
+        WHERE appid IN :cids
+          AND region_code = 'CN'
+          AND price_status = 'ok'
+          AND cny_fen IS NOT NULL AND cny_fen > 0
+    ),
+    lastdiff AS (
+        SELECT h.appid, MAX(h.snapshot_at) AS last_diff_at
+        FROM h JOIN cur ON cur.appid = h.appid
+        WHERE h.norm_fen != cur.cur_norm
+        GROUP BY h.appid
+    ),
+    era AS (
+        SELECT cur.appid, MIN(h.snapshot_at) AS era_start
+        FROM h
+        JOIN cur ON cur.appid = h.appid
+        LEFT JOIN lastdiff ld ON ld.appid = cur.appid
+        WHERE h.norm_fen = cur.cur_norm
+          AND (ld.last_diff_at IS NULL OR h.snapshot_at >= ld.last_diff_at)
+        GROUP BY cur.appid
+    )
+    SELECT era.appid, era.era_start,
+           MIN(CASE WHEN h.snapshot_at < era.era_start THEN h.cny_fen END) AS prior_era_min
+    FROM era JOIN h ON h.appid = era.appid
+    GROUP BY era.appid, era.era_start
+    """
+)
+
+
 async def refresh_hl_flags(appids: list[int] | None = None) -> int:
     """刷新 games.hl_flag（新史低 / 平史低标记）。
 
-    语义：当前 CN 价 vs 既往历史最低（排除当前快照）→ 1=新史低 2=平史低；
-    无既往数据时打折记 3；不打折记 0。appids=None 全库刷新（启动时），
+    判定锚是**当前折扣期起点**：现价（按 0.1 元取整对齐）在国区标准版
+    历史里最近一段连续同价快照的最早时刻。起点之前的最低价与现价相比：
+    便宜 ≥1 角 → 本期是新低期，起点距今 ≤30 天记 1（新史低，整期持续，
+    不随刷新轮次消退，超期回落 2）；差在 ±1 角带内记 2（平史低）；明显
+    高于历史最低记 3（打折）/ 0（无折扣）。历史全部落在现价期内（首发
+    即打折）视作新低期按窗口记 1/2，从未变价且无折扣记 0；现价在历史里
+    没有同期快照按无既往处理（3/0）。appids=None 全库刷新（启动时），
     否则增量（爬取落库后调用）。
     """
     from sqlalchemy.orm import aliased
@@ -1444,14 +1503,66 @@ async def refresh_hl_flags(appids: list[int] | None = None) -> int:
             cur_q = cur_q.where(Game.appid.in_(appids))
         cur_rows = (await session.execute(cur_q)).all()
 
+        # 折扣期只解析给「处于史低带内」的游戏——明显高于历史最低的必是
+        # 3/0，与期起点无关，不进 CTE 查询（候选集 ≈ 史低游戏数，远小于全库）。
+        # 无既往（本周期才首次落快照）的打折游戏也是首发即打折的形态，一并解析
+        band = LOW_EQUAL_BAND_FEN
+        cands = sorted(
+            {
+                int(appid)
+                for appid, discount, fen in cur_rows
+                if fen is not None
+                and fen > 0
+                and (
+                    (
+                        prior_low.get(int(appid)) is not None
+                        and prior_low[int(appid)] - fen > -band
+                    )
+                    or (prior_low.get(int(appid)) is None and (discount or 0) > 0)
+                )
+            }
+        )
+        # 库内 DateTime 列统一存 naive 北京时间（与 db_writer._naive 同口径）
+        now_dt = get_beijing_time_obj().replace(tzinfo=None)
+        era_window = timedelta(days=NEW_LOW_ERA_DAYS)
+        era_info: dict[int, tuple[datetime | None, int | None]] = {}
+        for i in range(0, len(cands), 400):
+            chunk = cands[i : i + 400]
+            rows = (
+                await session.execute(
+                    _ERA_INFO_SQL.bindparams(
+                        bindparam("hids", expanding=True),
+                        bindparam("cids", expanding=True),
+                    ),
+                    {"hids": chunk, "cids": chunk},
+                )
+            ).all()
+            for appid, era_start, prior_era_min in rows:
+                if isinstance(era_start, str):
+                    era_start = datetime.fromisoformat(era_start)
+                era_info[int(appid)] = (era_start, prior_era_min)
+
         updates: list[tuple[int, int]] = []  # (appid, flag)
         for appid, discount, cn_fen in cur_rows:
             discount = discount or 0
-            prior = prior_low.get(int(appid))
-            if cn_fen is not None and cn_fen > 0 and prior is not None:
-                flag = 1 if cn_fen < prior else (2 if cn_fen == prior else (3 if discount > 0 else 0))
-            else:
+            era_start, prior_era_min = era_info.get(int(appid), (None, None))
+            if era_start is None:
+                # 现价在历史里没有同期快照（从未落快照 / 不在史低带内）
                 flag = 3 if discount > 0 else 0
+            elif prior_era_min is None:
+                # 历史全部落在现价期内：首发即打折（有史以来第一次到该价，
+                # 按新低期计窗口）或从未变价（无折扣不入史低）
+                in_window = now_dt - era_start <= era_window
+                flag = (1 if in_window else 2) if discount > 0 else 0
+            else:
+                diff = prior_era_min - cn_fen
+                if diff >= band:
+                    in_window = now_dt - era_start <= era_window
+                    flag = 1 if in_window else 2
+                elif diff > -band:
+                    flag = 2
+                else:
+                    flag = 3 if discount > 0 else 0
             updates.append((int(appid), flag))
 
         if updates:
