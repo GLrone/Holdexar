@@ -22,13 +22,14 @@ from sqlalchemy import delete, text
 from app.core import seed_assets
 from app.core.database import get_session_factory
 from app.crawler.db_writer import DbWriter
-from app.domains.games.models import Game
+from app.domains.games.models import Game, GameCurrentPrice
 
 SYNTHETIC_CUR = "XTS"  # ISO 测试币种，不在任何白名单，误留也会被启动清洗掉
 APPID_A = 997_102
 APPID_B = 997_103
 APPID_C = 997_104  # 价格历史合并用例专用（种子/本地行全合成）
 APPID_D = 997_105  # 预设池合并用例专用
+APPID_E = 997_106  # 现价快照合并用例专用（种子/本地行全合成）
 
 
 @pytest.fixture
@@ -63,6 +64,19 @@ CREATE TABLE game_price_history (
     is_gold INTEGER, version_suffix TEXT, is_bundle INTEGER,
     price_status TEXT, cny_fen INTEGER, snapshot_at TEXT);
 CREATE INDEX ix_seed_gph_key ON game_price_history (appid, region_code, snapshot_at);
+CREATE TABLE games_catalog (
+    appid INTEGER PRIMARY KEY, name TEXT, name_en TEXT, type TEXT,
+    header_image TEXT, family_sharing INTEGER, trading_cards INTEGER,
+    is_adult INTEGER, is_visual_novel INTEGER, release_date TEXT,
+    genres TEXT, positive_rate INTEGER, positive_reviews INTEGER,
+    review_count INTEGER, view_count INTEGER, removed_at TEXT,
+    free_kind TEXT);
+CREATE TABLE game_current_prices (
+    appid INTEGER, region_code TEXT, currency TEXT, price INTEGER,
+    original_price INTEGER, discount_percent INTEGER, sub_id INTEGER,
+    price_status TEXT, fail_count INTEGER, cny_fen INTEGER,
+    discount_end_ts INTEGER, updated_at TEXT);
+CREATE INDEX ix_seed_gcp_appid ON game_current_prices (appid);
 """
 
 
@@ -74,6 +88,8 @@ def _make_seed(
     curated: list[tuple] | None = None,
     preset: list[tuple] | None = None,
     history: list[tuple] | None = None,
+    games_catalog: list[tuple] | None = None,
+    current_prices: list[tuple] | None = None,
     version: str = SEED_VERSION,
 ) -> Path:
     if path.exists():
@@ -94,13 +110,23 @@ def _make_seed(
             history or [],
         )
         con.executemany(
+            "INSERT INTO games_catalog VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            games_catalog or [],
+        )
+        con.executemany(
+            "INSERT INTO game_current_prices VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            current_prices or [],
+        )
+        con.executemany(
             "INSERT INTO seed_meta VALUES (?, ?)",
             [
-                ("schema_version", "4"),
+                ("schema_version", "5"),
                 ("version", version),
                 ("exported_at", version),
                 ("rows_fx_history", str(len(fx_history or []))),
                 ("rows_history", str(len(history or []))),
+                ("rows_games_catalog", str(len(games_catalog or []))),
+                ("rows_current_prices", str(len(current_prices or []))),
             ],
         )
         con.commit()
@@ -149,6 +175,7 @@ _ALL_MARKER_KEYS = (
     seed_assets.CURATED_MARKER_KEY,
     seed_assets.PRESET_MARKER_KEY,
     seed_assets.HISTORY_MARKER_KEY,
+    seed_assets.CURRENT_MARKER_KEY,
 )
 
 
@@ -174,7 +201,10 @@ async def _cleanup():
     yield
     async with get_session_factory()() as session:
         await session.execute(
-            delete(Game).where(Game.appid.in_([APPID_A, APPID_B, APPID_C, APPID_D]))
+            delete(Game).where(Game.appid.in_([APPID_A, APPID_B, APPID_C, APPID_D, APPID_E]))
+        )
+        await session.execute(
+            text(f"DELETE FROM game_current_prices WHERE appid IN ({APPID_A}, {APPID_B}, {APPID_C}, {APPID_D}, {APPID_E})")
         )
         await session.execute(
             text(f"DELETE FROM fx_rate_history WHERE currency_code = '{SYNTHETIC_CUR}'")
@@ -770,3 +800,116 @@ async def test_history_merge_backfills_blank_suffix(tmp_path: Path) -> None:
     by_sub = {int(r[0]): r[1] for r in rows}
     assert by_sub[1] == "Digital Deluxe Edition"  # 空名被种子补上
     assert by_sub[2] == "本地已有版本名"  # 本地名不被旧种子拉回
+
+
+# ── 6. 现价快照合并 ───────────────────────────────────────────────────
+
+
+def _gc_row(appid: int, name: str) -> tuple:
+    """17 列 games_catalog 种子行（与 export_seed.GC_COLS 同序）。"""
+    return (
+        appid, name, None, "game", None, 0, 0, 0, 0, None, None,
+        None, 0, 0, 0, None, None,
+    )
+
+
+def _gcp_row(appid: int, region: str = "CN", price: int = 1000) -> tuple:
+    """12 列 game_current_prices 种子行（与 export_seed.GCP_COLS 同序）。"""
+    return (
+        appid, region, "CNY", price, price, 0, 1, "ok", 0, price, None,
+        "2026-09-15 08:00:00",
+    )
+
+
+async def _current_local_state(appid: int) -> tuple[dict | None, list]:
+    """本地 (games 行 name, 现价行 [region, price]) 现状。"""
+    async with get_session_factory()() as session:
+        game = (
+            await session.execute(
+                text(f"SELECT name FROM games WHERE appid = {appid}")
+            )
+        ).first()
+        prices = (
+            await session.execute(
+                text(
+                    "SELECT region_code, price FROM game_current_prices "
+                    f"WHERE appid = {appid} ORDER BY region_code"
+                )
+            )
+        ).fetchall()
+    return ({"name": game[0]} if game else None), [tuple(r) for r in prices]
+
+
+@pytest.mark.asyncio
+async def test_current_seed_fills_missing_and_yields_to_local(tmp_path: Path) -> None:
+    """现价快照合并三口径：缺行落行 / 本地爬过的让位 / 本地有行无价的补价。
+
+    - APPID_E：本地全无 → games 行 + 现价整包插入；
+    - APPID_A：本地有 games 行且有现价 → 一个字段都不动（本地观测权威）；
+    - APPID_B：本地有 games 行但无现价 → 现价补上（appid 粒度判定）。
+    """
+    async with get_session_factory()() as session:
+        session.add(Game(appid=APPID_A, name="本地名A", type="game"))
+        session.add(Game(appid=APPID_B, name="本地名B", type="game"))
+        await session.commit()
+    async with get_session_factory()() as session:
+        session.add(GameCurrentPrice(
+            appid=APPID_A, region_code="CN", price=9999, price_status="ok",
+        ))
+        await session.commit()
+
+    seed = _make_seed(
+        tmp_path / "holdexar_seed.db",
+        games_catalog=[
+            _gc_row(APPID_E, "种子目录行E"),
+            _gc_row(APPID_A, "种子名A"),
+            _gc_row(APPID_B, "种子名B"),
+        ],
+        current_prices=[
+            _gcp_row(APPID_E),
+            _gcp_row(APPID_E, "US", 2000),
+            _gcp_row(APPID_A, "CN", 1111),
+            _gcp_row(APPID_B, "CN", 2222),
+        ],
+    )
+    stats = await seed_assets.merge_current_seed(seed)
+    assert stats == {"games": 1, "prices": 3}
+
+    game_e, prices_e = await _current_local_state(APPID_E)
+    assert game_e == {"name": "种子目录行E"}
+    assert prices_e == [("CN", 1000), ("US", 2000)]
+
+    game_a, prices_a = await _current_local_state(APPID_A)
+    assert game_a == {"name": "本地名A"}
+    assert prices_a == [("CN", 9999)]  # 本地观测不被种子回拨
+
+    game_b, prices_b = await _current_local_state(APPID_B)
+    assert game_b == {"name": "本地名B"}
+    assert prices_b == [("CN", 2222)]  # 本地有行无价 → 种子补价
+
+    from app.domains.settings import service as settings_service
+
+    assert await settings_service.get_value(seed_assets.CURRENT_MARKER_KEY) == SEED_VERSION
+    # 幂等：同版本种子二次合并零开销（marker 命中直接返回）
+    assert await seed_assets.merge_current_seed(seed) is None
+
+
+@pytest.mark.asyncio
+async def test_current_merge_no_catalog_table_noop(tmp_path: Path) -> None:
+    """schema 4 旧种子（无现价快照表）：合并静默 no-op，不留 marker。"""
+    seed = tmp_path / "holdexar_seed.db"
+    if seed.exists():
+        seed.unlink()
+    con = sqlite3.connect(str(seed))
+    try:
+        con.executescript(
+            "CREATE TABLE seed_meta (key TEXT PRIMARY KEY, value TEXT);"
+            f"INSERT INTO seed_meta VALUES ('version', '{SEED_VERSION}');"
+        )
+        con.commit()
+    finally:
+        con.close()
+    assert await seed_assets.merge_current_seed(seed) is None
+    from app.domains.settings import service as settings_service
+
+    assert await settings_service.get_value(seed_assets.CURRENT_MARKER_KEY) is None

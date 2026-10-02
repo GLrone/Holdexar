@@ -1,9 +1,10 @@
 """资产种子导出：生产库公共切片 → assets/seed/holdexar_seed.db。
 
-白名单制：只读五块公共数据（汇率快照 / 汇率历史 / games 人工策划列（含
-name 身份列）/ 预设游戏池清单 / game_price_history 切片），结构上不可能
-带出凭据表。随包分发，启动时并入：汇率走一次性导入，人工列名单、预设池
-与价格历史走按种子版本的独立合并通道（老用户库也并入）。
+白名单制：只读七块公共数据（汇率快照 / 汇率历史 / games 人工策划列（含
+name 身份列）/ 预设游戏池清单 / game_price_history 切片 / games 主档目录行
+/ game_current_prices 现价快照），结构上不可能带出凭据表。随包分发，启动时
+并入：汇率走一次性导入，人工列名单、预设池、价格历史与现价快照走按种子
+版本的独立合并通道（老用户库也并入）。
 
 用法（发布机）：
     python scripts/export_seed.py                     # data/holdexar.db → assets/seed/
@@ -14,11 +15,16 @@ name 身份列）/ 预设游戏池清单 / game_price_history 切片），结构
 去重键（同键保留 id 最大一行，对齐写入侧幂等口径）：fx_rate_history 按
 (currency_code, fetched_at 原文)；game_price_history 按 (appid, region_code,
 sub_id, is_gold, snapshot_at 原文)，price 不进键（同键不同价 = 同一次快照的
-价格修正）；games_curated 只收任一人工列非空的行。
+价格修正）；games_curated 只收任一人工列非空的行；game_current_prices 以
+本地主键 (appid, region_code) 原样带出。
 
 人工列名单与预设池随种子下发完整 games 行：合并侧对本地缺行的 appid 直接
 落行（name 取种子），新用户开箱即有初始目录；名单行 updated_at 非空，不被
 孤儿补抓层捡去爬——监控范围只由愿望单驱动，名单 ≠ 监控。
+
+现价快照（games_catalog + game_current_prices）：库内有现价的游戏整表带出
+（主档最小列集 + 全区现价行），新用户开箱即有全量目录与现价，找游戏页
+首屏就有数据；合并按 appid 粒度让位本地观测（本地爬过的游戏不回拨）。
 
 价格历史窗口：默认全量时间切片（0）；--history-days 可按天裁窗，合并通道
 按逻辑键幂等去重，老用户每次升级都并入最新切片。
@@ -38,7 +44,7 @@ from app.core.paths import resolve_data_dir  # noqa: E402 —— 数据目录判
 
 DEFAULT_OUT = ROOT / "assets" / "seed" / "holdexar_seed.db"
 
-SEED_SCHEMA_VERSION = 4
+SEED_SCHEMA_VERSION = 5
 CURATED_COLS = ("xgp_tier", "epic_date", "is_epic", "is_hb", "hb_data", "series_id")
 # 人工列名单行的身份列：名单行要在用户库里落成完整 games 行（缺行时），
 # name 是 games 表唯一 NOT NULL 的展示字段。与 CURATED_COLS 分列：覆写
@@ -53,6 +59,26 @@ GPH_COLS = (
     "appid", "region_code", "currency", "price", "original_price",
     "discount_percent", "sub_id", "is_gold", "version_suffix", "is_bundle",
     "price_status", "cny_fen", "snapshot_at",
+)
+
+# game_current_prices 种子列（appid+region_code 是本地主键，同键库内不会重复；
+# 列全集显式带出——合并侧按列名集合直插，不依赖库内默认值）。与
+# seed_assets.GCP_COLS 同序同集
+GCP_COLS = (
+    "appid", "region_code", "currency", "price", "original_price",
+    "discount_percent", "sub_id", "price_status", "fail_count", "cny_fen",
+    "discount_end_ts", "updated_at",
+)
+# 现价快照自带 games 主档行：找游戏页展示/筛选所需最小集 + 库内 NOT NULL
+# 无默认列（family_sharing/trading_cards/positive_reviews/review_count/
+# view_count 必须显式给值）。排序缓存列（min_cny_fen/diff_fen/smart_score/
+# hl_flag/pp_flag）由启动链标记三连按现价重算，不带；人工列走 games_curated
+# 通道，不带。与 seed_assets.GC_COLS 同序同集
+GC_COLS = (
+    "appid", "name", "name_en", "type", "header_image", "family_sharing",
+    "trading_cards", "is_adult", "is_visual_novel", "release_date", "genres",
+    "positive_rate", "positive_reviews", "review_count", "view_count",
+    "removed_at", "free_kind",
 )
 
 _HISTORY_CHUNK = 50_000
@@ -87,6 +113,17 @@ def _iter_history(src: sqlite3.Connection, history_days: int):
         ") m ON g.id = m.id",
         params,
     )
+    while True:
+        rows = cur.fetchmany(_HISTORY_CHUNK)
+        if not rows:
+            return
+        yield rows
+
+
+def _iter_current_prices(src: sqlite3.Connection):
+    """现价快照切片（流式）：本地主键 (appid, region_code) 原样带出，按块产出。"""
+    cols = ", ".join(f"g.{c}" for c in GCP_COLS)
+    cur = src.execute(f"SELECT {cols} FROM game_current_prices g")
     while True:
         rows = cur.fetchmany(_HISTORY_CHUNK)
         if not rows:
@@ -158,6 +195,19 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
                 "WHERE TRIM(COALESCE(g.name, p.name, '')) != '' "
                 "ORDER BY p.appid"
             ).fetchall()
+        # 现价快照（同缺表语义）：有现价的游戏整表带出——主档目录行（最小
+        # 列集，无名行不进，与预设池同守卫）+ 全区现价行
+        has_gcp = src.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='game_current_prices'"
+        ).fetchone() is not None
+        games_catalog: list[tuple] = []
+        if has_gcp:
+            gc_cols = ", ".join(f"g.{c}" for c in GC_COLS)
+            games_catalog = src.execute(
+                f"SELECT {gc_cols} FROM games g "
+                "WHERE g.appid IN (SELECT DISTINCT appid FROM game_current_prices) "
+                "AND TRIM(COALESCE(g.name, '')) != ''"
+            ).fetchall()
 
         exported_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         seed = sqlite3.connect(str(out_path))
@@ -214,6 +264,41 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
                 );
                 CREATE INDEX ix_seed_gph_key
                     ON game_price_history (appid, region_code, snapshot_at);
+                CREATE TABLE games_catalog (
+                    appid INTEGER PRIMARY KEY,
+                    name TEXT,
+                    name_en TEXT,
+                    type TEXT,
+                    header_image TEXT,
+                    family_sharing INTEGER,
+                    trading_cards INTEGER,
+                    is_adult INTEGER,
+                    is_visual_novel INTEGER,
+                    release_date TEXT,
+                    genres TEXT,
+                    positive_rate INTEGER,
+                    positive_reviews INTEGER,
+                    review_count INTEGER,
+                    view_count INTEGER,
+                    removed_at TEXT,
+                    free_kind TEXT
+                );
+                CREATE TABLE game_current_prices (
+                    appid INTEGER,
+                    region_code TEXT,
+                    currency TEXT,
+                    price INTEGER,
+                    original_price INTEGER,
+                    discount_percent INTEGER,
+                    sub_id INTEGER,
+                    price_status TEXT,
+                    fail_count INTEGER,
+                    cny_fen INTEGER,
+                    discount_end_ts INTEGER,
+                    updated_at TEXT
+                );
+                CREATE INDEX ix_seed_gcp_appid
+                    ON game_current_prices (appid);
                 """
             )
             seed.executemany("INSERT INTO fx_rates VALUES (?, ?, ?)", fx_rates)
@@ -236,6 +321,18 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
                     )
                     gph_rows += len(chunk)
             seed.executemany(
+                "INSERT INTO games_catalog VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                games_catalog,
+            )
+            gcp_rows = 0
+            gcp_placeholders = ", ".join("?" for _ in GCP_COLS)
+            if has_gcp:
+                for chunk in _iter_current_prices(src):
+                    seed.executemany(
+                        f"INSERT INTO game_current_prices VALUES ({gcp_placeholders})", chunk
+                    )
+                    gcp_rows += len(chunk)
+            seed.executemany(
                 "INSERT INTO seed_meta VALUES (?, ?)",
                 [
                     ("schema_version", str(SEED_SCHEMA_VERSION)),
@@ -247,6 +344,8 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
                     ("rows_preset", str(len(preset))),
                     ("rows_history", str(gph_rows)),
                     ("history_days", str(history_days)),
+                    ("rows_games_catalog", str(len(games_catalog))),
+                    ("rows_current_prices", str(gcp_rows)),
                 ],
             )
             seed.commit()
@@ -260,7 +359,8 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
     print(
         f"[种子] 汇率快照 {len(fx_rates)} 条 / 汇率历史 {len(history)} 行 / "
         f"人工列 {len(curated)} 款 / 预设池 {len(preset)} 款 / "
-        f"价格历史（{window}）{gph_rows} 行"
+        f"价格历史（{window}）{gph_rows} 行 / "
+        f"现价快照 {len(games_catalog)} 款 {gcp_rows} 行"
     )
     print(f"[种子] {out_path}（{size / 1048576:.1f} MB）")
     print(f"[种子] sha256 {_sha256(out_path)[:16]}…  version={exported_at}")
@@ -270,6 +370,8 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
         "curated": len(curated),
         "preset": len(preset),
         "history": gph_rows,
+        "games_catalog": len(games_catalog),
+        "current_prices": gcp_rows,
         "size": size,
     }
 
