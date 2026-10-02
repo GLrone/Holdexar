@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -447,6 +448,11 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    # 传输压缩。text/event-stream 在 Starlette 默认排除表内，crawl / pilot /
+    # logs 三条 SSE 不被缓冲；图片、字体、压缩包同样排除。
+    # compresslevel 取 6 而非默认 9：捆绑包全量列表是 50MB 级 JSON，9 下单次
+    # 压缩为秒级 CPU，而压缩比只高约 4%——6 是压缩率与单请求 CPU 的平衡点。
+    app.add_middleware(GZipMiddleware, compresslevel=6)
 
     @app.middleware("http")
     async def _add_static_cache_headers(request, call_next):

@@ -55,6 +55,7 @@ const bundles = {
 
   /* 高级筛选（只放捆绑包有数据源的维度） */
   'bundles.filter.section.basic': '购买形态',
+  'bundles.filter.followedOnly': '只看关注',
   'bundles.filter.completableOnly': '仅可补齐（不必整包）',
   'bundles.filter.cnLowestOnly': '国区最低',
   'bundles.filter.section.ownership': '撞库结果',

@@ -125,7 +125,8 @@ export function computeCompletion(
     }
   }
 
-  const regionAids = new Set(rp.appIds.map(Number))
+  // 区表成员来自详情载荷（appIds 只在那里下发）；缺表按空集处理
+  const regionAids = new Set((rp.appIds ?? []).map(Number))
   let sumMinor = 0
   let sumFen = 0
   let validCount = 0
