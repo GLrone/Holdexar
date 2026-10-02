@@ -11,7 +11,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
-from sqlalchemy import case, or_, select, text, update
+from sqlalchemy import case, delete, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core import seed_assets
@@ -1062,6 +1062,37 @@ class DbWriter:
         except Exception as e:
             logger.error("记录异常状态失败: %s", e)
 
+    async def clear_missing_regions(self, pairs: list[tuple[int, str]]) -> int:
+        """批量清除误标的 missing 现价行（只删 missing 状态行，历史不动）。
+
+        处理器对目标「看见了但不落价」的判定（非游戏类型、未发售、元数据
+        与库内原值双缺）意味着该区当前不存在可写的价格事实——批量失败整批
+        记 missing 时误标的行若不清，会成为补抓通道每拍重拾、永不收敛的
+        死账——每拍重拾、永不收敛。删除后回到「未观测」态：黄框消失、补抓不再
+        拾取，主轮/重探在事实变化后（发售/上线）自然写出真实状态行。
+        """
+        if not pairs:
+            return 0
+        try:
+            async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+                result = await session.execute(
+                    delete(GameCurrentPrice).where(
+                        or_(
+                            *[
+                                (GameCurrentPrice.appid == int(appid))
+                                & (GameCurrentPrice.region_code == cc.upper())
+                                for appid, cc in pairs
+                            ]
+                        ),
+                        GameCurrentPrice.price_status == "missing",
+                    )
+                )
+                await session.commit()
+                return int(result.rowcount or 0)
+        except Exception as e:
+            logger.error("清除 missing 行失败: %s", e)
+            return 0
+
     async def mark_coming_soon(self, appid: int) -> None:
         """coming_soon 无包（未开放预购/未上线）暂缓语义：type=COMING_SOON 挂名行。
 
@@ -1220,33 +1251,37 @@ class DbWriter:
             from .browse_store import DEFAULT_BATCH_SIZE  # 延迟导入：browse_store 反向依赖本模块
 
             async with get_session_factory()() as session:
-                # 下架脱池（宽限期内照常补抓——误判保险期；终态 404 不会
-                # 改善，穷尽重试转 blocked 后自然停，无需单独排除逻辑）
-                # + 免费态排除（f2p/promo 的价格事实已定，欠账重试是空转）
-                excluded = (
-                    select(Game.appid).where(
-                        or_(
-                            Game.removed_at.is_not(None),
-                            Game.free_kind.is_not(None),
-                        )
-                    )
-                )
+                # 不按业务状态排除欠账：下架/免费态的 missing 行若被排除，
+                # 而它们同样不在 pool/catalog 的爬取集合里——账本行将永远
+                # 无消费路径的死账。可补抓性交给补抓本身：真不可
+                # 得的区由逐项判定重新记账并走 fail_count 穷尽转 blocked。
                 rows = (await session.execute(
                     select(GameCurrentPrice.appid, GameCurrentPrice.region_code)
                     .where(
                         GameCurrentPrice.price_status == "missing",
                         GameCurrentPrice.updated_at < cutoff,
-                        ~GameCurrentPrice.appid.in_(excluded),
                     )
                     .order_by(GameCurrentPrice.updated_at)
                 )).all()
+                # 空区行是「全球不可见」的尝试痕迹（无对应真实区服），发给
+                # Steam 的 country_code 会是空串，一发必 400，且永远没有
+                # bump fail_count 的路径——留在账本只会永久占位，即拾即清。
+                stale_empty = [int(appid) for appid, region in rows if not region]
+                if stale_empty:
+                    async with write_gate(WritePriority.BACKGROUND):
+                        await session.execute(
+                            delete(GameCurrentPrice).where(
+                                GameCurrentPrice.appid.in_(stale_empty),
+                                GameCurrentPrice.region_code == "",
+                                GameCurrentPrice.price_status == "missing",
+                            )
+                        )
+                        await session.commit()
+                    logger.info("[补抓] 清除空区尝试痕迹 %d 行", len(stale_empty))
             if limit_rows > 0:
                 rows = rows[:limit_rows]
             by_region: dict[str, list[int]] = {}
             for appid, region in rows:
-                # 空区行是「全球不可见」的尝试痕迹（回补层落账，无对应真实
-                # 区服），不是可补抓的欠账——发给 Steam 的 country_code 会是
-                # 空串，一发必 400。留在账本里走 fail_count 穷尽转 blocked。
                 if not region:
                     continue
                 by_region.setdefault(region.lower(), []).append(int(appid))
