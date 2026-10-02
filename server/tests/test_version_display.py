@@ -204,9 +204,13 @@ async def test_current_excludes_bundle_from_standard_candidates():
 
 @pytest.mark.asyncio
 async def test_hl_flags_excludes_bundle_rows():
-    """史低计算排除 bundle：bundle 低价（9000）不压 prior_low，edition 旧价
-    （11000）成为基准 → 当前 10000 < 11000 = 新史低（flag 1）。
-    若不排除 bundle，prior=9000 → flag 0。"""
+    """史低计算排除 bundle：bundle 低价（9000）不进折扣期前的最低价，
+    edition 旧价（11000）成为基准 → 当前 10000 便宜 ≥1 角且折扣期刚
+    开始 → 新史低（flag 1）。若不排除 bundle，基准=9000 → flag 0。"""
+    # 折扣期起点由现价的连续同价快照解析，库里须有一行现价同期快照
+    async with get_session_factory()() as session:
+        _seed_history(session, 1, "CN", 10000, days_ago=0)
+        await session.commit()
     await games_service.refresh_hl_flags([APPID])
     async with get_session_factory()() as session:
         game = await session.get(Game, APPID)
