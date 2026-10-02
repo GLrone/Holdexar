@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -299,3 +300,72 @@ async def test_probe_pools_return_committed_session(tmp_data_dir, monkeypatch):
             secret="s", now=NOW,
         )
         assert l2 and not s.in_transaction(), "L2 池函数返回前必须提交"
+
+@pytest.mark.asyncio
+async def test_job_proxypool_cycle_does_not_hold_write_gate(tmp_data_dir, monkeypatch):
+    """job 包装层不得让整个周期持写闸：探测/维护期间其他写者必须能拿到写者位。
+
+    周期体（L0 串行探测 + 重建 + L1/L2 维护）可达分钟级；包装层一旦持闸，
+    全局单写者被占住整个周期，交互写入排队到 busy_timeout。
+    """
+    from app.core import scheduler as core_sched
+    from app.core.database import WritePriority, write_gate, write_scheduler_diagnostics
+    from app.domains.proxypool import runtime as pool_runtime
+
+    observed: dict = {}
+
+    async def _fake_cycle(session, **kw):  # noqa: ANN001
+        observed["busy_at_body"] = write_scheduler_diagnostics()["busy"]
+        async with write_gate(WritePriority.BACKGROUND):
+            # 重入深度 1 = 本次获取是新授权（外层没有周期级持闸）
+            observed["depth_at_body_write"] = write_scheduler_diagnostics()["depth"]
+        return SimpleNamespace(l0=(), busy=False, rebuilt=None, maintenance=None)
+
+    monkeypatch.setattr(
+        pool_runtime, "controller_endpoint_of",
+        lambda data_dir: ("http://127.0.0.1:19090", "s"),
+    )
+    monkeypatch.setattr(sched, "run_proxypool_cycle", _fake_cycle)
+
+    await core_sched._job_proxypool_cycle()
+
+    assert observed == {"busy_at_body": False, "depth_at_body_write": 1}
+    assert write_scheduler_diagnostics()["busy"] is False
+
+
+@pytest.mark.asyncio
+async def test_run_pending_rebuild_serialized_across_callers(tmp_data_dir, monkeypatch):
+    """take→rebuild_runtime 之间有 await 窗口：重建期间新置位的 pending 会让
+    第二个调用方也拿到执行权——跨调用方必须串行，不得双内核 stop/start。"""
+    import asyncio
+
+    concurrency = {"cur": 0, "max": 0}
+
+    async def _rebuild(session, **kw):  # noqa: ANN001
+        concurrency["cur"] += 1
+        concurrency["max"] = max(concurrency["max"], concurrency["cur"])
+        await asyncio.sleep(0.05)
+        sched.request_rebuild()  # 重建期间池又脏了：新 pending
+        concurrency["cur"] -= 1
+        return SimpleNamespace(controller_url="x")
+
+    async def _skip(session, **kw):  # noqa: ANN001
+        return None
+
+    monkeypatch.setattr(sched, "rebuild_runtime", _rebuild)
+    monkeypatch.setattr(sched, "_rebuild_skip_reason", _skip)
+    monkeypatch.setattr(sched, "crawler_busy", lambda: False)
+
+    sched.request_rebuild()
+    results = await asyncio.gather(*(
+        sched.run_pending_rebuild(
+            None, data_dir=tmp_data_dir, controller_url="http://127.0.0.1:9",
+            secret="s", runtime=object(), exe_path="x",
+        )
+        for _ in range(2)
+    ))
+
+    assert concurrency["max"] == 1, "两个调用方不得并发进入 rebuild_runtime"
+    assert sum(1 for r in results if r is not None) == 2, (
+        "重建期间新置位的 pending 应由第二个调用方顺次消费，不得吞掉"
+    )
