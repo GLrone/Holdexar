@@ -7,7 +7,7 @@ bundleid / packageid 与 appid 一样进 `ids` 数组，单区一发 ≤400 条�
 - **抓取区 = 监控启用区**（「我」页勾选，与游戏侧同一口径），不再全区全发；
   南亚（CC_LIST 的 pk 聚合位）按 Steam 实际拆巴基斯坦（pk）/ 孟加拉（bd）
   两个独立区各发一次、各落一行（展示层按追踪位合并放行、取两区更低价）。
-- **请求数**：整表每区一发（监控区数发，URL ≈3.4KB），而非每包每区一发。
+- **请求数**：关注集每区一发（监控区数发，URL ≈3.4KB），而非每包每区一发。
 - **身份直给**：`item_type`（1=Sub / 2=Bundle）与 `store_url_path`（sub/… vs
   bundle/…）即 Steam 权威身份，无需「us 区基准判定整包身份 → 全区沿用」的
   双轨探测（同号 sub/bundle 混写即该探测的失真场景）。
@@ -78,9 +78,7 @@ _CC_CURRENCY.update(
 # 新接口请求参数（语言固定 english：名称与 app 链路同口径，区域价与语言无关）
 BROWSE_LANG = "english"
 
-# 全表刷新的分片数：整表 × 监控区一发约占限流预算 30 分钟以上，切成
-# N 片按小时轮换（每轮链尾只跑一片），N 小时完成一次全表轮换
-_BUNDLE_REFRESH_SHARDS = 3
+# 单发请求条数上限与超时（关注集每区一发，超长由 plan_id_batches 自动再切）
 BROWSE_TIMEOUT = 20
 
 
@@ -458,17 +456,6 @@ async def _upsert_bundle_rows(
         return True
 
 
-async def _blocked_bundle_ids() -> set[int]:
-    """不进刷新的包：用户排除（excluded）或已停止监控（released）。"""
-    try:
-        from app.domains.monitoring import service as monitoring_service
-
-        return await monitoring_service.blocked_ids("bundle")
-    except Exception:  # noqa: BLE001
-        logger.exception("[bundles] 监控状态读取失败（本次按全量刷新处理）")
-        return set()
-
-
 async def _attach_bundle_source(bundle_id: int) -> None:
     """导入 = 用户明确意图：挂上 import 来源并解除排除。
 
@@ -484,61 +471,49 @@ async def _attach_bundle_source(bundle_id: int) -> None:
 
 
 async def refresh_bundles() -> dict:
-    """全量刷新捆绑包：库内所有包**监控区整表每区一发**（≤400 条）→ upsert。
+    """刷新关注的捆绑包：监控层在册的包**监控区整表每区一发**（≤400 条）→ upsert。
 
-    同时承担「无价桩首抓」职责：发现的捆绑包（游戏爬取 purchase_options
-    落下的无价桩）就在全量表内，随同一批请求完成首抓——不需要独立的
-    逐包播种通道。抓取区 = 监控启用区（南亚 pk/bd 双发），全禁用时由
-    effective_regions 抛 ValueError（链尾按跳过语义、手动导入转 400）。
+    候选集 = monitoring 层 target_type=bundle 的 active 对象——favorite
+    （星标关注）与 import（手动导入）都是用户显式意图，excluded / released
+    被状态门挡在 active 之外。库内未关注的包（含游戏爬取落下的发现桩）不
+    随轮刷新：桩在列表侧本就按无价剔除，用户关注/导入时才进刷新集（导入
+    当场整包抓取），运行负担只随关注的集合走，不随库内包数走。抓取区 =
+    监控启用区（南亚 pk/bd 双发），全禁用时由 effective_regions 抛
+    ValueError（链尾按跳过语义、手动导入转 400）。
     """
     rates = await get_rates()  # {currency: rate_to_cny}
     rate_map = dict(rates) if isinstance(rates, dict) else {}
     rate_map.setdefault("CNY", 1.0)
-    ccs = await _bundle_fetch_ccs()
 
-    # 监控资格门：被排除 / 已停止监控的包不进刷新。没有监控记录的包照刷
-    # ——库内既有捆绑包默认参与，只有用户显式表达过「别再爬它」才退出。
-    blocked = await _blocked_bundle_ids()
+    from app.domains.monitoring import service as monitoring_service
+
+    # 先看关注集再解析抓取区：无关注包时整轮跳过，不碰区域配置
+    # （全禁用区由 effective_regions 抛 ValueError，链尾按跳过语义处理）
+    watched = await monitoring_service.active_ids("bundle")
     stmt = select(
         Bundle.bundle_id,
         # 形态选键：item_kind 权威；v3 之前的行兜底沿用 mps 旧值
         func.coalesce(Bundle.item_kind, Bundle.must_purchase_as_set),
-    )
-    if blocked:
-        stmt = stmt.where(Bundle.bundle_id.notin_(sorted(blocked)))
-    stmt = stmt.order_by(Bundle.bundle_id)
+    ).where(Bundle.bundle_id.in_(watched)).order_by(Bundle.bundle_id)
 
     async with get_session_factory()() as session:
         want = [
             (int(bid), kind)
             for bid, kind in (await session.execute(stmt)).all()
         ]
-        priced = {
-            int(b)
-            for b in (
-                await session.execute(
-                    select(BundleRegionPrice.bundle_id).distinct()
-                )
-            ).scalars()
-        }
     if not want:
-        return {"ok": False, "detail": "库内无捆绑包（先从原项目导入或添加）"}
-    pending_ids = {bid for bid, _kind in want if bid not in priced}
+        logger.info("[bundles] 无关注的捆绑包，本轮跳过刷新")
+        invalidate_bundles_cache()
+        return {
+            "ok": True, "updated": 0, "total": 0, "regionPrices": 0,
+            "failed": [],
+        }
+    ccs = await _bundle_fetch_ccs()
 
     now = datetime.utcnow()
-    # 分片轮转：全表 × 监控区整表一发约上千发，占满限流预算 30 分钟以上——
-    # 刷新挂在主轮链尾，跑不完就被下一次重启杀掉，表时间长期停在偶尔跑完的
-    # 那一轮。按 bundle_id 固定取模分片、每小时换一片：每轮只刷一片（约
-    # 1/3 表，限流预算内稳稳跑完）+ 全部无价桩（首抓不随分片等待），
-    # N 片小时数内完成一次全表轮换；bundle_id 取模让新包始终落在固定片，
-    # 不会因表增删漂移而漏刷。
-    shard_count = _BUNDLE_REFRESH_SHARDS
-    shard = int(now.timestamp() // 3600) % shard_count
-    shard_ids = {bid for bid, _ in want if bid % shard_count == shard}
-    want = [w for w in want if w[0] in shard_ids or w[0] in pending_ids]
     logger.info(
-        "[bundles] 本轮分片 %d/%d：刷新 %d 个包（无价桩 %d 个随轮全刷）",
-        shard + 1, shard_count, len(want), len(pending_ids),
+        "[bundles] 本轮刷新关注包 %d 个（%s 区整表一发）",
+        len(want), "/".join(ccs),
     )
 
     updated_bundles = 0
@@ -563,7 +538,6 @@ async def refresh_bundles() -> dict:
 
     failed: list[int] = [bid for bid, _kind in want if not rows_by_id.get(bid)]
     dropped_singletons = 0
-    seeded = 0
     touched: list[int] = []  # 本轮成功落库的包：链尾统一重建排序快照
     for bid, _kind in want:
         regions = rows_by_id.get(bid) or []
@@ -575,8 +549,6 @@ async def refresh_bundles() -> dict:
         updated_bundles += 1
         updated_prices += len(regions)
         touched.append(bid)
-        if bid in pending_ids:
-            seeded += 1
 
     # ── 排序快照增量重建（bundles.min_cny_fen/diff_fen/is_lowest）──
     # 写时算好、GET 只读：本轮价格变了哪些包就重建哪些包（按批，允许
@@ -588,10 +560,10 @@ async def refresh_bundles() -> dict:
             logger.exception("[bundles] 排序快照重建失败（列表沿用上一版快照）")
 
     logger.info(
-        "捆绑包刷新完成：成功 %d/%d，区域价 %d 行，失败 %d 个，单品甄别剔除 %d 个，"
-        "无价桩首抓 %d 个（%s 区整表一发）",
+        "捆绑包刷新完成：成功 %d/%d，区域价 %d 行，失败 %d 个，单品甄别剔除 %d 个"
+        "（%s 区整表一发）",
         updated_bundles, len(want), updated_prices, len(failed),
-        dropped_singletons, seeded, "/".join(ccs),
+        dropped_singletons, "/".join(ccs),
     )
     result = {
         "ok": not failed,
@@ -600,7 +572,6 @@ async def refresh_bundles() -> dict:
         "regionPrices": updated_prices,
         "failed": failed,
         "droppedSingletons": dropped_singletons,
-        "seeded": seeded,
     }
     invalidate_bundles_cache()
     # ── 包内 appid 检测 → app 爬取队列联动 ──

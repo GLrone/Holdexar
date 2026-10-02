@@ -919,8 +919,9 @@ class DbWriter:
         """捆绑包发现桩落库（游戏条目 purchase_options 白送的数据）。
 
         只 INSERT 库内没有的包（on_conflict_do_nothing）：既有完整主档不
-        覆盖——发现渠道只负责「把新包带进门」，无价桩随 6h 主轮链尾的
-        全量刷新（bundles.refresh_bundles）整区抓取补齐。
+        覆盖——发现渠道只负责「把新包带进门」，无价桩不随轮刷新，用户
+        关注/导入该包时才整区抓取补价（bundles.refresh_bundles 只刷
+        监控层在册的包）。
         app_ids 只存本游戏一个 id 当种子，抓取时会被 included_appids 校正。
 
         返回新插入数（调用方做发现计数）。
