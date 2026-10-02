@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
@@ -69,6 +70,13 @@ L0_COMMIT_EVERY = PROBE_COMMIT_EVERY
 # 按节点计容量。上限取与生产 worker 上限同量级，够把容量模型建出来即可。
 STARTUP_L1_MAX_NODES = 60
 STARTUP_L1_BUDGET_SECONDS = 240.0
+
+# rebuild 跨调用方互斥：take_rebuild_pending 的消费原子只保「取」不保「做」——
+# take 与 rebuild_runtime 之间的 await 窗口里新置位的 pending 会让第二个调用方
+# 也进入重建（双内核 stop/start）。获取顺序必须**先写闸后本锁**：锁内段含
+# events.record 的独立写闸（orchestration.record），反序会与「持闸等锁」的调用方
+# 形成闸↔锁 AB-BA 死锁；写闸对本链既有持闸调用方按重入放行。
+_rebuild_lock = asyncio.Lock()
 
 _pending = False
 # L1/L2 体检探测进行中（跨整池串行探测，可达分钟级）。给任务页「系统在干嘛」
@@ -392,19 +400,25 @@ async def run_pending_rebuild(
     动手前先过空转闸（`_rebuild_skip_reason`）：目标与现状一致、或合格集已空而
     Runtime 还活着 → 跳过并返回 `None`；重建生效优先走热重载通道（见
     `rebuild_runtime`），失败自动回退进程重启。
+
+    全段持写闸 + `_rebuild_lock`：重建是内核生命周期操作（stop/start）且
+    `rebuild_runtime` 事件留痕自带独立写闸，跨调用方（启动链 / 周期 job /
+    bootstrap）同一时刻只允许一个重建在执行。
     """
     if crawler_busy():
         return None
-    if not take_rebuild_pending():
-        return None
-    skip = await _rebuild_skip_reason(session, data_dir=data_dir)
-    if skip is not None:
-        logger.info("[重建] 跳过本次重建：%s", skip)
-        return None
-    return await rebuild_runtime(
-        session, data_dir=data_dir, controller_url=controller_url, secret=secret,
-        runtime=runtime, exe_path=exe_path,
-    )
+    async with write_gate(WritePriority.BACKGROUND):
+        async with _rebuild_lock:
+            if not take_rebuild_pending():
+                return None
+            skip = await _rebuild_skip_reason(session, data_dir=data_dir)
+            if skip is not None:
+                logger.info("[重建] 跳过本次重建：%s", skip)
+                return None
+            return await rebuild_runtime(
+                session, data_dir=data_dir, controller_url=controller_url, secret=secret,
+                runtime=runtime, exe_path=exe_path,
+            )
 
 
 @dataclass(frozen=True)

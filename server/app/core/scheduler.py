@@ -540,25 +540,15 @@ async def _record_cycle_stats(cycle_id: int | None) -> None:
 
 
 async def _price_refresh_specs() -> list[dict]:
-    """价格轮队列组成（每轮开工时现读开关，改开关不打断在跑的轮）：
+    """价格轮队列组成——委托 crawl 服务 `default_queue_specs()`（唯一来源）。
 
-    - 常驻两段：欠账补抓 → 监控层（pool：有来源且未排除的对象）；
-    - 目录层（catalog：games 主档减监控层）随 KV `crawl.catalog_refresh`
-      决定是否带上——打开后未关注的目录游戏与监控对象同轮同频刷新；
-    - 特惠榜尾段（specials：Steam 特惠+热门榜翻页队列去重后垫底）恒在
-      列，与 pool/catalog 重合的对象不重复爬，尾段只剩榜单独有差集；
-      「自动抓取」页 Steam 榜单源关闭时该段为空。
+    自动价格轮与任务页「全部」档同源同组成：欠账补抓 → 监控层（pool）→
+    目录层（catalog）+ 特惠榜差值段（specials）随 KV `crawl.catalog_refresh`
+    （默认开）；关闭后只抓监控层。组成调整只改 crawl 服务那一处。
     """
-    from app.domains.settings.service import get_value
+    from app.domains.crawl import service as crawl_service
 
-    specs: list[dict] = [
-        {"kind": "missing"},
-        {"scope": "pool"},
-    ]
-    if await get_value("crawl.catalog_refresh", False):
-        specs.append({"scope": "catalog"})
-    specs.append({"scope": "specials", "kind": "specials_backfill"})
-    return specs
+    return await crawl_service.default_queue_specs()
 
 
 async def _job_price_refresh() -> None:
@@ -582,10 +572,10 @@ async def _job_price_refresh() -> None:
     存储代价由 db_writer 历史差量门禁兜住：价格未变不写快照。
 
     链尾捆绑包刷新：两层链逐个 await 跑完后，紧跟
-    bundles.refresh_bundles() 全量刷包——发现的捆绑包（游戏条目
-    purchase_options 落下的无价桩）随同一批请求完成首抓，与存量包的
-    各区价/折扣一起跟着这张 6h 网格轮换（锚点即 Steam 折扣刷新时刻，
-    折扣轮换后捆包/单买比较不失真）。捆绑包抓取只在链尾发生，不随
+    bundles.refresh_bundles() 刷新监控层在册的包（星标关注/手动导入）
+    ——库内未关注的包与发现桩不再随轮全刷，运行负担只随用户关注的集合
+    走。抓取区=监控启用区，跟着这张 6h 网格轮换（锚点即 Steam 折扣刷新
+    时刻，折扣轮换后捆包/单买比较不失真）。捆绑包抓取只在链尾发生，不随
     其他爬取运行触发；出网直连 + 与主链共享全局限流预算，异常只记
     日志，不拖垮主链结果。
     """
@@ -905,7 +895,10 @@ async def _job_proxypool_cycle() -> None:
             (legacy.controller_url, legacy.secret)
             if getattr(legacy, "controller_url", None) else None
         )
-        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+        # 探测/重建/维护全程不持写闸：周期可达分钟级，长持闸会把交互写入
+        # 饿死到 busy_timeout。周期内落库各自在 write_gate 短临界区内完成
+        # （含 rebuild 段），此处会话只承载读取与兜底收尾提交。
+        async with get_session_factory()() as session:
             result = await _sched.run_proxypool_cycle(
                 session,
                 data_dir=data_dir,
@@ -916,7 +909,8 @@ async def _job_proxypool_cycle() -> None:
                 now=datetime.now(),
                 recovery_controller=legacy_controller,
             )
-            await session.commit()
+            async with write_gate(WritePriority.BACKGROUND):
+                await session.commit()
         logger.info(
             "[定时] proxypool 周期：L0 %d 项 | busy=%s | rebuilt=%s | 维护=%s",
             len(result.l0), result.busy,
@@ -1674,7 +1668,7 @@ def start_scheduler() -> None:
         asyncio.create_task(_job_bartervg_catchup())
     except RuntimeError:
         logger.warning("[调度] 无运行中事件循环，跳过 Barter.vg 启动补跑")
-    logger.info("调度器已启动（账户同步 15min / 池价格爬取锚点网格：Steam 折扣刷新锚 北京 01:00[夏令时]/02:00[冬令时] + 6h 步进[目录层随开关·特惠榜尾段恒随轮] / 外部时间判定 DST / 捆绑包存量刷新随价格链 / 失败记录修复 5min 空闲档 / 汇率每日 03:00 + 历史修复每日 04:00[缺口·空闲·Key·配额四重门禁] / WAL 收缩每日 04:30 / Barter.vg bundle 计数每日 05:40 / 代理体检 6h / Clash 订阅重拉 30min 拍[6h 门槛·爬虫空闲档] / 钱包每分钟轮转 / 账单 30min / 热销榜 1h / 热门新品 24h / 即将推出 24h / CS 重探每日 10:00 / 自动备份 24h）")
+    logger.info("调度器已启动（账户同步 15min / 池价格爬取锚点网格：Steam 折扣刷新锚 北京 01:00[夏令时]/02:00[冬令时] + 6h 步进[目录层与特惠榜差值段随开关] / 外部时间判定 DST / 捆绑包关注集刷新随价格链 / 失败记录修复 5min 空闲档 / 汇率每日 03:00 + 历史修复每日 04:00[缺口·空闲·Key·配额四重门禁] / WAL 收缩每日 04:30 / Barter.vg bundle 计数每日 05:40 / 代理体检 6h / Clash 订阅重拉 30min 拍[6h 门槛·爬虫空闲档] / 钱包每分钟轮转 / 账单 30min / 热销榜 1h / 热门新品 24h / 即将推出 24h / CS 重探每日 10:00 / 自动备份 24h）")
 
 
 def stop_scheduler() -> None:
