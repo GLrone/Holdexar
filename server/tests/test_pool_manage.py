@@ -399,7 +399,7 @@ async def test_pool_priority_wishlist_and_follow_first(db, monkeypatch):
     await _seed_item(db, 200, active=True, wishlisted=True)   # 第一优先级（愿望单）
     await _seed_item(db, 100, active=True, manual=True)       # 第一优先级（关注）
 
-    ordered = [a for a, _ in await crawl_service._resolve_scope_appids("wishlist", None)]
+    ordered = [a for a, _ in await crawl_service.resolve_scope_appids("wishlist", None)]
     assert ordered == [100, 200, 350, 300, 400], (
         "期望 [关注 100] → [愿望单 200] → [第二优先级 hot 350 → 300 → 400]，"
         f"实际 {ordered}"

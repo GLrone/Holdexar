@@ -172,7 +172,7 @@ async def _read_fetch_settings() -> FetchSettingsPayload:
     except (TypeError, ValueError):
         pass
     payload.catalog_refresh = bool(
-        await service.get_value("crawl.catalog_refresh", False)
+        await service.get_value("crawl.catalog_refresh", True)
     )
     return payload
 

@@ -221,7 +221,7 @@ async def test_case4_start_job_refuses_when_pool_empty(tmp_path, monkeypatch) ->
 
     monkeypatch.setattr(crawl_service, "effective_regions",
                         lambda regions=None: _async(["us"]))
-    monkeypatch.setattr(crawl_service, "_resolve_scope_appids",
+    monkeypatch.setattr(crawl_service, "resolve_scope_appids",
                         lambda scope, appids: _async([(220, "HL2")]))
     monkeypatch.setattr(crawl_service, "_resolve_worker_count", lambda: _async(4))
     monkeypatch.setattr(crawl_service, "_get_settings", lambda: _Settings(),

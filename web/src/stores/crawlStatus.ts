@@ -31,12 +31,18 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
   const roundTotal = ref(0)
   const roundTracking = ref(false)
 
-  /** 轮内累计进度（含在跑任务段的实时计数）；null = 当前无轮次口径 */
+  /** 轮内累计进度（含在跑任务段的实时计数）；null = 当前无轮次口径。
+      分母不叠加在跑段 total：roundTotal（冻结轮批次总账与已启动段精确值
+      的较大者）已含在跑段，再叠加会让分母逐段跳大。max 兜 REST 对账
+      未落地的窗口——此时以「分子已完成 + 在跑段 total」保底，不重复计数。 */
   const roundProgress = computed(() => {
     if (!roundTracking.value) return null
     const liveDone = running.value ? done.value : 0
     const liveTotal = running.value ? total.value : 0
-    return { done: roundDone.value + liveDone, total: roundTotal.value + liveTotal }
+    return {
+      done: roundDone.value + liveDone,
+      total: Math.max(roundTotal.value, roundDone.value + liveTotal),
+    }
   })
 
   /* 以最近一轮的记账状态核对轮次是否在跑，并把该轮已收尾任务段的完成量补进
@@ -48,7 +54,9 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
         roundTracking.value = false
         return
       }
-      const jobs = await crawlApi.jobs(10)
+      /* 30：轮内段数 ≤4 之外再留同窗余量——jobs 按 id 降序截断，秋促长轮
+         期间修复/手动任务会把轮内早段挤出小窗口，分子分母随之缺段 */
+      const jobs = await crawlApi.jobs(30)
       let finishedDone = 0
       let startedTotal = 0
       for (const job of jobs) {
@@ -89,6 +97,9 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
 
     source.onopen = () => {
       void resyncRunning()
+      /* 断线重连会丢轮内事件：以 REST 账本对账轮次追踪，避免退回段级
+         口径让「总队列」随段跳变 */
+      void syncRoundScope()
     }
 
     source.addEventListener('crawl.progress', (e) => {
@@ -117,10 +128,12 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
     source.addEventListener('job.status', (e) => {
       const data = JSON.parse((e as MessageEvent).data)
       if (['done', 'failed', 'stopped'].includes(data.status)) {
-        /* 任务段收尾并入轮次累计；轮内下一段起算时不清零 */
+        /* 分子并入轮次累计（轮内下一段起算时不清零）；分母不加——本段
+           total 在启动时已随 syncRoundScope 的 startedTotal 进入
+           max(batchesExpected, startedTotal) 分母，收尾再加会让分母跳大、
+           进度条倒退。 */
         if (roundTracking.value) {
           roundDone.value += done.value
-          roundTotal.value += total.value
         }
         running.value = false
         activeJobId.value = null

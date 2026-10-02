@@ -295,7 +295,7 @@ async def test_wishlist_scope_excludes_removed():
                                      added_at=datetime.now(), active=True))
             await session.commit()
 
-        pairs = await crawl_service._resolve_scope_appids("wishlist", None)
+        pairs = await crawl_service.resolve_scope_appids("wishlist", None)
         got = {a for a, _ in pairs}
         assert 990101 not in got        # 宽限外脱池
         assert 990102 in got            # 宽限内保留

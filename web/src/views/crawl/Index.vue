@@ -25,7 +25,7 @@ const settingsStore = useSettingsStore()
 const jobs = ref<CrawlJob[]>([])
 const loading = ref(false)
 const manualAppids = ref('')
-const scope = ref<'appids' | 'wishlist'>('wishlist')
+const scope = ref<'all' | 'appids' | 'wishlist'>('all')
 
 /** 区服列表（服务端下发，含 enabled 状态）；null = 全部启用。
     作用：已购游戏抓取地区的全选/清空备选集与「跟随监控地区」计数
@@ -318,6 +318,15 @@ async function start() {
   if (starting.value) return
   starting.value = true
   try {
+    if (scope.value === 'all') {
+      // 默认全队列：与自动价格轮同组成（欠账 → 关注 → 目录层 → 特惠榜差值），
+      // 后台串行链立即受理；全空时后端 400（用户语言），进度走 SSE 与任务列表
+      const res = await crawlApi.runAll()
+      message.success(t('crawl.start.startedQueue', { n: res.total }))
+      crawl.running = true
+      await loadJobs()
+      return
+    }
     let appids: number[] | undefined
     if (scope.value === 'appids') {
       appids = manualAppids.value
@@ -555,6 +564,7 @@ onBeforeUnmount(() => {
 
       <div class="start-row">
         <el-radio-group v-model="scope">
+          <el-radio-button value="all">{{ t('crawl.start.scopeAll') }}</el-radio-button>
           <el-radio-button value="wishlist">{{ t('crawl.start.scopeWishlist') }}</el-radio-button>
           <el-radio-button value="appids">{{ t('crawl.start.scopeAppids') }}</el-radio-button>
         </el-radio-group>

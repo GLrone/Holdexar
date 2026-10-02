@@ -127,7 +127,7 @@ async def test_pool_scope_orders_family_wishlist_before_second_priority(db):
     # 手动加入 = 用户显式来源（不再由 wishlist_items 的 manual_pool 派生）
     await monitoring.ensure_source("game", 800, "manual")
 
-    assert await crawl_service._resolve_scope_appids("pool", None) == [(700, ""), (800, "")]
+    assert await crawl_service.resolve_scope_appids("pool", None) == [(700, ""), (800, "")]
 
 
 # ── 2. 多来源共存 ─────────────────────────────────────────────
@@ -179,7 +179,7 @@ async def test_excluded_blocks_monitoring_and_crawl(db):
     assert await monitoring.sources_of("game", 700) == ["family_wishlist"]
     assert await monitoring.state_of("game", 700) == "excluded"
     assert await monitoring.active_ids("game") == []
-    assert await crawl_service._resolve_scope_appids("pool", None) == []
+    assert await crawl_service.resolve_scope_appids("pool", None) == []
 
     # 来源重现也不绕过排除门
     await monitoring.attach_source("game", 700, "manual")
@@ -236,7 +236,7 @@ async def test_catalog_only_game_is_not_monitored(db):
     await _game(db, 900)
     assert await monitoring.state_of("game", 900) is None
     assert await monitoring.active_ids("game") == []
-    assert await crawl_service._resolve_scope_appids("pool", None) == []
+    assert await crawl_service.resolve_scope_appids("pool", None) == []
 
 
 # ── 7. Bundle 同一套生命周期 ──────────────────────────────────
@@ -319,8 +319,8 @@ async def test_pool_and_catalog_scopes_are_disjoint(db):
     await _wl(db, 700, wishlisted=True)
     await monitoring.sync_game_sources([700])
 
-    pool = [a for a, _ in await crawl_service._resolve_scope_appids("pool", None)]
-    catalog = [a for a, _ in await crawl_service._resolve_scope_appids("catalog", None)]
+    pool = [a for a, _ in await crawl_service.resolve_scope_appids("pool", None)]
+    catalog = [a for a, _ in await crawl_service.resolve_scope_appids("catalog", None)]
     assert pool == [700]
     assert catalog == [800]
 
@@ -331,7 +331,7 @@ async def test_catalog_scope_skips_removed_and_free_games(db):
     await _game(db, 801, removed_at=datetime.now())
     await _game(db, 802, free_kind="f2p")
 
-    catalog = [a for a, _ in await crawl_service._resolve_scope_appids("catalog", None)]
+    catalog = [a for a, _ in await crawl_service.resolve_scope_appids("catalog", None)]
     assert catalog == [800]
 
 

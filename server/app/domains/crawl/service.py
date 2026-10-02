@@ -172,9 +172,16 @@ async def _wishlist_ordered(
     )
 
 
-async def _resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tuple[int, str]]:
-    """scope: appids（显式列表）| wishlist（全部活跃监控条目，含已购）
-    | wishlist_only（活跃且非已购）| owned（活跃且已购）
+async def resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tuple[int, str]]:
+    """对象范围解析唯一出口：scope → 有序 (appid, "") 对。
+
+    所有爬取入口共用本函数——手动任务（start_job 的 scope/appids）、
+    scheduler specs（run_sequential → start_job）、Cycle 期望集冻结
+    （plan_scope_appids）都从这里拿对象集合；新增爬取入口禁止自带
+    一套对象解析。监视各入口是否绕行：grep resolve_scope_appids。
+
+    scope: appids（显式列表，最高优先级，原样直用）| wishlist（全部活跃
+    监控条目，含已购）| wishlist_only（活跃且非已购）| owned（活跃且已购）
     | pool（监控层）| catalog（目录层）| specials（特惠榜尾段）。
     前四种按第一优先级（愿望单/关注）→ hot（打折/史低）→ appid 序排。
 
@@ -185,7 +192,8 @@ async def _resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tu
     - pool = Monitoring：monitor_targets 里 state=active 的对象，来源是
       家族愿望单 / 关注 / 手动入池 / 已购 / 榜单，排除门在 state 上；
     - catalog = Catalog：games 主档里未被业务状态（下架宽限期外、永久免费）
-      摘除的行，减去 pool 已覆盖的对象——价格库维护轮。
+      摘除的行，减去 monitor_targets 全部在册对象（active 由 pool 段覆盖，
+      released / excluded 按状态定义不进 crawl）——价格库维护轮。
     主轮 6h 网格两段都跑（先 pool 后 catalog），总覆盖与合并成一个 job 时
     相同，但「谁被监控」与「库里有什么」不再互相推导。
     """
@@ -240,8 +248,11 @@ async def _resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tu
         return [(a, "") for a in ids if a not in excluded]
 
     if scope == "catalog":
-        # 目录层：games 主档里未被业务状态摘除的行，减去 pool 已覆盖的对象
-        # （同轮不重复爬，避免同价重复快照）。appid 稳定序。
+        # 目录层：games 主档里未被业务状态摘除的行，减去 monitor_targets
+        # 全部在册对象——active 由 pool 段覆盖（同轮不重复爬，避免同价
+        # 重复快照）；released / excluded 按状态定义不进任何 crawl 段
+        # （排除门复用 monitoring.blocked_ids，不另立第二套排除账）。
+        # appid 稳定序。
         from app.domains.monitoring import service as monitoring_service
 
         async with get_session_factory()() as session:
@@ -255,6 +266,7 @@ async def _resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tu
                 )
             ).scalars().all()
         monitored = set(await monitoring_service.active_ids("game"))
+        monitored |= await monitoring_service.blocked_ids("game")
         return [(int(a), "") for a in pool_rows if int(a) not in monitored]
 
     if scope == "specials":
@@ -296,10 +308,10 @@ async def _resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tu
 async def plan_scope_appids(scope: str, appids: list[int] | None = None) -> list[int]:
     """本轮范围解析（Cycle planning 冻结期望集用）：只取对象 id 序列。
 
-    与 `_resolve_scope_appids` 同一出口，保证「本轮该刷谁」在冻结时刻与
+    与 `resolve_scope_appids` 同一出口，保证「本轮该刷谁」在冻结时刻与
     执行时刻口径一致；空列表 / 未知 scope 照旧抛 ValueError 由调用方跳过。
     """
-    return [int(a) for a, _ in await _resolve_scope_appids(scope, appids)]
+    return [int(a) for a, _ in await resolve_scope_appids(scope, appids)]
 
 
 # 欠账补抓冷却（分钟）。池价格爬取 6h 一轮 → 冷却是重试节奏的主闸：
@@ -693,7 +705,7 @@ async def start_job(
             raise ValueError("没有待回补的挂名孤儿游戏")
         effective = await effective_regions(regions)
     else:
-        pairs = await _resolve_scope_appids(scope, appids)
+        pairs = await resolve_scope_appids(scope, appids)
         if not pairs:
             raise ValueError("任务列表为空")
         effective = await effective_regions(regions)
@@ -808,6 +820,105 @@ async def start_job(
         job_id, kind, scope, count, len(pre_tasks or []), pre_rows,
     )
     return {"id": job_id, "scope": scope, "count": count, "regions": effective}
+
+
+async def default_queue_specs() -> list[dict]:
+    """默认爬取队列组成（唯一来源：自动价格轮与任务页「全部」档共用）。
+
+    - 常驻两段：欠账补抓（missing）→ 监控层（pool：有来源且未排除的对象，
+      愿望单/关注按来源优先级排前）；
+    - 目录层（catalog：games 主档减监控层）与特惠榜差值段（specials：榜单
+      翻页队列去重后的差集）随 KV `crawl.catalog_refresh`（默认开）决定是否
+      带上——关闭后只抓监控层，差值段是目录发现通道随之一并停；榜单源另受
+      KV `fetch.boards` 门控（在 specials scope 内判定）。
+
+    调度器 `_price_refresh_specs` 与 `start_full_queue` 都从这里取组成；
+    新增/调整队列段只改本函数。
+    """
+    from app.domains.settings.service import get_value
+
+    specs: list[dict] = [
+        {"kind": "missing"},
+        {"scope": "pool"},
+    ]
+    if await get_value("crawl.catalog_refresh", True):
+        specs.append({"scope": "catalog"})
+        specs.append({"scope": "specials", "kind": "specials_backfill"})
+    return specs
+
+
+# 手动全队列链句柄：段间隙占用窗口（_active 已清、下一段未建）的防重入闸
+_queue_chain_task: asyncio.Task | None = None
+
+
+async def start_full_queue() -> dict:
+    """任务页「全部」档：按默认队列组成后台串行启动整条链。
+
+    与自动价格轮同组成同出口（default_queue_specs）；区别只在触发方与
+    记账层——手动链不挂 Cycle（Cycle 归自动轮），无显式 kind 的 scope 段
+    job 行 kind 记 manual（missing / specials_backfill 是通道/段身份标签，
+    保留）。单任务模型：占用（含 bundles 链尾直调）即 RuntimeError，路由
+    转 409；段与段之间由链句柄防重入。
+
+    受理前先按同出口预解析各段款数：全部为空直接 ValueError（路由转 400，
+    用户语言说明），不留下「按键转圈但什么都不会发生」的死胡同；非空则
+    立即返回各段计数，进度走既有 crawl.progress 事件与任务列表。预解析
+    与链内 start_job 各解析一次（纯库内查询 + 榜单缓存，代价可忽略）。
+    """
+    global _queue_chain_task
+    from app.crawler.occupancy import crawler_busy
+
+    if crawler_busy() or (_active is not None and not _active.task.done()):
+        raise RuntimeError("已有爬取任务在运行")
+    if _queue_chain_task is not None and not _queue_chain_task.done():
+        raise RuntimeError("全量队列已在启动中")
+    composed = await default_queue_specs()
+
+    missing_pending = await has_pending_missing()
+    segment_plan: list[dict] = [{"name": "missing", "count": 1 if missing_pending else 0}]
+    for spec in composed:
+        scope = spec.get("scope")
+        if not scope:
+            continue
+        segment_plan.append(
+            {"name": scope, "count": len(await plan_scope_appids(scope, None))}
+        )
+    if not any(p["count"] for p in segment_plan):
+        raise ValueError(
+            "没有可抓取的对象：关注与游戏库都是空的，先在找游戏页添加游戏"
+        )
+
+    # 无显式 kind 的 scope 段手动触发记 manual；missing / specials_backfill
+    # 是通道/段身份标签（任务页按此显示），保留
+    specs = [
+        {**spec, "kind": "manual"}
+        if spec.get("scope") and "kind" not in spec
+        else spec
+        for spec in composed
+    ]
+
+    async def _chain() -> None:
+        try:
+            results = await run_sequential(specs)
+            logger.info(
+                "[队列] 手动全队列完成：%s",
+                [r["id"] for r in results] or "无可抓段（全部为空）",
+            )
+        except Exception:  # noqa: BLE001 —— 链级异常只记日志，段内已各自兜底
+            logger.exception("[队列] 手动全队列异常")
+
+    _queue_chain_task = asyncio.create_task(_chain())
+    segment_names = [p["name"] for p in segment_plan]
+    logger.info(
+        "[队列] 手动全队列受理：段序 %s（款数 %s）",
+        segment_names, [p["count"] for p in segment_plan],
+    )
+    return {
+        "queued": True,
+        "scope": "all",
+        "total": sum(p["count"] for p in segment_plan if p["name"] != "missing"),
+        "segments": segment_plan,
+    }
 
 
 async def stop_job(job_id: int | None = None) -> bool:
