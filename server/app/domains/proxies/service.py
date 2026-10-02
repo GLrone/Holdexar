@@ -617,13 +617,16 @@ async def refresh_clash_subscription(sub_id: int) -> dict:
     restarted = False
     detect = clash_manager.detect_kernel(settings.data_dir)
     if clash_manager.runtime.running_subscription_is(sub_url) and detect["found"]:
-        try:
-            outcome = await clash_manager.runtime.ensure_running(
-                detect["path"], meta["path"], subscription_url=sub_url,
-            )
-            restarted = bool(outcome.get("reloaded") or outcome.get("started"))
-        except Exception:  # noqa: BLE001 —— 更新失败保留旧内核运行
-            logger.exception("[订阅刷新] 内核配置更新失败（沿用运行中的实例）")
+        # 生命周期变更与节点探测互斥（同手动切换订阅的持锁做法）：热重载或
+        # stop/start 切断在途探测的 lane 连接，会把节点误记失败写进账本
+        async with _clash_test_lock():
+            try:
+                outcome = await clash_manager.runtime.ensure_running(
+                    detect["path"], meta["path"], subscription_url=sub_url,
+                )
+                restarted = bool(outcome.get("reloaded") or outcome.get("started"))
+            except Exception:  # noqa: BLE001 —— 更新失败保留旧内核运行
+                logger.exception("[订阅刷新] 内核配置更新失败（沿用运行中的实例）")
     if not meta.get("cached"):
         await _mark_refreshed(sub_id)
 
