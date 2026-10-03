@@ -1,35 +1,11 @@
-"""achievements 域服务：奖杯（成就）与游玩时长的采集与汇总。
-
-数据通道（名册需要 Cookie/Key，明细两条通道按凭证择优）：
-
-**名册（哪些游戏进成就殿堂）**
-- IPlayerService/GetOwnedGames/v1（Cookie JWT access_token，或 Key）
-  → 本号已购全量（时长/最近游玩/名称），`source=owned`
-- IFamilyGroupsService/GetSharedLibraryApps/v1（access_token）
-  → 家庭共享池；`exclude_reason == 0`（枚举 0 = Included）且本号不在
-    owner_steamids 里 = 本号可玩但未拥有。这类游戏 Steam 侧照样记录本号
-    成就，若只按已购建册
-    就整批漏掉——`source=shared`
-- 免费周末 / 已从库中移除那类：官方清单与未文档化接口都只能按 appid 点名，
-  **没有任何枚举通道**（GetOwnedGames 不含、社区游戏列表页需登录态），
-  只能手动补录（`source=manual`）
-
-**进度（解锁数/总数）**
-- IPlayerService/GetAchievementsProgress/v1（POST，form `appids[N]` 批量 100）
-  → 每游戏解锁数/总数；**Key 会 401，只能用 access_token**；接受未拥有的
-  appid
-
-**明细（定义 + 解锁态）**
-- IPlayerService/GetGameAchievements/v1（Key 或 access_token）
-  → 定义（apiname/名称/描述/彩图/灰图/全服占比），替代社区清单页 HTML
-- ISteamUserStats/GetPlayerAchievements/v1（**必须 Key**）
-  → 解锁态（apiname/achieved/unlocktime）；未拥有的游戏同样返回，且换
-    steamid 即可读**其他账号**
-- 无 Key 时降级到公开社区页（清单页 + 个人页），靠图标资产名桥接两页——
-  保留这条通道是为了「不绑 Key 也能用」，不是主路径
-
-行标识沿用图标资产名（`image_name`）：API 通道直接把 apiname 写进定义行，
-解锁态按 apiname 精确对上，不再依赖显示名模糊匹配。
+"""achievements 域：成就与游玩时长采集。通道事实：名册=GetOwnedGames
+（Cookie token 或 Key，source=owned）+ 家庭共享 GetSharedLibraryApps
+（exclude_reason==0 且本号非 owner → source=shared——Steam 照记成就，只按
+已购建册会整批漏）+ 手动补录（免费周末/已移除无任何枚举通道，source=manual）。
+进度=GetAchievementsProgress（POST form 批量 100；Key 会 401，只能 token）。
+明细=GetGameAchievements（定义；Key/token 均可）+ GetPlayerAchievements
+（解锁态，必须 Key；未拥有也返回，换 steamid 可读其他账号）；无 Key 降级
+公开社区页两页桥接（保底通道非主路径）。行标识=image_name（图标资产名）。
 """
 from __future__ import annotations
 

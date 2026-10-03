@@ -1,34 +1,12 @@
 """account 域应用内登录：账号密码直调 Steam 认证 API，协议与商店登录页一致。
-
-流程（出网全部经代理策略引擎，密码只在内存驻留、不落库不写日志）：
-
-    GET  IAuthenticationService/GetPasswordRSAPublicKey/v1
-         ?origin=<商店>&input_protobuf_encoded=<账号名>
-         → RSA 公钥（mod / exp / 下发时刻）
-    POST IAuthenticationService/BeginAuthSessionViaCredentials/v1
-         密码以 RSA PKCS#1 v1.5 加密后按 base64 文本写入 protobuf；会话归属
-         商店站（website_id=Store），设备形态 platform_type=WebBrowser
-         → 会话标识与二次验证形态
-    POST login.steampowered.com/jwt/checkdevice/<steamid>
-         本机在 Steam 记忆名单时免验证码，直接轮询等待通过
-    [需要验证码] POST IAuthenticationService/UpdateAuthSessionWithSteamGuardCode/v1
-    轮询 POST IAuthenticationService/PollAuthSessionStatus/v1
-         → 续期凭据（refresh token）
-    续期凭据 → session.web_cookies_from_refresh_token 产出登录 Cookie
-    → service.bind_account 落库生效（试抓钱包 + 后台全量拉取）
-
-二次验证形态（allowed_confirmations，同一账号可能同时具备多种）：
-  - 手机 App 确认 / 邮件确认：无需输入，默认呈现——轮询等待用户在手机
-    /邮箱上确认（与商店登录页首屏同序）；
-  - 手机验证器令牌（TOTP）/ 邮箱验证码：备选路径，用户在状态卡切换后
-    输入 5 位码提交（状态快照带 code_available 标记可切换性）。
-  轮询全程在跑：用户不输码、直接在手机上确认登录同样会命中。
-
-认证接口的请求与响应均为 protobuf（请求走 input_protobuf_encoded 表单字
-段，结果码以 x-eresult 响应头承载，HTTP 常为 200），编解码由本文件的极简
-varint 读写器承担，不引第三方依赖。
-
-会话为模块级单例：同一时刻只允许一个登录流程，重开前先取消。
+密码只在内存驻留、不落库不写日志。流程：GetPasswordRSAPublicKey →
+BeginAuthSessionViaCredentials（RSA PKCS#1 v1.5 加密进 protobuf，
+website_id=Store）→ jwt/checkdevice（记忆名单免验证码）→ [需要时]
+UpdateAuthSessionWithSteamGuardCode → PollAuthSessionStatus 轮询拿 refresh
+token → 换登录 Cookie → bind_account 落库。二次验证多形态并存：App/邮件
+确认默认轮询等待；TOTP/邮箱码由用户在状态卡切换后输 5 位码；轮询全程在跑。
+请求与响应均为 protobuf（结果码在 x-eresult 头，HTTP 常为 200），编解码用
+本文件极简 varint 读写器。会话为模块级单例，重开前先取消。
 """
 from __future__ import annotations
 
