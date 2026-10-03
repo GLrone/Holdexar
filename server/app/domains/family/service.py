@@ -25,6 +25,7 @@ from sqlalchemy import select
 
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
+from app.domains.games import tags as game_tags
 from app.domains.settings import service as settings_service
 
 from .models import FamilyGroup
@@ -960,7 +961,7 @@ async def fetch_family_library(steam_id: str | None = None) -> dict:
             "name": m.get("name") or steam_name_by_app.get(appid) or (shared_info or {}).get("name"),
             "headerImage": m.get("header_image"),
             "releaseDate": m.get("release_date"),
-            "genres": m.get("genres"),
+            "tags": m.get("tags"),
             "cnPriceFen": m.get("cn_price_fen"),
             "originalPriceFen": m.get("original_price_fen"),
             "discount": m.get("discount"),
@@ -1050,12 +1051,13 @@ async def _local_games_meta(appids: list[int]) -> dict[int, dict]:
                     .where(Game.appid.in_(chunk))
                 )
             ).all()
+            tag_map = await game_tags.tags_by_appid(chunk)
             for game, price in rows:
                 out[int(game.appid)] = {
                     "name": game.name,
                     "header_image": game.header_image,
                     "release_date": game.release_date,
-                    "genres": game.genres,
+                    "tags": game_tags.named_tags(tag_map.get(int(game.appid))),
                     "cn_price_fen": int(price.cny_fen) if price and price.cny_fen is not None else None,
                     # 原价（未折 CNY 分）——价值洞察「原价合计/节省率」口径
                     "original_price_fen": (
@@ -1177,7 +1179,7 @@ async def _library_from_snapshot(
                 "name": m.get("name") or r.name,
                 "headerImage": m.get("header_image"),
                 "releaseDate": m.get("release_date"),
-                "genres": m.get("genres"),
+                "tags": m.get("tags"),
                 "cnPriceFen": m.get("cn_price_fen"),
                 "originalPriceFen": m.get("original_price_fen"),
                 "discount": m.get("discount") or 0,
@@ -1401,7 +1403,7 @@ async def family_wishlist(steam_id: str | None = None) -> dict:
             "appid": appid,
             "name": m.get("name"),
             "headerImage": m.get("header_image"),
-            "genres": m.get("genres"),
+            "tags": m.get("tags"),
             "releaseDate": m.get("release_date"),
             "cnPriceFen": m.get("cn_price_fen"),
             "discount": m.get("discount") or 0,

@@ -18,6 +18,11 @@ from app.core.config import get_settings
 from app.core.database import get_session_factory, init_db
 from app.domains.games import service
 
+# 真实库用例豁免 conftest 的数据目录隔离（本文件声明：断言对象就是真实库）。
+# 必须是模块常量由夹具按文件作用域读取，不能用环境变量（进程全局会泄漏给
+# 同进程其后所有文件，把它们的隔离一并关掉）。
+HOLDEXAR_TEST_REAL_DB = True
+
 
 TOLERANCE = 500  # 5 元（分）
 
@@ -55,12 +60,13 @@ def _cn(item: dict) -> dict | None:
 
 
 def _lowest_other(item: dict) -> int | None:
-    """非 CN 各区最低 cnyFen（无则回落国区），复刻 _build_list_item 语义。"""
+    """非 CN 各区最低 cnyFen（无则回落国区），复刻 _build_list_item 语义：
+    只认成功观察（stale 旧价是传输失败前的残留，不参与最低比较）。"""
     cn = _cn(item)
     base = cn[1] if cn else None
     lowest = base
     for code, data in _matrix(item).items():
-        if code == "CN":
+        if code == "CN" or (len(data) > 4 and data[4]):
             continue
         v = data[1]
         if v and (lowest is None or v < lowest):
@@ -153,11 +159,12 @@ async def test_region_ua_highdiff():
 
 @pytest.mark.asyncio
 async def test_region_locked_no_cn():
-    """LOCKED = 无国区 ok 价格行（不能返回空集）。"""
+    """LOCKED = 国区无成功观察（缺席，或 stale 旧价残留），不能返回空集。"""
     r = await _fetch(region="LOCKED")
     assert r["total"] > 0, "锁区列表不应为空"
     for item in r["items"]:
-        assert "CN" not in _matrix(item)
+        cn = _matrix(item).get("CN")
+        assert cn is None or cn[4], "锁区项的国区行只能缺席或带 stale 标记"
 
 
 @pytest.mark.asyncio
@@ -447,3 +454,24 @@ async def test_flag_hl_three_states():
     # 既有语义回归：hl 总数 = new + flat 总数（两态不相交，见上）
     both = await _fetch(flag="hl", limit=1)
     assert both["total"] == new["total"] + flat["total"]
+
+
+@pytest.mark.asyncio
+async def test_flag_hl_combo_or():
+    """flag 逗号组合 = 三态值 OR（游戏库史低三态多选的数据源）。
+
+    组合集总数恰为两侧单值总数之和（OR 不重不漏），组合项不混入第三态；
+    new,flat 组合与既有 hl 同集（同义复用）。
+    """
+    new = await _fetch(flag="new", limit=100)
+    flat = await _fetch(flag="flat", limit=100)
+    nonhl = await _fetch(flag="nonhl", limit=100)
+
+    combo = await _fetch(flag="new,nonhl", limit=100)
+    assert combo["total"] == new["total"] + nonhl["total"]
+    assert all(it["hlFlag"] != 2 for it in combo["items"])
+
+    both = await _fetch(flag="new,flat", limit=100)
+    hl = await _fetch(flag="hl", limit=100)
+    assert both["total"] == hl["total"]
+    assert all(it["hlFlag"] in (1, 2) for it in both["items"])

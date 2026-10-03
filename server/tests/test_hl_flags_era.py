@@ -1,13 +1,15 @@
-"""refresh_hl_flags 折扣期语义（新史低 30 天持续窗 + 0.1 元同价带）。
+"""refresh_hl_flags 折扣期语义（新史低只属首个到达该价的折扣期 + 兜底窗）。
 
-- 新低期：现价比折扣期起点之前的最低价便宜 ≥1 角即入新低期；起点距今
-  ≤30 天内刷新恒记 1——持久性由「期起点」保证，不依赖单轮比较（现价行
-  updated_at 每轮刷新、历史行只在变价时落库）；超 30 天回落 flag 2。
+- 新低期：现价比折扣期起点之前的最低价便宜 ≥1 角 → 本期首次到该价，
+  整期持续记 1（持久性由「期起点」保证，不依赖单轮比较——现价行
+  updated_at 每轮刷新、历史行只在变价时落库）；同一价位之后的折扣期
+  期前最低已含上一期 → 平史低 2，只给第一个到达该价的期记新史低。
+- 兜底窗：历史全部落在现价期内（首发即打折、历史短程看不到既往期）
+  无法用既往期背书，期起点 ≤30 天记 1、超期回落 2（防短程历史反复
+  判新史低）。
 - 同价带：导入历史价只精确到角且进一（9207 分记成 9210），现价与期前
   最低差在带内视作同一价位 → flag 2；恰好便宜 1 角 → 新低期。
-- 历史全部落在现价期内：首发即打折（有史以来第一次到该价）按新低期计
-  窗口 → 1/2；从未变价且无折扣 → 0。现价明显高于历史最低 → 打折 3 /
-  无折扣 0。
+- 从未变价且无折扣 → 0；现价明显高于历史最低 → 打折 3 / 无折扣 0。
 """
 import sys
 from datetime import datetime, timedelta
@@ -26,11 +28,13 @@ from app.domains.games.models import Game, GameCurrentPrice, GamePriceHistory
 A_ERA = 996_101       # 新低期内多轮刷新
 A_BAND = 996_102      # 角精度同价带（9207 vs 9210）
 A_BAND_EDGE = 996_103  # 恰好便宜 1 角（9200 vs 9210）
-A_OLD = 996_104       # 新低期起点已超 30 天
+A_OLD = 996_104       # 有既往期背书的新低期超 30 天（整期持续）
 A_FIRST = 996_105     # 首发即打折
 A_ABOVE_D = 996_106   # 高于历史最低且打折
 A_ABOVE_N = 996_107   # 高于历史最低无折扣
 A_CONST = 996_108     # 从未变价无折扣
+A_REP = 996_109       # 同一价位第二个折扣期
+A_CAP = 996_110       # 短程历史兜底窗超期
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -123,8 +127,9 @@ async def test_rounded_prior_within_band_is_flat():
 
 
 @pytest.mark.asyncio
-async def test_era_older_than_30d_reverts_to_flat():
-    """新低期起点已 40 天：即使仍处最低价也回落平史低。"""
+async def test_first_low_era_persists_past_30d():
+    """有既往期背书的首次新低期整期持续：期起点已 40 天仍记新史低
+    （30 天回落只是历史短程时的兜底，不作用于可背书的新低期）。"""
     now = datetime.now()
     async with get_session_factory()() as session:
         _game(session, A_OLD, 23115, 33, now)
@@ -133,7 +138,47 @@ async def test_era_older_than_30d_reverts_to_flat():
         await session.commit()
 
     await games_service.refresh_hl_flags(None)
-    assert await _flag(A_OLD) == 2
+    assert await _flag(A_OLD) == 1
+
+
+@pytest.mark.asyncio
+async def test_second_same_price_period_is_flat():
+    """同一价位只给第一个折扣期记新史低：第一期（15 天前进新低）记 1；
+    涨回原价后第二次同价打折（3 天前开始）→ 期前最低已含上一期 → 平史低。"""
+    now = datetime.now()
+    async with get_session_factory()() as session:
+        _game(session, A_REP, 23115, 33, now - timedelta(days=15))
+        _hist(session, A_REP, 34500, 30)
+        _hist(session, A_REP, 23115, 15, discount=33)
+        await session.commit()
+
+    await games_service.refresh_hl_flags(None)
+    assert await _flag(A_REP) == 1
+
+    # 第二期：涨回原价（10 天前）后再打同价折（3 天前开始，现行价）
+    async with get_session_factory()() as session:
+        row = await session.get(GameCurrentPrice, (A_REP, "CN"))
+        row.updated_at = now - timedelta(days=3)
+        _hist(session, A_REP, 34500, 10)
+        _hist(session, A_REP, 23115, 3, discount=33)
+        await session.commit()
+
+    await games_service.refresh_hl_flags(None)
+    assert await _flag(A_REP) == 2
+
+
+@pytest.mark.asyncio
+async def test_short_history_fallback_caps_at_30d():
+    """兜底窗：历史短程（只有现价期，看不到既往期）时无法背书首次新低，
+    期起点超 30 天回落平史低，防止短程历史反复判新史低。"""
+    now = datetime.now()
+    async with get_session_factory()() as session:
+        _game(session, A_CAP, 23115, 33, now - timedelta(days=40))
+        _hist(session, A_CAP, 23115, 40, discount=33)
+        await session.commit()
+
+    await games_service.refresh_hl_flags(None)
+    assert await _flag(A_CAP) == 2
 
 
 @pytest.mark.asyncio

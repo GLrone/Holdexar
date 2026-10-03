@@ -3,6 +3,12 @@
 输入 games.name（展示名）与 games.name_en，按名称相似启发式把「可能是
 同一个系列」的游戏聚成组，写回 games.series_id（如 GTA / Resident Evil）。
 
+名称启发式覆盖不了的（命名不统一的系列：外传改写、系列词在名字尾部、
+中英文写法漂移），由数据目录下的系列覆盖文件兜底（series_overrides.json，
+键=系列名，值=appid 列表）：覆盖成员先预成组、组名以文件键为准，再与
+名称启发式的边合并——成员经名称规则命中的邻居（重制版等）自动并入。
+文件被改过时爬后链的空转闸会触发全库重算。
+
 语义约定：
 - NULL = 未计算（新入库还没跑过识别）；'' = 已计算但落单（无同系列）；
   非空 = 系列标识（展示用名，取成员英文名的最长公共词前缀）。
@@ -16,15 +22,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import re
 from collections import defaultdict
 from difflib import SequenceMatcher
+from pathlib import Path
 
 from sqlalchemy import and_, or_, select, update
 
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
 from app.domains.games.models import Game
+
+logger = logging.getLogger(__name__)
 
 # 参与聚类的类型：正作才有「系列」语义；DLC/DEMO/MOD 等不聚（否则每款
 # 带 DLC 的本作都会成「系列」，同系列区块会被自家 DLC 淹没）。
@@ -80,6 +91,75 @@ _FORCED_SERIES_PREFIX = (
     ("ender lilies", ("ender", "series")),
     ("ender magnolia", ("ender", "series")),
 )
+
+
+# ─── 系列覆盖文件（数据目录，机器本地不入库） ────────────────────────────
+
+_OVERRIDES_FILENAME = "series_overrides.json"
+
+
+def _overrides_path() -> Path:
+    from app.core.paths import resolve_data_dir
+
+    return resolve_data_dir() / _OVERRIDES_FILENAME
+
+
+def load_overrides() -> dict[str, list[int]]:
+    """读系列覆盖文件：{系列名: [appid,...]}。
+
+    缺文件返回空表；坏条目（非列表 / appid 非法 / 空键）逐条跳过并记
+    日志，不让单个坏条目拖垮整个识别流程。appid 去重升序，键裁到
+    _SERIES_ID_MAX（与 series_id 列宽一致）。
+    """
+    path = _overrides_path()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        logger.warning("[series] 系列覆盖文件不可读，本轮忽略：%s", path)
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning("[series] 系列覆盖文件须为 {系列名: [appid,...]}，本轮忽略：%s", path)
+        return {}
+    out: dict[str, list[int]] = {}
+    for key, value in raw.items():
+        name = str(key).strip()[:_SERIES_ID_MAX]
+        if not name or not isinstance(value, list):
+            continue
+        ids: list[int] = []
+        for a in value:
+            try:
+                appid = int(a)
+            except (TypeError, ValueError):
+                continue
+            if appid > 0:
+                ids.append(appid)
+        if ids:
+            out[name] = sorted(set(ids))
+    return out
+
+
+_overrides_mtime_seen: float | None = None
+
+
+def overrides_changed() -> bool:
+    """覆盖文件被改过、还没被全库重算消费过吗（爬后链空转闸的第二触发
+    条件，与 has_unassigned 互补）。文件不存在恒 False；消费后记录 mtime，
+    同一版本不再触发。"""
+    try:
+        mtime = _overrides_path().stat().st_mtime
+    except OSError:
+        return False
+    return _overrides_mtime_seen is None or mtime != _overrides_mtime_seen
+
+
+def _mark_overrides_consumed() -> None:
+    global _overrides_mtime_seen
+    try:
+        _overrides_mtime_seen = _overrides_path().stat().st_mtime
+    except OSError:
+        _overrides_mtime_seen = None
 
 
 def _series_tokens(name_en: str | None, name: str) -> list[str]:
@@ -284,8 +364,14 @@ def _bucket_keys(m: _Member) -> list[tuple[str, str]]:
 
 def build_clusters(
     rows: list[tuple[int, str, str | None]],
+    overrides: dict[str, list[int]] | None = None,
 ) -> list[tuple[str, list[int]]]:
-    """名称行 → 系列簇列表 [(系列名, [appid...])]，只含 ≥2 成员的簇。"""
+    """名称行 → 系列簇列表 [(系列名, [appid...])]，纯启发式簇只含 ≥2 成员。
+
+    overrides（覆盖文件：{系列名: [appid,...]}）的成员先按键预成组，组名
+    固定用键；再叠加名称启发式的边——覆盖组成员经名称规则命中的邻居
+    （重制版等）自动并入。键名冲突时组名取组内被列成员最多者（并列取
+    键名字序小者）；覆盖组不受最小成员数门槛限制。"""
     members = [_Member(a, n or "", e) for a, n, e in rows if (n or "").strip()]
     parent = list(range(len(members)))
 
@@ -299,6 +385,21 @@ def build_clusters(
         ri, rj = find(i), find(j)
         if ri != rj:
             parent[ri] = rj
+
+    # 覆盖种子先落：同一键下全部成员互连成一组
+    appid_key: dict[int, str] = {}
+    key_members: dict[str, list[int]] = {}
+    if overrides:
+        index_by_appid = {m.appid: i for i, m in enumerate(members)}
+        for key, ids in overrides.items():
+            for appid in ids:
+                idx = index_by_appid.get(appid)
+                appid_key.setdefault(appid, key)
+                if idx is not None:
+                    key_members.setdefault(key, []).append(idx)
+        for idxs in key_members.values():
+            for j in idxs[1:]:
+                union(idxs[0], j)
 
     buckets: dict[tuple[str, str], list[int]] = defaultdict(list)
     for i, m in enumerate(members):
@@ -324,10 +425,20 @@ def build_clusters(
 
     out: list[tuple[str, list[int]]] = []
     for grp in groups.values():
-        if len(grp) < _CLUST_MIN_MEMBER:
-            continue
+        # 覆盖键命中：组名以文件为准（键内被列成员最多者，并列取键名字序）
+        keys_hit: dict[str, int] = defaultdict(int)
+        for m in grp:
+            key = appid_key.get(m.appid)
+            if key:
+                keys_hit[key] += 1
+        if keys_hit:
+            name = sorted(keys_hit, key=lambda k: (-keys_hit[k], k))[0]
+        else:
+            if len(grp) < _CLUST_MIN_MEMBER:
+                continue
+            name = series_name(grp)
         grp.sort(key=lambda m: m.appid)
-        out.append((series_name(grp), [m.appid for m in grp]))
+        out.append((name, [m.appid for m in grp]))
     out.sort(key=lambda x: x[0].lower())
     return out
 
@@ -417,9 +528,11 @@ async def refresh_series() -> int:
 
     series_id 语义：NULL=未计算；''=已算落单；非空=系列标识。落单行写
     空串而非 NULL，has_unassigned 才不会对同一批行每轮空转重算。
-    CPU 聚类放线程池，不占事件循环；写回按主键批量 executemany 单事务
-    提交。幂等：结果不变的行零写入。
+    覆盖文件（load_overrides）参与合并：文件点名的 appid 不受可聚类类型
+    限制，整组以文件键为名。CPU 聚类放线程池，不占事件循环；写回按主键
+    批量 executemany 单事务提交。幂等：结果不变的行零写入。
     """
+    overrides = load_overrides()
     async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         rows = (
             (
@@ -430,11 +543,22 @@ async def refresh_series() -> int:
                 )
             ).all()
         )
+        listed = {a for ids in overrides.values() for a in ids} - {r.appid for r in rows}
+        if listed:
+            extra = (
+                await session.execute(
+                    select(Game.appid, Game.name, Game.name_en, Game.series_id).where(
+                        Game.appid.in_(sorted(listed))
+                    )
+                )
+            ).all()
+            rows = list(rows) + list(extra)
         if not rows:
+            _mark_overrides_consumed()
             return 0
 
         clusters = await asyncio.to_thread(
-            build_clusters, [(r.appid, r.name, r.name_en) for r in rows]
+            build_clusters, [(r.appid, r.name, r.name_en) for r in rows], overrides
         )
         new_map: dict[int, str] = {}
         for name, appids in clusters:
@@ -453,7 +577,8 @@ async def refresh_series() -> int:
         if updates:
             await session.execute(update(Game), updates)
             await session.commit()
-        return len(updates)
+    _mark_overrides_consumed()
+    return len(updates)
 
 
 async def series_members(appid: int) -> dict | None:

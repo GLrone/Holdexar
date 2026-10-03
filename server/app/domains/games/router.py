@@ -32,8 +32,15 @@ async def list_games(
     onlyDiscounted: bool = False,
     isLowest: bool = False,
     # 史低/永降标记过滤：hl=史低(新+平) pp=永降 any=并集（降价动态 feed）；
-    # new/flat/nonhl = 史低三态细分（新史低 / 平史低 / 非史低，实验池对照用）
-    flag: str = Query("", pattern="^(|hl|pp|any|new|flat|nonhl)$"),
+    # new/flat/nonhl = 史低三态细分（新史低 / 平史低 / 非史低），可逗号组合
+    # 按 OR 叠加（游戏库史低三态 checkbox 是多选）
+    flag: str = Query("", pattern=r"^(|hl|pp|any|(new|flat|nonhl)(,(new|flat|nonhl))*)$"),
+    # 送礼分析（判据：收礼侧区价 ≤ 送礼侧区价×1.15）：out=我可以送给谁
+    # （giftSender 固定送礼方 + giftReceivers 多目标任一命中）；in=哪些游戏
+    # 可以低价送给我（giftReceivers 单收礼方，送礼方全区自动遍历）
+    giftMode: str = Query("", pattern="^(|out|in)$"),
+    giftSender: str = Query("", pattern="^(|[a-z]{2})$"),
+    giftReceivers: str = Query("", pattern=r"^([a-z]{2}(,[a-z]{2})*)?$"),
     minRating: int = Query(0, ge=0, le=100),
     maxRating: int | None = Query(None, ge=0, le=100),
     minReviews: int = Query(0, ge=0),
@@ -66,6 +73,9 @@ async def list_games(
         only_discounted=onlyDiscounted,
         is_lowest=isLowest,
         flag=flag,
+        gift_mode=giftMode,
+        gift_sender=giftSender,
+        gift_receivers=giftReceivers,
         min_rating=minRating,
         max_rating=maxRating,
         min_reviews=minReviews,

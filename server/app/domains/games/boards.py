@@ -1,31 +1,13 @@
 """Steam 榜单发现源：topsellers / popularnew / specials / comingsoon 四板聚合。
-
-发现类增量源（补愿望单覆盖不到的游戏），反哺去向分两路：
-- 持久监控（board.pool=True，topsellers / popularnew / comingsoon）：
-  本轮榜整批并入监控池（wishlist_service.ensure_board_pool），成为
-  随全池轮刷新的监控条目；同时照常补爬差集拓展游戏商店；
-- 临时队列（specials）：只把「不在库里」的差集补爬入库（发现面用于
-  游戏商店展示），不落监控池——折扣全集量级数千条且定位是展示面
-  拓展，不做持久监控。
-
-- topsellers  热销榜 5 页 / 500 条（filter=topsellers；前 100 条兼作
-  前端 TOP100 展示序，全量供初始游戏库反哺与预设池登记）
-- popularnew  热门新品
-  （sort_by=Released_DESC&filter=popularnew，5 批 500 条）
-- specials    特惠差集（临时队列）
-  （sort_by=Global_Topsellers&specials=1，全量翻页求差集）
-- comingsoon  即将推出   ← 商店页 filter=popularcomingsoon&os=win
-  （JSON 通道同构直连，item 无价格字段，无包游戏由爬取层 COMING_SOON 暂缓）
-
-特惠源约束：
-- 拉榜封顶 5000 条 appid（总数，含已在库的——50 批 × 100）；
-- 只对「不在库里」（games 无行）的差集反哺爬取，挂名孤儿留给
-  kind=backfill 回补层（防双通道重复吃配额）；
-- 连续 3 批零新增自动终止（到末尾后不再空翻页刷请求）。
-
-缓存三级策略：热缓存 1h TTL → miss 实时拉取
-→ stale 旧值兜底（24h）；分板独立缓存（key 隔离，互不污染）。
-出网走策略引擎 proxy_first，独立轻量会话，不接爬虫主链路 429 熔断。
+反哺两路：持久监控（board.pool=True，topsellers/popularnew/comingsoon）整批
+并入监控池随全池轮刷新；specials 走临时队列只补「不在库里」的差集（展示面
+拓展，数千条量级不落监控池）。板参数：topsellers 5 页 500 条（前 100 兼作
+前端 TOP100 序）；popularnew Released_DESC 5 批；specials 全量翻页求差集；
+comingsoon popularcomingsoon&os=win（无价格字段，无包游戏由爬取层暂缓）。
+约束：拉榜封顶 5000 appid；只对 games 无行差集反哺，挂名孤儿留 kind=backfill
+回补层（防双通道重复吃配额）；连续 3 批零新增自动终止。缓存三级：1h 热缓存
+→ 实时拉取 → 24h 旧值兜底，分板 key 隔离。出网走 proxy_first 独立轻量会话，
+不接爬虫主链路 429 熔断。
 """
 from __future__ import annotations
 
