@@ -11,7 +11,7 @@
 - 通关跨度：单游戏最早→最晚解锁的间隔（≥2 条解锁才算）。
 - 白金用时：白金即全成就，取该游戏当前总时长近似（注释在前端文案里说明）。
 - 类型偏好：一游戏多类型时按类型数均分时长（避免 A+B 双计把偏好读歪），
-  游戏计数不拆分。
+  游戏计数不拆分。玩家标签接替 genres 后同口径改为**按票重分摊**。
 """
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ from app.domains.achievements.service import (
     rarity_tier,
     resolve_credentials,
 )
+from app.domains.games import tags as game_tags
 from app.domains.games.models import Game
 from app.domains.games.series import _display_name_for
 from app.domains.settings import service as settings_service
@@ -67,12 +68,14 @@ DORMANT_LIMIT = 12
 SERIES_MIN_OWNED = 2
 SERIES_LIMIT = 18
 
-# 类型 → 风格族。**中文等值匹配只允许放在后端**：前端 `.ts` 里出现中文字面量
-# 会被双语红线（no-hardcoded-cjk）直接拦下，而「动作/冒险/角色扮演」是
-# `games.genres` 的数据取值（不是可译文案），前端只认这里的 ASCII 族 id，
-# 再由词典把族 id 译成「手感党 / 剧情党」这类画像标签。
-# 取值域是 Steam 类型表的全集（21 个，另 9 个是软件/创作工具类）。
-GENRE_FAMILIES: dict[str, tuple[str, ...]] = {
+# 标签 → 风格族。只收「与旧 genres 大类同名的标签」——细粒度标签（农场模拟 /
+# 像素图形…）不猜族，凭空归类会把画像算成拍脑袋结论；未归族的标签只进
+# 标签榜、不进族榜。
+# **中文等值匹配只允许放在后端**：前端 `.ts` 里出现中文字面量会被双语红线
+# （no-hardcoded-cjk）直接拦下，前端只认这里的 ASCII 族 id，再由词典把族 id
+# 译成「手感党 / 剧情党」这类画像标签。
+# 标签表里没有的名字（如旧类型的「网络出版」）不登记，避免悬空映射。
+TAG_FAMILIES: dict[str, tuple[str, ...]] = {
     "action": ("动作",),
     "adventure": ("冒险",),
     "rpg": ("角色扮演",),
@@ -88,20 +91,22 @@ GENRE_FAMILIES: dict[str, tuple[str, ...]] = {
     # 库里确实混着一批非游戏条目（实用工具 / 教育 / 照片编辑…），
     # 单列一族而不是丢掉——「买了不少创作工具」本身就是一条画像。
     "software": (
-        "实用工具", "设计和插画", "动画制作和建模", "教育",
-        "网络出版", "游戏开发", "视频制作", "照片编辑",
+        "实用工具", "设计与插画", "动画制作和建模", "教育",
+        "游戏开发", "视频制作", "照片编辑",
     ),
 }
-FAMILY_OF: dict[str, str] = {
-    genre: family for family, genres in GENRE_FAMILIES.items() for genre in genres
+TAG_FAMILY_OF: dict[str, str] = {
+    name: family for family, names in TAG_FAMILIES.items() for name in names
 }
 
 
-def _split_multi(raw: str | None) -> list[str]:
-    """逗号分隔多值串 → 去空列表（`games.genres` 的原样格式）。"""
-    if not raw:
-        return []
-    return [p.strip() for p in raw.split(",") if p.strip()]
+def _tag_weights(rows: list[dict] | None) -> list[tuple[str, int]]:
+    """标签行 → [(名字, 票重)]（未收录名字的标签跳过）。"""
+    return [
+        (r["name"], int(r.get("weight") or 0))
+        for r in (rows or [])
+        if r.get("name")
+    ]
 
 
 def _json_list(raw) -> list[str]:
@@ -183,7 +188,7 @@ def _empty_career(steamid: str, has_credential: bool, last_synced: str | None) -
         },
         "platinum": {
             "count": 0, "avgMin": 0, "medianMin": 0, "fastest": None,
-            "slowest": None, "genres": [], "spanDays": 0, "perYear": [],
+            "slowest": None, "tags": [], "spanDays": 0, "perYear": [],
             "firstDate": 0, "lastDate": 0,
         },
         "activity": {
@@ -206,7 +211,7 @@ def _empty_career(steamid: str, has_credential: bool, last_synced: str | None) -
             "avgPositiveRate": 0.0, "topValue": None,
         },
         "taste": {
-            "genres": [], "families": [], "developers": [], "publishers": [], "series": [],
+            "tags": [], "families": [], "developers": [], "publishers": [], "series": [],
             "decades": [], "chineseGames": 0, "freshGames": 0, "oldestGame": None,
             "newestGame": None, "avgReleaseYear": 0,
         },
@@ -254,12 +259,13 @@ async def get_career(target: str | None = None) -> dict:
     # 成就口径含库外（家庭共享等），时长/系列/库价值口径只看已购：
     # 库外行没有时长数据（Steam 不提供未拥有游戏的时长），混进时长分布与
     # 「系列拥有数」「库价值」会凭空多出条目
+    tag_map = await game_tags.tags_by_appid([g.appid for g, _ in pairs])
     _fill_playtime(career, owned_pairs)
     _fill_trophy(career, pairs, achieved)
     _fill_activity(career, achieved, pairs)
-    _fill_taste(career, owned_pairs)
+    _fill_taste(career, owned_pairs, tag_map)
     _fill_series(career, owned_pairs)
-    _fill_platinum(career, pairs, achieved)
+    _fill_platinum(career, pairs, achieved, tag_map)
     _fill_library(career, owned_pairs)
     career["quotes"] = quotes
     return career
@@ -700,7 +706,9 @@ def _yearly(timed: list[dict], per_game: dict, pairs: list) -> list[dict]:
     ]
 
 
-def _fill_platinum(career: dict, pairs: list, achieved: list[dict]) -> None:
+def _fill_platinum(
+    career: dict, pairs: list, achieved: list[dict], tag_map: dict[int, list[dict]]
+) -> None:
     plat_last: dict[int, int] = {}
     for a in achieved:
         plat_last[a["appid"]] = max(plat_last.get(a["appid"], 0), a["unlockTime"])
@@ -715,10 +723,13 @@ def _fill_platinum(career: dict, pairs: list, achieved: list[dict]) -> None:
     timed = [e for e in entries if e["playtimeMin"] > 0] or entries
     times = [e["playtimeMin"] for e in timed]
 
-    genre_counter: Counter[str] = Counter()
-    for g, gm in rows:
-        for genre in _split_multi(gm.genres if gm else None):
-            genre_counter[genre] += 1
+    tag_counter: Counter[str] = Counter()
+    for g, _gm in rows:
+        # 白金作只记票重最高的那个标签：20 个标签全记会让每部白金作都给大众
+        # 标签各投一票，榜单退化成「人人都有的标签」
+        top = _tag_weights(tag_map.get(g.appid))
+        if top:
+            tag_counter[top[0][0]] += 1
 
     per_year: Counter[int] = Counter()
     for e in dated:
@@ -730,7 +741,7 @@ def _fill_platinum(career: dict, pairs: list, achieved: list[dict]) -> None:
         "medianMin": _median(times),
         "fastest": min(timed, key=lambda e: e["playtimeMin"]),
         "slowest": max(timed, key=lambda e: e["playtimeMin"]),
-        "genres": [{"genre": k, "count": v} for k, v in genre_counter.most_common(TASTE_LIMIT)],
+        "tags": [{"tag": k, "count": v} for k, v in tag_counter.most_common(TASTE_LIMIT)],
         "spanDays": (
             (max(e["date"] for e in dated) - min(e["date"] for e in dated)) // 86400
             if len(dated) > 1 else 0
@@ -742,11 +753,11 @@ def _fill_platinum(career: dict, pairs: list, achieved: list[dict]) -> None:
     career["records"]["biggestPlatinum"] = max(entries, key=lambda e: e["total"], default=None)
 
 
-def _fill_taste(career: dict, pairs: list) -> None:
+def _fill_taste(career: dict, pairs: list, tag_map: dict[int, list[dict]]) -> None:
     taste = career["taste"]
     played = [(g, gm) for g, gm in pairs if (g.playtime_min or 0) > 0]
 
-    genres: dict[str, dict] = {}
+    tags: dict[str, dict] = {}
     families: dict[str, dict] = {}
     developers: dict[str, dict] = {}
     publishers: dict[str, dict] = {}
@@ -761,17 +772,19 @@ def _fill_taste(career: dict, pairs: list) -> None:
     for g, gm in played:
         minutes = g.playtime_min or 0
         platinum = bool(g.platinum)
-        genre_list = _split_multi(gm.genres if gm else None)
+        tag_list = _tag_weights(tag_map.get(g.appid))
         dev_list = _json_list(gm.developers if gm else None)
-        share = minutes / max(1, len(genre_list)) if genre_list else 0
-        for genre in genre_list:
-            row = genres.setdefault(genre, {"genre": genre, "games": 0, "playtimeMin": 0, "platinum": 0})
+        # 时长按票重分摊：一作的 20 个标签里票高的是它的定义性特征，均分会把
+        # 「口味」摊平成人人都有的大众标签；单作贡献总时长与旧口径同样守恒。
+        total_weight = sum(w for _, w in tag_list)
+        for name, weight in tag_list:
+            row = tags.setdefault(name, {"tag": name, "games": 0, "playtimeMin": 0, "platinum": 0})
             row["games"] += 1
-            row["playtimeMin"] += share
+            row["playtimeMin"] += (minutes * weight / total_weight) if total_weight else 0
             row["platinum"] += 1 if platinum else 0
-        # 风格族：同一款的多个类型常落进同一族（动作+抢先体验→action/early），
-        # 按**去重后的族数**均分时长，避免一作把某个族撑成双倍权重。
-        fam_list = {FAMILY_OF[g] for g in genre_list if g in FAMILY_OF}
+        # 风格族：同一款的多个标签常落进同一族，按**去重后的族数**均分时长，
+        # 避免一作把某个族撑成双倍权重。
+        fam_list = {TAG_FAMILY_OF[n] for n, _ in tag_list if n in TAG_FAMILY_OF}
         fam_share = minutes / max(1, len(fam_list)) if fam_list else 0
         for family in fam_list:
             row = families.setdefault(
@@ -821,7 +834,7 @@ def _fill_taste(career: dict, pairs: list) -> None:
     newest = max(played, key=lambda x: (x[1].release_date or "") if x[1] else "", default=None)
 
     taste.update({
-        "genres": _rank(genres, "genre"),
+        "tags": _rank(tags, "tag"),
         "families": _rank(families, "family"),
         "developers": _rank(developers, "name"),
         "publishers": _rank(publishers, "name"),

@@ -85,3 +85,18 @@ async def appid_freshness(appids: list[int]) -> list[dict]:
                     if last_seen is not None:
                         observed[int(appid)] = last_seen
     return [{"appid": a, **freshness_of(observed.get(a))} for a in ids]
+
+
+async def latest_price_observation() -> datetime | None:
+    """全库最近一次成功价格观察时刻（灵动岛「数据有多旧」的事实源）。
+
+    只认 `last_success_at`：成功观察（含 locked / 无购买选项）推进、传输失败
+    不回退，且自动轮 / 手动 / 补抓 / 回填共用同一写面——任何触发方的成功
+    写入都推进时钟，不读 price_cycles（不挂轮的作业不再对时钟不可见）。
+    从未成功观察返回 None：「没有数据」不是「数据很旧」，由调用侧表达。
+    """
+    async with get_session_factory()() as session:
+        value = (
+            await session.execute(select(func.max(GameCurrentPrice.last_success_at)))
+        ).scalar()
+    return value

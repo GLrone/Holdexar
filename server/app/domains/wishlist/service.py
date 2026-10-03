@@ -26,6 +26,7 @@ from sqlalchemy import func, select
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
 from app.crawler.utils import get_beijing_time_obj
+from app.domains.games import tags as game_tags
 from .models import TrackedAccount, WishlistItem
 
 logger = logging.getLogger(__name__)
@@ -822,7 +823,6 @@ async def owned_library() -> dict:
                     Game.name,
                     Game.name_en,
                     Game.header_image,
-                    Game.genres,
                     Game.release_date,
                     GameCurrentPrice.cny_fen,
                     GameCurrentPrice.original_price,
@@ -843,7 +843,8 @@ async def owned_library() -> dict:
     stats: dict[str, dict] = {
         a.steamid: {"count": 0, "valueFen": 0, "free": 0} for a in accounts
     }
-    for item, name, name_en, header_image, genres, release_date, cny_fen, original_price, discount in rows:
+    tag_map = await game_tags.tags_by_appid([int(item.appid) for item, *_ in rows])
+    for item, name, name_en, header_image, release_date, cny_fen, original_price, discount in rows:
         g = games.get(int(item.appid))
         if g is None:
             g = games[int(item.appid)] = {
@@ -851,7 +852,7 @@ async def owned_library() -> dict:
                 "name": name,
                 "nameEn": name_en,
                 "headerImage": header_image,
-                "genres": genres,
+                "tags": game_tags.named_tags(tag_map.get(int(item.appid))),
                 "releaseDate": release_date,
                 "cnPriceFen": int(cny_fen) if cny_fen is not None else None,
                 "originalPriceFen": (

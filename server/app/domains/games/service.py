@@ -18,7 +18,7 @@ import re
 import time
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import and_, asc, bindparam, delete, desc, func, or_, select, text, update
+from sqlalchemy import and_, asc, bindparam, delete, desc, exists, func, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -26,8 +26,9 @@ from sqlalchemy.orm import aliased
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
 from app.crawler.utils import get_beijing_time_obj
-from app.domains.crawl import coverage as coverage_service
 from app.domains.crawl import freshness as freshness_service
+from app.domains.regions.service import effective_regions
+from app.domains.games import tags as game_tags
 from app.domains.games.models import (
     Game,
     Bundle,
@@ -37,11 +38,10 @@ from app.domains.games.models import (
     GamePriceHistory,
 )
 from app.domains.games.scoring import (
+    familiarity_score,
     quality_score,
     save_score,
-    series_score,
     smart_score,
-    steam_board_score,
     timing_score,
 )
 from app.domains.games.sorting import build_order_by
@@ -163,6 +163,47 @@ async def _wishlist_appids() -> list[int]:
         return []
 
 
+# 送礼分析判据（两模式同式）：收礼侧区价 ≤ 送礼侧区价 × 1.15——付款双轨
+# （前端 lib/gifting.ts GIFT_THRESHOLD）中落在「按送礼方区价实付」的划算轨道。
+# 区价按 cny_fen 整数分比较：t×100 ≤ s×115，不走浮点。
+GIFT_TRACK_BAND = 115
+
+
+def _gift_exists(g, *, sender: str, receiver: str, targets: list[str]):
+    """送礼价轨 EXISTS：同 appid 存在一对 ok 区价行（送礼侧 s / 收礼侧 t）
+    满足 t.cny_fen ≤ s.cny_fen × GIFT_TRACK_BAND/100。
+
+    out 模式（我可以送给谁）：s 固定送礼方，t 遍历多目标（排除送礼方自身，
+    防自比恒真）；in 模式（哪些游戏可以低价送给我）：t 固定收礼方，s 遍历
+    其余全区。行定位走 ix_gcp_appid_status_cny / 主键 (appid, region_code)。"""
+    s = aliased(GameCurrentPrice)
+    t = aliased(GameCurrentPrice)
+    priced = and_(
+        s.price_status == "ok", s.cny_fen.is_not(None), s.cny_fen > 0,
+        t.price_status == "ok", t.cny_fen.is_not(None), t.cny_fen > 0,
+    )
+    if sender:
+        pair = and_(
+            s.appid == g.appid,
+            t.appid == g.appid,
+            s.region_code == sender,
+            t.region_code != sender,
+            t.region_code.in_(targets),
+            t.cny_fen * 100 <= s.cny_fen * GIFT_TRACK_BAND,
+            priced,
+        )
+    else:
+        pair = and_(
+            s.appid == g.appid,
+            t.appid == g.appid,
+            t.region_code == receiver,
+            s.region_code != receiver,
+            t.cny_fen * 100 <= s.cny_fen * GIFT_TRACK_BAND,
+            priced,
+        )
+    return exists().where(pair)
+
+
 def _build_filter_conditions(
     *,
     g, cn, sr,
@@ -183,6 +224,9 @@ def _build_filter_conditions(
     only_xgp: bool,
     sort: str,
     flag: str = "",
+    gift_mode: str = "",
+    gift_sender: str = "",
+    gift_receivers: str = "",
     top100_appids: list[int] | None = None,
     hide_owned: bool = False,
     hide_family_sharing: bool = False,
@@ -200,7 +244,8 @@ def _build_filter_conditions(
     top100_appids 非空时注入 `appid IN (...)`（top100 的 WHERE 叠加——
     其他筛选/地区模式照常生效）。
     flag：hl=新史低+平史低（hl_flag 1/2）、pp=永降（pp_flag 1）、
-    any=两者并集——读全库预计算标记，与提醒规则无关（降价动态 feed）。
+    any=两者并集——读全库预计算标记，与提醒规则无关（降价动态 feed）；
+    new/flat/nonhl 三态值可逗号组合按 OR 叠加（游戏库史低三态多选）。
     hide_owned：排除「已拥有」徽章同款集合——主账户 owned 行（未配置
     主账户时任一追踪账户 owned 行），与游戏卡归属徽章口径一致。
     hide_family_sharing：排除「家庭共享」徽章同款集合——非主账户的追踪
@@ -213,6 +258,9 @@ def _build_filter_conditions(
     反向语义：最低区必须实质低于国区，而非"近似相等也放行"）。
     removed_only：目录移除（假删除）作用域——False（默认）隐藏已移除款，
     True 只出已移除款（商店页「已移除」视图的恢复入口）。
+    gift_mode/gift_sender/gift_receivers：送礼分析（判据见 GIFT_TRACK_BAND）——
+    out=固定送礼方（gift_sender）找可送目标（gift_receivers csv 多选，任一
+    命中即入选）；in=固定收礼方（gift_receivers 首个），送礼方全区自动遍历。
     """
     tolerance = TOLERANCE_FEN if tolerance_fen is None else tolerance_fen
     conditions: list = [g.name.is_not(None), g.name != ""]
@@ -302,17 +350,12 @@ def _build_filter_conditions(
         conditions.append(g.is_epic.is_(True))
     if only_xgp:
         conditions.append(g.xgp_tier.is_not(None))
-    # [flag] 史低/永降标记过滤（降价动态 feed；refresh_hl_flags/refresh_pp_flags 维护）
-    # new/flat/nonhl：史低三态细分（hl_flag 语义见 refresh_hl_flags——
-    # 1=新史低 2=平史低 3=打折非史低 0=无标记；「非史低」= 1/2 之外）
+    # [flag] 史低/永降标记过滤（refresh_hl_flags/refresh_pp_flags 维护）。
+    # hl/pp/any：降价动态 feed 的三值；new/flat/nonhl 史低三态细分可逗号
+    # 组合按 OR 叠加（游戏库史低三态 checkbox 是多选——hl_flag 1=新史低
+    # 2=平史低 3=打折非史低 0=无标记，「非史低」= 1/2 之外）
     if flag == "hl":
         conditions.append(g.hl_flag.in_((1, 2)))
-    elif flag == "new":
-        conditions.append(g.hl_flag == 1)
-    elif flag == "flat":
-        conditions.append(g.hl_flag == 2)
-    elif flag == "nonhl":
-        conditions.append(g.hl_flag.not_in((1, 2)))
     elif flag == "pp":
         conditions.append(g.pp_flag == 1)
     elif flag == "any":
@@ -333,6 +376,29 @@ def _build_filter_conditions(
                 ),
             )
         )
+    elif flag:
+        # 逗号组合的史低三态值（new/flat/nonhl 子集）：逐值 OR。
+        # 未知词直接忽略——空组合等价无过滤，不阻断列表
+        sub = []
+        for part in flag.split(","):
+            if part == "new":
+                sub.append(g.hl_flag == 1)
+            elif part == "flat":
+                sub.append(g.hl_flag == 2)
+            elif part == "nonhl":
+                sub.append(g.hl_flag.not_in((1, 2)))
+        if sub:
+            conditions.append(or_(*sub))
+    # [gift] 送礼分析（判据见 GIFT_TRACK_BAND）：out=送礼方固定+多目标任一命中；
+    # in=收礼方固定，送礼方全区自动遍历。out 需要送礼方与目标齐备，in 只看
+    # 收礼方；in 模式 receivers 多于一个时取首个（语义=单收礼方）。
+    gift_targets = [x for x in (p.strip().upper() for p in gift_receivers.split(",")) if x]
+    if gift_mode == "out" and gift_sender.strip() and gift_targets:
+        conditions.append(
+            _gift_exists(g, sender=gift_sender.strip().upper(), receiver="", targets=gift_targets)
+        )
+    elif gift_mode == "in" and gift_targets:
+        conditions.append(_gift_exists(g, sender="", receiver=gift_targets[0], targets=[]))
     if top100_appids is not None:
         # [Top100] 榜内过滤（appid 集合注入）
         conditions.append(g.appid.in_(top100_appids))
@@ -418,6 +484,9 @@ async def list_games(
     only_discounted: bool = False,
     is_lowest: bool = False,
     flag: str = "",
+    gift_mode: str = "",
+    gift_sender: str = "",
+    gift_receivers: str = "",
     min_rating: int = 0,
     max_rating: int | None = None,
     min_reviews: int = 0,
@@ -470,6 +539,9 @@ async def list_games(
         only_epic=only_epic,
         only_xgp=only_xgp,
         flag=flag,
+        gift_mode=gift_mode,
+        gift_sender=gift_sender,
+        gift_receivers=gift_receivers,
         diff_min_fen=diff_min_fen,
         diff_max_fen=diff_max_fen,
         diff_type=diff_type,
@@ -497,6 +569,9 @@ async def list_games(
         min_price=min_price, max_price=max_price,
         only_hb=only_hb, only_epic=only_epic, only_xgp=only_xgp,
         flag=flag,
+        gift_mode=gift_mode,
+        gift_sender=gift_sender,
+        gift_receivers=gift_receivers,
         sort=sort,
         hide_owned=hide_owned,
         hide_family_sharing=hide_family_sharing,
@@ -550,15 +625,19 @@ async def list_games(
         appid_list = [row[0].appid for row in rows]
         price_rows = await _load_page_prices(session, appid_list)
 
-    # 页级一次取齐本轮覆盖率：每页固定两条聚合查询，不按卡片数量增长
-    coverage_map = await coverage_service.latest_appid_coverage(appid_list) or {}
+    # 覆盖分母 = 用户启用区服（regions 域唯一事实），整页取一次；
+    # 未启用任何区服时不给覆盖（分母无意义），列表照常服务
+    try:
+        regions_expected = [r.upper() for r in await effective_regions(None)]
+    except ValueError:
+        regions_expected = []
 
     items = [
         _build_list_item(
             game,
             cn_row,
             price_rows.get(game.appid, []),
-            coverage_map.get(game.appid),
+            regions_expected,
         )
         for game, cn_row in rows
     ]
@@ -599,6 +678,9 @@ async def _list_games_top100(
     only_discounted: bool = False,
     is_lowest: bool = False,
     flag: str = "",
+    gift_mode: str = "",
+    gift_sender: str = "",
+    gift_receivers: str = "",
     min_rating: int = 0,
     max_rating: int | None = None,
     min_reviews: int = 0,
@@ -651,6 +733,9 @@ async def _list_games_top100(
         min_price=min_price, max_price=max_price,
         only_hb=only_hb, only_epic=only_epic, only_xgp=only_xgp,
         flag=flag,
+        gift_mode=gift_mode,
+        gift_sender=gift_sender,
+        gift_receivers=gift_receivers,
         sort="top100", top100_appids=appids,
         diff_min_fen=diff_min_fen,
         diff_max_fen=diff_max_fen,
@@ -701,10 +786,13 @@ async def _list_games_top100(
     async with get_session_factory()() as session:
         price_rows = await _load_page_prices(session, appid_list)
 
-    coverage_map = await coverage_service.latest_appid_coverage(appid_list) or {}
+    try:
+        regions_expected = [r.upper() for r in await effective_regions(None)]
+    except ValueError:
+        regions_expected = []
     items = [
         _build_list_item(
-            game, cn_row, price_rows.get(game.appid, []), coverage_map.get(game.appid)
+            game, cn_row, price_rows.get(game.appid, []), regions_expected
         )
         for game, cn_row in page
     ]
@@ -804,6 +892,8 @@ async def get_game_detail(appid: int) -> dict | None:
         if v.version_suffix and v.version_suffix.strip()
     ]
 
+    tags = game_tags.named_tags((await game_tags.tags_by_appid([appid])).get(int(appid)))
+
     return {
         "appid": int(game.appid),
         "name": game.name,
@@ -815,7 +905,7 @@ async def get_game_detail(appid: int) -> dict | None:
         "familySharing": game.family_sharing or False,
         "tradingCards": game.trading_cards or False,
         "releaseDate": game.release_date,
-        "genres": game.genres,
+        "tags": tags,
         "developers": game.developers or [],
         "publishers": game.publishers or [],
         "positiveRate": (game.positive_rate / 100) if game.positive_rate is not None else None,
@@ -1398,8 +1488,9 @@ async def get_game_versions(appid: int) -> dict:
 
 
 # 新史低判定参数。同价带 0.1 元：导入的历史价快照只精确到角且进一
-# （如 9207 分记成 9210），现价与既往最低差在带内视作同一价位；新低期
-# 自折扣期起点起 NEW_LOW_ERA_DAYS 天内持续记新史低，超期回落平史低。
+# （如 9207 分记成 9210），现价与既往最低差在带内视作同一价位；
+# NEW_LOW_ERA_DAYS 是兜底窗——仅当历史短程看不到既往期（无法背书
+# 「首次到该价」）时，折扣期起点超窗即回落平史低。
 LOW_EQUAL_BAND_FEN = 10
 NEW_LOW_ERA_DAYS = 30
 
@@ -1455,13 +1546,14 @@ async def refresh_hl_flags(appids: list[int] | None = None) -> int:
     """刷新 games.hl_flag（新史低 / 平史低标记）。
 
     判定锚是**当前折扣期起点**：现价（按 0.1 元取整对齐）在国区标准版
-    历史里最近一段连续同价快照的最早时刻。起点之前的最低价与现价相比：
-    便宜 ≥1 角 → 本期是新低期，起点距今 ≤30 天记 1（新史低，整期持续，
-    不随刷新轮次消退，超期回落 2）；差在 ±1 角带内记 2（平史低）；明显
-    高于历史最低记 3（打折）/ 0（无折扣）。历史全部落在现价期内（首发
-    即打折）视作新低期按窗口记 1/2，从未变价且无折扣记 0；现价在历史里
-    没有同期快照按无既往处理（3/0）。appids=None 全库刷新（启动时），
-    否则增量（爬取落库后调用）。
+    历史里最近一段连续同价快照的最早时刻。新史低只属于**首次到达该价的
+    那个折扣期**：期前最低价比现价便宜 ≥1 角 → 本期是新低期，整期记 1；
+    同一价位之后的折扣期期前最低已含上一期，diff 落回 ±1 角带内 → 2
+    （平史低）；明显高于历史最低记 3（打折）/ 0（无折扣）。历史全部落在
+    现价期内（首发即打折、历史短程看不到既往期）无法用既往期背书，按
+    30 天兜底窗记 1、超期回落 2；从未变价且无折扣记 0；现价在历史里没有
+    同期快照按无既往处理（3/0）。appids=None 全库刷新（启动时），否则
+    增量（爬取落库后调用）。
     """
     from sqlalchemy.orm import aliased
 
@@ -1550,15 +1642,18 @@ async def refresh_hl_flags(appids: list[int] | None = None) -> int:
                 # 现价在历史里没有同期快照（从未落快照 / 不在史低带内）
                 flag = 3 if discount > 0 else 0
             elif prior_era_min is None:
-                # 历史全部落在现价期内：首发即打折（有史以来第一次到该价，
-                # 按新低期计窗口）或从未变价（无折扣不入史低）
+                # 历史全部落在现价期内（首发即打折 / 历史短程看不到既往期）：
+                # 无法用既往期背书「首次到该价」，按 30 天兜底窗记 1，超期回落 2；
+                # 从未变价且无折扣不入史低
                 in_window = now_dt - era_start <= era_window
                 flag = (1 if in_window else 2) if discount > 0 else 0
             else:
                 diff = prior_era_min - cn_fen
                 if diff >= band:
-                    in_window = now_dt - era_start <= era_window
-                    flag = 1 if in_window else 2
+                    # 期前最低 ≥1 角高于现价：本期是首次到该价的折扣期，整期
+                    # 持续记新史低；同价位之后再现的折扣期期前最低已含上一期，
+                    # diff 落回带内判平史低——新史低只属于第一个到达该价的期
+                    flag = 1
                 elif diff > -band:
                     flag = 2
                 else:
@@ -1731,12 +1826,11 @@ async def refresh_pp_flags(appids: list[int] | None = None) -> int:
 
 
 async def _refresh_smart_scores(session: AsyncSession, appids: list[int] | None) -> int:
-    """重算 games.smart_score / games.steam_board（refresh_sort_cache 的组成部分）。
+    """重算 games.smart_score（refresh_sort_cache 的组成部分）。
 
-    输入列 diff_fen / hl_flag 必须已刷新（启动链与爬取增量路径均保证
-    hl_flags → sort_cache 顺序）；CN 折扣左联取 ok 行，无行按无折扣计。
-    steam_board 快照随 smart_score 同事务写入（系列认知度由既有 series_id
-    现读，不落列）。Python 侧算分（公式见 scoring.py），不依赖 SQLite 数学函数。
+    输入列 diff_fen / hl_flag / release_date 必须已刷新（启动链与爬取增量路径
+    均保证 hl_flags → sort_cache 顺序）；CN 折扣左联取 ok 行，无行按无折扣计。
+    Python 侧算分（公式见 scoring.py），不依赖 SQLite 数学函数。
     """
     stmt = (
         select(
@@ -1745,8 +1839,8 @@ async def _refresh_smart_scores(session: AsyncSession, appids: list[int] | None)
             Game.positive_rate,
             Game.review_count,
             Game.hl_flag,
+            Game.release_date,
             func.coalesce(GameCurrentPrice.discount_percent, 0),
-            Game.series_id,
         )
         .join(
             GameCurrentPrice,
@@ -1769,29 +1863,14 @@ async def _refresh_smart_scores(session: AsyncSession, appids: list[int] | None)
     rows = (await session.execute(stmt)).all()
     if not rows:
         return 0
-    # 认知度信号读各自的既有账本（一次批量装载，不逐行查）：Steam 官方榜单
-    # （monitor_sources source='board'）/ 系列（既有 series_id）。快照列与 smart_score
-    # 同事务刷新——GET 侧只读快照，展示与 ORDER BY 不会读到两套口径。
-    from app.domains.monitoring.service import active_source_appids
-
-    steam_board = await active_source_appids("board", session)
     await session.execute(
         update(Game),
         [
             {
                 "appid": appid,
-                "steam_board": appid in steam_board,
-                "smart_score": smart_score(
-                    diff,
-                    rate,
-                    reviews,
-                    hl,
-                    disc,
-                    steam_board=appid in steam_board,
-                    series=bool(series_id),
-                ),
+                "smart_score": smart_score(diff, rate, reviews, hl, disc, rd),
             }
-            for appid, diff, rate, reviews, hl, disc, series_id in rows
+            for appid, diff, rate, reviews, hl, rd, disc in rows
         ],
     )
     return len(rows)
@@ -1856,7 +1935,7 @@ def _build_list_item(
     game: Game,
     cn_row: GameCurrentPrice | None,
     price_rows: list,
-    price_coverage: dict | None = None,
+    regions_expected: list[str] | None = None,
 ) -> dict:
     """对齐 route.ts buildGameResponse。cn_row=None 为锁区（无国区行，LEFT JOIN）。
 
@@ -1864,8 +1943,11 @@ def _build_list_item(
     （diff_fen/min_cny_fen）落在不同汇率基准上，出现「排名说省 ¥20 /
     卡片算出来不是 ¥20」。缺失行由 recompute_cny_fen_all 在汇率刷新时补齐。
 
-    price_coverage 是本页一次取齐的本轮覆盖率（无 Cycle 归属的对象为 None）；
-    观察时刻取本对象价格行的 MAX(updated_at)，与 freshness 接口同口径。
+    覆盖从活表尝试状态现算（唯一事实源：每个游戏×区的最近一次抓取结果，
+    与触发方无关——自动轮/手动/补抓写同一处）：分母 = 用户启用区服，
+    成功观察 = attempt_outcome='success'（含 locked / 无购买选项——拿到
+    Steam 明确答复即成功）；无行的区 = 未尝试。本次失败的区保留上一次
+    成功价照常进价格矩阵（stale 标记），前端展示旧价并标注过期。
     """
     base_cn_price = int(cn_row.price) if cn_row is not None and cn_row.price is not None else None
 
@@ -1873,15 +1955,18 @@ def _build_list_item(
     unavailable_regions: list[str] = []
     for p in price_rows:
         code = p.region_code.upper()
-        if p.price_status in ("missing", "blocked"):
-            # 爬过但未成功（missing=欠账待补抓；blocked=连败终态，大概率无货）
-            unavailable_regions.append(code)
+        if not code:
             continue
+        stale = p.attempt_outcome != "success"
+        if p.price_status in ("missing", "blocked"):
+            # missing=本次尝试失败（旧价保留在行上，矩阵带 stale 标记）；
+            # blocked=连败终态，大概率无货
+            unavailable_regions.append(code)
         if p.price is None or int(p.price) <= 0:
             continue
         price_cents = int(p.price)
         cny_fen = int(p.cny_fen) if p.cny_fen is not None else None
-        price_map[code] = {"cents": price_cents, "cnyFen": cny_fen}
+        price_map[code] = {"cents": price_cents, "cnyFen": cny_fen, "stale": stale}
 
     all_prices: dict[str, list] = {}
     lowest_cny_fen = base_cn_price
@@ -1890,10 +1975,14 @@ def _build_list_item(
         if not data:
             continue
         all_prices[code.upper()] = [
-            format_minor_units(data["cents"], currency), data["cnyFen"] or 0, data["cents"], None
+            format_minor_units(data["cents"], currency), data["cnyFen"] or 0, data["cents"], None,
+            data["stale"],
         ]
+        # 全区最低只认成功观察：stale 旧价（传输失败前的残留）不得参与
+        # isLowest 判定——否则一个转 missing 的促销区会永久压住国区徽章
         if (
             data["cnyFen"] is not None
+            and not data["stale"]
             and code.upper() != "CN"
             and (lowest_cny_fen is None or data["cnyFen"] < lowest_cny_fen)
         ):
@@ -1915,14 +2004,57 @@ def _build_list_item(
     )
 
     # smart 评分因子（与 games.smart_score 同公式同口径，scoring.py）——
-    # 展示期现算即可：每页 40 行的纯数学，无需回读落库值（落库值只服务 ORDER BY）
+    # 展示期现算即可：每页 40 行的纯数学，无需回读落库值（落库值只服务
+    # ORDER BY）；零评价的发行年龄按请求日现算，与刷新落库同公式
     smart_factors = {
         "save": round(save_score(game.diff_fen), 3),
-        "quality": round(quality_score(game.positive_rate, game.review_count), 3),
+        "quality": round(
+            quality_score(game.positive_rate, game.review_count, game.release_date), 3
+        ),
         "timing": round(timing_score(game.hl_flag, discount), 2),
-        "steamBoard": round(steam_board_score(game.steam_board), 3),
-        "series": round(series_score(bool(game.series_id)), 3),
+        "familiarity": round(familiarity_score(game.review_count), 3),
     }
+
+    # 覆盖（唯一事实源 = 活表尝试状态，与触发方无关）：分母 = 启用区服；
+    # regions 只点名非成功区（outcome/answer/lastSuccessAt 供前端说
+    # 「本次失败，展示的是 X 时刻的数据」）；启用区为空时不给覆盖
+    coverage: dict | None = None
+    if regions_expected:
+        rows_by_region = {
+            p.region_code.upper(): p for p in price_rows if p.region_code
+        }
+        problem_regions: dict[str, dict] = {}
+        success = 0
+        for code in regions_expected:
+            p = rows_by_region.get(code)
+            if p is None:
+                problem_regions[code] = {
+                    "outcome": "notAttempted", "answer": None, "lastSuccessAt": None,
+                }
+                continue
+            if p.attempt_outcome == "success":
+                success += 1
+                continue
+            problem_regions[code] = {
+                "outcome": p.attempt_outcome or "failed",
+                "answer": p.steam_answer,
+                "lastSuccessAt": (
+                    p.last_success_at.isoformat() if p.last_success_at else None
+                ),
+            }
+        expected = len(regions_expected)
+        coverage = {
+            "expectedUnits": expected,
+            "success": success,
+            "failed": sum(
+                1 for v in problem_regions.values() if v["outcome"] == "failed"
+            ),
+            "notAttempted": sum(
+                1 for v in problem_regions.values() if v["outcome"] == "notAttempted"
+            ),
+            "coverage": round(success / expected, 4) if expected else None,
+            "regions": problem_regions,
+        }
 
     return {
         "appid": int(game.appid),
@@ -1956,7 +2088,7 @@ def _build_list_item(
         "unavailableRegions": sorted(unavailable_regions),
         "hlFlag": game.hl_flag or 0,
         "ppFlag": game.pp_flag or 0,
-        # smart 评分（0~1 加权和）与五因子拆解（实验池对照展示用）
+        # smart 评分（0~1 加权和）与四因子拆解（实验池对照展示用）
         "smartScore": round(
             smart_score(
                 game.diff_fen,
@@ -1964,8 +2096,7 @@ def _build_list_item(
                 game.review_count,
                 game.hl_flag,
                 discount,
-                steam_board=bool(game.steam_board),
-                series=bool(game.series_id),
+                game.release_date,
             ),
             4,
         ),
@@ -1974,7 +2105,7 @@ def _build_list_item(
         "ppChangedAt": game.pp_changed_at.isoformat() if game.pp_changed_at else None,
         "updatedAt": game.updated_at.isoformat() if game.updated_at else None,
         # 价格数据状态：observedAt/freshness 是价格观察时间（≠ updatedAt 的实体
-        # 更新时间）；coverage 只在有 Cycle 归属（属本轮期望集）时非空
+        # 更新时间）；coverage 从活表尝试状态现算（分母 = 启用区服）
         "priceData": {
             **freshness_service.freshness_of(
                 max(
@@ -1982,7 +2113,7 @@ def _build_list_item(
                     default=None,
                 )
             ),
-            "coverage": price_coverage,
+            "coverage": coverage,
         },
         "familySharing": game.family_sharing or False,
         "tradingCards": game.trading_cards or False,

@@ -21,7 +21,7 @@ from app.core.database import Base
 from app.domains.account import service as account_service
 from app.domains.achievements import service as achievements_service
 from app.domains.achievements.models import AchievementDef, AchievementGame, AchievementState
-from app.domains.games.models import Game
+from app.domains.games.models import Game, GameTag, Tag
 from app.domains.settings import service as settings_service
 
 PRIMARY = "76561198000000001"
@@ -831,14 +831,20 @@ async def _seed_career(db):
     year = datetime.now().year
     async with db() as session:
         session.add(Game(appid=620, name="Portal 2", header_image="https://x/620.jpg",
-                         genres="动作,冒险", developers=["Valve"], publishers=["Valve"],
+                         developers=["Valve"], publishers=["Valve"],
                          release_date="2011-04-19", series_id="Portal",
                          chinese_support="official", positive_rate=9800, min_cny_fen=3700))
-        session.add(Game(appid=440, name="Team Fortress 2", genres="动作",
+        session.add(Game(appid=440, name="Team Fortress 2",
                          developers=["Valve"], publishers=["Valve"],
                          release_date="2007-10-10", positive_rate=9000))
         session.add(Game(appid=730, name="CS2", release_date=f"{year}-01-15",
                          developers=["Valve"], publishers=["Valve"], chinese_support="official"))
+        # 热门标签（票重等权 → 时长在两标签间均分，与旧 genres 断言同值）
+        session.add(Tag(tagid=19, name_zh="动作"))
+        session.add(Tag(tagid=21, name_zh="冒险"))
+        session.add(GameTag(appid=620, tagid=19, weight=100))   # 动作
+        session.add(GameTag(appid=620, tagid=21, weight=100))   # 冒险
+        session.add(GameTag(appid=440, tagid=19, weight=100))   # 动作
         session.add(AchievementGame(steamid=PRIMARY, appid=620, name="Portal 2",
                                     playtime_min=900, last_played=_ts(CAREER_DAYS_EARLY, 8),
                                     total_achievements=6, unlocked=6, platinum=True))
@@ -887,18 +893,19 @@ def test_playtime_bucket_boundaries(career):
     ]
 
 
-def test_genre_family_table_is_total(career):
-    """族表必须覆盖 Steam 类型取值域：漏一个类型，那一票时长就从画像里静默消失。"""
-    domain = {
-        "动作", "冒险", "独立", "角色扮演", "模拟", "休闲", "策略", "抢先体验",
-        "大型多人在线", "体育", "竞速", "免费开玩", "设计和插画", "动画制作和建模",
-        "实用工具", "教育", "网络出版", "游戏开发", "视频制作", "照片编辑",
-    }
-    missing = {g for g in domain if g not in career.FAMILY_OF}
-    assert missing == set(), f"未归族的类型：{missing}"
+def test_tag_family_table_stays_inside_name_baseline(career):
+    """族表只收「与旧大类同名的标签」：表里的名字必须真实存在于标签名底座。
+
+    名字写错/写了标签表没有的名字 = 悬空映射，那一票时长会从族榜里静默消失。
+    """
+    from app.domains.games.tag_names_zh import TAG_NAMES_ZH
+
+    baseline = set(TAG_NAMES_ZH.values())
+    unknown = {n for names in career.TAG_FAMILIES.values() for n in names} - baseline
+    assert unknown == set(), f"族表里的名字不在标签名底座：{unknown}"
     # 每个族 id 必须是 ASCII（前端 TS 里写不了中文字面量，只认族 id）
-    assert all(f.isascii() for f in career.GENRE_FAMILIES)
-    assert all(g not in career.FAMILY_OF for g in ("裸露", ""))
+    assert all(f.isascii() for f in career.TAG_FAMILIES)
+    assert all(n not in career.TAG_FAMILY_OF for n in ("裸露", ""))
 
 
 @pytest.mark.asyncio
@@ -1005,12 +1012,12 @@ async def test_career_taste_and_library(career, db):
     c = await career.get_career()
     taste = c["taste"]
 
-    # 类型按「一游戏多类型时均分时长」计：动作 450+60=510，冒险 450
-    genres = {g["genre"]: g for g in taste["genres"]}
-    assert set(genres) == {"动作", "冒险"}
-    assert [g["genre"] for g in taste["genres"]] == ["动作", "冒险"]
-    assert genres["动作"]["playtimeMin"] == 510 and genres["动作"]["games"] == 2
-    assert genres["冒险"]["playtimeMin"] == 450 and genres["冒险"]["platinum"] == 1
+    # 标签按「票重分摊时长」计：等权 → 动作 450+60=510，冒险 450
+    tags = {g["tag"]: g for g in taste["tags"]}
+    assert set(tags) == {"动作", "冒险"}
+    assert [g["tag"] for g in taste["tags"]] == ["动作", "冒险"]
+    assert tags["动作"]["playtimeMin"] == 510 and tags["动作"]["games"] == 2
+    assert tags["冒险"]["playtimeMin"] == 450 and tags["冒险"]["platinum"] == 1
 
     # 风格族（前端画像词云只认这些 ASCII 族 id；中文归类只做在后端）
     fams = {f["family"]: f for f in taste["families"]}
@@ -1018,7 +1025,7 @@ async def test_career_taste_and_library(career, db):
     assert fams["action"]["playtimeMin"] == 510 and fams["action"]["games"] == 2
     assert fams["adventure"]["playtimeMin"] == 450 and fams["adventure"]["platinum"] == 1
 
-    # 厂牌/系列按 name 排序（曾误用 genre 键导致 KeyError）
+    # 厂牌/系列按 name 排序（曾误用 genre/tag 键导致 KeyError）
     assert taste["developers"][0]["name"] == "Valve"
     assert taste["developers"][0]["playtimeMin"] == 970 and taste["developers"][0]["games"] == 3
     assert taste["publishers"][0]["name"] == "Valve"
@@ -1070,7 +1077,7 @@ async def test_career_empty_without_account(career, monkeypatch):
     assert c["milestones"] == [] and c["quotes"] == []
     assert c["spotlight"] == [] and c["records"]["fastestComplete"] is None
     assert c["library"]["valueFen"] == 0
-    assert c["taste"]["genres"] == []
+    assert c["taste"]["tags"] == []
     assert c["series"] == {"rows": [], "seriesTotal": 0, "taggedTotal": 0, "perfected": 0}
 
 

@@ -2,8 +2,11 @@
 
 规则层用真实库校准时踩过的坑做断言样本（X of Y 撞车 / 品牌伞 / 裸序号
 枢纽 / 版本号 2.0），落库与端点跑 tmp 库（refresh_series 是全库写，
-不碰真实库）。
+不碰真实库）。覆盖文件路径同样指 tmp：测试与机器本地的
+series_overrides.json 解耦。
 """
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -13,10 +16,13 @@ import pytest_asyncio
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.domains.games.models import Game, GameCurrentPrice  # noqa: E402
+from app.domains.games import series as series_mod  # noqa: E402
 from app.domains.games.series import (  # noqa: E402
     build_clusters,
     has_unassigned,
     is_same_series,
+    load_overrides,
+    overrides_changed,
     refresh_series,
     series_members,
 )
@@ -182,6 +188,11 @@ async def _series_db(tmp_path, monkeypatch):
         await conn.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(series_mod, "get_session_factory", lambda: factory)
+    # 覆盖文件路径指 tmp：默认无文件（=无覆盖），用例自行写入
+    monkeypatch.setattr(
+        series_mod, "_overrides_path", lambda: tmp_path / "series_overrides.json"
+    )
+    monkeypatch.setattr(series_mod, "_overrides_mtime_seen", None)
     yield factory
     await engine.dispose()
 
@@ -253,3 +264,106 @@ async def test_series_members_payload(_seed_and_clean):
     # 落单 / 不存在 → None（路由层转 404）
     assert await series_members(APP_ALONE) is None
     assert await series_members(999_999_999) is None
+
+
+# ─── 系列覆盖文件（series_overrides.json） ─────────────────────────────
+
+def test_build_clusters_override_pins_and_absorbs():
+    """覆盖键点名各碎片的代表 appid，名字相近的成员（重制版等）自动并入；
+    组名以文件键为准，不吃启发式计算名。"""
+    rows = [
+        (1, "Horizon Zero Dawn Complete", "Horizon Zero Dawn Complete"),
+        (2, "Horizon Zero Dawn Remastered", "Horizon Zero Dawn Remastered"),
+        (3, "Horizon Forbidden West", "Horizon Forbidden West"),
+        (4, "无关单机", "Unrelated Game"),
+    ]
+    clusters = build_clusters(rows, {"Horizon": [1, 3]})
+    assert len(clusters) == 1
+    name, members = _cluster_of(clusters, 3)
+    assert name == "Horizon" and set(members) == {1, 2, 3}
+    assert _cluster_of(clusters, 4) == (None, None)
+
+
+def test_build_clusters_override_single_and_unknown_ids():
+    # 无启发式邻居的单成员键也如实成组（同组无兄弟时下游天然惰性）
+    rows = [(1, "Alpha Alone", "Alpha Alone"), (2, "Beta Game", "Beta Game")]
+    assert build_clusters(rows, {"孤品": [1]}) == [("孤品", [1])]
+    # 库外 appid 忽略
+    assert build_clusters(rows, {"幽灵": [999]}) == []
+    # 列表成员的启发式邻居照常并入（Portal 点名 → Portal 2 吸收）
+    rows2 = [(1, "Portal", "Portal"), (2, "Portal 2", "Portal 2")]
+    assert build_clusters(rows2, {"传送门": [1]}) == [("传送门", [1, 2])]
+
+
+def test_build_clusters_override_key_conflict_picks_largest():
+    """同一组命中多个键（数据把两键成员连在一起）时，组名取组内被列成员
+    最多者、并列取键名字序小者——结果不随文件遍历序漂移。"""
+    rows = [(1, "Portal", "Portal"), (2, "Portal 2", "Portal 2")]
+    merged = {"B 系列": [2], "A 系列": [1]}
+    assert build_clusters(rows, merged) == [("A 系列", [1, 2])]
+    assert build_clusters(rows, dict(reversed(list(merged.items())))) == [("A 系列", [1, 2])]
+
+
+def test_load_overrides_skips_bad_entries(tmp_path, monkeypatch):
+    """坏条目逐条跳过：空键 / 非列表 / 负数与非数 appid 剔除，字符串与
+    浮点整数收；整文件坏则空表，缺文件空表。"""
+    p = tmp_path / "series_overrides.json"
+    monkeypatch.setattr(series_mod, "_overrides_path", lambda: p)
+    p.write_text(
+        json.dumps(
+            {
+                "好系列": [1, "2", 3.0, -4, "abc", 1],
+                "": [5],
+                "空列表": [],
+                "混类型": "not-a-list",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    assert load_overrides() == {"好系列": [1, 2, 3]}
+    p.write_text("{broken", encoding="utf-8")
+    assert load_overrides() == {}
+    p.unlink()
+    assert load_overrides() == {}
+
+
+@pytest.mark.asyncio
+async def test_refresh_series_applies_override_file_and_mtime_gate(
+    _seed_and_clean, _series_db, tmp_path, monkeypatch
+):
+    from app.domains.games import series as series_mod
+
+    p = tmp_path / "series_overrides.json"
+    monkeypatch.setattr(series_mod, "_overrides_path", lambda: p)
+    p.write_text(json.dumps({"Portal Saga": [APP_PORTAL, APP_W3]}), encoding="utf-8")
+
+    assert overrides_changed() is True
+    await refresh_series()
+    async with _series_db() as session:
+        # 点名的 Portal / Witcher3 连同两者各自的启发式邻居（Portal2、
+        # Witcher2）全落到文件键名下；无关行不受影响
+        for appid in (APP_PORTAL, APP_PORTAL2, APP_W3, APP_W2):
+            assert (await session.get(Game, appid)).series_id == "Portal Saga"
+        assert (await session.get(Game, APP_ALONE)).series_id == ""
+    # 消费后同版本不再触发；重算幂等零写入
+    assert overrides_changed() is False
+    assert await refresh_series() == 0
+
+    # 文件改键名：mtime 推进触发重算，新键名覆盖旧值
+    st = p.stat()
+    p.write_text(json.dumps({"Portal 传说": [APP_PORTAL, APP_W3]}), encoding="utf-8")
+    os.utime(p, (st.st_atime, st.st_mtime + 10))
+    assert overrides_changed() is True
+    await refresh_series()
+    async with _series_db() as session:
+        assert (await session.get(Game, APP_PORTAL)).series_id == "Portal 传说"
+
+    # 坏文件整份忽略：回落纯启发式命名，不抛异常
+    p.write_text("{broken", encoding="utf-8")
+    os.utime(p, (st.st_atime, st.st_mtime + 20))
+    assert overrides_changed() is True
+    await refresh_series()
+    async with _series_db() as session:
+        assert (await session.get(Game, APP_PORTAL)).series_id == "Portal"
+        assert (await session.get(Game, APP_W2)).series_id == "Witcher"

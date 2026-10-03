@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.core.database import get_session_factory
 from app.domains.crawl.cycle import TERMINAL_STATES, PriceCycle
@@ -279,66 +279,3 @@ def _result_from_snapshot(
         targets_done=targets_done,
         per_appid={str(a): snaps[a] for a in appids},
     )
-
-
-async def latest_appid_coverage(appids: list[int]) -> dict[int, dict] | None:
-    """最近一个已收敛 Cycle 里，给定对象的覆盖率；没有可用 Cycle 返回 None。
-
-    只给**在该 Cycle 期望集内**的对象结果：不在本轮该刷范围里的对象没有 Cycle
-    归属，覆盖率就是 null，不用 100% 冒充。分母是期望区服数，与 `cycle_coverage`
-    同一处 `_scan` 算出，避免前端与接口各报一个数。
-
-    取「已收敛」而非最新一个：正在跑的 Cycle 拿的是半截数字，卡片上会长时间
-    显示一个看起来像坏掉的覆盖率。
-
-    证据**只**来自收敛时冻结在 Cycle 行上的对象级快照（coverage_json）：
-    `game_current_prices` 是当前价表，行会随任何周期外写入（手动抓取 / repair /
-    下一轮进行中）滚动覆盖 updated_at，旧窗口在活表上不可复现——按窗口现算会把
-    已收敛轮的覆盖率改成 0/5 之类的假塌陷（观察时间却是新鲜的，两行自相矛盾）。
-    最新已收敛轮没有快照（冻结机制上线前的存量轮）时**不返回数字**：宁可暂时
-    不显示覆盖，也不显示已知不可复现的塌陷值；下一轮收敛冻结后自动恢复。
-    """
-    if not appids:
-        return None
-    wanted = {int(a) for a in appids}
-    async with get_session_factory()() as session:
-        cycle = (
-            await session.execute(
-                select(PriceCycle)
-                .where(PriceCycle.status.in_(TERMINAL_STATES))
-                .order_by(PriceCycle.id.desc())
-                .limit(1)
-            )
-        ).scalars().first()
-        if cycle is None:
-            return None
-        cycle_id = int(cycle.id)
-        cycle_status = cycle.status
-        expected = dict(cycle.expected_json or {})
-        snapshot_raw = dict(cycle.coverage_json or {})
-
-    regions = {str(r).strip().lower() for r in (expected.get("regions") or [])}
-    per_unit = len(regions)
-    if not snapshot_raw or per_unit == 0:
-        return None
-    return {
-        int(appid): {
-            "cycleId": cycle_id,
-            "cycleStatus": cycle_status,
-            "expectedUnits": per_unit,
-            "ok": buckets.get("ok", 0),
-            "locked": buckets.get("locked", 0),
-            "missing": buckets.get("missing", 0),
-            "blocked": buckets.get("blocked", 0),
-            "unobserved": buckets.get("unobserved", 0),
-            "coverage": round(buckets.get("ok", 0) / per_unit, 4),
-            "coverageConfirmed": round(
-                (buckets.get("ok", 0) + buckets.get("locked", 0)) / per_unit, 4
-            ),
-            # 区级问题明细（大写码 → locked/missing/blocked/unobserved）：
-            # 卡片悬停点名问题地区；旧格式快照无此键，前端退回计数措辞
-            "regions": dict(buckets.get("regions") or {}),
-        }
-        for appid, buckets in snapshot_raw.items()
-        if int(appid) in wanted
-    }
