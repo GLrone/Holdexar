@@ -44,7 +44,7 @@ from app.core.paths import resolve_data_dir  # noqa: E402 —— 数据目录判
 
 DEFAULT_OUT = ROOT / "assets" / "seed" / "holdexar_seed.db"
 
-SEED_SCHEMA_VERSION = 5
+SEED_SCHEMA_VERSION = 7
 CURATED_COLS = ("xgp_tier", "epic_date", "is_epic", "is_hb", "hb_data", "series_id")
 # 人工列名单行的身份列：名单行要在用户库里落成完整 games 行（缺行时），
 # name 是 games 表唯一 NOT NULL 的展示字段。与 CURATED_COLS 分列：覆写
@@ -76,10 +76,13 @@ GCP_COLS = (
 # 通道，不带。与 seed_assets.GC_COLS 同序同集
 GC_COLS = (
     "appid", "name", "name_en", "type", "header_image", "family_sharing",
-    "trading_cards", "is_adult", "is_visual_novel", "release_date", "genres",
+    "trading_cards", "is_adult", "is_visual_novel", "release_date",
     "positive_rate", "positive_reviews", "review_count", "view_count",
     "removed_at", "free_kind",
 )
+# 玩家标签种子列（appid+tagid 即主键；重量随行，顺序即热门度）。
+# 与 seed_assets 侧的并入口径配对：只带「有现价的游戏」的标签，与目录行同域
+GAME_TAGS_COLS = ("appid", "tagid", "weight")
 
 _HISTORY_CHUNK = 50_000
 
@@ -124,6 +127,20 @@ def _iter_current_prices(src: sqlite3.Connection):
     """现价快照切片（流式）：本地主键 (appid, region_code) 原样带出，按块产出。"""
     cols = ", ".join(f"g.{c}" for c in GCP_COLS)
     cur = src.execute(f"SELECT {cols} FROM game_current_prices g")
+    while True:
+        rows = cur.fetchmany(_HISTORY_CHUNK)
+        if not rows:
+            return
+        yield rows
+
+
+def _iter_game_tags(src: sqlite3.Connection):
+    """玩家标签切片（流式）：只带有现价的游戏（与目录行同域，避免孤立标签行）。"""
+    cur = src.execute(
+        "SELECT appid, tagid, weight FROM game_tags "
+        "WHERE appid IN (SELECT DISTINCT appid FROM game_current_prices) "
+        "ORDER BY appid, tagid"
+    )
     while True:
         rows = cur.fetchmany(_HISTORY_CHUNK)
         if not rows:
@@ -208,6 +225,10 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
                 "WHERE g.appid IN (SELECT DISTINCT appid FROM game_current_prices) "
                 "AND TRIM(COALESCE(g.name, '')) != ''"
             ).fetchall()
+        # 玩家标签（老源库无该表 = 切片为空，与价格历史同守卫）
+        has_tags = src.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='game_tags'"
+        ).fetchone() is not None
 
         exported_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         seed = sqlite3.connect(str(out_path))
@@ -275,7 +296,6 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
                     is_adult INTEGER,
                     is_visual_novel INTEGER,
                     release_date TEXT,
-                    genres TEXT,
                     positive_rate INTEGER,
                     positive_reviews INTEGER,
                     review_count INTEGER,
@@ -299,6 +319,12 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
                 );
                 CREATE INDEX ix_seed_gcp_appid
                     ON game_current_prices (appid);
+                CREATE TABLE game_tags (
+                    appid INTEGER,
+                    tagid INTEGER,
+                    weight INTEGER,
+                    PRIMARY KEY (appid, tagid)
+                ) WITHOUT ROWID;
                 """
             )
             seed.executemany("INSERT INTO fx_rates VALUES (?, ?, ?)", fx_rates)
@@ -320,8 +346,9 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
                         f"INSERT INTO game_price_history VALUES ({placeholders})", chunk
                     )
                     gph_rows += len(chunk)
+            gc_placeholders = ", ".join("?" for _ in GC_COLS)
             seed.executemany(
-                "INSERT INTO games_catalog VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                f"INSERT INTO games_catalog VALUES ({gc_placeholders})",
                 games_catalog,
             )
             gcp_rows = 0
@@ -332,6 +359,14 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
                         f"INSERT INTO game_current_prices VALUES ({gcp_placeholders})", chunk
                     )
                     gcp_rows += len(chunk)
+            tags_rows = 0
+            tags_placeholders = ", ".join("?" for _ in GAME_TAGS_COLS)
+            if has_gcp and has_tags:
+                for chunk in _iter_game_tags(src):
+                    seed.executemany(
+                        f"INSERT INTO game_tags VALUES ({tags_placeholders})", chunk
+                    )
+                    tags_rows += len(chunk)
             seed.executemany(
                 "INSERT INTO seed_meta VALUES (?, ?)",
                 [
@@ -346,6 +381,7 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
                     ("history_days", str(history_days)),
                     ("rows_games_catalog", str(len(games_catalog))),
                     ("rows_current_prices", str(gcp_rows)),
+                    ("rows_game_tags", str(tags_rows)),
                 ],
             )
             seed.commit()
@@ -360,7 +396,8 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
         f"[种子] 汇率快照 {len(fx_rates)} 条 / 汇率历史 {len(history)} 行 / "
         f"人工列 {len(curated)} 款 / 预设池 {len(preset)} 款 / "
         f"价格历史（{window}）{gph_rows} 行 / "
-        f"现价快照 {len(games_catalog)} 款 {gcp_rows} 行"
+        f"现价快照 {len(games_catalog)} 款 {gcp_rows} 行 / "
+        f"玩家标签 {tags_rows} 行"
     )
     print(f"[种子] {out_path}（{size / 1048576:.1f} MB）")
     print(f"[种子] sha256 {_sha256(out_path)[:16]}…  version={exported_at}")
@@ -372,6 +409,7 @@ def export(db_path: Path, out_path: Path, history_days: int = HISTORY_DAYS_DEFAU
         "history": gph_rows,
         "games_catalog": len(games_catalog),
         "current_prices": gcp_rows,
+        "game_tags": tags_rows,
         "size": size,
     }
 

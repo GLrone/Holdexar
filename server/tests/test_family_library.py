@@ -140,7 +140,7 @@ async def _seed_games(db):
     """games 表 + CN 现价（本地元数据补齐验证用）。"""
     async with db() as session:
         session.add(Game(appid=620, name="Portal 2", header_image="https://x/620.jpg",
-                         release_date="2011-04-19", genres="PPG, Puzzle"))
+                         release_date="2011-04-19"))
         session.add(Game(appid=570, name="Dota 2", release_date="2013-07-09"))
         session.add(GameCurrentPrice(appid=620, region_code="CN", price=4200,
                                      cny_fen=4200, discount_percent=0))

@@ -117,6 +117,35 @@ async def test_migration_chain_applies_and_resumes(isolated_db: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_player_tags_v12_drops_genres(isolated_db: Path) -> None:
+    """v12：老库的 games.genres 被删除、旧行与其它列保留；无该列时重放安全。"""
+    con = sqlite3.connect(str(isolated_db))
+    con.execute("CREATE TABLE games (appid INTEGER PRIMARY KEY, name TEXT, genres TEXT)")
+    con.execute("INSERT INTO games (appid, name, genres) VALUES (1, 'X', '动作, 冒险')")
+    con.execute("PRAGMA user_version = 11")
+    con.commit()
+    con.close()
+
+    database_module._MIGRATIONS.append(
+        (12, "玩家标签接替 genres", database_module._migrate_player_tags)
+    )
+    await database_module._run_schema_migrations()
+
+    assert _user_version(isolated_db) == 12
+    con = sqlite3.connect(str(isolated_db))
+    try:
+        cols = {row[1] for row in con.execute("PRAGMA table_info(games)")}
+        assert "genres" not in cols
+        assert con.execute("SELECT name FROM games WHERE appid = 1").fetchone()[0] == "X"
+    finally:
+        con.close()
+
+    # 全新库形态（模型已无该列）：重放不报错
+    async with database_module.get_engine().begin() as conn:
+        await database_module._migrate_player_tags(conn)
+
+
+@pytest.mark.asyncio
 async def test_snapshot_taken_only_when_migration_pending(isolated_db: Path) -> None:
     """无差额不落快照；有差额先落快照，且快照里是**迁移前**的版本号。
 

@@ -117,6 +117,13 @@ async def import_legacy(req: LegacyImport) -> dict:
 
         for (appid, region), row in latest.items():
             price = row["price"]
+            status = row["price_status"] or "ok"
+            # 从 history 重建属于人工修复动作：按快照状态补观察章
+            # （ok/locked = 成功观察并推进 last_success_at；missing/blocked
+            # = 失败态快照，last_success_at 留空待下次真实观察）
+            outcome = "success" if status in ("ok", "locked") else "failed"
+            answer = "locked" if status == "locked" else "ok" if status == "ok" else None
+            success_at = datetime.now() if outcome == "success" else None
             stmt = sqlite_insert(GameCurrentPrice).values(
                 appid=appid,
                 region_code=region,
@@ -125,7 +132,10 @@ async def import_legacy(req: LegacyImport) -> dict:
                 original_price=int(row["original_price"]) if row["original_price"] is not None else None,
                 discount_percent=row["discount_percent"] or 0,
                 sub_id=row["sub_id"],
-                price_status=row["price_status"] or "ok",
+                price_status=status,
+                attempt_outcome=outcome,
+                steam_answer=answer,
+                last_success_at=success_at,
                 updated_at=datetime.now(),
             )
             await session.execute(
@@ -138,6 +148,9 @@ async def import_legacy(req: LegacyImport) -> dict:
                         "discount_percent": stmt.excluded.discount_percent,
                         "sub_id": stmt.excluded.sub_id,
                         "price_status": stmt.excluded.price_status,
+                        "attempt_outcome": stmt.excluded.attempt_outcome,
+                        "steam_answer": stmt.excluded.steam_answer,
+                        "last_success_at": stmt.excluded.last_success_at,
                         "updated_at": stmt.excluded.updated_at,
                     },
                 )
