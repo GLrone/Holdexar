@@ -54,6 +54,10 @@ def db(tmp_path, monkeypatch):
     import app.crawler.db_writer as dw
 
     monkeypatch.setattr(dw, "get_session_factory", lambda: factory)
+    # 空壳轮窗口判定在 coverage 域——漏桩会把终态判定指向生产库
+    import app.domains.crawl.coverage as crawl_coverage
+
+    monkeypatch.setattr(crawl_coverage, "get_session_factory", lambda: factory)
     return factory
 
 
@@ -133,7 +137,25 @@ def _crawl_env(monkeypatch):
     monkeypatch.setattr(crawl_service.games_service, "refresh_pp_flags", _noop)
     monkeypatch.setattr(crawl_service.games_service, "refresh_sort_cache", _noop)
 
+    # 忠实模拟：真实爬取按 config.regions 把每款对象的各期望区服现价行都刷掉
+    # （pairs 第二位是区码覆盖位，空串=跑本轮全部区服）。空壳轮终态判定以
+    # 窗口内价格写入为准——桩不落行会把主轮误判成零写入空壳并触发重试；
+    # merge 落行，避免与种子的欠账行撞主键。
+    import app.core.database as database_module
+
     async def _run_crawl(pairs, *, config, stop_event=None, pre_tasks=None):
+        from datetime import datetime
+
+        now = datetime.now()
+        regions = list(getattr(config, "regions", None) or [])
+        async with database_module.get_session_factory()() as session:
+            for appid, _region in pairs or []:
+                for region in regions:
+                    await session.merge(GameCurrentPrice(
+                        appid=appid, region_code=region, currency="", price=None,
+                        sub_id=None, price_status="ok", fail_count=0, updated_at=now,
+                    ))
+            await session.commit()
         return {"total": len(pairs or []) + len(pre_tasks or []), "processed": 0}
 
     monkeypatch.setattr(crawl_service, "run_crawl", _run_crawl)

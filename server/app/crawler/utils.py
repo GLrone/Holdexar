@@ -159,6 +159,11 @@ def _is_price_segment(seg: str) -> bool:
     return bool(re.search(rf"(?:{_PRICE_TAIL_TOKENS})", seg, re.IGNORECASE))
 
 
+# 选项名尾巴的多语种标注（"(English/Chinese/Japanese/Korean)"，≥2 个斜杠
+# 分隔的单词）是语言覆盖说明，不是版本名
+_LANG_TAG_TAIL_RE = re.compile(r"\s*\([A-Za-z]+(?:\s*/\s*[A-Za-z]+)+\)\s*$")
+
+
 def extract_version_suffix(option_text: str | None, name_en: str | None) -> str:
     if not option_text:
         return ""
@@ -177,8 +182,11 @@ def extract_version_suffix(option_text: str | None, name_en: str | None) -> str:
         return ""
     if not name_en:
         return ""
-    pkg_lower = package_name.lower()
-    name_lower = name_en.lower()
+    # 尾巴语言标注（"(English/Chinese/Japanese/Korean)" 式多语种斜杠列表）
+    # 不是版本：比对两侧都剥掉——否则带 CJK 标注命名的本体被误判成版本款
+    # 出局（三国志14 等）；返回的版本名保留原标注，历史标签不丢信息
+    pkg_lower = _LANG_TAG_TAIL_RE.sub("", package_name).strip().lower()
+    name_lower = _LANG_TAG_TAIL_RE.sub("", name_en).strip().lower()
     if pkg_lower == name_lower:
         return ""
     # 官方名 + 连接符（空格 / 半全角冒号）之后的片段即版本名。两种连接形态

@@ -67,6 +67,11 @@ _CURRENT_UPDATABLE = (
     "cny_fen",
     "discount_end_ts",
     "updated_at",
+    # 尝试观察三元组：批量成功观察随行盖章（失败路径走 mark_region_status /
+    # 账本 bump，不在此列——它们不得触碰 last_success_at）
+    "attempt_outcome",
+    "steam_answer",
+    "last_success_at",
 )
 
 # 补抓账本参数：免费游戏 price=0 合法（parse_all_sub_prices is_free 路径），
@@ -82,6 +87,18 @@ _INSERT_CHUNK_ROWS = 2000
 def _is_ok_price_row(price_cents: int | None) -> bool:
     """ok 行价格合法性：None 才是坏数据（0 = 免费游戏，合法）。"""
     return price_cents is not None
+
+
+# 显式命名的标准版（"Standard Edition"/"Standard Digital Edition"）是本体
+# 自身的官方命名，不算版本款；"Standard Edition Four Pack" 等带附加词的
+# 礼包 SKU 不在此列，仍按版本款处理
+_PLAIN_STANDARD_SUFFIX_RE = re.compile(r"standard( digital)? edition$", re.IGNORECASE)
+
+
+def _is_plain_standard_suffix(version_suffix: str | None) -> bool:
+    if not version_suffix:
+        return False
+    return bool(_PLAIN_STANDARD_SUFFIX_RE.match(version_suffix.strip()))
 
 
 # 测试入口命名（测试版/测试服/公测/Playtest 等）→ 不进监控池的判定词形。
@@ -146,7 +163,9 @@ def _classify_free_kind(
 
 def _missing_ledger_bump() -> dict:
     """missing 计账 SET 片段：fail_count 旧值+1，第 MISSING_MAX_RETRIES 次
-    失败即转 blocked 终态（"连续 N 次仍失败"语义，含当次）。
+    失败即转 blocked 终态（"连续 N 次仍失败"语义，含当次）；同时盖尝试
+    失败章（attempt_outcome=failed——两条调用方都是失败路径，价格与
+    last_success_at 不在此列，由调用方语义决定保留）。
 
     UPDATE SET 与 UPSERT DO UPDATE SET 中表列均引用旧行值，两处语义一致，
     单一定义避免转移规则漂移。
@@ -157,6 +176,7 @@ def _missing_ledger_bump() -> dict:
             else_="missing",
         ),
         "fail_count": GameCurrentPrice.fail_count + 1,
+        "attempt_outcome": "failed",
     }
 
 
@@ -325,12 +345,17 @@ class DbWriter:
                         }
                     )
 
-            # 标准版候选: 非 gold 且无版本后缀且非捆绑包
-            # （bundle-as-sub 与标准版无法从价格区分，靠 A4 识别标记隔离）
+            # 标准版候选: 非 gold 且非捆绑包，且名字无版本后缀——显式命名的
+            # Standard Edition 是本体的官方命名，归一化为标准版候选（否则
+            # 真本体被当版本款排除，某区全后缀时只能走兜底）。bundle-as-sub
+            # 与标准版无法从价格区分，靠 A4 识别标记隔离
             is_standard = (
                 (not is_gold)
-                and (not version_suffix or version_suffix == "")
                 and not is_bundle
+                and (
+                    not version_suffix
+                    or _is_plain_standard_suffix(version_suffix)
+                )
             )
             if is_standard:
                 standard_candidates.setdefault(region, []).append(
@@ -346,9 +371,9 @@ class DbWriter:
                         "cny_fen": cny_fen,
                         "discount_end_ts": p.get("discount_end_ts"),
                         "updated_at": now_dt,
+                        "steam_answer": p.get("steam_answer"),
                     }
                 )
-
         # 每个区域选标准版写入 current：优先有价（ok+price 有值）行——
         # 该区任何版本有价就算有数；全部无价才落 missing 状态行
         current_batch: list[dict] = []
@@ -360,14 +385,35 @@ class DbWriter:
             )
             seen_regions.add(region)
 
-        # 无标准版的区域（locked/blocked/missing）也写入 current 作为状态；
-        # 逆序遍历：同区多行降级时以最后一条为准（降级常因版本无价
-        # 整组发生，末行即最新尝试的状态）
-        for p in reversed(prices_data):
+        # 无标准版候选的区域也写入 current：该区有价（非捆绑包）行里取
+        # sub_id 最小的确定性兜底——最老 SKU 即本体；曾经按响应顺序取末行，
+        # 同一 appid 各区会混装不同版本（如显式命名 Standard Edition +
+        # Starter Edition 全后缀场景，本体被当版本款出局后落哪个版本全看
+        # 响应序）。全部无价才落状态行，同区多行降级时以最后一条为准
+        fallback_rows: dict[str, list[dict]] = {}
+        fallback_order: list[str] = []
+        for p in prices_data:
             region = p.get("region_code", "").upper()
             if region in seen_regions:
                 continue
-            seen_regions.add(region)
+            if region not in fallback_rows:
+                fallback_rows[region] = []
+                fallback_order.append(region)
+            fallback_rows[region].append(p)
+        for region in fallback_order:
+            rows = fallback_rows[region]
+            priced = [
+                p
+                for p in rows
+                if p.get("price_status", "ok") == "ok"
+                and _is_ok_price_row(p.get("price"))
+                and not p.get("is_bundle", False)
+            ]
+            p = (
+                min(priced, key=lambda x: x.get("sub_id") or 0)
+                if priced
+                else rows[-1]
+            )
             # 门禁降级行的实时状态在主循环里已算过，重算保持独立
             raw_status = p.get("price_status", "ok")
             price_cents = p.get("price")
@@ -392,8 +438,25 @@ class DbWriter:
                     else None,
                     "discount_end_ts": p.get("discount_end_ts"),
                     "updated_at": now_dt,
+                    "steam_answer": p.get("steam_answer"),
                 }
             )
+
+        # 尝试观察盖章：批量写 = 成功观察（拿到了 Steam 对该区的明确答复，
+        # 含 locked / 无购买选项）。answer 缺省时按状态推导（导入 / 旧调用
+        # 方路径不带显式 answer）。
+        for row in current_batch:
+            row["attempt_outcome"] = "success"
+            row["last_success_at"] = row["updated_at"]
+            if not row.get("steam_answer"):
+                status = row["price_status"]
+                row["steam_answer"] = (
+                    "locked"
+                    if status == "locked"
+                    else "no_options"
+                    if status in ("missing", "blocked")
+                    else "free" if row.get("price") == 0 else "ok"
+                )
 
         ok_regions = {
             row["region_code"] for row in current_batch if row["price_status"] == "ok"
@@ -434,7 +497,7 @@ class DbWriter:
                     for c in (
                         "name", "name_en", "type", "header_image", "store_url",
                         "chinese_support", "family_sharing", "trading_cards",
-                        "release_date", "genres", "is_adult", "is_visual_novel",
+                        "release_date", "is_adult", "is_visual_novel",
                         "developers", "publishers",
                         "positive_rate", "positive_reviews", "review_count",
                         "updated_at",
@@ -641,7 +704,7 @@ class DbWriter:
                         for c in (
                             "name", "name_en", "type", "header_image", "store_url",
                             "chinese_support", "family_sharing", "trading_cards",
-                            "release_date", "genres", "is_adult", "is_visual_novel",
+                            "release_date", "is_adult", "is_visual_novel",
                             "developers", "publishers",
                             "positive_rate", "positive_reviews", "review_count",
                             "updated_at",
@@ -658,7 +721,7 @@ class DbWriter:
                             for c in (
                                 "name", "name_en", "type", "header_image", "store_url",
                                 "chinese_support", "family_sharing", "trading_cards",
-                                "release_date", "genres", "is_adult", "is_visual_novel",
+                                "release_date", "is_adult", "is_visual_novel",
                                 "developers", "publishers",
                                 "positive_rate", "positive_reviews", "review_count",
                                 "updated_at",
@@ -994,6 +1057,10 @@ class DbWriter:
     async def mark_region_status(self, appid: int, region_code: str, status: str) -> None:
         """标记区域状态（locked/blocked/missing）→ game_current_prices (UPSERT)。
 
+        尝试观察语义：missing = 本次尝试失败（传输/写库类），行上保留上一次
+        成功的价格与 last_success_at——「这次没拿到」不推翻「曾经拿到」；
+        locked = 成功观察（Steam 明确答复该区不售）。price_status 仍按旧口径
+        投影（missing/blocked 计欠账、locked 终态），供过渡期读取方兼容。
         账本语义（补抓链路）：
         - missing：fail_count 递增（_missing_ledger_bump）；穷尽 MISSING_MAX_RETRIES
           转 blocked（终态）——该区大概率根本无货/无版本，继续重试只是浪费配额
@@ -1003,7 +1070,8 @@ class DbWriter:
             now_dt = _naive(get_beijing_time_obj())
             async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
                 if status == "missing":
-                    # 首次插入 fail_count=1；已有行则 DO UPDATE 里旧值+1
+                    # 首次插入 fail_count=1；已有行则 DO UPDATE 里旧值+1。
+                    # 价格三件套不在 SET 里：失败保留 last good price
                     stmt = sqlite_insert(GameCurrentPrice).values(
                         appid=int(appid),
                         region_code=region_code.upper() if region_code else "",
@@ -1015,20 +1083,21 @@ class DbWriter:
                         price_status="missing",
                         fail_count=1,
                         cny_fen=None,
+                        attempt_outcome="failed",
+                        last_success_at=None,
                         updated_at=now_dt,
                     )
                     stmt = stmt.on_conflict_do_update(
                         index_elements=[GameCurrentPrice.appid, GameCurrentPrice.region_code],
                         set_={
                             **_missing_ledger_bump(),
-                            "price": None,
-                            "original_price": None,
-                            "discount_percent": 0,
-                            "cny_fen": None,
+                            "attempt_outcome": "failed",
+                            "steam_answer": None,
                             "updated_at": now_dt,
                         },
                     )
                 else:
+                    outcome = "success" if status == "locked" else "failed"
                     stmt = sqlite_insert(GameCurrentPrice).values(
                         appid=int(appid),
                         region_code=region_code.upper() if region_code else "",
@@ -1040,6 +1109,9 @@ class DbWriter:
                         price_status=status,
                         fail_count=0,
                         cny_fen=None,
+                        attempt_outcome=outcome,
+                        steam_answer="locked" if status == "locked" else None,
+                        last_success_at=now_dt if status == "locked" else None,
                         updated_at=now_dt,
                     )
                     stmt = stmt.on_conflict_do_update(
@@ -1054,6 +1126,9 @@ class DbWriter:
                             "original_price": None,
                             "discount_percent": 0,
                             "cny_fen": None,
+                            "attempt_outcome": outcome,
+                            "steam_answer": stmt.excluded.steam_answer,
+                            "last_success_at": stmt.excluded.last_success_at,
                             "updated_at": stmt.excluded.updated_at,
                         },
                     )

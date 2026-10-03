@@ -29,6 +29,7 @@ from sqlalchemy import text
 from yarl import URL
 
 from app.core.database import WritePriority, get_session_factory, write_gate
+from app.crawler import tag_names
 from app.crawler.config import CC_LIST
 from app.crawler.db_writer import DbWriter
 from app.crawler.http_client import SteamRateLimitError
@@ -38,6 +39,7 @@ from app.crawler.utils import (
     get_beijing_time_obj,
     is_gold_edition,
 )
+from app.domains.games import tags as tags_service
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +70,11 @@ DATA_REQUEST_EXTRAS = {
     "include_reviews": True,      # → 好评率/评论数（替掉 appreviews 接口）
     "include_platforms": True,    # → 平台支持
     "include_coming_soon": True,  # → 即将推出标记
+    "include_tag_count": 20,      # → tags[]{tagid,weight}（热门用户标签，含票重）
 }
+# 热门标签条数上限：店铺页「该产品的热门用户自定义标签」最多回 20 条，
+# 请求值给更大也只回这么多
+TAG_COUNT_LIMIT = 20
 
 # browse 的 item.type 标定：
 #   0=游戏 1=Demo 2=Mod 3=Tool 4=DLC 6=应用(如 Wallpaper Engine，按 GAME 收)
@@ -200,6 +206,23 @@ def _visible_without_options(item: dict | None) -> bool:
     if not item or item.get("success") != 1 or not item.get("visible") or item.get("is_free"):
         return False
     return not (item.get("purchase_options") or item.get("best_purchase_option"))
+
+
+def _item_tags(item: dict | None) -> list[tuple[int, int]]:
+    """browse item → [(tagid, weight), ...]（票重降序 = 店铺页热门标签顺序）。
+
+    `tags` 与 `tagids` 由同一个 include_tag_count 产出、同序同集，前者多带票重；
+    仅在 `tags` 缺席时回落到裸编号（票重记 0）。
+    """
+    tags = (item or {}).get("tags") or []
+    out = [
+        (int(t["tagid"]), _to_int(t.get("weight")) or 0)
+        for t in tags
+        if isinstance(t, dict) and t.get("tagid")
+    ]
+    if out:
+        return out
+    return [(int(t), 0) for t in ((item or {}).get("tagids") or []) if t]
 
 
 async def _mark_missing_async(db_writer, appids: list[int], cc: str) -> int:
@@ -517,7 +540,7 @@ class StoreBrowseAPI:
 # games 表：browse 拿不到的列，保留库内原值（不保留就会被写 NULL）
 _PRESERVED_COLUMNS = [
     "name", "name_en", "type", "header_image", "chinese_support", "family_sharing",
-    "trading_cards", "release_date", "genres", "developers", "publishers",
+    "trading_cards", "release_date", "developers", "publishers",
     "positive_rate", "positive_reviews", "review_count", "is_adult", "is_visual_novel",
 ]
 
@@ -525,8 +548,8 @@ _PRESERVED_COLUMNS = [
 def load_preserved_rows(db_path: Path) -> dict[int, dict]:
     """库内原值 → PRESERVED（browse 拿不到的列不能被抹成 NULL）。
 
-    旧链路的 chinese_support 来自 appdetails 语言表、genres 来自 genres 分类，
-    browse 均不返回——不做保留就会把已有数据抹成 NULL。
+    旧链路的 chinese_support 来自 appdetails 语言表，browse 不返回——不做保留
+    就会把已有数据抹成 NULL。
     """
     cols = ",".join(_PRESERVED_COLUMNS)
     conn = sqlite3.connect(Path(db_path).as_posix())
@@ -586,7 +609,6 @@ def build_game_data(appid: int, meta: dict | None, now_dt) -> dict | None:
         #   空库首爬（无原值）必须给 bool 缺省，透传 None 会让 INSERT 违约束
         "chinese_support": (keep or {}).get("chinese_support"),
         "is_visual_novel": bool((keep or {}).get("is_visual_novel")),
-        "genres": (keep or {}).get("genres"),
         # ↓ browse 可提供
         "family_sharing": bool(meta.get("family_sharing")) if has_browse_meta
         else bool((keep or {}).get("family_sharing")),
@@ -983,6 +1005,7 @@ async def _browse_price_task_inner(context) -> bool:
                     "version_suffix": o["version_suffix"] or None,
                     "is_bundle": o["is_bundle"],
                     "price_status": "ok",
+                    "steam_answer": "ok",
                     "discount_end_ts": o.get("discount_end_ts"),
                     "crawled_at": now_dt,
                 }
@@ -1006,7 +1029,8 @@ async def _browse_price_task_inner(context) -> bool:
                     "discount_percent": o.get("discount_pct") or 100,
                     "sub_id": o.get("sub_id") or 0,
                     "is_gold": False, "version_suffix": None,
-                    "is_bundle": False, "price_status": "ok", "crawled_at": now_dt,
+                    "is_bundle": False, "price_status": "ok", "steam_answer": "free",
+                    "crawled_at": now_dt,
                     # promo_end_ts 随行透传给 db_writer 维护 games.promo_end_at
                     # （仪表盘 Steam 喜加一模块的数据源）；discount_end_ts 同值
                     # 落现价/历史（100% 折扣的截止即赠送截止）
@@ -1023,7 +1047,8 @@ async def _browse_price_task_inner(context) -> bool:
                     "appid": int(appid), "region_code": cc.upper(), "currency": currency,
                     "price": 0, "original_price": 0, "discount_percent": 0,
                     "sub_id": 0, "is_gold": False, "version_suffix": None,
-                    "is_bundle": False, "price_status": "ok", "crawled_at": now_dt,
+                    "is_bundle": False, "price_status": "ok", "steam_answer": "free",
+                    "crawled_at": now_dt,
                 }
             ]
         else:
@@ -1032,7 +1057,11 @@ async def _browse_price_task_inner(context) -> bool:
                     "appid": int(appid), "region_code": cc.upper(), "currency": currency,
                     "price": None, "original_price": None, "discount_percent": 0,
                     "sub_id": 0, "is_gold": False, "version_suffix": None,
-                    "is_bundle": False, "price_status": status, "crawled_at": now_dt,
+                    "is_bundle": False, "price_status": status,
+                    # locked / 无购买选项都是成功观察：拿到了 Steam 对该区的
+                    # 明确答复，只是答复不是价格
+                    "steam_answer": "locked" if status == "locked" else "no_options",
+                    "crawled_at": now_dt,
                 }
             ]
         counts[status if status in counts else "missing"] += 1
@@ -1083,6 +1112,22 @@ async def _browse_price_task_inner(context) -> bool:
                 logger.debug("[browse] %s 捆绑包发现落库失败: %s", task_id, e)
         if extra_entries:
             await context.db_writer.attach_browse_extras_batch(extra_entries)
+
+    # ── 热门用户标签（include_tag_count 白送，与价格同发）：按 appid 整批替换。
+    #    标签是区域无关的目录事实，不看本区价格状态——locked/无购买选项的条目
+    #    同样落标签，覆盖率不会被区服设置切成碎片。
+    if not DRY_RUN:
+        tag_entries = [
+            (appid, rows) for appid in appids if (rows := _item_tags(items.get(appid)))
+        ]
+        if tag_entries:
+            try:
+                await tags_service.replace_game_tags_batch(tag_entries)
+                await tag_names.resolve_tag_names(
+                    context, {t for _, rows in tag_entries for t, _ in rows}
+                )
+            except Exception as e:  # noqa: BLE001 —— 标签是副产物，绝不拖垮价格链路
+                logger.warning("[browse] %s 标签落库失败: %s", task_id, e)
 
     if cleared_missing and not DRY_RUN:
         await context.db_writer.clear_missing_regions(cleared_missing)
