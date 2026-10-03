@@ -262,7 +262,7 @@ async def _run_crawl_locked(
     db = bs.BrowseDbWriter()
     await db.connect()
 
-    # browse 拿不到的 games 列（chinese_support/genres/is_visual_novel…）保留库内原值，
+    # browse 拿不到的 games 列（chinese_support/is_visual_novel…）保留库内原值，
     # 否则 upsert 会把它们抹成 NULL
     from ..core.config import get_settings
 

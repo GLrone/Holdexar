@@ -78,6 +78,25 @@ def test_suffix_real_option_text_forms():
         ("女神异闻录5：皇家版", "女神异闻录5", "皇家版"),
         # 冒号连接 + 价格尾巴混排
         ("Game Name: Gold Edition - ¥ 298.00", "Game Name", "Gold Edition"),
+        # 尾巴语言标注不是版本：带 CJK 标注的本体 = 标准版（三国志14 实锤，
+        # 曾被误判成版本款出局、标准版让位给 Complete Edition）
+        (
+            "ROMANCE OF THE THREE KINGDOMS XIV (English/Chinese/Japanese/Korean)",
+            "ROMANCE OF THE THREE KINGDOMS XIV",
+            "",
+        ),
+        # name_en 自带语言标注时同样剥掉再比对
+        (
+            "ROMANCE OF THE THREE KINGDOMS XIV (English/Chinese/Japanese/Korean) - ¥ 268.00",
+            "ROMANCE OF THE THREE KINGDOMS XIV (English/Chinese/Japanese/Korean)",
+            "",
+        ),
+        # 真版本 + 语言标注：版本名保留（历史标签不丢信息）
+        (
+            "Game - Complete Edition Bundle (Chinese/Japanese/Korean) - ¥ 268.00",
+            "Game",
+            "Complete Edition Bundle (Chinese/Japanese/Korean)",
+        ),
     ]
     for opt, name_en, expected in cases:
         got = extract_version_suffix(opt, name_en)

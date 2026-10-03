@@ -133,3 +133,86 @@ async def test_batch_change_produces_new_snapshot(db):
     )
     assert results == [True]
     assert await _history_count(db, APPID_A) == 2
+
+
+# ── 标准版选择（_plan_price_rows 纯函数直测） ────────────────────────────
+
+
+def _opt(appid, sub, price, suffix=None, *, is_bundle=False, status="ok", currency="CNY"):
+    return {
+        "appid": appid, "region_code": "CN", "currency": currency,
+        "price": price, "original_price": price, "discount_percent": 0,
+        "sub_id": sub, "is_gold": False, "version_suffix": suffix,
+        "is_bundle": is_bundle, "price_status": status,
+    }
+
+
+def _plan(w, rows):
+    return w._plan_price_rows(rows, ({}, {}), datetime.now(), None)
+
+
+def _cn_row(current):
+    return next(r for r in current if r["region_code"] == "CN")
+
+
+def test_plan_named_standard_edition_is_standard_candidate():
+    """显式命名的 Standard Edition 是本体官方命名：归一化为标准版候选，
+    与无名本体同台按 min(sub_id) 竞争——不再被当版本款排除。"""
+    w = DbWriter()
+    rows = [
+        _opt(APPID_A, 200, 30000),
+        _opt(APPID_A, 100, 10900, "Standard Edition"),
+    ]
+    current, _, ok, _ = _plan(w, rows)
+    assert _cn_row(current)["sub_id"] == 100
+    assert _cn_row(current)["price"] == 10900
+    assert ok == {"CN"}
+
+
+def test_plan_standard_edition_four_pack_stays_non_standard():
+    """带附加词的礼包 SKU（Four Pack）不归一：仍是版本款，不进候选。"""
+    w = DbWriter()
+    rows = [
+        _opt(APPID_A, 500, 12000),
+        _opt(APPID_A, 100, 40000, "Standard Edition Four Pack"),
+    ]
+    current, _, _, _ = _plan(w, rows)
+    assert _cn_row(current)["sub_id"] == 500
+
+
+def test_plan_all_suffixed_fallback_is_order_independent():
+    """该区全部选项带真版本后缀（无候选）：兜底取有价行里 sub_id 最小者，
+    与响应顺序无关——曾经按响应序取末行，同一 appid 各区混装不同版本。"""
+    w = DbWriter()
+    deluxe = _opt(APPID_A, 2000000, 30000, "Deluxe Edition")
+    starter = _opt(APPID_A, 1567580, 49000, "Starter Edition")
+    for rows in ([starter, deluxe], [deluxe, starter]):
+        current, _, _, _ = _plan(w, rows)
+        assert _cn_row(current)["sub_id"] == 1567580
+        assert _cn_row(current)["price"] == 49000
+
+
+def test_plan_bundle_never_enters_fallback_pick():
+    """捆绑包选项绝不落 current：有价非捆绑行缺席时落状态行（末行）。"""
+    w = DbWriter()
+    rows = [
+        _opt(APPID_A, 300, 20000, is_bundle=True),
+        _opt(APPID_A, 0, None, status="locked"),
+    ]
+    current, _, _, _ = _plan(w, rows)
+    row = _cn_row(current)
+    assert row["price_status"] == "locked" and row["price"] is None
+
+
+def test_plan_status_only_region_picks_lowest_sub():
+    """纯降级区（missing/locked，无价）走第一轮候选选择：取最小 sub 的
+    状态行（候选判据不查状态，兜底分支只服务全后缀区域）。"""
+    w = DbWriter()
+    rows = [
+        _opt(APPID_A, 100, None, status="locked"),
+        _opt(APPID_A, 200, None, status="missing"),
+    ]
+    current, _, ok, _ = _plan(w, rows)
+    row = _cn_row(current)
+    assert row["sub_id"] == 100 and row["price_status"] == "locked"
+    assert ok == set()
