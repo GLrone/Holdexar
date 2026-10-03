@@ -1,29 +1,10 @@
-"""价格刷新周期（Price Refresh Cycle）：一轮价格刷新的生命周期与归属。
-
-`PriceCycle` 是一级业务对象，与 CrawlJob 是 1:N——本轮启动的每个 job 都挂
-`cycle_id`，Cycle 的状态机是唯一的一级生命周期：
-
-    planning → running → repairing → finalizing
-                                   → completed / partial / failed / cancelled
-
-- planning    冻结本轮期望集（对象 × 地区）与阶段列表
-- running     本轮抓取阶段
-- repairing  本轮抓取结束时仍有待补欠账（补抓由既有 repair 通道承担）
-- finalizing  不再产生抓取，按本轮 job 结果收敛终态
-- completed   本轮 job 全部成功且未进过 repairing
-- partial     部分 job 失败/被停止，或本轮进过 repairing（有单元没拿到）
-- failed      本轮没跑起来（无区可爬 / 无 job 成功）
-- cancelled   本轮被用户停止
-
-期望集在 planning 落库后即冻结：此后监控池增删、区服配置变化都不改写本轮
-分母——覆盖率的分母必须可复现。
-
-Repair 归属边界：5min `price_repair` 扫全库 missing 账本，与本轮期望集没有
-确定性关联，其 job 的 `cycle_id` 保持 NULL（暂不归属）；Cycle 的 repairing
-只记录本轮确实遗留了欠账，不另发起抓取。
-
-状态只由本模块的 `advance` 写入；job / worker / scheduler 不得直接改 Cycle
-状态。
+"""价格刷新周期（PriceCycle）：一轮价格刷新的生命周期，与 CrawlJob 1:N。
+状态机 planning → running → repairing → finalizing → completed/partial/failed/
+cancelled（partial=有 job 失败/被停或进过 repairing；failed=没跑起来；
+cancelled=用户停止）。期望集在 planning 落库即冻结——监控池增删、区服变化
+不改写本轮分母（覆盖率分母必须可复现）。repair 归属边界：5min price_repair
+扫全库 missing 账本与本轮期望集无确定性关联，其 job 的 cycle_id 保持 NULL，
+Cycle 的 repairing 只记欠账不另发起抓取。状态只由本模块 advance 写入。
 """
 from __future__ import annotations
 
@@ -253,6 +234,8 @@ def decide_terminal(
 ) -> str:
     """终态判定：看整轮 job 结果，不是最后一个 job 的状态。
 
+    Cycle 是调度执行记录，只回答「这批任务跑得怎么样」——价格可靠性由
+    game_current_prices 的尝试观察状态回答，不在这里判定。
     - 一个 job 都没启动：期望集为空 = 本轮无事可做，否则没跑起来
     - 全部被停止 = cancelled
     - 没有一个 job 成功（全部 failed）= failed

@@ -74,6 +74,8 @@ def _alert_dict(a: PriceAlert) -> dict:
         "targetType": a.target_type,
         "targetValue": a.target_value,
         "active": a.active,
+        "repeatMode": a.repeat_mode,
+        "repeatHours": a.repeat_hours,
         "createdAt": a.created_at.isoformat() if a.created_at else None,
         "lastTriggeredAt": a.last_triggered_at.isoformat() if a.last_triggered_at else None,
     }
@@ -106,13 +108,21 @@ async def list_alerts() -> list[dict]:
 
 
 async def add_alert(
-    appid: int, region: str, target_type: str, target_value: float | None
+    appid: int,
+    region: str,
+    target_type: str,
+    target_value: float | None,
+    *,
+    repeat_mode: str = "once",
+    repeat_hours: int = 24,
 ) -> dict:
     """新增规则。target_value：price 类 = 人民币分（前端按元输入 ×100），pct 类 = 百分数。"""
     if target_type not in ("price", "pct", "historic_low"):
         raise ValueError(f"未知提醒类型: {target_type}")
     if target_type in ("price", "pct") and target_value is None:
         raise ValueError("该类型需要目标值")
+    if repeat_mode not in ("once", "cooldown", "always"):
+        raise ValueError(f"未知重复策略: {repeat_mode}")
     async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         alert = PriceAlert(
             appid=appid,
@@ -120,6 +130,8 @@ async def add_alert(
             target_type=target_type,
             target_value=target_value,
             active=True,
+            repeat_mode=repeat_mode,
+            repeat_hours=max(1, int(repeat_hours)),
             created_at=_naive(get_beijing_time_obj()),
         )
         session.add(alert)
@@ -134,8 +146,10 @@ async def update_alert(
     target_value: float | None = None,
     target_type: str | None = None,
     region: str | None = None,
+    repeat_mode: str | None = None,
+    repeat_hours: int | None = None,
 ) -> dict:
-    """更新提醒规则（支持编辑条件类型、目标值、区服、启停）。
+    """更新提醒规则（支持编辑条件类型、目标值、区服、启停、重复策略）。
 
     target_value 口径同 add_alert：price 类 = 人民币分，pct 类 = 百分数。
     改区不改值——阈值即人民币目标位，换区后继续按同一人民币口径比较。
@@ -154,6 +168,12 @@ async def update_alert(
             alert.target_value = target_value
         if region is not None:
             alert.region = region.upper()
+        if repeat_mode is not None:
+            if repeat_mode not in ("once", "cooldown", "always"):
+                raise ValueError(f"未知重复策略: {repeat_mode}")
+            alert.repeat_mode = repeat_mode
+        if repeat_hours is not None:
+            alert.repeat_hours = max(1, int(repeat_hours))
         await session.commit()
         return _alert_dict(alert)
 
@@ -193,6 +213,10 @@ async def check_appids(appids: list[int]) -> list[dict]:
         ).scalars().all()
 
         for alert in alerts:
+            if alert.repeat_mode == "cooldown" and alert.last_triggered_at is not None:
+                elapsed_hours = (now - alert.last_triggered_at).total_seconds() / 3600
+                if elapsed_hours < (alert.repeat_hours or 24):
+                    continue
             price_row = await session.execute(
                 select(GameCurrentPrice).where(
                     GameCurrentPrice.appid == alert.appid,
@@ -240,6 +264,9 @@ async def check_appids(appids: list[int]) -> list[dict]:
                 )
             )
             alert.last_triggered_at = now
+            if alert.repeat_mode == "once":
+                # 到价提醒只说一次：触发即收敛，历史留 AlertEvent
+                alert.active = False
             triggered.append(
                 {
                     "appid": int(alert.appid),

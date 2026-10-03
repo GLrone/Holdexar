@@ -154,6 +154,18 @@ async def freshness(appid: list[int] = Query(default=[])):
     return {"items": await freshness_service.appid_freshness(appids)}
 
 
+@router.get("/crawl/freshness/latest")
+async def freshness_latest():
+    """全库最近一次成功价格观察（ISO 时刻）：灵动岛「价格已更新/未更新」的时钟。
+
+    与对象级 `/crawl/freshness` 同域不同面：这里回答整个库的价格数据离现在
+    多久，事实源是活表观察章（`last_success_at` 的 MAX）——不读 price_cycles，
+    手动 / 回填 / 补抓作业的成功写入同样推进。从未成功观察为 null。
+    """
+    at = await freshness_service.latest_price_observation()
+    return {"lastSuccessAt": at.isoformat() if at else None}
+
+
 @router.get("/crawl/price-events")
 async def price_events(
     cycle_id: int | None = None,

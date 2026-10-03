@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.core import scheduler as sched_mod
 from app.core.database import Base
 from app.domains.crawl import cycle as cycle_mod
+from app.domains.crawl import cycle_run
 from app.domains.crawl import events as _events_mod  # noqa: F401  price_events 建表
 from app.domains.crawl import service as crawl_service
 from app.domains.crawl.cycle import PriceCycle
@@ -72,6 +73,11 @@ def db(tmp_path, monkeypatch):
     monkeypatch.setattr(crawl_events, "get_session_factory", lambda: factory)
     monkeypatch.setattr(crawl_stats, "get_session_factory", lambda: factory)
     monkeypatch.setattr(notification_service, "get_session_factory", lambda: factory)
+    # 空壳轮窗口判定与卡片覆盖选轮都在 coverage 域——漏打桩会让终态判定
+    # 读到生产库的最近写入，把零写入模拟轮误判成有写入
+    import app.domains.crawl.coverage as crawl_coverage
+
+    monkeypatch.setattr(crawl_coverage, "get_session_factory", lambda: factory)
     return factory
 
 
@@ -135,7 +141,23 @@ def _crawl_env(monkeypatch):
     monkeypatch.setattr(crawl_service.games_service, "refresh_pp_flags", _noop)
     monkeypatch.setattr(crawl_service.games_service, "refresh_sort_cache", _noop)
 
+    # 忠实模拟：真实爬取按 config.regions 把每款对象的各期望区服现价行都刷掉
+    # （pairs 第二位是区码覆盖位，空串=跑本轮全部区服）。空壳轮终态判定以
+    # 窗口内价格写入为准——桩不落行会把所有模拟轮误判成零写入空壳；
+    # merge 落行，避免与种子的欠账行撞主键。
+    import app.core.database as database_module
+
     async def _run_crawl(pairs, *, config, stop_event=None, pre_tasks=None):
+        now = datetime.now()
+        regions = list(getattr(config, "regions", None) or [])
+        async with database_module.get_session_factory()() as session:
+            for appid, _region in pairs or []:
+                for region in regions:
+                    await session.merge(GameCurrentPrice(
+                        appid=appid, region_code=region, currency="", price=None,
+                        sub_id=None, price_status="ok", fail_count=0, updated_at=now,
+                    ))
+            await session.commit()
         return {"total": len(pairs or []) + len(pre_tasks or []), "processed": 0}
 
     monkeypatch.setattr(crawl_service, "run_crawl", _run_crawl)
@@ -213,12 +235,142 @@ async def test_price_refresh_creates_one_cycle(db, monkeypatch):
     assert rows[0]["status"] in cycle_mod.TERMINAL_STATES
 
 
+# ── 手动全队列链：与自动轮同一条编排，同样挂 Cycle ──
+# 手动链此前 cycle_id 恒为 NULL，顶栏状态胶囊读的是上一轮自动轮的终态——
+# 用户手动跑完仍可能看到「更新未完成」。手动链现在建 kind='manual' 的轮。
+
+
+def _no_catalog_segments(monkeypatch):
+    """手动链用例只验「挂轮 + 口径一致」，不验目录层/特惠榜段。
+
+    `default_queue_specs()` 的 catalog / specials 段会解析真实目录与榜单
+    （specials 走 `get_board` 出网），与本文件「不发任何真实请求」的隔离约定
+    相冲；关掉 `crawl.catalog_refresh` 后队列只剩 missing + pool 两段，
+    挂轮与期望集口径的断言面不变。
+    """
+    import app.domains.settings.service as settings_service
+
+    real = settings_service.get_value
+
+    async def _value(key, default=None):
+        if key == "crawl.catalog_refresh":
+            return False
+        return await real(key, default)
+
+    monkeypatch.setattr(settings_service, "get_value", _value)
+
+
+@pytest.mark.asyncio
+async def test_manual_full_queue_creates_manual_cycle(db, monkeypatch):
+    """任务页「全部游戏」：建 kind='manual' 的 Cycle 并收敛到终态。"""
+    _crawl_env(monkeypatch)
+    _no_catalog_segments(monkeypatch)
+    await _seed_games(db, APPIDS)
+
+    await crawl_service.start_full_queue()
+    await crawl_service._queue_chain_task
+
+    rows = await cycle_mod.list_cycles(10)
+    assert len(rows) == 1, f"手动全队列也应产生一个 Cycle：{rows}"
+    assert rows[0]["kind"] == "manual"
+    assert rows[0]["status"] in cycle_mod.TERMINAL_STATES
+    assert rows[0]["finishedAt"], "手动轮必须收敛，不留中间态"
+
+
+@pytest.mark.asyncio
+async def test_manual_full_queue_jobs_share_that_cycle(db, monkeypatch):
+    """手动链各段 job 挂同一个 manual cycle——覆盖率与事件口径才有分母。"""
+    _crawl_env(monkeypatch)
+    _no_catalog_segments(monkeypatch)
+    await _seed_games(db, APPIDS)
+    await _seed_missing(db, 760003)
+
+    await crawl_service.start_full_queue()
+    await crawl_service._queue_chain_task
+
+    cycles = await cycle_mod.list_cycles(10)
+    jobs = await _job_rows(db)
+    assert jobs, "手动链应真实启动任务"
+    assert {j.cycle_id for j in jobs} == {cycles[0]["id"]}
+
+
+@pytest.mark.asyncio
+async def test_manual_and_scheduled_share_same_orchestration(db, monkeypatch):
+    """两条触发路径跑同一份编排：同 specs 下期望集与覆盖率口径一致。"""
+    _crawl_env(monkeypatch)
+    _stub_scheduler_env(monkeypatch)
+    _no_catalog_segments(monkeypatch)
+    await _seed_games(db, APPIDS)
+    specs = await crawl_service.default_queue_specs()
+
+    await cycle_run.run_price_cycle(specs, kind="manual")
+    manual = (await cycle_mod.list_cycles(10))[0]
+    await cycle_run.run_price_cycle(specs, kind="scheduled")
+    scheduled = (await cycle_mod.list_cycles(10))[0]
+
+    assert (manual["kind"], scheduled["kind"]) == ("manual", "scheduled")
+    assert manual["expectedUnits"] == scheduled["expectedUnits"], (
+        "同 specs 的期望集分母必须一致"
+    )
+    assert manual["batchesExpected"] == scheduled["batchesExpected"]
+    assert manual["status"] == scheduled["status"], "同结果对两条路径应同终态"
+
+
+@pytest.mark.asyncio
+async def test_chain_exception_does_not_ask_caller_to_retry(db, monkeypatch):
+    """链异常 = 本轮跑崩了，不是「被占用」：不得让调用方让路重试。
+
+    重试一个崩掉的链不会让用户多拿一轮价格，只会再建一轮并把同一轮失败
+    广播两次（终态推进第二次会被 advance 拒绝，但事件已经发出去了）。
+    """
+    _crawl_env(monkeypatch)
+    await _seed_games(db, APPIDS)
+    events = _capture_cycle_events(monkeypatch)
+
+    async def _boom(specs, **kw):
+        raise RuntimeError("链炸了")
+
+    monkeypatch.setattr(crawl_service, "run_sequential", _boom)
+
+    started = await cycle_run.run_price_cycle([{"scope": "pool"}], kind="scheduled")
+
+    assert started is True, "链异常后不得让调用方重试"
+    assert [p["status"] for p in events] == [cycle_mod.FAILED], (
+        f"异常轮只广播一次：{events}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cycle_create_failure_does_not_ask_caller_to_retry(db, monkeypatch):
+    """建轮失败：不重试。抓取照常跑完（本轮无归属），重试解决不了建轮失败。"""
+    _crawl_env(monkeypatch)
+    await _seed_games(db, APPIDS)
+    called: list = []
+
+    async def _spy(specs, **kw):
+        called.append(specs)
+        return [{"id": 1}]
+
+    monkeypatch.setattr(crawl_service, "run_sequential", _spy)
+
+    async def _boom(*a, **kw):
+        raise RuntimeError("库炸了")
+
+    monkeypatch.setattr(cycle_mod, "create", _boom)
+
+    started = await cycle_run.run_price_cycle([{"scope": "pool"}], kind="scheduled")
+
+    assert started is True
+    assert called, "记账失败不得让用户少一轮价格"
+
+
 @pytest.mark.asyncio
 async def test_all_round_jobs_share_one_cycle(db, monkeypatch):
     """本轮启动的多个 job 全部挂到同一个 cycle_id。"""
     _crawl_env(monkeypatch)
     await _seed_games(db, APPIDS)
     await _seed_missing(db, 760003)
+
 
     await sched_mod._run_price_cycle([{"kind": "missing"}, {"scope": "pool"}])
 
@@ -391,14 +543,18 @@ async def test_finalization_exception_lands_on_failed(db, monkeypatch):
     _crawl_env(monkeypatch)
     await _seed_games(db, APPIDS)
 
-    async def _boom(cycle_id):
-        raise RuntimeError("收尾撞锁")
+    real_advance = cycle_mod.advance
 
-    monkeypatch.setattr(cycle_mod, "jobs_of", _boom)
+    async def _boom(cycle_id, status, *, error=None):
+        if status == cycle_mod.FINALIZING:
+            raise RuntimeError("收尾撞锁")
+        return await real_advance(cycle_id, status, error=error)
+
+    monkeypatch.setattr(cycle_mod, "advance", _boom)
 
     await sched_mod._run_price_cycle([{"scope": "pool"}])
 
-    # 断言不走 list_cycles（它内部也调 jobs_of，已被桩住）
+    # 断言不走 list_cycles（它内部也调 jobs_of；advance 已被桩住）
     async with db() as session:
         row = (await session.execute(
             select(PriceCycle).order_by(PriceCycle.id.desc())
@@ -688,10 +844,10 @@ async def test_rejected_and_repeated_settle_do_not_broadcast(db, monkeypatch):
     events = _capture_cycle_events(monkeypatch)
     cid = await cycle_mod.create("scheduled", "pool")
 
-    assert not await sched_mod._settle_cycle(cid, cycle_mod.COMPLETED)
-    assert await sched_mod._settle_cycle(cid, cycle_mod.FAILED)
-    assert not await sched_mod._settle_cycle(cid, cycle_mod.FAILED)
-    assert not await sched_mod._settle_cycle(cid, cycle_mod.CANCELLED)
+    assert not await cycle_run.settle_cycle(cid, cycle_mod.COMPLETED)
+    assert await cycle_run.settle_cycle(cid, cycle_mod.FAILED)
+    assert not await cycle_run.settle_cycle(cid, cycle_mod.FAILED)
+    assert not await cycle_run.settle_cycle(cid, cycle_mod.CANCELLED)
 
     assert [p["status"] for p in events] == [cycle_mod.FAILED]
 
@@ -701,7 +857,7 @@ async def test_settle_without_cycle_broadcasts_nothing(db, monkeypatch):
     """本轮没挂 Cycle（记账失败）：没有可广播的归属。"""
     events = _capture_cycle_events(monkeypatch)
 
-    assert not await sched_mod._settle_cycle(None, cycle_mod.FAILED)
+    assert not await cycle_run.settle_cycle(None, cycle_mod.FAILED)
 
     assert events == []
 

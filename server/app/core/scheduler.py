@@ -1,16 +1,8 @@
 """APScheduler 常驻调度：账户同步 / 池价格爬取 / 汇率 / 代理体检。
 
-监控池两层节奏——「池成员资格」与「价格爬取」分开：
-- 账户同步 wishlist_sync 15min：拉账户愿望单/已购、差异入库（决定监控
-  队列里有什么）+ 新增条目即时首爬（占用时收尾定向补爬；crawl.auto_price
-  关闭时只入库不爬，与全部调度链一并停转）
-- 池价格爬取 price_refresh 锚点网格：外部时间判
-  太平洋夏令时 → Steam 折扣刷新时刻为锚（北京 01:00 夏令时 / 02:00
-  冬令时）+ 6h 步进网格（1/7/13/19 或 2/8/14/20）；每轮触发时用
-  外部时间重算下一格（DST 切换日网格自动换轨重算）。启动时本地
-  zoneinfo 初锚 + 异步外部时间纠偏探针；interval 6h 兜底（与网格
-  间距同宽——重锚链断裂也不脱轨）。三层串行 欠账补抓 → 监控层 → 目录层，
-  每轮由一个 PriceCycle 统管（`_run_price_cycle`）
+价格网格锚=Steam 折扣刷新时刻（北京 01:00 夏令时 / 02:00 冬令时）+ 6h 步进，
+每轮用外部时间重算下一格（DST 自动换轨）；三层串行 欠账补抓 → 监控层 →
+目录层，每轮由一个 PriceCycle 统管（`_run_price_cycle`）。
 """
 from __future__ import annotations
 
@@ -200,6 +192,8 @@ async def _stamp_uncrawled_missing(appids: list[int]) -> int:
                 price_status="missing",
                 fail_count=1,
                 cny_fen=None,
+                attempt_outcome="failed",
+                last_success_at=None,
                 updated_at=now,
             )
             await session.execute(
@@ -351,233 +345,41 @@ async def _job_price_repair() -> None:
 
 
 async def _run_price_cycle(specs: list[dict]) -> None:
-    """价格网格主轮的 Cycle 驱动段：一个 Cycle 统管本轮全部 job。
-
-    三层 spec 语义不变——欠账补抓 → 监控层（pool：有来源且未排除的对象，
-    来源优先级排前）→ 目录层（catalog：games 主档减去监控层，价格库维护轮）。
-    两段分开是为了让「被监控的对象」与「库里存在的对象」不再互相推导；
-    catalog 排除监控层，同轮不会重复爬。空的 spec 视为正常跳过。
-
-    本轮每个 job 挂同一个 PriceCycle：planning 冻结期望集 → running 跑链 →
-    （结束时仍有待补欠账）repairing → finalizing → 终态。Cycle 记账失败
-    不阻断抓取——记账失败不该让用户少一轮价格；无 Cycle 时本轮照常跑完，
-    只是这一轮没有归属可查。
+    """价格网格主轮驱动段：编排委托 `cycle_run.run_price_cycle`（与手动全队列
+    同一份）；本函数只留调度器策略——与修复拍/榜单反哺同拍被占时让路等待
+    （两拍 × 30s），仍被占按空结果走终态判定。
     """
-    from app.domains.crawl import cycle as price_cycle
+    from app.domains.crawl import cycle_run
+
+    if await cycle_run.run_price_cycle(specs, kind="scheduled"):
+        return
+    # 主轮整点常与 5min 修复拍 / 榜单反哺 / 免费促销重试同拍，单任务
+    # 爬虫被先到者占住时各 spec 会被逐个跳过——直接记 failed 等于让
+    # 主轮替别人的占用背锅。让路等待后再试一次（有界，两拍 × 30s），
+    # 仍被占才按空结果走终态判定。
     from app.domains.crawl import service as crawl_service
 
-    cycle_id: int | None = None
-    regions: list[str] | None = None
-    expected_units = 0
-    try:
-        cycle_id = await price_cycle.create("scheduled", "pool")
-    except Exception:  # noqa: BLE001
-        logger.exception("[周期] 本轮 Cycle 创建失败：抓取照常进行（本轮不挂 Cycle）")
-        cycle_id = None
-    if cycle_id is not None:
-        try:
-            regions, expected_units = await price_cycle.freeze_expected(cycle_id, specs)
-        except Exception:  # noqa: BLE001
-            # 冻结失败不影响抓取：本轮照跑，终态按「无区可爬 / 无期望集」收 failed
-            logger.exception("[周期] 本轮期望集冻结失败：抓取照常进行（本轮记 failed）")
-            regions = None
-
-    entered_repairing = False
-    try:
-        await price_cycle.advance(cycle_id, price_cycle.RUNNING)
-        results = await crawl_service.run_sequential(specs, cycle_id=cycle_id)
-        if not results and specs:
-            # 主轮整点常与 5min 修复拍 / 榜单反哺 / 免费促销重试同拍，单任务
-            # 爬虫被先到者占住时各 spec 会被逐个跳过——直接记 failed 等于让
-            # 主轮替别人的占用背锅。让路等待后再试一次（有界，两拍 × 30s），
-            # 仍被占才按空结果走终态判定。
-            for _ in range(2):
-                await asyncio.sleep(_SPEC_YIELD_WAIT_SECONDS)
-                handle = crawl_service._active
-                if handle is None or handle.task.done():
-                    break
-            results = await crawl_service.run_sequential(specs, cycle_id=cycle_id)
-        if not results:
-            logger.info("[定时] 池价格爬取：本轮无任务启动（占用/空列表）")
-        else:
-            logger.info("[定时] 池价格爬取链完成：%s", [r["id"] for r in results])
-        # 本轮结束时仍有待补欠账 → 本轮进入 repairing。补抓由既有 5min
-        # repair 通道承担（它扫全库账本，与本轮期望集没有确定性关联，job
-        # 暂不挂 Cycle），Cycle 只把「本轮确实遗留了未覆盖单元」记下来。
-        if cycle_id is not None and await crawl_service.has_pending_missing():
-            entered_repairing = await price_cycle.advance(
-                cycle_id, price_cycle.REPAIRING
-            )
-    except Exception as e:  # noqa: BLE001
-        logger.exception("[周期] 本轮价格链异常")
-        await _settle_cycle(cycle_id, price_cycle.FAILED, error=str(e)[:200])
-        await _record_cycle_stats(cycle_id)
-        return
-
-    if cycle_id is None:
-        return
-    # 收尾段（job 汇总 → finalizing → 事件 → 终态 → 通知 → 统计）必须兜异常：
-    # 这些库操作撞上写锁竞争时若异常外逃，Cycle 行会永久停在中间态——直到
-    # 下次进程重启才被孤儿清理收尸，期间前端「这轮跑到哪了」永远无解。
-    try:
-        jobs = await price_cycle.jobs_of(cycle_id)
-        terminal = (
-            price_cycle.FAILED
-            if regions is None
-            else price_cycle.decide_terminal(
-                [j["status"] for j in jobs],
-                expected_units=expected_units,
-                entered_repairing=entered_repairing,
-            )
-        )
-        if not await price_cycle.advance(cycle_id, price_cycle.FINALIZING):
-            return
-        # 事件检测排在本轮最终有效结果之上（finalizing 内、终态之前）：job 自己产生
-        # 事件会让「暂时失败→随后补抓成功」的单元先报不可用再报恢复
-        await _detect_cycle_events(cycle_id)
-        await _settle_cycle(cycle_id, terminal)
-        logger.info(
-            "[周期] 价格刷新 Cycle %d → %s（job %d 个，期望 %d 单元）",
-            cycle_id, terminal, len(jobs), expected_units,
-        )
-        # 通知是 Cycle 收敛后的下游副作用：失败只影响候选状态，不影响终态与统计
-        await _notify_cycle_events(cycle_id)
-        await _record_cycle_stats(cycle_id)
-    except Exception as e:  # noqa: BLE001
-        logger.exception("[周期] Cycle %d 收尾异常：兜底收敛为 failed", cycle_id)
-        await _settle_cycle(cycle_id, price_cycle.FAILED, error=str(e)[:200])
-        await _record_cycle_stats(cycle_id)
-
-
-async def _notify_cycle_events(cycle_id: int | None) -> None:
-    """Cycle 收敛后把本轮事件交给通知层（策略 → 候选 → 聚合摘要 → 邮件）。
-
-    失败只记日志：通知挂了不能让 Cycle 变 failed，更不能让用户少一轮价格。
-    """
-    if cycle_id is None:
-        return
-    try:
-        from app.domains.notifications import service as notification_service
-
-        await notification_service.dispatch(cycle_id)
-    except Exception:  # noqa: BLE001
-        logger.exception("[周期] Cycle %d 通知投递失败（不影响本轮结果）", cycle_id)
-
-
-async def _settle_cycle(
-    cycle_id: int | None, terminal: str, error: str | None = None
-) -> bool:
-    """把 Cycle 收敛到终态，并广播 `price_cycle.completed`；返回是否真的收敛。
-
-    先落库终态再发事件：客户端收到事件后立刻重拉，读到的就是新数据。只广播
-    跃迁成功的那一次——非法/重复跃迁没有产生新结果，不该让前端白刷一遍列表。
-    """
-    from app.core.events import bus
-    from app.core.orchestration import KIND_PRICE_CYCLE_FINISHED, LEVEL_ERROR, LEVEL_INFO, record
-    from app.domains.crawl import cycle as price_cycle
-
-    if not await price_cycle.advance(cycle_id, terminal, error=error):
-        return False
-    bus.publish("price_cycle.completed", cycleId=cycle_id, status=terminal)
-    # 事实留痕（独立会话，fail-soft）：进程重启后仍能回答「上一轮价格刷新何时、
-    # 以何种终态收敛、失败原因是什么」；SSE 广播只覆盖在线时刻。
-    if cycle_id is not None:
-        await record(
-            KIND_PRICE_CYCLE_FINISHED,
-            error or f"价格刷新轮 #{cycle_id} 收敛：{terminal}",
-            level=LEVEL_ERROR if error else LEVEL_INFO,
-            payload={"cycle_id": cycle_id, "status": terminal},
-        )
-    return True
-
-
-async def _detect_cycle_events(cycle_id: int | None) -> None:
-    """Cycle finalizing：把本轮观察相对历史的变化写成 price_events。
-
-    检测失败只记日志：本轮抓取结果与统计已经落库，事件缺失不该影响它们。
-    """
-    if cycle_id is None:
-        return
-    try:
-        from app.domains.crawl import events as price_events
-
-        written = await price_events.detect(cycle_id)
-        if written:
-            logger.info(
-                "[周期] Cycle %d 价格事件 %d 条：%s",
-                cycle_id, len(written),
-                sorted({e["event_type"] for e in written}),
-            )
-    except Exception:  # noqa: BLE001
-        logger.exception("[周期] Cycle %d 价格事件检测失败（不影响本轮结果）", cycle_id)
-
-
-async def _record_cycle_stats(cycle_id: int | None) -> None:
-    """Cycle 收敛后留下本轮生产统计（观测结果，不参与任何控制）。
-
-    统计失败只记日志：本轮抓取结果已经落库，统计缺失不该影响它。
-    """
-    if cycle_id is None:
-        return
-    try:
-        from app.domains.crawl import stats as price_stats
-
-        recorded = await price_stats.record_stats(cycle_id)
-        if recorded is not None:
-            logger.info(
-                "[周期] Cycle %d 统计：对象 %s/%s，单元 %s（ok %s / locked %s / 失败 %s / "
-                "未观察 %s），覆盖 %s（确认 %s），stale %s，耗时 %ss",
-                cycle_id,
-                recorded["targetsDone"], recorded["targetsTotal"],
-                recorded["unitsExpected"], recorded["unitsOk"],
-                recorded["unitsLocked"], recorded["unitsFailed"],
-                recorded["unitsUnobserved"], recorded["coverage"],
-                recorded["coverageConfirmed"], recorded["staleCount"],
-                recorded["durationSeconds"],
-            )
-    except Exception:  # noqa: BLE001
-        logger.exception("[周期] Cycle %d 统计落库失败（不影响本轮抓取结果）", cycle_id)
+    for _ in range(2):
+        await asyncio.sleep(_SPEC_YIELD_WAIT_SECONDS)
+        handle = crawl_service._active
+        if handle is None or handle.task.done():
+            break
+    await cycle_run.run_price_cycle(specs, kind="scheduled")
 
 
 async def _price_refresh_specs() -> list[dict]:
-    """价格轮队列组成——委托 crawl 服务 `default_queue_specs()`（唯一来源）。
-
-    自动价格轮与任务页「全部」档同源同组成：欠账补抓 → 监控层（pool）→
-    目录层（catalog）+ 特惠榜差值段（specials）随 KV `crawl.catalog_refresh`
-    （默认开）；关闭后只抓监控层。组成调整只改 crawl 服务那一处。
-    """
+    """价格轮队列组成——委托 `default_queue_specs()`（唯一来源，与任务页
+    「全部」档同源同组成）。"""
     from app.domains.crawl import service as crawl_service
 
     return await crawl_service.default_queue_specs()
 
 
 async def _job_price_refresh() -> None:
-    """池价格爬取（锚点网格：北京 01/07/13/19 夏令时 · 02/08/14/20 冬令时，
-    6h 步进）：串行链 欠账补抓 → 全池（愿望单+已购优先序排前），目录层与
-    特惠榜尾段按 `_price_refresh_specs` 的开关口径决定是否带上。
-
-    开头先重锚（下一格算好排队）再干活——长任务跑完后触发器不会覆盖
-    手改的 next_run_time（APScheduler 3.11 行为）；DST 切换日下一轮
-    探针自动把网格换到新锚点。
-
-    修复线程让路：busy 标志在排干等待**之前**置位——等待窗口内修复
-    轮同样让路（否则修复可能抢在主链前夺锁，spec 撞锁整条丢弃，
-    该轮全区刷新丢失）。若上一轮修复/用户任务仍占锁，排干等待其结束
-    再开链（每 10s 探一次，上限 10min 超时放行）。
-
-    全池层单 job 一遍过：愿望单+已购（manual→打折/史低→appid 优先序）
-    排头先爬，其余 games 行（含名单/导入行）垫后——全部池内条目获得与
-    愿望单同频的现价刷新。旧关注层/回补层随全池退役（分层会让愿望单
-    同轮双爬产生重复快照；孤儿行本就是 games 行，限量随分层失去意义）。
-    存储代价由 db_writer 历史差量门禁兜住：价格未变不写快照。
-
-    链尾捆绑包刷新：两层链逐个 await 跑完后，紧跟
-    bundles.refresh_bundles() 刷新监控层在册的包（星标关注/手动导入）
-    ——库内未关注的包与发现桩不再随轮全刷，运行负担只随用户关注的集合
-    走。抓取区=监控启用区，跟着这张 6h 网格轮换（锚点即 Steam 折扣刷新
-    时刻，折扣轮换后捆包/单买比较不失真）。捆绑包抓取只在链尾发生，不随
-    其他爬取运行触发；出网直连 + 与主链共享全局限流预算，异常只记
-    日志，不拖垮主链结果。
+    """池价格爬取（6h 锚点网格）：重锚 → 排干等待（修复/用户任务先走，每 10s
+    探一次上限 10min；busy 标志在排干前置位让修复轮同窗让路）→ 组队列 →
+    主轮；链尾捆绑包刷新只覆盖监控层在册的包，出网直连共享限流预算，
+    异常只记日志不拖垮主链。`crawl.auto_price` 关闭整链停转。
     """
     global _price_cycle_busy
     if not await price_auto_enabled():

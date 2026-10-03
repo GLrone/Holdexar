@@ -56,6 +56,27 @@ def db(tmp_path, monkeypatch):
 
     monkeypatch.setattr(dw, "get_session_factory", lambda: factory)
     monkeypatch.setattr(settings_service, "get_session_factory", lambda: factory)
+    # 空壳轮窗口判定在 coverage 域——漏桩会把终态判定指向生产库
+    import app.domains.crawl.coverage as crawl_coverage
+
+    monkeypatch.setattr(crawl_coverage, "get_session_factory", lambda: factory)
+    # 收尾链（终态判定 / 事件 / 通知 / 事实留痕）各自模块级持 factory 引用，
+    # 漏桩的模块会把 Cycle 收尾写进隔离外的库——逐个对齐本文件工厂
+    import app.domains.crawl.cycle as cycle_mod
+
+    monkeypatch.setattr(cycle_mod, "get_session_factory", lambda: factory)
+    import app.core.orchestration as orchestration_mod
+
+    monkeypatch.setattr(orchestration_mod, "get_session_factory", lambda: factory)
+    import app.domains.crawl.events as crawl_events
+    import app.domains.crawl.stats as crawl_stats
+    import app.domains.notifications.service as notification_service
+
+    monkeypatch.setattr(crawl_events, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(crawl_stats, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(notification_service, "get_session_factory", lambda: factory)
+    # 让路重试与空壳重试的等待拍归零：本文件断言编排语义，不测等待时长
+    monkeypatch.setattr(sched_mod, "_SPEC_YIELD_WAIT_SECONDS", 0)
     return factory
 
 
@@ -350,7 +371,9 @@ async def test_price_refresh_sets_busy_and_drains(db, monkeypatch):
 
     async def _spy(specs, **kw):
         states.append(sched_mod._price_cycle_busy)
-        return []
+        # 返回非空 = 本轮真的启动了任务：主轮据此不触发「被同拍挤占」的
+        # 让路重试（重试会让 states 追加第二轮，观测到的是重试而非首轮）
+        return [{"id": 1}]
 
     monkeypatch.setattr(crawl_service, "run_sequential", _spy)
     crawl_service._active = None
@@ -525,7 +548,7 @@ async def test_price_auto_enabled_allows_main_cycle(db, monkeypatch):
 
     async def _spy(specs, **kw):
         states.append(sched_mod._price_cycle_busy)
-        return []
+        return [{"id": 1}]
 
     monkeypatch.setattr(crawl_service, "run_sequential", _spy)
     crawl_service._active = None

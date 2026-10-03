@@ -455,8 +455,8 @@ async def test_sending_candidates_are_not_requeued(db, delivery):
 
 @pytest.mark.asyncio
 async def test_notification_failure_never_breaks_cycle_finalizing(db, monkeypatch):
-    """通知层抛异常也只记日志：调度器侧包住后 Cycle 照常收敛 completed。"""
-    from app.core import scheduler as sched_mod
+    """通知层抛异常也只记日志：编排侧包住后 Cycle 照常收敛 completed。"""
+    from app.domains.crawl import cycle_run
 
     await _enable(db)
     await _seed_game(db)
@@ -468,8 +468,8 @@ async def test_notification_failure_never_breaks_cycle_finalizing(db, monkeypatc
         raise RuntimeError("通知层炸了")
 
     monkeypatch.setattr(notification_service, "dispatch", _explode)
-    # 调度器侧由 try/except 包住：通知挂了不能让 Cycle 变 failed
-    await sched_mod._notify_cycle_events(cid)
+    # 编排侧由 try/except 包住：通知挂了不能让 Cycle 变 failed
+    await cycle_run.notify_events(cid)
 
     assert await _cycle_status(db, cid) == "completed"
 

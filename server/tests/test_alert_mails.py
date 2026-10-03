@@ -78,7 +78,25 @@ class _FakeSMTP:
     last_subject: str | None = None
     last_body: str | None = None
 
+    # AUTH 握手面：单次 AUTH 改动后生产路径先 ehlo → 探测 AUTH 扩展 →
+    # 按通告机制取 auth_<mech> 回调调用 server.auth()
+    esmtp_features: dict = {"auth": "PLAIN LOGIN"}
+
     def __init__(self, host, port, timeout=0):
+        pass
+
+    def ehlo_or_helo_if_needed(self):
+        pass
+
+    def has_extn(self, name):
+        return name in self.esmtp_features
+
+    auth_plain = None
+
+    def auth(self, mechanism, authobj):
+        pass
+
+    def starttls(self):
         pass
 
     def login(self, user, password):
@@ -132,6 +150,9 @@ def db(tmp_path, monkeypatch):
     from app.domains.alerts import service as alerts
 
     monkeypatch.setattr(alerts, "get_session_factory", lambda: factory)
+    # settings 域持有 core 原工厂的直接引用（from-import 绑定），不补桩会在
+    # 隔离夹具的空临时库上查询 app_settings 而报 no such table
+    monkeypatch.setattr(alerts.settings_service, "get_session_factory", lambda: factory)
     # 号主区直接对 alerts 引用的账号域函数打桩（账号域内部的 session
     # factory 绑定不可替换，没必要为取一个 region_code 走全链路）
     monkeypatch.setattr(alerts.account_service, "get_primary_account", _fake_primary)
@@ -173,7 +194,22 @@ async def _schema(db, monkeypatch):
     _owner_region_holder["region"] = None
     monkeypatch.setattr(notify.smtplib, "SMTP_SSL", _FakeSMTP)
     monkeypatch.setattr(notify.smtplib, "SMTP", _FakeSMTP)
+    # smtp_config 经 from-import 绑定 settings.get_value，桩掉避免读到
+    # 隔离夹具空库里的「未配置」（未配置时 send_mail 直接跳过发信）
+    monkeypatch.setattr(
+        notify, "smtp_config",
+        lambda: _async({
+            "host": "smtp.test", "port": 465, "user": "t@example.com",
+            "password": "pw", "to_addr": "owner@example.com", "use_ssl": True,
+        }),
+    )
     yield
+
+
+def _async(value):
+    async def _get():
+        return value
+    return _get()
 
 
 async def _call_check_new_lows(appids, owner_region=None):

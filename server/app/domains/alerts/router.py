@@ -18,6 +18,8 @@ class AlertAdd(BaseModel):
     region: str = "CN"
     targetType: str = "price"  # price | pct | historic_low
     targetValue: float | None = None
+    repeatMode: str = "once"  # once | cooldown | always
+    repeatHours: int = 24
 
 
 class AlertUpdate(BaseModel):
@@ -25,6 +27,8 @@ class AlertUpdate(BaseModel):
     targetValue: float | None = None
     targetType: str | None = None
     region: str | None = None
+    repeatMode: str | None = None
+    repeatHours: int | None = None
 
 
 class SmtpUpdate(BaseModel):
@@ -46,7 +50,10 @@ async def list_alerts():
 @router.post("")
 async def add_alert(req: AlertAdd):
     try:
-        return await service.add_alert(req.appid, req.region, req.targetType, req.targetValue)
+        return await service.add_alert(
+            req.appid, req.region, req.targetType, req.targetValue,
+            repeat_mode=req.repeatMode, repeat_hours=req.repeatHours,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -122,6 +129,8 @@ async def update_alert(alert_id: int, req: AlertUpdate):
             target_value=req.targetValue,
             target_type=req.targetType,
             region=req.region,
+            repeat_mode=req.repeatMode,
+            repeat_hours=req.repeatHours,
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))

@@ -22,6 +22,10 @@ class PriceAlert(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime | None] = mapped_column(DateTime)
     last_triggered_at: Mapped[datetime | None] = mapped_column(DateTime)
+    # 触发后行为：once=触发即收敛（规则完成，历史留 AlertEvent）
+    # | cooldown=repeat_hours 内不重复触发 | always=每次评估都触发
+    repeat_mode: Mapped[str] = mapped_column(String(10), default="once")
+    repeat_hours: Mapped[int] = mapped_column(Integer, default=24)
 
 
 class AlertEvent(Base):

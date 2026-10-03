@@ -412,11 +412,35 @@ def _crawled_appids(
     ]
 
 
-def _spawn_post_crawl_chain(crawled: list[int]) -> None:
-    """任务收尾下游链转后台：提醒 → 史低 → 新史低邮件 → 永降 → 排序缓存
-    → 系列归组 → 免费脱池。串行顺序与前台版一致，逐段兜异常不影响任务状态。
+def _spawn_post_crawl_chain(crawled: list[int], job_id: int) -> None:
+    """任务收尾下游链转后台：事件检测 → 提醒 → 史低 → 新史低邮件 → 永降
+    → 排序缓存 → 系列归组 → 免费脱池。串行顺序与前台版一致，逐段兜异常
+    不影响任务状态。
     """
     async def _chain() -> None:
+        try:
+            # 非周期执行（job 无 Cycle：手动单发 / 补抓拍）的价格变化同样进
+            # 事件账本——检测逻辑与挂轮共用一份（events.detect_window），
+            # 归属键取 -job_id，窗口=本 job 起止时刻
+            job = await _load_job(job_id)
+            if job is not None and job.cycle_id is None and crawled:
+                from app.domains.crawl import events as crawl_events
+
+                written = await crawl_events.detect_window(
+                    crawled,
+                    job.regions_json or [],
+                    job.started_at,
+                    job.finished_at or datetime.now(),
+                    cycle_id=-job_id,
+                )
+                if written:
+                    logger.info(
+                        "任务 %d 价格事件 %d 条：%s",
+                        job_id, len(written),
+                        sorted({e["event_type"] for e in written}),
+                    )
+        except Exception:  # noqa: BLE001
+            logger.exception("任务 %d 价格事件检测失败（不影响任务）", job_id)
         try:
             await alerts_service.check_appids(crawled)
         except Exception:  # noqa: BLE001
@@ -443,9 +467,9 @@ def _spawn_post_crawl_chain(crawled: list[int]) -> None:
         except Exception:  # noqa: BLE001
             logger.exception("排序缓存刷新失败（不影响任务）")
         try:
-            # 系列归组：仅当库里有未识别行（series_id NULL）时才全库重算，
-            # 已扫过的库这步是零成本探测
-            if await games_series.has_unassigned():
+            # 系列归组：库里有未识别行（series_id NULL）或系列覆盖文件被
+            # 改过时才全库重算，否则是零成本探测
+            if await games_series.has_unassigned() or games_series.overrides_changed():
                 refreshed = await games_series.refresh_series()
                 logger.info("系列归组已刷新 %d 款", refreshed)
         except Exception:  # noqa: BLE001
@@ -492,7 +516,7 @@ async def _execute(
         # 派生数据（晚几秒可见；进程退出丢一轮由下一轮重算自愈），提前释放
         # 的是抓取占用与任务收尾时长
         crawled = _crawled_appids(appid_pairs, pre_tasks)
-        _spawn_post_crawl_chain(crawled)
+        _spawn_post_crawl_chain(crawled, job_id=job_id)
     except Exception as e:  # noqa: BLE001
         logger.exception("任务 %d 失败", job_id)
         await _finish_job(job_id, "failed", None, str(e))
@@ -866,16 +890,11 @@ _queue_chain_task: asyncio.Task | None = None
 async def start_full_queue() -> dict:
     """任务页「全部」档：按默认队列组成后台串行启动整条链。
 
-    与自动价格轮同组成同出口（default_queue_specs）；区别只在触发方与
-    记账层——手动链不挂 Cycle（Cycle 归自动轮），无显式 kind 的 scope 段
-    job 行 kind 记 manual（missing / specials_backfill 是通道/段身份标签，
-    保留）。单任务模型：占用（含 bundles 链尾直调）即 RuntimeError，路由
-    转 409；段与段之间由链句柄防重入。
-
-    受理前先按同出口预解析各段款数：全部为空直接 ValueError（路由转 400，
-    用户语言说明），不留下「按键转圈但什么都不会发生」的死胡同；非空则
-    立即返回各段计数，进度走既有 crawl.progress 事件与任务列表。预解析
-    与链内 start_job 各解析一次（纯库内查询 + 榜单缓存，代价可忽略）。
+    与自动价格轮同一编排（`cycle_run.run_price_cycle`，kind='manual'），范围/
+    冻结/覆盖/事件/通知全部一致，手动轮同样挂 PriceCycle——手动跑一次与等
+    6h 自动跑一次是同一件事。受理前按同出口预解析各段款数：全空 ValueError
+    （路由 400），占用 RuntimeError（409），链句柄防重入；无显式 kind 的
+    scope 段 job 行记 manual（missing/specials_backfill 是段身份标签，保留）。
     """
     global _queue_chain_task
     from app.crawler.occupancy import crawler_busy
@@ -910,11 +929,15 @@ async def start_full_queue() -> dict:
     ]
 
     async def _chain() -> None:
+        # 编排本体在 crawl 域内，与自动轮共用一份；本函数只负责「后台跑 +
+        # 链级异常兜底」（段内异常各自兜底，不外抛）
+        from app.domains.crawl import cycle_run
+
         try:
-            results = await run_sequential(specs)
+            started = await cycle_run.run_price_cycle(specs, kind="manual")
             logger.info(
-                "[队列] 手动全队列完成：%s",
-                [r["id"] for r in results] or "无可抓段（全部为空）",
+                "[队列] 手动全队列完成：启动 %s",
+                "部分/全部段" if started else "无可抓段（全部为空或被占用）",
             )
         except Exception:  # noqa: BLE001 —— 链级异常只记日志，段内已各自兜底
             logger.exception("[队列] 手动全队列异常")
@@ -949,6 +972,7 @@ async def run_sequential(
     *,
     missing_cooldown: int | None = None,
     cycle_id: int | None = None,
+    skip_reasons: list[str] | None = None,
 ) -> list[dict]:
     """串行链式启动多个爬取任务（单任务模型下唯一的多 spec 方式）。
 
@@ -957,6 +981,8 @@ async def run_sequential(
     时跳过该 spec 继续下一个——链式触发的健壮性优先于严格性。
     missing_cooldown 显式传值时透传给 missing/repair 类 spec；cycle_id
     非空时本轮启动的 job 全部挂到该价格刷新周期。
+    skip_reasons 传列表时逐段收集跳过原因（"段标识：原因"），供编排层在
+    「整轮零启动」终态判定时把真实拒因写进 Cycle 账本，而不是只进日志。
     """
     results: list[dict] = []
     for spec in specs:
@@ -971,6 +997,8 @@ async def run_sequential(
             )
         except (RuntimeError, ValueError) as e:
             logger.info("[链式] 跳过 %s：%s", spec.get("kind", spec.get("scope")), e)
+            if skip_reasons is not None:
+                skip_reasons.append(f"{spec.get('kind', spec.get('scope'))}：{e}")
             continue
         results.append(result)
         active = _active

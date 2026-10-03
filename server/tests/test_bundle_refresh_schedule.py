@@ -36,6 +36,18 @@ def _stub_chain_env(monkeypatch, *, events, auto=True):
 
     monkeypatch.setattr(sched_mod, "_reanchor_price_refresh", _no_reanchor)
 
+    # 队列组成打桩：default_queue_specs 要读设置表（本文件零触库），
+    # 这里按现役默认组成固定四段；组成语义由 default_queue_specs 自己的用例验证
+    async def _fixed_specs():
+        return [
+            {"kind": "missing"},
+            {"scope": "pool"},
+            {"scope": "catalog"},
+            {"scope": "specials", "kind": "specials_backfill"},
+        ]
+
+    monkeypatch.setattr(sched_mod, "_price_refresh_specs", _fixed_specs)
+
     async def _run_sequential(specs, **kwargs):
         events.append(("chain", [s.get("kind", s.get("scope")) for s in specs]))
         return [{"id": 1}]
