@@ -56,14 +56,9 @@ class Game(Base):
     # smart 排序评分预计算列（refresh_sort_cache 维护，公式见 scoring.py；
     # 0~1 浮点，NULL=尚未计算——DESC 排序天然沉底）
     smart_score: Mapped[float | None] = mapped_column(Float)
-    # ── 认知度快照（refresh_sort_cache 维护）──
-    # steam_board = 上过 Steam 官方榜单（monitor_sources source='board'）
-    # 系列 / IP 认知度看既有的 series_id，不另设列
-    steam_board: Mapped[bool] = mapped_column(Boolean, default=False)
     is_adult: Mapped[bool] = mapped_column(Boolean, default=False)  # 成人内容
     is_visual_novel: Mapped[bool] = mapped_column(Boolean, default=False)  # 视觉小说
     release_date: Mapped[str | None] = mapped_column(String(50))
-    genres: Mapped[str | None] = mapped_column(String(512))
     # 商店移除监控：NULL=在售；非空=判定下架的北京时间。
     # 判定条件（mark_removed，app_handler 终端路径）：Phase 1 五区回退元数据
     # 全部 404 + 库内已有元数据行（之前抓到过）——持续两轮全 404 才落值，
@@ -114,6 +109,15 @@ class GameCurrentPrice(Base):
     # 促销截止（browse active_discounts[0].discount_end_date，Unix 秒）：
     # 现价表每轮 UPSERT，始终跟随最新一轮抓取；NULL=无折扣/未带促销元数据
     discount_end_ts: Mapped[int | None] = mapped_column(Integer)
+    # 尝试观察：每个 (appid, 区) 的最近一次抓取结果。成功观察 = 拿到 Steam
+    # 的明确答复（ok / free / locked / 无购买选项）；failed = 传输类失败
+    # （超时 / 代理 / 429 / 连接错误），此时本行价格保留上一次成功值。
+    # NULL = 观察机制上线前的存量行 / 种子导入基线。
+    attempt_outcome: Mapped[str | None] = mapped_column(String(10))
+    steam_answer: Mapped[str | None] = mapped_column(String(12))
+    # 最近一次成功观察时刻：只在成功观察时推进，失败不回退——
+    # 前端据此展示「本次失败，展示的是 X 时刻的数据」
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime)
 
     __table_args__ = (
@@ -261,3 +265,36 @@ class CatalogRemoval(Base):
     appid: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     reason: Mapped[str | None] = mapped_column(String(200))
     removed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class GameTag(Base):
+    """游戏热门用户标签（browse 的 include_tag_count 白送）：一行一个 tagid。
+
+    WITHOUT ROWID + 复合主键：主键即表本体，不再另建一棵重复的 B 树索引
+    （rowid 表为复合主键建的唯一索引会把 appid+tagid 存两遍）。
+    「取某游戏的标签」按主键前缀直达；「按标签聚合」全表顺序扫即得。
+    """
+
+    __tablename__ = "game_tags"
+
+    appid: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    tagid: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    # 标签票重：Steam 按它降序给热门标签排序，页面只显示名字不给票数
+    weight: Mapped[int] = mapped_column(Integer, default=0)
+
+    __table_args__ = ({"sqlite_with_rowid": False},)
+
+
+class Tag(Base):
+    """tagid → 中英文名对照表（标签名的唯一事实源，别处不再存名字）。
+
+    name_zh / name_en IS NULL = 已请求过对应语言的热门标签表且其中没有该
+    tagid（冷门标签），记占位行以免每轮爬取都重发一次请求。
+    """
+
+    __tablename__ = "tags"
+
+    tagid: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    name_zh: Mapped[str | None] = mapped_column(String(100))
+    name_en: Mapped[str | None] = mapped_column(String(100))
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime)

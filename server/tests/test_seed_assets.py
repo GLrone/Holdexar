@@ -22,7 +22,11 @@ from sqlalchemy import delete, text
 from app.core import seed_assets
 from app.core.database import get_session_factory
 from app.crawler.db_writer import DbWriter
-from app.domains.games.models import Game, GameCurrentPrice
+from app.domains.games.models import Game, GameCurrentPrice, GameTag
+
+# 本文件需要真实开发库：导入行为用例依赖存量 games 行判定「跳过/让位」语义，
+# 种子 marker 的清理/重放操作 app_settings——隔离夹具的空临时库给不出这些形态。
+HOLDEXAR_TEST_REAL_DB = True
 
 SYNTHETIC_CUR = "XTS"  # ISO 测试币种，不在任何白名单，误留也会被启动清洗掉
 APPID_A = 997_102
@@ -68,7 +72,7 @@ CREATE TABLE games_catalog (
     appid INTEGER PRIMARY KEY, name TEXT, name_en TEXT, type TEXT,
     header_image TEXT, family_sharing INTEGER, trading_cards INTEGER,
     is_adult INTEGER, is_visual_novel INTEGER, release_date TEXT,
-    genres TEXT, positive_rate INTEGER, positive_reviews INTEGER,
+    positive_rate INTEGER, positive_reviews INTEGER,
     review_count INTEGER, view_count INTEGER, removed_at TEXT,
     free_kind TEXT);
 CREATE TABLE game_current_prices (
@@ -77,6 +81,9 @@ CREATE TABLE game_current_prices (
     price_status TEXT, fail_count INTEGER, cny_fen INTEGER,
     discount_end_ts INTEGER, updated_at TEXT);
 CREATE INDEX ix_seed_gcp_appid ON game_current_prices (appid);
+CREATE TABLE game_tags (
+    appid INTEGER, tagid INTEGER, weight INTEGER,
+    PRIMARY KEY (appid, tagid)) WITHOUT ROWID;
 """
 
 
@@ -90,6 +97,7 @@ def _make_seed(
     history: list[tuple] | None = None,
     games_catalog: list[tuple] | None = None,
     current_prices: list[tuple] | None = None,
+    game_tags: list[tuple] | None = None,
     version: str = SEED_VERSION,
 ) -> Path:
     if path.exists():
@@ -110,7 +118,7 @@ def _make_seed(
             history or [],
         )
         con.executemany(
-            "INSERT INTO games_catalog VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO games_catalog VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             games_catalog or [],
         )
         con.executemany(
@@ -118,15 +126,20 @@ def _make_seed(
             current_prices or [],
         )
         con.executemany(
+            "INSERT INTO game_tags VALUES (?, ?, ?)",
+            game_tags or [],
+        )
+        con.executemany(
             "INSERT INTO seed_meta VALUES (?, ?)",
             [
-                ("schema_version", "5"),
+                ("schema_version", "7"),
                 ("version", version),
                 ("exported_at", version),
                 ("rows_fx_history", str(len(fx_history or []))),
                 ("rows_history", str(len(history or []))),
                 ("rows_games_catalog", str(len(games_catalog or []))),
                 ("rows_current_prices", str(len(current_prices or []))),
+                ("rows_game_tags", str(len(game_tags or []))),
             ],
         )
         con.commit()
@@ -176,6 +189,7 @@ _ALL_MARKER_KEYS = (
     seed_assets.PRESET_MARKER_KEY,
     seed_assets.HISTORY_MARKER_KEY,
     seed_assets.CURRENT_MARKER_KEY,
+    seed_assets.GAME_TAGS_MARKER_KEY,
 )
 
 
@@ -202,6 +216,9 @@ async def _cleanup():
     async with get_session_factory()() as session:
         await session.execute(
             delete(Game).where(Game.appid.in_([APPID_A, APPID_B, APPID_C, APPID_D, APPID_E]))
+        )
+        await session.execute(
+            text(f"DELETE FROM game_tags WHERE appid IN ({APPID_A}, {APPID_B}, {APPID_C}, {APPID_D}, {APPID_E})")
         )
         await session.execute(
             text(f"DELETE FROM game_current_prices WHERE appid IN ({APPID_A}, {APPID_B}, {APPID_C}, {APPID_D}, {APPID_E})")
@@ -806,9 +823,9 @@ async def test_history_merge_backfills_blank_suffix(tmp_path: Path) -> None:
 
 
 def _gc_row(appid: int, name: str) -> tuple:
-    """17 列 games_catalog 种子行（与 export_seed.GC_COLS 同序）。"""
+    """16 列 games_catalog 种子行（与 export_seed.GC_COLS 同序）。"""
     return (
-        appid, name, None, "game", None, 0, 0, 0, 0, None, None,
+        appid, name, None, "game", None, 0, 0, 0, 0, None,
         None, 0, 0, 0, None, None,
     )
 
@@ -819,6 +836,21 @@ def _gcp_row(appid: int, region: str = "CN", price: int = 1000) -> tuple:
         appid, region, "CNY", price, price, 0, 1, "ok", 0, price, None,
         "2026-09-15 08:00:00",
     )
+
+
+async def _tags_local_state(appid: int) -> list[tuple]:
+    """本地 game_tags 现状 [(tagid, weight)]（票重降序，与读取侧同序）。"""
+    async with get_session_factory()() as session:
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT tagid, weight FROM game_tags WHERE appid = :a "
+                    "ORDER BY weight DESC, tagid"
+                ),
+                {"a": appid},
+            )
+        ).all()
+    return [(int(t), int(w)) for t, w in rows]
 
 
 async def _current_local_state(appid: int) -> tuple[dict | None, list]:
@@ -892,6 +924,64 @@ async def test_current_seed_fills_missing_and_yields_to_local(tmp_path: Path) ->
     assert await settings_service.get_value(seed_assets.CURRENT_MARKER_KEY) == SEED_VERSION
     # 幂等：同版本种子二次合并零开销（marker 命中直接返回）
     assert await seed_assets.merge_current_seed(seed) is None
+
+
+@pytest.mark.asyncio
+async def test_game_tags_seed_fills_missing_and_yields_to_local(tmp_path: Path) -> None:
+    """玩家标签合并两口径：本地没抓过的整款补齐 / 本地抓过的整款让位。
+
+    让位必须是**整款**而非逐行：本地 {19,21}、种子 {19,21,122} 逐行 OR IGNORE
+    会并出 122 —— 那是 Steam 早先摘掉的标签被种子复活。
+    """
+    async with get_session_factory()() as session:
+        session.add(Game(appid=APPID_A, name="本地名A", type="game"))
+        session.add(Game(appid=APPID_B, name="本地名B", type="game"))
+        session.add(GameTag(appid=APPID_A, tagid=19, weight=500))
+        session.add(GameTag(appid=APPID_A, tagid=21, weight=300))
+        await session.commit()
+
+    seed = _make_seed(
+        tmp_path / "holdexar_seed.db",
+        game_tags=[
+            (APPID_A, 19, 900),
+            (APPID_A, 21, 800),
+            (APPID_A, 122, 700),
+            (APPID_B, 87918, 600),
+        ],
+    )
+    stats = await seed_assets.merge_game_tags_seed(seed)
+    assert stats == {"tags": 1}
+
+    assert await _tags_local_state(APPID_A) == [(19, 500), (21, 300)]
+    assert await _tags_local_state(APPID_B) == [(87918, 600)]
+
+    from app.domains.settings import service as settings_service
+
+    assert await settings_service.get_value(seed_assets.GAME_TAGS_MARKER_KEY) == SEED_VERSION
+    # 幂等：同版本种子二次合并零开销（marker 命中直接返回）
+    assert await seed_assets.merge_game_tags_seed(seed) is None
+
+
+@pytest.mark.asyncio
+async def test_game_tags_merge_no_table_noop(tmp_path: Path) -> None:
+    """旧种子（schema 6 及以前，无标签表）：合并静默 no-op，不留 marker。"""
+    seed = tmp_path / "holdexar_seed.db"
+    if seed.exists():
+        seed.unlink()
+    con = sqlite3.connect(str(seed))
+    try:
+        con.executescript(
+            "CREATE TABLE seed_meta (key TEXT PRIMARY KEY, value TEXT);"
+            f"INSERT INTO seed_meta VALUES ('version', '{SEED_VERSION}');"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    assert await seed_assets.merge_game_tags_seed(seed) is None
+    from app.domains.settings import service as settings_service
+
+    assert await settings_service.get_value(seed_assets.GAME_TAGS_MARKER_KEY) is None
 
 
 @pytest.mark.asyncio

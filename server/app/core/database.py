@@ -60,8 +60,6 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "diff_fen": "INTEGER DEFAULT 0",
         # smart 排序评分（refresh_sort_cache 维护；NULL=未计算）
         "smart_score": "REAL",
-        # 认知度快照（refresh_sort_cache 维护；见 scoring.py）
-        "steam_board": "BOOLEAN DEFAULT 0",
         # 商店移除监控：下架判定时间戳 + 连续全 404 轮数
         "removed_at": "DATETIME",
         "removed_strikes": "INTEGER DEFAULT 0",
@@ -83,11 +81,22 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         # 同步反向核对免疫——榜单游戏不在 Steam 名单里）
         "board_pool": "BOOLEAN DEFAULT 0",
     },
+    # 告警触发后行为（once=触发即收敛 / cooldown=冷却 / always=持续提醒）
+    "price_alerts": {
+        "repeat_mode": "VARCHAR(10) NOT NULL DEFAULT 'once'",
+        "repeat_hours": "INTEGER NOT NULL DEFAULT 24",
+    },
     # 补抓账本：missing 状态的补抓尝试计数
     # + 促销截止（browse active_discounts 下发，Unix 秒；每轮 UPSERT 跟随最新抓取）
+    # + 尝试观察三元组：每次抓取尝试都留下结果（成功观察 = 拿到 Steam 的明确
+    #   答复，含 locked / 无购买选项；传输类失败 = failed）；last_success_at
+    #   只在成功观察时推进，失败保留旧价与上次成功时刻
     "game_current_prices": {
         "fail_count": "INTEGER DEFAULT 0",
         "discount_end_ts": "INTEGER",
+        "attempt_outcome": "VARCHAR(10)",
+        "steam_answer": "VARCHAR(12)",
+        "last_success_at": "DATETIME",
     },
     # bundle-as-sub 识别标记（版本显示修复）
     # + browse 促销元数据四列（与 browse_store.GPH_EXTRA_COLUMNS 一一对应：
@@ -127,6 +136,10 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
     # 许可证 appid（名称列商店链接提取；家庭库存精确关联用）
     "bill_cdk_games": {
         "appid": "BIGINT",
+    },
+    # 标签英文名（英文界面展示；存量库启动 ALTER 补列，seed_names 回填）
+    "tags": {
+        "name_en": "VARCHAR(100)",
     },
     # 订阅废弃终态（节点状态存储：>95% 不可用 → deprecated）
     "proxy_subscriptions": {
@@ -288,6 +301,28 @@ def _ensure_schema(sync_conn) -> None:
             if name not in existing:
                 sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
 
+    # 观察三元组回填：存量行按 price_status 推导（ok/locked=成功观察并带
+    # last_success_at；其余=失败态）。WHERE attempt_outcome IS NULL 保证幂等。
+    gcp_cols = {
+        row[1]
+        for row in sync_conn.execute(
+            text("PRAGMA table_info(game_current_prices)")
+        ).fetchall()
+    }
+    if "attempt_outcome" in gcp_cols:
+        sync_conn.execute(
+            text(
+                "UPDATE game_current_prices SET "
+                "attempt_outcome = CASE WHEN price_status IN ('ok', 'locked') "
+                "  THEN 'success' ELSE 'failed' END, "
+                "steam_answer = CASE price_status WHEN 'ok' THEN 'ok' "
+                "  WHEN 'locked' THEN 'locked' ELSE NULL END, "
+                "last_success_at = CASE WHEN price_status IN ('ok', 'locked') "
+                "  THEN updated_at ELSE NULL END "
+                "WHERE attempt_outcome IS NULL"
+            )
+        )
+
     for table, statements in _TABLE_EXTRA_INDEXES.items():
         has_table = sync_conn.execute(
             text("SELECT 1 FROM sqlite_master WHERE type='table' AND name=:t"), {"t": table}
@@ -304,7 +339,7 @@ def _ensure_schema(sync_conn) -> None:
 #   2. _MIGRATIONS 追加 (版本号, 描述, SQL 列表)；SQL 须幂等（中断续跑 +
 #      用户库版本乱序防御），复杂逻辑可登记 async fn(engine) 同位元素
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # 零小数货币（Steam 以整数计价）：旧捆绑包链路的除数表按 1 处理，与「统一存分」
 # 的新约定差 100 倍——v2 归一的目标集合
@@ -809,6 +844,23 @@ async def _migrate_cycle_coverage_snapshot(conn) -> None:
         )
 
 
+async def _migrate_player_tags(conn) -> None:
+    """v12：玩家标签接替粗粒度 genres —— 删掉 games.genres 列。
+
+    标签两表（game_tags / tags）由模型经 create_all 建，无需版本步；这里只做
+    结构性删除。旧列来自 appdetails 链路，写入者已不存在，数据停在 12.9%
+    覆盖率且永不再增长，删除不损失在产数据。
+
+    带 PRAGMA 守卫：全新库的 games 本就没有该列（模型已移除），重放与续跑
+    都安全。SQLite 的 DROP COLUMN 需 3.35+（Python 3.13 自带 3.45）。
+    """
+    from sqlalchemy import text
+
+    cols = await conn.execute(text("PRAGMA table_info(games)"))
+    if "genres" in {row[1] for row in cols}:
+        await conn.execute(text("ALTER TABLE games DROP COLUMN genres"))
+
+
 # (目标版本, 说明, 迁移体)：迁移体 = SQL 语句列表，或 async callable(engine)
 _MIGRATIONS: list[tuple[int, str, object]] = [
     (2, "bundle_region_prices 零小数货币单位归一（元→分 + cny_fen 去虚高）",
@@ -855,6 +907,9 @@ _MIGRATIONS: list[tuple[int, str, object]] = [
          "卡片覆盖改读快照——当前价表行随周期外写入滚动覆盖，旧轮窗口在活表上"
          "不可复现，按窗口现算会把已收敛轮的覆盖率算成假塌陷）",
      _migrate_cycle_coverage_snapshot),
+    (12, "玩家标签接替 genres：删除 games.genres（旧 appdetails 链路的粗粒度大类，"
+         "写入者已删除、覆盖率停在 12.9%；标签两表由模型 create_all 建）",
+     _migrate_player_tags),
 ]
 
 
@@ -1029,6 +1084,11 @@ async def init_db() -> None:
         if existing is None:
             session.add(FxRate(currency_code="CNY", rate_to_cny=1.0))
             await session.commit()
+
+    # 标签中文名底座：内置热门标签表落库（零请求；冷门 tagid 由爬取侧懒请求兜底）
+    from app.domains.games import tags as tags_service
+
+    await tags_service.seed_names()
 
 
 @lru_cache
