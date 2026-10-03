@@ -112,3 +112,53 @@ def _db_caches_fresh_before_each(_sanitize_db_lru_caches):
     database_module.get_engine.cache_clear()
     database_module.get_session_factory.cache_clear()
     database_module.get_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_data_dir(request, _db_caches_fresh_before_each):
+    """默认把数据目录隔离进一次性临时目录：任何漏桩的域模块落库都落进
+    空临时库（表不存在即响亮报错），「测试写生产库」从结构上不可能，
+    而不是依赖每个测试文件自觉打全桩（与 `_block_outbound_smtp` 同一设计：
+    桩打在公共层，漏桩的最坏后果是测试自己失败，不是污染真实数据）。
+
+    真实库用例在模块级声明 `HOLDEXAR_TEST_REAL_DB = True` 显式豁免。
+    豁免按文件作用域经 `request.module` 读取，不走环境变量：进程全局的
+    环境变量一旦被某个文件设置，会给同进程其后所有文件静默关掉隔离。
+    豁免的含义是「本文件声明要对真实库断言」，不是漏桩的遮羞布。临时
+    目录随 teardown 删除；环境变量与工厂缓存一并还原，防向后续用例外溢。
+    """
+    import tempfile
+
+    # 测试内 monkeypatch 与本夹具对同一环境变量的还原顺序随文件内夹具结构
+    # 变化，上个用例可能留下指向已删临时目录的孤儿值——每个用例 setup 先
+    # 自愈清掉本家族残留，豁免用例才不会继承死路径。
+    stale = os.environ.get("HOLDEXAR_DATA_DIR", "")
+    if stale.startswith(os.path.join(tempfile.gettempdir(), "holdexar-test-data-")):
+        os.environ.pop("HOLDEXAR_DATA_DIR", None)
+
+    if getattr(request.module, "HOLDEXAR_TEST_REAL_DB", False) is True:
+        yield
+        return
+    import shutil
+
+    from app.core import database as database_module
+
+    # 先抓原函数再清：teardown 时刻模块属性可能仍被本用例夹具的假件占据
+    # （手动 setattr 的夹具晚于本夹具还原），只有原对象保证带 cache_clear
+    orig_engine = database_module.get_engine
+    orig_factory = database_module.get_session_factory
+    orig_settings = database_module.get_settings
+    old = os.environ.get("HOLDEXAR_DATA_DIR")
+    tmp_dir = tempfile.mkdtemp(prefix="holdexar-test-data-")
+    os.environ["HOLDEXAR_DATA_DIR"] = tmp_dir
+    orig_engine.cache_clear()
+    orig_factory.cache_clear()
+    orig_settings.cache_clear()
+    yield
+    os.environ.pop("HOLDEXAR_DATA_DIR", None)
+    if old is not None:
+        os.environ["HOLDEXAR_DATA_DIR"] = old
+    orig_engine.cache_clear()
+    orig_factory.cache_clear()
+    orig_settings.cache_clear()
+    shutil.rmtree(tmp_dir, ignore_errors=True)
