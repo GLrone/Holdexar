@@ -1,29 +1,12 @@
-"""P1.7 bootstrap：把「订阅 → Snapshot → Registry → Pool → Runtime」串起来的最小幂等原语。
-
-职责只有一个：
-
-> **没有可用 Runtime 时，把这条链第一次建起来。**
-
-因此它与 rebuild 是**两个语义**，不合并成 `ensure_everything()`：
-
-- `ensure_pool_runtime()`：Runtime 根本还没有 / 池刚产生；
-- `request_rebuild()` / `rebuild_runtime()`：Runtime 已存在，因池变化而重建。
-
-**幂等的严格定义**：不是"文件存在就算已有"，而是"池非空 + 入口在听 + controller 可访问
-+ 对账通过"才算 ready；否则重新 bootstrap。
-
-**single-flight**：生产有两个调用点（启动链、订阅刷新），两者可能同时认为"Runtime 不存在"。
-进程内一把锁保证只有一个调用者真正执行 bootstrap，第二个等锁后重新检查——不引入
-`RuntimeLease`，也不落任何持久化状态。
-
-**失败语义**：无订阅 / 任一步失败 → Runtime 不可用 → crawler 保持 fail-closed（P1.6-C），
-不退旧订阅代理、不退直连；下一个既有调度周期再试。**不新增 `BOOTSTRAP_FAILED` 状态**——
-失败是一次操作结果，不是状态资产。
-
-**数据语义**：`ProxyNodeSource.subscription_id` 就是 `proxy_subscriptions.id`（与既有
-`clash_nodes.subscription_id` 同一约定）；`subscription_snapshots.sha256` 是快照身份的
-**唯一事实源**，`proxy_subscriptions.snapshot_sha256` 只是"最近一次成功快照"的**投影**，
-且**只在快照落库成功之后**回写。
+"""bootstrap：订阅 → Snapshot → Registry → Pool → Runtime 的首次建立，幂等原语。
+与 rebuild 是两个语义不合并：ensure_pool_runtime=Runtime 还没有；request_rebuild/
+rebuild_runtime=已存在因池变化重建。幂等严格定义：池非空+入口在听+controller
+可访问+对账通过才 ready。single-flight：生产两个调用点（启动链/订阅刷新），
+进程内一把锁串行，第二个等锁后重查，不落持久化状态。失败语义：无订阅或任一步
+失败 → Runtime 不可用 → crawler fail-closed，不退旧订阅代理不退直连，下个调度
+周期再试；不新增 BOOTSTRAP_FAILED 状态（失败是操作结果不是状态资产）。
+数据语义：snapshot sha256 唯一事实源在 subscription_snapshots.sha256，订阅行上
+的 snapshot_sha256 只是投影，且仅在快照落库成功后回写。
 """
 from __future__ import annotations
 

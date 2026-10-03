@@ -1,29 +1,12 @@
 """account 域登录会话续期：steamLoginSecure 有效期解析与刷新。
-
-Steam 登录 Cookie 串里两枚令牌决定登录态还能用多久：
-
-- `steamLoginSecure` = `<steamid64>||<access JWT>`：寿命约 24 小时的访问令牌，
-  钱包 / 愿望单 / 已购 / 账单 / 家庭组 / CDK 激活等一切登录态请求都用它；
-- `steamRefresh_steam` = `<steamid64>||<refresh JWT>`：长命续期凭据，登录时
-  勾选「记住我」由 Steam 下发。浏览器能长期保持登录态，靠的就是它每次访问
-  Steam 页面时换一张新的访问令牌。
-
-访问令牌一旦过期，Steam 对所有登录态请求一律按未登录处理。本模块按 JWT 的
-exp 判断剩余寿命，临期或过期时用续期凭据换一组新的 web Cookie（Steam Web
-前端同款两跳）：
-
-    POST https://login.steampowered.com/jwt/finalizelogin → {transfer_info: [...]}
-    POST <transfer_info[].url>（表单带 steamID + params） → Set-Cookie: steamLoginSecure
-
-令牌按域签发：finalizelogin 会为 store / community / help / checkout / steam.tv
-各发一枚 aud 不同的 steamLoginSecure（web:store / web:community / …），互不通用。
-本应用入库口径取 **store 域令牌**（与手贴浏览器商店 Cookie 一致）——现有全部
-Cookie 消费点都在 store 与 api.steampowered.com（api 接受 store 令牌作
-access_token）；若未来出现 community 域登录态消费点，须经 finalizelogin 的
-community settoken 单独取令牌，不得复用 store 令牌。
-
-exp 只用于本地判断「要不要提前续期」，不做签名校验——令牌真伪由 Steam 在
-实际请求时判定。
+两枚令牌：steamLoginSecure=<steamid>||<access JWT>（约 24h，一切登录态请求用）；
+steamRefresh_steam=<steamid>||<refresh JWT>（长命，勾选记住我时下发）。
+按 JWT exp 判剩余寿命，临期/过期用续期凭据换新 web Cookie：POST
+jwt/finalizelogin → POST transfer_info[].url 取 Set-Cookie。令牌按域签发
+（store/community/help/checkout/steam.tv 各一枚互不通用）；本应用取 **store
+域令牌**（全部消费点在 store 与 api.steampowered.com）；未来若出现 community
+消费点须经其 settoken 单独取令牌，不得复用 store 令牌。exp 只做本地提前续期
+判断，不验签——真伪由 Steam 实际请求判定。
 """
 from __future__ import annotations
 

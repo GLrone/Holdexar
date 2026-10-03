@@ -1,31 +1,12 @@
-"""池内核容量探测器：阶梯压测「本机 mihomo + lane 架构能稳定承载多少条 lane」。
-
-探测器用**与生产完全相同的 Runtime 架构**（每条 lane = 一个 `lane-<i>` select 组 +
-一个 mixed listener，listener 的 `proxy` 指向该组），对每个档位 N：
-
-1. 独立临时目录渲染 N lane 配置，拉起**自己的**内核实例（与生产内核互不触碰，
-   配置路径隔离，`ClashRuntime._kill_orphans` 只按本档配置路径清理）；
-2. 等全部 listener 监听就绪（部分就绪即该档失败）；
-3. 逐 lane 经控制器绑定节点（`assign_lanes` 回读确认）；
-4. 全部 lane 并行、每条 lane 串行地发请求（生产 worker 与 lane 一对一同构），
-   采集成功率 / 超时 / 串出口 / 延迟分位 / 内核 CPU 与内存；
-5. 按稳定判据（`CapacityCriteria` + `evaluate_run`）判档，梯度爬升，
-   连续两档失败即停，最后对通过档做持续负载 soak 确认。
-
-产出 `CapacityReport`：理论容量（listener 全就绪的最高档）、验证容量
-（ladder + soak 双过的最高档）、建议生产上限（验证容量 × 安全系数）。
-报告为 JSON，落在数据目录 `proxypool/capacity/` 下，不入库。
-
-三种模式（`mode`）：
-- `nodes`：lane 绑出口槽代表节点，目标为出口 IP 回显——测生产同构链路的容量，
-  并按「lane 的出口 IP 必须与自己首次观测一致」判串出口；
-- `direct`：lane 全部绑 DIRECT（lane 组成员里前置 DIRECT）——排除代理链路，
-  测内核与本机资源的裸容量；
-- `steam`：lane 绑出口槽，目标为 Steam 商店轻量端点——真实业务面的末轮验证，
-  单独发起 429 计数（限流属服务端行为，不计入内核容量成败）。
-
-本模块的请求并发由探测器自驱，不走统一 worker 池：并发数 N 正是被测
-变量，接入 worker 池会把并发钳在生产上限以内，测量即失效。
+"""池内核容量探测器：阶梯压测本机 mihomo + lane 架构的稳定承载档位。
+用与生产完全同构的 Runtime（lane 组 + listener）逐档：临时目录渲染配置拉起
+独立内核（`_kill_orphans` 只按本档配置路径清理）→ listener 全就绪 → 绑节点
+确认 → 全 lane 并行发请求采集成功率/串出口/延迟分位/CPU 内存 → 按
+CapacityCriteria 判档，连续两档失败停，通过档 soak 确认。产出 CapacityReport
+（理论/验证/建议上限三数字），JSON 落数据目录 proxypool/capacity/，不入库。
+模式：nodes=生产同构链路（出口 IP 一致性判串线）；direct=全 DIRECT 测内核
+裸容量（须 --target-url 直连可达目标）；steam=商店轻端点（429 单列不计成败）。
+请求并发由探测器自驱、不接统一 worker 池——并发数 N 是被测变量，接池即失效。
 """
 from __future__ import annotations
 
