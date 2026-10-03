@@ -1,35 +1,12 @@
-"""价格事实事件（Price Event）：本轮观察相对此前有效观察发生了什么变化。
-
-Observation = 本轮实际观察到了什么（`game_price_history` / `game_current_prices`）；
-Event = 这次观察相对此前有效状态发生的变化（`price_events` 一行）。两者不混用：
-「RU = 99 RUB」是观察，「上一有效价 199 → 本次 99」才是事件。
-
-事件在 Cycle finalizing 阶段统一检测，建立在本轮**最终有效结果**之上，不由各个
-CrawlJob 自己产生——否则「本轮暂时失败、随后补抓成功」的单元会先报
-PRICE_UNAVAILABLE 再报 PRICE_RESTORED。各类型的判据见对应检测段的注释。
-
-三条判定前提：
-
-1. **未观察不产生事件**：该单元在本轮窗口内没有任何结果（`unobserved`）时一律
-   跳过——「没抓到」推不出「价格不可用」。
-2. **只认变化**：当前值与上一有效观察相同时不产生事件。`hl_flag` / `pp_flag` /
-   `free_kind` / `removed_at` / `price_status` 都是持续量，按当前值机械生成会
-   每轮重复。
-3. **上一有效观察来自持久证据**：价格类用 `game_price_history`（INSERT-only）。
-   状态类没有历史行（`mark_region_status` 只 UPSERT 当前表），故用「本表最近一条
-   状态事件」+「窗口前存在有效快照 ⇒ 当时为 ok」作为上一状态；两者都拿不到
-   （首次观察的新单元）时不产生状态事件。
-
-价格比较用**该区货币的 `price`**，不用 `cny_fen`——后者会把汇率波动误判成价格
-变化；0 价（促销/永久免费）不参与涨跌判定，它属于 FREE_PROMO 的语义。
-
-`region_code` 为 NULL 表示该事件由游戏级对象表达（`free_kind` / `removed_at`
-存在 `games` 上），不属于单一区域；不拿 NULL 表示「没判断」。历史低价与永降按
-CN 标准版判定（与 `hl_flag` / `pp_flag` 的计算对象一致），其 `region_code` 为 CN。
-
-本轮结果窗口与 Coverage 同口径：`[cycle.started_at, cycle.finished_at]`
-（未收敛取当前时刻）。窗口内并行的 5min repair / 手动抓取区分不出来源，
-来源不明的结果不额外制造事件。
+"""价格事实事件（Price Event）：本轮观察相对此前有效观察的变化，一行一事件。
+检测在 Cycle finalizing 统一做（建立在最终有效结果上，不由各 job 自产——防
+「暂时失败→补抓成功」误报成对）。判定前提：①未观察不产生事件（没抓到推不出
+不可用）；②只认变化（hl_flag/pp_flag 等持续量按当前值机械生成会每轮重复）；
+③上一有效观察取持久证据——价格用 INSERT-only 的 game_price_history，状态类
+用本表最近一条状态事件+窗口前有效快照，首次观察不产生。价格比较用该区货币
+price 不用 cny_fen（防汇率波动误判），0 价归 FREE_PROMO。region_code=NULL=
+游戏级对象（free_kind/removed_at），历史低价/永降按 CN 标准版判定。结果窗口
+与 Coverage 同口径 [started_at, finished_at]，窗口内并行的 repair/手动来源不分。
 """
 from __future__ import annotations
 
@@ -84,7 +61,7 @@ class PriceEvent(Base):
     __tablename__ = "price_events"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    # 事件发生在哪一轮（Cycle 是一级归属）
+    # 事件归属：>0 挂轮执行（PriceCycle.id）；<0 非周期执行（-job_id）
     cycle_id: Mapped[int] = mapped_column(Integer)
     appid: Mapped[int] = mapped_column(Integer)
     # NULL = 该事件由游戏级对象表达，不属于单一区域
@@ -131,6 +108,29 @@ async def detect(cycle_id: int) -> list[dict]:
 
     appids = [int(a) for a in (expected.get("appids") or [])]
     regions = {str(r).strip().lower() for r in (expected.get("regions") or [])}
+    if not appids or not regions:
+        return []
+    return await detect_window(appids, regions, started_at, window_end, cycle_id)
+
+
+async def detect_window(
+    appids: list[int],
+    regions,
+    window_start: datetime,
+    window_end: datetime,
+    cycle_id: int,
+) -> list[dict]:
+    """把窗口内观察相对历史的变化写成事件（幂等：重复调用不新增行）。
+
+    检测逻辑只有这一份，两种调用方共用：挂轮执行走 `detect`（窗口=Cycle
+    冻结期望集与起止时刻）；非周期执行（手动单发 / 补抓拍，job 无 Cycle）
+    直接给本 job 的对象集、区服与起止时刻。`cycle_id` 是事件归属键的组成
+    部分：>0 挂轮；<0 = 非周期执行（-job_id）——不同执行各自成键，同一
+    事实不会因跨执行重检而重复落行。
+    """
+    started_at = window_start
+    appids = [int(a) for a in appids]
+    regions = {str(r).strip().lower() for r in (regions or [])}
     if not appids or not regions:
         return []
 
