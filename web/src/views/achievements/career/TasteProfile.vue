@@ -23,27 +23,27 @@ const { t } = useI18n()
 
 const taste = computed(() => props.career.taste)
 
-/* ── 类型偏好（条形榜）── */
-const GENRE_COLORS = [PALETTE.sky, PALETTE.blue, PALETTE.violet, PALETTE.pink, PALETTE.orange, PALETTE.teal, PALETTE.lime, PALETTE.iris]
-const GENRE_MAX = 8
+/* ── 标签偏好（条形榜）── */
+const TAG_COLORS = [PALETTE.sky, PALETTE.blue, PALETTE.violet, PALETTE.pink, PALETTE.orange, PALETTE.teal, PALETTE.lime, PALETTE.iris]
+const TAG_MAX = 8
 
-const genres = computed(() => {
-  const list = taste.value.genres.slice(0, GENRE_MAX)
+const tagRanks = computed(() => {
+  const list = taste.value.tags.slice(0, TAG_MAX)
   const max = Math.max(1, ...list.map((g) => g.playtimeMin))
   return list.map((g, i) => ({
     ...g,
     pct: Math.round((g.playtimeMin / max) * 100),
-    color: GENRE_COLORS[i % GENRE_COLORS.length],
+    color: TAG_COLORS[i % TAG_COLORS.length],
   }))
 })
 
-/* ── 类型雷达（SVG 手绘）── */
+/* ── 标签雷达（SVG 手绘）── */
 const RADAR_R = 82
 const RADAR_CX = 104
 const RADAR_CY = 104
 
 const radar = computed(() => {
-  const list = taste.value.genres.slice(0, 6)
+  const list = taste.value.tags.slice(0, 6)
   const n = list.length
   if (n < 3) return null
   const max = Math.max(1, ...list.map((g) => g.playtimeMin))
@@ -62,7 +62,7 @@ const radar = computed(() => {
     }).join(' '),
   )
   const spokes = list.map((_, i) => at(i, 1))
-  const dots = list.map((g, i) => ({ ...at(i, g.playtimeMin / max), genre: g.genre, games: g.games }))
+  const dots = list.map((g, i) => ({ ...at(i, g.playtimeMin / max), tag: g.tag, games: g.games }))
   return {
     n,
     rings,
@@ -71,7 +71,7 @@ const radar = computed(() => {
     shape: dots.map((d) => `${d.x.toFixed(1)},${d.y.toFixed(1)}`).join(' '),
     labels: list.map((g, i) => {
       const p = at(i, 1.16)
-      return { x: p.x, y: p.y, text: g.genre }
+      return { x: p.x, y: p.y, text: g.tag }
     }),
   }
 })
@@ -80,7 +80,7 @@ const radar = computed(() => {
 function topRows(rows: CareerTasteRow[], limit: number) {
   const max = Math.max(1, ...rows.slice(0, limit).map((r) => r.playtimeMin))
   return rows.slice(0, limit).map((r) => ({
-    name: r.name ?? r.genre ?? '',
+    name: r.name ?? r.tag ?? '',
     games: r.games,
     playtimeMin: r.playtimeMin,
     platinum: r.platinum,
@@ -129,14 +129,14 @@ const newest = computed(() => taste.value.newestGame)
         <div class="cr-head">
           <span class="cr-head-title">
             <HlIcon name="layers" />
-            {{ t('achievements.career.taste.genreTitle') }}
+            {{ t('achievements.career.taste.tagTitle') }}
           </span>
-          <span class="cr-head-hint">{{ t('achievements.career.taste.genreHint') }}</span>
+          <span class="cr-head-hint">{{ t('achievements.career.taste.tagHint') }}</span>
         </div>
-        <div v-if="genres.length" class="hl-stagger" v-stagger>
-          <div v-for="g in genres" :key="g.genre" class="cr-rank">
+        <div v-if="tagRanks.length" class="hl-stagger" v-stagger>
+          <div v-for="g in tagRanks" :key="g.tag" class="cr-rank">
             <div class="cr-rank-top">
-              <span class="cr-rank-name">{{ g.genre }}</span>
+              <span class="cr-rank-name">{{ g.tag }}</span>
               <span class="cr-rank-meta">
                 <span class="hl-num">{{ fmtHours(g.playtimeMin, t) }}</span>
                 <span>{{ t('achievements.career.taste.games', { n: g.games }) }}</span>
@@ -210,7 +210,7 @@ const newest = computed(() => taste.value.newestGame)
       <div class="cr-card">
         <div class="cr-head">
           <span class="cr-head-title">{{ t('achievements.career.taste.devTitle') }}</span>
-          <span class="cr-head-hint">{{ t('achievements.career.taste.genreHint') }}</span>
+          <span class="cr-head-hint">{{ t('achievements.career.taste.tagHint') }}</span>
         </div>
         <div v-for="d in developers" :key="d.name" class="cr-rank">
           <div class="cr-rank-top">
@@ -232,7 +232,7 @@ const newest = computed(() => taste.value.newestGame)
       <div class="cr-card">
         <div class="cr-head">
           <span class="cr-head-title">{{ t('achievements.career.taste.pubTitle') }}</span>
-          <span class="cr-head-hint">{{ t('achievements.career.taste.genreHint') }}</span>
+          <span class="cr-head-hint">{{ t('achievements.career.taste.tagHint') }}</span>
         </div>
         <div v-for="d in publishers" :key="d.name" class="cr-rank">
           <div class="cr-rank-top">
@@ -254,7 +254,7 @@ const newest = computed(() => taste.value.newestGame)
       <div class="cr-card">
         <div class="cr-head">
           <span class="cr-head-title">{{ t('achievements.career.taste.seriesTitle') }}</span>
-          <span class="cr-head-hint">{{ t('achievements.career.taste.genreHint') }}</span>
+          <span class="cr-head-hint">{{ t('achievements.career.taste.tagHint') }}</span>
         </div>
         <div v-for="d in series" :key="d.name" class="cr-rank">
           <div class="cr-rank-top">

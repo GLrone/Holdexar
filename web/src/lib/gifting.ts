@@ -65,6 +65,58 @@ export function giftPayAmountFen(
     : senderPriceCnyFen
 }
 
+export interface GiftMatch {
+  code: string
+  cnyFen: number
+}
+
+type PriceMatrix = Record<string, [string, number, number, unknown]>
+
+/** 送礼筛选两模式的共同判据：收礼侧区价 ≤ 送礼侧区价 ×1.15——付款双轨里
+ *  落在「按送礼方区价实付」的划算轨道（超出即 isReceiverPriced 的收礼方价轨）。
+ *  与后端 _gift_exists（GIFT_TRACK_BAND）同式同源，改动必须两处同步。 */
+export function onSenderTrack(
+  senderPriceCnyFen: number | null | undefined,
+  receiverPriceCnyFen: number | null | undefined,
+): boolean {
+  return (
+    senderPriceCnyFen != null &&
+    receiverPriceCnyFen != null &&
+    senderPriceCnyFen > 0 &&
+    receiverPriceCnyFen > 0 &&
+    !isReceiverPriced(senderPriceCnyFen, receiverPriceCnyFen)
+  )
+}
+
+/** 模式一（我送出）：固定送礼方，选目标里命中判据的集合（区价升序）。 */
+export function qualifyingTargets(
+  matrix: PriceMatrix,
+  senderCode: string,
+  targetCodes: string[],
+): GiftMatch[] {
+  const senderFen = matrix[senderCode.toUpperCase()]?.[1] ?? 0
+  if (senderFen <= 0) return []
+  return targetCodes
+    .filter((c) => c.toUpperCase() !== senderCode.toUpperCase())
+    .map((c) => ({ code: c, cnyFen: matrix[c.toUpperCase()]?.[1] ?? 0 }))
+    .filter((m) => onSenderTrack(senderFen, m.cnyFen))
+    .sort((a, b) => a.cnyFen - b.cnyFen)
+}
+
+/** 模式二（送给我）：固定收礼方，其余有价区全量遍历出的可用送礼来源（区价升序）。 */
+export function qualifyingSources(
+  matrix: PriceMatrix,
+  receiverCode: string,
+): GiftMatch[] {
+  const receiverFen = matrix[receiverCode.toUpperCase()]?.[1] ?? 0
+  if (receiverFen <= 0) return []
+  return Object.entries(matrix)
+    .map(([code, cell]) => ({ code: code.toLowerCase(), cnyFen: cell[1] }))
+    .filter((m) => m.code !== receiverCode.toLowerCase())
+    .filter((m) => onSenderTrack(m.cnyFen, receiverFen))
+    .sort((a, b) => a.cnyFen - b.cnyFen)
+}
+
 export interface GiftingRegionRow extends RegionPriceInfo {
   /** 该笔赠送实付（分） */
   payFen: number

@@ -107,12 +107,13 @@ const cycleDigest = computed(() => {
   }
 })
 
-// 价格周期收敛 → 摘要随新数据重算（先失效缓存再重拉：cycles / price-events 都在
+// 价格数据版本推进（周期收敛 / 任务终态，含无 Cycle 的手动与补抓任务）
+// → 摘要随新数据重算（先失效缓存再重拉：cycles / price-events 都在
 // 60s 时间窗缓存里，不失效就会把刚结束的一轮读成上一轮）
 watch(
-  () => crawlStore.priceCycle?.cycleId ?? null,
-  (cycleId) => {
-    if (cycleId === null) return
+  () => crawlStore.dataEpoch,
+  (epoch) => {
+    if (epoch === 0) return
     invalidateGetCache('/crawl')
     loadCycleDigest()
   },

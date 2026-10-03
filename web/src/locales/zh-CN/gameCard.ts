@@ -76,6 +76,10 @@ const gameCard = {
   /* ── 价格数据状态（观察时间 / 新鲜度 / 本轮覆盖）──
      锁区、抓取失败、本轮没结果三者措辞必须分开：锁区不是失败，
      没结果也不等于价格不可用。 */
+  /* 送礼分析行（游戏库送礼筛选激活时逐卡展示） */
+  'gameCard.gift.sources': '可送来源',
+  'gameCard.gift.targets': '可送目标',
+
   'gameCard.priceData.label': '价格数据',
   'gameCard.priceData.justNow': '刚刚更新',
   'gameCard.priceData.minutesAgo': '{n} 分钟前',
@@ -83,12 +87,10 @@ const gameCard = {
   'gameCard.priceData.daysAgo': '{n} 天前',
   'gameCard.priceData.none': '尚无价格数据',
   'gameCard.priceData.coveragePartial': '覆盖 {ok}/{expected}，未完整',
-  'gameCard.priceData.tip.locked': '{n} 个地区不售卖（锁区）',
-  'gameCard.priceData.tip.failed': '{n} 个地区暂时没拿到，稍后自动重试',
-  'gameCard.priceData.tip.unobserved': '{n} 个地区还在获取中',
-  'gameCard.priceData.tipRegion.locked': '{region}：不售卖（锁区）',
-  'gameCard.priceData.tipRegion.failed': '{region}：暂时没拿到，稍后自动重试',
-  'gameCard.priceData.tipRegion.unobserved': '{region}：还在获取中',
+  'gameCard.priceData.tipRegion.failed': '{region}：本次抓取失败，稍后自动重试',
+  'gameCard.priceData.tipRegion.failedStale':
+    '{region}：本次抓取失败，展示的是 {time} 的数据',
+  'gameCard.priceData.tipRegion.notAttempted': '{region}：还没抓过',
 
   /* ── 卡片操作行（regionPrice.title 与 GPW 弹窗小标题同条）── */
   'gameCard.regionPrice.title': '全区价格',
@@ -101,6 +103,7 @@ const gameCard = {
 
   /* ── 地区格状态（列表 tab 与柱状图 tab 共用）── */
   'gameCard.region.unavailableTip': '该地区价格未成功更新（爬虫抓取失败），等待下轮补抓',
+  'gameCard.region.staleTip': '本次抓取失败，展示的是上次成功抓到的价格',
   'gameCard.region.clickGiftTip': '点击查看赠礼分析',
   'gameCard.region.pending': '待更新',
   'gameCard.region.locked': '锁区',

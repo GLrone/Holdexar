@@ -43,7 +43,7 @@ const famWish = {
   'famWish.empty.loading': '家庭愿望单聚合中…',
   'famWish.empty.noData': '暂无愿望单数据——家庭成员同步愿望单后展示（监控池页可手动同步）',
   'famWish.empty.noMemberData': '暂无成员数据',
-  'famWish.empty.noGenreData': '暂无类型数据',
+  'famWish.empty.noTagData': '暂无标签数据',
   'famWish.empty.noMatch': '没有匹配的愿望单游戏',
 
   /* 工具栏 */
@@ -53,7 +53,7 @@ const famWish = {
 
   /* 左栏三张图 */
   'famWish.chart.memberDist': '成员愿望单分布',
-  'famWish.chart.topTags': '热门类型 TOP 8',
+  'famWish.chart.topTags': '热门标签 TOP 8',
   'famWish.chart.priceBands': '价格区间分布',
   'famWish.donut.total': '总数',
 

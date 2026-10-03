@@ -63,6 +63,9 @@ const crawl = {
      仍是当前任务段的实时计数。速度按批次/分钟显示 */
   'crawl.progress.meta':
     '已处理 {done}/{total} · 成功 {ok} · 失败 {fail} · 队列 {qsize} · {speed} 批/分',
+  /* 预计结束时刻（{time} 走 format.ts 的时:分出口：zh-CN `14:30` / en-US `02:30 PM`）；
+     速度未知或剩余量已跑完时整段不出现 */
+  'crawl.progress.eta': '预计 {time} 结束',
 
   /* 系统侧活动（不是任务，任务列表看不到） */
   'crawl.sys.starting': '正在启动任务：后端在登记队列与排定出口，稍等片刻',

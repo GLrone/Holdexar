@@ -6,6 +6,7 @@ import {
   gamesApi,
   invalidateGetCache,
   type GameDetail,
+  type GameTag,
   type HistoryPayload,
   type PriceEventItem,
 } from '@/api/client'
@@ -21,6 +22,7 @@ import {
 } from '@/lib/priceEvents'
 import { selectableVariants, versionSelectOptions } from '@/lib/versions'
 import { useCrawlStatusStore } from '@/stores/crawlStatus'
+import { useLocaleStore } from '@/stores/locale'
 import { usePilotStore } from '@/stores/pilot'
 import { useRegionsStore } from '@/stores/regions'
 import { useI18n, useLocaleFormat, type MessageKey } from '@/locales'
@@ -52,6 +54,7 @@ interface RegionRow {
 const route = useRoute()
 const router = useRouter()
 const regionsStore = useRegionsStore()
+const localeStore = useLocaleStore()
 // 千分位与时间随界面语言（fmt 内部现读 locale，切语言即重渲染，见 locales/format.ts）
 const fmt = useLocaleFormat()
 const { t } = useI18n()
@@ -218,13 +221,11 @@ const ppTagVisible = computed(() => {
   return isPermChangeRecent(d.ppChangedAt)
 })
 
-// ── 侧栏类型标签 ──
-const genresList = computed(() =>
-  (detail.value?.genres ?? '')
-    .split(',')
-    .map((g) => g.trim())
-    .filter(Boolean),
-)
+// ── 侧栏热门标签 ──
+const tagList = computed(() => detail.value?.tags ?? [])
+/* 标签按界面语言取名：英文界面用英文名，缺失回退中文名 */
+const tagText = (tag: GameTag) =>
+  localeStore.locale === 'en' ? tag.nameEn || tag.name : tag.name
 
 // 全版本浏览在卡片走势抽屉「全部版本」区块；本页走势按
 // component-framework.html 模块 F 权威模版：Steam 价 + Key 店走线 + 史低平线
@@ -465,11 +466,12 @@ async function refreshAfterCycle() {
   await loadEvents()
 }
 
-// 价格周期收敛 → 价格数据与事件面一起刷新（P6-A 的刷新链在这里续到事件面）
+// 价格数据版本推进（周期收敛 / 任务终态，含无 Cycle 的手动与补抓任务）
+// → 价格数据与事件面一起刷新（P6-A 的刷新链在这里续到事件面）
 watch(
-  () => crawl.priceCycle?.cycleId ?? null,
-  (cycleId) => {
-    if (cycleId !== null) refreshAfterCycle()
+  () => crawl.dataEpoch,
+  (epoch) => {
+    if (epoch > 0) refreshAfterCycle()
   },
 )
 watch(appid, () => loadEvents())
@@ -644,10 +646,10 @@ onMounted(load)
             </div>
           </div>
 
-          <div v-if="genresList.length" class="gd-info-section">
-            <div class="gd-info-title">{{ t('gameDetail.info.genres') }}</div>
+          <div v-if="tagList.length" class="gd-info-section">
+            <div class="gd-info-title">{{ t('gameDetail.info.tags') }}</div>
             <div class="gd-info-tags">
-              <span v-for="g in genresList" :key="g" class="gd-info-tag">{{ g }}</span>
+              <span v-for="g in tagList" :key="g.tagid" class="gd-info-tag">{{ tagText(g) }}</span>
             </div>
           </div>
 

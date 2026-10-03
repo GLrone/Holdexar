@@ -59,12 +59,12 @@ const accountBars = computed(() => {
   }))
 })
 
-/* ── 类型分布：每款游戏的主类型（第一个标签），top 8 ── */
-const genreBars = computed(() => {
+/* ── 标签分布：每款游戏的首个热门标签（票重最高），top 8 ── */
+const tagBars = computed(() => {
   const counts = new Map<string, number>()
   for (const g of store.games) {
-    const genre = (g.genres || '').split(',')[0]?.trim() || ''
-    const key = genre || '__unknown__'
+    const tag = g.tags[0]?.name || ''
+    const key = tag || '__unknown__'
     counts.set(key, (counts.get(key) ?? 0) + 1)
   }
   const top = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8)
@@ -72,7 +72,7 @@ const genreBars = computed(() => {
   const total = store.games.length || 1
   return top.map(([key, n], i) => ({
     key,
-    label: key === '__unknown__' ? t('gamelib.insight.genreUnknown') : key,
+    label: key === '__unknown__' ? t('gamelib.insight.tagUnknown') : key,
     n,
     pctOfLib: Math.round((n / total) * 100),
     color: BAR_COLORS[i % BAR_COLORS.length],
@@ -189,13 +189,13 @@ const topValue = computed(() =>
           </div>
         </div>
 
-        <!-- 类型分布 -->
+        <!-- 标签分布 -->
         <div class="gl-module">
           <div class="gl-sub">
-            {{ t('gamelib.insight.genreDist') }}
-            <small>{{ t('gamelib.insight.genreDist.sub') }}</small>
+            {{ t('gamelib.insight.tagDist') }}
+            <small>{{ t('gamelib.insight.tagDist.sub') }}</small>
           </div>
-          <div v-for="g in genreBars" :key="g.key" class="gl-ratio">
+          <div v-for="g in tagBars" :key="g.key" class="gl-ratio">
             <div class="gl-ratio__name"><span>{{ g.label }}</span></div>
             <div class="gl-ratio__track">
               <div class="gl-ratio__fill" :style="{ width: g.pct + '%', background: g.color }"></div>

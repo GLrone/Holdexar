@@ -575,6 +575,38 @@
    第二个祖母绿，单色即语义。 */
 .diff-badge.positive { background: var(--rate-good); }
 
+/* 送礼分析行（网格模式专属，列表模式 grid-only 隐藏）：小标行 + 整宽 chips 行，
+   chips 不换行（溢出隐藏）——换行会把价格区撑出卡片底缘 */
+.gift-row {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 2px 0;
+}
+.gift-row .gift-label { font-size: 10px; color: var(--text-muted); }
+.gift-row .gift-chips {
+    display: flex;
+    align-items: center;
+    flex-wrap: nowrap;
+    gap: 4px;
+    min-width: 0;
+    overflow: hidden;
+}
+.gift-row .gift-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    padding: 2px 5px;
+    border: 1px solid var(--border-soft);
+    border-radius: 3px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    background: var(--surface-chip);
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+.gift-row .gift-chip-more { color: var(--text-muted); }
+
 /* ==================== 全区价格按钮 ==================== */
 .details-btn {
     display: flex;
@@ -713,6 +745,10 @@
 .detail-item.unavailable-region .locked { color: var(--warning); }
 .bc-bar-group.unavailable-region .bc-bar { border: 1px solid var(--warning); }
 .bc-bar-group.unavailable-region .bc-bar-value { color: var(--warning); }
+
+/* 本次抓取失败、展示上次成功价：弱化显示 + 虚线底标（token 取值，非字面量） */
+.detail-item .prices.stale-price { opacity: 0.62; }
+.detail-item .prices.stale-price .cny { text-decoration: underline dashed; text-underline-offset: 3px; }
 
 /* ── 同系列区块（GPW 内，服务端名称聚类；未识别到系列不渲染）── */
 .series-section {

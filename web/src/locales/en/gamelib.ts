@@ -56,9 +56,9 @@ const gamelib = {
   /* ── Insights tab ── */
   'gamelib.insight.accountCmp': 'By Account',
   'gamelib.insight.accountCmp.sub': 'Games owned and library value per account (sum of CN prices)',
-  'gamelib.insight.genreDist': 'Genres',
-  'gamelib.insight.genreDist.sub': 'Counted by each game\'s primary (first) genre tag',
-  'gamelib.insight.genreUnknown': 'Uncategorized',
+  'gamelib.insight.tagDist': 'Tags',
+  'gamelib.insight.tagDist.sub': 'Counted by each game\'s top popular tag',
+  'gamelib.insight.tagUnknown': 'Uncategorized',
   'gamelib.insight.overlap': 'Overlap',
   'gamelib.insight.overlap.sub': 'How many accounts own the same game',
   'gamelib.insight.overlap.exclusive': 'Exclusive to one',

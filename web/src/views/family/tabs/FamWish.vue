@@ -10,9 +10,11 @@ import { cachedGet } from '@/lib/apiCache'
 import { memberColor, PALETTE } from '@/lib/familyColors'
 import { useI18n, useLocaleFormat } from '@/locales'
 import { useFamilyStore } from '@/stores/familyLib'
+import { useLocaleStore } from '@/stores/locale'
 
 const store = useFamilyStore()
 const { t } = useI18n()
+const localeStore = useLocaleStore()
 // 时间格式随语言：zh-CN → 14:30，en → 02:30 PM
 const fmt = useLocaleFormat()
 const payload = ref<FamilyWishlistPayload | null>(null)
@@ -134,12 +136,13 @@ const memberDist = computed(() => {
     .sort((a, b) => b.count - a.count)
 })
 
-/** 热门标签 TOP 8（games.genres 真实计数） */
+/** 热门标签 TOP 8（game_tags 真实计数；标签名按界面语言取名） */
 const topTags = computed(() => {
   const counter = new Map<string, number>()
   for (const it of items.value) {
-    for (const tag of (it.genres || '').split(',').map((s) => s.trim()).filter(Boolean)) {
-      counter.set(tag, (counter.get(tag) ?? 0) + 1)
+    for (const tag of it.tags) {
+      const name = localeStore.locale === 'en' ? tag.nameEn || tag.name : tag.name
+      counter.set(name, (counter.get(name) ?? 0) + 1)
     }
   }
   const rows = [...counter.entries()]
@@ -250,7 +253,7 @@ function fmtPrice(it: FamilyWishlistItem): { text: string; tone: 'muted' | 'soon
           </div>
           <div class="wl-chart-card">
             <div class="wl-chart-title">{{ t('famWish.chart.topTags') }}</div>
-            <div v-if="topTags.length === 0" class="fx-empty-mini">{{ t('famWish.empty.noGenreData') }}</div>
+            <div v-if="topTags.length === 0" class="fx-empty-mini">{{ t('famWish.empty.noTagData') }}</div>
             <div v-for="t in topTags" :key="t.name" class="wl-bar-row">
               <span class="wl-bar-name">{{ t.name }}</span>
               <div class="wl-bar-track"><div class="wl-bar-fill" :style="{ width: t.pct + '%', background: '#54a0ff' }"></div></div>

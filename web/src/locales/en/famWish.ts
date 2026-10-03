@@ -37,7 +37,7 @@ const famWish: Partial<Record<MessageKey, string>> = {
   'famWish.empty.noData':
     'No wishlist data yet — it appears once family members sync their wishlists (you can sync manually on the Watch pool page)',
   'famWish.empty.noMemberData': 'No member data',
-  'famWish.empty.noGenreData': 'No genre data',
+  'famWish.empty.noTagData': 'No tag data',
   'famWish.empty.noMatch': 'No matching titles',
 
   /* Toolbar */
@@ -47,7 +47,7 @@ const famWish: Partial<Record<MessageKey, string>> = {
 
   /* Three charts in the left column */
   'famWish.chart.memberDist': 'Wishlist distribution by member',
-  'famWish.chart.topTags': 'Top 8 genres',
+  'famWish.chart.topTags': 'Top 8 tags',
   'famWish.chart.priceBands': 'Price distribution',
   'famWish.donut.total': 'Total',
 

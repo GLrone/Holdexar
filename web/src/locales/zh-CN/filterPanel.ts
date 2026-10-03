@@ -43,12 +43,20 @@ const filterPanel = {
   'filterPanel.platform.xgp': 'XGP 收录',
 
   /* 与国区差价 */
-  'filterPanel.diff.giftOnly': '仅可跨区送礼',
   /* 差价模式下拉的当前值与弹层选项共用同两条词条（同一语义，避免两处漂移） */
   'filterPanel.diff.absolute': '绝对值',
   'filterPanel.diff.percent': '百分比',
   'filterPanel.diff.minPlaceholder': '最低差价',
   'filterPanel.diff.maxPlaceholder': '最高差价',
+
+  /* 送礼分析（两模式同判据：收礼侧区价 ≤ 送礼侧区价×1.15，付款双轨的送礼方价轨） */
+  'filterPanel.gift.title': '送礼分析',
+  'filterPanel.gift.modeOut': '我送出',
+  'filterPanel.gift.modeIn': '送给我',
+  'filterPanel.gift.sender': '送礼方',
+  'filterPanel.gift.receiver': '收礼方',
+  'filterPanel.gift.targets': '目标地区',
+  'filterPanel.gift.pick': '选择地区',
 
   /* 评测量范围 —— 「条」跟在数字输入框后独立成元素，故单独成条（英文侧为 reviews） */
   'filterPanel.reviews.unit': '条',
