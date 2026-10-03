@@ -8,7 +8,8 @@ import { useFilterStore } from '@/stores/gamesFilter'
 import { usePilotStore } from '@/stores/pilot'
 import { useRegionsStore } from '@/stores/regions'
 import { usePasteAdd } from '@/composables/usePasteAdd'
-import { canGift } from '@/lib/gifting'
+import { qualifyingSources, qualifyingTargets } from '@/lib/gifting'
+import { formatCnyFen } from '@/api/regions'
 import { mergeItemsByAppid } from '@/lib/priceRefresh'
 import { vStagger } from '@/lib/stagger'
 import { useI18n, useLocaleFormat } from '@/locales'
@@ -29,7 +30,7 @@ import {
 
 /**
  * 库视图完整实现：Navbar + 高级筛选 + 卡片网格 +
- * 无限滚动 + 客户端高级过滤（史低/差价/绝对低价/跨区送礼）。
+ * 无限滚动 + 客户端高级过滤（跨区送礼；史低/差价/绝对低价均已服务端化）。
  * 系列区块重组（applySeriesBlocks）依赖 seriesId 数据源，暂为空转。
  */
 const store = useFilterStore()
@@ -74,7 +75,40 @@ function diffBound(v: string): number | undefined {
   return Math.round(store.diffType === 'percent' ? n : n * 100)
 }
 
+/** 史低三态 checkbox → 服务端 flag（全库 SQL 筛选——分页后再客户端过滤会
+ *  把筛选范围缩小到已加载页）。三态互斥完备：单值直传；新+平=史低并集 hl；
+ *  其余两值组合逗号 OR（后端支持）；三态全选 = 每款必然命中其一，等价无过滤 */
+function hlFlagParam(): string | undefined {
+  if (!store.hlNew && !store.hlEqual && !store.hlNon) return undefined
+  if (store.hlNew && store.hlEqual && store.hlNon) return undefined
+  if (store.hlNew && store.hlEqual) return 'hl'
+  const parts: string[] = []
+  if (store.hlNew) parts.push('new')
+  if (store.hlEqual) parts.push('flat')
+  if (store.hlNon) parts.push('nonhl')
+  return parts.join(',')
+}
+
+/** 送礼分析 → 服务端 gift 三参数（判据=收礼侧 ≤ 送礼侧×1.15，全库 SQL 筛选）。
+ *  out=送礼方+目标多选齐备；in=收礼方已选。字段不齐 = 筛选未启用，不下发 */
+function giftFilterParams():
+  | { giftMode: string; giftSender?: string; giftReceivers: string }
+  | undefined {
+  if (store.giftMode === 'out' && store.giftSender && store.giftReceivers.length) {
+    return {
+      giftMode: 'out',
+      giftSender: store.giftSender,
+      giftReceivers: store.giftReceivers.join(','),
+    }
+  }
+  if (store.giftMode === 'in' && store.giftReceivers.length) {
+    return { giftMode: 'in', giftReceivers: store.giftReceivers.join(',') }
+  }
+  return undefined
+}
+
 function baseParams() {
+  const gift = giftFilterParams()
   return {
     q: store.committedSearch || undefined,
     sort: store.sortBy,
@@ -82,6 +116,10 @@ function baseParams() {
     filterMode: store.filterMode,
     onlyDiscounted: store.onlyDiscounted,
     isLowest: store.isLowest,
+    flag: hlFlagParam(),
+    giftMode: gift?.giftMode,
+    giftSender: gift?.giftSender,
+    giftReceivers: gift?.giftReceivers,
     onlyHb: store.onlyHb,
     onlyEpic: store.onlyEpic,
     onlyXgp: store.onlyXgp,
@@ -172,11 +210,12 @@ async function refreshInPlace() {
   items.value = mergeItemsByAppid(items.value, fresh)
 }
 
-// 价格周期收敛 → 精确失效 games 缓存（不等下一次写操作全量清）→ 原地刷新
+// 价格数据版本推进（周期收敛 / 任务终态，含无 Cycle 的手动与补抓任务）
+// → 精确失效 games 缓存（不等下一次写操作全量清）→ 原地刷新
 watch(
-  () => crawl.priceCycle?.cycleId ?? null,
-  async (cycleId) => {
-    if (cycleId === null) return
+  () => crawl.dataEpoch,
+  async (epoch) => {
+    if (epoch === 0) return
     invalidateGetCache('/games')
     await refreshInPlace()
   },
@@ -191,6 +230,12 @@ watch(
     store.filterMode,
     store.onlyDiscounted,
     store.isLowest,
+    store.hlNew,
+    store.hlEqual,
+    store.hlNon,
+    store.giftMode,
+    store.giftSender,
+    store.giftReceivers,
     store.onlyHb,
     store.onlyEpic,
     store.onlyXgp,
@@ -215,37 +260,36 @@ watch(
   },
 )
 
-// ─── 客户端高级过滤（对齐 GameGrid useMemo）───
-// 差价区间/绝对低价已服务端化（分页正确性：客户端过滤会丢页内条目），
-// 本地仅保留无服务端维度的：史低状态、跨区送礼。
+// ─── 送礼分析卡片行（筛选已在服务端完成；此处只从价矩阵派生展示数据）───
+// 判据与后端 GIFT_TRACK_BAND 同式（lib/gifting.ts onSenderTrack），改动须两处同步。
+// chips 最多 4 枚（区价升序=最便宜优先），余量进 more 徽标——整行换行会
+// 溢出卡片价格区；完整清单走卡片既有赠礼分析弹窗
 
-function passesAdvanced(g: GameListItem): boolean {
-  // 1. 史低状态（hlFlag 数据源未接入：恒为 0，仅"非史低"可匹配）
-  if (store.hlNew || store.hlEqual || store.hlNon) {
-    const hlType = g.discount > 0 ? g.hlFlag : 0
-    const matchNew = store.hlNew && hlType === 1
-    const matchEqual = store.hlEqual && hlType === 2
-    const matchNon = store.hlNon && (hlType === 3 || hlType === 0)
-    if (!(matchNew || matchEqual || matchNon)) return false
+/** 送礼模式激活时逐卡计算：in=可用送礼来源（全区遍历）；out=命中的选目标 */
+function giftLineFor(g: GameListItem):
+  | { label: string; items: Array<{ code: string; price: string }>; more: number }
+  | undefined {
+  const cap = 3
+  if (store.giftMode === 'in' && store.giftReceivers[0]) {
+    const all = qualifyingSources(g.priceMatrix, store.giftReceivers[0])
+    if (!all.length) return undefined
+    return {
+      label: t('gameCard.gift.sources'),
+      items: all.slice(0, cap).map((m) => ({ code: m.code, price: formatCnyFen(m.cnyFen) })),
+      more: Math.max(0, all.length - cap),
+    }
   }
-
-  // 2. 仅显示可跨区送礼：CN 与任一解锁区（新政策下价格倍率只影响实付口径，不限资格）
-  if (store.giftFilter) {
-    const cnCny = g.basePriceFen
-    if (cnCny === null || cnCny <= 0) return false
-    const giftable = Object.entries(g.priceMatrix).some(([code, cell]) => {
-      if (code === 'CN') return false
-      const cnyFen = cell[1]
-      if (!cnyFen || cnyFen === -1) return false
-      return canGift(cnCny, cnyFen) || canGift(cnyFen, cnCny)
-    })
-    if (!giftable) return false
+  if (store.giftMode === 'out' && store.giftSender && store.giftReceivers.length) {
+    const all = qualifyingTargets(g.priceMatrix, store.giftSender, store.giftReceivers)
+    if (!all.length) return undefined
+    return {
+      label: t('gameCard.gift.targets'),
+      items: all.slice(0, cap).map((m) => ({ code: m.code, price: formatCnyFen(m.cnyFen) })),
+      more: Math.max(0, all.length - cap),
+    }
   }
-
-  return true
+  return undefined
 }
-
-const visibleGames = computed(() => items.value.filter(passesAdvanced))
 
 // ─── 空态：区分「库里没有游戏」与「有条件但没匹配」───
 
@@ -324,13 +368,13 @@ function toggleSelect(appid: number, e: Event) {
 }
 
 const allLoadedSelected = computed(
-  () => visibleGames.value.length > 0 && visibleGames.value.every((g) => selected.value.has(g.appid)),
+  () => items.value.length > 0 && items.value.every((g) => selected.value.has(g.appid)),
 )
 
 function toggleSelectLoaded() {
   selected.value = allLoadedSelected.value
     ? new Set()
-    : new Set(visibleGames.value.map((g) => g.appid))
+    : new Set(items.value.map((g) => g.appid))
 }
 
 /** 分批调用（服务端单批上限 500，对齐池端点按 100 一批） */
@@ -582,7 +626,7 @@ onBeforeUnmount(() => {
            两态分开：A 库里没有游戏（给添加动作）≠ C 有条件但没匹配（给清除入口）。
            添加只进目录并自动取一次价格，不需要 Steam 账号，也不经过任务页 -->
       <HlEmpty
-        v-if="!isLoading && !isError && visibleGames.length === 0 && initialized"
+        v-if="!isLoading && !isError && items.length === 0 && initialized"
         icon=""
         data-tour="lib-empty"
       >
@@ -645,8 +689,8 @@ onBeforeUnmount(() => {
            此前是往容器上挂 `card-grid list-grid` 再靠 `.animated-list-wrapper .scroll-list`
            补回同一套值——两个来源写同一件事。 -->
       <HlScrollList
-        v-if="visibleGames.length > 0 && store.layoutMode === 'list'"
-        :items="visibleGames"
+        v-if="items.length > 0 && store.layoutMode === 'list'"
+        :items="items"
         max-height="80vh"
         @end-reached="onEndReached"
       >
@@ -661,6 +705,7 @@ onBeforeUnmount(() => {
               :layout-mode="'list'"
               :enabled-regions="regionsStore.enabledCodes"
               :show-top3="store.top3Check"
+              :gift-line="giftLineFor(item as GameListItem)"
               :store-action="cardAction"
               @store-action="onCardAction(item.appid)"
             />
@@ -685,12 +730,12 @@ onBeforeUnmount(() => {
 
       <!-- 网格模式：原始布局（hl-stagger：逐卡级联入场，见 hl-framework.css） -->
       <div
-        v-if="visibleGames.length > 0 && store.layoutMode !== 'list'"
+        v-if="items.length > 0 && store.layoutMode !== 'list'"
         v-stagger
         class="card-grid hl-stagger"
       >
         <div
-          v-for="game in visibleGames"
+          v-for="game in items"
           :key="game.appid"
           class="lib-item-wrap"
           :class="{ 'is-managed': manageMode, 'is-selected': manageMode && selected.has(game.appid) }"
@@ -701,6 +746,7 @@ onBeforeUnmount(() => {
             :layout-mode="store.layoutMode"
             :enabled-regions="regionsStore.enabledCodes"
             :show-top3="store.top3Check"
+            :gift-line="giftLineFor(game)"
             :store-action="cardAction"
             @store-action="onCardAction(game.appid)"
           />
@@ -714,7 +760,7 @@ onBeforeUnmount(() => {
 
       <!-- 无限滚动哨兵（仅网格模式；列表模式的哨兵在 HlScrollList 滚动区末尾） -->
       <div
-        v-if="visibleGames.length > 0 && store.layoutMode !== 'list'"
+        v-if="items.length > 0 && store.layoutMode !== 'list'"
         ref="sentinel"
         class="loading-sentinel"
       >

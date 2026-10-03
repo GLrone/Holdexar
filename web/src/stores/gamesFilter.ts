@@ -43,7 +43,12 @@ interface FilterState {
   hlNew: boolean
   hlEqual: boolean
   hlNon: boolean
-  giftFilter: boolean
+  /** 送礼分析模式：out=我可以送给谁（固定送礼方）；in=哪些游戏可以低价送给我（固定收礼方）；''=未启用 */
+  giftMode: '' | 'out' | 'in'
+  /** out 模式的送礼方区码（小写）；in 模式不使用 */
+  giftSender: string
+  /** out 模式=目标地区多选（小写区码）；in 模式=收礼方单元素数组 */
+  giftReceivers: string[]
   /** 游戏商店默认隐藏 DLC（白名单豁免个别常驻 DLC） */
   excludeDlc: boolean
   filterRegion: string
@@ -88,7 +93,9 @@ export const useFilterStore = defineStore('gamesFilter', {
     hlNew: false,
     hlEqual: false,
     hlNon: false,
-    giftFilter: false,
+    giftMode: '',
+    giftSender: '',
+    giftReceivers: [],
     excludeDlc: true,
     filterRegion: 'cn',
     showAdvancedFilter: false,
@@ -126,7 +133,9 @@ export const useFilterStore = defineStore('gamesFilter', {
       this.hlNew = false
       this.hlEqual = false
       this.hlNon = false
-      this.giftFilter = false
+      this.giftMode = ''
+      this.giftSender = ''
+      this.giftReceivers = []
       this.excludeDlc = true
       this.filterRegion = 'cn'
     },
@@ -156,7 +165,10 @@ export const useFilterStore = defineStore('gamesFilter', {
       if (this.hlNew) count++
       if (this.hlEqual) count++
       if (this.hlNon) count++
-      if (this.giftFilter) count++
+      // 送礼筛选只在字段齐备时计入并下发（out=送礼方+目标；in=收礼方），
+      // 半选状态不产生过滤效果
+      if (this.giftMode === 'out' && this.giftSender && this.giftReceivers.length) count++
+      if (this.giftMode === 'in' && this.giftReceivers.length) count++
       if (!this.excludeDlc) count++
       if (this.minPrice) count++
       if (this.maxPrice) count++

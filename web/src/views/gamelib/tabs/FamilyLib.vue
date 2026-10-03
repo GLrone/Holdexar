@@ -127,7 +127,7 @@ function ownersAvatars(owners: string[]) {
           :appid="g.appid"
           :name="g.name"
           :header-image="g.headerImage"
-          :genres="g.genres"
+          :tags="g.tags"
           :release-date="g.releaseDate"
           :price-fen="g.cnPriceFen"
           :original-price-fen="g.originalPriceFen"

@@ -14,10 +14,12 @@ import { useSettingsStore } from '@/stores/settings'
 import { flagUrl } from '@/api/regions'
 import { useRegionsStore } from '@/stores/regions'
 import { useI18n } from '@/locales'
+import { useLocaleFormat } from '@/locales/format'
 import { parseAppRefs, parseFavoritesRefs } from '@/lib/appidRefs'
 import { HlAvatar, HlButton, HlDialog, HlIcon, HlInput, HlSwitch, message } from '@/components/ui'
 
 const { t } = useI18n()
+const fmt = useLocaleFormat()
 const crawl = useCrawlStatusStore()
 const regionsStore = useRegionsStore()
 const settingsStore = useSettingsStore()
@@ -251,6 +253,21 @@ const progressCounts = computed(() => {
   const rp = crawl.roundProgress
   if (rp) return { done: rp.done, total: rp.total }
   return { done: crawl.done, total: crawl.total }
+})
+
+/** 进度行整句：预计结束时刻挂在末尾（算不出速度时整段省略） */
+const progressMeta = computed(() => {
+  const counts = t('crawl.progress.meta', {
+    done: progressCounts.value.done,
+    total: progressCounts.value.total,
+    ok: crawl.ok,
+    fail: crawl.fail,
+    qsize: crawl.qsize,
+    speed: (crawl.speed * 60).toFixed(1),
+  })
+  const eta = crawl.etaSeconds
+  if (eta == null) return counts
+  return `${counts} · ${t('crawl.progress.eta', { time: fmt.time(Date.now() + eta * 1000) })}`
 })
 
 // ── 自动价格链启停（只想手动抓的用户关这里：定时爬价 + 失败修复停转）──
@@ -630,18 +647,7 @@ onBeforeUnmount(() => {
           :stroke-width="10"
           :show-text="false"
         />
-        <div class="progress-box__meta">
-          {{
-            t('crawl.progress.meta', {
-              done: progressCounts.done,
-              total: progressCounts.total,
-              ok: crawl.ok,
-              fail: crawl.fail,
-              qsize: crawl.qsize,
-              speed: (crawl.speed * 60).toFixed(1),
-            })
-          }}
-        </div>
+        <div class="progress-box__meta">{{ progressMeta }}</div>
       </div>
     </div>
 

@@ -49,7 +49,7 @@ const gameDetail: Partial<Record<MessageKey, string>> = {
   'gameDetail.info.series': 'Series: {id}',
   'gameDetail.info.developers': 'Developers',
   'gameDetail.info.publishers': 'Publishers',
-  'gameDetail.info.genres': 'Genres',
+  'gameDetail.info.tags': 'Popular tags',
   'gameDetail.info.reviews': 'Reviews',
   'gameDetail.rating.positive': '{rate}% positive',
   'gameDetail.rating.reviews': '{n} reviews',

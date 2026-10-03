@@ -3,9 +3,10 @@
    一个结论只表达一件事：正在更新 / 价格已更新 / 更新未完成 / 等待更新 /
    价格未更新。
 
-   结论以**刷新轮次**为准：最近一轮的终态决定这轮收敛没有，最近一次真正写入
-   价格的轮次收尾时刻决定数据有多旧。store 只补运行中的实时计数。
-   轮次与批次的计数口径都不是游戏数，故对外不给任何数量。
+   结论由两条独立事实合成：轮次状态（最近一轮的终态，回答这轮收敛没有）+
+   数据年龄（全库最近一次成功价格观察——活表观察章，自动轮/手动/补抓/回填
+   的成功写入都推进，不再只看挂 Cycle 的轮次收尾）。store 只补运行中的
+   实时计数。轮次与批次的计数口径都不是游戏数，故对外不给任何数量。
 
    空闲结论只在数据已旧（stale）时占岛：距上次成功写入未超出静默窗口就保持
    静默，岛体让位给消息与任务；从未写入过视同已旧。
@@ -16,9 +17,6 @@ import { crawlApi, type PriceCycleItem } from '@/api/client'
 import { priceStatusOf } from '@/lib/headerStatus'
 import { useI18n } from '@/locales'
 import { useCrawlStatusStore } from '@/stores/crawlStatus'
-
-/** 扫描的轮次条数：够越过近期连续未收敛的轮次，回看到最近一次真正写入的轮次 */
-const CYCLE_SCAN = 20
 
 /** 数据静默窗口：距上次成功写入不超过该时长即视为新鲜，空闲结论不占岛 */
 const FRESH_WINDOW_MS = 6 * 60 * 60 * 1000
@@ -35,7 +33,7 @@ export function usePriceStatus() {
 
   /** 最近一轮刷新周期；null = 还没有任何轮次记录 */
   const latestCycle = ref<PriceCycleItem | null>(null)
-  /** 最近一次真正写入价格的轮次收尾时刻（ISO）；null = 从未写入过 */
+  /** 全库最近一次成功价格观察时刻（ISO，活表事实）；null = 从未写入过 */
   const lastUpdatedAt = ref<string | null>(null)
   /** 本会话内出现过更新活动：轮次收尾前不得回落成「等待更新」 */
   const sawActivity = ref(false)
@@ -47,9 +45,12 @@ export function usePriceStatus() {
 
   async function loadCycles() {
     try {
-      const cycles = await crawlApi.cycles(CYCLE_SCAN)
+      const [cycles, latest] = await Promise.all([
+        crawlApi.cycles(1),
+        crawlApi.latestObservation(),
+      ])
       latestCycle.value = cycles[0] ?? null
-      lastUpdatedAt.value = cycles.find((c) => (c.stats?.unitsOk ?? 0) > 0)?.finishedAt ?? null
+      lastUpdatedAt.value = latest.lastSuccessAt
     } catch {
       /* 读不到就保持上一次的结论：不把状态改写成比实际更好或更坏 */
     }

@@ -55,9 +55,9 @@ const gamelib = {
   /* ── 库分析页签 ── */
   'gamelib.insight.accountCmp': '账号对比',
   'gamelib.insight.accountCmp.sub': '各账号拥有款数与库价值（CN 现价合计）',
-  'gamelib.insight.genreDist': '类型分布',
-  'gamelib.insight.genreDist.sub': '按每款游戏的主类型（第一个标签）统计',
-  'gamelib.insight.genreUnknown': '未分类',
+  'gamelib.insight.tagDist': '标签分布',
+  'gamelib.insight.tagDist.sub': '按每款游戏的首个热门标签统计',
+  'gamelib.insight.tagUnknown': '未分类',
   'gamelib.insight.overlap': '账号间重合',
   'gamelib.insight.overlap.sub': '同一款游戏被几个账号同时拥有',
   'gamelib.insight.overlap.exclusive': '单人独享',

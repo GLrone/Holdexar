@@ -52,6 +52,9 @@ const crawl: Partial<Record<MessageKey, string>> = {
      queue; ok/fail/qsize/speed stay per-segment live counts. Speed is per minute */
   'crawl.progress.meta':
     'Done {done}/{total} · OK {ok} · Failed {fail} · Queued {qsize} · {speed} batches/min',
+  // Expected finish time ({time} from format.ts: `14:30` zh-CN / `02:30 PM` en-US);
+  // omitted entirely when speed is unknown or nothing is left
+  'crawl.progress.eta': 'ETA {time}',
 
   /* System-side activity (not a job; invisible in the job list) */
   'crawl.sys.starting':

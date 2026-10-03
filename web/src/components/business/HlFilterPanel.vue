@@ -20,6 +20,14 @@ const showDiffTypeMenu = ref(false)
 const regionSelectorRef = ref<HTMLElement | null>(null)
 const diffTypeRef = ref<HTMLElement | null>(null)
 
+// 送礼分析（两模式独立弹层；区码一律小写进 store，服务端统一转大写比对）
+const showGiftSenderPop = ref(false)
+const showGiftTargetsPop = ref(false)
+const showGiftReceiverPop = ref(false)
+const giftSenderRef = ref<HTMLElement | null>(null)
+const giftTargetsRef = ref<HTMLElement | null>(null)
+const giftReceiverRef = ref<HTMLElement | null>(null)
+
 /* 空表兜底（后端不可达 / 启动首帧）：只兜 code 与 currency。
    **区名不在这里写死** —— 区服名以 stores/regions 为单一来源（含它「表外区码
    回落区码本身」的既定口径），组件侧只问它要名字。 */
@@ -64,12 +72,63 @@ function handleSelectDiffType(type: 'absolute' | 'percent') {
   showDiffTypeMenu.value = false
 }
 
+/* ── 送礼分析（判据=收礼侧区价 ≤ 送礼侧区价×1.15，付款双轨的送礼方价轨）── */
+
+function regionMeta(code: string): RegionMeta | null {
+  return regionsStore.metas.find((r) => r.code.toLowerCase() === code) ?? null
+}
+
+const giftSenderMeta = computed(() => regionMeta(store.giftSender))
+const giftReceiverMeta = computed(() => regionMeta(store.giftReceivers[0] ?? ''))
+// 目标地区选项排除送礼方自身（自区不可作为跨区送礼目标）
+const giftTargetOptions = computed(() =>
+  priceRegionOptions.value.filter((r) => r.code.toLowerCase() !== store.giftSender),
+)
+
+function setGiftMode(mode: 'out' | 'in') {
+  const next = store.giftMode === mode ? '' : mode
+  store.setFilter('giftMode', next)
+  store.setFilter('giftSender', '')
+  store.setFilter('giftReceivers', [])
+  showGiftSenderPop.value = false
+  showGiftTargetsPop.value = false
+  showGiftReceiverPop.value = false
+}
+
+function pickGiftSender(code: string) {
+  store.setFilter('giftSender', code)
+  // 送礼方不可作目标：连带清掉同区目标选择
+  store.setFilter('giftReceivers', store.giftReceivers.filter((c) => c !== code))
+  showGiftSenderPop.value = false
+}
+
+function pickGiftReceiver(code: string) {
+  store.setFilter('giftReceivers', [code])
+  showGiftReceiverPop.value = false
+}
+
+function toggleGiftTarget(code: string) {
+  const next = store.giftReceivers.includes(code)
+    ? store.giftReceivers.filter((c) => c !== code)
+    : [...store.giftReceivers, code]
+  store.setFilter('giftReceivers', next)
+}
+
 function onDocClick(e: MouseEvent) {
   if (regionSelectorRef.value && !regionSelectorRef.value.contains(e.target as Node)) {
     showRegionPopup.value = false
   }
   if (diffTypeRef.value && !diffTypeRef.value.contains(e.target as Node)) {
     showDiffTypeMenu.value = false
+  }
+  if (giftSenderRef.value && !giftSenderRef.value.contains(e.target as Node)) {
+    showGiftSenderPop.value = false
+  }
+  if (giftTargetsRef.value && !giftTargetsRef.value.contains(e.target as Node)) {
+    showGiftTargetsPop.value = false
+  }
+  if (giftReceiverRef.value && !giftReceiverRef.value.contains(e.target as Node)) {
+    showGiftReceiverPop.value = false
   }
 }
 
@@ -229,14 +288,7 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
       <div>
         <div class="hl-fp-sec-title hl-fp-sec-flex">
           <span>{{ t('filterPanel.section.diff') }}</span>
-          <div style="display: flex; align-items: center; gap: 8px">
-            <HlCheckbox
-              style="font-size: 11px"
-              :model-value="store.giftFilter"
-              :label="t('filterPanel.diff.giftOnly')"
-              @update:model-value="(v: boolean) => store.setFilter('giftFilter', v)"
-            />
-            <div ref="diffTypeRef" class="hl-fp-diff">
+          <div ref="diffTypeRef" class="hl-fp-diff">
               <div class="hl-fp-diff-sel" @click="showDiffTypeMenu = !showDiffTypeMenu">
                 <span>{{
                   store.diffType === 'absolute'
@@ -261,7 +313,6 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
                   {{ t('filterPanel.diff.percent') }}
                 </div>
               </div>
-            </div>
           </div>
         </div>
         <div class="hl-fp-range-row">
@@ -286,6 +337,125 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
           </div>
           <span class="hl-fp-cur">{{ currencyLabel() }}</span>
         </div>
+      </div>
+
+      <!-- 送礼分析（两模式同判据：收礼侧区价 ≤ 送礼侧区价×1.15，付款双轨的
+           送礼方价轨）。out=固定送礼方+目标多选任一命中；in=固定收礼方，
+           送礼方全区自动遍历。字段齐备才生效（服务端过滤） -->
+      <div>
+        <div class="hl-fp-sec-title">{{ t('filterPanel.gift.title') }}</div>
+        <div class="hl-fp-mode-row">
+          <button
+            type="button"
+            class="hl-fp-mode"
+            :class="{ 'is-active': store.giftMode === 'out' }"
+            @click="setGiftMode('out')"
+          >
+            {{ t('filterPanel.gift.modeOut') }}
+          </button>
+          <button
+            type="button"
+            class="hl-fp-mode"
+            :class="{ 'is-active': store.giftMode === 'in' }"
+            @click="setGiftMode('in')"
+          >
+            {{ t('filterPanel.gift.modeIn') }}
+          </button>
+        </div>
+
+        <!-- 模式一：送礼方（单选）+ 目标地区（多选） -->
+        <template v-if="store.giftMode === 'out'">
+          <div ref="giftSenderRef" style="position: relative; margin-top: 10px">
+            <div class="hl-fp-field-label">{{ t('filterPanel.gift.sender') }}</div>
+            <div class="hl-fp-region-sel" @click="showGiftSenderPop = !showGiftSenderPop">
+              <span v-if="giftSenderMeta" class="hl-rf hl-rf--sm">
+                <img :src="flagUrl(giftSenderMeta.code)" :alt="giftSenderMeta.code" />
+                {{ giftSenderMeta.name }}
+              </span>
+              <span v-else class="hl-fp-gift-ph">{{ t('filterPanel.gift.pick') }}</span>
+              <span class="car">▼</span>
+            </div>
+            <div class="hl-fp-region-pop" :class="{ show: showGiftSenderPop }">
+              <div
+                v-for="r in priceRegionOptions"
+                :key="`gs-${r.code}`"
+                class="hl-fp-region-pop__item"
+                :class="{ 'is-active': store.giftSender === r.code.toLowerCase() }"
+                @click="pickGiftSender(r.code.toLowerCase())"
+              >
+                <span class="hl-rf hl-rf--sm">
+                  <img :src="flagUrl(r.code)" :alt="r.code" />
+                  {{ r.name }}
+                </span>
+              </div>
+            </div>
+          </div>
+          <div ref="giftTargetsRef" style="position: relative; margin-top: 10px">
+            <div class="hl-fp-field-label">{{ t('filterPanel.gift.targets') }}</div>
+            <div class="hl-fp-region-sel" @click="showGiftTargetsPop = !showGiftTargetsPop">
+              <span v-if="store.giftReceivers.length === 0" class="hl-fp-gift-ph">
+                {{ t('filterPanel.gift.pick') }}
+              </span>
+              <span v-else class="hl-fp-target-chips">
+                <span
+                  v-for="code in store.giftReceivers"
+                  :key="`gt-${code}`"
+                  class="hl-fp-target-chip"
+                >
+                  <span class="hl-rf hl-rf--sm">
+                    <img v-if="regionMeta(code)" :src="flagUrl(code)" :alt="code" />
+                    {{ regionMeta(code)?.name ?? code.toUpperCase() }}
+                  </span>
+                  <i class="hl-fp-chip-x" @click.stop="toggleGiftTarget(code)">×</i>
+                </span>
+              </span>
+              <span class="car">▼</span>
+            </div>
+            <div class="hl-fp-region-pop" :class="{ show: showGiftTargetsPop }">
+              <div
+                v-for="r in giftTargetOptions"
+                :key="`gto-${r.code}`"
+                class="hl-fp-region-pop__item"
+                :class="{ 'is-active': store.giftReceivers.includes(r.code.toLowerCase()) }"
+                @click="toggleGiftTarget(r.code.toLowerCase())"
+              >
+                <span class="hl-rf hl-rf--sm">
+                  <img :src="flagUrl(r.code)" :alt="r.code" />
+                  {{ r.name }}
+                </span>
+              </div>
+            </div>
+          </div>
+        </template>
+
+        <!-- 模式二：收礼方（单选；送礼方由服务端全区自动遍历） -->
+        <template v-else-if="store.giftMode === 'in'">
+          <div ref="giftReceiverRef" style="position: relative; margin-top: 10px">
+            <div class="hl-fp-field-label">{{ t('filterPanel.gift.receiver') }}</div>
+            <div class="hl-fp-region-sel" @click="showGiftReceiverPop = !showGiftReceiverPop">
+              <span v-if="giftReceiverMeta" class="hl-rf hl-rf--sm">
+                <img :src="flagUrl(giftReceiverMeta.code)" :alt="giftReceiverMeta.code" />
+                {{ giftReceiverMeta.name }}
+              </span>
+              <span v-else class="hl-fp-gift-ph">{{ t('filterPanel.gift.pick') }}</span>
+              <span class="car">▼</span>
+            </div>
+            <div class="hl-fp-region-pop" :class="{ show: showGiftReceiverPop }">
+              <div
+                v-for="r in priceRegionOptions"
+                :key="`gr-${r.code}`"
+                class="hl-fp-region-pop__item"
+                :class="{ 'is-active': store.giftReceivers[0] === r.code.toLowerCase() }"
+                @click="pickGiftReceiver(r.code.toLowerCase())"
+              >
+                <span class="hl-rf hl-rf--sm">
+                  <img :src="flagUrl(r.code)" :alt="r.code" />
+                  {{ r.name }}
+                </span>
+              </div>
+            </div>
+          </div>
+        </template>
       </div>
 
       <!-- 评测量范围 -->

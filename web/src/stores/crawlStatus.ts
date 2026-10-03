@@ -14,6 +14,10 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
   const fail = ref(0)
   const qsize = ref(0)
   const speed = ref(0)
+  /* 平滑速度（计数/秒）：进度事件的 speed 是近 10s 滑窗的瞬时值，直接拿来
+     算预计结束时间会随窗口跳动；按 0.3 权重做指数平滑。速度为 0（刚起步、
+     段间空档、停摆）既不参与平滑也不给结论——宁可不说，不报假时间 */
+  const etaSpeed = ref(0)
   /* 任务目标量：后端在任务启动时定死（初始任务数），随进度事件下发。
      不能用 done+qsize 拼总数——队列排干/逐层入队/重推都会让它波动。 */
   const total = ref(0)
@@ -23,6 +27,11 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
   /* 最近一次收敛的价格刷新周期（SSE price_cycle.completed）：库视图据此失效
      列表缓存并原地重拉。按 cycleId 去重——同一轮重复到达不触发第二次请求。 */
   const priceCycle = ref<PriceCycleMark | null>(null)
+
+  /* 价格数据版本号：price_cycle.completed 与任务终态（含无 Cycle 的手动/
+     补抓任务——它们写价但不产生周期收敛事件）都会推进。视图只盯这一个
+     信号做原地重拉，不再各自判断「这轮/这个任务有没有写价」。 */
+  const dataEpoch = ref(0)
 
   /* 一轮价格刷新由多个任务段串行组成；进度按轮累计（段与段之间不清零），
      岛上的进度条与百分比在轮内单调推进。轮次未激活时（手动抓取、修复等
@@ -43,6 +52,18 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
       done: roundDone.value + liveDone,
       total: Math.max(roundTotal.value, roundDone.value + liveTotal),
     }
+  })
+
+  /** 预计剩余秒数：剩余量取轮内累计口径，速度取当前段（段间速度不同，
+      轮内换段后随新段速度重新收敛）。null = 算不出来（无速度 / 已跑完 /
+      超出 24h 不报）。 */
+  const etaSeconds = computed(() => {
+    if (!running.value || etaSpeed.value <= 0) return null
+    const p = roundProgress.value ?? { done: done.value, total: total.value }
+    const remain = p.total - p.done
+    if (remain <= 0) return null
+    const secs = Math.ceil(remain / etaSpeed.value)
+    return secs <= 86400 ? secs : null
   })
 
   /* 以最近一轮的记账状态核对轮次是否在跑，并把该轮已收尾任务段的完成量补进
@@ -110,6 +131,9 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
       fail.value = data.fail ?? 0
       qsize.value = data.qsize ?? 0
       speed.value = data.speed ?? 0
+      if (speed.value > 0) {
+        etaSpeed.value = etaSpeed.value > 0 ? etaSpeed.value * 0.7 + speed.value * 0.3 : speed.value
+      }
       total.value = data.total ?? done.value + qsize.value
       lastEventAt.value = new Date().toLocaleTimeString()
     })
@@ -122,6 +146,7 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
       ok.value = 0
       fail.value = 0
       total.value = 0
+      etaSpeed.value = 0 // 新段速度未知：先不报预计结束时间
       void syncRoundScope()
     })
 
@@ -137,6 +162,8 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
         }
         running.value = false
         activeJobId.value = null
+        /* 任务终态=一轮写价落地：无 Cycle 的任务只有这一条收敛信号 */
+        dataEpoch.value++
       }
     })
 
@@ -155,6 +182,7 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
         roundTracking.value = false
         roundDone.value = 0
         roundTotal.value = 0
+        dataEpoch.value++
       }
     })
 
@@ -176,7 +204,9 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
     activeJobId,
     lastEventAt,
     priceCycle,
+    dataEpoch,
     roundProgress,
+    etaSeconds,
     start,
   }
 })

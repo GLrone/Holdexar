@@ -68,7 +68,7 @@ const gameDetail = {
   'gameDetail.info.series': '系列：{id}',
   'gameDetail.info.developers': '开发商',
   'gameDetail.info.publishers': '发行商',
-  'gameDetail.info.genres': '类型标签',
+  'gameDetail.info.tags': '热门标签',
   'gameDetail.info.reviews': '评测',
   'gameDetail.rating.positive': '好评 {rate}%',
   'gameDetail.rating.reviews': '{n} 篇评测',

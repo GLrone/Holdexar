@@ -64,55 +64,53 @@ export interface CoverageView extends TextPart {
   partial: boolean
 }
 
-/** 覆盖率 → 文案；无 Cycle 归属（null）或**已刷满**都返回 null——
- * 已确认数（ok+locked）达到期望时不出覆盖标签，价格数据行只剩观察时间。
+/** 覆盖率 → 文案；无覆盖数据或**已刷满**都返回 null——
+ * 成功观察数达到期望区数时不出覆盖标签，价格数据行只剩观察时间。
  * 未刷满才显示「覆盖 x/y，未完整」，悬停点名问题地区（tips）。
  *
- * 计入确认的是 ok（有价）+ locked（Steam 明确该区不售——请求成功、结论
- * 终态，缺的只是购买选项）；missing / blocked / unobserved 才算未刷满。 */
+ * 覆盖口径（活表尝试状态）：成功观察 = 拿到 Steam 明确答复（含 locked /
+ * 无购买选项）；failed = 传输类失败；notAttempted = 尚无尝试记录。 */
 export function coverageView(cov: PriceCoverage | null | undefined): CoverageView | null {
   if (!cov) return null
-  const confirmed = cov.ok + cov.locked
-  if (confirmed >= cov.expectedUnits) return null
+  if (cov.success >= cov.expectedUnits) return null
   return {
     key: 'gameCard.priceData.coveragePartial',
-    params: { ok: confirmed, expected: cov.expectedUnits },
+    params: { ok: cov.success, expected: cov.expectedUnits },
     partial: true,
   }
 }
 
-/** 区级状态 → 悬停文案词条；顺序与桶语义一致：锁区 → 没拿到 → 获取中 */
-const REGION_TIP_KEYS: Array<{ statuses: string[]; key: MessageKey }> = [
-  { statuses: ['locked'], key: 'gameCard.priceData.tipRegion.locked' },
-  { statuses: ['missing', 'blocked'], key: 'gameCard.priceData.tipRegion.failed' },
-  { statuses: ['unobserved'], key: 'gameCard.priceData.tipRegion.unobserved' },
-]
+/** ISO 时刻 → 短时间文案（月-日 时:分）。纯展示分档用，不做时区语义。 */
+function shortTime(iso: string): string {
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
 
-/** 未覆盖部分 → 悬停提示。有区级明细（快照冻结的 regions）就逐区点名；
- * 旧格式快照没有明细，退回按桶计数——不虚构区名。 */
+/** 未覆盖部分 → 悬停提示。区级明细逐区点名：
+ * 本次失败（带上次成功时刻）→ 「本次抓取失败，展示 X 时刻的数据」；
+ * 未尝试 → 「还没抓过」。成功区（含锁区）不点名。 */
 export function coverageTipParts(
   cov: PriceCoverage | null | undefined,
   regionName?: (code: string) => string,
 ): TextPart[] {
   if (!cov) return []
-  const regions = cov.regions ?? {}
-  if (regionName && Object.keys(regions).length > 0) {
-    const parts: TextPart[] = []
-    for (const group of REGION_TIP_KEYS) {
-      for (const [code, status] of Object.entries(regions)) {
-        if (group.statuses.includes(status)) {
-          parts.push({ key: group.key, params: { region: regionName(code) } })
-        }
-      }
-    }
-    return parts
-  }
   const parts: TextPart[] = []
-  if (cov.locked > 0) parts.push({ key: 'gameCard.priceData.tip.locked', params: { n: cov.locked } })
-  const failed = cov.missing + cov.blocked
-  if (failed > 0) parts.push({ key: 'gameCard.priceData.tip.failed', params: { n: failed } })
-  if (cov.unobserved > 0) {
-    parts.push({ key: 'gameCard.priceData.tip.unobserved', params: { n: cov.unobserved } })
+  for (const [code, info] of Object.entries(cov.regions ?? {})) {
+    const name = regionName?.(code) ?? code
+    if (info.outcome === 'failed') {
+      if (info.lastSuccessAt) {
+        parts.push({
+          key: 'gameCard.priceData.tipRegion.failedStale',
+          params: { region: name, time: shortTime(info.lastSuccessAt) },
+        })
+      } else {
+        parts.push({ key: 'gameCard.priceData.tipRegion.failed', params: { region: name } })
+      }
+    } else {
+      parts.push({ key: 'gameCard.priceData.tipRegion.notAttempted', params: { region: name } })
+    }
   }
   return parts
 }

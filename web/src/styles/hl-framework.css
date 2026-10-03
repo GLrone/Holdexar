@@ -2601,6 +2601,43 @@ html.dark .hl-theme-btn svg { transform: rotate(180deg); }
 .hl-fp-cur { font-size: 11px; color: var(--accent); font-weight: 600; margin-left: 2px; }
 .hl-fp-range-row { display: flex; align-items: center; gap: 8px; }
 .hl-fp-range-row .hl-input-wrap { flex: 1; }
+/* 送礼分析：模式选择钮 + 字段小标 + 目标地区已选 chips */
+.hl-fp-mode-row { display: flex; gap: 8px; }
+.hl-fp-mode {
+  flex: 1;
+  padding: 6px 0;
+  background: var(--input-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-secondary);
+  transition: border-color var(--transition), color var(--transition);
+}
+.hl-fp-mode:hover { border-color: var(--accent); }
+.hl-fp-mode.is-active { border-color: var(--accent); color: var(--accent); background: var(--hover-soft); }
+.hl-fp-field-label { font-size: 11px; color: var(--text-muted); margin-bottom: 6px; }
+.hl-fp-gift-ph { font-size: 12px; color: var(--text-muted); }
+.hl-fp-target-chips { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
+.hl-fp-target-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  font-size: 11px;
+  color: var(--text-primary);
+  background: var(--bg-soft);
+}
+.hl-fp-chip-x {
+  font-style: normal;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.hl-fp-chip-x:hover { color: var(--text-primary); }
 /* 地区旗帜（对齐 RegionFlag.vue：国旗 + 中文名，禁止国际代码） */
 .hl-rf { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
 .hl-rf img {

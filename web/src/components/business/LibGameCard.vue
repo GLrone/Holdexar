@@ -12,7 +12,9 @@
  */
 import { computed } from 'vue'
 
+import type { GameTag } from '@/api/client'
 import { useI18n } from '@/locales'
+import { useLocaleStore } from '@/stores/locale'
 import HlImg from '@/components/ui/HlImg.vue'
 
 const props = withDefaults(
@@ -20,8 +22,8 @@ const props = withDefaults(
     appid: number
     name?: string | null
     headerImage?: string | null
-    /** 逗号分隔的类型串（games.genres 原样），只展示首类型 */
-    genres?: string | null
+    /** 热门用户标签（票重降序），只展示首个 */
+    tags?: GameTag[]
     releaseDate?: string | null
     /** CN 价 CNY 分；null = 本地未爬到价格 */
     priceFen?: number | null
@@ -35,7 +37,7 @@ const props = withDefaults(
   {
     name: null,
     headerImage: null,
-    genres: null,
+    tags: () => [],
     releaseDate: null,
     priceFen: null,
     originalPriceFen: null,
@@ -46,6 +48,7 @@ const props = withDefaults(
 )
 
 const { t } = useI18n()
+const localeStore = useLocaleStore()
 
 const displayName = computed(() => props.name?.trim() || `AppID ${props.appid}`)
 /* 本地 games 表没爬到的游戏不给裂图：按 Steam 商店公开素材路径拼封面，
@@ -55,10 +58,12 @@ const cover = computed(
     props.headerImage ||
     `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${props.appid}/header.jpg`,
 )
+/* 标签按界面语言取名：英文界面用英文名，缺失回退中文名 */
+const tagText = (tag?: GameTag) =>
+  !tag ? '' : localeStore.locale === 'en' ? tag.nameEn || tag.name : tag.name
 const metaLine = computed(() => {
-  const genre = (props.genres || '').split(',')[0]?.trim() || ''
   const year = (props.releaseDate || '').slice(0, 4)
-  return [genre, year].filter(Boolean).join(' · ')
+  return [tagText(props.tags[0]), year].filter(Boolean).join(' · ')
 })
 
 type PriceState = 'unknown' | 'free' | 'paid'

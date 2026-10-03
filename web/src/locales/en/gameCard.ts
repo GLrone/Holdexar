@@ -66,6 +66,10 @@ const gameCard: Partial<Record<MessageKey, string>> = {
   /* Price data status (observation time / freshness / this round's coverage).
      Locked, failed and no-result-this-round must not share wording: locked is
      not a failure, and no result is not "price unavailable". */
+  /* Gift analysis row (library gift filter active) */
+  'gameCard.gift.sources': 'Gift sources',
+  'gameCard.gift.targets': 'Gift targets',
+
   'gameCard.priceData.label': 'Price data',
   'gameCard.priceData.justNow': 'updated just now',
   'gameCard.priceData.minutesAgo': '{n} min ago',
@@ -73,12 +77,10 @@ const gameCard: Partial<Record<MessageKey, string>> = {
   'gameCard.priceData.daysAgo': '{n} d ago',
   'gameCard.priceData.none': 'no price data yet',
   'gameCard.priceData.coveragePartial': 'coverage {ok}/{expected}, incomplete',
-  'gameCard.priceData.tip.locked': '{n} region(s) do not sell this game (locked)',
-  'gameCard.priceData.tip.failed': '{n} region(s) not fetched yet — will retry automatically',
-  'gameCard.priceData.tip.unobserved': '{n} region(s) still being fetched',
-  'gameCard.priceData.tipRegion.locked': '{region}: does not sell this game (locked)',
-  'gameCard.priceData.tipRegion.failed': '{region}: not fetched yet — will retry automatically',
-  'gameCard.priceData.tipRegion.unobserved': '{region}: still being fetched',
+  'gameCard.priceData.tipRegion.failed': '{region}: fetch failed this round — will retry automatically',
+  'gameCard.priceData.tipRegion.failedStale':
+    '{region}: fetch failed this round, showing data from {time}',
+  'gameCard.priceData.tipRegion.notAttempted': '{region}: not fetched yet',
 
   /* Card action row */
   'gameCard.regionPrice.title': 'All regions',
@@ -92,6 +94,7 @@ const gameCard: Partial<Record<MessageKey, string>> = {
   /* Region cell states */
   'gameCard.region.unavailableTip':
     'Price update failed for this region (crawl error); it will be retried in the next round',
+  'gameCard.region.staleTip': 'Fetch failed this round — showing the last successfully fetched price',
   'gameCard.region.clickGiftTip': 'Click to analyze gifting',
   'gameCard.region.pending': 'Pending',
   'gameCard.region.locked': 'Locked',

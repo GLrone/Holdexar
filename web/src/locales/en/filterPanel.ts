@@ -30,11 +30,19 @@ const filterPanel: Partial<Record<MessageKey, string>> = {
   'filterPanel.platform.hb': 'Humble Bundle',
   'filterPanel.platform.xgp': 'Xbox Game Pass',
 
-  'filterPanel.diff.giftOnly': 'Gift only',
   'filterPanel.diff.absolute': 'Absolute',
   'filterPanel.diff.percent': 'Percent',
   'filterPanel.diff.minPlaceholder': 'Min diff',
   'filterPanel.diff.maxPlaceholder': 'Max diff',
+
+  /* Gifting analysis (both modes: receiver price <= sender price x1.15, the sender-priced track) */
+  'filterPanel.gift.title': 'Gifting',
+  'filterPanel.gift.modeOut': 'I send',
+  'filterPanel.gift.modeIn': 'To me',
+  'filterPanel.gift.sender': 'Sender',
+  'filterPanel.gift.receiver': 'Receiver',
+  'filterPanel.gift.targets': 'Targets',
+  'filterPanel.gift.pick': 'Select region',
 
   'filterPanel.reviews.unit': 'reviews',
 

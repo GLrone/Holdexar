@@ -350,6 +350,22 @@ export const pilotApi = {
   }) => request<PilotConfigPayload>('PUT', '/pilot/config', payload),
   ask: (question: string, appid?: number) =>
     request<PilotAskResponse>('POST', '/pilot/ask', { question, appid }),
+  /** 会话账本读取（历史轮还原）；无会话返回 404 */
+  getSession: (sessionId: string) =>
+    request<PilotSessionOut>('GET', `/pilot/sessions/${encodeURIComponent(sessionId)}`, undefined, { noCache: true }),
+}
+
+/** 会话账本里的一轮问答：后端落盘的历史投影，前端按其还原历史轮 */
+export interface PilotSessionTurn {
+  q: string
+  resp: PilotAskResponse
+  ts: string | null
+}
+
+export interface PilotSessionOut {
+  session_id: string
+  turns: PilotSessionTurn[]
+  updated_at: string | null
 }
 
 export interface PilotStreamEvent {
@@ -611,7 +627,7 @@ export interface FamilyLibGame {
   name: string | null
   headerImage: string | null
   releaseDate: string | null
-  genres: string | null
+  tags: GameTag[]
   cnPriceFen: number | null
   originalPriceFen: number | null
   discount: number
@@ -650,7 +666,7 @@ export interface FamilyWishlistItem {
   appid: number
   name: string | null
   headerImage: string | null
-  genres: string | null
+  tags: GameTag[]
   releaseDate: string | null
   cnPriceFen: number | null
   discount: number
@@ -700,25 +716,25 @@ export const familyApi = {
 
 // ─── games ───────────────────────────────────────────────
 
-/** 本轮覆盖率（Cycle 冻结期望集口径；只对本轮期望集内的对象给出） */
+/** 覆盖（活表尝试状态口径）：每个游戏×区的最近一次抓取结果，与触发方
+    无关（自动轮/手动/补抓写同一处）。成功观察 = 拿到 Steam 明确答复
+    （含 locked / 无购买选项）；failed = 传输类失败（旧价保留展示）。 */
 export interface PriceCoverage {
-  cycleId: number
-  cycleStatus: string
-  /** 本轮期望刷新的地区数（分母） */
+  /** 分母：用户启用区服数 */
   expectedUnits: number
-  ok: number
-  /** 锁区：Steam 明确不卖，不是抓取失败 */
-  locked: number
-  /** 欠账待补抓 */
-  missing: number
-  blocked: number
-  /** 本轮窗口内没有结果：不是「价格不可用」 */
-  unobserved: number
-  coverage: number
-  coverageConfirmed: number
-  /** 区级问题明细（大写区码 → locked/missing/blocked/unobserved），只含非 ok 区；
-      旧格式快照无此键——悬停点名问题地区的依据 */
-  regions?: Record<string, string>
+  /** 成功观察区数（含 locked / no_options） */
+  success: number
+  /** 本次失败区数（传输类） */
+  failed: number
+  /** 应抓但尚无尝试记录的区数 */
+  notAttempted: number
+  coverage: number | null
+  /** 区级问题明细（大写区码 → 尝试态），只含非成功区：
+      failed 带 lastSuccessAt（「展示的是 X 时刻的数据」） */
+  regions?: Record<
+    string,
+    { outcome: 'failed' | 'notAttempted'; answer: string | null; lastSuccessAt: string | null }
+  >
 }
 
 /** 价格数据状态。观察时间/新鲜度是**价格**维度，与 updatedAt（实体更新时间）不同源 */
@@ -736,6 +752,14 @@ export interface PriceData {
 /** 捆绑包价格数据状态：与 PriceData 同口径（观察时刻/新鲜度分档），无
     coverage——捆绑包不属价格刷新 Cycle 的期望集 */
 export type BundlePriceData = Omit<PriceData, 'coverage'>
+
+/** 游戏热门用户标签（Steam 玩家自定义标签；数组顺序即票重降序 = 热门程度，
+    至少一个语言对照到名字的冷门标签不会下发；name=中文名 nameEn=英文名） */
+export interface GameTag {
+  tagid: number
+  name: string
+  nameEn?: string | null
+}
 
 export interface GameListItem {
   appid: number
@@ -756,7 +780,7 @@ export interface GameListItem {
   savingsFen: number
   headerImage: string
   /** 区服键控价格矩阵：{"CN": [formatted, cnyFen, cents, discountPct], ...}，只含有价区 */
-  priceMatrix: Record<string, [string, number, number, number]>
+  priceMatrix: Record<string, [string, number, number, number, boolean?]>
   /** 爬过但未抓到价格的区（大写码，missing/blocked）——黄框「待更新」依据 */
   unavailableRegions?: string[]
   hlFlag: number
@@ -781,13 +805,12 @@ export interface GameListItem {
   removedAt: string | null
   /** smart 排序评分（0~1 加权和；公式见后端 scoring.py） */
   smartScore?: number
-  /** smart 五因子拆解（实验池对照展示用；0~1 归一值） */
+  /** smart 四因子拆解（实验池对照展示用；0~1 归一值） */
   smartFactors?: {
     save: number
     quality: number
     timing: number
-    steamBoard: number
-    series: number
+    familiarity: number
   }
 }
 
@@ -917,7 +940,7 @@ export interface GameDetail extends GameListItem {
   type: string
   storeUrl: string
   chineseSupport: string | null
-  genres: string | null
+  tags: GameTag[]
   developers: string[]
   publishers: string[]
   positiveReviews: number
@@ -994,8 +1017,17 @@ export interface GamesListParams {
   minPrice?: number
   maxPrice?: number
   isLowest?: boolean
-  /** 史低/永降标记过滤：hl=新史低+平史低、pp=永降、any=并集（降价动态 feed） */
+  /** 史低/永降标记过滤：hl=新史低+平史低、pp=永降、any=并集（降价动态 feed）；
+   *  new/flat/nonhl=史低三态，可逗号组合按 OR 叠加（游戏库史低多选） */
   flag?: string
+  /** 送礼分析模式：out=我可以送给谁（giftSender 固定送礼方）；
+   *  in=哪些游戏可以低价送给我（giftReceivers 单收礼方，送礼方全区自动遍历）。
+   *  判据=收礼侧区价 ≤ 送礼侧区价×1.15（付款双轨的送礼方价轨） */
+  giftMode?: string
+  /** out 模式送礼方区码（小写）；in 模式不使用 */
+  giftSender?: string
+  /** out 模式=目标地区 csv 多选；in 模式=收礼方单值 */
+  giftReceivers?: string
   onlyHb?: boolean
   onlyEpic?: boolean
   onlyXgp?: boolean
@@ -1203,7 +1235,7 @@ export interface OwnedLibGame {
   name: string | null
   nameEn: string | null
   headerImage: string | null
-  genres: string | null
+  tags: GameTag[]
   releaseDate: string | null
   /** CN 价 CNY 分（未爬到的游戏为 null，不计价值合计） */
   cnPriceFen: number | null
@@ -1410,6 +1442,12 @@ export const crawlApi = {
     ),
   /** 价格刷新轮次（新→旧）；前端只用来看「最近一轮是否已收敛」 */
   cycles: (limit = 1) => request<PriceCycleItem[]>('GET', `/crawl/cycles${toQuery({ limit })}`),
+  /** 全库最近一次成功价格观察（灵动岛时钟事实源，活表 last_success_at 的 MAX；
+   *  自动轮/手动/补抓/回填的成功写入同样推进；null=从未成功观察） */
+  latestObservation: () => request<{ lastSuccessAt: string | null }>(
+    'GET',
+    '/crawl/freshness/latest',
+  ),
   /**
    * 价格事件：**唯一**的事件来源，事实记录只读。
    * 事件类型与前后值都由后端判定，前端只做格式化展示，不据价格矩阵自行推断。
@@ -2513,18 +2551,18 @@ export interface CareerGame {
   platinum: boolean
 }
 
-/** 时长/偏好排行行（类型、开发商、发行商、系列） */
+/** 时长/偏好排行行（标签、开发商、发行商、系列） */
 export interface CareerTasteRow {
   games: number
   playtimeMin: number
   platinum: number
-  genre?: string
+  tag?: string
   name?: string
 }
 
 /** 生涯口味画像（雷达/条形/年代构成的数据源） */
 export interface CareerTasteProfile {
-  genres: (CareerTasteRow & { genre: string })[]
+  tags: (CareerTasteRow & { tag: string })[]
   developers: (CareerTasteRow & { name: string })[]
   publishers: (CareerTasteRow & { name: string })[]
   series: (CareerTasteRow & { name: string })[]
@@ -2614,7 +2652,7 @@ export interface CareerPayload {
     medianMin: number
     fastest: (CareerGame & { date: number }) | null
     slowest: (CareerGame & { date: number }) | null
-    genres: { genre: string; count: number }[]
+    tags: { tag: string; count: number }[]
     spanDays: number
     perYear: { year: number; count: number }[]
     firstDate: number

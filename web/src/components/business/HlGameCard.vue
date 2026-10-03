@@ -63,6 +63,13 @@ const props = defineProps<{
   /** 商店页动作按钮（星标旁）：remove = 移出商店，restore = 恢复（已移除视图）；
    *  不传 = 不渲染（其他页面不受影响）。点击只上报事件，API 由页面侧处理 */
   storeAction?: 'remove' | 'restore'
+  /** 送礼分析行（游戏库筛选激活时由页面逐卡计算传入）：label + 命中地区价
+   *  （区价升序前 4 枚，more = 未展示余量） */
+  giftLine?: {
+    label: string
+    items: Array<{ code: string; price: string }>
+    more: number
+  }
 }>()
 
 const emit = defineEmits<{ (e: 'storeAction'): void }>()
@@ -352,6 +359,8 @@ interface RegionPrice {
   free: boolean
   /** 爬过但未抓到价格（missing/blocked）：黄框「待更新」，区别于真锁区 */
   unavailable: boolean
+  /** 本次抓取失败、展示的是上次成功价（attempt_outcome=failed 的保留价） */
+  stale: boolean
 }
 
 /** priceMatrix 为区服键控对象；展示顺序 = 服务端下发区服顺序 */
@@ -370,6 +379,7 @@ const regionPrices = computed<RegionPrice[]>(() =>
       locked: true,
       free: false,
       unavailable,
+      stale: false,
     }
     if (!cell) return base
     return {
@@ -380,6 +390,7 @@ const regionPrices = computed<RegionPrice[]>(() =>
       // cnyFen=0 且 cents=0 = 免费态；cnyFen=0 但 cents>0 = 汇率缺失（沿用锁区显示）
       free: cell[2] === 0,
       locked: cell[1] === -1 || (cell[1] === 0 && cell[2] !== 0),
+      stale: cell[4] === true,
     }
   }),
 )
@@ -602,6 +613,7 @@ const gpwDisplayPrices = computed<RegionPrice[]>(() => {
       nativeCents: 0,
       locked: true,
       unavailable,
+      stale: false,
     }
     if (!vrp) return base
     return {
@@ -1308,6 +1320,21 @@ const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/asse
           <span v-else class="diff-badge">{{ t('gameCard.price.noDiff') }}</span>
         </div>
 
+        <!-- 送礼分析行（两行结构：小标 + 整宽 chips 行，前 3 枚 + 余量徽标，
+             完整清单走赠礼分析弹窗）；grid-only（列表模式不渲染） -->
+        <div v-if="giftLine" class="gift-row grid-only">
+          <span class="gift-label">{{ giftLine.label }}</span>
+          <span class="gift-chips">
+            <span v-for="it in giftLine.items" :key="it.code" class="gift-chip">
+              <img :src="flagUrl(it.code)" class="flag-icon" :alt="it.code" />
+              {{ it.price }}
+            </span>
+            <span v-if="giftLine.more > 0" class="gift-chip gift-chip-more">
+              +{{ giftLine.more }}
+            </span>
+          </span>
+        </div>
+
         <div v-if="game.priceData" class="price-row">
           <span class="price-label">{{ t('gameCard.priceData.label') }}</span>
           <span
@@ -1446,7 +1473,9 @@ const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/asse
               :title="
                 rec.unavailable
                   ? t('gameCard.region.unavailableTip')
-                  : t('gameCard.region.clickGiftTip')
+                  : rec.stale
+                    ? t('gameCard.region.staleTip')
+                    : t('gameCard.region.clickGiftTip')
               "
               @click="handleRegionClick(rec.code, $event)"
             >
@@ -1456,7 +1485,7 @@ const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/asse
                 rec.unavailable ? t('gameCard.region.pending') : t('gameCard.region.locked')
               }}</span>
               <span v-else-if="rec.free" class="free-tag">{{ t('gameCard.price.free') }}</span>
-              <div v-else class="prices">
+              <div v-else class="prices" :class="{ 'stale-price': rec.stale }">
                 <span class="orig">{{ rec.nativePrice }}</span>
                 <span class="cny" :class="priceClass(rec)">¥{{ (rec.cnyFen / 100).toFixed(2) }}</span>
               </div>

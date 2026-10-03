@@ -127,7 +127,7 @@ export const TITLE_CARDS: CareerCardSpec[] = [
   { id: 'nightowl', category: 'activity', icon: 'moon', unit: 'count', thresholds: [50, 200, 500, 1000, 2000], metric: (c) => c.activity.nightUnlocks, nameKey: `${KEY}.card.nightowl.name`, scopeKey: `${KEY}.scope.nightUnlocks` },
 
   // ── 偏好 ───────────────────────────────────────────────
-  { id: 'explorer', category: 'taste', icon: 'globe', unit: 'count', thresholds: [4, 6, 9, 11, 13], metric: (c) => c.taste.genres.length, nameKey: `${KEY}.card.explorer.name`, scopeKey: `${KEY}.scope.genreBreadth` },
+  { id: 'explorer', category: 'taste', icon: 'globe', unit: 'count', thresholds: [4, 6, 9, 11, 13], metric: (c) => c.taste.tags.length, nameKey: `${KEY}.card.explorer.name`, scopeKey: `${KEY}.scope.tagBreadth` },
 
   // ── 库藏 ───────────────────────────────────────────────
   { id: 'curator', category: 'library', icon: 'wallet', unit: 'fen', thresholds: [100000, 600000, 1500000, 3000000, 6000000], metric: (c) => c.library.valueFen, nameKey: `${KEY}.card.curator.name`, scopeKey: `${KEY}.scope.libraryValue` },
