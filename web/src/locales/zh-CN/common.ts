@@ -6,6 +6,8 @@
 
 const common = {
   'common.empty': '暂无数据',
+  'common.reveal': '显示明文',
+  'common.mask': '隐藏',
   'common.loading': '加载中…',
   'common.confirm': '确定',
   'common.cancel': '取消',

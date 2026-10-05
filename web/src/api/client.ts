@@ -237,18 +237,38 @@ export const settingsApi = {
 
 // ─── pilot（领航员：比价助手问答）────────────────────────
 
+/** 模型供应商（绑定页左导航 / 菜单分组的账本投影；has_key 不含密钥原文） */
+export interface PilotProvider {
+  id: string
+  name: string
+  protocol: string
+  base_url: string
+  models: string[]
+  models_disabled: string[]
+  has_key: boolean
+  /** 模型上下文窗口（token，用户可选配置）；未知 = null（历史预算回落固定值） */
+  context_window: number | null
+}
+
 export interface PilotConfigPayload {
   protocol: string
   enabled: boolean
   base_url: string
   model: string
   models: string[]
+  /** 被禁用的模型（不进切换菜单；未列出的默认启用） */
+  models_disabled: string[]
   has_api_key: boolean
   monthly_cap: number
+  /** 活跃供应商的模型窗口（token）；未知 = null */
+  context_window: number | null
   usage_inp: number
   usage_out: number
   usage_calls: number
   usage_total: number
+  /** 活跃供应商 id（无供应商账本时为空） */
+  active: string
+  providers: PilotProvider[]
 }
 
 /** 领航员入口的游戏上下文（游戏详情页进入时携带） */
@@ -267,6 +287,35 @@ export interface PilotPriceFacts {
   cn: { cnyFen: number | null; discount: number } | null
   lowest: { cnyFen: number; snapshotAt: string | null } | null
   year: { minFen: number; maxFen: number; medianFen: number; count: number } | null
+  alt?: { region: string; cnyFen: number; discount: number } | null
+  /** 近一年国区价格变化点 [YYYY-MM-DD, 分]，按时间升序（阶梯图数据源） */
+  trend?: [string, number][]
+}
+
+/** 地区对比卡：全区现价中最便宜的若干区 + 账号结算区（cnyFen 升序） */
+export interface PilotRegionsFacts {
+  kind: 'regions'
+  appid: number
+  name: string | null
+  accountRegion: string
+  items: { region: string; display: string; cnyFen: number; discount: number }[]
+  count: number
+}
+
+/** 多游戏对比卡：2~3 款并排（region 非空 = 国区不可买、价格取自该最低可购区） */
+export interface PilotCompareFacts {
+  kind: 'compare'
+  items: {
+    appid: number
+    name: string | null
+    positiveRate: number | null
+    reviewCount: number | null
+    cnyFen: number | null
+    discount: number
+    region: string | null
+    lowestFen: number | null
+    medianFen: number | null
+  }[]
 }
 
 export interface PilotGameFactsItem {
@@ -276,11 +325,18 @@ export interface PilotGameFactsItem {
   discount: number | null
   positiveRate: number | null
   reviewCount: number | null
+  chineseSupport?: string | null
+  /** 行内注记（词条化）：key 对应 `pilot.row.{key}`，data 其余键直接插值、at 截日期 */
+  note?: { key: string; v?: string; at?: string | null } | null
 }
 
 export interface PilotGameFacts {
   kind: 'games'
+  /** 卡题词条键片段（`pilot.rows.{titleKey}`）；缺省用通用「候选游戏」 */
+  titleKey?: string
   items: PilotGameFactsItem[]
+  /** 清单全量数（截前 N 条展示时给模型与标题栏用） */
+  total?: number
 }
 
 /** 写动作回执（Phase 2 白名单：monitor_add / alert_add，均为单对象可逆动作） */
@@ -302,20 +358,133 @@ export interface PilotNavigateFacts {
   path: string
 }
 
-export type PilotFacts = PilotPriceFacts | PilotGameFacts | PilotActionFacts | PilotNavigateFacts
+/** 行卡：清单与诊断的通用形态。k 为名称/区码等专有名词；vKey 对应词条键
+ *  `pilot.row.{vKey}`（data.priceFen 自动格式化为 ¥，data 其余键直接插值）；
+ *  v 为原样值（错误摘要/计数串/区码）；at 为 ISO 时刻，前端截日期显示。 */
+export interface PilotRowsFacts {
+  kind: 'rows'
+  titleKey: string
+  name?: string | null
+  appid?: number | null
+  rows: {
+    k: string
+    /** 左侧词条键（有值时优先于 k，用于后端只能给机器码的行） */
+    kindKey?: string
+    vKey?: string
+    v?: string
+    tone?: 'ok' | 'warn' | 'bad'
+    at?: string | null
+    data?: Record<string, string | number>
+  }[]
+}
+
+/** 批量提议卡：待用户确认的批量动作清单（提议无副作用，确认后才逐项执行） */
+export interface PilotProposalFacts {
+  kind: 'proposal'
+  pid: string
+  action: 'add_follow' | 'create_price_alert' | 'delete'
+  items: { appid?: number; name: string; key?: string; reason?: string }[]
+  args: { target_type?: string; target_value_yuan?: number }
+  state: 'pending' | 'confirmed' | 'rejected' | 'withdrawn' | 'dismissed'
+  /** 确认后的结果回填（仅本地展示，后端以业务账本为准） */
+  done?: number
+  failedCount?: number
+}
+
+/** 家庭组卡：成员行复用家庭页的「头像+昵称+角色+地区」形态（family 域同一 payload 投影） */
+export interface PilotFamilyFacts {
+  kind: 'family'
+  bound: boolean
+  joined?: boolean
+  walletRegion?: string | null
+  members: {
+    steamid: string
+    name?: string | null
+    avatar?: string | null
+    role?: 'primary' | 'member'
+    region?: string | null
+  }[]
+  total?: number
+}
+
+/** 奖杯卡：成就域 summary 的富投影（KPI + 白金陈列 + 最近解锁） */
+export interface PilotAchievementFacts {
+  kind: 'achievements'
+  hasCredential: boolean
+  platinum: number
+  unlocked: number
+  total: number
+  completionRate?: number | null
+  lastSyncedAt?: string | null
+  platinums: { appid: number; name: string | null }[]
+  recent: { appid: number; name: string; gameName?: string | null; at?: number | null }[]
+}
+
+/** 工作流流水线步骤 */
+export interface PilotStepperStep {
+  id: number | string
+  title: string
+  detail?: string
+  status: 'wait' | 'running' | 'ok' | 'warn' | 'empty' | 'error'
+  current?: number
+  total?: number
+  badge?: string
+}
+
+/** 长任务/工作流分步卡片：阶段式流水线进度展示（如全量扫描与批量提议） */
+export interface PilotStepperFacts {
+  kind: 'stepper'
+  title: string
+  description?: string
+  currentStepIndex?: number
+  steps: PilotStepperStep[]
+}
+
+export type PilotFacts =
+  | PilotPriceFacts
+  | PilotRegionsFacts
+  | PilotCompareFacts
+  | PilotGameFacts
+  | PilotActionFacts
+  | PilotNavigateFacts
+  | PilotRowsFacts
+  | PilotProposalFacts
+  | PilotFamilyFacts
+  | PilotAchievementFacts
+  | PilotStepperFacts
 
 /** agent 时间线步骤：label 对应词条键 `pilot.step.{label}`，data 供词条插值。
  *  status = ok / empty / denied；running 只存在于流式过程中的本地态。 */
 export interface PilotStep {
   label: string
   status: 'ok' | 'empty' | 'denied' | 'running'
-  data: { count?: number; name?: string | null; target?: string }
+  data: { count?: number; name?: string | null; target?: string; path?: string }
+}
+
+/** agent 循环的一步（阶段）：该步的思考、前言正文与工具步骤同属一条记录 */
+export interface PilotPhase {
+  step: number
+  /** 该步思考原文（单阶段超预算时被截断，见 truncated） */
+  thinking: string
+  /** 该步正文；terminal 段的正文即终答 */
+  text: string
+  /** 该步思考工时（毫秒）；无思考为 null */
+  think_ms?: number | null
+  /** 该步思考超单阶段预算，已停止累加 */
+  truncated?: boolean
+  /** 该步是终答轮（无工具调用）；步数耗尽的轮次无此标记 */
+  terminal?: boolean
+  steps: PilotStep[]
 }
 
 export interface PilotAskResponse {
   /** LLM 回答原文；facts / guide / none 形态下为空串，展示层按 source 渲染 */
   answer: string
   source: 'llm' | 'facts' | 'guide' | 'none'
+  /** 推理模型思维链原文（reasoning_content）；普通模型或降级路径为 null */
+  thinking?: string | null
+  /** 思考工时（毫秒，思考通道活跃墙钟累计）；无思考/降级轮为 null */
+  think_ms?: number | null
   /** 回退机器码（llm_off / cap_reached / llm_failed / no_data），用户语言由前端翻 */
   reason: string | null
   facts: PilotFacts | null
@@ -323,19 +492,65 @@ export interface PilotAskResponse {
   cards: PilotFacts[]
   /** 本轮 agent 时间线全量（后端 tools.tool_step 产出）；降级路径为空 */
   steps?: PilotStep[]
+  /** 本轮按循环步分段的阶段记录（权威）；thinking 与 steps 均由它派生 */
+  phases?: PilotPhase[]
   cached: boolean
+  /** 本轮发给模型的上下文估算 token 数（agent 路径才有） */
+  ctx_tokens?: number | null
+  /** 当前会话生效标题（账本 title 行或首问兜底）；标题栏实时显示 */
+  title?: string | null
+  /** 上下文历史预算（装配让位基准） */
+  ctx_budget?: number | null
+  /** 上下文构成估算（五来源字符数，agent 路径才有）；分段条占比口径 */
+  ctx_breakdown?: { source: string; chars: number }[] | null
+  /** 输入缓存命中率（0-1，provider 报告缓存 token 时才有；本轮最近一次请求口径） */
+  cache_hit_rate?: number | null
+  /** 本轮输入 token 合计（provider 用量口径，含缓存部分；未回传为 0） */
+  usage_in?: number
+  /** 本轮输出 token 合计（provider 回传口径；未回传为 0） */
+  usage_out?: number
+  /** 本轮缓存读 token 合计（跨请求累计；provider 从未报告为 null） */
+  cache_read_tokens?: number | null
+  /** 本轮缓存写 token 合计（仅 Anthropic 系报告；从未报告为 null） */
+  cache_write_tokens?: number | null
+  /** 本轮计费输入总量（含缓存部分，缓存命中率分母口径）；无用量回传为 null */
+  cache_base_tokens?: number | null
+  /** 生成墙钟合计（毫秒，各请求首个内容增量→流结束；仅用量同步回传的请求计入） */
+  decode_ms?: number
+  /** 计入生成墙钟的请求的输出 token 合计（decode_ms 配对分子） */
+  decode_out?: number
+  /** 首字延迟合计（毫秒，跨请求累计） */
+  ttft_ms?: number
+  /** 计入首字延迟的请求数 */
+  ttft_n?: number
+  /** 本轮总耗时（毫秒，agent 路径墙钟，含思考与工具执行）；降级轮为 null */
+  elapsed_ms?: number | null
+  /** 本轮完成时已归档进要点存档的轮数边界（过程链记忆条目用）；降级轮为 null */
+  archived_through?: number | null
+}
+
+export interface PilotToolRunResult {
+  step: PilotStep
+  cards: PilotFacts[]
 }
 
 export const pilotApi = {
   getConfig: () => request<PilotConfigPayload>('GET', '/pilot/config'),
+  /** 快捷动作直达：+ 菜单点选 → 确定性工具执行（不经模型，省两轮延迟） */
+  runTool: (name: string, label: string, sessionId?: string) =>
+    request<PilotToolRunResult>('POST', '/pilot/tool', {
+      name,
+      label,
+      session_id: sessionId || undefined,
+    }),
   test: (payload: { protocol?: string; base_url?: string; api_key?: string; model?: string }) =>
     request<{ ok: boolean; latency_ms: number; model: string; reply: string; reason: string | null; detail: string }>(
       'POST',
       '/pilot/test',
       payload,
     ),
-  detect: (payload: { base_url?: string; api_key?: string; protocol?: string }) =>
-    request<{ protocol: string; vendor: string; models: string[]; suggested: string[]; key_valid: boolean | null }>(
+  detect: (payload: { base_url?: string; api_key?: string; protocol?: string; provider_id?: string }) =>
+    request<{ protocol: string; vendor: string; models: string[]; suggested: string[]; key_valid: boolean | null; reason: string | null }>(
       'POST',
       '/pilot/detect',
       payload,
@@ -347,12 +562,51 @@ export const pilotApi = {
     model?: string
     api_key?: string
     monthly_cap?: number
+    models_disabled?: string[]
+    /** 切换活跃供应商（模型自动重置为新家启用清单） */
+    active?: string
   }) => request<PilotConfigPayload>('PUT', '/pilot/config', payload),
+  listProviders: () =>
+    request<{ items: PilotProvider[] }>('GET', '/pilot/providers', undefined, { noCache: true }),
+  createProvider: (payload: { name?: string; protocol?: string; base_url?: string; api_key?: string; models?: string[]; context_window?: number | null }) =>
+    request<PilotProvider>('POST', '/pilot/providers', payload),
+  updateProvider: (
+    id: string,
+    payload: { name?: string; protocol?: string; base_url?: string; models?: string[]; models_disabled?: string[]; api_key?: string; context_window?: number | null },
+  ) => request<PilotProvider>('PUT', `/pilot/providers/${encodeURIComponent(id)}`, payload),
+  deleteProvider: (id: string) =>
+    request<{ ok: boolean }>('DELETE', `/pilot/providers/${encodeURIComponent(id)}`),
   ask: (question: string, appid?: number) =>
     request<PilotAskResponse>('POST', '/pilot/ask', { question, appid }),
   /** 会话账本读取（历史轮还原）；无会话返回 404 */
   getSession: (sessionId: string) =>
     request<PilotSessionOut>('GET', `/pilot/sessions/${encodeURIComponent(sessionId)}`, undefined, { noCache: true }),
+  /** 手动归档：早期轮次蒸馏进要点存档（与自动压缩同一实现）；机器码见 reason */
+  compactSession: (sessionId: string) =>
+    request<{ ok: boolean; reason?: string | null; summary_through?: number; turn_total?: number }>(
+      'POST',
+      `/pilot/sessions/${encodeURIComponent(sessionId)}/compact`,
+    ),
+  /** 历史会话清单（mtime 倒序投影） */
+  listSessions: (limit = 50) =>
+    request<{ items: PilotSessionListItem[] }>('GET', `/pilot/sessions?limit=${limit}`, undefined, { noCache: true }),
+  /** 会话改名（账本追加 title 记录，后者胜） */
+  renameSession: (sessionId: string, text: string) =>
+    request<{ ok: boolean }>('PUT', `/pilot/sessions/${encodeURIComponent(sessionId)}/title`, { text }),
+  /** 删除会话文件（与 TTL 清扫同机制） */
+  deleteSession: (sessionId: string) =>
+    request<{ ok: boolean }>('DELETE', `/pilot/sessions/${encodeURIComponent(sessionId)}`),
+  /** 批量提议确认：approve 为真逐项执行既有写动作，为假作废；机器码见 reason */
+  confirmProposal: (sessionId: string, pid: string, approve: boolean) =>
+    request<{
+      ok: boolean
+      state: string
+      action: string
+      total: number
+      done: number
+      failed: { appid: number; name: string | null }[]
+      reason: string | null
+    }>('POST', '/pilot/proposal/confirm', { session_id: sessionId, pid, approve }),
 }
 
 /** 会话账本里的一轮问答：后端落盘的历史投影，前端按其还原历史轮 */
@@ -362,14 +616,68 @@ export interface PilotSessionTurn {
   ts: string | null
 }
 
+/** 压缩边界：第 after_turn 轮之后发生过一次压缩（对话流分隔线依据） */
+export interface PilotCompactMarker {
+  after_turn: number
+  trigger: string
+  ts: string | null
+  pre_tokens?: number | null
+  post_tokens?: number | null
+}
+
+/** 会话级统计投影（后端对账本全部轮次的只读折叠；底栏统计与消耗明细种子） */
+export interface PilotSessionStats {
+  turns: number
+  steps: number
+  elapsed_ms: number
+  ttft_ms: number
+  ttft_n: number
+  /** 速度口径 = decode_out / decode_ms（加权聚合，非各轮速率均值） */
+  decode_ms: number
+  decode_out: number
+  usage_in: number
+  usage_out: number
+  cache_read_tokens: number | null
+  cache_write_tokens: number | null
+  /** 计费输入合计（缓存命中率分母；null 时无命中率可言） */
+  cache_base_tokens: number | null
+}
+
 export interface PilotSessionOut {
   session_id: string
   turns: PilotSessionTurn[]
   updated_at: string | null
+  /** 账本总轮数 */
+  turn_total: number
+  /** 已压缩进要点存档的轮数边界 */
+  summary_through: number
+  /** 压缩边界列表（按发生顺序），前端在对话流对应位置插分隔线 */
+  markers?: PilotCompactMarker[]
+  /** 会话生效标题（账本 title 行或首问兜底） */
+  title: string
+  /** 本会话出现过的批量提议终态（按 pid）：历史轮卡片据此校正可点性 */
+  proposals?: { pid: string; state: string; done: number | null; failedCount?: number }[]
+  /** 全部轮次统计折叠（空会话为 null） */
+  stats?: PilotSessionStats | null
+}
+
+/** 历史会话清单项（账本只读投影） */
+export interface PilotSessionListItem {
+  sid: string
+  title: string
+  turn_total: number
+  /** 账本 mtime（ISO）：最近一次落账时刻 */
+  updated_at: string | null
+  /** ask 流在途（agent 正在生成本会话回复） */
+  running?: boolean
 }
 
 export interface PilotStreamEvent {
-  type: 'thinking' | 'answer' | 'tool_start' | 'tool' | 'facts' | 'done' | 'error'
+  type: 'ack' | 'busy' | 'step_start' | 'thinking' | 'answer' | 'tool_start' | 'tool' | 'facts' | 'done' | 'error'
+  /** ack：全局在飞轮数（含本轮）——供应商按 Key 排队时前端据此显示等待态 */
+  active?: number
+  /** step_start：进入第几步（阶段边界，先于该步任何增量） */
+  step?: number
   delta?: string
   name?: string
   /** tool / tool_start 事件的步骤词条片段与终态（见 PilotStep） */
@@ -378,11 +686,21 @@ export interface PilotStreamEvent {
   data?: PilotStep['data']
   facts?: PilotFacts | null
   answer?: string
+  /** 推理模型思维链原文；普通模型或降级路径为 null */
   thinking?: string | null
+  /** 思考工时（毫秒，思考通道活跃墙钟累计）；无思考/降级轮为 null */
+  think_ms?: number | null
+  /** 本轮装配发生了上下文压缩（对话流插分隔线；ctx 水位已回落） */
+  compacted?: boolean
   source?: PilotAskResponse['source']
   reason?: string | null
   steps?: PilotStep[]
+  /** 本轮按循环步分段的阶段记录（done 事件携带，权威） */
+  phases?: PilotPhase[]
   cached?: boolean
+  title?: string | null
+  ctx_tokens?: number | null
+  ctx_budget?: number | null
 }
 
 /** 流式问答：SSE 帧解析（data: JSON / data: [DONE]），事件逐个回调。
@@ -393,11 +711,14 @@ export async function askPilotStream(
   appid: number | undefined,
   sessionId: string | undefined,
   onEvent: (e: PilotStreamEvent) => void,
+  referenceSid?: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   const resp = await fetch(`${BASE}/pilot/ask/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question, appid, session_id: sessionId }),
+    body: JSON.stringify({ question, appid, session_id: sessionId, reference_sid: referenceSid || undefined }),
+    signal,
   })
   if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`)
   const reader = resp.body.getReader()
@@ -1525,6 +1846,35 @@ export interface UpdatePending {
   tag?: string
 }
 
+/** 密钥保护状态：凭据静态加密的密钥托管方式与解锁态 */
+export interface SecurityStatus {
+  /** legacy=机器绑定（默认）/ dpapi=系统凭据保护 / passphrase=口令保护 / unknown=密钥文件损坏 */
+  mode: 'legacy' | 'dpapi' | 'passphrase' | 'unknown'
+  /** 口令模式下未解锁时为 true：此间凭据不可读写 */
+  locked: boolean
+  /** 系统凭据保护（Windows DPAPI）在当前平台是否可用 */
+  dpapi_available: boolean
+  error: string
+}
+
+/** 加密导出文件（.hxexport） */
+export interface ExportItem {
+  name: string
+  sizeBytes: number
+  createdAt: string
+}
+
+export interface ExportResult {
+  path: string
+  name: string
+  sizeBytes: number
+  createdAt: string
+  /** 各用户数据表导出行数 */
+  counts: Record<string, number>
+  /** 明确排除的公共数据说明（随包种子/目录/价格） */
+  excludes: string[]
+}
+
 export const systemApi = {
   /** 运行信息（关于页）：应用名 / 版本 / Python / 平台 / 数据目录 / 运行时长 / 发布仓库 */
   info: () =>
@@ -1558,6 +1908,28 @@ export const systemApi = {
     ),
   backupRemove: (name: string) =>
     request<{ removed: boolean }>('DELETE', `/system/backup/${encodeURIComponent(name)}`),
+  // 密钥保护（凭据静态加密的密钥托管：机器绑定 / 系统凭据 / 口令）
+  securityStatus: () => request<SecurityStatus>('GET', '/system/security'),
+  /** 切换保护方式：后端全库换钥重加密（失败不改动库与密钥文件） */
+  securitySetMode: (mode: string, passphrase?: string, currentPassphrase?: string) =>
+    request<{ ok: boolean; counts: Record<string, number>; security: SecurityStatus }>(
+      'POST',
+      '/system/security/mode',
+      { mode, passphrase: passphrase || null, current_passphrase: currentPassphrase || null },
+    ),
+  securityUnlock: (passphrase: string) =>
+    request<{ ok: boolean; security: SecurityStatus }>('POST', '/system/security/unlock', {
+      passphrase,
+    }),
+  securityLock: () =>
+    request<{ ok: boolean; security: SecurityStatus }>('POST', '/system/security/lock'),
+  // 敏感数据加密导出（只含用户侧数据；不含随包种子与公共目录/价格数据）
+  exportCreate: (password: string) => request<ExportResult>('POST', '/export', { password }),
+  exportList: () => request<{ items: ExportItem[] }>('GET', '/export/list'),
+  exportRemove: (name: string) =>
+    request<{ removed: boolean }>('DELETE', `/export/${encodeURIComponent(name)}`),
+  /** 导出文件下载地址（浏览器直下，不经 request 封装） */
+  exportDownloadUrl: (name: string) => `${BASE}/export/download/${encodeURIComponent(name)}`,
   // 应用更新（GitHub Releases）
   updateCheck: () => request<UpdateCheckResult>('GET', '/system/update-check'),
   /** 发起下载（后端 fire-and-forget，进度走 updateProgress 轮询）。

@@ -18,6 +18,7 @@ const shell = {
   'nav.group.system': '系统',
   'nav.dashboard': '仪表盘',
   'nav.library': '找游戏',
+  'nav.pilot': '领航台',
   'nav.gamelib': '游戏库',
   'nav.achievements': '成就',
   'nav.bundles': '捆绑包',

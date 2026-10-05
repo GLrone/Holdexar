@@ -4,6 +4,8 @@ import type { MessageKey } from '../zh-CN'
 
 const common: Partial<Record<MessageKey, string>> = {
   'common.empty': 'No data',
+  'common.reveal': 'Show',
+  'common.mask': 'Hide',
   'common.loading': 'Loading…',
   'common.confirm': 'Confirm',
   'common.cancel': 'Cancel',

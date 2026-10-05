@@ -9,6 +9,7 @@ const shell: Partial<Record<MessageKey, string>> = {
   'nav.group.system': 'System',
   'nav.dashboard': 'Dashboard',
   'nav.library': 'Find Games',
+  'nav.pilot': 'Pilot Console',
   'nav.gamelib': 'Game Library',
   'nav.achievements': 'Achievements',
   'nav.bundles': 'Bundles',

@@ -442,6 +442,16 @@
 .hl-input-wrap .hl-isuffix { display: inline-flex; color: var(--text-faint); flex-shrink: 0; }
 .hl-input-wrap .hl-iprefix svg,
 .hl-input-wrap .hl-isuffix svg { width: 14px; height: 14px; }
+/* 密钥眼睛按钮：掩码/明文切换（ghost 态，悬停点亮） */
+.hl-input-wrap .hl-input-eye {
+  border: none;
+  background: none;
+  padding: 2px;
+  cursor: pointer;
+  color: var(--text-faint);
+  transition: color var(--transition);
+}
+.hl-input-wrap .hl-input-eye:hover { color: var(--text-secondary); }
 .hl-input-wrap--sm { min-width: 0; }
 .hl-textarea {
   display: block;
