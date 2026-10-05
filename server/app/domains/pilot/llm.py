@@ -1,17 +1,21 @@
 """pilot LLM 客户端：多协议适配层。
 
-四种协议各自适配请求构造、鉴权头、流式解析与工具调用格式，归一化为
+三种协议各自适配请求构造、鉴权头、流式解析与工具调用格式，归一化为
 统一事件流供 agent 循环消费：
   ("thinking", 增量)            推理通道（协议/模型支持时才有）；
   ("answer", 增量)              正文通道；
   ("tool_calls", [assembled])   工具调用（arguments 已解析为 dict）；
-  ("usage", (输入, 输出))        用量（provider 回传时才有）。
+  ("usage", (输入, 输出))        用量（provider 回传时才有）；
+  ("cache", {"rate","read","write","base"})
+                                 输入缓存计量：rate=命中率(0-1)，read/write=缓存读/写
+                                 token 数，base=计费输入总量（含缓存部分）；provider
+                                 未报告缓存时 base 仍给出（计费口径的分母）。
 
 协议：
-- openai     OpenAI 兼容 /chat/completions（DeepSeek / 智谱 / 通义 / Kimi 等）
-- anthropic  Messages API（thinking 块、tool_use/tool_result）
-- gemini     Google generateContent（thought 部件、functionCall/functionResponse）
-- ollama     本地 Ollama /api/chat（ndjson，thinking 字段）
+- openai            OpenAI 兼容 /chat/completions
+- openai-responses  OpenAI Responses API /responses（instructions/input 工具即 function_call 项）
+- anthropic         Messages API（thinking 块、tool_use/tool_result）
+- ollama            本地 Ollama /api/chat（ndjson，thinking 字段）
 
 网络/协议异常统一收敛为 PilotLlmError，由服务层转用户语言提示。"""
 from __future__ import annotations
@@ -24,18 +28,18 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-_TIMEOUT_S = 60.0
-_MAX_OUTPUT_TOKENS = 700
-_ANTHROPIC_THINKING_BUDGET = 1024
+_TIMEOUT = httpx.Timeout(180.0, connect=15.0, read=180.0, write=30.0)
+_MAX_OUTPUT_TOKENS = 4096
+_ANTHROPIC_THINKING_BUDGET = 2048
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
-PROTOCOLS = ("openai", "anthropic", "gemini", "ollama")
+PROTOCOLS = ("openai", "openai-responses", "anthropic", "ollama")
 
 DEFAULT_BASE_URL = {
     "openai": "",
+    "openai-responses": "",
     "anthropic": "https://api.anthropic.com",
-    "gemini": "https://generativelanguage.googleapis.com",
     "ollama": "http://127.0.0.1:11434",
 }
 
@@ -48,10 +52,22 @@ def _is_loopback(base_url: str) -> bool:
     return urlsplit(base_url).hostname in _LOOPBACK_HOSTS
 
 
-def _client(base_url: str) -> httpx.AsyncClient:
+def http_client(base_url: str) -> httpx.AsyncClient:
     """回环地址（自建/本地网关）绕过系统代理——httpx trust_env 会把环回
     请求也交给代理，代理对回环返回 502；外部地址照常跟随环境代理。"""
-    return httpx.AsyncClient(timeout=_TIMEOUT_S, trust_env=not _is_loopback(base_url))
+    return httpx.AsyncClient(timeout=_TIMEOUT, trust_env=not _is_loopback(base_url))
+
+
+def _auth_headers(protocol: str, api_key: str) -> dict:
+    """匿名端点（免费网关 / 本地 Ollama）不落鉴权头：空值头会被 httpx 拒绝。"""
+    if protocol == "anthropic":
+        headers = {"anthropic-version": "2023-06-01"}
+        if api_key:
+            headers["x-api-key"] = api_key
+        return headers
+    if protocol == "ollama" or not api_key:
+        return {}
+    return {"Authorization": f"Bearer {api_key}"}
 
 
 def _assembled(pending: dict[int, dict]) -> list[dict]:
@@ -85,9 +101,15 @@ def _sse_data_lines(aiter_lines):
 
 def _openai_request(base_url: str, api_key: str, model: str, messages: list[dict], tools: list[dict] | None) -> tuple[str, dict, dict]:
     url = base_url.rstrip("/") + "/chat/completions"
+    # 兼容层收敛：部分网关（unisound 等）拒绝 assistant content=null（纯 tool_calls
+    # 轮的标准形态），统一规范为空串——对标准 OpenAI 同样合法。
+    normalized = [
+        {**m, "content": ""} if m.get("role") == "assistant" and m.get("content") is None else m
+        for m in messages
+    ]
     body = {
         "model": model,
-        "messages": messages,
+        "messages": normalized,
         "temperature": 0.4,
         "max_tokens": _MAX_OUTPUT_TOKENS,
         "stream": True,
@@ -95,7 +117,7 @@ def _openai_request(base_url: str, api_key: str, model: str, messages: list[dict
     }
     if tools:
         body["tools"] = tools
-    return url, {"Authorization": f"Bearer {api_key}"}, body
+    return url, _auth_headers("openai", api_key), body
 
 
 async def _openai_parse(aiter_lines):
@@ -107,7 +129,12 @@ async def _openai_parse(aiter_lines):
             continue
         usage = chunk.get("usage")
         if usage:
-            yield ("usage", (int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)))
+            prompt = int(usage.get("prompt_tokens") or 0)
+            yield ("usage", (prompt, int(usage.get("completion_tokens") or 0)))
+            cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+            read = int(cached) if isinstance(cached, (int, float)) else None
+            yield ("cache", {"rate": (min(1.0, read / prompt) if read is not None and prompt > 0 else None),
+                             "read": read, "write": None, "base": prompt or None})
             continue
         choices = chunk.get("choices") or []
         if not choices:
@@ -141,6 +168,137 @@ async def _openai_parse(aiter_lines):
         assembled = _assembled(pending)
         if assembled:
             yield ("tool_calls", assembled)
+
+
+# ── openai-responses（Responses API）─────────────────────────────────
+
+def _responses_input(messages: list[dict]) -> tuple[str | None, list[dict]]:
+    """内部消息 → Responses input 项：system 提为 instructions，
+    工具调用/结果转 function_call / function_call_output 项。"""
+    system_parts = [m["content"] for m in messages if m["role"] == "system" and m.get("content")]
+    out: list[dict] = []
+    for m in messages:
+        role = m.get("role")
+        if role == "system":
+            continue
+        if role == "user":
+            out.append({"role": "user", "content": [{"type": "input_text", "text": m.get("content") or ""}]})
+        elif role == "assistant":
+            if m.get("content"):
+                out.append({"role": "assistant", "content": [{"type": "output_text", "text": m["content"]}]})
+            for tc in m.get("tool_calls") or []:
+                out.append({
+                    "type": "function_call",
+                    "call_id": tc["id"],
+                    "name": tc["function"]["name"],
+                    "arguments": tc["function"]["arguments"] or "{}",
+                })
+        elif role == "tool":
+            out.append({
+                "type": "function_call_output",
+                "call_id": m.get("tool_call_id") or "",
+                "output": m.get("content") or "",
+            })
+    instructions = "\n".join(system_parts) or None
+    return instructions, out
+
+
+def _responses_request(base_url: str, api_key: str, model: str, messages: list[dict], tools: list[dict] | None) -> tuple[str, dict, dict]:
+    url = base_url.rstrip("/") + "/responses"
+    instructions, items = _responses_input(messages)
+    body: dict = {
+        "model": model,
+        "input": items,
+        "stream": True,
+        "max_output_tokens": _MAX_OUTPUT_TOKENS,
+        "temperature": 0.4,
+    }
+    if instructions:
+        body["instructions"] = instructions
+    if tools:
+        body["tools"] = [
+            {
+                "type": "function",
+                "name": t["function"]["name"],
+                "description": t["function"].get("description", ""),
+                "parameters": t["function"].get("parameters", {"type": "object"}),
+            }
+            for t in tools
+        ]
+    return url, {"Authorization": f"Bearer {api_key}"}, body
+
+
+def _flush_pending(pending: dict[str, dict], order: list[str]) -> list[list[dict]]:
+    """按出现顺序组装积攒的 function_call 项并清空积攒（坏 JSON 落空参）。"""
+    if not order:
+        return []
+    calls = []
+    for item_id in order:
+        acc = pending.pop(item_id, None)
+        if not acc or not acc["name"]:
+            continue
+        try:
+            args = json.loads(acc["args"] or "{}")
+        except json.JSONDecodeError:
+            args = {}
+        calls.append({"id": acc["id"], "name": acc["name"], "arguments": args})
+    order.clear()
+    return [calls] if calls else []
+
+
+async def _responses_parse(aiter_lines):
+    """Responses SSE：output_text.delta=正文、reasoning_summary_text.delta=思考、
+    function_call 项按 item 组装（added 起头、arguments.delta 追加、done 成call）。"""
+    pending: dict[str, dict] = {}
+    order: list[str] = []
+    async for data in _sse_data_lines(aiter_lines):
+        try:
+            ev = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        etype = ev.get("type")
+        if etype == "response.output_text.delta":
+            if ev.get("delta"):
+                yield ("answer", str(ev["delta"]))
+        elif etype == "response.reasoning_summary_text.delta":
+            if ev.get("delta"):
+                yield ("thinking", str(ev["delta"]))
+        elif etype == "response.output_item.added":
+            item = ev.get("item") or {}
+            if item.get("type") == "function_call" and item.get("item_id"):
+                item_id = str(item["item_id"])
+                order.append(item_id)
+                pending[item_id] = {
+                    "id": item.get("call_id") or item_id,
+                    "name": item.get("name") or "",
+                    "args": item.get("arguments") or "",
+                }
+        elif etype == "response.function_call_arguments.delta":
+            item_id = str(ev.get("item_id") or "")
+            if item_id in pending and ev.get("delta"):
+                pending[item_id]["args"] += str(ev["delta"])
+        elif etype == "response.output_item.done":
+            item = ev.get("item") or {}
+            item_id = str(ev.get("item_id") or item.get("id") or "")
+            if item.get("type") == "function_call" and item_id in pending:
+                acc = pending[item_id]
+                acc["name"] = item.get("name") or acc["name"]
+                acc["id"] = item.get("call_id") or acc["id"]
+                if item.get("arguments"):
+                    acc["args"] = item["arguments"]
+        elif etype == "response.completed":
+            for calls in _flush_pending(pending, order):
+                yield ("tool_calls", calls)
+            usage = (ev.get("response") or {}).get("usage") or {}
+            inp = int(usage.get("input_tokens") or 0)
+            yield ("usage", (inp, int(usage.get("output_tokens") or 0)))
+            cached = (usage.get("input_tokens_details") or {}).get("cached_tokens")
+            read = int(cached) if isinstance(cached, (int, float)) else None
+            yield ("cache", {"rate": (min(1.0, read / inp) if read is not None and inp > 0 else None),
+                             "read": read, "write": None, "base": inp or None})
+    for calls in _flush_pending(pending, order):
+        # 流末兜底：部分兼容服务不发 completed
+        yield ("tool_calls", calls)
 
 
 # ── anthropic（Messages API）────────────────────────────────────────
@@ -198,7 +356,7 @@ def _anthropic_request(base_url: str, api_key: str, model: str, messages: list[d
              "input_schema": t["function"].get("parameters", {"type": "object"})}
             for t in tools
         ]
-    return url, {"x-api-key": api_key, "anthropic-version": "2023-06-01"}, body
+    return url, _auth_headers("anthropic", api_key), body
 
 
 async def _anthropic_parse(aiter_lines):
@@ -213,6 +371,15 @@ async def _anthropic_parse(aiter_lines):
         if etype == "message_start":
             u = (ev.get("message") or {}).get("usage") or {}
             usage[0] = int(u.get("input_tokens") or 0)
+            cache_read = u.get("cache_read_input_tokens")
+            cache_write = u.get("cache_creation_input_tokens")
+            read = int(cache_read) if isinstance(cache_read, (int, float)) else 0
+            write = int(cache_write) if isinstance(cache_write, (int, float)) else 0
+            # 计费输入 = 未缓存输入 + 缓存读 + 缓存写（Anthropic 三桶分开计费）；
+            # 命中率分母含缓存读自身，避免部分命中被高估到 100%
+            input_side = usage[0] + read + write
+            yield ("cache", {"rate": (min(1.0, read / input_side) if input_side > 0 else None),
+                             "read": read or None, "write": write or None, "base": input_side or None})
         elif etype == "content_block_delta":
             d = ev.get("delta") or {}
             dt = d.get("type")
@@ -243,78 +410,6 @@ async def _anthropic_parse(aiter_lines):
     yield ("usage", (usage[0], usage[1]))
 
 
-# ── gemini（Google generateContent）───────────────────────────────────
-
-def _gemini_convert(messages: list[dict]) -> tuple[str | None, list[dict]]:
-    system = "\n".join(m["content"] for m in messages if m["role"] == "system") or None
-    out: list[dict] = []
-    for m in messages:
-        role = m["role"]
-        if role == "system":
-            continue
-        grole = "model" if role == "assistant" else "user"
-        parts: list[dict] = []
-        if role == "assistant":
-            if m.get("content"):
-                parts.append({"text": m["content"]})
-            for tc in m.get("tool_calls") or []:
-                parts.append({"functionCall": {"name": tc["function"]["name"],
-                                               "args": json.loads(tc["function"]["arguments"] or "{}")}})
-        elif role == "tool":
-            parts.append({"functionResponse": {
-                "name": m.get("name") or m.get("tool_call_id") or "tool",
-                "response": {"result": m.get("content") or ""},
-            }})
-        else:
-            parts.append({"text": m["content"]})
-        out.append({"role": grole, "parts": parts})
-    return system, out
-
-
-def _gemini_request(base_url: str, api_key: str, model: str, messages: list[dict], tools: list[dict] | None) -> tuple[str, dict, dict]:
-    base = base_url.rstrip("/")
-    url = base + f"/v1beta/models/{model}:streamGenerateContent?alt=sse"
-    system, contents = _gemini_convert(messages)
-    body: dict = {
-        "contents": contents,
-        "generationConfig": {"maxOutputTokens": _MAX_OUTPUT_TOKENS, "temperature": 0.4},
-    }
-    if system:
-        body["systemInstruction"] = {"parts": [{"text": system}]}
-    if tools:
-        body["tools"] = [{"function_declarations": [
-            {"name": t["function"]["name"], "description": t["function"].get("description", ""),
-             "parameters": t["function"].get("parameters", {"type": "object"})}
-            for t in tools
-        ]}]
-    return url, {"x-goog-api-key": api_key}, body
-
-
-async def _gemini_parse(aiter_lines):
-    async for data in _sse_data_lines(aiter_lines):
-        try:
-            ev = json.loads(data)
-        except json.JSONDecodeError:
-            continue
-        meta = ev.get("usageMetadata") or {}
-        calls: list[dict] = []
-        for cand in ev.get("candidates") or []:
-            parts = ((cand.get("content") or {}).get("parts")) or []
-            for p in parts:
-                if p.get("thought") and p.get("text"):
-                    yield ("thinking", str(p["text"]))
-                elif p.get("functionCall"):
-                    calls.append({"id": f"gc-{p['functionCall'].get('name')}-{len(calls)}",
-                                  "name": p["functionCall"].get("name") or "",
-                                  "arguments": p["functionCall"].get("args") or {}})
-                elif p.get("text"):
-                    yield ("answer", str(p["text"]))
-        if calls:
-            yield ("tool_calls", calls)
-        if meta:
-            yield ("usage", (int(meta.get("promptTokenCount") or 0), int(meta.get("candidatesTokenCount") or 0)))
-
-
 # ── ollama（本地 /api/chat，ndjson）───────────────────────────────────
 
 def _ollama_request(base_url: str, api_key: str, model: str, messages: list[dict], tools: list[dict] | None) -> tuple[str, dict, dict]:
@@ -331,7 +426,7 @@ def _ollama_request(base_url: str, api_key: str, model: str, messages: list[dict
     body: dict = {"model": model, "messages": converted, "stream": True}
     if tools:
         body["tools"] = tools
-    return url, {}, body
+    return url, _auth_headers("ollama", api_key), body
 
 
 async def _ollama_parse(aiter_lines):
@@ -370,8 +465,8 @@ async def _ollama_parse(aiter_lines):
 
 # ── 分发 ─────────────────────────────────────────────────────────────
 
-_PARSE = {"openai": _openai_parse, "anthropic": _anthropic_parse, "gemini": _gemini_parse, "ollama": _ollama_parse}
-_REQUEST = {"openai": _openai_request, "anthropic": _anthropic_request, "gemini": _gemini_request, "ollama": _ollama_request}
+_PARSE = {"openai": _openai_parse, "openai-responses": _responses_parse, "anthropic": _anthropic_parse, "ollama": _ollama_parse}
+_REQUEST = {"openai": _openai_request, "openai-responses": _responses_request, "anthropic": _anthropic_request, "ollama": _ollama_request}
 
 
 def effective_base_url(protocol: str, base_url: str) -> str:
@@ -388,22 +483,43 @@ async def chat_stream(
     messages: list[dict],
     tools: list[dict] | None = None,
     max_tokens: int | None = None,
+    client: httpx.AsyncClient | None = None,
 ):
-    """按协议构造请求并流式解析，产出统一事件（见模块 docstring）。"""
+    """按协议构造请求并流式解析，产出统一事件（见模块 docstring）。
+
+    client 传入时由调用方持有并关闭（agent 循环多轮共用一个连接池，免每轮
+    重新握手）；缺省自建一次性客户端。"""
     if protocol not in _PARSE:
         raise PilotLlmError(f"未知协议: {protocol}")
     url, headers, body = _REQUEST[protocol](base_url, api_key, model, messages, tools)
     if max_tokens:
-        body["max_tokens"] = max_tokens
+        if protocol == "openai-responses":
+            body["max_output_tokens"] = max_tokens
+        else:
+            body["max_tokens"] = max_tokens
+
+    async def _run(own: httpx.AsyncClient):
+        async with own.stream("POST", url, json=body, headers=headers) as resp:
+            if resp.status_code >= 400:
+                # 响应体截断进异常：网关用 4xx 报真实原因（参数缺失/超窗），
+                # 日志与溢出回收（looks_like_overflow）都依赖这段文本
+                detail = (await resp.aread()).decode("utf-8", errors="replace")[:300]
+                raise PilotLlmError(f"HTTP {resp.status_code}: {detail}")
+            async for event in _PARSE[protocol](resp.aiter_lines()):
+                yield event
+
     try:
-        async with _client(base_url) as client:
-            async with client.stream("POST", url, json=body, headers=headers) as resp:
-                resp.raise_for_status()
-                async for event in _PARSE[protocol](resp.aiter_lines()):
+        if client is not None:
+            async for event in _run(client):
+                yield event
+        else:
+            async with http_client(base_url) as own:
+                async for event in _run(own):
                     yield event
     except (httpx.HTTPError, TypeError, ValueError) as e:
         logger.warning("pilot LLM 流式调用失败（%s）: %r", protocol, e)
-        raise PilotLlmError(str(e)) from e
+        # 超时异常 str 为空，回落类名，避免上层拿到空白诊断
+        raise PilotLlmError(str(e) or type(e).__name__) from e
 
 
 # ── 服务商智能识别：网址 + 密钥 → 协议 / 服务商 / 可用模型清单 ──────────
@@ -422,7 +538,6 @@ _KNOWN_HOSTS: list[tuple[str, str, str, list[str]]] = [
     ("api.x.ai", "openai", "Grok", []),
     ("api.openai.com", "openai", "OpenAI", []),
     ("api.anthropic.com", "anthropic", "Anthropic", []),
-    ("generativelanguage.googleapis.com", "gemini", "Gemini", []),
     (":11434", "ollama", "Ollama 本地", []),
 ]
 
@@ -439,44 +554,41 @@ def match_host(base_url: str) -> tuple[str, str, list[str]] | None:
 
 
 def _parse_model_list(protocol: str, payload: dict) -> list[str]:
-    if protocol in ("openai", "anthropic"):
+    if protocol in ("openai", "openai-responses", "anthropic"):
         return sorted(str(m["id"]) for m in payload.get("data") or [] if m.get("id"))
-    if protocol == "gemini":
-        names = (m.get("name") for m in payload.get("models") or [])
-        return sorted(str(n).split("/")[-1] for n in names if n)
     if protocol == "ollama":
         return sorted(str(m["name"]) for m in payload.get("models") or [] if m.get("name"))
     return []
 
 
-def _list_models_url(protocol: str, base: str) -> tuple[str, dict]:
+def _list_models_url(protocol: str, base: str) -> str:
     base = base.rstrip("/")
-    if protocol == "openai":
-        return base + "/models", {"Authorization": "Bearer {key}"}
     if protocol == "anthropic":
-        return base + "/v1/models", {"x-api-key": "{key}", "anthropic-version": "2023-06-01"}
-    if protocol == "gemini":
-        return base + "/v1beta/models", {"x-goog-api-key": "{key}"}
-    return base + "/api/tags", {}
+        return base + "/v1/models"
+    if protocol == "ollama":
+        return base + "/api/tags"
+    return base + "/models"
 
 
 async def list_models(protocol: str, base_url: str, api_key: str) -> list[str]:
     """探测该账号可用的模型清单（短超时 GET；异常上抛由调用方处置）。"""
-    url_t, headers_t = _list_models_url(protocol, base_url)
-    url = url_t
-    headers = {k: v.replace("{key}", api_key) for k, v in headers_t.items()}
-    async with _client(base_url) as client:
-        resp = await client.get(url, headers=headers)
+    async with http_client(base_url) as client:
+        resp = await client.get(
+            _list_models_url(protocol, base_url),
+            headers=_auth_headers(protocol, api_key),
+        )
         resp.raise_for_status()
         return _parse_model_list(protocol, resp.json())
 
 
 async def detect_provider(base_url: str, api_key: str, protocol_hint: str | None = None) -> dict:
-    """网址 + 密钥 → 协议 / 服务商 / 可用模型清单 / 密钥有效性。
+    """网址 + 密钥 → 协议 / 服务商 / 可用模型清单 / 密钥有效性 / 失败原因。
 
     协议判定：显式提示 > host 指纹 > 缺省 openai（第三方网关多为兼容形态）。
     模型清单以端点探测为准，探测失败回退 host 表推荐值；密钥有效性只在
-    探测拿到明确 401/403 时判 False，网络失败记 None（未知，不冤枉密钥）。"""
+    探测拿到明确 401/403 时判 False，reason 分类：key_invalid（401/403）/
+    not_found（404，地址与协议不配对）/ upstream（其余 HTTP 错误）/
+    unreachable（网络不通），成功为 None。"""
     hit = match_host(base_url)
     protocol = protocol_hint or (hit[0] if hit else "openai")
     vendor = hit[1] if hit else ""
@@ -485,14 +597,22 @@ async def detect_provider(base_url: str, api_key: str, protocol_hint: str | None
 
     key_valid: bool | None = None
     models = suggested
+    reason: str | None = None
     try:
         models = await list_models(protocol, base, api_key)
         key_valid = True
     except httpx.HTTPStatusError as e:
-        if e.response.status_code in (401, 403):
+        code = e.response.status_code
+        if code in (401, 403):
             key_valid = False
+            reason = "key_invalid"
+        elif code == 404:
+            reason = "not_found"
+        else:
+            reason = "upstream"
     except httpx.HTTPError:
         key_valid = None
+        reason = "unreachable"
 
     return {
         "protocol": protocol,
@@ -500,4 +620,5 @@ async def detect_provider(base_url: str, api_key: str, protocol_hint: str | None
         "models": models,
         "suggested": suggested,
         "key_valid": key_valid,
+        "reason": reason,
     }

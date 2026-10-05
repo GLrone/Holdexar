@@ -805,6 +805,127 @@ async def _list_games_top100(
     }
 
 
+async def names_for(appids: list[int]) -> dict[int, str]:
+    """批量取游戏名（领航台关注清单等只读投影用）。"""
+    ids = [int(a) for a in appids if a]
+    if not ids:
+        return {}
+    async with get_session_factory()() as session:
+        rows = (
+            await session.execute(select(Game.appid, Game.name).where(Game.appid.in_(ids)))
+        ).all()
+    return {int(a): (n or f"AppID {a}") for a, n in rows}
+
+
+async def price_diagnosis(appid: int) -> dict | None:
+    """单游戏价格诊断投影：现价 + 活表覆盖（各区 outcome/answer/lastSuccessAt）。
+
+    覆盖计算复用 _build_list_item 同一实现（与游戏卡覆盖同源同口径），
+    领航台诊断卡是它的只读消费方，不另立第二套覆盖口径。"""
+    regions_expected = [r.upper() for r in await effective_regions(None)]
+    async with get_session_factory()() as session:
+        game = await session.get(Game, appid)
+        if game is None:
+            return None
+        price_rows = (
+            await session.execute(
+                select(GameCurrentPrice).where(GameCurrentPrice.appid == appid)
+            )
+        ).scalars().all()
+    cn_row = next(
+        (p for p in price_rows if (p.region_code or "").upper() == "CN"), None
+    )
+    item = _build_list_item(game, cn_row, price_rows, regions_expected)
+    cn_col = (item.get("priceMatrix") or {}).get("CN")
+    price_data = item.get("priceData") or {}
+    return {
+        "appid": int(appid),
+        "name": item.get("name"),
+        "cn": {"cnyFen": cn_col[1], "discount": cn_col[3]} if cn_col else None,
+        "lowestPriceFen": item.get("lowestPriceFen"),
+        "coverage": price_data.get("coverage"),
+        "observedAt": price_data.get("observedAt"),
+    }
+
+
+async def search_catalog(term: str, limit: int = 5) -> list[dict]:
+    """目录名检索（领航员找对象用）：name/name_en LIKE，不做价格 JOIN——
+    未爬价 / 锁区游戏同样可见；找游戏页的带价检索走 list_games。
+    返回行与 list_games 同形（positiveRate 0-1），cn 价命中才带。"""
+    q = (term or "").strip()
+    if not q or limit <= 0:
+        return []
+    like = f"%{q}%"
+    cn = aliased(GameCurrentPrice)
+    async with get_session_factory()() as session:
+        rows = (
+            await session.execute(
+                select(Game, cn.cny_fen, cn.discount_percent)
+                .join(
+                    cn,
+                    and_(
+                        cn.appid == Game.appid,
+                        cn.region_code == "CN",
+                        cn.price_status == "ok",
+                    ),
+                    isouter=True,
+                )
+                .where(or_(Game.name.like(like), Game.name_en.like(like)))
+                .where(Game.appid.not_in(select(CatalogRemoval.appid)))
+                .order_by(desc(Game.review_count))
+                .limit(int(limit))
+            )
+        ).all()
+    return [
+        {
+            "appid": int(g.appid),
+            "name": g.name,
+            "nameEn": g.name_en,
+            "basePriceFen": cny,
+            "discount": int(disc or 0) if disc else 0,
+            "positiveRate": (g.positive_rate / 100) if g.positive_rate is not None else None,
+            "reviewCount": g.review_count,
+        }
+        for g, cny, disc in rows
+    ]
+
+
+async def briefs_for(appids: list[int]) -> dict[int, dict]:
+    """appid 批量简报（名称/国区价/折扣/好评/评测数）——领航台清单卡与
+    榜单卡的统一取数点；缺失行不出键。"""
+    ids = [int(a) for a in appids if a]
+    if not ids:
+        return {}
+    cn = aliased(GameCurrentPrice)
+    async with get_session_factory()() as session:
+        rows = (
+            await session.execute(
+                select(Game, cn.cny_fen, cn.discount_percent)
+                .join(
+                    cn,
+                    and_(
+                        cn.appid == Game.appid,
+                        cn.region_code == "CN",
+                        cn.price_status == "ok",
+                    ),
+                    isouter=True,
+                )
+                .where(Game.appid.in_(ids))
+            )
+        ).all()
+    return {
+        int(g.appid): {
+            "name": g.name,
+            "cnyFen": cny,
+            "discount": int(disc or 0) if disc else 0,
+            "positiveRate": (g.positive_rate / 100) if g.positive_rate is not None else None,
+            "reviewCount": g.review_count,
+            "chineseSupport": g.chinese_support,
+        }
+        for g, cny, disc in rows
+    }
+
+
 async def get_game_detail(appid: int) -> dict | None:
     """游戏详情：元数据 + 全区当前价 + 版本列表（捆绑包域未建，返回空列表）。"""
     rates = await get_rates()
