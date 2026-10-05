@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint
+from sqlalchemy import Float, JSON, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -95,3 +95,23 @@ class AgentEvent(Base):
     __table_args__ = (
         UniqueConstraint("run_id", "seq", name="ux_agent_event_run_seq"),
     )
+
+
+class AgentMemory(Base):
+    """长期记忆：用户画像与全局偏好。"""
+
+    __tablename__ = "agent_memories"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    category: Mapped[str] = mapped_column(String(32), index=True)
+    key: Mapped[str] = mapped_column(String(64), index=True)
+    value: Mapped[dict] = mapped_column(JSON)
+    confidence: Mapped[float] = mapped_column(Float, default=1.0)
+    source: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime | None] = mapped_column(DateTime)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+    __table_args__ = (
+        UniqueConstraint("category", "key", name="ux_agent_memory_category_key"),
+    )
+

@@ -26,6 +26,9 @@ EV_TURN_RECEIVED = "turn.received"
 EV_STEP_STARTED = "step.started"
 EV_STEP_COMPLETED = "step.completed"
 EV_CANCEL_REQUESTED = "run.cancel_requested"
+EV_TASK_STARTED = "task.started"
+EV_TASK_PROGRESS = "task.progress"
+EV_TASK_FAILED = "task.failed"
 
 EVENT_TYPES = (
     EV_RUN_STATE,
@@ -34,9 +37,12 @@ EVENT_TYPES = (
     EV_STEP_STARTED,
     EV_STEP_COMPLETED,
     EV_CANCEL_REQUESTED,
+    EV_TASK_STARTED,
+    EV_TASK_PROGRESS,
+    EV_TASK_FAILED,
 )
 
-# 事件类型 → 允许入账的 payload 键集（lifecycle / message / step /
+# 事件类型 → 允许入账的 payload 键集（lifecycle / message / step / task /
 # cancel 元数据各归其类；usage / tool / approval / decision 元数据
 # 随对应阶段接入时在此登记）
 EVENT_FIELDS: dict[str, frozenset[str]] = {
@@ -46,6 +52,10 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     EV_STEP_STARTED: frozenset({"step"}),
     EV_STEP_COMPLETED: frozenset({"step", "summary"}),
     EV_CANCEL_REQUESTED: frozenset({"reason", "by"}),
+    # 任务类事件只记调度面事实（哪个任务、采样进度）；业务事实仍归域账本
+    EV_TASK_STARTED: frozenset({"kind", "label", "total", "ref"}),
+    EV_TASK_PROGRESS: frozenset({"phase", "done", "total", "note"}),
+    EV_TASK_FAILED: frozenset({"reason", "error_code"}),
 }
 
 _SENSITIVE_KEY_RE = re.compile(
