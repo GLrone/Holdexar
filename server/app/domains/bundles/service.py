@@ -900,3 +900,15 @@ async def followed_bundle_ids() -> list[int]:
     from app.domains.monitoring import service as monitoring_service
 
     return await monitoring_service.ids_with_source("bundle", "favorite")
+
+
+async def names_for(bundle_ids: list[int]) -> dict[int, str]:
+    """批量取捆绑包名（领航台关注清单等只读投影用）。"""
+    ids = [int(b) for b in bundle_ids if b]
+    if not ids:
+        return {}
+    async with get_session_factory()() as session:
+        rows = (
+            await session.execute(select(Bundle.id, Bundle.name).where(Bundle.id.in_(ids)))
+        ).all()
+    return {int(b): (n or f"Bundle {b}") for b, n in rows}
