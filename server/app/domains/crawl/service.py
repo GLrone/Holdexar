@@ -501,7 +501,11 @@ async def _execute(
     started = time.monotonic()
     try:
         stats = await run_crawl(
-            appid_pairs, config=config, stop_event=stop_event, pre_tasks=pre_tasks
+            appid_pairs,
+            config=config,
+            stop_event=stop_event,
+            pre_tasks=pre_tasks,
+            crawl_job_id=job_id,
         )
         stats["elapsed_seconds"] = round(time.monotonic() - started, 1)
         status = "stopped" if stop_event.is_set() else "done"

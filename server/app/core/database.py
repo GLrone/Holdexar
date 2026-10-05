@@ -228,6 +228,10 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
     "crawl_jobs": {
         "cycle_id": "INTEGER",
     },
+    # 作业台账显式关联爬取任务行（NULL = bundles/CLI 直调，或本列上线前的历史行）
+    "proxy_job_runs": {
+        "crawl_job_id": "INTEGER",
+    },
     # 价格周期的阶段时刻与生产统计（统计口径见 crawl/stats.py）：
     # 统计列全为 NULL = 本轮没留下统计（未收敛 / 进程中断）
     "price_cycles": {

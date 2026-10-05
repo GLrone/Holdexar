@@ -130,6 +130,7 @@ async def test_start_run_records_pool_facts_and_selected_node(tmp_data_dir, monk
             workers=30,
             data_dir=tmp_data_dir,
             now=NOW,
+            crawl_job_id=777,
         )
         await session.commit()
         row = await session.get(ProxyJobRun, run_id)
@@ -149,6 +150,7 @@ async def test_start_run_records_pool_facts_and_selected_node(tmp_data_dir, monk
         assert row.active_subscription_id is None
         assert row.regions_json == ["us"]
         assert row.workers == 30
+        assert row.crawl_job_id == 777
         assert row.finished_at is None
 
 
@@ -168,6 +170,7 @@ async def test_pool_exit_ip_count_null_when_never_probed(tmp_data_dir):
         assert row.pool_exit_ip_count is None
         assert row.pool_sha256 is None  # 没有池文件 → 无该事实
         assert row.selected_node is None  # 控制器读不到 → NULL，不阻塞
+        assert row.crawl_job_id is None  # 未传任务身份 → NULL（bundles/CLI 直调形态）
 
 
 @pytest.mark.asyncio
@@ -508,7 +511,9 @@ async def test_run_crawl_writes_one_row(tmp_data_dir):
     bundles 直调与 CLI 两条路径同样经过它（写在 start_job 上会漏掉那两条）。
     """
     await init_db()
-    stats = await run_crawl(None, config=CrawlRunConfig(regions=["us"], workers=2))
+    stats = await run_crawl(
+        None, config=CrawlRunConfig(regions=["us"], workers=2), crawl_job_id=42
+    )
     assert stats["processed"] == 0 and stats["success"] == 0 and stats["failed"] == 0
 
     async with get_session_factory()() as session:
@@ -516,6 +521,7 @@ async def test_run_crawl_writes_one_row(tmp_data_dir):
     assert len(rows) == 1
     row = rows[0]
     assert row.status == jobruns.STATUS_SUCCESS  # 0/0 不算失败
+    assert row.crawl_job_id == 42  # 执行入口把任务身份带到台账
     assert row.task_count == 0
     assert row.finished_at is not None and row.duration_ms is not None
     assert row.proxy_url is None  # 直连形态（本轮没有池 Runtime）

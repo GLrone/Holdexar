@@ -251,6 +251,7 @@ async def start_run(
     data_dir: Path,
     now: datetime,
     kind: str = "crawl",
+    crawl_job_id: int | None = None,
 ) -> int:
     """插入 `running` 行，返回作业 id（= 作业身份，没有第二个 run_id）。"""
     facts = await _pool_facts(session, data_dir)
@@ -258,6 +259,7 @@ async def start_run(
     row = ProxyJobRun(
         status=STATUS_RUNNING,
         kind=kind,
+        crawl_job_id=crawl_job_id,
         started_at=now,
         regions_json=list(regions or []),
         workers=workers,
@@ -335,6 +337,7 @@ async def record_start(
     data_dir: Path,
     now: datetime,
     kind: str = "crawl",
+    crawl_job_id: int | None = None,
 ) -> int | None:
     try:
         async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
@@ -346,6 +349,7 @@ async def record_start(
                 data_dir=data_dir,
                 now=now,
                 kind=kind,
+                crawl_job_id=crawl_job_id,
             )
             await session.commit()
         return run_id
@@ -416,6 +420,7 @@ def _row_payload(row: ProxyJobRun) -> dict:
         "id": row.id,
         "status": row.status,
         "kind": row.kind,
+        "crawlJobId": row.crawl_job_id,
         "startedAt": _iso(row.started_at),
         "finishedAt": _iso(row.finished_at),
         "durationMs": row.duration_ms,

@@ -374,6 +374,8 @@ class ProxyJobRun(Base):
     status: Mapped[str] = mapped_column(String(16), index=True)
     # 预留触发来源（manual|scheduled|bundles|cli）；v1 一律 'crawl'（run_crawl 是唯一入口）
     kind: Mapped[str] = mapped_column(String(16), default="crawl")
+    # 关联爬取任务行（NULL = bundles/CLI 直调，或本列上线前的历史行）
+    crawl_job_id: Mapped[int | None] = mapped_column(Integer)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime)
     duration_ms: Mapped[int | None] = mapped_column(Integer)
