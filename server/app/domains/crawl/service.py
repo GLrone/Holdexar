@@ -890,6 +890,9 @@ async def default_queue_specs() -> list[dict]:
 # 手动全队列链句柄：段间隙占用窗口（_active 已清、下一段未建）的防重入闸
 _queue_chain_task: asyncio.Task | None = None
 
+# 链级停止位：段间隙也要能喊停（链句柄只看 done 判不出「该不该继续下一段」）
+_queue_stop: asyncio.Event | None = None
+
 
 async def start_full_queue() -> dict:
     """任务页「全部」档：按默认队列组成后台串行启动整条链。
@@ -900,7 +903,7 @@ async def start_full_queue() -> dict:
     （路由 400），占用 RuntimeError（409），链句柄防重入；无显式 kind 的
     scope 段 job 行记 manual（missing/specials_backfill 是段身份标签，保留）。
     """
-    global _queue_chain_task
+    global _queue_chain_task, _queue_stop
     from app.crawler.occupancy import crawler_busy
 
     if crawler_busy() or (_active is not None and not _active.task.done()):
@@ -935,16 +938,21 @@ async def start_full_queue() -> dict:
     async def _chain() -> None:
         # 编排本体在 crawl 域内，与自动轮共用一份；本函数只负责「后台跑 +
         # 链级异常兜底」（段内异常各自兜底，不外抛）
+        global _queue_stop
         from app.domains.crawl import cycle_run
 
         try:
-            started = await cycle_run.run_price_cycle(specs, kind="manual")
+            started = await cycle_run.run_price_cycle(
+                specs, kind="manual", stop_event=_queue_stop
+            )
             logger.info(
                 "[队列] 手动全队列完成：启动 %s",
                 "部分/全部段" if started else "无可抓段（全部为空或被占用）",
             )
         except Exception:  # noqa: BLE001 —— 链级异常只记日志，段内已各自兜底
             logger.exception("[队列] 手动全队列异常")
+        finally:
+            _queue_stop = None
 
     _queue_chain_task = asyncio.create_task(_chain())
     segment_names = [p["name"] for p in segment_plan]
@@ -971,12 +979,37 @@ async def stop_job(job_id: int | None = None) -> bool:
     return True
 
 
+def full_queue_running() -> bool:
+    """手动全队列链是否在跑（含段间隙——链句柄未完成即算在跑）。"""
+    return _queue_chain_task is not None and not _queue_chain_task.done()
+
+
+async def stop_full_queue() -> bool:
+    """停止手动全队列链：置段间停止位 + 停当前段，返回是否找到在跑的链。
+
+    不 cancel 链任务：链内 await 的是 `run_price_cycle`，取消会穿透它的
+    try 边界（CancelledError 不是 Exception），本轮 Cycle 将永久停在
+    running 直到下次进程重启收尸。协作式停止让链在段间隙自行退出，
+    Cycle 照常收尾（当前段 stopped → 终态 cancelled）。
+    """
+    global _queue_stop
+    if not full_queue_running():
+        _queue_stop = None
+        return False
+    if _queue_stop is not None:
+        _queue_stop.set()
+    await stop_job()
+    logger.info("[队列] 手动全队列已请求停止")
+    return True
+
+
 async def run_sequential(
     specs: list[dict],
     *,
     missing_cooldown: int | None = None,
     cycle_id: int | None = None,
     skip_reasons: list[str] | None = None,
+    stop_event: asyncio.Event | None = None,
 ) -> list[dict]:
     """串行链式启动多个爬取任务（单任务模型下唯一的多 spec 方式）。
 
@@ -987,9 +1020,15 @@ async def run_sequential(
     非空时本轮启动的 job 全部挂到该价格刷新周期。
     skip_reasons 传列表时逐段收集跳过原因（"段标识：原因"），供编排层在
     「整轮零启动」终态判定时把真实拒因写进 Cycle 账本，而不是只进日志。
+    stop_event 置位时段间隙即退出（当前段由 stop_job 收敛为 stopped），
+    链不再推进下一段——取消只能是协作式的，链任务本身不可 cancel。
     """
     results: list[dict] = []
     for spec in specs:
+        if stop_event is not None and stop_event.is_set():
+            if skip_reasons is not None:
+                skip_reasons.append(f"{spec.get('kind', spec.get('scope'))}：用户已停止")
+            break
         try:
             result = await start_job(
                 scope=spec.get("scope", "appids"),

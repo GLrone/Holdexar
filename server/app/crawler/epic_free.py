@@ -69,7 +69,7 @@ EGS_SEARCH_CATEGORY = (
     "|software/edition/base|games/experience|subscription"
 )
 # 持久化查询请求头：与放行组合一致（urllib 默认头序 + 浏览器 UA + Referer）
-_EGS_HEADERS = {
+_EGSSTEAM_HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -78,6 +78,9 @@ _EGS_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://store.epicgames.com/en-US/",
 }
+
+# 改名过渡别名：并行会话半成品的引用兜底（内部用点与新名并存）
+STEAM_HTTP_HEADERS = _EGSSTEAM_HTTP_HEADERS
 STORESEARCH_URL = "https://store.steampowered.com/api/storesearch/"
 # 英文标题用于匹配（中文标题对 storesearch 无效；en-US 拉双语对照）
 EN_PARAMS = {"locale": "en-US", "country": "US"}
@@ -91,7 +94,7 @@ _HEADERS = {
     "Accept": "application/json",
     "Accept-Language": "en-US,en;q=0.9",
 }
-_REQUEST_INTERVAL = 0.5  # storesearch 批间隔 500ms（对齐 boards 批间隔）
+_REQUEST_INTERVAL = 0.5  # Steam 匿名轻端点通用请求头（浏览器 UA 指纹，epic/领航台检索共用）；storesearch 批间隔 500ms（对齐 boards 批间隔）
 
 
 @dataclass(frozen=True)
@@ -280,7 +283,7 @@ async def match_steam_appid(session: aiohttp.ClientSession, title: str,
         async with session.get(
             STORESEARCH_URL,
             params={"term": title, "cc": "US", "l": "english"},
-            headers=_HEADERS,
+            headers=STEAM_HTTP_HEADERS,
             proxy=proxy,
         ) as resp:
             if resp.status != 200:
@@ -309,7 +312,7 @@ async def _fetch_parsed(
     # ① 英文促销响应（匹配键源）
     try:
         async with session.get(FREE_GAMES_URL, params=EN_PARAMS,
-                               headers=_HEADERS, proxy=proxy) as resp:
+                               headers=STEAM_HTTP_HEADERS, proxy=proxy) as resp:
             if resp.status != 200:
                 logger.warning("[epic] 促销端点 HTTP %d（本轮放弃）", resp.status)
                 return None
@@ -325,7 +328,7 @@ async def _fetch_parsed(
     # ② 中文响应回填对照标题与原价文案（失败不影响主链）
     try:
         async with session.get(FREE_GAMES_URL, params=CN_PARAMS,
-                               headers=_HEADERS, proxy=proxy) as resp:
+                               headers=STEAM_HTTP_HEADERS, proxy=proxy) as resp:
             if resp.status == 200:
                 _fill_title_cn(games, await resp.json(content_type=None))
     except (aiohttp.ClientError, asyncio.TimeoutError):
@@ -381,7 +384,7 @@ async def fetch_mobile_breaker(proxy: str | None = None,
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
     try:
         try:
-            async with session.get(MOBILE_CMS_URL, headers=_HEADERS, proxy=proxy) as resp:
+            async with session.get(MOBILE_CMS_URL, headers=STEAM_HTTP_HEADERS, proxy=proxy) as resp:
                 if resp.status != 200:
                     logger.info("[epic-mobile] CMS 移动页 HTTP %d（本轮跳过）", resp.status)
                     return None
@@ -460,7 +463,7 @@ async def _resolve_redirect(url: str, session: aiohttp.ClientSession,
                             proxy: str | None = None) -> str:
     """跟随跳转取最终落地 URL（官方领取页）；失败原样返回。"""
     try:
-        async with session.get(url, headers=_HEADERS,
+        async with session.get(url, headers=STEAM_HTTP_HEADERS,
                                allow_redirects=True, proxy=proxy) as resp:
             final = str(resp.url)
             return final if final.startswith("http") else url
@@ -648,7 +651,7 @@ async def fetch_mobile_freebie(proxy: str | None = None,
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25))
     try:
         try:
-            async with session.get(GAMERPOWER_ANDROID_URL, headers=_HEADERS,
+            async with session.get(GAMERPOWER_ANDROID_URL, headers=STEAM_HTTP_HEADERS,
                                    proxy=proxy) as resp:
                 if resp.status != 200:
                     logger.info("[epic-mobile] GamerPower HTTP %d（本轮跳过）", resp.status)
