@@ -14,7 +14,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core.database import Base
@@ -45,6 +45,15 @@ def db(tmp_path, monkeypatch):
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{(tmp_path / 'agent_test.db').as_posix()}", echo=False
     )
+
+    # 与生产同口径开外键校验：关着跑会放过「会话行未落库也能建 run」这类
+    # FK 违规（agent 三表的 FK 只在开着校验时才有意义）
+    @event.listens_for(engine.sync_engine, "connect")
+    def _fk_on(dbapi_conn, _record):
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA foreign_keys=ON")
+        cur.close()
+
     factory = async_sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
     monkeypatch.setattr(agent_service, "get_session_factory", lambda: factory)

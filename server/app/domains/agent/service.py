@@ -85,6 +85,9 @@ async def create_run(
         if session_id is None:
             sid = _new_id()
             session.add(AgentSession(id=sid, created_at=ts, updated_at=ts))
+            # 先落会话行再建 run：生产库开着 PRAGMA foreign_keys=ON，同批插入的
+            # 语句顺序不受保证，不显式 flush 会撞 agent_runs.session_id 外键
+            await session.flush()
         else:
             existing = await session.get(AgentSession, session_id)
             if existing is None:
@@ -109,21 +112,31 @@ async def create_run(
 
 async def start_run(run_id: str) -> dict:
     """启动执行器（仅 queued 可启动）。令牌先注册再拉起任务，保证
-    取消请求从第一刻起就可见。"""
+    取消请求从第一刻起就可见。执行器按 `runner` 列分派。"""
     run = await get_run(run_id)
     if run is None:
         raise LookupError(f"run not found: {run_id}")
     assert_transition(run["status"], RUN_RUNNING)
     REGISTRY.register(run_id)
-    from app.domains.agent.runtime import fake  # 延迟导入：fake 依赖本模块
-
     meta = run.get("meta") or {}
-    task = asyncio.create_task(fake.execute_fake_run(
-        run_id,
-        scenario=str(meta.get("scenario") or "success"),
-        steps=int(meta.get("steps") or 3),
-        step_delay=float(meta.get("step_delay") or 0.0),
-    ))
+    if run["runner"] == "task":
+        from app.domains.agent.runtime import task_runner
+
+        task = asyncio.create_task(task_runner.execute_task_run(
+            run_id,
+            kind=str(meta.get("task") or ""),
+            ref=meta.get("ref") if isinstance(meta.get("ref"), dict) else None,
+            adopted=bool(meta.get("adopted")),
+        ))
+    else:
+        from app.domains.agent.runtime import fake  # 延迟导入：fake 依赖本模块
+
+        task = asyncio.create_task(fake.execute_fake_run(
+            run_id,
+            scenario=str(meta.get("scenario") or "success"),
+            steps=int(meta.get("steps") or 3),
+            step_delay=float(meta.get("step_delay") or 0.0),
+        ))
     REGISTRY.attach_task(run_id, task)
     return {"run_id": run_id, "started": True}
 
@@ -203,6 +216,49 @@ async def get_run(run_id: str) -> dict | None:
             "started_at": run.started_at,
             "finished_at": run.finished_at,
         }
+
+
+async def list_runs(*, status: str | None = None, limit: int = 20) -> list[dict]:
+    """运行列表（新→旧）。运行中与终态一视同仁，调用方按 status 过滤；
+    只读投影，不改变任何状态。"""
+    limit = max(1, min(int(limit), 100))
+    async with get_session_factory()() as session:
+        stmt = select(AgentRun)
+        if status:
+            stmt = stmt.where(AgentRun.status == status)
+        rows = (await session.execute(
+            stmt.order_by(AgentRun.created_at.desc(), AgentRun.id.desc()).limit(limit)
+        )).scalars().all()
+        return [
+            {
+                "run_id": r.id,
+                "session_id": r.session_id,
+                "runner": r.runner,
+                "trigger": r.trigger,
+                "meta": r.meta,
+                "status": r.status,
+                "error_code": r.error_code,
+                "created_at": r.created_at,
+                "started_at": r.started_at,
+                "finished_at": r.finished_at,
+            }
+            for r in rows
+        ]
+
+
+async def latest_progress(run_id: str) -> dict | None:
+    """最近一条进度采样（运行中任务的进度投影；从未采样则 None）。"""
+    async with get_session_factory()() as session:
+        row = await session.scalar(
+            select(AgentEvent)
+            .where(
+                AgentEvent.run_id == run_id,
+                AgentEvent.event_type == agent_events_spec.EV_TASK_PROGRESS,
+            )
+            .order_by(AgentEvent.seq.desc())
+            .limit(1)
+        )
+        return dict(row.payload or {}) if row is not None else None
 
 
 async def list_events(run_id: str, *, after_seq: int = 0,
