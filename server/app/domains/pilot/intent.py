@@ -8,8 +8,7 @@
 不给写工具，落回只读或指引。"""
 from __future__ import annotations
 
-# 守卫词：命中即禁用写意图（风险门的确定性部分）
-_GUARD_WORDS = ("清空", "删除", "移除", "移出", "停用", "停止", "批量", "全部", "所有")
+from app.domains.agent.tools.policy import GUARD_WORDS as _GUARD_WORDS  # 守卫词唯一来源（agent.tools.policy）
 
 # 怎么做类（指引）：疑问词用复合词形，「今天天气怎么样」这类日常寒暄不会命中
 _HOW_TO_WORDS = (

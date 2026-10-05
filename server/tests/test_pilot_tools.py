@@ -116,7 +116,7 @@ def test_proxy_and_gate_status_shapes(monkeypatch):
                        "clash": {"running": True, "exitIps": 9, "okExitIps": 7}}),
     )
     monkeypatch.setattr(
-        pilot_tools, "write_scheduler_diagnostics",
+        "app.domains.agent.tools.builtin.system.write_scheduler_diagnostics",
         lambda: {"busy": False, "owner_label": None,
                  "waiting_interactive": 0, "waiting_background": 2},
     )
@@ -579,7 +579,7 @@ import asyncio
 def test_search_steam_parses_store_items(monkeypatch):
     monkeypatch.setattr(
         pilot_tools.proxies_service, "resolve_proxy_url", _async_return("http://127.0.0.1:7897"))
-    monkeypatch.setattr(pilot_tools, "_steam_storesearch", _async_return({
+    monkeypatch.setattr("app.domains.agent.tools.builtin.catalog._steam_storesearch", _async_return({
         "items": [
             {"id": 2680010, "name": "The First Berserker: Khazan",
              "price": {"final": 2099, "initial": 3499, "currency": "USD"}},
@@ -600,7 +600,7 @@ def test_search_steam_empty_term_and_failure(monkeypatch):
     assert out == {"kind": "empty", "note": "bad_term"}
     monkeypatch.setattr(
         pilot_tools.proxies_service, "resolve_proxy_url", _async_return(None))
-    monkeypatch.setattr(pilot_tools, "_steam_storesearch", _async_return(None))
+    monkeypatch.setattr("app.domains.agent.tools.builtin.catalog._steam_storesearch", _async_return(None))
     out = asyncio.run(pilot_tools.execute_tool("search_steam", {"term": "khazan"}))
     assert out == {"kind": "empty", "note": "search_failed"}
 
@@ -769,10 +769,10 @@ def test_notify_test_failure_path(monkeypatch):
     async def _fail(**kw):
         raise ValueError("SMTP 535")
 
-    monkeypatch.setattr(pilot_tools, "get_smtp_config", _async_return({
+    monkeypatch.setattr("app.domains.agent.tools.builtin.system.get_smtp_config", _async_return({
         "host": "h", "port": 465, "user": "u", "password": "p", "to_addr": "t", "use_ssl": True,
     }))
-    monkeypatch.setattr(pilot_tools, "send_test_mail", _fail)
+    monkeypatch.setattr("app.domains.agent.tools.builtin.system.send_test_mail", _fail)
     import asyncio
     out = asyncio.run(pilot_tools.execute_tool("notify_test", {}))
     assert out["rows"][0]["vKey"] == "notifyFailed" and out["rows"][0]["tone"] == "bad"
@@ -782,7 +782,7 @@ def test_notify_test_no_config(monkeypatch):
     async def _empty_cfg():
         return {"host": "", "port": 0, "user": "", "password": "", "to_addr": "", "use_ssl": True}
 
-    monkeypatch.setattr(pilot_tools, "get_smtp_config", _empty_cfg)
+    monkeypatch.setattr("app.domains.agent.tools.builtin.system.get_smtp_config", _empty_cfg)
     import asyncio
     out = asyncio.run(pilot_tools.execute_tool("notify_test", {}))
     assert out["rows"][0]["vKey"] == "notifyNoConfig" and out["rows"][0]["tone"] == "warn"
@@ -794,14 +794,14 @@ def test_find_deletables_creates_delete_proposal(monkeypatch):
         {"key": "alert:3", "appid": 292030, "name": "巫师 3", "reason": "removed"},
         {"key": "bill_import:9", "name": "雾渃 10.2.csv", "reason": "dupImport"},
     ]
-    monkeypatch.setattr(pilot_tools, "_scan_deletables", _async_return(scanned))
+    monkeypatch.setattr("app.domains.agent.tools.builtin.tracking._scan_deletables", _async_return(scanned))
     import asyncio
     out = asyncio.run(pilot_tools.execute_tool("find_deletables", {}, sid="del-s1"))
     assert out["kind"] == "proposal" and out["action"] == "delete"
     assert out["items"][0]["reason"] == "removed"
     assert out["items"][1]["key"] == "bill_import:9"
 
-    monkeypatch.setattr(pilot_tools, "_scan_deletables", _async_return([]))
+    monkeypatch.setattr("app.domains.agent.tools.builtin.tracking._scan_deletables", _async_return([]))
     empty = asyncio.run(pilot_tools.execute_tool("find_deletables", {}, sid="del-s1"))
     assert empty == {"kind": "empty", "note": "nothing_to_delete"}
 

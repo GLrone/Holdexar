@@ -80,7 +80,7 @@ def test_compare_games_projects_price_facts(monkeypatch):
     async def fake_price_facts(appid):
         return facts[appid]
 
-    monkeypatch.setattr(pilot_tools, "price_facts", fake_price_facts)
+    monkeypatch.setattr("app.domains.agent.tools.builtin.prices.price_facts", fake_price_facts)
     out = asyncio.run(pilot_tools.compare_games([1, "2", 3, 2, "x"]))
     assert out["kind"] == "compare"
     a, b = out["items"]
