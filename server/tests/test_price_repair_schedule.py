@@ -188,7 +188,7 @@ def _stub_start_env(monkeypatch, *, captured_specs=None):
     monkeypatch.setattr(crawl_service.games_service, "refresh_sort_cache", _noop)
 
     # run_crawl 打桩短路（stats 形态对齐 runner 返回）
-    async def _run_crawl(pairs, *, config, stop_event=None, pre_tasks=None):
+    async def _run_crawl(pairs, *, config, stop_event=None, pre_tasks=None, crawl_job_id=None):
         return {
             "total": len(pairs or []) + len(pre_tasks or []),
             "processed": 0,

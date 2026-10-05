@@ -143,7 +143,7 @@ def _crawl_env(monkeypatch):
     # merge 落行，避免与种子的欠账行撞主键。
     import app.core.database as database_module
 
-    async def _run_crawl(pairs, *, config, stop_event=None, pre_tasks=None):
+    async def _run_crawl(pairs, *, config, stop_event=None, pre_tasks=None, crawl_job_id=None):
         from datetime import datetime
 
         now = datetime.now()
@@ -319,7 +319,7 @@ async def test_direct_strategy_crawls_without_pool(db, monkeypatch):
 
     captured: list = []
 
-    async def _capture_run_crawl(pairs, *, config, stop_event=None, pre_tasks=None):
+    async def _capture_run_crawl(pairs, *, config, stop_event=None, pre_tasks=None, crawl_job_id=None):
         captured.append(config)
         return {"total": len(pairs or []) + len(pre_tasks or []), "processed": 0}
 
@@ -332,6 +332,29 @@ async def test_direct_strategy_crawls_without_pool(db, monkeypatch):
     cfg = captured[0]
     assert cfg.proxy_url is None and not cfg.proxy_urls, "直连形态不带任何代理"
     assert cfg.workers == crawl_service.DIRECT_MODE_WORKERS
+
+
+@pytest.mark.asyncio
+async def test_run_crawl_receives_job_identity(db, monkeypatch):
+    """任务行身份随执行入口下传：作业台账凭 crawl_job_id 显式回指任务行。"""
+    from sqlalchemy import select
+
+    _crawl_env(monkeypatch)
+    captured: list = []
+
+    async def _capture_run_crawl(pairs, *, config, stop_event=None, pre_tasks=None, crawl_job_id=None):
+        captured.append(crawl_job_id)
+        return {"total": len(pairs or []) + len(pre_tasks or []), "processed": 0}
+
+    monkeypatch.setattr(crawl_service, "run_crawl", _capture_run_crawl)
+
+    await crawl_service.start_job(scope="appids", appids=[998003], kind="scheduled")
+    assert crawl_service._active is not None
+    await crawl_service._active.task
+    assert captured, "run_crawl 必须被调用"
+    async with db() as session:
+        row = (await session.execute(select(CrawlJob))).scalars().one()
+    assert captured == [row.id], "作业台账关联键必须是任务行主键"
 
 
 # ── 全局滑动窗口限流 ──

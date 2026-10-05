@@ -124,6 +124,7 @@ async def run_crawl(
     config: CrawlRunConfig,
     stop_event: asyncio.Event | None = None,
     pre_tasks: list[dict] | None = None,
+    crawl_job_id: int | None = None,
 ) -> dict:
     """生产爬取入口：取得 crawler 占用后执行，结束（含异常）必定释放。
 
@@ -159,6 +160,7 @@ async def run_crawl(
             workers=config.workers,
             data_dir=Path(get_settings().data_dir),
             now=datetime.now(),
+            crawl_job_id=crawl_job_id,
         )
         stats = await _run_crawl_locked(
             appids,
