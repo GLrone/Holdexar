@@ -13,10 +13,12 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from app.core.app_info import APP_SLUG, GITHUB_REPO
+from app.core.app_info import GITHUB_REPO
+from app.core import data_export, keyring, rekey, secretbox
+from app.core.keyring import KeyringError
+from app.core.secretbox import SecretBoxError
 from app.core.backup import (
     create_backup as create_backup_impl,
     list_backups as list_backups_impl,
@@ -179,40 +181,110 @@ async def import_legacy(req: LegacyImport) -> dict:
     }
 
 
+class ExportRequest(BaseModel):
+    password: str  # 导出口令：加密正文的密钥来源（不落库、不保存）
+
+
 @router.post("/export")
-async def export_data() -> dict:
-    """导出全库为 JSON（data/exports/）。"""
-    settings = get_settings()
-    export_dir = settings.data_dir / "exports"
-    export_dir.mkdir(parents=True, exist_ok=True)
-    out_path = export_dir / f"{APP_SLUG}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+async def export_data(req: ExportRequest) -> dict:
+    """敏感数据加密导出：用户侧数据（凭据/关注/设置/订阅…）口令加密为单文件。
 
-    async with get_session_factory()() as session:
-        games = (await session.execute(select(Game))).scalars().all()
-        prices = (await session.execute(select(GameCurrentPrice))).scalars().all()
+    不含随包种子与公共目录/价格数据（由发布包与爬虫重建）。需当前主密钥可用
+    （口令保护模式下先解锁），凭据类列解密后随正文重新加密封装。
+    """
+    try:
+        return await data_export.create_export(req.password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except SecretBoxError as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
-    payload = {
-        "exportedAt": datetime.now().isoformat(),
-        "games": [
-            {
-                "appid": int(g.appid), "name": g.name, "nameEn": g.name_en,
-                "type": g.type, "positiveRate": g.positive_rate,
-                "reviewCount": g.review_count, "releaseDate": g.release_date,
-            }
-            for g in games
-        ],
-        "currentPrices": [
-            {
-                "appid": int(p.appid), "region": p.region_code, "currency": p.currency,
-                "price": int(p.price) if p.price else None,
-                "original": int(p.original_price) if p.original_price else None,
-                "discount": p.discount_percent, "status": p.price_status,
-            }
-            for p in prices
-        ],
-    }
-    out_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    return {"path": str(out_path), "games": len(games), "prices": len(prices)}
+
+@router.get("/export/list")
+async def export_list() -> dict:
+    """已有加密导出文件（新→旧）。"""
+    return {"items": data_export.list_exports()}
+
+
+@router.get("/export/download/{name}")
+async def export_download(name: str) -> FileResponse:
+    """下载加密导出文件。"""
+    try:
+        path = data_export.safe_export_path(name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="导出文件不存在")
+    return FileResponse(path, filename=path.name, media_type="application/octet-stream")
+
+
+@router.delete("/export/{name}")
+async def export_delete(name: str) -> dict:
+    """删除某份导出文件。"""
+    try:
+        path = data_export.safe_export_path(name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="导出文件不存在")
+    path.unlink()
+    return {"removed": True}
+
+
+# ─────────────────────────── 密钥保护（凭据加密的密钥托管）────────────────────
+
+
+class SecurityModeRequest(BaseModel):
+    mode: str  # legacy（关闭）| dpapi（系统凭据）| passphrase（口令）
+    passphrase: str | None = None  # 设为口令模式时的新口令
+    current_passphrase: str | None = None  # 从口令模式切换出去时的当前口令
+
+
+class SecurityUnlock(BaseModel):
+    passphrase: str
+
+
+@router.get("/system/security")
+async def security_status() -> dict:
+    """当前密钥保护状态（模式 / 是否锁定 / 系统凭据是否可用）。"""
+    return keyring.status(get_settings().data_dir)
+
+
+@router.post("/system/security/mode")
+async def security_set_mode(req: SecurityModeRequest) -> dict:
+    """切换密钥保护模式：全库密文换钥重加密（失败不改动库与密钥文件）。"""
+    try:
+        result = await rekey.switch_mode(
+            req.mode,
+            passphrase=req.passphrase,
+            current_passphrase=req.current_passphrase,
+        )
+    except KeyringError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "counts": result["counts"],
+            "security": keyring.status(get_settings().data_dir)}
+
+
+@router.post("/system/security/unlock")
+async def security_unlock(req: SecurityUnlock) -> dict:
+    """口令模式解锁：口令正确后本进程可读写凭据。"""
+    data_dir = get_settings().data_dir
+    try:
+        ok = keyring.unlock(data_dir, req.passphrase)
+    except KeyringError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not ok:
+        raise HTTPException(status_code=400, detail="口令不正确")
+    secretbox.clear_key_cache()
+    return {"ok": True, "security": keyring.status(data_dir)}
+
+
+@router.post("/system/security/lock")
+async def security_lock() -> dict:
+    """锁定：清空进程内主密钥（仅口令模式有意义）。"""
+    keyring.lock()
+    secretbox.clear_key_cache()
+    return {"ok": True, "security": keyring.status(get_settings().data_dir)}
 
 
 # ─────────────────────────── 数据备份（VACUUM INTO 在线快照）────────────────────
