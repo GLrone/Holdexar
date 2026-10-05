@@ -24,6 +24,8 @@ export const ICONS: Record<string, string> = {
   'chevron-left': '<path d="m15 6-6 6 6 6"/>',
   close: '<path d="M18 6 6 18M6 6l12 12"/>',
   check: '<path d="m5 13 4 4L19 7"/>',
+  eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/>',
+  'eye-off': '<path d="m3 3 18 18"/><path d="M10.6 5.1A9.8 9.8 0 0 1 12 5c6.5 0 10 7 10 7a17.4 17.4 0 0 1-2.9 3.8M6.4 6.4C3.7 8.3 2 12 2 12s3.5 7 10 7c1.5 0 2.9-.4 4.1-.9"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/>',
   'arrow-up': '<path d="M12 19V5M5 12l7-7 7 7"/>',
   'arrow-down': '<path d="M12 5v14M19 12l-7 7-7-7"/>',
   'arrow-left-right': '<path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/>',

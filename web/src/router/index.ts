@@ -27,6 +27,11 @@ const router = createRouter({
       meta: titleKey('nav.library'),
     },
     {
+      path: '/pilot',
+      component: () => import('@/views/pilot/Index.vue'),
+      meta: titleKey('nav.pilot'),
+    },
+    {
       path: '/gamelib',
       component: () => import('@/views/gamelib/Index.vue'),
       meta: titleKey('nav.gamelib'),

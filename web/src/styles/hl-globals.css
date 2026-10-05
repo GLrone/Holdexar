@@ -751,7 +751,8 @@
     position: sticky;
     /* 吸在 navbar 下方：navbar 高度随布局变（桌面 68px / 窄屏 50px），CSS 变量动态适配 */
     top: calc(var(--navbar-h, 68px) + 6px);
-    z-index: 9000;
+    /* 只需盖过页内卡片（≤10）；必须低于 HlDrawer 遮罩（100），模态抽屉打开时由抽屉接管全屏 */
+    z-index: 20;
     background: var(--surface-overlay-panel);
     backdrop-filter: blur(10px);
     padding: 10px 20px;

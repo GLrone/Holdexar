@@ -103,7 +103,7 @@ function selectRegion(code: string) {
   if (code === region.value) return
   region.value = code
   renderLimit.value = RENDER_STEP
-  // 进地区维度即回顶：工具栏是吸顶层（z-index 9000），滚动中途选区会把它
+  // 进地区维度即回顶：工具栏是吸顶层，滚动中途选区会把它
   // 钉在当前视口上、盖住正下方的卡片行（与游戏商店选排序回顶同一语义）
   ;(document.querySelector('.view-container') as HTMLElement | null)?.scrollTo({
     top: 0,

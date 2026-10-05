@@ -15,6 +15,8 @@ import {
   type NotificationStats,
   type SettingsPayload,
   type BackupItem,
+  type SecurityStatus,
+  type ExportItem,
   type SteamAccountItem,
 } from '@/api/client'
 import { useI18n, type MessageKey } from '@/locales'
@@ -55,44 +57,257 @@ const apiKeyInput = ref('')
 const apiKeyMasked = ref('')
 const hasApiKey = ref(false)
 
-/* ── 领航员（pilot）：AI 解读服务配置（key 密文落库，留空不改） ── */
+/* ── 领航员（pilot）：多供应商绑定（左导航 + 右详情；密钥密文落库） ── */
 const pilotEnabled = ref(false)
-const pilotProtocol = ref('openai')
-const pilotBaseUrl = ref('')
-const pilotModel = ref('')
-const pilotApiKeyInput = ref('')
-const pilotHasApiKey = ref(false)
 const pilotCapText = ref('500000')
-const modelDialogOpen = ref(false)
-const modelDialogPick = ref('')
-const modelDialogCustom = ref('')
-const pilotTesting = ref(false)
-const pilotTestOk = ref<{ ms: number } | null>(null)
+const pilotUsage = ref({ inp: 0, out: 0, calls: 0, total: 0 })
+const pilotModel = ref('')
+const pilotActiveId = ref('')
+const globalSaving = ref(false)
 
-function openModelDialog() {
-  modelDialogPick.value = pilotModel.value
-  modelDialogCustom.value = ''
-  modelDialogOpen.value = true
+const pilotBanner = ref<{ tone: 'pending' | 'success' | 'fail'; text: string } | null>(null)
+let pilotBannerTimer: ReturnType<typeof setTimeout> | null = null
+function showPilotBanner(
+  tone: 'pending' | 'success' | 'fail',
+  key: MessageKey,
+  params?: Record<string, string | number>,
+) {
+  if (pilotBannerTimer) {
+    clearTimeout(pilotBannerTimer)
+    pilotBannerTimer = null
+  }
+  pilotBanner.value = { tone, text: t(key, params) }
+  if (tone !== 'pending') {
+    pilotBannerTimer = setTimeout(() => {
+      pilotBanner.value = null
+      pilotBannerTimer = null
+    }, 4000)
+  }
 }
 
-function addModelToList(name: string) {
-  const m = name.trim()
-  if (m && !pilotModels.value.includes(m)) pilotModels.value = [...pilotModels.value, m]
+const pilotProviders = ref<PilotProvider[]>([])
+const selectedPid = ref('')
+const pickerOpen = ref(false)
+const providerSaving = ref(false)
+const providerDeleteArm = ref(false)
+let deleteArmTimer: ReturnType<typeof setTimeout> | null = null
+
+const draftName = ref('')
+const draftProtocol = ref('openai')
+const draftBaseUrl = ref('')
+const draftWindow = ref('')
+const draftModels = ref<string[]>([])
+const draftDisabled = ref<string[]>([])
+const providerKeyInput = ref('')
+const draftHasKey = ref(false)
+
+const modelDialogOpen = ref(false)
+const modelDialogCustom = ref('')
+const modelStatus = ref<Record<string, { state: 'testing' | 'ok' | 'fail'; ms?: number; reason?: string }>>({})
+const pilotDetecting = ref(false)
+const pilotTesting = ref(false)
+
+const selectedProvider = computed(() => pilotProviders.value.find((p) => p.id === selectedPid.value) || null)
+const activeProviderName = computed(
+  () => pilotProviders.value.find((p) => p.id === pilotActiveId.value)?.name || t('pilot.model.none'),
+)
+const enabledCount = computed(
+  () => draftModels.value.filter((m) => !draftDisabled.value.includes(m)).length,
+)
+
+const pilotProtocolOptions = computed(() => [
+  { value: 'openai', label: t('pilot.proto.openai') },
+  { value: 'openai-responses', label: t('pilot.proto.openai-responses') },
+  { value: 'anthropic', label: t('pilot.proto.anthropic') },
+  { value: 'ollama', label: t('pilot.proto.ollama') },
+])
+const pilotBaseUrlPlaceholder = computed(() =>
+  t(`pilot.proto.base_${draftProtocol.value}` as MessageKey))
+
+/** 模板卡：协议 + 端点路径（与协议下拉同源，选哪个按服务商支持的路径） */
+const PROVIDER_TEMPLATES = computed(() => [
+  { protocol: 'openai', name: t('pilot.providers.tplOpenai'), label: t('pilot.proto.openai'), path: '/chat/completions' },
+  { protocol: 'openai-responses', name: t('pilot.providers.tplResponses'), label: t('pilot.proto.openai-responses'), path: '/responses' },
+  { protocol: 'anthropic', name: t('pilot.providers.tplAnthropic'), label: t('pilot.proto.anthropic'), path: '/v1/messages' },
+  { protocol: 'ollama', name: t('pilot.providers.tplOllama'), label: t('pilot.proto.ollama'), path: '/api/chat' },
+])
+
+function loadDraft() {
+  const p = pilotProviders.value.find((x) => x.id === selectedPid.value)
+  if (!p) return
+  draftName.value = p.name
+  draftProtocol.value = p.protocol
+  draftBaseUrl.value = p.base_url
+  draftWindow.value = p.context_window ? String(p.context_window) : ''
+  draftModels.value = [...p.models]
+  draftDisabled.value = [...p.models_disabled]
+  draftHasKey.value = p.has_key
+  providerKeyInput.value = ''
+  modelStatus.value = {}
+}
+
+function selectProvider(pid: string) {
+  selectedPid.value = pid
+  pickerOpen.value = false
+  providerDeleteArm.value = false
+  loadDraft()
+}
+
+async function refreshProviders(preferSelect?: string) {
+  const r = await pilotApi.listProviders()
+  pilotProviders.value = r.items
+  if (preferSelect && r.items.some((p) => p.id === preferSelect)) selectedPid.value = preferSelect
+  if (!r.items.some((p) => p.id === selectedPid.value)) selectedPid.value = r.items[0]?.id ?? ''
+  loadDraft()
+}
+
+async function loadPilot() {
+  try {
+    const cfg = await pilotApi.getConfig()
+    pilotEnabled.value = cfg.enabled
+    pilotCapText.value = String(cfg.monthly_cap)
+    pilotUsage.value = {
+      inp: cfg.usage_inp, out: cfg.usage_out, calls: cfg.usage_calls, total: cfg.usage_total,
+    }
+    pilotModel.value = cfg.model
+    pilotActiveId.value = cfg.active
+    const r = await pilotApi.listProviders()
+    pilotProviders.value = r.items
+    selectedPid.value = cfg.active || r.items[0]?.id || ''
+    loadDraft()
+  } catch {
+    /* 领航员配置拉不到不影响设置页其余部分 */
+  }
+}
+
+async function createFromTemplate(tpl: { protocol: string; name: string; label: string }) {
+  providerSaving.value = true
+  try {
+    const created = await pilotApi.createProvider({ name: tpl.name, protocol: tpl.protocol })
+    pickerOpen.value = false
+    await refreshProviders(created.id)
+    showPilotBanner('success', 'pilot.providers.created', { name: created.name })
+  } catch {
+    showPilotBanner('fail', 'pilot.providers.createFailed')
+  } finally {
+    providerSaving.value = false
+  }
+}
+
+async function saveProvider() {
+  if (!selectedPid.value) return
+  providerSaving.value = true
+  try {
+    const patch: {
+      name: string
+      protocol: string
+      models: string[]
+      models_disabled: string[]
+      base_url?: string
+      api_key?: string
+      context_window: number | null
+    } = {
+      name: draftName.value.trim() || t('pilot.providers.defaultName'),
+      protocol: draftProtocol.value,
+      models: draftModels.value,
+      models_disabled: draftDisabled.value,
+      // 窗口显式随表单走：清空输入框 = 清除配置（后端回落固定历史预算）
+      context_window: (() => {
+        const n = Number(draftWindow.value.trim())
+        return draftWindow.value.trim() && Number.isFinite(n) && n > 0 ? Math.floor(n) : null
+      })(),
+    }
+    // base_url 为空时不上送：避免编辑其他字段（如改模型清单）时把已配好的端点静默清空
+    const url = draftBaseUrl.value.trim()
+    if (url) patch.base_url = url
+    const key = providerKeyInput.value.trim()
+    if (key) patch.api_key = key
+    const updated = await pilotApi.updateProvider(selectedPid.value, patch)
+    draftHasKey.value = updated.has_key
+    providerKeyInput.value = ''
+    await refreshProviders(selectedPid.value)
+    showPilotBanner('success', 'pilot.providers.saved')
+  } catch {
+    showPilotBanner('fail', 'pilot.providers.saveFailed')
+  } finally {
+    providerSaving.value = false
+  }
+}
+
+function armDeleteProvider() {
+  if (!providerDeleteArm.value) {
+    providerDeleteArm.value = true
+    deleteArmTimer = setTimeout(() => (providerDeleteArm.value = false), 3000)
+    return
+  }
+  if (deleteArmTimer) clearTimeout(deleteArmTimer)
+  providerDeleteArm.value = false
+  void deleteProviderNow()
+}
+
+async function deleteProviderNow() {
+  const pid = selectedPid.value
+  if (!pid) return
+  try {
+    await pilotApi.deleteProvider(pid)
+    await refreshProviders()
+    showPilotBanner('success', 'pilot.providers.deleted')
+  } catch {
+    showPilotBanner('fail', 'pilot.providers.deleteFailed')
+  }
+}
+
+async function savePilotGlobal() {
+  globalSaving.value = true
+  try {
+    const cfg = await pilotApi.updateConfig({
+      enabled: pilotEnabled.value,
+      monthly_cap: Number(pilotCapText.value) || 0,
+    })
+    pilotUsage.value = {
+      inp: cfg.usage_inp, out: cfg.usage_out, calls: cfg.usage_calls, total: cfg.usage_total,
+    }
+    message.success(t('pilot.settings.saved'))
+  } catch (e) {
+    errorMsg.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    globalSaving.value = false
+  }
+}
+
+/* 模型清单对话框：管理选中供应商的模型（检测 / 测试 / 启用 / 删除） */
+function openModelsDialog() {
+  modelDialogOpen.value = true
+  modelStatus.value = {}
+}
+
+function addModelToList() {
+  const m = modelDialogCustom.value.trim()
+  if (!m) return
+  if (!draftModels.value.includes(m)) draftModels.value = [...draftModels.value, m]
+  modelDialogCustom.value = ''
 }
 
 function removeModelFromList(name: string) {
-  pilotModels.value = pilotModels.value.filter((m) => m !== name)
-  if (modelDialogPick.value === name) modelDialogPick.value = ''
+  draftModels.value = draftModels.value.filter((m) => m !== name)
+  draftDisabled.value = draftDisabled.value.filter((m) => m !== name)
   delete modelStatus.value[name]
+}
+
+/** 启用开关走草稿，随「保存供应商」落库 */
+function toggleModelEnabled(name: string, on: boolean) {
+  draftDisabled.value = on
+    ? draftDisabled.value.filter((m) => m !== name)
+    : [...new Set([...draftDisabled.value, name])]
 }
 
 async function testModel(name: string) {
   modelStatus.value = { ...modelStatus.value, [name]: { state: 'testing' } }
   try {
-    const key = pilotApiKeyInput.value.trim()
+    const key = providerKeyInput.value.trim()
     const r = await pilotApi.test({
-      protocol: pilotProtocol.value,
-      base_url: pilotBaseUrl.value.trim(),
+      protocol: draftProtocol.value,
+      base_url: draftBaseUrl.value.trim(),
       model: name,
       ...(key ? { api_key: key } : {}),
     })
@@ -105,123 +320,40 @@ async function testModel(name: string) {
   }
 }
 
-function confirmModelDialog() {
-  if (!modelDialogPick.value) return
-  pilotModel.value = modelDialogPick.value
-  modelDialogOpen.value = false
-}
-
 function testFailText(reason?: string): string {
-  const fk = `pilot.test.fail.${reason ?? 'server_error'}` as MessageKey
-  return t(fk)
+  return t(`pilot.test.fail.${reason ?? 'server_error'}` as MessageKey)
 }
-
-async function testPilotConn() {
-  pilotTesting.value = true
-  pilotTestOk.value = null
-  try {
-    const key = pilotApiKeyInput.value.trim()
-    const r = await pilotApi.test({
-      protocol: pilotProtocol.value,
-      base_url: pilotBaseUrl.value.trim(),
-      model: pilotModel.value,
-      ...(key ? { api_key: key } : {}),
-    })
-    if (r.ok) {
-      pilotTestOk.value = { ms: r.latency_ms }
-      message.success(t('pilot.test.ok', { ms: r.latency_ms }))
-    } else {
-      const fk = `pilot.test.fail.${r.reason ?? 'server_error'}` as MessageKey
-      message.error(t(fk))
-    }
-  } catch {
-    message.error(t('pilot.test.fail.unreachable'))
-  } finally {
-    pilotTesting.value = false
-  }
-}
-const pilotModels = ref<string[]>([])
-const pilotDetecting = ref(false)
-const modelStatus = ref<Record<string, { state: 'testing' | 'ok' | 'fail'; ms?: number; reason?: string }>>({})
-const pilotUsage = ref({ inp: 0, out: 0, calls: 0, total: 0 })
-/* 协议选项存 value 不存文案（切语言跟随）；地址占位随协议变化 */
-const pilotProtocolOptions = computed(() => [
-  { value: 'openai', label: t('pilot.proto.openai') },
-  { value: 'anthropic', label: t('pilot.proto.anthropic') },
-  { value: 'gemini', label: t('pilot.proto.gemini') },
-  { value: 'ollama', label: t('pilot.proto.ollama') },
-])
-const pilotBaseUrlPlaceholder = computed(() =>
-  t(`pilot.proto.base_${pilotProtocol.value}` as MessageKey))
-const pilotSaving = ref(false)
 
 async function detectPilot() {
   pilotDetecting.value = true
+  showPilotBanner('pending', 'pilot.banner.detecting')
   try {
-    const key = pilotApiKeyInput.value.trim()
+    const key = providerKeyInput.value.trim()
     const r = await pilotApi.detect({
-      base_url: pilotBaseUrl.value.trim(),
+      base_url: draftBaseUrl.value.trim(),
+      // 编辑已有供应商：识别用该供应商已存密钥，不用活跃供应商的（跨家必 401）
+      ...(selectedPid.value ? { provider_id: selectedPid.value } : {}),
       ...(key ? { api_key: key } : {}),
     })
-    pilotProtocol.value = r.protocol
-    pilotModels.value = r.models?.length ? r.models : pilotModels.value
-    if (!pilotModel.value && r.models?.length) pilotModel.value = r.models[0]
+    draftProtocol.value = r.protocol
+    draftModels.value = r.models?.length ? r.models : draftModels.value
     if (r.key_valid === false) {
-      message.error(t('pilot.detect.keybad'))
+      showPilotBanner('fail', 'pilot.detect.keybad')
+    } else if (r.reason === 'not_found') {
+      showPilotBanner('fail', 'pilot.detect.notFound')
+    } else if (r.reason === 'upstream') {
+      showPilotBanner('fail', 'pilot.detect.upstream')
+    } else if (r.reason === 'unreachable') {
+      showPilotBanner('fail', 'pilot.detect.unreachable')
     } else if (r.models?.length) {
-      message.success(t('pilot.detect.ok', { vendor: r.vendor || t('pilot.title'), n: r.models.length }))
+      showPilotBanner('success', 'pilot.detect.ok', { vendor: r.vendor || t('pilot.title'), n: r.models.length })
     } else {
-      message.info(t('pilot.detect.nomodels', { vendor: r.vendor || t('pilot.title') }))
+      showPilotBanner('success', 'pilot.detect.nomodels', { vendor: r.vendor || t('pilot.title') })
     }
   } catch {
-    message.error(t('pilot.detect.unreachable'))
+    showPilotBanner('fail', 'pilot.detect.unreachable')
   } finally {
     pilotDetecting.value = false
-  }
-}
-
-async function loadPilot() {
-  try {
-    const cfg = await pilotApi.getConfig()
-    pilotEnabled.value = cfg.enabled
-    pilotProtocol.value = cfg.protocol || 'openai'
-    pilotBaseUrl.value = cfg.base_url
-    if (!pilotModel.value) pilotModel.value = cfg.model
-    pilotModels.value = cfg.models || []
-    pilotHasApiKey.value = cfg.has_api_key
-    pilotCapText.value = String(cfg.monthly_cap)
-    pilotUsage.value = {
-      inp: cfg.usage_inp, out: cfg.usage_out, calls: cfg.usage_calls, total: cfg.usage_total,
-    }
-  } catch {
-    /* 领航员配置拉不到不影响设置页其余部分 */
-  }
-}
-
-async function savePilot() {
-  pilotSaving.value = true
-  try {
-    const key = pilotApiKeyInput.value.trim()
-    const cfg = await pilotApi.updateConfig({
-      protocol: pilotProtocol.value,
-      enabled: pilotEnabled.value,
-      base_url: pilotBaseUrl.value.trim(),
-      model: pilotModel.value.trim(),
-      models: pilotModels.value,
-      ...(key ? { api_key: key } : {}),
-      monthly_cap: Number(pilotCapText.value) || 0,
-    })
-    pilotHasApiKey.value = cfg.has_api_key
-    pilotModels.value = cfg.models || pilotModels.value
-    pilotUsage.value = {
-      inp: cfg.usage_inp, out: cfg.usage_out, calls: cfg.usage_calls, total: cfg.usage_total,
-    }
-    pilotApiKeyInput.value = ''
-    message.success(t('pilot.settings.saved'))
-  } catch (e) {
-    errorMsg.value = e instanceof Error ? e.message : String(e)
-  } finally {
-    pilotSaving.value = false
   }
 }
 
@@ -884,6 +1016,149 @@ async function sendTestNotification() {
   }
 }
 
+/* ── 数据与安全（密钥保护 + 加密导出）──
+ * 保护方式切换会在后端做全库换钥重加密，耗时与库内凭据条数相关：期间禁用按钮，
+ * 成功后才刷新状态。口令模式下 `locked` 为真时凭据不可读写，导出会直接失败。 */
+const securityStatus = ref<SecurityStatus | null>(null)
+const securityMode = ref<SecurityStatus['mode']>('legacy')
+const securityBusy = ref(false)
+const newPassphrase = ref('')
+const currentPassphrase = ref('')
+const unlockPassphrase = ref('')
+
+const securityModeOptions = computed(() => {
+  const options: { value: string; label: string }[] = [
+    { value: 'legacy', label: t('settings.security.modeLegacy') },
+    { value: 'passphrase', label: t('settings.security.modePassphrase') },
+  ]
+  if (securityStatus.value?.dpapi_available)
+    options.splice(1, 0, { value: 'dpapi', label: t('settings.security.modeDpapi') })
+  return options
+})
+
+function securityModeLabel(mode: SecurityStatus['mode']): string {
+  if (mode === 'dpapi') return t('settings.security.modeDpapi')
+  if (mode === 'passphrase') return t('settings.security.modePassphrase')
+  return t('settings.security.modeLegacy')
+}
+
+const securityModeHint = computed(() => {
+  const m = securityStatus.value?.mode
+  if (m === 'dpapi') return t('settings.security.modeDpapiHint')
+  if (m === 'passphrase') return t('settings.security.modePassphraseHint')
+  return t('settings.security.modeLegacyHint')
+})
+
+async function loadSecurity() {
+  try {
+    const st = await systemApi.securityStatus()
+    securityStatus.value = st
+    securityMode.value = st.mode
+  } catch {
+    /* 状态读取失败不阻塞设置页 */
+  }
+}
+
+async function applySecurityMode() {
+  if (securityMode.value === securityStatus.value?.mode) return
+  if (securityMode.value === 'passphrase' && newPassphrase.value.length < 6) {
+    message.error(t('settings.security.passphraseTooShort'))
+    return
+  }
+  securityBusy.value = true
+  try {
+    const res = await systemApi.securitySetMode(
+      securityMode.value,
+      newPassphrase.value || undefined,
+      currentPassphrase.value || undefined,
+    )
+    securityStatus.value = res.security
+    securityMode.value = res.security.mode
+    newPassphrase.value = ''
+    currentPassphrase.value = ''
+    message.success(t('settings.security.modeChanged'))
+    await load()
+  } catch (e) {
+    securityMode.value = securityStatus.value?.mode ?? 'legacy'
+    message.error(e instanceof Error ? e.message : String(e))
+  } finally {
+    securityBusy.value = false
+  }
+}
+
+async function doUnlock() {
+  securityBusy.value = true
+  try {
+    const res = await systemApi.securityUnlock(unlockPassphrase.value)
+    securityStatus.value = res.security
+    unlockPassphrase.value = ''
+    message.success(t('settings.security.unlocked'))
+    await load()
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+  } finally {
+    securityBusy.value = false
+  }
+}
+
+async function doLock() {
+  securityBusy.value = true
+  try {
+    const res = await systemApi.securityLock()
+    securityStatus.value = res.security
+    message.success(t('settings.security.lockedToast'))
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+  } finally {
+    securityBusy.value = false
+  }
+}
+
+/* 加密导出：导出文件列表与口令（口令不落库，仅本次提交用） */
+const exportItems = ref<ExportItem[]>([])
+const exportPassword = ref('')
+const exporting = ref(false)
+const removingExportName = ref('')
+
+async function loadExports() {
+  try {
+    exportItems.value = (await systemApi.exportList()).items
+  } catch {
+    /* 列表失败不阻塞设置页 */
+  }
+}
+
+async function createExport() {
+  if (exportPassword.value.length < 6) {
+    message.error(t('settings.export.pwTooShort'))
+    return
+  }
+  exporting.value = true
+  try {
+    const res = await systemApi.exportCreate(exportPassword.value)
+    exportPassword.value = ''
+    message.success(t('settings.export.done', { name: res.name, size: fmtSize(res.sizeBytes) }))
+    await loadExports()
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+  } finally {
+    exporting.value = false
+  }
+}
+
+async function removeExport(name: string) {
+  removingExportName.value = name
+  try {
+    await systemApi.exportRemove(name)
+    message.success(t('settings.export.removed', { name }))
+    await loadExports()
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+  } finally {
+    removingExportName.value = ''
+  }
+}
+
 onMounted(() => {
   /* 更新开关存在 settings store（启动逻辑与侧栏红点共用）：本页也要保证它拉到过
      ——深链直接进本页时 App 外壳虽会 load，但失败重试的兜底放在这里更稳。 */
@@ -891,6 +1166,8 @@ onMounted(() => {
   void load()
   void loadNotifications()
   void loadPilot()
+  void loadSecurity()
+  void loadExports()
   /* 登录会话在后端存续：进页先对状态快照，进行中就恢复状态卡并续上轮询 */
   void refreshLoginState().then(() => {
     if (loginActive.value) startLoginPolling()
@@ -1246,103 +1523,186 @@ onUnmounted(stopLoginPolling)
         </div>
       </div>
 
-      <!-- 领航员（AI 解读服务配置） -->
+      <!-- 领航员（AI 解读服务绑定：多供应商，左导航 + 右详情） -->
       <div class="card settings-card" data-section="pilot.settings.title">
         <div class="section-title">{{ t('pilot.settings.title') }}</div>
         <div class="section-desc">{{ t('pilot.settings.desc') }}</div>
 
-        <div class="settings-row">
-          <div class="settings-row__line">
-            <HlSwitch v-model="pilotEnabled" accent :label="t('pilot.settings.enabled')" />
+        <!-- 全局：总开关 + 上限（与供应商无关） -->
+        <div class="pilot-form">
+          <div class="pilot-form__row">
+            <span class="pilot-form__label">{{ t('pilot.settings.enabled') }}</span>
+            <div class="pilot-form__field pilot-form__field--inline">
+              <HlSwitch v-model="pilotEnabled" accent />
+              <span class="pilot-form__hint">
+                {{ t('pilot.model.current') }}：{{ pilotModel || t('pilot.model.none') }} · {{ activeProviderName }}
+              </span>
+            </div>
           </div>
-          <div class="settings-row__line">
-            <HlSelect
-              v-model="pilotProtocol"
-              :options="pilotProtocolOptions"
-              style="max-width: 420px"
-            />
-          </div>
-          <div class="settings-row__line">
-            <HlInput
-              v-model="pilotBaseUrl"
-              :placeholder="pilotBaseUrlPlaceholder"
-              style="max-width: 340px"
-            />
-            <HlButton
-              size="sm"
-              :disabled="!pilotBaseUrl.trim() || pilotDetecting"
-              :loading="pilotDetecting"
-              @click="detectPilot"
-            >
-              {{ t('pilot.detect.button') }}
-            </HlButton>
-          </div>
-          <div class="settings-row__line">
-            <span class="section-desc">{{ t('pilot.model.current') }}</span>
-            <HlChip shape="soft" :on="Boolean(pilotModel)">{{ pilotModel || t('pilot.model.none') }}</HlChip>
-            <HlButton size="sm" @click="openModelDialog">{{ t('pilot.model.edit') }}</HlButton>
-            <HlButton
-              size="sm"
-              :disabled="!pilotBaseUrl.trim() || !pilotModel || pilotTesting"
-              :loading="pilotTesting"
-              @click="testPilotConn"
-            >
-              {{ t('pilot.test.button') }}
-            </HlButton>
-          </div>
-          <div class="settings-row__line">
-            <HlInput
-              v-model="pilotApiKeyInput"
-              show-password
-              :placeholder="
-                pilotHasApiKey
-                  ? t('pilot.settings.api_key_hint')
-                  : t('pilot.settings.api_key')
-              "
-              style="max-width: 420px"
-            />
-          </div>
-          <div class="settings-row__line">
-            <HlInput
-              v-model="pilotCapText"
-              :placeholder="t('pilot.settings.monthly_cap')"
-              style="max-width: 420px"
-            />
-            <span class="section-desc" style="display: inline; margin-left: 8px">
-              {{ t('pilot.settings.usage', {
-                total: pilotUsage.total,
-                inp: pilotUsage.inp,
-                out: pilotUsage.out,
-                calls: pilotUsage.calls,
-              }) }}
-            </span>
+          <div class="pilot-form__row">
+            <span class="pilot-form__label">{{ t('pilot.settings.monthly_cap') }}</span>
+            <div class="pilot-form__field pilot-form__field--inline">
+              <HlInput v-model="pilotCapText" style="max-width: 180px" />
+              <span class="pilot-form__hint">
+                {{ t('pilot.settings.usage', { total: pilotUsage.total, inp: pilotUsage.inp, out: pilotUsage.out, calls: pilotUsage.calls }) }}
+              </span>
+              <HlButton size="sm" :loading="globalSaving" @click="savePilotGlobal">
+                <HlIcon name="check" />
+              </HlButton>
+            </div>
           </div>
         </div>
 
-        <div class="settings-row">
-          <div class="settings-row__line">
-            <HlButton
-              art="outline"
-              tone="blue"
-              size="sm"
-              :disabled="pilotSaving"
-              :loading="pilotSaving"
-              @click="savePilot"
+        <!-- 多供应商：左导航（厂商收敛） + 右详情（模板选择 / 编辑卡） -->
+        <div class="pilot-prov">
+          <aside class="pilot-prov__nav">
+            <button
+              v-for="p in pilotProviders"
+              :key="p.id"
+              type="button"
+              class="pilot-prov__item"
+              :class="{ 'is-active': p.id === selectedPid, 'is-current': p.id === pilotActiveId }"
+              @click="selectProvider(p.id)"
             >
-              <HlIcon name="check" />
-              {{ t('pilot.settings.save') }}
-            </HlButton>
+              <span class="pilot-prov__dot" :class="{ 'is-on': p.has_key && p.base_url }" aria-hidden="true"></span>
+              <span class="pilot-prov__item-name">{{ p.name || t('pilot.providers.defaultName') }}</span>
+              <span v-if="p.id === pilotActiveId" class="pilot-prov__badge">{{ t('pilot.providers.inUse') }}</span>
+            </button>
+            <button
+              type="button"
+              class="pilot-prov__add"
+              :disabled="providerSaving"
+              @click="pickerOpen = !pickerOpen"
+            >
+              + {{ t('pilot.providers.add') }}
+            </button>
+          </aside>
+
+          <div class="pilot-prov__detail">
+            <template v-if="pickerOpen">
+              <div class="pilot-prov__picker-title">{{ t('pilot.providers.templateTitle') }}</div>
+              <div class="pilot-prov__templates">
+                <button
+                  v-for="tpl in PROVIDER_TEMPLATES"
+                  :key="tpl.protocol"
+                  type="button"
+                  class="pilot-prov__tpl"
+                  :disabled="providerSaving"
+                  @click="createFromTemplate(tpl)"
+                >
+                  <span class="pilot-prov__tpl-name">{{ tpl.label }}</span>
+                  <span class="pilot-prov__tpl-path">{{ tpl.path }}</span>
+                </button>
+              </div>
+            </template>
+
+            <template v-else-if="selectedProvider">
+              <div class="pilot-form">
+                <div class="pilot-form__row">
+                  <span class="pilot-form__label">{{ t('pilot.providers.name') }}</span>
+                  <div class="pilot-form__field">
+                    <HlInput v-model="draftName" />
+                  </div>
+                </div>
+                <div class="pilot-form__row">
+                  <span class="pilot-form__label">{{ t('pilot.settings.protocol') }}</span>
+                  <div class="pilot-form__field">
+                    <HlSelect v-model="draftProtocol" :options="pilotProtocolOptions" />
+                  </div>
+                </div>
+                <div class="pilot-form__row">
+                  <span class="pilot-form__label">{{ t('pilot.settings.baseUrl') }}</span>
+                  <div class="pilot-form__field pilot-form__field--inline">
+                    <HlInput v-model="draftBaseUrl" :placeholder="pilotBaseUrlPlaceholder" />
+                    <HlButton
+                      size="sm"
+                      :disabled="!draftBaseUrl.trim() || pilotDetecting"
+                      :loading="pilotDetecting"
+                      @click="detectPilot"
+                    >
+                      {{ t('pilot.detect.button') }}
+                    </HlButton>
+                  </div>
+                </div>
+                <div class="pilot-form__row">
+                  <span class="pilot-form__label">{{ t('pilot.settings.api_key') }}</span>
+                  <div class="pilot-form__field">
+                    <HlInput
+                      v-model="providerKeyInput"
+                      show-password
+                      :placeholder="draftHasKey ? t('pilot.settings.api_key_hint') : t('pilot.settings.api_key')"
+                    />
+                    <span v-if="draftHasKey" class="pilot-form__hint">{{ t('pilot.settings.api_key_hint') }}</span>
+                  </div>
+                </div>
+                <div class="pilot-form__row">
+                  <span class="pilot-form__label">{{ t('pilot.settings.model') }}</span>
+                  <div class="pilot-form__field pilot-form__field--inline">
+                    <HlChip shape="soft" :on="enabledCount > 0">
+                      {{ t('pilot.providers.modelsHint', { enabled: enabledCount, total: draftModels.length }) }}
+                    </HlChip>
+                    <HlButton size="sm" @click="openModelsDialog">{{ t('pilot.model.edit') }}</HlButton>
+                  </div>
+                </div>
+                <div class="pilot-form__row">
+                  <span class="pilot-form__label">{{ t('pilot.providers.contextWindow') }}</span>
+                  <div class="pilot-form__field">
+                    <HlInput v-model="draftWindow" :placeholder="t('pilot.providers.contextWindowHint')" />
+                  </div>
+                </div>
+              </div>
+
+              <Transition name="hl-pop">
+                <div v-if="pilotBanner" class="pilot-banner" :class="`is-${pilotBanner.tone}`" role="status">
+                  <span class="pilot-banner__dot" aria-hidden="true"></span>
+                  <span class="pilot-banner__text">{{ pilotBanner.text }}</span>
+                  <button
+                    v-if="pilotBanner.tone !== 'pending'"
+                    type="button"
+                    class="pilot-banner__close"
+                    :aria-label="t('common.close')"
+                    @click="pilotBanner = null"
+                  >×</button>
+                </div>
+              </Transition>
+
+              <div class="pilot-form__save">
+                <HlButton
+                  art="outline"
+                  tone="blue"
+                  size="sm"
+                  :disabled="providerSaving"
+                  :loading="providerSaving"
+                  @click="saveProvider"
+                >
+                  <HlIcon name="check" />
+                  {{ t('pilot.providers.save') }}
+                </HlButton>
+                <HlButton
+                  variant="text"
+                  size="sm"
+                  :class="{ 'is-arm': providerDeleteArm }"
+                  @click="armDeleteProvider"
+                >
+                  {{ providerDeleteArm ? t('pilot.providers.deleteConfirm') : t('pilot.providers.delete') }}
+                </HlButton>
+              </div>
+            </template>
+
+            <div v-else class="pilot-prov__empty">{{ t('pilot.providers.empty') }}</div>
           </div>
         </div>
       </div>
 
-      <!-- 模型编辑窗口：识别清单单选 / 自定义模型名 -->
-      <HlDialog v-model="modelDialogOpen" :title="t('pilot.model.dialogTitle')" width="480px">
+      <!-- 模型清单对话框：管理选中供应商的模型（检测 / 测试 / 启用 / 删除） -->
+      <HlDialog v-model="modelDialogOpen" :title="t('pilot.model.dialogTitle')" width="520px">
         <div class="pilot-model-dialog">
           <div class="settings-row__line">
+            <HlInput v-model="modelDialogCustom" :placeholder="t('pilot.model.custom')" style="max-width: 240px" />
+            <HlButton size="sm" @click="addModelToList">{{ t('pilot.model.customAdd') }}</HlButton>
             <HlButton
               size="sm"
-              :disabled="!pilotBaseUrl.trim() || pilotDetecting"
+              :disabled="!draftBaseUrl.trim() || pilotDetecting"
               :loading="pilotDetecting"
               @click="detectPilot"
             >
@@ -1350,31 +1710,25 @@ onUnmounted(stopLoginPolling)
             </HlButton>
           </div>
           <div class="section-desc">{{ t('pilot.model.dialogHint') }}</div>
-          <div v-if="pilotModels.length" class="pilot-model-list">
-            <div
-              v-for="m in pilotModels"
-              :key="m"
-              class="pilot-model-row"
-              :class="{ 'is-pick': modelDialogPick === m }"
-              @click="modelDialogPick = m"
-            >
+          <div v-if="draftModels.length" class="pilot-model-list">
+            <div v-for="m in draftModels" :key="m" class="pilot-model-row">
               <span class="pilot-model-row__name">{{ m }}</span>
               <span v-if="modelStatus[m]?.state === 'testing'" class="pilot-model-row__status">
                 {{ t('pilot.model.testing') }}
               </span>
-              <span
-                v-else-if="modelStatus[m]?.state === 'ok'"
-                class="pilot-model-row__status is-ok"
-              >
+              <span v-else-if="modelStatus[m]?.state === 'ok'" class="pilot-model-row__status is-ok">
                 {{ t('pilot.model.testOk', { ms: modelStatus[m]?.ms }) }}
               </span>
-              <span
-                v-else-if="modelStatus[m]?.state === 'fail'"
-                class="pilot-model-row__status is-fail"
-              >
+              <span v-else-if="modelStatus[m]?.state === 'fail'" class="pilot-model-row__status is-fail">
                 {{ testFailText(modelStatus[m]?.reason) }}
               </span>
               <span class="pilot-model-row__ops">
+                <HlSwitch
+                  :model-value="!draftDisabled.includes(m)"
+                  :title="t('pilot.model.enabledHint')"
+                  @click.stop
+                  @update:model-value="(v: boolean) => toggleModelEnabled(m, v)"
+                />
                 <HlButton size="sm" variant="text" :disabled="modelStatus[m]?.state === 'testing'" @click.stop="testModel(m)">
                   {{ t('pilot.model.rowTest') }}
                 </HlButton>
@@ -1384,21 +1738,7 @@ onUnmounted(stopLoginPolling)
               </span>
             </div>
           </div>
-          <div class="settings-row__line">
-            <HlInput v-model="modelDialogCustom" :placeholder="t('pilot.model.custom')" style="flex: 1" />
-            <HlButton
-              size="sm"
-              :disabled="!modelDialogCustom.trim()"
-              @click="addModelToList(modelDialogCustom.trim()); modelDialogPick = modelDialogCustom.trim(); modelDialogCustom = ''"
-            >
-              {{ t('pilot.model.customAdd') }}
-            </HlButton>
-          </div>
-          <div class="settings-row__line">
-            <HlButton variant="primary" size="sm" :disabled="!modelDialogPick" @click="confirmModelDialog">
-              {{ t('pilot.model.confirm') }}
-            </HlButton>
-          </div>
+          <div v-else class="section-desc">{{ t('pilot.detect.nomodels', { vendor: t('pilot.title') }) }}</div>
         </div>
       </HlDialog>
 
@@ -1487,6 +1827,141 @@ onUnmounted(stopLoginPolling)
           </div>
         </div>
         <div v-else class="section-desc">{{ t('settings.backup.empty') }}</div>
+      </div>
+
+      <!-- 数据与安全（凭据密钥托管 + 敏感数据加密导出） -->
+      <div class="card settings-card" data-section="settings.section.security">
+        <div class="section-title">{{ t('settings.section.security') }}</div>
+        <div class="section-desc">{{ t('settings.security.desc') }}</div>
+
+        <div class="settings-row">
+          <div class="settings-row__line">
+            <span class="section-desc" style="display: inline">{{ t('settings.security.modeLabel') }}</span>
+            <HlSelect
+              v-model="securityMode"
+              :options="securityModeOptions"
+              :disabled="securityBusy"
+              style="max-width: 220px"
+            />
+            <HlButton
+              size="sm"
+              :disabled="securityBusy || securityMode === securityStatus?.mode"
+              :loading="securityBusy"
+              @click="applySecurityMode"
+            >
+              {{ t('settings.security.apply') }}
+            </HlButton>
+          </div>
+          <div class="section-desc">
+            {{ t('settings.security.current', { mode: securityModeLabel(securityStatus?.mode ?? 'legacy') }) }}
+            · {{ securityModeHint }}
+          </div>
+        </div>
+
+        <div v-if="securityMode === 'passphrase'" class="settings-row">
+          <div class="settings-row__line">
+            <HlInput
+              v-model="newPassphrase"
+              type="password"
+              :placeholder="t('settings.security.passphraseLabel')"
+              style="max-width: 220px"
+            />
+            <HlInput
+              v-if="securityStatus?.mode === 'passphrase'"
+              v-model="currentPassphrase"
+              type="password"
+              :placeholder="t('settings.security.currentPassphrasePlaceholder')"
+              style="max-width: 220px"
+            />
+          </div>
+        </div>
+
+        <div v-if="securityStatus?.locked" class="settings-row">
+          <div class="section-desc">{{ t('settings.security.locked') }}</div>
+          <div class="settings-row__line">
+            <HlInput
+              v-model="unlockPassphrase"
+              type="password"
+              :placeholder="t('settings.security.unlockLabel')"
+              style="max-width: 220px"
+              @keydown.enter="doUnlock"
+            />
+            <HlButton art="outline" tone="green" size="sm" :disabled="securityBusy" @click="doUnlock">
+              {{ t('settings.security.unlock') }}
+            </HlButton>
+          </div>
+        </div>
+
+        <div
+          v-else-if="securityStatus?.mode === 'passphrase'"
+          class="settings-row"
+        >
+          <div class="settings-row__line">
+            <HlButton art="outline" size="sm" :disabled="securityBusy" @click="doLock">
+              {{ t('settings.security.lock') }}
+            </HlButton>
+          </div>
+        </div>
+
+        <!-- 加密导出（只含用户侧数据，不含随包种子与公共目录/价格数据） -->
+        <div class="section-title" style="margin-top: 14px; font-size: 14px">
+          {{ t('settings.export.create') }}
+        </div>
+        <div class="section-desc">{{ t('settings.export.desc') }}</div>
+        <div class="section-desc">{{ t('settings.export.excludeNote') }}</div>
+
+        <div class="settings-row">
+          <div class="settings-row__line">
+            <HlInput
+              v-model="exportPassword"
+              type="password"
+              :placeholder="t('settings.export.passwordPlaceholder')"
+              style="max-width: 220px"
+              :disabled="exporting"
+            />
+            <HlButton
+              art="outline"
+              tone="blue"
+              size="sm"
+              :disabled="exporting"
+              :loading="exporting"
+              @click="createExport"
+            >
+              <HlIcon v-if="!exporting" name="download" />
+              {{ exporting ? t('settings.export.creating') : t('settings.export.create') }}
+            </HlButton>
+            <span class="section-desc" style="display: inline; margin-left: 8px">
+              {{ t('settings.export.count', { n: exportItems.length }) }}
+            </span>
+          </div>
+        </div>
+
+        <div v-if="exportItems.length" class="settings-backup-list">
+          <div v-for="e in exportItems" :key="e.name" class="settings-backup-item">
+            <span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono, monospace); font-size: 12px">
+              {{ e.name }}
+            </span>
+            <span class="section-desc" style="flex-shrink: 0">{{ fmtSize(e.sizeBytes) }}</span>
+            <span class="section-desc" style="flex-shrink: 0">
+              {{ e.createdAt.replace('T', ' ').slice(0, 19) }}
+            </span>
+            <span class="settings-backup-actions">
+              <a class="settings-backup-download" :href="systemApi.exportDownloadUrl(e.name)" download>
+                {{ t('settings.export.download') }}
+              </a>
+              <HlButton
+                variant="text"
+                size="sm"
+                :disabled="removingExportName === e.name"
+                :loading="removingExportName === e.name"
+                @click="removeExport(e.name)"
+              >
+                {{ removingExportName === e.name ? t('settings.export.removing') : t('settings.export.remove') }}
+              </HlButton>
+            </span>
+          </div>
+        </div>
+        <div v-else class="section-desc">{{ t('settings.export.empty') }}</div>
       </div>
 
       <!-- 应用更新（GitHub Releases：下载暂存 + 重启换装，数据目录永不移动） -->
@@ -2343,4 +2818,270 @@ onUnmounted(stopLoginPolling)
   align-items: center;
   gap: 2px;
 }
+
+/* 领航员绑定卡：标签行网格（ZCode 模型供应商卡式排版） */
+.pilot-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.pilot-form__row {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+}
+
+.pilot-form__label {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.pilot-form__field {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.pilot-form__field--inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.pilot-form__hint {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.pilot-form__save {
+  margin-top: 14px;
+}
+
+/* 测试/识别反馈横幅：pending 常驻、success 手动关、fail 自动消失 */
+.pilot-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--bg-card);
+}
+
+.pilot-banner__dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+
+.pilot-banner.is-pending .pilot-banner__dot {
+  background: var(--accent);
+  animation: pilot-banner-pulse 1.2s ease-in-out infinite alternate;
+}
+
+.pilot-banner.is-success .pilot-banner__dot {
+  background: var(--success);
+}
+
+.pilot-banner.is-fail .pilot-banner__dot {
+  background: var(--warning);
+}
+
+.pilot-banner.is-success {
+  border-color: var(--success);
+}
+
+@keyframes pilot-banner-pulse {
+  from { opacity: 1; }
+  to { opacity: 0.35; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pilot-banner.is-pending .pilot-banner__dot {
+    animation: none;
+  }
+}
+
+.pilot-banner__text {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.pilot-banner__close {
+  flex: none;
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--text-faint);
+}
+
+.pilot-banner__close:hover {
+  color: var(--text-primary);
+}
+
+
+/* 领航员多供应商：左导航（厂商收敛） + 右详情 */
+.pilot-prov {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: 14px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.pilot-prov__nav {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.pilot-prov__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+
+.pilot-prov__item:hover {
+  background: var(--accent-a10);
+}
+
+.pilot-prov__item.is-active {
+  background: var(--accent-a10);
+}
+
+.pilot-prov__dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+
+.pilot-prov__dot.is-on {
+  background: var(--success);
+}
+
+.pilot-prov__item-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.pilot-prov__item.is-current .pilot-prov__item-name {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.pilot-prov__badge {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--accent-a10);
+  font-size: 10px;
+  color: var(--accent);
+}
+
+.pilot-prov__add {
+  padding: 8px 10px;
+  border: 1px dashed var(--border-soft);
+  border-radius: 8px;
+  background: none;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-secondary);
+  text-align: left;
+}
+
+.pilot-prov__add:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.pilot-prov__detail {
+  min-width: 0;
+}
+
+.pilot-prov__picker-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+}
+
+.pilot-prov__templates {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.pilot-prov__tpl {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-height: 56px;
+  padding: 10px 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--bg-card);
+  cursor: pointer;
+  text-align: left;
+}
+
+.pilot-prov__tpl:hover {
+  border-color: var(--accent);
+  background: var(--accent-a10);
+}
+
+.pilot-prov__tpl-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.pilot-prov__tpl-path {
+  font-size: 11px;
+  font-family: var(--font-mono, monospace);
+  color: var(--text-secondary);
+}
+
+.pilot-prov__empty {
+  padding: 24px 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.pilot-form__save {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.pilot-form__save .is-arm {
+  color: var(--warning);
+}
+
 </style>

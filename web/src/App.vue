@@ -189,6 +189,7 @@ const navGroups = computed<HlSideNavGroup[]>(() => [
     items: [
       { label: t('nav.dashboard'), to: '/dashboard', icon: 'dashboard' },
       { label: t('nav.library'), to: '/library', icon: 'store' },
+      { label: t('nav.pilot'), to: '/pilot', icon: 'zap' },
       { label: t('nav.bundles'), to: '/bundles', icon: 'package' },
       { label: t('nav.gamelib'), to: '/gamelib', icon: 'gamepad' },
       { label: t('nav.pool'), to: '/pool', icon: 'target' },
