@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from app.core.events import bus
@@ -25,13 +26,16 @@ from app.domains.crawl import stats as price_stats
 logger = logging.getLogger(__name__)
 
 
-async def run_price_cycle(specs: list[dict], *, kind: str = "scheduled") -> bool:
+async def run_price_cycle(
+    specs: list[dict], *, kind: str = "scheduled",
+    stop_event: asyncio.Event | None = None,
+) -> bool:
     """跑完一轮价格刷新，返回**本轮是否值得让调用方让路重试**。
 
     返回 False 仅当本轮一个任务都没起来且属于「被占、稍后跑得动」；链异常与
     建轮失败返回 True（重试只会重复建轮、二次广播同一终态）。`kind` 仅作
     归属标签落 `price_cycles.kind`（scheduled=定时网格 / manual=用户手动）。
-    """
+    `stop_event` 透传链内做段间协作式停止（见 run_sequential）。"""
     cycle_id: int | None = None
     regions: list[str] | None = None
     expected_units = 0
@@ -53,7 +57,7 @@ async def run_price_cycle(specs: list[dict], *, kind: str = "scheduled") -> bool
     try:
         await price_cycle.advance(cycle_id, price_cycle.RUNNING)
         results = await crawl_service.run_sequential(
-            specs, cycle_id=cycle_id, skip_reasons=skipped
+            specs, cycle_id=cycle_id, skip_reasons=skipped, stop_event=stop_event
         )
         started = bool(results)
         if not results and specs:
@@ -98,7 +102,11 @@ async def run_price_cycle(specs: list[dict], *, kind: str = "scheduled") -> bool
                 expected_units=expected_units,
                 entered_repairing=entered_repairing,
             )
-            if terminal == price_cycle.FAILED and not jobs:
+            if not jobs and stop_event is not None and stop_event.is_set():
+                # 停在了第一个段之前：用户意图明确，不按「无事可做/没跑起来」记
+                terminal = price_cycle.CANCELLED
+                terminal_error = "用户已停止"
+            elif terminal == price_cycle.FAILED and not jobs:
                 detail = "；".join(skipped[:4]) if skipped else "原因未随段留痕（详见服务日志）"
                 terminal_error = f"本轮没有任何抓取段启动：{detail}"[:200]
             elif terminal == price_cycle.FAILED:
