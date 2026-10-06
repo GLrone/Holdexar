@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
+from app.core.logging import log_event
 from app.domains.proxypool.models import (
     ProxyJobRun,
     ProxyNode,
@@ -354,7 +355,12 @@ async def record_start(
             await session.commit()
         return run_id
     except Exception:  # noqa: BLE001 —— 观测失败不得影响爬取
-        logger.exception("[作业台账] 开始记录失败（爬取照常进行）")
+        log_event(
+            logger,
+            "作业台账开始记录失败，爬取照常进行",
+            level=logging.ERROR,
+            exc_info=True,
+        )
         return None
 
 
@@ -386,7 +392,13 @@ async def record_finish(
             )
             await session.commit()
     except Exception:  # noqa: BLE001
-        logger.exception("[作业台账] 收尾记录失败（作业 %s）", run_id)
+        log_event(
+            logger,
+            "作业台账收尾记录失败",
+            level=logging.ERROR,
+            exc_info=True,
+            detail={"作业编号": run_id},
+        )
 
 
 async def record_interrupted(now: datetime | None = None) -> int:
@@ -397,7 +409,12 @@ async def record_interrupted(now: datetime | None = None) -> int:
             await session.commit()
         return marked
     except Exception:  # noqa: BLE001
-        logger.exception("[作业台账] 中断作业标记失败（不阻塞启动）")
+        log_event(
+            logger,
+            "中断作业标记失败，不阻塞启动",
+            level=logging.ERROR,
+            exc_info=True,
+        )
         return 0
 
 

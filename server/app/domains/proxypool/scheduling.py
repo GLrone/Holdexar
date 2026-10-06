@@ -30,6 +30,7 @@ from pathlib import Path
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import WritePriority, write_gate
+from app.core.logging import log_event
 from app.crawler.occupancy import crawler_busy
 from app.domains.proxypool.bridge import ingest_ledger, rebind_missing_sources
 from app.domains.proxypool.exits import exit_snapshot, select_exit_slots, slot_signature
@@ -119,9 +120,14 @@ async def run_startup_l1(
     deadline = time.monotonic() + max(0.0, float(budget_seconds))
     for start in range(0, len(names), L0_COMMIT_EVERY):
         if time.monotonic() >= deadline:
-            logger.info(
-                "[首轮L1] 时间预算用尽（已探 %d/%d 个节点），其余交给维护周期",
-                len(outcomes), len(names),
+            log_event(
+                logger,
+                f"首轮出口身份探测时间预算用尽，已探 {len(outcomes)}/{len(names)} 个节点，其余交给维护周期",
+                tag="未完成",
+                detail={
+                    "已探节点数": len(outcomes),
+                    "本轮计划节点数": len(names),
+                },
             )
             break
         chunk = names[start:start + L0_COMMIT_EVERY]
@@ -198,17 +204,32 @@ async def run_l0_cycle(
         try:
             repaired = await rebind_missing_sources(session, now=now)
             if repaired:
-                logger.info("[来源补回] 订阅 %s 的来源关联按最新快照补齐", list(repaired))
+                log_event(
+                    logger,
+                    f"已按最新快照补齐 {len(repaired)} 条订阅的来源关联",
+                    tag="已修复",
+                    detail={"订阅编号": "、".join(str(i) for i in repaired)},
+                )
             ingested = await ingest_ledger(session, now=now)
             if ingested.changed:
-                logger.info(
-                    "[体检→池] 账本对齐：命中 %d（复活 %d / 新出口 %d，陈久跳过 %d）",
-                    ingested.matched, ingested.activated, ingested.exit_ips_added,
-                    ingested.skipped_stale,
+                log_event(
+                    logger,
+                    f"体检结果与池账本对齐：命中 {ingested.matched} 个节点",
+                    detail={
+                        "命中": ingested.matched,
+                        "复活": ingested.activated,
+                        "新增出口": ingested.exit_ips_added,
+                        "陈久跳过": ingested.skipped_stale,
+                    },
                 )
             await session.commit()
         except Exception:  # noqa: BLE001 —— 对齐失败不阻断 L0 与重建判定
-            logger.exception("[体检→池] 两账本对齐失败（本轮跳过）")
+            log_event(
+                logger,
+                "体检结果与池账本对齐失败，本轮跳过",
+                level=logging.ERROR,
+                exc_info=True,
+            )
             await session.rollback()
     before = await eligible_runtime_names(session)
     outcomes: list[HealthOutcome] = []
@@ -298,7 +319,12 @@ async def _maintenance_probe(
             now=now, run_id=run.id, **({"url": l1_url} if l1_url else {}),
         )
     except Exception:  # noqa: BLE001
-        logger.exception("[L1] 出口 IP 探针程序异常：本轮 L1 无结果")
+        log_event(
+            logger,
+            "出口身份探针程序异常，本轮无出口身份结果",
+            level=logging.ERROR,
+            exc_info=True,
+        )
         l1 = ()
     try:
         l2 = await business_check_pool(
@@ -306,7 +332,12 @@ async def _maintenance_probe(
             now=now, appid=appid, run_id=run.id, **({"url": l2_url} if l2_url else {}),
         )
     except Exception:  # noqa: BLE001
-        logger.exception("[L2] 业务探针程序异常：本轮 L2 无结果")
+        log_event(
+            logger,
+            "业务可用性探针程序异常，本轮无业务可用性结果",
+            level=logging.ERROR,
+            exc_info=True,
+        )
         l2 = ()
     run.total = len(l2)
     run.steam_ok = sum(1 for o in l2 if getattr(o, "ok", False))
@@ -327,9 +358,10 @@ async def _maintenance_probe(
     exits_after = await exit_snapshot(session)
     if slot_signature(exits_after) != slot_signature(exits_before):
         request_rebuild()
-        logger.info(
-            "[L1] 出口身份变化：%d → %d 个已知出口，置 rebuild_pending（空闲时收敛 listener 数）",
-            len(exits_before), len(exits_after),
+        log_event(
+            logger,
+            f"出口身份变化：已知出口从 {len(exits_before)} 个变为 {len(exits_after)} 个，已标记待重建（空闲时收敛监听端口数）",
+            detail={"变化前出口数": len(exits_before), "变化后出口数": len(exits_after)},
         )
 
     chosen = restore_selection(previous, await eligible_runtime_names(session))
@@ -380,7 +412,12 @@ async def _rebuild_skip_reason(session: AsyncSession, *, data_dir: Path) -> str 
             return "池与 lane 计划均与现状一致：重建无目标差异"
         return None
     except Exception:  # noqa: BLE001 —— 闸 itself 故障时放行重建，不拦真需求
-        logger.exception("[重建] 空转闸读取异常，按需重建处理")
+        log_event(
+            logger,
+            "重建必要性检查读取异常，本次仍执行重建",
+            level=logging.ERROR,
+            exc_info=True,
+        )
         return None
 
 
@@ -413,7 +450,12 @@ async def run_pending_rebuild(
                 return None
             skip = await _rebuild_skip_reason(session, data_dir=data_dir)
             if skip is not None:
-                logger.info("[重建] 跳过本次重建：%s", skip)
+                log_event(
+                    logger,
+                    "本次重建无需执行，已跳过",
+                    tag="跳过",
+                    detail={"原因": skip},
+                )
                 return None
             return await rebuild_runtime(
                 session, data_dir=data_dir, controller_url=controller_url, secret=secret,

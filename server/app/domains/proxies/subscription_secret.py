@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 
 from app.core import secretbox
+from app.core.logging import log_event
 from app.core.secretbox import SecretBoxError
 
 logger = logging.getLogger(__name__)
@@ -44,7 +45,7 @@ def open_url(value: str | None) -> str:
     try:
         return secretbox.decrypt_secret(value, PURPOSE)
     except SecretBoxError:
-        logger.warning("[proxies] 订阅链接无法在本机解密，按链接不可用处理")
+        log_event(logger, "订阅链接无法在本机解密，按链接不可用处理", level=logging.WARNING)
         return ""
 
 

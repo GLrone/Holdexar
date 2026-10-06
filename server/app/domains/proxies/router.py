@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.core.config import get_settings
+from app.core.logging import log_event
 from . import clash_manager, service
 
 logger = logging.getLogger(__name__)
@@ -34,13 +35,18 @@ async def _auto_promote_after_check(sub_id: int, alive: int) -> None:
             )
             await session.commit()
         if result.promoted:
-            logger.info(
-                "[准入] 订阅 %s 首检健康（可用 %d）→ 自动转正进池", sub_id, alive
+            log_event(
+                logger,
+                f"订阅 {sub_id} 首检健康（可用 {alive} 个节点），已自动转正进池",
+                tag="成功",
+                detail={"订阅": sub_id, "可用节点": alive},
             )
     except Exception as e:  # noqa: BLE001 —— 转正不成本身不构成首检失败
-        logger.info(
-            "[准入] 订阅 %s 首检健康（可用 %d）但暂不能转正（%s）；等同步落快照后自动转正",
-            sub_id, alive, e,
+        log_event(
+            logger,
+            f"订阅 {sub_id} 首检健康（可用 {alive} 个节点）但暂时无法转正，等同步落快照后自动重试",
+            tag="未完成",
+            detail={"订阅": sub_id, "可用节点": alive, "原因": str(e)},
         )
 
 
@@ -90,19 +96,28 @@ def _spawn_first_check(sub_id: int, *, probe_all: bool = True) -> None:
     async def _first_check() -> None:
         try:
             if await service.clash_nodes_fresh(sub_id):
-                logger.info(
-                    "[订阅首检] Clash 订阅 %s：账本 %d 分钟内已检测，沿用现有结论",
-                    sub_id, service.FIRST_CHECK_REUSE_MINUTES,
+                log_event(
+                    logger,
+                    f"Clash 订阅 {sub_id} 的检测结论还在 {service.FIRST_CHECK_REUSE_MINUTES} 分钟有效期内，沿用上次结果",
+                    tag="复用",
+                    detail={"订阅": sub_id, "复用窗口分钟": service.FIRST_CHECK_REUSE_MINUTES},
                 )
                 return
             r = await service.test_clash_nodes(sub_id, probe_all=probe_all)
-            logger.info(
-                "[订阅首检] Clash 订阅 %s：共 %s 节点，可用 %s",
-                sub_id, r.get("total"), r.get("alive"),
+            log_event(
+                logger,
+                f"Clash 订阅 {sub_id} 首检完成：共 {r.get('total')} 个节点，{r.get('alive')} 个可用",
+                detail={"订阅": sub_id, "节点总数": r.get("total"), "可用节点": r.get("alive")},
             )
             await _auto_promote_after_check(sub_id, int(r.get("alive") or 0))
         except Exception:  # noqa: BLE001 —— 首检失败不影响内核已生效的事实
-            logger.exception("[订阅首检] Clash 节点检测失败（可稍后手动检测）")
+            log_event(
+                logger,
+                f"Clash 订阅 {sub_id} 首检的节点检测失败，可稍后手动检测",
+                level=logging.ERROR,
+                exc_info=True,
+                detail={"订阅": sub_id},
+            )
 
     asyncio.get_running_loop().create_task(_first_check())
 
@@ -482,12 +497,19 @@ async def sync_subscription(sub_id: int):
         async def _post_sync_check() -> None:
             try:
                 r = await service.test_clash_nodes(sub_id, probe_all=True)
-                logger.info(
-                    "[刷新首检] Clash 订阅 %s：共 %s 节点，可用 %s",
-                    sub_id, r.get("total"), r.get("alive"),
+                log_event(
+                    logger,
+                    f"Clash 订阅 {sub_id} 刷新后首检完成：共 {r.get('total')} 个节点，{r.get('alive')} 个可用",
+                    detail={"订阅": sub_id, "节点总数": r.get("total"), "可用节点": r.get("alive")},
                 )
             except Exception:  # noqa: BLE001 —— 首检失败不影响刷新事实
-                logger.exception("[刷新首检] Clash 节点检测失败（可稍后手动检测）")
+                log_event(
+                    logger,
+                    f"Clash 订阅 {sub_id} 刷新后的节点检测失败，可稍后手动检测",
+                    level=logging.ERROR,
+                    exc_info=True,
+                    detail={"订阅": sub_id},
+                )
 
         asyncio.get_running_loop().create_task(_post_sync_check())
     return result

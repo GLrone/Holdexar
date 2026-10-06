@@ -13,6 +13,7 @@ from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session_factory, write_gate
+from app.core.logging import log_event
 
 from app.domains.proxypool.models import ProxyRunExit
 
@@ -130,7 +131,12 @@ async def write_run_exits(
                 node_by_exit=node_by_exit, now=now,
             )
     except Exception:  # noqa: BLE001 —— 出口账本写失败不改爬取行为
-        logger.exception("[出口账本] 落库失败（不影响本次作业结果）")
+        log_event(
+            logger,
+            "出口账本落库失败，不影响本次作业结果",
+            level=logging.ERROR,
+            exc_info=True,
+        )
         return 0
 
 

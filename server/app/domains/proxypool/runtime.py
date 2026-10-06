@@ -36,6 +36,7 @@ import yaml
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import orchestration as events
+from app.core.logging import log_event
 from app.domains.proxypool.exits import MAX_CRAWL_WORKERS, ExitSlot, select_exit_slots
 from app.domains.proxypool.pool import (
     PoolBuildError,
@@ -803,8 +804,12 @@ async def rebuild_runtime(
                 previous_lanes=previous_lanes, wait_timeout=wait_timeout,
             )
         except Exception as exc:  # noqa: BLE001 —— 热通道任何一步未通过都回退冷通道
-            logger.warning(
-                "池配置热重载未通过（%s：%s），回退进程重启", type(exc).__name__, exc
+            log_event(
+                logger,
+                "池配置热重载未通过，改走内核重启",
+                tag="降级",
+                level=logging.WARNING,
+                detail={"异常类型": type(exc).__name__, "原因": str(exc)},
             )
 
     config = prepare_runtime_config(data_dir, lanes=len(slots) or None)
@@ -1151,13 +1156,21 @@ async def hot_reconverge(
             runtime=runtime, build=build, slots=slots, previous=previous,
             previous_lanes=previous_lanes, wait_timeout=wait_timeout,
         )
-        logger.info(
-            "[收敛] 启动前热通道收敛完成：出口槽 %d / 池 %d 节点",
-            len(slots), len(build.runtime_names),
+        log_event(
+            logger,
+            f"启动前热通道收敛完成：出口槽 {len(slots)} 个，池内 {len(build.runtime_names)} 个节点",
+            tag="成功",
+            detail={"出口槽数": len(slots), "池内节点数": len(build.runtime_names)},
         )
         return True
     except Exception as exc:  # noqa: BLE001 —— 收敛不成走原 fail-closed 拒绝
-        logger.warning("[收敛] 启动前热通道收敛未通过：%s", exc)
+        log_event(
+            logger,
+            "启动前热通道收敛未通过",
+            tag="未完成",
+            level=logging.WARNING,
+            detail={"原因": str(exc)},
+        )
         return False
 
 
@@ -1187,7 +1200,11 @@ async def _recover_lane_plan(
         pending = [n.runtime_name for n in await eligible_nodes(session)
                    if not n.exit_ip][:LANE_RECOVERY_L1_NODES]
         if pending:
-            logger.info("[收敛] 出口槽为空：就地补探 %d 个合格节点的出口身份", len(pending))
+            log_event(
+                logger,
+                f"出口槽为空，就地补探 {len(pending)} 个合格节点的出口身份",
+                detail={"补探节点数": len(pending)},
+            )
             await exit_ip_check_pool(
                 session, data_dir=data_dir, controller_url=base, secret=secret,
                 now=datetime.now(), names=tuple(pending),
@@ -1229,7 +1246,13 @@ async def crawl_lane_plan(
         # 技术细节（缺什么/差多少）进日志；用户面只给结论与下一步——
         # 未生成 lane plan / listener 未就绪是刚启动时的正常形态，池空是
         # 订阅侧问题，两者给出的出路不同
-        logger.warning("[爬取拒绝] 运行时就绪闸未通过：%s", why)
+        log_event(
+            logger,
+            "运行时就绪闸未通过，本次爬取拒绝启动",
+            tag="跳过",
+            level=logging.WARNING,
+            detail={"原因": why},
+        )
         starting_up = "lane" in why
         raise RuntimeUnavailableError(
             "代理通道还在启动：内核正在拉起出口，等十几秒再点一次启动"

@@ -24,6 +24,7 @@ import yaml
 from app.domains.proxies.models import ProxySubscription
 from app.domains.proxies.subscription_secret import UNREADABLE_MESSAGE, open_url
 from app.core import orchestration as events
+from app.core.logging import log_event
 from app.domains.proxypool.admission import auto_admit_healthy_candidate, is_admitted
 from app.domains.proxypool.exits import select_exit_slots
 from app.domains.proxypool.health import latest_l0_delays
@@ -128,7 +129,12 @@ async def sync_subscriptions(
         auto_subs = [s for s in subs if _auto_refresh_on(s)]
         off = [s.id for s in subs if not _auto_refresh_on(s)]
         if off:
-            logger.info("[同步] 跳过已关闭自动更新的订阅：%s", off)
+            log_event(
+                logger,
+                f"{len(off)} 条关闭了自动更新的订阅本轮跳过同步",
+                tag="跳过",
+                detail={"订阅编号": "、".join(str(i) for i in off)},
+            )
         subs = auto_subs
     before = await eligible_runtime_names(session)
     shas: dict[int, str] = {}
@@ -192,16 +198,28 @@ async def sync_subscriptions(
                         session, subscription_id=sub_id, data_dir=data_dir, now=now
                     )
                     if admitted is not None:
-                        logger.info(
-                            "[同步] 订阅 %s 体检健康（可用 %s）→ 自动转正进池（快照 %s，%d 条）",
-                            sub_id, (sub.last_stats or {}).get("alive"),
-                            snap.sha256[:10], len(nodes),
+                        log_event(
+                            logger,
+                            f"订阅 {sub_id} 体检健康，自动转正进生产池",
+                            tag="成功",
+                            detail={
+                                "订阅编号": sub_id,
+                                "可用节点数": (sub.last_stats or {}).get("alive"),
+                                "快照": snap.sha256[:10],
+                                "节点数": len(nodes),
+                            },
                         )
                     else:
                         skipped.append(sub_id)
-                        logger.info(
-                            "[同步] 订阅 %s 保持候选（体检无可用节点或未体检）：快照已落盘（%s，%d 条），不进 Registry",
-                            sub_id, snap.sha256[:10], len(nodes),
+                        log_event(
+                            logger,
+                            f"订阅 {sub_id} 体检无可用节点或尚未体检，保持候选（快照已落盘、不进生产池）",
+                            tag="跳过",
+                            detail={
+                                "订阅编号": sub_id,
+                                "快照": snap.sha256[:10],
+                                "节点数": len(nodes),
+                            },
                         )
         except Exception as exc:  # noqa: BLE001 —— 单条订阅失败不阻断其它
             message = str(exc)[:500] or type(exc).__name__
