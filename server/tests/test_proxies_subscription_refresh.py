@@ -440,7 +440,7 @@ async def test_start_scheduler_registers_refresh_job(monkeypatch):
     sched_mod.start_scheduler()
 
     func, trigger, kw = added["subscription_refresh"]
-    assert func is sched_mod._job_subscription_refresh
+    assert getattr(func, "__wrapped__", func) is sched_mod._job_subscription_refresh
     assert trigger == "interval"
     assert kw.get("minutes") == 30
 
