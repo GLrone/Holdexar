@@ -9,12 +9,13 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import or_, select, text
 
 from app.core.database import WritePriority, get_session_factory, write_gate
 from app.core.events import bus
+from app.core.logging import log_event
 from app.crawler.config import DEFAULT_WORKER_COUNT, HTTP_TIMEOUT, WORKERS_MAX
 from app.crawler.runner import CrawlRunConfig, run_crawl
 from app.crawler.utils import get_beijing_time_obj
@@ -40,6 +41,29 @@ class JobHandle:
 
 # 进程内活动任务表（单任务模型）
 _active: JobHandle | None = None
+
+# 链级停止位：在跑的 run_price_cycle（自动轮/手动全队列同源）登记，stop 端点
+# 置位后链不再推进后续段；单任务模型下同一时刻至多一条链在跑
+_chain_stop: asyncio.Event | None = None
+
+
+def register_chain_stop(ev: asyncio.Event) -> None:
+    global _chain_stop
+    _chain_stop = ev
+
+
+def unregister_chain_stop(ev: asyncio.Event) -> None:
+    global _chain_stop
+    if _chain_stop is ev:
+        _chain_stop = None
+
+
+def chain_stop_requested() -> bool:
+    return _chain_stop is not None and _chain_stop.is_set()
+
+
+# start_job 预取占用的 tag（经 config.occupancy_tag 传给 run_crawl 复用）
+JOB_OCCUPANCY_TAG = "crawl_job"
 
 
 def active_job_id() -> int | None:
@@ -71,7 +95,13 @@ async def cleanup_orphan_jobs() -> None:
             job.finished_at = datetime.now()
         if rows:
             await session.commit()
-            logger.warning("清理了 %d 个中断任务", len(rows))
+            log_event(
+                logger,
+                f"进程启动清理了 {len(rows)} 个上一进程遗留的运行中任务，已标记为失败",
+                tag="已修复",
+                level=logging.WARNING,
+                detail={"数量": len(rows)},
+            )
     await price_cycle.cleanup_orphan_cycles()
 
 
@@ -302,6 +332,26 @@ async def resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tup
             out.append((appid, ""))
         return out
 
+    if scope == "discounts":
+        # 直连折扣队列：特惠榜（search specials 接口）**全量**作爬取对象——
+        # 不减目录集（目录段直连默认关，榜内在库游戏由本段刷新价格），只减
+        # 监控层（active 由 pool 段覆盖，同轮不重复爬）与业务排除（下架/
+        # 永久免费）。新面孔爬取落库即完成目录发现。受 fetch.boards 门控。
+        from app.domains.games import boards as games_boards
+        from app.domains.monitoring import service as monitoring_service
+        from app.domains.settings.service import get_value as _kv
+
+        if not await _kv("fetch.boards", True):
+            return []
+        board_ids = await games_boards.get_board("specials")
+        excluded = await _excluded_removed_appids() | await _excluded_free_appids()
+        monitored = set(await monitoring_service.active_ids("game"))
+        return [
+            (int(a), "")
+            for a in board_ids
+            if int(a) not in monitored and int(a) not in excluded
+        ]
+
     raise ValueError(f"未知 scope: {scope}")
 
 
@@ -353,8 +403,24 @@ async def _missing_tasks(
 async def has_pending_missing(
     cooldown_minutes: int = REPAIR_RETRY_COOLDOWN_MINUTES,
 ) -> bool:
-    """是否存在待补抓欠账（Cycle 判定本轮是否遗留未覆盖单元的出口）。"""
-    return bool(await _missing_tasks(cooldown_minutes=cooldown_minutes, limit_rows=1))
+    """是否存在待补抓欠账（EXISTS 直查：不经任务生成、无写副作用）。
+
+    空区行（region_code=''）是即拾即清的尝试痕迹，不算待补欠账——与
+    generate_missing_tasks 清账后的实际可抓集合同口径。"""
+    cutoff = get_beijing_time_obj().replace(tzinfo=None) - timedelta(
+        minutes=cooldown_minutes
+    )
+    async with get_session_factory()() as session:
+        row = await session.execute(
+            select(GameCurrentPrice.appid)
+            .where(
+                GameCurrentPrice.price_status == "missing",
+                GameCurrentPrice.region_code != "",
+                GameCurrentPrice.updated_at < cutoff,
+            )
+            .limit(1)
+        )
+    return row.first() is not None
 
 
 async def _load_job(job_id: int) -> CrawlJob | None:
@@ -434,46 +500,96 @@ def _spawn_post_crawl_chain(crawled: list[int], job_id: int) -> None:
                     cycle_id=-job_id,
                 )
                 if written:
-                    logger.info(
-                        "任务 %d 价格事件 %d 条：%s",
-                        job_id, len(written),
-                        sorted({e["event_type"] for e in written}),
+                    log_event(
+                        logger,
+                        f"任务 {job_id} 检测到 {len(written)} 条价格变化事件",
+                        detail={
+                            "任务": job_id,
+                            "事件数": len(written),
+                            "类型": "/".join(sorted({e["event_type"] for e in written})),
+                        },
                     )
         except Exception:  # noqa: BLE001
-            logger.exception("任务 %d 价格事件检测失败（不影响任务）", job_id)
+            log_event(
+                logger,
+                f"任务 {job_id} 的价格变化事件检测失败（不影响任务结果）",
+                level=logging.ERROR,
+                exc_info=True,
+                detail={"任务": job_id},
+            )
         try:
             await alerts_service.check_appids(crawled)
         except Exception:  # noqa: BLE001
-            logger.exception("提醒检查失败（不影响任务）")
+            log_event(
+                logger,
+                "爬取收尾的提醒检查失败（不影响任务结果）",
+                level=logging.ERROR,
+                exc_info=True,
+            )
         try:
             refreshed = await games_service.refresh_hl_flags(crawled)
-            logger.info("史低标记已刷新 %d 款", refreshed)
+            log_event(
+                logger,
+                f"史低标记已刷新 {refreshed} 款游戏",
+                tag="成功",
+                detail={"数量": refreshed},
+            )
         except Exception:  # noqa: BLE001
-            logger.exception("史低标记刷新失败（不影响任务）")
+            log_event(
+                logger, "史低标记刷新失败（不影响任务结果）",
+                level=logging.ERROR, exc_info=True,
+            )
         try:
             # 新史低邮件：基于刚落库的 hl_flag 增量（差集对历史游标），
             # 在 refresh_hl_flags 之后才有数据可查
             await alerts_service.check_new_lows(crawled)
         except Exception:  # noqa: BLE001
-            logger.exception("新史低邮件检查失败（不影响任务）")
+            log_event(
+                logger, "新史低邮件检查失败（不影响任务结果）",
+                level=logging.ERROR, exc_info=True,
+            )
         try:
             refreshed = await games_service.refresh_pp_flags(crawled)
-            logger.info("永降标记已刷新 %d 款", refreshed)
+            log_event(
+                logger,
+                f"永降标记已刷新 {refreshed} 款游戏",
+                tag="成功",
+                detail={"数量": refreshed},
+            )
         except Exception:  # noqa: BLE001
-            logger.exception("永降标记刷新失败（不影响任务）")
+            log_event(
+                logger, "永降标记刷新失败（不影响任务结果）",
+                level=logging.ERROR, exc_info=True,
+            )
         try:
             refreshed = await games_service.refresh_sort_cache(crawled)
-            logger.info("排序缓存已增量刷新 %d 款", refreshed)
+            log_event(
+                logger,
+                f"排序缓存已增量刷新 {refreshed} 款游戏",
+                tag="成功",
+                detail={"数量": refreshed},
+            )
         except Exception:  # noqa: BLE001
-            logger.exception("排序缓存刷新失败（不影响任务）")
+            log_event(
+                logger, "排序缓存刷新失败（不影响任务结果）",
+                level=logging.ERROR, exc_info=True,
+            )
         try:
             # 系列归组：库里有未识别行（series_id NULL）或系列覆盖文件被
             # 改过时才全库重算，否则是零成本探测
             if await games_series.has_unassigned() or games_series.overrides_changed():
                 refreshed = await games_series.refresh_series()
-                logger.info("系列归组已刷新 %d 款", refreshed)
+                log_event(
+                    logger,
+                    f"系列归组已刷新 {refreshed} 款游戏",
+                    tag="成功",
+                    detail={"数量": refreshed},
+                )
         except Exception:  # noqa: BLE001
-            logger.exception("系列归组刷新失败（不影响任务）")
+            log_event(
+                logger, "系列归组刷新失败（不影响任务结果）",
+                level=logging.ERROR, exc_info=True,
+            )
         try:
             # 永久免费自动脱池：本轮爬到 free_kind='f2p' 的游戏移出监控池
             # （价格事实已定，留在池里只会每轮空转配额）；promo 不脱，赠送
@@ -482,9 +598,17 @@ def _spawn_post_crawl_chain(crawled: list[int], job_id: int) -> None:
 
             released = await wishlist_service.release_free_games(crawled)
             if released:
-                logger.info("永久免费自动脱池 %d 款", released)
+                log_event(
+                    logger,
+                    f"永久免费游戏已自动脱池 {released} 款",
+                    tag="成功",
+                    detail={"数量": released},
+                )
         except Exception:  # noqa: BLE001
-            logger.exception("免费游戏自动脱池失败（不影响任务）")
+            log_event(
+                logger, "永久免费游戏自动脱池失败（不影响任务结果）",
+                level=logging.ERROR, exc_info=True,
+            )
 
     task = asyncio.create_task(_chain())
     _post_crawl_tasks.add(task)
@@ -510,7 +634,21 @@ async def _execute(
         stats["elapsed_seconds"] = round(time.monotonic() - started, 1)
         status = "stopped" if stop_event.is_set() else "done"
         await _finish_job(job_id, status, stats)
-        logger.info("任务 %d 结束（%s）：%s", job_id, status, stats)
+        log_event(
+            logger,
+            f"爬取任务 {job_id} 已结束，共处理 {stats.get('processed')}/{stats.get('total')} 项",
+            detail={
+                "任务": job_id,
+                "状态": {"done": "完成", "stopped": "已停止"}.get(status, status),
+                "总数": stats.get("total"),
+                "已处理": stats.get("processed"),
+                "成功": stats.get("success"),
+                "失败": stats.get("failed"),
+                "无折扣跳过": stats.get("skipped_no_discount"),
+                "折扣已结束": stats.get("discount_ended"),
+                "耗时": f"{stats.get('elapsed_seconds')}秒",
+            },
+        )
 
         if stop_event.is_set():
             # 手动停止：跳过提醒检查 / 史低刷新 / 排序缓存（对未爬完的数据无意义）
@@ -522,7 +660,13 @@ async def _execute(
         crawled = _crawled_appids(appid_pairs, pre_tasks)
         _spawn_post_crawl_chain(crawled, job_id=job_id)
     except Exception as e:  # noqa: BLE001
-        logger.exception("任务 %d 失败", job_id)
+        log_event(
+            logger,
+            f"爬取任务 {job_id} 执行失败",
+            level=logging.ERROR,
+            exc_info=True,
+            detail={"任务": job_id},
+        )
         await _finish_job(job_id, "failed", None, str(e))
         # 系统异常告警：任务级失败（含定时价格网格轮）带 12h 冷却发一封，
         # 连续失败不刷屏；告警自身异常不得影响任务状态收敛
@@ -540,11 +684,22 @@ async def _execute(
                 hint="可在「任务」页手动重跑一次；连续失败请检查代理通道与网络。",
             )
         except Exception:  # noqa: BLE001
-            logger.exception("爬取失败告警发送失败（不影响任务状态）")
+            log_event(
+                logger,
+                "爬取失败告警发送失败（不影响任务状态）",
+                level=logging.ERROR,
+                exc_info=True,
+            )
     finally:
         global _active
         if _active and _active.id == job_id:
             _active = None
+        if config is not None and config.occupancy_tag:
+            # 占用是 start_job 前移预取的：释放权在任务收尾（run_crawl 只复用不取还）
+            from app.crawler.occupancy import end_crawl
+
+            end_crawl()
+            bus.publish("crawl.idle")
 
 
 # 补抓层专用：定向小流量通道，低 worker 防 429 风暴（STT"稀缺配额单独通道"）
@@ -658,7 +813,11 @@ async def _resolve_worker_count() -> int:
 
     explicit = await get_value("crawl.workers")
     if isinstance(explicit, (int, float)) and not isinstance(explicit, bool) and int(explicit) > 0:
-        logger.info("[worker 分类] 显式配置 crawl.workers=%d，不按出口数分类", int(explicit))
+        log_event(
+            logger,
+            f"已显式配置并发 worker 数为 {int(explicit)}，不再按可用出口数推导",
+            detail={"worker": int(explicit), "来源": "显式配置"},
+        )
         return int(explicit)
 
     try:
@@ -666,24 +825,28 @@ async def _resolve_worker_count() -> int:
 
         available = int((await proxies_service.pool_stats()).get("available") or 0)
     except Exception as e:  # noqa: BLE001 —— 统计失败不阻断爬取
-        logger.warning(
-            "[worker 分类] 出口 IP 统计失败（%s），回退 workers=%d", e, DEFAULT_WORKER_COUNT
+        log_event(
+            logger,
+            f"统计可用出口 IP 失败，回退使用默认并发 worker 数 {DEFAULT_WORKER_COUNT}",
+            tag="降级",
+            level=logging.WARNING,
+            detail={"原因": e, "worker": DEFAULT_WORKER_COUNT},
         )
         return DEFAULT_WORKER_COUNT
 
     if available <= 0:
-        logger.info(
-            "[worker 分类] 无可用出口 IP（直连形态）→ workers=%d（默认）",
-            DEFAULT_WORKER_COUNT,
+        log_event(
+            logger,
+            f"当前没有可用出口 IP，按直连形态使用默认并发 worker 数 {DEFAULT_WORKER_COUNT}",
+            detail={"可用出口": 0, "worker": DEFAULT_WORKER_COUNT},
         )
         return DEFAULT_WORKER_COUNT
 
     workers = min(WORKERS_MAX, available)
-    logger.info(
-        "[worker 分类] 可用出口 IP %d → workers=%d（1 出口 1 worker，上限 %d）",
-        available,
-        workers,
-        WORKERS_MAX,
+    log_event(
+        logger,
+        f"按可用出口 IP 数开启 {workers} 个并发 worker（一个出口一个 worker，上限 {WORKERS_MAX}）",
+        detail={"可用出口": available, "worker": workers, "上限": WORKERS_MAX},
     )
     return workers
 
@@ -715,139 +878,171 @@ async def start_job(
     """
     global _active
     # 统一占用语义：bundles 链尾是直调 run_crawl 的（不登记 _active），只看
-    # _active 会漏掉它。在创建 job 之前就挡，避免留下一条"注定失败"的任务行。
-    from app.crawler.occupancy import crawler_busy
+    # _active 会漏掉它。检查后立即预取占用（tag 经 config.occupancy_tag 传给
+    # run_crawl 复用，释放权在 _execute 收尾）——检查与取得占用之间无 await，
+    # 并发启动窗口闭合，注定失败的任务行不再产生。
+    from app.crawler.occupancy import CrawlerBusyError, begin_crawl, crawler_busy, end_crawl
 
     if crawler_busy():
         raise RuntimeError("已有爬取任务在运行")
     if _active is not None and not _active.task.done():
         raise RuntimeError("已有爬取任务在运行")
+    try:
+        begin_crawl(JOB_OCCUPANCY_TAG)
+    except CrawlerBusyError:
+        raise RuntimeError("已有爬取任务在运行")
 
-    pre_tasks: list[dict] | None = None
-    pairs: list[tuple[int, str]] = []
-    if kind in ("missing", "repair"):
-        effective = await effective_regions(regions)
-        cooldown = (
-            missing_cooldown
-            if missing_cooldown is not None
-            else (
-                REPAIR_RETRY_COOLDOWN_MINUTES
-                if kind == "repair"
-                else MISSING_RETRY_COOLDOWN_MINUTES
+    try:
+        pre_tasks: list[dict] | None = None
+        pairs: list[tuple[int, str]] = []
+        if kind in ("missing", "repair"):
+            effective = await effective_regions(regions)
+            cooldown = (
+                missing_cooldown
+                if missing_cooldown is not None
+                else (
+                    REPAIR_RETRY_COOLDOWN_MINUTES
+                    if kind == "repair"
+                    else MISSING_RETRY_COOLDOWN_MINUTES
+                )
             )
+            pre_tasks = await _missing_tasks(cooldown_minutes=cooldown)
+            if not pre_tasks:
+                raise ValueError("没有待补抓的欠账（missing）数据")
+        elif kind == "backfill":
+            pairs = await _backfill_pairs()
+            if not pairs:
+                raise ValueError("没有待回补的挂名孤儿游戏")
+            effective = await effective_regions(regions)
+        else:
+            pairs = await resolve_scope_appids(scope, appids)
+            if not pairs:
+                raise ValueError("任务列表为空")
+            effective = await effective_regions(regions)
+        # 受管爬取：**每次 run 只取一次**当前 Runtime 的入口集合，整个 run 固定用它
+        # （重建会换端口并打断在途请求，所以 run 内不换）。拿不到就拒绝启动——
+        # 绝不静默退回直连或旧订阅代理（那会把"池坏了"伪装成"爬取成功"）。
+        #
+        # 容量单位是**独立出口 IP**：入口集合由 `crawl_lane_plan` 用**当前出口槽快照**
+        # 校验后给出（池里有出口 + 有 lane + 两者逐位一致），任一不满足即拒绝启动——
+        # **绝不**回退 GLOBAL / 直连 / 旧订阅代理。收敛结果即本次 run 的**快照**：
+        # run 内不再变，后台维护改出口集只影响下一次 run。
+        from app.core.config import get_settings as _get_settings
+        from app.domains.proxypool.exits import MAX_CRAWL_WORKERS
+        from app.domains.proxypool.runtime import crawl_lane_plan
+        worker_count = await _resolve_worker_count()
+        small_lane = kind in ("missing", "repair", "backfill")
+        planned_workers = (
+            min(worker_count, MISSING_RECOVERY_WORKERS) if small_lane else worker_count
         )
-        pre_tasks = await _missing_tasks(cooldown_minutes=cooldown)
-        if not pre_tasks:
-            raise ValueError("没有待补抓的欠账（missing）数据")
-    elif kind == "backfill":
-        pairs = await _backfill_pairs()
-        if not pairs:
-            raise ValueError("没有待回补的挂名孤儿游戏")
-        effective = await effective_regions(regions)
-    else:
-        pairs = await resolve_scope_appids(scope, appids)
-        if not pairs:
-            raise ValueError("任务列表为空")
-        effective = await effective_regions(regions)
-    # 受管爬取：**每次 run 只取一次**当前 Runtime 的入口集合，整个 run 固定用它
-    # （重建会换端口并打断在途请求，所以 run 内不换）。拿不到就拒绝启动——
-    # 绝不静默退回直连或旧订阅代理（那会把"池坏了"伪装成"爬取成功"）。
-    #
-    # 容量单位是**独立出口 IP**：入口集合由 `crawl_lane_plan` 用**当前出口槽快照**
-    # 校验后给出（池里有出口 + 有 lane + 两者逐位一致），任一不满足即拒绝启动——
-    # **绝不**回退 GLOBAL / 直连 / 旧订阅代理。收敛结果即本次 run 的**快照**：
-    # run 内不再变，后台维护改出口集只影响下一次 run。
-    from app.core.config import get_settings as _get_settings
-    from app.domains.proxypool.exits import MAX_CRAWL_WORKERS
-    from app.domains.proxypool.runtime import crawl_lane_plan
+        data_dir = _get_settings().data_dir
+        from app.domains.settings.service import get_value
+        # 默认 direct_only（初次打开即直连；与 proxies.get_strategy 的默认
+        # 同源，改默认须两处同步）
+        if (await get_value("proxy.strategy", "direct_only")) == "direct_only":
+            # 直连策略：价格作业**托管到用户本机网络环境**——TUN 型加速器裸连
+            # 即走；系统代理型（Clash Verge 等）由系统代理解析找到并显式挂上
+            # （aiohttp 不读注册表，不挂就等于绕开用户的本地代理）。池子状态与
+            # 此形态无关（空池也能作业）。频率由 crawler 的全局滑动窗口闸
+            # （200 发/5 分钟）统一约束，多 worker 只是在闸前排队，不提高请求
+            # 速率，因此 worker 数收在小额。
+            from app.domains.proxies import service as proxy_service
 
-    worker_count = await _resolve_worker_count()
-    small_lane = kind in ("missing", "repair", "backfill")
-    planned_workers = (
-        min(worker_count, MISSING_RECOVERY_WORKERS) if small_lane else worker_count
-    )
-    data_dir = _get_settings().data_dir
-
-    from app.domains.settings.service import get_value
-
-    if (await get_value("proxy.strategy", "proxy_first")) == "direct_only":
-        # 直连策略：价格作业**托管到用户本机网络环境**——加速器 / Clash Verge
-        # 等本地代理的通道即实际出口，池子状态与此形态无关（空池也能作业）。
-        # 频率由 crawler 的全局滑动窗口闸（200 发/5 分钟）统一约束，多 worker
-        # 只是在闸前排队，不提高请求速率，因此 worker 数收在小额。
-        effective_workers = min(planned_workers, DIRECT_MODE_WORKERS)
-        logger.info(
-            "[容量] 直连形态：作业托管到本机网络环境（加速器 / 本地代理的通道即实际出口）"
-            "| worker %d | 频率闸 200 发/5 分钟",
-            effective_workers,
-        )
-        config = CrawlRunConfig(
-            regions=effective,
-            workers=effective_workers,
-            timeout=HTTP_TIMEOUT,
-        )
-    else:
-        from app.domains.proxies import clash_manager as _cm
-
-        async with get_session_factory()() as session:
-            # max_lanes 不传：run 拿走全部 active lane（≤MAX_LANES）——多出的
-            # 部分即待用出口池；worker 数由下面的 effective_workers 单独钳在 60
-            run_plan = await crawl_lane_plan(
-                session, data_dir, runtime=_cm.pool_runtime,
+            system_proxy = await proxy_service.resolve_system_proxy_url()
+            effective_workers = min(planned_workers, DIRECT_MODE_WORKERS)
+            if system_proxy:
+                log_event(
+                    logger,
+                    f"直连形态：价格抓取托管到本机网络环境，已探活系统代理，使用 {effective_workers} 个 worker，频率闸 200 发/5 分钟",
+                    detail={
+                        "系统代理": system_proxy,
+                        "worker": effective_workers,
+                        "频率闸": "200 发/5 分钟",
+                    },
+                )
+            else:
+                log_event(
+                    logger,
+                    f"直连形态：价格抓取托管到本机网络环境，未检测到可用系统代理、裸直连出网，使用 {effective_workers} 个 worker，频率闸 200 发/5 分钟",
+                    detail={"worker": effective_workers, "频率闸": "200 发/5 分钟"},
+                )
+            config = CrawlRunConfig(
+                regions=effective,
+                workers=effective_workers,
+                occupancy_tag=JOB_OCCUPANCY_TAG,
+                timeout=HTTP_TIMEOUT,
+                proxy_url=system_proxy,
             )
-        proxy_urls = run_plan["urls"]
-        effective_workers = max(1, min(planned_workers, len(proxy_urls), MAX_CRAWL_WORKERS))
-        logger.info(
-            "[容量] 出口槽：已知出口 %d | active lane %d（内核 listener %d，"
-            "其中待用 %d）| worker %d（期望 %d，上限 %d）",
-            run_plan.get("known_exits", 0), len(proxy_urls),
-            run_plan.get("runtime_lanes", len(proxy_urls)),
-            max(0, len(proxy_urls) - effective_workers),
-            effective_workers, planned_workers, MAX_CRAWL_WORKERS,
-        )
-        config = CrawlRunConfig(
-            regions=effective,
-            workers=effective_workers,
-            timeout=HTTP_TIMEOUT,
-            proxy_url=proxy_urls[0],
-            proxy_urls=proxy_urls,
-            exit_keys=run_plan["exit_keys"],
-            exit_nodes=run_plan["nodes"],
-        )
-    # 任务行落库过写调度器：定时写者（体检台账/钱包轮转）密集时不过闸的
-    # commit 会在 SQLite 写锁上排队到超时——主轮建不出任务行，用户手动启动
-    # 的任务也迟迟建不出来。
-    # 轮账本的初始批次：与 run_crawl 收尾统计同口径（total_target = 初始任务数）
-    # —— browse 批量段是「区数 × 款数÷单发容量」的桶数，补抓段是 pre_tasks
-    # 的发数（行数只是日志口径），口径错位会让进度条永远跑不满。
-    from app.crawler.browse_store import DEFAULT_BATCH_SIZE
-
-    if pre_tasks:
-        initial_total = len(pre_tasks)
-    else:
-        initial_total = -(-len(pairs) // DEFAULT_BATCH_SIZE) * len(effective)
-    async with write_gate(WritePriority.BACKGROUND):
-        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
-            job = CrawlJob(
-                kind=kind,
-                status="running",
-                mode="app",
-                regions_json=effective,
-                started_at=datetime.now(),
-                cycle_id=cycle_id,
-                stats_json={
-                    "total": initial_total, "processed": 0, "success": 0, "failed": 0,
+        else:
+            from app.domains.proxies import clash_manager as _cm
+            async with get_session_factory()() as session:
+                # max_lanes 不传：run 拿走全部 active lane（≤MAX_LANES）——多出的
+                # 部分即待用出口池；worker 数由下面的 effective_workers 单独钳在 60
+                run_plan = await crawl_lane_plan(
+                    session, data_dir, runtime=_cm.pool_runtime,
+                )
+            proxy_urls = run_plan["urls"]
+            effective_workers = max(1, min(planned_workers, len(proxy_urls), MAX_CRAWL_WORKERS))
+            log_event(
+                logger,
+                f"出口槽已就绪，本轮启用 {effective_workers} 个 worker 抓取",
+                detail={
+                    "已知出口": run_plan.get("known_exits", 0) or 0,
+                    "活动通道": len(proxy_urls),
+                    "内核监听": run_plan.get("runtime_lanes", len(proxy_urls)) or 0,
+                    "待用通道": max(0, len(proxy_urls) - effective_workers),
+                    "worker": effective_workers,
+                    "期望worker": planned_workers,
+                    "上限": MAX_CRAWL_WORKERS,
                 },
             )
-            session.add(job)
-            await session.commit()
-            job_id = job.id
+            config = CrawlRunConfig(
+                regions=effective,
+                workers=effective_workers,
+                occupancy_tag=JOB_OCCUPANCY_TAG,
+                timeout=HTTP_TIMEOUT,
+                proxy_url=proxy_urls[0],
+                proxy_urls=proxy_urls,
+                exit_keys=run_plan["exit_keys"],
+                exit_nodes=run_plan["nodes"],
+            )
+        # 任务行落库过写调度器：定时写者（体检台账/钱包轮转）密集时不过闸的
+        # commit 会在 SQLite 写锁上排队到超时——主轮建不出任务行，用户手动启动
+        # 的任务也迟迟建不出来。
+        # 轮账本的初始批次：与 run_crawl 收尾统计同口径（total_target = 初始任务数）
+        # —— browse 批量段是「区数 × 款数÷单发容量」的桶数，补抓段是 pre_tasks
+        # 的发数（行数只是日志口径），口径错位会让进度条永远跑不满。
+        from app.crawler.browse_store import DEFAULT_BATCH_SIZE
+        if pre_tasks:
+            initial_total = len(pre_tasks)
+        else:
+            initial_total = -(-len(pairs) // DEFAULT_BATCH_SIZE) * len(effective)
+        async with write_gate(WritePriority.BACKGROUND):
+            async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+                job = CrawlJob(
+                    kind=kind,
+                    status="running",
+                    mode="app",
+                    regions_json=effective,
+                    started_at=datetime.now(),
+                    cycle_id=cycle_id,
+                    stats_json={
+                        "total": initial_total, "processed": 0, "success": 0, "failed": 0,
+                    },
+                )
+                session.add(job)
+                await session.commit()
+                job_id = job.id
+        stop_event = asyncio.Event()
+        task = asyncio.create_task(
+            _execute(job_id, pairs, config, stop_event, pre_tasks=pre_tasks)
+        )
+        _active = JobHandle(id=job_id, task=task, stop_event=stop_event)
+    except BaseException:
+        # 启动半途失败（无欠账/范围空/lane 规划拒绝等）：释放预取的占用
+        end_crawl()
+        raise
 
-    stop_event = asyncio.Event()
-    task = asyncio.create_task(
-        _execute(job_id, pairs, config, stop_event, pre_tasks=pre_tasks)
-    )
-    _active = JobHandle(id=job_id, task=task, stop_event=stop_event)
 
     # 事件与日志沿用「项数」口径（款数/行数），初始账本的桶口径见上
     pre_rows = sum(
@@ -855,9 +1050,17 @@ async def start_job(
     )
     count = len(pairs) + pre_rows
     bus.publish("job.started", job_id=job_id, scope=scope, count=count, regions=effective)
-    logger.info(
-        "任务 %d 已启动：kind=%s scope=%s 共 %d 项（预构建补抓 %d 发 / %d 行）",
-        job_id, kind, scope, count, len(pre_tasks or []), pre_rows,
+    log_event(
+        logger,
+        f"爬取任务 {job_id} 已启动，共 {count} 项待抓",
+        detail={
+            "任务": job_id,
+            "类型": kind,
+            "范围": scope,
+            "项数": count,
+            "补抓批次": len(pre_tasks or []),
+            "补抓行数": pre_rows,
+        },
     )
     return {"id": job_id, "scope": scope, "count": count, "regions": effective}
 
@@ -867,10 +1070,15 @@ async def default_queue_specs() -> list[dict]:
 
     - 常驻两段：欠账补抓（missing）→ 监控层（pool：有来源且未排除的对象，
       愿望单/关注按来源优先级排前）；
-    - 目录层（catalog：games 主档减监控层）与特惠榜差值段（specials：榜单
-      翻页队列去重后的差集）随 KV `crawl.catalog_refresh`（默认开）决定是否
-      带上——关闭后只抓监控层，差值段是目录发现通道随之一并停；榜单源另受
-      KV `fetch.boards` 门控（在 specials scope 内判定）。
+    - 代理形态：目录层（catalog：games 主档减监控层）与特惠榜差值段
+      （specials：榜单翻页队列去重后的差集）随 KV `crawl.catalog_refresh`
+      （默认开）决定是否带上——关闭后只抓监控层，差值段是目录发现通道随之一并停；
+    - 直连形态：目录段默认关（单出口预算留给监控层，用户未关注的大盘子不
+      自动出网），改带折扣队列段（discounts：search specials 接口的折扣游戏
+      全量作爬取对象，榜内在库游戏由它刷新价格）——直连下的自动更新范围
+      = 关注层 + 当前折扣游戏。
+      显式设置过的 catalog_refresh 值两种形态都尊重；榜单源另受
+      KV `fetch.boards` 门控（discounts/specials scope 内判定）。
 
     调度器 `_price_refresh_specs` 与 `start_full_queue` 都从这里取组成；
     新增/调整队列段只改本函数。
@@ -881,7 +1089,14 @@ async def default_queue_specs() -> list[dict]:
         {"kind": "missing"},
         {"scope": "pool"},
     ]
-    if await get_value("crawl.catalog_refresh", True):
+    # 默认 direct_only（与 proxies.get_strategy 同源）
+    direct_mode = (
+        (await get_value("proxy.strategy", "direct_only")) == "direct_only"
+    )
+    catalog_default = False if direct_mode else True
+    if direct_mode:
+        specs.append({"scope": "discounts", "kind": "discounts"})
+    if await get_value("crawl.catalog_refresh", catalog_default):
         specs.append({"scope": "catalog"})
         specs.append({"scope": "specials", "kind": "specials_backfill"})
     return specs
@@ -889,9 +1104,6 @@ async def default_queue_specs() -> list[dict]:
 
 # 手动全队列链句柄：段间隙占用窗口（_active 已清、下一段未建）的防重入闸
 _queue_chain_task: asyncio.Task | None = None
-
-# 链级停止位：段间隙也要能喊停（链句柄只看 done 判不出「该不该继续下一段」）
-_queue_stop: asyncio.Event | None = None
 
 
 async def start_full_queue() -> dict:
@@ -903,7 +1115,7 @@ async def start_full_queue() -> dict:
     （路由 400），占用 RuntimeError（409），链句柄防重入；无显式 kind 的
     scope 段 job 行记 manual（missing/specials_backfill 是段身份标签，保留）。
     """
-    global _queue_chain_task, _queue_stop
+    global _queue_chain_task
     from app.crawler.occupancy import crawler_busy
 
     if crawler_busy() or (_active is not None and not _active.task.done()):
@@ -923,7 +1135,7 @@ async def start_full_queue() -> dict:
         )
     if not any(p["count"] for p in segment_plan):
         raise ValueError(
-            "没有可抓取的对象：关注与游戏库都是空的，先在找游戏页添加游戏"
+            "没有可抓取的对象：关注与游戏库都是空的，先在游戏商店页添加游戏"
         )
 
     # 无显式 kind 的 scope 段手动触发记 manual；missing / specials_backfill
@@ -936,29 +1148,35 @@ async def start_full_queue() -> dict:
     ]
 
     async def _chain() -> None:
-        # 编排本体在 crawl 域内，与自动轮共用一份；本函数只负责「后台跑 +
-        # 链级异常兜底」（段内异常各自兜底，不外抛）
-        global _queue_stop
+        # 编排本体在 crawl 域内，与自动轮共用一份；链级停止位由 run_price_cycle
+        # 自行登记（stop 端点经它停整轮）。本函数只负责「后台跑 + 链级异常兜底」
         from app.domains.crawl import cycle_run
 
         try:
-            started = await cycle_run.run_price_cycle(
-                specs, kind="manual", stop_event=_queue_stop
-            )
-            logger.info(
-                "[队列] 手动全队列完成：启动 %s",
-                "部分/全部段" if started else "无可抓段（全部为空或被占用）",
+            started = await cycle_run.run_price_cycle(specs, kind="manual")
+            log_event(
+                logger,
+                "手动全队列已跑完，部分或全部段已启动"
+                if started
+                else "手动全队列已跑完，没有可抓的段（全部为空或被占用）",
             )
         except Exception:  # noqa: BLE001 —— 链级异常只记日志，段内已各自兜底
-            logger.exception("[队列] 手动全队列异常")
-        finally:
-            _queue_stop = None
+            log_event(
+                logger,
+                "手动全队列执行异常，段内已各自兜底",
+                level=logging.ERROR,
+                exc_info=True,
+            )
 
     _queue_chain_task = asyncio.create_task(_chain())
     segment_names = [p["name"] for p in segment_plan]
-    logger.info(
-        "[队列] 手动全队列受理：段序 %s（款数 %s）",
-        segment_names, [p["count"] for p in segment_plan],
+    log_event(
+        logger,
+        "手动全队列已受理，正在后台按段串行执行",
+        detail={
+            "段序": "→".join(segment_names),
+            "各段款数": "/".join(str(p["count"]) for p in segment_plan),
+        },
     )
     return {
         "queued": True,
@@ -968,14 +1186,24 @@ async def start_full_queue() -> dict:
     }
 
 
-async def stop_job(job_id: int | None = None) -> bool:
-    """请求停止当前任务。返回是否找到可停止的任务。"""
+async def stop_job(job_id: int | None = None, *, whole_chain: bool = True) -> bool:
+    """请求停止。默认同时置位链级停止位：当前段结束后整轮不再推进后续段
+    （自动轮与手动全队列同源）；whole_chain=False 保持旧语义只停当前段。
+    返回是否命中可停止的对象（链在跑即算命中，含规划阶段与段间隙）。"""
+    chain_hit = False
+    if whole_chain and _chain_stop is not None:
+        _chain_stop.set()
+        chain_hit = True
     if _active is None:
-        return False
+        return chain_hit
     if job_id is not None and _active.id != job_id:
-        return False
+        return chain_hit
     _active.stop_event.set()
-    logger.info("已请求停止任务 %d", _active.id)
+    log_event(
+        logger,
+        f"已请求停止爬取任务 {_active.id}",
+        detail={"任务": _active.id, "整轮": "是" if chain_hit else "否"},
+    )
     return True
 
 
@@ -985,22 +1213,15 @@ def full_queue_running() -> bool:
 
 
 async def stop_full_queue() -> bool:
-    """停止手动全队列链：置段间停止位 + 停当前段，返回是否找到在跑的链。
+    """停止手动全队列链：置链级停止位 + 停当前段（协作式，见 stop_job）。
 
     不 cancel 链任务：链内 await 的是 `run_price_cycle`，取消会穿透它的
     try 边界（CancelledError 不是 Exception），本轮 Cycle 将永久停在
-    running 直到下次进程重启收尸。协作式停止让链在段间隙自行退出，
-    Cycle 照常收尾（当前段 stopped → 终态 cancelled）。
-    """
-    global _queue_stop
-    if not full_queue_running():
-        _queue_stop = None
-        return False
-    if _queue_stop is not None:
-        _queue_stop.set()
-    await stop_job()
-    logger.info("[队列] 手动全队列已请求停止")
-    return True
+    running 直到下次进程重启收尸。"""
+    stopped = await stop_job(whole_chain=True)
+    if stopped:
+        log_event(logger, "已请求停止手动全队列")
+    return stopped
 
 
 async def run_sequential(
@@ -1039,7 +1260,15 @@ async def run_sequential(
                 cycle_id=cycle_id,
             )
         except (RuntimeError, ValueError) as e:
-            logger.info("[链式] 跳过 %s：%s", spec.get("kind", spec.get("scope")), e)
+            log_event(
+                logger,
+                "本轮串行链跳过了一个抓取段",
+                tag="跳过",
+                detail={
+                    "段": spec.get("kind", spec.get("scope")) or "未标注",
+                    "原因": e,
+                },
+            )
             if skip_reasons is not None:
                 skip_reasons.append(f"{spec.get('kind', spec.get('scope'))}：{e}")
             continue

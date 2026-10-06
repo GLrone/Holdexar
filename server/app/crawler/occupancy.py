@@ -28,9 +28,13 @@ def current_holder() -> str | None:
 
 
 def begin_crawl(tag: str) -> None:
-    """取得爬取占用；已被占用即抛 `CrawlerBusyError`。"""
+    """取得爬取占用；已被其它占用者持有即抛 `CrawlerBusyError`。
+
+    同 tag 重入视为幂等：start_job 预取占用后 run_crawl 以同名 tag 复用。"""
     global _holder
     with _lock:
+        if _holder == tag:
+            return
         if _holder is not None:
             raise CrawlerBusyError(f"已有爬取任务在执行（{_holder}）")
         _holder = tag

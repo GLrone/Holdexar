@@ -35,6 +35,8 @@ from datetime import datetime, timezone
 
 import aiohttp
 
+from app.core.logging import log_event
+
 logger = logging.getLogger(__name__)
 
 # 现役端点（旧域名 store-site-backend-static.ak 已 404）
@@ -287,11 +289,21 @@ async def match_steam_appid(session: aiohttp.ClientSession, title: str,
             proxy=proxy,
         ) as resp:
             if resp.status != 200:
-                logger.warning("[epic] storesearch '%s' HTTP %d", title, resp.status)
+                log_event(
+                    logger,
+                    f"按标题匹配 Steam appid 失败：storesearch 返回 HTTP {resp.status}",
+                    level=logging.WARNING,
+                    detail={"标题": title, "HTTP状态": resp.status},
+                )
                 return None
             data = await resp.json(content_type=None)
     except (aiohttp.ClientError, asyncio.TimeoutError):
-        logger.warning("[epic] storesearch '%s' 网络错误", title)
+        log_event(
+            logger,
+            "按标题匹配 Steam appid 失败：storesearch 网络错误",
+            level=logging.WARNING,
+            detail={"标题": title},
+        )
         return None
     items = data.get("items") or []
     if not items:
@@ -314,11 +326,21 @@ async def _fetch_parsed(
         async with session.get(FREE_GAMES_URL, params=EN_PARAMS,
                                headers=STEAM_HTTP_HEADERS, proxy=proxy) as resp:
             if resp.status != 200:
-                logger.warning("[epic] 促销端点 HTTP %d（本轮放弃）", resp.status)
+                log_event(
+                    logger,
+                    f"拉取 Epic 促销端点失败：HTTP {resp.status}，本轮放弃",
+                    level=logging.WARNING,
+                    detail={"HTTP状态": resp.status},
+                )
                 return None
             en_payload = await resp.json(content_type=None)
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        logger.warning("[epic] 促销端点网络错误：%s", e)
+        log_event(
+            logger,
+            "拉取 Epic 促销端点失败：网络错误",
+            level=logging.WARNING,
+            detail={"原因": e},
+        )
         return None
 
     games = parse_free_games(en_payload)
@@ -332,7 +354,7 @@ async def _fetch_parsed(
             if resp.status == 200:
                 _fill_title_cn(games, await resp.json(content_type=None))
     except (aiohttp.ClientError, asyncio.TimeoutError):
-        logger.info("[epic] 中文对照标题拉取失败（忽略）")
+        log_event(logger, "Epic 中文对照标题拉取失败，忽略（不影响主流程）", tag="忽略")
     return games
 
 
@@ -349,7 +371,11 @@ async def fetch_free_offers(proxy: str | None = None,
     try:
         games = await _fetch_parsed(proxy, session)
         if games:
-            logger.info("[epic-offers] 白送元素 %d 个（展示链，未匹配）", len(games))
+            log_event(
+                logger,
+                f"本轮发现 {len(games)} 个 Epic 白送元素（展示链，未匹配 appid）",
+                detail={"数量": len(games)},
+            )
         return games or []
     finally:
         if owns_session:
@@ -386,11 +412,21 @@ async def fetch_mobile_breaker(proxy: str | None = None,
         try:
             async with session.get(MOBILE_CMS_URL, headers=STEAM_HTTP_HEADERS, proxy=proxy) as resp:
                 if resp.status != 200:
-                    logger.info("[epic-mobile] CMS 移动页 HTTP %d（本轮跳过）", resp.status)
+                    log_event(
+                        logger,
+                        f"拉取 Epic 移动页 CMS 失败：HTTP {resp.status}，本轮跳过",
+                        tag="跳过",
+                        detail={"HTTP状态": resp.status},
+                    )
                     return None
                 payload = await resp.json(content_type=None)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.info("[epic-mobile] CMS 移动页网络错误（忽略）：%s", e)
+            log_event(
+                logger,
+                "拉取 Epic 移动页 CMS 网络错误，忽略",
+                tag="忽略",
+                detail={"原因": e},
+            )
             return None
         return parse_mobile_breaker(payload)
     finally:
@@ -493,11 +529,20 @@ def _egs_persisted_sync(operation: str, variables: dict, sha: str,
     try:
         with _urlopen(req, proxy, 25) as resp:
             if resp.status != 200:
-                logger.info("[epic-mobile] 商店查询 %s HTTP %d", operation, resp.status)
+                log_event(
+                    logger,
+                    f"Epic 商店持久化查询返回 HTTP {resp.status}，放弃本次查询",
+                    detail={"操作": operation, "HTTP状态": resp.status},
+                )
                 return None
             return json.loads(resp.read().decode("utf-8", "replace"))
     except (urllib.error.URLError, OSError, ValueError) as e:
-        logger.info("[epic-mobile] 商店查询 %s 失败（忽略）：%s", operation, e)
+        log_event(
+            logger,
+            "Epic 商店持久化查询失败，忽略",
+            tag="忽略",
+            detail={"操作": operation, "原因": e},
+        )
         return None
 
 
@@ -571,12 +616,21 @@ def _sandbox_offers_sync(namespace: str, platform: str,
     try:
         with _urlopen(req, proxy, 25) as resp:
             if resp.status != 200:
-                logger.info("[epic-mobile] sandbox offers %s HTTP %d", platform, resp.status)
+                log_event(
+                    logger,
+                    f"查询 Epic sandbox 报价（{platform} 端）返回 HTTP {resp.status}",
+                    detail={"平台": platform, "HTTP状态": resp.status},
+                )
                 return []
             return (json.loads(resp.read().decode("utf-8", "replace"))
                     .get("data") or [])
     except (urllib.error.URLError, OSError, ValueError) as e:
-        logger.info("[epic-mobile] sandbox offers %s 失败（忽略）：%s", platform, e)
+        log_event(
+            logger,
+            "查询 Epic sandbox 报价失败，忽略",
+            tag="忽略",
+            detail={"平台": platform, "原因": e},
+        )
         return []
 
 
@@ -654,11 +708,21 @@ async def fetch_mobile_freebie(proxy: str | None = None,
             async with session.get(GAMERPOWER_ANDROID_URL, headers=STEAM_HTTP_HEADERS,
                                    proxy=proxy) as resp:
                 if resp.status != 200:
-                    logger.info("[epic-mobile] GamerPower HTTP %d（本轮跳过）", resp.status)
+                    log_event(
+                        logger,
+                        f"拉取 GamerPower 限免列表失败：HTTP {resp.status}，本轮跳过",
+                        tag="跳过",
+                        detail={"HTTP状态": resp.status},
+                    )
                     return None
                 payload = await resp.json(content_type=None)
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
-            logger.info("[epic-mobile] GamerPower 网络错误（忽略）：%s", e)
+            log_event(
+                logger,
+                "拉取 GamerPower 限免列表网络错误，忽略",
+                tag="忽略",
+                detail={"原因": e},
+            )
             return None
         freebie = parse_gamerpower_mobile(payload)
         if not freebie:
@@ -740,7 +804,7 @@ async def fetch_free_games(proxy: str | None = None,
     try:
         games = await _fetch_parsed(proxy, session)
         if not games:
-            logger.info("[epic] 本轮无白送元素")
+            log_event(logger, "本轮 Epic 没有白送元素")
             return []
 
         # ③ storesearch 逐个匹配（间隔 500ms 防限流）
@@ -750,8 +814,11 @@ async def fetch_free_games(proxy: str | None = None,
             if g.appid is not None:
                 matched += 1
             await asyncio.sleep(_REQUEST_INTERVAL)
-        logger.info("[epic] 白送元素 %d 个，Steam 匹配 %d 个",
-                    len(games), matched)
+        log_event(
+            logger,
+            f"本轮发现 {len(games)} 个 Epic 白送元素，其中 {matched} 个匹配到 Steam appid",
+            detail={"白送元素": len(games), "匹配成功": matched},
+        )
         return games
     finally:
         if owns_session:

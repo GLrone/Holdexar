@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 
 import aiohttp
 
+from app.core.logging import log_event
 from app.crawler.db_writer import DbWriter
 from app.crawler.http_client import SteamHttpClient
 
@@ -50,12 +51,23 @@ class CrawlerRouter:
     async def route(self, context: CrawlerContext) -> None:
         task_type = context.task.get("type")
         if not task_type:
-            logger.error("任务缺少 type 字段: %s", context.task)
+            log_event(
+                logger,
+                "任务缺少类型字段，无法路由",
+                level=logging.ERROR,
+                detail={"任务": str(context.task)},
+            )
             return
 
         handler = self._handlers.get(task_type)
         if not handler:
-            logger.error("找不到处理类型 '%s' 的 Handler", task_type)
+            log_event(
+                logger,
+                f"没有能处理类型 {task_type} 的处理器，任务被跳过",
+                tag="跳过",
+                level=logging.ERROR,
+                detail={"任务类型": task_type},
+            )
             return
 
         await handler(context)

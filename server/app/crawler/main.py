@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 from ..core.app_info import APP_NAME, ENV_PREFIX
+from ..core.logging import log_event
 from .config import DEFAULT_WORKER_COUNT, HTTP_TIMEOUT
 from .runner import CrawlRunConfig, run_crawl
 
@@ -61,12 +62,22 @@ def _load_appids(args) -> list[tuple[int, str]]:
     if args.queue:
         path = Path(args.queue)
         if not path.exists():
-            logger.error("队列文件不存在: %s", path)
+            log_event(
+                logger,
+                "任务队列文件不存在，无法读取任务",
+                level=logging.ERROR,
+                detail={"文件": str(path)},
+            )
             return []
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception as e:  # noqa: BLE001
-            logger.error("队列文件解析失败: %s", e)
+            log_event(
+                logger,
+                "任务队列文件解析失败，无法读取任务",
+                level=logging.ERROR,
+                detail={"文件": str(path), "原因": str(e)},
+            )
             return []
         if isinstance(data, list):
             for item in data:
@@ -84,31 +95,69 @@ async def async_main(args) -> int:
     # 判定，加速器在系统网络层透明生效。代理仅显式指定时启用（调试通道）。
     proxy_url = args.proxy or os.environ.get(f"{ENV_PREFIX}PROXY_URL")
     if proxy_url:
-        logger.info("代理已启用（显式指定）: %s", proxy_url)
+        log_event(logger, "已启用显式指定的代理抓取", detail={"代理": proxy_url})
     else:
-        logger.info("直连模式（加速器由系统网络层透明生效，无需配置）")
+        log_event(logger, "以直连模式抓取，未配置代理")
 
     from app.domains.regions.service import effective_regions
 
     explicit = [r.strip().lower() for r in str(args.regions).split(",") if r.strip()]
     regions = await effective_regions(explicit or None)
-    logger.info("生效区服: %s", ", ".join(regions))
+    log_event(
+        logger,
+        f"本次抓取覆盖 {len(regions)} 个区服",
+        detail={"区服": ", ".join(regions)},
+    )
 
     appids = _load_appids(args)
     if not appids:
-        logger.error("没有任务：用 --appids 或 --queue 指定")
+        log_event(
+            logger,
+            "没有可执行的任务，请用 --appids 或 --queue 指定",
+            level=logging.ERROR,
+        )
         return 1
-    logger.info("任务就绪：appids=%s workers=%d", [a for a, _ in appids], args.workers)
-
-    stats = await run_crawl(
-        appids,
-        config=CrawlRunConfig(
-            regions=regions, workers=args.workers, proxy_url=proxy_url, timeout=args.timeout
-        ),
+    log_event(
+        logger,
+        f"任务就绪：{len(appids)} 款游戏、{args.workers} 个 worker",
+        detail={
+            "游戏数": len(appids),
+            "游戏ID": ", ".join(str(a) for a, _ in appids),
+            "worker 数": args.workers,
+        },
     )
-    logger.info(
-        "完成：处理 %d | 成功 %d / 失败 %d",
-        stats["processed"], stats["success"], stats["failed"],
+
+    # 与生产同口径入运行账（CLI 一次调用 = agent_runs 一行；账本失败不拖垮抓取）
+    from app.domains.agent.runtime import scheduler_bridge
+
+    async def _crawl_body():
+        body_stats = await run_crawl(
+            appids,
+            config=CrawlRunConfig(
+                regions=regions, workers=args.workers, proxy_url=proxy_url, timeout=args.timeout
+            ),
+        )
+        await scheduler_bridge.note_step("crawl", {
+            "total": body_stats.get("total"),
+            "processed": body_stats.get("processed"),
+            "success": body_stats.get("success"),
+            "failed": body_stats.get("failed"),
+        })
+        return body_stats
+
+    stats = await scheduler_bridge.run_accounted(
+        "crawl_cli", _crawl_body, trigger="manual",
+        ref={"appids": [a for a, _ in appids], "regions": regions,
+             "workers": args.workers, "entry": "cli"},
+    )
+    log_event(
+        logger,
+        f"命令行抓取完成：共处理 {stats['processed']} 款，成功 {stats['success']} 款，失败 {stats['failed']} 款",
+        detail={
+            "处理": stats["processed"],
+            "成功": stats["success"],
+            "失败": stats["failed"],
+        },
     )
     return 0
 
@@ -125,7 +174,7 @@ def main() -> int:
     try:
         return asyncio.run(async_main(args))
     except KeyboardInterrupt:
-        logger.warning("用户中断")
+        log_event(logger, "用户中断，抓取提前结束", tag="未完成", level=logging.WARNING)
         return 130
 
 

@@ -20,6 +20,8 @@ from collections.abc import Sequence
 
 import aiohttp
 
+from app.core.logging import log_event
+
 logger = logging.getLogger(__name__)
 
 _USER_AGENTS = [
@@ -57,16 +59,27 @@ class Global429CircuitBreaker:
             self._cooldown = min(self._max_cooldown, 5.0 * (2 ** (self._consecutive_429 - 1)))
             self._tripped = True
             self._trip_time = time.monotonic()
-            logger.warning(
-                "[熔断器] 触发全局 429 冷却 %.0fs（连续第 %d 次）status=%s url=%s",
-                self._cooldown,
-                self._consecutive_429,
-                status_code,
-                url,
+            log_event(
+                logger,
+                f"Steam 连续返回 429，暂停全部请求 {self._cooldown:.0f} 秒"
+                f"（连续第 {self._consecutive_429} 次）",
+                tag="降级",
+                level=logging.WARNING,
+                detail={
+                    "冷却秒": round(self._cooldown),
+                    "连续次数": self._consecutive_429,
+                    "状态码": status_code,
+                    "地址": url,
+                },
             )
             if response_body:
                 preview = (response_body or "<空>")[:500]
-                logger.debug("[熔断器] 响应原文: %s", preview)
+                log_event(
+                    logger,
+                    "熔断期间收到的响应原文如下",
+                    level=logging.DEBUG,
+                    detail={"响应原文": preview},
+                )
 
     async def wait_if_tripped(self) -> None:
         if not self._tripped:
@@ -185,6 +198,7 @@ class SteamHttpClient:
         url: str,
         appid: str | int | None = None,
         params: dict | None = None,
+        body_size_out: list[int] | None = None,
     ):
         """GET 并解析 JSON。内置拦截：
 
@@ -195,6 +209,9 @@ class SteamHttpClient:
         5. 网络超时/错误 → 重试（直连为主，代理通道仅用户显式配置时启用）
         6. 断网检测：传输层成败上报 NetworkChecker（达阈值 ping 确认，
            app_handler 守卫据此暂停而非写 missing 污染账本）
+
+        body_size_out 传列表时把成功响应的 Content-Length 追加进去（取字节量
+        的零成本通道，调用方无需为算体积再序列化一遍响应体）。
         """
         from .network_check import network_checker
         from .rate_limit import steam_rate_limiter
@@ -221,6 +238,10 @@ class SteamHttpClient:
                             data = await response.json()
                             await breaker.reset()
                             self._record("ok", started, url)
+                            if body_size_out is not None:
+                                body_size_out.append(
+                                    int(response.headers.get("Content-Length") or 0)
+                                )
                             return data
                         except aiohttp.ContentTypeError:
                             # 200 但返回了 HTML 错误页
@@ -252,10 +273,18 @@ class SteamHttpClient:
                                             and isinstance(phantom_app.get("data"), dict)):
                                         await breaker.reset()
                                         self._record("ok", started, url)
+                                        if body_size_out is not None:
+                                            body_size_out.append(
+                                                int(response.headers.get("Content-Length") or 0)
+                                            )
                                         return phantom_data
                                 elif not appid and isinstance(phantom_data.get("data"), dict):
                                     await breaker.reset()
                                     self._record("ok", started, url)
+                                    if body_size_out is not None:
+                                        body_size_out.append(
+                                            int(response.headers.get("Content-Length") or 0)
+                                        )
                                     return phantom_data
                         except Exception:
                             pass

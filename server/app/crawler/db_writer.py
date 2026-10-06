@@ -20,6 +20,7 @@ from app.core.database import (
     get_session_factory,
     write_gate,
 )
+from app.core.logging import log_event
 from app.domains.games.models import (
     Bundle,
     Game,
@@ -201,9 +202,19 @@ class DbWriter:
             async with get_session_factory()() as session:
                 rows = (await session.execute(select(FxRate))).scalars().all()
             self._fx_rates = {r.currency_code: float(r.rate_to_cny) for r in rows}
-            logger.info("[汇率] 已加载 %d 条汇率", len(self._fx_rates))
+            log_event(
+                logger,
+                f"已加载 {len(self._fx_rates)} 条汇率",
+                detail={"数量": len(self._fx_rates)},
+            )
         except Exception as e:
-            logger.warning("[汇率] 加载失败, 将使用 fallback: %s", e)
+            log_event(
+                logger,
+                "加载汇率失败，将使用兜底汇率",
+                tag="降级",
+                level=logging.WARNING,
+                detail={"原因": e},
+            )
             self._fx_rates = {}
         self._fx_rates.setdefault("CNY", 1.0)
 
@@ -585,7 +596,7 @@ class DbWriter:
                 return True
 
         except Exception as e:
-            logger.error("写入失败: %s", e)
+            log_event(logger, "游戏价格写入失败", level=logging.ERROR, detail={"原因": e})
             return False
 
     async def _load_baseline(self, session, appid: int):
@@ -662,7 +673,7 @@ class DbWriter:
             return results
         _t0 = time.perf_counter()
         # 写调度器在取连接之前：排队等写者位的段不占连接池，读请求不被写侧挤占
-        async with write_gate(WritePriority.BACKGROUND):
+        async with write_gate(WritePriority.BACKGROUND, label="price_batch"):
             try:
                 async with get_session_factory()() as session:
                     _tc = time.perf_counter()
@@ -816,7 +827,14 @@ class DbWriter:
                     await session.commit()
                     commit_ms = _ms_since(_tm)
             except Exception:
-                logger.exception("批量写快路径失败，整段回退逐款隔离写（%d 款）", len(entries))
+                log_event(
+                    logger,
+                    f"批量写快路径失败，整段回退为逐款隔离写（{len(entries)} 款）",
+                    tag="降级",
+                    level=logging.ERROR,
+                    exc_info=True,
+                    detail={"款数": len(entries)},
+                )
                 return await self._upsert_task_batch_slow(entries)
         # 收尾（复活清标 / 种子补挂）在写者位之外执行：各自过调度器的小事务，
         # 交互写可在段间插入；收尾不叠在未提交事务里
@@ -827,71 +845,103 @@ class DbWriter:
         ]
         _tp = time.perf_counter()
         await self.clear_removed_marks_batch(ok_ids)
-        for aid in ok_ids:
-            try:
-                await seed_assets.apply_curated(aid)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("批量写入收尾失败 appid=%s: %s", aid, e)
+        # 种子人工列补挂：单闸分块 executemany 覆盖整段 ok_ids
+        try:
+            await seed_assets.apply_curated_batch(ok_ids)
+        except Exception as e:  # noqa: BLE001
+            log_event(
+                logger,
+                "批量写入收尾失败：种子标记批量补挂异常",
+                level=logging.WARNING,
+                detail={"原因": e},
+            )
         post_ms = _ms_since(_tp)
-        logger.info(
-            "[写账] 段 apps=%d baseline=%dms pool=%dms game=%dms current=%dms "
-            "ledger=%dms history=%dms commit=%dms post=%dms lockwait=%dms total=%dms",
-            len(entries), baseline_ms, pool_ms, game_ms, current_ms, ledger_ms,
-            history_ms, commit_ms, post_ms, lockwait_ms, _ms_since(_t0),
+        log_event(
+            logger,
+            f"写库分段完成：{len(entries)} 款，共耗时 {_ms_since(_t0)} 毫秒",
+            detail={
+                "款数": len(entries),
+                "基线查询": f"{baseline_ms}毫秒",
+                "取连接": f"{pool_ms}毫秒",
+                "游戏元数据": f"{game_ms}毫秒",
+                "现价": f"{current_ms}毫秒",
+                "欠账结转": f"{ledger_ms}毫秒",
+                "历史": f"{history_ms}毫秒",
+                "提交": f"{commit_ms}毫秒",
+                "收尾": f"{post_ms}毫秒",
+                "等写锁": f"{lockwait_ms}毫秒",
+                "总计": f"{_ms_since(_t0)}毫秒",
+            },
         )
         return results
 
     async def _upsert_task_batch_slow(
         self, entries: list[tuple[dict, list[dict] | None]]
     ) -> list[bool]:
-        """逐款隔离写（回退路径）：一整批基线一次 + 单款 SAVEPOINT，单款失败
-        不拖垮整段。快路径的任何段级异常都退到这里；调用方已持写者位时按
-        重入放行，闸在会话关与提交处交还。"""
+        """逐款隔离写（回退路径）：按 _BATCH_WRITE_CHUNK 分段，每段一闸
+        一会话——段内一整批基线一次 + 单款 SAVEPOINT，单款失败不拖垮整段；
+        **段间交还写者位**（兜底路径慢 ~10 倍，整批持闸会把交互写饿到
+        超时）。快路径的任何段级异常都退到这里；段级异常只作废本段。"""
         results = [False] * len(entries)
         if not entries:
             return results
         _t0 = time.perf_counter()
-        async with write_gate(WritePriority.BACKGROUND):
-            try:
-                async with get_session_factory()() as session:
-                    _tc = time.perf_counter()
-                    await session.connection()
-                    pool_ms = _ms_since(_tc)
-                    _tb = time.perf_counter()
-                    known, latest = await self._query_baselines(
-                        session, [int(g.get("appid") or 0) for g, _ in entries]
+        baseline_ms = pool_ms = savepoint_ms = apps_ms = commit_ms = 0
+        for start in range(0, len(entries), _BATCH_WRITE_CHUNK):
+            chunk = entries[start : start + _BATCH_WRITE_CHUNK]
+            async with write_gate(
+                WritePriority.BACKGROUND, label="price_batch_slow"
+            ):
+                try:
+                    async with get_session_factory()() as session:
+                        _tc = time.perf_counter()
+                        await session.connection()
+                        pool_ms += _ms_since(_tc)
+                        _tb = time.perf_counter()
+                        known, latest = await self._query_baselines(
+                            session, [int(g.get("appid") or 0) for g, _ in chunk]
+                        )
+                        baseline_ms += _ms_since(_tb)
+                        for i_in_chunk, (game_data, prices_data) in enumerate(chunk):
+                            i = start + i_in_chunk
+                            aid = int(game_data.get("appid") or 0)
+                            _ts = time.perf_counter()
+                            sp = await session.begin_nested()
+                            savepoint_ms += _ms_since(_ts)
+                            _ta = time.perf_counter()
+                            try:
+                                ok = await self.upsert_game_and_prices(
+                                    game_data,
+                                    prices_data,
+                                    baseline=(known.get(aid, {}), latest.get(aid, {})),
+                                    session=session,
+                                    commit=False,
+                                )
+                            except Exception as e:  # noqa: BLE001 —— 单款失败不拖垮整段
+                                log_event(
+                                    logger,
+                                    f"批量写入时单款失败：游戏 {aid}",
+                                    level=logging.ERROR,
+                                    detail={"游戏": aid, "原因": e},
+                                )
+                                ok = False
+                            apps_ms += _ms_since(_ta)
+                            if ok:
+                                await sp.commit()
+                            else:
+                                await sp.rollback()
+                            results[i] = ok
+                        _tm = time.perf_counter()
+                        await session.commit()
+                        commit_ms += _ms_since(_tm)
+                except Exception as e:
+                    # 段级失败只作废本段（其余段照常），与主路径段语义对齐
+                    log_event(
+                        logger,
+                        "逐款隔离写段失败",
+                        level=logging.ERROR,
+                        detail={"原因": e, "起始款序": start},
                     )
-                    baseline_ms = _ms_since(_tb)
-                    savepoint_ms = apps_ms = 0
-                    for i, (game_data, prices_data) in enumerate(entries):
-                        aid = int(game_data.get("appid") or 0)
-                        _ts = time.perf_counter()
-                        sp = await session.begin_nested()
-                        savepoint_ms += _ms_since(_ts)
-                        _ta = time.perf_counter()
-                        try:
-                            ok = await self.upsert_game_and_prices(
-                                game_data,
-                                prices_data,
-                                baseline=(known.get(aid, {}), latest.get(aid, {})),
-                                session=session,
-                                commit=False,
-                            )
-                        except Exception as e:  # noqa: BLE001 —— 单款失败不拖垮整批
-                            logger.error("批量写入单款失败 appid=%s: %s", aid, e)
-                            ok = False
-                        apps_ms += _ms_since(_ta)
-                        if ok:
-                            await sp.commit()
-                        else:
-                            await sp.rollback()
-                        results[i] = ok
-                    _tm = time.perf_counter()
-                    await session.commit()
-                    commit_ms = _ms_since(_tm)
-            except Exception as e:
-                logger.error("批量写入失败: %s", e)
-                return [False] * len(entries)
         # 收尾（复活清标 / 种子补挂）在写者位之外执行，各自过调度器
         ok_ids = [
             int(game_data.get("appid") or 0)
@@ -900,17 +950,30 @@ class DbWriter:
         ]
         _tp = time.perf_counter()
         await self.clear_removed_marks_batch(ok_ids)
-        for aid in ok_ids:
-            try:
-                await seed_assets.apply_curated(aid)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("批量写入收尾失败 appid=%s: %s", aid, e)
+        # 种子人工列补挂：单闸分块 executemany 覆盖整段 ok_ids
+        try:
+            await seed_assets.apply_curated_batch(ok_ids)
+        except Exception as e:  # noqa: BLE001
+            log_event(
+                logger,
+                "批量写入收尾失败：种子标记批量补挂异常",
+                level=logging.WARNING,
+                detail={"原因": e},
+            )
         post_ms = _ms_since(_tp)
-        logger.info(
-            "[写账] 慢批 apps=%d baseline=%dms pool=%dms savepoint=%dms apps=%dms "
-            "commit=%dms post=%dms total=%dms",
-            len(entries), baseline_ms, pool_ms, savepoint_ms, apps_ms,
-            commit_ms, post_ms, _ms_since(_t0),
+        log_event(
+            logger,
+            f"逐款隔离写完成：{len(entries)} 款，共耗时 {_ms_since(_t0)} 毫秒",
+            detail={
+                "款数": len(entries),
+                "基线查询": f"{baseline_ms}毫秒",
+                "取连接": f"{pool_ms}毫秒",
+                "保存点": f"{savepoint_ms}毫秒",
+                "逐款写入": f"{apps_ms}毫秒",
+                "提交": f"{commit_ms}毫秒",
+                "收尾": f"{post_ms}毫秒",
+                "总计": f"{_ms_since(_t0)}毫秒",
+            },
         )
         return results
 
@@ -930,7 +993,7 @@ class DbWriter:
             # 回补链路只插行不抓价，人工列在此同步补挂（与主 upsert 同语义）
             await seed_assets.apply_curated(int(appid))
         except Exception as e:
-            logger.error("ensure_game_exists 失败: %s", e)
+            log_event(logger, "补建游戏占位行失败", level=logging.ERROR, detail={"原因": e})
 
     async def get_known_bundle_ids(self, sub_ids: set[int]) -> set[int]:
         """已入库的 bundle_id（bundle-as-sub 探测的持久缓存，跨重启免重复探测）。"""
@@ -943,7 +1006,7 @@ class DbWriter:
                 )
                 return {int(r) for r in rows.scalars()}
         except Exception as e:
-            logger.error("查询已知 bundle 失败: %s", e)
+            log_event(logger, "查询已知捆绑包失败", level=logging.ERROR, detail={"原因": e})
             return set()
 
     async def upsert_bundle_candidate(
@@ -976,7 +1039,12 @@ class DbWriter:
                 )
                 await session.commit()
         except Exception as e:
-            logger.error("bundle 回填失败 %s: %s", bundle_id, e)
+            log_event(
+                logger,
+                f"回填捆绑包 {bundle_id} 失败",
+                level=logging.ERROR,
+                detail={"捆绑包": bundle_id, "原因": e},
+            )
 
     async def record_bundle_discoveries(self, discoveries: list[dict]) -> int:
         """捆绑包发现桩落库（游戏条目 purchase_options 白送的数据）。
@@ -1021,7 +1089,12 @@ class DbWriter:
                 await session.commit()
                 return len(fresh)
         except Exception as e:  # noqa: BLE001
-            logger.warning("捆绑包发现桩落库失败: %s", e)
+            log_event(
+                logger,
+                "捆绑包发现桩落库失败",
+                level=logging.WARNING,
+                detail={"原因": e},
+            )
             return 0
 
     async def mark_non_game_type(self, appid: int, app_type: str) -> None:
@@ -1052,7 +1125,7 @@ class DbWriter:
                 )
                 await session.commit()
         except Exception as e:
-            logger.error("mark_non_game_type 失败: %s", e)
+            log_event(logger, "标记非游戏类型失败", level=logging.ERROR, detail={"原因": e})
 
     async def mark_region_status(self, appid: int, region_code: str, status: str) -> None:
         """标记区域状态（locked/blocked/missing）→ game_current_prices (UPSERT)。
@@ -1135,7 +1208,7 @@ class DbWriter:
                 await session.execute(stmt)
                 await session.commit()
         except Exception as e:
-            logger.error("记录异常状态失败: %s", e)
+            log_event(logger, "记录区域异常状态失败", level=logging.ERROR, detail={"原因": e})
 
     async def clear_missing_regions(self, pairs: list[tuple[int, str]]) -> int:
         """批量清除误标的 missing 现价行（只删 missing 状态行，历史不动）。
@@ -1165,7 +1238,12 @@ class DbWriter:
                 await session.commit()
                 return int(result.rowcount or 0)
         except Exception as e:
-            logger.error("清除 missing 行失败: %s", e)
+            log_event(
+                logger,
+                "清除误标的缺失数据行失败",
+                level=logging.ERROR,
+                detail={"原因": e},
+            )
             return 0
 
     async def mark_coming_soon(self, appid: int) -> None:
@@ -1200,7 +1278,7 @@ class DbWriter:
                 )
                 await session.commit()
         except Exception as e:
-            logger.error("mark_coming_soon 失败: %s", e)
+            log_event(logger, "标记即将推出暂缓失败", level=logging.ERROR, detail={"原因": e})
 
     async def bump_removed_strike(self, appid: int) -> bool:
         """全 404 轮记一击；连续 ≥2 击（跨两个价格刷新周期）→ 落 removed_at 终态。
@@ -1216,12 +1294,20 @@ class DbWriter:
                 row.removed_strikes = (row.removed_strikes or 0) + 1
                 if row.removed_strikes >= 2:
                     row.removed_at = _naive(get_beijing_time_obj())
-                    logger.info("[下架监控] %s 连续 %d 轮全 404，标记 removed_at",
-                                appid, row.removed_strikes)
+                    log_event(
+                        logger,
+                        f"游戏 {appid} 连续 {row.removed_strikes} 轮全部 404，已标记为下架",
+                        detail={"游戏": appid, "连续轮数": row.removed_strikes},
+                    )
                 await session.commit()
                 return row.removed_at is not None
         except Exception as e:
-            logger.error("bump_removed_strike 失败: %s", e)
+            log_event(
+                logger,
+                "记录下架判定击数失败",
+                level=logging.ERROR,
+                detail={"原因": e},
+            )
             return False
 
     async def clear_removed_mark(self, appid: int) -> None:
@@ -1236,9 +1322,19 @@ class DbWriter:
                     row.removed_at = None
                     row.removed_strikes = 0
                     await session.commit()
-                    logger.info("[下架监控] %s 复活（重新有数据），清除下架标记", appid)
+                    log_event(
+                        logger,
+                        f"游戏 {appid} 重新有数据，已清除下架标记",
+                        tag="已修复",
+                        detail={"游戏": appid},
+                    )
         except Exception as e:
-            logger.error("clear_removed_mark 失败: %s", e)
+            log_event(
+                logger,
+                "清除下架标记失败",
+                level=logging.ERROR,
+                detail={"原因": e},
+            )
 
     async def clear_removed_marks_batch(self, appids: list[int]) -> int:
         """批量复活清标（爬虫批量路径）：整批一次 SELECT + 一次 UPDATE。
@@ -1270,12 +1366,20 @@ class DbWriter:
                     .values(removed_at=None, removed_strikes=0)
                 )
                 await session.commit()
-                logger.info(
-                    "[下架监控] %d 款复活（重新有数据），清除下架标记", len(rows)
+                log_event(
+                    logger,
+                    f"{len(rows)} 款游戏重新有数据，已清除下架标记",
+                    tag="已修复",
+                    detail={"数量": len(rows)},
                 )
                 return len(rows)
         except Exception as e:
-            logger.error("clear_removed_marks_batch 失败: %s", e)
+            log_event(
+                logger,
+                "批量清除下架标记失败",
+                level=logging.ERROR,
+                detail={"原因": e},
+            )
             return 0
 
     async def coming_soon_retry_pairs(self, cooldown_days: int, limit: int) -> list[tuple[int, str]]:
@@ -1299,7 +1403,12 @@ class DbWriter:
                 ).all()
                 return [(int(a), n or "") for a, n in rows]
         except Exception as e:
-            logger.error("coming_soon 重探候选查询失败: %s", e)
+            log_event(
+                logger,
+                "查询即将推出重探候选失败",
+                level=logging.ERROR,
+                detail={"原因": e},
+            )
             return []
 
     async def generate_missing_tasks(
@@ -1352,7 +1461,11 @@ class DbWriter:
                             )
                         )
                         await session.commit()
-                    logger.info("[补抓] 清除空区尝试痕迹 %d 行", len(stale_empty))
+                    log_event(
+                        logger,
+                        f"已清除 {len(stale_empty)} 行空区的补抓尝试痕迹",
+                        detail={"行数": len(stale_empty)},
+                    )
             if limit_rows > 0:
                 rows = rows[:limit_rows]
             by_region: dict[str, list[int]] = {}
@@ -1371,7 +1484,12 @@ class DbWriter:
                         }
                     )
         except Exception as e:
-            logger.error("生成补抓任务失败: %s", e)
+            log_event(
+                logger,
+                "生成缺失数据补抓任务失败",
+                level=logging.ERROR,
+                detail={"原因": e},
+            )
         return tasks
 
     async def get_discounted_appids(self) -> set[int]:
@@ -1385,7 +1503,7 @@ class DbWriter:
                 )
                 return {int(r) for r in rows.scalars()}
         except Exception as e:
-            logger.error("获取打折 appid 失败: %s", e)
+            log_event(logger, "查询正在打折的游戏失败", level=logging.ERROR, detail={"原因": e})
             return set()
 
     async def get_crawled_appids(self) -> set[int]:
@@ -1404,7 +1522,12 @@ class DbWriter:
                 )
                 return {int(r) for r in rows.scalars()}
         except Exception as e:
-            logger.error("查询已爬游戏失败: %s", e)
+            log_event(
+                logger,
+                "查询已爬取价格的游戏失败",
+                level=logging.ERROR,
+                detail={"原因": e},
+            )
             return set()
 
     async def get_uncrawled_appids(self) -> set[int]:
@@ -1437,7 +1560,12 @@ class DbWriter:
                 orphan_ids = {int(r) for r in orphan_rows.scalars()}
                 return orphan_ids - crawled
         except Exception as e:
-            logger.error("查询未爬游戏失败: %s", e)
+            log_event(
+                logger,
+                "查询未爬取价格的游戏失败",
+                level=logging.ERROR,
+                detail={"原因": e},
+            )
             return set()
 
     async def generate_queue_from_db(self, mode: str = "app") -> list[dict]:
@@ -1452,9 +1580,13 @@ class DbWriter:
         async with get_session_factory()() as session:
             force_all = is_near_steam_refresh(window_minutes=30)
             if force_all:
-                logger.info("[队列生成] 检测到 Steam 折扣刷新时间窗口，强制全量更新")
+                log_event(logger, "检测到 Steam 折扣刷新时间窗口，本轮改为全量更新")
             else:
-                logger.info("[队列生成] 查询超过 %d 小时未更新或当前打折的游戏...", STALE_HOURS)
+                log_event(
+                    logger,
+                    f"按超过 {STALE_HOURS} 小时未更新或当前正在打折的条件生成爬取队列",
+                    detail={"过期小时": STALE_HOURS},
+                )
 
             query = select(Game.appid, Game.name).where(Game.type.in_(["GAME", "DLC"]))
             if not force_all:
@@ -1472,5 +1604,9 @@ class DbWriter:
             for appid, name in (await session.execute(query)).all():
                 tasks.append({"type": "app", "id": int(appid), "name": name or ""})
 
-        logger.info("[队列生成] mode=%s, 共 %d 个任务", mode, len(tasks))
+        log_event(
+            logger,
+            f"爬取队列生成完成，共 {len(tasks)} 个任务",
+            detail={"模式": mode, "任务数": len(tasks)},
+        )
         return tasks

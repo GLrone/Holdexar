@@ -58,6 +58,11 @@ def db(tmp_path, monkeypatch):
     import app.domains.crawl.coverage as crawl_coverage
 
     monkeypatch.setattr(crawl_coverage, "get_session_factory", lambda: factory)
+    # 价格写路径经 steam_events.active_event_key_at 打活动标记——同款
+    # 模块级 factory，漏桩会摸到 lru 缓存的旧引擎（无表库）
+    import app.domains.steam_events.service as steam_events_service
+
+    monkeypatch.setattr(steam_events_service, "get_session_factory", lambda: factory)
     return factory
 
 
@@ -104,6 +109,13 @@ def _crawl_env(monkeypatch):
         return {"available": 0}
 
     monkeypatch.setattr(proxies_service, "pool_stats", _pool_stats)
+
+    # 系统代理解析打桩：解析读真实注册表/环境，结果随机器而变——
+    # 直连分支用例一律桩掉，个别用例自定值覆盖
+    async def _no_system_proxy():
+        return None
+
+    monkeypatch.setattr(proxies_service, "resolve_system_proxy_url", _no_system_proxy)
 
     # 受管爬取的前置条件是「池 Runtime 可用 + 本次 run 有 active lane」（fail closed）。
     # 这里给一份确定性的单 lane 计划——本文件断言的是周期编排本身，不是出口容量发现
@@ -197,11 +209,18 @@ async def test_start_job_without_runtime_refuses_to_start(db, monkeypatch):
     """受管爬取 fail closed：拿不到池 Runtime 就拒绝启动。
 
     静默退直连会把"池坏了"伪装成"爬取成功"，所以这里断言的是拒绝而不是放行。
+    显式选代理优先（默认直连下本用例测的是池路径的 fail-closed）。
     """
     import app.domains.proxypool.runtime as pp_runtime
+    import app.domains.settings.service as settings_service
     from app.domains.proxypool.runtime import RuntimeUnavailableError
 
     _crawl_env(monkeypatch)
+
+    async def _strategy_first(key, default=None):
+        return "proxy_first" if key == "proxy.strategy" else default
+
+    monkeypatch.setattr(settings_service, "get_value", _strategy_first)
     # 确定性：不看本机是否有池 Runtime，直接声明"不可用"
     monkeypatch.setattr(pp_runtime, "current_runtime_proxy_url", lambda _d=None: None)
 
@@ -220,10 +239,17 @@ async def test_start_job_without_runtime_refuses_to_start(db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_run_sequential_without_runtime_starts_nothing(db, monkeypatch):
-    """无池 Runtime 时每个 spec 都启动不了（不再整链放行直连）。"""
+    """代理形态下无池 Runtime 时每个 spec 都启动不了（不再整链放行直连）。
+    显式选代理优先（默认直连下本用例测的是池路径）。"""
     import app.domains.proxypool.runtime as pp_runtime
+    import app.domains.settings.service as settings_service
 
     _crawl_env(monkeypatch)
+
+    async def _strategy_first(key, default=None):
+        return "proxy_first" if key == "proxy.strategy" else default
+
+    monkeypatch.setattr(settings_service, "get_value", _strategy_first)
     monkeypatch.setattr(pp_runtime, "current_runtime_proxy_url", lambda _d=None: None)
 
     async def _no_runtime(_session, _d, **_kw):
@@ -295,7 +321,7 @@ async def test_price_refresh_runs_with_runtime(db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_direct_strategy_crawls_without_pool(db, monkeypatch):
-    """直连策略显式选中：池子不可用也照常启动，config 不带任何代理。
+    """直连策略显式选中：池子不可用也照常启动；无系统代理时不带代理。
 
     与 fail-closed 的分界：直连是用户显式选的策略，不是池坏了的静默兜底。
     worker 收在 DIRECT_MODE_WORKERS（单出口下多 worker 只是在全局闸前排队）。"""
@@ -330,7 +356,52 @@ async def test_direct_strategy_crawls_without_pool(db, monkeypatch):
     await crawl_service._active.task
     assert captured, "直连形态下 run_crawl 必须被调用"
     cfg = captured[0]
-    assert cfg.proxy_url is None and not cfg.proxy_urls, "直连形态不带任何代理"
+    assert cfg.proxy_url is None and not cfg.proxy_urls, "无系统代理：裸直连不带代理"
+    assert cfg.workers == crawl_service.DIRECT_MODE_WORKERS
+
+
+@pytest.mark.asyncio
+async def test_direct_strategy_rides_alive_system_proxy(db, monkeypatch):
+    """直连策略 + 系统代理探活通过 → 挂系统代理作单入口出口。
+
+    纯系统代理型本地工具（Clash Verge 等）的直连模式由此生效；台账
+    record_start(proxy_url=...) 如实记账。"""
+    import app.domains.proxypool.runtime as pp_runtime
+    import app.domains.settings.service as settings_service
+    import app.domains.proxies.service as proxies_service
+
+    _crawl_env(monkeypatch)
+
+    async def _direct_value(key, default=None):
+        if key == "proxy.strategy":
+            return "direct_only"
+        return default
+
+    monkeypatch.setattr(settings_service, "get_value", _direct_value)
+
+    async def _alive():
+        return "http://127.0.0.1:7897"
+
+    monkeypatch.setattr(proxies_service, "resolve_system_proxy_url", _alive)
+
+    async def _no_lane(_session, _d, **_kw):
+        raise AssertionError("直连形态不得询问池子 lane 计划")
+
+    monkeypatch.setattr(pp_runtime, "crawl_lane_plan", _no_lane)
+
+    captured: list = []
+
+    async def _capture_run_crawl(pairs, *, config, stop_event=None, pre_tasks=None, crawl_job_id=None):
+        captured.append(config)
+        return {"total": len(pairs or []) + len(pre_tasks or []), "processed": 0}
+
+    monkeypatch.setattr(crawl_service, "run_crawl", _capture_run_crawl)
+
+    await crawl_service.start_job(scope="appids", appids=[998001], kind="scheduled")
+    await crawl_service._active.task
+    cfg = captured[0]
+    assert cfg.proxy_url == "http://127.0.0.1:7897", "系统代理即实际出口"
+    assert not cfg.proxy_urls, "单入口形态：系统代理不展开成 lane 列表"
     assert cfg.workers == crawl_service.DIRECT_MODE_WORKERS
 
 

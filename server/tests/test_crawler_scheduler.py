@@ -130,10 +130,11 @@ async def test_progress_events_all_published_before_run_returns():
         bus.unsubscribe(queue)
 
     progress = []
-    while not queue.empty():
-        event = queue.get_nowait()
-        if event.type == "crawl.progress":
-            progress.append(event.payload)
+    for channel in (queue.progress, queue.critical):
+        while not channel.empty():
+            event = channel.get_nowait()
+            if event.type == "crawl.progress":
+                progress.append(event.payload)
     assert progress, "run() 返回前应已发布进度事件"
     assert progress[-1]["done"] == total, "run() 返回时末条进度必须已发布"
 

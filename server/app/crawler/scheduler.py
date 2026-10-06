@@ -20,6 +20,7 @@ from collections.abc import Callable
 import aiohttp
 
 from app.core.events import bus
+from app.core.logging import log_event
 
 from .router import CrawlerContext
 
@@ -247,8 +248,24 @@ class CrawlerScheduler:
                     try:
                         self.error_sink(e)
                     except Exception:  # noqa: BLE001 —— 记账回调绝不能拖垮 worker
-                        logger.exception("[Worker-%d] 错误分类回调异常", worker_id)
-                logger.error("[Worker-%d] %s:%s 异常: %s", worker_id, task_type, task_id, e)
+                        log_event(
+                            logger,
+                            f"{worker_id} 号 worker 的错误分类回调异常，已忽略",
+                            level=logging.ERROR,
+                            exc_info=True,
+                            detail={"worker": worker_id},
+                        )
+                log_event(
+                    logger,
+                    f"{worker_id} 号 worker 处理任务 {task_type}:{task_id} 失败",
+                    level=logging.ERROR,
+                    detail={
+                        "worker": worker_id,
+                        "任务类型": task_type,
+                        "任务ID": task_id,
+                        "原因": str(e),
+                    },
+                )
             finally:
                 # 进度事件必须先于 task_done 发布：join() 一放行，run() 的收尾
                 # 路径（job.status）就会出站；末条进度若压在它后面，客户端会把
@@ -258,13 +275,16 @@ class CrawlerScheduler:
                 await self._record_speed()
                 if self.total_processed % _PROGRESS_LOG_EVERY == 0:
                     done, ok, fails = self._derived_counts()
-                    logger.info(
-                        "进度: %d 完成 (成功 %d / 失败 %d), 队列剩余 %d, 速度 %.1f t/s",
-                        done,
-                        ok,
-                        fails,
-                        self.queue.qsize(),
-                        self._get_speed(),
+                    log_event(
+                        logger,
+                        f"抓取进度：完成 {done} 项，成功 {ok} 项，失败 {fails} 项",
+                        detail={
+                            "完成": done,
+                            "成功": ok,
+                            "失败": fails,
+                            "队列剩余": self.queue.qsize(),
+                            "速度": f"{self._get_speed():.1f} 项/秒",
+                        },
                     )
                 self._publish_progress()
                 self.queue.task_done()
@@ -281,8 +301,10 @@ class CrawlerScheduler:
         for task in initial_tasks:
             await self.queue.put(task)
 
-        logger.info(
-            "启动 %d 个 Worker，队列初始任务数: %d", self.worker_count, total_initial
+        log_event(
+            logger,
+            f"启动 {self.worker_count} 个 worker 开始抓取，初始任务 {total_initial} 个",
+            detail={"worker 数": self.worker_count, "初始任务数": total_initial},
         )
 
         workers = [
@@ -295,7 +317,12 @@ class CrawlerScheduler:
         await asyncio.wait({join_task, stop_wait}, return_when=asyncio.FIRST_COMPLETED)
 
         if self.stop_event.is_set() and not join_task.done():
-            logger.info("收到停止信号：取消 %d 个 Worker 并清空队列", len(workers))
+            log_event(
+                logger,
+                f"收到停止信号，取消 {len(workers)} 个 worker 并清空队列",
+                tag="未完成",
+                detail={"worker 数": len(workers)},
+            )
             for w in workers:
                 w.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
@@ -323,13 +350,18 @@ class CrawlerScheduler:
             extras.append(f"打折结束 {self.discount_ended_count}")
         done, ok, fails = self._derived_counts()
         speed = (done / elapsed) if elapsed > 0 else 0.0
-        logger.info(
-            "爬取完成：初始 %d | 总处理 %d | 成功 %d | 失败 %d | %s耗时 %.1fs | %.1f task/s",
-            total_initial,
-            self.total_processed,
-            ok,
-            fails,
-            (" | ".join(extras) + " | ") if extras else "",
-            elapsed,
-            speed,
+        log_event(
+            logger,
+            f"抓取完成：共处理 {self.total_processed} 项，成功 {ok} 项，失败 {fails} 项，"
+            f"耗时 {elapsed:.1f} 秒",
+            tag="成功",
+            detail={
+                "初始任务": total_initial,
+                "总处理": self.total_processed,
+                "成功": ok,
+                "失败": fails,
+                "折扣相关": " | ".join(extras) or "无",
+                "耗时秒": round(elapsed, 1),
+                "速度": f"{speed:.1f} 项/秒",
+            },
         )

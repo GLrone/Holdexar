@@ -1,7 +1,8 @@
 """目录层随价格更新（catalog_refresh）测试。
 
 - specs 组成随 KV `crawl.catalog_refresh` 变化（常驻：欠账 + 监控层；
-  目录层与特惠榜尾段仅开关打开时带上，默认打开）；
+  目录层与特惠榜尾段仅开关打开时带上；默认随策略——代理形态开、
+  直连形态关，显式设置过的值优先）；
 - specials 尾段去重：特惠榜里与 pool/catalog 重合、下架、免费的对象
   全部剔除，只剩榜单独有差集；「Steam 榜单」源关闭时该段为空。
 """
@@ -81,13 +82,43 @@ async def test_specials_scope_empty_when_boards_switch_off(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_discounts_scope_keeps_catalog_games(monkeypatch):
+    """折扣队列段：榜单全量作爬取对象——不减目录集（直连下目录段默认关，
+    榜内在库游戏由本段刷新价格）；只减监控层与业务排除。"""
+    await _seed_games()
+
+    async def _fake_board(key: str) -> list[int]:
+        return [200, 300, 400, 500, 999]
+
+    monkeypatch.setattr(boards_mod, "get_board", _fake_board)
+    from app.domains.crawl.service import resolve_scope_appids
+
+    pairs = await resolve_scope_appids("discounts", None)
+    # 200 目录层保留（与 specials 差集段的关键差异）/ 300 监控层剔除 /
+    # 400 已下架、500 免费（业务状态剔除）/ 999 新面孔保留
+    assert pairs == [(200, ""), (999, "")]
+
+
+@pytest.mark.asyncio
+async def test_discounts_scope_empty_when_boards_switch_off(monkeypatch):
+    await _seed_games()
+    from app.domains.settings import service as settings_service
+
+    await settings_service.set_value("fetch.boards", False)
+    from app.domains.crawl.service import resolve_scope_appids
+
+    assert await resolve_scope_appids("discounts", None) == []
+
+
+@pytest.mark.asyncio
 async def test_price_refresh_specs_gate_catalog_segment():
     from app.domains.settings import service as settings_service
 
     tail = {"scope": "specials", "kind": "specials_backfill"}
     base = [{"kind": "missing"}, {"scope": "pool"}]
 
-    # 默认全量：目录层 + 特惠榜差值段随默认开关打开
+    # 代理形态（显式选择）：默认全量——目录层 + 特惠榜差值段随默认开关打开
+    await settings_service.set_value("proxy.strategy", "proxy_first")
     assert await scheduler_mod._price_refresh_specs() == (
         base + [{"scope": "catalog"}, tail]
     )
@@ -103,12 +134,76 @@ async def test_price_refresh_specs_gate_catalog_segment():
 
 
 @pytest.mark.asyncio
+async def test_direct_only_defaults_catalog_segments_off():
+    """直连形态：目录/特惠榜段默认不随轮（单出口预算留给监控层），改带
+    折扣队列段（search specials 全量作爬取对象）；显式开过目录层则两种
+    形态都尊重（折扣段与目录段并存）。"""
+    from app.domains.settings import service as settings_service
+
+    tail = {"scope": "specials", "kind": "specials_backfill"}
+    discounts = {"scope": "discounts", "kind": "discounts"}
+    base = [{"kind": "missing"}, {"scope": "pool"}]
+
+    await settings_service.set_value("proxy.strategy", "direct_only")
+    assert await scheduler_mod._price_refresh_specs() == base + [discounts]
+
+    # 显式打开 = 用户明确要目录层，直连形态同样执行（折扣段与目录段并存）
+    await settings_service.set_value("crawl.catalog_refresh", True)
+    assert await scheduler_mod._price_refresh_specs() == (
+        base + [discounts, {"scope": "catalog"}, tail]
+    )
+
+    # 代理形态未显式设置时仍默认开（无折扣段——目录层覆盖大盘子）
+    await settings_service.set_value("proxy.strategy", "proxy_first")
+    await settings_service.delete_value("crawl.catalog_refresh")
+    assert await scheduler_mod._price_refresh_specs() == (
+        base + [{"scope": "catalog"}, tail]
+    )
+
+
+@pytest.mark.asyncio
+async def test_followed_games_ride_pool_regardless_of_discount_board(monkeypatch):
+    """星标关注始终随轮：pool 是两形态常驻段，不看折扣榜——不在折扣列表的
+    关注游戏照常进队列（直连下自动更新范围 = 关注层 + 折扣面的边界保证）。"""
+    await _seed_games()  # 300 = 监控层在册（favorite=第一优先级组，星级关注同语义）
+    from app.domains.crawl.service import default_queue_specs, resolve_scope_appids
+
+    # 榜单故意不含 300：关注对象不依赖折扣榜
+    async def _fake_board(key: str) -> list[int]:
+        return [999]
+
+    monkeypatch.setattr(boards_mod, "get_board", _fake_board)
+
+    specs = await default_queue_specs()
+    assert {"scope": "pool"} in specs  # 直连/代理两形态常驻
+
+    pairs = await resolve_scope_appids("pool", None)
+    assert (300, "") in pairs  # 在册对象照爬，与榜单无关
+
+
+@pytest.mark.asyncio
+async def test_fetch_settings_read_shows_effective_direct_default():
+    """设置读口与队列组成同一有效默认：直连形态未设置时开关如实显示关。"""
+    from app.domains.settings import service as settings_service
+    from app.domains.settings.router import get_fetch_settings
+
+    await settings_service.set_value("proxy.strategy", "direct_only")
+    assert (await get_fetch_settings()).catalog_refresh is False
+
+    await settings_service.set_value("crawl.catalog_refresh", True)
+    assert (await get_fetch_settings()).catalog_refresh is True
+
+
+@pytest.mark.asyncio
 async def test_manual_full_queue_shares_one_composition(monkeypatch):
     """任务页「全部」档与自动价格轮同源：组成逐段一致，仅无显式 kind 的
     scope 段记 manual（missing / specials_backfill 是通道/段身份标签）；
     受理响应带各段预解析款数（missing 段计 0/1 欠账存在性）。"""
     from app.domains.crawl import service as crawl_service
+    from app.domains.settings import service as settings_service
 
+    # 代理形态（显式选择）下的全量组成：missing+pool+catalog+specials
+    await settings_service.set_value("proxy.strategy", "proxy_first")
     await _seed_games()
 
     async def _fake_board(key: str) -> list[int]:

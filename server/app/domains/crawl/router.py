@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.core.events import bus
+from app.core.logging import log_event
 from . import coverage as coverage_service
 from . import cycle as cycle_service
 from . import events as events_service
@@ -15,6 +17,31 @@ from . import freshness as freshness_service
 from . import service
 
 router = APIRouter(tags=["crawl"])
+
+logger = logging.getLogger(__name__)
+
+
+async def _adopt_run(kind: str, accepted: dict) -> None:
+    """手动受理的登记长任务同口径入运行账（adopted：受理已完成，执行器
+    只接管观察与取消）。账本失败不影响已受理的任务。"""
+    from datetime import datetime
+
+    from app.domains.agent import service as agent_service
+
+    try:
+        await agent_service.adopt_task_run(
+            kind=kind,
+            trigger="manual",
+            ref={**accepted, "startedAt": datetime.now().isoformat()},
+        )
+    except Exception:  # noqa: BLE001 —— 运行账不可用不拖垮已受理任务
+        log_event(
+            logger,
+            "手动任务登记运行账失败，任务已受理不受影响",
+            level=logging.ERROR,
+            exc_info=True,
+            detail={"任务类型": kind},
+        )
 
 
 class CrawlRunRequest(BaseModel):
@@ -38,14 +65,21 @@ async def run(req: CrawlRunRequest):
         req.regions = await owned_regions()
     try:
         if req.scope == "all":
-            return await service.start_full_queue()
-        return await service.start_job(
+            accepted = await service.start_full_queue()
+            # 手动全队列与 pilot 发起同口径入运行账（登记任务 kind）
+            await _adopt_run("price_refresh", accepted)
+            return accepted
+        accepted = await service.start_job(
             scope=req.scope,
             appids=req.appids,
             regions=req.regions,
             kind=req.kind,
             missing_cooldown=req.cooldown,
         )
+        if req.kind == "repair":
+            # 任务页「补游戏价格」：登记任务 kind，与 pilot 发起同口径
+            await _adopt_run("price_repair", accepted)
+        return accepted
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
@@ -53,8 +87,9 @@ async def run(req: CrawlRunRequest):
 
 
 @router.post("/crawl/stop")
-async def stop(jobId: int | None = None):
-    stopped = await service.stop_job(jobId)
+async def stop(jobId: int | None = None, chain: bool = True):
+    # chain=true（默认）停整轮：当前段结束后不再启动后续段；false 只停当前段
+    stopped = await service.stop_job(jobId, whole_chain=chain)
     return {"stopped": stopped}
 
 
