@@ -97,11 +97,19 @@ assets/clash/
 
 # ── 运行时数据 ──
 data/
+# dev 实例数据目录落仓库树内时的产物：clash 内核运行副本、活动页抓取缓存
+/server/clash/
+/server/steam_events/
 # 数据目录迁出仓库后的旧位置（改名保留的副本，见 dev.bat 的迁移提示）。
 # 注意：`data/` 只匹配名为 data 的目录，**不**匹配 data.old/，故须显式列出——
 # 否则其中散落的 .json/.md 草稿会被 `git add -A` 一并收走（*.db 已被下面挡住）。
 /data.old/
 *.db
+# SQLite 边车与迁移备份、密钥环盐：不落 *.db 通配，显式挡住（活实例数据目录在仓库树内时生成）
+*.db-shm
+*.db-wal
+*.db.pre-migration.bak
+secret.salt
 *.sqlite3
 *.log
 *.pid
