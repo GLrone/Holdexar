@@ -143,11 +143,67 @@ async def test_scan_finds_missing_and_carried(db):
 
 
 @pytest.mark.asyncio
-async def test_scan_skips_currency_without_anchor(db):
-    """完全无历史行的币种无锚点，跳过。"""
+async def test_scan_bootstraps_empty_library(db):
+    """全库零历史行（全新安装）：以 Provider 全历史起点为白名单币种建窗。
+
+    种子不再带汇率档案——若无锚点跳过，新装库永远建不出历史 CNY 换算；
+    bootstrap 窗口交修复链现抓（bing 全历史档位自 2012 年起）。
+    """
     scan = await rates_history.scan_history_gaps(today=TODAY)
-    assert scan["currencies"] == {}
-    assert scan["windows"] == []
+    assert set(scan["currencies"]) == {XTS}
+    info = scan["currencies"][XTS]
+    assert info["first"] == "2012-01-01"
+    assert info["carried"] == 0
+    span_days = (date(2026, 9, 7) - date(2012, 1, 1)).days + 1
+    assert info["missing"] == span_days
+    assert scan["totalDays"] == span_days
+    assert scan["windows"][0]["start"] == "2012-01-01"
+    assert scan["windows"][-1]["end"] == "2026-09-07"
+    assert all(w["days"] <= 365 for w in scan["windows"])
+
+
+# ── 全新安装 bootstrap 入口 ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_noop_when_history_exists(db, monkeypatch):
+    """存量库（有任何历史行）不得触发全史 bootstrap。"""
+    await _seed_gap()
+
+    async def _fail(**kwargs):
+        raise AssertionError("存量库不得触发全史 bootstrap")
+
+    monkeypatch.setattr(rates_history, "repair_history_gaps", _fail)
+    assert await rates_history.bootstrap_full_history() == {"status": "no_bootstrap"}
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_repairs_when_library_empty(db, monkeypatch):
+    """零历史行库：bootstrap 复用修复链（参数透传）。"""
+    calls: list[dict] = []
+
+    async def fake_repair(**kwargs):
+        calls.append(kwargs)
+        return {"status": "ok", "written": 1}
+
+    monkeypatch.setattr(rates_history, "repair_history_gaps", fake_repair)
+    result = await rates_history.bootstrap_full_history(max_windows=3)
+    assert result == {"status": "ok", "written": 1}
+    assert calls == [{"max_windows": 3}]
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_respects_fetch_toggle(db, monkeypatch):
+    """「汇率历史补全」开关关闭时 bootstrap 跳过（与定时修复同一闸）。"""
+    from app.domains.settings import service as settings_service
+
+    async def fake_get_value(key, default=None):
+        if key == "fetch.fx_history":
+            return False
+        return default
+
+    monkeypatch.setattr(settings_service, "get_value", fake_get_value)
+    assert await rates_history.bootstrap_full_history() == {"status": "disabled"}
 
 
 @pytest.mark.asyncio

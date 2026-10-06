@@ -27,6 +27,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
+from app.core.logging import log_event
 from app.crawler.utils import get_beijing_time_obj
 from .models import FxRateHistory
 from .providers.bing_currency import (
@@ -40,6 +41,11 @@ logger = logging.getLogger(__name__)
 # 缺口日聚类阈值：相邻待修复日间隔 ≤ 该值并入同一窗口段（多拉几天数据零成本，
 # 换来更少的请求数）；超过则各自成段。
 _CLUSTER_GAP_DAYS = 7
+
+# 全新安装 bootstrap 起点 = Provider 全历史档位起点（bing chartType=9 自 2012
+# 年起）：种子不再携带汇率档案，无任何历史行的币种由扫描以该锚点建窗，
+# 交修复链现抓——否则新装库永远「无锚点跳过」，历史 CNY 换算无从建立。
+FULL_HISTORY_START = date(2012, 1, 1)
 
 # 修复窗口上限：批次化单窗数据量（Bing 按币种请求，窗口大小不影响请求数，
 # 批次语义保留用于逐窗落账与失败定位）
@@ -248,8 +254,9 @@ async def scan_history_gaps(
     """扫 canonical 历史缺口：缺行日 ∪ carried 日。
 
     扫描范围 = 各币种最早历史行 → 昨天（今天由实时链负责）；`start`/`end`
-    可再收窄（运维限定区间修复）。无任何历史行的币种无锚点，跳过（序列由
-    实时刷新从当天起建立）。
+    可再收窄（运维限定区间修复）。**全库零历史行**（全新安装）时以
+    FULL_HISTORY_START 为每个白名单币种锚定（bootstrap：种子不再带汇率
+    档案，全史由修复链现抓）；存量库无行币种照旧跳过。
 
     返回 {currencies, windows, totalDays, totalPairs, horizon}：
     - currencies：{code: {missing, carried, first, last}}
@@ -261,12 +268,19 @@ async def scan_history_gaps(
     if end is not None and end < horizon:
         horizon = end
     marks = await _load_marks()
+    from .service import ALLOWED_CURRENCIES
 
+    # 全新安装 bootstrap：**全库零历史行**时以 Provider 全历史起点给每个
+    # 白名单币种建窗（种子不再带汇率档案，全史由修复链现抓）；存量库保持
+    # 旧语义——个别无行币种跳过，序列由实时刷新从当天起建立（不给老用户
+    # 突然排 2012 起的全量回填）。
+    bootstrap = not marks
     per_currency: dict[str, dict] = {}
     pending_days: set[date] = set()
     total_pairs = 0
-    for code, days in marks.items():
-        span_start = min(days)
+    for code in sorted(ALLOWED_CURRENCIES) if bootstrap else sorted(marks):
+        days = marks.get(code, {})
+        span_start = min(days) if days else FULL_HISTORY_START
         if start is not None and span_start < start:
             span_start = start
         if span_start > horizon:
@@ -397,9 +411,10 @@ async def revalue_dependents(touched: dict[str, set[date]]) -> dict:
 
     result = await bills_service.revalue_affected(touched)
     if result.get("bills"):
-        logger.info(
-            "[rates] 历史修复后账单重估：%d 个账单 / %d 笔交易", 
-            result.get("bills"), result.get("transactions"),
+        log_event(
+            logger,
+            "历史汇率修复后账单重估完成",
+            detail={"账单": result.get("bills"), "交易": result.get("transactions")},
         )
     return result
 
@@ -475,8 +490,33 @@ async def repair_history_gaps(
 
     if result["written"]:
         result["revalued"] = await revalue_dependents(touched)
-    logger.info(
-        "[rates] 历史修复：%s 请求 %d 次 / 写入 %d 行 / 覆盖币种 %d",
-        result["status"], result["requests"], result["written"], len(touched),
+    log_event(
+        logger,
+        "历史汇率缺口修复本轮结束",
+        detail={
+            "状态": result["status"],
+            "请求": result["requests"],
+            "写入行": result["written"],
+            "覆盖币种": len(touched),
+        },
     )
     return result
+
+
+async def bootstrap_full_history(*, max_windows: int | None = None) -> dict:
+    """全新安装的汇率全史 bootstrap（种子不再携带汇率档案）。
+
+    判定：全库零历史行 → 扫描以 FULL_HISTORY_START 给全部白名单币种建窗 →
+    复用修复链现抓（bing 免 Key 全历史档位）；已有任何历史行的存量库直接
+    返回 no_bootstrap，缺口照常归每日 04:00 修复任务。「汇率历史补全」
+    开关关闭时跳过（与定时修复同一闸）。
+    """
+    from app.core.scheduler import content_fetch_enabled
+
+    if not await content_fetch_enabled("fetch.fx_history"):
+        return {"status": "disabled"}
+    marks = await _load_marks()
+    if marks:
+        return {"status": "no_bootstrap"}
+    log_event(logger, "全新安装汇率全史补全启动，全库零历史行，现抓全时间范围")
+    return await repair_history_gaps(max_windows=max_windows)
