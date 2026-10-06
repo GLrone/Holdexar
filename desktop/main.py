@@ -600,6 +600,18 @@ def _restore_moved(moved: list[str], target: Path, old_dir: Path) -> None:
             _log_update(f"回滚 {name} 失败：{e}（原件仍在 {old_dir}，可手工移回）")
 
 
+def _replace_with_retry(src: Path, dst: Path, *, attempts: int = 8, delay: float = 1.0) -> None:
+    """同卷改名，拒绝访问按短窗重试（旧进程句柄释放非瞬时）。"""
+    for i in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(delay)
+
+
 def _swap_payload(staging: Path, target: Path) -> bool:
     """换装主体：旧条目让位 → 新载荷落位 → 校验 → 清暂存。返回是否成功。
 
@@ -619,13 +631,15 @@ def _swap_payload(staging: Path, target: Path) -> bool:
             return False
     old_dir.mkdir(parents=True)
 
-    # ② 旧条目让位（纯改名，逐条登记以便回滚）
+    # ② 旧条目让位（纯改名，逐条登记以便回滚）。旧进程句柄释放有延迟、
+    #   残余占用进程也可能恰在退出，拒绝访问按短窗重试——让位是整条链
+    #   唯一的门槛步骤，多等几秒好过整轮失败加一次回滚。
     moved: list[str] = []
     try:
         for entry in target.iterdir():
             if entry.name in _UPDATE_KEEP or entry == old_dir:
                 continue
-            os.replace(entry, old_dir / entry.name)
+            _replace_with_retry(entry, old_dir / entry.name)
             moved.append(entry.name)
     except Exception as e:  # noqa: BLE001
         _log_update(f"旧条目让位失败：{e}（回滚已让位条目）")
@@ -638,6 +652,10 @@ def _swap_payload(staging: Path, target: Path) -> bool:
         for entry in payload.iterdir():
             dst = target / entry.name
             if entry.is_dir():
+                if dst.exists():
+                    # 正常流程目标已被移走，还留着就是上次失败的残壳：
+                    # copytree 吃不下半截目录（目标已存在/深层路径缺失）
+                    _remove_path(dst)
                 shutil.copytree(entry, dst)
             else:
                 shutil.copy2(entry, dst)
@@ -682,6 +700,11 @@ def _run_update_helper(staging: Path, target: Path, wait_pid: int | None) -> Non
 
     if not _swap_payload(staging, target):
         _mark_swap_failed(target)
+        # 失败标记只有新版现装认识；旧版现装的编排没有这条检查，看到 manifest
+        # 就会把换装再次交出，形成「失败→回滚→重演」循环。manifest 是自动换装
+        # 的唯一判据，由本进程直接摘除（它不是本进程运行的文件，删得掉），
+        # 对所有已装版本同时终止自动重试。
+        (staging / _MANIFEST_NAME).unlink(missing_ok=True)
         # 先把窗口还给用户，再弹窗：MessageBoxW 是模态阻塞调用，排在拉起之前
         # 会让现装一直回不来——用户不点确定，应用就停在「点更新后消失」。
         _relaunch_after_failed_swap(target)
