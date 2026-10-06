@@ -29,6 +29,7 @@ from app.core.database import (
     get_session_factory,
     write_gate,
 )
+from app.core.logging import log_event
 from app.core.secretbox import SecretBoxError
 from app.crawler.utils import get_beijing_time_obj
 from app.domains.account.models import SteamAccount
@@ -88,7 +89,12 @@ def _stored_credential(row: SteamAccount) -> str:
     try:
         return secretbox.decrypt_secret(value, _CREDENTIAL_PURPOSE)
     except SecretBoxError:
-        logger.warning("[account] 账号 %s 凭据无法在本机解密，按无凭据处理", row.steam_id)
+        log_event(
+            logger,
+            "账号凭据无法在本机解密，按无凭据处理",
+            level=logging.WARNING,
+            detail={"SteamID": row.steam_id},
+        )
         return ""
 
 
@@ -269,10 +275,15 @@ async def ensure_live_session(steam_id: str, cookies: str, *, force: bool = Fals
                 current, proxy_url=await _strategy_proxy()
             )
         except SessionRefreshError as exc:
-            logger.warning("[account] 账号 %s 登录态续期失败：%s", steam_id, exc)
+            log_event(
+                logger,
+                "账号登录态续期失败，本轮沿用原 Cookie",
+                level=logging.WARNING,
+                detail={"SteamID": steam_id, "原因": str(exc)},
+            )
             return current
         await _save_cookies_only(steam_id, renewed)
-        logger.info("[account] 账号 %s 登录态已续期（换发新的访问令牌）", steam_id)
+        log_event(logger, "账号登录态已续期，换发新的访问令牌", detail={"SteamID": steam_id})
         return renewed
 
 
@@ -288,7 +299,11 @@ async def _fetch_wallet_with_live_session(steam_id: str, cookies: str) -> Wallet
         fresh = await ensure_live_session(steam_id, cookies, force=True)
         if fresh == cookies:
             raise
-        logger.info("[account] 账号 %s store 会话衰减，已换发新会话重试钱包抓取", steam_id)
+        log_event(
+            logger,
+            "商店会话被服务端衰减，已换发新会话重试钱包抓取",
+            detail={"SteamID": steam_id},
+        )
         return await fetch_wallet(fresh, proxy_url=await _strategy_proxy())
 
 
@@ -478,12 +493,23 @@ async def _post_bind_fetch(steam_id: str, is_primary: bool) -> None:
 
         auto_crawl = await price_auto_enabled()
         r = await wishlist_service.sync_account(steam_id, auto_crawl=auto_crawl)
-        logger.info(
-            "[account] 绑定后同步 %s：愿望单新增 %s 款 / 已购新增 %s 款（活跃 %s）",
-            steam_id, r.get("added"), r.get("addedOwned"), r.get("active"),
+        log_event(
+            logger,
+            "绑定后愿望单与已购同步完成",
+            detail={
+                "SteamID": steam_id,
+                "愿望单新增": r.get("added"),
+                "已购新增": r.get("addedOwned"),
+                "活跃条目": r.get("active"),
+            },
         )
     except Exception:  # noqa: BLE001 —— 失败由 15min 定时同步兜底
-        logger.exception("[account] 绑定后愿望单/已购同步异常（定时任务将兜底）")
+        log_event(
+            logger,
+            "绑定后愿望单与已购同步失败，定时任务将兜底",
+            level=logging.ERROR,
+            exc_info=True,
+        )
 
     # 家庭组跟随本账号：绑定即发现（成员自动入追踪，愿望单/已购/监控池随之
     # 生效）；失败不阻断，下次手动同步继续兜底
@@ -491,12 +517,17 @@ async def _post_bind_fetch(steam_id: str, is_primary: bool) -> None:
         from app.domains.family import service as family_service
 
         r = await family_service.sync_family_group(steam_id)
-        logger.info(
-            "[account] 绑定后家庭组同步 %s：joined=%s failed=%s",
-            steam_id, r.get("joined"), r.get("failed"),
+        log_event(
+            logger,
+            "绑定后家庭组同步完成",
+            detail={
+                "SteamID": steam_id,
+                "新加入成员": r.get("joined"),
+                "失败成员": r.get("failed"),
+            },
         )
     except Exception:  # noqa: BLE001 —— 单账号失败隔离，不拖垮绑定流程
-        logger.exception("[account] 绑定后家庭组同步异常（下次同步兜底）")
+        log_event(logger, "绑定后家庭组同步失败，下次同步兜底", level=logging.ERROR, exc_info=True)
 
     if not is_primary:
         return
@@ -505,14 +536,28 @@ async def _post_bind_fetch(steam_id: str, is_primary: bool) -> None:
 
         r = await bills_service.sync_bills(force=True)
         if r.get("ok"):
-            logger.info(
-                "[account] 绑定后账单同步：history %s 行 / licenses %s 行",
-                r.get("historyRows"), r.get("licenseRows"),
+            log_event(
+                logger,
+                "绑定后账单同步完成",
+                detail={
+                    "消费记录行": r.get("historyRows"),
+                    "许可证行": r.get("licenseRows"),
+                },
             )
         elif r.get("status") not in ("no_cookie", "busy"):
-            logger.info("[account] 绑定后账单同步失败：%s", r.get("error"))
+            log_event(
+                logger,
+                "绑定后账单同步失败",
+                tag="未完成",
+                detail={"原因": r.get("error")},
+            )
     except Exception:  # noqa: BLE001 —— 失败由 30min 定时同步兜底
-        logger.exception("[account] 绑定后账单同步异常（定时任务将兜底）")
+        log_event(
+            logger,
+            "绑定后账单同步失败，定时任务将兜底",
+            level=logging.ERROR,
+            exc_info=True,
+        )
 
 
 async def bind_account(cookies_raw: str) -> dict:
@@ -528,7 +573,12 @@ async def bind_account(cookies_raw: str) -> dict:
     await after_bind(result["steam_id"])
     sync = await sync_wallet(force=True)
     if not sync.get("ok"):
-        logger.info("[account] 绑定完成但首次抓取失败：%s", sync.get("error"))
+        log_event(
+            logger,
+            "账号绑定完成，但首次钱包抓取失败",
+            tag="未完成",
+            detail={"原因": sync.get("error")},
+        )
     steam_id = result["steam_id"]
     is_primary = steam_id == await get_primary_steam_id()
     asyncio.get_running_loop().create_task(_post_bind_fetch(steam_id, is_primary))
@@ -917,12 +967,22 @@ async def sync_wallets_rotational() -> dict:
     skipped = sum(1 for r in results if isinstance(r, dict) and r.get("status") == "backoff")
     for r in results:
         if isinstance(r, Exception):
-            logger.warning("[钱包轮转] 同步异常：%s", r)
+            log_event(
+                logger,
+                "钱包轮转中账号同步出现异常",
+                level=logging.WARNING,
+                detail={"原因": str(r)},
+            )
 
     # 官方在线状态批量刷新（有 API Key 时权威覆盖 miniprofile 兜底；一次调用查全部）
     state_result = await refresh_online_states(rows)
     if not state_result.get("ok"):
-        logger.debug("[钱包轮转] 官方在线状态未刷新（%s）", state_result.get("status"))
+        log_event(
+            logger,
+            "官方在线状态本轮未刷新",
+            detail={"状态": state_result.get("status")},
+            level=logging.DEBUG,
+        )
 
     # 失败原因汇总。httpx 的逐请求日志已被静音（它把请求 URL 连同 API Key
     # 一起打进了日志），于是「HTTP 403」这类唯一的状态码线索也一并消失——
@@ -976,9 +1036,11 @@ async def _sync_wallet_of(steam_id: str) -> dict:
         if not freshness["has_refresh_token"]:
             await _save_wallet(steam_id, error=SESSION_EXPIRED_MESSAGE, now=now, frozen=True)
             if not row.wallet_frozen:
-                logger.warning(
-                    "[钱包轮转] 账号 %s 登录态已过期且无续期凭据，"
-                    "冻结自动刷新（等重新登录）", steam_id
+                log_event(
+                    logger,
+                    "账号登录态已过期且没有续期凭据，冻结自动刷新，等待重新登录",
+                    level=logging.WARNING,
+                    detail={"SteamID": steam_id},
                 )
             return {"ok": False, "status": "session_expired", "error": SESSION_EXPIRED_MESSAGE}
         await _save_wallet(
@@ -996,18 +1058,22 @@ async def _sync_wallet_of(steam_id: str) -> dict:
         await _save_wallet(steam_id, error=str(exc), now=now, backoff_level=next_level,
                            fail_streak=next_streak, frozen=will_freeze)
         if will_freeze and not row.wallet_frozen:
-            logger.warning(
-                "[钱包轮转] 账号 %s 连续 %d 次钱包同步失败，熔断冻结自动刷新"
-                "（手动刷新余额或换绑 Cookie 解锁）", steam_id, next_streak,
+            log_event(
+                logger,
+                "账号连续多次钱包同步失败，熔断冻结自动刷新（手动刷新余额或换绑 Cookie 解锁）",
+                level=logging.WARNING,
+                detail={"SteamID": steam_id, "连续失败次数": next_streak},
             )
         return {"ok": False, "error": str(exc)}
     except WalletFetchError as exc:
         await _save_wallet(steam_id, error=str(exc), now=now, backoff_level=next_level,
                            fail_streak=next_streak, frozen=will_freeze)
         if will_freeze and not row.wallet_frozen:
-            logger.warning(
-                "[钱包轮转] 账号 %s 连续 %d 次钱包同步失败，熔断冻结自动刷新"
-                "（手动刷新余额或换绑 Cookie 解锁）", steam_id, next_streak,
+            log_event(
+                logger,
+                "账号连续多次钱包同步失败，熔断冻结自动刷新（手动刷新余额或换绑 Cookie 解锁）",
+                level=logging.WARNING,
+                detail={"SteamID": steam_id, "连续失败次数": next_streak},
             )
         return {"ok": False, "error": str(exc)}
 
@@ -1022,6 +1088,8 @@ async def _sync_wallet_of(steam_id: str) -> dict:
         "country_code": info.country_code,
         "steam_id": info.steam_id,
         "checked_at": now.isoformat(),
+        # 上次成功获取余额的时刻（与手动通道同口径；前端同步成功缓存窗判据）
+        "ok_at": now.isoformat(),
         "check_ok": True,
         "error": "",
     }
@@ -1088,7 +1156,12 @@ async def _wishlist_counts(steam_ids: list[str]) -> dict[str, dict]:
             else:
                 out[sid]["wishlist_count"] = cnt
     except Exception:  # noqa: BLE001
-        logger.debug("愿望单计数查询失败（表缺失等），按 0 处理", exc_info=True)
+        log_event(
+            logger,
+            "愿望单计数查询失败（表缺失等），按 0 处理",
+            level=logging.DEBUG,
+            exc_info=True,
+        )
     return out
 
 
@@ -1207,9 +1280,19 @@ async def after_bind(steam_id: str) -> None:
             existing = await session.get(TrackedAccount, steam_id)
         if existing is None:
             await wishlist_service.add_account(steam_id, kinds={"wishlist": True, "owned": True})
-            logger.info("[account] 账号 %s 已注册愿望单追踪（愿望单+已购双开）", steam_id)
+            log_event(
+                logger,
+                "账号已注册愿望单追踪（愿望单与已购双开）",
+                detail={"SteamID": steam_id},
+            )
     except Exception:  # noqa: BLE001
-        logger.warning("[account] 账号 %s 愿望单注册失败（不阻断绑定）", steam_id, exc_info=True)
+        log_event(
+            logger,
+            "账号愿望单追踪注册失败，不阻断绑定",
+            level=logging.WARNING,
+            exc_info=True,
+            detail={"SteamID": steam_id},
+        )
 
 
 async def _strategy_proxy() -> str | None:
@@ -1270,7 +1353,11 @@ async def migrate_legacy_kv() -> int:
     await settings_service.set_value(KEY_COOKIES, "")
     await settings_service.set_value(KEY_WALLET, None)
     await settings_service.set_value(KEY_PROFILE, None)
-    logger.info("[account] 旧单账号 Cookie 已迁移至多账号表：%s", cookie_sid)
+    log_event(
+        logger,
+        "旧单账号 Cookie 已迁移至 Steam 多账号表",
+        detail={"SteamID": cookie_sid},
+    )
     return 1
 
 
@@ -1295,5 +1382,5 @@ async def seal_credentials_at_rest() -> int:
         await session.commit()
     sealed += await settings_service.seal_secret_values()
     if sealed:
-        logger.info("[account] 存量明文凭据已加密落库（%d 条）", sealed)
+        log_event(logger, "存量明文凭据已加密落库", detail={"条数": sealed})
     return sealed

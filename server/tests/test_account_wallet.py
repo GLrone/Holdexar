@@ -269,6 +269,41 @@ async def test_sync_wallet_failure_preserves_ok_at(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_wallet_rotation_success_writes_ok_at(monkeypatch):
+    """轮转通道与手动通道同口径：成功快照必须带 ok_at（同步成功缓存窗判据）。
+
+    曾漏写：自动轮转成功后 wallet_json 无 ok_at，前端 10min 缓存窗在下次
+    失败改写前恒判「同步过期」——口径分裂。"""
+    async def fake_live(_steam_id, _stored):
+        return {"steamLoginSecure": "x"}
+
+    async def fake_fetch(_steam_id, _cookies):
+        return _from_raw_amounts(15000, 0, 23, "CN")
+
+    monkeypatch.setattr(account_service, "ensure_live_session", fake_live)
+    monkeypatch.setattr(
+        account_service, "session_freshness",
+        lambda _cookies: {"expired": False, "expires_at": None, "has_refresh_token": True},
+    )
+    monkeypatch.setattr(account_service, "_fetch_wallet_with_live_session", fake_fetch)
+
+    async def _no_profile(_steam_id, _cookies, _now):
+        return None
+
+    monkeypatch.setattr(account_service, "_sync_profile_row", _no_profile)
+    await account_service.save_cookies("steamLoginSecure=76561198123456789%7C%7Ct")
+
+    result = await account_service._sync_wallet_of("76561198123456789")
+    assert result["ok"] is True
+    snapshot = result["wallet"]
+    assert snapshot["ok_at"] == snapshot["checked_at"]
+
+    wallet = (await account_service.get_status())["wallet"]
+    assert wallet["ok_at"] == snapshot["ok_at"]  # 落行同口径
+    assert wallet["check_ok"] is True
+
+
+@pytest.mark.asyncio
 async def test_save_cookies_flags_mismatch(monkeypatch):
     async def fake_fetch(cookies, *, verify=None, proxy_url=None):
         return _from_raw_amounts(1, 0, 1, "US")

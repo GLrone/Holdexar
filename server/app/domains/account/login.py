@@ -21,6 +21,7 @@ import httpx
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicNumbers
 
+from app.core.logging import log_event
 from .service import _strategy_proxy, bind_account
 from .session import SessionRefreshError, web_cookies_from_refresh_token
 
@@ -451,7 +452,12 @@ async def start_login(account_name: str, password: str) -> dict:
             proxy_url = await _strategy_proxy()
             info = await _begin_session(account, password, proxy_url)
         except LoginError as exc:
-            logger.info("[account] 应用内登录失败（账号=%s…）：%s", account[:3], exc)
+            log_event(
+                logger,
+                "应用内账号密码登录失败",
+                tag="未完成",
+                detail={"账号前缀": account[:3], "原因": str(exc)},
+            )
             _update_state(STATE_FAILED, error=str(exc))
             return {"ok": False, "state": login_status()}
         # 会话凭据性字段并入会话容器（login_status 快照白名单不外泄它们）
@@ -519,13 +525,20 @@ async def _poll_until_authed(info: dict, proxy_url: str | None) -> None:
                         STATE_FINALIZING,
                         f"网络不稳，正在自动恢复登录（第 {attempt + 1}/{_FINALIZE_ATTEMPTS - 1} 次重试）…",
                     )
-                    logger.warning(
-                        "[account] 登录收尾第 %s 次失败（网络瞬断），稍后重试",
-                        attempt + 1,
+                    log_event(
+                        logger,
+                        "登录收尾遇网络瞬断，稍后重试",
+                        level=logging.WARNING,
+                        detail={"第几次尝试": attempt + 1},
                     )
                     await asyncio.sleep(_FINALIZE_RETRY_BACKOFF_S * (attempt + 1))
             await bind_account(cookies)
-            logger.info("[account] 应用内登录成功并已绑定 %s", info["steam_id"])
+            log_event(
+                logger,
+                "应用内登录成功并已绑定账号",
+                tag="成功",
+                detail={"SteamID": info["steam_id"]},
+            )
             _update_state(STATE_DONE, "登录成功")
             return
         if not _cancelled.is_set():
@@ -536,7 +549,7 @@ async def _poll_until_authed(info: dict, proxy_url: str | None) -> None:
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001 —— 落库链异常归为登录失败，凭据链路细节留日志
-        logger.exception("[account] 应用内登录收尾异常")
+        log_event(logger, "应用内登录收尾失败", level=logging.ERROR, exc_info=True)
         if not _cancelled.is_set():
             _update_state(STATE_FAILED, error="登录收尾失败，请重试")
 

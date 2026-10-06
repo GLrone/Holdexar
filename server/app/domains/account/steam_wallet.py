@@ -15,6 +15,8 @@ from dataclasses import dataclass
 
 import httpx
 
+from app.core.logging import log_event
+
 logger = logging.getLogger(__name__)
 
 ACCOUNT_URL = "https://store.steampowered.com/account/"
@@ -233,7 +235,12 @@ async def _region_from_history(
         match = _REGION_NOTE_RE.search(resp.text)
         return match.group(1).strip() if match else ""
     except Exception as exc:  # noqa: BLE001 地区名是增强信号，失败不阻断余额
-        logger.debug("history 页地区名抓取失败：%s", exc)
+        log_event(
+            logger,
+            "账号历史页地区名抓取失败",
+            level=logging.DEBUG,
+            detail={"原因": str(exc)},
+        )
         return ""
 
 
@@ -387,14 +394,29 @@ async def _try_channels(
                         f"{channel.__name__}）——请切换 Clash 节点或稍后再试"
                     ) from exc
                 errors.append(f"{channel.__name__}: {type(exc).__name__}: {exc}")
-                logger.debug("钱包通道失败（verify=%s）%s", verify_flag, errors[-1])
+                log_event(
+                    logger,
+                    "钱包通道抓取失败",
+                    level=logging.DEBUG,
+                    detail={"证书校验": verify_flag, "错误": errors[-1]},
+                )
             except httpx.TransportError as exc:
                 errors.append(f"{channel.__name__}: {type(exc).__name__}: {exc}")
-                logger.debug("钱包通道失败（verify=%s）%s", verify_flag, errors[-1])
+                log_event(
+                    logger,
+                    "钱包通道抓取失败",
+                    level=logging.DEBUG,
+                    detail={"证书校验": verify_flag, "错误": errors[-1]},
+                )
                 retried = attempt == 0
             except Exception as exc:  # noqa: BLE001 通道间容错，最后统一抛
                 errors.append(f"{channel.__name__}: {type(exc).__name__}: {exc}")
-                logger.debug("钱包通道失败（verify=%s）%s", verify_flag, errors[-1])
+                log_event(
+                    logger,
+                    "钱包通道抓取失败",
+                    level=logging.DEBUG,
+                    detail={"证书校验": verify_flag, "错误": errors[-1]},
+                )
             else:
                 if info is not None:
                     return info
@@ -427,7 +449,11 @@ async def fetch_wallet(cookies_raw: str, *, verify: bool | None = None, proxy_ur
     except WalletFetchError as exc:
         if not _has_ssl_error(str(exc)):
             raise
-        logger.info("Steam 证书校验失败（疑似本机加速器），降级跳过校验重试")
+        log_event(
+            logger,
+            "Steam 证书校验失败（疑似本机加速器），降级跳过校验重试",
+            tag="降级",
+        )
         return await _try_channels(False, cookies, proxy_url)
 
 
@@ -515,7 +541,12 @@ async def fetch_player_states(
             return {}
         players = (resp.json().get("response") or {}).get("players") or []
     except Exception:  # noqa: BLE001
-        logger.debug("GetPlayerSummaries 拉取失败", exc_info=True)
+        log_event(
+            logger,
+            "官方在线状态批量拉取失败",
+            level=logging.DEBUG,
+            exc_info=True,
+        )
         return {}
     out: dict[str, dict] = {}
     for p in players:
@@ -570,7 +601,12 @@ async def fetch_profile(
         try:
             result = await _get(verify_flag)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("miniprofile 拉取失败（verify=%s）: %s", verify_flag, exc)
+            log_event(
+                logger,
+                "账号资料（昵称/头像/在线态）拉取失败",
+                level=logging.DEBUG,
+                detail={"证书校验": verify_flag, "原因": str(exc)},
+            )
             if verify is None and _has_ssl_error(str(exc)):
                 continue  # 证书问题 → 降级重试一轮
             return empty
