@@ -248,18 +248,43 @@ Holdexar/
 └── web/src/          # Vue 3 + TS(components/ui = Hl* 体系, views = 页面)
 ```
 
-## 定制与反馈
+## 贡献指南
 
-欢迎 fork 后按自己的需求改造。常见定制点:
+欢迎提 Issue 与 PR，也欢迎 fork 后按自己的需求改造。
+
+### 环境准备
+
+1. 克隆仓库，启用提交门禁：`git config core.hooksPath .githooks`
+2. 后端：Python ≥ 3.13，依赖与启动见上文【源码运行】（`run.py` 自动建 venv 装依赖）
+3. 前端：Node ≥ 20.19（或 ≥ 22.12），`cd web && npm install`
+
+### 开发流程
+
+| 环节 | 命令 |
+|---|---|
+| 联调开发 | `python run.py --dev`（对接 Vite 热更新） |
+| 仅起后端 | `python run.py --server`，浏览器访问 http://127.0.0.1:28765 |
+| 后端选测 | `python scripts/test_select.py --run`（按导入关系自动圈定受影响测试） |
+| 推送前冒烟 | `python scripts/test_select.py --smoke --run` |
+| 后端全量 | `cd server && python -m pytest`（归发布门，日常不必跑） |
+| 前端检查 | `cd web && npm run lint`、`npm run test` |
+| 出包发布 | 见上文【打包与发布】 |
+
+### 提交约定
+
+- 一个提交只做一件事；提交信息一句话功能概述，单行，不加正文
+- pre-commit 会自动跑七道门禁：敏感面扫描、注释留痕、写路径审计、前端 lint、路由完整性、双语词典、旗帜素材。任何一项未过先修内容，禁止 `--no-verify` 绕行
+- 数据库写入统一走全局写调度器（write_gate），例外需先登记；前端新代码一律使用 Hl\* 组件体系，不直连 Element Plus
+- PR 聚焦单一功能面，正文写清做了什么、怎么验证的（测试或实测结果）
+
+### 常见定制点
 
 | 定制项 | 位置 |
 |---|---|
-| 区服列表(增删国家) | `server/app/crawler/config.py` → `CC_LIST` |
-| 调度节奏(任务 / 间隔) | `server/app/core/scheduler.py` → `start_scheduler()` |
+| 区服列表（增删国家） | `server/app/crawler/config.py` → `CC_LIST` |
+| 调度节奏（任务 / 间隔） | `server/app/core/scheduler.py` → `start_scheduler()` |
 | 爬取并发与超时 | `server/app/crawler/config.py` → `DEFAULT_WORKER_COUNT` / `HTTP_TIMEOUT` |
-| 主题与样式 | `web/src/styles/`(token 化,深浅主题各一套) |
-
-有问题或功能建议,随时提 Issue。参与开发:克隆后执行 `git config core.hooksPath .githooks` 启用提交门禁(敏感面 / 注释留痕 / lint / 路由 / 词典 / 旗帜素材六项);依赖与启动见上文【源码运行】,出包与发布见【打包与发布】。
+| 主题与样式 | `web/src/styles/`（token 化，深浅主题各一套） |
 
 ## 致谢
 
