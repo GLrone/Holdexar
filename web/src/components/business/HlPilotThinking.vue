@@ -30,6 +30,36 @@ const props = withDefaults(
 
 const { t } = useI18n()
 
+/* 首个 delta 前的等待计时：供应商排队/首 token 延迟是阶段间「断层」的本体，
+   静态话术掩盖不了死等——逐秒跳动的计数才是诚实信号。文本到达即停。 */
+const waitSec = ref(0)
+let waitTicker: ReturnType<typeof setInterval> | null = null
+
+function stopWaitTicker() {
+  if (waitTicker) {
+    clearInterval(waitTicker)
+    waitTicker = null
+  }
+}
+
+watch(
+  () => [props.live, props.active, Boolean(props.text)] as const,
+  ([live, active, hasText]) => {
+    if (live && active && !hasText) {
+      if (!waitTicker) {
+        waitSec.value = 0
+        const start = Date.now()
+        waitTicker = setInterval(() => {
+          waitSec.value = Math.floor((Date.now() - start) / 1000)
+        }, 1000)
+      }
+    } else {
+      stopWaitTicker()
+    }
+  },
+  { immediate: true },
+)
+
 const open = ref(props.initialOpen)
 const userTouched = ref(false)
 const liveSec = ref(0)
@@ -61,7 +91,10 @@ watch(
     if (!live) stopTicker()
   },
 )
-onBeforeUnmount(stopTicker)
+onBeforeUnmount(() => {
+  stopTicker()
+  stopWaitTicker()
+})
 
 watch(
   () => props.active,
@@ -131,6 +164,11 @@ watch(
 )
 
 const durLabel = computed(() => {
+  if (props.live && !props.text) {
+    return waitSec.value >= 1
+      ? t('pilot.think.waiting', { sec: waitSec.value })
+      : (props.waitingText || t('pilot.think.waiting', { sec: 0 }))
+  }
   if (props.live && !props.text && props.waitingText) return props.waitingText
   if (props.live) {
     return open.value && liveSec.value
@@ -224,8 +262,8 @@ const durLabel = computed(() => {
   min-width: 0;
   overflow: hidden;
   max-width: 220px;
-  mask-image: linear-gradient(90deg, transparent, #000 16px, #000 calc(100% - 16px), transparent);
-  -webkit-mask-image: linear-gradient(90deg, transparent, #000 16px, #000 calc(100% - 16px), transparent);
+  mask-image: linear-gradient(90deg, transparent, black 16px, black calc(100% - 16px), transparent);
+  -webkit-mask-image: linear-gradient(90deg, transparent, black 16px, black calc(100% - 16px), transparent);
 }
 
 .pthink__summary {
@@ -255,18 +293,19 @@ const durLabel = computed(() => {
   transform: rotate(45deg) translate(-2px, -2px);
 }
 
-/* 展开体：纯文本 pre-wrap + 左导线 + 限高滚动 + 吸底跟随；
-   撑满思考块宽度，滚动条贴阶段右缘而不是贴正文右缘 */
+/* 展开体：推理控制台容器 + 纯文本 pre-wrap + 优雅内滚 */
 .pthink__body-box {
   align-self: stretch;
   margin-top: 6px;
-  margin-left: 2px;
   max-height: 240px;
   overflow-y: auto;
-  padding-left: 12px;
-  border-left: 1px solid var(--border-soft);
-  font-size: 12px;
-  line-height: 1.7;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-panel);
+  border: 1px solid var(--border-soft);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.6;
   color: var(--text-muted);
 }
 

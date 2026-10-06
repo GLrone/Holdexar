@@ -1,16 +1,7 @@
-/* English 词典 · pool（与 zh-CN/pool.ts 同构，key 必须逐一对齐）。
-   对应源文件：views/pool/Index.vue。
-
-   措辞对齐（这些词的译法在别处已定，本页沿用）：
-   · Wishlist / Owned —— gameCard 的归属徽章（gameCard.status.wishlist / .owned），
-     也是账户 kinds 维度的原文概念；
-   · bind / unbind —— dashboard 页指向本页的引导用词；
-   · Sync / crawl —— dashboard 与 shell 的既有译法；
-   · “识别到 N 个 AppID”复用 crawl.import.detected / .detectedInvalid——
-     同一份粘贴解析在任务页与池页逐字相同。
-
-   三段同步结果文案各自成条，不在组件侧拼片段（中文那个「，已自动开始爬取」
-   是随条件增减的整句，直译成英文会拼不出版行）。 */
+/* English 词典 · pool —— views/pool/Index.vue（与 zh-CN/pool.ts 同构，key 必须逐一对齐）。
+   措辞沿用既有译法：Wishlist / Owned（gameCard 归属徽章）、bind / unbind、Sync / crawl。
+   复用：「识别到 N 个 AppID」用 crawl.import.detected / .detectedInvalid（与任务页逐字相同）。
+   不变量：三段同步结果文案各自成条、组件侧不拼片段（直译拼不出版行）。 */
 
 import type { MessageKey } from '../zh-CN'
 
@@ -95,7 +86,7 @@ const pool: Partial<Record<MessageKey, string>> = {
   'pool.items.noKindMatch': 'No games in this category.',
   /* Steam account section empty: account-scoped prompt, never a global prerequisite */
   'pool.accounts.empty': 'No Steam account bound yet — bind one and your wishlist and owned games will join Following automatically.',
-  'pool.items.empty': 'Nothing followed yet — star a game on Find Games, or use “Add” above.',
+  'pool.items.empty': 'Nothing followed yet — star a game on Store, or use “Add” above.',
 }
 
 export default pool

@@ -1,16 +1,7 @@
-/* English 词典 · bills（与 zh-CN/bills.ts 同构，key 必须逐一对齐）。
-   对应源文件：views/bills/Index.vue + LedgerTab.vue + CdkTab.vue + TopupTab.vue。
-   子区块用子命名空间区分：bills.ledger.* / bills.cdk.* / bills.topup.*。
-
-   金额一律留在组件侧用 useLocaleFormat() 格式化后作为 {amount} 传入——词条里的
-   ¥ 是标签的一部分（同 gameCard.price.save / trendChart.tip.* 的写法），不带数字。
-
-   带行内标记的三条（bills.empty.desc / bills.ledger.year.sumRefund /
-   bills.topup.year.sum）保持 HTML 与 zh 侧对齐：组件侧 v-html 渲染，标记以外的
-   词句按英文重写，不逐字对译。
-
-   量词：zh 用「笔 / 条 / 个」，英文没有对应计数词，按被数对象写成
-   transactions / orders / top-ups / entries。 */
+/* English 词典 · bills —— views/bills/Index.vue + LedgerTab + CdkTab + TopupTab（与 zh-CN/bills.ts 同构，key 必须逐一对齐）。
+   不变量：金额留在组件侧 useLocaleFormat() 格式化后作 {amount} 传入（词条里 ¥ 是标签的一部分、不带数字）；
+   带行内标记的词条 HTML 与 zh 侧对齐、组件侧 v-html 渲染，词句按英文重写不逐字对译；
+   zh 量词（笔 / 条 / 个）按被数对象写成 transactions / orders / top-ups / entries。 */
 
 import type { MessageKey } from '../zh-CN'
 

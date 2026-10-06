@@ -1,13 +1,7 @@
 /* alerts 词条 —— 价格提醒页（views/alerts/Index.vue）。
-
-   分节 key（`section.*`）**同时是区块标题**：对应区块的 `data-section` 直接写
-   这个 key，HlSectionRail 读到后用 t() 显示（同 rates 的约定）。
-   其中 `alerts.section.rules` 还是 **ProductTour 引导步骤的选择器契约**——
-   视图的 data-section 与 ProductTour 的 target 必须逐字相同，改名即静默落空。
-
-   ⚠️ SMTP 一节里没有任何地址 / 账号字面量：`{host}` 与 `{email}` 是**示例值**，
-   由视图侧传入（词典只留句式），`{masked}` 是服务端返回的掩码串，同样只走参数。
-   这样「连接信息不进词条」在结构上成立，而不是靠人记得别写。 */
+   分节 key（section.*）同时是区块标题（data-section 写该 key，HlSectionRail 读到后 t() 显示）；
+   契约：alerts.section.rules 是 ProductTour 引导步骤的选择器，与视图侧必须逐字相同，改名即静默落空。
+   不变量：SMTP 一节无任何地址 / 账号字面量——{host} / {email} 为视图侧传入的示例值、{masked} 为服务端掩码串，连接信息只走参数。 */
 
 const alerts = {
   /* ── 分节锚点（兼区块标题；alerts.section.rules 为 ProductTour 契约 key）── */

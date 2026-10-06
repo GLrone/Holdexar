@@ -15,7 +15,7 @@ const fetchPage = {
     'Humble 每月推出一批游戏合集。开着它，每月自动整理当月有哪些游戏，并发一封清单邮件。',
   'fetch.boards.label': 'Steam 排行榜',
   'fetch.boards.desc':
-    '自动获取 Steam 的热销、特惠、新品和即将推出排行榜，「找游戏」里最近热门的游戏就来自这里。',
+    '自动获取 Steam 的热销、特惠、新品和即将推出排行榜，「游戏商店」里最近热门的游戏就来自这里。',
   'fetch.bundleCounts.label': '捆绑包记录',
   'fetch.bundleCounts.desc':
     '记录每款游戏参加过哪些优惠合集，显示在捆绑包页和游戏详情里。关掉后这些记录不再更新。',

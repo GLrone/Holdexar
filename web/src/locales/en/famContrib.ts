@@ -1,18 +1,8 @@
-/* English 词典 · famContrib（与 zh-CN/famContrib.ts 同构，key 必须逐一对齐）。
-   对应源文件：views/family/tabs/FamContrib.vue。
-
-   措辞对齐（这些词的译法在别处已定，本页沿用）：
-   · contribution split —— A 表「贡献分布」；family library —— A 表「家庭库」；
-   · Exclusive / Shared by {n} / tier —— B 表「独占」「N人共享」「档位·分层」；
-   · acquisition / acquired —— B 表「入库」（与 acquisition heatmap 同源）；
-   · share —— B 表「占比」（纯比例用 share，不用 ratio）；
-   · Exclusive contributions (filtered) —— D4：本页的独占数随范围控件变化，
-     与 famLib.kpi.exclusive 的「全库口径」是两个数，英文上必须看得出差别；
-   · X per member —— D3，`famContrib.kpi.perMember` 用 "Exclusive per member"，
-     不用 "per-capita"（禁止 Contributors）。
-
-   档位提示是两条整句而不是「标签 + 计数」两段拼接：中英语序不同，`tierLabel()`
-   的结果塞进占位符里英文会拼成残句。 */
+/* English 词典 · famContrib —— views/family/tabs/FamContrib.vue（与 zh-CN/famContrib.ts 同构，key 必须逐一对齐）。
+   措辞沿用既有译法：contribution split / family library / Exclusive / Shared by {n} / tier / acquisition / share（纯比例用 share 不用 ratio）；
+   Exclusive contributions (filtered) 随范围控件变化，与 famLib.kpi.exclusive（全库口径）英文上必须可区分；
+   "Exclusive per member"（禁 per-capita 与 Contributors）。
+   不变量：档位提示是整句词条，tierLabel() 的结果不塞占位符（拼接出残句）。 */
 
 import type { MessageKey } from '../zh-CN'
 

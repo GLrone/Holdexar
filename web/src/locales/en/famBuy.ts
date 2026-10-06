@@ -1,12 +1,6 @@
-/* English 词典 · famBuy（与 zh-CN/famBuy.ts 同构，key 必须逐一对齐）。
-   对应源文件：views/family/tabs/FamBuy.vue。
-
-   措辞对齐：
-   · Acquired —— B 表 / D5：「购入时间」与「入库时间」是同一个字段
-     （rt_time_acquired），一律 Acquired，不写 Date / Purchase date；
-   · Free / Snapshot / Exclusive only —— B 表；
-   · Bills —— 沿用 shell.nav.bills 的既有英文（本按钮正跳到 /bills）；
-   · family library —— A 表「家庭库」。 */
+/* English 词典 · famBuy —— views/family/tabs/FamBuy.vue（与 zh-CN/famBuy.ts 同构，key 必须逐一对齐）。
+   措辞沿用既有译法：Acquired（购入 / 入库同一字段 rt_time_acquired，不写 Date / Purchase date）/ Free / Snapshot /
+   Exclusive only / Bills（沿用 shell.nav.bills，本按钮正跳到 /bills）/ family library。 */
 
 import type { MessageKey } from '../zh-CN'
 

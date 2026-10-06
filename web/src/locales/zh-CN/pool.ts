@@ -1,27 +1,8 @@
-/* pool 词条 —— 监控池页（views/pool/Index.vue）。
-
-   本页四个分节（Steam 账户 / 监控地区 / 监控条目 / 添加条目对话框）共同
-   构成「监控池」的完整链路：绑定数据源 → 圈定抓取区服 → 浏览与增删池内
-   条目。页面名义是监控池——愿望单只是数据来源之一（账户 kinds 同时有
-   wishlist/owned 两类），文案全部取监控语义，「愿望单」一词只出现在
-   数据来源与类别标记处。
-
-   三个分节锚点 `pool.section.*` 是**共用**词条：既是 data-section 的属性值
-   （HlSectionRail 当 key 解释后渲染成气泡/aria-label），又是可见的
-   小标题本身，本页这两处文案逐字相同，故不另立重复条目。
-
-   几处刻意的对齐（跨模块同义分歧靠人维护，门禁看不出来）：
-   · 账户的「愿望单 / 已购」徽章沿用 gameCard.status.wishlist / .owned
-     的既有译法（kinds 的两个维度都是 Steam 侧的原文概念）；
-   · 「绑定」这一动作取 dashboard 页的英文说法 bind（dashboard.toast.noAccounts
-     的引导正指向本页）；
-   · 监控地区的三件动作（保存 / 全选 / 清空）是通用动作，走 common.*，
-     不在本模块重复立条；
-   · 添加对话框的「识别到 N 个 AppID」复用 crawl.import.detected /
-     .detectedInvalid——同一份粘贴解析在两个入口逐字相同。
-
-   三段同步结果文案（新增/新增+爬取/无新增）各自成条，不在组件侧用 + 拼：
-   「，已自动开始爬取」是随条件增减的一整个分句，中英语序不同。 */
+/* pool 词条 —— 监控池页（views/pool/Index.vue）。文案全部取监控语义，「愿望单」只出现在数据来源与类别标记处。
+   分节锚点 pool.section.* 一条定义两处消费（data-section 属性值 + 可见小标题）。
+   复用：账户徽章沿用 gameCard.status.wishlist/.owned 译法；「绑定」沿用 dashboard 的 bind；
+   通用动作走 common.*；「识别到 N 个 AppID」复用 crawl.import.detected/.detectedInvalid。
+   不变量：三段同步结果文案各自成条、组件侧不拼片段（「，已自动开始爬取」是随条件增减的整分句）。 */
 
 const pool = {
   /* ── 分节锚点（data-section 属性值 + 可见小标题共用）── */
@@ -105,7 +86,7 @@ const pool = {
   'pool.items.noKindMatch': '这个类别下还没有游戏。',
   /* Steam 账户区空态：账号能力专属（绑定后愿望单/已购自动进关注），不冒充全局前置 */
   'pool.accounts.empty': '还没有绑定 Steam 账号——绑定后，愿望单和已购游戏会自动进入关注。',
-  'pool.items.empty': '还没有关注任何游戏——到「找游戏」页点卡片上的星标关注，或点上方「添加条目」。',
+  'pool.items.empty': '还没有关注任何游戏——到「游戏商店」页点卡片上的星标关注，或点上方「添加条目」。',
 } as const
 
 export default pool

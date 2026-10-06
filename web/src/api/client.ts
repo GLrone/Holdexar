@@ -170,6 +170,8 @@ export interface SettingsPayload {
   update_notify: boolean
   /** 静默自动更新：true = 检测到新版本后台自动下载校验，不打扰，下次启动换装 */
   update_auto: boolean
+  /** 直连模式加速器建议弹窗已看过：false = 首次使用直连（自动弹一次） */
+  direct_notice_seen: boolean
 }
 
 // ─── regions（区服元数据单一来源：服务端下发，前端零硬编码）───
@@ -229,6 +231,8 @@ export const settingsApi = {
     update_notify?: boolean
     /** 静默自动更新开关 */
     update_auto?: boolean
+    /** 直连模式加速器建议弹窗已看过 */
+    direct_notice_seen?: boolean
   }) => request<SettingsPayload>('PUT', '/settings', payload),
   getFetch: () => request<FetchSettingsPayload>('GET', '/settings/fetch'),
   updateFetch: (payload: Partial<FetchSettingsPayload>) =>
@@ -454,11 +458,15 @@ export type PilotFacts =
   | PilotStepperFacts
 
 /** agent 时间线步骤：label 对应词条键 `pilot.step.{label}`，data 供词条插值。
- *  status = ok / empty / denied；running 只存在于流式过程中的本地态。 */
+ *  status = ok / empty / denied / timeout / failed；running 与耗时只存在于流式过程的本地态。 */
 export interface PilotStep {
   label: string
-  status: 'ok' | 'empty' | 'denied' | 'running'
+  status: 'ok' | 'empty' | 'denied' | 'timeout' | 'failed' | 'running'
   data: { count?: number; name?: string | null; target?: string; path?: string }
+  /** 本次工具执行耗时（毫秒）：执行期随心跳帧刷新，完成态取服务端下发值 */
+  elapsedMs?: number
+  /** 执行开始的本地时刻（仅运行态）：心跳帧之间按它插值显示已用秒数 */
+  startedAt?: number
 }
 
 /** agent 循环的一步（阶段）：该步的思考、前言正文与工具步骤同属一条记录 */
@@ -673,17 +681,25 @@ export interface PilotSessionListItem {
 }
 
 export interface PilotStreamEvent {
-  type: 'ack' | 'busy' | 'step_start' | 'thinking' | 'answer' | 'tool_start' | 'tool' | 'facts' | 'done' | 'error'
+  type: 'ack' | 'busy' | 'step_start' | 'thinking' | 'answer' | 'tool_start' | 'tool_progress' | 'tool' | 'card' | 'facts' | 'done' | 'error'
   /** ack：全局在飞轮数（含本轮）——供应商按 Key 排队时前端据此显示等待态 */
   active?: number
   /** step_start：进入第几步（阶段边界，先于该步任何增量） */
   step?: number
   delta?: string
   name?: string
+  /** tool_start：预期产出卡片类型（骨架占位提示；不产卡的工具为 null/缺省） */
+  card_kind?: string | null
+  /** card：卡片结算帧（每个完成工具一帧，card=null = 本工具无卡，前端撤骨架） */
+  card?: PilotFacts | null
   /** tool / tool_start 事件的步骤词条片段与终态（见 PilotStep） */
   label?: string
   status?: PilotStep['status']
   data?: PilotStep['data']
+  /** tool：本次工具执行耗时（毫秒） */
+  duration_ms?: number
+  /** tool_progress：执行期已用时长（毫秒），执行期心跳帧 */
+  elapsed_ms?: number
   facts?: PilotFacts | null
   answer?: string
   /** 推理模型思维链原文；普通模型或降级路径为 null */
@@ -2121,6 +2137,8 @@ export const proxiesApi = {
       warning?: string
       kernelInstalled?: boolean
       kernelVersion?: string | null
+      /** 订阅有效且导入时处于默认直连：已自动切到代理优先 */
+      strategySwitched?: boolean
     }>('POST', '/proxies/subscriptions', { kind, url, label }),
   removeSubscription: (id: number) =>
     request<{ removed: boolean }>('DELETE', `/proxies/subscriptions/${id}`),
@@ -2160,6 +2178,8 @@ export const proxiesApi = {
       skipped: number
       checked?: number
       alive?: number
+      /** 订阅有效且导入时处于默认直连：已自动切到代理优先 */
+      strategySwitched?: boolean
     }>('POST', `/proxies/subscriptions/${id}/import`),
   /** 当前代理策略下解析出的代理 URL（null=直连）；商店页空态诊断用 */
   resolveProxy: () => request<{ proxyUrl: string | null }>('GET', '/proxies/resolve'),

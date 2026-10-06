@@ -1,8 +1,4 @@
 <script setup lang="ts">
-/**
- * 领航台游戏对比卡：2~3 款并排，按行比较现价 / 距史低 / 较近一年中位价 / 好评，
- * 每行最优项高亮。样式只取设计 token。
- */
 import { computed } from 'vue'
 
 import type { PilotCompareFacts } from '@/api/client'
@@ -26,13 +22,11 @@ function nameOf(g: Item): string {
   return g.name || `AppID ${g.appid}`
 }
 
-/** 距史低（分）：现价 − 史低，<=0 即当前就是史低 */
 function gapLow(g: Item): number | null {
   if (typeof g.cnyFen !== 'number' || typeof g.lowestFen !== 'number') return null
   return Math.max(0, g.cnyFen - g.lowestFen)
 }
 
-/** 较近一年中位价的百分比偏差（负 = 便宜于常态） */
 function vsMedian(g: Item): number | null {
   if (typeof g.cnyFen !== 'number' || !g.medianFen) return null
   return Math.round(((g.cnyFen - g.medianFen) / g.medianFen) * 100)
@@ -45,7 +39,6 @@ function bestIndex(values: (number | null)[], dir: 'min' | 'max'): number {
     if (best < 0) best = i
     else if (dir === 'min' ? v < (values[best] as number) : v > (values[best] as number)) best = i
   })
-  // 全部相同没有"最优"可言
   const real = values.filter((v): v is number => v !== null)
   return real.length > 1 && real.every((v) => v === real[0]) ? -1 : best
 }
@@ -56,7 +49,7 @@ const bestMedian = computed(() => bestIndex(props.card.items.map(vsMedian), 'min
 const bestRating = computed(() => bestIndex(props.card.items.map((g) => positivePct(g.positiveRate)), 'max'))
 
 const gridStyle = computed(() => ({
-  gridTemplateColumns: `52px repeat(${props.card.items.length}, minmax(88px, 1fr))`,
+  gridTemplateColumns: `72px repeat(${props.card.items.length}, minmax(100px, 1fr))`,
 }))
 
 function pctText(v: number | null): string {
@@ -67,10 +60,17 @@ function pctText(v: number | null): string {
 
 <template>
   <div class="pcmp">
-    <div class="pcmp__title">{{ t('pilot.compare.title') }}</div>
+    <div class="pcmp__header">
+      <svg class="pcmp__header-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+      </svg>
+      <span class="pcmp__title">{{ t('pilot.compare.title') }}</span>
+    </div>
+
     <div class="pcmp__scroll">
       <div class="pcmp__grid" :style="gridStyle">
-        <span></span>
+        <span class="pcmp__corner"></span>
         <router-link
           v-for="g in card.items"
           :key="`h${g.appid}`"
@@ -85,51 +85,61 @@ function pctText(v: number | null): string {
           <span class="pcmp__name" :title="nameOf(g)">{{ nameOf(g) }}</span>
         </router-link>
 
+        <!-- 现价对比行 -->
         <span class="pcmp__k">{{ t('pilot.compare.price') }}</span>
-        <span
+        <div
           v-for="(g, i) in card.items"
           :key="`p${g.appid}`"
           class="pcmp__v pcmp__v--price"
           :class="{ 'is-best': i === bestPrice }"
         >
-          {{ fen(g.cnyFen) }}
-          <b v-if="g.discount" class="pcmp__disc">-{{ g.discount }}%</b>
-          <small v-if="g.region" class="pcmp__region">{{ g.region }}</small>
-        </span>
+          <span class="pcmp__price-num">{{ fen(g.cnyFen) }}</span>
+          <span v-if="g.discount" class="pcmp__disc">-{{ g.discount }}%</span>
+          <span v-if="i === bestPrice" class="pcmp__best-badge">
+            {{ t('pilot.regions.cheapest') }}
+          </span>
+        </div>
 
+        <!-- 距史低行 -->
         <span class="pcmp__k">{{ t('pilot.compare.vsLow') }}</span>
-        <span
+        <div
           v-for="(g, i) in card.items"
           :key="`l${g.appid}`"
           class="pcmp__v"
           :class="{ 'is-best': i === bestLow }"
         >
           <template v-if="gapLow(g) === null">—</template>
-          <template v-else-if="gapLow(g) === 0">{{ t('pilot.compare.atLow') }}</template>
+          <span v-else-if="gapLow(g) === 0" class="pcmp__tag-at-low">{{ t('pilot.compare.atLow') }}</span>
           <template v-else>+{{ fen(gapLow(g)) }}</template>
-        </span>
+        </div>
 
+        <!-- 较一年中位价行 -->
         <span class="pcmp__k">{{ t('pilot.compare.vsMedian') }}</span>
-        <span
+        <div
           v-for="(g, i) in card.items"
           :key="`m${g.appid}`"
           class="pcmp__v"
           :class="{ 'is-best': i === bestMedian }"
         >
-          {{ pctText(vsMedian(g)) }}
-        </span>
+          <span :class="vsMedian(g) != null && vsMedian(g)! < 0 ? 'pcmp__diff-good' : 'pcmp__diff-high'">
+            {{ pctText(vsMedian(g)) }}
+          </span>
+        </div>
 
+        <!-- 好评率行 -->
         <span class="pcmp__k">{{ t('pilot.compare.rating') }}</span>
-        <span
+        <div
           v-for="(g, i) in card.items"
           :key="`r${g.appid}`"
           class="pcmp__v pcmp__rating"
           :class="[ratingClass(g.positiveRate), { 'is-best': i === bestRating }]"
         >
           <template v-if="positivePct(g.positiveRate) === null">—</template>
-          <template v-else>{{ positivePct(g.positiveRate) }}%</template>
-          <small v-if="g.reviewCount">{{ countFmt.format(g.reviewCount) }}</small>
-        </span>
+          <template v-else>
+            <span class="pcmp__rate-val">{{ positivePct(g.positiveRate) }}%</span>
+            <small v-if="g.reviewCount" class="pcmp__review-cnt">({{ countFmt.format(g.reviewCount) }})</small>
+          </template>
+        </div>
       </div>
     </div>
   </div>
@@ -137,48 +147,71 @@ function pctText(v: number | null): string {
 
 <style scoped>
 .pcmp {
-  display: grid;
-  gap: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
   max-width: 100%;
   min-width: 0;
-  overflow: hidden;
+}
+
+.pcmp__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.pcmp__header-icon {
+  width: 15px;
+  height: 15px;
+  color: var(--accent);
 }
 
 .pcmp__scroll {
   width: 100%;
   max-width: 100%;
   overflow-x: auto;
-  padding-bottom: 3px;
-}
-
-.pcmp__title {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-secondary);
+  padding-bottom: 4px;
 }
 
 .pcmp__grid {
   display: grid;
   align-items: center;
-  gap: 8px 6px;
+  gap: 8px 10px;
   font-size: 12px;
   min-width: fit-content;
 }
 
+.pcmp__corner {
+  display: block;
+}
+
 .pcmp__game {
-  display: grid;
-  gap: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
   min-width: 0;
+  text-decoration: none;
+  color: inherit;
+  transition: transform var(--transition);
+}
+
+.pcmp__game:hover {
+  transform: translateY(-2px);
 }
 
 .pcmp__cover {
   width: 100%;
   aspect-ratio: 460 / 215;
-  border-radius: 5px;
+  border-radius: var(--radius-sm);
   overflow: hidden;
   background: var(--surface-inset);
+  border: 1px solid var(--border-soft);
   display: grid;
   place-items: center;
+  box-shadow: 0 2px 6px var(--surface-inset);
 }
 
 .pcmp__cover :deep(img) {
@@ -190,7 +223,7 @@ function pctText(v: number | null): string {
 
 .pcmp__cover-fallback {
   font-size: 11px;
-  color: var(--text-secondary);
+  color: var(--text-muted);
 }
 
 .pcmp__name {
@@ -202,6 +235,7 @@ function pctText(v: number | null): string {
   font-weight: 600;
   line-height: 1.3;
   color: var(--text-primary);
+  text-align: center;
 }
 
 .pcmp__game:hover .pcmp__name {
@@ -210,63 +244,102 @@ function pctText(v: number | null): string {
 
 .pcmp__k {
   font-size: 11px;
-  color: var(--text-secondary);
+  font-weight: 500;
+  color: var(--text-muted);
 }
 
 .pcmp__v {
   min-width: 0;
-  padding: 3px 4px;
-  border-radius: 6px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-chip);
+  border: 1px solid var(--border-soft);
   text-align: center;
   color: var(--text-primary);
-}
-
-.pcmp__v.is-best {
-  background: var(--accent-a15);
-  color: var(--accent);
-  font-weight: 700;
-}
-
-.pcmp__v--price {
   display: flex;
-  flex-wrap: wrap;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
   gap: 3px;
+  font-size: 12px;
+}
+
+.pcmp__v.is-best {
+  background: var(--accent-a08);
+  border-color: var(--accent-a30);
+  font-weight: 600;
+}
+
+.pcmp__v--price {
+  gap: 4px;
+}
+
+.pcmp__price-num {
   font-size: 14px;
   font-weight: 700;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
 }
 
 .pcmp__disc {
-  padding: 0 4px;
-  border-radius: 4px;
+  padding: 1px 4px;
+  border-radius: var(--radius-sm);
   background: var(--success);
   color: var(--ink-on-fill);
   font-size: 10px;
   font-weight: 700;
 }
 
-.pcmp__region,
-.pcmp__rating small {
-  margin-left: 3px;
+.pcmp__best-badge {
   font-size: 10px;
-  font-weight: 400;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--success);
+  color: var(--ink-on-fill);
+  font-weight: 600;
+}
+
+.pcmp__tag-at-low {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--success-a15);
+  color: var(--success);
+  font-weight: 600;
+  font-size: 11px;
+}
+
+.pcmp__diff-good {
+  color: var(--success);
+  font-weight: 600;
+}
+
+.pcmp__diff-high {
   color: var(--text-secondary);
 }
 
 .pcmp__rating {
+  font-size: 12px;
+}
+
+.pcmp__rate-val {
+  font-weight: 600;
+}
+
+.pcmp__rating.good .pcmp__rate-val {
   color: var(--success);
 }
 
-.pcmp__rating.medium {
+.pcmp__rating.medium .pcmp__rate-val {
   color: var(--warning);
 }
 
-.pcmp__rating.low {
-  color: var(--text-secondary);
+.pcmp__rating.low .pcmp__rate-val {
+  color: var(--danger);
 }
 
-.pcmp__rating.is-best {
-  color: var(--accent);
+.pcmp__review-cnt {
+  font-size: 10px;
+  color: var(--text-faint);
 }
 </style>

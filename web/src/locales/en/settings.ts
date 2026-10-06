@@ -1,13 +1,6 @@
-/* English 词典 · settings（与 zh-CN/settings.ts 同构，key 必须逐一对齐）。
-
-   `settings.section.steamAccount` 的值**不是自由文案**：ProductTour 的
-   `target: '[data-section="settings.section.steamAccount"]'` 与视图侧
-   data-section 用的是 key 串本身，与这里显示成什么无关——但改 key 会同时
-   掐断两处，别动。
-
-   `update.networkPost` / `update.noReleasePost` **带前导空格**（拼在
-   「releases page」链接节点之后，模板空白节点在 `</a>` 与 `{{ }}` 之间
-   不保留），同 zh 侧说明，不是笔误。 */
+/* English 词典 · settings —— views/settings/Index.vue（与 zh-CN/settings.ts 同构，key 必须逐一对齐）。
+   契约：settings.section.steamAccount 的 key 被 ProductTour 的 target 逐字引用，与显示值无关，改 key 会同时掐断两处。
+   不变量：update.networkPost / update.noReleasePost 带前导空格（拼在 releases page 链接节点之后，模板空白节点不保留），不是笔误。 */
 
 import type { MessageKey } from '../zh-CN'
 

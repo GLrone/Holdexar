@@ -1,14 +1,8 @@
-/* English 词典 · family（与 zh-CN/family.ts 同构，key 必须逐一对齐）。
-   对应源文件：views/family/Index.vue。
-
-   术语锁定分 A / B 两组，逐字照抄，不要另起译法：
-   · Family / family library / shared library（后者是另一个集合）
-   · contribution split / acquisition heatmap / value insights
-   · Member insights / Purchase activity / Play activity / Exclusive
-   · `family.member.recent30` 的数据口径是**入库**不是游玩，故用 "Acquired in
-     last 30 days"，**不用 active**（D6）。
-   · `family.role.family`（'Family'）与 `family.role.familyMember`
-     （'family member'）是刻意的长短分工，别统一成一条。 */
+/* English 词典 · family —— views/family/Index.vue（与 zh-CN/family.ts 同构，key 必须逐一对齐）。
+   术语锁定：Family / family library / shared library（另一个集合）/ contribution split / acquisition heatmap /
+   value insights / Member insights / Purchase activity / Play activity / Exclusive。
+   不变量：family.member.recent30 口径是入库非游玩，用 "Acquired in last 30 days"、不用 active；
+   family.role.family（'Family'）与 family.role.familyMember（'family member'）是长短分工，不统一成一条。 */
 
 import type { MessageKey } from '../zh-CN'
 

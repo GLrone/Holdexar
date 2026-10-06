@@ -14,7 +14,7 @@ const fetchPage: Partial<Record<MessageKey, string>> = {
     "Humble Choice is a monthly game bundle. Keep this on and each month's lineup is collected automatically, with a summary email.",
   'fetch.boards.label': 'Steam charts',
   'fetch.boards.desc':
-    "Fetches Steam's top sellers, specials, new releases and coming-soon charts — the popular games on Find Games come from here.",
+    "Fetches Steam's top sellers, specials, new releases and coming-soon charts — the popular games on Store come from here.",
   'fetch.bundleCounts.label': 'Bundle records',
   'fetch.bundleCounts.desc':
     "Keeps track of which deal bundles each game has appeared in, shown on the Bundles page and game details. When off, these records stop updating.",

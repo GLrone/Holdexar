@@ -22,6 +22,7 @@ import { mdLiteToHtml } from '@/lib/markdownLite'
 import { buildCtxSegments, shouldShowCacheHitRate } from '@/lib/ctxSegments'
 import { fmtTokens, pilotCoverUrl, positivePct, ratingClass, sessionTime } from '@/lib/pilotView'
 import HlImg from '@/components/ui/HlImg.vue'
+import HlSkeleton from '@/components/ui/HlSkeleton.vue'
 import HlPilotCards from '@/components/business/HlPilotCards.vue'
 import HlPilotChain from '@/components/business/HlPilotChain.vue'
 import HlPilotOutline from '@/components/business/HlPilotOutline.vue'
@@ -84,10 +85,17 @@ const question = ref('')
 const streaming = ref(false)
 /** 本轮流式阶段的活账本：step_start 开新段，思考/正文/工具按段归位 */
 const livePhases = ref<PilotPhase[]>([])
-// 排队可见性：供应商按 Key 串行时第二个会话长时间无增量——ack.active>1 或
-// 受理后 8s 无模型事件时提示「等待模型」，把「卡住」变成「排队中」
-const queuedHint = ref<'parallel' | 'waiting' | null>(null)
+// 排队可见性：供应商按 Key 串行 / 工具执行期都可能长时间无增量——ack.active>1
+// 直接提示，其余每段静默（模型等待 / 工具执行）重新武装 8s 提示，把「卡住」变成「进行中」
+const queuedHint = ref<'parallel' | 'waiting' | 'toolSlow' | null>(null)
 let queuedTimer: ReturnType<typeof setTimeout> | null = null
+
+/** 静默计时：每段静默开始时武装一次；期间收到任何内容即由 clearQueuedHint 撤下 */
+function armQueuedHint(kind: 'waiting' | 'toolSlow') {
+  if (queuedTimer !== null) clearTimeout(queuedTimer)
+  queuedHint.value = null
+  queuedTimer = setTimeout(() => { if (streaming.value) queuedHint.value = kind }, 8000)
+}
 
 function clearQueuedHint() {
   if (queuedTimer !== null) {
@@ -98,6 +106,50 @@ function clearQueuedHint() {
 }
 /** 流式期步骤展平（过程链的旧口径 prop；阶段记录在场时以 phases 为准） */
 const liveStepsFlat = computed(() => livePhases.value.flatMap((p) => p.steps))
+/* 终答就位渲染：文字在回答层原位生长（与终态布局同序），done 不再翻转 */
+const liveAnswerHtml = computed(() => {
+  const text = livePhases.value.map((p) => p.text).join('')
+  return text ? mdLiteToHtml(text) : ''
+})
+
+/** 流式期即时卡片账：tool_start 按类型预告挂骨架占位，card 事件原位填充——
+ *  卡片在终态前先可见，done 整轮替换时高度已就位，不再整块砸出。 */
+interface LiveCardEntry {
+  key: number
+  name: string
+  kind: string | null
+  card: PilotFacts | null
+}
+let liveCardSeq = 0
+const liveCards = ref<LiveCardEntry[]>([])
+const liveRealCards = computed(() =>
+  liveCards.value.map((e) => e.card).filter((c): c is PilotFacts => Boolean(c)))
+
+function pushLiveSkeleton(name: string, kind: string | null) {
+  liveCards.value.push({ key: ++liveCardSeq, name, kind, card: null })
+}
+
+function dropLiveSkeleton(name: string) {
+  const idx = liveCards.value.findIndex((e) => e.name === name && !e.card)
+  if (idx >= 0) liveCards.value.splice(idx, 1)
+}
+
+function fillLiveCard(name: string, card: PilotFacts) {
+  const idx = liveCards.value.findIndex((e) => e.name === name && !e.card)
+  if (idx >= 0) {
+    liveCards.value[idx] = { ...liveCards.value[idx], card }
+  } else {
+    // 无预告骨架（提示表未覆盖的工具）：直接追加实体卡，先到先渲染不受影响
+    liveCards.value.push({ key: ++liveCardSeq, name, kind: card.kind ?? null, card })
+  }
+}
+
+function dropUnresolvedCards() {
+  if (liveCards.value.some((e) => !e.card)) {
+    liveCards.value = liveCards.value.filter((e) => e.card)
+  }
+}
+
 const turns = ref<Turn[]>([])
 // 会话 id：跨表面持久（localStorage）——抽屉/整页/重启应用后续接同一会话，
 // 追问与指代靠它串起；「新对话」重新生成。
@@ -220,6 +272,7 @@ const REASON_KEYS: Record<string, MessageKey> = {
   no_data: 'pilot.reason.no_data',
   need_target: 'pilot.reason.need_target',
   session_busy: 'pilot.reason.busy',
+  max_steps: 'pilot.reason.max_steps',
 }
 
 const SESSION_KEY = 'holdexar-pilot-session-id'
@@ -673,6 +726,8 @@ async function onProposal(payload: { pid: string; approve: boolean }) {
       failedCount: res.failed?.length ?? 0,
     })
     for (const turn of turns.value) syncProposalCards(turn.cards ?? [])
+    // 流式期即时卡同步提议终态（live 区与终态轮同一账）
+    syncProposalCards(liveRealCards.value)
   } catch {
     message.error(t('pilot.error'))
   } finally {
@@ -992,6 +1047,7 @@ async function ask(text?: string) {
   streaming.value = true
   abortCtrl = new AbortController()
   livePhases.value = []
+  liveCards.value = []
   clearQueuedHint()
   loadingSeq.value += 1
   // 用户发言立即上屏（pending 占位轮，回复完成后原位替换）；跟随复位——刚发的消息必须看着它长出来
@@ -1010,14 +1066,15 @@ async function ask(text?: string) {
       if (e.type === 'ack') {
         // 受理回执：另一会话在处理 → 并行提示；否则 8s 无增量再提示等待模型
         if ((e.active ?? 1) > 1) queuedHint.value = 'parallel'
-        else queuedTimer = setTimeout(() => { if (streaming.value) queuedHint.value = 'waiting' }, 8000)
+        else armQueuedHint('waiting')
       } else if (e.type === 'busy') {
         done = { answer: '', thinking: null, source: 'none', reason: 'session_busy', facts: null, cards: [], cached: false }
         clearQueuedHint()
       } else if (e.type === 'step_start') {
-        clearQueuedHint()
-        // 阶段边界：先冲刷上一段残留增量，再开新段
+        // 阶段边界：先冲刷上一段残留增量，再开新段；本段模型静默重新计时
+        armQueuedHint('waiting')
         flushDeltas()
+        dropUnresolvedCards()
         livePhases.value.push({ step: e.step ?? livePhases.value.length + 1, thinking: '', text: '', steps: [] })
       } else if (e.type === 'thinking' && e.delta) {
         clearQueuedHint()
@@ -1026,13 +1083,21 @@ async function ask(text?: string) {
         clearQueuedHint()
         queueDelta('answer', e.delta)
       } else if (e.type === 'tool_start') {
-        clearQueuedHint()
+        // 执行期由 tool_progress 续命；两者都断炊时按 8s 提示"仍在执行"
+        armQueuedHint('toolSlow')
         flushDeltas()
         // 导航直通等路径不发阶段定界，按首段兜底
         if (!livePhases.value.length) {
           livePhases.value.push({ step: 1, thinking: '', text: '', steps: [] })
         }
-        currentPhase()?.steps.push({ label: e.label ?? '', status: 'running', data: {} })
+        currentPhase()?.steps.push({ label: e.label ?? '', status: 'running', data: {}, startedAt: Date.now() })
+        // 卡片类型预告：执行期先挂骨架占位（结果到达前高度先就位）
+        if (e.card_kind) pushLiveSkeleton(e.name ?? '', e.card_kind)
+      } else if (e.type === 'tool_progress') {
+        // 执行期心跳：已用时长以服务端读数为准（前端本地表只作帧间插值）
+        const step = currentPhase()?.steps.find((s) => s.status === 'running')
+        if (step) step.elapsedMs = e.elapsed_ms ?? step.elapsedMs
+        armQueuedHint('toolSlow')
       } else if (e.type === 'tool') {
         // 回填本阶段最后一个运行态步骤；无运行态（如重放）直接追加
         const phase = currentPhase()
@@ -1041,14 +1106,21 @@ async function ask(text?: string) {
           pending.label = e.label ?? pending.label
           pending.status = e.status ?? 'ok'
           pending.data = e.data ?? {}
+          pending.elapsedMs = e.duration_ms ?? pending.elapsedMs
+          pending.startedAt = undefined
         } else if (phase) {
-          phase.steps.push({ label: e.label ?? '', status: e.status ?? 'ok', data: e.data ?? {} })
+          phase.steps.push({ label: e.label ?? '', status: e.status ?? 'ok', data: e.data ?? {}, elapsedMs: e.duration_ms })
         }
+        clearQueuedHint()
         if (e.name === 'navigate' && e.status === 'ok' && e.data?.path && !navApplied) {
           navApplied = true
           void router.push(e.data.path)
           setTimeout(focusMainRegion, 700)
         }
+      } else if (e.type === 'card') {
+        // 结算帧：每个完成工具一帧，card=null = 本工具无卡（撤骨架）
+        if (e.card) fillLiveCard(e.name ?? '', e.card)
+        else dropLiveSkeleton(e.name ?? '')
       } else if (e.type === 'done') {
         done = e as PilotAskResponse
         clearQueuedHint()
@@ -1092,13 +1164,14 @@ async function ask(text?: string) {
     // 失败还原输入（用户没在新输入时才还原，可一键重试）
     if (!question.value.trim()) question.value = q
   } else if (stopped) {
-    // 中断保留已流出的阶段与终答候选，历史轮仍可展开过程
+    // 中断保留已流出的阶段与终答候选，历史轮仍可展开过程；已即时下发的卡片一并保留
     turn = {
       q,
       kind: 'answer',
       text: answerOf(phaseSnapshot, ''),
       phases: phaseSnapshot.length ? phaseSnapshot : undefined,
       steps: snapshotSteps,
+      cards: liveRealCards.value.length ? [...liveRealCards.value] : undefined,
       stopped: true,
     } as Turn
   } else {
@@ -1469,6 +1542,16 @@ function triggerFollowUp(prompt: string) {
 
         <!-- agent 回复层：与用户气泡两种图层的统一左对齐面板；pending 轮只上屏发言，回复侧由下方 live 区承担 -->
         <div v-if="turn.kind !== 'pending'" class="pilot-reply">
+          <div class="pilot-reply__header">
+            <span class="pilot-reply__avatar">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="10" />
+                <polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76" />
+              </svg>
+            </span>
+            <span class="pilot-reply__role">Pilot</span>
+          </div>
+
           <!-- agent 过程链：链头一行摘要（工时+步数），展开看思考/步骤/记忆；done.steps 全量回填 -->
           <HlPilotChain
             v-if="turn.phases?.length || turn.think || turn.steps.length"
@@ -1488,34 +1571,40 @@ function triggerFollowUp(prompt: string) {
 
           <div v-else-if="turn.kind === 'candidates'" class="pilot-briefing">
             <div class="pilot-briefing__title">{{ turn.reasonKey ? t(turn.reasonKey) : '' }}</div>
-            <button
-              v-for="(g, gi) in turn.items"
-              :key="gi"
-              type="button"
-              class="pilot-cand"
-              :class="{ 'is-locked': i !== turns.length - 1 }"
-              @click="pickCandidate(turn, gi)"
-            >
-              <HlImg
-                :src="pilotCoverUrl(g.appid)"
-                :alt="g.name || `AppID ${g.appid}`"
-                loading="lazy"
-                class="pilot-cand__cover"
+            <div class="pilot-cands-grid">
+              <button
+                v-for="(g, gi) in turn.items"
+                :key="gi"
+                type="button"
+                class="pilot-cand"
+                :class="{ 'is-locked': i !== turns.length - 1 }"
+                @click="pickCandidate(turn, gi)"
               >
-                <template #fallback>
-                  <span class="pilot-cand__cover-fallback">{{ (g.name || `AppID ${g.appid}`).slice(0, 2) }}</span>
-                </template>
-              </HlImg>
-              <span class="pilot-cand__name">{{ gi + 1 }}. {{ g.name }}</span>
-              <span
-                v-if="typeof g.positiveRate === 'number' && g.positiveRate > 0"
-                class="pilot-cand__rating"
-                :class="ratingClass(g.positiveRate)"
-              >{{ positivePct(g.positiveRate) }}%</span>
-              <span class="pilot-cand__meta">
-                {{ fen(g.cnyFen) }}<template v-if="g.discount"> · -{{ g.discount }}%</template>
-              </span>
-            </button>
+                <span class="pilot-cand__idx">{{ gi + 1 }}</span>
+                <HlImg
+                  :src="pilotCoverUrl(g.appid)"
+                  :alt="g.name || `AppID ${g.appid}`"
+                  loading="lazy"
+                  class="pilot-cand__cover"
+                >
+                  <template #fallback>
+                    <span class="pilot-cand__cover-fallback">{{ (g.name || `AppID ${g.appid}`).slice(0, 2) }}</span>
+                  </template>
+                </HlImg>
+                <div class="pilot-cand__main">
+                  <span class="pilot-cand__name" :title="g.name">{{ g.name }}</span>
+                  <div class="pilot-cand__meta">
+                    <span
+                      v-if="typeof g.positiveRate === 'number' && g.positiveRate > 0"
+                      class="pilot-cand__rating"
+                      :class="ratingClass(g.positiveRate)"
+                    >{{ positivePct(g.positiveRate) }}%</span>
+                    <span class="pilot-cand__price">{{ fen(g.cnyFen) }}</span>
+                    <span v-if="g.discount" class="pilot-cand__disc">-{{ g.discount }}%</span>
+                  </div>
+                </div>
+              </button>
+            </div>
           </div>
 
           <HlPilotCards v-else-if="turn.kind === 'action'" :cards="turn.cards ?? []" />
@@ -1568,16 +1657,45 @@ function triggerFollowUp(prompt: string) {
 
       <div v-if="streaming" class="pilot-turn">
         <div class="pilot-reply">
+          <div class="pilot-reply__header">
+            <span class="pilot-reply__avatar is-live">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="10" />
+                <polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76" />
+              </svg>
+            </span>
+            <span class="pilot-reply__role">Pilot</span>
+          </div>
+
           <!-- 运行中过程链：阶段块随定界逐个长出，每段正文随所在阶段就地展示；
                完成时原位替换为历史链，终答正文改由回答层承接 -->
           <HlPilotChain
             live
+            hide-phase-text
             :steps="liveStepsFlat"
             :phases="livePhases"
             :waiting-text="loadingText"
           />
+          <!-- 终答就位：文字流式期即在回答层原位生长，卡片在其下，done 零翻转 -->
+          <div v-if="liveAnswerHtml" class="pilot-answer" v-html="liveAnswerHtml"></div>
+          <!-- 即时卡片：工具执行期先挂骨架占位，card 事件到达原位填充（终态前先见卡） -->
+          <div v-if="liveCards.length" class="pilot-live-cards">
+            <template v-for="entry in liveCards" :key="entry.key">
+              <HlPilotCards
+                v-if="entry.card"
+                :cards="[entry.card]"
+                :busy-pid="busyPid"
+                @proposal="onProposal"
+              />
+              <div v-else class="pilot-live-card-skel" role="status" aria-busy="true">
+                <HlSkeleton variant="title" />
+                <HlSkeleton variant="text" :rows="3" />
+              </div>
+            </template>
+          </div>
           <div v-if="queuedHint" class="pilot-queued">
-            {{ t(queuedHint === 'parallel' ? 'pilot.queued.parallel' : 'pilot.queued.waiting') }}
+            {{ t(queuedHint === 'parallel' ? 'pilot.queued.parallel'
+              : queuedHint === 'toolSlow' ? 'pilot.queued.toolSlow' : 'pilot.queued.waiting') }}
           </div>
         </div>
       </div>
@@ -2673,6 +2791,26 @@ function triggerFollowUp(prompt: string) {
   50% { opacity: 1; }
 }
 
+/* 流式期即时卡片：与终态轮卡片同一视觉层（.pcard 同族），骨架占位先行 */
+.pilot-live-cards {
+  align-self: stretch;
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.pilot-live-card-skel {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  background: var(--bg-card);
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
 .pilot-compact__pill svg {
   width: 12px;
   height: 12px;
@@ -2709,34 +2847,75 @@ function triggerFollowUp(prompt: string) {
   max-width: 100%;
 }
 
-/* agent 回复统一图层：恒占满会话列宽（不随内容伸缩），与用户气泡（右对齐
-   accent 气泡）形成两种可辨识的层 */
+/* agent 回复统一图层：去盒子化，通透流式布局与 Agent 身份标 */
 .pilot-reply {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 10px 12px;
-  background: var(--bg-base);
-  border: 1px solid var(--border-soft);
-  border-radius: 4px 14px 14px 14px;
+  gap: 10px;
+  padding: 4px 0 10px;
+  background: transparent;
+  border: none;
   min-width: 0;
   max-width: 100%;
-  overflow: hidden;
   box-sizing: border-box;
+}
+
+.pilot-reply__header {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 2px;
+  align-self: flex-start;
+}
+
+.pilot-reply__avatar {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--surface-chip);
+  border: 1px solid var(--border-soft);
+  color: var(--accent);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.pilot-reply__avatar svg {
+  width: 13px;
+  height: 13px;
+}
+
+.pilot-reply__avatar.is-live {
+  background: var(--accent-a15);
+  border-color: var(--accent);
+  animation: pavatar-pulse 1.8s ease-in-out infinite alternate;
+}
+
+@keyframes pavatar-pulse {
+  from { box-shadow: 0 0 0 1px var(--accent-a20); }
+  to { box-shadow: 0 0 0 4px var(--accent-a20); }
+}
+
+.pilot-reply__role {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
 }
 
 .pilot-turn__q {
   align-self: flex-end;
-  max-width: 88%;
+  max-width: 82%;
   margin: 0;
-  padding: 7px 12px;
-  background: var(--accent-a10);
-  border-radius: 14px 14px 4px 14px;
-  font-size: 12px;
+  padding: 10px 16px;
+  background: linear-gradient(135deg, var(--accent-a20), var(--accent-a10));
+  border: 1px solid var(--accent-a30);
+  border-radius: 18px 18px 4px 18px;
+  font-size: 13px;
   line-height: 1.6;
   color: var(--text-primary);
   white-space: pre-wrap;
   word-break: break-word;
+  box-shadow: 0 2px 8px var(--surface-inset-sm);
 }
 
 .pilot-composer .hl-button {
@@ -2908,34 +3087,53 @@ function triggerFollowUp(prompt: string) {
   color: var(--text-primary);
 }
 
+.pilot-cands-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+
 .pilot-cand {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  gap: 10px;
   width: 100%;
-  padding: 8px 12px;
+  padding: 8px 10px;
   border: 1px solid var(--border-soft);
-  border-radius: 8px;
-  background: var(--bg-card);
+  border-radius: var(--radius-sm);
+  background: var(--surface-card);
   cursor: pointer;
   text-align: left;
+  transition: all var(--duration-2) ease;
 }
 
-.pilot-cand + .pilot-cand {
-  margin-top: 6px;
+.pilot-cand:hover:not(.is-locked) {
+  border-color: var(--accent);
+  background: var(--accent-a08);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-sm);
 }
 
 .pilot-cand.is-locked {
   cursor: default;
-  opacity: 0.6;
+  opacity: 0.65;
+}
+
+.pilot-cand__idx {
+  flex: none;
+  width: 16px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-faint);
+  text-align: center;
 }
 
 .pilot-cand__cover {
   flex: none;
-  width: 72px;
+  width: 68px;
   aspect-ratio: 460 / 215;
-  border-radius: 5px;
+  border-radius: var(--radius-sm);
   overflow: hidden;
   background: var(--surface-inset);
   display: grid;
@@ -2950,14 +3148,22 @@ function triggerFollowUp(prompt: string) {
 }
 
 .pilot-cand__cover-fallback {
-  font-size: 11px;
-  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.pilot-cand__main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
 }
 
 .pilot-cand__name {
-  flex: 1;
-  min-width: 0;
   font-size: 13px;
+  font-weight: 500;
   color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2965,14 +3171,31 @@ function triggerFollowUp(prompt: string) {
 }
 
 .pilot-cand__meta {
-  font-size: 12px;
-  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
   white-space: nowrap;
 }
 
+.pilot-cand__price {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.pilot-cand__disc {
+  padding: 1px 4px;
+  border-radius: var(--radius-sm);
+  background: var(--success);
+  color: var(--ink-on-fill);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
 .pilot-cand__rating {
-  flex-shrink: 0;
   font-size: 11px;
+  font-weight: 600;
   color: var(--success);
 }
 
@@ -2981,7 +3204,7 @@ function triggerFollowUp(prompt: string) {
 }
 
 .pilot-cand__rating.low {
-  color: var(--text-secondary);
+  color: var(--text-muted);
 }
 
 .pilot-guide p {

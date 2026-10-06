@@ -31,6 +31,36 @@ const galleryCards: PilotFacts[] = [
     year: { minFen: 3100, maxFen: 12700, medianFen: 6200, count: 48 },
   },
   {
+    kind: 'regions',
+    appid: 292030,
+    name: 'The Witcher 3: Wild Hunt',
+    accountRegion: 'CN',
+    items: [
+      { region: 'UA', display: '₴450', cnyFen: 7800, discount: 50 },
+      { region: 'CN', display: '¥62.00', cnyFen: 6200, discount: 0 },
+      { region: 'US', display: '$19.99', cnyFen: 14200, discount: 0 },
+    ],
+    count: 3,
+  },
+  {
+    kind: 'compare',
+    items: [
+      { appid: 413150, name: 'Stardew Valley', positiveRate: 0.98, reviewCount: 900000, cnyFen: 4800, discount: 0, region: 'CN', lowestFen: 2800, medianFen: 4800 },
+      { appid: 1145360, name: 'Hades', positiveRate: 0.98, reviewCount: 300000, cnyFen: 8800, discount: 0, region: 'CN', lowestFen: 3800, medianFen: 8800 },
+    ],
+  },
+  {
+    kind: 'stepper',
+    title: 'Diagnostic Pipeline',
+    description: 'Scanning regional prices and inventory',
+    currentStepIndex: 1,
+    steps: [
+      { id: 1, title: 'Sync Wishlist', status: 'ok', detail: '18 items matched' },
+      { id: 2, title: 'Check Regional Rates', status: 'running', detail: 'Checked 14/17 regions', current: 14, total: 17 },
+      { id: 3, title: 'Generate Recommendations', status: 'wait' },
+    ],
+  },
+  {
     kind: 'games',
     items: [
       { appid: 413150, name: 'Stardew Valley', cnyFen: 4800, discount: 0, positiveRate: 0.98, reviewCount: 900000 },

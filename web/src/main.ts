@@ -14,7 +14,7 @@ import 'element-plus/theme-chalk/dark/css-vars.css'
 import * as ElementPlusIconsVue from '@element-plus/icons-vue'
 
 import './styles/tokens.css'
-// 框架标准层（hl-* 隔离类名，规范来源 web/public/component-framework.html）
+// 框架标准层（hl-* 隔离类名，规范来源 web/dev/component-framework.html）
 import './styles/hl-framework.css'
 // 库页/商店页的卡片与列表样式层（globals + gamecard 全量）
 import './styles/hl-globals.css'

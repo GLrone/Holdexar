@@ -433,6 +433,7 @@ const kindLabel = (kind: string) =>
     popularnew_backfill: t('crawl.kind.popularnewBackfill'),
     specials_backfill: t('crawl.kind.specialsBackfill'),
     comingsoon_backfill: t('crawl.kind.comingsoonBackfill'),
+    discounts: t('crawl.kind.discounts'),
   })[kind] ?? kind
 
 // ── 账户设置弹窗：按账户开关已购同步（库太大的账户可关，只盯愿望单）──

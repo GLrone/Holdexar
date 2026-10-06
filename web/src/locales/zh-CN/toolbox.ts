@@ -1,15 +1,7 @@
 /* toolbox 词条 —— views/toolbox/Index.vue（账户消费账单 + CDK 批量激活）。
-
-   两个分节锚点（`data-section="toolbox.section.bill" / "toolbox.section.cdk"`）
-   直接复用分节标题词条：HlSectionRail 读到后 t() 显示，DOM 锚点与语言无关；
-   标题与锚点一条定义两处消费，不存在「改了标题忘了锚点」的漂移面。
-
-   **本页的冻结陷阱集中在 CDK 侧**：进度文案、批次号、未绑 Cookie 提示都不能
-   写进 ref 的成品中文（赋值全在异步回调里）——一律「state 只存词条 key 或
-   数字，句子在模板里 t() 现取」。账单表格的类型列同理（行数据一次性加工）。
-
-   复用：「全部」chip 走 common.all；「游戏购买 / 钱包充值 / 退款」在筛选 chip、
-   表格类型列、消费占比三处是同一件事，共用 toolbox.bill.type.*。 */
+   分节锚点 data-section 值直接复用分节标题词条（HlSectionRail 读 key 显示，锚点与语言无关）。
+   不变量：异步回调里的进度/批次/提示文案一律「state 只存词条 key 或数字，句子在模板里 t() 现取」；
+   账单类型列同理。复用：common.all；toolbox.bill.type.*（筛选 chip / 类型列 / 占比图三处同一件事）。 */
 
 const toolbox = {
   /* ── 分节锚点（data-section 值 = 模块标题）── */

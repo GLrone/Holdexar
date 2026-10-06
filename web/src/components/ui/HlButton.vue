@@ -4,7 +4,7 @@ import { computed } from 'vue'
 /**
  * 标准按键 —— 艺术按键优先。
  * 传入 art 时渲染 .hl-btn-art（pattern 图案阴影 / outline 粗描边 / combo 深色波浪），
- * 否则渲染常规 .hl-btn 变体。视觉规范见 web/public/component-framework.html。
+ * 否则渲染常规 .hl-btn 变体。视觉规范见 web/dev/component-framework.html。
  */
 const props = withDefaults(
   defineProps<{

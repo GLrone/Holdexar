@@ -1,10 +1,7 @@
-/* English 词典 · gameDetail（与 zh-CN/gameDetail.ts 同构，key 必须逐一对齐）。
-
-   ⚠️ 下列词条与 trendDrawer / trendChart 模块是**同一件事的镜像译法**，改动必须两边同步
-   （门禁查不出跨模块同义分歧）：range.* / event.* / trend.lowest（= All-time low）/
-   trend.discount / trend.noDiscount / trend.steamNow / trend.empty / trend.emptyRegion。
-   与 gameCard 模块对齐的另有 rating.* / price.save / price.col.* / bundle.* / badge.hb /
-   hl.* / pp.cut / region.cn / link.steamStore / price.locked / price.lowestTag / removed.tag。 */
+/* English 词典 · gameDetail —— views/game-detail/Index.vue（与 zh-CN/gameDetail.ts 同构，key 必须逐一对齐）。
+   不变量：与 trendDrawer / trendChart 是同一件事的镜像译法，改动两边同步（门禁查不出跨模块同义分歧）：
+   range.* / event.* / trend.lowest（= All-time low）/ trend.discount / trend.noDiscount / trend.steamNow / trend.empty / trend.emptyRegion；
+   与 gameCard 对齐的另有 rating.* / price.save / price.col.* / bundle.* / badge.hb / hl.* / pp.cut / region.cn / link.steamStore / price.locked / price.lowestTag / removed.tag。 */
 
 import type { MessageKey } from '../zh-CN'
 
@@ -16,7 +13,7 @@ const gameDetail: Partial<Record<MessageKey, string>> = {
   'gameDetail.section.bundles': 'Linked bundles',
 
   /* Gradient header */
-  'gameDetail.header.back': 'Back to Find Games',
+  'gameDetail.header.back': 'Back to Store',
   'gameDetail.header.developers': 'Developer: {names}',
   'gameDetail.header.publishers': 'Publisher: {names}',
   'gameDetail.region.cn': 'CN',

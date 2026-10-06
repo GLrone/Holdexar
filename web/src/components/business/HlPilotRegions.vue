@@ -1,8 +1,4 @@
 <script setup lang="ts">
-/**
- * 领航台地区对比卡：各地区折合人民币的现价横条（便宜的在上），
- * 标出最低价地区与账号结算区，并给出换区能省多少。样式只取设计 token。
- */
 import { computed } from 'vue'
 
 import type { PilotRegionsFacts } from '@/api/client'
@@ -13,14 +9,14 @@ import RegionFlag from '@/components/RegionFlag.vue'
 const props = defineProps<{ card: PilotRegionsFacts }>()
 const { t } = useI18n()
 
-const maxFen = computed(() => Math.max(...props.card.items.map((r) => r.cnyFen)))
+const maxFen = computed(() => Math.max(...props.card.items.map((r) => r.cnyFen), 1))
 
 function isMine(code: string): boolean {
   return !!props.card.accountRegion && code.toLowerCase() === props.card.accountRegion
 }
 
 function barWidth(fen: number): string {
-  return `${Math.max(8, Math.round((fen / maxFen.value) * 100))}%`
+  return `${Math.max(12, Math.round((fen / maxFen.value) * 100))}%`
 }
 
 const cheapest = computed(() => props.card.items[0])
@@ -41,9 +37,26 @@ const verdict = computed(() => {
 
 <template>
   <div class="preg">
-    <div class="preg__title" :title="card.name || `AppID ${card.appid}`">
-      {{ t('pilot.regions.title', { name: card.name || `AppID ${card.appid}` }) }}
+    <div class="preg__header">
+      <div class="preg__title" :title="card.name || `AppID ${card.appid}`">
+        <svg class="preg__title-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="10" />
+          <line x1="2" y1="12" x2="22" y2="12" />
+          <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
+        </svg>
+        <span>{{ t('pilot.regions.title', { name: card.name || `AppID ${card.appid}` }) }}</span>
+      </div>
     </div>
+
+    <!-- 智能省钱洞察横幅置顶 -->
+    <div v-if="verdict" class="preg__verdict">
+      <svg class="preg__verdict-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="10" />
+        <polyline points="12 6 12 12 16 14" />
+      </svg>
+      <span>{{ verdict }}</span>
+    </div>
+
     <div class="preg__list">
       <div
         v-for="(r, i) in card.items"
@@ -53,19 +66,25 @@ const verdict = computed(() => {
       >
         <div class="preg__item-left">
           <RegionFlag :code="r.region.toLowerCase()" compact class="preg__region" />
-          <div class="preg__bar">
-            <i :style="{ width: barWidth(r.cnyFen) }"></i>
+          <div class="preg__bar-track">
+            <i class="preg__bar-fill" :style="{ width: barWidth(r.cnyFen) }"></i>
           </div>
         </div>
+
         <div class="preg__item-right">
           <span class="preg__price">{{ formatCnyFen(r.cnyFen) }}</span>
           <span v-if="r.discount" class="preg__disc">-{{ r.discount }}%</span>
-          <span v-if="i === 0" class="preg__tag preg__tag--best">{{ t('pilot.regions.cheapest') }}</span>
-          <span v-else-if="isMine(r.region)" class="preg__tag">{{ t('pilot.regions.mine') }}</span>
+          <span v-if="i === 0" class="preg__tag preg__tag--best">
+            <svg class="preg__crown" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+              <path d="M2 4l3 12h14l3-12-5 6-5-8-5 8z" />
+            </svg>
+            {{ t('pilot.regions.cheapest') }}
+          </span>
+          <span v-else-if="isMine(r.region)" class="preg__tag preg__tag--mine">{{ t('pilot.regions.mine') }}</span>
         </div>
       </div>
     </div>
-    <div v-if="verdict" class="preg__verdict">{{ verdict }}</div>
+
     <div v-if="card.count > card.items.length" class="preg__foot">
       {{ t('pilot.regions.more', { count: card.count }) }}
     </div>
@@ -74,25 +93,62 @@ const verdict = computed(() => {
 
 <style scoped>
 .preg {
-  display: grid;
-  gap: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
   max-width: 100%;
   min-width: 0;
-  overflow: hidden;
+}
+
+.preg__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 
 .preg__title {
-  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
   font-weight: 600;
-  color: var(--text-secondary);
+  color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.preg__title-icon {
+  width: 15px;
+  height: 15px;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.preg__verdict {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--success-a15);
+  color: var(--success);
+  border: 1px solid var(--success-a30);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.preg__verdict-icon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
 .preg__list {
-  display: grid;
-  gap: 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
   min-width: 0;
 }
 
@@ -100,17 +156,27 @@ const verdict = computed(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  padding: 4px 8px;
-  border-radius: 6px;
-  background: var(--surface-inset);
+  gap: 12px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-chip);
+  border: 1px solid var(--border-soft);
   min-width: 0;
-  font-size: 12px;
-  transition: background 0.15s ease;
+  transition: all var(--transition);
+}
+
+.preg__item:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-panel);
 }
 
 .preg__item.is-best {
-  background: var(--accent-a10);
+  background: var(--accent-a08);
+  border-color: var(--accent-a30);
+}
+
+.preg__item.is-mine {
+  border-left: 3px solid var(--accent);
 }
 
 .preg__item-left {
@@ -118,86 +184,92 @@ const verdict = computed(() => {
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
 }
 
 .preg__region {
   flex-shrink: 0;
-  width: 58px;
-  font-size: 11px;
+  width: 60px;
 }
 
-.preg__bar {
+.preg__bar-track {
   flex: 1;
-  min-width: 24px;
-  height: 5px;
-  border-radius: 3px;
-  background: var(--border-soft);
+  min-width: 40px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--surface-track);
   overflow: hidden;
 }
 
-.preg__bar i {
+.preg__bar-fill {
   display: block;
   height: 100%;
-  border-radius: 3px;
-  background: var(--text-secondary);
-  opacity: 0.45;
+  border-radius: 999px;
+  background: var(--text-faint);
+  transition: width 0.3s ease;
 }
 
-.preg__item.is-best .preg__bar i {
-  background: var(--accent);
-  opacity: 1;
+.preg__item.is-best .preg__bar-fill {
+  background: var(--success);
 }
 
-.preg__item.is-mine .preg__bar i {
+.preg__item.is-mine .preg__bar-fill {
   background: var(--accent);
-  opacity: 0.8;
 }
 
 .preg__item-right {
   flex-shrink: 0;
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
 }
 
 .preg__price {
-  font-weight: 600;
+  font-weight: 700;
   color: var(--text-primary);
-  font-size: 11px;
+  font-size: 13px;
+  font-family: var(--font-mono);
 }
 
 .preg__disc {
+  padding: 1px 4px;
+  border-radius: var(--radius-sm);
+  background: var(--success);
+  color: var(--ink-on-fill);
   font-size: 10px;
   font-weight: 700;
-  color: var(--success);
 }
 
 .preg__tag {
-  padding: 1px 5px;
-  border-radius: 4px;
-  background: var(--bg-card);
-  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 7px;
+  border-radius: 999px;
   font-size: 10px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.preg__crown {
+  width: 10px;
+  height: 10px;
 }
 
 .preg__tag--best {
-  background: var(--accent);
+  background: var(--success);
   color: var(--ink-on-fill);
-  font-weight: 600;
 }
 
-.preg__verdict {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-primary);
-  padding: 4px 8px;
-  border-radius: 6px;
-  background: var(--surface-inset);
+.preg__tag--mine {
+  background: var(--accent-a20);
+  color: var(--accent);
 }
 
 .preg__foot {
   font-size: 11px;
-  color: var(--text-secondary);
+  color: var(--text-muted);
+  text-align: right;
+  padding-top: 2px;
 }
 </style>

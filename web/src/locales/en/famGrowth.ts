@@ -1,14 +1,7 @@
-/* English 词典 · famGrowth（与 zh-CN/famGrowth.ts 同构，key 必须逐一对齐）。
-   对应源文件：views/family/tabs/FamGrowth.vue。
-
-   措辞对齐：
-   · acquisition / acquired —— B 表「入库」；playtime —— B 表「时长」；
-   · family library —— A 表「家庭库」；
-   · 贡献最多 / 贡献最少 → Top / Lowest contributor（成员一律
-     members 口径，不写 Contributors 之外的花样）。
-
-   行内标记只有 `<b>` 与 `class="gr-top"` / `class="gr-low"`（强调色与等宽字在
-   CSS 里，由 `:deep()` 够进来——v-html 注入的节点拿不到 scoped 属性）。 */
+/* English 词典 · famGrowth —— views/family/tabs/FamGrowth.vue（与 zh-CN/famGrowth.ts 同构，key 必须逐一对齐）。
+   措辞沿用既有译法：acquisition / acquired / playtime / family library；
+   贡献最多 / 贡献最少 → Top / Lowest contributor（一律 members 口径，不写 Contributors）。
+   不变量：行内标记只有 <b> 与 class="gr-top" / "gr-low"（强调色与等宽字在 CSS 里由 :deep() 够进来）。 */
 
 import type { MessageKey } from '../zh-CN'
 

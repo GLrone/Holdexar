@@ -1,10 +1,6 @@
 /* epicFree 词条 —— Epic 喜加一卡片组（components/business/EpicFreeCards.vue）。
-
-   倒计时/更新时间是参数化整句：中英「剩 {n} 天 / {n}d left」语序不同，
-   拆「标签 + 值」拼不回去，全部整句取词。
-
-   状态章两组四态（进行中/即将开始 × 剩 N 天/N 天后开始），章的状态字
-   （live/upcoming）与倒计时句分列：英文里一个是词、一个是短语，不硬凑。 */
+   不变量：倒计时 / 更新时间为参数化整句；状态章两组四态，章的状态字（live / upcoming）与倒计时句分列
+   （英文里一个是词、一个是短语，不硬凑）。 */
 
 const epicFree = {
   'epicFree.title': 'Epic 喜加一',

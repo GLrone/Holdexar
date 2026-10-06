@@ -1,13 +1,6 @@
-/* English 词典 · famWish（与 zh-CN/famWish.ts 同构，key 必须逐一对齐）。
-   对应源文件：views/family/tabs/FamWish.vue。
-
-   ⚠️ famWish.band.* 与 famValue.band.* 是同一套价格分档。中文两侧写法不同
-   （此处 ≥¥200、FamValue 写 ¥200+，且那边多一档「未定价」），**英文必须逐字一致**，
-   故 band.gte200 两侧都写 '¥200+'——不受各自中文写法影响。
-
-   术语：「折扣中」= On sale（同 trendDrawer.price.discount）、
-   「即将推出」= Coming soon、「家庭库」= family library（小写）、
-   「未收录」= Not listed（同 gameCard.cdk.notListed）、「成员」= members。 */
+/* English 词典 · famWish —— views/family/tabs/FamWish.vue（与 zh-CN/famWish.ts 同构，key 必须逐一对齐）。
+   不变量：famWish.band.* 与 famValue.band.* 同一套价格分档，英文两侧逐字一致（band.gte200 两侧都写 '¥200+'，不受各自中文写法影响）。
+   措辞沿用既有译法：On sale（同 trendDrawer.price.discount）/ Coming soon / family library（小写）/ Not listed（同 gameCard.cdk.notListed）/ members。 */
 
 import type { MessageKey } from '../zh-CN'
 

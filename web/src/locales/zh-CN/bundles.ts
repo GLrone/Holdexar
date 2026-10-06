@@ -1,22 +1,8 @@
 /* bundles 词条 —— 捆绑包浏览视图（views/bundles/Index.vue）。
-
-   几处刻意的复用，改一条两处同步：
-   · 「✅ 支持补齐」「❌ 不支持补齐」「❓ 未知」在**两个位置**是同一件事——
-     卡片标签行（bundle-mps-tag）与抽屉「补齐状态」栏（statusBar computed）。
-     共用 mps.* 三条，不各写一份。
-   · 只有「已拥有全部内容 / 家庭组已拥有全套」是状态栏独有（见 status.owned /
-     status.family）。
-
-   带 {占位符} 的词条**不要**在组件侧用 + 或模版字符串拼中文片段：中英语序
-   不同（如「共 {n} 个捆绑包」对 '{n} bundles'），拼不出版行。
-   · calc.excludeHint **整句进词条，行内强调用 <em class="calc-hint-em"> 包在值里**，
-     组件侧 v-html 渲染（同 HlBanner 的 item.html 先例）。曾按强调边界切成
-     Prefix/Word/Suffix 三连，理由是「两语言里被强调的词位置一致」——那个
-     理由不成立：切分等于**逼译文把被强调的词永远放在句尾**，英文那样写出来是
-     "💡 Click any games below that you do not want."，缺了 to buy，是残句。
-     词条是应用自有静态文案（非用户输入），v-html 无注入面。
-
-   gameTag.* 值**带前导空格**（拼在游戏名之后：`名字 [已拥有]`），不是笔误。 */
+   不变量：带 {占位符} 的词条禁止组件侧拼中文片段（中英语序不同，拼不出版行）；calc.excludeHint 整句进词条、
+   行内强调 <em> 写在值里由组件侧 v-html 渲染（应用自有静态文案，无注入面）；
+   mps.* 同时用于卡片标签与抽屉「补齐状态」栏（改一条两处同步）；status.owned / status.family 为状态栏独有。
+   gameTag.* 值带前导空格（拼在游戏名之后：`名字 [已拥有]`），不是笔误。 */
 
 const bundles = {
   /* 抽屉「补齐状态」栏（statusBar computed；completable/unknown 复用 mps.*） */

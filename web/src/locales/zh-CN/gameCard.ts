@@ -1,18 +1,8 @@
 /* gameCard 词条 —— 游戏卡（components/business/HlGameCard.vue）。
-
-   几处刻意的复用，改一条两边同步：
-   · 「全区价格」同时是卡片按钮与 GPW 弹窗小标题（共用 regionPrice.title）。
-   · 「省¥{amount}」在卡片差价徽章与关联捆绑包条目里是同一件事（共用 price.save）。
-   · 「待更新」「锁区」在列表 tab 与柱状图 tab 各出现一次（各一条）。
-   · 归属三态徽章的**显示字**与**弹窗标题**分列两条：同一个 owned 在两处
-     语义不同（「已拥有」/「归属账号」），英文也不是同一个词。
-
-   带 {占位符} 的条目**不要**在组件侧用 + 拼中文片段：中英语序不同，
-   拼不出版行（如 gift.sendReceiverPriced 的两处 {region}）。
-
-   注意 STATUS_META 那类模块级常量只能存 **key**（见组件内注释）——这里
-   一行是一条静态文案，没有「按量级分档」的取值，评测数走 reviewCount 一条
-   （量级是数字格式，由组件侧的 Intl compact 现取语言，不进词典）。 */
+   不变量：带 {占位符} 的条目禁止在组件侧拼中文片段（中英语序不同，拼不出版行）；
+   STATUS_META 等模块级常量只存 key 不存译文；评测量级走 reviewCount 一条（数字格式组件侧现取）。
+   复用：regionPrice.title（卡片按钮 + GPW 弹窗小标题）、price.save（差价徽章 + 捆绑包条目）；
+   归属三态的徽章显示字与弹窗标题分列两条（同一 owned 两处语义不同）。 */
 
 const gameCard = {
   /* ── 折扣 / 史低标签（hlFlag：1 新史低 2 平史低 其余非史低）── */

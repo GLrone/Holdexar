@@ -1,19 +1,8 @@
 /* rates 词条 —— 汇率页（views/rates/Index.vue）。
-
-   分节 key（`section.*`）同时是**页内分节锚点的显示名**：对应区块的
-   `data-section` 直接写这个 key，HlSectionRail 读到后用 t() 显示。
-   其中 `section.rates` / `section.convert` 还兼作区块标题（同文案同一件事）；
-   `section.allCurrencies` 只是锚点名——「全部币种（41）」带计数的标题
-   是另一条参数化词条（`allCurrencies.title`），两者不能合并。
-
-   时间范围 chips 的 key 单独一组：`RATE_RANGES`（api/client.ts）里的 label
-   是中文硬编码，且该文件不在本视图的可改范围内，故视图侧按 `id` 映射到
-   本组词条显示，不再读 `r.label`。
-
-   `history.title` / `history.empty` / `chart.yAxis` / `chart.tooltip` 里
-   币种名走 `{currency}`（中文名）与 `{code}`（ISO 代号）双占位符：
-   中文用前者（「美元 历史走势」），英文用后者（「USD history」）——
-   币种中文名来自 api/currencies.ts，那里没有英文名，见报告。 */
+   分节 key（section.*）同时是页内分节锚点的显示名；section.rates / section.convert 兼作区块标题，
+   section.allCurrencies 只是锚点名（带计数的标题是另一条参数化词条，不能合并）。
+   不变量：RATE_RANGES 的 label 是 api/client.ts 的中文硬编码，视图侧按 id 映射本组词条显示、不读 r.label；
+   history / chart 词条里币种名走 {currency}（中文名）与 {code}（ISO 代号）双占位符，中文用前者英文用后者。 */
 
 const rates = {
   /* 分节锚点 + 区块标题 */

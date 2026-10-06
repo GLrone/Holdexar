@@ -1,12 +1,5 @@
-/* ════════════════════════════════════════════════════════════════════
-   filterPanel 词条 —— components/business/HlFilterPanel.vue（高级筛选抽屉）。
-
-   覆盖抽屉标题 / 八个分区标题 / 各筛选标签 / 输入框占位符 / 单位词 / 页脚按钮。
-
-   **区服名不在此列**：抽屉里的地区名（`selectedRegion.name`，含「价格范围」弹层
-   每一行）来自服务端 GET /api/v1/regions，走 stores/regions 单一来源，属于
-   数据层词汇——本模块不为任何区名建词条。
-   ════════════════════════════════════════════════════════════════════ */
+/* filterPanel 词条 —— components/business/HlFilterPanel.vue（高级筛选抽屉：标题 / 八个分区 / 筛选标签 / 占位符 / 单位词 / 页脚按钮）。
+   不变量：区服名不在此列——地区名来自 GET /api/v1/regions，走 stores/regions 单一来源，属数据层词汇，本模块不为区名建词条。 */
 
 const filterPanel = {
   /* 抽屉标题（HlDrawer title）——⚙ 与词同句，整句进词条 */

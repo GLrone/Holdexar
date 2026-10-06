@@ -1,12 +1,6 @@
-/* gamelib 词条 —— 游戏库页（views/gamelib/Index.vue 及其页签）。
-   页签结构：账号游戏库（每个追踪账户的已购矩阵）/ 库分析 / 家庭库 /
-   游玩动态（自 family 页迁入，词条仍挂 famPlay.* 模块）。
-
-   术语对齐既有 A / B 表：
-   · 入库（本系统首次见到该游戏的时间）→ acquired / added
-   · 多人共有（追踪账户间）→ co-owned，与家庭库侧的 shared（家庭组共享）
-     是两个口径，英文刻意分开
-   · 库价值口径 = CN 现价合计，与 famLib.kpi.value 同源 */
+/* gamelib 词条 —— 游戏库页（views/gamelib/Index.vue 及其页签：账号游戏库 / 库分析 / 家庭库 / 游玩动态）。
+   不变量：「入库」→ acquired / added；多人共有 → co-owned，与家庭库侧 shared（家庭组共享）刻意分词、两个口径；
+   库价值口径 = CN 现价合计，与 famLib.kpi.value 同源。 */
 
 const gamelib = {
   /* ── 页签与分节锚点（data-section 值 = 词条 key，HlSectionRail 渲染期 t()）── */
