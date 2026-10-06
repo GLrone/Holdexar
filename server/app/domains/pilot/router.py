@@ -7,6 +7,8 @@ import logging
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
+from app.core.logging import log_event
+
 logger = logging.getLogger(__name__)
 
 from . import config as pilot_config
@@ -206,7 +208,13 @@ async def get_session(session_id: str) -> PilotSessionOut:
             turns.append(PilotSessionTurn(
                 q=t.get("q") or "", resp=t.get("resp") or {}, ts=t.get("ts")))
         except Exception:  # noqa: BLE001 — 单条坏记录跳过，不拖垮整段历史
-            logger.warning("pilot 会话历史记录无法还原，已跳过（sid=%s）", session_id)
+            log_event(
+                logger,
+                f"会话 {session_id} 有一条历史记录无法还原，已跳过",
+                tag="跳过",
+                level=logging.WARNING,
+                detail={"会话": session_id},
+            )
             continue
     return PilotSessionOut(
         session_id=session_id, turns=turns, updated_at=state.updated_at,

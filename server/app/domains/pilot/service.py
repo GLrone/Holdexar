@@ -19,15 +19,19 @@
 语言。罗盘数据飞轮：每轮问答追加 decisions.jsonl（shadow）。"""
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import time
 
+from app.core.logging import log_event
 from app.core.paths import resolve_data_dir
 from app.crawler.utils import get_beijing_time_obj
 from app.domains.agent import memory as agent_memory
 from app.domains.pilot import config as pilot_config
 from app.domains.pilot import context as pilot_context
+from app.domains.pilot.decision import DECISION_AGENT
 from app.domains.pilot import intent as pilot_intent
 from app.domains.pilot import llm as pilot_llm
 from app.domains.pilot import session as pilot_session
@@ -35,7 +39,23 @@ from app.domains.pilot import tools as pilot_tools
 
 logger = logging.getLogger(__name__)
 
-_MAX_STEPS = 6
+_MAX_STEPS = 8
+# 数据型意图：答案应来自工具事实。模型宣告要查却一步工具未调时，循环追问一次
+_DATA_INTENTS = frozenset({
+    pilot_intent.PRICE_ANALYSIS, pilot_intent.FIND_GAMES,
+    pilot_intent.ADD_MONITOR, pilot_intent.CREATE_ALERT,
+})
+_ANNOUNCE_WORDS = ("我来", "让我来", "我这就", "先查", "查一下", "查查", "排查", "分析一下", "帮你查", "帮您查")
+_NUDGE_EMPTY = (
+    "（系统提示）你刚才没有输出任何内容也未调用工具。"
+    "请立即调用合适的工具获取真实数据再回答；若确实无需工具，直接输出最终结论。"
+)
+_NUDGE_ANNOUNCED = (
+    "（系统提示）你刚才宣告了要查询但没有实际调用工具。"
+    "请立即调用所需的工具获取真实数据；若确实无需工具，直接输出最终结论。"
+)
+# 工具执行期心跳节拍（秒）：执行不再静默——每拍上报一次已用时长，前端据此显示进度
+_TOOL_TICK_S = 1.0
 # 单阶段思考预算（字符）：超限后该阶段不再累加与下发思考增量，避免单个阶段拉成长文本
 _THINK_BUDGET_CHARS = 32000
 # 压缩连败熔断：连续 N 次「压缩调用失败」后跳过自动压缩（手动压缩不受限且成功即重置）。
@@ -137,7 +157,13 @@ _SYSTEM_PROMPT = (
     "- 用简体中文，简洁分点，先结论后依据；\n"
     "- 排版：可用 ## 小节标题分段，**加粗**标关键信息，==高亮==标最关键的数字或结论，"
     "> 行写提示或注意；价格/列表等数据靠工具卡片呈现，正文不重复罗列长数据；\n"
-    "- 涉及购买建议时，说明当前价与史低、近一年区间的关系作为依据。"
+    "- 涉及购买建议时，说明当前价与史低、近一年区间的关系作为依据；\n"
+    "- 需要调用工具时直接输出工具调用，严禁输出「好的，我来查询…」等前置垫话或过程宣告；待拿到工具执行结果后再统一输出分析与结论；\n"
+    "- 内部决策代理与卡片控制：系统内置了快速决策代理负责向用户界面呈现结构化卡片；\n"
+    "  * 数据检索类工具（如 epic_free、steam_free、rates_overview、diagnose_price 等）默认作为推导事实，内部代理默认不会向用户展示原始行数据卡片（_ui_card.status 为 'suppressed'）。请在正文中用清晰的 Markdown 整理总结出对用户有用的结论；\n"
+    "  * 核心可视化卡片（如价格走势 price、候选游戏 games、家庭成员 family、批量提议 proposal 等）符合用户显式意图时由决策代理渲染并在 _ui_card 标记 'rendered'；\n"
+    "  * 若调用工具仅为内部推演，可在参数中传 emit_card: false 抑制卡片；如需显式呈现数据表亦可传 emit_card: true；\n"
+    "  * 每次工具执行结果中均包含 _ui_card 状态：若 status 为 'rendered'，对应可视化卡片已在用户界面呈现，你在正文中无需重复打印冗长报表；若 status 为 'suppressed'，说明未渲染卡片，请在正文中如实陈述全部关键信息。"
 )
 
 
@@ -236,6 +262,8 @@ def _tool_summary(name: str, result: dict) -> str:
     """工具事件的上屏摘要（机器码 + 最小数据，前端不翻译这个字段）。"""
     if result.get("kind") == "denied":
         return f"{name}: denied"
+    if result.get("kind") in ("timeout", "failed"):
+        return f"{name}: {result['kind']}"
     if result.get("kind") == "rows":
         return f"{name}: {len(result.get('rows') or [])} rows"
     if name == "search_games":
@@ -335,6 +363,76 @@ def _card_of(tool_name: str, result: dict) -> dict | None:
     return None
 
 
+# 工具名 → 预期卡片类型（tool_start 事件的骨架占位提示）；行卡类工具回落 rows。
+# 与 _card_of 的结果→卡片映射同源维护，新增产卡工具两边同步。
+_CARD_KIND_HINTS: dict[str, str] = {
+    "get_price_briefing": "price",
+    "get_region_prices": "regions",
+    "compare_games": "compare",
+    "search_games": "games",
+    "recommend_games": "games",
+    "search_steam": "games",
+    "top_games": "games",
+    "price_drops": "games",
+    "list_wishlist": "games",
+    "list_owned": "games",
+    "list_family_library": "games",
+    "audit_follows_workflow": "stepper",
+    "achievements_summary": "achievements",
+    "family_status": "family",
+    "propose_bulk": "proposal",
+    "propose_delete": "proposal",
+    "navigate": "navigate",
+}
+
+_CARD_HINT_ROWS_TOOLS = ("proxy_exit_detail", "proxy_latency_test")
+
+
+def _card_kind_hint(tool_name: str) -> str | None:
+    """tool_start 事件的卡片类型预告：前端在工具执行期先挂骨架占位卡。"""
+    if tool_name in _CARD_KIND_HINTS:
+        return _CARD_KIND_HINTS[tool_name]
+    if tool_name in _CARD_HINT_ROWS_TOOLS:
+        return "rows"
+    if tool_name in (pilot_tools._READ_TOOLS + pilot_tools._WRITE_TOOLS
+                     + pilot_tools._SYNC_TOOLS + pilot_tools._TASK_TOOLS):
+        return "rows"
+    return None
+
+
+_CORE_CARD_KINDS = {
+    "proposal", "stepper", "price", "regions", "compare",
+    "games", "family", "achievements",
+}
+_MAX_CARDS_PER_TURN = 2
+
+
+def _should_admit_card(card: dict | None, current_cards: list[dict]) -> bool:
+    """卡片准入判定：单轮最多两张，核心卡优先，辅助诊断卡去重。"""
+    if card is None or card in current_cards:
+        return False
+    if len(current_cards) >= _MAX_CARDS_PER_TURN:
+        return False
+    kind = card.get("kind")
+    has_core = any(c.get("kind") in _CORE_CARD_KINDS for c in current_cards)
+    if has_core and kind not in _CORE_CARD_KINDS:
+        return False
+    if kind == "rows" and any(c.get("kind") == "rows" for c in current_cards):
+        return False
+    return True
+
+
+def _stream_card_hint(
+    tool_name: str,
+    current_cards: list[dict],
+    arguments: dict | None = None,
+    question: str = "",
+) -> str | None:
+    """执行期骨架预告：超限或被抑制的工具不挂骨架。"""
+    base_hint = _card_kind_hint(tool_name)
+    return DECISION_AGENT.stream_card_hint(tool_name, arguments, question, current_cards, base_hint)
+
+
 def _minimal_base(state, question: str, appid: int | None) -> list[dict]:
     """溢出回收装配：仅要点存档 + 当前问题，不带历史轮次。"""
     msgs: list[dict] = []
@@ -351,7 +449,12 @@ async def _build_system_prompt() -> str:
         if profile:
             return f"{_SYSTEM_PROMPT}\n\n{profile}"
     except Exception as e:
-        logger.warning("failed to build profile context: %s", e)
+        log_event(
+            logger,
+            "构建用户画像偏好失败，本轮问答不使用画像",
+            level=logging.WARNING,
+            detail={"原因": str(e)},
+        )
     return _SYSTEM_PROMPT
 
 
@@ -406,26 +509,69 @@ async def _assemble_for_model(state, question: str, appid: int | None, cfg: dict
         try:
             await agent_memory.extract_preferences_from_text(text, source=f"compact:{state.sid}")
         except Exception as e:
-            logger.warning("failed to extract preferences: %s", e)
+            log_event(
+                logger,
+                "从压缩存档中提取用户偏好失败，跳过本次提取",
+                level=logging.WARNING,
+                detail={"原因": str(e)},
+            )
         return post_msgs, True
     return msgs, False
 
 
-async def _agent_stream(base: list[dict], state, question: str, appid: int | None, cfg: dict):
+_INTENT_NOTE_LABELS = {
+    pilot_intent.HOW_TO: "指引咨询",
+    pilot_intent.CREATE_ALERT: "设置价格提醒",
+    pilot_intent.ADD_MONITOR: "添加关注",
+    pilot_intent.PRICE_ANALYSIS: "价格查询/分析",
+    pilot_intent.FIND_GAMES: "游戏商店/推荐",
+    pilot_intent.NAVIGATE: "页面导航",
+    pilot_intent.CHAT: "自由问答",
+}
+
+
+def _deterministic_note(question: str, intent: str) -> dict | None:
+    """确定性层事实 → 模型可见的同步消息（账本打通）。
+
+    意图路由与守卫判定在模型之外发生，但它们决定/约束了模型能做什么——
+    不告知就是信息不对等。消息放在对话末尾、只随本请求在场，不入会话账本
+    （每轮按问句现算）；anthropic 协议下由 provider 提顶进 system。"""
+    label = _INTENT_NOTE_LABELS.get(intent)
+    if not label:
+        return None
+    text = f"（系统侧同步·仅供参照）确定性意图路由将本问句识别为「{label}」；工具选择仍由你决定。"
+    if pilot_intent.is_guarded(question):
+        text += "本问句命中批量/删除类守卫词：写类工具会被拒绝，批量需求请改用 propose_bulk 提交提议交用户确认。"
+    return {"role": "system", "content": text}
+
+
+async def _agent_stream(base: list[dict], state, question: str, appid: int | None, cfg: dict,
+                        intent: str = pilot_intent.CHAT):
     """agent 循环（流式）。base 为 system 之后的装配序列（末位是当前问题）。事件形态与 ask_stream 一致，另加阶段与工具执行事件：
 
     {"type": "step_start", "step": n}                进入第 n 步（阶段定界，先于该步任何增量）；
     {"type": "tool_start", "name":..., "label":...}   工具开始执行（前端置运行态）；
-    {"type": "tool", "name":..., "label":..., "status":..., "data":...}
-                                                      工具执行完毕（结构化步骤）。
+    {"type": "tool_progress", "name":..., "elapsed_ms": n}
+                                                      执行期心跳（每 _TOOL_TICK_S 一拍，前端显示已用时长）；
+    {"type": "tool", "name":..., "label":..., "status":..., "data":..., "duration_ms": n}
+                                                      工具执行完毕（结构化步骤 + 本次执行耗时）；
+    {"type": "card", "name":..., "card": dict | None}
+                                                      卡片结算帧：每个完成工具一帧，card=None =
+                                                      本工具无可渲染卡片；有卡即时下发（先到先渲染，
+                                                      与 done.cards 同源同序，去重口径一致）。
 
-    label/status/data 由 tools.tool_step 产出（词条键片段 + 最小插值数据）；
-    思考 / 前言 / 工具按步归入 phase，done 事件携带全量 phases 与由它派生的 steps，
-    前端历史轮按它还原时间线。"""
+    label/status/data 由 tools.tool_step 产出（词条键片段 + 最小插值数据）；执行超
+    tools.tool_budget_s 预算则取消并归因为 status=timeout，工具自身抛错归因为
+    status=failed（两类都回灌模型让它自愈，不吞掉整轮）；思考 / 前言 / 工具按步
+    归入 phase，done 事件携带全量 phases 与由它派生的 steps，前端历史轮按它还原时间线。"""
     sys_prompt = await _build_system_prompt()
     system = [{"role": "system", "content": sys_prompt}]
     minimal = _minimal_base(state, question, appid)
     messages = system + list(base)
+    # 确定性层同步（意图路由 / 守卫状态）跟随当前请求，不入账本
+    note = _deterministic_note(question, intent)
+    if note is not None:
+        messages.append(note)
     # 装配序列末位恒为当前问题（context.assemble 契约）——本轮入账只含它
     new_msgs = [base[-1]]
     overflow_retried = False
@@ -470,8 +616,11 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
     base_url = pilot_llm.effective_base_url(cfg["protocol"], cfg["base_url"])
     # 一轮问答共用一个客户端：agent 循环跨轮复用连接，免每轮重新握手
     client = pilot_llm.http_client(base_url)
+    inflight: asyncio.Task | None = None
     try:
         step = 0
+        nudged = False
+        tools_ran = 0
         while step < _MAX_STEPS:
             phase = {"step": step + 1, "thinking": [], "text": [], "steps": [],
                      "think_ms": 0.0, "truncated": False, "terminal": False}
@@ -556,6 +705,21 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
             step += 1
             assistant = {"role": "assistant", "content": "".join(round_answer) or None}
             if not tool_calls:
+                # 追问一次：模型空转（零输出零工具）或只宣告要查却一步工具未调
+                # ——回灌系统提示再给一轮；宣告文本只留展示层，不进模型对话
+                text = "".join(round_answer)
+                if not nudged and step < _MAX_STEPS:
+                    if not text:
+                        nudge = {"role": "system", "content": _NUDGE_EMPTY}
+                    elif (tools_ran == 0 and intent in _DATA_INTENTS
+                          and any(w in text for w in _ANNOUNCE_WORDS)):
+                        nudge = {"role": "system", "content": _NUDGE_ANNOUNCED}
+                    else:
+                        nudge = None
+                    if nudge is not None:
+                        nudged = True
+                        messages.append(nudge)
+                        continue
                 # 终答轮：assistant 消息回写进会话历史（下一轮模型可见上文）
                 phase["terminal"] = True
                 messages.append(assistant)
@@ -575,41 +739,102 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
             new_msgs.append(assistant)
             write_seen = 0
             for t in tool_calls:
+                tools_ran += 1
                 meta_label = pilot_tools.TOOL_META.get(t["name"], {}).get("label") or t["name"]
-                yield {"type": "tool_start", "name": t["name"], "label": meta_label}
+                yield {"type": "tool_start", "name": t["name"], "label": meta_label,
+                       "card_kind": _stream_card_hint(t["name"], cards, arguments=t.get("arguments"), question=question)}
                 guarded = pilot_intent.is_guarded(question)
                 if t["name"] in pilot_tools._WRITE_TOOLS:
                     # 单轮写动作上限：第 3 个起一律拒绝（堵「一句话连发」）
                     write_seen += 1
                     guarded = guarded or write_seen > 2
-                result = await pilot_tools.execute_tool(
+                started_at = time.monotonic()
+                inflight = asyncio.create_task(pilot_tools.execute_tool(
                     t["name"], t["arguments"], guarded=guarded,
                     sid=state.sid if state is not None else None,
-                )
+                ))
+                budget_s = pilot_tools.tool_budget_s(t["name"])
+                while True:
+                    done, _ = await asyncio.wait({inflight}, timeout=_TOOL_TICK_S)
+                    if done:
+                        try:
+                            result = inflight.result()
+                        except Exception as e:  # noqa: BLE001 —— 工具自身失败不吞整轮：归因为失败步骤回灌模型
+                            log_event(
+                                logger,
+                                f"领航员工具「{t['name']}」执行失败，已将失败结果回灌模型",
+                                level=logging.ERROR,
+                                exc_info=True,
+                                detail={"工具": t["name"], "原因": type(e).__name__},
+                            )
+                            result = {"kind": "failed", "tool": t["name"], "note": type(e).__name__}
+                        break
+                    used_ms = int((time.monotonic() - started_at) * 1000)
+                    if budget_s is not None and used_ms >= budget_s * 1000:
+                        inflight.cancel()
+                        with contextlib.suppress(BaseException):
+                            await inflight
+                        result = {"kind": "timeout", "tool": t["name"], "budget_s": int(budget_s)}
+                        break
+                    # 执行期心跳：两侧都静默时前端仍有"仍在执行 · 已用 N 秒"的活信号
+                    yield {"type": "tool_progress", "name": t["name"],
+                           "label": meta_label, "elapsed_ms": used_ms}
+                inflight = None
+                duration_ms = int((time.monotonic() - started_at) * 1000)
                 step_data = pilot_tools.tool_step(t["name"], result)
                 phase["steps"].append(step_data)
                 tool_log.append(_tool_summary(t["name"], result))
-                yield {"type": "tool", "name": t["name"], **step_data}
-                card = _card_of(t["name"], result)
-                if card is not None and card not in cards:
-                    cards.append(card)
+                yield {"type": "tool", "name": t["name"], "duration_ms": duration_ms, **step_data}
+                # card 结算帧：内部决策代理统一裁决是否下发可视化卡片
+                base_card = _card_of(t["name"], result)
+                card_dec = DECISION_AGENT.decide_card(
+                    tool_name=t["name"],
+                    result=result,
+                    arguments=t.get("arguments"),
+                    question=question,
+                    current_cards=cards,
+                    base_card=base_card,
+                )
+                if card_dec.should_emit and card_dec.card:
+                    cards.append(card_dec.card)
+                    yield {"type": "card", "name": t["name"], "card": card_dec.card}
+                else:
+                    yield {"type": "card", "name": t["name"], "card": None}
                 if result.get("proposal") and isinstance(result["proposal"], dict):
                     p_card = _card_of("propose_bulk", result["proposal"])
-                    if p_card is not None and p_card not in cards:
-                        cards.append(p_card)
+                    p_dec = DECISION_AGENT.decide_card(
+                        tool_name="propose_bulk",
+                        result=result["proposal"],
+                        arguments=t.get("arguments"),
+                        question=question,
+                        current_cards=cards,
+                        base_card=p_card,
+                    )
+                    if p_dec.should_emit and p_dec.card:
+                        cards.append(p_dec.card)
+                        yield {"type": "card", "name": "propose_bulk", "card": p_dec.card}
                 if t["name"] in ("add_follow", "create_price_alert") and result.get("appid"):
                     last_game = {"appid": result["appid"], "name": result.get("name")}
                 tool_msg = {
                     "role": "tool",
                     "tool_call_id": t["id"] or f"{t['name']}-{len(messages)}",
-                    "content": json.dumps(_model_view(result), ensure_ascii=False),
+                    "content": json.dumps(
+                        DECISION_AGENT.enhance_model_view(result, card_dec),
+                        ensure_ascii=False,
+                    ),
                 }
                 messages.append(tool_msg)
                 new_msgs.append(tool_msg)
     finally:
+        # 流被中断（客户端断开 / 服务端取消）时在飞工具一并取消，不留后台孤儿
+        if inflight is not None and not inflight.done():
+            inflight.cancel()
         await client.aclose()
 
     _think_close()
+    # 步数上限耗尽（未走终答轮）：明确归因，前端翻成用户语言——不再静默交白卷
+    if not (phases and phases[-1].get("terminal")):
+        reason = "max_steps"
     for phase in phases:
         phase["thinking"] = "".join(phase["thinking"])
         phase["text"] = "".join(phase["text"])
@@ -631,7 +856,7 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
         "source": "llm",
         "reason": reason,
         "facts": None,
-        "cards": cards[:6],
+        "cards": cards[:_MAX_CARDS_PER_TURN],
         "steps": steps,
         "phases": phases,
         "tools": tool_log,
@@ -939,8 +1164,12 @@ async def _ask_stream_body(question: str, appid: int | None = None, session_id: 
     """流式编排本体。事件形态：
     {"type": "step_start", "step": int} 进入第几步（阶段边界）；
     {"type": "thinking" | "answer", "delta": str} 增量（归属当前步所在阶段）；
-    {"type": "tool_start", "name": str, "label": str} 工具开始执行；
-    {"type": "tool", "name": str, "label": str, "status": str, "data": dict} 工具执行完毕；
+    {"type": "tool_start", "name": str, "label": str, "card_kind": str | None}
+                                                      工具开始执行（card_kind = 预期卡片类型，前端挂骨架占位）；
+    {"type": "tool_progress", "name": str, "label": str, "elapsed_ms": int} 执行期心跳；
+    {"type": "tool", "name": str, "label": str, "status": str, "data": dict, "duration_ms": int} 工具执行完毕；
+    {"type": "card", "name": str, "card": dict | None}
+                                                      卡片结算帧（每个完成工具一帧；null=无卡，前端撤骨架）；
     {"type": "done", ...结果字段, "phases": list, "steps": list} 终态
         （phases = 按步分段的思考/前言/工具；steps = 由 phases 展平的时间线全量）；
     {"type": "error", "reason": str} 前置异常。
@@ -994,7 +1223,7 @@ async def _ask_stream_body(question: str, appid: int | None = None, session_id: 
         base = [ref_msg] + base
     result: dict | None = None
     try:
-        async for event in _agent_stream(base, state, q, appid, cfg):
+        async for event in _agent_stream(base, state, q, appid, cfg, intent):
             if event["type"] == "tool":
                 yield event
                 continue

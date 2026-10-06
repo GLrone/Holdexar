@@ -674,6 +674,22 @@ def test_search_games_uses_catalog_search(monkeypatch):
     assert out["kind"] == "games" and out["items"][0]["appid"] == 2680010
 
 
+def test_search_games_full_sentence_passthrough(monkeypatch):
+    """整句自然语言原样透传 search_catalog（bigram OR 通道在 service 层消解句子）。"""
+    seen = {}
+
+    async def _fake(term, limit=5):
+        seen["term"] = term
+        return []
+
+    monkeypatch.setattr(pilot_tools.games_service, "search_catalog", _fake)
+    out = asyncio.run(
+        pilot_tools.execute_tool("search_games", {"q": "有没有类似只狼的动作游戏"})
+    )
+    assert seen["term"] == "有没有类似只狼的动作游戏"
+    assert out["kind"] == "games" and out["items"] == []
+
+
 def test_price_facts_offers_alt_region_when_cn_locked(monkeypatch):
     """国区锁区：cn 空 + alt=最低可购区（消费 detail 的 lowest 事实）。"""
     detail = {
