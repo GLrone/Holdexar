@@ -368,3 +368,65 @@ class TestPilotDispatch:
 
         result = await pilot_tools.execute_tool("cancel_task", {})
         assert result["rows"][0]["vKey"] == "taskNoRunning"
+
+
+class TestDomainOutcomeMapping:
+    """域终态 → run 终态投影：run 记调度事实，业务结论按映射收口。"""
+
+    @staticmethod
+    def _sequenced_observations(stub_kind, sequence):
+        remaining = list(sequence)
+
+        async def _observe(ref):
+            return remaining.pop(0) if remaining else {
+                "active": False, "phase": "idle",
+            }
+
+        stub_kind(observe=_observe)
+
+    @pytest.mark.asyncio
+    async def test_domain_failed_outcome_fails_run(self, db, fast_runner, stub_kind):
+        self._sequenced_observations(stub_kind, [
+            {"active": True, "phase": "running", "done": 1, "total": 3},
+            {"active": False, "phase": "idle", "outcome": "failed"},
+        ])
+        rid = await launch()
+        run = await wait_status(rid, {"failed"})
+        assert run["error_code"] == "domain_failed"
+        events = await events_of(rid)
+        assert any(
+            e["event_type"] == "task.failed" and e["payload"]["reason"] == "domain_status=failed"
+            for e in events
+        )
+
+    @pytest.mark.asyncio
+    async def test_domain_cancelled_outcome(self, db, fast_runner, stub_kind):
+        self._sequenced_observations(stub_kind, [
+            {"active": True, "phase": "running", "done": 1, "total": 3},
+            {"active": False, "phase": "idle", "outcome": "stopped"},
+        ])
+        rid = await launch()
+        run = await wait_status(rid, {"cancelled"})
+        assert run["error_code"] is None  # 域侧停止不是用户取消，无错误码语义混入
+
+    @pytest.mark.asyncio
+    async def test_partial_domain_outcome_maps_to_done(self, db, fast_runner, stub_kind):
+        """partial（部分成功）的业务细节归 price_cycles，run 收 done。"""
+        self._sequenced_observations(stub_kind, [
+            {"active": True, "phase": "running", "done": 2, "total": 3},
+            {"active": False, "phase": "idle", "outcome": "partial"},
+        ])
+        rid = await launch()
+        await wait_status(rid, {"done"})
+
+    @pytest.mark.asyncio
+    async def test_outcome_ignored_without_observed_activity(self, db, fast_runner, stub_kind):
+        """没观察到活动（域对象未认领）→ 不下业务结论，done（error_code 空）。"""
+        self._sequenced_observations(stub_kind, [
+            {"active": False, "phase": "idle", "outcome": "failed"},
+        ])
+        rid = await launch()
+        run = await wait_status(rid, {"done"})
+        assert run["error_code"] is None
+        events = await events_of(rid)
+        assert not any(e["event_type"] == "task.failed" for e in events)

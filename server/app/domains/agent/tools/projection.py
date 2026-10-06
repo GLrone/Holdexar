@@ -13,6 +13,8 @@ _READ_TOOLS = (
     "diagnose_price",
     "recent_job_failures",
     "proxy_pool_status",
+    "proxy_exit_detail",
+    "proxy_latency_test",
     "write_gate_status",
     "hb_monthly",
     "epic_free",
@@ -92,6 +94,8 @@ _TOOL_BUDGET_S: dict[str, float] = {
     "list_family_library": 60.0, "list_owned": 60.0, "top_games": 60.0,
     "price_drops": 60.0, "list_bundles": 60.0, "read_session": 60.0,
     "find_deletables": 90.0, "audit_follows_workflow": 90.0,
+    # 全量出口检测（逐节点探测，分钟级；工具内轮询窗 170s 略小于此预算）
+    "proxy_latency_test": 180.0,
 }
 
 
@@ -236,6 +240,8 @@ LABELS: dict[str, str] = {
     "diagnose_price": "diagnose",
     "recent_job_failures": "jobFailures",
     "proxy_pool_status": "proxyStatus",
+    "proxy_exit_detail": "proxyExits",
+    "proxy_latency_test": "proxyLatencyTest",
     "write_gate_status": "gateStatus",
     "list_tasks": "tasks",
     "start_task": "taskStart",

@@ -1,6 +1,6 @@
 """任务登记表：可被调度面（pilot / 运行面）发起的长任务。
 
-登记准入（设计稿见 RUNTIME_CONTROL_PLANE_PLAN 阶段四）：
+登记准入：
 - **只登记已存在于用户界面的长任务**（任务页「全部」档、补抓按钮）——
   禁止新造只有调度方能触发的任务，否则等于绕过用户面新增业务动作；
 - `start` 只调用域内既有受理入口，不自建调度器、不绕过域内占用闸
@@ -16,6 +16,11 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+
+# 域终态全集（price_cycles / crawl_jobs 的收尾字符串）；observe 只在
+# 观测到终态时给出 outcome，任务执行器经 state.map_domain_status 收口
+_CYCLE_TERMINAL = frozenset({"completed", "partial", "failed", "cancelled"})
+_JOB_TERMINAL = frozenset({"done", "failed", "stopped"})
 
 
 @dataclass(frozen=True)
@@ -59,6 +64,8 @@ async def _observe_price_refresh(ref: dict) -> dict:
         out["done"] = cycle.get("batchesDone")
         out["total"] = cycle.get("batchesExpected")
         out["note"] = cycle.get("status")
+        if cycle.get("status") in _CYCLE_TERMINAL:
+            out["outcome"] = cycle.get("status")
     elif job_id is not None:
         jobs = await crawl_service.list_jobs(1)
         if jobs:
@@ -85,12 +92,27 @@ async def _start_price_repair() -> dict:
 async def _observe_price_repair(ref: dict) -> dict:
     from app.domains.crawl import service as crawl_service
 
-    job_id = crawl_service.active_job_id()
-    jobs = await crawl_service.list_jobs(1)
-    job = jobs[0] if jobs else None
+    # 认领规则：受理路径按 job id 认领（最新 job 可能是别人插进来的手动
+    # 任务）；桥接采样（未受理具体 job）只认本运行期内启动的 job——
+    # 进度与终态都不能张冠李戴到历史 job 上
+    want_id = ref.get("id")
+    started_at = ref.get("startedAt")
+    jobs = await crawl_service.list_jobs(5)
+    if want_id is not None:
+        job = next((j for j in jobs if j.get("id") == want_id), None)
+    elif started_at is not None:
+        job = next(
+            (j for j in jobs if (j.get("startedAt") or "") >= started_at), None
+        )
+    else:
+        job = jobs[0] if jobs else None
+    if want_id is not None and job is None:
+        # 受理的 job 行尚未可见（域侧拒收 / 事务在途）——按未观测处理
+        return {"active": False, "phase": "idle", "done": None,
+                "total": ref.get("count"), "note": "unobserved"}
     stats = (job or {}).get("stats") or {}
-    active = job_id is not None
-    return {
+    active = job is not None and crawl_service.active_job_id() is not None
+    out = {
         "active": active,
         "phase": "running" if active else "idle",
         "done": stats.get("processed"),
@@ -98,6 +120,12 @@ async def _observe_price_repair(ref: dict) -> dict:
         "note": (job or {}).get("status"),
         "jobId": (job or {}).get("id"),
     }
+    status = (job or {}).get("status")
+    if status in _JOB_TERMINAL and (
+        started_at is None or ((job.get("startedAt") or "") >= started_at)
+    ):
+        out["outcome"] = status
+    return out
 
 
 async def _stop_price_repair() -> bool:

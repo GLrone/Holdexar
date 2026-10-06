@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from app.core.logging import log_event
 from app.domains.agent.tools import policy
 from app.domains.agent.tools.base import Status, ToolResult, ToolSpec, derive_status
 
@@ -25,7 +26,13 @@ async def execute(spec: ToolSpec, arguments: dict, *, guarded: bool = False,
                           data={"kind": "timeout", "tool": spec.name, "budget_s": int(spec.timeout_s)},
                           error_code="timeout")
     except Exception as e:  # noqa: BLE001 — 归一化铁律：异常 = 结果
-        logger.exception("领航员工具执行失败：%s", spec.name)
+        log_event(
+            logger,
+            f"领航员工具「{spec.name}」执行失败，已将失败结果回灌模型",
+            level=logging.ERROR,
+            exc_info=True,
+            detail={"工具": spec.name, "原因": type(e).__name__},
+        )
         return ToolResult(status="error",
                           data={"kind": "failed", "tool": spec.name, "note": type(e).__name__},
                           error_code="tool_error")

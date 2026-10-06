@@ -7,6 +7,7 @@ from typing import AsyncIterator
 
 import httpx
 
+from app.core.logging import log_event
 from app.domains.agent.providers.anthropic import AnthropicProvider
 from app.domains.agent.providers.base import LlmEvent, LlmRequest, Provider, ProviderError
 from app.domains.agent.providers.ollama import OllamaProvider
@@ -49,7 +50,12 @@ async def stream_events(protocol: str, req: LlmRequest) -> AsyncIterator[LlmEven
         except ProviderError as e:
             if not e.retriable or emitted or attempt:
                 raise
-            logger.warning("provider 流式调用重试（%s）: %s", protocol, e.code)
+            log_event(
+                logger,
+                f"模型来源「{protocol}」的流式调用失败，正在重试一次",
+                level=logging.WARNING,
+                detail={"模型来源": protocol, "原因码": e.code},
+            )
 
 
 # ── 服务商智能识别：网址 + 密钥 → 协议 / 服务商 / 可用模型清单 ──────────

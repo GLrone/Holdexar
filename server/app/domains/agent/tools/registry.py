@@ -25,12 +25,25 @@ class ToolRegistry:
 
     def views(self) -> list[dict]:
         """模型可见的 function 视图（openai function 信封形状）。"""
-        return [
-            {"type": "function", "function": {
-                "name": s.name, "description": s.description, "parameters": s.parameters,
-            }}
-            for s in self._specs.values()
-        ]
+        out = []
+        for s in self._specs.values():
+            params = dict(s.parameters)
+            props = dict(params.get("properties") or {})
+            if "emit_card" not in props:
+                props["emit_card"] = {
+                    "type": "boolean",
+                    "description": "是否在用户界面渲染可视化卡片（默认 true；若仅为内部核验/中间查询请传 false）",
+                }
+                params["properties"] = props
+            out.append({
+                "type": "function",
+                "function": {
+                    "name": s.name,
+                    "description": s.description,
+                    "parameters": params,
+                },
+            })
+        return out
 
     def meta(self) -> dict[str, dict]:
         """时间线 label 表（旧 TOOL_META 形状：name → {"label": 词条片段}）。"""
