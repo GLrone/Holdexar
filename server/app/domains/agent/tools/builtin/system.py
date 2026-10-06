@@ -1,8 +1,9 @@
-"""系统诊断与联网工具：任务失败 / 代理池 / 写闸 / 联网搜索 / 价格补抓 / 测试邮件。"""
+"""系统诊断与联网工具：任务失败 / 代理池 / 出口明细 / 延迟检测 / 写闸 / 联网搜索 / 价格补抓 / 测试邮件。"""
 from __future__ import annotations
 
 import asyncio
 import re
+import time
 
 import aiohttp
 
@@ -47,6 +48,63 @@ async def proxy_pool_status() -> dict:
          "tone": "ok" if clash.get("running") else "warn"},
     ]
     return _shared.rows_result("proxy", rows)
+
+
+async def proxy_exit_detail() -> dict:
+    """出口节点明细（clash_nodes 账本只读投影）：逐节点状态/延迟/出口 IP。
+
+    只读最近一次检测留下的账本事实，不发起探测；存活节点按延迟升序在前。"""
+    overview = await proxies_service.clash_nodes_overview()
+    if not overview.get("running"):
+        return _shared.rows_result("proxyExits", [{"k": "", "vKey": "proxyStopped", "tone": "warn"}])
+    nodes = overview.get("nodes") or []
+    rows = [
+        {
+            "k": str(n.get("name") or ""),
+            "v": " · ".join(bits) if (bits := [b for b in (
+                str(n.get("exit_ip") or ""),
+                f"{n['latency_ms']}ms" if n.get("latency_ms") is not None else "",
+            ) if b]) else "",
+            "tone": "ok" if n.get("status") == "ok" else "bad",
+        }
+        for n in nodes
+    ]
+    return _shared.rows_result("proxyExits", rows, total=len(rows))
+
+
+# 出口延迟检测的轮询窗口（秒）：略低于 projection 里给该工具的执行预算，
+# 超窗未收口按超时行返回——由模型决定是否稍后重试
+_PROXY_TEST_WAIT_S = 170.0
+_PROXY_TEST_POLL_S = 2.0
+
+
+async def proxy_latency_test() -> dict:
+    """发起一次全量出口延迟检测并等到收口（与手动检测/首检同一会话）。
+
+    返回逐节点 存活/延迟/出口 IP；存活按延迟升序在前，方便模型直接引用
+    「最快的前几个」。检测进行中重复调用会复用在飞会话。"""
+    snap = proxies_service.clash_test_start()
+    deadline = time.monotonic() + _PROXY_TEST_WAIT_S
+    while snap and snap.get("phase") in ("queued", "running") and time.monotonic() < deadline:
+        await asyncio.sleep(_PROXY_TEST_POLL_S)
+        snap = proxies_service.clash_test_progress() or snap
+    if not snap:
+        return _shared.rows_result("proxyTest", [{"k": "", "vKey": "proxyStopped", "tone": "warn"}])
+    if snap.get("phase") not in ("done", "failed"):
+        return _shared.rows_result("proxyTest", [{"k": "", "vKey": "proxyTestPending", "tone": "warn"}])
+    if snap.get("phase") == "failed":
+        return _shared.rows_result("proxyTest", [{"k": "", "v": str(snap.get("error") or "")[:80], "tone": "bad"}])
+    probed = [n for n in (snap.get("nodes") or []) if n.get("probed")]
+    probed.sort(key=lambda n: (not n.get("alive"),
+                               n.get("ms") if n.get("ms") is not None else 1 << 30))
+    alive = sum(1 for n in probed if n.get("alive"))
+    rows: list[dict] = [{"k": "", "v": f"{alive}/{len(probed)}", "tone": "ok" if alive else "bad"}]
+    rows.extend({
+        "k": str(n.get("name") or ""),
+        "v": (f"{n.get('exitIp') or '-'} · {n.get('ms')}ms" if n.get("alive") else ""),
+        "tone": "ok" if n.get("alive") else "bad",
+    } for n in probed)
+    return _shared.rows_result("proxyTest", rows, total=len(probed))
 
 
 async def write_gate_status() -> dict:
@@ -164,6 +222,14 @@ async def _proxy_pool_status(args: dict, sid: str | None = None) -> dict:
     return await proxy_pool_status()
 
 
+async def _proxy_exit_detail(args: dict, sid: str | None = None) -> dict:
+    return await proxy_exit_detail()
+
+
+async def _proxy_latency_test(args: dict, sid: str | None = None) -> dict:
+    return await proxy_latency_test()
+
+
 async def _write_gate_status(args: dict, sid: str | None = None) -> dict:
     return await write_gate_status()
 
@@ -216,6 +282,20 @@ SPECS = [
         description="查看代理通道可用状态（价格抓取依赖它）。诊断『价格不更新/抓取不动』类网络问题时与任务失败清单配合调用",
         parameters={"type": "object", "properties": {}},
         handler=_proxy_pool_status, step_label="proxyStatus",
+    ),
+    ToolSpec(
+        name="proxy_exit_detail", group="read", risk="low",
+        description="查看代理出口节点明细：逐节点的状态、延迟与出口 IP（最近一次检测的账本事实，不发起新探测）。"
+                    "用户问『出口 IP 是什么/有哪些节点/哪个节点延迟最低』时调用",
+        parameters={"type": "object", "properties": {}},
+        handler=_proxy_exit_detail, step_label="proxyExits",
+    ),
+    ToolSpec(
+        name="proxy_latency_test", group="read", risk="medium",
+        description="对全部代理出口节点发起一次真实延迟与连通性检测（耗时约 1~3 分钟，等它跑完再回答）。"
+                    "用户说『测一下节点延迟/测试连通性/体检代理』时调用；只想看最近一次结果用 proxy_exit_detail",
+        parameters={"type": "object", "properties": {}},
+        handler=_proxy_latency_test, step_label="proxyLatencyTest",
     ),
     ToolSpec(
         name="write_gate_status", group="read", risk="low",

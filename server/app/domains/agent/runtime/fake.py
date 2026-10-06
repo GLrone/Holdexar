@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 
+from app.core.logging import log_event
 from app.domains.agent import service as agent_service
 from app.domains.agent.runtime import events as agent_events_spec
 from app.domains.agent.runtime.cancellation import REGISTRY
@@ -61,6 +62,11 @@ async def execute_fake_run(
             await agent_service.apply_transition(run_id, RUN_DONE)
     except IllegalRunTransition:
         # 状态已被他方收敛（收尸/取消竞态）：本轮执行作废，不与账本对抗
-        logger.info("fake run %s 状态已被收敛，执行作废", run_id)
+        log_event(
+            logger,
+            f"模拟运行 {run_id} 的状态已被他方收敛，本轮执行作废",
+            tag="忽略",
+            detail={"运行": run_id},
+        )
     finally:
         REGISTRY.pop(run_id)

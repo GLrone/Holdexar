@@ -21,6 +21,7 @@ from app.core.database import (
     get_session_factory,
     write_gate,
 )
+from app.core.logging import log_event
 from app.crawler.utils import get_beijing_time_obj
 from app.domains.agent.models import AgentEvent, AgentRun, AgentSession
 from app.domains.agent.runtime import events as agent_events_spec
@@ -108,6 +109,39 @@ async def create_run(
             ))
         await session.commit()
     return {"run_id": rid, "session_id": sid, "status": RUN_QUEUED}
+
+
+# 非交互 run 的统一挂靠会话：调度桥 / CLI / 手动受理的运行账本都锚在
+# 这一行（agent_runs.session_id 非空外键）；领航台会话列表走 pilot
+# SessionStore（JSONL 文件），不受此行影响
+SYSTEM_SESSION_ID = "runtime"
+
+
+async def ensure_system_session() -> str:
+    """挂靠会话幂等建（首次一次写，之后零开销）。"""
+    async with write_gate(WritePriority.INTERACTIVE, "agent_session"), get_session_factory()() as session:
+        if await session.get(AgentSession, SYSTEM_SESSION_ID) is None:
+            ts = _now()
+            session.add(AgentSession(id=SYSTEM_SESSION_ID, created_at=ts, updated_at=ts))
+            await session.commit()
+    return SYSTEM_SESSION_ID
+
+
+async def adopt_task_run(
+    *, kind: str, ref: dict | None = None, trigger: str = "manual"
+) -> dict:
+    """受纳运行：受理已在域内完成（用户入口直接调了域受理口）时建 task 型
+    run 并拉起观察执行器（adopted=True，不重复受理）。受理被域拒绝时
+    调用方根本走不到这里——HTTP 4xx 即拒绝记录，不为按钮重试造账。"""
+    await ensure_system_session()
+    created = await create_run(
+        session_id=SYSTEM_SESSION_ID,
+        runner="task",
+        trigger=trigger,
+        meta={"task": kind, "adopted": True, "ref": dict(ref or {})},
+    )
+    await start_run(created["run_id"])
+    return created
 
 
 async def start_run(run_id: str) -> dict:
@@ -345,5 +379,9 @@ async def reconcile_orphan_runs() -> int:
         except LookupError:  # 并发窗口内已被收敛，跳过
             continue
     if count:
-        logger.info("Agent 启动收尸：%d 条未终态 run 收敛为 cancelled", count)
+        log_event(
+            logger,
+            f"启动收尸：{count} 条重启前遗留的未完成运行已收敛为已取消",
+            detail={"收敛条数": count},
+        )
     return count

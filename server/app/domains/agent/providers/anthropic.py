@@ -26,27 +26,33 @@ from app.domains.agent.providers.base import (
 
 
 def _convert(messages: tuple) -> tuple[str | None, list[dict]]:
-    """内部消息 → Anthropic 形态：system 提顶、工具结果转 tool_result 块。"""
+    """内部消息 → Anthropic 形态：system 提顶、工具结果转 tool_result 块、
+    连续同角色合并为单条多块消息（tool_result 必须收进 user 消息）。"""
     system = "\n".join(m.content for m in messages if m.role == "system") or None
     out: list[dict] = []
     for m in messages:
         if m.role == "system":
             continue
         if m.role == "user":
-            out.append({"role": "user", "content": [{"type": "text", "text": m.content or ""}]})
+            blocks = [{"type": "text", "text": m.content or ""}]
         elif m.role == "assistant":
             blocks: list[dict] = []
             if m.content:
                 blocks.append({"type": "text", "text": m.content})
             for tc in m.tool_calls:
                 blocks.append({"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.arguments})
-            out.append({"role": "assistant", "content": blocks})
         elif m.role == "tool":
-            out.append({"role": "user", "content": [{
+            blocks = [{
                 "type": "tool_result",
                 "tool_use_id": m.tool_call_id or "",
                 "content": m.content or "",
-            }]})
+            }]
+        else:
+            continue
+        if out and out[-1]["role"] == m.role:
+            out[-1]["content"].extend(blocks)
+        else:
+            out.append({"role": m.role, "content": blocks})
     return system, out
 
 

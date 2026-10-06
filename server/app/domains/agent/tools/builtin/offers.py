@@ -61,7 +61,8 @@ async def price_drops() -> dict:
     items = [
         _shared.brief_item(
             int(e["appid"]), briefs.get(int(e["appid"])) if e.get("appid") else None,
-            note={"key": f"ev_{e.get('eventType')}", "v": str(e.get("region") or ""),
+            # 事件类型入库为大写枚举，词条键为小写——统一在此对齐，缺词条时前端会漏原始键
+            note={"key": f"ev_{str(e.get('eventType') or '').lower()}", "v": str(e.get("region") or ""),
                   "at": e.get("occurredAt")},
         )
         for e in events if e.get("appid")

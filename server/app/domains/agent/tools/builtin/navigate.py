@@ -38,7 +38,7 @@ SPECS = [
     ToolSpec(
         name="navigate", group="navigate", risk="low",
         description="跳转到用户想查看的模块页面。target 取值（用户说法 → target）："
-                    "仪表盘=dashboard、找游戏=library、游戏库=gamelib、我的关注=follows、"
+                    "仪表盘=dashboard、游戏商店=library、游戏库=gamelib、我的关注=follows、"
                     "捆绑包=bundles、价格提醒=alerts、活动日历=events、成就=achievements、"
                     "家庭=family、账单=bills、汇率=rates、工具箱=toolbox、任务=crawl、"
                     "网络=proxies、自动抓取=fetch、日志=logs、设置=settings。"

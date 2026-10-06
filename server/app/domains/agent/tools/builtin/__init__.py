@@ -54,6 +54,8 @@ _ORDER = (
     "diagnose_price",
     "recent_job_failures",
     "proxy_pool_status",
+    "proxy_exit_detail",
+    "proxy_latency_test",
     "write_gate_status",
     "list_tasks",
     "start_task",

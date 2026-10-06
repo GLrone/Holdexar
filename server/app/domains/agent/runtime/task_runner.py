@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import time
 
+from app.core.logging import log_event
 from app.domains.agent import service as agent_service
 from app.domains.agent.runtime import events as agent_events_spec
 from app.domains.agent.runtime import tasks as task_registry
@@ -26,6 +27,7 @@ from app.domains.agent.runtime.state import (
     RUN_FAILED,
     RUN_RUNNING,
     IllegalRunTransition,
+    map_domain_status,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,7 +90,13 @@ async def execute_task_run(
                 )
                 return
             except Exception:  # noqa: BLE001 —— 受理异常不外逃，账本记 failed
-                logger.exception("任务 %s 受理异常", kind)
+                log_event(
+                    logger,
+                    f"任务「{kind}」受理失败，本次执行按失败收敛",
+                    level=logging.ERROR,
+                    exc_info=True,
+                    detail={"任务": kind},
+                )
                 await agent_service.apply_transition(
                     run_id, RUN_FAILED, error_code="start_error"
                 )
@@ -102,14 +110,22 @@ async def execute_task_run(
 
         seen_active = adopted
         last_sig: tuple | None = None
+        last_obs: dict | None = None
         t0 = time.monotonic()
         while True:
             try:
                 obs = await spec.observe(ctx)
             except Exception:  # noqa: BLE001 —— 观测失败不杀任务（fail-soft）
-                logger.exception("任务 %s 进度观测失败", kind)
+                log_event(
+                    logger,
+                    f"任务「{kind}」进度观测失败，已跳过本次观测继续执行",
+                    level=logging.ERROR,
+                    exc_info=True,
+                    detail={"任务": kind},
+                )
                 obs = None
             if obs:
+                last_obs = obs
                 if obs.get("active"):
                     seen_active = True
                 sig = (obs.get("phase"), obs.get("done"), obs.get("total"), obs.get("note"))
@@ -136,12 +152,38 @@ async def execute_task_run(
                 try:
                     await spec.stop()
                 except Exception:  # noqa: BLE001 —— 停止失败不改变「已请求取消」
-                    logger.exception("任务 %s 停止请求失败", kind)
+                    log_event(
+                        logger,
+                        f"任务「{kind}」停止请求失败，已请求的取消不受影响",
+                        level=logging.ERROR,
+                        exc_info=True,
+                        detail={"任务": kind},
+                    )
             await agent_service.apply_transition(run_id, RUN_CANCELLED, reason="user")
         else:
-            await agent_service.apply_transition(run_id, RUN_DONE)
+            # 终态按域账本投影：观察到域终态才下业务结论；没观察到活动
+            # 一律 done + unobserved（进程内句柄瞬时态不冒充业务失败）
+            outcome = (last_obs or {}).get("outcome") if seen_active else None
+            run_state = map_domain_status(outcome) or RUN_DONE
+            if run_state == RUN_FAILED:
+                await agent_service.append_event(
+                    run_id, agent_events_spec.EV_TASK_FAILED,
+                    {"reason": f"domain_status={outcome}", "error_code": "domain_failed"},
+                )
+                await agent_service.apply_transition(
+                    run_id, RUN_FAILED, error_code="domain_failed"
+                )
+            elif run_state == RUN_CANCELLED:
+                await agent_service.apply_transition(run_id, RUN_CANCELLED, reason="domain")
+            else:
+                await agent_service.apply_transition(run_id, RUN_DONE)
     except IllegalRunTransition:
         # 状态已被他方收敛（孤儿收尸 / 终态后取消）：本轮执行作废
-        logger.info("任务 run %s 状态已被收敛，执行作废", run_id)
+        log_event(
+            logger,
+            f"运行 {run_id} 的状态已被他方收敛，本轮执行作废",
+            tag="忽略",
+            detail={"运行": run_id},
+        )
     finally:
         REGISTRY.pop(run_id)

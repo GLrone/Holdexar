@@ -16,9 +16,9 @@ def _spec(name):
     return spec
 
 
-def test_registry_holds_all_58_tools():
-    assert len(REGISTRY.names()) == 58
-    assert len(set(REGISTRY.names())) == 58
+def test_registry_holds_all_tools():
+    assert len(REGISTRY.names()) == 60
+    assert len(set(REGISTRY.names())) == 60
     assert set(REGISTRY.names()) == set(projection.LABELS)
 
 
