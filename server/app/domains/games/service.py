@@ -25,6 +25,7 @@ from sqlalchemy.orm import aliased
 
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
+from app.core.logging import log_event
 from app.crawler.utils import get_beijing_time_obj
 from app.domains.crawl import freshness as freshness_service
 from app.domains.regions.service import effective_regions
@@ -849,33 +850,16 @@ async def price_diagnosis(appid: int) -> dict | None:
 
 
 async def search_catalog(term: str, limit: int = 5) -> list[dict]:
-    """目录名检索（领航员找对象用）：name/name_en LIKE，不做价格 JOIN——
+    """目录名检索（领航员找对象用）：name/name_en 检索，不做价格 JOIN——
     未爬价 / 锁区游戏同样可见；找游戏页的带价检索走 list_games。
-    返回行与 list_games 同形（positiveRate 0-1），cn 价命中才带。"""
+    返回行与 list_games 同形（positiveRate 0-1），cn 价命中才带。
+    检索通道：优先 games_name_fts（CJK bigram 影子列，2 字中文/英文词/
+    整句均可命中，token 间 OR + 评测数排序）；FTS 无命中或不可用时退回 LIKE。"""
     q = (term or "").strip()
     if not q or limit <= 0:
         return []
-    like = f"%{q}%"
-    cn = aliased(GameCurrentPrice)
     async with get_session_factory()() as session:
-        rows = (
-            await session.execute(
-                select(Game, cn.cny_fen, cn.discount_percent)
-                .join(
-                    cn,
-                    and_(
-                        cn.appid == Game.appid,
-                        cn.region_code == "CN",
-                        cn.price_status == "ok",
-                    ),
-                    isouter=True,
-                )
-                .where(or_(Game.name.like(like), Game.name_en.like(like)))
-                .where(Game.appid.not_in(select(CatalogRemoval.appid)))
-                .order_by(desc(Game.review_count))
-                .limit(int(limit))
-            )
-        ).all()
+        rows = await _catalog_rows(session, q, int(limit))
     return [
         {
             "appid": int(g.appid),
@@ -888,6 +872,71 @@ async def search_catalog(term: str, limit: int = 5) -> list[dict]:
         }
         for g, cny, disc in rows
     ]
+
+
+_FTS_APPID_CAP = 1000
+
+
+async def _catalog_rows(session: AsyncSession, q: str, limit: int) -> list:
+    """目录检索取数：FTS 影子列优先，无命中 / 异常退回 LIKE 兜底。"""
+    from app.domains.games.searchtext import fts_match_expr
+
+    match_expr = fts_match_expr(q)
+    appids: list[int] = []
+    if match_expr:
+        try:
+            appids = list(
+                (
+                    await session.execute(
+                        text("SELECT appid FROM games_name_fts WHERE games_name_fts MATCH :m"),
+                        {"m": match_expr},
+                    )
+                ).scalars()
+            )[:_FTS_APPID_CAP]
+        except Exception:
+            # 影子表缺失/异常（未跑迁移的异常库）→ LIKE 通道仍可用
+            appids = []
+    cn = aliased(GameCurrentPrice)
+    if appids:
+        rows = (
+            await session.execute(
+                select(Game, cn.cny_fen, cn.discount_percent)
+                .join(
+                    cn,
+                    and_(
+                        cn.appid == Game.appid,
+                        cn.region_code == "CN",
+                        cn.price_status == "ok",
+                    ),
+                    isouter=True,
+                )
+                .where(Game.appid.in_(appids))
+                .where(Game.appid.not_in(select(CatalogRemoval.appid)))
+                .order_by(desc(Game.review_count))
+                .limit(limit)
+            )
+        ).all()
+        if rows:
+            return rows
+    like = f"%{q}%"
+    return (
+        await session.execute(
+            select(Game, cn.cny_fen, cn.discount_percent)
+            .join(
+                cn,
+                and_(
+                    cn.appid == Game.appid,
+                    cn.region_code == "CN",
+                    cn.price_status == "ok",
+                ),
+                isouter=True,
+            )
+            .where(or_(Game.name.like(like), Game.name_en.like(like)))
+            .where(Game.appid.not_in(select(CatalogRemoval.appid)))
+            .order_by(desc(Game.review_count))
+            .limit(limit)
+        )
+    ).all()
 
 
 async def briefs_for(appids: list[int]) -> dict[int, dict]:
@@ -2386,6 +2435,10 @@ async def restore_games(appids: list[int]) -> dict:
             await crawl_service.start_job(scope="appids", appids=recrawl, kind="catalog_restore")
         except (RuntimeError, ValueError) as e:
             # 已有任务在跑 / 空列表：恢复已生效，取价留给下一轮手动刷新
-            logger.info("目录恢复 %d 款未自动取价（%s）", len(recrawl), e)
+            log_event(
+                logger,
+                f"目录恢复后 {len(recrawl)} 款未自动取价，留待下一轮刷新",
+                detail={"原因": e},
+            )
 
     return {"restored": restored, "missing": len(clean) - restored}

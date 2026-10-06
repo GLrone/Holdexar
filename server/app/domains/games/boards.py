@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 
 import aiohttp
 
+from app.core.logging import log_event
+
 logger = logging.getLogger(__name__)
 
 SEARCH_URL = "https://store.steampowered.com/search/results"
@@ -160,8 +162,11 @@ async def fetch_board(key: str) -> list[int]:
             if len(collected) >= board.max_records:
                 break
             if consecutive_empty >= board.empty_tolerance:
-                logger.info("[%s] 连续 %d 批零新增，终止拉榜（已收集 %d 个）",
-                            board.key, consecutive_empty, len(collected))
+                log_event(
+                    logger,
+                    f"连续 {consecutive_empty} 批零新增，提前终止拉榜",
+                    detail={"榜单": board.key, "已收集": len(collected)},
+                )
                 break
             params = {
                 "start": (request_no - 1) * BATCH_SIZE,
@@ -177,13 +182,21 @@ async def fetch_board(key: str) -> list[int]:
                     proxy=proxy_url,
                 ) as resp:
                     if resp.status != 200:
-                        logger.warning("[%s] 第 %d 批请求失败：HTTP %d",
-                                       board.key, request_no, resp.status)
+                        log_event(
+                            logger,
+                            f"第 {request_no} 批拉榜请求失败，停止收集",
+                            detail={"榜单": board.key, "HTTP": resp.status},
+                            level=logging.WARNING,
+                        )
                         break
                     data = await resp.json(content_type=None)
             except (aiohttp.ClientError, asyncio.TimeoutError):
-                logger.warning("[%s] 第 %d 批网络错误，停止收集（已收集 %d 个）",
-                               board.key, request_no, len(collected))
+                log_event(
+                    logger,
+                    f"第 {request_no} 批拉榜网络错误，停止收集",
+                    detail={"榜单": board.key, "已收集": len(collected)},
+                    level=logging.WARNING,
+                )
                 break
 
             items = data.get("items") or [] if isinstance(data, dict) else []
@@ -200,8 +213,11 @@ async def fetch_board(key: str) -> list[int]:
                         added += 1
             consecutive_empty = consecutive_empty + 1 if added == 0 else 0
             if added:
-                logger.info("[%s] 第 %d 批 +%d（累计 %d）",
-                            board.key, request_no, added, len(collected))
+                log_event(
+                    logger,
+                    f"第 {request_no} 批拉榜新增 {added} 个",
+                    detail={"榜单": board.key, "累计": len(collected)},
+                )
             # 批间隔 500ms 避免限流（凑满即不再请求）
             if len(collected) < board.max_records:
                 await asyncio.sleep(BATCH_INTERVAL)
@@ -224,10 +240,16 @@ async def refresh_board(key: str) -> list[int]:
     appids = await fetch_board(key)
     if appids:
         _write_cache(key, appids)
-        logger.info("[%s] 同步完成：%d 个 appid", key, len(appids))
+        log_event(logger, "榜单同步完成", tag="成功", detail={"榜单": key, "appid 数": len(appids)})
         return appids
 
-    logger.warning("[%s] 同步未获取到数据，保留旧缓存兜底", key)
+    log_event(
+        logger,
+        "榜单同步未获取到数据，保留旧缓存兜底",
+        tag="未完成",
+        detail={"榜单": key},
+        level=logging.WARNING,
+    )
     cached = _board_state[key]["cache"]
     return cached if cached is not None else []
 
@@ -256,8 +278,13 @@ async def get_board(key: str) -> list[int]:
             return appids
 
         if st["stale"] is not None and time.monotonic() - st["stale_ts"] < STALE_TTL_SECONDS:
-            logger.warning("[%s] 拉取失败，使用 stale 缓存兜底（%d 个）",
-                           key, len(st["stale"]))
+            log_event(
+                logger,
+                "榜单实时拉取失败，回退到已过期的缓存兜底",
+                tag="降级",
+                detail={"榜单": key, "条数": len(st["stale"])},
+                level=logging.WARNING,
+            )
             return st["stale"]
         return []
 
@@ -332,12 +359,21 @@ async def backfill_specs(key: str, limit: int = 100) -> list[dict]:
                 if needs.get(appid, True):  # 库内无行 → True
                     pending.append(appid)
     except Exception:  # noqa: BLE001 —— 库查询失败不阻塞榜单本身
-        logger.exception("[%s] 反哺查询失败", board.key)
+        log_event(
+            logger,
+            "榜单反哺查询失败，本轮不做反哺",
+            detail={"榜单": board.key},
+            level=logging.ERROR,
+            exc_info=True,
+        )
         return []
 
     if not pending:
         return []
     pending = pending[:limit]
-    logger.info("[%s] 反哺队列：%d/%d 个榜单游戏待首爬（limit=%d）",
-                board.key, len(pending), len(appids), limit)
+    log_event(
+        logger,
+        "榜单反哺队列已生成",
+        detail={"榜单": board.key, "待首爬": len(pending), "榜单总数": len(appids), "上限": limit},
+    )
     return [{"scope": "appids", "appids": pending, "kind": board.backfill_kind}]
