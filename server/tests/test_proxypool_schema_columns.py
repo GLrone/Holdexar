@@ -107,4 +107,8 @@ async def test_init_db_heals_legacy_snapshot_table(tmp_data_dir):
         "FROM subscription_snapshots"
     ).fetchall()
     con.close()
-    assert row == [("OK", 200, "text/yaml", "direct", "https://heal.invalid/x", 1)]
+    from app.domains.proxies.subscription_secret import open_url
+
+    assert [(r[0], r[1], r[2], r[3], open_url(r[4]), r[5]) for r in row] == [
+        ("OK", 200, "text/yaml", "direct", "https://heal.invalid/x", 1)
+    ]

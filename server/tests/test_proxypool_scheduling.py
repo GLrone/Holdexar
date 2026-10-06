@@ -682,6 +682,9 @@ async def test_crawl_service_injects_current_runtime_per_run(
     from app.domains.proxypool.runtime import lane_proxy_urls
 
     await init_db()
+    # 本测试验证代理形态的 lane 注入：直连形态（现默认）proxy_urls/proxy_url 恒空
+    from app.domains.settings.service import set_value
+    await set_value("proxy.strategy", "proxy_first")
     await _add("1|A", port=_free_port())
     await _set_exit_ip("1|A", "1.1.1.1")
     base, secret = await _boot(proxy_runtime, kernel_exe_path, tmp_data_dir)
@@ -690,7 +693,7 @@ async def test_crawl_service_injects_current_runtime_per_run(
 
     captured: list[list[str] | None] = []
 
-    async def _stub_run_crawl(pairs, *, config, stop_event=None, pre_tasks=None):
+    async def _stub_run_crawl(pairs, *, config, stop_event=None, pre_tasks=None, crawl_job_id=None):
         captured.append(config.proxy_urls)
         return {"total": 1, "processed": 1, "success": 1, "failed": 0}
 
@@ -734,6 +737,9 @@ async def test_bundles_path_injects_runtime_and_fails_closed(
     from app.domains.crawl import service as cs
 
     await init_db()
+    # 本测试验证代理形态的 lane 注入：直连形态（现默认）proxy_urls/proxy_url 恒空
+    from app.domains.settings.service import set_value
+    await set_value("proxy.strategy", "proxy_first")
     await _add("1|A", port=_free_port())
     await _set_exit_ip("1|A", "1.1.1.1")
     async with get_session_factory()() as s:
@@ -742,7 +748,7 @@ async def test_bundles_path_injects_runtime_and_fails_closed(
 
     captured: list[str | None] = []
 
-    async def _stub_run_crawl(pairs, *, config, stop_event=None, pre_tasks=None):
+    async def _stub_run_crawl(pairs, *, config, stop_event=None, pre_tasks=None, crawl_job_id=None):
         captured.append(config.proxy_url)
         return {"total": 1, "processed": 1, "success": 1, "failed": 0}
 

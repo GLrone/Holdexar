@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 from datetime import datetime, timedelta
 
@@ -1867,6 +1868,7 @@ def _acct(job_id: str, fn, *, task_kind: str | None = None):
     """
     from app.domains.agent.runtime import scheduler_bridge
 
+    @functools.wraps(fn)
     async def _wrapped():
         await scheduler_bridge.run_accounted(job_id, fn, task_kind=task_kind)
 

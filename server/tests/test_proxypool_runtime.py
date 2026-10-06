@@ -227,7 +227,7 @@ def test_reconcile_reports_missing_and_ignores_builtins() -> None:
 # ── 4. 真实差额成因：池里有一条内核不认的节点 ────────────────────
 @pytest.mark.asyncio
 async def test_unloadable_node_makes_the_kernel_die_not_shrink(
-    tmp_data_dir, kernel_exe_path, clash_runtime
+    tmp_data_dir, kernel_exe_path, clash_runtime, monkeypatch
 ) -> None:
     """内核**不会**静默少加载，而是直接拒绝启动。
 
@@ -248,6 +248,12 @@ async def test_unloadable_node_makes_the_kernel_die_not_shrink(
     })
     config.write_text(yaml.safe_dump(doc, allow_unicode=True, sort_keys=False),
                       encoding="utf-8")
+
+    # -t 预检会启动前拒绝坏协议配置；本测试钉的是「内核运行时死亡不缩减」
+    # 的自愈语义（-t 覆盖不到的运行期死亡），放行校验让内核自己起来再死
+    from app.domains.proxies import clash_manager as _cm
+
+    monkeypatch.setattr(_cm, "validate_config", lambda *a, **k: None)
 
     with pytest.raises(RuntimeUnreachableError, match="不可用"):
         await _start_and_read(

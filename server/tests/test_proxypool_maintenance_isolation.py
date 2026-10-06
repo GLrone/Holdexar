@@ -91,7 +91,7 @@ async def test_l2_exception_keeps_l1_telemetry(tmp_data_dir, monkeypatch, caplog
     assert result is not None
     assert result.l1 == ("l1-outcome",), "L1 必须已执行"
     assert result.l2 == (), "L2 程序异常 → 本轮无结果，不得伪装成功"
-    assert "业务探针程序异常" in caplog.text, "必须有明确错误日志"
+    assert "业务可用性探针程序异常" in caplog.text, "必须有明确错误日志"
 
     async with get_session_factory()() as s:
         l1_rows = await s.scalar(
