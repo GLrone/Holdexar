@@ -28,15 +28,18 @@ APP_DIR = Path(__file__).resolve().parent.parent / "server" / "app"
 # 日后新增的裸 commit 仍会被拦）。豁免 = 调用点已在 write_gate 内、或写锁
 # 天然独占的启动机制；新增豁免须先在此登记并同步 CONSTRAINTS §八。
 ALLOW: dict[tuple[str, str], tuple[frozenset[str], str]] = {
-    ("core/seed_assets.py", "_merge_history_sync"): (
+    ("core/seed_assets.py", "_merge_history_chunk"): (
         frozenset({"commit", "execute"}),
-        "线程池原生连接合并（调用点已 write_gate 包裹，见 import_seed）"),
+        "线程池原生连接历史合并（分块续跑，每块调用点已 write_gate 包裹，六段逻辑键 INSERT only）"),
+    ("core/seed_assets.py", "_merge_bundles_sync"): (
+        frozenset({"commit", "execute"}),
+        "线程池原生连接捆绑包合并（调用点已 write_gate 包裹，与历史合并同形态）"),
     ("core/seed_assets.py", "_merge_current_prices_sync"): (
         frozenset({"commit", "execute"}),
-        "线程池原生连接现价快照合并（调用点已 write_gate 包裹，与 _merge_history_sync 同形态）"),
+        "线程池原生连接现价快照合并（调用点已 write_gate 包裹，与历史合并同形态）"),
     ("core/seed_assets.py", "_merge_game_tags_sync"): (
         frozenset({"commit", "execute"}),
-        "线程池原生连接玩家标签合并（调用点已 write_gate 包裹，与 _merge_history_sync 同形态）"),
+        "线程池原生连接玩家标签合并（调用点已 write_gate 包裹，与历史合并同形态）"),
     ("core/database.py", "_ensure_schema"): (
         frozenset({"execute"}),
         "启动链建表与存量回填（sync 引擎独占窗口执行，写调度器管不到同步连接）"),

@@ -4,17 +4,17 @@
     python scripts/build_release.py                    # 常规出包（沿用现有种子）
     python scripts/build_release.py --refresh-seed     # 先从生产库重导资产种子
     python scripts/build_release.py --skip-web         # 跳过前端构建（dist 已是最新）
-
 产物（三件，全部要上传 Release；清单由 scripts/build_manifest.py 生成）：
 - release/Holdexar-win64-v<版本>.zip —— 应用包，解压双击即用。包内**含
   mihomo 内核与 GeoIP 数据**（assets/clash → _MEIPASS/clash），用户机器不需要
   自装 Clash、也不需要首次联网下载内核；缺该资产即中止出包（见
-  ensure_clash_assets）。**用户数据不在包内、也不落在程序目录**：打包态数据
+  ensure_clash_assets）。**不含种子**（按需下载落 data/seed，见
+  app/core/seed_fetch.py）。**用户数据不在包内、也不落在程序目录**：打包态数据
   目录判定见 app/core/paths.py（默认落 %LOCALAPPDATA% 下的同名目录），因此
   覆盖解压、换目录、整包删除重装都不会碰到用户数据。
-- release/holdexar_seed.db —— 公共数据种子独立资产（汇率档案 + games 人工策划列
-  + 3 年价格历史切片），供源码 clone 用户（run.py 首次启动）经
-  scripts/fetch_seed.py 自动获取；价格历史按种子版本对老用户库增量合并。
+- release/holdexar_seed.db.gz —— 公共数据种子独立资产（games 人工策划列
+  + 预设池 + 目录/现价 + 玩家标签；不含汇率与价格历史），供应用首启按需下载
+  与源码 clone 用户（run.py 首次启动）经 scripts/fetch_seed.py 自动获取。
 - release/latest.json —— 更新清单，挂到固定 tag `updater` 供客户端检查更新。
   加 Scoop 渠道时另出 release/scoop/（用法见 packaging/scoop/README.md）。
 """
@@ -41,6 +41,7 @@ WORK_DIR = RELEASE / "work"
 VENV_PY = SERVER / ".venv" / "Scripts" / "python.exe"
 
 SEED_BASENAME = "holdexar_seed.db"
+SEED_GZ_NAME = "holdexar_seed.db.gz"
 # 公共目录库模板（server/scripts/export_template_db.py 的落点同在 assets/seed/）。
 # 它与种子的分发路径不同：包内只留种子（sanitize 的 .db 白名单只认 SEED_BASENAME，
 # 模板库在打包产物里会被当残留剔除），因此它是**纯独立 Release 资产**——
@@ -76,14 +77,6 @@ def app_version() -> str:
 def refresh_seed() -> None:
     print("[种子] 从生产库重导资产种子 ...")
     subprocess.check_call([str(pick_python()), str(ROOT / "scripts" / "export_seed.py")])
-
-
-def ensure_seed_dir() -> None:
-    """spec datas 引用 assets/seed，目录必须存在（无种子 = 空目录，导入零开销）。"""
-    SEED_DIR.mkdir(parents=True, exist_ok=True)
-    if not SEED_DB.is_file():
-        print("[警告] 未找到资产种子（assets/seed/holdexar_seed.db），"
-              "本包将不带汇率档案/人工列；发布前建议先跑 --refresh-seed")
 
 
 def ensure_clash_assets() -> None:
@@ -131,18 +124,19 @@ def run_pyinstaller(python: Path) -> None:
 
 
 def sanitize() -> None:
-    """产物消毒：任何用户数据/日志残留即删除并复检，仍有则中止发布。"""
+    """产物消毒：任何用户数据/日志/db 残留即删除并复检，仍有则中止发布。
+
+    种子不随包（spec datas 已移除 seed/），产物里出现任何 .db 都是残留。
+    """
     assert APP_DIR.is_dir(), f"打包产物缺失：{APP_DIR}"
     residue: list[Path] = []
     for path in APP_DIR.rglob("*"):
-        rel = path.relative_to(APP_DIR)
-        parts = rel.parts
-        is_seed = len(parts) >= 2 and parts[-2] == "seed" and path.name == SEED_BASENAME
         if path.is_dir() and path.name == "data":
             residue.append(path)
-        elif path.is_file() and not is_seed:
-            if path.suffix.lower() in (".log", ".db", ".sqlite3", ".db-wal", ".db-shm"):
-                residue.append(path)
+        elif path.is_file() and path.suffix.lower() in (
+            ".log", ".db", ".sqlite3", ".db-wal", ".db-shm",
+        ):
+            residue.append(path)
     for path in residue:
         if path.is_dir():
             shutil.rmtree(path, ignore_errors=True)
@@ -151,13 +145,7 @@ def sanitize() -> None:
     residue = [
         p for p in APP_DIR.rglob("*")
         if (p.is_dir() and p.name == "data")
-        or (
-            p.is_file()
-            and p.suffix.lower() in (".log", ".db", ".sqlite3", ".db-wal", ".db-shm")
-            and not (len(p.relative_to(APP_DIR).parts) >= 2
-                     and p.relative_to(APP_DIR).parts[-2] == "seed"
-                     and p.name == SEED_BASENAME)
-        )
+        or (p.is_file() and p.suffix.lower() in (".log", ".db", ".sqlite3", ".db-wal", ".db-shm"))
     ]
     if residue:
         sys.exit(f"[错误] 产物消毒复检仍有残留，中止发布：{residue}")
@@ -191,18 +179,25 @@ def make_zip(version: str) -> tuple[Path, str]:
 
 
 def stage_seed_asset() -> Path | None:
-    """把种子另存为 release/ 下的**独立 Release 资产**。
+    """把种子压缩为 release/ 下的**独立 Release 资产**（holdexar_seed.db.gz）。
 
-    发布包内已含一份（zip 用户零操作）；独立资产供**源码 clone 用户**的
-    run.py 首次启动经 scripts/fetch_seed.py 拉取——大体积二进制不入 git，
-    走 Release 资产分发。
+    应用首启按需下载（core/seed_fetch.py）与源码 clone 用户（run.py 经
+    scripts/fetch_seed.py）都拉这份 gz——大体积二进制不入 git，走 Release
+    资产分发。源种子缺失时跳过（发布无种子，应用侧静默等下次发布）。
     """
     if not SEED_DB.is_file():
+        print("[提示] 未找到源种子（assets/seed/holdexar_seed.db），"
+              "本轮发布不含种子资产；需要时先跑 --refresh-seed")
         return None
     RELEASE.mkdir(parents=True, exist_ok=True)
-    dest = RELEASE / SEED_BASENAME
-    shutil.copy2(SEED_DB, dest)
-    print(f"[发布] 种子资产：{dest.name}（{dest.stat().st_size / 1048576:.1f} MB）")
+    dest = RELEASE / SEED_GZ_NAME
+    import gzip
+
+    with SEED_DB.open("rb") as fin, gzip.open(dest, "wb", compresslevel=9) as fout:
+        while chunk := fin.read(1 << 20):
+            fout.write(chunk)
+    print(f"[发布] 种子资产：{dest.name}（{dest.stat().st_size / 1048576:.1f} MB，"
+          f"源 {SEED_DB.stat().st_size / 1048576:.1f} MB）")
     return dest
 
 
@@ -254,7 +249,6 @@ def main() -> None:
 
     if args.refresh_seed:
         refresh_seed()
-    ensure_seed_dir()
     ensure_clash_assets()
     if not args.skip_web:
         build_web()

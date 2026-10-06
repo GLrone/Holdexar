@@ -29,6 +29,7 @@ from sqlalchemy import JSON, DateTime, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base, WritePriority, get_session_factory, write_gate
+from app.core.logging import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -99,5 +100,11 @@ async def record(
             await own.commit()
         return True
     except Exception:  # noqa: BLE001 —— 观测失败不得影响生产
-        logger.exception("[编排事件] 写入失败（kind=%s）", kind)
+        log_event(
+            logger,
+            "编排事件写入失败，已按容错约定忽略",
+            level=logging.ERROR,
+            exc_info=True,
+            detail={"事件类型": kind},
+        )
         return False

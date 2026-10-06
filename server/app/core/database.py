@@ -17,24 +17,48 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import sys
 import time
 from collections import deque
 from collections.abc import AsyncIterator
+from datetime import datetime
 from enum import IntEnum
 from functools import lru_cache
 from pathlib import Path
 
 from sqlalchemy import event
+from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
 from app.core.config import get_settings
+from app.core.logging import log_event
 
 logger = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
     """全部域模型的声明基类。"""
+
+
+@event.listens_for(Engine, "connect")
+def _register_sqlite_name_bigram(dbapi_conn, _record) -> None:
+    """全进程每个 sqlite 连接注册 games_name_fts 影子文本函数（v13 触发器
+    与回填依赖）。挂在 Engine 类级而非 get_engine 局部——迁移可能在测试
+    自建引擎上跑、任意引擎连接都可能是 games 写入方，函数缺失会让写入
+    硬炸「no such function」。非 sqlite 连接（无 create_function）跳过。"""
+    create_function = getattr(dbapi_conn, "create_function", None)
+    if create_function is None:
+        return
+    from app.domains.games.searchtext import name_bigram as _name_bigram
+
+    def _name_bigram_udf(name, name_en):  # noqa: ANN001 - sqlite3 UDF 签名
+        try:
+            return _name_bigram(f"{name or ''} {name_en or ''}")
+        except Exception:
+            return ""
+
+    create_function("name_bigram", 2, _name_bigram_udf, deterministic=True)
 
 
 # ── 轻量 schema 迁移（统一标准）─────────────────────────────
@@ -343,7 +367,7 @@ def _ensure_schema(sync_conn) -> None:
 #   2. _MIGRATIONS 追加 (版本号, 描述, SQL 列表)；SQL 须幂等（中断续跑 +
 #      用户库版本乱序防御），复杂逻辑可登记 async fn(engine) 同位元素
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 # 零小数货币（Steam 以整数计价）：旧捆绑包链路的除数表按 1 处理，与「统一存分」
 # 的新约定差 100 倍——v2 归一的目标集合
@@ -457,10 +481,18 @@ async def _migrate_bundle_price_units(conn) -> None:
         to_cents += 1 if is_units else 0
         fen_fixed += 1
     if rows:
-        logger.info(
-            "[迁移] 捆绑包零小数货币归一：扫描 %d 行，元→分 %d 行，cny_fen 纠正 %d 行，"
-            "无汇率跳过 %d 行，无法判定跳过 %d 行",
-            len(rows), to_cents, fen_fixed, skipped, undecided,
+        log_event(
+            logger,
+            f"把零小数货币的捆绑包区域价统一到人民币分：扫过 {len(rows)} 行，"
+            f"{to_cents} 行由元改分、{fen_fixed} 行修正了人民币分价",
+            tag="已修复",
+            detail={
+                "扫描行数": len(rows),
+                "元改分": to_cents,
+                "分价修正": fen_fixed,
+                "缺汇率跳过": skipped,
+                "无法判定跳过": undecided,
+            },
         )
 
 
@@ -512,9 +544,11 @@ async def _migrate_alert_targets_to_cny(conn) -> None:
         )
         converted += 1
     if converted or skipped:
-        logger.info(
-            "[迁移:v7] 价格阈值口径归一（外币分→人民币分）：%d 条换算，%d 条缺汇率跳过",
-            converted, skipped,
+        log_event(
+            logger,
+            f"把价格提醒的阈值统一换算成人民币分：{converted} 条完成换算，{skipped} 条因缺汇率跳过",
+            tag="已修复",
+            detail={"换算条数": converted, "缺汇率跳过": skipped, "迁移版本": 7},
         )
 
 
@@ -547,10 +581,16 @@ async def _migrate_gph_snapshot_unique(conn) -> None:
         )
     ).scalar_one()
     if dup_groups:
-        logger.warning(
-            "[迁移] game_price_history 存在 %d 组重复行（同 appid/区/时刻/sub/价/gold），"
-            "跳过 ux_gph_snapshot 建索引：请先人工核对清理，重启后本步骤会自动重试",
-            dup_groups,
+        log_event(
+            logger,
+            f"价格历史里还留着 {dup_groups} 组重复行，暂不建去重唯一索引——"
+            "请先人工核对清理，重启后本步骤会自动重试",
+            tag="跳过",
+            level=logging.WARNING,
+            detail={
+                "重复组数": dup_groups,
+                "重复判定": "同一游戏、同一区服、同一快照时刻、同一购买包、同一价格与史低标记",
+            },
         )
         return
     await conn.execute(
@@ -560,7 +600,12 @@ async def _migrate_gph_snapshot_unique(conn) -> None:
             " COALESCE(price, 0), COALESCE(is_gold, 0))"
         )
     )
-    logger.info("[迁移] game_price_history 幂等唯一索引 ux_gph_snapshot 已就绪")
+    log_event(
+        logger,
+        "价格历史表的去重唯一索引已就绪",
+        tag="成功",
+        detail={"索引名": "ux_gph_snapshot"},
+    )
 
 
 async def _migrate_fx_history_canonical(conn) -> None:
@@ -611,7 +656,12 @@ async def _migrate_fx_history_canonical(conn) -> None:
     )
     removed = dup.rowcount or 0
     if removed:
-        logger.info("[迁移:v8] 汇率历史同日合并：删除 %d 行（保留日收语义最后一行）", removed)
+        log_event(
+            logger,
+            f"汇率历史按日合并：删掉 {removed} 条同日多余记录，只留当天最后一条",
+            tag="已修复",
+            detail={"删除行数": removed, "迁移版本": 8},
+        )
 
 
 async def _migrate_monitoring_bootstrap(conn) -> None:
@@ -865,6 +915,44 @@ async def _migrate_player_tags(conn) -> None:
         await conn.execute(text("ALTER TABLE games DROP COLUMN genres"))
 
 
+async def _migrate_games_name_fts(conn) -> None:
+    """v13：games_name_fts 名称影子检索表（CJK bigram + 英文原词）。
+
+    FTS5 unicode61 不切 CJK（连续汉字整段成词）且 trigram 需 ≥3 字符，
+    2 字中文游戏名（只狼/黑魂/群星）在两者下都无法直查——影子文本把
+    名称预切为空格分隔的 2-gram（name_bigram UDF，注册见 get_engine
+    connect 钩子），每片段恰成一个 token。触发器同步让 db_writer / 导入 /
+    种子 / 管理台等全部 SQL 写入方零改动即被覆盖；回填先清后插保证幂等。
+    查询侧同函数变换见 games/service.search_catalog。
+    """
+    from sqlalchemy import text
+
+    await conn.execute(
+        text("CREATE VIRTUAL TABLE IF NOT EXISTS games_name_fts "
+             "USING fts5(appid UNINDEXED, name_bi)")
+    )
+    await conn.execute(text(
+        "CREATE TRIGGER IF NOT EXISTS games_name_bi_ai AFTER INSERT ON games BEGIN "
+        "INSERT INTO games_name_fts(appid, name_bi) "
+        "VALUES (new.appid, name_bigram(new.name, new.name_en)); END"
+    ))
+    await conn.execute(text(
+        "CREATE TRIGGER IF NOT EXISTS games_name_bi_au AFTER UPDATE OF name, name_en ON games BEGIN "
+        "DELETE FROM games_name_fts WHERE appid = old.appid; "
+        "INSERT INTO games_name_fts(appid, name_bi) "
+        "VALUES (new.appid, name_bigram(new.name, new.name_en)); END"
+    ))
+    await conn.execute(text(
+        "CREATE TRIGGER IF NOT EXISTS games_name_bi_ad AFTER DELETE ON games BEGIN "
+        "DELETE FROM games_name_fts WHERE appid = old.appid; END"
+    ))
+    await conn.execute(text("DELETE FROM games_name_fts"))
+    await conn.execute(text(
+        "INSERT INTO games_name_fts(appid, name_bi) "
+        "SELECT appid, name_bigram(name, name_en) FROM games"
+    ))
+
+
 # (目标版本, 说明, 迁移体)：迁移体 = SQL 语句列表，或 async callable(engine)
 _MIGRATIONS: list[tuple[int, str, object]] = [
     (2, "bundle_region_prices 零小数货币单位归一（元→分 + cny_fen 去虚高）",
@@ -914,6 +1002,9 @@ _MIGRATIONS: list[tuple[int, str, object]] = [
     (12, "玩家标签接替 genres：删除 games.genres（旧 appdetails 链路的粗粒度大类，"
          "写入者已删除、覆盖率停在 12.9%；标签两表由模型 create_all 建）",
      _migrate_player_tags),
+    (13, "games_name_fts 名称影子检索表（CJK bigram + 英文原词，unicode61 下"
+         "逐片成词——2 字中文游戏名可查；触发器同步覆盖全部 SQL 写入方）",
+     _migrate_games_name_fts),
 ]
 
 
@@ -976,16 +1067,41 @@ async def _snapshot_before_migration(current: int, target: int) -> None:
         # VACUUM INTO 的目标文件已存在会直接报错，先清
         dest.unlink(missing_ok=True)
         await asyncio.to_thread(snapshot_to, src, dest)
-        logger.info(
-            "[迁移] 迁移前快照已落：%s（v%d → v%d，%.1f MB）",
-            dest.name, current, target, dest.stat().st_size / 1024 / 1024,
+        size_mb = dest.stat().st_size / 1024 / 1024
+        log_event(
+            logger,
+            f"升级前已存好回滚快照 {dest.name}，准备把数据库结构从 v{current} 升到 v{target}",
+            tag="成功",
+            detail={
+                "快照文件": dest.name,
+                "当前版本": current,
+                "目标版本": target,
+                "大小MB": round(size_mb, 1),
+            },
         )
     except Exception:  # noqa: BLE001
-        logger.error(
-            "[迁移] 迁移前快照失败（v%d → v%d）：本次迁移**没有回滚点**。"
-            "迁移若中断或结果异常，请从 backups/ 里最近一份备份恢复",
-            current, target, exc_info=True,
+        log_event(
+            logger,
+            "升级前快照失败，这次迁移没有回滚点——迁移若中断或结果异常，"
+            "请从 backups/ 里最近一份备份恢复",
+            level=logging.ERROR,
+            exc_info=True,
+            detail={"当前版本": current, "目标版本": target},
         )
+
+
+def _headline(text: str) -> str:
+    """变更说明的首句：去掉括号里的展开。长解释整条留在 detail，主句只留结论。"""
+    depth = 0
+    kept = []
+    for char in text:
+        if char == "（":
+            depth += 1
+        elif char == "）":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            kept.append(char)
+    return "".join(kept).strip("，。；;： ")
 
 
 async def _run_schema_migrations() -> None:
@@ -1018,10 +1134,13 @@ async def _run_schema_migrations() -> None:
         # 高于本代码链 = 步骤被移除，或账本被外部写脏（如测试夹具把临时步骤
         # 泄漏进真实链后在生产库上跑过 init_db）——此时差额迁移会**全部静默
         # 跳过**，必须留痕
-        logger.warning(
-            "[迁移] 库结构版本 v%d 高于本代码迁移链最新 v%d："
-            "差额迁移将全部跳过，请核对版本账本",
-            current, latest,
+        log_event(
+            logger,
+            f"数据库结构版本 v{current} 比本程序认识的最高版本 v{latest} 还新，"
+            "差额迁移会全部跳过，请核对版本账本",
+            tag="跳过",
+            level=logging.WARNING,
+            detail={"库结构版本": current, "代码迁移链最高版本": latest},
         )
 
     pending = [m for m in _MIGRATIONS if m[0] > current]
@@ -1031,7 +1150,11 @@ async def _run_schema_migrations() -> None:
     for target_version, description, body in _MIGRATIONS:
         if target_version <= current:
             continue
-        logger.info("[迁移] schema v%d：%s", target_version, description)
+        log_event(
+            logger,
+            f"把数据库结构升级到 v{target_version}：{_headline(description)}",
+            detail={"目标版本": target_version, "变更说明": description},
+        )
         async with engine.begin() as conn:
             if callable(body):
                 await body(conn)
@@ -1176,9 +1299,26 @@ _WAIT_WARN_MS = {WritePriority.INTERACTIVE: 1000.0, WritePriority.BACKGROUND: 15
 _HOLD_WARN_MS = 5000.0
 
 
-def _label_suffix(label: str | None) -> str:
-    """告警日志的归属后缀：无标签时保持原日志形态。"""
-    return f" {label}" if label else ""
+_PRIORITY_LABELS = {"INTERACTIVE": "交互", "BACKGROUND": "后台"}
+
+
+def _priority_label(priority: WritePriority | str | None) -> str:
+    """优先级 → 人话。枚举名 `BACKGROUND` 印给用户看等于没写。"""
+    if priority is None:
+        return "无"
+    name = priority.name if isinstance(priority, WritePriority) else str(priority)
+    return _PRIORITY_LABELS.get(name, name)
+
+
+def _write_state_detail(state: dict) -> dict[str, object]:
+    """闸状态 → 人话键值。原始 dict 打进日志行是给程序看的，日志页没人读得懂。"""
+    return {
+        "持闸方": _priority_label(state["owner_priority"]),
+        "归属": state["owner_label"] or "未标注",
+        "闸": "占用中" if state["busy"] else "空闲",
+        "重入层数": state["depth"],
+        "排队": f"交互{state['waiting_interactive']}/后台{state['waiting_background']}",
+    }
 
 
 class WriteScheduler:
@@ -1203,6 +1343,9 @@ class WriteScheduler:
             WritePriority.INTERACTIVE: _SchedulerMetrics(),
             WritePriority.BACKGROUND: _SchedulerMetrics(),
         }
+        # 超阈值持闸/排队事件环（巨无霸收网用）：auto: 归属 + 等待者快照，
+        # 诊断端点直接出列表——不用再翻日志文本归因「是谁在堵」
+        self._events: deque[dict] = deque(maxlen=100)
 
     def snapshot(self) -> dict:
         """当前排队与占用状态（诊断输出用）。"""
@@ -1216,7 +1359,7 @@ class WriteScheduler:
         }
 
     def diagnostics(self) -> dict:
-        """诊断快照：占用归属 + 排队 + 分优先级等待/持闸指标（诊断端点用）。"""
+        """诊断快照：占用归属 + 排队 + 分优先级指标 + 超阈值事件环（诊断端点用）。"""
         return {
             **self.snapshot(),
             "metrics": {
@@ -1229,7 +1372,23 @@ class WriteScheduler:
                 }
                 for prio, m in self.metrics.items()
             },
+            "events": list(self._events),
         }
+
+    def _record_event(self, kind: str, priority: WritePriority, label: str | None,
+                      ms: float) -> None:
+        """超阈值持闸/排队事件入环（带 auto 归属与等待者快照，供收网归因）。"""
+        self._events.append({
+            "at": datetime.now().isoformat(timespec="seconds"),
+            "kind": kind,
+            "priority": priority.name,
+            "label": label or "未标注",
+            "ms": round(ms),
+            "waiting": {
+                "interactive": len(self._waiters[WritePriority.INTERACTIVE]),
+                "background": len(self._waiters[WritePriority.BACKGROUND]),
+            },
+        })
 
     async def acquire(self, priority: WritePriority, label: str | None = None) -> None:
         task = asyncio.current_task()
@@ -1271,10 +1430,12 @@ class WriteScheduler:
             hold_ms = (time.perf_counter() - self._hold_started) * 1000
             self.metrics[self._owner_priority].observe_hold(hold_ms)
             if hold_ms > _HOLD_WARN_MS:
-                logger.warning(
-                    "写调度：%s%s 写事务持闸 %.1fs（%s）",
-                    self._owner_priority.name, _label_suffix(self._owner_label),
-                    hold_ms / 1000, self.snapshot(),
+                self._record_event("hold", self._owner_priority, self._owner_label, hold_ms)
+                log_event(
+                    logger,
+                    f"{_priority_label(self._owner_priority)}写事务占用写锁 {hold_ms / 1000:.1f} 秒仍未释放",
+                    level=logging.WARNING,
+                    detail=_write_state_detail(self.snapshot()),
                 )
         self._owner = None
         self._owner_priority = None
@@ -1307,10 +1468,12 @@ class WriteScheduler:
         wait_ms = (time.perf_counter() - t0) * 1000
         self.metrics[priority].observe_wait(wait_ms)
         if wait_ms > _WAIT_WARN_MS[priority]:
-            logger.warning(
-                "写调度：%s%s 写事务排队 %.1fs 才拿到写者位（%s）",
-                priority.name, _label_suffix(label), wait_ms / 1000,
-                self.snapshot(),
+            self._record_event("wait", priority, label, wait_ms)
+            log_event(
+                logger,
+                f"{_priority_label(priority)}写事务排队 {wait_ms / 1000:.1f} 秒才拿到写锁",
+                level=logging.WARNING,
+                detail={**_write_state_detail(self.snapshot()), "申请方": label or "未标注"},
             )
 
 
@@ -1336,7 +1499,14 @@ class _WriteGate:
 
     async def __aenter__(self) -> None:
         self._scheduler = _scheduler_for_loop()
-        await self._scheduler.acquire(self._priority, self._label)
+        label = self._label
+        if label is None:
+            # 归属兜底：未显式标注时从调用栈取「谁在过闸」（auto:文件:行号）。
+            # owner_label=None 的观测盲区曾让 135-233s 级持闸无法点名——
+            # 任何巨型持闸都必须能回答「是谁」。
+            frame = sys._getframe(1)
+            label = f"auto:{frame.f_code.co_filename.replace(chr(92), '/').rsplit('/', 1)[-1]}:{frame.f_lineno}"
+        await self._scheduler.acquire(self._priority, label)
 
     async def __aexit__(self, *exc: object) -> None:
         if self._scheduler is not None:
@@ -1352,7 +1522,8 @@ def write_gate(
     （各域经自身 `get_session_factory` 导入取连接，测试接缝保持不变）。
 
     label 标注写事务归属（如 price_batch / wallet_save），随排队/持闸
-    告警日志输出，直接回答「是谁在堵」。"""
+    告警日志输出，直接回答「是谁在堵」；缺省时从调用栈自动取
+    `auto:文件:行号` 兜底——不存在无归属的持闸。"""
     return _WriteGate(priority, label)
 
 

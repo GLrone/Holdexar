@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from app.core.logging import log_event
 from app.crawler.utils import BEIJING_TZ
 
 logger = logging.getLogger(__name__)
@@ -81,7 +82,11 @@ async def _http_get_json(url: str, proxy: str | None) -> dict | None:
             resp.raise_for_status()
             return resp.json()
     except Exception as e:  # noqa: BLE001
-        logger.info("时间源请求失败（%s 通道）: %s", "代理" if proxy else "直连", e)
+        log_event(
+            logger,
+            "外部时间源请求失败",
+            detail={"通道": "代理" if proxy else "直连", "原因": str(e)},
+        )
         return None
 
 
@@ -93,7 +98,12 @@ def _warn_clock_drift(data: dict) -> None:
         ext = datetime.fromisoformat(re.sub(r"(\.\d{6})\d+", r"\1", raw))
         drift = abs((ext.replace(tzinfo=PACIFIC_TZ) - datetime.now(PACIFIC_TZ)).total_seconds())
         if drift > 300:
-            logger.warning("外部时间与本机时钟偏差 %.0f 分钟——本机时钟可能不准", drift / 60)
+            log_event(
+                logger,
+                "外部时间与本机时钟偏差过大，本机时钟可能不准",
+                level=logging.WARNING,
+                detail={"偏差分钟": round(drift / 60)},
+            )
     except Exception:  # noqa: BLE001 —— 诊断性质，失败静默
         pass
 
@@ -112,7 +122,13 @@ async def fetch_pacific_dst() -> tuple[bool, str]:
             continue
         zone = data.get("timeZone")
         if zone is not None and zone != TIMEAPI_ZONE:
-            logger.warning("时间源响应时区异常（%s），不采信", zone)
+            log_event(
+                logger,
+                "时间源响应时区异常，本次不采信",
+                tag="忽略",
+                level=logging.WARNING,
+                detail={"时区": zone},
+            )
             continue
         dst = data.get("dstActive")
         if isinstance(dst, bool):
