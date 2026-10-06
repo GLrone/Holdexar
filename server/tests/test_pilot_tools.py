@@ -257,15 +257,13 @@ def test_rates_and_calendar_rows(monkeypatch):
 
 
 def test_top_games_uses_board_and_names(monkeypatch):
-    class _Boards:
-        @staticmethod
-        async def get_board(key):
-            assert key == "topsellers"
-            return [10, 20, 30]
-    import sys
-    monkeypatch.setitem(sys.modules, "app.domains.games.boards", _Boards)
-    import importlib
-    importlib.reload(pilot_tools)
+    # top_games 实现在 agent.tools.builtin.catalog，拉榜经 boards.get_board——
+    # patch 模块属性即可（函数内 import 调用时解析），无需重载门面
+    async def _fake_get_board(key):
+        assert key == "topsellers"
+        return [10, 20, 30]
+
+    monkeypatch.setattr("app.domains.games.boards.get_board", _fake_get_board)
     monkeypatch.setattr(
         pilot_tools.games_service, "briefs_for",
         _async_return({10: {"name": "甲", "cnyFen": 6200, "discount": 0,
@@ -277,10 +275,6 @@ def test_top_games_uses_board_and_names(monkeypatch):
     assert out["total"] == 3
     assert out["items"][0]["name"] == "甲" and out["items"][0]["appid"] == 10
     assert out["items"][2]["appid"] == 30 and out["items"][2]["name"] is None
-    # 还原真实模块，避免影响后续用例
-    import app.domains.games.boards as real_boards
-    monkeypatch.setitem(sys.modules, "app.domains.games.boards", real_boards)
-    importlib.reload(pilot_tools)
 
 
 def test_list_accounts_projects_names_only(monkeypatch):

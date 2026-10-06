@@ -368,9 +368,14 @@ async def test_start_switches_subscription_when_running(monkeypatch, tmp_path):
 
     class _FakeProc:
         pid = 111
+        returncode = 0
+        args: list = []
+        _finished = False
 
         def poll(self):
-            return None
+            # 双语义：直用 Popen（内核进程句柄）时 None=在跑；
+            # communicate 之后（subprocess.run 校验路径）返回退出码 0
+            return 0 if self._finished else None
 
         def terminate(self):
             pass
@@ -380,6 +385,17 @@ async def test_start_switches_subscription_when_running(monkeypatch, tmp_path):
 
         def kill(self):
             pass
+
+        # 启动链上的 subprocess.run（内核版本探测等）把 Popen 当上下文管理器用
+        def communicate(self, input=None, timeout=None):
+            self._finished = True
+            return ("", "")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
 
     monkeypatch.setattr(clash_manager.subprocess, "Popen", lambda *a, **kw: _FakeProc())
     monkeypatch.setattr(clash_manager.ClashRuntime, "_kill_orphans", lambda self, exe, cfgp: 0)
@@ -742,9 +758,14 @@ class _FakeControllerClient:
 def _patch_kernel_launch(monkeypatch):
     class _FakeProc:
         pid = 111
+        returncode = 0
+        args: list = []
+        _finished = False
 
         def poll(self):
-            return None
+            # 双语义：直用 Popen（内核进程句柄）时 None=在跑；
+            # communicate 之后（subprocess.run 校验路径）返回退出码 0
+            return 0 if self._finished else None
 
         def terminate(self):
             pass
@@ -754,6 +775,17 @@ def _patch_kernel_launch(monkeypatch):
 
         def kill(self):
             pass
+
+        # 启动链上的 subprocess.run（内核版本探测等）把 Popen 当上下文管理器用
+        def communicate(self, input=None, timeout=None):
+            self._finished = True
+            return ("", "")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
 
     monkeypatch.setattr(clash_manager.subprocess, "Popen", lambda *a, **kw: _FakeProc())
     monkeypatch.setattr(clash_manager.ClashRuntime, "_kill_orphans", lambda self, exe, cfgp: 0)
@@ -786,7 +818,8 @@ async def test_ensure_running_switches_via_hot_reload(monkeypatch, tmp_path):
     assert r.port == 17891, "混合端口跟随新配置"
     assert any("/configs" in u for u in _FakeControllerClient.puts)
     text = Path(cfg).read_text(encoding="utf-8")
-    assert "HlProbeLane" in text and "external-controller" in text
+    # external-controller 只经命令行下发（resolve_controller 契约），文件里不该有
+    assert "HlProbeLane" in text and "external-controller" not in text
     r.stop()
 
 
