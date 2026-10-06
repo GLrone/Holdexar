@@ -95,16 +95,16 @@ def ensure_npm() -> None:
 
 
 def ensure_seed(python: Path) -> None:
-    """资产种子（历史汇率档案）：缺失则从 Release 资产补一份（不进 git，
-    见 scripts/fetch_seed.py）。失败只警告不阻断——没有种子只是汇率页
-    没有历史档案。"""
+    """资产种子（目录/现价/人工列/预设/标签公共切片）：缺失则从 Release 资产
+    补一份（gzip，不进 git，见 scripts/fetch_seed.py）。失败只警告不阻断——
+    没有种子时目录逐步由爬虫与云端分包补齐。"""
     seed = ROOT / "assets" / "seed" / "holdexar_seed.db"
     if seed.is_file():
         return
-    print("[数据] 未找到汇率档案种子，尝试从 Release 资产获取（约 12MB）…")
+    print("[数据] 未找到公共数据种子，尝试从 Release 资产获取（gzip，约几 MB）…")
     rc = _run([str(python), str(ROOT / "scripts" / "fetch_seed.py")])
     if rc != 0:
-        print("[警告] 汇率档案种子未获取到：汇率历史页将为空，其余功能不受影响。")
+        print("[警告] 公共数据种子未获取到：游戏商店首屏目录需等爬虫补齐，其余功能不受影响。")
 
 
 def ensure_kernel(python: Path) -> None:

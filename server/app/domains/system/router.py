@@ -28,7 +28,12 @@ from app.core.backup import (
     backup_dir,
 )
 from app.core.config import get_settings
-from app.core.database import WritePriority, get_session_factory, write_scheduler_diagnostics
+from app.core.database import (
+    SCHEMA_VERSION,
+    WritePriority,
+    get_session_factory,
+    write_scheduler_diagnostics,
+)
 from app.core.database import write_gate
 from app.core.logging import ring_log_handler
 from app.domains.games.models import Game, GameCurrentPrice, GamePriceHistory
@@ -449,6 +454,25 @@ async def update_pending() -> dict:
     return updater.pending_status()
 
 
+@router.get("/system/seed/status")
+async def seed_status() -> dict:
+    """公共数据种子状态：是否在位（含版本）+ 按需下载进度。"""
+    from app.core import seed_fetch
+
+    return await seed_fetch.status_snapshot()
+
+
+@router.post("/system/seed/fetch")
+async def seed_fetch_now() -> dict:
+    """手动触发种子按需获取（已就绪时空转返回；进行中 409）。"""
+    from app.core import seed_fetch
+
+    if seed_fetch.status().get("state") in ("downloading", "extracting", "merging"):
+        raise HTTPException(status_code=409, detail="种子获取已在进行中")
+    asyncio.get_running_loop().create_task(seed_fetch.ensure_seed_online())
+    return {"started": True}
+
+
 @router.post("/system/update-cancel")
 async def update_cancel() -> dict:
     """取消更新：下载中 → 中止下载（保留已下的续传基线，下次接着下）；
@@ -462,3 +486,167 @@ async def update_cancel() -> dict:
     if updater.download_progress().get("running"):
         return {**updater.cancel_download(), "cleared": False}
     return updater.clear_staging()
+
+# ─────────────────────── 结构化诊断（机器排障读证据面）───────────────────────
+
+# 写账等写锁预警阈值（毫秒）：BACKGROUND 持闸进入饥饿区间的经验线，
+# 超过它才值得把「写锁竞争」列为嫌疑
+_WRITE_LOCK_WAIT_WARN_MS = 30_000
+
+# 写账样本条数：环形缓冲里最近 N 条「写库分段完成」
+_WRITE_LEDGER_SAMPLES = 8
+
+
+def _parse_write_ledger(lines: list[str], limit: int) -> list[dict]:
+    """环形日志 → 写账样本（写库分段完成的分段毫秒）。
+
+    行格式（HumanFormatter）：`HH:MM:SS [结果词] 模块 · 主句 │ 键=值 键=值`。
+    解析只取诊断要用的三个数：款数 / 总计 / 等写锁（值形如 "12毫秒"）。
+    """
+    out: list[dict] = []
+    for line in reversed(lines):  # 旧→新扫，取最近 limit 条
+        if "写库分段完成" not in line:
+            continue
+        entry: dict = {"time": line[:8], "message": None, "entries": None, "total_ms": None, "lockwait_ms": None}
+        head, _, tail = line.partition(" │ ")
+        entry["message"] = head.split(" · ", 1)[-1]
+        for pair in tail.split():
+            key, _, value = pair.partition("=")
+            if key in ("款数", "总计", "等写锁"):
+                digits = "".join(ch for ch in value if ch.isdigit())
+                if digits:
+                    entry[{"款数": "entries", "总计": "total_ms", "等写锁": "lockwait_ms"}[key]] = int(digits)
+        out.append(entry)
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def _diagnostics_section(name: str, fn):
+    """单面故障不拖垮整体：一面异常就降级为 {"error": 原文}。"""
+    try:
+        return await fn() if asyncio.iscoroutinefunction(fn) else fn()
+    except Exception as e:  # noqa: BLE001 —— 诊断面自身必须可用
+        return {"error": str(e)[:200]}
+
+
+@router.get("/system/diagnostics")
+async def diagnostics() -> dict:
+    """机器排障读证据面：把散在四个账本里的疑难杂症证据收拢成一份快照。
+
+    聚合（全部只读，一面失败不拖垮整体）：
+    - 身份面：版本 / schema / 数据目录 / 策略（含是否显式选择）/ 内核态 /
+      系统代理 / 池可用出口数——回答「这个实例是谁、现在走什么通道」；
+    - 价格轮面：最近 5 轮 Cycle（终态 + 拒因 + 覆盖统计）——回答「上一轮
+      跑没跑、为什么失败」；
+    - 作业面：最近 10 次生产作业台账（proxy_job_runs，状态/出口/错误枚举）；
+    - 写账面：环形缓冲最近 8 条「写库分段完成」（款数/总计/等写锁）——
+      回答「写库是否在饥饿」；
+    - 派生信号 signals：机器可读的问题清单（code + 人话 + 级别），消费方
+      （领航员/运维/人）从「翻日志」变「读证据」。
+    """
+    from app.domains.crawl import cycle as cycle_service
+    from app.domains.crawl.service import has_pending_missing
+    from app.domains.proxies import clash_manager
+    from app.domains.proxies import service as proxies_service
+    from app.domains.proxypool import jobruns
+
+    settings = get_settings()
+
+    async def _identity() -> dict:
+        strategy_info = await proxies_service.get_strategy()
+        strategy = strategy_info["strategy"]
+        from app.domains.settings import service as settings_service
+
+        explicit = bool(
+            await settings_service.get_value(proxies_service.STRATEGY_EXPLICIT_KEY, False)
+        )
+        status = clash_manager.runtime.status()
+        pool = await proxies_service.pool_stats()
+        try:
+            system_proxy = await proxies_service.resolve_system_proxy_url()
+        except Exception:  # noqa: BLE001 —— 探活失败按无系统代理记
+            system_proxy = None
+        return {
+            "app_version": settings.version,
+            "schema_version": SCHEMA_VERSION,
+            "data_dir": str(settings.data_dir),
+            "strategy": strategy,
+            "strategy_explicit": explicit,
+            "clash_running": bool(status.get("running")),
+            "system_proxy": system_proxy,
+            "pool_available_exits": int(pool.get("available") or 0),
+        }
+
+    async def _cycles() -> dict:
+        cycles = await cycle_service.list_cycles(5)
+        return {"last": cycles[0] if cycles else None, "recent": cycles}
+
+    async def _job_runs() -> dict:
+        async with get_session_factory()() as session:
+            return await jobruns.list_runs(session, limit=10)
+
+    def _write_ledger() -> dict:
+        samples = _parse_write_ledger(
+            ring_log_handler.snapshot(2000), _WRITE_LEDGER_SAMPLES
+        )
+        return {"samples": samples}
+
+    async def _backlog() -> dict:
+        return {"missing_pending": bool(await has_pending_missing())}
+
+    identity = await _diagnostics_section("identity", _identity)
+    cycles = await _diagnostics_section("cycles", _cycles)
+    job_runs = await _diagnostics_section("job_runs", _job_runs)
+    write_ledger = _write_ledger()
+    backlog = await _diagnostics_section("backlog", _backlog)
+
+    # ── 派生信号：机器可读的嫌疑清单（有证据才产信号，不臆测）──
+    signals: list[dict] = []
+    last_cycle = (cycles.get("last") or {}) if isinstance(cycles, dict) else {}
+    if last_cycle.get("status") == "failed":
+        signals.append({
+            "code": "last_cycle_failed",
+            "severity": "error",
+            "text": f"上一轮价格刷新失败：{last_cycle.get('error') or '原因未随轮留痕'}",
+        })
+    samples = write_ledger.get("samples") if isinstance(write_ledger, dict) else []
+    lockwaits = [s["lockwait_ms"] for s in samples if s.get("lockwait_ms")]
+    if lockwaits and max(lockwaits) > _WRITE_LOCK_WAIT_WARN_MS:
+        signals.append({
+            "code": "write_lock_wait_high",
+            "severity": "warning",
+            "text": f"最近写账等写锁最高 {max(lockwaits)} 毫秒（预警线 {_WRITE_LOCK_WAIT_WARN_MS}），写库可能存在竞争",
+        })
+    items = (job_runs.get("items") or []) if isinstance(job_runs, dict) else []
+    bad_runs = [r for r in items if r.get("status") in ("failed", "interrupted")]
+    if bad_runs:
+        signals.append({
+            "code": "job_runs_failed",
+            "severity": "warning",
+            "text": f"最近 {len(items)} 次生产作业 {len(bad_runs)} 次失败/中断（作业台账面）",
+        })
+    if backlog.get("missing_pending"):
+        signals.append({
+            "code": "missing_backlog",
+            "severity": "info",
+            "text": "存在待补抓欠账（补抓通道按冷却自动消化）",
+        })
+    if isinstance(identity, dict) and "error" not in identity:
+        needs_pool = identity["strategy"] in ("proxy_first", "proxy_only")
+        if needs_pool and identity["pool_available_exits"] == 0:
+            signals.append({
+                "code": "proxy_pool_unavailable",
+                "severity": "error",
+                "text": "当前策略需要代理池但无可用出口，价格轮会被拒绝（到网络页确认订阅与节点）",
+            })
+
+    return {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "identity": identity,
+        "cycles": cycles,
+        "job_runs": job_runs,
+        "write_ledger": write_ledger,
+        "backlog": backlog,
+        "signals": signals,
+    }
