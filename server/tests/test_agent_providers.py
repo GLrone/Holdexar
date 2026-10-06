@@ -224,12 +224,29 @@ def test_request_parity_ollama():
 
 
 def test_convert_and_auth_headers_parity():
-    dicts = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}, TOOL_RESULT_MSG]
+    # 序列不出现相邻 user/tool：连续同角色合并是适配器有意新增的行为，
+    # 单独在 test_tool_result_merges_into_user_turn 断言
+    dicts = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"},
+             {"role": "assistant", "content": "a"}, TOOL_RESULT_MSG]
     old_system, old_out = pilot_llm._anthropic_convert(dicts)
     new_system, new_out = _convert(_to_messages(dicts))
     assert (old_system, old_out) == (new_system, new_out)
     assert base.auth_headers("openai", "sk") == pilot_llm._auth_headers("openai", "sk")
     assert base.auth_headers("anthropic", "") == pilot_llm._auth_headers("anthropic", "")
+
+
+def test_tool_result_merges_into_user_turn():
+    """工具结果以 tool_result 块收进 user 轮（Anthropic 无 tool 角色）：并入相邻
+    user 消息为单条多块，孤立时自成 user 轮。"""
+    dicts = [{"role": "user", "content": "u"}, TOOL_RESULT_MSG, {"role": "user", "content": "v"}]
+    _, out = _convert(_to_messages(dicts))
+    assert out == [
+        {"role": "user", "content": [
+            {"type": "text", "text": "u"},
+            {"type": "tool_result", "tool_use_id": "c1", "content": "res"},
+            {"type": "text", "text": "v"},
+        ]},
+    ]
 
 
 def test_list_models_url_parity():

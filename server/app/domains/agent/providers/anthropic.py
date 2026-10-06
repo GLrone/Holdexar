@@ -33,6 +33,18 @@ def _convert(messages: tuple) -> tuple[str | None, list[dict]]:
     for m in messages:
         if m.role == "system":
             continue
+        if m.role == "tool":
+            # Anthropic 无 tool 角色：工具结果以 tool_result 块收进 user 轮
+            blocks = [{
+                "type": "tool_result",
+                "tool_use_id": m.tool_call_id or "",
+                "content": m.content or "",
+            }]
+            if out and out[-1]["role"] == "user":
+                out[-1]["content"].extend(blocks)
+            else:
+                out.append({"role": "user", "content": blocks})
+            continue
         if m.role == "user":
             blocks = [{"type": "text", "text": m.content or ""}]
         elif m.role == "assistant":
@@ -41,12 +53,6 @@ def _convert(messages: tuple) -> tuple[str | None, list[dict]]:
                 blocks.append({"type": "text", "text": m.content})
             for tc in m.tool_calls:
                 blocks.append({"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.arguments})
-        elif m.role == "tool":
-            blocks = [{
-                "type": "tool_result",
-                "tool_use_id": m.tool_call_id or "",
-                "content": m.content or "",
-            }]
         else:
             continue
         if out and out[-1]["role"] == m.role:
