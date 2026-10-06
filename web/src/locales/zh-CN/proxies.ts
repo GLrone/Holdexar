@@ -1,21 +1,8 @@
-/* proxies 词条 —— 代理管理页（views/proxies/Index.vue）。
-   页内四区：路由策略卡片网格 / Clash 接入 / 代理节点列表 / 走线控制台。
-
-   分节 key（`section.*`）同时是**页内分节锚点的显示名**：四个区块的
-   `data-section` 直接写这个 key（锚点与语言无关，切语言时 ProductTour 的
-   选择器不会断），HlSectionRail 读到后用 t() 显示。
-   其中 `proxies.section.clash` 是**契约值**——ProductTour 的 target 里逐字
-   引用同一个字符串（见 .tmp-i18n-brief5.md 第一节），改名即引导静默落空。
-
-   几处刻意的复用：
-   · 两张表格的「节点地址」「状态」列头是同一件事，共用 node.col*；
-   · 「改名」「删除」「保存订阅」在订阅行与节点行是同一个动作，共用一份；
-   · 「检测中…」在池测试与 Clash 逐节点检测两处是同一句话，共用 node.checking。
-
-   参数化整句（不拆片段拼接）：内核下载/安装结果、订阅重拉、明文订阅导入
-   统计、Clash 检测结果——中英语序与量词不同，拆成「标签 + 值」多条再拼
-   拼不回去。`kernel.sizeHint` / `kernel.viaWrap` 是**标点差异**（全角括号与
-   分隔符）落进词条，让英文界面不出现全角括号。 */
+/* proxies 词条 —— 代理管理页（views/proxies/Index.vue）。页内四区：路由策略 / Clash 接入 / 节点列表 / 走线控制台。
+   分节 key（section.*）同时是页内分节锚点的显示名；契约：proxies.section.clash 被 ProductTour 的 target 逐字引用，改名即引导静默落空。
+   复用：两张表格列头共用 node.col*；「改名 / 删除 / 保存订阅」订阅行与节点行共用；「检测中…」共用 node.checking。
+   不变量：内核安装 / 订阅重拉 / 导入统计 / 检测结果为参数化整句、组件侧不拼片段；
+   kernel.sizeHint / kernel.viaWrap 把标点差异落进词条（英文界面不出现全角括号）。 */
 
 const proxies = {
   /* 分节锚点 + 区块标题（data-section 直接写这组 key） */
@@ -34,6 +21,10 @@ const proxies = {
   'proxies.strategy.proxyFirst.desc': 'Clash 在跑走 Clash<br><small>否则代理池轮询，最后直连</small>',
   'proxies.strategy.directOnly.label': '直连',
   'proxies.strategy.directOnly.desc': '作业托管到本机网络环境（加速器 / Clash Verge 的通道即实际出口）<br><small>价格作业也走本机 · 限速 200 次/5 分钟</small>',
+  'proxies.strategy.directOnly.infoTitle': '直连模式使用建议',
+  'proxies.strategy.directOnly.infoP1': '直连模式下，价格获取由本机网络直连 Steam，速度与成功率取决于网络环境。',
+  'proxies.strategy.directOnly.infoP2': '建议开启网络加速器（如 UU 加速器、Watt Toolkit（原 Steam++））加速 Steam 后，再使用直连模式。',
+  'proxies.strategy.directOnly.infoOk': '知道了',
   'proxies.strategy.directFirst.label': '直连优先',
   'proxies.strategy.directFirst.desc': '本机优先<br><small>失败时换代理重试</small>',
   'proxies.strategy.proxyOnly.label': '完全走代理',
@@ -129,6 +120,7 @@ const proxies = {
   'proxies.sub.savedNodes': '订阅已保存（{nodes} 节点）',
   'proxies.sub.saved': '订阅已保存',
   'proxies.sub.savedPlain': '订阅已保存（长期保留在本地库）',
+  'proxies.sub.autoSwitched': '已自动切换到「代理优先」',
   'proxies.sub.kernelInstalled': '内核已自动安装',
   'proxies.sub.kernelInstalledVersion': '内核已自动安装{version}',
   'proxies.sub.deleted': '已删除订阅（{name}）',

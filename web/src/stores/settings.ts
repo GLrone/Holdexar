@@ -19,6 +19,8 @@ export const useSettingsStore = defineStore('settings', () => {
   const updateNotify = ref<boolean | null>(null)
   /** 静默自动更新开关（null = 未拉到，UI 按关处理：默认不偷偷下载整包） */
   const updateAuto = ref<boolean | null>(null)
+  /** 直连模式加速器建议已看过（null = 未拉到，UI 不主动弹） */
+  const directNoticeSeen = ref<boolean | null>(null)
 
   async function load() {
     if (loaded.value) return
@@ -31,6 +33,7 @@ export const useSettingsStore = defineStore('settings', () => {
       updateNotified.value = s.update_notified
       updateNotify.value = s.update_notify
       updateAuto.value = s.update_auto
+      directNoticeSeen.value = s.direct_notice_seen
       loaded.value = true
     } catch {
       /* 静默 */
@@ -116,6 +119,17 @@ export const useSettingsStore = defineStore('settings', () => {
     }
   }
 
+  /** 直连建议弹窗已看过：打开即落标志（幂等，ProductTour 同款兜底；失败静默） */
+  async function markDirectNoticeSeen() {
+    directNoticeSeen.value = true
+    try {
+      const s = await settingsApi.update({ direct_notice_seen: true })
+      directNoticeSeen.value = s.direct_notice_seen
+    } catch {
+      /* 静默：失败只影响下次进入直连会再弹一次 */
+    }
+  }
+
   return {
     account,
     loaded,
@@ -125,9 +139,11 @@ export const useSettingsStore = defineStore('settings', () => {
     updateNotified,
     updateNotify,
     updateAuto,
+    directNoticeSeen,
     load,
     markOnboardingDone,
     markUpdateNotified,
+    markDirectNoticeSeen,
     setAutoPrice,
     setBackupAuto,
     setUpdateNotify,

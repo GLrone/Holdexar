@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ElMessageBox } from 'element-plus'
 
@@ -17,6 +17,8 @@ import {
 import { HlButton, HlDialog, HlIcon, HlSwitch, message } from '@/components/ui'
 import { useI18n, type MessageKey } from '@/locales'
 import { useProxyTasksStore } from '@/stores/proxyTasks'
+import { useSettingsStore } from '@/stores/settings'
+import { useTourStore } from '@/stores/tour'
 
 /**
  * 代理 IP 池管理 —— 页内分四区：策略卡片网格 / 分区区块 / 节点表格 / 走线控制台。
@@ -291,7 +293,10 @@ async function addSubscription(kind: 'clash' | 'plain') {
         subFailKind.value = kind
         subFailError.value = sub.warning
         subFailDialog.value = true
-      } else message.success(bits.join(' · '))
+      } else {
+        if (sub.strategySwitched) bits.push(t('proxies.sub.autoSwitched'))
+        message.success(bits.join(' · '))
+      }
     } else {
       newPlainSubUrl.value = ''
       message.success(t('proxies.sub.savedPlain'))
@@ -437,14 +442,18 @@ async function importPlainSubscription(sub: ProxySubscriptionItem) {
     message.info(t('proxies.plain.importToast'))
     const stats = await proxiesApi.importSubscription(sub.id)
     const counts = { added: stats.added, skipped: stats.skipped }
-    message.success(
+    const importedText =
       stats.checked !== undefined
         ? t('proxies.plain.importedChecked', {
             ...counts,
             alive: stats.alive ?? 0,
             checked: stats.checked,
           })
-        : t('proxies.plain.imported', counts),
+        : t('proxies.plain.imported', counts)
+    message.success(
+      stats.strategySwitched
+        ? `${importedText} · ${t('proxies.sub.autoSwitched')}`
+        : importedText,
     )
     await load()
   } catch (e) {
@@ -460,6 +469,55 @@ function pickStrategy(card: StrategyCard) {
   strategy.value.strategy = card.value
   applyStrategy()
 }
+
+/* ── 直连模式加速器建议弹窗 ──
+   直连的成败系于本机网络环境，首次使用（点选直连卡，或进页时已处于直连）
+   自动弹一次，卡右上角 i 随时可重看。武装 = 直连态 × 未看过标志，两条件
+   任意先后到达都成立（settings 拉取与本页 load 无时序保证）。
+   避让新手导览：导览开着或尚未决出（onboarding 未拉到/首启待弹）时不弹，
+   等导览关闭再延时浮出——两条蒙层永不叠现。
+   打开即落 ui.direct_notice_seen 标志（幂等，ProductTour 同款兜底）。 */
+const settingsStore = useSettingsStore()
+const tourStore = useTourStore()
+const directInfoOpen = ref(false)
+const directNoticeArmed = ref(false)
+let directNoticeTimer: number | undefined
+
+watch(
+  [() => settingsStore.directNoticeSeen, () => strategy.value.strategy],
+  ([seen, mode]) => {
+    if (seen === false && mode === 'direct_only') directNoticeArmed.value = true
+  },
+  { immediate: true },
+)
+
+watch(directInfoOpen, (open) => {
+  if (open) void settingsStore.markDirectNoticeSeen()
+})
+
+watch(
+  [directNoticeArmed, () => tourStore.open, () => settingsStore.onboardingDone],
+  ([armed, tourOpen, onboarded]) => {
+    if (!armed || tourOpen || onboarded === false || onboarded === null) {
+      window.clearTimeout(directNoticeTimer)
+      return
+    }
+    window.clearTimeout(directNoticeTimer)
+    directNoticeTimer = window.setTimeout(() => {
+      if (
+        directNoticeArmed.value &&
+        !tourStore.open &&
+        strategy.value.strategy === 'direct_only' &&
+        settingsStore.directNoticeSeen === false
+      ) {
+        directInfoOpen.value = true
+      }
+    }, 600)
+  },
+  { immediate: true },
+)
+
+onUnmounted(() => window.clearTimeout(directNoticeTimer))
 
 async function applyStrategy() {
   try {
@@ -770,27 +828,41 @@ function jobRunDuration(ms: number | null): string {
         <span>{{ t('proxies.section.routing') }}</span>
       </div>
       <div class="proxyx-strategy-grid">
-        <button
+        <div
           v-for="card in strategyCards"
           :key="card.value"
-          class="proxyx-strategy-card"
-          :class="{ active: strategy.strategy === card.value }"
-          @click="pickStrategy(card)"
+          class="proxyx-strategy-slot"
         >
-          <span class="proxyx-strategy-state" :class="strategy.strategy === card.value ? 'is-on' : 'is-off'">
-            <svg v-if="strategy.strategy === card.value" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" width="14" height="14">
-              <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
-              <polyline points="22 4 12 14.01 9 11.01" />
-            </svg>
-            <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" width="14" height="14">
-              <circle cx="12" cy="12" r="10" />
-              <line x1="4.93" y1="4.93" x2="19.07" y2="19.07" />
-            </svg>
-            {{ t(strategy.strategy === card.value ? 'proxies.strategy.on' : 'proxies.strategy.off') }}
-          </span>
-          <span class="proxyx-strategy-label">{{ t(card.labelKey) }}</span>
-          <span class="proxyx-strategy-desc" v-html="t(card.descKey)" />
-        </button>
+          <button
+            class="proxyx-strategy-card"
+            :class="{ active: strategy.strategy === card.value }"
+            @click="pickStrategy(card)"
+          >
+            <span class="proxyx-strategy-state" :class="strategy.strategy === card.value ? 'is-on' : 'is-off'">
+              <svg v-if="strategy.strategy === card.value" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" width="14" height="14">
+                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+                <polyline points="22 4 12 14.01 9 11.01" />
+              </svg>
+              <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" width="14" height="14">
+                <circle cx="12" cy="12" r="10" />
+                <line x1="4.93" y1="4.93" x2="19.07" y2="19.07" />
+              </svg>
+              {{ t(strategy.strategy === card.value ? 'proxies.strategy.on' : 'proxies.strategy.off') }}
+            </span>
+            <span class="proxyx-strategy-label">{{ t(card.labelKey) }}</span>
+            <span class="proxyx-strategy-desc" v-html="t(card.descKey)" />
+          </button>
+          <button
+            v-if="card.value === 'direct_only'"
+            class="proxyx-strategy-info"
+            type="button"
+            :aria-label="t('proxies.strategy.directOnly.infoTitle')"
+            :title="t('proxies.strategy.directOnly.infoTitle')"
+            @click="directInfoOpen = true"
+          >
+            <HlIcon name="info" :size="13" />
+          </button>
+        </div>
       </div>
     </div>
 
@@ -1306,6 +1378,19 @@ function jobRunDuration(ms: number | null): string {
       </template>
     </HlDialog>
 
+    <!-- 直连模式建议弹窗：加速器提示（首次使用自动弹，卡右上角 i 可重看） -->
+    <HlDialog v-model="directInfoOpen" :title="t('proxies.strategy.directOnly.infoTitle')" :width="420">
+      <div class="dnotice">
+        <p class="dnotice__p">{{ t('proxies.strategy.directOnly.infoP1') }}</p>
+        <p class="dnotice__emph">{{ t('proxies.strategy.directOnly.infoP2') }}</p>
+      </div>
+      <template #footer>
+        <HlButton art="solid" tone="blue" size="sm" @click="directInfoOpen = false">
+          {{ t('proxies.strategy.directOnly.infoOk') }}
+        </HlButton>
+      </template>
+    </HlDialog>
+
     <!-- 编辑订阅：名称 + 链接（链接变更自动重新拉取） -->
     <HlDialog v-model="editDialog" :title="t('proxies.sub.editTitle')" :width="520">
       <div class="sed">
@@ -1409,6 +1494,45 @@ function jobRunDuration(ms: number | null): string {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
   gap: 10px;
+}
+
+/* 槽位承载卡片与（直连卡的）右上角 i 角标：button 内不得嵌交互元素，
+   i 作为卡片的兄弟节点绝对定位悬浮在同一点位 */
+.proxyx-strategy-slot {
+  position: relative;
+  display: flex;
+}
+
+.proxyx-strategy-slot .proxyx-strategy-card {
+  flex: 1;
+}
+
+.proxyx-strategy-info {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  border: 1px solid var(--border-soft);
+  background: var(--bg-soft);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.proxyx-strategy-info:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* 卡 hover 上浮时角标同步位移，避免同点位两元素脱节 */
+.proxyx-strategy-slot:hover .proxyx-strategy-info {
+  transform: translateY(-2px);
 }
 
 .proxyx-strategy-card {
@@ -1990,6 +2114,29 @@ function jobRunDuration(ms: number | null): string {
 .sfd__tip {
   color: var(--text-muted);
   font-size: 12px;
+}
+
+/* 直连模式建议弹窗 */
+.dnotice {
+  display: grid;
+  gap: 10px;
+  padding: 4px 2px 8px;
+}
+
+.dnotice__p {
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.dnotice__emph {
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.6;
+  background: var(--accent-soft);
+  border-radius: var(--radius);
+  padding: 10px 12px;
 }
 
 /* 编辑订阅弹窗（名称 + 链接两行表单） */

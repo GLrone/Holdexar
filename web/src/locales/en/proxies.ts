@@ -1,11 +1,6 @@
-/* English 词典 · proxies（与 zh-CN/proxies.ts 同构，key 必须逐一对齐）。
-   对应源文件：views/proxies/Index.vue。
-
-   两个契约值：`proxies.section.clash` 的中文值必须是「Clash 接入」——它的
-   **key** 被 ProductTour 的 target 逐字引用，两个文件同时改才不断引导。
-
-   表格列头与徽标是固定窄列（70–130px），一律取最短的英语说法：
-   「通/不通」= Yes/No，「同出口」= Same exit，「耗时」= Duration。 */
+/* English 词典 · proxies —— views/proxies/Index.vue（与 zh-CN/proxies.ts 同构，key 必须逐一对齐）。
+   契约：proxies.section.clash 的 key 被 ProductTour 的 target 逐字引用，两个文件同时改才不断引导。
+   不变量：表格列头与徽标是固定窄列（70–130px），取最短英语说法：「通/不通」= Yes/No、「同出口」= Same exit、「耗时」= Duration。 */
 
 import type { MessageKey } from '../zh-CN'
 
@@ -26,6 +21,10 @@ const proxies: Partial<Record<MessageKey, string>> = {
   'proxies.strategy.proxyFirst.desc': 'Clash when running<br><small>otherwise rotate the pool, then go direct</small>',
   'proxies.strategy.directOnly.label': 'Direct only',
   'proxies.strategy.directOnly.desc': 'Jobs run on your local network (game booster / Clash Verge tunnel is the actual exit)<br><small>price jobs included · rate-capped at 200 req/5 min</small>',
+  'proxies.strategy.directOnly.infoTitle': 'Direct mode tips',
+  'proxies.strategy.directOnly.infoP1': 'In direct mode, prices are fetched from Steam through your local network; speed and success rate depend on it.',
+  'proxies.strategy.directOnly.infoP2': 'Turn on a game accelerator (e.g. UU Booster or Watt Toolkit, formerly Steam++) for Steam before using direct mode.',
+  'proxies.strategy.directOnly.infoOk': 'Got it',
   'proxies.strategy.directFirst.label': 'Direct first',
   'proxies.strategy.directFirst.desc': 'Local first<br><small>retry through a proxy on failure</small>',
   'proxies.strategy.proxyOnly.label': 'Proxy only',
@@ -121,6 +120,7 @@ const proxies: Partial<Record<MessageKey, string>> = {
   'proxies.sub.savedNodes': 'Subscription saved ({nodes} nodes)',
   'proxies.sub.saved': 'Subscription saved',
   'proxies.sub.savedPlain': 'Subscription saved (kept locally for the long term)',
+  'proxies.sub.autoSwitched': 'Switched to proxy-first automatically',
   'proxies.sub.kernelInstalled': 'Kernel installed automatically',
   'proxies.sub.kernelInstalledVersion': 'Kernel {version} installed automatically',
   'proxies.sub.deleted': 'Subscription deleted ({name})',
