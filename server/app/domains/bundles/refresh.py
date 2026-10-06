@@ -1,7 +1,8 @@
 """bundles 刷新服务：按监控区抓取捆绑包价格 → 落 bundles/bundle_region_prices。
 
 抓取层为 IStoreBrowseService/GetItems/v1（与 app 链路 app/crawler/browse_store 同源）：
-bundleid / packageid 与 appid 一样进 `ids` 数组，单区一发 ≤400 条。与旧链路
+bundleid / packageid 与 appid 一样进 `ids` 数组，单发 ≤300 条
+（browse_store.DEFAULT_BATCH_SIZE，URL 超长再切）。与旧链路
 （逐区 ajaxresolvebundles → packagedetails 降级）的关键差异：
 
 - **抓取区 = 监控启用区**（「我」页勾选，与游戏侧同一口径），不再全区全发；
@@ -37,6 +38,7 @@ from sqlalchemy import delete, func, select
 from app.core import database as _database
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
+from app.core.logging import log_event
 from app.crawler import browse_store as bs
 from app.crawler.config import CC_LIST
 from app.domains.games.models import Bundle, BundleRegionPrice, Game
@@ -114,7 +116,7 @@ def _headers() -> dict:
 
 
 # ══════════════════════════════════════════════════════════════
-# 抓取层：IStoreBrowseService/GetItems（单区一发 ≤400 条）
+# 抓取层：IStoreBrowseService/GetItems（单发 ≤300 条，DEFAULT_BATCH_SIZE）
 # ══════════════════════════════════════════════════════════════
 
 
@@ -161,11 +163,21 @@ async def _fetch_browse_region(
             timeout=aiohttp.ClientTimeout(total=BROWSE_TIMEOUT),
         ) as resp:
             if resp.status != 200:
-                logger.debug("[bundles] browse %s 状态 %s", cc, resp.status)
+                log_event(
+                    logger,
+                    "捆绑包区域抓取返回非 200 状态",
+                    level=logging.DEBUG,
+                    detail={"区服": cc, "HTTP状态": resp.status},
+                )
                 return None
             data = await resp.json(content_type=None)
     except Exception as e:  # noqa: BLE001
-        logger.debug("[bundles] browse %s 失败：%s", cc, e)
+        log_event(
+            logger,
+            "捆绑包区域抓取失败",
+            level=logging.DEBUG,
+            detail={"区服": cc, "原因": str(e)},
+        )
         return None
     return ((data or {}).get("response") or {}).get("store_items") or []
 
@@ -264,7 +276,8 @@ async def _fetch_regions_batched(
     """整表逐区一发：want=[(bundle_id, item_kind)] → {bundle_id: 区域行}。
 
     抓取区（ccs，缺省取监控启用区 + 南亚拆区展开）每区按形态（bundleid /
-    packageid）各发；单发超 400 条或 URL 超长由 plan_id_batches 自动再切。
+    packageid）各发；单发超 300 条（DEFAULT_BATCH_SIZE）或 URL 超长由
+    plan_id_batches 自动再切。
     全部（区 × 形态 × 批）请求一次 fan-out 并发，不再区内串行。请求失败的区
     不写行（下轮重试），锁区照写 locked，未收录（伪造 id）不写行。
     """
@@ -467,11 +480,16 @@ async def _attach_bundle_source(bundle_id: int) -> None:
 
         await monitoring_service.track("bundle", bundle_id, "import")
     except Exception:  # noqa: BLE001
-        logger.exception("[bundles] 监控来源登记失败（不影响导入结果）")
+        log_event(
+            logger,
+            "捆绑包监控来源登记失败，不影响导入结果",
+            level=logging.ERROR,
+            exc_info=True,
+        )
 
 
 async def refresh_bundles() -> dict:
-    """刷新关注的捆绑包：监控层在册的包**监控区整表每区一发**（≤400 条）→ upsert。
+    """刷新关注的捆绑包：监控层在册的包**监控区整表每区一发**（≤300 条）→ upsert。
 
     候选集 = monitoring 层 target_type=bundle 的 active 对象——favorite
     （星标关注）与 import（手动导入）都是用户显式意图，excluded / released
@@ -502,7 +520,7 @@ async def refresh_bundles() -> dict:
             for bid, kind in (await session.execute(stmt)).all()
         ]
     if not want:
-        logger.info("[bundles] 无关注的捆绑包，本轮跳过刷新")
+        log_event(logger, "没有关注的捆绑包，本轮跳过刷新", tag="跳过")
         invalidate_bundles_cache()
         return {
             "ok": True, "updated": 0, "total": 0, "regionPrices": 0,
@@ -511,9 +529,10 @@ async def refresh_bundles() -> dict:
     ccs = await _bundle_fetch_ccs()
 
     now = datetime.utcnow()
-    logger.info(
-        "[bundles] 本轮刷新关注包 %d 个（%s 区整表一发）",
-        len(want), "/".join(ccs),
+    log_event(
+        logger,
+        "开始刷新关注的捆绑包（监控区整表逐区一发）",
+        detail={"包数": len(want), "抓取区": "/".join(ccs)},
     )
 
     updated_bundles = 0
@@ -530,7 +549,11 @@ async def refresh_bundles() -> dict:
                 (bid, 1 if _browse_kind(bid, kind) == "bundleid" else 0)
                 for bid, kind in missing
             ]
-            logger.info("[bundles] %d 个包按库内形态未命中，换形态兜底探测", len(flipped))
+            log_event(
+                logger,
+                "部分包按库内形态未命中，换形态兜底探测",
+                detail={"包数": len(flipped)},
+            )
             alt = await _fetch_regions_batched(session, flipped, ccs=ccs)
             for bid, _kind in missing:
                 if alt.get(bid):
@@ -557,13 +580,24 @@ async def refresh_bundles() -> dict:
         try:
             await refresh_bundle_sort_cache(touched)
         except Exception:  # noqa: BLE001
-            logger.exception("[bundles] 排序快照重建失败（列表沿用上一版快照）")
+            log_event(
+                logger,
+                "捆绑包排序快照重建失败，列表沿用上一版快照",
+                level=logging.ERROR,
+                exc_info=True,
+            )
 
-    logger.info(
-        "捆绑包刷新完成：成功 %d/%d，区域价 %d 行，失败 %d 个，单品甄别剔除 %d 个"
-        "（%s 区整表一发）",
-        updated_bundles, len(want), updated_prices, len(failed),
-        dropped_singletons, "/".join(ccs),
+    log_event(
+        logger,
+        "捆绑包刷新完成",
+        detail={
+            "成功包数": updated_bundles,
+            "总包数": len(want),
+            "区域价行": updated_prices,
+            "失败包数": len(failed),
+            "单品剔除": dropped_singletons,
+            "抓取区": "/".join(ccs),
+        },
     )
     result = {
         "ok": not failed,
@@ -580,7 +614,12 @@ async def refresh_bundles() -> dict:
         result["appsEnqueued"] = enqueued
         result["appsSkippedNonGame"] = skipped
     except Exception as e:  # noqa: BLE001
-        logger.warning("捆绑包 appid 队列联动失败（不影响刷新结果）: %s", e)
+        log_event(
+            logger,
+            "捆绑包内 AppID 队列联动失败，不影响刷新结果",
+            level=logging.WARNING,
+            detail={"原因": str(e)},
+        )
     return result
 
 
@@ -649,7 +688,16 @@ async def import_bundle(text: str) -> dict:
     ):
         return {"ok": False, "detail": "落库失败"}
     await _attach_bundle_source(bundle_id)
-    logger.info("捆绑包导入完成：%s %d（%d 区价格）", kind, bundle_id, len(regions))
+    log_event(
+        logger,
+        "捆绑包导入完成",
+        tag="成功",
+        detail={
+            "形态": "订阅包（Sub）" if kind == "sub" else "捆绑包（Bundle）",
+            "捆绑包号": bundle_id,
+            "区域价数": len(regions),
+        },
+    )
     result = {
         "ok": True,
         "bundleId": bundle_id,
@@ -662,7 +710,12 @@ async def import_bundle(text: str) -> dict:
     try:
         await refresh_bundle_sort_cache([bundle_id])
     except Exception:  # noqa: BLE001
-        logger.exception("[bundles] 导入后排序快照重建失败（列表沿用上一版快照）")
+        log_event(
+            logger,
+            "导入后捆绑包排序快照重建失败，列表沿用上一版快照",
+            level=logging.ERROR,
+            exc_info=True,
+        )
     # 包内新 appid 即时进 app 爬取队列——后台跑：预检（每轮限量）+ 小批量
     # 爬取是分钟级长事务，导入交互要求落库后立即回显（与全量刷新的同步
     # 计数语义不同，失败只记日志不影响导入结果）
@@ -671,11 +724,18 @@ async def import_bundle(text: str) -> dict:
     async def _enqueue_bg() -> None:
         try:
             enqueued, skipped = await _enqueue_new_bundle_apps()
-            logger.info(
-                "[bundles] 导入后队列联动完成：入队 %d，非游戏标记 %d", enqueued, skipped
+            log_event(
+                logger,
+                "导入后 AppID 队列联动完成",
+                detail={"入队爬取": enqueued, "非游戏打标": skipped},
             )
         except Exception as e:  # noqa: BLE001
-            logger.warning("导入后 appid 队列联动失败（不影响导入结果）: %s", e)
+            log_event(
+                logger,
+                "导入后 AppID 队列联动失败，不影响导入结果",
+                level=logging.WARNING,
+                detail={"原因": str(e)},
+            )
 
     asyncio.create_task(_enqueue_bg())
     return result
@@ -703,12 +763,27 @@ async def _fetch_app_type(
                 return None, ""
             data = await resp.json(content_type=None)
     except Exception as e:  # noqa: BLE001
-        logger.debug("[bundles] appid %s appdetails 预检异常: %r", appid, e)
+        log_event(
+            logger,
+            "AppID 类型预检异常",
+            level=logging.DEBUG,
+            detail={"AppID": appid, "原因": str(e)},
+        )
         return None, ""
-    logger.debug("[bundles] appid %s appdetails HTTP %s", appid, status)
+    log_event(
+        logger,
+        "AppID 类型预检返回状态",
+        level=logging.DEBUG,
+        detail={"AppID": appid, "HTTP状态": status},
+    )
     entry = (data or {}).get(str(appid), {})
     if not entry.get("success"):
-        logger.debug("[bundles] appid %s appdetails success=false（下架/限速）", appid)
+        log_event(
+            logger,
+            "AppID 类型预检未成功（下架或限速）",
+            level=logging.DEBUG,
+            detail={"AppID": appid},
+        )
         return None, ""
     d = entry.get("data", {})
     return (d.get("type") or "").lower() or None, d.get("name") or ""
@@ -753,9 +828,10 @@ async def _enqueue_new_bundle_apps() -> tuple[int, int]:
     if not candidates:
         return 0, 0
     if len(candidates) > _PRECHECK_PER_RUN:
-        logger.info(
-            "[bundles] 候选 appid %d 个 > 本轮上限 %d，只预检前 %d 个（余量顺延下轮）",
-            len(candidates), _PRECHECK_PER_RUN, _PRECHECK_PER_RUN,
+        log_event(
+            logger,
+            "候选 AppID 超过本轮预检上限，只处理前一批，余量顺延下轮",
+            detail={"候选数": len(candidates), "本轮上限": _PRECHECK_PER_RUN},
         )
         candidates = candidates[:_PRECHECK_PER_RUN]
 
@@ -776,17 +852,28 @@ async def _enqueue_new_bundle_apps() -> tuple[int, int]:
                 # 占位行（updated_at NULL）→ ensure 语义；中文名由爬取回补
                 await db_writer.ensure_game_exists(appid, name)
                 crawl_pairs.append((appid, name))
-                logger.info("[bundles] appid %s (%s) 为 %s → 进 app 爬取队列", appid, name[:30], app_type)
+                log_event(
+                    logger,
+                    "捆绑包内游戏进入 App 爬取队列",
+                    detail={"AppID": appid, "名称": name[:30], "类型": app_type},
+                )
             else:
                 await db_writer.mark_non_game_type(appid, app_type)
                 skipped += 1
-                logger.info("[bundles] appid %s (%s) 为 %s → 打标跳过", appid, name[:30], app_type)
+                log_event(
+                    logger,
+                    "捆绑包内非游戏项打标跳过",
+                    tag="跳过",
+                    detail={"AppID": appid, "名称": name[:30], "类型": app_type},
+                )
             # appdetails 限速（封面图三级缓存同为 0.3s 间隔）
             await asyncio.sleep(0.3)
     if probe_failed:
-        logger.warning(
-            "[bundles] appid 预检失败 %d/%d（限速/无可用代理/下架），未标记，下轮刷新自动重试",
-            probe_failed, len(candidates),
+        log_event(
+            logger,
+            "部分 AppID 类型预检失败（限速/无可用代理/下架），未打标，下轮刷新重试",
+            level=logging.WARNING,
+            detail={"失败数": probe_failed, "候选数": len(candidates)},
         )
 
     if crawl_pairs:
@@ -810,19 +897,36 @@ async def _enqueue_new_bundle_apps() -> tuple[int, int]:
                         )
                 except Exception as exc:  # noqa: BLE001 —— 池未就绪即拒绝本次 run
                     plan = None
-                    logger.warning(
-                        "[bundles] 代理运行时未就绪（%s）：本次新 appid 爬取未启动"
-                        "（不退回直连）", exc,
+                    log_event(
+                        logger,
+                        "代理运行时未就绪，本次新 AppID 爬取未启动，不退回直连",
+                        tag="跳过",
+                        level=logging.WARNING,
+                        detail={"原因": str(exc)},
                     )
                 if plan is not None:
                     config = CrawlRunConfig(
                         regions=regions, workers=4, proxy_url=plan["urls"][0]
                     )
                     stats = await run_crawl(crawl_pairs, config=config)
-                    logger.info(
-                        "[bundles] 新 appid 爬取完成：%s",
-                        {k: v for k, v in stats.items() if k != "elapsed_seconds"},
+                    log_event(
+                        logger,
+                        "新 AppID 爬取完成",
+                        detail={
+                            "总数": stats.get("total"),
+                            "已处理": stats.get("processed"),
+                            "成功": stats.get("success"),
+                            "失败": stats.get("failed"),
+                            "无折扣跳过": stats.get("skipped_no_discount"),
+                            "促销已结束": stats.get("discount_ended"),
+                        },
                     )
             except Exception as e:  # noqa: BLE001
-                logger.warning("[bundles] 新 appid 爬取任务失败（占位行已落库，回补层会消化）: %s", e)
+                log_event(
+                    logger,
+                    "新 AppID 爬取任务失败，占位行已落库由回补层消化",
+                    tag="未完成",
+                    level=logging.WARNING,
+                    detail={"原因": str(e)},
+                )
     return len(crawl_pairs), skipped

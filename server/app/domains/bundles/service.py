@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
+from app.core.logging import log_event
 from app.domains.crawl import freshness as freshness_service
 from app.domains.games.models import Bundle, BundleRegionPrice, Game, GameCurrentPrice
 from app.domains.games.pricing import (
@@ -123,7 +124,13 @@ async def _bundle_blocked_ids() -> set[int]:
 
         return await monitoring_service.blocked_ids("bundle")
     except Exception:  # noqa: BLE001
-        logger.exception("[bundles] 监控状态读取失败（列表按全量展示处理）")
+        log_event(
+            logger,
+            "读取已移除监控名单失败，捆绑包列表改按全量展示",
+            tag="降级",
+            level=logging.ERROR,
+            exc_info=True,
+        )
         return set()
 
 
@@ -134,7 +141,13 @@ async def _bundle_followed_ids() -> set[int]:
 
         return set(await monitoring_service.ids_with_source("bundle", "favorite"))
     except Exception:  # noqa: BLE001
-        logger.exception("[bundles] 关注状态读取失败（列表按无置顶处理）")
+        log_event(
+            logger,
+            "读取星标关注名单失败，捆绑包列表不做置顶",
+            tag="降级",
+            level=logging.ERROR,
+            exc_info=True,
+        )
         return set()
 
 
