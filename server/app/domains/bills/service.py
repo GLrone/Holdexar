@@ -24,6 +24,7 @@ from sqlalchemy import case, delete, func, select
 
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
+from app.core.logging import log_event
 from app.crawler.utils import get_beijing_time_obj
 from .models import BillCdkGame, BillGameTx, BillImport, BillTopupTx
 from .parser import parse_report
@@ -164,9 +165,10 @@ async def revalue_affected(touched: dict[str, set[date]]) -> dict:
             imp.orders = orders
         await session.commit()
 
-    logger.info(
-        "账单历史汇率重估：覆盖币种 %s，重算 %d 笔交易 / %d 个账单",
-        ",".join(currencies), changed, len(import_ids),
+    log_event(
+        logger,
+        "历史汇率修复后账单重估完成",
+        detail={"币种": "、".join(currencies), "重算交易": changed, "账单": len(import_ids)},
     )
     return {"bills": len(import_ids), "transactions": changed}
 
@@ -306,15 +308,18 @@ async def import_report(data: dict, source_file: str = "") -> dict:
         imp.fx_missing = fx_missing
         await session.commit()
 
-    logger.info(
-        "账单导入完成：%s 游戏 %d 笔 / 充值 %d 笔 / CDK %d 个（汇率缺失 %d+=%d，覆盖旧账 %d 份）",
-        parsed["account"]["nickname"],
-        len(parsed["game_txs"]),
-        len(parsed["topup_txs"]),
-        len(parsed["cdk_games"]),
-        fx_missing,
-        topup_fx_missing,
-        replaced,
+    log_event(
+        logger,
+        f"账单「{parsed['account']['nickname']}」导入完成",
+        tag="成功",
+        detail={
+            "游戏交易": len(parsed["game_txs"]),
+            "充值": len(parsed["topup_txs"]),
+            "CDK": len(parsed["cdk_games"]),
+            "游戏汇率缺失": fx_missing,
+            "充值汇率缺失": topup_fx_missing,
+            "覆盖旧账": replaced,
+        },
     )
     return {
         "importId": imp.id,
@@ -383,7 +388,12 @@ async def _with_live_session_retry(run):
         )
         if fresh == cookies:
             raise
-        logger.info("[bills] 主账号 %s store 会话衰减，已换发新会话重试", steam_id)
+        log_event(
+            logger,
+            "主账号商店会话已衰减，换发新会话后重试",
+            tag="已修复",
+            detail={"账号": steam_id},
+        )
         return await run(fresh)
 
 
@@ -473,7 +483,7 @@ async def sync_bills(*, force: bool = False) -> dict:
                 KEY_BILLS_SYNC, {"running": True, "since": now.isoformat(), **info}
             )
         except Exception:  # noqa: BLE001
-            logger.debug("账单同步进度写入失败", exc_info=True)
+            log_event(logger, "账单同步进度写入失败", tag="忽略", level=logging.DEBUG, exc_info=True)
 
     try:
         proxy_url = await account_service._strategy_proxy()
@@ -504,7 +514,7 @@ async def sync_bills(*, force: bool = False) -> dict:
         await settings_service.set_value(KEY_BILLS_SYNC, snapshot)
         return result
     except Exception as exc:  # noqa: BLE001
-        logger.warning("账单自动同步失败：%s", exc)
+        log_event(logger, "账单自动同步失败", detail={"原因": exc}, level=logging.WARNING)
         error_snapshot = {
             "ok": False,
             "running": False,

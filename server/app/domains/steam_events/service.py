@@ -20,6 +20,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
+from app.core.logging import log_event
 from app.crawler.utils import get_beijing_time_obj
 from . import parser
 from .models import SteamEvent
@@ -126,7 +127,13 @@ async def sync() -> dict:
             try:
                 sink[0] = await _fetch_page(lang)
             except Exception:  # noqa: BLE001 —— 单语言失败由主流程按通道语义处理
-                logger.exception("Steam 活动文档页抓取失败（lang=%s）", lang)
+                log_event(
+                    logger,
+                    "Steam 活动文档页抓取失败",
+                    level=logging.ERROR,
+                    exc_info=True,
+                    detail={"语言": lang},
+                )
 
         en_sink: list[str | None] = [None]
         zh_sink: list[str | None] = [None]
@@ -155,8 +162,11 @@ async def sync() -> dict:
                     for e2 in events_zh if e2["category"] == "seasonal_sale"
                 )
                 if matched and (e["category"], e["start"], e["end"]) not in zh_windows:
-                    logger.warning(
-                        "Steam 活动双语言通道日期不一致（EN 为准）：%s %s", e["name"], e["start"]
+                    log_event(
+                        logger,
+                        "Steam 活动中英文通道日期不一致，以英文页为准",
+                        level=logging.WARNING,
+                        detail={"活动": e["name"], "开始日期": e["start"]},
                     )
 
         rows = _merge_bilingual(events_en, events_zh, zh_nav_names)
@@ -198,9 +208,11 @@ async def sync() -> dict:
 
         tagged = await _backfill_price_history(prepared)
         _windows_cache = None  # 失效，下次打标查询按新窗口重建
-        logger.info(
-            "Steam 活动日历已同步：%d 个活动（回贴价格观测 %d 行）",
-            len(prepared), tagged,
+        log_event(
+            logger,
+            "Steam 活动日历已同步",
+            tag="成功",
+            detail={"活动数": len(prepared), "回贴价格观测行": tagged},
         )
         return {"count": len(prepared), "backfilled": tagged, "fetchedAt": now.isoformat()}
 
@@ -213,7 +225,13 @@ def _write_snapshot(lang: str, raw: str) -> None:
         snap_dir.mkdir(parents=True, exist_ok=True)
         (snap_dir / f"upcoming_{lang}.html").write_text(raw, encoding="utf-8")
     except OSError:
-        logger.exception("Steam 活动页快照写入失败（lang=%s）", lang)
+        log_event(
+            logger,
+            "Steam 活动页快照写入失败",
+            level=logging.ERROR,
+            exc_info=True,
+            detail={"语言": lang},
+        )
 
 
 async def _backfill_price_history(rows: list[dict]) -> int:
@@ -294,7 +312,7 @@ async def refresh_if_stale() -> bool:
         await sync()
         return True
     except Exception:  # noqa: BLE001 —— 失败留日志等下一拍，旧数据继续展示
-        logger.exception("Steam 活动日历启动补同步失败")
+        log_event(logger, "Steam 活动日历启动补同步失败", level=logging.ERROR, exc_info=True)
         return False
 
 

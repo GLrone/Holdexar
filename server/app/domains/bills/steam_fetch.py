@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from app.core.logging import log_event
 from app.domains.account.steam_wallet import (
     StoreSessionExpiredError,
     WalletFetchError,
@@ -416,7 +417,12 @@ async def _fetch_account_identity(client: httpx.AsyncClient) -> tuple[str, str]:
                     + base64.b64encode(avatar_resp.content).decode("ascii")
                 )
     except Exception as exc:  # noqa: BLE001
-        logger.info("账单抓取：账户身份提取失败（不阻断）：%s", exc)
+        log_event(
+            logger,
+            "账单抓取中账户昵称头像提取失败，不影响本次抓取",
+            tag="忽略",
+            detail={"原因": exc},
+        )
     return nickname, avatar
 
 
@@ -427,7 +433,7 @@ async def _emit_progress(on_progress: ProgressCallback | None, **info) -> None:
     try:
         await on_progress(info)
     except Exception:  # noqa: BLE001
-        logger.debug("账单同步进度回调失败", exc_info=True)
+        log_event(logger, "账单同步进度回调失败", tag="忽略", level=logging.DEBUG, exc_info=True)
 
 
 async def _fetch_history(
@@ -464,7 +470,13 @@ async def _fetch_history(
     while cursor:
         pages += 1
         if pages > _MAX_PAGES:
-            logger.warning("账单抓取：history 翻页达安全上限 %d，提前停止", _MAX_PAGES)
+            log_event(
+                logger,
+                "账单抓取消费明细翻页达到安全上限，提前停止",
+                tag="未完成",
+                detail={"上限": _MAX_PAGES},
+                level=logging.WARNING,
+            )
             break
         form = {"sessionid": session_id}
         for key, value in cursor.items():
@@ -483,7 +495,11 @@ async def _fetch_history(
             await _emit_progress(on_progress, stage="history", pages=pages, rows=len(rows))
         # 防重投喂/死循环：响应游标与请求相同 = Steam 原样重发 → 停
         if next_cursor and next_cursor == cursor:
-            logger.warning("账单抓取：history 游标未推进（重投喂），停止翻页")
+            log_event(
+                logger,
+                "消费明细翻页游标未推进，疑似 Steam 重投喂，停止翻页",
+                level=logging.WARNING,
+            )
             break
         cursor = next_cursor
         if not html_fragment:
@@ -514,7 +530,12 @@ async def probe_history_first_screen(
     try:
         resp = await _get_html(client, HISTORY_URL)
     except Exception as exc:  # noqa: BLE001 探测失败不阻断主流程
-        logger.info("账单探测：history 首屏拉取失败（按需全量处理）：%s", exc)
+        log_event(
+            logger,
+            "账单首屏探测拉取失败，本轮按需全量处理",
+            tag="降级",
+            detail={"原因": exc},
+        )
         return True
     try:
         _ensure_account_page(resp, "消费明细页")
@@ -531,11 +552,19 @@ async def probe_history_first_screen(
     from .parser import parse_date_cn
 
     first_date = parse_date_cn(rows[0].get("date", ""))
-    logger.info(
-        "账单探测：Steam 最新交易 %s vs 库内最新 %s → %s",
-        first_date or "?", known_latest_date,
-        "发现新交易，全量拉取" if first_date > known_latest_date else "无新交易，跳过",
-    )
+    if first_date > known_latest_date:
+        log_event(
+            logger,
+            "账单探测发现新交易，转全量拉取",
+            detail={"Steam 最新": first_date or "?", "库内最新": known_latest_date},
+        )
+    else:
+        log_event(
+            logger,
+            "账单探测无新交易，本轮跳过",
+            tag="跳过",
+            detail={"Steam 最新": first_date or "?", "库内最新": known_latest_date},
+        )
     return first_date > known_latest_date
 
 
@@ -549,7 +578,13 @@ async def _fetch_licenses(client: httpx.AsyncClient) -> list[dict]:
     while next_url:
         pages += 1
         if pages > _MAX_PAGES:
-            logger.warning("账单抓取：licenses 翻页达安全上限 %d", _MAX_PAGES)
+            log_event(
+                logger,
+                "账单抓取许可翻页达到安全上限，提前停止",
+                tag="未完成",
+                detail={"上限": _MAX_PAGES},
+                level=logging.WARNING,
+            )
             break
         # 分页器 href 是相对路径（/?continuationToken=...）——对 licenses 页绝对化
         from urllib.parse import urljoin
@@ -564,7 +599,7 @@ async def _fetch_licenses(client: httpx.AsyncClient) -> list[dict]:
         import asyncio
 
         await asyncio.sleep(_PAGE_DELAY)
-    logger.info("账单抓取：licenses 共 %d 页 %d 条", pages, len(rows))
+    log_event(logger, "账单抓取许可翻页完成", tag="成功", detail={"页数": pages, "条数": len(rows)})
     return rows
 
 
@@ -619,7 +654,11 @@ async def fetch_full_report(
     except (httpx.HTTPStatusError, httpx.RequestError, SteamFetchError) as exc:
         if not _has_ssl_error(str(exc)):
             raise SteamFetchError(str(exc)) from exc
-        logger.info("账单抓取：Steam 证书校验失败（疑似本机加速器），降级跳过校验重试")
+        log_event(
+            logger,
+            "Steam 证书校验失败（疑似本机加速器），降级跳过校验重试",
+            tag="降级",
+        )
         try:
             return await _run(False)
         except (httpx.HTTPStatusError, httpx.RequestError) as exc2:
@@ -654,5 +693,9 @@ async def probe_new_transactions(
     except (httpx.HTTPStatusError, httpx.RequestError, SteamFetchError) as exc:
         if not _has_ssl_error(str(exc)):
             raise
-        logger.info("账单探测：Steam 证书校验失败（疑似本机加速器），降级跳过校验重试")
+        log_event(
+            logger,
+            "Steam 证书校验失败（疑似本机加速器），降级跳过校验重试",
+            tag="降级",
+        )
         return await _probe(False)

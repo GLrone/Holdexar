@@ -25,6 +25,7 @@ from sqlalchemy import select
 
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
+from app.core.logging import log_event
 from app.domains.games import tags as game_tags
 from app.domains.settings import service as settings_service
 
@@ -78,7 +79,7 @@ async def _steam_get(url: str, params: dict, *, method: str = "GET") -> httpx.Re
     except httpx.HTTPError as e:
         if not _is_ssl_error(e):
             raise
-        logger.info("Steam API 证书校验失败（经代理场景），降级跳过校验重试")
+        log_event(logger, "Steam 接口证书校验失败（经代理场景），降级跳过校验重试", tag="降级")
         async with httpx.AsyncClient(timeout=20, proxy=proxy, verify=False) as client:
             resp = await client.request(method, url, params=params)
     resp.raise_for_status()
@@ -230,7 +231,7 @@ async def _fetch_player_details(token: str, steamids: list[str]) -> dict[str, di
         resp = await _steam_get(PLAYER_LINK_URL, dict(params))
         accounts = resp.json().get("response", {}).get("accounts", []) or []
     except Exception as e:  # noqa: BLE001 —— 昵称失败不阻断家庭组同步
-        logger.warning("成员昵称获取失败：%s", e)
+        log_event(logger, "家庭成员昵称获取失败", level=logging.WARNING, detail={"原因": str(e)})
         return {}
     out: dict[str, dict] = {}
     for acc in accounts:
@@ -264,7 +265,7 @@ async def _fetch_member_countries(steamids: list[str]) -> dict[str, str]:
             steamids, api_key, proxy_url=await _strategy_proxy()
         )
     except Exception:  # noqa: BLE001 —— 国家补齐失败不阻断同步
-        logger.info("[family] 成员资料国家获取失败（不阻断同步）")
+        log_event(logger, "成员资料国家获取失败，不阻断同步")
         return {}
     return {
         sid: s["country"]
@@ -308,7 +309,7 @@ async def _backfill_member_countries(row: FamilyGroup) -> None:
                 fresh.members_json = members
                 await session.commit()
     except Exception:  # noqa: BLE001 —— 写回失败不影响本次返回
-        logger.exception("[family] 成员资料国家写回失败")
+        log_event(logger, "成员资料国家写回失败", level=logging.ERROR, exc_info=True)
 
 
 async def fetch_member_owned_games(token: str, steamid: str) -> list[dict]:
@@ -326,7 +327,12 @@ async def fetch_member_owned_games(token: str, steamid: str) -> list[dict]:
         games = resp.json().get("response", {}).get("games", []) or []
         return [{"appid": int(g["appid"])} for g in games if g.get("appid")]
     except Exception as e:  # noqa: BLE001 —— 单成员失败不阻断
-        logger.warning("成员 %s 已购库获取失败：%s", steamid, e)
+        log_event(
+            logger,
+            "家庭成员已购库获取失败",
+            level=logging.WARNING,
+            detail={"SteamID": steamid, "原因": str(e)},
+        )
         return []
 
 
@@ -403,8 +409,16 @@ async def _sync_group_for_account(steam_id: str, cookies: str, now: datetime) ->
         "family_name": group.get("family_name"), "family_groupid": group["family_groupid"],
     }, now)
 
-    logger.info("家庭组同步成功：%s（%s）%d 人",
-                group.get("family_name"), steam_id, len(members))
+    log_event(
+        logger,
+        "家庭组同步完成",
+        tag="成功",
+        detail={
+            "家庭组名": group.get("family_name"),
+            "SteamID": steam_id,
+            "成员数": len(members),
+        },
+    )
     return {"steamid": steam_id, "joined": True,
             "familyName": group.get("family_name"), "memberCount": len(members)}
 
@@ -437,7 +451,12 @@ async def sync_family_group(steam_id: str | None = None) -> dict:
             results.append(await _sync_group_for_account(sid, cookies, now))
         except Exception as e:  # noqa: BLE001 —— 单账号失败隔离
             # 异常 str 可能为空（部分网络异常无消息）：类型名保底，失败必须可读
-            logger.warning("[family] 账号 %s 家庭组同步失败：%s", sid, e)
+            log_event(
+                logger,
+                "该账号家庭组同步失败",
+                level=logging.WARNING,
+                detail={"SteamID": sid, "原因": str(e)},
+            )
             results.append({"steamid": sid, "joined": False,
                             "error": (str(e) or type(e).__name__)[:200]})
     joined = sum(1 for r in results if r.get("joined"))
@@ -505,7 +524,11 @@ async def _sync_members_to_accounts(members: list[dict], now: datetime) -> None:
                 updated += 1
         if added or updated:
             await session.commit()
-            logger.info("家庭组成员同步进追踪：新增 %d，档案刷新 %d 处", added, updated)
+            log_event(
+                logger,
+                "家庭成员已同步进追踪账户",
+                detail={"新增": added, "档案刷新": updated},
+            )
 
 
 # app_settings 键：成员地区持久化 {steamid: region_code}（家庭页手动选择的落点）
@@ -568,9 +591,18 @@ async def _backfill_member_avatars(members: list[dict], owner_sid: str) -> list[
             if row is not None:
                 row.members_json = members
                 await session.commit()
-                logger.info("[family] status 头像兜底补齐 %d/%d 人并写回快照", len(missing), len(members))
+                log_event(
+                    logger,
+                    "家庭成员头像兜底补齐并写回快照",
+                    detail={"补齐人数": len(missing), "成员总数": len(members)},
+                )
     except Exception:  # noqa: BLE001
-        logger.exception("[family] status 头像补齐写回失败（不影响本次返回）")
+        log_event(
+            logger,
+            "家庭成员头像补齐写回失败，不影响本次返回",
+            level=logging.ERROR,
+            exc_info=True,
+        )
     return members
 
 
@@ -701,7 +733,11 @@ async def _cleanup_legacy_member_regions(manual: dict[str, str]) -> dict[str, st
     await settings_service.set_value(KEY_REGION_LEGACY_CLEANUP, True)
     if cleaned != manual:
         await settings_service.set_value(KEY_MEMBER_REGIONS, cleaned)
-        logger.info("[family] 成员地区一次性清洗：%d 条兜底值移除", len(manual) - len(cleaned))
+        log_event(
+            logger,
+            "成员地区一次性清洗完成，移除历史兜底条目",
+            detail={"移除条数": len(manual) - len(cleaned)},
+        )
     return cleaned
 
 
@@ -745,9 +781,9 @@ async def _resolve_member_regions(
                 KEY_MEMBER_REGIONS,
                 {k: v for k, v in manual.items() if k not in stale},
             )
-            logger.info("[family] 成员地区兜底残留清除 %d 个", len(stale))
+            log_event(logger, "成员地区兜底残留已清除", detail={"清除个数": len(stale)})
         except Exception:  # noqa: BLE001 —— 写回失败不影响本次返回
-            logger.exception("[family] 成员地区残留清除写库失败")
+            log_event(logger, "成员地区残留清除写库失败", level=logging.ERROR, exc_info=True)
     return resolved
 
 
@@ -852,7 +888,12 @@ async def fetch_family_library(steam_id: str | None = None) -> dict:
     for m, result in zip(member_rows, owned_results):
         sid = m["steamid"]
         if isinstance(result, BaseException):
-            logger.warning("[family] 成员 %s 已购/游玩拉取失败（该成员明细缺席）：%s", sid, result)
+            log_event(
+                logger,
+                "家庭成员已购与游玩数据拉取失败，该成员明细缺席",
+                level=logging.WARNING,
+                detail={"SteamID": sid, "原因": str(result)},
+            )
             result = []
         games = result
         member_owned_count[sid] = len(games)
@@ -990,7 +1031,12 @@ async def fetch_family_library(steam_id: str | None = None) -> dict:
                     row.play_json = member_play
                     await session.commit()
         except Exception:  # noqa: BLE001 —— 写库失败不影响本次返回
-            logger.exception("[family] 游玩明细快照写库失败（不影响本次返回）")
+            log_event(
+                logger,
+                "家庭成员游玩明细快照写库失败，不影响本次返回",
+                level=logging.ERROR,
+                exc_info=True,
+            )
 
     return {
         "familyGroupid": group["family_groupid"],
@@ -1099,7 +1145,11 @@ async def _upsert_library_snapshot(family_groupid: str, games: list[dict]) -> No
                 snap.name = g.get("name") or snap.name
                 snap.updated_at = now
         await session.commit()
-    logger.info("[family] 家庭库快照已落库：%d app（组 %s）", len(games), family_groupid)
+    log_event(
+        logger,
+        "家庭共享库快照已落库",
+        detail={"应用数": len(games), "家庭组号": family_groupid},
+    )
 
 
 async def _library_from_snapshot(
@@ -1229,7 +1279,12 @@ def _start_library_refresh(steam_id: str) -> None:
                 datetime.utcnow(), await fetch_family_library(steam_id),
             )
         except Exception as e:  # noqa: BLE001 —— 后台刷新失败保留旧条目
-            logger.info("[family] 后台刷新失败（保留现缓存）：%s", e)
+            log_event(
+                logger,
+                "家庭库后台刷新失败，保留现有缓存",
+                tag="降级",
+                detail={"原因": str(e)},
+            )
             old = _LIBRARY_CACHE.get(steam_id)
             if old:
                 _LIBRARY_CACHE[steam_id] = (datetime.utcnow(), old[1])
@@ -1289,7 +1344,12 @@ async def cached_family_library(steam_id: str | None = None) -> dict:
         _LIBRARY_CACHE[sid] = (now, data)
         return data
     except Exception as e:  # noqa: BLE001 —— 无快照可兜底，如实上抛
-        logger.warning("[family] 实时聚合失败且无快照可兜底：%s", e)
+        log_event(
+            logger,
+            "家庭库实时聚合失败且没有快照可兜底",
+            level=logging.WARNING,
+            detail={"原因": str(e)},
+        )
         raise
 
 
@@ -1344,9 +1404,18 @@ async def _kick_uncrawled_games(appids: list[int]) -> None:
         await crawl_service.start_job(
             scope="appids", appids=appids, kind="family_wishlist"
         )
-        logger.info("[family] 愿望单 %d 款未收录，已触发补爬", len(appids))
+        log_event(
+            logger,
+            "家庭成员愿望单有未收录游戏，已触发补爬",
+            detail={"款数": len(appids)},
+        )
     except Exception as e:  # noqa: BLE001 —— 任务占用/网络失败都静默
-        logger.info("[family] 愿望单未收录补爬未触发（%d 款）：%s", len(appids), e)
+        log_event(
+            logger,
+            "家庭成员愿望单补爬未触发",
+            tag="跳过",
+            detail={"款数": len(appids), "原因": str(e)},
+        )
 
 
 async def family_wishlist(steam_id: str | None = None) -> dict:
