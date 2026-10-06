@@ -29,6 +29,7 @@ import yaml
 
 from app.core.app_info import APP_SLUG
 from app.core.config import get_settings
+from app.core.logging import log_event
 from app.domains.proxies.kernel_release import (
     GEO_ASSETS,
     MIHOMO_VERSION,
@@ -95,9 +96,20 @@ def _maybe_upgrade_kernel(kernel_path: Path) -> str | None:
     try:
         shutil.copy2(bundled_exe, exe)
     except OSError as e:  # noqa: BLE001 —— 文件锁/权限失败：保留旧内核继续可用
-        logger.warning("内核升级替换失败（保留现有 %s）：%s", current, e)
+        log_event(
+            logger,
+            "内核升级替换失败，保留现有内核继续使用",
+            tag="降级",
+            level=logging.WARNING,
+            detail={"现有版本": ".".join(map(str, current)), "原因": str(e)},
+        )
         return None
-    logger.info("内核已升级：%s → %s", ".".join(map(str, current)), MIHOMO_VERSION)
+    log_event(
+        logger,
+        f"内核已升级到 {MIHOMO_VERSION}",
+        tag="成功",
+        detail={"旧版本": ".".join(map(str, current)), "新版本": MIHOMO_VERSION},
+    )
     return f"{'.'.join(map(str, current))} → {MIHOMO_VERSION}"
 
 
@@ -171,16 +183,25 @@ def ensure_kernel(data_dir: Path) -> dict:
         result["upgraded"] = upgrade
     ready = kernel_exe(data_dir).is_file()
     if result["copied"]:
-        logger.info("随包内核资产已就位：%s", ", ".join(result["copied"]))
+        log_event(
+            logger,
+            "随包内核资产已就位",
+            tag="成功",
+            detail={"文件": "、".join(result["copied"])},
+        )
     if not ready:
-        logger.warning(
-            "随包内核不可用（%s 内无 %s），将回退网络下载",
-            bundled_clash_dir(), kernel_filename(),
+        log_event(
+            logger,
+            "随包内核不可用，将回退网络下载",
+            tag="降级",
+            level=logging.WARNING,
+            detail={"目录": str(bundled_clash_dir()), "缺失文件": kernel_filename()},
         )
     elif result["missing"]:
-        logger.info(
-            "内核目录缺少 %s（内核启动时会尝试自行下载，直连网络下可能卡住）",
-            ", ".join(result["missing"]),
+        log_event(
+            logger,
+            "内核目录缺少部分文件，内核启动时会尝试自行下载（直连网络下可能卡住）",
+            detail={"缺失文件": "、".join(result["missing"])},
         )
     return {
         "kernelReady": ready,
@@ -387,7 +408,13 @@ def install_kernel(data_dir: Path) -> dict:
     target = kernel_exe(data_dir)
     if target.is_file():
         return {"ok": True, "path": str(target), "source": "bundled", "via": "随包资产"}
-    logger.warning("随包内核不可用，回退网络下载（%s）", MIHOMO_VERSION)
+    log_event(
+        logger,
+        "随包内核不可用，回退网络下载",
+        tag="降级",
+        level=logging.WARNING,
+        detail={"目标版本": MIHOMO_VERSION},
+    )
     return download_kernel(data_dir) if is_windows() else download_kernel_linux(data_dir)
 
 
@@ -461,7 +488,11 @@ def download_kernel(data_dir: Path) -> dict:
             url = mirror + base if mirror else base
             for proxy, label in channels:
                 try:
-                    logger.info("下载 Clash 内核（%s / %s）：%s", mirror or "github", label, url)
+                    log_event(
+                        logger,
+                        f"下载 Clash 内核：尝试镜像 {mirror or 'github'}、通道 {label}",
+                        detail={"镜像": mirror or "github", "通道": label, "下载地址": url},
+                    )
                     # 尝试开始即上报：连接阶段（最长 10s）弹窗也可见当前镜像/通道
                     _KERNEL_PROGRESS.update({
                         "phase": "连接下载源", "source": mirror or "github", "via": label,
@@ -473,7 +504,12 @@ def download_kernel(data_dir: Path) -> dict:
                         "source": mirror or "github", "via": label,
                     }
                 except Exception as e:  # noqa: BLE001
-                    logger.warning("镜像下载失败（%s / %s）：%s", mirror or "github", label, e)
+                    log_event(
+                        logger,
+                        f"内核下载失败：镜像 {mirror or 'github'} 经 {label} 未成功，换下一通道",
+                        level=logging.WARNING,
+                        detail={"镜像": mirror or "github", "通道": label, "原因": str(e)},
+                    )
         _KERNEL_PROGRESS.update({
             "running": False,
             "error": "所有下载源均失败，可手动放置内核到 data/clash/",
@@ -501,7 +537,12 @@ def download_kernel_linux(data_dir: Path) -> dict:
                 target.chmod(0o755)
                 return {"ok": True, "path": str(target), "source": mirror or "github"}
             except Exception as e:  # noqa: BLE001
-                logger.warning("镜像下载失败：%s", e)
+                log_event(
+                    logger,
+                    "镜像下载内核失败，换下一个镜像",
+                    level=logging.WARNING,
+                    detail={"原因": str(e)},
+                )
         return {"ok": False, "error": "所有下载源均失败"}
     finally:
         _KERNEL_PROGRESS["running"] = False
@@ -580,7 +621,12 @@ def validate_config(exe_path: str, config_path: str, work_dir: Path) -> None:
             encoding="utf-8", errors="replace",
         )
     except subprocess.TimeoutExpired:
-        logger.warning("内核配置校验超时（geo 下载可能在进行），放行启动")
+        log_event(
+            logger,
+            "内核配置校验超时（可能在下载 GeoIP 数据），放行启动",
+            tag="跳过",
+            level=logging.WARNING,
+        )
         return
     if result.returncode == 0:
         return
@@ -855,7 +901,12 @@ class ClashRuntime:
                 )
                 killed += 1
         if killed:
-            logger.info("已清理 %d 个残留 Clash 内核进程", killed)
+            log_event(
+                logger,
+                f"已清理 {killed} 个残留 Clash 内核进程",
+                tag="已修复",
+                detail={"清理数": killed},
+            )
         return killed
 
     def start(
@@ -877,9 +928,10 @@ class ClashRuntime:
                 target = (subscription_url or "").strip()
                 if not target or self.subscription_url == target:
                     return self.status()
-                logger.info(
-                    "切换订阅：当前跑 %s，按 %s 重启内核",
-                    self.subscription_url, target,
+                log_event(
+                    logger,
+                    "切换订阅：停掉当前内核并按新订阅重启",
+                    detail={"当前订阅": self.subscription_url, "新订阅": target},
                 )
                 self.stop()
             else:
@@ -892,11 +944,23 @@ class ClashRuntime:
         try:
             self._kill_orphans(exe_path, config_path)
         except Exception as e:  # noqa: BLE001 —— 清理失败不阻断启动（psutil 缺失等）
-            logger.warning("残留内核清理跳过：%s", e)
+            log_event(
+                logger,
+                "残留内核进程清理跳过",
+                tag="跳过",
+                level=logging.WARNING,
+                detail={"原因": str(e)},
+            )
         try:
             ensure_kernel_files(Path(config_path).parent)
         except Exception as e:  # noqa: BLE001 —— 清理失败不阻断启动（psutil 缺失等）
-            logger.warning("随包内核资产补齐失败：%s", e)
+            log_event(
+                logger,
+                "随包内核资产补齐失败，不影响启动",
+                tag="忽略",
+                level=logging.WARNING,
+                detail={"原因": str(e)},
+            )
         config_text = Path(config_path).read_text(encoding="utf-8", errors="ignore")
         validate_config(exe_path, config_path, Path(config_path).parent)
         self.port = parse_mixed_port(config_text)
@@ -925,9 +989,15 @@ class ClashRuntime:
             stderr=subprocess.STDOUT,
         )
         log_file.close()
-        logger.info(
-            "Clash 内核已启动 pid=%s port=%d controller=%s",
-            self.process.pid, self.port, self.controller_url,
+        log_event(
+            logger,
+            "Clash 内核已启动",
+            tag="成功",
+            detail={
+                "进程编号": self.process.pid,
+                "混合端口": self.port,
+                "控制器地址": self.controller_url,
+            },
         )
         return self.status()
 
@@ -1039,10 +1109,21 @@ class ClashRuntime:
                     Path(config_path).write_text(prev_file_text, encoding="utf-8")
                 else:
                     Path(config_path).unlink(missing_ok=True)  # 本次新建的缓存，删掉
-            logger.warning("热重载被拒，已保留当前运行配置：%s", e)
+            log_event(
+                logger,
+                "内核拒绝热重载新配置，已保留当前运行配置",
+                level=logging.WARNING,
+                detail={"原因": str(e)},
+            )
             raise ValueError(str(e)) from None
         except Exception as e:  # noqa: BLE001 —— 通路故障才回退进程重启
-            logger.warning("配置热重载失败（%s：%s），回退内核重启", type(e).__name__, e)
+            log_event(
+                logger,
+                "配置热重载失败，回退内核重启",
+                tag="降级",
+                level=logging.WARNING,
+                detail={"异常类型": type(e).__name__, "原因": str(e)},
+            )
             self.stop()
             status = self.start(exe_path, config_path, subscription_url=sub_url)
             return {**status, "started": True, "reloaded": False}
@@ -1052,9 +1133,11 @@ class ClashRuntime:
         self.port = parse_mixed_port(injected)
         self.probe_lanes = parse_probe_lanes(injected)
         self.subscription_url = sub_url or self.subscription_url
-        logger.info(
-            "内核配置已热重载：subscription=%s port=%d（进程未重启）",
-            self.subscription_url, self.port,
+        log_event(
+            logger,
+            "内核配置已热重载，进程未重启",
+            tag="成功",
+            detail={"订阅": self.subscription_url, "混合端口": self.port},
         )
         return {**self.status(), "started": False, "reloaded": True}
 
@@ -1065,7 +1148,7 @@ class ClashRuntime:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.process.kill()
-            logger.info("Clash 内核已停止")
+            log_event(logger, "Clash 内核已停止")
         self.process = None
         self.controller_url = None
         self.subscription_url = None
@@ -1100,7 +1183,12 @@ class ClashRuntime:
                     resp.raise_for_status()
                     return {"userinfo": resp.headers.get("subscription-userinfo")}
             except Exception as e:  # noqa: BLE001 —— 逐通道降级
-                logger.warning("订阅头拉取失败（%s）：%s", label, e)
+                log_event(
+                    logger,
+                    f"订阅响应头经 {label} 拉取失败，换下一通道",
+                    level=logging.WARNING,
+                    detail={"通道": label, "原因": str(e)},
+                )
         return None
 
     async def download_subscription(
@@ -1158,7 +1246,12 @@ class ClashRuntime:
                         text, resp = task.result()
                     except Exception as e:  # noqa: BLE001 —— 单通道失败不影响竞速
                         last_err = e
-                        logger.warning("订阅下载失败（%s）：%s", label, e)
+                        log_event(
+                            logger,
+                            f"订阅下载经 {label} 失败，继续等待其它通道",
+                            level=logging.WARNING,
+                            detail={"通道": label, "原因": str(e)},
+                        )
                         continue
                     for t in pending:
                         t.cancel()
@@ -1167,8 +1260,11 @@ class ClashRuntime:
                     # 自动取名链：profile-title → Content-Disposition → URL 末段
                     title = subscription_auto_name(resp.headers, sub_url)
                     userinfo = resp.headers.get("subscription-userinfo")
-                    logger.info(
-                        "订阅下载成功（%s）：%d 节点，面板名=%s", label, len(nodes), title
+                    log_event(
+                        logger,
+                        f"订阅下载成功：{len(nodes)} 个节点",
+                        tag="成功",
+                        detail={"通道": label, "节点数": len(nodes), "面板名": title},
                     )
                     return {
                         "path": str(path), "title": title, "userinfo": userinfo,
@@ -1178,7 +1274,13 @@ class ClashRuntime:
             for t in pending:
                 t.cancel()
         if path.is_file():
-            logger.warning("订阅全部通道失败，回退本地缓存 %s", path)
+            log_event(
+                logger,
+                "订阅全部通道下载失败，回退上次成功的本地缓存",
+                tag="降级",
+                level=logging.WARNING,
+                detail={"缓存文件": str(path)},
+            )
             cached_text = path.read_text(encoding="utf-8", errors="ignore")
             return {
                 "path": str(path), "title": None, "userinfo": None,

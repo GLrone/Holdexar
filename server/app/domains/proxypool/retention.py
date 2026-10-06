@@ -29,6 +29,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import WritePriority, write_gate
+from app.core.logging import log_event
 from app.domains.proxypool.models import SubscriptionSnapshot
 
 logger = logging.getLogger(__name__)
@@ -193,11 +194,17 @@ async def prune_telemetry(
 
     result = PruneResult(job_runs, observations, events, snapshots, truncated)
     if any(result.as_dict().values()):
-        logger.info(
-            "[proxypool保留] 已清理：作业 %d / 健康观测 %d / 编排事件 %d / 快照 %d%s",
-            result.job_runs, result.health_observations,
-            result.orchestration_events, result.snapshots,
-            "（本轮达块上限，剩余下轮继续）" if truncated else "",
+        log_event(
+            logger,
+            "遥测清理完成，本轮达分块上限、剩余留待下轮" if truncated else "遥测清理完成",
+            tag="成功",
+            detail={
+                "清理作业行数": result.job_runs,
+                "清理健康观测行数": result.health_observations,
+                "清理编排事件行数": result.orchestration_events,
+                "清理快照行数": result.snapshots,
+                "还有剩余": "是" if truncated else "否",
+            },
         )
     return result
 

@@ -27,6 +27,7 @@ from pathlib import Path
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.logging import log_event
 from app.domains.proxies.models import (
     ADMISSION_ACTIVE,
     ADMISSION_CANDIDATE,
@@ -128,11 +129,16 @@ async def exit_from_production(
 
     if await pool_signature(session) != before_sig:
         request_rebuild()
-        logger.info(
-            "[准入] 订阅 %s 退出生产池：移除来源 %d 行，eligible 变化 → request_rebuild()",
-            subscription_id, removed,
+        log_event(
+            logger,
+            f"订阅 {subscription_id} 退出生产池，合格集变化已请求重建",
+            detail={"订阅编号": subscription_id, "移除来源行数": removed},
         )
-    logger.info("[准入] 订阅 %s 退出生产池（置回 CANDIDATE，来源行 %d）", subscription_id, removed)
+    log_event(
+        logger,
+        f"订阅 {subscription_id} 退出生产池，置回候选",
+        detail={"订阅编号": subscription_id, "移除来源行数": removed},
+    )
     return ExitResult(subscription_id, True, "已退出生产池（置回 CANDIDATE）", removed)
 
 
@@ -219,18 +225,23 @@ async def promote_to_active(
     applied = len({node_fingerprint(dict(n)) for n in snap.nodes})
     if await pool_signature(session) != before_sig:
         request_rebuild()
-        logger.info(
-            "[准入] 订阅 %s 晋升后 eligible 集合变化 → request_rebuild()（由既有重建链消费）",
-            subscription_id,
+        log_event(
+            logger,
+            f"订阅 {subscription_id} 晋升后合格集变化，已请求重建",
+            detail={"订阅编号": subscription_id},
         )
-    logger.info(
-        "[准入] 订阅 %s 晋升 ACTIVE：apply 快照 %s（对齐节点 %d；新建 %d / 刷新 %d / 撤来源 %d）",
-        subscription_id,
-        snap.sha256[:10],
-        applied,
-        len(result.created_nodes),
-        len(result.refreshed_nodes),
-        len(result.removed_sources),
+    log_event(
+        logger,
+        f"订阅 {subscription_id} 晋升为生产订阅，快照已应用",
+        tag="成功",
+        detail={
+            "订阅编号": subscription_id,
+            "快照": snap.sha256[:10],
+            "对齐节点数": applied,
+            "新建节点数": len(result.created_nodes),
+            "刷新来源数": len(result.refreshed_nodes),
+            "移除来源数": len(result.removed_sources),
+        },
     )
     return PromotionResult(
         subscription_id, True, "晋升完成（快照已进 Registry）", snap.sha256, applied
@@ -272,8 +283,15 @@ async def auto_admit_healthy_candidate(
             session, subscription_id=subscription_id, data_dir=data_dir, now=now
         )
     except Exception as exc:  # noqa: BLE001 —— 转正不成保持候选原样，等下一轮再试
-        logger.warning(
-            "[准入] 订阅 %s 体检健康（可用 %d）但暂不能转正：%s",
-            subscription_id, alive, exc,
+        log_event(
+            logger,
+            f"订阅 {subscription_id} 体检健康但暂不能转正，保持候选",
+            tag="未完成",
+            level=logging.WARNING,
+            detail={
+                "订阅编号": subscription_id,
+                "可用节点数": alive,
+                "原因": str(exc),
+            },
         )
         return None

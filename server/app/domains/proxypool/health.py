@@ -24,6 +24,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import WritePriority, write_gate
+from app.core.logging import log_event
 from app.crawler.browse_store import StoreBrowseAPI, _to_int
 from app.domains.proxypool.models import HealthObservation, ProxyNode, ProxyNodeSource
 from app.domains.proxypool.pool import pool_file_names
@@ -404,9 +405,14 @@ async def recover_dead_nodes(
         await session.commit()
     if outcomes:
         still_out = sum(1 for o in outcomes if o.state in (NODE_DEAD, NODE_RETIRED))
-        logger.info(
-            "[L0恢复] 出池节点补探 %d 个：成功 %d / 仍未进池 %d",
-            len(outcomes), len(outcomes) - still_out, still_out,
+        log_event(
+            logger,
+            f"出池节点恢复探测完成：补探 {len(outcomes)} 个，成功 {len(outcomes) - still_out} 个，仍未回池 {still_out} 个",
+            detail={
+                "补探节点数": len(outcomes),
+                "恢复成功数": len(outcomes) - still_out,
+                "仍未回池数": still_out,
+            },
         )
     return tuple(outcomes)
 
