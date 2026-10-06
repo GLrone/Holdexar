@@ -147,7 +147,7 @@ async def test_all_channels_fail_surfaces_reason(
     assert "ConnectTimeout" in result.detail, "并带出真实原因（通道级）"
     from app.domains.proxypool.runtime import require_runtime_proxy_url
 
-    with pytest.raises(Exception, match="代理运行时不可用"):
+    with pytest.raises(Exception, match="代理通道尚未就绪"):
         require_runtime_proxy_url(tmp_data_dir)
     # 持久化诊断事实仍在
     from sqlalchemy import select

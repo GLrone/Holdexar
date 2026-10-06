@@ -241,7 +241,7 @@ async def test_no_subscription_cannot_bootstrap(tmp_data_dir, kernel_exe_path,
     # 与"有订阅但抓取失败"必须是**不同**的原因（真实运行诊断需要区分）
     assert "没有可 bootstrap 的订阅" in result.detail
     assert "订阅抓取失败" not in result.detail
-    with pytest.raises(Exception, match="代理运行时不可用"):
+    with pytest.raises(Exception, match="代理通道尚未就绪"):
         require_runtime_proxy_url(tmp_data_dir)
 
 
@@ -262,7 +262,7 @@ async def test_failed_fetch_keeps_crawler_unavailable(
     assert result.ready is False
     row = await _sub_row(sub_id)
     assert row.last_fetch_status == "FAILED" and row.snapshot_sha256 is None
-    with pytest.raises(Exception, match="代理运行时不可用"):
+    with pytest.raises(Exception, match="代理通道尚未就绪"):
         require_runtime_proxy_url(tmp_data_dir)
 
 

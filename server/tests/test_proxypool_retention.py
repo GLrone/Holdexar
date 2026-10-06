@@ -284,7 +284,7 @@ async def test_retention_job_is_registered_next_to_wal_truncate(monkeypatch):
     sched_mod.start_scheduler()
 
     func, trigger, kw = added["proxypool_retention"]
-    assert func is sched_mod._job_proxypool_retention
+    assert getattr(func, "__wrapped__", func) is sched_mod._job_proxypool_retention
     assert trigger == "cron"
     assert (kw.get("hour"), kw.get("minute")) == (4, 35)
     assert kw.get("max_instances") == 1
