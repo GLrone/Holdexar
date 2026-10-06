@@ -33,6 +33,7 @@ from sqlalchemy import and_, or_, select, update
 
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
+from app.core.logging import log_event
 from app.domains.games.models import Game
 
 logger = logging.getLogger(__name__)
@@ -117,10 +118,22 @@ def load_overrides() -> dict[str, list[int]]:
     except FileNotFoundError:
         return {}
     except (OSError, ValueError):
-        logger.warning("[series] 系列覆盖文件不可读，本轮忽略：%s", path)
+        log_event(
+            logger,
+            "系列覆盖文件不可读，本轮忽略",
+            tag="忽略",
+            detail={"文件": path},
+            level=logging.WARNING,
+        )
         return {}
     if not isinstance(raw, dict):
-        logger.warning("[series] 系列覆盖文件须为 {系列名: [appid,...]}，本轮忽略：%s", path)
+        log_event(
+            logger,
+            "系列覆盖文件格式非法（应为 系列名 到 appid 列表 的映射），本轮忽略",
+            tag="忽略",
+            detail={"文件": path},
+            level=logging.WARNING,
+        )
         return {}
     out: dict[str, list[int]] = {}
     for key, value in raw.items():
