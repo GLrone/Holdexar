@@ -19,6 +19,8 @@ from typing import Any
 
 import httpx
 
+from app.core.logging import log_event
+
 from .proxy import resolve_proxy_url
 
 logger = logging.getLogger(__name__)
@@ -53,7 +55,12 @@ async def fetch_steampy(appid: int, sub_id: int | None, proxy_url: str | None = 
             }
         return empty
     except Exception as e:  # noqa: BLE001
-        logger.warning("SteamPY 查询失败 appid=%s: %s", appid, e)
+        log_event(
+            logger,
+            f"SteamPY 查价失败，{appid} 号游戏没查到第三方价格",
+            level=logging.WARNING,
+            detail={"游戏ID": appid, "原因": str(e)},
+        )
         return {**empty, "error": str(e)}
 
 
@@ -81,7 +88,12 @@ async def fetch_steamcici(appid: int, sub_id: int | None, proxy_url: str | None 
             return {"listed": False, "price": None, "url": url}
         return {"listed": False, "price": None, "url": url}
     except Exception as e:  # noqa: BLE001
-        logger.warning("SteamCICI 查询失败 appid=%s: %s", appid, e)
+        log_event(
+            logger,
+            f"SteamCICI 查价失败，{appid} 号游戏没查到第三方价格",
+            level=logging.WARNING,
+            detail={"游戏ID": appid, "原因": str(e)},
+        )
         return {"listed": False, "price": None, "url": url, "error": str(e)}
 
 

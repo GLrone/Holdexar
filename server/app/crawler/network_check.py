@@ -28,6 +28,8 @@ import logging
 
 import httpx
 
+from app.core.logging import log_event
+
 logger = logging.getLogger(__name__)
 
 FAILURE_THRESHOLD = 3  # 连续传输失败达此次数 → 值得怀疑，转入核实
@@ -87,17 +89,20 @@ class NetworkChecker:
             count = self._failure_count
             if await self._probe_with_retries():
                 self._failure_count = 0
-                logger.info(
-                    "[断网检测] 连续 %d 次传输失败，但本机可直连外网 —— 归为代理/目标侧问题，"
-                    "交由换出口重试处理",
-                    count,
+                log_event(
+                    logger,
+                    f"连续 {count} 次传输失败，但本机可以直连外网，"
+                    "判定为代理或目标侧问题，转为换出口重试",
+                    detail={"连续失败次数": count},
                 )
                 return
             self._is_offline = True
-            logger.error(
-                "[断网检测] 本机网络不可达（连续 %d 次传输失败 + %d 轮直连探测全败），"
-                "转入等待模式：暂停抓取，网络恢复后自动继续",
-                count, PING_ATTEMPTS,
+            log_event(
+                logger,
+                f"本机网络不可达（连续 {count} 次传输失败，{PING_ATTEMPTS} 轮直连探测全败），"
+                "暂停抓取，等网络恢复后自动继续",
+                level=logging.ERROR,
+                detail={"连续失败次数": count, "探测轮数": PING_ATTEMPTS},
             )
 
     async def _probe_with_retries(self) -> bool:
@@ -137,14 +142,16 @@ class NetworkChecker:
         停止信号用 Event.wait 与超时竞争，而不是把间隔切成小片轮询：等待期间
         用户唯一的操作就是「停止」，没有理由让它最多晚一秒才生效。
         """
-        logger.warning(
-            "[断网等待] 本机网络不可达，每 %d 秒探测一次，恢复后自动继续抓取",
-            POLL_INTERVAL,
+        log_event(
+            logger,
+            f"本机网络不可达，每 {POLL_INTERVAL} 秒探测一次，恢复后自动继续抓取",
+            level=logging.WARNING,
+            detail={"探测间隔秒": POLL_INTERVAL},
         )
         while not _is_set(stop_event):
             if await self._ping_once():
                 self.reset()
-                logger.info("[断网等待] 本机网络已恢复，继续抓取")
+                log_event(logger, "本机网络已恢复，继续抓取", tag="成功")
                 return True
             if await _sleep_or_stop(stop_event, POLL_INTERVAL):
                 return False

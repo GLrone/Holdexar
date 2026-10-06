@@ -14,6 +14,7 @@ import asyncio
 import logging
 import time
 
+from app.core.logging import log_event
 from app.domains.games import tags as tags_service
 
 logger = logging.getLogger(__name__)
@@ -52,16 +53,27 @@ async def resolve_tag_names(context, tagids) -> int:
             for col, url in POPULAR_TAGS_URLS.items():
                 payloads[col] = await context.http_client.get_json(context.session, url)
         except Exception as e:  # noqa: BLE001 —— 名字是副产物，失败不阻断价格链路
-            logger.warning(
-                "[标签] 热门标签表拉取失败（%s），%d 个 tagid 待补，下轮再试: %s",
-                type(e).__name__, len(unknown), e,
+            log_event(
+                logger,
+                f"拉取热门标签表失败，还有 {len(unknown)} 个标签没名字，留到下一轮再补",
+                level=logging.WARNING,
+                detail={
+                    "失败类型": type(e).__name__,
+                    "待补标签数": len(unknown),
+                    "原因": str(e),
+                },
             )
             return 0
 
     maps: dict[str, dict[int, str | None]] = {}
     for col, data in payloads.items():
         if not isinstance(data, list):
-            logger.warning("[标签] 热门标签表响应形态异常（%s）：%s", col, type(data).__name__)
+            log_event(
+                logger,
+                "热门标签表返回的数据形态不对，本轮放弃补名",
+                level=logging.WARNING,
+                detail={"语言字段": col, "返回类型": type(data).__name__},
+            )
             return 0
         maps[col] = {
             int(t["tagid"]): (t.get("name") or None)
@@ -74,7 +86,9 @@ async def resolve_tag_names(context, tagids) -> int:
         {t: en.get(t) for t in unknown},
     )
     hit = sum(1 for t in unknown if zh.get(t) or en.get(t))
-    logger.info(
-        "[标签] 热门标签表补齐：命中 %d，未收录占位 %d", hit, len(unknown) - hit
+    log_event(
+        logger,
+        f"补齐标签名：命中 {hit} 个，未收录 {len(unknown) - hit} 个先占位",
+        detail={"命中": hit, "未收录占位": len(unknown) - hit},
     )
     return wrote

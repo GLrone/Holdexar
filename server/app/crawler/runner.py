@@ -22,10 +22,11 @@ from pathlib import Path
 import aiohttp
 
 from ..core.database import init_db
+from ..core.logging import log_event
 from ..domains.proxypool import jobruns
 from . import browse_store as bs
 from .config import DEFAULT_WORKER_COUNT, HTTP_TIMEOUT
-from .occupancy import begin_crawl, end_crawl
+from .occupancy import begin_crawl, current_holder, end_crawl
 from .http_client import SteamHttpClient
 from .router import CrawlerRouter
 from .scheduler import CrawlerScheduler
@@ -45,6 +46,9 @@ class CrawlRunConfig:
     exit_keys: list[str] | None = None
     # 与 proxy_urls 同序的节点运行名：出口账本要能追到"当时是哪个节点在执行"
     exit_nodes: list[str] | None = None
+    # 占用已由调用方预取（start_job 前移）：run_crawl 复用同 tag 占用、不自行
+    # 取还；None = 自取自还（bundles 直调 / CLI）
+    occupancy_tag: str | None = None
     timeout: int = HTTP_TIMEOUT
 
 
@@ -129,13 +133,17 @@ async def run_crawl(
     """生产爬取入口：取得 crawler 占用后执行，结束（含异常）必定释放。
 
     占用放在这里而不是调用方的 job 表上——bundles 链尾是**直调**本函数的，
-    只有把门禁落在执行入口，两条路径才会真正互斥。
+    只有把门禁落在执行入口，两条路径才会真正互斥。config.occupancy_tag 表示
+    占用已由调用方预取（start_job 占用前移）：复用不取还，释放归调用方。
 
     **生产作业台账也落在这里**（同一理由：这里是唯一入口，写在上层 job 表上会漏掉
     bundles 直调与 CLI）。台账两笔写入（开始 `running` / 结束终态）全部 fail-soft：
     记录失败只留日志，绝不改变爬取行为。
     """
-    begin_crawl("run_crawl")
+    occupancy_tag = config.occupancy_tag or "run_crawl"
+    self_acquired = current_holder() != occupancy_tag
+    if self_acquired:
+        begin_crawl(occupancy_tag)
     started_monotonic = time.monotonic()
     summary = jobruns.new_error_summary()
     # 出口账本：内存累计，作业收尾一次性落库（不按请求写库）
@@ -222,12 +230,13 @@ async def run_crawl(
         await _write_exit_ledger(run_id, exit_stats, node_by_exit)
         raise
     finally:
-        end_crawl()
-        # 占用释放广播： bundles 链尾等直调路径不建 job 行、没有 job.status
-        # 收尾事件，订阅端据此把「抓取进行中」的实时标志拉回空闲
-        from ..core.events import bus
+        if self_acquired:
+            end_crawl()
+            # 占用释放广播： bundles 链尾等直调路径不建 job 行、没有 job.status
+            # 收尾事件，订阅端据此把「抓取进行中」的实时标志拉回空闲
+            from ..core.events import bus
 
-        bus.publish("crawl.idle")
+            bus.publish("crawl.idle")
 
 
 async def _write_exit_ledger(run_id, exit_stats, node_by_exit) -> None:
@@ -265,12 +274,13 @@ async def _run_crawl_locked(
     await db.connect()
 
     # browse 拿不到的 games 列（chinese_support/is_visual_novel…）保留库内原值，
-    # 否则 upsert 会把它们抹成 NULL
+    # 否则 upsert 会把它们抹成 NULL（整表读取移线程：不在事件循环上同步执行）
     from ..core.config import get_settings
 
-    bs.PRESERVED.update(
-        bs.load_preserved_rows(Path(get_settings().data_dir) / "holdexar.db")
+    preserved = await asyncio.to_thread(
+        bs.load_preserved_rows, Path(get_settings().data_dir) / "holdexar.db"
     )
+    bs.PRESERVED.update(preserved)
 
     http_client = SteamHttpClient(
         timeout=config.timeout, max_retries=3, proxy_url=config.proxy_url
@@ -284,15 +294,20 @@ async def _run_crawl_locked(
     )
     tasks: list[dict] = list(pre_tasks or []) + built_tasks
 
-    logger.info(
-        "任务就绪：常规 %d + 预构建 %d | appids=%d regions=%s workers=%d 入口=%s",
-        len(built_tasks),
-        len(pre_tasks or []),
-        len(target_ids),
-        ",".join(regions),
-        config.workers,
-        f"{len(config.proxy_urls)} 条 lane" if client_factory
-        else (config.proxy_url or "直连"),
+    log_event(
+        logger,
+        f"任务就绪：常规任务 {len(built_tasks)} 个、预构建任务 {len(pre_tasks or [])} 个，"
+        f"覆盖 {len(target_ids)} 款游戏、{len(regions)} 个区服",
+        detail={
+            "常规任务": len(built_tasks),
+            "预构建任务": len(pre_tasks or []),
+            "游戏数": len(target_ids),
+            "区服": ",".join(regions),
+            "worker 数": config.workers,
+            "入口": f"{len(config.proxy_urls)} 条 lane"
+            if client_factory
+            else (config.proxy_url or "直连"),
+        },
     )
 
     connector = aiohttp.TCPConnector(limit=config.workers * 2, ttl_dns_cache=60)
@@ -316,10 +331,15 @@ async def _run_crawl_locked(
                 for aid in unknown:
                     if aid in zh or aid in en:
                         bs.META[aid] = bs.StoreBrowseAPI.build_meta(zh.get(aid), en.get(aid))
-                logger.info(
-                    "[预取] 元数据覆盖 %d/%d（网络预取 %d 款，库内原值 %d 款）",
-                    len(bs.META), len(target_ids), len(unknown),
-                    len(target_ids) - len(unknown),
+                log_event(
+                    logger,
+                    f"元数据预取完成：已覆盖 {len(bs.META)}/{len(target_ids)} 款游戏",
+                    detail={
+                        "已覆盖": len(bs.META),
+                        "目标总数": len(target_ids),
+                        "网络预取": len(unknown),
+                        "库内原值": len(target_ids) - len(unknown),
+                    },
                 )
         # failure_ledger：browse 层重试耗尽的批次只记账本不抛异常，调度器
         # 对外口径（进度事件与这里的返回统计）必须把账本并入「失败」

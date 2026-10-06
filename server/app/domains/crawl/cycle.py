@@ -15,6 +15,7 @@ from sqlalchemy import DateTime, Float, Index, Integer, String, Text, JSON, sele
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base, WritePriority, get_session_factory, write_gate
+from app.core.logging import log_event
 from app.domains.crawl.models import CrawlJob
 
 logger = logging.getLogger(__name__)
@@ -145,7 +146,13 @@ async def freeze_expected(cycle_id: int, specs: list[dict]) -> tuple[list[str] |
     try:
         regions = await crawl_service.effective_regions(None)
     except ValueError as e:
-        logger.warning("[周期] Cycle %d 区服不可用：%s", cycle_id, e)
+        log_event(
+            logger,
+            f"价格刷新周期 {cycle_id} 没有可用区服，跳过冻结期望集",
+            tag="跳过",
+            level=logging.WARNING,
+            detail={"周期": cycle_id, "原因": e},
+        )
         return None, 0
 
     appids: list[int] = []
@@ -160,7 +167,12 @@ async def freeze_expected(cycle_id: int, specs: list[dict]) -> tuple[list[str] |
         except ValueError as e:
             # 该阶段本轮无可刷对象（空列表 / 未知 scope）：与 run_sequential
             # 同款容忍——跳过该阶段，不让它掀翻整轮记账
-            logger.info("[周期] 阶段 %s 范围解析跳过：%s", scope, e)
+            log_event(
+                logger,
+                "一个抓取阶段本轮没有可刷对象，已跳过",
+                tag="跳过",
+                detail={"阶段": scope, "原因": e},
+            )
             continue
         # 批次按段算：pool 与 catalog 的对象互斥，并集会低估桶数
         batches_expected += -(-len(resolved) // DEFAULT_BATCH_SIZE)
@@ -197,13 +209,20 @@ async def advance(cycle_id: int | None, status: str, *, error: str | None = None
                 return False
             current = cycle.status
             if current in TERMINAL_STATES:
-                logger.info(
-                    "[周期] Cycle %d 已终态（%s），忽略推进到 %s", cycle_id, current, status
+                log_event(
+                    logger,
+                    f"价格刷新周期 {cycle_id} 已是终态，忽略本次推进",
+                    tag="忽略",
+                    detail={"周期": cycle_id, "当前状态": current, "目标状态": status},
                 )
                 return False
             if status not in _TRANSITIONS.get(current, ()):
-                logger.warning(
-                    "[周期] Cycle %d 拒绝非法跃迁 %s → %s", cycle_id, current, status
+                log_event(
+                    logger,
+                    f"价格刷新周期 {cycle_id} 拒绝非法的状态跃迁",
+                    tag="忽略",
+                    level=logging.WARNING,
+                    detail={"周期": cycle_id, "当前状态": current, "目标状态": status},
                 )
                 return False
             cycle.status = status
@@ -383,5 +402,11 @@ async def cleanup_orphan_cycles() -> int:
             cycle.finished_at = datetime.now()
         if rows:
             await session.commit()
-            logger.warning("清理了 %d 个中断价格周期", len(rows))
+            log_event(
+                logger,
+                f"进程启动清理了 {len(rows)} 个上一进程遗留的未收敛价格周期，已标记为失败",
+                tag="已修复",
+                level=logging.WARNING,
+                detail={"数量": len(rows)},
+            )
     return len(rows)

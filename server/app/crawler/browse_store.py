@@ -29,6 +29,7 @@ from sqlalchemy import text
 from yarl import URL
 
 from app.core.database import WritePriority, get_session_factory, write_gate
+from app.core.logging import log_event
 from app.crawler import tag_names
 from app.crawler.config import CC_LIST
 from app.crawler.db_writer import DbWriter
@@ -235,7 +236,12 @@ async def _mark_missing_async(db_writer, appids: list[int], cc: str) -> int:
             await db_writer.mark_region_status(int(appid), cc, "missing")
             wrote += 1
         except Exception as e:  # noqa: BLE001 —— 账本写失败不阻断主流程
-            logger.error("[browse] missing 记账失败 %s/%s: %s", appid, cc, e)
+            log_event(
+                logger,
+                f"给游戏 {appid} 的 {cc} 区补记缺失数据失败",
+                level=logging.ERROR,
+                detail={"游戏": appid, "区": cc, "原因": e},
+            )
     return wrote
 
 
@@ -358,12 +364,14 @@ class StoreBrowseAPI:
     async def fetch_batch(
         context, appids: list[int], cc: str, lang: str, extras: bool = True
     ) -> tuple[dict[int, dict | None], int]:
-        """一发批量。返回 ({appid: item|None}, 响应体字节估算)。"""
+        """一发批量。返回 ({appid: item|None}, 响应体字节数)。"""
         url = StoreBrowseAPI.build_url(appids, cc, lang, extras)
-        data = await context.http_client.get_json(context.session, url)
+        sized: list[int] = []
+        data = await context.http_client.get_json(
+            context.session, url, body_size_out=sized
+        )
         store_items = ((data or {}).get("response") or {}).get("store_items") or []
-        size = len(json.dumps(data, ensure_ascii=False)) if data else 0
-        return StoreBrowseAPI.map_items(store_items, appids), size
+        return StoreBrowseAPI.map_items(store_items, appids), sized[0] if sized else 0
 
     @staticmethod
     def map_items(items: list[dict], appids: list[int]) -> dict[int, dict | None]:
@@ -379,12 +387,20 @@ class StoreBrowseAPI:
                 if not it.get("appid"):
                     it = {**it, "appid": int(sent)}
                 elif int(it["appid"]) != int(sent):
-                    logger.warning("[browse] 位置错位：请求 %s 返回 %s", sent, it["appid"])
+                    log_event(
+                        logger,
+                        "价格批量响应出现位置错位：返回条目的 appid 与请求不一致",
+                        level=logging.WARNING,
+                        detail={"请求appid": sent, "返回appid": it["appid"]},
+                    )
                 out[int(sent)] = it
         else:
-            logger.warning(
-                "[browse] 条目数不符：请求 %d 返回 %d，降级按 appid 映射",
-                len(appids), len(items),
+            log_event(
+                logger,
+                "价格批量响应条目数与请求不符，降级按 appid 映射",
+                tag="降级",
+                level=logging.WARNING,
+                detail={"请求条数": len(appids), "返回条数": len(items)},
             )
             for it in items:
                 if it.get("appid"):
@@ -657,13 +673,20 @@ class BrowseDbWriter(DbWriter):
                 cols = {row[1] for row in res.fetchall()}
             cls._extras_ready = set(GPH_EXTRA_COLUMNS) <= cols
             if not cls._extras_ready:
-                logger.warning(
-                    "[browse] game_price_history 缺扩展列 %s，扩展字段落库跳过"
-                    "（需迁移后才有促销截止/促销类型/bundle 归属）",
-                    sorted(set(GPH_EXTRA_COLUMNS) - cols),
+                log_event(
+                    logger,
+                    "价格历史表缺少浏览扩展列，扩展字段落库跳过（需迁移后才有促销截止/促销类型/捆绑包归属）",
+                    tag="跳过",
+                    level=logging.WARNING,
+                    detail={"缺少列": "/".join(sorted(set(GPH_EXTRA_COLUMNS) - cols))},
                 )
         except Exception as e:  # noqa: BLE001
-            logger.warning("[browse] 扩展列探测失败：%s", e)
+            log_event(
+                logger,
+                "探测价格历史表扩展列失败",
+                level=logging.WARNING,
+                detail={"原因": e},
+            )
             cls._extras_ready = False
         return cls._extras_ready
 
@@ -683,7 +706,11 @@ class BrowseDbWriter(DbWriter):
                         conn.execute(
                             f"ALTER TABLE game_price_history ADD COLUMN {name} {ddl}"
                         )
-                        logger.info("[browse] game_price_history += %s", name)
+                        log_event(
+                            logger,
+                            "价格历史表新增了一个浏览扩展列",
+                            detail={"列名": name},
+                        )
                 conn.commit()
             finally:
                 conn.close()
@@ -722,7 +749,12 @@ class BrowseDbWriter(DbWriter):
                 )
                 await session.commit()
         except Exception as e:  # noqa: BLE001 —— 扩展字段不阻断主链路
-            logger.warning("[browse] 扩展字段落库失败 %s/%s: %s", appid, cc, e)
+            log_event(
+                logger,
+                f"游戏 {appid} 的 {cc} 区浏览扩展字段落库失败",
+                level=logging.WARNING,
+                detail={"游戏": appid, "区": cc, "原因": e},
+            )
 
     async def attach_browse_extras_batch(self, entries) -> None:
         """一批扩展字段一次事务回贴（entries = (appid, cc, now_dt, extras_by_sub)）。
@@ -763,7 +795,12 @@ class BrowseDbWriter(DbWriter):
                         )
                     await session.commit()
         except Exception as e:  # noqa: BLE001 —— 扩展字段不阻断主链路
-            logger.warning("[browse] 扩展字段批量落库失败: %s", e)
+            log_event(
+                logger,
+                "浏览扩展字段批量落库失败",
+                level=logging.WARNING,
+                detail={"原因": e},
+            )
 
 
 # ══════════════════════════════════════════════════════════════
@@ -839,9 +876,16 @@ async def handle_browse_price_task(context) -> None:
             return
         if retries < MAX_PARTIAL_RETRIES:
             delay = 5.0 * (2**retries) if isinstance(e, SteamRateLimitError) else 2.0
-            logger.warning(
-                "[browse] %s 未预期异常（%s），%.0fs 后重推（第 %d 次）",
-                task_id, type(e).__name__, delay, retries + 1,
+            log_event(
+                logger,
+                f"价格抓取批次 {task_id} 出现未预期异常，{delay:.0f} 秒后重推",
+                level=logging.WARNING,
+                detail={
+                    "批次": task_id or "未标注",
+                    "异常": type(e).__name__,
+                    "等待": f"{delay:.0f}秒",
+                    "重试次数": retries + 1,
+                },
             )
             await asyncio.sleep(delay)
             await context.queue.put({**task, "retries": retries + 1})
@@ -850,12 +894,19 @@ async def handle_browse_price_task(context) -> None:
         # 进补抓账本，让补抓层下个周期只补这些失败区——绝不能静默丢行。
         if task_id not in _WRITE_STARTED:
             n = await _mark_missing_async(context.db_writer, appids, cc)
-            logger.error(
-                "[browse] %s 重推耗尽（%s），未落库整批 %d 条记 missing 进账本",
-                task_id, e, n,
+            log_event(
+                logger,
+                f"价格抓取批次 {task_id} 重推耗尽，整批 {n} 条未落库，已记缺失数据进补抓账本",
+                level=logging.ERROR,
+                detail={"批次": task_id or "未标注", "异常": e, "条数": n},
             )
         else:
-            logger.error("[browse] %s 重推耗尽（%s），部分已落库，不覆盖", task_id, e)
+            log_event(
+                logger,
+                f"价格抓取批次 {task_id} 重推耗尽，部分数据已落库，本次不覆盖",
+                level=logging.ERROR,
+                detail={"批次": task_id or "未标注", "异常": e},
+            )
         FAILED_TASKS.append(str(task_id))
     finally:
         _WRITE_STARTED.discard(str(task_id))
@@ -875,7 +926,13 @@ async def _browse_price_task_inner(context) -> bool:
     task_id = task.get("id")
 
     if network_checker.is_offline and not await _wait_network_online(context):
-        logger.warning("[browse] %s 断网等待期间收到停止信号，任务丢弃", task_id)
+        log_event(
+            logger,
+            f"价格抓取批次 {task_id} 在断网等待期间收到停止信号，已丢弃",
+            tag="未完成",
+            level=logging.WARNING,
+            detail={"批次": task_id or "未标注"},
+        )
         return False
 
     started = time.monotonic()
@@ -893,17 +950,27 @@ async def _browse_price_task_inner(context) -> bool:
             return True
         if retries < MAX_PARTIAL_RETRIES:
             delay = 5.0 * (2**retries) if rate_limited else 1.0
-            logger.warning(
-                "[browse] %s 抓取失败（%s），%.0fs 后重推（第 %d 次）",
-                task_id, type(e).__name__, delay, retries + 1,
+            log_event(
+                logger,
+                f"价格抓取批次 {task_id} 抓取失败，{delay:.0f} 秒后重推",
+                level=logging.WARNING,
+                detail={
+                    "批次": task_id or "未标注",
+                    "异常": type(e).__name__,
+                    "等待": f"{delay:.0f}秒",
+                    "重试次数": retries + 1,
+                },
             )
             await asyncio.sleep(delay)
             await context.queue.put({**task, "retries": retries + 1})
             return True
         # 穷尽：本批必然一行未写 → 整批记 missing 进账本（补抓层下轮只补失败区）
         n = await _mark_missing_async(context.db_writer, appids, cc)
-        logger.error(
-            "[browse] %s 抓取失败且已达最大重试（%s），%d 条记 missing 进账本", task_id, e, n
+        log_event(
+            logger,
+            f"价格抓取批次 {task_id} 抓取失败且已达最大重试，{n} 条记缺失数据进补抓账本",
+            level=logging.ERROR,
+            detail={"批次": task_id or "未标注", "异常": e, "条数": n},
         )
         FAILED_TASKS.append(str(task_id))
         return False
@@ -917,9 +984,16 @@ async def _browse_price_task_inner(context) -> bool:
     if followed:
         PARENT_FOLLOWED += followed
 
-    logger.info(
-        "[browse] %s 返回 %d/%d 条 | %.0fKB | %.1fs",
-        task_id, len(items), len(appids), size / 1024, time.monotonic() - started,
+    log_event(
+        logger,
+        f"价格抓取批次 {task_id} 返回 {len(items)}/{len(appids)} 条",
+        detail={
+            "批次": task_id or "未标注",
+            "返回条数": len(items),
+            "请求条数": len(appids),
+            "响应大小": f"{size / 1024:.0f}KB",
+            "耗时": f"{time.monotonic() - started:.1f}秒",
+        },
     )
 
     currency = CURRENCY_BY_CC.get(cc, "USD")
@@ -932,7 +1006,10 @@ async def _browse_price_task_inner(context) -> bool:
     # 补抓通道每拍重拾的死账——统一收集，落库段一次性清除
     cleared_missing: list[tuple[int, str]] = []
 
-    for appid in appids:
+    for idx, appid in enumerate(appids):
+        if idx % 32 == 0:
+            # 逐款判定/构建是纯 CPU 段：定期让出事件循环，抓取期间 HTTP/SSE 不被饿死
+            await asyncio.sleep(0)
         meta = META.get(appid)
         keep = PRESERVED.get(appid)
 
@@ -1109,7 +1186,12 @@ async def _browse_price_task_inner(context) -> bool:
                     await context.db_writer.record_bundle_discoveries(found)
                     BUNDLES_DISCOVERED += len(found)
             except Exception as e:  # noqa: BLE001
-                logger.debug("[browse] %s 捆绑包发现落库失败: %s", task_id, e)
+                log_event(
+                    logger,
+                    f"价格抓取批次 {task_id} 的捆绑包发现落库失败",
+                    level=logging.DEBUG,
+                    detail={"批次": task_id or "未标注", "原因": e},
+                )
         if extra_entries:
             await context.db_writer.attach_browse_extras_batch(extra_entries)
 
@@ -1127,12 +1209,30 @@ async def _browse_price_task_inner(context) -> bool:
                     context, {t for _, rows in tag_entries for t, _ in rows}
                 )
             except Exception as e:  # noqa: BLE001 —— 标签是副产物，绝不拖垮价格链路
-                logger.warning("[browse] %s 标签落库失败: %s", task_id, e)
+                log_event(
+                    logger,
+                    f"价格抓取批次 {task_id} 的热门标签落库失败",
+                    level=logging.WARNING,
+                    detail={"批次": task_id or "未标注", "原因": e},
+                )
 
     if cleared_missing and not DRY_RUN:
         await context.db_writer.clear_missing_regions(cleared_missing)
 
-    logger.debug("[browse] %s 计数 %s", task_id, counts)
+    log_event(
+        logger,
+        f"价格抓取批次 {task_id} 处理完成",
+        level=logging.DEBUG,
+        detail={
+            "批次": task_id or "未标注",
+            "有价": counts["ok"],
+            "限时赠送": counts["free_promo"],
+            "不可售": counts["locked"],
+            "缺失数据": counts["missing"],
+            "跳过": counts["skip"],
+            "写库失败": counts["write_fail"],
+        },
+    )
     return False
 
 
@@ -1212,7 +1312,12 @@ async def prefetch_lang(
             try:
                 items, _ = await StoreBrowseAPI.fetch_batch(ctx, batch, cc, lang, extras)
             except Exception as e:  # noqa: BLE001 —— 单发失败不拖垮预取，条目回落库内原值
-                logger.error("[预取] %s/%s 失败（%d 条）：%s", lang, cc, len(batch), e)
+                log_event(
+                    logger,
+                    f"元数据预取失败：语言 {lang}、区 {cc}，本发 {len(batch)} 条",
+                    level=logging.ERROR,
+                    detail={"语言": lang, "区": cc, "条数": len(batch), "原因": e},
+                )
                 still.extend(batch)
                 continue
             for appid, item in items.items():
@@ -1220,8 +1325,10 @@ async def prefetch_lang(
                     out[appid] = item
                 else:
                     still.append(appid)
-        logger.info(
-            "[预取] 语言=%s 区=%s 命中 %d，余 %d", lang, cc, len(out), len(still)
+        log_event(
+            logger,
+            f"元数据预取：语言 {lang}、区 {cc} 命中 {len(out)} 条",
+            detail={"语言": lang, "区": cc, "命中": len(out), "待补齐": len(still)},
         )
         pending = still
     return out

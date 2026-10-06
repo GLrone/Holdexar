@@ -53,6 +53,11 @@ def db(tmp_path, monkeypatch):
     import app.domains.monitoring.service as monitoring_service
 
     monkeypatch.setattr(monitoring_service, "get_session_factory", lambda: factory)
+    # 写路径经 steam_events.active_event_key_at 打活动标记——该域也是
+    # 模块级 import factory，漏桩会摸到 lru 缓存的旧引擎（无表库）
+    import app.domains.steam_events.service as steam_events_service
+
+    monkeypatch.setattr(steam_events_service, "get_session_factory", lambda: factory)
     import app.core.orchestration as orchestration_mod
 
     # 编排事件独立会话形态也经模块级 factory，漏打桩会把测试事件写进生产库
@@ -147,7 +152,7 @@ def _crawl_env(monkeypatch):
     # merge 落行，避免与种子的欠账行撞主键。
     import app.core.database as database_module
 
-    async def _run_crawl(pairs, *, config, stop_event=None, pre_tasks=None):
+    async def _run_crawl(pairs, *, config, stop_event=None, pre_tasks=None, crawl_job_id=None):
         now = datetime.now()
         regions = list(getattr(config, "regions", None) or [])
         async with database_module.get_session_factory()() as session:

@@ -53,8 +53,12 @@ def db(tmp_path, monkeypatch):
     monkeypatch.setattr(crawl_service, "get_session_factory", lambda: factory)
     import app.crawler.db_writer as dw
     import app.domains.settings.service as settings_service
+    # 写路径经 steam_events.active_event_key_at 打活动标记——该域也是
+    # 模块级 import factory，漏桩会摸到 lru 缓存的旧引擎（无表库）
+    import app.domains.steam_events.service as steam_events_service
 
     monkeypatch.setattr(dw, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(steam_events_service, "get_session_factory", lambda: factory)
     monkeypatch.setattr(settings_service, "get_session_factory", lambda: factory)
     # 空壳轮窗口判定在 coverage 域——漏桩会把终态判定指向生产库
     import app.domains.crawl.coverage as crawl_coverage

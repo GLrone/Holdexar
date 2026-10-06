@@ -29,6 +29,8 @@ import time
 from collections import deque
 from collections.abc import Sequence
 
+from app.core.logging import log_event
+
 logger = logging.getLogger(__name__)
 
 # 窗口参数（见 module docstring）
@@ -75,9 +77,15 @@ class SlidingWindowRateLimiter:
                 self._waited_total += max(wait, 0.0)
                 self._waiting += 1
             if wait > 0:
-                logger.info(
-                    "[限流] 窗口满（%d 发/%ds），等待 %.1fs 后放行",
-                    self.max_requests, self.window_seconds, wait,
+                log_event(
+                    logger,
+                    f"出网请求已达频率上限（{self.max_requests} 次/{self.window_seconds} 秒），"
+                    f"等 {wait:.1f} 秒再发",
+                    detail={
+                        "窗口上限": self.max_requests,
+                        "窗口秒": self.window_seconds,
+                        "等待秒": round(wait, 1),
+                    },
                 )
                 try:
                     await asyncio.sleep(wait)
@@ -88,7 +96,13 @@ class SlidingWindowRateLimiter:
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 —— 限流器故障不得拖垮爬取
-            logger.exception("[限流] 限流器异常，本请求放行")
+            log_event(
+                logger,
+                "限流器内部出错，本次请求直接放行",
+                tag="降级",
+                level=logging.ERROR,
+                exc_info=True,
+            )
 
     @property
     def waiting(self) -> int:
