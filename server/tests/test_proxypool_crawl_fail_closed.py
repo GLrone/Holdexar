@@ -216,6 +216,11 @@ async def test_case4_start_job_refuses_when_pool_empty(tmp_path, monkeypatch) ->
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+    # 空池拒绝语义属代理形态：直连形态（现默认）不依赖池子，先切策略
+    from app.domains.settings.service import set_value
+
+    await set_value("proxy.strategy", "proxy_first")
+
     class _Settings:
         data_dir = tmp_path
 
