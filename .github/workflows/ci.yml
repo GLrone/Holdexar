@@ -1,9 +1,8 @@
 # CI：后端测试 + 敏感面门禁 + 前端构建门禁。
 #
-# 仅在 Actions 页手动触发（workflow_dispatch），不随 push / PR 自动运行；
-# 常规验证由开发会话内的靶向测试与真实链路实测承担，发布前手动跑一次本
-# 工作流或本地全量。timeout-minutes 兜底：单 job 卡死最多 45 分钟必出结论，
-# 不无限占用 runner。
+# push 到 main / PR / 手动触发均运行；公开仓库标准 runner 免额度，作为云端
+# 兜底门禁，快速反馈仍由本地 L1 选测与 L2 冒烟承担。timeout-minutes 兜底：
+# 单 job 卡死必出结论，不无限占用 runner。
 #
 # 后端跑 windows-latest 而不是 ubuntu：本产品是 Windows 专用的（`mihomo.exe`、
 # pywebview/WebView2、`run.py` 的自重入与 .bat 启动器、`paths.py` 里的
@@ -15,6 +14,10 @@
 name: CI
 
 on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 # 同一分支的新触发取消上一轮未完成的运行，省 runner 也少噪音
@@ -26,7 +29,7 @@ jobs:
   backend:
     name: 后端（Python 3.13）
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
