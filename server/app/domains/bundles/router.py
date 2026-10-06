@@ -79,9 +79,16 @@ async def restore_bundle(bundle_id: int):
 
 @router.post("/refresh")
 async def refresh_bundles():
-    """全量刷新：监控区整表每区一发（南亚 pk/bd 双发，代理优先）→ upsert。"""
+    """全量刷新：监控区整表每区一发（南亚 pk/bd 双发，代理优先）→ upsert。
+
+    与价格轮链尾同口径入运行账（独立 run：手动按钮无调度桥上下文）。"""
+    from app.domains.agent.runtime import scheduler_bridge
+
     try:
-        return await refresh.refresh_bundles()
+        return await scheduler_bridge.run_accounted(
+            "bundle_refresh", refresh.refresh_bundles, trigger="manual",
+            ref={"entry": "manual_refresh_button"},
+        )
     except ValueError as e:
         # 未启用任何区服等配置错误 → 400（前端静默失败即可，不落 500）
         raise HTTPException(status_code=400, detail=str(e)) from e
