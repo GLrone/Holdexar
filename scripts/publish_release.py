@@ -43,10 +43,10 @@ RELEASE = ROOT / "release"
 SCOOP_JSON = RELEASE / "scoop" / "holdexar.json"
 NOTES_FILE = RELEASE / "RELEASE_NOTES.md"
 MANIFEST = RELEASE / "latest.json"
-# build_release.py 会把种子另存到 release/ 作为独立资产；源码树里的那份是同源副本，
-# 缺前者时用它兜底（避免「种子明明在却报没有」）
-SEED_DB = RELEASE / "holdexar_seed.db"
-SEED_DB_FALLBACK = ROOT / "assets" / "seed" / "holdexar_seed.db"
+# build_release.py 会把种子 gz 另存到 release/ 作为独立资产；源码树里的 raw 副本
+# 可现场压缩兜底（避免「种子明明在却报没有」）
+SEED_GZ = RELEASE / "holdexar_seed.db.gz"
+SEED_RAW_FALLBACK = ROOT / "assets" / "seed" / "holdexar_seed.db"
 # 公共目录库模板（server/scripts/export_template_db.py 产物）：导出脚本的落点
 # 是 assets/seed/，构建期另存到 release/ 之后由本脚本一并上传
 TEMPLATE_DB = RELEASE / "holdexar_template.db"
@@ -150,20 +150,37 @@ def _with_fallback(primary: Path, fallback: Path, label: str, found: list[Path])
     print(f"[警告] 未找到{label}（{primary} / {fallback}），本次发布不含该件")
 
 
+def _ensure_seed_gz() -> None:
+    """种子分发形态统一为 .gz：release/ 下没有 gz 时用 raw 副本现场压缩。"""
+    if SEED_GZ.is_file():
+        return
+    if not SEED_RAW_FALLBACK.is_file():
+        print(f"[警告] 未找到资产种子（{SEED_GZ.name} / {SEED_RAW_FALLBACK}），本次发布不含该件")
+        return
+    import gzip
+
+    with SEED_RAW_FALLBACK.open("rb") as fin, gzip.open(SEED_GZ, "wb", compresslevel=9) as fout:
+        while chunk := fin.read(1 << 20):
+            fout.write(chunk)
+    print(f"[发布] 种子 gz 现场压缩：{SEED_RAW_FALLBACK} → {SEED_GZ.name}")
+
+
 def collect_artifacts(app_zip: Path) -> list[Path]:
     """版本 Release 的资产全集：release/ 下**全部**待分发产物。
 
     「全部」是硬要求——漏传一件就是一个半成品发布（源码用户拉不到种子、
     Scoop 渠道跟进不到清单、用户看不到更新说明）。顺序固定（应用包在首，
     人工核对与 Scoop checkver 拼 URL 都靠它）：
-        ① 应用包 zip   ② latest.json   ③ 资产种子 holdexar_seed.db
+        ① 应用包 zip   ② latest.json   ③ 资产种子 holdexar_seed.db.gz
         ④ 公共目录库模板 holdexar_template.db（有则带）
         ⑤ Scoop 渠道清单 release/scoop/holdexar.json（有则带）
     更新说明 RELEASE_NOTES.md 走 --notes-file 成为 Release 正文，不再另挂附件；
     构建中间产物（build/、work/、build*.log）不是发布物，一律不带。
     """
     artifacts: list[Path] = [app_zip, MANIFEST]
-    _with_fallback(SEED_DB, SEED_DB_FALLBACK, "资产种子", artifacts)
+    _ensure_seed_gz()
+    if SEED_GZ.is_file():
+        artifacts.append(SEED_GZ)
     _with_fallback(TEMPLATE_DB, TEMPLATE_DB_FALLBACK, "公共目录库模板", artifacts)
     # Scoop 清单是渠道跟进的入口（checkver 读 latest.json、autoupdate 拼 zip URL），
     # 属于分发面；更新说明不作附件——它以 --notes-file 成为 Release 正文，
