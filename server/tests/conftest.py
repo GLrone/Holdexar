@@ -114,6 +114,98 @@ def _db_caches_fresh_before_each(_sanitize_db_lru_caches):
     database_module.get_settings.cache_clear()
 
 
+def _scan_module_level_factory_importers() -> dict[str, tuple[str, ...]]:
+    """扫描模块级 `from app.core.database import ...` 绑定了 get_session_factory /
+    get_engine 的模块（顶格导入在 import 时绑定原函数对象；函数内导入调用时解析、
+    不受影响）。tests 目录无包结构，模块名取文件名。"""
+    import re as _re
+
+    server_root = Path(__file__).resolve().parents[1]
+    pattern = _re.compile(r"^from app\.core\.database import ([^\n(]+)$", _re.M)
+    targets = ("get_session_factory", "get_engine")
+    hits: dict[str, tuple[str, ...]] = {}
+    for scan_root, dotted in (
+        (server_root / "app", True),
+        (server_root / "tests", False),
+    ):
+        for path in sorted(scan_root.rglob("*.py")):
+            text = path.read_text(encoding="utf-8", errors="replace")
+            found = {
+                name
+                for match in pattern.finditer(text)
+                for name in targets
+                if name in match.group(1)
+            }
+            if found:
+                if dotted:
+                    rel = path.relative_to(server_root).with_suffix("")
+                    key = str(rel).replace(os.sep, ".")
+                else:
+                    key = path.stem
+                hits[key] = tuple(sorted(found))
+    return hits
+
+
+_FACTORY_IMPORTERS = _scan_module_level_factory_importers()
+
+# 模块导入时刻的原始工厂函数：夹具 setup 时 database_module 可能已被本用例
+# 更早的夹具 patch，不能用「与当前 database_module 属性同对象」做判定
+from app.core import database as _database_import_time  # noqa: E402
+
+_ORIG_SESSION_FACTORY = _database_import_time.get_session_factory
+_ORIG_ENGINE = _database_import_time.get_engine
+
+
+class _ForwardedFactory:
+    """database 模块工厂的动态转发：调用时解析 database 模块当前属性，测试
+    patch 一处全域生效。cache_clear 转发到当前目标（目标非 lru 函数时安全
+    no-op）——兼容测试夹具对 from-import 对象直接调 cache_clear 的既有写法。"""
+
+    def __init__(self, database_module, name):
+        self._dm = database_module
+        self._name = name
+
+    def __call__(self, *args, **kwargs):
+        return getattr(self._dm, self._name)(*args, **kwargs)
+
+    @property
+    def cache_clear(self):
+        return getattr(getattr(self._dm, self._name), "cache_clear", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _forward_session_factory_imports(monkeypatch):
+    """模块级 from-import 绑定的工厂函数统一转发到 database 模块当前值。
+
+    30+ 域模块（与部分测试文件）顶部 `from app.core.database import
+    get_session_factory` 在 import 时绑定原函数，测试对 database_module 的
+    monkeypatch 拦不住这些本地引用——跨域调用点（settings.get_value 等）把
+    读写漏进隔离空库，「no such table」成片假失败；测试文件自身的 from-import
+    则依赖前序用例毒化 lru_cache 才偶然拿到测试库（跨文件污染判例同源）。
+
+    本夹具把全部此类引用改写为转发：测试 patch database_module 一处即全域
+    生效；测试自行 patch 某域模块属性时 setattr 晚于本夹具、正常覆盖；
+    monkeypatch 后进先出的还原顺序保证撤销后回到转发形态。
+    """
+    import importlib
+
+    from app.core import database as database_module
+
+    orig = {
+        "get_session_factory": _ORIG_SESSION_FACTORY,
+        "get_engine": _ORIG_ENGINE,
+    }
+    for name, names in _FACTORY_IMPORTERS.items():
+        module = importlib.import_module(name)
+        for attr in names:
+            current = getattr(module, attr, None)
+            if isinstance(current, _ForwardedFactory):
+                continue
+            if current is not orig[attr]:
+                continue  # 已被更早的夹具/测试换成桩，尊重它
+            monkeypatch.setattr(module, attr, _ForwardedFactory(database_module, attr))
+
+
 @pytest.fixture(autouse=True)
 def _reset_crawl_control_globals():
     """爬取控制面的进程级全局（占用持有者 / 活动任务 / 链级停止位 / 主轮
@@ -171,6 +263,19 @@ def _isolate_data_dir(request, _db_caches_fresh_before_each):
     orig_engine.cache_clear()
     orig_factory.cache_clear()
     orig_settings.cache_clear()
+    # 隔离库直接建全 schema（生产同源 init_db：create_all + 迁移链 + 基础种子）：
+    # 漏桩的跨域调用落到「表齐全的空库」上行为正常，而不是成片 no such table。
+    # 只影响本进程的临时库，数据隔离不变。建完即弃连接池——池内连接绑定已关
+    # 的 event loop，复用会在后续用例的 loop 上报 attached-to-different-loop。
+    import asyncio
+
+    from app.core.database import init_db
+
+    async def _bootstrap_isolated_db() -> None:
+        await init_db()
+        await database_module.get_engine().dispose()
+
+    asyncio.run(_bootstrap_isolated_db())
     yield
     os.environ.pop("HOLDEXAR_DATA_DIR", None)
     if old is not None:
