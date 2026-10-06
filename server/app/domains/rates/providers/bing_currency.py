@@ -27,6 +27,8 @@ from typing import Iterable
 
 import httpx
 
+from app.core.logging import log_event
+
 logger = logging.getLogger(__name__)
 
 
@@ -127,7 +129,12 @@ class BingCurrencyProvider:
             try:
                 series[code] = await self._chart_points(code, chart)
             except ProviderError as e:
-                logger.warning("bing 采样拉取失败（该币种缺口保留）：%s %s", code, e)
+                log_event(
+                    logger,
+                    "单个币种汇率采样拉取失败，该币种缺口保留",
+                    detail={"币种": code, "原因": e},
+                    level=logging.WARNING,
+                )
                 failed.append(code)
         if failed and len(failed) == len(codes):
             raise ProviderError(f"全部币种采样拉取失败（示例 {failed[:3]}）")

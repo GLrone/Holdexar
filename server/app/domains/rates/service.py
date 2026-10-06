@@ -21,6 +21,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
+from app.core.logging import log_event
 from app.crawler.config import CC_LIST
 from app.crawler.utils import get_beijing_time_obj
 from .models import FxRate, FxRateHistory
@@ -59,7 +60,12 @@ async def _fetch_with_retry(url: str, attempts: int = 2) -> httpx.Response | Non
                 return resp
         except Exception as e:  # noqa: BLE001
             last_err = e
-    logger.warning("汇率源请求失败（%d 次）: %s: %s", attempts, url, last_err)
+    log_event(
+        logger,
+        f"汇率源请求连续 {attempts} 次失败",
+        detail={"地址": url, "原因": last_err},
+        level=logging.WARNING,
+    )
     return None
 
 
@@ -83,7 +89,7 @@ async def _fetch_augmentedsteam() -> dict[str, float] | None:
             return None
         return rates
     except Exception as e:  # noqa: BLE001
-        logger.warning("augmentedsteam 汇率获取失败: %s", e)
+        log_event(logger, "augmentedsteam 汇率源获取失败", detail={"原因": e}, level=logging.WARNING)
         return None
 
 
@@ -98,7 +104,7 @@ async def _fetch_er_api() -> dict[str, float] | None:
             return None
         return {str(k).upper(): 1.0 / float(v) for k, v in per_cny.items() if float(v) != 0}
     except Exception as e:  # noqa: BLE001
-        logger.warning("er-api 汇率获取失败: %s", e)
+        log_event(logger, "er-api 汇率源获取失败", detail={"原因": e}, level=logging.WARNING)
         return None
 
 
@@ -184,9 +190,16 @@ async def refresh_rates() -> dict:
 
     invalidate_bundles_cache()
 
-    logger.info(
-        "汇率已刷新：source=%s 共 %d 币种（cny_fen 重算 games %d / bundles %d）",
-        source, len(rates), recomputed["games"], recomputed["bundles"],
+    log_event(
+        logger,
+        "汇率刷新完成",
+        tag="成功",
+        detail={
+            "汇率源": source,
+            "币种": len(rates),
+            "重算游戏": recomputed["games"],
+            "重算捆绑包": recomputed["bundles"],
+        },
     )
     return {
         "source": source,
@@ -217,12 +230,16 @@ async def refresh_if_stale() -> bool:
     age_hours = (_naive(get_beijing_time_obj()) - last).total_seconds() / 3600
     if age_hours < STALE_THRESHOLD_HOURS:
         return False
-    logger.info("汇率快照已 %.1f 小时未更新，启动补刷新", age_hours)
+    log_event(
+        logger,
+        "汇率快照已过期，启动补刷新",
+        detail={"过期小时": f"{age_hours:.1f}"},
+    )
     try:
         await refresh_rates()
         return True
     except Exception:  # noqa: BLE001
-        logger.exception("启动汇率补刷新失败（等待下次调度）")
+        log_event(logger, "启动汇率补刷新失败，等待下次调度", level=logging.ERROR, exc_info=True)
         return False
 
 
@@ -314,5 +331,10 @@ async def cleanup_disallowed() -> tuple[int, int]:
         removed = await _delete_disallowed(session)
         if any(removed):
             await session.commit()
-            logger.info("汇率白名单清洗：删除快照 %d 条 / 历史 %d 条", *removed)
+            log_event(
+                logger,
+                "汇率白名单清洗完成，已清除名单外币种数据",
+                tag="成功",
+                detail={"快照删除": removed[0], "历史删除": removed[1]},
+            )
     return removed

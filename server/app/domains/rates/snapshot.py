@@ -30,6 +30,8 @@ import logging
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.logging import log_event
+
 logger = logging.getLogger(__name__)
 
 # cny_fen = ROUND(price(分) × rate_to_cny)：与写库侧
@@ -66,9 +68,11 @@ async def recompute_cny_fen_all(session: AsyncSession) -> dict[str, int]:
     games = await session.execute(_RECOMPUTE_GAMES_SQL)
     bundles = await session.execute(_RECOMPUTE_BUNDLES_SQL)
     counts = {"games": games.rowcount or 0, "bundles": bundles.rowcount or 0}
-    logger.info(
-        "CNY 快照重算（同事务）：games %d 行 / bundles %d 行",
-        counts["games"], counts["bundles"],
+    log_event(
+        logger,
+        "人民币价格快照重算完成",
+        tag="成功",
+        detail={"游戏行": counts["games"], "捆绑包行": counts["bundles"]},
     )
     return counts
 
@@ -85,7 +89,10 @@ async def rebuild_sort_snapshots(session: AsyncSession) -> dict[str, int]:
 
     games = await games_service.refresh_sort_cache(session=session)
     bundles = await bundles_service.refresh_bundle_sort_cache(session=session)
-    logger.info(
-        "排序快照重建（同事务）：games %d 款 / bundles %d 个", games, bundles
+    log_event(
+        logger,
+        "排序快照重建完成",
+        tag="成功",
+        detail={"游戏": games, "捆绑包": bundles},
     )
     return {"games": games, "bundles": bundles}
