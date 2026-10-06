@@ -28,6 +28,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from app.core.logging import log_event
+
 logger = logging.getLogger(__name__)
 
 SESSION_MAX_FILES = 200
@@ -141,7 +143,12 @@ class SessionStore:
                 if existed:
                     path.unlink()
             except OSError as e:
-                logger.warning("pilot 会话删除失败（%s）: %r", sid, e)
+                log_event(
+                    logger,
+                    f"会话 {sid} 删除失败",
+                    level=logging.WARNING,
+                    detail={"会话": sid, "原因": repr(e)},
+                )
                 return False
             self._cache.pop(sid, None)
             return existed
@@ -207,7 +214,12 @@ class SessionStore:
                 with self._path(sid).open("a", encoding="utf-8") as f:
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
             except OSError as e:
-                logger.warning("pilot 会话写入失败（%s）: %r", sid, e)
+                log_event(
+                    logger,
+                    f"会话 {sid} 写入失败，本条记录已丢弃",
+                    level=logging.WARNING,
+                    detail={"会话": sid, "原因": repr(e)},
+                )
                 return False
             self._apply(state, record)
             self._cache_put(state)
@@ -259,7 +271,12 @@ class SessionStore:
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
         except OSError as e:
-            logger.warning("pilot 会话读取失败（%s）: %r", path.name, e)
+            log_event(
+                logger,
+                f"会话文件 {path.name} 读取失败，已按空会话处理",
+                level=logging.WARNING,
+                detail={"文件": path.name, "原因": repr(e)},
+            )
             return out
         for line in lines:
             try:

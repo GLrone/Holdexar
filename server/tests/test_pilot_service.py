@@ -158,6 +158,287 @@ class TestAgentLoop:
         assert done["cards"] == [{"kind": "price", **{**_FACTS, "appid": 292030}}]
 
     @pytest.mark.asyncio
+    async def test_card_event_streams_before_done(self, monkeypatch):
+        """卡片随工具完成即时下发：card 事件先于 done，tool_start 带类型预告，done.cards 同源。"""
+        executed = []
+        _patch_ready(
+            monkeypatch,
+            stream=[
+                ("tool_calls", [{"id": "t1", "name": "get_price_briefing", "arguments": {"appid": 292030}}]),
+                ("answer", "结论：值得。"),
+                ("usage", (10, 5)),
+            ],
+        )
+        monkeypatch.setattr(
+            service.pilot_tools,
+            "execute_tool",
+            _tool_stub(executed, _FACTS),
+        )
+        events = [e async for e in service.ask_stream("这游戏值得入手吗", session_id="s-card")]
+        types = [e["type"] for e in events]
+        assert "card" in types
+        started = next(e for e in events if e["type"] == "tool_start")
+        assert started["card_kind"] == "price"
+        card_ev = next(e for e in events if e["type"] == "card")
+        assert card_ev["name"] == "get_price_briefing"
+        assert card_ev["card"]["kind"] == "price"
+        # 先见卡后收终态：card 落在 tool 与 done 之间
+        assert types.index("tool") < types.index("card") < types.index("done")
+        done = events[-1]
+        assert done["cards"] == [card_ev["card"]]
+
+    @pytest.mark.asyncio
+    async def test_card_event_dedupes_repeated_result(self, monkeypatch):
+        """同轮重复产出同一卡片只在终态账本记一份，card 事件也只发一次。"""
+        executed = []
+        _patch_ready(
+            monkeypatch,
+            stream=[
+                ("tool_calls", [
+                    {"id": "t1", "name": "get_price_briefing", "arguments": {"appid": 292030}},
+                    {"id": "t2", "name": "get_price_briefing", "arguments": {"appid": 292030}},
+                ]),
+                ("answer", "同一款不重复贴卡。"),
+                ("usage", (10, 5)),
+            ],
+        )
+        monkeypatch.setattr(
+            service.pilot_tools,
+            "execute_tool",
+            _tool_stub(executed, _FACTS),
+        )
+        events = [e async for e in service.ask_stream("查两次同一个", session_id="s-dedupe")]
+        card_events = [e for e in events if e["type"] == "card"]
+        # 第二次同结果只在终态账本记一份：首帧带卡，重帧为空结算（前端撤骨架）
+        assert [e["card"] for e in card_events] == [card_events[0]["card"], None]
+        assert card_events[0]["card"] is not None
+        done = events[-1]
+        assert done["cards"] == [card_events[0]["card"]]
+
+    @pytest.mark.asyncio
+    async def test_stepper_and_proposal_both_stream(self, monkeypatch):
+        """复合结果（进度 + 提议）两张卡各自即时下发，提议卡以 propose_bulk 名义发事件。"""
+        executed = []
+        _patch_ready(
+            monkeypatch,
+            stream=[
+                ("tool_calls", [{"id": "t1", "name": "audit_follows_workflow", "arguments": {}}]),
+                ("answer", "扫描完成。"),
+                ("usage", (10, 5)),
+            ],
+        )
+
+        async def _audit(name, arguments, guarded=False, sid=None):
+            executed.append(name)
+            return {
+                "kind": "stepper",
+                "stepper": {"title": "T", "steps": [{"label": "a", "status": "ok"}]},
+                "proposal": {"kind": "proposal", "pid": "p1", "action": "add",
+                             "items": [{"appid": 1, "name": "X"}]},
+            }
+
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _audit)
+        events = [e async for e in service.ask_stream("体检一下关注", session_id="s-compound")]
+        card_events = [e for e in events if e["type"] == "card"]
+        assert [(e["name"], e["card"]["kind"]) for e in card_events] == [
+            ("audit_follows_workflow", "stepper"),
+            ("propose_bulk", "proposal"),
+        ]
+        started = next(e for e in events if e["type"] == "tool_start")
+        assert started["card_kind"] == "stepper"
+        done = events[-1]
+        assert [c["kind"] for c in done["cards"]] == ["stepper", "proposal"]
+
+    @pytest.mark.asyncio
+    async def test_card_admission_caps_and_prioritizes_core_cards(self, monkeypatch):
+        """单轮卡片上限两张且核心卡优先：超限或低优先级辅助卡被抑制。"""
+        executed = []
+        _patch_ready(
+            monkeypatch,
+            stream=[
+                ("tool_calls", [
+                    {"id": "t1", "name": "get_price_briefing", "arguments": {"appid": 292030}},
+                    {"id": "t2", "name": "get_price_briefing", "arguments": {"appid": 413150}},
+                    {"id": "t3", "name": "list_follows", "arguments": {}},
+                ]),
+                ("answer", "对比完成。"),
+                ("usage", (10, 5)),
+            ],
+        )
+
+        async def _stub(name, arguments, guarded=False, sid=None):
+            executed.append(name)
+            if name == "get_price_briefing":
+                appid = arguments.get("appid", 292030)
+                return {"kind": "price", "appid": appid, "name": f"Game {appid}", "cn": {"cnyFen": 6000}}
+            return {"kind": "rows", "titleKey": "follows", "rows": [{"k": "1", "vKey": "ok"}]}
+
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _stub)
+        events = [e async for e in service.ask_stream("对比这两款游戏", session_id="s-cap")]
+        card_events = [e for e in events if e["type"] == "card"]
+        assert len(card_events) == 3
+        assert card_events[0]["card"] is not None and card_events[0]["card"]["appid"] == 292030
+        assert card_events[1]["card"] is not None and card_events[1]["card"]["appid"] == 413150
+        assert card_events[2]["card"] is None
+        done = events[-1]
+        assert len(done["cards"]) == 2
+        assert [c["kind"] for c in done["cards"]] == ["price", "price"]
+
+    @pytest.mark.asyncio
+    async def test_card_admission_dedupes_multiple_rows_cards(self, monkeypatch):
+        """多张同类辅助行卡去重：同一轮只保留首张行卡。"""
+        executed = []
+        _patch_ready(
+            monkeypatch,
+            stream=[
+                ("tool_calls", [
+                    {"id": "t1", "name": "list_tasks", "arguments": {}},
+                    {"id": "t2", "name": "list_follows", "arguments": {}},
+                ]),
+                ("answer", "排查完成。"),
+                ("usage", (10, 5)),
+            ],
+        )
+
+        async def _stub_rows(name, arguments, guarded=False, sid=None):
+            executed.append(name)
+            return {"kind": "rows", "titleKey": name, "rows": [{"k": "status", "vKey": "ok"}]}
+
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _stub_rows)
+        events = [e async for e in service.ask_stream("排查状态", session_id="s-rows-dedupe")]
+        card_events = [e for e in events if e["type"] == "card"]
+        assert len(card_events) == 2
+        assert card_events[0]["card"] is not None
+        assert card_events[1]["card"] is None
+        done = events[-1]
+        assert len(done["cards"]) == 1
+        assert done["cards"][0]["titleKey"] == "list_tasks"
+
+    @pytest.mark.asyncio
+    async def test_decision_agent_suppresses_card_on_explicit_emit_card_false(self, monkeypatch):
+        """外层模型显式控制：传入 emit_card=False 时抑制卡片渲染并在回灌中明确标识。"""
+        executed = []
+        _patch_ready(
+            monkeypatch,
+            stream=[
+                ("tool_calls", [
+                    {"id": "t1", "name": "get_price_briefing", "arguments": {"appid": 292030, "emit_card": False}},
+                ]),
+                ("answer", "价格核实完成。"),
+                ("usage", (10, 5)),
+            ],
+        )
+
+        async def _stub(name, arguments, guarded=False, sid=None):
+            executed.append((name, arguments))
+            return {"kind": "price", "appid": 292030, "name": "Witcher 3", "currentPrice": 4000}
+
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _stub)
+        events = [e async for e in service.ask_stream("查询巫师3价格", session_id="s-suppress-explicit")]
+        card_events = [e for e in events if e["type"] == "card"]
+        assert len(card_events) == 1
+        assert card_events[0]["card"] is None
+        done = events[-1]
+        assert done["cards"] == []
+
+    @pytest.mark.asyncio
+    async def test_decision_agent_suppresses_price_card_when_question_is_non_price(self, monkeypatch):
+        """非价格咨询门禁：用户咨询显卡配置等硬件问题时，内部代理自动抑制价格走势卡片。"""
+        executed = []
+        _patch_ready(
+            monkeypatch,
+            stream=[
+                ("tool_calls", [
+                    {"id": "t1", "name": "get_price_briefing", "arguments": {"appid": 2358720}},
+                ]),
+                ("answer", "GTX 1060 可以运行低画质。"),
+                ("usage", (10, 5)),
+            ],
+        )
+
+        async def _stub(name, arguments, guarded=False, sid=None):
+            executed.append(name)
+            return {"kind": "price", "appid": 2358720, "name": "Black Myth", "currentPrice": 26800}
+
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _stub)
+        events = [e async for e in service.ask_stream("黑神话悟空显卡配置要求高吗？GTX 1060 能玩吗？", session_id="s-non-price")]
+        card_events = [e for e in events if e["type"] == "card"]
+        assert len(card_events) == 1
+        assert card_events[0]["card"] is None
+        done = events[-1]
+        assert done["cards"] == []
+
+    @pytest.mark.asyncio
+    async def test_decision_agent_informs_model_view_with_ui_card_status(self, monkeypatch):
+        """双向认知对齐：回灌模型的工具结果携带 _ui_card 呈现状态。"""
+        captured_messages = []
+        _patch_ready(
+            monkeypatch,
+            stream=[
+                ("tool_calls", [
+                    {"id": "t1", "name": "get_price_briefing", "arguments": {"appid": 292030}},
+                ]),
+                ("answer", "正如卡片所示，当前售价打折。"),
+                ("usage", (10, 5)),
+            ],
+        )
+        orig_stream = service.pilot_llm.chat_stream
+
+        async def _spy(**kw):
+            messages = kw.get("messages") or []
+            captured_messages.append(list(messages))
+            async for item in orig_stream(**kw):
+                yield item
+
+        monkeypatch.setattr(service.pilot_llm, "chat_stream", _spy)
+
+        async def _stub(name, arguments, guarded=False, sid=None):
+            return {"kind": "price", "appid": 292030, "name": "Witcher 3", "currentPrice": 4000, "discount": 70}
+
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _stub)
+        events = [e async for e in service.ask_stream("巫师3现在多少钱？打折吗？", session_id="s-feedback")]
+        card_events = [e for e in events if e["type"] == "card"]
+        assert card_events[0]["card"] is not None
+        second_req_msgs = captured_messages[1]
+        tool_msg = [m for m in second_req_msgs if m.get("role") == "tool"][0]
+        content_json = json.loads(tool_msg["content"])
+        assert "_ui_card" in content_json
+        assert content_json["_ui_card"]["status"] == "rendered"
+        assert content_json["_ui_card"]["kind"] == "price"
+        assert "价格卡片已在用户界面呈现" in content_json["_ui_card"]["summary"]
+
+    @pytest.mark.asyncio
+    async def test_denied_tool_hints_rows_but_no_card(self, monkeypatch):
+        """守卫拒绝无卡可发：tool_start 仍按行卡类预告，事件流不出现 card。"""
+        executed = []
+        _patch_ready(
+            monkeypatch,
+            stream=[
+                ("tool_calls", [{"id": "t1", "name": "add_follow", "arguments": {"appid": 2}}]),
+                ("answer", "已拒绝。"),
+            ],
+        )
+        monkeypatch.setattr(
+            service.pilot_tools,
+            "execute_tool",
+            _tool_stub(executed, {"kind": "denied", "note": "guarded"}),
+        )
+        events = [e async for e in service.ask_stream("批量把所有游戏加进关注")]
+        # 守卫拒绝无卡可发：card 结算帧仍下发给前端撤骨架，但 card 为空
+        card_events = [e for e in events if e["type"] == "card"]
+        assert len(card_events) == 1 and card_events[0]["card"] is None
+        started = next(e for e in events if e["type"] == "tool_start")
+        assert started["card_kind"] == "rows"
+
+    def test_card_kind_hint_groups(self):
+        assert service._card_kind_hint("get_price_briefing") == "price"
+        assert service._card_kind_hint("search_games") == "games"
+        assert service._card_kind_hint("list_follows") == "rows"
+        assert service._card_kind_hint("refresh_rates") == "rows"
+        assert service._card_kind_hint("list_tasks") == "rows"
+        assert service._card_kind_hint("read_profile") is None
+
+    @pytest.mark.asyncio
     async def test_write_guard_denies_execution(self, monkeypatch):
         executed = []
         _patch_ready(
@@ -1104,3 +1385,441 @@ def test_ask_stream_ack_and_same_sid_busy():
         await gen4.aclose()
 
     asyncio.run(run())
+
+
+class TestToolExecutionWatch:
+    """工具执行期心跳、预算收口与失败归属：执行不再静默，异常不吞整轮。"""
+
+    @pytest.mark.asyncio
+    async def test_progress_frames_during_slow_tool(self, monkeypatch):
+        _patch_ready(monkeypatch, stream=[
+            ("tool_calls", [{"id": "t1", "name": "list_follows", "arguments": {}}]),
+            ("answer", "完成"),
+        ])
+
+        async def _slow(name, arguments, guarded=False, sid=None):
+            await asyncio.sleep(0.3)
+            return {"kind": "games", "items": [{"appid": 1}]}
+
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _slow)
+        monkeypatch.setattr(service, "_TOOL_TICK_S", 0.05)
+        events = [e async for e in service.ask_stream("我关注了哪些游戏", session_id="s-tick")]
+        progress = [e for e in events if e["type"] == "tool_progress"]
+        assert progress and all(e["name"] == "list_follows" for e in progress)
+        stamps = [e["elapsed_ms"] for e in progress]
+        assert stamps == sorted(stamps) and stamps[0] >= 50
+        tool_ev = [e for e in events if e["type"] == "tool"][0]
+        assert tool_ev["status"] == "ok" and tool_ev["duration_ms"] >= 250
+        # 心跳只走流式事件，不改变账本形态（步骤与 done 与既有一致）
+        assert events[-1]["steps"] == [{"label": "follows", "status": "ok", "data": {"count": 1}}]
+
+    @pytest.mark.asyncio
+    async def test_budget_exceeded_yields_timeout_step(self, monkeypatch):
+        _patch_ready(monkeypatch, stream=[
+            ("tool_calls", [{"id": "t1", "name": "list_follows", "arguments": {}}]),
+            ("answer", "没查到，稍后再试。"),
+        ])
+        cancelled = {"v": False}
+
+        async def _hang(name, arguments, guarded=False, sid=None):
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelled["v"] = True
+                raise
+            return {"kind": "games", "items": []}
+
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _hang)
+        monkeypatch.setattr(service, "_TOOL_TICK_S", 0.05)
+        monkeypatch.setattr(service.pilot_tools, "tool_budget_s", lambda name: 0.2)
+        events = [e async for e in service.ask_stream("我关注了哪些游戏", session_id="s-timeout")]
+        tool_ev = [e for e in events if e["type"] == "tool"][0]
+        assert tool_ev["status"] == "timeout" and tool_ev["label"] == "follows"
+        assert tool_ev["duration_ms"] >= 200
+        assert cancelled["v"] is True
+        done = events[-1]
+        assert done["type"] == "done" and done["source"] == "llm"
+        assert done["steps"] == [{"label": "follows", "status": "timeout", "data": {}}]
+
+    @pytest.mark.asyncio
+    async def test_tool_failure_attributed_and_fed_back(self, monkeypatch):
+        _patch_ready(monkeypatch, stream=[
+            ("tool_calls", [{"id": "t1", "name": "list_follows", "arguments": {}}]),
+            ("answer", "查询失败了。"),
+        ])
+
+        async def _boom(name, arguments, guarded=False, sid=None):
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _boom)
+        events = [e async for e in service.ask_stream("我关注了哪些游戏", session_id="s-fail")]
+        tool_ev = [e for e in events if e["type"] == "tool"][0]
+        assert tool_ev["status"] == "failed"
+        assert events[-1]["type"] == "done" and events[-1]["source"] == "llm"
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_inflight_tool(self, monkeypatch):
+        _patch_ready(monkeypatch, stream=[
+            ("tool_calls", [{"id": "t1", "name": "list_follows", "arguments": {}}]),
+            ("answer", "完成"),
+        ])
+        cancelled = {"v": False}
+
+        async def _hang(name, arguments, guarded=False, sid=None):
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelled["v"] = True
+                raise
+
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _hang)
+        monkeypatch.setattr(service, "_TOOL_TICK_S", 0.05)
+        gen = service.ask_stream("我关注了哪些游戏", session_id="s-cut")
+        async for e in gen:
+            if e["type"] == "tool_progress":
+                break
+        await gen.aclose()
+        await asyncio.sleep(0.05)
+        assert cancelled["v"] is True
+
+    def test_budget_by_category(self):
+        budgets = service.pilot_tools.tool_budget_s
+        assert budgets("navigate") == service.pilot_tools._BUDGET_DEFAULT_S
+        assert budgets("bills_summary") == 60.0
+        assert budgets("audit_follows_workflow") == 90.0
+        assert budgets("add_follow") == service.pilot_tools._BUDGET_SLOW_S
+        assert budgets("sync_library") == service.pilot_tools._BUDGET_SLOW_S
+        assert budgets("list_tasks") == service.pilot_tools._BUDGET_TASK_S
+
+
+class TestAgentNudge:
+    """追问机制：模型空转 / 只宣告不行动时循环内回灌系统提示再给一轮（每轮至多一次）。"""
+
+    @staticmethod
+    def _patch_scripts(monkeypatch, scripts, calls):
+        _patch_ready(monkeypatch)  # 配置/用量替身（本类再覆写 chat_stream 为逐请求脚本）
+        it = iter(scripts)
+
+        async def _chat(**kw):
+            calls.append(list(kw.get("messages") or []))  # 快照：循环会原地追加消息
+            for item in next(it):
+                yield item
+
+        monkeypatch.setattr(service.pilot_llm, "chat_stream", _chat)
+
+    @pytest.mark.asyncio
+    async def test_empty_phase_nudges_then_answers(self, monkeypatch):
+        calls = []
+        self._patch_scripts(
+            monkeypatch,
+            [[], [("answer", "补上结论。"), ("usage", (10, 5))]],
+            calls,
+        )
+        events = [e async for e in service.ask_stream("最近有什么值得关注的高分史低大作？", session_id="s-nudge1")]
+        done = events[-1]
+        assert done["type"] == "done" and done["answer"] == "补上结论。" and done["reason"] is None
+        # 两阶段：第一次空转被追问，第二次给出终答
+        assert [e for e in events if e["type"] == "step_start"][-1]["step"] == 2
+        # 追问消息不入会话账本（turn_messages 只含当前问句与终答 assistant）
+        state = await service.get_store().load("s-nudge1")
+        roles = [m.get("role") for m in state.turns[-1]["messages"]]
+        assert roles == ["user", "assistant"]
+
+    @pytest.mark.asyncio
+    async def test_announced_without_tools_nudges_then_answers(self, monkeypatch):
+        calls = []
+        self._patch_scripts(
+            monkeypatch,
+            [[("answer", "好问题，我来深入查一下。")], [("answer", "真实结论。"), ("usage", (10, 5))]],
+            calls,
+        )
+        events = [e async for e in service.ask_stream("最近有什么值得关注的高分史低大作？", session_id="s-nudge2")]
+        done = events[-1]
+        assert "真实结论。" in done["answer"]
+        # 第一次请求之后收到追问系统消息（在对话末尾），第二次请求正常执行
+        first_msgs, second_msgs = calls[0], calls[1]
+        assert len(second_msgs) == len(first_msgs) + 1
+        assert "没有实际调用工具" in second_msgs[-1]["content"]
+        # 宣告文本不进模型对话（只留展示层）
+        assert all("我来深入查一下" not in str(m.get("content")) for m in second_msgs)
+
+    @pytest.mark.asyncio
+    async def test_conclusive_answer_not_nudged(self, monkeypatch):
+        calls = []
+        self._patch_scripts(
+            monkeypatch,
+            [[("answer", "史低 199 元，近一年中位 299。"), ("usage", (10, 5))]],
+            calls,
+        )
+        events = [e async for e in service.ask_stream("赛博朋克2077 现在史低多少", session_id="s-nudge3")]
+        done = events[-1]
+        assert done["answer"].startswith("史低") and done["reason"] is None
+        assert [e for e in events if e["type"] == "step_start"][-1]["step"] == 1
+
+    @pytest.mark.asyncio
+    async def test_intent_note_reaches_model(self, monkeypatch):
+        calls = []
+        self._patch_scripts(
+            monkeypatch,
+            [[("answer", "好的。"), ("usage", (10, 5))]],
+            calls,
+        )
+        events = [e async for e in service.ask_stream("最近有什么值得关注的高分史低大作？", session_id="s-note1")]
+        assert events[-1]["type"] == "done"
+        note = calls[0][-1]
+        assert note["role"] == "system" and "意图路由" in note["content"]
+
+    @pytest.mark.asyncio
+    async def test_guarded_question_note_mentions_propose_bulk(self, monkeypatch):
+        calls = []
+        self._patch_scripts(
+            monkeypatch,
+            [[("answer", "好的。"), ("usage", (10, 5))]],
+            calls,
+        )
+        events = [e async for e in service.ask_stream("清空所有提醒规则", session_id="s-note2")]
+        assert events[-1]["type"] == "done"
+        assert "propose_bulk" in calls[0][-1]["content"]
+
+
+class TestMonthlyCap:
+    def test_zero_means_unlimited(self):
+        assert pilot_config.DEFAULT_MONTHLY_CAP == 0
+        assert pilot_config.over_cap({"inp": 10**9, "out": 0, "calls": 1, "total": 10**9}, 0) is False
+        assert pilot_config.over_cap({"inp": 5, "out": 0, "calls": 1, "total": 5}, 5) is True
+        assert pilot_config.over_cap({"inp": 4, "out": 0, "calls": 1, "total": 4}, 5) is False
+
+
+class TestMessagelessTurnReplay:
+    def test_replay_line_synthesized_for_messageless_turn(self):
+        turn = {"q": "打开代理页", "resp": {"source": "facts", "answer": "",
+                                            "tools": ["navigate: proxies"],
+                                            "cards": [{"kind": "navigate", "target": "proxies", "path": "/proxies"}]}}
+        msgs = pilot_context._turn_view(turn)
+        assert len(msgs) == 1
+        assert msgs[0]["role"] == "user"
+        assert "系统回放" in msgs[0]["content"] and "navigate" in msgs[0]["content"]
+
+    def test_messageless_turn_without_facts_stays_silent(self):
+        turn = {"q": "在吗", "resp": {"source": "none", "reason": "no_data", "answer": "", "tools": [], "cards": []}}
+        assert pilot_context._turn_view(turn) == []
+
+    def test_assemble_includes_replay(self):
+        state = pilot_context.__dict__ and None
+        from app.domains.pilot.session import SessionState
+        st = SessionState(sid="s1")
+        st.turns = [{"q": "打开代理页", "resp": {"source": "facts", "answer": "",
+                                                 "tools": ["navigate: proxies"], "cards": [{"kind": "navigate"}]}}]
+        msgs = pilot_context.assemble(st, "现在呢", None)
+        assert any("系统回放" in str(m.get("content")) for m in msgs)
+
+
+class TestDecisionAgent:
+    """内部快速决策引擎（System 1 Decision Agent）测试。"""
+
+    def test_card_suppressed_when_model_passes_emit_card_false(self):
+        from app.domains.pilot.decision import DECISION_AGENT
+        base = {"kind": "price", "name": "黑神话", "currentPrice": 26800}
+        dec = DECISION_AGENT.decide_card(
+            tool_name="get_price_briefing",
+            result={"kind": "price", "cnyFen": 26800},
+            arguments={"appid": 2358720, "emit_card": False},
+            question="黑神话配置要求高吗",
+            current_cards=[],
+            base_card=base,
+        )
+        assert dec.should_emit is False
+        assert dec.status == "suppressed"
+        assert dec.reason == "suppressed_by_model"
+
+    def test_card_suppressed_on_non_price_question(self):
+        from app.domains.pilot.decision import DECISION_AGENT
+        base = {"kind": "price", "name": "黑神话", "currentPrice": 26800}
+        dec = DECISION_AGENT.decide_card(
+            tool_name="get_price_briefing",
+            result={"kind": "price", "cnyFen": 26800},
+            arguments={"appid": 2358720},
+            question="黑神话卡顿闪退怎么办",
+            current_cards=[],
+            base_card=base,
+        )
+        assert dec.should_emit is False
+        assert dec.reason == "no_price_intent"
+
+    def test_model_view_enhancement_contains_ui_card_status(self):
+        from app.domains.pilot.decision import DECISION_AGENT, CardDecision
+        dec = CardDecision(
+            should_emit=True,
+            card={"kind": "price"},
+            kind="price",
+            status="rendered",
+            reason="ok",
+            summary="价格卡片已在用户界面呈现",
+        )
+        view = DECISION_AGENT.enhance_model_view({"kind": "price", "cnyFen": 26800, "trend": [1, 2]}, dec)
+        assert "_ui_card" in view
+        assert view["_ui_card"]["status"] == "rendered"
+        assert "trend" not in view
+
+    def test_single_game_query_suppresses_list_cards(self):
+        from app.domains.pilot.decision import DECISION_AGENT
+        card = {"kind": "games", "items": [{"name": "赛博朋克2077"}, {"name": "黑神话"}]}
+        # 1. 针对单款游戏的问句：抑制全量列表卡片
+        dec = DECISION_AGENT.decide_card(
+            tool_name="list_follows",
+            result=card,
+            arguments={},
+            question="黑神话在不在我的关注里？",
+            current_cards=[],
+            base_card=card,
+        )
+        assert dec.should_emit is False
+        assert dec.reason == "single_game_query"
+
+        # 2. 明确请求列表的问句：正常放行渲染
+        dec_list = DECISION_AGENT.decide_card(
+            tool_name="list_follows",
+            result=card,
+            arguments={},
+            question="查看我的关注列表",
+            current_cards=[],
+            base_card=card,
+        )
+        assert dec_list.should_emit is True
+        assert dec_list.status == "rendered"
+
+    def test_diagnostic_tool_suppression(self):
+        from app.domains.pilot.decision import DECISION_AGENT
+        card = {"kind": "rows", "titleKey": "proxies", "rows": [{"k": "node1"}]}
+        # 1. 普通非诊断问句：抑制技术诊断卡片
+        dec = DECISION_AGENT.decide_card(
+            tool_name="proxy_pool_status",
+            result=card,
+            arguments={},
+            question="黑神话为什么价格没刷新？",
+            current_cards=[],
+            base_card=card,
+        )
+        assert dec.should_emit is False
+        assert dec.reason == "internal_diagnostic"
+
+        # 2. 技术诊断问句：正常放行渲染
+        dec_diag = DECISION_AGENT.decide_card(
+            tool_name="proxy_pool_status",
+            result=card,
+            arguments={},
+            question="体检网络节点代理池状态",
+            current_cards=[],
+            base_card=card,
+        )
+        assert dec_diag.should_emit is True
+        assert dec_diag.status == "rendered"
+
+    def test_family_and_achievements_rules_suppression(self):
+        from app.domains.pilot.decision import DECISION_AGENT
+        fam_card = {"kind": "family", "members": [{"steamId": "123", "personaName": "Tom"}]}
+        ach_card = {"kind": "achievements", "unlocked": 10, "total": 81, "completionRate": 12}
+
+        # 规则/攻略问句抑制个人信息卡片
+        dec_fam = DECISION_AGENT.decide_card(
+            tool_name="family_status",
+            result=fam_card,
+            arguments={},
+            question="Steam家庭共享怎么开启？最多支持几个人？",
+            current_cards=[],
+            base_card=fam_card,
+        )
+        assert dec_fam.should_emit is False
+        assert dec_fam.reason == "family_rules_query"
+
+        dec_ach = DECISION_AGENT.decide_card(
+            tool_name="achievements_summary",
+            result=ach_card,
+            arguments={},
+            question="黑神话全成就难吗？需要几周目？",
+            current_cards=[],
+            base_card=ach_card,
+        )
+        assert dec_ach.should_emit is False
+        assert dec_ach.reason == "game_achievement_query"
+
+        # 查看个人进度放行渲染
+        dec_fam_ok = DECISION_AGENT.decide_card(
+            tool_name="family_status",
+            result=fam_card,
+            arguments={},
+            question="看看我的家庭成员列表",
+            current_cards=[],
+            base_card=fam_card,
+        )
+        assert dec_fam_ok.should_emit is True
+
+        dec_ach_ok = DECISION_AGENT.decide_card(
+            tool_name="achievements_summary",
+            result=ach_card,
+            arguments={},
+            question="查看我的成就进度",
+            current_cards=[],
+            base_card=ach_card,
+        )
+        assert dec_ach_ok.should_emit is True
+
+    def test_nav_target_blocked_on_compound_and_action_queries(self):
+        from app.domains.pilot.intent import nav_target
+        # 复合动作或提问不直通导航
+        assert nav_target("去设置修改密钥") is None
+        assert nav_target("看看我的关注里有没有打折") is None
+        assert nav_target("去关注列表找找黑神话") is None
+        # 纯粹导航直通
+        assert nav_target("打开设置") == "settings"
+        assert nav_target("去关注列表") == "follows"
+
+    def test_registry_views_exposes_emit_card_schema(self):
+        from app.domains.agent.tools.registry import REGISTRY
+        views = REGISTRY.views()
+        for v in views:
+            props = v["function"]["parameters"].get("properties") or {}
+            assert "emit_card" in props
+            assert props["emit_card"]["type"] == "boolean"
+
+    def test_skeleton_hint_accurate_and_not_leaking(self):
+        # 决策代理按意图与参数抑制骨架占位
+        assert service._stream_card_hint("list_follows", [], arguments={"emit_card": False}, question="查看关注") is None
+        assert service._stream_card_hint("list_follows", [], arguments={}, question="黑神话在不在我的关注里？") is None
+        assert service._stream_card_hint("proxy_pool_status", [], arguments={}, question="黑神话为什么价格没刷新？") is None
+        assert service._stream_card_hint("family_status", [], arguments={}, question="家庭共享怎么开？") is None
+        assert service._stream_card_hint("epic_free", [], arguments={}, question="目前有什么可以领取的免费喜加一游戏吗？") is None
+        assert service._stream_card_hint("steam_free", [], arguments={}, question="目前有什么可以领取的免费喜加一游戏吗？") is None
+        # 放行情况
+        assert service._stream_card_hint("list_follows", [], arguments={}, question="查看我的关注列表") == "rows"
+        assert service._stream_card_hint("proxy_pool_status", [], arguments={}, question="体检网络节点代理池") == "rows"
+        assert service._stream_card_hint("epic_free", [], arguments={"emit_card": True}, question="目前有什么可以领取的免费喜加一游戏吗？") == "rows"
+
+    def test_free_offers_rows_suppressed_by_default_unless_explicit(self):
+        from app.domains.pilot.decision import DECISION_AGENT
+        epic_card = {"kind": "rows", "titleKey": "epic", "rows": [{"k": "System Shock 2", "vKey": "epicFree"}]}
+        # 1. 默认聊天对话：作为内部推导事实抑制原始数据表发卡
+        dec = DECISION_AGENT.decide_card(
+            tool_name="epic_free",
+            result=epic_card,
+            arguments={},
+            question="目前有什么可以领取的免费喜加一游戏吗？",
+            current_cards=[],
+            base_card=epic_card,
+        )
+        assert dec.should_emit is False
+        assert dec.reason == "internal_data_for_synthesis"
+
+        # 2. 显式要求发卡：emit_card=True 放行
+        dec_explicit = DECISION_AGENT.decide_card(
+            tool_name="epic_free",
+            result=epic_card,
+            arguments={"emit_card": True},
+            question="目前有什么可以领取的免费喜加一游戏吗？",
+            current_cards=[],
+            base_card=epic_card,
+        )
+        assert dec_explicit.should_emit is True
+        assert dec_explicit.status == "rendered"
+
+

@@ -18,8 +18,9 @@ _HOW_TO_WORDS = (
 # 设提醒类：渠道词（提醒 / 告诉我）+ 条件词（低于 / 史低 等）同时出现
 _ALERT_CHANNEL_WORDS = ("提醒", "告诉我")
 _ALERT_COND_WORDS = ("低于", "以下", "史低", "跌到", "跌至", "降至", "打")
-# 关注类
+# 关注类（「值得关注」是评价语不是关注动作，需排除）
 _MONITOR_WORDS = ("加进关注", "加入关注", "关注一下", "帮我关注", "关注")
+_MONITOR_BLOCK_WORDS = ("值得关注",)
 # 价格 / 找游戏类
 _PRICE_WORDS = (
     "价格", "史低", "最低价", "值不值", "值得买", "值得入手", "多少钱", "贵不",
@@ -45,7 +46,7 @@ _NAV_VERBS = (
 )
 _NAV_ALIASES: dict[str, tuple[str, ...]] = {
     "dashboard": ("仪表盘", "首页", "主页", "总览"),
-    "library": ("找游戏", "发现页"),
+    "library": ("游戏商店", "找游戏", "发现页"),
     "gamelib": ("游戏库",),
     "follows": ("我的关注", "关注列表", "监控池", "监控"),
     "bundles": ("捆绑包", "礼包"),
@@ -62,10 +63,15 @@ _NAV_ALIASES: dict[str, tuple[str, ...]] = {
     "logs": ("日志",),
     "settings": ("设置", "配置"),
 }
-# 疑问/否定形态不直通（交给模型或指引，防「设置在哪」「别去设置」误跳）
+# 疑问/否定/复合提问形态不直通（交给模型深入理解，防「设置在哪」「看看关注里有没有打折」误跳）
 _NAV_BLOCK_WORDS = (
     "怎么", "如何", "哪", "吗", "什么", "为什么", "为啥",
     "别去", "别打开", "不要去", "不要打开", "别跳", "先别",
+    "有没有", "有哪些", "多少", "谁", "帮我", "顺便", "并且", "而且",
+    "查查", "分析", "建议", "报错", "异常", "失败",
+    "打折", "降价", "史低", "便宜", "好玩", "推荐", "配置", "教程",
+    "能不能", "可不可以", "是不是",
+    "改", "修改", "换", "添加", "同步", "清理", "重试", "刷新", "找", "查",
 )
 
 
@@ -83,9 +89,9 @@ def is_guarded(question: str) -> bool:
 def nav_target(question: str) -> str | None:
     """导航直通目标：导航动词与页面别名同时命中时返回 target。
 
-    守卫词与疑问/否定形态一律不直通；未命中返回 None 交回模型。"""
+    守卫词与疑问/复合形态一律不直通（超长问句交给模型）；未命中返回 None。"""
     q = (question or "").strip()
-    if not q:
+    if not q or len(q) > 12:
         return None
     if any(w in q for w in _GUARD_WORDS) or any(w in q for w in _NAV_BLOCK_WORDS):
         return None
@@ -108,7 +114,8 @@ def route(question: str) -> str:
         return NAVIGATE
     if not guarded and _looks_like_alert(q):
         return CREATE_ALERT
-    if not guarded and any(w in q for w in _MONITOR_WORDS):
+    if not guarded and any(w in q for w in _MONITOR_WORDS) \
+            and not any(w in q for w in _MONITOR_BLOCK_WORDS):
         return ADD_MONITOR
     if any(w in q for w in _PRICE_WORDS):
         return PRICE_ANALYSIS

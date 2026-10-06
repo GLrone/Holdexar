@@ -6,7 +6,7 @@
 - pilot.llm.provider_key.<id>  供应商 API Key（逐家独立派生加密，写时即密文）
 - pilot.llm.enabled            bool，LLM 解读总开关（全局；关闭时领航台仍直出模板化事实摘要）
 - pilot.llm.model              当前选用模型名（属于活跃供应商的清单）
-- pilot.llm.monthly_cap        单月 token 用量上限（全局；超限停用解读，模板摘要不受限）
+- pilot.llm.monthly_cap        单月 token 用量上限（全局；0 = 不限，仅统计不熔断）
 - pilot.usage.<YYYYMM>         当月已用 token 累计（用量台账，跨月自然换键）
 
 存量单配置（pilot.llm.protocol/base_url/models/api_key）在账本键缺失时
@@ -22,7 +22,9 @@ from app.crawler.utils import get_beijing_time_obj
 from app.domains.pilot import llm as pilot_llm
 from app.domains.settings import service as settings_service
 
-DEFAULT_MONTHLY_CAP = 500_000
+DEFAULT_MONTHLY_CAP = 0
+# 旧版默认上限：曾按 50 万 token 熔断月度用量——存量库迁移为不限（0）
+_LEGACY_DEFAULT_CAP = 500_000
 
 _ENABLED_KEY = "pilot.llm.enabled"
 _PROTOCOL_KEY = "pilot.llm.protocol"
@@ -197,6 +199,10 @@ async def load_config() -> dict:
         cap = max(0, int(cap_raw))
     except (TypeError, ValueError):
         cap = DEFAULT_MONTHLY_CAP
+    if cap == _LEGACY_DEFAULT_CAP:
+        # 旧默认值不是用户的选择：一次性迁为不限，让「默认移除 token 上限」对存量库生效
+        cap = 0
+        await settings_service.set_value(_CAP_KEY, 0)
     providers = await load_providers()
     active_id = str(await settings_service.get_value(_ACTIVE_KEY, "") or "")
     active = next((p for p in providers if p["id"] == active_id), providers[0] if providers else None)
@@ -334,7 +340,7 @@ async def add_usage(inp: int, out: int) -> None:
 
 
 def over_cap(usage: dict, cap: int) -> bool:
-    return usage["total"] >= cap
+    return cap > 0 and usage["total"] >= cap
 
 
 def llm_ready(cfg: dict) -> bool:

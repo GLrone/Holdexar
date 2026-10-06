@@ -101,9 +101,33 @@ def looks_like_overflow(err_text: str) -> bool:
     return any(marker in lowered for marker in _OVERFLOW_MARKERS)
 
 
+def _replay_line(turn: dict) -> dict | None:
+    """无消息轮次（快捷动作/导航直通/降级轮）→ 单条回放消息。
+
+    这些轮次没有模型消息可放，但卡片与工具事实用户真实看到过——不回放
+    就是账本断裂（模型不知道界面上发生过什么）。按 _turn_line 同源口径
+    合成一条 user 消息，标注「非当前请求」防模型误答。"""
+    resp = turn.get("resp") or {}
+    if not (resp.get("tools") or resp.get("cards") or resp.get("answer")):
+        return None
+    parts = [f"用户：{turn.get('q') or ''}"]
+    if resp.get("answer"):
+        parts.append(f"助手：{resp['answer']}")
+    if resp.get("tools"):
+        parts.append("工具：" + "；".join(str(x) for x in resp["tools"]))
+    if resp.get("cards"):
+        kinds = [str(c.get("kind") or "") for c in resp["cards"] if isinstance(c, dict)]
+        parts.append("已生成界面卡片：" + "、".join(k for k in kinds if k))
+    return {"role": "user", "content": "[系统回放·非当前请求] " + "\n".join(parts)}
+
+
 def _turn_view(turn: dict) -> list[dict]:
+    msgs = turn.get("messages") or []
+    if not msgs:
+        replay = _replay_line(turn)
+        return [replay] if replay else []
     out = []
-    for m in turn.get("messages") or []:
+    for m in msgs:
         if m.get("role") == "tool" and isinstance(m.get("content"), str):
             content = prune_tool_content(m["content"])
             if content != m["content"]:

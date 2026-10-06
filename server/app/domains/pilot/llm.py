@@ -26,6 +26,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from app.core.logging import log_event
+
 logger = logging.getLogger(__name__)
 
 _TIMEOUT = httpx.Timeout(180.0, connect=15.0, read=180.0, write=30.0)
@@ -517,7 +519,12 @@ async def chat_stream(
                 async for event in _run(own):
                     yield event
     except (httpx.HTTPError, TypeError, ValueError) as e:
-        logger.warning("pilot LLM 流式调用失败（%s）: %r", protocol, e)
+        log_event(
+            logger,
+            f"模型来源「{protocol}」的流式调用失败",
+            level=logging.WARNING,
+            detail={"模型来源": protocol, "原因": repr(e)},
+        )
         # 超时异常 str 为空，回落类名，避免上层拿到空白诊断
         raise PilotLlmError(str(e) or type(e).__name__) from e
 
