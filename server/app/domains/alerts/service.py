@@ -11,6 +11,7 @@ from sqlalchemy import func, or_, select
 from app.core.app_info import APP_NAME
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
+from app.core.logging import log_event
 from app.crawler.config import APPDETAILS_URL
 from app.crawler.utils import get_beijing_time_obj
 from app.domains.account import service as account_service
@@ -60,7 +61,7 @@ async def _owner_region_code() -> str:
         wallet = primary.wallet_json if primary and isinstance(primary.wallet_json, dict) else None
         return str((wallet or {}).get("region_code") or "")
     except Exception:  # noqa: BLE001 — 账号域异常不阻断价格检查
-        logger.warning("读取主账号地区失败，按无号主区兜底")
+        log_event(logger, "读取主账号地区失败，按无号主地区兜底", tag="降级", level=logging.WARNING)
         return ""
 
 
@@ -304,7 +305,7 @@ async def check_appids(appids: list[int]) -> list[dict]:
             await session.commit()
 
     if triggered:
-        logger.info("价格提醒触发 %d 条", len(triggered))
+        log_event(logger, "价格提醒已触发", detail={"条数": len(triggered)})
     return triggered
 
 
@@ -425,9 +426,14 @@ async def check_new_lows(appids: list[int]) -> list[dict]:
             f"{APP_NAME} 新史低：{len(picks)} 款精选",
             notify.new_low_mail_html(picks),
         )
-        logger.info("新史低邮件已发 %s：%d 款（新增 %d，号主区 %s）",
-                    "成功" if sent else "失败（未配置 SMTP 或发送异常，本轮不重试）",
-                    len(picks), len(news), owner_region or "未知")
+        log_event(
+            logger,
+            "新史低精选邮件已发送"
+            if sent
+            else "新史低精选邮件发送失败（未配置 SMTP 或发送异常，本轮不重试）",
+            tag="成功" if sent else "未完成",
+            detail={"精选": len(picks), "新增": len(news), "号主地区": owner_region or "未知"},
+        )
     return picks
 
 
@@ -609,10 +615,13 @@ async def check_wishlist_deals() -> list[dict]:
         f"{APP_NAME} 监控池折扣速报：{len(picks)} 款新折扣",
         notify.wishlist_deal_mail_html(picks),
     )
-    logger.info(
-        "监控池折扣速报已发 %s：%d 款（池内折扣条目 %d）",
-        "成功" if sent_ok else "失败（未配置 SMTP 或发送异常，本轮不重试）",
-        len(picks), len(grouped),
+    log_event(
+        logger,
+        "监控池折扣速报邮件已发送"
+        if sent_ok
+        else "监控池折扣速报邮件发送失败（未配置 SMTP 或发送异常，本轮不重试）",
+        tag="成功" if sent_ok else "未完成",
+        detail={"精选": len(picks), "池内折扣条目": len(grouped)},
     )
     return picks
 
@@ -735,10 +744,13 @@ async def check_bundle_deals() -> list[dict]:
         f"{APP_NAME} 捆绑包精选：{len(picks)} 个新折扣",
         notify.bundle_deal_mail_html(picks),
     )
-    logger.info(
-        "捆绑包精选已发 %s：%d 个（池内折扣包 %d）",
-        "成功" if sent_ok else "失败（未配置 SMTP 或发送异常，本轮不重试）",
-        len(picks), len(grouped),
+    log_event(
+        logger,
+        "捆绑包精选邮件已发送"
+        if sent_ok
+        else "捆绑包精选邮件发送失败（未配置 SMTP 或发送异常，本轮不重试）",
+        tag="成功" if sent_ok else "未完成",
+        detail={"精选": len(picks), "池内折扣包": len(grouped)},
     )
     return picks
 
@@ -785,7 +797,7 @@ async def check_epic_free() -> list[dict]:
 
     payload = await metadata_service.epic_free_offers()
     if not payload.get("ok"):
-        logger.info("Epic 喜加一邮件跳过：展示链本轮无数据")
+        log_event(logger, "Epic 喜加一邮件跳过，展示链本轮无数据", tag="跳过")
         return []
     offers = [o for o in (payload.get("offers") or []) if o.get("title")]
     current = [o for o in offers if not o.get("upcoming")]
@@ -808,10 +820,13 @@ async def check_epic_free() -> list[dict]:
         f"{APP_NAME} Epic 喜加一：{len(picks)} 款限免",
         notify.epic_free_mail_html(picks, preview),
     )
-    logger.info(
-        "Epic 喜加一邮件已发 %s：当期新 %d 款（窗口 %d，预告 %d）",
-        "成功" if sent_ok else "失败（未配置 SMTP 或发送异常，本轮不重试）",
-        len(picks), len(current), len(upcoming),
+    log_event(
+        logger,
+        "Epic 喜加一邮件已发送"
+        if sent_ok
+        else "Epic 喜加一邮件发送失败（未配置 SMTP 或发送异常，本轮不重试）",
+        tag="成功" if sent_ok else "未完成",
+        detail={"当期新": len(picks), "窗口": len(current), "预告": len(upcoming)},
     )
     return picks
 
@@ -861,10 +876,13 @@ async def check_hb_choice(result: dict) -> list[dict]:
             games=games,
         ),
     )
-    logger.info(
-        "Humble Choice 邮件已发 %s：%s（%d 款）",
-        "成功" if sent_ok else "失败（未配置 SMTP 或发送异常，本轮不重试）",
-        label, len(games),
+    log_event(
+        logger,
+        "Humble Choice 邮件已发送"
+        if sent_ok
+        else "Humble Choice 邮件发送失败（未配置 SMTP 或发送异常，本轮不重试）",
+        tag="成功" if sent_ok else "未完成",
+        detail={"月包": label, "款数": len(games)},
     )
     return games
 
@@ -898,7 +916,13 @@ async def check_proxy_health() -> bool:
     try:
         stats = await proxies_service.pool_stats()
     except Exception:  # noqa: BLE001 — 统计失败无法判定，不误报
-        logger.exception("代理池统计失败，跳过通道告警")
+        log_event(
+            logger,
+            "代理池统计失败，跳过通道告警",
+            tag="跳过",
+            level=logging.ERROR,
+            exc_info=True,
+        )
         return False
     total = int(stats.get("total") or 0)
     available = int(stats.get("available") or 0)
@@ -933,7 +957,12 @@ async def check_proxy_health() -> bool:
         f"{APP_NAME} 代理通道告警：{reason}",
         notify.proxy_health_mail_html(snapshot),
     )
-    logger.info("代理通道告警已发 %s：%s", "成功" if sent_ok else "失败（未配置 SMTP）", reason)
+    log_event(
+        logger,
+        "代理通道告警邮件已发送" if sent_ok else "代理通道告警邮件发送失败（未配置 SMTP）",
+        tag="成功" if sent_ok else "未完成",
+        detail={"原因": reason},
+    )
     return sent_ok
 
 
@@ -973,7 +1002,12 @@ async def send_system_alert(
             title=title, summary=summary, rows=rows or [], level=level, hint=hint
         ),
     )
-    logger.info("系统告警已发 %s：%s", "成功" if sent_ok else "失败（未配置 SMTP）", title)
+    log_event(
+        logger,
+        "系统告警邮件已发送" if sent_ok else "系统告警邮件发送失败（未配置 SMTP）",
+        tag="成功" if sent_ok else "未完成",
+        detail={"标题": title},
+    )
     return sent_ok
 
 
@@ -1124,7 +1158,12 @@ async def search_games(q: str, region: str = "CN") -> dict:
             }]
         }
     except Exception as e:
-        logger.warning("在线查询 AppID %s 失败: %s", appid_val, e)
+        log_event(
+            logger,
+            "在线查询 Steam AppID 失败",
+            detail={"appid": appid_val, "原因": e},
+            level=logging.WARNING,
+        )
         return {"items": [], "error": f"在线查询失败: {e}"}
 
 

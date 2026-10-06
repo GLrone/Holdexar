@@ -25,6 +25,7 @@ from sqlalchemy import func, select
 
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
+from app.core.logging import log_event
 from app.crawler.utils import get_beijing_time_obj
 from app.domains.games import tags as game_tags
 from .models import TrackedAccount, WishlistItem
@@ -257,14 +258,26 @@ async def fetch_owned_games(steamid: str) -> tuple[list[dict], str | None]:
         cookies = await account_service.get_primary_cookies()
         token = extract_webapi_token(cookies) if cookies else None
     except Exception as e:  # noqa: BLE001 —— Cookie 读取失败降级走 Key，不阻断同步
-        logger.warning("主账号 Cookie 读取失败，已购拉取直接走 Key 通道: %s", e)
+        log_event(
+            logger,
+            "主账号 Cookie 读取失败，已购拉取改走 WebAPI Key 通道",
+            tag="降级",
+            detail={"原因": e},
+            level=logging.WARNING,
+        )
         token = None
     if token:
         try:
             games = await fetch_owned_games_via_jwt(steamid, token)
             return games, "jwt"
         except OwnedFetchError as e:
-            logger.warning("已购拉取 JWT 通道失败（%s），回退 WebAPI Key", e)
+            log_event(
+                logger,
+                "已购拉取登录令牌通道失败，回退到 WebAPI Key 通道",
+                tag="降级",
+                detail={"原因": e},
+                level=logging.WARNING,
+            )
 
     from app.domains.settings.service import get_secret_value
 
@@ -399,7 +412,7 @@ async def add_account(steamid_or_vanity: str, label: str = "", kinds: dict | Non
         _apply_persona(account, persona)
         session.add(account)
         await session.commit()
-    logger.info("已绑定账户 %s", steamid)
+    log_event(logger, "已绑定 Steam 账户", tag="成功", detail={"账号": steamid})
     return {"steamid": steamid, "friendCode": friend_code(steamid)}
 
 
@@ -444,7 +457,12 @@ async def sync_account(steamid: str, auto_crawl: bool = True) -> dict:
             owned, owned_source = await fetch_owned_games(steamid)
         except OwnedFetchError as e:
             owned_error = str(e)
-            logger.warning("已购拉取失败（%s），本次保留既有 owned 标记", e)
+            log_event(
+                logger,
+                "已购游戏拉取失败，本次保留既有已购标记",
+                detail={"原因": e},
+                level=logging.WARNING,
+            )
 
         # 昵称/头像随手刷新（Steam 昵称会改；拉取失败静默保留旧值）
         persona = await _fetch_persona(steamid)
@@ -570,11 +588,18 @@ async def sync_account(steamid: str, auto_crawl: bool = True) -> dict:
         "newAppids": new_appids,
         "newOwnedAppids": new_owned_appids,
     }
-    logger.info(
-        "同步 %s：愿望单 %d / 已购 %d（%s）/ 新增 %d（已购新增 %d）",
-        steamid, len(wishlist), len(owned),
-        f"通道 {owned_source}" if owned_error is None else f"失败：{owned_error}",
-        len(new_appids), len(new_owned_appids),
+    log_event(
+        logger,
+        "Steam 账户同步完成",
+        tag="成功",
+        detail={
+            "账号": steamid,
+            "愿望单": len(wishlist),
+            "已购": len(owned),
+            "已购通道": f"通道 {owned_source}" if owned_error is None else f"失败：{owned_error}",
+            "新增": len(new_appids),
+            "已购新增": len(new_owned_appids),
+        },
     )
 
     if auto_crawl and new_appids:
@@ -601,7 +626,12 @@ async def sync_account(steamid: str, auto_crawl: bool = True) -> dict:
             # 单任务模型不能并行；HTTP 语境不等待爬完）
             if crawl_service.active_job_id() is not None:
                 result["crawlTriggered"] = False
-                logger.info("已有爬取任务运行，新增 %d 项未自动爬取", len(new_appids))
+                log_event(
+                    logger,
+                    "已有爬取任务运行，新增条目本轮未自动爬取",
+                    tag="跳过",
+                    detail={"新增": len(new_appids)},
+                )
             else:
                 asyncio.create_task(
                     crawl_service.run_sequential(
@@ -642,10 +672,20 @@ async def sync_account(steamid: str, auto_crawl: bool = True) -> dict:
             except ValueError as e:
                 # 空列表等参数性拒绝：静默跳过，下轮同步再探
                 result["crawlTriggered"] = False
-                logger.info("新增 %d 项未自动爬取（%s）", len(new_appids), e)
+                log_event(
+                    logger,
+                    "新增条目未自动爬取",
+                    tag="跳过",
+                    detail={"新增": len(new_appids), "原因": e},
+                )
             except RuntimeError:
                 result["crawlTriggered"] = False  # 已有任务运行，稍后手动触发
-                logger.info("已有爬取任务运行，新增 %d 项未自动爬取", len(new_appids))
+                log_event(
+                    logger,
+                    "已有爬取任务运行，新增条目本轮未自动爬取",
+                    tag="跳过",
+                    detail={"新增": len(new_appids)},
+                )
 
     return result
 
@@ -916,7 +956,15 @@ async def update_kinds(steamid: str, kinds_patch: dict) -> dict:
         kinds.update(kinds_patch)
         account.kinds_json = kinds
         await session.commit()
-    logger.info("更新账户 %s 同步类型: %s", steamid, kinds)
+    log_event(
+        logger,
+        "账户同步类型已更新",
+        detail={
+            "账号": steamid,
+            "愿望单同步": "开" if kinds.get("wishlist") else "关",
+            "已购同步": "开" if kinds.get("owned") else "关",
+        },
+    )
     return {"steamid": steamid, "kinds": kinds}
 
 
@@ -1054,7 +1102,13 @@ async def _sync_monitoring(appids: list[int], *, exclusion: bool | None = None) 
                 )
         await monitoring_service.sync_game_sources(clean)
     except Exception:  # noqa: BLE001
-        logger.exception("监控层同步失败（不影响监控池主链）：%d 项", len(clean))
+        log_event(
+            logger,
+            "监控层同步失败，不影响监控池主链",
+            detail={"项数": len(clean)},
+            level=logging.ERROR,
+            exc_info=True,
+        )
 
 
 async def ensure_board_pool(appids: list[int], *, source: str = "board") -> dict:
@@ -1138,9 +1192,10 @@ async def ensure_board_pool(appids: list[int], *, source: str = "board") -> dict
         added += 1
 
     if added or skipped:
-        logger.info(
-            "发现源落池（%s）：新增 %d / 已在池 %d / 已移除跳过 %d",
-            source, added, exists, skipped,
+        log_event(
+            logger,
+            "榜单发现源落池完成",
+            detail={"来源": source, "新增": added, "已在池": exists, "已移除跳过": skipped},
         )
     return {"added": added, "exists": exists, "skipped": skipped}
 
@@ -1211,7 +1266,12 @@ async def add_pool_items(
             )
             crawl_triggered = True
         except (RuntimeError, ValueError) as e:
-            logger.info("监控池新增 %d 项未自动爬取（%s）", len(touched), e)
+            log_event(
+                logger,
+                "监控池新增条目未自动爬取",
+                tag="跳过",
+                detail={"新增": len(touched), "原因": e},
+            )
 
     # 预设池登记（池页「导入文件」来源，见 games/preset.py）：登记失败不阻断入池
     if source and clean:
@@ -1220,7 +1280,13 @@ async def add_pool_items(
         try:
             await preset_mod.record_imported(clean, source)
         except Exception:  # noqa: BLE001
-            logger.exception("预设池登记失败（不阻断入池）：source=%s", source)
+            log_event(
+                logger,
+                "预设池登记失败，不阻断入池",
+                detail={"来源": source},
+                level=logging.ERROR,
+                exc_info=True,
+            )
 
     return {
         "results": results,

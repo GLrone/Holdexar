@@ -22,6 +22,7 @@ from sqlalchemy import delete, func, select
 
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
+from app.core.logging import log_event
 from app.domains.account import service as account_service
 from app.domains.achievements.models import AchievementDef, AchievementGame, AchievementState
 from app.domains.family.service import (
@@ -138,7 +139,7 @@ async def _post_form(url: str, data: dict) -> httpx.Response:
     except httpx.HTTPError as e:
         if not _is_ssl_error(e):
             raise
-        logger.info("Steam API 证书校验失败（经代理场景），降级跳过校验重试")
+        log_event(logger, "Steam 接口证书校验失败（经代理场景），降级跳过校验重试", tag="降级")
         async with httpx.AsyncClient(timeout=30, proxy=proxy, verify=False) as client:
             resp = await client.post(url, data=data)
     resp.raise_for_status()
@@ -233,9 +234,15 @@ async def fetch_progress_keyed(
     skipped = skip or set()
     todo = [a for a in appids if a not in skipped]
     if len(todo) != len(appids):
-        logger.info(
-            "[achievements] 逐款进度：%d/%d 款近 %d 分钟内已刷过，跳过",
-            len(appids) - len(todo), len(appids), PROGRESS_FALLBACK_SKIP_MINUTES,
+        log_event(
+            logger,
+            "逐款进度补刷跳过刚刷过的游戏",
+            tag="跳过",
+            detail={
+                "已刷过款数": len(appids) - len(todo),
+                "总款数": len(appids),
+                "跳过窗口分钟": PROGRESS_FALLBACK_SKIP_MINUTES,
+            },
         )
     await _write_snapshot(stage="progress", total=len(todo), done=0)
 
@@ -402,12 +409,17 @@ async def shared_pool_candidates(steamid: str) -> tuple[list[int], dict[int, str
                         if not a.get("excluded")
                     ]
         except Exception as e:  # noqa: BLE001 —— 实时不可得时走快照
-            logger.info("[achievements] 家庭共享池实时获取失败（转本地快照）：%s", e)
+            log_event(
+                logger,
+                "家庭共享池实时获取失败，改用本地快照",
+                tag="降级",
+                detail={"原因": str(e)},
+            )
 
     if rows is None:
         rows = await _shared_pool_from_snapshot(steamid)
     if rows is None:
-        logger.info("[achievements] 家庭共享池不可得（实时与快照都无），跳过库外名册")
+        log_event(logger, "家庭共享池实时与快照都不可得，跳过库外名册", tag="跳过")
         return [], {}
 
     out: list[int] = []
@@ -460,7 +472,7 @@ async def _shared_pool_from_snapshot(
             (int(s.appid), [str(x) for x in (s.owners_json or [])], s.name) for s in snaps
         ]
     except Exception as e:  # noqa: BLE001 —— 快照不可读时按「无候选」处理
-        logger.info("[achievements] 家庭库快照读取失败：%s", e)
+        log_event(logger, "家庭库快照读取失败", detail={"原因": str(e)})
         return None
 
 
@@ -749,7 +761,12 @@ async def start_sync(target: str | None = None) -> dict:
             age = timedelta(0)
         if age <= timedelta(minutes=SYNC_STALE_MINUTES):
             raise ValueError("成就同步已在进行中")
-        logger.warning("[achievements] 同步快照 running 卡死超过 %d 分钟，放行重试", SYNC_STALE_MINUTES)
+        log_event(
+            logger,
+            "成就同步快照卡在运行态过久，放行重新同步",
+            level=logging.WARNING,
+            detail={"卡死超过分钟": SYNC_STALE_MINUTES},
+        )
     steamid = (target or "").strip() or await _primary_steam_id()
     await _write_snapshot(running=True, ok=None, error="", stage="library", done=0, total=0,
                           current="", steamid=steamid,
@@ -797,10 +814,16 @@ async def _run_sync(steamid: str) -> None:
     try:
         await _sync_all(steamid)
     except SyncError as e:
-        logger.warning("[achievements] 同步失败：%s", e)
+        log_event(
+            logger,
+            "成就同步失败",
+            tag="未完成",
+            level=logging.WARNING,
+            detail={"原因": str(e)},
+        )
         await _finish_snapshot(ok=False, error=str(e))
     except Exception:  # noqa: BLE001 —— 同步失败只留日志与快照，不影响服务
-        logger.exception("[achievements] 同步异常")
+        log_event(logger, "成就同步异常中断", level=logging.ERROR, exc_info=True)
         await _finish_snapshot(ok=False, error="同步异常，详见服务日志")
     finally:
         _sync_task = None
@@ -847,7 +870,11 @@ async def _sync_all(target: str = "") -> None:
     external_ids, external_names = await shared_pool_candidates(steamid)
     external_ids = [a for a in external_ids if a not in owned_ids]
     if external_ids:
-        logger.info("[achievements] 家庭共享池候选 %d 款（本号未拥有）", len(external_ids))
+        log_event(
+            logger,
+            "家庭共享池发现本号未拥有的候选游戏",
+            detail={"款数": len(external_ids)},
+        )
 
     candidates = sorted(owned_ids) + external_ids
     progress: dict[int, dict] = {}
@@ -861,9 +888,12 @@ async def _sync_all(target: str = "") -> None:
             api_key = _api_key_of(creds)
             if not api_key:
                 raise
-            logger.warning(
-                "[achievements] 批量进度通道不可用（%s），改用单游戏接口逐款回退（%d 款）",
-                e, len(candidates),
+            log_event(
+                logger,
+                "批量进度通道不可用，改用单游戏接口逐款回退",
+                tag="降级",
+                level=logging.WARNING,
+                detail={"原因": str(e), "款数": len(candidates)},
             )
             progress = await fetch_progress_keyed(
                 steamid, candidates, api_key, skip=recent_progress
@@ -897,8 +927,11 @@ async def _sync_all(target: str = "") -> None:
             continue  # 计数未变且近期已刷明细：无新解锁可采
         pending.append(row)
     if len(pending) != len(targets):
-        logger.info(
-            "[achievements] 增量同步：%d/%d 款计数未变，跳过明细抓取", len(targets) - len(pending), len(targets)
+        log_event(
+            logger,
+            "游戏成就计数未变，跳过明细抓取",
+            tag="跳过",
+            detail={"未变款数": len(targets) - len(pending), "总款数": len(targets)},
         )
 
     await _write_snapshot(stage="details", total=len(pending), done=0)
@@ -916,7 +949,12 @@ async def _sync_all(target: str = "") -> None:
             try:
                 await _sync_game(steamid, row, creds)
             except SyncError as e:
-                logger.warning("[achievements] appid=%s 明细失败：%s", row.appid, e)
+                log_event(
+                    logger,
+                    "单游戏成就明细抓取失败",
+                    level=logging.WARNING,
+                    detail={"AppID": row.appid, "原因": str(e)},
+                )
             except BaseException as e:  # noqa: BLE001 —— 收集后在 gather 外重抛
                 failures.append(e)
                 return
@@ -1028,7 +1066,7 @@ async def _prune_external(steamid: str, candidates: set[int]) -> int:
         if removed:
             await session.commit()
     if removed:
-        logger.info("[achievements] 清理失效库外行 %d 款", removed)
+        log_event(logger, "清理失效的库外成就行", detail={"款数": removed})
     return removed
 
 
@@ -1111,7 +1149,11 @@ async def _sync_game(steamid: str, row: AchievementGame, creds: list[tuple[str, 
             ]
             merged, unmatched = merge_states(defs, page_rows)
         if unmatched:
-            logger.info("[achievements] appid=%s 有 %d 行未匹配到清单行", appid, unmatched)
+            log_event(
+                logger,
+                "部分解锁状态行未匹配到成就清单",
+                detail={"AppID": appid, "未匹配行数": unmatched},
+            )
 
         now = datetime.utcnow()
         if merged:
@@ -1145,7 +1187,11 @@ async def _sync_game(steamid: str, row: AchievementGame, creds: list[tuple[str, 
         else:
             # 两条通道都没读到（无 Key 且页面为空 / 资料游戏详情不公开）：
             # 保留既有解锁态，不拿空结果覆盖已有账
-            logger.info("[achievements] appid=%s 明细通道未读到解锁态，保留既有数据", appid)
+            log_event(
+                logger,
+                "该游戏未读到解锁状态，保留既有数据",
+                detail={"AppID": appid},
+            )
         await session.merge(row)
         await session.commit()
 
@@ -1451,7 +1497,7 @@ async def available_accounts() -> list[dict]:
                 "relation": "bound",
             }
     except Exception:  # noqa: BLE001 —— 账号域异常不拖垮成就页
-        logger.info("[achievements] 已绑账号列表读取失败", exc_info=True)
+        log_event(logger, "已绑账号列表读取失败", exc_info=True)
 
     try:
         from app.domains.family.models import FamilyGroup
@@ -1476,7 +1522,7 @@ async def available_accounts() -> list[dict]:
                     "relation": "family",
                 }
     except Exception:  # noqa: BLE001 —— 家庭快照缺失时只列已绑账号
-        logger.info("[achievements] 家庭成员列表读取失败", exc_info=True)
+        log_event(logger, "家庭成员列表读取失败", exc_info=True)
 
     # 名字/头像补齐：tracked_accounts 由账户轮转持续维护（含家庭成员），
     # 成就页不另起网络请求，直接复用这份本地档案。
@@ -1492,7 +1538,7 @@ async def available_accounts() -> list[dict]:
             entry["personaName"] = entry["personaName"] or t.persona_name or ""
             entry["avatarUrl"] = entry["avatarUrl"] or t.avatar_url or ""
     except Exception:  # noqa: BLE001 —— 档案缺失只影响展示，不阻断账号清单
-        logger.info("[achievements] tracked_accounts 档案读取失败", exc_info=True)
+        log_event(logger, "本地追踪账户档案读取失败", exc_info=True)
 
     items = list(out.values())
     items.sort(key=lambda x: (

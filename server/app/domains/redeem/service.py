@@ -24,6 +24,7 @@ import re
 
 import httpx
 
+from app.core.logging import log_event
 from app.domains.account import service as account_service
 from app.domains.account.steam_wallet import parse_cookie_str
 
@@ -127,7 +128,11 @@ async def _post_steam(url: str, data: dict, jar: dict, *, referer: str | None = 
     except httpx.HTTPError as e:
         if not _is_ssl_error(e):
             raise
-        logger.info("商店端点证书校验失败（经代理场景），降级跳过校验重试")
+        log_event(
+            logger,
+            "商店端点证书校验失败（经代理场景），降级跳过校验重试",
+            tag="降级",
+        )
         async with httpx.AsyncClient(timeout=20, proxy=proxy, verify=False) as client:
             resp = await client.post(url, data=data, cookies=jar, headers=headers)
     return resp

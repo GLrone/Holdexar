@@ -17,6 +17,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
+from app.core.logging import log_event
 from app.domains.alerts.notify import send_mail_ex, smtp_config
 from app.domains.crawl import events as events_service
 from app.domains.crawl import service as crawl_service
@@ -93,7 +94,12 @@ async def _watched_appids() -> set[int]:
     try:
         return set(await crawl_service.plan_scope_appids("pool"))
     except Exception:  # noqa: BLE001 —— 范围解析失败按「无关注」处理，不产生候选
-        logger.exception("[通知] 监控池范围解析失败，本轮不产生通知候选")
+        log_event(
+            logger,
+            "监控池范围解析失败，本轮不产生通知候选",
+            level=logging.ERROR,
+            exc_info=True,
+        )
         return set()
 
 
@@ -201,7 +207,13 @@ async def _region_names(codes: set[str]) -> dict[str, str]:
     try:
         rows = await regions_service.list_regions()
     except Exception:  # noqa: BLE001
-        logger.exception("[通知] 区服名称读取失败，摘要退回区码")
+        log_event(
+            logger,
+            "区服名称读取失败，摘要退回区码",
+            tag="降级",
+            level=logging.ERROR,
+            exc_info=True,
+        )
         return {}
     return {r["code"].upper(): r["name"] for r in rows if r.get("code")}
 
@@ -269,9 +281,15 @@ async def dispatch(cycle_id: int) -> dict:
         events = await events_service.list_events(cycle_id=cycle_id, limit=EVENT_LIMIT)
         if not prefs.get("enabled") or not recipient:
             # 总开关关闭 / 出口未配置：不产生候选也不留积压（以后开启不补发旧账）
-            logger.info(
-                "[通知] 本轮 %d 条事件不进入通知（enabled=%s，出口=%s）",
-                len(events), prefs.get("enabled"), bool(recipient),
+            log_event(
+                logger,
+                "本轮事件不进入通知（通知总开关关闭或收件出口未配置）",
+                tag="跳过",
+                detail={
+                    "事件": len(events),
+                    "通知开关": "开" if prefs.get("enabled") else "关",
+                    "收件出口": "已配置" if recipient else "未配置",
+                },
             )
             return result
 
@@ -284,8 +302,12 @@ async def dispatch(cycle_id: int) -> dict:
         # 而不是丢掉。不判断这条就等于静默期形同虚设——候选刚建完就被自己投出去。
         if policy_mod.in_quiet_window(datetime.now(), prefs):
             result["deferred"] = len(await _undelivered())
-            logger.info("[通知] Cycle %d：处于静默期，%d 条候选顺延",
-                        cycle_id, result["deferred"])
+            log_event(
+                logger,
+                "本轮处于静默期，通知候选顺延到下批",
+                tag="跳过",
+                detail={"周期": cycle_id, "顺延": result["deferred"]},
+            )
             return result
 
         candidates = await _undelivered()
@@ -320,13 +342,25 @@ async def dispatch(cycle_id: int) -> dict:
             await _settle(candidates, "failed", f"smtp: {error}", error)
             result["failed"] = len(candidates)
             result["retryable"] = retryable(error)
-        logger.info(
-            "[通知] Cycle %d：候选 %d（新增 %d / 重试 %d），投递成功 %d / 失败 %d"
-            + ("（临时故障，下次可重试）" if result["retryable"] else ""),
-            cycle_id, len(candidates), result["created"], result["retried"],
-            result["sent"], result["failed"],
+        log_event(
+            logger,
+            "通知本轮投递完成" + ("，存在临时故障，下轮可重试" if result["retryable"] else ""),
+            detail={
+                "周期": cycle_id,
+                "候选": len(candidates),
+                "新增": result["created"],
+                "重试": result["retried"],
+                "成功": result["sent"],
+                "失败": result["failed"],
+            },
         )
         return result
     except Exception:  # noqa: BLE001 —— 通知失败绝不影响 Cycle 收敛
-        logger.exception("[通知] Cycle %d 通知投递失败（不影响本轮结果）", cycle_id)
+        log_event(
+            logger,
+            "通知投递失败，不影响本轮价格刷新结果",
+            detail={"周期": cycle_id},
+            level=logging.ERROR,
+            exc_info=True,
+        )
         return result

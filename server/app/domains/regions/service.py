@@ -17,6 +17,7 @@ from sqlalchemy import select
 from app.crawler.config import CC_LIST
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
+from app.core.logging import log_event
 from app.crawler.utils import get_beijing_time_obj
 from app.domains.regions.models import CrawlRegion
 from app.domains.settings.models import AppSetting
@@ -148,9 +149,18 @@ async def set_enabled(codes: list[str] | None) -> None:
 
         rebuilt = await bundles_service.refresh_bundle_sort_cache()
         bundles_service.invalidate_bundles_cache()
-        logger.info("追踪区变更：捆绑包排序快照重建 %d 个", rebuilt)
+        log_event(
+            logger,
+            "追踪区变更，捆绑包排序快照已重建",
+            detail={"重建包数": rebuilt},
+        )
     except Exception:  # noqa: BLE001
-        logger.exception("追踪区变更后捆绑包排序快照重建失败（快照沿用旧集合）")
+        log_event(
+            logger,
+            "追踪区变更后捆绑包排序快照重建失败，快照沿用旧集合",
+            level=logging.ERROR,
+            exc_info=True,
+        )
 
 
 async def effective_regions(explicit: list[str] | None) -> list[str]:

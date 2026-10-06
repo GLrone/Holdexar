@@ -31,6 +31,7 @@ from email.utils import formataddr
 from html import escape
 
 from app.core.app_info import APP_NAME
+from app.core.logging import log_event
 from app.domains.settings.service import get_value, set_value
 
 logger = logging.getLogger(__name__)
@@ -88,7 +89,12 @@ async def update_smtp_config(
         await set_value("smtp.password", password)
     await set_value("smtp.to_addr", to_addr)
     await set_value("smtp.use_ssl", use_ssl)
-    logger.info("SMTP 配置已更新: host=%s user=%s", host, user)
+    log_event(
+        logger,
+        "SMTP 配置已更新",
+        tag="成功",
+        detail={"服务器": host, "发件账户": user},
+    )
     return await get_smtp_config()
 
 
@@ -140,7 +146,7 @@ async def send_mail_ex(subject: str, html_body: str) -> tuple[bool, str | None]:
     """
     cfg = await smtp_config()
     if not (cfg["host"] and cfg["user"] and cfg["password"] and cfg["to_addr"]):
-        logger.info("SMTP 未配置，跳过邮件通知")
+        log_event(logger, "SMTP 未配置，跳过邮件通知", tag="跳过")
         return False, "SMTP 未配置"
     try:
         if cfg["use_ssl"]:
@@ -155,14 +161,14 @@ async def send_mail_ex(subject: str, html_body: str) -> tuple[bool, str | None]:
             message["From"] = formataddr((APP_NAME, cfg["user"]))
             message["To"] = cfg["to_addr"]
             server.sendmail(cfg["user"], [cfg["to_addr"]], message.as_string())
-        logger.info("邮件已发送: %s", subject)
+        log_event(logger, "邮件已发送", tag="成功", detail={"主题": subject})
         return True, None
     except smtplib.SMTPAuthenticationError as e:
         reason = f"SMTPAuthenticationError: {_smtp_auth_reason(e)}"
-        logger.error("邮件认证被拒: %s", reason)
+        log_event(logger, "邮件发送认证被拒", detail={"原因": reason}, level=logging.ERROR)
         return False, reason
     except Exception as e:  # noqa: BLE001
-        logger.error("邮件发送失败: %s", e)
+        log_event(logger, "邮件发送失败", detail={"原因": e}, level=logging.ERROR)
         # 返回里带上异常类型名：错误文本会被系统语言本地化（中文 Windows 的
         # socket 错误是中文），只有类型名是与语言无关的稳定判据
         return False, f"{type(e).__name__}: {e}"
@@ -1012,15 +1018,25 @@ async def send_test_mail(
             message["From"] = formataddr((APP_NAME, user))
             message["To"] = to_addr
             server.sendmail(user, [to_addr], message.as_string())
-        logger.info("连通性测试邮件已发送: %s -> %s", user, to_addr)
+        log_event(
+            logger,
+            "连通性测试邮件已发送",
+            tag="成功",
+            detail={"发件": user, "收件": to_addr},
+        )
         return {"ok": True}
     except ValueError:
         raise
     except smtplib.SMTPAuthenticationError as e:
-        logger.warning("连通性测试认证被拒: %s %s", e.smtp_code, e.smtp_error)
+        log_event(
+            logger,
+            "连通性测试邮件认证被拒",
+            detail={"错误码": e.smtp_code, "服务器回复": e.smtp_error},
+            level=logging.WARNING,
+        )
         raise ValueError(_smtp_auth_reason(e)) from e
     except Exception as e:  # noqa: BLE001 — SMTP 错误原文回传前端
-        logger.warning("连通性测试失败: %s", e)
+        log_event(logger, "连通性测试邮件发送失败", detail={"原因": e}, level=logging.WARNING)
         raise ValueError(f"连接失败：{e}") from e
 
 

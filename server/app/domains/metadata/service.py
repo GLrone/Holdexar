@@ -41,6 +41,7 @@ from sqlalchemy import case, func, or_, select, update
 
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
+from app.core.logging import log_event
 from app.crawler.epic_free import (
     fetch_free_games,
     fetch_free_offers,
@@ -515,7 +516,13 @@ async def refresh_hb_choice() -> dict:
             appid = await _resolve_appid(session, title, proxy)
             if appid is None:
                 unresolved.append(title)
-                logger.warning("[hb-choice] 条目 %s（%s）未能解析 appid，留待人工", name, title)
+                log_event(
+                    logger,
+                    f"《{title}》未能匹配到 appid，留待人工处理",
+                    tag="未完成",
+                    detail={"条目": name},
+                    level=logging.WARNING,
+                )
             else:
                 await _mark_game_hb(appid, title, label)
                 marked.append({"appid": appid, "title": title})
@@ -525,9 +532,12 @@ async def refresh_hb_choice() -> dict:
         # 空数据/不完整结案不记账：记账后 machine_name 判重会把当月永久
         # 跳过（搜索侧故障一整天 = 整月漏标）。打标幂等，次日重跑零代价，
         # 未全量结案前每天重试直到全解析。
-        logger.warning(
-            "[hb-choice] %s 有 %d 条未解析，不记账（次日重试）",
-            machine, len(unresolved),
+        log_event(
+            logger,
+            f"当月包有 {len(unresolved)} 款未解析出 appid，本轮不记账，次日重试",
+            tag="未完成",
+            detail={"月包标识": machine},
+            level=logging.WARNING,
         )
         return {
             "source": "hb-choice", "ok": True, "skipped": False,
@@ -557,9 +567,11 @@ async def refresh_hb_choice() -> dict:
             "count": len(marked),
         },
     )
-    logger.info(
-        "[hb-choice] %s 打标完成：%d 款（%s），已记账",
-        machine, len(marked), label,
+    log_event(
+        logger,
+        f"当月包打标完成，{len(marked)} 款已记入 Humble Choice 名单",
+        tag="成功",
+        detail={"月包标识": machine, "标签": label},
     )
     return {
         "source": "hb-choice", "ok": True, "machineName": machine,
@@ -903,14 +915,21 @@ async def refresh_epic_free() -> dict:
     for g in games:
         if g.appid is None:
             unresolved.append({"title": g.title, "freeStart": g.free_start})
-            logger.warning("[epic-free] 条目 %s 未能解析 appid，留待次日", g.title)
+            log_event(
+                logger,
+                f"《{g.title}》未能匹配到 appid，留待次日重试",
+                tag="未完成",
+                level=logging.WARNING,
+            )
             continue
         if await _mark_game_epic(g.appid, g.title_cn or g.title, g.free_start):
             marked.append({"appid": g.appid, "title": g.title, "freeStart": g.free_start})
 
-    logger.info(
-        "[epic-free] 窗口标记完成：窗口 %d 款，新标 %d 款，未解析 %d 款",
-        len(games), len(marked), len(unresolved),
+    log_event(
+        logger,
+        f"Epic 免费窗口标记完成，新标记 {len(marked)} 款",
+        tag="成功",
+        detail={"窗口": len(games), "未解析": len(unresolved)},
     )
     return {
         "source": "epic-free", "ok": True, "window": len(games),
@@ -935,9 +954,11 @@ async def import_epic_list(items: list[dict]) -> dict:
         if await _mark_game_epic(int(aid), title, free_start):
             marked.append({"appid": int(aid), "freeStart": free_start})
 
-    logger.info(
-        "[epic-list] 外部名单导入：收到 %d 条，新标 %d 条，跳过 %d 条",
-        len(items), len(marked), skipped,
+    log_event(
+        logger,
+        f"Epic 外部名单导入完成，新标记 {len(marked)} 款",
+        tag="成功",
+        detail={"收到": len(items), "跳过": skipped},
     )
     return {
         "source": "epic-list", "ok": True, "received": len(items),
@@ -973,7 +994,12 @@ async def _read_offers_snapshot() -> dict | None:
     try:
         row = await get_value(_EPIC_OFFERS_CACHE_KEY)
     except Exception as e:  # noqa: BLE001 —— 读缓存失败等同无缓存
-        logger.warning("[epic-offers] 落库快照读取失败（按无缓存处理）：%s", e)
+        log_event(
+            logger,
+            "Epic 免费游戏快照读取失败，本轮按无缓存处理",
+            detail={"原因": e},
+            level=logging.WARNING,
+        )
         return None
     if not isinstance(row, dict):
         return None
@@ -993,7 +1019,13 @@ async def _write_offers_snapshot(payload: dict) -> None:
             {"fetched_at": time.time(), "payload": payload},
         )
     except Exception as e:  # noqa: BLE001 —— 落库失败不影响本次返回
-        logger.warning("[epic-offers] 落库快照写入失败（忽略）：%s", e)
+        log_event(
+            logger,
+            "Epic 免费游戏快照写入失败，本次忽略",
+            tag="忽略",
+            detail={"原因": e},
+            level=logging.WARNING,
+        )
 
 
 async def _fetch_offers_payload() -> dict | None:
@@ -1062,7 +1094,11 @@ def _start_offers_refresh() -> None:
         try:
             payload = await _fetch_offers_payload()
             if payload is None:
-                logger.info("[epic-offers] 后台刷新全失败（保留旧快照）")
+                log_event(
+                    logger,
+                    "Epic 免费游戏后台刷新全部失败，保留旧快照",
+                    tag="未完成",
+                )
                 return
             # 快照替换即当期集合可能变化：先比对落事实，再覆盖缓存
             await _publish_epic_rotation(_epic_offers_cache["payload"], payload)
@@ -1071,9 +1107,19 @@ def _start_offers_refresh() -> None:
             # PC 列表失败时只出移动卡，不写快照——下次启动重试 Epic
             if payload["offers"]:
                 await _write_offers_snapshot(payload)
-            logger.info("[epic-offers] 后台刷新完成：PC %d 张", len(payload["offers"]))
+            log_event(
+                logger,
+                "Epic 免费游戏后台刷新完成",
+                tag="成功",
+                detail={"PC 白送": len(payload["offers"])},
+            )
         except Exception as e:  # noqa: BLE001 —— 后台失败保留旧快照
-            logger.info("[epic-offers] 后台刷新异常（保留旧快照）：%s", e)
+            log_event(
+                logger,
+                "Epic 免费游戏后台刷新异常，保留旧快照",
+                tag="未完成",
+                detail={"原因": e},
+            )
         finally:
             _epic_offers_refreshing = False
 
@@ -1242,7 +1288,12 @@ async def refresh_bundle_counts(force: bool = False) -> dict:
     try:
         bundles_map = await _fetch_bartervg_bundles(proxy)
     except Exception as e:  # noqa: BLE001
-        logger.warning("[bartervg] bundles 档案拉取失败：%s", e)
+        log_event(
+            logger,
+            "Barter.vg 捆绑包档案拉取失败",
+            detail={"原因": e},
+            level=logging.WARNING,
+        )
         return {"source": "bartervg-bundles", "ok": False, "error": str(e)}
 
     updated = 0
@@ -1271,9 +1322,11 @@ async def refresh_bundle_counts(force: bool = False) -> dict:
         _BUNDLES_STATE_KEY,
         {"fetchedAt": now.isoformat(), "records": len(bundles_map), "updated": updated},
     )
-    logger.info(
-        "[bartervg] bundle 计数刷新完成：档案 %d 条，库内命中更新 %d 行",
-        len(bundles_map), updated,
+    log_event(
+        logger,
+        "Barter.vg 捆绑包计数刷新完成",
+        tag="成功",
+        detail={"档案": len(bundles_map), "更新行": updated},
     )
     return {
         "source": "bartervg-bundles", "ok": True, "skipped": False,

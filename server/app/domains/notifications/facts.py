@@ -15,6 +15,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
+from app.core.logging import log_event
 from app.domains.notifications.models import FactNotice
 
 logger = logging.getLogger(__name__)
@@ -48,7 +49,13 @@ async def record_fact(
             await session.commit()
         return bool(cursor.rowcount)
     except Exception:  # noqa: BLE001 —— 事实落库失败不影响数据链路
-        logger.exception("[事实通知] 落行失败（source=%s key=%s）", source, fact_key)
+        log_event(
+            logger,
+            "一条事实通知落库失败，灵动岛将少收到一条变化",
+            level=logging.ERROR,
+            exc_info=True,
+            detail={"来源": source, "类型": kind, "事实键": fact_key},
+        )
         return False
 
 
