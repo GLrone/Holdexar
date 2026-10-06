@@ -99,10 +99,114 @@ async def test_resolve_proxy_first_local_clash_port_alive(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_resolve_direct_only(db):
-    """direct_only 策略 → 恒直连。"""
+async def test_resolve_direct_only_without_system_proxy(db, monkeypatch):
+    """direct_only 策略 → 无可用系统代理时恒直连。"""
     await settings_service.set_value("proxy.strategy", "direct_only")
+
+    async def _none():
+        return None
+
+    monkeypatch.setattr(proxies_service, "resolve_system_proxy_url", _none)
     assert await proxies_service.resolve_proxy_url() is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_direct_only_rides_system_proxy(db, monkeypatch):
+    """direct_only 策略 → 探活通过的系统代理即本机出口（托管语义）。"""
+    await settings_service.set_value("proxy.strategy", "direct_only")
+
+    async def _alive():
+        return "http://127.0.0.1:7897"
+
+    monkeypatch.setattr(proxies_service, "resolve_system_proxy_url", _alive)
+    assert await proxies_service.resolve_proxy_url() == "http://127.0.0.1:7897"
+
+
+@pytest.mark.asyncio
+async def test_resolve_direct_first_stays_raw_direct(db, monkeypatch):
+    """direct_first（本机优先，失败才换代理）不走系统代理——恒 None，
+    failover 由 resolve_failover_proxy_url 单独负责。"""
+    await settings_service.set_value("proxy.strategy", "direct_first")
+
+    async def _alive():
+        return "http://127.0.0.1:7897"
+
+    monkeypatch.setattr(proxies_service, "resolve_system_proxy_url", _alive)
+    assert await proxies_service.resolve_proxy_url() is None
+
+
+# ── 系统代理解析器 ──────────────────────────────────────────
+
+
+def test_system_proxy_candidates_parse_and_filter(monkeypatch):
+    """https 优先、无 scheme 补 http://、socks 形态剔除、重复去重。"""
+    import urllib.request
+
+    def _env_proxies():
+        return {
+            "https": "127.0.0.1:7897",
+            "http": "http://127.0.0.1:7897",
+            "socks": "socks5://127.0.0.1:1080",
+        }
+
+    monkeypatch.setattr(urllib.request, "getproxies", _env_proxies)
+    assert proxies_service._system_proxy_candidates() == ["http://127.0.0.1:7897"]
+
+    monkeypatch.setattr(urllib.request, "getproxies", lambda: {})
+    assert proxies_service._system_proxy_candidates() == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_system_proxy_alive_and_dead(db, monkeypatch):
+    """候选逐个探活，首个活端口胜出；全死 → None。"""
+    import urllib.request
+
+    monkeypatch.setattr(
+        urllib.request, "getproxies",
+        lambda: {"https": "127.0.0.1:7897", "http": "127.0.0.1:7890"},
+    )
+    probed: list[int] = []
+
+    async def _alive(host, port, timeout=1.0):
+        probed.append(port)
+        return port == 7890
+
+    monkeypatch.setattr(proxies_service, "_tcp_alive", _alive)
+    monkeypatch.setattr(proxies_service, "_system_proxy_cache", None)
+    assert await proxies_service.resolve_system_proxy_url() == "http://127.0.0.1:7890"
+    assert probed == [7897, 7890]
+
+    monkeypatch.setattr(proxies_service, "_system_proxy_cache", None)
+
+    async def _dead(host, port, timeout=1.0):
+        return False
+
+    monkeypatch.setattr(proxies_service, "_tcp_alive", _dead)
+    assert await proxies_service.resolve_system_proxy_url() is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_system_proxy_cached(db, monkeypatch):
+    """30s 缓存：命中期内不重探，调用方高频轮询不反复探活。"""
+    import urllib.request
+
+    monkeypatch.setattr(
+        urllib.request, "getproxies", lambda: {"https": "127.0.0.1:7897"}
+    )
+    calls: list[int] = []
+
+    async def _alive(host, port, timeout=1.0):
+        calls.append(port)
+        return True
+
+    monkeypatch.setattr(proxies_service, "_tcp_alive", _alive)
+    monkeypatch.setattr(proxies_service, "_system_proxy_cache", None)
+    first = await proxies_service.resolve_system_proxy_url()
+    # 换掉候选源也不影响缓存命中
+    monkeypatch.setattr(urllib.request, "getproxies", lambda: {})
+    second = await proxies_service.resolve_system_proxy_url()
+    assert first == second == "http://127.0.0.1:7897"
+    assert len(calls) == 1
 
 
 @pytest.mark.asyncio

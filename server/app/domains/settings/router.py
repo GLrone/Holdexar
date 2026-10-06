@@ -37,6 +37,8 @@ class SettingsUpdate(BaseModel):
     # 静默自动更新开关（True=检测到新版本后台自动下载校验，不打扰；
     # 下次启动应用时桌面壳消费暂存目录自动换装）
     update_auto: bool | None = None
+    # 直连模式加速器建议弹窗已看过（首次使用直连自动弹一次）
+    direct_notice_seen: bool | None = None
     # 主题镜像（dark/light）：网页主题存 localStorage，桌面壳读不到——
     # 前端 apply() 每次 apply/toggle 都镜像一份到这里，关闭弹窗（独立
     # WinForms 窗）按它跟随主题。
@@ -53,6 +55,7 @@ class SettingsPayload(BaseModel):
     # 下载 100MB+ 属于「用户没同意就不该做」的事，必须显式开启
     update_notify: bool = True
     update_auto: bool = False
+    direct_notice_seen: bool = False
     theme: str = "dark"
 
 
@@ -104,6 +107,7 @@ async def get_settings() -> SettingsPayload:
     update_notified = await service.get_value("ui.update_notified", "")
     update_notify = await service.get_value("ui.update_notify", True)
     update_auto = await service.get_value("ui.update_auto", False)
+    direct_notice_seen = await service.get_value("ui.direct_notice_seen", False)
     theme = await service.get_value("ui.theme", "dark")
     return SettingsPayload(
         account={
@@ -117,6 +121,7 @@ async def get_settings() -> SettingsPayload:
         update_notified=str(update_notified or ""),
         update_notify=bool(update_notify),
         update_auto=bool(update_auto),
+        direct_notice_seen=bool(direct_notice_seen),
         theme=str(theme or "dark"),
     )
 
@@ -152,6 +157,9 @@ async def update_settings(payload: SettingsUpdate) -> SettingsPayload:
     if payload.update_auto is not None:
         await service.set_value("ui.update_auto", bool(payload.update_auto))
 
+    if payload.direct_notice_seen is not None:
+        await service.set_value("ui.direct_notice_seen", bool(payload.direct_notice_seen))
+
     if payload.theme is not None:
         # 主题镜像只认两值：异常值忽略（防脏数据把弹窗配色带歪）
         if payload.theme in ("dark", "light"):
@@ -171,8 +179,16 @@ async def _read_fetch_settings() -> FetchSettingsPayload:
         )
     except (TypeError, ValueError):
         pass
+    # 与 crawl.default_queue_specs 同一有效默认：直连形态下目录段默认不随
+    # 价格轮出网，未显式设置时开关如实显示「关」（默认 direct_only，
+    # 初次打开即直连）
+    catalog_default = (
+        False
+        if (await service.get_value("proxy.strategy", "direct_only")) == "direct_only"
+        else True
+    )
     payload.catalog_refresh = bool(
-        await service.get_value("crawl.catalog_refresh", True)
+        await service.get_value("crawl.catalog_refresh", catalog_default)
     )
     return payload
 
