@@ -1,22 +1,8 @@
 /* famWish 词条 —— 家庭组·愿望单页签（views/family/tabs/FamWish.vue）。
-
-   两处刻意的复用，改一条多处同步（同 zh-CN/bundles.ts 的 mps.* 约定）：
-   · famWish.tag.*   四个分类标签在**三个位置**是同一件事——筛选片（`HlChip`
-     shape="soft"）、KPI 标签（wl-kpi__lbl）、卡片标签（wl-tag）。共用一份，不各写一句。
-   · famWish.band.*  价格区间环图的图例。与 FamValue 的 famValue.band.* 是**同一套
-     分档**，两个模块的中文写法不同（≥¥200 / ¥200+，FamValue 还多一档「未定价」）——
-     **中文保持各自现状**，只要求**英文两侧逐字一致**（见 en/famWish.ts）。两个模块的 key
-     不能同名（词典展开后同名即重复 key，是 check-i18n 判据 ①），故各存一份。
-
-   常量表只存 key，不存译文：FILTERS / PRICE_BANDS 是模块级常量，存译文会把语言
-   冻在模块加载那一刻（冻结陷阱）。activeFilter 与 filtered 的比较用的也是 **key**
-   （'all' / 'owned' / …），不是中文串——只换标签不改比较，切语言就会丢选中态。
-
-   带 {占位符} 的词条不要在组件侧用 + 或模板字符串拼片段：「共 {n} 个」对
-   '{n} titles' 拼不出版行。两条分页词条带行内 <b>，组件侧 v-html 渲染
-   （同 bills.empty.desc / bundles.calc.excludeHint 的先例）——整句一条词条，
-   不按标记边界切碎。强调色留在 CSS：v-html 注入的节点拿不到 scoped 属性，
-   故 `.wl-pager` 用 `:deep(b)` 够进去。 */
+   复用：famWish.tag.* 四个分类标签同时用于筛选片 / KPI 标签 / 卡片标签；famWish.band.* 与 famValue.band.*
+   同一套分档，中文各保持现状、英文两侧逐字一致（两模块 key 不能同名，同名即 check-i18n 判据①）。
+   不变量：FILTERS / PRICE_BANDS 常量只存 key（存译文会把语言冻在模块加载时），比较也用 key 不用译文串；
+   带 {占位符} 的词条禁止组件侧拼片段；行内 <b> 整句进词条由组件侧 v-html 渲染，强调色留在 CSS。 */
 
 const famWish = {
   /* 分类标签（筛选片 / KPI 标签 / 卡片标签共用；「全部」复用 common.all） */

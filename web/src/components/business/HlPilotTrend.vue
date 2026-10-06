@@ -147,8 +147,8 @@ const ariaLabel = computed(() =>
 
 .ptrend__plot {
   position: relative;
-  height: 64px;
-  margin: 2px 5px 0 0;
+  height: 72px;
+  margin: 4px 6px 2px 0;
   touch-action: none;
 }
 
@@ -168,7 +168,7 @@ const ariaLabel = computed(() =>
 .ptrend__line {
   fill: none;
   stroke: var(--accent);
-  stroke-width: 1.6;
+  stroke-width: 1.8;
   stroke-linejoin: round;
 }
 
@@ -177,8 +177,8 @@ const ariaLabel = computed(() =>
   top: 0;
   bottom: 0;
   width: 1px;
-  background: var(--text-secondary);
-  opacity: 0.45;
+  background: var(--accent);
+  opacity: 0.6;
   pointer-events: none;
 }
 
@@ -190,16 +190,18 @@ const ariaLabel = computed(() =>
   background: var(--accent);
   border: 2px solid var(--bg-card);
   transform: translate(-50%, -50%);
+  box-shadow: 0 0 0 2px var(--accent-a20);
 }
 
 .ptrend__dot--low {
   background: var(--success);
+  box-shadow: 0 0 0 2px var(--success-a20);
 }
 
 .ptrend__axis {
   display: flex;
   justify-content: space-between;
   font-size: 10px;
-  color: var(--text-secondary);
+  color: var(--text-faint);
 }
 </style>

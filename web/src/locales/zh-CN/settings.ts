@@ -1,29 +1,8 @@
 /* settings 词条 —— 系统设置页（views/settings/Index.vue）。
-
-   分节 key（`section.*`）同时是**页内分节锚点的显示名**：对应卡片的
-   `data-section` 直接写这个 key（锚点与语言无关，切语言时 ProductTour 的
-   选择器不会断），HlSectionRail 读到后用 t() 显示。
-
-   ⚠️ `settings.section.steamAccount` 是**契约值**——ProductTour 的
-   `target: '[data-section="settings.section.steamAccount"]'` 与视图侧的
-   data-section 必须逐字一致，改名等于静默掐断产品引导的第一步。
-   另四条 section.* 无契约约束，但同样「一处定义两处消费」（卡片标题 +
-   锚点标签），改一条两处同步。
-
-   三处刻意的**整句化**（不是逐片段拼）：
-   · 绑定 / 备份 / 更新 / 解绑的结果提示都是一条带占位符的整句——中英
-     语序与量词不同（「已解绑 X」对 'Unbound X'、「共 N 份」对
-     '{n} backups'），拆成「前缀 + 值 + 后缀」拼不回去。
-   · Cookie 分步引导的第 2–4 步在原文里被 <kbd> / <code> / <b> 行内元素
-     切碎，这里**整步一条词条**，行内标签写在值里、由组件侧 v-html 渲染
-     （同 bundles.calc.excludeHint 的先例）。按元素边界切成片段的写法会
-     逼译文把被强调的词钉死在原位，英文拼出来是残句。词条是应用自有静态
-     文案（非用户输入），v-html 无注入面。
-   · 「当前账号同步时间 + 钱包轮转说明」原文是两个文本节点，合并成一条。
-
-   `update.*Post` 两条**带前导空格**（拼在链接节点之后：`发布页 手动下载。`），
-   同 bundles.gameTag.* 的写法，不是笔误：模板里的空白节点在 `</a>` 与
-   `{{ }}` 之间不会被保留，英文需要那个空格。 */
+   分节 key（section.*）同时是页内分节锚点的显示名：卡片 data-section 写该 key，HlSectionRail 读到后 t() 显示。
+   契约：settings.section.steamAccount 被 ProductTour 的 target 选择器逐字引用，改名等于静默掐断引导。
+   不变量：结果提示为参数化整句、Cookie 引导每步整条词条（行内 <kbd>/<code>/<b> 写在值里 v-html 渲染）；
+   update.*Post 两条带前导空格（模板空白节点在 </a> 与插值间不保留），不是笔误。 */
 
 const settings = {
   /* ── 分节锚点（data-section 属性值）+ 卡片标题 ── */

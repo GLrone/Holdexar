@@ -1,19 +1,9 @@
 /* famContrib 词条 —— 家庭组·贡献分布页签（views/family/tabs/FamContrib.vue）。
-
-   术语沿用 A / B 表（英文侧逐字对齐，见 en/famContrib.ts）：
-   · 贡献分布 → contribution split
-   · 独占 → Exclusive、N人共享 → Shared by {n}、档位/分层 → tier
-   · 入库 → acquisition / acquired、占比 → share
-   · 家庭库 → family library（与 shared library 不是一个集合）
-
-   三处刻意的写法：
-   · 档位标签（`tierLabel`）与档位提示（`tierTip`）分开成两组 key，而不是把
-     `tierLabel()` 的结果塞进提示的占位符——那等于拼接两段已翻译的文本，英文
-     语序拼不回来；
-   · 「N人共享」的 `{n}` 是**人数**（档位层数），提示里的 `{count}` 是**游戏数**，
-     两个占位符不可互换；
-   · 月份轴标签（原 `${dd.getMonth() + 1}月`）不是词条，走
-     `useLocaleFormat().month()`——中文 `1月`、英文 `Jan`。 */
+   术语沿用既有译法：贡献分布 → contribution split、独占 → Exclusive、N人共享 → Shared by {n}、
+   档位 → tier、入库 → acquisition、占比 → share、家庭库 → family library（与 shared library 不是一个集合）。
+   不变量：tierLabel 与 tierTip 分成两组 key（拼接两段已翻译文本英文语序拼不回来）；
+   「N人共享」的 {n} 是人数、提示里的 {count} 是游戏数，两占位符不可互换；
+   月份轴标签不进词条，走 useLocaleFormat().month()。 */
 const famContrib = {
   /* ── 空态 ── */
   'famContrib.empty.loading': '家庭库数据拉取中…',

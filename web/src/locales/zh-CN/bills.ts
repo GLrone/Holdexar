@@ -1,26 +1,8 @@
-/* bills 词条 —— 账单页，四个文件共用一个模块（views/bills/Index.vue +
-   LedgerTab.vue + CdkTab.vue + TopupTab.vue）。子区块用子命名空间区分：
-   bills.ledger.* / bills.cdk.* / bills.topup.*。
-
-   跨文件复用的三条（都在两个以上文件里同义同形，故提到模块顶层）：
-   · bills.fxMissing    —— 汇率缺失兜底（LedgerTab 明细行 + TopupTab 流水行）
-   · bills.year.all     —— 「全部年份」chip（Index 年份切换 + LedgerTab 年筛选）
-   · bills.currencyValue —— 「名称（代号）」币种写法（LedgerTab 明细 + TopupTab 币种卡）
-
-   带 {占位符} 的词条不要在组件侧用 + 或模板字符串拼中文片段：中英语序与量词
-   不同（「{count} 笔」对 '{count} transactions'），拼不出版行。金额本身在组件侧
-   用 useLocaleFormat() 格式化后作为参数传入，**词条里不放已格式化的数字串**。
-
-   三条词条带行内标记（<b> / <span class="neg"> / <br />），组件侧 v-html 渲染
-   （同 bundles.calc.excludeHint 的先例）——整句进词条，不按强调边界切碎：
-   · bills.empty.desc           空态说明两段（中间 <br /> 与原文同款）
-   · bills.ledger.year.sum / sumRefund   年汇总行（有无退款两个整句二选一）
-   · bills.topup.year.sum       充值年汇总行
-
-   图表：`bills.chart.*` 只有标题/描述/空态。echarts option 里两条 series.name
-   （当月净支出 / 累计净支出）**刻意未建词条**：该 option 属图表主题红线的
-   冻结区，只迁周边文案。注意 echarts legend 有注册，这两个名字确实会
-   显示在图例里——英文界面下仍会显示中文，是一个已知的、尚未处理的缺口。 */
+/* bills 词条 —— 账单页，四个文件共用一个模块（Index + LedgerTab + CdkTab + TopupTab）。
+   子区块用子命名空间 bills.ledger.* / bills.cdk.* / bills.topup.*；跨文件复用条目提到模块顶层。
+   不变量：带 {占位符} 的词条禁止组件侧拼中文片段；金额组件侧 useLocaleFormat() 格式化后作参数传入，
+   词条里不放已格式化数字串；整句含行内 <b>/<span>/<br> 时组件侧 v-html 渲染。
+   图表 series.name 刻意未建词条（图表主题冻结区），英文界面下图例仍显示中文——已知缺口。 */
 
 const bills = {
   /* ── 跨文件复用 ── */

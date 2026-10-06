@@ -1,22 +1,8 @@
 /* famLib 词条 —— 游戏库·家庭库页签（views/gamelib/tabs/FamilyLib.vue）。
-
-   术语对齐表（英文侧逐字对齐，见 en/famLib.ts）：
-   · 未收录 → Not listed（与 gameCard.cdk.notListed 同源）
-   · 独占 → Exclusive、多人共享 → Shared
-   · 最近游玩 → Last played、时长 → playtime
-   · 近30日活跃 → Acquired in last 30 days（它统计的是 timeAcquired，
-     名字里的「活跃」是误导，英文绝不能用 active）
-   · 独占贡献（全库口径）→ Exclusive titles（与 FamContrib 的「随范围
-     变化的独占贡献」是两个口径，差异体现在英文上，中文侧保持原样）
-
-   两处刻意的写法：
-   · 时长单位 `h` / `kh` **不在本模块**：它不是语言中立的（中文 `128h`、
-     英文 `128 hrs`），跨模块共用，落在 common.hours / common.hoursK。
-     原 `FamLib:80` 还手写了一个多一个空格的 `'k h'`，一并收敛到同一条。
-   · `famLib.pager.range` 的 `<b>` 写在值里、组件侧 v-html 渲染（同
-     rates.chart.tooltip / bills 的先例）。不按标记边界拆句子——拆了等于逼译文
-     把被强调的数字固定在某个位置。强调色留在 CSS：v-html 注入的节点拿不到
-     scoped 属性，故 `.wl-pager` 用 `:deep(b)` 够进去。 */
+   不变量：「近30日活跃」词条统计 timeAcquired，英文必须是 "Acquired in last 30 days"、禁用 active；
+   时长单位 h / kh 不在本模块（非语言中立），落 common.hours / common.hoursK；
+   famLib.pager.range 的 <b> 写在值里由组件侧 v-html 渲染，强调色留在 CSS；
+   术语（未收录 / 独占 / 多人共享等）英文对齐既有译法，跨模块不另起一套。 */
 
 const famLib = {
   /* ── 空态与引导 ── */

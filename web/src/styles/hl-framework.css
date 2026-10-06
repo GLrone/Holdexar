@@ -1,6 +1,6 @@
 /* ════════════════════════════════════════════════════════════════════
    Holdexar Component Framework — 生产标准层（L2 束口）
-   规范来源：web/public/component-framework.html（隔离的框架总览页，唯一真源）
+   规范来源：web/dev/component-framework.html（隔离的框架总览页，唯一真源）
    实现规则：
    1. 所有类名加 hl- 前缀 —— 与生产遗留全局类（.btn/.tag/.game-card 等）完全隔离；
       视图层禁止直接使用本文件类名，必须通过 components/ui/ 的 Hl* 组件。
@@ -74,7 +74,7 @@
 /* ══════════ 艺术按键 · 三种非纯色块设计 ══════════
    ※ 本段为「艺术常量白名单」：渐变/描边色为主题无关的品牌装饰色，
    是全项目唯一允许出现写死色值的组件层段落（tokens.css 除外）。
-   修改艺术配色请同步回写 web/public/component-framework.html。 */
+   修改艺术配色请同步回写 web/dev/component-framework.html。 */
 .hl-btn-art {
   display: inline-flex;
   align-items: center;

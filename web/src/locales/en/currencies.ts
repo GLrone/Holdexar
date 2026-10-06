@@ -1,13 +1,7 @@
-/* ════════════════════════════════════════════════════════════════════
-   English 词条 —— 币种名（39 条），与 `zh-CN/currencies.ts` 逐条对齐。
-
-   初值取自 `Intl.DisplayNames(['en-US'], { type: 'currency' })` 的输出
-   （39 个 code 全部被 Intl 认识，无一回退）。**此后以本表为准，不再回读 Intl**
-   ——词典的价值就在于它是人可以改的那一份；若哪天要改成 "RMB" 这类项目自己的
-   说法，改这里即可，不必去动 `api/currencies.ts`。
-
-   注意 CRC 的 "Costa Rican Colón" 带非 ASCII 的 ó，是 Intl 的正确拼法，勿"修正"。
-   ════════════════════════════════════════════════════════════════════ */
+/* English 词条 —— 币种名（39 条），与 zh-CN/currencies.ts 逐条对齐。
+   初值取自 Intl.DisplayNames(['en-US'], { type: 'currency' })。不变量：此后以本表为准、不再回读 Intl
+   （词典是人可以改的那一份；要改成项目自有说法直接改这里，不动 api/currencies.ts）；
+   CRC 的 "Costa Rican Colón" 带非 ASCII 的 ó，是正确拼法，勿「修正」。 */
 const currencies = {
   // ── 按 CC_LIST 首次出现顺序；末尾两条为服务端预留币种 ──
   'currencies.name.CNY': 'Chinese Yuan',

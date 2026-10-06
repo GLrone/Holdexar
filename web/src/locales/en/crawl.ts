@@ -1,18 +1,7 @@
-/* English 词典 · crawl（与 zh-CN/crawl.ts 同构，key 必须逐一对齐）。
-   对应源文件：views/crawl/Index.vue。
-
-   措辞对齐（这些词在别处已定，本页沿用）：
-   · Wishlist / Owned —— gameCard 与 pool 的既有译法（「愿望单」「已购」）；
-   · crawl / sync / bind —— dashboard 与 pool 的既有动词；
-   · sale pre-check —— about.source.price.desc 里对「打折预检」的既有说法；
-   · friend code —— pool.account.friendCode 的既有说法（本页「好友码」同义）。
-
-   汇总行（progress.meta / import.* 的计数 / jobs.statsText）是参数化整句，
-   段间用 · 与 / 分隔——分隔符留在词条内，不在组件侧拼。
-
-   ⚠️ 收藏列表导入的分节说明含两枚 <code>：写进词条值、组件侧 v-html 渲染。
-   曾切三段（descPrefix / descMid / descSuffix）并让 descMid 取 ` → `——那是
-   被切分逼出来的写法，读成转换关系，原意是嵌套；见 zh-CN/crawl.ts 的说明。 */
+/* English 词典 · crawl —— views/crawl/Index.vue（与 zh-CN/crawl.ts 同构，key 必须逐一对齐）。
+   措辞沿用既有译法：Wishlist / Owned / crawl / sync / bind / sale pre-check / friend code。
+   不变量：汇总行（progress.meta / import.* 计数 / jobs.statsText）为参数化整句，· 与 / 分隔符留在词条内；
+   含两枚 <code> 的分节说明写进词条值由组件侧 v-html 渲染，不按标记切分。 */
 
 import type { MessageKey } from '../zh-CN'
 
@@ -195,6 +184,7 @@ const crawl: Partial<Record<MessageKey, string>> = {
   'crawl.kind.popularnewBackfill': 'New releases backfill',
   'crawl.kind.specialsBackfill': 'Specials backfill',
   'crawl.kind.comingsoonBackfill': 'Coming soon backfill',
+  'crawl.kind.discounts': 'Discount queue',
 }
 
 export default crawl

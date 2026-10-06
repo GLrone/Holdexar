@@ -11,13 +11,13 @@ const shell = {
   'nav.gameDetail': '游戏详情',
 
   /* 侧边导航（App.vue navGroups）：核心组不带组名——首页 + 四个用户心智入口
-     （找游戏=发现 / 游戏库=拥有 / 我的关注=持续关注 / 价格提醒=主动通知）直接
+     （游戏商店=发现 / 游戏库=拥有 / 我的关注=持续关注 / 价格提醒=主动通知）直接
      置顶；「更多」收具体业务功能；「系统」收技术 / 维护入口（允许实现词）。
      只改用户面叫法，route / store / API 名一律不动 */
   'nav.group.more': '更多',
   'nav.group.system': '系统',
   'nav.dashboard': '仪表盘',
-  'nav.library': '找游戏',
+  'nav.library': '游戏商店',
   'nav.pilot': '领航台',
   'nav.gamelib': '游戏库',
   'nav.achievements': '成就',

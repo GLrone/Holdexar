@@ -1,31 +1,8 @@
 /* gameDetail 词条 —— 游戏详情页（views/game-detail/Index.vue）。
-
-   几条刻意的取舍，改之前先读：
-
-   · **分节锚点**（`gameDetail.section.*`）的 key 就是 `data-section` 的属性值本身，
-     HlSectionRail 读到后 t() 显示（锚点与语言无关，ProductTour 的选择器不会随切
-     语言断掉）。其中 priceDetail / trend 两条**同时是区块可见标题**——标题与锚点
-     是同一个字符串，共用一条（dashboard.section.* 同例，一处定义两处消费）。
-
-   · 本页与 PriceTrendDrawer / PriceTrendChart 共用同一批术语，下列词条是**同义镜像**，
-     两份英文必须逐字一致（check-i18n.mjs 判不出跨模块的同义分歧，靠人记）：
-       gameDetail.range.*        ←→ trendDrawer.range.*
-       gameDetail.event.*        ←→ trendDrawer.event.*
-       gameDetail.trend.lowest   ←→ trendDrawer.legend.lowest / trendChart.legend.lowest
-       gameDetail.trend.discount ←→ trendDrawer.price.discount
-       gameDetail.trend.noDiscount ←→ trendDrawer.price.noDiscount
-       gameDetail.trend.steamNow ←→ trendChart.legend.steam
-       gameDetail.trend.empty     ←→ trendChart.empty
-       gameDetail.trend.emptyRegion ←→ trendChart.empty（前半句换成本页的「该地区」）
-     按模块拆 key 是既定约定（各模块可独立改动），代价就是上面这张表要人记。
-
-   · `gameDetail.rating.positive` / `rating.reviews` / `price.save` / `price.col.*` /
-     `bundle.*` / `badge.hb` / `hl.*` / `pp.cut` / `region.cn` / `link.steamStore` /
-     `price.locked` / `price.lowestTag` / `removed.tag` / `removed.probing` 也与
-     gameCard 模块的同义词条对齐（措辞沿用已有译法，不另起一套）。
-
-   · 后端数据值（`detail.type` / `detail.chineseSupport` / 地区名与货币码）本身仍是
-     中文枚举，属数据层词汇；本模块只迁「标签」，值原样渲染。 */
+   分节锚点 gameDetail.section.* 的 key 即 data-section 属性值（锚点与语言无关，ProductTour 选择器不断）；
+   priceDetail / trend 两条同时是区块可见标题（一处定义两处消费）。
+   不变量：与 PriceTrendDrawer / PriceTrendChart 的同义镜像词条英文两侧须逐字一致（check-i18n 判不出跨模块同义分歧）；
+   后端数据值（type / chineseSupport / 地区名 / 货币码）原样渲染，本模块只迁标签。 */
 
 const gameDetail = {
   /* ── 分节锚点（data-section 属性值）+ 同名区块标题 ── */
@@ -35,7 +12,7 @@ const gameDetail = {
   'gameDetail.section.bundles': '关联捆绑包',
 
   /* ── 渐变头部 ── */
-  'gameDetail.header.back': '返回找游戏',
+  'gameDetail.header.back': '返回游戏商店',
   'gameDetail.header.developers': '开发：{names}',
   'gameDetail.header.publishers': '发行：{names}',
   'gameDetail.region.cn': '国区',

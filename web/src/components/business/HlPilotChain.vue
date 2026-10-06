@@ -1,12 +1,4 @@
 <script setup lang="ts">
-/**
- * 过程链折叠块：单轮回复的过程段收进一个链头一行摘要的折叠层，展开体内按
- * agent 循环步分阶段排列，每段依次是思考行、前言正文、工具步骤（无阶段记录
- * 的旧轮回落为单段形态）。开合规则状态驱动——运行中展开（秒表跳动），
- * 历史轮收起（链头即摘要），失败轮强制展开；用户手动开合后自动规则退位。
- * 链头时长取服务端整轮工时（elapsedSec），完成即冻结不再吃本地时钟。
- * 步骤文案由 `pilot.step.{label}` 词条渲染，工具机器名不出用户面。
- */
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 
 import type { PilotPhase, PilotStep } from '@/api/client'
@@ -17,18 +9,14 @@ import { fmtTokens } from '@/lib/pilotView'
 const props = withDefaults(
   defineProps<{
     steps: PilotStep[]
-    /** 按 agent 循环步分段的阶段记录（权威）；缺省时回落 think + steps 的单段形态 */
     phases?: PilotPhase[]
     think?: string
     thinkSec?: number | null
-    /** 整轮工时（秒，服务端下发；缺省不显示时长） */
     elapsedSec?: number | null
-    /** 记忆快照：本轮上下文占用 + 会话归档边界 + 缓存命中 */
     memory?: { tokens?: number | null; budget?: number | null; archived?: number | null; cached?: boolean } | null
     live?: boolean
-    /** 首个 delta 前的等待话术（live 时透传给思考行） */
     waitingText?: string
-    /** 失败/未完成轮：默认展开，完成后不自动收起 */
+    hidePhaseText?: boolean
     failed?: boolean
   }>(),
   {
@@ -39,13 +27,13 @@ const props = withDefaults(
     memory: null,
     live: false,
     waitingText: '',
+    hidePhaseText: false,
     failed: false,
   },
 )
 
 const { t } = useI18n()
 
-/** 渲染用阶段列表：无 phases（旧会话 / 快捷动作轮）时把 think + steps 折成单段。 */
 const viewPhases = computed<PilotPhase[]>(() => {
   if (props.phases.length) return props.phases
   if (props.think || props.steps.length || props.live) {
@@ -54,15 +42,12 @@ const viewPhases = computed<PilotPhase[]>(() => {
   return []
 })
 
-/** 当前阶段下标（流式期只有它展开思考体）；无阶段时为 -1 */
 const activeIndex = computed(() => (props.live && viewPhases.value.length ? viewPhases.value.length - 1 : -1))
 
-/** 已让位阶段的思考工时（秒）；无思考为 null（思考行不显示时长） */
 function phaseSec(p: PilotPhase): number | null {
   return p.think_ms ? Math.max(1, Math.round(p.think_ms / 1000)) : null
 }
 
-/** 本轮工具步骤总数（跨阶段求和；链头摘要口径） */
 const stepTotal = computed(() => viewPhases.value.reduce((n, p) => n + p.steps.length, 0))
 
 const open = ref(props.live || props.failed)
@@ -73,7 +58,6 @@ function toggle() {
   open.value = !open.value
 }
 
-/* 流式→完成边界自动收起（摘要已在链头），手动开合过或失败轮则不介入 */
 watch(
   () => props.live,
   (live, was) => {
@@ -81,7 +65,6 @@ watch(
   },
 )
 
-/* 运行秒表：仅 live 期间走表；完成态时长以服务端下发为准 */
 const liveSec = ref(0)
 let startedAt = 0
 let ticker: ReturnType<typeof setInterval> | null = null
@@ -120,7 +103,6 @@ const headLabel = computed(() => {
   return t('pilot.chain.plain')
 })
 
-/* 记忆快照一行：上下文占用 + 归档边界 + 缓存命中，全部缺省则整行不出 */
 const memoryText = computed(() => {
   const m = props.memory
   if (!m) return ''
@@ -131,20 +113,36 @@ const memoryText = computed(() => {
   return parts.join(' · ')
 })
 
-/** 步骤条目 → 用户语言一行：词条基础文案 + 最小插值（计数 / 对象名 / 模块名）。 */
+const _SLOW_STEP_MS = 3000
+
 function navModuleName(target: string): string {
   return t(`pilot.nav.${target}` as MessageKey)
 }
 
-/** 前言正文按纯文本展示（逐帧跑 markdown 代价过高），仅剥掉行内标记符，不露出源码。 */
 function plainInline(s: string): string {
   return s.replace(/\*\*([^*]+)\*\*/g, '$1').replace(/==([^=]+)==/g, '$1').replace(/`([^`]+)`/g, '$1')
+}
+
+/* 阶段正文展示值：剥标记并去首尾空白——模型常吐纯换行（如 '\n\n'），
+   pre-wrap 会把它如实渲染成整块空白，夹在思考行与工具行之间像断层 */
+function phasePre(p: PilotPhase): string {
+  return plainInline(p.text).trim()
 }
 
 function stepText(s: PilotStep): string {
   if (s.status === 'denied') return t('pilot.step.denied')
   const parts: string[] = [t(`pilot.step.${s.label}` as MessageKey)]
-  if (s.status === 'empty') {
+  if (s.status === 'running') {
+    void liveSec.value
+    const ms = s.elapsedMs ?? (s.startedAt ? Date.now() - s.startedAt : 0)
+    parts.push(t('pilot.step.running', { sec: Math.max(0, Math.round(ms / 1000)) }))
+    return parts.join(' · ')
+  }
+  if (s.status === 'timeout') {
+    parts.push(t('pilot.step.timeout'))
+  } else if (s.status === 'failed') {
+    parts.push(t('pilot.step.failed'))
+  } else if (s.status === 'empty') {
     parts.push(t('pilot.step.empty'))
   } else if (typeof s.data.count === 'number') {
     parts.push(t('pilot.step.hits', { count: s.data.count }))
@@ -153,6 +151,9 @@ function stepText(s: PilotStep): string {
   } else if (s.data.name) {
     parts.push(t('pilot.step.target', { name: s.data.name }))
   }
+  if (typeof s.elapsedMs === 'number' && s.elapsedMs >= _SLOW_STEP_MS) {
+    parts.push(t('pilot.step.duration', { sec: Math.round(s.elapsedMs / 1000) }))
+  }
   return parts.join(' · ')
 }
 </script>
@@ -160,10 +161,22 @@ function stepText(s: PilotStep): string {
 <template>
   <div class="pchain" :class="{ 'is-open': open, 'is-live': live }">
     <button type="button" class="pchain__head" @click="toggle">
-      <span class="pchain__icon" aria-hidden="true"></span>
+      <div class="pchain__indicator">
+        <svg v-if="live" class="pchain__live-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+        </svg>
+        <span v-else class="pchain__done-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="20 6 9 17 4 12" />
+          </svg>
+        </span>
+      </div>
       <span class="pchain__label" :class="{ 'is-shimmer': live }">{{ headLabel }}</span>
-      <span class="pchain__chevron" aria-hidden="true"></span>
+      <svg class="pchain__chevron" :class="{ 'is-open': open }" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <polyline points="6 9 12 15 18 9" />
+      </svg>
     </button>
+
     <div v-if="open" class="pchain__body">
       <div
         v-for="(p, pi) in viewPhases"
@@ -172,7 +185,7 @@ function stepText(s: PilotStep): string {
         class="pchain__phase"
       >
         <HlPilotThinking
-          v-if="p.thinking || pi === activeIndex"
+          v-if="p.thinking || (pi === activeIndex && !(hidePhaseText && phasePre(p)))"
           :text="p.thinking"
           :live="pi === activeIndex"
           :active="pi === activeIndex"
@@ -181,20 +194,43 @@ function stepText(s: PilotStep): string {
           :waiting-text="waitingText"
         />
         <p v-if="p.truncated" class="pchain__truncated">{{ t('pilot.think.truncated') }}</p>
-        <p v-if="p.text" class="pchain__pre">{{ plainInline(p.text) }}</p>
-        <div
-          v-for="(s, si) in p.steps"
-          :key="si"
-          class="pilot-step"
-          :class="`is-${s.status}`"
-        >
-          <span class="pilot-step__dot" aria-hidden="true"></span>
-          <span class="pilot-step__text">{{ stepText(s) }}</span>
+        <p v-if="phasePre(p) && !hidePhaseText" class="pchain__pre">{{ phasePre(p) }}</p>
+
+        <div class="pchain__steps-list">
+          <div
+            v-for="(s, si) in p.steps"
+            :key="si"
+            class="pilot-step"
+            :class="`is-${s.status}`"
+          >
+            <div class="pilot-step__icon-box">
+              <svg v-if="s.status === 'ok'" class="pilot-step__svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+              <svg v-else-if="s.status === 'running'" class="pilot-step__svg is-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true">
+                <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+              </svg>
+              <svg v-else-if="s.status === 'failed'" class="pilot-step__svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true">
+                <line x1="18" y1="6" x2="6" y2="18" />
+                <line x1="6" y1="6" x2="18" y2="18" />
+              </svg>
+              <svg v-else-if="s.status === 'denied'" class="pilot-step__svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+              </svg>
+              <span v-else class="pilot-step__dot-subtle"></span>
+            </div>
+            <span class="pilot-step__text">{{ stepText(s) }}</span>
+          </div>
         </div>
       </div>
+
       <div v-if="memoryText && !live" class="pchain__memory">
-        <span class="pilot-step__dot" aria-hidden="true"></span>
-        <span class="pilot-step__text">{{ memoryText }}</span>
+        <svg class="pchain__memory-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <ellipse cx="12" cy="5" rx="9" ry="3" />
+          <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3" />
+          <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" />
+        </svg>
+        <span class="pchain__memory-text">{{ memoryText }}</span>
       </div>
     </div>
   </div>
@@ -205,6 +241,7 @@ function stepText(s: PilotStep): string {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
+  align-self: stretch;
 }
 
 .pchain__head {
@@ -212,40 +249,76 @@ function stepText(s: PilotStep): string {
   align-items: center;
   gap: 8px;
   max-width: 100%;
-  padding: 2px 0;
-  border: none;
-  background: none;
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-soft);
+  background: var(--surface-panel);
   cursor: pointer;
   text-align: left;
+  transition: all var(--transition);
 }
 
-.pchain__icon {
-  flex-shrink: 0;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  border: 1.5px solid var(--text-faint);
+.pchain__head:hover {
+  background: var(--surface-chip);
+  border-color: var(--border-strong);
 }
 
-.pchain.is-live .pchain__icon {
-  border-color: var(--accent);
+.pchain.is-live .pchain__head {
+  border-color: var(--accent-a30);
+  background: var(--accent-a08);
 }
 
-.pchain__label {
-  flex-shrink: 0;
-  font-size: 12px;
-  font-weight: 500;
+.pchain__indicator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
   color: var(--text-muted);
 }
 
-/* 运行态流光：渐变裁切文字，替代旋转 loader（与思考行同语言） */
+.pchain.is-live .pchain__indicator {
+  color: var(--accent);
+}
+
+.pchain__live-spin {
+  width: 13px;
+  height: 13px;
+  animation: pchain-spin 1.2s linear infinite;
+}
+
+@keyframes pchain-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.pchain__done-icon {
+  width: 13px;
+  height: 13px;
+  color: var(--success);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.pchain__done-icon svg {
+  width: 12px;
+  height: 12px;
+}
+
+.pchain__label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
 .pchain__label.is-shimmer {
-  background: linear-gradient(90deg, var(--text-faint) 34%, var(--text-secondary) 50%, var(--text-faint) 66%);
+  background: linear-gradient(90deg, var(--text-muted) 30%, var(--accent) 50%, var(--text-muted) 70%);
   background-size: 300% 100%;
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  animation: pchain-sweep 4s linear infinite;
+  animation: pchain-sweep 3s linear infinite;
 }
 
 @keyframes pchain-sweep {
@@ -258,73 +331,54 @@ function stepText(s: PilotStep): string {
   .pchain__label.is-shimmer {
     animation: none;
     background: none;
-    color: var(--text-secondary);
+    color: var(--accent);
+  }
+  .pchain__live-spin {
+    animation: none;
   }
 }
 
 .pchain__chevron {
-  flex-shrink: 0;
-  width: 7px;
-  height: 7px;
-  border-right: 1.5px solid var(--text-faint);
-  border-bottom: 1.5px solid var(--text-faint);
-  transform: rotate(-45deg);
-  opacity: 0;
-  transition: transform 0.2s, opacity 0.2s;
+  width: 12px;
+  height: 12px;
+  color: var(--text-muted);
+  transition: transform var(--transition);
 }
 
-.pchain__head:hover .pchain__chevron,
-.pchain.is-open .pchain__chevron {
-  opacity: 1;
+.pchain__chevron.is-open {
+  transform: rotate(180deg);
 }
 
-.pchain.is-open .pchain__chevron {
-  transform: rotate(45deg) translate(-2px, -2px);
-}
-
-/* 链体：左导线串起思考 / 工具 / 记忆三类条目。
-   stretch 必须显式写——父级沿交叉轴 flex-start，不写就按内容收缩，
-   正文会被压成贴着最长行的窄条，面板右侧大片留白。 */
 .pchain__body {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
   align-self: stretch;
-  gap: 6px;
-  margin-top: 6px;
-  margin-left: 2px;
-  padding-left: 12px;
-  border-left: 1px solid var(--border-soft);
+  gap: 8px;
+  margin-top: 8px;
+  margin-left: 6px;
+  padding-left: 14px;
+  border-left: 2px solid var(--border-soft);
   max-width: 100%;
 }
 
-.pchain__memory {
-  display: flex;
-  align-items: center;
-  align-self: stretch;
-  gap: 8px;
-  font-size: 12px;
-  line-height: 1.5;
-  color: var(--text-secondary);
-  text-align: left;
-}
-
-/* 阶段块：一步的思考 / 前言 / 工具自成一组，步骤行按序排在其下 */
 .pchain__phase {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
   align-self: stretch;
-  gap: 6px;
+  gap: 8px;
   max-width: 100%;
 }
 
-/* 前言正文：该步正文随阶段就地展示，纯文本不跑 markdown（逐帧解析代价过高） */
 .pchain__pre {
   align-self: stretch;
   margin: 0;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-panel);
   font-size: 12px;
-  line-height: 1.7;
+  line-height: 1.6;
   color: var(--text-secondary);
   white-space: pre-wrap;
   word-break: break-word;
@@ -339,58 +393,92 @@ function stepText(s: PilotStep): string {
   text-align: left;
 }
 
+.pchain__steps-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-self: stretch;
+}
+
 .pilot-step {
   display: flex;
   align-items: center;
   gap: 8px;
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
   font-size: 12px;
-  line-height: 1.5;
+  line-height: 1.4;
   color: var(--text-secondary);
-  text-align: left;
+  background: var(--surface-panel);
+  border: 1px solid var(--border-soft);
+  align-self: flex-start;
+  max-width: 100%;
 }
 
-.pilot-step__dot {
+.pilot-step__icon-box {
   flex: none;
+  width: 14px;
+  height: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.pilot-step__svg {
   width: 12px;
-  text-align: center;
+  height: 12px;
 }
 
-.pilot-step__dot::before {
-  content: '';
-  display: inline-block;
-  width: 7px;
-  height: 7px;
+.pilot-step.is-ok .pilot-step__icon-box {
+  color: var(--success);
+}
+
+.pilot-step.is-running .pilot-step__icon-box {
+  color: var(--accent);
+}
+
+.pilot-step.is-failed .pilot-step__icon-box {
+  color: var(--danger);
+}
+
+.pilot-step.is-denied .pilot-step__icon-box {
+  color: var(--warning);
+}
+
+.pilot-step__svg.is-spin {
+  animation: pchain-spin 1s linear infinite;
+}
+
+.pilot-step__dot-subtle {
+  width: 5px;
+  height: 5px;
   border-radius: 50%;
-  background: var(--success);
-  vertical-align: middle;
+  background: var(--text-faint);
 }
 
-.pilot-step.is-empty .pilot-step__dot::before {
-  background: var(--text-secondary);
-  opacity: 0.45;
+.pilot-step__text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.pilot-step.is-denied .pilot-step__dot::before {
-  background: var(--warning);
+.pchain__memory {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-chip);
+  border: 1px solid var(--border-soft);
+  margin-top: 2px;
 }
 
-.pilot-step.is-running .pilot-step__dot::before {
-  background: var(--accent);
-  animation: pchain-dot-pulse calc(var(--duration-4) * var(--motion-scale)) ease-in-out infinite alternate;
-}
-
-@keyframes pchain-dot-pulse {
-  from {
-    opacity: 1;
-  }
-  to {
-    opacity: 0.35;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .pilot-step.is-running .pilot-step__dot::before {
-    animation: none;
-  }
+.pchain__memory-icon {
+  width: 13px;
+  height: 13px;
+  color: var(--text-faint);
+  flex-shrink: 0;
 }
 </style>

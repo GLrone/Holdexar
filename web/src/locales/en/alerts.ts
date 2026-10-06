@@ -1,11 +1,6 @@
-/* English 词典 · alerts（与 zh-CN/alerts.ts 同构，key 必须逐一对齐）。
-   对应源文件：views/alerts/Index.vue。
-
-   分节条目（`alerts.section.*`）既是 data-section 锚点也是区块标题；
-   `alerts.section.rules` 被 ProductTour 的选择器引用，勿改名。
-
-   `{host}` / `{email}` 是视图传进来的**示例值**（词典内不放任何地址字面量），
-   `{masked}` 是服务端返回的掩码串。 */
+/* English 词典 · alerts —— views/alerts/Index.vue（与 zh-CN/alerts.ts 同构，key 必须逐一对齐）。
+   分节条目（alerts.section.*）既是 data-section 锚点也是区块标题；契约：alerts.section.rules 被 ProductTour 选择器引用，勿改名。
+   不变量：{host} / {email} 是视图传入的示例值、{masked} 是服务端掩码串，词典内不放任何地址字面量。 */
 
 import type { MessageKey } from '../zh-CN'
 

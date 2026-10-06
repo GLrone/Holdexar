@@ -1,6 +1,6 @@
 /* ════════════════════════════════════════════════════════════════════
    English 词典 · productTour（与 zh-CN/productTour.ts 同构，key 必须逐一对齐）。
-   文案口径见 zh 侧文件头：只教用户主链（找游戏 → 看价格 → 关注 → 自动更新），
+   文案口径见 zh 侧文件头：只教用户主链（Store → 看价格 → 关注 → 自动更新），
    价格来源与更新周期讲清，账号 = 可选增强（单独一步），代理与任务页不进导览。
    ════════════════════════════════════════════════════════════════════ */
 
@@ -16,8 +16,8 @@ const productTour: Partial<Record<MessageKey, string>> = {
   'productTour.intro.p3':
     'Skip tour any time — and reopen it later from the {app} logo on the About page.',
 
-  /* Step 1 · Find Games (spotlight on the search box) */
-  'productTour.stepFind.title': 'Step 1 · Find Games',
+  /* Step 1 · Store (spotlight on the search box) */
+  'productTour.stepFind.title': 'Step 1 · Store',
   'productTour.stepFind.p1':
     'Type a name in the search box, or use the filters next to it — one card per game.',
   'productTour.stepFind.p2':
@@ -36,7 +36,7 @@ const productTour: Partial<Record<MessageKey, string>> = {
   /* Step 3 · Following (continuous updates) */
   'productTour.stepFollow.title': 'Step 3 · Following',
   'productTour.stepFollow.p1':
-    'To have the system keep watching a game, follow it here — star its card on Find Games, or add it on this page.',
+    'To have the system keep watching a game, follow it here — star its card on Store, or add it on this page.',
   'productTour.stepFollow.p2':
     'The follow list always shows each game’s latest price and update time, and you can unfollow any time.',
   'productTour.stepFollow.emph': 'Once you follow a game, the system keeps its prices updated in the background.',
@@ -55,7 +55,7 @@ const productTour: Partial<Record<MessageKey, string>> = {
   /* Closing card (no spotlight target) */
   'productTour.done.title': 'Done — from here the system runs itself',
   'productTour.done.emph':
-    'Find games → compare prices → follow → automatic updates — the rest is automatic.',
+    'Store → compare prices → follow → automatic updates — the rest is automatic.',
   'productTour.done.p1':
     'Followed games refresh every 6 hours; to get notified when a price hits, set a condition on the Price Alerts page.',
   'productTour.done.p2': 'Everything else can wait — explore it when you need it.',

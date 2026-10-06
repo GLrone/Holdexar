@@ -59,7 +59,7 @@ const hasApiKey = ref(false)
 
 /* ── 领航员（pilot）：多供应商绑定（左导航 + 右详情；密钥密文落库） ── */
 const pilotEnabled = ref(false)
-const pilotCapText = ref('500000')
+const pilotCapText = ref('0')
 const pilotUsage = ref({ inp: 0, out: 0, calls: 0, total: 0 })
 const pilotModel = ref('')
 const pilotActiveId = ref('')
@@ -1542,8 +1542,9 @@ onUnmounted(stopLoginPolling)
           <div class="pilot-form__row">
             <span class="pilot-form__label">{{ t('pilot.settings.monthly_cap') }}</span>
             <div class="pilot-form__field pilot-form__field--inline">
-              <HlInput v-model="pilotCapText" style="max-width: 180px" />
+              <HlInput v-model="pilotCapText" style="max-width: 180px" placeholder="0" />
               <span class="pilot-form__hint">
+                {{ t('pilot.settings.cap_hint') }}
                 {{ t('pilot.settings.usage', { total: pilotUsage.total, inp: pilotUsage.inp, out: pilotUsage.out, calls: pilotUsage.calls }) }}
               </span>
               <HlButton size="sm" :loading="globalSaving" @click="savePilotGlobal">

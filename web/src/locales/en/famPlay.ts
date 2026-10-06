@@ -1,15 +1,8 @@
-/* English 词典 · famPlay（与 zh-CN/famPlay.ts 同构，key 必须逐一对齐）。
-   对应源文件：views/gamelib/tabs/GlPlay.vue（moved from the family page）。
-
-   措辞对齐（这些词的译法在别处已定，本页沿用）：
-   · Total playtime —— D2（与 famLib.kpi.playtime 同一个数，逐字一致）；
-   · X per member —— D3，`famPlay.kpi.avgLabel` 补全被平均的量词
-     （"Playtime per member (2 weeks)"，不是 "avg 2-week"）；
-   · playtime / Last played / Member —— B 表与 A 表；
-   · Play activity —— B 表「游玩动态」，刷新按钮据此写成 Refresh play activity。
-
-   时长单位（`h` / `kh`）不在这里：它不是语言中立的，跨模块共用，
-   落在 common.hours（`{h} hrs`）与 common.hoursK（`{h}k hrs`）。 */
+/* English 词典 · famPlay —— views/gamelib/tabs/GlPlay.vue（与 zh-CN/famPlay.ts 同构，key 必须逐一对齐）。
+   措辞沿用既有译法：Total playtime（与 famLib.kpi.playtime 同一个数、逐字一致）、
+   "Playtime per member (2 weeks)"（补全被平均的量词，不是 avg）、playtime / Last played / Member、
+   Play activity（刷新按钮据此写 Refresh play activity）。
+   不变量：时长单位 h / kh 落 common.hours / common.hoursK，不在本模块。 */
 
 import type { MessageKey } from '../zh-CN'
 

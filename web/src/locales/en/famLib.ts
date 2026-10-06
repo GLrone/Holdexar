@@ -1,19 +1,9 @@
-/* English 词典 · famLib（与 zh-CN/famLib.ts 同构，key 必须逐一对齐）。
-   对应源文件：views/gamelib/tabs/FamilyLib.vue（自 family 页迁入）。
-
-   措辞对齐（这些词的译法在别处已定，本页沿用）：
-   · Not listed —— A 表（gameCard.cdk.notListed 的既有英文）；
-   · Exclusive / Shared —— B 表「独占」「多人共享」；
-   · Last played / playtime —— B 表与 D5（Steam 官方字段措辞）；
-   · Family library —— A 表「家庭库」；它与 shared library 不是同一集合，
-     故本页提到「共享清单」时写 shared library，不与 family library 混用；
-   · Acquired in last 30 days —— D6：该 KPI 数的是 timeAcquired（入库）而非游玩，
-     中文名「近30日活跃」是误导，英文按真实口径写，不用 active；
-   · Exclusive titles —— D4：本页是全库独占数，与 FamContrib 的筛选口径区分；
-   · Total playtime —— D2：三处中文指同一个数，英文一律这一种写法。
-
-   时长单位（`h` / `kh`）不在这里：它不是语言中立的，跨模块共用，
-   落在 common.hours（`{h} hrs`）与 common.hoursK（`{h}k hrs`）。 */
+/* English 词典 · famLib —— views/gamelib/tabs/FamilyLib.vue（与 zh-CN/famLib.ts 同构，key 必须逐一对齐）。
+   措辞沿用既有译法：Not listed / Exclusive / Shared / Last played / playtime / Family library；
+   共享清单写 shared library，与 family library 刻意区分（两个集合）；
+   "Acquired in last 30 days" 按真实口径（timeAcquired 入库数，不用 active）；
+   Exclusive titles 为全库口径，与 FamContrib 的筛选口径英文上必须可区分。
+   不变量：时长单位 h / kh 落 common.hours / common.hoursK，不在本模块。 */
 
 import type { MessageKey } from '../zh-CN'
 

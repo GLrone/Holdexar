@@ -1,17 +1,7 @@
-/* ════════════════════════════════════════════════════════════════════
-   English 词典汇总。与 `zh-CN/index.ts` 同构，新增模块同样在这里展开一行。
-
-   类型刻意声明为 `Partial<Record<MessageKey, string>>`：**key 受中文词典约束**
-   （拼错的 key、中文删了但英文没删的孤儿词条都会在 tsc 阶段报错），而值可缺。
-
-   ⚠️ 「值可缺」是**运行时兜底**，不是工作流：构造上是 Partial（缺译不至于崩），
-   但 `scripts/check-i18n.mjs` 把「缺译」判为 error 并挂在 `npm run build` 与
-   pre-commit 上——英文界面下回退成中文是用户可见的缺陷，不该进产物。
-   所以类型写成 Partial 是为了**不崩**，门禁判 error 是为了**译全**，两者不矛盾。
-
-   另注：tsc 目前跑不起来（tsconfig 的 baseUrl 弃用告警），`vite build` 也不做类型
-   检查，故「类型会报错」这条实际由 check-i18n.mjs 兜住，别只依赖编辑器。
-   ════════════════════════════════════════════════════════════════════ */
+/* English 词典汇总。与 zh-CN/index.ts 同构，新增模块同样在这里展开一行。
+   类型声明为 Partial<Record<MessageKey, string>>：key 受中文词典约束（拼错的 key 与孤儿词条在 tsc 报错），值可缺。
+   注意：缺译由 check-i18n.mjs 判 error（挂 npm run build 与 pre-commit）——运行时回退中文是用户可见缺陷，不是可用状态；
+   vite build 不做类型检查，词典问题以 check-i18n 为准。 */
 
 import type { MessageKey } from '../zh-CN'
 import common from './common'

@@ -1,23 +1,7 @@
-/* ════════════════════════════════════════════════════════════════════
-   币种名词条（39 条）。
-
-   这些名字必须住在这里：`api/**` 不在 CJK 规则的词典豁免目录内，
-   中文字面量留在 api/ 会让该文件一直命中 no-hardcoded-cjk。放在词典里
-   同时拿到三件事：
-     ① 落进 CJK 门禁的豁免目录（`src/locales/**` 是中文的正确落点）；
-     ② 受 check-i18n 的"中英逐条对齐"约束；
-     ③ 译者可以直接改。
-
-   ⚠️ **zh 侧取值以本表为准**，且**不要改成从 Intl.DisplayNames 现取**：
-   zh 侧有 2 条与本项目既有说法不一致 —— IDR 表为「印尼盾」而 Intl 为
-   「印度尼西亚卢比」、ILS 表为「以色列谢克尔」而 Intl 为「以色列新谢克尔」。
-   既有的短名写法（印尼 / 阿联酋 / 韩国 / 英国 …）与 `CC_LIST` 的命名政策一致。
-
-   对齐单一来源：`server/app/crawler/config.py` 的 CC_LIST（41 区 → 37 种唯一
-   货币）；末尾 TRY / ARS 是服务端永久保留币种（当前无区服使用）。
-   新增区服货币时：CC_LIST 加行 → `api/currencies.ts` 的 CURRENCIES 加一条
-   （code / cc）→ 本表加 `currencies.name.<CODE>` 的中英各一条。
-   ════════════════════════════════════════════════════════════════════ */
+/* 币种名词条（39 条）。zh 侧取值以本表为准，不要改成从 Intl.DisplayNames 现取
+   （IDR / ILS 两条与 Intl 输出不同，既有短名与 CC_LIST 命名政策一致）。
+   对齐单一来源：server/app/crawler/config.py 的 CC_LIST；末尾 TRY / ARS 为服务端永久保留币种。
+   新增区服货币：CC_LIST 加行 → api/currencies.ts 加一条 → 本表加中英各一条。 */
 const currencies = {
   // ── 按 CC_LIST 首次出现顺序；末尾两条为服务端预留币种 ──
   'currencies.name.CNY': '人民币',

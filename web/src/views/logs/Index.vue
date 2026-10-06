@@ -140,12 +140,21 @@ onBeforeUnmount(() => {
   source = null
 })
 
-/* ── 行结构着色：`时间 [级别] logger: 消息` ── */
+/* ── 行结构着色：`时间 [结果词] 模块中文名 · 人话主句 │ 键=值` ──
+   行首只印一个结果词（后端 HumanFormatter），级别信息由这个词承载；
+   分色与计数只有这一条依据，故词表必须与后端 core/logging.py 的 TAG_SEVERITY 对齐。 */
+
+const SEVERITY: Record<string, 'error' | 'warning'> = {
+  失败: 'error',
+  严重: 'error',
+  注意: 'warning',
+  降级: 'warning',
+  未完成: 'warning',
+}
 
 function levelOf(line: string): 'error' | 'warning' | 'info' {
-  if (line.includes('[ERROR]') || line.includes('[CRITICAL]')) return 'error'
-  if (line.includes('[WARNING]')) return 'warning'
-  return 'info'
+  const head = line.match(/^\S+\s+\[([^\]]+)\]/)?.[1]
+  return (head && SEVERITY[head]) || 'info'
 }
 
 const levelCount = computed(() => {

@@ -1,10 +1,6 @@
-/* English 词典 · toolbox（与 zh-CN/toolbox.ts 同构，key 必须逐一对齐）。
-
-   两处刻意的写法：
-   · `bill.stats.txUnit` 留空 —— 中文「12 笔」的量词在英文里没有对等物，
-     数字旁的独立小字号 span 渲染成空串，等于英文只显示数字（No unused word）。
-   · `bill.trend.monthLabel` 的英文只有月份数字 —— 柱下标在中文是「3月」，
-     英文侧靠同一区块的标题（Spending, last 8 months）表明这是月度视图。 */
+/* English 词典 · toolbox —— views/toolbox/Index.vue（与 zh-CN/toolbox.ts 同构，key 必须逐一对齐）。
+   不变量：bill.stats.txUnit 留空（中文「笔」的量词英文无对等物，渲染成空串只显示数字）；
+   bill.trend.monthLabel 只有月份数字（月度语义由同区块标题 "Spending, last 8 months" 表明）。 */
 
 import type { MessageKey } from '../zh-CN'
 

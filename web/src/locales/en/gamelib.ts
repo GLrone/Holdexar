@@ -1,13 +1,7 @@
-/* gamelib strings — Game Library page (views/gamelib/Index.vue and its tabs).
-   Tabs: per-account owned games / insights / family library (moved from the
-   family page; its strings still live in the famLib.* module) / play activity
-   (also moved from the family page; strings live in the famPlay.* module).
-
-   Terminology follows the established A / B tables:
-   · 入库 (when this system first saw a game) → acquired / added
-   · co-owned = shared between tracked accounts — deliberately distinct from
-     shared in the famLib module (family-group sharing semantics)
-   · library value = sum of current CN prices, same source as famLib.kpi.value */
+/* English 词典 · gamelib —— views/gamelib/Index.vue and its tabs: per-account owned games / insights /
+   family library（词条在 famLib.*） / play activity（词条在 famPlay.*）。与 zh-CN/gamelib.ts 同构，key 必须逐一对齐。
+   措辞沿用既有译法：acquired / added（首次见到该游戏的时间）；co-owned 与 famLib 的 shared 刻意分词（两个口径）；
+   library value = CN 现价合计，与 famLib.kpi.value 同源。 */
 
 const gamelib = {
   /* ── Tabs & section anchors (data-section holds the key; HlSectionRail t()s at render) ── */

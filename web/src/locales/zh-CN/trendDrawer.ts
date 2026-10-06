@@ -1,12 +1,7 @@
 /* trendDrawer 词条 —— 价格走势抽屉（components/business/PriceTrendDrawer.vue）。
-
-   一处刻意的复用，改一条三处同步：版本标签「标准版」/「Gold 版」在版本下拉、
-   详情页价格区块与「全部版本」chips 里是同一件事（共用 version.standard /
-   version.gold）——标准版横跨的多个 sub 代际由列表侧合并成一条，不再另立词条。
-   · 「历史最低」同时是图例项与统计格标签，共用 legend.lowest。
-
-   文案里带 {占位符} 的（header.subtitle / price.discount）**不要**在组件侧
-   用 + 拼中文片段：中英语序不同，拼不出版行。 */
+   复用：version.standard / version.gold 在版本下拉、详情页价格区块与「全部版本」chips 三处同一件事；
+   legend.lowest 同时是图例项与统计格标签（与 trendChart 的同名词条英文须一致）。
+   不变量：带 {占位符} 的词条禁止组件侧拼中文片段（中英语序不同）。 */
 
 const trendDrawer = {
   /* 时间范围 chips（值是天数，显示文本走这里） */

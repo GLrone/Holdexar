@@ -1,30 +1,8 @@
 /* crawl 词条 —— 任务中心页（views/crawl/Index.vue）。
-
-   分节锚点 `crawl.section.*` 是**共用**词条：既是 data-section 的属性值
-   （HlSectionRail 读到后 t() 显示成悬停气泡与 aria-label），又是区块可见
-   标题本身——本页这两处逐字相同，故不另立重复条目。
-   ⚠️ `crawl.section.bulkImport` 的字符串被 ProductTour 的 target 选择器引用
-   （`[data-section="crawl.section.bulkImport"]`），属**契约**：改名或换词会
-   让引导静默选不中，改之前先与 ProductTour 侧同步。
-
-   几处刻意的复用（改一条多处同步）：
-   · `crawl.action.*`（清空 / 保存）在批量导入、收藏导入、已购地区三处
-     是同一个动作，共用一组；
-   · `crawl.import.importing / detected / detectedInvalid` 在两个导入框
-     （批量导入 / 收藏列表导入）逐字相同，共用；
-   · 「全部」（区服列的空值）不另立——复用 common.all；
-   · 「导入中…」的三种写法合并成一条：中文语境下三处完全一致。
-
-   汇总行一律是**参数化整句**，不在组件侧拼片段：进度 meta、导入结果 parts
-   （新导入 / 已在库 / 未识别 / 无效 / 首爬已启动）、任务统计行——中英量词与
-   语序不同，拆成「标签 + 值」多条再拼拼不回去。parts 之间的 ` · ` 分隔符
-   是中性符号，留在组件侧（与 dashboard 的 proxy 副注同理）。
-
-   ⚠️ 收藏列表导入的分节说明含两枚 <code>（FAVORITES_RESPONSE / favorites）：
-   本项目的 t() 没有标记插值（没有 <i18n-t> 之类），但**不必**因此切分句子——
-   <code> 直接写进词条值、组件侧 v-html 渲染即可（同 bundles.calc.excludeHint）。
-   曾按标记边界切三段，理由「两枚标识符在中英里的落点相同」不成立：切分把标识符
-   钉死在固定位置，英文只能拼成 "FAVORITES_RESPONSE → favorites"，读成转换关系。 */
+   分节锚点 crawl.section.* 一条定义两处消费（data-section 属性值 + 可见区块标题）。
+   契约：crawl.section.bulkImport 的字符串被 ProductTour 的 target 选择器引用，改名前与 ProductTour 侧同步。
+   复用：crawl.action.* 三处同一动作；crawl.import.importing/detected/detectedInvalid 两个导入框共用；「全部」复用 common.all。
+   不变量：汇总行与导入结果一律参数化整句、组件侧不拼片段（中英语序不同）；行内 <code>/<b> 写进词条值由组件侧 v-html 渲染。 */
 
 const crawl = {
   /* ── 分节锚点（data-section 属性值 + 可见区块标题共用）──
@@ -206,6 +184,7 @@ const crawl = {
   'crawl.kind.popularnewBackfill': '热门新品回补',
   'crawl.kind.specialsBackfill': '特惠榜回补',
   'crawl.kind.comingsoonBackfill': '即将推出回补',
+  'crawl.kind.discounts': '折扣队列',
 } as const
 
 export default crawl
