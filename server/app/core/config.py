@@ -67,15 +67,17 @@ class Settings(BaseSettings):
 
     @property
     def seed_dir(self) -> Path:
-        """资产种子目录（holdexar_seed.db）：开发态 assets/seed；打包后随资源目录。"""
+        """资产种子目录（holdexar_seed.db）：数据目录优先（按需下载落点），
+        开发态回落 assets/seed，打包后回落随包资源目录。"""
+        candidates = [self.data_dir / "seed"]
         if getattr(sys, "frozen", False):
             meipass = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
-            candidates = [
+            candidates += [
                 meipass / "seed",
                 Path(sys.executable).resolve().parent / "seed",
             ]
         else:
-            candidates = [PROJECT_ROOT / "assets" / "seed"]
+            candidates += [PROJECT_ROOT / "assets" / "seed"]
         for candidate in candidates:
             if (candidate / f"{APP_SLUG}_seed.db").is_file():
                 return candidate

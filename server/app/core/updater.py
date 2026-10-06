@@ -44,6 +44,7 @@ from app.core.app_info import (
     SWAP_FAILED_FLAG,
 )
 from app.core.config import get_settings
+from app.core.logging import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +126,12 @@ async def _fetch_manifest() -> dict | None:
                 last_err = RuntimeError("清单缺 version 字段")
             except Exception as e:  # noqa: BLE001 —— 换下一镜像
                 last_err = e
-    logger.info("[更新] 清单不可用（%s），回落 GitHub API", last_err)
+    log_event(
+        logger,
+        "更新清单不可用，回落 GitHub API",
+        tag="降级",
+        detail={"原因": str(last_err)},
+    )
     return None
 
 
@@ -185,7 +191,12 @@ async def _check_update_via_api() -> dict:
         resp.raise_for_status()
         release = resp.json()
     except Exception as e:  # noqa: BLE001 —— 网络失败降级为「暂不可查」
-        logger.info("[更新] 检查失败（网络）：%s", e)
+        log_event(
+            logger,
+            "检查更新失败（网络不可达）",
+            tag="降级",
+            detail={"原因": str(e)},
+        )
         return {"available": False, "reason": "network", "error": str(e)[:200]}
 
     tag = str(release.get("tag_name") or "")
@@ -415,10 +426,14 @@ async def download_update(
             except _Cancelled:
                 raise
             except Exception as e:  # noqa: BLE001 —— 换下一通道
-                logger.info(
-                    "[更新] 通道不可用（%s）：%s",
-                    probe["label"],
-                    e or type(e).__name__,  # httpx 超时的 str() 常为空，退回异常类型
+                log_event(
+                    logger,
+                    "更新下载通道不可用，换下一通道",
+                    detail={
+                        "通道": probe["label"],
+                        # httpx 超时的 str() 常为空，退回异常类型
+                        "原因": str(e) or type(e).__name__,
+                    },
                 )
                 last_err = e
         else:
@@ -456,7 +471,12 @@ async def download_update(
         (staging / HANDOFF_UNSUPPORTED_MARK).unlink(missing_ok=True)
         (staging.parent / SWAP_FAILED_FLAG).unlink(missing_ok=True)
         _PROGRESS.update({"ok": True, "running": False, "phase": "done", "percent": 100})
-        logger.info("[更新] %s 已暂存至 %s（重启后换装）", tag, staging)
+        log_event(
+            logger,
+            "更新包已下载暂存，重启后换装",
+            tag="成功",
+            detail={"版本": tag, "暂存目录": str(staging)},
+        )
         return {"ok": True, "staging": str(staging), "tag": tag}
     except _Cancelled:
         part.unlink(missing_ok=True)
@@ -501,7 +521,12 @@ async def _resolve_asset_url(tag: str, asset_name: str | None) -> str:
                 if asset:
                     return str(asset["browser_download_url"])
     except Exception as e:  # noqa: BLE001 —— 反查失败按猜名继续（探测阶段会给出结论）
-        logger.info("[更新] 资产列表反查失败（%s），按命名规则直连", e)
+        log_event(
+            logger,
+            "更新资产列表反查失败，按命名规则直连",
+            tag="降级",
+            detail={"原因": str(e)},
+        )
     return guessed
 
 

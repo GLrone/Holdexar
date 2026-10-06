@@ -25,6 +25,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import get_settings
+from .logging import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -87,8 +88,15 @@ async def create_backup(label: str | None = None, manual: bool = False) -> dict:
 
     _rotate_old_backups()
 
-    logger.info(
-        "[备份] 完成：%s（%.1f MB，games=%d）", dest.name, dest.stat().st_size / 1024 / 1024, games
+    log_event(
+        logger,
+        "数据库备份完成",
+        tag="成功",
+        detail={
+            "文件名": dest.name,
+            "体积MB": round(dest.stat().st_size / 1024 / 1024, 1),
+            "游戏数": games,
+        },
     )
     return {
         "path": str(dest),
@@ -199,13 +207,13 @@ def _rotate_old_backups() -> None:
         size = p.stat().st_size
         if kept >= BACKUP_MIN_KEEP and (kept >= BACKUP_KEEP or total + size > cap):
             p.unlink(missing_ok=True)
-            logger.info("[备份] 轮转清理：%s", p.name)
+            log_event(logger, "清理超量的自动备份归档", detail={"文件名": p.name})
             continue
         kept += 1
         total += size
     for old in manual[1:]:
         old.unlink(missing_ok=True)
-        logger.info("[备份] 手动备份轮转（仅保留最新一份）：%s", old.name)
+        log_event(logger, "手动备份仅保留最新一份，清理旧档", detail={"文件名": old.name})
 
 
 # ─── 恢复（三段式，防误恢复伤生产库）──────────────────────────
@@ -267,11 +275,15 @@ async def restore_backup(name: str) -> dict:
         stop_scheduler()
         active = crawl_service._active
         if active is not None and not active.task.done():
-            logger.info("[恢复] 等待进行中的爬取任务结束…")
+            log_event(logger, "数据库恢复前等待进行中的爬取任务结束")
             try:
                 await asyncio.wait_for(asyncio.shield(active.task), timeout=60)
             except asyncio.TimeoutError:
-                logger.warning("[恢复] 爬取任务 60s 未结束，继续恢复（任务将被中断）")
+                log_event(
+                    logger,
+                    "爬取任务 60 秒未结束，继续恢复，该任务将被中断",
+                    level=logging.WARNING,
+                )
         # 调度器停令已下（shutdown wait=False），给在途 job 一点落地时间，
         # 避免未归还连接导致 dispose 后仍持有文件句柄
         await asyncio.sleep(2)
@@ -294,7 +306,7 @@ async def restore_backup(name: str) -> dict:
         engine_ok = await _rebuild_engine()
         if not engine_ok:
             # 回滚：把回滚档换回去
-            logger.error("[恢复] 引擎重建失败，回滚原库")
+            log_event(logger, "恢复后数据库引擎重建失败，回滚原库", level=logging.ERROR)
             os.replace(rollback, src)
             src.with_name(src.name + "-wal").unlink(missing_ok=True)
             src.with_name(src.name + "-shm").unlink(missing_ok=True)
@@ -303,10 +315,15 @@ async def restore_backup(name: str) -> dict:
                 raise RuntimeError("恢复失败且回滚失败——请手动检查 data 目录")
         else:
             rollback.unlink(missing_ok=True)  # 成功后清理回滚档
-            logger.info("[恢复] 已从备份 %s 恢复（原库回滚档已清理）", name)
+            log_event(
+                logger,
+                "已从备份恢复数据库，原库回滚档已清理",
+                tag="成功",
+                detail={"备份文件名": name},
+            )
 
         start_scheduler()
-        logger.info("[恢复] 调度器已重启")
+        log_event(logger, "数据库恢复完成，调度器已重启")
         return {"restored": True, "name": name, "rolledBack": False}
     finally:
         lock_path.unlink(missing_ok=True)
@@ -349,5 +366,5 @@ async def _rebuild_engine() -> bool:
             await session.execute(text("SELECT 1"))
         return True
     except Exception:  # noqa: BLE001
-        logger.exception("[恢复] 引擎探活失败")
+        log_event(logger, "数据库引擎探活失败", level=logging.ERROR, exc_info=True)
         return False

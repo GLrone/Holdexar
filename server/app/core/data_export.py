@@ -26,6 +26,7 @@ from app.core import keyring, secretbox
 from app.core.app_info import APP_SLUG
 from app.core.config import get_settings
 from app.core.database import get_session_factory
+from app.core.logging import log_event
 from app.core.secretbox import SecretBoxError
 
 logger = logging.getLogger(__name__)
@@ -124,7 +125,13 @@ def _decrypt_or_raw(token, purpose: str) -> str:
     try:
         return secretbox.decrypt_secret(str(value), purpose)
     except SecretBoxError:
-        logger.warning("[导出] 凭据无法解密，按密文原样导出（purpose=%s）", purpose)
+        log_event(
+            logger,
+            "凭据无法解密，按密文原样导出",
+            tag="降级",
+            detail={"用途": purpose},
+            level=logging.WARNING,
+        )
         return str(value)
 
 
@@ -134,7 +141,13 @@ async def _dump_table(session, table: str) -> list[dict]:
             await session.execute(text(f'SELECT * FROM "{table}"'))
         ).mappings().all()
     except Exception:  # noqa: BLE001 —— 表缺失（版本差异）跳过
-        logger.debug("[导出] 表不存在，跳过：%s", table)
+        log_event(
+            logger,
+            "导出时表不存在，已跳过",
+            tag="跳过",
+            detail={"表名": table},
+            level=logging.DEBUG,
+        )
         return []
     return [dict(r) for r in rows]
 
@@ -252,8 +265,16 @@ async def create_export(password: str) -> dict:
         out_path.chmod(0o600)
 
     size = out_path.stat().st_size
-    logger.info("[导出] 加密导出完成：%s（%.1f KB，%d 张表）",
-                name, size / 1024, len(payload["counts"]))
+    log_event(
+        logger,
+        "加密导出已完成并落盘",
+        tag="成功",
+        detail={
+            "文件名": name,
+            "大小": f"{size / 1024:.1f} KB",
+            "表数量": len(payload["counts"]),
+        },
+    )
     return {
         "path": str(out_path),
         "name": name,

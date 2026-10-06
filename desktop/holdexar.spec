@@ -4,7 +4,6 @@
 打包链：scripts/build_release.py（npm build → 本 spec → 产物消毒 → zip）。
 datas 布局与 app/core/config.py 的 sys.frozen 分支对齐：
   web/         ← web/dist        （web_dist_dir 命中 _MEIPASS/web）
-  seed/        ← assets/seed     （seed_dir 命中 _MEIPASS/seed）
   clash/       ← assets/clash    （clash_dir 命中 _MEIPASS/clash；mihomo 内核 +
                                   GeoIP 数据 + 上游许可原文，随包分发）
   app.ico      ← _MEIPASS 根     （desktop/main.py frozen icon 分支）
@@ -52,7 +51,7 @@ a = Analysis(
     binaries=[],
     datas=[
         (os.path.join(ROOT, "web", "dist"), "web"),
-        (os.path.join(ROOT, "assets", "seed"), "seed"),
+        # 种子不随包（按需下载落 data/seed，见 core/seed_fetch.py）；
         # 内核随包分发：mihomo 与 GeoIP 数据齐备是发布前提，由
         # build_release.ensure_clash_assets() 在打包前校验（缺一即中止）
         (os.path.join(ROOT, "assets", "clash"), "clash"),

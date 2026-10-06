@@ -1,9 +1,11 @@
-"""资产种子获取：从 GitHub Release 资产下载 holdexar_seed.db 到 assets/seed/。
+"""资产种子获取：从 GitHub Release 资产下载 holdexar_seed.db.gz 到 assets/seed/。
 
 种子是大体积、每次发布重导都会变的二进制，不入 git，走 Release 资产
-（发布包内置一份 + 资产独立一份）；源码 clone 用户由 run.py 首次启动时
-调用本脚本自动补齐。内容 = 公共数据快照：历史汇率档案 + games 人工策划列，
-结构上不含任何用户凭据（白名单导出，见 scripts/export_seed.py）。
+（gzip 形态，与应用首启按需下载 core/seed_fetch.py 同一资产）；源码 clone
+用户由 run.py 首次启动时调用本脚本自动补齐。内容 = 公共数据快照：games
+人工策划列 + 预设池 + 目录/现价 + 玩家标签（不含汇率与价格历史——汇率由
+应用内 Provider 现抓回填，价格历史走 R2 云端分包按款并入），结构上不含
+任何用户凭据（白名单导出，见 scripts/export_seed.py）。
 
 用法（源码运行）：
     python scripts/fetch_seed.py            # 缺则下载；已有且有效则跳过
@@ -13,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import sqlite3
 import sys
 import urllib.error
@@ -26,7 +29,7 @@ from app.core.app_info import GITHUB_REPO  # noqa: E402
 
 SEED_DIR = ROOT / "assets" / "seed"
 SEED_DB = SEED_DIR / "holdexar_seed.db"
-ASSET_NAME = "holdexar_seed.db"
+ASSET_NAME = "holdexar_seed.db.gz"
 
 # 通道链：先直连，再走国内镜像（GitHub Release 资产直连在国内基本不可用）。
 # 与 app/core/updater.py 的镜像链同源，改动请两边对齐。
@@ -45,7 +48,7 @@ def asset_url(mirror: str = "") -> str:
 
 
 def seed_ok(path: Path) -> tuple[bool, str]:
-    """种子有效性：能只读打开 + 有 seed_meta + 汇率档案非空。
+    """种子有效性：能只读打开 + 有 seed_meta.version + 有数据表。
 
     坏种子等同无种子（后端 read_seed_meta 会静默忽略），此处提前拦下，
     避免把半截下载文件留在磁盘上冒充可用种子。
@@ -56,17 +59,22 @@ def seed_ok(path: Path) -> tuple[bool, str]:
         con = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
         try:
             meta = dict(con.execute("SELECT key, value FROM seed_meta").fetchall())
-            rows = con.execute("SELECT COUNT(*) FROM fx_rate_history").fetchone()[0]
+            tables = {
+                row[0]
+                for row in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
         finally:
             con.close()
     except Exception as e:  # noqa: BLE001 —— 任何异常都算坏档
         return False, f"读取失败：{e}"
-    if rows <= 0:
-        return False, "汇率档案为空"
-    desc = f"version={meta.get('version', '?')} 汇率档案 {rows} 行"
-    if meta.get("rows_history"):
-        desc += f" / 价格历史 {meta['rows_history']} 行"
-    return True, desc
+    if not meta.get("version"):
+        return False, "缺少 seed_meta.version"
+    data_tables = tables & {"games_curated", "games_catalog", "preset_games", "game_tags"}
+    if not data_tables:
+        return False, "没有任何数据表"
+    return True, f"version={meta['version']} 表 {','.join(sorted(data_tables))}"
 
 
 def _download(url: str, dest: Path) -> None:
@@ -88,6 +96,7 @@ def fetch(force: bool = False) -> int:
             return 0
 
     SEED_DIR.mkdir(parents=True, exist_ok=True)
+    gz_tmp = SEED_DIR / "holdexar_seed.db.gz.part"
     tmp = SEED_DB.with_suffix(".part")
     last_err = ""
     for mirror in _MIRRORS:
@@ -95,8 +104,12 @@ def fetch(force: bool = False) -> int:
         label = mirror or "直连"
         print(f"[种子] 下载（{label}）…")
         try:
+            gz_tmp.unlink(missing_ok=True)
             tmp.unlink(missing_ok=True)
-            _download(url, tmp)
+            _download(url, gz_tmp)
+            with gzip.open(gz_tmp, "rb") as fin, tmp.open("wb") as fout:
+                while chunk := fin.read(1 << 20):
+                    fout.write(chunk)
             ok, detail = seed_ok(tmp)
             if not ok:
                 last_err = f"{label}：下载内容无效（{detail}）"
@@ -105,16 +118,16 @@ def fetch(force: bool = False) -> int:
             size_mb = SEED_DB.stat().st_size / 1048576
             print(f"[种子] 完成：{SEED_DB}（{size_mb:.1f} MB，{detail}）")
             return 0
-        except (urllib.error.URLError, OSError, TimeoutError) as e:
+        except (urllib.error.URLError, OSError, TimeoutError, gzip.BadGzipFile) as e:
             last_err = f"{label}：{e}"
             continue
 
+    gz_tmp.unlink(missing_ok=True)
     tmp.unlink(missing_ok=True)
     print(
         f"[种子] 获取失败（{last_err}）。\n"
-        f"       汇率历史档案暂缺，应用其余功能不受影响；联网后可重跑本脚本，"
-        f"或手动取一份放到 {SEED_DB}\n"
-        f"       （发布包内的 Holdexar/_internal/seed/{ASSET_NAME} 即同一文件，可直接拷用）"
+        f"       目录/现价种子暂缺，应用其余功能不受影响（价格历史走云端分包按款并入）；"
+        f"联网后可重跑本脚本，或手动解压 Release 资产 {ASSET_NAME} 放到 {SEED_DB}"
     )
     return 1
 

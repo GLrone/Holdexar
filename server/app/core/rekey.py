@@ -19,6 +19,7 @@ import secrets
 
 from app.core import keyring, secretbox
 from app.core.database import WritePriority, get_session_factory, write_gate
+from app.core.logging import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -81,10 +82,16 @@ async def reencrypt_all(old_master: bytes, new_master: bytes) -> dict:
 
         await session.commit()
 
-    logger.info(
-        "[换钥] 完成：账号 Cookie %d / 设置凭据 %d / 订阅 %d / 快照 %d",
-        counts["accountCookies"], counts["settingSecrets"],
-        counts["subscriptions"], counts["snapshots"],
+    log_event(
+        logger,
+        "全库密钥换装完成",
+        tag="成功",
+        detail={
+            "账号Cookie": counts["accountCookies"],
+            "设置凭据": counts["settingSecrets"],
+            "订阅": counts["subscriptions"],
+            "快照": counts["snapshots"],
+        },
     )
     return counts
 
@@ -122,7 +129,7 @@ async def switch_mode(
         keyring.remove_record(data_dir)
         keyring.reset_state()
         secretbox.clear_key_cache()
-        logger.info("[换钥] 保护已关闭（回到机器绑定）")
+        log_event(logger, "密钥保护已关闭，回到机器绑定模式")
         return {"mode": mode, "counts": counts}
 
     new_master = secrets.token_bytes(32)
@@ -140,11 +147,21 @@ async def switch_mode(
     except Exception:
         keyring.restore_record(data_dir, old_record)
         secretbox.clear_key_cache()
-        logger.exception("[换钥] 失败，密钥文件已回滚")
+        log_event(
+            logger,
+            "密钥换装失败，密钥文件已回滚",
+            level=logging.ERROR,
+            exc_info=True,
+        )
         raise
 
     if mode == keyring.MODE_PASSPHRASE:
         keyring.load_unlocked_key(new_master)  # 刚设的口令即当前会话口令
     secretbox.clear_key_cache()
-    logger.info("[换钥] 保护已启用：%s", _MODE_LABEL.get(mode, mode))
+    log_event(
+        logger,
+        "密钥保护已启用",
+        tag="成功",
+        detail={"保护方式": _MODE_LABEL.get(mode, mode)},
+    )
     return {"mode": mode, "counts": counts}

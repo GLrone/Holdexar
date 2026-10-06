@@ -14,6 +14,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -139,7 +140,7 @@ class _Sink(logging.Handler):
     def __init__(self) -> None:
         super().__init__()
         self.lines: list[str] = []
-        self.setFormatter(logging.Formatter(app_logging._FMT))
+        self.setFormatter(app_logging.HumanFormatter(datefmt="%H:%M:%S"))
         self.addFilter(app_logging.RedactFilter())
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -262,6 +263,13 @@ def test_setup_logging_silences_httpx(tmp_path):
         assert root.level == logging.INFO  # 应用自身仍是 INFO
 
 
+def test_setup_logging_silences_apscheduler(tmp_path):
+    """调度心跳（每 job 两行 INFO）占全量日志约一半、零业务信息，必须降级。"""
+    with installed_logging(tmp_path) as root:
+        for name in ("apscheduler.executors.default", "apscheduler.scheduler"):
+            assert logging.getLogger(name).level >= logging.WARNING
+
+
 def test_setup_logging_attaches_redact_filter_to_every_handler(tmp_path):
     """三道 handler（控制台/文件/环形缓冲）都必须挂上过滤器——漏一个就是一条外泄路径。"""
     with installed_logging(tmp_path) as root:
@@ -283,3 +291,126 @@ def test_ring_buffer_holds_scrubbed_lines(tmp_path):
         tail = app_logging.ring_log_handler.snapshot(10)
         assert tail, "环形缓冲未收到日志"
         assert all(FAKE_SESSION not in line for line in tail), tail
+
+
+# ── HumanFormatter：人话渲染 ────────────────────────────────
+# 验收线：日志页每一行都要能回答「谁在做什么、结果如何」。判据是行里不许留下
+# 点分模块路径与裸状态枚举，主句在前、细节在 `│` 之后。
+
+
+def _record(level: int, message: str, name: str = "app.core.scheduler", **extra):
+    record = logging.LogRecord(name, level, __file__, 1, message, (), None)
+    for key, value in extra.items():
+        setattr(record, key, value)
+    return record
+
+
+def _human():
+    return app_logging.HumanFormatter(datefmt="%H:%M:%S")
+
+
+@pytest.mark.parametrize(
+    ("level", "expected"),
+    [
+        (logging.DEBUG, "[调试]"),
+        (logging.INFO, "[信息]"),
+        (logging.WARNING, "[注意]"),
+        (logging.ERROR, "[失败]"),
+        (logging.CRITICAL, "[严重]"),
+    ],
+)
+def test_human_formatter_result_tag_follows_level(level, expected):
+    assert expected in _human().format(_record(level, "占位"))
+
+
+def test_human_formatter_explicit_tag_wins():
+    """事件语义比级别精确（跳过 ≠ 信息），调用方 tag= 必须覆盖级别兜底。"""
+    line = _human().format(_record(logging.INFO, "本轮没有待补的价格缺口", hl_tag="跳过"))
+    assert "[跳过]" in line
+    assert "[信息]" not in line
+
+
+def test_human_formatter_renders_module_label_not_dotted_path():
+    line = _human().format(_record(logging.INFO, "补探完成", name="app.domains.proxypool.health"))
+    assert "代理池·健康检查" in line
+    assert "app.domains.proxypool.health" not in line
+
+
+def test_module_label_falls_back_for_unregistered_module():
+    """未登记的模块也必须翻成人话，点分路径不许漏给用户。"""
+    assert app_logging.module_label("app.domains.monitoring.service") == "业务·monitoring"
+    assert app_logging.module_label("app.crawler.some_new_probe") == "爬取·some_new_probe"
+
+
+def test_human_formatter_appends_detail_tail():
+    line = _human().format(_record(logging.INFO, "补探 6 个掉线节点", hl_detail={"探测": 6, "恢复": 0}))
+    assert line.endswith("│ 探测=6 恢复=0")
+
+
+def test_human_formatter_redacts_detail_values():
+    """细节尾是第二条外泄路径：RedactFilter 只看主句，订阅链接正是从 detail 漏出去的。"""
+    line = _human().format(
+        _record(logging.INFO, "订阅已刷新", hl_detail={"节点": f"{PROXY_SCHEME}uuid-11112222@example.invalid:443"})
+    )
+    assert "uuid-11112222" not in line
+    assert "example.invalid" not in line
+
+
+def test_human_formatter_keeps_traceback_below_the_line():
+    """异常栈要跟在人话行下方，且不能被行结构吞掉。"""
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        record = _record(logging.ERROR, "应用启动失败")
+        record.exc_info = sys.exc_info()
+    first, _, rest = _human().format(record).partition("\n")
+    assert re.fullmatch(r"\d{2}:\d{2}:\d{2} \[失败\] 定时任务 · 应用启动失败", first), first
+    assert "Traceback (most recent call last)" in rest
+    assert "ValueError: boom" in rest
+
+
+def test_log_event_writes_human_line(root_logging):
+    root, sinks = root_logging
+    sink = _capture(root, sinks)
+    app_logging.log_event(
+        logging.getLogger("app.core.scheduler"),
+        "本轮没有待补的价格缺口，跳过补抓",
+        tag="跳过",
+        detail={"环节": "补抓", "原因": "无缺失"},
+    )
+    assert len(sink.lines) == 1
+    assert "[跳过]" in sink.lines[0]
+    assert "定时任务 · 本轮没有待补的价格缺口，跳过补抓" in sink.lines[0]
+    assert sink.lines[0].endswith("│ 环节=补抓 原因=无缺失")
+
+
+def test_every_logging_module_has_a_human_label():
+    """新增日志模块漏登记中文名，点分路径就会直接漏给用户——用源码扫描守住。"""
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+    missing = []
+    for path in app_dir.rglob("*.py"):
+        if "log_event(" not in path.read_text(encoding="utf-8"):
+            continue
+        parts = list(path.relative_to(app_dir.parent).with_suffix("").parts)
+        if parts[-1] == "__init__":
+            parts.pop()
+        module = ".".join(parts)
+        if module not in app_logging._MODULE_LABELS:
+            missing.append(module)
+    assert not missing, f"以下日志模块未登记中文名（会漏点分路径给用户）：{missing}"
+
+
+def test_result_tag_vocabulary_is_closed():
+    """`tag=` 是闭集：级别兜底词必须在表内，否则行首会印出前端不认识的结果词。"""
+    for word in app_logging._RESULT_BY_LEVEL.values():
+        assert word in app_logging.TAG_SEVERITY, f"{word} 不在结果词表内"
+
+
+def test_every_used_tag_is_in_the_vocabulary():
+    """源码里出现的每个 tag= 都必须在词表内——否则前端分色与计数会漏掉它。"""
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+    used: set[str] = set()
+    for path in app_dir.rglob("*.py"):
+        used.update(re.findall(r'tag="([^"]+)"', path.read_text(encoding="utf-8")))
+    unknown = sorted(used - set(app_logging.TAG_SEVERITY))
+    assert not unknown, f"以下结果词未登记（前端分色会漏）：{unknown}"

@@ -172,3 +172,31 @@ async def test_diagnostics_reports_owner_and_metrics():
     s.release()
     d2 = s.diagnostics()
     assert not d2["busy"] and d2["owner_label"] is None
+
+
+@pytest.mark.asyncio
+async def test_gate_autolabels_unlabeled_caller():
+    """未显式标注的闸自动取调用栈归属（auto:文件:行号）。
+
+    owner_label=None 的观测盲区曾让 135-233s 级持闸无法点名——任何巨型
+    持闸都必须能回答「是谁」。
+    """
+    from app.core.database import write_gate, write_scheduler_diagnostics
+
+    async with write_gate(WritePriority.BACKGROUND):
+        snap = write_scheduler_diagnostics()
+        assert snap["busy"]
+        assert snap["owner_label"].startswith("auto:"), (
+            f"未标注闸应自动归属调用点，实际 {snap['owner_label']}"
+        )
+        assert "test_core_write_scheduler" in snap["owner_label"]
+    assert write_scheduler_diagnostics()["owner_label"] is None
+
+
+@pytest.mark.asyncio
+async def test_gate_keeps_explicit_label():
+    """显式 label 优先于自动归属。"""
+    from app.core.database import write_gate, write_scheduler_diagnostics
+
+    async with write_gate(WritePriority.BACKGROUND, label="price_batch"):
+        assert write_scheduler_diagnostics()["owner_label"] == "price_batch"

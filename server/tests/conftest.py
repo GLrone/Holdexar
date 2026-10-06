@@ -115,6 +115,23 @@ def _db_caches_fresh_before_each(_sanitize_db_lru_caches):
 
 
 @pytest.fixture(autouse=True)
+def _reset_crawl_control_globals():
+    """爬取控制面的进程级全局（占用持有者 / 活动任务 / 链级停止位 / 主轮
+    busy 标志）逐用例复位：它们不随事件循环销毁，跨文件泄漏会让后续文件
+    的启动类用例撞上幽灵占用。"""
+    yield
+    from app.crawler import occupancy as occupancy_mod
+    from app.domains.crawl import service as crawl_service
+    from app.core import scheduler as sched_mod
+
+    occupancy_mod.end_crawl()
+    crawl_service._active = None
+    if crawl_service._chain_stop is not None:
+        crawl_service.unregister_chain_stop(crawl_service._chain_stop)
+    sched_mod._price_cycle_busy = False
+
+
+@pytest.fixture(autouse=True)
 def _isolate_data_dir(request, _db_caches_fresh_before_each):
     """默认把数据目录隔离进一次性临时目录：任何漏桩的域模块落库都落进
     空临时库（表不存在即响亮报错），「测试写生产库」从结构上不可能，

@@ -14,10 +14,49 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app.core.external_time import local_next_grid, probe_next_grid
 from app.core.database import WritePriority, get_session_factory, write_gate
+from app.core.logging import log_event
 
 logger = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
+
+_BOARD_LABELS = {
+    "topsellers": "热销榜",
+    "popularnew": "热门新品",
+    "comingsoon": "即将推出",
+    "specials": "特惠榜",
+}
+_WALLET_REASON_LABELS = {
+    "frozen": "凭据已失效",
+    "backoff": "已退避重试",
+    "no_cookie": "未绑定 Cookie",
+}
+_TRIAGE_ACTION_LABELS = {
+    "none": "无需处理",
+    "bootstrapped": "已装配运行时",
+    "unavailable": "运行时不可用",
+    "rebuild_requested": "已请求重建",
+}
+_TIME_SOURCE_LABELS = {
+    "timeapi.io": "在线时间源",
+    "zoneinfo": "本地时区库",
+}
+
+
+def _board_label(board_key: str) -> str:
+    return _BOARD_LABELS.get(board_key, board_key)
+
+
+def _wallet_reason_label(reason: str) -> str:
+    return _WALLET_REASON_LABELS.get(reason, reason)
+
+
+def _triage_action_label(action: str) -> str:
+    return _TRIAGE_ACTION_LABELS.get(action, action)
+
+
+def _time_source_label(source: str) -> str:
+    return _TIME_SOURCE_LABELS.get(source, source)
 
 
 async def _job_achievements_sync() -> None:
@@ -29,12 +68,26 @@ async def _job_achievements_sync() -> None:
     try:
         steamid, creds = await achievements_service.resolve_credentials()
         if not steamid or not creds:
-            logger.info("[定时] 成就同步跳过：未绑定账号或无可用凭证")
+            log_event(
+                logger,
+                "成就快照同步跳过：未绑定 Steam 账号或凭据不可用",
+                tag="跳过",
+                detail={"原因": "无可用账号或凭据"},
+            )
             return
         snap = await achievements_service.start_sync()
-        logger.info("[定时] 成就同步已发起（running=%s）", snap.get("running"))
+        log_event(
+            logger,
+            "成就快照同步已发起",
+            detail={"同步中": snap.get("running")},
+        )
     except Exception:  # noqa: BLE001 —— 已在进行中/通道失败不反复打扰
-        logger.info("[定时] 成就同步未发起（占用或通道不可用）")
+        log_event(
+            logger,
+            "成就快照同步本轮未发起：已有同步在进行或数据通道不可用",
+            tag="跳过",
+            detail={"原因": "占用中或通道不可用"},
+        )
 
 
 async def _job_wishlist_sync() -> None:
@@ -54,22 +107,40 @@ async def _job_wishlist_sync() -> None:
                 account["steamid"], auto_crawl=auto_crawl
             )
             if result.get("ownedError"):
-                logger.warning(
-                    "[定时] 账户同步 %s：新增 %d / 活跃 %d / 已购拉取失败（%s）",
-                    account["steamid"], result["added"], result["active"],
-                    result["ownedError"],
+                log_event(
+                    logger,
+                    "Steam 账号愿望单同步完成，但已购清单拉取失败",
+                    level=logging.WARNING,
+                    detail={
+                        "账号": account["steamid"],
+                        "新增": result["added"],
+                        "活跃": result["active"],
+                        "失败原因": result["ownedError"],
+                    },
                 )
             else:
-                logger.info(
-                    "[定时] 账户同步 %s：新增 %d / 活跃 %d / 已购 %d（通道 %s）",
-                    account["steamid"], result["added"], result["active"],
-                    result.get("ownedCount", 0), result.get("ownedSource") or "-",
+                log_event(
+                    logger,
+                    "Steam 账号愿望单同步完成",
+                    detail={
+                        "账号": account["steamid"],
+                        "新增": result["added"],
+                        "活跃": result["active"],
+                        "已购": result.get("ownedCount", 0),
+                        "数据通道": result.get("ownedSource") or "未知",
+                    },
                 )
             # 占用漏爬的新增（sync_account crawlTriggered=False 且有 newAppids）
             if auto_crawl and result.get("crawlTriggered") is False and result.get("newAppids"):
                 pending_new.extend(result["newAppids"])
         except Exception:  # noqa: BLE001
-            logger.exception("[定时] 账户同步失败: %s", account["steamid"])
+            log_event(
+                logger,
+                "Steam 账号愿望单同步失败",
+                level=logging.ERROR,
+                detail={"账号": account["steamid"]},
+                exc_info=True,
+            )
 
     # 收尾补爬：本轮同步中因任务占用未首爬的新增条目，定向小批补一次
     # （同批去重；仍在占用则 run_sequential 内部跳过，下轮 15min 同步兜底）
@@ -82,9 +153,18 @@ async def _job_wishlist_sync() -> None:
                 [{"scope": "appids", "appids": uniq, "kind": "wishlist_sync"}],
             )
             if results:
-                logger.info("[定时] 账户同步收尾补爬 %d 个新增", len(uniq))
+                log_event(
+                    logger,
+                    "账户同步收尾，补抓本轮新增条目",
+                    detail={"新增条目数": len(uniq)},
+                )
         except Exception:  # noqa: BLE001
-            logger.exception("[定时] 账户同步收尾补爬失败")
+            log_event(
+                logger,
+                "账户同步收尾的新增条目补抓失败",
+                level=logging.ERROR,
+                exc_info=True,
+            )
 
     # 未爬新增回补：同步入库了但从未获得过价格数据（绑定后进程重启中断、
     # 任务占用漏爬后 15min 内被再次跳过等），会留下
@@ -105,14 +185,25 @@ async def _job_wishlist_sync() -> None:
                     }],
                 )
                 if results:
-                    logger.info("[定时] 未爬新增回补 %d 个（配额帽 %d）",
-                                len(appids), _WISH_UNCRAWLED_BATCH)
+                    log_event(
+                        logger,
+                        "对从未取到价格的监控条目回补首抓",
+                        detail={
+                            "回补条目数": len(appids),
+                            "单轮上限": _WISH_UNCRAWLED_BATCH,
+                        },
+                    )
                     # 爬完仍无 games 行的条目（全球不可见/预取全空）写一笔
                     # missing 尝试痕迹，防止下轮回补对同一批无限重扫——
                     # 之后由 missing 账本通道按自己的节奏重试。
                     await _stamp_uncrawled_missing(appids)
         except Exception:  # noqa: BLE001
-            logger.exception("[定时] 未爬新增回补失败")
+            log_event(
+                logger,
+                "从未取到价格的监控条目回补失败",
+                level=logging.ERROR,
+                exc_info=True,
+            )
 
 
 # 未爬新增回补单轮配额帽：首绑大愿望单（几百款）一次全爬会长时间占住
@@ -207,7 +298,12 @@ async def _stamp_uncrawled_missing(appids: list[int]) -> int:
         if todo:
             await session.commit()
     if wrote:
-        logger.info("[定时] 未爬回补后仍无数据：%d 个记 missing（转补抓通道）", wrote)
+        log_event(
+            logger,
+            "回补后仍取不到价格，已标记为缺失数据并转入补抓通道",
+            tag="未完成",
+            detail={"条目数": wrote},
+        )
     return wrote
 
 
@@ -237,18 +333,27 @@ async def _reanchor_price_refresh(reason: str) -> None:
         hours = await price_refresh_interval_hours()
         nxt, hour, is_dst, source = await probe_next_grid(timedelta(hours=hours))
         scheduler.modify_job("price_refresh", next_run_time=nxt)
-        logger.info(
-            "[调度] price_refresh 重锚（%s）→ %s 锚点 %02d:00 %s 网格（步长 %dh，DST=%s，源=%s）",
-            reason,
-            nxt.strftime("%m-%d %H:%M"),
-            hour,
-            "/".join(f"{(hour + hours * i) % 24:02d}" for i in range(4)),
-            hours,
-            is_dst,
-            source,
+        log_event(
+            logger,
+            "价格刷新已重新对齐网格，下一轮按新时刻触发",
+            detail={
+                "原因": reason,
+                "下一轮": nxt.strftime("%m-%d %H:%M"),
+                "锚点": f"{hour:02d}:00",
+                "网格": "/".join(f"{(hour + hours * i) % 24:02d}" for i in range(4)),
+                "步长": f"{hours}小时",
+                "夏令时": "是" if is_dst else "否",
+                "时间源": _time_source_label(source),
+            },
         )
     except Exception:  # noqa: BLE001
-        logger.exception("[调度] price_refresh 重锚失败（%s）——保留现有排程", reason)
+        log_event(
+            logger,
+            "价格刷新重新对齐网格失败，保留原排程",
+            level=logging.ERROR,
+            detail={"原因": reason},
+            exc_info=True,
+        )
 
 
 # ── 5min 失败记录修复线程 ──
@@ -328,8 +433,10 @@ async def _job_price_repair() -> None:
     """
     global _price_cycle_busy
     if not _crawler_idle():
+        await scheduler_bridge_note("price_repair", {"skipped": "crawler_busy"})
         return
     if not await price_auto_enabled():
+        await scheduler_bridge_note("price_repair", {"skipped": "auto_price_off"})
         return
     from app.domains.crawl import service as crawl_service
 
@@ -339,9 +446,27 @@ async def _job_price_repair() -> None:
             missing_cooldown=4,
         )
         if result:
-            logger.info("[修复] 失败记录修复完成：任务 %s", [r["id"] for r in result])
+            log_event(
+                logger,
+                "失败记录修复完成",
+                detail={
+                    "任务数": len(result),
+                    "任务编号": "、".join(str(r["id"]) for r in result[:5]),
+                },
+            )
+    except ValueError as e:
+        # 无欠账：本轮零出网，原因上运行账（用户语言原样）
+        await scheduler_bridge_note("price_repair", {"skipped": str(e)[:120]})
+    except RuntimeError as e:
+        # 撞锁：上轮修复还在收尾，下轮再来
+        await scheduler_bridge_note("price_repair", {"skipped": f"busy: {str(e)[:100]}"})
     except Exception:  # noqa: BLE001
-        logger.exception("[修复] 失败记录修复轮异常")
+        log_event(
+            logger,
+            "失败记录修复轮异常",
+            level=logging.ERROR,
+            exc_info=True,
+        )
 
 
 async def _run_price_cycle(specs: list[dict]) -> None:
@@ -383,6 +508,7 @@ async def _job_price_refresh() -> None:
     """
     global _price_cycle_busy
     if not await price_auto_enabled():
+        await scheduler_bridge_note("price_refresh", {"skipped": "auto_price_off"})
         return
     _price_cycle_busy = True
     try:
@@ -404,9 +530,22 @@ async def _job_price_refresh() -> None:
         try:
             from app.domains.bundles import refresh as bundles_refresh
 
-            await bundles_refresh.refresh_bundles()
+            bundle_result = await bundles_refresh.refresh_bundles()
+            if isinstance(bundle_result, dict):
+                await scheduler_bridge_note("bundle_refresh", {
+                    "ok": bool(bundle_result.get("ok")),
+                    "updated": bundle_result.get("updated"),
+                    "total": bundle_result.get("total"),
+                    "failed": len(bundle_result.get("failed") or []),
+                })
         except Exception:  # noqa: BLE001
-            logger.exception("[定时] 捆绑包刷新异常（不影响主链结果）")
+            log_event(
+                logger,
+                "捆绑包刷新异常，不影响价格刷新主链结果",
+                level=logging.ERROR,
+                exc_info=True,
+            )
+            await scheduler_bridge_note("bundle_refresh", {"ok": False, "error": "exception"})
     finally:
         _price_cycle_busy = False
 
@@ -421,6 +560,19 @@ async def _job_price_refresh_with_mails() -> None:
     """
     await _job_price_refresh()
     await _send_price_cycle_mails()
+
+
+async def _job_agent_ledger_prune() -> None:
+    """运行账本保留：job 型 run（调度桥行）过窗级联清理，task/fake 不动。"""
+    from app.domains.agent.runtime import scheduler_bridge
+
+    pruned = await scheduler_bridge.prune_job_runs()
+    if pruned:
+        log_event(
+            logger,
+            "运行账本清理完成，删除过窗的任务记录",
+            detail={"清理条数": pruned},
+        )
 
 
 async def _send_price_cycle_mails() -> None:
@@ -438,7 +590,12 @@ async def _send_price_cycle_mails() -> None:
         try:
             await send()
         except Exception:  # noqa: BLE001
-            logger.exception("[定时] %s 发送失败（不影响轮次结果）", label)
+            log_event(
+                logger,
+                f"{label}邮件发送失败，不影响本轮结果",
+                level=logging.ERROR,
+                exc_info=True,
+            )
 
 
 async def _job_fx_refresh() -> None:
@@ -456,7 +613,7 @@ async def _job_fx_refresh() -> None:
     try:
         await rates_service.refresh_rates()
     except Exception:  # noqa: BLE001
-        logger.exception("[定时] 汇率刷新失败")
+        log_event(logger, "汇率刷新失败", level=logging.ERROR, exc_info=True)
 
 
 async def _job_fx_history_repair() -> None:
@@ -480,28 +637,39 @@ async def _job_fx_history_repair() -> None:
     try:
         scan = await rates_history.scan_history_gaps()
     except Exception:  # noqa: BLE001
-        logger.exception("[定时] 汇率历史缺口扫描失败")
+        log_event(logger, "汇率历史缺口扫描失败", level=logging.ERROR, exc_info=True)
         return
     if not scan["windows"]:
         return
     if not _crawler_idle():
-        logger.info("[定时] 汇率历史修复跳过：爬虫占线（缺口 %d 个窗口待次轮）",
-                    len(scan["windows"]))
+        log_event(
+            logger,
+            "汇率历史修复跳过：爬虫正在占用，缺口留待下一轮",
+            tag="跳过",
+            detail={"待补窗口数": len(scan["windows"])},
+        )
         return
     try:
         result = await rates_history.repair_history_gaps(max_windows=_FX_REPAIR_MAX_WINDOWS)
         if result["status"] == "ok":
-            logger.info(
-                "[定时] 汇率历史修复：请求 %d 次 / 写入 %d 行 / 窗口 %d",
-                result["requests"], result["written"], len(result["windows"]),
+            log_event(
+                logger,
+                "汇率历史缺口修复完成",
+                detail={
+                    "请求次数": result["requests"],
+                    "写入行数": result["written"],
+                    "修复窗口数": len(result["windows"]),
+                },
             )
         elif result["status"] != "no_gaps":
-            logger.warning(
-                "[定时] 汇率历史修复中止：%s（%s）",
-                result["status"], result.get("error", ""),
+            log_event(
+                logger,
+                "汇率历史修复中止",
+                level=logging.WARNING,
+                detail={"状态": result["status"], "原因": result.get("error", "")},
             )
     except Exception:  # noqa: BLE001
-        logger.exception("[定时] 汇率历史修复异常")
+        log_event(logger, "汇率历史修复异常", level=logging.ERROR, exc_info=True)
 
 
 # 历史修复单轮窗口上限：8 窗口/轮 ≈ 单日最多 8 次 Provider 请求
@@ -550,9 +718,10 @@ async def _startup_pool_runtime() -> None:
                 exe_path=exe_path, now=datetime.now(),
             )
             await session.commit()
-        logger.info(
-            "[启动] 池 Runtime：%s（%s）",
-            "ready" if result.ready else "unavailable", result.detail,
+        log_event(
+            logger,
+            "代理池运行时已就绪" if result.ready else "代理池运行时不可用",
+            detail={"详情": result.detail},
         )
         if not result.ready:
             return
@@ -568,9 +737,13 @@ async def _startup_pool_runtime() -> None:
                 now=datetime.now(),
             )
             await session.commit()
-        logger.info(
-            "[启动] 首轮 L1 出口身份发现：探 %d 个节点，成功 %d 个",
-            len(outcomes), sum(1 for o in outcomes if o.ok),
+        log_event(
+            logger,
+            "首次探测代理出口身份完成",
+            detail={
+                "探测节点数": len(outcomes),
+                "成功节点数": sum(1 for o in outcomes if o.ok),
+            },
         )
         after = await _exit_snapshot_or_empty()
         if slot_signature(after) == slot_signature(before):
@@ -587,20 +760,29 @@ async def _startup_pool_runtime() -> None:
             )
             await session.commit()
         if rebuilt is not None:
-            logger.info(
-                "[启动] 出口身份建立后重建 Runtime：%d lane / %d 个已知出口",
-                len(rebuilt.lane_urls), len(rebuilt.lane_exits),
+            log_event(
+                logger,
+                "出口身份建立后已重建代理池运行时",
+                detail={
+                    "通道数": len(rebuilt.lane_urls),
+                    "已知出口数": len(rebuilt.lane_exits),
+                },
             )
     except Exception:  # noqa: BLE001
-        logger.exception("[启动] 池 Runtime bootstrap 失败（应用继续运行，crawler 保持不可用）")
+        log_event(
+            logger,
+            "代理池运行时装配失败，应用继续运行但爬虫保持不可用",
+            level=logging.ERROR,
+            exc_info=True,
+        )
 
 
 async def _startup_subscription_sync() -> None:
     """启动链的一步：订阅同步（排在池 Runtime 就位**之后**，只刷自动更新的订阅）。
 
     内核就位不等订阅下载——bootstrap 冷路径直接吃持久化 Registry 起核，本步
-    按 30min 刷新同一口径拉一遍（`only_auto=True`：限时订阅关了自动更新就不
-    在启动时撞死链，换链接后的重拉是用户的手动动作）。池签名变化 → 置
+    按 30min 刷新同一口径拉一遍（`only_auto=True`：限时订阅关了自动更新就不在
+    启动时撞死链，换链接后的重拉是用户的手动动作）。池签名变化 → 置
     `rebuild_pending` 并就地消费一次（热重载优先，启动期 crawler 必然空闲）；
     Runtime 尚不可用时不消费——把它拉起来是 bootstrap 的职责，交给 30min 刷新
     的 `ensure_pool_runtime`。失败只留日志：下一拍订阅刷新是下一次机会。
@@ -625,13 +807,18 @@ async def _startup_subscription_sync() -> None:
             after = await _bs.pool_signature(session)
         failed = len(sync.failures)
         if after == before:
-            logger.info("[启动] 订阅同步完成：池签名未变（失败 %d 条）", failed)
+            log_event(
+                logger,
+                "启动时订阅同步完成，代理池配置无变化",
+                detail={"失败订阅数": failed},
+            )
             return
         try:
             base, secret = controller_endpoint_of(data_dir)
         except (RuntimeConfigError, OSError):
-            logger.info(
-                "[启动] 订阅同步后池签名变化，但池 Runtime 未就绪——重建交订阅刷新链",
+            log_event(
+                logger,
+                "订阅同步后代理池配置有变化，但运行时未就绪，重建交由订阅刷新链处理",
             )
             return
         _sched.request_rebuild()
@@ -641,12 +828,21 @@ async def _startup_subscription_sync() -> None:
                 runtime=_cm.pool_runtime, exe_path=str(_cm.kernel_exe(data_dir)),
             )
             await session.commit()
-        logger.info(
-            "[启动] 订阅同步触发池重建：%s（失败 %d 条）",
-            "已执行" if rebuilt is not None else "本轮未执行", failed,
+        log_event(
+            logger,
+            "订阅同步触发代理池重建",
+            detail={
+                "结果": "已执行" if rebuilt is not None else "本轮未执行",
+                "失败订阅数": failed,
+            },
         )
     except Exception:  # noqa: BLE001
-        logger.exception("[启动] 订阅同步步骤失败（应用继续运行，下一拍订阅刷新是下次机会）")
+        log_event(
+            logger,
+            "启动时订阅同步步骤失败，应用继续运行，下次订阅刷新重试",
+            level=logging.ERROR,
+            exc_info=True,
+        )
 
 
 async def _exit_snapshot_or_empty() -> dict:
@@ -658,7 +854,12 @@ async def _exit_snapshot_or_empty() -> dict:
         async with get_session_factory()() as session:
             return await exit_snapshot(session)
     except Exception:  # noqa: BLE001
-        logger.exception("[启动] 出口身份快照读取失败（按空处理）")
+        log_event(
+            logger,
+            "出口身份快照读取失败，按空快照处理",
+            level=logging.ERROR,
+            exc_info=True,
+        )
         return {}
 
 
@@ -686,7 +887,12 @@ async def _job_proxypool_cycle() -> None:
     try:
         base, secret = controller_endpoint_of(data_dir)
     except (RuntimeConfigError, OSError) as e:
-        logger.info("[定时] proxypool 周期跳过：池 Runtime 尚未就绪（%s）", e)
+        log_event(
+            logger,
+            "代理池周期跳过：池运行时尚未就绪",
+            tag="跳过",
+            detail={"原因": str(e)},
+        )
         return
     try:
         # DEAD 恢复探测要打在**持有这些节点配置的内核**上：DEAD 不在池文件里，
@@ -713,14 +919,18 @@ async def _job_proxypool_cycle() -> None:
             )
             async with write_gate(WritePriority.BACKGROUND):
                 await session.commit()
-        logger.info(
-            "[定时] proxypool 周期：L0 %d 项 | busy=%s | rebuilt=%s | 维护=%s",
-            len(result.l0), result.busy,
-            "是" if result.rebuilt else "否",
-            "跳过" if result.maintenance is None else "已执行",
+        log_event(
+            logger,
+            "代理池周期完成",
+            detail={
+                "节点探测数": len(result.l0),
+                "任务占用": "是" if result.busy else "否",
+                "已重建": "是" if result.rebuilt else "否",
+                "维护": "跳过" if result.maintenance is None else "已执行",
+            },
         )
     except Exception:  # noqa: BLE001 —— 周期失败不拖垮调度器
-        logger.exception("[定时] proxypool 周期异常")
+        log_event(logger, "代理池周期执行异常", level=logging.ERROR, exc_info=True)
 
 
 async def _job_proxypool_retention() -> None:
@@ -743,14 +953,19 @@ async def _job_proxypool_retention() -> None:
     try:
         async with get_session_factory()() as session:
             result = await _ret.prune_telemetry(session, datetime.now())
-        logger.info(
-            "[定时] proxypool 保留清理：作业 %d / 健康观测 %d / 编排事件 %d / 快照 %d%s",
-            result.job_runs, result.health_observations,
-            result.orchestration_events, result.snapshots,
-            "（达块上限，剩余下轮继续）" if result.truncated else "",
+        log_event(
+            logger,
+            "代理池遥测保留清理完成",
+            detail={
+                "作业记录": result.job_runs,
+                "健康观测": result.health_observations,
+                "编排事件": result.orchestration_events,
+                "订阅快照": result.snapshots,
+                "已达单轮上限": "是" if result.truncated else "否",
+            },
         )
     except Exception:  # noqa: BLE001 —— 清理失败不拖垮调度器
-        logger.exception("[定时] proxypool 保留清理异常")
+        log_event(logger, "代理池遥测保留清理异常", level=logging.ERROR, exc_info=True)
 
 
 async def _job_subscription_refresh() -> None:
@@ -769,24 +984,42 @@ async def _job_subscription_refresh() -> None:
     from app.domains.proxies import service as proxies_service
 
     if not _crawler_idle():
-        logger.info("[定时] Clash 订阅重拉跳过：爬虫占线")
+        log_event(
+            logger,
+            "代理订阅重拉跳过：爬虫正在占用",
+            tag="跳过",
+            detail={"原因": "爬虫占线"},
+        )
         return
     try:
         result = await proxies_service.maybe_refresh_active_clash_subscription()
     except Exception:  # noqa: BLE001
-        logger.exception("[定时] Clash 订阅重拉异常")
+        log_event(logger, "代理订阅重拉异常", level=logging.ERROR, exc_info=True)
     else:
         if result.get("state") == "refreshed":
-            logger.info("[定时] Clash 订阅重拉完成：%s 节点", result.get("nodes"))
+            log_event(
+                logger,
+                "代理订阅重拉完成",
+                detail={"节点数": result.get("nodes")},
+            )
             if result.get("restarted") and result.get("subscriptionId"):
                 try:
                     checked = await proxies_service.test_clash_nodes(result["subscriptionId"])
-                    logger.info(
-                        "[定时] 订阅重拉后首检：共 %s 节点，可用 %s",
-                        checked.get("total"), checked.get("alive"),
+                    log_event(
+                        logger,
+                        "订阅重拉后首次节点检测完成",
+                        detail={
+                            "节点总数": checked.get("total"),
+                            "可用节点": checked.get("alive"),
+                        },
                     )
                 except Exception:  # noqa: BLE001 —— 首检失败不影响重拉事实
-                    logger.exception("[定时] 订阅重拉后首检失败（可稍后手动检测）")
+                    log_event(
+                        logger,
+                        "订阅重拉后首次节点检测失败，可稍后手动检测",
+                        level=logging.ERROR,
+                        exc_info=True,
+                    )
 
     # 订阅刷新 → Snapshot/Registry → 池签名分流；**绝不在这里 stop/start 池 Runtime**
     try:
@@ -804,12 +1037,22 @@ async def _job_subscription_refresh() -> None:
                 exe_path=str(_cm.kernel_exe(data_dir)), now=datetime.now(),
             )
             await session.commit()
-        logger.info(
-            "[定时] 订阅刷新后池分流：synced=%s pool_changed=%s action=%s",
-            triage.synced, triage.pool_changed, triage.action,
+        log_event(
+            logger,
+            "订阅刷新后代理池已分流处理",
+            detail={
+                "已同步": "是" if triage.synced else "否",
+                "池配置变化": "是" if triage.pool_changed else "否",
+                "处理动作": _triage_action_label(triage.action),
+            },
         )
     except Exception:  # noqa: BLE001 —— 分流失败不影响订阅重拉事实
-        logger.exception("[定时] 订阅刷新后池分流失败（下轮再试）")
+        log_event(
+            logger,
+            "订阅刷新后代理池分流失败，下一轮重试",
+            level=logging.ERROR,
+            exc_info=True,
+        )
 
 
 async def _job_proxy_health() -> None:
@@ -827,14 +1070,14 @@ async def _job_proxy_health() -> None:
         try:
             await proxies_service.test_all()
         except Exception:  # noqa: BLE001
-            logger.exception("[定时] 代理体检失败")
+            log_event(logger, "代理节点体检失败", level=logging.ERROR, exc_info=True)
 
     try:
         state = await proxies_service.maybe_run_clash_health_check()
         if state == "checked":
-            logger.info("[定时] Clash 节点体检完成")
+            log_event(logger, "代理节点体检完成")
     except Exception:  # noqa: BLE001
-        logger.exception("[定时] Clash 节点体检失败")
+        log_event(logger, "代理节点体检失败", level=logging.ERROR, exc_info=True)
 
     # 体检后判定通道健康度：全灭 / 可用占比过低才发告警（12h 冷却，
     # 未配置任何通道视为用户选择，不告警）
@@ -843,7 +1086,12 @@ async def _job_proxy_health() -> None:
 
         await alerts_service.check_proxy_health()
     except Exception:  # noqa: BLE001
-        logger.exception("[定时] 代理通道告警检查失败")
+        log_event(
+            logger,
+            "代理通道健康告警检查失败",
+            level=logging.ERROR,
+            exc_info=True,
+        )
 
 
 async def _job_wallet_sync() -> None:
@@ -858,22 +1106,34 @@ async def _job_wallet_sync() -> None:
     try:
         result = await account_service.sync_wallets_rotational()
         if result.get("ok"):
-            logger.info(
-                "[定时] 钱包轮转完成：%s/%s 个账号刷新成功（跳过 %s）",
-                result.get("ok_count"), result.get("total"), result.get("skipped"),
+            log_event(
+                logger,
+                "Steam 钱包余额轮转刷新完成",
+                detail={
+                    "成功": result.get("ok_count"),
+                    "账号总数": result.get("total"),
+                    "跳过": result.get("skipped"),
+                },
             )
         elif result.get("status") != "no_cookie":
             reasons = result.get("reasons") or {}
-            logger.info(
-                "[定时] 钱包轮转无成功账号：%s/%s 成功%s",
-                result.get("ok_count"),
-                result.get("total"),
-                "；" + "；".join(f"{n}× {why}" for why, n in reasons.items())
-                if reasons
-                else "（可能全部退避中）",
+            log_event(
+                logger,
+                f"{result.get('total')} 个账号的 Steam 钱包余额本轮全部同步失败",
+                level=logging.ERROR,
+                detail={
+                    "账号总数": result.get("total"),
+                    "成功": result.get("ok_count"),
+                    "失败原因": (
+                        "；".join(
+                            f"{n}×{_wallet_reason_label(w)}" for w, n in reasons.items()
+                        )
+                        if reasons else "可能在退避重试中"
+                    ),
+                },
             )
     except Exception:  # noqa: BLE001
-        logger.exception("[定时] 钱包轮转异常")
+        log_event(logger, "Steam 钱包余额轮转异常", level=logging.ERROR, exc_info=True)
 
 
 async def _job_bills_sync() -> None:
@@ -887,14 +1147,24 @@ async def _job_bills_sync() -> None:
     try:
         result = await bills_service.sync_bills(force=False)
         if result.get("ok"):
-            logger.info(
-                "[定时] 账单同步完成：%s 游戏 %s 笔 / licenses %s 行",
-                result.get("nickname"), result.get("gameTxs"), result.get("licenseRows"),
+            log_event(
+                logger,
+                "Steam 账单同步完成",
+                detail={
+                    "账号": result.get("nickname"),
+                    "游戏消费笔数": result.get("gameTxs"),
+                    "许可记录行数": result.get("licenseRows"),
+                },
             )
         elif result.get("status") not in ("no_cookie", "busy"):
-            logger.warning("[定时] 账单同步失败（等下一轮）：%s", result.get("error"))
+            log_event(
+                logger,
+                "Steam 账单同步失败，等下一轮重试",
+                level=logging.WARNING,
+                detail={"原因": result.get("error")},
+            )
     except Exception:  # noqa: BLE001
-        logger.exception("[定时] 账单同步异常")
+        log_event(logger, "Steam 账单同步异常", level=logging.ERROR, exc_info=True)
 
 
 def _make_board_job(
@@ -931,12 +1201,25 @@ def _make_board_job(
         try:
             appids = await boards_mod.refresh_board(board_key)
             if appids:
-                logger.info("[定时] %s 预热完成：%d 个 appid", board_key, len(appids))
+                log_event(
+                    logger,
+                    f"{_board_label(board_key)}缓存预热完成",
+                    detail={"收录条目数": len(appids)},
+                )
             else:
-                logger.warning("[定时] %s 预热未获取到数据", board_key)
+                log_event(
+                    logger,
+                    f"{_board_label(board_key)}缓存预热未获取到数据",
+                    level=logging.WARNING,
+                )
                 return
         except Exception:  # noqa: BLE001
-            logger.exception("[定时] %s 预热失败", board_key)
+            log_event(
+                logger,
+                f"{_board_label(board_key)}缓存预热失败",
+                level=logging.ERROR,
+                exc_info=True,
+            )
             return
 
         # 落持久监控池：board.pool=True 的板本轮整批并入监控池（反复上榜
@@ -946,29 +1229,60 @@ def _make_board_job(
 
             try:
                 landed = await wishlist_service.ensure_board_pool(appids)
-                logger.info(
-                    "[定时] %s 落监控池：新增 %d / 已在池 %d / 已移除跳过 %d",
-                    board_key, landed["added"], landed["exists"], landed["skipped"],
+                log_event(
+                    logger,
+                    f"{_board_label(board_key)}条目已并入监控池",
+                    detail={
+                        "新增": landed["added"],
+                        "已在池": landed["exists"],
+                        "已移除跳过": landed["skipped"],
+                    },
                 )
             except Exception:  # noqa: BLE001
-                logger.exception("[定时] %s 落监控池失败（不阻断反哺）", board_key)
+                log_event(
+                    logger,
+                    f"{_board_label(board_key)}条目并入监控池失败，不阻断后续反哺",
+                    level=logging.ERROR,
+                    exc_info=True,
+                )
 
         if record_preset:
             from app.domains.games import preset as preset_mod
 
             try:
                 n = await preset_mod.record_board(appids)
-                logger.info("[定时] %s 预设池登记：%d 款", board_key, n)
+                log_event(
+                    logger,
+                    f"{_board_label(board_key)}条目已登记进预设池",
+                    detail={"登记款数": n},
+                )
             except Exception:  # noqa: BLE001
-                logger.exception("[定时] %s 预设池登记失败（不阻断反哺）", board_key)
+                log_event(
+                    logger,
+                    f"{_board_label(board_key)}条目登记进预设池失败，不阻断后续反哺",
+                    level=logging.ERROR,
+                    exc_info=True,
+                )
 
         try:
             specs = await boards_mod.backfill_specs(board_key, limit=backfill_limit)
             if specs:
                 results = await crawl_service.run_sequential(specs)
-                logger.info("[定时] %s 反哺爬取完成：%s", board_key, [r["id"] for r in results])
+                log_event(
+                    logger,
+                    f"{_board_label(board_key)}条目反哺抓取完成",
+                    detail={
+                        "任务数": len(results),
+                        "任务编号": "、".join(str(r["id"]) for r in results[:5]),
+                    },
+                )
         except Exception:  # noqa: BLE001
-            logger.exception("[定时] %s 反哺爬取失败", board_key)
+            log_event(
+                logger,
+                f"{_board_label(board_key)}条目反哺抓取失败",
+                level=logging.ERROR,
+                exc_info=True,
+            )
 
     return _job
 
@@ -996,7 +1310,12 @@ async def _job_wal_truncate() -> None:
     from app.core.database import get_engine
 
     if not _crawler_idle():
-        logger.info("[定时] WAL 收缩跳过：爬虫占线")
+        log_event(
+            logger,
+            "WAL 收缩跳过：爬虫正在占用",
+            tag="跳过",
+            detail={"原因": "爬虫占线"},
+        )
         return
     db = get_engine().url.database
     if not db:
@@ -1008,9 +1327,15 @@ async def _job_wal_truncate() -> None:
             await conn.execute(text("PRAGMA wal_checkpoint(TRUNCATE)"))
         ).one()
     after = wal.stat().st_size if wal.exists() else 0
-    logger.info(
-        "[定时] WAL 收缩完成：%.1f MB → %.1f MB（busy=%d, frames=%d）",
-        before / 1024 / 1024, after / 1024 / 1024, busy, frames,
+    log_event(
+        logger,
+        "WAL 物理收缩完成",
+        detail={
+            "收缩前": f"{before / 1024 / 1024:.1f}MB",
+            "收缩后": f"{after / 1024 / 1024:.1f}MB",
+            "是否被占用": "是" if busy else "否",
+            "检查点帧数": frames,
+        },
     )
 
 
@@ -1027,12 +1352,17 @@ async def _job_backup() -> None:
 
     try:
         result = await core_backup.create_backup()
-        logger.info(
-            "[定时] 自动备份完成：%s（%.1f MB，games=%d）",
-            result["name"], result["sizeBytes"] / 1024 / 1024, result["games"],
+        log_event(
+            logger,
+            "自动备份完成",
+            detail={
+                "文件名": result["name"],
+                "大小": f"{result['sizeBytes'] / 1024 / 1024:.1f}MB",
+                "游戏数": result["games"],
+            },
         )
     except Exception as e:  # noqa: BLE001
-        logger.exception("[定时] 自动备份失败")
+        log_event(logger, "自动备份失败", level=logging.ERROR, exc_info=True)
         # 系统告警：备份失败是「数据没有第二份」的信号，24h 冷却内只提醒一次
         try:
             from app.domains.alerts import service as alerts_service
@@ -1049,7 +1379,12 @@ async def _job_backup() -> None:
                 hint="可在「设置 → 数据」页检查备份目录剩余空间与写入权限。",
             )
         except Exception:  # noqa: BLE001
-            logger.exception("[定时] 备份失败告警发送失败")
+            log_event(
+                logger,
+                "备份失败告警发送失败",
+                level=logging.ERROR,
+                exc_info=True,
+            )
 
 
 async def _job_backup_catchup() -> None:
@@ -1073,14 +1408,28 @@ async def _job_backup_catchup() -> None:
                 datetime.now() - datetime.fromisoformat(newest)
             ).total_seconds() / 3600
             if age_h < BACKUP_STALE_HOURS:
-                logger.info("[调度] 启动补备跳过：最新备份 %.1f 小时前", age_h)
+                log_event(
+                    logger,
+                    "启动补备跳过：最新备份仍较新",
+                    tag="跳过",
+                    detail={"备份龄": f"{age_h:.1f}小时"},
+                )
                 return
-            logger.info("[调度] 启动补备触发：最新备份已 %.1f 小时前", age_h)
+            log_event(
+                logger,
+                "启动补备触发：最新备份已过期",
+                detail={"备份龄": f"{age_h:.1f}小时"},
+            )
         else:
-            logger.info("[调度] 启动补备触发：尚无任何备份")
+            log_event(logger, "启动补备触发：尚无任何备份")
         await _job_backup()
     except Exception:  # noqa: BLE001
-        logger.exception("[调度] 启动补备异常（不阻塞启动）")
+        log_event(
+            logger,
+            "启动补备异常，不阻塞启动",
+            level=logging.ERROR,
+            exc_info=True,
+        )
 
 
 async def _job_hb_choice() -> None:
@@ -1094,14 +1443,26 @@ async def _job_hb_choice() -> None:
     try:
         result = await metadata_service.refresh_hb_choice()
         if not result.get("ok"):
-            logger.warning("[调度] HB 当月包标记失败：%s", result)
+            log_event(
+                logger,
+                "Humble Choice 当月包标记失败",
+                level=logging.WARNING,
+                detail={"原因": result.get("error")},
+            )
         elif result.get("recorded") is False:
-            logger.warning(
-                "[调度] HB 当月包标记未结案（不记账，次日重试）：%d 条未解析",
-                len(result.get("unresolved") or []),
+            log_event(
+                logger,
+                "Humble Choice 当月包标记未结案，本轮不记账，次日重试",
+                tag="未完成",
+                level=logging.WARNING,
+                detail={"未解析条数": len(result.get("unresolved") or [])},
             )
         elif not result.get("skipped"):
-            logger.info("[调度] HB 当月包标记：%s", result.get("machineName"))
+            log_event(
+                logger,
+                "Humble Choice 当月包已标记",
+                detail={"月包标识": result.get("machineName")},
+            )
         # 新月包结案即发一封当月包清单（标签游标保证同月只发一封；
         # 失败/未结案/跳过都不发，次日重试）
         try:
@@ -1109,9 +1470,19 @@ async def _job_hb_choice() -> None:
 
             await alerts_service.check_hb_choice(result)
         except Exception:  # noqa: BLE001
-            logger.exception("[调度] HB 当月包邮件发送失败")
+            log_event(
+                logger,
+                "Humble Choice 当月包清单邮件发送失败",
+                level=logging.ERROR,
+                exc_info=True,
+            )
     except Exception:  # noqa: BLE001
-        logger.exception("[调度] HB 当月包标记异常（次日自动重试）")
+        log_event(
+            logger,
+            "Humble Choice 当月包标记异常，次日自动重试",
+            level=logging.ERROR,
+            exc_info=True,
+        )
     # 已标记未取价的 HB 游戏补首爬（标记 ≠ 取价；打标失败不挡补价）。
     # 撞锁/池未就绪由链式层跳过留日志，次日重试；走爬取通道，auto_price
     # 关闭时与 comingsoon/free_promo 重试层一并停转。
@@ -1119,9 +1490,22 @@ async def _job_hb_choice() -> None:
         if await price_auto_enabled():
             backfill = await metadata_service.backfill_hb_prices()
             if backfill.get("pending"):
-                logger.info("[调度] HB 已标记未取价补爬：%s", backfill)
+                log_event(
+                    logger,
+                    "Humble Choice 已标记但未取价的游戏已发起补抓",
+                    detail={
+                        "待补款数": backfill.get("pending"),
+                        "已发起": "是" if backfill.get("started") else "否",
+                        "任务号": backfill.get("jobId"),
+                    },
+                )
     except Exception:  # noqa: BLE001
-        logger.exception("[调度] HB 取价补爬异常（不影响标记结果）")
+        log_event(
+            logger,
+            "Humble Choice 取价补抓异常，不影响标记结果",
+            level=logging.ERROR,
+            exc_info=True,
+        )
 
 
 async def _job_epic_free() -> None:
@@ -1135,16 +1519,28 @@ async def _job_epic_free() -> None:
     try:
         result = await metadata_service.refresh_epic_free()
         if not result.get("ok"):
-            logger.warning("[调度] Epic 免费标记失败：%s", result.get("error"))
+            log_event(
+                logger,
+                "Epic 免费游戏标记失败",
+                level=logging.WARNING,
+                detail={"原因": result.get("error")},
+            )
         elif result.get("unresolved"):
-            logger.warning(
-                "[调度] Epic 免费标记有 %d 条未解析（次日重试）",
-                len(result.get("unresolved") or []),
+            log_event(
+                logger,
+                "Epic 免费游戏标记有未解析条目，次日重试",
+                tag="未完成",
+                level=logging.WARNING,
+                detail={"未解析条数": len(result.get("unresolved") or [])},
             )
         else:
-            logger.info(
-                "[调度] Epic 免费标记：窗口 %s 款，新标 %d 款",
-                result.get("window"), len(result.get("marked") or []),
+            log_event(
+                logger,
+                "Epic 免费游戏标记完成",
+                detail={
+                    "窗口款数": result.get("window"),
+                    "新标款数": len(result.get("marked") or []),
+                },
             )
         # 标记完成后发喜加一邮件（当期新条目才发；预告段只作展示，
         # 转正后才自己发一封）
@@ -1153,9 +1549,19 @@ async def _job_epic_free() -> None:
 
             await alerts_service.check_epic_free()
         except Exception:  # noqa: BLE001
-            logger.exception("[调度] Epic 喜加一邮件发送失败")
+            log_event(
+                logger,
+                "Epic 喜加一邮件发送失败",
+                level=logging.ERROR,
+                exc_info=True,
+            )
     except Exception:  # noqa: BLE001
-        logger.exception("[调度] Epic 免费标记异常（次日自动重试）")
+        log_event(
+            logger,
+            "Epic 免费游戏标记异常，次日自动重试",
+            level=logging.ERROR,
+            exc_info=True,
+        )
 
 
 async def _job_steam_events_sync() -> None:
@@ -1167,12 +1573,21 @@ async def _job_steam_events_sync() -> None:
 
     try:
         result = await steam_events_service.sync()
-        logger.info(
-            "[调度] Steam 活动日历同步：%d 个活动（回贴价格观测 %d 行）",
-            result.get("count", 0), result.get("backfilled", 0),
+        log_event(
+            logger,
+            "Steam 活动日历同步完成",
+            detail={
+                "活动数": result.get("count", 0),
+                "回贴价格观测行数": result.get("backfilled", 0),
+            },
         )
     except Exception:  # noqa: BLE001
-        logger.exception("[调度] Steam 活动日历同步异常（次日自动重试）")
+        log_event(
+            logger,
+            "Steam 活动日历同步异常，次日自动重试",
+            level=logging.ERROR,
+            exc_info=True,
+        )
 
 
 async def _job_bartervg_bundles() -> None:
@@ -1185,16 +1600,36 @@ async def _job_bartervg_bundles() -> None:
     try:
         result = await metadata_service.refresh_bundle_counts()
         if not result.get("ok"):
-            logger.warning("[调度] Barter.vg bundle 计数刷新失败：%s", result.get("error"))
+            log_event(
+                logger,
+                "捆绑包进包计数刷新失败",
+                level=logging.WARNING,
+                detail={"数据源": "Barter.vg", "原因": result.get("error")},
+            )
         elif result.get("skipped"):
-            logger.info("[调度] Barter.vg bundle 计数：48h 内已拉取，跳过")
+            log_event(
+                logger,
+                "捆绑包进包计数跳过：48 小时内已拉取过",
+                tag="跳过",
+                detail={"数据源": "Barter.vg"},
+            )
         else:
-            logger.info(
-                "[调度] Barter.vg bundle 计数：档案 %s 条，更新 %s 行",
-                result.get("records"), result.get("updated"),
+            log_event(
+                logger,
+                "捆绑包进包计数刷新完成",
+                detail={
+                    "数据源": "Barter.vg",
+                    "档案条数": result.get("records"),
+                    "更新行数": result.get("updated"),
+                },
             )
     except Exception:  # noqa: BLE001
-        logger.exception("[调度] Barter.vg bundle 计数异常（次日自动重试）")
+        log_event(
+            logger,
+            "捆绑包进包计数刷新异常，次日自动重试",
+            level=logging.ERROR,
+            exc_info=True,
+        )
 
 
 async def _job_bartervg_catchup() -> None:
@@ -1204,7 +1639,12 @@ async def _job_bartervg_catchup() -> None:
         await asyncio.sleep(90)
         await _job_bartervg_bundles()
     except Exception:  # noqa: BLE001
-        logger.exception("[调度] Barter.vg 启动补跑异常（不阻塞启动）")
+        log_event(
+            logger,
+            "捆绑包进包计数启动补跑异常，不阻塞启动",
+            level=logging.ERROR,
+            exc_info=True,
+        )
 
 
 async def _job_coming_soon_retry() -> None:
@@ -1224,7 +1664,12 @@ async def _job_coming_soon_retry() -> None:
             cooldown_days=14, limit=20
         )
     except Exception:  # noqa: BLE001
-        logger.exception("[定时] COMING_SOON 重探候选查询失败")
+        log_event(
+            logger,
+            "即将推出游戏的重探候选查询失败",
+            level=logging.ERROR,
+            exc_info=True,
+        )
         return
     if not pairs:
         return
@@ -1235,9 +1680,18 @@ async def _job_coming_soon_retry() -> None:
               "kind": "comingsoon_retry"}],
         )
         if results:
-            logger.info("[定时] COMING_SOON 重探完成：%d 个候选", len(pairs))
+            log_event(
+                logger,
+                "即将推出游戏重探完成",
+                detail={"候选数": len(pairs)},
+            )
     except Exception:  # noqa: BLE001
-        logger.exception("[定时] COMING_SOON 重探爬取失败")
+        log_event(
+            logger,
+            "即将推出游戏重探抓取失败",
+            level=logging.ERROR,
+            exc_info=True,
+        )
 
 
 async def _job_free_promo_retry() -> None:
@@ -1273,7 +1727,12 @@ async def _job_free_promo_retry() -> None:
                 )
             ).scalars().all()
     except Exception:  # noqa: BLE001
-        logger.exception("[定时] 限时赠送复查候选查询失败")
+        log_event(
+            logger,
+            "限时赠送复查的候选查询失败",
+            level=logging.ERROR,
+            exc_info=True,
+        )
         return
     appids = [int(r) for r in rows]
     if not appids:
@@ -1282,9 +1741,18 @@ async def _job_free_promo_retry() -> None:
         await crawl_service.run_sequential(
             [{"scope": "appids", "appids": appids, "kind": "free_promo_retry"}],
         )
-        logger.info("[定时] 限时赠送复查完成：%d 个候选", len(appids))
+        log_event(
+            logger,
+            "限时赠送复查完成",
+            detail={"候选数": len(appids)},
+        )
     except Exception:  # noqa: BLE001
-        logger.exception("[定时] 限时赠送复查爬取失败")
+        log_event(
+            logger,
+            "限时赠送复查抓取失败",
+            level=logging.ERROR,
+            exc_info=True,
+        )
 
 
 # ── 启动新鲜度补偿 ──
@@ -1357,13 +1825,15 @@ async def _kick_stale_price_refresh() -> None:
     if current is not None and current <= earliest:
         return
     scheduler.modify_job("price_refresh", next_run_time=earliest)
-    logger.info(
-        "[调度] 启动新鲜度补偿：池内 %d 个对象 24h 内有观察的占 %d%%（门槛 %d%%），"
-        "price_refresh 提前至 %s（跑完由轮转重锚归位网格）",
-        total,
-        round(share * 100),
-        round(_STARTUP_STALE_SHARE * 100),
-        earliest.strftime("%m-%d %H:%M"),
+    log_event(
+        logger,
+        "启动时监控池数据整体过期，价格刷新已提前",
+        detail={
+            "池内对象数": total,
+            "24 小时内有更新的占比": f"{round(share * 100)}%",
+            "触发门槛": f"{round(_STARTUP_STALE_SHARE * 100)}%",
+            "提前至": earliest.strftime("%m-%d %H:%M"),
+        },
     )
 
 
@@ -1382,75 +1852,106 @@ async def _anchor_probe_after_start() -> None:
         await _reanchor_price_refresh("启动纠偏探针")
         await _kick_stale_price_refresh()
     except Exception:  # noqa: BLE001
-        logger.exception("[调度] 启动纠偏探针异常（不阻塞启动）")
+        log_event(
+            logger,
+            "启动后时间纠偏探针异常，不阻塞启动",
+            level=logging.ERROR,
+            exc_info=True,
+        )
+
+
+def _acct(job_id: str, fn, *, task_kind: str | None = None):
+    """job 注册包装：每次调用入运行账本（开始/结束/异常，桥内全 fail-soft）。
+
+    task_kind 给定时（job 对应任务登记表条目）结束后按域账本终态采样收口。
+    """
+    from app.domains.agent.runtime import scheduler_bridge
+
+    async def _wrapped():
+        await scheduler_bridge.run_accounted(job_id, fn, task_kind=task_kind)
+
+    return _wrapped
+
+
+async def scheduler_bridge_note(step: str, summary: dict) -> None:
+    """job 体向当前运行账 run 追加段位流水（跳过原因/链尾结果）；桥内 fail-soft。"""
+    from app.domains.agent.runtime import scheduler_bridge
+
+    await scheduler_bridge.note_step(step, summary)
 
 
 def start_scheduler() -> None:
     if scheduler.running:
         return
-    scheduler.add_job(_job_wishlist_sync, "interval", minutes=15, id="wishlist_sync")
+    scheduler.add_job(_acct("wishlist_sync", _job_wishlist_sync), "interval", minutes=15, id="wishlist_sync")
     # 失败记录修复：5min 一轮，job 内部自判空闲（busy/任务表），占线即静默让路
-    scheduler.add_job(_job_price_repair, "interval", minutes=5, id="price_repair")
+    scheduler.add_job(_acct("price_repair", _job_price_repair, task_kind="price_repair"), "interval", minutes=5, id="price_repair")
     # 池价格爬取：interval 6h 只做兜底（重锚链断裂也不脱轨；真实步长由
     # 设置 crawl.price_interval_hours 决定，初锚的 6h 网格点在启动 10s
     # 纠偏探针处按用户步长重算，注册期同步上下文读不到 KV）
     # 真实节奏由 _reanchor_price_refresh 手改 next_run_time
     # 主导（job 内 modify 的排程不受触发器覆盖）
     scheduler.add_job(
-        _job_price_refresh_with_mails, "interval", hours=6, id="price_refresh",
+        _acct("price_refresh", _job_price_refresh_with_mails, task_kind="price_refresh"),
+        "interval", hours=6, id="price_refresh",
         next_run_time=local_next_grid()[0],
         coalesce=True, misfire_grace_time=None,
     )
-    scheduler.add_job(_job_fx_refresh, "cron", hour=3, minute=0, id="fx_refresh")
+    scheduler.add_job(_acct("fx_refresh", _job_fx_refresh), "cron", hour=3, minute=0, id="fx_refresh")
     # 汇率历史修复：与实时刷新分离的独立任务（配额账本 + 缺口 + 爬虫空闲门禁）
     scheduler.add_job(
-        _job_fx_history_repair, "cron", hour=4, minute=0, id="fx_history_repair"
+        _acct("fx_history_repair", _job_fx_history_repair), "cron", hour=4, minute=0, id="fx_history_repair"
     )
-    scheduler.add_job(_job_proxy_health, "interval", hours=6, id="proxy_health")
+    scheduler.add_job(_acct("proxy_health", _job_proxy_health), "interval", hours=6, id="proxy_health")
     # 订阅重拉：拍子给密一点（30min），真间隔靠 service 的 6h KV 门槛 +
     # 爬虫空闲门禁——占线错过一拍不消费门槛，下一拍补上
     scheduler.add_job(
-        _job_subscription_refresh, "interval", minutes=30, id="subscription_refresh",
+        _acct("subscription_refresh", _job_subscription_refresh), "interval", minutes=30, id="subscription_refresh",
         next_run_time=datetime.now() + _REFRESH_STAGGER,
     )
-    scheduler.add_job(_job_wallet_sync, "interval", minutes=1, id="wallet_sync")
+    scheduler.add_job(_acct("wallet_sync", _job_wallet_sync), "interval", minutes=1, id="wallet_sync")
     scheduler.add_job(
-        _job_bills_sync, "interval", minutes=30, id="bills_sync",
+        _acct("bills_sync", _job_bills_sync), "interval", minutes=30, id="bills_sync",
         next_run_time=datetime.now() + _BILLS_STAGGER,
     )
-    scheduler.add_job(_job_achievements_sync, "cron", hour=5, minute=20, id="achievements_sync")
+    scheduler.add_job(_acct("achievements_sync", _job_achievements_sync), "cron", hour=5, minute=20, id="achievements_sync")
     # 热销榜：发现面 5 页（500 条，其中前 100 条仍作 TOP100 展示序）；
     # 首轮反哺放宽到 500 一次补满初始游戏库，并登记预设池清单（随种子分发）
     scheduler.add_job(
-        _make_board_job("topsellers", backfill_limit=500, record_preset=True),
+        _acct("board_topsellers", _make_board_job("topsellers", backfill_limit=500, record_preset=True)),
         "interval", hours=1, id="board_topsellers",
     )
-    scheduler.add_job(_make_board_job("popularnew"), "interval", hours=24, id="board_popularnew")
+    scheduler.add_job(_acct("board_popularnew", _make_board_job("popularnew")), "interval", hours=24, id="board_popularnew")
     # specials 不设独立 job：特惠+热门榜的去重爬取随价格轮尾段进行
     # （`_price_refresh_specs`），与内部队列重合的对象不重复爬
-    scheduler.add_job(_make_board_job("comingsoon"), "interval", hours=24, id="board_comingsoon")
-    scheduler.add_job(_job_coming_soon_retry, "cron", hour=10, minute=0, id="comingsoon_retry")
+    scheduler.add_job(_acct("board_comingsoon", _make_board_job("comingsoon")), "interval", hours=24, id="board_comingsoon")
+    scheduler.add_job(_acct("comingsoon_retry", _job_coming_soon_retry), "cron", hour=10, minute=0, id="comingsoon_retry")
     # 限时赠送复查：到期（或 1h 内到期）的 promo 重爬翻转状态；通常 0 候选
-    scheduler.add_job(_job_free_promo_retry, "interval", hours=6, id="free_promo_retry")
-    scheduler.add_job(_job_hb_choice, "cron", hour=6, minute=40, id="hb_choice")
-    scheduler.add_job(_job_epic_free, "cron", hour=7, minute=10, id="epic_free")
+    scheduler.add_job(_acct("free_promo_retry", _job_free_promo_retry), "interval", hours=6, id="free_promo_retry")
+    scheduler.add_job(_acct("hb_choice", _job_hb_choice), "cron", hour=6, minute=40, id="hb_choice")
+    scheduler.add_job(_acct("epic_free", _job_epic_free), "cron", hour=7, minute=10, id="epic_free")
     # Steam 活动日历：官方文档页低频变更，每日一拍足够；05:00 避开已占分钟
     scheduler.add_job(
-        _job_steam_events_sync, "cron", hour=5, minute=0, id="steam_events_sync"
+        _acct("steam_events_sync", _job_steam_events_sync), "cron", hour=5, minute=0, id="steam_events_sync"
     )
-    scheduler.add_job(_job_bartervg_bundles, "cron", hour=5, minute=40, id="bartervg_bundles")
-    scheduler.add_job(_job_wal_truncate, "cron", hour=4, minute=30, id="wal_truncate")
+    scheduler.add_job(_acct("bartervg_bundles", _job_bartervg_bundles), "cron", hour=5, minute=40, id="bartervg_bundles")
+    scheduler.add_job(_acct("wal_truncate", _job_wal_truncate), "cron", hour=4, minute=30, id="wal_truncate")
     # proxypool 遥测保留：每日 04:35（紧随 WAL 收缩，不与 04:30 的重活撞同一分钟）。
     # 分块删除 + 单轮块上限在函数内部；max_instances=1 防叠轮。
     scheduler.add_job(
-        _job_proxypool_retention, "cron", hour=4, minute=35, id="proxypool_retention",
+        _acct("proxypool_retention", _job_proxypool_retention), "cron", hour=4, minute=35, id="proxypool_retention",
         max_instances=1, coalesce=True,
     )
-    scheduler.add_job(_job_backup, "interval", hours=24, id="auto_backup")
+    scheduler.add_job(_acct("auto_backup", _job_backup), "interval", hours=24, id="auto_backup")
     # proxypool 周期：**只注册这一个**（L0 / pending 重建 / L1-L2 都在它内部按序发生）。
     # 池 Runtime 未就绪时函数内部自行跳过；max_instances=1 防上一轮未跑完又叠一轮。
     scheduler.add_job(
-        _job_proxypool_cycle, "interval", minutes=5, id="proxypool_cycle",
+        _acct("proxypool_cycle", _job_proxypool_cycle), "interval", minutes=5, id="proxypool_cycle",
+        max_instances=1, coalesce=True,
+    )
+    # 运行账本保留：job 型 run 过窗清理（级联事件），每日 04:36
+    scheduler.add_job(
+        _acct("agent_ledger_prune", _job_agent_ledger_prune), "cron", hour=4, minute=36, id="agent_ledger_prune",
         max_instances=1, coalesce=True,
     )
     scheduler.start()
@@ -1459,18 +1960,44 @@ def start_scheduler() -> None:
     try:
         asyncio.create_task(_anchor_probe_after_start())
     except RuntimeError:
-        logger.warning("[调度] 无运行中事件循环，跳过外部时间纠偏探针（初锚生效）")
+        log_event(
+            logger,
+            "没有运行中的事件循环，跳过外部时间纠偏探针",
+            tag="跳过",
+            level=logging.WARNING,
+            detail={"说明": "初始锚点仍生效"},
+        )
     # 备份补备（异步，5min 延时）：interval 从启动起算，不常驻的用法等不到
     try:
         asyncio.create_task(_job_backup_catchup())
     except RuntimeError:
-        logger.warning("[调度] 无运行中事件循环，跳过启动补备")
+        log_event(
+            logger,
+            "没有运行中的事件循环，跳过启动补备",
+            tag="跳过",
+            level=logging.WARNING,
+        )
     # Barter.vg bundle 计数启动补跑（异步，90s 延时；48h 闸内静默跳过）
     try:
         asyncio.create_task(_job_bartervg_catchup())
     except RuntimeError:
-        logger.warning("[调度] 无运行中事件循环，跳过 Barter.vg 启动补跑")
-    logger.info("调度器已启动（账户同步 15min / 池价格爬取锚点网格：Steam 折扣刷新锚 北京 01:00[夏令时]/02:00[冬令时] + 6h 步进[目录层与特惠榜差值段随开关] / 外部时间判定 DST / 捆绑包关注集刷新随价格链 / 失败记录修复 5min 空闲档 / 汇率每日 03:00 + 历史修复每日 04:00[缺口·空闲·Key·配额四重门禁] / WAL 收缩每日 04:30 / Barter.vg bundle 计数每日 05:40 / 代理体检 6h / Clash 订阅重拉 30min 拍[6h 门槛·爬虫空闲档] / 钱包每分钟轮转 / 账单 30min / 热销榜 1h / 热门新品 24h / 即将推出 24h / CS 重探每日 10:00 / 自动备份 24h）")
+        log_event(
+            logger,
+            "没有运行中的事件循环，跳过捆绑包进包计数启动补跑",
+            tag="跳过",
+            level=logging.WARNING,
+        )
+    log_event(
+        logger,
+        "调度器已启动，全部定时任务按预定节奏注册完成",
+        detail={
+            "任务节奏": "账户同步每 15 分钟；价格刷新按 Steam 折扣刷新锚点加 6 小时网格；"
+            "失败记录修复每 5 分钟（空闲档）；汇率每日 03:00 刷新、历史缺口每日 04:00 修复；"
+            "WAL 收缩每日 04:30；捆绑包进包计数每日 05:40；代理体检每 6 小时；"
+            "订阅重拉每 30 分钟（6 小时门槛、爬虫空闲档）；钱包轮转每分钟；账单同步每 30 分钟；"
+            "热销榜每小时；热门新品与即将推出每 24 小时；即将推出重探每日 10:00；自动备份每 24 小时",
+        },
+    )
 
 
 def stop_scheduler() -> None:

@@ -1,5 +1,12 @@
 """日志：控制台 + 滚动文件（data/logs/<app_slug>.log，5MB x 5）+ 内存环形缓冲（日志页 SSE）。
 
+行结构 `时间 [结果词] 模块中文名 · 人话主句 │ 键=值 键=值`：主句给人读，`│` 后的
+结构化细节给排障读。调用方写 `log_event(...)` 给主句与细节，不再自己拼字符串——
+拼接把「结论」和「参数」混成一句，日志页就成了开发者内部简写的堆砌。
+
+`[结果词]` 默认由级别推出（INFO→信息 / WARNING→注意 / ERROR→失败），事件语义更精确
+时用 `tag=` 显式覆盖（跳过 / 成功 / 已修复 …）。
+
 **日志是凭据外泄的主要通道之一，故本模块承担脱敏职责。** 日志文件会被整包提交进
 版本库、被用户导出、贴进 issue、发给他人排障，而第三方库与应用自身都会在无意间
 把凭据写进日志行：
@@ -25,16 +32,25 @@ import logging
 import re
 import threading
 from collections import deque
+from collections.abc import Mapping
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from app.core.app_info import APP_SLUG
 
-_FMT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-
 # 日志噪声与泄漏源：httpx 逐请求打印完整 URL（含查询串里的密钥）。
 # 降到 WARNING 后请求失败仍可见（httpx 的错误走 WARNING/ERROR），成功不再刷屏。
-_NOISY_LOGGERS = ("httpx", "httpcore")
+#
+# APScheduler 同理且量更大：每跑一个 job 打两行 INFO（Running job "_job_x
+# (trigger: interval[0:05:00], next run at: ...)" / executed successfully），
+# 占全量日志约一半，零业务信息，把真正的日志冲得看不见。它的失败仍走
+# WARNING/ERROR（Job 抛异常、maximum number of running instances reached），不受影响。
+_NOISY_LOGGERS = (
+    "httpx",
+    "httpcore",
+    "apscheduler.executors.default",
+    "apscheduler.scheduler",
+)
 
 # ── 脱敏规则 ────────────────────────────────────────────────
 # 全部按「保留字段名、抹掉值」替换：日志的可读性与排障价值留在字段名上。
@@ -100,6 +116,189 @@ def redact(text: str) -> str:
     return text
 
 
+# ── 人话渲染 ────────────────────────────────────────────────
+# 结果词由级别兜底，事件语义更精确时调用方用 tag= 覆盖。
+_RESULT_BY_LEVEL = {
+    logging.DEBUG: "调试",
+    logging.INFO: "信息",
+    logging.WARNING: "注意",
+    logging.ERROR: "失败",
+    logging.CRITICAL: "严重",
+}
+
+# 结果词 → 严重度。**这是闭集**：`tag=` 只能取这里已有的键，新增词必须同步
+# 前端日志页 `web/src/views/logs/Index.vue` 的分色与计数（依据键值，不靠猜词根）。
+# 行首只印一个词，级别信息由这张表承载——所以「降级」「未完成」尽管是 tag，
+# 也仍然按注意级呈现，不会因为盖掉级别词而丢掉严重度。
+TAG_SEVERITY = {
+    "调试": "info",
+    "信息": "info",
+    "成功": "info",
+    "跳过": "info",
+    "已修复": "info",
+    "忽略": "info",
+    "复用": "info",
+    "注意": "warning",
+    "降级": "warning",
+    "未完成": "warning",
+    "失败": "error",
+    "严重": "error",
+}
+
+# 点分模块路径 → 用户可读名。日志页印 `app.domains.proxypool.health` 对读者是零信息，
+# 印「代理池·健康检查」才说明白这条日志属于谁。映射是 1:1 的，故排障时按名反查模块无歧义。
+# 与源码同步的守卫见 tests/test_logging_redact.py（新增日志模块漏登记会测试失败）。
+_MODULE_LABELS = {
+    # 内核
+    "app.main": "应用启动",
+    "app.core.scheduler": "定时任务",
+    "app.core.database": "数据库",
+    "app.core.backup": "数据备份",
+    "app.core.updater": "应用更新",
+    "app.core.rekey": "密钥换装",
+    "app.core.external_time": "时间校准",
+    "app.core.seed_assets": "种子数据",
+    "app.core.seed_fetch": "种子拉取",
+    "app.core.data_export": "数据导出",
+    "app.core.orchestration": "编排事件",
+    "app.core.logging": "日志",
+    # 爬取
+    "app.crawler.scheduler": "爬取调度",
+    "app.crawler.runner": "爬取执行",
+    "app.crawler.main": "爬取·命令行",
+    "app.crawler.router": "爬取·任务路由",
+    "app.crawler.browse_store": "爬取·商店页",
+    "app.crawler.epic_free": "爬取·Epic 免费",
+    "app.crawler.db_writer": "爬取·入库",
+    "app.crawler.network_check": "爬取·网络自检",
+    "app.crawler.rate_limit": "爬取·出网限流",
+    "app.crawler.http_client": "爬取·HTTP 客户端",
+    "app.crawler.cdk_fetcher": "爬取·CDK 查价",
+    "app.crawler.tag_names": "爬取·标签名",
+    # 价格刷新
+    "app.domains.crawl.service": "价格刷新·周期链",
+    "app.domains.crawl.cycle_run": "价格刷新·周期执行",
+    "app.domains.crawl.cycle": "价格刷新·周期",
+    "app.domains.crawl.router": "价格刷新·接口",
+    # 代理池
+    "app.domains.proxypool.health": "代理池·健康检查",
+    "app.domains.proxypool.runtime": "代理池·运行时",
+    "app.domains.proxypool.bootstrap": "代理池·启动装配",
+    "app.domains.proxypool.scheduling": "代理池·调度",
+    "app.domains.proxypool.admission": "代理池·准入",
+    "app.domains.proxypool.retention": "代理池·清理",
+    "app.domains.proxypool.exitstats": "代理池·出口统计",
+    "app.domains.proxypool.jobruns": "代理池·作业记录",
+    # 代理订阅与内核
+    "app.domains.proxies.clash_manager": "代理内核",
+    "app.domains.proxies.service": "代理订阅",
+    "app.domains.proxies.router": "代理接口",
+    "app.domains.proxies.subscription_secret": "代理订阅·密钥",
+    # 账户与资产
+    "app.domains.account.service": "Steam 账号",
+    "app.domains.account.login": "Steam 登录",
+    "app.domains.account.steam_wallet": "Steam 钱包",
+    "app.domains.family.service": "Steam 家庭",
+    "app.domains.wishlist.service": "愿望单同步",
+    "app.domains.achievements.service": "成就同步",
+    "app.domains.steam_events.service": "Steam 活动",
+    # 价格与账单
+    "app.domains.bills.service": "账单同步",
+    "app.domains.bills.steam_fetch": "账单抓取",
+    "app.domains.games.boards": "榜单同步",
+    "app.domains.games.service": "游戏库",
+    "app.domains.games.series": "游戏系列",
+    "app.domains.metadata.service": "游戏资料",
+    "app.domains.bundles.refresh": "捆绑包刷新",
+    "app.domains.bundles.service": "捆绑包列表",
+    "app.domains.rates.service": "汇率刷新",
+    "app.domains.rates.history": "汇率历史",
+    "app.domains.rates.snapshot": "汇率快照",
+    "app.domains.rates.providers.bing_currency": "汇率源·Bing",
+    "app.domains.alerts.service": "价格提醒",
+    "app.domains.alerts.notify": "提醒推送",
+    "app.domains.notifications.service": "通知中心",
+    "app.domains.notifications.facts": "通知·事实",
+    "app.domains.redeem.service": "兑换",
+    "app.domains.regions.service": "区域",
+    # 运行账本与领航员
+    "app.domains.agent.service": "运行账本",
+    "app.domains.agent.runtime.task_runner": "运行账本·任务执行",
+    "app.domains.agent.runtime.scheduler_bridge": "运行账本·调度桥",
+    "app.domains.agent.runtime.executor": "运行账本·工具执行",
+    "app.domains.agent.runtime.fake": "运行账本·模拟运行",
+    "app.domains.agent.providers.registry": "运行账本·模型来源",
+    "app.domains.pilot.service": "领航员·编排",
+    "app.domains.pilot.session": "领航员·会话",
+    "app.domains.pilot.router": "领航员·接口",
+    "app.domains.pilot.llm": "领航员·模型",
+}
+
+# 三级域兜底：未登记的中文名按 `app.<层>.<名>` 推 `层·名`，至少不让点分路径漏给用户。
+_LAYER_LABELS = {"core": "内核", "crawler": "爬取", "domains": "业务", "providers": "数据源"}
+_DROPPED_SEGMENTS = {"service", "router", "models", "schemas", "main", "__init__"}
+
+
+def module_label(name: str) -> str:
+    """模块路径 → 用户可读名；未登记的按结构兜底，绝不返回点分路径。"""
+    label = _MODULE_LABELS.get(name)
+    if label is not None:
+        return label
+    parts = [p for p in name.split(".") if p != "app"]
+    parts = [p for p in parts if p not in _DROPPED_SEGMENTS] or parts
+    if parts:
+        parts[0] = _LAYER_LABELS.get(parts[0], parts[0])
+    return "·".join(parts) or name
+
+
+def result_tag(record: logging.LogRecord) -> str:
+    """行首结果词：调用方 tag= 优先，否则按级别兜底。"""
+    return str(getattr(record, "hl_tag", None) or _RESULT_BY_LEVEL.get(record.levelno, "信息"))
+
+
+class HumanFormatter(logging.Formatter):
+    """`时间 [结果词] 模块中文名 · 主句 │ 键=值 键=值`。
+
+    文本 handler 用 `datefmt="%H:%M:%S"`（日志页要的是当下读到什么，日期由文件日志承担）；
+    文件 handler 留默认日期。脱敏在**渲染之后**再走一次 `redact()`：`hl_detail` 的值
+    不经过 `RedactFilter`（它只看 `record.getMessage()`），订阅链接这类凭据正是从这里漏的。
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 —— 占位符与参数不匹配时保住这条日志
+            message = str(record.msg)
+        line = f"{self.formatTime(record, self.datefmt)} [{result_tag(record)}] {module_label(record.name)} · {message}"
+        detail = getattr(record, "hl_detail", None)
+        if detail:
+            line += " │ " + " ".join(f"{k}={v}" for k, v in detail.items())
+        if record.exc_info and not record.exc_text:
+            record.exc_text = self.formatException(record.exc_info)
+        if record.exc_text:
+            line += "\n" + record.exc_text
+        if record.stack_info:
+            line += "\n" + self.formatStack(record.stack_info)
+        return redact(line)
+
+
+def log_event(
+    logger: logging.Logger,
+    message: str,
+    *,
+    tag: str | None = None,
+    detail: Mapping[str, object] | None = None,
+    level: int = logging.INFO,
+    exc_info: bool = False,
+) -> None:
+    """一条人话日志：主句写结论，`detail` 放排障要看的键值。
+
+    主句里不要再拼状态枚举与模块黑话（`[L0恢复]`、`frozen`、`missing`）——那些
+    要么翻成人话写进主句，要么作为键值进 `detail`。
+    """
+    logger.log(level, message, extra={"hl_tag": tag, "hl_detail": detail or None}, exc_info=exc_info)
+
+
 class RedactFilter(logging.Filter):
     """把脱敏施加到每一条日志记录上。
 
@@ -136,7 +335,7 @@ class RingBufferLogHandler(logging.Handler):
         self._subscribers: list[asyncio.Queue] = []
         self._lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
-        self.setFormatter(logging.Formatter(_FMT))
+        self.setFormatter(HumanFormatter(datefmt="%H:%M:%S"))
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """SSE 端点在事件循环线程内调用一次；重复绑定无妨（uvicorn 单循环）。"""
@@ -192,11 +391,13 @@ def setup_logging(data_dir: Path, level: int = logging.INFO) -> None:
     if root.handlers:
         return
     root.setLevel(level)
-    fmt = logging.Formatter(_FMT)
+    # 控制台与日志页要「当下读到什么」，只留时分秒；文件是归档与贴 issue 的凭据，留完整日期。
+    live_fmt = HumanFormatter(datefmt="%H:%M:%S")
+    file_fmt = HumanFormatter()
     scrub = RedactFilter()
 
     console = logging.StreamHandler()
-    console.setFormatter(fmt)
+    console.setFormatter(live_fmt)
     console.addFilter(scrub)
     root.addHandler(console)
 
@@ -208,7 +409,7 @@ def setup_logging(data_dir: Path, level: int = logging.INFO) -> None:
         backupCount=5,
         encoding="utf-8",
     )
-    file_handler.setFormatter(fmt)
+    file_handler.setFormatter(file_fmt)
     file_handler.addFilter(scrub)
     root.addHandler(file_handler)
 
