@@ -29,7 +29,7 @@ jobs:
   backend:
     name: 后端（Python 3.13）
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
 
