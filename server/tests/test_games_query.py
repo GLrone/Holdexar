@@ -32,9 +32,15 @@ def _require_populated_library():
     """games 表为空时跳过（真实库用例，同步夹具内 skip 兼容性最好）。"""
     settings = get_settings()
     db_path = settings.data_dir / settings.db_filename
+    if not db_path.is_file():
+        # 库文件不存在（CI runner / 无库环境）：真实库前提不成立，与空库同语义 skip
+        pytest.skip(f"真实库文件不存在（{db_path}），真实库用例跳过")
     con = sqlite3.connect(str(db_path))
     try:
         count = con.execute("SELECT COUNT(*) FROM games").fetchone()[0]
+    except sqlite3.OperationalError:
+        # 库文件在但 games 表缺（半初始化状态）：同属前提不成立
+        pytest.skip("真实库无 games 表（半初始化状态），真实库用例跳过")
     finally:
         con.close()
     if count < 100:

@@ -156,8 +156,8 @@ async def test_stopped_cycle_returns_true_skips_repairing_and_events(
     monkeypatch.setattr(crawl_service, "effective_regions", _regions)
 
     async with db() as session:
-        session.add(Game(appid=770001, name="T", created_at=datetime.now(),
-                         updated_at=datetime.now()))
+        session.add(Game(appid=770001, name="T", created_at=_now_naive(),
+                         updated_at=_now_naive()))
         session.add(GameCurrentPrice(
             appid=770001, region_code="CN", currency="CNY", price=None,
             original_price=None, discount_percent=0, sub_id=None,
@@ -202,12 +202,20 @@ async def test_stopped_cycle_returns_true_skips_repairing_and_events(
 # ── has_pending_missing：EXISTS 直查 ──
 
 
+def _now_naive() -> datetime:
+    """时间戳列统一北京时 naive（与生产的冷却判定同源）：本机时区若是
+    UTC（云端 runner），datetime.now() 会与判定口径错位整 8 小时。"""
+    from app.crawler.utils import get_beijing_time_obj
+
+    return get_beijing_time_obj().replace(tzinfo=None)
+
+
 def _missing_row(appid, region="CN", age_hours=2.0):
     return GameCurrentPrice(
         appid=appid, region_code=region, currency="CNY", price=None,
         original_price=None, discount_percent=0, sub_id=None,
         price_status="missing", fail_count=1,
-        updated_at=datetime.now() - timedelta(hours=age_hours),
+        updated_at=_now_naive() - timedelta(hours=age_hours),
     )
 
 

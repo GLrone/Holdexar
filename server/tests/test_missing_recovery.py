@@ -11,6 +11,13 @@
 """
 from datetime import datetime, timedelta
 
+
+def _now_naive() -> datetime:
+    """时间戳列统一北京时 naive（与生产的冷却判定同源），不依赖本机时区。"""
+    from app.crawler.utils import get_beijing_time_obj
+
+    return get_beijing_time_obj().replace(tzinfo=None)
+
 import pytest
 import pytest_asyncio
 from sqlalchemy import delete
@@ -25,7 +32,7 @@ APPID3 = 997_003
 
 
 def _game(appid: int, name: str = "补抓测试游戏") -> Game:
-    now = datetime.now()
+    now = _now_naive()
     return Game(
         appid=appid, name=name, created_at=now, updated_at=now,
     )
@@ -46,7 +53,7 @@ def _price(
         price_status=status,
         fail_count=fail_count,
         cny_fen=price,
-        updated_at=updated_at or datetime.now(),
+        updated_at=updated_at or _now_naive(),
     )
 
 
@@ -54,7 +61,7 @@ def _price(
 async def _seed():
     await init_db()
     appids = [APPID, APPID2, APPID3]
-    now = datetime.now()
+    now = _now_naive()
     async with get_session_factory()() as session:
         # 三款合成游戏 + 各自的价格欠账/终态行
         session.add_all([_game(a) for a in appids])
@@ -143,7 +150,7 @@ async def test_generate_missing_tasks():
 async def test_upsert_gate_degrades_ok_without_price():
     """质量门禁：status=ok 且 price=None 的行降级 missing 并计一次账。"""
     db = DbWriter()
-    now = datetime.now()
+    now = _now_naive()
     game_data = {
         "appid": APPID3, "name": "门禁测试", "updated_at": now,
     }
@@ -180,7 +187,7 @@ async def test_upsert_gate_degrades_ok_without_price():
 async def test_upsert_recovery_clears_ledger():
     """补抓闭环：欠账行补到有价 → 回 ok 且 fail_count 清零。"""
     db = DbWriter()
-    now = datetime.now()
+    now = _now_naive()
     # APPID 已有 CN/UA missing 欠账（夹具播种）
     game_data = {"appid": APPID, "name": "补抓回填", "updated_at": now}
     prices = [
@@ -214,7 +221,7 @@ async def test_generate_tasks_cooldown_boundary():
 async def test_generate_missing_tasks_batches_by_region():
     """按区分组凑批：同区欠账超过单发上限拆多发，每发 ≤400 行且不重不漏。"""
     db = DbWriter()
-    now = datetime.now()
+    now = _now_naive()
     # 段位取现网 Steam appid 上限（~505 万）之外，避开真实库的既有行
     batch_ids = list(range(9_980_000, 9_980_000 + 401))
     id_set = set(batch_ids)
@@ -252,7 +259,7 @@ async def test_generate_missing_tasks_includes_free_state_rows():
     from app.domains.games.models import Game as _Game
 
     appid = 997_101
-    now = datetime.now()
+    now = _now_naive()
     async with get_session_factory()() as session:
         session.add(_Game(appid=appid, name="免费态欠账游戏", free_kind="f2p",
                           created_at=now, updated_at=now))
@@ -276,7 +283,7 @@ async def test_generate_missing_tasks_clears_empty_region_rows():
     """空区行（region_code=''）即拾即清：无对应真实区服、没有 bump 路径，
     留在账本只会永久占位。"""
     appid = 997_102
-    now = datetime.now()
+    now = _now_naive()
     async with get_session_factory()() as session:
         session.add(_price(appid, "", "missing", None, fail_count=1,
                            updated_at=now - timedelta(hours=2)))

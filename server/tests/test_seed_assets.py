@@ -207,6 +207,14 @@ async def _cleanup():
     # 但**绝不能只删不还**：本测试对真实开发库跑，marker 是种子通道的幂等锚，
     # 被删后下一次应用启动会整链重跑（名单合并、现价快照合并全量过一遍），
     # 日志表现为「每次启动都在执行种子合并」——正是曾经发生过的真实污染。
+    # 无库环境（CI runner）先建全 schema 空库：本文件断言的「存量形态」用例
+    # 各自 arrange 合成行，空 schema 即可承载；本机真实库存在时零行为变化
+    import app.core.database as _database
+
+    settings = _database.get_settings()
+    if not (settings.data_dir / settings.db_filename).is_file():
+        await _database.init_db()
+        await _database.get_engine().dispose()
     keys_sql = ", ".join(f"'{k}'" for k in _ALL_MARKER_KEYS)
     async with get_session_factory()() as session:
         saved_markers: dict[str, str] = {
