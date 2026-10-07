@@ -589,7 +589,7 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
     cache_read_total: int | None = None
     cache_write_total: int | None = None
     cache_base_total = 0
-    # 逐请求计时：TTFT=请求起点→首个内容增量；decode=首个增量→流结束
+    # 逐请求计时：等待首增量（请求起点→首个内容增量）与解码期（首个增量→流结束）
     # （仅在使用量同步回传的请求计入速度口径——没有 token 数的墙钟不进分母）
     ttft_ms_total = 0.0
     ttft_n = 0

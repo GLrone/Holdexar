@@ -1,4 +1,4 @@
-"""openai 兼容 /chat/completions 适配（DeepSeek / 智谱 / 通义 / Kimi 等）。"""
+"""openai 兼容 /chat/completions 适配。"""
 from __future__ import annotations
 
 import json
