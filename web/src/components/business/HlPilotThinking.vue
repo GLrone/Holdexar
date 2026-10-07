@@ -30,8 +30,7 @@ const props = withDefaults(
 
 const { t } = useI18n()
 
-/* 首个 delta 前的等待计时：供应商排队/首 token 延迟是阶段间「断层」的本体，
-   静态话术掩盖不了死等——逐秒跳动的计数才是诚实信号。文本到达即停。 */
+/* 首个增量前的等待计时：逐秒跳动的计数让死等可感知，文本到达即停。 */
 const waitSec = ref(0)
 let waitTicker: ReturnType<typeof setInterval> | null = null
 

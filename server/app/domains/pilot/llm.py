@@ -99,7 +99,7 @@ def _sse_data_lines(aiter_lines):
     return _gen()
 
 
-# ── openai（兼容 DeepSeek / 智谱 / 通义 / Kimi 等）────────────────────
+# ── openai 兼容 ────────────────────────────────────────────
 
 def _openai_request(base_url: str, api_key: str, model: str, messages: list[dict], tools: list[dict] | None) -> tuple[str, dict, dict]:
     url = base_url.rstrip("/") + "/chat/completions"

@@ -39,6 +39,9 @@ TRACE_PATTERNS: list[tuple[str, str]] = [
     (r"背景[：:]|动机[：:]", "开发背景叙述"),
     (r"我们", "第一人称叙述"),
     (r"20\d{2}-\d{2}-\d{2}", "注释内开发日期"),
+    (r"云知声|u2-?flash|书生|智谱|硅基|bigmodel|siliconflow|moonshot|dashscope|deepseek|openrouter|通义|月之暗面|kimi",
+     "外部供应商 / 服务名（溯源字样）"),
+    (r"TTFT|首\s?token", "实测性能数据术语"),
 ]
 
 # 例外登记：文件 → [(正则, 理由)]。命中行的注释文本匹配该正则即放行。
