@@ -166,6 +166,8 @@ def test_patterns_are_single_source_for_agents_md():
         "开发背景叙述",
         "第一人称叙述",
         "注释内开发日期",
+        "外部供应商 / 服务名（溯源字样）",
+        "实测性能数据术语",
     }
 
 
