@@ -21,6 +21,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+
+# 输出统一 UTF-8：管道场景 stdout 编码跟随 ANSI 代码页，西欧环境编不了中文
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
 # 子进程直接写继承的 stdout，父进程的选测报告须即时冲刷，否则管道下顺序颠倒
 print = functools.partial(print, flush=True)
 
