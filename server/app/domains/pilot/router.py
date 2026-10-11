@@ -239,6 +239,7 @@ async def get_session(session_id: str) -> PilotSessionOut:
         pinned=state.pinned,
         archived=state.archived,
         forked_from=state.forked_from,
+        inflight_q=service.inflight_question(session_id),
     )
 
 
@@ -425,6 +426,9 @@ async def ask_stream(payload: AskRequest):
         sid = payload.session_id
         if sid:
             service.mark_session_running(sid)
+            # 与本层运行登记同生命周期：刷新后据此补一屏进行中轮（含只挂附件的提交）
+            service.set_inflight_question(
+                sid, (payload.question or "").strip() or ("附件" if payload.attachments else ""))
         try:
             try:
                 async for event in service.ask_stream(payload.question, payload.appid,
@@ -440,6 +444,7 @@ async def ask_stream(payload: AskRequest):
         finally:
             if sid:
                 service.clear_session_running(sid)
+                service.clear_inflight_question(sid)
 
     return StreamingResponse(
         gen(),
