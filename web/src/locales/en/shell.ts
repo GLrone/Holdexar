@@ -62,7 +62,13 @@ const shell: Partial<Record<MessageKey, string>> = {
   'shell.lang.targetEn': 'EN',
   'shell.lang.targetZh': '中',
 
-  'update.toastAvailable': 'Version v{version} is available — update from the "Me" page',
+  /* App update: top-left bubble (UpdateBubble.vue) + sidebar dot */
+  'update.bubble.available': 'New version v{version}',
+  'update.bubble.ready': 'Restart to update v{version}',
+  'update.bubble.downloading': 'Downloading {percent}%',
+  'update.bubble.swapFailed': 'Last update did not finish',
+  'update.bubble.hoverPreparing': 'Preparing to download…',
+  'update.bubble.clickHint': 'Click for details and download',
   'update.navDot': 'Update available',
 
   'shell.updateReady.title': 'Update downloaded',

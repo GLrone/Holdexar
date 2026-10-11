@@ -110,9 +110,13 @@ const bills: Partial<Record<MessageKey, string>> = {
   'bills.ledger.detail.rateValue': '1 {code} = {rate} CNY',
   'bills.ledger.detail.discount': 'Discount',
   'bills.ledger.detail.origPrice': 'Original price',
+  'bills.ledger.detail.basePrice': 'Base price',
+  'bills.ledger.detail.walletBalance': 'Wallet balance',
   'bills.ledger.detail.payment': 'Payment method',
+  'bills.ledger.detail.paymentSplit': 'Payment split',
   'bills.ledger.detail.ownership': 'Source',
   'bills.ledger.detail.giftRefund': 'Gift refund',
+  'bills.ledger.detail.giftTo': 'Sent to',
 
   /* ── Hit strips (shared by CdkTab + LedgerTab: family-library match + price context) ── */
   'bills.hit.stat': 'Library hits',

@@ -5,7 +5,8 @@
    - 家庭库 → familyLib store（GET /family/library），自 family 页迁入，
      页签激活时由 FamilyLib 自行拉取（familyLib store 的 ready 守卫复用缓存）；
    - 游玩动态（GlPlay）同数据源，自 family 页迁入（词条 famPlay.* 随迁）。 */
-import { computed, onMounted, ref, type Component } from 'vue'
+import { computed, onMounted, ref, watch, type Component } from 'vue'
+import { useRoute } from 'vue-router'
 
 import { useI18n, type MessageKey } from '@/locales'
 import { HlPaneSwitch, HlTabs, type HlTabItem } from '@/components/ui'
@@ -23,6 +24,8 @@ onMounted(() => {
 
 const activeTab = ref('owned')
 
+
+
 /* 页签常量**只存词条 key**：模块级常量存译文会把语言冻在模块加载那一刻，
    渲染期 t(tab.labelKey) 才是响应式的。 */
 const TAB_KEYS: { key: string; labelKey: MessageKey }[] = [
@@ -35,6 +38,13 @@ const TAB_KEYS: { key: string; labelKey: MessageKey }[] = [
 const tabItems = computed<HlTabItem[]>(() =>
   TAB_KEYS.map((x) => ({ key: x.key, label: t(x.labelKey) })),
 )
+
+/* 领航员导航带板块键（route.query.s）：合法页签直接定位（agent 跳转入口） */
+const route = useRoute()
+watch(() => route.query.s, (s) => {
+  if (typeof s === 'string' && TAB_KEYS.some((t) => t.key === s)) activeTab.value = s
+}, { immediate: true })
+
 
 /* 页签 → 面板组件。**映射而不是 v-if 链**：面板切换要过渡，<Transition> 只接受
    单个子节点，v-if 链会编译成 fragment，过渡不触发（family 页同款教训）。 */

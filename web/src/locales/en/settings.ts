@@ -108,41 +108,9 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.backup.removing': 'Deleting…',
   'settings.backup.empty': 'No backups yet — click “Back up now” to create the first one.',
 
-  /* App update card */
-  'settings.update.desc': 'Reads the release manifest to compare versions, then downloads and verifies the SHA256 — restart the app to finish. Updates replace program files only; your data (games, prices, accounts, backups) lives in its own data directory and is never touched.',
-  'settings.update.check': 'Check for updates',
-  'settings.update.checking': 'Checking…',
-  'settings.update.currentVersion': 'Current version v{version}',
-  'settings.update.pendingReady': 'v{version} is downloaded and verified — restart the app to finish updating.',
-  'settings.update.restartNow': 'Restart and update',
-  'settings.update.later': 'Not now',
-  'settings.update.download': 'Download v{version}',
-  'settings.update.downloading': 'Downloading…',
-  'settings.update.noChecksum': '(this release has no checksum)',
-  'settings.update.networkPre': 'GitHub is unreachable right now. Try again later, or open the',
-  'settings.update.noReleasePre': 'No published release found yet. Try again later, or check the',
-  'settings.update.releasesPage': 'releases page',
-  'settings.update.networkPost': ' to download manually.',
-  'settings.update.noReleasePost': ' for updates.',
-  'settings.update.upToDate': 'You are on the latest version (v{version}).',
-  'settings.update.availableHint':
-    'v{version} is available — use "Check for updates" to download and install it from the update dialog.',
-  'settings.update.phaseDownloading': 'Downloading {progress}',
-  'settings.update.phaseVerifying': 'Verifying SHA256…',
-  'settings.update.phaseExtracting': 'Extracting…',
-  'settings.update.phaseProcessing': 'Working…',
-  /* Update behaviour switches (alerts / silent auto-update) */
-  'settings.update.notifyLabel': 'New version alerts',
-  'settings.update.notifyHint':
-    'Pop up a dialog and light a dot on "Me" in the sidebar when an update is found. Turn it off to stay silent — you can still check manually any time.',
-  'settings.update.notifyOn': 'New version alerts turned on',
-  'settings.update.notifyOff': 'New version alerts turned off — no more interruptions',
-  'settings.update.autoLabel': 'Silent auto-update',
-  'settings.update.autoHint':
-    'Download and verify new versions in the background with no popup; the update is applied the next time you start the app.',
-  'settings.update.autoOn': 'Silent auto-update turned on — downloads will run in the background',
-  'settings.update.autoOff': 'Silent auto-update turned off — downloads are manual again',
-  'settings.update.autoStarted': 'Downloading v{version} in the background — we will not interrupt you',
+  /* The app-update card has left the settings page (its UI moved into the
+     top-left bubble and the global update dialog); only the backup switch
+     still borrows this namespace's failure copy. */
   'settings.update.switchFailed': 'Could not save the setting — please try again',
 
   /* Guided-tour card (the tour copy itself lives in ProductTour.vue) */

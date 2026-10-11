@@ -121,6 +121,17 @@ const toolbox: Partial<Record<MessageKey, string>> = {
   'toolbox.cdk.done.allFailed': 'Every activation failed ({fail}) — see the result list',
   'toolbox.cdk.done.allFailedSkipped':
     'Every activation failed ({fail}) — see the result list · {skipped} skipped (quota)',
+
+  /* Activation history (server-side ledger: successes, already-owned, failures and free claims all kept) */
+  'toolbox.cdk.history.title': 'Activation history',
+  'toolbox.cdk.history.count': '{n} in total',
+  'toolbox.cdk.history.loading': 'Loading history…',
+  'toolbox.cdk.history.empty': 'No activation records yet',
+  'toolbox.cdk.history.col.time': 'Time',
+  'toolbox.cdk.history.col.result': 'Result',
+  'toolbox.cdk.history.col.item': 'Item',
+  'toolbox.cdk.history.col.detail': 'Notes',
+  'toolbox.cdk.history.freeItem': 'Free claim · SubID {subid}',
 }
 
 export default toolbox

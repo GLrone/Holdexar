@@ -108,40 +108,8 @@ const settings = {
   'settings.backup.removing': '删除中…',
   'settings.backup.empty': '尚无备份——点击「立即备份」创建第一份。',
 
-  /* ── 应用更新卡片 ── */
-  'settings.update.desc': '读取发布清单比对版本，下载并校验 SHA256 后重启应用即可完成更新。更新只替换程序文件，你的数据（游戏、价格、账号、备份）保存在独立的数据目录中，永不受影响。',
-  'settings.update.check': '检查更新',
-  'settings.update.checking': '检查中…',
-  'settings.update.currentVersion': '当前版本 v{version}',
-  'settings.update.pendingReady': 'v{version} 已下载并校验完成，重启应用即可完成更新。',
-  'settings.update.restartNow': '重启并更新',
-  'settings.update.later': '暂不更新',
-  'settings.update.download': '下载 v{version}',
-  'settings.update.downloading': '下载中…',
-  'settings.update.noChecksum': '（本次发布未提供校验值）',
-  'settings.update.networkPre': 'GitHub 暂时不可达，可稍后重试或前往',
-  'settings.update.noReleasePre': '暂未查到可用的发布版本，可稍后重试或前往',
-  'settings.update.releasesPage': '发布页',
-  'settings.update.networkPost': '手动下载。',
-  'settings.update.noReleasePost': '查看。',
-  'settings.update.upToDate': '已是最新版本（v{version}）。',
-  'settings.update.availableHint': '发现新版本 v{version}，点「检查更新」在弹窗里一键下载安装。',
-  'settings.update.phaseDownloading': '下载中 {progress}',
-  'settings.update.phaseVerifying': '校验 SHA256…',
-  'settings.update.phaseExtracting': '解包中…',
-  'settings.update.phaseProcessing': '处理中…',
-  /* 更新行为开关（提示 / 静默自动更新）：标签 + 说明 + 落定提示各一条 */
-  'settings.update.notifyLabel': '新版本提示',
-  'settings.update.notifyHint':
-    '发现新版本时弹窗提醒，并在侧栏「我」上亮红点。关闭后不再主动打扰，仍可随时手动检查。',
-  'settings.update.notifyOn': '已开启新版本提示',
-  'settings.update.notifyOff': '已关闭新版本提示，不再主动打扰',
-  'settings.update.autoLabel': '静默自动更新',
-  'settings.update.autoHint':
-    '发现新版本后在后台自动下载并校验，不弹窗；下次启动应用时自动完成更新。',
-  'settings.update.autoOn': '已开启静默自动更新，将在后台自动下载',
-  'settings.update.autoOff': '已关闭静默自动更新，改为手动下载',
-  'settings.update.autoStarted': '已开始后台下载 v{version}，完成前不会打扰你',
+  /* 应用更新卡片已撤出设置页（交互收进左上角气泡与全局更新弹窗），
+     仅备份开关沿用本命名空间的失败提示 */
   'settings.update.switchFailed': '设置保存失败，请重试',
 
   /* ── 新手教程卡片（导览正文在 ProductTour.vue，本页只有入口）── */

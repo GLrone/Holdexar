@@ -34,6 +34,7 @@ const family: Partial<Record<MessageKey, string>> = {
   'family.member.exclusive': 'Exclusive {n}',
   'family.member.recent30': 'Acquired in last 30 days {n}',
   'family.member.remove': 'Remove',
+  'family.remove.failed': 'Failed to remove member: {err}',
 
   /* Region popover */
   'family.regionPop.who': '{role} · currently {region}',
@@ -58,6 +59,7 @@ const family: Partial<Record<MessageKey, string>> = {
   'family.add.needInput': 'Enter a friend code or SteamID64 first — the account must resolve before it can be added',
   'family.add.trackFailed': 'Added to the list, but tracking failed: {err}',
   'family.add.success': 'Added {name} — now tracked in the watch pool. Link a cookie and run “Sync family group” to fill in the rest.',
+  'family.add.failed': 'Failed to add member: {err}',
   'family.add.confirming': 'Adding…',
   'family.add.action': 'Add',
   'family.add.invite': '＋ Invite a member to the family group ({n} / 6 — room for {left} more, drag to reorder)',

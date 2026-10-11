@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type ComponentPublicInstance } from 'vue'
 
 import {
   ApiError,
   askPilotStream,
   pilotApi,
   type PilotAskResponse,
+  type PilotAttachmentChunk,
+  type PilotAttachmentRef,
   type PilotFacts,
   type PilotGameFactsItem,
   type PilotNavigateFacts,
@@ -13,6 +15,7 @@ import {
   type PilotPriceFacts,
   type PilotProvider,
   type PilotRegionsFacts,
+  type PilotResumePayload,
   type PilotSessionListItem,
   type PilotSessionStats,
   type PilotStep,
@@ -20,14 +23,15 @@ import {
 import { formatCnyFen } from '@/api/regions'
 import { mdLiteToHtml } from '@/lib/markdownLite'
 import { buildCtxSegments, shouldShowCacheHitRate } from '@/lib/ctxSegments'
-import { fmtTokens, pilotCoverUrl, positivePct, ratingClass, sessionTime } from '@/lib/pilotView'
+import { fmtTokens, isErrorReason, isLongAnswerText, pilotCoverUrl, positivePct, ratingClass, sessionTime } from '@/lib/pilotView'
 import HlImg from '@/components/ui/HlImg.vue'
 import HlSkeleton from '@/components/ui/HlSkeleton.vue'
 import HlPilotCards from '@/components/business/HlPilotCards.vue'
 import HlPilotChain from '@/components/business/HlPilotChain.vue'
 import HlPilotOutline from '@/components/business/HlPilotOutline.vue'
+import HlPilotRuns from '@/components/business/HlPilotRuns.vue'
 import HlPilotStats from '@/components/business/HlPilotStats.vue'
-import { useRouter } from 'vue-router'
+import { useRouter, useRoute } from 'vue-router'
 import { useI18n, type MessageKey } from '@/locales'
 import HlButton from '@/components/ui/HlButton.vue'
 import HlTextarea from '@/components/ui/HlTextarea.vue'
@@ -36,6 +40,7 @@ import HlTag from '@/components/ui/HlTag.vue'
 import HlDropdown from '@/components/ui/HlDropdown.vue'
 import HlInput from '@/components/ui/HlInput.vue'
 import { message } from '@/components/ui'
+import { useElementPicker, type PickedElement } from '@/composables/useElementPicker'
 
 /**
  * 领航台对话核心（抽屉与整页 /pilot 共用同一实现——一事实一实现）。
@@ -54,6 +59,46 @@ const props = withDefaults(
 )
 const { t } = useI18n()
 const router = useRouter()
+const route = useRoute()
+
+/** 采集当前页面上下文（路由 + 板块 + 会话标题 + 游戏上下文），随每次提问注入模型 */
+const viewContext = computed(() => {
+  const ctx: { route: string; section?: string; sessionTitle?: string; appid?: number } = { route: route.path }
+  const s = route.query.s
+  if (typeof s === 'string' && s) ctx.section = s
+  // 会话标题让模型知道用户在讨论什么话题（整页 /pilot 模式下路由无信息量，
+  // 会话标题是唯一线索）
+  const cur = (sessions.value ?? []).find((x) => x.sid === sessionId.value)
+  if (cur?.title) ctx.sessionTitle = cur.title
+  // 游戏详情页：从路由参数提取 appid（顶栏通用入口不传 game prop，
+  // 但用户确实在游戏详情页——路由参数是唯一可靠来源）
+  if (route.path.startsWith('/game/')) {
+    const id = Number(route.params.appid)
+    if (id > 0) ctx.appid = id
+  }
+  return ctx
+})
+
+/** 页面元素选择器：用户点击输入框中的按钮进入选择模式，点击页面元素采集引用 */
+const {
+  isPicking: elPicking,
+  picked: pickedElements,
+  startPicking: startElPicking,
+  cancelPicking: cancelElPicking,
+  removePicked: removePickedEl,
+  clearPicked: clearPickedEls,
+} = useElementPicker()
+
+/** 已选元素引用 → 随提问发送的精简数据（只传 agent 需要的字段） */
+const elementRefs = computed(() =>
+  pickedElements.value.map((p) => ({
+    tag: p.tag,
+    label: p.label,
+    text: p.text,
+    selector: p.selector,
+    role: p.role,
+  })),
+)
 
 interface Turn {
   q: string
@@ -64,6 +109,8 @@ interface Turn {
   compactTrigger?: string
   /** 本轮被用户停止生成（保留已流出内容） */
   stopped?: boolean
+  /** 账本里的轮次序号（编辑重问的定位依据）；未落账的轮为 undefined */
+  turnIndex?: number
   text?: string
   reasonKey?: MessageKey
   items?: PilotGameFactsItem[]
@@ -79,6 +126,10 @@ interface Turn {
   elapsedSec?: number
   /** 过程链记忆快照：本轮上下文占用 + 归档边界 + 缓存命中 */
   mem?: { tokens: number | null; budget: number | null; archived: number | null; cached: boolean } | null
+  /** 本轮随问携带的长文本附件（用户气泡下的附件芯片；点击展开内容） */
+  attachments?: PilotAttachmentRef[]
+  /** 长回答是否展开（最新对话结果默认展开，发新对话时自动收敛；随轮持有，可手动切换） */
+  expanded?: boolean
 }
 
 const question = ref('')
@@ -106,11 +157,27 @@ function clearQueuedHint() {
 }
 /** 流式期步骤展平（过程链的旧口径 prop；阶段记录在场时以 phases 为准） */
 const liveStepsFlat = computed(() => livePhases.value.flatMap((p) => p.steps))
-/* 终答就位渲染：文字在回答层原位生长（与终态布局同序），done 不再翻转 */
+/* 终答就位渲染：回答层只承接「尚未被工具定性的当前段」正文——tool_start
+   一到，该段正文划归过程链（链内 phasePre 就地展示），回答层空窗等待终答。
+   模型在调工具前输出的过程叙述不再以「先文字后卡片」的形态占据回答层。 */
 const liveAnswerHtml = computed(() => {
-  const text = livePhases.value.map((p) => p.text).join('')
-  return text ? mdLiteToHtml(text) : ''
+  const phases = livePhases.value
+  if (!phases.length) return ''
+  const last = phases[phases.length - 1]!
+  const text = last.steps.length ? '' : last.text
+  return text ? renderAnswerHtml(text) : ''
 })
+
+/** 回答层统一渲染入口：支持 SVG 矢量图实时渐进式渲染与终态卡片呈现。 */
+function renderAnswerHtml(text: string): string {
+  return mdLiteToHtml(text, {
+    svgPendingLabel: t('pilot.svgPending'),
+    svgDrawingLabel: t('pilot.svgDrawing'),
+    svgPreviewLabel: t('pilot.svgPreview'),
+    svgCodeLabel: t('pilot.svgCode'),
+    svgCopyLabel: t('pilot.svgCopy'),
+  })
+}
 
 /** 流式期即时卡片账：tool_start 按类型预告挂骨架占位，card 事件原位填充——
  *  卡片在终态前先可见，done 整轮替换时高度已就位，不再整块砸出。 */
@@ -157,7 +224,8 @@ const sessionId = ref('')
 const scrollBox = ref<HTMLDivElement | null>(null)
 // 输入区状态栏：在用模型 + 最近一轮上下文占用（均来自后端账本/配置，前端不自测）
 const pilotModel = ref('')
-const pilotReady = ref(false)
+// 三态：null=尚未拿到配置（不渲染，避免误报「未配置」）/ true=可用 / false=确认未配
+const pilotReady = ref<boolean | null>(null)
 const pilotModels = ref<string[]>([])
 const pilotDisabled = ref<string[]>([])
 // 多供应商：菜单按厂商分组收敛/展开（活跃组默认展开）
@@ -249,6 +317,8 @@ function fmtPct(v: number | null | undefined): string {
 const switchingModel = ref(false)
 // 会话管理：常驻标签栏 + 跨会话引用（清单是后端账本投影，轮后刷新；null = 投影未到，不猜）
 const sessions = ref<PilotSessionListItem[] | null>(null)
+/** 本会话分叉自哪个会话（账本事实；非派生会话为 null） */
+const forkedFrom = ref<string | null>(null)
 const renamingSid = ref('')
 const renameText = ref('')
 const deleteArmSid = ref('')
@@ -258,6 +328,12 @@ const referenceSession = ref<{ sid: string; title: string } | null>(null)
 const openSids = ref<string[]>([])
 const historyOpen = ref(false)
 const historyRoot = ref<HTMLElement | null>(null)
+// 会话列检索/归档折叠：检索走后端账本投影（标题与问答正文命中），不在前端过滤
+const sessionQuery = ref('')
+let sessionSearchTimer: ReturnType<typeof setTimeout> | null = null
+const archivedOpen = ref(false)
+// 会话级动作在途集合（置顶/归档按钮防连点；同名 sid 只压一次）
+const flagBusy = ref<string>('')
 
 const ctxPercent = computed(() => {
   if (!lastCtx.value || lastCtx.value.budget <= 0) return 0
@@ -354,17 +430,25 @@ onMounted(() => {
     sessionId.value = newSessionId()
     saveSessionId(sessionId.value)
   }
+  loadQueue()
 })
 
 /** 领航员在用模型与可用态（设置页保存后重开表面即刷新）。 */
-async function loadPilotStatus() {
+async function loadPilotStatus(retry = 0): Promise<void> {
   try {
     const cfg = await pilotApi.getConfig()
     pilotModel.value = cfg.model || ''
     pilotProviders.value = cfg.providers || []
     pilotActiveId.value = cfg.active || ''
-    pilotReady.value = Boolean(cfg.enabled && cfg.base_url && cfg.model && cfg.has_api_key)
+    // 与后端 llm_ready 同口径：enabled + base_url + model；密钥可选，不参与判定
+    pilotReady.value = Boolean(cfg.enabled && cfg.base_url && cfg.model)
   } catch {
+    // 冷启动窗口（后端装配/DB 写锁排队）内首次拉取会失败：按退避重拉，
+    // 不把一次失败当终态——否则整个会话都停在「未配置」，只有刷新页面才恢复
+    if (retry < 4) {
+      setTimeout(() => void loadPilotStatus(retry + 1), 800 * (retry + 1))
+      return
+    }
     pilotReady.value = false
   }
 }
@@ -437,6 +521,7 @@ async function restoreSession(sid: string) {
     const data = await pilotApi.getSession(sid)
     // 会话统计投影（底栏与消耗明细种子）：空会话为 null，不在旧会话上残留
     sessionStats.value = data.stats ?? null
+    forkedFrom.value = data.forked_from ?? null
     if (!data.turns.length) return
     proposalStates.value = new Map(
       (data.proposals ?? []).map((p) => [p.pid, { ...p, failedCount: p.failedCount ?? 0 }]),
@@ -445,13 +530,19 @@ async function restoreSession(sid: string) {
     data.turns.forEach((t, idx) => {
       const turn = buildTurn(t.q, { ...t.resp, cached: false }, [])
       syncProposalCards(turn.cards ?? [])
-      items.push(turn)
+      items.push({ ...turn, turnIndex: idx, expanded: false })
       for (const m of data.markers ?? []) {
         if (m.after_turn === idx + 1) {
           items.push({ q: '', kind: 'compact', steps: [], compactTrigger: m.trigger || 'auto' })
         }
       }
     })
+    for (let i = items.length - 1; i >= 0; i--) {
+      if (items[i].kind === 'answer' || items[i].text) {
+        items[i].expanded = true
+        break
+      }
+    }
     turns.value = items
     const lastResp = data.turns[data.turns.length - 1]?.resp
     lastCtx.value =
@@ -479,7 +570,9 @@ function startNewChat() {
   sessionStats.value = null
   sessionId.value = newSessionId()
   saveSessionId(sessionId.value)
+  loadQueue()
   referenceSession.value = null
+  forkedFrom.value = null
   void loadSessions()
 }
 
@@ -487,10 +580,106 @@ function startNewChat() {
 
 async function loadSessions() {
   try {
-    const data = await pilotApi.listSessions(50)
+    const data = await pilotApi.listSessions(50, sessionQuery.value.trim())
     sessions.value = data.items
   } catch {
     sessions.value = []
+  }
+}
+
+/** 检索输入：防抖 300ms 后按关键词重投影（账本侧过滤，非前端筛） */
+function onSessionQueryInput() {
+  if (sessionSearchTimer) clearTimeout(sessionSearchTimer)
+  sessionSearchTimer = setTimeout(() => {
+    sessionSearchTimer = null
+    void loadSessions()
+  }, 300)
+}
+
+/** 会话列分区：归档项从主列收进折叠区；置顶由后端排序在前（前端不再重排）。
+    检索态下不分区——命中结果平铺，避免归档命中被折叠区藏住。 */
+const searchingSessions = computed(() => sessionQuery.value.trim().length > 0)
+const liveSessions = computed(() => {
+  const all = sessions.value ?? []
+  return searchingSessions.value ? all : all.filter((s) => !s.archived)
+})
+const archivedSessions = computed(() => (sessions.value ?? []).filter((s) => s.archived))
+
+/** 会话列渲染行：主列 + （非检索态下的）归档折叠头 + 展开的归档项，扁平成一个数组 */
+interface SideRow { head?: boolean; item?: PilotSessionListItem; count?: number }
+const sideRows = computed<SideRow[]>(() => {
+  const out: SideRow[] = liveSessions.value.map((it) => ({ item: it }))
+  if (!searchingSessions.value && archivedSessions.value.length) {
+    out.push({ head: true, count: archivedSessions.value.length })
+    if (archivedOpen.value) for (const it of archivedSessions.value) out.push({ item: it })
+  }
+  return out
+})
+
+/** 置顶/归档开关：账本追加记录，成功后回填本行并重投影（排序随之后端定） */
+async function togglePin(it: PilotSessionListItem) {
+  if (flagBusy.value) return
+  flagBusy.value = it.sid
+  try {
+    const r = await pilotApi.pinSession(it.sid, !it.pinned)
+    if (!r.ok) {
+      message.error(t('pilot.session.flagFailed'))
+      return
+    }
+    it.pinned = !it.pinned
+    await loadSessions()
+  } catch {
+    message.error(t('pilot.session.flagFailed'))
+  } finally {
+    flagBusy.value = ''
+  }
+}
+
+async function toggleArchive(it: PilotSessionListItem) {
+  if (flagBusy.value) return
+  flagBusy.value = it.sid
+  try {
+    const r = await pilotApi.archiveSession(it.sid, !it.archived)
+    if (!r.ok) {
+      message.error(t('pilot.session.flagFailed'))
+      return
+    }
+    it.archived = !it.archived
+    await loadSessions()
+  } catch {
+    message.error(t('pilot.session.flagFailed'))
+  } finally {
+    flagBusy.value = ''
+  }
+}
+
+/** 分叉失败机器码 → 人话（复用编辑重问的失败码口径） */
+const FORK_FAIL_KEYS: Record<string, MessageKey> = {
+  no_session: 'pilot.edit.fail.gone',
+  busy: 'pilot.edit.fail.busy',
+  write_failed: 'pilot.edit.fail.write',
+}
+
+/** 话题分叉：从本会话第 idx 轮（含）派生新会话并切过去（源账本零改动）。 */
+async function forkFromTurn(idx: number) {
+  if (streaming.value || flagBusy.value) return
+  const turn = turns.value[idx]
+  if (!turn || typeof turn.turnIndex !== 'number') return
+  flagBusy.value = 'fork'
+  try {
+    const out = await pilotApi.forkSession(sessionId.value, turn.turnIndex + 1)
+    if (!out.ok || !out.sid) {
+      message.error(t(FORK_FAIL_KEYS[out.reason ?? ''] ?? 'pilot.session.forkFailed'))
+      return
+    }
+    openSessionSid(out.sid)
+    await loadSessions()
+    message.success(t('pilot.session.forked'))
+    await switchSession(out.sid)
+  } catch {
+    message.error(t('pilot.session.forkFailed'))
+  } finally {
+    flagBusy.value = ''
   }
 }
 
@@ -519,11 +708,13 @@ async function switchSession(sid: string) {
   if (streaming.value || sid === sessionId.value) return
   sessionId.value = sid
   saveSessionId(sid)
+  loadQueue()
   turns.value = []
   livePhases.value = []
   lastCtx.value = null
   sessionStats.value = null
   referenceSession.value = null
+  forkedFrom.value = null
   await restoreSession(sid)
 }
 
@@ -601,6 +792,9 @@ async function runQuick(tool: string) {
   if (!item) return
   quickBusy.value = true
   const label = t(item.key as MessageKey)
+  for (const t of turns.value) {
+    t.expanded = false
+  }
   turns.value.push({ q: label, kind: 'pending', steps: [] })
   void scrollBottom()
   try {
@@ -608,7 +802,7 @@ async function runQuick(tool: string) {
     turns.value.splice(
       turns.value.length - 1,
       1,
-      { q: label, kind: 'answer', text: '', cards: r.cards, steps: [r.step] } as Turn,
+      { q: label, kind: 'answer', text: '', cards: r.cards, steps: [r.step], expanded: true } as Turn,
     )
   } catch {
     turns.value.splice(
@@ -681,7 +875,8 @@ function focusMainRegion() {
 /** 导航卡生效：跳转模块 + 聚焦框（对话表面保持打开，模块在底层切换） */
 function applyNavigate(f: PilotNavigateFacts) {
   if (!f.path) return
-  void router.push(f.path)
+  // section = 页内板块键（gamelib/bills/family 页签），经 query.s 交给目标页定位
+  void router.push(f.section ? { path: f.path, query: { s: f.section } } : f.path)
   setTimeout(focusMainRegion, 700)
 }
 
@@ -765,6 +960,7 @@ function buildTurn(q: string, e: PilotAskResponse, livePhaseSnapshot: PilotPhase
       archived: e.archived_through ?? null,
       cached: Boolean(e.cached),
     },
+    attachments: e.attachments?.length ? e.attachments : undefined,
   }
   // 批量提议：卡片带确认/取消，故独立成轮（模型说明文字随卡片一并展示）
   if (cards.some((c) => c.kind === 'proposal')) {
@@ -815,52 +1011,19 @@ async function scrollBottom() {
    与窗口 resize。 */
 const followBottom = ref(true)
 
-/* 有效滚动容器二态：抽屉里 turns 自滚；整页 turns 不自滚（不出内层滚动条，
-   滚动交给页面滚动条），钉底锚会话区底缘——新内容长在上方，输入区与最新进度同屏。 */
-const pageScroller = ref<HTMLElement | null>(null)
-let savedScrollBehavior = ''
-
-/* 整页钉位：把会话区（.pilot-console）底缘——有会话统计时即统计栏、无则输入区——
-   停在滚动容器底上方 14px 处所需的 scrollTop。rect 是视口坐标、容器会被顶栏压下，
-   必须减去容器 top，否则整块钉高一截。该值只随内容布局变化、与当前 scrollTop 无关，
-   故可同时用作跟随判据。 */
-const PAGE_PIN_GAP = 14
-
-function pagePinTarget(): number {
-  const vc = pageScroller.value
-  const inner = scrollBox.value
-  if (!vc || !inner) return 0
-  const foot = inner.closest('.pilot-console') as HTMLElement | null
-  if (!foot) return 0
-  const vcRect = vc.getBoundingClientRect()
-  return Math.max(
-    foot.getBoundingClientRect().bottom - vcRect.top + vc.scrollTop - vc.clientHeight + PAGE_PIN_GAP,
-    0,
-  )
-}
-
+/* 滚动容器唯一：对话记录盒自滚（抽屉与整页同一实现——整页高度由宿主给定），
+   输入区在盒外，位置恒定——思考展开/卡片落地都推不动它 */
 function onContainerScroll(e: Event) {
   const el = e.target as HTMLElement
-  if (el === pageScroller.value) {
-    /* 整页（turns 不自滚）：跟随判据必须与钉位同源。composer 下方还有会话统计栏
-       与组件总览，「到页面真底的距离」恒 > 48px，拿它判会把刚钉好的位置误判成
-       「用户已上滚」→ 跟随当场关闭 → composer 被后续增长推出视口。 */
-    followBottom.value = el.scrollTop >= pagePinTarget() - 48
-  } else {
-    followBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 48
-  }
+  hideSelQuote()
+  followBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 48
   scheduleOutlineProbe()
 }
 
 function pinIfFollow() {
   const inner = scrollBox.value
-  if (!inner) return
-  if (inner.scrollHeight > inner.clientHeight + 1) {
-    if (followBottom.value) inner.scrollTop = inner.scrollHeight
-    return
-  }
-  if (!followBottom.value || !pageScroller.value) return
-  pageScroller.value.scrollTop = pagePinTarget()
+  if (!inner || !followBottom.value) return
+  if (inner.scrollHeight > inner.clientHeight + 1) inner.scrollTop = inner.scrollHeight
 }
 
 /* 钉底与渲染同帧：nextTick 回调排在 DOM 补丁之后、本帧绘制之前，读一次布局即钉到底。
@@ -882,15 +1045,15 @@ let growthObserver: MutationObserver | null = null
 
 const outlineActive = ref<number | null>(null)
 const outlineOpen = ref(false)
+/* 徽标轮数：压缩分隔线不入目录，与 Outline 内部编号口径一致 */
+const outlineCount = computed(() => turns.value.filter((t) => t.kind !== 'compact').length)
 let outlineProbeTimer: ReturnType<typeof setTimeout> | null = null
 
-/** 阅读线（有效滚动容器顶下 48px）之上最后一轮即当前轮；仅目录打开时计算。
-    整页模式盒子会整体滚出视口，线必须锚滚动容器而非 turns 盒 */
+/** 阅读线（滚动容器顶下 48px）之上最后一轮即当前轮；仅目录打开时计算 */
 function probeOutlineActive() {
   const inner = scrollBox.value
   if (!inner || !outlineOpen.value) return
-  const scroller = inner.scrollHeight > inner.clientHeight + 1 ? inner : pageScroller.value
-  const line = (scroller ?? inner).getBoundingClientRect().top + 48
+  const line = inner.getBoundingClientRect().top + 48
   const rows = inner.querySelectorAll<HTMLElement>('[data-turn-index]')
   let current: number | null = rows.length ? Number(rows[0].dataset.turnIndex) : null
   for (const row of rows) {
@@ -919,13 +1082,10 @@ function jumpToTurn(index: number) {
   if (!inner) return
   const row = inner.querySelector<HTMLElement>(`[data-turn-index="${index}"]`)
   if (!row) return
-  // 有效滚动容器二态与钉底同源：内滚优先，内滚放不下交给页面滚动条
-  const scroller = inner.scrollHeight > inner.clientHeight + 1 ? inner : pageScroller.value
-  if (!scroller) return
   const reduced = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches
-  const top = Math.max(0, row.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop - 12)
+  const top = Math.max(0, row.getBoundingClientRect().top - inner.getBoundingClientRect().top + inner.scrollTop - 12)
   followBottom.value = false
-  scroller.scrollTo({ top, behavior: reduced ? 'auto' : 'smooth' })
+  inner.scrollTo({ top, behavior: reduced ? 'auto' : 'smooth' })
   scheduleOutlineProbe()
 }
 
@@ -942,35 +1102,30 @@ function onVisibilityChange() {
 
 onMounted(() => {
   document.addEventListener('visibilitychange', onVisibilityChange)
+  document.addEventListener('selectionchange', onSelectionChange)
+  document.addEventListener('mouseup', revealSelQuote)
   const el = scrollBox.value
   if (!el) return
   growthObserver = new MutationObserver(() => schedulePinIfFollow())
   growthObserver.observe(el, { childList: true, subtree: true })
   el.addEventListener('load', pinIfFollow, true)
   window.addEventListener('resize', pinIfFollow)
-  const vc = el.closest<HTMLElement>('.view-container')
-  if (vc) {
-    pageScroller.value = vc
-    savedScrollBehavior = vc.style.scrollBehavior
-    // 钉底是高频程序化滚动，smooth 会拖尾——console 存续期内改即时
-    vc.style.scrollBehavior = 'auto'
-    vc.addEventListener('scroll', onContainerScroll, { passive: true })
-  }
+  window.addEventListener('resize', hideSelQuote)
 })
 
 onBeforeUnmount(() => {
   document.removeEventListener('click', onDocClickCloseMenu)
   document.removeEventListener('visibilitychange', onVisibilityChange)
+  document.removeEventListener('selectionchange', onSelectionChange)
+  document.removeEventListener('mouseup', revealSelQuote)
   if (deltaTimer !== null) clearTimeout(deltaTimer)
   growthObserver?.disconnect()
+  window.removeEventListener('resize', hideSelQuote)
   if (outlineProbeTimer !== null) clearTimeout(outlineProbeTimer)
   scrollBox.value?.removeEventListener('load', pinIfFollow, true)
   window.removeEventListener('resize', pinIfFollow)
-  if (pageScroller.value) {
-    pageScroller.value.removeEventListener('scroll', onContainerScroll)
-    pageScroller.value.style.scrollBehavior = savedScrollBehavior
-  }
   if (deleteArmTimer) clearTimeout(deleteArmTimer)
+  if (sessionSearchTimer) clearTimeout(sessionSearchTimer)
 })
 
 /* 流式 delta 合帧：token 级 setState 是逐字全量重渲染（v-html 整段重跑
@@ -1025,6 +1180,148 @@ function queueDelta(kind: 'thinking' | 'answer', delta: string) {
   }
 }
 
+/* ── 对话取用：整条复制 + 拖选引用（答复出来之后的两个常规去处）── */
+
+/** 写剪贴板：异步接口优先，桌面壳未授权时回落到临时编辑区 */
+async function writeClipboard(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch {
+    /* 未授权 / 窗口无焦点 → 回落 */
+  }
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    const ok = document.execCommand('copy')
+    ta.remove()
+    return ok
+  } catch {
+    return false
+  }
+}
+
+async function onCopyText(text: string) {
+  const body = text.trim()
+  if (!body) return
+  if (await writeClipboard(body)) message.success(t('pilot.copy.done'))
+  else message.error(t('pilot.copy.failed'))
+}
+
+/** 答复头的复制钮：取当面那一轮的可见正文（只有数据卡、没有正文的轮不挂钮） */
+function onCopyReply(e: MouseEvent) {
+  const body = (e.currentTarget as HTMLElement)
+    .closest('.pilot-reply')
+    ?.querySelector<HTMLElement>('.pilot-answer')
+  void onCopyText(body?.innerText ?? '')
+}
+
+/** 会话记录点击委托：处理内嵌 SVG 图卡的预览/源码切换与复制操作 */
+function onTurnsClick(e: MouseEvent) {
+  const target = (e.target as HTMLElement).closest<HTMLElement>('.pilot-svg-tab, .pilot-svg-copy')
+  if (!target) return
+  const card = target.closest<HTMLElement>('.pilot-svg')
+  if (!card) return
+  const action = target.dataset.action
+  if (action === 'preview') {
+    card.classList.remove('show-code')
+    const sourceEl = card.querySelector<HTMLElement>('.pilot-svg-source')
+    const stageEl = card.querySelector<HTMLElement>('.pilot-svg-stage')
+    if (sourceEl) sourceEl.style.display = 'none'
+    if (stageEl) stageEl.style.display = ''
+    card.querySelectorAll<HTMLButtonElement>('.pilot-svg-tab').forEach((t) => t.classList.remove('is-active'))
+    target.classList.add('is-active')
+    return
+  }
+  if (action === 'code') {
+    card.classList.add('show-code')
+    const sourceEl = card.querySelector<HTMLElement>('.pilot-svg-source')
+    const stageEl = card.querySelector<HTMLElement>('.pilot-svg-stage')
+    if (sourceEl) sourceEl.style.display = 'block'
+    if (stageEl) stageEl.style.display = 'none'
+    card.querySelectorAll<HTMLButtonElement>('.pilot-svg-tab').forEach((t) => t.classList.remove('is-active'))
+    target.classList.add('is-active')
+    return
+  }
+  if (action === 'copy') {
+    const codeEl = card.querySelector<HTMLElement>('.pilot-svg-source code')
+    const text = codeEl?.textContent ?? ''
+    if (text) void onCopyText(text)
+    return
+  }
+}
+
+/** 拖选片段：选区落在某一轮答复里才算数，输入框与标签栏的选字不算 */
+interface SelPiece { text: string; top: number; left: number }
+
+function readReplySelection(): SelPiece | null {
+  const sel = window.getSelection()
+  if (!sel || sel.isCollapsed || !sel.rangeCount) return null
+  const text = sel.toString().trim()
+  if (!text) return null
+  const range = sel.getRangeAt(0)
+  const node = range.commonAncestorContainer
+  const host = node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement
+  if (!host?.closest('.pilot-reply')) return null
+  const box = range.getBoundingClientRect()
+  return { text, top: box.top, left: box.left + box.width / 2 }
+}
+
+const selQuote = ref<SelPiece | null>(null)
+// 拖选过程不出条（每动一下 selectionchange 都来），松手才抬出来
+let pendingSel: SelPiece | null = null
+
+function onSelectionChange() {
+  pendingSel = readReplySelection()
+  if (!pendingSel) selQuote.value = null
+}
+
+function revealSelQuote() {
+  selQuote.value = pendingSel ?? readReplySelection()
+}
+
+function hideSelQuote() {
+  pendingSel = null
+  selQuote.value = null
+}
+
+/** 锚在选区正上方居中，左右留出自身半宽不被视口切掉 */
+const selBarStyle = computed(() => {
+  const s = selQuote.value
+  if (!s) return {}
+  const half = 76
+  const limit = Math.max(half, window.innerWidth - half)
+  return { top: `${Math.max(s.top - 44, 8)}px`, left: `${Math.min(Math.max(s.left, half), limit)}px` }
+})
+
+const composer = ref<ComponentPublicInstance | null>(null)
+
+/** 引用回填：每行领一个 >，插在光标处（没有光标就接在末尾），之后光标停在引用尾部 */
+function quoteToComposer(text: string) {
+  const block = text.trim().split('\n').map((l) => `> ${l}`).join('\n')
+  const el = composer.value?.$el as HTMLTextAreaElement | undefined
+  const cur = question.value
+  const start = el?.selectionStart ?? cur.length
+  const end = el?.selectionEnd ?? cur.length
+  const head = cur.slice(0, start)
+  const trail = cur.slice(end)
+  const lead = head && !head.endsWith('\n') ? '\n' : ''
+  question.value = `${head}${lead}${block}\n${trail}`
+  const caret = `${head}${lead}${block}\n`.length
+  hideSelQuote()
+  window.getSelection()?.removeAllRanges()
+  void nextTick(() => {
+    el?.focus()
+    el?.setSelectionRange(caret, caret)
+  })
+}
+
 function onComposerKeydown(e: KeyboardEvent) {
   // Enter 发送；输入法组词确认的 Enter（isComposing）不是发送意图，放行给编辑器
   if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return
@@ -1035,15 +1332,374 @@ function onComposerKeydown(e: KeyboardEvent) {
 
 let abortCtrl: AbortController | null = null
 
+/* ── 长文本附件：粘贴超阈值即落盘，消息里只带引用（与后端 attachments 同源口径） ──
+   内联上限 15360 字符（对齐后端常量）：超过就不进提问字段，改存附件文件，
+   提问只带「名称 / 字符数 / 行数」；正文按需展开（区间读取，一次一块，可续读）。
+   这样输入长度不再有天花板，长文本也不会每轮重复挤占上下文。 */
+const ATTACH_INLINE_LIMIT = 15360
+/** 待发附件（发送后随本轮上屏并清空） */
+const pendingAttachments = ref<PilotAttachmentRef[]>([])
+const attachBusy = ref(false)
+/** 展开中的附件（同一时刻只展开一枚）；chunk 为空 = 正在取块 */
+const openAtt = ref<{ ref: PilotAttachmentRef; chunk: PilotAttachmentChunk | null; busy: boolean } | null>(null)
+
+function fmtChars(n: number): string {
+  return n >= 10000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+}
+
+async function attachText(text: string, name?: string) {
+  if (!sessionId.value) {
+    sessionId.value = newSessionId()
+    saveSessionId(sessionId.value)
+  }
+  attachBusy.value = true
+  try {
+    const ref_ = await pilotApi.createAttachment(sessionId.value, text, name)
+    pendingAttachments.value = [...pendingAttachments.value, ref_]
+    message.success(t('pilot.attach.added', { name: ref_.name, n: ref_.lines }))
+  } catch {
+    message.error(t('pilot.attach.failed'))
+  } finally {
+    attachBusy.value = false
+  }
+}
+
+function removePendingAttachment(id: string) {
+  pendingAttachments.value = pendingAttachments.value.filter((a) => a.id !== id)
+}
+
+/** 粘贴拦截：短文本照常进输入框；长文本落盘换引用（长度不再是输入的天花板） */
+function onComposerPaste(e: ClipboardEvent) {
+  const text = e.clipboardData?.getData('text/plain') ?? ''
+  if (!text || text.length <= ATTACH_INLINE_LIMIT) return
+  e.preventDefault()
+  const first = (text.split('\n')[0] ?? '').trim().slice(0, 24)
+  void attachText(text, first || t('pilot.attach.pastedName'))
+}
+
+/** 展开/收起附件内容：块按需取（truncated 时可按提示续读下一块） */
+async function toggleAttachment(ref_: PilotAttachmentRef) {
+  if (openAtt.value?.ref.id === ref_.id) {
+    openAtt.value = null
+    return
+  }
+  await loadAttachment(ref_, 1, false)
+}
+
+async function loadAttachment(ref_: PilotAttachmentRef, startLine: number, append: boolean) {
+  if (!sessionId.value) return
+  const keep = append ? (openAtt.value?.chunk?.content ?? '') : ''
+  openAtt.value = { ref: ref_, chunk: append ? (openAtt.value?.chunk ?? null) : null, busy: true }
+  try {
+    const chunk = await pilotApi.readAttachment(sessionId.value, ref_.id, startLine)
+    openAtt.value = {
+      ref: ref_,
+      chunk: keep ? { ...chunk, content: `${keep}\n${chunk.content}` } : chunk,
+      busy: false,
+    }
+  } catch {
+    openAtt.value = null
+    message.error(t('pilot.attach.readFailed'))
+  }
+}
+
+/* ── 消息队列：生成中提交的问题排队等本轮结束自动发出 ──
+   队列归属当前会话（可增删改序），落 localStorage 防刷新丢失；
+   用户主动停止生成时队列暂停（内容不丢），确认后再继续。 */
+interface QueuedAsk { id: number; text: string }
+
+const queue = ref<QueuedAsk[]>([])
+const queuePaused = ref(false)
+let queueSeq = 0
+
+const queueKey = () => `pilot.queue.${sessionId.value || 'local'}`
+
+function saveQueue() {
+  try {
+    localStorage.setItem(queueKey(), JSON.stringify(queue.value))
+  } catch {
+    /* 存储不可用（隐私模式）时队列只在内存里，不影响发送 */
+  }
+}
+
+function loadQueue() {
+  queuePaused.value = false
+  try {
+    const raw = localStorage.getItem(queueKey())
+    const items = raw ? (JSON.parse(raw) as QueuedAsk[]) : []
+    queue.value = Array.isArray(items)
+      ? items.filter((i) => i && typeof i.text === 'string' && i.text.trim())
+      : []
+    queueSeq = queue.value.reduce((m, i) => Math.max(m, Number(i.id) || 0), 0)
+  } catch {
+    queue.value = []
+  }
+}
+
+/** 生成中提交：入队而不是丢弃输入 */
+function pushQueue(text: string) {
+  const body = text.trim()
+  if (!body) return
+  queue.value = [...queue.value, { id: ++queueSeq, text: body }]
+  saveQueue()
+  message.info(t('pilot.queue.enqueued', { n: queue.value.length }))
+}
+
+function removeQueued(id: number) {
+  queue.value = queue.value.filter((i) => i.id !== id)
+  if (!queue.value.length) queuePaused.value = false
+  saveQueue()
+}
+
+function moveQueued(id: number, delta: number) {
+  const i = queue.value.findIndex((x) => x.id === id)
+  const j = i + delta
+  if (i < 0 || j < 0 || j >= queue.value.length) return
+  const next = [...queue.value]
+  ;[next[i], next[j]] = [next[j], next[i]]
+  queue.value = next
+  saveQueue()
+}
+
+/** 取回输入框改一改再发：出队并把文本交还 composer */
+function takeQueued(id: number) {
+  const item = queue.value.find((i) => i.id === id)
+  if (!item) return
+  question.value = item.text
+  removeQueued(id)
+  void nextTick(() => (composer.value?.$el as HTMLTextAreaElement | undefined)?.focus())
+}
+
+/** 本轮结束后自动发出队首；暂停中或仍在生成则不动 */
+function flushQueue() {
+  if (streaming.value || queuePaused.value || !queue.value.length) return
+  const head = queue.value[0]
+  queue.value = queue.value.slice(1)
+  if (!queue.value.length) queuePaused.value = false
+  saveQueue()
+  void ask(head.text)
+}
+
+function resumeQueue() {
+  queuePaused.value = false
+  flushQueue()
+}
+
 /** 停止生成本轮：中断 SSE，已流出的内容保留在对话里。 */
 function stopPilot() {
   abortCtrl?.abort()
+  // 主动停止 = 队列暂停：后续问题不再自动发出，等用户确认继续
+  if (queue.value.length) queuePaused.value = true
 }
 
-async function ask(text?: string) {
-  const q = (text ?? question.value).trim()
-  if (!q || streaming.value) return
+/* ── 中断续跑：把上一轮已完成的事实回灌，接着把这一轮做完 ── */
+
+/** 步骤结果摘要：数据卡类工具取结构化结果，纯叙述步骤跳过 */
+function stepSummary(step: PilotStep): string {
+  const data = step.data ?? {}
+  if (!Object.keys(data).length) return ''
+  try {
+    return JSON.stringify(data).slice(0, 400)
+  } catch {
+    return ''
+  }
+}
+
+function continueStopped(index: number) {
+  if (streaming.value) return
+  const turn = turns.value[index]
+  if (!turn) return
+  const resume: PilotResumePayload = {
+    text: turn.text ?? '',
+    tools: (turn.steps ?? [])
+      .filter((s) => s.status === 'ok')
+      .map((s) => ({ label: s.label, status: s.status, summary: stepSummary(s) }))
+      .filter((s) => s.summary),
+  }
+  const q = turn.q
+  // 中断轮未落账（账本只在终态写），本地移出后按同一问题重跑——视觉上是接着长出来
+  turns.value.splice(index, 1)
+  void ask(q, resume)
+}
+
+/* ── 改一句重问：作废该轮及其后各轮，用新提问重跑 ── */
+
+/** 新轮的账本序号：已落账轮的最大序号 + 1（中断轮不占号，它不入账本） */
+function nextTurnIndex(): number {
+  let max = -1
+  for (const t of turns.value) {
+    if (typeof t.turnIndex === 'number' && t.turnIndex > max) max = t.turnIndex
+  }
+  return max + 1
+}
+
+const editingIndex = ref<number | null>(null)
+const editingText = ref('')
+const editBusy = ref(false)
+
+function canEditTurn(turn: Turn): boolean {
+  if (streaming.value) return false
+  return typeof turn.turnIndex === 'number' || turn.kind === 'reason' || Boolean(turn.stopped)
+}
+
+/** 该轮可否分叉：只有已落账本（有轮号）且不在生成中的轮才有确定的分叉点 */
+function canForkTurn(turn: Turn): boolean {
+  return typeof turn.turnIndex === 'number' && !streaming.value && !flagBusy.value
+}
+
+/** 该轮之后还会被丢掉的轮数（编辑提示用） */
+const editDropCount = computed(() => {
+  const i = editingIndex.value
+  const turn = i === null ? undefined : turns.value[i]
+  if (!turn) return 0
+  if (typeof turn.turnIndex === 'number') {
+    return turns.value.filter((t) => typeof t.turnIndex === 'number' && t.turnIndex > turn.turnIndex!).length
+  }
+  return Math.max(0, turns.value.length - 1 - i)
+})
+
+function startEdit(index: number) {
+  const turn = turns.value[index]
+  if (streaming.value || !turn || !canEditTurn(turn)) return
+  editingIndex.value = index
+  editingText.value = turn.q
+  void nextTick(() => editBoxes.value[0]?.focus())
+}
+
+/** 编辑态文本框（同一时刻最多一个，v-for 内字符串 ref 收到数组） */
+const editBoxes = ref<HTMLTextAreaElement[]>([])
+
+function cancelEdit() {
+  editingIndex.value = null
+  editingText.value = ''
+}
+
+function onEditKeydown(e: KeyboardEvent) {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    e.preventDefault()
+    void submitEdit()
+  } else if (e.key === 'Escape') {
+    cancelEdit()
+  }
+}
+
+const EDIT_FAIL_KEYS: Record<string, MessageKey> = {
+  no_session: 'pilot.edit.fail.gone',
+  busy: 'pilot.edit.fail.busy',
+  write_failed: 'pilot.edit.fail.write',
+}
+
+async function submitEdit() {
+  const i = editingIndex.value
+  const turn = i === null ? undefined : turns.value[i]
+  const text = editingText.value.trim()
+  if (!turn || !canEditTurn(turn) || !text || editBusy.value) return
+  editBusy.value = true
+  try {
+    if (typeof turn.turnIndex === 'number') {
+      const out = await pilotApi.rewindSession(sessionId.value, turn.turnIndex)
+      if (!out.ok) {
+        message.error(t(EDIT_FAIL_KEYS[out.reason ?? ''] ?? 'pilot.edit.fail.generic'))
+        return
+      }
+      editingIndex.value = null
+      editingText.value = ''
+      // 账本同源：截断后按后端投影重建对话流，再提交新提问
+      if (sessionId.value) await restoreSession(sessionId.value)
+      void ask(text)
+    } else {
+      // 未落账轮次（失败轮 / 中断轮）：无需服务端软截断，直接丢弃该轮及其后未入账轮次并重新提问
+      editingIndex.value = null
+      editingText.value = ''
+      turns.value.splice(i)
+      void ask(text)
+    }
+  } catch {
+    message.error(t('pilot.edit.fail.generic'))
+  } finally {
+    editBusy.value = false
+  }
+}
+
+function canRetryTurn(turn: Turn): boolean {
+  return turn.kind === 'reason' && Boolean(turn.q)
+}
+
+async function retryTurn(index: number) {
+  if (streaming.value) return
+  const turn = turns.value[index]
+  if (!turn || !turn.q) return
+  const retryQ = turn.q
+  const retryAtts = turn.attachments ? [...turn.attachments] : []
+  if (typeof turn.turnIndex === 'number') {
+    const out = await pilotApi.rewindSession(sessionId.value, turn.turnIndex)
+    if (!out.ok) {
+      message.error(t(EDIT_FAIL_KEYS[out.reason ?? ''] ?? 'pilot.edit.fail.generic'))
+      return
+    }
+    if (sessionId.value) await restoreSession(sessionId.value)
+  } else {
+    // 未落账失败轮：直接从对话记录中移除该轮，原位重发
+    turns.value.splice(index)
+  }
+  if (retryAtts.length) pendingAttachments.value = retryAtts
+  void ask(retryQ)
+}
+
+/* ── 长回答折叠：最新对话结果默认展开，发新对话时收敛历史轮次（纯前端，不改账本） ── */
+
+function isLongAnswer(turn: Turn): boolean {
+  return isLongAnswerText(turn.text)
+}
+
+function toggleAnswer(turn: Turn) {
+  turn.expanded = !turn.expanded
+}
+
+/** 分叉溯源文案：源会话标题按账本投影解析（找不到回落「新对话」） */
+const forkedFromLabel = computed(() => {
+  const sid = forkedFrom.value
+  if (!sid) return ''
+  const src = (sessions.value ?? []).find((s) => s.sid === sid)
+  return t('pilot.session.forkedFrom', { title: src?.title || t('pilot.session.untitled') })
+})
+
+/** 派生标记：点分隔线跳回源会话（源已删则不动，标签栏也不会挂上不存在的会话） */
+function openForkSource() {
+  const sid = forkedFrom.value
+  if (!sid) return
+  if (!(sessions.value ?? []).some((s) => s.sid === sid)) {
+    message.error(t('pilot.session.forkedFromGone'))
+    return
+  }
+  openFromHistory(sid)
+}
+
+/** 清单/标签栏标题：派生会话标出源头，父子在列表里可分辨（账本 forked_from 为准） */
+function sessionLabel(item: { title?: string | null; forked_from?: string | null }): string {
+  const base = item.title || t('pilot.session.untitled')
+  return item.forked_from ? t('pilot.session.forkedTitle', { title: base }) : base
+}
+
+async function ask(text?: string, resume?: PilotResumePayload) {
+  const typedQ = (text ?? question.value).trim()
+  const sentAtts = pendingAttachments.value
+  // 允许「只挂附件、不写问题」的提交（附件本体已是内容）；提问留空时补一句，
+  // 与后端回落用同一句，气泡与账本才不会一边空一边有字
+  if (!typedQ && !sentAtts.length) return
+  const q = typedQ || t('pilot.attach.only')
+  if (streaming.value) {
+    // 生成中提交 = 排队，不丢弃输入（队列表只存文本，附件不随队：
+    // 只挂附件没写字就不入队，否则会排一句空指向的占位话）
+    if (!text) question.value = ''
+    if (typedQ) pushQueue(typedQ)
+    return
+  }
   if (!text) question.value = ''
+  pendingAttachments.value = []
+  // 元素引用随本轮发送后即清空（一次性，与附件同语义）
+  const sentElRefs = elementRefs.value.length ? [...elementRefs.value] : null
+  clearPickedEls()
   streaming.value = true
   abortCtrl = new AbortController()
   livePhases.value = []
@@ -1052,12 +1708,25 @@ async function ask(text?: string) {
   loadingSeq.value += 1
   // 用户发言立即上屏（pending 占位轮，回复完成后原位替换）；跟随复位——刚发的消息必须看着它长出来
   followBottom.value = true
-  turns.value.push({ q, kind: 'pending', steps: [] })
+  // 发了新对话：收敛历史所有轮次的输出结果（长回答收起，让出视口给新问答）
+  for (const t of turns.value) {
+    t.expanded = false
+  }
+  // 本轮预占的账本序号；只有确实落账本的终态才保留（见收尾处的 recorded 判定）
+  const pendingIndex = nextTurnIndex()
+  turns.value.push({
+    q,
+    kind: 'pending',
+    steps: [],
+    turnIndex: pendingIndex,
+    attachments: sentAtts.length ? sentAtts : undefined,
+  })
   // 本地即时点亮「工作中」（后端登记为准，done 后 loadSessions 归位）
   markRunningLocal(sessionId.value, true)
   void scrollBottom()
   let done: PilotAskResponse | null = null
   let failed = false
+  let failedMsg = ''
   let stopped = false
   // 本轮已即时跳转：tool 事件到达即切页（不等后续模型叙述），done 后不再重复跳
   let navApplied = false
@@ -1114,7 +1783,7 @@ async function ask(text?: string) {
         clearQueuedHint()
         if (e.name === 'navigate' && e.status === 'ok' && e.data?.path && !navApplied) {
           navApplied = true
-          void router.push(e.data.path)
+          void router.push(e.data.section ? { path: e.data.path, query: { s: e.data.section } } : e.data.path)
           setTimeout(focusMainRegion, 700)
         }
       } else if (e.type === 'card') {
@@ -1143,12 +1812,15 @@ async function ask(text?: string) {
         clearQueuedHint()
         done = { answer: '', thinking: null, source: 'none', reason: e.reason ?? 'llm_failed', facts: null, cards: [], cached: false }
       }
-    }, referenceSession.value?.sid, abortCtrl.signal)
+    }, referenceSession.value?.sid, abortCtrl.signal, resume, sentAtts.map((a) => a.id), viewContext.value, sentElRefs || undefined)
   } catch (err) {
     if (abortCtrl.signal.aborted) {
       stopped = true
     } else {
       failed = true
+      failedMsg = String((err as Error)?.message ?? '')
+      // 附件已落盘仍有效：放回待发区，用户可一键重试（不重传内容）
+      if (sentAtts.length) pendingAttachments.value = sentAtts
     }
   }
   referenceSession.value = null
@@ -1159,27 +1831,42 @@ async function ask(text?: string) {
   }))
   const snapshotSteps = phaseSnapshot.flatMap((p) => p.steps)
   let turn: Turn
+  // 提问展示以后端终态为准：超长正文被转成附件时，账本与气泡同为收窄形态
+  const shownQ = done?.q || q
+  // 附件芯片：后端终态是权威口径（回传本轮引用），失败/中断轮回落本地已发清单
+  const turnAtts = done?.attachments?.length ? done.attachments : sentAtts
   if (failed) {
-    turn = { q, kind: 'reason', reasonKey: 'pilot.error', steps: snapshotSteps } as Turn
-    // 失败还原输入（用户没在新输入时才还原，可一键重试）
-    if (!question.value.trim()) question.value = q
+    turn = {
+      q: shownQ,
+      kind: 'reason',
+      reasonKey: failedMsg.includes('HTTP 422') ? 'pilot.reason.too_long' : 'pilot.error',
+      steps: snapshotSteps,
+      attachments: turnAtts.length ? turnAtts : undefined,
+    } as Turn
   } else if (stopped) {
     // 中断保留已流出的阶段与终答候选，历史轮仍可展开过程；已即时下发的卡片一并保留
     turn = {
-      q,
+      q: shownQ,
       kind: 'answer',
       text: answerOf(phaseSnapshot, ''),
       phases: phaseSnapshot.length ? phaseSnapshot : undefined,
       steps: snapshotSteps,
       cards: liveRealCards.value.length ? [...liveRealCards.value] : undefined,
       stopped: true,
+      attachments: turnAtts.length ? turnAtts : undefined,
+      expanded: true,
     } as Turn
   } else {
-    turn = buildTurn(q, done ?? { answer: '', thinking: null, source: 'none', reason: 'llm_failed', facts: null, cards: [], cached: false }, phaseSnapshot)
+    turn = buildTurn(shownQ, done ?? { answer: '', thinking: null, source: 'none', reason: 'llm_failed', facts: null, cards: [], cached: false }, phaseSnapshot)
+    turn.expanded = true
+    if (!done?.attachments?.length && turnAtts.length) turn.attachments = turnAtts
   }
+  // 账本序号只在「本轮确实落了账本」时保留（buildTurn 不带序号，需在此补）：
+  // 中断 / 失败 / 未受理的轮不占号——它们没进账本，占号会让下一轮序号与账本错位，
+  // 改一句重问按序号截断时就会截错位置。
+  const recorded = !failed && !stopped && done?.source !== 'none'
+  if (recorded) turn.turnIndex = pendingIndex
   turns.value.splice(turns.value.length - 1, 1, turn)
-  // busy = 本轮未受理：原样还原输入，等会话空闲后一键重发
-  if (done?.reason === 'session_busy' && !question.value.trim()) question.value = q
   // 导航卡生效：取本轮最后一张，跳模块并打聚焦框（tool 事件已即时跳过则不再重复）
   const navCards = (turn.cards ?? []).filter((c): c is PilotNavigateFacts => c.kind === 'navigate' && Boolean(c.path))
   const lastNav = navCards[navCards.length - 1]
@@ -1189,6 +1876,8 @@ async function ask(text?: string) {
   livePhases.value = []
   clearQueuedHint()
   void scrollBottom()
+  // 本轮结束：队列不再被占用，自动接着发下一条（暂停中则等用户确认）
+  flushQueue()
 }
 
 function pickCandidate(turn: Turn, index: number) {
@@ -1334,69 +2023,144 @@ function triggerFollowUp(prompt: string) {
           </svg>
           {{ t('pilot.newChat') }}
         </button>
+        <HlPilotRuns variant="side" />
         <HlPilotOutline
           v-if="page"
           side="right"
           :turns="turns"
+          :count="outlineCount"
           :active-index="outlineActive"
           @jump="jumpToTurn"
           @toggle="onOutlineToggle"
         />
       </div>
+      <div class="pilot-side__search">
+        <HlInput
+          v-model="sessionQuery"
+          class="pilot-side__search-box"
+          :placeholder="t('pilot.session.search')"
+          :aria-label="t('pilot.session.search')"
+          @input="onSessionQueryInput"
+        />
+      </div>
       <div class="pilot-side__scroll">
         <div v-if="sessions == null" class="pilot-side__empty">{{ t('pilot.history.empty') }}</div>
-        <div v-else-if="!sessions.length" class="pilot-side__empty">{{ t('pilot.history.empty') }}</div>
+        <div v-else-if="!sessions.length" class="pilot-side__empty">
+          {{ searchingSessions ? t('pilot.session.noHit') : t('pilot.history.empty') }}
+        </div>
         <template v-else>
-          <div
-            v-for="it in sessions"
-            :key="it.sid"
-            class="pilot-side__row"
-            :class="{ 'is-current': it.sid === sessionId }"
-            :title="`${it.title || t('pilot.session.untitled')} · ${t('pilot.history.turns', { n: it.turn_total })}${it.running ? ' · ' + t('pilot.session.running') : ''}`"
-            @click="openFromHistory(it.sid)"
-            @dblclick="startRename(it)"
-          >
-            <template v-if="renamingSid === it.sid">
-              <HlInput
-                v-model="renameText"
-                class="pilot-side__rename"
-                @keydown.enter="submitRename"
-                @keydown.esc="renamingSid = ''"
-              />
-              <button type="button" class="pilot-side__x is-ok" :title="t('pilot.history.rename')" @click.stop="submitRename">
-                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                  <path d="M5 13l4 4L19 7" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" />
-                </svg>
-              </button>
-            </template>
-            <template v-else>
-              <span class="pilot-side__main">
-                <span class="pilot-side__name">
-                  <span
-                    v-if="it.running"
-                    class="pilot-side__running"
-                    :title="t('pilot.session.running')"
-                    aria-hidden="true"
-                  ></span>
-                  {{ it.title || t('pilot.session.untitled') }}
+          <template v-for="row in sideRows" :key="row.head ? '__arch' : row.item?.sid">
+            <!-- 归档折叠头：点开才列归档项（检索态不出现，命中结果平铺） -->
+            <button
+              v-if="row.head"
+              type="button"
+              class="pilot-side__arch"
+              @click="archivedOpen = !archivedOpen"
+            >
+              <svg class="pilot-side__arch-ico" :class="{ 'is-open': archivedOpen }" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+              <span>{{ t('pilot.session.archived', { n: row.count ?? 0 }) }}</span>
+            </button>
+            <div
+              v-else
+              class="pilot-side__row"
+              :class="{ 'is-current': row.item?.sid === sessionId, 'is-arch': row.item?.archived }"
+              :title="`${sessionLabel(row.item ?? {})} · ${t('pilot.history.turns', { n: row.item?.turn_total ?? 0 })}${row.item?.running ? ' · ' + t('pilot.session.running') : ''}`"
+              @click="row.item && openFromHistory(row.item.sid)"
+              @dblclick="row.item && startRename(row.item)"
+            >
+              <template v-if="renamingSid === row.item?.sid">
+                <HlInput
+                  v-model="renameText"
+                  class="pilot-side__rename"
+                  @keydown.enter="submitRename"
+                  @keydown.esc="renamingSid = ''"
+                />
+                <button type="button" class="pilot-side__x is-ok" :title="t('pilot.history.rename')" @click.stop="submitRename">
+                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                    <path d="M5 13l4 4L19 7" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                </button>
+              </template>
+              <template v-else>
+                <span class="pilot-side__main">
+                  <span class="pilot-side__name">
+                    <span
+                      v-if="row.item?.pinned"
+                      class="pilot-side__pinmark"
+                      :title="t('pilot.session.pinned')"
+                      aria-hidden="true"
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <path d="M12 17v4M9 3h6l-1 7 3 3H7l3-3-1-7Z" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" />
+                      </svg>
+                    </span>
+                    <span
+                      v-if="row.item?.running"
+                      class="pilot-side__running"
+                      :title="t('pilot.session.running')"
+                      aria-hidden="true"
+                    ></span>
+                    <!-- 派生标记：窄列会省略标题尾部，故标记走标题前缀而非后缀 -->
+                    <span
+                      v-if="row.item?.forked_from"
+                      class="pilot-forkmark"
+                      :title="t('pilot.session.forked')"
+                      aria-hidden="true"
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <circle cx="6.5" cy="6" r="2.4" />
+                        <circle cx="6.5" cy="18" r="2.4" />
+                        <circle cx="17.5" cy="9.5" r="2.4" />
+                        <path d="M6.5 8.4v7.2M8.9 6h4.1a4.5 4.5 0 0 1 4.5 1.4" />
+                      </svg>
+                    </span>
+                    {{ row.item?.title || t('pilot.session.untitled') }}
+                  </span>
+                  <span class="pilot-side__meta">
+                    {{ t('pilot.history.turns', { n: row.item?.turn_total ?? 0 }) }} · {{ sessionTime(row.item?.updated_at ?? null) }}
+                  </span>
+                  <span v-if="row.item?.snippet" class="pilot-side__snippet">{{ row.item.snippet }}</span>
                 </span>
-                <span class="pilot-side__meta">
-                  {{ t('pilot.history.turns', { n: it.turn_total }) }} · {{ sessionTime(it.updated_at) }}
+                <span class="pilot-side__acts">
+                  <button
+                    type="button"
+                    class="pilot-side__x"
+                    :class="{ 'is-on': row.item?.pinned }"
+                    :title="row.item?.pinned ? t('pilot.session.unpin') : t('pilot.session.pin')"
+                    @click.stop="row.item && togglePin(row.item)"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                      <path d="M12 17v4M9 3h6l-1 7 3 3H7l3-3-1-7Z" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" />
+                    </svg>
+                  </button>
+                  <button
+                    type="button"
+                    class="pilot-side__x"
+                    :class="{ 'is-on': row.item?.archived }"
+                    :title="row.item?.archived ? t('pilot.session.unarchive') : t('pilot.session.archive')"
+                    @click.stop="row.item && toggleArchive(row.item)"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                      <path d="M3 7h18M5 7v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V7M9 11h6" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" />
+                    </svg>
+                  </button>
+                  <button
+                    type="button"
+                    class="pilot-side__x"
+                    :class="{ 'is-armed': deleteArmSid === row.item?.sid }"
+                    :title="deleteArmSid === row.item?.sid ? t('pilot.history.deleteConfirm') : t('pilot.history.delete')"
+                    @click.stop="row.item && armDelete(row.item.sid)"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                      <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
+                    </svg>
+                  </button>
                 </span>
-              </span>
-              <button
-                type="button"
-                class="pilot-side__x"
-                :class="{ 'is-armed': deleteArmSid === it.sid }"
-                :title="deleteArmSid === it.sid ? t('pilot.history.deleteConfirm') : t('pilot.history.delete')"
-                @click.stop="armDelete(it.sid)"
-              >
-                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                  <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
-                </svg>
-              </button>
-            </template>
-          </div>
+              </template>
+            </div>
+          </template>
         </template>
       </div>
     </aside>
@@ -1419,7 +2183,7 @@ function triggerFollowUp(prompt: string) {
           :key="it.sid"
           class="pilot-tab"
           :class="{ 'is-current': it.sid === sessionId }"
-          :title="`${it.title || t('pilot.session.untitled')} · ${t('pilot.history.turns', { n: it.turn_total })} · ${t('pilot.history.dblRename')}`"
+          :title="`${sessionLabel(it)} · ${t('pilot.history.turns', { n: it.turn_total })} · ${t('pilot.history.dblRename')}`"
           @dblclick="startRename(it)"
         >
         <template v-if="renamingSid === it.sid">
@@ -1440,7 +2204,22 @@ function triggerFollowUp(prompt: string) {
             <path d="M5 13l4 4L19 7" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" />
           </svg>
           <button type="button" class="pilot-tab__main" @click="switchSession(it.sid)">
-            <span class="pilot-tab__name">{{ it.title || t('pilot.session.untitled') }}</span>
+            <span class="pilot-tab__name">
+              <span
+                v-if="it.forked_from"
+                class="pilot-forkmark"
+                :title="t('pilot.session.forked')"
+                aria-hidden="true"
+              >
+                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <circle cx="6.5" cy="6" r="2.4" />
+                  <circle cx="6.5" cy="18" r="2.4" />
+                  <circle cx="17.5" cy="9.5" r="2.4" />
+                  <path d="M6.5 8.4v7.2M8.9 6h4.1a4.5 4.5 0 0 1 4.5 1.4" />
+                </svg>
+              </span>
+              {{ it.title || t('pilot.session.untitled') }}
+            </span>
           </button>
           <button
             type="button"
@@ -1493,6 +2272,19 @@ function triggerFollowUp(prompt: string) {
                     :title="t('pilot.session.running')"
                     aria-hidden="true"
                   ></span>
+                  <span
+                    v-if="it.forked_from"
+                    class="pilot-forkmark"
+                    :title="t('pilot.session.forked')"
+                    aria-hidden="true"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                      <circle cx="6.5" cy="6" r="2.4" />
+                      <circle cx="6.5" cy="18" r="2.4" />
+                      <circle cx="17.5" cy="9.5" r="2.4" />
+                      <path d="M6.5 8.4v7.2M8.9 6h4.1a4.5 4.5 0 0 1 4.5 1.4" />
+                    </svg>
+                  </span>
                   {{ it.title || t('pilot.session.untitled') }}
                 </span>
                 <span class="pilot-history__meta">
@@ -1514,16 +2306,40 @@ function triggerFollowUp(prompt: string) {
           </div>
         </Transition>
       </div>
+      <HlPilotRuns variant="tab" />
+      <!-- page 模式宽屏时会话列里已有 outline；窄屏时会话列隐藏、tabbar 恢复，
+           此处 outline 跟随 tabbar 补位——去掉 v-if=!page 让两种屏宽都有入口 -->
       <HlPilotOutline
-        v-if="!page"
         :turns="turns"
+        :count="outlineCount"
         :active-index="outlineActive"
         @jump="jumpToTurn"
         @toggle="onOutlineToggle"
       />
     </div>
 
-    <div ref="scrollBox" class="pilot-turns" @scroll.passive="onContainerScroll">
+    <div ref="scrollBox" class="pilot-turns" @scroll.passive="onContainerScroll" @click="onTurnsClick">
+      <!-- 分叉溯源：派生标记是对话流首行的一条分隔线（与压缩分隔线同一套线+胶囊语言），
+           点它跳回源会话——账本事实可追溯，不是装饰徽章 -->
+      <button
+        v-if="forkedFromLabel"
+        type="button"
+        class="pilot-forkline"
+        :title="t('pilot.session.forkedFromOpen')"
+        @click="openForkSource"
+      >
+        <span class="pilot-forkline__line" aria-hidden="true"></span>
+        <span class="pilot-forkline__pill">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="6.5" cy="6" r="2.4" />
+            <circle cx="6.5" cy="18" r="2.4" />
+            <circle cx="17.5" cy="9.5" r="2.4" />
+            <path d="M6.5 8.4v7.2M8.9 6h4.1a4.5 4.5 0 0 1 4.5 1.4" />
+          </svg>
+          {{ forkedFromLabel }}
+        </span>
+        <span class="pilot-forkline__line" aria-hidden="true"></span>
+      </button>
       <div v-for="(turn, i) in turns" :key="i" class="pilot-turn" :data-turn-index="turn.kind === 'compact' ? undefined : i">
         <!-- 压缩分隔线：账本边界事件，历史消息一条不动（ZCode 压缩语义） -->
         <div v-if="turn.kind === 'compact'" class="pilot-compact">
@@ -1538,7 +2354,103 @@ function triggerFollowUp(prompt: string) {
           <span class="pilot-compact__line" aria-hidden="true"></span>
         </div>
         <template v-else>
-        <p class="pilot-turn__q">{{ turn.q }}</p>
+        <div class="pilot-turn__row">
+          <!-- 编辑态：改完提交 → 作废该轮及其后各轮，用新提问重跑 -->
+          <div v-if="editingIndex === i" class="pilot-edit">
+            <textarea
+              ref="editBoxes"
+              v-model="editingText"
+              class="pilot-edit__box"
+              rows="2"
+              :placeholder="t('pilot.edit.placeholder')"
+              @keydown="onEditKeydown"
+            ></textarea>
+            <div class="pilot-edit__bar">
+              <span v-if="editDropCount" class="pilot-edit__warn">
+                {{ t('pilot.edit.dropWarn', { n: editDropCount }) }}
+              </span>
+              <button
+                type="button"
+                class="pilot-edit__btn"
+                :disabled="editBusy || !editingText.trim()"
+                @click="submitEdit"
+              >{{ t('pilot.edit.submit') }}</button>
+              <button type="button" class="pilot-edit__btn is-ghost" @click="cancelEdit">
+                {{ t('pilot.edit.cancel') }}
+              </button>
+            </div>
+          </div>
+          <p v-else class="pilot-turn__q">{{ turn.q }}</p>
+        </div>
+
+        <!-- 发言动作行：挂在气泡下方独立一行（右沿对齐），hover 才显形；
+             动作不再挤在气泡旁边，气泡宽度与位置恒定 -->
+        <div v-if="editingIndex !== i" class="pilot-acts pilot-acts--end">
+          <button
+            type="button"
+            class="pilot-act"
+            :title="t('pilot.copy')"
+            :aria-label="t('pilot.copy')"
+            @click="onCopyText(turn.q)"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="9" y="9" width="11" height="11" rx="2" />
+              <path d="M15 5H6a2 2 0 0 0-2 2v9" />
+            </svg>
+          </button>
+          <!-- 改一句重问：已落账轮或失败/中断轮均可改（修改后重发） -->
+          <button
+            v-if="canEditTurn(turn)"
+            type="button"
+            class="pilot-act"
+            :title="t('pilot.edit.title')"
+            :aria-label="t('pilot.edit.title')"
+            @click="startEdit(i)"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17v3Z" />
+              <path d="M14.5 6.5 17.5 9.5" />
+            </svg>
+          </button>
+        </div>
+
+        <!-- 本轮附件：长文本的引用（名称 / 字符数 / 行数），点开按需取块看内容。
+             与回复层同级挂纵向的 pilot-turn 下——气泡那一行是横向 flex，
+             留在行内会被当成行内第三项横排到气泡旁边。 -->
+        <div v-if="turn.attachments?.length" class="pilot-atts">
+          <button
+            v-for="a in turn.attachments"
+            :key="a.id"
+            type="button"
+            class="pilot-att"
+            :class="{ 'is-open': openAtt?.ref.id === a.id }"
+            :title="t('pilot.attach.toggle')"
+            @click="toggleAttachment(a)"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M14 3v5h5" />
+              <path d="M15 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-4-5Z" />
+            </svg>
+            <span class="pilot-att__name">{{ a.name }}</span>
+            <span class="pilot-att__meta">{{ t('pilot.attach.meta', { chars: fmtChars(a.chars), lines: a.lines }) }}</span>
+          </button>
+        </div>
+        <div
+          v-if="openAtt && turn.attachments?.some((a) => a.id === openAtt?.ref.id)"
+          class="pilot-att-panel"
+        >
+          <pre class="pilot-att-panel__body">{{ openAtt.busy && !openAtt.chunk ? t('pilot.attach.loading') : openAtt.chunk?.content }}</pre>
+          <div class="pilot-att-panel__bar">
+            <span class="pilot-att-panel__note">{{ openAtt.chunk?.note }}</span>
+            <button
+              v-if="openAtt.chunk?.truncated"
+              type="button"
+              class="pilot-att-panel__more"
+              :disabled="openAtt.busy"
+              @click="loadAttachment(openAtt.ref, (openAtt.chunk?.end_line ?? 0) + 1, true)"
+            >{{ t('pilot.attach.more') }}</button>
+          </div>
+        </div>
 
         <!-- agent 回复层：与用户气泡两种图层的统一左对齐面板；pending 轮只上屏发言，回复侧由下方 live 区承担 -->
         <div v-if="turn.kind !== 'pending'" class="pilot-reply">
@@ -1550,11 +2462,25 @@ function triggerFollowUp(prompt: string) {
               </svg>
             </span>
             <span class="pilot-reply__role">Pilot</span>
+            <!-- 中断续跑：已完成的工具事实回灌，接着把这一轮做完（ZCode 语义） -->
+            <button
+              v-if="turn.stopped && !streaming"
+              type="button"
+              class="pilot-resume"
+              :title="t('pilot.continue.title')"
+              @click="continueStopped(i)"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M6 3.5 20 12 6 20.5v-17Z" />
+              </svg>
+              <span>{{ t('pilot.continue') }}</span>
+            </button>
           </div>
 
           <!-- agent 过程链：链头一行摘要（工时+步数），展开看思考/步骤/记忆；done.steps 全量回填 -->
           <HlPilotChain
             v-if="turn.phases?.length || turn.think || turn.steps.length"
+            hide-phase-text
             :steps="turn.steps"
             :phases="turn.phases ?? []"
             :think="turn.think"
@@ -1564,9 +2490,49 @@ function triggerFollowUp(prompt: string) {
             :failed="turn.kind === 'reason'"
           />
 
-          <div v-if="turn.kind === 'reason'" class="pilot-reason">
-            {{ turn.reasonKey ? t(turn.reasonKey) : '' }}
-            <span v-if="turn.cached">({{ t('pilot.cached') }})</span>
+          <!-- 结果异常/原因气泡：红色条件气泡支持行内直接重试 -->
+          <div
+            v-if="turn.kind === 'reason'"
+            class="pilot-reason"
+            :class="{ 'is-error': isErrorReason(turn.reasonKey) }"
+          >
+            <div class="pilot-reason__body">
+              <svg
+                v-if="isErrorReason(turn.reasonKey)"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                class="pilot-reason__icon"
+                aria-hidden="true"
+              >
+                <circle cx="12" cy="12" r="10" />
+                <line x1="12" y1="8" x2="12" y2="12" />
+                <line x1="12" y1="16" x2="12.01" y2="16" />
+              </svg>
+              <span class="pilot-reason__text">
+                {{ turn.reasonKey ? t(turn.reasonKey) : '' }}
+                <span v-if="turn.cached">({{ t('pilot.cached') }})</span>
+              </span>
+            </div>
+            <button
+              v-if="canRetryTurn(turn)"
+              type="button"
+              class="pilot-reason__retry-btn"
+              :disabled="streaming"
+              :title="t('pilot.retry')"
+              @click="retryTurn(i)"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="pilot-reason__retry-icon" aria-hidden="true">
+                <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+                <path d="M3 3v5h5" />
+                <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
+                <path d="M16 21h5v-5" />
+              </svg>
+              <span>{{ t('pilot.retry') }}</span>
+            </button>
           </div>
 
           <div v-else-if="turn.kind === 'candidates'" class="pilot-briefing">
@@ -1623,17 +2589,38 @@ function triggerFollowUp(prompt: string) {
             <div
               v-if="turn.text"
               class="pilot-answer"
-              v-html="mdLiteToHtml(turn.text)"
+              :class="{ 'is-clamped': isLongAnswer(turn) && !turn.expanded }"
+              v-html="renderAnswerHtml(turn.text)"
             ></div>
+            <button
+              v-if="isLongAnswer(turn)"
+              type="button"
+              class="pilot-answer__more"
+              @click="toggleAnswer(turn)"
+            >{{ t(turn.expanded ? 'pilot.answer.collapse' : 'pilot.answer.expand') }}</button>
           </div>
 
-          <!-- 回答：极简 Markdown 渲染（分点/粗体/行内码/代码块；渲染器内先转义后拼标签） -->
+          <!-- 回答：极简 Markdown 渲染（分点/粗体/行内码/代码块；渲染器内先转义后拼标签）。
+               数据卡先行、终答文字收尾——与流式期布局同序，done 不重排 -->
           <template v-else-if="turn.kind === 'answer'">
+            <HlPilotCards
+              v-if="turn.cards?.length"
+              :cards="turn.cards"
+              :busy-pid="busyPid"
+              @proposal="onProposal"
+            />
             <div
               v-if="turn.text"
               class="pilot-answer"
-              v-html="mdLiteToHtml(turn.text)"
+              :class="{ 'is-clamped': isLongAnswer(turn) && !turn.expanded }"
+              v-html="renderAnswerHtml(turn.text)"
             ></div>
+            <button
+              v-if="isLongAnswer(turn)"
+              type="button"
+              class="pilot-answer__more"
+              @click="toggleAnswer(turn)"
+            >{{ t(turn.expanded ? 'pilot.answer.collapse' : 'pilot.answer.expand') }}</button>
             <div v-if="turn.stopped" class="pilot-stopped">{{ t('pilot.stopped') }}</div>
           </template>
 
@@ -1644,13 +2631,40 @@ function triggerFollowUp(prompt: string) {
             <router-link class="pilot-guide__link" to="/library">{{ t('pilot.guide.link') }}</router-link>
           </div>
 
-          <!-- agent 轮的结构化卡片：统一富卡片渲染（价格/列表/动作/导航） -->
-          <HlPilotCards
-            v-if="turn.cards?.length && turn.kind === 'answer'"
-            :cards="turn.cards"
-            :busy-pid="busyPid"
-            @proposal="onProposal"
-          />
+          <!-- 回复动作行：挂在回复正文下方独立一行（左沿对齐），hover 才显形。
+               动作属于它作用的那条回复——不挤在身份标旁边，也不上到提问那一行 -->
+          <div v-if="turn.text || canForkTurn(turn)" class="pilot-acts">
+            <button
+              v-if="turn.text"
+              type="button"
+              class="pilot-act"
+              :title="t('pilot.copy')"
+              :aria-label="t('pilot.copy')"
+              @click="onCopyReply"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="9" y="9" width="11" height="11" rx="2" />
+                <path d="M15 5H6a2 2 0 0 0-2 2v9" />
+              </svg>
+            </button>
+            <!-- 话题分叉：从这一轮（含）派生新会话，源会话保留（同走账本记录） -->
+            <button
+              v-if="canForkTurn(turn)"
+              type="button"
+              class="pilot-act"
+              :title="t('pilot.session.forkTitle')"
+              :aria-label="t('pilot.session.fork')"
+              @click="forkFromTurn(i)"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="6.5" cy="6" r="2.4" />
+                <circle cx="6.5" cy="18" r="2.4" />
+                <circle cx="17.5" cy="9.5" r="2.4" />
+                <path d="M6.5 8.4v7.2M8.9 6h4.1a4.5 4.5 0 0 1 4.5 1.4" />
+              </svg>
+            </button>
+          </div>
+
         </div>
         </template>
       </div>
@@ -1676,9 +2690,8 @@ function triggerFollowUp(prompt: string) {
             :phases="livePhases"
             :waiting-text="loadingText"
           />
-          <!-- 终答就位：文字流式期即在回答层原位生长，卡片在其下，done 零翻转 -->
-          <div v-if="liveAnswerHtml" class="pilot-answer" v-html="liveAnswerHtml"></div>
-          <!-- 即时卡片：工具执行期先挂骨架占位，card 事件到达原位填充（终态前先见卡） -->
+          <!-- 即时卡片：工具执行期先挂骨架占位，card 事件到达原位填充（终态前先见卡）。
+               卡片区在回答层之上——过程叙述进链、数据卡先行、终答收尾，done 零翻转 -->
           <div v-if="liveCards.length" class="pilot-live-cards">
             <template v-for="entry in liveCards" :key="entry.key">
               <HlPilotCards
@@ -1693,9 +2706,26 @@ function triggerFollowUp(prompt: string) {
               </div>
             </template>
           </div>
+          <!-- 终答就位：文字流式期在卡片区之下原位生长，done 零翻转 -->
+          <div v-if="liveAnswerHtml" class="pilot-answer" v-html="liveAnswerHtml"></div>
           <div v-if="queuedHint" class="pilot-queued">
             {{ t(queuedHint === 'parallel' ? 'pilot.queued.parallel'
               : queuedHint === 'toolSlow' ? 'pilot.queued.toolSlow' : 'pilot.queued.waiting') }}
+          </div>
+          <!-- 运行中动作行：与终态回复同一位置同一套钮，只在已流出正文时给复制 -->
+          <div v-if="liveAnswerHtml" class="pilot-acts">
+            <button
+              type="button"
+              class="pilot-act"
+              :title="t('pilot.copy')"
+              :aria-label="t('pilot.copy')"
+              @click="onCopyReply"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="9" y="9" width="11" height="11" rx="2" />
+                <path d="M15 5H6a2 2 0 0 0-2 2v9" />
+              </svg>
+            </button>
           </div>
         </div>
       </div>
@@ -1721,13 +2751,78 @@ function triggerFollowUp(prompt: string) {
       </div>
     </div>
 
+    <!-- 消息队列：生成中提交的问题排在这里，本轮结束后自动发出；
+         可改序、取回重编辑、移除；主动停止生成时暂停但内容不丢 -->
+    <div v-if="queue.length || queuePaused" class="pilot-queue">
+      <div class="pilot-queue__head">
+        <span class="pilot-queue__title">{{ t('pilot.queue.title', { n: queue.length }) }}</span>
+        <span v-if="queuePaused" class="pilot-queue__paused">{{ t('pilot.queue.paused') }}</span>
+        <button v-if="queuePaused" type="button" class="pilot-queue__resume" @click="resumeQueue">
+          {{ t('pilot.queue.resume') }}
+        </button>
+      </div>
+      <div v-for="(item, qi) in queue" :key="item.id" class="pilot-queue__row">
+        <span class="pilot-queue__idx">{{ qi + 1 }}</span>
+        <span class="pilot-queue__text" :title="item.text">{{ item.text }}</span>
+        <button
+          type="button"
+          class="pilot-queue__btn"
+          :disabled="qi === 0"
+          :title="t('pilot.queue.up')"
+          :aria-label="t('pilot.queue.up')"
+          @click="moveQueued(item.id, -1)"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 19V5M5 12l7-7 7 7" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          class="pilot-queue__btn"
+          :disabled="qi === queue.length - 1"
+          :title="t('pilot.queue.down')"
+          :aria-label="t('pilot.queue.down')"
+          @click="moveQueued(item.id, 1)"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 5v14M19 12l-7 7-7-7" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          class="pilot-queue__btn"
+          :title="t('pilot.queue.edit')"
+          :aria-label="t('pilot.queue.edit')"
+          @click="takeQueued(item.id)"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17v3Z" />
+            <path d="M14.5 6.5 17.5 9.5" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          class="pilot-queue__btn"
+          :title="t('pilot.queue.remove')"
+          :aria-label="t('pilot.queue.remove')"
+          @click="removeQueued(item.id)"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true">
+            <path d="M6 6l12 12M18 6L6 18" />
+          </svg>
+        </button>
+      </div>
+    </div>
+
     <div class="pilot-composer">
       <HlTextarea
+        ref="composer"
         v-model="question"
         :rows="2"
         class="pilot-composer__input"
         :placeholder="t('pilot.ask.placeholder')"
         @keydown="onComposerKeydown"
+        @paste="onComposerPaste"
       />
       <div class="pilot-composer__bar">
         <div class="pilot-composer__chips">
@@ -1742,7 +2837,55 @@ function triggerFollowUp(prompt: string) {
           <HlTag v-if="referenceSession" type="accent" closable @close="referenceSession = null">
             {{ t('pilot.ref.chip', { title: referenceSession.title }) }}
           </HlTag>
-          <HlTag v-if="game" type="accent">{{ t('pilot.context.of') }} · {{ game.name }}</HlTag>
+          <!-- 待发附件：长文本已落盘，这里只是引用（发送后随该轮上屏） -->
+          <HlTag
+            v-for="a in pendingAttachments"
+            :key="a.id"
+            type="accent"
+            closable
+            @close="removePendingAttachment(a.id)"
+          >
+            {{ t('pilot.attach.chip', { name: a.name, n: a.lines }) }}
+          </HlTag>
+          <HlChip v-if="attachBusy" tone="neutral" :title="t('pilot.attach.uploading')">
+            {{ t('pilot.attach.uploading') }}
+          </HlChip>
+          <!-- 页面元素引用：点击进入选择模式，选中元素后以 chip 展示 -->
+          <button
+            type="button"
+            class="pilot-el-pick"
+            :class="{ 'is-active': elPicking }"
+            :title="elPicking ? t('pilot.elPicker.cancel') : t('pilot.elPicker.start')"
+            :aria-label="elPicking ? t('pilot.elPicker.cancel') : t('pilot.elPicker.start')"
+            @click="elPicking ? cancelElPicking() : startElPicking()"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <path d="M3 3l7 19 2-8 8-2L3 3z" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </button>
+          <HlTag
+            v-for="el in pickedElements"
+            :key="el.id"
+            type="accent"
+            closable
+            :title="el.selector"
+            @close="removePickedEl(el.id)"
+          >
+            {{ t('pilot.elPicker.chip', { tag: el.tag, label: el.label || el.text }) }}
+          </HlTag>
+          <HlTag v-if="game" type="accent" class="pilot-game-tag">
+            <HlImg
+              :src="pilotCoverUrl(game.appid)"
+              :alt="game.name"
+              loading="lazy"
+              class="pilot-game-tag__cover"
+            >
+              <template #fallback>
+                <span class="pilot-game-tag__cover-fallback">{{ (game.name || '').slice(0, 1) }}</span>
+              </template>
+            </HlImg>
+            <span class="pilot-game-tag__text">{{ t('pilot.context.of') }} · {{ game.name }}</span>
+          </HlTag>
           <div
             class="pilot-ctxpick"
             @click.stop
@@ -1895,7 +3038,8 @@ function triggerFollowUp(prompt: string) {
               </div>
             </Transition>
           </div>
-          <HlChip v-else tone="accent" @click="goSettings">{{ t('pilot.composer.modelOff') }}</HlChip>
+          <!-- 配置尚未取回（null）时不渲染，避免把「还在取」显示成「未配置」 -->
+          <HlChip v-else-if="pilotReady === false" tone="accent" @click="goSettings">{{ t('pilot.composer.modelOff') }}</HlChip>
           <button
             v-if="streaming"
             type="button"
@@ -1927,6 +3071,35 @@ function triggerFollowUp(prompt: string) {
       </div>
     </div>
 
+    <!-- 拖选浮条：答复里划一段松手即浮出，两个去处——整段拿走 / 带回输入框。
+         Teleport 到 body：会话区是滚动容器，浮条在里面会被裁掉 -->
+    <Teleport to="body">
+      <Transition name="hl-pop">
+        <div
+          v-if="selQuote"
+          class="pilot-selbar"
+          :style="selBarStyle"
+          @mousedown.prevent
+        >
+          <button type="button" class="pilot-selbar__btn" @click="onCopyText(selQuote.text)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="9" y="9" width="11" height="11" rx="2" />
+              <path d="M15 5H6a2 2 0 0 0-2 2v9" />
+            </svg>
+            <span>{{ t('pilot.copy') }}</span>
+          </button>
+          <button type="button" class="pilot-selbar__btn" @click="quoteToComposer(selQuote.text)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M10 7H6a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2v-4" />
+              <path d="M14 4h6v6" />
+              <path d="M20 4l-8 8" />
+            </svg>
+            <span>{{ t('pilot.quote') }}</span>
+          </button>
+        </div>
+      </Transition>
+    </Teleport>
+
     <!-- 底栏会话统计：轮/步/速度读数 + 点击弹总耗时/首字面板（账本投影，无轮不渲染） -->
     <HlPilotStats v-if="sessionStats && sessionStats.turns > 0" :stats="sessionStats" />
   </div>
@@ -1945,8 +3118,10 @@ function triggerFollowUp(prompt: string) {
 
 /* ── 整页：会话列 Teleport 到页面级左侧挂点（与对话列布局解耦）；
    head 标题与页面标题重复故整页隐藏 ── */
+/* 高度由宿主（Index 的定高容器）给出：对话记录吃掉剩余空间内滚，
+   输入框恒在底部——长内容（思考展开/卡片）不再把它顶下去 */
 .pilot-console.is-page {
-  height: auto;
+  height: 100%;
 }
 
 .pilot-console.is-page .pilot-head,
@@ -2137,6 +3312,106 @@ function triggerFollowUp(prompt: string) {
 .pilot-side__x svg {
   width: 12px;
   height: 12px;
+}
+
+/* 已置顶/已归档动作钮：状态恒显（不靠 hover），用 accent 标「开着」 */
+.pilot-side__x.is-on {
+  opacity: 1;
+  color: var(--accent);
+}
+
+/* 搜索框：常驻列头（固定不随列表滚动） */
+.pilot-side__search {
+  flex: none;
+}
+
+.pilot-side__search-box {
+  width: 100%;
+}
+
+/* 归档折叠头：点开条，弱色不抢主列注意力 */
+.pilot-side__arch {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 8px;
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.pilot-side__arch:hover {
+  color: var(--text-secondary);
+}
+
+.pilot-side__arch-ico {
+  width: 11px;
+  height: 11px;
+  flex: none;
+  transition: transform 0.15s;
+}
+
+.pilot-side__arch-ico.is-open {
+  transform: rotate(90deg);
+}
+
+/* 归档项在主列之外再压一档：名与元信息降色 */
+.pilot-side__row.is-arch .pilot-side__name {
+  color: var(--text-secondary);
+}
+
+/* 置顶标记：小图钉恒显（不是 hover 才出的动作钮） */
+.pilot-side__pinmark {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 11px;
+  height: 11px;
+  color: var(--accent);
+}
+
+.pilot-side__pinmark svg {
+  width: 11px;
+  height: 11px;
+}
+
+/* 派生标记：标题前缀的常驻小图标（会话列 / 标签栏 / 历史面板共用）——
+   放前缀是因为窄列会省略标题尾部，后缀标记会被截掉 */
+.pilot-forkmark {
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  width: 11px;
+  height: 11px;
+  margin-right: 4px;
+  vertical-align: -1px;
+  color: var(--text-muted);
+}
+
+.pilot-forkmark svg {
+  width: 11px;
+  height: 11px;
+  stroke: currentColor;
+}
+
+/* 检索命中的正文片段：单行省略（「…」由后端裁好） */
+.pilot-side__snippet {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* 行内动作组：置顶/归档/删除三钮并排（占位恒定，hover 才显形） */
+.pilot-side__acts {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 2px;
 }
 
 .pilot-side__rename {
@@ -2418,6 +3693,35 @@ function triggerFollowUp(prompt: string) {
   height: 14px;
 }
 
+/* 页面元素选择按钮：与 + 引用按钮同尺寸同风格，激活时高亮 */
+.pilot-el-pick {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background var(--duration-2) var(--motion-default),
+    color var(--duration-2) var(--motion-default);
+}
+.pilot-el-pick:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+.pilot-el-pick.is-active {
+  background: var(--accent-a20);
+  color: var(--accent-a);
+}
+.pilot-el-pick svg {
+  width: 14px;
+  height: 14px;
+}
+
 .pilot-head__actions {
   display: flex;
   align-items: center;
@@ -2505,6 +3809,43 @@ function triggerFollowUp(prompt: string) {
   margin-top: 2px;
   font-size: 12px;
   color: var(--text-secondary);
+}
+
+.pilot-game-tag {
+  display: inline-flex !important;
+  align-items: center;
+  gap: 5px;
+  padding-left: 4px !important;
+}
+
+.pilot-game-tag__cover {
+  width: 20px;
+  aspect-ratio: 460 / 215;
+  border-radius: var(--radius-xs, 2px);
+  overflow: hidden;
+  background: var(--surface-inset);
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.pilot-game-tag__cover :deep(img) {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.pilot-game-tag__cover-fallback {
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--text-muted);
+}
+
+.pilot-game-tag__text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 160px;
 }
 
 .pilot-ctxpick {
@@ -2902,6 +4243,15 @@ function triggerFollowUp(prompt: string) {
   color: var(--text-secondary);
 }
 
+/* 发言行：气泡 + 复制钮同一行右沿对齐；钮常驻占位，hover 才显形 */
+.pilot-turn__row {
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+}
+
 .pilot-turn__q {
   align-self: flex-end;
   max-width: 82%;
@@ -2918,11 +4268,416 @@ function triggerFollowUp(prompt: string) {
   box-shadow: 0 2px 8px var(--surface-inset-sm);
 }
 
+/* ── 附件：引用芯片 + 展开的内容面板（长文本不进消息体，按需取块） ── */
+.pilot-atts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+  align-self: flex-end;
+  max-width: 82%;
+  margin-top: 6px;
+}
+
+.pilot-att {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  padding: 3px 9px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--bg-soft);
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.pilot-att:hover,
+.pilot-att.is-open {
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+}
+
+.pilot-att svg {
+  width: 12px;
+  height: 12px;
+  flex: none;
+  display: block;
+}
+
+.pilot-att__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 150px;
+}
+
+.pilot-att__meta {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.pilot-att-panel {
+  align-self: stretch;
+  margin-top: 6px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--bg-soft);
+  overflow: hidden;
+}
+
+.pilot-att-panel__body {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 220px;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.pilot-att-panel__bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.pilot-att-panel__note {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.pilot-att-panel__more {
+  flex: none;
+  padding: 2px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.pilot-att-panel__more:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* 动作行：挂在它作用的那条消息下方，与消息同侧对齐。
+   整行常驻占位（高度恒定）只切透明度——显隐不推动上方内容，
+   气泡/正文不因出现动作而位移。 */
+.pilot-acts {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 22px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.pilot-acts--end {
+  justify-content: flex-end;
+}
+
+/* 发言动作：鼠标落在提问那一行或动作行自身时显形 */
+.pilot-turn__row:hover ~ .pilot-acts--end,
+.pilot-acts--end:hover,
+.pilot-acts--end:focus-within {
+  opacity: 1;
+}
+
+/* 回复动作：鼠标落在回复层或动作行自身时显形 */
+.pilot-reply:hover .pilot-acts,
+.pilot-reply .pilot-acts:hover,
+.pilot-reply .pilot-acts:focus-within {
+  opacity: 1;
+}
+
+/* 单枚动作钮：复制 / 编辑 / 分叉共用同一形态 */
+.pilot-act {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.pilot-act svg {
+  width: 13px;
+  height: 13px;
+  display: block;
+}
+
+.pilot-act:hover {
+  background: var(--surface-chip);
+  color: var(--text-primary);
+}
+
+.pilot-act:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* 编辑重问：气泡原位换成可改的文本框，其后轮次会被作废（有提示） */
+.pilot-edit {
+  flex: 1;
+  min-width: 0;
+  max-width: 82%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--accent-a40);
+  border-radius: 16px 16px 4px 16px;
+}
+
+.pilot-edit__box {
+  width: 100%;
+  min-height: 50px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.6;
+  resize: vertical;
+  outline: none;
+}
+
+.pilot-edit__bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pilot-edit__warn {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--danger-deep);
+}
+
+.pilot-edit__btn {
+  flex: none;
+  padding: 4px 11px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: var(--accent-fill);
+  color: var(--text-on-fill);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.pilot-edit__btn.is-ghost {
+  background: transparent;
+  border-color: var(--border-soft);
+  color: var(--text-secondary);
+}
+
+.pilot-edit__btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.pilot-edit__btn:hover:not(:disabled) {
+  background: var(--accent-fill-hover);
+}
+
+.pilot-edit__btn.is-ghost:hover:not(:disabled) {
+  background: var(--surface-chip);
+  color: var(--text-primary);
+}
+
+/* 中断续跑：答复头上的「继续」，只有被用户停止过的轮才有 */
+.pilot-resume {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 2px;
+  padding: 3px 9px;
+  border: 1px solid var(--accent-a30);
+  border-radius: 999px;
+  background: var(--accent-a10);
+  color: var(--accent-deep);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.pilot-resume svg {
+  width: 11px;
+  height: 11px;
+  display: block;
+}
+
+.pilot-resume:hover {
+  background: var(--accent-a20);
+  border-color: var(--accent-a50);
+}
+
+/* 消息队列：生成中提交的问题排队等本轮结束（可改序/取回/移除） */
+.pilot-queue {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: var(--bg-soft);
+}
+
+.pilot-queue__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pilot-queue__title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.pilot-queue__paused {
+  font-size: 11px;
+  color: var(--danger-deep);
+}
+
+.pilot-queue__resume {
+  margin-left: auto;
+  padding: 2px 9px;
+  border: 1px solid var(--accent-a30);
+  border-radius: 999px;
+  background: var(--accent-a10);
+  color: var(--accent-deep);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.pilot-queue__resume:hover {
+  background: var(--accent-a20);
+}
+
+.pilot-queue__row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.pilot-queue__idx {
+  flex: none;
+  width: 16px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.pilot-queue__text {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pilot-queue__btn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.pilot-queue__btn svg {
+  width: 12px;
+  height: 12px;
+  display: block;
+}
+
+.pilot-queue__btn:hover:not(:disabled) {
+  background: var(--surface-chip);
+  color: var(--text-primary);
+}
+
+.pilot-queue__btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* 拖选浮条：定在选区正上方居中，@mousedown.prevent 保住选区不散 */
+.pilot-selbar {
+  position: fixed;
+  z-index: 90;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 10px;
+  background: var(--surface-float);
+  border: 1px solid var(--border-soft);
+  box-shadow: 0 6px 20px var(--surface-inset-sm);
+}
+
+.pilot-selbar__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.pilot-selbar__btn svg {
+  width: 13px;
+  height: 13px;
+}
+
+.pilot-selbar__btn:hover {
+  background: var(--surface-chip);
+  color: var(--text-primary);
+}
+
 .pilot-composer .hl-button {
   flex: none;
 }
 
 .pilot-reason {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   padding: 8px 12px;
   border-radius: 8px;
   font-size: 12px;
@@ -2932,6 +4687,64 @@ function triggerFollowUp(prompt: string) {
   border: 1px dashed var(--border-soft);
 }
 
+.pilot-reason.is-error {
+  color: var(--danger);
+  background: var(--danger-a15);
+  border: 1px solid var(--danger-a30);
+}
+
+.pilot-reason__body {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.pilot-reason__icon {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  color: var(--danger);
+}
+
+.pilot-reason__text {
+  flex: 1;
+  word-break: break-word;
+}
+
+.pilot-reason__retry-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  border-radius: 6px;
+  border: 1px solid var(--danger-a40);
+  background: var(--danger-a20);
+  color: var(--danger);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: all var(--duration-fast) var(--ease-out);
+}
+
+.pilot-reason__retry-btn:hover:not(:disabled) {
+  background: var(--danger);
+  color: var(--text-on-fill);
+  border-color: var(--danger);
+}
+
+.pilot-reason__retry-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.pilot-reason__retry-icon {
+  width: 13px;
+  height: 13px;
+}
+
 /* 回答走对话流排版（不装箱）：markdown 标签由渲染器产出，scoped 下用 :deep() 着样式 */
 .pilot-answer {
   margin: 0;
@@ -2939,6 +4752,95 @@ function triggerFollowUp(prompt: string) {
   line-height: 1.75;
   color: var(--text-primary);
   word-break: break-word;
+}
+
+/* 长回答折叠：渐隐裁切 + 展开/收起钮（阈值 700 字；展开态按轮记忆） */
+.pilot-answer.is-clamped {
+  position: relative;
+  max-height: 320px;
+  overflow: hidden;
+}
+
+.pilot-answer.is-clamped::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 56px;
+  background: linear-gradient(to bottom, transparent, var(--bg-base));
+  pointer-events: none;
+}
+
+.pilot-answer__more {
+  align-self: flex-start;
+  margin-top: 4px;
+  padding: 2px 9px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: none;
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.pilot-answer__more:hover {
+  border-color: var(--accent-a30);
+  background: var(--accent-a10);
+  color: var(--accent);
+}
+
+/* 分叉溯源分隔线：与压缩分隔线同一套「两侧细线 + 居中胶囊」语言——
+   派生是本会话的起点事实，占对话流首行；可点跳回源会话，故用按钮而非徽章 */
+.pilot-forkline {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 4px 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+}
+
+.pilot-forkline__line {
+  flex: 1;
+  height: 1px;
+  background: var(--border-soft);
+}
+
+.pilot-forkline__pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 70%;
+  padding: 3px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.pilot-forkline:hover .pilot-forkline__pill,
+.pilot-forkline:focus-visible .pilot-forkline__pill {
+  border-color: var(--accent-a30);
+  background: var(--accent-a10);
+  color: var(--accent);
+}
+
+.pilot-forkline:focus-visible {
+  outline: none;
+}
+
+.pilot-forkline__pill svg {
+  width: 12px;
+  height: 12px;
+  flex: none;
 }
 
 .pilot-answer :deep(p) {
@@ -2987,6 +4889,161 @@ function triggerFollowUp(prompt: string) {
   border-radius: 0;
   font-size: 12px;
   line-height: 1.6;
+}
+
+.pilot-answer :deep(.pilot-svg) {
+  margin: 8px 0 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  background: var(--bg-card);
+  overflow: hidden;
+}
+
+.pilot-answer :deep(.pilot-svg-toolbar) {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--bg-hover);
+  font-size: 11px;
+}
+
+.pilot-answer :deep(.pilot-svg-badge) {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.pilot-answer :deep(.pilot-svg-badge svg) {
+  width: 12px;
+  height: 12px;
+  color: var(--accent);
+}
+
+.pilot-answer :deep(.pilot-svg-actions) {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.pilot-answer :deep(.pilot-svg-tab) {
+  padding: 2px 8px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: none;
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all calc(var(--duration-1) * var(--motion-scale)) ease;
+}
+
+.pilot-answer :deep(.pilot-svg-tab:hover) {
+  color: var(--text-primary);
+  background: var(--bg-card);
+}
+
+.pilot-answer :deep(.pilot-svg-tab.is-active) {
+  color: var(--accent);
+  background: var(--bg-card);
+  border-color: var(--border-soft);
+  font-weight: 600;
+}
+
+.pilot-answer :deep(.pilot-svg-copy) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all calc(var(--duration-1) * var(--motion-scale)) ease;
+}
+
+.pilot-answer :deep(.pilot-svg-copy svg) {
+  width: 13px;
+  height: 13px;
+}
+
+.pilot-answer :deep(.pilot-svg-copy:hover) {
+  color: var(--text-primary);
+  background: var(--bg-card);
+}
+
+.pilot-answer :deep(.pilot-svg-stage) {
+  padding: 12px;
+  overflow-x: auto;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  background: var(--bg-card);
+}
+
+.pilot-answer :deep(.pilot-svg-stage svg) {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-width: 720px;
+}
+
+.pilot-answer :deep(.pilot-svg-source) {
+  padding: 10px 12px;
+  background: var(--bg-card);
+  overflow-x: auto;
+}
+
+.pilot-answer :deep(.pilot-svg-source pre) {
+  margin: 0;
+  padding: 0;
+  background: none;
+}
+
+.pilot-answer :deep(.pilot-svg-source code) {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-primary);
+}
+
+.pilot-answer :deep(.pilot-svg.is-pending) {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 56px;
+  padding: 12px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.pilot-answer :deep(.pilot-svg.is-drawing) {
+  border-color: var(--accent-a30);
+  box-shadow: 0 0 12px var(--accent-a08);
+}
+
+.pilot-answer :deep(.pilot-svg-badge.is-drawing) {
+  color: var(--accent);
+}
+
+.pilot-answer :deep(.pilot-svg-badge.is-drawing svg) {
+  animation: pilot-svg-spin 2s linear infinite;
+}
+
+@keyframes pilot-svg-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pilot-answer :deep(.pilot-svg-badge.is-drawing svg) {
+    animation: none;
+  }
 }
 
 .pilot-answer :deep(h3) {

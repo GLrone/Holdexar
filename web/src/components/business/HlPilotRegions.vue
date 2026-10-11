@@ -4,6 +4,8 @@ import { computed } from 'vue'
 import type { PilotRegionsFacts } from '@/api/client'
 import { formatCnyFen } from '@/api/regions'
 import { useI18n } from '@/locales'
+import { pilotCoverUrl } from '@/lib/pilotView'
+import HlImg from '@/components/ui/HlImg.vue'
 import RegionFlag from '@/components/RegionFlag.vue'
 
 const props = defineProps<{ card: PilotRegionsFacts }>()
@@ -38,7 +40,40 @@ const verdict = computed(() => {
 <template>
   <div class="preg">
     <div class="preg__header">
-      <div class="preg__title" :title="card.name || `AppID ${card.appid}`">
+      <router-link
+        v-if="card.appid"
+        :to="`/game/${card.appid}`"
+        class="preg__hero"
+        :title="card.name || `AppID ${card.appid}`"
+      >
+        <HlImg
+          :src="pilotCoverUrl(card.appid)"
+          :alt="card.name || `AppID ${card.appid}`"
+          loading="lazy"
+          class="preg__cover"
+        >
+          <template #fallback>
+            <span class="preg__cover-fallback">{{ (card.name || `AppID ${card.appid}`).slice(0, 2) }}</span>
+          </template>
+        </HlImg>
+        <div class="preg__title-wrap">
+          <div class="preg__title">
+            <span>{{ card.name || `AppID ${card.appid}` }}</span>
+            <svg class="preg__title-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M7 17l9.2-9.2M17 17V8H8" />
+            </svg>
+          </div>
+          <span class="preg__subtitle">
+            <svg class="preg__subtitle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="10" />
+              <line x1="2" y1="12" x2="22" y2="12" />
+              <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
+            </svg>
+            {{ t('pilot.regions.title', { name: card.name || `AppID ${card.appid}` }) }}
+          </span>
+        </div>
+      </router-link>
+      <div v-else class="preg__title" :title="card.name || `AppID ${card.appid}`">
         <svg class="preg__title-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <circle cx="12" cy="12" r="10" />
           <line x1="2" y1="12" x2="22" y2="12" />
@@ -107,6 +142,51 @@ const verdict = computed(() => {
   gap: 8px;
 }
 
+.preg__hero {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-decoration: none;
+  min-width: 0;
+  flex: 1;
+}
+
+.preg__cover {
+  width: 58px;
+  aspect-ratio: 460 / 215;
+  border-radius: var(--radius-xs, 4px);
+  overflow: hidden;
+  background: var(--surface-inset);
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+}
+
+.preg__cover :deep(img) {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transition: transform var(--transition);
+}
+
+.preg__hero:hover .preg__cover :deep(img) {
+  transform: scale(1.05);
+}
+
+.preg__cover-fallback {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-muted);
+}
+
+.preg__title-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
 .preg__title {
   display: flex;
   align-items: center;
@@ -117,6 +197,38 @@ const verdict = computed(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.preg__title-arrow {
+  width: 13px;
+  height: 13px;
+  opacity: 0;
+  color: var(--accent);
+  transition: opacity var(--transition), transform var(--transition);
+  flex-shrink: 0;
+}
+
+.preg__hero:hover .preg__title-arrow {
+  opacity: 1;
+  transform: translate(2px, -2px);
+}
+
+.preg__subtitle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.preg__subtitle-icon {
+  width: 12px;
+  height: 12px;
+  color: var(--accent);
+  flex-shrink: 0;
 }
 
 .preg__title-icon {

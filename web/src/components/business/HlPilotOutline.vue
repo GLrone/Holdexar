@@ -20,6 +20,8 @@ interface OutlineTurn {
 const props = defineProps<{
   turns: OutlineTurn[]
   activeIndex: number | null
+  /** 当前会话轮数（过滤压缩分隔线后）；>0 时显示徽标 */
+  count?: number
   /** 面板弹出方位：down=按钮下方（tabbar 场景），right=按钮右侧（会话列场景） */
   side?: 'down' | 'right'
 }>()
@@ -126,8 +128,8 @@ watch(
       type="button"
       class="poutline__btn"
       :class="{ 'is-open': open }"
-      :title="t('pilot.outline.title')"
-      :aria-label="t('pilot.outline.title')"
+      :title="props.count ? t('pilot.outline.titleCount', { n: props.count }) : t('pilot.outline.title')"
+      :aria-label="props.count ? t('pilot.outline.titleCount', { n: props.count }) : t('pilot.outline.title')"
       :aria-expanded="open"
       @click="toggle"
     >
@@ -135,6 +137,9 @@ watch(
         <path d="M4 6h16M4 12h10M4 18h7" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
       </svg>
     </button>
+    <span v-if="props.count && props.count > 0" class="poutline__badge" aria-hidden="true">
+      {{ props.count > 99 ? '99+' : props.count }}
+    </span>
     <Transition name="hl-pop">
       <div v-if="open" ref="listEl" class="poutline__panel" :class="{ 'is-right': side === 'right' }">
         <div v-if="!entries.length" class="poutline__empty">{{ t('pilot.outline.empty') }}</div>
@@ -186,6 +191,26 @@ watch(
 .poutline__btn svg {
   width: 14px;
   height: 14px;
+}
+
+/* 轮数徽标：按钮外右上角，让「刻度」语义在未点开时就可见 */
+.poutline__badge {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  z-index: 1;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: var(--bg-card);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
 }
 
 .poutline__panel {

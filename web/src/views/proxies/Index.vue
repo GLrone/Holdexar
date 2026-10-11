@@ -37,7 +37,8 @@ const {
 } = storeToRefs(proxyTasks)
 const items = ref<ProxyItem[]>([])
 const subscriptions = ref<ProxySubscriptionItem[]>([])
-const strategy = ref<ProxyStrategy>({ strategy: 'proxy_first', clashPort: 7890 })
+// 空串 = 尚未拉到策略：不预置任何模式，避免首屏假高亮（load 后由后端值决定）
+const strategy = ref<ProxyStrategy>({ strategy: '', clashPort: 7890 })
 const events = ref<Awaited<ReturnType<typeof proxiesApi.events>>>([])
 const clash = ref<ClashStatus | null>(null)
 const loading = ref(true)
@@ -398,9 +399,14 @@ async function syncSubscription(sub: ProxySubscriptionItem) {
     if (res.traffic) parts.push(shortTraffic(res.traffic))
     const summary = { parts: parts.join(' · ') }
     message.success(
-      res.restarted
-        ? t('proxies.sub.syncedRestarted', summary)
-        : t('proxies.sub.synced', summary),
+      [
+        res.restarted
+          ? t('proxies.sub.syncedRestarted', summary)
+          : t('proxies.sub.synced', summary),
+        res.strategySwitched ? t('proxies.sub.autoSwitched') : '',
+      ]
+        .filter(Boolean)
+        .join(' · '),
     )
     await load()
   } catch (e) {
@@ -520,8 +526,10 @@ watch(
 onUnmounted(() => window.clearTimeout(directNoticeTimer))
 
 async function applyStrategy() {
+  // 只发策略字段：端口/开关有各自的保存口，混发会把「改端口」误判成
+  // 用户表达了策略偏好（后端据此永久关闭订阅导入的自动切换）
   try {
-    await proxiesApi.setStrategy(strategy.value)
+    await proxiesApi.setStrategy({ strategy: strategy.value.strategy })
     message.success(t('proxies.strategy.updated'))
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e))
@@ -537,7 +545,7 @@ async function saveClashPort() {
     return
   }
   try {
-    await proxiesApi.setStrategy({ ...strategy.value, clashPort: port })
+    await proxiesApi.setStrategy({ clashPort: port })
     message.success(t('proxies.port.updated'))
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e))

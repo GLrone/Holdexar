@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch, type Component } from 'vue'
+import { useRoute } from 'vue-router'
 import { flagUrl } from '@/api/regions'
 import { useRegionsStore } from '@/stores/regions'
 import { useFamilyStore } from '@/stores/familyLib'
@@ -181,8 +182,8 @@ function onAddInput(e: Event) {
   ;(onAddInput as unknown as { _t?: number })._t = window.setTimeout(previewResolve, 300)
 }
 
-/** 确认添加：解析结果入库追踪（tracked_accounts）+ 加入家庭页列表；
-    家庭组其余真实成员由「同步家庭组」按主账号 Cookie 自动补齐 */
+/** 确认添加：成员账落 manual 条目（列表唯一事实源）+ 入库追踪（tracked_accounts）；
+    列表以 /family/status 重拉为准，本地不再自行拼接 */
 const confirming = ref(false)
 async function confirmAddMember() {
   const p = resolvePreview.value
@@ -192,39 +193,29 @@ async function confirmAddMember() {
   }
   confirming.value = true
   try {
-    // 入库追踪：进 tracked_accounts（愿望单/已购同步链路随之生效，无需等待家庭组）
+    await familyApi.addMember(p.steamid, p.personaName || '', p.avatarUrl || '', activeGroupSid.value || undefined)
     try {
+      // 入库追踪：进 tracked_accounts（愿望单/已购同步链路随之生效）
       await watchPoolApi.add(p.steamid, p.personaName || '', { wishlist: true, owned: true })
     } catch (e) {
       // 重复添加（账户已存在）静默放行
       const msg = e instanceof Error ? e.message : String(e)
       if (!/已存在|exist/i.test(msg)) message.warning(t('family.add.trackFailed', { err: msg }))
     }
-    const nextId = Math.max(...members.value.map((m) => m.id), 0) + 1
-    members.value.push({
-      id: nextId,
-      steamid: p.steamid,
-      name: p.personaName || '',
-      avatar: '',
-      avatarUrl: normalizeAvatarUrl(p.avatarUrl),
-      role: 'family',
-      friendCode: String(BigInt(p.steamid) - 76561197960265728n),
-      region: null,
-      regionSource: null,
-      contribution: 0,
-      exclusive: 0,
-      recent30: 0,
-    })
-    normalizeRoles()
     addInput.value = ''
     resolvePreview.value = null
+    await loadFamily()
     message.success(t('family.add.success', { name: p.personaName || p.steamid }))
+  } catch (e) {
+    message.warning(t('family.add.failed', { err: e instanceof Error ? e.message : String(e) }))
   } finally {
     confirming.value = false
   }
 }
 
 const activeTab = ref('contrib')
+
+
 
 /* 页签常量表**只存词条 key**：模块级 const 存译文会把语言冻在模块加载那一刻
    （brief 的冻结陷阱），渲染期 `t(tab.labelKey)` 才是响应式的。`key` 是筛选用的
@@ -244,6 +235,13 @@ const TAB_KEYS: { key: string; labelKey: MessageKey }[] = [
 const tabItems = computed<HlTabItem[]>(() =>
   TAB_KEYS.map((x) => ({ key: x.key, label: t(x.labelKey) })),
 )
+
+/* 领航员导航带板块键（route.query.s）：合法页签直接定位（agent 跳转入口） */
+const route = useRoute()
+watch(() => route.query.s, (s) => {
+  if (typeof s === 'string' && TAB_KEYS.some((t) => t.key === s)) activeTab.value = s
+}, { immediate: true })
+
 
 /* 页签 → 面板组件。**为什么用映射而不是 v-if 链**：面板切换要过渡，而
    `<Transition>` 只接受单个子节点——v-if 链会编译成一个 fragment，Vue 会告警
@@ -366,9 +364,19 @@ function regionName(code: string) {
   return r ? r.name : code.toUpperCase()
 }
 
-function removeMember(id: number) {
-  members.value = members.value.filter((m) => m.id !== id)
-  normalizeRoles()
+/** 移除成员：真实账本操作（manual 删条目 / steam 落排除标记），成功后列表重拉 */
+const removingSid = ref('')
+async function removeMember(m: FamilyMember) {
+  if (removingSid.value) return
+  removingSid.value = m.steamid
+  try {
+    await familyApi.removeMember(m.steamid, activeGroupSid.value || undefined)
+    await loadFamily()
+  } catch (e) {
+    message.warning(t('family.remove.failed', { err: e instanceof Error ? e.message : String(e) }))
+  } finally {
+    removingSid.value = ''
+  }
 }
 
 onMounted(() => {
@@ -473,7 +481,10 @@ const excludedBySteamid = computed(() => {
               <template v-else>{{ t('family.member.regionUnset') }}</template>
               <span class="car">▼</span>
             </button>
-            <span class="fam-del" :title="t('family.member.remove')" @click="removeMember(m.id)">✕</span>
+            <span class="fam-del" :title="t('family.member.remove')" @click="removeMember(m)">
+              <span v-if="removingSid === m.steamid" class="hl-spinner hl-spinner--inline" aria-hidden="true" />
+              <template v-else>✕</template>
+            </span>
           </div>
         </div>
       </div>

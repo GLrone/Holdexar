@@ -15,7 +15,6 @@ const FORBIDDEN = [
   '代理管理',
   '代理',
   'Clash',
-  '商店',
   '我」页',
   '我页',
   '工具箱',
@@ -50,16 +49,16 @@ test('导览词条不含旧模型词（首次用户可见文本 = productTour �
   }
 })
 
-test('导览点名与导航词典逐字一致（找游戏 / 我的关注；绑定步带「可选」）', () => {
+test('导览点名与导航词典逐字一致（游戏商店 / 我的关注；绑定步带「可选」）', () => {
   const zhDict = zh as Record<string, string>
   // 各步标题就是导航名（定稿形态逐字出现）
-  assert.ok(zhDict['productTour.stepFind.title']!.includes('找游戏'))
+  assert.ok(zhDict['productTour.stepFind.title']!.includes('游戏商店'))
   assert.ok(zhDict['productTour.stepFollow.title']!.includes('我的关注'))
   // 账号绑定 = 可选增强：标题带「可选」，收尾重看入口指向「设置」页
   assert.match(zhDict['productTour.stepBind.title']!, /可选 · 绑定 Steam 账号/)
   assert.match(zhDict['productTour.done.p3']!, /「设置」页/)
   // 收尾主链句与教学步骤一一对应（提醒不单独设步，收尾一句话带过）
-  assert.match(zhDict['productTour.done.emph']!, /找游戏 → 看价格 → 关注 → 自动更新/)
+  assert.match(zhDict['productTour.done.emph']!, /游戏商店 → 看价格 → 关注 → 自动更新/)
   assert.match(zhDict['productTour.done.p1']!, /价格提醒/)
 })
 

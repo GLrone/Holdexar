@@ -18,6 +18,7 @@ import HlImg from '@/components/ui/HlImg.vue'
 import CurrencyFlag from '@/components/CurrencyFlag.vue'
 import RegionFlag from '@/components/RegionFlag.vue'
 import HlPilotCompare from '@/components/business/HlPilotCompare.vue'
+import HlPilotEpic from '@/components/business/HlPilotEpic.vue'
 import HlPilotRegions from '@/components/business/HlPilotRegions.vue'
 import HlPilotStepper from '@/components/business/HlPilotStepper.vue'
 import HlPilotTrend from '@/components/business/HlPilotTrend.vue'
@@ -528,6 +529,23 @@ function toggleTrend(appid: number) {
       <template v-else-if="c.kind === 'action'">
         <div class="pcard-receipt">
           <div class="pcard-receipt__dot"></div>
+          <router-link
+            v-if="c.appid"
+            :to="`/game/${c.appid}`"
+            class="pcard-receipt__cover-link"
+            :title="c.name || `AppID ${c.appid}`"
+          >
+            <HlImg
+              :src="pilotCoverUrl(c.appid)"
+              :alt="c.name || `AppID ${c.appid}`"
+              loading="lazy"
+              class="pcard-receipt__cover"
+            >
+              <template #fallback>
+                <span class="pcard-receipt__cover-fallback">{{ (c.name || `AppID ${c.appid}`).slice(0, 2) }}</span>
+              </template>
+            </HlImg>
+          </router-link>
           <span class="pcard-receipt__text">{{ actionReceipt(c) }}</span>
           <router-link v-if="c.action === 'monitor_add'" class="pcard-receipt__link" to="/pool">
             {{ t('pilot.action.toFollows') }}
@@ -545,9 +563,26 @@ function toggleTrend(appid: number) {
 
       <!-- 系统诊断 / 代理通道 / 汇率多行卡片 -->
       <template v-else-if="c.kind === 'rows'">
-        <div class="pcard-header-bar">
+        <div class="pcard-header-bar" :class="{ 'has-cover': Boolean(c.appid) }">
+          <router-link
+            v-if="c.appid"
+            :to="`/game/${c.appid}`"
+            class="pcard-header-bar__cover-link"
+            :title="c.name || `AppID ${c.appid}`"
+          >
+            <HlImg
+              :src="pilotCoverUrl(c.appid)"
+              :alt="c.name || `AppID ${c.appid}`"
+              loading="lazy"
+              class="pcard-header-bar__cover"
+            >
+              <template #fallback>
+                <span class="pcard-header-bar__cover-fallback">{{ (c.name || `AppID ${c.appid}`).slice(0, 2) }}</span>
+              </template>
+            </HlImg>
+          </router-link>
           <div class="pcard-header-bar__title">
-            <svg class="pcard-header-bar__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <svg v-if="!c.appid" class="pcard-header-bar__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <circle cx="12" cy="12" r="10" />
               <line x1="12" y1="16" x2="12" y2="12" />
               <line x1="12" y1="8" x2="12.01" y2="8" />
@@ -696,8 +731,27 @@ function toggleTrend(appid: number) {
           <div v-if="c.recent.length" class="pcard-ach-recent">
             <div class="pcard-ach-recent__title">{{ t('pilot.card.recentUnlocks') }}</div>
             <div v-for="a in c.recent" :key="`${a.appid}-${a.name}`" class="pcard-ach-recent__item">
-              <span class="pcard-ach-recent__name">{{ a.name }}</span>
-              <span class="pcard-ach-recent__game">{{ a.gameName || `AppID ${a.appid}` }}</span>
+              <router-link
+                v-if="a.appid"
+                :to="`/game/${a.appid}`"
+                class="pcard-ach-recent__cover-link"
+                :title="a.gameName || `AppID ${a.appid}`"
+              >
+                <HlImg
+                  :src="pilotCoverUrl(a.appid)"
+                  :alt="a.gameName || `AppID ${a.appid}`"
+                  loading="lazy"
+                  class="pcard-ach-recent__cover"
+                >
+                  <template #fallback>
+                    <span class="pcard-ach-recent__cover-fallback">{{ (a.gameName || `AppID ${a.appid}`).slice(0, 1) }}</span>
+                  </template>
+                </HlImg>
+              </router-link>
+              <div class="pcard-ach-recent__main">
+                <span class="pcard-ach-recent__name">{{ a.name }}</span>
+                <span class="pcard-ach-recent__game" :title="a.gameName || `AppID ${a.appid}`">{{ a.gameName || `AppID ${a.appid}` }}</span>
+              </div>
               <span v-if="a.at" class="pcard-ach-recent__date">{{ dateOf(new Date((a.at as number) * 1000).toISOString()) }}</span>
             </div>
           </div>
@@ -749,7 +803,25 @@ function toggleTrend(appid: number) {
           </div>
 
           <div v-else class="pcard-item-chips">
-            <span v-for="it in c.items.slice(0, 8)" :key="it.appid" class="pcard-item-chip">{{ it.name }}</span>
+            <span
+              v-for="it in c.items.slice(0, 8)"
+              :key="it.key ?? it.appid ?? it.name"
+              class="pcard-item-chip"
+              :class="{ 'has-cover': Boolean(it.appid) }"
+            >
+              <HlImg
+                v-if="it.appid"
+                :src="pilotCoverUrl(it.appid)"
+                :alt="it.name"
+                loading="lazy"
+                class="pcard-item-chip__cover"
+              >
+                <template #fallback>
+                  <span class="pcard-item-chip__cover-fallback">{{ (it.name || `AppID ${it.appid}`).slice(0, 1) }}</span>
+                </template>
+              </HlImg>
+              <span class="pcard-item-chip__name" :title="it.name">{{ it.name }}</span>
+            </span>
             <span v-if="c.items.length > 8" class="pcard-item-chip pcard-item-chip--more">+{{ c.items.length - 8 }}</span>
           </div>
 
@@ -782,6 +854,11 @@ function toggleTrend(appid: number) {
       <!-- 管道工作流卡片 -->
       <template v-else-if="c.kind === 'stepper'">
         <HlPilotStepper :card="c" />
+      </template>
+
+      <!-- Epic 喜加一卡片 -->
+      <template v-else-if="c.kind === 'epic'">
+        <HlPilotEpic :card="c" />
       </template>
     </div>
 
@@ -1212,6 +1289,41 @@ function toggleTrend(appid: number) {
   min-width: 0;
 }
 
+.pcard-header-bar__cover-link {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  text-decoration: none;
+}
+
+.pcard-header-bar__cover {
+  width: 44px;
+  aspect-ratio: 460 / 215;
+  border-radius: var(--radius-xs, 3px);
+  overflow: hidden;
+  background: var(--surface-inset);
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.pcard-header-bar__cover :deep(img) {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transition: transform var(--transition);
+}
+
+.pcard-header-bar__cover-link:hover .pcard-header-bar__cover :deep(img) {
+  transform: scale(1.06);
+}
+
+.pcard-header-bar__cover-fallback {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-muted);
+}
+
 .pcard-header-bar__title {
   display: flex;
   align-items: center;
@@ -1480,6 +1592,41 @@ function toggleTrend(appid: number) {
   background: var(--success);
   box-shadow: 0 0 0 3px var(--success-a20);
   flex-shrink: 0;
+}
+
+.pcard-receipt__cover-link {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  text-decoration: none;
+}
+
+.pcard-receipt__cover {
+  width: 44px;
+  aspect-ratio: 460 / 215;
+  border-radius: var(--radius-xs, 3px);
+  overflow: hidden;
+  background: var(--surface-inset);
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.pcard-receipt__cover :deep(img) {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transition: transform var(--transition);
+}
+
+.pcard-receipt__cover-link:hover .pcard-receipt__cover :deep(img) {
+  transform: scale(1.06);
+}
+
+.pcard-receipt__cover-fallback {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-muted);
 }
 
 .pcard-receipt__text {
@@ -1760,7 +1907,7 @@ function toggleTrend(appid: number) {
 .pcard-ach-recent {
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 6px;
   padding-top: 4px;
 }
 
@@ -1772,15 +1919,55 @@ function toggleTrend(appid: number) {
 
 .pcard-ach-recent__item {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
   gap: 8px;
   font-size: 11px;
 }
 
+.pcard-ach-recent__cover-link {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  text-decoration: none;
+}
+
+.pcard-ach-recent__cover {
+  width: 32px;
+  aspect-ratio: 460 / 215;
+  border-radius: var(--radius-xs, 2px);
+  overflow: hidden;
+  background: var(--surface-inset);
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.pcard-ach-recent__cover :deep(img) {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.pcard-ach-recent__cover-fallback {
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--text-muted);
+}
+
+.pcard-ach-recent__main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  overflow: hidden;
+}
+
 .pcard-ach-recent__name {
   font-weight: 500;
   color: var(--text-primary);
+  flex-shrink: 0;
 }
 
 .pcard-ach-recent__game {
@@ -1913,12 +2100,50 @@ function toggleTrend(appid: number) {
 }
 
 .pcard-item-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   padding: 3px 8px;
   border-radius: var(--radius-sm);
   background: var(--surface-chip);
   border: 1px solid var(--border-soft);
   font-size: 12px;
   color: var(--text-primary);
+  max-width: 100%;
+}
+
+.pcard-item-chip.has-cover {
+  padding-left: 4px;
+}
+
+.pcard-item-chip__cover {
+  width: 24px;
+  aspect-ratio: 460 / 215;
+  border-radius: var(--radius-xs, 2px);
+  overflow: hidden;
+  background: var(--surface-inset);
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.pcard-item-chip__cover :deep(img) {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.pcard-item-chip__cover-fallback {
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--text-muted);
+}
+
+.pcard-item-chip__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 160px;
 }
 
 .pcard-item-chip--more {

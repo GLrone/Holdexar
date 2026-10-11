@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 
-import { redeemApi, type RedeemQuota } from '@/api/client'
+import { redeemApi, type RedeemActivationRow, type RedeemQuota } from '@/api/client'
 import { beginTask, endTask, updateTask } from '@/components/ui/island'
 import { message } from '@/components/ui'
 import { useI18n, type MessageKey } from '@/locales'
@@ -68,6 +68,26 @@ export const useCdkRedeemStore = defineStore('cdkRedeem', () => {
   /** 账号维度已用次数：后端为准 + 本会话内增量（多批激活即时累计） */
   const usedBase = ref(0)
   const usedSession = ref<number[]>([])
+
+  /* ── 激活历史（后端账本，跨会话留存；批量激活完成后自动刷新）── */
+  const history = ref<RedeemActivationRow[]>([])
+  const historyTotal = ref(0)
+  const historyLoading = ref(false)
+  const HISTORY_PAGE_SIZE = 20
+
+  /** 拉取激活历史（时间倒序，取最近一页） */
+  async function loadHistory(): Promise<void> {
+    historyLoading.value = true
+    try {
+      const res = await redeemApi.activations({ limit: HISTORY_PAGE_SIZE })
+      history.value = res.rows
+      historyTotal.value = res.total
+    } catch {
+      /* 历史是留痕展示，拉取失败不打断面板，保留旧数据 */
+    } finally {
+      historyLoading.value = false
+    }
+  }
 
   /** 30 分钟窗口内本账号已用激活次数（后端基数 + 会话增量） */
   const usedCount = computed(() => {
@@ -232,6 +252,7 @@ export const useCdkRedeemStore = defineStore('cdkRedeem', () => {
       )
     }
     void loadQuota()
+    void loadHistory()
   }
 
   /** 清空重置（运行中拒绝：会清掉在跑批次的状态行） */
@@ -270,9 +291,13 @@ export const useCdkRedeemStore = defineStore('cdkRedeem', () => {
     quotaMsg,
     usedCount,
     nearLimit,
+    history,
+    historyTotal,
+    historyLoading,
     parseKeys,
     renderKeyQueue,
     loadQuota,
+    loadHistory,
     resetSession,
     startRedeem,
     resetRedeem,

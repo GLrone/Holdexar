@@ -2,7 +2,7 @@
 import { ref, computed, watch, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
-import { HlButton, HlChip, HlIcon, HlSelect, HlStat, HlTooltip, message } from '@/components/ui'
+import { HlButton, HlChip, HlEmpty, HlIcon, HlSelect, HlStat, HlTooltip, message } from '@/components/ui'
 import { billsApi, type BillImportItem, type BillOverview } from '@/api/client'
 import { useAccountStore } from '@/stores/account'
 import { CDK_ACT_LIMIT, useCdkRedeemStore, type KeyStatus } from '@/stores/cdkRedeem'
@@ -63,6 +63,9 @@ const {
   quotaMsg,
   usedCount,
   nearLimit,
+  history,
+  historyTotal,
+  historyLoading,
 } = storeToRefs(cdk)
 const ACT_LIMIT = CDK_ACT_LIMIT
 
@@ -75,6 +78,7 @@ watch(keyArea, () => cdk.renderKeyQueue())
 onMounted(() => {
   cdk.renderKeyQueue()
   void cdk.loadQuota()
+  void cdk.loadHistory()
 })
 
 /** 队列状态 → 词条 key（常量表存 key 不存译文：模块级常量只求值一次，会把语言冻住） */
@@ -88,6 +92,13 @@ const QUEUE_LABEL_KEY: Record<string, MessageKey> = {
 
 function queueLabel(s: KeyStatus): string {
   return t(QUEUE_LABEL_KEY[s])
+}
+
+/** 历史行状态 → 词条 key（复用结果徽章词；行数据只存值，句子在模板 t() 现取） */
+const HISTORY_STATUS_KEY: Record<string, MessageKey> = {
+  ok: 'toolbox.cdk.status.ok',
+  own: 'toolbox.cdk.status.own',
+  fail: 'toolbox.cdk.status.fail',
 }
 
 const startRedeem = () => cdk.startRedeem()
@@ -520,6 +531,42 @@ onMounted(() => void loadBills())
           </div>
         </div>
       </div>
+
+      <!-- 激活历史（后端账本投影，跨会话留存；批量激活完成后 store 自动刷新） -->
+      <div class="cdk-history">
+        <div class="cdk-result-head" style="margin-top: 16px">
+          <div class="cdk-section-title" style="margin-bottom: 0">{{ t('toolbox.cdk.history.title') }}</div>
+          <span v-if="historyTotal > 0" class="cdk-batch-indicator">{{ t('toolbox.cdk.history.count', { n: historyTotal }) }}</span>
+        </div>
+        <div v-if="historyLoading" class="fx-empty-mini" style="margin-top: 8px">{{ t('toolbox.cdk.history.loading') }}</div>
+        <HlEmpty v-else-if="history.length === 0" size="sm" icon="" :text="t('toolbox.cdk.history.empty')" />
+        <div v-else class="cdk-history-scroll">
+          <table class="bill-tbl">
+            <thead>
+              <tr>
+                <th style="width: 150px">{{ t('toolbox.cdk.history.col.time') }}</th>
+                <th style="width: 92px">{{ t('toolbox.cdk.history.col.result') }}</th>
+                <th>{{ t('toolbox.cdk.history.col.item') }}</th>
+                <th>{{ t('toolbox.cdk.history.col.detail') }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in history" :key="row.id">
+                <td class="mono" style="color: var(--text-dim); white-space: nowrap">{{ row.createdAt }}</td>
+                <td>
+                  <span class="cdk-badge" :class="'cdk-badge--' + row.status">{{ t(HISTORY_STATUS_KEY[row.status] ?? 'toolbox.cdk.status.fail') }}</span>
+                </td>
+                <td class="cdk-history__item">
+                  <span v-if="row.subName">{{ row.subName }}</span>
+                  <span v-else-if="row.kind === 'free'" class="cdk-sub-empty">{{ t('toolbox.cdk.history.freeItem', { subid: row.subId }) }}</span>
+                  <span v-else class="cdk-history__key">{{ row.key }}</span>
+                </td>
+                <td class="cdk-history__detail" :class="{ 'cdk-detail--fail': row.status === 'fail' }">{{ row.detail || '—' }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
 
   </section>
@@ -699,6 +746,13 @@ onMounted(() => void loadBills())
 .cdk-copy-btn:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-a10); }
 .cdk-copy-btn.copied { border-color: var(--success); color: var(--success); background: var(--success-a15); }
 .cdk-result-scroll { max-height: 320px; overflow-y: auto; border: 1px solid var(--line-1); border-radius: 6px; }
+
+/* 激活历史（账本投影）：复用结果表徽章色，行高收紧 */
+.cdk-history-scroll { max-height: 260px; overflow-y: auto; border: 1px solid var(--line-1); border-radius: 6px; margin-top: 8px; }
+.cdk-history__item { max-width: 220px; }
+.cdk-history__item span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cdk-history__key { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.3px; color: var(--text-secondary); }
+.cdk-history__detail { font-size: 11px; color: var(--text-secondary); }
 
 /* ── 结果三态徽章（个性化设计：胶囊 + 图标 + 左侧色条，非原脚本纯文本红绿字）── */
 .cdk-badge {

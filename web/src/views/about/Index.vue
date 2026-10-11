@@ -9,13 +9,15 @@ import { APP_NAME } from '@/appInfo'
 import { useI18n, type MessageKey } from '@/locales'
 import { useThemeStore } from '@/stores/theme'
 import { useTourStore } from '@/stores/tour'
-import { HlIcon } from '@/components/ui'
+import { useUpdaterStore } from '@/stores/updater'
+import { HlButton, HlIcon } from '@/components/ui'
 import BorderGlow from '@/components/ui/BorderGlow.vue'
 
 const { t } = useI18n()
 
 const themeStore = useThemeStore()
 const tour = useTourStore()
+const updater = useUpdaterStore()
 const logo = computed(() =>
   themeStore.isDark ? '/assets/logo_dark.ico' : '/assets/logo_light.ico',
 )
@@ -100,6 +102,18 @@ const CREDITS: { name: string; url: string; noteKey: MessageKey }[] = [
           <div class="about-hero__name">
             <h1>{{ APP_NAME }}</h1>
             <span v-if="version" class="about-ver">v{{ version }}</span>
+            <!-- 手动检查更新入口：更新面板撤出设置页后，这里是与版本号
+                 相邻的自然落点（气泡只在自动检查命中时出现） -->
+            <HlButton
+              art="outline"
+              tone="blue"
+              size="sm"
+              :loading="updater.checking"
+              @click="updater.openDialog()"
+            >
+              <HlIcon v-if="!updater.checking" name="refresh" />
+              {{ t('about.checkUpdate') }}
+            </HlButton>
             <a
               :href="REPO_URL"
               target="_blank"
