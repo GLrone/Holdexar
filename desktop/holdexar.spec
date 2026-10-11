@@ -11,6 +11,7 @@ datas 布局与 app/core/config.py 的 sys.frozen 分支对齐：
                                   磁盘兜底，main.py frozen 态把它插进 sys.path）
 """
 import os
+import re
 import sys
 
 SPECDIR = SPECPATH  # PyInstaller 注入：本 spec 所在目录（desktop/）
@@ -23,6 +24,18 @@ if SERVER not in sys.path:
     sys.path.insert(0, SERVER)
 
 from PyInstaller.utils.hooks import collect_submodules  # noqa: E402
+from PyInstaller.utils.win32.versioninfo import (  # noqa: E402
+    FixedFileInfo,
+    StringFileInfo,
+    StringStruct,
+    StringTable,
+    VarFileInfo,
+    VarStruct,
+    VSVersionInfo,
+)
+
+from app.core.app_info import APP_NAME, APP_SUBTITLE, APP_VERSION  # noqa: E402
+from app.core.optional_deps import PYINSTALLER_EXCLUDES  # noqa: E402
 
 hiddenimports = [
     # uvicorn.run("app.main:app") 字符串导入 + auto 协议模块运行时选择
@@ -44,6 +57,46 @@ hiddenimports = [
     "webview.platforms.winforms",
 ]
 hiddenimports += collect_submodules("app")
+
+
+def numeric_version(text):
+    """语义化版本 → PE 要求的四段数字（0.3.0-beta → (0, 3, 0, 0)）。"""
+    parts = [int(n) for n in re.findall(r"\d+", text)[:4]]
+    return tuple((parts + [0, 0, 0, 0])[:4])
+
+
+# 文件版本取 PE 四段数字（属性页按数字版本读），产品版本保留语义化原文
+file_version = ".".join(str(n) for n in numeric_version(APP_VERSION))
+
+# exe 的 VERSIONINFO 资源：字段值取 APP_VERSION 单一来源，发版无需另改。
+version_info = VSVersionInfo(
+    ffi=FixedFileInfo(
+        filevers=numeric_version(APP_VERSION),
+        prodvers=numeric_version(APP_VERSION),
+        mask=0x3F,
+        flags=0x0,
+        OS=0x40004,
+        fileType=0x1,
+        subtype=0x0,
+        date=(0, 0),
+    ),
+    kids=[
+        StringFileInfo([
+            StringTable("040904B0", [
+                StringStruct("CompanyName", APP_NAME),
+                StringStruct("FileDescription", f"{APP_NAME} — {APP_SUBTITLE}"),
+                StringStruct("FileVersion", file_version),
+                StringStruct("InternalName", APP_NAME),
+                StringStruct("LegalCopyright",
+                             f"Copyright (c) {APP_NAME} contributors. Licensed under GPL-3.0."),
+                StringStruct("OriginalFilename", f"{APP_NAME}.exe"),
+                StringStruct("ProductName", APP_NAME),
+                StringStruct("ProductVersion", APP_VERSION),
+            ]),
+        ]),
+        VarFileInfo([VarStruct("Translation", [1033, 1200])]),
+    ],
+)
 
 a = Analysis(
     ["main.py"],
@@ -67,7 +120,9 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["tkinter"],
+    # tkinter 无引用；其余为依赖链拖入的零引用库（名单与运行时兜底同源，
+    # 见 app/core/optional_deps.py）
+    excludes=["tkinter", *PYINSTALLER_EXCLUDES],
     noarchive=False,
     optimize=0,
 )
@@ -90,6 +145,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=["app.ico"],
+    version=version_info,
 )
 
 coll = COLLECT(exe, a.binaries, a.datas, name="Holdexar")

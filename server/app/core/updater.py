@@ -36,12 +36,14 @@ import httpx
 from app.core.app_info import (
     APP_NAME,
     GITHUB_REPO,
+    HANDOFF_LEDGER_NAME,
     HANDOFF_UNSUPPORTED_MARK,
     MANIFEST_ASSET,
     MANIFEST_TAG,
     STAGING_DIR_NAME,
     STAGING_MANIFEST_NAME,
     SWAP_FAILED_FLAG,
+    version_gt,
 )
 from app.core.config import get_settings
 from app.core.logging import log_event
@@ -164,7 +166,7 @@ def _payload_from_manifest(data: dict) -> dict:
 
     current = settings.version
     return {
-        "available": _version_gt(latest, current),
+        "available": version_gt(latest, current),
         "current": current,
         "latest": latest,
         "tag": str(data.get("tag") or f"v{latest}"),
@@ -206,7 +208,7 @@ async def _check_update_via_api() -> dict:
 
     latest = tag.lstrip("vV")
     current = settings.version
-    newer = _version_gt(latest, current)
+    newer = version_gt(latest, current)
     # GitHub 的 release 资产自带 digest（形如 "sha256:..."），有则用作校验值
     digest = str(asset.get("digest") or "")
     return {
@@ -223,60 +225,8 @@ async def _check_update_via_api() -> dict:
     }
 
 
-def _version_parts(version: str) -> tuple[list[int], list[tuple[int, object]]]:
-    """版本号 → (主段数字, 预发布段)。
-
-    主段只取数字（`v0.2` 与 `0.2` 同解）；预发布段在 `-` 之后、`+` 之前，
-    数字标识按数值比、字母标识按字典序比——两者分属不同类型，比较时先看类型位。
-    """
-    text = version.strip()
-    if "+" in text:
-        text = text.split("+", 1)[0]
-    release_text, _, pre_text = text.partition("-")
-
-    release: list[int] = []
-    for seg in release_text.split("."):
-        digits = re.sub(r"\D", "", seg)
-        release.append(int(digits) if digits else 0)
-
-    pre: list[tuple[int, object]] = []
-    if pre_text:
-        for ident in pre_text.split("."):
-            if ident.isdigit():
-                pre.append((0, int(ident)))
-            elif ident:
-                pre.append((1, ident.lower()))
-    return release, pre
-
-
-def _version_gt(a: str, b: str) -> bool:
-    """a 是否比 b 新。
-
-    主段按点分数字逐段比（0.1.0 < 0.2.0 < 0.10.0），长度不齐补 0（0.2 == 0.2.0）。
-    主段相同时按预发布段判：**有预发布段的一侧更旧**（0.1.0-beta.2 < 0.1.0），
-    两侧都有则逐标识比（0.1.0-alpha < 0.1.0-beta.2 < 0.1.0-rc.1），
-    同前缀下标识少的更旧（0.1.0-alpha < 0.1.0-alpha.1）。
-    """
-    rel_a, pre_a = _version_parts(a)
-    rel_b, pre_b = _version_parts(b)
-
-    length = max(len(rel_a), len(rel_b))
-    rel_a += [0] * (length - len(rel_a))
-    rel_b += [0] * (length - len(rel_b))
-    if rel_a != rel_b:
-        return rel_a > rel_b
-
-    if not pre_a and not pre_b:
-        return False
-    if not pre_a:
-        return True  # a 是正式版、b 是预发布 → a 更新
-    if not pre_b:
-        return False  # a 是预发布、b 是正式版 → a 更旧
-
-    for got, want in zip(pre_a, pre_b):
-        if got != want:
-            return got > want
-    return len(pre_a) > len(pre_b)
+# 版本比较统一在 app_info.version_gt（零依赖模块，桌面壳/发布脚本共用一份）
+_version_gt = version_gt
 
 
 def _plain_notes(body: str, limit: int = 1500) -> str:
@@ -466,10 +416,11 @@ async def download_update(
             json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
         )
         # 新暂存包重新具备交接资格：上一包的「不支持换装」标记随包作废，
-        # 上次换装失败的安装状态标记也一并解除——否则重新下载同一版本会被
-        # 旧标记一直挡在自动换装之外。
+        # 上次换装失败的安装状态标记与交接账本一并解除——否则重新下载同一版本
+        # 会被旧标记/旧账一直挡在自动换装之外。
         (staging / HANDOFF_UNSUPPORTED_MARK).unlink(missing_ok=True)
         (staging.parent / SWAP_FAILED_FLAG).unlink(missing_ok=True)
+        (staging.parent / HANDOFF_LEDGER_NAME).unlink(missing_ok=True)
         _PROGRESS.update({"ok": True, "running": False, "phase": "done", "percent": 100})
         log_event(
             logger,
@@ -725,16 +676,25 @@ def _extract(zip_path: Path, staging: Path) -> None:
 
 
 def pending_status() -> dict:
-    """staging 就绪状态（前端「重启以完成更新」提示的依据）。"""
+    """staging 就绪状态（前端「重启以完成更新」提示的依据）。
+
+    swapFailed 投影换装失败标记：换装失败只有原生弹窗一个出口，前端拿不到
+    这个事实就没法给「重新下载」的出路（账本同源：标记是唯一事实源，这里只读）。
+    """
     staging = staging_dir()
     manifest = staging / "manifest.json"
+    swap_failed = (staging.parent / SWAP_FAILED_FLAG).is_file()
     if not manifest.is_file():
-        return {"pending": False}
+        return {"pending": False, "swapFailed": swap_failed}
     try:
         data = json.loads(manifest.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 —— 坏 manifest 视为无暂存
-        return {"pending": False}
-    return {"pending": bool(data.get("ready")), "tag": data.get("tag")}
+        return {"pending": False, "swapFailed": swap_failed}
+    return {
+        "pending": bool(data.get("ready")),
+        "tag": data.get("tag"),
+        "swapFailed": swap_failed,
+    }
 
 
 def clear_staging() -> dict:

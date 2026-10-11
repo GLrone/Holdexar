@@ -18,8 +18,11 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -65,7 +68,8 @@ def _make_payload(staging: Path, *, exe: str = "new-exe", files: dict | None = N
     return payload
 
 
-def _stage_manifest(staging: Path, tag: str = "v0.1.0-beta.1", ready: bool = True) -> None:
+def _stage_manifest(staging: Path, tag: str = "v9.9.9", ready: bool = True) -> None:
+    """默认 tag 必须比现装（app_info.APP_VERSION，0.3.0-beta）新：版本门只放行更新。"""
     import json
 
     staging.mkdir(parents=True, exist_ok=True)
@@ -205,7 +209,7 @@ def test_handoff_refuses_legacy_payload_without_touching_files(
     data_dir = tmp_path / "data"
     staging = data_dir / "update-staging"
     _make_payload(staging)
-    _stage_manifest(staging, tag="v0.1.0")
+    _stage_manifest(staging, tag="v9.9.9")
     install = _make_install(tmp_path / "install")
     alerts: list[str] = []
 
@@ -334,6 +338,8 @@ def _prepare_failed_helper_case(
 
     monkeypatch.setattr(desktop, "_data_dir", lambda: data_dir)
     monkeypatch.setattr(desktop, "_swap_payload", lambda _s, _t: False)
+    # 互斥体是真实内核对象：helper 单测不碰它（独占语义由专属用例验证）
+    monkeypatch.setattr(desktop, "_acquire_swap_mutex", lambda: True)
     monkeypatch.setattr(desktop, "_alert", lambda msg: events.append(("alert", msg)))
     monkeypatch.setattr(
         desktop.subprocess,
@@ -450,3 +456,134 @@ def test_cleanup_staging_leftover_removes_consumed_staging(
 
     desktop._cleanup_staging_leftover()
     assert not staging.exists()
+
+
+# ── 并发与循环防线（版本门 / 交接账本 / 换装互斥）──────────────────────
+
+
+def test_handoff_refuses_stale_version_and_cleans_staging(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """版本门：同版本/更旧的暂存包不换装，清掉暂存防反复触发交接。"""
+    data_dir = tmp_path / "data"
+    staging = data_dir / "update-staging"
+    _make_payload(staging)
+    _stage_manifest(staging, tag="v0.1.0-beta.2")  # 比现装 0.3.0-beta 旧
+    install = _make_install(tmp_path / "install")
+    spawns: list = []
+
+    monkeypatch.setattr(desktop, "is_frozen", lambda: True)
+    monkeypatch.setattr(desktop, "_data_dir", lambda: data_dir)
+    monkeypatch.setattr(desktop, "_app_root", lambda: install)
+    monkeypatch.setattr(
+        desktop.subprocess, "Popen", lambda cmd, **kwargs: spawns.append(cmd)
+    )
+
+    assert desktop._handoff_pending_update() is False
+    assert spawns == []
+    assert not staging.exists()  # 残包被清理
+    assert (install / EXE_NAME).read_bytes() == b"old-exe"
+
+
+def test_handoff_ledger_terminates_second_handoff(tmp_path: Path, monkeypatch) -> None:
+    """交接账本：同一暂存包第二次交接被终止——旧构建暂存包（不摘 manifest）
+    的死循环由此斩断，不依赖暂存包自己守规矩。"""
+    data_dir = tmp_path / "data"
+    staging = data_dir / "update-staging"
+    _make_payload(staging)
+    _stage_manifest(staging, tag="v9.9.9")
+    install = _make_install(tmp_path / "install")
+    spawns: list = []
+    alerts: list[str] = []
+
+    monkeypatch.setattr(desktop, "is_frozen", lambda: True)
+    monkeypatch.setattr(desktop, "_data_dir", lambda: data_dir)
+    monkeypatch.setattr(desktop, "_app_root", lambda: install)
+    monkeypatch.setattr(desktop, "_staged_supports_helper", lambda _exe: True)
+    monkeypatch.setattr(
+        desktop.subprocess, "Popen", lambda cmd, **kwargs: spawns.append(cmd)
+    )
+    monkeypatch.setattr(desktop, "_alert", lambda msg: alerts.append(msg))
+
+    # 第一次交接：放行，账本落 count=1
+    assert desktop._handoff_pending_update() is True
+    assert len(spawns) == 1
+    import json
+
+    ledger = json.loads(
+        (data_dir / desktop.HANDOFF_LEDGER_NAME).read_text(encoding="utf-8")
+    )
+    assert ledger["tag"] == "v9.9.9"
+    assert ledger["count"] == 1
+
+    # 第二次交接（模拟：换装失败回滚后现装又被拉起）：终止 + 清场 + 告知
+    assert desktop._handoff_pending_update() is False
+    assert len(spawns) == 1  # 没有第二个换装进程
+    assert not staging.exists()  # 已被证明换不动的包被清理
+    assert not (data_dir / desktop.HANDOFF_LEDGER_NAME).exists()  # 账本复位
+    assert len(alerts) == 1  # 用户得到「上次更新失败已回滚」的说明
+
+
+def test_handoff_clears_stale_ledger_when_no_manifest(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """无待换装包时顺带清旧账本：旧构建换装进程不清账，现装启动兜底复位。"""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    (data_dir / desktop.HANDOFF_LEDGER_NAME).write_text(
+        '{"tag": "v9.9.9", "count": 1}', encoding="utf-8"
+    )
+
+    monkeypatch.setattr(desktop, "is_frozen", lambda: True)
+    monkeypatch.setattr(desktop, "_data_dir", lambda: data_dir)
+
+    assert desktop._handoff_pending_update() is False
+    assert not (data_dir / desktop.HANDOFF_LEDGER_NAME).exists()
+
+
+def test_run_update_helper_success_clears_ledger_and_flag(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """换装成功：交接账本与失败标记一并清零，安装状态回到干净态。"""
+    data_dir, staging, target, events = _prepare_failed_helper_case(
+        tmp_path, monkeypatch
+    )
+    # 反转前置桩：这次换装成功
+    monkeypatch.setattr(desktop, "_swap_payload", lambda _s, _t: True)
+    (data_dir / desktop._FAILED_MARK).write_text("stale\n", encoding="utf-8")
+    (data_dir / desktop.HANDOFF_LEDGER_NAME).write_text(
+        '{"tag": "v9.9.9", "count": 1}', encoding="utf-8"
+    )
+
+    desktop._run_update_helper(staging, target, None)
+
+    assert not (data_dir / desktop.HANDOFF_LEDGER_NAME).exists()
+    assert not (data_dir / desktop._FAILED_MARK).is_file()
+    # 成功后拉起新版本
+    assert [kind for kind, _ in events] == ["spawn"]
+    assert events[0][1] == str(target / EXE_NAME)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="换装互斥体是 Windows 命名互斥")
+def test_swap_mutex_serializes_holders() -> None:
+    """互斥独占：持有期间第二个申请者拿不到；持有者退场后互斥体随之消失。"""
+    import threading
+
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def _holder() -> None:
+        assert desktop._acquire_swap_mutex() is True
+        acquired.set()
+        release.wait(5)  # 持有到主线程放行；句柄随线程退出被内核回收
+
+    thread = threading.Thread(target=_holder, daemon=True)
+    thread.start()
+    assert acquired.wait(2)
+
+    assert desktop._swap_mutex_held() is True
+    assert desktop._acquire_swap_mutex() is False  # 第二个换装进程就地退出
+
+    release.set()
+    thread.join(timeout=2)
+    assert desktop._swap_mutex_held() is False

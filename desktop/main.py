@@ -55,13 +55,21 @@ else:
 from app.core.app_info import (  # noqa: E402
     APP_NAME,
     APP_SLUG,
+    APP_VERSION,
     ENV_PREFIX,
+    HANDOFF_LEDGER_NAME,
     HANDOFF_UNSUPPORTED_MARK,
     STAGING_DIR_NAME,
     STAGING_MANIFEST_NAME,
     SWAP_FAILED_FLAG,
+    version_from_tag,
+    version_gt,
 )
 from app.core.paths import data_dir_filename, is_frozen, resolve_data_dir  # noqa: E402
+from app.core.optional_deps import install_optional_dep_resolver  # noqa: E402
+
+# 打包态剔除的可选依赖若被真实路径用到，从这里起可按需补装（见 optional_deps）
+install_optional_dep_resolver()
 
 # WebView2 Runtime（Evergreen 固定产品 GUID）注册表探测 + 官方离线安装链
 _WEBVIEW2_REG_KEYS = (
@@ -364,15 +372,23 @@ class DesktopApi:
         """前端「重启以完成更新」入口：新进程拉起自己，本进程即刻退出。
 
         js_api 调用在独立线程，os._exit 安全；重启后由 main() 的
-        _handoff_pending_update 分支接管换装。
+        _handoff_pending_update 分支接管换装。子进程带 UPDATE_RESTART 标记
+        与本进程 pid：它要先等本进程退场再走端口协商与交接，否则端口探活
+        会命中「已在运行」把交接截胡成普通唤醒。
         """
         exe = Path(sys.executable) if getattr(sys, "frozen", False) else None
         if exe is None or not exe.is_file():
             return {"ok": False, "error": "仅打包态支持一键重启，请手动重启应用。"}
-    
+
+        child_env = {
+            **os.environ,
+            f"{ENV_PREFIX}UPDATE_RESTART": "1",
+            f"{ENV_PREFIX}PREV_PID": str(os.getpid()),
+        }
         subprocess.Popen(
             [str(exe)],
             cwd=str(exe.parent),
+            env=child_env,
             close_fds=True,
             creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
         )
@@ -441,6 +457,204 @@ def _swap_failed_flag() -> Path:
     return _data_dir() / _FAILED_MARK
 
 
+# ── 换装并发与循环防线 ──────────────────────────────────────────────
+# 两个直接推手：交接竞态拉起两个换装进程并发毁坏同一安装目录；换装失败
+# 回滚后现装被拉起，看到 manifest 就再交一次，循环到天亮。
+# 防线全部落在现装/换装进程侧，不依赖暂存包构建自身守规矩（旧构建没有
+# 摘除 manifest 与让位重试的逻辑，指望它配合等于没有防线）。
+
+_SWAP_MUTEX_NAME = f"{APP_NAME}-update-swap"
+_WAIT_ABANDONED = 0x80
+_WAIT_TIMEOUT = 0x00000102  # WaitForSingleObject 超时：互斥体已被他人持有
+
+
+def _open_swap_mutex() -> int | None:
+    """打开或创建换装互斥体；非 Windows 返回 None（开发态无并发换装场景）。"""
+    if os.name != "nt":
+        return None
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+    # 不带命名空间前缀 = 当前会话内可见；句柄随进程退出由内核回收，无残留可清
+    return kernel32.CreateMutexW(None, False, _SWAP_MUTEX_NAME)
+
+
+def _swap_mutex_held() -> bool:
+    """是否有换装进程正持有换装互斥体（探测不占有）。
+
+    现装启动时判它：换装进行中就退位等待（换装进程完成后会拉起新版或回滚
+    现装），绝不能带着「程序目录即将被搬空」继续起服务。互斥体不存在 =
+    没有换装在跑；探到弃置互斥（前任换装进程暴毙）不算进行中。
+    """
+    if os.name != "nt":
+        return False
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    SYNCHRONIZE = 0x00100000
+    kernel32.OpenMutexW.restype = ctypes.c_void_p
+    kernel32.OpenMutexW.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_wchar_p]
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel32.ReleaseMutex.argtypes = [ctypes.c_void_p]
+    handle = kernel32.OpenMutexW(SYNCHRONIZE, False, _SWAP_MUTEX_NAME)
+    if not handle:
+        return False  # 互斥体不存在：没有换装进程
+    held = kernel32.WaitForSingleObject(handle, 0) == _WAIT_TIMEOUT
+    if not held:
+        kernel32.ReleaseMutex(handle)  # 探测把空闲/弃置互斥拿到了手上，必须放回去
+    kernel32.CloseHandle(handle)
+    return held
+
+
+def _acquire_swap_mutex() -> bool:
+    """换装进程入口独占：拿不到 = 已有换装进程在跑，第二个立即退出。
+
+    双开/交接竞态下两个换装进程并发换同一目录，会互相删除对方正在复制的
+    `_internal`，把安装毁成「新 exe + 残缺 _internal」的半截态。句柄持有到
+    进程退出为止（内核回收，无残留可清）；前任换装进程暴毙留下的弃置互斥
+    视为可接管——上一轮已经死了，活人才有权继续换装。
+    """
+    if os.name != "nt":
+        return True
+    import ctypes
+
+    handle = _open_swap_mutex()
+    if handle is None:
+        return True
+    kernel32 = ctypes.windll.kernel32
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+    wait = kernel32.WaitForSingleObject(handle, 0)
+    if wait == _WAIT_TIMEOUT:
+        kernel32.CloseHandle(handle)
+        return False
+    return True  # WAIT_OBJECT_0/WAIT_ABANDONED 都是「本轮归我」
+
+
+def _pids_running_from(target: Path) -> list[int]:
+    """镜像文件落在 target 目录树下的进程 pid 列表（自身除外）。
+
+    让位失败的占用者几乎总是「还有实例从程序目录里跑着」：交接竞态拉起的
+    多余实例、用户在换装窗口期手动双击的新实例。按进程快照逐一核对镜像
+    路径，比只等单个 wait_pid 可靠。
+    """
+    if os.name != "nt":
+        return []
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    TH32CS_SNAPPROCESS = 0x2
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    class _PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", ctypes.c_ulong),
+            ("cntUsage", ctypes.c_ulong),
+            ("th32ProcessID", ctypes.c_ulong),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", ctypes.c_ulong),
+            ("cntThreads", ctypes.c_ulong),
+            ("th32ParentProcessID", ctypes.c_ulong),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", ctypes.c_ulong),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    kernel32.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+    kernel32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PROCESSENTRY32W)]
+    kernel32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PROCESSENTRY32W)]
+    kernel32.Process32FirstW.restype = ctypes.c_int
+    kernel32.Process32NextW.restype = ctypes.c_int
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.QueryFullProcessImageNameW.restype = ctypes.c_int
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint32, ctypes.c_wchar_p,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == -1:  # 无效句柄（-1）：快照失败按「查不到」处理
+        return []
+    prefix = str(target).rstrip("\\/") + "\\"
+    me = os.getpid()
+    pids: list[int] = []
+    try:
+        entry = _PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+        ok = bool(kernel32.Process32FirstW(snap, ctypes.byref(entry)))
+        while ok:
+            pid = int(entry.th32ProcessID)
+            if pid and pid != me:
+                handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                if handle:
+                    try:
+                        buf = ctypes.create_unicode_buffer(1024)
+                        size = ctypes.c_uint32(1024)
+                        if kernel32.QueryFullProcessImageNameW(
+                            handle, 0, buf, ctypes.byref(size)
+                        ):
+                            image = str(buf.value)
+                            if image and image.lower().startswith(prefix.lower()):
+                                pids.append(pid)
+                    finally:
+                        kernel32.CloseHandle(handle)
+            ok = bool(kernel32.Process32NextW(snap, ctypes.byref(entry)))
+    finally:
+        kernel32.CloseHandle(snap)
+    return pids
+
+
+def _wait_target_idle(target: Path, timeout_s: float = 45.0) -> None:
+    """等所有从 target 目录树里跑着的进程退场（有界）。
+
+    超时后照常动手：真有赖着不走的占用者，让位重试会失败并整体回滚，
+    循环终止交给交接账本——这里只负责把「再多等几秒就能成」的窗口吃满。
+    """
+    deadline = time.monotonic() + timeout_s
+    while _pids_running_from(target):
+        if time.monotonic() >= deadline:
+            _log_update(f"等待程序目录占用进程超时（{timeout_s:.0f}s），按现状继续换装")
+            return
+        time.sleep(1.0)
+
+
+def _handoff_ledger_path() -> Path:
+    """交接账本：现装进程每次交接前登记（tag + 次数），数据目录落盘。"""
+    return _data_dir() / HANDOFF_LEDGER_NAME
+
+
+def _read_handoff_ledger() -> dict:
+    try:
+        return json.loads(_handoff_ledger_path().read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 —— 无账本/坏账本都按「没交过」处理
+        return {}
+
+
+def _record_handoff(tag: str) -> None:
+    """登记一次交接（同一 tag 累计次数）。"""
+    ledger = _read_handoff_ledger()
+    count = int(ledger.get("count", 0) or 0) + 1 if ledger.get("tag") == tag else 1
+    try:
+        _handoff_ledger_path().write_text(
+            json.dumps({"tag": tag, "count": count, "pid": os.getpid(), "ts": time.time()}),
+            encoding="utf-8",
+        )
+    except Exception as e:  # noqa: BLE001 —— 账本写不进去不阻断交接（后续防线仍在）
+        _log_update(f"写交接账本失败：{e}")
+
+
+def _clear_handoff_ledger() -> None:
+    try:
+        _handoff_ledger_path().unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001 —— 清不掉不阻断主流程
+        pass
+
+
 def _remove_path(path: Path) -> None:
 
     try:
@@ -486,8 +700,8 @@ def _staged_supports_helper(exe: Path) -> bool:
 def _wait_pid_exit(pid: int, timeout: float = 180.0) -> None:
     """等旧进程退出（Windows 句柄等待：换装进程要先拿到「程序目录没人占用」）。
 
-    非 Windows / 句柄打不开时退化为短等待——换装进程本就是脱前台的兜底进程，
-    多等一会儿不伤人；早动手才会撞文件锁。
+    句柄打不开 = 进程已不在（正常路径：旧实例早已退场）——立即放行，等待
+    残余占用的责任交给让位重试；这里多睡一秒都是用户盯着空屏的时间。
     """
     if os.name == "nt":
         try:
@@ -503,9 +717,10 @@ def _wait_pid_exit(pid: int, timeout: float = 180.0) -> None:
             if handle:
                 kernel32.WaitForSingleObject(handle, int(timeout * 1000))
                 return
-        except Exception:  # noqa: BLE001 —— 句柄打不开走下面的兜底等待
-            pass
-    time.sleep(min(timeout, 5.0))
+        except Exception:  # noqa: BLE001 —— 句柄打不开视为已退出
+            return
+    else:
+        time.sleep(min(timeout, 5.0))
 
 
 def _handoff_pending_update() -> bool:
@@ -514,6 +729,14 @@ def _handoff_pending_update() -> bool:
     本进程正从 `_internal` 装载 DLL，运行中的目录无法整体改名；换装进程
     等本进程句柄消失后再动文件。返回 True = 已交接（调用方必须立即退出，
     别再起 uvicorn 与窗口）。
+
+    三道门（顺序即防线顺序，全部现装侧自持，不依赖暂存包构建配合）：
+    ① 换装失败标记：上次换装已失败回滚，不再自动重演；
+    ② 版本门：暂存包必须比现装新——同版本/更旧的暂存包是残包或错包，
+       换装没有意义，清掉防反复触发；
+    ③ 交接账本：同一暂存包只许自动交接一次，第二次 = 上次失败回滚后又被
+       拉起，终止并清场——这是旧构建暂存包（没有摘 manifest 逻辑）也能
+       被终止循环的最后防线。
     """
     if not is_frozen():
         return False
@@ -529,12 +752,41 @@ def _handoff_pending_update() -> bool:
     payload = staging / APP_NAME
     manifest = staging / _MANIFEST_NAME
     if not manifest.is_file() or not payload.is_dir():
+        # 无待换装包：顺带清掉可能残留的交接账本（换装成功由换装进程清，
+        # 旧构建的换装进程不会清——这里兜底，避免旧账挡住下一次交接）
+        _clear_handoff_ledger()
         return False
     try:
         info = json.loads(manifest.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 —— 坏 manifest 忽略，正常启动
         return False
     if not info.get("ready"):
+        return False
+
+    tag = str(info.get("tag") or "")
+    staged_version = version_from_tag(tag)
+    if not staged_version or not version_gt(staged_version, APP_VERSION):
+        _log_update(
+            f"暂存包 {tag or '(无 tag)'} 不比现装 {APP_VERSION} 新，清理暂存跳过换装"
+        )
+        _remove_path(staging)
+        _clear_handoff_ledger()
+        return False
+
+    ledger = _read_handoff_ledger()
+    if ledger.get("tag") == tag and int(ledger.get("count", 0) or 0) >= 1:
+        _log_update("同一暂存包已交接过一次（此前换装失败回滚），终止自动换装并清理")
+        _remove_path(staging)
+        _clear_handoff_ledger()
+        threading.Thread(
+            target=_alert,
+            args=(
+                "[更新] 检测到上次更新未能完成安装（已回滚到原版本），本次启动已"
+                "终止自动更新。\n\n可在应用内重新下载更新再试；"
+                f"详情见 {_update_log()}",
+            ),
+            daemon=True,
+        ).start()
         return False
 
     staged_exe = _staged_main_exe(payload)
@@ -561,6 +813,10 @@ def _handoff_pending_update() -> bool:
             ).start()
         return False
 
+
+    # 交接前落账：本进程退出后如果换装失败，回滚拉起的现装会带着这笔账
+    # 拒绝第二次交接（循环终止判据），而不是无限重演
+    _record_handoff(tag)
 
     try:
         subprocess.Popen(
@@ -639,7 +895,9 @@ def _swap_payload(staging: Path, target: Path) -> bool:
         for entry in target.iterdir():
             if entry.name in _UPDATE_KEEP or entry == old_dir:
                 continue
-            _replace_with_retry(entry, old_dir / entry.name)
+            # 让位是整条链唯一的门槛步骤：占用者（杀软扫描/残余句柄）多为
+            # 秒级窗口，给足 30s 退避窗（回滚路径保持短窗，别拖慢失败兜底）
+            _replace_with_retry(entry, old_dir / entry.name, attempts=15, delay=2.0)
             moved.append(entry.name)
     except Exception as e:  # noqa: BLE001
         _log_update(f"旧条目让位失败：{e}（回滚已让位条目）")
@@ -692,11 +950,18 @@ def _run_update_helper(staging: Path, target: Path, wait_pid: int | None) -> Non
     的 `_internal` 无法整体改名）。成功即拉起新程序；失败保持原版本完好并弹窗
     给出日志路径与手工升级指引。
     """
-
     _log_update(f"换装进程启动：staging={staging} target={target} wait_pid={wait_pid}")
+    # 互斥独占第一件事：交接竞态拉起的第二个换装进程在这里就地退出，
+    # 没有这道闸，两个进程会并发搬同一目录互相拆台
+    if not _acquire_swap_mutex():
+        _log_update("已有换装进程在跑，本进程退出")
+        return
     if wait_pid:
         _wait_pid_exit(int(wait_pid))
     time.sleep(1.5)  # 进程退出 ≠ 文件锁立刻消失，留一点收尾余量
+    # wait_pid 只等交接方一个进程；交接窗口期还可能有别的新实例从程序目录
+    # 里跑起来（用户手快双击/回滚链重叠），按进程快照把它们一并等退场
+    _wait_target_idle(target)
 
     if not _swap_payload(staging, target):
         _mark_swap_failed(target)
@@ -720,9 +985,20 @@ def _run_update_helper(staging: Path, target: Path, wait_pid: int | None) -> Non
         ).start()
         return
 
+    # 换装成功清交接账本：这笔账只在「交接了但没装成」时有意义，装成了就是
+    # 新版本接管，留着旧账会让下一次更新被误判成重演（旧构建换装进程没有
+    # 这步，现装启动时对无 manifest 场景有兜底清理）
+    _clear_handoff_ledger()
+    _swap_failed_flag().unlink(missing_ok=True)
+    # 拉起新版本：定位规则与回滚拉起同源（优先与本程序同名，其次载荷内任一
+    # exe），用户改过主程序名也能拉起
+    new_exe = _staged_main_exe(target)
+    if new_exe is None:
+        _log_update("新程序已就位，但未找到主程序，请手动启动")
+        return
     try:
         subprocess.Popen(
-            [str(target / Path(sys.executable).name)],
+            [str(new_exe)],
             cwd=str(target),
             close_fds=True,
             creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
@@ -1804,17 +2080,13 @@ def main() -> None:
     # WebView2 静态参数须在任何窗口创建前就位（webview.start 建环境时读取）
     _apply_webview2_static_args()
 
-    # 换装：暂存就绪则把换装交给暂存包的新 exe（本进程立即退出，不再起服务）；
-    # 交接失败（旧版暂存包/拉不起来）就照常启动现装，下次启动再试
-    if _handoff_pending_update():
-        sys.stdout.flush()
-        os._exit(0)
-
-    # 换装残留清理：已消费的暂存目录（无 manifest）+ 上一版程序备份 __old__
-    _cleanup_staging_leftover()
-    _stale_old_dir = _app_root() / "__old__"
-    if _should_clean_old_dir(_stale_old_dir):
-        _cleanup_old_dir_async(_stale_old_dir)
+    # 更新重启链：restart_app 拉起的子进程带着 PREV_PID——旧实例退出前
+    # 仍持着服务端口与单实例锁，不先等它退场，端口协商会探活命中「已在运行」
+    # 把更新交接截胡成一次普通唤醒（表现为「点了重启，应用关了又没更」）
+    if os.environ.get(f"{ENV_PREFIX}UPDATE_RESTART") == "1":
+        raw = os.environ.get(f"{ENV_PREFIX}PREV_PID", "").strip()
+        if raw.isdigit():
+            _wait_pid_exit(int(raw), timeout=15.0)
 
     # 启动期端口协商（已运行实例检测在前）：被占自动避让/唤醒分流
     _negotiate_ports()
@@ -1830,6 +2102,27 @@ def main() -> None:
             return
         # 锁位被外来程序占坑且无真实例：协商已选好服务端口，降级运行
         print(f"[警告] 锁端口 {LOCK_PORT} 被其他程序占用，单实例保护降级为探活判定。")
+
+    # 交接放在单实例锁之后：只有拿到锁（= 此刻唯一的正式实例）才有资格交接。
+    # 交接先于锁会让双开实例各交一次，拉起两个换装进程并发毁坏安装目录。
+    # 换装进行中（互斥体被持有）则本实例直接让位：换装进程完成时会拉起新版
+    # 或回滚现装，不该带着「程序目录即将被搬空」继续起服务。
+    if _swap_mutex_held():
+        _log_update("检测到换装进程进行中，本实例退出等待其完成")
+        sys.stdout.flush()
+        os._exit(0)
+
+    # 换装：暂存就绪则把换装交给暂存包的新 exe（本进程立即退出，不再起服务）；
+    # 交接失败（旧版暂存包/拉不起来）就照常启动现装，下次启动再试
+    if _handoff_pending_update():
+        sys.stdout.flush()
+        os._exit(0)
+
+    # 换装残留清理：已消费的暂存目录（无 manifest）+ 上一版程序备份 __old__
+    _cleanup_staging_leftover()
+    _stale_old_dir = _app_root() / "__old__"
+    if _should_clean_old_dir(_stale_old_dir):
+        _cleanup_old_dir_async(_stale_old_dir)
 
     ready = threading.Event()
     error_box: list[str] = []

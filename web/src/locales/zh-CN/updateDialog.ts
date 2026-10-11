@@ -1,11 +1,8 @@
-/* 更新模块文案：顶栏提示入口（components/business/UpdateEntry.vue）、
+/* 更新模块文案：左上角气泡（components/business/UpdateBubble.vue）、
    更新报告窗口（components/business/UpdateDialog.vue）、更新内容渲染
-   （components/business/UpdateNotes.vue）。设置页只剩「检查更新」入口。 */
+   （components/business/UpdateNotes.vue）。设置页不再有常驻更新面板。 */
 export default {
   'updateDialog.title': '应用更新',
-  'updateDialog.entry': '更新',
-  'updateDialog.entryTip': '检测应用更新',
-  'updateDialog.checkNow': '检测更新',
   'updateDialog.notesTitle': 'v{version} 更新内容',
   'updateDialog.notesEmpty': '此版本未提供更新说明',
   'updateDialog.releaseDate': '发布于 {date}',
@@ -27,6 +24,7 @@ export default {
   'updateDialog.whatsNew': '更新内容',
   'updateDialog.packageSize': '更新包大小 {size}，下载期间可继续使用应用。',
   'updateDialog.autoDownload': '自动下载并安装更新',
+  'updateDialog.notifyMe': '有新版本时提醒我',
 
   'updateDialog.progressLabel': '下载进度',
   'updateDialog.probe': '正在探测可用下载通道…',
@@ -42,6 +40,9 @@ export default {
   'updateDialog.failVerify': '下载完成但校验未通过，已丢弃（不会安装坏包）。请重试或手动下载。',
   'updateDialog.failCancelled': '已取消下载，已下载的部分会保留，下次继续。',
   'updateDialog.failGeneric': '更新失败。可重试，或到发布页手动下载。',
+  'updateDialog.swapFailedBanner': '上次更新未能完成安装，已回滚到原版本。',
+  'updateDialog.swapFailedHint':
+    '可能是文件被占用导致换装中断。重新下载更新即可再试；问题反复出现时请把更新日志发给我们。',
   'updateDialog.readyBody': 'v{version} 已下载并通过校验，重启应用即可完成安装。',
   'updateDialog.readyHint': '重启期间界面会短暂关闭，随后自动回到新版；游戏库与账号数据不受影响。',
 

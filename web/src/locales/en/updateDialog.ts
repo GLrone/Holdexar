@@ -1,10 +1,8 @@
-/* Update module strings: the top-bar entry (UpdateEntry.vue), the update report
-   window (UpdateDialog.vue) and the release-notes renderer (UpdateNotes.vue). */
+/* Update module strings: the top-left bubble (UpdateBubble.vue), the update report
+   window (UpdateDialog.vue) and the release-notes renderer (UpdateNotes.vue).
+   The settings page no longer hosts a resident update panel. */
 export default {
   'updateDialog.title': 'App Update',
-  'updateDialog.entry': 'Update',
-  'updateDialog.entryTip': 'Check for app updates',
-  'updateDialog.checkNow': 'Check for updates',
   'updateDialog.notesTitle': "What's new in v{version}",
   'updateDialog.notesEmpty': 'This version ships no release notes',
   'updateDialog.releaseDate': 'Released {date}',
@@ -26,6 +24,7 @@ export default {
   'updateDialog.whatsNew': "What's new",
   'updateDialog.packageSize': 'Package size {size}. You can keep using the app while it downloads.',
   'updateDialog.autoDownload': 'Download and install updates automatically',
+  'updateDialog.notifyMe': 'Notify me when a new version is available',
 
   'updateDialog.progressLabel': 'Download progress',
   'updateDialog.probe': 'Probing download channels…',
@@ -42,6 +41,9 @@ export default {
     'Download finished but failed verification and was discarded (a broken package is never installed). Retry or download manually.',
   'updateDialog.failCancelled': 'Download cancelled. The partial download is kept for next time.',
   'updateDialog.failGeneric': 'Update failed. Retry, or download manually from the releases page.',
+  'updateDialog.swapFailedBanner': 'The previous update did not finish installing and was rolled back.',
+  'updateDialog.swapFailedHint':
+    'The swap was likely interrupted by a locked file. Download the update again to retry; if it keeps happening, please send us the update log.',
   'updateDialog.readyBody': 'v{version} is downloaded and verified. Restart the app to install it.',
   'updateDialog.readyHint':
     'The window closes briefly during restart and comes back on the new version; your library and accounts are untouched.',

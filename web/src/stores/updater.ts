@@ -2,6 +2,7 @@ import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 
 import { systemApi, type UpdateCheckResult, type UpdateProgress } from '@/api/client'
+import { useSettingsStore } from '@/stores/settings'
 
 /**
  * 应用更新状态（检查 + 下载进度 + 待重启暂存）。
@@ -17,12 +18,12 @@ import { systemApi, type UpdateCheckResult, type UpdateProgress } from '@/api/cl
  *
  * 设计要点：
  * - `hasUpdate` 跟随实际可用状态，用户没更新就一直亮红点
- * - 「已提示过」的判定不在这里，而在 settings store 的 ui.update_notified
- *   （跨启动持久化，本 store 是内存态，重启即空）
+ * - 「跳过此版本」持久化在 settings store（app_settings KV），本 store 只投影
  * - `pendingTag` 非空 = 新版本已下载校验完成、等待重启换装：全局弹窗与
- *   设置页卡片都以此为准（后端 /system/update-pending 是唯一事实来源）
+ *   气泡都以此为准（后端 /system/update-pending 是唯一事实来源）
  */
 export const useUpdaterStore = defineStore('updater', () => {
+  const settingsStore = useSettingsStore()
   const info = ref<UpdateCheckResult | null>(null)
   const checking = ref(false)
   /** 本次会话是否已查过（避免重复自动检查；手动检查传 force） */
@@ -37,13 +38,16 @@ export const useUpdaterStore = defineStore('updater', () => {
   const downloading = ref(false)
   /** 暂存就绪的版本 tag（非空 = 下载完成待重启） */
   const pendingTag = ref('')
+  /** 上次换装失败已回滚（后端 .swap-failed 标记投影；给「重新下载」出路的依据） */
+  const swapFailed = ref(false)
   /** 全局「已下载，需重启」弹窗是否已被用户关掉（本次会话内不再打扰） */
   const pendingDialogDismissed = ref(false)
 
   /** 全局更新弹窗（模糊幕布）是否展开：更新模块已从设置页搬到这里 */
   const dialogOpen = ref(false)
-  /** 本次会话被用户跳过的版本（"跳过此版本"后不再自动提示） */
-  const skipped = ref('')
+  /** 被用户跳过的版本：持久化在 settings（app_settings KV），跨启动有效。
+   *  严格等值匹配——跳过 A 不拦 A 之后发布的 B；手动检查不受它限制。 */
+  const skipped = computed(() => settingsStore.updateSkipped)
   /** 最近一次失败（下载/校验/通道），弹窗按 code 给不同出路 */
   const failure = ref<{ code: string; message: string } | null>(null)
 
@@ -111,6 +115,7 @@ export const useUpdaterStore = defineStore('updater', () => {
     try {
       const p = await systemApi.updatePending()
       pendingTag.value = p.pending ? (p.tag || '') : ''
+      swapFailed.value = p.swapFailed === true
     } catch {
       /* 拉不到保持现值 */
     }
@@ -187,9 +192,11 @@ export const useUpdaterStore = defineStore('updater', () => {
     dialogOpen.value = false
   }
 
-  /** 跳过此版本：本次会话内不再提示（不删已下载的包） */
-  function skipVersion(version: string): void {
-    skipped.value = version
+  /** 跳过此版本：持久化到后端 KV，气泡与自动提示不再出现该版本。
+   *  已下载的暂存包不删（用户下次仍可从弹窗重启换装）。 */
+  async function skipVersion(version: string): Promise<void> {
+    if (!version) return
+    await settingsStore.setUpdateSkipped(version)
     dialogOpen.value = false
   }
 
@@ -242,6 +249,7 @@ export const useUpdaterStore = defineStore('updater', () => {
     progress,
     downloading,
     pendingTag,
+    swapFailed,
     pendingDialogDismissed,
     dialogOpen,
     skipped,
