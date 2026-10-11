@@ -35,21 +35,25 @@ logger = logging.getLogger(__name__)
 
 _current_run: ContextVar[str | None] = ContextVar("agent_current_run", default=None)
 
+# job_id → 在飞 run_id：job 跳拍事件（上一轮还没跑完/到点错失）由调度事件
+# 监听器按 job_id 投给在飞 run（监听器跑在调度器分发上下文，拿不到 ContextVar）
+_RUNNING_JOB_RUNS: dict[str, str] = {}
+
 # job 型运行账保留窗口：调度流水只服务「最近跑没跑、为什么没跑」，
 # 过窗级联删除（agent_events 外键 CASCADE）；task/fake run（领航会话
 # 回放依据）不受本清理影响
 JOB_RUN_RETENTION_DAYS = 30
+# 分块删除（每块一个事务过写闸）：一次长 DELETE 会长时间持写锁，与
+# 遥测保留模块同一硬要求；删不完留给下一轮
+_PRUNE_CHUNK = 5000
+_PRUNE_MAX_CHUNKS = 20
 
 
 def current_run_id() -> str | None:
     return _current_run.get()
 
 
-async def note_step(step: str, summary: dict | None = None) -> bool:
-    """向当前 run 追加一段运行流水；无 run 上下文或落账失败都是 no-op。"""
-    run_id = _current_run.get()
-    if run_id is None:
-        return False
+async def _append_step(run_id: str, step: str, summary: dict | None) -> bool:
     try:
         await agent_service.append_event(
             run_id,
@@ -68,6 +72,22 @@ async def note_step(step: str, summary: dict | None = None) -> bool:
         return False
 
 
+async def note_step(step: str, summary: dict | None = None) -> bool:
+    """向当前 run 追加一段运行流水；无 run 上下文或落账失败都是 no-op。"""
+    run_id = _current_run.get()
+    if run_id is None:
+        return False
+    return await _append_step(run_id, step, summary)
+
+
+async def note_job_skipped(job_id: str, step: str, summary: dict | None = None) -> bool:
+    """向 job 当前在飞的 run 记让路流水；无在飞 run 返回 False。"""
+    run_id = _RUNNING_JOB_RUNS.get(job_id)
+    if run_id is None:
+        return False
+    return await _append_step(run_id, step, summary)
+
+
 async def run_accounted(
     job_id: str,
     fn,
@@ -81,6 +101,15 @@ async def run_accounted(
     task_kind 给定时（job 对应任务登记表条目），结束后采样一次域账本，
     按 state.map_domain_status 把域终态投影成 run 终态；采样不到业务
     结论按 done 收敛——run 不冒充业务裁判。"""
+    if task_kind is not None and not (ref or {}).get("startedAt"):
+        # 桥接采样只认本 run 建账后启动的 job/cycle：不补锚点会把历史
+        # 或手动轮的业务终态错收进本次 run（受理路径同源构造）
+        from app.crawler.utils import get_beijing_time_obj
+
+        ref = {
+            **dict(ref or {}),
+            "startedAt": get_beijing_time_obj().replace(tzinfo=None).isoformat(),
+        }
     run_id: str | None = None
     try:
         await agent_service.ensure_system_session()
@@ -96,6 +125,7 @@ async def run_accounted(
             },
         )
         run_id = created["run_id"]
+        _RUNNING_JOB_RUNS[job_id] = run_id
     except Exception:  # noqa: BLE001 —— 账本不可用不拖垮业务
         log_event(
             logger,
@@ -136,6 +166,8 @@ async def run_accounted(
         )
         return result
     finally:
+        if run_id is not None and _RUNNING_JOB_RUNS.get(job_id) == run_id:
+            _RUNNING_JOB_RUNS.pop(job_id, None)
         _current_run.reset(token)
 
 
@@ -179,17 +211,29 @@ async def _sample_outcome(run_id: str, task_kind: str | None, ref: dict | None) 
 
 
 async def prune_job_runs(days: int = JOB_RUN_RETENTION_DAYS) -> int:
-    """清理窗口外的 job 型运行账（行删级联事件）；task/fake run 不动。"""
-    from sqlalchemy import delete
+    """清理窗口外的 job 型运行账（行删级联事件）；task/fake run 不动。
 
-    from app.domains.agent.models import AgentRun
+    分块删除：每块一个事务过写闸，块间写者位空出；单轮块上限内删不完
+    留给下一轮（每日 04:36 一拍）。"""
+    from sqlalchemy import text
 
     cutoff = datetime.now() - timedelta(days=days)
-    async with write_gate(WritePriority.BACKGROUND, "agent_prune"), get_session_factory()() as session:
-        result = await session.execute(
-            delete(AgentRun).where(
-                AgentRun.runner == "job", AgentRun.created_at < cutoff
+    deleted = 0
+    factory = get_session_factory()
+    for _ in range(_PRUNE_MAX_CHUNKS):
+        async with write_gate(WritePriority.BACKGROUND, "agent_prune"), factory() as session:
+            result = await session.execute(
+                text(
+                    "DELETE FROM agent_runs WHERE id IN ("
+                    "SELECT id FROM agent_runs"
+                    " WHERE runner = 'job' AND created_at < :cutoff"
+                    " ORDER BY id LIMIT :chunk)"
+                ),
+                {"cutoff": cutoff, "chunk": _PRUNE_CHUNK},
             )
-        )
-        await session.commit()
-        return int(result.rowcount or 0)
+            await session.commit()
+        affected = int(result.rowcount or 0)
+        deleted += affected
+        if affected < _PRUNE_CHUNK:
+            return deleted
+    return deleted

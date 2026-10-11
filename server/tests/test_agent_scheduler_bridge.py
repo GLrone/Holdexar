@@ -139,6 +139,48 @@ class TestRunAccounted:
         runs = await agent_service.list_runs(status="done")
         assert any((r.get("meta") or {}).get("job") == "j2" for r in runs)
 
+    @pytest.mark.asyncio
+    async def test_task_kind_without_ref_gets_start_anchor(self, db, stub_kind):
+        """桥接采样不传 ref：建账时刻自动作 startedAt 锚点，observe 拿到它
+        （跳过拍不得把历史 job/cycle 的业务终态错收进本次 run）。"""
+        seen: dict = {}
+
+        async def _observe(ref):
+            seen.update(ref)
+            return {"active": False, "phase": "idle", "outcome": "completed"}
+
+        stub_kind(_observe)
+
+        async def _job():
+            return None
+
+        await scheduler_bridge.run_accounted("anchored_job", _job, task_kind="stub")
+        assert seen.get("startedAt"), "observe 必须拿到本 run 的建账时刻锚点"
+        runs = await agent_service.list_runs()
+        run = next(
+            r for r in runs if (r.get("meta") or {}).get("job") == "anchored_job"
+        )
+        assert (run.get("meta") or {}).get("ref", {}).get("startedAt")
+
+    @pytest.mark.asyncio
+    async def test_task_kind_keeps_caller_started_at(self, db, stub_kind):
+        """调用方已给 startedAt（受理路径）时不覆盖。"""
+        seen: dict = {}
+
+        async def _observe(ref):
+            seen.update(ref)
+            return {"active": False, "phase": "idle"}
+
+        stub_kind(_observe)
+
+        async def _job():
+            return None
+
+        await scheduler_bridge.run_accounted(
+            "kept_job", _job, task_kind="stub", ref={"startedAt": "2020-01-01T00:00:00"},
+        )
+        assert seen["startedAt"] == "2020-01-01T00:00:00"
+
 
 class TestNoteStep:
     @pytest.mark.asyncio
@@ -160,6 +202,200 @@ class TestNoteStep:
         assert await scheduler_bridge.note_step("x", {}) is False
 
 
+class TestSkipNotes:
+    """门禁跳过静默分支接 skip 流水：原因用户语言、run 保持 done。"""
+
+    async def _last_skip(self, job_id: str) -> tuple[dict, list[dict]]:
+        runs = await agent_service.list_runs()
+        run = next(r for r in runs if (r.get("meta") or {}).get("job") == job_id)
+        events = await agent_service.list_events(run["run_id"])
+        steps = [e for e in events if e["event_type"] == "step.completed"]
+        return run, steps
+
+    @pytest.mark.asyncio
+    async def test_wallet_sync_no_cookie_notes_skip(self, db, monkeypatch):
+        from app.core import scheduler as sched
+        from app.domains.account import service as account_service
+
+        async def no_cookie():
+            return {"ok": False, "status": "no_cookie"}
+
+        monkeypatch.setattr(account_service, "sync_wallets_rotational", no_cookie)
+        await scheduler_bridge.run_accounted("wallet_sync", sched._job_wallet_sync)
+        run, steps = await self._last_skip("wallet_sync")
+        assert run["status"] == "done"
+        assert steps, "no_cookie 分支必须落 skip 流水"
+        assert steps[-1]["payload"] == {
+            "step": "wallet_sync", "summary": {"skipped": "未绑定 Steam 账号"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_bills_sync_no_cookie_and_busy_notes_skip(self, db, monkeypatch):
+        from app.core import scheduler as sched
+        from app.domains.bills import service as bills_service
+
+        for status, wording in (
+            ("no_cookie", "未绑定 Steam Cookie"),
+            ("busy", "账单同步进行中"),
+        ):
+            async def fake(force=False, _status=status):
+                return {"ok": False, "status": _status}
+
+            monkeypatch.setattr(bills_service, "sync_bills", fake)
+            await scheduler_bridge.run_accounted("bills_sync", sched._job_bills_sync)
+            run, steps = await self._last_skip("bills_sync")
+            assert run["status"] == "done"
+            assert steps[-1]["payload"]["summary"] == {"skipped": wording}
+
+    @pytest.mark.asyncio
+    async def test_fx_refresh_switch_off_notes_skip(self, db, monkeypatch):
+        from app.core import scheduler as sched
+        from app.domains.settings import service as settings_service
+
+        async def off(key, default=None):
+            return False if key == "crawl.auto_refresh_rates" else default
+
+        monkeypatch.setattr(settings_service, "get_value", off)
+        await scheduler_bridge.run_accounted("fx_refresh", sched._job_fx_refresh)
+        run, steps = await self._last_skip("fx_refresh")
+        assert run["status"] == "done"
+        assert steps[-1]["payload"]["summary"] == {"skipped": "汇率自动更新已关闭"}
+
+    @pytest.mark.asyncio
+    async def test_proxy_health_switch_off_notes_skip(self, db, monkeypatch):
+        from app.core import scheduler as sched
+
+        async def disabled(key):
+            return False
+
+        monkeypatch.setattr(sched, "content_fetch_enabled", disabled)
+        await scheduler_bridge.run_accounted("proxy_health", sched._job_proxy_health)
+        run, steps = await self._last_skip("proxy_health")
+        assert run["status"] == "done"
+        assert steps[-1]["payload"]["summary"] == {"skipped": "自动节点体检已关闭"}
+
+    @pytest.mark.asyncio
+    async def test_board_gate_skip_notes_with_board_key(self, db, monkeypatch):
+        from app.core import scheduler as sched
+
+        async def disabled(key):
+            return False
+
+        monkeypatch.setattr(sched, "content_fetch_enabled", disabled)
+        await scheduler_bridge.run_accounted(
+            "board_topsellers", sched._make_board_job("topsellers")
+        )
+        run, steps = await self._last_skip("board_topsellers")
+        assert run["status"] == "done"
+        assert steps[-1]["payload"] == {
+            "step": "board_topsellers", "summary": {"skipped": "Steam 排行榜自动更新已关闭"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_fx_history_repair_no_gaps_notes(self, db, monkeypatch):
+        from app.core import scheduler as sched
+        from app.domains.rates import history as rates_history
+
+        async def enabled(key):
+            return True
+
+        async def no_gaps():
+            return {"windows": []}
+
+        monkeypatch.setattr(sched, "content_fetch_enabled", enabled)
+        monkeypatch.setattr(rates_history, "scan_history_gaps", no_gaps)
+        await scheduler_bridge.run_accounted("fx_history_repair", sched._job_fx_history_repair)
+        run, steps = await self._last_skip("fx_history_repair")
+        assert run["status"] == "done"
+        assert steps[-1]["payload"]["summary"] == {"skipped": "历史汇率没有缺漏，暂不补齐"}
+
+    @pytest.mark.asyncio
+    async def test_comingsoon_and_free_promo_empty_notes(self, db, monkeypatch):
+        from app.core import scheduler as sched
+
+        async def on():
+            return True
+
+        monkeypatch.setattr(sched, "price_auto_enabled", on)
+
+        async def no_pairs(self, **kw):
+            return []
+
+        from app.crawler.db_writer import DbWriter
+        monkeypatch.setattr(DbWriter, "coming_soon_retry_pairs", no_pairs)
+        await scheduler_bridge.run_accounted("comingsoon_retry", sched._job_coming_soon_retry)
+        run, steps = await self._last_skip("comingsoon_retry")
+        assert run["status"] == "done"
+        assert steps[-1]["payload"]["summary"] == {"skipped": "暂无需要重新检查的游戏"}
+
+    @pytest.mark.asyncio
+    async def test_gate_open_no_skip_note(self, db, monkeypatch):
+        """正向对照：开关全开时 run 无任何 skipped step 事件。"""
+        from app.core import scheduler as sched
+        from app.domains.rates import service as rates_service
+        from app.domains.settings import service as settings_service
+
+        async def on(key, default=None):
+            return True
+
+        async def ok_refresh():
+            return {"ok": True}
+
+        monkeypatch.setattr(settings_service, "get_value", on)
+        monkeypatch.setattr(rates_service, "refresh_rates", ok_refresh)
+        await scheduler_bridge.run_accounted("fx_refresh", sched._job_fx_refresh)
+        run, steps = await self._last_skip("fx_refresh")
+        assert run["status"] == "done"
+        assert not steps, "开关全开不得落 skip 流水"
+
+
+class TestNoteJobSkipped:
+    """调度跳拍事件按 job_id 投给在飞 run（监听器拿不到 ContextVar，靠映射）。"""
+
+    @pytest.mark.asyncio
+    async def test_note_job_skipped_targets_inflight_run(self, db):
+        async def _job():
+            noted = await scheduler_bridge.note_job_skipped(
+                "evt_job", "evt_job", {"skipped": "上一轮还在进行，本拍让路"}
+            )
+            assert noted is True
+            return None
+
+        await scheduler_bridge.run_accounted("evt_job", _job)
+        runs = await agent_service.list_runs()
+        run = next(r for r in runs if (r.get("meta") or {}).get("job") == "evt_job")
+        events = await agent_service.list_events(run["run_id"])
+        steps = [e for e in events if e["event_type"] == "step.completed"]
+        assert steps and steps[0]["payload"] == {
+            "step": "evt_job", "summary": {"skipped": "上一轮还在进行，本拍让路"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_note_job_skipped_without_inflight_run_is_noop(self, db):
+        assert await scheduler_bridge.note_job_skipped("ghost", "ghost", {}) is False
+
+    @pytest.mark.asyncio
+    async def test_run_accounted_clears_inflight_mapping(self, db):
+        async def _job():
+            return None
+
+        await scheduler_bridge.run_accounted("map_job", _job)
+        assert "map_job" not in scheduler_bridge._RUNNING_JOB_RUNS
+
+    @pytest.mark.asyncio
+    async def test_run_accounted_keeps_foreign_mapping_value(self, db):
+        """收口只清自己登记的值，不误删理论重入时他者写入的同键值。"""
+        async def _job():
+            scheduler_bridge._RUNNING_JOB_RUNS["map_job2"] = "foreign_run"
+            return None
+
+        try:
+            await scheduler_bridge.run_accounted("map_job2", _job)
+            assert scheduler_bridge._RUNNING_JOB_RUNS["map_job2"] == "foreign_run"
+        finally:
+            scheduler_bridge._RUNNING_JOB_RUNS.pop("map_job2", None)
+
+
 class TestAdoptTaskRun:
     @pytest.mark.asyncio
     async def test_adopted_run_converges_done(self, db, stub_kind):
@@ -175,6 +411,60 @@ class TestAdoptTaskRun:
         assert run["runner"] == "task"
         assert run["meta"]["adopted"] is True
         assert run["meta"]["task"] == "stub"
+
+
+class TestPruneCrawlJobs:
+    @pytest.mark.asyncio
+    async def test_prune_removes_only_old_terminal_rows(self, db):
+        from app.domains.crawl import service as crawl_service
+        from app.domains.crawl.cycle import PriceCycle
+        from app.domains.crawl.models import CrawlJob
+
+        factory = db["factory"]
+        old_ts = datetime.now() - timedelta(days=91)
+        async with factory() as session:
+            session.add_all([
+                CrawlJob(id=1, kind="manual", status="done", finished_at=old_ts),
+                CrawlJob(id=2, kind="manual", status="failed", finished_at=old_ts),
+                CrawlJob(id=3, kind="manual", status="pending"),
+                CrawlJob(id=4, kind="manual", status="running"),
+                CrawlJob(id=5, kind="manual", status="done", finished_at=datetime.now()),
+            ])
+            # price_cycles 整行归周期保留窗：过窗行不得被本函数碰
+            session.add(PriceCycle(
+                kind="scheduled", status="done", started_at=old_ts,
+                finished_at=old_ts,
+            ))
+            await session.commit()
+
+        pruned = await crawl_service.prune_crawl_jobs(days=90)
+        assert pruned == 2
+
+        async with factory() as session:
+            jobs = {j.id: j.status for j in (
+                await session.execute(CrawlJob.__table__.select())).fetchall()}
+            assert jobs == {3: "pending", 4: "running", 5: "done"}
+            cycles = (await session.execute(PriceCycle.__table__.select())).fetchall()
+            assert len(cycles) == 1, "price_cycles 整行不碰"
+
+    @pytest.mark.asyncio
+    async def test_prune_chunk_cap_truncates(self, db):
+        from app.domains.crawl import service as crawl_service
+        from app.domains.crawl.models import CrawlJob
+
+        factory = db["factory"]
+        old_ts = datetime.now() - timedelta(days=91)
+        async with factory() as session:
+            session.add_all([
+                CrawlJob(id=i, kind="manual", status="done", finished_at=old_ts)
+                for i in range(1, 6)
+            ])
+            await session.commit()
+
+        pruned = await crawl_service.prune_crawl_jobs(days=90, chunk=2, max_chunks=2)
+        assert pruned == 4, "单轮块上限截断，剩余 1 行留下一轮"
+        pruned = await crawl_service.prune_crawl_jobs(days=90, chunk=2, max_chunks=2)
+        assert pruned == 1, "续删幂等清零"
 
 
 class TestPruneJobRuns:

@@ -120,11 +120,11 @@ def tool_step(name: str, result: dict) -> dict:
     """工具执行结果 → 时间线步骤条目。
 
     返回 {label, status, data}：label 对应前端词条键片段；status 取
-    ok / empty / denied / timeout / failed；data 只装词条插值所需的最小数据
+    ok / empty / denied / timeout / failed / stopped；data 只装词条插值所需的最小数据
     （结果计数、对象名、导航目标）。判定走数据层，前端不复制这套语义。"""
     if result.get("kind") == "denied":
         return {"label": "denied", "status": "denied", "data": {}}
-    if result.get("kind") in ("timeout", "failed"):
+    if result.get("kind") in ("timeout", "failed", "stopped"):
         return {
             "label": LABELS.get(name, name),
             "status": result["kind"],
