@@ -2506,3 +2506,147 @@ class TestParallelReadTools:
         tool_msgs = [m for t in state.turns for m in (t.get("messages") or [])
                      if m.get("role") == "tool"]
         assert len(tool_msgs) == 2
+
+
+class TestTurnStepClosure:
+    """回合收口：tool_start 声明的运行态占位在结算时原位回填，异常收场统一归为 stopped。"""
+
+    @staticmethod
+    def _spy_captured(monkeypatch):
+        """包裹收口助手，捕获收口前后的 phases 深快照。"""
+        captured: dict = {}
+        original = service._settle_running_steps
+
+        def _spy(phases):
+            snap = lambda ps: [{**p, "steps": [dict(s) for s in p["steps"]]} for p in ps]
+            captured["before"] = snap(phases)
+            original(phases)
+            captured["after"] = snap(phases)
+
+        monkeypatch.setattr(service, "_settle_running_steps", _spy)
+        return captured
+
+    def test_settle_running_steps_flips_only_running(self):
+        phases = [{"steps": [
+            {"label": "a", "status": "ok", "data": {"count": 1}},
+            {"label": "b", "status": "running", "data": {}},
+        ]}]
+        service._settle_running_steps(phases)
+        assert phases[0]["steps"][0] == {"label": "a", "status": "ok", "data": {"count": 1}}
+        assert phases[0]["steps"][1] == {"label": "b", "status": "stopped", "data": {}}
+
+    @pytest.mark.asyncio
+    async def test_cancelled_mid_tool_settles_running_to_stopped(self, monkeypatch):
+        """工具执行中途回合被取消：收口把运行态占位归为 stopped，中断轮不落账。"""
+        _patch_ready(monkeypatch, stream=[
+            ("tool_calls", [{"id": "t1", "name": "list_follows", "arguments": {}}]),
+        ])
+        monkeypatch.setattr(service, "_TOOL_TICK_S", 0.02)
+        captured = self._spy_captured(monkeypatch)
+        entered = asyncio.Event()
+
+        async def _hang(name, arguments, guarded=False, sid=None):
+            entered.set()
+            await asyncio.Event().wait()  # 永不返回：等收口取消
+
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _hang)
+        state = await service.get_store().load_or_new("s-stop")
+        agen = service._agent_stream(
+            [{"role": "user", "content": "查一下关注"}], state, "查一下关注", None, _CFG)
+        assert (await agen.__anext__())["type"] == "step_start"
+        assert (await agen.__anext__())["type"] == "tool_start"
+        assert (await agen.__anext__())["type"] == "tool_progress"
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+            if entered.is_set():
+                break
+        assert entered.is_set()
+        await agen.aclose()
+        await asyncio.sleep(0.05)  # 让被取消的在飞任务走完取消流程
+        # 收口前：tool_start 已声明、尚未结算 → 运行态占位在场
+        assert captured["before"][0]["steps"] == [{"label": "follows", "status": "running", "data": {}}]
+        # 收口后：统一归为 stopped 终态，phases 无 running 残留
+        assert captured["after"][0]["steps"] == [{"label": "follows", "status": "stopped", "data": {}}]
+        # 中断轮不落账：账本文件从未创建
+        assert not (service.get_store().base / "s-stop.jsonl").exists()
+
+    @pytest.mark.asyncio
+    async def test_parallel_batch_cancel_settles_all_declared_steps(self, monkeypatch):
+        """并行批次中途取消：全部已声明的运行态占位一并收口为 stopped。"""
+        _patch_ready(monkeypatch, stream=[
+            ("tool_calls", [
+                {"id": "t1", "name": "list_follows", "arguments": {}},
+                {"id": "t2", "name": "list_alerts", "arguments": {}},
+            ]),
+        ])
+        monkeypatch.setattr(service, "_TOOL_TICK_S", 0.02)
+        captured = self._spy_captured(monkeypatch)
+        entered = asyncio.Event()
+
+        async def _hang(name, arguments, guarded=False, sid=None):
+            entered.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _hang)
+        state = await service.get_store().load_or_new("s-par-stop")
+        agen = service._agent_stream(
+            [{"role": "user", "content": "都查一下"}], state, "都查一下", None, _CFG)
+        assert (await agen.__anext__())["type"] == "step_start"
+        assert (await agen.__anext__())["type"] == "tool_start"
+        assert (await agen.__anext__())["type"] == "tool_start"
+        assert (await agen.__anext__())["type"] == "tool_progress"
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+            if entered.is_set():
+                break
+        assert entered.is_set()
+        await agen.aclose()
+        await asyncio.sleep(0.05)
+        assert captured["before"][0]["steps"] == [
+            {"label": "follows", "status": "running", "data": {}},
+            {"label": "alerts", "status": "running", "data": {}},
+        ]
+        assert captured["after"][0]["steps"] == [
+            {"label": "follows", "status": "stopped", "data": {}},
+            {"label": "alerts", "status": "stopped", "data": {}},
+        ]
+        assert not (service.get_store().base / "s-par-stop.jsonl").exists()
+
+    @pytest.mark.asyncio
+    async def test_tool_cancelled_error_propagates_without_ledger_write(self, monkeypatch):
+        """桩工具抛取消：取消异常上抛不吞，收口已把占位归为 stopped，轮次不落账。"""
+        _patch_ready(monkeypatch, stream=[
+            ("tool_calls", [{"id": "t1", "name": "list_alerts", "arguments": {}}]),
+        ])
+        captured = self._spy_captured(monkeypatch)
+
+        async def _raise_cancel(name, arguments, guarded=False, sid=None):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _raise_cancel)
+        with pytest.raises(asyncio.CancelledError):
+            async for _ in service.ask_stream("查提醒", session_id="s-cancel"):
+                pass
+        assert captured["before"][0]["steps"] == [{"label": "alerts", "status": "running", "data": {}}]
+        assert captured["after"][0]["steps"] == [{"label": "alerts", "status": "stopped", "data": {}}]
+        assert not (service.get_store().base / "s-cancel.jsonl").exists()
+
+    @pytest.mark.asyncio
+    async def test_done_phases_settled_and_ledger_free_of_running(self, monkeypatch):
+        """正常收尾回归：结算原位回填占位，done 与账本 phases 全为既有终态、无 stopped 误伤。"""
+        _patch_ready(monkeypatch, stream=[
+            ("tool_calls", [{"id": "t1", "name": "get_price_briefing", "arguments": {"appid": 7}}]),
+            ("answer", "结论：值得。"),
+        ])
+        monkeypatch.setattr(service.pilot_tools, "execute_tool",
+                            _tool_stub([], {**_FACTS, "appid": 7}))
+        events = [e async for e in service.ask_stream("这游戏值得吗", session_id="s-term")]
+        done = events[-1]
+        assert done["type"] == "done"
+        all_steps = [s for p in done["phases"] for s in p["steps"]]
+        assert all_steps == [{"label": "price", "status": "ok", "data": {"name": "测试游戏"}}]
+        state = await service.get_store().load("s-term")
+        ledger_steps = [s for t in state.turns
+                        for p in (t.get("resp", {}).get("phases") or [])
+                        for s in p.get("steps") or []]
+        assert ledger_steps == all_steps

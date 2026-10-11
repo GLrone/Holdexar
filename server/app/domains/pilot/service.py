@@ -83,6 +83,11 @@ _store: pilot_session.SessionStore | None = None
 # 进程内存态——重启即清零，与「流在途」的生命周期天然一致
 _RUNNING_SIDS: set[str] = set()
 
+# 在飞轮的提问原文（sid → 本轮流式受理到的那一问）。与 _RUNNING_SIDS 同生命周期：
+# 刷新/重开表面后据此显示「正在进行的是哪一问」，而不是让那一轮凭空消失。
+# 刻意不落账本——被取消/中断的轮次不留任何账本痕迹（既有契约）。
+_INFLIGHT_QUESTIONS: dict[str, str] = {}
+
 
 def mark_session_running(sid: str) -> None:
     _RUNNING_SIDS.add(sid)
@@ -94,6 +99,20 @@ def clear_session_running(sid: str) -> None:
 
 def session_running(sid: str) -> bool:
     return sid in _RUNNING_SIDS
+
+
+def set_inflight_question(sid: str, question: str) -> None:
+    if sid:
+        _INFLIGHT_QUESTIONS[sid] = question or ""
+
+
+def clear_inflight_question(sid: str) -> None:
+    _INFLIGHT_QUESTIONS.pop(sid, None)
+
+
+def inflight_question(sid: str) -> str | None:
+    """本会话在飞轮的提问；无在飞轮返回 None。"""
+    return _INFLIGHT_QUESTIONS.get(sid) if session_running(sid) else None
 
 
 def get_store() -> pilot_session.SessionStore:
@@ -771,6 +790,18 @@ def _resume_note(resume: dict | None) -> dict | None:
     return {"role": "system", "content": "\n".join(lines)}
 
 
+def _settle_running_steps(phases: list[dict]) -> None:
+    """回合收口：未结算的运行态步骤统一归为 stopped 终态。
+
+    running 只允许在工具执行期存在于内存；任何被写进账本或随 done 下发的
+    phases，步骤必须全部为终态。"""
+    for phase in phases:
+        for s in phase.get("steps") or []:
+            if s.get("status") == "running":
+                s["status"] = "stopped"
+                s["data"] = {}
+
+
 async def _agent_stream(base: list[dict], state, question: str, appid: int | None, cfg: dict,
                         intent: str = pilot_intent.CHAT, resume: dict | None = None,
                         *, expanded: frozenset[str] | None = None,
@@ -791,8 +822,11 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
 
     label/status/data 由 tools.tool_step 产出（词条键片段 + 最小插值数据）；执行超
     tools.tool_budget_s 预算则取消并归因为 status=timeout，工具自身抛错归因为
-    status=failed（两类都回灌模型让它自愈，不吞掉整轮）；思考 / 前言 / 工具按步
-    归入 phase，done 事件携带全量 phases 与由它派生的 steps，前端历史轮按它还原时间线。"""
+    status=failed（两类都回灌模型让它自愈，不吞掉整轮）；tool_start 声明即在
+    phase.steps 记运行态占位，tool 结算原位回填，回合异常收场（取消 / 中断 / 报错）
+    时未结算占位统一收口为 status=stopped——落账或下发的 phases 不残留 running。
+    思考 / 前言 / 工具按步归入 phase，done 事件携带全量 phases 与由它派生的
+    steps，前端历史轮按它还原时间线。"""
     sys_prompt = await _build_system_prompt()
     system = [{"role": "system", "content": sys_prompt}]
     minimal = _minimal_base(state, question, appid, view_context, element_refs)
@@ -993,7 +1027,12 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
                 """工具结果结算（时间线 + 卡片裁决 + 回灌消息）——顺序/并行两路共用。"""
                 nonlocal last_game
                 step_data = pilot_tools.tool_step(t["name"], result)
-                phase["steps"].append(step_data)
+                # tool_start 已声明运行态占位，结算按声明序原位回填；无占位时兜底追加
+                pending = next((s for s in phase["steps"] if s.get("status") == "running"), None)
+                if pending is not None:
+                    pending.update(step_data)
+                else:
+                    phase["steps"].append(step_data)
                 tool_log.append(_tool_summary(t["name"], result))
                 yield {"type": "tool", "name": t["name"], "duration_ms": duration_ms, **step_data}
                 # card 结算帧：内部决策代理统一裁决是否下发可视化卡片
@@ -1058,6 +1097,7 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
                 for t in tool_calls:
                     tools_ran += 1
                     meta_label = pilot_tools.TOOL_META.get(t["name"], {}).get("label") or t["name"]
+                    phase["steps"].append({"label": meta_label, "status": "running", "data": {}})
                     yield {"type": "tool_start", "name": t["name"], "label": meta_label,
                            "card_kind": _stream_card_hint(t["name"], cards, arguments=t.get("arguments"),
                                                           question=question, recent_cards=recent_cards)}
@@ -1112,6 +1152,7 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
             for t in tool_calls:
                 tools_ran += 1
                 meta_label = pilot_tools.TOOL_META.get(t["name"], {}).get("label") or t["name"]
+                phase["steps"].append({"label": meta_label, "status": "running", "data": {}})
                 yield {"type": "tool_start", "name": t["name"], "label": meta_label,
                        "card_kind": _stream_card_hint(t["name"], cards, arguments=t.get("arguments"),
                                                       question=question, recent_cards=recent_cards)}
@@ -1152,6 +1193,9 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
         # 流被中断（客户端断开 / 服务端取消）时在飞工具一并取消，不留后台孤儿
         if inflight is not None and not inflight.done():
             inflight.cancel()
+        # 回合收口：未结算步骤统一归为 stopped（正常轮全部已结算，此处为恒等操作；
+        # 异常 / 取消路径经此收口后 phases 不残留 running，取消异常照常上抛不吞）
+        _settle_running_steps(phases)
         await client.aclose()
 
     _think_close()

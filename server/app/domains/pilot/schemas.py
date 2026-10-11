@@ -388,6 +388,9 @@ class PilotSessionOut(BaseModel):
     """归档标记（账本事实）。"""
     forked_from: str | None = None
     """分叉溯源：本会话派生自哪个会话（fork 记录）；非派生会话为 null。"""
+    inflight_q: str | None = None
+    """在飞轮的提问原文（进程内存态，不落账本）；无在飞轮为 null。
+    前端据此在刷新/重开表面后仍显示进行中那一轮，而不是空窗。"""
 
 
 class ToolRunRequest(BaseModel):
