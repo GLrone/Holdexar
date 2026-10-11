@@ -453,3 +453,61 @@ async def test_rebind_restores_missing_source_rows(env):
         sources = list((await s.execute(select(ProxyNodeSource))).scalars())
     assert len(sources) == 1
     assert sources[0].source_code == f"sd{sub_id}"
+
+
+@pytest.mark.asyncio
+async def test_purge_orphan_subscription_sources(env):
+    """指向已删除订阅的来源行/快照行清掉；来源全失的节点按状态机降级；
+    仍被现存订阅提供的共享节点不动。"""
+    await init_db()
+    seen = NOW
+    async with get_session_factory()() as s:
+        s.add(ProxySubscription(kind="clash", url="", label="live",
+                                admission_status="ACTIVE"))
+        await s.commit()
+    async with get_session_factory()() as s:
+        live_id = int((await s.execute(select(ProxySubscription.id))).scalar_one())
+        orphan_id = live_id + 999  # 无订阅行的失主编号
+
+        def _node(node_id: str) -> ProxyNode:
+            return ProxyNode(
+                node_id=node_id, fingerprint=node_id, runtime_name=f"1|{node_id}",
+                proxy_type="http", server="10.0.0.1",
+                normalized_config={"name": node_id, "type": "http",
+                                   "server": "10.0.0.1", "port": 1},
+                state="ACTIVE", first_seen=seen, last_seen=seen, last_source_seen=seen,
+            )
+
+        s.add_all([_node("orphan-only"), _node("shared")])
+        s.add_all([
+            ProxyNodeSource(node_id="orphan-only", subscription_id=orphan_id,
+                            original_name="orphan-only", first_seen=seen, last_seen=seen),
+            ProxyNodeSource(node_id="shared", subscription_id=orphan_id,
+                            original_name="shared", first_seen=seen, last_seen=seen),
+            ProxyNodeSource(node_id="shared", subscription_id=live_id,
+                            original_name="shared", first_seen=seen, last_seen=seen),
+        ])
+        s.add(SubscriptionSnapshot(
+            subscription_id=orphan_id, sha256="sha-orphan", format="yaml",
+            raw_path="orphan.bin", node_count=1, status="OK", fetched_at=seen, url="",
+        ))
+        await s.commit()
+
+    async with get_session_factory()() as s:
+        purged = await B.purge_orphan_subscription_sources(s, now=seen)
+        await s.commit()
+
+    assert purged == (orphan_id,)
+    async with get_session_factory()() as s:
+        sources = list((await s.execute(select(ProxyNodeSource))).scalars())
+        snaps = list((await s.execute(select(SubscriptionSnapshot))).scalars())
+        states = dict((await s.execute(
+            select(ProxyNode.node_id, ProxyNode.state))).all())
+    assert {src.subscription_id for src in sources} == {live_id}
+    assert snaps == [], "失主订阅的快照行随清扫走（retention 的每订阅保底留不住孤儿）"
+    assert states["orphan-only"] == "STALE", "来源全失的节点不得永远 ACTIVE"
+    assert states["shared"] == "ACTIVE"
+
+    async with get_session_factory()() as s:
+        again = await B.purge_orphan_subscription_sources(s, now=seen)
+    assert again == (), "幂等：清完即空转"

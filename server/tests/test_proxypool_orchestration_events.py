@@ -177,7 +177,9 @@ async def test_exit_writes_event_and_idempotent_second_call_writes_nothing(env, 
 
     rows = await _events(events.KIND_SUBSCRIPTION_EXITED)
     assert len(rows) == 1
-    assert rows[0].payload_json == {"subscriptionId": a, "removedSources": 1}
+    assert rows[0].payload_json == {
+        "subscriptionId": a, "removedSources": 1, "degradedNodes": 1,
+    }
     assert rows[0].level == events.LEVEL_WARN
 
     # 幂等空转：本来就不在池里 → 不写第二行（同一生命周期只有一次退出）

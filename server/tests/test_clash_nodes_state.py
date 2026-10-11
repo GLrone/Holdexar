@@ -21,26 +21,10 @@ from app.domains.proxies.models import ClashNode, ProxySubscription
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    import app.core.database as database_module
+def db():
+    from app.core.database import get_session_factory
 
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(proxies_service, "get_session_factory", lambda: factory)
-    return factory
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    import app.domains.proxies.models  # noqa: F401
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
+    return get_session_factory()
 async def _seed_sub(db, kind="clash") -> int:
     async with db() as session:
         sub = ProxySubscription(kind=kind, url="https://example.com/sub")
@@ -304,7 +288,6 @@ async def test_clash_nodes_waits_for_shared_lock(db, monkeypatch):
 
     with pytest.raises(ValueError, match="Clash 未运行"):
         await task  # 锁释放后放行，进入函数体立即因未运行报错
-
 
 
 # ─── 检测会话（后台执行 + 进度快照）─────────────────────────

@@ -20,7 +20,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domains.proxies.models import ClashNode
@@ -29,6 +29,7 @@ from app.domains.proxypool.models import (
     HealthObservation,
     ProxyNode,
     ProxyNodeSource,
+    SubscriptionSnapshot,
     is_info_placeholder,
     subscription_code,
 )
@@ -378,3 +379,46 @@ async def rebind_missing_sources(
         await apply_snapshot(session, subscription_id=int(sub.id), snapshot=snap, now=now)
         repaired.append(int(sub.id))
     return tuple(repaired)
+
+
+async def purge_orphan_subscription_sources(
+    session: AsyncSession, *, now: datetime, max_subs: int = 8
+) -> tuple[int, ...]:
+    """清理指向已不存在订阅的来源关联与快照行（级联断账的存量自愈）。
+
+    订阅删除级联生效前的存量：来源行还挂着已删除的订阅号，池合格判定把它们
+    当「仍被提供」——只由已删订阅提供的健康节点因此一直占运行位。这是
+    `rebind_missing_sources` 相对的另一侧修复（那边给现存订阅补缺失来源，
+    这边删失主来源）：删来源行 + 快照行，来源全部流失的节点按注册表同一条
+    收尾规则向状态机要判定（快照行随订阅走，retention 的「每订阅最新 3 条
+    永不删」会把孤儿快照永远留住）。只 flush，不 commit。
+    """
+    from app.domains.proxies.models import ProxySubscription
+    from app.domains.proxypool.registry import (
+        lock_subscription_mutation,
+        settle_nodes_after_source_change,
+    )
+
+    orphan_ids = list(await session.scalars(
+        select(ProxyNodeSource.subscription_id)
+        .where(ProxyNodeSource.subscription_id.not_in(select(ProxySubscription.id)))
+        .distinct()
+    ))
+    purged: list[int] = []
+    for sub_id in orphan_ids[: max(1, int(max_subs))]:
+        await lock_subscription_mutation(session, int(sub_id))
+        node_ids = set(await session.scalars(
+            select(ProxyNodeSource.node_id)
+            .where(ProxyNodeSource.subscription_id == int(sub_id))
+        ))
+        await session.execute(
+            delete(ProxyNodeSource)
+            .where(ProxyNodeSource.subscription_id == int(sub_id))
+        )
+        await session.execute(
+            delete(SubscriptionSnapshot)
+            .where(SubscriptionSnapshot.subscription_id == int(sub_id))
+        )
+        await settle_nodes_after_source_change(session, node_ids, now=now)
+        purged.append(int(sub_id))
+    return tuple(purged)

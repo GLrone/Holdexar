@@ -52,7 +52,7 @@ async def promote_subscription(subscription_id: int):
     """
     from app.domains.proxypool.admission import PromotionError, promote_to_active
 
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         try:
             result = await promote_to_active(
                 session,
@@ -96,9 +96,11 @@ async def exit_subscription(subscription_id: int):
     """
     from app.domains.proxypool.admission import PromotionError, exit_from_production
 
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         try:
-            result = await exit_from_production(session, subscription_id=subscription_id)
+            result = await exit_from_production(
+                session, subscription_id=subscription_id, now=datetime.now()
+            )
             await session.commit()
         except PromotionError as e:
             await session.rollback()
@@ -113,6 +115,7 @@ async def exit_subscription(subscription_id: int):
             payload={
                 "subscriptionId": result.subscription_id,
                 "removedSources": result.removed_sources,
+                "degradedNodes": result.degraded_nodes,
             },
         )
     return {
@@ -120,5 +123,6 @@ async def exit_subscription(subscription_id: int):
         "exited": result.exited,
         "detail": result.detail,
         "removedSources": result.removed_sources,
+        "degradedNodes": result.degraded_nodes,
         "admissionStatus": "CANDIDATE",
     }

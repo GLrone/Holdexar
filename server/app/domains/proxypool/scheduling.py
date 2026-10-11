@@ -32,7 +32,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import WritePriority, write_gate
 from app.core.logging import log_event
 from app.crawler.occupancy import crawler_busy
-from app.domains.proxypool.bridge import ingest_ledger, rebind_missing_sources
+from app.domains.proxypool.bridge import (
+    ingest_ledger,
+    purge_orphan_subscription_sources,
+    rebind_missing_sources,
+)
 from app.domains.proxypool.exits import exit_snapshot, select_exit_slots, slot_signature
 from app.domains.proxypool.health import (
     DEFAULT_BUSINESS_APPID,
@@ -74,9 +78,10 @@ STARTUP_L1_BUDGET_SECONDS = 240.0
 
 # rebuild 跨调用方互斥：take_rebuild_pending 的消费原子只保「取」不保「做」——
 # take 与 rebuild_runtime 之间的 await 窗口里新置位的 pending 会让第二个调用方
-# 也进入重建（双内核 stop/start）。获取顺序必须**先写闸后本锁**：锁内段含
-# events.record 的独立写闸（orchestration.record），反序会与「持闸等锁」的调用方
-# 形成闸↔锁 AB-BA 死锁；写闸对本链既有持闸调用方按重入放行。
+# 也进入重建（双内核 stop/start）。全部入口（启动链两处 / 周期 job / bootstrap）
+# 均不持写闸进入，锁内只有读取与 events.record 的独立短写闸——闸↔锁只有
+# 「锁内取闸」单向序，AB-BA 不可能。重建本体对 session 零写入（Registry 写入
+# 归订阅同步段），持闸横跨整段会把全体写者饿死在写者位上。
 _rebuild_lock = asyncio.Lock()
 
 _pending = False
@@ -202,6 +207,16 @@ async def run_l0_cycle(
     # autoflush 到闸外。
     async with write_gate(WritePriority.BACKGROUND):
         try:
+            # 先删失主来源（指向已删除订阅的残留，存量自愈），再补缺失来源：
+            # 两侧都是「来源=当前事实」的对齐，语义相反、互为兜底。
+            purged = await purge_orphan_subscription_sources(session, now=now)
+            if purged:
+                log_event(
+                    logger,
+                    f"已清理 {len(purged)} 条已删订阅的残留来源关联",
+                    tag="已修复",
+                    detail={"订阅编号": "、".join(str(i) for i in purged)},
+                )
             repaired = await rebind_missing_sources(session, now=now)
             if repaired:
                 log_event(
@@ -312,7 +327,9 @@ async def _maintenance_probe(
     exits_before = await exit_snapshot(session)
     # 每个探针各自兜异常：探针的程序异常不得逃出维护事务——那会跳过收尾提交，
     # 把本轮已写好的遥测留在未提交事务里。异常只记日志、该层本轮无结果（空
-    # tuple），不改分类、不伪装成功；已提交的观测不受影响。
+    # tuple），不改分类、不伪装成功；已提交的观测不受影响。失败证据同时写进
+    # run 行（end_reason），空轮与真·空池在台账上可区分。
+    probe_errors: list[str] = []
     try:
         l1 = await exit_ip_check_pool(
             session, data_dir=data_dir, controller_url=controller_url, secret=secret,
@@ -324,7 +341,9 @@ async def _maintenance_probe(
             "出口身份探针程序异常，本轮无出口身份结果",
             level=logging.ERROR,
             exc_info=True,
+            detail={"run_id": run.id},
         )
+        probe_errors.append("l1_error")
         l1 = ()
     try:
         l2 = await business_check_pool(
@@ -337,13 +356,16 @@ async def _maintenance_probe(
             "业务可用性探针程序异常，本轮无业务可用性结果",
             level=logging.ERROR,
             exc_info=True,
+            detail={"run_id": run.id},
         )
+        probe_errors.append("l2_error")
         l2 = ()
     run.total = len(l2)
     run.steam_ok = sum(1 for o in l2 if getattr(o, "ok", False))
     run.ip_known = sum(1 for o in l1
                        if getattr(o, "ok", False) and getattr(o, "exit_ip", None))
     run.failed = run.total - run.steam_ok
+    run.end_reason = ",".join(probe_errors) or None
     run.finished_at = datetime.now()
     run.duration_ms = int((run.finished_at - run.started_at).total_seconds() * 1000)
     # 收尾提交放在恢复 GLOBAL（网络调用）之前：节点状态与观测此时已齐，
@@ -383,7 +405,7 @@ async def _rebuild_skip_reason(session: AsyncSession, *, data_dir: Path) -> str 
       等订阅恢复才是对的。池文件与合格集在此刻允许不一致。
 
     Runtime 不可达时**不跳过**（返回 `None`）：重建也是"内核掉了把它拉起来"的
-    恢复路径。闸内任何读取异常一律放行重建（宁多动一次，不漏一次真重建）。
+    恢复路径。锁内任何读取异常一律放行重建（宁多动一次，不漏一次真重建）。
     """
     try:
         alive = current_runtime_proxy_url(data_dir) is not None
@@ -411,7 +433,7 @@ async def _rebuild_skip_reason(session: AsyncSession, *, data_dir: Path) -> str 
         if alive:
             return "池与 lane 计划均与现状一致：重建无目标差异"
         return None
-    except Exception:  # noqa: BLE001 —— 闸 itself 故障时放行重建，不拦真需求
+    except Exception:  # noqa: BLE001 —— 必要性检查自身故障时放行重建，不拦真需求
         log_event(
             logger,
             "重建必要性检查读取异常，本次仍执行重建",
@@ -438,29 +460,29 @@ async def run_pending_rebuild(
     Runtime 还活着 → 跳过并返回 `None`；重建生效优先走热重载通道（见
     `rebuild_runtime`），失败自动回退进程重启。
 
-    全段持写闸 + `_rebuild_lock`：重建是内核生命周期操作（stop/start）且
-    `rebuild_runtime` 事件留痕自带独立写闸，跨调用方（启动链 / 周期 job /
-    bootstrap）同一时刻只允许一个重建在执行。
+    只持 `_rebuild_lock`，**不持写闸**：重建本体是文件渲染 + 内核生命周期操作
+    （热重载 / stop/start）+ HTTP 等待，对 session 零写入；事件留痕走
+    orchestration.record 的独立短写闸。重建段整段持闸会把交互写饿死在
+    写者位上——网络与内核操作禁止进闸（写事务纪律第 1 条）。
     """
     if crawler_busy():
         return None
-    async with write_gate(WritePriority.BACKGROUND):
-        async with _rebuild_lock:
-            if not take_rebuild_pending():
-                return None
-            skip = await _rebuild_skip_reason(session, data_dir=data_dir)
-            if skip is not None:
-                log_event(
-                    logger,
-                    "本次重建无需执行，已跳过",
-                    tag="跳过",
-                    detail={"原因": skip},
-                )
-                return None
-            return await rebuild_runtime(
-                session, data_dir=data_dir, controller_url=controller_url, secret=secret,
-                runtime=runtime, exe_path=exe_path,
+    async with _rebuild_lock:
+        if not take_rebuild_pending():
+            return None
+        skip = await _rebuild_skip_reason(session, data_dir=data_dir)
+        if skip is not None:
+            log_event(
+                logger,
+                "本次重建无需执行，已跳过",
+                tag="跳过",
+                detail={"原因": skip},
             )
+            return None
+        return await rebuild_runtime(
+            session, data_dir=data_dir, controller_url=controller_url, secret=secret,
+            runtime=runtime, exe_path=exe_path,
+        )
 
 
 @dataclass(frozen=True)

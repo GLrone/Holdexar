@@ -93,7 +93,43 @@ def _render_proxies(nodes: Sequence[ProxyNode]) -> list[dict]:
         payload = dict(node.normalized_config)
         payload["name"] = node.runtime_name
         proxies.append(payload)
+    _resolve_dialer_refs(proxies)
     return proxies
+
+
+def _resolve_dialer_refs(proxies: list[dict]) -> None:
+    """就地改写 `dialer-proxy`：订阅原名 → 池内真实条目名，映射不到则剥离。
+
+    条目名由 `make_runtime_name` 铸成 `<订阅>|原名`，而订阅下发来的
+    `dialer-proxy` 值仍是**未加前缀的原名**。渲染若只覆盖 name 不动引用，
+    内核 `-t` 校验会以 `dialer-proxy [原名] not found` 拒配——整池起不来，
+    价格/抓取链全部被闸在门外。这里按同一订阅前缀回填；目标不在本次渲染集
+    （未入选或已退役）时剥离该字段——留悬空引用等于把一次订阅改名变成下次
+    启动的拒配。
+    """
+    known = {str(p["name"]) for p in proxies}
+    for payload in proxies:
+        raw = payload.get("dialer-proxy")
+        if not raw:
+            continue
+        name = str(payload.get("name") or "")
+        prefix, _, _ = name.partition("|")
+        resolved = ""
+        if prefix and "|" in name:
+            base = f"{prefix}|{raw}"
+            if base in known:
+                resolved = base
+            else:
+                # 同订阅撞名：make_runtime_name 追加 #2 #3…
+                for suffix in range(2, 10):
+                    alias = f"{base}#{suffix}"
+                    if alias in known:
+                        resolved = alias
+                        break
+        if resolved:
+            payload["dialer-proxy"] = resolved
+        else:
+            payload.pop("dialer-proxy", None)
 
 
 def render_pool(nodes: Sequence[ProxyNode]) -> tuple[str, tuple[str, ...]]:
