@@ -24,6 +24,8 @@ from app.core.backup import (
     list_backups as list_backups_impl,
     restore_backup as restore_backup_impl,
     verify_backup as verify_backup_impl,
+    compact_main_db as compact_main_db_impl,
+    remove_archive,
     safe_backup_path,
     backup_dir,
 )
@@ -79,28 +81,39 @@ class LegacyImport(BaseModel):
     path: str  # 旧爬虫 steam-price.db 路径
 
 
+def _fetch_legacy_snapshot(src: Path) -> tuple[list[sqlite3.Row], list[sqlite3.Row], int]:
+    """旧库整表读取：steam_games 全表 + steam_prices 每 (appid, 区服) 最新一条
+    （同快照时刻按行序取最后一条）。"""
+    conn = sqlite3.connect(str(src))
+    conn.row_factory = sqlite3.Row
+    try:
+        games = conn.execute("SELECT appid, name FROM steam_games").fetchall()
+        total = conn.execute("SELECT COUNT(*) FROM steam_prices").fetchone()[0]
+        prices = conn.execute(
+            "SELECT appid, region_code, currency, price, original_price, "
+            "discount_percent, sub_id, is_gold, version_suffix, price_status, crawled_at "
+            "FROM (SELECT *, ROW_NUMBER() OVER ("
+            "PARTITION BY appid, upper(region_code) "
+            "ORDER BY crawled_at DESC, rowid DESC) AS rn FROM steam_prices) "
+            "WHERE rn = 1"
+        ).fetchall()
+    finally:
+        conn.close()
+    return games, prices, total
+
+
 @router.post("/import-legacy")
 async def import_legacy(req: LegacyImport) -> dict:
     """从旧爬虫 SQLite（steam_games / steam_prices）导入最新快照。
 
-    current 表并入 (appid, region) 最新快照；history 整段追加。
-    同步阻塞操作，FastAPI 线程池执行。
+    current 表并入每 (appid, region) 的最新快照，history 落同一条；
+    旧库整表读取在线程池执行，不占事件循环。
     """
     src = Path(req.path)
     if not src.is_file():
         raise HTTPException(status_code=404, detail=f"文件不存在: {src}")
 
-    conn = sqlite3.connect(str(src))
-    conn.row_factory = sqlite3.Row
-    try:
-        games = conn.execute("SELECT appid, name FROM steam_games").fetchall()
-        prices = conn.execute(
-            "SELECT appid, region_code, currency, price, original_price, "
-            "discount_percent, sub_id, is_gold, version_suffix, price_status, crawled_at "
-            "FROM steam_prices ORDER BY crawled_at ASC"
-        ).fetchall()
-    finally:
-        conn.close()
+    games, prices, prices_total = await asyncio.to_thread(_fetch_legacy_snapshot, src)
 
     games_upserted = 0
     async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
@@ -116,13 +129,10 @@ async def import_legacy(req: LegacyImport) -> dict:
             )
             games_upserted += 1
 
-        # 每个 (appid, region) 取最新一条写 current，全部追加 history
-        latest: dict[tuple[int, str], sqlite3.Row] = {}
+        # 每个 (appid, region) 的最新一条写 current，history 落同一条
         for row in prices:
-            key = (int(row["appid"]), row["region_code"].upper())
-            latest[key] = row  # ASC 排序，后者覆盖
-
-        for (appid, region), row in latest.items():
+            appid = int(row["appid"])
+            region = row["region_code"].upper()
             price = row["price"]
             status = row["price_status"] or "ok"
             # 从 history 重建属于人工修复动作：按快照状态补观察章
@@ -181,8 +191,8 @@ async def import_legacy(req: LegacyImport) -> dict:
 
     return {
         "games": games_upserted,
-        "priceRows": len(prices),
-        "currentUpserted": len(latest),
+        "priceRows": prices_total,
+        "currentUpserted": len(prices),
     }
 
 
@@ -310,6 +320,22 @@ async def backup_create(req: BackupCreate) -> dict:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/system/compact")
+async def compact_db() -> dict:
+    """回收空闲空间（原地收缩）：删数据/删索引留下的页在此真正归还文件系统。
+
+    收缩期间调度器与爬取暂停并断开所有连接（VACUUM 需独占库文件），大库是
+    分钟级；并发调用由维护锁挡住。
+    """
+    try:
+        stats = await compact_main_db_impl()
+    except sqlite3.OperationalError as e:
+        raise HTTPException(status_code=503, detail=f"有写入正在进行，请稍后重试（{e}）")
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, **stats}
+
+
 @router.get("/system/backup")
 async def backup_list() -> dict:
     return {"items": list_backups_impl()}
@@ -346,7 +372,7 @@ async def backup_delete(name: str) -> dict:
         raise HTTPException(status_code=400, detail=str(e))
     if not path.is_file():
         raise HTTPException(status_code=404, detail="备份不存在")
-    path.unlink()
+    remove_archive(path)
     return {"removed": True}
 
 
