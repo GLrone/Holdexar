@@ -55,10 +55,10 @@ async def update_account_kinds(steamid: str, req: AccountKinds):
 
 @router.delete("/accounts/{steamid}")
 async def remove_account(steamid: str):
-    removed = await service.remove_account(steamid)
-    if not removed:
+    receipt = await service.remove_account(steamid)
+    if receipt is None:
         raise HTTPException(status_code=404, detail="账户不存在")
-    return {"removed": True}
+    return {"removed": True, **receipt}
 
 
 @router.post("/accounts/{steamid}/sync")

@@ -43,3 +43,12 @@ async def claim_free(req: FreeClaimRequest):
 async def quota():
     """激活前提状态（Cookie 可用性）——前端激活前的引导提示。"""
     return await service.quota_status()
+
+
+@router.get("/activations")
+async def activations(limit: int = 50, offset: int = 0):
+    """激活历史（时间倒序分页；成功/已拥有/失败与免费领取都在内）。"""
+    try:
+        return await service.list_activations(limit=limit, offset=offset)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))

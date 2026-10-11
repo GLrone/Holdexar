@@ -525,7 +525,7 @@ def _egs_persisted_sync(operation: str, variables: dict, sha: str,
             separators=(",", ":"),
         ),
     })
-    req = urllib.request.Request(url, headers=_EGS_HEADERS)
+    req = urllib.request.Request(url, headers=STEAM_HTTP_HEADERS)
     try:
         with _urlopen(req, proxy, 25) as resp:
             if resp.status != 200:

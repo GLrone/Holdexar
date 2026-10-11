@@ -363,25 +363,30 @@ class StoreBrowseAPI:
     @staticmethod
     async def fetch_batch(
         context, appids: list[int], cc: str, lang: str, extras: bool = True
-    ) -> tuple[dict[int, dict | None], int]:
-        """一发批量。返回 ({appid: item|None}, 响应体字节数)。"""
+    ) -> tuple[dict[int, dict | None], set[int], int]:
+        """一发批量。返回 ({appid: item|None}, 缺失 appid 集, 响应体字节数)。"""
         url = StoreBrowseAPI.build_url(appids, cc, lang, extras)
         sized: list[int] = []
         data = await context.http_client.get_json(
             context.session, url, body_size_out=sized
         )
         store_items = ((data or {}).get("response") or {}).get("store_items") or []
-        return StoreBrowseAPI.map_items(store_items, appids), sized[0] if sized else 0
+        mapped, missing = StoreBrowseAPI.map_items(store_items, appids)
+        return mapped, missing, sized[0] if sized else 0
 
     @staticmethod
-    def map_items(items: list[dict], appids: list[int]) -> dict[int, dict | None]:
-        """条目 → {appid: item}。
+    def map_items(
+        items: list[dict], appids: list[int]
+    ) -> tuple[dict[int, dict | None], set[int]]:
+        """条目 → ({appid: item}, 缺失 appid 集)。
 
         坑：服务端对「未收录」条目回 appid=0（如 228980 Steamworks），按 appid
         映射会互相覆盖；发送前已去重，位置 1:1 才是唯一可靠映射，返回的 appid
-        只做校验（数量不符时降级为按 appid 映射）。
+        只做校验（数量不符时降级为按 appid 映射）。降级路径中响应没有答复的
+        appid 进缺失集——传输截断不是「该区不售」的答复，调用方按 missing 记账。
         """
         out: dict[int, dict | None] = {}
+        missing: set[int] = set()
         if len(items) == len(appids):
             for sent, it in zip(appids, items):
                 if not it.get("appid"):
@@ -405,9 +410,10 @@ class StoreBrowseAPI:
             for it in items:
                 if it.get("appid"):
                     out[int(it["appid"])] = it
+            missing = {int(a) for a in appids} - set(out)
         for a in appids:
             out.setdefault(int(a), None)
-        return out
+        return out, missing
 
     # ── 解析 ──
 
@@ -937,7 +943,7 @@ async def _browse_price_task_inner(context) -> bool:
 
     started = time.monotonic()
     try:
-        items, size = await StoreBrowseAPI.fetch_batch(
+        items, missing_ids, size = await StoreBrowseAPI.fetch_batch(
             context, appids, cc, "english", EXTRAS_ENABLED
         )
     except Exception as e:  # noqa: BLE001
@@ -1005,11 +1011,18 @@ async def _browse_price_task_inner(context) -> bool:
     # 这些陈欠行没有任何爬取路径会再写（跳过分支永不 bump），不清就是
     # 补抓通道每拍重拾的死账——统一收集，落库段一次性清除
     cleared_missing: list[tuple[int, str]] = []
+    # 传输截断的缺失条目（响应里没有该 appid 的答复）：按 missing 记账走补抓
+    # 通道，不当 locked 终态成功观察
+    truncated_missing: list[int] = []
 
     for idx, appid in enumerate(appids):
         if idx % 32 == 0:
             # 逐款判定/构建是纯 CPU 段：定期让出事件循环，抓取期间 HTTP/SSE 不被饿死
             await asyncio.sleep(0)
+        if appid in missing_ids:
+            truncated_missing.append(appid)
+            counts["missing"] += 1
+            continue
         meta = META.get(appid)
         keep = PRESERVED.get(appid)
 
@@ -1052,12 +1065,17 @@ async def _browse_price_task_inner(context) -> bool:
             continue
 
 
-        # 赠送态但响应里拿不到 0 价赠送选项（异常响应）→ 按 missing 记账自愈
+        # 赠送态但响应里拿不到 0 价赠送选项（异常响应）→ 不进批量写（批量写
+        # 会把 missing 行盖成成功章并抹掉 last good price），直接走欠账 bump
+        # 通道（failed 章 + fail_count 递增 + 保留价格三件套）
         if status == "free_promo" and not any(
             o.get("price_cents") == 0 and (o.get("original_cents") or 0) > 0
             for o in (opts or [])
         ):
-            status = "missing"
+            counts["missing"] += 1
+            if not DRY_RUN:
+                await context.db_writer.mark_region_status(appid, cc, "missing")
+            continue
 
         if status == "ok" and opts:
             # 标准版候选只收「包」，bundle 选项仅在「该区一个包都没有」时才顶上。
@@ -1218,6 +1236,8 @@ async def _browse_price_task_inner(context) -> bool:
 
     if cleared_missing and not DRY_RUN:
         await context.db_writer.clear_missing_regions(cleared_missing)
+    if truncated_missing and not DRY_RUN:
+        await _mark_missing_async(context.db_writer, truncated_missing, cc)
 
     log_event(
         logger,

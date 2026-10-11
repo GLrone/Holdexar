@@ -234,25 +234,62 @@ def _write_snapshot(lang: str, raw: str) -> None:
         )
 
 
+# 回贴水位 KV：每窗口已回贴推进到的时刻，与该窗回贴同事务落位（断点续跑
+# 形态同 seed.history_progress）；键缺失的窗口（首次 / 日历新增活动）全窗口回贴
+_BACKFILL_WATERMARK_KEY = "steam_events.backfill_watermark"
+# 水位回看余量：吸收写库与回贴两侧时钟的偏差，多扫段由 NULL 条件幂等兜底
+_BACKFILL_WATERMARK_MARGIN = timedelta(hours=1)
+
+
 async def _backfill_price_history(rows: list[dict]) -> int:
-    """按活动窗口回贴价格观测行的周期标签（只补 NULL 行，幂等）。"""
+    """按活动窗口回贴价格观测行的周期标签（只补 NULL 行，幂等）。
+
+    逐窗短事务：一窗一闸一提交，段间交还写者位；窗口水位 KV 与回贴同事务
+    落位，已有水位的窗口只扫水位以上增量（snapshot_at 索引范围）。"""
+    from app.domains.settings.models import AppSetting
+    from app.domains.settings.service import get_value
+
     total = 0
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
-        for row in rows:
-            window_start = f"{row['start_date'].isoformat()} 00:00:00"
-            window_end = (
-                f"{(row['end_date'] + timedelta(days=1)).isoformat()} 00:00:00"
-            )
-            result = await session.execute(
-                text(
-                    "UPDATE game_price_history SET steam_event_key = :key "
-                    "WHERE steam_event_key IS NULL "
-                    "AND snapshot_at >= :ws AND snapshot_at < :we"
-                ),
-                {"key": row["event_key"], "ws": window_start, "we": window_end},
-            )
+    marks = await get_value(_BACKFILL_WATERMARK_KEY)
+    if not isinstance(marks, dict):
+        marks = {}
+    stamped = (_now() - _BACKFILL_WATERMARK_MARGIN).isoformat(sep=" ")
+    for row in rows:
+        key = row["event_key"]
+        window_start = f"{row['start_date'].isoformat()} 00:00:00"
+        window_end = (
+            f"{(row['end_date'] + timedelta(days=1)).isoformat()} 00:00:00"
+        )
+        sql = (
+            "UPDATE game_price_history SET steam_event_key = :key "
+            "WHERE steam_event_key IS NULL "
+            "AND snapshot_at >= :ws AND snapshot_at < :we"
+        )
+        params: dict = {"key": key, "ws": window_start, "we": window_end}
+        watermark = marks.get(key)
+        if isinstance(watermark, str):
+            sql += " AND snapshot_at >= :wm"
+            params["wm"] = watermark
+        async with write_gate(
+            WritePriority.BACKGROUND, label="steam_event_backfill"
+        ), get_session_factory()() as session:
+            result = await session.execute(text(sql), params)
             total += result.rowcount or 0
-        await session.commit()
+            marks[key] = stamped
+            stmt = sqlite_insert(AppSetting).values(
+                key=_BACKFILL_WATERMARK_KEY, value_json=marks,
+                updated_at=get_beijing_time_obj().replace(tzinfo=None),
+            )
+            await session.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=[AppSetting.key],
+                    set_={
+                        "value_json": stmt.excluded.value_json,
+                        "updated_at": stmt.excluded.updated_at,
+                    },
+                )
+            )
+            await session.commit()
     return total
 
 

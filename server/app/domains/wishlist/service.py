@@ -21,7 +21,7 @@ import logging
 from datetime import datetime
 
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
@@ -416,21 +416,81 @@ async def add_account(steamid_or_vanity: str, label: str = "", kinds: dict | Non
     return {"steamid": steamid, "friendCode": friend_code(steamid)}
 
 
-async def remove_account(steamid: str) -> bool:
+async def remove_account(steamid: str) -> dict | None:
+    """解绑账户并回收派生监控来源，返回回执；账户不存在返回 None。
+
+    wishlist_items 是派生来源的单一真相源：删除账户来源数据后按现状重算
+    该账户条目的派生来源（其余账户仍持有的保留；favorite / manual / board
+    等非派生来源不动；失去全部来源的对象退出监控），并顺带回收历史解绑
+    遗留的孤儿派生来源。
+    """
     async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         account = await session.get(TrackedAccount, steamid)
         if account is None:
-            return False
+            return None
+        appids = [
+            int(r[0])
+            for r in (
+                await session.execute(
+                    select(WishlistItem.appid).where(WishlistItem.steamid == steamid)
+                )
+            ).all()
+        ]
         await session.delete(account)
-        items = (
-            await session.execute(
-                select(WishlistItem).where(WishlistItem.steamid == steamid)
-            )
-        ).scalars().all()
-        for it in items:
-            await session.delete(it)
+        await session.execute(delete(WishlistItem).where(WishlistItem.steamid == steamid))
         await session.commit()
-    return True
+
+    released, reconciled = await _release_account_sources(appids)
+    log_event(
+        logger,
+        "已解绑 Steam 账户",
+        tag="成功",
+        detail={"账号": steamid, "条目移除": len(appids), "监控回收": released},
+    )
+    return {
+        "steamid": steamid,
+        "itemsRemoved": len(appids),
+        "poolReleased": released,
+        "reconciled": reconciled,
+    }
+
+
+async def _release_account_sources(appids: list[int]) -> tuple[int, bool]:
+    """解绑后按现状重算派生监控来源并回收孤儿来源。
+
+    返回 (退出监控的对象数, 是否对账成功)；失败只记日志——账户解绑主链
+    已落库，监控层异常不回滚解绑（与 `_sync_monitoring` 同口径）。
+    """
+    released = 0
+    try:
+        from app.domains.monitoring import service as monitoring_service
+
+        if appids:
+            before = await monitoring_service.states_of("game", appids)
+            after = await monitoring_service.sync_game_sources(appids)
+            released = sum(
+                1
+                for a, state in after.items()
+                if before.get(a) == monitoring_service.STATE_ACTIVE
+                and state == monitoring_service.STATE_RELEASED
+            )
+        released += await monitoring_service.recycle_orphan_game_sources()
+        return released, True
+    except Exception:  # noqa: BLE001
+        log_event(
+            logger,
+            "解绑后监控来源回收未完成，监控池暂留旧条目",
+            detail={"项数": len(appids)},
+            level=logging.ERROR,
+            exc_info=True,
+        )
+        return released, False
+
+
+# 同账号在飞哨兵（进程内）：定时 / 手动 / 绑定后三入口并发触发同一账号时，
+# 后到者直接返回进行中——基线读跨网络取数窗后落库，双开会让后提交者撞
+# wishlist_items 主键整轮回滚
+_inflight: dict[str, asyncio.Task] = {}
 
 
 async def sync_account(steamid: str, auto_crawl: bool = True) -> dict:
@@ -439,7 +499,37 @@ async def sync_account(steamid: str, auto_crawl: bool = True) -> dict:
     已购拉取可按账户关闭（kinds.owned，任务页·已购游戏抓取·账户设置）：
     关闭后不再覆写 owned 标记，已有已购条目回落为愿望单条目。
     新增条目在 auto_crawl=True 且无任务运行时自动触发爬取。
+    同账号已在飞时直接返回 {"inflight": True}，不重复拉取。
     """
+    task = asyncio.current_task()
+    assert task is not None
+    inflight = _inflight.get(steamid)
+    if inflight is not None and not inflight.done():
+        log_event(
+            logger,
+            "同账号同步已在进行中，本次触发跳过",
+            detail={"账号": steamid},
+        )
+        return {
+            "steamid": steamid,
+            "inflight": True,
+            "wishlistCount": 0,
+            "ownedCount": 0,
+            "added": 0,
+            "addedOwned": 0,
+            "active": 0,
+            "newAppids": [],
+            "newOwnedAppids": [],
+        }
+    _inflight[steamid] = task
+    try:
+        return await _sync_account_inflight(steamid, auto_crawl)
+    finally:
+        if _inflight.get(steamid) is task:
+            _inflight.pop(steamid, None)
+
+
+async def _sync_account_inflight(steamid: str, auto_crawl: bool) -> dict:
     # 取数段（无写闸）：账号校验 + 三路网络拉取 + 基线读，全部不持写者位
     async with get_session_factory()() as session:
         account = await session.get(TrackedAccount, steamid)

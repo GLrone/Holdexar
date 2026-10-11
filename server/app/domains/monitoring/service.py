@@ -690,11 +690,54 @@ async def sync_game_sources(appids: list[int]) -> dict[int, str]:
     return await sync_sources(TARGET_GAME, desired, managed=DERIVED_SOURCES)
 
 
+async def recycle_orphan_game_sources() -> int:
+    """回收孤儿账号派生来源：active 派生来源已无任何 active wishlist_items
+    行支撑的（账户已解绑 / 历史解绑遗留），按空集重算停用。
+
+    复用 `sync_sources`（managed=DERIVED_SOURCES）：用户显式来源
+    （favorite / manual / board）不动，失去全部来源的对象转 released。
+    返回因回收而退出监控（active → released）的对象数。
+    """
+    from app.domains.wishlist.models import WishlistItem
+
+    async with get_session_factory()() as session:
+        orphan_ids = [
+            int(a)
+            for a in (
+                await session.execute(
+                    select(MonitorSource.target_id)
+                    .where(
+                        MonitorSource.target_type == TARGET_GAME,
+                        MonitorSource.source.in_(DERIVED_SOURCES),
+                        MonitorSource.active.is_(True),
+                        MonitorSource.target_id.not_in(
+                            select(WishlistItem.appid).where(
+                                WishlistItem.active.is_(True)
+                            )
+                        ),
+                    )
+                    .distinct()
+                )
+            ).scalars().all()
+        ]
+    if not orphan_ids:
+        return 0
+    before = await states_of(TARGET_GAME, orphan_ids)
+    await sync_sources(TARGET_GAME, {a: set() for a in orphan_ids}, managed=DERIVED_SOURCES)
+    after = await states_of(TARGET_GAME, orphan_ids)
+    return sum(
+        1
+        for a in orphan_ids
+        if before.get(a) == STATE_ACTIVE and after.get(a) == STATE_RELEASED
+    )
+
+
 async def sync_all_game_sources() -> int:
-    """全库对账：wishlist_items 里出现过的 appid 全部重算一遍。
+    """全库对账：wishlist_items 里出现过的 appid 全部重算一遍 + 孤儿派生来源回收。
 
     兜底入口（迁移漏跑或监控表被清空的库按需手工调用）；账号同步与池内增删
-    走 `sync_game_sources` 按 appid 增量对账。
+    走 `sync_game_sources` 按 appid 增量对账，解绑流程走精准对账 +
+    `recycle_orphan_game_sources`。返回重算 appid 数与回收对象数之和。
     """
     from app.domains.wishlist.models import WishlistItem
 
@@ -705,10 +748,10 @@ async def sync_all_game_sources() -> int:
                 await session.execute(select(WishlistItem.appid).distinct())
             ).scalars().all()
         ]
-    if not appids:
-        return 0
-    await sync_game_sources(appids)
-    return len(appids)
+    recycled = await recycle_orphan_game_sources()
+    if appids:
+        await sync_game_sources(appids)
+    return len(appids) + recycled
 
 
 # ── 统计（运行验证用）────────────────────────────────────────

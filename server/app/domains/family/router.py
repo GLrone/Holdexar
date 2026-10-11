@@ -55,6 +55,33 @@ async def status():
     return await service.get_status()
 
 
+class AddMemberPayload(BaseModel):
+    steamid: str
+    personaName: str = ""
+    avatarUrl: str = ""
+    groupSteamid: str | None = None  # 成员条目落哪条组账（缺省主账号）
+
+
+@router.post("/members")
+async def add_member(req: AddMemberPayload):
+    """手动添加家庭成员（manual 条目落 members_json，家庭页列表唯一事实源）。"""
+    try:
+        return await service.add_family_member(
+            req.steamid, req.personaName, req.avatarUrl, req.groupSteamid
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/members/{steamid}")
+async def remove_member(steamid: str, group_steamid: str | None = None):
+    """移除家庭成员：manual 删条目；Steam 成员落持久排除标记（同步不复活）。"""
+    try:
+        return await service.remove_family_member(steamid, group_steamid)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 class MemberRegionsPayload(BaseModel):
     regions: dict[str, str]  # {steamid: region_code}；空值键 = 清除该成员覆盖
 

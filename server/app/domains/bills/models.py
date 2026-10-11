@@ -89,7 +89,11 @@ class BillTopupTx(Base):
 
 
 class BillCdkGame(Base):
-    """零售 CDK / 礼物 / 免费入库（账单无金额，手动计价 fen 列；free 只展示不计价）。"""
+    """零售 CDK / 礼物 / 免费入库（账单无金额，手动计价 fen 列；free 只展示不计价）。
+
+    本表是「许可归属」账（账单导入侧的库存事实）；激活动作的事件留痕在
+    redeem 域 redeem_activations（激活事件账），两者分工不同、互不回写。
+    """
 
     __tablename__ = "bill_cdk_games"
     __table_args__ = (Index("ix_bcg_import_acq", "import_id", "acq"),)
