@@ -2,9 +2,22 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 
 import { crawlApi } from '@/api/client'
+import { message } from '@/components/ui'
+import { beginTask, endTask, updateTask } from '@/components/ui/island'
 import { CYCLE_ACTIVE } from '@/lib/headerStatus'
+import { useI18n } from '@/locales'
 
 import { nextPriceCycle, type PriceCycleMark } from '@/lib/priceRefresh'
+
+/** 体检/重建进行中的前端状态：kind + 两层已探测计数（累计口径）。 */
+interface MaintenanceState {
+  kind: string
+  probedL1: number
+  probedL2: number
+}
+
+/** 灵动岛长任务注册键：体检跨页存活，进行中不自动消失 */
+const MAINTENANCE_TASK_KEY = 'pool-maintenance'
 
 /** 爬取状态（SSE 驱动）：顶栏胶囊 + 爬取任务页共用。 */
 export const useCrawlStatusStore = defineStore('crawlStatus', () => {
@@ -23,6 +36,17 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
   const total = ref(0)
   const activeJobId = ref<number | null>(null)
   const lastEventAt = ref<string>('')
+
+  /* 体检/重建进行中（SSE maintenance.* 实时事件 + REST 账本对账双通道喂入）：
+     事实源是后端体检账本（health_runs + 逐块落库的观测行），这里只投影。
+     任务页系统状态行与灵动岛长任务共用这一份，任务页 / 顶栏之外任何页面
+     都能从岛上看到体检在跑、跑到哪。 */
+  const maintenance = ref<MaintenanceState | null>(null)
+
+  /* 轮收尾段（标记刷新/事件检测/统计，分钟级且无抓取在跑）：SSE
+     price_cycle.finalizing 置位、终态事件清除；价格状态胶囊据此给「汇总中」
+     而不是停在「正在更新」。syncRoundScope 以轮账本为准对账页面刷新。 */
+  const roundFinalizing = ref(false)
 
   /* 最近一次收敛的价格刷新周期（SSE price_cycle.completed）：库视图据此失效
      列表缓存并原地重拉。按 cycleId 去重——同一轮重复到达不触发第二次请求。 */
@@ -73,8 +97,10 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
       const [cycle] = await crawlApi.cycles(1)
       if (!cycle || !CYCLE_ACTIVE.has(cycle.status)) {
         roundTracking.value = false
+        roundFinalizing.value = false
         return
       }
+      roundFinalizing.value = cycle.status === 'finalizing'
       /* 30：轮内段数 ≤4 之外再留同窗余量——jobs 按 id 降序截断，秋促长轮
          期间修复/手动任务会把轮内早段挤出小窗口，分子分母随之缺段 */
       const jobs = await crawlApi.jobs(30)
@@ -96,6 +122,74 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
     }
   }
 
+  /* ── 体检/维护进行中：账本投影的唯一落点 ──────────────────────────
+     SSE 事件（started/progress/ended）与 REST 对账（/crawl/active 的
+     maintenanceInfo）都汇到这里，同一事实一个落点，页面轮询与事件推送
+     不各养一份状态。灵动岛长任务随状态注册/续接/撤下。 */
+
+  function maintenanceTaskText(state: MaintenanceState): string {
+    const { t } = useI18n()
+    if (state.kind === 'rebuild') return t('island.maintenance.rebuild')
+    const n = state.probedL1 + state.probedL2
+    return n > 0
+      ? t('island.maintenance.healthProbed', { n })
+      : t('island.maintenance.health')
+  }
+
+  /** 维护状态统一落点（null = 收场）：岛任务随状态注册/续接/撤下 */
+  function setMaintenance(state: MaintenanceState | null): void {
+    const fresh = state !== null && maintenance.value === null
+    const cleared = state === null && maintenance.value !== null
+    maintenance.value = state
+    if (fresh) {
+      beginTask(MAINTENANCE_TASK_KEY, maintenanceTaskText(state!), {
+        percent: null,
+        to: '/crawl',
+      })
+    } else if (state) {
+      updateTask(MAINTENANCE_TASK_KEY, maintenanceTaskText(state))
+    } else if (cleared) {
+      endTask(MAINTENANCE_TASK_KEY)
+    }
+  }
+
+  /** REST 投影适配：/crawl/active.maintenanceInfo → 统一落点 */
+  function applyMaintenanceInfo(
+    info: {
+      kind?: string
+      probed?: { l1?: number; l2?: number }
+    } | null,
+  ): void {
+    setMaintenance(
+      info
+        ? {
+            kind: info.kind ?? 'health',
+            probedL1: info.probed?.l1 ?? 0,
+            probedL2: info.probed?.l2 ?? 0,
+          }
+        : null,
+    )
+  }
+
+  /** 维护收场：撤下进行中气泡，结果入消息队列（有节点结论才报数字） */
+  function announceMaintenanceEnded(
+    kind: string,
+    data: { durationMs?: number; ok?: number; failed?: number },
+  ): void {
+    const { t } = useI18n()
+    const text =
+      kind === 'rebuild'
+        ? t('island.maintenance.rebuildDone')
+        : typeof data.ok === 'number'
+          ? t('island.maintenance.healthDone', {
+              ok: data.ok,
+              fail: data.failed ?? 0,
+              min: data.durationMs ? Math.max(1, Math.round(data.durationMs / 60000)) : 0,
+            })
+          : t('island.maintenance.healthDoneSimple')
+    message.success(text, { duration: 8000, to: '/crawl' })
+  }
+
   let source: EventSource | null = null
   let started = false
 
@@ -106,6 +200,8 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
     try {
       const a = await crawlApi.active()
       running.value = a.busy === true || a.activeJobId !== null
+      /* 断线窗口里的体检开始/结束事件可能丢失：以维护账本投影对账 */
+      applyMaintenanceInfo(a.maintenanceInfo ?? null)
     } catch {
       /* 拉不到占用账本，保持现状 */
     }
@@ -182,8 +278,45 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
         roundTracking.value = false
         roundDone.value = 0
         roundTotal.value = 0
+        roundFinalizing.value = false
         dataEpoch.value++
       }
+    })
+
+    /* 轮进入收尾段：抓取已全部结束，标记刷新/事件检测/统计在跑——
+       分钟级窗口，价格状态胶囊据此切「汇总中」而不是停在更新态 */
+    source.addEventListener('price_cycle.finalizing', () => {
+      roundFinalizing.value = true
+    })
+
+    /* 体检/重建三拍：开始注册岛任务、逐块进度续接、收场撤下并报结果。
+       进度事件走可丢通道（丢一条只是少刷一次），开始/结束走关键通道。 */
+    source.addEventListener('maintenance.started', (e) => {
+      const data = JSON.parse((e as MessageEvent).data)
+      setMaintenance({ kind: data.kind ?? 'health', probedL1: 0, probedL2: 0 })
+    })
+
+    source.addEventListener('maintenance.progress', (e) => {
+      const data = JSON.parse((e as MessageEvent).data)
+      const prev = maintenance.value ?? {
+        kind: data.kind ?? 'health',
+        probedL1: 0,
+        probedL2: 0,
+      }
+      setMaintenance({
+        ...prev,
+        /* 事件带的是该层的累计探测数；只刷新在位的那一层 */
+        ...(data.level === 'L1'
+          ? { probedL1: data.probed ?? prev.probedL1 }
+          : { probedL2: data.probed ?? prev.probedL2 }),
+      })
+    })
+
+    source.addEventListener('maintenance.ended', (e) => {
+      const data = JSON.parse((e as MessageEvent).data)
+      const kind = maintenance.value?.kind ?? data.kind ?? 'health'
+      setMaintenance(null)
+      announceMaintenanceEnded(kind, data)
     })
 
     source.onerror = () => {
@@ -207,6 +340,9 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
     dataEpoch,
     roundProgress,
     etaSeconds,
+    maintenance,
+    roundFinalizing,
+    applyMaintenanceInfo,
     start,
   }
 })

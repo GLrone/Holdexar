@@ -310,8 +310,20 @@ async function loadJobs() {
 }
 
 // ── 系统侧活动（体检 / 限流排队）：不是任务，任务列表看不到，单独轮询 ──
-const maintenance = ref(false)
+// 体检状态归 crawlStatus store 统一投影（SSE + 轮询同源），页面只消费
 const throttled = ref(0)
+
+/** 体检/重建进行中（store 投影）与状态行文案 */
+const maintenanceActive = computed(() => crawl.maintenance !== null)
+const maintenanceLabel = computed(() => {
+  const m = crawl.maintenance
+  if (!m) return ''
+  if (m.kind === 'rebuild') return t('crawl.sys.rebuild')
+  const n = m.probedL1 + m.probedL2
+  return n > 0
+    ? `${t('crawl.sys.maintenance')} · ${t('crawl.sys.probed', { n })}`
+    : t('crawl.sys.maintenance')
+})
 
 async function loadActive() {
   try {
@@ -320,7 +332,7 @@ async function loadActive() {
       // 页面刷新后 SSE 尚无事件：以服务端为准（busy 含不建任务行的直调抓取）
       crawl.running = true
     }
-    maintenance.value = active.maintenance ?? false
+    crawl.applyMaintenanceInfo(active.maintenanceInfo ?? null)
     throttled.value = active.throttled ?? 0
   } catch {
     /* 读不到就保持上一次的显示，不打断页面 */
@@ -627,14 +639,14 @@ onBeforeUnmount(() => {
 
       <!-- 系统侧活动：体检不是任务，排队中的请求还没开始产出进度，
            启动请求在后端登记任务的真空期也要有交代 -->
-      <div v-if="maintenance || starting || throttled > 0" class="sys-status">
+      <div v-if="maintenanceActive || starting || throttled > 0" class="sys-status">
         <span v-if="starting" class="sys-status__item">
           <HlIcon name="refresh" />
           {{ t('crawl.sys.starting') }}
         </span>
-        <span v-if="maintenance" class="sys-status__item">
+        <span v-if="maintenanceActive" class="sys-status__item">
           <HlIcon name="refresh" />
-          {{ t('crawl.sys.maintenance') }}
+          {{ maintenanceLabel }}
         </span>
         <span v-if="throttled > 0" class="sys-status__item">
           {{ t('crawl.sys.throttled', { n: throttled }) }}

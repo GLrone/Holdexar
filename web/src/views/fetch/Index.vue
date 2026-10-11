@@ -1,10 +1,15 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 
-import { settingsApi, type FetchSettingsPayload } from '@/api/client'
+import {
+  settingsApi,
+  type ContentSchedule,
+  type FetchSettingsPayload,
+} from '@/api/client'
 import {
   HlButton,
   HlIcon,
+  HlInput,
   HlSelect,
   HlSkeleton,
   HlSwitch,
@@ -15,8 +20,9 @@ import { useI18n } from '@/locales'
 
 /**
  * 自动抓取 —— 系统组的维护面板：一个开关管一个「自动联网更新的内容源」，
- * 另有价格更新间隔与恢复默认。开关只控制定时更新（下一轮起生效）；
- * 已有数据保留，手动刷新不受影响——这条语义由页首说明与每行描述承载。
+ * 另有价格更新间隔、两个内容源的自定义刷新节奏（时刻+间隔天数）与恢复默认。
+ * 开关只控制定时更新（下一轮起生效）；已有数据保留，手动刷新不受影响——
+ * 这条语义由页首说明与每行描述承载。刷新节奏改动即时重排对应定时拍。
  */
 const { t } = useI18n()
 
@@ -42,6 +48,35 @@ const ROWS = [
     descKey: 'fetch.fxHistory.desc',
   },
 ] as const
+
+/** 带自定义节奏的内容源：行 key → payload 字段 */
+const SOURCE_SCHEDULES = {
+  epic_free: 'epic_schedule',
+  hb_choice: 'hb_schedule',
+} as const satisfies Record<string, keyof FetchSettingsPayload>
+type ScheduleRowKey = keyof typeof SOURCE_SCHEDULES
+
+/* 间隔天数候选项（天）。库里出现清单外的值（如手改）时补一项显示 */
+const DAY_CHOICES = [1, 2, 3, 5, 7, 14, 30]
+
+function scheduleOf(rowKey: ScheduleRowKey): ContentSchedule {
+  const field = SOURCE_SCHEDULES[rowKey]
+  return (
+    prefs.value?.[field] ?? { time: '', days: 1 }
+  )
+}
+
+function dayOptions(rowKey: ScheduleRowKey): HlSelectOption[] {
+  const opts = DAY_CHOICES.map((d) => ({
+    value: d,
+    label: d === 1 ? t('fetch.schedule.daily') : t('fetch.schedule.everyDays', { n: d }),
+  }))
+  const cur = scheduleOf(rowKey).days
+  if (!DAY_CHOICES.includes(cur)) {
+    opts.unshift({ value: cur, label: t('fetch.schedule.everyDays', { n: cur }) })
+  }
+  return opts
+}
 
 /* 价格更新间隔候选项（小时）。库里出现清单外的值（如手改）时补一项显示 */
 const INTERVAL_CHOICES = [1, 2, 3, 4, 6, 8, 12, 24, 48]
@@ -73,6 +108,15 @@ async function save(patch: Partial<FetchSettingsPayload>): Promise<boolean> {
     const saved = (await settingsApi.updateFetch(patch)) as Partial<FetchSettingsPayload>
     if (patch.price_interval_hours != null && saved.price_interval_hours == null) {
       // 旧版后端会静默丢弃不认识的字段：请求带了间隔、响应没有 = 没保存上
+      prefs.value = prev
+      message.error(t('fetch.toast.failed'))
+      return false
+    }
+    // 节奏字段同判：请求带了、响应没有 = 对端没保存上
+    const scheduleField = (['hb_schedule', 'epic_schedule'] as const).find(
+      (f) => patch[f] != null && saved[f] == null,
+    )
+    if (scheduleField) {
       prefs.value = prev
       message.error(t('fetch.toast.failed'))
       return false
@@ -113,6 +157,22 @@ async function changeInterval(raw: string | number) {
   if (ok) message.success(t('fetch.interval.toast', { n: hours }))
 }
 
+/** 内容源刷新节奏：时刻或间隔任一变化即保存（保存失败由 save 回滚提示） */
+async function changeSchedule(rowKey: ScheduleRowKey, patchTime?: string, patchDays?: number) {
+  if (saving.value) return
+  const field = SOURCE_SCHEDULES[rowKey]
+  const cur = scheduleOf(rowKey)
+  const next: ContentSchedule = {
+    time: patchTime ?? cur.time,
+    days: patchDays ?? cur.days,
+  }
+  if (!next.time) return
+  savingKey.value = field
+  const ok = await save({ [field]: next } as Partial<FetchSettingsPayload>)
+  savingKey.value = null
+  if (ok) message.success(t('fetch.schedule.toast', { time: next.time }))
+}
+
 async function resetDefaults() {
   if (saving.value) return
   savingKey.value = 'reset'
@@ -125,6 +185,8 @@ async function resetDefaults() {
     fx_history: true,
     catalog_refresh: true,
     price_interval_hours: 6,
+    hb_schedule: { time: '02:30', days: 1 },
+    epic_schedule: { time: '23:05', days: 1 },
   })
   savingKey.value = null
   if (ok) message.success(t('fetch.reset.toast'))
@@ -217,6 +279,25 @@ onMounted(load)
             @update:model-value="(on: boolean) => toggle(row.key, on)"
           />
         </div>
+        <!-- 内容源自定义刷新节奏：时刻 + 间隔天数，改动即时保存并重排定时拍 -->
+        <div v-if="row.key in SOURCE_SCHEDULES" class="fetch-row__schedule">
+          <span class="fetch-row__schedule-label">{{ t('fetch.schedule.time') }}</span>
+          <HlInput
+            class="fetch-row__time"
+            type="time"
+            :model-value="scheduleOf(row.key as ScheduleRowKey).time"
+            :disabled="saving"
+            @update:model-value="(v: string) => changeSchedule(row.key as ScheduleRowKey, v)"
+          />
+          <span class="fetch-row__schedule-label">{{ t('fetch.schedule.interval') }}</span>
+          <HlSelect
+            class="fetch-row__days"
+            :model-value="scheduleOf(row.key as ScheduleRowKey).days"
+            :options="dayOptions(row.key as ScheduleRowKey)"
+            :disabled="saving"
+            @update:model-value="(d: string | number) => changeSchedule(row.key as ScheduleRowKey, undefined, Number(d))"
+          />
+        </div>
         <p class="fetch-row__desc">{{ t(row.descKey) }}</p>
       </div>
     </div>
@@ -292,6 +373,30 @@ onMounted(load)
 
 .fetch-row__select {
   width: 150px;
+  flex-shrink: 0;
+}
+
+/* 内容源刷新节奏行：时刻输入 + 间隔下拉，嵌在对应开关行下方 */
+.fetch-row__schedule {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.fetch-row__schedule-label {
+  font-size: 12.5px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.fetch-row__time {
+  width: 128px;
+  flex-shrink: 0;
+}
+
+.fetch-row__days {
+  width: 128px;
   flex-shrink: 0;
 }
 

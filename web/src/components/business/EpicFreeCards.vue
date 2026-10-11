@@ -4,6 +4,7 @@
  *
  * 数据链：GET /metadata/epic/offers（服务端快照缓存 30 分钟 + 过期后台刷新，
  * 只读展示链，不做 appid 匹配不落游戏行）→ 前端挂载即拉 + 每小时轮询；
+ * 「立即刷新」带 force 绕过快照缓存现拉一次。
  * 冷启动先显落库快照（stale + 「刷新中」），10s 短轮询盯到后台刷新落点
  * 自动覆盖，无需等一轮完整抓取。
  * 三种卡刻意不同形（防误读）：
@@ -16,7 +17,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
 import { metadataApi, type EpicMobileOffer, type EpicOffer } from '@/api/client'
 import { useI18n } from '@/locales'
-import { HlEmpty, HlImg, HlSkeleton } from '@/components/ui'
+import { HlButton, HlEmpty, HlImg, HlSkeleton } from '@/components/ui'
 
 const { t } = useI18n()
 
@@ -27,6 +28,8 @@ const fetchedAt = ref('')
 const state = ref<'loading' | 'ok' | 'failed'>('loading')
 /** true = 当前显示的是过期快照，服务端后台正在刷新（短轮询覆盖） */
 const stale = ref(false)
+/** 手动强刷进行中（按钮转圈防重入） */
+const refreshing = ref(false)
 
 /** 快照态短轮询：后台刷新完成前每 10s 补拉一次（封顶 6 次），拿到新鲜
  *  数据即停——「先显示本地快照，刷新完成后自动覆盖」的覆盖侧。 */
@@ -76,6 +79,26 @@ async function load() {
   } catch {
     if (offers.value.length === 0 && !mobile.value) state.value = 'failed'
   }
+}
+
+/** 手动强刷：绕过快照缓存现拉一次（拿到的就是新鲜数据，无需短轮询） */
+async function refresh() {
+  if (refreshing.value) return
+  refreshing.value = true
+  stopStalePoll()
+  try {
+    const res = await metadataApi.epicOffers({ noCache: true, force: true })
+    if (res.ok) {
+      offers.value = res.offers
+      mobile.value = res.mobile
+      fetchedAt.value = res.fetchedAt ? res.fetchedAt.slice(11, 16) : ''
+      state.value = 'ok'
+      stale.value = false
+    }
+  } catch {
+    // 强刷失败保留当前数据
+  }
+  refreshing.value = false
 }
 
 /** 'YYYY-M-D'（无前导零）→ 距今的日历日差（UTC 口径，对齐 Epic 窗口日期） */
@@ -146,6 +169,13 @@ onBeforeUnmount(() => {
           t('epicFree.updatedAt', { time: fetchedAt })
         }}</span>
         <span v-if="stale" class="epic-free__refreshing">{{ t('epicFree.refreshing') }}</span>
+        <HlButton
+          variant="text"
+          size="sm"
+          :loading="refreshing"
+          class="epic-free__refresh"
+          @click="refresh"
+        >{{ refreshing ? t('epicFree.refreshing') : t('epicFree.refresh') }}</HlButton>
         <a
           class="epic-free__hub"
           href="https://store.epicgames.com/en-US/free-games"
@@ -292,6 +322,11 @@ onBeforeUnmount(() => {
 
 .epic-free__hub:hover {
   text-decoration: underline;
+}
+
+/* 手动强刷按键：与外链同排同号字 */
+.epic-free__refresh {
+  font-size: 12px;
 }
 
 .epic-free__grid {

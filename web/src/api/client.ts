@@ -202,6 +202,12 @@ export const regionsApi = {
 
 // ─── settings ────────────────────────────────────────────
 
+/** 内容源自动刷新节奏：时刻（HH:MM）+ 间隔天数（1=每天，上限 30） */
+export interface ContentSchedule {
+  time: string
+  days: number
+}
+
 export interface FetchSettingsPayload {
   /** Epic 免费游戏：每日核对 + 首页卡片 */
   epic_free: boolean
@@ -219,6 +225,10 @@ export interface FetchSettingsPayload {
   price_interval_hours: number
   /** 目录层随价格更新：True = 每轮价格更新带上未关注的目录游戏；下一轮生效 */
   catalog_refresh: boolean
+  /** HB 月包自动刷新节奏（默认每天 02:30） */
+  hb_schedule: ContentSchedule
+  /** Epic 喜加一自动刷新节奏（默认每天 23:05） */
+  epic_schedule: ContentSchedule
 }
 
 export const settingsApi = {
@@ -500,14 +510,14 @@ export type PilotFacts =
   | PilotEpicFacts
 
 /** agent 时间线步骤：label 对应词条键 `pilot.step.{label}`，data 供词条插值。
- *  status = ok / empty / denied / timeout / failed；running 与耗时只存在于流式过程的本地态。 */
+ *  status = ok / empty / denied / timeout / failed / stopped；running 见流式过程，stopped 见中断收口轮，两者均为前端本地态。 */
 export interface PilotStep {
   label: string
-  status: 'ok' | 'empty' | 'denied' | 'timeout' | 'failed' | 'running'
+  status: 'ok' | 'empty' | 'denied' | 'timeout' | 'failed' | 'running' | 'stopped'
   data: { count?: number; name?: string | null; target?: string; path?: string }
   /** 本次工具执行耗时（毫秒）：执行期随心跳帧刷新，完成态取服务端下发值 */
   elapsedMs?: number
-  /** 执行开始的本地时刻（仅运行态）：心跳帧之间按它插值显示已用秒数 */
+  /** 执行开始的本地时刻（仅运行态） */
   startedAt?: number
 }
 
@@ -849,6 +859,8 @@ export interface PilotSessionOut {
   archived?: boolean
   /** 分叉溯源：本会话派生自哪个会话（非派生会话为 null/缺省） */
   forked_from?: string | null
+  /** 在飞轮的提问原文（进程内存态，不落账本）；无在飞轮为 null/缺省 */
+  inflight_q?: string | null
 }
 
 /** 历史会话清单项（账本只读投影） */
@@ -2004,6 +2016,13 @@ export const crawlApi = {
       busy?: boolean
       /** 池体检（整池串行探测）进行中——不是任务，任务列表看不到 */
       maintenance?: boolean
+      /** 体检/重建进行中的实时情况：体检账本投影（开跑时刻 + 已探测计数） */
+      maintenanceInfo?: {
+        kind: string
+        reason?: string | null
+        startedAt?: string | null
+        probed?: { l1: number; l2: number }
+      } | null
       /** 正在限流窗口外排队的请求数（>0 = 任务启动后请求还没放行） */
       throttled?: number
     }>('GET', '/crawl/active'),
@@ -2266,6 +2285,8 @@ export interface ProxyStrategy {
 export interface ClashStatus {
   running: boolean
   port: number | null
+  /** 混合入口就绪事实：启动/重载时验证过端口真的在听（进程活着 ≠ 入口可用） */
+  entryReady?: boolean
   configPath: string | null
   /** 内核当前跑的订阅 URL（启动/切换时登记）——检测结果归属的事实源 */
   subscriptionUrl: string | null
@@ -3024,11 +3045,19 @@ export interface EpicOffersPayload {
 }
 
 export const metadataApi = {
-  /** 当期 + 预告白送元素；后端快照缓存 30 分钟（冷启动先回快照 + 后台刷新） */
-  epicOffers: (opts?: { noCache?: boolean }) =>
-    request<EpicOffersPayload>('GET', '/metadata/epic/offers', undefined, opts),
+  /** 当期 + 预告白送元素；后端快照缓存 30 分钟（冷启动先回快照 + 后台刷新）；
+   *  force=true 绕过缓存现拉（手动强刷） */
+  epicOffers: (opts?: { noCache?: boolean; force?: boolean }) =>
+    request<EpicOffersPayload>(
+      'GET',
+      opts?.force ? '/metadata/epic/offers?force=true' : '/metadata/epic/offers',
+      undefined,
+      opts,
+    ),
   /** 当月 HB Choice 游戏清单（纯本地库读，零外网；ok=false = 尚未入库） */
   hbChoiceOffers: () => request<HbChoiceOffersPayload>('GET', '/metadata/hb/offers'),
+  /** 手动强刷 HB 当月包（重新抓 membership 页解析打标，绕过月包判重） */
+  hbRefresh: () => request<HbRefreshPayload>('POST', '/metadata/hb/refresh'),
   /** 正在赠送中的 Steam 限时免费（纯本地库读；offers 空 = 无赠送，模块整块隐藏） */
   steamFreeOffers: () => request<SteamFreeOffersPayload>('GET', '/metadata/steam/offers'),
 }
@@ -3080,6 +3109,16 @@ export interface HbChoiceOffersPayload {
   games: HbChoiceGame[]
   /** ok=false 时的原因文案 */
   error?: string
+}
+
+export interface HbRefreshPayload {
+  ok: boolean
+  /** true = 月包标识未变且未强刷，跳过打标 */
+  skipped?: boolean
+  /** 本轮新标记的条目（appid + 官方条目名） */
+  marked?: { appid: number; title: string }[]
+  /** 未能匹配出 appid 的条目名（次日自动重试） */
+  unresolved?: string[]
 }
 
 // ─── 成就殿堂（奖杯）────────────────────────────────────

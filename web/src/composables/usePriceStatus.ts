@@ -68,6 +68,15 @@ export function usePriceStatus() {
     },
   )
 
+  /* 终态收敛发生在运行位已让出之后（收尾段内）：数据版本推进即重读，
+     「汇总中」不等 5 分钟兜底轮询就切回终态结论 */
+  watch(
+    () => crawl.dataEpoch,
+    () => {
+      void loadCycles()
+    },
+  )
+
   onMounted(() => {
     void loadCycles()
     ticker = window.setInterval(() => {
@@ -93,21 +102,33 @@ export function usePriceStatus() {
     return !Number.isFinite(ms) || ms > FRESH_WINDOW_MS
   })
 
-  const kind = computed(() =>
-    priceStatusOf({
+  const kind = computed(() => {
+    const base = priceStatusOf({
       running: crawl.running,
       ok: crawl.ok,
       fail: crawl.fail,
       total: crawl.total,
       lastStatus: latestCycle.value?.status ?? null,
       hasHistory: hasHistory.value,
-    }),
-  )
+    })
+    /* 轮收尾段（标记刷新/事件检测/统计，分钟级且无抓取在跑）：如实给
+       「汇总中」，不吃「正在更新」——否则岛上停在更新态像卡死 */
+    if (
+      base === 'running' &&
+      !crawl.running &&
+      (crawl.roundFinalizing || latestCycle.value?.status === 'finalizing')
+    ) {
+      return 'finalizing'
+    }
+    return base
+  })
 
   const label = computed(() => {
     switch (kind.value) {
       case 'running':
         return t('island.price.running')
+      case 'finalizing':
+        return t('island.price.finalizing')
       case 'partial':
         return stale.value ? t('island.price.stale') : t('island.price.partial')
       case 'done':
@@ -122,6 +143,7 @@ export function usePriceStatus() {
   const color = computed(() => {
     switch (kind.value) {
       case 'running':
+      case 'finalizing':
         return 'var(--accent)'
       case 'partial':
         return 'var(--warning)'

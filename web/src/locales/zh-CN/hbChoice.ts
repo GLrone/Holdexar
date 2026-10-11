@@ -5,6 +5,8 @@
 
 const hbChoice = {
   'hbChoice.title': 'HB 月包',
+  'hbChoice.refresh': '立即刷新',
+  'hbChoice.refreshing': '刷新中…',
   'hbChoice.goMonth': '前往月包',
   'hbChoice.skip': '跳过本月',
   'hbChoice.empty': '当月包尚未入库，等待每日抓取',

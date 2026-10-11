@@ -34,8 +34,8 @@ const proxies = {
   'proxies.strategy.updated': '路由策略已更新（下个任务生效）',
 
   /* 本地混合端口（纯配置，不随策略切换） */
-  'proxies.port.label': '本地混合端口',
-  'proxies.port.title': '自启 Clash/Verge 的混合端口（代理优先的回落探测指向它）',
+  'proxies.port.label': '内核工作端口',
+  'proxies.port.title': '本程序内核监听的混合端口，程序的代理流量统一走它；兜底探测自启 Verge 固定 7897，与此设置无关',
   'proxies.port.invalid': '端口须为 1024–65535 的整数',
   'proxies.port.updated': 'Clash 端口已更新',
 
@@ -65,6 +65,7 @@ const proxies = {
 
   /* Clash 运行状态与启停 */
   'proxies.clash.running': '运行中 · 端口 {port}',
+  'proxies.clash.entryNotReady': '运行中 · 端口 {port}（入口未就绪，端口未监听）',
   'proxies.clash.stopped': '未运行',
   'proxies.clash.notRunningTitle': 'Clash 未运行',
   'proxies.clash.start': '启动',

@@ -478,11 +478,12 @@ async def _mark_game_hb(appid: int, title: str, label: str) -> None:
         await session.commit()
 
 
-async def refresh_hb_choice() -> dict:
+async def refresh_hb_choice(force: bool = False) -> dict:
     """当月 HB Choice → games.is_hb/hb_data 标记（每日调度与手动触发同入口）。
 
     幂等判据：membership 页 activeContentMachineName 与 app_settings 记账值
-    一致即跳过（新月包出现才走解析+打标）。返回摘要，失败的条目（storesearch
+    一致即跳过（新月包出现才走解析+打标）；force=True 绕过判重强制重打标
+    （手动触发用，标记本身按月续写幂等）。返回摘要，失败的条目（storesearch
     未命中）记 unresolved 留待人工，不阻塞其余条目。
     """
     from app.domains.settings.service import get_value, set_value
@@ -499,7 +500,7 @@ async def refresh_hb_choice() -> dict:
             return {"source": "hb-choice", "ok": False, "error": "页面无当月包数据"}
 
         last = await get_value(_HB_STATE_KEY) or {}
-        if last.get("machineName") == machine:
+        if last.get("machineName") == machine and not force:
             return {
                 "source": "hb-choice", "ok": True, "skipped": True,
                 "machineName": machine, "lastMarked": last.get("marked"),

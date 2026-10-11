@@ -2664,7 +2664,7 @@ onUnmounted(stopLoginPolling)
   gap: 2px;
 }
 
-/* 领航员绑定卡：标签行网格（ZCode 模型供应商卡式排版） */
+/* 领航员绑定卡：标签行网格（模型供应商卡式排版） */
 .pilot-form {
   display: flex;
   flex-direction: column;

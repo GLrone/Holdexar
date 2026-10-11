@@ -5,6 +5,8 @@
 
 const hbChoice = {
   'hbChoice.title': 'Humble Choice',
+  'hbChoice.refresh': 'Refresh',
+  'hbChoice.refreshing': 'Refreshing…',
   'hbChoice.goMonth': 'Open bundle',
   'hbChoice.skip': 'Skip month',
   'hbChoice.empty': 'This month’s bundle has not been synced yet',

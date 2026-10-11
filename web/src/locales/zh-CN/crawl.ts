@@ -49,6 +49,8 @@ const crawl = {
   'crawl.sys.starting': '正在启动任务：后端在登记队列与排定出口，稍等片刻',
   'crawl.sys.maintenance':
     '系统体检进行中：正在逐个检测代理通道，价格抓取会自动让路，无需操作',
+  'crawl.sys.probed': '已检测 {n} 个节点',
+  'crawl.sys.rebuild': '代理通道重建中：正在整理出口节点，价格抓取会自动让路，无需操作',
   'crawl.sys.throttled':
     '正在排队等发送窗口：{n} 个请求在限流队列中，任务会自动继续',
 

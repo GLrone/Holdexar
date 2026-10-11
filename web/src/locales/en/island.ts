@@ -20,6 +20,7 @@ const island: Partial<Record<MessageKey, string>> = {
 
   'island.price.waiting': 'Waiting to update',
   'island.price.running': 'Updating game prices',
+  'island.price.finalizing': 'Wrapping up this update round…',
   'island.price.done': 'Prices updated',
   'island.price.partial': 'Update incomplete',
   'island.price.stale': 'Prices not updated',
@@ -31,6 +32,14 @@ const island: Partial<Record<MessageKey, string>> = {
   'island.ago.minutes': '{n} min ago',
   'island.ago.hours': '{n} h ago',
   'island.ago.days': '{n} d ago',
+
+  /* Proxy health check / rebuild long task (system-side maintenance, island-wide while running) */
+  'island.maintenance.health': 'Health check in progress: testing proxy nodes one by one',
+  'island.maintenance.healthProbed': 'Health check in progress: {n} nodes checked',
+  'island.maintenance.healthDone': 'Health check finished: {ok} healthy · {fail} failed · took {min} min',
+  'island.maintenance.healthDoneSimple': 'Health check finished',
+  'island.maintenance.rebuild': 'Rebuilding proxy channels',
+  'island.maintenance.rebuildDone': 'Proxy channels rebuilt',
 
   'island.fact.hbChanged': 'Humble Choice monthly bundle refreshed: {label}',
   'island.fact.hbChangedDetail': '{count} games redeemable on Steam this month; see the dashboard card',
