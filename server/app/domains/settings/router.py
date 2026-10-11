@@ -32,6 +32,9 @@ class SettingsUpdate(BaseModel):
     backup_auto: bool | None = None
     # 已主动提示过的版本号（启动告知「一次一版本」的去重锚点）
     update_notified: str | None = None
+    # 用户明确跳过的版本号（严格等值匹配：跳过 A 不拦 A 之后的 B；
+    # 手动检查不受它限制——用户主动查就该看到结果）
+    update_skipped: str | None = None
     # 新版本提示总开关（False=有新版也不弹窗/不亮侧栏红点，只留手动检查）
     update_notify: bool | None = None
     # 静默自动更新开关（True=检测到新版本后台自动下载校验，不打扰；
@@ -51,6 +54,7 @@ class SettingsPayload(BaseModel):
     auto_price: bool = True
     backup_auto: bool = True
     update_notified: str = ""
+    update_skipped: str = ""
     # 提示默认开（有新版该告诉用户）；静默自动更新默认关——后台悄悄
     # 下载 100MB+ 属于「用户没同意就不该做」的事，必须显式开启
     update_notify: bool = True
@@ -105,6 +109,7 @@ async def get_settings() -> SettingsPayload:
     auto_price = await service.get_value("crawl.auto_price", True)
     backup_auto = await service.get_value("backup.auto", True)
     update_notified = await service.get_value("ui.update_notified", "")
+    update_skipped = await service.get_value("ui.update_skipped_version", "")
     update_notify = await service.get_value("ui.update_notify", True)
     update_auto = await service.get_value("ui.update_auto", False)
     direct_notice_seen = await service.get_value("ui.direct_notice_seen", False)
@@ -119,6 +124,7 @@ async def get_settings() -> SettingsPayload:
         auto_price=bool(auto_price),
         backup_auto=bool(backup_auto),
         update_notified=str(update_notified or ""),
+        update_skipped=str(update_skipped or ""),
         update_notify=bool(update_notify),
         update_auto=bool(update_auto),
         direct_notice_seen=bool(direct_notice_seen),
@@ -150,6 +156,9 @@ async def update_settings(payload: SettingsUpdate) -> SettingsPayload:
 
     if payload.update_notified is not None:
         await service.set_value("ui.update_notified", payload.update_notified.strip())
+
+    if payload.update_skipped is not None:
+        await service.set_value("ui.update_skipped_version", payload.update_skipped.strip())
 
     if payload.update_notify is not None:
         await service.set_value("ui.update_notify", bool(payload.update_notify))

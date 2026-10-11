@@ -159,11 +159,6 @@ class GamePriceHistory(Base):
     steam_event_key: Mapped[str | None] = mapped_column(String(60))
     snapshot_at: Mapped[datetime | None] = mapped_column(DateTime)
 
-    __table_args__ = (
-        Index("ix_gph_appid_region_snapshot", "appid", "region_code", "snapshot_at"),
-        Index("ix_gph_sub_id", "sub_id"),
-    )
-
 
 class Bundle(Base):
     """捆绑包主档。app_ids 数组列按 SQLite 习惯转 JSON 文本。"""

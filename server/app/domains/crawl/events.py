@@ -10,11 +10,13 @@ price 不用 cny_fen（防汇率波动误判），0 价归 FREE_PROMO。region_c
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 
 from sqlalchemy import (
-    DateTime, Index, Integer, String, JSON, select, text,
+    BigInteger, DateTime, Index, Integer, JSON, String,
+    bindparam, column, func, select, text,
 )
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Mapped, mapped_column
@@ -22,7 +24,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.core.database import Base, WritePriority, get_session_factory
 from app.core.database import write_gate
 from app.domains.crawl.cycle import PriceCycle
-from app.domains.games.models import Game, GameCurrentPrice, GamePriceHistory
+from app.domains.games.models import Game, GameCurrentPrice
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,71 @@ BENCHMARK_REGION = "CN"
 
 # 失败态：明确表示「本轮没有拿到可购买价格」
 _FAILED_STATUSES = ("missing", "blocked")
+
+# 证据查询在 SQL 侧按观察单元下推（每单元一次索引探测取 argmax/聚合行），
+# 结果集与全史解耦；region_code 库内单一来源大写，SQL 按大写对齐索引前缀。
+_GPH_STANDARD = (
+    "(is_gold IS NULL OR is_gold = 0) "
+    "AND (version_suffix IS NULL OR version_suffix = '') "
+    "AND (is_bundle IS NULL OR is_bundle = 0)"
+)
+_GPH_SNAP_SQL = text(
+    "SELECT w.a, w.r, h2.price, h2.original_price, h2.cny_fen, h2.snapshot_at, h2.id "
+    "FROM (SELECT value->>'a' AS a, value->>'r' AS r, CAST(value->>'s' AS INTEGER) AS s "
+    "FROM json_each(:want)) w "
+    "JOIN game_price_history h2 ON h2.id = ("
+    "SELECT h3.id FROM game_price_history h3 "
+    "WHERE h3.appid = w.a AND h3.region_code = w.r AND COALESCE(h3.sub_id, 0) = w.s "
+    "AND h3.snapshot_at IS NOT NULL AND h3.snapshot_at >= :started AND h3.snapshot_at <= :ended "
+    f"AND {_GPH_STANDARD} "
+    "ORDER BY h3.snapshot_at DESC, h3.id DESC LIMIT 1)"
+).columns(
+    column("a", Integer), column("r", String), column("price", BigInteger),
+    column("original_price", BigInteger), column("cny_fen", BigInteger),
+    column("snapshot_at", DateTime), column("id", Integer),
+).bindparams(bindparam("started", type_=DateTime), bindparam("ended", type_=DateTime))
+_GPH_PREV_SQL = text(
+    "SELECT w.a, w.r, "
+    "(SELECT MIN(h1.price) FROM game_price_history h1 "
+    " WHERE h1.appid = w.a AND h1.region_code = w.r AND COALESCE(h1.sub_id, 0) = w.s "
+    " AND h1.snapshot_at IS NOT NULL AND h1.snapshot_at < :started "
+    " AND h1.price IS NOT NULL AND h1.price != 0 "
+    f"AND {_GPH_STANDARD}) AS low, "
+    "h2.price, h2.original_price, h2.cny_fen, h2.snapshot_at, h2.id "
+    "FROM (SELECT value->>'a' AS a, value->>'r' AS r, CAST(value->>'s' AS INTEGER) AS s "
+    "FROM json_each(:want)) w "
+    "JOIN game_price_history h2 ON h2.id = ("
+    "SELECT h3.id FROM game_price_history h3 "
+    "WHERE h3.appid = w.a AND h3.region_code = w.r AND COALESCE(h3.sub_id, 0) = w.s "
+    "AND h3.snapshot_at IS NOT NULL AND h3.snapshot_at < :started "
+    "AND h3.price IS NOT NULL AND h3.price != 0 "
+    f"AND {_GPH_STANDARD} "
+    "ORDER BY h3.snapshot_at DESC, h3.id DESC LIMIT 1)"
+).columns(
+    column("a", Integer), column("r", String), column("low", BigInteger),
+    column("price", BigInteger), column("original_price", BigInteger),
+    column("cny_fen", BigInteger), column("snapshot_at", DateTime),
+    column("id", Integer),
+).bindparams(bindparam("started", type_=DateTime))
+_GPH_HAD_SQL = text(
+    "SELECT w.value->>'a' AS a, w.value->>'r' AS r FROM json_each(:units) w WHERE EXISTS ("
+    "SELECT 1 FROM game_price_history h "
+    "WHERE h.appid = CAST(w.value->>'a' AS INTEGER) AND h.region_code = w.value->>'r' "
+    "AND h.snapshot_at IS NOT NULL "
+    "AND NOT (h.snapshot_at >= :started AND h.snapshot_at <= :ended) "
+    "AND h.price IS NOT NULL AND h.price != 0 "
+    f"AND {_GPH_STANDARD})"
+).bindparams(bindparam("started", type_=DateTime), bindparam("ended", type_=DateTime))
+_PREV_STATUS_SQL = text(
+    "SELECT appid, region_code, MAX(id) AS last_id, current_json FROM price_events "
+    "WHERE appid IN (SELECT CAST(value AS INTEGER) FROM json_each(:appids)) "
+    "AND event_type IN :types "
+    "AND COALESCE(json_extract(current_json, '$.status'), '') != '' "
+    "GROUP BY appid, region_code"
+).columns(
+    column("appid", Integer), column("region_code", String),
+    column("last_id", Integer), column("current_json", JSON),
+).bindparams(bindparam("types", expanding=True))
 
 
 class PriceEvent(Base):
@@ -85,13 +152,6 @@ class PriceEvent(Base):
         Index("ix_price_events_cycle", "cycle_id"),
         Index("ix_price_events_appid", "appid", "occurred_at"),
     )
-
-
-def _is_standard(
-    is_gold: bool | None, version_suffix: str | None, is_bundle: bool | None
-) -> bool:
-    """标准版快照：与写库侧一致（非 gold、无版本后缀、非 bundle-as-sub）。"""
-    return not is_gold and not (version_suffix or "") and not is_bundle
 
 
 async def detect(cycle_id: int) -> list[dict]:
@@ -134,7 +194,8 @@ async def detect_window(
     if not appids or not regions:
         return []
 
-    # ── 本轮观察：只认窗口内的行（未观察的单元不产生任何事件）──
+    # ── 本轮观察：只认窗口内的行（未观察的单元不产生任何事件）；区服与
+    # 窗口过滤在 SQL 完成，结果只含本轮观察到的单元 ──
     observed: dict[tuple[int, str], dict] = {}
     async with get_session_factory()() as session:
         rows = (
@@ -144,15 +205,17 @@ async def detect_window(
                     GameCurrentPrice.price, GameCurrentPrice.cny_fen,
                     GameCurrentPrice.price_status, GameCurrentPrice.sub_id,
                     GameCurrentPrice.updated_at,
-                ).where(GameCurrentPrice.appid.in_(appids))
+                ).where(
+                    GameCurrentPrice.appid.in_(appids),
+                    func.lower(func.trim(GameCurrentPrice.region_code)).in_(regions),
+                    GameCurrentPrice.updated_at.is_not(None),
+                    GameCurrentPrice.updated_at >= started_at,
+                    GameCurrentPrice.updated_at <= window_end,
+                )
             )
         ).all()
     for appid, region_code, price, cny_fen, status, sub_id, updated_at in rows:
         region = str(region_code).strip().lower()
-        if region not in regions or updated_at is None:
-            continue
-        if updated_at < started_at or updated_at > window_end:
-            continue
         observed[(int(appid), region)] = {
             "price": price, "cnyFen": cny_fen, "subId": sub_id,
             "status": str(status or "").strip().lower(), "at": updated_at,
@@ -283,72 +346,60 @@ async def _history_evidence(
     本轮新快照：窗口内该 sub 最后写入的 ok 快照（同 `snapshot_at` 时按 id 取最后
     一条——与写库侧基线同序）。窗口前基线：该 sub 在窗口之前的最低有效价（`low`）
     与最近一条快照（`price` / `original`），只取正价；`unobserved` 与 0 价不参与
-    比较。
+    比较。三段证据查询按观察单元在 SQL 侧下推（每单元一次索引探测取 argmax /
+    聚合行，结果集与全史解耦）；「窗口前有有效价」只覆盖本轮观察单元
+    （消费面即 detect 的 observed 循环）。
     """
-    want: dict[str, int] = {}
+    want: list[dict] = []
+    units: list[dict] = []
     for (appid, region), item in observed.items():
+        units.append({"a": appid, "r": region.upper()})
         if item.get("subId") is not None:
-            want[f"{appid}:{region}"] = int(item["subId"])
+            want.append({"a": appid, "r": region.upper(), "s": int(item["subId"])})
     snaps: dict[str, dict] = {}
     prevs: dict[str, dict] = {}
-    had_valid: set[str] = set()
-    if not want:
-        want = {}
-
     async with get_session_factory()() as session:
-        rows = (
+        if want:
+            snap_rows = (
+                await session.execute(
+                    _GPH_SNAP_SQL,
+                    {"want": json.dumps(want), "started": started_at, "ended": window_end},
+                )
+            ).all()
+            prev_rows = (
+                await session.execute(
+                    _GPH_PREV_SQL, {"want": json.dumps(want), "started": started_at}
+                )
+            ).all()
+        else:
+            snap_rows, prev_rows = [], []
+        had_rows = (
             await session.execute(
-                select(
-                    GamePriceHistory.appid, GamePriceHistory.region_code,
-                    GamePriceHistory.sub_id, GamePriceHistory.price,
-                    GamePriceHistory.original_price, GamePriceHistory.cny_fen,
-                    GamePriceHistory.snapshot_at, GamePriceHistory.id,
-                    GamePriceHistory.is_gold, GamePriceHistory.version_suffix,
-                    GamePriceHistory.is_bundle,
-                ).where(GamePriceHistory.appid.in_(appids))
+                _GPH_HAD_SQL,
+                {"units": json.dumps(units), "started": started_at, "ended": window_end},
             )
         ).all()
-    for (appid, region_code, sub_id, price, original, cny_fen, snap_at, row_id,
-         is_gold, suffix, is_bundle) in rows:
-        region = str(region_code).strip().lower()
-        if not _is_standard(is_gold, suffix, is_bundle) or snap_at is None:
-            continue
-        key = f"{int(appid)}:{region}"
-        promo = price == 0 and (original or 0) > 0
-        in_window = started_at <= snap_at <= window_end
-        if not in_window and price:
-            # 「窗口前有过有效价」不清 sub：只要该单元当时有价，就说明它当时是 ok，
-            # 这是状态类事件的基线（与价格比较用的同 sub 基线分开）
-            had_valid.add(key)
-        if want.get(key) != int(sub_id or 0):
-            continue
-        if in_window:
-            seen = snaps.get(key)
-            if seen is None or (snap_at, row_id) >= (seen["at"], seen["rowId"]):
-                snaps[key] = {"at": snap_at, "rowId": row_id, "price": price,
-                              "original": original, "cnyFen": cny_fen,
-                              "promo": promo}
-            continue
-        if snap_at >= started_at or not price:
-            continue
-        bucket = prevs.get(key)
-        if bucket is None:
-            prevs[key] = {"low": price, "price": price, "original": original,
-                          "cnyFen": cny_fen, "at": snap_at, "rowId": row_id,
-                          "promo": promo}
-            continue
-        if price < bucket["low"]:
-            bucket["low"] = price
-        if (snap_at, row_id) >= (bucket["at"], bucket["rowId"]):
-            bucket["price"], bucket["original"] = price, original
-            bucket["cnyFen"] = cny_fen
-            bucket["at"], bucket["rowId"] = snap_at, row_id
-            bucket["promo"] = promo
+
+    snaps: dict[str, dict] = {}
+    for a, r, price, original, cny_fen, snap_at, row_id in snap_rows:
+        snaps[f"{int(a)}:{str(r).strip().lower()}"] = {
+            "at": snap_at, "rowId": row_id, "price": price, "original": original,
+            "cnyFen": cny_fen, "promo": price == 0 and (original or 0) > 0,
+        }
+    prevs: dict[str, dict] = {}
+    for a, r, low, price, original, cny_fen, snap_at, row_id in prev_rows:
+        prevs[f"{int(a)}:{str(r).strip().lower()}"] = {
+            "low": low, "price": price, "original": original, "cnyFen": cny_fen,
+            "at": snap_at, "rowId": row_id, "promo": price == 0 and (original or 0) > 0,
+        }
+    # 「窗口前有过有效价」不清 sub：只要该单元当时有价，就说明它当时是 ok，
+    # 这是状态类事件的基线（与价格比较用的同 sub 基线分开）
+    had_valid = {f"{int(a)}:{str(r).strip().lower()}" for a, r in had_rows}
     return snaps, prevs, had_valid
 
 
 async def _previous_status(appids: list[int]) -> dict[str, str]:
-    """每个单元最近一条状态事件隐含的状态（按 id 升序遍历，后者覆盖前者）。
+    """每个单元最近一条状态事件隐含的状态（每单元 SQL 侧取 MAX(id) 一行）。
 
     价格状态没有历史行（`mark_region_status` 只 UPSERT 当前表），本表自身就是
     状态跃迁的持久记忆；没有记录时不猜，由调用方回落到「窗口前有有效快照 ⇒ ok」。
@@ -356,16 +407,11 @@ async def _previous_status(appids: list[int]) -> dict[str, str]:
     async with get_session_factory()() as session:
         rows = (
             await session.execute(
-                select(PriceEvent.appid, PriceEvent.region_code, PriceEvent.current_json)
-                .where(
-                    PriceEvent.appid.in_(appids),
-                    PriceEvent.event_type.in_(STATUS_EVENT_TYPES),
-                )
-                .order_by(PriceEvent.id)
+                _PREV_STATUS_SQL, {"appids": json.dumps(appids), "types": list(STATUS_EVENT_TYPES)}
             )
         ).all()
     out: dict[str, str] = {}
-    for appid, region_code, current in rows:
+    for appid, region_code, _last_id, current in rows:
         status = (current or {}).get("status")
         if status:
             out[f"{int(appid)}:{str(region_code or '').strip().lower()}"] = status

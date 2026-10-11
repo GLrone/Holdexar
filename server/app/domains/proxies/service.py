@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import shutil
 import socket
 import time
 import weakref
@@ -232,6 +233,40 @@ async def maybe_autoswitch_on_subscription(nodes: int | None) -> bool:
     if (await get_value("proxy.strategy", "direct_only")) != "direct_only":
         return False
     await set_value("proxy.strategy", "proxy_first")
+    return True
+
+
+async def maybe_revert_to_direct() -> bool:
+    """无可用出口时回退默认直连——自动切换的反面对称动作。
+
+    与自动切换同一把尺：只回退依赖代理池的策略（proxy_first/proxy_only），
+    用户显式选过的策略不动。出口只看稳定事实（未废弃订阅 / 手动池启用
+    节点），不看节点瞬时存活——体检抖动不该把策略永久打回直连。
+    """
+    from app.domains.settings.service import get_value, set_value
+
+    if (await get_value(STRATEGY_EXPLICIT_KEY, False)) is True:
+        return False
+    if (await get_value("proxy.strategy", "direct_only")) not in (
+        "proxy_first",
+        "proxy_only",
+    ):
+        return False
+    async with get_session_factory()() as session:
+        live_subs = await session.scalar(
+            select(func.count())
+            .select_from(ProxySubscription)
+            .where(ProxySubscription.deprecated.is_(False))
+        )
+        if live_subs:
+            return False
+        enabled_pool = await session.scalar(
+            select(func.count()).select_from(Proxy).where(Proxy.enabled.is_(True))
+        )
+    if enabled_pool:
+        return False
+    await set_value("proxy.strategy", "direct_only")
+    log_event(logger, "无可用代理出口，策略已回退直连", tag="降级")
     return True
 
 
@@ -568,7 +603,7 @@ async def update_subscription(
         }
     if url_changed and result["kind"] == "clash":
         try:
-            sync = await refresh_clash_subscription(sub_id)
+            sync = await refresh_clash_subscription(sub_id, auto_switch=True)
         except Exception as e:  # noqa: BLE001 —— 重拉失败不撤销改名换链
             result["warning"] = f"订阅链接已更新，但自动重拉失败：{e}"
             return result
@@ -637,7 +672,7 @@ async def _mark_refreshed(sub_id: int) -> None:
     await set_value("proxy.sub_last_refresh_at", now.isoformat())
 
 
-async def refresh_clash_subscription(sub_id: int) -> dict:
+async def refresh_clash_subscription(sub_id: int, *, auto_switch: bool = False) -> dict:
     """独立刷新 Clash 订阅：重新下载配置 + 流量回填 + 账本收敛。
 
     不依赖「重启内核」——服务常驻期间订阅内容也能刷新。下载成功后：
@@ -737,7 +772,7 @@ async def refresh_clash_subscription(sub_id: int) -> dict:
     # 重拉成功 → 池子学新内容：autoRefresh 关闭的订阅（限时订阅）不在周期
     # 同步里，池子学新链接只走这条路（拉取 → 落快照 → 体检健康的候选自动转正）
     asyncio.get_running_loop().create_task(_pool_sync_single(sub_id))
-    return {
+    result = {
         "id": sub_id,
         "label": label,
         "nodes": meta.get("nodes"),
@@ -748,6 +783,12 @@ async def refresh_clash_subscription(sub_id: int) -> dict:
         "restarted": restarted,
         "prunedLedger": pruned,
     }
+    # 用户主动重拉/换链接也算一次「订阅有效」的表示：默认直连且没表达过
+    # 偏好时切代理优先。定时周期重拉不传 auto_switch——自动行为不该由
+    # 后台节拍翻转用户当前的出口形态。
+    if auto_switch and await maybe_autoswitch_on_subscription(meta.get("nodes")):
+        result["strategySwitched"] = True
+    return result
 
 
 async def _pool_sync_single(sub_id: int) -> None:
@@ -759,19 +800,19 @@ async def _pool_sync_single(sub_id: int) -> None:
         from app.core.config import get_settings
         from app.domains.proxypool import bootstrap as _bs
 
-        async with write_gate(WritePriority.BACKGROUND, label="subscription_sync"), get_session_factory()() as session:
+        # 下载在 sync_subscriptions 闸外完成、落库段闸内提交；会话只承载读取
+        async with get_session_factory()() as session:
             result = await _bs.sync_subscriptions(
                 session, data_dir=get_settings().data_dir,
                 now=datetime.now(), only_sub_id=sub_id,
             )
-            await session.commit()
         log_event(
             logger,
             f"订阅 {sub_id} 重拉后已喂给代理池",
             tag="成功",
             detail={
                 "订阅编号": sub_id,
-                "保持候选数": len(result.skipped),
+                "保持候选数": len(result.skipped_candidates),
                 "失败数": len(result.failures),
             },
         )
@@ -1294,8 +1335,12 @@ async def add_subscription(kind: str, url: str, label: str | None = None) -> dic
 
 
 async def delete_subscription(sub_id: int) -> bool:
-    """删除订阅 + 级联清理账本（clash_nodes 按 subscription_id 挂靠，
-    订阅没了节点行就是纯孤儿数据，一并删除防止永久累积）。"""
+    """删除订阅 + 级联清理两本账：clash_nodes（本域）整批删；clash 订阅同时
+    退出生产池并清快照（复用池域的退出登记，同一事务）——来源行不清，池合格
+    判定会把已删订阅的节点继续当「仍被提供」，其健康节点将永远留在生产池里。"""
+    from app.core.config import get_settings
+    from app.domains.proxypool.subscription import snapshot_dir
+
     async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         sub = await session.get(ProxySubscription, sub_id)
         if sub is None:
@@ -1303,9 +1348,42 @@ async def delete_subscription(sub_id: int) -> bool:
         await session.execute(
             delete(ClashNode).where(ClashNode.subscription_id == sub_id)
         )
+        exit_result = None
+        if sub.kind == "clash":
+            from app.domains.proxypool.admission import exit_from_production
+            from app.domains.proxypool.models import SubscriptionSnapshot
+
+            exit_result = await exit_from_production(
+                session, subscription_id=sub_id, now=_naive(get_beijing_time_obj())
+            )
+            await session.execute(
+                delete(SubscriptionSnapshot)
+                .where(SubscriptionSnapshot.subscription_id == sub_id)
+            )
         await session.delete(sub)
         await session.commit()
-        return True
+    # 行已删，快照原始字节按订阅目录整体回收（内容寻址，行没了字节即孤儿）
+    shutil.rmtree(
+        snapshot_dir(get_settings().data_dir) / str(sub_id), ignore_errors=True
+    )
+    # 来源解除必须留痕（与退出端点同一理由）：否则事后只见一批节点降级、找不到原因
+    if exit_result is not None and exit_result.exited:
+        from app.core import orchestration as events
+
+        await events.record(
+            events.KIND_SUBSCRIPTION_EXITED,
+            f"订阅 {sub_id} 删除，随删退出生产池：移除来源 {exit_result.removed_sources} 行",
+            level=events.LEVEL_WARN,
+            payload={
+                "subscriptionId": sub_id,
+                "removedSources": exit_result.removed_sources,
+                "degradedNodes": exit_result.degraded_nodes,
+                "deleted": True,
+            },
+        )
+    # 删到一条不剩即无出口：回退直连（事务外，避免与写闸重入）
+    await maybe_revert_to_direct()
+    return True
 
 
 async def get_subscription(sub_id: int) -> ProxySubscription | None:
@@ -2176,6 +2254,8 @@ async def _apply_node_results(
         proxy_label=f"clash:{sub_id}",
         error=None if alive_count else "全部节点不可用",
     )
+    if deprecated:
+        await maybe_revert_to_direct()
     return alive_count, unique_alive, deprecated
 
 

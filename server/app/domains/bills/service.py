@@ -449,6 +449,10 @@ async def sync_bills(*, force: bool = False) -> dict:
         if not stale:
             return {"ok": False, "status": "busy"}
 
+    # 先占 running 位再探测/翻页：busy 判定与探测之间隔着秒级网络段，并发
+    # 触发会双开全量翻页；各失败路径均以快照收尾，进程被杀的残留由 stale 兜底
+    await settings_service.set_value(KEY_BILLS_SYNC, {"running": True, "since": now.isoformat()})
+
     # 首屏探测：无新交易 → 本轮跳过（写探测跳过快照，等下一周期再探）
     if not force:
         try:
@@ -472,8 +476,6 @@ async def sync_bills(*, force: bool = False) -> dict:
             await settings_service.set_value(KEY_BILLS_PROBE_SKIPPED, True)
             return {"ok": True, "status": "probed_skip", "historyRows": 0, "licenseRows": 0}
         await settings_service.set_value(KEY_BILLS_PROBE_SKIPPED, False)
-
-    await settings_service.set_value(KEY_BILLS_SYNC, {"running": True, "since": now.isoformat()})
 
     async def _progress(info: dict) -> None:
         # 阶段进度写进快照 KV：GET /bills/sync 的轮询方（前端进度气泡）实时可读；
@@ -563,6 +565,17 @@ async def delete_import(import_id: int) -> dict:
         return {"deleted": (res.rowcount or 0) > 0, "importId": import_id}
 
 
+def _json_list(raw: str | None) -> list | None:
+    """行级 JSON 列 → 结构化列表；空/损坏返回 None（如实缺失）。"""
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return data if isinstance(data, list) else None
+
+
 def _tx_to_dict(r) -> dict:
     return {
         "id": r.id,
@@ -578,6 +591,10 @@ def _tx_to_dict(r) -> dict:
         "payment": r.payment,
         "discountPct": r.discount_pct,
         "origPrice": r.orig_price,
+        "walletBalance": r.wallet_balance or None,
+        "basePrice": r.base_price or None,
+        "paymentParts": _json_list(r.payment_parts_json),
+        "giftTo": _json_list(r.gift_to_json),
         "isGift": r.is_gift,
         "isRefund": r.is_refund,
         "origIsGift": r.orig_is_gift,

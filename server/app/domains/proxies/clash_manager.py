@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ctypes
 import io
 import logging
 import re
@@ -22,6 +23,7 @@ import subprocess
 import urllib.parse
 import zipfile
 from collections.abc import Sequence
+from ctypes import wintypes
 from pathlib import Path
 
 import httpx
@@ -113,23 +115,77 @@ def _maybe_upgrade_kernel(kernel_path: Path) -> str | None:
     return f"{'.'.join(map(str, current))} → {MIHOMO_VERSION}"
 
 
+class PROCESSENTRY32W(ctypes.Structure):
+    """`tlhelp32.h` 中 tagPROCESSENTRY32W 的逐字段映射。
+
+    布局由 C ABI 推导而非试错对齐：th32DefaultHeapID 是 ULONG_PTR，x64 下宽 8
+    且要求 8 字节对齐，而它前面三个 DWORD 只排到 offset 12，因此 offset 12 是
+    C 编译器强制插入的 4 字节衬垫。x64 上由此得 sizeof == 568、
+    offsetof(szExeFile) == 44——二者有断言锁定，改动字段顺序会立刻暴露错位。
+    """
+
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_void_p),  # ULONG_PTR：x64 下 8 字节
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", wintypes.LONG),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", wintypes.WCHAR * wintypes.MAX_PATH),
+    ]
+
+
+_TH32CS_SNAPPROCESS = 0x00000002
+
+
+def _image_process_running(image_name: str) -> bool:
+    """Toolhelp32 快照枚举：是否存在映像名为 `image_name` 的进程（忽略大小写）。
+
+    等价替代 `tasklist /FI "IMAGENAME eq <name>"`，但全程是本进程内的 Win32 调用：
+    只读内核给出的进程列表快照，不 OpenProcess、不触碰任何进程地址空间，也不拉起
+    任何子进程。快照失败返回 False（沿用旧实现「查询失败不阻断」的保守语义）。
+    """
+    kernel32 = ctypes.WinDLL("kernel32")
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+    if snapshot is None or snapshot == ctypes.c_void_p(-1).value:
+        return False
+
+    target = image_name.lower()
+    entry = PROCESSENTRY32W()
+    entry.dwSize = ctypes.sizeof(entry)
+    try:
+        ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while ok:
+            if entry.szExeFile.lower() == target:
+                return True
+            ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return False
+
+
 def _kernel_process_alive() -> bool:
     """内核进程存活探测：真孤儿（非本 runtime 实例）的兜底。
 
-    tasklist 快速过滤 mihomo 进程；查询失败（Windows 专属命令、非 Windows
-    环境等）返回 False——探测只是保守替换的额外闸门，失败不阻断补资产。
+    Windows 走 Toolhelp32 快照比对内核映像名（进程内 Win32 调用，不产生子进程）；
+    非 Windows 与旧行为一致返回 False——探测只是保守替换的额外闸门，失败不阻断
+    补资产。
     """
     if not is_windows():
         return False
     try:
-        out = subprocess.run(
-            ["tasklist", "/FI", f"IMAGENAME eq {kernel_filename()}", "/FO", "CSV", "/NH"],
-            capture_output=True, timeout=10,
-            encoding="utf-8", errors="replace",
-        ).stdout
+        return _image_process_running(kernel_filename())
     except Exception:  # noqa: BLE001
         return False
-    return kernel_filename().lower() in (out or "").lower()
 
 
 def _copy_bundled(kernel_path: Path, names: Sequence[str]) -> dict:

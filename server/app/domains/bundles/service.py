@@ -375,6 +375,7 @@ def _aggregate(
 # 铁律：排序所依赖的派生值一律在写时算好（本函数组），任何 GET 只读快照。
 _SNAPSHOT_TOLERANCE_FEN = 500  # 「国区 ≈ 追踪区最低」容差（±5 元，对齐 games isLowest）
 _SNAPSHOT_BATCH = 400  # 回写批量（SQLite 绑定变量上限内）
+_PRICE_LOAD_CHUNK = 9000  # 区域价装载批量：全库包数可超单条 IN 的绑定变量上限
 
 
 def _bundle_smart_score(
@@ -499,22 +500,30 @@ async def _refresh_bundle_sort_cache(
         return 0
 
     ids = [b.bundle_id for b in bundles]
-    price_rows = (
-        await db.execute(
-            select(
-                BundleRegionPrice.id,
-                BundleRegionPrice.bundle_id,
-                BundleRegionPrice.region_code,
-                BundleRegionPrice.price,
-                BundleRegionPrice.currency,
-                BundleRegionPrice.discount_percent,
-                BundleRegionPrice.bundle_base_discount,
-                BundleRegionPrice.discount_end_ts,
-                BundleRegionPrice.cny_fen,
-                BundleRegionPrice.app_ids,
-            ).where(BundleRegionPrice.bundle_id.in_(ids))
+    price_cols = (
+        BundleRegionPrice.id,
+        BundleRegionPrice.bundle_id,
+        BundleRegionPrice.region_code,
+        BundleRegionPrice.price,
+        BundleRegionPrice.currency,
+        BundleRegionPrice.discount_percent,
+        BundleRegionPrice.bundle_base_discount,
+        BundleRegionPrice.discount_end_ts,
+        BundleRegionPrice.cny_fen,
+        BundleRegionPrice.app_ids,
+    )
+    price_rows: list = []
+    for i in range(0, len(ids), _PRICE_LOAD_CHUNK):
+        chunk = ids[i : i + _PRICE_LOAD_CHUNK]
+        price_rows.extend(
+            (
+                await db.execute(
+                    select(*price_cols).where(
+                        BundleRegionPrice.bundle_id.in_(chunk)
+                    )
+                )
+            ).all()
         )
-    ).all()
     by_bundle: dict[int, list] = {}
     for p in price_rows:
         by_bundle.setdefault(p.bundle_id, []).append(p)

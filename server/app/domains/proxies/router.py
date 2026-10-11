@@ -486,7 +486,7 @@ async def sync_subscription(sub_id: int):
     重启生效（restarted=true，可能带新节点）时后台首检——新节点入库即
     校验，避免下个 6h 体检窗口前的未验证态（串行锁与手动检测互斥）。"""
     try:
-        result = await service.refresh_clash_subscription(sub_id)
+        result = await service.refresh_clash_subscription(sub_id, auto_switch=True)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:  # noqa: BLE001

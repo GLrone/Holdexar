@@ -57,6 +57,7 @@ async def ensure_seeded() -> None:
             await session.delete(legacy)
 
         changed = False
+        added = refreshed = reenabled = 0
         for idx, (code, name, currency) in enumerate(CC_LIST):
             row = existing.get(code)
             if row is None:
@@ -69,11 +70,13 @@ async def ensure_seeded() -> None:
                         sort=idx, updated_at=now,
                     )
                 )
+                added += 1
                 changed = True
             elif row.name != display_name(name) or row.currency != currency:
                 row.name = display_name(name)
                 row.currency = currency
                 row.updated_at = now
+                refreshed += 1
                 changed = True
 
         # 旧键迁移：按旧启用集重设 enabled（只在首次建表时生效一次）
@@ -83,10 +86,17 @@ async def ensure_seeded() -> None:
                 new_enabled = row.code in wanted
                 if new_enabled != row.enabled:
                     row.enabled = new_enabled
+                    reenabled += 1
                     changed = True
 
         if changed:
             await session.commit()
+            log_event(logger, "区服配置种子有更新", detail={
+                "新增区数": added,
+                "刷新展示名区数": refreshed,
+                "旧键迁移重设区数": reenabled,
+                "删除旧配置键": legacy is not None,
+            })
 
 
 async def list_regions() -> list[dict]:
