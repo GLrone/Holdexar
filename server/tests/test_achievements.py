@@ -1202,7 +1202,11 @@ async def test_summary_warm_sync_on_stale_snapshot(monkeypatch):
         warm_calls.append(target or "")
 
     monkeypatch.setattr(achievements_service, "start_sync", _fake_start_sync)
-    monkeypatch.setattr(achievements_service, "_last_warm_attempt", 0.0)
+    # 节流基准用「一天前」而非 0.0：monotonic 自系统引导起算，云端 runner 是
+    # 刚启动的虚拟机，其值可能小于节流窗（600 秒），0.0 会让节流闸误吞补拉
+    monkeypatch.setattr(
+        achievements_service, "_last_warm_attempt", time.monotonic() - 86400
+    )
 
     creds = [("steamRefresh_steam", "token")]
     stale = {

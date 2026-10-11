@@ -187,7 +187,7 @@ async def _record_ledger(
     log_event(
         logger,
         f"激活记录：{verdict}",
-        tag="CDK",
+        tag={"ok": "成功", "own": "信息"}.get(status, "失败"),
         detail={
             "类型": "激活" if kind == "cdk" else "免费领取",
             "激活码": _mask_key(product_key) if product_key else f"SubID {subid}",

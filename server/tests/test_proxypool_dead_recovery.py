@@ -16,6 +16,7 @@ from app.core.config import get_settings
 from app.core.database import get_engine, get_session_factory, init_db
 from app.domains.proxypool import health as H
 from app.domains.proxypool import scheduling as sched
+from app.domains.proxies.models import ProxySubscription
 from app.domains.proxypool.models import HealthObservation, ProxyNode, ProxyNodeSource
 from app.domains.proxypool.pool import eligible_runtime_names, pool_path
 from app.domains.proxypool.state import (
@@ -44,6 +45,10 @@ def env(tmp_path, monkeypatch):
 async def _add_node(*, node_id: str, state: str, failures: int = 0,
                     last_probe: datetime | None = None) -> None:
     async with get_session_factory()() as s:
+        # 订阅行必须真实存在：L0 的「失主来源清理」会把指向不存在订阅的
+        # 来源关联删掉，恢复探测因此跳过无来源节点
+        if await s.get(ProxySubscription, 1) is None:
+            s.add(ProxySubscription(id=1, kind="plain", url="http://sub.example/list"))
         s.add(ProxyNode(node_id=node_id, fingerprint=node_id, runtime_name=f"1|{node_id}",
                         proxy_type="http", server="10.0.0.1",
                         normalized_config=dict(CONFIG), state=state,

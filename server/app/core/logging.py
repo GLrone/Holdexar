@@ -155,6 +155,7 @@ _MODULE_LABELS = {
     "app.core.database": "数据库",
     "app.core.backup": "数据备份",
     "app.core.updater": "应用更新",
+    "app.core.optional_deps": "可选依赖",
     "app.core.rekey": "密钥换装",
     "app.core.external_time": "时间校准",
     "app.core.seed_assets": "种子数据",
