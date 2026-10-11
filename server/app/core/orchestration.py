@@ -40,6 +40,8 @@ KIND_SUBSCRIPTION_FAILED = "subscription_failed"
 KIND_SUBSCRIPTION_PROMOTED = "subscription_promoted"
 KIND_SUBSCRIPTION_EXITED = "subscription_exited"
 KIND_RECONCILE_REJECTED = "reconcile_rejected"
+KIND_MAINTENANCE_STARTED = "pool_maintenance_started"
+KIND_MAINTENANCE_ENDED = "pool_maintenance_ended"
 # 价格刷新周期（crawl 域）
 KIND_PRICE_CYCLE_FINISHED = "price_cycle_finished"
 

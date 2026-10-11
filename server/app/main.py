@@ -93,7 +93,8 @@ async def _autostart_clash() -> None:
         sub = picked["subscription"]
         config_path = picked["configPath"]
         status = await clash_manager.runtime.ensure_running(
-            detect["path"], config_path, subscription_url=sub["url"]
+            detect["path"], config_path, subscription_url=sub["url"],
+            mixed_port=await proxies_service.pinned_kernel_port(),
         )
         # 账本收敛：启动用的是上面这份配置内容，已下线/改名节点的旧行随启动清理
         # （订阅名不再自动回填——手动改名，见 proxies 域）
@@ -170,6 +171,11 @@ async def _post_startup_chain() -> None:
         await cleanup_orphan_jobs()
     except Exception:  # noqa: BLE001
         log_event(logger, "孤儿爬取任务清理失败，不阻塞启动", level=logging.ERROR, exc_info=True)
+
+    # 代理池两本台账（作业/体检）的上一进程遗留行收尸：函数内自兜失败
+    from app.domains.proxypool import jobruns as proxypool_jobruns
+
+    await proxypool_jobruns.record_interrupted()
 
     # 汇率白名单清洗：41 区货币集（+ TRY/ARS 预留）之外的历史币种数据清除
     from app.domains.rates import service as rates_service
@@ -374,6 +380,13 @@ async def _post_startup_chain() -> None:
     except Exception:  # noqa: BLE001
         log_event(logger, "Agent 孤儿运行收尸失败，不阻塞启动", level=logging.ERROR, exc_info=True)
     start_scheduler()
+    # 内容源自定义刷新节奏（自动抓取页 KV）：注册用默认，这里落用户值
+    try:
+        from app.core.scheduler import apply_content_schedules_from_settings
+
+        await apply_content_schedules_from_settings()
+    except Exception:  # noqa: BLE001
+        log_event(logger, "内容源自定义刷新节奏应用失败，保持默认拍点", level=logging.ERROR, exc_info=True)
     log_event(logger, "后台收拾链完成，服务已就绪（调度器已启动）")
 
     # 按需补齐（调度器启动后，网络步骤不占开门链）：种子缺失时后台下载并
