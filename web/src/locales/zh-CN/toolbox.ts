@@ -128,6 +128,17 @@ const toolbox = {
   'toolbox.cdk.done.allFailed': '激活全部失败（{fail} 个）——详情见结果列表',
   'toolbox.cdk.done.allFailedSkipped':
     '激活全部失败（{fail} 个）——详情见结果列表 · 配额跳过 {skipped}',
+
+  /* 激活历史（后端账本投影：成功/已拥有/失败与免费领取都留痕，跨会话可查） */
+  'toolbox.cdk.history.title': '激活历史',
+  'toolbox.cdk.history.count': '共 {n} 条',
+  'toolbox.cdk.history.loading': '历史记录加载中…',
+  'toolbox.cdk.history.empty': '暂无激活记录',
+  'toolbox.cdk.history.col.time': '时间',
+  'toolbox.cdk.history.col.result': '结果',
+  'toolbox.cdk.history.col.item': '内容',
+  'toolbox.cdk.history.col.detail': '说明',
+  'toolbox.cdk.history.freeItem': '免费领取 · SubID {subid}',
 } as const
 
 export default toolbox

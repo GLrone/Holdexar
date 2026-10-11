@@ -9,6 +9,7 @@ const about: Partial<Record<MessageKey, string>> = {
   /* Hero */
   'about.hero.desc':
     'A self-hosted personal terminal that pulls Steam multi-region pricing, wishlist monitoring, family library analytics, purchase history and proxy routing into one local dashboard. All data stays on this machine, and every outbound request goes through your own proxy chain — never a third-party server.',
+  'about.checkUpdate': 'Check for updates',
 
   /* Uptime value in the footer */
   'about.uptime.seconds': '{n} sec',

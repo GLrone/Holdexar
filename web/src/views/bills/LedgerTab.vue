@@ -6,7 +6,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 
 import { HlEmpty, HlIcon, HlInput, HlSkeleton, message } from '@/components/ui'
-import { billsApi, type BillTxItem, type BillYearStat } from '@/api/client'
+import { billsApi, type BillPaymentPart, type BillTxItem, type BillYearStat } from '@/api/client'
 import { currencyName } from '@/api/currencies'
 import { cachedGet } from '@/lib/apiCache'
 import {
@@ -185,6 +185,14 @@ function toggleRow(id: number) {
 const fmtFen = (fen: number | null) => (fen == null ? '' : fmt.money(fen / 100))
 const fmtCur = (tx: BillTxItem) =>
   `${tx.sign < 0 ? '+' : ''}${fmt.round2(tx.amount)} ${tx.currency}`
+
+/* 混合支付拆分段文本：渠道 + 金额（金额为 Steam 原文含区币符号，不再格式化） */
+function partsLabel(parts: BillPaymentPart[]): string {
+  return parts
+    .map((p) => [p.pm, p.amount].filter(Boolean).join(' '))
+    .filter(Boolean)
+    .join(' + ')
+}
 
 function rowClass(tx: BillTxItem) {
   return {
@@ -365,8 +373,12 @@ onMounted(() => {
                 <dl v-if="tx.fxRate != null" class="bills-kv"><dt>{{ t('bills.ledger.detail.rate') }}</dt><dd>{{ t('bills.ledger.detail.rateValue', { code: tx.currency, rate: tx.fxRate }) }}</dd></dl>
                 <dl v-if="tx.discountPct" class="bills-kv"><dt>{{ t('bills.ledger.detail.discount') }}</dt><dd>{{ tx.discountPct }}</dd></dl>
                 <dl v-if="tx.origPrice != null" class="bills-kv"><dt>{{ t('bills.ledger.detail.origPrice') }}</dt><dd>{{ tx.origPrice }} {{ tx.currency }}</dd></dl>
+                <dl v-if="tx.basePrice" class="bills-kv"><dt>{{ t('bills.ledger.detail.basePrice') }}</dt><dd>{{ tx.basePrice }}</dd></dl>
                 <dl v-if="tx.payment" class="bills-kv"><dt>{{ t('bills.ledger.detail.payment') }}</dt><dd>{{ tx.payment }}</dd></dl>
+                <dl v-if="tx.paymentParts?.length" class="bills-kv"><dt>{{ t('bills.ledger.detail.paymentSplit') }}</dt><dd>{{ partsLabel(tx.paymentParts) }}</dd></dl>
+                <dl v-if="tx.walletBalance" class="bills-kv"><dt>{{ t('bills.ledger.detail.walletBalance') }}</dt><dd>{{ tx.walletBalance }}</dd></dl>
                 <dl v-if="tx.origIsGift && tx.isRefund" class="bills-kv"><dt>{{ t('bills.ledger.detail.ownership') }}</dt><dd>{{ t('bills.ledger.detail.giftRefund') }}</dd></dl>
+                <dl v-if="tx.isGift && tx.giftTo?.length" class="bills-kv"><dt>{{ t('bills.ledger.detail.giftTo') }}</dt><dd>{{ tx.giftTo.join(', ') }}</dd></dl>
                 <div class="bills-tx__items">
                   <template v-for="(it, i) in tx.items" :key="i">
                     <!-- 命中家庭库的物品：封面 + 详情直达 chip，悬停给截至日价格 -->

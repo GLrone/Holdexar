@@ -32,6 +32,7 @@ const family = {
   'family.member.exclusive': '独占 {n}',
   'family.member.recent30': '近30日活跃 {n}',
   'family.member.remove': '移除',
+  'family.remove.failed': '移除成员失败：{err}',
 
   /* 地区二级窗 */
   'family.regionPop.who': '{role} · 当前 {region}',
@@ -56,6 +57,7 @@ const family = {
   'family.add.needInput': '请先输入好友码或 SteamID64（解析出账号后再添加）',
   'family.add.trackFailed': '已加入列表，但入库追踪失败：{err}',
   'family.add.success': '已添加 {name}：已进入监控池追踪（绑定 Cookie 后点「同步家庭组」自动补齐全家）',
+  'family.add.failed': '添加成员失败：{err}',
   'family.add.confirming': '添加中…',
   'family.add.action': '添加',
   'family.add.invite': '＋ 邀请成员加入家庭组（当前 {n} / 6，还可加入 {left} 人，可拖拽排序）',

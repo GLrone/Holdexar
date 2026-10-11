@@ -89,3 +89,95 @@ test('GFM 表格解析：表头、对齐与单元格行内样式', () => {
   assert.ok(html.includes('<td style="text-align: left"><strong>博德之门3</strong></td>'))
   assert.ok(html.includes('<td style="text-align: right">平史低</td>'))
 })
+
+test('SVG 图块：白名单标签原样呈现并包容器', () => {
+  const svg = '<svg viewBox="0 0 10 10"><rect x="1" y="1" width="8" height="8" fill="#E6F1FB" /><text x="2" y="5" font-size="4">链路</text></svg>'
+  const html = mdLiteToHtml(`前置说明\n${svg}\n后置说明`)
+  assert.ok(html.startsWith('<p>前置说明</p><div class="pilot-svg" role="region" aria-label="SVG">'))
+  assert.ok(html.includes('<div class="pilot-svg-stage" role="img"><svg viewBox="0 0 10 10">'))
+  assert.ok(html.includes('<rect x="1" y="1" width="8" height="8" fill="#E6F1FB" />'))
+  assert.ok(html.includes('<text x="2" y="5" fontSize="4">链路</text></svg></div>'))
+  assert.ok(html.includes('<div class="pilot-svg-source" style="display:none;"><pre><code>'))
+  assert.ok(html.endsWith('<p>后置说明</p>'))
+})
+
+test('SVG 图块：脚本与事件属性被剥除', () => {
+  const svg = '<svg><rect onload="alert(1)" x="1" width="2" height="2" /><script>alert(2)</script><foreignObject><body>hi</body></foreignObject></svg>'
+  const html = mdLiteToHtml(svg)
+  assert.ok(html.includes('<div class="pilot-svg"'))
+  assert.ok(!html.includes('onload'))
+  assert.ok(!html.includes('<script'))
+  assert.ok(!html.includes('foreignObject'))
+  assert.ok(!html.includes('alert'))
+})
+
+test('SVG 图块：属性值带 javascript 协议整体拒渲染（回落转义文本）', () => {
+  const svg = '<svg><rect width="10" height="javascript:alert(1)" /></svg>'
+  const html = mdLiteToHtml(svg)
+  assert.ok(!html.includes('pilot-svg'))
+  assert.ok(html.includes('&lt;svg&gt;'))
+})
+
+test('SVG 图块：未闭合（流式期）挂占位不闪现原始标记', () => {
+  const html = mdLiteToHtml('<svg viewBox="0 0 2 2"><rect ', { svgPendingLabel: '图生成中' })
+  assert.equal(html, '<div class="pilot-svg is-pending" role="status"><span>图生成中</span></div>')
+})
+
+test('SVG 图块：文本与属性值转义、实体还原后仍安全', () => {
+  const svg = '<svg><text x="1" y="1">a&lt;b &amp; c</text><rect width="1" height="1" title="&quot;q&quot;" /></svg>'
+  const html = mdLiteToHtml(svg)
+  assert.ok(html.includes('a&lt;b &amp; c'))
+  assert.ok(html.includes('title="&quot;q&quot;"'))
+  assert.ok(!html.includes('<b '))
+})
+
+test('SVG 图块：支持 style 标签与行内 style 属性，并拦截危险 CSS', () => {
+  const svg = '<svg viewBox="0 0 10 10"><style>.red { fill: #f00; }</style><rect class="red" width="5" height="5" style="stroke: #00f; stroke-width: 1px;" /></svg>'
+  const html = mdLiteToHtml(svg)
+  assert.ok(html.includes('<style>.red { fill: #f00; }</style>'))
+  assert.ok(html.includes('style="stroke: #00f; stroke-width: 1px;"'))
+
+  const badSvg = '<svg viewBox="0 0 10 10"><rect width="5" height="5" style="background: url(javascript:alert(1));" /></svg>'
+  assert.ok(!mdLiteToHtml(badSvg).includes('pilot-svg'))
+})
+
+test('SVG 图块：支持 use、symbol、defs 与局部 fragment 引用', () => {
+  const svg = '<svg viewBox="0 0 20 20"><defs><symbol id="dot"><circle r="2" /></symbol></defs><use href="#dot" x="5" y="5" fill="#f00" /></svg>'
+  const html = mdLiteToHtml(svg)
+  assert.ok(html.includes('<symbol id="dot">'))
+  assert.ok(html.includes('<use href="#dot"'))
+
+  const badUse = '<svg viewBox="0 0 20 20"><use href="javascript:alert(1)" /></svg>'
+  assert.ok(!mdLiteToHtml(badUse).includes('pilot-svg'))
+})
+
+test('SVG 图块：支持 filter 滤镜图元与 clipPath', () => {
+  const svg = '<svg viewBox="0 0 20 20"><defs><filter id="sh"><feDropShadow dx="1" dy="1" stdDeviation="2" /></filter><clipPath id="cp"><rect width="10" height="10" /></clipPath></defs><rect filter="url(#sh)" clip-path="url(#cp)" width="15" height="15" /></svg>'
+  const html = mdLiteToHtml(svg)
+  assert.ok(html.includes('<filter id="sh">'))
+  assert.ok(html.includes('<feDropShadow'))
+  assert.ok(html.includes('clip-path="url(#cp)"'))
+})
+
+test('SVG 图块：围栏包含 XML 声明、DOCTYPE 与注释正常提取渲染', () => {
+  const fence = '```xml\n<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">\n<!-- 图表说明 -->\n<svg viewBox="0 0 10 10"><circle cx="5" cy="5" r="4" fill="#E6F1FB" /></svg>\n```'
+  const html = mdLiteToHtml(fence)
+  assert.ok(html.includes('<div class="pilot-svg" role="region" aria-label="SVG">'))
+  assert.ok(html.includes('<circle cx="5" cy="5" r="4" fill="#E6F1FB" />'))
+})
+
+test('SVG 图块：缺少 viewBox 但具备数值宽高自动补全 viewBox 保持自适应', () => {
+  const svg = '<svg width="200" height="100"><rect width="200" height="100" fill="#E6F1FB" /></svg>'
+  const html = mdLiteToHtml(svg)
+  assert.ok(html.includes('viewBox="0 0 200 100"'))
+})
+
+test('SVG 图块：流式未闭合状态下自动补全闭合标签并渐进式出图渲染', () => {
+  const streamingPartial = '```svg\n<svg viewBox="0 0 100 100">\n<rect x="10" y="10" width="80" height="80" fill="#66c0f4" />\n<g stroke="#fff">\n<line x1="20" y1="50" x2="80" y2="50" />'
+  const html = mdLiteToHtml(streamingPartial, { svgDrawingLabel: '绘制中...' })
+  assert.ok(html.includes('class="pilot-svg is-drawing"'))
+  assert.ok(html.includes('<span>绘制中...</span>'))
+  assert.ok(html.includes('<rect x="10" y="10" width="80" height="80" fill="#66c0f4" />'))
+  assert.ok(html.includes('<line x1="20" y1="50" x2="80" y2="50" /></g></svg></div>'))
+})
+

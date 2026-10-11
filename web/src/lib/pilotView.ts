@@ -38,3 +38,26 @@ export function sessionTime(iso: string | null | undefined): string {
   const md = `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
   return d.getFullYear() === now.getFullYear() ? md : `${d.getFullYear()}-${md}`
 }
+
+export const ANSWER_CLAMP_CHARS = 700
+
+/** 长回答判定：正文字符数超过阈值 */
+export function isLongAnswerText(text: string | null | undefined): boolean {
+  return (text?.length ?? 0) > ANSWER_CLAMP_CHARS
+}
+
+/** 失败/异常原因键集合（对应红色错误条件气泡与允许重试） */
+export const ERROR_REASON_KEYS = new Set([
+  'pilot.error',
+  'pilot.reason.llm_failed',
+  'pilot.reason.busy',
+  'pilot.reason.too_long',
+  'pilot.reason.cap_reached',
+  'pilot.reason.max_steps',
+])
+
+export function isErrorReason(reasonKey: string | null | undefined): boolean {
+  if (!reasonKey) return false
+  return ERROR_REASON_KEYS.has(reasonKey)
+}
+

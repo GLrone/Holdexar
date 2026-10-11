@@ -41,6 +41,8 @@ function formatApiDetail(detail: unknown): string {
 // 各视图 onMounted 无条件重拉是板块切换延迟的主因之一；这里在唯一请求
 // 出口收口：切换往返（< TTL）直接复用上次响应，并发同 URL 共享同一请求。
 
+/** 领航员流式问答：建流后等待首个事件的时限（超时中止，交由调用方复位与提示）。 */
+const PILOT_FIRST_EVENT_TIMEOUT_MS = 25_000
 const GET_CACHE_TTL = 60_000
 const GET_CACHE_MAX = 128
 /** Map 插入序即 LRU 序：命中时摘下重插，超限淘汰最老一条 */
@@ -166,6 +168,8 @@ export interface SettingsPayload {
   backup_auto: boolean
   /** 已主动提示过的版本号：启动告知按「一次一版本」去重的锚点 */
   update_notified: string
+  /** 用户跳过的版本号：气泡/自动提示不再出现该版本（手动检查不受限） */
+  update_skipped: string
   /** 新版本提示总开关：false = 有新版也不弹窗/不亮红点（只留手动检查） */
   update_notify: boolean
   /** 静默自动更新：true = 检测到新版本后台自动下载校验，不打扰，下次启动换装 */
@@ -227,6 +231,8 @@ export const settingsApi = {
     backup_auto?: boolean
     /** 记录已主动提示过的版本号（启动告知去重用） */
     update_notified?: string
+    /** 跳过此版本（严格等值匹配：跳过 A 不拦 A 之后的 B） */
+    update_skipped?: string
     /** 新版本提示总开关 */
     update_notify?: boolean
     /** 静默自动更新开关 */
@@ -264,8 +270,14 @@ export interface PilotConfigPayload {
   models_disabled: string[]
   has_api_key: boolean
   monthly_cap: number
-  /** 活跃供应商的模型窗口（token）；未知 = null */
+  /** 生效的模型窗口（token）：手填优先，其次按模型名自动识别；都没有 = null */
   context_window: number | null
+  /** 窗口来源：manual 手填 / auto 按模型名识别 / fallback 兜底估算 / none 未知 */
+  context_window_source: 'manual' | 'auto' | 'fallback' | 'none'
+  /** 按当前模型名识别出的窗口（不轮手填与否），供设置页对照提示 */
+  context_window_auto: number | null
+  /** 历史轮工具结果保留预算（字符，头尾保留、中段省略） */
+  tool_content_limit: number
   usage_inp: number
   usage_out: number
   usage_calls: number
@@ -360,6 +372,8 @@ export interface PilotNavigateFacts {
   kind: 'navigate'
   target: string
   path: string
+  /** 可选板块键（gamelib/bills/family 页签），页内定位用 */
+  section?: string
 }
 
 /** 行卡：清单与诊断的通用形态。k 为名称/区码等专有名词；vKey 对应词条键
@@ -444,6 +458,33 @@ export interface PilotStepperFacts {
   steps: PilotStepperStep[]
 }
 
+export interface PilotEpicOfferItem {
+  title: string
+  titleCn?: string | null
+  appid?: number | null
+  start: string
+  end: string
+  upcoming: boolean
+  image?: string | null
+  url: string
+  priceOriginal?: string | null
+}
+
+export interface PilotEpicFacts {
+  kind: 'epic'
+  titleKey?: string
+  offers: PilotEpicOfferItem[]
+  mobile?: {
+    title?: string | null
+    image?: string | null
+    url: string
+    end?: string | null
+    worth?: string | null
+  } | null
+  fetchedAt?: string | null
+  total?: number
+}
+
 export type PilotFacts =
   | PilotPriceFacts
   | PilotRegionsFacts
@@ -456,6 +497,7 @@ export type PilotFacts =
   | PilotFamilyFacts
   | PilotAchievementFacts
   | PilotStepperFacts
+  | PilotEpicFacts
 
 /** agent 时间线步骤：label 对应词条键 `pilot.step.{label}`，data 供词条插值。
  *  status = ok / empty / denied / timeout / failed；running 与耗时只存在于流式过程的本地态。 */
@@ -476,6 +518,8 @@ export interface PilotPhase {
   thinking: string
   /** 该步正文；terminal 段的正文即终答 */
   text: string
+  /** 该步执行期结算下发的卡片（卡片出现账本，按账本序；无卡为空） */
+  cards?: PilotFacts[]
   /** 该步思考工时（毫秒）；无思考为 null */
   think_ms?: number | null
   /** 该步思考超单阶段预算，已停止累加 */
@@ -535,6 +579,35 @@ export interface PilotAskResponse {
   elapsed_ms?: number | null
   /** 本轮完成时已归档进要点存档的轮数边界（过程链记忆条目用）；降级轮为 null */
   archived_through?: number | null
+  /** 本轮随问携带的附件引用（用户消息下的附件芯片与历史还原用；无附件时缺省） */
+  attachments?: PilotAttachmentRef[]
+  /** 本轮实际入库的提问（超长正文被服务端转附件时是收窄后的形态）；展示与账本同源 */
+  q?: string
+}
+
+/** 长文本附件引用：全文在后端落盘，消息体里只有这条引用（见 pilot/attachments.py） */
+export interface PilotAttachmentRef {
+  id: string
+  name: string
+  /** 字符数 */
+  chars: number
+  /** 行数 */
+  lines: number
+  created_at?: string | null
+}
+
+/** 附件区间读取结果：按行号取一块；truncated=true 时按 end_line+1 续读 */
+export interface PilotAttachmentChunk {
+  id: string
+  name: string
+  lines: number
+  chars: number
+  start_line: number
+  end_line: number
+  truncated: boolean
+  content: string
+  /** 截断时的续读提示（后端原文，直接展示） */
+  note?: string
 }
 
 export interface PilotToolRunResult {
@@ -571,6 +644,8 @@ export const pilotApi = {
     api_key?: string
     monthly_cap?: number
     models_disabled?: string[]
+    /** 历史轮工具结果保留预算（字符，服务端夹在 500–20000） */
+    tool_content_limit?: number
     /** 切换活跃供应商（模型自动重置为新家启用清单） */
     active?: string
   }) => request<PilotConfigPayload>('PUT', '/pilot/config', payload),
@@ -586,6 +661,22 @@ export const pilotApi = {
     request<{ ok: boolean }>('DELETE', `/pilot/providers/${encodeURIComponent(id)}`),
   ask: (question: string, appid?: number) =>
     request<PilotAskResponse>('POST', '/pilot/ask', { question, appid }),
+  /** 长文本落盘为附件：粘贴超阈值时先存，提问只带引用 id */
+  createAttachment: (sessionId: string, text: string, name?: string) =>
+    request<PilotAttachmentRef>('POST', '/pilot/attachments', {
+      session_id: sessionId,
+      text,
+      name,
+    }),
+  /** 附件区间读取：展开附件时取一块（truncated 时按 end_line + 1 续读） */
+  readAttachment: (sessionId: string, id: string, startLine = 1, endLine?: number) =>
+    request<PilotAttachmentChunk>(
+      'GET',
+      `/pilot/attachments/${encodeURIComponent(id)}?session_id=${encodeURIComponent(sessionId)}`
+        + `&start_line=${startLine}` + (endLine ? `&end_line=${endLine}` : ''),
+      undefined,
+      { noCache: true },
+    ),
   /** 会话账本读取（历史轮还原）；无会话返回 404 */
   getSession: (sessionId: string) =>
     request<PilotSessionOut>('GET', `/pilot/sessions/${encodeURIComponent(sessionId)}`, undefined, { noCache: true }),
@@ -595,15 +686,48 @@ export const pilotApi = {
       'POST',
       `/pilot/sessions/${encodeURIComponent(sessionId)}/compact`,
     ),
-  /** 历史会话清单（mtime 倒序投影） */
-  listSessions: (limit = 50) =>
-    request<{ items: PilotSessionListItem[] }>('GET', `/pilot/sessions?limit=${limit}`, undefined, { noCache: true }),
+  /** 历史会话清单（mtime 倒序投影；置顶在前）。q 给定时按关键词过滤 */
+  listSessions: (limit = 50, q = '') =>
+    request<{ items: PilotSessionListItem[] }>(
+      'GET',
+      `/pilot/sessions?limit=${limit}` + (q ? `&q=${encodeURIComponent(q)}` : ''),
+      undefined,
+      { noCache: true },
+    ),
   /** 会话改名（账本追加 title 记录，后者胜） */
   renameSession: (sessionId: string, text: string) =>
     request<{ ok: boolean }>('PUT', `/pilot/sessions/${encodeURIComponent(sessionId)}/title`, { text }),
+  /** 置顶开/关（账本追加 pin 记录）；机器码见 reason（no_session/write_failed） */
+  pinSession: (sessionId: string, on: boolean) =>
+    request<{ ok: boolean; reason: string | null }>(
+      'PUT',
+      `/pilot/sessions/${encodeURIComponent(sessionId)}/pin`,
+      { on },
+    ),
+  /** 归档开/关（账本追加 archive 记录）；机器码见 reason */
+  archiveSession: (sessionId: string, on: boolean) =>
+    request<{ ok: boolean; reason: string | null }>(
+      'PUT',
+      `/pilot/sessions/${encodeURIComponent(sessionId)}/archive`,
+      { on },
+    ),
+  /** 话题分叉：从本会话前 keepTurns 轮派生新会话；成功返回新会话 id */
+  forkSession: (sessionId: string, keepTurns: number) =>
+    request<{ ok: boolean; sid: string; turn_total: number; reason: string | null }>(
+      'POST',
+      `/pilot/sessions/${encodeURIComponent(sessionId)}/fork`,
+      { keep_turns: keepTurns },
+    ),
   /** 删除会话文件（与 TTL 清扫同机制） */
   deleteSession: (sessionId: string) =>
     request<{ ok: boolean }>('DELETE', `/pilot/sessions/${encodeURIComponent(sessionId)}`),
+  /** 编辑重问：账本保留前 keepTurns 轮，其后轮次作废；机器码见 reason（no_session/busy/write_failed） */
+  rewindSession: (sessionId: string, keepTurns: number) =>
+    request<{ ok: boolean; turn_total: number; reason: string | null }>(
+      'POST',
+      `/pilot/sessions/${encodeURIComponent(sessionId)}/rewind`,
+      { keep_turns: keepTurns },
+    ),
   /** 批量提议确认：approve 为真逐项执行既有写动作，为假作废；机器码见 reason */
   confirmProposal: (sessionId: string, pid: string, approve: boolean) =>
     request<{
@@ -615,6 +739,58 @@ export const pilotApi = {
       failed: { appid: number; name: string | null }[]
       reason: string | null
     }>('POST', '/pilot/proposal/confirm', { session_id: sessionId, pid, approve }),
+}
+
+/** 运行账本（agent 域）：后台任务的只读投影 + 取消。与调度器同一事实源 */
+export const agentApi = {
+  /** 可调度任务形态白名单（kind → 标签键，后端登记表投影） */
+  listTasks: () =>
+    request<{ kind: string; label: string }[]>('GET', '/agent/tasks', undefined, { noCache: true }),
+  /** 最近运行列表（新→旧）；status 给定时按状态过滤 */
+  listRuns: (status?: string, limit = 20) =>
+    request<{ items: AgentRunView[] }>(
+      'GET',
+      `/agent/runs?limit=${limit}` + (status ? `&status=${encodeURIComponent(status)}` : ''),
+      undefined,
+      { noCache: true },
+    ),
+  /** 取消运行（幂等）：accepted = 本轮是否新受理；status = 响应时刻状态 */
+  cancelRun: (runId: string, reason = 'user') =>
+    request<{ accepted: boolean; status: string }>(
+      'POST',
+      `/agent/runs/${encodeURIComponent(runId)}/cancel`,
+      { reason },
+    ),
+  /** 运行事件回放（after_seq 游标续读） */
+  listEvents: (runId: string, afterSeq = 0, limit = 200) =>
+    request<{ run_id: string; items: AgentEventItem[] }>(
+      'GET',
+      `/agent/runs/${encodeURIComponent(runId)}/events?after_seq=${afterSeq}&limit=${limit}`,
+      undefined,
+      { noCache: true },
+    ),
+}
+
+/** 运行账本一行（agent_runs 投影）；runner=job 为调度任务，fake/task 为运行面自证 */
+export interface AgentRunView {
+  run_id: string
+  session_id: string
+  runner: string
+  trigger: string
+  /** job 型：{ job, entry, task?, ref? }；fake 型：{ scenario, steps, step_delay } */
+  meta: Record<string, unknown> | null
+  status: string
+  error_code: string | null
+  created_at: string | null
+  started_at: string | null
+  finished_at: string | null
+}
+
+export interface AgentEventItem {
+  seq: number
+  event_type: string
+  payload: Record<string, unknown> | null
+  created_at: string | null
 }
 
 /** 会话账本里的一轮问答：后端落盘的历史投影，前端按其还原历史轮 */
@@ -667,6 +843,12 @@ export interface PilotSessionOut {
   proposals?: { pid: string; state: string; done: number | null; failedCount?: number }[]
   /** 全部轮次统计折叠（空会话为 null） */
   stats?: PilotSessionStats | null
+  /** 置顶标记（账本事实） */
+  pinned?: boolean
+  /** 归档标记（账本事实） */
+  archived?: boolean
+  /** 分叉溯源：本会话派生自哪个会话（非派生会话为 null/缺省） */
+  forked_from?: string | null
 }
 
 /** 历史会话清单项（账本只读投影） */
@@ -678,6 +860,14 @@ export interface PilotSessionListItem {
   updated_at: string | null
   /** ask 流在途（agent 正在生成本会话回复） */
   running?: boolean
+  /** 置顶标记（账本事实）：列表把置顶项排在最前 */
+  pinned?: boolean
+  /** 归档标记（账本事实）：列表可折叠归档区 */
+  archived?: boolean
+  /** 分叉溯源：本会话派生自哪个会话（非派生会话为 null/缺省） */
+  forked_from?: string | null
+  /** 搜索命中片段（仅带 q 查询且有正文命中时非空） */
+  snippet?: string
 }
 
 export interface PilotStreamEvent {
@@ -722,6 +912,31 @@ export interface PilotStreamEvent {
 /** 流式问答：SSE 帧解析（data: JSON / data: [DONE]），事件逐个回调。
  *  thinking 通道 = 推理模型思维链增量；普通模型只有 answer 通道。
  *  sessionId 串起同一次开舱内的追问与指代（候选待定 / 上一款游戏）。 */
+/** 中断续跑载荷：上一轮被中断时已完成的事实（一次性注入上下文，不入账本） */
+export interface PilotResumePayload {
+  /** 上一轮已流出的正文结尾（模型从这里接着写） */
+  text?: string
+  /** 上一轮已完成的工具调用（结果可采信，不必重复执行） */
+  tools?: { name?: string; label?: string; status?: string; summary?: string }[]
+}
+
+/** 用户当前页面的上下文（领航台注入模型用） */
+export interface PilotViewContext {
+  route: string
+  section?: string
+  tab?: string
+  sessionTitle?: string
+  appid?: number
+}
+
+export interface PilotElementRef {
+  tag: string
+  label: string
+  text: string
+  selector: string
+  role: string
+}
+
 export async function askPilotStream(
   question: string,
   appid: number | undefined,
@@ -729,36 +944,69 @@ export async function askPilotStream(
   onEvent: (e: PilotStreamEvent) => void,
   referenceSid?: string,
   signal?: AbortSignal,
+  resume?: PilotResumePayload,
+  attachments?: string[],
+  viewContext?: PilotViewContext,
+  elementRefs?: PilotElementRef[],
 ): Promise<void> {
+  // 首帧看门狗：连接建好后迟迟不来事件（后端排队 / 闸未通过 / 流被中间层缓冲）
+  // 时，调用方会一直停在 streaming 态，发送按钮被「停止」顶掉——观感就是点了没
+  // 反应。收到第一个事件即解除，之后不设总时长上限（长回答与慢工具仍照常跑）；
+  // 心跳注释帧不算事件，避免用空帧把看门狗骗过去。
+  const ctrl = new AbortController()
+  const onOuterAbort = () => ctrl.abort()
+  signal?.addEventListener('abort', onOuterAbort)
+  const watchdog = setTimeout(() => ctrl.abort(), PILOT_FIRST_EVENT_TIMEOUT_MS)
   const resp = await fetch(`${BASE}/pilot/ask/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question, appid, session_id: sessionId, reference_sid: referenceSid || undefined }),
-    signal,
+    body: JSON.stringify({
+      question,
+      appid,
+      session_id: sessionId,
+      reference_sid: referenceSid || undefined,
+      resume: resume || undefined,
+      attachments: attachments?.length ? attachments : undefined,
+      view_context: viewContext || undefined,
+      element_refs: elementRefs?.length ? elementRefs : undefined,
+    }),
+    signal: ctrl.signal,
   })
-  if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`)
+  if (!resp.ok || !resp.body) {
+    clearTimeout(watchdog)
+    signal?.removeEventListener('abort', onOuterAbort)
+    // 带上响应体：422 一类拒绝带具体原因（如提问超长），调用方才能翻成人话
+    const detail = await resp.text().catch(() => '')
+    throw new Error(`HTTP ${resp.status}${detail ? ' ' + detail.slice(0, 200) : ''}`)
+  }
   const reader = resp.body.getReader()
   const decoder = new TextDecoder()
   let buf = ''
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buf += decoder.decode(value, { stream: true })
-    let idx: number
-    while ((idx = buf.indexOf('\n\n')) >= 0) {
-      const raw = buf.slice(0, idx)
-      buf = buf.slice(idx + 2)
-      for (const line of raw.split('\n')) {
-        if (!line.startsWith('data:')) continue
-        const data = line.slice(5).trim()
-        if (!data || data === '[DONE]') continue
-        try {
-          onEvent(JSON.parse(data) as PilotStreamEvent)
-        } catch {
-          /* 坏帧跳过，不影响后续 */
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      let idx: number
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const raw = buf.slice(0, idx)
+        buf = buf.slice(idx + 2)
+        for (const line of raw.split('\n')) {
+          if (!line.startsWith('data:')) continue
+          const data = line.slice(5).trim()
+          if (!data || data === '[DONE]') continue
+          try {
+            onEvent(JSON.parse(data) as PilotStreamEvent)
+            clearTimeout(watchdog)
+          } catch {
+            /* 坏帧跳过，不影响后续 */
+          }
         }
       }
     }
+  } finally {
+    clearTimeout(watchdog)
+    signal?.removeEventListener('abort', onOuterAbort)
   }
 }
 
@@ -905,6 +1153,8 @@ export interface FamilyMemberItem {
   role: string
   personaName: string
   avatarUrl: string
+  /** 成员来源：steam=家庭组同步镜像；manual=用户手动添加 */
+  origin: 'steam' | 'manual'
   /** 服务端判定的地区（手动 > 钱包结算区 > 资料国家）；null = 未设置 */
   region: string | null
   regionSource: 'manual' | 'wallet' | 'profile' | null
@@ -1028,6 +1278,20 @@ export const familyApi = {
       `/family/sync${toQuery(steamId ? { steam_id: steamId } : {})}`,
     ),
   status: () => request<FamilyStatus>('GET', '/family/status'),
+  /** 手动添加家庭成员（manual 条目落家庭组账）；groupSteamid 缺省 = 主账号组 */
+  addMember: (steamid: string, personaName = '', avatarUrl = '', groupSteamid?: string) =>
+    request<{ ok: boolean }>('POST', '/family/members', {
+      steamid,
+      personaName,
+      avatarUrl,
+      groupSteamid: groupSteamid || null,
+    }),
+  /** 移除家庭成员：manual 删条目；steam 来源落持久排除标记（同步不复活） */
+  removeMember: (steamid: string, groupSteamid?: string) =>
+    request<{ ok: boolean; removed: boolean }>(
+      'DELETE',
+      `/family/members/${steamid}${toQuery(groupSteamid ? { group_steamid: groupSteamid } : {})}`,
+    ),
   saveMemberRegions: (regions: Record<string, string>) =>
     request<{ ok: boolean; memberRegions: Record<string, string> }>(
       'PUT',
@@ -1860,6 +2124,8 @@ export interface UpdateProgress {
 export interface UpdatePending {
   pending: boolean
   tag?: string
+  /** 上次换装失败已回滚（前端给「重新下载」出路的依据） */
+  swapFailed?: boolean
 }
 
 /** 密钥保护状态：凭据静态加密的密钥托管方式与解锁态 */
@@ -2170,6 +2436,8 @@ export const proxiesApi = {
       usedCache: boolean
       restarted: boolean
       prunedLedger: number
+      /** 订阅有效且重拉时处于默认直连：已自动切到代理优先 */
+      strategySwitched?: boolean
     }>('POST', `/proxies/subscriptions/${id}/sync`),
   importSubscription: (id: number) =>
     request<{
@@ -2455,6 +2723,12 @@ export interface BillImportItem {
   fxMissing: number
 }
 
+/** 混合支付拆分段（Steam 导出原文：支付渠道 pm + 渠道金额 amount） */
+export interface BillPaymentPart {
+  pm: string
+  amount: string
+}
+
 export interface BillTxItem {
   id: number
   date: string
@@ -2469,6 +2743,14 @@ export interface BillTxItem {
   payment: string
   discountPct: string
   origPrice: number | null
+  /** 交易后钱包余额（Steam 账单原文，含区币符号） */
+  walletBalance: string | null
+  /** 商店区基准价原文（Steam 新版账单基准价列；与 origPrice 折前原价数值不同源） */
+  basePrice: string | null
+  /** 混合支付拆分（原文金额） */
+  paymentParts: BillPaymentPart[] | null
+  /** 送出礼物的受赠人（可多个） */
+  giftTo: string[] | null
   isGift: boolean
   isRefund: boolean
   origIsGift: boolean
@@ -2656,12 +2938,40 @@ export interface RedeemQuota {
   limit: number
 }
 
+export interface RedeemActivationRow {
+  id: number
+  /** 记录时间（本地时区 "YYYY-MM-DD HH:mm:ss"） */
+  createdAt: string
+  /** cdk=激活码激活 · free=免费领取 */
+  kind: 'cdk' | 'free'
+  status: 'ok' | 'own' | 'fail'
+  /** 激活码原文（免费领取行为空） */
+  key: string
+  subId: string
+  subName: string
+  /** 结果说明 / 失败原因 */
+  detail: string
+  steamId: string
+}
+
+export interface RedeemActivationList {
+  total: number
+  rows: RedeemActivationRow[]
+}
+
 export const redeemApi = {
   activateKeys: (keys: string[]) =>
     request<RedeemBatchResult>('POST', '/redeem/keys', { keys }),
   freeClaims: (subids: number[]) =>
     request<RedeemBatchResult>('POST', '/redeem/free', { subids }),
   quota: () => request<RedeemQuota>('GET', '/redeem/quota'),
+  activations: (q: { limit?: number; offset?: number } = {}) =>
+    request<RedeemActivationList>(
+      'GET',
+      `/redeem/activations${toQuery({ limit: q.limit, offset: q.offset })}`,
+      undefined,
+      { noCache: true },
+    ),
 }
 
 // ─── metadata（Epic 喜加一展示链：仪表盘卡片）───

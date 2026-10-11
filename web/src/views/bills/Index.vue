@@ -5,6 +5,7 @@
    CNY。三个视图：消费明细 / 充值流水 / 许可证（零售 CDK / 礼物 / 免费，
    家庭页「入库许可证 · CDK 花费台账」模块已并入许可证页签）。 */
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
 import { BarChart, LineChart } from 'echarts/charts'
@@ -44,6 +45,13 @@ const TABS = computed<HlTabItem[]>(() => [
   { key: 'topup', label: t('bills.tab.topup') },
   { key: 'cdk', label: t('bills.tab.cdk') },
 ])
+
+/* 领航员导航带板块键（route.query.s）：合法页签直接定位（agent 跳转入口） */
+const route = useRoute()
+watch(() => route.query.s, (s) => {
+  if (typeof s === 'string' && TABS.value.some((t) => t.key === s)) activeTab.value = s
+}, { immediate: true })
+
 
 /** tooltip 主题化配色（悬停提示窗红线：echarts 默认白底脱离双主题，禁止） */
 const tipPalette = useTipPalette()
@@ -152,6 +160,8 @@ const stats = computed(() => {
 
 /* ── 月度图（柱=当月净支出，线=累计）── */
 const activeTab = ref('ledger')
+
+
 const chartYear = ref<string>('all')
 const yearOptions = computed(() => [
   { label: t('bills.year.all'), value: 'all' },

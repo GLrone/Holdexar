@@ -108,9 +108,13 @@ const bills = {
   'bills.ledger.detail.rateValue': '1 {code} = {rate} CNY',
   'bills.ledger.detail.discount': '折扣',
   'bills.ledger.detail.origPrice': '折前原价',
+  'bills.ledger.detail.basePrice': '基准价',
+  'bills.ledger.detail.walletBalance': '钱包余额',
   'bills.ledger.detail.payment': '支付方式',
+  'bills.ledger.detail.paymentSplit': '支付拆分',
   'bills.ledger.detail.ownership': '归属',
   'bills.ledger.detail.giftRefund': '送礼退款',
+  'bills.ledger.detail.giftTo': '受赠人',
 
   /* ── 命中条（CdkTab + LedgerTab 共用：家庭库关联 + 截至日价格上下文）── */
   'bills.hit.stat': '库存命中',

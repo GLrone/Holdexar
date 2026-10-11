@@ -7,9 +7,9 @@ import zh from '../src/locales/zh-CN/shell.ts'
 /* P-M3 导航 IA：核心四入口的职责词、三组结构、一级导航禁词。
    只钉用户面词条 value——route / store / API 名不在这里约束。 */
 
-test('四个核心心智入口的命名固定（找游戏=发现 / 游戏库=拥有 / 我的关注=持续关注 / 价格提醒=主动通知）', () => {
+test('四个核心心智入口的命名固定（游戏商店=发现 / 游戏库=拥有 / 我的关注=持续关注 / 价格提醒=主动通知）', () => {
   const coreZh: Record<string, string> = {
-    'nav.library': '找游戏',
+    'nav.library': '游戏商店',
     'nav.gamelib': '游戏库',
     'nav.pool': '我的关注',
     'nav.alerts': '价格提醒',
@@ -18,7 +18,7 @@ test('四个核心心智入口的命名固定（找游戏=发现 / 游戏库=拥
     assert.equal((zh as Record<string, string>)[key], value, `${key} zh 命名漂移`)
   }
   const coreEn: Record<string, string> = {
-    'nav.library': 'Find Games',
+    'nav.library': 'Store',
     'nav.gamelib': 'Game Library',
     'nav.pool': 'Following',
     'nav.alerts': 'Price Alerts',

@@ -194,7 +194,7 @@ function stepText(s: PilotStep): string {
           :waiting-text="waitingText"
         />
         <p v-if="p.truncated" class="pchain__truncated">{{ t('pilot.think.truncated') }}</p>
-        <p v-if="phasePre(p) && !hidePhaseText" class="pchain__pre">{{ phasePre(p) }}</p>
+        <p v-if="phasePre(p) && p.steps.length" class="pchain__pre">{{ phasePre(p) }}</p>
 
         <div class="pchain__steps-list">
           <div

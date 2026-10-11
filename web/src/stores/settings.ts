@@ -13,8 +13,8 @@ export const useSettingsStore = defineStore('settings', () => {
   const autoPrice = ref<boolean | null>(null)
   /** 每日自动备份开关（null = 未拉到，UI 按开处理；启动补备同闸） */
   const backupAuto = ref<boolean | null>(null)
-  /** 已主动提示过的版本号（'' = 从未提示；启动告知据此做「一次一版本」去重） */
-  const updateNotified = ref('')
+  /** 用户跳过的版本号（'' = 无；严格等值匹配，新版本号天然绕过旧跳过记录） */
+  const updateSkipped = ref('')
   /** 新版本提示开关（null = 未拉到，UI 按开处理：提示默认开） */
   const updateNotify = ref<boolean | null>(null)
   /** 静默自动更新开关（null = 未拉到，UI 按关处理：默认不偷偷下载整包） */
@@ -30,7 +30,7 @@ export const useSettingsStore = defineStore('settings', () => {
       onboardingDone.value = s.onboarding_done
       autoPrice.value = s.auto_price
       backupAuto.value = s.backup_auto
-      updateNotified.value = s.update_notified
+      updateSkipped.value = s.update_skipped
       updateNotify.value = s.update_notify
       updateAuto.value = s.update_auto
       directNoticeSeen.value = s.direct_notice_seen
@@ -51,15 +51,14 @@ export const useSettingsStore = defineStore('settings', () => {
     }
   }
 
-  /** 记录本次已提示的版本号（先改本地避免同会话重复弹；落库失败静默可接受） */
-  async function markUpdateNotified(version: string) {
-    if (!version) return
-    updateNotified.value = version
+  /** 跳过此版本（持久化：气泡与自动提示不再出现该版本；手动检查不受限） */
+  async function setUpdateSkipped(version: string) {
+    updateSkipped.value = version
     try {
-      const s = await settingsApi.update({ update_notified: version })
-      updateNotified.value = s.update_notified
+      const s = await settingsApi.update({ update_skipped: version })
+      updateSkipped.value = s.update_skipped
     } catch {
-      /* 静默：失败只影响下次启动会再提示一次 */
+      /* 静默：失败只影响下次启动会再提示 */
     }
   }
 
@@ -136,13 +135,13 @@ export const useSettingsStore = defineStore('settings', () => {
     onboardingDone,
     autoPrice,
     backupAuto,
-    updateNotified,
+    updateSkipped,
     updateNotify,
     updateAuto,
     directNoticeSeen,
     load,
     markOnboardingDone,
-    markUpdateNotified,
+    setUpdateSkipped,
     markDirectNoticeSeen,
     setAutoPrice,
     setBackupAuto,

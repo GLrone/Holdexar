@@ -69,6 +69,32 @@ const galleryCards: PilotFacts[] = [
     ],
   },
   {
+    kind: 'epic',
+    titleKey: 'epic',
+    total: 2,
+    fetchedAt: '2026-10-10T12:00:00',
+    offers: [
+      {
+        title: 'The Falconeer',
+        titleCn: null,
+        upcoming: false,
+        start: '2026-10-03',
+        end: '2026-10-10',
+        priceOriginal: '¥ 70',
+        url: 'https://store.epicgames.com/p/the-falconeer',
+      },
+      {
+        title: 'Ghostrunner',
+        titleCn: null,
+        upcoming: true,
+        start: '2026-10-10',
+        end: '2026-10-17',
+        priceOriginal: '¥ 148',
+        url: 'https://store.epicgames.com/p/ghostrunner',
+      },
+    ],
+  },
+  {
     // 榜单/清单形态：卡题 + 行内注记（热销榜、降价事件、关注来源共用）
     kind: 'games',
     titleKey: 'drops',
@@ -125,11 +151,25 @@ const galleryCards: PilotFacts[] = [
       { key: 'bill_import:9', name: 'Steam bills 2026-09', reason: 'dupImport' },
     ],
   },
+  {
+    kind: 'proposal',
+    pid: 'demo-follow',
+    action: 'add_follow',
+    state: 'pending',
+    args: {},
+    items: [
+      { appid: 413150, name: 'Stardew Valley' },
+      { appid: 1145360, name: 'Hades' },
+      { appid: 1245620, name: 'Dave the Diver' },
+    ],
+  },
   { kind: 'action', action: 'monitor_add', appid: 413150, name: 'Stardew Valley', state: 'active' },
   { kind: 'navigate', target: 'alerts', path: '/alerts' },
   {
     kind: 'rows',
     titleKey: 'diagnosis',
+    appid: 413150,
+    name: 'Stardew Valley',
     rows: [
       { k: '', vKey: 'coverage', data: { ok: 14, total: 17 }, tone: 'warn' },
       { k: 'RU', vKey: 'failed', v: 'locked', tone: 'bad', at: '2026-10-03T14:00:00' },
@@ -187,12 +227,16 @@ const galleryThink = computed(() => t('pilot.gallery.thinkDemo'))
   padding: 16px 18px 40px;
 }
 
-/* 会话列：钉在内容区左缘（sticky 跟随滚动），定高让内滚生效 */
+/* 会话列：钉在内容区左缘（sticky 跟随滚动），定高让内滚生效。
+   z-index 必需：列内的弹层（如后台任务面板）会向右溢出到对话列上方，
+   而对话列里的 .pilot-console 也是定位元素（同在 z-index:auto 组、树序在后），
+   不给会话列抬级就会被它盖住、弹层点不动。 */
 .pilot-page__side {
   flex: none;
   width: 236px;
   position: sticky;
   top: 12px;
+  z-index: 2;
   display: flex;
   height: calc(100vh - 84px);
   min-width: 0;
@@ -215,12 +259,10 @@ const galleryThink = computed(() => t('pilot.gallery.thinkDemo'))
   gap: 16px;
 }
 
-/* 整页对话区：turns 不自滚（不出内层滚动条），随页流动由页面滚动条负责；
-   console 运行时按「能否滚」解析有效滚动容器，钉底锚在输入区 */
-.pilot-page__console :deep(.pilot-turns) {
-  max-height: none;
+/* 整页对话区定高：对话记录在内层滚，思考展开不再把输入框顶出视口 */
+.pilot-page__console {
+  height: calc(100vh - var(--header-height) - 96px);
   min-height: 320px;
-  overflow: visible;
 }
 
 /* 窄屏：会话列退出（Console 内部回落顶部标签栏） */

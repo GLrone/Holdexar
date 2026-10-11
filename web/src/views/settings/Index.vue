@@ -24,7 +24,6 @@ import { useAccountStore } from '@/stores/account'
 import { useRegionsStore } from '@/stores/regions'
 import { useSettingsStore } from '@/stores/settings'
 import { useTourStore } from '@/stores/tour'
-import { useUpdaterStore } from '@/stores/updater'
 import { friendCodeOf } from '@/utils/steamId'
 import { walletSyncOk, walletSyncedAt } from '@/lib/walletSync'
 import CurrencyFlag from '@/components/CurrencyFlag.vue'
@@ -38,9 +37,6 @@ const { t } = useI18n()
 const loading = ref(true)
 const saving = ref(false)
 const errorMsg = ref('')
-
-/* 更新检查结果与侧栏红点共用一份（App.vue 启动时也会查一次） */
-const updaterStore = useUpdaterStore()
 
 /* 产品导览手动重开（首次启动已自动弹过）：开的是 App.vue 里那个全局实例，
    本页不自己挂浮层——页面实例会被导览第一步的 router.push 卸载 */
@@ -60,9 +56,14 @@ const hasApiKey = ref(false)
 /* ── 领航员（pilot）：多供应商绑定（左导航 + 右详情；密钥密文落库） ── */
 const pilotEnabled = ref(false)
 const pilotCapText = ref('0')
+/** 历史轮工具结果保留预算（字符）：调大更保真，调小更省上下文 */
+const pilotToolLimitText = ref('')
 const pilotUsage = ref({ inp: 0, out: 0, calls: 0, total: 0 })
 const pilotModel = ref('')
 const pilotActiveId = ref('')
+const pilotWindowSource = ref<'manual' | 'auto' | 'fallback' | 'none'>('none')
+const pilotWindowAuto = ref<number | null>(null)
+const pilotWindowEffective = ref<number | null>(null)
 const globalSaving = ref(false)
 
 const pilotBanner = ref<{ tone: 'pending' | 'success' | 'fail'; text: string } | null>(null)
@@ -115,6 +116,22 @@ const enabledCount = computed(
   () => draftModels.value.filter((m) => !draftDisabled.value.includes(m)).length,
 )
 
+/** 窗口留空时提示它的实际来源：自动识别的值不该让用户误以为已经手填。 */
+const windowAutoHint = computed(() => {
+  if (draftWindow.value.trim()) return ''
+  if (selectedPid.value !== pilotActiveId.value) return ''
+  if (pilotWindowSource.value === 'auto' && pilotWindowAuto.value) {
+    return t('pilot.providers.windowAuto', { model: pilotModel.value, value: pilotWindowAuto.value })
+  }
+  if (pilotWindowSource.value === 'fallback') {
+    return t('pilot.providers.windowFallback', { model: pilotModel.value, value: pilotWindowEffective.value })
+  }
+  if (pilotWindowSource.value === 'none') {
+    return t('pilot.providers.windowUnknown', { model: pilotModel.value })
+  }
+  return ''
+})
+
 const pilotProtocolOptions = computed(() => [
   { value: 'openai', label: t('pilot.proto.openai') },
   { value: 'openai-responses', label: t('pilot.proto.openai-responses') },
@@ -166,11 +183,15 @@ async function loadPilot() {
     const cfg = await pilotApi.getConfig()
     pilotEnabled.value = cfg.enabled
     pilotCapText.value = String(cfg.monthly_cap)
+    pilotToolLimitText.value = String(cfg.tool_content_limit ?? '')
     pilotUsage.value = {
       inp: cfg.usage_inp, out: cfg.usage_out, calls: cfg.usage_calls, total: cfg.usage_total,
     }
     pilotModel.value = cfg.model
     pilotActiveId.value = cfg.active
+    pilotWindowSource.value = cfg.context_window_source
+    pilotWindowAuto.value = cfg.context_window_auto ?? null
+    pilotWindowEffective.value = cfg.context_window ?? null
     const r = await pilotApi.listProviders()
     pilotProviders.value = r.items
     selectedPid.value = cfg.active || r.items[0]?.id || ''
@@ -263,6 +284,7 @@ async function savePilotGlobal() {
     const cfg = await pilotApi.updateConfig({
       enabled: pilotEnabled.value,
       monthly_cap: Number(pilotCapText.value) || 0,
+      tool_content_limit: Number(pilotToolLimitText.value) || 0,
     })
     pilotUsage.value = {
       inp: cfg.usage_inp, out: cfg.usage_out, calls: cfg.usage_calls, total: cfg.usage_total,
@@ -541,34 +563,16 @@ async function removeBackup(name: string) {
   }
 }
 
-/* ── 应用更新入口 ──
- * 检查/下载/校验/重启全部在全局更新弹窗（components/business/UpdateDialog.vue）
- * 里闭环；本页只保留「当前版本 + 入口按键」。数据目录在换装白名单内永不移动。
- * 检查结果存在 stores/updater（启动时也会查一次供侧栏红点用），本页与弹窗
- * 读写同一份，不会「这边检查了那边不知道」。 */
-const appVersion = ref('')
-const repoSlug = ref('')
-const updateInfo = computed(() => updaterStore.info)
-const updateChecking = computed(() => updaterStore.checking)
-const updatePendingTag = computed(() => updaterStore.pendingTag)
+/* ── 应用更新 ──
+ * 更新交互已全部收进全局更新弹窗（components/business/UpdateDialog.vue）与
+ * 左上角气泡（UpdateBubble.vue），本页不设常驻更新面板。
+ * 手动「检查更新」入口在「关于」页版本徽标旁。 */
 
-/** 发布页地址（仓库标识由后端 /system/info 下发，前端不硬编码） */
-const releasesUrl = computed(() =>
-  repoSlug.value ? `https://github.com/${repoSlug.value}/releases` : '',
-)
-
-function openUpdateDialog() {
-  void updaterStore.openDialog()
-}
-
-/* ── 更新行为开关（新版本提示 / 静默自动更新）──
- * 状态放 settings store（启动逻辑 App.vue 与侧栏红点都读同一份），本页只读写。
- * null（未拉到）按「提示开 / 静默关」处理——与后端默认值一致，UI 不会闪错态。 */
+/* ── 更新行为开关 ──
+ * 提示/静默两个开关已随更新面板一起移进全局更新弹窗；本页只留备份开关
+ * （null 未拉到按「开」处理——与后端默认值一致，UI 不会闪错态）。 */
 const settingsStore = useSettingsStore()
-const updateNotifyOn = computed(() => settingsStore.updateNotify !== false)
-const updateAutoOn = computed(() => settingsStore.updateAuto === true)
 const backupAutoOn = computed(() => settingsStore.backupAuto !== false)
-const updatePrefsToggling = ref(false)
 const backupToggling = ref(false)
 
 async function toggleBackupAuto(on: boolean) {
@@ -583,49 +587,14 @@ async function toggleBackupAuto(on: boolean) {
   }
 }
 
-async function toggleUpdateNotify(on: boolean) {
-  if (updatePrefsToggling.value) return
-  updatePrefsToggling.value = true
-  try {
-    const ok = await settingsStore.setUpdateNotify(on)
-    if (ok) message.success(t(on ? 'settings.update.notifyOn' : 'settings.update.notifyOff'))
-    else message.error(t('settings.update.switchFailed'))
-  } finally {
-    updatePrefsToggling.value = false
-  }
-}
-
-async function toggleUpdateAuto(on: boolean) {
-  if (updatePrefsToggling.value) return
-  updatePrefsToggling.value = true
-  // setUpdateAuto 内部吞异常并返回成败，这里不必再包一层 try
-  const ok = await settingsStore.setUpdateAuto(on)
-  updatePrefsToggling.value = false
-  if (!ok) {
-    message.error(t('settings.update.switchFailed'))
-    return
-  }
-  message.success(t(on ? 'settings.update.autoOn' : 'settings.update.autoOff'))
-  if (!on) return
-  /* 开启即兑现一次：立刻强制查一遍并起后台下载，而不是等下次启动。
-     check(true) 必须强制——两个开关此前都关时启动不查，本地可能压根没有结果。 */
-  void (async () => {
-    const res = await updaterStore.check(true)
-    if (!res?.available || !res.latest || updaterStore.pendingTag) return
-    await updaterStore.download()
-    message.info(t('settings.update.autoStarted', { version: res.latest }))
-  })()
-}
-
 async function load() {
   loading.value = true
   errorMsg.value = ''
-  /* 六个数据来源互不依赖：主表单数据先发出，其余并行跟进，骨架屏只等主数据；
-     账户 / 备份列表 / 更新状态各自吞错，到数即填对应卡片，不阻塞页面 */
+  /* 数据来源互不依赖：主表单数据先发出，其余并行跟进，骨架屏只等主数据；
+     账户 / 备份列表各自吞错，到数即填对应卡片，不阻塞页面 */
   const main = settingsApi.get()
   void accountStore.load()
   void loadBackups()
-  void loadUpdateInfo()
   try {
     const data: SettingsPayload = await main
     steamId.value = data.account.steam_id
@@ -635,18 +604,6 @@ async function load() {
     errorMsg.value = e instanceof Error ? e.message : String(e)
   } finally {
     loading.value = false
-  }
-}
-
-async function loadUpdateInfo() {
-  /* 版本信息 + 与后端对齐更新状态（暂存/进行中的下载；失败静默不阻塞设置页） */
-  try {
-    const info = await systemApi.info()
-    appVersion.value = info.version
-    repoSlug.value = info.repo
-    await updaterStore.sync()
-  } catch {
-    /* 更新状态拉不到不影响设置页 */
   }
 }
 
@@ -1552,6 +1509,13 @@ onUnmounted(stopLoginPolling)
               </HlButton>
             </div>
           </div>
+          <div class="pilot-form__row">
+            <span class="pilot-form__label">{{ t('pilot.settings.toolLimit') }}</span>
+            <div class="pilot-form__field pilot-form__field--inline">
+              <HlInput v-model="pilotToolLimitText" style="max-width: 180px" placeholder="3000" />
+              <span class="pilot-form__hint">{{ t('pilot.settings.toolLimitHint') }}</span>
+            </div>
+          </div>
         </div>
 
         <!-- 多供应商：左导航（厂商收敛） + 右详情（模板选择 / 编辑卡） -->
@@ -1649,6 +1613,7 @@ onUnmounted(stopLoginPolling)
                   <span class="pilot-form__label">{{ t('pilot.providers.contextWindow') }}</span>
                   <div class="pilot-form__field">
                     <HlInput v-model="draftWindow" :placeholder="t('pilot.providers.contextWindowHint')" />
+                    <span v-if="windowAutoHint" class="pilot-form__hint">{{ windowAutoHint }}</span>
                   </div>
                 </div>
               </div>
@@ -1965,79 +1930,7 @@ onUnmounted(stopLoginPolling)
         <div v-else class="section-desc">{{ t('settings.export.empty') }}</div>
       </div>
 
-      <!-- 应用更新（GitHub Releases：下载暂存 + 重启换装，数据目录永不移动） -->
-      <div class="card settings-card" data-section="settings.section.update">
-        <div class="section-title">{{ t('settings.section.update') }}</div>
-        <div class="section-desc">{{ t('settings.update.desc') }}</div>
-
-        <!-- 更新交互全在全局弹窗（模糊幕布）里闭环：本页只留入口 + 状态一句。
-             进度/下载/重启不再出现在这里——它们是应用级事务，塞在页签里时
-             用户切走再回来就得靠 store 续命，体感就是「点了没反应」。 -->
-        <div class="settings-row">
-          <div class="settings-row__line">
-            <HlButton art="outline" tone="blue" size="sm" :loading="updateChecking" @click="openUpdateDialog">
-              <HlIcon v-if="!updateChecking" name="refresh" />
-              {{ updateChecking ? t('settings.update.checking') : t('settings.update.check') }}
-            </HlButton>
-            <span class="section-desc" style="display: inline; margin-left: 8px">
-              {{ t('settings.update.currentVersion', { version: appVersion || '…' }) }}
-            </span>
-          </div>
-        </div>
-
-        <!-- 更新行为开关：提示 / 静默自动更新。两个开关独立——提示管「告知」，
-             静默管「后台下载」；静默开着时，提示只负责下载完成后的重启提醒。 -->
-        <div class="settings-row">
-          <div class="settings-row__line">
-            <HlSwitch
-              :model-value="updateNotifyOn"
-              accent
-              :disabled="updatePrefsToggling"
-              :label="t('settings.update.notifyLabel')"
-              :title="t('settings.update.notifyHint')"
-              @update:model-value="toggleUpdateNotify"
-            />
-          </div>
-          <div class="section-desc">{{ t('settings.update.notifyHint') }}</div>
-        </div>
-
-        <div class="settings-row">
-          <div class="settings-row__line">
-            <HlSwitch
-              :model-value="updateAutoOn"
-              accent
-              :disabled="updatePrefsToggling"
-              :label="t('settings.update.autoLabel')"
-              :title="t('settings.update.autoHint')"
-              @update:model-value="toggleUpdateAuto"
-            />
-          </div>
-          <div class="section-desc">{{ t('settings.update.autoHint') }}</div>
-        </div>
-
-        <div v-if="updatePendingTag" class="settings-update-ready">
-          <div class="settings-update-ready__text">
-            {{ t('settings.update.pendingReady', { version: updatePendingTag.replace(/^v/, '') }) }}
-          </div>
-          <div class="settings-row__line">
-            <HlButton art="combo" tone="green" size="sm" @click="openUpdateDialog">
-              <HlIcon name="check" />
-              {{ t('settings.update.restartNow') }}
-            </HlButton>
-          </div>
-        </div>
-
-        <div v-else-if="updateInfo?.available" class="section-desc">
-          {{ t('settings.update.availableHint', { version: updateInfo.latest }) }}
-        </div>
-        <div v-else-if="updateInfo?.reason === 'network'" class="section-desc">
-          {{ t('settings.update.networkPre') }}
-          <a :href="releasesUrl" target="_blank">{{ t('settings.update.releasesPage') }}</a>{{ t('settings.update.networkPost') }}
-        </div>
-        <div v-else-if="updateInfo" class="section-desc">
-          {{ t('settings.update.upToDate', { version: updateInfo.current }) }}
-        </div>
-      </div>
+      <!-- 应用更新不设常驻面板：更新交互收进左上角气泡与全局更新弹窗 -->
 
       <!-- 价格事件通知：总开关 + 用户类别 + 静默窗 + 出口状态 + 测试邮件。
            类别是用户面分类，内部事件枚举不出现在这里。 -->
@@ -2680,17 +2573,6 @@ onUnmounted(stopLoginPolling)
   font-size: 12px;
 }
 
-/* ── 应用更新卡片 ── */
-.settings-update-ready {
-  margin-top: 14px;
-  padding: 12px 14px;
-  border: 1px solid var(--success, #27ae60);
-  border-radius: 8px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
 /* ── 通知区块 ── */
 .notify-cat-label {
   font-weight: 600;
@@ -2724,44 +2606,6 @@ onUnmounted(stopLoginPolling)
 }
 .notify-status.is-bad .notify-status__dot {
   background: var(--danger);
-}
-
-.settings-update-ready__text {
-  font-size: 13px;
-  color: var(--text-primary);
-}
-
-.settings-update-notes {
-  margin-top: 10px;
-  padding: 10px 12px;
-  border: 1px solid var(--border-soft);
-  border-radius: 8px;
-  background: var(--surface-inset, transparent);
-  font-size: 12.5px;
-  line-height: 1.6;
-  color: var(--text-secondary);
-  white-space: pre-wrap;
-  max-height: 240px;
-  overflow-y: auto;
-}
-
-.settings-update-progress {
-  margin-top: 12px;
-}
-
-.settings-update-progress__bar {
-  margin-top: 6px;
-  height: 4px;
-  border-radius: 2px;
-  background: var(--surface-inset, var(--bg-card));
-  overflow: hidden;
-}
-
-.settings-update-progress__fill {
-  height: 100%;
-  border-radius: 2px;
-  background: var(--accent);
-  transition: width 0.3s ease;
 }
 .pilot-model-list {
   display: flex;
