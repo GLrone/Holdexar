@@ -2,11 +2,12 @@
 setlocal
 title Holdexar (dev)
 
-rem Dev launcher. Runtime data never lands in the git worktree: data goes to
-rem %LOCALAPPDATA%\holdexar-dev, which is separate from the packaged app's
-rem %LOCALAPPDATA%\holdexar on purpose (a dev-mode schema migration must not be
-rem able to touch real user data).
-rem The full resolution order lives in server\app\core\paths.py.
+rem Dev launcher. Runtime data never lands in the git worktree. The data
+rem directory is resolved by server\app\core\paths.py (env var, portable.flag,
+rem an existing data\holdexar.db, a holdexar-dev-home.txt pointer, then the
+rem machine-level holdexar-dev dir). Dev and packaged never share a dir: the
+rem packaged app puts its data beside its own program directory.
+rem Setting HOLDEXAR_DATA_DIR here would outrank all of those, so it is not set.
 
 cd /d "%~dp0"
 
@@ -17,16 +18,6 @@ if %errorlevel% neq 0 (
     echo         and check "Add python.exe to PATH" during setup.
     pause
     exit /b 1
-)
-
-rem Only set the env var when this checkout has no database of its own. The env
-rem var outranks the "database already sits next to the program" rule, so setting
-rem it unconditionally would make an older checkout look like it lost its data.
-if exist "%~dp0data\holdexar.db" (
-    echo [INFO] data\holdexar.db found in this checkout - using it in place
-) else (
-    set "HOLDEXAR_DATA_DIR=%LOCALAPPDATA%\holdexar-dev"
-    echo [INFO] dev data dir: %LOCALAPPDATA%\holdexar-dev
 )
 
 python run.py %*

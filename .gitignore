@@ -193,6 +193,12 @@ server/_tmp_verify_data/
 /_tmp_close_smoke/
 /holdexar-dev/
 
+# 开发态数据目录指针（维护机本机配置，不入库）
+/holdexar-dev-home.txt
+
+# 第三方工具在工作目录写的 AI 会话记忆（不入库）
+/.workbuddy-ai/
+
 # R2 上传凭据与上传工具（维护机本机文件，不入库；公共仓库不含发布侧上传链路）
 .r2.env
 scripts/upload_cloud_packs.py
