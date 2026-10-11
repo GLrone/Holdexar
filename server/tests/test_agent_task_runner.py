@@ -32,41 +32,15 @@ from app.domains.agent.runtime.tasks import TaskSpec
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    import app.core.database as database_module
+def db():
+    """完整库（隔离数据目录，外键与生产同开）；url 供重启模拟另开引擎。"""
+    from app.core.database import get_session_factory, get_settings
 
-    url = f"sqlite+aiosqlite:///{(tmp_path / 'task_test.db').as_posix()}"
-    engine = create_async_engine(url, echo=False)
-
-    # 与生产同口径开外键校验：agent 三表的 FK 只在开着校验时才有意义，
-    # 关着跑等于把「会话行没落库也能建 run」这类缺陷放过
-    @event.listens_for(engine.sync_engine, "connect")
-    def _fk_on(dbapi_conn, _record):
-        cur = dbapi_conn.cursor()
-        cur.execute("PRAGMA foreign_keys=ON")
-        cur.close()
-
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(agent_service, "get_session_factory", lambda: factory)
-    yield {"factory": factory, "url": url}
+    yield {"factory": get_session_factory(), "url": get_settings().db_url}
     for rid in REGISTRY.active_ids():
         entry = REGISTRY.pop(rid)
         if entry and entry.task and not entry.task.done():
             entry.task.cancel()
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    engine = create_async_engine(db["url"])
-    try:
-        async with engine.begin() as conn:
-            await conn.run_sync(
-                Base.metadata.create_all,
-                [AgentSession.__table__, AgentRun.__table__, AgentEvent.__table__],
-            )
-    finally:
-        await engine.dispose()
 
 
 @pytest.fixture

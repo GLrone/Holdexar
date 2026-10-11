@@ -21,6 +21,12 @@ _TASK_STATUS_ROW: dict[str, tuple[str, str]] = {
     "budget_exhausted": ("taskCancelled", "warn"),
 }
 
+_READ_MAX_TURNS = 30
+"""单次回读最多取多少轮：区间是给模型看的正文，不能一次拉满整段历史。"""
+
+_READ_DIGEST_TOKENS = 3000
+"""单次回读的文本预算（成本上限，与装配侧同一份估值口径）。"""
+
 
 def _task_row(run: dict, progress: dict | None = None, *,
               vKey: str | None = None, tone: str | None = None,
@@ -129,14 +135,24 @@ async def list_sessions() -> dict:
     return _shared.rows_result("sessions", rows, total=len(items))
 
 
-async def read_session(sid: str) -> dict:
-    """读某段历史会话：最近几轮问答行 + 预算内摘要（模型消费 digest，卡片消费 rows）。"""
+async def read_session(sid: str, offset: int = 0, count: int = _shared._READ_ROWS_LIMIT) -> dict:
+    """读某段历史会话：指定区间的问答行 + 该区间的文本摘要（模型消费 digest，卡片消费 rows）。
+
+    offset = 从最新一轮往回跳过多少轮（0 = 从最新开始），count = 本次读多少轮。
+    这两个参数是压缩后的回读通道：本会话被蒸馏掉的那段区间，模型可以往回翻原文，
+    不必靠记忆复述数字。区间之外的内容不返回，越界不报错、只返回能取到的部分。"""
     state = await _shared.pilot_store().load(str(sid or ""))
     if state is None:
         return {"kind": "empty", "note": "no_data"}
     store = _shared.pilot_store()
+    total = len(state.turns)
+    skip = max(0, int(offset or 0))
+    size = max(1, min(_READ_MAX_TURNS, int(count or _shared._READ_ROWS_LIMIT)))
+    end = max(0, total - skip)
+    start = max(0, end - size)
+    window = state.turns[start:end]
     rows = []
-    for t in state.turns[-_shared._READ_ROWS_LIMIT:]:
+    for t in window:
         resp = t.get("resp") or {}
         answer = str(resp.get("answer") or "")
         tools_txt = "；".join(str(x) for x in (resp.get("tools") or []))
@@ -149,12 +165,15 @@ async def read_session(sid: str) -> dict:
     try:
         from app.domains.pilot import context as pilot_context
 
-        digest = pilot_context.reference_digest(state)
+        digest = pilot_context.digest_lines(window, budget=_READ_DIGEST_TOKENS)
     except Exception:  # noqa: BLE001 — 摘要失败不影响清单行
         digest = None
-    result = _shared.rows_result("sessionRead", rows, total=len(state.turns))
+    result = _shared.rows_result("sessionRead", rows, total=total)
     result["sid"] = str(sid or "")
     result["sessionTitle"] = store.title_of(state)
+    result["startTurn"] = start
+    result["turnCount"] = len(window)
+    result["summaryThrough"] = state.summary_through
     result["digest"] = digest or ""
     return result
 
@@ -179,7 +198,11 @@ async def _list_sessions(args: dict, sid: str | None = None) -> dict:
 
 
 async def _read_session(args: dict, sid: str | None = None) -> dict:
-    return await read_session(str(args.get("sid") or ""))
+    return await read_session(
+        str(args.get("sid") or ""),
+        int(args.get("offset") or 0),
+        int(args.get("count") or _shared._READ_ROWS_LIMIT),
+    )
 
 
 SPECS = [
@@ -220,11 +243,16 @@ SPECS = [
     ),
     ToolSpec(
         name="read_session", group="read", risk="low",
-        description="读取某段历史对话的内容摘要。"
+        description="读取某段历史对话的内容。"
                     "用户问『我们之前聊过什么』或需要旧对话里的信息时调用；"
-                    "会话 id 可先用会话清单工具获取",
+                    "会话 id 可先用会话清单工具获取。"
+                    "offset 从最新一轮往回跳过若干轮（默认 0=从最新开始），"
+                    "count 指定本次读多少轮（默认 8，最多 30）；"
+                    "本会话被压缩后如需更早的原文，用 offset 逐段往回读",
         parameters={"type": "object", "properties": {
             "sid": {"type": "string", "description": "会话 id（来自会话清单）"},
+            "offset": {"type": "integer", "description": "从最新往回跳过的轮数，默认 0"},
+            "count": {"type": "integer", "description": "本次读取的轮数，默认 8，最多 30"},
         }, "required": ["sid"]},
         handler=_read_session, step_label="sessionRead",
     ),

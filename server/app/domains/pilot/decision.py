@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 _CORE_CARD_KINDS = {
     "proposal", "stepper", "price", "regions", "compare",
-    "games", "family", "achievements",
+    "games", "family", "achievements", "epic",
 }
 _MAX_CARDS_PER_TURN = 2
 
@@ -41,7 +41,7 @@ _DIAGNOSTIC_TOOLS = frozenset({
 
 # 纯数据提供类工具集（供大模型推导与综合，默认不外泄为 UI 原始表格卡片）
 _DATA_SYNTHESIS_TOOLS = frozenset({
-    "epic_free", "steam_free", "hb_monthly", "calendar_events", "rates_overview",
+    "steam_free", "hb_monthly", "calendar_events", "rates_overview",
 })
 
 # 系统技术排查特征词
@@ -84,6 +84,30 @@ class CardDecision:
     status: str  # "rendered" | "suppressed"
     reason: str  # "ok" | "suppressed_by_model" | "low_confidence" | "no_price_intent" | "quota_exceeded" | "empty"
     summary: str | None = None
+
+
+# 跨轮去重的卡种：静态清单类可抑制（同内容已呈现过）；价格/对比类不抑制
+# ——价格随刷新轮变化，重复询问往往正是要看最新价
+_REPEATABLE_SUPPRESS_KINDS = frozenset({"games", "family", "achievements", "rows", "epic"})
+
+
+def _card_identity(kind: str, card: dict) -> str:
+    """卡片身份：同 kind 下区分内容的最小锚（名称/对象/首行）。"""
+    if kind == "epic":
+        offers = card.get("offers") or []
+        first = offers[0].get("title") or offers[0].get("titleCn") if offers else ""
+        return f"epic:{first}:{len(offers)}"
+    for key in ("name", "appid", "title", "titleKey"):
+        v = card.get(key)
+        if v:
+            return str(v)
+    items = card.get("items") or card.get("rows") or []
+    for it in items:
+        if isinstance(it, dict) and it.get("name"):
+            return str(it["name"])
+        if isinstance(it, dict) and it.get("k"):
+            return str(it["k"])
+    return ""
 
 
 class DecisionAgent:
@@ -158,6 +182,7 @@ class DecisionAgent:
         question: str,
         current_cards: list[dict],
         base_hint: str | None,
+        recent_cards: list[tuple[str, str]] | None = None,
     ) -> str | None:
         """执行期骨架预告裁决：模型主动关闭或意图不符时不挂骨架占位。"""
         if not base_hint:
@@ -193,6 +218,14 @@ class DecisionAgent:
             return None
         if base_hint == "rows" and any(c.get("kind") == "rows" for c in current_cards):
             return None
+        if recent_cards and base_hint in _REPEATABLE_SUPPRESS_KINDS and not explicit_allow:
+            args_h = args or {}
+            # 骨架期拿不到结果卡，仅按工具参数可得的身份粗探：无身份参数的
+            # 清单/概况类工具，近轮同 kind 已呈现时不再挂骨架（结果期还有
+            # 精确身份裁决）；带 query/appid 的检索不在此列
+            if not any(args_h.get(a) for a in ("appid", "query", "name")) \
+                    and any(k == base_hint for k, _ in recent_cards):
+                return None
         return base_hint
 
     def decide_card(
@@ -203,8 +236,12 @@ class DecisionAgent:
         question: str,
         current_cards: list[dict],
         base_card: dict | None,
+        recent_cards: list[tuple[str, str]] | None = None,
     ) -> CardDecision:
-        """裁决工具结果是否在前端界面生成可视化卡片。"""
+        """裁决工具结果是否在前端界面生成可视化卡片。
+
+        recent_cards 是跨轮卡片账本（kind, identity）清单——静态清单类卡
+        近轮已呈现过即不再重复发卡，价格/对比类不受此限（价格会变）。"""
         args = arguments or {}
 
         # 1. 外层模型显式控制：允许模型主动关闭卡片渲染
@@ -286,6 +323,18 @@ class DecisionAgent:
                     summary="问句仅核验单款游戏，内部决策代理已抑制全量清单卡片",
                 )
 
+        if kind == "epic":
+            offers = base_card.get("offers") or []
+            if not offers and not base_card.get("mobile"):
+                return CardDecision(
+                    should_emit=False,
+                    card=None,
+                    kind=kind,
+                    status="suppressed",
+                    reason="empty_candidates",
+                    summary="未获取到有效 Epic 免费游戏数据",
+                )
+
         if tool_name in _DATA_SYNTHESIS_TOOLS and not explicit_allow:
             return CardDecision(
                 should_emit=False,
@@ -329,7 +378,20 @@ class DecisionAgent:
                     summary="问句为游戏成就难度咨询，已抑制个人成就概况卡片",
                 )
 
-        # 4. 配额与去重门禁
+        # 4. 跨轮卡片账本：静态清单类同内容卡近轮已呈现过，不重复发卡
+        if recent_cards and kind in _REPEATABLE_SUPPRESS_KINDS and not explicit_allow:
+            identity = _card_identity(kind, base_card)
+            if identity and (kind, identity) in recent_cards:
+                return CardDecision(
+                    should_emit=False,
+                    card=None,
+                    kind=kind,
+                    status="suppressed",
+                    reason="already_presented",
+                    summary="近几轮已向用户呈现过同内容卡片，本轮不重复发卡",
+                )
+
+        # 5. 配额与去重门禁
         if base_card in current_cards:
             return CardDecision(
                 should_emit=False,
@@ -368,7 +430,7 @@ class DecisionAgent:
                 summary="同类型列表卡片去重",
             )
 
-        # 5. 准入通过，组装卡片摘要供大模型回灌感知
+        # 6. 准入通过，组装卡片摘要供大模型回灌感知
         summary = self._summarize_card(base_card)
         return CardDecision(
             should_emit=True,
@@ -407,6 +469,12 @@ class DecisionAgent:
             act = card.get("action") or "操作"
             items = card.get("items") or []
             return f"待确认动作卡片已在用户界面呈现：{act}，涉及 {len(items)} 项条目"
+        if kind == "epic":
+            offers = card.get("offers") or []
+            titles = [o.get("titleCn") or o.get("title") for o in offers[:3] if (o.get("title") or o.get("titleCn"))]
+            titles_str = f" ({'、'.join(titles)})" if titles else ""
+            total_str = f"，共 {card.get('total')} 款" if card.get("total") is not None else ""
+            return f"Epic 喜加一卡片已在用户界面呈现：展示 {len(offers)} 款免费游戏{titles_str}{total_str}"
         if kind == "rows":
             title = card.get("titleKey") or "数据清单"
             rows = card.get("rows") or []

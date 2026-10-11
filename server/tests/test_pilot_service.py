@@ -7,6 +7,7 @@ import pytest
 from app.domains.pilot import config as pilot_config
 from app.domains.pilot import context as pilot_context
 from app.domains.pilot import intent as pilot_intent
+from app.domains.pilot import model_windows
 from app.domains.pilot import service
 from app.domains.pilot import llm as pilot_llm
 from app.domains.pilot.llm import PilotLlmError
@@ -737,7 +738,8 @@ class TestProtocolAdapters:
 
         events = [e async for e in pilot_llm._responses_parse(lines())]
         kinds = [k for k, _ in events]
-        assert kinds == ["thinking", "answer", "tool_calls", "usage", "cache"]
+        assert kinds == ["thinking", "answer", "tool_calls", "usage", "context", "cache"]
+        assert [d for k, d in events if k == "context"] == [88]
         calls = [d for k, d in events if k == "tool_calls"][0]
         assert calls == [{"id": "call_9", "name": "get_price_briefing", "arguments": {"appid": 292030}}]
         assert ("usage", (88, 9)) in events
@@ -877,7 +879,7 @@ class TestNavigateDirect:
         assert done["facts"] == {"kind": "navigate", "target": "settings", "path": "/settings"}
         assert done["cards"] == [done["facts"]]
         assert done["steps"] == [{"label": "navigate", "status": "ok",
-                                  "data": {"target": "settings", "path": "/settings"}}]
+                                  "data": {"target": "settings", "path": "/settings", "section": ""}}]
         assert executed == [("navigate", None, False)]
 
     @pytest.mark.asyncio
@@ -972,6 +974,37 @@ class TestSessionTools:
         assert "50 元" in (read.get("digest") or "")
         missing = await pilot_tools_mod.execute_tool("read_session", {"sid": "no-such"})
         assert missing["kind"] == "empty"
+        service._store = None
+
+    @pytest.mark.asyncio
+    async def test_read_session_pages_back_into_compacted_region(self, monkeypatch, tmp_path):
+        """压缩后的回读通道：offset/count 能翻到被蒸馏掉的旧区间，摘要外的原文取得到。"""
+        from app.domains.pilot import tools as pilot_tools_mod
+
+        monkeypatch.setattr(service, "resolve_data_dir", lambda: tmp_path)
+        service._store = None
+        store = service.get_store()
+        for i in range(12):
+            await store.append_turn("tool-s2", TestSessionReference._turn_record(
+                f"问题{i}", f"回答{i} 价格 {1000 + i} 元"))
+        await store.append_summary("tool-s2", "存档：早期都在问价格", 9)
+
+        head = await pilot_tools_mod.execute_tool(
+            "read_session", {"sid": "tool-s2", "count": 3})
+        assert head["startTurn"] == 9 and head["turnCount"] == 3
+        assert head["summaryThrough"] == 9
+
+        # 往回翻：跳过最新 3 轮，读 4 轮 → 覆盖被蒸馏区间
+        back = await pilot_tools_mod.execute_tool(
+            "read_session", {"sid": "tool-s2", "offset": 3, "count": 4})
+        assert back["startTurn"] == 5 and back["turnCount"] == 4
+        assert "价格 1005 元" in back["digest"] and "价格 1008 元" in back["digest"]
+        assert "价格 1011 元" not in back["digest"]
+
+        # 越界不报错，取得到多少给多少
+        edge = await pilot_tools_mod.execute_tool(
+            "read_session", {"sid": "tool-s2", "offset": 50, "count": 4})
+        assert edge["turnCount"] >= 0 and edge["kind"] == "rows"
         service._store = None
 
 
@@ -1202,6 +1235,33 @@ class TestCtxBreakdown:
         assert breakdown["current"] > 0
         assert breakdown["summary"] == 0
 
+    def test_cache_hit_rate_aggregates_whole_turn(self, monkeypatch):
+        """命中率取本轮聚合：末次请求落空（0）不改写整轮读数。"""
+        _patch_ready(monkeypatch)
+        scripts = [
+            [("cache", {"rate": 0.9, "read": 9000, "write": None, "base": 10000}),
+             ("tool_calls", [{"id": "t1", "name": "get_price_briefing", "arguments": {"appid": 7}}])],
+            [("cache", {"rate": 0.0, "read": 0, "write": None, "base": 12000}),
+             ("answer", "结论"), ("usage", (12000, 6))],
+        ]
+        rounds = {"n": 0}
+
+        async def _rounds(**kw):
+            for item in scripts[rounds["n"]]:
+                yield item
+            rounds["n"] += 1
+
+        monkeypatch.setattr(service.pilot_llm, "chat_stream", _rounds)
+
+        async def _stub(name, arguments, guarded=False, sid=None):
+            return {**_FACTS, "appid": arguments.get("appid")}
+
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _stub)
+        result = asyncio.run(service.ask("巫师3值不值？", session_id="cache-agg"))
+        assert result["cache_read_tokens"] == 9000
+        assert result["cache_base_tokens"] == 22000
+        assert result["cache_hit_rate"] == pytest.approx(9000 / 22000)
+
     def test_session_stats_folds_turns(self, monkeypatch):
         """会话统计折叠：轮/步/用量/计时按账本全轮求和，缓存桶 None 传导。"""
         _patch_ready(monkeypatch, stream=[
@@ -1221,37 +1281,410 @@ class TestCtxBreakdown:
         assert s["decode_out"] == 10
 
 
+class TestToolCatalog:
+    """工具表切面：默认只给核心集，list_tools 解锁其余，解锁是会话级单向的。
+
+    工具表是请求前缀的一部分，按轮增减会让整段历史的前缀缓存作废——所以
+    只解锁、不回退。这里钉住三件事：首请求只有核心集、解锁后立刻展开、
+    解锁事实落账并在下一轮延续。"""
+
+    @staticmethod
+    def _capture(monkeypatch, scripts):
+        """脚本化 chat_stream，记录每次请求收到的工具名集合。"""
+        seen: list[set[str]] = []
+        rounds = {"n": 0}
+
+        async def _rounds(**kw):
+            seen.append({t["function"]["name"] for t in kw["tools"]})
+            for item in scripts[rounds["n"]]:
+                yield item
+            rounds["n"] += 1
+
+        monkeypatch.setattr(service.pilot_llm, "chat_stream", _rounds)
+        return seen
+
+    @staticmethod
+    def _catalog_stub(monkeypatch):
+        async def _fn(name, arguments, guarded=False, sid=None):
+            return {"kind": "tool_catalog", "tools": [], "count": 0}
+
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _fn)
+
+    def test_unexpanded_session_keeps_core_slice(self, monkeypatch):
+        _patch_ready(monkeypatch)
+        seen = self._capture(monkeypatch, [[("answer", "好"), ("usage", (10, 2))]])
+        result = asyncio.run(service.ask("巫师3多少钱", session_id="catalog-plain"))
+        assert seen[0] == set(service.pilot_tools.CORE_TOOLS)
+        assert "bills_summary" not in seen[0]
+        assert "tool_catalog" not in result  # 没解锁就不写这条账
+
+    def test_list_tools_expands_mid_turn(self, monkeypatch):
+        _patch_ready(monkeypatch)
+        seen = self._capture(monkeypatch, [
+            [("tool_calls", [{"id": "t1", "name": "list_tools", "arguments": {}}])],
+            [("answer", "好了"), ("usage", (100, 5))],
+        ])
+        self._catalog_stub(monkeypatch)
+        result = asyncio.run(service.ask("同步一下账单", session_id="catalog-expand"))
+        core = set(service.pilot_tools.CORE_TOOLS)
+        extra = set(service.pilot_tools.expandable_tools())
+        assert seen[0] == core            # 首次请求：只有核心切面
+        assert seen[1] == core | extra    # 解锁后：本步之后的请求立刻带上其余工具
+        assert "bills_summary" in seen[1] and "bills_summary" not in seen[0]
+        assert set(result["tool_catalog"]) == extra
+
+    def test_expansion_survives_next_turn(self, monkeypatch):
+        _patch_ready(monkeypatch)
+        self._capture(monkeypatch, [
+            [("tool_calls", [{"id": "t1", "name": "list_tools", "arguments": {}}])],
+            [("answer", "好了"), ("usage", (100, 5))],
+        ])
+        self._catalog_stub(monkeypatch)
+        asyncio.run(service.ask("同步一下账单", session_id="catalog-keep"))
+        state = asyncio.run(service.get_store().load("catalog-keep"))
+        assert (service.session_expanded_tools(state)
+                == service.pilot_tools.expandable_tools())
+
+        _patch_ready(monkeypatch)
+        seen = self._capture(monkeypatch, [[("answer", "再答"), ("usage", (100, 5))]])
+        asyncio.run(service.ask("那再看看", session_id="catalog-keep"))
+        assert "bills_summary" in seen[0]  # 下一轮仍带展开后的工具表
+
+    def test_session_expanded_tools_ignores_empty_and_missing(self):
+        class _St:
+            turns: list[dict] = []
+
+        assert service.session_expanded_tools(None) == frozenset()
+        assert service.session_expanded_tools(_St()) == frozenset()
+        _St.turns = [{"resp": {}}, {"resp": {"tool_catalog": []}},
+                     {"resp": {"tool_catalog": ["bills_summary", "read_logs"]}}]
+        assert service.session_expanded_tools(_St()) == {"bills_summary", "read_logs"}
+
+
 class TestHistoryBudget:
-    """历史预算派生：窗口未知回落固定值，已知窗口按公式派生并夹边。"""
+    """历史预算派生：窗口未知回落固定值；已知窗口按比例切给历史，再受成本线约束。"""
 
     def test_unknown_window_falls_back(self):
         assert pilot_context.derive_history_budget(None) == pilot_context.HISTORY_BUDGET_TOKENS
         assert pilot_context.derive_history_budget(0) == pilot_context.HISTORY_BUDGET_TOKENS
         assert pilot_context.derive_history_budget(-5) == pilot_context.HISTORY_BUDGET_TOKENS
 
-    def test_window_minus_reserve_and_overhead(self):
-        # 不触顶区间：派生值 = 窗口 − 回答预留 − 安全垫 − 开销
-        assert pilot_context.derive_history_budget(12000, 2000) == 12000 - 2048 - 1024 - 2000
-        assert pilot_context.derive_history_budget(10000, -100) == 10000 - 2048 - 1024
+    def test_scales_with_window_below_cost_line(self):
+        # 成本线以下：有效窗口（窗口 − 回答预留 − 安全垫）按比例归历史，再扣非历史开销
+        window = 16384
+        usable = window - pilot_context._OUTPUT_RESERVE_TOKENS - pilot_context._WINDOW_BUFFER_TOKENS
+        scaled = int(usable * pilot_context.HISTORY_BUDGET_RATIO)
+        assert scaled < pilot_context.HISTORY_COST_TOKENS
+        assert pilot_context.derive_history_budget(window) == scaled
+        assert pilot_context.derive_history_budget(window, 2000) == scaled - 2000
+        assert pilot_context.derive_history_budget(window, -100) == scaled
 
-    def test_clamps_small_and_large_windows(self):
-        assert pilot_context.derive_history_budget(4096, 8000) == 2000
-        assert pilot_context.derive_history_budget(1_000_000) == 12000
-        assert pilot_context.derive_history_budget(3_000_000) == 12000
+    def test_cost_line_caps_large_windows(self):
+        # 窗口决定「装得下多少」，成本线决定「值不值得装这么多」——大窗口不再线性放开。
+        # 每轮每个请求都要重发整段历史，一次缓存未命中就是整段全量重算的账单。
+        assert pilot_context.derive_history_budget(200_000) == pilot_context.HISTORY_COST_TOKENS
+        assert pilot_context.derive_history_budget(1_000_000) == pilot_context.HISTORY_COST_TOKENS
+        # 成本线是「一次请求的总量」：固定开销照扣，扣完剩下的才是历史
+        assert (pilot_context.derive_history_budget(200_000, 5000)
+                == pilot_context.HISTORY_COST_TOKENS - 5000)
+        # 小窗口本来就在线以下，成本线不动它
+        assert (pilot_context.derive_history_budget(16384)
+                < pilot_context.derive_history_budget(200_000))
+
+    def test_clamps_small_windows(self):
+        assert pilot_context.derive_history_budget(4096, 8000) == pilot_context._HISTORY_BUDGET_MIN
+        assert pilot_context.derive_history_budget(8000) == pilot_context._HISTORY_BUDGET_MIN
 
     def test_service_budget_uses_window_from_cfg(self):
         unknown = service._history_budget(_CFG)
         assert unknown == pilot_context.HISTORY_BUDGET_TOKENS
-        assert service._history_budget({**_CFG, "context_window": 1_000_000}) == 12000
-        assert service._history_budget({**_CFG, "context_window": 4096}) == 2000  # 开销吃满余量，夹下限
         # 期望值按当前开销动态推导：工具表体量随版本演化，测试钉公式不钉开销
         overhead = (
             pilot_context.estimate_tokens(service._SYSTEM_PROMPT)
             + pilot_context.estimate_tokens(
                 json.dumps(service.pilot_tools.tool_specs(), ensure_ascii=False))
         )
-        mid = service._history_budget({**_CFG, "context_window": 16384})
-        assert mid == min(12000, max(2000, 16384 - 3072 - overhead))
+        usable = 16384 - pilot_context._OUTPUT_RESERVE_TOKENS - pilot_context._WINDOW_BUFFER_TOKENS
+        assert service._history_budget({**_CFG, "context_window": 16384}) == max(
+            pilot_context._HISTORY_BUDGET_MIN,
+            min(int(usable * pilot_context.HISTORY_BUDGET_RATIO) - overhead,
+                pilot_context.HISTORY_COST_TOKENS),
+        )
+
+
+class TestSystemPromptCapabilities:
+    """系统提示词能力宣告：确认已知能力覆盖，防模型误判自身能力边界。"""
+
+    def test_declares_core_capabilities_coverage(self):
+        prompt = service._SYSTEM_PROMPT
+        assert "矢量图形与图表渲染" in prompt
+        assert "<svg>" in prompt
+        assert "界面导航与页面直达" in prompt
+        assert "navigate" in prompt
+        assert "系统诊断与网络排障" in prompt
+        assert "system_diagnostics" in prompt
+        assert "read_logs" in prompt
+        assert "偏好记忆与对话回溯" in prompt
+        assert "get_user_preferences" in prompt
+        assert "list_sessions" in prompt
+        assert "批量提议与安全确认" in prompt
+        assert "propose_bulk" in prompt
+        assert "Markdown 表格" in prompt
+        assert "read_attachment" in prompt
+
+
+class TestPruneOldToolResults:
+    """老工具结果清理：整轮让位之前那道免费减负（只改发给模型的视图）。"""
+
+    @staticmethod
+    def _groups(count: int, size: int = 400) -> list[dict]:
+        msgs = []
+        for i in range(count):
+            msgs.append({"role": "assistant", "content": "", "tool_calls": [{"id": f"c{i}", "arguments": {}}]})
+            msgs.append({"role": "tool", "content": "价" * size})
+        return msgs
+
+    def test_keeps_recent_groups_verbatim(self):
+        msgs = self._groups(8)
+        out = pilot_context.prune_old_tool_results(msgs)
+        cleared = [m for m in out if m["content"] == pilot_context.CLEARED_TOOL_RESULT]
+        kept = [m for m in out if m["role"] == "tool" and m["content"] != pilot_context.CLEARED_TOOL_RESULT]
+        assert len(cleared) == 8 - pilot_context.KEEP_RECENT_TOOL_GROUPS
+        assert len(kept) == pilot_context.KEEP_RECENT_TOOL_GROUPS
+        # 传入的列表不被改动：这是视图，不是存储
+        assert all(m["content"] != pilot_context.CLEARED_TOOL_RESULT for m in msgs)
+
+    def test_noop_within_keep_window(self):
+        msgs = self._groups(3)
+        assert pilot_context.prune_old_tool_results(msgs) == msgs
+
+    def test_assemble_clears_before_dropping_turns(self):
+        from app.domains.pilot.session import SessionState
+
+        st = SessionState(sid="s1")
+        for i in range(6):
+            st.turns.append({
+                "q": f"q{i}",
+                "messages": [
+                    {"role": "assistant", "content": "", "tool_calls": [{"id": f"c{i}", "arguments": {}}]},
+                    {"role": "tool", "content": "价格数据" * 200},
+                    {"role": "assistant", "content": f"回答{i}"},
+                ],
+                "resp": {"answer": f"回答{i}"},
+            })
+
+        full = pilot_context.assemble(st, "现在呢", None, budget=10 ** 9)
+        pruned = pilot_context.prune_old_tool_results(full)
+        # 预算卡在「清得动、装不下整轮」之间：该清老工具结果，而不是丢轮次
+        budget = pilot_context.estimate_messages(pruned) + 10
+        assert budget < pilot_context.estimate_messages(full)
+        out = pilot_context.assemble(st, "现在呢", None, budget=budget)
+        assert any(m.get("content") == pilot_context.CLEARED_TOOL_RESULT for m in out)
+        assert any("回答0" in str(m.get("content")) for m in out)  # 最早那轮没被让位丢掉
+
+    @staticmethod
+    def _named_groups(count: int, name: str, *, kind: str = "rows", size: int = 400) -> list[dict]:
+        """带工具名的真实形态：名字只在同组 assistant 的 tool_calls 里。"""
+        msgs = []
+        for i in range(count):
+            msgs.append({"role": "assistant", "content": "", "tool_calls": [
+                {"id": f"c{i}", "type": "function",
+                 "function": {"name": name, "arguments": "{}"}}]})
+            msgs.append({"role": "tool", "tool_call_id": f"c{i}",
+                         "content": json.dumps({"kind": kind, "payload": "价" * size},
+                                               ensure_ascii=False)})
+        return msgs
+
+    def test_only_replayable_tool_results_are_cleared(self):
+        """只清「能重新调回来」的只读工具结果；动作类结果不可复现，留着。"""
+        read = self._named_groups(8, "price_drops")
+        out = pilot_context.prune_old_tool_results(read)
+        assert sum(1 for m in out if m["content"] == pilot_context.CLEARED_TOOL_RESULT) == 3
+
+        write = self._named_groups(8, "add_follow")
+        assert pilot_context.prune_old_tool_results(write) == write
+
+    def test_failed_results_are_kept(self):
+        """失败结果承载「这一步没成」的事实，清掉模型就没法决定要不要重试。"""
+        msgs = self._named_groups(8, "price_drops", kind="failed")
+        assert pilot_context.prune_old_tool_results(msgs) == msgs
+
+    def test_placeholder_tells_model_how_to_recover(self):
+        assert "重新调用" in pilot_context.CLEARED_TOOL_RESULT
+
+    def test_low_trigger_ratio_clears_before_budget(self):
+        """闲置回落：触发线降到九成，体量还没超预算就先清（此刻缓存已过期，清了不亏）。"""
+        from app.domains.pilot.session import SessionState
+
+        st = SessionState(sid="s1")
+        for i in range(6):
+            st.turns.append({
+                "q": f"q{i}",
+                "messages": [
+                    {"role": "assistant", "content": "", "tool_calls": [{"id": f"c{i}", "arguments": {}}]},
+                    {"role": "tool", "content": "价格数据" * 200},
+                    {"role": "assistant", "content": f"回答{i}"},
+                ],
+                "resp": {"answer": f"回答{i}"},
+            })
+        full = pilot_context.assemble(st, "现在呢", None, budget=10 ** 9)
+        full_tokens = pilot_context.estimate_messages(full)
+        # 触发线上：正常触发线是 1.0（体量恰好等于预算 → 不动）
+        plain = pilot_context.assemble(st, "现在呢", None, budget=full_tokens)
+        # 闲置触发线 0.9：同样体量下先把老工具结果清掉
+        idle = pilot_context.assemble(st, "现在呢", None, budget=full_tokens,
+                                      prune_ratio=pilot_context.IDLE_PRUNE_TRIGGER_RATIO)
+        assert not any(m.get("content") == pilot_context.CLEARED_TOOL_RESULT for m in plain)
+        assert any(m.get("content") == pilot_context.CLEARED_TOOL_RESULT for m in idle)
+
+
+class TestRetainBoundary:
+    """逐字保留的近期历史按窗口比例算（DSH retainRatio），不再钉死两轮。"""
+
+    @staticmethod
+    def _turns(count: int, chars: int) -> list[dict]:
+        return [{"q": f"q{i}", "messages": [{"role": "assistant", "content": "长" * chars}],
+                 "resp": {}} for i in range(count)]
+
+    def test_unknown_window_keeps_recent_two_turns(self):
+        assert pilot_context.retain_boundary(self._turns(10, 200), None) == 8
+
+    def test_large_window_retains_much_more(self):
+        turns = self._turns(500, 200)
+        boundary = pilot_context.retain_boundary(turns, 200_000)
+        retained = sum(pilot_context.estimate_messages(t["messages"]) for t in turns[boundary:])
+        assert boundary < 490                     # 远早于「留两轮」(498)，这才是大窗口的意义
+        assert retained >= pilot_context.derive_retain_tokens(200_000)
+        assert retained < pilot_context.derive_retain_tokens(200_000) * 1.5
+
+    def test_never_distills_the_current_turn(self):
+        turns = self._turns(4, 10)
+        turns[-1]["messages"] = [{"role": "assistant", "content": "长" * 300_000}]
+        assert pilot_context.retain_boundary(turns, 200_000) == 2
+
+    def test_retain_scales_with_window_then_caps_at_cost_line(self):
+        # 窗口未知 → 0（调用方退回轮数下限）
+        assert pilot_context.derive_retain_tokens(None) == 0
+        assert pilot_context.derive_retain_tokens(0) == 0
+        # 成本线以下按窗口比例；保留段恒在历史预算以内（压缩才有腾挪空间）
+        small = pilot_context.derive_retain_tokens(16384)
+        assert small == pytest.approx(
+            (16384 - pilot_context._OUTPUT_RESERVE_TOKENS) * pilot_context.RETAIN_RATIO, abs=1)
+        assert small < pilot_context.derive_history_budget(16384)
+        # 成本线以上：200k 与 1M 的逐字保留段一样厚——否则保留段自己就把预算吃满
+        assert (pilot_context.derive_retain_tokens(200_000)
+                == pilot_context.derive_retain_tokens(1_000_000)
+                == int(pilot_context.HISTORY_COST_TOKENS * pilot_context.RETAIN_RATIO))
+        assert (pilot_context.derive_retain_tokens(200_000)
+                < pilot_context.derive_history_budget(200_000))
+
+
+class TestSummaryBudget:
+    """摘要输出上限跟窗口走：被蒸馏的历史是十万量级，摘要却是它之后唯一的载体。"""
+
+    def test_scales_and_clamps(self):
+        assert pilot_context.derive_summary_max_tokens(None) == pilot_context.SUMMARY_MAX_TOKENS_MIN
+        assert pilot_context.derive_summary_max_tokens(200_000) > 2_000
+        assert pilot_context.derive_summary_max_tokens(1_000_000) == pilot_context.SUMMARY_MAX_TOKENS_MAX
+        assert (pilot_context.derive_summary_max_tokens(400_000)
+                > pilot_context.derive_summary_max_tokens(200_000))
+
+    def test_old_hard_cap_is_gone(self):
+        # 历史上摘要被钉在 380 token / 300 字；大窗口下那等于把历史丢掉
+        assert pilot_context.derive_summary_max_tokens(1_000_000) > 380 * 10
+
+
+class TestCompactPlan:
+    """蒸馏计划：边界来自保留预算，区间太小不蒸（省一次模型调用，不是失败）。"""
+
+    def test_no_plan_when_nothing_above_boundary(self):
+        from app.domains.pilot.session import SessionState
+
+        st = SessionState(sid="s")
+        st.turns = TestRetainBoundary._turns(2, 200)
+        assert pilot_context.compact_plan(st, 200_000) is None
+        assert pilot_context.compact_plan(None, 200_000) is None
+
+    def test_region_too_small_is_not_worth_compacting(self):
+        from app.domains.pilot.session import SessionState
+
+        st = SessionState(sid="s")
+        st.turns = TestRetainBoundary._turns(3, 10)   # 区间远小于摘要上限的倍数
+        assert pilot_context.compact_plan(st, None) is None
+
+    def test_plan_carries_boundary_and_budget(self):
+        from app.domains.pilot.session import SessionState
+
+        st = SessionState(sid="s")
+        st.turns = TestRetainBoundary._turns(600, 200)
+        plan = pilot_context.compact_plan(st, 200_000)
+        assert plan is not None
+        start, through, max_tokens = plan
+        assert start == 0 and 0 < through < 600
+        assert max_tokens == pilot_context.derive_summary_max_tokens(200_000)
+
+
+class TestUsageCorrection:
+    """用提供方回传的真实输入量收紧本地估值——只紧不松。"""
+
+    class _St:
+        def __init__(self, turns):
+            self.turns = turns
+
+    def test_no_sample_means_no_correction(self):
+        assert service._measure_correction(None, 1000) == 1.0
+        assert service._measure_correction(self._St([]), 1000) == 1.0
+        assert service._measure_correction(self._St([{"resp": {}}]), 1000) == 1.0
+
+    def test_small_sample_is_ignored(self):
+        st = self._St([{"resp": {"first_in": 900, "ctx_tokens": 10}}])
+        assert service._measure_correction(st, 0) == 1.0
+
+    def test_underestimate_is_corrected_upwards(self):
+        # 真实跑了 2000，本地只估到 800（低估）→ 预算按 2.0 收紧，但夹在上限
+        st = self._St([{"resp": {"first_in": 2_000, "ctx_tokens": 800}}])
+        assert service._measure_correction(st, 0) == service._CORRECTION_MAX
+
+    def test_overestimate_never_loosens_below_one(self):
+        st = self._St([{"resp": {"first_in": 500, "ctx_tokens": 900}}])
+        assert service._measure_correction(st, 0) == 1.0
+
+    def test_absurd_ratio_falls_back(self):
+        st = self._St([{"resp": {"first_in": 10_000_000, "ctx_tokens": 900}}])
+        assert service._measure_correction(st, 0) == 1.0
+
+    def test_budget_is_tightened_by_correction(self):
+        assert (pilot_context.derive_history_budget(200_000, 5000, correction=1.4)
+                < pilot_context.derive_history_budget(200_000, 5000))
+
+    def test_history_budget_passes_correction_through(self):
+        # 工具表体量随版本演化：按当前真实开销反推一个「真实/估值 = 1.3」的样本
+        tools_tokens = pilot_context.estimate_tokens(json.dumps(
+            service.pilot_tools.tool_specs(), ensure_ascii=False))
+        st = self._St([{"resp": {"first_in": int((1_000 + tools_tokens) * 1.3),
+                                 "ctx_tokens": 1_000}}])
+        assert service._measure_correction(st, tools_tokens) == pytest.approx(1.3, abs=0.01)
+        tight = service._history_budget({**_CFG, "context_window": 200_000}, state=st)
+        loose = service._history_budget({**_CFG, "context_window": 200_000})
+        assert tight < loose
+
+
+class TestIdlePrune:
+    """闲置回落：前缀缓存早已过期，此刻清理不额外损失缓存。"""
+
+    def test_minutes_from_turn_timestamp(self):
+        import time as _time
+        from app.domains.pilot.session import SessionState
+
+        st = SessionState(sid="s")
+        assert service._idle_minutes(st) is None
+        st.turns = [{"ts": _time.strftime("%Y-%m-%dT%H:%M:%S")}]
+        assert service._idle_minutes(st) == pytest.approx(0, abs=0.2)
+        st.turns = [{"ts": "2020-01-01T00:00:00"}]
+        assert service._idle_minutes(st) > pilot_context.IDLE_PRUNE_MINUTES
+        st.turns = [{"ts": "不是时间"}]
+        assert service._idle_minutes(st) is None
+
 
 
 class TestContextWindowConfig:
@@ -1266,6 +1699,43 @@ class TestContextWindowConfig:
         assert pilot_config._clean_window(131072) == 131072
         assert pilot_config._clean_window("131072") == 131072
         assert pilot_config._clean_window(3_000_000) is None
+
+    def test_manual_window_beats_auto(self):
+        assert pilot_config._resolve_window(32000, 200000) == (32000, "manual")
+        assert pilot_config._resolve_window(None, 200000) == (200000, "auto")
+        # 表外模型不拒绝猜测：按兜底窗口估算（source=fallback，前端提示可手填覆盖）
+        assert pilot_config._resolve_window(None, None) == (
+            model_windows.FALLBACK_CONTEXT_WINDOW,
+            "fallback",
+        )
+
+    def test_guess_matches_known_models(self):
+        from app.domains.pilot import model_windows
+
+        guess = model_windows.guess_context_window
+        assert guess("deepseek-chat") == 131072
+        assert guess("glm-4-plus") == 131072
+        assert guess("claude-3-5-sonnet-20241022") == 200000
+        assert guess("gpt-4o-mini") == 128000
+        assert guess("kimi-k2-0711-preview") == 131072
+        # 新一代型号沿用同系列窗口（未发布型号的保守取值）
+        assert guess("glm-5.3-flash") == 131072
+        assert guess("kimi-k3") == 131072
+        assert guess("deepseek-v4-pro") == 131072
+        # 先具体后宽泛：短后缀规则不能被通用规则吃掉
+        assert guess("moonshot-v1-8k") == 8192
+        assert guess("moonshot-v1-128k") == 131072
+        assert guess("gpt-4-turbo") == 128000
+
+    def test_guess_returns_none_for_unknown(self):
+        from app.domains.pilot import model_windows
+
+        guess = model_windows.guess_context_window
+        # 网关自定义名认不出就不要猜：回落固定预算，行为与从前一致
+        assert guess("u2-flash") is None
+        assert guess("some-private-model") is None
+        assert guess("") is None
+        assert guess(None) is None
 
     def test_provider_carries_window(self):
         cleaned = pilot_config._clean_provider({"id": "p1", "context_window": 65536})
@@ -1339,11 +1809,71 @@ class TestCompactBreakerAndLedger:
         assert pilot_context.estimate_messages(base) < marker["pre_tokens"]
 
     @pytest.mark.asyncio
+    async def test_trigger_measures_full_view_not_dropped_one(self, monkeypatch):
+        """触发看全量视图：装配让位到装得下就不再压缩，等于存档永远不更新。
+
+        这里装配结果（让位到最近 2 轮）已在预算内，但未让位的全量历史超了——
+        按旧口径不会压缩，实际会让位硬扛、把更早的对话静默丢掉。"""
+        _patch_ready(monkeypatch)
+        calls = {"compact": 0}
+        self._patch_split_stream(monkeypatch, compact_fail=False, calls=calls)
+        store = service.get_store()
+        sid = "sess-full-view"
+        for i in range(3):  # 每轮约 3000 token：3 轮超预算，让位到 2 轮正好装得下
+            await store.append_turn(sid, {
+                "q": f"问题{i}",
+                "resp": {"answer": "答" * 1875},
+                "messages": [
+                    {"role": "user", "content": f"问题{i}" + "长" * 1875},
+                    {"role": "assistant", "content": "答" * 1875},
+                ],
+                "last_game": None,
+            })
+        state = await store.load(sid)
+        base, compacted = await service._assemble_for_model(state, "新问题", None, {**_CFG})
+        assert compacted is True and calls["compact"] == 1
+        # 压缩后带存档的视图明显小于未压缩的全量历史
+        assert pilot_context.estimate_messages(base) < state.markers[-1]["pre_tokens"]
+
+    @pytest.mark.asyncio
+    async def test_free_prune_first_skips_the_paid_compaction(self, monkeypatch):
+        """先免费清理、清得动就不摘要：省下一次真花钱的模型调用（DSH 的顺序）。"""
+        _patch_ready(monkeypatch)
+        calls = {"compact": 0}
+        self._patch_split_stream(monkeypatch, compact_fail=False, calls=calls)
+        store = service.get_store()
+        sid = "sess-prune-shortcut"
+        for i in range(9):  # 9 组工具结果：留下最近 5 组，清掉 4 组即回到预算内
+            await store.append_turn(sid, {
+                "q": f"问题{i}",
+                "resp": {"answer": f"回答{i}"},
+                "messages": [
+                    {"role": "assistant", "content": "", "tool_calls": [
+                        {"id": f"c{i}", "type": "function",
+                         "function": {"name": "price_drops", "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": f"c{i}",
+                     "content": json.dumps({"kind": "rows", "payload": "价" * 1400},
+                                           ensure_ascii=False)},
+                    {"role": "assistant", "content": f"回答{i}"},
+                ],
+                "last_game": None,
+            })
+        state = await store.load(sid)
+        full = pilot_context.full_view(state, "新问题", None)
+        budget = pilot_context.HISTORY_BUDGET_TOKENS
+        assert pilot_context.estimate_messages(full) > budget          # 压力确实越线
+        assert pilot_context.estimate_messages(
+            pilot_context.prune_old_tool_results(full)) <= budget       # 但清得动
+        base, compacted = await service._assemble_for_model(state, "新问题", None, {**_CFG})
+        assert compacted is False and calls["compact"] == 0
+        assert any(m.get("content") == pilot_context.CLEARED_TOOL_RESULT for m in base)
+
+    @pytest.mark.asyncio
     async def test_manual_compact_resets_breaker(self, monkeypatch):
         _patch_ready(monkeypatch)
         calls = {"compact": 0}
-        self._patch_split_stream(monkeypatch, compact_fail=True, calls=calls)
         cfg = {**_CFG}
+        self._patch_split_stream(monkeypatch, compact_fail=True, calls=calls)
         state = await self._seed_big_turns("sess-manual")
         await service._assemble_for_model(state, "问", None, cfg)
         await service._assemble_for_model(state, "问", None, cfg)
@@ -1788,17 +2318,49 @@ class TestDecisionAgent:
         assert service._stream_card_hint("list_follows", [], arguments={}, question="黑神话在不在我的关注里？") is None
         assert service._stream_card_hint("proxy_pool_status", [], arguments={}, question="黑神话为什么价格没刷新？") is None
         assert service._stream_card_hint("family_status", [], arguments={}, question="家庭共享怎么开？") is None
-        assert service._stream_card_hint("epic_free", [], arguments={}, question="目前有什么可以领取的免费喜加一游戏吗？") is None
         assert service._stream_card_hint("steam_free", [], arguments={}, question="目前有什么可以领取的免费喜加一游戏吗？") is None
         # 放行情况
         assert service._stream_card_hint("list_follows", [], arguments={}, question="查看我的关注列表") == "rows"
         assert service._stream_card_hint("proxy_pool_status", [], arguments={}, question="体检网络节点代理池") == "rows"
-        assert service._stream_card_hint("epic_free", [], arguments={"emit_card": True}, question="目前有什么可以领取的免费喜加一游戏吗？") == "rows"
+        assert service._stream_card_hint("epic_free", [], arguments={}, question="目前有什么可以领取的免费喜加一游戏吗？") == "epic"
 
     def test_free_offers_rows_suppressed_by_default_unless_explicit(self):
         from app.domains.pilot.decision import DECISION_AGENT
-        epic_card = {"kind": "rows", "titleKey": "epic", "rows": [{"k": "System Shock 2", "vKey": "epicFree"}]}
+        steam_card = {"kind": "rows", "titleKey": "steamFree", "rows": [{"k": "System Shock 2", "vKey": "steamFree"}]}
         # 1. 默认聊天对话：作为内部推导事实抑制原始数据表发卡
+        dec = DECISION_AGENT.decide_card(
+            tool_name="steam_free",
+            result=steam_card,
+            arguments={},
+            question="目前有什么可以领取的免费喜加一游戏吗？",
+            current_cards=[],
+            base_card=steam_card,
+        )
+        assert dec.should_emit is False
+        assert dec.reason == "internal_data_for_synthesis"
+
+        # 2. 显式要求发卡：emit_card=True 放行
+        dec_explicit = DECISION_AGENT.decide_card(
+            tool_name="steam_free",
+            result=steam_card,
+            arguments={"emit_card": True},
+            question="目前有什么可以领取的免费喜加一游戏吗？",
+            current_cards=[],
+            base_card=steam_card,
+        )
+        assert dec_explicit.should_emit is True
+        assert dec_explicit.status == "rendered"
+
+    def test_epic_free_emits_epic_card_by_default(self):
+        from app.domains.pilot.decision import DECISION_AGENT
+        epic_card = {
+            "kind": "epic",
+            "titleKey": "epic",
+            "offers": [
+                {"title": "The Falconeer", "titleCn": "空战猎鹰", "upcoming": False, "start": "2026-10-03", "end": "2026-10-10", "url": "https://store.epicgames.com/p/the-falconeer"},
+            ],
+            "total": 1,
+        }
         dec = DECISION_AGENT.decide_card(
             tool_name="epic_free",
             result=epic_card,
@@ -1807,19 +2369,140 @@ class TestDecisionAgent:
             current_cards=[],
             base_card=epic_card,
         )
-        assert dec.should_emit is False
-        assert dec.reason == "internal_data_for_synthesis"
+        assert dec.should_emit is True
+        assert dec.status == "rendered"
+        assert dec.kind == "epic"
+        assert "空战猎鹰" in (dec.summary or "")
 
-        # 2. 显式要求发卡：emit_card=True 放行
-        dec_explicit = DECISION_AGENT.decide_card(
-            tool_name="epic_free",
-            result=epic_card,
-            arguments={"emit_card": True},
-            question="目前有什么可以领取的免费喜加一游戏吗？",
-            current_cards=[],
-            base_card=epic_card,
+
+
+
+class TestCardLedger:
+    """跨轮卡片账本：卡片出现挂账（phases.cards）、近轮账本去重与模型同步。"""
+
+    @pytest.mark.asyncio
+    async def test_phase_cards_ledgered_and_streamed(self, monkeypatch):
+        _patch_ready(monkeypatch, stream=[
+            ("tool_calls", [{"id": "t1", "name": "list_follows", "arguments": {}}]),
+            ("answer", "这是你的关注。"),
+        ])
+
+        async def _games(name, arguments, guarded=False, sid=None):
+            return {"kind": "games", "items": [{"appid": 1, "name": "黑神话"}]}
+
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _games)
+        events = [e async for e in service.ask_stream("关注里都有什么游戏", session_id="s-ledger")]
+        card_evs = [e for e in events if e["type"] == "card" and e.get("card")]
+        assert card_evs and card_evs[0]["card"]["kind"] == "games"
+        done = events[-1]
+        phase_cards = done["phases"][0]["cards"]
+        assert phase_cards and phase_cards[0]["kind"] == "games"
+        assert done["cards"] == phase_cards
+
+    def test_recent_cards_digest_reads_turn_ledger(self):
+        from types import SimpleNamespace
+
+        state = SimpleNamespace(turns=[
+            {"resp": {"cards": [{"kind": "price", "name": "黑神话"}]}},
+            {"resp": {"cards": [{"kind": "games", "items": [{"name": "艾尔登法环"}]}]}},
+        ])
+        digest = service._recent_cards_digest(state)
+        assert ("price", "黑神话") in digest
+        assert ("games", "艾尔登法环") in digest
+        assert service._recent_cards_digest(None) == []
+
+    def test_ledger_note_lists_recent_cards(self):
+        note = service._card_ledger_note([("games", "艾尔登法环"), ("price", "黑神话")])
+        assert note is not None and "艾尔登法环" in note["content"]
+        assert service._card_ledger_note([]) is None
+
+    @pytest.mark.asyncio
+    async def test_ledger_note_reaches_model_and_dedups_static_lists(self, monkeypatch):
+        state = await service.get_store().load_or_new("s-cross")
+        await service._record_turn(state, "旧问题", {
+            "answer": "", "source": "llm",
+            "cards": [{"kind": "games", "items": [{"appid": 2, "name": "艾尔登法环"}]}],
+        })
+        _patch_ready(monkeypatch, stream=[("answer", "占位")])
+        seen: dict = {}
+
+        async def _capture(messages=None, **kw):
+            seen["messages"] = list(messages or [])
+            yield ("answer", "好的。")
+
+        monkeypatch.setattr(service.pilot_llm, "chat_stream", _capture)
+
+        async def _games(name, arguments, guarded=False, sid=None):
+            return {"kind": "games", "items": [{"appid": 2, "name": "艾尔登法环"}]}
+
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _games)
+        events = [e async for e in service.ask_stream("关注里都有什么游戏", session_id="s-cross")]
+        note = [m for m in seen["messages"]
+                if m.get("role") == "system" and "界面卡片" in str(m.get("content"))]
+        assert note and "艾尔登法环" in note[0]["content"]
+        # 静态清单卡近轮已呈现：本轮不再发卡（模型可用 emit_card=true 强制）
+        assert not [e for e in events if e["type"] == "card" and e.get("card")]
+        assert not events[-1]["phases"][0]["cards"]
+
+    def test_price_card_not_deduped_across_turns(self):
+        from app.domains.pilot.decision import DECISION_AGENT
+
+        base = {"kind": "price", "name": "黑神话", "cnyFen": 26800}
+        dec = DECISION_AGENT.decide_card(
+            tool_name="get_price_briefing", result={"kind": "price", "cnyFen": 26800},
+            arguments={"appid": 2358720}, question="黑神话现在多少钱",
+            current_cards=[], base_card=base,
+            recent_cards=[("price", "黑神话")],
         )
-        assert dec_explicit.should_emit is True
-        assert dec_explicit.status == "rendered"
+        assert dec.should_emit is True
+
+    def test_explicit_emit_card_overrides_recent_dedup(self):
+        from app.domains.pilot.decision import DECISION_AGENT
+
+        base = {"kind": "games", "items": [{"name": "艾尔登法环"}]}
+        dec = DECISION_AGENT.decide_card(
+            tool_name="list_follows", result={"kind": "games", "items": [{"name": "艾尔登法环"}]},
+            arguments={"emit_card": True}, question="再列一次我的关注",
+            current_cards=[], base_card=base,
+            recent_cards=[("games", "艾尔登法环")],
+        )
+        assert dec.should_emit is True and dec.status == "rendered"
 
 
+class TestParallelReadTools:
+    """模型一次给多个只读调用时的并行批次。"""
+
+    @pytest.mark.asyncio
+    async def test_read_tools_run_concurrently(self, monkeypatch):
+        import time as _time
+
+        _patch_ready(monkeypatch, stream=[
+            ("tool_calls", [
+                {"id": "t1", "name": "list_follows", "arguments": {}},
+                {"id": "t2", "name": "list_alerts", "arguments": {}},
+            ]),
+            ("answer", "两边都查完了。"),
+        ])
+        started: dict[str, float] = {}
+
+        async def _slow(name, arguments, guarded=False, sid=None):
+            started[name] = _time.monotonic()
+            await asyncio.sleep(0.3 if name == "list_follows" else 0.05)
+            if name == "list_follows":
+                return {"kind": "games", "items": [{"appid": 1, "name": name}]}
+            return {"kind": "rows", "rows": [{"k": "提醒", "v": "x"}]}
+
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _slow)
+        events = [e async for e in service.ask_stream("黑神话在关注里吗", session_id="s-par")]
+        # 并行证明：第二个工具在第一个还在跑时就已启动（顺序执行会差 ≥0.3s）
+        assert started["list_alerts"] - started["list_follows"] < 0.15
+        tool_evs = [e for e in events if e["type"] == "tool"]
+        assert [e["name"] for e in tool_evs] == ["list_follows", "list_alerts"]
+        assert all(e["status"] == "ok" for e in tool_evs)
+        done = events[-1]
+        assert [s["label"] for s in done["phases"][0]["steps"]] == ["follows", "alerts"]
+        # 两个工具结果都回灌模型（账本里两条 tool 消息；turn_messages 不下发 SSE）
+        state = await service.get_store().load("s-par")
+        tool_msgs = [m for t in state.turns for m in (t.get("messages") or [])
+                     if m.get("role") == "tool"]
+        assert len(tool_msgs) == 2

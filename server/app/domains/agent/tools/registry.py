@@ -23,16 +23,19 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return list(self._specs)
 
-    def views(self) -> list[dict]:
-        """模型可见的 function 视图（openai function 信封形状）。"""
+    def views(self, *, card_tools: frozenset[str] | None = None) -> list[dict]:
+        """模型可见的 function 视图（openai function 信封形状）。
+
+        card_tools 给定时只给这些工具注入 emit_card：不产卡的工具带上它，
+        只是每次请求都白付的固定开销。缺省 None = 全部注入。"""
         out = []
         for s in self._specs.values():
             params = dict(s.parameters)
             props = dict(params.get("properties") or {})
-            if "emit_card" not in props:
+            if "emit_card" not in props and (card_tools is None or s.name in card_tools):
                 props["emit_card"] = {
                     "type": "boolean",
-                    "description": "是否在用户界面渲染可视化卡片（默认 true；若仅为内部核验/中间查询请传 false）",
+                    "description": "是否渲染卡片（默认 true；中间核验传 false）",
                 }
                 params["properties"] = props
             out.append({

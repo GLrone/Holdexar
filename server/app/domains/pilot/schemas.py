@@ -51,7 +51,15 @@ class PilotConfigPayload(BaseModel):
     has_api_key: bool
     monthly_cap: int
     context_window: int | None = None
-    """活跃供应商的模型窗口（token，用户可选配置）；未知 = None（历史预算回落固定值）。"""
+    """生效的模型窗口（token）：手动配置优先，未配置时按模型名自动识别。"""
+    context_window_source: str = "none"
+    """窗口来源：manual（用户手填）/ auto（按模型名表自动识别）/ none（识别不出也未手填）。
+
+    none 时历史预算回落固定值——这是当前的既有行为，不是故障。"""
+    context_window_auto: int | None = None
+    """按当前选用模型名识别出的窗口（无论是否被手填覆盖），供设置页提示对照。"""
+    tool_content_limit: int = 3000
+    """历史轮工具结果保留预算（字符，头尾保留、中段省略）。"""
     usage_inp: int = 0
     usage_out: int = 0
     usage_calls: int = 0
@@ -75,6 +83,8 @@ class PilotConfigUpdate(BaseModel):
     monthly_cap: int | None = None
     context_window: int | None = None
     """无供应商账本时的存量单键写路径；显式空 = 清除（回落固定历史预算）。"""
+    tool_content_limit: int | None = None
+    """历史轮工具结果保留预算（字符，服务端夹在 500–20000）。"""
     active: str | None = None
     """切换活跃供应商（切换时模型自动重置为新家启用清单）。"""
 
@@ -115,13 +125,80 @@ class TestResponse(BaseModel):
     detail: str = ""
 
 
+class PilotResumeTool(BaseModel):
+    """中断续跑：上一轮已完成的一次工具调用的最小事实。"""
+
+    name: str = ""
+    label: str = ""
+    status: str = ""
+    summary: str = ""
+
+
+class PilotResumePayload(BaseModel):
+    """中断续跑载荷：上一轮被中断时已完成的事实（前端持有的真实执行结果）。
+
+    只作上下文注入，不入账本——续跑产生的是新的一轮。"""
+
+    text: str = ""
+    """上一轮已流出的正文结尾（模型从这里接着说，不重头再来）。"""
+    tools: list[PilotResumeTool] = []
+    """上一轮已完成的工具调用（结果可采信，不必重复执行）。"""
+
+
 class AskRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=500)
+    # 内联上限宽松（6 万字符）；再长的正文由服务端自动转附件（见 pilot/attachments.py），
+    # 消息体里只留引用——内容长度对问答本身不再构成上限。
+    # 允许空串：只挂附件不写问题也是合法一轮，服务端回落到「请查看我附带的附件。」
+    question: str = Field(default="", max_length=60000)
     appid: int | None = None
     # 领航台会话 id：前端每次开抽屉生成一次，同一会话内追问/指代靠它串起
     session_id: str | None = Field(default=None, max_length=64)
     # 跨会话引用：本轮把另一段会话的要点摘要注入上下文（一次性，不入被引会话）
     reference_sid: str | None = Field(default=None, max_length=64)
+    # 本轮随问携带的附件 id（前端粘贴转附件后回填）；服务端按会话校验归属
+    attachments: list[str] = Field(default_factory=list, max_length=8)
+    # 中断续跑：上一轮被中断时已完成的事实（一次性注入，不入账本）
+    resume: PilotResumePayload | None = None
+    # 用户当前所在页面的上下文（前端路由 + 活跃板块），让模型知道用户在看什么
+    view_context: dict | None = None
+    # 用户在页面上选中的元素引用（标签/文本/selector/role），让模型知道用户指代的具体元素
+    element_refs: list[dict] | None = None
+
+
+class PilotAttachmentCreate(BaseModel):
+    """长文本落盘为附件：前端粘贴超阈值时先存，提问只带引用 id。"""
+
+    session_id: str = Field(min_length=1, max_length=64)
+    text: str = Field(min_length=1, max_length=2_000_000)
+    name: str | None = Field(default=None, max_length=80)
+
+
+class PilotAttachmentOut(BaseModel):
+    """附件引用（不含磁盘路径与全文）。"""
+
+    id: str
+    name: str = ""
+    chars: int = 0
+    lines: int = 0
+    created_at: str | None = None
+
+
+class PilotAttachmentListOut(BaseModel):
+    items: list[PilotAttachmentOut] = []
+
+
+class PilotRewindRequest(BaseModel):
+    """编辑重问：账本保留前 keep_turns 轮，其后轮次作废。"""
+
+    keep_turns: int = Field(ge=0, le=999)
+
+
+class PilotRewindOut(BaseModel):
+    ok: bool
+    turn_total: int = 0
+    """截断生效后账本里的轮数。"""
+    reason: str | None = None
+    """机器码（前端翻用户语言）：no_session / busy / write_failed。"""
 
 
 class AskResponse(BaseModel):
@@ -134,6 +211,8 @@ class AskResponse(BaseModel):
     reason: str | None = None
     facts: dict | None = None
     """本轮工具取到的结构化卡片（games / price / action），供前端组件渲染。"""
+    attachments: list = []
+    """本轮随问携带的附件引用（id/名称/字符数/行数）：用户消息下的附件芯片与历史还原用。"""
     cards: list = []
     """本轮 agent 时间线（tools.tool_step 产出，由 phases 展平而得）；降级路径为空列表。"""
     steps: list = []
@@ -198,6 +277,14 @@ class PilotSessionListItem(BaseModel):
     """账本文件 mtime（ISO）：最近一次落账时刻，列表展示用。"""
     running: bool = False
     """ask 流在途（agent 正在生成本会话回复）。"""
+    pinned: bool = False
+    """置顶标记（账本事实）：列表把置顶项排在最前。"""
+    archived: bool = False
+    """归档标记（账本事实）：列表可折叠归档区。"""
+    forked_from: str | None = None
+    """分叉溯源：本会话派生自哪个会话（fork 记录）；非派生会话为 null。"""
+    snippet: str = ""
+    """搜索命中片段（仅带 q 查询且有正文命中时非空）。"""
 
 
 class PilotSessionListOut(BaseModel):
@@ -206,6 +293,33 @@ class PilotSessionListOut(BaseModel):
 
 class PilotSessionTitleUpdate(BaseModel):
     text: str = Field(min_length=1, max_length=60)
+
+
+class PilotSessionFlagUpdate(BaseModel):
+    """置顶 / 归档开关（会话级布尔，账本追加记录）。"""
+
+    on: bool
+
+
+class PilotSessionFlagOut(BaseModel):
+    """置顶 / 归档结果：机器码 no_session / write_failed（不抛 5xx）。"""
+
+    ok: bool
+    reason: str | None = None
+
+
+class PilotForkRequest(BaseModel):
+    """话题分叉：保留源会话前 keep_turns 轮（含该轮）。"""
+
+    keep_turns: int = Field(ge=0, le=999)
+
+
+class PilotForkOut(BaseModel):
+    ok: bool
+    sid: str = ""
+    """派生出的新会话 id（成功时非空，供前端切换）。"""
+    turn_total: int = 0
+    reason: str | None = None
 
 
 class PilotSessionTurn(BaseModel):
@@ -268,6 +382,12 @@ class PilotSessionOut(BaseModel):
     """本会话出现过的批量提议终态（按 pid），历史轮卡片据此校正可点性。"""
     stats: PilotSessionStats | None = None
     """全部轮次的统计折叠（底栏统计与消耗明细的种子；空会话为 null）。"""
+    pinned: bool = False
+    """置顶标记（账本事实）。"""
+    archived: bool = False
+    """归档标记（账本事实）。"""
+    forked_from: str | None = None
+    """分叉溯源：本会话派生自哪个会话（fork 记录）；非派生会话为 null。"""
 
 
 class ToolRunRequest(BaseModel):

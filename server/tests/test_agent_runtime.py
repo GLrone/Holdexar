@@ -38,45 +38,16 @@ from app.domains.agent.runtime.state import (
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    """独立临时库：替换 session 工厂，write_gate 保持真实全局调度器。"""
-    import app.core.database as database_module
+def db():
+    """完整库（隔离数据目录，外键与生产同开）；url 供重启模拟另开引擎。"""
+    from app.core.database import get_session_factory, get_settings
 
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'agent_test.db').as_posix()}", echo=False
-    )
-
-    # 与生产同口径开外键校验：关着跑会放过「会话行未落库也能建 run」这类
-    # FK 违规（agent 三表的 FK 只在开着校验时才有意义）
-    @event.listens_for(engine.sync_engine, "connect")
-    def _fk_on(dbapi_conn, _record):
-        cur = dbapi_conn.cursor()
-        cur.execute("PRAGMA foreign_keys=ON")
-        cur.close()
-
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(agent_service, "get_session_factory", lambda: factory)
-    yield {"factory": factory, "url": f"sqlite+aiosqlite:///{(tmp_path / 'agent_test.db').as_posix()}"}
+    yield {"factory": get_session_factory(), "url": get_settings().db_url}
     # 遗留执行任务兜底回收（正常用例 runner 已自行退出）
     for rid in REGISTRY.active_ids():
         entry = REGISTRY.pop(rid)
         if entry and entry.task and not entry.task.done():
             entry.task.cancel()
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    """tmp 库只建 agent 三表。"""
-    engine = create_async_engine(db["url"])
-    try:
-        async with engine.begin() as conn:
-            await conn.run_sync(
-                Base.metadata.create_all,
-                [AgentSession.__table__, AgentRun.__table__, AgentEvent.__table__],
-            )
-    finally:
-        await engine.dispose()
 
 
 async def wait_status(run_id: str, statuses: set[str], timeout: float = 5.0) -> dict:

@@ -33,6 +33,21 @@ async def epic_free() -> dict:
     """Epic 当期 + 预告白送（库快照/缓存，不触发外网）。"""
     payload = await metadata_service.epic_free_offers()
     offers = payload.get("offers") or []
+    mobile = payload.get("mobile")
+    clean_offers = [
+        {
+            "title": o.get("title") or "",
+            "titleCn": o.get("titleCn"),
+            "appid": o.get("appid"),
+            "start": str(o.get("start") or ""),
+            "end": str(o.get("end") or ""),
+            "upcoming": bool(o.get("upcoming")),
+            "image": o.get("image"),
+            "url": o.get("url") or "https://store.epicgames.com/en-US/free-games",
+            "priceOriginal": o.get("priceOriginal"),
+        }
+        for o in offers
+    ]
     rows = [
         {
             "k": o.get("titleCn") or o.get("title") or (f"AppID {o['appid']}" if o.get("appid") else "—"),
@@ -42,7 +57,15 @@ async def epic_free() -> dict:
         }
         for o in offers
     ]
-    return _shared.rows_result("epic", rows, total=len(rows))
+    return {
+        "kind": "epic",
+        "titleKey": "epic",
+        "offers": clean_offers,
+        "rows": rows,
+        "mobile": mobile,
+        "fetchedAt": payload.get("fetchedAt"),
+        "total": len(clean_offers),
+    }
 
 
 async def steam_free() -> dict:
