@@ -1221,7 +1221,11 @@ async def test_summary_warm_sync_on_stale_snapshot(monkeypatch):
     assert warm_calls == []  # 新鲜 / 别号快照 / 同步进行中都不触发
 
     achievements_service._maybe_warm_sync(PRIMARY, creds, stale)
-    await _asyncio.sleep(0)
+    # 补拉走 create_task，慢机上一轮 sleep(0) 不保证任务跑完——轮询等条件成立
+    for _ in range(50):
+        if warm_calls:
+            break
+        await _asyncio.sleep(0.02)
     assert warm_calls == [PRIMARY]  # 陈旧快照触发一次补拉
 
     achievements_service._maybe_warm_sync(PRIMARY, creds, stale)
