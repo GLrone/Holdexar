@@ -210,11 +210,48 @@ async def set_strategy(
         if (await get_value(STRATEGY_EXPLICIT_KEY, False)) is not True:
             await set_value(STRATEGY_EXPLICIT_KEY, True)
     if clash_port is not None:
+        old_port = await get_value("proxy.clash_port", 7890)
         await set_value("proxy.clash_port", clash_port)
+        global _clash_port_cache
+        _clash_port_cache = None
+        # 端口即内核工作口：改了就要用上——内核在跑且监听口与新值不符时
+        # 按新端口重启（全自动化，不等下次启动/切换）
+        if int(clash_port) != int(old_port or 7890):
+            await _restart_kernel_for_port(int(clash_port))
     if autostart is not None:
         await set_value("proxy.autostart", bool(autostart))
     if health_auto is not None:
         await set_value("proxy.health_auto", bool(health_auto))
+
+
+async def _restart_kernel_for_port(new_port: int) -> None:
+    """工作端口变化即生效：内核在跑就停掉并按新端口重启。"""
+    from app.core.config import get_settings
+
+    detect = clash_manager.detect_kernel(get_settings().data_dir)
+    status = clash_manager.runtime.status()
+    if not (detect["found"] and status["running"]):
+        return
+    if clash_manager.runtime.port == new_port:
+        return
+    config_path = clash_manager.runtime.config_path
+    sub_url = clash_manager.runtime.subscription_url
+    if not config_path:
+        return
+    try:
+        clash_manager.runtime.stop()
+        await clash_manager.runtime.ensure_running(
+            detect["path"], config_path, subscription_url=sub_url, mixed_port=new_port,
+        )
+        log_event(logger, f"内核工作端口已切换为 {new_port}，已按新端口重启", tag="成功")
+    except Exception:  # noqa: BLE001 —— 重启失败如实留痕，入口就绪事实会显示
+        log_event(
+            logger,
+            "内核按新工作端口重启失败",
+            level=logging.ERROR,
+            exc_info=True,
+            detail={"端口": new_port},
+        )
 
 
 async def maybe_autoswitch_on_subscription(nodes: int | None) -> bool:
@@ -270,15 +307,6 @@ async def maybe_revert_to_direct() -> bool:
     return True
 
 
-async def _local_clash_alive() -> bool:
-    """探测 proxy.clash_port 指向的本地混合端口是否活着（1s TCP 连接）。
-
-    只验证端口在监听，不验证出口能通 Steam——后者由调用方超时/重试兜底。
-    """
-    port = await _clash_port_cached()
-    return await _tcp_alive("127.0.0.1", port)
-
-
 async def _tcp_alive(host: str, port: int, timeout: float = 1.0) -> bool:
     try:
         _, writer = await asyncio.wait_for(
@@ -305,6 +333,28 @@ async def _clash_port_cached() -> int:
     port = await get_value("proxy.clash_port", 7890)
     _clash_port_cache = (now, int(port or 7890))
     return _clash_port_cache[1]
+
+
+async def pinned_kernel_port() -> int:
+    """本程序内核的工作端口 = 网络页右上角配置的端口（proxy.clash_port，默认 7890）。
+
+    程序的全部代理流量统一走这个口——内核启动/切换/重启一律把混合口钉成它
+    （clash_manager.pin_mixed_port），订阅配置里写的端口不再决定监听口。兜底
+    探测（内核没跑时借道用户自启 Verge）固定走 `LOCAL_MIXED_PORTS`（7897），
+    与本设置无关。"""
+    return await _clash_port_cached()
+
+
+async def _local_fallback_port() -> int | None:
+    """兜底探测用户自启 Clash/Verge 的默认混合端口（1s TCP 连接）。
+
+    只验证端口在监听，不验证出口能通 Steam——后者由调用方超时/重试兜底。
+    与 proxy.clash_port 无关：配置的端口是程序内核的监听口，不是 Verge 的
+    探测目标。"""
+    for port in clash_manager.LOCAL_MIXED_PORTS:
+        if await _tcp_alive("127.0.0.1", port):
+            return port
+    return None
 
 
 # ─── 直连形态的系统代理解析 ─────────────────────────────────
@@ -383,19 +433,20 @@ async def resolve_proxy_url() -> str | None:
         return None
 
     if strategy == "proxy_first":
-        # 代理优先（2026-09 起默认）：Clash 内核在跑 → 内核端口；
-        # 代理池有启用节点 → 轮询；都没有 → 探本地混合端口（用户自启的
-        # Verge/Clash 不在本服务管辖内，但 steam 域直连基本不可用，
-        # 活着的本地代理永远优于直连兜底）；仍无 → 直连。
+        # 代理优先（2026-09 起默认）：Clash 内核在跑 → 内核端口（工作端口，
+        # 网络页配置的那个）；代理池有启用节点 → 轮询；都没有 → 探用户自启
+        # Verge 的兜底口（7897，与工作端口设置无关）；仍无 → 直连。
         status = clash_manager.runtime.status()
-        if status["running"] and status.get("port"):
+        # 入口硬闸：进程活着但混合端口没在听（订阅没写端口/端口被占）时
+        # 交出去的地址必然 ConnectError，直接落到后续通道
+        if status["running"] and status.get("port") and clash_manager.runtime.entry_listening():
             return f"http://127.0.0.1:{status['port']}"
         enabled = await list_proxies(enabled_only=True)
         if enabled:
             return await _weighted_pick(enabled)
-        if await _local_clash_alive():
-            port = await get_value("proxy.clash_port", 7890)
-            return f"http://127.0.0.1:{port}"
+        fallback = await _local_fallback_port()
+        if fallback:
+            return f"http://127.0.0.1:{fallback}"
         return None
 
     # proxy_only: 加权随机（延迟+健康反馈到流量分配；rr_index 顺序轮询兜底）
@@ -409,20 +460,19 @@ async def resolve_failover_proxy_url() -> str | None:
     """失败换代理取值口（direct_first 的 failover 通道）：强制取一个代理出口。
 
     与 resolve_proxy_url 的差异：direct 类策略平时返回 None（直连），
-    但失败换代理时需要「有什么代理用什么」——Clash 在跑走内核端口，
-    池有节点走加权随机，再探本地混合端口，全无 → None（真没有代理）。
+    但失败换代理时需要「有什么代理用什么」——Clash 在跑走内核工作端口，
+    池有节点走加权随机，再探用户自启 Verge 的兜底口，全无 → None（真没有代理）。
     """
     status = clash_manager.runtime.status()
-    if status["running"] and status.get("port"):
+    # 入口硬闸同 resolve_proxy_url：端口没在听不交假地址
+    if status["running"] and status.get("port") and clash_manager.runtime.entry_listening():
         return f"http://127.0.0.1:{status['port']}"
     enabled = await list_proxies(enabled_only=True)
     if enabled:
         return await _weighted_pick(enabled)
-    if await _local_clash_alive():
-        from app.domains.settings.service import get_value
-
-        port = await get_value("proxy.clash_port", 7890)
-        return f"http://127.0.0.1:{port}"
+    fallback = await _local_fallback_port()
+    if fallback:
+        return f"http://127.0.0.1:{fallback}"
     return None
 
 
@@ -757,6 +807,7 @@ async def refresh_clash_subscription(sub_id: int, *, auto_switch: bool = False) 
             try:
                 outcome = await clash_manager.runtime.ensure_running(
                     detect["path"], meta["path"], subscription_url=sub_url,
+                    mixed_port=await pinned_kernel_port(),
                 )
                 restarted = bool(outcome.get("reloaded") or outcome.get("started"))
             except Exception:  # noqa: BLE001 —— 更新失败保留旧内核运行
@@ -1944,6 +1995,12 @@ async def _test_clash_nodes_impl(
             if lanes:
                 results = await _probe_nodes_via_lanes(ctl, base, lanes, to_probe)
             else:
+                # selector 回退路径的探测流量走混合端口：入口没在听时全部节点
+                # 会误判失败污染账本（并连带触发订阅误废弃），如实报错代替
+                if not clash_manager.runtime.entry_listening():
+                    raise ValueError(
+                        "内核入口不可用（混合端口未监听）且探测 lane 缺席，无法检测；请重启内核后重试"
+                    )
                 results = await _probe_nodes_via_selector(
                     ctl, base, headers, mixed_port, to_probe, selector
                 )

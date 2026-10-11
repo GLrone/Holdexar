@@ -465,7 +465,7 @@ async def test_refresh_holds_test_lock_during_lifecycle_change(db, monkeypatch, 
     )
     lock_probe: dict = {}
 
-    async def _fake_ensure_running(exe, cfg_path, *, subscription_url=None):
+    async def _fake_ensure_running(exe, cfg_path, *, subscription_url=None, mixed_port=None):
         lock = proxies_service._clash_test_lock()
         lock_probe["held"] = lock.locked()
         try:

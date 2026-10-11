@@ -316,6 +316,14 @@ async def test_refresh_records_state_and_skips_when_resolved(monkeypatch):
         row = await session.get(Game, APP_UNRESOLVED)
         assert row is not None and row.hb_data == LABEL
 
+    # force=True（手动强刷）：绕过判重重跑打标，标记按月续写不重复
+    third = await hb.refresh_hb_choice(force=True)
+    assert third.get("skipped") is not True
+    assert third["recorded"] is True
+    async with get_session_factory()() as session:
+        row = await session.get(Game, APP_UNRESOLVED)
+        assert row is not None and row.hb_data == LABEL
+
 
 @pytest.mark.asyncio
 async def test_unpriced_hb_appids_filters_priced():

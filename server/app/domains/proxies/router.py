@@ -273,7 +273,8 @@ async def clash_start(req: ClashStart):
 
     try:
         status = await clash_manager.runtime.ensure_running(
-            detect["path"], picked["configPath"], subscription_url=sub_url
+            detect["path"], picked["configPath"], subscription_url=sub_url,
+            mixed_port=await service.pinned_kernel_port(),
         )
     except Exception as e:  # noqa: BLE001 —— 配置已到手，起不来是内核侧问题
         raise HTTPException(status_code=502, detail=f"内核启动失败: {e}")
@@ -348,7 +349,8 @@ async def clash_switch(req: ClashSwitch):
             )
         async with service._clash_test_lock():
             new_status = await clash_manager.runtime.ensure_running(
-                detect["path"], str(sub_cache), subscription_url=sub["url"]
+                detect["path"], str(sub_cache), subscription_url=sub["url"],
+                mixed_port=await service.pinned_kernel_port(),
             )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -438,9 +440,70 @@ async def list_subscriptions(kind: str | None = None):
 @router.post("/subscriptions")
 async def add_subscription(req: SubscriptionAdd):
     try:
-        return await service.add_subscription(req.kind, req.url, req.label)
+        result = await service.add_subscription(req.kind, req.url, req.label)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    # 添加即生效（全自动化红线）：clash 订阅验证下载成功后自动走完
+    # 「喂池快照 → 内核拉起/切换 → 后台首检 → 健康自动转正」全链，
+    # 不再依赖 30min 同步拍或用户手动启动——否则内核从未跑过的新订阅
+    # 会永久停在候选态，节点永不进池。生效链失败只降级提示，不回滚保存。
+    if req.kind == "clash" and result.get("nodes"):
+        result.update(await _effectuate_new_subscription(int(result["id"]), result["url"]))
+    return result
+
+
+async def _effectuate_new_subscription(sub_id: int, url: str) -> dict:
+    """新订阅即时生效链。每一步 fail-soft：添加本身已成功，任何一环失败
+    都记日志留给 30min 同步拍 / 手动启动兜底。"""
+    extra: dict = {}
+    settings = get_settings()
+    try:
+        sub_cache = clash_manager.subscription_config_path(settings.data_dir, sub_id)
+        detect = clash_manager.detect_kernel(settings.data_dir)
+        status = clash_manager.runtime.status()
+        if not detect["found"]:
+            extra["warning"] = "订阅已保存，但内核未安装，无法自动启动体检"
+            return extra
+        if not (
+            status["running"]
+            and clash_manager.runtime.running_subscription_is(url)
+        ):
+            if not sub_cache.is_file():
+                return extra
+            async with service._clash_test_lock():
+                new_status = await clash_manager.runtime.ensure_running(
+                    detect["path"], str(sub_cache), subscription_url=url,
+                    mixed_port=await service.pinned_kernel_port(),
+                )
+            # 启动成功即「用户最近一次显式选中」，与启动/切换端点同源
+            await service.remember_selected_clash_sub(sub_id)
+            await service.record_event(
+                kind="clash", target="subscription",
+                proxy_label=f"clash:{new_status.get('port')}",
+            )
+            extra["kernelStarted"] = True
+    except Exception as e:  # noqa: BLE001 —— 生效链失败不影响保存结果
+        log_event(
+            logger,
+            f"订阅 {sub_id} 自动启动内核失败，留待手动启动或重启自启",
+            level=logging.ERROR,
+            exc_info=True,
+            detail={"订阅": sub_id, "原因": str(e)},
+        )
+        extra["warning"] = f"订阅已保存，但自动启动内核失败：{e}（可稍后手动启动）"
+        return extra
+
+    async def _sync_then_first_check() -> None:
+        # 先喂池（快照落盘）再首检：首检健康后的自动转正要求快照已存在，
+        # 顺序颠倒会在全新安装上把生效推迟一个同步拍
+        try:
+            await service._pool_sync_single(sub_id)
+        finally:
+            if clash_manager.runtime.status()["running"]:
+                _spawn_first_check(sub_id)
+
+    asyncio.get_running_loop().create_task(_sync_then_first_check())
+    return extra
 
 
 @router.get("/clash/install/progress")
