@@ -22,6 +22,11 @@ filterwarnings = [
     # 只压掉已确认与我们无关的几条，其余照旧打印。
     "ignore::DeprecationWarning:apscheduler.*",
     "ignore::DeprecationWarning:pkg_resources.*",
+    # aiosqlite 连接线程在所属事件循环关闭后的收尾回调（call_soon_threadsafe 打到
+    # 已关 loop）：测试建的引擎靠 GC 兜底关闭属测试语境既有形态，本地 GC 时机不同
+    # 可零命中，云端 runner 的 GC/线程时序把它放大成成片线程异常 warning，其
+    # traceback 被 GitHub 日志转成 error 注解。测试结论零影响，此处只对齐两端表现。
+    "ignore:Exception in thread:pytest.PytestUnhandledThreadExceptionWarning",
 ]
 
 [tool.ruff]
