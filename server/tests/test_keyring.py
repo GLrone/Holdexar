@@ -48,32 +48,10 @@ def _isolate(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    import app.core.database as database_module
+def db():
+    from app.core.database import get_session_factory
 
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(account_service, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(settings_service, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(rekey, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(data_export, "get_session_factory", lambda: factory)
-    return factory
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    import app.domains.account.models  # noqa: F401
-    import app.domains.proxies.models  # noqa: F401
-    import app.domains.proxypool.models  # noqa: F401
-    import app.domains.settings.models  # noqa: F401
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
+    return get_session_factory()
 async def _seed_user_rows() -> None:
     """一条解密后应可读的用户数据：账号 Cookie + 订阅链接 + API Key 设置。"""
     async with rekey.get_session_factory()() as session:

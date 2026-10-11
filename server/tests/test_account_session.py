@@ -306,32 +306,17 @@ async def test_refresh_login_cookies_rejects_malformed_and_failed_transfer(monke
 # ── ensure_live_session / 钱包路径 ────────────────────────
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    import app.core.database as database_module
+def db(monkeypatch, tmp_path):
+    from app.core.database import get_session_factory
 
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(account_service, "get_session_factory", lambda: factory)
+
     # 凭据密封的密钥材料（secret.salt）隔离到临时目录，不落开发数据目录
     from app.core import secretbox
 
     monkeypatch.setattr(secretbox, "_data_dir", lambda: tmp_path)
     secretbox.clear_key_cache()
-    return factory
 
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    import app.domains.crawl.models  # noqa: F401
-    import app.domains.settings.models  # noqa: F401
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
+    return get_session_factory()
 @pytest_asyncio.fixture(autouse=True)
 async def _isolate(monkeypatch):
     async def _none():

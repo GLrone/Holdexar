@@ -30,41 +30,13 @@ from app.domains.settings import service as settings_service
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    """独立临时库：临时替换 session 工厂与 settings 键值层落点。
+def db():
+    from app.core.database import get_session_factory
 
-    settings_service.get_value/set_value 走同一个 session factory，
-    替换 factory 即可把全部 DB 读写隔离到 tmp 库。
-    """
-    import app.core.database as database_module
-
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    # service/settings 模块以 from-import 持有函数引用，需同步替换
-    monkeypatch.setattr(account_service, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(settings_service, "get_session_factory", lambda: factory)
-    return factory
-
-
+    return get_session_factory()
 @pytest_asyncio.fixture(autouse=True)
 async def _schema(db):
-    """在临时库上建表 + 种子区服。"""
-    import app.domains.alerts.models  # noqa: F401 注册模型
-    import app.domains.crawl.models  # noqa: F401
-    import app.domains.account.models  # noqa: F401
-    import app.domains.games.models  # noqa: F401
-    import app.domains.proxies.models  # noqa: F401
-    import app.domains.rates.models  # noqa: F401
-    import app.domains.regions.models  # noqa: F401
-    import app.domains.settings.models  # noqa: F401
-    import app.domains.wishlist.models  # noqa: F401
-    from app.domains.regions import service as regions_service
-
-    async with engine_begin(db):
-        pass
+    """种子区服：本文件要「全部 CC_LIST 区启用」语义（首启默认只启用前四区）。"""
     from sqlalchemy import text
 
     from app.crawler.config import CC_LIST
@@ -82,19 +54,6 @@ async def _schema(db):
                 {"c": code, "n": name, "cu": currency, "s": idx, "u": now},
             )
         await session.commit()
-
-
-def engine_begin(factory):
-    """create_all 到临时库（复用 Base.metadata）。"""
-    from contextlib import asynccontextmanager
-
-    @asynccontextmanager
-    async def _ctx():
-        async with factory.kw["bind"].begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        yield
-
-    return _ctx()
 
 
 # ── Cookie 解析 ──────────────────────────────────────────
