@@ -58,27 +58,10 @@ def _key_material(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    import app.core.database as database_module
+def db():
+    from app.core.database import get_session_factory
 
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(account_service, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(settings_service, "get_session_factory", lambda: factory)
-    return factory
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    import app.domains.settings.models  # noqa: F401
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
+    return get_session_factory()
 async def _seed(steam_id: str, cookies: str) -> None:
     async with account_service.get_session_factory()() as session:
         session.add(SteamAccount(steam_id=steam_id, cookies=cookies, is_active=True))

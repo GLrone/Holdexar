@@ -25,33 +25,15 @@ def cookie(sid: str, token: str = "jwt-token") -> str:
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    import app.core.database as database_module
+def db(monkeypatch, tmp_path):
+    from app.core.database import get_session_factory
 
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(account_service, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(settings_service, "get_session_factory", lambda: factory)
+
     # 凭据密封的密钥材料（secret.salt）隔离到临时目录，不落开发数据目录
     monkeypatch.setattr(secretbox, "_data_dir", lambda: tmp_path)
     secretbox.clear_key_cache()
-    return factory
 
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    import app.domains.account.models  # noqa: F401
-    import app.domains.crawl.models  # noqa: F401
-    import app.domains.settings.models  # noqa: F401
-    import app.domains.wishlist.models  # noqa: F401
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
+    return get_session_factory()
 @pytest_asyncio.fixture(autouse=True)
 async def _no_proxy(monkeypatch):
     """网络层隔离：代理解析恒直连（fetch 由各用例 monkeypatch）。"""
@@ -144,6 +126,70 @@ async def test_remove_last_account_back_to_unbound(db):
 async def test_remove_unknown_raises(db):
     with pytest.raises(ValueError):
         await account_service.remove_account(A)
+
+
+# ── 删除账号的监控追踪对称拆除 ────────────────────────────
+
+
+async def _seed_tracking(db, sid: str, appids: list[int]) -> None:
+    """直种追踪账与愿望单行（模拟绑定后置任务注册 + 同步链落行的结果）。"""
+    from app.domains.wishlist.models import TrackedAccount, WishlistItem
+
+    async with db() as session:
+        session.add(TrackedAccount(steamid=sid, kinds_json='{"wishlist": true, "owned": true}'))
+        for appid in appids:
+            session.add(WishlistItem(steamid=sid, appid=appid, active=True, owned=False))
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_remove_account_tears_down_tracking(db):
+    """设置页删账号 = 凭据 + 绑定时自动注册的追踪一并拆（与绑定对称）；
+    从未绑定、仅手动追踪的账号不受影响。"""
+    from sqlalchemy import select
+
+    from app.domains.account.models import SteamAccount
+    from app.domains.wishlist.models import TrackedAccount, WishlistItem
+
+    await account_service.save_cookies(cookie(A))
+    await account_service.save_cookies(cookie(B))
+    await _seed_tracking(db, A, [10, 11])
+    await _seed_tracking(db, C, [20])  # C 从未绑定凭据
+
+    r = await account_service.remove_account(A)
+
+    assert r["ok"] is True and r["trackingRemoved"] == 2
+    async with db() as session:
+        tracked = {t.steamid for t in (await session.execute(select(TrackedAccount))).scalars()}
+        items = {(w.steamid, w.appid) for w in (await session.execute(select(WishlistItem))).scalars()}
+        accounts = {a.steam_id for a in (await session.execute(select(SteamAccount))).scalars()}
+    assert tracked == {C}, "被删账号的追踪拆除，未绑定账号的追踪保留"
+    assert items == {(C, 20)}, "被删账号的愿望单行随删"
+    assert accounts == {B}, "凭据账只少被删的那个"
+
+
+@pytest.mark.asyncio
+async def test_clear_cookies_tears_down_bound_tracking_only(db):
+    """解绑全部：有凭据账号的追踪随删；仅手动追踪的账号原样保留。"""
+    from sqlalchemy import select
+
+    from app.domains.account.models import SteamAccount
+    from app.domains.wishlist.models import TrackedAccount, WishlistItem
+
+    await account_service.save_cookies(cookie(A))
+    await account_service.save_cookies(cookie(B))
+    await _seed_tracking(db, A, [10])
+    await _seed_tracking(db, B, [11])
+    await _seed_tracking(db, C, [20])  # 从未绑定
+
+    await account_service.clear_cookies()
+
+    async with db() as session:
+        tracked = {t.steamid for t in (await session.execute(select(TrackedAccount))).scalars()}
+        items = {(w.steamid, w.appid) for w in (await session.execute(select(WishlistItem))).scalars()}
+        accounts = (await session.execute(select(SteamAccount))).scalars().all()
+    assert accounts == []
+    assert tracked == {C} and items == {(C, 20)}, "只拆绑定过的追踪，手动追踪原样"
 
 
 # ── status / list 载荷 ─────────────────────────────────────

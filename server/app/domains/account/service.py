@@ -42,6 +42,7 @@ from .session import (
     session_freshness,
 )
 from .steam_wallet import (
+    WALLET_NETWORK_ERROR_HEAD,
     StoreSessionExpiredError,
     UnknownCurrencyError,
     WalletFetchError,
@@ -610,8 +611,40 @@ async def set_active(steam_id: str) -> dict:
     return {"ok": True, "steam_id": steam_id}
 
 
+async def _teardown_tracking(steam_id: str) -> dict:
+    """删除账号后拆除其监控追踪（绑定自动注册的对称拆除）。
+
+    复用监控池解绑链（tracked_accounts + wishlist_items + 派生来源对账 +
+    孤儿回收）；失败只记日志不回滚解绑（与解绑链自身的监控对账同口径）。
+    追踪本就不存在（用户已在监控池解绑过）时为无操作。
+    """
+    from app.domains.wishlist import service as wishlist_service
+
+    try:
+        receipt = await wishlist_service.remove_account(steam_id)
+    except Exception:  # noqa: BLE001 —— 追踪拆除失败不阻断解绑主链
+        log_event(
+            logger,
+            "账号监控追踪拆除失败，不阻断解绑",
+            level=logging.WARNING,
+            exc_info=True,
+            detail={"SteamID": steam_id},
+        )
+        return {}
+    if receipt is None:
+        return {}
+    return {
+        "trackingRemoved": receipt.get("itemsRemoved", 0),
+        "poolReleased": receipt.get("poolReleased", 0),
+    }
+
+
 async def remove_account(steam_id: str) -> dict:
-    """删除指定账号。删除 active 时回退剩余首个（即新主账号）。"""
+    """删除指定账号。删除 active 时回退剩余首个（即新主账号）。
+
+    绑定时自动注册的监控追踪随删（与绑定对称）：复用监控池解绑链。
+    重绑同一账号会经绑定后置任务自动重新注册追踪，拆除实际可逆。
+    """
     async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         row = await session.get(SteamAccount, steam_id)
         if row is None:
@@ -635,7 +668,8 @@ async def remove_account(steam_id: str) -> dict:
                 rest[0].is_active = True  # 数据兜底：无 active 也归位
         await session.commit()
         remaining = len(rest)
-    return {"ok": True, "removed": steam_id, "remaining": remaining}
+    teardown = await _teardown_tracking(steam_id)
+    return {"ok": True, "removed": steam_id, "remaining": remaining, **teardown}
 
 
 # ── 钱包 / 资料 同步 ────────────────────────────────────────
@@ -836,6 +870,24 @@ def _is_rate_limited(error: str) -> bool:
     return "429" in text or "403" in text or "风控" in text
 
 
+def _frozen_reason(wallet_error: str) -> str:
+    """冻结账号的轮转原因文案：按最后一次失败归因，不一律算凭据失效。
+
+    冻结是熔断终态，本身不含原因——真因在行内 wallet_error。混写成「凭据
+    已失效」会把网络/风控故障顶到用户头上，对着没过期的 Cookie 反复重登。
+    """
+    text = wallet_error or ""
+    if SESSION_EXPIRED_MESSAGE in text:
+        return "登录已过期，等待重新登录"
+    if _is_rate_limited(text):
+        cause = "Steam 风控拒绝"
+    elif WALLET_NETWORK_ERROR_HEAD in text:
+        cause = "网络或代理通道不通"
+    else:
+        cause = "连续失败过多"
+    return f"{cause}，已停自动重试（手动刷新余额解锁）"
+
+
 async def _sync_profile_row(steam_id: str, cookies: str, now: datetime) -> None:
     """刷账号资料 + 在线态兜底（miniprofile 公开通道，不依赖页面登录态）。
 
@@ -845,12 +897,12 @@ async def _sync_profile_row(steam_id: str, cookies: str, now: datetime) -> None:
     也不会因网络抖动把头像清空。在线字段为官方 GetPlayerSummaries 不可用
     时的兜底（粗糙：只区分离线/在线/游戏名）。
     """
+    # 取数段在会话外：网络拉取不占连接池位（与 refresh_online_states 同形态）
+    fetched = await fetch_profile(steam_id, proxy_url=await _strategy_proxy())
     async with get_session_factory()() as session:
         row = await session.get(SteamAccount, steam_id)
         if row is None:
             return
-        # 取数段（无写闸）：网络拉取不持写者位
-        fetched = await fetch_profile(steam_id, proxy_url=await _strategy_proxy())
         async with write_gate(WritePriority.INTERACTIVE, label="account_sync"):
             if fetched.get("persona_name") and not row.persona_name:
                 row.persona_name = fetched["persona_name"]
@@ -932,7 +984,12 @@ async def sync_wallets_rotational() -> dict:
         # 门禁 0：熔断冻结（连续失败终态）——自动轮转不再请求该账号，
         # 解锁只走手动刷新余额（sync_wallet force）或换绑 Cookie
         if row.wallet_frozen:
-            return {"ok": False, "status": "frozen", "steam_id": row.steam_id}
+            return {
+                "ok": False,
+                "status": "frozen",
+                "error": _frozen_reason(row.wallet_error),
+                "steam_id": row.steam_id,
+            }
         # 门禁 1：快照新鲜（距上次成功 < 阈值）→ 本轮跳过，不吃配额
         snapshot = row.wallet_json if isinstance(row.wallet_json, dict) else None
         if (
@@ -1100,7 +1157,11 @@ async def _sync_wallet_of(steam_id: str) -> dict:
 
 
 async def clear_cookies() -> None:
-    """解绑全部（清账号表 + 旧 KV；手填 SteamID64 / API Key 不动）。"""
+    """解绑全部（清账号表 + 旧 KV；手填 SteamID64 / API Key 不动）。
+
+    被删账号的监控追踪随删（绑定自动注册的对称拆除）；从未绑定凭据、
+    仅在监控池手动追踪的账号不受影响。
+    """
     async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
         rows = (
             (
@@ -1109,10 +1170,13 @@ async def clear_cookies() -> None:
             .scalars()
             .all()
         )
+        removed_ids = [r.steam_id for r in rows]
         for r in rows:
             await session.delete(r)
         await session.commit()
     await settings_service.set_value(KEY_COOKIES, "")
+    for steam_id in removed_ids:
+        await _teardown_tracking(steam_id)
 
 
 # ── 状态汇总（永不回传 Cookie 明文）─────────────────────────

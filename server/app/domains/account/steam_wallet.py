@@ -102,6 +102,12 @@ _STEAM_COOKIE_KEYS = (
 )
 
 
+# 失败归因前缀：按「传输层失败 / 非传输层失败」二分，行内 wallet_error 与
+# 轮转其原因文案都靠它分辨——网络不通不能顶替成凭据问题
+WALLET_NETWORK_ERROR_HEAD = "无法连接 Steam（网络或代理出口不通）："
+WALLET_AUTH_ERROR_HEAD = "无法获取 Steam 钱包余额（登录态不符或服务端异常）："
+
+
 class WalletFetchError(RuntimeError):
     """余额抓取失败（账户页未取到有效数据）。"""
 
@@ -375,6 +381,7 @@ async def _try_channels(
     风控时连环硬打只会加深印象（redeem 域 429 同语义：换节点才有效）。
     """
     errors: list[str] = []
+    transport_only = True
     retried = False
     for attempt in (0, 1):
         if attempt > 0 and not retried:
@@ -393,6 +400,7 @@ async def _try_channels(
                         f"Steam 节点风控（HTTP {exc.response.status_code}，"
                         f"{channel.__name__}）——请切换 Clash 节点或稍后再试"
                     ) from exc
+                transport_only = False
                 errors.append(f"{channel.__name__}: {type(exc).__name__}: {exc}")
                 log_event(
                     logger,
@@ -410,6 +418,7 @@ async def _try_channels(
                 )
                 retried = attempt == 0
             except Exception as exc:  # noqa: BLE001 通道间容错，最后统一抛
+                transport_only = False
                 errors.append(f"{channel.__name__}: {type(exc).__name__}: {exc}")
                 log_event(
                     logger,
@@ -420,9 +429,18 @@ async def _try_channels(
             else:
                 if info is not None:
                     return info
-    raise WalletFetchError(
-        "无法获取 Steam 钱包余额（Cookie 失效或网络不通）：" + "；".join(errors)
-    )
+    raise WalletFetchError(_failure_head(transport_only) + "；".join(errors))
+
+
+def _failure_head(transport_only: bool) -> str:
+    """失败归因前缀：全部通道都卡在传输层 = 网络或代理出口不通，与登录态无关。
+
+    两者混写成「Cookie 失效或网络不通」会把网络故障顶成凭据问题——用户对
+    着没过期的 Cookie 反复重登，排障方向被这句话带偏。
+    """
+    if transport_only:
+        return WALLET_NETWORK_ERROR_HEAD
+    return WALLET_AUTH_ERROR_HEAD
 
 
 async def fetch_wallet(cookies_raw: str, *, verify: bool | None = None, proxy_url: str | None = None) -> WalletInfo:
