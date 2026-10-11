@@ -232,7 +232,8 @@ async def test_download_and_pending_flow(tmp_path: Path, monkeypatch) -> None:
 
     # clear 后 pending 复位
     updater.clear_staging()
-    assert updater.pending_status() == {"pending": False}
+    cleared = updater.pending_status()
+    assert cleared["pending"] is False and cleared["swapFailed"] is False
 
     # 期望值不匹配：staging 清空 + 抛错
     import hashlib
@@ -241,7 +242,7 @@ async def test_download_and_pending_flow(tmp_path: Path, monkeypatch) -> None:
     await updater.download_update("v0.2.0", expected_sha256=None)  # 重新暂存
     with pytest.raises(RuntimeError, match="SHA256"):
         await updater.download_update("v0.2.0", expected_sha256="dead" * 16)
-    assert updater.pending_status() == {"pending": False}
+    assert updater.pending_status()["pending"] is False
     # 期望值正确：通过
     await updater.download_update("v0.2.0", expected_sha256=real_sha)
     assert updater.pending_status()["pending"] is True

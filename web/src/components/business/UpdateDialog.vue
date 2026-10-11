@@ -173,6 +173,10 @@ async function onAutoDownloadChange(on: boolean): Promise<void> {
   await settings.setUpdateAuto(on)
 }
 
+async function onNotifyChange(on: boolean): Promise<void> {
+  await settings.setUpdateNotify(on)
+}
+
 async function onRestart(): Promise<void> {
   const res = await updater.restartForUpdate()
   if (res.ok) return
@@ -239,6 +243,15 @@ function onClose(): void {
             </div>
 
             <template v-else>
+              <!-- 换装失败投影：上次更新没装上（已回滚），给「重新下载」的出路 -->
+              <div v-if="updater.swapFailed && phase !== 'downloading'" class="upd-fail">
+                <span class="upd-fail__icon"><HlIcon name="warning" /></span>
+                <div>
+                  <p class="upd-fail__hint">{{ t('updateDialog.swapFailedBanner') }}</p>
+                  <p class="upd-fail__detail">{{ t('updateDialog.swapFailedHint') }}</p>
+                </div>
+              </div>
+
               <!-- 版本跃迁说明（下载中/已就绪阶段不再重复这句） -->
               <p v-if="phase === 'available'" class="upd-line">
                 {{
@@ -290,14 +303,20 @@ function onClose(): void {
                 {{ t('updateDialog.packageSize', { size: fmtSize(info.sizeBytes) }) }}
               </p>
 
-              <!-- 自动下载开关（与设置页同一个后端开关） -->
-              <HlCheckbox
-                v-if="phase === 'available'"
-                class="upd-auto"
-                :model-value="settings.updateAuto === true"
-                :label="t('updateDialog.autoDownload')"
-                @update:model-value="onAutoDownloadChange"
-              />
+              <!-- 更新行为开关（随设置页更新面板一起搬到这里）：提示管「告知」，
+                   静默管「后台下载」；两个开关独立，状态都在 settings store -->
+              <div v-if="phase === 'available'" class="upd-prefs">
+                <HlCheckbox
+                  :model-value="settings.updateNotify !== false"
+                  :label="t('updateDialog.notifyMe')"
+                  @update:model-value="onNotifyChange"
+                />
+                <HlCheckbox
+                  :model-value="settings.updateAuto === true"
+                  :label="t('updateDialog.autoDownload')"
+                  @update:model-value="onAutoDownloadChange"
+                />
+              </div>
 
               <!-- 更新内容：下载中也在（进度条之下独立限高滚动） -->
               <section v-if="notes" class="upd-notes" :class="{ 'upd-notes--live': phase === 'downloading' }">
@@ -518,10 +537,45 @@ function onClose(): void {
 }
 
 .upd-progress__fill {
+  position: relative;
   height: 100%;
   border-radius: 4px;
   background: var(--accent-fill);
   transition: width calc(var(--duration-2) * var(--motion-scale)) var(--ease-inout);
+  overflow: hidden;
+}
+
+/* 扫光：fill 上滑过的高光条，让进度条在两个轮询心跳之间也「活着」 */
+.upd-progress__fill::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: min(3.5rem, 70%);
+  background: linear-gradient(90deg, transparent, var(--accent-a30), transparent);
+  animation: upd-progress-sweep 1.15s cubic-bezier(0.65, 0, 0.35, 1) infinite;
+}
+
+@keyframes upd-progress-sweep {
+  0% {
+    transform: translateX(-120%);
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 0.9;
+  }
+  100% {
+    transform: translateX(260%);
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .upd-progress__fill::after {
+    animation: none;
+    display: none;
+  }
 }
 
 .upd-progress__meta {
@@ -583,6 +637,13 @@ function onClose(): void {
 }
 
 .upd-auto {
+  font-size: 12.5px;
+}
+
+.upd-prefs {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   font-size: 12.5px;
 }
 
