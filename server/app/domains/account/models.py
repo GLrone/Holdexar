@@ -28,12 +28,15 @@ class SteamAccount(Base):
     # 每账号独立钱包快照：{balance, balance_display, currency_code, region_code, ...}
     wallet_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=False)
-    # Steam 真实在线状态（miniprofile/GetPlayerSummaries 双通道，每分钟轮转刷新）：
-    # 在线 = miniprofile.online 或 personastate 1-6；游戏中 = gameextrainfo/in_game
+    # Steam 真实在线状态（miniprofile/GetPlayerSummaries 双通道，按活跃感知
+    # 新鲜度门禁刷新（2min/30min））：在线 = miniprofile.online 或 personastate
+    # 1-6；游戏中 = gameextrainfo/in_game
     is_online: Mapped[bool] = mapped_column(Boolean, default=False)
     in_game: Mapped[str] = mapped_column(String(200), default="")
     bound_at: Mapped[datetime | None] = mapped_column(DateTime)
     wallet_checked_at: Mapped[datetime | None] = mapped_column(DateTime)
+    # 官方在线状态批量通道最近一次成功采集时刻（NULL=从未查过）
+    online_checked_at: Mapped[datetime | None] = mapped_column(DateTime)
     # 最近一次钱包同步失败原因（空串 = 正常）；用于每分钟轮转的指数退避
     wallet_error: Mapped[str] = mapped_column(String(300), default="")
     # 递增退避级别：0=正常，每次失败 +1（成功清零）；间隔查

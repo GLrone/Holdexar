@@ -915,11 +915,15 @@ async def _sync_profile_row(steam_id: str, cookies: str, now: datetime) -> None:
 
 
 async def refresh_online_states(rows: list[SteamAccount] | None = None) -> dict:
-    """官方在线状态批量刷新（ISteamUser/GetPlayerSummaries/v2，一次查全部账号）。
+    """官方在线状态批量刷新（ISteamUser/GetPlayerSummaries/v2，按传入子集批量
+    查询，不传=全量）。
 
     有 API Key 时为**权威通道**：personastate 1-6 = 在线（2 忙碌/3 离开/4 打盹
     对 dot 均显示在线绿，具体语义放 tooltip），gameextrainfo = 正在玩的游戏名。
     无 Key / 调用失败时保留 miniprofile 兜底结果（_sync_profile_row 已写）。
+
+    「响应缺失=离线」回写只作用于本次查询子集——调用方传全量时未查询账号
+    会被误写离线，必须传与实参一致的行。
     """
     rows = rows if rows is not None else await _all_accounts()
     if not rows:
@@ -934,19 +938,20 @@ async def refresh_online_states(rows: list[SteamAccount] | None = None) -> dict:
     )
     if not states:
         return {"ok": False, "status": "fetch_failed"}
+    now = _naive_now()
     async with write_gate(WritePriority.INTERACTIVE, label="account_sync"), get_session_factory()() as session:
         for r in rows:
             s = states.get(r.steam_id)
-            if s is None:  # 响应缺失 = 离线（私密档案同款语义）
-                row = await session.get(SteamAccount, r.steam_id)
-                if row is not None:
-                    row.is_online = False
-                    row.in_game = ""
-                continue
             row = await session.get(SteamAccount, r.steam_id)
-            if row is not None:
-                row.is_online = s["state"] > 0
-                row.in_game = s["in_game"][:200]
+            if row is None:
+                continue
+            row.online_checked_at = now
+            if s is None:  # 响应缺失 = 离线（私密档案同款语义）
+                row.is_online = False
+                row.in_game = ""
+                continue
+            row.is_online = s["state"] > 0
+            row.in_game = s["in_game"][:200]
         await session.commit()
     return {"ok": True, "count": len(states)}
 
@@ -1031,13 +1036,27 @@ async def sync_wallets_rotational() -> dict:
                 detail={"原因": str(r)},
             )
 
-    # 官方在线状态批量刷新（有 API Key 时权威覆盖 miniprofile 兜底；一次调用查全部）
-    state_result = await refresh_online_states(rows)
-    if not state_result.get("ok"):
+    # 官方在线状态批量刷新：按活跃感知新鲜度门禁先筛过期子集，子集空则本轮
+    # 零出网；实参=子集行，保证「响应缺失=离线」回写不越出查询范围
+    stale = [
+        r for r in rows
+        if r.online_checked_at is None
+        or (now - r.online_checked_at).total_seconds() / 60 >= fresh_minutes
+    ]
+    if stale:
+        state_result = await refresh_online_states(stale)
+        if not state_result.get("ok"):
+            log_event(
+                logger,
+                "官方在线状态本轮未刷新",
+                detail={"状态": state_result.get("status")},
+                level=logging.DEBUG,
+            )
+    else:
         log_event(
             logger,
             "官方在线状态本轮未刷新",
-            detail={"状态": state_result.get("status")},
+            detail={"状态": "fresh_skip"},
             level=logging.DEBUG,
         )
 
