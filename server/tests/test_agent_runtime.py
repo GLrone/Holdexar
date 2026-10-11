@@ -348,7 +348,14 @@ class TestCancellation:
 
 class TestReconcile:
     @pytest.mark.asyncio
-    async def test_reconcile_orphans(self, db):
+    async def test_reconcile_orphans(self, db, monkeypatch):
+        # 收尸测试造的 run 都建在本进程启动之后：把启动锚点推到未来，
+        # 让它们与「上一进程遗留」语义对齐（真实锚点行为见下一个用例）
+        from datetime import datetime, timedelta
+
+        monkeypatch.setattr(
+            agent_service, "_PROCESS_STARTED_AT", datetime.now() + timedelta(days=1)
+        )
         rid_q = (await agent_service.create_run())["run_id"]
         rid_r = (await agent_service.create_run())["run_id"]
         rid_a = (await agent_service.create_run())["run_id"]
@@ -373,6 +380,13 @@ class TestReconcile:
     @pytest.mark.asyncio
     async def test_reconcile_empty(self, db):
         assert await agent_service.reconcile_orphan_runs() == 0
+
+    @pytest.mark.asyncio
+    async def test_reconcile_spares_runs_created_after_start(self, db):
+        """开门到收尸窗口内新建的 run 是活 run：不被启动收尸误收敛。"""
+        rid = (await agent_service.create_run())["run_id"]
+        assert await agent_service.reconcile_orphan_runs() == 0
+        assert (await agent_service.get_run(rid))["status"] == RUN_QUEUED
 
 
 # ── 写路径（全局单写者调度）与 DDL ───────────────────────────────

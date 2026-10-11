@@ -133,6 +133,7 @@ def test_tool_step_projection():
     assert pilot_tools.tool_step("add_follow", {"kind": "denied"}) == {"label": "denied", "status": "denied", "data": {}}
     assert pilot_tools.tool_step("web_search", {"kind": "timeout"})["status"] == "timeout"
     assert pilot_tools.tool_step("web_search", {"kind": "failed"})["status"] == "failed"
+    assert pilot_tools.tool_step("web_search", {"kind": "stopped"}) == {"label": "webSearch", "status": "stopped", "data": {}}
     step = pilot_tools.tool_step("search_games", {"kind": "games", "items": [1, 2]})
     assert step == {"label": "search", "status": "ok", "data": {"count": 2}}
     step = pilot_tools.tool_step("navigate", {"kind": "navigate", "target": "alerts", "path": "/alerts"})

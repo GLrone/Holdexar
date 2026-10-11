@@ -54,6 +54,11 @@ def _now():
     return get_beijing_time_obj().replace(tzinfo=None)
 
 
+# 进程启动时刻（模块导入即进程启动）：收尸只认上一进程遗留的 run——
+# 后台收拾链可能晚于首个用户请求跑完，开门后新建的 run 是活 run 不得误收敛
+_PROCESS_STARTED_AT = _now()
+
+
 async def _next_seq(session, run_id: str) -> int:
     current = await session.scalar(
         select(func.max(AgentEvent.seq)).where(AgentEvent.run_id == run_id)
@@ -366,10 +371,14 @@ async def cancel_run(run_id: str, *, reason: str = "user") -> dict:
 
 async def reconcile_orphan_runs() -> int:
     """启动链收尸：进程重启后未终态 run 的执行者已不存在，一律收敛
-    cancelled（reason=runtime_restarted，与用户取消区分）。返回收敛数。"""
+    cancelled（reason=runtime_restarted，与用户取消区分）。只收 created_at
+    早于本进程启动时刻的行（开门到收尸之间新建的是活 run）。返回收敛数。"""
     async with get_session_factory()() as session:
         ids = (await session.execute(
-            select(AgentRun.id).where(AgentRun.status.in_(_ORPHAN_STATUSES))
+            select(AgentRun.id).where(
+                AgentRun.status.in_(_ORPHAN_STATUSES),
+                AgentRun.created_at < _PROCESS_STARTED_AT,
+            )
         )).scalars().all()
     count = 0
     for rid in ids:
