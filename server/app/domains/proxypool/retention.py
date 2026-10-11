@@ -5,6 +5,7 @@
 | 表 | 速率 | 保留 |
 |---|---|---|
 | `proxy_job_runs` | 十几~几十行/天 | 90 天，且至少留最近 200 行 |
+| `health_runs` | ~22 行/天 | 90 天 |
 | `health_observations` | **L0 每 5min × 池内每个节点** → 68 节点 ≈ 19.6k 行/天 | 30 天 |
 | `orchestration_events` | 事件驱动，低频 | 90 天 |
 | `subscription_snapshots` | 每次抓取一行（行小） | 180 天，且每订阅最新 3 条永不删 |
@@ -49,6 +50,7 @@ KEEP_SNAPSHOTS_PER_SUB = 3
 @dataclass(frozen=True)
 class PruneResult:
     job_runs: int
+    health_runs: int
     health_observations: int
     orchestration_events: int
     snapshots: int
@@ -58,6 +60,7 @@ class PruneResult:
     def as_dict(self) -> dict[str, int]:
         return {
             "job_runs": self.job_runs,
+            "health_runs": self.health_runs,
             "health_observations": self.health_observations,
             "orchestration_events": self.orchestration_events,
             "snapshots": self.snapshots,
@@ -144,6 +147,21 @@ async def prune_telemetry(
     )
     truncated = truncated or more
 
+    health_runs, more = await _delete_chunked(
+        session,
+        """
+        DELETE FROM health_runs WHERE id IN (
+            SELECT id FROM health_runs
+            WHERE started_at IS NOT NULL AND started_at < :cutoff
+            ORDER BY id LIMIT :chunk
+        )
+        """,
+        {"cutoff": _cutoff(now, job_days)},
+        chunk=chunk,
+        max_chunks=max_chunks,
+    )
+    truncated = truncated or more
+
     observations, more = await _delete_chunked(
         session,
         """
@@ -192,7 +210,7 @@ async def prune_telemetry(
     )
     truncated = truncated or more
 
-    result = PruneResult(job_runs, observations, events, snapshots, truncated)
+    result = PruneResult(job_runs, health_runs, observations, events, snapshots, truncated)
     if any(result.as_dict().values()):
         log_event(
             logger,
@@ -200,6 +218,7 @@ async def prune_telemetry(
             tag="成功",
             detail={
                 "清理作业行数": result.job_runs,
+                "清理体检台账行数": result.health_runs,
                 "清理健康观测行数": result.health_observations,
                 "清理编排事件行数": result.orchestration_events,
                 "清理快照行数": result.snapshots,

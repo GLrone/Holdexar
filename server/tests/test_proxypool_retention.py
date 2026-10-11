@@ -104,6 +104,7 @@ async def test_prunes_by_age(tmp_data_dir):
 
     assert result.as_dict() == {
         "job_runs": 2,
+        "health_runs": 0,
         "health_observations": 3,
         "orchestration_events": 2,
         "snapshots": 3,
@@ -253,10 +254,39 @@ async def test_second_run_deletes_nothing(tmp_data_dir):
     assert first.health_observations == 5
     assert second.as_dict() == {
         "job_runs": 0,
+        "health_runs": 0,
         "health_observations": 0,
         "orchestration_events": 0,
         "snapshots": 0,
     }
+
+
+async def _add_health_runs(session, count: int, *, at: datetime) -> None:
+    for _ in range(count):
+        await session.execute(
+            text(
+                "INSERT INTO health_runs (channel, started_at, total, steam_ok, ip_known, failed) "
+                "VALUES ('scheduled', :at, 0, 0, 0, 0)"
+            ),
+            {"at": at},
+        )
+
+
+@pytest.mark.asyncio
+async def test_health_runs_pruned_by_age(tmp_data_dir):
+    """体检台账同在保留窗内：过窗行随轮清掉，窗内行不动。"""
+    await init_db()
+    async with get_session_factory()() as session:
+        await _add_health_runs(session, 3, at=NOW - timedelta(days=100))
+        await _add_health_runs(session, 1, at=NOW - timedelta(days=1))
+        await session.commit()
+
+    async with get_session_factory()() as session:
+        result = await retention.prune_telemetry(session, NOW)
+    assert result.health_runs == 3
+
+    async with get_session_factory()() as session:
+        assert await _count(session, "health_runs") == 1
 
 
 @pytest.mark.asyncio

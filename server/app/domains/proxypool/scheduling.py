@@ -31,7 +31,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import WritePriority, write_gate
 from app.core.logging import log_event
-from app.crawler.occupancy import crawler_busy
+from app.crawler.occupancy import (
+    MAINTENANCE_HEALTH,
+    MAINTENANCE_REBUILD,
+    CrawlerBusyError,
+    begin_maintenance,
+    crawler_busy,
+    end_maintenance,
+    maintenance_kind,
+)
 from app.domains.proxypool.bridge import (
     ingest_ledger,
     purge_orphan_subscription_sources,
@@ -85,14 +93,57 @@ STARTUP_L1_BUDGET_SECONDS = 240.0
 _rebuild_lock = asyncio.Lock()
 
 _pending = False
-# L1/L2 体检探测进行中（跨整池串行探测，可达分钟级）。给任务页「系统在干嘛」
-# 提供读口——体检不是 CrawlJob，任务列表看不到它。
-_maintenance_running = False
 
 
 def maintenance_running() -> bool:
-    """体检（L1/L2 整池探测）当前是否在跑。"""
-    return _maintenance_running
+    """体检（L1/L2 整池探测）当前是否在跑——预约位是唯一事实源，重建期间不点亮。"""
+    return maintenance_kind() == MAINTENANCE_HEALTH
+
+
+_MAINTENANCE_EVENT_LABELS = {
+    MAINTENANCE_HEALTH: "代理体检",
+    MAINTENANCE_REBUILD: "代理通道重建",
+}
+
+
+async def _announce_maintenance(kind: str) -> None:
+    """维护开始播报：SSE 实时事件 + 编排事件留痕（均 fail-soft）。
+
+    维护期间爬取被预约位拒绝，这是前端与灵动岛唯一能投影「体检进行中 /
+    重建进行中」的窗口——没有这一步，维护就是一段用户完全看不见的静默期。"""
+    from app.core import orchestration
+    from app.core.events import bus
+
+    try:
+        bus.publish("maintenance.started", kind=kind)
+        await orchestration.record(
+            orchestration.KIND_MAINTENANCE_STARTED,
+            f"{_MAINTENANCE_EVENT_LABELS[kind]}开始：期间价格抓取自动让路",
+            payload={"kind": kind},
+        )
+    except Exception:  # noqa: BLE001 —— 观测不是生产依赖
+        pass
+
+
+async def _conclude_maintenance(
+    kind: str, *, elapsed_s: float, summary: dict | None = None,
+) -> None:
+    """维护收场播报：SSE 事件 + 编排事件（fail-soft）。summary 带节点级结论
+    （total/ok/failed），异常中断路径没有结论，只有耗时。"""
+    from app.core import orchestration
+    from app.core.events import bus
+
+    payload: dict = {"kind": kind, "durationMs": int(elapsed_s * 1000)}
+    payload.update(summary or {})
+    try:
+        bus.publish("maintenance.ended", **payload)
+        await orchestration.record(
+            orchestration.KIND_MAINTENANCE_ENDED,
+            f"{_MAINTENANCE_EVENT_LABELS[kind]}结束（{elapsed_s:.0f} 秒）",
+            payload=payload,
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def run_startup_l1(
@@ -279,22 +330,48 @@ async def run_maintenance_cycle(
 ) -> MaintenanceResult | None:
     """L1/L2 维护事务：capture → 串行探测 → 恢复 `GLOBAL`。
 
-    crawl 占线时返回 `None`（**跳过**，不排队）。恢复用的是**当前**合格集而非事务
+    crawl 占线时返回 `None`（**跳过**，不排队）。维护全程持维护预约位（计入
+    crawler_busy）：体检期间爬取被拒、rebuild 让路。恢复用的是**当前**合格集而非事务
     开始时缓存的列表：L0 允许与维护并行，池可能在维护期间就变了——那时若原节点
     已出池，必须落到当前池第一项，而不是恢复一个已经不存在的选择。
     """
     if crawler_busy():
         return None
-
-    global _maintenance_running
-    _maintenance_running = True
+    # 预约包络：检查与预约之间无 await，此处取得失败属防御性兜底
     try:
-        return await _maintenance_probe(
+        begin_maintenance(MAINTENANCE_HEALTH)
+    except CrawlerBusyError:
+        return None
+    started = time.monotonic()
+    await _announce_maintenance(MAINTENANCE_HEALTH)
+    try:
+        result = await _maintenance_probe(
             session, data_dir=data_dir, controller_url=controller_url,
             secret=secret, now=now, l1_url=l1_url, l2_url=l2_url, appid=appid,
         )
+        await _conclude_maintenance(
+            MAINTENANCE_HEALTH,
+            elapsed_s=time.monotonic() - started,
+            summary=_health_run_summary(result),
+        )
+        return result
+    except BaseException:
+        await _conclude_maintenance(
+            MAINTENANCE_HEALTH, elapsed_s=time.monotonic() - started,
+        )
+        raise
     finally:
-        _maintenance_running = False
+        end_maintenance()
+
+
+def _health_run_summary(result: MaintenanceResult | None) -> dict:
+    """体检收场播报的节点级结论（L2 是生死判据层，汇总以它为准）。
+
+    结果形状防御：维护包络对替身实现（测试哨兵）不假设 MaintenanceResult。"""
+    l2 = getattr(result, "l2", None) or ()
+    total = len(l2)
+    ok = sum(1 for o in l2 if getattr(o, "ok", False))
+    return {"total": total, "ok": ok, "failed": total - ok}
 
 
 async def _maintenance_probe(
@@ -464,25 +541,92 @@ async def run_pending_rebuild(
     （热重载 / stop/start）+ HTTP 等待，对 session 零写入；事件留痕走
     orchestration.record 的独立短写闸。重建段整段持闸会把交互写饿死在
     写者位上——网络与内核操作禁止进闸（写事务纪律第 1 条）。
+    重建全程持维护预约位：先预约后消费，预约取得失败 pending 原样保留给下一拍。
     """
     if crawler_busy():
         return None
     async with _rebuild_lock:
-        if not take_rebuild_pending():
+        try:
+            begin_maintenance(MAINTENANCE_REBUILD)
+        except CrawlerBusyError:
             return None
-        skip = await _rebuild_skip_reason(session, data_dir=data_dir)
-        if skip is not None:
-            log_event(
-                logger,
-                "本次重建无需执行，已跳过",
-                tag="跳过",
-                detail={"原因": skip},
+        started = time.monotonic()
+        await _announce_maintenance(MAINTENANCE_REBUILD)
+        try:
+            result = await _run_pending_rebuild_locked(
+                session, data_dir=data_dir, controller_url=controller_url,
+                secret=secret, runtime=runtime, exe_path=exe_path,
             )
-            return None
-        return await rebuild_runtime(
-            session, data_dir=data_dir, controller_url=controller_url, secret=secret,
-            runtime=runtime, exe_path=exe_path,
+            await _conclude_maintenance(
+                MAINTENANCE_REBUILD, elapsed_s=time.monotonic() - started,
+            )
+            return result
+        except BaseException:
+            await _conclude_maintenance(
+                MAINTENANCE_REBUILD, elapsed_s=time.monotonic() - started,
+            )
+            raise
+        finally:
+            end_maintenance()
+
+
+async def _run_pending_rebuild_locked(
+    session: AsyncSession, *,
+    data_dir: Path,
+    controller_url: str,
+    secret: str,
+    runtime: _KernelRuntime,
+    exe_path: str,
+) -> RebuildResult | None:
+    """预约在位后的重建主体（`run_pending_rebuild` 的锁内段）。"""
+    if not take_rebuild_pending():
+        return None
+    skip = await _rebuild_skip_reason(session, data_dir=data_dir)
+    if skip is not None:
+        log_event(
+            logger,
+            "本次重建无需执行，已跳过",
+            tag="跳过",
+            detail={"原因": skip},
         )
+        return None
+    return await rebuild_runtime(
+        session, data_dir=data_dir, controller_url=controller_url, secret=secret,
+        runtime=runtime, exe_path=exe_path,
+    )
+
+
+async def consume_rebuild_after_crawl() -> None:
+    """任务收尾（占用刚释放）后立即消费待重建，不等下一个 5min 拍。
+
+    订阅删除/节点降级在任务进行中只做账面结算，内核级剔除被占用互斥推迟到
+    任务结束——本函数就是"任务结束后剔除"的那一步：池 Runtime 在跑就热重建
+    （进程/端口不动），把已标记移除的节点从内核里剔出去。Runtime 不在跑时
+    重建属于"拉起内核"的恢复路径，仍归周期拍处理。全程 fail-soft。
+    """
+    from app.core.config import get_settings
+    from app.core.database import get_session_factory
+    from app.domains.proxies import clash_manager as _cm
+    from app.domains.proxypool.runtime import (
+        RuntimeConfigError,
+        controller_endpoint_of,
+        current_runtime_proxy_url,
+    )
+
+    try:
+        data_dir = get_settings().data_dir
+        if current_runtime_proxy_url(data_dir) is None:
+            return
+        base, secret = controller_endpoint_of(data_dir)
+        async with get_session_factory()() as session:
+            await run_pending_rebuild(
+                session, data_dir=data_dir, controller_url=base, secret=secret,
+                runtime=_cm.pool_runtime, exe_path=str(_cm.kernel_exe(data_dir)),
+            )
+    except (RuntimeConfigError, OSError):
+        return
+    except Exception:  # noqa: BLE001 —— 收尾钩子绝不外抛
+        log_event(logger, "任务收尾重建消费异常", level=logging.ERROR, exc_info=True)
 
 
 @dataclass(frozen=True)
