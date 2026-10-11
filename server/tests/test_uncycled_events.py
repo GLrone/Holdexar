@@ -28,23 +28,10 @@ JOB_ID = 4242
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 't.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    for module in (cycle_mod, events_mod):
-        monkeypatch.setattr(module, "get_session_factory", lambda: factory)
-    return factory
+def db():
+    from app.core.database import get_session_factory
 
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
-
-
+    return get_session_factory()
 async def _seed(db, *, baseline_price: int, current_price: int, status: str = "ok"):
     """窗口前基线（history）+ 窗口内观察（current price 行）。"""
     window_end = datetime.now()
@@ -53,7 +40,7 @@ async def _seed(db, *, baseline_price: int, current_price: int, status: str = "o
         session.add(Game(appid=APP, name="测试游戏", type="game"))
         session.add(
             GamePriceHistory(
-                appid=APP, region_code="cn", currency="CNY",
+                appid=APP, region_code="CN", currency="CNY",
                 price=baseline_price, original_price=baseline_price,
                 discount_percent=0, sub_id=0, is_gold=False,
                 version_suffix=None, price_status="ok",
@@ -63,7 +50,7 @@ async def _seed(db, *, baseline_price: int, current_price: int, status: str = "o
         )
         session.add(
             GameCurrentPrice(
-                appid=APP, region_code="cn", price=current_price,
+                appid=APP, region_code="CN", price=current_price,
                 original_price=baseline_price, discount_percent=0,
                 sub_id=0, price_status=status, cny_fen=current_price,
                 updated_at=window_end - timedelta(minutes=1),
@@ -110,7 +97,7 @@ async def test_status_transition_emits_restored(db):
         session.add(Game(appid=APP, name="测试游戏", type="game"))
         session.add(
             GamePriceHistory(
-                appid=APP, region_code="cn", currency="CNY",
+                appid=APP, region_code="CN", currency="CNY",
                 price=10000, original_price=10000, discount_percent=0,
                 sub_id=0, is_gold=False, version_suffix=None,
                 price_status="ok", cny_fen=10000,
@@ -119,7 +106,7 @@ async def test_status_transition_emits_restored(db):
         )
         session.add(
             PriceEvent(
-                cycle_id=1, appid=APP, region_code="cn",
+                cycle_id=1, appid=APP, region_code="CN",
                 event_type="PRICE_UNAVAILABLE",
                 previous_json={"status": "ok"},
                 current_json={"status": "missing"},
@@ -129,7 +116,7 @@ async def test_status_transition_emits_restored(db):
         )
         session.add(
             GameCurrentPrice(
-                appid=APP, region_code="cn", price=10000,
+                appid=APP, region_code="CN", price=10000,
                 original_price=10000, discount_percent=0, sub_id=0,
                 price_status="ok", cny_fen=10000,
                 updated_at=window_end - timedelta(minutes=1),

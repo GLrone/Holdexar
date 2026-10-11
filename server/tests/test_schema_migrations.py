@@ -630,3 +630,75 @@ async def test_v11_adds_cycle_coverage_snapshot_column(tmp_path: Path, monkeypat
         await database_module.init_db()
     finally:
         await engine.dispose()
+
+
+# ── v14：game_price_history 冗余索引退役 ─────────────────────────────
+# 删的是两条重复检索路径；去重唯一索引必须留在场——它是写入侧
+# INSERT OR REPLACE 的去重依据，删了会让同刻同价反复堆积。
+
+_V14_REDUNDANT = (
+    "CREATE INDEX ix_gph_sub_id ON game_price_history (sub_id)",
+    "CREATE INDEX ix_gph_appid_region_snapshot ON game_price_history"
+    " (appid, region_code, snapshot_at)",
+)
+
+
+def _gph_table_with_unique(db: Path, *, with_unique: bool) -> None:
+    con = sqlite3.connect(str(db))
+    try:
+        con.execute(_GPH_DDL)
+        if with_unique:
+            con.execute(
+                "CREATE UNIQUE INDEX ux_gph_snapshot ON game_price_history"
+                " (appid, region_code, snapshot_at, COALESCE(sub_id, -1),"
+                " COALESCE(price, 0), COALESCE(is_gold, 0))"
+            )
+        for ddl in _V14_REDUNDANT:
+            con.execute(ddl)
+        con.commit()
+    finally:
+        con.close()
+
+
+@pytest.mark.asyncio
+async def test_v14_drops_redundant_indexes_keeping_unique(isolated_db: Path) -> None:
+    """唯一索引在场：两个冗余索引被删，去重唯一索引保留。"""
+    _gph_table_with_unique(isolated_db, with_unique=True)
+
+    async with database_module.get_engine().begin() as conn:
+        await database_module._migrate_drop_redundant_gph_indexes(conn)
+
+    names = _index_names(isolated_db)
+    assert names == {"ux_gph_snapshot"}, f"实际残留索引: {sorted(names)}"
+
+
+@pytest.mark.asyncio
+async def test_v14_skips_when_unique_index_absent(isolated_db: Path) -> None:
+    """唯一索引缺席（重复行未清理、v4 跳过）：一个都不删，留待补建后重试。
+
+    这里的危险不在「少回收体积」，而在失去 `INSERT OR REPLACE` 的去重依据前，
+    先把还能用的检索路径删掉——必须整组跳过。
+    """
+    _gph_table_with_unique(isolated_db, with_unique=False)
+
+    async with database_module.get_engine().begin() as conn:
+        await database_module._migrate_drop_redundant_gph_indexes(conn)
+
+    names = _index_names(isolated_db)
+    assert {"ix_gph_sub_id", "ix_gph_appid_region_snapshot"} <= names
+
+
+@pytest.mark.asyncio
+async def test_v14_new_library_has_no_redundant_indexes(isolated_db: Path) -> None:
+    """新装库：模型已不再定义这两个索引，create_all 跑完只剩去重唯一索引
+    与零登记层的观察列索引（活动标签回贴的增量扫描谓词）。"""
+    database_module._MIGRATIONS.append(
+        (4, "v4：幂等唯一索引", database_module._migrate_gph_snapshot_unique)
+    )
+    database_module._MIGRATIONS.append(
+        (14, "v14：冗余索引退役", database_module._migrate_drop_redundant_gph_indexes)
+    )
+    await database_module.init_db()
+
+    assert _user_version(isolated_db) == 14
+    assert _index_names(isolated_db) == {"ux_gph_snapshot", "ix_gph_snapshot_at"}

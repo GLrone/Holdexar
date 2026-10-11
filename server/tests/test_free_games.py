@@ -35,39 +35,10 @@ PROMO_END = int(__import__("time").time()) + 86_400
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 't.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    import app.core.database as database_module
+def db():
+    from app.core.database import get_session_factory
 
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    import app.crawler.db_writer as dw
-    import app.domains.metadata.service as metadata_service
-    import app.domains.wishlist.service as wishlist_service
-
-    monkeypatch.setattr(dw, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(metadata_service, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(wishlist_service, "get_session_factory", lambda: factory)
-    return factory
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    import app.domains.crawl.models  # noqa: F401
-    import app.domains.games.models  # noqa: F401
-    import app.domains.monitoring.models  # noqa: F401（release 流程查 monitor_sources）
-    import app.domains.rates.models  # noqa: F401
-    import app.domains.wishlist.models  # noqa: F401
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
-# ── 解析层：evaluate 分类 + parse_options 0 价保留 ──────────────────────
-
-
+    return get_session_factory()
 def _promo_item() -> dict:
     """赠送中条目形态：is_free 与 is_free_temporarily 同时为 true。"""
     return {

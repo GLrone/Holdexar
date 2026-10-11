@@ -318,6 +318,38 @@ def test_parse_gamerpower_mobile():
     assert parse_gamerpower_mobile({"error": 1}) is None
 
 
+def test_egs_persisted_uses_shared_headers(monkeypatch):
+    """持久化查询必须带共享放行请求头（常量改名漏改引用会在此直接报错）。"""
+    from app.crawler import epic_free as ef
+
+    captured: dict = {}
+
+    class _Resp:
+        status = 200
+
+        def read(self):
+            return b'{"data": {"ok": 1}}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(req, proxy, timeout):
+        captured["headers"] = req.headers
+        captured["url"] = req.full_url
+        return _Resp()
+
+    monkeypatch.setattr(ef, "_urlopen", fake_urlopen)
+    out = ef._egs_persisted_sync("primarySearchAutocomplete", {"keywords": "X"},
+                                 ef.EGS_SEARCH_HASH)
+    assert out == {"data": {"ok": 1}}
+    # Referer 是过 CF 放行组合的关键项（urllib 归一首字母大写）
+    assert captured["headers"].get("Referer") == "https://store.epicgames.com/en-US/"
+    assert "sha256Hash" in captured["url"]
+
+
 @pytest.mark.asyncio
 async def test_resolve_store_page_url(monkeypatch):
     """标题 → 商品页 URL：搜索首条 offerId/sandboxId → catalogNs.pageSlug。"""

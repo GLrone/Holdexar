@@ -18,35 +18,10 @@ from app.domains.settings import service as settings_service
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    import app.core.database as database_module
+def db():
+    from app.core.database import get_session_factory
 
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(settings_service, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(proxies_service, "get_session_factory", lambda: factory)
-    return factory
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    import app.domains.alerts.models  # noqa: F401
-    import app.domains.crawl.models  # noqa: F401
-    import app.domains.games.models  # noqa: F401
-    import app.domains.proxies.models  # noqa: F401
-    import app.domains.proxypool.models  # noqa: F401
-    import app.domains.rates.models  # noqa: F401
-    import app.domains.regions.models  # noqa: F401
-    import app.domains.settings.models  # noqa: F401
-    import app.domains.wishlist.models  # noqa: F401
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
+    return get_session_factory()
 @pytest.mark.asyncio
 async def test_default_strategy_is_direct_only(db):
     """全新库（无策略 KV）→ 默认 direct_only：初次打开软件即直连模式。"""
@@ -79,6 +54,49 @@ async def test_autoswitch_noop_cases(db):
     assert await proxies_service.maybe_autoswitch_on_subscription(0) is False
     await proxies_service.set_strategy("proxy_first")
     assert await proxies_service.maybe_autoswitch_on_subscription(42) is False
+
+
+@pytest.mark.asyncio
+async def test_revert_to_direct_when_last_subscription_gone(db):
+    """订阅删光即无出口 → 自动形态的代理策略回退直连（导入自动切的反向）。"""
+    from app.domains.proxies.models import ProxySubscription
+
+    await proxies_service.maybe_autoswitch_on_subscription(3)
+    assert (await proxies_service.get_strategy())["strategy"] == "proxy_first"
+    async with db() as session:
+        sub = ProxySubscription(
+            kind="clash", url="https://example.test/sub",
+            created_at=datetime(2026, 10, 7, 12, 0, 0),
+        )
+        session.add(sub)
+        await session.commit()
+        sub_id = sub.id
+    assert await proxies_service.delete_subscription(sub_id) is True
+    assert (await proxies_service.get_strategy())["strategy"] == "direct_only"
+
+
+@pytest.mark.asyncio
+async def test_revert_respects_explicit_choice(db):
+    """用户显式选过策略 → 无出口也不回退（与自动切换同一把尺）。"""
+    await proxies_service.set_strategy("proxy_first")
+    assert await proxies_service.maybe_revert_to_direct() is False
+    assert (await proxies_service.get_strategy())["strategy"] == "proxy_first"
+
+
+@pytest.mark.asyncio
+async def test_revert_noop_when_manual_pool_alive(db):
+    """手动池还有启用节点即有出口 → 不回退。"""
+    from app.domains.proxies.models import Proxy
+
+    await proxies_service.maybe_autoswitch_on_subscription(3)
+    async with db() as session:
+        session.add(Proxy(
+            scheme="http", host="127.0.0.1", port=8080, enabled=True,
+            created_at=datetime(2026, 10, 7, 12, 0, 0),
+        ))
+        await session.commit()
+    assert await proxies_service.maybe_revert_to_direct() is False
+    assert (await proxies_service.get_strategy())["strategy"] == "proxy_first"
 
 
 @pytest.mark.asyncio

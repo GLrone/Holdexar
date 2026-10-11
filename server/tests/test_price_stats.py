@@ -31,22 +31,10 @@ REGIONS = ("cn", "ru")  # 2 对象 × 2 区 = 4 单元
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 't.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    for module in (cycle_mod, coverage_mod, freshness_mod, stats_mod):
-        monkeypatch.setattr(module, "get_session_factory", lambda: factory)
-    return factory
+def db():
+    from app.core.database import get_session_factory
 
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
+    return get_session_factory()
 async def _make_cycle(db, appids, regions) -> int:
     cid = await cycle_mod.create("scheduled", "pool")
     async with db() as session:

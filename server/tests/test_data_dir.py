@@ -1,4 +1,5 @@
-"""数据目录解析测试：环境变量 / 便携 / 存量 / 开发态 / 打包态 五条判定分支。
+"""数据目录解析测试：环境变量 / 便携 / 程序目录存量 / 开发态指针与机器级 /
+打包态机器级存量与同盘新装 判定链。
 
 覆盖 app/core/paths.py 的判定链——它是「升级不丢数据」的唯一入口，
 判定顺序错一步就是老用户库被当成新装（或反之）。
@@ -139,15 +140,95 @@ def _only_appdir_writable(app_dir: Path):
 # ── 判定链：第 5 条（打包态）────────────────────────────────
 
 
-def test_frozen_fresh_install_uses_machine_dir(fake_env, monkeypatch):
-    """打包态全新安装（程序目录无 data/）：落机器级目录。
+def test_dev_pointer_honored(fake_env, monkeypatch):
+    """指针文件里的绝对路径就是开发态数据目录（库与备份可整份放到别的磁盘）。"""
+    _unfreeze(monkeypatch)
+    target = fake_env["tmp"] / "other-disk" / "holdexar-data"
+    (fake_env["app_dir"] / paths.DEV_POINTER).write_text(str(target), encoding="utf-8")
+    resolved = paths.resolve_data_dir()
+    assert resolved == target
+    assert (target / "logs").is_dir()
+    assert paths.describe_layout(resolved) == "dev-pointer"
+    assert not paths.is_inside(resolved, paths.PROJECT_ROOT)
 
-    这条是「解压到新目录 / 从压缩包直接运行不再产生空白数据环境」的根因防线。
-    """
+
+def test_dev_pointer_ignored_when_frozen(fake_env, monkeypatch):
+    """指针只作用于开发态：打包态不看这个文件，安装包里也不会有它。"""
+    _freeze(monkeypatch)
+    target = fake_env["tmp"] / "other-disk"
+    (fake_env["app_dir"] / paths.DEV_POINTER).write_text(str(target), encoding="utf-8")
+    assert paths.resolve_data_dir() == fake_env["app_dir"] / "data"
+    assert not target.exists()
+
+
+def test_dev_pointer_never_outranks_explicit_env(fake_env, monkeypatch):
+    """环境变量覆盖排在指针之前：两处都配时按环境变量，不出现两套口径。"""
+    _unfreeze(monkeypatch)
+    (fake_env["app_dir"] / paths.DEV_POINTER).write_text(
+        str(fake_env["tmp"] / "pointed"), encoding="utf-8")
+    custom = fake_env["tmp"] / "custom"
+    monkeypatch.setenv(f"{paths.ENV_PREFIX}DATA_DIR", str(custom))
+    assert paths.resolve_data_dir() == custom
+
+
+def test_dev_pointer_blank_comment_or_relative_ignored(fake_env, monkeypatch):
+    """空文件、只有注释、相对路径都算未配置，落回机器级 dev 目录。"""
+    _unfreeze(monkeypatch)
+    pointer = fake_env["app_dir"] / paths.DEV_POINTER
+    dev_machine = fake_env["local"] / f"{paths.APP_SLUG}-dev"
+    for body in ("", "# 把开发态数据放到别处：E:\\HoldexarData\n", "relative/path\n"):
+        pointer.write_text(body, encoding="utf-8")
+        assert paths.resolve_data_dir() == dev_machine
+
+
+def test_dev_pointer_unwritable_falls_back_to_machine_dir(fake_env, monkeypatch):
+    """指针目标建不出 logs/ 时落回机器级候选，而不是让程序起不来。"""
+    _unfreeze(monkeypatch)
+    blocked = fake_env["tmp"] / "blocked"
+    blocked.mkdir()
+    (blocked / "logs").write_text("", encoding="utf-8")  # logs 被文件占住，目录建不出
+    (fake_env["app_dir"] / paths.DEV_POINTER).write_text(str(blocked), encoding="utf-8")
+    assert paths.resolve_data_dir() == fake_env["local"] / f"{paths.APP_SLUG}-dev"
+
+
+def test_frozen_fresh_install_keeps_data_on_app_disk(fake_env, monkeypatch):
+    """打包态全新安装：数据落程序目录旁 data/，与解压位置同盘，不写系统盘。"""
     _freeze(monkeypatch)
     resolved = paths.resolve_data_dir()
-    assert resolved == fake_env["local"] / paths.APP_SLUG
+    assert resolved == fake_env["app_dir"] / "data"
     assert (resolved / "logs").is_dir()
+    assert not (fake_env["local"] / paths.APP_SLUG).exists()
+
+
+def test_frozen_existing_machine_db_stays_in_place(fake_env, monkeypatch):
+    """老用户升级：机器级已有库一律原地续用，不因新默认而被当成新装。
+
+    这条是「升级后数据看着全没了」的根因防线——程序目录旁 data/ 可写且不等于
+    该用它，先看存量在哪。
+    """
+    _freeze(monkeypatch)
+    machine = fake_env["local"] / paths.APP_SLUG
+    machine.mkdir(parents=True, exist_ok=True)
+    (machine / paths.data_dir_filename()).write_bytes(b"")
+    assert paths.resolve_data_dir() == machine
+
+
+def test_frozen_app_dir_readonly_falls_back_to_machine_dir(fake_env, monkeypatch):
+    """程序目录只读（装进受限位置）：回落机器级目录，而不是起不来。"""
+    _freeze(monkeypatch)
+    monkeypatch.setattr(paths, "_ensure", _only_machine_writable(fake_env["local"]))
+    assert paths.resolve_data_dir() == fake_env["local"] / paths.APP_SLUG
+
+
+def _only_machine_writable(local: Path):
+    real = paths._ensure
+
+    def fake(path: Path) -> Path:
+        if not paths.is_inside(path, local):
+            raise OSError("只读")
+        return real(path)
+
+    return fake
 
 
 # ── 布局标签 ────────────────────────────────────────────────
@@ -155,11 +236,17 @@ def test_frozen_fresh_install_uses_machine_dir(fake_env, monkeypatch):
 
 def test_layout_labels(fake_env, monkeypatch):
     _freeze(monkeypatch)
-    assert paths.describe_layout(paths.resolve_data_dir()) == "machine"
+    # 新装：与程序同盘
+    assert paths.describe_layout(paths.resolve_data_dir()) == "appdir"
     assert paths.describe_layout(fake_env["tmp"] / "elsewhere") == "custom"
-    # 程序目录 data/ 但无库：打包态是「系统目录不可写时的兜底」
+    # 机器级已有库：原地续用并标 machine
+    machine = fake_env["local"] / paths.APP_SLUG
+    machine.mkdir(parents=True, exist_ok=True)
+    (machine / paths.data_dir_filename()).write_bytes(b"")
+    assert paths.describe_layout(paths.resolve_data_dir()) == "machine"
+    # 程序目录 data/ 但无库：仍是 appdir（系统目录不可写时的兜底）
     assert paths.describe_layout(fake_env["app_dir"] / "data") == "appdir"
-    # 造出存量库后，同一个位置改判 legacy（放在最后：seed 会留下文件）
+    # 造出程序目录存量库后，同一个位置改判 legacy（放在最后：seed 会留下文件）
     assert paths.describe_layout(_seed_repo_db(fake_env["app_dir"])) == "legacy"
 
 
@@ -189,6 +276,10 @@ def test_every_layout_has_a_label(fake_env, monkeypatch):
         paths.describe_layout(fake_env["app_dir"] / "data"),
         paths.describe_layout(fake_env["local"] / f"{paths.APP_SLUG}-dev"),
     }
+    _unfreeze(monkeypatch)
+    pointed = fake_env["tmp"] / "other-disk" / "data"
+    (fake_env["app_dir"] / paths.DEV_POINTER).write_text(str(pointed), encoding="utf-8")
+    produced.add(paths.describe_layout(pointed))
     assert produced <= set(paths.LAYOUT_LABEL)
 
 

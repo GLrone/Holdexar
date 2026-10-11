@@ -23,16 +23,11 @@ REGIONS = ["cn", "ru", "kz", "ua", "in"]
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 't.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    import app.core.database as database_module
+def db(monkeypatch):
+    from app.core.database import get_session_factory
 
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
+
     # 域模块都是模块级 import 的 factory——漏一个就会读到生产库
-    monkeypatch.setattr(games_service, "get_session_factory", lambda: factory)
 
     async def _no_follows():
         return []
@@ -44,16 +39,8 @@ def db(tmp_path, monkeypatch):
         return list(REGIONS)
 
     monkeypatch.setattr(games_service, "effective_regions", _regions)
-    return factory
 
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
-
-
+    return get_session_factory()
 def _row(appid, region, status, when, price=1000, outcome=None, answer=None,
          last_success=None):
     """一条当前价行；status=ok 给价，其余状态只带状态。观察三元组缺省时

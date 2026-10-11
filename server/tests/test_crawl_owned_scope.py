@@ -17,20 +17,11 @@ PRIMARY = "76561198000000001"
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    import app.core.database as database_module
-    import app.domains.monitoring.service as monitoring_service
-    import app.domains.wishlist.service as wishlist_service
+def db(monkeypatch):
+    from app.core.database import get_session_factory
 
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(crawl_service, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(monitoring_service, "get_session_factory", lambda: factory)
+
     # import_appids 会走 wishlist 域入池 + 主账户解析：一并打桩到测试库
-    monkeypatch.setattr(wishlist_service, "get_session_factory", lambda: factory)
 
     import app.domains.account.service as account_service
 
@@ -38,20 +29,8 @@ def db(tmp_path, monkeypatch):
         return PRIMARY
 
     monkeypatch.setattr(account_service, "get_primary_steam_id", fake_primary)
-    return factory
 
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    import app.domains.crawl.models  # noqa: F401
-    import app.domains.games.models  # noqa: F401
-    import app.domains.monitoring.models  # noqa: F401
-    import app.domains.wishlist.models  # noqa: F401
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
+    return get_session_factory()
 async def _seed(db, appid: int, *, owned: bool, active: bool = True):
     async with db() as session:
         session.add(WishlistItem(

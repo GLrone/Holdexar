@@ -39,18 +39,11 @@ TODAY = date(2026, 9, 8)  # 周二；horizon = 9/7
 
 
 @pytest_asyncio.fixture
-async def db(tmp_path, monkeypatch):
-    """tmp 独立库：建全量 schema + canonical 唯一索引；各模块工厂指向它。"""
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 't.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_engine", lambda: engine)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    for mod in (rates_history, rates_service, bills_service):
-        monkeypatch.setattr(mod, "get_session_factory", lambda: factory)
-    async with engine.begin() as conn:
-        await conn.run_sync(database_module.Base.metadata.create_all)
+async def db(monkeypatch):
+    """完整库（隔离数据目录）+ canonical 唯一索引（幂等）。"""
+    from app.core.database import get_engine, get_session_factory
+
+    async with get_engine().begin() as conn:
         await conn.execute(
             text(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ux_frh_currency_date"
@@ -59,8 +52,7 @@ async def db(tmp_path, monkeypatch):
         )
     # 白名单收窄为合成币种（scan/repair 只处理白名单币种）
     monkeypatch.setattr(rates_service, "ALLOWED_CURRENCIES", frozenset({XTS}))
-    yield factory
-    await engine.dispose()
+    return get_session_factory()
 
 
 async def _add_history(

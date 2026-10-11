@@ -36,25 +36,10 @@ RECIPIENT = "owner@example.com"
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 't.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    for module in (
-        cycle_mod, events_mod, notification_service, settings_service, regions_service
-    ):
-        monkeypatch.setattr(module, "get_session_factory", lambda: factory)
-    return factory
+def db():
+    from app.core.database import get_session_factory
 
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
-
-
+    return get_session_factory()
 @pytest.fixture
 def delivery(monkeypatch):
     """send_mail / SMTP 配置 / 监控池范围的桩：记录调用，不出网。"""

@@ -17,34 +17,10 @@ from app.domains.settings import service as settings_service
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    import app.core.database as database_module
+def db():
+    from app.core.database import get_session_factory
 
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(settings_service, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(proxies_service, "get_session_factory", lambda: factory)
-    return factory
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    import app.domains.alerts.models  # noqa: F401
-    import app.domains.crawl.models  # noqa: F401
-    import app.domains.games.models  # noqa: F401
-    import app.domains.proxies.models  # noqa: F401
-    import app.domains.rates.models  # noqa: F401
-    import app.domains.regions.models  # noqa: F401
-    import app.domains.settings.models  # noqa: F401
-    import app.domains.wishlist.models  # noqa: F401
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
+    return get_session_factory()
 @pytest.mark.asyncio
 async def test_resolve_proxy_first_clash_running(db, monkeypatch):
     """proxy_first + 内核在跑 → 返回内核混合端口（登录窗代理优先的取数源）。"""

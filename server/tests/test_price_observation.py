@@ -25,30 +25,10 @@ APPID = 760100
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 't.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    import app.core.database as database_module
+def db():
+    from app.core.database import get_session_factory
 
-    import app.crawler.db_writer as db_writer_module
-
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(db_writer_module, "get_session_factory", lambda: factory)
-    return factory
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    # 批量写路径要查 steam_events（活动日历快照标签）——模型须注册建表
-    import app.domains.steam_events.models  # noqa: F401
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
-
-
+    return get_session_factory()
 def _price_row(region: str, status: str, *, price: int | None = 1000) -> dict:
     """browse 形状的现价行（steam_answer 由 browse 归一传入）。"""
     return {

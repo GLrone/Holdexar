@@ -168,19 +168,12 @@ def test_merge_bilingual_overlays_zh_names():
 # ── 价格观测打标与窗口回贴 ────────────────────────────────────────────────
 
 
-@pytest_asyncio.fixture
-async def db(tmp_path, monkeypatch):
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 't.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(service, "get_session_factory", lambda: factory)
+@pytest.fixture
+def db(monkeypatch):
+    from app.core.database import get_session_factory
+
     monkeypatch.setattr(service, "_windows_cache", None)
-    async with engine.begin() as conn:
-        await conn.run_sync(database_module.Base.metadata.create_all)
-    yield factory
-    await engine.dispose()
+    return get_session_factory()
 
 
 @pytest.mark.asyncio

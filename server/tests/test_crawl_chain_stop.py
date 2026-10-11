@@ -29,43 +29,10 @@ from app.crawler.occupancy import CrawlerBusyError, begin_crawl, current_holder,
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 't.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    import app.core.database as database_module
-    import app.crawler.db_writer as dw
+def db():
+    from app.core.database import get_session_factory
 
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(cycle_mod, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(crawl_service, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(dw, "get_session_factory", lambda: factory)
-    import app.domains.monitoring.service as monitoring_service
-    import app.core.orchestration as orchestration_mod
-    import app.domains.crawl.events as crawl_events
-    import app.domains.crawl.stats as crawl_stats
-    import app.domains.crawl.coverage as crawl_coverage
-    import app.domains.notifications.service as notification_service
-
-    monkeypatch.setattr(monitoring_service, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(orchestration_mod, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(crawl_events, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(crawl_stats, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(crawl_coverage, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(notification_service, "get_session_factory", lambda: factory)
-    return factory
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
-    crawl_service._active = None
-    crawl_service.unregister_chain_stop(crawl_service._chain_stop)
-    sched_mod._price_cycle_busy = False
-    end_crawl()
+    return get_session_factory()
 
 
 # ── occupancy：同 tag 幂等重入 ──
