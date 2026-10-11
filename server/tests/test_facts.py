@@ -22,19 +22,11 @@ from app.domains.notifications import facts as facts_service
 from app.domains.notifications.models import FactNotice  # noqa: F401
 
 
-@pytest_asyncio.fixture
-async def db(tmp_path, monkeypatch):
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 't.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(facts_service, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(metadata_service, "get_session_factory", lambda: factory)
-    async with engine.begin() as conn:
-        await conn.run_sync(database_module.Base.metadata.create_all)
-    yield factory
-    await engine.dispose()
+@pytest.fixture
+def db():
+    from app.core.database import get_session_factory
+
+    return get_session_factory()
 
 
 async def _all_rows(factory) -> list[FactNotice]:

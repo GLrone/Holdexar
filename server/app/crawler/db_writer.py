@@ -672,6 +672,7 @@ class DbWriter:
         if not entries:
             return results
         _t0 = time.perf_counter()
+        degraded = False
         # 写调度器在取连接之前：排队等写者位的段不占连接池，读请求不被写侧挤占
         async with write_gate(WritePriority.BACKGROUND, label="price_batch"):
             try:
@@ -835,7 +836,12 @@ class DbWriter:
                     exc_info=True,
                     detail={"款数": len(entries)},
                 )
-                return await self._upsert_task_batch_slow(entries)
+                degraded = True
+        if degraded:
+            # 回退在写者位之外调用：慢路径自带分段闸，段间交还写者位——在外层
+            # 闸体内 await 会被同任务重入抵消，交互写被堵整段慢路径时长；
+            # 慢路径自带收尾与完成日志
+            return await self._upsert_task_batch_slow(entries)
         # 收尾（复活清标 / 种子补挂）在写者位之外执行：各自过调度器的小事务，
         # 交互写可在段间插入；收尾不叠在未提交事务里
         ok_ids = [

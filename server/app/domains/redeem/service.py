@@ -24,9 +24,11 @@ import re
 
 import httpx
 
+from app.core.database import WritePriority, get_session_factory, write_gate
 from app.core.logging import log_event
 from app.domains.account import service as account_service
 from app.domains.account.steam_wallet import parse_cookie_str
+from app.domains.redeem.models import RAW_MAX, RedeemActivation
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +151,87 @@ def _summary_from_receipt(receipt: dict) -> tuple[str, str]:
     return sub_id, sub_name
 
 
+def _mask_key(key: str) -> str:
+    """激活码日志掩码：留首段与尾 2 位，中段以 * 代替。"""
+    if len(key) <= 7:
+        return "*" * len(key)
+    return f"{key[:5]}{'*' * (len(key) - 7)}{key[-2:]}"
+
+
+async def _record_ledger(
+    *,
+    kind: str,
+    status: str,
+    product_key: str = "",
+    subid: str = "",
+    sub_name: str = "",
+    detail: str = "",
+    raw: str = "",
+    steamid: str = "",
+) -> None:
+    """激活结果落激活账本（redeem_activations，成功/已拥有/失败都记）+ 业务日志（key 只留掩码）。"""
+    row = RedeemActivation(
+        kind=kind,
+        status=status,
+        product_key=product_key[:120],
+        subid=str(subid)[:40],
+        sub_name=sub_name[:300],
+        detail=detail[:300],
+        raw=(raw or "")[:RAW_MAX],
+        steamid=str(steamid)[:32],
+    )
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+        session.add(row)
+        await session.commit()
+    verdict = {"ok": "成功", "own": "已拥有"}.get(status, "失败")
+    log_event(
+        logger,
+        f"激活记录：{verdict}",
+        tag="CDK",
+        detail={
+            "类型": "激活" if kind == "cdk" else "免费领取",
+            "激活码": _mask_key(product_key) if product_key else f"SubID {subid}",
+            "内容": sub_name[:80],
+            "说明": detail[:80],
+            "账号": steamid,
+        },
+    )
+
+
+async def list_activations(limit: int = 50, offset: int = 0) -> dict:
+    """激活历史（时间倒序分页；不含 raw 回执原文，控制载荷）。"""
+    limit = max(1, min(int(limit), 200))
+    offset = max(0, int(offset))
+    from sqlalchemy import func, select
+
+    async with get_session_factory()() as session:
+        total = await session.scalar(select(func.count()).select_from(RedeemActivation))
+        stmt = (
+            select(RedeemActivation)
+            .order_by(RedeemActivation.created_at.desc(), RedeemActivation.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        rows = (await session.execute(stmt)).scalars().all()
+        return {
+            "total": int(total or 0),
+            "rows": [
+                {
+                    "id": r.id,
+                    "createdAt": r.created_at.isoformat(sep=" ", timespec="seconds") if r.created_at else "",
+                    "kind": r.kind,
+                    "status": r.status,
+                    "key": r.product_key,
+                    "subId": r.subid,
+                    "subName": r.sub_name,
+                    "detail": r.detail,
+                    "steamId": r.steamid,
+                }
+                for r in rows
+            ],
+        }
+
+
 async def activate_key(product_key: str) -> dict:
     """激活单个 CDK。返回 {status: ok|own|fail, detail, subId, subName, raw}。
 
@@ -158,65 +241,89 @@ async def activate_key(product_key: str) -> dict:
       同样提取 subId/subName 展示（失败回执也取
       line_items[0].packageid + line_item_description，此前只认成功回执是遗漏）；
     - raw：Steam 返回原文（JSON 序列化），供前端"展开原文"核对；
-    - 每次尝试记入账号维度 30 分钟计数（Steam 端才是真裁判，本端只做节奏指引）。
+    - 每次尝试记入账号维度 30 分钟计数（Steam 端才是真裁判，本端只做节奏指引）；
+    - 结果无论成败落激活账本（redeem_activations）一行；传输层失败同样记 fail
+      （Steam 未收到的不计激活尝试次数）。
     """
     jar, sessionid, steamid = await _login_session()
-    resp = await _post_steam(
-        REGISTER_KEY_URL, {"product_key": product_key, "sessionid": sessionid}, jar
-    )
-    _record_activation(steamid)
-
-    raw_text = ""
+    resp: httpx.Response | None
     try:
-        raw_text = resp.text[:2000]
-    except Exception:  # noqa: BLE001
-        pass
+        resp = await _post_steam(
+            REGISTER_KEY_URL, {"product_key": product_key, "sessionid": sessionid}, jar
+        )
+    except httpx.HTTPError as e:
+        resp = None
+        result: dict = {"status": "fail", "detail": f"激活请求失败：{e}",
+                        "subId": "", "subName": "", "raw": ""}
 
-    if resp.status_code == 401:
-        return {"status": "fail", "detail": "Cookie 已失效，请重新绑定",
-                "subId": "", "subName": "", "raw": raw_text}
-    if resp.status_code == 429:
-        return {"status": "fail", "detail": _ERROR_CODES[14], "subId": "", "subName": "",
-                "raw": raw_text}
+    if resp is not None:
+        _record_activation(steamid)
 
-    try:
-        data = resp.json()
-    except ValueError:
-        # store 页面层可能对脚本客户端返回登录页 HTML（钱包模块同款行为），
-        # 或节点级 429 页面——都归为"页面层未认登录态"，指引换节点/稍后再试。
-        if resp.status_code == 429:
-            return {"status": "fail", "detail": "激活节点被限流（429），请稍后再试或切换 Clash 节点",
-                    "subId": "", "subName": "", "raw": raw_text}
-        return {"status": "fail",
-                "detail": "Steam 页面层未认登录态（返回非 JSON）——可能节点被限流或会话校验拒绝，"
-                          "请切换 Clash 节点重试；持续失败参考「完整账单」同款页面层限制",
-                "subId": "", "subName": "", "raw": raw_text}
-
-    if data.get("success") == 1:
-        sub_id, sub_name = _summary_from_receipt(data.get("purchase_receipt_info") or {})
-        return {"status": "ok", "detail": "激活成功", "subId": sub_id, "subName": sub_name, "raw": raw_text}
-
-    # 错误码永远取 purchase_result_details（真 key 回执里 success=2 是"失败"标记
-    # 不是错误码——{"success":2, "purchase_result_details":53}；只判
-    # success==1，错误分类全靠 purchase_result_details）。receipt.result_detail 兜底。
-    detail = data.get("purchase_result_details")
-    receipt = data.get("purchase_receipt_info") or {}
-    code = 0
-    try:
-        code = int(detail)
-    except (TypeError, ValueError):
+        raw_text = ""
         try:
-            code = int(receipt.get("result_detail") or 0)
-        except (TypeError, ValueError):
-            code = 0
-    # 失败/已拥有回执若带 line_items（失败分支同样提取），一并展示
-    # subId/版本名——"已拥有"能看到是哪个 sub 是原脚本一直有的信息。
-    sub_id, sub_name = _summary_from_receipt(receipt)
-    if code == 9:
-        return {"status": "own", "detail": "已拥有", "subId": sub_id, "subName": sub_name, "raw": raw_text}
-    zh = _ERROR_CODES.get(code)
-    text = zh or (f"激活失败（错误码 {code}）" if code else str(detail)[:120] or "激活失败")
-    return {"status": "fail", "detail": text, "subId": sub_id, "subName": sub_name, "raw": raw_text}
+            raw_text = resp.text[:2000]
+        except Exception:  # noqa: BLE001
+            pass
+
+        if resp.status_code == 401:
+            result = {"status": "fail", "detail": "Cookie 已失效，请重新绑定",
+                      "subId": "", "subName": "", "raw": raw_text}
+        elif resp.status_code == 429:
+            result = {"status": "fail", "detail": _ERROR_CODES[14], "subId": "", "subName": "",
+                      "raw": raw_text}
+        else:
+            try:
+                data = resp.json()
+            except ValueError:
+                # store 页面层可能对脚本客户端返回登录页 HTML（钱包模块同款行为），
+                # 或节点级 429 页面——都归为"页面层未认登录态"，指引换节点/稍后再试。
+                if resp.status_code == 429:
+                    result = {"status": "fail", "detail": "激活节点被限流（429），请稍后再试或切换 Clash 节点",
+                              "subId": "", "subName": "", "raw": raw_text}
+                else:
+                    result = {"status": "fail",
+                              "detail": "Steam 页面层未认登录态（返回非 JSON）——可能节点被限流或会话校验拒绝，"
+                                        "请切换 Clash 节点重试；持续失败参考「完整账单」同款页面层限制",
+                              "subId": "", "subName": "", "raw": raw_text}
+            else:
+                if data.get("success") == 1:
+                    sub_id, sub_name = _summary_from_receipt(data.get("purchase_receipt_info") or {})
+                    result = {"status": "ok", "detail": "激活成功", "subId": sub_id, "subName": sub_name, "raw": raw_text}
+                else:
+                    # 错误码永远取 purchase_result_details（真 key 回执里 success=2 是"失败"标记
+                    # 不是错误码——{"success":2, "purchase_result_details":53}；只判
+                    # success==1，错误分类全靠 purchase_result_details）。receipt.result_detail 兜底。
+                    detail = data.get("purchase_result_details")
+                    receipt = data.get("purchase_receipt_info") or {}
+                    code = 0
+                    try:
+                        code = int(detail)
+                    except (TypeError, ValueError):
+                        try:
+                            code = int(receipt.get("result_detail") or 0)
+                        except (TypeError, ValueError):
+                            code = 0
+                    # 失败/已拥有回执若带 line_items（失败分支同样提取），一并展示
+                    # subId/版本名——"已拥有"能看到是哪个 sub 是原脚本一直有的信息。
+                    sub_id, sub_name = _summary_from_receipt(receipt)
+                    if code == 9:
+                        result = {"status": "own", "detail": "已拥有", "subId": sub_id, "subName": sub_name, "raw": raw_text}
+                    else:
+                        zh = _ERROR_CODES.get(code)
+                        text = zh or (f"激活失败（错误码 {code}）" if code else str(detail)[:120] or "激活失败")
+                        result = {"status": "fail", "detail": text, "subId": sub_id, "subName": sub_name, "raw": raw_text}
+
+    await _record_ledger(
+        kind="cdk",
+        status=result["status"],
+        product_key=product_key,
+        subid=result["subId"],
+        sub_name=result["subName"],
+        detail=result["detail"],
+        raw=result["raw"],
+        steamid=steamid,
+    )
+    return result
 
 
 async def activate_batch(keys: list[str]) -> dict:
@@ -272,49 +379,68 @@ async def _redirect_chain_hits_login(resp: httpx.Response, max_hops: int = 4) ->
 
 
 async def add_free_license(subid: int) -> dict:
-    """领取免费产品（SubID 通道）。返回 {status: ok|own|fail, detail}。"""
-    jar, sessionid, _steamid = await _login_session()
+    """领取免费产品（SubID 通道）。返回 {status: ok|own|fail, detail}；结果落激活账本（来源类型 free）。"""
+    jar, sessionid, steamid = await _login_session()
     referer = f"https://store.steampowered.com/checkout/freelicense/{subid}/"
     url = ADD_FREE_LICENSE_URL.rstrip("/") + f"/{subid}"
-    resp = await _post_steam(
-        url, {"sessionid": sessionid, "action": "approve"}, jar, referer=referer
-    )
-
-    if resp.status_code == 401:
-        return {"status": "fail", "detail": "Cookie 已失效，请重新绑定"}
-    if resp.status_code == 429:
-        return {"status": "fail", "detail": "领取节点被限流（429），请稍后再试或切换 Clash 节点"}
-    # 302 = 提交被受理（跳转回结算页）；200 且 body 为 JSON 也算受理。
-    # 200 但 HTML 多半是登录页/错误页（页面层会话校验拒绝，钱包模块同款）——不冒领。
-    # ⚠️ checkout 域重定向是**两跳**——第一跳 302 → checkout 页
-    # （看似受理），第二跳 302 → **登录页**（页面层拒绝，license 根本没发）。
-    # 只看第一跳 Location 会误报"已提交领取"；必须跟随整条链看终点是否登录页。
-    if resp.status_code == 302:
-        if await _redirect_chain_hits_login(resp):
-            return {"status": "fail",
-                    "detail": "Steam 页面层未认登录态（重定向到登录页）——请切换 Clash 节点重试"}
-        return {"status": "ok", "detail": "已提交领取"}
-    if resp.status_code == 200:
-        body = ""
-        try:
-            body = resp.text[:400]
-        except Exception:  # noqa: BLE001
-            pass
-        if body.lstrip().startswith("{"):
-            data = resp.json()
-            if data.get("success") in (1, True):
-                return {"status": "ok", "detail": "已提交领取"}
-            if int(data.get("error") or 0) == 24:
-                return {"status": "own", "detail": "已拥有该产品"}
-            return {"status": "fail", "detail": f"领取被拒绝（{data.get('error_text') or data}）"}
-        return {"status": "fail",
-                "detail": "Steam 页面层未认登录态（返回页面）——请切换 Clash 节点重试"}
-    body_hint = ""
+    resp: httpx.Response | None
     try:
-        body_hint = resp.text[:120]
-    except Exception:  # noqa: BLE001
-        pass
-    return {"status": "fail", "detail": f"Steam 拒绝了领取请求（HTTP {resp.status_code}）{body_hint}"}
+        resp = await _post_steam(
+            url, {"sessionid": sessionid, "action": "approve"}, jar, referer=referer
+        )
+    except httpx.HTTPError as e:
+        resp = None
+        result: dict = {"status": "fail", "detail": f"领取请求失败：{e}"}
+
+    if resp is not None:
+        if resp.status_code == 401:
+            result = {"status": "fail", "detail": "Cookie 已失效，请重新绑定"}
+        elif resp.status_code == 429:
+            result = {"status": "fail", "detail": "领取节点被限流（429），请稍后再试或切换 Clash 节点"}
+        # 302 = 提交被受理（跳转回结算页）；200 且 body 为 JSON 也算受理。
+        # 200 但 HTML 多半是登录页/错误页（页面层会话校验拒绝，钱包模块同款）——不冒领。
+        # ⚠️ checkout 域重定向是**两跳**——第一跳 302 → checkout 页
+        # （看似受理），第二跳 302 → **登录页**（页面层拒绝，license 根本没发）。
+        # 只看第一跳 Location 会误报"已提交领取"；必须跟随整条链看终点是否登录页。
+        elif resp.status_code == 302:
+            if await _redirect_chain_hits_login(resp):
+                result = {"status": "fail",
+                          "detail": "Steam 页面层未认登录态（重定向到登录页）——请切换 Clash 节点重试"}
+            else:
+                result = {"status": "ok", "detail": "已提交领取"}
+        elif resp.status_code == 200:
+            body = ""
+            try:
+                body = resp.text[:400]
+            except Exception:  # noqa: BLE001
+                pass
+            if body.lstrip().startswith("{"):
+                data = resp.json()
+                if data.get("success") in (1, True):
+                    result = {"status": "ok", "detail": "已提交领取"}
+                elif int(data.get("error") or 0) == 24:
+                    result = {"status": "own", "detail": "已拥有该产品"}
+                else:
+                    result = {"status": "fail", "detail": f"领取被拒绝（{data.get('error_text') or data}）"}
+            else:
+                result = {"status": "fail",
+                          "detail": "Steam 页面层未认登录态（返回页面）——请切换 Clash 节点重试"}
+        else:
+            body_hint = ""
+            try:
+                body_hint = resp.text[:120]
+            except Exception:  # noqa: BLE001
+                pass
+            result = {"status": "fail", "detail": f"Steam 拒绝了领取请求（HTTP {resp.status_code}）{body_hint}"}
+
+    await _record_ledger(
+        kind="free",
+        status=result["status"],
+        subid=str(subid),
+        detail=result["detail"],
+        steamid=steamid,
+    )
+    return result
 
 
 async def add_free_licenses(subids: list[int]) -> dict:
@@ -363,5 +489,6 @@ __all__ = [
     "activate_key",
     "add_free_license",
     "add_free_licenses",
+    "list_activations",
     "quota_status",
 ]

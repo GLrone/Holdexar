@@ -42,32 +42,16 @@ SECOND = "76561198000000002"
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    for mod in (database_module, monitoring, wishlist_service, crawl_service, preset_mod):
-        monkeypatch.setattr(mod, "get_session_factory", lambda: factory)
+def db(monkeypatch):
+    from app.core.database import get_session_factory
+
 
     async def _no_start(**kwargs):
         return {"id": 1, "scope": kwargs.get("scope"), "count": 0}
 
     monkeypatch.setattr(crawl_service, "start_job", _no_start)
-    return factory
 
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    import app.domains.crawl.models  # noqa: F401
-    import app.domains.games.models  # noqa: F401
-    import app.domains.monitoring.models  # noqa: F401
-    import app.domains.wishlist.models  # noqa: F401
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
+    return get_session_factory()
 async def _account(db):
     async with db() as session:
         if await session.get(TrackedAccount, PRIMARY) is None:
@@ -351,3 +335,121 @@ async def test_free_game_release_is_not_exclusion(db):
     assert released == 1
     assert await monitoring.state_of("game", 700) == "released"
     assert await monitoring.is_excluded("game", 700) is False
+
+
+# ── 11. 解绑账户回收派生来源（账本连续性）─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_remove_account_releases_derived_sources(db):
+    """解绑：派生来源摘除，无其他来源的对象退出监控与池列表。"""
+    await _account(db)
+    await _game(db, 700)
+    await _game(db, 701)
+    await _wl(db, 700, wishlisted=True, owned=True)
+    await _wl(db, 701, wishlisted=True)
+    await monitoring.sync_game_sources([700, 701])
+    assert await monitoring.state_of("game", 700) == "active"
+
+    receipt = await wishlist_service.remove_account(PRIMARY)
+
+    assert receipt["itemsRemoved"] == 2
+    assert receipt["poolReleased"] == 2 and receipt["reconciled"] is True
+    # 派生来源全部摘除
+    assert await monitoring.sources_of("game", 700) == []
+    assert await monitoring.sources_of("game", 701) == []
+    # 失去全部来源 → released，退出 crawl 与池列表
+    assert await monitoring.state_of("game", 700) == "released"
+    assert await monitoring.active_ids("game") == []
+    assert await monitoring.crawl_order("game") == []
+    items = {it["appid"]: it for it in await wishlist_service.list_items()}
+    assert 700 not in items and 701 not in items
+    # 账户与来源数据已删
+    async with db() as session:
+        assert await session.get(TrackedAccount, PRIMARY) is None
+        rows = (
+            await session.execute(
+                select(WishlistItem).where(WishlistItem.steamid == PRIMARY)
+            )
+        ).scalars().all()
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_remove_account_keeps_explicit_and_other_account_sources(db):
+    """解绑：manual 等非派生来源保留；其余账户仍持有的派生来源保留。"""
+    await _account(db)
+    async with db() as session:
+        session.add(TrackedAccount(steamid=SECOND, label="副号"))
+        await session.commit()
+    await _game(db, 700)
+    await _game(db, 701)
+    await _game(db, 702)
+    # 700：仅 manual（用户显式来源）；701：主号愿望单 + manual；702：双账户愿望单
+    await _wl(db, 700, PRIMARY, manual_pool=True)
+    await _wl(db, 701, PRIMARY, wishlisted=True, manual_pool=True)
+    await _wl(db, 702, PRIMARY, wishlisted=True)
+    await _wl(db, 702, SECOND, wishlisted=True)
+    await monitoring.sync_game_sources([700, 701, 702])
+    await monitoring.ensure_source("game", 700, "manual")
+    await monitoring.ensure_source("game", 701, "manual")
+
+    receipt = await wishlist_service.remove_account(PRIMARY)
+
+    assert receipt["itemsRemoved"] == 3
+    assert receipt["poolReleased"] == 0
+    # 700：manual 来源原样保留，仍在监控与池列表
+    assert await monitoring.sources_of("game", 700) == ["manual"]
+    assert await monitoring.state_of("game", 700) == "active"
+    # 701：family_wishlist 摘除、manual 保留 → 仍 active
+    assert await monitoring.sources_of("game", 701) == ["manual"]
+    assert await monitoring.state_of("game", 701) == "active"
+    # 702：副号仍持有 → family_wishlist 保留
+    assert await monitoring.sources_of("game", 702) == ["family_wishlist"]
+    assert await monitoring.state_of("game", 702) == "active"
+    assert sorted(await monitoring.active_ids("game")) == [700, 701, 702]
+    items = {it["appid"]: it for it in await wishlist_service.list_items()}
+    assert set(items) == {700, 701, 702}
+    assert items[700]["manualPool"] is True and items[700]["wishlisted"] is False
+    assert items[701]["manualPool"] is True and items[701]["wishlisted"] is False
+    assert items[702]["wishlisted"] is True
+
+
+@pytest.mark.asyncio
+async def test_remove_account_recycles_historical_orphans(db):
+    """历史孤儿（解绑遗留、无对应账户数据的派生来源）被解绑流程回收。"""
+    await _account(db)
+    await _game(db, 700)
+    await _wl(db, 700, wishlisted=True)
+    await monitoring.sync_game_sources([700])
+    # 伪造历史孤儿：600 曾被已解绑账户派生（无 wishlist_items 行、无账户），
+    # 601 只有 owned 孤儿来源
+    now = datetime.now()
+    async with db() as session:
+        for appid, src in ((600, "family_wishlist"), (601, "owned")):
+            session.add(
+                MonitorSource(
+                    target_type="game", target_id=appid, source=src,
+                    priority=95 if src == "family_wishlist" else 40,
+                    active=True, created_at=now, updated_at=now,
+                )
+            )
+            session.add(
+                MonitorTarget(
+                    target_type="game", target_id=appid, state="active",
+                    priority=95 if src == "family_wishlist" else 40,
+                    created_at=now, updated_at=now,
+                )
+            )
+        await session.commit()
+
+    receipt = await wishlist_service.remove_account(PRIMARY)
+
+    assert receipt["poolReleased"] == 3  # 700 + 两个孤儿
+    assert await monitoring.state_of("game", 600) == "released"
+    assert await monitoring.state_of("game", 601) == "released"
+    assert await monitoring.active_ids("game") == []
+    items = {it["appid"]: it for it in await wishlist_service.list_items()}
+    assert 600 not in items and 601 not in items
+    # 再跑全量对账：无新回收（幂等）
+    assert await monitoring.sync_all_game_sources() == 0

@@ -22,6 +22,7 @@ from urllib.parse import unquote
 
 import httpx
 from sqlalchemy import select
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
@@ -291,16 +292,18 @@ async def _backfill_member_countries(row: FamilyGroup) -> None:
         m for m in (row.members_json or [])
         if isinstance(m, dict) and m.get("steamid")
     ]
-    if not members or all(m.get("loccountrycode") for m in members):
+    # 被移除成员（excluded）不再消耗资料国家请求；写回保全量防丢条目
+    active = [m for m in members if not m.get("excluded")]
+    if not active or all(m.get("loccountrycode") for m in active):
         return
     now = datetime.utcnow()
     if now < (_country_backoff_until or now):
         return
-    countries = await _fetch_member_countries([str(m["steamid"]) for m in members])
+    countries = await _fetch_member_countries([str(m["steamid"]) for m in active])
     if not countries:
         _country_backoff_until = now + timedelta(seconds=_COUNTRY_BACKOFF_SECONDS)
         return
-    for m in members:
+    for m in active:
         m["loccountrycode"] = m.get("loccountrycode") or countries.get(str(m["steamid"]))
     try:
         async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
@@ -403,6 +406,11 @@ async def _sync_group_for_account(steam_id: str, cookies: str, now: datetime) ->
             m["personaName"] = m["personaName"] or p.get("personaName", "")
             m["avatarUrl"] = m["avatarUrl"] or _norm_avatar(p.get("avatarUrl", ""))
 
+    # 已移除成员（excluded 标记）不再是家庭成员：不再自动入追踪账户
+    excluded = await _excluded_member_sids(steam_id)
+    if excluded:
+        members = [m for m in members if m["steamid"] not in excluded]
+
     await _sync_members_to_accounts(members, now)
     await _save_group(steam_id, {
         "joined": True, "fetch_ok": True, "error": None, "members": members,
@@ -465,17 +473,33 @@ async def sync_family_group(steam_id: str | None = None) -> dict:
 
 
 async def _save_group(primary: str, snap: dict, now: datetime) -> None:
+    """组快照落库：Steam 成员按 origin=steam 整表重建；手动添加条目与已移除
+    成员的 excluded 排除标记原样保留（同步不复活、不冲掉手动成员）。"""
     async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
         row = await session.get(FamilyGroup, primary)
         if row is None:
             row = FamilyGroup(steamid=primary)
             session.add(row)
+        existing = [m for m in (row.members_json or []) if isinstance(m, dict)]
+        manual_kept = [m for m in existing if m.get("origin") == "manual" and not m.get("excluded")]
+        excluded_map = {
+            str(m.get("steamid")): m
+            for m in existing if m.get("excluded") and m.get("origin") != "manual"
+        }
+        steam_members: list[dict] = []
+        for m in snap.get("members") or []:
+            entry = {**m, "origin": "steam"}
+            sid = str(m.get("steamid"))
+            if sid in excluded_map:
+                entry["excluded"] = True
+                excluded_map.pop(sid)
+            steam_members.append(entry)
         row.family_groupid = snap.get("family_groupid")
         row.family_name = snap.get("family_name")
-        row.members_json = snap.get("members") or []
+        row.members_json = steam_members + manual_kept + list(excluded_map.values())
         row.fetch_ok = snap.get("fetch_ok", True)
         row.last_error = snap.get("error")
-        row.member_count = len(snap.get("members") or [])
+        row.member_count = len(steam_members)
         row.updated_at = now
         await session.commit()
 
@@ -531,6 +555,142 @@ async def _sync_members_to_accounts(members: list[dict], now: datetime) -> None:
             )
 
 
+async def _excluded_member_sids(owner: str) -> set[str]:
+    """已移除成员（excluded 排除标记）的 steamid 全集。"""
+    async with get_session_factory()() as session:
+        row = await session.get(FamilyGroup, owner)
+    if row is None:
+        return set()
+    return {
+        str(m.get("steamid"))
+        for m in (row.members_json or [])
+        if isinstance(m, dict) and m.get("excluded")
+    }
+
+
+# ─── 成员增删（家庭页手动管理；与 Steam 同步条目同账分 origin 层）──
+
+# 未绑定任何账号时手动成员的承载组行键（steamid 主键列，与 7656…17 位无碰撞面）
+LOCAL_GROUP_SID = "local"
+
+
+async def _resolve_group_owner(group_steamid: str | None) -> str:
+    """成员条目落哪条组账：前端指定组 > 主账号 > 本地组行（未绑定任何账号时）。"""
+    owner = (group_steamid or "").strip()
+    if owner:
+        return owner
+    try:
+        return await get_primary_steamid()
+    except ValueError:
+        return LOCAL_GROUP_SID
+
+
+async def add_family_member(
+    steamid: str,
+    persona_name: str = "",
+    avatar_url: str = "",
+    group_steamid: str | None = None,
+) -> dict:
+    """手动添加家庭成员：manual 条目落 members_json（列表读取的同一本账）。
+
+    无组行时确保一条组行承载（member_count 不含 manual，joined 语义不动）；
+    目标已在列（含 Steam 来源）幂等返回；带 excluded 标记的视为重新添加并
+    解除移除。tracked_accounts 由愿望单池既有添加动作负责，此处不碰。
+    """
+    sid = str(steamid or "").strip()
+    if not re.fullmatch(r"\d{17}", sid):
+        raise ValueError("无效的 SteamID64，请先通过输入框解析好友码")
+    owner = await _resolve_group_owner(group_steamid)
+    now = datetime.utcnow()
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+        row = await session.get(FamilyGroup, owner)
+        if owner != LOCAL_GROUP_SID:
+            await _absorb_local_members(session, sid)
+        members = [m for m in ((row.members_json if row else None) or []) if isinstance(m, dict)]
+        target = next((m for m in members if str(m.get("steamid")) == sid), None)
+        if target is not None:
+            if not target.get("excluded"):
+                return {"ok": True, "duplicate": True}
+            target.pop("excluded", None)  # 重新添加 = 解除移除
+            # JSON 条目原位变异不触发列变更检测，须显式标脏
+            flag_modified(row, "members_json")
+            row.updated_at = now
+            await session.commit()
+            log_event(logger, "家庭成员重新添加", tag="成功", detail={"SteamID": sid, "来源组": owner})
+            return {"ok": True, "reactivated": True}
+        entry = {
+            "steamid": sid,
+            "role": "",
+            "origin": "manual",
+            "personaName": (persona_name or "").strip(),
+            "avatarUrl": _norm_avatar(avatar_url),
+            "loccountrycode": None,
+        }
+        if row is None:
+            session.add(FamilyGroup(
+                steamid=owner, members_json=[entry], member_count=0,
+                fetch_ok=False, updated_at=now,
+            ))
+        else:
+            row.members_json = members + [entry]
+            row.updated_at = now
+        await session.commit()
+    log_event(logger, "家庭成员已添加", tag="成功", detail={"SteamID": sid, "来源组": owner})
+    return {"ok": True}
+
+
+async def _absorb_local_members(session, steamid: str) -> None:
+    """绑定前落在本地组的手动条目迁回主账号组（投影与增删随之同源）。"""
+    local_row = await session.get(FamilyGroup, LOCAL_GROUP_SID)
+    if local_row is None:
+        return
+    local_members = [m for m in (local_row.members_json or []) if isinstance(m, dict)]
+    kept = [m for m in local_members
+            if not (str(m.get("steamid")) == steamid and not m.get("excluded"))]
+    if len(kept) != len(local_members):
+        local_row.members_json = kept
+        flag_modified(local_row, "members_json")
+        local_row.updated_at = datetime.utcnow()
+        await session.commit()
+        log_event(logger, "家庭成员条目迁移到主账号组", detail={"SteamID": steamid})
+
+
+async def remove_family_member(steamid: str, group_steamid: str | None = None) -> dict:
+    """移除家庭成员（真实账本操作）：manual 条目删除；Steam 成员落 excluded
+    持久排除标记（Steam 家庭组同步不复活）。tracked_accounts 不动——解绑账户
+    是愿望单池页的既有独立动作，职责分离。"""
+    sid = str(steamid or "").strip()
+    owner = await _resolve_group_owner(group_steamid)
+    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+        row = await session.get(FamilyGroup, owner)
+        if row is None:
+            raise ValueError("该账号还没有家庭组记录，没有可移除的成员")
+        members = [m for m in (row.members_json or []) if isinstance(m, dict)]
+        target = next((m for m in members if str(m.get("steamid")) == sid), None)
+        if target is None and owner != LOCAL_GROUP_SID:
+            # 绑定前的手动成员可能仍在本地组行——移除随之可达
+            local_row = await session.get(FamilyGroup, LOCAL_GROUP_SID)
+            if local_row is not None:
+                local_members = [m for m in (local_row.members_json or []) if isinstance(m, dict)]
+                if any(str(m.get("steamid")) == sid and not m.get("excluded") for m in local_members):
+                    row, members = local_row, local_members
+                    target = next((m for m in members if str(m.get("steamid")) == sid), None)
+        if target is None or target.get("excluded"):
+            return {"ok": True, "removed": False}
+        if target.get("origin") == "manual":
+            row.members_json = [m for m in members if m is not target]
+            how = "删除条目"
+        else:
+            target["excluded"] = True
+            # JSON 条目原位变异不触发列变更检测，须显式标脏
+            flag_modified(row, "members_json")
+            how = "排除标记"
+        row.updated_at = datetime.utcnow()
+        await session.commit()
+    log_event(logger, "家庭成员已移除", tag="成功", detail={"SteamID": sid, "处理": how, "来源组": owner})
+    return {"ok": True, "removed": True}
+
+
 # app_settings 键：成员地区持久化 {steamid: region_code}（家庭页手动选择的落点）
 KEY_MEMBER_REGIONS = "family.member_regions"
 # 一次性清洗标记：首轮清掉历史整表落库写入的「cn」兜底条目后置位
@@ -563,7 +723,8 @@ async def _backfill_member_avatars(members: list[dict], owner_sid: str) -> list[
         m["personaName"] = m.get("personaName") or m.get("persona_name") or ""
     missing = [
         m for m in members
-        if isinstance(m, dict) and m.get("steamid") and (not m.get("avatarUrl") or not m.get("personaName"))
+        if isinstance(m, dict) and m.get("steamid") and not m.get("excluded")
+        and (not m.get("avatarUrl") or not m.get("personaName"))
     ]
     now = datetime.utcnow()
     if not missing or now < (_avatar_backoff_until or now):
@@ -606,6 +767,65 @@ async def _backfill_member_avatars(members: list[dict], owner_sid: str) -> list[
     return members
 
 
+async def _status_without_accounts() -> dict:
+    """未绑定任何账号时的状态：仍有成员（manual / 未排除）的组行如实投影。
+
+    手动成员不因未绑定消失（本地组行承载）；地区判定退化为
+    手动选择 > 资料国家（无钱包来源），不触网回填。
+    """
+    base = {
+        "bound": False,
+        "primarySteamid": "",
+        "steamid": "",
+        "joined": False,
+        "walletRegion": None,
+        "memberRegions": {},
+        "message": "尚未绑定 Steam 账号（请在「我」页绑定后同步家庭组）",
+        "lastError": None,
+    }
+    async with get_session_factory()() as session:
+        rows = (await session.execute(select(FamilyGroup))).scalars().all()
+
+    saved_regions = await settings_service.get_value(KEY_MEMBER_REGIONS, None)
+    manual = (
+        {str(k): str(v) for k, v in saved_regions.items()}
+        if isinstance(saved_regions, dict) else {}
+    )
+    profile: dict[str, str] = {}
+    all_sids: list[str] = []
+    for row in rows:
+        for m in (row.members_json or []):
+            if isinstance(m, dict) and m.get("steamid"):
+                sid = str(m["steamid"])
+                all_sids.append(sid)
+                if m.get("loccountrycode"):
+                    profile.setdefault(sid, str(m["loccountrycode"]))
+    resolved = await _resolve_member_regions(all_sids, manual, {}, profile)
+
+    groups: list[dict] = []
+    flat: dict[str, dict] = {}
+    for row in rows:
+        members = await _group_members_payload(row, resolved)
+        if not members:
+            continue
+        groups.append({
+            "steamid": row.steamid,
+            "accountName": "",
+            "synced": True,
+            "joined": bool(row.member_count) if row.family_groupid else None,
+            "familyName": row.family_name,
+            "familyGroupid": row.family_groupid,
+            "updatedAt": row.updated_at.isoformat() if row.updated_at else None,
+            "lastError": row.last_error,
+            "members": members,
+        })
+        for m in members:
+            flat.setdefault(m["steamid"], m)
+    if not groups:
+        return {**base, "groups": [], "members": []}
+    return {**base, "groups": groups, "members": list(flat.values())}
+
+
 async def get_status() -> dict:
     """家庭页数据（多账号多组）：每个绑定账号一条组记录 + 跨组成员并集。
 
@@ -618,21 +838,16 @@ async def get_status() -> dict:
 
     accounts = await account_service.list_accounts()
     if not accounts:
-        return {
-            "bound": False,
-            "message": "尚未绑定 Steam 账号（请在「我」页绑定后同步家庭组）",
-            "primarySteamid": "",
-            "groups": [],
-            "members": [],
-            "memberRegions": {},
-        }
+        return await _status_without_accounts()
 
     rows: dict[str, FamilyGroup] = {}
+    local_row: FamilyGroup | None = None
     async with get_session_factory()() as session:
         for a in accounts:
             row = await session.get(FamilyGroup, a["steam_id"])
             if row is not None:
                 rows[a["steam_id"]] = row
+        local_row = await session.get(FamilyGroup, LOCAL_GROUP_SID)
 
     # 资料国家回填先行（写回快照），随后的 profile 映射才能取到
     for row in rows.values():
@@ -648,13 +863,13 @@ async def get_status() -> dict:
 
     # 资料国家：各组 members_json 的 loccountrycode（同步时随成员档案落库）
     profile: dict[str, str] = {}
-    for row in rows.values():
+    for row in [*rows.values(), *( [local_row] if local_row else [] )]:
         for m in (row.members_json or []):
             if isinstance(m, dict) and m.get("steamid") and m.get("loccountrycode"):
                 profile.setdefault(str(m["steamid"]), str(m["loccountrycode"]))
 
     all_sids: list[str] = []
-    for row in rows.values():
+    for row in [*rows.values(), *( [local_row] if local_row else [] )]:
         all_sids += [
             str(m.get("steamid")) for m in (row.members_json or []) if m.get("steamid")
         ]
@@ -682,6 +897,15 @@ async def get_status() -> dict:
         })
         for m in members:
             flat.setdefault(m["steamid"], m)
+
+    # 绑定前落在本地组的手动成员并入主账号组投影（账仍在本地组行，增删可达）
+    if local_row is not None and groups:
+        for m in await _group_members_payload(local_row, resolved):
+            if m["steamid"] not in flat and all(
+                m["steamid"] != pm["steamid"] for pm in groups[0]["members"]
+            ):
+                groups[0]["members"].append(m)
+                flat.setdefault(m["steamid"], m)
 
     primary_sid = accounts[0]["steam_id"]
     healed = await settings_service.get_value(KEY_MEMBER_REGIONS, None)
@@ -788,11 +1012,11 @@ async def _resolve_member_regions(
 
 
 async def _group_members_payload(row: FamilyGroup, resolved: dict[str, dict]) -> list[dict]:
-    """组内成员 payload：头像/昵称兜底补齐 + 判定地区附加。"""
+    """组内成员 payload：头像/昵称兜底补齐 + 判定地区附加；已移除成员不投影。"""
     members = await _backfill_member_avatars(list(row.members_json or []), row.steamid)
     out: list[dict] = []
     for m in members:
-        if not isinstance(m, dict) or not m.get("steamid"):
+        if not isinstance(m, dict) or not m.get("steamid") or m.get("excluded"):
             continue
         sid = str(m["steamid"])
         r = resolved.get(sid) or {}
@@ -801,6 +1025,7 @@ async def _group_members_payload(row: FamilyGroup, resolved: dict[str, dict]) ->
             "role": str(m.get("role", "")),
             "personaName": m.get("personaName", "") or m.get("persona_name", ""),
             "avatarUrl": m.get("avatarUrl", "") or m.get("avatar_url", ""),
+            "origin": str(m.get("origin") or "steam"),
             "region": r.get("region"),
             "regionSource": r.get("regionSource"),
         })
@@ -863,11 +1088,24 @@ async def fetch_family_library(steam_id: str | None = None) -> dict:
     if not group.get("joined") or not group.get("family_groupid"):
         raise ValueError("当前账号未加入家庭组，无法拉取家庭库")
 
+    # 成员档案快照（后段 persona/头像合并共用）；excluded 标记 = 已移除成员，
+    # 实时聚合不再为其拉取已购/游玩明细
+    _fam_row = None
+    async with get_session_factory()() as session:
+        _fam_row = await session.get(FamilyGroup, owner)
+    excluded_sids = {
+        str(m.get("steamid"))
+        for m in ((_fam_row.members_json if _fam_row else None) or [])
+        if isinstance(m, dict) and m.get("excluded")
+    }
+
     shared_apps = await _fetch_shared_library(token, group["family_groupid"])
     shared_map = {a["appid"]: a for a in shared_apps}
 
     # 成员已购 + 游玩数据（appid → 该游戏在库信息）
-    member_rows: list[dict] = group["members"]
+    member_rows: list[dict] = [
+        m for m in group["members"] if str(m.get("steamid")) not in excluded_sids
+    ]
     member_ids = [m["steamid"] for m in member_rows if m.get("steamid")]
     details = await _fetch_player_details(token, member_ids)
 
@@ -957,10 +1195,6 @@ async def fetch_family_library(steam_id: str | None = None) -> dict:
     # GetPlayerLinkDetails 的 public_data 早已不返 avatar URL（见下方同步链路
     # 同款注释），头像从 family_groups.members_json（同步时 miniprofile 补齐过）
     # 合并；仍缺的走 miniprofile 实时补（失败静默）
-    _fam_row = None
-    if owner:
-        async with get_session_factory()() as session:
-            _fam_row = await session.get(FamilyGroup, owner)
     _saved = {
         str(m.get("steamid")): m
         for m in ((_fam_row.members_json if _fam_row else None) or [])
@@ -1194,6 +1428,8 @@ async def _library_from_snapshot(
             fam_row = await session.get(FamilyGroup, primary)
         if fam_row and fam_row.members_json:
             for m in fam_row.members_json:
+                if isinstance(m, dict) and m.get("excluded"):
+                    continue  # 已移除成员不再作为家庭成员投影
                 sid = str(m.get("steamid", ""))
                 if sid:
                     members_out.append({
@@ -1437,7 +1673,11 @@ async def family_wishlist(steam_id: str | None = None) -> dict:
         async with get_session_factory()() as session:
             row = await session.get(FamilyGroup, owner)
         if row and row.members_json:
-            members = [str(m.get("steamid")) for m in row.members_json if m.get("steamid")]
+            members = [
+                str(m.get("steamid"))
+                for m in row.members_json
+                if m.get("steamid") and not m.get("excluded")
+            ]
             family_name = row.family_name
     fallback = not members
 
