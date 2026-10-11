@@ -27,6 +27,7 @@ from app.domains.proxies import service as proxies_service  # noqa: E402
 from app.domains.rates import service as rates_service  # noqa: E402
 from app.domains.settings import service as settings_service  # noqa: E402
 from app.domains.settings.router import (  # noqa: E402
+    ContentSchedule,
     FetchSettingsUpdate,
     SettingsUpdate,
     get_fetch_settings,
@@ -63,6 +64,9 @@ async def test_fetch_settings_defaults_and_roundtrip(tmp_data_dir):
         "price_interval_hours": 6,
         # 目录层默认随策略：默认直连下目录段不随轮出网
         "catalog_refresh": False,
+        # 内容源节奏默认（与调度器注册同一套常量）
+        "hb_schedule": {"time": "02:30", "days": 1},
+        "epic_schedule": {"time": "23:05", "days": 1},
     }
 
     await update_fetch_settings(FetchSettingsUpdate(epic_free=False, fx_auto=False))
@@ -77,6 +81,61 @@ async def test_fetch_settings_defaults_and_roundtrip(tmp_data_dir):
     # 调度器闸门读到同一份 KV
     assert await core_scheduler.content_fetch_enabled("fetch.epic_free") is False
     assert await core_scheduler.content_fetch_enabled("fetch.hb_choice") is True
+
+
+@pytest.mark.asyncio
+async def test_content_schedule_roundtrip_validation_and_reschedule(tmp_data_dir, monkeypatch):
+    """内容源刷新节奏：读写回路 + 时刻校验/天数夹取 + 调度在跑时立即重排
+    + 脏 KV 逐项回落默认 + 启动链应用同一重排入口。"""
+    await init_db()
+    rescheduled: list[tuple] = []
+    monkeypatch.setattr(
+        core_scheduler.scheduler,
+        "reschedule_job",
+        lambda job, **kw: rescheduled.append((job, kw)),
+    )
+    monkeypatch.setattr(type(core_scheduler.scheduler), "running", property(lambda self: True))
+
+    updated = await update_fetch_settings(
+        FetchSettingsUpdate(
+            hb_schedule=ContentSchedule(time="04:00", days=3),
+            epic_schedule=ContentSchedule(time="1:05"),
+        )
+    )
+    assert updated.hb_schedule.time == "04:00" and updated.hb_schedule.days == 3
+    assert updated.epic_schedule.time == "01:05" and updated.epic_schedule.days == 1
+    assert await settings_service.get_value("fetch.hb_choice_schedule", None) == {
+        "time": "04:00", "days": 3,
+    }
+    # 调度在跑：保存即重排（days>1 走 cron 日步进，days=1 回每日）
+    assert ("hb_choice", {"trigger": "cron", "hour": 4, "minute": 0, "day": "*/3"}) in rescheduled
+    assert ("epic_free", {"trigger": "cron", "hour": 1, "minute": 5}) in rescheduled
+
+    # 校验：非法时刻拒绝（缺分钟位 / 超出当日范围），天数夹取 1..30
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        FetchSettingsUpdate(hb_schedule=ContentSchedule(time="2:5"))
+    with pytest.raises(ValidationError):
+        FetchSettingsUpdate(hb_schedule=ContentSchedule(time="24:00"))
+    clamped = FetchSettingsUpdate(hb_schedule=ContentSchedule(time="04:00", days=99))
+    assert clamped.hb_schedule.days == 30
+
+    # 脏 KV 逐项回落默认（读口归一化，与启动链同一套）
+    await settings_service.set_value(
+        "fetch.epic_free_schedule", {"time": "99:99", "days": 0}
+    )
+    reread = await get_fetch_settings()
+    assert reread.epic_schedule.time == "23:05" and reread.epic_schedule.days == 1
+
+    # 启动链应用：KV 自定义值 → 同一重排入口（注册默认保持 02:30/23:05）
+    rescheduled.clear()
+    await settings_service.set_value(
+        "fetch.hb_choice_schedule", {"time": "03:15", "days": 2}
+    )
+    await core_scheduler.apply_content_schedules_from_settings()
+    assert ("hb_choice", {"trigger": "cron", "hour": 3, "minute": 15, "day": "*/2"}) in rescheduled
+    assert ("epic_free", {"trigger": "cron", "hour": 23, "minute": 5}) in rescheduled
 
 
 @pytest.mark.asyncio

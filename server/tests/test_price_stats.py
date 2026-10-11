@@ -148,6 +148,8 @@ async def test_full_cycle_stats(db):
     assert recorded["unitsExpected"] == 4
     assert (recorded["unitsOk"], recorded["unitsLocked"]) == (4, 0)
     assert (recorded["unitsFailed"], recorded["unitsUnobserved"]) == (0, 0)
+    assert (recorded["unitsMissing"], recorded["unitsBlocked"]) == (0, 0)
+    assert "perAppid" not in recorded, "对象级明细不再进统计"
     assert recorded["coverage"] == 1.0
     assert recorded["coverageConfirmed"] == 1.0
     assert recorded["staleCount"] == 0
@@ -160,6 +162,10 @@ async def test_full_cycle_stats(db):
     assert set(snap["stats"]["stageMs"]) == {
         "planning", "running", "repairing", "finalizing",
     }
+    async with db() as session:
+        row = await session.get(PriceCycle, cid)
+        assert row.units_missing == 0 and row.units_blocked == 0
+        assert row.coverage_json is None, "新轮不再写快照列"
 
 
 # ── 部分 Cycle：口径关系 ──
@@ -179,6 +185,7 @@ async def test_partial_cycle_relationships(db):
     assert recorded["unitsExpected"] == 4
     assert (recorded["unitsOk"], recorded["unitsLocked"]) == (1, 1)
     assert recorded["unitsFailed"] == 2, "missing + blocked 都算明确失败"
+    assert (recorded["unitsMissing"], recorded["unitsBlocked"]) == (1, 1)
     assert recorded["unitsUnobserved"] == 0
     assert recorded["coverage"] == 0.25
     assert recorded["coverageConfirmed"] == 0.5

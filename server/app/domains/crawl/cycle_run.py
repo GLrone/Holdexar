@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 
 from app.core.events import bus
@@ -120,8 +121,12 @@ async def _run_price_cycle(
             level=logging.ERROR,
             exc_info=True,
         )
-        await settle_cycle(cycle_id, price_cycle.FAILED, error=str(e)[:200])
-        await record_stats(cycle_id)
+        # 兜底收敛自身再败（同拍两连败）也不外逃：Cycle 行留给重启收尸，
+        # 调用方按正常返回值走
+        with contextlib.suppress(Exception):
+            await settle_cycle(cycle_id, price_cycle.FAILED, error=str(e)[:200])
+        with contextlib.suppress(Exception):
+            await record_stats(cycle_id)
         return True
 
     if cycle_id is None:
@@ -157,6 +162,9 @@ async def _run_price_cycle(
                 terminal_error = f"本轮 {len(jobs)} 个抓取段全部失败，明细见任务列表"
         if not await price_cycle.advance(cycle_id, price_cycle.FINALIZING):
             return True if stop_event.is_set() else started
+        # 收尾段（标记刷新/事件检测/统计）分钟级且无抓取在跑：实时告知前端
+        # 切「汇总中」呈现，别让岛停在「正在抓取 100%」像卡死
+        bus.publish("price_cycle.finalizing", cycleId=cycle_id)
         # 停止的轮跳过事件检测与通知：未观察到的单元不等于「不可用」，半轮
         # 事实不产生价格事件、不发邮件；终态与统计照常落账
         if stop_event.is_set():
@@ -195,8 +203,11 @@ async def _run_price_cycle(
             exc_info=True,
             detail={"周期": cycle_id},
         )
-        await settle_cycle(cycle_id, price_cycle.FAILED, error=str(e)[:200])
-        await record_stats(cycle_id)
+        # 兜底收敛自身再败（同拍两连败）也不外逃：Cycle 行留给重启收尸
+        with contextlib.suppress(Exception):
+            await settle_cycle(cycle_id, price_cycle.FAILED, error=str(e)[:200])
+        with contextlib.suppress(Exception):
+            await record_stats(cycle_id)
         # 本轮抓取已经跑完（收尾崩的是记账，不是抓取）——同异常路径，
         # 返回 True 让调用方不重试，重试不会补上抓取只会重复广播
         return True
