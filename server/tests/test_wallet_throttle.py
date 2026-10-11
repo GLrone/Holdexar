@@ -9,6 +9,8 @@
    停止请求）；手动刷新余额（force）或换绑 Cookie 解锁并清零重计。
 5. 失败归因二分：冻结原因文案按最后一次失败（网络 / 风控 / 登录过期）
    分流，不一律写成「凭据已失效」；只有全通道都卡在传输层才归网络不通。
+6. 在线状态活跃感知门禁：官方批量通道只查超过新鲜度阈值的过期子集
+   （NULL 视为过期），子集空则本轮零出网；失败不推进时间戳下轮重试。
 """
 import asyncio
 import sys
@@ -528,3 +530,150 @@ async def test_fetch_wallet_head_splits_transport_from_http(monkeypatch):
     with pytest.raises(steam_wallet.WalletFetchError) as info:
         await steam_wallet.fetch_wallet(cookie(A), verify=True)
     assert str(info.value).startswith(steam_wallet.WALLET_AUTH_ERROR_HEAD)
+
+
+# ── 6. 在线状态活跃感知门禁 ─────────────────────────────────
+
+
+async def _wallet_fail_path(monkeypatch):
+    """钱包通道全程失败（零出网真实路径），让轮转不因钱包成功态干扰断言。"""
+
+    async def fail_fetch(cookies, *, verify=None, proxy_url=None):
+        raise account_service.WalletFetchError("Cookie 失效或网络不通")
+
+    monkeypatch.setattr(account_service, "fetch_wallet", fail_fetch)
+
+
+async def _set_online_check(steam_id: str, minutes_ago: float | None, **fields) -> None:
+    """直改库：拨 online_checked_at 到 N 分钟前（None=清空），附带行字段。"""
+    from app.crawler.utils import get_beijing_time_obj
+
+    from app.domains.account.models import SteamAccount
+
+    async with account_service.get_session_factory()() as session:
+        row = await session.get(SteamAccount, steam_id)
+        assert row is not None
+        row.online_checked_at = (
+            None if minutes_ago is None
+            else get_beijing_time_obj().replace(tzinfo=None) - timedelta(minutes=minutes_ago)
+        )
+        for key, value in fields.items():
+            setattr(row, key, value)
+        await session.commit()
+
+
+async def _get_account(steam_id: str):
+    from app.domains.account.models import SteamAccount
+
+    async with account_service.get_session_factory()() as session:
+        return await session.get(SteamAccount, steam_id)
+
+
+@pytest.mark.asyncio
+async def test_online_states_active_gate_skips_fresh(db, monkeypatch):
+    """活跃心跳下刚采集过的账号零出网；过期后才补查（2min 一发）。"""
+    calls: list[list[str]] = []
+
+    async def fake_states(steam_ids, api_key, *, proxy_url=None):
+        calls.append(list(steam_ids))
+        return {sid: {"state": 1, "in_game": ""} for sid in steam_ids}
+
+    await _wallet_fail_path(monkeypatch)
+    monkeypatch.setattr(account_service, "fetch_player_states", fake_states)
+    await settings_service.set_value("account.steam_api_key", "TESTKEY")
+
+    await account_service.save_cookies(cookie(A))
+    # 首轮：NULL 时间戳视为过期 → 补查一次并落时间戳
+    await account_service.refresh_online_states()
+    assert len(calls) == 1
+    assert (await _get_account(A)).online_checked_at is not None
+
+    # 心跳建立活跃阈值 2min：刚采集的时间戳 < 2min → 子集空，零出网
+    account_service.mark_seen()
+    assert account_service._freshness_threshold_minutes() == 2.0
+    await account_service.sync_wallets_rotational()
+    assert len(calls) == 1
+
+    # 拨回 3min 前（> 活跃阈值 2min）：下一轮补查一次，时间戳推进
+    await _set_online_check(A, minutes_ago=3.0)
+    await account_service.sync_wallets_rotational()
+    assert len(calls) == 2
+    assert calls[1] == [A]
+    assert (await _get_account(A)).online_checked_at is not None
+
+
+@pytest.mark.asyncio
+async def test_online_states_fetches_only_stale_subset(db, monkeypatch):
+    """只查过期子集：未查询账号的在线态保持原值，不被响应缺失误写离线。"""
+    calls: list[list[str]] = []
+
+    async def fake_states(steam_ids, api_key, *, proxy_url=None):
+        calls.append(list(steam_ids))
+        return {A: {"state": 1, "in_game": "Dota 2"}}
+
+    await _wallet_fail_path(monkeypatch)
+    monkeypatch.setattr(account_service, "fetch_player_states", fake_states)
+    await settings_service.set_value("account.steam_api_key", "TESTKEY")
+
+    await account_service.save_cookies(cookie(A))
+    await account_service.save_cookies(cookie(B))
+    # A 过期 45min（>30min 阈值）；B 新鲜 1min 且带非默认在线值：
+    # 若实现误传全量 rows，B 会被响应缺失写离线，与「未触碰」不可区分
+    await _set_online_check(A, minutes_ago=45.0)
+    await _set_online_check(B, minutes_ago=1.0, is_online=True, in_game="Elden Ring")
+
+    result = await account_service.sync_wallets_rotational()
+    assert len(calls) == 1
+    assert calls[0] == [A], "必须只把过期子集传给批量通道"
+
+    a = await _get_account(A)
+    assert a.is_online is True
+    assert a.in_game == "Dota 2"
+    assert a.online_checked_at is not None
+    b = await _get_account(B)
+    assert b.is_online is True, "未查询账号不得被误写离线"
+    assert b.in_game == "Elden Ring", "未查询账号的游戏名不得被清"
+    assert result["ok_count"] == 0  # 钱包通道全失败不影响在线断言
+
+
+@pytest.mark.asyncio
+async def test_online_states_fetch_failure_keeps_stale(db, monkeypatch):
+    """批量通道整体失败：不推进时间戳，下一轮自然重试。"""
+    calls: list[list[str]] = []
+
+    async def failing_states(steam_ids, api_key, *, proxy_url=None):
+        calls.append(list(steam_ids))
+        return {}
+
+    await _wallet_fail_path(monkeypatch)
+    monkeypatch.setattr(account_service, "fetch_player_states", failing_states)
+    await settings_service.set_value("account.steam_api_key", "TESTKEY")
+
+    await account_service.save_cookies(cookie(A))
+    await account_service.sync_wallets_rotational()
+    assert len(calls) == 1
+    assert (await _get_account(A)).online_checked_at is None, "失败不得推进时间戳"
+
+    await account_service.sync_wallets_rotational()
+    assert len(calls) == 2, "失败后下一轮必须重试"
+
+
+@pytest.mark.asyncio
+async def test_online_states_new_account_self_heals_once(db, monkeypatch):
+    """新绑定账号（NULL 时间戳）首轮补查一次，成功后进入新鲜期不再连发。"""
+    calls: list[list[str]] = []
+
+    async def fake_states(steam_ids, api_key, *, proxy_url=None):
+        calls.append(list(steam_ids))
+        return {sid: {"state": 1, "in_game": ""} for sid in steam_ids}
+
+    await _wallet_fail_path(monkeypatch)
+    monkeypatch.setattr(account_service, "fetch_player_states", fake_states)
+    await settings_service.set_value("account.steam_api_key", "TESTKEY")
+
+    await account_service.save_cookies(cookie(A))
+    await account_service.sync_wallets_rotational()
+    assert len(calls) == 1, "NULL 时间戳视为过期，新账号首轮补查"
+
+    await account_service.sync_wallets_rotational()
+    assert len(calls) == 1, "成功后进入新鲜期（30min），不连发"
