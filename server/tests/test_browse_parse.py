@@ -106,3 +106,27 @@ def test_build_game_data_overwrites_reviews_when_meta_real() -> None:
         assert data["review_count"] == 71207
         assert data["positive_rate"] == 9700
         assert data["positive_reviews"] == round(71207 * 97 / 100)
+
+
+def test_follow_parent_apps_accepts_full_fetch_signature(monkeypatch) -> None:
+    """父应用补发必须吃下 fetch_batch 的完整三元组返回。
+
+    回归：补发调用点曾按两元解包，fetch_batch 加响应体字节数后一进
+    父应用补发就 ValueError，整批重推耗尽记 300 行缺失进补抓账本。
+    """
+    import asyncio
+
+    async def fake_fetch_batch(context, appids, cc, lang, extras=True):
+        return (
+            {100: {"success": 1, "visible": True,
+                   "purchase_options": [{"price_cents": 999, "sub_id": 1}]}},
+            set(),
+            123,
+        )
+
+    monkeypatch.setattr(bs.StoreBrowseAPI, "fetch_batch", staticmethod(fake_fetch_batch))
+    monkeypatch.setattr(bs, "FOLLOW_PARENT", True)
+    items = {7: {"success": 1, "visible": True, "related_items": {"parent_appid": 100}}}
+    filled = asyncio.run(bs._follow_parent_apps(object(), items, [7], "us"))
+    assert filled == 1
+    assert items[7]["parent_appid"] == 100

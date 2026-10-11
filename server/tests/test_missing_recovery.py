@@ -4,7 +4,7 @@
 1. mark_region_status('missing')：fail_count 递增；穷尽（>MISSING_MAX_RETRIES）
    转 blocked 终态；locked/blocked 清零账本
 2. generate_missing_tasks：欠账行按区分组凑批成 type=app 任务
-   （每发 ≤400 行、只装该区欠账、冷却窗口内不选）；blocked/locked 不进补抓
+   （每发 ≤300 行、只装该区欠账、冷却窗口内不选）；blocked/locked 不进补抓
 3. upsert 质量门禁：status=ok 且 price=None 降级 missing 进账本，
    补抓成功回 ok 时 fail_count 清零（欠账闭环）
 4. app_handler 落库失败（upsert 返回 False）→ 全区欠账化（消费 False 缺口）
@@ -219,7 +219,7 @@ async def test_generate_tasks_cooldown_boundary():
 
 @pytest.mark.asyncio
 async def test_generate_missing_tasks_batches_by_region():
-    """按区分组凑批：同区欠账超过单发上限拆多发，每发 ≤400 行且不重不漏。"""
+    """按区分组凑批：同区欠账超过单发上限拆多发，每发 ≤300 行且不重不漏。"""
     db = DbWriter()
     now = _now_naive()
     # 段位取现网 Steam appid 上限（~505 万）之外，避开真实库的既有行
@@ -298,6 +298,70 @@ async def test_generate_missing_tasks_clears_empty_region_rows():
     finally:
         async with get_session_factory()() as session:
             await session.execute(delete(GameCurrentPrice).where(GameCurrentPrice.appid == appid))
+            await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_generate_missing_tasks_sql_limit_truncates_oldest():
+    """LIMIT 下推到 SQL：仍按账本年龄取最老 N 行（老账先补），新行被挡在窗口外。"""
+    appids = [997_110, 997_111, 997_112]
+    now = _now_naive()
+    ages = [5, 4, 3]
+    async with get_session_factory()() as session:
+        session.add_all([_game(a) for a in appids])
+        session.add_all(
+            _price(a, "CN", "missing", None, fail_count=1,
+                   updated_at=now - timedelta(hours=h))
+            for a, h in zip(appids, ages)
+        )
+        await session.commit()
+    try:
+        db = DbWriter()
+        tasks = await db.generate_missing_tasks(cooldown_minutes=10, limit_rows=3)
+        picked = [a for t in tasks for a in t["appids"]]
+        # 自动夹具的 APPID（now-1h 更新）比三行都新：被 LIMIT 挡住
+        assert sorted(picked) == appids
+        assert len(picked) == 3
+    finally:
+        async with get_session_factory()() as session:
+            await session.execute(delete(GameCurrentPrice).where(GameCurrentPrice.appid.in_(appids)))
+            await session.execute(delete(Game).where(Game.appid.in_(appids)))
+            await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_generate_missing_tasks_limit_keeps_empty_region_cleanup_complete():
+    """空区清理解耦：超限截断后窗口外空区行仍被清；冷却窗内空区行保留。"""
+    appids = [997_110, 997_111, 997_112]
+    empty_old, empty_fresh = 997_123, 997_124
+    now = _now_naive()
+    ages = [5, 4, 3]
+    async with get_session_factory()() as session:
+        session.add_all([_game(a) for a in appids])
+        session.add_all(
+            _price(a, "CN", "missing", None, fail_count=1,
+                   updated_at=now - timedelta(hours=h))
+            for a, h in zip(appids, ages)
+        )
+        # 空区行：老账（8h，远在 limit=2 窗口外）与冷却窗内新鲜行各一
+        session.add(_price(empty_old, "", "missing", None, fail_count=1,
+                           updated_at=now - timedelta(hours=8)))
+        session.add(_price(empty_fresh, "", "missing", None, fail_count=1,
+                           updated_at=now))
+        await session.commit()
+    try:
+        db = DbWriter()
+        tasks = await db.generate_missing_tasks(cooldown_minutes=10, limit_rows=2)
+        picked = [a for t in tasks for a in t["appids"]]
+        assert picked == [997_110, 997_111], "limit 只取最老 2 行真实欠账"
+        async with get_session_factory()() as session:
+            assert await session.get(GameCurrentPrice, (empty_old, "")) is None,                 "窗口外空区行仍须被清（不占槽位也不漏清）"
+            assert await session.get(GameCurrentPrice, (empty_fresh, "")) is not None,                 "冷却窗内空区行等过冷却再清"
+    finally:
+        async with get_session_factory()() as session:
+            await session.execute(delete(GameCurrentPrice).where(
+                GameCurrentPrice.appid.in_(appids + [empty_old, empty_fresh])))
+            await session.execute(delete(Game).where(Game.appid.in_(appids)))
             await session.commit()
 
 

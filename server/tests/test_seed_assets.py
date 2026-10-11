@@ -439,6 +439,47 @@ async def test_curated_seed_wins_and_crawl_hook(tmp_path: Path, monkeypatch) -> 
     assert row["epic_date"] == "2023-12-25 ~ 2024-01-01"
 
 
+@pytest.mark.asyncio
+async def test_curated_seed_guides_never_downgrades_local_marks(tmp_path: Path) -> None:
+    """本地在役编辑器列的防覆写契约：种子只补空/升级、不降级不覆盖。
+
+    is_hb/hb_data（HB 月包标记链）、is_epic/epic_date（Epic 喜加一标记链）、
+    series_id（系列归组）有本地写者——种子侧陈旧快照（is_hb=0/hb_data=NULL）
+    不得清掉本地标记；本地无值时种子照常引导落位。xgp_tier 无本地写者，
+    保持种子权威（本用例不涉及）。
+    """
+    seed = _make_seed(
+        tmp_path / "holdexar_seed.db",
+        curated=[
+            # 本地已标记的款：种子侧是陈旧快照（全空/0）
+            (APPID_A, "种子名A", None, None, 0, 0, None, None),
+            # 本地无标记的款：种子侧有值（引导落位通道）
+            (APPID_B, "种子名B", None, "2023-12-25", 1, 1, "HB慈善包24年1月", None),
+        ],
+    )
+    async with get_session_factory()() as session:
+        session.add(Game(
+            appid=APPID_A, name="本地标记游戏A",
+            is_hb=True, hb_data="HB慈善包26年10月包", created_at=datetime.now(),
+        ))
+        session.add(Game(appid=APPID_B, name="本地无标记游戏B", created_at=datetime.now()))
+        await session.commit()
+
+    # 启动合并与批量补挂两条 UPDATE 路径都过一遍（同一段受保护 SET 片段）
+    summary = await seed_assets.merge_curated_seed(seed)
+    assert summary is not None and summary["curated_updated"] == 2
+    assert await seed_assets.apply_curated_batch([APPID_A, APPID_B], seed_path=seed) == 2
+
+    # 本地标记原样幸存（旧实现在这里被种子整行覆写为 0/NULL）
+    row_a = await _game_row(APPID_A)
+    assert row_a["is_hb"] == 1 and row_a["hb_data"] == "HB慈善包26年10月包"
+    # 本地无值 → 种子引导落位（is_hb 0→1 升级、epic_date/hb_data 补空）
+    row_b = await _game_row(APPID_B)
+    assert row_b["is_hb"] == 1 and row_b["is_epic"] == 1
+    assert row_b["hb_data"] == "HB慈善包24年1月"
+    assert row_b["epic_date"] == "2023-12-25"
+
+
 # ── 3.5 名单行随种子落地（不进监控）───────────────────────────────────
 
 

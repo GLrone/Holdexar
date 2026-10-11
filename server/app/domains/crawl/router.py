@@ -126,19 +126,38 @@ async def active():
     拿它对账「抓取进行中」标志。
 
     `maintenance` = 池体检（L1/L2 整池串行探测）在跑——它不是 CrawlJob，
-    任务列表看不到；任务页据此显示「体检进行中」。`throttled` = 正在
+    任务列表看不到；任务页据此显示「体检进行中」。`maintenanceInfo` 是体检
+    账本（health_runs 未收尾行 + 逐块落库的观测计数）的实时投影：开跑时刻与
+    已探测数，前端用它显示进度而不是一行死文案。`throttled` = 正在
     全局限流窗口外排队的请求数——任务已启动但请求还没放行时，任务页
     据此显示「排队等发送窗口」而不是让用户以为卡死。
     """
-    from app.crawler.occupancy import crawler_busy
+    from app.crawler.occupancy import (
+        MAINTENANCE_HEALTH,
+        current_holder,
+        maintenance_kind,
+        maintenance_reason,
+    )
     from app.crawler.rate_limit import steam_rate_limiter
+    from app.domains.proxypool import health as pool_health
     from app.domains.proxypool import scheduling as pool_scheduling
 
     job_id = service.active_job_id()
+    kind_now = maintenance_kind()
+    maintenance_info = None
+    if kind_now is not None:
+        maintenance_info: dict = {"kind": kind_now, "reason": maintenance_reason()}
+        live = await pool_health.current_maintenance_run()
+        if live is not None:
+            maintenance_info["startedAt"] = live["startedAt"]
+            maintenance_info["probed"] = live["probed"]
     return {
         "activeJobId": job_id,
-        "busy": job_id is not None or crawler_busy(),
-        "maintenance": pool_scheduling.maintenance_running(),
+        # busy 只表达「抓取在跑」（爬取占用位）：体检/重建由 maintenance 单独表达，
+        # 混进 busy 会让前端把维护期误亮成「抓取进行中」
+        "busy": job_id is not None or current_holder() is not None,
+        "maintenance": kind_now == MAINTENANCE_HEALTH,
+        "maintenanceInfo": maintenance_info,
         "throttled": steam_rate_limiter.waiting,
     }
 

@@ -105,6 +105,52 @@ async def cleanup_orphan_jobs() -> None:
     await price_cycle.cleanup_orphan_cycles()
 
 
+# 爬取任务台账保留窗：与 proxy_job_runs 同为 90 天——两层台账靠时序对应，
+# 窗一致对应关系才在窗内完整；price_cycles 整行归 crawl/retention.py 的周期
+# 保留窗，本函数一行不碰
+CRAWL_JOB_RETENTION_DAYS = 90
+# 分块删除（每块一个事务过写闸）：一次长 DELETE 会长时间持写锁；删不完留给下一轮
+_CRAWL_PRUNE_CHUNK = 5000
+_CRAWL_PRUNE_MAX_CHUNKS = 20
+
+
+async def prune_crawl_jobs(
+    days: int = CRAWL_JOB_RETENTION_DAYS,
+    chunk: int = _CRAWL_PRUNE_CHUNK,
+    max_chunks: int = _CRAWL_PRUNE_MAX_CHUNKS,
+) -> int:
+    """清理窗口外的终态爬取任务台账行；price_cycles 整行不碰（归周期保留窗）。
+
+    账龄按 finished_at 算（长任务的 started_at 会低估账龄）；开放态行
+    （pending/running）finished_at 恒空，加 status 防御双保险。分块删除：
+    每块一个事务过写闸，块间写者位空出；单轮块上限内删不完留给下一日续删。
+    """
+    from sqlalchemy import text
+
+    cutoff = datetime.now() - timedelta(days=days)
+    deleted = 0
+    for _ in range(max_chunks):
+        async with write_gate(
+            WritePriority.BACKGROUND, "crawl_prune"
+        ), get_session_factory()() as session:
+            result = await session.execute(
+                text(
+                    "DELETE FROM crawl_jobs WHERE id IN ("
+                    "SELECT id FROM crawl_jobs"
+                    " WHERE finished_at IS NOT NULL AND finished_at < :cutoff"
+                    " AND status NOT IN ('pending', 'running')"
+                    " ORDER BY id LIMIT :chunk)"
+                ),
+                {"cutoff": cutoff, "chunk": chunk},
+            )
+            await session.commit()
+        affected = int(result.rowcount or 0)
+        deleted += affected
+        if affected < chunk:
+            return deleted
+    return deleted
+
+
 async def import_appids(appids: list[int]) -> dict:
     """批量导入：加入本地游戏目录 + 分类，**不建立持续监控关系**。
 
@@ -881,12 +927,18 @@ async def start_job(
     # _active 会漏掉它。检查后立即预取占用（tag 经 config.occupancy_tag 传给
     # run_crawl 复用，释放权在 _execute 收尾）——检查与取得占用之间无 await，
     # 并发启动窗口闭合，注定失败的任务行不再产生。
-    from app.crawler.occupancy import CrawlerBusyError, begin_crawl, crawler_busy, end_crawl
+    from app.crawler.occupancy import (
+        CrawlerBusyError,
+        begin_crawl,
+        crawler_busy,
+        end_crawl,
+        maintenance_reason,
+    )
 
     if crawler_busy():
-        raise RuntimeError("已有爬取任务在运行")
+        raise RuntimeError(maintenance_reason() or "已有爬取任务在运行")
     if _active is not None and not _active.task.done():
-        raise RuntimeError("已有爬取任务在运行")
+        raise RuntimeError(maintenance_reason() or "已有爬取任务在运行")
     try:
         begin_crawl(JOB_OCCUPANCY_TAG)
     except CrawlerBusyError:
@@ -1104,6 +1156,8 @@ async def default_queue_specs() -> list[dict]:
 
 # 手动全队列链句柄：段间隙占用窗口（_active 已清、下一段未建）的防重入闸
 _queue_chain_task: asyncio.Task | None = None
+# 受理段占位：检查通过后、首个 await 前同步置位，并发受理不得都过闸
+_queue_accepting = False
 
 
 async def start_full_queue() -> dict:
@@ -1115,60 +1169,67 @@ async def start_full_queue() -> dict:
     （路由 400），占用 RuntimeError（409），链句柄防重入；无显式 kind 的
     scope 段 job 行记 manual（missing/specials_backfill 是段身份标签，保留）。
     """
-    global _queue_chain_task
-    from app.crawler.occupancy import crawler_busy
+    global _queue_chain_task, _queue_accepting
+    from app.crawler.occupancy import crawler_busy, maintenance_reason
 
     if crawler_busy() or (_active is not None and not _active.task.done()):
-        raise RuntimeError("已有爬取任务在运行")
-    if _queue_chain_task is not None and not _queue_chain_task.done():
+        raise RuntimeError(maintenance_reason() or "已有爬取任务在运行")
+    if _queue_accepting or (
+        _queue_chain_task is not None and not _queue_chain_task.done()
+    ):
         raise RuntimeError("全量队列已在启动中")
-    composed = await default_queue_specs()
+    # 检查与置位之间无 await（同 start_job 预取占用判例）
+    _queue_accepting = True
+    try:
+        composed = await default_queue_specs()
 
-    missing_pending = await has_pending_missing()
-    segment_plan: list[dict] = [{"name": "missing", "count": 1 if missing_pending else 0}]
-    for spec in composed:
-        scope = spec.get("scope")
-        if not scope:
-            continue
-        segment_plan.append(
-            {"name": scope, "count": len(await plan_scope_appids(scope, None))}
-        )
-    if not any(p["count"] for p in segment_plan):
-        raise ValueError(
-            "没有可抓取的对象：关注与游戏库都是空的，先在游戏商店页添加游戏"
-        )
-
-    # 无显式 kind 的 scope 段手动触发记 manual；missing / specials_backfill
-    # 是通道/段身份标签（任务页按此显示），保留
-    specs = [
-        {**spec, "kind": "manual"}
-        if spec.get("scope") and "kind" not in spec
-        else spec
-        for spec in composed
-    ]
-
-    async def _chain() -> None:
-        # 编排本体在 crawl 域内，与自动轮共用一份；链级停止位由 run_price_cycle
-        # 自行登记（stop 端点经它停整轮）。本函数只负责「后台跑 + 链级异常兜底」
-        from app.domains.crawl import cycle_run
-
-        try:
-            started = await cycle_run.run_price_cycle(specs, kind="manual")
-            log_event(
-                logger,
-                "手动全队列已跑完，部分或全部段已启动"
-                if started
-                else "手动全队列已跑完，没有可抓的段（全部为空或被占用）",
+        missing_pending = await has_pending_missing()
+        segment_plan: list[dict] = [{"name": "missing", "count": 1 if missing_pending else 0}]
+        for spec in composed:
+            scope = spec.get("scope")
+            if not scope:
+                continue
+            segment_plan.append(
+                {"name": scope, "count": len(await plan_scope_appids(scope, None))}
             )
-        except Exception:  # noqa: BLE001 —— 链级异常只记日志，段内已各自兜底
-            log_event(
-                logger,
-                "手动全队列执行异常，段内已各自兜底",
-                level=logging.ERROR,
-                exc_info=True,
+        if not any(p["count"] for p in segment_plan):
+            raise ValueError(
+                "没有可抓取的对象：关注与游戏库都是空的，先在游戏商店页添加游戏"
             )
 
-    _queue_chain_task = asyncio.create_task(_chain())
+        # 无显式 kind 的 scope 段手动触发记 manual；missing / specials_backfill
+        # 是通道/段身份标签（任务页按此显示），保留
+        specs = [
+            {**spec, "kind": "manual"}
+            if spec.get("scope") and "kind" not in spec
+            else spec
+            for spec in composed
+        ]
+
+        async def _chain() -> None:
+            # 编排本体在 crawl 域内，与自动轮共用一份；链级停止位由 run_price_cycle
+            # 自行登记（stop 端点经它停整轮）。本函数只负责「后台跑 + 链级异常兜底」
+            from app.domains.crawl import cycle_run
+
+            try:
+                started = await cycle_run.run_price_cycle(specs, kind="manual")
+                log_event(
+                    logger,
+                    "手动全队列已跑完，部分或全部段已启动"
+                    if started
+                    else "手动全队列已跑完，没有可抓的段（全部为空或被占用）",
+                )
+            except Exception:  # noqa: BLE001 —— 链级异常只记日志，段内已各自兜底
+                log_event(
+                    logger,
+                    "手动全队列执行异常，段内已各自兜底",
+                    level=logging.ERROR,
+                    exc_info=True,
+                )
+
+        _queue_chain_task = asyncio.create_task(_chain())
+    finally:
+        _queue_accepting = False
     segment_names = [p["name"] for p in segment_plan]
     log_event(
         logger,

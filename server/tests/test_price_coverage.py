@@ -349,6 +349,7 @@ async def test_coverage_endpoint_returns_cycle_result(db):
     result = await crawl_router.cycle_coverage(cid)
     assert result["cycleId"] == cid
     assert result["coverage"] == 1.0
+    assert "perAppid" not in result, "聚合端点不再返回对象级明细"
 
 
 @pytest.mark.asyncio
@@ -390,30 +391,29 @@ async def test_freshness_latest_endpoint(db):
     assert payload["lastSuccessAt"] is not None
 
 
-# ── 对象级覆盖快照（收敛冻结，轮详情页 cycle_coverage 的证据源；
-#    卡片覆盖已改活表尝试状态现算，不再读快照）──
+# ── 收敛统计落列（拆分随统计列落库；读路径由统计列重建，快照列仅存量）──
 
 
 @pytest.mark.asyncio
-async def test_convergence_freezes_per_appid_snapshot(db):
-    """收敛统计冻结每个对象的五桶计数进 Cycle 行，轮详情读快照。"""
+async def test_convergence_records_split_stat_columns(db):
+    """收敛统计落列：missing/blocked 拆分入列，coverage_json 不再写入。"""
     cid = await _make_cycle(db, [APP_A, APP_B], REGIONS, started_hours_ago=2.0)
     await _price(db, APP_A, "cn", "ok", hours_ago=1.8)
     await _price(db, APP_A, "ru", "locked", hours_ago=1.8)
-    await _price(db, APP_B, "cn", "ok", hours_ago=1.8)
+    await _price(db, APP_B, "cn", "missing", hours_ago=1.8)
+    await _price(db, APP_B, "ru", "blocked", hours_ago=1.8)
     await _close_cycle(db, cid, hours_ago=1.0)
 
     stats = await stats_mod.record_stats(cid)
-    snap = stats["perAppid"]
-    assert snap[str(APP_A)] == {
-        "ok": 1, "locked": 1, "missing": 0, "blocked": 0, "unobserved": 0,
-        "regions": {"RU": "locked"},
-    }
-    # 没观察到的区进 regions，标 unobserved——悬停点名问题地区的依据
-    assert snap[str(APP_B)] == {
-        "ok": 1, "locked": 0, "missing": 0, "blocked": 0, "unobserved": 1,
-        "regions": {"RU": "unobserved"},
-    }
+    assert "perAppid" not in stats, "对象级明细不再进统计"
+    assert (stats["unitsMissing"], stats["unitsBlocked"]) == (1, 1)
+    assert stats["unitsFailed"] == 2
+
+    async with db() as session:
+        cycle = await session.get(PriceCycle, cid)
+        assert cycle.units_missing == 1
+        assert cycle.units_blocked == 1
+        assert cycle.coverage_json is None, "新轮不再写快照列"
 
 
 async def _touch_price(db, appid, region, status, *, hours_ago: float = 0.0) -> None:
@@ -437,8 +437,8 @@ async def _touch_price(db, appid, region, status, *, hours_ago: float = 0.0) -> 
 
 
 @pytest.mark.asyncio
-async def test_cycle_coverage_reads_snapshot_over_window(db):
-    """轮详情覆盖率同样快照优先：快照在，周期外写入不改已收敛轮的数字。"""
+async def test_cycle_coverage_reads_columns_over_window(db):
+    """收敛轮读统计列：窗口外补写价格行，读数不漂移（列重建的复现性）。"""
     cid = await _make_cycle(db, [APP_A], REGIONS, started_hours_ago=2.0)
     await _price(db, APP_A, "cn", "ok", hours_ago=1.8)
     await _price(db, APP_A, "ru", "locked", hours_ago=1.8)
@@ -450,20 +450,62 @@ async def test_cycle_coverage_reads_snapshot_over_window(db):
 
     result = await coverage_mod.cycle_coverage(cid)
     assert (result["ok"], result["locked"]) == (1, 1)
+    assert (result["missing"], result["blocked"]) == (0, 0)
     assert result["unobserved"] == 0
     assert result["targetsDone"] == 1
-    assert result["perAppid"][str(APP_A)]["locked"] == 1
+    assert result["targetsTotal"] == 1
 
 
 @pytest.mark.asyncio
-async def test_snapshot_excludes_objects_outside_expected_set(db):
-    """不在期望集内的对象不进快照——轮详情只回答本轮该刷的对象。"""
+async def test_legacy_rows_without_split_columns_rebuild_merged(db):
+    """存量统计行拆分裂缺失：missing=units_failed、blocked=0 合并重建（合计精确）。"""
+    cid = await _make_cycle(db, [APP_A], REGIONS, started_hours_ago=2.0)
+    await _close_cycle(db, cid, hours_ago=1.0)
+    async with db() as session:
+        cycle = await session.get(PriceCycle, cid)
+        cycle.units_expected = 2
+        cycle.units_ok = 1
+        cycle.units_locked = 1
+        cycle.units_failed = 0
+        cycle.units_missing = None
+        cycle.units_blocked = None
+        cycle.units_unobserved = 0
+        cycle.coverage = 0.5
+        cycle.coverage_confirmed = 1.0
+        cycle.targets_total = 1
+        cycle.targets_done = 1
+        await session.commit()
+
+    result = await coverage_mod.cycle_coverage(cid)
+    assert (result["missing"], result["blocked"]) == (0, 0)
+    assert (result["ok"], result["locked"]) == (1, 1)
+    assert result["coverage"] == 0.5
+    assert result["coverageConfirmed"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_unconverged_cycle_falls_back_to_window_scan(db):
+    """units_expected 为 NULL（未收敛/无统计）→ 活表窗口现算兜底不回归。"""
+    cid = await _make_cycle(db, [APP_A], REGIONS, started_hours_ago=2.0)
+    await _price(db, APP_A, "cn", "ok", hours_ago=1.8)
+    await _price(db, APP_A, "ru", "missing", hours_ago=1.8)
+
+    async with db() as session:
+        cycle = await session.get(PriceCycle, cid)
+        assert cycle.units_expected is None
+
+    result = await coverage_mod.cycle_coverage(cid)
+    assert (result["ok"], result["missing"], result["coverage"]) == (1, 1, 0.5)
+
+
+@pytest.mark.asyncio
+async def test_window_scan_excludes_objects_outside_expected_set(db):
+    """活表现算路径同样只回答本轮该刷的对象（期望集外不进计数）。"""
     cid = await _make_cycle(db, [APP_A], REGIONS, started_hours_ago=2.0)
     await _price(db, APP_A, "cn", "ok", hours_ago=1.8)
     await _price(db, APP_A, "ru", "ok", hours_ago=1.8)
     await _price(db, APP_B, "cn", "ok", hours_ago=1.8)
-    await _close_cycle(db, cid, hours_ago=1.0)
-    await stats_mod.record_stats(cid)
 
     result = await coverage_mod.cycle_coverage(cid)
-    assert str(APP_A) in result["perAppid"] and str(APP_B) not in result["perAppid"]
+    assert result["targetsTotal"] == 1
+    assert (result["ok"], result["unobserved"]) == (2, 0)

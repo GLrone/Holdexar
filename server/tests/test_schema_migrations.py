@@ -632,6 +632,76 @@ async def test_v11_adds_cycle_coverage_snapshot_column(tmp_path: Path, monkeypat
         await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_extra_columns_add_price_cycle_split_stats(tmp_path: Path, monkeypatch) -> None:
+    """零登记层：v15 时代存量库首启幂等补 units_missing/units_blocked 两列；
+    新装库（create_all 已带列）重放不撞重复列名。"""
+    db = tmp_path / "legacy.db"
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{db.as_posix()}", echo=False
+    )
+    monkeypatch.setattr(database_module, "get_engine", lambda: engine)
+    monkeypatch.setattr(
+        database_module,
+        "get_session_factory",
+        lambda: async_sessionmaker(engine, expire_on_commit=False),
+    )
+    # 迁移前形态：v15 时代库——price_cycles 无拆分列，版本账本停在 15
+    con = sqlite3.connect(str(db))
+    try:
+        con.execute(
+            "CREATE TABLE price_cycles ("
+            " id INTEGER PRIMARY KEY, kind VARCHAR(20), status VARCHAR(20),"
+            " scope VARCHAR(20), expected_json JSON, specs_json JSON,"
+            " started_at DATETIME, running_at DATETIME, repairing_at DATETIME,"
+            " finalizing_at DATETIME, finished_at DATETIME, error TEXT)"
+        )
+        con.execute("PRAGMA user_version = 15")
+        con.commit()
+    finally:
+        con.close()
+
+    await database_module.init_db()
+    try:
+        con = sqlite3.connect(str(db))
+        try:
+            cols = {r[1] for r in con.execute("PRAGMA table_info(price_cycles)")}
+            assert {"units_missing", "units_blocked"} <= cols
+        finally:
+            con.close()
+        # 幂等重放：第二次 init_db 不得因列已存在而抛错
+        await database_module.init_db()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_extra_columns_fresh_library_carries_split_stats(tmp_path: Path, monkeypatch) -> None:
+    """新装库：create_all 直接带拆分列，零登记层重放零增列。"""
+    db = tmp_path / "fresh.db"
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{db.as_posix()}", echo=False
+    )
+    monkeypatch.setattr(database_module, "get_engine", lambda: engine)
+    monkeypatch.setattr(
+        database_module,
+        "get_session_factory",
+        lambda: async_sessionmaker(engine, expire_on_commit=False),
+    )
+
+    await database_module.init_db()
+    try:
+        con = sqlite3.connect(str(db))
+        try:
+            cols = {r[1] for r in con.execute("PRAGMA table_info(price_cycles)")}
+            assert {"units_missing", "units_blocked"} <= cols
+        finally:
+            con.close()
+        await database_module.init_db()
+    finally:
+        await engine.dispose()
+
+
 # ── v14：game_price_history 冗余索引退役 ─────────────────────────────
 # 删的是两条重复检索路径；去重唯一索引必须留在场——它是写入侧
 # INSERT OR REPLACE 的去重依据，删了会让同刻同价反复堆积。

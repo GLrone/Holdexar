@@ -1420,16 +1420,17 @@ class DbWriter:
     async def generate_missing_tasks(
         self, cooldown_minutes: int = 10, limit_rows: int = 0
     ) -> list[dict]:
-        """从欠账账本生成定向补抓任务（按区分组批量：1 任务 = 1 区 × ≤400 appid）。
+        """从欠账账本生成定向补抓任务（按区分组批量：1 任务 = 1 区 × ≤300 appid）。
 
-        选取规则：price_status='missing' 且已过冷却（updated_at < now - cooldown）。
-        locked/blocked 不进补抓（终态合理）；missing 连补 MISSING_MAX_RETRIES 次
-        仍失败会在 mark_region_status 里转 blocked，不再出现在这里。
+        选取规则：price_status='missing' 且已过冷却（updated_at < now - cooldown），
+        空区行不在选取之列。locked/blocked 不进补抓（终态合理）；missing 连补
+        MISSING_MAX_RETRIES 次仍失败会在 mark_region_status 里转 blocked，不再
+        出现在这里。
 
         任务形状与主轮一致（type=app，批量 handler 现成消费）：同一区的欠账凑满
-        一发再发，请求次数 = 区数 × ⌈行/400⌉，不再逐行一发。limit_rows > 0 时按
-        账本年龄从老到新截断——上限挡的是「积压账本一轮吃满挤占关注层」，不是
-        请求量（请求量天然被批量压住）。
+        一发再发，请求次数 = 区数 × ⌈行/300⌉，不再逐行一发。limit_rows > 0 时
+        LIMIT 下推到 SQL 按账本年龄从老到新取——上限挡的是「积压账本一轮吃满
+        挤占关注层」，不是请求量（请求量天然被批量压住）。
 
         Returns:
             [{"type": "app", "id": "{cc}:补{n}", "region": cc,
@@ -1441,39 +1442,42 @@ class DbWriter:
             from .browse_store import DEFAULT_BATCH_SIZE  # 延迟导入：browse_store 反向依赖本模块
 
             async with get_session_factory()() as session:
+                # 空区行是「全球不可见」的尝试痕迹（无对应真实区服），发给
+                # Steam 的 country_code 会是空串，一发必 400，且永远没有
+                # bump fail_count 的路径——留在账本只会永久占位，即拾即清；
+                # 与选取解耦（不占 LIMIT 槽位），冷却窗内的新鲜空区行等过冷却再清
+                async with write_gate(WritePriority.BACKGROUND):
+                    cleared = await session.execute(
+                        delete(GameCurrentPrice).where(
+                            GameCurrentPrice.price_status == "missing",
+                            GameCurrentPrice.region_code == "",
+                            GameCurrentPrice.updated_at < cutoff,
+                        )
+                    )
+                    await session.commit()
+                removed = int(cleared.rowcount or 0)
+                if removed:
+                    log_event(
+                        logger,
+                        f"已清除 {removed} 行空区的补抓尝试痕迹",
+                        detail={"行数": removed},
+                    )
                 # 不按业务状态排除欠账：下架/免费态的 missing 行若被排除，
                 # 而它们同样不在 pool/catalog 的爬取集合里——账本行将永远
                 # 无消费路径的死账。可补抓性交给补抓本身：真不可
                 # 得的区由逐项判定重新记账并走 fail_count 穷尽转 blocked。
-                rows = (await session.execute(
+                query = (
                     select(GameCurrentPrice.appid, GameCurrentPrice.region_code)
                     .where(
                         GameCurrentPrice.price_status == "missing",
+                        GameCurrentPrice.region_code != "",
                         GameCurrentPrice.updated_at < cutoff,
                     )
                     .order_by(GameCurrentPrice.updated_at)
-                )).all()
-                # 空区行是「全球不可见」的尝试痕迹（无对应真实区服），发给
-                # Steam 的 country_code 会是空串，一发必 400，且永远没有
-                # bump fail_count 的路径——留在账本只会永久占位，即拾即清。
-                stale_empty = [int(appid) for appid, region in rows if not region]
-                if stale_empty:
-                    async with write_gate(WritePriority.BACKGROUND):
-                        await session.execute(
-                            delete(GameCurrentPrice).where(
-                                GameCurrentPrice.appid.in_(stale_empty),
-                                GameCurrentPrice.region_code == "",
-                                GameCurrentPrice.price_status == "missing",
-                            )
-                        )
-                        await session.commit()
-                    log_event(
-                        logger,
-                        f"已清除 {len(stale_empty)} 行空区的补抓尝试痕迹",
-                        detail={"行数": len(stale_empty)},
-                    )
-            if limit_rows > 0:
-                rows = rows[:limit_rows]
+                )
+                if limit_rows > 0:
+                    query = query.limit(limit_rows)
+                rows = (await session.execute(query)).all()
             by_region: dict[str, list[int]] = {}
             for appid, region in rows:
                 if not region:

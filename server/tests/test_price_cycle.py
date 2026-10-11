@@ -774,6 +774,27 @@ async def test_settle_broadcasts_once_with_cycle_id_and_status(db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_finalizing_broadcast_precedes_terminal(db, monkeypatch):
+    """轮进入收尾段即广播 price_cycle.finalizing：前端据此切「汇总中」，
+    不让岛在分钟级收尾窗口（事件检测/统计）停在更新态像卡死。"""
+    _crawl_env(monkeypatch)
+    await _seed_games(db, APPIDS)
+    types: list[str] = []
+
+    def _capture(event_type, **payload):
+        if event_type in ("price_cycle.finalizing", "price_cycle.completed"):
+            types.append(event_type)
+
+    import app.core.events as events_mod
+
+    monkeypatch.setattr(events_mod.bus, "publish", _capture)
+
+    await sched_mod._run_price_cycle([{"scope": "pool"}])
+
+    assert types == ["price_cycle.finalizing", "price_cycle.completed"]
+
+
+@pytest.mark.asyncio
 async def test_failed_round_also_broadcasts_its_terminal_status(db, monkeypatch):
     """异常轮同样广播：客户端据此知道「这一轮结束了、数据可能变了」。"""
     _crawl_env(monkeypatch)

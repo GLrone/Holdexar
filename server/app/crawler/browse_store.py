@@ -837,7 +837,9 @@ async def _follow_parent_apps(context, items: dict, appids: list[int], cc: str) 
 
     missing = [p for p in dict.fromkeys(pairs.values()) if p not in items]
     if missing:
-        pitems, _ = await StoreBrowseAPI.fetch_batch(context, missing, cc, "english", EXTRAS_ENABLED)
+        pitems, _, _ = await StoreBrowseAPI.fetch_batch(
+            context, missing, cc, "english", EXTRAS_ENABLED
+        )
         items.update(pitems)
 
     filled = 0
@@ -1330,7 +1332,7 @@ async def prefetch_lang(
         for batch in StoreBrowseAPI.plan_batches(pending, cc, lang, extras, batch_size):
             ctx = _Ctx(http_client, session)
             try:
-                items, _ = await StoreBrowseAPI.fetch_batch(ctx, batch, cc, lang, extras)
+                items, _, _ = await StoreBrowseAPI.fetch_batch(ctx, batch, cc, lang, extras)
             except Exception as e:  # noqa: BLE001 —— 单发失败不拖垮预取，条目回落库内原值
                 log_event(
                     logger,

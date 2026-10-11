@@ -93,12 +93,13 @@ class PriceCycle(Base):
     units_locked: Mapped[int | None] = mapped_column(Integer)
     # 明确失败的单元 = missing + blocked
     units_failed: Mapped[int | None] = mapped_column(Integer)
+    # missing/blocked 拆分，覆盖读路径的拆分来源
+    units_missing: Mapped[int | None] = mapped_column(Integer)
+    units_blocked: Mapped[int | None] = mapped_column(Integer)
     units_unobserved: Mapped[int | None] = mapped_column(Integer)
     coverage: Mapped[float | None] = mapped_column(Float)
     coverage_confirmed: Mapped[float | None] = mapped_column(Float)
-    # 对象级覆盖快照：{"<appid>": {"ok":n,"locked":n,"missing":n,"blocked":n,
-    # "unobserved":n}}，收敛时冻结。卡片覆盖读它而非窗口现算——当前价表的行
-    # 会随周期外写入滚动覆盖，旧窗口在活表上不可复现。
+    # 存量轮冻结快照（对象级五桶明细）；新轮不再写入，读路径走统计列
     coverage_json: Mapped[dict | None] = mapped_column(JSON)
     # 对象级：价格记录的最后观察时刻已 ≥ STALE_HOURS 的对象数（与 Freshness 同口径）
     stale_count: Mapped[int | None] = mapped_column(Integer)
@@ -349,10 +350,11 @@ async def write_stats(cycle_id: int, stats: dict) -> bool:
             cycle.units_ok = stats["unitsOk"]
             cycle.units_locked = stats["unitsLocked"]
             cycle.units_failed = stats["unitsFailed"]
+            cycle.units_missing = stats["unitsMissing"]
+            cycle.units_blocked = stats["unitsBlocked"]
             cycle.units_unobserved = stats["unitsUnobserved"]
             cycle.coverage = stats["coverage"]
             cycle.coverage_confirmed = stats["coverageConfirmed"]
-            cycle.coverage_json = stats.get("perAppid")
             cycle.stale_count = stats["staleCount"]
             cycle.duration_seconds = stats["durationSeconds"]
             cycle.stage_ms_json = stats["stageMs"]

@@ -218,6 +218,7 @@ def _reset_crawl_control_globals():
     from app.core import scheduler as sched_mod
 
     occupancy_mod.end_crawl()
+    occupancy_mod.end_maintenance()
     crawl_service._active = None
     if crawl_service._chain_stop is not None:
         crawl_service.unregister_chain_stop(crawl_service._chain_stop)

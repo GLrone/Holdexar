@@ -207,6 +207,8 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         # 钱包熔断：连续失败计数（成功清零）与冻结终态（手动刷新/换绑解锁）
         "wallet_fail_streak": "INTEGER DEFAULT 0",
         "wallet_frozen": "BOOLEAN DEFAULT 0",
+        # 官方在线状态批量通道最近一次成功采集时刻（NULL=从未查过）
+        "online_checked_at": "DATETIME",
     },
     # 愿望单账户行展示：Steam 昵称/头像（miniprofile 免 Key 通道）
     "tracked_accounts": {
@@ -276,6 +278,9 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "stage_ms_json": "JSON",
         "batches_expected": "INTEGER",
         "batches_done": "INTEGER",
+        # missing/blocked 拆分（units_failed 的拆分来源，覆盖读路径由统计列重建）
+        "units_missing": "INTEGER",
+        "units_blocked": "INTEGER",
     },
     # 体检运行台账收尾原因（值域见 proxypool/models.py HealthRun.end_reason 注释）
     "health_runs": {
