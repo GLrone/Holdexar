@@ -1,6 +1,7 @@
 """测试共享夹具与 sys.path 注入。"""
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -223,21 +224,82 @@ def _reset_crawl_control_globals():
     sched_mod._price_cycle_busy = False
 
 
-@pytest.fixture(autouse=True)
-def _isolate_data_dir(request, _db_caches_fresh_before_each):
-    """默认把数据目录隔离进一次性临时目录：任何漏桩的域模块落库都落进
-    空临时库（表不存在即响亮报错），「测试写生产库」从结构上不可能，
-    而不是依赖每个测试文件自觉打全桩（与 `_block_outbound_smtp` 同一设计：
-    桩打在公共层，漏桩的最坏后果是测试自己失败，不是污染真实数据）。
+# ── 会话级模板库：一个完整数据库，逐用例克隆 ────────────────────────
+# 模板 = 真实 init_db() 产物（create_all + 迁移链 + 区服/汇率/标签种子），
+# 与生产新装库同构，每会话只构建一次；每个用例复制文件得到完整空库，
+# 建库成本从逐用例 ~330ms 降到文件复制 ~ms。迁移/建表/加列的耦合语义
+# 仍由 test_schema_migrations 走真实 init_db 链路专项覆盖。
+_TEMPLATE: dict = {"db_file": None, "dir": None}
+_ISOLATED_DIRS: list[str] = []
 
-    真实库用例在模块级声明 `HOLDEXAR_TEST_REAL_DB = True` 显式豁免。
-    豁免按文件作用域经 `request.module` 读取，不走环境变量：进程全局的
-    环境变量一旦被某个文件设置，会给同进程其后所有文件静默关掉隔离。
-    豁免的含义是「本文件声明要对真实库断言」，不是漏桩的遮羞布。临时
-    目录随 teardown 删除；环境变量与工厂缓存一并还原，防向后续用例外溢。
-    """
+
+def _get_template_db_file():
+    """返回模板库文件路径；首次调用时以真实 init_db 构建。"""
+    if _TEMPLATE["db_file"] is not None:
+        return _TEMPLATE["db_file"]
+    import asyncio
+    import sqlite3
     import tempfile
 
+    from app.core.database import init_db
+    import app.core.database as database_module
+
+    tpl_dir = Path(tempfile.mkdtemp(prefix="holdexar-test-template-"))
+    old = os.environ.get("HOLDEXAR_DATA_DIR")
+    os.environ["HOLDEXAR_DATA_DIR"] = str(tpl_dir)
+    try:
+        database_module.get_engine.cache_clear()
+        database_module.get_session_factory.cache_clear()
+        database_module.get_settings.cache_clear()
+        asyncio.run(init_db())
+    finally:
+        if old is None:
+            os.environ.pop("HOLDEXAR_DATA_DIR", None)
+        else:
+            os.environ["HOLDEXAR_DATA_DIR"] = old
+        # 环境已还原，缓存必须重新解析，防模板目录外溢给后续用例
+        database_module.get_engine.cache_clear()
+        database_module.get_session_factory.cache_clear()
+        database_module.get_settings.cache_clear()
+    db_files = list(tpl_dir.glob("*.db"))
+    if len(db_files) != 1:
+        raise RuntimeError(f"模板库构建异常：期望 1 个 .db 文件，实际 {db_files}")
+    db_file = db_files[0]
+    conn = sqlite3.connect(db_file)
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+    _TEMPLATE["db_file"] = db_file
+    _TEMPLATE["dir"] = tpl_dir
+    return db_file
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """会话末补删临时目录：Windows 下用例内打开的连接句柄可能延迟释放，
+    逐用例 rmtree 失败的残留（holdexar-test-data-*）在会话末句柄已释放时
+    统一补删，从源头消灭 Temp 积压。"""
+    import shutil
+
+    if _TEMPLATE["dir"] is not None:
+        shutil.rmtree(_TEMPLATE["dir"], ignore_errors=True)
+        _TEMPLATE["db_file"] = None
+        _TEMPLATE["dir"] = None
+    for d in _ISOLATED_DIRS:
+        shutil.rmtree(d, ignore_errors=True)
+    _ISOLATED_DIRS.clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_data_dir(request, _db_caches_fresh_before_each):
+    """默认把数据目录隔离进一次性临时目录，库文件 = 会话模板库的克隆。
+
+    每个用例拿到与生产新装同构的完整空库（schema+种子，一次构建逐用例
+    复制），漏桩的域模块落库落进本用例临时库，「测试写生产库」从结构上
+    不可能。真实库用例仍按文件级 HOLDEXAR_TEST_REAL_DB 豁免（经
+    request.module 读取，不走进程全局环境变量）。临时目录登记进
+    _ISOLATED_DIRS，会话末统一补删。
+    """
     # 测试内 monkeypatch 与本夹具对同一环境变量的还原顺序随文件内夹具结构
     # 变化，上个用例可能留下指向已删临时目录的孤儿值——每个用例 setup 先
     # 自愈清掉本家族残留，豁免用例才不会继承死路径。
@@ -259,23 +321,14 @@ def _isolate_data_dir(request, _db_caches_fresh_before_each):
     orig_settings = database_module.get_settings
     old = os.environ.get("HOLDEXAR_DATA_DIR")
     tmp_dir = tempfile.mkdtemp(prefix="holdexar-test-data-")
+    _ISOLATED_DIRS.append(tmp_dir)
     os.environ["HOLDEXAR_DATA_DIR"] = tmp_dir
     orig_engine.cache_clear()
     orig_factory.cache_clear()
     orig_settings.cache_clear()
-    # 隔离库直接建全 schema（生产同源 init_db：create_all + 迁移链 + 基础种子）：
-    # 漏桩的跨域调用落到「表齐全的空库」上行为正常，而不是成片 no such table。
-    # 只影响本进程的临时库，数据隔离不变。建完即弃连接池——池内连接绑定已关
-    # 的 event loop，复用会在后续用例的 loop 上报 attached-to-different-loop。
-    import asyncio
-
-    from app.core.database import init_db
-
-    async def _bootstrap_isolated_db() -> None:
-        await init_db()
-        await database_module.get_engine().dispose()
-
-    asyncio.run(_bootstrap_isolated_db())
+    # 隔离库 = 完整模板库的克隆（schema+种子与生产新装同源），不再逐用例
+    # 重跑 init_db 建库链；建库/迁移语义的覆盖归 test_schema_migrations。
+    shutil.copyfile(_get_template_db_file(), Path(tmp_dir) / _get_template_db_file().name)
     yield
     os.environ.pop("HOLDEXAR_DATA_DIR", None)
     if old is not None:

@@ -27,8 +27,10 @@ _BOARD_LABELS = {
     "comingsoon": "即将推出",
     "specials": "特惠榜",
 }
+# 钱包轮转失败标签。frozen 不在表内：冻结只是熔断终态，真因由 service 按
+# 最后一次失败归因后自带（见 account.service._frozen_reason），写成「凭据
+# 已失效」会把网络/风控故障顶到用户头上
 _WALLET_REASON_LABELS = {
-    "frozen": "凭据已失效",
     "backoff": "已退避重试",
     "no_cookie": "未绑定 Cookie",
 }
@@ -713,12 +715,13 @@ async def _startup_pool_runtime() -> None:
     try:
         data_dir = get_settings().data_dir
         exe_path = str(_cm.kernel_exe(data_dir))
-        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+        # 会话只承载读取：ensure 的写入各自进闸（订阅同步段闸内提交、事件独立
+        # 落库），内核 start/HTTP 等待不进闸——持闸横跨启动段会饿死全体写者
+        async with get_session_factory()() as session:
             result = await _bs.ensure_pool_runtime(
                 session, data_dir=data_dir, runtime=_cm.pool_runtime,
                 exe_path=exe_path, now=datetime.now(),
             )
-            await session.commit()
         log_event(
             logger,
             "代理池运行时已就绪" if result.ready else "代理池运行时不可用",
@@ -732,12 +735,14 @@ async def _startup_pool_runtime() -> None:
         if before:
             return  # 库里已有出口身份（重启场景）：不重复探测，交给维护周期刷新
         base, secret = controller_endpoint_of(data_dir)
-        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+        # 探测不进闸（exit_ip_check_pool 内部逐块过闸提交），外层只兜收尾提交
+        async with get_session_factory()() as session:
             outcomes = await _sched.run_startup_l1(
                 session, data_dir=data_dir, controller_url=base, secret=secret,
                 now=datetime.now(),
             )
-            await session.commit()
+            async with write_gate(WritePriority.BACKGROUND):
+                await session.commit()
         log_event(
             logger,
             "首次探测代理出口身份完成",
@@ -754,12 +759,12 @@ async def _startup_pool_runtime() -> None:
         from app.domains.proxypool.scheduling import request_rebuild, run_pending_rebuild
 
         request_rebuild()
-        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+        # 重建段零 DB 写入（文件渲染+内核操作），不持闸
+        async with get_session_factory()() as session:
             rebuilt = await run_pending_rebuild(
                 session, data_dir=data_dir, controller_url=base, secret=secret,
                 runtime=_cm.pool_runtime, exe_path=exe_path,
             )
-            await session.commit()
         if rebuilt is not None:
             log_event(
                 logger,
@@ -799,12 +804,12 @@ async def _startup_subscription_sync() -> None:
 
     try:
         data_dir = get_settings().data_dir
-        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+        # 下载在 sync_subscriptions 闸外完成、落库段闸内提交；会话只承载读取与签名对比
+        async with get_session_factory()() as session:
             before = await _bs.pool_signature(session)
             sync = await _bs.sync_subscriptions(
                 session, data_dir=data_dir, now=datetime.now(), only_auto=True
             )
-            await session.commit()
             after = await _bs.pool_signature(session)
         failed = len(sync.failures)
         if after == before:
@@ -823,12 +828,12 @@ async def _startup_subscription_sync() -> None:
             )
             return
         _sched.request_rebuild()
-        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+        # 重建段零 DB 写入（文件渲染+内核操作），不持闸
+        async with get_session_factory()() as session:
             rebuilt = await _sched.run_pending_rebuild(
                 session, data_dir=data_dir, controller_url=base, secret=secret,
                 runtime=_cm.pool_runtime, exe_path=str(_cm.kernel_exe(data_dir)),
             )
-            await session.commit()
         log_event(
             logger,
             "订阅同步触发代理池重建",
@@ -1032,12 +1037,13 @@ async def _job_subscription_refresh() -> None:
         from app.domains.proxypool import bootstrap as _bs
 
         data_dir = get_settings().data_dir
-        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+        # 会话只承载读取：分流内写入各自进闸（订阅同步闸内提交、bootstrap 事件
+        # 独立落库），runtime_ready 探测与内核操作不进闸
+        async with get_session_factory()() as session:
             triage = await _bs.handle_subscription_refresh(
                 session, data_dir=data_dir, runtime=_cm.pool_runtime,
                 exe_path=str(_cm.kernel_exe(data_dir)), now=datetime.now(),
             )
-            await session.commit()
         log_event(
             logger,
             "订阅刷新后代理池已分流处理",

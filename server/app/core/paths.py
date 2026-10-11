@@ -2,9 +2,11 @@
 纯标准库（os/sys/pathlib）：config 与桌面壳必须对「data/ 在哪」同答案，且启动器
 在导入任何第三方库之前就可能要它。判定顺序（先到先得）：①环境变量 DATA_DIR
 显式覆盖 ②程序目录 portable.flag 便携声明 ③程序目录内已有 data/<slug>.db
-原地续用 ④未打包开发态用机器级 <slug>-dev（与打包态物理隔离，运行时写入不落
-工作树）⑤打包态落 %LOCALAPPDATA%<slug>（解压升级/临时解包/删目录重装都不产生
-空白环境）。机器级目录不可写的极端环境回退程序目录旁 data/，启动告警点名。
+原地续用 ④未打包开发态读工作树指针文件里写明的数据目录 ⑤开发态机器级
+<slug>-dev（与打包态物理隔离，运行时写入不落工作树）⑥打包态机器级已有库
+原地续用 ⑦打包态新装落程序目录旁 data/（与解压位置同盘），该目录不可写才回落
+机器级 <slug>。机器级目录不可写的极端环境同样回退程序目录旁 data/，启动告警
+点名。指针目标不可写时同样落回 ⑤，不因一处配置让程序起不来。
 """
 from __future__ import annotations
 
@@ -18,6 +20,25 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]  # server/app/core/paths.py -
 
 # 便携模式显式标记（程序目录内放一个同名空文件即启用）
 PORTABLE_FLAG = "portable.flag"
+
+# 开发态数据目录指针（工作树内的文本文件，内容一行绝对路径即生效）
+DEV_POINTER = f"{APP_SLUG}-dev-home.txt"
+
+
+def read_dev_pointer(base: Path | None = None) -> Path | None:
+    """取指针文件里写明的开发态数据目录；缺失、空行、注释行、非绝对路径都算未配置。"""
+    path = (base or app_dir()) / DEV_POINTER
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    for line in lines:
+        entry = line.strip()
+        if not entry or entry.startswith("#"):
+            continue
+        candidate = Path(entry)
+        return candidate if candidate.is_absolute() else None
+    return None
 
 
 def is_frozen() -> bool:
@@ -113,12 +134,26 @@ def resolve_data_dir(slug: str = APP_SLUG, env_prefix: str = ENV_PREFIX) -> Path
     if (base / "data" / data_dir_filename(slug)).is_file():
         return _ensure(base / "data")
 
-    # 开发态：机器级 dev 目录，与打包态数据物理隔离，工作树内不写任何运行时数据
+    # 开发态：指针文件写明的目录优先，其次机器级 dev 目录；两者都让运行时写入不落工作树
     if not is_frozen():
+        pointed = read_dev_pointer()
+        if pointed is not None:
+            try:
+                return _ensure(pointed)
+            except OSError:
+                pass
         return _first_writable(dev_machine_candidates(slug), base / "data")
 
-    # 打包态新装：机器级数据目录
-    return _first_writable(machine_candidates(slug), base / "data")
+    # 打包态机器级存量库原地续用：删旧目录重装、换解压位置都不产生空白环境
+    for candidate in machine_candidates(slug):
+        if (candidate / data_dir_filename(slug)).is_file():
+            try:
+                return _ensure(candidate)
+            except OSError:
+                continue
+
+    # 打包态新装：数据与解压位置同盘；程序目录不可写（只读盘/受限目录）才落机器级
+    return _first_writable([base / "data", *machine_candidates(slug)], base / "data")
 
 
 def describe_layout(data_dir: Path, slug: str = APP_SLUG) -> str:
@@ -139,15 +174,20 @@ def describe_layout(data_dir: Path, slug: str = APP_SLUG) -> str:
         if (app_dir() / "data" / data_dir_filename(slug)).is_file():
             return "legacy"
         return "appdir" if is_frozen() else "dev"
+    if not is_frozen():
+        pointed = read_dev_pointer()
+        if pointed is not None and path == pointed:
+            return "dev-pointer"
     return "custom"
 
 
 LAYOUT_LABEL = {
     "machine": "系统数据目录（与程序目录解耦，升级/重装/换目录均不受影响）",
     "dev-machine": "开发态机器级目录（与打包态数据物理隔离，推荐）",
+    "dev-pointer": "开发态自定义目录（工作树内指针文件指定，运行时写入不落仓库）",
     "portable": "便携模式（程序目录 data/，随包整体迁移）",
     "legacy": "程序目录 data/ 内有库（原地使用；升级需整目录保留）",
-    "appdir": "程序目录 data/（系统数据目录不可写时的兜底）",
+    "appdir": "程序目录 data/（与程序同盘，随解压位置走；系统数据目录不可写时也是兜底）",
     "dev": "程序目录 data/（开发态兜底：机器级目录全不可写时才会走到，不推荐）",
     "custom": "自定义数据目录（环境变量指定）",
 }
@@ -189,6 +229,7 @@ def layout_warning(data_dir: Path | str, slug: str = APP_SLUG) -> str:
 
 __all__ = [
     "APP_SLUG",
+    "DEV_POINTER",
     "ENV_PREFIX",
     "LAYOUT_LABEL",
     "PORTABLE_FLAG",
@@ -201,5 +242,6 @@ __all__ = [
     "is_inside",
     "layout_warning",
     "machine_candidates",
+    "read_dev_pointer",
     "resolve_data_dir",
 ]
