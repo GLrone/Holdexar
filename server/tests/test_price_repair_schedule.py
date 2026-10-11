@@ -39,61 +39,26 @@ APPID4 = 997_004  # ok 正常行——与修复无关
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 't.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    import app.core.database as database_module
+def db(monkeypatch):
+    from app.core.database import get_session_factory
 
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
+
     # service/db_writer/settings 均模块级 import factory——逐个打桩；
     # settings 漏桩会让 price_auto_enabled 读真实库的总开关，
     # 本机把 crawl.auto_price 关掉时主轮/修复轮全部提前返回
-    monkeypatch.setattr(crawl_service, "get_session_factory", lambda: factory)
-    import app.crawler.db_writer as dw
-    import app.domains.settings.service as settings_service
     # 写路径经 steam_events.active_event_key_at 打活动标记——该域也是
     # 模块级 import factory，漏桩会摸到 lru 缓存的旧引擎（无表库）
-    import app.domains.steam_events.service as steam_events_service
 
-    monkeypatch.setattr(dw, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(steam_events_service, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(settings_service, "get_session_factory", lambda: factory)
     # 空壳轮窗口判定在 coverage 域——漏桩会把终态判定指向生产库
-    import app.domains.crawl.coverage as crawl_coverage
 
-    monkeypatch.setattr(crawl_coverage, "get_session_factory", lambda: factory)
     # 收尾链（终态判定 / 事件 / 通知 / 事实留痕）各自模块级持 factory 引用，
     # 漏桩的模块会把 Cycle 收尾写进隔离外的库——逐个对齐本文件工厂
-    import app.domains.crawl.cycle as cycle_mod
 
-    monkeypatch.setattr(cycle_mod, "get_session_factory", lambda: factory)
-    import app.core.orchestration as orchestration_mod
 
-    monkeypatch.setattr(orchestration_mod, "get_session_factory", lambda: factory)
-    import app.domains.crawl.events as crawl_events
-    import app.domains.crawl.stats as crawl_stats
-    import app.domains.notifications.service as notification_service
-
-    monkeypatch.setattr(crawl_events, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(crawl_stats, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(notification_service, "get_session_factory", lambda: factory)
     # 让路重试与空壳重试的等待拍归零：本文件断言编排语义，不测等待时长
     monkeypatch.setattr(sched_mod, "_SPEC_YIELD_WAIT_SECONDS", 0)
-    return factory
 
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    # 价格写入路径会查 steam_events（活动日历快照标签）——单跑本文件时
-    # 没有别处 import 该模型，显式导入建表，消除与其他文件的顺序依赖
-    import app.domains.steam_events.models  # noqa: F401
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
+    return get_session_factory()
 @pytest_asyncio.fixture(autouse=True)
 async def _seed(db):
     now = get_beijing_time_obj().replace(tzinfo=None)

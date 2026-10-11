@@ -36,63 +36,10 @@ APPIDS = (760001, 760002)
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 't.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    import app.core.database as database_module
-    import app.crawler.db_writer as dw
+def db():
+    from app.core.database import get_session_factory
 
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    # cycle / crawl.service / db_writer / monitoring 都是模块级 import 的
-    # factory——逐个打桩，漏一个就会读到生产库
-    monkeypatch.setattr(cycle_mod, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(crawl_service, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(dw, "get_session_factory", lambda: factory)
-    import app.domains.monitoring.service as monitoring_service
-
-    monkeypatch.setattr(monitoring_service, "get_session_factory", lambda: factory)
-    # 写路径经 steam_events.active_event_key_at 打活动标记——该域也是
-    # 模块级 import factory，漏桩会摸到 lru 缓存的旧引擎（无表库）
-    import app.domains.steam_events.service as steam_events_service
-
-    monkeypatch.setattr(steam_events_service, "get_session_factory", lambda: factory)
-    import app.core.orchestration as orchestration_mod
-
-    # 编排事件独立会话形态也经模块级 factory，漏打桩会把测试事件写进生产库
-    monkeypatch.setattr(orchestration_mod, "get_session_factory", lambda: factory)
-    # 收尾链的系列归组 / 免费脱池也在本文件任务路径上（现已转后台）：
-    # 同样模块级 import 了 factory，漏了就会读写生产库
-    import app.domains.games.series as games_series
-    import app.domains.wishlist.service as wishlist_service
-
-    monkeypatch.setattr(games_series, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(wishlist_service, "get_session_factory", lambda: factory)
-    # 周期收尾的事件检测 / 通知投递 / 统计落库同样模块级 import factory——
-    # 生产实例在跑时漏一个就是每测一次 60s busy_timeout 等锁
-    import app.domains.crawl.events as crawl_events
-    import app.domains.crawl.stats as crawl_stats
-    import app.domains.notifications.service as notification_service
-
-    monkeypatch.setattr(crawl_events, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(crawl_stats, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(notification_service, "get_session_factory", lambda: factory)
-    # 空壳轮窗口判定与卡片覆盖选轮都在 coverage 域——漏打桩会让终态判定
-    # 读到生产库的最近写入，把零写入模拟轮误判成有写入
-    import app.domains.crawl.coverage as crawl_coverage
-
-    monkeypatch.setattr(crawl_coverage, "get_session_factory", lambda: factory)
-    return factory
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
-    crawl_service._active = None
-    sched_mod._price_cycle_busy = False
+    return get_session_factory()
 
 
 def _crawl_env(monkeypatch):

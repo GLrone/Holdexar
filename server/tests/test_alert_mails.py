@@ -138,30 +138,22 @@ async def _fake_primary():
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    import app.core.database as database_module
+def db(monkeypatch):
+    from app.core.database import get_session_factory
 
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
 
     from app.domains.alerts import service as alerts
 
-    monkeypatch.setattr(alerts, "get_session_factory", lambda: factory)
     # settings 域持有 core 原工厂的直接引用（from-import 绑定），不补桩会在
     # 隔离夹具的空临时库上查询 app_settings 而报 no such table
-    monkeypatch.setattr(alerts.settings_service, "get_session_factory", lambda: factory)
     # 号主区直接对 alerts 引用的账号域函数打桩（账号域内部的 session
     # factory 绑定不可替换，没必要为取一个 region_code 走全链路）
     monkeypatch.setattr(alerts.account_service, "get_primary_account", _fake_primary)
     monkeypatch.setattr(alerts.regions_service, "list_regions", _fake_regions)
     monkeypatch.setattr(alerts.settings_service, "set_value", _fake_set_value)
     monkeypatch.setattr(alerts.settings_service, "get_value", _fake_get_value)
-    return factory
 
-
+    return get_session_factory()
 async def _fake_regions():
     return [{"code": "cn", "name": "国区"}, {"code": "ar", "name": "阿根廷"}]
 
@@ -179,15 +171,6 @@ _sent_store: dict = {}
 
 @pytest_asyncio.fixture(autouse=True)
 async def _schema(db, monkeypatch):
-    import app.domains.games.models  # noqa: F401
-    import app.domains.alerts.models  # noqa: F401
-    import app.domains.account.models  # noqa: F401
-    import app.domains.regions.models  # noqa: F401
-    import app.domains.settings.models  # noqa: F401
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
     _sent_store.clear()
     _FakeSMTP.last_subject = None
     _FakeSMTP.last_body = None

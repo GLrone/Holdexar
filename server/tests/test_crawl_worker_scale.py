@@ -27,34 +27,18 @@ from app.domains.settings import service as settings_service
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    import app.core.database as database_module
+def db(monkeypatch):
+    from app.core.database import get_session_factory
 
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    for mod in (crawl_service, proxies_service, settings_service):
-        monkeypatch.setattr(mod, "get_session_factory", lambda: factory)
+
     # 内核没跑：Clash 一律记 0，available 只由手动池贡献
     monkeypatch.setattr(
         clash_manager.runtime,
         "status",
         lambda: {"running": False, "port": None, "configPath": None},
     )
-    return factory
 
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    import app.domains.proxies.models  # noqa: F401
-    import app.domains.settings.models  # noqa: F401
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
+    return get_session_factory()
 async def _seed_proxies(db, *, ok=0, failed=0, disabled=0) -> None:
     """种手动池行：ok = 可用出口；failed/disabled 不进 available。"""
     async with db() as session:

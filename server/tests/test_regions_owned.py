@@ -14,17 +14,11 @@ from app.domains.settings import service as settings_service
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    import app.core.database as database_module
+def db(monkeypatch):
+    from app.core.database import get_session_factory
+
     from app.domains.bundles import service as bundles_service
 
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(settings_service, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(regions_service, "get_session_factory", lambda: factory)
 
     # set_enabled 会联动捆绑包排序快照整库重建（追踪区集合变化的写侧事件）：
     # 本文件只测 regions 域语义，打桩隔离，避免触碰真实库
@@ -32,18 +26,8 @@ def db(tmp_path, monkeypatch):
         return 0
 
     monkeypatch.setattr(bundles_service, "refresh_bundle_sort_cache", _noop_rebuild)
-    return factory
 
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    import app.domains.regions.models  # noqa: F401
-    import app.domains.settings.models  # noqa: F401
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
+    return get_session_factory()
 @pytest.mark.asyncio
 async def test_owned_regions_default_follow(db):
     """缺省 = None（跟随启用集），读写往返一致。"""

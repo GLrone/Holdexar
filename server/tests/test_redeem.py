@@ -5,8 +5,10 @@
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -14,52 +16,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.core.database import Base
 from app.domains.account import service as account_service
 from app.domains.redeem import service as redeem_service
+from app.domains.redeem.models import RAW_MAX, RedeemActivation
 from app.domains.settings import service as settings_service
 
 PRIMARY = "76561198000000001"
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    """独立临时库：替换 session factory，隔离 settings 键值读写。"""
-    import app.core.database as database_module
+def db():
+    from app.core.database import get_session_factory
 
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(settings_service, "get_session_factory", lambda: factory)
-    # redeem 经 account_service.get_cookies() 读表：模块级
-    # factory 引用必须单独打桩，否则直读生产库（真实 Cookie/真实激活请求泄漏）
-    monkeypatch.setattr(account_service, "get_session_factory", lambda: factory)
-    return factory
-
-
+    return get_session_factory()
 @pytest_asyncio.fixture(autouse=True)
 async def _clean_act_log():
     """清空模块级激活计数（进程内滑动窗口，跨用例会泄漏）。"""
     redeem_service._ACT_LOG.clear()
     yield
     redeem_service._ACT_LOG.clear()
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    """临时库建表 + 注册全部模型。"""
-    import app.domains.account.models  # noqa: F401
-    import app.domains.alerts.models  # noqa: F401
-    import app.domains.crawl.models  # noqa: F401
-    import app.domains.family.models  # noqa: F401
-    import app.domains.games.models  # noqa: F401
-    import app.domains.proxies.models  # noqa: F401
-    import app.domains.rates.models  # noqa: F401
-    import app.domains.regions.models  # noqa: F401
-    import app.domains.settings.models  # noqa: F401
-    import app.domains.wishlist.models  # noqa: F401
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
 
 
 class FakeResponse:
@@ -323,6 +296,131 @@ async def test_activation_count_per_account(db, monkeypatch):
     out = await redeem_service.quota_status()
     assert out["steamId"] == "76561198000000002" and out["used"] == 0
     redeem_service._ACT_LOG.clear()
+
+
+@pytest.mark.asyncio
+async def test_activation_ledger_rows_for_each_status(db, monkeypatch):
+    """激活结果落账：ok/own/fail 各一行，key/subId/说明/账号随行。"""
+    await settings_service.set_value(
+        "account.steam_cookies",
+        "sessionid=abc123; steamLoginSecure=76561198000000001%7C%7Cjwt-token",
+    )
+    cases = [
+        (FakeResponse(payload={
+            "success": 1,
+            "purchase_receipt_info": {"line_items": [
+                {"packageid": 307574, "line_item_description": "Dark Envoy"}]},
+        }), "ok", "307574"),
+        (FakeResponse(payload={"success": 2, "purchase_result_details": 9}), "own", ""),
+        (FakeResponse(payload={"success": 2, "purchase_result_details": 15}), "fail", ""),
+    ]
+    for resp, status, subid in cases:
+        monkeypatch.setattr(redeem_service, "_post_steam", _async(resp))
+        await redeem_service.activate_key("AAAAA-BBBBB-CCCCC")
+    async with db() as session:
+        rows = (await session.execute(
+            select(RedeemActivation).order_by(RedeemActivation.id)
+        )).scalars().all()
+    assert [r.status for r in rows] == ["ok", "own", "fail"]
+    assert all(r.kind == "cdk" for r in rows)
+    assert all(r.product_key == "AAAAA-BBBBB-CCCCC" for r in rows)
+    assert rows[0].subid == "307574" and rows[0].sub_name == "Dark Envoy"
+    assert rows[0].detail == "激活成功"
+    assert rows[0].steamid == PRIMARY
+    assert "purchase_receipt_info" in rows[0].raw
+    # 日志侧 key 只留掩码（账本表存原文，日志不整码明文）
+    assert redeem_service._mask_key("ABCDE-FGHIJ-KLMNP") == "ABCDE**********NP"
+
+
+@pytest.mark.asyncio
+async def test_free_claim_ledger_row_kind_free(db, monkeypatch):
+    """免费领取落账：来源类型 free、subid 随行、key 列为空。"""
+    await settings_service.set_value(
+        "account.steam_cookies",
+        "sessionid=abc123; steamLoginSecure=76561198000000001%7C%7Cjwt-token",
+    )
+    monkeypatch.setattr(
+        redeem_service, "_post_steam",
+        lambda *a, **k: _async(FakeResponse(status_code=302, location="/account"))(),
+    )
+    monkeypatch.setattr(redeem_service, "_redirect_chain_hits_login", _async(False))
+    r = await redeem_service.add_free_license(927875)
+    assert r["status"] == "ok"
+    async with db() as session:
+        row = (await session.execute(select(RedeemActivation))).scalars().one()
+    assert row.kind == "free" and row.status == "ok"
+    assert row.subid == "927875" and row.product_key == ""
+    assert row.steamid == PRIMARY
+
+
+@pytest.mark.asyncio
+async def test_list_activations_order_and_paging(db, monkeypatch):
+    """激活历史读取：时间倒序（同秒按 id 倒序）+ limit/offset 分页 + total。"""
+    await settings_service.set_value(
+        "account.steam_cookies",
+        "sessionid=abc123; steamLoginSecure=76561198000000001%7C%7Cjwt-token",
+    )
+    keys = ["AAAAA-BBBBB-CCCC1", "AAAAA-BBBBB-CCCC2", "AAAAA-BBBBB-CCCC3"]
+    monkeypatch.setattr(
+        redeem_service, "_post_steam",
+        lambda *a, **k: _async(FakeResponse(payload={"success": 2, "purchase_result_details": 15}))(),
+    )
+    for k in keys:
+        await redeem_service.activate_key(k)
+    page1 = await redeem_service.list_activations(limit=2, offset=0)
+    assert page1["total"] == 3
+    assert [r["key"] for r in page1["rows"]] == list(reversed(keys))[:2]
+    page2 = await redeem_service.list_activations(limit=2, offset=2)
+    assert [r["key"] for r in page2["rows"]] == [keys[0]]
+    # limit 夹取：超上限收 200，非法值不炸
+    out = await redeem_service.list_activations(limit=99999, offset=-5)
+    assert len(out["rows"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_ledger_raw_truncated(db):
+    """超长回执原文落账被截断到 RAW_MAX：不炸、不整段入库。"""
+    big = "x" * (RAW_MAX * 3)
+    await redeem_service._record_ledger(
+        kind="cdk", status="fail", product_key="AAAAA-BBBBB-CCCCC",
+        detail="测试截断", raw=big, steamid=PRIMARY,
+    )
+    async with db() as session:
+        row = (await session.execute(select(RedeemActivation))).scalars().one()
+    assert len(row.raw) == RAW_MAX
+    # 正常激活链路的 raw 先按前端展示口径截到 2000，再受 RAW_MAX 兜底
+    await redeem_service._record_ledger(
+        kind="cdk", status="fail", product_key="BBBBB-CCCCC-DDDDD",
+        detail="测试上限", raw="y" * 5000, steamid=PRIMARY,
+    )
+    async with db() as session:
+        rows = (await session.execute(
+            select(RedeemActivation).order_by(RedeemActivation.id)
+        )).scalars().all()
+    assert len(rows[1].raw) == 5000
+    assert rows[0].product_key == "AAAAA-BBBBB-CCCCC"
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_ledger_row(db, monkeypatch):
+    """传输层失败（网络不通/超时）同样落 fail 一行；Steam 未收到，不消耗激活次数。"""
+    await settings_service.set_value(
+        "account.steam_cookies",
+        "sessionid=abc123; steamLoginSecure=76561198000000001%7C%7Cjwt-token",
+    )
+
+    def boom(*a, **k):
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(redeem_service, "_post_steam", boom)
+    r = await redeem_service.activate_key("AAAAA-BBBBB-CCCCC")
+    assert r["status"] == "fail" and "激活请求失败" in r["detail"]
+    out = await redeem_service.quota_status()
+    assert out["used"] == 0
+    async with db() as session:
+        row = (await session.execute(select(RedeemActivation))).scalars().one()
+    assert row.status == "fail"
+    assert row.product_key == "AAAAA-BBBBB-CCCCC" and row.raw == ""
 
 
 def _async(value):

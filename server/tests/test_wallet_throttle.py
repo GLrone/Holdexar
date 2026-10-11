@@ -7,6 +7,8 @@
 3. 429/403 风控信号：直接进 30min 长冷却（不走普通递增梯度）。
 4. 熔断：连续 5 次失败进 10min 慢车道，累计 10 次冻结终态（自动轮转
    停止请求）；手动刷新余额（force）或换绑 Cookie 解锁并清零重计。
+5. 失败归因二分：冻结原因文案按最后一次失败（网络 / 风控 / 登录过期）
+   分流，不一律写成「凭据已失效」；只有全通道都卡在传输层才归网络不通。
 """
 import asyncio
 import sys
@@ -21,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.database import Base
 from app.domains.account import service as account_service
+from app.domains.account import steam_wallet
 from app.domains.account.steam_wallet import _from_raw_amounts
 from app.domains.settings import service as settings_service
 
@@ -33,30 +36,10 @@ def cookie(sid: str, token: str = "jwt-token") -> str:
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    import app.core.database as database_module
+def db():
+    from app.core.database import get_session_factory
 
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(account_service, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(settings_service, "get_session_factory", lambda: factory)
-    return factory
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    import app.domains.account.models  # noqa: F401
-    import app.domains.crawl.models  # noqa: F401
-    import app.domains.settings.models  # noqa: F401
-    import app.domains.wishlist.models  # noqa: F401
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
+    return get_session_factory()
 @pytest_asyncio.fixture(autouse=True)
 async def _isolation(monkeypatch):
     """网络层全隔离 + jitter 置零 + 心跳复位（每用例独立进程态）。"""
@@ -454,3 +437,94 @@ async def test_breaker_slow_lane_keeps_rate_limit_floor(db, monkeypatch):
     result = await account_service.sync_wallets_rotational()
     assert result["skipped"] == 1
     assert (await account_service._get_row(A)).wallet_fail_streak == 5
+
+
+# ── 5. 失败归因二分 ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_frozen_reason_splits_by_last_failure(db, monkeypatch):
+    """冻结原因按最后一次失败分流：网络不通与真·登录过期不能共用一句「凭据已失效」。"""
+
+    async def network_fail(cookies, *, verify=None, proxy_url=None):
+        raise account_service.WalletFetchError(
+            steam_wallet.WALLET_NETWORK_ERROR_HEAD
+            + "_fetch_store_account: ConnectError: all attempts failed"
+        )
+
+    monkeypatch.setattr(account_service, "fetch_wallet", network_fail)
+    await account_service.save_cookies(cookie(A))
+    for _ in range(account_service._WALLET_BREAKER_FREEZE_AFTER):
+        await account_service._sync_wallet_of(A)
+    assert (await account_service._get_row(A)).wallet_frozen is True
+
+    result = await account_service.sync_wallets_rotational()
+    assert result["frozen"] == 1
+    assert result["reasons"] == {
+        "网络或代理通道不通，已停自动重试（手动刷新余额解锁）": 1
+    }
+
+    # 换成真·登录过期：必须换分支（出路是重新登录，不是刷新余额）
+    await account_service._save_wallet(
+        A,
+        error=account_service.SESSION_EXPIRED_MESSAGE,
+        now=account_service._naive_now(),
+    )
+    result = await account_service.sync_wallets_rotational()
+    assert result["reasons"] == {"登录已过期，等待重新登录": 1}
+
+
+@pytest.mark.asyncio
+async def test_frozen_reason_flags_rate_limit(db, monkeypatch):
+    """风控冻结：归因落到风控本身，避免被读成「Cookie 坏了再去重登」。"""
+
+    async def limited_fetch(cookies, *, verify=None, proxy_url=None):
+        raise steam_wallet.WalletRateLimitedError(
+            "Steam 节点风控（HTTP 429，_fetch_store_account）——请切换 Clash 节点或稍后再试"
+        )
+
+    monkeypatch.setattr(account_service, "fetch_wallet", limited_fetch)
+    await account_service.save_cookies(cookie(A))
+    for _ in range(account_service._WALLET_BREAKER_FREEZE_AFTER):
+        await account_service._sync_wallet_of(A)
+
+    result = await account_service.sync_wallets_rotational()
+    assert result["reasons"] == {
+        "Steam 风控拒绝，已停自动重试（手动刷新余额解锁）": 1
+    }
+
+
+@pytest.mark.asyncio
+async def test_fetch_wallet_head_splits_transport_from_http(monkeypatch):
+    """归因源头：只有全通道卡在传输层才写「网络不通」；拿到 HTTP 响应不算。"""
+    import httpx
+
+    class _Client:
+        def __init__(self, fail: str) -> None:
+            self.fail = fail
+
+        async def get(self, url, **kwargs):
+            if self.fail == "transport":
+                raise httpx.ConnectError("All connection attempts failed")
+            request = httpx.Request("GET", str(url))
+            raise httpx.HTTPStatusError(
+                "Server error '500'",
+                request=request,
+                response=httpx.Response(500, request=request),
+            )
+
+    mode = "transport"
+
+    async def _client_factory(proxy_url, verify, timeout, *, fresh=False):
+        return _Client(mode)
+
+    monkeypatch.setattr(steam_wallet, "_borrow_client", _client_factory)
+
+    with pytest.raises(steam_wallet.WalletFetchError) as info:
+        await steam_wallet.fetch_wallet(cookie(A), verify=True)
+    assert str(info.value).startswith(steam_wallet.WALLET_NETWORK_ERROR_HEAD)
+
+    mode = "http"
+    with pytest.raises(steam_wallet.WalletFetchError) as info:
+        await steam_wallet.fetch_wallet(cookie(A), verify=True)
+    assert str(info.value).startswith(steam_wallet.WALLET_AUTH_ERROR_HEAD)

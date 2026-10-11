@@ -38,52 +38,10 @@ from app.domains.monitoring import models as _monitoring_models  # noqa: F401
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 't.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    import app.core.database as database_module
+def db():
+    from app.core.database import get_session_factory
 
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(crawl_service, "get_session_factory", lambda: factory)
-    # monitoring 也是模块级 import 的 factory——漏桩会读到生产库
-    import app.domains.monitoring.service as monitoring_service
-
-    monkeypatch.setattr(monitoring_service, "get_session_factory", lambda: factory)
-    import app.crawler.db_writer as dw
-
-    monkeypatch.setattr(dw, "get_session_factory", lambda: factory)
-    # 空壳轮窗口判定在 coverage 域——漏桩会把终态判定指向生产库
-    import app.domains.crawl.coverage as crawl_coverage
-
-    monkeypatch.setattr(crawl_coverage, "get_session_factory", lambda: factory)
-    # 价格写路径经 steam_events.active_event_key_at 打活动标记——同款
-    # 模块级 factory，漏桩会摸到 lru 缓存的旧引擎（无表库）
-    import app.domains.steam_events.service as steam_events_service
-
-    monkeypatch.setattr(steam_events_service, "get_session_factory", lambda: factory)
-    return factory
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    # 进程内运行状态跨文件不隔离：占用（crawler/occupancy）与活动任务句柄是模块级
-    # 状态，别的测试文件留下的占用会让这里的 start_job 正确地拒绝启动——那会把
-    # 「占用生效」误报成「周期没跑」。进来前先清干净（与 test_proxypool_scheduling
-    # 的同名约定一致）。
-    from app.crawler.occupancy import crawler_busy, end_crawl
-
-    if crawler_busy():
-        end_crawl()
-    crawl_service._active = None
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
-    if crawler_busy():
-        end_crawl()
-    crawl_service._active = None
-    sched_mod._price_cycle_busy = False
+    return get_session_factory()
 
 
 def _crawl_env(monkeypatch):

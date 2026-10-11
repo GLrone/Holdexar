@@ -23,36 +23,18 @@ APPID_B = 996_102
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 't.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    import app.core.database as database_module
+def db(monkeypatch):
+    from app.core.database import get_session_factory
 
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    import app.crawler.db_writer as dw
 
-    monkeypatch.setattr(dw, "get_session_factory", lambda: factory)
     from app.domains.steam_events import service as steam_events_service
 
     async def _no_event(_ts):
         return None
 
     monkeypatch.setattr(steam_events_service, "active_event_key_at", _no_event)
-    return factory
 
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    import app.domains.crawl.models  # noqa: F401
-    import app.domains.games.models  # noqa: F401
-    import app.domains.rates.models  # noqa: F401
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
+    return get_session_factory()
 def _game(appid, name="批量测试"):
     return {"appid": appid, "name": name, "updated_at": datetime.now()}
 

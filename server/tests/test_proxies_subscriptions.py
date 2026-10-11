@@ -32,29 +32,10 @@ async def _no_proxy() -> None:
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    import app.core.database as database_module
+def db():
+    from app.core.database import get_session_factory
 
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(proxies_service, "get_session_factory", lambda: factory)
-    # 启动候选读「最近显式选中」KV，settings 会话同样打桩到本库
-    monkeypatch.setattr(settings_service, "get_session_factory", lambda: factory)
-    return factory
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    import app.domains.proxies.models  # noqa: F401
-    import app.domains.settings.models  # noqa: F401
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
+    return get_session_factory()
 async def _add_sub(db, *, kind: str = "clash", last_stats: dict | None = None) -> int:
     async with db() as session:
         sub = ProxySubscription(kind=kind, url=SUB_URL, last_stats=last_stats)
@@ -113,9 +94,11 @@ async def test_update_subscription_url_change_triggers_sync(db, monkeypatch):
     """换链接的 clash 订阅保存即自动重拉：synced=True，节点/流量并道回传。"""
     sub_id = await _add_sub(db)
     calls: list[int] = []
+    switches: list[bool] = []
 
-    async def fake_refresh(sid):
+    async def fake_refresh(sid, *, auto_switch=False):
         calls.append(sid)
+        switches.append(auto_switch)
         return {
             "id": sid, "label": "新名字", "nodes": 7, "traffic": USERINFO,
             "alive": 3, "total": 7, "usedCache": False,
@@ -128,6 +111,8 @@ async def test_update_subscription_url_change_triggers_sync(db, monkeypatch):
         sub_id, label="新名字", url="https://example.com/sub?token=xyz"
     )
     assert calls == [sub_id]
+    # 换链接是用户主动动作：带自动切换开关（定时周期重拉不带）
+    assert switches == [True]
     assert res["synced"] is True
     assert res["nodes"] == 7
     assert res["traffic"] == USERINFO
@@ -279,6 +264,90 @@ async def test_delete_subscription_cascades_ledger(db):
     assert sorted(r.name for r in rows) == ["B1"]
 
 
+@pytest.mark.asyncio
+async def test_delete_subscription_cascades_pool_ledger(db):
+    """clash 订阅删除必须级联生产池账本：来源行/快照行清、身份行保留并按状态机
+    降级、仍被别的订阅提供的来源不受影响、重建被请求——否则已删订阅的健康节点
+    会永远留在生产池里。"""
+    from sqlalchemy import select
+
+    from app.domains.proxypool import scheduling as pool_scheduling
+    from app.domains.proxypool.models import (
+        ProxyNode,
+        ProxyNodeSource,
+        SubscriptionSnapshot,
+    )
+
+    seen = datetime(2026, 10, 11, 12, 0, 0)
+    async with db() as session:
+        sub_a = ProxySubscription(kind="clash", url=SUB_URL, admission_status="ACTIVE")
+        sub_b = ProxySubscription(kind="clash", url=SUB_URL, admission_status="ACTIVE")
+        session.add_all([sub_a, sub_b])
+        await session.flush()
+        a, b = sub_a.id, sub_b.id
+
+        def _node(node_id: str, runtime_name: str) -> ProxyNode:
+            return ProxyNode(
+                node_id=node_id, fingerprint=node_id, runtime_name=runtime_name,
+                proxy_type="ss", server="10.0.0.1",
+                normalized_config={"name": node_id, "type": "ss",
+                                   "server": "10.0.0.1", "port": 1},
+                state="ACTIVE", first_seen=seen, last_seen=seen, last_source_seen=seen,
+            )
+
+        session.add_all([
+            _node("only-a", f"{a}|only-a"),
+            _node("shared", f"{a}|shared"),
+            _node("only-b", f"{b}|only-b"),
+        ])
+        session.add_all([
+            ProxyNodeSource(node_id="only-a", subscription_id=a,
+                            original_name="only-a", first_seen=seen, last_seen=seen),
+            ProxyNodeSource(node_id="shared", subscription_id=a,
+                            original_name="shared", first_seen=seen, last_seen=seen),
+            ProxyNodeSource(node_id="shared", subscription_id=b,
+                            original_name="shared", first_seen=seen, last_seen=seen),
+            ProxyNodeSource(node_id="only-b", subscription_id=b,
+                            original_name="only-b", first_seen=seen, last_seen=seen),
+        ])
+        session.add(SubscriptionSnapshot(
+            subscription_id=a, sha256="sha-a", format="yaml", raw_path="a.bin",
+            url="sealed-a", node_count=2, status="OK", fetched_at=seen,
+        ))
+        await session.commit()
+
+    assert await proxies_service.delete_subscription(a) is True
+
+    async with db() as session:
+        sources_a = (await session.scalars(
+            select(ProxyNodeSource).where(ProxyNodeSource.subscription_id == a))).all()
+        sources_b = (await session.scalars(
+            select(ProxyNodeSource).where(ProxyNodeSource.subscription_id == b))).all()
+        snaps_a = (await session.scalars(
+            select(SubscriptionSnapshot)
+            .where(SubscriptionSnapshot.subscription_id == a))).all()
+        nodes = {n.node_id: n for n in (await session.scalars(select(ProxyNode))).all()}
+    assert sources_a == [], "已删订阅的来源行必须整体解除"
+    assert {s.node_id for s in sources_b} == {"shared", "only-b"}
+    assert snaps_a == [], "已删订阅的快照行随订阅走"
+    assert "only-a" in nodes and "shared" in nodes, "身份账本保留"
+    assert nodes["only-a"].state == "STALE", "来源全部流失的节点按状态机降级"
+    assert nodes["shared"].state == "ACTIVE", "仍被别的订阅提供的节点不动"
+    assert pool_scheduling.rebuild_pending() is True, "合格集变化必须请求重建"
+    pool_scheduling.take_rebuild_pending()
+
+    from app.core import orchestration as events
+    from app.core.orchestration import OrchestrationEvent
+
+    async with db() as session:
+        ev = (await session.scalars(
+            select(OrchestrationEvent)
+            .where(OrchestrationEvent.kind == events.KIND_SUBSCRIPTION_EXITED)
+            .order_by(OrchestrationEvent.id.desc())
+        )).first()
+    assert ev is not None and "删除" in ev.message, "来源解除必须留痕（与退出端点同一理由）"
+
+
 # ─── 账本收敛 ────────────────────────────────────────────────
 
 
@@ -415,7 +484,6 @@ async def test_start_switches_subscription_when_running(monkeypatch, tmp_path):
     assert r.process is same, "同订阅幂等：沿用运行中的实例"
     r.stop()
     assert r.subscription_url is None
-
 
 
 # ─── 检测存活统计落库 ────────────────────────────────────────
@@ -592,7 +660,6 @@ async def test_import_plain_check_errors_do_not_break_stats(db, monkeypatch):
 
         rows = (await session.execute(select(Proxy))).scalars().all()
     assert len(rows) == 1 and rows[0].status == "unknown"  # 行保留，未被删除
-
 
 
 # ── 订阅自动取名链（行为对齐：profile-title → Content-Disposition → URL 末段）──

@@ -484,40 +484,10 @@ def test_real_sample_parse(name, game, topup, cdk, spend, refund):
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    import app.core.database as database_module
+def db():
+    from app.core.database import get_session_factory
 
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'test_bills.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-
-    class _Factory:
-        """factory(engine 双引用：service 只认 get_session_factory()。"""
-
-        def __call__(self):
-            return factory()
-
-        @property
-        def bind(self):
-            return engine
-
-    wrapped = _Factory()
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: wrapped)
-    monkeypatch.setattr(bills_service, "get_session_factory", lambda: wrapped)
-    return wrapped
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    import app.domains.bills.models  # noqa: F401
-    import app.domains.rates.models  # noqa: F401
-
-    from app.core.database import Base
-
-    async with db.bind.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
+    return get_session_factory()
 
 
 async def _seed_fx(db, rows: list[tuple[str, float, str]], kind: str = "observed"):
@@ -609,6 +579,79 @@ async def test_import_overview_roundtrip(db):
     await bills_service.delete_import(res["importId"])
     imports = await bills_service.list_imports()
     assert imports == []
+
+
+@pytest.mark.asyncio
+async def test_game_txs_projection_four_columns(db):
+    """投影下发 walletBalance/basePrice/paymentParts/giftTo 四列：
+    礼物行结构化返回拆分与受赠人；普通行如实 null；topup 投影不受影响。"""
+    data = {
+        "account": {"nickname": "proj", "avatar_base64": ""},
+        "history": [
+            # 礼物行：混合支付拆分 + 受赠人 + 余额/基准价（新导出形态）
+            {
+                "date": "2026 年 3 月 21 日",
+                "item": "Gift Game X",
+                "type": "礼物购买",
+                "payment": "钱包 + 万事达卡 **52",
+                "total": "₹ 264",
+                "wallet_change": "-₹ 264",
+                "wallet_balance": "₹ 2,357.30",
+                "base_price": "₹ 345",
+                "payment_parts": [
+                    {"pm": "钱包", "amount": "₹ 100"},
+                    {"pm": "万事达卡 **52", "amount": "₹ 164"},
+                ],
+                "gift_recipients": ["recipient_a", "тест имя получателя"],
+            },
+            # 普通购买行：四列无数据
+            {
+                "date": "2026 年 3 月 22 日",
+                "item": "Game Plain",
+                "type": "购买",
+                "payment": "钱包",
+                "total": "¥30",
+                "wallet_change": "-¥30",
+            },
+            # 钱包充值（topup 路径）
+            {
+                "date": "2026 年 3 月 23 日",
+                "item": "已购买 ¥60.00 钱包资金",
+                "type": "购买",
+                "payment": "支付宝",
+                "total": "¥ 60.00",
+                "wallet_change": "+¥60",
+            },
+        ],
+        "licenses": [],
+    }
+    res = await bills_service.import_report(data, "proj.json")
+    rows = await bills_service.game_txs(res["importId"])
+    by_item = {r["items"][0]: r for r in rows["rows"]}
+
+    gift = by_item["Gift Game X"]
+    assert gift["walletBalance"] == "₹ 2,357.30"
+    assert gift["basePrice"] == "₹ 345"
+    assert gift["paymentParts"] == [
+        {"pm": "钱包", "amount": "₹ 100"},
+        {"pm": "万事达卡 **52", "amount": "₹ 164"},
+    ]
+    assert gift["giftTo"] == ["recipient_a", "тест имя получателя"]
+
+    plain = by_item["Game Plain"]
+    assert plain["walletBalance"] is None
+    assert plain["basePrice"] is None
+    assert plain["paymentParts"] is None
+    assert plain["giftTo"] is None
+
+    # topup 表无四列语义，投影不新增键
+    topups = await bills_service.topup_txs(res["importId"])
+    assert topups["total"] == 1
+    assert topups["rows"][0]["amount"] == 60.0
+    assert all(
+        k not in topups["rows"][0]
+        for k in ("walletBalance", "basePrice", "paymentParts", "giftTo")
+    )
 
 
 @pytest.mark.asyncio

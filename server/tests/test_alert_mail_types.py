@@ -68,23 +68,16 @@ async def _fake_regions():
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 't.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(alerts_service, "get_session_factory", lambda: factory)
+def db(monkeypatch):
+    from app.core.database import get_session_factory
+
     monkeypatch.setattr(alerts_service.account_service, "get_primary_account", _fake_primary)
     monkeypatch.setattr(alerts_service.regions_service, "list_regions", _fake_regions)
     monkeypatch.setattr(alerts_service.settings_service, "get_value", _fake_get_value)
     monkeypatch.setattr(alerts_service.settings_service, "set_value", _fake_set_value)
     monkeypatch.setattr(notify, "send_mail", _record_send)
-    import app.core.database as database_module
 
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    return factory
-
-
+    return get_session_factory()
 @pytest_asyncio.fixture(autouse=True)
 async def _clean(db):
     async with db.kw["bind"].begin() as conn:

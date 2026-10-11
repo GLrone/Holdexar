@@ -45,18 +45,10 @@ import app.main as main_mod
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 't.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    for mod in (crawl_service, family_service, games_service, proxies_service,
-                rates_service, account_service):
-        monkeypatch.setattr(mod, "get_session_factory", lambda: factory)
-    return factory
+def db():
+    from app.core.database import get_session_factory
 
-
+    return get_session_factory()
 @pytest.fixture
 def chain_calls(monkeypatch):
     """把收拾链的全部依赖换成记录桩，返回调用序列与放行闸。"""

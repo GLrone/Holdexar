@@ -36,32 +36,10 @@ PRIMARY = "76561198000000001"
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    for mod in (
-        database_module,
-        crawl_service_mod,
-        db_writer_mod,
-        wishlist_service_mod,
-    ):
-        monkeypatch.setattr(mod, "get_session_factory", lambda: factory)
+def db():
+    from app.core.database import get_session_factory
 
-    return factory
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    import app.domains.crawl.models  # noqa: F401
-    import app.domains.games.models  # noqa: F401
-    import app.domains.wishlist.models  # noqa: F401
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
-    sched_mod._WISH_UNCRAWLED_BATCH = 400
+    return get_session_factory()
 
 
 async def _seed_wishlist_row(db, appid: int, *, active=True):

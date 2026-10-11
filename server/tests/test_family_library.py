@@ -2,7 +2,8 @@
 
 覆盖：共享库 ∪ 成员已购合并 / presence 与 ownerCount / 游玩时长聚合 /
 本地 games 表元数据与 CN 价补齐 / 缓存失效 / 多账号家庭组同步 /
-成员地区判定链（手动 > 钱包结算区 > 资料国家 > 未设置）。
+成员地区判定链（手动 > 钱包结算区 > 资料国家 > 未设置）/
+成员增删账本（manual 条目持久化、同步保留、移除与排除标记不复活）。
 """
 import sys
 from datetime import datetime, timedelta
@@ -22,26 +23,18 @@ from app.domains.settings import service as settings_service
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    import app.core.database as database_module
+def db(monkeypatch):
+    from app.core.database import get_session_factory
 
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(settings_service, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(family_service, "get_session_factory", lambda: factory)
+
     # family 经 account_service.get_primary_cookies() 读表：
     # 模块级 factory 引用必须单独打桩，否则直读生产库
-    monkeypatch.setattr(account_service, "get_session_factory", lambda: factory)
     # miniprofile 头像兜底默认静默空（防单测触网）；验证头像链路的用例自行覆盖
     async def _no_preview(sid):
         return {"personaName": "", "avatarUrl": ""}
     monkeypatch.setattr(family_service, "_persona_preview", _no_preview)
-    return factory
 
-
+    return get_session_factory()
 @pytest_asyncio.fixture(autouse=True)
 async def _reset_family_cache():
     """家庭库缓存/刷新账本是模块级状态：跨用例重置，防顺序耦合。"""
@@ -50,22 +43,6 @@ async def _reset_family_cache():
     yield
     family_service._LIBRARY_CACHE = {}
     family_service._LIBRARY_REFRESHING = set()
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    import app.domains.account.models  # noqa: F401
-    import app.domains.alerts.models  # noqa: F401
-    import app.domains.crawl.models  # noqa: F401
-    import app.domains.family.models  # noqa: F401
-    import app.domains.proxies.models  # noqa: F401
-    import app.domains.rates.models  # noqa: F401
-    import app.domains.regions.models  # noqa: F401
-    import app.domains.settings.models  # noqa: F401
-    import app.domains.wishlist.models  # noqa: F401
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
 
 
 PRIMARY = "76561198000000001"
@@ -611,6 +588,10 @@ async def test_status_groups_and_region_chain(db, monkeypatch):
     from app.domains.regions.models import CrawlRegion
 
     async with db() as session:
+        # 模板库自带首启区服种子，本文件要自己的一套区服行，先清再种
+        from sqlalchemy import delete
+
+        await session.execute(delete(CrawlRegion))
         for code in ("cn", "in", "us", "ru"):
             session.add(CrawlRegion(code=code, name=code.upper(), currency=code.upper()))
         await session.commit()
@@ -707,3 +688,198 @@ async def test_member_regions_legacy_cleanup(db):
     assert cleaned == {PRIMARY: "in", "76561198000000099": "ru"}
     # 标记置位后不再清洗：清洗后用户手动加回的 cn 条目受尊重
     assert await family_service._cleanup_legacy_member_regions({FRIEND: "cn"}) == {FRIEND: "cn"}
+
+
+MANUAL = "76561198000000021"
+
+
+def _mock_sync_env(monkeypatch):
+    """单账号同步环境：绑定 Cookie + token + 资料国家静默（两成员组）。"""
+    async def fake_bound():
+        return [(PRIMARY, COOKIE)]
+    monkeypatch.setattr(account_service, "list_bound_cookies", fake_bound)
+    monkeypatch.setattr(family_service, "extract_webapi_token", lambda cookies: "tok")
+
+    async def no_countries(steamids):
+        return {}
+    monkeypatch.setattr(family_service, "_fetch_member_countries", no_countries)
+    _mock_steam(monkeypatch, shared_apps=[], owned_by_member={})
+
+
+@pytest.mark.asyncio
+async def test_manual_member_persists_in_status(db):
+    """手动添加成员落 members_json（manual 条目）：/family/status 重拉仍在（刷新语义）。
+
+    无组行时确保一条本地组行承载（member_count 不含 manual，joined 语义不动）；
+    重复添加幂等不产生重复条目。
+    """
+    await _seed_account(db)
+
+    r = await family_service.add_family_member(
+        MANUAL, persona_name="手动成员", avatar_url="https://steamcdn/m.jpg"
+    )
+    assert r == {"ok": True}
+    assert await family_service.add_family_member(MANUAL) == {"ok": True, "duplicate": True}
+
+    st = await family_service.get_status()
+    g = st["groups"][0]
+    assert [m["steamid"] for m in g["members"]] == [MANUAL]
+    assert g["members"][0]["origin"] == "manual"
+    assert g["members"][0]["personaName"] == "手动成员"
+    assert g["joined"] is False  # 本地组行不计入 Steam 加入状态
+
+    from app.domains.family.models import FamilyGroup
+
+    async with db() as session:
+        row = await session.get(FamilyGroup, PRIMARY)
+    assert row.member_count == 0
+    assert [m["steamid"] for m in row.members_json] == [MANUAL]
+
+
+@pytest.mark.asyncio
+async def test_manual_member_without_bound_account(db):
+    """未绑定任何账号：手动成员落本地组行，/family/status 仍如实投影（bound=False）。
+
+    手动添加不因「无主账号可跟随」而失败或只在本地存活——成员事实进组账。
+    """
+    assert await family_service.add_family_member(MANUAL, persona_name="手动成员") == {"ok": True}
+
+    st = await family_service.get_status()
+    assert st["bound"] is False
+    assert len(st["groups"]) == 1
+    g = st["groups"][0]
+    assert [m["steamid"] for m in g["members"]] == [MANUAL]
+    assert g["members"][0]["origin"] == "manual"
+    assert g["joined"] is None  # 本地组行：不冒充已同步/未加入的 Steam 状态
+    assert {m["steamid"] for m in st["members"]} == {MANUAL}
+
+
+@pytest.mark.asyncio
+async def test_sync_preserves_manual_members(db, monkeypatch):
+    """Steam 同步重建：steam 条目整表刷新（origin=steam），manual 条目原样保留。"""
+    await _seed_account(db)
+    _mock_sync_env(monkeypatch)
+    await family_service.add_family_member(MANUAL, persona_name="手动成员")
+
+    await family_service.sync_family_group()
+
+    from app.domains.family.models import FamilyGroup
+
+    async with db() as session:
+        row = await session.get(FamilyGroup, PRIMARY)
+    by_sid = {m["steamid"]: m for m in row.members_json}
+    assert set(by_sid) == {PRIMARY, FRIEND, MANUAL}
+    assert by_sid[PRIMARY]["origin"] == "steam"
+    assert by_sid[FRIEND]["origin"] == "steam"
+    assert by_sid[MANUAL]["origin"] == "manual"
+    assert by_sid[MANUAL]["personaName"] == "手动成员"  # 同步不冲掉手动成员档案
+    assert row.member_count == 2  # member_count 只计 Steam 成员
+
+
+@pytest.mark.asyncio
+async def test_remove_manual_member_keeps_tracked_account(db):
+    """移除 manual 成员 = 删账本条目：/family/status 不再包含；tracked_accounts 不动。"""
+    await _seed_account(db)
+    from app.domains.wishlist.models import TrackedAccount
+
+    async with db() as session:
+        session.add(TrackedAccount(
+            steamid=MANUAL, kinds_json={"wishlist": True, "owned": True},
+            item_count=0, created_at=datetime.utcnow(),
+        ))
+        await session.commit()
+
+    await family_service.add_family_member(MANUAL, persona_name="手动成员")
+    assert await family_service.remove_family_member(MANUAL) == {"ok": True, "removed": True}
+
+    st = await family_service.get_status()
+    assert st["groups"][0]["members"] == []
+
+    from app.domains.family.models import FamilyGroup
+
+    async with db() as session:
+        tracked = await session.get(TrackedAccount, MANUAL)
+        row = await session.get(FamilyGroup, PRIMARY)
+    assert tracked is not None  # 解绑账户是愿望单池页的独立动作，移除成员不波及
+    assert row.members_json == []
+
+
+@pytest.mark.asyncio
+async def test_remove_steam_member_not_revived_by_sync(db, monkeypatch):
+    """移除 Steam 成员 = excluded 持久排除标记：再次同步不复活、列表不投影、
+    家庭愿望单不再计其条目；tracked_accounts 不动；重新添加解除排除。"""
+    await _seed_account(db)
+    _mock_sync_env(monkeypatch)
+
+    await family_service.sync_family_group()
+    assert await family_service.remove_family_member(FRIEND) == {"ok": True, "removed": True}
+
+    from app.domains.family.models import FamilyGroup
+    from app.domains.wishlist.models import TrackedAccount, WishlistItem
+
+    async with db() as session:
+        row = await session.get(FamilyGroup, PRIMARY)
+    assert [m["steamid"] for m in row.members_json] == [PRIMARY, FRIEND]
+    assert row.members_json[1]["excluded"] is True  # 排除标记持久保留
+
+    st = await family_service.get_status()
+    assert [m["steamid"] for m in st["groups"][0]["members"]] == [PRIMARY]
+
+    # 再次同步：Steam 仍返回该成员，但排除标记不复活
+    await family_service.sync_family_group()
+    async with db() as session:
+        row = await session.get(FamilyGroup, PRIMARY)
+    assert row.members_json[1]["excluded"] is True
+    st2 = await family_service.get_status()
+    assert FRIEND not in [m["steamid"] for m in st2["groups"][0]["members"]]
+
+    # 同一本账的其他读点同样排除：家庭愿望单不再计已移除成员
+    now = datetime(2026, 10, 1, 12, 0, 0)
+    async with db() as session:
+        session.add(WishlistItem(steamid=FRIEND, appid=620, added_at=now, active=True, owned=False))
+        await session.commit()
+    out = await family_service.family_wishlist()
+    assert out["memberIds"] == [PRIMARY]
+    assert all(FRIEND not in it["members"] for it in out["items"])
+
+    # 移除不动 tracked_accounts
+    async with db() as session:
+        tracked = await session.get(TrackedAccount, FRIEND)
+    assert tracked is not None
+
+    # 重新添加 = 解除排除
+    await family_service.add_family_member(FRIEND)
+    st3 = await family_service.get_status()
+    assert [m["steamid"] for m in st3["groups"][0]["members"]] == [PRIMARY, FRIEND]
+
+
+@pytest.mark.asyncio
+async def test_local_member_survives_later_binding(db):
+    """先加成员、后绑账号：本地组行条目并入主账号组投影，移除随之可达。
+
+    回归：绑定后投影曾只读主账号组行，绑定前添加的手动成员一度「消失」。
+    """
+    await family_service.add_family_member(MANUAL, persona_name="先绑前成员")
+
+    await _seed_account(db)
+
+    st = await family_service.get_status()
+    assert st["bound"] is True
+    assert [m["steamid"] for m in st["groups"][0]["members"]] == [MANUAL]
+    assert st["groups"][0]["members"][0]["origin"] == "manual"
+
+    # 再次添加同员：条目从本地组迁入主账号组，不产生双份
+    assert await family_service.add_family_member(MANUAL) == {"ok": True}
+    from app.domains.family.models import FamilyGroup
+
+    async with db() as session:
+        local = await session.get(FamilyGroup, "local")
+        primary = await session.get(FamilyGroup, PRIMARY)
+    assert local is not None
+    assert [m["steamid"] for m in (local.members_json or []) if m.get("origin") == "manual"] == []
+    assert "manual" in [m.get("origin") for m in primary.members_json]
+
+    # 绑定态移除：主账号组直取
+    assert await family_service.remove_family_member(MANUAL) == {"ok": True, "removed": True}
+    st2 = await family_service.get_status()
+    assert [m["steamid"] for m in st2["groups"][0]["members"]] == []

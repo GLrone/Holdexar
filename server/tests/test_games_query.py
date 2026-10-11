@@ -221,7 +221,7 @@ async def test_flag_filter():
     from app.crawler.utils import get_beijing_time_obj
     from app.domains.games.service import PP_FLAG_WINDOW_DAYS
 
-    window_start = get_beijing_time_obj() - timedelta(days=PP_FLAG_WINDOW_DAYS)
+    window_start = (get_beijing_time_obj() - timedelta(days=PP_FLAG_WINDOW_DAYS)).replace(tzinfo=None)
     for item in r["items"]:
         if item["hlFlag"] in (1, 2):
             continue

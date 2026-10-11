@@ -1,12 +1,14 @@
-"""备份功能测试：VACUUM INTO 快照语义 / 轮转 / 路径穿越防护 / 三段式恢复。
+"""备份功能测试：VACUUM INTO 快照 + gzip 归档与哈希校验 / 轮转 / 路径穿越防护 / 三段式恢复。
 
 用户核心担忧逐条验证：
 - 「备份不最新」→ 快照必须包含 WAL 已提交未 checkpoint 的数据
-- 「备份不完整」→ 快照独立打开 integrity_check 必须通过、表行数与源库一致
-- 「误恢复损坏生产库」→ 校验不过的备份拒绝恢复；恢复成功后原库内容被替换；
-  路径穿越文件名拒绝
+- 「备份不完整」→ 归档解档后 integrity 通过、表行数与源库一致；随档哈希能识破篡改
+- 「误恢复损坏生产库」→ 校验不过/哈希不符的备份拒绝恢复；恢复成功后原库内容被替换；
+  路径穿越文件名拒绝；升级前的未压缩旧档仍可用
+- 「恢复中途失败」→ 主库句柄被占用时先重关引擎再重试；替换未成功则不留残留档
 """
 import asyncio
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -71,24 +73,34 @@ async def test_snapshot_includes_wal_committed_data(data_env):
 
 
 @pytest.mark.asyncio
-async def test_snapshot_is_standalone_and_consistent(data_env):
-    """担忧②完整性：备份独立打开 integrity 通过、行数与源一致。"""
+async def test_snapshot_is_compressed_and_consistent(data_env):
+    """担忧②完整性：快照压成 gzip 归档，解档后 integrity 通过、行数与源一致。"""
     tmp, holder = data_env
     holder["conn"].execute("INSERT INTO games VALUES (440, 'TF2')")
     holder["conn"].commit()
 
     result = await core_backup.create_backup()
-    # 备份文件自洽：没有 -wal 伴随文件（VACUUM INTO 产出独立单文件）
-    backup_path = Path(result["path"])
-    assert backup_path.is_file()
-    assert not backup_path.with_name(backup_path.name + "-wal").exists()
+    archive = Path(result["path"])
+    assert archive.name.endswith(".db.gz")
+    assert archive.is_file()
+    # 未压缩中间档不留（否则备份目录里同时躺着两份同内容库）
+    assert not archive.with_name(archive.name[: -len(".gz")]).exists()
+    # 哈希随档走
+    meta = core_backup._read_archive_meta(archive)
+    assert meta["sha256"] == result["sha256"]
+    assert meta["games"] == 2
+    assert meta["rawBytes"] > archive.stat().st_size  # 压缩确实省了体积
 
-    conn = sqlite3.connect(backup_path.as_posix())
+    probe = tmp / "opened.db"
+    core_backup._decompress_archive(archive, probe)
+    conn = sqlite3.connect(probe.as_posix())
     try:
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert conn.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 2
     finally:
         conn.close()
+    # 归档自洽：单文件即可解，无 -wal 伴随
+    assert not archive.with_name(archive.name + "-wal").exists()
 
 
 @pytest.mark.asyncio
@@ -114,7 +126,7 @@ async def test_manual_backup_keeps_only_latest(data_env, monkeypatch):
         await core_backup.create_backup(manual=True)
     names = [b["name"] for b in core_backup.list_backups()]
     assert len(names) == 1
-    assert names[0].endswith("-manual.db")
+    assert names[0].endswith("-manual.db.gz")
     assert "-00002-manual.db" in names[0]  # 留的是最新那份
 
 
@@ -130,12 +142,12 @@ async def test_manual_backup_independent_of_auto_rotation(data_env, monkeypatch)
     names = [b["name"] for b in core_backup.list_backups()]
     assert len(names) == 4  # 3 自动 + 1 手动
     assert not any("a0" in n for n in names)
-    assert sum(1 for n in names if n.endswith("-manual.db")) == 1
+    assert sum(1 for n in names if n.endswith("-manual.db.gz")) == 1
     # 再手动一次：旧手动被顶替，自动 3 份原样
     await core_backup.create_backup(manual=True)
     names = [b["name"] for b in core_backup.list_backups()]
     assert len(names) == 4
-    assert sum(1 for n in names if n.endswith("-manual.db")) == 1
+    assert sum(1 for n in names if n.endswith("-manual.db.gz")) == 1
     assert any("a3" in n for n in names)
 
 
@@ -144,8 +156,9 @@ async def test_rotation_caps_total_size(data_env, monkeypatch):
     """总量上限：主库体积×倍数封顶时只留最新的 BACKUP_MIN_KEEP 份。"""
     tmp, _ = data_env
     monkeypatch.setattr(core_backup, "BACKUP_TOTAL_CAP_RATIO", 2.0)
-    # 上限钉到 2KB：任何一份备份都会超——正好验证「至少保留 2 份」的下限
-    monkeypatch.setattr(core_backup, "_main_db_bytes", lambda: 1024)
+    # 上限钉到比任何一档都小（压缩档体积随数据形态变化，不按固定 KB 钉）——
+    # 正好验证「总量受限时仍至少保留 BACKUP_MIN_KEEP 份」的下限
+    monkeypatch.setattr(core_backup, "_main_db_bytes", lambda: 1)
     seq = iter(range(10))
     monkeypatch.setattr(core_backup, "_ts", lambda: f"20260101-0000{next(seq)}")
     for i in range(4):
@@ -169,6 +182,10 @@ async def test_path_traversal_rejected(data_env):
         safe_backup_path(core_backup.backup_dir(), "sub/holdexar.db")
     with pytest.raises(ValueError):
         safe_backup_path(core_backup.backup_dir(), "evil.exe")
+    # 归档后缀合法（.db.gz），元数据后缀不放开给恢复入口
+    assert safe_backup_path(core_backup.backup_dir(), "a.db.gz").name == "a.db.gz"
+    with pytest.raises(ValueError):
+        safe_backup_path(core_backup.backup_dir(), "a.db.gz.json")
 
 
 @pytest.mark.asyncio
@@ -182,58 +199,68 @@ async def test_corrupt_backup_rejected_for_restore(data_env):
         await core_backup.restore_backup("bad.db")
 
 
-@pytest.mark.asyncio
-async def test_restore_replaces_production_db(data_env, monkeypatch):
-    """恢复闭环：停写入面 → 替换 → 引擎重建 → 内容等于备份时刻。
+@pytest.fixture
+def maintenance_mock(monkeypatch):
+    """恢复链单元层替身：调度器/引擎/爬取位全部 mock，只验文件轮换与数据正确性。"""
+    calls: list[int] = []
 
-    调度器/引擎交互 mock 掉（进程内 APScheduler/aiosqlite 全链路在
-    E2E 验证，单元层只验文件轮换与数据正确性）。
-    """
+    async def _noop_dispose():
+        return None
+
+    async def _noop_rebuild():
+        return True
+
+    class _Sched:
+        def __call__(self):
+            calls.append(1)
+
+    monkeypatch.setattr(core_backup, "_dispose_engine", _noop_dispose)
+    monkeypatch.setattr(core_backup, "_rebuild_engine", _noop_rebuild)
+    import app.core.scheduler as sched_mod
+
+    monkeypatch.setattr(sched_mod, "stop_scheduler", _Sched())
+    monkeypatch.setattr(sched_mod, "start_scheduler", _Sched())
+    import app.domains.crawl.service as crawl_service
+
+    monkeypatch.setattr(crawl_service, "_active", None)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_dispose_engine_skips_when_none_cached(monkeypatch):
+    """引擎缓存为空时直接返回：此时 get_engine() 会凭空建出一个持有主库句柄的引擎。"""
+    from types import SimpleNamespace
+
+    from app.core import database as db_mod
+
+    def _boom():
+        raise AssertionError("无缓存引擎时不得新建引擎")
+
+    _boom.cache_info = lambda: SimpleNamespace(currsize=0)
+    monkeypatch.setattr(db_mod, "get_engine", _boom)
+    await core_backup._dispose_engine()
+
+
+@pytest.mark.asyncio
+async def test_restore_replaces_production_db(data_env, maintenance_mock):
+    """恢复闭环（归档档）：解档 → 校验 → 替换 → 内容等于备份时刻。"""
     tmp, holder = data_env
     db = tmp / "holdexar.db"
 
     # 1) 先备份（此刻只有 620）
     result = await core_backup.create_backup(label="base")
-    backup_name = result["name"]
 
     # 2) 生产库继续演进（新增 440——备份里没有）
     holder["conn"].execute("INSERT INTO games VALUES (440, 'TF2')")
     holder["conn"].commit()
 
-    # 3) 恢复：mock 掉引擎/调度器层（单元测试不碰全局状态）
-    import app.core.database as database_module
-
-    async def _noop_dispose():
-        pass
-
-    async def _noop_rebuild():
-        return True
-
-    class _FakeSched:
-        def __init__(self):
-            self.calls = []
-
-        def __call__(self):
-            self.calls.append(1)
-
-    fake_sched = _FakeSched()
-    monkeypatch.setattr(core_backup, "_dispose_engine", _noop_dispose)
-    monkeypatch.setattr(core_backup, "_rebuild_engine", _noop_rebuild)
-    import app.core.scheduler as sched_mod
-
-    monkeypatch.setattr(sched_mod, "stop_scheduler", fake_sched)
-    monkeypatch.setattr(sched_mod, "start_scheduler", fake_sched)
-    import app.domains.crawl.service as crawl_service
-
-    monkeypatch.setattr(crawl_service, "_active", None)
-
     # 占用连接必须先关——恢复前模拟「停服」释放句柄
     holder["conn"].close()
 
-    res = await core_backup.restore_backup(backup_name)
+    res = await core_backup.restore_backup(result["name"])
     assert res["restored"] is True
 
-    # 4) 生产库内容回到备份时刻：只有 620，没有 440
+    # 3) 生产库内容回到备份时刻：只有 620，没有 440
     conn = sqlite3.connect(db.as_posix())
     try:
         rows = conn.execute("SELECT appid FROM games ORDER BY appid").fetchall()
@@ -243,7 +270,182 @@ async def test_restore_replaces_production_db(data_env, monkeypatch):
 
     # 陈旧 WAL 已清理（新库打开不会重放旧帧）
     assert not db.with_name(db.name + "-wal").exists()
-    # 成功后回滚档清理
+    # 成功后回滚档与就位档清理
     assert not db.with_suffix(".rollback.db").exists()
     assert not db.with_suffix(".restoring.db").exists()
-    assert len(fake_sched.calls) == 2  # stop + start
+    assert len(maintenance_mock) == 2  # stop + start
+    # 解档探针不留备份目录
+    assert not list(core_backup.backup_dir().glob("*.verify.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_restore_from_legacy_plain_db_still_works(data_env, maintenance_mock):
+    """旧格式兼容：升级前留下的未压缩 .db 备份照样能列、能校验、能恢复。"""
+    tmp, holder = data_env
+    db = tmp / "holdexar.db"
+    legacy = core_backup.backup_dir() / "holdexar-20251231-000000.db"
+    core_backup.snapshot_to(db, legacy)
+    holder["conn"].close()
+
+    names = [b["name"] for b in core_backup.list_backups()]
+    assert legacy.name in names
+    assert (await core_backup.verify_backup(legacy.name))["integrityOk"] is True
+    assert (await core_backup.restore_backup(legacy.name))["restored"] is True
+
+
+@pytest.mark.asyncio
+async def test_replace_main_db_retries_after_file_is_held(data_env, monkeypatch):
+    """主库句柄被并发请求重新持有 → 先重关引擎再重试，替换最终完成。"""
+    tmp, holder = data_env
+    src = tmp / "holdexar.db"
+    staging = tmp / "holdexar.restoring.db"
+    staging.write_bytes(b"staged")
+    holder["conn"].close()  # 占用连接先释放，替换才有成功的可能
+    disposes: list[int] = []
+    attempts = {"n": 0}
+    real_replace = os.replace
+
+    async def _fake_dispose():
+        disposes.append(1)
+
+    def _flaky(a, b):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise PermissionError(13, "拒绝访问")
+        return real_replace(a, b)
+
+    monkeypatch.setattr(core_backup, "_dispose_engine", _fake_dispose)
+    monkeypatch.setattr(core_backup, "_REPLACE_RETRY_SECONDS", 0)
+    monkeypatch.setattr(core_backup.os, "replace", _flaky)
+    await core_backup._replace_main_db(staging, src)
+    assert attempts["n"] == 2
+    assert disposes == [1]
+    assert src.read_bytes() == b"staged"
+
+
+@pytest.mark.asyncio
+async def test_restore_failure_leaves_no_leftovers(data_env, maintenance_mock, monkeypatch):
+    """替换未成功：主库内容一字不动，就位档/回滚档/解档探针/锁全部清掉。"""
+    tmp, holder = data_env
+    db = tmp / "holdexar.db"
+    result = await core_backup.create_backup(label="f")
+    holder["conn"].execute("INSERT INTO games VALUES (440, 'TF2')")
+    holder["conn"].commit()
+    holder["conn"].close()
+
+    async def _blocked(staging, src):
+        raise RuntimeError("主库文件被占用")
+
+    monkeypatch.setattr(core_backup, "_replace_main_db", _blocked)
+    with pytest.raises(RuntimeError, match="被占用"):
+        await core_backup.restore_backup(result["name"])
+
+    conn = sqlite3.connect(db.as_posix())
+    try:
+        rows = conn.execute("SELECT appid FROM games ORDER BY appid").fetchall()
+        assert rows == [(440,), (620,)]
+    finally:
+        conn.close()
+    assert not db.with_suffix(".rollback.db").exists()
+    assert not db.with_suffix(".restoring.db").exists()
+    assert not list(core_backup.backup_dir().glob("*.verify.tmp"))
+    assert not (core_backup.backup_dir() / core_backup._LOCK_FILE).exists()
+
+
+@pytest.mark.asyncio
+async def test_verify_uses_hash_and_rejects_tampered_archive(data_env):
+    """校验口径：比对随档哈希；改一个字节即拒绝，不必解档整库自检。"""
+    result = await core_backup.create_backup(label="v")
+    name = result["name"]
+    ok = await core_backup.verify_backup(name)
+    assert ok["integrityOk"] is True
+    assert ok["games"] == 1
+    assert ok["sha256"] == result["sha256"]
+
+    archive = core_backup.backup_dir() / name
+    body = bytearray(archive.read_bytes())
+    body[len(body) // 2] ^= 0xFF
+    archive.write_bytes(bytes(body))
+    assert (await core_backup.verify_backup(name))["integrityOk"] is False
+
+
+@pytest.mark.asyncio
+async def test_restore_rejects_tampered_archive(data_env, maintenance_mock):
+    """哈希不符的归档拒绝恢复：不碰生产库，也不留解档探针。"""
+    tmp, holder = data_env
+    result = await core_backup.create_backup(label="t")
+    archive = core_backup.backup_dir() / result["name"]
+    archive.write_bytes(archive.read_bytes()[:-8])  # 截断即哈希不符
+    with pytest.raises(RuntimeError, match="哈希不符"):
+        await core_backup.restore_backup(result["name"])
+    assert (tmp / "holdexar.db").is_file()
+    assert not list(core_backup.backup_dir().glob("*.verify.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_rotation_removes_meta_with_archive(data_env):
+    """轮转删档连带删元数据档：不留无人认领的哈希。"""
+    for i in range(5):  # BACKUP_KEEP=3 → 最老两份被清
+        await core_backup.create_backup(label=f"r{i}")
+    base = core_backup.backup_dir()
+    archives = {p.name for p in base.glob(f"*{core_backup.ARCHIVE_SUFFIX}")}
+    metas = {
+        p.name[: -len(core_backup.META_SUFFIX)]
+        for p in base.glob(f"*{core_backup.META_SUFFIX}")
+    }
+    assert archives and metas == archives
+
+
+def test_vacuum_reclaims_free_pages_and_absorbs_wal(data_env) -> None:
+    """空间回收：删行留下的空闲页被收回、WAL 里的写入并入主库。
+
+    只看主文件会误判 VACUUM 的效果（合并 WAL 会让主文件变大），故口径是
+    「主库 + WAL + shm」的总占用下降，同时主库自身相对收缩前变小。
+    """
+    tmp, holder = data_env
+    db = tmp / "holdexar.db"
+    conn = holder["conn"]
+    conn.execute("CREATE TABLE bloat (payload TEXT)")
+    conn.executemany(
+        "INSERT INTO bloat VALUES (?)", [("y" * 400,) for _ in range(20000)]
+    )
+    conn.commit()
+    conn.execute("DELETE FROM bloat")
+    conn.commit()
+    before_main = db.stat().st_size
+    before_total = core_backup._footprint(db)
+    assert before_total > before_main, "前置失败：写入未滞留 WAL（测试环境不成立）"
+
+    holder["conn"].close()  # 真实回收会先停写入面并断开所有连接
+    core_backup._vacuum_file(db)
+
+    after_main = db.stat().st_size
+    after_total = core_backup._footprint(db)
+    # 主文件可能因页分配而不变小；真正的回收口径是「总占用下降」（WAL 收进主库）
+    assert after_main <= before_main, f"主文件反而变大：{before_main} → {after_main}"
+    assert after_total < before_total, f"磁盘总占用未下降：{before_total} → {after_total}"
+    check = sqlite3.connect(db.as_posix())
+    try:
+        assert check.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 1
+    finally:
+        check.close()
+
+
+def test_vacuum_translates_disk_full(tmp_path: Path, monkeypatch) -> None:
+    """磁盘不够时 SQLite 只报 "disk is full"：转成能照做的提示，不透传原文。"""
+
+    class _Conn:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def execute(self, *args, **kwargs):  # noqa: ANN401
+            self.calls += 1
+            if self.calls > 2:
+                raise sqlite3.OperationalError("database or disk is full")
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(core_backup.sqlite3, "connect", lambda *a, **k: _Conn())
+    with pytest.raises(RuntimeError, match="磁盘空间不足"):
+        core_backup._vacuum_file(tmp_path / "x.db")

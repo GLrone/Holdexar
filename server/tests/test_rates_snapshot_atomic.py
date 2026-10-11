@@ -42,32 +42,24 @@ NEW_USD_RATE = 7.0  # 本轮刷新汇率
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 't.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    for mod in (rates_service, games_service, bundles_service):
-        monkeypatch.setattr(mod, "get_session_factory", lambda: factory)
+def db(monkeypatch):
+    from app.core.database import get_session_factory
+
 
     async def _all_regions():
         return None
 
     monkeypatch.setattr(bundles_service, "_tracked_region_codes", _all_regions)
-    return factory
 
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
+    return get_session_factory()
 @pytest_asyncio.fixture(autouse=True)
 async def _seed(db):
     """旧汇率（USD=8）下的完整快照：cny_fen 与排序快照都是旧值。"""
     async with db() as session:
+        # 模板库自带 CNY 首启种子，本文件要自己的汇率集，先清再种
+        from sqlalchemy import delete
+
+        await session.execute(delete(FxRate))
         session.add(FxRate(currency_code="CNY", rate_to_cny=1.0))
         session.add(FxRate(currency_code="USD", rate_to_cny=OLD_USD_RATE))
         # 旧快照：US 500 分 ×8 = 4000 → diff = 10000 − 4000 = 6000

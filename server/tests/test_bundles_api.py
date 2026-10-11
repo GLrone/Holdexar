@@ -625,3 +625,34 @@ async def test_smart_score_snapshot_and_sort():
             )
             await session.execute(delete(Bundle).where(Bundle.bundle_id == BID_D))
             await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_sort_snapshot_rebuild_over_bind_limit():
+    """全库重建：包数超单条 IN 的绑定变量上限（SQLite 32766）不得中断。
+
+    回归：区域价装载曾把全库 bundle_id 塞进一条 IN，包数过 32766 即
+    OperationalError「too many SQL variables」，启动期快照重建整链失败。
+    """
+    base = 880_000_000
+    n = 33_000
+    try:
+        async with get_session_factory()() as session:
+            session.add_all(
+                [
+                    Bundle(
+                        bundle_id=base + i,
+                        name="批量探测包",
+                        must_purchase_as_set=0,
+                    )
+                    for i in range(n)
+                ]
+            )
+            await session.commit()
+        written = await service.refresh_bundle_sort_cache()
+        assert written > n
+    finally:
+        service.invalidate_bundles_cache()
+        async with get_session_factory()() as session:
+            await session.execute(delete(Bundle).where(Bundle.bundle_id >= base))
+            await session.commit()

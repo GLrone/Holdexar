@@ -17,21 +17,11 @@ from app.domains.games.tag_names_en import TAG_NAMES_EN
 from app.domains.games.tag_names_zh import TAG_NAMES_ZH
 
 
-@pytest_asyncio.fixture
-async def db(tmp_path, monkeypatch):
-    import app.core.database as database_module
+@pytest.fixture
+def db():
+    from app.core.database import get_session_factory
 
-    import app.domains.games.models  # noqa: F401 —— 建表需要模型注册
-
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 't.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield factory
-    await engine.dispose()
+    return get_session_factory()
 
 
 class _FakeClient:
@@ -65,6 +55,18 @@ def test_item_tags_prefers_weighted_tags():
     assert _item_tags({"tagids": [19, 21]}) == [(19, 0), (21, 0)]
     assert _item_tags({"tags": [], "tagids": [122]}) == [(122, 0)]
     assert _item_tags(None) == []
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _no_seed_names(db):
+    """模板库自带内置标签底座，本文件多处断言无底座形态，逐用例清空。"""
+    from sqlalchemy import delete
+
+    from app.domains.games.models import Tag
+
+    async with db() as session:
+        await session.execute(delete(Tag))
+        await session.commit()
 
 
 @pytest.mark.asyncio

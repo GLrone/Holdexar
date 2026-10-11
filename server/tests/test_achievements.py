@@ -31,33 +31,10 @@ THIS_MONTH = datetime.fromtimestamp(NOW)
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    import app.core.database as database_module
+def db():
+    from app.core.database import get_session_factory
 
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(achievements_service, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(settings_service, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(account_service, "get_session_factory", lambda: factory)
-    return factory
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    import app.domains.account.models  # noqa: F401
-    import app.domains.achievements.models  # noqa: F401
-    import app.domains.family.models  # noqa: F401
-    import app.domains.games.models  # noqa: F401
-    import app.domains.settings.models  # noqa: F401
-    import app.domains.wishlist.models  # noqa: F401 —— tracked_accounts（账号档案兜底源）
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
+    return get_session_factory()
 @pytest.fixture(autouse=True)
 def _primary_sid(monkeypatch):
     async def fake_sid():
@@ -840,8 +817,9 @@ async def _seed_career(db):
         session.add(Game(appid=730, name="CS2", release_date=f"{year}-01-15",
                          developers=["Valve"], publishers=["Valve"], chinese_support="official"))
         # 热门标签（票重等权 → 时长在两标签间均分，与旧 genres 断言同值）
-        session.add(Tag(tagid=19, name_zh="动作"))
-        session.add(Tag(tagid=21, name_zh="冒险"))
+        # 模板库自带内置标签底座，tagid 撞 19/21 时用 merge 覆盖为本文件语义行
+        await session.merge(Tag(tagid=19, name_zh="动作"))
+        await session.merge(Tag(tagid=21, name_zh="冒险"))
         session.add(GameTag(appid=620, tagid=19, weight=100))   # 动作
         session.add(GameTag(appid=620, tagid=21, weight=100))   # 冒险
         session.add(GameTag(appid=440, tagid=19, weight=100))   # 动作

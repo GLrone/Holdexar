@@ -30,22 +30,10 @@ NEXT = 0.05  # 「下一轮」窗口内的观察时刻（3 分钟前，晚于上
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 't.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    for module in (cycle_mod, events_mod):
-        monkeypatch.setattr(module, "get_session_factory", lambda: factory)
-    return factory
+def db():
+    from app.core.database import get_session_factory
 
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
+    return get_session_factory()
 async def _cycle(db, appids, regions=("cn",), *, started_minutes_ago: int = 60) -> int:
     """建一个已收敛的 Cycle，窗口 = [started_minutes_ago, 现在]。
 
