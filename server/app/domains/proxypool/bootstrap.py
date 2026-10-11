@@ -23,6 +23,7 @@ import yaml
 
 from app.domains.proxies.models import ProxySubscription
 from app.domains.proxies.subscription_secret import UNREADABLE_MESSAGE, open_url
+from app.core.database import WritePriority, write_gate
 from app.core import orchestration as events
 from app.core.logging import log_event
 from app.domains.proxypool.admission import auto_admit_healthy_candidate, is_admitted
@@ -162,96 +163,103 @@ async def sync_subscriptions(
 
     await asyncio.gather(*(_prefetch(s) for s in subs))
 
-    for sub in subs:
-        sub_id = sub.id  # 先取出来：savepoint 回滚后 ORM 对象会过期，不能再靠它
-        try:
-            # 每条订阅一个 SAVEPOINT：本条目的半截写入只回滚自己，
-            # 同轮其它订阅已完成的成果留在外层事务里
-            async with session.begin_nested():
-                sub_url = sub_urls.get(sub_id) or ""
-                if not sub_url:
-                    # 链接解不开（密钥属主机绑定）：本轮跳过并留原因，不伪装成抓取失败
-                    skipped.append(sub_id)
-                    failures[sub_id] = UNREADABLE_MESSAGE
-                    continue
-                result = fetched.get(sub_id)
-                if isinstance(result, Exception):
-                    raise result
-                if result is None:  # 预取缺失（不可达）：按失败记账，不静默丢
-                    raise RuntimeError("订阅下载未返回结果")
-                nodes = parse_nodes(result.raw, result.fmt)
-                snap = build_snapshot(sub_id, sub_url, result, nodes, now=now)
-                await persist_snapshot(session, snap, data_dir=data_dir)
-                # 准入判定必须**现读**：`subs` 是轮询开始时加载的，抓取可能耗时几十秒，
-                # 期间这条订阅可能已经被晋升（或本来就是候选）。用陈旧对象判定会出现：
-                # 同步落盘了更新的快照、却因为"当初是候选"而跳过 apply → 订阅已是 ACTIVE
-                # 而 Registry 仍停在旧快照。刷新一次再判，代价是一条 SELECT。
-                await session.refresh(sub)
-                if is_admitted(sub):
-                    await apply_snapshot(
-                        session, subscription_id=sub_id, snapshot=snap, now=now
-                    )
-                else:
-                    # 候选订阅的健康自动转正：最近一次体检有可用节点即进池，
-                    # 准入依据是体检事实而不是人工点头（快照刚落盘，转正 apply 的就是它）
-                    admitted = await auto_admit_healthy_candidate(
-                        session, subscription_id=sub_id, data_dir=data_dir, now=now
-                    )
-                    if admitted is not None:
-                        log_event(
-                            logger,
-                            f"订阅 {sub_id} 体检健康，自动转正进生产池",
-                            tag="成功",
-                            detail={
-                                "订阅编号": sub_id,
-                                "可用节点数": (sub.last_stats or {}).get("alive"),
-                                "快照": snap.sha256[:10],
-                                "节点数": len(nodes),
-                            },
+    # 落库段进闸：并发下载已在闸外完成，闸内只允许本轮流库 I/O（savepoint /
+    # 事件 / 投影）与收尾提交——网络等待进闸会横持写者位，饿死全体写。
+    async with write_gate(WritePriority.BACKGROUND, label="subscription_apply"):
+        for sub in subs:
+            sub_id = sub.id  # 先取出来：savepoint 回滚后 ORM 对象会过期，不能再靠它
+            try:
+                # 每条订阅一个 SAVEPOINT：本条目的半截写入只回滚自己，
+                # 同轮其它订阅已完成的成果留在外层事务里
+                async with session.begin_nested():
+                    sub_url = sub_urls.get(sub_id) or ""
+                    if not sub_url:
+                        # 链接解不开（密钥属主机绑定）：本轮跳过并留原因，不伪装成抓取失败
+                        skipped.append(sub_id)
+                        failures[sub_id] = UNREADABLE_MESSAGE
+                        continue
+                    result = fetched.get(sub_id)
+                    if isinstance(result, Exception):
+                        raise result
+                    if result is None:  # 预取缺失（不可达）：按失败记账，不静默丢
+                        raise RuntimeError("订阅下载未返回结果")
+                    nodes = parse_nodes(result.raw, result.fmt)
+                    snap = build_snapshot(sub_id, sub_url, result, nodes, now=now)
+                    await persist_snapshot(session, snap, data_dir=data_dir)
+                    # 准入判定必须**现读**：`subs` 是轮询开始时加载的，抓取可能耗时几十秒，
+                    # 期间这条订阅可能已经被晋升（或本来就是候选）。用陈旧对象判定会出现：
+                    # 同步落盘了更新的快照、却因为"当初是候选"而跳过 apply → 订阅已是 ACTIVE
+                    # 而 Registry 仍停在旧快照。刷新一次再判，代价是一条 SELECT。
+                    await session.refresh(sub)
+                    if is_admitted(sub):
+                        await apply_snapshot(
+                            session, subscription_id=sub_id, snapshot=snap, now=now
                         )
                     else:
-                        skipped.append(sub_id)
-                        log_event(
-                            logger,
-                            f"订阅 {sub_id} 体检无可用节点或尚未体检，保持候选（快照已落盘、不进生产池）",
-                            tag="跳过",
-                            detail={
-                                "订阅编号": sub_id,
-                                "快照": snap.sha256[:10],
-                                "节点数": len(nodes),
-                            },
+                        # 候选订阅的健康自动转正：最近一次体检有可用节点即进池，
+                        # 准入依据是体检事实而不是人工点头（快照刚落盘，转正 apply 的就是它）
+                        admitted = await auto_admit_healthy_candidate(
+                            session, subscription_id=sub_id, data_dir=data_dir, now=now
                         )
-        except Exception as exc:  # noqa: BLE001 —— 单条订阅失败不阻断其它
-            message = str(exc)[:500] or type(exc).__name__
-            # savepoint 已把本条目回滚掉；失败用 Core UPDATE 记录，**不碰已过期的 ORM
-            # 对象**——真实生产已复现：flush 失败后再读 sub.* 会抛 PendingRollbackError，
-            # 于是原始失败反而没有被记录下来。
-            await session.execute(
-                update(ProxySubscription)
-                .where(ProxySubscription.id == sub_id)
-                .values(last_fetch_at=now, last_fetch_status="FAILED", last_error=message)
-            )
-            # 事件与 FAILED 投影同事务：两者说的是同一件事，一起提交或一起回滚
-            await events.record(
-                events.KIND_SUBSCRIPTION_FAILED,
-                f"订阅 {sub_id} 同步失败：{message}",
-                level=events.LEVEL_WARN,
-                payload={"subscriptionId": sub_id},
-                session=session,
-                now=now,
-            )
-            failures[sub_id] = message
-            continue
+                        if admitted is not None:
+                            log_event(
+                                logger,
+                                f"订阅 {sub_id} 体检健康，自动转正进生产池",
+                                tag="成功",
+                                detail={
+                                    "订阅编号": sub_id,
+                                    "可用节点数": (sub.last_stats or {}).get("alive"),
+                                    "快照": snap.sha256[:10],
+                                    "节点数": len(nodes),
+                                },
+                            )
+                        else:
+                            skipped.append(sub_id)
+                            log_event(
+                                logger,
+                                f"订阅 {sub_id} 体检无可用节点或尚未体检，保持候选（快照已落盘、不进生产池）",
+                                tag="跳过",
+                                detail={
+                                    "订阅编号": sub_id,
+                                    "快照": snap.sha256[:10],
+                                    "节点数": len(nodes),
+                                },
+                            )
+            except Exception as exc:  # noqa: BLE001 —— 单条订阅失败不阻断其它
+                message = str(exc)[:500] or type(exc).__name__
+                # savepoint 已把本条目回滚掉；失败用 Core UPDATE 记录，**不碰已过期的 ORM
+                # 对象**——真实生产已复现：flush 失败后再读 sub.* 会抛 PendingRollbackError，
+                # 于是原始失败反而没有被记录下来。
+                await session.execute(
+                    update(ProxySubscription)
+                    .where(ProxySubscription.id == sub_id)
+                    .values(last_fetch_at=now, last_fetch_status="FAILED", last_error=message)
+                )
+                # 事件与 FAILED 投影同事务：两者说的是同一件事，一起提交或一起回滚
+                await events.record(
+                    events.KIND_SUBSCRIPTION_FAILED,
+                    f"订阅 {sub_id} 同步失败：{message}",
+                    level=events.LEVEL_WARN,
+                    payload={"subscriptionId": sub_id},
+                    session=session,
+                    now=now,
+                )
+                failures[sub_id] = message
+                continue
 
-        # 投影必须在**快照落库成功之后**；事实源始终是 subscription_snapshots.sha256
-        sub.snapshot_sha256 = snap.sha256
-        sub.snapshot_version = int(sub.snapshot_version or 0) + 1
-        sub.last_fetch_at = now
-        sub.last_fetch_status = "OK"
-        sub.last_success_at = now
-        sub.last_error = None
-        shas[sub.id] = snap.sha256
-        counts[sub.id] = len(nodes)
+            # 投影必须在**快照落库成功之后**；事实源始终是 subscription_snapshots.sha256
+            sub.snapshot_sha256 = snap.sha256
+            sub.snapshot_version = int(sub.snapshot_version or 0) + 1
+            sub.last_fetch_at = now
+            sub.last_fetch_status = "OK"
+            sub.last_success_at = now
+            sub.last_error = None
+            shas[sub.id] = snap.sha256
+            counts[sub.id] = len(nodes)
+
+        # 提交在闸内完成：SQLite 文件写锁随提交释放，闸界与锁界对齐——
+        # 否则后续写者拿到闸却撞上未释放的文件锁，空等 busy_timeout
+        await session.commit()
 
     names = await eligible_runtime_names(session)
     return SyncResult(
@@ -443,6 +451,8 @@ async def ensure_pool_runtime(
             observed_names=observed,
         )
         if not ledger.ok:
+            # 独立会话落库：本函数不再由调用方的写闸/事务包络（调用方只承载读取），
+            # 「bootstrap 对账拒绝」这个事实必须自己留痕，不随调用方回滚消失
             await events.record(
                 events.KIND_RECONCILE_REJECTED,
                 f"bootstrap 对账拒绝：缺 {sorted(ledger.missing)}",
@@ -456,7 +466,6 @@ async def ensure_pool_runtime(
                     "unexpectedCount": len(ledger.unexpected),
                     "observedTotal": ledger.observed_total,
                 },
-                session=session,
                 now=now,
             )
             return BootstrapResult(

@@ -12,7 +12,7 @@
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -88,7 +88,36 @@ async def _sources_of(session: AsyncSession, subscription_id: int) -> dict[str, 
     return {fingerprint: node_id for node_id, fingerprint in rows.all()}
 
 
-async def _inheritable_exit_ip(session: AsyncSession, node: Mapping) -> str | None:
+async def _exit_ip_indexes(
+    session: AsyncSession,
+) -> tuple[dict[str, str], dict[tuple[str, str, str], str]]:
+    """(名字主干→出口IP) 与 (端点键→出口IP) 两张索引，一次按 `last_seen` 降序
+    扫描构建：`setdefault` 保留首个写入 = 最近 seen 的化身；`exit_ip` 空行不进
+    索引。批量登记时构建一次供全部新建节点共享，避免每个新指纹各做一次全表
+    扫描把写闸按满。"""
+    rows = await session.execute(select(ProxyNode).order_by(ProxyNode.last_seen.desc()))
+    by_base: dict[str, str] = {}
+    by_endpoint: dict[tuple[str, str, str], str] = {}
+    for cand in rows.scalars():
+        if not cand.exit_ip:
+            continue
+        base = _name_base(str((cand.normalized_config or {}).get("name") or ""))
+        if base:
+            by_base.setdefault(base, cand.exit_ip)
+        endpoint = (
+            str(cand.proxy_type or ""),
+            str(cand.server or ""),
+            str((cand.normalized_config or {}).get("port") or ""),
+        )
+        if all(endpoint):
+            by_endpoint.setdefault(endpoint, cand.exit_ip)
+    return by_base, by_endpoint
+
+
+def _inheritable_exit_ip(
+    indexes: tuple[dict[str, str], dict[tuple[str, str, str], str]],
+    node: Mapping,
+) -> str | None:
     """旧化身**已知的出口 IP**：机场频繁改写节点条目（重排序 / 换入口服务器 /
     换内容版本号 `#N`），指纹与端点键都可能变，但**节点名主干**（去掉版本后缀）
     是机场自己的节点身份——同一主干的新化身继承旧化身的出口身份，避免每轮
@@ -102,24 +131,12 @@ async def _inheritable_exit_ip(session: AsyncSession, node: Mapping) -> str | No
     endpoint = (str(node.get("type") or ""), str(server or ""), str(node.get("port") or ""))
     if not base and not all(endpoint):
         return None
-    rows = await session.execute(
-        select(ProxyNode).order_by(ProxyNode.last_seen.desc())
-    )
-    fallback: str | None = None
-    for cand in rows.scalars():
-        if not cand.exit_ip:
-            continue
-        cand_base = _name_base(str((cand.normalized_config or {}).get("name") or ""))
-        cand_endpoint = (
-            str(cand.proxy_type or ""),
-            str(cand.server or ""),
-            str((cand.normalized_config or {}).get("port") or ""),
-        )
-        if base and cand_base == base:
-            return cand.exit_ip
-        if fallback is None and all(endpoint) and cand_endpoint == endpoint:
-            fallback = cand.exit_ip
-    return fallback
+    by_base, by_endpoint = indexes
+    if base and base in by_base:
+        return by_base[base]
+    if all(endpoint):
+        return by_endpoint.get(endpoint)
+    return None
 
 
 def _name_base(name: str) -> str:
@@ -127,6 +144,49 @@ def _name_base(name: str) -> str:
     import re
 
     return re.sub(r"#\d+\s*$", "", name).strip()
+
+
+async def settle_nodes_after_source_change(
+    session: AsyncSession, node_ids: Iterable[str], *, now: datetime
+) -> tuple[tuple[str, str, str], ...]:
+    """来源变动后的节点收尾（快照对齐 / 退出 / 删除路径共用，唯一实现）：
+
+    仍有来源 → `last_source_seen` 对齐剩余来源的最近 seen；来源全部流失 → 向
+    状态机要一次判定（`probe_ok=None`）。只 flush，不 commit。
+    """
+    changes: list[tuple[str, str, str]] = []
+    for node_id in sorted(node_ids):
+        row = (
+            await session.execute(select(ProxyNode).where(ProxyNode.node_id == node_id))
+        ).scalar_one()
+        remaining = await session.scalar(
+            select(func.count())
+            .select_from(ProxyNodeSource)
+            .where(ProxyNodeSource.node_id == node_id)
+        )
+        if remaining:
+            # last_source_seen 的语义是「全部来源 last_seen 的最大值」——本轮本订阅
+            # 撤掉、别的订阅没刷新时绝不能写 now：那会把节点的"最后见到"时刻凭空
+            # 推到本轮，STALE 候选按新鲜度筛选会因此误判。
+            latest = await session.scalar(
+                select(func.max(ProxyNodeSource.last_seen)).where(
+                    ProxyNodeSource.node_id == node_id
+                )
+            )
+            row.last_source_seen = latest or now
+            continue
+        target = evaluate_node_state(
+            row.state,
+            source_seen=False,
+            probe_ok=None,
+            consecutive_failures=row.consecutive_failures or 0,
+        )
+        if target != row.state:
+            changes.append((node_id, row.state, target))
+            row.state = target
+
+    await session.flush()
+    return tuple(changes)
 
 
 async def apply_snapshot(
@@ -180,6 +240,9 @@ async def apply_snapshot(
     created: list[str] = []
     refreshed: list[str] = []
     touched: set[str] = set()
+    # 出口继承索引：首个新建节点用到时才构建一次（纯刷新轮零成本），整批换
+    # 指纹的场景共享同一份，避免每个新指纹各做一次全表扫描
+    inherit_indexes: tuple[dict[str, str], dict[tuple[str, str, str], str]] | None = None
 
     for fingerprint, node in desired.items():
         original_name = str(node.get("name") or "")
@@ -210,6 +273,8 @@ async def apply_snapshot(
         if row is None:
             runtime_name = make_runtime_name(subscription_id, original_name, taken)
             taken.add(runtime_name)
+            if inherit_indexes is None:
+                inherit_indexes = await _exit_ip_indexes(session)
             row = ProxyNode(
                 node_id=fingerprint,
                 fingerprint=fingerprint,
@@ -224,7 +289,7 @@ async def apply_snapshot(
                 # 端点身份相同的旧节点携带着**已知的出口身份**：机场改名单 /
                 # 换内容版本号（指纹变、type|server|port 不变）时把 exit_ip 继承
                 # 过来——否则每次内容更新都要裸探一轮，空窗期内爬取全部被拒
-                exit_ip=await _inheritable_exit_ip(session, node),
+                exit_ip=_inheritable_exit_ip(inherit_indexes, node),
             )
             session.add(row)
             created.append(fingerprint)
@@ -255,38 +320,7 @@ async def apply_snapshot(
 
     await session.flush()
 
-    changes: list[tuple[str, str, str]] = []
-    for node_id in sorted(touched):
-        row = (
-            await session.execute(select(ProxyNode).where(ProxyNode.node_id == node_id))
-        ).scalar_one()
-        remaining = await session.scalar(
-            select(func.count())
-            .select_from(ProxyNodeSource)
-            .where(ProxyNodeSource.node_id == node_id)
-        )
-        if remaining:
-            # last_source_seen 的语义是「全部来源 last_seen 的最大值」——本轮本订阅
-            # 撤掉、别的订阅没刷新时绝不能写 now：那会把节点的"最后见到"时刻凭空
-            # 推到本轮，STALE 候选按新鲜度筛选会因此误判。
-            latest = await session.scalar(
-                select(func.max(ProxyNodeSource.last_seen)).where(
-                    ProxyNodeSource.node_id == node_id
-                )
-            )
-            row.last_source_seen = latest or now
-            continue
-        target = evaluate_node_state(
-            row.state,
-            source_seen=False,
-            probe_ok=None,
-            consecutive_failures=row.consecutive_failures or 0,
-        )
-        if target != row.state:
-            changes.append((node_id, row.state, target))
-            row.state = target
-
-    await session.flush()
+    changes = await settle_nodes_after_source_change(session, touched, now=now)
     return ApplyResult(
         created_nodes=tuple(created),
         refreshed_nodes=tuple(refreshed),

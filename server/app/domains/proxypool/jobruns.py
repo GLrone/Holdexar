@@ -31,6 +31,7 @@ from app.core.database import WritePriority, get_session_factory
 from app.core.database import write_gate
 from app.core.logging import log_event
 from app.domains.proxypool.models import (
+    HealthRun,
     ProxyJobRun,
     ProxyNode,
     ProxyNodeSource,
@@ -311,6 +312,8 @@ async def mark_interrupted_runs(session: AsyncSession, now: datetime) -> int:
     """把上次进程遗留的 `running` 标 `interrupted`（与 `cleanup_orphan_jobs` 同构）。
 
     只认「进程已经不在」这个事实：调用点在启动链上，此刻不可能有本进程的作业在跑。
+    同一事务收体检台账的悬空行（finished_at IS NULL：进程在探测段被杀，run 行
+    永无正常收尾）；返回值只计作业行。
     """
     rows = (
         await session.execute(
@@ -326,6 +329,17 @@ async def mark_interrupted_runs(session: AsyncSession, now: datetime) -> int:
         summary = dict(row.error_summary or {"by_error": {}})
         summary["interrupted"] = True
         row.error_summary = finalize_summary(summary)
+    stale_runs = (
+        await session.execute(
+            select(HealthRun).where(HealthRun.finished_at.is_(None))
+        )
+    ).scalars().all()
+    for run in stale_runs:
+        run.finished_at = now
+        run.end_reason = "interrupted"
+        if run.started_at is not None:
+            delta = now - run.started_at
+            run.duration_ms = max(0, int(delta.total_seconds() * 1000))
     return len(rows)
 
 

@@ -30,22 +30,12 @@ PRIMARY = "76561198000000001"
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    import app.core.database as database_module
-    import app.domains.crawl.service as crawl_service
-    import app.domains.games.preset as preset_mod
-    import app.domains.monitoring.service as monitoring_service
+def db(monkeypatch):
+    from app.core.database import get_session_factory
 
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(wishlist_service, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(crawl_service, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(preset_mod, "get_session_factory", lambda: factory)
+    import app.domains.crawl.service as crawl_service
+
     # 关注/加入已改走 monitoring 层：同一测试库，绝不允许落到真实数据目录
-    monkeypatch.setattr(monitoring_service, "get_session_factory", lambda: factory)
 
     # persona 拉取（miniprofile）与家庭组快照：不触网 / 不依赖未建表
     async def fake_persona(steamid):
@@ -61,29 +51,14 @@ def db(tmp_path, monkeypatch):
     # 首爬触发统一打桩（真实 start_job 会走代理/区服链路）；
     # 需要断言调用形状的用例用 _make_start_job_stub 再换一份记录账本
     monkeypatch.setattr(crawl_service, "start_job", _make_start_job_stub([]))
-    return factory
 
-
+    return get_session_factory()
 def _make_start_job_stub(calls: list[dict]):
     async def fake_start(**kwargs):
         calls.append(kwargs)
         return {"id": 1, "scope": kwargs.get("scope"), "count": len(kwargs.get("appids") or [])}
 
     return fake_start
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    import app.domains.crawl.models  # noqa: F401
-    import app.domains.games.models  # noqa: F401
-    import app.domains.monitoring.models  # noqa: F401
-    import app.domains.wishlist.models  # noqa: F401
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
-# ── 种子与桩 ─────────────────────────────────────────────
 
 
 async def _seed_account(db, steamid=PRIMARY, kinds=None):

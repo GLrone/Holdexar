@@ -85,7 +85,7 @@ async def test_other_subscription_exit_leaves_shared_node_untouched(env, monkeyp
     monkeypatch.setattr(adm, "request_rebuild", lambda: rebuilds.append(1))
 
     async with get_session_factory()() as s:
-        result = await exit_from_production(s, subscription_id=c)
+        result = await exit_from_production(s, subscription_id=c, now=NOW)
         await s.commit()
 
     assert result.exited is True and result.removed_sources == 1
@@ -106,7 +106,7 @@ async def test_one_of_two_sources_exits_keeps_node_eligible(env, monkeypatch):
     monkeypatch.setattr(adm, "request_rebuild", lambda: [])
 
     async with get_session_factory()() as s:
-        await exit_from_production(s, subscription_id=a)
+        await exit_from_production(s, subscription_id=a, now=NOW)
         await s.commit()
 
     assert await _source_count("x") == 1
@@ -124,10 +124,10 @@ async def test_last_source_exit_shrinks_eligible_and_keeps_identity(env, monkeyp
     monkeypatch.setattr(adm, "request_rebuild", lambda: [])
 
     async with get_session_factory()() as s:
-        await exit_from_production(s, subscription_id=a)
+        await exit_from_production(s, subscription_id=a, now=NOW)
         await s.commit()
     async with get_session_factory()() as s:
-        await exit_from_production(s, subscription_id=b)
+        await exit_from_production(s, subscription_id=b, now=NOW)
         await s.commit()
 
     assert await _source_count("x") == 0
@@ -150,10 +150,10 @@ async def test_exit_is_idempotent(env, monkeypatch):
     monkeypatch.setattr(adm, "request_rebuild", lambda: rebuilds.append(1))
 
     async with get_session_factory()() as s:
-        first = await exit_from_production(s, subscription_id=a)
+        first = await exit_from_production(s, subscription_id=a, now=NOW)
         await s.commit()
     async with get_session_factory()() as s:
-        again = await exit_from_production(s, subscription_id=a)
+        again = await exit_from_production(s, subscription_id=a, now=NOW)
         await s.commit()
 
     assert first.exited is True and again.exited is False
@@ -183,7 +183,7 @@ async def test_repromote_after_exit_restores_sources(env, monkeypatch):
     assert await _admission(a) == "ACTIVE"
 
     async with get_session_factory()() as s:
-        await exit_from_production(s, subscription_id=a)
+        await exit_from_production(s, subscription_id=a, now=NOW)
         await s.commit()
     assert await _admission(a) == "CANDIDATE"
     async with get_session_factory()() as s:
@@ -198,3 +198,24 @@ async def test_repromote_after_exit_restores_sources(env, monkeypatch):
         assert (await s.scalar(
             select(func.count()).select_from(ProxyNodeSource)
             .where(ProxyNodeSource.subscription_id == a))) == 1
+
+
+@pytest.mark.asyncio
+async def test_last_source_exit_settles_node_state(env, monkeypatch):
+    """最后一个来源退出 → 节点状态按注册表同一条规则结算（ACTIVE→STALE），
+    共享节点不受影响；账目带回降级数。"""
+    await init_db()
+    a, b = await _sub("A", "https://a.invalid"), await _sub("B", "https://b.invalid")
+    await _node("x", [a], state="ACTIVE")      # 只由 A 提供 → A 退出后来源全失
+    await _node("y", [a, b], state="ACTIVE")   # B 仍在提供 → 状态不动
+
+    async with get_session_factory()() as s:
+        result = await exit_from_production(s, subscription_id=a, now=NOW)
+        await s.commit()
+
+    assert result.exited is True and result.degraded_nodes == 1
+    async with get_session_factory()() as s:
+        states = dict((await s.execute(
+            select(ProxyNode.node_id, ProxyNode.state))).all())
+    assert states["x"] == "STALE", "来源全部流失的健康节点按状态机降为 STALE，不是永远 ACTIVE"
+    assert states["y"] == "ACTIVE", "仍有来源的节点不得被误降级"

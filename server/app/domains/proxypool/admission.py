@@ -81,12 +81,15 @@ class ExitResult:
     exited: bool
     detail: str
     removed_sources: int
+    # 来源全部流失、状态因此被推进的节点数（身份账本保留，状态如实反映「已无来源」）
+    degraded_nodes: int = 0
 
 
 async def exit_from_production(
     session: AsyncSession,
     *,
     subscription_id: int,
+    now: datetime,
 ) -> ExitResult:
     """把一个 ACTIVE 订阅撤出生产池：置回 CANDIDATE，并移除它的全部来源行。
 
@@ -94,7 +97,7 @@ async def exit_from_production(
 
     事务顺序（不变量 `CANDIDATE ⇒ 它的来源行已全部移除`）：
 
-        取写串行化边界 → 读订阅行 → 删本订阅来源行 → 置 CANDIDATE
+        取写串行化边界 → 读订阅行 → 删本订阅来源行 → 置 CANDIDATE → 节点状态结算
 
     `ProxyNode` 身份账本一行不动：没有任何当前来源的节点由合格集口径自然退出池，
     仍被别的订阅提供的节点不受影响。退出是**可逆**的——以后要重新进池再走一次
@@ -114,32 +117,42 @@ async def exit_from_production(
     # 函数内 import：`bootstrap` 反向依赖本模块的 `is_admitted`，模块级会成环。
     from app.domains.proxypool.bootstrap import pool_signature
     from app.domains.proxypool.models import ProxyNodeSource
+    from app.domains.proxypool.registry import settle_nodes_after_source_change
 
     before_sig = await pool_signature(session)
-    removed = int(await session.scalar(
-        select(func.count())
-        .select_from(ProxyNodeSource)
+    source_node_ids = set(await session.scalars(
+        select(ProxyNodeSource.node_id)
         .where(ProxyNodeSource.subscription_id == subscription_id)
-    ) or 0)
+    ))
+    removed = len(source_node_ids)
     await session.execute(
         delete(ProxyNodeSource).where(ProxyNodeSource.subscription_id == subscription_id)
     )
     sub.admission_status = ADMISSION_CANDIDATE
     await session.flush()
 
+    # 来源全部流失的节点按注册表同一条规则向状态机要一次判定（与快照对齐共用
+    # 收尾路径）：身份账本保留，状态如实反映「订阅已不再提供」。
+    changes = await settle_nodes_after_source_change(
+        session, source_node_ids, now=now
+    )
+
     if await pool_signature(session) != before_sig:
         request_rebuild()
         log_event(
             logger,
             f"订阅 {subscription_id} 退出生产池，合格集变化已请求重建",
-            detail={"订阅编号": subscription_id, "移除来源行数": removed},
+            detail={"订阅编号": subscription_id, "移除来源行数": removed,
+                    "状态降级节点数": len(changes)},
         )
     log_event(
         logger,
         f"订阅 {subscription_id} 退出生产池，置回候选",
-        detail={"订阅编号": subscription_id, "移除来源行数": removed},
+        detail={"订阅编号": subscription_id, "移除来源行数": removed,
+                "状态降级节点数": len(changes)},
     )
-    return ExitResult(subscription_id, True, "已退出生产池（置回 CANDIDATE）", removed)
+    return ExitResult(subscription_id, True, "已退出生产池（置回 CANDIDATE）",
+                      removed, len(changes))
 
 
 async def promote_to_active(

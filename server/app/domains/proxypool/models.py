@@ -313,6 +313,9 @@ class HealthRun(Base):
     steam_ok: Mapped[int] = mapped_column(Integer, default=0)
     ip_known: Mapped[int] = mapped_column(Integer, default=0)
     failed: Mapped[int] = mapped_column(Integer, default=0)
+    # 收尾原因：NULL = 正常完成；l1_error/l2_error = 对应探针段程序异常（本轮
+    # 汇总为空轮）；interrupted = 启动链收尸（进程在探测段被杀的悬空行）
+    end_reason: Mapped[str | None] = mapped_column(String(30))
 
 
 class SubscriptionSnapshot(Base):

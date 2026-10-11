@@ -781,6 +781,16 @@ async def business_check_pool(
                 latency_ms=result.latency_ms,
             ))
         async with write_gate(WritePriority.BACKGROUND, label="health_observation"):
+            # 防丢失更新：探测是分钟级串行网络段，载入时读到的 state /
+            # consecutive_failures 早已陈旧——闸内按主键重读当前行（刷新本会话
+            # 同一对象），把探测结论套到新鲜值上再 evaluate，窗口内手动体检
+            # ingest 与订阅同步 settle 对同一节点的写入不因陈旧基线被覆盖。
+            if probed:
+                await session.execute(
+                    select(ProxyNode)
+                    .where(ProxyNode.node_id.in_([n.node_id for n, _ in probed]))
+                    .execution_options(populate_existing=True)
+                )
             for node, result in probed:
                 # 生死证据判定：None = 不构成节点证据（选不中节点是探针基础设施问题）。
                 # 拿到 Steam 侧响应（200 / 429 / 503 等）= 传输成功，Steam 故障不罚节点；
