@@ -5,6 +5,7 @@ import type { MessageKey } from '../zh-CN'
 const epicFree: Partial<Record<MessageKey, string>> = {
   'epicFree.title': 'Epic Free Games',
   'epicFree.updatedAt': 'Updated {time}',
+  'epicFree.refresh': 'Refresh',
   'epicFree.refreshing': 'Refreshing…',
   'epicFree.free': 'FREE',
   'epicFree.live': 'Live',

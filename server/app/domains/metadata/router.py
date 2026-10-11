@@ -35,8 +35,8 @@ async def metadata_status(source_dir: str | None = None) -> dict:
 @router.post("/hb/refresh")
 async def refresh_hb_choice() -> dict:
     """当月 HB Choice 游戏侧标记 + 已标记未取价补首爬
-    （调度器每日自动跑同一入口，可手动触发）。"""
-    result = await service.refresh_hb_choice()
+    （调度器每日自动跑同一入口；手动触发强制重打标，绕过月包判重）。"""
+    result = await service.refresh_hb_choice(force=True)
     result["backfill"] = await service.backfill_hb_prices()
     return result
 

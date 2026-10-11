@@ -42,6 +42,15 @@ const strategy = ref<ProxyStrategy>({ strategy: '', clashPort: 7890 })
 const events = ref<Awaited<ReturnType<typeof proxiesApi.events>>>([])
 const clash = ref<ClashStatus | null>(null)
 const loading = ref(true)
+// 运行态文案：入口未就绪（进程活着但混合端口没在听）时如实降级展示，
+// 不让「运行中 · 端口 N」伪装成可用
+const clashRunningText = computed(() => {
+  if (!clash.value?.running) return t('proxies.clash.stopped')
+  if (clash.value.entryReady === false) {
+    return t('proxies.clash.entryNotReady', { port: clash.value.port })
+  }
+  return t('proxies.clash.running', { port: clash.value.port })
+})
 const testingAll = ref(false)
 const testingId = ref<number | null>(null)
 
@@ -910,8 +919,8 @@ function jobRunDuration(ms: number | null): string {
 
       <div class="proxyx-clash">
         <div class="proxyx-clash-status">
-          <span class="tag" :class="clash?.running ? 'tag--success' : ''">
-            {{ clash?.running ? t('proxies.clash.running', { port: clash.port }) : t('proxies.clash.stopped') }}
+          <span class="tag" :class="clash?.running ? (clash?.entryReady === false ? 'tag--danger' : 'tag--success') : ''">
+            {{ clashRunningText }}
           </span>
           <span class="tag" :class="clash?.kernel.found ? 'tag--accent' : 'tag--danger'">
             {{ t(clash?.kernel.found ? 'proxies.kernel.ready' : 'proxies.kernel.missing') }}

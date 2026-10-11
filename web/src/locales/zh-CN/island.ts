@@ -17,6 +17,7 @@ const island = {
   /* 空闲态：价格更新结论（数据已旧时占岛） */
   'island.price.waiting': '等待更新',
   'island.price.running': '正在更新游戏价格',
+  'island.price.finalizing': '正在汇总本轮更新结果…',
   'island.price.done': '价格已更新',
   'island.price.partial': '更新未完成',
   'island.price.stale': '价格未更新',
@@ -31,6 +32,14 @@ const island = {
   'island.ago.days': '{n} 天前',
 
   /* 内容链事实通知（服务端判定事实变化，岛上消费展示） */
+  /* 代理体检/重建长任务（系统侧维护，进行中跨页占岛） */
+  'island.maintenance.health': '系统体检进行中：正在逐个检测代理节点',
+  'island.maintenance.healthProbed': '系统体检进行中：已检测 {n} 个节点',
+  'island.maintenance.healthDone': '系统体检完成：正常 {ok} · 异常 {fail} · 用时 {min} 分钟',
+  'island.maintenance.healthDoneSimple': '系统体检已完成',
+  'island.maintenance.rebuild': '代理通道重建中',
+  'island.maintenance.rebuildDone': '代理通道重建完成',
+
   'island.fact.hbChanged': 'Humble Choice 当月包已换新：{label}',
   'island.fact.hbChangedDetail': '本月 {count} 款 Steam 可兑换，清单见仪表盘卡片',
   'island.fact.epicRotation': 'Epic 喜加一轮换：新增 {count} 款免费',

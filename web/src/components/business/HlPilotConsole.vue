@@ -36,7 +36,6 @@ import { useI18n, type MessageKey } from '@/locales'
 import HlButton from '@/components/ui/HlButton.vue'
 import HlTextarea from '@/components/ui/HlTextarea.vue'
 import HlChip from '@/components/ui/HlChip.vue'
-import HlTag from '@/components/ui/HlTag.vue'
 import HlDropdown from '@/components/ui/HlDropdown.vue'
 import HlInput from '@/components/ui/HlInput.vue'
 import { message } from '@/components/ui'
@@ -52,7 +51,7 @@ import { useElementPicker, type PickedElement } from '@/composables/useElementPi
 const props = withDefaults(
   defineProps<{
     game?: { appid: number; name: string } | null
-    /** 整页模式：左侧常驻会话列（ZCode 语义），顶部标签栏退役；抽屉保持不变 */
+    /** 整页模式：左侧常驻会话列，顶部标签栏退役；抽屉保持不变 */
     page?: boolean
   }>(),
   { game: null, page: false },
@@ -134,6 +133,16 @@ interface Turn {
 
 const question = ref('')
 const streaming = ref(false)
+
+/** 草稿落盘闸门：挂载回填期间关闸，避免把空值/旧值反写覆盖磁盘上的草稿 */
+let draftReady = false
+
+/** 草稿落盘：只认「用户输入」一个来源，发送清空与切会话都要撤掉对应键 */
+watch(question, (v) => {
+  if (!draftReady) return
+  writeDraft(sessionId.value, v)
+})
+
 /** 本轮流式阶段的活账本：step_start 开新段，思考/正文/工具按段归位 */
 const livePhases = ref<PilotPhase[]>([])
 // 排队可见性：供应商按 Key 串行 / 工具执行期都可能长时间无增量——ack.active>1
@@ -324,7 +333,7 @@ const renameText = ref('')
 const deleteArmSid = ref('')
 let deleteArmTimer: ReturnType<typeof setTimeout> | null = null
 const referenceSession = ref<{ sid: string; title: string } | null>(null)
-// 标签栏打开集：× 只关标签不删会话（ZCode 语义）；账本里的会话随时可从历史面板找回
+// 标签栏打开集：× 只关标签不删会话；账本里的会话随时可从历史面板找回
 const openSids = ref<string[]>([])
 const historyOpen = ref(false)
 const historyRoot = ref<HTMLElement | null>(null)
@@ -372,6 +381,37 @@ function saveSessionId(id: string) {
 
 function newSessionId(): string {
   return globalThis.crypto?.randomUUID?.() ?? `s-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+/** 未发送的提问草稿按会话分键落盘，刷新/重开表面后原地恢复 */
+const DRAFT_KEY = 'holdexar-pilot-draft'
+
+function readDraft(sid: string): string {
+  if (!sid) return ''
+  try {
+    return localStorage.getItem(`${DRAFT_KEY}:${sid}`) ?? ''
+  } catch {
+    return ''
+  }
+}
+
+function writeDraft(sid: string, text: string) {
+  if (!sid) return
+  try {
+    if (text) localStorage.setItem(`${DRAFT_KEY}:${sid}`, text)
+    else localStorage.removeItem(`${DRAFT_KEY}:${sid}`)
+  } catch {
+    /* 存储不可用时静默：草稿仅当前生命周期有效 */
+  }
+}
+
+function dropDraft(sid: string) {
+  if (!sid) return
+  try {
+    localStorage.removeItem(`${DRAFT_KEY}:${sid}`)
+  } catch {
+    /* 同上 */
+  }
 }
 
 const OPEN_SIDS_KEY = 'holdexar-pilot-open-sids'
@@ -430,6 +470,10 @@ onMounted(() => {
     sessionId.value = newSessionId()
     saveSessionId(sessionId.value)
   }
+  // 草稿回填：无条件按当前会话取盘上值——编辑器此刻必为空（刚挂载），
+  // 回填后开闸，之后每次输入才允许反写
+  question.value = readDraft(sessionId.value)
+  draftReady = true
   loadQueue()
 })
 
@@ -453,7 +497,7 @@ async function loadPilotStatus(retry = 0): Promise<void> {
   }
 }
 
-// 模型就地切换（ZCode 对话面板样式）：ghost chip 弹向上清单，点击即切不关抽屉
+// 模型就地切换：ghost chip 弹向上清单，点击即切不关抽屉
 /** 分组清单：按供应商收敛，每组只出启用模型；当前模型不在启用清单也保底可见 */
 const menuGroups = computed(() =>
   pilotProviders.value.map((p) => {
@@ -522,7 +566,9 @@ async function restoreSession(sid: string) {
     // 会话统计投影（底栏与消耗明细种子）：空会话为 null，不在旧会话上残留
     sessionStats.value = data.stats ?? null
     forkedFrom.value = data.forked_from ?? null
-    if (!data.turns.length) return
+    const inflightQ = String(data.inflight_q ?? '')
+    // 只有已落账本轮次、且没有在飞轮：确属空会话（无可渲染事实）
+    if (!data.turns.length && !inflightQ) return
     proposalStates.value = new Map(
       (data.proposals ?? []).map((p) => [p.pid, { ...p, failedCount: p.failedCount ?? 0 }]),
     )
@@ -537,6 +583,12 @@ async function restoreSession(sid: string) {
         }
       }
     })
+    // 在飞轮补一屏：刷新/重开表面后，进行中那一轮不能凭空消失
+    // （该轮终态落账本、或在飞登记撤下后，下次 restore 自然不再出现）
+    if (inflightQ) {
+      items.push({ q: inflightQ, kind: 'pending', steps: [], turnIndex: items.length })
+      markRunningLocal(sid, true)
+    }
     for (let i = items.length - 1; i >= 0; i--) {
       if (items[i].kind === 'answer' || items[i].text) {
         items[i].expanded = true
@@ -568,8 +620,11 @@ function startNewChat() {
   livePhases.value = []
   lastCtx.value = null
   sessionStats.value = null
+  draftReady = false
   sessionId.value = newSessionId()
   saveSessionId(sessionId.value)
+  question.value = ''
+  draftReady = true
   loadQueue()
   referenceSession.value = null
   forkedFrom.value = null
@@ -706,6 +761,8 @@ const onFreshChat = computed(
 
 async function switchSession(sid: string) {
   if (streaming.value || sid === sessionId.value) return
+  // 草稿按会话分账：切走前先关闸，防止旧会话文本被写进新会话的键
+  draftReady = false
   sessionId.value = sid
   saveSessionId(sid)
   loadQueue()
@@ -715,6 +772,8 @@ async function switchSession(sid: string) {
   sessionStats.value = null
   referenceSession.value = null
   forkedFrom.value = null
+  question.value = readDraft(sid)
+  draftReady = true
   await restoreSession(sid)
 }
 
@@ -1368,6 +1427,27 @@ function removePendingAttachment(id: string) {
   pendingAttachments.value = pendingAttachments.value.filter((a) => a.id !== id)
 }
 
+/** 同类引用收拢胶囊：悬停/点击弹清单（面板内单条删除，胶囊 ✕ 全清）；条目清空即收起 */
+const attGroupOpen = ref(false)
+const elGroupOpen = ref(false)
+watch(pendingAttachments, (v) => {
+  if (!v.length) attGroupOpen.value = false
+})
+watch(pickedElements, (v) => {
+  if (!v.length) elGroupOpen.value = false
+})
+const attachGroupLabel = computed(() => {
+  const atts = pendingAttachments.value
+  if (!atts.length) return t('pilot.attach.uploading')
+  if (atts.length === 1) return t('pilot.attach.chip', { name: atts[0].name, n: atts[0].lines })
+  return t('pilot.attach.group', { n: atts.length })
+})
+const elGroupLabel = computed(() => {
+  const els = pickedElements.value
+  if (els.length === 1) return t('pilot.elPicker.chip', { tag: els[0].tag, label: els[0].label || els[0].text })
+  return t('pilot.elPicker.group', { n: els.length })
+})
+
 /** 粘贴拦截：短文本照常进输入框；长文本落盘换引用（长度不再是输入的天花板） */
 function onComposerPaste(e: ClipboardEvent) {
   const text = e.clipboardData?.getData('text/plain') ?? ''
@@ -1466,6 +1546,7 @@ function takeQueued(id: number) {
   const item = queue.value.find((i) => i.id === id)
   if (!item) return
   question.value = item.text
+  writeDraft(sessionId.value, item.text)
   removeQueued(id)
   void nextTick(() => (composer.value?.$el as HTMLTextAreaElement | undefined)?.focus())
 }
@@ -1691,11 +1772,17 @@ async function ask(text?: string, resume?: PilotResumePayload) {
   if (streaming.value) {
     // 生成中提交 = 排队，不丢弃输入（队列表只存文本，附件不随队：
     // 只挂附件没写字就不入队，否则会排一句空指向的占位话）
-    if (!text) question.value = ''
+    if (!text) {
+      question.value = ''
+      dropDraft(sessionId.value)
+    }
     if (typedQ) pushQueue(typedQ)
     return
   }
-  if (!text) question.value = ''
+  if (!text) {
+    question.value = ''
+    dropDraft(sessionId.value)
+  }
   pendingAttachments.value = []
   // 元素引用随本轮发送后即清空（一次性，与附件同语义）
   const sentElRefs = elementRefs.value.length ? [...elementRefs.value] : null
@@ -1845,6 +1932,10 @@ async function ask(text?: string, resume?: PilotResumePayload) {
     } as Turn
   } else if (stopped) {
     // 中断保留已流出的阶段与终答候选，历史轮仍可展开过程；已即时下发的卡片一并保留
+    // 后端不为中断补发工具终态帧：快照残留 running 的步骤就地收口为 stopped
+    for (const s of snapshotSteps) {
+      if (s.status === 'running') s.status = 'stopped'
+    }
     turn = {
       q: shownQ,
       kind: 'answer',
@@ -2341,7 +2432,7 @@ function triggerFollowUp(prompt: string) {
         <span class="pilot-forkline__line" aria-hidden="true"></span>
       </button>
       <div v-for="(turn, i) in turns" :key="i" class="pilot-turn" :data-turn-index="turn.kind === 'compact' ? undefined : i">
-        <!-- 压缩分隔线：账本边界事件，历史消息一条不动（ZCode 压缩语义） -->
+        <!-- 压缩分隔线：账本边界事件，历史消息一条不动 -->
         <div v-if="turn.kind === 'compact'" class="pilot-compact">
           <span class="pilot-compact__line" aria-hidden="true"></span>
           <span class="pilot-compact__pill">
@@ -2462,7 +2553,7 @@ function triggerFollowUp(prompt: string) {
               </svg>
             </span>
             <span class="pilot-reply__role">Pilot</span>
-            <!-- 中断续跑：已完成的工具事实回灌，接着把这一轮做完（ZCode 语义） -->
+            <!-- 中断续跑：已完成的工具事实回灌，接着把这一轮做完 -->
             <button
               v-if="turn.stopped && !streaming"
               type="button"
@@ -2815,6 +2906,127 @@ function triggerFollowUp(prompt: string) {
     </div>
 
     <div class="pilot-composer">
+      <!-- 引用区：一次性上下文（当前对象 / 跨会话引用 / 待发附件 / 页面元素），顶置在输入文本上方，多枚自动换行 -->
+      <div
+        v-if="game || referenceSession || pendingAttachments.length || attachBusy || pickedElements.length"
+        class="pilot-composer__refs"
+      >
+        <!-- 当前对象上下文：随页面而来，不可移除 -->
+        <span v-if="game" class="pilot-ref" :title="game.name">
+          <HlImg
+            :src="pilotCoverUrl(game.appid)"
+            :alt="game.name"
+            loading="lazy"
+            class="pilot-ref__cover"
+          >
+            <template #fallback>
+              <span class="pilot-ref__cover-fallback">{{ (game.name || '').slice(0, 1) }}</span>
+            </template>
+          </HlImg>
+          <span class="pilot-ref__label">{{ t('pilot.context.of') }} · {{ game.name }}</span>
+        </span>
+        <!-- 跨会话引用：+ 弹最近会话清单（排除当前），选中后下一轮提问携带其要点（一次性） -->
+        <span v-if="referenceSession" class="pilot-ref" :title="referenceSession.title">
+          <svg class="pilot-ref__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <path d="M4 6a3 3 0 0 1 3-3h10a3 3 0 0 1 3 3v7a3 3 0 0 1-3 3H9l-5 4V6z" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+          <span class="pilot-ref__label">{{ t('pilot.ref.chip', { title: referenceSession.title }) }}</span>
+          <button type="button" class="pilot-ref__x" :aria-label="t('pilot.ref.remove')" @click="referenceSession = null">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">
+              <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
+            </svg>
+          </button>
+        </span>
+        <!-- 待发附件：同类收拢为一颗胶囊，悬停/点击弹清单（面板内单条删除，胶囊 ✕ 全清） -->
+        <div
+          v-if="pendingAttachments.length || attachBusy"
+          class="pilot-ref is-group"
+          :class="{ 'is-busy': !pendingAttachments.length }"
+          @click="attGroupOpen = !attGroupOpen"
+          @mouseenter="attGroupOpen = true"
+          @mouseleave="attGroupOpen = false"
+        >
+          <svg class="pilot-ref__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+          <span class="pilot-ref__label">{{ attachGroupLabel }}</span>
+          <button
+            v-if="pendingAttachments.length"
+            type="button"
+            class="pilot-ref__x"
+            :aria-label="t('pilot.ref.remove')"
+            @click.stop="pendingAttachments = []"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">
+              <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
+            </svg>
+          </button>
+          <Transition name="hl-pop">
+            <div v-if="attGroupOpen && pendingAttachments.length" class="pilot-ref__panel">
+              <div v-for="a in pendingAttachments" :key="a.id" class="pilot-ref__row" :title="a.name">
+                <svg class="pilot-ref__row-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                  <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+                <div class="pilot-ref__row-main">
+                  <div class="pilot-ref__row-title">{{ a.name }}</div>
+                  <div class="pilot-ref__row-meta">{{ t('pilot.attach.meta', { chars: fmtChars(a.chars), lines: a.lines }) }}</div>
+                </div>
+                <button
+                  type="button"
+                  class="pilot-ref__row-x"
+                  :aria-label="t('pilot.ref.remove')"
+                  @click.stop="removePendingAttachment(a.id)"
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">
+                    <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          </Transition>
+        </div>
+        <!-- 页面元素引用：同类收拢为一颗胶囊，悬停/点击弹清单；选择模式内再点已选元素仍可取消 -->
+        <div
+          v-if="pickedElements.length"
+          class="pilot-ref is-group"
+          @click="elGroupOpen = !elGroupOpen"
+          @mouseenter="elGroupOpen = true"
+          @mouseleave="elGroupOpen = false"
+        >
+          <svg class="pilot-ref__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <path d="M3 3l7 19 2-8 8-2L3 3z" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+          <span class="pilot-ref__label">{{ elGroupLabel }}</span>
+          <button type="button" class="pilot-ref__x" :aria-label="t('pilot.ref.remove')" @click.stop="clearPickedEls()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">
+              <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
+            </svg>
+          </button>
+          <Transition name="hl-pop">
+            <div v-if="elGroupOpen" class="pilot-ref__panel">
+              <div v-for="el in pickedElements" :key="el.id" class="pilot-ref__row" :title="el.selector">
+                <svg class="pilot-ref__row-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                  <path d="M3 3l7 19 2-8 8-2L3 3z" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+                <div class="pilot-ref__row-main">
+                  <div class="pilot-ref__row-title">{{ el.label || el.text }}</div>
+                  <div class="pilot-ref__row-meta">{{ el.tag }} · {{ el.selector }}</div>
+                </div>
+                <button
+                  type="button"
+                  class="pilot-ref__row-x"
+                  :aria-label="t('pilot.ref.remove')"
+                  @click.stop="removePickedEl(el.id)"
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">
+                    <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          </Transition>
+        </div>
+      </div>
       <HlTextarea
         ref="composer"
         v-model="question"
@@ -2826,7 +3038,6 @@ function triggerFollowUp(prompt: string) {
       />
       <div class="pilot-composer__bar">
         <div class="pilot-composer__chips">
-          <!-- 跨会话引用：+ 弹最近会话清单（排除当前），选中后下一轮提问携带其要点（一次性） -->
           <HlDropdown :items="plusMenuItems" trigger="click" direction="up" @select="onMenuSelect">
             <HlChip tone="neutral" class="pilot-ref-add" :title="t('pilot.ref.add')">
               <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -2834,58 +3045,19 @@ function triggerFollowUp(prompt: string) {
               </svg>
             </HlChip>
           </HlDropdown>
-          <HlTag v-if="referenceSession" type="accent" closable @close="referenceSession = null">
-            {{ t('pilot.ref.chip', { title: referenceSession.title }) }}
-          </HlTag>
-          <!-- 待发附件：长文本已落盘，这里只是引用（发送后随该轮上屏） -->
-          <HlTag
-            v-for="a in pendingAttachments"
-            :key="a.id"
-            type="accent"
-            closable
-            @close="removePendingAttachment(a.id)"
-          >
-            {{ t('pilot.attach.chip', { name: a.name, n: a.lines }) }}
-          </HlTag>
-          <HlChip v-if="attachBusy" tone="neutral" :title="t('pilot.attach.uploading')">
-            {{ t('pilot.attach.uploading') }}
-          </HlChip>
-          <!-- 页面元素引用：点击进入选择模式，选中元素后以 chip 展示 -->
+          <!-- 页面元素选择：点击进入选择模式，再点已选元素可取消 -->
           <button
             type="button"
             class="pilot-el-pick"
             :class="{ 'is-active': elPicking }"
             :title="elPicking ? t('pilot.elPicker.cancel') : t('pilot.elPicker.start')"
             :aria-label="elPicking ? t('pilot.elPicker.cancel') : t('pilot.elPicker.start')"
-            @click="elPicking ? cancelElPicking() : startElPicking()"
+            @click="elPicking ? cancelElPicking() : startElPicking({ pickedHint: t('pilot.elPicker.picked') })"
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
               <path d="M3 3l7 19 2-8 8-2L3 3z" stroke-linecap="round" stroke-linejoin="round" />
             </svg>
           </button>
-          <HlTag
-            v-for="el in pickedElements"
-            :key="el.id"
-            type="accent"
-            closable
-            :title="el.selector"
-            @close="removePickedEl(el.id)"
-          >
-            {{ t('pilot.elPicker.chip', { tag: el.tag, label: el.label || el.text }) }}
-          </HlTag>
-          <HlTag v-if="game" type="accent" class="pilot-game-tag">
-            <HlImg
-              :src="pilotCoverUrl(game.appid)"
-              :alt="game.name"
-              loading="lazy"
-              class="pilot-game-tag__cover"
-            >
-              <template #fallback>
-                <span class="pilot-game-tag__cover-fallback">{{ (game.name || '').slice(0, 1) }}</span>
-              </template>
-            </HlImg>
-            <span class="pilot-game-tag__text">{{ t('pilot.context.of') }} · {{ game.name }}</span>
-          </HlTag>
           <div
             class="pilot-ctxpick"
             @click.stop
@@ -2983,7 +3155,7 @@ function triggerFollowUp(prompt: string) {
         </div>
 
         <div class="pilot-composer__right">
-          <!-- 模型就地切换：ZCode 对话面板样式（ghost chip + 向上清单 + 底部管理入口） -->
+          <!-- 模型就地切换：ghost chip + 向上清单 + 底部管理入口 -->
           <div v-if="pilotReady" ref="modelPickRoot" class="pilot-modelpick" @click.stop>
             <button
               type="button"
@@ -3706,8 +3878,8 @@ function triggerFollowUp(prompt: string) {
   background: transparent;
   color: var(--text-secondary);
   cursor: pointer;
-  transition: background var(--duration-2) var(--motion-default),
-    color var(--duration-2) var(--motion-default);
+  transition: background calc(var(--duration-2) * var(--motion-scale)) ease,
+    color calc(var(--duration-2) * var(--motion-scale)) ease;
 }
 .pilot-el-pick:hover {
   background: var(--bg-hover);
@@ -3811,41 +3983,216 @@ function triggerFollowUp(prompt: string) {
   color: var(--text-secondary);
 }
 
-.pilot-game-tag {
-  display: inline-flex !important;
+/* 引用区：一次性上下文胶囊（当前对象 / 引用 / 附件 / 页面元素），删除钮 hover 显形 */
+.pilot-composer__refs {
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 5px;
-  padding-left: 4px !important;
+  gap: 6px;
 }
 
-.pilot-game-tag__cover {
-  width: 20px;
+.pilot-ref {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 3px 6px 3px 9px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--bg-soft);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.pilot-ref__icon {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  color: var(--text-muted);
+}
+
+.pilot-ref__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 200px;
+}
+
+.pilot-ref__cover {
+  width: 26px;
   aspect-ratio: 460 / 215;
   border-radius: var(--radius-xs, 2px);
   overflow: hidden;
   background: var(--surface-inset);
   display: grid;
   place-items: center;
-  flex-shrink: 0;
+  flex: none;
 }
 
-.pilot-game-tag__cover :deep(img) {
+.pilot-ref__cover :deep(img) {
   width: 100%;
   height: 100%;
   object-fit: cover;
 }
 
-.pilot-game-tag__cover-fallback {
+.pilot-ref__cover-fallback {
   font-size: 9px;
   font-weight: 700;
   color: var(--text-muted);
 }
 
-.pilot-game-tag__text {
+.pilot-ref__x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity calc(var(--duration-2) * var(--motion-scale)) ease,
+    background calc(var(--duration-2) * var(--motion-scale)) ease,
+    color calc(var(--duration-2) * var(--motion-scale)) ease;
+}
+
+.pilot-ref:hover .pilot-ref__x,
+.pilot-ref__x:focus-visible {
+  opacity: 1;
+}
+
+.pilot-ref__x:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.pilot-ref__x svg {
+  width: 9px;
+  height: 9px;
+  display: block;
+}
+
+@media (hover: none) {
+  .pilot-ref__x {
+    opacity: 1;
+  }
+}
+
+.pilot-ref.is-busy {
+  padding: 3px 9px;
+  border-style: dashed;
+  background: transparent;
+  color: var(--text-muted);
+}
+
+/* 收拢组：同类引用一颗胶囊，清单面板向上弹（同上下文环面板语言） */
+.pilot-ref.is-group {
+  position: relative;
+  cursor: default;
+}
+
+.pilot-ref__panel {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: 7;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 320px;
+  max-height: 264px;
+  overflow-y: auto;
+  padding: 6px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  box-shadow: var(--shadow-lg);
+}
+
+.pilot-ref__row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 26px 5px 8px;
+  border-radius: 8px;
+}
+
+.pilot-ref__row:hover {
+  background: var(--bg-hover);
+}
+
+.pilot-ref__row-icon {
+  width: 12px;
+  height: 12px;
+  flex: none;
+  color: var(--text-muted);
+}
+
+.pilot-ref__row-main {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.pilot-ref__row-title {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 160px;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.pilot-ref__row-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.pilot-ref__row-x {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity calc(var(--duration-2) * var(--motion-scale)) ease,
+    background calc(var(--duration-2) * var(--motion-scale)) ease,
+    color calc(var(--duration-2) * var(--motion-scale)) ease;
+}
+
+.pilot-ref__row:hover .pilot-ref__row-x,
+.pilot-ref__row-x:focus-visible {
+  opacity: 1;
+}
+
+.pilot-ref__row-x:hover {
+  background: var(--border-soft);
+  color: var(--text-primary);
+}
+
+@media (hover: none) {
+  .pilot-ref__row-x {
+    opacity: 1;
+  }
 }
 
 .pilot-ctxpick {
@@ -4155,10 +4502,6 @@ function triggerFollowUp(prompt: string) {
 .pilot-compact__pill svg {
   width: 12px;
   height: 12px;
-}
-
-.pilot-composer__chips .hl-chip.is-warn {
-  color: var(--warning);
 }
 
 .pilot-composer__chips {
@@ -5279,7 +5622,7 @@ function triggerFollowUp(prompt: string) {
   font-size: 13px;
 }
 
-/* 模型就地切换：ghost chip + 向上弹清单（ZCode 对话面板样式） */
+/* 模型就地切换：ghost chip + 向上弹清单 */
 .pilot-modelpick {
   position: relative;
 }

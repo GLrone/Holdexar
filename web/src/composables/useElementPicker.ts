@@ -1,14 +1,13 @@
 /**
- * 页面元素选择器（仿 ZCode useWebElementPicker）
+ * 页面元素选择器
  *
  * 交互流程：点击按钮 → 进入选择模式（crosshair cursor + hover 高亮 overlay）→
- * 点击元素 → 采集摘要 → 退出选择模式 → 以 chip 形式显示在输入框。
- * Esc 取消选择。
+ * 点击元素采集为引用并退出；点击已采集的元素则移除该引用（再点一次即取消）。
+ * Esc 取消本次选择，已采集引用保持不变。
  *
- * 与 ZCode 的关键差异：不采集完整 HTML/CSS/rect，只采集「agent 需要知道
- * 用户指代什么」的最小信息——标签、文本、selector、role、accessibleName。
- * 同一页面的其他组件仍可选择（不做全局屏蔽），agent 默认无法读取的组件
- * 不生效由后端按页面路由白名单决定，前端不做拦截。
+ * 只采集「agent 需要知道用户指代什么」的最小信息——标签、文本、selector、
+ * role、accessibleName，不采集完整 HTML/CSS/rect。同一页面的其他组件仍可
+ * 选择（不做全局屏蔽），能否读取由后端按页面路由白名单决定，前端不拦截。
  */
 import { ref, onBeforeUnmount } from 'vue'
 
@@ -145,10 +144,21 @@ function getSection(el: Element): string {
 export function useElementPicker() {
   const isPicking = ref(false)
   const picked = ref<PickedElement[]>([])
+  /** 已采集引用的 DOM 节点登记（id → 元素）：点击时按元素身份判定加入还是移除 */
+  const pickedNodes = new Map<string, Element>()
+  /** hover 到已采集元素时标签框里的提示文案（由调用方传入，组合式函数不碰 i18n） */
+  let pickedHint = ''
   let overlay: HTMLDivElement | null = null
   let label: HTMLDivElement | null = null
   let hoveredEl: Element | null = null
   let settled = false
+
+  function findPickedId(el: Element): string | null {
+    for (const [id, node] of pickedNodes) {
+      if (node === el) return id
+    }
+    return null
+  }
 
   function cleanup() {
     document.removeEventListener('mousemove', onMouseMove, true)
@@ -185,6 +195,8 @@ export function useElementPicker() {
     overlay.style.top = `${Math.max(0, rect.top)}px`
     overlay.style.width = `${rect.width}px`
     overlay.style.height = `${rect.height}px`
+    // 已采集元素用虚线框区分，配合标签框提示「点击将取消」
+    overlay.style.borderStyle = findPickedId(target) ? 'dashed' : 'solid'
 
     // 标签框
     label.style.display = 'block'
@@ -206,6 +218,17 @@ export function useElementPicker() {
         marginTop: '2px',
       })
       tag.append(n)
+    }
+    if (pickedHint && findPickedId(target)) {
+      const hint = document.createElement('div')
+      hint.textContent = pickedHint
+      Object.assign(hint.style, {
+        color: 'var(--text-on-fill, rgba(255,255,255,0.7))',
+        fontSize: '12px',
+        fontWeight: '600',
+        marginTop: '2px',
+      })
+      tag.append(hint)
     }
     label.append(tag)
 
@@ -233,17 +256,25 @@ export function useElementPicker() {
     e.stopPropagation()
     e.stopImmediatePropagation()
     if (!hoveredEl) {
-      finish(null)
+      finish()
       return
     }
-    finish(collectElement(hoveredEl))
+    // toggle：点击已采集元素 = 移除该引用，点击未采集元素 = 新增
+    const target = hoveredEl
+    const existingId = findPickedId(target)
+    finish()
+    if (existingId) {
+      removePicked(existingId)
+    } else {
+      addPicked(collectElement(target), target)
+    }
   }
 
   function onKeyDown(e: KeyboardEvent) {
     if (e.key !== 'Escape') return
     e.preventDefault()
     e.stopPropagation()
-    finish(null)
+    finish()
   }
 
   function collectElement(el: Element): PickedElement {
@@ -259,19 +290,22 @@ export function useElementPicker() {
     }
   }
 
-  function finish(element: PickedElement | null) {
+  function addPicked(element: PickedElement, node: Element) {
+    pickedNodes.set(element.id, node)
+    picked.value = [...picked.value, element]
+  }
+
+  function finish() {
     if (settled) return
     settled = true
     cleanup()
-    if (element) {
-      picked.value = [...picked.value, element]
-    }
   }
 
-  function startPicking() {
+  function startPicking(opts?: { pickedHint?: string }) {
     if (isPicking.value) return
     isPicking.value = true
     settled = false
+    pickedHint = opts?.pickedHint ?? ''
 
     overlay = document.createElement('div')
     overlay.setAttribute('data-hl-element-picker', 'overlay')
@@ -323,10 +357,12 @@ export function useElementPicker() {
   }
 
   function removePicked(id: string) {
+    pickedNodes.delete(id)
     picked.value = picked.value.filter((p) => p.id !== id)
   }
 
   function clearPicked() {
+    pickedNodes.clear()
     picked.value = []
   }
 

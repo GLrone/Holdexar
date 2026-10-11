@@ -4,9 +4,11 @@
  *
  * 数据链：GET /metadata/hb/offers（纯本地库读：记账游标 → 当月标签 →
  * games.is_hb 标记行 + 国区价）→ 挂载即拉 + 每小时轻刷（抓取链每日跑，
- * 库内标记到位后卡片自动浮出）。游戏卡点击进站内详情页；头部「跳过本月 /
- * 前往月包」是官方页直达外链。归属徽章与卡片归属边框（已拥有/家庭共享/
- * 愿望单）走 ownership 批量接口，与游戏库同源配色与词条。
+ * 库内标记到位后卡片自动浮出）。「立即刷新」走 POST /metadata/hb/refresh
+ * 强制重打标（绕过月包判重）后重读清单，空态/异常时的手动恢复入口。
+ * 游戏卡点击进站内详情页；头部「跳过本月 / 前往月包」是官方页直达外链。
+ * 归属徽章与卡片归属边框（已拥有/家庭共享/愿望单）走 ownership 批量接口，
+ * 与游戏库同源配色与词条。
  */
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
@@ -15,7 +17,7 @@ import { metadataApi, type HbChoiceGame } from '@/api/client'
 import { formatCnyFen } from '@/api/regions'
 import { useI18n, type MessageKey } from '@/locales'
 import { useOwnershipStore, type OwnershipInfo, type OwnershipType } from '@/stores/ownership'
-import { HlEmpty, HlImg, HlSkeleton } from '@/components/ui'
+import { HlButton, HlEmpty, HlImg, HlSkeleton } from '@/components/ui'
 
 const router = useRouter()
 const { t } = useI18n()
@@ -27,6 +29,8 @@ const monthUrl = ref('')
 const skipUrl = ref('')
 /** loading=首次拉取中 / ok=有数据 / failed=无数据可显（尚未入库或拉取失败） */
 const state = ref<'loading' | 'ok' | 'failed'>('loading')
+/** 手动强刷进行中（按钮转圈防重入） */
+const refreshing = ref(false)
 
 async function load() {
   try {
@@ -45,6 +49,19 @@ async function load() {
   } catch {
     if (games.value.length === 0) state.value = 'failed'
   }
+}
+
+/** 手动强刷：强制重打标后重读清单（空态卡片的恢复入口） */
+async function refresh() {
+  if (refreshing.value) return
+  refreshing.value = true
+  try {
+    await metadataApi.hbRefresh()
+  } catch {
+    // 强刷失败保持原状态，清单重读不受阻
+  }
+  await load()
+  refreshing.value = false
 }
 
 // ─── 归属徽章（与游戏库 status-badge 同源词条/配色；存 key 渲染期 t()）───
@@ -100,6 +117,13 @@ onBeforeUnmount(() => {
         <span v-if="label" class="hb-choice__label">{{ label }}</span>
       </div>
       <div class="hb-choice__meta">
+        <HlButton
+          variant="text"
+          size="sm"
+          :loading="refreshing"
+          class="hb-choice__refresh"
+          @click="refresh"
+        >{{ refreshing ? t('hbChoice.refreshing') : t('hbChoice.refresh') }}</HlButton>
         <a
           v-if="skipUrl"
           class="hb-choice__link"
@@ -217,6 +241,11 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 12px;
   flex-shrink: 0;
+}
+
+/* 手动强刷按键：与外链同排同号字，accent 弱化避免抢过外链 */
+.hb-choice__refresh {
+  font-size: 12px;
 }
 
 /* 官方页直达外链（真实链接语义，非动作按键） */

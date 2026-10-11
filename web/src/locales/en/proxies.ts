@@ -34,8 +34,8 @@ const proxies: Partial<Record<MessageKey, string>> = {
   'proxies.strategy.updated': 'Routing policy updated (takes effect on the next job)',
 
   /* Local mixed port (standalone config, unaffected by policy) */
-  'proxies.port.label': 'Local mixed port',
-  'proxies.port.title': 'Mixed port of a Clash/Verge you start yourself (proxy-first fallback probes it)',
+  'proxies.port.label': 'Kernel port',
+  'proxies.port.title': 'Mixed port our own kernel listens on — all program proxy traffic goes through it; the Verge fallback probes 7897 regardless of this setting',
   'proxies.port.invalid': 'Port must be an integer between 1024 and 65535',
   'proxies.port.updated': 'Clash port updated',
 
@@ -65,6 +65,7 @@ const proxies: Partial<Record<MessageKey, string>> = {
 
   /* Clash run state and start/stop */
   'proxies.clash.running': 'Running · port {port}',
+  'proxies.clash.entryNotReady': 'Running · port {port} (entry not ready — port not listening)',
   'proxies.clash.stopped': 'Not running',
   'proxies.clash.notRunningTitle': 'Clash is not running',
   'proxies.clash.start': 'Start',

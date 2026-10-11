@@ -4,6 +4,7 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import type { PilotPhase, PilotStep } from '@/api/client'
 import { useI18n, type MessageKey } from '@/locales'
 import HlPilotThinking from '@/components/business/HlPilotThinking.vue'
+import { HlIcon } from '@/components/ui'
 import { fmtTokens } from '@/lib/pilotView'
 
 const props = withDefaults(
@@ -50,7 +51,7 @@ function phaseSec(p: PilotPhase): number | null {
 
 const stepTotal = computed(() => viewPhases.value.reduce((n, p) => n + p.steps.length, 0))
 
-const open = ref(props.live || props.failed)
+const open = ref(props.live)
 const userTouched = ref(false)
 
 function toggle() {
@@ -113,10 +114,14 @@ const memoryText = computed(() => {
   return parts.join(' · ')
 })
 
-const _SLOW_STEP_MS = 3000
+/* 词条缺键回落通用词：t 回落链末端返回 key 本身，不把 key 渲染给用户 */
+function dictLabel(key: MessageKey): string {
+  const text = t(key)
+  return text === key ? t('pilot.step.generic') : text
+}
 
 function navModuleName(target: string): string {
-  return t(`pilot.nav.${target}` as MessageKey)
+  return dictLabel(`pilot.nav.${target}` as MessageKey)
 }
 
 function plainInline(s: string): string {
@@ -131,11 +136,13 @@ function phasePre(p: PilotPhase): string {
 
 function stepText(s: PilotStep): string {
   if (s.status === 'denied') return t('pilot.step.denied')
-  const parts: string[] = [t(`pilot.step.${s.label}` as MessageKey)]
+  const parts: string[] = [dictLabel(`pilot.step.${s.label}` as MessageKey)]
   if (s.status === 'running') {
-    void liveSec.value
-    const ms = s.elapsedMs ?? (s.startedAt ? Date.now() - s.startedAt : 0)
-    parts.push(t('pilot.step.running', { sec: Math.max(0, Math.round(ms / 1000)) }))
+    parts.push(t('pilot.step.running'))
+    return parts.join(' · ')
+  }
+  if (s.status === 'stopped') {
+    parts.push(t('pilot.step.stopped'))
     return parts.join(' · ')
   }
   if (s.status === 'timeout') {
@@ -151,9 +158,6 @@ function stepText(s: PilotStep): string {
   } else if (s.data.name) {
     parts.push(t('pilot.step.target', { name: s.data.name }))
   }
-  if (typeof s.elapsedMs === 'number' && s.elapsedMs >= _SLOW_STEP_MS) {
-    parts.push(t('pilot.step.duration', { sec: Math.round(s.elapsedMs / 1000) }))
-  }
   return parts.join(' · ')
 }
 </script>
@@ -162,9 +166,10 @@ function stepText(s: PilotStep): string {
   <div class="pchain" :class="{ 'is-open': open, 'is-live': live }">
     <button type="button" class="pchain__head" @click="toggle">
       <div class="pchain__indicator">
-        <svg v-if="live" class="pchain__live-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-        </svg>
+        <HlIcon v-if="live" name="zap" :size="13" />
+        <span v-else-if="failed" class="pchain__fail-icon">
+          <HlIcon name="close" :size="12" />
+        </span>
         <span v-else class="pchain__done-icon">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <polyline points="20 6 9 17 4 12" />
@@ -173,7 +178,7 @@ function stepText(s: PilotStep): string {
       </div>
       <span class="pchain__label" :class="{ 'is-shimmer': live }">{{ headLabel }}</span>
       <svg class="pchain__chevron" :class="{ 'is-open': open }" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <polyline points="6 9 12 15 18 9" />
+        <polyline points="9 6 15 12 9 18" />
       </svg>
     </button>
 
@@ -207,9 +212,7 @@ function stepText(s: PilotStep): string {
               <svg v-if="s.status === 'ok'" class="pilot-step__svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <polyline points="20 6 9 17 4 12" />
               </svg>
-              <svg v-else-if="s.status === 'running'" class="pilot-step__svg is-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true">
-                <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-              </svg>
+              <HlIcon v-else-if="s.status === 'running'" name="zap" :size="12" />
               <svg v-else-if="s.status === 'failed'" class="pilot-step__svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true">
                 <line x1="18" y1="6" x2="6" y2="18" />
                 <line x1="6" y1="6" x2="18" y2="18" />
@@ -281,15 +284,13 @@ function stepText(s: PilotStep): string {
   color: var(--accent);
 }
 
-.pchain__live-spin {
+.pchain__fail-icon {
   width: 13px;
   height: 13px;
-  animation: pchain-spin 1.2s linear infinite;
-}
-
-@keyframes pchain-spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
+  color: var(--danger);
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .pchain__done-icon {
@@ -333,20 +334,24 @@ function stepText(s: PilotStep): string {
     background: none;
     color: var(--accent);
   }
-  .pchain__live-spin {
-    animation: none;
-  }
 }
 
 .pchain__chevron {
   width: 12px;
   height: 12px;
   color: var(--text-muted);
-  transition: transform var(--transition);
+  flex: none;
+  opacity: 0;
+  transition: transform var(--transition), opacity var(--transition);
+}
+
+.pchain__head:hover .pchain__chevron,
+.pchain.is-open .pchain__chevron {
+  opacity: 1;
 }
 
 .pchain__chevron.is-open {
-  transform: rotate(180deg);
+  transform: rotate(90deg);
 }
 
 .pchain__body {
@@ -443,10 +448,6 @@ function stepText(s: PilotStep): string {
 
 .pilot-step.is-denied .pilot-step__icon-box {
   color: var(--warning);
-}
-
-.pilot-step__svg.is-spin {
-  animation: pchain-spin 1s linear infinite;
 }
 
 .pilot-step__dot-subtle {

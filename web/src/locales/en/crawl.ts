@@ -50,6 +50,9 @@ const crawl: Partial<Record<MessageKey, string>> = {
     'Starting the job: the backend is enqueuing work and assigning exits — one moment',
   'crawl.sys.maintenance':
     'System health check in progress: proxy channels are being tested one by one; price crawling yields automatically — no action needed',
+  'crawl.sys.probed': '{n} nodes checked',
+  'crawl.sys.rebuild':
+    'Rebuilding proxy channels: exits are being reorganized; price crawling yields automatically — no action needed',
   'crawl.sys.throttled':
     'Waiting for send window: {n} requests queued by the rate limiter; the job will continue automatically',
 

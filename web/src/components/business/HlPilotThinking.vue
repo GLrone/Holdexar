@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * 思考链折叠行（对齐 ZCode 对话面板模式的自研实现）。
+ * 思考链折叠行。
  * 三态：流式展开 =「正在思考 · 秒表计时 + 吸底跟随」（默认展开，用户可手收为
  * 「正在思考 · 最新一行滚动摘要」扫光态）；完成 =「思考 · 用时 N 秒」。
  * 初始开合由 initialOpen 定（历史过程链内传 false），用户手动收合过则不再被自动展开；
@@ -168,7 +168,6 @@ const durLabel = computed(() => {
       ? t('pilot.think.waiting', { sec: waitSec.value })
       : (props.waitingText || t('pilot.think.waiting', { sec: 0 }))
   }
-  if (props.live && !props.text && props.waitingText) return props.waitingText
   if (props.live) {
     return open.value && liveSec.value
       ? t('pilot.think.liveElapsed', { sec: liveSec.value })
