@@ -36,7 +36,7 @@ from sqlalchemy import select
 
 from app.core.config import get_settings  # noqa: E402
 from app.core.database import get_engine, get_session_factory, init_db  # noqa: E402
-from app.crawler.occupancy import CrawlerBusyError, begin_crawl, crawler_busy, end_crawl  # noqa: E402
+from app.crawler.occupancy import CrawlerBusyError, begin_crawl, crawler_busy, end_crawl, end_maintenance  # noqa: E402
 from app.crawler.runner import CrawlRunConfig, run_crawl  # noqa: E402
 from app.domains.crawl import service as crawl_service  # noqa: E402
 from app.domains.proxies import clash_manager  # noqa: E402
@@ -177,12 +177,14 @@ def tmp_data_dir(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def clean_scheduling_state():
-    """占用与 pending 都是进程内状态，逐个测试清干净。"""
+    """占用、维护预约与 pending 都是进程内状态，逐个测试清干净。"""
     take_rebuild_pending()
+    end_maintenance()
     if crawler_busy():
         end_crawl()
     yield
     take_rebuild_pending()
+    end_maintenance()
     if crawler_busy():
         end_crawl()
 
@@ -876,3 +878,42 @@ async def test_proxypool_controller_port_is_dedicated(
         assert await _global_now(legacy.controller_url, legacy.secret) is not None
     finally:
         legacy.stop()
+
+@pytest.mark.asyncio
+async def test_consume_rebuild_after_crawl_noop_without_runtime(tmp_data_dir) -> None:
+    """池 Runtime 不在跑时收尾消费不动作（拉起内核的恢复路径归周期拍），
+    pending 原样保留给下一个 5min 拍。"""
+    from app.domains.proxypool import scheduling as sched
+
+    request_rebuild()
+    try:
+        await sched.consume_rebuild_after_crawl()
+        assert rebuild_pending(), "Runtime 不在跑时不得消费 pending"
+    finally:
+        take_rebuild_pending()
+
+
+@pytest.mark.asyncio
+async def test_end_crawl_kicks_rebuild_consume(tmp_data_dir, monkeypatch) -> None:
+    """占用释放即触发收尾重建消费：任务结束后剔除已标记移除的节点，
+    不等下一个 5min 拍。"""
+    from app.crawler import occupancy
+    from app.domains.proxypool import scheduling as sched
+
+    called: list[bool] = []
+
+    async def fake_consume() -> None:
+        called.append(True)
+
+    monkeypatch.setattr(sched, "rebuild_pending", lambda: True)
+    monkeypatch.setattr(sched, "consume_rebuild_after_crawl", fake_consume)
+    begin_crawl("kick-test")
+    try:
+        end_crawl()
+        for _ in range(50):
+            if called:
+                break
+            await asyncio.sleep(0.01)
+        assert called, "end_crawl 应触发一次收尾重建消费"
+    finally:
+        end_crawl()

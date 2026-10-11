@@ -24,7 +24,7 @@ import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import WritePriority, get_session_factory
@@ -308,16 +308,28 @@ async def finish_run(
     return True
 
 
-async def mark_interrupted_runs(session: AsyncSession, now: datetime) -> int:
-    """把上次进程遗留的 `running` 标 `interrupted`（与 `cleanup_orphan_jobs` 同构）。
+# 进程启动时刻（模块导入即进程启动）：收尸只认上一进程遗留的行——
+# 后台收拾链可能晚于首个用户请求跑完，本进程监听后新建的行不得误标
+_PROCESS_STARTED_AT = datetime.now()
 
-    只认「进程已经不在」这个事实：调用点在启动链上，此刻不可能有本进程的作业在跑。
-    同一事务收体检台账的悬空行（finished_at IS NULL：进程在探测段被杀，run 行
-    永无正常收尾）；返回值只计作业行。
+
+async def mark_interrupted_runs(session: AsyncSession, now: datetime) -> int:
+    """把上一进程遗留的 `running` 标 `interrupted`（与 `cleanup_orphan_jobs` 同构）。
+
+    只认 `started_at` 早于本进程启动时刻的行（先开门再收拾：开门到收尸
+    之间本进程新建的 running 行是活作业，不动）。同一事务收体检台账的
+    悬空行（finished_at IS NULL：进程在探测段被杀，run 行永无正常收尾）；
+    返回值只计作业行。
     """
     rows = (
         await session.execute(
-            select(ProxyJobRun).where(ProxyJobRun.status == STATUS_RUNNING)
+            select(ProxyJobRun).where(
+                ProxyJobRun.status == STATUS_RUNNING,
+                or_(
+                    ProxyJobRun.started_at.is_(None),
+                    ProxyJobRun.started_at < _PROCESS_STARTED_AT,
+                ),
+            )
         )
     ).scalars().all()
     for row in rows:
@@ -331,7 +343,10 @@ async def mark_interrupted_runs(session: AsyncSession, now: datetime) -> int:
         row.error_summary = finalize_summary(summary)
     stale_runs = (
         await session.execute(
-            select(HealthRun).where(HealthRun.finished_at.is_(None))
+            select(HealthRun).where(
+                HealthRun.finished_at.is_(None),
+                HealthRun.started_at < _PROCESS_STARTED_AT,
+            )
         )
     ).scalars().all()
     for run in stale_runs:

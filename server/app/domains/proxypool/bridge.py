@@ -34,7 +34,12 @@ from app.domains.proxypool.models import (
     subscription_code,
 )
 from app.domains.proxypool.registry import _name_base
-from app.domains.proxypool.state import evaluate_node_state
+from app.domains.proxypool.state import (
+    NODE_DEAD,
+    NODE_RETIRED,
+    NODE_STALE,
+    evaluate_node_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -267,7 +272,10 @@ async def ingest_node_check(
             outcome.activated += 1
         if exit_added:
             outcome.exit_ips_added += 1
-        if state_changed or exit_added:
+        # 带 run_id 的轮次（手动体检/首检）逐节点落明细：HealthRun.total 数的
+        # 是全部实探节点，明细只在变化时才写会让台账与流水对不上账；周期账本
+        # 对齐（run_id=None）保持只记变化，避免每拍刷观测行。
+        if state_changed or exit_added or run_id is not None:
             _write_observations(
                 session, node, exit_ip=exit_ip, latency_ms=latency_ms, now=now,
                 run_id=run_id, channel=channel,
@@ -305,12 +313,15 @@ async def ingest_ledger(
         node = _match(by_source, by_runtime, int(row.subscription_id), str(row.name))
         if node is None:
             continue
-        # 池内已有**更新**的 L0 结论时，不用更早的体检结论覆盖它：否则
-        # 「L0 判死 → 体检账本再复活」会每拍互相推翻，节点状态永远翻烧饼。
+        # 池内已有**更新**的业务结论（L2 维护 / 生产证据都盖 last_l2_at）且节点
+        # 正被池判坏时，不用更早的体检结论复活它：否则「池判死 → 体检账本再
+        # 复活」每拍互相推翻，节点状态永远翻烧饼。节点健康或账本更新时照常
+        # 对齐——复活依据是更强的证据，出口 IP 回填也不受影响。
         if (
-            node.last_l0_at is not None
+            node.last_l2_at is not None
             and checked_at is not None
-            and node.last_l0_at > checked_at
+            and node.last_l2_at > checked_at
+            and node.state in (NODE_STALE, NODE_DEAD, NODE_RETIRED)
         ):
             continue
         outcome.matched += 1

@@ -192,9 +192,22 @@ async def sync_subscriptions(
                     # 而 Registry 仍停在旧快照。刷新一次再判，代价是一条 SELECT。
                     await session.refresh(sub)
                     if is_admitted(sub):
-                        await apply_snapshot(
+                        applied = await apply_snapshot(
                             session, subscription_id=sub_id, snapshot=snap, now=now
                         )
+                        # 出库留痕：快照对齐删除的来源与随之结算的节点是最高频的
+                        # 出库通道，零日志会让「这批节点为什么变 STALE」不可追溯
+                        if applied.removed_sources or applied.state_changes:
+                            log_event(
+                                logger,
+                                f"订阅 {sub_id} 快照对齐：移除 {len(applied.removed_sources)} 个失效来源，"
+                                f"{len(applied.state_changes)} 个节点状态随来源变动结算",
+                                detail={
+                                    "订阅编号": sub_id,
+                                    "移除来源": len(applied.removed_sources),
+                                    "状态结算": len(applied.state_changes),
+                                },
+                            )
                     else:
                         # 候选订阅的健康自动转正：最近一次体检有可用节点即进池，
                         # 准入依据是体检事实而不是人工点头（快照刚落盘，转正 apply 的就是它）
@@ -324,7 +337,8 @@ def default_kernel_proxy() -> str | None:
         from app.domains.proxies import clash_manager
 
         status = clash_manager.runtime.status()
-        if status.get("running") and status.get("port"):
+        # 入口硬闸：端口没在听（解析出的默认值无人监听/被占）不交假通道
+        if status.get("running") and status.get("port") and clash_manager.runtime.entry_listening():
             return f"http://127.0.0.1:{status['port']}"
     except Exception:  # noqa: BLE001 —— 老 Clash 不在也不影响直连通道
         return None

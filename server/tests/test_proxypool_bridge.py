@@ -339,6 +339,8 @@ async def test_clash_test_choke_point_feeds_pool(env, monkeypatch):
     """
     from app.domains.proxies import clash_manager, service as proxies_service
 
+    # 假内核没有真实监听端口：selector 回退路径的入口硬闸按「入口在听」放行
+    monkeypatch.setattr(clash_manager.runtime, "entry_listening", lambda: True)
     await init_db()
     cfg = env / "sub.yaml"
     cfg.write_text(
@@ -392,8 +394,9 @@ async def test_clash_test_choke_point_feeds_pool(env, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ledger_does_not_override_newer_l0_verdict(env):
-    """池内已有更新的 L0 结论时不复活：避免「L0 判死 ↔ 体检复活」每拍互推翻。"""
+async def test_ledger_does_not_override_newer_pool_verdict(env):
+    """池内已有更新的业务结论（last_l2_at）且节点正被判坏时不复活：
+    避免「池判死 ↔ 体检账本复活」每拍互相推翻、节点状态翻烧饼。"""
     await init_db()
     await _add_node("n7", NODE_DEAD, sub_id=2, name="sub-x")
     async with get_session_factory()() as s:
@@ -406,7 +409,7 @@ async def test_ledger_does_not_override_newer_l0_verdict(env):
         node = (
             await s.execute(select(ProxyNode).where(ProxyNode.node_id == "n7"))
         ).scalar_one()
-        node.last_l0_at = NOW - timedelta(hours=1)
+        node.last_l2_at = NOW - timedelta(hours=1)
         await s.commit()
 
     async with get_session_factory()() as s:
@@ -415,6 +418,33 @@ async def test_ledger_does_not_override_newer_l0_verdict(env):
 
     assert outcome.activated == 0
     assert (await _node("n7")).state == NODE_DEAD
+
+
+@pytest.mark.asyncio
+async def test_ledger_resurrects_when_check_newer_than_pool_verdict(env):
+    """账本检测比池内业务结论更新时照常复活：守卫只拦「池更新 × 节点判坏」，
+    不拦「账本更新」与「节点本就健康」两条正常对齐路径。"""
+    await init_db()
+    await _add_node("n8", NODE_DEAD, sub_id=2, name="sub-x")
+    async with get_session_factory()() as s:
+        s.add(
+            ClashNode(
+                subscription_id=2, name="sub-x", status="ok", exit_ip="8.8.8.8",
+                latency_ms=70, last_checked_at=NOW - timedelta(hours=1),
+            )
+        )
+        node = (
+            await s.execute(select(ProxyNode).where(ProxyNode.node_id == "n8"))
+        ).scalar_one()
+        node.last_l2_at = NOW - timedelta(hours=2)
+        await s.commit()
+
+    async with get_session_factory()() as s:
+        outcome = await B.ingest_ledger(s, now=NOW)
+        await s.commit()
+
+    assert outcome.activated == 1
+    assert (await _node("n8")).state == NODE_ACTIVE
 
 
 @pytest.mark.asyncio

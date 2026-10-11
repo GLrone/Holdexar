@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import WritePriority, write_gate
 from app.core.logging import log_event
 from app.crawler.browse_store import StoreBrowseAPI, _to_int
-from app.domains.proxypool.models import HealthObservation, ProxyNode, ProxyNodeSource
+from app.domains.proxypool.models import HealthObservation, HealthRun, ProxyNode, ProxyNodeSource
 from app.domains.proxypool.pool import pool_file_names
 from app.domains.proxypool.runtime import mixed_port_of
 from app.domains.proxypool.state import NODE_DEAD, NODE_RETIRED, evaluate_node_state
@@ -69,6 +69,65 @@ INVALID_BUSINESS_RESPONSE = "INVALID_BUSINESS_RESPONSE"
 # 与 crawler 生产探测同一个 appid / 区服（Half-Life 2，长期在售）
 DEFAULT_BUSINESS_APPID = 220
 BUSINESS_CC = "us"
+
+
+def _publish_probe_progress(level: str, probed: int) -> None:
+    """体检维护包络内的探测进度 → SSE（progress 通道，可丢）。
+
+    只在维护预约位为体检时发布：启动链 L1、手动节点检测不持维护位，各有
+    自己的进度面，从这里静默跳过。进度的事实源是 health_observations 按
+    run_id 的累计行数，事件只是让前端少轮询一次。"""
+    from app.crawler.occupancy import MAINTENANCE_HEALTH, maintenance_kind
+    from app.core.events import bus
+
+    if maintenance_kind() != MAINTENANCE_HEALTH:
+        return
+    try:
+        bus.publish("maintenance.progress", kind=MAINTENANCE_HEALTH,
+                    level=level, probed=probed)
+    except Exception:  # noqa: BLE001 —— 进度事件不是生产依赖
+        pass
+
+
+async def current_maintenance_run() -> dict | None:
+    """当前进行中的体检运行（health_runs 未收尾行 + 逐层观测计数）。
+
+    run 行在建轮时即提交、观测按 PROBE_COMMIT_EVERY 逐块落库——读账本即得
+    实时进度，不另设进度状态。无进行中运行返回 None。"""
+    from app.core.database import get_session_factory
+
+    async with get_session_factory()() as session:
+        row = (
+            await session.execute(
+                select(HealthRun)
+                .where(
+                    HealthRun.finished_at.is_(None),
+                    # 手动节点检测也写 run 行但不持维护预约位；本读点只在
+                    # 预约位在位时被调用，只对 scheduled 运行行负责
+                    HealthRun.channel == "scheduled",
+                )
+                .order_by(HealthRun.started_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        counts = {"l1": 0, "l2": 0}
+        level_rows = await session.execute(
+            select(HealthObservation.level, func.count())
+            .where(HealthObservation.run_id == row.id)
+            .group_by(HealthObservation.level)
+        )
+        for level, n in level_rows:
+            key = (level or "").lower()
+            if key in counts:
+                counts[key] = n
+        return {
+            "runId": row.id,
+            "channel": row.channel,
+            "startedAt": row.started_at.isoformat() if row.started_at else None,
+            "probed": counts,
+        }
 
 
 def business_probe_url(appid: int = DEFAULT_BUSINESS_APPID,
@@ -396,11 +455,27 @@ async def recover_dead_nodes(
 
     # 探测（网络）与落库分离：状态变更与观测在写调度器内一次落库提交
     async with write_gate(WritePriority.BACKGROUND, label="health_recovery"):
+        # 防丢失更新（与 business_check_pool 同一防线）：补探是分钟级网络段，
+        # 载入时的 state / consecutive_failures 早已陈旧——闸内按主键重读
+        # （刷新本会话同一对象）后用新鲜基线重算状态迁移，窗口内手动体检
+        # ingest 与订阅 settle 的写入不因陈旧基线被覆盖。
+        if pending:
+            await session.execute(
+                select(ProxyNode)
+                .where(ProxyNode.node_id.in_([n.node_id for n, _, _ in pending]))
+                .execution_options(populate_existing=True)
+            )
         for node, observation, mutations in pending:
             if mutations is not None:
-                failures, target = mutations
+                ok = bool(observation.get("ok"))
+                failures = 0 if ok else (node.consecutive_failures or 0) + 1
                 node.consecutive_failures = failures
-                node.state = target
+                node.state = evaluate_node_state(
+                    node.state,
+                    source_seen=True,
+                    probe_ok=ok,
+                    consecutive_failures=failures,
+                )
             session.add(HealthObservation(**observation))
         await session.commit()
     if outcomes:
@@ -588,6 +663,14 @@ async def exit_ip_check_pool(
                 latency_ms=result.latency_ms,
             ))
         async with write_gate(WritePriority.BACKGROUND, label="health_observation"):
+            # 防丢失更新：块内探测是串行网络段，载入的 exit_ip 可能已被
+            # 手动体检 ingest 更新——闸内重读再写（与 L2 同一防线）。
+            if probed:
+                await session.execute(
+                    select(ProxyNode)
+                    .where(ProxyNode.node_id.in_([n.node_id for n, _ in probed]))
+                    .execution_options(populate_existing=True)
+                )
             for node, result in probed:
                 if result.ok and result.exit_ip:
                     node.exit_ip = result.exit_ip
@@ -603,6 +686,7 @@ async def exit_ip_check_pool(
                     target=url,
                 ))
             await session.commit()
+        _publish_probe_progress(L1_LEVEL, len(outcomes))
     return tuple(outcomes)
 
 
@@ -815,6 +899,10 @@ async def business_check_pool(
                         probe_ok=probe_ok,
                         consecutive_failures=failures,
                     )
+                    # 业务结论时间随结论落章：体检账本对齐（bridge.ingest_ledger）
+                    # 靠它与账本检测时刻比新旧，缺了它「池判死 → 旧账本复活」
+                    # 的翻烧饼守卫永远不生效
+                    node.last_l2_at = now
                 session.add(HealthObservation(
                     node_id=node.node_id,
                     level=L2_LEVEL,
@@ -827,4 +915,5 @@ async def business_check_pool(
                     target=target_url,
                 ))
             await session.commit()
+        _publish_probe_progress(L2_LEVEL, len(outcomes))
     return tuple(outcomes)

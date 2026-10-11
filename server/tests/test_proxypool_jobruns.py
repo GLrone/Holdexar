@@ -24,6 +24,7 @@ from app.crawler.runner import CrawlRunConfig, run_crawl  # noqa: E402
 from app.domains.proxypool import jobruns  # noqa: E402
 from app.domains.proxypool import runtime as runtime_module  # noqa: E402
 from app.domains.proxypool.models import (  # noqa: E402
+    HealthRun,
     ProxyJobRun,
     ProxyNode,
     ProxyNodeSource,
@@ -482,6 +483,28 @@ async def test_mark_interrupted_runs(tmp_data_dir):
 
         # 幂等：再来一次没有可标的行
         assert await jobruns.mark_interrupted_runs(session, now) == 0
+
+
+@pytest.mark.asyncio
+async def test_mark_interrupted_spares_rows_started_after_process_start(tmp_data_dir):
+    """先开门再收拾：本进程启动后新建的作业/体检行是活行，不得误标。"""
+    await init_db()
+    async with get_session_factory()() as session:
+        session.add(ProxyJobRun(
+            status=jobruns.STATUS_RUNNING,
+            started_at=datetime.now() + timedelta(minutes=1),
+        ))
+        session.add(HealthRun(channel="manual", started_at=datetime.now() + timedelta(minutes=1)))
+        await session.commit()
+
+        marked = await jobruns.mark_interrupted_runs(session, datetime.now() + timedelta(minutes=2))
+        await session.commit()
+        assert marked == 0
+
+        job_row = (await session.execute(select(ProxyJobRun))).scalars().one()
+        assert job_row.status == jobruns.STATUS_RUNNING
+        health_row = (await session.execute(select(HealthRun))).scalars().one()
+        assert health_row.finished_at is None
 
 
 @pytest.mark.asyncio

@@ -9,8 +9,11 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import re
+import time
 from datetime import datetime, timedelta
 
+from apscheduler.events import EVENT_JOB_MAX_INSTANCES, EVENT_JOB_MISSED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app.core.external_time import local_next_grid, probe_next_grid
@@ -26,6 +29,33 @@ _BOARD_LABELS = {
     "popularnew": "热门新品",
     "comingsoon": "即将推出",
     "specials": "特惠榜",
+}
+# job_id → 中文任务名（日志主句用；漏登记的新 job 原样露出 id）
+_JOB_LABELS = {
+    "wishlist_sync": "心愿单同步",
+    "price_refresh": "价格刷新",
+    "price_repair": "价格补抓",
+    "fx_refresh": "汇率刷新",
+    "fx_history_repair": "汇率历史补抓",
+    "proxy_health": "代理体检",
+    "subscription_refresh": "代理订阅拉取",
+    "wallet_sync": "钱包同步",
+    "bills_sync": "账单同步",
+    "achievements_sync": "成就同步",
+    "board_topsellers": "热销榜抓取",
+    "board_popularnew": "热门新品榜抓取",
+    "board_comingsoon": "即将推出榜抓取",
+    "comingsoon_retry": "即将推出重试",
+    "free_promo_retry": "免费促销重试",
+    "hb_choice": "慈善包精选",
+    "epic_free": "Epic 免费游戏",
+    "steam_events_sync": "Steam 活动同步",
+    "bartervg_bundles": "捆绑包抓取",
+    "wal_truncate": "WAL 截断",
+    "auto_backup": "自动备份",
+    "proxypool_cycle": "代理池轮换",
+    "proxypool_retention": "代理池清理",
+    "agent_ledger_prune": "运行账本清理",
 }
 # 钱包轮转失败标签。frozen 不在表内：冻结只是熔断终态，真因由 service 按
 # 最后一次失败归因后自带（见 account.service._frozen_reason），写成「凭据
@@ -48,6 +78,10 @@ _TIME_SOURCE_LABELS = {
 
 def _board_label(board_key: str) -> str:
     return _BOARD_LABELS.get(board_key, board_key)
+
+
+def _job_label(job_id: str) -> str:
+    return _JOB_LABELS.get(job_id, job_id)
 
 
 def _wallet_reason_label(reason: str) -> str:
@@ -232,13 +266,24 @@ async def _uncrawled_active_appids() -> list[int]:
     from app.domains.wishlist.models import WishlistItem
 
     async with get_session_factory()() as session:
+        # NOT EXISTS 反连接（判例同 _backfill_pairs）：短路价格表逐行扇出，
+        # DISTINCT 保留（多账号对同一 appid 复写行）
+        not_in_games = (
+            _select(Game.appid).where(Game.appid == WishlistItem.appid).exists()
+        )
+        not_in_prices = (
+            _select(GameCurrentPrice.appid)
+            .where(GameCurrentPrice.appid == WishlistItem.appid)
+            .exists()
+        )
         rows = (
             await session.execute(
                 _select(WishlistItem.appid)
-                .where(WishlistItem.active.is_(True))
-                .outerjoin(Game, Game.appid == WishlistItem.appid)
-                .outerjoin(GameCurrentPrice, GameCurrentPrice.appid == WishlistItem.appid)
-                .where(Game.appid.is_(None), GameCurrentPrice.appid.is_(None))
+                .where(
+                    WishlistItem.active.is_(True),
+                    ~not_in_games,
+                    ~not_in_prices,
+                )
                 .distinct()
             )
         ).scalars().all()
@@ -399,13 +444,89 @@ async def content_fetch_enabled(key: str) -> bool:
     return bool(await get_value(key, True))
 
 
+# ─── 内容源自定义刷新节奏（自动抓取页：HB 月包 / Epic 喜加一）─────────────
+# KV `fetch.<source>_schedule` = {"time": "HH:MM", "days": N}（1=每天，上限 30）。
+# 注册用默认；启动链（apply_content_schedules_from_settings）与设置保存
+# （settings 路由直调 apply_content_schedule）双生效点共用同一重排入口。
+CONTENT_SCHEDULE_KEYS = {
+    "hb_choice": "fetch.hb_choice_schedule",
+    "epic_free": "fetch.epic_free_schedule",
+}
+CONTENT_SCHEDULE_DEFAULTS = {
+    "hb_choice": {"time": "02:30", "days": 1},
+    "epic_free": {"time": "23:05", "days": 1},
+}
+
+
+def parse_schedule_time(text: str) -> tuple[int, int]:
+    """"HH:MM" → (小时, 分钟)；非法抛 ValueError。"""
+    m = re.match(r"^(\d{1,2}):(\d{2})$", str(text).strip())
+    if not m:
+        raise ValueError(f"非法时刻: {text!r}")
+    hour, minute = int(m.group(1)), int(m.group(2))
+    if hour > 23 or minute > 59:
+        raise ValueError(f"时刻超出当日范围: {text!r}")
+    return hour, minute
+
+
+def normalize_schedule(raw: object, job_id: str) -> tuple[str, int]:
+    """KV 原始值 → (HH:MM, 天数)；缺失/非法逐项回落该源默认。"""
+    default = CONTENT_SCHEDULE_DEFAULTS[job_id]
+    if not isinstance(raw, dict):
+        return default["time"], int(default["days"])
+    try:
+        hour, minute = parse_schedule_time(str(raw.get("time") or ""))
+    except ValueError:
+        return default["time"], int(default["days"])
+    try:
+        days = max(1, min(30, int(raw.get("days") or 1)))
+    except (TypeError, ValueError):
+        days = int(default["days"])
+    return f"{hour:02d}:{minute:02d}", days
+
+
+def apply_content_schedule(job_id: str, time_text: str, days: int = 1) -> None:
+    """内容源定时拍重排（设置保存即时生效 + 启动链应用自定义，同一入口）。
+
+    reschedule 整体替换触发器：days>1 用 cron 日步进（day=*/N，按日历日
+    计，月末偶有相邻两天）；days=1 即回到每日。
+    """
+    hour, minute = parse_schedule_time(time_text)
+    kwargs: dict = {"hour": hour, "minute": minute}
+    if days > 1:
+        kwargs["day"] = f"*/{max(2, days)}"
+    scheduler.reschedule_job(job_id, trigger="cron", **kwargs)
+
+
+async def apply_content_schedules_from_settings() -> None:
+    """启动链应用用户自定义内容源拍点（KV 缺失保持注册默认；失败不阻塞）。"""
+    from app.domains.settings.service import get_value
+
+    for job_id, key in CONTENT_SCHEDULE_KEYS.items():
+        try:
+            raw = await get_value(key, None)
+            time_text, days = normalize_schedule(raw, job_id)
+            apply_content_schedule(job_id, time_text, days)
+        except Exception:  # noqa: BLE001 —— 作业缺失/未注册等，保持默认拍点
+            continue
+        if isinstance(raw, dict):
+            label = _JOB_LABELS.get(job_id, job_id)
+            rhythm = f"每天 {time_text}" if days == 1 else f"每 {days} 天的 {time_text}"
+            log_event(logger, f"{label}自动刷新节奏已按自定义设置生效：{rhythm}")
+
+
 def _crawler_idle() -> bool:
     """爬虫当前无任务在跑（主价格刷新以 _price_cycle_busy 判定）。
 
-    探的是进程内任务表（crawl_service._active），非 6h 间隔——门禁语义是
-    「价格刷新爬虫已结束工作」。
+    探的是进程内任务表（crawl_service._active）与爬取占用面（occupancy，
+    覆盖 bundles 直调 run_crawl 那条不经任务表的路径），非 6h 间隔——
+    门禁语义是「价格刷新爬虫已结束工作」。
     """
     if _price_cycle_busy:
+        return False
+    from app.crawler.occupancy import crawler_busy
+
+    if crawler_busy():
         return False
     from app.domains.crawl import service as crawl_service
 
@@ -517,11 +638,17 @@ async def _job_price_refresh() -> None:
     try:
         await _reanchor_price_refresh("轮转重锚")
 
+        from app.crawler.occupancy import crawler_busy
         from app.domains.crawl import service as crawl_service
 
-        # 排干等待：锁被上一轮修复/用户任务占着时等它结束再开链
+        # 排干等待：锁被上一轮修复/用户任务占着时等它结束再开链（占用面
+        # 同查，bundles 直调路径不在任务表上）
         for _ in range(_DRAIN_MAX_POLLS):
-            if crawl_service._active is None or crawl_service._active.task.done():
+            active = crawl_service._active
+            if (
+                (active is None or active.task.done())
+                and not crawler_busy()
+            ):
                 break
             await asyncio.sleep(_DRAIN_POLL_SECONDS)
         specs = await _price_refresh_specs()
@@ -566,15 +693,21 @@ async def _job_price_refresh_with_mails() -> None:
 
 
 async def _job_agent_ledger_prune() -> None:
-    """运行账本保留：job 型 run（调度桥行）过窗级联清理，task/fake 不动。"""
+    """运行账本保留：job 型 run（调度桥行）过窗级联清理，task/fake 不动；
+    同拍顺带清爬取任务台账的过窗终态行（90 天窗，见 crawl service）。"""
     from app.domains.agent.runtime import scheduler_bridge
+    from app.domains.crawl import service as crawl_service
 
     pruned = await scheduler_bridge.prune_job_runs()
-    if pruned:
+    pruned_jobs = await crawl_service.prune_crawl_jobs()
+    if pruned or pruned_jobs:
         log_event(
             logger,
-            "运行账本清理完成，删除过窗的任务记录",
-            detail={"清理条数": pruned},
+            "过窗任务台账清理完成",
+            detail={
+                "清理条数": pruned,
+                "清理抓取任务条数": pruned_jobs,
+            },
         )
 
 
@@ -612,6 +745,7 @@ async def _job_fx_refresh() -> None:
     from app.domains.rates import service as rates_service
 
     if not await get_value("crawl.auto_refresh_rates", True):
+        await scheduler_bridge_note("fx_refresh", {"skipped": "汇率自动更新已关闭"})
         return
     try:
         await rates_service.refresh_rates()
@@ -636,6 +770,7 @@ async def _job_fx_history_repair() -> None:
     from app.domains.rates import history as rates_history
 
     if not await content_fetch_enabled("fetch.fx_history"):
+        await scheduler_bridge_note("fx_history_repair", {"skipped": "汇率历史补全已关闭"})
         return  # 「汇率历史补全」开关关闭
     try:
         scan = await rates_history.scan_history_gaps()
@@ -643,6 +778,7 @@ async def _job_fx_history_repair() -> None:
         log_event(logger, "汇率历史缺口扫描失败", level=logging.ERROR, exc_info=True)
         return
     if not scan["windows"]:
+        await scheduler_bridge_note("fx_history_repair", {"skipped": "历史汇率没有缺漏，暂不补齐"})
         return
     if not _crawler_idle():
         log_event(
@@ -974,6 +1110,17 @@ async def _job_proxypool_retention() -> None:
         log_event(logger, "代理池遥测保留清理异常", level=logging.ERROR, exc_info=True)
 
 
+async def _job_price_cycle_retention() -> None:
+    """价格周期台账保留（每日 04:37）：90 天窗整行删除 + 存量 JSON 明细
+    置 NULL（除最近 8 轮），收敛调度账本最大无界点。异常只记日志。"""
+    from app.domains.crawl import retention as crawl_retention
+
+    try:
+        await crawl_retention.prune_price_cycles()
+    except Exception:  # noqa: BLE001 —— 清理失败不拖垮调度器
+        log_event(logger, "价格周期台账保留清理异常", level=logging.ERROR, exc_info=True)
+
+
 async def _job_subscription_refresh() -> None:
     """Clash 订阅重拉（30min 一拍；真间隔由 service 侧 6h 门槛决定）。
 
@@ -1069,6 +1216,7 @@ async def _job_proxy_health() -> None:
     （跨重启有效——本地软件不常驻）；APScheduler 间隔只是兜底频率。
     """
     if not await content_fetch_enabled("proxy.health_auto"):
+        await scheduler_bridge_note("proxy_health", {"skipped": "自动节点体检已关闭"})
         return  # 「自动节点体检」开关关闭：定时全测与 Clash 节点检测一并停转
     from app.domains.proxies import service as proxies_service
 
@@ -1101,18 +1249,71 @@ async def _job_proxy_health() -> None:
         )
 
 
+# 钱包全员失败日志按「账号总数+冻结数」签名收敛：形态不变只报一次，之后每小时注意级提醒
+_WALLET_FAIL_LOG_DIGEST_SECONDS = 3600.0
+_wallet_fail_log_state: dict = {}
+
+
+def _wallet_fail_signature(result: dict) -> tuple:
+    return (result.get("total"), result.get("frozen"))
+
+
+def _fmt_fail_duration(seconds: float) -> str:
+    hours, minutes = divmod(int(seconds // 60), 60)
+    if hours == 0:
+        return f"{minutes} 分钟"
+    if minutes == 0:
+        return f"{hours} 小时"
+    return f"{hours} 小时 {minutes} 分钟"
+
+
+def _log_wallet_fail_converged(result: dict) -> None:
+    reasons = result.get("reasons") or {}
+    detail = {
+        "账号总数": result.get("total"),
+        "成功": result.get("ok_count"),
+        "失败原因": (
+            "；".join(f"{n}×{_wallet_reason_label(w)}" for w, n in reasons.items())
+            if reasons else "可能在退避重试中"
+        ),
+    }
+    signature = _wallet_fail_signature(result)
+    now = time.monotonic()
+    if signature != _wallet_fail_log_state.get("signature"):
+        _wallet_fail_log_state.clear()
+        _wallet_fail_log_state.update(signature=signature, first_at=now, last_at=now)
+        log_event(
+            logger,
+            f"{result.get('total')} 个账号的 Steam 钱包余额本轮全部同步失败",
+            level=logging.ERROR,
+            detail=detail,
+        )
+        return
+    if now - _wallet_fail_log_state.get("last_at", now) >= _WALLET_FAIL_LOG_DIGEST_SECONDS:
+        _wallet_fail_log_state["last_at"] = now
+        duration = _fmt_fail_duration(now - _wallet_fail_log_state["first_at"])
+        total = result.get("total")
+        if total and result.get("frozen") == total:
+            headline = f"{total} 个账号的钱包余额同步仍在冻结，已持续 {duration}"
+        else:
+            headline = f"Steam 钱包余额同步仍未恢复，已持续 {duration}"
+        log_event(logger, headline, level=logging.WARNING, detail=detail)
+
+
 async def _job_wallet_sync() -> None:
     """钱包每分钟轮转：调度只是节拍器，真频率由 service 三层门禁决定
     （快照新鲜度活跃感知 / 失败递增退避 / 429 长冷却——无人看时单账号
     请求量自动降到 ~2 次/小时；App 打开 ≤60s 补上）。
 
     未绑 Cookie 静默跳过；多账号随机延时错峰不变。
+    全员失败日志同形态只报一次，之后每小时注意级提醒。
     """
     from app.domains.account import service as account_service
 
     try:
         result = await account_service.sync_wallets_rotational()
         if result.get("ok"):
+            _wallet_fail_log_state.clear()
             log_event(
                 logger,
                 "Steam 钱包余额轮转刷新完成",
@@ -1123,22 +1324,10 @@ async def _job_wallet_sync() -> None:
                 },
             )
         elif result.get("status") != "no_cookie":
-            reasons = result.get("reasons") or {}
-            log_event(
-                logger,
-                f"{result.get('total')} 个账号的 Steam 钱包余额本轮全部同步失败",
-                level=logging.ERROR,
-                detail={
-                    "账号总数": result.get("total"),
-                    "成功": result.get("ok_count"),
-                    "失败原因": (
-                        "；".join(
-                            f"{n}×{_wallet_reason_label(w)}" for w, n in reasons.items()
-                        )
-                        if reasons else "可能在退避重试中"
-                    ),
-                },
-            )
+            _log_wallet_fail_converged(result)
+        else:
+            _wallet_fail_log_state.clear()
+            await scheduler_bridge_note("wallet_sync", {"skipped": "未绑定 Steam 账号"})
     except Exception:  # noqa: BLE001
         log_event(logger, "Steam 钱包余额轮转异常", level=logging.ERROR, exc_info=True)
 
@@ -1163,6 +1352,10 @@ async def _job_bills_sync() -> None:
                     "许可记录行数": result.get("licenseRows"),
                 },
             )
+        elif result.get("status") == "no_cookie":
+            await scheduler_bridge_note("bills_sync", {"skipped": "未绑定 Steam Cookie"})
+        elif result.get("status") == "busy":
+            await scheduler_bridge_note("bills_sync", {"skipped": "账单同步进行中"})
         elif result.get("status") not in ("no_cookie", "busy"):
             log_event(
                 logger,
@@ -1204,6 +1397,9 @@ def _make_board_job(
         from app.domains.games import boards as boards_mod
 
         if not await content_fetch_enabled("fetch.boards"):
+            await scheduler_bridge_note(
+                f"board_{board_key}", {"skipped": "Steam 排行榜自动更新已关闭"}
+            )
             return  # 「Steam 榜单」开关关闭：发现源停转，落池与反哺一并跳过
         try:
             appids = await boards_mod.refresh_board(board_key)
@@ -1354,6 +1550,7 @@ async def _job_backup() -> None:
     `_job_backup_catchup` 在启动后补。
     """
     if not await content_fetch_enabled("backup.auto"):
+        await scheduler_bridge_note("auto_backup", {"skipped": "自动备份已关闭"})
         return  # 「每日自动备份」开关关闭：定时与启动补备一并停转，手动备份不受影响
     from app.core import backup as core_backup
 
@@ -1405,6 +1602,7 @@ async def _job_backup_catchup() -> None:
     既抢 IO 又让快照落在最没代表性的时刻（半空的库）。
     """
     from app.core import backup as core_backup
+    from app.domains.agent.runtime import scheduler_bridge
 
     try:
         await asyncio.sleep(300)
@@ -1429,7 +1627,8 @@ async def _job_backup_catchup() -> None:
             )
         else:
             log_event(logger, "启动补备触发：尚无任何备份")
-        await _job_backup()
+        # 与定时拍同口径入运行账（job_id 带 catchup 后缀区分补跑拍）
+        await scheduler_bridge.run_accounted("auto_backup_catchup", _job_backup)
     except Exception:  # noqa: BLE001
         log_event(
             logger,
@@ -1444,6 +1643,7 @@ async def _job_hb_choice() -> None:
     未变即跳过，新月包出现才解析+打标；无登录态拿不到往期页，错过
     当月即漏，因此按日检查而非按月）+ 已标记未取价补首爬。"""
     if not await content_fetch_enabled("fetch.hb_choice"):
+        await scheduler_bridge_note("hb_choice", {"skipped": "Humble Choice 每月合集自动更新已关闭"})
         return  # 「Humble Choice」开关关闭：当月包核对停转，已有标记保留
     from app.domains.metadata import service as metadata_service
 
@@ -1520,6 +1720,7 @@ async def _job_epic_free() -> None:
     当期+预告，历史深度由静态档案/外部名单导入补足，漏跑一日由
     后续轮次自然补齐）。"""
     if not await content_fetch_enabled("fetch.epic_free"):
+        await scheduler_bridge_note("epic_free", {"skipped": "Epic 免费游戏自动更新已关闭"})
         return  # 「Epic 免费游戏」开关关闭：喜加一标记停转，已有标记保留
     from app.domains.metadata import service as metadata_service
 
@@ -1575,6 +1776,7 @@ async def _job_steam_events_sync() -> None:
     """Steam 官方活动日历同步（每日一拍；校验门不过则保留旧数据）。
     活动窗口是价格观测行周期标签的来源，回贴随同步幂等执行。"""
     if not await content_fetch_enabled("fetch.steam_events"):
+        await scheduler_bridge_note("steam_events_sync", {"skipped": "Steam 活动日历自动更新已关闭"})
         return  # 「Steam 活动日历」开关关闭：同步停转，已有数据保留展示
     from app.domains.steam_events import service as steam_events_service
 
@@ -1601,6 +1803,7 @@ async def _job_bartervg_bundles() -> None:
     """Barter.vg bundle 计数全量刷新（48h 新鲜度闸内跳过；计数只增，
     差量写入幂等，档案拉取失败保留库内旧值）。"""
     if not await content_fetch_enabled("fetch.bundle_counts"):
+        await scheduler_bridge_note("bartervg_bundles", {"skipped": "捆绑包记录自动更新已关闭"})
         return  # 「捆绑包资料」开关关闭：进包计数刷新停转（启动补跑同闸）
     from app.domains.metadata import service as metadata_service
 
@@ -1642,9 +1845,14 @@ async def _job_bartervg_bundles() -> None:
 async def _job_bartervg_catchup() -> None:
     """启动补跑：首次部署/长期停机等不到每日定点，启动窗口 90s 后补跑
     一轮（48h 新鲜度闸内静默跳过，重启风暴无代价）。"""
+    from app.domains.agent.runtime import scheduler_bridge
+
     try:
         await asyncio.sleep(90)
-        await _job_bartervg_bundles()
+        # 与定时拍同口径入运行账（job_id 带 catchup 后缀区分补跑拍）
+        await scheduler_bridge.run_accounted(
+            "bartervg_bundles_catchup", _job_bartervg_bundles
+        )
     except Exception:  # noqa: BLE001
         log_event(
             logger,
@@ -1665,6 +1873,7 @@ async def _job_coming_soon_retry() -> None:
     from app.domains.crawl import service as crawl_service
 
     if not await price_auto_enabled():
+        await scheduler_bridge_note("comingsoon_retry", {"skipped": "自动价格更新已关闭"})
         return  # 自动价格更新关闭：重探也走爬取通道，一并停转
     try:
         pairs = await DbWriter().coming_soon_retry_pairs(
@@ -1679,6 +1888,7 @@ async def _job_coming_soon_retry() -> None:
         )
         return
     if not pairs:
+        await scheduler_bridge_note("comingsoon_retry", {"skipped": "暂无需要重新检查的游戏"})
         return
     try:
         # 走 kind=scheduled 正常 worker 通道（重探目标量小、多为元数据短路）
@@ -1717,6 +1927,7 @@ async def _job_free_promo_retry() -> None:
     from app.domains.games.models import Game
 
     if not await price_auto_enabled():
+        await scheduler_bridge_note("free_promo_retry", {"skipped": "自动价格更新已关闭"})
         return  # 自动价格更新关闭：复查也走爬取通道，一并停转
     try:
         now_ts = int(get_beijing_time_obj().timestamp())
@@ -1743,6 +1954,7 @@ async def _job_free_promo_retry() -> None:
         return
     appids = [int(r) for r in rows]
     if not appids:
+        await scheduler_bridge_note("free_promo_retry", {"skipped": "暂无到期的赠送游戏"})
         return
     try:
         await crawl_service.run_sequential(
@@ -1888,6 +2100,70 @@ async def scheduler_bridge_note(step: str, summary: dict) -> None:
     await scheduler_bridge.note_step(step, summary)
 
 
+# 调度跳拍事件处理的强引用集：监听器派发的异步投递任务防 GC
+_EVENT_TASKS: set[asyncio.Task] = set()
+
+
+def _hold_event_task(task: asyncio.Task) -> None:
+    _EVENT_TASKS.add(task)
+    task.add_done_callback(_EVENT_TASKS.discard)
+
+
+async def _note_max_instances(event) -> None:
+    from app.domains.agent.runtime import scheduler_bridge
+
+    try:
+        delivered = await scheduler_bridge.note_job_skipped(
+            event.job_id,
+            event.job_id,
+            {
+                "skipped": "上一轮还在进行，本拍让路",
+                "原定时刻": event.scheduled_run_times[0].astimezone().strftime("%m-%d %H:%M"),
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("让路流水投递失败", exc_info=True)
+        return
+    if not delivered:
+        # 在飞 run 恰好刚收口（投递竞态）：降级出同词形日志，痕不丢
+        log_event(
+            logger,
+            f"定时任务「{_job_label(event.job_id)}」上一轮还在进行，本拍让路",
+            tag="跳过",
+            level=logging.WARNING,
+            detail={
+                "原定时刻": event.scheduled_run_times[0].astimezone().strftime("%m-%d %H:%M")
+            },
+        )
+
+
+def _on_job_skipped(event) -> None:
+    try:
+        if event.code == EVENT_JOB_MAX_INSTANCES:
+            _hold_event_task(asyncio.create_task(_note_max_instances(event)))
+        elif event.code == EVENT_JOB_MISSED:
+            log_event(
+                logger,
+                f"定时任务「{_job_label(event.job_id)}」到点没能按时启动，那一拍已跳过，之后照常按拍执行",
+                tag="跳过",
+                level=logging.WARNING,
+                detail={
+                    "原定时刻": event.scheduled_run_time.astimezone().strftime("%m-%d %H:%M")
+                },
+            )
+    except Exception:  # noqa: BLE001 —— 监听器异常绝不影响调度器
+        logger.debug("调度跳拍事件处理失败", exc_info=True)
+
+
+# 启动期后台任务的强引用集：create_task 产物只有被持有时才不会被 GC
+_STARTUP_TASKS: set[asyncio.Task] = set()
+
+
+def _hold_startup_task(task: asyncio.Task) -> None:
+    _STARTUP_TASKS.add(task)
+    task.add_done_callback(_STARTUP_TASKS.discard)
+
+
 def start_scheduler() -> None:
     if scheduler.running:
         return
@@ -1936,8 +2212,10 @@ def start_scheduler() -> None:
     scheduler.add_job(_acct("comingsoon_retry", _job_coming_soon_retry), "cron", hour=10, minute=0, id="comingsoon_retry")
     # 限时赠送复查：到期（或 1h 内到期）的 promo 重爬翻转状态；通常 0 候选
     scheduler.add_job(_acct("free_promo_retry", _job_free_promo_retry), "interval", hours=6, id="free_promo_retry")
-    scheduler.add_job(_acct("hb_choice", _job_hb_choice), "cron", hour=6, minute=40, id="hb_choice")
-    scheduler.add_job(_acct("epic_free", _job_epic_free), "cron", hour=7, minute=10, id="epic_free")
+    _hb_hour, _hb_minute = parse_schedule_time(CONTENT_SCHEDULE_DEFAULTS["hb_choice"]["time"])
+    scheduler.add_job(_acct("hb_choice", _job_hb_choice), "cron", hour=_hb_hour, minute=_hb_minute, id="hb_choice")
+    _ep_hour, _ep_minute = parse_schedule_time(CONTENT_SCHEDULE_DEFAULTS["epic_free"]["time"])
+    scheduler.add_job(_acct("epic_free", _job_epic_free), "cron", hour=_ep_hour, minute=_ep_minute, id="epic_free")
     # Steam 活动日历：官方文档页低频变更，每日一拍足够；05:00 避开已占分钟
     scheduler.add_job(
         _acct("steam_events_sync", _job_steam_events_sync), "cron", hour=5, minute=0, id="steam_events_sync"
@@ -1962,11 +2240,19 @@ def start_scheduler() -> None:
         _acct("agent_ledger_prune", _job_agent_ledger_prune), "cron", hour=4, minute=36, id="agent_ledger_prune",
         max_instances=1, coalesce=True,
     )
+    # 价格周期台账保留：每日 04:37（错峰序列 04:30 WAL→04:35 遥测→04:36 运行账→04:37 周期）
+    scheduler.add_job(
+        _acct("price_cycle_retention", _job_price_cycle_retention), "cron", hour=4, minute=37, id="price_cycle_retention",
+        max_instances=1, coalesce=True,
+    )
+    # 跳拍事件监听（并发上限让路/到点错失）：remove 先行幂等，防 stop→start 重入双注册
+    scheduler.remove_listener(_on_job_skipped)
+    scheduler.add_listener(_on_job_skipped, EVENT_JOB_MAX_INSTANCES | EVENT_JOB_MISSED)
     scheduler.start()
     # 外部时间纠偏探针（异步，10s 延时错开启动风暴）；无事件循环的
     # 同步上下文静默跳过——初锚已可用，首轮触发时重锚会再核对一次
     try:
-        asyncio.create_task(_anchor_probe_after_start())
+        _hold_startup_task(asyncio.create_task(_anchor_probe_after_start()))
     except RuntimeError:
         log_event(
             logger,
@@ -1977,7 +2263,7 @@ def start_scheduler() -> None:
         )
     # 备份补备（异步，5min 延时）：interval 从启动起算，不常驻的用法等不到
     try:
-        asyncio.create_task(_job_backup_catchup())
+        _hold_startup_task(asyncio.create_task(_job_backup_catchup()))
     except RuntimeError:
         log_event(
             logger,
@@ -1987,7 +2273,7 @@ def start_scheduler() -> None:
         )
     # Barter.vg bundle 计数启动补跑（异步，90s 延时；48h 闸内静默跳过）
     try:
-        asyncio.create_task(_job_bartervg_catchup())
+        _hold_startup_task(asyncio.create_task(_job_bartervg_catchup()))
     except RuntimeError:
         log_event(
             logger,
