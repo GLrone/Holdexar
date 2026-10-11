@@ -19,7 +19,7 @@ SERVER_ROOT = PROJECT_ROOT / "server"
 
 
 def _default_data_dir() -> Path:
-    """数据目录：判定链见 app.core.paths.resolve_data_dir（打包态新装落系统数据目录）。"""
+    """数据目录：判定链见 app.core.paths.resolve_data_dir（打包态新装与程序目录同盘）。"""
     return resolve_data_dir(APP_SLUG, ENV_PREFIX)
 
 

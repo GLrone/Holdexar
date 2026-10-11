@@ -187,6 +187,13 @@ async def _post_startup_chain() -> None:
     except Exception:  # noqa: BLE001
         log_event(logger, "旧版 Clash 订阅迁移失败，不阻塞启动", level=logging.ERROR, exc_info=True)
 
+    # 无出口自愈：订阅删光或全废弃后仍停在代理形态，作业会一直等不存在的
+    # 出口；按稳定事实校正回直连（用户显式选过的策略不动）
+    try:
+        await proxies_service.maybe_revert_to_direct()
+    except Exception:  # noqa: BLE001
+        log_event(logger, "无代理出口策略自愈失败，不阻塞启动", level=logging.ERROR, exc_info=True)
+
     # 旧单账号 Cookie KV → steam_accounts 多账号表（一次性）
     from app.domains.account import service as account_service
 

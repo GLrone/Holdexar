@@ -3,8 +3,13 @@
 SQLite 单写者约束下，server/app 内所有写事务必须位于 write_gate() 调度上下文
 （见 app/core/database.py 的「全局写入调度器」）。本脚本用 AST 静态扫描：
 
-- 检测点：`.commit()` / `.flush()` 调用；`.execute()` / `.executescript()` 的
-  SQL 字面量含写语句（INSERT/UPDATE/DELETE/REPLACE/BEGIN IMMEDIATE/DDL）。
+- 检测点：`.commit()` / `.flush()` 调用；`.execute()` / `.executescript()` /
+  `.executemany()` 的 SQL 字面量含写语句（INSERT/UPDATE/DELETE/REPLACE/
+  BEGIN IMMEDIATE/DDL/VACUUM/ATTACH/ANALYZE/REINDEX）；`engine.begin()` /
+  `session.begin()` 事务块（排除 begin_nested）内的 execute/executemany
+  整体按写对待（提交在块退出自动发生）。
+- 已知 AST 数据流边界（fail-closed 之外）：别名绑定调用（`c = s.commit` 后
+  `await c()`）与非常量 SQL 变量不可见，词法表达不了的形态走 ALLOW 登记。
 - 判定：沿 AST 祖先链找 `async with write_gate(...)`（含复合 with 的任一
   context item）；命中 = PASS，未命中 = FAIL。
 - 豁免：调用点在闸内、本体是线程池同步函数或迁移机制等无法词法表达的形态，
@@ -37,7 +42,7 @@ APP_DIR = Path(__file__).resolve().parent.parent / "server" / "app"
 ALLOW: dict[tuple[str, str], tuple[frozenset[str], str]] = {
     ("core/seed_assets.py", "_merge_history_chunk"): (
         frozenset({"commit", "execute"}),
-        "线程池原生连接历史合并（分块续跑，每块调用点已 write_gate 包裹，六段逻辑键 INSERT only）"),
+        "线程池原生连接历史合并（调用点已 write_gate 包裹（分块续跑），缺键 INSERT + 派生列差异覆写 UPDATE，价格键不回拨）"),
     ("core/seed_assets.py", "_merge_bundles_sync"): (
         frozenset({"commit", "execute"}),
         "线程池原生连接捆绑包合并（调用点已 write_gate 包裹，与历史合并同形态）"),
@@ -50,9 +55,17 @@ ALLOW: dict[tuple[str, str], tuple[frozenset[str], str]] = {
     ("core/database.py", "_ensure_schema"): (
         frozenset({"execute"}),
         "启动链建表与存量回填（sync 引擎独占窗口执行，写调度器管不到同步连接）"),
-    ("core/backup.py", "restore_backup"): (
+    ("core/backup.py", "_vacuum_file"): (
         frozenset({"execute"}),
-        "恢复通道（独占进程内执行，整库重建）"),
+        "原地 VACUUM（停写入面的独占窗口执行，靠调用方调度保证独占）"),
+    ("core/backup.py", "snapshot_to"): (
+        frozenset({"execute"}),
+        "VACUUM INTO 在线快照（对源库只读，产出自洽新文件）"),
+    ("domains/family/service.py", "_absorb_local_members"): (
+        frozenset({"commit"}),
+        "调用点已 write_gate 包裹（吸收即调用方事务的一步）"),
+    ("domains/proxypool/registry.py", "settle_nodes_after_source_change"): (
+        frozenset({"flush"}), "flush-only 共用收尾（快照对齐/退出/清理），事务边界在调用方闸内"),
     ("domains/monitoring/service.py", "_ensure_target"): (
         frozenset({"flush"}), "flush-only，事务边界在调用方闸内（ensure_source 等）"),
     ("domains/proxypool/admission.py", "exit_from_production"): (
@@ -71,7 +84,7 @@ ALLOW: dict[tuple[str, str], tuple[frozenset[str], str]] = {
 
 SQL_WRITE_RE = re.compile(
     r"^\s*(INSERT\s+OR\s+REPLACE|INSERT|UPDATE|DELETE|REPLACE\s+INTO|"
-    r"BEGIN\s+IMMEDIATE|CREATE|DROP|ALTER)\b",
+    r"BEGIN\s+IMMEDIATE|CREATE|DROP|ALTER|VACUUM|ATTACH|ANALYZE|REINDEX)\b",
     re.IGNORECASE,
 )
 
@@ -106,7 +119,7 @@ class _Visitor(ast.NodeVisitor):
                         f = ctx.func
                         name = f.id if isinstance(f, ast.Name) else (
                             f.attr if isinstance(f, ast.Attribute) else None)
-                        if name in ("write_gate", "write_session"):
+                        if name == "write_gate":
                             return True
             cur = self._parents.get(cur)
         return False
@@ -115,7 +128,8 @@ class _Visitor(ast.NodeVisitor):
         funcs = self._enclosing_funcs(node)
         # schema 迁移链：启动初始化机制，写锁天然独占窗口，整族豁免
         if self._file_suffix == "core/database.py" and (
-            "init_db" in funcs or any(f.startswith("_migrate_") for f in funcs)
+            "init_db" in funcs or "_run_schema_migrations" in funcs
+            or any(f.startswith("_migrate_") for f in funcs)
         ):
             return "schema 迁移链（启动初始化，写锁天然独占窗口）"
         # 文件内豁免按「任意外层函数名」匹配（内层 helper 属于外层事务）
@@ -129,13 +143,29 @@ class _Visitor(ast.NodeVisitor):
     source_lines: list[str] = []
     kind = "commit"
 
+    def _in_begin_tx(self, node: ast.AST) -> bool:
+        cur = self._parents.get(node)
+        while cur is not None:
+            if isinstance(cur, (ast.AsyncWith, ast.With)):
+                for item in cur.items:
+                    ctx = item.context_expr
+                    if isinstance(ctx, ast.Call) and isinstance(ctx.func, ast.Attribute) \
+                            and ctx.func.attr == "begin":
+                        return True
+            cur = self._parents.get(cur)
+        return False
+
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
         f = node.func
-        if isinstance(f, ast.Attribute) and f.attr in ("commit", "flush", "execute", "executescript"):
+        if isinstance(f, ast.Attribute) and f.attr in (
+            "commit", "flush", "execute", "executescript", "executemany",
+        ):
             flagged = f.attr in ("commit", "flush")
             if not flagged and node.args:
                 sql = self._sql_text(node.args[0])
                 flagged = bool(sql and SQL_WRITE_RE.match(sql))
+            if not flagged and f.attr in ("execute", "executemany") and self._in_begin_tx(node):
+                flagged = True
             if flagged and not self._in_gate(node):
                 self.kind = f.attr
                 reason = self._allow(node)
@@ -146,11 +176,16 @@ class _Visitor(ast.NodeVisitor):
     def _sql_text(self, node: ast.AST) -> str | None:
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             return node.value
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "text":
-            if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
-                return node.args[0].value
         if isinstance(node, ast.JoinedStr):
-            return ""
+            parts = "".join(
+                v.value for v in node.values
+                if isinstance(v, ast.Constant) and isinstance(v.value, str)
+            )
+            if parts:
+                return parts
+            return "UPDATE"  # 无常量片段无法判读，fail-closed 按写处理
+        if isinstance(node, ast.Call) and node.args:
+            return self._sql_text(node.args[0])
         return None
 
 

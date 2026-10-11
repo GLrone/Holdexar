@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 import sys
 import time
 from collections import deque
@@ -276,10 +277,19 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "batches_expected": "INTEGER",
         "batches_done": "INTEGER",
     },
+    # 体检运行台账收尾原因（值域见 proxypool/models.py HealthRun.end_reason 注释）
+    "health_runs": {
+        "end_reason": "VARCHAR(30)",
+    },
 }
 
 # 增量索引（CREATE INDEX IF NOT EXISTS 幂等）
 _TABLE_EXTRA_INDEXES: dict[str, list[str]] = {
+    # 活动窗口标签回贴的增量扫描（snapshot_at 范围谓词）；唯一索引
+    # ux_gph_snapshot 首列 appid 服务不了该谓词
+    "game_price_history": [
+        "CREATE INDEX IF NOT EXISTS ix_gph_snapshot_at ON game_price_history(snapshot_at)",
+    ],
     "game_current_prices": [
         "CREATE INDEX IF NOT EXISTS ix_gcp_appid_status_cny "
         "ON game_current_prices(appid, price_status, cny_fen)",
@@ -316,9 +326,13 @@ _TABLE_EXTRA_INDEXES: dict[str, list[str]] = {
 }
 
 
+_EXTRA_INDEX_NAME_RE = re.compile(r"CREATE (?:UNIQUE )?INDEX IF NOT EXISTS (\w+)")
+
+
 def _ensure_schema(sync_conn) -> None:
     from sqlalchemy import text
 
+    added_columns: list[str] = []
     for table, columns in _TABLE_EXTRA_COLUMNS.items():
         existing = {
             row[1] for row in sync_conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
@@ -328,6 +342,7 @@ def _ensure_schema(sync_conn) -> None:
         for name, ddl in columns.items():
             if name not in existing:
                 sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+                added_columns.append(f"{table}.{name}")
 
     # 观察三元组回填：存量行按 price_status 推导（ok/locked=成功观察并带
     # last_success_at；其余=失败态）。WHERE attempt_outcome IS NULL 保证幂等。
@@ -337,8 +352,9 @@ def _ensure_schema(sync_conn) -> None:
             text("PRAGMA table_info(game_current_prices)")
         ).fetchall()
     }
+    backfilled = 0
     if "attempt_outcome" in gcp_cols:
-        sync_conn.execute(
+        backfilled = sync_conn.execute(
             text(
                 "UPDATE game_current_prices SET "
                 "attempt_outcome = CASE WHEN price_status IN ('ok', 'locked') "
@@ -349,8 +365,14 @@ def _ensure_schema(sync_conn) -> None:
                 "  THEN updated_at ELSE NULL END "
                 "WHERE attempt_outcome IS NULL"
             )
-        )
+        ).rowcount
 
+    existing_indexes = {
+        row[0] for row in sync_conn.execute(
+            text("SELECT name FROM sqlite_master WHERE type='index'")
+        ).fetchall()
+    }
+    added_indexes: list[str] = []
     for table, statements in _TABLE_EXTRA_INDEXES.items():
         has_table = sync_conn.execute(
             text("SELECT 1 FROM sqlite_master WHERE type='table' AND name=:t"), {"t": table}
@@ -359,6 +381,17 @@ def _ensure_schema(sync_conn) -> None:
             continue
         for ddl in statements:
             sync_conn.execute(text(ddl))
+            m = _EXTRA_INDEX_NAME_RE.match(ddl)
+            if m and m.group(1) not in existing_indexes:
+                existing_indexes.add(m.group(1))
+                added_indexes.append(m.group(1))
+
+    if added_columns:
+        log_event(logger, "存量库结构补列", detail={"列": added_columns})
+    if backfilled:
+        log_event(logger, "观察三元组存量回填", detail={"行数": backfilled})
+    if added_indexes:
+        log_event(logger, "存量库补索引", detail={"索引": added_indexes})
 
 
 # ── 迁移链（后门）：结构性 schema 变更登记处 ──────────────────────────
@@ -367,7 +400,7 @@ def _ensure_schema(sync_conn) -> None:
 #   2. _MIGRATIONS 追加 (版本号, 描述, SQL 列表)；SQL 须幂等（中断续跑 +
 #      用户库版本乱序防御），复杂逻辑可登记 async fn(engine) 同位元素
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 15
 
 # 零小数货币（Steam 以整数计价）：旧捆绑包链路的除数表按 1 处理，与「统一存分」
 # 的新约定差 100 倍——v2 归一的目标集合
@@ -953,6 +986,51 @@ async def _migrate_games_name_fts(conn) -> None:
     ))
 
 
+async def _migrate_drop_redundant_gph_indexes(conn) -> None:
+    """v14：删 game_price_history 两个冗余索引（回收体量见 ML 注释，此处不动数据）。
+
+    删的是两条重复检索路径：一条是去重唯一索引的严格前缀列组合，另一条的
+    检索目标在查询侧从不单独出现（引用它的查询都同限 appid）。
+
+    **唯一索引在场才删**：它是写入侧 `INSERT OR REPLACE` 的去重依据，缺了会让
+    同一快照反复堆积。它缺席时本步只告警跳过——该索引由 v4 补建，重启后两条
+    按序自动重试。删索引只把页标空待复用，文件大小不变，收缩需另跑空间回收。
+    """
+    from sqlalchemy import text
+
+    names = {
+        row[0]
+        for row in (
+            await conn.execute(
+                text(
+                    "SELECT name FROM sqlite_master WHERE type='index'"
+                    " AND tbl_name='game_price_history'"
+                )
+            )
+        ).all()
+    }
+    if "ux_gph_snapshot" not in names:
+        log_event(
+            logger,
+            "价格历史的去重唯一索引不在场，本步不删冗余索引——重复行清理后重启会自动续跑",
+            tag="跳过",
+            level=logging.WARNING,
+            detail={"既有索引": ", ".join(sorted(names)) or "(无)"},
+        )
+        return
+    dropped: list[str] = []
+    for name in ("ix_gph_appid_region_snapshot", "ix_gph_sub_id"):
+        if name in names:
+            await conn.execute(text(f"DROP INDEX IF EXISTS {name}"))
+            dropped.append(name)
+    log_event(
+        logger,
+        "价格历史冗余索引已删除（空闲页待复用，文件收缩需跑空间回收）",
+        tag="成功",
+        detail={"已删索引": ", ".join(dropped) or "(此前已删)"},
+    )
+
+
 # (目标版本, 说明, 迁移体)：迁移体 = SQL 语句列表，或 async callable(engine)
 _MIGRATIONS: list[tuple[int, str, object]] = [
     (2, "bundle_region_prices 零小数货币单位归一（元→分 + cny_fen 去虚高）",
@@ -1005,6 +1083,25 @@ _MIGRATIONS: list[tuple[int, str, object]] = [
     (13, "games_name_fts 名称影子检索表（CJK bigram + 英文原词，unicode61 下"
          "逐片成词——2 字中文游戏名可查；触发器同步覆盖全部 SQL 写入方）",
      _migrate_games_name_fts),
+    (14, "game_price_history 冗余索引退役（检索能力被去重唯一索引覆盖/查询侧从不"
+         "单独选中；唯一索引缺席时跳过，留待 v4 补建后自动重试）",
+     _migrate_drop_redundant_gph_indexes),
+    (15, "redeem_activations 激活账本表（CDK 激活 / 免费领取的结果落账，"
+         "许可归属账仍归 bill_cdk_games）",
+     [
+         "CREATE TABLE IF NOT EXISTS redeem_activations ("
+         "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
+         "created_at DATETIME NOT NULL, "
+         "kind VARCHAR(10) NOT NULL, "
+         "status VARCHAR(10) NOT NULL, "
+         "product_key VARCHAR(120) NOT NULL, "
+         "subid VARCHAR(40) NOT NULL, "
+         "sub_name VARCHAR(300) NOT NULL, "
+         "detail VARCHAR(300) NOT NULL, "
+         "raw TEXT NOT NULL, "
+         "steamid VARCHAR(32) NOT NULL)",
+         "CREATE INDEX IF NOT EXISTS ix_ra_created ON redeem_activations (created_at)",
+     ]),
 ]
 
 
@@ -1188,6 +1285,7 @@ async def init_db() -> None:
     from app.domains.wishlist import models as _wishlist_models  # noqa: F401
     from app.domains.family import models as _family_models  # noqa: F401
     from app.domains.account import models as _account_models  # noqa: F401
+    from app.domains.redeem import models as _redeem_models  # noqa: F401
 
     async with get_engine().begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -1211,11 +1309,14 @@ async def init_db() -> None:
         if existing is None:
             session.add(FxRate(currency_code="CNY", rate_to_cny=1.0))
             await session.commit()
+            log_event(logger, "汇率基准行已落库", detail={"币种": "CNY", "对人民币汇率": 1.0})
 
     # 标签中文名底座：内置热门标签表落库（零请求；冷门 tagid 由爬取侧懒请求兜底）
     from app.domains.games import tags as tags_service
 
-    await tags_service.seed_names()
+    written = await tags_service.seed_names()
+    if written:
+        log_event(logger, "标签中文名底座落库", detail={"写入行数": written})
 
 
 @lru_cache
@@ -1234,10 +1335,10 @@ def get_engine():
         # 让每个连接做完 checkpoint 都把 WAL 收回本限内。
         cursor.execute("PRAGMA journal_size_limit=67108864")
         cursor.execute("PRAGMA foreign_keys=ON")
-        # 256MB 页缓存（默认 2MB）+ mmap 读路径：GB 级库上基线查询与批量
-        # upsert 的索引下探优先命中进程内，省去逐页读盘
+        # 256MB 页缓存（默认 2MB）
         cursor.execute("PRAGMA cache_size=-262144")
-        cursor.execute("PRAGMA mmap_size=1073741824")
+        # mmap 按连接各映射一份、不跨连接共享，连接一多内存成倍叠加，故不启用
+        cursor.execute("PRAGMA mmap_size=0")
         cursor.execute("PRAGMA temp_store=MEMORY")
         # 60s：种子历史合并单事务 BEGIN IMMEDIATE 持锁可达十几秒，引擎侧
         # 连接等锁要扛过这个窗口（与 _merge_history_sync 自己的 60s 同宽）；
