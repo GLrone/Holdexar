@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -23,15 +24,37 @@ def db():
     return get_session_factory()
 @pytest.mark.asyncio
 async def test_resolve_proxy_first_clash_running(db, monkeypatch):
-    """proxy_first + 内核在跑 → 返回内核混合端口（登录窗代理优先的取数源）。"""
+    """proxy_first + 内核在跑且入口在听 → 返回内核混合端口（登录窗代理优先的取数源）。"""
     await settings_service.set_value("proxy.strategy", "proxy_first")
     monkeypatch.setattr(
         clash_manager.runtime,
         "status",
         lambda: {"running": True, "port": 7890, "configPath": "x", "controllerUrl": "y"},
     )
+    monkeypatch.setattr(clash_manager.runtime, "entry_listening", lambda: True)
     url = await proxies_service.resolve_proxy_url()
     assert url == "http://127.0.0.1:7890"
+
+
+@pytest.mark.asyncio
+async def test_resolve_proxy_first_clash_entry_dead_skips_kernel(db, monkeypatch):
+    """proxy_first + 内核进程在跑但混合端口没在听 → 不交假地址，落到后续通道。
+
+    进程活着 ≠ 入口可用：订阅没写端口（解析出的默认值无人监听）或端口被占
+    时，交出去的地址必然 ConnectError。"""
+    await settings_service.set_value("proxy.strategy", "proxy_first")
+    monkeypatch.setattr(
+        clash_manager.runtime,
+        "status",
+        lambda: {"running": True, "port": 7890, "configPath": "x", "controllerUrl": "y"},
+    )
+    monkeypatch.setattr(clash_manager.runtime, "entry_listening", lambda: False)
+
+    async def _no_fallback() -> int | None:
+        return None
+
+    monkeypatch.setattr(proxies_service, "_local_fallback_port", _no_fallback)
+    assert await proxies_service.resolve_proxy_url() is None
 
 
 @pytest.mark.asyncio
@@ -47,18 +70,19 @@ async def test_resolve_proxy_first_nothing_falls_back_direct(db, monkeypatch):
         "status",
         lambda: {"running": False, "port": None, "configPath": None, "controllerUrl": None},
     )
-    async def _dead() -> bool:
-        return False
+    async def _no_fallback() -> int | None:
+        return None
 
-    monkeypatch.setattr(proxies_service, "_local_clash_alive", _dead)
+    monkeypatch.setattr(proxies_service, "_local_fallback_port", _no_fallback)
     assert await proxies_service.resolve_proxy_url() is None
 
 
 @pytest.mark.asyncio
 async def test_resolve_proxy_first_local_clash_port_alive(db, monkeypatch):
-    """proxy_first + 无自管内核无池 + 本地混合端口活着（用户自启 Verge）→ 走该端口。
+    """proxy_first + 无自管内核无池 + 用户自启 Verge 兜底口在听 → 走 7897。
 
-    steam 域直连基本被墙，活着的本地代理永远优于直连兜底。
+    兜底探测与 proxy.clash_port 无关：配置的端口是程序内核的监听口，不是
+    Verge 的探测目标；兜底固定走生态默认口 7897。
     """
     await settings_service.set_value("proxy.strategy", "proxy_first")
     await settings_service.set_value("proxy.clash_port", 7890)
@@ -67,11 +91,11 @@ async def test_resolve_proxy_first_local_clash_port_alive(db, monkeypatch):
         "status",
         lambda: {"running": False, "port": None, "configPath": None, "controllerUrl": None},
     )
-    async def _alive() -> bool:
-        return True
+    async def _alive() -> int | None:
+        return 7897
 
-    monkeypatch.setattr(proxies_service, "_local_clash_alive", _alive)
-    assert await proxies_service.resolve_proxy_url() == "http://127.0.0.1:7890"
+    monkeypatch.setattr(proxies_service, "_local_fallback_port", _alive)
+    assert await proxies_service.resolve_proxy_url() == "http://127.0.0.1:7897"
 
 
 @pytest.mark.asyncio
@@ -204,3 +228,57 @@ async def test_set_strategy_rejects_removed_strategy(db):
     for removed in ("pinned", "clash"):
         with pytest.raises(ValueError, match="未知策略"):
             await proxies_service.set_strategy(removed)
+
+
+# ─── 端口语义 ────────────────────────────────────────────
+
+
+def test_pin_mixed_port_overrides_subscription_port():
+    """钉端口：配置里写的端口不再决定监听口，工作端口说了算（幂等）。"""
+    text = yaml.safe_dump(
+        {"mixed-port": 17890, "proxies": [dict(name="a", type="http", server="10.0.0.1", port=1)]}
+    )
+    pinned = clash_manager.pin_mixed_port(text, 7890)
+    assert clash_manager.parse_mixed_port(pinned) == 7890
+    assert clash_manager.pin_mixed_port(pinned, 7890) == pinned
+
+
+def test_pin_mixed_port_adds_missing_key():
+    """订阅没写端口的旧缺陷（解析默认值无人监听）在此根除：钉端口补上键。"""
+    text = yaml.safe_dump({"proxies": [dict(name="a", type="http", server="10.0.0.1", port=1)]})
+    pinned = clash_manager.pin_mixed_port(text, 7890)
+    assert clash_manager.parse_mixed_port(pinned) == 7890
+
+
+def test_pin_mixed_port_unparseable_returns_raw():
+    """不可解析的配置原样返回（校验与入口就绪检查会拦住起不来的形态）。"""
+    raw = "not: [valid"
+    assert clash_manager.pin_mixed_port(raw, 7890) == raw
+
+
+def test_subscription_view_strips_mixed_port():
+    """端口归程序管：订阅内容等价比较剥掉 mixed-port，端口漂移不触发重启。"""
+    a = clash_manager._subscription_view(yaml.safe_dump({"mixed-port": 17890, "proxies": []}))
+    b = clash_manager._subscription_view(yaml.safe_dump({"mixed-port": 7890, "proxies": []}))
+    assert a == b
+
+
+def test_fallback_ports_are_verge_default_only():
+    """兜底借道口 = 用户自启 Verge 的生态默认 7897，与工作端口设置无关。"""
+    assert clash_manager.LOCAL_MIXED_PORTS == (7897,)
+
+
+@pytest.mark.asyncio
+async def test_set_strategy_port_change_restarts_kernel(db, monkeypatch):
+    """工作端口改了就要用上：内核在跑时按新端口重启；同值不重启。"""
+    called: list[int] = []
+
+    async def fake_restart(port: int) -> None:
+        called.append(port)
+
+    monkeypatch.setattr(proxies_service, "_restart_kernel_for_port", fake_restart)
+    await proxies_service.set_strategy(clash_port=7891)
+    assert called == [7891]
+    called.clear()
+    await proxies_service.set_strategy(clash_port=7891)
+    assert called == []

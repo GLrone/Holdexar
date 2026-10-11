@@ -20,6 +20,7 @@ import re
 import shutil
 import socket
 import subprocess
+import time
 import urllib.parse
 import zipfile
 from collections.abc import Sequence
@@ -374,8 +375,10 @@ def _port_reachable(port: int, host: str = "127.0.0.1", timeout: float = 0.3) ->
         return False
 
 
-# 本机常见混合端口：7890 是旧版默认，7897 是 Verge 默认
-LOCAL_MIXED_PORTS: tuple[int, ...] = (7890, 7897)
+# 兜底借道口：用户自启 Clash/Verge 的生态默认混合端口（内核没跑且无池时
+# 的下载/代理兜底探测目标）。与 proxy.clash_port 无关——网络页配置的端口
+# 是程序内核的监听口，不是 Verge 的探测目标。
+LOCAL_MIXED_PORTS: tuple[int, ...] = (7897,)
 
 
 def local_mixed_channels(exclude_port: int | None = None) -> list[str]:
@@ -627,6 +630,25 @@ def parse_mixed_port(config_text: str) -> int:
     return 7890
 
 
+def pin_mixed_port(config_text: str, port: int) -> str:
+    """把混合口钉成程序配置的工作端口（幂等）。
+
+    网络页配置的端口是**本程序内核的监听口**，程序的全部代理流量统一走它——
+    订阅写什么端口不再决定监听口；订阅没写端口时解析默认值将无人监听，此函
+    数一并钉掉该形态。不可解析的配置原样返回（校验与入口就绪检查会拦住起不
+    来的形态）。"""
+    try:
+        doc = yaml.safe_load(config_text)
+    except yaml.YAMLError:
+        return config_text
+    if not isinstance(doc, dict):
+        return config_text
+    if doc.get("mixed-port") == int(port):
+        return config_text
+    doc["mixed-port"] = int(port)
+    return yaml.safe_dump(doc, allow_unicode=True, sort_keys=False)
+
+
 CONTROLLER_PORT = 19090
 CONTROLLER_SECRET = APP_SLUG
 
@@ -712,7 +734,10 @@ def config_unchanged(startup_text: str | None, disk_text: str) -> bool:
 
 
 def _subscription_view(config_text: str) -> dict | None:
-    """配置的订阅内容视图：剥掉探测 lane 后的 yaml 结构（等价比较用）。"""
+    """配置的订阅内容视图：剥掉探测 lane 与混合口后的 yaml 结构（等价比较用）。
+
+    mixed-port 一并剥掉：监听口归程序管（pin_mixed_port 钉成工作端口），
+    不属于订阅内容——端口漂移不触发重启的语义由这里兑现。"""
     try:
         doc = yaml.safe_load(config_text)
     except yaml.YAMLError:
@@ -720,6 +745,7 @@ def _subscription_view(config_text: str) -> dict | None:
     if not isinstance(doc, dict):
         return None
     view = dict(doc)
+    view.pop("mixed-port", None)
     for key in ("proxy-groups", "listeners"):
         entries = view.get(key)
         if isinstance(entries, list):
@@ -917,16 +943,49 @@ class ClashRuntime:
         # （内核在内存里照常跑着注入后的配置），磁盘内容不可信。
         self.probe_lanes: list[tuple[str, int]] = []
         self._startup_text: str | None = None  # 启动时的配置文本（重启判定用）
+        # 混合入口就绪事实：启动/重载时验证过「端口真的在听」才为 True。
+        # 内核对端口绑定失败只打日志不退出（订阅没写端口时解析出的默认值
+        # 无人监听、端口被占同理），「进程在跑」与「入口可用」是两回事。
+        self.entry_ready: bool = False
 
     def status(self) -> dict:
         running = self.process is not None and self.process.poll() is None
         return {
             "running": running,
             "port": self.port,
+            "entryReady": bool(running and self.port and self.entry_ready),
             "configPath": self.config_path,
             "controllerUrl": self.controller_url if running else None,
             "subscriptionUrl": self.subscription_url if running else None,
         }
+
+    def entry_listening(self) -> bool:
+        """混合入口此刻真的可连（进程在跑 + 端口在听）——出口取值口的硬闸。
+
+        status() 的 entryReady 是启动/重载时刻落章的事实；本方法现查现判，
+        覆盖「启动后端口被抢 / 内核半死」的滞后窗口。"""
+        if not (self.status()["running"] and self.port):
+            return False
+        return _port_listening(self.port)
+
+    def _wait_mixed_port(self, timeout: float = 1.5) -> bool:
+        """启动后等混合端口真的在听（控制器就绪 ≠ 入口就绪，池内核同款检查）。"""
+        if not self.port:
+            return False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.process is not None and self.process.poll() is not None:
+                break  # 进程已退出：不必再等
+            if _port_listening(self.port):
+                return True
+            time.sleep(0.1)
+        log_event(
+            logger,
+            "Clash 内核混合端口未监听，入口暂不可用",
+            level=logging.WARNING,
+            detail={"端口": self.port, "配置": self.config_path},
+        )
+        return False
 
     def _kill_orphans(self, exe_path: str, config_path: str) -> int:
         """清理同 exe+config 的残留内核进程（服务被强杀后 mihomo 不随父进程退出）。
@@ -970,13 +1029,16 @@ class ClashRuntime:
         restart_if_changed: bool = False,
         inject_lanes: bool = True,
         subscription_url: str | None = None,
+        mixed_port: int | None = None,
     ) -> dict:
         """启动内核。restart_if_changed：已在跑但配置文件内容较启动时
         有变化 → 重启生效（免重启刷新订阅节点用）；内容没变沿用实例。
         inject_lanes：注入探测 lane（节点检测的 20 并发通道）；池内核有
         自己的 lane 体系，传 False 保持其运行配置与对账口径纯净。
         subscription_url：本次启动归属的订阅（「在跑哪条」的事实源，
-        检测归属与订阅重拉的重启开关都认它）。"""
+        检测归属与订阅重拉的重启开关都认它）。
+        mixed_port：钉死本内核的混合监听口（程序工作端口）——给了就覆写
+        配置里的端口，订阅写什么不再决定监听口；不给保持订阅原样（池内核）。"""
         if self.status()["running"]:
             if not restart_if_changed:
                 # 已在跑：同订阅（或调用方未带归属）幂等返回；带了**不同**的
@@ -1018,6 +1080,11 @@ class ClashRuntime:
                 detail={"原因": str(e)},
             )
         config_text = Path(config_path).read_text(encoding="utf-8", errors="ignore")
+        if mixed_port:
+            pinned = pin_mixed_port(config_text, mixed_port)
+            if pinned != config_text:
+                Path(config_path).write_text(pinned, encoding="utf-8")
+                config_text = pinned
         validate_config(exe_path, config_path, Path(config_path).parent)
         self.port = parse_mixed_port(config_text)
         # 控制器经命令行参数下发（-ext-ctl / -secret）：优先级高于配置文件，
@@ -1027,10 +1094,10 @@ class ClashRuntime:
         self.probe_lanes = []
         text = config_text
         if inject_lanes:
-            text = inject_probe_lanes(config_text)
+            text = inject_probe_lanes(text)
             self.probe_lanes = parse_probe_lanes(text)
-            if text != config_text:
-                Path(config_path).write_text(text, encoding="utf-8")
+        if text != config_text:
+            Path(config_path).write_text(text, encoding="utf-8")
         self.config_path = config_path
         self.subscription_url = (subscription_url or "").strip() or None
         self._startup_text = text if inject_lanes else config_text
@@ -1045,6 +1112,7 @@ class ClashRuntime:
             stderr=subprocess.STDOUT,
         )
         log_file.close()
+        self.entry_ready = self._wait_mixed_port()
         log_event(
             logger,
             "Clash 内核已启动",
@@ -1081,14 +1149,17 @@ class ClashRuntime:
         self._startup_text = text
         self.port = parse_mixed_port(text)
 
-    def _running_kernel_text(self, config_path: str) -> tuple[str, str]:
+    def _running_kernel_text(
+        self, config_path: str, *, mixed_port: int | None = None,
+    ) -> tuple[str, str]:
         """给**运行中**内核热重载用的配置文本：做合法性预检（YAML 可解析
         + 有节点段），不合法抛 _ReloadRejected——坏配置不该走到内核面前。
         返回 (注入 lane 后文本, 写盘前的文件原内容)：拒载回滚恢复的是**这个
         文件自己**被覆盖前的内容——每订阅各存一份缓存后，目标文件与运行中
         订阅经常不是同一条，用运行文本回滚会把别的订阅内容写进这份缓存。
         控制器不需写入文本：端点由启动时的命令行参数固定，热重载不会把它
-        搬回配置文件里的值（PUT /configs 之后控制器仍保持在命令行端点）。"""
+        搬回配置文件里的值（PUT /configs 之后控制器仍保持在命令行端点）。
+        mixed_port 给了就一并钉死混合监听口（程序工作端口不随订阅走）。"""
         prev_file_text = ""
         if Path(config_path).is_file():
             prev_file_text = Path(config_path).read_text(encoding="utf-8", errors="ignore")
@@ -1100,6 +1171,8 @@ class ClashRuntime:
         if not isinstance(doc, dict) or not (doc.get("proxies") or doc.get("proxy-providers")):
             raise _ReloadRejected("新配置没有 proxies / proxy-providers 段")
         text = inject_probe_lanes(text)
+        if mixed_port:
+            text = pin_mixed_port(text, mixed_port)
         Path(config_path).write_text(text, encoding="utf-8")
         return text, prev_file_text
 
@@ -1121,23 +1194,38 @@ class ClashRuntime:
         lanes = parse_probe_lanes(injected_text)
         if lanes and not any(_port_listening(port) for _g, port in lanes):
             raise RuntimeError("重载后探测 lane 端口无一在听")
+        # 混合入口与 lane 同一道就绪检查：重载会重绑 listener，新配置的
+        # 混合端口（可能随订阅变了）不在听 = 入口不可用，走回退重启。
+        new_port = parse_mixed_port(injected_text)
+        if new_port and not _port_listening(new_port):
+            raise RuntimeError(f"重载后混合端口 {new_port} 未监听")
 
     async def ensure_running(
         self, exe_path: str, config_path: str, *, subscription_url: str | None = None,
+        mixed_port: int | None = None,
     ) -> dict:
         """确保内核跑着指定订阅的配置：没跑就启动；在跑时**热重载**生效
         （切换订阅 / 同订阅内容更新都走控制器 PUT /configs，内核进程不动——
         与 Clash Verge Rev 的换配置路径同款）；控制器不可达或重载校验不通过
-        才回退进程重启。返回 status + {started, reloaded} 两个标记。"""
+        才回退进程重启。返回 status + {started, reloaded} 两个标记。
+        mixed_port：钉死混合监听口（程序工作端口），当前监听口与它不符时
+        不走幂等空转，重载/重启收敛到新端口。"""
         sub_url = (subscription_url or "").strip() or None
         if not self.status()["running"]:
-            status = self.start(exe_path, config_path, subscription_url=sub_url)
+            status = self.start(
+                exe_path, config_path, subscription_url=sub_url, mixed_port=mixed_port,
+            )
             return {**status, "started": True, "reloaded": False}
 
         same_sub = bool(sub_url and self.subscription_url == sub_url)
-        if same_sub and self.config_path == config_path and config_unchanged(
-            self._startup_text,
-            Path(config_path).read_text(encoding="utf-8", errors="ignore"),
+        if (
+            same_sub
+            and self.config_path == config_path
+            and (mixed_port is None or self.port == mixed_port)
+            and config_unchanged(
+                self._startup_text,
+                Path(config_path).read_text(encoding="utf-8", errors="ignore"),
+            )
         ):
             # 同订阅且订阅内容没变：不重载（幂等）
             return {**self.status(), "started": False, "reloaded": False}
@@ -1145,7 +1233,9 @@ class ClashRuntime:
         prev_file_text = ""
         wrote = False
         try:
-            injected, prev_file_text = self._running_kernel_text(config_path)
+            injected, prev_file_text = self._running_kernel_text(
+                config_path, mixed_port=mixed_port,
+            )
             wrote = True
             headers = {"Authorization": f"Bearer {self.secret}"} if self.secret else {}
             async with httpx.AsyncClient(timeout=15, headers=headers, trust_env=False) as client:
@@ -1181,7 +1271,9 @@ class ClashRuntime:
                 detail={"异常类型": type(e).__name__, "原因": str(e)},
             )
             self.stop()
-            status = self.start(exe_path, config_path, subscription_url=sub_url)
+            status = self.start(
+                exe_path, config_path, subscription_url=sub_url, mixed_port=mixed_port,
+            )
             return {**status, "started": True, "reloaded": False}
 
         self.config_path = config_path
@@ -1189,6 +1281,8 @@ class ClashRuntime:
         self.port = parse_mixed_port(injected)
         self.probe_lanes = parse_probe_lanes(injected)
         self.subscription_url = sub_url or self.subscription_url
+        # 混合端口在 _verify_reloaded 已验证在听，入口事实随之落章
+        self.entry_ready = True
         log_event(
             logger,
             "内核配置已热重载，进程未重启",
@@ -1210,13 +1304,17 @@ class ClashRuntime:
         self.subscription_url = None
         self.probe_lanes = []
         self._startup_text = None
+        self.entry_ready = False
         return self.status()
 
     def _download_attempts(
         self, proxy_url: str | list[str] | None = None
     ) -> list[tuple[str | None, str]]:
-        """实例包装：补上本内核运行端口后走模块级通道链。"""
-        running = self.status()["running"] and self.port
+        """实例包装：补上本内核运行端口后走模块级通道链。端口没在听
+        （进程活着但入口是死的）就不交这条通道——否则每次刷新先白等一轮。"""
+        running = (
+            self.status()["running"] and self.port and _port_listening(self.port)
+        )
         return _download_attempts(self.port if running else None, proxy_url)
 
     async def fetch_subscription_headers(

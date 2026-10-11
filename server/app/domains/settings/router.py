@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 
 from fastapi import APIRouter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from . import service
 
@@ -76,6 +76,33 @@ _FETCH_SETTING_KEYS: dict[str, str] = {
 }
 
 
+class ContentSchedule(BaseModel):
+    """内容源自动刷新节奏：时刻（HH:MM）+ 间隔天数（1=每天，上限 30）。"""
+
+    time: str
+    days: int = 1
+
+    @field_validator("time")
+    @classmethod
+    def _normalize_time(cls, value: str) -> str:
+        from app.core.scheduler import parse_schedule_time
+
+        hour, minute = parse_schedule_time(value)
+        return f"{hour:02d}:{minute:02d}"
+
+    @field_validator("days")
+    @classmethod
+    def _clamp_days(cls, value: int) -> int:
+        return max(1, min(30, int(value)))
+
+
+def _default_schedule(job_id: str) -> ContentSchedule:
+    from app.core.scheduler import CONTENT_SCHEDULE_DEFAULTS
+
+    default = CONTENT_SCHEDULE_DEFAULTS[job_id]
+    return ContentSchedule(time=default["time"], days=int(default["days"]))
+
+
 class FetchSettingsPayload(BaseModel):
     epic_free: bool = True
     hb_choice: bool = True
@@ -88,6 +115,9 @@ class FetchSettingsPayload(BaseModel):
     # 目录层随价格更新：True = 每轮价格更新带上未关注的目录游戏
     # （特惠榜尾段恒随轮）；改动从下一轮生效，不打断在跑的轮
     catalog_refresh: bool = False
+    # 内容源自定义刷新节奏（自动抓取页；改动即时重排对应定时拍）
+    hb_schedule: ContentSchedule = Field(default_factory=lambda: _default_schedule("hb_choice"))
+    epic_schedule: ContentSchedule = Field(default_factory=lambda: _default_schedule("epic_free"))
 
 
 class FetchSettingsUpdate(BaseModel):
@@ -99,6 +129,8 @@ class FetchSettingsUpdate(BaseModel):
     fx_history: bool | None = None
     price_interval_hours: int | None = None
     catalog_refresh: bool | None = None
+    hb_schedule: ContentSchedule | None = None
+    epic_schedule: ContentSchedule | None = None
 
 
 @router.get("")
@@ -199,6 +231,13 @@ async def _read_fetch_settings() -> FetchSettingsPayload:
     payload.catalog_refresh = bool(
         await service.get_value("crawl.catalog_refresh", catalog_default)
     )
+    # 内容源自定义节奏：KV 缺失/非法逐项回落注册默认（同一套默认）
+    from app.core.scheduler import CONTENT_SCHEDULE_KEYS, normalize_schedule
+
+    for field, job_id in (("hb_schedule", "hb_choice"), ("epic_schedule", "epic_free")):
+        raw = await service.get_value(CONTENT_SCHEDULE_KEYS[job_id], None)
+        time_text, days = normalize_schedule(raw, job_id)
+        setattr(payload, field, ContentSchedule(time=time_text, days=days))
     return payload
 
 
@@ -230,4 +269,21 @@ async def update_fetch_settings(payload: FetchSettingsUpdate) -> FetchSettingsPa
     if payload.catalog_refresh is not None:
         # 只落偏好：价格轮每轮开工时现读，改动从下一轮生效
         await service.set_value("crawl.catalog_refresh", bool(payload.catalog_refresh))
+    # 内容源自定义节奏：落 KV + 调度在跑时立即重排（下次启动按 KV 再应用）
+    from app.core.scheduler import CONTENT_SCHEDULE_KEYS, apply_content_schedule
+
+    for field, job_id in (("hb_schedule", "hb_choice"), ("epic_schedule", "epic_free")):
+        cfg = getattr(payload, field)
+        if cfg is None:
+            continue
+        await service.set_value(
+            CONTENT_SCHEDULE_KEYS[job_id], {"time": cfg.time, "days": cfg.days}
+        )
+        try:
+            from app.core import scheduler as core_scheduler
+
+            if core_scheduler.scheduler.running:
+                core_scheduler.apply_content_schedule(job_id, cfg.time, cfg.days)
+        except Exception:  # noqa: BLE001 —— 调度器未起时由启动链按 KV 应用
+            pass
     return await _read_fetch_settings()
