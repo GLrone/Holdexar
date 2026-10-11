@@ -111,7 +111,10 @@ from app.domains.agent.tools.projection import (
     BUDGET_DEFAULT_S as _BUDGET_DEFAULT_S,
     BUDGET_SLOW_S as _BUDGET_SLOW_S,
     BUDGET_TASK_S as _BUDGET_TASK_S,
+    CARD_TOOLS as _CARD_TOOLS,
+    CORE_TOOLS as _CORE_TOOLS,
     LABELS as _LABELS,
+    LIST_TOOLS as _LIST_TOOLS,
     QUICK_TOOLS,
     _NET_TOOLS,
     _READ_TOOLS,
@@ -141,6 +144,23 @@ _THRESH_RE = _shared._THRESH_RE
 _QUERY_CLEAN_RE = _shared._QUERY_CLEAN_RE
 
 TOOL_META: dict[str, dict] = REGISTRY.meta()
+
+# 工具表切面（唯一事实源在 agent/tools/projection.py）
+CARD_TOOLS = _CARD_TOOLS
+"""产卡工具：只有它们需要 emit_card 开关。"""
+
+CORE_TOOLS = _CORE_TOOLS
+"""默认可见的核心切面（四条主流程 + 会话/偏好/附件/导航 + list_tools）。"""
+
+LIST_TOOLS = _LIST_TOOLS
+"""按需解锁工具（builtin/info.py）。"""
+
+ATTACHMENT_TOOL = "read_attachment"
+"""附件读取工具（builtin/attachment.py）。
+
+常驻可见，不随轮次增减：工具表是请求前缀的一部分，按轮开关会让「system +
+工具表」这截前缀在两态之间来回翻，每次翻转都要把整段历史按未缓存重算一遍。
+常驻的代价只是一份固定说明。"""
 
 
 def clean_query_tokens(question: str) -> list[str]:
@@ -177,9 +197,33 @@ def tool_budget_s(name: str) -> float | None:
     return spec.timeout_s if spec else _BUDGET_DEFAULT_S
 
 
-def tool_specs() -> list[dict]:
-    """agent 循环的工具表（OpenAI function 格式），来自注册表视图投影。"""
-    return REGISTRY.views()
+def expandable_tools() -> frozenset[str]:
+    """核心切面之外的其余工具名——list_tools 解锁的对象（builtin/info.py）。
+
+    注册表已由 builtin/__init__ 在导入期填满，这里现算：加一个新工具只需在
+    它的 SPECS 里声明，核心与否由 projection.CORE_TOOLS 一处决定。"""
+    return frozenset(REGISTRY.names()) - CORE_TOOLS - {LIST_TOOLS}
+
+
+def tool_specs(*, expanded: frozenset[str] | None = None,
+               full: bool = False) -> list[dict]:
+    """agent 循环的工具表（OpenAI function 格式），来自注册表视图投影。
+
+    默认只发**核心切面**：四条用户主流程（找游戏 / 看价格 / 关注提醒 / 免费与
+    活动）加上会话、偏好、附件读取与导航，以及 list_tools 本身。工具表是每个
+    请求都要重发一遍的固定开销，而核心之外的大半是长会话里很少用到的诊断与
+    同步类——需要时由 list_tools 一次解锁（见 builtin/info.py），解锁后本会话
+    不再回退（回退会让整段历史的前缀缓存作废）。
+
+    expanded = 本会话已解锁的额外工具名（service.session_expanded_tools 从账本
+    重建）；full=True 给全量表（诊断 / 测试用，运行时不用）。
+
+    emit_card 只注入产卡工具（CARD_TOOLS）——不产卡的工具带上它只是白付开销。"""
+    views = REGISTRY.views(card_tools=CARD_TOOLS)
+    if full:
+        return views
+    names = CORE_TOOLS | (expanded or frozenset())
+    return [v for v in views if v["function"]["name"] in names]
 
 
 async def execute_tool(name: str, arguments: dict, *, guarded: bool = False,

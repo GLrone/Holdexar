@@ -11,12 +11,17 @@ from app.core.logging import log_event
 
 logger = logging.getLogger(__name__)
 
+from . import attachments as pilot_attachments
 from . import config as pilot_config
 from . import llm as pilot_llm
 from . import service
 from .schemas import (AskRequest, AskResponse, DetectRequest, DetectResponse,
+                      PilotAttachmentCreate, PilotAttachmentListOut, PilotAttachmentOut,
                       PilotCompactMarker, PilotConfigPayload, PilotConfigUpdate,
+                      PilotForkOut, PilotForkRequest,
                       PilotProviderListOut, PilotProviderOut, PilotProviderPayload,
+                      PilotRewindOut, PilotRewindRequest,
+                      PilotSessionFlagOut, PilotSessionFlagUpdate,
                       PilotSessionListItem, PilotSessionStats,
                       PilotSessionListOut, PilotSessionOut, PilotSessionTitleUpdate,
                       PilotSessionTurn, PilotProposalConfirm, PilotProposalOut, PilotProposalState,
@@ -39,6 +44,9 @@ async def _config_payload() -> PilotConfigPayload:
         has_api_key=bool(cfg["api_key"]),
         monthly_cap=cfg["monthly_cap"],
         context_window=cfg.get("context_window"),
+        tool_content_limit=cfg.get("tool_content_limit") or 3000,
+        context_window_source=cfg.get("context_window_source", "none"),
+        context_window_auto=cfg.get("context_window_auto"),
         usage_inp=usage["inp"],
         usage_out=usage["out"],
         usage_calls=usage["calls"],
@@ -179,10 +187,11 @@ async def test_connection(payload: TestRequest) -> TestResponse:
 
 
 @router.get("/sessions")
-async def list_sessions(limit: int = 50) -> PilotSessionListOut:
-    """最近会话投影（mtime 倒序）：标题/轮数/更新时间 + 是否生成中（运行登记），供历史面板与会话列。"""
+async def list_sessions(limit: int = 50, q: str = "") -> PilotSessionListOut:
+    """最近会话投影（mtime 倒序，置顶在前）：标题/轮数/更新时间 + 是否生成中
+    （运行登记），供历史面板与会话列。q 给定时按关键词过滤（标题或问答正文）。"""
     try:
-        items = service.get_store().list_recent(max(1, min(limit, 200)))
+        items = service.get_store().list_recent(max(1, min(limit, 200)), q=q or None)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(e)) from e
     return PilotSessionListOut(items=[
@@ -227,6 +236,9 @@ async def get_session(session_id: str) -> PilotSessionOut:
                                       done=info.get("done"),
                                       failedCount=info.get("failedCount"))
                    for pid, info in state.proposals.items()],
+        pinned=state.pinned,
+        archived=state.archived,
+        forked_from=state.forked_from,
     )
 
 
@@ -248,16 +260,81 @@ async def rename_session(session_id: str, payload: PilotSessionTitleUpdate) -> d
     return {"ok": True}
 
 
+@router.put("/sessions/{session_id}/pin")
+async def pin_session(session_id: str, payload: PilotSessionFlagUpdate) -> PilotSessionFlagOut:
+    """置顶开/关（账本追加 pin 记录）。机器码响应：no_session / write_failed。"""
+    try:
+        result = await service.pin_session(session_id, payload.on)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return PilotSessionFlagOut(**result)
+
+
+@router.put("/sessions/{session_id}/archive")
+async def archive_session(session_id: str, payload: PilotSessionFlagUpdate) -> PilotSessionFlagOut:
+    """归档开/关（账本追加 archive 记录）。机器码响应：no_session / write_failed。"""
+    try:
+        result = await service.archive_session(session_id, payload.on)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return PilotSessionFlagOut(**result)
+
+
+@router.post("/sessions/{session_id}/fork")
+async def fork_session(session_id: str, payload: PilotForkRequest) -> PilotForkOut:
+    """话题分叉：从源会话前 keep_turns 轮派生新会话（源账本零改动）。
+
+    生成中拒绝。机器码响应：no_session / busy / write_failed；成功返回新会话 id。"""
+    try:
+        result = await service.fork_session(session_id, payload.keep_turns)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return PilotForkOut(**result)
+
+
 @router.delete("/sessions/{session_id}")
 async def delete_session(session_id: str) -> dict:
-    """删除会话文件（账本生命周期动作，与 TTL 清扫同机制）。无此会话 → 404。"""
+    """删除会话文件（账本生命周期动作，与 TTL 清扫同机制）。无此会话 → 404。
+
+    附件是会话的外部资源（见 attachments 模块），随会话一并清理——留着的
+    附件没有引用它的对话，只会在数据目录里无主堆积。"""
     try:
         ok = await service.get_store().delete(session_id)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(e)) from e
     if not ok:
         raise HTTPException(status_code=404, detail="session not found")
+    pilot_attachments.purge(session_id)
     return {"ok": True}
+
+
+@router.post("/attachments")
+async def create_attachment(payload: PilotAttachmentCreate) -> PilotAttachmentOut:
+    """长文本落盘为附件（提问字段只带引用 id）。
+
+    前端粘贴超阈值时先调它——消息体里从此不放全文；服务端也会对超长提问
+    做同样的兜底，两条路同一套存储。落盘失败（sid 非法 / 内容超上限）→ 422。"""
+    ref = pilot_attachments.save(payload.session_id, payload.text, payload.name)
+    if ref is None:
+        raise HTTPException(status_code=422, detail="attachment_rejected")
+    return PilotAttachmentOut(**ref)
+
+
+@router.get("/attachments")
+async def list_attachments(session_id: str) -> PilotAttachmentListOut:
+    """本会话附件清单（引用形式，不含全文）。"""
+    return PilotAttachmentListOut(
+        items=[PilotAttachmentOut(**ref) for ref in pilot_attachments.list_of(session_id)])
+
+
+@router.get("/attachments/{aid}")
+async def read_attachment(aid: str, session_id: str, start_line: int = 1,
+                          end_line: int | None = None) -> dict:
+    """按行号区间读附件（前端展开附件时用；与模型侧读取同一实现与同一预算）。"""
+    got = pilot_attachments.read_range(session_id, aid, start_line=start_line, end_line=end_line)
+    if got is None:
+        raise HTTPException(status_code=404, detail="attachment not found")
+    return got
 
 
 @router.post("/sessions/{session_id}/compact")
@@ -280,6 +357,18 @@ async def compact_session(session_id: str) -> dict:
         raise
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@router.post("/sessions/{session_id}/rewind")
+async def rewind_session(session_id: str, payload: PilotRewindRequest) -> PilotRewindOut:
+    """编辑重问：账本保留前 keep_turns 轮，其后轮次作废（软截断，历史行不动）。
+
+    生成中拒绝。机器码响应：no_session / busy / write_failed。"""
+    try:
+        result = await service.rewind_session(session_id, payload.keep_turns)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return PilotRewindOut(**result)
 
 
 @router.post("/proposal/confirm")
@@ -314,7 +403,11 @@ async def run_tool(payload: ToolRunRequest) -> ToolRunResponse:
 async def ask(payload: AskRequest) -> AskResponse:
     try:
         result = await service.ask(payload.question, payload.appid, payload.session_id,
-                                   payload.reference_sid)
+                                   payload.reference_sid,
+                                   payload.resume.model_dump() if payload.resume else None,
+                                   payload.attachments,
+                                   payload.view_context,
+                                   payload.element_refs)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     except Exception as e:  # noqa: BLE001
@@ -335,7 +428,11 @@ async def ask_stream(payload: AskRequest):
         try:
             try:
                 async for event in service.ask_stream(payload.question, payload.appid,
-                                                      payload.session_id, payload.reference_sid):
+                                                      payload.session_id, payload.reference_sid,
+                                                      payload.resume.model_dump() if payload.resume else None,
+                                                      payload.attachments,
+                                                      payload.view_context,
+                                                      payload.element_refs):
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
             except Exception:  # noqa: BLE001 — 流已开始，HTTP 状态无法再改，帧内报错
                 yield f'data: {json.dumps({"type": "error", "reason": "server_error"}, ensure_ascii=False)}\n\n'

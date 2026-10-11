@@ -16,7 +16,7 @@ def _async_fn(fn):
 
 
 def test_specs_contains_read_tools_without_required_params():
-    specs = {s["function"]["name"]: s["function"] for s in pilot_tools.tool_specs()}
+    specs = {s["function"]["name"]: s["function"] for s in pilot_tools.tool_specs(full=True)}
     for name in pilot_tools._READ_TOOLS:
         assert name in specs, name
         assert not specs[name].get("required"), name

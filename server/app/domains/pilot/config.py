@@ -7,6 +7,7 @@
 - pilot.llm.enabled            bool，LLM 解读总开关（全局；关闭时领航台仍直出模板化事实摘要）
 - pilot.llm.model              当前选用模型名（属于活跃供应商的清单）
 - pilot.llm.monthly_cap        单月 token 用量上限（全局；0 = 不限，仅统计不熔断）
+- pilot.ctx.tool_content_limit 历史轮工具结果保留预算（字符；头尾保留、中段省略）
 - pilot.usage.<YYYYMM>         当月已用 token 累计（用量台账，跨月自然换键）
 
 存量单配置（pilot.llm.protocol/base_url/models/api_key）在账本键缺失时
@@ -20,6 +21,7 @@ from uuid import uuid4
 
 from app.crawler.utils import get_beijing_time_obj
 from app.domains.pilot import llm as pilot_llm
+from app.domains.pilot import model_windows as MODEL_WINDOWS
 from app.domains.settings import service as settings_service
 
 DEFAULT_MONTHLY_CAP = 0
@@ -40,6 +42,13 @@ _CONTEXT_WINDOW_KEY = "pilot.llm.context_window"
 # 窗口上限：防手滑填爆（1M 级窗口已覆盖现役模型；未知填 0/清空即回落固定预算）
 _CONTEXT_WINDOW_MAX = 2_000_000
 
+# 工具输出留在上下文里的保留预算（字符，头尾保留、中段省略）：
+# 历史轮里超长工具结果按它裁剪——调大更保真但更快撞上下文预算。
+_TOOL_LIMIT_KEY = "pilot.ctx.tool_content_limit"
+TOOL_CONTENT_LIMIT_DEFAULT = 3000
+TOOL_CONTENT_LIMIT_MIN = 500
+TOOL_CONTENT_LIMIT_MAX = 20000
+
 
 def _provider_key_name(pid: str) -> str:
     return f"pilot.llm.provider_key.{pid}"
@@ -57,6 +66,36 @@ def _clean_window(raw) -> int | None:
     except (TypeError, ValueError):
         return None
     return window if 0 < window <= _CONTEXT_WINDOW_MAX else None
+
+
+def _clean_tool_limit(raw) -> int:
+    """工具输出预算清洗：夹在 [MIN, MAX]；非法/非正回落默认。"""
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return TOOL_CONTENT_LIMIT_DEFAULT
+    if value <= 0:
+        return TOOL_CONTENT_LIMIT_DEFAULT
+    return max(TOOL_CONTENT_LIMIT_MIN, min(TOOL_CONTENT_LIMIT_MAX, value))
+
+
+async def tool_content_limit() -> int:
+    """历史轮工具结果的保留预算（字符）；未设置回落默认。"""
+    return _clean_tool_limit(await settings_service.get_value(_TOOL_LIMIT_KEY, None))
+
+
+def _resolve_window(manual: int | None, auto: int | None) -> tuple[int | None, str]:
+    """生效窗口 = 手填优先，其次模型名识别，都没有则按兜底窗口估算。
+
+    手填的高于识别值：用户可能知道自家网关改造过窗口，而模型名只认得通用
+    型号；识别只负责「用户没说话时给个合理的数」。表外模型不再回落固定
+    预算——现代主流模型窗口都很大，按宽裕口径兜底比保守少给更接近真实，
+    source 标为 fallback 供前端提示「这是估算值，可手填覆盖」。"""
+    if manual:
+        return manual, "manual"
+    if auto:
+        return auto, "auto"
+    return MODEL_WINDOWS.FALLBACK_CONTEXT_WINDOW, "fallback"
 
 
 def _clean_provider(raw: dict) -> dict:
@@ -212,6 +251,12 @@ async def load_config() -> dict:
     else:
         # 无供应商账本时回落存量单配置读取（全新库两路皆空）
         api_key = str(await settings_service.get_secret_value(_API_KEY_KEY, "") or "")
+    model = str(await settings_service.get_value(_MODEL_KEY, "") or "").strip()
+    stored_window = active["context_window"] if active else _clean_window(
+        await settings_service.get_value(_CONTEXT_WINDOW_KEY, None))
+    # 手填优先，没手填就按模型名问内置表——填了 a 家地址却忘了窗口也能工作
+    auto_window = MODEL_WINDOWS.guess_context_window(model)
+    window, window_source = _resolve_window(stored_window, auto_window)
     return {
         "protocol": active["protocol"] if active else str(await settings_service.get_value(_PROTOCOL_KEY, "openai") or "openai").strip(),
         "enabled": bool(await settings_service.get_value(_ENABLED_KEY, False)),
@@ -221,10 +266,12 @@ async def load_config() -> dict:
         "models_disabled": active["models_disabled"] if active else _models_of(await settings_service.get_value(_MODELS_DISABLED_KEY, None)),
         "api_key": api_key,
         "monthly_cap": cap,
-        "context_window": active["context_window"] if active else _clean_window(
-            await settings_service.get_value(_CONTEXT_WINDOW_KEY, None)),
+        "context_window": window,
+        "context_window_source": window_source,
+        "context_window_auto": auto_window,
         "active": active["id"] if active else "",
         "providers": providers,
+        "tool_content_limit": _clean_tool_limit(await settings_service.get_value(_TOOL_LIMIT_KEY, None)),
     }
 
 
@@ -276,6 +323,9 @@ async def save_config(update: dict) -> None:
         # 显式空 = 清除（回落固定预算）；无供应商账本时落存量单键
         if not await _patch_active_provider({"context_window": cleaned}):
             await settings_service.set_value(_CONTEXT_WINDOW_KEY, cleaned or 0)
+    if "tool_content_limit" in update:
+        await settings_service.set_value(
+            _TOOL_LIMIT_KEY, _clean_tool_limit(update["tool_content_limit"]))
 
 
 def _models_of(raw) -> list[str]:

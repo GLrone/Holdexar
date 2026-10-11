@@ -1,4 +1,4 @@
-"""builtin 工具集：58 个 ToolSpec 按旧 tool_specs() 顺序登记进注册表。
+"""builtin 工具集：65 个 ToolSpec 按旧 tool_specs() 顺序登记进注册表。
 
 每工具预算（timeout_s）统一取 projection.budget_for（旧 tool_budget_s 分类），
 等价性由 test_agent_tools.py 全量对比钉住。"""
@@ -8,7 +8,9 @@ from dataclasses import replace
 
 from app.domains.agent.tools.builtin import (
     account,
+    attachment,
     catalog,
+    info,
     navigate,
     offers,
     prefs,
@@ -22,7 +24,7 @@ from app.domains.agent.tools.projection import budget_for
 from app.domains.agent.tools.registry import REGISTRY
 
 _SPEC_BY_NAME: dict[str, ToolSpec] = {}
-for _mod in (catalog, prices, tracking, offers, account, system, runtime_tools, navigate, prefs):
+for _mod in (catalog, prices, tracking, offers, account, system, runtime_tools, navigate, prefs, attachment, info):
     for _spec in _mod.SPECS:
         if _spec.name in _SPEC_BY_NAME:
             raise ValueError(f"重复注册工具: {_spec.name}")
@@ -57,6 +59,9 @@ _ORDER = (
     "proxy_exit_detail",
     "proxy_latency_test",
     "write_gate_status",
+    "read_logs",
+    "system_diagnostics",
+    "sync_subscriptions",
     "list_tasks",
     "start_task",
     "cancel_task",
@@ -90,6 +95,8 @@ _ORDER = (
     "get_user_preferences",
     "set_user_preference",
     "audit_follows_workflow",
+    "read_attachment",
+    "list_tools",
 )
 
 if set(_ORDER) != set(_SPEC_BY_NAME) or len(_ORDER) != len(_SPEC_BY_NAME):

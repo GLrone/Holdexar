@@ -17,37 +17,11 @@ from app.domains.pilot import tools as pilot_tools
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    """独立临时库，替换 session 工厂。"""
-    import app.core.database as database_module
+def db():
+    """完整库（隔离数据目录，外键与生产同开）；url 供重启模拟另开引擎。"""
+    from app.core.database import get_session_factory, get_settings
 
-    db_file = tmp_path / "memory_test.db"
-    engine = create_async_engine(f"sqlite+aiosqlite:///{db_file.as_posix()}", echo=False)
-
-    @event.listens_for(engine.sync_engine, "connect")
-    def _fk_on(dbapi_conn, _record):
-        cur = dbapi_conn.cursor()
-        cur.execute("PRAGMA foreign_keys=ON")
-        cur.close()
-
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
-    monkeypatch.setattr(agent_memory, "get_session_factory", lambda: factory)
-    yield {"factory": factory, "url": f"sqlite+aiosqlite:///{db_file.as_posix()}"}
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _schema(db):
-    """建 agent_memories 表。"""
-    engine = create_async_engine(db["url"])
-    try:
-        async with engine.begin() as conn:
-            await conn.run_sync(
-                Base.metadata.create_all,
-                [AgentMemory.__table__],
-            )
-    finally:
-        await engine.dispose()
+    yield {"factory": get_session_factory(), "url": get_settings().db_url}
 
 
 @pytest.mark.asyncio

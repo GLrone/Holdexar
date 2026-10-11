@@ -1,4 +1,4 @@
-"""系统诊断与联网工具：任务失败 / 代理池 / 出口明细 / 延迟检测 / 写闸 / 联网搜索 / 价格补抓 / 测试邮件。"""
+"""系统诊断与联网工具：任务失败 / 代理池 / 出口明细 / 延迟检测 / 写闸 / 联网搜索 / 价格补抓 / 测试邮件 / 日志读取 / 诊断证据面 / 订阅同步。"""
 from __future__ import annotations
 
 import asyncio
@@ -8,6 +8,7 @@ import time
 import aiohttp
 
 from app.core.database import write_scheduler_diagnostics
+from app.core.logging import TAG_SEVERITY, ring_log_handler
 from app.domains.agent.tools.base import ToolSpec
 from app.domains.agent.tools.builtin import _shared
 from app.domains.alerts.notify import get_smtp_config, send_test_mail
@@ -214,6 +215,125 @@ async def notify_test() -> dict:
     return _shared.rows_result("notify", [{"k": "", "vKey": "notifySent", "tone": "ok"}])
 
 
+# ─────────────────────── 感知面：日志 / 诊断证据 / 订阅同步 ───────────────────────
+
+# 日志行的结果词片段：时间 [结果词] 模块中文名 · 主句 │ 键=值
+_LOG_LINE_TAG_RE = re.compile(r"\[([^\]]{1,6})\]")
+_LOG_SEVERITY_FILTERS = {
+    "info": frozenset({"info"}),
+    "warning": frozenset({"warning"}),
+    "error": frozenset({"error"}),
+}
+_LOG_TAIL_MAX = 400
+_LOG_SNAPSHOT_LIMIT = 2000
+
+
+def _line_severity(line: str) -> str | None:
+    m = _LOG_LINE_TAG_RE.search(line)
+    return TAG_SEVERITY.get(m.group(1)) if m else None
+
+
+def _log_tone(sev: str | None) -> str:
+    return {"warning": "warn", "error": "bad"}.get(sev or "", "")
+
+
+async def read_logs(keyword: str = "", level: str = "", tail: int = 120) -> dict:
+    """读运行日志的最近片段（内存环形缓冲，与日志页同源）。
+
+    按关键词（不区分大小写子串）与级别过滤后取尾部 N 行；随结果附级别
+    计数，供模型先看分布再读细节。行内只含已脱敏的运行日志，无凭据面。"""
+    try:
+        tail = max(10, min(int(tail or 120), _LOG_TAIL_MAX))
+    except (TypeError, ValueError):
+        tail = 120
+    lines = ring_log_handler.snapshot(_LOG_SNAPSHOT_LIMIT)
+    want = _LOG_SEVERITY_FILTERS.get(str(level or "").lower())
+    if want is not None:
+        lines = [ln for ln in lines if _line_severity(ln) in want]
+    kw = str(keyword or "").strip().lower()
+    if kw:
+        lines = [ln for ln in lines if kw in ln.lower()]
+    counts: dict[str, int] = {}
+    for ln in lines:
+        sev = _line_severity(ln) or "unknown"
+        counts[sev] = counts.get(sev, 0) + 1
+    rows = []
+    for ln in lines[-tail:]:
+        head, sep, body = ln.partition(" · ")
+        sev = _line_severity(ln)
+        rows.append({
+            "k": (head if sep else ln)[:56],
+            "v": (body if sep else "")[:200],
+            "tone": _log_tone(sev),
+        })
+    out = {"kind": "rows", "titleKey": "logs", "rows": rows, "total": len(lines)}
+    if counts:
+        out["counts"] = counts
+    return out
+
+
+async def system_diagnostics() -> dict:
+    """机器排障证据面快照（/system/diagnostics 同源）：身份 + 最近价格轮 + 异常信号。"""
+    from app.domains.system.router import diagnostics as _diagnostics
+
+    snap = await _diagnostics()
+    rows: list[dict] = []
+    ident = snap.get("identity")
+    if isinstance(ident, dict) and "error" not in ident:
+        rows.append({"k": f"v{ident.get('app_version', '?')}",
+                     "v": f"策略 {ident.get('strategy', '?')} · 出口 {ident.get('pool_available_exits', '?')}",
+                     "tone": "ok"})
+    cycles = snap.get("cycles") or []
+    if isinstance(cycles, list) and cycles:
+        c0 = cycles[0] if isinstance(cycles[0], dict) else {}
+        status = str(c0.get("status") or "")
+        rows.append({"k": "价格轮", "v": f"最近一轮 {status or '未知'}",
+                     "tone": "ok" if status in ("completed", "partial") else "bad"})
+    for s in (snap.get("signals") or [])[:10]:
+        if not isinstance(s, dict):
+            continue
+        rows.append({"k": str(s.get("code") or "")[:32], "v": str(s.get("text") or "")[:140],
+                     "tone": {"error": "bad", "warning": "warn"}.get(str(s.get("severity")), "")})
+    if not (snap.get("signals") or []):
+        rows.append({"k": "", "v": "诊断面未检出异常信号", "tone": "ok"})
+    return _shared.rows_result("diag", rows, total=len(rows))
+
+
+async def sync_subscriptions() -> dict:
+    """重新拉取全部启用的代理订阅（与订阅页同步按钮同源：下载新配置 + 内核按需重启）。
+
+    回执只含订阅标签与结果，绝不含订阅链接本身。"""
+    subs = await proxies_service.list_subscriptions("clash")
+    active = [s for s in subs if not s.get("deprecated")]
+    if not active:
+        return _shared.rows_result("subs", [{"k": "", "vKey": "subsNone", "tone": "warn"}])
+    rows: list[dict] = []
+    for s in active:
+        label = str(s.get("label") or f"#{s.get('id')}")
+        try:
+            await proxies_service.refresh_clash_subscription(int(s.get("id") or 0))
+            rows.append({"k": label, "vKey": "subsSynced", "tone": "ok"})
+        except Exception as e:  # noqa: BLE001 —— 单订阅失败不影响其余
+            rows.append({"k": label, "vKey": "subsFailed", "v": str(e)[:60], "tone": "bad"})
+    return _shared.rows_result("subs", rows, total=len(rows))
+
+
+async def _read_logs(args: dict, sid: str | None = None) -> dict:
+    return await read_logs(
+        keyword=str(args.get("keyword") or ""),
+        level=str(args.get("level") or ""),
+        tail=args.get("tail") if args.get("tail") is not None else 120,
+    )
+
+
+async def _system_diagnostics(args: dict, sid: str | None = None) -> dict:
+    return await system_diagnostics()
+
+
+async def _sync_subscriptions(args: dict, sid: str | None = None) -> dict:
+    return await sync_subscriptions()
+
+
 async def _recent_job_failures(args: dict, sid: str | None = None) -> dict:
     return await recent_job_failures()
 
@@ -302,5 +422,36 @@ SPECS = [
         description="查看写入调度状态。用户说『操作一直不生效/卡住了』时调用",
         parameters={"type": "object", "properties": {}},
         handler=_write_gate_status, step_label="gateStatus",
+    ),
+    ToolSpec(
+        name="read_logs", group="read", risk="low",
+        description="读取应用运行日志的最近片段（与日志页同源，已脱敏）。"
+                    "排查任何异常（抓取失败/同步出错/代理异常/界面报错）时先读这里："
+                    "可按关键词过滤（如游戏名、mihomo、wallet），或按级别只看 warning/error，"
+                    "并结合级别计数判断问题规模。返回行数有限时可用更大的 tail",
+        parameters={"type": "object", "properties": {
+            "keyword": {"type": "string", "description": "可选：只保留包含该关键词的行"},
+            "level": {"type": "string", "enum": ["info", "warning", "error"],
+                      "description": "可选：按级别过滤"},
+            "tail": {"type": "integer", "description": "取尾部多少行，默认 120，最大 400"},
+        }},
+        handler=_read_logs, step_label="readLogs",
+    ),
+    ToolSpec(
+        name="system_diagnostics", group="read", risk="low",
+        description="读取实例诊断证据面快照：版本/策略/出口概况、最近价格轮状态，"
+                    "以及机器检出的异常信号清单（如价格轮失败、写库竞争、代理池不可用）。"
+                    "用户问『现在系统什么状况/有没有什么问题/为什么跑不动』时优先调用，"
+                    "再按信号用 read_logs 深挖细节",
+        parameters={"type": "object", "properties": {}},
+        handler=_system_diagnostics, step_label="diagnostics",
+    ),
+    ToolSpec(
+        name="sync_subscriptions", group="read", risk="medium",
+        description="重新拉取全部启用的代理订阅（下载新配置，内核按需自动重启；约需十几秒）。"
+                    "用户说『同步订阅/更新订阅/重新拉一下订阅』时调用。"
+                    "只想看订阅状态用 proxy_pool_status；回执不含订阅链接",
+        parameters={"type": "object", "properties": {}},
+        handler=_sync_subscriptions, step_label="syncSubs",
     ),
 ]

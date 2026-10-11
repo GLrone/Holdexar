@@ -34,6 +34,7 @@ _READ_TOOLS = (
     "list_bundles",
     "list_sessions",
     "read_session",
+    "read_attachment",
     "web_search",
 )
 
@@ -66,6 +67,7 @@ _SYNC_TOOLS = (
     "sync_achievements",
     "sync_bills",
     "sync_family",
+    "sync_subscriptions",
     "refresh_rates",
     "ingest_appids",
     "refresh_game_price",
@@ -173,6 +175,22 @@ def tool_step(name: str, result: dict) -> dict:
             "status": "ok" if ok else "empty",
             "data": {},
         }
+    if name == "read_attachment":
+        # 附件区间读取：取到内容 = ok；附件不存在 = empty（note 已说明原因）
+        got = bool(result.get("content"))
+        return {
+            "label": "attachmentRead",
+            "status": "ok" if got else "empty",
+            "data": {"count": int(result.get("end_line") or 0) - int(result.get("start_line") or 0) + 1
+                     if got else 0},
+        }
+    if name == "epic_free":
+        offers = result.get("offers") or result.get("rows") or []
+        return {
+            "label": "epicFree",
+            "status": "ok" if offers else "empty",
+            "data": {"count": len(offers)},
+        }
     if name in _READ_TOOLS:
         rows = result.get("rows") or []
         data: dict = {"count": len(rows)}
@@ -217,13 +235,14 @@ def tool_step(name: str, result: dict) -> dict:
         return {
             "label": "navigate",
             "status": "ok" if result.get("path") else "empty",
-            "data": {"target": result.get("target") or "", "path": result.get("path") or ""},
+            "data": {"target": result.get("target") or "", "path": result.get("path") or "",
+                     "section": result.get("section") or ""},
         }
     return {"label": LABELS.get(name, name), "status": "ok", "data": {}}
 
 
 # 机器名 → 用户面步骤词条片段（label 与 i18n key `pilot.step.{label}` 对应）。
-# 机器名只进模型协议与日志，不进用户面。来源：旧 TOOL_META 全量 58 条。
+# 机器名只进模型协议与日志，不进用户面。来源：旧 TOOL_META 全量 58 条（+感知三件 63）。
 LABELS: dict[str, str] = {
     "search_games": "search",
     "get_price_briefing": "price",
@@ -248,6 +267,7 @@ LABELS: dict[str, str] = {
     "cancel_task": "taskCancel",
     "list_sessions": "sessions",
     "read_session": "sessionRead",
+    "read_attachment": "attachmentRead",
     "hb_monthly": "hbMonthly",
     "epic_free": "epicFree",
     "steam_free": "steamFree",
@@ -285,4 +305,52 @@ LABELS: dict[str, str] = {
     "get_user_preferences": "getPreferences",
     "set_user_preference": "setPreference",
     "audit_follows_workflow": "auditFollowsWorkflow",
+    "read_logs": "readLogs",
+    "system_diagnostics": "diagnostics",
+    "sync_subscriptions": "syncSubs",
+    "list_tools": "listTools",
 }
+
+
+# ─── 模型可见工具表的默认切面（每次请求都全量在场的固定开销）───
+# 核心集覆盖四条用户主流程（找游戏 / 看价格 / 关注提醒 / 免费与活动）与会话、偏好、
+# 附件、导航，以及真实账本里调用过的全部工具；其余工具由 list_tools 展开后追加。
+LIST_TOOLS = "list_tools"
+
+CORE_TOOLS: frozenset[str] = frozenset({
+    "search_games", "search_steam", "web_search", "ingest_appids",
+    "recommend_games", "top_games", "price_drops",
+    "get_price_briefing", "get_region_prices", "compare_games",
+    "refresh_game_price", "diagnose_price",
+    "add_follow", "list_follows", "create_price_alert", "update_price_alert", "list_alerts",
+    "epic_free", "steam_free", "hb_monthly", "calendar_events",
+    "propose_bulk", "propose_delete", "find_deletables",
+    "read_session", "get_user_preferences", "set_user_preference",
+    "navigate", "read_attachment",
+    LIST_TOOLS,
+})
+
+# 能产出卡片的工具（与 service 的 _CARD_KIND_HINTS / _CARD_HINT_ROWS_TOOLS 同源）：
+# 只有这些工具需要 emit_card 开关，其余工具带它只是白占固定开销。
+CARD_KIND_HINTS: dict[str, str] = {
+    "get_price_briefing": "price",
+    "get_region_prices": "regions",
+    "compare_games": "compare",
+    "search_games": "games",
+    "recommend_games": "games",
+    "search_steam": "games",
+    "top_games": "games",
+    "price_drops": "games",
+    "epic_free": "epic",
+    "list_wishlist": "games",
+    "list_owned": "games",
+    "list_family_library": "games",
+    "audit_follows_workflow": "stepper",
+    "achievements_summary": "achievements",
+    "family_status": "family",
+    "propose_bulk": "proposal",
+    "propose_delete": "proposal",
+    "navigate": "navigate",
+}
+CARD_HINT_ROWS_TOOLS: tuple[str, ...] = ("proxy_exit_detail", "proxy_latency_test")
+CARD_TOOLS: frozenset[str] = frozenset(CARD_KIND_HINTS) | frozenset(CARD_HINT_ROWS_TOOLS)

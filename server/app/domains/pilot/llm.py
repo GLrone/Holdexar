@@ -6,6 +6,10 @@
   ("answer", 增量)              正文通道；
   ("tool_calls", [assembled])   工具调用（arguments 已解析为 dict）；
   ("usage", (输入, 输出))        用量（provider 回传时才有）；
+  ("context", 输入侧总量)        本次请求真实喂进去的输入侧 token（规范化口径，
+                                 含缓存桶）；provider 没报时不下发。服务层用它
+                                 校正本地估值——各协议字段语义不同，折算在此层
+                                 一次做完，上层只认一个数；
   ("cache", {"rate","read","write","base"})
                                  输入缓存计量：rate=命中率(0-1)，read/write=缓存读/写
                                  token 数，base=计费输入总量（含缓存部分）；provider
@@ -133,6 +137,9 @@ async def _openai_parse(aiter_lines):
         if usage:
             prompt = int(usage.get("prompt_tokens") or 0)
             yield ("usage", (prompt, int(usage.get("completion_tokens") or 0)))
+            # OpenAI 兼容的 prompt_tokens 已含缓存命中部分，直接就是输入侧总量
+            if prompt:
+                yield ("context", prompt)
             cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
             read = int(cached) if isinstance(cached, (int, float)) else None
             yield ("cache", {"rate": (min(1.0, read / prompt) if read is not None and prompt > 0 else None),
@@ -294,6 +301,9 @@ async def _responses_parse(aiter_lines):
             usage = (ev.get("response") or {}).get("usage") or {}
             inp = int(usage.get("input_tokens") or 0)
             yield ("usage", (inp, int(usage.get("output_tokens") or 0)))
+            # Responses API 的 input_tokens 同样已含缓存命中部分
+            if inp:
+                yield ("context", inp)
             cached = (usage.get("input_tokens_details") or {}).get("cached_tokens")
             read = int(cached) if isinstance(cached, (int, float)) else None
             yield ("cache", {"rate": (min(1.0, read / inp) if read is not None and inp > 0 else None),
@@ -364,6 +374,7 @@ def _anthropic_request(base_url: str, api_key: str, model: str, messages: list[d
 async def _anthropic_parse(aiter_lines):
     tools_acc: dict[int, dict] = {}
     usage = [0, 0]
+    ctx_input = 0
     async for data in _sse_data_lines(aiter_lines):
         try:
             ev = json.loads(data)
@@ -380,6 +391,7 @@ async def _anthropic_parse(aiter_lines):
             # 计费输入 = 未缓存输入 + 缓存读 + 缓存写（Anthropic 三桶分开计费）；
             # 命中率分母含缓存读自身，避免部分命中被高估到 100%
             input_side = usage[0] + read + write
+            ctx_input = input_side
             yield ("cache", {"rate": (min(1.0, read / input_side) if input_side > 0 else None),
                              "read": read or None, "write": write or None, "base": input_side or None})
         elif etype == "content_block_delta":
@@ -410,6 +422,9 @@ async def _anthropic_parse(aiter_lines):
         elif etype == "message_stop":
             break
     yield ("usage", (usage[0], usage[1]))
+    # Anthropic 的 input_tokens 不含缓存两桶，输入侧总量要三桶相加
+    if ctx_input:
+        yield ("context", ctx_input)
 
 
 # ── ollama（本地 /api/chat，ndjson）───────────────────────────────────
@@ -462,7 +477,10 @@ async def _ollama_parse(aiter_lines):
         if calls:
             yield ("tool_calls", calls)
         if ev.get("done"):
-            yield ("usage", (int(ev.get("prompt_eval_count") or 0), int(ev.get("eval_count") or 0)))
+            prompt_eval = int(ev.get("prompt_eval_count") or 0)
+            yield ("usage", (prompt_eval, int(ev.get("eval_count") or 0)))
+            if prompt_eval:
+                yield ("context", prompt_eval)
 
 
 # ── 分发 ─────────────────────────────────────────────────────────────

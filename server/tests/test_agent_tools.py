@@ -17,8 +17,8 @@ def _spec(name):
 
 
 def test_registry_holds_all_tools():
-    assert len(REGISTRY.names()) == 60
-    assert len(set(REGISTRY.names())) == 60
+    assert len(REGISTRY.names()) == 65
+    assert len(set(REGISTRY.names())) == 65
     assert set(REGISTRY.names()) == set(projection.LABELS)
 
 
@@ -136,17 +136,42 @@ def test_tool_step_projection():
     step = pilot_tools.tool_step("search_games", {"kind": "games", "items": [1, 2]})
     assert step == {"label": "search", "status": "ok", "data": {"count": 2}}
     step = pilot_tools.tool_step("navigate", {"kind": "navigate", "target": "alerts", "path": "/alerts"})
-    assert step == {"label": "navigate", "status": "ok", "data": {"target": "alerts", "path": "/alerts"}}
+    assert step == {"label": "navigate", "status": "ok", "data": {"target": "alerts", "path": "/alerts", "section": ""}}
     step = pilot_tools.tool_step("list_alerts", {"kind": "rows", "rows": []})
     assert step["status"] == "empty" and step["data"] == {"count": 0}
 
 
 def test_tool_budget_step_and_specs_facade():
-    """门面三件套与注册表同源：specs / meta / budget / step。"""
-    specs = pilot_tools.tool_specs()
-    assert specs == REGISTRY.views()
+    """门面三件套与注册表同源：specs / meta / budget / step。
+
+    默认切面只给核心工具（模型侧省固定开销，见 pilot/tools.py::tool_specs）；
+    full=True 才是全量表，等价性对比走它。emit_card 只注入产卡工具。"""
+    specs = pilot_tools.tool_specs(full=True)
+    assert specs == REGISTRY.views(card_tools=pilot_tools.CARD_TOOLS)
     assert [s["function"]["name"] for s in specs][0] == "search_games"
     assert REGISTRY.get("cancel_task").parameters["properties"].get("run_id") is not None
+    # 默认切面 = 全量表的核心子集，且恒含发现入口与附件读取
+    core = {s["function"]["name"] for s in pilot_tools.tool_specs()}
+    assert core < {s["function"]["name"] for s in specs}
+    assert {"list_tools", "read_attachment"} <= core
+
+
+def test_card_tools_are_the_only_ones_with_emit_card():
+    """emit_card 只给产卡工具：其余工具带上它，是每次请求都白付的固定开销。"""
+    by_name = {s["function"]["name"]: s["function"] for s in pilot_tools.tool_specs(full=True)}
+    with_emit = {n for n, f in by_name.items() if "emit_card" in (f["parameters"].get("properties") or {})}
+    assert with_emit == set(pilot_tools.CARD_TOOLS)
+    assert "navigate" in with_emit and "read_logs" not in with_emit
+
+
+def test_core_and_expandable_partition_the_catalog():
+    """核心切面 + 可解锁 + list_tools 正好是全部工具，不重不漏。"""
+    all_names = set(REGISTRY.names())
+    core = set(pilot_tools.CORE_TOOLS)
+    extra = set(pilot_tools.expandable_tools())
+    assert core | extra == all_names
+    assert not (core & extra)
+    assert pilot_tools.LIST_TOOLS in core
 
 
 def test_sid_passes_through_to_handler():
@@ -173,3 +198,89 @@ def test_sid_passes_through_to_handler():
 def test_step_labels_without_i18n_keys_pinned(name, label):
     """5 个尚未有 pilot.step 词条键的 label 在此钉住（补键后本用例即护栏）。"""
     assert _spec(name).step_label == label
+
+
+class TestPerceptionTools:
+    """感知面工具：日志读取 / 诊断证据面 / 导航板块与游戏详情。"""
+
+    def test_navigate_section_whitelist(self):
+        from app.domains.agent.tools.builtin.navigate import _navigate
+
+        out = asyncio.run(_navigate({"target": "gamelib", "section": "insights"}))
+        assert out == {"kind": "navigate", "target": "gamelib", "path": "/gamelib",
+                       "section": "insights"}
+        # 白名单外板块拒绝（原样不带 section）
+        out2 = asyncio.run(_navigate({"target": "gamelib", "section": "nope"}))
+        assert "section" not in out2
+        # 不支持板块的页面忽略 section
+        out3 = asyncio.run(_navigate({"target": "alerts", "section": "ledger"}))
+        assert "section" not in out3
+
+    def test_navigate_game_detail(self):
+        from app.domains.agent.tools.builtin.navigate import _navigate
+
+        out = asyncio.run(_navigate({"target": "game", "appid": 2358720}))
+        assert out == {"kind": "navigate", "target": "game", "path": "/game/2358720",
+                       "appid": 2358720}
+        # 无 appid / 非法 appid 拒绝
+        assert asyncio.run(_navigate({"target": "game"}))["path"] == ""
+        assert asyncio.run(_navigate({"target": "game", "appid": "x"}))["path"] == ""
+
+    def test_navigate_tool_step_carries_section(self):
+        step = pilot_tools.tool_step("navigate", {"kind": "navigate", "target": "bills",
+                                                  "path": "/bills", "section": "cdk"})
+        assert step["data"]["section"] == "cdk"
+
+    def test_read_logs_filters_and_counts(self):
+        from app.domains.agent.tools.builtin.system import read_logs
+
+        out = asyncio.run(read_logs(tail=50))
+        assert out["kind"] == "rows" and out["titleKey"] == "logs"
+        assert out["total"] >= 0 and isinstance(out["rows"], list)
+        # 过滤形态：关键词 + 级别（环内无命中也必须结构合法）
+        out2 = asyncio.run(read_logs(keyword="__no_such_marker__", level="error", tail=10))
+        assert out2["rows"] == [] and out2["total"] == 0
+
+    def test_system_diagnostics_shape(self):
+        from app.domains.agent.tools.builtin.system import system_diagnostics
+
+        out = asyncio.run(system_diagnostics())
+        assert out["kind"] == "rows" and out["titleKey"] == "diag"
+        assert isinstance(out["rows"], list) and out["rows"]
+
+    def test_sync_subscriptions_no_subs(self, monkeypatch):
+        from app.domains.agent.tools.builtin import system
+
+        async def _empty(kind=None):
+            return []
+
+        monkeypatch.setattr(system.proxies_service, "list_subscriptions", _empty)
+        out = asyncio.run(system.sync_subscriptions())
+        assert out["rows"] == [{"k": "", "vKey": "subsNone", "tone": "warn"}]
+
+    def test_sync_subscriptions_reports_without_url(self, monkeypatch):
+        from app.domains.agent.tools.builtin import system
+
+        async def _subs(kind=None):
+            return [{"id": 7, "kind": "clash", "label": "机场A", "deprecated": False},
+                    {"id": 8, "kind": "clash", "label": "旧", "deprecated": True}]
+
+        async def _refresh(sub_id):
+            assert sub_id == 7
+            return {"restarted": False}
+
+        monkeypatch.setattr(system.proxies_service, "list_subscriptions", _subs)
+        monkeypatch.setattr(system.proxies_service, "refresh_clash_subscription", _refresh)
+        out = asyncio.run(system.sync_subscriptions())
+        assert out["total"] == 1
+        assert out["rows"][0]["k"] == "机场A" and out["rows"][0]["tone"] == "ok"
+        # 红线：回执任何位置不得出现订阅 URL
+        import json as _json
+        assert "http" not in _json.dumps(out, ensure_ascii=False)
+
+    def test_new_tools_registered_with_budgets(self):
+        for name in ("read_logs", "system_diagnostics", "sync_subscriptions"):
+            spec = REGISTRY.get(name)
+            assert spec is not None
+            assert spec.timeout_s == projection.budget_for(name)
+        assert "sync_subscriptions" in projection._SYNC_TOOLS
