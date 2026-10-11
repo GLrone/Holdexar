@@ -173,17 +173,18 @@ def _load_curated_index(path: Path) -> dict[int, dict]:
 
 
 async def apply_curated(appid: int, seed_path: Path | None = None) -> None:
-    """爬虫入库联动：appid 在种子人工列索引内则整行覆写（本地无此数据编辑通道）。
+    """爬虫入库联动：appid 在种子人工列索引内则补挂（本地无值才引导落位）。
 
     索引为空（未随种子/发布者未回填）时零开销直接返回；任何异常吞掉，
-    绝不影响爬虫写库主链路。
+    绝不影响爬虫写库主链路。种子是冷启动引导而非权威：HB/Epic 标记链与
+    系列归组有本地在役编辑器，见 _CURATED_SETS。
     """
     try:
         index = _load_curated_index(seed_path or seed_db_path())
         row = index.get(int(appid))
         if not row:
             return
-        sets = ", ".join(f"{c} = :{c}" for c in CURATED_COLS)
+        sets = _curated_sets()
         from app.core.database import WritePriority, write_gate
 
         async with write_gate(
@@ -203,6 +204,30 @@ async def apply_curated(appid: int, seed_path: Path | None = None) -> None:
         )
 
 
+# 人工列的种子写入口径：种子是冷启动引导而非权威。本地有在役编辑器的列
+# 只补空/升级、不降级不覆盖——is_hb/hb_data 写者=HB 月包标记链（+import_hb），
+# is_epic/epic_date 写者=Epic 喜加一标记链（+名单导入），series_id 写者=
+# 系列归组（refresh_series）；xgp_tier 无本地写者，种子保持权威覆写。
+_CURATED_SETS: dict[str, str] = {
+    "is_hb": "CASE WHEN :is_hb = 1 THEN 1 ELSE games.is_hb END",
+    "hb_data": (
+        "CASE WHEN games.hb_data IS NULL OR games.hb_data = '' "
+        "THEN :hb_data ELSE games.hb_data END"
+    ),
+    "is_epic": "CASE WHEN :is_epic = 1 THEN 1 ELSE games.is_epic END",
+    "epic_date": (
+        "CASE WHEN games.epic_date IS NULL OR games.epic_date = '' "
+        "THEN :epic_date ELSE games.epic_date END"
+    ),
+    "series_id": "CASE WHEN games.series_id IS NULL THEN :series_id ELSE games.series_id END",
+}
+
+
+def _curated_sets() -> str:
+    """人工列 UPDATE SET 片段（三写点共用：单款补挂/批量补挂/启动合并）。"""
+    return ", ".join(f"{c} = {_CURATED_SETS.get(c, ':' + c)}" for c in CURATED_COLS)
+
+
 async def apply_curated_batch(appids: list[int], seed_path: Path | None = None) -> int:
     """批量人工列补挂（收尾链聚合形态）：一次闸分块 executemany 覆盖整批。
 
@@ -217,7 +242,7 @@ async def apply_curated_batch(appids: list[int], seed_path: Path | None = None) 
         hit = [a for a in dict.fromkeys(ids) if a in index]
         if not hit:
             return 0
-        sets = ", ".join(f"{c} = :{c}" for c in CURATED_COLS)
+        sets = _curated_sets()
         from app.core.database import WritePriority, write_gate
 
         async with write_gate(
@@ -858,7 +883,7 @@ async def merge_curated_seed(seed_path: Path | None = None) -> dict | None:
         }
         updated = 0
         if present:
-            sets = ", ".join(f"{c} = :{c}" for c in CURATED_COLS)
+            sets = _curated_sets()
             await session.execute(
                 text(f"UPDATE games SET {sets} WHERE appid = :appid"),
                 [

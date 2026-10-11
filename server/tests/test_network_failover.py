@@ -195,8 +195,8 @@ async def test_transport_error_retries_then_succeeds(monkeypatch):
     class FakeResp:
         status = 200
 
-        async def json(self):
-            return {"620": {"success": True}}
+        async def read(self):
+            return b'{"620": {"success": true}}'
 
         async def __aenter__(self):
             return self
@@ -231,8 +231,8 @@ async def test_429_trips_breaker_then_backoff_succeeds(monkeypatch):
         status = 429
         url = "https://store.example/api"  # 熔断器日志取 str(response.url)
 
-        async def text(self):
-            return "Too Many Requests"
+        async def read(self):
+            return b"Too Many Requests"
 
         async def __aenter__(self):
             return self
@@ -243,8 +243,8 @@ async def test_429_trips_breaker_then_backoff_succeeds(monkeypatch):
     class FakeResp:
         status = 200
 
-        async def json(self):
-            return {"620": {"success": True}}
+        async def read(self):
+            return b'{"620": {"success": true}}'
 
         async def __aenter__(self):
             return self
@@ -297,8 +297,8 @@ async def test_connect_establish_error_raises_immediately():
     class FakeResp:
         status = 200
 
-        async def json(self):
-            return {"620": {"success": True}}
+        async def read(self):
+            return b'{"620": {"success": true}}'
 
         async def __aenter__(self):
             return self

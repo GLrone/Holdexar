@@ -235,7 +235,10 @@ class SteamHttpClient:
                     network_checker.report_success()
                     if response.status == 200:
                         try:
-                            data = await response.json()
+                            # 大响应（批量 300/批）的 JSON 解析放线程：解析
+                            # 占用事件循环会把写账的持闸/等待计量拉长失真
+                            raw = await response.read()
+                            data = await asyncio.to_thread(json.loads, raw)
                             await breaker.reset()
                             self._record("ok", started, url)
                             if body_size_out is not None:
@@ -243,8 +246,9 @@ class SteamHttpClient:
                                     int(response.headers.get("Content-Length") or 0)
                                 )
                             return data
-                        except aiohttp.ContentTypeError:
-                            # 200 但返回了 HTML 错误页
+                        except (aiohttp.ContentTypeError, json.JSONDecodeError):
+                            # 200 但返回了 HTML 错误页（read+loads 形态下
+                            # 表现为 JSONDecodeError；ContentTypeError 兜底）
                             self._record("other", started, url)
                             if attempt < self.max_retries - 1:
                                 await asyncio.sleep(1 + random.uniform(0, 1))
@@ -264,9 +268,12 @@ class SteamHttpClient:
                         # 两条分支都不匹配 → 真 429 照常熔断，不受此启发式影响。
                         body_text_429 = None
                         try:
-                            body_text_429 = await response.text()
+                            raw_429 = await response.read()
+                            body_text_429 = raw_429.decode("utf-8", errors="replace")
                             if body_text_429 and body_text_429.strip().startswith("{"):
-                                phantom_data = json.loads(body_text_429)
+                                phantom_data = await asyncio.to_thread(
+                                    json.loads, body_text_429
+                                )
                                 if appid and str(appid) in phantom_data:
                                     phantom_app = phantom_data[str(appid)]
                                     if (phantom_app.get("success")
