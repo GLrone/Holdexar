@@ -1,10 +1,39 @@
 """pilot LLM 适配层单测：协议请求构造、鉴权头与探测失败分类（不触网）。"""
+import logging
+
 import httpx
 import pytest
 
 from app.domains.pilot import llm as pilot_llm
 from app.domains.pilot import router as pilot_router
 from app.domains.pilot.schemas import DetectRequest
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_logs_http_provider_failure(caplog):
+    async def handler(request):
+        return httpx.Response(
+            503, request=request,
+            json={"error": {"message": "Authorization: Bearer sk-test-secret"}},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with caplog.at_level(logging.ERROR, logger=pilot_llm.__name__):
+            with pytest.raises(pilot_llm.PilotLlmError, match="HTTP 503") as raised:
+                async for _ in pilot_llm.chat_stream(
+                    protocol="openai", base_url="https://provider.test/v1",
+                    api_key="sk-test-secret", model="test-model",
+                    messages=[{"role": "user", "content": "hello"}], client=client,
+                ):
+                    pass
+
+    failures = [record for record in caplog.records
+                if record.name == pilot_llm.__name__ and record.levelno == logging.ERROR]
+    assert len(failures) == 1
+    assert failures[0].hl_detail["HTTP状态"] == 503
+    assert failures[0].hl_detail["诊断编号"]
+    assert "sk-test-secret" not in failures[0].hl_detail["原因"]
+    assert "sk-test-secret" not in raised.value.to_diagnostic()["message"]
 
 
 def test_anonymous_endpoints_send_no_auth_header():

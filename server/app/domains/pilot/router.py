@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -20,11 +21,13 @@ from .schemas import (AskRequest, AskResponse, DetectRequest, DetectResponse,
                       PilotAttachmentCreate, PilotAttachmentListOut, PilotAttachmentOut,
                       PilotCompactMarker, PilotConfigPayload, PilotConfigUpdate,
                       PilotForkOut, PilotForkRequest,
+                      PilotFlywheelExportOut, PilotFlywheelStats,
                       PilotProviderListOut, PilotProviderOut, PilotProviderPayload,
                       PilotRewindOut, PilotRewindRequest,
                       PilotSessionFlagOut, PilotSessionFlagUpdate,
                       PilotSessionListItem, PilotSessionStats,
                       PilotSessionListOut, PilotSessionOut, PilotSessionTitleUpdate,
+                      PilotTurnFeedbackOut, PilotTurnFeedbackRequest,
                       PilotSessionTurn, PilotProposalConfirm, PilotProposalOut, PilotProposalState,
                       ToolRunRequest, ToolRunResponse,
                       TestRequest, TestResponse)
@@ -215,10 +218,18 @@ async def get_session(session_id: str) -> PilotSessionOut:
     if state is None:
         raise HTTPException(status_code=404, detail="session not found")
     turns: list = []
+    feedback_by_tid = {
+        str(record.get("tid")): str(record.get("label"))
+        for record in service.get_store().raw_records(session_id)
+        if record.get("t") == "feedback"
+        and record.get("label") in ("accepted", "rejected")
+        and record.get("tid")
+    }
     for t in state.turns:
         try:
             turns.append(PilotSessionTurn(
-                q=t.get("q") or "", resp=t.get("resp") or {}, ts=t.get("ts")))
+                q=t.get("q") or "", resp=t.get("resp") or {}, ts=t.get("ts"),
+                tid=t.get("tid"), feedback=feedback_by_tid.get(str(t.get("tid") or ""))))
         except Exception:  # noqa: BLE001 — 单条坏记录跳过，不拖垮整段历史
             log_event(
                 logger,
@@ -303,11 +314,13 @@ async def delete_session(session_id: str) -> dict:
     附件是会话的外部资源（见 attachments 模块），随会话一并清理——留着的
     附件没有引用它的对话，只会在数据目录里无主堆积。"""
     try:
-        ok = await service.get_store().delete(session_id)
+        result = await service.get_store().delete_with_reason(session_id)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(e)) from e
-    if not ok:
+    if result == "no_session":
         raise HTTPException(status_code=404, detail="session not found")
+    if result != "deleted":
+        raise HTTPException(status_code=502, detail=result)
     pilot_attachments.purge(session_id)
     return {"ok": True}
 
@@ -373,6 +386,50 @@ async def rewind_session(session_id: str, payload: PilotRewindRequest) -> PilotR
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(e)) from e
     return PilotRewindOut(**result)
+
+
+@router.put("/sessions/{session_id}/turns/{turn_id}/feedback")
+async def rate_turn(session_id: str, turn_id: str,
+                    payload: PilotTurnFeedbackRequest) -> PilotTurnFeedbackOut:
+    """将用户明确的满意/不满意评价追加到对应会话账本。"""
+    result = await service.rate_turn(session_id, turn_id, payload.feedback)
+    reason = result.get("reason")
+    if reason in ("no_session", "turn_gone"):
+        raise HTTPException(status_code=404, detail=reason)
+    if reason == "bad_request":
+        raise HTTPException(status_code=422, detail=reason)
+    if reason:
+        raise HTTPException(status_code=502, detail=reason)
+    return PilotTurnFeedbackOut(**result)
+
+
+@router.get("/flywheel")
+async def flywheel_stats() -> PilotFlywheelStats:
+    """决策飞轮画像：决策日志 × 会话账本反馈的只读投影（意图 × 反馈标签）。
+
+    读取侧现算，不落独立账本；无会话态问答计入 unlabeled。"""
+    try:
+        built = service.build_flywheel()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return PilotFlywheelStats(**built["stats"])
+
+
+@router.post("/flywheel/export")
+async def flywheel_export() -> PilotFlywheelExportOut:
+    """导出可训数据集（覆盖写派生投影，随时可重算）；返回计数与画像。"""
+    try:
+        result = service.export_flywheel()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    stats = result.get("stats")
+    return PilotFlywheelExportOut(
+        ok=bool(result["ok"]), count=int(result.get("count") or 0),
+        preference_count=int(result.get("preference_count") or 0),
+        path=result.get("path"), reason=result.get("reason"),
+        preference_path=result.get("preference_path"),
+        stats=PilotFlywheelStats(**stats) if stats else None,
+    )
 
 
 @router.post("/proposal/confirm")
@@ -441,8 +498,20 @@ async def ask_stream(payload: AskRequest):
                                                       payload.view_context,
                                                       payload.element_refs):
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-            except Exception:  # noqa: BLE001 — 流已开始，HTTP 状态无法再改，帧内报错
-                yield f'data: {json.dumps({"type": "error", "reason": "server_error"}, ensure_ascii=False)}\n\n'
+            except pilot_llm.PilotLlmError as e:
+                yield f'data: {json.dumps({"type": "error", "reason": "llm_failed", "diagnostic": e.to_diagnostic()}, ensure_ascii=False)}\n\n'
+            except Exception as e:  # noqa: BLE001 — 流已开始，HTTP 状态无法再改，帧内报错
+                diagnostic_id = uuid4().hex[:12]
+                log_event(
+                    logger,
+                    "领航员本轮问答未能完成",
+                    tag="失败",
+                    level=logging.ERROR,
+                    exc_info=True,
+                    detail={"诊断编号": diagnostic_id, "会话": sid, "错误类型": type(e).__name__},
+                )
+                diagnostic = {"id": diagnostic_id, "code": "server_error", "message": ""}
+                yield f'data: {json.dumps({"type": "error", "reason": "server_error", "diagnostic": diagnostic}, ensure_ascii=False)}\n\n'
             yield "data: [DONE]\n\n"
         finally:
             if sid:

@@ -1,7 +1,15 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { fmtTokens, isErrorReason, isLongAnswerText, positivePct, ratingClass } from '../src/lib/pilotView.ts'
+import { canRateTurn, fmtTokens, isEmptyLlmFailure, isErrorReason, isLongAnswerText, positivePct, ratingClass } from '../src/lib/pilotView.ts'
+
+test('有可见内容且有账本 id 的回答允许评分（含只有步骤或卡片的回答）', () => {
+  assert.equal(canRateTurn({ tid: 'turn-1', text: '回答' }), true)
+  assert.equal(canRateTurn({ tid: 'turn-2', steps: [{}] }), true)
+  assert.equal(canRateTurn({ tid: 'turn-3', cards: [{}] }), true)
+  assert.equal(canRateTurn({ tid: 'turn-4', text: '' }), false)
+  assert.equal(canRateTurn({ text: '没有可保存的账本轮次' }), false)
+})
 
 test('positivePct：0–1 小数按百分整数渲染', () => {
   assert.equal(positivePct(0.872), 87)
@@ -104,6 +112,7 @@ test('会话恢复策略：历史轮次收敛，最新一轮对话结果默认�
 test('isErrorReason：失败异常原因判定', () => {
   assert.equal(isErrorReason('pilot.error'), true)
   assert.equal(isErrorReason('pilot.reason.llm_failed'), true)
+  assert.equal(isErrorReason('pilot.reason.llm_failed_empty'), true)
   assert.equal(isErrorReason('pilot.reason.busy'), true)
   assert.equal(isErrorReason('pilot.reason.too_long'), true)
   assert.equal(isErrorReason('pilot.reason.cap_reached'), true)
@@ -114,4 +123,10 @@ test('isErrorReason：失败异常原因判定', () => {
   assert.equal(isErrorReason(null), false)
   assert.equal(isErrorReason(undefined), false)
   assert.equal(isErrorReason(''), false)
+})
+
+test('isEmptyLlmFailure：无事实兜底时使用无回答文案', () => {
+  assert.equal(isEmptyLlmFailure('llm_failed', 'none'), true)
+  assert.equal(isEmptyLlmFailure('llm_failed', 'facts'), false)
+  assert.equal(isEmptyLlmFailure('no_data', 'none'), false)
 })
