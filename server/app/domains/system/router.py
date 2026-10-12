@@ -583,6 +583,7 @@ async def diagnostics() -> dict:
     from app.domains.crawl import cycle as cycle_service
     from app.domains.crawl.service import has_pending_missing
     from app.domains.proxies import clash_manager
+    from app.domains.proxies import env_check
     from app.domains.proxies import service as proxies_service
     from app.domains.proxypool import jobruns
 
@@ -602,6 +603,10 @@ async def diagnostics() -> dict:
             system_proxy = await proxies_service.resolve_system_proxy_url()
         except Exception:  # noqa: BLE001 —— 探活失败按无系统代理记
             system_proxy = None
+        try:
+            env_hijacked = env_check.tun_mode_suspected()
+        except Exception:  # noqa: BLE001 —— 判定失败按未接管记
+            env_hijacked = False
         return {
             "app_version": settings.version,
             "schema_version": SCHEMA_VERSION,
@@ -610,6 +615,7 @@ async def diagnostics() -> dict:
             "strategy_explicit": explicit,
             "clash_running": bool(status.get("running")),
             "system_proxy": system_proxy,
+            "network_hijacked": env_hijacked,
             "pool_available_exits": int(pool.get("available") or 0),
         }
 
@@ -668,6 +674,12 @@ async def diagnostics() -> dict:
             "text": "存在待补抓欠账（补抓通道按冷却自动消化）",
         })
     if isinstance(identity, dict) and "error" not in identity:
+        if identity.get("network_hijacked"):
+            signals.append({
+                "code": "network_hijacked",
+                "severity": "error",
+                "text": f"{env_check.USER_MESSAGE}（节点体检与价格刷新已让路）",
+            })
         needs_pool = identity["strategy"] in ("proxy_first", "proxy_only")
         if needs_pool and identity["pool_available_exits"] == 0:
             signals.append({

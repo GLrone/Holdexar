@@ -1023,11 +1023,22 @@ async def _job_proxypool_cycle() -> None:
     from app.core.config import get_settings
     from app.core.database import get_session_factory
     from app.domains.proxies import clash_manager as _cm
+    from app.domains.proxies.env_check import USER_MESSAGE, tun_mode_suspected
     from app.domains.proxypool import scheduling as _sched
     from app.domains.proxypool.runtime import (
         RuntimeConfigError, controller_endpoint_of,
     )
 
+    if tun_mode_suspected():
+        # 环境不可信时探测结论必然是「全死」：节点地址已被换成假地址。继续探测
+        # 只会把好节点按连续失败推进到退休，所以整轮（含 L0 与恢复探测）都停。
+        log_event(
+            logger,
+            "代理体检跳过：本机网络被其他软件接管，节点探测结论不可信",
+            tag="跳过",
+            detail={"原因": USER_MESSAGE},
+        )
+        return
     data_dir = get_settings().data_dir
     try:
         base, secret = controller_endpoint_of(data_dir)

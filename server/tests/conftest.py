@@ -52,6 +52,21 @@ def _sanitize_db_lru_caches():
 
 
 @pytest.fixture(autouse=True)
+def _host_network_env_neutral(monkeypatch):
+    """本机网络形态判定默认钉成「未被接管」。
+
+    判定读的是真实系统 DNS——开发机上开着接管式加速工具时，它会返回真值并
+    让体检/抓取的守卫在**与该守卫无关的用例**里生效（段一个都不启动），
+    表现为一批用例在本机失败、在干净机器全绿。测试要覆盖的是代码路径，
+    不是宿主环境：需要接管的用例自行打桩，函数级 patch 晚于本桩生效。
+    """
+    from app.domains.proxies import env_check
+
+    monkeypatch.setattr(env_check, "_resolves_to_fake_ip", lambda host=None: False)
+    env_check.reset_cache()
+
+
+@pytest.fixture(autouse=True)
 def _block_outbound_smtp(monkeypatch):
     """测试进程绝不发真实邮件：SMTP 传输层统一换成「只记录、不开连接」的假件。
 

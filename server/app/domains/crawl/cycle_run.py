@@ -24,8 +24,16 @@ from app.domains.crawl import cycle as price_cycle
 from app.domains.crawl import events as price_events
 from app.domains.crawl import service as crawl_service
 from app.domains.crawl import stats as price_stats
+from app.domains.proxies import env_check
 
 logger = logging.getLogger(__name__)
+
+
+def env_abort_reason(skipped: list[str]) -> str | None:
+    """本轮是否因本机网络被接管而中止（从段级拒因派生，不另立状态）。"""
+    if any(env_check.USER_MESSAGE in s for s in skipped):
+        return env_check.USER_MESSAGE
+    return None
 
 
 async def run_price_cycle(
@@ -142,6 +150,7 @@ async def _run_price_cycle(
         # 「整轮零启动」「全段失败」「冻结失败」各有真实原因可查，
         # 账本只记 failed 不记原因等于让使用者面对不可信记录。
         terminal_error: str | None = None
+        env_aborted = env_abort_reason(skipped)
         if regions is None:
             terminal = price_cycle.FAILED
             terminal_error = "本轮期望集冻结失败，未按本轮口径记录覆盖"
@@ -151,7 +160,14 @@ async def _run_price_cycle(
                 expected_units=expected_units,
                 entered_repairing=entered_repairing,
             )
-            if not jobs and stop_event is not None and stop_event.is_set():
+            if env_aborted is not None and terminal != price_cycle.COMPLETED:
+                # 环境拒因压过通用失败文案：账本上要能看出「本轮是让路停的，
+                # 不是爬挂了」，否则使用者会对着失败记录找不存在的故障。
+                # 一个段都没起来时按取消记：本轮是主动不跑，不是跑坏了
+                terminal_error = env_aborted
+                if not jobs:
+                    terminal = price_cycle.CANCELLED
+            elif not jobs and stop_event is not None and stop_event.is_set():
                 # 停在了第一个段之前：用户意图明确，不按「无事可做/没跑起来」记
                 terminal = price_cycle.CANCELLED
                 terminal_error = "用户已停止"
@@ -170,7 +186,11 @@ async def _run_price_cycle(
         if stop_event.is_set():
             log_event(
                 logger,
-                f"用户已停止周期 {cycle_id}，跳过价格事件检测与通知",
+                (
+                    f"本机网络被接管，周期 {cycle_id} 跳过价格事件检测与通知"
+                    if env_aborted is not None
+                    else f"用户已停止周期 {cycle_id}，跳过价格事件检测与通知"
+                ),
                 tag="跳过",
                 detail={"周期": cycle_id},
             )
