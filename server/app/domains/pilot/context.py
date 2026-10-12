@@ -12,8 +12,8 @@
   由服务层落盘；失败返回 None，装配退回「整轮让位」，问答不中断。
 - 预算是三个量、同一个口径：历史预算、逐字保留的近期历史、摘要输出上限
   全部由模型窗口派生（窗口来自 model_windows 自动识别或用户手填），窗口
-  未知才各自回落固定值。三者的关系是「保留 ⊂ 历史预算」，与 DSH
-  compaction-basic 的 thresholdRatio / retainRatio 同构。
+  未知才各自回落固定值。三者的关系是「保留 ⊂ 历史预算」，与成熟压缩
+  实现的阈值/保留两比例同构。
 - 历史预算与逐字保留另受 HISTORY_COST_TOKENS 约束：窗口管「请求别溢出」，
   成本线管「账单别失控」（每轮每个请求都要重发整段历史）。窗口再大，历史
   也不会无上限地厚下去。
@@ -72,8 +72,8 @@ RETAIN_RATIO = 0.16
 """逐字保留的近期历史占「有效窗口」的比例。
 
 压缩不是「只留最后两轮」——留多少要跟窗口走。窗口大就把近期历史整段原样
-留着（细节不丢），窗口小才退化成两轮。0.16 是 DSH compaction-basic 的
-retainRatio 默认值；比值必须明显小于 HISTORY_BUDGET_RATIO，否则压缩腾不出
+留着（细节不丢），窗口小才退化成两轮。0.16 是业界压缩实现的常用保留比例；
+比值必须明显小于 HISTORY_BUDGET_RATIO，否则压缩腾不出
 空间（保留段自己就把预算吃满了）。"""
 
 RECENT_KEEP_TURNS = 2
@@ -85,8 +85,8 @@ SUMMARY_MAX_TOKENS_RATIO = 0.012
 """摘要输出上限占窗口的比例。
 
 被蒸馏的历史在大窗口下是十万量级，摘要却是它之后唯一的载体——上限必须
-跟着窗口走，否则「压缩」等于「丢弃」。同口径参照：ZCode 摘要上限 20k
-tokens、DSH 默认 65k；本项目取更小的比例，因为摘要是中文要点而非结构化
+跟着窗口走，否则「压缩」等于「丢弃」。主流实现的摘要上限在 2 万–6.5 万
+tokens；本项目取更小的比例，因为摘要是中文要点而非结构化
 长文档。"""
 
 SUMMARY_MAX_TOKENS_MIN = 600
@@ -107,8 +107,8 @@ REFERENCE_BUDGET_TOKENS = 800
 CLEARED_TOOL_RESULT = "[早前工具返回结果已清理；需要该数据请重新调用对应工具]"
 """被清掉的老工具结果留下的占位行（派生视图内的替换，不动存储）。
 
-占位行顺带告诉模型怎么把数据拿回来——ZCode 的占位是光秃秃一句
-"[Old tool result content cleared]"，模型只能自己猜。"""
+占位行顺带告诉模型怎么把数据拿回来——光秃秃一句
+"已清理"模型只能自己猜。"""
 
 KEEP_RECENT_TOOL_GROUPS = 5
 """保留最近几组工具结果不清。
@@ -123,7 +123,7 @@ PRUNE_TRIGGER_RATIO = 1.0
 """清理触发线＝历史预算的多少倍。
 
 1.0 = 只在已经超预算时才动手（默认）。闲置回落时调用方传更小的值
-（IDLE_PRUNE_TRIGGER_RATIO，ZCode microcompact 的 0.9 同口径），提前清掉
+（IDLE_PRUNE_TRIGGER_RATIO，成熟实现的 0.9 同口径），提前清掉
 可以省下一次真花钱的压缩调用。"""
 
 IDLE_PRUNE_TRIGGER_RATIO = 0.9
@@ -132,7 +132,7 @@ IDLE_PRUNE_MINUTES = 60
 
 判据是**前缀缓存已经过期**——缓存有存活时间，隔了一小时再发请求本来就要
 重算全量前缀，「重写视图」此刻不额外损失缓存；反过来在缓存还热的时候清理，
-等于把上一轮刚建好的前缀缓存作废。ZCode microcompact 的 60 分钟同源。"""
+等于把上一轮刚建好的前缀缓存作废。60 分钟与缓存保质期对齐。"""
 
 _SUMMARY_FRAME = "本会话因上下文预算进行过压缩：以下摘要把更早的对话浓缩为背景，之后是最近几轮的原文。摘要不是当前请求，请结合它继续对话：\n"
 
@@ -264,7 +264,7 @@ def user_text(question: str, appid: int | None,
     当前在哪个页面、看哪个板块——回答可以针对性地引用当前页面内容，
     而不是把用户当成无上下文的空壳。
 
-    element_refs 是用户在页面上选中的元素引用（仿 ZCode 网页元素选择），
+    element_refs 是用户在页面上选中的元素引用（仿编码助手的网页元素选择），
     只传最小信息（标签/文本/selector/role），让模型知道用户指代的具体元素——
     不传完整 HTML/CSS，agent 只需知道「用户说的是什么」。
     """
@@ -383,11 +383,11 @@ def _format_element_refs(refs: list[dict] | None) -> str:
 
 
 def summary_message(summary: str, sid: str | None = None) -> dict:
-    """要点存档 → user 消息（ZCode 压缩语义：摘要以 user 角色衔接在历史前，
+    """要点存档 → user 消息（摘要以 user 角色衔接在历史前，
     system 位留给永不压缩的系统提示；连续 user 消息各协议均接受）。
 
     sid 在场时附一句回读指引：压缩是「有损但可恢复」，不是永久丢弃——
-    同 ZCode 把完整转写文件路径写进摘要消息的做法。"""
+    摘要消息里带会话回读指引的做法。"""
     tail = _SUMMARY_TAIL.format(sid=sid) if sid else ""
     return {"role": "user", "content": _SUMMARY_FRAME + summary + tail}
 
@@ -717,7 +717,7 @@ def _compact_region(state, start: int, through: int,
 
     这里必须是**真实消息**而不是压平后的对话行：指令要求保留精确价格事实与
     AppID，而那些数字只存在于工具返回里；只喂问题与答案，摘要结构上就拿不到
-    它们。ZCode 与 DSH 的摘要输入同样是回放原始消息。"""
+    它们。成熟实现的摘要输入同样是回放原始消息。"""
     return [m for t in state.turns[start:through] for m in _turn_view(t, tool_limit)]
 
 
@@ -748,7 +748,7 @@ def _compact_messages(sys_prompt: str | None, old_summary: str | None,
 
 
 def _strip_analysis(text: str) -> str:
-    """剥掉模型可能自带的推理段，只留存档正文（与 ZCode 同口径的防御）。"""
+    """剥掉模型可能自带的推理段，只留存档正文（对 hallucinated 分析段的防御）。"""
     out = text.strip()
     if "<analysis>" in out and "</analysis>" in out:
         head, _, tail = out.partition("<analysis>")
@@ -767,7 +767,7 @@ async def compact(state, cfg: dict, *, sys_prompt: str | None = None,
     """把更早轮次蒸馏进要点存档（与既有存档合并），返回 (存档, 存到第几轮, 用量)。
 
     无可蒸馏轮次、模型失败或空回答返回 None——调用方保持原状即可。压缩输入
-    自身超出窗口时按 ZCode 口径丢掉最早一段重试（最多 COMPACT_INPUT_RETRY_LIMIT
+    自身超出窗口时丢掉最早一段重试（最多 COMPACT_INPUT_RETRY_LIMIT
     次，附截断标记），重试耗尽才放弃。"""
     if state is None:
         return None

@@ -773,7 +773,7 @@ async def _assemble_for_model(state, question: str, appid: int | None, cfg: dict
     返回 (消息序列, 本轮是否发生了压缩)——压缩事实同时已落会话账本。
     触发看**全量视图**（不裁剪的全部未存档轮次）而不是装配结果：装配结果是
     每次现算、会静默让位到只剩两轮的临时视图，拿它当触发依据等于「一直靠
-    让位硬扛，存档永远不更新」。这是 DSH 的「先测压力、再剪枝、再摘要」顺序：
+    让位硬扛，存档永远不更新」。压缩按「先测压力、再剪枝、再摘要」的顺序走：
     剪枝能把全量视图压回预算内就不花这次模型调用。"""
     budget = _history_budget(cfg, sys_prompt, expanded=expanded, state=state)
     if state is None:

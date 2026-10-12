@@ -25,7 +25,7 @@ const { t, locale } = useI18n()
 const open = ref(false)
 const root = ref<HTMLElement | null>(null)
 
-/** ≥10 取整、否则一位小数；负值夹 0（DSH 速度格式纪律） */
+/** ≥10 取整、否则一位小数；负值夹 0（速度读数格式纪律） */
 const speedText = computed(() => {
   if (props.stats.decode_ms <= 0) return ''
   const tps = Math.max(0, props.stats.decode_out / (props.stats.decode_ms / 1000))

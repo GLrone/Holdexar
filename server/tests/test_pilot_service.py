@@ -1582,7 +1582,7 @@ class TestPruneOldToolResults:
 
 
 class TestRetainBoundary:
-    """逐字保留的近期历史按窗口比例算（DSH retainRatio），不再钉死两轮。"""
+    """逐字保留的近期历史按窗口比例算（保留比例随窗口缩放），不再钉死两轮。"""
 
     @staticmethod
     def _turns(count: int, chars: int) -> list[dict]:
@@ -1880,7 +1880,7 @@ class TestCompactBreakerAndLedger:
 
     @pytest.mark.asyncio
     async def test_free_prune_first_skips_the_paid_compaction(self, monkeypatch):
-        """先免费清理、清得动就不摘要：省下一次真花钱的模型调用（DSH 的顺序）。"""
+        """先免费清理、清得动就不摘要：省下一次真花钱的模型调用（先剪枝后摘要的顺序）。"""
         _patch_ready(monkeypatch)
         calls = {"compact": 0}
         self._patch_split_stream(monkeypatch, compact_fail=False, calls=calls)
