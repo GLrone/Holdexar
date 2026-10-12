@@ -20,6 +20,7 @@ from app.core.database import (
     WritePriority,
     get_session_factory,
     write_gate,
+    write_session,
 )
 from app.core.logging import log_event
 from app.crawler.utils import get_beijing_time_obj
@@ -69,7 +70,7 @@ async def _next_seq(session, run_id: str) -> int:
 async def create_session(title: str | None = None) -> dict:
     sid = _new_id()
     ts = _now()
-    async with write_gate(WritePriority.INTERACTIVE, "agent_session"), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE, "agent_session") as session:
         session.add(AgentSession(id=sid, title=title, created_at=ts, updated_at=ts))
         await session.commit()
     return {"session_id": sid, "title": title}
@@ -87,7 +88,7 @@ async def create_run(
     同事务落 turn.received 事件（消息历史的派生源）。"""
     rid = _new_id()
     ts = _now()
-    async with write_gate(WritePriority.INTERACTIVE, "agent_run"), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE, "agent_run") as session:
         if session_id is None:
             sid = _new_id()
             session.add(AgentSession(id=sid, created_at=ts, updated_at=ts))
@@ -124,7 +125,7 @@ SYSTEM_SESSION_ID = "runtime"
 
 async def ensure_system_session() -> str:
     """挂靠会话幂等建（首次一次写，之后零开销）。"""
-    async with write_gate(WritePriority.INTERACTIVE, "agent_session"), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE, "agent_session") as session:
         if await session.get(AgentSession, SYSTEM_SESSION_ID) is None:
             ts = _now()
             session.add(AgentSession(id=SYSTEM_SESSION_ID, created_at=ts, updated_at=ts))
@@ -187,7 +188,7 @@ async def apply_transition(
     """状态跃迁唯一入口：校验 → 状态行 → run.state 事件 → 终态补
     run.finished 事件，全部在单一写事务内。非法迁移抛
     IllegalRunTransition 且不产生任何写入。"""
-    async with write_gate(WritePriority.INTERACTIVE, "agent_run"), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE, "agent_run") as session:
         run = await session.get(AgentRun, run_id)
         if run is None:
             raise LookupError(f"run not found: {run_id}")
@@ -224,7 +225,7 @@ async def apply_transition(
 
 async def append_event(run_id: str, event_type: str, payload: dict | None = None) -> int:
     """追加事件（账本流水）。payload 经入账边界后落库，返回分配的 seq。"""
-    async with write_gate(WritePriority.INTERACTIVE, "agent_event"), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE, "agent_event") as session:
         run = await session.get(AgentRun, run_id)
         if run is None:
             raise LookupError(f"run not found: {run_id}")
@@ -339,7 +340,7 @@ async def cancel_run(run_id: str, *, reason: str = "user") -> dict:
                                {"reason": reason, "by": "user"})
         fresh = await get_run(run_id)
         return {"accepted": first, "status": fresh["status"] if fresh else run["status"]}
-    async with write_gate(WritePriority.INTERACTIVE, "agent_run"), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE, "agent_run") as session:
         row = await session.get(AgentRun, run_id)
         if row is None:
             raise LookupError(f"run not found: {run_id}")

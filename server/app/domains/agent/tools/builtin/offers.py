@@ -1,6 +1,7 @@
 """优惠与行情类工具：HB 月包 / Epic·Steam 喜加一 / 价格事件 / 汇率 / 日历。"""
 from __future__ import annotations
 
+from app.crawler.utils import get_beijing_time_obj
 from app.domains.agent.tools.base import ToolSpec
 from app.domains.agent.tools.builtin import _shared
 from app.domains.crawl import events as crawl_events_service
@@ -103,11 +104,26 @@ async def rates_overview() -> dict:
     return _shared.rows_result("rates", rows, total=len(rows))
 
 
+_UPCOMING_ROWS_LIMIT = 12
+_SEASONAL_CATEGORY = "seasonal_sale"
+
+
+def _upcoming_events(payload: dict) -> list[dict]:
+    """未来活动：季节大促优先，其余按开始时间升序，上限 12 条。"""
+    upcoming = payload.get("upcoming")
+    if not upcoming:
+        today = get_beijing_time_obj().date().isoformat()
+        upcoming = [e for e in (payload.get("events") or []) if str(e.get("start") or "") > today]
+    ordered = [e for e in upcoming if e.get("category") == _SEASONAL_CATEGORY]
+    ordered += [e for e in upcoming if e.get("category") != _SEASONAL_CATEGORY]
+    return ordered[:_UPCOMING_ROWS_LIMIT]
+
+
 async def calendar_events() -> dict:
     """Steam 官方活动日历（库内已爬，进行中在前）。"""
     payload = await steam_events_service.list_events()
     live = payload.get("live") or []
-    upcoming = (payload.get("upcoming") or [])[:_shared._READ_ROWS_LIMIT]
+    upcoming = _upcoming_events(payload)
     rows = [
         {"k": e.get("nameZh") or e.get("nameEn") or e.get("key") or "—",
          "vKey": "eventLive", "v": f"{e.get('start')}~{e.get('end')}", "tone": "ok"}
@@ -117,7 +133,8 @@ async def calendar_events() -> dict:
          "vKey": "eventUpcoming", "v": str(e.get("start") or "")}
         for e in upcoming
     ]
-    return _shared.rows_result("calendar", rows, total=len(rows))
+    rows = rows[:_UPCOMING_ROWS_LIMIT]
+    return {"kind": "rows", "titleKey": "calendar", "rows": rows, "total": len(rows)}
 
 
 async def _hb_monthly(args: dict, sid: str | None = None) -> dict:

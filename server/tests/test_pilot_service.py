@@ -564,8 +564,42 @@ class TestAgentLoop:
         await service.ask("把它加进关注", session_id="s-h")
         second = seen_messages[1]
         roles = [m["role"] for m in second]
-        assert roles.count("user") == 2
+        # system + 环境事实（user 位）+ 上一轮问答（user/assistant）+ 当前问题
+        assert roles.count("user") == 3
+        assert roles.count("system") >= 1
         assert any(m.get("role") == "assistant" and m.get("content") == "好" for m in second)
+
+    @pytest.mark.asyncio
+    async def test_turn_prefix_replayed_byte_identical(self, monkeypatch):
+        """跨轮前缀稳定：本轮请求的头部与上一轮实际请求逐字节一致（缓存复用地基）。
+
+        意图等注入笔记随发送原样入账本，下一轮重放时原位重现——任何一条
+        缺席或变形都会把上一轮助手与工具往返全部打出缓存。"""
+        seen_messages = []
+        scripts = [
+            [("answer", "第一轮结论。"), ("usage", (10, 5))],
+            [("answer", "第二轮结论。"), ("usage", (10, 5))],
+        ]
+        rounds = {"n": 0}
+
+        async def _rounds(**kw):
+            seen_messages.append([dict(m) for m in kw["messages"]])
+            for item in scripts[rounds["n"]]:
+                yield item
+            rounds["n"] += 1
+
+        _patch_ready(monkeypatch)
+        monkeypatch.setattr(service.pilot_llm, "chat_stream", _rounds)
+        await service.ask("找一款值得一试的角色扮演大作", session_id="s-prefix")
+        await service.ask("再推荐一款策略游戏", session_id="s-prefix")
+        first, second = seen_messages[0], seen_messages[1]
+        # 上一轮请求的完整序列在本轮请求头部逐字节重现（含意图笔记）
+        assert len(second) > len(first)
+        for i, m in enumerate(first):
+            assert second[i] == m, f"前缀在第 {i} 条分叉：{m.get('role')}"
+        # 账本侧：本轮入账 = 问句 + 意图笔记 + 终答
+        state = await service.get_store().load("s-prefix")
+        assert [m.get("role") for m in state.turns[0]["messages"]] == ["user", "system", "assistant"]
 
 
 class TestFallback:
@@ -1413,24 +1447,33 @@ class TestHistoryBudget:
 
 
 class TestSystemPromptCapabilities:
-    """系统提示词能力宣告：确认已知能力覆盖，防模型误判自身能力边界。"""
+    """系统提示词能力宣告：钉住自主性与证据纪律的硬条款，防提示词回退成工具清单枚举。"""
 
-    def test_declares_core_capabilities_coverage(self):
+    def test_declares_autonomy_and_evidence_discipline(self):
         prompt = service._SYSTEM_PROMPT
-        assert "矢量图形与图表渲染" in prompt
+        # 证据纪律：日期与数字必须有工具证据，禁止按惯例补
+        assert "日期、价格、折扣" in prompt
+        assert "严禁按「历年惯例」" in prompt
+        # 开放问题不自我设限：说做不到之前必须先查完整能力
+        assert "list_tools" in prompt
+        assert "绝不要说「我没有这个能力」" in prompt
+        # 呈现与导航能力仍在（模型不得声称无渲染/无法跳转能力）
         assert "<svg>" in prompt
-        assert "界面导航与页面直达" in prompt
         assert "navigate" in prompt
-        assert "系统诊断与网络排障" in prompt
-        assert "system_diagnostics" in prompt
-        assert "read_logs" in prompt
-        assert "偏好记忆与对话回溯" in prompt
-        assert "get_user_preferences" in prompt
-        assert "list_sessions" in prompt
-        assert "批量提议与安全确认" in prompt
-        assert "propose_bulk" in prompt
         assert "Markdown 表格" in prompt
-        assert "read_attachment" in prompt
+        # 批量动作走提议确认
+        assert "propose_bulk" in prompt
+
+    def test_prompt_is_not_a_tool_catalog(self):
+        """提示词不得退化成工具清单：不得逐个罗列冷门工具名。
+
+        工具用法跟着工具走（工具表里带 description），提示词只讲方法论——
+        否则加一个工具就要改一次提示词，且清单会把方法论淹掉。"""
+        prompt = service._SYSTEM_PROMPT
+        for cold in ("system_diagnostics", "read_logs", "proxy_latency_test",
+                     "proxy_exit_detail", "sync_subscriptions", "read_attachment",
+                     "list_sessions", "get_user_preferences"):
+            assert cold not in prompt
 
 
 class TestPruneOldToolResults:
@@ -2050,10 +2093,10 @@ class TestAgentNudge:
         assert done["type"] == "done" and done["answer"] == "补上结论。" and done["reason"] is None
         # 两阶段：第一次空转被追问，第二次给出终答
         assert [e for e in events if e["type"] == "step_start"][-1]["step"] == 2
-        # 追问消息不入会话账本（turn_messages 只含当前问句与终答 assistant）
+        # 追问消息随发送原样入账（账本重放保前缀缓存）：问句 + 意图笔记 + 追问 + 终答
         state = await service.get_store().load("s-nudge1")
         roles = [m.get("role") for m in state.turns[-1]["messages"]]
-        assert roles == ["user", "assistant"]
+        assert roles == ["user", "system", "system", "assistant"]
 
     @pytest.mark.asyncio
     async def test_announced_without_tools_nudges_then_answers(self, monkeypatch):
@@ -2437,8 +2480,9 @@ class TestCardLedger:
 
         monkeypatch.setattr(service.pilot_tools, "execute_tool", _games)
         events = [e async for e in service.ask_stream("关注里都有什么游戏", session_id="s-cross")]
+        # 词条锁定「已向用户呈现过」而非泛化的「界面卡片」——后者会连系统提示一起命中
         note = [m for m in seen["messages"]
-                if m.get("role") == "system" and "界面卡片" in str(m.get("content"))]
+                if m.get("role") == "system" and "已向用户呈现过" in str(m.get("content"))]
         assert note and "艾尔登法环" in note[0]["content"]
         # 静态清单卡近轮已呈现：本轮不再发卡（模型可用 emit_card=true 强制）
         assert not [e for e in events if e["type"] == "card" and e.get("card")]
@@ -2650,3 +2694,155 @@ class TestTurnStepClosure:
                         for p in (t.get("resp", {}).get("phases") or [])
                         for s in p.get("steps") or []]
         assert ledger_steps == all_steps
+
+
+class TestDeterministicPrefetch:
+    """确定性预取：数据型问句在首轮模型请求前先把事实取回注入（步骤挂第 1 阶段）。"""
+
+    @staticmethod
+    def _spy_stream(seen_notes):
+        async def _spy(**kw):
+            for m in kw["messages"]:
+                c = m.get("content")
+                if isinstance(c, str) and service._PREFETCH_NOTE_HEAD in c:
+                    seen_notes.append(c)
+            yield ("answer", "结论：现价 50 元。")
+            yield ("usage", (100, 20))
+        return _spy
+
+    @pytest.mark.asyncio
+    async def test_price_question_prefetches_briefing_before_first_request(self, monkeypatch):
+        executed = []
+        seen_notes = []
+        _patch_ready(monkeypatch)
+        monkeypatch.setattr(service.pilot_llm, "chat_stream", self._spy_stream(seen_notes))
+
+        async def _search(question, query=None):
+            return [{"appid": 292030, "name": "测试游戏"}]
+
+        monkeypatch.setattr(service.pilot_tools, "search_games", _search)
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _tool_stub(executed, _FACTS))
+        events = [e async for e in service.ask_stream("《测试游戏》现在多少钱", session_id="s-prefetch")]
+        kinds = [e["type"] for e in events]
+        assert "tool_start" in kinds and "card" in kinds
+        first_tool = [e for e in events if e["type"] == "tool_start"][0]
+        assert first_tool["name"] == "get_price_briefing" and first_tool["card_kind"] == "price"
+        assert executed[0] == ("get_price_briefing", 292030, False)
+        assert seen_notes and "get_price_briefing" in seen_notes[0]
+        done = events[-1]
+        assert done["type"] == "done" and done["source"] == "llm"
+        assert done["steps"][0] == {"label": "price", "status": "ok", "data": {"name": "测试游戏"}}
+        assert done["cards"] and done["cards"][0]["kind"] == "price"
+        state = await service.get_store().load("s-prefetch")
+        ledger_steps = [s for t in state.turns
+                        for p in (t.get("resp", {}).get("phases") or [])
+                        for s in p.get("steps") or []]
+        assert ledger_steps == done["steps"]
+
+    @pytest.mark.asyncio
+    async def test_price_prefetch_abstains_on_ambiguous_target(self, monkeypatch):
+        executed = []
+        seen_notes = []
+        _patch_ready(monkeypatch, stream=[("answer", "需要先确认是哪一款。")])
+        _spy = self._spy_stream(seen_notes)
+        monkeypatch.setattr(service.pilot_llm, "chat_stream", _spy)
+
+        async def _search(question, query=None):
+            return [{"appid": 1}, {"appid": 2}]
+
+        monkeypatch.setattr(service.pilot_tools, "search_games", _search)
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _tool_stub(executed, _FACTS))
+        events = [e async for e in service.ask_stream("《赛博朋克2077》和《巫师3》多少钱", session_id="s-ambig")]
+        assert not [e for e in events if e["type"] in ("tool_start", "tool", "card")]
+        assert not seen_notes and not executed
+
+    @pytest.mark.asyncio
+    async def test_free_words_prefetch_offers_without_search(self, monkeypatch):
+        executed = []
+        seen_notes = []
+        _patch_ready(monkeypatch)
+        monkeypatch.setattr(service.pilot_llm, "chat_stream", self._spy_stream(seen_notes))
+
+        async def _exec(name, arguments, guarded=False, sid=None):
+            executed.append(name)
+            if name == "epic_free":
+                return {"kind": "epic", "titleKey": "epic",
+                        "offers": [{"title": "Free", "titleCn": "免费游戏"}], "total": 1}
+            return {"kind": "rows", "titleKey": "steamFree",
+                    "rows": [{"k": "A", "v": "", "vKey": "x"}], "total": 1}
+
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _exec)
+        events = [e async for e in service.ask_stream("最近有什么免费游戏可以白嫖", session_id="s-free")]
+        assert executed == ["epic_free", "steam_free"]
+        cards = [e["card"] for e in events if e["type"] == "card" and e["card"]]
+        assert [c["kind"] for c in cards] == ["epic"]
+        done = events[-1]
+        assert [s["label"] for s in done["phases"][0]["steps"]] == ["epicFree", "steamFree"]
+        assert done["cards"] and done["cards"][0]["kind"] == "epic"
+        assert seen_notes and "epic_free" in seen_notes[0] and "steam_free" in seen_notes[0]
+
+    @pytest.mark.asyncio
+    async def test_region_words_prefetch_region_prices(self, monkeypatch):
+        executed = []
+        seen_notes = []
+        _patch_ready(monkeypatch)
+        monkeypatch.setattr(service.pilot_llm, "chat_stream", self._spy_stream(seen_notes))
+
+        async def _search(question, query=None):
+            return [{"appid": 292030, "name": "测试游戏"}]
+
+        monkeypatch.setattr(service.pilot_tools, "search_games", _search)
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _tool_stub(executed, _FACTS))
+        events = [e async for e in service.ask_stream("《测试游戏》全区多少钱", session_id="s-region")]
+        assert executed[0] == ("get_region_prices", 292030, False)
+        first_tool = [e for e in events if e["type"] == "tool_start"][0]
+        assert first_tool["name"] == "get_region_prices"
+        assert seen_notes and "get_region_prices" in seen_notes[0]
+
+    @pytest.mark.asyncio
+    async def test_forced_single_pass_omits_tools_on_first_request(self, monkeypatch):
+        """目标零歧义（appid 直给）+ 纯数据咨询：首轮请求不带工具表，模型只能基于预取事实作答。"""
+        executed = []
+        seen_tools = []
+        _patch_ready(monkeypatch)
+
+        async def _spy(**kw):
+            seen_tools.append(kw.get("tools"))
+            yield ("answer", "结论：现价 50 元。")
+            yield ("usage", (100, 20))
+
+        monkeypatch.setattr(service.pilot_llm, "chat_stream", _spy)
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _tool_stub(executed, _FACTS))
+        events = [e async for e in service.ask_stream(
+            "它现在多少钱", session_id="s-force", appid=292030)]
+        done = events[-1]
+        assert done["type"] == "done" and done["source"] == "llm"
+        assert seen_tools and seen_tools[0] is None
+        assert [e for e in events if e["type"] == "tool_start"][0]["name"] == "get_price_briefing"
+        assert done["cards"] and done["cards"][0]["kind"] == "price"
+        assert done["ttft_n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_compound_question_keeps_full_tool_table(self, monkeypatch):
+        """复合问句（价格 + 推荐）：预取照发，但保留完整工具表不禁工具。"""
+        seen_tools = []
+        _patch_ready(monkeypatch)
+
+        async def _spy(**kw):
+            seen_tools.append(kw.get("tools"))
+            yield ("answer", "结论。")
+            yield ("usage", (100, 20))
+
+        monkeypatch.setattr(service.pilot_llm, "chat_stream", _spy)
+
+        async def _search(question, query=None):
+            return [{"appid": 292030, "name": "测试游戏"}]
+
+        monkeypatch.setattr(service.pilot_tools, "search_games", _search)
+        monkeypatch.setattr(service.pilot_tools, "execute_tool",
+                            _tool_stub([], _FACTS))
+        events = [e async for e in service.ask_stream(
+            "《测试游戏》多少钱？顺便推荐几个类似的游戏", session_id="s-compound")]
+        assert seen_tools and seen_tools[0]  # 工具表仍在场
+        names = [e["name"] for e in events if e["type"] == "tool_start"]
+        assert names and names[0] == "get_price_briefing"

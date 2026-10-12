@@ -244,8 +244,19 @@ def test_rates_and_calendar_rows(monkeypatch):
     monkeypatch.setattr(
         pilot_tools.steam_events_service, "list_events",
         _async_return({
-            "live": [{"nameZh": "秋促", "nameEn": None, "key": "autumn", "start": "2026-10-02", "end": "2026-10-09"}],
-            "upcoming": [{"nameZh": None, "nameEn": "Winter", "key": "winter", "start": "2026-12-20"}],
+            "events": [
+                {"nameZh": "秋促", "nameEn": None, "key": "autumn", "category": "seasonal_sale",
+                 "start": "2026-10-02", "end": "2026-10-09"},
+                {"nameZh": None, "nameEn": "Winter", "key": "winter", "category": "seasonal_sale",
+                 "start": "2026-12-20", "end": "2027-01-03"},
+            ],
+            "live": [{"nameZh": "秋促", "nameEn": None, "key": "autumn", "category": "seasonal_sale",
+                      "start": "2026-10-02", "end": "2026-10-09"}],
+            "upcoming": [{"nameZh": None, "nameEn": "Winter", "key": "winter",
+                          "category": "seasonal_sale", "start": "2026-12-20", "end": "2027-01-03"}],
+            "next": {"nameZh": None, "nameEn": "Winter", "key": "winter",
+                     "category": "seasonal_sale", "start": "2026-12-20", "end": "2027-01-03"},
+            "fetchedAt": None, "stale": False,
         }),
     )
     import asyncio
@@ -254,6 +265,35 @@ def test_rates_and_calendar_rows(monkeypatch):
     cal = asyncio.run(pilot_tools.execute_tool("calendar_events", {}))
     assert cal["rows"][0]["vKey"] == "eventLive" and cal["rows"][0]["tone"] == "ok"
     assert cal["rows"][1]["k"] == "Winter" and cal["rows"][1]["vKey"] == "eventUpcoming"
+
+
+def test_calendar_events_falls_back_to_events_and_prioritizes_seasonal(monkeypatch):
+    def _future(offset_days: int) -> str:
+        import datetime
+        return (datetime.date.today() + datetime.timedelta(days=offset_days)).isoformat()
+
+    monkeypatch.setattr(
+        pilot_tools.steam_events_service, "list_events",
+        _async_return({
+            "events": [
+                {"nameZh": "已结束", "nameEn": None, "key": "past", "category": "themed_fest",
+                 "start": "2020-01-01", "end": "2020-01-05"},
+                {"nameZh": "烹饪游戏节", "nameEn": None, "key": "cooking", "category": "themed_fest",
+                 "start": _future(3), "end": _future(10)},
+                {"nameZh": "2026 年冬季特卖", "nameEn": "Winter Sale", "key": "seasonal_2026_winter",
+                 "category": "seasonal_sale", "start": _future(60), "end": _future(78)},
+            ],
+            "live": [],
+            "next": None,
+            "fetchedAt": None,
+            "stale": False,
+        }),
+    )
+    import asyncio
+    cal = asyncio.run(pilot_tools.execute_tool("calendar_events", {}))
+    upcoming = [r for r in cal["rows"] if r["vKey"] == "eventUpcoming"]
+    assert len(upcoming) == 2
+    assert upcoming[0]["k"] == "2026 年冬季特卖"
 
 
 def test_top_games_uses_board_and_names(monkeypatch):

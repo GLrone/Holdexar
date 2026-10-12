@@ -226,6 +226,26 @@ def tool_specs(*, expanded: frozenset[str] | None = None,
     return [v for v in views if v["function"]["name"] in names]
 
 
+async def exact_catalog_appid(name: str) -> int | None:
+    """书名号整名精确直取：目录 FTS 分词对带标点整名会错位（近似名挤占
+    候选位），名称等值唯一命中才返回 appid，其余形态（零命中 / 多义）弃权。"""
+    q = (name or "").strip()
+    if not q:
+        return None
+    from sqlalchemy import func, or_, select
+
+    from app.core.database import get_session_factory
+    from app.domains.games.models import CatalogRemoval, Game
+
+    async with get_session_factory()() as session:
+        rows = (await session.execute(
+            select(Game.appid)
+            .where(or_(Game.name == q, func.lower(Game.name_en) == q.lower()))
+            .where(Game.appid.not_in(select(CatalogRemoval.appid)))
+        )).scalars().all()
+    return int(rows[0]) if len(rows) == 1 else None
+
+
 async def execute_tool(name: str, arguments: dict, *, guarded: bool = False,
                        sid: str | None = None) -> dict:
     """工具执行分发：守卫 / 校验 / 超时 / 失败归一由 agent.tools.executor 承载。

@@ -21,9 +21,14 @@
 from __future__ import annotations
 
 import json
+import logging
 
+from app.core.logging import log_event
+from app.crawler.utils import get_beijing_time_obj
 from app.domains.agent.tools import projection as tool_projection
 from app.domains.pilot import llm as pilot_llm
+
+logger = logging.getLogger(__name__)
 
 _CLEARABLE_TOOLS = tool_projection._READ_TOOLS
 """可清结果的工具集合 = 只读工具（唯一事实源在 agent/tools/projection.py）。
@@ -160,6 +165,94 @@ _OVERFLOW_MARKERS = (
     "too many tokens", "input length", "prompt is too long", "reduce the length",
 )
 
+
+
+_ENV_FACTS_FRAME = "以下是本次问答时本机的事实（以此为准，不要用惯例或记忆猜日期与地区）：\n"
+
+
+async def environment_facts() -> str | None:
+    """本机环境事实块（给模型的注入文本），无可取事实时返回 None。
+
+    逐条独立取数：任何一项失败只丢该项，不影响其余项与问答本身。
+    """
+    lines: list[str] = [f"今天是 {get_beijing_time_obj().strftime('%Y-%m-%d')}（北京时间）"]
+
+    region_line = await _wallet_region_line()
+    if region_line:
+        lines.append(region_line)
+    owned_line = await _owned_line()
+    if owned_line:
+        lines.append(owned_line)
+    regions_line = await _enabled_regions_line()
+    if regions_line:
+        lines.append(regions_line)
+
+    return _ENV_FACTS_FRAME + "\n".join(lines)
+
+
+async def _wallet_region_line() -> str | None:
+    """主账号钱包快照 → 结算区事实行；无绑定账号或快照无判定则 None。"""
+    try:
+        from app.domains.account import service as account_service
+
+        regions = await account_service.wallet_regions()
+        if not regions:
+            return None
+        primary = await account_service.get_primary_steam_id()
+        code = regions.get(primary) or next(iter(regions.values()), None)
+        if not code:
+            return None
+        currency = ""
+        row = await account_service.get_primary_account()
+        wallet = getattr(row, "wallet_json", None)
+        if isinstance(wallet, dict):
+            currency = str(wallet.get("currency_code") or "")
+        if currency:
+            return f"账号结算区：{str(code).upper()}（币种 {currency.upper()}）"
+        return f"账号结算区：{str(code).upper()}"
+    except Exception as e:  # noqa: BLE001 —— 事实注入是旁支，取不到就不写
+        log_event(logger, "环境事实：钱包结算区取数失败，本条不注入",
+                  level=logging.DEBUG, detail={"原因": str(e)})
+        return None
+
+
+async def _owned_line() -> str | None:
+    """已拥有条目计数 → 事实行；取不到或为空则 None。"""
+    try:
+        from app.domains.wishlist import service as wishlist_service
+
+        items = await wishlist_service.list_items()
+        count = sum(1 for it in items if it.get("owned"))
+        if count <= 0:
+            return None
+        return f"已拥有 {count} 款游戏（推荐与清单里可跳过这些）"
+    except Exception as e:  # noqa: BLE001
+        log_event(logger, "环境事实：已拥有游戏数取数失败，本条不注入",
+                  level=logging.DEBUG, detail={"原因": str(e)})
+        return None
+
+
+async def _enabled_regions_line() -> str | None:
+    """启用中的区服数量 → 事实行；取不到则 None。"""
+    try:
+        from app.domains.regions import service as regions_service
+
+        codes = await regions_service.enabled_regions()
+        if not codes:
+            return None
+        return f"当前启用 {len(codes)} 个区服"
+    except Exception as e:  # noqa: BLE001
+        log_event(logger, "环境事实：启用区服数取数失败，本条不注入",
+                  level=logging.DEBUG, detail={"原因": str(e)})
+        return None
+
+
+async def environment_message() -> list[dict] | None:
+    """环境事实 → 单条 user 消息（供服务层拼进消息序列）；无事实返回 None。"""
+    facts = await environment_facts()
+    if not facts:
+        return None
+    return [{"role": "user", "content": facts}]
 
 
 def user_text(question: str, appid: int | None,

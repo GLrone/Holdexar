@@ -9,7 +9,7 @@ from typing import Any
 
 from sqlalchemy import delete, select
 
-from app.core.database import WritePriority, get_session_factory, write_gate
+from app.core.database import WritePriority, get_session_factory, write_session
 from app.crawler.utils import get_beijing_time_obj
 from app.domains.agent.models import AgentMemory
 
@@ -35,7 +35,7 @@ async def upsert_memory(
     """写入或更新记忆项（category+key 唯一确定一行）。"""
     ts = _now()
     val_dict = value if isinstance(value, dict) else {"val": value}
-    async with write_gate(WritePriority.INTERACTIVE, "agent_memory"), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE, "agent_memory") as session:
         stmt = select(AgentMemory).where(
             AgentMemory.category == category,
             AgentMemory.key == key,
@@ -120,7 +120,7 @@ async def list_memories(category: str | None = None) -> list[dict]:
 
 async def delete_memory(category: str, key: str) -> bool:
     """按分类和键删除单条记忆。"""
-    async with write_gate(WritePriority.INTERACTIVE, "agent_memory"), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE, "agent_memory") as session:
         stmt = delete(AgentMemory).where(
             AgentMemory.category == category,
             AgentMemory.key == key,
@@ -132,7 +132,7 @@ async def delete_memory(category: str, key: str) -> bool:
 
 async def clear_memories(category: str | None = None) -> int:
     """清空记忆项。"""
-    async with write_gate(WritePriority.INTERACTIVE, "agent_memory"), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE, "agent_memory") as session:
         stmt = delete(AgentMemory)
         if category:
             stmt = stmt.where(AgentMemory.category == category)

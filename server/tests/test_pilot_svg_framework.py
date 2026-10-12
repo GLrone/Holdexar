@@ -36,9 +36,9 @@ def test_deterministic_note_injects_svg_framework():
 
 
 def test_system_prompt_contains_svg_rule():
-    assert "矢量图形与图表渲染" in service._SYSTEM_PROMPT
+    """系统提示保留 SVG 呈现规范（调色板与曲线口径），但不复述框架长文——
+    长文由 _deterministic_note 在视觉类问句上动态注入。"""
+    assert "<svg>" in service._SYSTEM_PROMPT
     assert "#66c0f4" in service._SYSTEM_PROMPT
     assert "贝塞尔曲线" in service._SYSTEM_PROMPT
-    assert "专有组件优先" in service._SYSTEM_PROMPT
-    assert "无法直接套用" in service._SYSTEM_PROMPT
 

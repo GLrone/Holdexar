@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 from app.domains.account import service as account_service
+from app.domains.achievements import challenges as achievements_challenges
+from app.domains.achievements import level as achievements_level
 from app.domains.achievements import service as achievements_service
+from app.domains.achievements import social as achievements_social
 from app.domains.agent.tools.base import ToolSpec
 from app.domains.agent.tools.builtin import _shared
 from app.domains.bills import service as bills_service
@@ -69,6 +72,76 @@ async def achievements_summary() -> dict:
             for a in (s.get("recentUnlocks") or [])[:4] if a.get("appid")
         ],
     }
+
+
+async def level_profile(steam_id: str | None = None) -> dict:
+    """猎手等级读数（等级/段位/累计经验/下一级所需/连猎加成 + 最近解锁）。"""
+    p = await achievements_level.level_profile(steam_id or None)
+    bonus = (p.get("activeBonuses") or [{}])[0]
+    unlocks = (await achievements_social.recent_unlocks(steam_id or None, 4)).get("items") or []
+    rows = [
+        {"k": "", "vKey": "levelNow",
+         "data": {"level": p.get("level"), "tier": p.get("tier"), "totalXp": p.get("totalXp")},
+         "tone": "ok"},
+        {"k": "", "vKey": "levelNext",
+         "data": {"into": p.get("xpIntoLevel"), "next": p.get("xpForNextLevel")}},
+    ]
+    if bonus.get("multiplier") and bonus["multiplier"] > 1.0:
+        rows.append({"k": "", "vKey": "levelBonus",
+                     "data": {"days": bonus.get("streakDays"),
+                              "percent": round((bonus["multiplier"] - 1) * 100)},
+                     "tone": "ok"})
+    for u in unlocks:
+        rows.append({"k": u.get("name") or "", "vKey": "levelUnlock",
+                     "data": {"gameName": u.get("gameName") or ""}})
+    out = _shared.rows_result("levelProfile", rows, total=len(rows))
+    out.update({
+        "level": p.get("level"),
+        "tier": p.get("tier"),
+        "totalXp": p.get("totalXp"),
+        "xpForNextLevel": p.get("xpForNextLevel"),
+        "streakDays": int(bonus.get("streakDays") or 0),
+        "activeBonusMultiplier": float(bonus.get("multiplier") or 1.0),
+        "recentUnlocks": [
+            {"name": u.get("name") or "", "gameName": u.get("gameName") or "",
+             "at": u.get("unlockTime")}
+            for u in unlocks
+        ],
+    })
+    return out
+
+
+async def challenges_overview(steam_id: str | None = None) -> dict:
+    """挑战进度读数（已完成/可领取/最接近完成的进行中项，挑战目录同源）。"""
+    data = await achievements_challenges.challenges_overview(steam_id or None)
+    summary = data.get("summary") or {}
+    near = sorted(
+        (c for c in (data.get("challenges") or [])
+         if c.get("status") == "active" and int(c.get("target") or 0) > 0),
+        key=lambda c: int(c.get("progress") or 0) / int(c.get("target") or 1),
+        reverse=True,
+    )[:3]
+    near_complete = [
+        {"challengeId": c.get("challengeId"), "progress": int(c.get("progress") or 0),
+         "target": int(c.get("target") or 0), "rewardXp": int(c.get("rewardXp") or 0)}
+        for c in near
+    ]
+    rows = [{"k": "", "vKey": "challengeSummary",
+             "data": {"completed": int(summary.get("completed") or 0),
+                      "claimable": int(summary.get("claimable") or 0),
+                      "total": int(summary.get("total") or 0)},
+             "tone": "ok" if summary.get("claimable") else None}]
+    for c in near_complete:
+        rows.append({"k": "", "vKey": "challengeNear",
+                     "data": {"challengeId": c["challengeId"], "progress": c["progress"],
+                              "target": c["target"], "rewardXp": c["rewardXp"]}})
+    out = _shared.rows_result("challengesOverview", rows, total=len(rows))
+    out.update({
+        "completed": int(summary.get("completed") or 0),
+        "claimable": int(summary.get("claimable") or 0),
+        "nearComplete": near_complete,
+    })
+    return out
 
 
 async def list_family_library() -> dict:
@@ -190,6 +263,14 @@ async def _achievements_summary(args: dict, sid: str | None = None) -> dict:
     return await achievements_summary()
 
 
+async def _level_profile(args: dict, sid: str | None = None) -> dict:
+    return await level_profile(args.get("steam_id") or None)
+
+
+async def _challenges_overview(args: dict, sid: str | None = None) -> dict:
+    return await challenges_overview(args.get("steam_id") or None)
+
+
 async def _list_family_library(args: dict, sid: str | None = None) -> dict:
     return await list_family_library()
 
@@ -261,6 +342,22 @@ SPECS = [
         description="查看奖杯概览（白金数、解锁进度、白金陈列、最近解锁）。用户问『我的成就/奖杯进度』『最近解了什么成就』时调用",
         parameters={"type": "object", "properties": {}},
         handler=_achievements_summary, step_label="achievements",
+    ),
+    ToolSpec(
+        name="level_profile", group="read", risk="low",
+        description="查看猎手等级与经验进度（等级、段位、累计经验、下一级还差多少、连猎加成、最近解锁）。用户问『我几级了』『经验/等级进度怎么样』时调用",
+        parameters={"type": "object", "properties": {
+            "steam_id": {"type": "string", "description": "账号 SteamID；缺省主账号"}
+        }},
+        handler=_level_profile, step_label="levelProfile",
+    ),
+    ToolSpec(
+        name="challenges_overview", group="read", risk="low",
+        description="查看挑战进度（已完成数、可领取数、最接近完成的挑战）。用户问『挑战进度』『有没有能领的挑战奖励』时调用",
+        parameters={"type": "object", "properties": {
+            "steam_id": {"type": "string", "description": "账号 SteamID；缺省主账号"}
+        }},
+        handler=_challenges_overview, step_label="challengesOverview",
     ),
     ToolSpec(
         name="bills_summary", group="read", risk="low",

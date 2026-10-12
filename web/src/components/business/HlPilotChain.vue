@@ -1,11 +1,20 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 
-import type { PilotPhase, PilotStep } from '@/api/client'
+import type { PilotFacts, PilotPhase, PilotStep } from '@/api/client'
 import { useI18n, type MessageKey } from '@/locales'
+import HlPilotCards from '@/components/business/HlPilotCards.vue'
 import HlPilotThinking from '@/components/business/HlPilotThinking.vue'
+import HlSkeleton from '@/components/ui/HlSkeleton.vue'
 import { HlIcon } from '@/components/ui'
 import { fmtTokens } from '@/lib/pilotView'
+
+/** 流式期随阶段内嵌的过程卡（思考时序原位，done 后由回答层正式版接管） */
+interface ChainLiveCard {
+  key: number
+  phase: number
+  card: PilotFacts | null
+}
 
 const props = withDefaults(
   defineProps<{
@@ -19,6 +28,8 @@ const props = withDefaults(
     waitingText?: string
     hidePhaseText?: boolean
     failed?: boolean
+    liveCards?: ChainLiveCard[]
+    busyPid?: string | null
   }>(),
   {
     phases: () => [],
@@ -30,8 +41,14 @@ const props = withDefaults(
     waitingText: '',
     hidePhaseText: false,
     failed: false,
+    liveCards: () => [],
+    busyPid: null,
   },
 )
+
+const emit = defineEmits<{
+  proposal: [payload: { pid: string; approve: boolean }]
+}>()
 
 const { t } = useI18n()
 
@@ -44,6 +61,11 @@ const viewPhases = computed<PilotPhase[]>(() => {
 })
 
 const activeIndex = computed(() => (props.live && viewPhases.value.length ? viewPhases.value.length - 1 : -1))
+
+/** 本阶段的过程卡：随阶段时序内嵌展示（骨架或实体） */
+function phaseCards(pi: number): ChainLiveCard[] {
+  return props.liveCards.filter((e) => e.phase === pi)
+}
 
 function phaseSec(p: PilotPhase): number | null {
   return p.think_ms ? Math.max(1, Math.round(p.think_ms / 1000)) : null
@@ -185,7 +207,7 @@ function stepText(s: PilotStep): string {
     <div v-if="open" class="pchain__body">
       <div
         v-for="(p, pi) in viewPhases"
-        v-show="p.thinking || p.text || p.steps.length || pi === activeIndex"
+        v-show="p.thinking || p.text || p.steps.length || phaseCards(pi).length || pi === activeIndex"
         :key="pi"
         class="pchain__phase"
       >
@@ -225,6 +247,23 @@ function stepText(s: PilotStep): string {
             <span class="pilot-step__text">{{ stepText(s) }}</span>
           </div>
         </div>
+
+        <!-- 过程卡内嵌：思考时序原位（工具步骤下方），随后续思考/步骤上移；
+             done 后由回答层的正式卡接管，这里只在流式期有值 -->
+        <template v-if="phaseCards(pi).length">
+          <div v-for="entry in phaseCards(pi)" :key="entry.key" class="pchain__card">
+            <HlPilotCards
+              v-if="entry.card"
+              :cards="[entry.card]"
+              :busy-pid="busyPid"
+              @proposal="emit('proposal', $event)"
+            />
+            <div v-else class="pchain__card-skel" role="status" aria-busy="true">
+              <HlSkeleton variant="title" />
+              <HlSkeleton variant="text" :rows="3" />
+            </div>
+          </div>
+        </template>
       </div>
 
       <div v-if="memoryText && !live" class="pchain__memory">
@@ -403,6 +442,22 @@ function stepText(s: PilotStep): string {
   flex-direction: column;
   gap: 4px;
   align-self: stretch;
+}
+
+.pchain__card {
+  align-self: stretch;
+  max-width: 100%;
+}
+
+.pchain__card-skel {
+  align-self: stretch;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-soft);
+  background: var(--surface-panel);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .pilot-step {

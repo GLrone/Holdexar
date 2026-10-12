@@ -90,6 +90,111 @@ class CardDecision:
 # ——价格随刷新轮变化，重复询问往往正是要看最新价
 _REPEATABLE_SUPPRESS_KINDS = frozenset({"games", "family", "achievements", "rows", "epic"})
 
+# 追问键白名单（前端按 pilot.followup.{key} 取双语词条，缺词即丢弃该条）
+_FOLLOWUP_KEYS = frozenset({
+    "saleNext", "saleLive", "saleWatch", "priceDropsRecent", "openCalendar",
+    "compareRegions", "priceHistory", "similarGames", "addFollow", "setAlert",
+    "myFollows", "ownedSkip", "freeNow", "auditFollows", "retryWeb",
+    "hotDeals", "highRated", "budgetFriendly", "familyOverlap", "testLatency",
+    "switchNode", "checkFailures", "listAlerts",
+})
+
+# 意图 → 候选追问（按序取前若干条；带 {name} 的需有本轮游戏对象才成立）
+_FOLLOWUP_BY_INTENT: dict[str, tuple[str, ...]] = {
+    "price_analysis": ("priceHistory", "compareRegions", "similarGames", "addFollow", "setAlert"),
+    "find_games": ("highRated", "budgetFriendly", "ownedSkip", "priceDropsRecent"),
+    "add_monitor": ("myFollows", "setAlert", "priceDropsRecent"),
+    "create_alert": ("listAlerts", "myFollows"),
+    "how_to": (),
+    "navigate": (),
+    "chat": (),
+}
+
+# 问句特征 → 追加候选（覆盖「意图路由没认出来」的开放问题）
+_FOLLOWUP_BY_TOPIC: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (("大促", "特卖", "促销", "打折活动", "夏促", "秋促", "冬促", "史低", "什么时候开始"),
+     ("saleNext", "saleLive", "saleWatch", "openCalendar")),
+    (("活动", "日历", "游戏节", "新品节", "fest"), ("openCalendar", "saleNext", "saleLive")),
+    (("免费", "喜加一", "白嫖", "白送", "限免"), ("freeNow", "priceDropsRecent")),
+    (("降价", "跌了", "新低", "便宜了"), ("priceDropsRecent", "myFollows", "hotDeals")),
+    (("汇率", "折合", "换算"), ("compareRegions",)),
+    (("家庭", "共享"), ("familyOverlap",)),
+    # 全区比价口径：不一定命中价格意图词（「划算」「最便宜」不在价格词表里）
+    (("哪个区", "哪个地区", "全区", "各区", "各区域", "比价", "划算", "最便宜", "哪里买"),
+     ("compareRegions", "priceHistory", "setAlert", "priceDropsRecent")),
+    (("代理", "节点", "延迟", "网络", "超时"), ("testLatency", "switchNode", "checkFailures")),
+    # 排障口径：现象描述类问句往往不含任何业务关键词
+    (("没更新", "不更新", "没刷新", "为什么", "报错", "异常", "失败", "卡住", "不动了"),
+     ("checkFailures", "testLatency", "switchNode")),
+)
+
+# 意图与主题都没命中时按本轮卡片兜底（有卡就有得问，别退回与所问无关的通用推荐）
+_FOLLOWUP_BY_CARD: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (("price", "regions", "compare"), ("priceHistory", "compareRegions", "similarGames",
+                                       "addFollow", "setAlert")),
+    (("games",), ("highRated", "budgetFriendly", "ownedSkip", "priceDropsRecent")),
+    (("family",), ("familyOverlap",)),
+    (("rows", "epic"), ("priceDropsRecent", "myFollows")),
+)
+
+
+def suggest_followups(question: str, intent: str, cards: list[dict],
+                      last_game: dict | None,
+                      tools_ran: int = 0) -> list[dict]:
+    """本轮追问：按意图与问句主题确定性产出结构化候选（key + args）。
+
+    只产出白名单内的键——文案由前端 i18n 承载，这里不出用户可见文本，
+    中英界面都不会被模型或后端的措辞污染。带 {name} 的候选需要本轮有明确
+    游戏对象（价格卡 / 地区卡 / 对比卡里的名称，或本轮写动作的对象）才成立。
+    无候选时返回空列表，前端回落它自己的固定开场推荐。"""
+    q = (question or "").strip()
+    ordered: list[str] = []
+
+    def _add(keys: tuple[str, ...]) -> None:
+        for k in keys:
+            if k in _FOLLOWUP_KEYS and k not in ordered:
+                ordered.append(k)
+
+    _add(_FOLLOWUP_BY_INTENT.get(intent, ()))
+    for words, keys in _FOLLOWUP_BY_TOPIC:
+        if any(w in q for w in words):
+            _add(keys)
+    # 意图与主题都空手时按本轮卡片兜底：有卡说明答的是具体对象，追问就该围着它
+    if not ordered:
+        kinds = {str(c.get("kind") or "") for c in (cards or []) if isinstance(c, dict)}
+        for want, keys in _FOLLOWUP_BY_CARD:
+            if kinds & set(want):
+                _add(keys)
+                break
+
+    name = ""
+    if isinstance(last_game, dict):
+        name = str(last_game.get("name") or "").strip()
+    if not name:
+        for card in cards or []:
+            if not isinstance(card, dict):
+                continue
+            if card.get("kind") in ("price", "regions", "compare"):
+                name = str(card.get("name") or "").strip()
+                if name:
+                    break
+    # 本轮一次工具都没跑成：给一条「换个说法再查」的退路，别只给不相关推荐
+    if not tools_ran and "retryWeb" not in ordered:
+        ordered.append("retryWeb")
+    if not ordered:
+        return []
+
+    named = {"compareRegions", "priceHistory", "similarGames", "addFollow", "setAlert"}
+    out: list[dict] = []
+    for k in ordered:
+        if k in named:
+            if not name:
+                continue
+            out.append({"key": k, "args": {"name": name}})
+            continue
+        out.append({"key": k, "args": {}})
+    return out[:4]
+
 
 def _card_identity(kind: str, card: dict) -> str:
     """卡片身份：同 kind 下区分内容的最小锚（名称/对象/首行）。"""
@@ -112,6 +217,11 @@ def _card_identity(kind: str, card: dict) -> str:
 
 class DecisionAgent:
     """内部快速决策引擎。"""
+
+    def suggest_followups(self, question: str, intent: str, cards: list[dict],
+                          last_game: dict | None, tools_ran: int = 0) -> list[dict]:
+        """本轮追问候选（确定性产出，转发模块级实现）。"""
+        return suggest_followups(question, intent, cards, last_game, tools_ran=tools_ran)
 
     def evaluate_intent(self, question: str) -> dict[str, Any]:
         """评估问句的意图与价格/导购倾向。"""
