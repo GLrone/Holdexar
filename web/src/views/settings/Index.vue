@@ -31,6 +31,7 @@ import RegionFlag from '@/components/RegionFlag.vue'
 import {
   HlButton, HlCheckbox, HlDialog, HlIcon, HlImg, HlInput, HlSelect, HlSkeleton, HlSwitch, message,
 } from '@/components/ui'
+import HlPilotFlywheel from '@/components/business/HlPilotFlywheel.vue'
 
 const { t } = useI18n()
 
@@ -1691,6 +1692,9 @@ onUnmounted(stopLoginPolling)
             <div v-else class="pilot-prov__empty">{{ t('pilot.providers.empty') }}</div>
           </div>
         </div>
+
+        <!-- 问答质量沉淀（决策飞轮画像）：跨会话统计采纳/重问分布 + 导出训练数据 -->
+        <HlPilotFlywheel />
       </div>
 
       <!-- 模型清单对话框：管理选中供应商的模型（检测 / 测试 / 启用 / 删除） -->

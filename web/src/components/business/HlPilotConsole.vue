@@ -24,7 +24,7 @@ import {
 import { formatCnyFen } from '@/api/regions'
 import { mdLiteToHtml } from '@/lib/markdownLite'
 import { buildCtxSegments, shouldShowCacheHitRate } from '@/lib/ctxSegments'
-import { fmtTokens, isErrorReason, isLongAnswerText, pilotCoverUrl, positivePct, ratingClass, sessionTime } from '@/lib/pilotView'
+import { canRateTurn, fmtTokens, isEmptyLlmFailure, isErrorReason, isLongAnswerText, pilotCoverUrl, positivePct, ratingClass, sessionTime } from '@/lib/pilotView'
 import HlImg from '@/components/ui/HlImg.vue'
 import HlPilotCards from '@/components/business/HlPilotCards.vue'
 import HlPilotChain from '@/components/business/HlPilotChain.vue'
@@ -101,6 +101,8 @@ const elementRefs = computed(() =>
 
 interface Turn {
   q: string
+  tid?: string
+  feedback?: 'accepted' | 'rejected' | null
   /** pending = 用户发言已上屏、回复未到的占位轮（回复完成后原位替换） */
   kind: 'candidates' | 'action' | 'price' | 'games' | 'answer' | 'guide' | 'reason' | 'pending' | 'compact'
     | 'proposal'
@@ -112,6 +114,7 @@ interface Turn {
   turnIndex?: number
   text?: string
   reasonKey?: MessageKey
+  diagnostic?: { id: string; code: string; message: string; status_code?: number | null }
   items?: PilotGameFactsItem[]
   cards?: PilotFacts[]
   cached?: boolean
@@ -135,6 +138,7 @@ interface Turn {
 
 const question = ref('')
 const streaming = ref(false)
+const feedbackBusyKey = ref<string | null>(null)
 
 /** 草稿落盘闸门：挂载回填期间关闸，避免把空值/旧值反写覆盖磁盘上的草稿 */
 let draftReady = false
@@ -361,6 +365,7 @@ const REASON_KEYS: Record<string, MessageKey> = {
   llm_off: 'pilot.reason.llm_off',
   cap_reached: 'pilot.reason.cap_reached',
   llm_failed: 'pilot.reason.llm_failed',
+  llm_failed_empty: 'pilot.reason.llm_failed_empty',
   no_data: 'pilot.reason.no_data',
   need_target: 'pilot.reason.need_target',
   session_busy: 'pilot.reason.busy',
@@ -583,7 +588,8 @@ async function restoreSession(sid: string) {
     data.turns.forEach((t, idx) => {
       const turn = buildTurn(t.q, { ...t.resp, cached: false }, [])
       syncProposalCards(turn.cards ?? [])
-      items.push({ ...turn, turnIndex: idx, expanded: false })
+      items.push({ ...turn, tid: t.tid ?? undefined, feedback: t.feedback ?? null,
+        turnIndex: idx, expanded: false })
       for (const m of data.markers ?? []) {
         if (m.after_turn === idx + 1) {
           items.push({ q: '', kind: 'compact', steps: [], compactTrigger: m.trigger || 'auto' })
@@ -1014,6 +1020,7 @@ function buildTurn(q: string, e: PilotAskResponse, livePhaseSnapshot: PilotPhase
   const answerText = answerOf(phases, e.answer || '')
   const base = {
     q,
+    tid: e.turn_id ?? undefined,
     steps: e.steps?.length ? e.steps : phases.flatMap((p) => p.steps),
     phases: phases.length ? phases : undefined,
     // 有阶段记录时思考由 phases 承载，不再重复带整段原文
@@ -1028,6 +1035,7 @@ function buildTurn(q: string, e: PilotAskResponse, livePhaseSnapshot: PilotPhase
     },
     attachments: e.attachments?.length ? e.attachments : undefined,
     followups: e.followups?.length ? e.followups : undefined,
+    diagnostic: e.diagnostic ?? undefined,
   }
   // 批量提议：卡片带确认/取消，故独立成轮（模型说明文字随卡片一并展示）
   if (cards.some((c) => c.kind === 'proposal')) {
@@ -1064,7 +1072,8 @@ function buildTurn(q: string, e: PilotAskResponse, livePhaseSnapshot: PilotPhase
     }
   }
   if (e.source === 'guide') return { q, kind: 'guide', ...base }
-  return { q, kind: 'reason', reasonKey: (e.reason && REASON_KEYS[e.reason]) || 'pilot.error', ...base }
+  const reasonKey = isEmptyLlmFailure(e.reason, e.source) ? 'pilot.reason.llm_failed_empty' : (e.reason && REASON_KEYS[e.reason]) || 'pilot.error'
+  return { q, kind: 'reason', reasonKey, ...base }
 }
 
 async function scrollBottom() {
@@ -1279,6 +1288,27 @@ async function onCopyText(text: string) {
   if (!body) return
   if (await writeClipboard(body)) message.success(t('pilot.copy.done'))
   else message.error(t('pilot.copy.failed'))
+}
+
+async function rateTurn(turn: Turn, feedback: 'accepted' | 'rejected') {
+  const sid = sessionId.value
+  const tid = turn.tid
+  if (!sid || !tid || turn.feedback === feedback || feedbackBusyKey.value) return
+  const key = `${sid}:${tid}`
+  feedbackBusyKey.value = key
+  try {
+    const result = await pilotApi.rateTurn(sid, tid, feedback)
+    if (!result.ok) {
+      message.error(t('pilot.feedback.failed'))
+      return
+    }
+    turn.feedback = feedback
+    message.success(t('pilot.feedback.saved'))
+  } catch {
+    message.error(t('pilot.feedback.failed'))
+  } finally {
+    if (feedbackBusyKey.value === key) feedbackBusyKey.value = null
+  }
 }
 
 /** 答复头的复制钮：取当面那一轮的可见正文（只有数据卡、没有正文的轮不挂钮） */
@@ -1906,7 +1936,7 @@ async function ask(text?: string, resume?: PilotResumePayload) {
         }
       } else if (e.type === 'error') {
         clearQueuedHint()
-        done = { answer: '', thinking: null, source: 'none', reason: e.reason ?? 'llm_failed', facts: null, cards: [], cached: false }
+        done = { answer: '', thinking: null, source: 'none', reason: e.reason ?? 'llm_failed', diagnostic: e.diagnostic, facts: null, cards: [], cached: false }
       }
     }, referenceSession.value?.sid, abortCtrl.signal, resume, sentAtts.map((a) => a.id), viewContext.value, sentElRefs || undefined)
   } catch (err) {
@@ -2608,6 +2638,12 @@ function triggerFollowUp(prompt: string) {
             :failed="turn.kind === 'reason'"
           />
 
+          <details v-if="turn.diagnostic" class="pilot-error-diagnostic">
+            <summary>{{ t('pilot.error.details') }}</summary>
+            <p>{{ turn.diagnostic.message || t('pilot.error.genericDetail') }}</p>
+            <span>{{ t('pilot.error.diagnosticId', { id: turn.diagnostic.id }) }}</span>
+          </details>
+
           <!-- 结果异常/原因气泡：红色条件气泡支持行内直接重试 -->
           <div
             v-if="turn.kind === 'reason'"
@@ -2751,7 +2787,7 @@ function triggerFollowUp(prompt: string) {
 
           <!-- 回复动作行：挂在回复正文下方独立一行（左沿对齐），hover 才显形。
                动作属于它作用的那条回复——不挤在身份标旁边，也不上到提问那一行 -->
-          <div v-if="turn.text || canForkTurn(turn)" class="pilot-acts">
+          <div v-if="canRateTurn(turn) || canForkTurn(turn)" class="pilot-acts">
             <button
               v-if="turn.text"
               type="button"
@@ -2763,6 +2799,36 @@ function triggerFollowUp(prompt: string) {
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <rect x="9" y="9" width="11" height="11" rx="2" />
                 <path d="M15 5H6a2 2 0 0 0-2 2v9" />
+              </svg>
+            </button>
+            <button
+              v-if="canRateTurn(turn)"
+              type="button"
+              class="pilot-act pilot-feedback"
+              :class="{ 'is-selected': turn.feedback === 'accepted' }"
+              :title="t('pilot.feedback.accepted')"
+              :aria-label="t('pilot.feedback.accepted')"
+              :aria-pressed="turn.feedback === 'accepted'"
+              :disabled="Boolean(feedbackBusyKey)"
+              @click="rateTurn(turn, 'accepted')"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M7 10v11H4V10h3Zm3 11h7.1a2 2 0 0 0 1.96-1.6l1.5-7.5A2 2 0 0 0 18.6 9H14l.7-3.5A2 2 0 0 0 12.75 3L8 10.2V21Z" />
+              </svg>
+            </button>
+            <button
+              v-if="canRateTurn(turn)"
+              type="button"
+              class="pilot-act pilot-feedback"
+              :class="{ 'is-rejected': turn.feedback === 'rejected' }"
+              :title="t('pilot.feedback.rejected')"
+              :aria-label="t('pilot.feedback.rejected')"
+              :aria-pressed="turn.feedback === 'rejected'"
+              :disabled="Boolean(feedbackBusyKey)"
+              @click="rateTurn(turn, 'rejected')"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M17 14V3h3v11h-3Zm-3-11H6.9a2 2 0 0 0-1.96 1.6l-1.5 7.5A2 2 0 0 0 5.4 15H10l-.7 3.5A2 2 0 0 0 11.25 21L16 13.8V3Z" />
               </svg>
             </button>
             <!-- 话题分叉：从这一轮（含）派生新会话，源会话保留（同走账本记录） -->
@@ -4770,6 +4836,19 @@ function triggerFollowUp(prompt: string) {
   outline-offset: 1px;
 }
 
+.pilot-feedback.is-selected {
+  color: var(--success);
+}
+
+.pilot-feedback.is-rejected {
+  color: var(--danger-deep);
+}
+
+.pilot-feedback:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
 /* 编辑重问：气泡原位换成可改的文本框，其后轮次会被作废（有提示） */
 .pilot-edit {
   flex: 1;
@@ -5049,6 +5128,25 @@ function triggerFollowUp(prompt: string) {
 .pilot-reason__text {
   flex: 1;
   word-break: break-word;
+}
+
+.pilot-error-diagnostic {
+  margin: 6px 0 8px 23px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.pilot-error-diagnostic summary {
+  width: fit-content;
+  color: var(--danger);
+  cursor: pointer;
+}
+
+.pilot-error-diagnostic p {
+  margin: 5px 0 2px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .pilot-reason__retry-btn {

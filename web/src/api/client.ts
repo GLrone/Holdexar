@@ -546,6 +546,13 @@ export interface PilotPhase {
   steps: PilotStep[]
 }
 
+export interface PilotErrorDiagnostic {
+  id: string
+  code: string
+  message: string
+  status_code?: number | null
+}
+
 export interface PilotAskResponse {
   /** LLM 回答原文；facts / guide / none 形态下为空串，展示层按 source 渲染 */
   answer: string
@@ -556,6 +563,9 @@ export interface PilotAskResponse {
   think_ms?: number | null
   /** 回退机器码（llm_off / cap_reached / llm_failed / no_data），用户语言由前端翻 */
   reason: string | null
+  /** 已写入会话账本的轮次 id（有会话且成功落账时提供） */
+  turn_id?: string | null
+  diagnostic?: PilotErrorDiagnostic | null
   facts: PilotFacts | null
   /** 本轮工具取到的结构化卡片（games / price / action），组件渲染数据层 */
   cards: PilotFacts[]
@@ -747,6 +757,19 @@ export const pilotApi = {
       `/pilot/sessions/${encodeURIComponent(sessionId)}/rewind`,
       { keep_turns: keepTurns },
     ),
+  /** 对已落账回答作明确评价；评价写入会话账本。 */
+  rateTurn: (sessionId: string, turnId: string, feedback: 'accepted' | 'rejected') =>
+    request<{ ok: boolean; feedback: 'accepted' | 'rejected' | null; reason: string | null }>(
+      'PUT',
+      `/pilot/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/feedback`,
+      { feedback },
+    ),
+  /** 决策飞轮画像：决策日志 × 会话账本反馈的跨会话投影（只读，不落独立账本） */
+  flywheel: () =>
+    request<PilotFlywheelStats>('GET', '/pilot/flywheel', undefined, { noCache: true }),
+  /** 导出可训数据集（覆盖写派生投影，随时可重算）；返回计数与画像 */
+  exportFlywheel: () =>
+    request<PilotFlywheelExportOut>('POST', '/pilot/flywheel/export'),
   /** 批量提议确认：approve 为真逐项执行既有写动作，为假作废；机器码见 reason */
   confirmProposal: (sessionId: string, pid: string, approve: boolean) =>
     request<{
@@ -817,6 +840,8 @@ export interface PilotSessionTurn {
   q: string
   resp: PilotAskResponse
   ts: string | null
+  tid?: string | null
+  feedback?: 'accepted' | 'rejected' | null
 }
 
 /** 压缩边界：第 after_turn 轮之后发生过一次压缩（对话流分隔线依据） */
@@ -872,6 +897,43 @@ export interface PilotSessionOut {
   inflight_q?: string | null
 }
 
+/** 决策飞轮：单个意图的反馈分布（后端对决策日志 × 会话账本的只读投影） */
+export interface PilotFlywheelIntent {
+  intent: string
+  total: number
+  accepted: number
+  rejected: number
+  failed: number
+  empty: number
+  unlabeled: number
+}
+
+/** 决策飞轮画像（跨会话聚合；读取侧现算，不落独立账本） */
+export interface PilotFlywheelStats {
+  total: number
+  /** 能关联到会话账本反馈标签的轮数（无会话态问答不计） */
+  labeled: number
+  unlabeled: number
+  /** 被拒率 = rejected / labeled；无样本为 null */
+  rejected_rate: number | null
+  /** 同会话同问、先否定后肯定且答案不同的回答对数 */
+  preference_pairs: number
+  by_feedback: Record<string, number>
+  by_intent: PilotFlywheelIntent[]
+  by_mode: Record<string, number>
+  by_source: Record<string, number>
+}
+
+export interface PilotFlywheelExportOut {
+  ok: boolean
+  count: number
+  preference_count: number
+  path: string | null
+  preference_path: string | null
+  reason: string | null
+  stats: PilotFlywheelStats | null
+}
+
 /** 历史会话清单项（账本只读投影） */
 export interface PilotSessionListItem {
   sid: string
@@ -921,6 +983,7 @@ export interface PilotStreamEvent {
   compacted?: boolean
   source?: PilotAskResponse['source']
   reason?: string | null
+  diagnostic?: PilotErrorDiagnostic | null
   steps?: PilotStep[]
   /** 本轮按循环步分段的阶段记录（done 事件携带，权威） */
   phases?: PilotPhase[]

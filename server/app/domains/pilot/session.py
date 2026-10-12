@@ -15,6 +15,7 @@
   state=confirmed/rejected/withdrawn 即为终态，不再作为待确认项。
 - {"t":"truncate","keep","ts"}  轮次截断（编辑重问）：账本只保留前 keep 轮，
   其后轮次作废。历史行不删不写——折叠到该行时按 keep 截断，审计链完整。
+- {"t":"feedback","tid","label","ts"}  用户对单条回答的明确评价。
 - {"t":"pin","on","ts"}  置顶标记：会话级布尔（后者胜）。置顶是账本内事实，
   列表接口按它把置顶项排在最前。
 - {"t":"archive","on","ts"}  归档标记：会话级布尔（后者胜）。归档只是列表归类，
@@ -37,6 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.core.logging import log_event
+from app.domains.pilot import flywheel as pilot_flywheel
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +147,15 @@ class SessionStore:
         state.updated_at = self._mtime_iso(path)
         return state
 
+    def raw_records(self, sid: str) -> list[dict]:
+        """原始记录行（不折叠）：t 字段分型、坏行已滤——决策飞轮的反馈投影输入。
+
+        返回账本自身形态（含 truncate 这类不参与折叠为状态、但携带用户反馈
+        语义的记录），调用方按需自行折叠。读失败按空表处理。"""
+        if not valid_sid(sid):
+            return []
+        return self._read_lines(self._path(sid))
+
     async def load_or_new(self, sid: str) -> SessionState | None:
         state = await self.load(sid)
         return state if state is not None else self._new(sid)
@@ -163,6 +174,28 @@ class SessionStore:
                 await self.set_title(sid, derive_title(str(record["q"])))
         return await self._append(sid, {"t": "turn", **record})
 
+    async def set_turn_feedback(self, sid: str, tid: str, label: str) -> str | None:
+        """把用户对某条已落账回答的明确评价追加到同一会话账本。"""
+        if not valid_sid(sid) or not tid or label not in ("accepted", "rejected"):
+            return "bad_request"
+        async with self._lock(sid):
+            path = self._path(sid)
+            if not path.is_file():
+                return "no_session"
+            records = await asyncio.to_thread(self._read_lines, path)
+            state = self._fold(sid, records)
+            if not any(str(turn.get("tid") or "") == tid for turn in state.turns):
+                return "turn_gone"
+            record = {"t": "feedback", "tid": tid, "label": label, "ts": _now_iso()}
+            try:
+                with path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            except OSError as e:
+                log_event(logger, f"会话 {sid} 评价写入失败", level=logging.WARNING,
+                          detail={"会话": sid, "原因": repr(e)})
+                return "write_failed"
+            return None
+
     async def set_title(self, sid: str, text: str) -> bool:
         """改名/自动起名：追加一条 title 记录（后者胜）。"""
         text = " ".join((text or "").split())[:_TITLE_MAX_LEN]
@@ -170,16 +203,21 @@ class SessionStore:
             return False
         return await self._append(sid, {"t": "title", "text": text})
 
-    async def delete(self, sid: str) -> bool:
-        """删除会话文件并逐出缓存；无文件返回 False。"""
+    async def delete_with_reason(self, sid: str) -> str:
+        """删除会话及其训练派生数据，返回可区分的终态。"""
         if not valid_sid(sid):
-            return False
+            return "no_session"
         async with self._lock(sid):
             path = self._path(sid)
             existed = path.is_file()
+            if not existed:
+                return "no_session"
+            if not pilot_flywheel.purge_session(self.base, sid):
+                log_event(logger, f"会话 {sid} 飞轮记录清理失败，已保留会话",
+                          level=logging.WARNING, detail={"会话": sid})
+                return "cleanup_failed"
             try:
-                if existed:
-                    path.unlink()
+                path.unlink()
             except OSError as e:
                 log_event(
                     logger,
@@ -187,10 +225,14 @@ class SessionStore:
                     level=logging.WARNING,
                     detail={"会话": sid, "原因": repr(e)},
                 )
-                return False
+                return "delete_failed"
             self._cache.pop(sid, None)
             self._list_cache.pop(sid, None)
-            return existed
+            return "deleted"
+
+    async def delete(self, sid: str) -> bool:
+        """删除会话与其飞轮影子记录、派生训练文件，并逐出缓存。"""
+        return await self.delete_with_reason(sid) == "deleted"
 
     def title_of(self, state: SessionState) -> str:
         """生效标题：账本 title 行优先，无则首问兜底（旧文件兼容）。"""
@@ -465,7 +507,13 @@ class SessionStore:
             files = sorted(self.base.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
         except OSError:
             return
-        for path in files[: max(0, len(files) - SESSION_MAX_FILES)]:
+        expired = files[: max(0, len(files) - SESSION_MAX_FILES)]
+        for path in expired:
+            sid = path.stem
+            if valid_sid(sid) and not pilot_flywheel.purge_session(self.base, sid):
+                log_event(logger, f"旧会话 {sid} 飞轮记录清理失败，已保留会话",
+                          level=logging.WARNING, detail={"会话": sid})
+                continue
             try:
                 path.unlink()
             except OSError:

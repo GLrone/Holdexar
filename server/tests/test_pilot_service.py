@@ -627,12 +627,35 @@ class TestFallback:
         assert resp["reason"] == "cap_reached"
 
     @pytest.mark.asyncio
+    async def test_general_knowledge_question_uses_llm_without_game_data(self, monkeypatch):
+        _patch_ready(monkeypatch, stream=[("answer", "苏格拉底是古希腊哲学家。"), ("usage", (8, 5))])
+        events = [event async for event in service.ask_stream("苏格拉底是谁？")]
+        done = next(event for event in events if event["type"] == "done")
+
+        assert done["source"] == "llm"
+        assert done["answer"] == "苏格拉底是古希腊哲学家。"
+        assert not any(event["type"] == "tool_start" for event in events)
+
+    @pytest.mark.asyncio
     async def test_llm_failure_degrades_to_facts(self, monkeypatch):
         _patch_ready(monkeypatch, fail=True)
         monkeypatch.setattr(service.pilot_tools, "price_facts", _async_return(dict(_FACTS)))
         resp = await service.ask("这游戏值不值得入手", appid=1)
         assert resp["source"] == "facts"
         assert resp["reason"] == "llm_failed"
+
+    @pytest.mark.asyncio
+    async def test_llm_failure_diagnostic_reaches_done_and_session(self, monkeypatch):
+        _patch_ready(monkeypatch, fail=True)
+        events = [event async for event in service.ask_stream(
+            "苏格拉底是谁？", session_id="s-llm-diagnostic")]
+        done = next(event for event in events if event["type"] == "done")
+
+        assert done["reason"] == "llm_failed"
+        assert done["diagnostic"]["message"] == "boom"
+        assert done["diagnostic"]["id"]
+        state = await service.get_store().load("s-llm-diagnostic")
+        assert state.turns[0]["resp"]["diagnostic"] == done["diagnostic"]
 
     @pytest.mark.asyncio
     async def test_guide(self, monkeypatch):
@@ -683,11 +706,12 @@ class TestFlywheel:
         _patch_ready(monkeypatch, cfg={**_CFG, "enabled": False})
         monkeypatch.setattr(service, "resolve_data_dir", lambda: tmp_path)
         monkeypatch.setattr(service.pilot_tools, "search_games", _async_return([]))
-        await service.ask("今天天气怎么样", session_id="s-log")
+        resp = await service.ask("今天天气怎么样", session_id="s-log")
         log = tmp_path / "pilot" / "decisions.jsonl"
         assert log.is_file()
         entry = json.loads(log.read_text(encoding="utf-8").splitlines()[-1])
         assert entry["question"] == "今天天气怎么样"
+        assert resp["turn_id"] == entry["tid"]
         assert entry["intent"] == pilot_intent.CHAT
         assert entry["mode"] == "fallback"
 
@@ -2846,3 +2870,140 @@ class TestDeterministicPrefetch:
         assert seen_tools and seen_tools[0]  # 工具表仍在场
         names = [e["name"] for e in events if e["type"] == "tool_start"]
         assert names and names[0] == "get_price_briefing"
+
+
+class TestEmptyStreakBreaker:
+    """连续空结果熔断：搜索类工具反复空返回时强制收敛，避免步数耗尽交白卷。"""
+
+    @pytest.mark.asyncio
+    async def test_empty_streak_injects_convergence_note(self, monkeypatch):
+        seen_notes = []
+        rounds = {"n": 0}
+        # 前 4 轮各调一次 web_search（返回空），第 5 轮给终答
+        scripts = [[("tool_calls", [{"id": f"t{i}", "name": "web_search",
+                                     "arguments": {"query": f"q{i}"}}])] for i in range(4)]
+        scripts.append([("answer", "没查到相关数据，建议去对应页面看看。")])
+
+        async def _rounds(**kw):
+            for m in kw["messages"]:
+                c = m.get("content")
+                if isinstance(c, str) and "连续" in c and "没有返回有效数据" in c:
+                    seen_notes.append(c)
+            for item in scripts[min(rounds["n"], len(scripts) - 1)]:
+                yield item
+            rounds["n"] += 1
+
+        _patch_ready(monkeypatch)
+        monkeypatch.setattr(service.pilot_llm, "chat_stream", _rounds)
+
+        async def _empty(name, arguments, guarded=False, sid=None):
+            return {"kind": "rows", "titleKey": "web", "rows": []}
+
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _empty)
+        events = [e async for e in service.ask_stream("某个冷门问题", session_id="s-empty")]
+        assert seen_notes, "连续空结果应注入收敛提醒"
+        done = events[-1]
+        assert done["type"] == "done" and done["answer"]
+
+    @pytest.mark.asyncio
+    async def test_nonempty_result_resets_streak(self, monkeypatch):
+        seen_notes = []
+        rounds = {"n": 0}
+        scripts = [
+            [("tool_calls", [{"id": "t1", "name": "web_search", "arguments": {"query": "a"}}])],
+            [("tool_calls", [{"id": "t2", "name": "web_search", "arguments": {"query": "b"}}])],
+            [("answer", "找到了：结论如下。")],
+        ]
+
+        async def _rounds(**kw):
+            for m in kw["messages"]:
+                c = m.get("content")
+                if isinstance(c, str) and "没有返回有效数据" in c:
+                    seen_notes.append(c)
+            for item in scripts[min(rounds["n"], len(scripts) - 1)]:
+                yield item
+            rounds["n"] += 1
+
+        _patch_ready(monkeypatch)
+        monkeypatch.setattr(service.pilot_llm, "chat_stream", _rounds)
+
+        async def _mix(name, arguments, guarded=False, sid=None):
+            if arguments.get("query") == "a":
+                return {"kind": "rows", "titleKey": "web", "rows": []}
+            return {"kind": "rows", "titleKey": "web", "rows": [{"k": "hit", "v": "x"}]}
+
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _mix)
+        events = [e async for e in service.ask_stream("问题", session_id="s-reset")]
+        assert not seen_notes, "中间有非空结果应重置连击，不触发熔断"
+        assert events[-1]["type"] == "done"
+
+
+class TestMaxStepsFallback:
+    """步数耗尽兜底：跑过工具却未走终答轮时，禁工具再要一次总结，避免白卷。"""
+
+    @pytest.mark.asyncio
+    async def test_exhausted_loop_produces_fallback_summary(self, monkeypatch):
+        rounds = {"n": 0}
+        calls = {"tools": 0}
+
+        async def _rounds(**kw):
+            # 每次都要求调工具，永不给终答——模拟步数耗尽
+            if kw.get("tools") is None:
+                # 兜底调用：无工具表，产出总结
+                yield ("answer", "综合已查到的数据，结论如下：暂无可推荐项。")
+                return
+            rounds["n"] += 1
+            yield ("tool_calls", [{"id": f"t{rounds['n']}", "name": "web_search",
+                                   "arguments": {"query": f"q{rounds['n']}"}}])
+
+        _patch_ready(monkeypatch)
+        monkeypatch.setattr(service.pilot_llm, "chat_stream", _rounds)
+
+        async def _ok(name, arguments, guarded=False, sid=None):
+            calls["tools"] += 1
+            return {"kind": "rows", "titleKey": "web", "rows": [{"k": "x", "v": "y"}]}
+
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _ok)
+        events = [e async for e in service.ask_stream("一直查不到的问题", session_id="s-max")]
+        done = events[-1]
+        assert done["type"] == "done"
+        assert done["answer"].strip(), "步数耗尽应有兜底总结，不交白卷"
+        assert done["reason"] is None, "兜底产出正文后不应记为 max_steps"
+
+
+class TestTruncationGuard:
+    def test_mid_clause_detection(self):
+        assert service._ends_mid_clause("根据数据，10月10") is True
+        assert service._ends_mid_clause("结论：值得等史低。") is False
+        assert service._ends_mid_clause("好了") is False
+
+    def test_looks_truncated_needs_tool_and_mid_clause(self):
+        assert service._looks_truncated("根据系统侧同步的价格事件数据，10月10", 1, []) is True
+        assert service._looks_truncated("结论：值得。", 1, []) is False   # 完整短句
+        assert service._looks_truncated("10月10", 0, []) is False        # 无工具结果不判
+
+
+class TestPrefetchFreeWordTightening:
+    """免费游戏预取：'白嫖' 单独出现不再触发（闲聊里常见），须与游戏词同现。"""
+
+    @pytest.mark.asyncio
+    async def test_bare_baipiao_does_not_prefetch(self, monkeypatch):
+        executed = []
+        _patch_ready(monkeypatch, stream=[("answer", "这属于人际沟通问题。")])
+        monkeypatch.setattr(service.pilot_tools, "execute_tool",
+                            _tool_stub(executed, _FACTS))
+        events = [e async for e in service.ask_stream(
+            "为什么对方说我要白嫖然后拉黑我？", session_id="s-bp")]
+        assert not executed, "'白嫖'单独出现不应预取免费游戏"
+        assert events[-1]["type"] == "done"
+
+    @pytest.mark.asyncio
+    async def test_baipiao_with_game_word_prefetches(self, monkeypatch):
+        executed = []
+        _patch_ready(monkeypatch, stream=[("answer", "本期可领的免费游戏如下。")])
+        monkeypatch.setattr(service.pilot_tools, "execute_tool",
+                            _tool_stub(executed, _FACTS))
+        events = [e async for e in service.ask_stream(
+            "有什么白嫖游戏可以领", session_id="s-bp2")]
+        assert executed, "'白嫖'+游戏词应预取免费游戏"
+        assert events[-1]["type"] == "done"

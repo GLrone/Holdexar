@@ -1,6 +1,8 @@
 """pilot 域请求/响应模型。"""
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -201,6 +203,13 @@ class PilotRewindOut(BaseModel):
     """机器码（前端翻用户语言）：no_session / busy / write_failed。"""
 
 
+class PilotErrorDiagnostic(BaseModel):
+    id: str
+    code: str
+    message: str
+    status_code: int | None = None
+
+
 class AskResponse(BaseModel):
     answer: str
     """推理模型的思维链原文（reasoning_content）；普通模型或降级路径为 null。"""
@@ -208,7 +217,9 @@ class AskResponse(BaseModel):
     think_ms: int | None = None
     """思考工时（毫秒，思考通道活跃墙钟时间累计）；无思考/降级轮为 null。"""
     source: str
+    turn_id: str | None = None
     reason: str | None = None
+    diagnostic: PilotErrorDiagnostic | None = None
     facts: dict | None = None
     """本轮工具取到的结构化卡片（games / price / action），供前端组件渲染。"""
     attachments: list = []
@@ -333,6 +344,18 @@ class PilotSessionTurn(BaseModel):
     q: str
     resp: AskResponse
     ts: str | None = None
+    tid: str | None = None
+    feedback: Literal["accepted", "rejected"] | None = None
+
+
+class PilotTurnFeedbackRequest(BaseModel):
+    feedback: Literal["accepted", "rejected"]
+
+
+class PilotTurnFeedbackOut(BaseModel):
+    ok: bool
+    feedback: Literal["accepted", "rejected"] | None = None
+    reason: str | None = None
 
 
 class PilotProposalState(BaseModel):
@@ -408,3 +431,45 @@ class ToolRunRequest(BaseModel):
 class ToolRunResponse(BaseModel):
     step: dict
     cards: list = []
+
+
+class PilotFlywheelIntentStat(BaseModel):
+    """单个意图的反馈分布。"""
+    intent: str
+    total: int = 0
+    accepted: int = 0
+    rejected: int = 0
+    failed: int = 0
+    empty: int = 0
+    unlabeled: int = 0
+
+
+class PilotFlywheelStats(BaseModel):
+    """决策飞轮画像：每轮问答的意图 × 反馈标签折叠（读侧现算，不落独立账本）。"""
+    total: int = 0
+    """决策日志总轮数。"""
+    labeled: int = 0
+    """可判定运行结果或已明确评价的轮数。"""
+    unlabeled: int = 0
+    rejected_rate: float | None = None
+    """不满意率 = rejected / (accepted + rejected)；无明确评价时为 null。"""
+    preference_pairs: int = 0
+    """同会话同问下先被否定、后被肯定且内容不同的回答对数。"""
+    by_feedback: dict[str, int] = {}
+    by_intent: list[PilotFlywheelIntentStat] = []
+    by_mode: dict[str, int] = {}
+    by_source: dict[str, int] = {}
+
+
+class PilotFlywheelExportOut(BaseModel):
+    """可训数据集导出结果。"""
+    ok: bool
+    count: int = 0
+    """写出的可训样本条数（意图在词表内且问句非空的行）。"""
+    preference_count: int = 0
+    """写出的真实回答偏好对数量。"""
+    path: str | None = None
+    preference_path: str | None = None
+    reason: str | None = None
+    """机器码：write_failed。"""
+    stats: PilotFlywheelStats | None = None

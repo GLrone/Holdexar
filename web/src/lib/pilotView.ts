@@ -41,6 +41,16 @@ export function sessionTime(iso: string | null | undefined): string {
 
 export const ANSWER_CLAMP_CHARS = 700
 
+/** 可评价的回答需要有对应会话轮次，并实际展示正文、卡片或步骤。 */
+export function canRateTurn(turn: {
+  tid?: string | null
+  text?: string | null
+  cards?: readonly unknown[] | null
+  steps?: readonly unknown[] | null
+}): boolean {
+  return Boolean(turn.tid && (turn.text?.trim() || turn.cards?.length || turn.steps?.length))
+}
+
 /** 长回答判定：正文字符数超过阈值 */
 export function isLongAnswerText(text: string | null | undefined): boolean {
   return (text?.length ?? 0) > ANSWER_CLAMP_CHARS
@@ -50,6 +60,7 @@ export function isLongAnswerText(text: string | null | undefined): boolean {
 export const ERROR_REASON_KEYS = new Set([
   'pilot.error',
   'pilot.reason.llm_failed',
+  'pilot.reason.llm_failed_empty',
   'pilot.reason.busy',
   'pilot.reason.too_long',
   'pilot.reason.cap_reached',
@@ -59,5 +70,9 @@ export const ERROR_REASON_KEYS = new Set([
 export function isErrorReason(reasonKey: string | null | undefined): boolean {
   if (!reasonKey) return false
   return ERROR_REASON_KEYS.has(reasonKey)
+}
+
+export function isEmptyLlmFailure(reason: string | null | undefined, source: string | null | undefined): boolean {
+  return reason === 'llm_failed' && source === 'none'
 }
 

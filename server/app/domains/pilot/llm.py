@@ -26,11 +26,12 @@ from __future__ import annotations
 
 import json
 import logging
+from uuid import uuid4
 from urllib.parse import urlsplit
 
 import httpx
 
-from app.core.logging import log_event
+from app.core.logging import log_event, redact
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,39 @@ DEFAULT_BASE_URL = {
 
 class PilotLlmError(RuntimeError):
     """LLM 调用失败（网络 / 非 2xx / 响应形态不符）。"""
+
+    def __init__(self, message: str, *, code: str = "provider_error",
+                 status_code: int | None = None, diagnostic_id: str | None = None):
+        super().__init__(message)
+        self.code = code
+        self.status_code = status_code
+        self.diagnostic_id = diagnostic_id or uuid4().hex[:12]
+
+    def to_diagnostic(self) -> dict:
+        return {
+            "id": self.diagnostic_id,
+            "code": self.code,
+            "message": redact(str(self))[:400],
+            "status_code": self.status_code,
+        }
+
+
+def _log_provider_failure(protocol: str, error: PilotLlmError) -> None:
+    detail = {
+        "诊断编号": error.diagnostic_id,
+        "模型来源": protocol,
+        "错误类型": error.code,
+        "原因": error.to_diagnostic()["message"],
+    }
+    if error.status_code is not None:
+        detail["HTTP状态"] = error.status_code
+    log_event(
+        logger,
+        "领航员无法完成模型请求",
+        tag="失败",
+        level=logging.ERROR,
+        detail=detail,
+    )
 
 
 def _is_loopback(base_url: str) -> bool:
@@ -509,26 +543,28 @@ async def chat_stream(
 
     client 传入时由调用方持有并关闭（agent 循环多轮共用一个连接池，免每轮
     重新握手）；缺省自建一次性客户端。"""
-    if protocol not in _PARSE:
-        raise PilotLlmError(f"未知协议: {protocol}")
-    url, headers, body = _REQUEST[protocol](base_url, api_key, model, messages, tools)
-    if max_tokens:
-        if protocol == "openai-responses":
-            body["max_output_tokens"] = max_tokens
-        else:
-            body["max_tokens"] = max_tokens
-
-    async def _run(own: httpx.AsyncClient):
-        async with own.stream("POST", url, json=body, headers=headers) as resp:
-            if resp.status_code >= 400:
-                # 响应体截断进异常：网关用 4xx 报真实原因（参数缺失/超窗），
-                # 日志与溢出回收（looks_like_overflow）都依赖这段文本
-                detail = (await resp.aread()).decode("utf-8", errors="replace")[:300]
-                raise PilotLlmError(f"HTTP {resp.status_code}: {detail}")
-            async for event in _PARSE[protocol](resp.aiter_lines()):
-                yield event
-
     try:
+        if protocol not in _PARSE:
+            raise PilotLlmError(f"未知协议: {protocol}", code="unsupported_protocol")
+        url, headers, body = _REQUEST[protocol](base_url, api_key, model, messages, tools)
+        if max_tokens:
+            if protocol == "openai-responses":
+                body["max_output_tokens"] = max_tokens
+            else:
+                body["max_tokens"] = max_tokens
+
+        async def _run(own: httpx.AsyncClient):
+            async with own.stream("POST", url, json=body, headers=headers) as resp:
+                if resp.status_code >= 400:
+                    detail = (await resp.aread()).decode("utf-8", errors="replace")[:300]
+                    raise PilotLlmError(
+                        f"HTTP {resp.status_code}: {detail}",
+                        code="provider_http_error",
+                        status_code=resp.status_code,
+                    )
+                async for event in _PARSE[protocol](resp.aiter_lines()):
+                    yield event
+
         if client is not None:
             async for event in _run(client):
                 yield event
@@ -536,15 +572,21 @@ async def chat_stream(
             async with http_client(base_url) as own:
                 async for event in _run(own):
                     yield event
-    except (httpx.HTTPError, TypeError, ValueError) as e:
-        log_event(
-            logger,
-            f"模型来源「{protocol}」的流式调用失败",
-            level=logging.WARNING,
-            detail={"模型来源": protocol, "原因": repr(e)},
-        )
-        # 超时异常 str 为空，回落类名，避免上层拿到空白诊断
-        raise PilotLlmError(str(e) or type(e).__name__) from e
+    except PilotLlmError as e:
+        _log_provider_failure(protocol, e)
+        raise
+    except Exception as e:  # noqa: BLE001 — 协议解析与网络边界统一产出诊断
+        if isinstance(e, (httpx.TimeoutException, TimeoutError)):
+            code = "provider_timeout"
+        elif isinstance(e, httpx.HTTPError):
+            code = "provider_network_error"
+        elif isinstance(e, (TypeError, ValueError)):
+            code = "provider_response_error"
+        else:
+            code = "provider_stream_error"
+        wrapped = PilotLlmError(str(e) or type(e).__name__, code=code)
+        _log_provider_failure(protocol, wrapped)
+        raise wrapped from e
 
 
 # ── 服务商智能识别：网址 + 密钥 → 协议 / 服务商 / 可用模型清单 ──────────

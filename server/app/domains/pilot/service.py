@@ -34,6 +34,7 @@ from app.domains.pilot import attachments as pilot_attachments
 from app.domains.pilot import config as pilot_config
 from app.domains.pilot import context as pilot_context
 from app.domains.pilot.decision import DECISION_AGENT, _NON_PRICE_KEYWORDS as _PF_NON_PRICE_WORDS
+from app.domains.pilot import flywheel as pilot_flywheel
 from app.domains.pilot import intent as pilot_intent
 from app.domains.pilot import llm as pilot_llm
 from app.domains.pilot import session as pilot_session
@@ -64,11 +65,42 @@ _NUDGE_STUCK = (
     "先读它。重复同样的调用拿不到新东西：请换参数、换另一个工具、"
     "或者证据已经够了就直接给结论（没有证据的部分如实说没查到）。"
 )
+# 连续空结果熔断：连续这么多次工具返回空/无数据时，回灌提醒强制收敛——
+# 搜索类工具反复空返回时模型会陷入「换词再搜」死循环直到步数耗尽交白卷
+_EMPTY_STREAK_LIMIT = 3
+_NUDGE_EMPTY_STREAK = (
+    "（系统提示）你已经连续 {n} 次调用的工具都没有返回有效数据。"
+    "继续换词重试大概率还是空——请立刻停止检索，基于目前已有的信息给出结论；"
+    "确实查不到的部分，如实告诉用户「没有查到相关数据」，不要编造。"
+)
+# 步数耗尽兜底：已跑过工具却未走终答轮时，禁工具再要一次总结，避免白卷
+_FALLBACK_SUMMARY_PROMPT = (
+    "（系统提示）本轮工具调用已达上限。请立刻基于上面已经拿到的全部工具结果，"
+    "直接输出给用户的最终回答：先给结论，再列依据；没有查到的部分如实说明「未查到」，"
+    "不得编造数据。不要再调用任何工具。"
+)
+# 终答疑似截断：已跑过工具、有卡片可呈现，正文却短到不像完整回答——追问补全一次
+_NUDGE_TRUNCATED = (
+    "（系统提示）你刚才的回答看起来没写完就停了。请接着把结论补完整："
+    "该给的数据/清单/依据要交代清楚，不要停在一句话中间。"
+)
+_TRUNCATED_MIN_CHARS = 40
+
+
+def _ends_mid_clause(body: str) -> bool:
+    """结尾是否明显「说到一半」：以逗号/顿号/数字收尾（正常句子不会这样断）。"""
+    if not body:
+        return False
+    tail = body[-1]
+    return tail in "，,、" or tail.isdigit()
 # 确定性预取：数据型问句在首轮模型请求前先把事实取回来注入，模型一轮直接
 # 综合——省掉「模型选工具→执行→再综合」里第一段等待。关键词只收无歧义形态，
 # 目标解析不唯一即弃权交还 agent 循环（低置信不行动）。
 _PREFETCH_REGION_WORDS = ("全区", "各区", "哪个区", "哪个地区", "各区域", "比价")
-_PREFETCH_FREE_WORDS = ("喜加一", "免费游戏", "免费领", "白嫖", "白送", "限时免费")
+# 免费游戏预取词：只收「明确在问免费游戏」的形态。"白嫖"单独出现太歧义
+# （社会用语/吐槽里常见），必须与游戏词同现才算（见 _prefetch_plan 的合取判据）
+_PREFETCH_FREE_WORDS = ("喜加一", "免费游戏", "免费领", "限时免费", "白送游戏")
+_PREFETCH_FREE_WEAK = ("白嫖",)
 _PREFETCH_CALENDAR_WORDS = ("活动", "日历")
 _PREFETCH_RATES_WORDS = ("汇率",)
 _PREFETCH_NOTE_HEAD = "（系统侧同步·仅供参照）以下是与本轮提问直接对应的实时预取事实（当轮刚取回的真实数据，非缓存、非估计）："
@@ -85,7 +117,7 @@ _RESPONDED_KEYS = ("answer", "thinking", "think_ms", "source", "reason", "facts"
                    "ctx_breakdown", "cache_hit_rate", "attachments", "followups",
                    "usage_in", "usage_out", "cache_read_tokens", "cache_write_tokens", "first_in",
                    "cache_base_tokens", "decode_ms", "decode_out", "ttft_ms", "ttft_n",
-                   "tool_catalog")
+                   "tool_catalog", "diagnostic")
 
 # 只带附件不带提问时的默认问句（附件本体已落盘，模型按引用清单取用）
 _ATTACH_ONLY_QUESTION = "请查看我附带的附件。"
@@ -153,15 +185,32 @@ def _resp_of(result: dict) -> dict:
     return {k: result[k] for k in _RESPONDED_KEYS if k in result}
 
 
-async def _record_turn(state, question: str, result: dict, messages: list[dict] | None = None) -> None:
+async def _record_turn(state, question: str, result: dict, messages: list[dict] | None = None) -> str | None:
+    """落一轮问答，返回该轮的账本 id（决策日志的关联键；无会话态返回 None）。
+
+    关联键用落账时生成的唯一 tid 而非轮次序号或时间戳——序号会被 truncate
+    （编辑重问）让给改后的新轮，时间戳只有秒级精度会同秒碰撞；tid 一旦落定
+    不再改写，弃轮仍能凭它在原始记录里唯一定位（见 flywheel 的反馈投影）。"""
     if state is None:
-        return
-    await get_store().append_turn(state.sid, {
+        return None
+    tid = uuid.uuid4().hex
+    if not await get_store().append_turn(state.sid, {
+        "t": "turn",
+        "tid": tid,
         "q": question,
         "resp": _resp_of(result),
         "messages": messages or [],
         "last_game": state.last_game,
-    })
+    }):
+        return None
+    return tid
+
+
+def _turn_key(state, tid: str | None) -> dict:
+    """决策日志的关联键：有会话态问答带上 sid 与轮次 id，否则两者皆空。"""
+    if state is None or not tid:
+        return {}
+    return {"sid": state.sid, "tid": tid}
 
 def _ctx_breakdown(base: list[dict], state, question: str, appid: int | None,
                    sys_prompt: str | None = None,
@@ -204,7 +253,22 @@ _SYSTEM_PROMPT = (
     "- 日期、价格、折扣、库存、活动场次、账号数据——凡是用户会照着做决定的数字，"
     "必须有工具证据；工具没给就直说「这边没查到」，然后告诉用户去哪能看到。\n"
     "- 严禁按「历年惯例」「通常是」「大概是」补日期和数字。宁可说不知道，也不要给一个像真的错答案。\n"
+    "- 价格、折扣、原价这类数字**照抄工具返回值**，不做四舍五入、不做单位换算、不凭记忆改写。\n"
+    "- **时间校验**：涉及赛事、活动、发售、比赛结果这类有明确时间点的事实，"
+    "先确认它**是否已经发生**。今天之后的赛事/活动**尚未有结果**，一律不得编造冠军、比分、名次。\n"
     "- 工具结果与你原本的判断冲突时，以工具为准，并把冲突讲出来。\n"
+    "\n"
+    "## 折扣口径（易错，务必分清）\n"
+    "- 「一折」= 折扣 90% off（现价为原价的 10%）。\n"
+    "- 「一折以下 / 低于一折」= 折扣**大于** 90% off（现价低于原价的 10%），比一折更狠。\n"
+    "- 「几折」按十位算：五折=50% off、三折=70% off、零点五折=95% off。\n"
+    "- 工具只返回部分结果时，不要说「没有更低的」这种全称断言，"
+    "应说「在我能看到的这些里，最低是 X」，并说明数据可能不全。\n"
+    "\n"
+    "## 什么时候不该调数据工具\n"
+    "- 用户只是在闲聊、吐槽、问游戏怎么玩/剧情/操作/社区现象，或问「为什么别人这样对我」这类"
+    "与价格库存无关的问题时，**不要**去调价格、免费游戏、榜单这类数据工具——直接按常识与已有知识回答。\n"
+    "- 判断标准：用户要的是「某个可查的事实」才查工具；要的是「解释、建议、闲聊」就直接回答。\n"
     "\n"
     "## 遇到没预设过的问题\n"
     "- 你面对的是开放问题，不要自我设限成「只支持某几类」。把问题拆开，"
@@ -243,13 +307,7 @@ def _log_decision(entry: dict) -> None:
     只追加、无读取方、失败静默——飞轮不依赖日志，日志也不阻塞问答。
     数据供未来自训决策引擎做意图标注与动作结果回归。
     """
-    try:
-        base = resolve_data_dir() / "pilot"
-        base.mkdir(parents=True, exist_ok=True)
-        with (base / "decisions.jsonl").open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except OSError:
-        pass
+    pilot_flywheel.append_decision(resolve_data_dir() / "pilot" / "sessions", entry)
 
 
 def _empty(source: str, reason: str | None, facts: dict | None) -> dict:
@@ -326,6 +384,34 @@ async def _fallback_deterministic(
             return _empty("none", "no_data", None)
         return _empty("facts", None, {"kind": "games", "items": items})
     return _empty("none", "llm_off", None)
+
+
+def _looks_truncated(text: str, tools_ran: int, cards: list[dict]) -> bool:
+    """终答是否疑似截断：已跑过工具/有卡片，正文短**且以逗号或数字收尾**。
+
+    只认「明显说到一半」的结尾（逗号/顿号/数字），不看长度单条件——否则
+    「结论：值得等史低。」这类简短完整回答会被误伤、多跑一轮。"""
+    body = text.strip()
+    if not body or (tools_ran == 0 and not cards):
+        return False
+    return len(body) < _TRUNCATED_MIN_CHARS and _ends_mid_clause(body)
+
+
+def _is_empty_result(result: dict) -> bool:
+    """工具结果是否「无有效数据」：空态、失败、超时、拒绝、零命中。
+
+    用于连续空结果熔断——搜索类工具反复返回 0 命中时，模型会陷入换词重搜
+    的死循环直到步数耗尽交白卷（D1 根因）。"""
+    kind = result.get("kind")
+    if kind in ("empty", "failed", "timeout", "denied", "unknown_tool", "not_found"):
+        return True
+    if kind == "rows":
+        return not (result.get("rows") or [])
+    if kind in ("games", "compare"):
+        return not (result.get("items") or [])
+    if kind == "epic":
+        return not (result.get("offers") or result.get("mobile"))
+    return False
 
 
 def _tool_summary(name: str, result: dict) -> str:
@@ -592,7 +678,9 @@ async def _prefetch_plan(question: str, appid: int | None, state, intent: str) -
         if region_ask:
             return ([("get_region_prices", {"appid": target})], force)
         return ([("get_price_briefing", {"appid": target})], force)
-    if any(w in q for w in _PREFETCH_FREE_WORDS):
+    if any(w in q for w in _PREFETCH_FREE_WORDS) or (
+            any(w in q for w in _PREFETCH_FREE_WEAK)
+            and any(w in q for w in ("游戏", "steam", "epic", "领", "入库"))):
         return ([("epic_free", {}), ("steam_free", {})], pure_ask)
     if any(w in q for w in _PREFETCH_CALENDAR_WORDS):
         return ([("calendar_events", {})], pure_ask)
@@ -1035,7 +1123,10 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
         stuck_nudged = False
         _stuck_repeats = 0
         _last_call_signature = ""
+        empty_streak = 0
+        empty_streak_nudged = False
         tools_ran = 0
+        exhausted = True  # 循环因步数耗尽退出（正常终答 break 时置 False）
         while step < _MAX_STEPS:
             phase = {"step": step + 1, "thinking": [], "text": [], "steps": [],
                      "cards": [], "think_ms": 0.0, "truncated": False, "terminal": False}
@@ -1150,6 +1241,9 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
                     elif (tools_ran == 0 and intent in _DATA_INTENTS
                           and any(w in text for w in _ANNOUNCE_WORDS)):
                         nudge = {"role": "system", "content": _NUDGE_ANNOUNCED}
+                    elif _looks_truncated(text, tools_ran, cards):
+                        # 终答过短却有工具结果/卡片：像是话说到一半断了，追问一次补全
+                        nudge = {"role": "system", "content": _NUDGE_TRUNCATED}
                     else:
                         nudge = None
                     if nudge is not None:
@@ -1161,6 +1255,7 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
                 phase["terminal"] = True
                 messages.append(assistant)
                 new_msgs.append(assistant)
+                exhausted = False
                 break
 
             # 模型要求调工具：assistant 消息（含 tool_calls）入列，执行后回灌
@@ -1202,7 +1297,7 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
 
             async def _emit_result(t: dict, result: dict, duration_ms: int):
                 """工具结果结算（时间线 + 卡片裁决 + 回灌消息）——顺序/并行两路共用。"""
-                nonlocal last_game
+                nonlocal last_game, empty_streak, empty_streak_nudged
                 step_data = pilot_tools.tool_step(t["name"], result)
                 # tool_start 已声明运行态占位，结算按声明序原位回填；无占位时兜底追加
                 pending = next((s for s in phase["steps"] if s.get("status") == "running"), None)
@@ -1211,6 +1306,18 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
                 else:
                     phase["steps"].append(step_data)
                 tool_log.append(_tool_summary(t["name"], result))
+                # 连续空结果熔断：累加空/无数据返回的连击，达上限回灌收敛提醒（一次）
+                if _is_empty_result(result):
+                    empty_streak += 1
+                    if (not empty_streak_nudged and empty_streak >= _EMPTY_STREAK_LIMIT
+                            and step < _MAX_STEPS):
+                        empty_streak_nudged = True
+                        note = {"role": "system",
+                                "content": _NUDGE_EMPTY_STREAK.format(n=empty_streak)}
+                        messages.append(note)
+                        new_msgs.append(note)
+                else:
+                    empty_streak = 0
                 yield {"type": "tool", "name": t["name"], "duration_ms": duration_ms, **step_data}
                 # card 结算帧：内部决策代理统一裁决是否下发可视化卡片
                 base_card = _card_of(t["name"], result)
@@ -1373,6 +1480,33 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
                 duration_ms = int((time.monotonic() - started_at) * 1000)
                 async for frame in _emit_result(t, result, duration_ms):
                     yield frame
+
+        # 步数耗尽兜底：已跑过工具却未走终答轮时，禁工具再要一次总结——
+        # 避免「调了一堆工具却交白卷」（D1 空回答的另一形态）。这次调用不计步数、
+        # 不带工具表，模型只能基于已有工具结果作答
+        summary_diagnostic: dict | None = None
+        if exhausted and tools_ran > 0:
+            phase = {"step": step + 1, "thinking": [], "text": [], "steps": [],
+                     "cards": [], "think_ms": 0.0, "truncated": False, "terminal": True}
+            phases.append(phase)
+            yield {"type": "step_start", "step": phase["step"]}
+            messages.append({"role": "system", "content": _FALLBACK_SUMMARY_PROMPT})
+            try:
+                async for kind, delta in pilot_llm.chat_stream(
+                    protocol=cfg["protocol"], base_url=base_url, api_key=cfg["api_key"],
+                    model=cfg["model"], messages=messages, tools=None, client=client,
+                ):
+                    if kind == "thinking":
+                        phase["thinking"].append(delta)
+                        yield {"type": "thinking", "delta": delta}
+                    elif kind == "answer":
+                        phase["text"].append(delta)
+                        yield {"type": "answer", "delta": delta}
+                    elif kind == "usage":
+                        usage_total[0] += delta[0]
+                        usage_total[1] += delta[1]
+            except pilot_llm.PilotLlmError as e:
+                summary_diagnostic = e.to_diagnostic()
     finally:
         # 流被中断（客户端断开 / 服务端取消）时在飞工具一并取消，不留后台孤儿
         if inflight is not None and not inflight.done():
@@ -1383,9 +1517,11 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
         await client.aclose()
 
     _think_close()
-    # 步数上限耗尽（未走终答轮）：明确归因，前端翻成用户语言——不再静默交白卷
-    if not (phases and phases[-1].get("terminal")):
-        reason = "max_steps"
+    # 步数耗尽且兜底也没产出正文：明确归因，前端翻成用户语言——不静默交白卷
+    if exhausted:
+        tail_text = "".join(phases[-1].get("text") or []) if phases else ""
+        if not tail_text.strip():
+            reason = "max_steps"
     for phase in phases:
         phase["thinking"] = "".join(phase["thinking"])
         phase["text"] = "".join(phase["text"])
@@ -1442,6 +1578,7 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
         **({"followups": _followups} if _followups else {}),
         # 本轮新增消息（会话入账用）；ask_stream 在下发前摘除，不进 SSE
         "turn_messages": new_msgs,
+        **({"diagnostic": summary_diagnostic} if summary_diagnostic else {}),
     }
 
 
@@ -1701,6 +1838,48 @@ def session_stats(state) -> dict:
     }
 
 
+def _flywheel_stats_out(stats: dict) -> dict:
+    """统计投影 → 接口形态：by_intent 从 {intent: {label: n}} 摊平成行表。"""
+    return {
+        "total": stats["total"], "labeled": stats["labeled"],
+        "unlabeled": stats["unlabeled"], "rejected_rate": stats["rejected_rate"],
+        "preference_pairs": stats["preference_pairs"], "by_feedback": stats["by_feedback"],
+        "by_intent": [{"intent": k, "total": v.get("total", 0),
+                       "accepted": v.get("accepted", 0), "rejected": v.get("rejected", 0),
+                       "failed": v.get("failed", 0), "empty": v.get("empty", 0),
+                       "unlabeled": v.get("unlabeled", 0)}
+                      for k, v in sorted(stats["by_intent"].items())],
+        "by_mode": stats["by_mode"], "by_source": stats["by_source"],
+    }
+
+
+def build_flywheel() -> dict:
+    """决策飞轮投影：决策日志 × 会话账本反馈 → 数据行 + 画像 + 可训样本。
+
+    读取侧现算（输入只有两份既有事实文件），不落独立账本——用户评价由会话
+    账本记录，失败与空答按本轮实际结果归类。"""
+    store = get_store()
+    built = pilot_flywheel.build(store.base, raw_records=store.raw_records)
+    built["stats"] = _flywheel_stats_out(built["stats"])
+    return built
+
+
+def export_flywheel() -> dict:
+    """导出本地意图分类数据与真实问答偏好对（均为覆盖写派生投影）。"""
+    store = get_store()
+    result = pilot_flywheel.export(store.base, raw_records=store.raw_records)
+    if result.get("stats"):
+        result["stats"] = _flywheel_stats_out(result["stats"])
+    return result
+
+
+async def rate_turn(sid: str, tid: str, feedback: str) -> dict:
+    """记录用户对已存在回答的明确评价。"""
+    reason = await get_store().set_turn_feedback(sid, tid, feedback)
+    return {"ok": reason is None, "feedback": feedback if reason is None else None,
+            "reason": reason}
+
+
 async def run_tool(name: str, *, label: str, session_id: str | None) -> dict:
     """快捷动作直达：+ 菜单点选 → 确定性工具执行，不经模型。
 
@@ -1715,10 +1894,11 @@ async def run_tool(name: str, *, label: str, session_id: str | None) -> dict:
     cards = [card] if card else []
     resp = {"answer": "", "thinking": None, "source": "facts", "reason": None,
             "facts": None, "cards": cards, "steps": [step], "cached": False}
-    await _record_turn(state, label, resp)
+    turn = await _record_turn(state, label, resp)
     _log_decision({"ts": get_beijing_time_obj().isoformat(timespec="seconds"),
                    "question": label, "intent": "quick", "mode": "quick",
-                   "source": "facts", "reason": None, "tool": name, "cached": False})
+                   "source": "facts", "reason": None, "tool": name, "cached": False,
+                   **_turn_key(state, turn)})
     return {"step": step, "cards": cards}
 
 
@@ -1726,50 +1906,62 @@ async def ask(question: str, appid: int | None = None, session_id: str | None = 
               reference_sid: str | None = None, resume: dict | None = None,
               attachments: list[str] | None = None,
               view_context: dict | None = None,
-             element_refs: list[dict] | None = None) -> dict:
-    """非流式入口（SSE 之外的消费形态 / 测试用）。"""
+             element_refs: list[dict] | None = None,
+             probe: bool = False) -> dict:
+    """非流式入口（SSE 之外的消费形态 / 测试用）。
+
+    probe=True 为合成探针（社区素材回灌）：不写会话账本（不传 session_id 即
+    天然如此），且不落决策日志——探针问句来自社区而非真实用户，混进
+    decisions.jsonl 会污染决策飞轮的银标签。"""
     q = (question or "").strip()
     if not q and not attachments:
         raise ValueError("empty question")
     state = await get_store().load_or_new(session_id) if session_id else None
     intent = pilot_intent.route(q)
 
+    def _log(entry: dict) -> None:
+        if not probe:
+            _log_decision(entry)
+
     nav_target = pilot_intent.nav_target(q)
     if intent == pilot_intent.NAVIGATE and nav_target:
         resp = await _navigate_direct(nav_target)
-        await _record_turn(state, q, resp)
+        turn = await _record_turn(state, q, resp)
+        resp["turn_id"] = turn
         resp["title"] = get_store().title_of(state) if state else None
-        _log_decision({"ts": get_beijing_time_obj().isoformat(timespec="seconds"),
-                       "question": q, "intent": intent, "mode": "direct",
-                       "source": resp["source"], "reason": None, "tools": resp["tools"],
-                       "cached": False, "appid": appid, "nav_target": nav_target,
-                       "reference_sid": reference_sid})
+        _log({"ts": get_beijing_time_obj().isoformat(timespec="seconds"),
+              "question": q, "intent": intent, "mode": "direct",
+              "source": resp["source"], "reason": None, "tools": resp["tools"],
+              "cached": False, "appid": appid, "nav_target": nav_target,
+              "reference_sid": reference_sid, **_turn_key(state, turn)})
         return {**resp, "cached": False}
 
     cfg = await pilot_config.load_config()
     if not pilot_config.llm_ready(cfg):
         resp = await _fallback_deterministic(q, appid, state, intent)
-        await _record_turn(state, q, resp)
+        turn = await _record_turn(state, q, resp)
+        resp["turn_id"] = turn
         resp["title"] = get_store().title_of(state) if state else None
-        _log_decision({"ts": get_beijing_time_obj().isoformat(timespec="seconds"),
-                       "question": q, "intent": intent, "mode": "fallback",
-                       "source": resp["source"], "reason": resp["reason"], "cached": False,
-                       "appid": appid, "reference_sid": reference_sid})
+        _log({"ts": get_beijing_time_obj().isoformat(timespec="seconds"),
+              "question": q, "intent": intent, "mode": "fallback",
+              "source": resp["source"], "reason": resp["reason"], "cached": False,
+              "appid": appid, "reference_sid": reference_sid, **_turn_key(state, turn)})
         return {**resp, "cached": False}
     if pilot_config.over_cap(await pilot_config.usage_month(), cfg["monthly_cap"]):
         resp = await _fallback_deterministic(q, appid, state, intent)
         resp["reason"] = "cap_reached" if resp["source"] != "guide" else resp["reason"]
-        await _record_turn(state, q, resp)
+        turn = await _record_turn(state, q, resp)
+        resp["turn_id"] = turn
         resp["title"] = get_store().title_of(state) if state else None
-        _log_decision({"ts": get_beijing_time_obj().isoformat(timespec="seconds"),
-                       "question": q, "intent": intent, "mode": "fallback",
-                       "source": resp["source"], "reason": resp["reason"], "cached": False,
-                       "appid": appid, "reference_sid": reference_sid})
+        _log({"ts": get_beijing_time_obj().isoformat(timespec="seconds"),
+              "question": q, "intent": intent, "mode": "fallback",
+              "source": resp["source"], "reason": resp["reason"], "cached": False,
+              "appid": appid, "reference_sid": reference_sid, **_turn_key(state, turn)})
         return {**resp, "cached": False}
     result: dict | None = None
     async for event in ask_stream(q, appid, session_id, reference_sid, resume, attachments,
                                    view_context=view_context,
-                                  element_refs=element_refs):
+                                  element_refs=element_refs, probe=probe):
         if event["type"] == "done":
             result = event
         elif event["type"] == "busy":
@@ -1789,13 +1981,15 @@ async def ask_stream(question: str, appid: int | None = None, session_id: str | 
                      reference_sid: str | None = None, resume: dict | None = None,
                      attachments: list[str] | None = None,
                      view_context: dict | None = None,
-                  element_refs: list[dict] | None = None):
+                  element_refs: list[dict] | None = None,
+                  probe: bool = False):
     """流式编排入口：在飞登记 + busy 防护 + 受理回执（编排本体见 _ask_stream_body）。
 
     在 _ask_stream_body 事件形态之上新增：
     {"type": "ack", "active": int}  受理回执（active = 全局在飞轮数，含本轮）；
     {"type": "busy"}                同会话已有轮在处理中，本轮未受理。
-    """
+
+    probe=True 为合成探针：不落决策日志（见 ask 的同名说明）。"""
     q = (question or "").strip()
     if not q and not attachments:
         yield {"type": "error", "reason": "bad_request"}
@@ -1810,7 +2004,7 @@ async def ask_stream(question: str, appid: int | None = None, session_id: str | 
         yield {"type": "ack", "active": sum(_INFLIGHT_TURNS.values())}
         async for event in _ask_stream_body(q, appid, session_id, reference_sid, resume, attachments,
                                              view_context=view_context,
-                                  element_refs=element_refs):
+                                  element_refs=element_refs, probe=probe):
             yield event
     finally:
         if sid:
@@ -1825,7 +2019,8 @@ async def _ask_stream_body(question: str, appid: int | None = None, session_id: 
                            reference_sid: str | None = None, resume: dict | None = None,
                            attachments: list[str] | None = None,
                            view_context: dict | None = None,
-                  element_refs: list[dict] | None = None):
+                  element_refs: list[dict] | None = None,
+                  probe: bool = False):
     """流式编排本体。事件形态：
     {"type": "step_start", "step": int} 进入第几步（阶段边界）；
     {"type": "thinking" | "answer", "delta": str} 增量（归属当前步所在阶段）；
@@ -1839,7 +2034,8 @@ async def _ask_stream_body(question: str, appid: int | None = None, session_id: 
         （phases = 按步分段的思考/前言/工具；steps = 由 phases 展平的时间线全量）；
     {"type": "error", "reason": str} 前置异常。
 
-    每轮终态落会话账本（session.append_turn），重启后可续。"""
+    每轮终态落会话账本（session.append_turn），重启后可续。probe=True 时不落
+    决策日志（合成探针不污染决策飞轮）。"""
     q = (question or "").strip()
     if not q and not attachments:
         yield {"type": "error", "reason": "bad_request"}
@@ -1852,6 +2048,10 @@ async def _ask_stream_body(question: str, appid: int | None = None, session_id: 
         q = _ATTACH_ONLY_QUESTION
     intent = pilot_intent.route(q)
 
+    def _log(entry: dict) -> None:
+        if not probe:
+            _log_decision(entry)
+
     # 导航直通：动词+页面别名命中即执行，不过模型（LLM 关闭/超限同样生效）
     nav_target = pilot_intent.nav_target(q)
     if intent == pilot_intent.NAVIGATE and nav_target:
@@ -1859,13 +2059,14 @@ async def _ask_stream_body(question: str, appid: int | None = None, session_id: 
         step = resp["steps"][0]
         yield {"type": "tool_start", "name": "navigate", "label": step["label"]}
         yield {"type": "tool", "name": "navigate", **step}
-        await _record_turn(state, q, resp)
+        turn = await _record_turn(state, q, resp)
+        resp["turn_id"] = turn
         resp["title"] = get_store().title_of(state) if state else None
-        _log_decision({"ts": get_beijing_time_obj().isoformat(timespec="seconds"),
-                       "question": q, "intent": intent, "mode": "direct",
-                       "source": resp["source"], "reason": None, "tools": resp["tools"],
-                       "cached": False, "appid": appid, "nav_target": nav_target,
-                       "reference_sid": reference_sid})
+        _log({"ts": get_beijing_time_obj().isoformat(timespec="seconds"),
+              "question": q, "intent": intent, "mode": "direct",
+              "source": resp["source"], "reason": None, "tools": resp["tools"],
+              "cached": False, "appid": appid, "nav_target": nav_target,
+              "reference_sid": reference_sid, **_turn_key(state, turn)})
         yield {"type": "done", "q": q, **resp}
         return
 
@@ -1880,12 +2081,13 @@ async def _ask_stream_body(question: str, appid: int | None = None, session_id: 
         resp["cards"] = [resp["facts"]] if resp.get("facts") else []
         if att_refs:
             resp["attachments"] = att_refs
-        await _record_turn(state, q, resp)
+        turn = await _record_turn(state, q, resp)
+        resp["turn_id"] = turn
         resp["title"] = get_store().title_of(state) if state else None
-        _log_decision({"ts": get_beijing_time_obj().isoformat(timespec="seconds"),
-                       "question": q, "intent": intent, "mode": "fallback",
-                       "source": resp["source"], "reason": resp["reason"], "cached": False,
-                       "appid": appid, "reference_sid": reference_sid})
+        _log({"ts": get_beijing_time_obj().isoformat(timespec="seconds"),
+              "question": q, "intent": intent, "mode": "fallback",
+              "source": resp["source"], "reason": resp["reason"], "cached": False,
+              "appid": appid, "reference_sid": reference_sid, **_turn_key(state, turn)})
         yield {"type": "done", "q": q, **resp}
         return
 
@@ -1919,23 +2121,27 @@ async def _ask_stream_body(question: str, appid: int | None = None, session_id: 
                 result = event
                 continue
             yield event
-    except pilot_llm.PilotLlmError:
+    except pilot_llm.PilotLlmError as error:
+        diagnostic = error.to_diagnostic()
         # 循环内已流出的内容不收回；无流出时降级为确定性事实
         if result is None:
             resp = await _fallback_deterministic(q, appid, state, intent)
             resp["reason"] = "llm_failed" if resp["source"] != "guide" else resp["reason"]
+            resp["diagnostic"] = diagnostic
             resp["cards"] = [resp["facts"]] if resp.get("facts") else []
             if att_refs:
                 resp["attachments"] = att_refs
-            await _record_turn(state, q, resp)
+            turn = await _record_turn(state, q, resp)
+            resp["turn_id"] = turn
             resp["title"] = get_store().title_of(state) if state else None
-            _log_decision({"ts": get_beijing_time_obj().isoformat(timespec="seconds"),
-                           "question": q, "intent": intent, "mode": "fallback",
-                           "source": resp["source"], "reason": resp["reason"], "cached": False,
-                           "appid": appid, "reference_sid": reference_sid})
+            _log({"ts": get_beijing_time_obj().isoformat(timespec="seconds"),
+                  "question": q, "intent": intent, "mode": "fallback",
+                  "source": resp["source"], "reason": resp["reason"], "cached": False,
+                  "appid": appid, "reference_sid": reference_sid, **_turn_key(state, turn)})
             yield {"type": "done", "q": q, **resp}
             return
         result["reason"] = "llm_failed"
+        result["diagnostic"] = diagnostic
 
     if result is None:
         result = _empty("none", "llm_failed", None)
@@ -1948,14 +2154,15 @@ async def _ask_stream_body(question: str, appid: int | None = None, session_id: 
         turn_messages = pre + turn_messages
     if compacted:
         result["compacted"] = True
-    _log_decision({
+    turn = await _record_turn(state, q, result, messages=turn_messages)
+    result["turn_id"] = turn
+    _log({
         "ts": get_beijing_time_obj().isoformat(timespec="seconds"),
         "question": q, "intent": intent, "mode": "agent",
         "protocol": cfg["protocol"],
         "source": result["source"], "reason": result["reason"],
         "tools": result.get("tools") or [], "cached": False, "appid": appid,
-        "reference_sid": reference_sid,
+        "reference_sid": reference_sid, **_turn_key(state, turn),
     })
-    await _record_turn(state, q, result, messages=turn_messages)
     result["title"] = get_store().title_of(state) if state else None
     yield {"type": "done", "q": q, **result}
