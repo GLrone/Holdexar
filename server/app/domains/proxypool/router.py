@@ -11,12 +11,14 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
+from sqlalchemy import select
 
 from app.core.config import get_settings
-from app.core.database import WritePriority, get_session_factory
+from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.database import write_gate
 from app.core import orchestration as events
 from app.domains.proxypool import exitstats, jobruns
+from app.domains.proxypool.models import HealthRun
 
 router = APIRouter(prefix="/proxypool", tags=["proxypool"])
 
@@ -43,6 +45,36 @@ async def job_run_detail(run_id: int):
     return payload
 
 
+@router.get("/health-runs")
+async def health_runs(limit: int = Query(20, ge=1, le=50)):
+    """体检台账：最近 N 轮（started_at 降序）。"""
+    async with get_session_factory()() as session:
+        rows = (
+            await session.execute(
+                select(HealthRun)
+                .order_by(HealthRun.started_at.desc(), HealthRun.id.desc())
+                .limit(limit)
+            )
+        ).scalars().all()
+    return {"runs": [_health_run_payload(row) for row in rows]}
+
+
+def _health_run_payload(row: HealthRun) -> dict:
+    return {
+        "id": row.id,
+        "channel": row.channel,
+        "subscriptionId": row.subscription_id,
+        "startedAt": row.started_at.isoformat() if row.started_at else None,
+        "finishedAt": row.finished_at.isoformat() if row.finished_at else None,
+        "durationMs": row.duration_ms,
+        "total": row.total,
+        "steamOk": row.steam_ok,
+        "ipKnown": row.ip_known,
+        "failed": row.failed,
+        "endReason": row.end_reason,
+    }
+
+
 @router.post("/subscriptions/{subscription_id}/promote")
 async def promote_subscription(subscription_id: int):
     """Candidate → Active：**同一事务**内「apply 最近一次成功快照 + 置 ACTIVE」。
@@ -52,7 +84,7 @@ async def promote_subscription(subscription_id: int):
     """
     from app.domains.proxypool.admission import PromotionError, promote_to_active
 
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE) as session:
         try:
             result = await promote_to_active(
                 session,
@@ -96,7 +128,7 @@ async def exit_subscription(subscription_id: int):
     """
     from app.domains.proxypool.admission import PromotionError, exit_from_production
 
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE) as session:
         try:
             result = await exit_from_production(
                 session, subscription_id=subscription_id, now=datetime.now()

@@ -332,3 +332,35 @@ async def test_crawl_active_maintenance_info_from_ledger(tmp_data_dir):
         assert payload["maintenanceInfo"] is None
     finally:
         end_maintenance()
+
+
+@pytest.mark.asyncio
+async def test_crawl_active_passes_totals_through(tmp_data_dir, monkeypatch):
+    """maintenanceInfo.totals 原样透传体检账本读数；读数未给时不写该字段。"""
+    from app.domains.crawl import router as crawl_router
+    from app.domains.proxypool import health as pool_health
+
+    await init_db()
+    begin_maintenance(MAINTENANCE_HEALTH)
+    try:
+        async def _live_with_totals():
+            return {
+                "runId": 1, "channel": "scheduled", "startedAt": NOW.isoformat(),
+                "probed": {"l1": 3, "l2": 2}, "totals": {"total": 12, "steamOk": 9},
+            }
+
+        monkeypatch.setattr(pool_health, "current_maintenance_run", _live_with_totals)
+        payload = await crawl_router.active()
+        assert payload["maintenanceInfo"]["totals"] == {"total": 12, "steamOk": 9}
+
+        async def _live_without_totals():
+            return {
+                "runId": 1, "channel": "scheduled", "startedAt": NOW.isoformat(),
+                "probed": {"l1": 3, "l2": 2},
+            }
+
+        monkeypatch.setattr(pool_health, "current_maintenance_run", _live_without_totals)
+        payload = await crawl_router.active()
+        assert "totals" not in payload["maintenanceInfo"]
+    finally:
+        end_maintenance()

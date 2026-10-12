@@ -53,6 +53,13 @@ def _holding_port() -> tuple[socket.socket, int]:
 
 
 # ── 1. 运行配置形状 ──────────────────────────────────────────────
+def _pool_lanes(doc: dict) -> tuple[list[dict], list[dict]]:
+    """运行配置里的池 lane 组与 listener（探测 lane `HlProbeLane-*` 是另一族）。"""
+    groups = [g for g in doc["proxy-groups"] if str(g["name"]).startswith("lane-")]
+    listeners = [lis for lis in doc["listeners"] if str(lis["name"]).startswith("lane-")]
+    return groups, listeners
+
+
 def test_runtime_config_emits_one_group_and_listener_per_lane(tmp_path) -> None:
     _write_pool(tmp_path, ["a", "b", "c"])
     out = rt.prepare_runtime_config(tmp_path)
@@ -61,38 +68,81 @@ def test_runtime_config_emits_one_group_and_listener_per_lane(tmp_path) -> None:
     assert doc["mode"] == "global", "GLOBAL 仍是维护入口，不改模式"
     assert isinstance(doc["mixed-port"], int) and doc["mixed-port"] > 0
     assert doc["bind-address"] == "127.0.0.1"
-    assert [g["name"] for g in doc["proxy-groups"]] == ["lane-0", "lane-1", "lane-2"]
-    for group in doc["proxy-groups"]:
+    groups, listeners = _pool_lanes(doc)
+    assert [g["name"] for g in groups] == ["lane-0", "lane-1", "lane-2"]
+    for group in groups:
         assert group["type"] == "select", "确定性调度必须用 select 组，不是 url-test/load-balance"
         assert group["proxies"] == ["a", "b", "c"], "每条 lane 的候选集都是池内全部节点"
 
-    assert [lis["proxy"] for lis in doc["listeners"]] == ["lane-0", "lane-1", "lane-2"]
-    assert [lis["name"] for lis in doc["listeners"]] == [
+    assert [lis["proxy"] for lis in listeners] == ["lane-0", "lane-1", "lane-2"]
+    assert [lis["name"] for lis in listeners] == [
         "lane-0-in", "lane-1-in", "lane-2-in",
     ]
     assert all(lis["type"] == "mixed" and lis["listen"] == "127.0.0.1"
-               for lis in doc["listeners"])
-    ports = [lis["port"] for lis in doc["listeners"]]
+               for lis in listeners)
+    ports = [lis["port"] for lis in listeners]
     assert len(set(ports)) == 3 and all(p > 0 for p in ports)
 
     assert doc["external-controller"] not in ("", None)
     assert doc["secret"]
 
 
+def test_runtime_config_injects_probe_lanes_in_dedicated_range(tmp_path) -> None:
+    """维护体检的并行探测通道随运行配置注入：池专属端口段、与池 lane 互不混用、幂等。"""
+    _write_pool(tmp_path, ["a", "b"])
+    doc = yaml.safe_load(rt.prepare_runtime_config(tmp_path).read_text(encoding="utf-8"))
+    probe_groups = [g for g in doc["proxy-groups"]
+                    if str(g["name"]).startswith("HlProbeLane-")]
+    probe_listeners = [lis for lis in doc["listeners"]
+                       if str(lis["name"]).startswith("HlProbeLane-")]
+    assert len(probe_groups) == 20 and len(probe_listeners) == 20
+    assert all(g["type"] == "select" for g in probe_groups)
+    assert all(21100 <= lis["port"] < 21100 + 900 for lis in probe_listeners)
+    assert all(lis["proxy"].startswith("HlProbeLane-") for lis in probe_listeners)
+    doc2 = yaml.safe_load(rt.prepare_runtime_config(tmp_path).read_text(encoding="utf-8"))
+    probe_ports = [lis["port"] for lis in doc2["listeners"]
+                   if str(lis["name"]).startswith("HlProbeLane-")]
+    assert len(probe_ports) == len(set(probe_ports)) == 20
+
+
+def test_hot_reload_pins_probe_lane_ports(tmp_path) -> None:
+    """热重载通道：探测 lane 端口钉住沿用（端口归池配置自有，即使正被现役内核
+    占用——绕过空闲检查）；冷启动才在专属段重新分配。"""
+    _write_pool(tmp_path, ["a", "b", "c"])
+    rt.prepare_runtime_config(tmp_path, lanes=2)
+
+    def _probe_ports() -> dict[str, int]:
+        doc = yaml.safe_load(rt.runtime_config_path(tmp_path).read_text(encoding="utf-8"))
+        return {str(lis["name"]).removesuffix("-in"): int(lis["port"])
+                for lis in doc["listeners"]
+                if str(lis["name"]).startswith("HlProbeLane-")}
+
+    cold_ports = _probe_ports()
+    assert len(cold_ports) == 20
+
+    rt.prepare_runtime_config(tmp_path, lanes=3, pin_running=True)
+    assert _probe_ports() == cold_ports, "热重载后探测 lane 端口必须原样沿用"
+    pinned = rt._pinned_runtime_endpoints(tmp_path)
+    assert pinned["probe_lane_ports"] == [cold_ports[f"HlProbeLane-{i}"] for i in range(1, 21)]
+
+
 def test_runtime_config_lane_count_follows_pool_size(tmp_path) -> None:
     _write_pool(tmp_path, ["a", "b"])
     doc = yaml.safe_load(rt.prepare_runtime_config(tmp_path).read_text(encoding="utf-8"))
-    assert len(doc["listeners"]) == 2, "一个节点一条 lane，不虚开工位"
+    groups, listeners = _pool_lanes(doc)
+    assert len(listeners) == 2 and len(groups) == 2, "一个节点一条 lane，不虚开工位"
 
     _write_pool(tmp_path, [f"n{i}" for i in range(rt.MAX_LANES + 20)])
     doc = yaml.safe_load(rt.prepare_runtime_config(tmp_path).read_text(encoding="utf-8"))
-    assert len(doc["listeners"]) == rt.MAX_LANES, "lane 数封顶 MAX_LANES"
+    _, listeners = _pool_lanes(doc)
+    assert len(listeners) == rt.MAX_LANES, "lane 数封顶 MAX_LANES"
 
     _write_pool(tmp_path, ["a", "b", "c"])
     doc = yaml.safe_load(
         rt.prepare_runtime_config(tmp_path, lanes=2).read_text(encoding="utf-8")
     )
-    assert len(doc["listeners"]) == 2, "显式 lane 数优先（且不超过池规模）"
+    _, listeners = _pool_lanes(doc)
+    assert len(listeners) == 2, "显式 lane 数优先（且不超过池规模）"
 
 
 @pytest.mark.parametrize(
@@ -120,12 +170,22 @@ def test_is_lane_group(name, expected) -> None:
     assert rt.is_lane_group(name) is expected
 
 
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [("HlProbeLane-1", True), ("HlProbeLane-20", True), ("HlProbeLane-", False),
+     ("HlProbeLane-1-in", False), ("lane-0", False), ("1|node", False)],
+)
+def test_is_probe_lane_group(name, expected) -> None:
+    assert rt.is_probe_lane_group(name) is expected
+
+
 # ── 2. 入口就绪判定（fail closed）────────────────────────────────
 def test_lane_ports_read_back_in_order(tmp_path) -> None:
     _write_pool(tmp_path, ["a", "b"])
     rt.prepare_runtime_config(tmp_path)
     doc = yaml.safe_load(rt.runtime_config_path(tmp_path).read_text(encoding="utf-8"))
-    expected = tuple(lis["port"] for lis in doc["listeners"])
+    _, listeners = _pool_lanes(doc)
+    expected = tuple(lis["port"] for lis in listeners)
     assert rt.runtime_lane_ports(tmp_path) == expected
 
 
@@ -238,7 +298,8 @@ def test_reconcile_ignores_runtime_lane_groups() -> None:
     ledger = rt.reconcile(
         registry_names={"1|a", "1|b"},
         pool_names={"1|a", "1|b"},
-        observed_names={"1|a", "1|b", "DIRECT", "REJECT", "GLOBAL", "lane-0", "lane-1"},
+        observed_names={"1|a", "1|b", "DIRECT", "REJECT", "GLOBAL",
+                        "lane-0", "lane-1", "HlProbeLane-1", "HlProbeLane-2"},
     )
     assert ledger.ok and not ledger.unexpected
 
@@ -247,7 +308,7 @@ def test_reconcile_still_flags_real_extra_nodes() -> None:
     ledger = rt.reconcile(
         registry_names={"1|a"},
         pool_names={"1|a"},
-        observed_names={"1|a", "lane-0", "1|zzz"},
+        observed_names={"1|a", "lane-0", "HlProbeLane-1", "1|zzz"},
     )
     assert not ledger.ok and ledger.unexpected == {"1|zzz"}
 

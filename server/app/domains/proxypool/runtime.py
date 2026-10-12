@@ -37,6 +37,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import orchestration as events
 from app.core.logging import log_event
+from app.domains.proxies.clash_manager import (
+    PROBE_LANE_PREFIX,
+    inject_probe_lanes,
+)
 from app.domains.proxypool.exits import MAX_CRAWL_WORKERS, ExitSlot, select_exit_slots
 from app.domains.proxypool.pool import (
     PoolBuildError,
@@ -91,6 +95,11 @@ LANE_GROUP_PREFIX = "lane-"
 # 就是待用出口：某个 lane 的出口连续失败被隔离后，worker 从待用池换一条继续干活，
 # 岗位数不掉。上限取 2 倍岗位数：备用池够厚，内核 listener 与配置体积仍有界。
 MAX_LANES = MAX_CRAWL_WORKERS * 2
+
+# 维护体检的探测 lane（`HlProbeLane-*`）：池运行时配置自有的并行探测通道。
+# 端口段与旧链路内核的 20000 段隔离，消除双内核并存时的端口竞争。
+POOL_PROBE_LANE_PORT_BASE = 21100
+POOL_PROBE_LANE_PORT_SPAN = 900
 
 logger = logging.getLogger(__name__)
 
@@ -247,6 +256,14 @@ def is_lane_group(name: str) -> bool:
     return tail.isdigit()
 
 
+def is_probe_lane_group(name: str) -> bool:
+    """名字是否为运行配置注入的探测 lane 组（`HlProbeLane-<序号>`）。"""
+    if not name.startswith(PROBE_LANE_PREFIX):
+        return False
+    tail = name[len(PROBE_LANE_PREFIX):].strip("-")
+    return tail.isdigit()
+
+
 def lane_count_for(pool_size: int, requested: int | None = None) -> int:
     """由池规模决定开几条 lane：一个节点最多占一条工位，上限 `MAX_LANES`。
 
@@ -262,8 +279,9 @@ def _pinned_runtime_endpoints(data_dir: Path) -> dict | None:
     """读**现役**运行配置里可被热重载沿用的端点（controller / mixed-port / lane 端口）。
 
     热重载不能换控制器（重载后内核仍监听原 controller 端口），沿用 mixed-port 与
-    既有 lane 端口则让所有已交出的入口 URL 继续有效。没有现役配置（首次启动、
-    文件缺失或不可解析）→ `None`，此时热重载没有可沿用的端点，调用方必须走冷通道。
+    既有 lane 端口则让所有已交出的入口 URL 继续有效；探测 lane（`HlProbeLane-*`）
+    端口是池配置自己的资产，同样钉住沿用。没有现役配置（首次启动、文件缺失或
+    不可解析）→ `None`，此时热重载没有可沿用的端点，调用方必须走冷通道。
     """
     path = runtime_config_path(data_dir)
     if not path.is_file():
@@ -282,23 +300,28 @@ def _pinned_runtime_endpoints(data_dir: Path) -> dict | None:
     except (TypeError, ValueError):
         return None
     old_lane_ports: dict[int, int] = {}
+    old_probe_ports: dict[int, int] = {}
     for entry in (doc.get("listeners") or []):
         if not isinstance(entry, Mapping):
             continue
         name = str(entry.get("name") or "")
         port = entry.get("port")
-        # 只认池 lane（`lane-<序号>-in`）；探测 lane（HlProbeLane-*）等其它 listener
-        # 的端口仍在被现役内核占用，钉进新配置只会撞车
-        if not name.startswith(LANE_GROUP_PREFIX) or not isinstance(port, int) or port <= 0:
+        if not isinstance(port, int) or port <= 0:
             continue
-        tail = name[len(LANE_GROUP_PREFIX):].split("-", 1)[0]
-        if tail.isdigit():
-            old_lane_ports[int(tail)] = port
+        if name.startswith(LANE_GROUP_PREFIX):
+            tail = name[len(LANE_GROUP_PREFIX):].split("-", 1)[0]
+            if tail.isdigit():
+                old_lane_ports[int(tail)] = port
+        elif name.startswith(PROBE_LANE_PREFIX):
+            tail = name[len(PROBE_LANE_PREFIX):].strip("-").split("-", 1)[0]
+            if tail.isdigit():
+                old_probe_ports[int(tail)] = port
     return {
         "controller": controller.strip(),
         "secret": str(doc.get("secret") or ""),
         "mixed_port": mixed_port,
         "lane_ports": [old_lane_ports[i] for i in sorted(old_lane_ports)],
+        "probe_lane_ports": [old_probe_ports[i] for i in sorted(old_probe_ports)],
     }
 
 
@@ -320,6 +343,8 @@ def prepare_runtime_config(data_dir: Path, *, lanes: int | None = None,
     - `proxy-groups` + `listeners`：每条 lane 一个 `select` 组（成员 = 池内全部节点，
       当前选择由控制器设置）+ 一个 mixed listener，listener 的 `proxy` 指向该组。
       入口流量因此固定走指定组，与 GLOBAL 无关；
+    - 探测 lane（`HlProbeLane-*`，`inject_probe_lanes` 注入）：维护体检的并行探测
+      通道，端口在池专属段（21100 起），热重载沿现役配置钉住；
     - `mode: global`：GLOBAL 仍是维护入口（健康检查按它逐节点探测）；
     - `allow-lan: false` + `bind-address: 127.0.0.1`（默认是 `*`，测出口 IP 不该把
       本机代理入口开给局域网）；
@@ -385,6 +410,13 @@ def prepare_runtime_config(data_dir: Path, *, lanes: int | None = None,
         },
         allow_unicode=True,
         sort_keys=False,
+    )
+    # 维护体检的并行探测通道（幂等）：热重载钉住现役端口，冷启动在专属段新分配
+    text = inject_probe_lanes(
+        text,
+        port_base=POOL_PROBE_LANE_PORT_BASE,
+        port_span=POOL_PROBE_LANE_PORT_SPAN,
+        pin_ports=pinned["probe_lane_ports"] if pinned else None,
     )
     tmp = out.with_suffix(".tmp")
     tmp.write_text(text, encoding="utf-8")
@@ -476,8 +508,8 @@ def reconcile(
     只比数量是不够的：改名、错位、去重都能让数量对上而集合不同，而名字是池与
     内核之间唯一的对账钥匙。
 
-    内核可见集里除了内置逻辑节点，还有**运行配置自己生成的 lane 组**——它们是运行
-    期条目而不是"池外多出来的节点"，因此同样不参与 `unexpected` 判定。
+    内核可见集里除了内置逻辑节点，还有**运行配置自己生成的 lane 组与探测 lane 组**
+    ——它们是运行期条目而不是"池外多出来的节点"，因此同样不参与 `unexpected` 判定。
     """
     registry = frozenset(registry_names)
     pool = frozenset(pool_names)
@@ -485,7 +517,10 @@ def reconcile(
 
     runtime_names = observed & pool
     missing = pool - observed
-    unexpected = observed - pool - BUILTIN_PROXY_NAMES - {n for n in observed if is_lane_group(n)}
+    unexpected = (
+        observed - pool - BUILTIN_PROXY_NAMES
+        - {n for n in observed if is_lane_group(n) or is_probe_lane_group(n)}
+    )
 
     return RuntimeReconcile(
         registry_names=registry,

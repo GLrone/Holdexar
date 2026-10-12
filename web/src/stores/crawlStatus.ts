@@ -9,11 +9,14 @@ import { useI18n } from '@/locales'
 
 import { nextPriceCycle, type PriceCycleMark } from '@/lib/priceRefresh'
 
-/** 体检/重建进行中的前端状态：kind + 两层已探测计数（累计口径）。 */
+/** 体检/重建进行中的前端状态：kind + 两层已探测计数（累计口径）。
+    totalL1/totalL2 是后端下发的各层目标量（旧后端不下发，缺省 = 无百分比）。 */
 interface MaintenanceState {
   kind: string
   probedL1: number
   probedL2: number
+  totalL1?: number
+  totalL2?: number
 }
 
 /** 灵动岛长任务注册键：体检跨页存活，进行中不自动消失 */
@@ -127,13 +130,33 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
      maintenanceInfo）都汇到这里，同一事实一个落点，页面轮询与事件推送
      不各养一份状态。灵动岛长任务随状态注册/续接/撤下。 */
 
-  function maintenanceTaskText(state: MaintenanceState): string {
+  /** 岛任务的文案与定量进度。三态：L2 进行中（有 L2 计数，或 L1 已探完而
+      下一层首个进度事件未到）按 L2 口径出 n/total 与百分比；总数未下发的
+      旧后端保持累计计数兜底（词条单参数口径）；有总数的 L1 阶段是出口
+      身份核对，不给会误导的「节点」计数。 */
+  function maintenanceTaskView(state: MaintenanceState): { text: string; percent: number | null } {
     const { t } = useI18n()
-    if (state.kind === 'rebuild') return t('island.maintenance.rebuild')
-    const n = state.probedL1 + state.probedL2
-    return n > 0
-      ? t('island.maintenance.healthProbed', { n })
-      : t('island.maintenance.health')
+    if (state.kind === 'rebuild') return { text: t('island.maintenance.rebuild'), percent: null }
+    const totalL1 = state.totalL1 ?? 0
+    const totalL2 = state.totalL2 ?? 0
+    const l2Underway = state.probedL2 > 0 || (totalL1 > 0 && state.probedL1 >= totalL1)
+    if (l2Underway && totalL2 > 0) {
+      return {
+        text: t('island.maintenance.healthProbed', { n: state.probedL2, total: totalL2 }),
+        percent: Math.min(100, Math.round((state.probedL2 / totalL2) * 100)),
+      }
+    }
+    if (totalL1 === 0 && totalL2 === 0) {
+      const n = state.probedL1 + state.probedL2
+      return {
+        text:
+          n > 0
+            ? t('island.maintenance.healthProbedCount', { n })
+            : t('island.maintenance.health'),
+        percent: null,
+      }
+    }
+    return { text: t('island.maintenance.healthExit'), percent: null }
   }
 
   /** 维护状态统一落点（null = 收场）：岛任务随状态注册/续接/撤下 */
@@ -142,12 +165,14 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
     const cleared = state === null && maintenance.value !== null
     maintenance.value = state
     if (fresh) {
-      beginTask(MAINTENANCE_TASK_KEY, maintenanceTaskText(state!), {
-        percent: null,
+      const view = maintenanceTaskView(state!)
+      beginTask(MAINTENANCE_TASK_KEY, view.text, {
+        percent: view.percent,
         to: '/crawl',
       })
     } else if (state) {
-      updateTask(MAINTENANCE_TASK_KEY, maintenanceTaskText(state))
+      const view = maintenanceTaskView(state)
+      updateTask(MAINTENANCE_TASK_KEY, view.text, view.percent)
     } else if (cleared) {
       endTask(MAINTENANCE_TASK_KEY)
     }
@@ -158,6 +183,7 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
     info: {
       kind?: string
       probed?: { l1?: number; l2?: number }
+      totals?: { l1?: number; l2?: number }
     } | null,
   ): void {
     setMaintenance(
@@ -166,6 +192,8 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
             kind: info.kind ?? 'health',
             probedL1: info.probed?.l1 ?? 0,
             probedL2: info.probed?.l2 ?? 0,
+            totalL1: typeof info.totals?.l1 === 'number' ? info.totals.l1 : undefined,
+            totalL2: typeof info.totals?.l2 === 'number' ? info.totals.l2 : undefined,
           }
         : null,
     )
@@ -293,7 +321,14 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
        进度事件走可丢通道（丢一条只是少刷一次），开始/结束走关键通道。 */
     source.addEventListener('maintenance.started', (e) => {
       const data = JSON.parse((e as MessageEvent).data)
-      setMaintenance({ kind: data.kind ?? 'health', probedL1: 0, probedL2: 0 })
+      setMaintenance({
+        kind: data.kind ?? 'health',
+        probedL1: 0,
+        probedL2: 0,
+        /* totals 可能缺省（旧后端）：缺哪层就保持无总数口径 */
+        totalL1: typeof data.totals?.l1 === 'number' ? data.totals.l1 : undefined,
+        totalL2: typeof data.totals?.l2 === 'number' ? data.totals.l2 : undefined,
+      })
     })
 
     source.addEventListener('maintenance.progress', (e) => {
@@ -305,10 +340,16 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
       }
       setMaintenance({
         ...prev,
-        /* 事件带的是该层的累计探测数；只刷新在位的那一层 */
+        /* 事件带的是该层的累计探测数；只刷新在位的那一层，总数随层更新 */
         ...(data.level === 'L1'
-          ? { probedL1: data.probed ?? prev.probedL1 }
-          : { probedL2: data.probed ?? prev.probedL2 }),
+          ? {
+              probedL1: data.probed ?? prev.probedL1,
+              ...(typeof data.total === 'number' ? { totalL1: data.total } : {}),
+            }
+          : {
+              probedL2: data.probed ?? prev.probedL2,
+              ...(typeof data.total === 'number' ? { totalL2: data.total } : {}),
+            }),
       })
     })
 

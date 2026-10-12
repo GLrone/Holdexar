@@ -4,10 +4,12 @@ import { storeToRefs } from 'pinia'
 import { ElMessageBox } from 'element-plus'
 
 import {
+  poolHealthApi,
   proxiesApi,
   proxypoolApi,
   type ClashNodeTestItem,
   type ClashStatus,
+  type PoolHealthRunsPayload,
   type ProxyItem,
   type ProxyJobRunsPayload,
   type ProxyRunExitRow,
@@ -757,6 +759,7 @@ onMounted(async () => {
   await load()
   void refreshTrafficQuiet() // 实时流量：进页即静默刷新（不阻塞首屏渲染）
   void loadJobRuns() // 作业台账：进页即拉（不阻塞首屏渲染）
+  void loadHealthRuns() // 体检台账：进页即拉（不阻塞首屏渲染）
   // 进页恢复检测会话：进行中则续上轮询与灵动岛任务位（离开页面检测照常推进），
   // 最近一次结果直接展示；无会话（idle/请求失败）不显示面板
   void proxyTasks.attach()
@@ -818,6 +821,29 @@ function jobRunDuration(ms: number | null): string {
   if (ms == null) return '—'
   const s = Math.round(ms / 1000)
   return s < 90 ? `${s}s` : `${Math.floor(s / 60)}m${s % 60}s`
+}
+
+/* ── 最近体检（系统侧体检台账）：一次体检一行，周期自动与手动触发同列；
+   结论字段都可能缺（该轮还没有结论），缺时显示 —。读不到台账保持空态，
+   不拦页面其余部分 ── */
+const healthRuns = ref<PoolHealthRunsPayload | null>(null)
+const healthRunsLoading = ref(false)
+
+function healthRunSource(channel: string): string {
+  return channel === 'manual'
+    ? t('proxies.healthruns.sourceManual')
+    : t('proxies.healthruns.sourceScheduled')
+}
+
+async function loadHealthRuns() {
+  healthRunsLoading.value = true
+  try {
+    healthRuns.value = await poolHealthApi.healthRuns(10)
+  } catch {
+    /* 读不到体检台账不拦页面其余部分 */
+  } finally {
+    healthRunsLoading.value = false
+  }
 }
 </script>
 
@@ -1164,6 +1190,37 @@ function jobRunDuration(ms: number | null): string {
             </tbody>
           </table>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 最近体检：系统侧体检台账（周期自动 / 手动触发同列），一次一行 -->
+    <div class="proxyx-section" data-section="proxies.section.healthruns">
+      <div class="proxyx-section-header">
+        <div class="proxyx-section-title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+            <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+            <polyline points="22 4 12 14.01 9 11.01" />
+          </svg>
+          <span>{{ t('proxies.section.healthruns') }}</span>
+        </div>
+      </div>
+      <div class="proxyx-console">
+        <div v-for="r in healthRuns?.runs ?? []" :key="r.id" class="proxyx-console-line">
+          <span class="t">{{ r.startedAt?.slice(5, 16).replace('T', ' ') ?? '—' }}</span>
+          <span class="k">{{ healthRunSource(r.channel) }}</span>
+          <span class="m">
+            <span v-if="r.finishedAt === null" class="tag">{{ t('proxies.healthruns.running') }}</span>
+            <template v-else>
+              <span v-if="r.endReason === 'interrupted'" class="tag tag--danger">
+                {{ t('proxies.healthruns.interrupted') }}
+              </span>
+              {{ t('proxies.healthruns.line', { total: r.total ?? '—', ok: r.steamOk ?? '—', fail: r.failed ?? '—' }) }} · {{ jobRunDuration(r.durationMs) }}
+            </template>
+          </span>
+        </div>
+        <div v-if="!healthRunsLoading && !(healthRuns?.runs ?? []).length" class="proxyx-console-line">
+          {{ t('proxies.healthruns.empty') }}
         </div>
       </div>
     </div>

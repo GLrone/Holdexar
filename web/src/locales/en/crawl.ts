@@ -45,12 +45,17 @@ const crawl: Partial<Record<MessageKey, string>> = {
   // omitted entirely when speed is unknown or nothing is left
   'crawl.progress.eta': 'ETA {time}',
 
-  /* System-side activity (not a job; invisible in the job list) */
+  /* System-side activity (not a job; invisible in the job list). probed counts the
+     L2 layer (node connectivity); probedCount is the cumulative fallback when the
+     backend sends no totals (separate keys: the placeholder gate requires every
+     call site to supply all placeholders); exitCheck is the L1 phase. */
   'crawl.sys.starting':
     'Starting the job: the backend is enqueuing work and assigning exits — one moment',
   'crawl.sys.maintenance':
     'System health check in progress: proxy channels are being tested one by one; price crawling yields automatically — no action needed',
-  'crawl.sys.probed': '{n} nodes checked',
+  'crawl.sys.exitCheck': 'verifying exit identities',
+  'crawl.sys.probed': '{n}/{total} nodes checked',
+  'crawl.sys.probedCount': '{n} nodes checked',
   'crawl.sys.rebuild':
     'Rebuilding proxy channels: exits are being reorganized; price crawling yields automatically — no action needed',
   'crawl.sys.throttled':

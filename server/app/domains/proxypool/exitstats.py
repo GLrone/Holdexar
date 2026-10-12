@@ -12,7 +12,7 @@ from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_session_factory, write_gate
+from app.core.database import get_session_factory, write_session
 from app.core.logging import log_event
 
 from app.domains.proxypool.models import ProxyRunExit
@@ -125,7 +125,7 @@ async def write_run_exits(
     try:
         from app.core.database import WritePriority
 
-        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+        async with write_session(WritePriority.BACKGROUND) as session:
             return await record_run_exits(
                 session, run_id=run_id, rows=collector.rows(),
                 node_by_exit=node_by_exit, now=now,

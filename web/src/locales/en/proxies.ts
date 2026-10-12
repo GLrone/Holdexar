@@ -212,6 +212,18 @@ const proxies: Partial<Record<MessageKey, string>> = {
   'proxies.jobruns.status.failed': 'Failed',
   'proxies.jobruns.status.interrupted': 'Interrupted',
 
+  /* Recent health checks (system-side check ledger): scheduled runs follow the
+     cycle, manual runs come from "test nodes"; endReason=interrupted means the
+     check was cut short by a restart. The three numbers in `line` can all be
+     missing (no conclusion yet) — the component shows — for those. */
+  'proxies.section.healthruns': 'Recent health checks',
+  'proxies.healthruns.sourceScheduled': 'Auto',
+  'proxies.healthruns.sourceManual': 'Manual',
+  'proxies.healthruns.running': 'Running',
+  'proxies.healthruns.interrupted': 'Interrupted',
+  'proxies.healthruns.line': '{total} nodes · {ok} healthy · {fail} failed',
+  'proxies.healthruns.empty': 'No health checks yet',
+
 /* Actions and dialogs (module-local; nothing shares a value with common) */
   'proxies.action.delete': 'Delete',
   'proxies.dialog.confirm': 'Confirm',

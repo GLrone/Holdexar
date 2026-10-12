@@ -510,11 +510,14 @@ async def test_mark_interrupted_spares_rows_started_after_process_start(tmp_data
 @pytest.mark.asyncio
 async def test_record_start_is_fail_soft(tmp_data_dir, monkeypatch):
     """观测失败绝不影响爬取：记录入口返回 None，不抛。"""
-    class _Boom:
-        def __call__(self, *a, **kw):
-            raise RuntimeError("库里写不进去")
+    from contextlib import asynccontextmanager
 
-    monkeypatch.setattr(jobruns, "get_session_factory", lambda: _Boom())
+    @asynccontextmanager
+    async def _boom_session(*a, **kw):
+        raise RuntimeError("库里写不进去")
+        yield None  # pragma: no cover —— 进入即抛，永不到达
+
+    monkeypatch.setattr(jobruns, "write_session", _boom_session)
     run_id = await jobruns.record_start(
         proxy_url=None, regions=["us"], workers=1, data_dir=tmp_data_dir, now=NOW
     )

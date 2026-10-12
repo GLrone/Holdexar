@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from app.domains.proxypool import health as H
@@ -38,6 +40,7 @@ class _Resp:
         self.status_code = status_code
         self._payload = payload
         self._non_json = non_json
+        self.text = "not json at all" if non_json else json.dumps(payload or {})
 
     def json(self):
         if self._non_json:
