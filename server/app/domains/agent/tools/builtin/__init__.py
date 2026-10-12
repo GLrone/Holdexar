@@ -1,4 +1,4 @@
-"""builtin 工具集：65 个 ToolSpec 按旧 tool_specs() 顺序登记进注册表。
+"""builtin 工具集：67 个 ToolSpec 按旧 tool_specs() 顺序登记进注册表。
 
 每工具预算（timeout_s）统一取 projection.budget_for（旧 tool_budget_s 分类），
 等价性由 test_agent_tools.py 全量对比钉住。"""
@@ -79,6 +79,8 @@ _ORDER = (
     "list_owned",
     "list_family_library",
     "achievements_summary",
+    "level_profile",
+    "challenges_overview",
     "bills_summary",
     "family_status",
     "redeem_quota",

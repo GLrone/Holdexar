@@ -1,6 +1,7 @@
 """pilot 域路由：领航员配置与问答（非流式 + SSE 流式）。"""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
@@ -191,7 +192,9 @@ async def list_sessions(limit: int = 50, q: str = "") -> PilotSessionListOut:
     """最近会话投影（mtime 倒序，置顶在前）：标题/轮数/更新时间 + 是否生成中
     （运行登记），供历史面板与会话列。q 给定时按关键词过滤（标题或问答正文）。"""
     try:
-        items = service.get_store().list_recent(max(1, min(limit, 200)), q=q or None)
+        # 折叠/检索入线程：账本文件扫描不占事件循环，流式回合不被卡顿
+        items = await asyncio.to_thread(
+            service.get_store().list_recent, max(1, min(limit, 200)), q or None)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(e)) from e
     return PilotSessionListOut(items=[

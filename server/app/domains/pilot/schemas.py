@@ -214,6 +214,11 @@ class AskResponse(BaseModel):
     attachments: list = []
     """本轮随问携带的附件引用（id/名称/字符数/行数）：用户消息下的附件芯片与历史还原用。"""
     cards: list = []
+    """本轮追问（结构化 key+args，文案由前端 i18n 承载）；无候选时为空列表。
+
+    由本轮问句意图、问句主题与本轮取到的事实确定性产出，不经模型生成自由
+    文本——中英界面共用同一批键，词条缺失的那条前端直接丢弃。"""
+    followups: list = []
     """本轮 agent 时间线（tools.tool_step 产出，由 phases 展平而得）；降级路径为空列表。"""
     steps: list = []
     """本轮按循环步分段的阶段记录（step / thinking / text / think_ms / truncated / terminal / steps）；thinking 与 steps 均由它派生。"""

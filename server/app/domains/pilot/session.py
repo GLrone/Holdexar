@@ -111,12 +111,18 @@ class SessionStore:
         self.base = base
         self._cache: dict[str, tuple[float, SessionState]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        # 列表投影缓存：sid → (mtime_ns+size 键, 摘要)。命中零折叠——
+        # 列表接口高频刷新，逐文件全量折叠是 O(全部历史) 的重复劳动
+        self._list_cache: dict[str, tuple[tuple[int, int], dict]] = {}
         self._sweep()
 
     # ── 读 ────────────────────────────────────────────────────────────
 
     async def load(self, sid: str) -> SessionState | None:
-        """载入会话（缓存优先）；无文件返回 None，不创建。"""
+        """载入会话（缓存优先）；无文件返回 None，不创建。
+
+        冷读的文件 IO 与折叠入线程执行：大账本的首开不在事件循环上阻塞
+        并发的流式回合。"""
         if not valid_sid(sid):
             return None
         hit = self._cache.get(sid)
@@ -130,10 +136,14 @@ class SessionStore:
             path = self._path(sid)
             if not path.is_file():
                 return None
-            state = self._fold(sid, self._read_lines(path))
-            state.updated_at = self._mtime_iso(path)
+            state = await asyncio.to_thread(self._load_fresh, sid, path)
             self._cache_put(state)
             return state
+
+    def _load_fresh(self, sid: str, path: Path) -> SessionState:
+        state = self._fold(sid, self._read_lines(path))
+        state.updated_at = self._mtime_iso(path)
+        return state
 
     async def load_or_new(self, sid: str) -> SessionState | None:
         state = await self.load(sid)
@@ -179,6 +189,7 @@ class SessionStore:
                 )
                 return False
             self._cache.pop(sid, None)
+            self._list_cache.pop(sid, None)
             return existed
 
     def title_of(self, state: SessionState) -> str:
@@ -194,9 +205,10 @@ class SessionStore:
     def list_recent(self, limit: int = 50, q: str | None = None) -> list[dict]:
         """最近会话投影：mtime 倒序，每文件折叠出标题/轮数（账本只读投影）。
 
-        q 给定时按关键词过滤——命中标题或任一轮的提问/回答正文即保留，
-        并附一段命中片段（正文命中时的上下文，标题命中为空）。置顶项排在
-        最前（稳定排序，置顶组内仍是 mtime 倒序）。"""
+        无检索时走摘要缓存（stat 键校验，命中零折叠）；q 给定时按关键词
+        过滤——命中标题或任一轮的提问/回答正文即保留，并附一段命中片段
+        （正文命中时的上下文，标题命中为空）。置顶项排在最前（稳定排序，
+        置顶组内仍是 mtime 倒序）。"""
         try:
             files = sorted(self.base.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
         except OSError:
@@ -210,23 +222,36 @@ class SessionStore:
             sid = path.stem
             if not valid_sid(sid):
                 continue
-            state = self._fold(sid, self._read_lines(path))
-            title = self.title_of(state)
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            key = (st.st_mtime_ns, st.st_size)
+            summary: dict | None = None
             snippet = ""
-            if needle:
-                hit, snippet = self._match(state, title, needle)
-                if not hit:
-                    continue
-            out.append({
-                "sid": sid,
-                "title": title,
-                "turn_total": len(state.turns),
-                "updated_at": self._mtime_iso(path),
-                "pinned": state.pinned,
-                "archived": state.archived,
-                "forked_from": state.forked_from,
-                "snippet": snippet,
-            })
+            if not needle:
+                hit = self._list_cache.get(sid)
+                if hit is not None and hit[0] == key:
+                    summary = hit[1]
+            if summary is None:
+                state = self._fold(sid, self._read_lines(path))
+                title = self.title_of(state)
+                if needle:
+                    hit_match, snippet = self._match(state, title, needle)
+                    if not hit_match:
+                        continue
+                summary = {
+                    "sid": sid,
+                    "title": title,
+                    "turn_total": len(state.turns),
+                    "updated_at": _iso_ts(st.st_mtime),
+                    "pinned": state.pinned,
+                    "archived": state.archived,
+                    "forked_from": state.forked_from,
+                }
+                if not needle:
+                    self._list_cache[sid] = (key, summary)
+            out.append({**summary, "snippet": snippet})
         out.sort(key=lambda it: not it["pinned"])
         return out[: max(0, limit)] if needle else out
 
@@ -466,10 +491,14 @@ class SessionStore:
     @staticmethod
     def _mtime_iso(path: Path) -> str | None:
         try:
-            return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(path.stat().st_mtime))
+            return _iso_ts(path.stat().st_mtime)
         except OSError:
             return None
 
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _iso_ts(ts: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts))

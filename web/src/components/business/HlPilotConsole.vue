@@ -9,6 +9,7 @@ import {
   type PilotAttachmentChunk,
   type PilotAttachmentRef,
   type PilotFacts,
+  type PilotFollowup,
   type PilotGameFactsItem,
   type PilotNavigateFacts,
   type PilotPhase,
@@ -25,7 +26,6 @@ import { mdLiteToHtml } from '@/lib/markdownLite'
 import { buildCtxSegments, shouldShowCacheHitRate } from '@/lib/ctxSegments'
 import { fmtTokens, isErrorReason, isLongAnswerText, pilotCoverUrl, positivePct, ratingClass, sessionTime } from '@/lib/pilotView'
 import HlImg from '@/components/ui/HlImg.vue'
-import HlSkeleton from '@/components/ui/HlSkeleton.vue'
 import HlPilotCards from '@/components/business/HlPilotCards.vue'
 import HlPilotChain from '@/components/business/HlPilotChain.vue'
 import HlPilotOutline from '@/components/business/HlPilotOutline.vue'
@@ -129,6 +129,8 @@ interface Turn {
   attachments?: PilotAttachmentRef[]
   /** 长回答是否展开（最新对话结果默认展开，发新对话时自动收敛；随轮持有，可手动切换） */
   expanded?: boolean
+  /** 后端下发的本轮追问（结构化 key + args）；缺失时追问走本地卡片推导 */
+  followups?: PilotFollowup[]
 }
 
 const question = ref('')
@@ -189,20 +191,25 @@ function renderAnswerHtml(text: string): string {
 }
 
 /** 流式期即时卡片账：tool_start 按类型预告挂骨架占位，card 事件原位填充——
- *  卡片在终态前先可见，done 整轮替换时高度已就位，不再整块砸出。 */
+ *  卡片归属产出它的阶段，在过程链内随思考时序内嵌展示；done 后由回答层
+ *  的正式卡接管（终态卡区在上、终答在下）。 */
 interface LiveCardEntry {
   key: number
   name: string
   kind: string | null
+  phase: number
   card: PilotFacts | null
 }
 let liveCardSeq = 0
 const liveCards = ref<LiveCardEntry[]>([])
 const liveRealCards = computed(() =>
   liveCards.value.map((e) => e.card).filter((c): c is PilotFacts => Boolean(c)))
+/** 过程链内嵌视图：只带链渲染需要的字段 */
+const liveChainCards = computed(() =>
+  liveCards.value.map((e) => ({ key: e.key, phase: e.phase, card: e.card })))
 
-function pushLiveSkeleton(name: string, kind: string | null) {
-  liveCards.value.push({ key: ++liveCardSeq, name, kind, card: null })
+function pushLiveSkeleton(name: string, kind: string | null, phase: number) {
+  liveCards.value.push({ key: ++liveCardSeq, name, kind, phase, card: null })
 }
 
 function dropLiveSkeleton(name: string) {
@@ -210,13 +217,13 @@ function dropLiveSkeleton(name: string) {
   if (idx >= 0) liveCards.value.splice(idx, 1)
 }
 
-function fillLiveCard(name: string, card: PilotFacts) {
+function fillLiveCard(name: string, card: PilotFacts, phase: number) {
   const idx = liveCards.value.findIndex((e) => e.name === name && !e.card)
   if (idx >= 0) {
     liveCards.value[idx] = { ...liveCards.value[idx], card }
   } else {
     // 无预告骨架（提示表未覆盖的工具）：直接追加实体卡，先到先渲染不受影响
-    liveCards.value.push({ key: ++liveCardSeq, name, kind: card.kind ?? null, card })
+    liveCards.value.push({ key: ++liveCardSeq, name, kind: card.kind ?? null, phase, card })
   }
 }
 
@@ -1020,6 +1027,7 @@ function buildTurn(q: string, e: PilotAskResponse, livePhaseSnapshot: PilotPhase
       cached: Boolean(e.cached),
     },
     attachments: e.attachments?.length ? e.attachments : undefined,
+    followups: e.followups?.length ? e.followups : undefined,
   }
   // 批量提议：卡片带确认/取消，故独立成轮（模型说明文字随卡片一并展示）
   if (cards.some((c) => c.kind === 'proposal')) {
@@ -1847,8 +1855,8 @@ async function ask(text?: string, resume?: PilotResumePayload) {
           livePhases.value.push({ step: 1, thinking: '', text: '', steps: [] })
         }
         currentPhase()?.steps.push({ label: e.label ?? '', status: 'running', data: {}, startedAt: Date.now() })
-        // 卡片类型预告：执行期先挂骨架占位（结果到达前高度先就位）
-        if (e.card_kind) pushLiveSkeleton(e.name ?? '', e.card_kind)
+        // 卡片类型预告：执行期先挂骨架占位（结果到达前高度先就位），归属当前阶段
+        if (e.card_kind) pushLiveSkeleton(e.name ?? '', e.card_kind, livePhases.value.length - 1)
       } else if (e.type === 'tool_progress') {
         // 执行期心跳：已用时长以服务端读数为准（前端本地表只作帧间插值）
         const step = currentPhase()?.steps.find((s) => s.status === 'running')
@@ -1874,8 +1882,9 @@ async function ask(text?: string, resume?: PilotResumePayload) {
           setTimeout(focusMainRegion, 700)
         }
       } else if (e.type === 'card') {
-        // 结算帧：每个完成工具一帧，card=null = 本工具无卡（撤骨架）
-        if (e.card) fillLiveCard(e.name ?? '', e.card)
+        // 结算帧：每个完成工具一帧，card=null = 本工具无卡（撤骨架）；
+        // 无预告骨架的兜底卡归属当前阶段
+        if (e.card) fillLiveCard(e.name ?? '', e.card, Math.max(0, livePhases.value.length - 1))
         else dropLiveSkeleton(e.name ?? '')
       } else if (e.type === 'done') {
         done = e as PilotAskResponse
@@ -1995,7 +2004,23 @@ const lastDoneTurnIndex = computed(() => {
   return -1
 })
 
-/** 追问 dock 内容：空会话给开场推荐，有轮给最后一轮的追问；流式中不出 */
+/** 后端下发的追问条目 → dock 条目；无对应词条的 key 直接丢弃（不渲染裸 key），最多 4 条 */
+function mapServerFollowUps(list: PilotFollowup[] | undefined): FollowUpItem[] {
+  const out: FollowUpItem[] = []
+  for (const f of list ?? []) {
+    if (!f?.key || out.length >= 4) continue
+    const key = `pilot.followup.${f.key}` as MessageKey
+    const promptKey = `pilot.followup.${f.key}Prompt` as MessageKey
+    const label = t(key, f.args)
+    const prompt = t(promptKey, f.args)
+    // 缺词条时 t 回退成 key 原文
+    if (label === key || prompt === promptKey) continue
+    out.push({ key, prompt })
+  }
+  return out
+}
+
+/** 追问 dock 内容：空会话给开场推荐，有轮优先用后端给的本轮追问；流式中不出 */
 const dockFollowUps = computed<FollowUpItem[]>(() => {
   if (streaming.value) return []
   const i = lastDoneTurnIndex.value
@@ -2007,7 +2032,9 @@ const dockFollowUps = computed<FollowUpItem[]>(() => {
       { key: 'pilot.followup.myFollows', prompt: t('pilot.followup.myFollowsPrompt') },
     ]
   }
-  return getTurnFollowUps(turns.value[i])
+  const turn = turns.value[i]
+  const served = mapServerFollowUps(turn.followups)
+  return served.length ? served : getTurnFollowUps(turn)
 })
 
 function getTurnFollowUps(turn: Turn): FollowUpItem[] {
@@ -2773,31 +2800,19 @@ function triggerFollowUp(prompt: string) {
           </div>
 
           <!-- 运行中过程链：阶段块随定界逐个长出，每段正文随所在阶段就地展示；
-               完成时原位替换为历史链，终答正文改由回答层承接 -->
+               过程卡按产出阶段内嵌链中（随思考时序原位，随后续思考上移）。
+               完成时原位替换为历史链，正式卡与终答由回答层承接 -->
           <HlPilotChain
             live
             hide-phase-text
             :steps="liveStepsFlat"
             :phases="livePhases"
             :waiting-text="loadingText"
+            :live-cards="liveChainCards"
+            :busy-pid="busyPid"
+            @proposal="onProposal"
           />
-          <!-- 即时卡片：工具执行期先挂骨架占位，card 事件到达原位填充（终态前先见卡）。
-               卡片区在回答层之上——过程叙述进链、数据卡先行、终答收尾，done 零翻转 -->
-          <div v-if="liveCards.length" class="pilot-live-cards">
-            <template v-for="entry in liveCards" :key="entry.key">
-              <HlPilotCards
-                v-if="entry.card"
-                :cards="[entry.card]"
-                :busy-pid="busyPid"
-                @proposal="onProposal"
-              />
-              <div v-else class="pilot-live-card-skel" role="status" aria-busy="true">
-                <HlSkeleton variant="title" />
-                <HlSkeleton variant="text" :rows="3" />
-              </div>
-            </template>
-          </div>
-          <!-- 终答就位：文字流式期在卡片区之下原位生长，done 零翻转 -->
+          <!-- 终答就位：文字流式期在链下原位生长，done 时正式卡接手卡区 -->
           <div v-if="liveAnswerHtml" class="pilot-answer" v-html="liveAnswerHtml"></div>
           <div v-if="queuedHint" class="pilot-queued">
             {{ t(queuedHint === 'parallel' ? 'pilot.queued.parallel'
@@ -4477,26 +4492,6 @@ function triggerFollowUp(prompt: string) {
 @keyframes pilot-queued-pulse {
   0%, 100% { opacity: 0.35; }
   50% { opacity: 1; }
-}
-
-/* 流式期即时卡片：与终态轮卡片同一视觉层（.pcard 同族），骨架占位先行 */
-.pilot-live-cards {
-  align-self: stretch;
-  display: grid;
-  gap: 8px;
-  min-width: 0;
-}
-
-.pilot-live-card-skel {
-  display: grid;
-  gap: 8px;
-  padding: 12px 14px;
-  border: 1px solid var(--border-soft);
-  border-radius: 10px;
-  background: var(--bg-card);
-  max-width: 100%;
-  min-width: 0;
-  box-sizing: border-box;
 }
 
 .pilot-compact__pill svg {
