@@ -31,6 +31,8 @@ const fetchPage: Partial<Record<MessageKey, string>> = {
   'fetch.interval.toast': 'Updated: prices now refresh every {n} hours',
   'fetch.schedule.time': 'Refresh at',
   'fetch.schedule.interval': 'Interval',
+  'fetch.schedule.hour': 'h',
+  'fetch.schedule.minute': 'min',
   'fetch.schedule.daily': 'Daily',
   'fetch.schedule.everyDays': 'Every {n} days',
   'fetch.schedule.toast': 'Updated: refreshes will follow the new time and interval',

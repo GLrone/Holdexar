@@ -521,6 +521,13 @@ export interface PilotStep {
   startedAt?: number
 }
 
+/** 本轮追问建议：后端按本轮实际结果给结构化条目（key 对 `pilot.followup.{key}`），
+ *  args 供词条插值；不落自由文本，界面语言仍由前端词典决定 */
+export interface PilotFollowup {
+  key: string
+  args?: Record<string, string | number>
+}
+
 /** agent 循环的一步（阶段）：该步的思考、前言正文与工具步骤同属一条记录 */
 export interface PilotPhase {
   step: number
@@ -593,6 +600,8 @@ export interface PilotAskResponse {
   attachments?: PilotAttachmentRef[]
   /** 本轮实际入库的提问（超长正文被服务端转附件时是收窄后的形态）；展示与账本同源 */
   q?: string
+  /** 本轮追问建议（缺此字段时前端按卡片类型自行推导） */
+  followups?: PilotFollowup[]
 }
 
 /** 长文本附件引用：全文在后端落盘，消息体里只有这条引用（见 pilot/attachments.py） */
@@ -919,6 +928,8 @@ export interface PilotStreamEvent {
   title?: string | null
   ctx_tokens?: number | null
   ctx_budget?: number | null
+  /** done：本轮追问建议 */
+  followups?: PilotFollowup[]
 }
 
 /** 流式问答：SSE 帧解析（data: JSON / data: [DONE]），事件逐个回调。
@@ -2016,12 +2027,14 @@ export const crawlApi = {
       busy?: boolean
       /** 池体检（整池串行探测）进行中——不是任务，任务列表看不到 */
       maintenance?: boolean
-      /** 体检/重建进行中的实时情况：体检账本投影（开跑时刻 + 已探测计数） */
+      /** 体检/重建进行中的实时情况：体检账本投影（开跑时刻 + 已探测计数）。
+          totals 是各层目标量（旧后端不下发，缺省 = 前端走无总数兜底口径） */
       maintenanceInfo?: {
         kind: string
         reason?: string | null
         startedAt?: string | null
         probed?: { l1: number; l2: number }
+        totals?: { l1: number; l2: number }
       } | null
       /** 正在限流窗口外排队的请求数（>0 = 任务启动后请求还没放行） */
       throttled?: number
@@ -2197,10 +2210,20 @@ export const systemApi = {
   backupList: () => request<{ items: BackupItem[] }>('GET', '/system/backup'),
   backupCreate: (label?: string) =>
     request<BackupCreateResult>('POST', '/system/backup', { label: label || null }),
-  backupVerify: (name: string) =>
-    request<{ name: string; integrityOk: boolean; games: number; sizeBytes: number }>(
+  backupVerify: (name: string, deep = false) =>
+    request<{
+      name: string
+      integrityOk: boolean
+      games: number
+      sizeBytes: number
+      /** 逐档结论：哈希 / 可还原 / 深校验；未执行的档为 null */
+      checks: { hashOk: boolean | null; restorableOk: boolean | null; deepOk: boolean | null }
+    }>('POST', `/system/backup/${encodeURIComponent(name)}/verify`, { deep }),
+  /** 回收主库空闲空间（原地收缩，期间写入暂停） */
+  compactDb: () =>
+    request<{ ok: boolean; freedBytes: number; beforeBytes: number; afterBytes: number }>(
       'POST',
-      `/system/backup/${encodeURIComponent(name)}/verify`,
+      '/system/compact',
     ),
   backupRestore: (name: string) =>
     request<{ restored: boolean; name: string; rolledBack: boolean }>(
@@ -2686,14 +2709,29 @@ export const notificationsApi = {
     ),
 }
 
-/** 一条内容链事实变化（HB 当月包换新 / Epic 喜加一轮换）。文案由前端按
- *  source+kind 映射词条现译，后端只发结构化事实。 */
+/** 一条内容链事实变化（HB 当月包换新 / Epic 喜加一轮换 / 成就域同步事实）。
+ *  文案由前端按 source+kind 映射词条现译，后端只发结构化事实。 */
 export interface FactNotice {
   id: number
-  source: 'hb_choice' | 'epic_free' | string
-  kind: 'bundle_changed' | 'free_rotation' | string
-  /** 消费参数：HB = {label, productName, count}；Epic = {count, titles[]} */
-  data: { label?: string; productName?: string; count?: number; titles?: string[] } | null
+  source: 'hb_choice' | 'epic_free' | 'achievements' | string
+  kind:
+    | 'bundle_changed'
+    | 'free_rotation'
+    | 'level_up'
+    | 'challenge_completed'
+    | 'achievement_unlocked_batch'
+    | string
+  /** 消费参数：HB = {label, productName, count}；Epic = {count, titles[]}；
+   *  成就 = {fromLevel, toLevel} / {challengeId} / {count, titles[]} */
+  data: {
+    label?: string
+    productName?: string
+    count?: number
+    titles?: string[]
+    fromLevel?: number
+    toLevel?: number
+    challengeId?: string
+  } | null
   occurredAt: string | null
 }
 
@@ -3275,6 +3313,247 @@ export const achievementsApi = {
   sync: (steamid = '') =>
     request<AchievementSyncSnapshot>('POST', `/achievements/sync${toQuery({ steamid })}`),
   syncStatus: () => request<AchievementSyncSnapshot>('GET', '/achievements/sync'),
+  /** 猎手等级（经验流水在后端，等级纯派生；fresh 绕开时间窗缓存） */
+  level: (steamid = '', fresh = false) =>
+    request<LevelPayload>('GET', `/achievements/level${toQuery({ steamid })}`, undefined, {
+      noCache: fresh,
+    }),
+  /** 挑战目录 + 进度（GET 即触发后端幂等重算） */
+  challenges: (steamid = '', fresh = false) =>
+    request<ChallengesPayload>('GET', `/achievements/challenges${toQuery({ steamid })}`, undefined, {
+      noCache: fresh,
+    }),
+  /** 领取挑战奖励（409 = 未完成或已领取） */
+  claimChallenge: (challengeId: string, steamid = '') =>
+    request<ChallengeClaimResult>(
+      'POST',
+      `/achievements/challenges/${encodeURIComponent(challengeId)}/claim${toQuery({ steamid })}`,
+    ),
+  /** 锚定到具体成就的批注墙 */
+  notes: (steamid = '', fresh = false) =>
+    request<NotesPayload>('GET', `/achievements/notes${toQuery({ steamid })}`, undefined, {
+      noCache: fresh,
+    }),
+  /** 保存批注；仅首次写入给 XP（后端按幂等键判定） */
+  addNote: (payload: NoteWriteInput) =>
+    request<NoteWriteResult>('POST', '/achievements/notes', payload),
+  deleteNote: (appid: number, imageName: string, steamid = '') =>
+    request<NoteRemoveResult>(
+      'DELETE',
+      `/achievements/notes/${appid}/${encodeURIComponent(imageName)}${toQuery({ steamid })}`,
+    ),
+  /** 多账号对比（steamids 缺省 = 后端取可切换账号前 4 个；上限 6） */
+  compare: (steamids: string[] = [], fresh = false) =>
+    request<ComparePayload>(
+      'GET',
+      `/achievements/compare${steamids.length ? toQuery({ steamids: steamids.join(',') }) : ''}`,
+      undefined,
+      { noCache: fresh },
+    ),
+  /** 最近解锁流（unlock_time 降序；limit ≤ 100） */
+  feed: (limit = 30, steamid = '', fresh = false) =>
+    request<FeedPayload>('GET', `/achievements/feed${toQuery({ limit, steamid })}`, undefined, {
+      noCache: fresh,
+    }),
+}
+
+// ─── 成就殿堂 · 猎手等级 / 挑战 / 批注 / 社交 ──────────────
+// 曲线、段位、奖励数值全部由后端派生下发，前端只消费形状、不做本地推算。
+
+/** 段位（后端按等级分档；legend 无下一档） */
+export type LevelTier = 'bronze' | 'silver' | 'gold' | 'platinum' | 'legend'
+
+/** 经验事件来源（与后端账本枚举同源，仅用于词条翻译，不参与前端推算） */
+export type XpEventSource =
+  | 'achievement_unlock'
+  | 'platinum'
+  | 'playtime_bucket'
+  | 'streak_day'
+  | 'challenge_claim'
+  | 'comment'
+  | 'baseline'
+
+export interface LevelCurvePoint {
+  level: number
+  /** 升入该级所需经验 */
+  costXp: number
+  cumulativeXp: number
+}
+
+export interface LevelMilestone {
+  level: number
+  tier: LevelTier
+  reached: boolean
+}
+
+export interface LevelBonus {
+  kind: 'streak'
+  multiplier: number
+  streakDays: number
+}
+
+export interface LevelEvent {
+  id: number
+  source: XpEventSource
+  xp: number
+  multiplier: number
+  createdAt: string
+}
+
+export interface LevelPayload {
+  steamid: string
+  level: number
+  tier: LevelTier
+  /** legend 之后无下一档：null */
+  nextTier: LevelTier | null
+  /** 本段位内进度 0~1 */
+  tierProgress: number
+  totalXp: number
+  xpIntoLevel: number
+  xpForNextLevel: number
+  xpRemaining: number
+  /** 本级内进度 0~1 */
+  levelProgress: number
+  /** 上一级花费（与下一级需要的差值构成「越升越贵」直读） */
+  lastLevelCost: number
+  /** 下一级成本相对上一级的增幅（0.092 = +9.2%） */
+  nextCostGrowth: number
+  /** 未来 6 级成本预览 */
+  curvePreview: LevelCurvePoint[]
+  milestones: LevelMilestone[]
+  activeBonuses: LevelBonus[]
+  /** 最近 10 条经验事件（不含机读备注） */
+  recentEvents: LevelEvent[]
+}
+
+export type ChallengeTier = 'bronze' | 'silver' | 'gold'
+
+export type ChallengeCategory =
+  | 'milestone'
+  | 'cumulative'
+  | 'streak'
+  | 'collection'
+  | 'platinum'
+  | 'comment'
+  | 'social'
+
+export type ChallengeStatus = 'active' | 'completed' | 'claimed'
+
+export interface ChallengeItem {
+  challengeId: string
+  tier: ChallengeTier
+  category: ChallengeCategory
+  /** 目标值与奖励恒出自后端目录常量 */
+  target: number
+  progress: number
+  rewardXp: number
+  status: ChallengeStatus
+  /** 已完成且未领取（后端判定，前端不复算） */
+  claimable: boolean
+  completedAt: string | null
+  claimedAt: string | null
+  updatedAt: string | null
+}
+
+export interface ChallengesSummary {
+  total: number
+  completed: number
+  claimed: number
+  claimable: number
+}
+
+export interface ChallengesPayload {
+  steamid: string
+  challenges: ChallengeItem[]
+  summary: ChallengesSummary
+}
+
+export interface ChallengeClaimResult {
+  challengeId: string
+  status: 'claimed'
+  xpGranted: number
+  totalXp: number
+  /** 涨级即时反馈（不依赖轮询） */
+  level: { previous: number; current: number; leveledUp: boolean }
+}
+
+export type NoteMood = 'love' | 'wow' | 'hard' | 'fun'
+
+export interface AchievementNoteItem {
+  appid: number
+  imageName: string
+  content: string
+  mood: NoteMood | null
+  /** join 成就定义与游戏行的展示字段 */
+  achievementName: string
+  achievementIcon: string
+  achievementGrayIcon: string
+  gameName: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface NotesPayload {
+  total: number
+  notes: AchievementNoteItem[]
+}
+
+export interface NoteWriteInput {
+  steamid: string
+  appid: number
+  imageName: string
+  /** 上限 140 字（超出后端 400） */
+  content: string
+  mood?: NoteMood | null
+}
+
+export interface NoteWriteResult {
+  note: AchievementNoteItem
+  /** 仅首次写入 > 0；编辑重存为 0 */
+  xpGranted: number
+  firstForAchievement: boolean
+}
+
+export interface NoteRemoveResult {
+  removed: boolean
+}
+
+export interface CompareAccount {
+  steamid: string
+  personaName: string
+  avatarUrl: string
+  relation: AchievementAccount['relation']
+  level: number
+  tier: LevelTier
+  totalXp: number
+  unlockedCount: number
+  platinumCount: number
+  playtimeMinutes: number
+  challengesCompleted: number
+  /** 稀有度分布（只含非空档，序与后端稀有度切点一致） */
+  rarityBuckets: { tier: RarityTier; count: number }[]
+}
+
+export interface ComparePayload {
+  accounts: CompareAccount[]
+}
+
+export interface FeedItem {
+  appid: number
+  imageName: string
+  name: string
+  iconUrl: string
+  iconGrayUrl: string
+  gameName: string
+  /** 全服解锁占比 0~100；null = 未取到 */
+  globalPercent: number | null
+  rarity: RarityTier
+  /** 解锁 epoch 秒 */
+  unlockTime: number
+}
+
+export interface FeedPayload {
+  items: FeedItem[]
 }
 
 // ─── 游戏生涯（称号 / 热力图 / 偏好画像 / 纪录 / 评语墙）──────────
@@ -3566,6 +3845,40 @@ export const proxypoolApi = {
     request<ProxyJobRunDetail>(
       'GET',
       `/proxypool/job-runs/${id}`,
+      undefined,
+      { noCache: true },
+    ),
+}
+
+// ─── proxypool 体检台账（/proxies 页「最近体检」分节）──────────────────
+// 系统侧体检一次一轮：L1 出口身份核对 + L2 节点连通检测，行内是收敛后的结论。
+
+export interface PoolHealthRunItem {
+  id: number
+  /** scheduled = 周期自动体检；manual = 手动触发 */
+  channel: 'scheduled' | 'manual'
+  startedAt: string | null
+  /** null = 还在跑（进行中） */
+  finishedAt: string | null
+  durationMs: number | null
+  /** 以下结论字段都可能缺（该轮还没有结论）：缺时显示 —，不是 0 */
+  total: number | null
+  steamOk: number | null
+  failed: number | null
+  ipKnown: number | null
+  /** interrupted = 被重启打断，未跑完 */
+  endReason: string | null
+}
+
+export interface PoolHealthRunsPayload {
+  runs: PoolHealthRunItem[]
+}
+
+export const poolHealthApi = {
+  healthRuns: (limit = 20) =>
+    request<PoolHealthRunsPayload>(
+      'GET',
+      `/proxypool/health-runs${toQuery({ limit })}`,
       undefined,
       { noCache: true },
     ),

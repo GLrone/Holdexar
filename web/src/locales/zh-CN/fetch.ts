@@ -32,6 +32,8 @@ const fetchPage = {
   'fetch.interval.toast': '已更新：价格每 {n} 小时自动刷新一次',
   'fetch.schedule.time': '刷新时间',
   'fetch.schedule.interval': '间隔',
+  'fetch.schedule.hour': '时',
+  'fetch.schedule.minute': '分',
   'fetch.schedule.daily': '每天',
   'fetch.schedule.everyDays': '每 {n} 天',
   'fetch.schedule.toast': '已更新：将按新的时间和间隔自动刷新',

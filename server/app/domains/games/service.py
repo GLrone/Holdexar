@@ -23,7 +23,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from app.core.database import WritePriority, get_session_factory
+from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.database import write_gate
 from app.core.logging import log_event
 from app.crawler.utils import get_beijing_time_obj
@@ -1729,7 +1729,7 @@ async def refresh_hl_flags(appids: list[int] | None = None) -> int:
 
     h = GamePriceHistory
     cn_cur = aliased(GameCurrentPrice)
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND) as session:
         prior_q = (
             select(h.appid, func.min(h.cny_fen))
             .select_from(h)
@@ -1948,7 +1948,7 @@ async def refresh_pp_flags(appids: list[int] | None = None) -> int:
         except ValueError:
             return None
 
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND) as session:
         rows = (
             await session.execute(
                 select(subq.c.appid, subq.c.cur_original, subq.c.prior_original).where(
@@ -2094,7 +2094,7 @@ async def refresh_sort_cache(
         await _refresh_smart_scores(session, appids)
         return result.rowcount or 0
 
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as own:
+    async with write_session(WritePriority.BACKGROUND) as own:
         result = await own.execute(sql, params)
         await _refresh_smart_scores(own, appids)
         await own.commit()
@@ -2312,7 +2312,7 @@ async def retry_removed_game(appid: int) -> dict:
     """
 
 
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE) as session:
         row = await session.get(Game, int(appid))
         if row is None:
             raise KeyError(f"游戏 {appid} 不存在")
@@ -2365,7 +2365,7 @@ async def remove_games(appids: list[int]) -> dict:
     if not clean:
         return {"removed": 0, "missing": 0}
 
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE) as session:
         known = set(
             (
                 await session.execute(select(Game.appid).where(Game.appid.in_(clean)))
@@ -2412,7 +2412,7 @@ async def restore_games(appids: list[int]) -> dict:
     if not clean:
         return {"restored": 0, "missing": 0}
 
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE) as session:
         result = await session.execute(
             delete(CatalogRemoval).where(CatalogRemoval.appid.in_(clean))
         )

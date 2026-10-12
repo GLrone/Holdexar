@@ -9,7 +9,6 @@ import {
 import {
   HlButton,
   HlIcon,
-  HlInput,
   HlSelect,
   HlSkeleton,
   HlSwitch,
@@ -64,6 +63,45 @@ function scheduleOf(rowKey: ScheduleRowKey): ContentSchedule {
   return (
     prefs.value?.[field] ?? { time: '', days: 1 }
   )
+}
+
+/* 刷新时刻用「时 + 分」两个主题下拉：原生时间控件的弹层是浏览器自绘的
+ * （白色吃不到主题、分段输入迟钝），换主题化选项后既配色又跟手。
+ * 分钟粒度 5 分钟；库里存过清单外的值（如手改的 07 分）时补一项显示。 */
+const HOUR_CHOICES = Array.from({ length: 24 }, (_, i) => String(i).padStart(2, '0'))
+const MINUTE_CHOICES = Array.from({ length: 12 }, (_, i) => String(i * 5).padStart(2, '0'))
+
+function partsOf(rowKey: ScheduleRowKey): { hour: string; minute: string } {
+  const [h = '', m = ''] = scheduleOf(rowKey).time.split(':')
+  return { hour: h.padStart(2, '0'), minute: m.padStart(2, '0') }
+}
+
+const hourOptions = computed<HlSelectOption[]>(() =>
+  HOUR_CHOICES.map((h) => ({ value: h, label: `${h} ${t('fetch.schedule.hour')}` })),
+)
+
+function minuteOptions(rowKey: ScheduleRowKey): HlSelectOption[] {
+  const opts = MINUTE_CHOICES.map((m) => ({
+    value: m,
+    label: `${m} ${t('fetch.schedule.minute')}`,
+  }))
+  const cur = partsOf(rowKey).minute
+  if (!MINUTE_CHOICES.includes(cur)) {
+    opts.unshift({ value: cur, label: `${cur} ${t('fetch.schedule.minute')}` })
+  }
+  return opts
+}
+
+/** 时刻某一位变化 → 与另一位拼回 HH:MM 保存 */
+async function changeSchedulePart(
+  rowKey: ScheduleRowKey,
+  part: 'hour' | 'minute',
+  value: string | number,
+) {
+  const cur = partsOf(rowKey)
+  const time =
+    part === 'hour' ? `${value}:${cur.minute}` : `${cur.hour}:${value}`
+  await changeSchedule(rowKey, time)
 }
 
 function dayOptions(rowKey: ScheduleRowKey): HlSelectOption[] {
@@ -279,15 +317,22 @@ onMounted(load)
             @update:model-value="(on: boolean) => toggle(row.key, on)"
           />
         </div>
-        <!-- 内容源自定义刷新节奏：时刻 + 间隔天数，改动即时保存并重排定时拍 -->
+        <!-- 内容源自定义刷新节奏：时刻（时+分下拉）+ 间隔天数，改动即时保存并重排定时拍 -->
         <div v-if="row.key in SOURCE_SCHEDULES" class="fetch-row__schedule">
           <span class="fetch-row__schedule-label">{{ t('fetch.schedule.time') }}</span>
-          <HlInput
-            class="fetch-row__time"
-            type="time"
-            :model-value="scheduleOf(row.key as ScheduleRowKey).time"
+          <HlSelect
+            class="fetch-row__time-part"
+            :model-value="partsOf(row.key as ScheduleRowKey).hour"
+            :options="hourOptions"
             :disabled="saving"
-            @update:model-value="(v: string) => changeSchedule(row.key as ScheduleRowKey, v)"
+            @update:model-value="(v: string | number) => changeSchedulePart(row.key as ScheduleRowKey, 'hour', v)"
+          />
+          <HlSelect
+            class="fetch-row__time-part"
+            :model-value="partsOf(row.key as ScheduleRowKey).minute"
+            :options="minuteOptions(row.key as ScheduleRowKey)"
+            :disabled="saving"
+            @update:model-value="(v: string | number) => changeSchedulePart(row.key as ScheduleRowKey, 'minute', v)"
           />
           <span class="fetch-row__schedule-label">{{ t('fetch.schedule.interval') }}</span>
           <HlSelect
@@ -390,8 +435,8 @@ onMounted(load)
   flex-shrink: 0;
 }
 
-.fetch-row__time {
-  width: 128px;
+.fetch-row__time-part {
+  width: 104px;
   flex-shrink: 0;
 }
 

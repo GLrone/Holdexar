@@ -520,6 +520,12 @@ function refreshOwnershipBadges(targets: BundleSummary[]) {
 
 /** silent = 静默保鲜（keep-alive 切回时）：不闪骨架屏、不重置渲染批数，
  *  失败保留原数据不把页面打成错误态 */
+let lastListLoadedAt = 0
+/** 切回保鲜节流：列表数据只在刷新链尾/汇率/用户动作时变化（小时级），
+ *  全量载荷的重复取回+解析会把每次切页卡出可感顿挫——窗口内的切回直接
+ *  用保留的卡片；关注/移除/切排序等动作路径不受此窗约束照常拉取 */
+const RELOAD_SKIP_MS = 10 * 60 * 1000
+
 async function load(silent = false) {
   if (!silent) {
     loading.value = true
@@ -532,6 +538,7 @@ async function load(silent = false) {
   try {
     const res = await bundlesApi.list(sortBy.value, removedView.value)
     bundles.value = res.bundles
+    lastListLoadedAt = Date.now()
     if (!silent) renderLimit.value = RENDER_STEP
   } catch (e) {
     if (!silent) errorMsg.value = e instanceof Error ? e.message : String(e)
@@ -1009,6 +1016,7 @@ onActivated(() => {
     const el = document.querySelector('.view-container')
     if (el) el.scrollTop = savedScrollTop
   })
+  if (Date.now() - lastListLoadedAt < RELOAD_SKIP_MS) return
   void load(true)
 })
 onDeactivated(() => {

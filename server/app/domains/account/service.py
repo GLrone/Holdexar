@@ -28,6 +28,7 @@ from app.core.database import (
     WritePriority,
     get_session_factory,
     write_gate,
+    write_session,
 )
 from app.core.logging import log_event
 from app.core.secretbox import SecretBoxError
@@ -236,7 +237,7 @@ def _session_lock(steam_id: str) -> asyncio.Lock:
 
 async def _save_cookies_only(steam_id: str, cookies: str) -> None:
     """只改账号行 Cookie（续期通道）：不动 active 归属与熔断状态；落库密封。"""
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE) as session:
         row = await session.get(SteamAccount, steam_id)
         if row is None:
             return
@@ -435,7 +436,7 @@ async def save_cookies(cookies_raw: str) -> dict:
     )
 
     now = _naive_now()
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE) as session:
         row = await session.get(SteamAccount, cookie_sid)
         is_new = row is None
         if row is None:
@@ -588,7 +589,7 @@ async def bind_account(cookies_raw: str) -> dict:
 
 async def set_active(steam_id: str) -> dict:
     """切换当前账号（全局唯一 active）。账号不存在时 ValueError。"""
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE) as session:
         row = await session.get(SteamAccount, steam_id)
         if row is None:
             raise ValueError(f"账号不存在: {steam_id}")
@@ -645,7 +646,7 @@ async def remove_account(steam_id: str) -> dict:
     绑定时自动注册的监控追踪随删（与绑定对称）：复用监控池解绑链。
     重绑同一账号会经绑定后置任务自动重新注册追踪，拆除实际可逆。
     """
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE) as session:
         row = await session.get(SteamAccount, steam_id)
         if row is None:
             raise ValueError(f"账号不存在: {steam_id}")
@@ -820,7 +821,7 @@ async def _save_wallet(
     冻结终态），同样只由调用方算好传入。
     """
     now = now or _naive_now()
-    async with write_gate(WritePriority.INTERACTIVE, label="wallet_save"), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE, label="wallet_save") as session:
         row = await session.get(SteamAccount, steam_id)
         if row is None:
             return
@@ -854,7 +855,7 @@ async def _save_wallet(
 async def _reset_wallet_breaker(steam_id: str) -> None:
     """熔断解锁（手动刷新余额 / 换绑 Cookie）：冻结、连续失败计数、
     退避级别一并清零——用户显式介入后从零重计，不带着旧账进新一轮。"""
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE) as session:
         row = await session.get(SteamAccount, steam_id)
         if row is None:
             return
@@ -939,7 +940,7 @@ async def refresh_online_states(rows: list[SteamAccount] | None = None) -> dict:
     if not states:
         return {"ok": False, "status": "fetch_failed"}
     now = _naive_now()
-    async with write_gate(WritePriority.INTERACTIVE, label="account_sync"), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE, label="account_sync") as session:
         for r in rows:
             s = states.get(r.steam_id)
             row = await session.get(SteamAccount, r.steam_id)
@@ -1181,7 +1182,7 @@ async def clear_cookies() -> None:
     被删账号的监控追踪随删（绑定自动注册的对称拆除）；从未绑定凭据、
     仅在监控池手动追踪的账号不受影响。
     """
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE) as session:
         rows = (
             (
                 await session.execute(select(SteamAccount))
@@ -1407,7 +1408,7 @@ async def migrate_legacy_kv() -> int:
     if not cookie_sid:
         return 0
 
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE) as session:
         existing = await session.get(SteamAccount, cookie_sid)
         if existing is not None:
             # 表里已有该账号（多账号时代再回到旧部署不会发生，防御式跳过）
@@ -1454,7 +1455,7 @@ async def seal_credentials_at_rest() -> int:
     返回本次封装的条目数。
     """
     sealed = 0
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE) as session:
         rows = ((await session.execute(select(SteamAccount))).scalars().all())
         for row in rows:
             value = row.cookies or ""

@@ -505,17 +505,50 @@ async function createBackup() {
   }
 }
 
-async function verifyBackup(name: string) {
+async function verifyBackup(name: string, deep = false) {
   verifyingName.value = name
   try {
-    const res = await systemApi.backupVerify(name)
-    if (res.integrityOk)
-      message.success(t('settings.toast.backupVerified', { name, games: res.games }))
-    else message.error(t('settings.toast.backupVerifyFailed', { name }))
+    const res = await systemApi.backupVerify(name, deep)
+    if (res.integrityOk) {
+      message.success(
+        t(deep ? 'settings.toast.backupVerifiedDeep' : 'settings.toast.backupVerified', {
+          name,
+          games: res.games,
+        }),
+      )
+    } else {
+      message.error(t('settings.toast.backupVerifyFailed', { name }))
+    }
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e))
   } finally {
     verifyingName.value = ''
+  }
+}
+
+/* 回收空闲空间：删数据/删索引留下的空页交还磁盘；期间写入暂停、大库是分钟级 */
+const compacting = ref(false)
+const compactArmed = ref(false)
+let compactArmTimer: ReturnType<typeof setTimeout> | null = null
+
+async function compactDb() {
+  if (!compactArmed.value) {
+    compactArmed.value = true
+    if (compactArmTimer) clearTimeout(compactArmTimer)
+    compactArmTimer = setTimeout(() => (compactArmed.value = false), 3000)
+    return
+  }
+  if (compactArmTimer) clearTimeout(compactArmTimer)
+  compactArmed.value = false
+  compacting.value = true
+  try {
+    const res = await systemApi.compactDb()
+    message.success(t('settings.toast.compactDone', { size: fmtSize(res.freedBytes) }))
+    await load()
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+  } finally {
+    compacting.value = false
   }
 }
 
@@ -1733,10 +1766,27 @@ onUnmounted(stopLoginPolling)
               <HlIcon v-if="!backingUp" name="plus" />
               {{ backingUp ? t('settings.backup.snapshotting') : t('settings.backup.createNow') }}
             </HlButton>
+            <HlButton
+              art="outline"
+              size="sm"
+              :disabled="compacting || backingUp"
+              :loading="compacting"
+              :class="{ 'settings-backup-armed': compactArmed }"
+              @click="compactDb"
+            >
+              {{
+                compacting
+                  ? t('settings.backup.compacting')
+                  : compactArmed
+                    ? t('settings.backup.confirmCompact')
+                    : t('settings.backup.compact')
+              }}
+            </HlButton>
             <span class="section-desc" style="display: inline; margin-left: 8px">
               {{ t('settings.backup.count', { n: backups.length }) }}
             </span>
           </div>
+          <div class="section-desc">{{ t('settings.backup.compactHint') }}</div>
         </div>
 
         <div v-if="backups.length" class="settings-backup-list">
@@ -1757,6 +1807,15 @@ onUnmounted(stopLoginPolling)
                 @click="verifyBackup(b.name)"
               >
                 {{ verifyingName === b.name ? t('settings.backup.verifying') : t('settings.backup.verify') }}
+              </HlButton>
+              <HlButton
+                variant="text"
+                size="sm"
+                :disabled="verifyingName === b.name"
+                :title="t('settings.backup.verifyDeepHint')"
+                @click="verifyBackup(b.name, true)"
+              >
+                {{ t('settings.backup.verifyDeep') }}
               </HlButton>
               <a
                 class="settings-backup-download"

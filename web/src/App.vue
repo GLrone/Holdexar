@@ -150,7 +150,7 @@ const logo = computed(() =>
   themeStore.isDark ? '/assets/logo_dark.ico' : '/assets/logo_light.ico',
 )
 
-/* ── 侧边栏：按用户目的分三组——首页不带组名直接置顶，找游戏 /
+/* ── 侧边栏：按用户目的分三组——首页 / 领航台不带组名直接置顶，游戏商店 /
    捆绑包 / 游戏库 / 我的关注 / 价格提醒同属浏览与追踪入口；「更多」
    收具体业务功能；「系统」收技术 / 维护入口。工具箱不进一级导航，
    入口在设置页（次级入口）──
@@ -159,8 +159,8 @@ const navGroups = computed<HlSideNavGroup[]>(() => [
   {
     items: [
       { label: t('nav.dashboard'), to: '/dashboard', icon: 'dashboard' },
-      { label: t('nav.library'), to: '/library', icon: 'store' },
       { label: t('nav.pilot'), to: '/pilot', icon: 'zap' },
+      { label: t('nav.library'), to: '/library', icon: 'store' },
       { label: t('nav.bundles'), to: '/bundles', icon: 'package' },
       { label: t('nav.gamelib'), to: '/gamelib', icon: 'gamepad' },
       { label: t('nav.pool'), to: '/pool', icon: 'target' },

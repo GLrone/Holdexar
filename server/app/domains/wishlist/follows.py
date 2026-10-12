@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from sqlalchemy import update
 
-from app.core.database import WritePriority, get_session_factory
+from app.core.database import WritePriority, write_session
 from app.core.database import write_gate
 from .models import WishlistItem
 
@@ -45,7 +45,7 @@ async def unfollow(appid: int) -> dict:
     target = int(appid)
     await monitoring_service.detach_source("game", target, "favorite")
     # 历史行上的星标标一并清掉（旧模型遗留：manual 标已不再作为关注真相源）
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE) as session:
         await session.execute(
             update(WishlistItem)
             .where(WishlistItem.appid == target, WishlistItem.manual.is_(True))

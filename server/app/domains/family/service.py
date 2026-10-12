@@ -24,9 +24,11 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.core.database import WritePriority, get_session_factory
+from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.database import write_gate
 from app.core.logging import log_event
+# SSL 上下文缓存在 core.tls（成就同步/代理池探测同用一份，一事实一记录者）
+from app.core.tls import ssl_context as _ssl_context
 from app.domains.games import tags as game_tags
 from app.domains.settings import service as settings_service
 
@@ -75,13 +77,13 @@ async def _steam_get(url: str, params: dict, *, method: str = "GET") -> httpx.Re
     """
     proxy = await _strategy_proxy()
     try:
-        async with httpx.AsyncClient(timeout=20, proxy=proxy) as client:
+        async with httpx.AsyncClient(timeout=20, proxy=proxy, verify=_ssl_context(True)) as client:
             resp = await client.request(method, url, params=params)
     except httpx.HTTPError as e:
         if not _is_ssl_error(e):
             raise
         log_event(logger, "Steam 接口证书校验失败（经代理场景），降级跳过校验重试", tag="降级")
-        async with httpx.AsyncClient(timeout=20, proxy=proxy, verify=False) as client:
+        async with httpx.AsyncClient(timeout=20, proxy=proxy, verify=_ssl_context(False)) as client:
             resp = await client.request(method, url, params=params)
     resp.raise_for_status()
     return resp
@@ -306,7 +308,7 @@ async def _backfill_member_countries(row: FamilyGroup) -> None:
     for m in active:
         m["loccountrycode"] = m.get("loccountrycode") or countries.get(str(m["steamid"]))
     try:
-        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+        async with write_session(WritePriority.BACKGROUND) as session:
             fresh = await session.get(FamilyGroup, row.steamid)
             if fresh is not None:
                 fresh.members_json = members
@@ -475,7 +477,7 @@ async def sync_family_group(steam_id: str | None = None) -> dict:
 async def _save_group(primary: str, snap: dict, now: datetime) -> None:
     """组快照落库：Steam 成员按 origin=steam 整表重建；手动添加条目与已移除
     成员的 excluded 排除标记原样保留（同步不复活、不冲掉手动成员）。"""
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND) as session:
         row = await session.get(FamilyGroup, primary)
         if row is None:
             row = FamilyGroup(steamid=primary)
@@ -513,7 +515,7 @@ async def _sync_members_to_accounts(members: list[dict], now: datetime) -> None:
     """
     from app.domains.wishlist.models import TrackedAccount
 
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND) as session:
         existing = {
             r.steamid: r
             for r in (
@@ -602,7 +604,7 @@ async def add_family_member(
         raise ValueError("无效的 SteamID64，请先通过输入框解析好友码")
     owner = await _resolve_group_owner(group_steamid)
     now = datetime.utcnow()
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE) as session:
         row = await session.get(FamilyGroup, owner)
         if owner != LOCAL_GROUP_SID:
             await _absorb_local_members(session, sid)
@@ -661,7 +663,7 @@ async def remove_family_member(steamid: str, group_steamid: str | None = None) -
     是愿望单池页的既有独立动作，职责分离。"""
     sid = str(steamid or "").strip()
     owner = await _resolve_group_owner(group_steamid)
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE) as session:
         row = await session.get(FamilyGroup, owner)
         if row is None:
             raise ValueError("该账号还没有家庭组记录，没有可移除的成员")
@@ -747,7 +749,7 @@ async def _backfill_member_avatars(members: list[dict], owner_sid: str) -> list[
 
     # 写回快照（只更 members_json；失败不影响本次返回，下次再自愈）
     try:
-        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+        async with write_session(WritePriority.BACKGROUND) as session:
             row = await session.get(FamilyGroup, owner_sid)
             if row is not None:
                 row.members_json = members
@@ -1161,7 +1163,7 @@ async def fetch_family_library(steam_id: str | None = None) -> dict:
     if steam_name_by_app:
         from app.domains.games.models import Game as GameRow
 
-        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+        async with write_session(WritePriority.BACKGROUND) as session:
             existing = {
                 r[0]: r[1] for r in (
                     await session.execute(
@@ -1259,7 +1261,7 @@ async def fetch_family_library(steam_id: str | None = None) -> dict:
     # 游玩动态就只剩空态（「经常失败」的另一半）。成功即存，兜底也有数据。
     if owner and member_play:
         try:
-            async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+            async with write_session(WritePriority.BACKGROUND) as session:
                 row = await session.get(FamilyGroup, owner)
                 if row is not None:
                     row.play_json = member_play
@@ -1357,7 +1359,7 @@ async def _upsert_library_snapshot(family_groupid: str, games: list[dict]) -> No
     from .models import FamilyLibrarySnapshot
 
     now = datetime.utcnow()
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND) as session:
         for g in games:
             snap = await session.get(FamilyLibrarySnapshot, (g["appid"], family_groupid))
             if snap is None:
