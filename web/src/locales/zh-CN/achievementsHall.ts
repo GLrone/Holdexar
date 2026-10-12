@@ -1,0 +1,115 @@
+/* achievementsHall 词条 —— 奖杯大厅（views/achievements/sections/LevelCard.vue 与 ChallengeCenter.vue）。
+   术语口径：猎手经验 = 等级经验（后端账本派生）；连猎 = 连续解锁天数；
+   深巡档位 = 单款游戏时长分档；段位按等级分五档。fact 三键由 stores/factNotices.ts 引用，键名固定。 */
+const achievementsHall = {
+  /* ── 分节锚点（data-section）── */
+  'achievements.section.challenges': '猎手挑战',
+
+  /* ── 段位（等级分档；legend 复用白金奖杯件）── */
+  'achievements.level.tier.bronze': '铜猎手',
+  'achievements.level.tier.silver': '银猎手',
+  'achievements.level.tier.gold': '金猎手',
+  'achievements.level.tier.platinum': '白金猎手',
+  'achievements.level.tier.legend': '传奇猎手',
+
+  /* ── 等级卡 ── */
+  'achievements.level.card.title': '猎手等级',
+  'achievements.level.card.totalXp': '生涯猎手经验',
+  'achievements.level.card.progressLabel': '本级进度',
+  'achievements.level.card.nextLevel': '距 {n} 级还差 {xp} 经验',
+  'achievements.level.card.lastCost': '上一级花费',
+  'achievements.level.card.nextCost': '下一级需要',
+  'achievements.level.card.costGrowth': '+{pct}%',
+  'achievements.level.card.costTitle': '升级成本',
+  'achievements.level.card.curveTitle': '升级成本预览',
+  'achievements.level.card.curveBar': '{level} 级 · 需 {xp} 经验',
+  'achievements.level.card.milestonesTitle': '境界节点',
+  'achievements.level.card.milestoneNext': '下一境界',
+  'achievements.level.card.recentTitle': '近期经验',
+  'achievements.level.card.recentEmpty': '还没有经验记录',
+  'achievements.level.card.xpGain': '+{xp}',
+
+  /* ── 经验加成 ── */
+  'achievements.level.bonus.streak': '连猎 {days} 天 · 经验 +{percent}%',
+
+  /* ── 经验来源（近期经验列表行首）── */
+  'achievements.level.event.achievementUnlock': '成就解锁',
+  'achievements.level.event.platinum': '白金达成',
+  'achievements.level.event.playtimeBucket': '深度巡猎',
+  'achievements.level.event.streakDay': '连猎日',
+  'achievements.level.event.challengeClaim': '挑战奖励',
+  'achievements.level.event.comment': '成就批注',
+  'achievements.level.event.baseline': '生涯折算',
+
+  /* ── 挑战中心 ── */
+  'achievements.challenge.tier.bronze': '铜',
+  'achievements.challenge.tier.silver': '银',
+  'achievements.challenge.tier.gold': '金',
+  'achievements.challenge.category.milestone': '里程碑',
+  'achievements.challenge.category.cumulative': '累计',
+  'achievements.challenge.category.streak': '连续',
+  'achievements.challenge.category.collection': '收集',
+  'achievements.challenge.category.platinum': '白金',
+  'achievements.challenge.category.comment': '批注',
+  'achievements.challenge.category.social': '社交',
+  'achievements.challenge.status.active': '进行中',
+  'achievements.challenge.status.completed': '可领取',
+  'achievements.challenge.status.claimed': '已领取',
+  'achievements.challenge.action.claim': '领取奖励',
+  'achievements.challenge.action.reward': '+{n} 经验',
+  'achievements.challenge.action.granted': '+{n} 经验已入账',
+  'achievements.challenge.action.failed': '领取失败：{error}',
+  'achievements.challenge.action.leveledUp': '猎手等级提升至 {n} 级！',
+  'achievements.challenge.progressOf': '{progress}/{target}',
+  'achievements.challenge.summary': '{done}/{total} 已完成 · {claimable} 项可领取',
+  'achievements.challenge.filter.all': '全部',
+
+  /* ── 挑战条目（名称为目录概念名；desc 说清推进方式）── */
+  'achievements.challenge.item.first_trophy.name': '初猎入袋',
+  'achievements.challenge.item.first_trophy.desc': '解锁你的第一枚成就',
+  'achievements.challenge.item.hunter_twelve.name': '十二猎',
+  'achievements.challenge.item.hunter_twelve.desc': '累计解锁 12 枚成就',
+  'achievements.challenge.item.hunter_fifty.name': '半百猎手',
+  'achievements.challenge.item.hunter_fifty.desc': '累计解锁 50 枚成就',
+  'achievements.challenge.item.hunter_hundred.name': '百猎殿堂',
+  'achievements.challenge.item.hunter_hundred.desc': '累计解锁 100 枚成就',
+  'achievements.challenge.item.streak_three.name': '三日连猎',
+  'achievements.challenge.item.streak_three.desc': '连续 3 天都有新成就入账',
+  'achievements.challenge.item.streak_seven.name': '七日不断线',
+  'achievements.challenge.item.streak_seven.desc': '连续 7 天都有新成就入账',
+  'achievements.challenge.item.streak_thirty.name': '月度长猎',
+  'achievements.challenge.item.streak_thirty.desc': '连续 30 天都有新成就入账',
+  'achievements.challenge.item.platinum_first.name': '首座白金',
+  'achievements.challenge.item.platinum_first.desc': '迎来第一款全成就游戏',
+  'achievements.challenge.item.platinum_five.name': '白金陈列架',
+  'achievements.challenge.item.platinum_five.desc': '集齐 5 款全成就游戏',
+  'achievements.challenge.item.platinum_twelve.name': '白金殿堂',
+  'achievements.challenge.item.platinum_twelve.desc': '集齐 12 款全成就游戏',
+  'achievements.challenge.item.breadth_twenty.name': '猎园初成',
+  'achievements.challenge.item.breadth_twenty.desc': '20 款游戏里有成就入账',
+  'achievements.challenge.item.full_clear_first.name': '满盘初收',
+  'achievements.challenge.item.full_clear_first.desc': '把一款游戏的成就全部拿下',
+  'achievements.challenge.item.full_clear_triple.name': '满堂三彩',
+  'achievements.challenge.item.full_clear_triple.desc': '把 3 款游戏的成就全部拿下',
+  'achievements.challenge.item.hours_hundred.name': '百时巡猎',
+  'achievements.challenge.item.hours_hundred.desc': '游玩时长累计满 100 小时',
+  'achievements.challenge.item.hours_thousand.name': '千时猎场',
+  'achievements.challenge.item.hours_thousand.desc': '游玩时长累计满 1000 小时',
+  'achievements.challenge.item.buckets_ten.name': '深巡十档',
+  'achievements.challenge.item.buckets_ten.desc': '把单款游戏玩进更深的时长档，累计跨越 10 档',
+  'achievements.challenge.item.note_first.name': '第一笔批注',
+  'achievements.challenge.item.note_first.desc': '为一枚成就写下你的第一条批注',
+  'achievements.challenge.item.note_gallery.name': '批注成册',
+  'achievements.challenge.item.note_gallery.desc': '批注累计写满 25 条',
+  'achievements.challenge.item.social_duo.name': '双人成行',
+  'achievements.challenge.item.social_duo.desc': '添加家庭成员后，让另一个账号也有成就记录',
+  'achievements.challenge.item.social_trio.name': '猎队成军',
+  'achievements.challenge.item.social_trio.desc': '添加家庭成员，凑齐 3 个各有 10 枚以上成就的账号',
+
+  /* ── 事实通知（灵动岛；键名固定，stores/factNotices.ts 引用）── */
+  'achievements.fact.levelUp': '猎手等级提升：{fromLevel} → {toLevel}',
+  'achievements.fact.challengeDone': '挑战达成「{name}」，奖励可领取',
+  'achievements.fact.unlockedBatch': '新收获 {count} 枚成就：{titles}',
+}
+
+export default achievementsHall
