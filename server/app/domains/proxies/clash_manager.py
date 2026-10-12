@@ -649,6 +649,22 @@ def pin_mixed_port(config_text: str, port: int) -> str:
     return yaml.safe_dump(doc, allow_unicode=True, sort_keys=False)
 
 
+def strip_tun_section(config_text: str) -> str:
+    """剥掉订阅自带的虚拟网卡段（tun）与其下的域名解析接管配置（幂等）。
+
+    程序的内核只做出口，不接管本机流量——订阅 yaml 常自带 tun 段与 dns-hijack
+    列表，照单收下会让内核去抢系统 DNS、把整机的域名解析换成假地址。不可解析
+    的配置原样返回（校验与入口就绪检查会拦住起不来的形态）。"""
+    try:
+        doc = yaml.safe_load(config_text)
+    except yaml.YAMLError:
+        return config_text
+    if not isinstance(doc, dict) or "tun" not in doc:
+        return config_text
+    doc.pop("tun", None)
+    return yaml.safe_dump(doc, allow_unicode=True, sort_keys=False)
+
+
 CONTROLLER_PORT = 19090
 CONTROLLER_SECRET = APP_SLUG
 
@@ -1008,7 +1024,7 @@ class ClashRuntime:
         只杀命令行包含本内核 exe 且带 -f 本配置的实例，不动用户自启的
         Clash / Verge；返回清理数。wmic 已从新版 Windows 移除，用 CIM。
         """
-        escaped_cfg = config_path.replace("\\", "\\")
+        escaped_cfg = config_path.replace("[", "`[").replace("]", "`]").replace("'", "''")
         ps_script = (
             "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
             "Get-CimInstance Win32_Process -Filter \"Name='mihomo.exe'\" | "
@@ -1100,6 +1116,10 @@ class ClashRuntime:
             if pinned != config_text:
                 Path(config_path).write_text(pinned, encoding="utf-8")
                 config_text = pinned
+        stripped = strip_tun_section(config_text)
+        if stripped != config_text:
+            Path(config_path).write_text(stripped, encoding="utf-8")
+            config_text = stripped
         validate_config(exe_path, config_path, Path(config_path).parent)
         self.port = parse_mixed_port(config_text)
         # 控制器经命令行参数下发（-ext-ctl / -secret）：优先级高于配置文件，
@@ -1188,6 +1208,7 @@ class ClashRuntime:
         text = inject_probe_lanes(text)
         if mixed_port:
             text = pin_mixed_port(text, mixed_port)
+        text = strip_tun_section(text)
         Path(config_path).write_text(text, encoding="utf-8")
         return text, prev_file_text
 
@@ -1425,7 +1446,7 @@ class ClashRuntime:
                     for t in pending:
                         t.cancel()
                     nodes = parse_node_names(text)
-                    path.write_text(text, encoding="utf-8")
+                    path.write_text(strip_tun_section(text), encoding="utf-8")
                     # 自动取名链：profile-title → Content-Disposition → URL 末段
                     title = subscription_auto_name(resp.headers, sub_url)
                     userinfo = resp.headers.get("subscription-userinfo")

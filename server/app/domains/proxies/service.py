@@ -1853,7 +1853,13 @@ async def _probe_nodes_via_selector(
             try:
                 await ctl.patch(f"{base}/configs", json={"mode": prev_mode})
             except Exception:  # noqa: BLE001
-                pass
+                log_event(
+                    logger,
+                    "检测后恢复内核路由模式失败，内核可能仍处于 global 模式（重启内核可恢复）",
+                    tag="告警",
+                    level=logging.WARNING,
+                    detail={"原模式": prev_mode},
+                )
     return results
 
 
@@ -2278,7 +2284,7 @@ async def _apply_node_results(
                     tier = min(row.fail_count, len(_FAIL_COOLDOWN_MINUTES)) - 1
                     cooldown_min = _FAIL_COOLDOWN_MINUTES[tier]
                     row.cooldown_until = now + timedelta(minutes=cooldown_min)
-                    row.status = "unknown" if row.status == "unknown" else row.status  # 保留 ok（冷却后复检）
+                    # status 保持不动：ok 的冷却后复检，unknown 的继续未知
 
         await session.commit()
 

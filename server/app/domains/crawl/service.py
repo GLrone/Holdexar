@@ -25,10 +25,14 @@ from app.domains.crawl.models import CrawlJob
 from app.domains.games.models import Game, GameCurrentPrice
 from app.domains.games import service as games_service
 from app.domains.games import series as games_series
+from app.domains.proxies import env_check
 from app.domains.regions.service import effective_regions
 from app.domains.wishlist.models import WishlistItem
 
 logger = logging.getLogger(__name__)
+
+# 模块级引用：本机网络环境判定，测试按此符号打桩
+_tun_mode_suspected = env_check.tun_mode_suspected
 
 
 @dataclass
@@ -1308,6 +1312,22 @@ async def run_sequential(
         if stop_event is not None and stop_event.is_set():
             if skip_reasons is not None:
                 skip_reasons.append(f"{spec.get('kind', spec.get('scope'))}：用户已停止")
+            break
+        # 本机网络被接管时抓取只会堆失败记录与限流：当前段跑完（已爬数据照常
+        # 落库）后不再推进下一段，链按协作式停止收敛
+        if _tun_mode_suspected():
+            if stop_event is not None:
+                stop_event.set()
+            if skip_reasons is not None:
+                skip_reasons.append(
+                    f"{spec.get('kind', spec.get('scope'))}：{env_check.USER_MESSAGE}"
+                )
+            log_event(
+                logger,
+                "本机网络被其他软件接管，抓取链在当前段结束后停止",
+                tag="跳过",
+                detail={"原因": env_check.USER_MESSAGE},
+            )
             break
         try:
             result = await start_job(
