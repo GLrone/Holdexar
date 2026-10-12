@@ -21,7 +21,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.core.database import Base, WritePriority, get_session_factory
+from app.core.database import WritePriority, get_session_factory, write_session, Base
 from app.core.database import write_gate
 from app.domains.crawl.cycle import PriceCycle
 from app.domains.games.models import Game, GameCurrentPrice
@@ -483,7 +483,7 @@ async def _persist(events: list[dict]) -> list[dict]:
         return []
     written: list[dict] = []
     now = datetime.now()
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND) as session:
         for item in events:
             stmt = (
                 sqlite_insert(PriceEvent)

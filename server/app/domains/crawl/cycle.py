@@ -14,7 +14,7 @@ from datetime import datetime
 from sqlalchemy import DateTime, Float, Index, Integer, String, Text, JSON, select
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.core.database import Base, WritePriority, get_session_factory, write_gate
+from app.core.database import WritePriority, get_session_factory, write_session, Base
 from app.core.logging import log_event
 from app.domains.crawl.models import CrawlJob
 
@@ -116,14 +116,13 @@ async def create(kind: str, scope: str = "") -> int:
     写事务过写调度器：不过闸的 commit 会在 SQLite 写锁上排到
     busy_timeout 超时，整轮价格刷新就没了归属。
     """
-    async with write_gate(WritePriority.BACKGROUND):
-        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
-            cycle = PriceCycle(
-                kind=kind, status=PLANNING, scope=scope, started_at=datetime.now()
-            )
-            session.add(cycle)
-            await session.commit()
-            return cycle.id
+    async with write_session(WritePriority.BACKGROUND) as session:
+        cycle = PriceCycle(
+            kind=kind, status=PLANNING, scope=scope, started_at=datetime.now()
+        )
+        session.add(cycle)
+        await session.commit()
+        return cycle.id
 
 
 async def freeze_expected(cycle_id: int, specs: list[dict]) -> tuple[list[str] | None, int]:
@@ -183,14 +182,13 @@ async def freeze_expected(cycle_id: int, specs: list[dict]) -> tuple[list[str] |
                 appids.append(appid)
     batches_expected *= len(regions)
 
-    async with write_gate(WritePriority.BACKGROUND):
-        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
-            cycle = await session.get(PriceCycle, cycle_id)
-            if cycle is not None:
-                cycle.expected_json = {"appids": appids, "regions": regions}
-                cycle.specs_json = [dict(s) for s in specs]
-                cycle.batches_expected = batches_expected
-                await session.commit()
+    async with write_session(WritePriority.BACKGROUND) as session:
+        cycle = await session.get(PriceCycle, cycle_id)
+        if cycle is not None:
+            cycle.expected_json = {"appids": appids, "regions": regions}
+            cycle.specs_json = [dict(s) for s in specs]
+            cycle.batches_expected = batches_expected
+            await session.commit()
     return regions, len(appids) * len(regions)
 
 
@@ -203,42 +201,41 @@ async def advance(cycle_id: int | None, status: str, *, error: str | None = None
     """
     if cycle_id is None:
         return False
-    async with write_gate(WritePriority.BACKGROUND):
-        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
-            cycle = await session.get(PriceCycle, cycle_id)
-            if cycle is None:
-                return False
-            current = cycle.status
-            if current in TERMINAL_STATES:
-                log_event(
-                    logger,
-                    f"价格刷新周期 {cycle_id} 已是终态，忽略本次推进",
-                    tag="忽略",
-                    detail={"周期": cycle_id, "当前状态": current, "目标状态": status},
-                )
-                return False
-            if status not in _TRANSITIONS.get(current, ()):
-                log_event(
-                    logger,
-                    f"价格刷新周期 {cycle_id} 拒绝非法的状态跃迁",
-                    tag="忽略",
-                    level=logging.WARNING,
-                    detail={"周期": cycle_id, "当前状态": current, "目标状态": status},
-                )
-                return False
-            cycle.status = status
-            now = datetime.now()
-            if status == RUNNING:
-                cycle.running_at = now
-            elif status == REPAIRING:
-                cycle.repairing_at = now
-            elif status == FINALIZING:
-                cycle.finalizing_at = now
-            if error is not None:
-                cycle.error = error
-            if status in TERMINAL_STATES:
-                cycle.finished_at = now
-            await session.commit()
+    async with write_session(WritePriority.BACKGROUND) as session:
+        cycle = await session.get(PriceCycle, cycle_id)
+        if cycle is None:
+            return False
+        current = cycle.status
+        if current in TERMINAL_STATES:
+            log_event(
+                logger,
+                f"价格刷新周期 {cycle_id} 已是终态，忽略本次推进",
+                tag="忽略",
+                detail={"周期": cycle_id, "当前状态": current, "目标状态": status},
+            )
+            return False
+        if status not in _TRANSITIONS.get(current, ()):
+            log_event(
+                logger,
+                f"价格刷新周期 {cycle_id} 拒绝非法的状态跃迁",
+                tag="忽略",
+                level=logging.WARNING,
+                detail={"周期": cycle_id, "当前状态": current, "目标状态": status},
+            )
+            return False
+        cycle.status = status
+        now = datetime.now()
+        if status == RUNNING:
+            cycle.running_at = now
+        elif status == REPAIRING:
+            cycle.repairing_at = now
+        elif status == FINALIZING:
+            cycle.finalizing_at = now
+        if error is not None:
+            cycle.error = error
+        if status in TERMINAL_STATES:
+            cycle.finished_at = now
+        await session.commit()
     return True
 
 
@@ -339,26 +336,25 @@ async def write_stats(cycle_id: int, stats: dict) -> bool:
     统计是观测结果，不参与控制：任何读取面（调度、重试、worker 数）都不得
     以这些数字作为输入。
     """
-    async with write_gate(WritePriority.BACKGROUND):
-        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
-            cycle = await session.get(PriceCycle, cycle_id)
-            if cycle is None:
-                return False
-            cycle.targets_total = stats["targetsTotal"]
-            cycle.targets_done = stats["targetsDone"]
-            cycle.units_expected = stats["unitsExpected"]
-            cycle.units_ok = stats["unitsOk"]
-            cycle.units_locked = stats["unitsLocked"]
-            cycle.units_failed = stats["unitsFailed"]
-            cycle.units_missing = stats["unitsMissing"]
-            cycle.units_blocked = stats["unitsBlocked"]
-            cycle.units_unobserved = stats["unitsUnobserved"]
-            cycle.coverage = stats["coverage"]
-            cycle.coverage_confirmed = stats["coverageConfirmed"]
-            cycle.stale_count = stats["staleCount"]
-            cycle.duration_seconds = stats["durationSeconds"]
-            cycle.stage_ms_json = stats["stageMs"]
-            await session.commit()
+    async with write_session(WritePriority.BACKGROUND) as session:
+        cycle = await session.get(PriceCycle, cycle_id)
+        if cycle is None:
+            return False
+        cycle.targets_total = stats["targetsTotal"]
+        cycle.targets_done = stats["targetsDone"]
+        cycle.units_expected = stats["unitsExpected"]
+        cycle.units_ok = stats["unitsOk"]
+        cycle.units_locked = stats["unitsLocked"]
+        cycle.units_failed = stats["unitsFailed"]
+        cycle.units_missing = stats["unitsMissing"]
+        cycle.units_blocked = stats["unitsBlocked"]
+        cycle.units_unobserved = stats["unitsUnobserved"]
+        cycle.coverage = stats["coverage"]
+        cycle.coverage_confirmed = stats["coverageConfirmed"]
+        cycle.stale_count = stats["staleCount"]
+        cycle.duration_seconds = stats["durationSeconds"]
+        cycle.stage_ms_json = stats["stageMs"]
+        await session.commit()
     return True
 
 
@@ -392,7 +388,7 @@ async def cleanup_orphan_cycles() -> int:
     与 `cleanup_orphan_jobs` 同一步骤：遗留的 running Cycle 若不清，
     「这一轮跑到哪了」永远无解（状态卡在中间态、finished_at 空着）。
     """
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND) as session:
         rows = (
             await session.execute(
                 select(PriceCycle).where(PriceCycle.status.in_(OPEN_STATES))

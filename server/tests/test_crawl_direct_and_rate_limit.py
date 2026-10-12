@@ -412,6 +412,8 @@ async def test_rate_limiter_blocks_beyond_window(monkeypatch):
 
     async def _fast_sleep(seconds):
         sleeps.append(seconds)
+        # 睡眠即时间流逝：把全部时间戳按等待时长回拨，窗口真实滑动
+        lim._timestamps = deque(t - seconds for t in lim._timestamps)
 
     monkeypatch.setattr(
         "app.crawler.rate_limit.asyncio.sleep", _fast_sleep
@@ -419,6 +421,24 @@ async def test_rate_limiter_blocks_beyond_window(monkeypatch):
     await lim.acquire()
     assert sleeps, "窗口满时必须等待（测试中 sleep 被替换为记录）"
     assert sleeps[0] <= 1.2 + 1e-6, "等待时长 = 最旧请求出窗剩余时间"
+    assert len(sleeps) == 1, "最旧一条出窗后必须立即放行，不得反复重等"
+
+
+@pytest.mark.asyncio
+async def test_rate_limiter_waiting_gauge_counts_each_request_once():
+    """排队计数口径：每个等待中的请求只计一次、取号后归零。
+
+    回归锚：等待是循环重取——若退回逐轮叠加（旧递归形态），
+    waiting 会变成「排队链长」而非「排队人数」，任务页读数失真。
+    """
+    lim = SlidingWindowRateLimiter(2, 0.2)
+    await lim.acquire()
+    await lim.acquire()
+    waiters = [asyncio.create_task(lim.acquire()) for _ in range(3)]
+    await asyncio.sleep(0.1)
+    assert lim.waiting == 3, "排队计数 = 等待中的请求数（不随重取轮次叠加）"
+    await asyncio.gather(*waiters)
+    assert lim.waiting == 0, "取号完成后排队计数必须归零"
 
 
 @pytest.mark.asyncio
