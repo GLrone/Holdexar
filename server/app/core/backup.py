@@ -80,6 +80,10 @@ async def create_backup(label: str | None = None, manual: bool = False) -> dict:
     src = _db_path()
     if not src.is_file():
         raise RuntimeError(f"数据库文件不存在: {src}")
+    # 恢复/收缩进行中不得再开一份快照：那期间引擎已断开、主库正在被替换，
+    # 此刻的 VACUUM INTO 会读到一个句柄已释放或正在换位的库。
+    if (backup_dir() / _LOCK_FILE).exists():
+        raise RuntimeError("已有恢复或空间回收操作在进行中，请稍后再备份")
     if label and not all(c.isalnum() or c in "-_" for c in label):
         raise ValueError("label 只允许字母数字和 -_")
     name = f"{src.stem}-{_ts()}"
@@ -94,11 +98,12 @@ async def create_backup(label: str | None = None, manual: bool = False) -> dict:
 
     await asyncio.to_thread(snapshot_to, src, snapshot)
 
-    # 自洽校验：快照必须能独立打开且 integrity 通过
+    # 自洽校验：快照必须能独立打开且结构一致（quick_check：O(N)，深度校验留
+    # 给恢复前与用户显式要求；此处的职责是挡住坏档，不是逐索引比对）
     integrity_ok, games = await asyncio.to_thread(_verify_file, snapshot)
     if not integrity_ok:
         snapshot.unlink(missing_ok=True)
-        raise RuntimeError("备份自洽校验失败（integrity_check 未通过），已删除坏档")
+        raise RuntimeError("备份自洽校验失败（一致性检查未通过），已删除坏档")
 
     raw_bytes = snapshot.stat().st_size
     try:
@@ -177,6 +182,23 @@ def _decompress_archive(archive: Path, dest: Path) -> None:
         shutil.copyfileobj(fin, fout, length=1 << 20)
 
 
+def _stream_verify_archive(archive: Path) -> bool:
+    """流式解压并丢弃输出：只验「这份归档能不能解出完整正确的字节流」。
+
+    读到流尾会触发 gzip 自带的 CRC32 + ISIZE 校验（RFC 1952），因此它同时
+    证明了「压缩流结构完好」「解出的字节数与写入时一致」「解出的内容与写入时
+    一致」三件事。不解档落盘、不开 SQLite，是同档体积下最便宜的可还原性证明。
+    失败（截断、CRC 不符）返回 False，不抛。
+    """
+    try:
+        with gzip.open(archive, "rb") as fin:
+            while fin.read(1 << 22):
+                pass
+        return True
+    except (OSError, EOFError, gzip.BadGzipFile):
+        return False
+
+
 def _archive_meta_path(archive: Path) -> Path:
     return archive.with_name(archive.name + META_SUFFIX)
 
@@ -242,28 +264,56 @@ async def compact_main_db() -> dict:
             await asyncio.to_thread(_vacuum_file, src)
         finally:
             engine_ok = await _rebuild_engine()
-        after = _footprint(src)
         if not engine_ok:
             raise RuntimeError("空间回收后数据库引擎重建失败——请检查数据目录")
+        # 收缩会把整库经 WAL 重写一遍，事后 WAL 可能涨到库体积量级；不截断它，
+        # 「总占用」反而变大，用户看到的释放量就是负数。截断只影响文件长度，
+        # 不影响已提交数据。
+        await _truncate_wal()
+        after = _footprint(src)
+        after_main = src.stat().st_size
         log_event(
             logger,
             "数据库空闲空间已回收",
             tag="成功",
             detail={
-                "收缩前MB": round(before / 1024 / 1024, 1),
-                "收缩后MB": round(after / 1024 / 1024, 1),
+                "主库收缩前MB": round(before_main / 1024 / 1024, 1),
+                "主库收缩后MB": round(after_main / 1024 / 1024, 1),
+                "总占用收缩前MB": round(before / 1024 / 1024, 1),
+                "总占用收缩后MB": round(after / 1024 / 1024, 1),
             },
         )
         return {
             "beforeBytes": before,
             "afterBytes": after,
-            "freedBytes": before - after,
+            # 分项取非负：主库与 WAL 各自只报缩减量。两者混成一个差值时，
+            # 「主库缩了但 WAL 涨了」会算出一个负数，用户看到「释放 -2.2 GB」。
+            "freedBytes": max(before_main - after_main, 0)
+            + max((before - before_main) - (after - after_main), 0),
             "mainDbBeforeBytes": before_main,
-            "mainDbAfterBytes": src.stat().st_size,
+            "mainDbAfterBytes": after_main,
         }
     finally:
         start_scheduler()
         lock_path.unlink(missing_ok=True)
+
+
+async def _truncate_wal() -> None:
+    """把 WAL 物理截断到最小（TRUNCATE checkpoint），失败不抛。
+
+    收缩后 WAL 里留着整库的重写副本，占位可能比回收出来的空间还大；截断把
+    文件长度收回，同时不丢任何已提交数据。撞上并发读时 checkpoint 会做不完，
+    属可接受的降级（下次写入自然推进）。
+    """
+    try:
+        from sqlalchemy import text
+
+        from .database import get_engine
+
+        async with get_engine().connect() as conn:
+            await conn.execute(text("PRAGMA wal_checkpoint(TRUNCATE)"))
+    except Exception:  # noqa: BLE001 —— 截断是收尾优化，失败不影响回收结论
+        log_event(logger, "WAL 截断未完成，留待下次写入推进", tag="跳过")
 
 
 def _footprint(src: Path) -> int:
@@ -305,11 +355,16 @@ def _vacuum_file(src: Path) -> None:
         conn.close()
 
 
-def _verify_file(path: Path) -> tuple[bool, int]:
-    """独立打开 + integrity_check + 核心表行数。返回 (是否自洽, games 行数)。
+def _verify_file(path: Path, deep: bool = False) -> tuple[bool, int]:
+    """独立打开 + 一致性自检 + 核心表行数。返回 (是否自洽, games 行数)。
 
-    损坏文件（非 SQLite 格式）执行 integrity_check 会直接抛
-    DatabaseError——按不自洽处理，不让异常穿透到调用方。
+    `deep=False` 走 `quick_check`（复杂度 O(N)），`deep=True` 走
+    `integrity_check`（O(N log N)，大库上慢一个数量级）：日常校验用前者，
+    后者留给恢复前与用户显式要求的深度校验。quick_check 不验证 UNIQUE 约束
+    与索引内容匹配，取舍见调用方说明。
+
+    损坏文件（非 SQLite 格式）执行自检会直接抛 DatabaseError——按不自洽处理，
+    不让异常穿透到调用方。
     """
     if not path.is_file():
         return False, 0
@@ -319,7 +374,9 @@ def _verify_file(path: Path) -> tuple[bool, int]:
         return False, 0
     try:
         try:
-            row = conn.execute("PRAGMA integrity_check").fetchone()
+            row = conn.execute(
+                "PRAGMA integrity_check" if deep else "PRAGMA quick_check"
+            ).fetchone()
         except sqlite3.DatabaseError:
             return False, 0  # 非 SQLite 格式 / 页头损坏
         if not row or row[0] != "ok":
@@ -334,42 +391,76 @@ def _verify_file(path: Path) -> tuple[bool, int]:
         conn.close()
 
 
-async def verify_backup(name: str) -> dict:
-    """校验一份备份的自洽性（不动任何文件）。
+async def verify_backup(name: str, deep: bool = False) -> dict:
+    """校验一份备份（不动任何文件），分三档，成本差约两个数量级。
 
-    归档档比对随档存下的 sha256（只读档、不解档不整库自检）；元数据缺失时才
-    解档走一遍完整性自检。旧的未压缩 .db 照旧独立打开自检。
+    - **哈希**：归档档比对随档 sha256——证明「这份归档没有被改动过」。
+    - **可还原**（默认档）：流式解压丢弃，触发 gzip 的 CRC32 + ISIZE 端到端
+      校验——证明「它能解出完整正确的字节流」。两者都不开 SQLite。
+    - **深校验**（`deep=True`）：解档到探针 + 表结构与行数自检——证明「它是一
+      个结构自洽的库」。旧的未压缩 `.db` 没有压缩层，直接走深校验。
+
+    返回里 `checks` 逐项给出每一档的结论，`integrityOk` 是它们的合取。
     """
     import asyncio
 
     path = safe_backup_path(backup_dir(), name)
     size = path.stat().st_size if path.is_file() else 0
     if not size:
-        return {"name": name, "integrityOk": False, "games": 0, "sizeBytes": 0}
+        return {
+            "name": name, "integrityOk": False, "games": 0, "sizeBytes": 0,
+            "checks": {"hashOk": False, "restorableOk": False, "deepOk": None},
+        }
     if path.suffix != ".gz":
-        integrity_ok, games = await asyncio.to_thread(_verify_file, path)
-        return {"name": name, "integrityOk": integrity_ok, "games": games, "sizeBytes": size}
+        integrity_ok, games = await asyncio.to_thread(_verify_file, path, deep)
+        return {
+            "name": name, "integrityOk": integrity_ok, "games": games,
+            "sizeBytes": size,
+            "checks": {"hashOk": None, "restorableOk": None, "deepOk": integrity_ok},
+        }
 
     meta = _read_archive_meta(path)
     expected = str(meta.get("sha256") or "")
+    actual = ""
+    hash_ok: bool | None = None
     if expected:
         actual = await asyncio.to_thread(sha256_of, path)
+        hash_ok = actual.lower() == expected.lower()
+        if not hash_ok:
+            # 归档与随档哈希不符：不再往下解档，结论已确定
+            return {
+                "name": name, "integrityOk": False, "games": 0, "sizeBytes": size,
+                "sha256": actual, "rawBytes": int(meta.get("rawBytes") or 0),
+                "checks": {"hashOk": False, "restorableOk": None, "deepOk": None},
+            }
+
+    if not deep:
+        restorable_ok = await asyncio.to_thread(_stream_verify_archive, path)
         return {
             "name": name,
-            "integrityOk": actual.lower() == expected.lower(),
+            "integrityOk": restorable_ok,
             "games": int(meta.get("games") or 0),
             "sizeBytes": size,
             "sha256": actual,
             "rawBytes": int(meta.get("rawBytes") or 0),
+            "checks": {"hashOk": hash_ok, "restorableOk": restorable_ok, "deepOk": None},
         }
 
     probe = path.with_name(path.name + ".verify.tmp")  # 不进备份列表的解档探针
     try:
         await asyncio.to_thread(_decompress_archive, path, probe)
-        integrity_ok, games = await asyncio.to_thread(_verify_file, probe)
+        deep_ok, games = await asyncio.to_thread(_verify_file, probe, deep)
     finally:
         probe.unlink(missing_ok=True)
-    return {"name": name, "integrityOk": integrity_ok, "games": games, "sizeBytes": size}
+    return {
+        "name": name,
+        "integrityOk": deep_ok,
+        "games": games,
+        "sizeBytes": size,
+        "sha256": actual,
+        "rawBytes": int(meta.get("rawBytes") or 0),
+        "checks": {"hashOk": hash_ok, "restorableOk": None, "deepOk": deep_ok},
+    }
 
 
 def _archive_files() -> list[Path]:
@@ -481,26 +572,31 @@ async def restore_backup(name: str) -> dict:
     compressed = path.suffix == ".gz"
 
     # ── 段 1：哈希比对 → 解档 → 完整性与表集合比对 ──
-    if compressed:
-        expected = str(_read_archive_meta(path).get("sha256") or "")
-        if expected and (
-            (await asyncio.to_thread(sha256_of, path)).lower() != expected.lower()
-        ):
-            raise RuntimeError(f"备份哈希不符（归档不完整或已损坏）: {name}")
-        await asyncio.to_thread(_decompress_archive, path, probe)
-    verify_target = probe if compressed else path
-    integrity_ok, _ = await asyncio.to_thread(_verify_file, verify_target)
-    if not integrity_ok:
+    # 本段自带清理：解档可能抛（截断归档的 EOFError/BadGzipFile），若把清理留给
+    # 段 2 的 finally，异常会直接穿出并把探针留在备份目录里——那个名字既不被
+    # 列表认领也不被删除放行，用户永远看不见也删不掉。
+    try:
+        if compressed:
+            expected = str(_read_archive_meta(path).get("sha256") or "")
+            if expected and (
+                (await asyncio.to_thread(sha256_of, path)).lower() != expected.lower()
+            ):
+                raise RuntimeError(f"备份哈希不符（归档不完整或已损坏）: {name}")
+            await asyncio.to_thread(_decompress_archive, path, probe)
+        verify_target = probe if compressed else path
+        integrity_ok, _ = await asyncio.to_thread(_verify_file, verify_target, True)
+        if not integrity_ok:
+            raise RuntimeError(f"备份文件校验失败: {name}")
+        backup_tables = await asyncio.to_thread(_table_names, verify_target)
+        current_tables = await asyncio.to_thread(_table_names, src)
+        if current_tables and not backup_tables >= current_tables:
+            missing = current_tables - backup_tables
+            raise RuntimeError(
+                f"备份缺表（版本过旧，恢复会丢数据）: {', '.join(sorted(missing))}"
+            )
+    except Exception:
         probe.unlink(missing_ok=True)
-        raise RuntimeError(f"备份文件校验失败: {name}")
-    backup_tables = await asyncio.to_thread(_table_names, verify_target)
-    current_tables = await asyncio.to_thread(_table_names, src)
-    if current_tables and not backup_tables >= current_tables:
-        missing = current_tables - backup_tables
-        probe.unlink(missing_ok=True)
-        raise RuntimeError(
-            f"备份缺表（版本过旧，恢复会丢数据）: {', '.join(sorted(missing))}"
-        )
+        raise
 
     # ── 段 2：回滚档 → 停写入面（调度器 + 爬取 + 引擎连接）──
     # 回滚档必须在停引擎之前做：VACUUM INTO 是在线快照、不需独占；停引擎后再复制

@@ -200,3 +200,101 @@ async def test_gate_keeps_explicit_label():
 
     async with write_gate(WritePriority.BACKGROUND, label="price_batch"):
         assert write_scheduler_diagnostics()["owner_label"] == "price_batch"
+
+
+@pytest.mark.asyncio
+async def test_write_session_begins_immediate_and_holds_sqlite_lock(tmp_path, monkeypatch):
+    """write_session 事务起点显式取写锁：持有期间外部连接拿不到 SQLite 写锁，
+    提交后释放；begin 耗时记会话属性。"""
+    import sqlite3
+
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    import app.core.database as dbmod
+    from app.core.database import write_session
+
+    db = tmp_path / "ws.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db}")
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(dbmod, "get_session_factory", lambda: maker)
+
+    async with engine.begin() as conn:
+        await conn.execute(text("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"))
+
+    async with write_session(WritePriority.BACKGROUND, label="ws_probe") as session:
+        await session.execute(text("INSERT INTO t (v) VALUES ('a')"))
+        assert session._hx_begin_ms >= 0
+        raw = sqlite3.connect(str(db), timeout=0.2, isolation_level=None)
+        try:
+            raw.execute("BEGIN IMMEDIATE")
+            raise AssertionError("write_session 持有期间外部连接不应拿到写锁")
+        except sqlite3.OperationalError:
+            pass
+        finally:
+            raw.close()
+    raw = sqlite3.connect(str(db), timeout=0.2, isolation_level=None)
+    try:
+        raw.execute("BEGIN IMMEDIATE")
+        raw.rollback()
+    finally:
+        raw.close()
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_write_session_reentrant_skips_immediate_begin(tmp_path, monkeypatch):
+    """重入上下文（同任务已持闸）不再发起 BEGIN IMMEDIATE：外层事务已取
+    SQLite 写锁，新连接再取只会撞自己；内层保持驱动默认 deferred。"""
+    import sqlite3
+
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    import app.core.database as dbmod
+    from app.core.database import write_session
+
+    db = tmp_path / "ws2.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db}")
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(dbmod, "get_session_factory", lambda: maker)
+
+    async with engine.begin() as conn:
+        await conn.execute(text("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"))
+
+    async with write_session(WritePriority.BACKGROUND, label="outer") as outer:
+        assert hasattr(outer, "_hx_begin_ms")
+        await outer.execute(text("INSERT INTO t (v) VALUES ('outer')"))
+        async with write_session(WritePriority.BACKGROUND, label="inner") as inner:
+            # 重入分支保持 deferred：不发 BEGIN（新连接再取写锁只会撞外层）
+            assert not hasattr(inner, "_hx_begin_ms")
+            # 读不被外层写事务阻塞（WAL 读者语义）
+            rows = (await inner.execute(text("SELECT count(*) FROM t"))).scalar()
+            assert rows == 0
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_write_session_autolabels_real_caller(tmp_path, monkeypatch):
+    """无标签 write_session 的归属 = 真实调用方（不是 database.py 自己）。
+
+    归属帧链要跳过 contextlib 包装帧与 write_session/write_gate 自身帧——
+    否则观测退化为所有无标签写事务都归到 database.py（盲区回归）。"""
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    import app.core.database as dbmod
+    from app.core.database import write_scheduler_diagnostics, write_session
+
+    db = tmp_path / "ws3.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db}")
+    monkeypatch.setattr(dbmod, "get_session_factory", lambda: async_sessionmaker(engine, expire_on_commit=False))
+
+    async with engine.begin() as conn:
+        await conn.execute(text("CREATE TABLE t (id INTEGER PRIMARY KEY)"))
+
+    async with write_session(WritePriority.BACKGROUND) as session:
+        await session.commit()
+        label = write_scheduler_diagnostics()["owner_label"]
+    assert label.startswith("auto:test_core_write_scheduler"), label
+    await engine.dispose()

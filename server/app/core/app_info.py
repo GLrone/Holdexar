@@ -21,6 +21,12 @@ APP_VERSION = "0.3.0-beta"
 # 发布仓库（owner/repo）：更新检查与种子资产下载共用一个来源，勿在两处各写一遍
 GITHUB_REPO = "GLrone/Holdexar"
 
+# 公共数据分发直链（对象存储上的自有入口）。种子这类数百 MB 的资产走它比
+# 走 GitHub 及其代理快一个量级，且不占发布仓库的带宽；不可达时下载链自动
+# 换回下面的 GitHub 通道，不需要用户做任何选择。
+# 空串 = 该通道不参与（自建分发未就绪时不产生无效候选）。
+DATA_CDN_BASE = "https://data.steamhl.com"
+
 # 更新清单落在一个**固定 tag** 的 Release 资产下，与版本号解耦：
 # 客户端检查更新永远只读这一个地址，不打 api.github.com（免限速、国内可达）。
 # 发布端的对应动作在 scripts/publish_release.py（刷该 tag 的资产）。

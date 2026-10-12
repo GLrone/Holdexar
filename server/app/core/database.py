@@ -22,12 +22,13 @@ import sys
 import time
 from collections import deque
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime
 from enum import IntEnum
 from functools import lru_cache
 from pathlib import Path
 
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
@@ -405,7 +406,7 @@ def _ensure_schema(sync_conn) -> None:
 #   2. _MIGRATIONS 追加 (版本号, 描述, SQL 列表)；SQL 须幂等（中断续跑 +
 #      用户库版本乱序防御），复杂逻辑可登记 async fn(engine) 同位元素
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 # 零小数货币（Steam 以整数计价）：旧捆绑包链路的除数表按 1 处理，与「统一存分」
 # 的新约定差 100 倍——v2 归一的目标集合
@@ -1036,6 +1037,27 @@ async def _migrate_drop_redundant_gph_indexes(conn) -> None:
     )
 
 
+async def _migrate_fts_trigger_when_gate(conn) -> None:
+    """v16：games_name_bi_au 触发器加 WHEN 门控（名字未变化跳过影子重写）。
+
+    UPDATE OF 触发器按「列在 SET 列表」触发而非「值变化」：价格段的 games
+    upsert 恒带 name/name_en 列，绝大多数行名字未变也整行重建 FTS 索引
+    （基准 329.7ms/百行）。WHEN 用 IS NOT（NULL 安全判等）：=/!= 任一侧
+    NULL 时结果为 NULL→判假，会漏同步 NULL→值/值→NULL 的改名。幂等：
+    DROP IF EXISTS + 重建；影子内容不因门控变化，无需重放回填。
+    """
+    from sqlalchemy import text
+
+    await conn.execute(text("DROP TRIGGER IF EXISTS games_name_bi_au"))
+    await conn.execute(text(
+        "CREATE TRIGGER games_name_bi_au AFTER UPDATE OF name, name_en ON games "
+        "WHEN old.name IS NOT new.name OR old.name_en IS NOT new.name_en BEGIN "
+        "DELETE FROM games_name_fts WHERE appid = old.appid; "
+        "INSERT INTO games_name_fts(appid, name_bi) "
+        "VALUES (new.appid, name_bigram(new.name, new.name_en)); END"
+    ))
+
+
 # (目标版本, 说明, 迁移体)：迁移体 = SQL 语句列表，或 async callable(engine)
 _MIGRATIONS: list[tuple[int, str, object]] = [
     (2, "bundle_region_prices 零小数货币单位归一（元→分 + cny_fen 去虚高）",
@@ -1107,6 +1129,10 @@ _MIGRATIONS: list[tuple[int, str, object]] = [
          "steamid VARCHAR(32) NOT NULL)",
          "CREATE INDEX IF NOT EXISTS ix_ra_created ON redeem_activations (created_at)",
      ]),
+    (16, "games 名称影子触发器 WHEN 门控（名字与英文名均未变化时跳过 FTS 重写；"
+         "价格段 upsert 恒带 name 列，UPDATE OF 按「列在 SET」触发，影子内容"
+         "本不变化却整行重建索引）",
+     _migrate_fts_trigger_when_gate),
 ]
 
 
@@ -1309,7 +1335,7 @@ async def init_db() -> None:
 
     from app.domains.rates.models import FxRate
 
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND) as session:
         existing = await session.scalar(select(FxRate).where(FxRate.currency_code == "CNY"))
         if existing is None:
             session.add(FxRate(currency_code="CNY", rate_to_cny=1.0))
@@ -1463,6 +1489,10 @@ class WriteScheduler:
             "waiting_interactive": len(self._waiters[WritePriority.INTERACTIVE]),
             "waiting_background": len(self._waiters[WritePriority.BACKGROUND]),
         }
+
+    def owned_by_current_task(self) -> bool:
+        """当前任务是否已持闸（重入上下文判定）。"""
+        return self._owner is asyncio.current_task()
 
     def diagnostics(self) -> dict:
         """诊断快照：占用归属 + 排队 + 分优先级指标 + 超阈值事件环（诊断端点用）。"""
@@ -1631,6 +1661,59 @@ def write_gate(
     告警日志输出，直接回答「是谁在堵」；缺省时从调用栈自动取
     `auto:文件:行号` 兜底——不存在无归属的持闸。"""
     return _WriteGate(priority, label)
+
+
+def scheduler_task_owns_gate() -> bool:
+    """当前任务是否已持写闸（重入上下文判定，供闸内自有会话分支）。"""
+    return _scheduler_for_loop().owned_by_current_task()
+
+
+def _caller_auto_label() -> str:
+    """调用方 auto 归属（跳过 contextlib 与 write_session/write_gate 自身帧）。
+
+    write_session 经 contextlib 异步生成器进入，帧链里夹着包装帧——不跳过
+    会把所有无标签写事务归属到 database.py 自己（观测盲区回归）。
+    """
+    frame = sys._getframe(1)
+    while frame is not None:
+        code = frame.f_code
+        if code.co_filename.endswith("contextlib.py"):
+            frame = frame.f_back
+            continue
+        if code.co_filename.endswith("database.py") and code.co_name in (
+            "write_session", "write_gate",
+        ):
+            frame = frame.f_back
+            continue
+        break
+    if frame is None:
+        return "auto:unknown"
+    return f"auto:{code.co_filename.replace(chr(92), '/').rsplit('/', 1)[-1]}:{frame.f_lineno}"
+
+
+@asynccontextmanager
+async def write_session(
+    priority: WritePriority = WritePriority.BACKGROUND,
+    label: str | None = None,
+) -> AsyncIterator[AsyncSession]:
+    """写事务闸 + 会话 + 显式事务起点（BEGIN IMMEDIATE）三合一。
+
+    闸内新建会话的唯一入口。会话首语句显式取 SQLite 写锁：「先读后写中途
+    升级」在跨进程直写形态下会触发 WAL 快照失效快速失败（busy_timeout 不
+    重试该错误），锁在事务起点取得后该失败构造性不可能；进程内本就闸序
+    串行，提前取锁零额外成本。重入上下文（同任务已持闸，外层事务在跑）
+    保持驱动默认 deferred——新连接再取写锁只会撞自己。begin 耗时记在
+    会话属性 `_hx_begin_ms`（[写账]「起事务」字段）。
+    """
+    if label is None:
+        label = _caller_auto_label()
+    reentrant = _scheduler_for_loop().owned_by_current_task()
+    async with write_gate(priority, label=label), get_session_factory()() as session:
+        if not reentrant:
+            _tb = time.perf_counter()
+            await session.execute(text("BEGIN IMMEDIATE"))
+            session._hx_begin_ms = round((time.perf_counter() - _tb) * 1000)
+        yield session
 
 
 def write_scheduler_diagnostics() -> dict:

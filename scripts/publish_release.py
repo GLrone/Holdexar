@@ -64,6 +64,7 @@ if str(SERVER) not in sys.path:
 from app.core.app_info import (  # noqa: E402
     APP_NAME,
     APP_VERSION,
+    DATA_CDN_BASE,
     GITHUB_REPO,
     MANIFEST_ASSET,
     MANIFEST_TAG,
@@ -170,6 +171,36 @@ def _ensure_seed_gz() -> None:
         while chunk := fin.read(1 << 20):
             fout.write(chunk)
     print(f"[发布] 种子 gz 现场压缩：{SEED_RAW_FALLBACK} → {SEED_GZ.name}")
+
+
+def sync_cdn_seed(dry: bool) -> None:
+    """把种子分发档推到自建分发（对象存储），并核对线上哈希与本地一致。
+
+    客户端下载种子的首选通道是它（大体积资产在该入口上通常比走 GitHub 快一个
+    数量级）；推不上去不影响发布——客户端的候选表里还有 GitHub 及其镜像，
+    探测阶段会自动选到能用的那条。
+
+    上传工具与凭据是维护机本机文件（不入库），公开克隆里没有——缺了就只打印
+    手工指引，不报错。
+    """
+    if not SEED_GZ.is_file():
+        print(f"[自建分发] 跳过：没有 {SEED_GZ.name}")
+        return
+    if not DATA_CDN_BASE:
+        print("[自建分发] 跳过：未配置分发地址")
+        return
+    target = f"{DATA_CDN_BASE}/seed/{SEED_GZ.name}"
+    size = SEED_GZ.stat().st_size / 1048576
+    uploader = ROOT / "scripts" / "upload_cloud_packs.py"
+    if not uploader.is_file():
+        print(f"[自建分发] 手工上传 {SEED_GZ.name}（{size:.1f} MB）→ {target}")
+        return
+    if dry:
+        print(f"[dry-run] 上传 {SEED_GZ.name}（{size:.1f} MB）→ {target}")
+        return
+    subprocess.check_call(
+        [sys.executable, str(uploader), "--seed"]
+    )
 
 
 def collect_artifacts(app_zip: Path) -> list[Path]:
@@ -349,6 +380,7 @@ def main() -> None:
     publish_version_release(version, artifacts, notes_file, args.prerelease, args.dry_run)
     if not args.skip_manifest:
         publish_manifest_release(args.dry_run)
+    sync_cdn_seed(args.dry_run)
     if args.scoop_dir:
         sync_scoop(Path(args.scoop_dir), args.dry_run)
 

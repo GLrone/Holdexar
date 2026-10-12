@@ -125,3 +125,60 @@ async def test_migration_backfill_rebuilds_from_games_table(seeded_db):
 
     assert 900001 in _appids(await service.search_catalog("只狼"))
     assert 900005 in _appids(await service.search_catalog("群星"))
+
+
+@pytest.mark.asyncio
+async def test_v16_update_trigger_has_when_gate():
+    """v16 后 UPDATE 触发器带 WHEN 门控（存量库由迁移收口，影子内容不变）。"""
+    async with get_session_factory()() as session:
+        ddl = (
+            await session.execute(
+                text("SELECT sql FROM sqlite_master WHERE type='trigger'"
+                     " AND name='games_name_bi_au'")
+            )
+        ).scalar()
+    assert ddl and "WHEN" in ddl and "IS NOT" in ddl
+
+
+@pytest.mark.asyncio
+async def test_when_gate_same_name_update_keeps_shadow(seeded_db):
+    """WHEN 门控语义：同名 UPDATE（价格段恒带 name 列的形态）影子与检索不损。"""
+    from app.domains.games.models import Game
+
+    async with get_session_factory()() as session:
+        row = await session.get(Game, 900001)
+        row.name = "只狼：影逝二度"
+        row.review_count = 111
+        await session.commit()
+    assert 900001 in _appids(await service.search_catalog("只狼"))
+
+
+@pytest.mark.asyncio
+async def test_when_gate_rename_syncs(seeded_db):
+    """WHEN 门控语义：真改名触发同步（旧名不再命中、新名命中）。"""
+    from app.domains.games.models import Game
+
+    async with get_session_factory()() as session:
+        row = await session.get(Game, 900003)
+        row.name = "丰收之月"
+        await session.commit()
+    assert 900003 not in _appids(await service.search_catalog("星露谷"))
+    assert 900003 in _appids(await service.search_catalog("丰收"))
+
+
+@pytest.mark.asyncio
+async def test_when_gate_name_en_null_transitions_sync(seeded_db):
+    """WHEN 门控 NULL 安全（IS NOT）：name_en 值→NULL→值 三态影子同步。"""
+    from app.domains.games.models import Game
+
+    async with get_session_factory()() as session:
+        row = await session.get(Game, 900005)
+        row.name_en = None
+        await session.commit()
+    assert 900005 not in _appids(await service.search_catalog("stellaris"))
+
+    async with get_session_factory()() as session:
+        row = await session.get(Game, 900005)
+        row.name_en = "Stellaris II"
+        await session.commit()
+    assert 900005 in _appids(await service.search_catalog("stellaris"))

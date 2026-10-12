@@ -23,7 +23,7 @@ from sqlalchemy import select, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.config import get_settings
-from app.core.database import WritePriority, get_session_factory, write_gate
+from app.core.database import WritePriority, write_gate, write_session
 from app.core.logging import log_event
 from app.domains.games.models import Game
 
@@ -187,9 +187,7 @@ async def apply_curated(appid: int, seed_path: Path | None = None) -> None:
         sets = _curated_sets()
         from app.core.database import WritePriority, write_gate
 
-        async with write_gate(
-            WritePriority.BACKGROUND, label="seed_curated_apply"
-        ), get_session_factory()() as session:
+        async with write_session(WritePriority.BACKGROUND, label="seed_curated_apply") as session:
             await session.execute(
                 text(f"UPDATE games SET {sets} WHERE appid = :appid"),
                 {**row, "appid": int(appid)},
@@ -228,40 +226,54 @@ def _curated_sets() -> str:
     return ", ".join(f"{c} = {_CURATED_SETS.get(c, ':' + c)}" for c in CURATED_COLS)
 
 
-async def apply_curated_batch(appids: list[int], seed_path: Path | None = None) -> int:
-    """批量人工列补挂（收尾链聚合形态）：一次闸分块 executemany 覆盖整批。
+def prepare_curated_rows(appids: list[int], seed_path: Path | None = None) -> list[dict]:
+    """批量补挂参数预备（闸外执行）：人工列索引 mtime 缓存查找 + 命中过滤。
 
+    返回 executemany 参数行（索引外的款零触碰）；索引为空返回空表零语句。
+    """
+    ids = [int(a) for a in dict.fromkeys(appids) if a]
+    if not ids:
+        return []
+    index = _load_curated_index(seed_path or seed_db_path())
+    return [{**index[a], "appid": a} for a in ids if a in index]
+
+
+async def apply_curated_rows(session, rows: list[dict]) -> None:
+    """批量补挂语句体（调用方事务内执行）：分块 executemany，不提交不建会话。"""
+    if not rows:
+        return
+    sets = _curated_sets()
+    # 分块受 SQLite 变量上限约束（与目录/名单通道同型）
+    for i in range(0, len(rows), 500):
+        await session.execute(
+            text(f"UPDATE games SET {sets} WHERE appid = :appid"),
+            rows[i : i + 500],
+        )
+
+
+async def apply_curated_batch(appids: list[int], seed_path: Path | None = None) -> int:
+    """批量人工列补挂（独立调用方）：一次闸分块 executemany 覆盖整批。
+
+    批量写路径走段内保存点内联（db_writer），不经此处。
     索引外的款零触碰。返回实际补挂款数；任何异常吞掉，
     不影响爬虫写库主链路。
     """
-    ids = [int(a) for a in appids if a]
-    if not ids:
+    rows = prepare_curated_rows(appids, seed_path)
+    if not rows:
         return 0
     try:
-        index = _load_curated_index(seed_path or seed_db_path())
-        hit = [a for a in dict.fromkeys(ids) if a in index]
-        if not hit:
-            return 0
-        sets = _curated_sets()
-        from app.core.database import WritePriority, write_gate
+        from app.core.database import WritePriority
 
-        async with write_gate(
-            WritePriority.BACKGROUND, label="seed_curated_apply"
-        ), get_session_factory()() as session:
-            # 分块受 SQLite 变量上限约束（与目录/名单通道同型）
-            for i in range(0, len(hit), 500):
-                await session.execute(
-                    text(f"UPDATE games SET {sets} WHERE appid = :appid"),
-                    [{**index[a], "appid": a} for a in hit[i : i + 500]],
-                )
+        async with write_session(WritePriority.BACKGROUND, label="seed_curated_apply") as session:
+            await apply_curated_rows(session, rows)
             await session.commit()
-        return len(hit)
+        return len(rows)
     except Exception as e:  # noqa: BLE001 —— 补挂失败不影响爬虫主链路
         log_event(
             logger,
             "种子人工列批量补挂失败，不影响爬虫写库",
             level=logging.WARNING,
-            detail={"款数": len(ids), "原因": str(e)},
+            detail={"款数": len(rows), "原因": str(e)},
         )
         return 0
 
@@ -399,9 +411,7 @@ async def merge_current_seed(seed_path: Path | None = None) -> dict | None:
     if catalog:
         from sqlalchemy import select as _select
 
-        async with write_gate(
-            WritePriority.BACKGROUND, label="seed_current_merge"
-        ), get_session_factory()() as session:
+        async with write_session(WritePriority.BACKGROUND, label="seed_current_merge") as session:
             present = {
                 int(a)
                 for (a,) in await session.execute(
@@ -872,9 +882,7 @@ async def merge_curated_seed(seed_path: Path | None = None) -> dict | None:
 
     from app.core.database import WritePriority, write_gate
 
-    async with write_gate(
-        WritePriority.BACKGROUND, label="seed_curated_merge"
-    ), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND, label="seed_curated_merge") as session:
         present = {
             int(a)
             for (a,) in await session.execute(
@@ -987,9 +995,7 @@ async def merge_preset_seed(seed_path: Path | None = None) -> dict | None:
 
     from app.core.database import WritePriority, write_gate
 
-    async with write_gate(
-        WritePriority.BACKGROUND, label="seed_preset_merge"
-    ), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND, label="seed_preset_merge") as session:
         present = {
             int(a)
             for (a,) in await session.execute(

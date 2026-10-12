@@ -354,19 +354,59 @@ async def test_restore_failure_leaves_no_leftovers(data_env, maintenance_mock, m
 
 @pytest.mark.asyncio
 async def test_verify_uses_hash_and_rejects_tampered_archive(data_env):
-    """校验口径：比对随档哈希；改一个字节即拒绝，不必解档整库自检。"""
+    """校验口径：哈希不符直接判否；哈希相符时默认档再证「能解出正确字节流」。"""
     result = await core_backup.create_backup(label="v")
     name = result["name"]
     ok = await core_backup.verify_backup(name)
     assert ok["integrityOk"] is True
     assert ok["games"] == 1
     assert ok["sha256"] == result["sha256"]
+    # 默认档只做「哈希 + 流式解压」两件事，不开 SQLite
+    assert ok["checks"] == {"hashOk": True, "restorableOk": True, "deepOk": None}
 
     archive = core_backup.backup_dir() / name
     body = bytearray(archive.read_bytes())
     body[len(body) // 2] ^= 0xFF
     archive.write_bytes(bytes(body))
     assert (await core_backup.verify_backup(name))["integrityOk"] is False
+
+
+@pytest.mark.asyncio
+async def test_verify_deep_opens_the_database(data_env):
+    """深校验档：解档落盘后开库自检，并给出这一档的独立结论。"""
+    result = await core_backup.create_backup(label="d")
+    deep = await core_backup.verify_backup(result["name"], deep=True)
+    assert deep["integrityOk"] is True
+    assert deep["games"] == 1
+    assert deep["checks"] == {"hashOk": True, "restorableOk": None, "deepOk": True}
+    assert not list(core_backup.backup_dir().glob("*.verify.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_verify_without_meta_still_proves_restorable(data_env):
+    """断电窗口：有归档、无元数据。默认档仍能证明「可解出完整字节流」。"""
+    result = await core_backup.create_backup(label="n")
+    archive = core_backup.backup_dir() / result["name"]
+    core_backup._archive_meta_path(archive).unlink()
+
+    ok = await core_backup.verify_backup(result["name"])
+    assert ok["integrityOk"] is True
+    assert ok["checks"]["hashOk"] is None      # 没有随档哈希可比
+    assert ok["checks"]["restorableOk"] is True
+
+
+@pytest.mark.asyncio
+async def test_verify_detects_truncated_archive_without_meta(data_env):
+    """无元数据 + 被截断：默认档靠 gzip 的 CRC/长度自证失败，且不落探针。"""
+    result = await core_backup.create_backup(label="tr")
+    archive = core_backup.backup_dir() / result["name"]
+    archive.write_bytes(archive.read_bytes()[:-64])
+    core_backup._archive_meta_path(archive).unlink()
+
+    ok = await core_backup.verify_backup(result["name"])
+    assert ok["integrityOk"] is False
+    assert ok["checks"]["restorableOk"] is False
+    assert not list(core_backup.backup_dir().glob("*.verify.tmp"))
 
 
 @pytest.mark.asyncio
@@ -380,6 +420,40 @@ async def test_restore_rejects_tampered_archive(data_env, maintenance_mock):
         await core_backup.restore_backup(result["name"])
     assert (tmp / "holdexar.db").is_file()
     assert not list(core_backup.backup_dir().glob("*.verify.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_restore_leaves_no_probe_when_archive_cannot_be_opened(
+    data_env, maintenance_mock
+):
+    """无元数据 + 截断：解档当场抛错，探针必须被清掉。
+
+    段 1 若把清理留给后面的 finally，异常会直接穿出并把探针留在备份目录里；
+    那个名字既不被列表认领（只收 .db/.db.gz）也不被删除入口放行——用户永远
+    看不见、也删不掉。
+    """
+    tmp, holder = data_env
+    result = await core_backup.create_backup(label="bad")
+    archive = core_backup.backup_dir() / result["name"]
+    archive.write_bytes(archive.read_bytes()[:-64])
+    core_backup._archive_meta_path(archive).unlink()
+
+    with pytest.raises(Exception):
+        await core_backup.restore_backup(result["name"])
+    assert not list(core_backup.backup_dir().glob("*.verify.tmp"))
+    assert not (core_backup.backup_dir() / core_backup._LOCK_FILE).exists()
+    assert (tmp / "holdexar.db").is_file()
+
+
+@pytest.mark.asyncio
+async def test_create_backup_refuses_while_maintenance_lock_held(data_env):
+    """维护锁在位（恢复/收缩进行中）时拒绝再开一份快照。"""
+    core_backup.backup_dir().joinpath(core_backup._LOCK_FILE).write_text("x", encoding="utf-8")
+    try:
+        with pytest.raises(RuntimeError, match="在进行中"):
+            await core_backup.create_backup(label="lk")
+    finally:
+        core_backup.backup_dir().joinpath(core_backup._LOCK_FILE).unlink(missing_ok=True)
 
 
 @pytest.mark.asyncio

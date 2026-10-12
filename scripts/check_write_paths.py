@@ -10,8 +10,10 @@ SQLite 单写者约束下，server/app 内所有写事务必须位于 write_gate
   整体按写对待（提交在块退出自动发生）。
 - 已知 AST 数据流边界（fail-closed 之外）：别名绑定调用（`c = s.commit` 后
   `await c()`）与非常量 SQL 变量不可见，词法表达不了的形态走 ALLOW 登记。
-- 判定：沿 AST 祖先链找 `async with write_gate(...)`（含复合 with 的任一
-  context item）；命中 = PASS，未命中 = FAIL。
+- 判定：沿 AST 祖先链找 `async with write_gate(...)` / `write_session(...)`
+  （含复合 with 的任一 context item）；命中 = PASS，未命中 = FAIL。
+- 复合形态：write_gate 与 get_session_factory 同 with 复合 → FAIL（闸内新建
+  会话必须走 write_session：事务起点显式取写锁；write_session 自身定义豁免）。
 - 豁免：调用点在闸内、本体是线程池同步函数或迁移机制等无法词法表达的形态，
   逐条登记在 ALLOW（文件 + 函数 + 理由）；登记是豁免生效的前置条件，
   与 docs/agent-context/CONSTRAINTS.md §八例外登记表同则。
@@ -40,6 +42,12 @@ APP_DIR = Path(__file__).resolve().parent.parent / "server" / "app"
 # 日后新增的裸 commit 仍会被拦）。豁免 = 调用点已在 write_gate 内、或写锁
 # 天然独占的启动机制；新增豁免须先在此登记并同步 CONSTRAINTS §八。
 ALLOW: dict[tuple[str, str], tuple[frozenset[str], str]] = {
+    ("crawler/db_writer.py", "_session_scope"): (
+        frozenset({"execute"}),
+        "自有会话事务起点 BEGIN IMMEDIATE（调用点在 write_gate/write_session 上下文内，防跨进程先读后写快照失效）"),
+    ("core/seed_assets.py", "apply_curated_rows"): (
+        frozenset({"execute"}),
+        "人工列批量补挂语句体（调用点在 write_session/段内保存点事务内，事务边界在调用方）"),
     ("core/seed_assets.py", "_merge_history_chunk"): (
         frozenset({"commit", "execute"}),
         "线程池原生连接历史合并（调用点已 write_gate 包裹（分块续跑），缺键 INSERT + 派生列差异覆写 UPDATE，价格键不回拨）"),
@@ -119,7 +127,7 @@ class _Visitor(ast.NodeVisitor):
                         f = ctx.func
                         name = f.id if isinstance(f, ast.Name) else (
                             f.attr if isinstance(f, ast.Attribute) else None)
-                        if name == "write_gate":
+                        if name in ("write_gate", "write_session"):
                             return True
             cur = self._parents.get(cur)
         return False
@@ -173,6 +181,43 @@ class _Visitor(ast.NodeVisitor):
                 self.hits.append((node.lineno, kind))
         self.generic_visit(node)
 
+    def visit_AsyncWith(self, node: ast.AsyncWith) -> None:  # noqa: N802
+        self._check_gate_session_composite(node)
+        self.generic_visit(node)
+
+    visit_With = visit_AsyncWith
+
+    @staticmethod
+    def _ctx_name(ctx: ast.expr) -> str | None:
+        """with 上下文名（解包 get_session_factory()() 这类嵌套调用）。"""
+        f = ctx.func if isinstance(ctx, ast.Call) else ctx
+        while isinstance(f, ast.Call):
+            f = f.func
+        if isinstance(f, ast.Name):
+            return f.id
+        if isinstance(f, ast.Attribute):
+            return f.attr
+        return None
+
+    def _check_gate_session_composite(self, node: ast.AST) -> None:
+        """write_gate 与 get_session_factory 同 with 复合 → FAIL。
+
+        闸内新建会话必须走 write_session（事务起点显式取写锁，防跨进程
+        先读后写快照失效）；write_session 自身定义是唯一合法形态。
+        """
+        has_gate = has_session = False
+        for item in getattr(node, "items", []):
+            name = self._ctx_name(item.context_expr)
+            if name == "write_gate":
+                has_gate = True
+            elif name == "get_session_factory":
+                has_session = True
+        if not (has_gate and has_session):
+            return
+        if self._file_suffix == "core/database.py" and "write_session" in self._enclosing_funcs(node):
+            return
+        self.hits.append((node.items[0].context_expr.lineno, "FAIL_COMPOSITE"))
+
     def _sql_text(self, node: ast.AST) -> str | None:
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             return node.value
@@ -189,7 +234,7 @@ class _Visitor(ast.NodeVisitor):
         return None
 
 
-def audit_file(path: Path) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
+def audit_file(path: Path) -> tuple[list[tuple[int, str]], list[tuple[int, str]], list[tuple[int, str]]]:
     tree = ast.parse(path.read_text(encoding="utf-8"))
     v = _Visitor()
     v.build_parents(tree)
@@ -198,7 +243,8 @@ def audit_file(path: Path) -> tuple[list[tuple[int, str]], list[tuple[int, str]]
     v.visit(tree)
     fails = [(ln, k) for ln, k in v.hits if k == "FAIL"]
     exceptions = [(ln, k) for ln, k in v.hits if k == "EXCEPTION"]
-    return fails, exceptions
+    composites = [(ln, k) for ln, k in v.hits if k == "FAIL_COMPOSITE"]
+    return fails, exceptions, composites
 
 
 def main() -> int:
@@ -207,7 +253,7 @@ def main() -> int:
     total_exc = 0
     for path in sorted(APP_DIR.rglob("*.py")):
         try:
-            fails, exceptions = audit_file(path)
+            fails, exceptions, composites = audit_file(path)
         except SyntaxError as e:
             print(f"FAIL {path.relative_to(APP_DIR.parent)}: 解析失败 {e}")
             total_fail += 1
@@ -218,10 +264,15 @@ def main() -> int:
             print(f"FAIL {rel}:{lineno}")
             print(f"    {src}")
             print("    未检测到 write_gate 上下文（写事务必须过全局写调度器）")
+        for lineno, _ in composites:
+            src = " ".join(path.read_text(encoding="utf-8").splitlines()[lineno - 1].split())[:100]
+            print(f"FAIL {rel}:{lineno}")
+            print(f"    {src}")
+            print("    闸内新建会话必须走 write_session（事务起点显式取写锁）")
         for lineno, _ in exceptions:
             if verbose:
                 print(f"EXCEPTION {rel}:{lineno}（ALLOW 已登记）")
-        total_fail += len(fails)
+        total_fail += len(fails) + len(composites)
         total_exc += len(exceptions)
     if verbose:
         print(f"EXCEPTION 合计 {total_exc}（ALLOW 登记，见脚本头）")
