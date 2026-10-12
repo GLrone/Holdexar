@@ -19,7 +19,10 @@ from app.core.logging import log_event, setup_logging
 from app.core.scheduler import start_scheduler, stop_scheduler
 from app.domains.account.router import router as account_router
 from app.domains.agent.router import router as agent_router
+from app.domains.achievements.challenges_router import router as achievements_challenges_router
+from app.domains.achievements.level_router import router as achievements_level_router
 from app.domains.achievements.router import router as achievements_router
+from app.domains.achievements.social_router import router as achievements_social_router
 from app.domains.alerts.router import router as alerts_router
 from app.domains.bills.router import router as bills_router
 from app.domains.bundles.router import router as bundles_router
@@ -536,6 +539,9 @@ def create_app() -> FastAPI:
     app.include_router(settings_router, prefix="/api/v1")
     app.include_router(games_router, prefix="/api/v1")
     app.include_router(achievements_router, prefix="/api/v1")
+    app.include_router(achievements_level_router, prefix="/api/v1")
+    app.include_router(achievements_challenges_router, prefix="/api/v1")
+    app.include_router(achievements_social_router, prefix="/api/v1")
     app.include_router(metadata_router, prefix="/api/v1")
     app.include_router(monitoring_router, prefix="/api/v1")
     app.include_router(notifications_router, prefix="/api/v1")

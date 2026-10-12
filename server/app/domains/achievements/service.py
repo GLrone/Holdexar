@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from sqlalchemy import delete, func, select
 
-from app.core.database import WritePriority, get_session_factory
+from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.database import write_gate
 from app.core.logging import log_event
 from app.domains.account import service as account_service
@@ -132,15 +132,17 @@ async def resolve_credentials(target: str | None = None) -> tuple[str, list[tupl
 
 async def _post_form(url: str, data: dict) -> httpx.Response:
     """POST 表单（代理优先 + SSL 证书降级，与 family._steam_get 同规则）。"""
+    from app.core.tls import ssl_context as _ssl_context
+
     proxy = await _strategy_proxy()
     try:
-        async with httpx.AsyncClient(timeout=30, proxy=proxy) as client:
+        async with httpx.AsyncClient(timeout=30, proxy=proxy, verify=_ssl_context(True)) as client:
             resp = await client.post(url, data=data)
     except httpx.HTTPError as e:
         if not _is_ssl_error(e):
             raise
         log_event(logger, "Steam 接口证书校验失败（经代理场景），降级跳过校验重试", tag="降级")
-        async with httpx.AsyncClient(timeout=30, proxy=proxy, verify=False) as client:
+        async with httpx.AsyncClient(timeout=30, proxy=proxy, verify=_ssl_context(False)) as client:
             resp = await client.post(url, data=data)
     resp.raise_for_status()
     return resp
@@ -964,11 +966,139 @@ async def _sync_all(target: str = "") -> None:
     await asyncio.gather(*(_one(r) for r in pending))
     if failures:
         raise failures[0]
+    await _award_sync_xp(steamid)
     await _finish_snapshot(ok=True)
 
 
+def _xp_marker(source: str, source_ref: str) -> dict:
+    return {"source": source, "source_ref": source_ref, "xp": 0, "multiplier": 1.0,
+            "note": "baseline marker"}
+
+
+async def _award_sync_xp(steamid: str) -> None:
+    """同步收尾经验记账：基线回填/差分批量落账 → 涨级与新解锁事实 → 挑战重算。
+
+    存量折算进基线并以 0 值事件占用幂等键，此后「无事件即新增量」恒成立；
+    只对真实增量发 XP，任何失败只少一条账，不阻断同步主链。
+    """
+    prev_level = 1
+    awarded_unlocks: list[dict] = []
+    try:
+        from . import challenges, level
+
+        async with write_session(WritePriority.BACKGROUND, label="achievements_xp_sync") as session:
+            prev_level = level.level_for_xp(await level.total_xp(session, steamid))[0]
+            baseline = await level.ensure_baseline(session, steamid)
+            streak_days = await level.current_streak_days(session, steamid)
+            achieved = (
+                await session.execute(
+                    select(AchievementState, AchievementDef)
+                    .outerjoin(
+                        AchievementDef,
+                        (AchievementDef.appid == AchievementState.appid)
+                        & (AchievementDef.image_name == AchievementState.image_name),
+                    )
+                    .where(AchievementState.steamid == steamid, AchievementState.achieved.is_(True))
+                )
+            ).all()
+            games = (
+                (
+                    await session.execute(
+                        select(AchievementGame).where(AchievementGame.steamid == steamid)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+            entries: list[dict] = []
+            if baseline is not None:
+                # 存量已折算进基线：0 值事件占住幂等键，本轮不发 XP 不算新增量
+                for st, _d in achieved:
+                    entries.append(_xp_marker(level.SOURCE_UNLOCK, f"{st.appid}:{st.image_name}"))
+                for g in games:
+                    if g.platinum:
+                        entries.append(_xp_marker(level.SOURCE_PLATINUM, str(g.appid)))
+                    for idx in range(1, level.playtime_bucket_index(g.playtime_min) + 1):
+                        entries.append(_xp_marker(level.SOURCE_BUCKET, f"{g.appid}:{idx}"))
+            else:
+                unlock_refs = await level.existing_source_refs(session, steamid, level.SOURCE_UNLOCK)
+                platinum_refs = await level.existing_source_refs(session, steamid, level.SOURCE_PLATINUM)
+                bucket_refs = await level.existing_source_refs(session, steamid, level.SOURCE_BUCKET)
+                streak_refs = await level.existing_source_refs(session, steamid, level.SOURCE_STREAK_DAY)
+                unlock_days = set(await level.unlock_days(session, steamid))
+                for st, d in achieved:
+                    ref = f"{st.appid}:{st.image_name}"
+                    if ref in unlock_refs:
+                        continue
+                    xp, mult = level.compose_xp(
+                        level.SOURCE_UNLOCK,
+                        rarity_percent=(d.global_percent if d is not None else None),
+                        streak_days=streak_days,
+                    )
+                    entries.append({"source": level.SOURCE_UNLOCK, "source_ref": ref,
+                                    "xp": xp, "multiplier": mult})
+                    awarded_unlocks.append({
+                        "name": (d.name if d is not None and d.name else st.image_name),
+                        "unlockTime": int(st.unlock_time or 0),
+                    })
+                for g in games:
+                    if g.platinum and str(g.appid) not in platinum_refs:
+                        xp, mult = level.compose_xp(level.SOURCE_PLATINUM, streak_days=streak_days)
+                        entries.append({"source": level.SOURCE_PLATINUM, "source_ref": str(g.appid),
+                                        "xp": xp, "multiplier": mult})
+                    for idx in range(1, level.playtime_bucket_index(g.playtime_min) + 1):
+                        ref = f"{g.appid}:{idx}"
+                        if ref in bucket_refs:
+                            continue
+                        xp, mult = level.compose_xp(level.SOURCE_BUCKET, streak_days=streak_days)
+                        entries.append({"source": level.SOURCE_BUCKET, "source_ref": ref,
+                                        "xp": xp, "multiplier": mult})
+                for day in sorted({
+                    datetime.fromtimestamp(a["unlockTime"]).date()
+                    for a in awarded_unlocks if a["unlockTime"] > 0
+                }):
+                    # 连击日自连续第 2 天起计：前一日也有解锁才落，历史存量不追认
+                    if (day - timedelta(days=1)) not in unlock_days or day.isoformat() in streak_refs:
+                        continue
+                    xp, mult = level.compose_xp(level.SOURCE_STREAK_DAY, streak_days=streak_days)
+                    entries.append({"source": level.SOURCE_STREAK_DAY, "source_ref": day.isoformat(),
+                                    "xp": xp, "multiplier": mult})
+            # 单语句多行 VALUES 受 SQLite 变量数上限约束，同一事务内分块落账
+            for start in range(0, len(entries), 400):
+                await level.record_xp_events(session, steamid, entries[start:start + 400])
+            await session.commit()
+    except Exception:  # noqa: BLE001 —— 经验记账失败只少一条账，不阻断同步
+        log_event(logger, "同步经验记账失败，本轮跳过", level=logging.WARNING, exc_info=True,
+                  detail={"SteamID": steamid})
+        return
+
+    if awarded_unlocks:
+        try:
+            from app.domains.notifications.facts import record_fact
+
+            await record_fact(
+                source="achievements",
+                kind="achievement_unlocked_batch",
+                fact_key=f"{steamid}:unlock_batch:{max(a['unlockTime'] for a in awarded_unlocks)}",
+                data={"count": len(awarded_unlocks),
+                      "titles": [a["name"] for a in awarded_unlocks]},
+            )
+        except Exception:  # noqa: BLE001 —— 事实落库失败不影响主链
+            log_event(logger, "新解锁批量事实落库失败", level=logging.WARNING, exc_info=True)
+    try:
+        async with get_session_factory()() as session:
+            await level.notify_level_up(session, steamid, previous_level=prev_level)
+    except Exception:  # noqa: BLE001
+        log_event(logger, "涨级事实检测失败", level=logging.WARNING, exc_info=True)
+    try:
+        await challenges.recompute_challenges(steamid)
+    except Exception:  # noqa: BLE001
+        log_event(logger, "挑战进度重算失败", level=logging.WARNING, exc_info=True)
+
+
 async def _apply_owned(steamid: str, owned: list[dict]) -> None:
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND) as session:
         rows = {
             r.appid: r
             for r in (
@@ -1006,7 +1136,7 @@ async def _apply_progress(
     而「已购但没成就」是既有口径（`filter=all` 能看到），保持原样。
     """
     names = external_names or {}
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND) as session:
         rows = {
             r.appid: r
             for r in (
@@ -1040,7 +1170,7 @@ async def _prune_external(steamid: str, candidates: set[int]) -> int:
     其既有解锁账与明细是这个应用里唯一留存的副本，不做静默清理。
     """
     removed = 0
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND) as session:
         rows = (
             (
                 await session.execute(
@@ -1113,7 +1243,7 @@ async def _sync_game(steamid: str, row: AchievementGame, creds: list[tuple[str, 
             await _apply_defs(appid, defs)
             row.total_achievements = len(defs)
             row.schema_synced_at = datetime.utcnow()
-            async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+            async with write_session(WritePriority.BACKGROUND) as session:
                 await session.merge(row)
                 await session.commit()
 
@@ -1124,7 +1254,7 @@ async def _sync_game(steamid: str, row: AchievementGame, creds: list[tuple[str, 
         html = await _community_get(PLAYER_PAGE.format(steamid=steamid, appid=appid), {"l": LANG})
         page_rows = parse_player_page(html, appid) if html else []
 
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND) as session:
         defs_rows = (
             (
                 await session.execute(
@@ -1197,7 +1327,7 @@ async def _sync_game(steamid: str, row: AchievementGame, creds: list[tuple[str, 
 
 
 async def _apply_defs(appid: int, defs: list[dict]) -> None:
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND) as session:
         existing = {
             d.image_name: d
             for d in (

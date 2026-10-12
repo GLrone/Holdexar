@@ -4,11 +4,24 @@
    本作最稀有的已解锁成就挂角标。 */
 import { computed, ref, watch } from 'vue'
 
-import { HlDrawer, HlEmpty, HlImg, HlSkeleton, HlTag } from '@/components/ui'
+import {
+  HlButton,
+  HlDrawer,
+  HlEmpty,
+  HlIcon,
+  HlImg,
+  HlPopconfirm,
+  HlSegmented,
+  HlSkeleton,
+  HlTag,
+  HlTextarea,
+} from '@/components/ui'
 import {
   achievementsApi,
   type AchievementDetailPayload,
   type AchievementItem,
+  type AchievementNoteItem,
+  type NoteMood,
   type RarityTier,
 } from '@/api/client'
 import type { MessageKey } from '@/locales'
@@ -51,7 +64,11 @@ async function fetchDetail(appid: number): Promise<void> {
 watch(
   () => [props.modelValue, props.appid, props.account] as const,
   ([v, appid]) => {
-    if (v && appid) void fetchDetail(appid)
+    if (v && appid) {
+      noteOpenFor.value = ''
+      void fetchDetail(appid)
+      void fetchNotes()
+    }
   },
 )
 
@@ -104,6 +121,109 @@ const rarestHere = computed(() => {
 
 const unlockedCount = computed(() => detail.value?.achievements.filter((a) => a.achieved).length ?? 0)
 const lockedCount = computed(() => detail.value?.achievements.filter((a) => !a.achieved).length ?? 0)
+
+/* ── 成就批注：锚定 (appid, imageName)，读写走 /achievements/notes；仅首评给经验 ── */
+const NOTE_MAX = 140
+const MOODS: NoteMood[] = ['love', 'wow', 'hard', 'fun']
+const MOOD_KEY: Record<NoteMood, MessageKey> = {
+  love: 'achievements.note.mood.love',
+  wow: 'achievements.note.mood.wow',
+  hard: 'achievements.note.mood.hard',
+  fun: 'achievements.note.mood.fun',
+}
+
+const noteMap = ref(new Map<string, AchievementNoteItem>())
+const noteOpenFor = ref('')
+const draftContent = ref('')
+const draftMood = ref<NoteMood | null>(null)
+const noteSaving = ref(false)
+const noteBonus = ref('')
+const noteError = ref('')
+let bonusTimer: ReturnType<typeof setTimeout> | undefined
+
+const moodOptions = computed(() => MOODS.map((m) => ({ label: t(MOOD_KEY[m]), value: m })))
+
+/* 点击已选中的心情即清空（心情是可选项） */
+const moodModel = computed<string>({
+  get: () => draftMood.value ?? '',
+  set: (v) => {
+    draftMood.value = v ? (v === draftMood.value ? null : (v as NoteMood)) : null
+  },
+})
+
+function noteKey(imageName: string): string {
+  return `${detail.value?.appid ?? props.appid ?? 0}:${imageName}`
+}
+
+const noteOf = (imageName: string): AchievementNoteItem | undefined =>
+  noteMap.value.get(noteKey(imageName))
+
+async function fetchNotes(): Promise<void> {
+  try {
+    const payload = await achievementsApi.notes(props.account ?? '')
+    noteMap.value = new Map(payload.notes.map((n) => [`${n.appid}:${n.imageName}`, n]))
+  } catch {
+    noteMap.value = new Map()
+  }
+}
+
+function toggleNote(imageName: string): void {
+  if (noteOpenFor.value === imageName) {
+    noteOpenFor.value = ''
+    return
+  }
+  const existing = noteOf(imageName)
+  draftContent.value = existing?.content ?? ''
+  draftMood.value = existing?.mood ?? null
+  noteBonus.value = ''
+  noteError.value = ''
+  noteOpenFor.value = imageName
+}
+
+function flashBonus(xp: number): void {
+  window.clearTimeout(bonusTimer)
+  noteBonus.value = t('achievements.note.firstBonus', { xp })
+  bonusTimer = window.setTimeout(() => {
+    noteBonus.value = ''
+  }, 4000)
+}
+
+async function saveNote(imageName: string): Promise<void> {
+  const appid = detail.value?.appid
+  const content = draftContent.value.trim()
+  if (!appid || !content || noteSaving.value) return
+  noteSaving.value = true
+  noteError.value = ''
+  try {
+    const r = await achievementsApi.addNote({
+      steamid: props.account ?? '',
+      appid,
+      imageName,
+      content,
+      mood: draftMood.value,
+    })
+    noteMap.value.set(`${r.note.appid}:${r.note.imageName}`, r.note)
+    if (r.xpGranted > 0) flashBonus(r.xpGranted)
+  } catch {
+    noteError.value = t('achievements.note.saveFailed')
+  } finally {
+    noteSaving.value = false
+  }
+}
+
+async function removeNote(imageName: string): Promise<void> {
+  const appid = detail.value?.appid
+  if (!appid) return
+  try {
+    await achievementsApi.deleteNote(appid, imageName, props.account ?? '')
+    noteMap.value.delete(noteKey(imageName))
+    draftContent.value = ''
+    draftMood.value = null
+    noteBonus.value = ''
+  } catch {
+    noteError.value = t('achievements.note.saveFailed')
+  }
+}
 </script>
 
 <template>
@@ -171,58 +291,104 @@ const lockedCount = computed(() => detail.value?.achievements.filter((a) => !a.a
             <span class="adw-group">{{ t('achievements.drawer.groupLocked', { n: lockedCount }) }}</span>
           </div>
           <div class="adw-list">
-            <div
-              v-for="a in detail.achievements"
-              :key="a.imageName"
-              class="adw-item"
-              :class="{ 'is-locked': !a.achieved }"
-            >
-              <div class="adw-icon-box">
-                <HlImg
-                  :src="a.achieved ? a.icon : a.iconGray || a.icon"
-                  class="adw-icon"
-                  :class="{ 'is-gray': !a.achieved && !a.iconGray }"
-                  alt=""
-                  loading="lazy"
-                >
-                  <template #fallback>
-                    <div class="adw-icon-fb"><TrophyMedal tier="platinum" :size="30" /></div>
-                  </template>
-                </HlImg>
-              </div>
-              <div class="adw-item-main">
-                <div class="adw-item-name" :title="a.name">
-                  <span class="adw-item-name-text">{{ a.name }}</span>
+            <div v-for="a in detail.achievements" :key="a.imageName" class="adw-item-wrap">
+              <div class="adw-item" :class="{ 'is-locked': !a.achieved }">
+                <div class="adw-icon-box">
+                  <HlImg
+                    :src="a.achieved ? a.icon : a.iconGray || a.icon"
+                    class="adw-icon"
+                    :class="{ 'is-gray': !a.achieved && !a.iconGray }"
+                    alt=""
+                    loading="lazy"
+                  >
+                    <template #fallback>
+                      <div class="adw-icon-fb"><TrophyMedal tier="platinum" :size="30" /></div>
+                    </template>
+                  </HlImg>
+                </div>
+                <div class="adw-item-main">
+                  <div class="adw-item-name" :title="a.name">
+                    <span class="adw-item-name-text">{{ a.name }}</span>
+                    <span
+                      v-if="a.imageName === rarestHere"
+                      class="adw-item-rarest"
+                      :title="globalPctTitle(a)"
+                    >
+                      {{ t('achievements.highlight.rarestBadge') }}
+                    </span>
+                  </div>
+                  <div class="adw-item-desc" :title="a.description">{{ a.description }}</div>
+                </div>
+                <div class="adw-item-side">
                   <span
-                    v-if="a.imageName === rarestHere"
-                    class="adw-item-rarest"
+                    class="adw-rarity"
+                    :style="{ color: RARITY_META[a.rarity].color, borderColor: RARITY_META[a.rarity].color + '55' }"
                     :title="globalPctTitle(a)"
                   >
-                    {{ t('achievements.highlight.rarestBadge') }}
+                  <TrophyMedal
+                    v-if="RARITY_TROPHY[a.rarity]"
+                    :tier="RARITY_TROPHY[a.rarity]"
+                    :size="14"
+                  />
+                    {{ t(RARITY_META[a.rarity].key) }}
+                  </span>
+                  <span class="adw-state" :class="{ 'is-on': a.achieved }">
+                    {{
+                      a.achieved
+                        ? t('achievements.drawer.unlockAt', { date: fmtDate(a.unlockTime) })
+                        : t('achievements.drawer.locked')
+                    }}
+                  </span>
+                  <button
+                    type="button"
+                    class="adw-note-btn"
+                    :class="{ 'is-on': !!noteOf(a.imageName) }"
+                    :title="t('achievements.social.tab.notes')"
+                    @click.stop="toggleNote(a.imageName)"
+                  >
+                    <HlIcon name="edit" :size="12" />
+                  </button>
+                </div>
+              </div>
+
+              <div v-if="noteOpenFor === a.imageName" class="adw-note">
+                <HlTextarea
+                  v-model="draftContent"
+                  :rows="2"
+                  :maxlength="NOTE_MAX"
+                  :placeholder="t('achievements.note.placeholder')"
+                />
+                <div class="adw-note-tools">
+                  <HlSegmented v-model="moodModel" :options="moodOptions" />
+                  <span class="adw-note-count hl-num">
+                    {{ t('achievements.note.maxLen', { used: draftContent.length, max: NOTE_MAX }) }}
+                  </span>
+                  <span v-if="noteBonus" class="adw-note-bonus">{{ noteBonus }}</span>
+                </div>
+                <div class="adw-note-actions">
+                  <span class="adw-note-hint">{{ t('achievements.note.firstBonusHint') }}</span>
+                  <span class="adw-note-btns">
+                    <HlPopconfirm
+                      v-if="noteOf(a.imageName)"
+                      :text="t('achievements.note.confirmDelete')"
+                      @confirm="removeNote(a.imageName)"
+                    >
+                      <HlButton variant="ghost" size="sm">
+                        {{ t('achievements.note.delete') }}
+                      </HlButton>
+                    </HlPopconfirm>
+                    <HlButton
+                      variant="primary"
+                      size="sm"
+                      :disabled="!draftContent.trim()"
+                      :loading="noteSaving"
+                      @click="saveNote(a.imageName)"
+                    >
+                      {{ t('achievements.note.save') }}
+                    </HlButton>
                   </span>
                 </div>
-                <div class="adw-item-desc" :title="a.description">{{ a.description }}</div>
-              </div>
-              <div class="adw-item-side">
-                <span
-                  class="adw-rarity"
-                  :style="{ color: RARITY_META[a.rarity].color, borderColor: RARITY_META[a.rarity].color + '55' }"
-                  :title="globalPctTitle(a)"
-                >
-                <TrophyMedal
-                  v-if="RARITY_TROPHY[a.rarity]"
-                  :tier="RARITY_TROPHY[a.rarity]"
-                  :size="14"
-                />
-                  {{ t(RARITY_META[a.rarity].key) }}
-                </span>
-                <span class="adw-state" :class="{ 'is-on': a.achieved }">
-                  {{
-                    a.achieved
-                      ? t('achievements.drawer.unlockAt', { date: fmtDate(a.unlockTime) })
-                      : t('achievements.drawer.locked')
-                  }}
-                </span>
+                <p v-if="noteError" class="adw-note-err">{{ noteError }}</p>
               </div>
             </div>
           </div>
@@ -288,4 +454,31 @@ const lockedCount = computed(() => detail.value?.achievements.filter((a) => !a.a
 }
 .adw-state { font-size: 9.5px; color: var(--text-dim); max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .adw-state.is-on { color: var(--success); }
+
+/* 成就批注：行侧入口 + 行下展开的读写面板 */
+.adw-item-wrap { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.adw-note-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 24px; height: 18px; border-radius: 4px;
+  border: 1px solid var(--line-1); background: var(--surface-inset);
+  color: var(--text-dim); cursor: pointer;
+  transition: color calc(var(--duration-1) * var(--motion-scale)) var(--ease-out),
+    border-color calc(var(--duration-1) * var(--motion-scale)) var(--ease-out),
+    background calc(var(--duration-1) * var(--motion-scale)) var(--ease-out);
+}
+.adw-note-btn:hover { color: var(--accent); border-color: var(--accent-a45); }
+.adw-note-btn.is-on { color: var(--accent); border-color: var(--accent-a45); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.adw-note {
+  display: flex; flex-direction: column; gap: 6px;
+  margin-left: 50px; padding: 8px 10px;
+  border: 1px dashed var(--line-1); border-radius: var(--radius-sm);
+  background: var(--surface-inset-sm);
+}
+.adw-note-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.adw-note-count { font-size: 10px; color: var(--text-dim); }
+.adw-note-bonus { font-size: 10px; font-weight: 700; color: var(--success); }
+.adw-note-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.adw-note-hint { font-size: 10px; color: var(--text-dim); }
+.adw-note-btns { display: inline-flex; align-items: center; gap: 6px; }
+.adw-note-err { margin: 0; font-size: 10.5px; color: var(--danger); }
 </style>

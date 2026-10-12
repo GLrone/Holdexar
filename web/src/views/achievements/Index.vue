@@ -30,7 +30,9 @@ import {
   HlSelect,
   HlSpinner,
   HlStat,
+  HlTabs,
   type HlSelectOption,
+  type HlTabItem,
 } from '@/components/ui'
 import {
   axisPointerStyle,
@@ -51,6 +53,7 @@ import TrophyMedal from '@/components/business/TrophyMedal.vue'
 import { vStagger } from '@/lib/stagger'
 import { useAchievementsStore } from '@/stores/achievements'
 import { useCareerStore } from '@/stores/career'
+import { useTrophyHallStore } from '@/stores/trophyHall'
 import ActivityHeatmap from './career/ActivityHeatmap.vue'
 import CareerBanner from './career/CareerBanner.vue'
 import CareerOverview from './career/CareerOverview.vue'
@@ -61,6 +64,11 @@ import TitleWall from './career/TitleWall.vue'
 import VaultWall from './career/VaultWall.vue'
 import DeferPanel from './DeferPanel.vue'
 import DetailDrawer from './DetailDrawer.vue'
+import ChallengeCenter from './sections/ChallengeCenter.vue'
+import LevelCard from './sections/LevelCard.vue'
+import NotesWall from './sections/NotesWall.vue'
+import RecentFeed from './sections/RecentFeed.vue'
+import SocialCompare from './sections/SocialCompare.vue'
 
 use([CanvasRenderer, BarChart, PieChart, GridComponent, TooltipComponent])
 
@@ -68,6 +76,25 @@ const router = useRouter()
 const { t } = useI18n()
 const store = useAchievementsStore()
 const careerStore = useCareerStore()
+/* 奖杯大厅（等级 / 挑战）：跨 store 接线由本页驱动——进页加载、切号联动、
+   同步收尾强制绕缓存刷新 */
+const trophyHall = useTrophyHallStore()
+
+watch(
+  () => store.syncing,
+  (now, old) => {
+    if (old && !now) void trophyHall.refresh()
+  },
+)
+
+/* 猎手社交三页签（账号对比 / 解锁动态 / 猎手批注）：页签容器由本页持有，
+   面板组件各自消费 trophyHall store，切页签才挂载 */
+const socialTab = ref('compare')
+const socialTabs = computed<HlTabItem[]>(() => [
+  { key: 'compare', label: t('achievements.social.tab.compare') },
+  { key: 'feed', label: t('achievements.social.tab.feed') },
+  { key: 'notes', label: t('achievements.social.tab.notes') },
+])
 
 /** 生涯八块共用一份载荷；空库时不渲染（渲染出来全是空态，反而更吵） */
 const career = computed(() => (careerStore.hasData() ? careerStore.career : null))
@@ -92,6 +119,9 @@ onActivated(() => {
   // 生涯：激活拉一次；同步跑完（syncing true→false）由 store 自动重算
   careerStore.attach(() => store.syncing)
   void careerStore.load()
+  // 奖杯大厅：账号一致走会话内单次加载；不一致（首次进页或切号后未拉）换号重拉
+  if (trophyHall.account === store.account) void trophyHall.load()
+  else void trophyHall.setAccount(store.account)
 })
 
 /* 切离时收起明细抽屉：keep-alive 会保留弹层状态，回来时被模态层挡住很突兀 */
@@ -165,6 +195,9 @@ async function switchAccount(steamid: string): Promise<void> {
   careerStore.setAccount(steamid)
   await store.setAccount(steamid)
   await careerStore.load(true, steamid)
+  void trophyHall.setAccount(steamid)
+  // 对比页签开着时切号即重拉缺省对比（载荷已清，挂载中的面板等不到重挂惰性拉取）
+  if (socialTab.value === 'compare') void trophyHall.loadCompare()
 }
 
 const accountModel = computed<string>({
@@ -545,8 +578,9 @@ const stopSummaryWatch = watch(
         <CareerOverview :career="career" />
       </template>
 
-      <!-- ① 总览：KPI + 白金殿堂 -->
+      <!-- ① 总览：等级身份卡 + KPI + 白金殿堂 -->
       <section data-section="achievements.section.overview" class="achv-block">
+        <LevelCard />
         <div class="achv-kpi-row">
           <HlStat
             size="sm"
@@ -637,6 +671,20 @@ const stopSummaryWatch = watch(
           </div>
           <HlEmpty v-else size="sm" icon="" :text="t('achievements.shelf.empty')" />
         </div>
+      </section>
+
+      <!-- ①′ 猎手挑战：铜/银/金分档筛选 + 领取 -->
+      <section data-section="achievements.section.challenges" class="achv-block">
+        <ChallengeCenter />
+      </section>
+
+      <!-- ①″ 猎手社交：账号对比 / 解锁动态 / 猎手批注，三页签 -->
+      <section data-section="achievements.section.social" class="achv-block">
+        <HlTabs v-model="socialTab" :tabs="socialTabs" class="achv-social-tabs">
+          <SocialCompare v-if="socialTab === 'compare'" />
+          <RecentFeed v-else-if="socialTab === 'feed'" @open-game="openDetail" />
+          <NotesWall v-else-if="socialTab === 'notes'" @open-game="openDetail" />
+        </HlTabs>
       </section>
 
       <!-- ── 档位一（续）· 总览：称号墙 ── -->
@@ -971,6 +1019,9 @@ const stopSummaryWatch = watch(
 .achv-kpi-row { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; }
 .achv-kpi-row :deep(.hl-stat) { border: 1px solid var(--line-1); border-radius: var(--radius-sm); }
 @media (max-width: 1100px) { .achv-kpi-row { grid-template-columns: repeat(3, 1fr); } }
+
+/* 社交三页签：收紧面板默认留白，让页签栏贴住内容卡 */
+.achv-social-tabs :deep(.hl-tabs__body) { padding: 10px 0 0; }
 
 /* 模块头 */
 .achv-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
