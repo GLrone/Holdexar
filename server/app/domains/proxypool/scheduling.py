@@ -21,12 +21,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import WritePriority, write_gate
@@ -48,6 +50,7 @@ from app.domains.proxypool.bridge import (
 from app.domains.proxypool.exits import exit_snapshot, select_exit_slots, slot_signature
 from app.domains.proxypool.health import (
     DEFAULT_BUSINESS_APPID,
+    NODE_PROBE_FAILED,
     PROBE_COMMIT_EVERY,
     BusinessOutcome,
     HealthOutcome,
@@ -105,21 +108,113 @@ _MAINTENANCE_EVENT_LABELS = {
     MAINTENANCE_REBUILD: "代理通道重建",
 }
 
+# 体检节流：KV 键与默认间隔。节流判据 = 「间隔内 + 合格集签名未变」才跳过，
+# 二者任一不成立（或读取失败）都按到期处理——宁可多跑，不可漏跑。
+MAINTENANCE_INTERVAL_HOURS_KEY = "proxy.pool_maintenance_interval_hours"
+MAINTENANCE_LAST_SIG_KEY = "proxy.pool_maintenance_last_sig"
+DEFAULT_MAINTENANCE_INTERVAL_HOURS = 2
 
-async def _announce_maintenance(kind: str) -> None:
-    """维护开始播报：SSE 实时事件 + 编排事件留痕（均 fail-soft）。
+
+def _eligible_signature(names) -> str:
+    """合格集签名：集合变化（判死/复活/换节点）必然改变它。"""
+    return hashlib.sha256("\n".join(names).encode("utf-8")).hexdigest()
+
+
+async def maintenance_due(session: AsyncSession, *, now: datetime) -> bool:
+    """体检节流判据：最近一次成功收尾的 scheduled 体检在间隔内、且当前合格集
+    签名与上次收尾记录一致 → 未到期；无历史 run、超间隔、签名变化、interval≤0
+    或任何读取异常 → 到期。"""
+    from app.domains.settings.service import get_value
+
+    try:
+        interval = await get_value(
+            MAINTENANCE_INTERVAL_HOURS_KEY, DEFAULT_MAINTENANCE_INTERVAL_HOURS
+        )
+        try:
+            interval = float(interval)
+        except (TypeError, ValueError):
+            interval = DEFAULT_MAINTENANCE_INTERVAL_HOURS
+        if interval <= 0:
+            return True
+        last = (await session.execute(
+            select(HealthRun)
+            .where(
+                HealthRun.channel == "scheduled",
+                HealthRun.finished_at.is_not(None),
+                HealthRun.end_reason.is_(None),
+                # 探测通道故障（如控制器认证失配）会让整轮 0 成功——它不是
+                # 「体检过且健康」的锚，隔 2 小时静默会漏掉真节点结论
+                HealthRun.total > 0,
+                HealthRun.steam_ok > 0,
+            )
+            .order_by(HealthRun.started_at.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+        if last is None or last.started_at is None:
+            return True
+        if now - last.started_at >= timedelta(hours=interval):
+            return True
+        signature = _eligible_signature(await eligible_runtime_names(session))
+        return (await get_value(MAINTENANCE_LAST_SIG_KEY)) != signature
+    except Exception:  # noqa: BLE001 —— 读侧故障按到期处理
+        log_event(
+            logger,
+            "体检节流判据读取异常，本轮按到期处理",
+            level=logging.WARNING,
+            exc_info=True,
+        )
+        return True
+
+
+async def _record_maintenance_signature(session: AsyncSession) -> None:
+    """成功体检收尾记录当前合格集签名（节流判据的事实源）；写失败只记日志。"""
+    from app.domains.settings.service import set_value
+
+    try:
+        await set_value(
+            MAINTENANCE_LAST_SIG_KEY,
+            _eligible_signature(await eligible_runtime_names(session)),
+        )
+    except Exception:  # noqa: BLE001 —— 签名写失败不影响主流程，下轮按到期重跑
+        log_event(
+            logger,
+            "体检签名写入失败，下一拍体检可能重复执行",
+            level=logging.WARNING,
+            exc_info=True,
+        )
+
+
+async def _announce_maintenance(kind: str, *, totals: dict | None = None) -> None:
+    """维护开始播报：用户可见日志 + SSE 实时事件 + 编排事件留痕（均 fail-soft）。
 
     维护期间爬取被预约位拒绝，这是前端与灵动岛唯一能投影「体检进行中 /
     重建进行中」的窗口——没有这一步，维护就是一段用户完全看不见的静默期。"""
     from app.core import orchestration
     from app.core.events import bus
 
+    payload: dict = {"kind": kind}
+    if totals is not None:
+        payload["totals"] = totals
+    if kind == MAINTENANCE_HEALTH:
+        count = (totals or {}).get("l1")
+        count_text = str(count) if count is not None else "?"
+        log_event(
+            logger,
+            f"代理体检开始：待检 {count_text} 个节点，价格抓取期间自动让路",
+            tag="开始",
+        )
+    else:
+        log_event(
+            logger,
+            f"{_MAINTENANCE_EVENT_LABELS[kind]}开始：期间价格抓取自动让路",
+            tag="开始",
+        )
     try:
-        bus.publish("maintenance.started", kind=kind)
+        bus.publish("maintenance.started", **payload)
         await orchestration.record(
             orchestration.KIND_MAINTENANCE_STARTED,
             f"{_MAINTENANCE_EVENT_LABELS[kind]}开始：期间价格抓取自动让路",
-            payload={"kind": kind},
+            payload=payload,
         )
     except Exception:  # noqa: BLE001 —— 观测不是生产依赖
         pass
@@ -128,13 +223,34 @@ async def _announce_maintenance(kind: str) -> None:
 async def _conclude_maintenance(
     kind: str, *, elapsed_s: float, summary: dict | None = None,
 ) -> None:
-    """维护收场播报：SSE 事件 + 编排事件（fail-soft）。summary 带节点级结论
+    """维护收场播报：用户可见日志 + SSE 事件 + 编排事件（fail-soft）。summary 带节点级结论
     （total/ok/failed），异常中断路径没有结论，只有耗时。"""
     from app.core import orchestration
     from app.core.events import bus
 
     payload: dict = {"kind": kind, "durationMs": int(elapsed_s * 1000)}
     payload.update(summary or {})
+    if kind == MAINTENANCE_HEALTH and summary and "ok" in summary:
+        log_event(
+            logger,
+            f"代理体检结束：用时 {elapsed_s / 60:.1f} 分钟，"
+            f"正常 {summary.get('ok', 0)} · 异常 {summary.get('failed', 0)}",
+            tag="结束",
+        )
+    elif kind == MAINTENANCE_HEALTH and summary:
+        # 整轮无一条节点结论（探测通道故障）：报「无结论」而不是「正常 0」
+        log_event(
+            logger,
+            f"代理体检结束：用时 {elapsed_s / 60:.1f} 分钟，"
+            f"待检 {summary.get('total', 0)} 个节点，本轮无有效结论",
+            tag="结束",
+        )
+    else:
+        log_event(
+            logger,
+            f"{_MAINTENANCE_EVENT_LABELS[kind]}结束：用时 {elapsed_s / 60:.1f} 分钟",
+            tag="结束",
+        )
     try:
         bus.publish("maintenance.ended", **payload)
         await orchestration.record(
@@ -343,7 +459,11 @@ async def run_maintenance_cycle(
     except CrawlerBusyError:
         return None
     started = time.monotonic()
-    await _announce_maintenance(MAINTENANCE_HEALTH)
+    # 计划总量 = 池文件节点数（两层各一）：SSE started/progress 用它表达进度比例
+    planned_total = len(pool_file_names(data_dir))
+    await _announce_maintenance(
+        MAINTENANCE_HEALTH, totals={"l1": planned_total, "l2": planned_total}
+    )
     try:
         result = await _maintenance_probe(
             session, data_dir=data_dir, controller_url=controller_url,
@@ -354,6 +474,7 @@ async def run_maintenance_cycle(
             elapsed_s=time.monotonic() - started,
             summary=_health_run_summary(result),
         )
+        await _record_maintenance_signature(session)
         return result
     except BaseException:
         await _conclude_maintenance(
@@ -367,10 +488,17 @@ async def run_maintenance_cycle(
 def _health_run_summary(result: MaintenanceResult | None) -> dict:
     """体检收场播报的节点级结论（L2 是生死判据层，汇总以它为准）。
 
-    结果形状防御：维护包络对替身实现（测试哨兵）不假设 MaintenanceResult。"""
+    结果形状防御：维护包络对替身实现（测试哨兵）不假设 MaintenanceResult。
+    整轮全部是探测通道失败（选不中节点，零节点证据）时不给 ok/failed——
+    「正常 0 · 异常 N」是探测基础设施故障的假结论，不是节点结论。"""
     l2 = getattr(result, "l2", None) or ()
     total = len(l2)
     ok = sum(1 for o in l2 if getattr(o, "ok", False))
+    if total and not ok and all(
+        str(getattr(o, "detail", "") or "").startswith(NODE_PROBE_FAILED)
+        for o in l2
+    ):
+        return {"total": total}
     return {"total": total, "ok": ok, "failed": total - ok}
 
 
@@ -659,7 +787,8 @@ async def run_proxypool_cycle(
     ② 重新判断占用：busy → 本轮到此为止（不重建、不 L1/L2、不切 GLOBAL）
     ③ 空闲 → 消费 `rebuild_pending` 并重建
     ④ 重建后确认 Runtime ready（新 controller/端口）
-    ⑤ 最后才 L1/L2——观察对象因此始终接近生产状态
+    ⑤ 体检节流：间隔内且合格集签名未变 → 跳过 L1/L2（维护位不占）
+    ⑥ 最后才 L1/L2——观察对象因此始终接近生产状态
 
     顺序不能颠倒：若先 L1/L2，它们面对的还是"含已死节点"的旧 Runtime，没有意义。
 
@@ -690,6 +819,10 @@ async def run_proxypool_cycle(
         # 重建换掉了实例：后续维护必须用**新的** controller
         controller_url = rebuilt.controller_url
         secret = getattr(runtime, "secret", secret)
+
+    # 体检节流：间隔内且合格集签名未变 → 本拍跳过（等价 busy 跳过，维护位不占）
+    if not await maintenance_due(session, now=now):
+        return ProxypoolCycleResult(l0=l0, busy=False, rebuilt=rebuilt, maintenance=None)
 
     maintenance = await run_maintenance_cycle(
         session, data_dir=data_dir, controller_url=controller_url, secret=secret,

@@ -45,11 +45,15 @@ const crawl = {
      速度未知或剩余量已跑完时整段不出现 */
   'crawl.progress.eta': '预计 {time} 结束',
 
-  /* 系统侧活动（不是任务，任务列表看不到） */
+  /* 系统侧活动（不是任务，任务列表看不到）。probed 是 L2 层（节点连通检测）
+     口径；probedCount 是总数未下发时的累计计数兜底（占位符判据要求两键分开）；
+     exitCheck 是 L1 阶段（出口身份核对，还没有可数的节点结论）。 */
   'crawl.sys.starting': '正在启动任务：后端在登记队列与排定出口，稍等片刻',
   'crawl.sys.maintenance':
     '系统体检进行中：正在逐个检测代理通道，价格抓取会自动让路，无需操作',
-  'crawl.sys.probed': '已检测 {n} 个节点',
+  'crawl.sys.exitCheck': '正在核对出口身份',
+  'crawl.sys.probed': '已检测 {n}/{total} 个节点',
+  'crawl.sys.probedCount': '已检测 {n} 个节点',
   'crawl.sys.rebuild': '代理通道重建中：正在整理出口节点，价格抓取会自动让路，无需操作',
   'crawl.sys.throttled':
     '正在排队等发送窗口：{n} 个请求在限流队列中，任务会自动继续',

@@ -26,7 +26,7 @@ import os
 import socket
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -551,12 +551,12 @@ async def test_maintenance_restores_global_from_current_pool(
 
 
 # ══ P1.6-C：接线（cycle / 两个注入点 / fail closed）══════════════
-async def _cycle(session, data_dir, base, secret, runtime, exe, **kw):
+async def _cycle(session, data_dir, base, secret, runtime, exe, now=None, **kw):
     from app.domains.proxypool.scheduling import run_proxypool_cycle
 
     return await run_proxypool_cycle(
         session, data_dir=data_dir, controller_url=base, secret=secret,
-        runtime=runtime, exe_path=str(exe), now=NOW,
+        runtime=runtime, exe_path=str(exe), now=now or NOW,
         l0_target_url=kw.get("l0_target_url"),
         l1_url=kw.get("l1_url"), l2_url=kw.get("l2_url"),
     )
@@ -658,6 +658,7 @@ async def test_cycle_when_idle_rebuilds_then_maintains(
     async with get_session_factory()() as s:
         second = await _cycle(
             s, tmp_data_dir, base, secret, proxy_runtime, kernel_exe_path,
+            now=NOW + timedelta(hours=3),  # 超出体检间隔：节流不得吞掉本轮维护
             l0_target_url="http://probe.invalid/ip",
             l1_url="http://probe.invalid/ip", l2_url="http://probe.invalid/browse",
         )

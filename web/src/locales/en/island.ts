@@ -33,9 +33,15 @@ const island: Partial<Record<MessageKey, string>> = {
   'island.ago.hours': '{n} h ago',
   'island.ago.days': '{n} d ago',
 
-  /* Proxy health check / rebuild long task (system-side maintenance, island-wide while running) */
+  /* Proxy health check / rebuild long task (system-side maintenance, island-wide while running).
+     healthProbed counts the L2 layer (node connectivity); healthProbedCount is the
+     cumulative fallback when the backend sends no totals (separate keys: the
+     placeholder gate requires every call site to supply all placeholders);
+     healthExit is the L1 phase (exit identity check, no node count yet). */
   'island.maintenance.health': 'Health check in progress: testing proxy nodes one by one',
-  'island.maintenance.healthProbed': 'Health check in progress: {n} nodes checked',
+  'island.maintenance.healthExit': 'System check in progress: verifying exit identities',
+  'island.maintenance.healthProbed': 'System check in progress: {n}/{total} nodes probed',
+  'island.maintenance.healthProbedCount': 'System check in progress: {n} nodes probed',
   'island.maintenance.healthDone': 'Health check finished: {ok} healthy · {fail} failed · took {min} min',
   'island.maintenance.healthDoneSimple': 'Health check finished',
   'island.maintenance.rebuild': 'Rebuilding proxy channels',

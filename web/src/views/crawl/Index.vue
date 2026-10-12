@@ -313,16 +313,27 @@ async function loadJobs() {
 // 体检状态归 crawlStatus store 统一投影（SSE + 轮询同源），页面只消费
 const throttled = ref(0)
 
-/** 体检/重建进行中（store 投影）与状态行文案 */
+/** 体检/重建进行中（store 投影）与状态行文案：与岛任务同口径——有总数时
+    按 L2 层（节点连通检测）出 n/total，总数未下发保持累计计数兜底，L1 阶段
+    （出口身份核对）不给会误导的节点计数 */
 const maintenanceActive = computed(() => crawl.maintenance !== null)
 const maintenanceLabel = computed(() => {
   const m = crawl.maintenance
   if (!m) return ''
   if (m.kind === 'rebuild') return t('crawl.sys.rebuild')
-  const n = m.probedL1 + m.probedL2
-  return n > 0
-    ? `${t('crawl.sys.maintenance')} · ${t('crawl.sys.probed', { n })}`
-    : t('crawl.sys.maintenance')
+  const totalL1 = m.totalL1 ?? 0
+  const totalL2 = m.totalL2 ?? 0
+  const l2Underway = m.probedL2 > 0 || (totalL1 > 0 && m.probedL1 >= totalL1)
+  if (l2Underway && totalL2 > 0) {
+    return `${t('crawl.sys.maintenance')} · ${t('crawl.sys.probed', { n: m.probedL2, total: totalL2 })}`
+  }
+  if (totalL1 === 0 && totalL2 === 0) {
+    const n = m.probedL1 + m.probedL2
+    return n > 0
+      ? `${t('crawl.sys.maintenance')} · ${t('crawl.sys.probedCount', { n })}`
+      : t('crawl.sys.maintenance')
+  }
+  return `${t('crawl.sys.maintenance')} · ${t('crawl.sys.exitCheck')}`
 })
 
 async function loadActive() {

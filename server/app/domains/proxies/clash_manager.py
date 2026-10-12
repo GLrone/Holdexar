@@ -790,11 +790,14 @@ def _port_listening(port: int) -> bool:
         return sock.connect_ex(("127.0.0.1", port)) == 0
 
 
-def _alloc_probe_ports(count: int, *, avoid: set[int]) -> list[int]:
+def _alloc_probe_ports(
+    count: int, *, avoid: set[int],
+    port_base: int = PROBE_LANE_PORT_BASE, port_span: int = PROBE_LANE_PORT_SPAN,
+) -> list[int]:
     """确定性扫空闲端口；凑不满 count 就给多少用多少（空列表 = 不注入）。"""
     ports: list[int] = []
-    candidate = PROBE_LANE_PORT_BASE
-    ceiling = PROBE_LANE_PORT_BASE + PROBE_LANE_PORT_SPAN
+    candidate = port_base
+    ceiling = port_base + port_span
     while len(ports) < count and candidate < ceiling:
         if candidate not in avoid and _port_free(candidate):
             ports.append(candidate)
@@ -802,10 +805,15 @@ def _alloc_probe_ports(count: int, *, avoid: set[int]) -> list[int]:
     return ports
 
 
-def inject_probe_lanes(config_text: str) -> str:
+def inject_probe_lanes(
+    config_text: str, *,
+    port_base: int = PROBE_LANE_PORT_BASE, port_span: int = PROBE_LANE_PORT_SPAN,
+    pin_ports: Sequence[int] | None = None,
+) -> str:
     """把探测 lane 注入内核配置（幂等）：剔除本前缀旧条目后追加
     PROBE_LANE_COUNT 组 `select`(include-all) + 同数 mixed listener。
-    端口避让本配置自己的混合口与控制器口。不可解析的配置原样返回；
+    端口避让本配置自己的混合口与控制器口；`pin_ports` 钉住沿用（热重载通道，
+    端口归现役内核所有，绕过空闲检查）。不可解析的配置原样返回；
     一个端口都分不到时不动配置（检测退回串行路径）。"""
     try:
         doc = yaml.safe_load(config_text)
@@ -821,7 +829,14 @@ def inject_probe_lanes(config_text: str) -> str:
     m = re.search(r":(\d+)\s*$", controller)
     if m:
         avoid.add(int(m.group(1)))
-    ports = _alloc_probe_ports(PROBE_LANE_COUNT, avoid=avoid)
+    pinned = [
+        p for p in (pin_ports or ())
+        if isinstance(p, int) and p > 0 and p not in avoid
+    ][:PROBE_LANE_COUNT]
+    ports = pinned + _alloc_probe_ports(
+        PROBE_LANE_COUNT - len(pinned), avoid=avoid | set(pinned),
+        port_base=port_base, port_span=port_span,
+    )
     if not ports:
         return config_text
     groups = [

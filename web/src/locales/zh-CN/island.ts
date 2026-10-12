@@ -32,9 +32,14 @@ const island = {
   'island.ago.days': '{n} 天前',
 
   /* 内容链事实通知（服务端判定事实变化，岛上消费展示） */
-  /* 代理体检/重建长任务（系统侧维护，进行中跨页占岛） */
+  /* 代理体检/重建长任务（系统侧维护，进行中跨页占岛）。
+     healthProbed 的 n/total 是 L2 层（节点连通检测）口径；healthProbedCount
+     是总数未下发时的累计计数兜底（占位符判据要求两键分开，不能只传 n）；
+     healthExit 是 L1 阶段（出口身份核对，还没有可数的节点结论）。 */
   'island.maintenance.health': '系统体检进行中：正在逐个检测代理节点',
-  'island.maintenance.healthProbed': '系统体检进行中：已检测 {n} 个节点',
+  'island.maintenance.healthExit': '系统体检进行中：正在核对出口身份',
+  'island.maintenance.healthProbed': '系统体检进行中：已检测 {n}/{total} 个节点',
+  'island.maintenance.healthProbedCount': '系统体检进行中：已检测 {n} 个节点',
   'island.maintenance.healthDone': '系统体检完成：正常 {ok} · 异常 {fail} · 用时 {min} 分钟',
   'island.maintenance.healthDoneSimple': '系统体检已完成',
   'island.maintenance.rebuild': '代理通道重建中',

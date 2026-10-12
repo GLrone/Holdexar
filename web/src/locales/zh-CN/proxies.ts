@@ -212,6 +212,17 @@ const proxies = {
   'proxies.jobruns.status.failed': '失败',
   'proxies.jobruns.status.interrupted': '已中断',
 
+  /* 最近体检（系统侧体检台账）：自动体检按周期跑、手动体检由「检测节点」触发；
+     endReason=interrupted 表示体检被重启打断，行内以「已中断」标出；
+     line 的三个数都可能缺（该次体检还没有结论），缺时组件侧显示 —。 */
+  'proxies.section.healthruns': '最近体检',
+  'proxies.healthruns.sourceScheduled': '自动',
+  'proxies.healthruns.sourceManual': '手动',
+  'proxies.healthruns.running': '进行中',
+  'proxies.healthruns.interrupted': '已中断',
+  'proxies.healthruns.line': '节点 {total} · 正常 {ok} · 异常 {fail}',
+  'proxies.healthruns.empty': '还没有体检记录',
+
   /* 动作与弹窗（本模块内复用；与 common 无同值项） */
   'proxies.action.delete': '删除',
   'proxies.dialog.confirm': '确认',

@@ -178,6 +178,9 @@ async def test_default_kernel_proxy_from_existing_runtime(monkeypatch) -> None:
         def status(self):
             return {"running": True, "port": 7890}
 
+        def entry_listening(self):
+            return True  # 入口硬闸：端口在听才交第二通道
+
     monkeypatch.setattr(clash_manager, "runtime", _Status())
     assert bs.default_kernel_proxy() == "http://127.0.0.1:7890"
 
