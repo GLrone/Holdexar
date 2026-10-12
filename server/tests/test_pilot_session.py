@@ -155,7 +155,7 @@ def _state_with_turns(n: int, summary: str | None = None, through: int = 0) -> S
 
 class TestAssemble:
     def test_summary_injected_as_user_and_turns_respected(self):
-        """压缩摘要以 user 消息衔接（ZCode 压缩语义），system 位只留系统提示。"""
+        """压缩摘要以 user 消息衔接（摘要占 user 位），system 位只留系统提示。"""
         state = _state_with_turns(3, summary="存档要点", through=1)
         msgs = pilot_context.assemble(state, "现在呢", None)
         assert msgs[0]["role"] == "user" and "存档要点" in msgs[0]["content"]

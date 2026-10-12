@@ -3136,7 +3136,7 @@ function triggerFollowUp(prompt: string) {
                   <span>{{ t('pilot.ctx.cacheHit') }}</span>
                   <span class="pilot-ctxpick__pct">{{ fmtPct(lastCtx.hitRate) }}</span>
                 </div>
-                <!-- 本会话消耗：账本全轮折叠（DSH UsagePill 口径——分桶精确数，
+                <!-- 本会话消耗：账本全轮折叠（用量药丸口径——分桶精确数，
                      部分命中永不显示 100%；provider 未报告的桶整行不出） -->
                 <div v-if="statsTotal > 0 && sessionStats" class="pilot-ctxpick__usage">
                   <div class="pilot-ctxpick__usage-head">
