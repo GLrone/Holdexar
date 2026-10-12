@@ -17,7 +17,7 @@ from apscheduler.events import EVENT_JOB_MAX_INSTANCES, EVENT_JOB_MISSED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app.core.external_time import local_next_grid, probe_next_grid
-from app.core.database import WritePriority, get_session_factory, write_gate
+from app.core.database import WritePriority, get_session_factory, write_gate, write_session
 from app.core.logging import log_event
 
 logger = logging.getLogger(__name__)
@@ -310,7 +310,7 @@ async def _stamp_uncrawled_missing(appids: list[int]) -> int:
 
     now = get_beijing_time_obj().replace(tzinfo=None)
     wrote = 0
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND) as session:
         # 只挑仍然整行缺失的（回补成功建行的跳过）
         still_missing = (
             await session.execute(
@@ -319,32 +319,35 @@ async def _stamp_uncrawled_missing(appids: list[int]) -> int:
         ).scalars().all()
         known = {int(a) for a in still_missing}
         todo = [int(a) for a in appids if int(a) not in known]
-        for appid in todo:
-            stmt = _insert(GameCurrentPrice).values(
-                appid=appid,
-                region_code="",
-                currency="",
-                price=None,
-                original_price=None,
-                discount_percent=0,
-                sub_id=None,
-                price_status="missing",
-                fail_count=1,
-                cny_fen=None,
-                attempt_outcome="failed",
-                last_success_at=None,
-                updated_at=now,
+        if todo:
+            stmt = _insert(GameCurrentPrice).on_conflict_do_nothing(
+                index_elements=[
+                    GameCurrentPrice.appid, GameCurrentPrice.region_code,
+                ]
             )
             await session.execute(
-                stmt.on_conflict_do_nothing(
-                    index_elements=[
-                        GameCurrentPrice.appid, GameCurrentPrice.region_code,
-                    ]
-                )
+                stmt,
+                [
+                    {
+                        "appid": appid,
+                        "region_code": "",
+                        "currency": "",
+                        "price": None,
+                        "original_price": None,
+                        "discount_percent": 0,
+                        "sub_id": None,
+                        "price_status": "missing",
+                        "fail_count": 1,
+                        "cny_fen": None,
+                        "attempt_outcome": "failed",
+                        "last_success_at": None,
+                        "updated_at": now,
+                    }
+                    for appid in todo
+                ],
             )
-            wrote += 1
-        if todo:
             await session.commit()
+        wrote = len(todo)
     if wrote:
         log_event(
             logger,
@@ -2228,7 +2231,12 @@ def start_scheduler() -> None:
         _acct("proxypool_retention", _job_proxypool_retention), "cron", hour=4, minute=35, id="proxypool_retention",
         max_instances=1, coalesce=True,
     )
-    scheduler.add_job(_acct("auto_backup", _job_backup), "interval", hours=24, id="auto_backup")
+    # 每日自动备份：3 GiB 库上单份是分钟级，且启动补备走的是直接 await 同一函数
+    # ——max_instances=1 + coalesce 防「定时拍与补备拍」叠成两份并行快照。
+    scheduler.add_job(
+        _acct("auto_backup", _job_backup), "interval", hours=24, id="auto_backup",
+        max_instances=1, coalesce=True,
+    )
     # proxypool 周期：**只注册这一个**（L0 / pending 重建 / L1-L2 都在它内部按序发生）。
     # 池 Runtime 未就绪时函数内部自行跳过；max_instances=1 防上一轮未跑完又叠一轮。
     scheduler.add_job(

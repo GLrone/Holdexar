@@ -37,6 +37,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SERVER = ROOT / "server"
 RELEASE = ROOT / "release"
 SEED_DB = ROOT / "assets" / "seed" / "holdexar_seed.db"
+SEED_GZ = RELEASE / "holdexar_seed.db.gz"
 SCOOP_DIR = RELEASE / "scoop"
 NOTES_FILE = RELEASE / "RELEASE_NOTES.md"
 MANIFEST_OUT = RELEASE / "latest.json"
@@ -105,9 +106,12 @@ def read_notes() -> str:
 
 
 def build_manifest(version: str, zip_path: Path) -> dict:
-    """清单结构：app 元信息 + assets[]（role 区分应用包与种子）。
+    """清单结构：app 元信息 + assets[]（role 区分应用包、种子与种子分发档）。
 
     role 让客户端不必靠文件名模式认资产；schema 号供将来兼容判断。
+    `seed` 声明的是**解压后的库**（历史字段，供人读与人工核对）；
+    `seed-archive` 声明的是**实际分发的压缩档**——客户端下载的就是它，
+    校验必须对着它的哈希，不能拿未压缩库的哈希去比一个 gz。
     """
     assets = [
         {
@@ -124,6 +128,15 @@ def build_manifest(version: str, zip_path: Path) -> dict:
                 "name": SEED_DB.name,
                 "size": SEED_DB.stat().st_size,
                 "sha256": sha256_of(SEED_DB),
+            }
+        )
+    if SEED_GZ.is_file():
+        assets.append(
+            {
+                "role": "seed-archive",
+                "name": SEED_GZ.name,
+                "size": SEED_GZ.stat().st_size,
+                "sha256": sha256_of(SEED_GZ),
             }
         )
     return {
@@ -190,6 +203,11 @@ def build(explicit_zip: str | None = None, version: str | None = None) -> dict:
               f"（{roles['seed']['size'] / 1048576:.1f} MB）")
     else:
         print("[清单] 警告：未找到种子资产，本次清单不含 seed 条目")
+    if "seed-archive" in roles:
+        print(f"[清单] v{version} 种子分发档 {roles['seed-archive']['name']}"
+              f"（{roles['seed-archive']['size'] / 1048576:.1f} MB）")
+    else:
+        print("[清单] 警告：未找到种子分发档，客户端下载后无哈希可比对")
     print(f"[清单] → {MANIFEST_OUT}")
     print(f"[清单] → {SCOOP_DIR / f'{APP_NAME.lower()}.json'}")
     print(f"[发布] 下一步：python scripts/publish_release.py（创建 Release 并上传）")

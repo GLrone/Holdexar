@@ -18,7 +18,7 @@ import logging
 import secrets
 
 from app.core import keyring, secretbox
-from app.core.database import WritePriority, get_session_factory, write_gate
+from app.core.database import WritePriority, write_session
 from app.core.logging import log_event
 
 logger = logging.getLogger(__name__)
@@ -50,9 +50,7 @@ async def reencrypt_all(old_master: bytes, new_master: bytes) -> dict:
     from sqlalchemy import select
 
     counts = {"accountCookies": 0, "settingSecrets": 0, "subscriptions": 0, "snapshots": 0}
-    async with write_gate(
-        WritePriority.INTERACTIVE, label="rekey"
-    ), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE, label="rekey") as session:
         for row in (await session.execute(select(SteamAccount))).scalars().all():
             migrated = _migrate(row.cookies, _CREDENTIAL_PURPOSE, old_master, new_master)
             if migrated is not None:

@@ -28,7 +28,7 @@ from datetime import datetime
 from sqlalchemy import JSON, DateTime, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.core.database import Base, WritePriority, get_session_factory, write_gate
+from app.core.database import WritePriority, write_session, Base
 from app.core.logging import log_event
 
 logger = logging.getLogger(__name__)
@@ -97,7 +97,7 @@ async def record(
             # 事务边界归调用方：这里只 add，不 commit
             session.add(row)
             return True
-        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as own:
+        async with write_session(WritePriority.BACKGROUND) as own:
             own.add(row)
             await own.commit()
         return True

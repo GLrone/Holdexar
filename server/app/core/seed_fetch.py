@@ -1,4 +1,4 @@
-"""按需获取资产种子：本地缺有效种子时从 GitHub Release 拉取并立即并入。
+"""按需获取资产种子：本地缺有效种子时从分发链拉取并立即并入。
 
 包内不再内置种子（体积）；全新安装 / 升级后首次启动在后台下载 gzip 种子到
 data/seed/，落位即跑一次 merge_seed_incremental 让数据当轮生效；失败静默等
@@ -6,19 +6,24 @@ data/seed/，落位即跑一次 merge_seed_incremental 让数据当轮生效；�
 经 scripts/fetch_seed.py 落 assets/seed）。
 
 通道复用 app.core.updater 的「出口 × 镜像」通道机（并发探测 / 断点续传 /
-停滞换道）；种子资产挂 releases/latest/download（固定文件名，地址恒定）。
-完整性闸：gzip 解压 + sqlite 打开 + seed_meta.version 非空（种子由本项目
-构建，gzip CRC + 结构校验即可，无需外部 sha256）。
+停滞换道）；候选表在自有分发直链与 GitHub 及其代理之间并列，谁先答且答得对
+就用谁，用户无需选择。
+
+完整性闸：清单哈希（权威，来自 latest.json 的 seed-archive 条目）→ gzip 解压
+（CRC32/ISIZE 端到端）→ sqlite 打开 + seed_meta.version 非空。清单不可达时
+退化为后两道——它们能挡住截断与坏档，但挡不住「内容被换成另一份自洽数据」，
+所以哈希可得时一定用它。
 """
 from __future__ import annotations
 
 import asyncio
 import gzip
+import hashlib
 import logging
 import shutil
 from pathlib import Path
 
-from app.core.app_info import GITHUB_REPO
+from app.core.app_info import DATA_CDN_BASE, GITHUB_REPO
 from app.core.config import get_settings
 from app.core.logging import log_event
 from app.core.seed_assets import merge_seed_incremental, read_seed_meta, seed_db_path
@@ -69,14 +74,51 @@ def _data_seed_dir() -> Path:
     return get_settings().data_dir / "seed"
 
 
-def _mirrors() -> tuple[str, ...]:
-    from app.core.updater import _MIRRORS
+def _cdn_seed_url(cache_key: str) -> str:
+    """自建分发上的种子地址；`cache_key` 非空时带上查询串做缓存区分。
 
-    return _MIRRORS
+    分发入口前面挂着一层 CDN，它按自己的规则缓存（边缘响应头给的缓存时长可能
+    比对象自身的设置更长）。种子是**固定文件名、内容随版本变**的对象：不带区分
+    串时，换版之后边缘会继续发旧档，客户端哈希校验失败、表现为反复重下同一份
+    坏档。查询串取清单哈希前缀，换版即换地址，旧档自然过期。
+    """
+    base = f"{DATA_CDN_BASE.rstrip('/')}/seed/{SEED_GZ_NAME}"
+    return f"{base}?v={cache_key}" if cache_key else base
 
 
-def _tail_url() -> str:
-    return f"https://github.com/{GITHUB_REPO}/releases/latest/download/{SEED_GZ_NAME}"
+async def _seed_manifest_entry() -> dict:
+    """清单里声明的种子分发档条目（含 sha256 与 size）；不可达返回空字典。
+
+    只认 `seed-archive`：`seed` 那条声明的是**未压缩的库**，拿它的哈希去比对
+    下载到的 gz 必然不符。
+    """
+    try:
+        from app.core.updater import _fetch_manifest
+
+        data = await _fetch_manifest()
+    except Exception as e:  # noqa: BLE001 —— 清单是增强项，取不到不影响下载
+        log_event(
+            logger,
+            "种子清单不可用，退化为结构校验",
+            tag="降级",
+            detail={"原因": str(e)},
+        )
+        return {}
+    for asset in (data or {}).get("assets") or []:
+        if str(asset.get("role") or "") == "seed-archive":
+            return {
+                "sha256": str(asset.get("sha256") or "").lower(),
+                "size": int(asset.get("size") or 0),
+            }
+    return {}
+
+
+def _sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _validate_seed(db_file: Path) -> str:
@@ -126,16 +168,44 @@ async def ensure_seed_online() -> dict:
         part = seed_dir / _PART_NAME
         gz_path = seed_dir / SEED_GZ_NAME
         db_tmp = seed_dir / "holdexar_seed.db.tmp"
-        for stale in (part, gz_path, db_tmp):
-            stale.unlink(missing_ok=True)
+        gz_path.unlink(missing_ok=True)
+        db_tmp.unlink(missing_ok=True)
+
+        entry = await _seed_manifest_entry()
+        expected_sha = str(entry.get("sha256") or "")
+        # 上一轮留下的半截档只在「还能接着下」时才留：它已经不小于清单声明的
+        # 目标体积，说明那不是可续传的半截，而是坏档或换版残留，直接丢弃从头来。
+        expected_size = int(entry.get("size") or 0)
+        if part.is_file() and expected_size and part.stat().st_size >= expected_size:
+            log_event(
+                logger,
+                "残留的种子下载临时档体积异常，丢弃重下",
+                tag="清理",
+                detail={"已有字节": part.stat().st_size, "目标字节": expected_size},
+            )
+            part.unlink(missing_ok=True)
 
         attempts = clash_manager.runtime._download_attempts()
-        tail = _tail_url()
+        # 候选地址两类，**不交叉**：自建分发直链原样访问（GitHub 代理镜像对它
+        # 没有意义，拼上去只会得到一个必然 404 的地址）；GitHub 尾部地址才逐
+        # 个镜像前缀各出一份。再与出口（直连/内核代理）做笛卡尔积。
+        endpoints: list[tuple[str, str]] = []
+        if DATA_CDN_BASE:
+            endpoints.append(
+                ("·自建分发", _cdn_seed_url(expected_sha[:12]))
+            )
+        gh_tail = f"https://github.com/{GITHUB_REPO}/releases/latest/download/{SEED_GZ_NAME}"
+        for mirror in _mirrors():
+            endpoints.append(("·镜像" if mirror else "", mirror + gh_tail))
         channels = [
-            {"label": f"{label}{'·镜像' if mirror else ''}", "url": mirror + tail,
-             "proxy": proxy, "direct": not mirror and proxy is None}
+            {
+                "label": f"{label}{suffix}",
+                "url": url,
+                "proxy": proxy,
+                "direct": not suffix and proxy is None,
+            }
             for proxy, label in attempts
-            for mirror in _mirrors()
+            for suffix, url in endpoints
         ]
         probes = await _probe_channels(channels, None)
         usable = [p for p in probes if not (p["missing"] or p["bogus"])] or probes
@@ -163,6 +233,24 @@ async def ensure_seed_online() -> dict:
         else:
             raise RuntimeError(f"所有下载通道均失败：{last_err}")
 
+        # 权威校验：下载到的字节必须就是清单声明的那一份。清单不可达时跳过
+        # （退化为下面的 gzip + 结构校验），此时在日志里留痕，别让「校验通过」
+        # 显得比实际更强。
+        if expected_sha:
+            actual = await asyncio.to_thread(_sha256_of, part)
+            if actual != expected_sha:
+                part.unlink(missing_ok=True)  # 内容不对，续传没有意义
+                raise RuntimeError(
+                    f"种子哈希与清单不符（实际 {actual[:16]}…，期望 {expected_sha[:16]}…）"
+                )
+        else:
+            log_event(
+                logger,
+                "清单哈希不可得，种子仅做结构与压缩校验",
+                tag="降级",
+                level=logging.WARNING,
+            )
+
         part.replace(gz_path)
         _PROGRESS.update({"state": "extracting", "percent": 100})
         await asyncio.to_thread(_gunzip, gz_path, db_tmp)
@@ -175,7 +263,11 @@ async def ensure_seed_online() -> dict:
             logger,
             "按需获取种子已完成，开始并入数据",
             tag="成功",
-            detail={"版本": version, "落位": str(db_final)},
+            detail={
+                "版本": version,
+                "落位": str(db_final),
+                "校验": "清单哈希" if expected_sha else "结构校验",
+            },
         )
 
         _PROGRESS.update({"state": "merging"})
@@ -194,4 +286,6 @@ async def ensure_seed_online() -> dict:
         return status()
     finally:
         _RUNNING = False
-        _data_seed_dir().joinpath(_PART_NAME).unlink(missing_ok=True)
+        # 半截档**故意保留**：下一次启动的断点续传靠它接着下。它不被任何
+        # 「种子是否在位」的判据认领（判据只看 holdexar_seed.db 的 seed_meta），
+        # 所以留在盘上不会让程序误判数据已就绪。
