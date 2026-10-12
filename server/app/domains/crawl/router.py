@@ -127,8 +127,9 @@ async def active():
 
     `maintenance` = 池体检（L1/L2 整池串行探测）在跑——它不是 CrawlJob，
     任务列表看不到；任务页据此显示「体检进行中」。`maintenanceInfo` 是体检
-    账本（health_runs 未收尾行 + 逐块落库的观测计数）的实时投影：开跑时刻与
-    已探测数，前端用它显示进度而不是一行死文案。`throttled` = 正在
+    账本（health_runs 未收尾行 + 逐块落库的观测计数）的实时投影：开跑时刻、
+    已探测数与 `totals`（如有，本轮节点级汇总读数原样透传），前端用它显示
+    进度而不是一行死文案。`throttled` = 正在
     全局限流窗口外排队的请求数——任务已启动但请求还没放行时，任务页
     据此显示「排队等发送窗口」而不是让用户以为卡死。
     """
@@ -151,6 +152,9 @@ async def active():
         if live is not None:
             maintenance_info["startedAt"] = live["startedAt"]
             maintenance_info["probed"] = live["probed"]
+            totals = live.get("totals")
+            if totals is not None:
+                maintenance_info["totals"] = totals
     return {
         "activeJobId": job_id,
         # busy 只表达「抓取在跑」（爬取占用位）：体检/重建由 maintenance 单独表达，

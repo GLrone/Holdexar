@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 
 from sqlalchemy import text
 
-from app.core.database import WritePriority, get_session_factory, write_gate
+from app.core.database import WritePriority, write_session
 from app.core.logging import log_event
 
 logger = logging.getLogger(__name__)
@@ -38,9 +38,7 @@ async def _chunked_execute(
     """
     affected_total = 0
     for _ in range(max_chunks):
-        async with write_gate(
-            WritePriority.BACKGROUND, "crawl_prune"
-        ), get_session_factory()() as session:
+        async with write_session(WritePriority.BACKGROUND, "crawl_prune") as session:
             result = await session.execute(text(sql), {**params, "chunk": chunk})
             await session.commit()
         affected = int(result.rowcount or 0)

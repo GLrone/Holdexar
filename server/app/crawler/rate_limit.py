@@ -59,40 +59,41 @@ class SlidingWindowRateLimiter:
     async def acquire(self) -> None:
         """取一个请求名额；窗口满时阻塞到有名额释放。
 
-        异常安全：限流器内部出错（时钟异常等）直接放行——它只负责
-        匀速，故障时宁可让请求发出去交给既有重试/熔断兜底。
+        等待用循环重取而非递归：睡醒后名额可能再被抢走，重取静默进行，
+        日志与排队计数只在首次等待时记一次。异常安全：限流器内部出错
+        （时钟异常等）直接放行——它只负责匀速，故障时宁可让请求发出去
+        交给既有重试/熔断兜底。
         """
+        first_wait = True
         try:
-            async with self._lock:
-                now = time.monotonic()
-                # 清掉已出窗的时间戳（窗口滑动）
-                cutoff = now - self.window_seconds
-                while self._timestamps and self._timestamps[0] <= cutoff:
-                    self._timestamps.popleft()
-                if len(self._timestamps) < self.max_requests:
-                    self._timestamps.append(now)
-                    return
-                # 窗口满：最旧一条出窗的时刻 = 最早可发的时刻
-                wait = self._timestamps[0] + self.window_seconds - now
-                self._waited_total += max(wait, 0.0)
-                self._waiting += 1
-            if wait > 0:
-                log_event(
-                    logger,
-                    f"出网请求已达频率上限（{self.max_requests} 次/{self.window_seconds} 秒），"
-                    f"等 {wait:.1f} 秒再发",
-                    detail={
-                        "窗口上限": self.max_requests,
-                        "窗口秒": self.window_seconds,
-                        "等待秒": round(wait, 1),
-                    },
-                )
-                try:
-                    await asyncio.sleep(wait)
-                finally:
-                    self._waiting = max(self._waiting - 1, 0)
-            # 睡醒后递归重取：等待期间其他 worker 可能已把名额抢走
-            await self.acquire()
+            while True:
+                async with self._lock:
+                    now = time.monotonic()
+                    # 清掉已出窗的时间戳（窗口滑动）
+                    cutoff = now - self.window_seconds
+                    while self._timestamps and self._timestamps[0] <= cutoff:
+                        self._timestamps.popleft()
+                    if len(self._timestamps) < self.max_requests:
+                        self._timestamps.append(now)
+                        return
+                    # 窗口满：最旧一条出窗的时刻 = 最早可发的时刻
+                    wait = self._timestamps[0] + self.window_seconds - now
+                    self._waited_total += max(wait, 0.0)
+                    if first_wait:
+                        self._waiting += 1
+                if first_wait:
+                    first_wait = False
+                    log_event(
+                        logger,
+                        f"出网请求已达频率上限（{self.max_requests} 次/"
+                        f"{self.window_seconds} 秒），等 {wait:.1f} 秒再发",
+                        detail={
+                            "窗口上限": self.max_requests,
+                            "窗口秒": self.window_seconds,
+                            "等待秒": round(wait, 1),
+                        },
+                    )
+                await asyncio.sleep(wait)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 —— 限流器故障不得拖垮爬取
@@ -103,6 +104,9 @@ class SlidingWindowRateLimiter:
                 level=logging.ERROR,
                 exc_info=True,
             )
+        finally:
+            if not first_wait:
+                self._waiting = max(self._waiting - 1, 0)
 
     @property
     def waiting(self) -> int:

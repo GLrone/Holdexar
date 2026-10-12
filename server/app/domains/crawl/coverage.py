@@ -49,33 +49,6 @@ def _bucket_of(price_status: str | None) -> str:
     return status if status in ("ok", "locked", "missing", "blocked") else "missing"
 
 
-def _in_window(
-    updated_at: datetime | None, started_at: datetime | None, window_end: datetime
-) -> bool:
-    """窗口外的行等于本轮没结果；无更新时刻的行同理。"""
-    if updated_at is None:
-        return False
-    if started_at is not None and updated_at < started_at:
-        return False
-    return updated_at <= window_end
-
-
-def _scan(
-    per_appid: dict[int, dict[str, int]],
-    rows,
-    regions: set[str],
-    started_at: datetime | None,
-    window_end: datetime,
-) -> None:
-    """价格行累加进「每个对象各桶的单元数」；所有消费方共用这一处判定。"""
-    for appid, region_code, price_status, updated_at in rows:
-        region = str(region_code).strip().lower()
-        if region not in regions or not _in_window(updated_at, started_at, window_end):
-            continue
-        buckets = per_appid.setdefault(int(appid), {b: 0 for b in BUCKETS})
-        buckets[_bucket_of(price_status)] += 1
-
-
 def _result(
     cycle_id: int,
     status: str | None,
@@ -186,17 +159,32 @@ async def cycle_coverage(cycle_id: int) -> dict | None:
     buckets_by_appid: dict[int, dict[str, int]] = {}
     async with get_session_factory()() as session:
         for start in range(0, len(appids), _CHUNK):
+            # 区服与窗口过滤下推 SQL，按 (对象, 状态) 预聚合——只传回窗口内
+            # 期望区的分桶计数，不拉全区全史行（region 小写比对对齐落库大写）
+            conds = [
+                GameCurrentPrice.appid.in_(appids[start : start + _CHUNK]),
+                GameCurrentPrice.updated_at.is_not(None),
+                func.lower(GameCurrentPrice.region_code).in_(regions),
+            ]
+            if started_at is not None:
+                conds.append(GameCurrentPrice.updated_at >= started_at)
+            conds.append(GameCurrentPrice.updated_at <= window_end)
             rows = (
                 await session.execute(
                     select(
                         GameCurrentPrice.appid,
-                        GameCurrentPrice.region_code,
                         GameCurrentPrice.price_status,
-                        GameCurrentPrice.updated_at,
-                    ).where(GameCurrentPrice.appid.in_(appids[start : start + _CHUNK]))
+                        func.count(),
+                    )
+                    .where(*conds)
+                    .group_by(GameCurrentPrice.appid, GameCurrentPrice.price_status)
                 )
             ).all()
-            _scan(buckets_by_appid, rows, regions, started_at, window_end)
+            for appid, price_status, n in rows:
+                buckets = buckets_by_appid.setdefault(
+                    int(appid), {b: 0 for b in BUCKETS}
+                )
+                buckets[_bucket_of(price_status)] += n
 
     counts = {
         b: sum(buckets.get(b, 0) for buckets in buckets_by_appid.values())

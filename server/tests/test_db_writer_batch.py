@@ -79,6 +79,46 @@ async def test_batch_writes_every_entry(db):
 
 
 @pytest.mark.asyncio
+async def test_curated_post_failure_does_not_rollback_main_segment(db, monkeypatch):
+    """收尾保存点失败只回滚收尾：主段价格照常落库、结果不降级。"""
+    import app.core.seed_assets as seed_assets
+
+    async def _boom(session, rows):
+        raise RuntimeError("curated boom")
+
+    monkeypatch.setattr(seed_assets, "apply_curated_rows", _boom)
+    w = DbWriter()
+    results = await w.upsert_task_batch(
+        [(_game(APPID_A, "甲"), _prices(APPID_A, 10000, 20000, 50))]
+    )
+    assert results == [True]
+    assert await _history_count(db, APPID_A) == 1
+    async with db() as session:
+        row = await session.get(GameCurrentPrice, (APPID_A, "CN"))
+    assert row is not None and row.price == 10000
+
+
+@pytest.mark.asyncio
+async def test_missing_ledger_batch_bump_and_dedup(db):
+    """批量欠账记账：首记 fail_count=1；同批 (appid, 区) 去重不双计；
+    再次失败冲突 bump 递增（保留 last good price 不动）。"""
+    w = DbWriter()
+    wrote = await w.mark_region_status_missing_batch(
+        [(APPID_A, "CN"), (APPID_A, "CN"), (APPID_B, "cn")]
+    )
+    assert wrote == 2
+    async with db() as session:
+        a = await session.get(GameCurrentPrice, (APPID_A, "CN"))
+        b = await session.get(GameCurrentPrice, (APPID_B, "CN"))
+    assert a.price_status == "missing" and a.fail_count == 1
+    assert b.price_status == "missing" and b.fail_count == 1
+    await w.mark_region_status_missing_batch([(APPID_A, "CN")])
+    async with db() as session:
+        a2 = await session.get(GameCurrentPrice, (APPID_A, "CN"))
+    assert a2.fail_count == 2 and a2.price_status == "missing"
+
+
+@pytest.mark.asyncio
 async def test_batch_has_no_low_entry_cap(db):
     """单批条数只受调用方任务大小约束：300 款一批照写，没有 200 条上限。"""
     w = DbWriter()

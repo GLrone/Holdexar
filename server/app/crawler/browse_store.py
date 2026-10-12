@@ -28,7 +28,7 @@ from pathlib import Path
 from sqlalchemy import text
 from yarl import URL
 
-from app.core.database import WritePriority, get_session_factory, write_gate
+from app.core.database import WritePriority, get_session_factory, write_gate, write_session
 from app.core.logging import log_event
 from app.crawler import tag_names
 from app.crawler.config import CC_LIST
@@ -227,22 +227,12 @@ def _item_tags(item: dict | None) -> list[tuple[int, int]]:
 
 
 async def _mark_missing_async(db_writer, appids: list[int], cc: str) -> int:
-    """同上，异步版：逐 appid 写 missing 进账本。返回写入条数。"""
+    """同上，异步版：整批一次事务写 missing 进账本。返回写入条数。"""
     if DRY_RUN:
         return 0
-    wrote = 0
-    for appid in appids:
-        try:
-            await db_writer.mark_region_status(int(appid), cc, "missing")
-            wrote += 1
-        except Exception as e:  # noqa: BLE001 —— 账本写失败不阻断主流程
-            log_event(
-                logger,
-                f"给游戏 {appid} 的 {cc} 区补记缺失数据失败",
-                level=logging.ERROR,
-                detail={"游戏": appid, "区": cc, "原因": e},
-            )
-    return wrote
+    return await db_writer.mark_region_status_missing_batch(
+        [(int(appid), cc) for appid in appids]
+    )
 
 
 # ══════════════════════════════════════════════════════════════
@@ -744,7 +734,7 @@ class BrowseDbWriter(DbWriter):
             for sub_id, opt in extras_by_sub.items()
         ]
         try:
-            async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+            async with write_session(WritePriority.BACKGROUND) as session:
                 await session.execute(
                     text(
                         "UPDATE game_price_history SET discount_end_ts=:e, "
@@ -776,7 +766,7 @@ class BrowseDbWriter(DbWriter):
             return
         try:
             async with write_gate(WritePriority.BACKGROUND):
-                async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+                async with write_session(WritePriority.BACKGROUND) as session:
                     for appid, cc, now_dt, extras_by_sub in rows:
                         params = [
                             {
@@ -1016,6 +1006,8 @@ async def _browse_price_task_inner(context) -> bool:
     # 传输截断的缺失条目（响应里没有该 appid 的答复）：按 missing 记账走补抓
     # 通道，不当 locked 终态成功观察
     truncated_missing: list[int] = []
+    # 欠账记账对（免费赠送异常 / 批量写失败）：整批一次事务落账，不再逐款开闸
+    ledger_missing: list[tuple[int, str]] = []
 
     for idx, appid in enumerate(appids):
         if idx % 32 == 0:
@@ -1075,8 +1067,7 @@ async def _browse_price_task_inner(context) -> bool:
             for o in (opts or [])
         ):
             counts["missing"] += 1
-            if not DRY_RUN:
-                await context.db_writer.mark_region_status(appid, cc, "missing")
+            ledger_missing.append((appid, cc))
             continue
 
         if status == "ok" and opts:
@@ -1186,7 +1177,7 @@ async def _browse_price_task_inner(context) -> bool:
         ):
             if not ok:
                 counts["write_fail"] += 1
-                await context.db_writer.mark_region_status(appid, cc, "missing")
+                ledger_missing.append((appid, cc))
                 continue
             if status == "ok" and opts:
                 extra_entries.append(
@@ -1240,6 +1231,8 @@ async def _browse_price_task_inner(context) -> bool:
         await context.db_writer.clear_missing_regions(cleared_missing)
     if truncated_missing and not DRY_RUN:
         await _mark_missing_async(context.db_writer, truncated_missing, cc)
+    if ledger_missing and not DRY_RUN:
+        await context.db_writer.mark_region_status_missing_batch(ledger_missing)
 
     log_event(
         logger,

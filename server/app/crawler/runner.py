@@ -320,13 +320,16 @@ async def _run_crawl_locked(
         if target_ids:
             unknown = [a for a in target_ids if a not in bs.PRESERVED]
             if unknown:
-                zh = await bs.prefetch_lang(
-                    session, http_client, unknown, "schinese", bs.EXTRAS_ENABLED,
-                    bs.DEFAULT_BATCH_SIZE,
-                )
-                en = await bs.prefetch_lang(
-                    session, http_client, unknown, "english", bs.EXTRAS_ENABLED,
-                    bs.DEFAULT_BATCH_SIZE,
+                # 两语言互不依赖，并行预取（各自内部仍按回退区串行补齐）
+                zh, en = await asyncio.gather(
+                    bs.prefetch_lang(
+                        session, http_client, unknown, "schinese", bs.EXTRAS_ENABLED,
+                        bs.DEFAULT_BATCH_SIZE,
+                    ),
+                    bs.prefetch_lang(
+                        session, http_client, unknown, "english", bs.EXTRAS_ENABLED,
+                        bs.DEFAULT_BATCH_SIZE,
+                    ),
                 )
                 for aid in unknown:
                     if aid in zh or aid in en:

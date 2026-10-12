@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 
 from sqlalchemy import or_, select, text
 
-from app.core.database import WritePriority, get_session_factory, write_gate
+from app.core.database import WritePriority, get_session_factory, write_gate, write_session
 from app.core.events import bus
 from app.core.logging import log_event
 from app.crawler.config import DEFAULT_WORKER_COUNT, HTTP_TIMEOUT, WORKERS_MAX
@@ -77,7 +77,7 @@ _PROCESS_STARTED_AT = get_beijing_time_obj().replace(tzinfo=None)
 
 async def cleanup_orphan_jobs() -> None:
     """进程启动时把上一进程遗留的 running 任务标记为失败。"""
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND) as session:
         rows = (
             await session.execute(
                 select(CrawlJob).where(
@@ -130,9 +130,7 @@ async def prune_crawl_jobs(
     cutoff = datetime.now() - timedelta(days=days)
     deleted = 0
     for _ in range(max_chunks):
-        async with write_gate(
-            WritePriority.BACKGROUND, "crawl_prune"
-        ), get_session_factory()() as session:
+        async with write_session(WritePriority.BACKGROUND, "crawl_prune") as session:
             result = await session.execute(
                 text(
                     "DELETE FROM crawl_jobs WHERE id IN ("
@@ -476,7 +474,7 @@ async def _load_job(job_id: int) -> CrawlJob | None:
 
 async def _finish_job(job_id: int, status: str, stats: dict | None = None, error: str | None = None) -> None:
     async with write_gate(WritePriority.BACKGROUND):
-        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+        async with write_session(WritePriority.BACKGROUND) as session:
             job = await session.get(CrawlJob, job_id)
             if job is None:
                 return
@@ -1070,7 +1068,7 @@ async def start_job(
         else:
             initial_total = -(-len(pairs) // DEFAULT_BATCH_SIZE) * len(effective)
         async with write_gate(WritePriority.BACKGROUND):
-            async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+            async with write_session(WritePriority.BACKGROUND) as session:
                 job = CrawlJob(
                     kind=kind,
                     status="running",
