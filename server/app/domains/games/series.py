@@ -31,7 +31,7 @@ from pathlib import Path
 
 from sqlalchemy import and_, or_, select, update
 
-from app.core.database import WritePriority, get_session_factory
+from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.database import write_gate
 from app.core.logging import log_event
 from app.domains.games.models import Game
@@ -546,7 +546,7 @@ async def refresh_series() -> int:
     批量 executemany 单事务提交。幂等：结果不变的行零写入。
     """
     overrides = load_overrides()
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND) as session:
         rows = (
             (
                 await session.execute(

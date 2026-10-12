@@ -18,7 +18,7 @@ from datetime import date, datetime, timedelta
 from sqlalchemy import func, select, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from app.core.database import WritePriority, get_session_factory
+from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.database import write_gate
 from app.core.logging import log_event
 from app.crawler.utils import get_beijing_time_obj
@@ -185,7 +185,7 @@ async def sync() -> dict:
             for e in rows
         ]
 
-        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+        async with write_session(WritePriority.BACKGROUND) as session:
             for row in prepared:
                 stmt = sqlite_insert(SteamEvent).values(**row)
                 stmt = stmt.on_conflict_do_update(
@@ -270,9 +270,7 @@ async def _backfill_price_history(rows: list[dict]) -> int:
         if isinstance(watermark, str):
             sql += " AND snapshot_at >= :wm"
             params["wm"] = watermark
-        async with write_gate(
-            WritePriority.BACKGROUND, label="steam_event_backfill"
-        ), get_session_factory()() as session:
+        async with write_session(WritePriority.BACKGROUND, label="steam_event_backfill") as session:
             result = await session.execute(text(sql), params)
             total += result.rowcount or 0
             marks[key] = stamped
@@ -387,6 +385,7 @@ async def list_events() -> dict:
     return {
         "events": events,
         "live": live,
+        "upcoming": upcoming[:12],
         "next": upcoming[0] if upcoming else None,
         "fetchedAt": fetched_iso,
         "stale": stale,

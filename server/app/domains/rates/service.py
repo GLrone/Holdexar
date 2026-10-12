@@ -19,7 +19,7 @@ import httpx
 from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from app.core.database import WritePriority, get_session_factory
+from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.database import write_gate
 from app.core.logging import log_event
 from app.crawler.config import CC_LIST
@@ -139,7 +139,7 @@ async def refresh_rates() -> dict:
 
     from . import snapshot as snapshot_service
 
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND) as session:
         for code, rate in rates.items():
             stmt = sqlite_insert(FxRate).values(
                 currency_code=code, rate_to_cny=rate, fetched_at=now
@@ -327,7 +327,7 @@ async def cleanup_disallowed() -> tuple[int, int]:
 
     启动时调用一次；refresh_rates 落库后也会顺带执行，保证幂等。
     """
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND) as session:
         removed = await _delete_disallowed(session)
         if any(removed):
             await session.commit()

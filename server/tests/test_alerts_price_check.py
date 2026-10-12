@@ -30,6 +30,10 @@ async def alerts_db(tmp_path: Path, monkeypatch):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
+    # 写路径经 write_session 走数据库模块工厂：两处都要指向同一个独立库
+    import app.core.database as database_module
+
+    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
     monkeypatch.setattr(alerts_service, "get_session_factory", lambda: factory)
 
     async def _region_name(code: str) -> str:

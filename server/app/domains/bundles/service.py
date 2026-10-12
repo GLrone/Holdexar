@@ -31,7 +31,7 @@ import zlib
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import WritePriority, get_session_factory
+from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.database import write_gate
 from app.core.logging import log_event
 from app.domains.crawl import freshness as freshness_service
@@ -81,6 +81,17 @@ _LIST_CACHE: tuple[tuple, list[dict]] | None = None
 _LIST_JSON_CACHE: dict[tuple, bytes] = {}
 _LIST_GZIP_CACHE: dict[tuple, bytes] = {}
 
+# 陈旧兑底（stale-while-revalidate）：失效时把上一版字节搬进来而不是丢弃，
+# 重建完成前的请求秒回旧版——数据只在刷新/汇率/追踪区变化时变，重建窗口
+# 内的陈旧以秒计且内容仍是最近一轮刷新的合法快照。_STALE_GZIP 另有一份
+# 磁盘档（data/cache/），进程重启后内存为空时读盘兜底，覆盖启动链预热
+# 完成前进页的窗口。
+_STALE_JSON: dict[str, bytes] = {}
+_STALE_GZIP: dict[str, bytes] = {}
+_REBUILDING: set[str] = set()
+_REBUILD_TASKS: set[asyncio.Task] = set()
+_DISK_STALE_LOADED = False
+
 # 列表排序参数（bundle 排序快照列）：diff = 差价降序（历史默认），
 # smart = 智能评分降序（games 商店同款四因子，见 _bundle_smart_score）
 _SORTS = ("diff", "smart")
@@ -109,8 +120,15 @@ def _list_fp(tracked: set[str] | None, rates: dict[str, float]) -> tuple:
 
 
 def invalidate_bundles_cache() -> None:
-    """捆绑包数据变更后调用（refresh / import / 爬虫补包共用写入口已挂）。"""
+    """捆绑包数据变更后调用（refresh / import / 爬虫补包共用写入口已挂）。
+
+    上一版预序列化字节先搬进陈旧槽再清活缓存：失效后的首个请求立即拿到
+    旧版并触发后台重建，不再把 15s 级冷重建压进请求路径。"""
     global _DATA_CACHE, _LIST_CACHE
+    for key, payload in _LIST_JSON_CACHE.items():
+        _STALE_JSON[key[1]] = payload
+    for key, payload in _LIST_GZIP_CACHE.items():
+        _STALE_GZIP[key[1]] = payload
     _DATA_CACHE = None
     _LIST_CACHE = None
     _LIST_JSON_CACHE.clear()
@@ -479,7 +497,7 @@ async def refresh_bundle_sort_cache(
     """
     if session is not None:
         return await _refresh_bundle_sort_cache(bundle_ids, session)
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as own:
+    async with write_session(WritePriority.BACKGROUND) as own:
         written = await _refresh_bundle_sort_cache(bundle_ids, own)
         await own.commit()
     return written
@@ -697,7 +715,7 @@ async def list_bundles(sort: str = "diff", *, removed: bool = False) -> list[dic
         blocked = await _bundle_blocked_ids()
         if blocked:
             bundles = [b for b in bundles if b.bundle_id not in blocked]
-        items = _build_list_items(bundles, prices_by_bundle, tracked)
+        items = await asyncio.to_thread(_build_list_items, bundles, prices_by_bundle, tracked)
         followed = await _bundle_followed_ids()
         if followed:
             # 关注置顶 = 稳定分区（关注组 / 其余组各自保持 SQL 排序），不重排
@@ -708,6 +726,109 @@ async def list_bundles(sort: str = "diff", *, removed: bool = False) -> list[dic
         return items
 
 
+def _dump_items(items: list[dict]) -> bytes:
+    return json.dumps({"bundles": items}, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+
+
+def _disk_stale_path(sort: str):
+    from pathlib import Path
+
+    from app.core.paths import resolve_data_dir
+
+    return Path(resolve_data_dir()) / "cache" / f"bundles-list-{sort}.json.gz"
+
+
+def _write_disk_stale(sort: str, payload: bytes) -> None:
+    """陈旧档落盘（原子替换）；失败只记日志——磁盘档只是重启窗口的兑底。"""
+    try:
+        path = _disk_stale_path(sort)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_bytes(payload)
+        tmp.replace(path)
+    except OSError:
+        log_event(
+            logger,
+            "捆绑包列表陈旧档写入失败，重启兜底退化为内存档",
+            level=logging.WARNING,
+            exc_info=True,
+        )
+
+
+def _stale_gzip_for(sort: str) -> bytes | None:
+    """陈旧压缩载荷：内存槽优先；进程重启后首轮请求读一次磁盘档。"""
+    global _DISK_STALE_LOADED
+    cached = _STALE_GZIP.get(sort)
+    if cached is not None:
+        return cached
+    if _DISK_STALE_LOADED:
+        return None
+    _DISK_STALE_LOADED = True
+    try:
+        data = _disk_stale_path(sort).read_bytes()
+    except OSError:
+        return None
+    if data:
+        _STALE_GZIP[sort] = data
+    return _STALE_GZIP.get(sort)
+
+
+def _schedule_rebuild(sort: str) -> None:
+    """后台重建单飞：陈旧兑底已回给请求方，这里把新鲜载荷补建出来。
+
+    重建成功且建出的键仍是当前指纹时才退役陈旧槽；中途又被失效的轮次
+    保留旧档（它仍是下一轮重建完成前唯一可秒回的兑底）。"""
+    if sort in _REBUILDING:
+        return
+    _REBUILDING.add(sort)
+
+    async def _run() -> None:
+        try:
+            # 直呼同步构建（不过陈旧快路径——否则重建任务自己又回陈旧字节空转）
+            await _build_json_bytes(sort)
+            await _build_gzip_bytes(sort)
+            key = _LIST_CACHE[0] if _LIST_CACHE is not None else None
+            if key is not None and key[1] == sort:
+                _STALE_JSON.pop(sort, None)
+                _STALE_GZIP.pop(sort, None)
+        except Exception:  # noqa: BLE001
+            log_event(
+                logger,
+                "捆绑包列表后台重建失败，陈旧载荷继续兑底",
+                level=logging.ERROR,
+                exc_info=True,
+            )
+        finally:
+            _REBUILDING.discard(sort)
+
+    task = asyncio.create_task(_run())
+    _REBUILD_TASKS.add(task)
+    task.add_done_callback(_REBUILD_TASKS.discard)
+
+
+async def _build_json_bytes(sort: str) -> bytes:
+    """同步构建路径（跳过陈旧快路径）：后台重建任务与冷启动兜底共用。"""
+    items = await list_bundles(sort)
+    payload = await asyncio.to_thread(_dump_items, items)
+    fresh_key = _LIST_CACHE[0] if _LIST_CACHE is not None else None
+    if fresh_key is not None and fresh_key[1] == sort:
+        _LIST_JSON_CACHE[fresh_key] = payload
+    return payload
+
+
+async def _build_gzip_bytes(sort: str) -> bytes:
+    """压缩变体同步构建；新鲜档建成时顺手落盘，供下次重启兜底。"""
+    payload = await list_bundles_json(sort)
+    compressed = await asyncio.to_thread(_gzip_payload, payload)
+    fresh_key = _LIST_CACHE[0] if _LIST_CACHE is not None else None
+    if fresh_key is not None and fresh_key[1] == sort:
+        _LIST_GZIP_CACHE[fresh_key] = compressed
+        await asyncio.to_thread(_write_disk_stale, sort, compressed)
+    return compressed
+
+
 async def list_bundles_json(sort: str = "diff") -> bytes:
     """列表的预序列化 UTF-8 JSON（路由出口用），内容与 list_bundles() 等值。
 
@@ -715,24 +836,26 @@ async def list_bundles_json(sort: str = "diff") -> bytes:
     jsonable_encoder + JSON 编码（15k 条聚合结果 2s 级），而列表内容
     只在数据/汇率/追踪区变化时变——聚合与编码都按同一指纹缓存。
     按排序分槽（dict）：smart/diff 两份共存，切换排序不再重复编码。
-    """
+
+    缓存未命中时先查陈旧槽：有上一版字节就立即回旧版 + 后台单飞重建
+    （SWR），只在进程启动后从无任何版本时才同步重建（启动预热通常
+    已覆盖该窗口）。编码在后台线程跑，不阻塞事件循环。"""
     sort = _normalize_sort(sort)
-    items = await list_bundles(sort)
-    key = _LIST_CACHE[0] if _LIST_CACHE is not None else None
-    # key 与本次排序不一致 = 并发请求刚切走了 _LIST_CACHE（内容正确但不缓存，
-    # 等 key 归位的那次请求补上编码缓存）
-    if key is not None and key[1] == sort:
+    tracked = await _tracked_region_codes()
+    rates = await get_rates()
+    key = (_list_fp(tracked, rates), sort)
+    if _LIST_CACHE is not None and _LIST_CACHE[0] == key:
         cached = _LIST_JSON_CACHE.get(key)
         if cached is not None:
             return cached
-        payload = json.dumps(
-            {"bundles": items}, ensure_ascii=False, separators=(",", ":")
-        ).encode("utf-8")
+        payload = await asyncio.to_thread(_dump_items, _LIST_CACHE[1])
         _LIST_JSON_CACHE[key] = payload
         return payload
-    return json.dumps(
-        {"bundles": items}, ensure_ascii=False, separators=(",", ":")
-    ).encode("utf-8")
+    stale = _STALE_JSON.get(sort)
+    if stale is not None:
+        _schedule_rebuild(sort)
+        return stale
+    return await _build_json_bytes(sort)
 
 
 def _gzip_payload(payload: bytes) -> bytes:
@@ -751,18 +874,22 @@ async def list_bundles_gzip_json(sort: str = "diff") -> bytes:
     传输压缩中间件对非流式响应必须收齐整包才开始下发，50MB 级载荷会把响应
     起送从毫秒推到秒级——列表是**预序列化缓存载荷**，压缩一步同样按缓存槽
     复用即可。路由按 Accept-Encoding 在原始/压缩两份中选择。
-    """
+
+    SWR 语义与 list_bundles_json 一致：陈旧压缩档直接回（含重启后读磁盘
+    档），新鲜压缩档建成时顺手落盘供下次重启兜底。"""
     sort = _normalize_sort(sort)
-    payload = await list_bundles_json(sort)
-    key = _LIST_CACHE[0] if _LIST_CACHE is not None else None
-    if key is not None and key[1] == sort:
+    tracked = await _tracked_region_codes()
+    rates = await get_rates()
+    key = (_list_fp(tracked, rates), sort)
+    if _LIST_CACHE is not None and _LIST_CACHE[0] == key:
         cached = _LIST_GZIP_CACHE.get(key)
         if cached is not None:
             return cached
-        compressed = _gzip_payload(payload)
-        _LIST_GZIP_CACHE[key] = compressed
-        return compressed
-    return _gzip_payload(payload)
+    stale = _stale_gzip_for(sort)
+    if stale is not None:
+        _schedule_rebuild(sort)
+        return stale
+    return await _build_gzip_bytes(sort)
 
 
 async def warmup() -> int:

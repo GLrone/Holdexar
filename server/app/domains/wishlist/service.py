@@ -23,7 +23,7 @@ from datetime import datetime
 import httpx
 from sqlalchemy import delete, func, select
 
-from app.core.database import WritePriority, get_session_factory
+from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.database import write_gate
 from app.core.logging import log_event
 from app.crawler.utils import get_beijing_time_obj
@@ -107,7 +107,7 @@ async def _backfill_personas(steamids: list[str]) -> None:
         try:
             persona = await _fetch_persona(sid)
             if persona.get("persona_name") or persona.get("avatar_url"):
-                async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+                async with write_session(WritePriority.BACKGROUND) as session:
                     account = await session.get(TrackedAccount, sid)
                     if account is not None:
                         _apply_persona(account, persona)
@@ -362,7 +362,7 @@ async def list_accounts() -> list[dict]:
     if pending:
         from app.domains.account.steam_wallet import normalize_avatar_url
 
-        async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+        async with write_session(WritePriority.INTERACTIVE) as session:
             for account, (name, avatar) in pending:
                 row = await session.get(TrackedAccount, account.steamid)
                 if row is None:
@@ -398,7 +398,7 @@ async def add_account(steamid_or_vanity: str, label: str = "", kinds: dict | Non
     now = _naive(get_beijing_time_obj())
     # 绑定即抓昵称/头像（愿望单页账户行展示；失败不阻断绑定）
     persona = await _fetch_persona(steamid)
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE) as session:
         existing = await session.get(TrackedAccount, steamid)
         if existing:
             raise ValueError(f"账户已存在: {steamid}")
@@ -424,7 +424,7 @@ async def remove_account(steamid: str) -> dict | None:
     等非派生来源不动；失去全部来源的对象退出监控），并顺带回收历史解绑
     遗留的孤儿派生来源。
     """
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE) as session:
         account = await session.get(TrackedAccount, steamid)
         if account is None:
             return None
@@ -1038,7 +1038,7 @@ async def update_kinds(steamid: str, kinds_patch: dict) -> dict:
 
     下次同步生效：关闭后该账户不再拉取/覆写已购库（已有条目回落愿望单条目）。
     """
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE) as session:
         account = await session.get(TrackedAccount, steamid)
         if account is None:
             raise ValueError(f"账户不存在: {steamid}")
@@ -1419,7 +1419,7 @@ async def remove_pool_items(appids: list[int], *, reason: str = "pool_removed") 
         states = await monitoring_service.states_of("game", clean)
         sources = await monitoring_service.sources_map("game", clean)
 
-        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+        async with write_session(WritePriority.BACKGROUND) as session:
             rows = (
                 (
                     await session.execute(
@@ -1478,7 +1478,7 @@ async def release_free_games(appids: list[int]) -> int:
 
     from app.domains.games.models import Game
 
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND) as session:
         free_ids = set(
             (
                 await session.execute(

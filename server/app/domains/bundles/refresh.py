@@ -36,7 +36,7 @@ import aiohttp
 from sqlalchemy import delete, func, select
 
 from app.core import database as _database
-from app.core.database import WritePriority, get_session_factory
+from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.database import write_gate
 from app.core.logging import log_event
 from app.crawler import browse_store as bs
@@ -382,7 +382,7 @@ async def _upsert_bundle_rows(
     baseline_appids = baseline.get("app_ids") or []
     if not allow_singleton and len(set(baseline_appids)) < 2:
         # 单品：删净既有主档/区域价（发现桩经链尾刷新抓价后到此甄别）
-        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as db:
+        async with write_session(WritePriority.BACKGROUND) as db:
             await db.execute(
                 delete(BundleRegionPrice).where(
                     BundleRegionPrice.bundle_id == bundle_id)
@@ -404,7 +404,7 @@ async def _upsert_bundle_rows(
     mps_votes = [r.get("mps") for r in regions if r.get("mps") in (0, 1)]
     mps_value = _majority(mps_votes)
 
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as db:
+    async with write_session(WritePriority.BACKGROUND) as db:
         row = (
             await db.execute(select(Bundle).where(Bundle.bundle_id == bundle_id))
         ).scalar_one_or_none()

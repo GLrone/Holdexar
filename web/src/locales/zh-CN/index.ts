@@ -55,6 +55,10 @@ import updateDialog from './updateDialog'
 import achievements from './achievements'
 // ── 游戏生涯（views/achievements/ 的 career/ 子模块与穿插分节）──
 import achievementsCareer from './achievementsCareer'
+// ── 奖杯大厅（views/achievements/sections/ 的等级卡与猎手挑战）──
+import achievementsHall from './achievementsHall'
+// ── 奖杯社交面（账号对比/解锁动态/成就批注，sections/ 三件与批注区）──
+import achievementsSocial from './achievementsSocial'
 // ── 价格事件面（游戏详情「最近价格变化」+ 仪表盘「本轮更新」）──
 import priceEvent from './priceEvent'
 // ── 自动抓取页（views/fetch/Index.vue，内容源开关）──
@@ -107,6 +111,8 @@ export const messages = {
   ...updateDialog,
   ...achievements,
   ...achievementsCareer,
+  ...achievementsHall,
+  ...achievementsSocial,
   ...priceEvent,
   ...fetchPage,
   ...island,

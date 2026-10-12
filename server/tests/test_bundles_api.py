@@ -15,6 +15,7 @@ game_current_prices（夹具清理，不污染真实库），验证：
 追踪区通过打桩 _tracked_region_codes 控制（模块级依赖 regions.service，
 不打桩会读到生产 crawl_regions 表——启用集随「我」页漂移，断言不稳定）。
 """
+import asyncio
 import sys
 from pathlib import Path
 
@@ -656,3 +657,54 @@ async def test_sort_snapshot_rebuild_over_bind_limit():
         async with get_session_factory()() as session:
             await session.execute(delete(Bundle).where(Bundle.bundle_id >= base))
             await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_list_json_serves_stale_and_rebuilds_in_background():
+    """失效后列表出口立即回上一版字节（SWR），重建挂后台单飞。
+
+    回归：缓存失效后首个请求同步冷重建（全量聚合+序列化秒级~十秒级）
+    压在请求路径上，进页要干等整个重建——失效必须秒回陈旧字节。"""
+    service._STALE_JSON.clear()
+    service._STALE_GZIP.clear()
+    try:
+        first = await service.list_bundles_json()
+        assert first
+        service.invalidate_bundles_cache()
+        assert service._STALE_JSON  # 上一版进陈旧槽而非丢弃
+        stale = await service.list_bundles_json()
+        assert stale == first
+        assert service._LIST_CACHE is None  # 陈旧兑底未同步重建
+        tasks = [t for t in service._REBUILD_TASKS if not t.done()]
+        assert tasks  # 后台重建已挂
+        await asyncio.gather(*tasks)
+        assert service._LIST_CACHE is not None  # 新鲜载荷后台就位
+        assert not service._STALE_JSON  # 建成且仍是当前指纹 → 陈旧槽退役
+        assert await service.list_bundles_json() == first  # 同数据重建内容一致
+    finally:
+        service._STALE_JSON.clear()
+        service._STALE_GZIP.clear()
+
+
+@pytest.mark.asyncio
+async def test_gzip_stale_serve_and_disk_seed():
+    """压缩变体同走 SWR；新鲜构建落磁盘档，进程重启后内存空档由磁盘兑底。"""
+    service._STALE_JSON.clear()
+    service._STALE_GZIP.clear()
+    disk_flag = service._DISK_STALE_LOADED
+    try:
+        gz = await service.list_bundles_gzip_json()
+        assert gz.startswith(b"\x1f\x8b")  # gzip magic
+        assert service._disk_stale_path("diff").read_bytes() == gz  # 新鲜构建已落盘
+        service.invalidate_bundles_cache()
+        service._STALE_JSON.clear()
+        service._STALE_GZIP.clear()
+        service._DISK_STALE_LOADED = False  # 模拟重启：内存档全空
+        served = await service.list_bundles_gzip_json()
+        assert served == gz  # 磁盘档秒回，不进同步重建
+        assert service._REBUILDING  # 后台重建已挂
+        await asyncio.gather(*[t for t in service._REBUILD_TASKS if not t.done()])
+    finally:
+        service._STALE_JSON.clear()
+        service._STALE_GZIP.clear()
+        service._DISK_STALE_LOADED = disk_flag

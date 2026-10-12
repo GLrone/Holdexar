@@ -56,6 +56,10 @@ import updateDialog from './updateDialog'
 import achievements from './achievements'
 // ── Game career (career/ children and interleaved sections of views/achievements/) ──
 import achievementsCareer from './achievementsCareer'
+// ── Trophy hall (LevelCard and ChallengeCenter of views/achievements/sections/) ──
+import achievementsHall from './achievementsHall'
+// ── Trophy social surfaces (account compare / unlock feed / achievement notes) ──
+import achievementsSocial from './achievementsSocial'
 // ── Price event surfaces (game detail "recent price changes" + dashboard digest) ──
 import priceEvent from './priceEvent'
 // ── Auto Fetch page (views/fetch/Index.vue, per-source switches) ──
@@ -107,6 +111,8 @@ const messages: Partial<Record<MessageKey, string>> = {
   ...updateDialog,
   ...achievements,
   ...achievementsCareer,
+  ...achievementsHall,
+  ...achievementsSocial,
   ...priceEvent,
   ...fetchPage,
   ...island,

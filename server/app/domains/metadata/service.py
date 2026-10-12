@@ -39,7 +39,7 @@ from pathlib import Path
 import aiohttp
 from sqlalchemy import case, func, or_, select, update
 
-from app.core.database import WritePriority, get_session_factory
+from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.database import write_gate
 from app.core.logging import log_event
 from app.crawler.epic_free import (
@@ -192,7 +192,7 @@ async def import_epic(source_dir: str | None = None) -> dict:
             epic_map[int(appid_str)] = a.get("free_period") or None
 
     updated = 0
-    async with write_gate(WritePriority.BACKGROUND, label="metadata_batch"), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND, label="metadata_batch") as session:
         rows = (
             await session.execute(
                 select(Game.appid).where(Game.appid.in_(list(epic_map)))
@@ -228,7 +228,7 @@ async def import_xgp(source_dir: str | None = None) -> dict:
         xgp_map = _collect_xgp_tiers(data)
 
     updated = 0
-    async with write_gate(WritePriority.BACKGROUND, label="metadata_batch"), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND, label="metadata_batch") as session:
         rows = (
             await session.execute(select(Game.appid).where(Game.appid.in_(list(xgp_map))))
         ).all()
@@ -271,7 +271,7 @@ async def import_hb(source_dir: str | None = None) -> dict:
         hl.close()
 
     updated = 0
-    async with write_gate(WritePriority.BACKGROUND, label="metadata_batch"), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND, label="metadata_batch") as session:
         rows = (
             await session.execute(select(Game.appid).where(Game.appid.in_(list(hb_map))))
         ).all()
@@ -460,7 +460,7 @@ async def _mark_game_hb(appid: int, title: str, label: str) -> None:
     from app.crawler.utils import get_beijing_time_obj
 
     now = get_beijing_time_obj().replace(tzinfo=None)
-    async with write_gate(WritePriority.BACKGROUND, label="metadata_batch"), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND, label="metadata_batch") as session:
         row = await session.get(Game, int(appid))
         if row is None:
             session.add(
@@ -878,7 +878,7 @@ async def _mark_game_epic(appid: int, title: str, free_start: str | None) -> boo
     from app.crawler.utils import get_beijing_time_obj
 
     now = get_beijing_time_obj().replace(tzinfo=None)
-    async with write_gate(WritePriority.BACKGROUND, label="metadata_batch"), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND, label="metadata_batch") as session:
         row = await session.get(Game, int(appid))
         if row is None:
             session.add(
@@ -1299,7 +1299,7 @@ async def refresh_bundle_counts(force: bool = False) -> dict:
 
     updated = 0
     ids = sorted(bundles_map)
-    async with write_gate(WritePriority.BACKGROUND, label="metadata_batch"), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND, label="metadata_batch") as session:
         # SQLite 变量数上限分片查交集；逐片差量更新
         for i in range(0, len(ids), 500):
             chunk = ids[i : i + 500]

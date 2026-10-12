@@ -35,6 +35,7 @@ from app.core.database import (
     WritePriority,
     get_session_factory,
     write_scheduler_diagnostics,
+    write_session,
 )
 from app.core.database import write_gate
 from app.core.logging import ring_log_handler
@@ -116,7 +117,7 @@ async def import_legacy(req: LegacyImport) -> dict:
     games, prices, prices_total = await asyncio.to_thread(_fetch_legacy_snapshot, src)
 
     games_upserted = 0
-    async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as session:
+    async with write_session(WritePriority.BACKGROUND) as session:
         for row in games:
             stmt = sqlite_insert(Game).values(
                 appid=int(row["appid"]),
@@ -341,11 +342,19 @@ async def backup_list() -> dict:
     return {"items": list_backups_impl()}
 
 
+class BackupVerify(BaseModel):
+    deep: bool = False
+
+
 @router.post("/system/backup/{name}/verify")
-async def backup_verify(name: str) -> dict:
-    """校验备份自洽性（integrity_check + 独立打开，不动任何文件）。"""
+async def backup_verify(name: str, req: BackupVerify | None = None) -> dict:
+    """校验一份备份，三档递进：哈希 → 可还原（默认）→ 深校验。
+
+    默认档流式解压并丢弃输出，用 gzip 自带的 CRC32/ISIZE 证明归档能解出完整
+    正确的字节流；`deep=true` 才解档落盘做结构与行数自检（大库上是分钟级）。
+    """
     try:
-        return await verify_backup_impl(name)
+        return await verify_backup_impl(name, bool(req and req.deep))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

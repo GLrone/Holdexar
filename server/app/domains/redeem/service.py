@@ -24,7 +24,7 @@ import re
 
 import httpx
 
-from app.core.database import WritePriority, get_session_factory, write_gate
+from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.logging import log_event
 from app.domains.account import service as account_service
 from app.domains.account.steam_wallet import parse_cookie_str
@@ -180,7 +180,7 @@ async def _record_ledger(
         raw=(raw or "")[:RAW_MAX],
         steamid=str(steamid)[:32],
     )
-    async with write_gate(WritePriority.INTERACTIVE), get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE) as session:
         session.add(row)
         await session.commit()
     verdict = {"ok": "成功", "own": "已拥有"}.get(status, "失败")
