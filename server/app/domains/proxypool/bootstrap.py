@@ -11,6 +11,8 @@ rebuild_runtime=已存在因池变化重建。幂等严格定义：池非空+入
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
@@ -54,6 +56,7 @@ from app.domains.proxypool.subscription import (
     parse_nodes,
     persist_snapshot,
 )
+from app.domains.proxypool.models import subscription_tag
 
 _single_flight = asyncio.Lock()
 
@@ -106,7 +109,7 @@ async def sync_subscriptions(
     """订阅 → 快照 → Registry。**Runtime 层不参与，也拿不到 subscription URL。**
 
     生产准入（见 `admission.py`）：**CANDIDATE 在落完快照后停止**——不调用
-    `apply_snapshot`，因此不产生 ProxyNode/ProxyNodeSource、不进 eligible/pool、
+    `apply_snapshot`，因此不产生 ProxyNode、不进 eligible/pool、
     不改 `pool_signature`、不触发 rebuild、不进健康与作业台账的来源事实；
     它的证据仍然完整（`subscription_snapshots` 行 + 内容寻址字节）。
     ACTIVE 保持既有行为（persist → apply）。
@@ -191,9 +194,17 @@ async def sync_subscriptions(
                     # 同步落盘了更新的快照、却因为"当初是候选"而跳过 apply → 订阅已是 ACTIVE
                     # 而 Registry 仍停在旧快照。刷新一次再判，代价是一条 SELECT。
                     await session.refresh(sub)
+                    if result.userinfo is not None:
+                        was_blocked = sub.resource_block_reason() is not None
+                        sub.last_stats = {**(sub.last_stats or {}), "traffic": result.userinfo}
+                        if was_blocked and sub.resource_block_reason() is None:
+                            sub.deprecated = False
+                            sub.deprecated_at = None
+                            sub.deprecated_reason = None
                     if is_admitted(sub):
                         applied = await apply_snapshot(
-                            session, subscription_id=sub_id, snapshot=snap, now=now
+                            session, subscription_id=sub_id, snapshot=snap, now=now,
+                            tag=subscription_tag(sub_url),
                         )
                         # 出库留痕：快照对齐删除的来源与随之结算的节点是最高频的
                         # 出库通道，零日志会让「这批节点为什么变 STALE」不可追溯
@@ -515,19 +526,17 @@ async def ensure_pool_runtime(
 
 
 async def pool_signature(session: AsyncSession) -> tuple[str, ...]:
-    """当前 Runtime 池的签名：eligible 节点的 `runtime_name` + 配置指纹。
-
-    只看**会进内核的东西**——所以 `state` 变化导致节点进出池会改变签名，而订阅侧
-    改名/换来源不会（`runtime_name` 铸造一次即固定、`name` 本来就不参与指纹）。
-    """
-    from app.domains.proxypool.models import node_fingerprint
+    """按完整连接参数判定运行集变化，节点身份与运行参数分开比较。"""
     from app.domains.proxypool.pool import eligible_nodes
 
     nodes = await eligible_nodes(session)
-    return tuple(
-        f"{node.runtime_name}:{node_fingerprint(dict(node.normalized_config or {}))}"
-        for node in nodes
-    )
+    signatures = []
+    for node in nodes:
+        payload = {**dict(node.normalized_config or {}), "name": node.runtime_name}
+        blob = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False, default=str)
+        signatures.append(f"{node.runtime_name}:{hashlib.sha256(blob.encode('utf-8')).hexdigest()}")
+    return tuple(signatures)
 
 
 @dataclass(frozen=True)

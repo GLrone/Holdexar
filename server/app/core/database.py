@@ -406,7 +406,7 @@ def _ensure_schema(sync_conn) -> None:
 #   2. _MIGRATIONS 追加 (版本号, 描述, SQL 列表)；SQL 须幂等（中断续跑 +
 #      用户库版本乱序防御），复杂逻辑可登记 async fn(engine) 同位元素
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 # 零小数货币（Steam 以整数计价）：旧捆绑包链路的除数表按 1 处理，与「统一存分」
 # 的新约定差 100 倍——v2 归一的目标集合
@@ -1058,9 +1058,146 @@ async def _migrate_fts_trigger_when_gate(conn) -> None:
     ))
 
 
+async def _migrate_proxynode_subscription_identity(conn) -> None:
+    """v17：代理池节点身份纳入订阅维度（`proxy_node_sources` 退役）。
+
+    三步（同一事务，任一步失败整体回滚）：
+    1. `proxy_nodes` 加 `subscription_id` / `original_name` 两列（幂等：已存在则跳过）；
+    2. 从 `proxy_node_sources` 回填归属与原名（每节点最多一条来源行）；
+    3. 按「订阅标识 + 配置」重算 `fingerprint` / `node_id`，并合并同组重复行。
+
+    订阅标识与运行期 `subscription_tag` 同源（sha256(订阅链接)[:8] + 域名后两段）——
+    链接从 `proxy_subscriptions.url` 现取现解密，解不开的订阅用 `sub<id>` 兜底。
+    重复合并保留优先级：状态 ACTIVE>NEW>STALE>DEAD>RETIRED，同状态取 id 最大；被合并
+    行的健康观测随之删除（它们属于已不存在的化身）。
+    """
+    import hashlib
+    import json as _json
+    from urllib.parse import urlsplit
+
+    from sqlalchemy import text
+
+    from app.domains.proxies.subscription_secret import open_url
+
+    def _tag(url: str, fallback_id: int) -> str:
+        raw = str(url or "").strip()
+        if not raw:
+            return f"sub{fallback_id}"
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+        host = urlsplit(raw).hostname or ""
+        parts = [p for p in host.split(".") if p]
+        label = ".".join(parts[-2:]) if len(parts) >= 2 else host
+        return f"{digest}.{label}" if label else digest
+
+    def _fingerprint(config: dict, tag: str) -> str:
+        ignore = {
+            "name", "display-name", "udp", "tfo", "mptcp", "smux",
+            "uot", "xudp", "dialer-proxy", "interface-name", "routing-mark",
+        }
+        keys = {k for k in config if k not in ignore}
+        port_is_identity = not (keys - {"type", "server", "port"})
+        payload = {
+            k: v
+            for k, v in config.items()
+            if k not in ignore and not (k == "port" and not port_is_identity)
+        }
+        blob = _json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str
+        )
+        return hashlib.sha256(f"{tag}|{blob}".encode("utf-8")).hexdigest()
+
+    tables = {row[0] for row in (await conn.execute(
+        text("SELECT name FROM sqlite_master WHERE type='table'")
+    )).all()}
+    if "proxy_nodes" not in tables:
+        return  # 新库由 create_all 建表，无需迁移
+
+    cols = {row[1] for row in (await conn.execute(text("PRAGMA table_info(proxy_nodes)")))}
+    if "subscription_id" not in cols:
+        await conn.execute(text("ALTER TABLE proxy_nodes ADD COLUMN subscription_id INTEGER"))
+    if "original_name" not in cols:
+        await conn.execute(text("ALTER TABLE proxy_nodes ADD COLUMN original_name VARCHAR(255)"))
+
+    tags: dict[int, str] = {}
+    for sid, enc in (await conn.execute(
+        text("SELECT id, url FROM proxy_subscriptions")
+    )).all():
+        try:
+            tags[int(sid)] = _tag(open_url(enc) or "", int(sid))
+        except Exception:  # noqa: BLE001 —— 解不开的链接用订户号兜底
+            tags[int(sid)] = f"sub{int(sid)}"
+
+    # 回填归属与原名（来源表可能已不存在——重跑时跳过）
+    if "proxy_node_sources" in tables:
+        rows = (await conn.execute(text(
+            "SELECT node_id, subscription_id, original_name FROM proxy_node_sources"
+        ))).all()
+        for node_id, sid, name in rows:
+            await conn.execute(
+                text(
+                    "UPDATE proxy_nodes SET subscription_id = :sid, original_name = :nm"
+                    " WHERE node_id = :nid AND subscription_id IS NULL"
+                ),
+                {"sid": int(sid), "nm": name, "nid": node_id},
+            )
+
+    # 来源表没覆盖到的部分用 `runtime_name` 前缀兜底：名字形如 `<订阅id>|<原名>`，
+    # 是登记时铸下的归属证据（早期版本未落 source 行，只靠它才追得回来）。
+    for rid, runtime_name, sid in (await conn.execute(text(
+        "SELECT id, runtime_name, subscription_id FROM proxy_nodes"
+    ))).all():
+        if sid is not None:
+            continue
+        prefix, sep, rest = str(runtime_name or "").partition("|")
+        if not sep or not prefix.isdigit():
+            continue
+        await conn.execute(
+            text(
+                "UPDATE proxy_nodes SET subscription_id = :sid, original_name = :nm"
+                " WHERE id = :rid"
+            ),
+            {"sid": int(prefix), "nm": rest, "rid": rid},
+        )
+
+    # 重算身份并合并同组重复行
+    rows = (await conn.execute(text(
+        "SELECT id, node_id, subscription_id, normalized_config, state FROM proxy_nodes"
+    ))).all()
+    groups: dict[str, list[tuple]] = {}
+    for rid, node_id, sid, cfg, state in rows:
+        try:
+            config = _json.loads(cfg) if cfg else {}
+        except (ValueError, TypeError):
+            config = {}
+        tag = tags.get(int(sid)) if sid is not None else ""
+        fp = _fingerprint(config if isinstance(config, dict) else {}, tag or "")
+        groups.setdefault(fp, []).append((rid, node_id, state))
+
+    rank = {"ACTIVE": 0, "NEW": 1, "STALE": 2, "DEAD": 3, "RETIRED": 4}
+    for fp, members in groups.items():
+        members.sort(key=lambda m: (rank.get(m[2], 9), -m[0]))
+        keep = members[0]
+        await conn.execute(
+            text("UPDATE proxy_nodes SET node_id = :fp, fingerprint = :fp WHERE id = :rid"),
+            {"fp": fp, "rid": keep[0]},
+        )
+        for rid, node_id, _ in members[1:]:
+            # 健康观测随化身一起走：这些行不属于任何真实存在的节点
+            await conn.execute(
+                text("DELETE FROM health_observations WHERE node_id = :nid"),
+                {"nid": node_id},
+            )
+            await conn.execute(text("DELETE FROM proxy_nodes WHERE id = :rid"), {"rid": rid})
+
+    await conn.execute(text("DROP TABLE IF EXISTS proxy_node_sources"))
+    await conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS ix_proxy_nodes_subscription_id"
+        " ON proxy_nodes (subscription_id)"
+    ))
+
+
 # (目标版本, 说明, 迁移体)：迁移体 = SQL 语句列表，或 async callable(engine)
-_MIGRATIONS: list[tuple[int, str, object]] = [
-    (2, "bundle_region_prices 零小数货币单位归一（元→分 + cny_fen 去虚高）",
+_MIGRATIONS: list[tuple[int, str, object]] = [    (2, "bundle_region_prices 零小数货币单位归一（元→分 + cny_fen 去虚高）",
      _migrate_bundle_price_units),
     (3, "bundles.item_kind 形态列（0=bundle/1=sub）初始回填（沿用 mps 旧值，"
         "形态本就是 mps 的旧语义之一；mps 本身的语义纠正交给刷新层带权威值完成，"
@@ -1133,6 +1270,10 @@ _MIGRATIONS: list[tuple[int, str, object]] = [
          "价格段 upsert 恒带 name 列，UPDATE OF 按「列在 SET」触发，影子内容"
          "本不变化却整行重建索引）",
      _migrate_fts_trigger_when_gate),
+    (17, "代理池节点身份纳入订阅维度：proxy_nodes 加 subscription_id/original_name"
+         "（从 proxy_node_sources 回填后退役该表）、指纹与 node_id 按「订阅标识 +"
+         " 配置」重算、同配置同订阅的重复化身合并为一行",
+     _migrate_proxynode_subscription_identity),
 ]
 
 

@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.crawler.browse_store import StoreBrowseAPI  # noqa: E402
 from app.core.config import get_settings  # noqa: E402
@@ -44,7 +44,6 @@ from app.domains.proxypool.health import (  # noqa: E402
 from app.domains.proxypool.models import (  # noqa: E402
     HealthObservation,
     ProxyNode,
-    ProxyNodeSource,
     node_fingerprint,
 )
 from app.domains.proxypool.pool import build_pool  # noqa: E402
@@ -335,10 +334,9 @@ async def _add(state: str, runtime_name: str, *, port: int,
             state=state, first_seen=NOW, last_seen=NOW, last_source_seen=NOW,
         ))
         if with_source:
-            s.add(ProxyNodeSource(
-                node_id=fp, subscription_id=1, original_name="x",
-                first_seen=NOW, last_seen=NOW,
-            ))
+            await s.execute(update(ProxyNode)
+                .where(ProxyNode.node_id == fp)
+                .values(subscription_id=1, original_name="x"))
         await s.commit()
     return fp
 

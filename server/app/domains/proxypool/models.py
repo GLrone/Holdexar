@@ -8,9 +8,11 @@ Registry 是事实源，pool 文件只是它的运行时产物：节点身份、
 判定「进池后叫什么」。
 
 身份模型（锁定，改它等于改主键语义）：
-- **节点身份 = `node_fingerprint`（整份配置的规范化哈希），全局唯一**；
-- **来源归属 = `ProxyNodeSource`**（订阅↔节点，多对多），一个节点可被多个订阅
-  同时提供，全部来源都不再提供时节点才允许离开运行集；
+- **节点身份 = `node_fingerprint`（订阅标识 + 整份配置的规范化哈希），全局唯一**；
+  订阅标识进身份是刻意的：同一份配置由两个订阅提供时它们是**两个节点**，
+  体检结论与删除清理因此各归各的——一个套餐失效不会牵连另一个。
+  归属订阅与原名落 `ProxyNode.subscription_id` / `original_name`（一对一，
+  节点跟着订阅走）。
 - 端点（type/server/port）只是 diff 分类与检索线索，不参与身份判定。
 """
 from __future__ import annotations
@@ -18,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime
+from urllib.parse import urlsplit
 
 from sqlalchemy import (
     JSON,
@@ -44,6 +47,32 @@ _IGNORE_FOR_FP = frozenset({
     "dialer-proxy", "interface-name", "routing-mark",
 })
 
+# 端口是否是本节点的唯一区分依据：除 type/server 外没有别的实质字段时，
+# 端口是唯一能分辨两个节点的东西（本地代理链的常见形态），此时它参与身份。
+# 反之（如机场节点带 password/sni/uuid）端口只是入口，动态端口机场每次拉取
+# 都换号，含它会让同一节点被反复判成新节点。
+_PORT_ONLY_KEYS = frozenset({"type", "server", "port"})
+
+
+def port_is_identity(config: dict) -> bool:
+    """配置是否只能靠端口区分（除 type/server/port 外没有别的实质字段）。"""
+    keys = {k for k in config if k not in _IGNORE_FOR_FP}
+    return not (keys - _PORT_ONLY_KEYS)
+
+
+def subscription_tag(url: str) -> str:
+    """订阅标识：短哈希 + 域名片段。
+
+    按**订阅**唯一而不是按机场：同一机场的两个套餐订阅是不同的来源，节点
+    各自记账，一个失效不牵连另一个。域名片段只为排障时可读。
+    """
+    text = str(url or "").strip()
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
+    host = urlsplit(text).hostname or ""
+    parts = [p for p in host.split(".") if p]
+    label = ".".join(parts[-2:]) if len(parts) >= 2 else host
+    return f"{digest}.{label}" if label else digest
+
 # 机场信息占位节点的名称特征：它们是机场公告位（剩余流量 / 到期 / 官网 / 套餐
 # / 重置等），不是可用的代理端点——进了池会占出口工位、污染 GLOBAL 选择、
 # 让出口探测记下垃圾归属；且内容随订阅更新漂移（「剩余流量：31.01 GB」每次
@@ -60,17 +89,25 @@ def is_info_placeholder(name: str) -> bool:
     return any(p in text for p in _INFO_NAME_PATTERNS)
 
 
-def node_fingerprint(config: dict) -> str:
-    """节点指纹：剔除消费侧噪声后规范化 JSON 的 sha256。
+def node_fingerprint(config: dict, tag: str = "") -> str:
+    """节点指纹：订阅标识 + 剔除消费侧噪声后规范化 JSON 的 sha256。
 
     稳定性契约：键顺序不影响结果；未知键参与身份（来源新增可选字段会换指纹，
     这是预期——宁可重登记一条，不可把两个节点并成一条台账）。
+    端口按 `port_is_identity` 分档：只有它能区分节点时才进指纹。
+    `tag` 是 `subscription_tag(url)` 的结果；生产写入口必须传，空串只用于
+    没有订阅语义的纯配置比较（测试造数）。
     """
-    payload = {k: v for k, v in config.items() if k not in _IGNORE_FOR_FP}
+    payload = {
+        k: v
+        for k, v in config.items()
+        if k not in _IGNORE_FOR_FP
+        and not (k == "port" and not port_is_identity(config))
+    }
     blob = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str
     )
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"{tag}|{blob}".encode("utf-8")).hexdigest()
 
 
 def make_runtime_name(subscription_id: int | str, original_name: str, taken: set[str]) -> str:
@@ -101,21 +138,18 @@ def subscription_code(subscription_id: int | str) -> str:
 
 
 class ProxyNode(Base):
-    """节点注册表行：一个唯一出口实现一条台账，跨订阅刷新不删节点、不丢历史。
+    """节点注册表行：一个「订阅里的一个出口」实现一条台账，跨刷新不删、不丢历史。
 
-    **身份**：`fingerprint`（整份配置的规范化哈希）就是全局节点身份，故它
-    **全局唯一**——同一份配置被订阅 A/B/C 同时提供，账上只有这一行。
-    「谁在提供它」不在本表，见 `ProxyNodeSource`。
+    **身份**：`fingerprint`（订阅标识 + 整份配置的规范化哈希）就是全局节点身份，
+    故它**全局唯一**。同一份配置被两个订阅提供时是**两行**——订阅标识进了身份。
 
-    早期版本在本表挂了单列 `subscription_id`（NOT NULL）+ 全局唯一 fingerprint，
-    是一套自相矛盾的模型：同一配置的第二条订阅插不进来（撞唯一约束），而
-    「订阅 A 撤掉、订阅 B 仍在提供」又会被读成节点消失（把来源当身份）。身份
-    与来源必须分表，这正是 `ProxyNodeSource` 存在的理由。
+    归属订阅落本表（`subscription_id` / `original_name`），不再另立来源关联表：
+    节点跟着订阅走，归属是一对一的身份组成部分，多对多语义随之消失。
 
-    节点离开运行集的条件是**所有来源都不再提供它**，不是某个订阅不再提供它。
+    节点离开运行集的条件是**它所属的订阅不再提供它**（或订阅被删）。
     `normalized_config` 是这条台账的事实副本；端点（type/server/port）只是检索
     线索与 diff 分类依据，不参与身份判定——同端点换凭据/参数＝另一个节点
-    （另起一行；旧行靠来源流失 + 健康证据自然退休，不做跨血缘的凭据轮换推定）。
+    （另起一行；旧行靠订阅侧流失 + 健康证据自然退休，不做跨血缘的凭据轮换推定）。
     """
 
     __tablename__ = "proxy_nodes"
@@ -131,12 +165,17 @@ class ProxyNode(Base):
     normalized_config: Mapped[dict | None] = mapped_column(JSON)
     state: Mapped[str] = mapped_column(String(16), default=NODE_NEW)
     first_seen: Mapped[datetime | None] = mapped_column(DateTime)
+    # 归属订阅与它在订阅里的原名：节点跟着订阅走，归属是身份的一部分（`fingerprint`
+    # 已含订阅标识），因此直接落本表而不是另立来源关联表。同一份配置由两个订阅
+    # 提供时是两行，各自记账。原名只作观测与审计（改名不影响身份），体检要拿它去
+    # 定位旧链路内核里的节点名。
+    subscription_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    original_name: Mapped[str | None] = mapped_column(String(255))
     # legacy / 暂不使用：登记时赋值，此后**不再推进**。来源时间的事实源是
-    # ProxyNodeSource.last_seen，来源总览是 last_source_seen，健康时间在
-    # last_l0/l1/l2_at——本列若也定义成「最近见到」，就会造出第二套时间真相。
+    # last_source_seen，健康时间在 last_l0/l1/l2_at——本列若也定义成「最近见到」，
+    # 就会造出第二套时间真相。
     last_seen: Mapped[datetime | None] = mapped_column(DateTime)
-    # 最后一次出现在**任一**订阅快照里的时刻（= 该节点全部来源 last_seen 的最大
-    # 值，冗余缓存，便于按单表筛 STALE 候选）——来源证据的事实源仍是 NodeSource
+    # 最后一次出现在订阅快照里的时刻（登记/刷新时推进）
     last_source_seen: Mapped[datetime | None] = mapped_column(DateTime)
     last_l0_at: Mapped[datetime | None] = mapped_column(DateTime)
     last_l1_at: Mapped[datetime | None] = mapped_column(DateTime)
@@ -146,35 +185,6 @@ class ProxyNode(Base):
     consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
     # 业务容量：由 L2 真实批次测得；L0 的小负载延迟不参与（NULL=未测）
     capacity_score: Mapped[float | None] = mapped_column(Float)
-
-
-class ProxyNodeSource(Base):
-    """订阅↔节点 的来源关联（多对多）：节点生命周期的来源证据。
-
-    订阅刷新成功后，用「本订阅本次快照解析出的指纹集合」**整体替换**本订阅的
-    行：新指纹插入、仍在的刷新 `last_seen` / `original_name`、本订阅已不再提供
-    的删除。节点行本身不因此消失——只要还有别的来源提供它，它就是活的（`state`
-    由状态机按健康证据决定），这正是「A 订阅撤掉、B 订阅仍在提供」不会被误判成
-    节点消失的地方。
-
-    `original_name` 挂这里而不是 `ProxyNode`：同一个配置在不同订阅里叫什么都不
-    影响身份，但「订阅侧改名了」的观测与审计要按来源分别留痕。
-    `node_id` 不单建索引——下面的唯一约束索引以 node_id 为前导列，够用。
-    """
-
-    __tablename__ = "proxy_node_sources"
-    __table_args__ = (
-        UniqueConstraint("node_id", "subscription_id", name="ux_pns_node_sub"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    node_id: Mapped[str] = mapped_column(String(64))
-    subscription_id: Mapped[int] = mapped_column(Integer, index=True)
-    original_name: Mapped[str] = mapped_column(String(255))
-    # 来源特征码（`sd<订阅 id>`）：体检结果按它对齐回池账本，跨订阅同名节点可区分
-    source_code: Mapped[str] = mapped_column(String(32), default="")
-    first_seen: Mapped[datetime | None] = mapped_column(DateTime)
-    last_seen: Mapped[datetime | None] = mapped_column(DateTime)
 
 
 class ExitGroup(Base):

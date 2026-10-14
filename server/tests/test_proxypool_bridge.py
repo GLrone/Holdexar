@@ -20,7 +20,6 @@ from app.domains.proxypool import bridge as B
 from app.domains.proxypool.models import (
     HealthObservation,
     ProxyNode,
-    ProxyNodeSource,
     SubscriptionSnapshot,
     node_fingerprint,
 )
@@ -29,6 +28,20 @@ from app.domains.proxypool.state import NODE_ACTIVE, NODE_DEAD, NODE_RETIRED
 from app.domains.proxypool.subscription import Snapshot
 
 NOW = datetime(2026, 9, 28, 23, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_unprobed_node_does_not_receive_failure_evidence(env):
+    await init_db()
+    await _add_node("unprobed", NODE_ACTIVE, sub_id=1, name="one", exit_ip="1.1.1.1")
+    async with get_session_factory()() as session:
+        result = await B.ingest_node_check(
+            session, subscription_id=1,
+            results=[{"name": "one", "alive": False, "probed": False}], now=NOW,
+        )
+        await session.commit()
+    assert result.matched == 0
+    assert (await _node("unprobed")).state == NODE_ACTIVE
 CONFIG = {"name": "a", "type": "http", "server": "10.0.0.1", "port": 1}
 
 
@@ -75,6 +88,8 @@ async def _add_node(
                 node_id=node_id,
                 fingerprint=node_id,
                 runtime_name=f"{sub_id}|{name or node_id}",
+                subscription_id=sub_id,
+                original_name=name or f"sub-{node_id}",
                 proxy_type="http",
                 server="10.0.0.1",
                 normalized_config=dict(CONFIG),
@@ -84,16 +99,6 @@ async def _add_node(
                 first_seen=NOW,
                 last_seen=NOW,
                 last_source_seen=NOW,
-            )
-        )
-        s.add(
-            ProxyNodeSource(
-                node_id=node_id,
-                subscription_id=sub_id,
-                original_name=name or f"sub-{node_id}",
-                source_code=f"sd{sub_id}",
-                first_seen=NOW,
-                last_seen=NOW,
             )
         )
         await s.commit()
@@ -123,8 +128,8 @@ async def _observations(node_id: str) -> list[HealthObservation]:
 async def test_check_matches_runtime_name_without_source(env):
     """来源关联缺失但身份行仍在时，体检结果按 runtime_name「订阅id|原名」也要命中。
 
-    订阅抓取失败 / 来源关联丢过一拍的行在池账本里没有 ProxyNodeSource，只按来源名
-    匹配会让这类「手动体检已证明健康」的节点全部落空、进不了池。
+    订阅抓取失败 / 归属丢过一拍的行在池账本里只按 runtime_name 匹配也能命中，
+    否则这类「手动体检已证明健康」的节点会全部落空、进不了池。
     """
     await init_db()
     async with get_session_factory()() as s:
@@ -287,12 +292,12 @@ async def test_apply_snapshot_writes_subscription_code_and_keeps_identity(env):
 
     async with get_session_factory()() as s:
         nodes = list((await s.execute(select(ProxyNode))).scalars())
-        sources = list((await s.execute(select(ProxyNodeSource))).scalars())
+        sources = list((await s.execute(select(ProxyNode))).scalars())
 
     assert len(nodes) == 1, "改名不重铸身份：同配置只应有一行"
     assert nodes[0].fingerprint == node_fingerprint(CONFIG)
     assert len(sources) == 1
-    assert sources[0].source_code == "sd5"
+    assert sources[0].subscription_id == 5
     assert sources[0].original_name == "renamed"
 
 
@@ -480,15 +485,14 @@ async def test_rebind_restores_missing_source_rows(env):
 
     assert repaired == (sub_id,)
     async with get_session_factory()() as s:
-        sources = list((await s.execute(select(ProxyNodeSource))).scalars())
+        sources = list((await s.execute(select(ProxyNode))).scalars())
     assert len(sources) == 1
-    assert sources[0].source_code == f"sd{sub_id}"
+    assert sources[0].subscription_id == sub_id
 
 
 @pytest.mark.asyncio
 async def test_purge_orphan_subscription_sources(env):
-    """指向已删除订阅的来源行/快照行清掉；来源全失的节点按状态机降级；
-    仍被现存订阅提供的共享节点不动。"""
+    """归属已删除订阅的节点解除归属（挂空）并按状态机降级；现存订阅的节点不动。"""
     await init_db()
     seen = NOW
     async with get_session_factory()() as s:
@@ -499,24 +503,17 @@ async def test_purge_orphan_subscription_sources(env):
         live_id = int((await s.execute(select(ProxySubscription.id))).scalar_one())
         orphan_id = live_id + 999  # 无订阅行的失主编号
 
-        def _node(node_id: str) -> ProxyNode:
+        def _node(node_id: str, sub_id: int) -> ProxyNode:
             return ProxyNode(
-                node_id=node_id, fingerprint=node_id, runtime_name=f"1|{node_id}",
+                node_id=node_id, fingerprint=node_id, runtime_name=f"{sub_id}|{node_id}",
+                subscription_id=sub_id, original_name=node_id,
                 proxy_type="http", server="10.0.0.1",
                 normalized_config={"name": node_id, "type": "http",
                                    "server": "10.0.0.1", "port": 1},
                 state="ACTIVE", first_seen=seen, last_seen=seen, last_source_seen=seen,
             )
 
-        s.add_all([_node("orphan-only"), _node("shared")])
-        s.add_all([
-            ProxyNodeSource(node_id="orphan-only", subscription_id=orphan_id,
-                            original_name="orphan-only", first_seen=seen, last_seen=seen),
-            ProxyNodeSource(node_id="shared", subscription_id=orphan_id,
-                            original_name="shared", first_seen=seen, last_seen=seen),
-            ProxyNodeSource(node_id="shared", subscription_id=live_id,
-                            original_name="shared", first_seen=seen, last_seen=seen),
-        ])
+        s.add_all([_node("orphan-only", orphan_id), _node("shared", live_id)])
         s.add(SubscriptionSnapshot(
             subscription_id=orphan_id, sha256="sha-orphan", format="yaml",
             raw_path="orphan.bin", node_count=1, status="OK", fetched_at=seen, url="",
@@ -529,14 +526,14 @@ async def test_purge_orphan_subscription_sources(env):
 
     assert purged == (orphan_id,)
     async with get_session_factory()() as s:
-        sources = list((await s.execute(select(ProxyNodeSource))).scalars())
+        sources = list((await s.execute(select(ProxyNode))).scalars())
         snaps = list((await s.execute(select(SubscriptionSnapshot))).scalars())
         states = dict((await s.execute(
             select(ProxyNode.node_id, ProxyNode.state))).all())
-    assert {src.subscription_id for src in sources} == {live_id}
+    assert {src.subscription_id for src in sources} == {None, live_id}
     assert snaps == [], "失主订阅的快照行随清扫走（retention 的每订阅保底留不住孤儿）"
-    assert states["orphan-only"] == "STALE", "来源全失的节点不得永远 ACTIVE"
-    assert states["shared"] == "ACTIVE"
+    assert states["orphan-only"] == "STALE", "失主节点不得永远 ACTIVE"
+    assert states["shared"] == "ACTIVE", "现存订阅的节点不受影响"
 
     async with get_session_factory()() as s:
         again = await B.purge_orphan_subscription_sources(s, now=seen)

@@ -17,12 +17,12 @@ from pathlib import Path
 
 import pytest
 import yaml
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.core.config import get_settings  # noqa: E402
 from app.core.database import get_engine, get_session_factory, init_db  # noqa: E402
 from app.domains.proxypool import pool as pool_module  # noqa: E402
-from app.domains.proxypool.models import ProxyNode, ProxyNodeSource, node_fingerprint  # noqa: E402
+from app.domains.proxypool.models import ProxyNode, node_fingerprint  # noqa: E402
 from app.domains.proxypool.pool import (  # noqa: E402
     PoolBuildError,
     build_pool,
@@ -38,6 +38,29 @@ from app.domains.proxypool.state import (  # noqa: E402
 )
 
 NOW = datetime(2026, 9, 19, 12, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_expired_source_is_excluded_but_shared_live_source_keeps_node(tmp_data_dir):
+    from app.domains.proxies.models import ProxySubscription
+
+    await init_db()
+    nid = await _add(NODE_ACTIVE, "shared", server="shared.example.test")
+    async with get_session_factory()() as session:
+        session.add_all([
+            ProxySubscription(id=1, kind="clash", url="https://example.test/expired",
+                              last_stats={"traffic": "expire=1"}),
+            ProxySubscription(id=2, kind="clash", url="https://example.test/live"),
+        ])
+        await session.commit()
+        assert await pool_module.eligible_nodes(session) == []
+        await session.execute(
+            update(ProxyNode)
+            .where(ProxyNode.node_id == nid)
+            .values(subscription_id=2, original_name="shared")
+        )
+        await session.commit()
+        assert [n.node_id for n in await pool_module.eligible_nodes(session)] == [nid]
 
 
 @pytest.fixture
@@ -78,10 +101,9 @@ async def _add(state: str, runtime_name: str, *, server: str, name: str | None =
             first_seen=NOW, last_seen=NOW, last_source_seen=NOW,
         ))
         # 合格集口径含「至少一个当前来源」：直接登记的行也要给一条来源
-        s.add(ProxyNodeSource(
-            node_id=fp, subscription_id=1, original_name=name or runtime_name,
-            first_seen=NOW, last_seen=NOW,
-        ))
+        await s.execute(update(ProxyNode)
+            .where(ProxyNode.node_id == fp)
+            .values(subscription_id=1, original_name=name or runtime_name))
         await s.commit()
     return fp
 
@@ -223,3 +245,37 @@ async def test_hostile_runtime_names_round_trip(tmp_data_dir) -> None:
     assert result.written_count == len(hostile)
     assert set(_names_in(pool_path(tmp_data_dir))) == {n for n, _ in hostile}
     assert result.runtime_names == tuple(n for n, _ in hostile)
+
+
+def _render_node(name, runtime_name, *, subscription_id=1, **options):
+    return ProxyNode(runtime_name=runtime_name, subscription_id=subscription_id,
+                     original_name=name,
+                     normalized_config={**_config(name=name, server="edge.example.test"),
+                                        **options})
+
+
+def test_pool_rewrites_dialer_using_current_subscription_name():
+    nodes = [
+        _render_node("endpoint", "1|endpoint", **{"dialer-proxy": "renamed-hop"}),
+        _render_node("renamed-hop", "1|original-hop"),
+        _render_node("renamed-hop", "2|other-hop", subscription_id=2),
+    ]
+    text, _ = render_pool(nodes)
+    proxies = yaml.safe_load(text)["proxies"]
+    assert proxies[0]["dialer-proxy"] == "1|original-hop"
+    assert nodes[0].normalized_config["dialer-proxy"] == "renamed-hop"
+
+
+@pytest.mark.parametrize("target", ["DIRECT", "REJECT"])
+def test_pool_keeps_builtin_dialer_target(target):
+    text, _ = render_pool([
+        _render_node("endpoint", "1|endpoint", **{"dialer-proxy": target}),
+    ])
+    assert yaml.safe_load(text)["proxies"][0]["dialer-proxy"] == target
+
+
+def test_pool_rejects_missing_dialer_target():
+    with pytest.raises(PoolBuildError, match="依赖"):
+        render_pool([
+            _render_node("endpoint", "1|endpoint", **{"dialer-proxy": "missing-hop"}),
+        ])

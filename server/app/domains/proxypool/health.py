@@ -29,7 +29,7 @@ from app.core.logging import log_event
 from app.core.tls import ssl_context as _ssl_context
 from app.crawler.browse_store import StoreBrowseAPI, _to_int
 from app.domains.proxies.clash_manager import _port_listening, parse_probe_lanes
-from app.domains.proxypool.models import HealthObservation, HealthRun, ProxyNode, ProxyNodeSource
+from app.domains.proxypool.models import HealthObservation, HealthRun, ProxyNode
 from app.domains.proxypool.pool import pool_file_names
 from app.domains.proxypool.runtime import mixed_port_of, runtime_config_path
 from app.domains.proxypool.state import NODE_DEAD, NODE_RETIRED, evaluate_node_state
@@ -266,8 +266,8 @@ async def _probe_and_decide(
     判据——生死归 Steam 业务探测（`business_check_pool`）与恢复探测。`state_push=True`
     只用于 DEAD 恢复探测（目标已是 Steam 端点）：成功回 ACTIVE、失败累加计数。
     `probe_name` 是**执行探测的内核认识的名字**：池内节点用 `runtime_name`（池内核的
-    运行配置里就是它），DEAD 节点不在池文件里、池内核不认识，改用来源订阅名
-    （`ProxyNodeSource.original_name`）打到持有全量订阅节点的旧链路内核上。
+    运行配置里就是它），DEAD 节点不在池文件里、池内核不认识，改用订阅原名
+    （`ProxyNode.original_name`）打到持有全量订阅节点的旧链路内核上。
     """
     result = await probe_node(controller_url, secret, probe_name,
                               url=url, timeout_ms=timeout_ms)
@@ -286,13 +286,10 @@ async def _decide_probe_result(
 ) -> tuple[HealthOutcome, dict, tuple[int, str] | None]:
     """探测结论判定（结论已由调用方取得；与 `_probe_and_decide` 共用同一套规则）。"""
     if state_push:
-        source_count = await session.scalar(
-            select(func.count())
-            .select_from(ProxyNodeSource)
-            .where(ProxyNodeSource.node_id == node.node_id)
-        )
+        # 归属订阅仍在 = 来源在场（节点跟着订阅走，归属是一对一的身份组成部分）
+        source_seen = node.subscription_id is not None
     else:
-        source_count = 0
+        source_seen = False
     previous = node.state
     observation = dict(
         node_id=node.node_id,
@@ -332,7 +329,7 @@ async def _decide_probe_result(
         # 唯一的状态决策入口：健康只提供证据，规则仍归状态机
         target = evaluate_node_state(
             previous,
-            source_seen=bool(source_count),
+            source_seen=source_seen,
             probe_ok=result.ok,
             consecutive_failures=failures,
         )
@@ -468,17 +465,8 @@ async def recover_dead_nodes(
         .group_by(HealthObservation.node_id)
         .subquery()
     )
-    source = (
-        select(
-            ProxyNodeSource.node_id.label("node_id"),
-            func.min(ProxyNodeSource.original_name).label("original_name"),
-        )
-        .group_by(ProxyNodeSource.node_id)
-        .subquery()
-    )
     rows = (await session.execute(
-        select(ProxyNode, source.c.original_name)
-        .join(source, source.c.node_id == ProxyNode.node_id)
+        select(ProxyNode, ProxyNode.original_name)
         .outerjoin(last_probe, last_probe.c.node_id == ProxyNode.node_id)
         .where(ProxyNode.state.in_((NODE_DEAD, NODE_RETIRED)))
         .order_by(
@@ -1001,16 +989,13 @@ async def _commit_business_wave(
                 .execution_options(populate_existing=True)
             )
         for node, result in probed:
-            # 生死证据判定：None = 不构成节点证据（选不中节点是探针基础设施问题）。
-            # 拿到 Steam 侧响应（200 / 429 / 503 等）= 传输成功，Steam 故障不罚节点；
-            # 502/504 是**代理链网关错误**（mihomo 上游链失败时本地生成，Steam 正常
-            # 不回裸 502/504）——与超时/连不上同归节点失败证据。
+            # 只有有效业务响应能晋升；目标限流与探测通道故障不奖惩节点。
             if result.ok:
                 probe_ok: bool | None = True
             elif result.http_status in (502, 504):
                 probe_ok = False
             elif result.http_status is not None:
-                probe_ok = True
+                probe_ok = None
             elif result.detail.startswith(NODE_PROBE_FAILED):
                 probe_ok = None
             else:  # 经节点发请求超时/连不上：节点失败证据

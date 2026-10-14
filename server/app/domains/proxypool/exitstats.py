@@ -34,7 +34,7 @@ async def _writeback_production_evidence(
     """
     from sqlalchemy import select
 
-    from app.domains.proxypool.models import ProxyNode, ProxyNodeSource
+    from app.domains.proxypool.models import ProxyNode
     from app.domains.proxypool.state import evaluate_node_state
 
     by_node: dict[str, dict] = {}
@@ -53,9 +53,8 @@ async def _writeback_production_evidence(
     node_rows = (await session.execute(
         select(ProxyNode).where(ProxyNode.node_id.in_(by_node))
     )).scalars().all()
-    sourced = set((await session.execute(
-        select(ProxyNodeSource.node_id).where(ProxyNodeSource.node_id.in_(by_node))
-    )).scalars().all())
+    # 仍归属订阅的节点才算「有来源」（归属是一对一的身份组成部分）
+    sourced = {n.node_id for n in node_rows if n.subscription_id is not None}
     stamp = now or datetime.now()
     for node in node_rows:
         agg = by_node[node.node_id]

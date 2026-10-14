@@ -36,6 +36,7 @@ from app.domains.proxypool.models import (
     SubscriptionSnapshot,
     is_info_placeholder,
     node_fingerprint,
+    port_is_identity,
 )
 
 # UA 必须与内核拉取 provider 时同款：面板按 UA 分流订阅格式，不含 clash 关键字会
@@ -156,6 +157,7 @@ class FetchResult:
     channel: str
     fmt: str
     attempts: list[FetchAttempt] = field(default_factory=list)
+    userinfo: str | None = None
 
 
 @dataclass(frozen=True)
@@ -376,6 +378,7 @@ async def fetch_subscription(
             fmt=fmt,
             attempts=attempts + [FetchAttempt(ch.name, fmt == FORMAT_YAML,
                                               resp.status_code, fmt)],
+            userinfo=resp.headers.get("subscription-userinfo"),
         )
         if fmt in SOURCE_DETERMINED_FORMATS:
             return result
@@ -415,12 +418,14 @@ def parse_nodes(raw: bytes, fmt: str) -> list[dict]:
 
 
 def node_key(config: dict) -> str:
-    """端点身份 `type|server|port`。
+    """端点身份 `type|server`（端口仅在它是唯一区分依据时参与）。
 
     与 fingerprint（全配置哈希、Registry 主键）分工：凭据/参数轮换时指纹变、端点键
-    不变，据此把它识别为 UPDATED 而不是「删一条 + 加一条」。
+    不变，据此把它识别为 UPDATED 而不是「删一条 + 加一条」。端口按 `port_is_identity`
+    分档——动态端口机场每次拉取都换号，含它会让同一节点被反复判成新节点。
     """
-    return f"{config.get('type', '')}|{config.get('server', '')}|{config.get('port', '')}"
+    base = f"{config.get('type', '')}|{config.get('server', '')}"
+    return f"{base}|{config.get('port', '')}" if port_is_identity(config) else base
 
 
 def _key_map(nodes: list[dict]) -> dict[str, dict]:
@@ -583,11 +588,16 @@ async def latest_snapshot(
 
 
 # ── Diff ──────────────────────────────────────────────────────────
-def compute_diff(previous: Snapshot | None, nodes: list[dict], sha256: str) -> Diff:
+def compute_diff(
+    previous: Snapshot | None, nodes: list[dict], sha256: str, tag: str = ""
+) -> Diff:
     """与上一份快照比对。
 
     previous 为 None（首次）→ 全部 ADDED。
     字节完全一致 → 全部 UNCHANGED，不产生 UPDATED（避免无意义的写放大）。
+
+    `tag` 是订阅标识，与 `node_fingerprint` 同源——比较始终发生在同一条订阅内，
+    两边用同一个 `tag` 才不会把「同一份快照」判成变了。
 
     互斥性不变量：`updated` 的 previous_fingerprint 与 `removed` 交集为空。
     旧实现用 `prev_fp - 当前指纹集` 算 removed，于是「端点没变、凭据/参数变了」
@@ -597,10 +607,10 @@ def compute_diff(previous: Snapshot | None, nodes: list[dict], sha256: str) -> D
     `updated[].previous_fingerprint` 里。
     """
     if previous is not None and previous.sha256 == sha256 and previous.node_count == len(nodes):
-        return Diff(unchanged=[node_fingerprint(n) for n in nodes],
+        return Diff(unchanged=[node_fingerprint(n, tag) for n in nodes],
                     unchanged_snapshot=True, node_count=len(nodes))
 
-    prev_fp = {node_fingerprint(n) for n in previous.nodes} if previous else set()
+    prev_fp = {node_fingerprint(n, tag) for n in previous.nodes} if previous else set()
     cur_map = _key_map(nodes)
     prev_map = _key_map(previous.nodes) if previous else {}
 
@@ -609,12 +619,12 @@ def compute_diff(previous: Snapshot | None, nodes: list[dict], sha256: str) -> D
     unchanged: list[str] = []
     matched: set[str] = set()  # 已被当前快照接管的上一份指纹（含被取代的旧指纹）
     for key, node in cur_map.items():
-        fp = node_fingerprint(node)
+        fp = node_fingerprint(node, tag)
         if fp in prev_fp:
             unchanged.append(fp)
             matched.add(fp)
         elif key in prev_map:
-            superseded = node_fingerprint(prev_map[key])
+            superseded = node_fingerprint(prev_map[key], tag)
             updated.append(NodeUpdate(previous_fingerprint=superseded, node=node))
             matched.add(superseded)
         else:

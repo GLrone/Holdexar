@@ -4,7 +4,7 @@
 这正是池健康账本的 L2（真实业务）与 L1（出口身份）证据。本模块把它们按
 「订阅来源」对齐到 Registry：
 
-    (subscription_id, 节点名)  →  ProxyNodeSource  →  ProxyNode
+    (subscription_id, 节点名)  →  ProxyNode（按归属订阅 + 原名匹配）
 
 命中节点按成功证据推进状态（evaluate_node_state(probe_ok=True)）、清零失败
 计数、带上出口 IP 与 L1/L2 观测。判定标准只有一条：**体检通过的健康出口节点
@@ -20,15 +20,15 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domains.proxies.models import ClashNode
+from app.domains.proxies.subscription_secret import open_url
 from app.domains.proxypool.health import L1_LEVEL, L2_LEVEL
 from app.domains.proxypool.models import (
     HealthObservation,
     ProxyNode,
-    ProxyNodeSource,
     SubscriptionSnapshot,
     is_info_placeholder,
     subscription_code,
@@ -95,16 +95,11 @@ async def _load_index(
         str(node.runtime_name): node
         for node in (await session.execute(select(ProxyNode))).scalars()
     }
-    rows = (
-        await session.execute(
-            select(ProxyNodeSource, ProxyNode).join(
-                ProxyNode, ProxyNode.node_id == ProxyNodeSource.node_id
-            )
-        )
-    ).all()
-    by_source: dict[tuple[int, str], ProxyNode] = {}
-    for source, node in rows:
-        by_source[(int(source.subscription_id), str(source.original_name))] = node
+    by_source: dict[tuple[int, str], ProxyNode] = {
+        (int(node.subscription_id), str(node.original_name)): node
+        for node in by_runtime.values()
+        if node.subscription_id is not None
+    }
     return by_source, by_runtime
 
 
@@ -239,6 +234,8 @@ async def ingest_node_check(
     code = subscription_code(subscription_id)
 
     for row in results:
+        if row.get("probed") is False:
+            continue
         name = str(row.get("name") or "")
         node = _match(by_source, by_runtime, int(subscription_id), name)
         if node is None:
@@ -351,7 +348,7 @@ async def rebind_missing_sources(
     """
     from app.domains.proxies.models import ProxySubscription
     from app.domains.proxypool.admission import is_admitted
-    from app.domains.proxypool.models import node_fingerprint
+    from app.domains.proxypool.models import node_fingerprint, subscription_tag
     from app.domains.proxypool.registry import apply_snapshot
     from app.domains.proxypool.subscription import SnapshotRecoveryError, latest_snapshot
 
@@ -373,21 +370,24 @@ async def rebind_missing_sources(
             continue
         if snap is None:
             continue
+        tag = subscription_tag(open_url(sub.url) or "")
         wanted = {
-            node_fingerprint(node)
+            node_fingerprint(node, tag)
             for node in snap.nodes
             if not is_info_placeholder(str(node.get("name") or ""))
         }
         have = set(
             await session.scalars(
-                select(ProxyNode.fingerprint)
-                .join(ProxyNodeSource, ProxyNode.node_id == ProxyNodeSource.node_id)
-                .where(ProxyNodeSource.subscription_id == int(sub.id))
+                select(ProxyNode.fingerprint).where(
+                    ProxyNode.subscription_id == int(sub.id)
+                )
             )
         )
         if not (wanted - have):
             continue
-        await apply_snapshot(session, subscription_id=int(sub.id), snapshot=snap, now=now)
+        await apply_snapshot(
+            session, subscription_id=int(sub.id), snapshot=snap, now=now, tag=tag
+        )
         repaired.append(int(sub.id))
     return tuple(repaired)
 
@@ -410,21 +410,26 @@ async def purge_orphan_subscription_sources(
         settle_nodes_after_source_change,
     )
 
+    # 归属订阅已不存在（订阅被删但节点行没跟着清）的存量自愈
     orphan_ids = list(await session.scalars(
-        select(ProxyNodeSource.subscription_id)
-        .where(ProxyNodeSource.subscription_id.not_in(select(ProxySubscription.id)))
+        select(ProxyNode.subscription_id)
+        .where(ProxyNode.subscription_id.is_not(None))
+        .where(ProxyNode.subscription_id.not_in(select(ProxySubscription.id)))
         .distinct()
     ))
     purged: list[int] = []
     for sub_id in orphan_ids[: max(1, int(max_subs))]:
         await lock_subscription_mutation(session, int(sub_id))
         node_ids = set(await session.scalars(
-            select(ProxyNodeSource.node_id)
-            .where(ProxyNodeSource.subscription_id == int(sub_id))
+            select(ProxyNode.node_id).where(
+                ProxyNode.subscription_id == int(sub_id)
+            )
         ))
         await session.execute(
-            delete(ProxyNodeSource)
-            .where(ProxyNodeSource.subscription_id == int(sub_id))
+            update(ProxyNode)
+            .where(ProxyNode.subscription_id == int(sub_id))
+            .values(subscription_id=None)
+            .execution_options(synchronize_session=False)
         )
         await session.execute(
             delete(SubscriptionSnapshot)

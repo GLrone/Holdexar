@@ -27,7 +27,6 @@ from app.domains.proxypool.models import (  # noqa: E402
     HealthRun,
     ProxyJobRun,
     ProxyNode,
-    ProxyNodeSource,
     SubscriptionSnapshot,
 )
 from app.domains.proxypool.pool import pool_path  # noqa: E402
@@ -64,6 +63,8 @@ async def _add_node(
         node_id=runtime_name,
         fingerprint=runtime_name,
         runtime_name=runtime_name,
+        subscription_id=sub_id,
+        original_name=runtime_name,
         proxy_type="ss",
         server="10.0.0.1",
         normalized_config={
@@ -73,12 +74,6 @@ async def _add_node(
         exit_ip=exit_ip,
     )
     session.add(node)
-    await session.flush()
-    session.add(
-        ProxyNodeSource(
-            node_id=node.node_id, subscription_id=sub_id, original_name=runtime_name
-        )
-    )
     await session.flush()
     return node
 
