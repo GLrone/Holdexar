@@ -308,5 +308,8 @@ async def test_record_is_fail_soft(env, monkeypatch):
     def _explode():
         raise RuntimeError("会话工厂不可用")
 
-    monkeypatch.setattr(events, "get_session_factory", _explode)
+    # 写会话在 database 模块内取工厂：patch 该处才拦得住实际写路径
+    from app.core import database as database_module
+
+    monkeypatch.setattr(database_module, "get_session_factory", _explode)
     assert await events.record("probe_kind", "m") is False

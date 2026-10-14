@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core import data_export, keyring, rekey, secretbox
-from app.core.database import Base
+from app.core.database import Base, get_session_factory
 from app.core.secretbox import SecretBoxError
 from app.domains.account import service as account_service
 from app.domains.account.models import SteamAccount
@@ -52,9 +52,11 @@ def db():
     from app.core.database import get_session_factory
 
     return get_session_factory()
+
+
 async def _seed_user_rows() -> None:
     """一条解密后应可读的用户数据：账号 Cookie + 订阅链接 + API Key 设置。"""
-    async with rekey.get_session_factory()() as session:
+    async with get_session_factory()() as session:
         session.add(
             SteamAccount(
                 steam_id=A,
@@ -75,7 +77,7 @@ async def _seed_user_rows() -> None:
 
 
 async def _read_cookie() -> str:
-    async with rekey.get_session_factory()() as session:
+    async with get_session_factory()() as session:
         row = await session.get(SteamAccount, A)
         return row.cookies if row else ""
 

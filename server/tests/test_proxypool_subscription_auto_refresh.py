@@ -93,9 +93,13 @@ async def test_switch_off_does_not_drop_nodes_or_sources(tmp_path) -> None:
     await _seed(factory, auto_refresh=True, sub_id=3)
 
     import app.domains.proxies.service as svc
+    from app.core import database as database_module
 
     original = svc.get_session_factory
+    original_db = database_module.get_session_factory
     svc.get_session_factory = lambda: factory
+    # 写会话在 database 模块内取工厂：只换域模块的引用，写路径仍打到默认库
+    database_module.get_session_factory = lambda: factory
     try:
         items = await list_subscriptions("clash")
         assert items[0]["autoRefresh"] is True
@@ -108,3 +112,4 @@ async def test_switch_off_does_not_drop_nodes_or_sources(tmp_path) -> None:
         assert items[0]["url"] == "http://example.invalid/3"
     finally:
         svc.get_session_factory = original
+        database_module.get_session_factory = original_db

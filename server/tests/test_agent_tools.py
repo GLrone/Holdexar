@@ -17,8 +17,8 @@ def _spec(name):
 
 
 def test_registry_holds_all_tools():
-    assert len(REGISTRY.names()) == 65
-    assert len(set(REGISTRY.names())) == 65
+    assert len(REGISTRY.names()) == 67
+    assert len(set(REGISTRY.names())) == 67
     assert set(REGISTRY.names()) == set(projection.LABELS)
 
 
