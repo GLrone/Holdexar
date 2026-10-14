@@ -12,6 +12,8 @@
  * - 预告：去领取 CTA、封面去饱和、虚线框——只传达「N 天后开始」；
  * - 移动端：无名称/日期（官方无结构化出口，立绘即信息），链指官方移动页，
  *   明示「App 内领取」——PC 商店页出不来免费按钮，不与 PC 领取混同。
+ *   direct=false（官方未公开该期移动 offer）时 CTA 说「App 内领取」，
+ *   不冒充一键领取。
  */
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
@@ -261,7 +263,7 @@ onBeforeUnmount(() => {
           <span class="epic-card__name">{{ mobile.title || t('epicFree.mobileCard') }}</span>
           <span class="epic-card__price">
             <span v-if="mobile.worth" class="epic-card__orig">{{ mobile.worth }}</span>
-            <span class="epic-card__claim">{{ t('epicFree.claim') }} ↗</span>
+            <span class="epic-card__claim">{{ mobile.direct === false ? t('epicFree.mobileInApp') : t('epicFree.claim') }} ↗</span>
           </span>
         </div>
       </a>
