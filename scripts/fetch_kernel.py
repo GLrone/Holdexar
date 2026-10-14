@@ -1,4 +1,4 @@
-"""内核资产获取：把 mihomo 内核与 GeoIP 数据补进 assets/clash/（随包资产）。
+"""内核资产获取：把 mihomo 内核与许可说明补进 assets/clash/（随包资产）。
 
 大体积、随版本变动的二进制不入 git，走「随包资产」通道：发行包内置一份
 （spec datas 的 `clash/`），源码 clone 由 run.py 首次启动调用本脚本补齐；
@@ -35,11 +35,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
 
 from app.domains.proxies.kernel_release import (  # noqa: E402
-    GEO_ASSETS,
     LICENSE_ASSETS,
     MIHOMO_VERSION,
     MIRRORS,
-    geo_url,
+    bundled_asset_names,
     kernel_filename,
     mihomo_asset,
     mihomo_url,
@@ -48,9 +47,8 @@ from app.domains.proxies.kernel_release import (  # noqa: E402
 CLASH_DIR = ROOT / "assets" / "clash"
 KERNEL_FILE = CLASH_DIR / kernel_filename()
 
-# 有效性下限：挡半截下载与占位文件（mihomo 约 45MB，GeoIP 数据 4~17MB，许可约 35KB）
+# 有效性下限：拒绝半截下载与占位文件。
 _MIN_KERNEL_BYTES = 5 * 1024 * 1024
-_MIN_DATA_BYTES = 1024 * 1024
 _MIN_LICENSE_BYTES = 8 * 1024
 _TIMEOUT_S = 300
 
@@ -114,10 +112,12 @@ def _fetch_mihomo() -> tuple[bool, str]:
 
 
 def _copy_from_dir(src_dir: Path) -> list[str]:
-    """从本机现成内核目录复制内核与 GeoIP 数据（显式使用，不做任何自动检索）。"""
+    """从指定目录复制内核与许可原文。"""
     CLASH_DIR.mkdir(parents=True, exist_ok=True)
     copied: list[str] = []
-    for name in (kernel_filename(), *GEO_ASSETS):
+    for name in bundled_asset_names():
+        if name == "README.txt":
+            continue
         src = src_dir / name
         if src.is_file():
             shutil.copy2(src, CLASH_DIR / name)
@@ -127,20 +127,12 @@ def _copy_from_dir(src_dir: Path) -> list[str]:
     return copied
 
 
-# 随包资产自带的来源/许可说明：与二进制同目录分发，让包内文件自己说清出处。
-# （合规义务的完整表述在 docs/THIRD_PARTY_NOTICES.md，随包放在程序根目录。）
+# 来源与许可说明随内核分发。
 _SOURCE_NOTE = """Holdexar 随包内核资产（bundle assets）
 ==================================================
 mihomo         {mihomo_version}
                来源 https://github.com/MetaCubeX/mihomo
                许可 GPL-3.0（原文见同目录 LICENSE-mihomo.txt）
-GeoIP/GeoSite 数据
-               来源 https://github.com/MetaCubeX/meta-rules-dat（滚动 tag: latest）
-               许可 GPL-3.0（原文见同目录 LICENSE-meta-rules-dat.txt）
-Country.mmdb   数据来源 MaxMind GeoLite2
-               This product includes GeoLite2 data created by MaxMind,
-               available from https://www.maxmind.com
-
 mihomo 以独立进程运行（非链接、非派生），本项目自身以 GPL-3.0 分发；
 对应源码即上游仓库上述地址，二进制未做任何修改。
 """
@@ -154,15 +146,12 @@ def _write_source_note() -> None:
 
 def _missing() -> list[str]:
     """尚缺（或明显不完整）的资产清单；空 = 随包资产已齐。"""
-    checks = (
-        [(KERNEL_FILE.name, _MIN_KERNEL_BYTES)]
-        + [(name, _MIN_DATA_BYTES) for name in GEO_ASSETS]
-        + [(name, _MIN_LICENSE_BYTES) for name in LICENSE_ASSETS]
-    )
+    minimum = {KERNEL_FILE.name: _MIN_KERNEL_BYTES}
+    minimum.update(dict.fromkeys(LICENSE_ASSETS, _MIN_LICENSE_BYTES))
     missing = []
-    for name, min_bytes in checks:
+    for name in bundled_asset_names():
         target = CLASH_DIR / name
-        if not target.is_file() or target.stat().st_size < min_bytes:
+        if not target.is_file() or target.stat().st_size < minimum.get(name, 1):
             missing.append(name)
     return missing
 
@@ -186,14 +175,6 @@ def fetch(force: bool = False, from_dir: Path | None = None) -> int:
             if not ok:
                 print(f"[内核] 可执行文件获取失败：{err}")
                 return 1
-        for name, asset in GEO_ASSETS.items():
-            target = CLASH_DIR / name
-            if target.is_file() and not force:
-                continue
-            ok, err = _fetch(geo_url(asset), target, _MIN_DATA_BYTES, name)
-            if not ok:
-                print(f"[内核] GeoIP 数据 {name} 获取失败：{err}")
-                return 1
         for name, url in LICENSE_ASSETS.items():
             target = CLASH_DIR / name
             if target.is_file() and not force:
@@ -210,7 +191,7 @@ def fetch(force: bool = False, from_dir: Path | None = None) -> int:
     if still_missing:
         print(f"[内核] 仍缺：{', '.join(still_missing)}")
         return 1
-    total = sum(p.stat().st_size for p in CLASH_DIR.iterdir() if p.is_file())
+    total = sum((CLASH_DIR / name).stat().st_size for name in bundled_asset_names())
     print(f"[内核] 完成：{CLASH_DIR}（共 {total / 1048576:.1f} MB，随包分发）")
     return 0
 
@@ -220,7 +201,7 @@ def main() -> None:
     parser.add_argument("--force", action="store_true", help="已有资产也强制重下")
     parser.add_argument(
         "--from-dir", type=Path, default=None,
-        help="从本机现成内核目录复制内核与 GeoIP 数据（离线场景；版本按原样复制）",
+        help="从本机现成内核目录复制内核与许可原文（离线场景；版本按原样复制）",
     )
     args = parser.parse_args()
     if args.from_dir is not None and not args.from_dir.is_dir():
