@@ -339,8 +339,8 @@ async def pinned_kernel_port() -> int:
 
     程序的全部代理流量统一走这个口——内核启动/切换/重启一律把混合口钉成它
     （clash_manager.pin_mixed_port），订阅配置里写的端口不再决定监听口。兜底
-    探测（内核没跑时借道用户自启 Verge）固定走 `LOCAL_MIXED_PORTS`（7897），
-    与本设置无关。"""
+    探测（内核没跑时借道本机在听的混合口）走 `LOCAL_MIXED_PORTS`（生态默认
+    7897 与本程序内核默认 7890），与本设置无关。"""
     return await _clash_port_cached()
 
 
