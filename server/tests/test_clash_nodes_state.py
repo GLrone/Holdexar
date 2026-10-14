@@ -149,47 +149,48 @@ async def test_dead_revive_streak_broken_by_fail(db):
         assert n.status == "dead"  # 失败不改变 dead 终态
 
 
-# ─── 订阅 95% 废弃判定 ──────────────────────────────────────
+# ─── 订阅停用判定（无可用节点 / 资源失效）─────────────────────
 
 
 @pytest.mark.asyncio
-async def test_subscription_deprecated_over_95(db):
-    """不可用占比 >95% → 订阅废弃（deprecated=True，带原因）；不删除。"""
+async def test_subscription_deprecated_when_no_alive_node(db):
+    """一个可用节点都没有 → 订阅停用（deprecated=True，带原因）；不删除。"""
     sub_id = await _seed_sub(db)
     now = proxies_service._naive(proxies_service.get_beijing_time_obj())
-    # 100 节点只有 4 个通（96% 不可用 > 95%）
-    results = [_ok(f"ok{i}") for i in range(4)] + [_fail(f"bad{i}") for i in range(96)]
+    # 100 节点全不通：没有可用出口即停用
+    results = [_fail(f"bad{i}") for i in range(100)]
     names = [r["name"] for r in results]
     alive, _, deprecated = await proxies_service._apply_node_results(sub_id, {}, results, names, now)
-    assert alive == 4
+    assert alive == 0
     assert deprecated is True
     async with db() as session:
         sub = await session.get(ProxySubscription, sub_id)
         assert sub.deprecated is True
         assert sub.deprecated_at is not None
-        assert "96%" in sub.deprecated_reason
+        assert "没有可用节点" in sub.deprecated_reason
 
 
 @pytest.mark.asyncio
-async def test_subscription_deprecated_boundary_not_triggered(db):
-    """恰好 95% 不可用（=5% 可用）不触发废弃——用户口径是「超过 95%」。"""
+async def test_subscription_stays_active_with_few_alive_nodes(db):
+    """只要还有可用节点就不停用——存活少不等于资源失效。"""
     sub_id = await _seed_sub(db)
     now = proxies_service._naive(proxies_service.get_beijing_time_obj())
-    # 100 节点 5 个通：不可用 95%，ratio > 0.95 为 False
-    results = [_ok(f"ok{i}") for i in range(5)] + [_fail(f"bad{i}") for i in range(95)]
+    # 100 节点只有 1 个通：仍可用，不触发停用
+    results = [_ok("ok0")] + [_fail(f"bad{i}") for i in range(99)]
     names = [r["name"] for r in results]
-    _, _, deprecated = await proxies_service._apply_node_results(sub_id, {}, results, names, now)
+    alive, _, deprecated = await proxies_service._apply_node_results(sub_id, {}, results, names, now)
+    assert alive == 1
     assert deprecated is False
 
 
 @pytest.mark.asyncio
 async def test_subscription_deprecated_auto_recover(db):
-    """废弃订阅恢复达标（不可用 ≤95%）→ 自动解除废弃。"""
+    """停用订阅恢复可用节点 → 自动解除停用。"""
     sub_id = await _seed_sub(db)
     now = proxies_service._naive(proxies_service.get_beijing_time_obj())
     bad = [_fail(f"bad{i}") for i in range(96)] + [_ok(f"ok{i}") for i in range(4)]
     names = [r["name"] for r in bad]
-    await proxies_service._apply_node_results(sub_id, {}, bad, names, now)
+    await proxies_service._apply_node_results(sub_id, {}, [_fail(f"bad{i}") for i in range(100)], names, now)
     # 修复到 50 个通
     fixed = [_ok(f"ok{i}") for i in range(50)] + [_fail(f"bad{i}") for i in range(50)]
     _, _, deprecated = await proxies_service._apply_node_results(sub_id, {}, fixed, names, now)

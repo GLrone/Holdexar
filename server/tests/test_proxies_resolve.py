@@ -263,9 +263,9 @@ def test_subscription_view_strips_mixed_port():
     assert a == b
 
 
-def test_fallback_ports_are_verge_default_only():
-    """兜底借道口 = 用户自启 Verge 的生态默认 7897，与工作端口设置无关。"""
-    assert clash_manager.LOCAL_MIXED_PORTS == (7897,)
+def test_fallback_ports_cover_ecosystem_and_own_default():
+    """兜底借道口 = 生态默认 7897 + 本程序内核默认 7890，与工作端口设置无关。"""
+    assert clash_manager.LOCAL_MIXED_PORTS == (7890, 7897)
 
 
 @pytest.mark.asyncio
