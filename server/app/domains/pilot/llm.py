@@ -178,7 +178,11 @@ async def _openai_parse(aiter_lines):
             read = int(cached) if isinstance(cached, (int, float)) else None
             yield ("cache", {"rate": (min(1.0, read / prompt) if read is not None and prompt > 0 else None),
                              "read": read, "write": None, "base": prompt or None})
-            continue
+            # 部分中转把 usage 挂在每一帧上（连同正文一起下发）——此时不能 continue，
+            # 否则正文随着这些帧一起被丢掉，整轮只剩用量事件、答案全空。
+            # 只有「纯用量帧」（无任何 choices）才到此为止。
+            if not (chunk.get("choices") or []):
+                continue
         choices = chunk.get("choices") or []
         if not choices:
             continue

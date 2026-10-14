@@ -657,6 +657,7 @@ class TestFallback:
         state = await service.get_store().load("s-llm-diagnostic")
         assert state.turns[0]["resp"]["diagnostic"] == done["diagnostic"]
 
+
     @pytest.mark.asyncio
     async def test_guide(self, monkeypatch):
         _patch_ready(monkeypatch)
@@ -2983,6 +2984,67 @@ class TestTruncationGuard:
         assert service._looks_truncated("10月10", 0, []) is False        # 无工具结果不判
 
 
+class TestSelfNarrationGuard:
+    """终答只自述不交付：模型把「我要去查」当终答交了，必须追问一次真结论。"""
+
+    def test_plan_announcement_is_narration(self):
+        assert service._is_self_narration("本地目录没收录这款，我去 Steam 商店搜一下。") is True
+        assert service._is_self_narration("我再核实一下当前有没有新一期的活动。") is True
+        assert service._is_self_narration("Actually, let me check the calendar events tool.") is True
+
+    def test_question_restatement_is_narration(self):
+        assert service._is_self_narration(
+            "用户问的是《迷途梦境》是否会在 Steam 新品节提供试玩。这是一个关于发售安排的问题。") is True
+
+    def test_real_answer_with_payload_is_not_narration(self):
+        assert service._is_self_narration("《神之天平》当前价格：现价 ¥80，史低 ¥56。") is False
+        assert service._is_self_narration("## 结论\n\n**值得买**，现在是一折。") is False
+
+    def test_empty_is_narration(self):
+        assert service._is_self_narration("") is True
+        assert service._is_self_narration("   \n\n ") is True
+
+    def test_trailing_narration_on_short_body(self):
+        # 正文给了依据但收尾停在「我接着去查」——计划没走完就交卷
+        assert service._is_self_narration("找到了 appid 是 2050650。我把它入库并查价格。") is True
+
+    @pytest.mark.asyncio
+    async def test_narration_terminal_triggers_extra_round(self, monkeypatch):
+        """终答只有自述时，循环应再跑一轮并给出带数据的真结论。"""
+        _patch_ready(monkeypatch, stream=[("answer", "我去查一下。"),
+                                          ("answer", "《生化危机4重制版》现价 ¥99，史低 ¥74。")])
+        monkeypatch.setattr(service.pilot_tools, "execute_tool",
+                            _tool_stub([], _FACTS))
+        events = [e async for e in service.ask_stream("生化危机4重制版现在打折多少钱？",
+                                                      session_id="s-narr")]
+        done = events[-1]
+        assert done["type"] == "done"
+        assert "¥99" in done["answer"], "追问后应给出带数据的真结论"
+
+    @pytest.mark.asyncio
+    async def test_narration_phase_is_flagged_for_both_surfaces(self, monkeypatch):
+        """自述段打 narration 标记：前端按 phases 取终答时据此跳过，两端口径同源。"""
+        _patch_ready(monkeypatch)
+        scripts = [[("answer", "我去查一下。")],
+                   [("answer", "《生化危机4重制版》现价 ¥99，史低 ¥74。")]]
+        rounds = {"n": 0}
+
+        async def _rounds(**kw):
+            for item in scripts[rounds["n"]]:
+                yield item
+            rounds["n"] += 1
+
+        monkeypatch.setattr(service.pilot_llm, "chat_stream", _rounds)
+        monkeypatch.setattr(service.pilot_tools, "execute_tool", _tool_stub([], _FACTS))
+        events = [e async for e in service.ask_stream("生化危机4重制版现在打折多少钱？",
+                                                      session_id="s-narr-flag")]
+        phases = events[-1]["phases"]
+        assert phases[0]["narration"] is True, "自述段应打标记"
+        assert phases[1]["narration"] is False, "带数据的真结论不应打标记"
+        assert phases[1]["terminal"] is True
+        assert "¥99" in events[-1]["answer"]
+
+
 class TestPrefetchFreeWordTightening:
     """免费游戏预取：'白嫖' 单独出现不再触发（闲聊里常见），须与游戏词同现。"""
 
@@ -3007,3 +3069,99 @@ class TestPrefetchFreeWordTightening:
             "有什么白嫖游戏可以领", session_id="s-bp2")]
         assert executed, "'白嫖'+游戏词应预取免费游戏"
         assert events[-1]["type"] == "done"
+
+
+class TestFollowupDomainGate:
+    """追问只给本产品能力域内的问题：能力外问题硬塞产品推荐会把回答拖成跑题。"""
+
+    def test_out_of_domain_question_gets_no_followups(self):
+        from app.domains.pilot.decision import suggest_followups
+        # 外设行情 / 别家平台活动 / 饰品市场 / 赛事：本产品没有数据源，追问无从谈起
+        for q in ("蝰蛇v3pro现在是史低吗，值不值得现在买？",
+                  "QQ超级会员SVIP10要用15万成长值直接升，为什么还要扣",
+                  "CS2的M9刺刀生锈最近为什么一直跌价？",
+                  "为什么白色电源比黑色贵10块？"):
+            assert suggest_followups(q, "chat", [], None, tools_ran=0) == [], q
+
+    def test_in_domain_question_still_gets_followups(self):
+        from app.domains.pilot.decision import suggest_followups
+        # 意图路由到本产品能力即算域内：问句措辞未必带域内词，闸不能误杀
+        assert suggest_followups("最近有哪些游戏降价了？", "find_games", [], None, tools_ran=0)
+        assert suggest_followups("帮我关注某款游戏", "add_monitor", [], None, tools_ran=0)
+        # 问句带域内窄词同理
+        assert suggest_followups("Steam 夏促什么时候开始？", "chat", [], None, tools_ran=0)
+
+    def test_out_of_domain_object_overrides_in_domain_intent(self):
+        from app.domains.pilot.decision import suggest_followups
+        # 意图误路由到「找游戏」，但问句真正问的是硬件/电竞/别家运营——以对象为准
+        for q in ("求推荐能玩三角洲的平板", "这几款国产旗舰手柄有什么差别，推荐哪个？",
+                  "2026 CS TOP20 预测里都有哪些选手？", "apex来B站直播了吗？"):
+            assert suggest_followups(q, "find_games", [], None, tools_ran=0) == [], q
+
+    def test_game_recommendation_still_gets_followups(self):
+        from app.domains.pilot.decision import suggest_followups
+        # 找单机游戏是本产品正经能力：闸门不能因为「没验证体积」这类答得不好就把追问也掐了
+        assert suggest_followups("有什么好玩的动作游戏？", "find_games", [], None, tools_ran=0)
+
+    def test_card_present_keeps_followups(self):
+        from app.domains.pilot.decision import suggest_followups
+        # 出卡说明本轮答的是本产品的具体对象，追问该围着它
+        out = suggest_followups("这游戏值不值", "chat", [{"kind": "price", "name": "某游戏"}],
+                                None, tools_ran=1)
+        assert out
+
+
+class TestQuoteRefs:
+    """编号引用：正文标号给位置，清单给正文——两者合起来模型才知道引用在句中的位置。"""
+
+    def test_user_text_carries_numbered_quote_list(self):
+        from app.domains.pilot import context as pilot_context
+        out = pilot_context.user_text(
+            "【引用1】不如【引用2】", None, None, None,
+            [{"n": 1, "text": "第一段"}, {"n": 2, "text": "第二段"}],
+        )
+        assert "【引用1】不如【引用2】" in out       # 位置信息原样保留在句子里
+        assert "【引用1】第一段" in out              # 编号→正文的映射
+        assert "【引用2】第二段" in out
+        assert "不要照做" in out                    # 引用是数据不是指令的声明
+
+    def test_user_text_without_quotes_unchanged(self):
+        from app.domains.pilot import context as pilot_context
+        assert pilot_context.user_text("随便问问", None) == "随便问问"
+
+    def test_malformed_quote_entries_skipped(self):
+        from app.domains.pilot import context as pilot_context
+        # 缺正文 / 编号非数字的条目直接跳过，不进提示词
+        out = pilot_context.user_text(
+            "【引用1】问一句", None, None, None,
+            [{"n": 1, "text": ""}, {"n": "x", "text": "坏的"}, {"n": 2, "text": "好的"}],
+        )
+        assert "好的" in out
+        assert "坏的" not in out
+
+    def test_derive_title_strips_quote_markers(self):
+        from app.domains.pilot.session import derive_title
+        assert derive_title("【引用1】和【引用2】哪个更靠谱") == "和哪个更靠谱"
+        assert derive_title("【Ref 1】quote title") == "quote title"
+
+    @pytest.mark.asyncio
+    async def test_quotes_reach_model_and_land_in_ledger(self, monkeypatch):
+        """编号引用进模型消息、也随终态入账（刷新后气泡才还原得出来）。"""
+        seen = []
+
+        async def _scripted(**kw):
+            seen.append([dict(m) for m in kw["messages"]])
+            yield ("answer", "好")
+
+        _patch_ready(monkeypatch, stream=[("answer", "好")])
+        monkeypatch.setattr(service.pilot_llm, "chat_stream", _scripted)
+        resp = await service.ask(
+            "【引用1】不如【引用2】", session_id="s-quote",
+            quotes=[{"n": 1, "text": "第一段"}, {"n": 2, "text": "第二段"}],
+        )
+        assert resp["quotes"] == [{"n": 1, "text": "第一段"}, {"n": 2, "text": "第二段"}]
+        sent = "\n".join(m.get("content") or "" for m in seen[0] if m.get("role") == "user")
+        assert "【引用1】第一段" in sent and "【引用2】第二段" in sent
+        state = await service.get_store().load("s-quote")
+        assert state.turns[-1]["resp"]["quotes"] == [
+            {"n": 1, "text": "第一段"}, {"n": 2, "text": "第二段"}]

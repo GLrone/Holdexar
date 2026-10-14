@@ -70,9 +70,13 @@ def valid_sid(sid: str) -> bool:
     return bool(_SID_RE.fullmatch(sid or ""))
 
 
+# 引用标号：中文【引用N】与英文【Ref N】同形（括号内非数字前缀 + 编号）
+_QUOTE_MARKER_RE = re.compile(r"【[^】\d]*\d+】")
+
+
 def derive_title(q: str) -> str:
-    """首问 → 标题：压平空白后截断（确定性，不调模型）。"""
-    text = " ".join((q or "").split())
+    """首问 → 标题：剥掉引用标号、压平空白后截断（确定性，不调模型）。"""
+    text = " ".join(_QUOTE_MARKER_RE.sub("", q or "").split())
     if not text:
         return ""
     return text[:_TITLE_AUTO_CHARS] + ("…" if len(text) > _TITLE_AUTO_CHARS else "")
