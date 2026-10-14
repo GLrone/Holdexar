@@ -1440,6 +1440,9 @@ async def init_db() -> None:
     from app.core import orchestration as _core_orchestration  # noqa: F401
     from app.domains.agent import models as _agent_models  # noqa: F401
     from app.domains.achievements import models as _achievements_models  # noqa: F401
+    # 成就域有两处表注册：models 三张表 + level 的经验流水表（后者只在本模块
+    # 被导入时才进 metadata，漏掉会让建库产物缺表）
+    from app.domains.achievements import level as _achievements_level  # noqa: F401
     from app.domains.alerts import models as _alerts_models  # noqa: F401
     from app.domains.bills import models as _bills_models  # noqa: F401
     from app.domains.crawl import cycle as _crawl_cycle  # noqa: F401

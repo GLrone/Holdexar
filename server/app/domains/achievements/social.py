@@ -323,9 +323,11 @@ async def compare(steamids: str | None = None) -> dict:
     if not wanted:
         return {"accounts": []}
     async with write_session(WritePriority.BACKGROUND, label="social_compare_baseline") as wsession:
-        # 对比读数前先补齐每个账号的存量基线（幂等），未开过等级页的账号不再显示 1 级 0 经验
+        # 对比读数前先补齐每个账号的存量基线（幂等），未开过等级页的账号不再显示 1 级 0 经验。
+        # 基线必须落库后才读：写会话不自动提交，不提交则本次补的基线在读数前被丢弃
         for sid in wanted:
             await level.ensure_baseline(wsession, sid)
+        await wsession.commit()
     async with get_session_factory()() as session:
         accounts = [await _compare_row(session, sid, roster.get(sid)) for sid in wanted]
     return {"accounts": accounts}
