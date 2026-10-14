@@ -94,6 +94,12 @@ MISSING_MAX_RETRIES = 5
 # 400 款 × 多区多版本的全量史行一次 values() 会越限、整批炸到慢路径
 _INSERT_CHUNK_ROWS = 2000
 
+_GAME_DEFAULTED_COLUMNS = frozenset(
+    column.key for column in Game.__table__.columns
+    if (column.default is not None or column.server_default is not None)
+    and not column.type.should_evaluate_none
+)
+
 # 写闸积压背压：后台等待超过阈值后，抓取提交按深度线性退避（事实流只降速
 # 不丢弃）；写段中位等待不再随积压无界增长。阈值高于常态满载深度，只在
 # 写侧真的跟不上时生效。
@@ -750,9 +756,11 @@ class DbWriter:
                 for i, (game_data, prices_data) in enumerate(entries):
                     aid = int(game_data.get("appid") or 0)
                     game_values, _ = self._normalize_game_row(game_data, prices_data)
-                    # free_state 键是否存在（而非值真假）决定 upsert set_ 键集：
-                    # (None, None) 是「付费显式清免费标记」信号，键在值空——
-                    # 两类行混进同一 executemany 会因键集不均触发编译错误
+                    game_values = {
+                        key: value for key, value in game_values.items()
+                        if value is not None or key not in _GAME_DEFAULTED_COLUMNS
+                    }
+                    # 免费态字段缺省的行保留已有标记。
                     game_groups["free_kind" in game_values].append(game_values)
                     now_dt = game_values["updated_at"]
                     if now_dt not in event_keys:
@@ -791,107 +799,105 @@ class DbWriter:
                         set_=group_set,
                     )
                     _tg = time.perf_counter()
-                    await session.execute(stmt, rows)
+                    await session.execute(stmt, rows, execution_options={"render_nulls": True})
                     game_ms += _ms_since(_tg)
-                    # 写锁已在事务起点（BEGIN IMMEDIATE）取得：首写耗时即语句
-                    # 执行成本（含 FTS 触发器），不再是等锁观测口径
 
-                    all_current: list[dict] = []
-                    all_history: list[dict] = []
-                    ok_groups: dict[frozenset, list[int]] = {}
-                    degraded_groups: dict[frozenset, list[int]] = {}
-                    for i, aid, prices_data, now_dt, event_key, baseline in plans:
-                        if not prices_data:
-                            continue
-                        current_rows, history_rows, ok_regions, degraded_regions = (
-                            self._plan_price_rows(
-                                prices_data, baseline, now_dt, event_key
-                            )
+                all_current: list[dict] = []
+                all_history: list[dict] = []
+                ok_groups: dict[frozenset, list[int]] = {}
+                degraded_groups: dict[frozenset, list[int]] = {}
+                for i, aid, prices_data, now_dt, event_key, baseline in plans:
+                    if not prices_data:
+                        continue
+                    current_rows, history_rows, ok_regions, degraded_regions = (
+                        self._plan_price_rows(
+                            prices_data, baseline, now_dt, event_key
                         )
-                        all_current.extend(current_rows)
-                        all_history.extend(history_rows)
-                        if ok_regions:
-                            ok_groups.setdefault(frozenset(ok_regions), []).append(aid)
-                        if degraded_regions:
-                            degraded_groups.setdefault(frozenset(degraded_regions), []).append(aid)
+                    )
+                    all_current.extend(current_rows)
+                    all_history.extend(history_rows)
+                    if ok_regions:
+                        ok_groups.setdefault(frozenset(ok_regions), []).append(aid)
+                    if degraded_regions:
+                        degraded_groups.setdefault(frozenset(degraded_regions), []).append(aid)
 
-                    if all_current:
-                        insert_cp = sqlite_insert(GameCurrentPrice)
-                        cp_stmt = insert_cp.on_conflict_do_update(
-                            index_elements=[
-                                GameCurrentPrice.appid,
-                                GameCurrentPrice.region_code,
-                            ],
-                            set_={c: getattr(insert_cp.excluded, c) for c in _CURRENT_UPDATABLE},
-                        )
-                        _tp = time.perf_counter()
-                        for chunk in _chunks(all_current, _INSERT_CHUNK_ROWS):
-                            await session.execute(cp_stmt, chunk)
-                        current_ms = _ms_since(_tp)
-                        # 补抓成功结转清账：本批有 ok 价的区 fail_count 归零
-                        # （missing → 补抓成功 → 回 ok 的欠账闭环）；按「区集合相同
-                        # 的款」分组成 IN 更新，避免 appid × 区的笛卡尔积误清
-                        for regions, aids in ok_groups.items():
-                            _tl = time.perf_counter()
-                            await session.execute(
-                                update(GameCurrentPrice)
-                                .where(
-                                    GameCurrentPrice.appid.in_(aids),
-                                    GameCurrentPrice.region_code.in_(regions),
-                                )
-                                .values(fail_count=0)
-                            )
-                            ledger_ms += _ms_since(_tl)
-                        # 欠账结转：门禁降级行计一次失败（递增 + 穷尽转 blocked）。
-                        # 常规 upsert 不带 fail_count（避免误清），账本专门走 bump。
-                        for regions, aids in degraded_groups.items():
-                            _tl = time.perf_counter()
-                            await session.execute(
-                                update(GameCurrentPrice)
-                                .where(
-                                    GameCurrentPrice.appid.in_(aids),
-                                    GameCurrentPrice.region_code.in_(regions),
-                                )
-                                .values(**_missing_ledger_bump())
-                            )
-                            ledger_ms += _ms_since(_tl)
-
-                    if all_history:
-                        _th = time.perf_counter()
-                        hist_stmt = sqlite_insert(GamePriceHistory)
-                        for chunk in _chunks(all_history, _INSERT_CHUNK_ROWS):
-                            await session.execute(hist_stmt, chunk)
-                        history_ms = _ms_since(_th)
-                    # 收尾（复活清标 / 种子补挂）保存点内联：与主段同事务一次
-                    # 提交，段后不再两次重排写闸；失败只回滚保存点不拖垮主段
+                if all_current:
+                    insert_cp = sqlite_insert(GameCurrentPrice)
+                    cp_stmt = insert_cp.on_conflict_do_update(
+                        index_elements=[
+                            GameCurrentPrice.appid,
+                            GameCurrentPrice.region_code,
+                        ],
+                        set_={c: getattr(insert_cp.excluded, c) for c in _CURRENT_UPDATABLE},
+                    )
                     _tp = time.perf_counter()
-                    sp = await session.begin_nested()
-                    try:
-                        cleared = await self._clear_removed_marks_statements(
-                            session, ok_ids
+                    for chunk in _chunks(all_current, _INSERT_CHUNK_ROWS):
+                        await session.execute(cp_stmt, chunk)
+                    current_ms = _ms_since(_tp)
+                    # 补抓成功结转清账：本批有 ok 价的区 fail_count 归零
+                    # （missing → 补抓成功 → 回 ok 的欠账闭环）；按「区集合相同
+                    # 的款」分组成 IN 更新，避免 appid × 区的笛卡尔积误清
+                    for regions, aids in ok_groups.items():
+                        _tl = time.perf_counter()
+                        await session.execute(
+                            update(GameCurrentPrice)
+                            .where(
+                                GameCurrentPrice.appid.in_(aids),
+                                GameCurrentPrice.region_code.in_(regions),
+                            )
+                            .values(fail_count=0)
                         )
-                        await seed_assets.apply_curated_rows(session, curated_rows)
-                        await sp.commit()
-                    except Exception as e:  # noqa: BLE001 —— 收尾失败不影响价格链
-                        await sp.rollback()
+                        ledger_ms += _ms_since(_tl)
+                    # 欠账结转：门禁降级行计一次失败（递增 + 穷尽转 blocked）。
+                    # 常规 upsert 不带 fail_count（避免误清），账本专门走 bump。
+                    for regions, aids in degraded_groups.items():
+                        _tl = time.perf_counter()
+                        await session.execute(
+                            update(GameCurrentPrice)
+                            .where(
+                                GameCurrentPrice.appid.in_(aids),
+                                GameCurrentPrice.region_code.in_(regions),
+                            )
+                            .values(**_missing_ledger_bump())
+                        )
+                        ledger_ms += _ms_since(_tl)
+
+                if all_history:
+                    _th = time.perf_counter()
+                    hist_stmt = sqlite_insert(GamePriceHistory)
+                    for chunk in _chunks(all_history, _INSERT_CHUNK_ROWS):
+                        await session.execute(hist_stmt, chunk)
+                    history_ms = _ms_since(_th)
+                # 收尾（复活清标 / 种子补挂）保存点内联：与主段同事务一次
+                # 提交，段后不再两次重排写闸；失败只回滚保存点不拖垮主段
+                _tp = time.perf_counter()
+                sp = await session.begin_nested()
+                try:
+                    cleared = await self._clear_removed_marks_statements(
+                        session, ok_ids
+                    )
+                    await seed_assets.apply_curated_rows(session, curated_rows)
+                    await sp.commit()
+                except Exception as e:  # noqa: BLE001 —— 收尾失败不影响价格链
+                    await sp.rollback()
+                    log_event(
+                        logger,
+                        "批量写入收尾保存点失败，已回滚（主段照常提交）",
+                        level=logging.WARNING,
+                        detail={"原因": e},
+                    )
+                else:
+                    if cleared:
                         log_event(
                             logger,
-                            "批量写入收尾保存点失败，已回滚（主段照常提交）",
-                            level=logging.WARNING,
-                            detail={"原因": e},
+                            f"{cleared} 款游戏重新有数据，已清除下架标记",
+                            tag="已修复",
+                            detail={"数量": cleared},
                         )
-                    else:
-                        if cleared:
-                            log_event(
-                                logger,
-                                f"{cleared} 款游戏重新有数据，已清除下架标记",
-                                tag="已修复",
-                                detail={"数量": cleared},
-                            )
-                    post_ms = _ms_since(_tp)
-                    _tm = time.perf_counter()
-                    await session.commit()
-                    commit_ms = _ms_since(_tm)
+                post_ms = _ms_since(_tp)
+                _tm = time.perf_counter()
+                await session.commit()
+                commit_ms = _ms_since(_tm)
             except Exception:
                 log_event(
                     logger,

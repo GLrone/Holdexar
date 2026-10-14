@@ -79,6 +79,74 @@ async def test_batch_writes_every_entry(db):
 
 
 @pytest.mark.asyncio
+async def test_nullable_metadata_keeps_one_batch_and_column_defaults(db):
+    from sqlalchemy import event
+    from app.core.database import get_engine
+    from app.domains.games.models import Game
+
+    engine = get_engine().sync_engine
+    writes = []
+
+    def count_writes(_conn, _cursor, statement, _parameters, _context, _many):
+        if statement.startswith("INSERT INTO games"):
+            writes.append(statement)
+
+    entries = []
+    for i in range(6):
+        aid = APPID_A + i
+        game = _game(aid, f"游戏{i}")
+        game.update(name_en=None if i % 2 else f"Game {i}", family_sharing=None)
+        entries.append((game, _prices(aid, 10000, 20000, 50)))
+
+    event.listen(engine, "before_cursor_execute", count_writes)
+    try:
+        assert await DbWriter().upsert_task_batch(entries) == [True] * 6
+    finally:
+        event.remove(engine, "before_cursor_execute", count_writes)
+
+    async with db() as session:
+        games = (await session.execute(select(Game).order_by(Game.appid))).scalars().all()
+    assert [g.name_en for g in games] == [f"Game {i}" if i % 2 == 0 else None for i in range(6)]
+    assert all(g.family_sharing is False for g in games)
+    assert len(writes) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "region, second_price, second_original, second_discount, second_status, second_history",
+    [("HK", 0, 2000, 100, "ok", 1), ("CN", None, None, 0, "locked", 0)],
+)
+async def test_mixed_free_state_batch_writes_history_once(
+    db, monkeypatch, region, second_price, second_original, second_discount,
+    second_status, second_history,
+):
+    w = DbWriter()
+
+    async def unexpected_fallback(_entries):
+        pytest.fail("mixed free states must stay on the batch path")
+
+    monkeypatch.setattr(w, "_upsert_task_batch_slow", unexpected_fallback)
+    paid = _prices(APPID_A, 10000, 20000, 50)
+    second = _prices(APPID_B, second_price, second_original, second_discount)
+    paid[0]["region_code"] = region
+    second[0]["region_code"] = region
+    second[0]["price_status"] = second_status
+
+    assert await w.upsert_task_batch([
+        (_game(APPID_A, "甲"), paid),
+        (_game(APPID_B, "乙"), second),
+    ]) == [True, True]
+    assert await _history_count(db, APPID_A) == 1
+    assert await _history_count(db, APPID_B) == second_history
+    async with db() as session:
+        paid_row = await session.get(GameCurrentPrice, (APPID_A, region))
+        second_row = await session.get(GameCurrentPrice, (APPID_B, region))
+    assert paid_row is not None and paid_row.price == 10000
+    assert second_row is not None and second_row.price == second_price
+    assert second_row.price_status == second_status
+
+
+@pytest.mark.asyncio
 async def test_curated_post_failure_does_not_rollback_main_segment(db, monkeypatch):
     """收尾保存点失败只回滚收尾：主段价格照常落库、结果不降级。"""
     import app.core.seed_assets as seed_assets
