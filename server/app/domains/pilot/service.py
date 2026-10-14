@@ -245,7 +245,7 @@ _COMPACT_FAIL_LIMIT = 2
 _compact_failures: dict[str, int] = {}
 _RESPONDED_KEYS = ("answer", "thinking", "think_ms", "source", "reason", "facts", "cards", "steps", "tools",
                    "phases", "ctx_tokens", "ctx_budget", "elapsed_ms", "archived_through",
-                   "ctx_breakdown", "cache_hit_rate", "attachments", "followups",
+                   "ctx_breakdown", "cache_hit_rate", "attachments", "quotes", "followups",
                    "usage_in", "usage_out", "cache_read_tokens", "cache_write_tokens", "first_in",
                    "cache_base_tokens", "decode_ms", "decode_out", "ttft_ms", "ttft_n",
                    "tool_catalog", "diagnostic")
@@ -347,6 +347,7 @@ def _ctx_breakdown(base: list[dict], state, question: str, appid: int | None,
                    sys_prompt: str | None = None,
                    view_context: dict | None = None,
                    element_refs: list[dict] | None = None,
+                   quotes: list[dict] | None = None,
                    expanded: frozenset[str] | None = None) -> list[dict]:
     """上下文构成估算（字符数）：五来源，供前端分段条与图例的占比口径。
 
@@ -357,7 +358,7 @@ def _ctx_breakdown(base: list[dict], state, question: str, appid: int | None,
     base_chars = sum(
         len(m["content"]) for m in base if isinstance(m.get("content"), str)
     )
-    current_chars = len(pilot_context.user_text(question, appid, view_context, element_refs))
+    current_chars = len(pilot_context.user_text(question, appid, view_context, element_refs, quotes))
     prompt_chars = len(sys_prompt or _SYSTEM_PROMPT)
     tools_chars = len(json.dumps(pilot_tools.tool_specs(expanded=expanded),
                                  ensure_ascii=False))
@@ -881,12 +882,13 @@ async def _prefetch_facts(question: str, appid: int | None, state, intent: str,
 
 def _minimal_base(state, question: str, appid: int | None,
                    view_context: dict | None = None,
-                   element_refs: list[dict] | None = None) -> list[dict]:
+                   element_refs: list[dict] | None = None,
+                   quotes: list[dict] | None = None) -> list[dict]:
     """溢出回收装配：仅要点存档 + 当前问题，不带历史轮次。"""
     msgs: list[dict] = []
     if state is not None and state.summary:
         msgs.append(pilot_context.summary_message(state.summary, state.sid))
-    msgs.append({"role": "user", "content": pilot_context.user_text(question, appid, view_context, element_refs)})
+    msgs.append({"role": "user", "content": pilot_context.user_text(question, appid, view_context, element_refs, quotes)})
     return msgs
 
 
@@ -991,7 +993,8 @@ async def _assemble_for_model(state, question: str, appid: int | None, cfg: dict
                               tool_limit: int | None = None,
                               expanded: frozenset[str] | None = None,
                               view_context: dict | None = None,
-                              element_refs: list[dict] | None = None) -> tuple[list[dict], bool]:
+                              element_refs: list[dict] | None = None,
+                              quotes: list[dict] | None = None) -> tuple[list[dict], bool]:
     """装配模型上下文；超预算先蒸馏要点存档（落账，含前后量），失败退回整轮让位。
 
     返回 (消息序列, 本轮是否发生了压缩)——压缩事实同时已落会话账本。
@@ -1001,7 +1004,7 @@ async def _assemble_for_model(state, question: str, appid: int | None, cfg: dict
     剪枝能把全量视图压回预算内就不花这次模型调用。"""
     budget = _history_budget(cfg, sys_prompt, expanded=expanded, state=state)
     if state is None:
-        return [{"role": "user", "content": pilot_context.user_text(question, appid, view_context, element_refs)}], False
+        return [{"role": "user", "content": pilot_context.user_text(question, appid, view_context, element_refs, quotes)}], False
     idle = _idle_minutes(state)
     prune_ratio = (pilot_context.IDLE_PRUNE_TRIGGER_RATIO
                    if idle is not None and idle >= pilot_context.IDLE_PRUNE_MINUTES
@@ -1009,10 +1012,10 @@ async def _assemble_for_model(state, question: str, appid: int | None, cfg: dict
     msgs = pilot_context.assemble(state, question, appid, budget=budget,
                                   tool_limit=tool_limit, prune_ratio=prune_ratio,
                                   view_context=view_context,
-                                  element_refs=element_refs)
+                                  element_refs=element_refs, quotes=quotes)
     full = pilot_context.full_view(state, question, appid, tool_limit,
                                    view_context=view_context,
-                                   element_refs=element_refs)
+                                   element_refs=element_refs, quotes=quotes)
     if not pilot_context.needs_compaction(full, budget=budget):
         return msgs, False
     if not pilot_context.needs_compaction(
@@ -1038,11 +1041,11 @@ async def _assemble_for_model(state, question: str, appid: int | None, cfg: dict
     state.summary, state.summary_through = text, through
     post_tokens = pilot_context.full_view_tokens(state, question, appid, tool_limit,
                                                     view_context=view_context,
-                                                    element_refs=element_refs)
+                                                    element_refs=element_refs, quotes=quotes)
     post_msgs = pilot_context.assemble(state, question, appid, budget=budget,
                                        tool_limit=tool_limit, prune_ratio=prune_ratio,
                                        view_context=view_context,
-                                       element_refs=element_refs)
+                                       element_refs=element_refs, quotes=quotes)
     state.summary, state.summary_through = prev
     if post_tokens >= pre_tokens:
         # 摘要没把源内容缩小（网关不守输出上限时会这样）：拒绝，保持原存档。
@@ -1145,7 +1148,8 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
                         intent: str = pilot_intent.CHAT, resume: dict | None = None,
                         *, expanded: frozenset[str] | None = None,
                         view_context: dict | None = None,
-                        element_refs: list[dict] | None = None):
+                        element_refs: list[dict] | None = None,
+                        quotes: list[dict] | None = None):
     """agent 循环（流式）。base 为 system 之后的装配序列（末位是当前问题）。事件形态与 ask_stream 一致，另加阶段与工具执行事件：
 
     {"type": "step_start", "step": n}                进入第 n 步（阶段定界，先于该步任何增量）；
@@ -1168,7 +1172,7 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
     steps，前端历史轮按它还原时间线。"""
     sys_prompt = await _build_system_prompt()
     system = [{"role": "system", "content": sys_prompt}]
-    minimal = _minimal_base(state, question, appid, view_context, element_refs)
+    minimal = _minimal_base(state, question, appid, view_context, element_refs, quotes)
     # 环境事实（今天几号 / 结算区 / 已拥有数 / 启用区服）：每轮现取，紧跟 system，
     # 不入账本——模型据此判断「下一个」是相对哪天、报价该按哪个区
     try:
@@ -2058,6 +2062,7 @@ async def ask(question: str, appid: int | None = None, session_id: str | None = 
               attachments: list[str] | None = None,
               view_context: dict | None = None,
              element_refs: list[dict] | None = None,
+             quotes: list[dict] | None = None,
              probe: bool = False) -> dict:
     """非流式入口（SSE 之外的消费形态 / 测试用）。
 
@@ -2110,15 +2115,22 @@ async def ask(question: str, appid: int | None = None, session_id: str | None = 
               "appid": appid, "reference_sid": reference_sid, **_turn_key(state, turn)})
         return {**resp, "cached": False}
     result: dict | None = None
+    last_diagnostic: dict | None = None
     async for event in ask_stream(q, appid, session_id, reference_sid, resume, attachments,
                                    view_context=view_context,
-                                  element_refs=element_refs, probe=probe):
+                                  element_refs=element_refs, quotes=quotes, probe=probe):
         if event["type"] == "done":
             result = event
         elif event["type"] == "busy":
             result = _empty("none", "session_busy", None)
+        elif event["type"] == "error":
+            last_diagnostic = event.get("diagnostic") or last_diagnostic
     if result is None:
         result = _empty("none", "llm_failed", None)
+        # 流式里已经拿到上游原文就别丢：否则界面只剩一句「模型暂时不可用」，
+        # 用户无从判断是没配服务、通道没额度还是网络断了
+        if last_diagnostic:
+            result["diagnostic"] = last_diagnostic
     return {**result, "cached": False}
 
 
@@ -2133,6 +2145,7 @@ async def ask_stream(question: str, appid: int | None = None, session_id: str | 
                      attachments: list[str] | None = None,
                      view_context: dict | None = None,
                   element_refs: list[dict] | None = None,
+                  quotes: list[dict] | None = None,
                   probe: bool = False):
     """流式编排入口：在飞登记 + busy 防护 + 受理回执（编排本体见 _ask_stream_body）。
 
@@ -2155,7 +2168,7 @@ async def ask_stream(question: str, appid: int | None = None, session_id: str | 
         yield {"type": "ack", "active": sum(_INFLIGHT_TURNS.values())}
         async for event in _ask_stream_body(q, appid, session_id, reference_sid, resume, attachments,
                                              view_context=view_context,
-                                  element_refs=element_refs, probe=probe):
+                                  element_refs=element_refs, quotes=quotes, probe=probe):
             yield event
     finally:
         if sid:
@@ -2171,6 +2184,7 @@ async def _ask_stream_body(question: str, appid: int | None = None, session_id: 
                            attachments: list[str] | None = None,
                            view_context: dict | None = None,
                   element_refs: list[dict] | None = None,
+                  quotes: list[dict] | None = None,
                   probe: bool = False):
     """流式编排本体。事件形态：
     {"type": "step_start", "step": int} 进入第几步（阶段边界）；
@@ -2232,6 +2246,8 @@ async def _ask_stream_body(question: str, appid: int | None = None, session_id: 
         resp["cards"] = [resp["facts"]] if resp.get("facts") else []
         if att_refs:
             resp["attachments"] = att_refs
+        if quotes:
+            resp["quotes"] = quotes
         turn = await _record_turn(state, q, resp)
         resp["turn_id"] = turn
         resp["title"] = get_store().title_of(state) if state else None
@@ -2250,6 +2266,7 @@ async def _ask_stream_body(question: str, appid: int | None = None, session_id: 
         expanded=unlocked,
         view_context=view_context,
         element_refs=element_refs,
+        quotes=quotes,
     )
     pre: list[dict] = []
     ref_msg = await _reference_message(reference_sid)
@@ -2260,20 +2277,25 @@ async def _ask_stream_body(question: str, appid: int | None = None, session_id: 
     if pre:
         base = pre + base
     result: dict | None = None
+    last_diagnostic: dict | None = None
     try:
         async for event in _agent_stream(base, state, q, appid, cfg, intent, resume,
                                          expanded=unlocked,
                                          view_context=view_context,
-                                         element_refs=element_refs):
+                                         element_refs=element_refs,
+                                         quotes=quotes):
             if event["type"] == "tool":
                 yield event
                 continue
             if event["type"] == "done":
                 result = event
+                if event.get("diagnostic"):
+                    last_diagnostic = event["diagnostic"]
                 continue
             yield event
     except pilot_llm.PilotLlmError as error:
         diagnostic = error.to_diagnostic()
+        last_diagnostic = diagnostic
         # 循环内已流出的内容不收回；无流出时降级为确定性事实
         if result is None:
             resp = await _fallback_deterministic(q, appid, state, intent)
@@ -2282,6 +2304,8 @@ async def _ask_stream_body(question: str, appid: int | None = None, session_id: 
             resp["cards"] = [resp["facts"]] if resp.get("facts") else []
             if att_refs:
                 resp["attachments"] = att_refs
+            if quotes:
+                resp["quotes"] = quotes
             turn = await _record_turn(state, q, resp)
             resp["turn_id"] = turn
             resp["title"] = get_store().title_of(state) if state else None
@@ -2298,6 +2322,9 @@ async def _ask_stream_body(question: str, appid: int | None = None, session_id: 
         result = _empty("none", "llm_failed", None)
     if att_refs:
         result["attachments"] = att_refs
+    # 编号引用随本轮入账：刷新/重开会话后气泡仍能按编号还原成胶囊（正文在 quotes 里）
+    if quotes:
+        result["quotes"] = quotes
     turn_messages = result.pop("turn_messages", [])
     # 引用/附件消息随本轮一起入账（发送原样）：下一轮重放时它们仍在原位，
     # 历史前缀不因「上轮的在场消息凭空消失」而分叉

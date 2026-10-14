@@ -468,7 +468,8 @@ async def ask(payload: AskRequest) -> AskResponse:
                                    payload.resume.model_dump() if payload.resume else None,
                                    payload.attachments,
                                    payload.view_context,
-                                   payload.element_refs)
+                                   payload.element_refs,
+                                   payload.quotes)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     except Exception as e:  # noqa: BLE001
@@ -496,7 +497,8 @@ async def ask_stream(payload: AskRequest):
                                                       payload.resume.model_dump() if payload.resume else None,
                                                       payload.attachments,
                                                       payload.view_context,
-                                                      payload.element_refs):
+                                                      payload.element_refs,
+                                                      payload.quotes):
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
             except pilot_llm.PilotLlmError as e:
                 yield f'data: {json.dumps({"type": "error", "reason": "llm_failed", "diagnostic": e.to_diagnostic()}, ensure_ascii=False)}\n\n'

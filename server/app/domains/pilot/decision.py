@@ -138,6 +138,32 @@ _FOLLOWUP_BY_CARD: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
 )
 
 
+# 本产品能力域信号：问句沾不上任何一条时，本轮不产出产品追问
+# ——鼠标行情、赛事比分、别家游戏机制这类问题硬塞「看降价/查促销」等于把回答拖成跑题。
+# 只收「本产品确实有数据源」的窄词，不收「史低/价格」这类通用词：外设、饰品、
+# 别家平台活动也问「多少钱/值不值」，把它们算进来等于没设这道闸。
+_DOMAIN_HINT: tuple[str, ...] = (
+    "steam", "愿望单", "喜加一", "夏促", "秋促", "冬促", "特卖", "区服",
+    "俄区", "土区", "港区", "港服", "国区", "阿根廷", "土耳其", "激活码",
+    "家庭共享", "成就", "奖杯", "关注列表", "降价提醒", "比价", "汇率折算",
+    "节点", "延迟", "刷新", "入库", "促销日历",
+)
+
+# 意图已被路由到本产品能力：问句措辞未必带域内词，但确实答的是本产品的事
+_DOMAIN_INTENTS = frozenset({"price_analysis", "find_games", "add_monitor", "create_alert"})
+
+# 能力外对象词：命中即说明本产品根本没这类数据（手柄/平板是硬件、选手/直播是电竞、
+# 联动/榜单是别家平台的运营）。意图误路由到「找游戏」时靠它把追问闸回去。
+_OUT_OF_DOMAIN: tuple[str, ...] = (
+    "手柄", "鼠标", "键盘", "耳机", "电源", "显卡", "主板", "内存", "硬盘",
+    "平板", "手机", "笔记本", "主机", "外设", "显示器", "路由器",
+    "选手", "战队", "比分", "夺冠", "冠军", "决赛", "半决赛", "小组赛",
+    "解说", "直播", "主播", "签约", "转会", "禁赛",
+    "联动", "周边", "手办", "快递", "门店", "客服申诉", "解封", "封号",
+    "战绩查询", "段位", "排位", "匹配机制",
+)
+
+
 def suggest_followups(question: str, intent: str, cards: list[dict],
                       last_game: dict | None,
                       tools_ran: int = 0) -> list[dict]:
@@ -182,6 +208,13 @@ def suggest_followups(question: str, intent: str, cards: list[dict],
     if not tools_ran and "retryWeb" not in ordered:
         ordered.append("retryWeb")
     if not ordered:
+        return []
+    # 问句与出卡都沾不上本产品能力域时，一条都不给：宁可没有追问，也不给跑题的。
+    # 意图被路由到本产品能力（比价/找游戏/加关注/设提醒）也算域内——问句措辞未必带域内词；
+    # 但问句里出现能力外对象（硬件/电竞/别家运营）时以对象为准，那才是用户真正问的东西。
+    _in_domain = (intent in _DOMAIN_INTENTS or any(w in q for w in _DOMAIN_HINT)) \
+        and not any(w in q for w in _OUT_OF_DOMAIN)
+    if not (_in_domain or any(isinstance(c, dict) for c in cards or [])):
         return []
 
     named = {"compareRegions", "priceHistory", "similarGames", "addFollow", "setAlert"}

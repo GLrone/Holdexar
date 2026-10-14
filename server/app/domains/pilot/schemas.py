@@ -165,6 +165,8 @@ class AskRequest(BaseModel):
     view_context: dict | None = None
     # 用户在页面上选中的元素引用（标签/文本/selector/role），让模型知道用户指代的具体元素
     element_refs: list[dict] | None = None
+    # 本轮随问携带的编号引用（n + 正文）：正文里的 【引用N】 标号给出它们在句中的位置
+    quotes: list[dict] | None = None
 
 
 class PilotAttachmentCreate(BaseModel):
@@ -224,6 +226,8 @@ class AskResponse(BaseModel):
     """本轮工具取到的结构化卡片（games / price / action），供前端组件渲染。"""
     attachments: list = []
     """本轮随问携带的附件引用（id/名称/字符数/行数）：用户消息下的附件芯片与历史还原用。"""
+    quotes: list = []
+    """本轮随问携带的编号引用（n + 正文）：气泡内按编号把正文里的【引用N】标号渲染成胶囊。"""
     cards: list = []
     """本轮追问（结构化 key+args，文案由前端 i18n 承载）；无候选时为空列表。
 

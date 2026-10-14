@@ -1,4 +1,5 @@
 """pilot LLM 适配层单测：协议请求构造、鉴权头与探测失败分类（不触网）。"""
+import json
 import logging
 
 import httpx
@@ -34,6 +35,41 @@ async def test_chat_stream_logs_http_provider_failure(caplog):
     assert failures[0].hl_detail["诊断编号"]
     assert "sk-test-secret" not in failures[0].hl_detail["原因"]
     assert "sk-test-secret" not in raised.value.to_diagnostic()["message"]
+
+
+@pytest.mark.asyncio
+async def test_usage_on_every_frame_still_yields_answer():
+    """部分中转把 usage 挂在每一帧上（与正文同帧下发）。
+
+    解析器若见 usage 就 continue，正文会随这些帧一起被丢掉——整轮只剩用量事件、
+    答案全空。只有「无任何 choices 的纯用量帧」才可以到此为止。
+    """
+    def _frame(content, usage):
+        chunk = {"choices": [{"delta": {"content": content}, "finish_reason": None}]}
+        if usage is not None:
+            chunk["usage"] = usage
+        return f"data: {json.dumps(chunk)}\n\n"
+
+    body = (
+        _frame("你", {"prompt_tokens": 10, "completion_tokens": 1})
+        + _frame("好", {"prompt_tokens": 10, "completion_tokens": 2})
+        + _frame(None, {"prompt_tokens": 10, "completion_tokens": 2})  # 纯用量帧
+    )
+
+    async def handler(request):
+        return httpx.Response(200, request=request, text=body,
+                              headers={"content-type": "text/event-stream"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        answer = ""
+        async for kind, delta in pilot_llm.chat_stream(
+            protocol="openai", base_url="https://provider.test/v1",
+            api_key="k", model="m",
+            messages=[{"role": "user", "content": "hi"}], client=client,
+        ):
+            if kind == "answer":
+                answer += delta
+    assert answer == "你好"
 
 
 def test_anonymous_endpoints_send_no_auth_header():
