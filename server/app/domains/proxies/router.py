@@ -279,9 +279,8 @@ async def clash_start(req: ClashStart):
     except Exception as e:  # noqa: BLE001 —— 配置已到手，起不来是内核侧问题
         raise HTTPException(status_code=502, detail=f"内核启动失败: {e}")
 
-    # 流量/节点数落库（启动即顺手回填）；订阅名只补空位——已有名称不覆写
-    if picked.get("title"):
-        await service._apply_subscription_name(sub_id, str(picked["title"]))
+    # 流量/节点数落库（启动即顺手回填）；名称走三档链（用户改名 > 机场名 > 缓存）
+    await service.apply_subscription_name_chain(sub_id, picked.get("title"))
     if picked.get("userinfo"):
         await service.mark_imported(
             sub_id,

@@ -573,38 +573,95 @@ async def _saved_proxy_candidates(limit: int = 3) -> list[str]:
     return out
 
 
-async def _apply_subscription_name(sub_id: int, name: str) -> str | None:
-    """订阅名落库（本地长期保存）：仅在本行尚无名称时写入。
+# ─── 名称三档链（用户改名 > 机场品牌名 > 缓存上次值）────────────
+#
+# 事实源唯一性：`label` 列始终是「当前生效名称」，`last_stats.labelSource`
+# 只记这个名字**从哪来**（user=用户真改过 / panel=机场给的），不另存一份名字。
+# 这样「用户改过」这个事实有唯一记录者，且不需要新增列。
 
-    拉到订阅名（profile-title / Content-Disposition / URL 末段）后调一次，
-    让「只有链接、没有名字」的订阅自动获得可读名称并长期保存在本地库——
-    名字一旦落地就是用户的资产，重拉二十次也不该把「我的机场」换回面板
-    里的 token，故已有名称的行一律不覆写。
-    返回写入后的名称（无名可写 / 订阅不存在时返回 None）。
+LABEL_SOURCE_USER = "user"
+LABEL_SOURCE_PANEL = "panel"
+
+
+def _label_source(sub: ProxySubscription) -> str | None:
+    """本行名字的来源（user / panel / None=还没有名字）。"""
+    stats = sub.last_stats if isinstance(sub.last_stats, dict) else {}
+    source = stats.get("labelSource")
+    return source if source in (LABEL_SOURCE_USER, LABEL_SOURCE_PANEL) else None
+
+
+async def apply_subscription_name_chain(sub_id: int, panel_name: str | None) -> str | None:
+    """按三档链决定订阅名（返回最终生效名称，无可用来源返回 None）。
+
+    优先级（高 → 低）：
+      ① 用户真手改过的名字 —— 永不覆盖（机场改名也不动它）；
+      ② 本次拉到的机场品牌名 —— 用户没改过时用它，且**可随机场改名而更新**；
+      ③ 缓存/库中上次的名字 —— 前两档都拿不到时兜底。
+
+    「机场名可更新」是关键：用户没改过时，机场把自己改名了，界面应跟着变；
+    只有用户亲手动过，这个名字才被锁住。来源标记落 `last_stats.labelSource`，
+    与名字本体同在一条账上，不新增平行记录。
+
+    无标记的历史行（老版本自动取的名）按「名字是否等于机场当前给的值」归位：
+    相等即视为机场名（可更新），不等即视为用户动过（锁死），无需迁移脚本。
     """
-    name = (name or "").strip()[:100]
-    if not name:
-        return None
+    name = (panel_name or "").strip()[:100]
     async with write_session(WritePriority.INTERACTIVE) as session:
         sub = await session.get(ProxySubscription, sub_id)
         if sub is None:
             return None
-        if sub.label:
-            return sub.label
-        sub.label = name
-        await session.commit()
-        return name
+
+        current = sub.label
+        source = _label_source(sub)
+
+        # ① 用户命名：锁死，任何机场名都不许覆盖。判定分两种情形——
+        #    a) 有 user 标记：用户手动改过名（含改成别的再改回来）；
+        #    b) 无任何标记但有名字：老版本自动取的名（旧代码没留来源）或
+        #       添加订阅时用户自己填的。这两种靠名字是否等于「机场当前给的名字」
+        #       区分：相等 → 就是机场给的，不算用户命名（可跟随机场改名更新）；
+        #       不等 → 用户动过，锁死。旧数据因此自动归位，无需迁移脚本。
+        if current and source == LABEL_SOURCE_USER:
+            return current
+        if current and source is None and (not name or name != current):
+            return current
+
+        # ② 本次机场名：用户没改过就用它（含机场自己改名的情况）
+        if name and name != current:
+            sub.label = name
+            stats = dict(sub.last_stats or {})
+            stats["labelSource"] = LABEL_SOURCE_PANEL
+            sub.last_stats = stats
+            await session.commit()
+            return name
+
+        # ②' 名字与本次机场名一致：补上 panel 标记（历史行归位）。
+        # 不补的话这些行永远是「无标记」，下次机场改名时又会被当成用户命名而锁死。
+        if name and name == current and source != LABEL_SOURCE_PANEL:
+            stats = dict(sub.last_stats or {})
+            stats["labelSource"] = LABEL_SOURCE_PANEL
+            sub.last_stats = stats
+            await session.commit()
+        return current
 
 
 async def update_subscription_label(sub_id: int, label: str) -> dict:
-    """订阅手动改名（订阅名不再自动回填——面板 profile-title 覆盖面窄，
-    且回填时机零散；名字由用户自己维护，空串可清名）。"""
-    label = (label or "").strip()
+    """订阅手动改名。
+
+    **只有真正改动才算用户命名**：新旧值相同（打开窗口没碰名字就保存）
+    不打 user 来源标记——否则任何一次「路过保存」都会把机场名永久冻死，
+    此后再不随机场改名而更新。判据是「值变了没有」，不是「保存按了没有」。
+    """
+    label = (label or "").strip()[:100]
     async with write_session(WritePriority.INTERACTIVE) as session:
         sub = await session.get(ProxySubscription, sub_id)
         if sub is None:
             raise ValueError("订阅不存在")
+        changed = label != (sub.label or "")
         sub.label = label or None
+        if changed:
+            stats = dict(sub.last_stats or {})
+            stats["labelSource"] = LABEL_SOURCE_USER if label else None
+            sub.last_stats = stats
         await session.commit()
         return {"id": sub.id, "kind": sub.kind, "url": open_url(sub.url), "label": sub.label}
 
@@ -733,8 +790,8 @@ async def refresh_clash_subscription(sub_id: int, *, auto_switch: bool = False) 
     _mark_refreshed）；缓存回退（全部通道下载失败）不算成功。
 
     通道：**直连优先**，直连失败自动改用项目保存的可用代理（_saved_proxy_candidates）。
-    本行还没有名称时，用本次拉到的订阅名（profile-title 等）回填并本地保存
-    ——见 _apply_subscription_name；已有名称（用户手改或此前自动取过）不覆写。
+    名称走三档链（用户真改过 > 本次机场名 > 缓存上次值），见
+    `apply_subscription_name_chain`——用户没改过时机场改名会跟过来。
     """
     sub = await get_subscription(sub_id)
     if sub is None:
@@ -763,8 +820,25 @@ async def refresh_clash_subscription(sub_id: int, *, auto_switch: bool = False) 
         "nodes": meta.get("nodes"),
         "cached": meta.get("cached", False),
     }
-    if meta.get("userinfo"):
-        fields["traffic"] = meta["userinfo"]
+    # 流量独立取值：本次头 > 上次账本（与名称链无关，降级时补拉一次拿最新）
+    traffic = meta.get("userinfo")
+    if not traffic and meta.get("cached"):
+        try:
+            fresh = await clash_manager.runtime.fetch_subscription_headers(
+                sub_url, proxy_url=await _saved_proxy_candidates()
+            )
+            if fresh and fresh.get("userinfo"):
+                traffic = fresh["userinfo"]
+        except Exception:  # noqa: BLE001 —— 补拉失败不阻塞本次刷新
+            log_event(
+                logger,
+                "订阅流量头补拉失败，沿用上次已记录的流量值",
+                level=logging.WARNING,
+                detail={"订阅编号": sub_id},
+            )
+    traffic = await _resolve_traffic(sub_id, traffic)
+    if traffic:
+        fields["traffic"] = traffic
 
     # 账本收敛：以新下载内容为准，已下线/改名节点的旧行删除
     current_names = set(clash_manager.parse_node_names(
@@ -791,9 +865,10 @@ async def refresh_clash_subscription(sub_id: int, *, auto_switch: bool = False) 
         fields["total"] = total
     await _merge_last_stats(sub_id, **fields)
 
-    # 自动取名（本地保存）：本行还没有名字时才写，手改过的名字不被覆盖
-    if not label and meta.get("title"):
-        label = await _apply_subscription_name(sub_id, str(meta["title"])) or label
+    # 名称三档链（用户改名 > 本次机场名 > 缓存上次值）：无条件走一次，
+    # 由链自己按来源决定用哪个——用户没改过时机场改名要能更新过来，
+    # 只有用户亲手动过的名字才锁死。降级时 title 来自响应头 sidecar。
+    label = await apply_subscription_name_chain(sub_id, meta.get("title")) or label
 
     # 内核在跑且跑的就是这条订阅：配置变化自动重启生效；跑的是别的订阅
     # 或没在跑 → 只下载不重启（避免共用缓存路径把内核悄悄切到别的订阅）
@@ -1361,18 +1436,34 @@ async def add_subscription(kind: str, url: str, label: str | None = None) -> dic
                 target_path=clash_manager.subscription_config_path(settings.data_dir, sub_id),
             )
             result["nodes"] = meta.get("nodes")
-            result["traffic"] = meta.get("userinfo")
             result["cached"] = meta.get("cached", False)
+            # 降级走缓存时下载响应不带流量头，补一次轻量头拉取同步最新值
+            # （保存订阅的语义包含「拿到当前流量」，失败保留空值不编造）。
+            if not meta.get("userinfo") and meta.get("cached"):
+                try:
+                    fresh = await clash_manager.runtime.fetch_subscription_headers(
+                        url, proxy_url=await _saved_proxy_candidates()
+                    )
+                    if fresh and fresh.get("userinfo"):
+                        meta["userinfo"] = fresh["userinfo"]
+                except Exception:  # noqa: BLE001 —— 补拉失败不影响保存
+                    log_event(
+                        logger,
+                        "订阅保存时流量头补拉失败（订阅仍已保存）",
+                        level=logging.WARNING,
+                        detail={"订阅编号": sub_id},
+                    )
+            # 流量走独立取值链（本次 > 上次账本），保证「保存后流量栏有最新数」
+            traffic = await _resolve_traffic(sub_id, meta.get("userinfo"))
+            result["traffic"] = traffic
             await _merge_last_stats(
                 sub_id, nodes=meta.get("nodes"), traffic=meta.get("userinfo")
             )
-            # 首次自动取名（Verge 链：profile-title → Content-Disposition →
-            # URL 末段）：仅在用户没填 label 时落库，机场名可见但不抢
-            # 手动命名权（_apply_subscription_name 保证已有名称不覆写）。
-            if not label and meta.get("title"):
-                named = await _apply_subscription_name(sub_id, str(meta["title"]))
-                if named:
-                    result["label"] = named
+            # 名称三档链（用户改名 > 本次机场名 > 缓存上次值）：无条件走一次，
+            # 用户没改过时机场改名能更新过来，只有用户亲手动过的名字才锁死。
+            named = await apply_subscription_name_chain(sub_id, meta.get("title"))
+            if named:
+                result["label"] = named
             # 订阅有效（节点数>0）且用户处在默认直连 → 自动切代理优先
             # （导入有效订阅即代理模式）
             if await maybe_autoswitch_on_subscription(meta.get("nodes")):
@@ -2322,47 +2413,72 @@ async def _apply_node_results(
     return alive_count, unique_alive, deprecated
 
 
+async def _resolve_traffic(sub_id: int, fresh: str | None) -> str | None:
+    """流量的取值链（与名称链**完全独立**）：本次拉到的 > 上次存下的。
+
+    流量是「用掉多少」的实时量，只有一个事实源：`last_stats.traffic`。
+    本次拿到新的就用新的；本次没拿到（降级走缓存、面板没发头）就沿用账本
+    里已有的值——绝不因为「这次没抓到」而清空，也绝不让名称用谁的这件事
+    影响流量（用户改了名字，照样认机场给的最新流量）。
+    """
+    value = (fresh or "").strip()
+    if value:
+        return value
+    async with get_session_factory()() as session:
+        sub = await session.get(ProxySubscription, sub_id)
+        if sub is None:
+            return None
+        existing = (sub.last_stats or {}).get("traffic")
+        return str(existing) if existing else None
+
+
 async def _merge_last_stats(sub_id: int, **fields) -> None:
-    """订阅 last_stats 局部合并（不动其他键）——流量/存活回填共用出口。"""
+    """订阅 last_stats 局部合并（不动其他键）——流量/存活回填共用出口。
+
+    `traffic` 是单调增长的实时量：传入 None/空串视为「本次没取到」，
+    保留既有值而不是写空——否则一次失败拉取就会把已记录的流量清掉，
+    界面上出现「流量从 318GB 退回未知」的倒退。
+    """
     async with write_session(WritePriority.BACKGROUND) as session:
         sub = await session.get(ProxySubscription, sub_id)
         if sub is None:
             return
         stats = dict(sub.last_stats or {})
-        stats.update(fields)
+        for key, value in fields.items():
+            if key == "traffic" and not value:
+                continue
+            stats[key] = value
         sub.last_stats = stats
         await session.commit()
 
 
 async def _evaluate_subscription_deprecation(sub_id: int, alive_count: int, total: int) -> bool:
-    """订阅废弃判定：不可用占比 >95% → deprecated（后端不再选用，不删除）。
-
-    恢复达标（不可用 ≤95%）自动解除——废弃是"当前不值得用"的标记，
-    不是死亡判决。total 为 0（空订阅）不判定。
-    """
+    """资源失效或没有可用节点时停用，恢复后自动解除。"""
     if total <= 0:
         return False
-    unusable_ratio = 1 - (alive_count / total)
     async with write_session(WritePriority.BACKGROUND) as session:
         sub = await session.get(ProxySubscription, sub_id)
         if sub is None:
             return False
-        if unusable_ratio > SUBSCRIPTION_DEPRECATE_RATIO:
+        reason = sub.resource_block_reason()
+        if reason is None and alive_count <= 0:
+            reason = f"没有可用节点（可用 0/{total}）"
+        if reason is not None:
             if not sub.deprecated:
                 sub.deprecated = True
                 sub.deprecated_at = _naive(get_beijing_time_obj())
-                sub.deprecated_reason = f"不可用节点占比 {unusable_ratio:.0%}（可用 {alive_count}/{total}）"
+                sub.deprecated_reason = reason
                 await session.commit()
                 log_event(
                     logger,
-                    f"订阅 {sub_id} 已废弃：可用 {alive_count}/{total}（不可用占比 {unusable_ratio:.0%}），后端不再选用",
+                    f"订阅 {sub_id} 暂不可用：{reason}",
                     tag="降级",
                     level=logging.WARNING,
                     detail={
                         "订阅编号": sub_id,
                         "可用节点数": alive_count,
                         "总节点数": total,
-                        "不可用占比": f"{unusable_ratio:.0%}",
+                        "原因": reason,
                     },
                 )
             return True
