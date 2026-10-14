@@ -612,6 +612,12 @@ onMounted(async () => {
 .history-select {
   width: 160px;
 }
+/* HlSelect 内部 .hl-select-wrap 自带 min-width:170px，比宿主（160）宽——
+   wrap 会溢出宿主；收口到宿主宽度，随宿主自适应 */
+.history-select :deep(.hl-select-wrap) {
+  width: 100%;
+  min-width: 0;
+}
 
 .history-controls {
   display: flex;

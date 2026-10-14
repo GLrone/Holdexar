@@ -26,11 +26,45 @@ import HlPilotTrend from '@/components/business/HlPilotTrend.vue'
 const props = defineProps<{
   cards: PilotFacts[]
   busyPid?: string | null
+  /** 悬停操作层（加引用 / 复制）：对话面传 true，纯展示（组件总览）不传 */
+  actions?: boolean
 }>()
 
 const emit = defineEmits<{
   (e: 'proposal', payload: { pid: string; approve: boolean }): void
+  (e: 'quote', text: string): void
+  (e: 'copy', text: string): void
 }>()
+
+/** 卡片可见文字：加引用与复制取同一份（用户看到的即是引用到的） */
+function cardInnerText(target: EventTarget | null): string {
+  const root = (target as HTMLElement | null)?.closest<HTMLElement>('.pcard')
+  if (!root) return ''
+  const parts: string[] = []
+  for (const child of Array.from(root.children)) {
+    if (child.classList.contains('pcard-acts')) continue
+    const text = (child as HTMLElement).innerText || ''
+    if (text.trim()) parts.push(text.trim())
+  }
+  return parts.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+}
+
+/** 卡片形态判定：带图/图表的是图样式卡（只需加引用），纯文字卡再加一枚复制 */
+function markCardShape(e: MouseEvent) {
+  const root = e.currentTarget as HTMLElement
+  const graphic = Boolean(root.querySelector('img, canvas, .pilot-svg-stage, .pilot-trend'))
+  root.classList.toggle('is-textcard', !graphic)
+}
+
+function emitQuote(e: MouseEvent) {
+  const text = cardInnerText(e.currentTarget)
+  if (text) emit('quote', text)
+}
+
+function emitCopy(e: MouseEvent) {
+  const text = cardInnerText(e.currentTarget)
+  if (text) emit('copy', text)
+}
 
 const { t, locale } = useI18n()
 
@@ -313,7 +347,35 @@ function toggleTrend(appid: number) {
       :key="ci"
       class="pcard"
       :class="`pcard--${c.kind}`"
+      @mouseenter="props.actions && markCardShape($event)"
     >
+      <!-- 悬停操作层：右上角挂到对话（加引用）；纯文字卡多一枚复制 -->
+      <div v-if="props.actions" class="pcard-acts">
+        <button
+          type="button"
+          class="pcard-act"
+          :title="t('pilot.card.quote')"
+          :aria-label="t('pilot.card.quote')"
+          @click="emitQuote"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M9 7H5a2 2 0 0 0-2 2v3a2 2 0 0 0 2 2h2v1a3 3 0 0 1-3 3" />
+            <path d="M19 7h-4a2 2 0 0 0-2 2v3a2 2 0 0 0 2 2h2v1a3 3 0 0 1-3 3" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          class="pcard-act pcard-act--copy"
+          :title="t('pilot.card.copy')"
+          :aria-label="t('pilot.card.copy')"
+          @click="emitCopy"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="9" y="9" width="11" height="11" rx="2" />
+            <path d="M15 5H6a2 2 0 0 0-2 2v9" />
+          </svg>
+        </button>
+      </div>
       <!-- 价格卡：Steam 视觉展台（头部海报 + 核心大价 + 基准对比矩阵 + 水位标尺 + 走势图） -->
       <template v-if="c.kind === 'price'">
         <div class="pcard-hero">
@@ -900,6 +962,7 @@ function toggleTrend(appid: number) {
 
 /* 统一基础卡片容器 */
 .pcard {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -913,6 +976,72 @@ function toggleTrend(appid: number) {
   box-sizing: border-box;
   box-shadow: 0 4px 16px var(--surface-inset-sm);
   transition: border-color var(--transition), box-shadow var(--transition);
+}
+
+/* 悬停操作层：钉在右上角，卡片 hover 才显形；不占卡片既有布局 */
+.pcard-acts {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--bg-card);
+  box-shadow: 0 2px 8px var(--surface-inset-sm);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--transition);
+}
+
+.pcard:hover .pcard-acts,
+.pcard:focus-within .pcard-acts {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@media (hover: none) {
+  .pcard-acts {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
+.pcard-act {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition);
+}
+
+.pcard-act svg {
+  width: 14px;
+  height: 14px;
+}
+
+.pcard-act:hover {
+  background: var(--accent-a15);
+  color: var(--accent);
+}
+
+/* 纯文字卡才给复制钮；带图/图表卡只留「加到对话」 */
+.pcard-acts .pcard-act--copy {
+  display: none;
+}
+
+.pcard.is-textcard .pcard-acts .pcard-act--copy {
+  display: inline-flex;
 }
 
 .pcard:hover {

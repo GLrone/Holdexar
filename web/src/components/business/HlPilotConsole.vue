@@ -130,6 +130,8 @@ interface Turn {
   mem?: { tokens: number | null; budget: number | null; archived: number | null; cached: boolean } | null
   /** 本轮随问携带的长文本附件（用户气泡下的附件芯片；点击展开内容） */
   attachments?: PilotAttachmentRef[]
+  /** 本轮随问携带的编号引用（编号 + 正文）；气泡内按编号把标号渲染成胶囊 */
+  quotes?: { n: number; text: string }[]
   /** 长回答是否展开（最新对话结果默认展开，发新对话时自动收敛；随轮持有，可手动切换） */
   expanded?: boolean
   /** 后端下发的本轮追问（结构化 key + args）；缺失时追问走本地卡片推导 */
@@ -170,6 +172,68 @@ function clearQueuedHint() {
   }
   queuedHint.value = null
 }
+
+/* ── 引用：带编号（引用1 / 引用2），编号在句子里标位置 ──
+   内容存在 pendingQuotes，用户在输入框用「引用N」指明这句里各引用对应哪一段；
+   发送时把编号与正文一并交给后端，agent 据编号理解引用在句中的位置。 */
+interface PendingQuote {
+  id: string
+  /** 稳定编号：取最小未占用正整数，删除后不回填重排（句中标号保持有效） */
+  n: number
+  text: string
+  /** 展示标题：过长截断，完整内容留给悬停面板 */
+  title: string
+}
+
+const pendingQuotes = ref<PendingQuote[]>([])
+
+/** 引用在提问正文里的标号：文案走词条（中英各自的形态用户都读得懂），编号用于回取正文 */
+function quoteMarker(n: number): string {
+  return `\u3010${t('pilot.quote.markerPrefix')}${n}\u3011`
+}
+
+/** 两种语言的标号都认：括号内非数字前缀 + 编号，中英界面切换后旧轮仍解析得出 */
+const QUOTE_MARKER_RE = /\u3010[^\u3011\d]*(\d+)\u3011/g
+
+/** 新引用的编号：最小未占用正整数（删掉引用1后新建仍可复用 1，旧标号不受影响） */
+function nextQuoteNo(): number {
+  const used = new Set(pendingQuotes.value.map((q) => q.n))
+  let n = 1
+  while (used.has(n)) n += 1
+  return n
+}
+
+/** 引用展示标题：压平空白后截断（完整正文在悬停面板里） */
+function quoteTitleOf(text: string): string {
+  const flat = text.replace(/\s+/g, ' ').trim()
+  return flat.length > 28 ? `${flat.slice(0, 28)}…` : flat
+}
+
+/** 提问正文按引用标号切片：文本段与引用段交替，渲染层据此把标号换成胶囊 */
+function quoteSegments(q: string): { kind: 'text' | 'quote'; value: string; n?: number }[] {
+  const out: { kind: 'text' | 'quote'; value: string; n?: number }[] = []
+  const text = q || ''
+  let last = 0
+  QUOTE_MARKER_RE.lastIndex = 0
+  for (const m of text.matchAll(QUOTE_MARKER_RE)) {
+    const at = m.index ?? 0
+    if (at > last) out.push({ kind: 'text', value: text.slice(last, at) })
+    out.push({ kind: 'quote', value: m[0], n: Number(m[1]) })
+    last = at + m[0].length
+  }
+  if (last < text.length) out.push({ kind: 'text', value: text.slice(last) })
+  return out
+}
+
+/** 某编号引用的正文（发给后端 / 气泡悬停面板按编号取） */
+function quoteTextOf(turn: { quotes?: { n: number; text: string }[] }, n: number): string {
+  return turn.quotes?.find((q) => q.n === n)?.text ?? ''
+}
+
+/** 本轮编号引用 → 随提问发送的结构（编号 + 正文） */
+function quotePayload(): { n: number; text: string }[] {
+  return pendingQuotes.value.map((q) => ({ n: q.n, text: q.text }))
+}
 /** 流式期步骤展平（过程链的旧口径 prop；阶段记录在场时以 phases 为准） */
 const liveStepsFlat = computed(() => livePhases.value.flatMap((p) => p.steps))
 /* 终答就位渲染：回答层只承接「尚未被工具定性的当前段」正文——tool_start
@@ -191,6 +255,7 @@ function renderAnswerHtml(text: string): string {
     svgPreviewLabel: t('pilot.svgPreview'),
     svgCodeLabel: t('pilot.svgCode'),
     svgCopyLabel: t('pilot.svgCopy'),
+    svgQuoteLabel: t('pilot.svgQuote'),
   })
 }
 
@@ -637,6 +702,7 @@ function startNewChat() {
   sessionId.value = newSessionId()
   saveSessionId(sessionId.value)
   question.value = ''
+  pendingQuotes.value = []
   draftReady = true
   loadQueue()
   referenceSession.value = null
@@ -786,6 +852,7 @@ async function switchSession(sid: string) {
   referenceSession.value = null
   forkedFrom.value = null
   question.value = readDraft(sid)
+  pendingQuotes.value = []
   draftReady = true
   await restoreSession(sid)
 }
@@ -1002,13 +1069,15 @@ async function onProposal(payload: { pid: string; approve: boolean }) {
   }
 }
 
-/** 终答取带 terminal 标记的那一段正文；步数耗尽 / 用户中断的轮次回落最后一段有正文的 */
+/** 终答取带 terminal 标记的那一段正文；步数耗尽 / 用户中断的轮次回落最后一段有正文的。
+ * 纯自述段（"我去查一下"）不是结论，服务端已标注 narration，两端口径一致地跳过 */
 function answerOf(phases: PilotPhase[], fallback: string): string {
   if (!phases.length) return fallback
-  const terminal = phases.find((p) => p.terminal)
+  const usable = phases.filter((p) => p.text && !p.narration)
+  const terminal = usable.find((p) => p.terminal)
   if (terminal?.text) return terminal.text
-  for (let i = phases.length - 1; i >= 0; i--) {
-    if (phases[i].text) return phases[i].text
+  for (let i = usable.length - 1; i >= 0; i--) {
+    if (usable[i].text) return usable[i].text
   }
   return fallback
 }
@@ -1034,6 +1103,7 @@ function buildTurn(q: string, e: PilotAskResponse, livePhaseSnapshot: PilotPhase
       cached: Boolean(e.cached),
     },
     attachments: e.attachments?.length ? e.attachments : undefined,
+    quotes: e.quotes?.length ? e.quotes : undefined,
     followups: e.followups?.length ? e.followups : undefined,
     diagnostic: e.diagnostic ?? undefined,
   }
@@ -1321,7 +1391,7 @@ function onCopyReply(e: MouseEvent) {
 
 /** 会话记录点击委托：处理内嵌 SVG 图卡的预览/源码切换与复制操作 */
 function onTurnsClick(e: MouseEvent) {
-  const target = (e.target as HTMLElement).closest<HTMLElement>('.pilot-svg-tab, .pilot-svg-copy')
+  const target = (e.target as HTMLElement).closest<HTMLElement>('.pilot-svg-tab, .pilot-svg-copy, .pilot-svg-quote')
   if (!target) return
   const card = target.closest<HTMLElement>('.pilot-svg')
   if (!card) return
@@ -1350,6 +1420,13 @@ function onTurnsClick(e: MouseEvent) {
     const codeEl = card.querySelector<HTMLElement>('.pilot-svg-source code')
     const text = codeEl?.textContent ?? ''
     if (text) void onCopyText(text)
+    return
+  }
+  if (action === 'quote') {
+    // 图卡引用取源码：图本身贴不进提问，代码才是可被追问与改写的对象
+    const codeEl = card.querySelector<HTMLElement>('.pilot-svg-source code')
+    const text = (codeEl?.textContent ?? '').trim()
+    if (text) quoteToComposer(text)
     return
   }
 }
@@ -1399,20 +1476,27 @@ const selBarStyle = computed(() => {
 
 const composer = ref<ComponentPublicInstance | null>(null)
 
-/** 引用回填：每行领一个 >，插在光标处（没有光标就接在末尾），之后光标停在引用尾部 */
+/** 取回一颗待发引用：移除并回填到输入框 */
+function removePendingQuote(id: string) {
+  pendingQuotes.value = pendingQuotes.value.filter((q) => q.id !== id)
+}
+
+/** 引用回填：拖选正文收成一颗带编号的引用（「引用N」插到光标处，正文存起来） */
 function quoteToComposer(text: string) {
-  const block = text.trim().split('\n').map((l) => `> ${l}`).join('\n')
+  const body = text.trim()
+  if (!body) return
+  const n = nextQuoteNo()
+  pendingQuotes.value = [...pendingQuotes.value, { id: newSessionId(), n, text: body, title: quoteTitleOf(body) }]
+  // 光标处插入标号：引用在句中的位置由用户自己摆，「引用1 不如 引用2」这种对比才写得出
   const el = composer.value?.$el as HTMLTextAreaElement | undefined
   const cur = question.value
-  const start = el?.selectionStart ?? cur.length
+  const at = el?.selectionStart ?? cur.length
   const end = el?.selectionEnd ?? cur.length
-  const head = cur.slice(0, start)
-  const trail = cur.slice(end)
-  const lead = head && !head.endsWith('\n') ? '\n' : ''
-  question.value = `${head}${lead}${block}\n${trail}`
-  const caret = `${head}${lead}${block}\n`.length
+  const marker = quoteMarker(n)
+  question.value = `${cur.slice(0, at)}${marker}${cur.slice(end)}`
   hideSelQuote()
   window.getSelection()?.removeAllRanges()
+  const caret = at + marker.length
   void nextTick(() => {
     el?.focus()
     el?.setSelectionRange(caret, caret)
@@ -1636,9 +1720,10 @@ function continueStopped(index: number) {
       .filter((s) => s.summary),
   }
   const q = turn.q
+  const resumeQuotes = turn.quotes ? [...turn.quotes] : []
   // 中断轮未落账（账本只在终态写），本地移出后按同一问题重跑——视觉上是接着长出来
   turns.value.splice(index, 1)
-  void ask(q, resume)
+  void ask(q, resume, resumeQuotes.length ? resumeQuotes : undefined)
 }
 
 /* ── 改一句重问：作废该轮及其后各轮，用新提问重跑 ── */
@@ -1750,6 +1835,7 @@ async function retryTurn(index: number) {
   if (!turn || !turn.q) return
   const retryQ = turn.q
   const retryAtts = turn.attachments ? [...turn.attachments] : []
+  const retryQuotes = turn.quotes ? [...turn.quotes] : []
   if (typeof turn.turnIndex === 'number') {
     const out = await pilotApi.rewindSession(sessionId.value, turn.turnIndex)
     if (!out.ok) {
@@ -1762,7 +1848,7 @@ async function retryTurn(index: number) {
     turns.value.splice(index)
   }
   if (retryAtts.length) pendingAttachments.value = retryAtts
-  void ask(retryQ)
+  void ask(retryQ, undefined, retryQuotes.length ? retryQuotes : undefined)
 }
 
 /* ── 长回答折叠：最新对话结果默认展开，发新对话时收敛历史轮次（纯前端，不改账本） ── */
@@ -1800,9 +1886,11 @@ function sessionLabel(item: { title?: string | null; forked_from?: string | null
   return item.forked_from ? t('pilot.session.forkedTitle', { title: base }) : base
 }
 
-async function ask(text?: string, resume?: PilotResumePayload) {
+async function ask(text?: string, resume?: PilotResumePayload, quotes?: { n: number; text: string }[]) {
   const typedQ = (text ?? question.value).trim()
   const sentAtts = pendingAttachments.value
+  // 编号引用：常规输入走待发区；重试/续跑由调用方把该轮的引用原样带回来
+  const sentQuotes = quotes ?? quotePayload()
   // 允许「只挂附件、不写问题」的提交（附件本体已是内容）；提问留空时补一句，
   // 与后端回落用同一句，气泡与账本才不会一边空一边有字
   if (!typedQ && !sentAtts.length) return
@@ -1822,6 +1910,7 @@ async function ask(text?: string, resume?: PilotResumePayload) {
     dropDraft(sessionId.value)
   }
   pendingAttachments.value = []
+  pendingQuotes.value = []
   // 元素引用随本轮发送后即清空（一次性，与附件同语义）
   const sentElRefs = elementRefs.value.length ? [...elementRefs.value] : null
   clearPickedEls()
@@ -1845,6 +1934,7 @@ async function ask(text?: string, resume?: PilotResumePayload) {
     steps: [],
     turnIndex: pendingIndex,
     attachments: sentAtts.length ? sentAtts : undefined,
+    quotes: sentQuotes.length ? sentQuotes : undefined,
   })
   // 本地即时点亮「工作中」（后端登记为准，done 后 loadSessions 归位）
   markRunningLocal(sessionId.value, true)
@@ -1938,7 +2028,8 @@ async function ask(text?: string, resume?: PilotResumePayload) {
         clearQueuedHint()
         done = { answer: '', thinking: null, source: 'none', reason: e.reason ?? 'llm_failed', diagnostic: e.diagnostic, facts: null, cards: [], cached: false }
       }
-    }, referenceSession.value?.sid, abortCtrl.signal, resume, sentAtts.map((a) => a.id), viewContext.value, sentElRefs || undefined)
+    }, referenceSession.value?.sid, abortCtrl.signal, resume, sentAtts.map((a) => a.id), viewContext.value, sentElRefs || undefined,
+       sentQuotes.length ? sentQuotes : undefined)
   } catch (err) {
     if (abortCtrl.signal.aborted) {
       stopped = true
@@ -1961,6 +2052,8 @@ async function ask(text?: string, resume?: PilotResumePayload) {
   const shownQ = done?.q || q
   // 附件芯片：后端终态是权威口径（回传本轮引用），失败/中断轮回落本地已发清单
   const turnAtts = done?.attachments?.length ? done.attachments : sentAtts
+  // 编号引用同理：后端终态是权威口径，失败/中断轮回落本地已发清单
+  const turnQuotes = done?.quotes?.length ? done.quotes : sentQuotes
   if (failed) {
     turn = {
       q: shownQ,
@@ -1968,6 +2061,7 @@ async function ask(text?: string, resume?: PilotResumePayload) {
       reasonKey: failedMsg.includes('HTTP 422') ? 'pilot.reason.too_long' : 'pilot.error',
       steps: snapshotSteps,
       attachments: turnAtts.length ? turnAtts : undefined,
+      quotes: turnQuotes.length ? turnQuotes : undefined,
     } as Turn
   } else if (stopped) {
     // 中断保留已流出的阶段与终答候选，历史轮仍可展开过程；已即时下发的卡片一并保留
@@ -1984,12 +2078,14 @@ async function ask(text?: string, resume?: PilotResumePayload) {
       cards: liveRealCards.value.length ? [...liveRealCards.value] : undefined,
       stopped: true,
       attachments: turnAtts.length ? turnAtts : undefined,
+      quotes: turnQuotes.length ? turnQuotes : undefined,
       expanded: true,
     } as Turn
   } else {
     turn = buildTurn(shownQ, done ?? { answer: '', thinking: null, source: 'none', reason: 'llm_failed', facts: null, cards: [], cached: false }, phaseSnapshot)
     turn.expanded = true
     if (!done?.attachments?.length && turnAtts.length) turn.attachments = turnAtts
+    if (!done?.quotes?.length && turnQuotes.length) turn.quotes = turnQuotes
   }
   // 账本序号只在「本轮确实落了账本」时保留（buildTurn 不带序号，需在此补）：
   // 中断 / 失败 / 未受理的轮不占号——它们没进账本，占号会让下一轮序号与账本错位，
@@ -2528,7 +2624,22 @@ function triggerFollowUp(prompt: string) {
               </button>
             </div>
           </div>
-          <p v-else class="pilot-turn__q">{{ turn.q }}</p>
+          <!-- 提问气泡：带编号引用时把正文里的标号就地渲染成胶囊，位置即用户在句中摆的位置 -->
+          <p v-else class="pilot-turn__q">
+            <template v-for="(seg, si) in quoteSegments(turn.q)" :key="si">
+              <span
+                v-if="seg.kind === 'quote'"
+                class="pilot-qchip"
+                :class="{ 'is-missing': !quoteTextOf(turn, seg.n!) }"
+                tabindex="0"
+              >
+                <span class="pilot-qchip__no">{{ seg.n }}</span>
+                <span class="pilot-qchip__title">{{ quoteTextOf(turn, seg.n!) ? quoteTitleOf(quoteTextOf(turn, seg.n!)) : t('pilot.quote.gone') }}</span>
+                <span v-if="quoteTextOf(turn, seg.n!)" class="pilot-qchip__full">{{ quoteTextOf(turn, seg.n!) }}</span>
+              </span>
+              <template v-else>{{ seg.value }}</template>
+            </template>
+          </p>
         </div>
 
         <!-- 发言动作行：挂在气泡下方独立一行（右沿对齐），hover 才显形；
@@ -2636,13 +2747,9 @@ function triggerFollowUp(prompt: string) {
             :elapsed-sec="turn.elapsedSec ?? null"
             :memory="turn.mem ?? null"
             :failed="turn.kind === 'reason'"
+            @quote="quoteToComposer"
+            @copy="onCopyText"
           />
-
-          <details v-if="turn.diagnostic" class="pilot-error-diagnostic">
-            <summary>{{ t('pilot.error.details') }}</summary>
-            <p>{{ turn.diagnostic.message || t('pilot.error.genericDetail') }}</p>
-            <span>{{ t('pilot.error.diagnosticId', { id: turn.diagnostic.id }) }}</span>
-          </details>
 
           <!-- 结果异常/原因气泡：红色条件气泡支持行内直接重试 -->
           <div
@@ -2689,6 +2796,13 @@ function triggerFollowUp(prompt: string) {
             </button>
           </div>
 
+          <!-- 上游原文：挂在原因气泡下方，先读得懂的结论再给可展开的原文 -->
+          <details v-if="turn.diagnostic" class="pilot-error-diagnostic" open>
+            <summary>{{ t('pilot.error.details') }}</summary>
+            <p>{{ turn.diagnostic.message || t('pilot.error.genericDetail') }}</p>
+            <span>{{ t('pilot.error.diagnosticId', { id: turn.diagnostic.id }) }}</span>
+          </details>
+
           <div v-else-if="turn.kind === 'candidates'" class="pilot-briefing">
             <div class="pilot-briefing__title">{{ turn.reasonKey ? t(turn.reasonKey) : '' }}</div>
             <div class="pilot-cands-grid">
@@ -2727,18 +2841,24 @@ function triggerFollowUp(prompt: string) {
             </div>
           </div>
 
-          <HlPilotCards v-else-if="turn.kind === 'action'" :cards="turn.cards ?? []" />
+          <HlPilotCards v-else-if="turn.kind === 'action'" :cards="turn.cards ?? []" actions
+            @quote="quoteToComposer" @copy="onCopyText" />
 
-          <HlPilotCards v-else-if="turn.kind === 'price'" :cards="turn.cards ?? []" />
+          <HlPilotCards v-else-if="turn.kind === 'price'" :cards="turn.cards ?? []" actions
+            @quote="quoteToComposer" @copy="onCopyText" />
 
-          <HlPilotCards v-else-if="turn.kind === 'games'" :cards="turn.cards ?? []" />
+          <HlPilotCards v-else-if="turn.kind === 'games'" :cards="turn.cards ?? []" actions
+            @quote="quoteToComposer" @copy="onCopyText" />
 
           <!-- 批量提议：清单 + 确认/取消，确认后才真正执行 -->
           <div v-else-if="turn.kind === 'proposal'" class="pilot-proposal">
             <HlPilotCards
               :cards="turn.cards ?? []"
               :busy-pid="busyPid"
+              actions
               @proposal="onProposal"
+              @quote="quoteToComposer"
+              @copy="onCopyText"
             />
             <div
               v-if="turn.text"
@@ -2761,7 +2881,10 @@ function triggerFollowUp(prompt: string) {
               v-if="turn.cards?.length"
               :cards="turn.cards"
               :busy-pid="busyPid"
+              actions
               @proposal="onProposal"
+              @quote="quoteToComposer"
+              @copy="onCopyText"
             />
             <div
               v-if="turn.text"
@@ -2877,6 +3000,8 @@ function triggerFollowUp(prompt: string) {
             :live-cards="liveChainCards"
             :busy-pid="busyPid"
             @proposal="onProposal"
+            @quote="quoteToComposer"
+            @copy="onCopyText"
           />
           <!-- 终答就位：文字流式期在链下原位生长，done 时正式卡接手卡区 -->
           <div v-if="liveAnswerHtml" class="pilot-answer" v-html="liveAnswerHtml"></div>
@@ -2987,9 +3112,9 @@ function triggerFollowUp(prompt: string) {
     </div>
 
     <div class="pilot-composer">
-      <!-- 引用区：一次性上下文（当前对象 / 跨会话引用 / 待发附件 / 页面元素），顶置在输入文本上方，多枚自动换行 -->
+      <!-- 引用区：一次性上下文（当前对象 / 跨会话引用 / 待发引用 / 待发附件 / 页面元素），顶置在输入文本上方，多枚自动换行 -->
       <div
-        v-if="game || referenceSession || pendingAttachments.length || attachBusy || pickedElements.length"
+        v-if="game || referenceSession || pendingQuotes.length || pendingAttachments.length || attachBusy || pickedElements.length"
         class="pilot-composer__refs"
       >
         <!-- 当前对象上下文：随页面而来，不可移除 -->
@@ -3017,6 +3142,27 @@ function triggerFollowUp(prompt: string) {
               <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
             </svg>
           </button>
+        </span>
+        <!-- 待发引用：拖选后落成带编号的胶囊；编号由用户在正文里摆位置，这里显示同一编号 -->
+        <span
+          v-for="quote in pendingQuotes"
+          :key="quote.id"
+          class="pilot-ref pilot-ref--quote"
+          tabindex="0"
+        >
+          <span class="pilot-ref__no">{{ quote.n }}</span>
+          <span class="pilot-ref__label">{{ quote.title }}</span>
+          <button
+            type="button"
+            class="pilot-ref__x"
+            :aria-label="t('pilot.ref.remove')"
+            @click.stop="removePendingQuote(quote.id)"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">
+              <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
+            </svg>
+          </button>
+          <span class="pilot-ref__quote-full">{{ quote.text }}</span>
         </span>
         <!-- 待发附件：同类收拢为一颗胶囊，悬停/点击弹清单（面板内单条删除，胶囊 ✕ 全清） -->
         <div
@@ -4672,6 +4818,126 @@ function triggerFollowUp(prompt: string) {
   box-shadow: 0 2px 8px var(--surface-inset-sm);
 }
 
+/* 待发引用胶囊的编号徽标：与发出去后的气泡内胶囊同一套编号视觉 */
+.pilot-ref__no {
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent-a20);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+/* 待发引用胶囊：只露一行标题，完整引用悬停/聚焦才浮出 */
+.pilot-ref--quote {
+  position: relative;
+  cursor: default;
+  outline: none;
+}
+
+.pilot-ref__quote-full {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  z-index: 7;
+  display: none;
+  max-width: min(420px, 78vw);
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  box-shadow: var(--shadow-lg);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  text-align: left;
+}
+
+.pilot-ref--quote:hover .pilot-ref__quote-full,
+.pilot-ref--quote:focus-visible .pilot-ref__quote-full {
+  display: block;
+}
+
+/* ── 发出去的提问气泡内：编号引用就地渲染成胶囊（位置即用户在句中摆的位置）── */
+.pilot-qchip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  margin: 0 2px;
+  padding: 1px 7px 1px 3px;
+  border: 1px solid var(--accent-a30);
+  border-radius: 999px;
+  background: var(--surface-panel);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 16px;
+  vertical-align: baseline;
+  cursor: default;
+  outline: none;
+}
+
+.pilot-qchip.is-missing {
+  border-style: dashed;
+  color: var(--text-muted);
+}
+
+.pilot-qchip__no {
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent-a20);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.pilot-qchip__title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 180px;
+}
+
+/* 完整引用：只在悬停/聚焦时浮出，默认不占位 */
+.pilot-qchip__full {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 6px);
+  z-index: 8;
+  display: none;
+  width: max-content;
+  max-width: min(420px, 78vw);
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  box-shadow: var(--shadow-lg);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  text-align: left;
+}
+
+.pilot-qchip:hover .pilot-qchip__full,
+.pilot-qchip:focus-visible .pilot-qchip__full {
+  display: block;
+}
+
 /* ── 附件：引用芯片 + 展开的内容面板（长文本不进消息体，按需取块） ── */
 .pilot-atts {
   display: flex;
@@ -5389,6 +5655,7 @@ function triggerFollowUp(prompt: string) {
   font-weight: 600;
 }
 
+.pilot-answer :deep(.pilot-svg-quote),
 .pilot-answer :deep(.pilot-svg-copy) {
   display: inline-flex;
   align-items: center;
@@ -5404,13 +5671,15 @@ function triggerFollowUp(prompt: string) {
   transition: all calc(var(--duration-1) * var(--motion-scale)) ease;
 }
 
+.pilot-answer :deep(.pilot-svg-quote svg),
 .pilot-answer :deep(.pilot-svg-copy svg) {
   width: 13px;
   height: 13px;
 }
 
+.pilot-answer :deep(.pilot-svg-quote:hover),
 .pilot-answer :deep(.pilot-svg-copy:hover) {
-  color: var(--text-primary);
+  color: var(--accent);
   background: var(--bg-card);
 }
 
@@ -5800,6 +6069,9 @@ function triggerFollowUp(prompt: string) {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  /* 按钮默认按内容收缩：不写 100% 时只有文字那一段可点，行内空白区点不动 */
+  width: 100%;
+  box-sizing: border-box;
   min-height: 32px;
   padding: 6px 10px;
   border: none;

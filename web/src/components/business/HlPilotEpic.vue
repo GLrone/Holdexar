@@ -174,7 +174,7 @@ const sortedOffers = computed(() => {
           <div class="pepic-card__footer">
             <div class="pepic-card__action">
               <span v-if="card.mobile.worth" class="pepic-card__orig">{{ card.mobile.worth }}</span>
-              <span class="pepic-card__claim">{{ t('epicFree.claim') }} ↗</span>
+              <span class="pepic-card__claim">{{ card.mobile.direct === false ? t('epicFree.mobileInApp') : t('epicFree.claim') }} ↗</span>
             </div>
           </div>
         </div>

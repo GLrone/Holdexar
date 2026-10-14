@@ -1,10 +1,10 @@
 <script setup lang="ts">
 /**
  * 思考链折叠行。
- * 三态：流式展开 =「正在思考 · 秒表计时 + 吸底跟随」（默认展开，用户可手收为
- * 「正在思考 · 最新一行滚动摘要」扫光态）；完成 =「思考 · 用时 N 秒」。
- * 初始开合由 initialOpen 定（历史过程链内传 false），用户手动收合过则不再被自动展开；
- * active 转 false（该阶段已让位给后续阶段）时自动收起，保证同时只展开一个思考块。
+ * 三态：默认收起——流式为「正在思考 · 最新一行滚动摘要」扫光态，完成为「思考 · 用时 N 秒」，
+ * 点开才看正文；收起态只占一行，长思考不再一上来就顶掉正答的位置。
+ * 初始开合由 initialOpen 定（流式当前阶段传 true，思考过程直接可见）；
+ * 用户手动收合过则不再被自动展开；active 转 false（该阶段已让位给后续阶段）时自动收起。
  * 展开体纯文本 pre-wrap——长思考逐帧重跑 markdown 解析代价过高，刻意不渲染。
  * 时长优先取外部服务端值（durSec），缺省回退内部秒表/不显示。
  */
@@ -18,14 +18,12 @@ const props = withDefaults(
     live?: boolean
     /** 完成态时长（秒，服务端工时）；缺省回退内部秒表，均无则不显示时长 */
     durSec?: number | null
-    /** 初始开合（历史轮过程链内默认收起，链头一行已是摘要）；默认展开 */
-    initialOpen?: boolean
     /** 首个 delta 前的等待话术（live 且无正文时作为行标签扫光显示） */
     waitingText?: string
     /** 是否为当前阶段（false = 已让位给后续阶段，自动收起；用户手动开过则不介入） */
     active?: boolean
   }>(),
-  { live: false, durSec: null, initialOpen: true, active: true },
+  { live: false, durSec: null, active: true },
 )
 
 const { t } = useI18n()
@@ -59,7 +57,9 @@ watch(
   { immediate: true },
 )
 
-const open = ref(props.initialOpen)
+/* 默认一律收起：思考块只占一行，正文等用户点开才铺开；
+   流式期收起态本身就在滚动摘要 + 扫光，不影响「正在跑」的可感。 */
+const open = ref(false)
 const userTouched = ref(false)
 const liveSec = ref(0)
 let ticker: ReturnType<typeof setInterval> | null = null

@@ -435,6 +435,21 @@ onMounted(load)
   flex-shrink: 0;
 }
 
+/* HlSelect 内部 .hl-select-wrap 自带 min-width:170px，比这三个定宽宿主都宽
+   （时/分/间隔三档）——wrap 会溢出宿主并压到相邻下拉上，造成边缘重叠。
+   收口到宿主宽度，随宿主自适应 */
+.fetch-row__time-part :deep(.hl-select-wrap),
+.fetch-row__days :deep(.hl-select-wrap) {
+  width: 100%;
+  min-width: 0;
+}
+
+/* 其余下拉（价格间隔）同样收口：定宽宿主一律不让 wrap 溢出 */
+.fetch-row__select :deep(.hl-select-wrap) {
+  width: 100%;
+  min-width: 0;
+}
+
 .fetch-row__time-part {
   width: 104px;
   flex-shrink: 0;
