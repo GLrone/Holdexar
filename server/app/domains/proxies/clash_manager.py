@@ -322,6 +322,10 @@ def subscription_auto_name(headers: httpx.Headers, url: str) -> str | None:
     三级全空返回 None（调用方落 null，前端回落显示 URL）。
     兜底若用固定字符串（如 "Remote File"）会造出一个假机场名——
     这里返回 None 保持「无机场名」的诚实语义。
+
+    URL 末段本身是 token 时（全 hex、含哈希特征）也返回 None：那串东西
+    对用户没有任何辨识度，比「无名称」（前端回落显示完整 URL，可核对）
+    更差——只有主域名路径段那种可读末段才当名字用。
     """
     title = decode_profile_title(headers.get("profile-title"))
     if title:
@@ -345,9 +349,23 @@ def subscription_auto_name(headers: httpx.Headers, url: str) -> str | None:
             decoded = urllib.parse.unquote(last)
         except Exception:  # noqa: BLE001
             decoded = last
-        if decoded:
+        if decoded and not _looks_like_opaque_token(decoded):
             return decoded
     return None
+
+
+def _looks_like_opaque_token(text: str) -> bool:
+    """末段是否是「看不出含义的凭据」（长 hex / 长随机串）。
+
+    判据保守：长度 ≥ 16 且不含分隔词、无空格、非中文——命中即不当名字。
+    """
+    if len(text) < 16:
+        return False
+    if any(ch.isspace() for ch in text):
+        return False
+    if any("\u4e00" <= ch <= "\u9fff" for ch in text):
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9_\-=]+", text))
 
 
 # 机场面板普遍校验 UA：httpx 默认 UA 会被 403，伪装 Clash 系客户端（内核拉取
@@ -368,10 +386,15 @@ def _port_reachable(port: int, host: str = "127.0.0.1", timeout: float = 0.3) ->
         return False
 
 
-# 兜底借道口：用户自启 Clash/Verge 的生态默认混合端口（内核没跑且无池时
-# 的下载/代理兜底探测目标）。与 proxy.clash_port 无关——网络页配置的端口
-# 是程序内核的监听口，不是 Verge 的探测目标。
-LOCAL_MIXED_PORTS: tuple[int, ...] = (7897,)
+# 兜底借道口：生态默认混合端口（内核没跑且无池时的下载/代理兜底探测目标）。
+# 与 proxy.clash_port 无关——网络页配置的端口是程序内核的监听口，不是这里的
+# 探测目标。7890 必须在内：程序自己内核的默认混合口就是它，内核在跑但运行时
+# 端口没被登记（如启动失败过一次、端口漂移）时，它仍是本机唯一可用出口——
+# 漏了它会让「明明有代理可用」的场景退化成直连，面板域名直连不通即全通道失败。
+LOCAL_MIXED_PORTS: tuple[int, ...] = (7890, 7897)
+# 借道口探活后的最小可用性验证：口在听不代表出口能出网
+# （内核起了但没选中节点、节点全挂时端口照样 listen）。
+_LOCAL_CHANNEL_PROBE_URL = "https://www.gstatic.com/generate_204"
 
 
 def local_mixed_channels(exclude_port: int | None = None) -> list[str]:
@@ -385,6 +408,25 @@ def local_mixed_channels(exclude_port: int | None = None) -> list[str]:
         for port in LOCAL_MIXED_PORTS
         if port != exclude_port and _port_reachable(port)
     ]
+
+
+def local_channel_egress_ok(proxy_url: str | None, timeout: float = 8.0) -> bool:
+    """借道口是否真能出网（端口在听 ≠ 出口可用）。
+
+    内核在跑但没选中可用节点时端口照样 listen，此时经它发请求必然失败；
+    把它排进通道链只会让每次刷新白等一轮超时。直连（proxy_url=None）恒真
+    ——直连不经过借道口，无需探活。
+    """
+    if not proxy_url:
+        return True
+    try:
+        resp = httpx.get(
+            _LOCAL_CHANNEL_PROBE_URL, proxy=proxy_url, timeout=timeout,
+            trust_env=False, follow_redirects=True,
+        )
+        return resp.status_code < 400
+    except Exception:  # noqa: BLE001 —— 探活失败即视为该口不可用
+        return False
 
 
 def _download_attempts(
@@ -877,8 +919,155 @@ def subscription_config_path(data_dir: Path, sub_id: int) -> Path:
     切换订阅因此只是「本地缓存文件热重载」，不再现场下载——下载只属于
     重拉/首次使用。共享单缓存文件会被任何一次下载覆写，是「切换卡住」
     与「配置互相覆盖」的根源。
+
+    这份文件是**原始订阅正文**：来源证据与离线缓存，不再直接交给内核。
     """
     return kernel_dir(data_dir) / f"clash-sub-{sub_id}.yaml"
+
+
+def materialize_subscription_config(raw_path: Path) -> Path:
+    """原始订阅缓存 → 内核实际加载的运行配置，返回生成文件路径。
+
+    内核加载的必须是项目生成的纯节点配置：地区规则、rule-providers、地区 DNS
+    过滤、系统接管设置都不进运行配置（也因此不消费地理数据）。原始缓存保持
+    原文不动——它是来源证据，且同一份原文总是渲染出同一份运行配置（幂等：
+    重复刷新相同内容不触发重启）。
+
+    入参已是生成文件时原样返回，让「已有生成结果」的调用点（如按端口重启，
+    手里拿的已经是运行配置路径）无需区分来源。
+    """
+    raw_path = Path(raw_path)
+    if raw_path.name.endswith(_RUNTIME_SUFFIX):
+        return raw_path
+    raw_text = raw_path.read_text(encoding="utf-8", errors="ignore")
+    rendered = render_subscription_config(raw_text)
+    out = raw_path.with_name(f"{raw_path.stem}{_RUNTIME_SUFFIX}")
+    tmp = out.with_name(f"{out.name}.tmp")
+    tmp.write_text(rendered, encoding="utf-8")
+    tmp.replace(out)
+    return out
+
+
+def parse_info_node_traffic(config_text: str) -> str | None:
+    """从机场信息占位节点里提取剩余流量（响应头拿不到时的兜底来源）。
+
+    部分机场不发 subscription-userinfo 头，而把用量写进占位节点名
+    （`剩余流量：19.48 GB`；占位节点识别复用 pool 域的 `is_info_placeholder`，
+    不在这里另立一份名称特征表）。返回的字符串形如 `剩余流量：19.48 GB`，
+    与响应头原文同为「给人看的事实」，上层按原文展示即可。
+    """
+    from app.domains.proxypool.models import is_info_placeholder
+
+    try:
+        doc = yaml.safe_load(config_text)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(doc, dict):
+        return None
+    entries = doc.get("proxy-groups")
+    if not isinstance(entries, list):
+        return None
+    for group in entries:
+        if not isinstance(group, dict):
+            continue
+        members = group.get("proxies")
+        if not isinstance(members, list):
+            continue
+        for name in members:
+            text = str(name or "")
+            if "剩余" in text and is_info_placeholder(text):
+                return text.strip()
+    return None
+
+
+def _subscription_id_of(config_path: Path | None) -> int | None:
+    """从按订阅分文件的缓存路径反解订阅 id（`clash-sub-{id}.yaml`）。
+
+    共享单文件路径（`config.yaml`）与任何非法命名返回 None——调用方据此
+    决定是否写元数据 sidecar（没有订阅身份就没有归属对象）。
+    """
+    if config_path is None:
+        return None
+    stem = config_path.stem
+    if not stem.startswith("clash-sub-"):
+        return None
+    try:
+        return int(stem[len("clash-sub-"):])
+    except ValueError:
+        return None
+
+
+def subscription_meta_path(data_dir: Path, sub_id: int) -> Path:
+    """订阅缓存正文的响应头元数据 sidecar（`clash-sub-{id}.meta.json`）。
+
+    面板名与流量头只存在于网络响应里，正文落盘时它们就丢了；降级回读缓存
+    时便无从取值。这份 sidecar 把「上次成功拉取到的响应头」与正文一同持久化，
+    成为标题/流量在离线场景下的**唯一事实源**。
+    """
+    return kernel_dir(data_dir) / f"clash-sub-{sub_id}.meta.json"
+
+
+def read_subscription_meta(data_dir: Path, sub_id: int) -> dict:
+    """读缓存 sidecar（缺失/损坏一律返回空 dict，不抛）。"""
+    import json
+
+    try:
+        raw = subscription_meta_path(data_dir, sub_id).read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def write_subscription_meta(data_dir: Path, sub_id: int, meta: dict) -> None:
+    """写缓存 sidecar（best-effort：写失败不影响正文已落盘的事实）。"""
+    import json
+
+    path = subscription_meta_path(data_dir, sub_id)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        log_event(
+            logger,
+            "订阅缓存元数据写入失败（正文已落盘，不影响本次使用）",
+            level=logging.WARNING,
+            detail={"文件": str(path)},
+        )
+
+
+def remove_subscription_artifacts(data_dir: Path, sub_id: int) -> list[str]:
+    """删除一条订阅的全部本地缓存产物（原文 + 生成配置 + 元数据），返回删掉的文件名。
+
+    删除订阅时**必须**与数据库行、快照目录在同一收尾里调用：只删行不删文件，
+    磁盘上会留下永远无人引用的孤儿（旧订阅的节点内容继续躺在 clash 目录里），
+    既占体积也让「订阅已删除」在文件系统层面不成立。
+    """
+    removed: list[str] = []
+    raw = subscription_config_path(data_dir, sub_id)
+    for path in (
+        raw,
+        raw.with_name(f"{raw.stem}{_RUNTIME_SUFFIX}"),
+        subscription_meta_path(data_dir, sub_id),
+    ):
+        try:
+            path.unlink()
+            removed.append(path.name)
+        except FileNotFoundError:
+            continue
+        except OSError as e:  # noqa: BLE001 —— 回收尽力而为，失败不阻断删除
+            log_event(
+                logger,
+                "订阅缓存文件删除失败（订阅行已删，文件成为孤儿）",
+                level=logging.WARNING,
+                detail={"文件": str(path), "原因": str(e)},
+            )
+    return removed
 
 
 def parse_probe_lanes(config_text: str) -> list[tuple[str, int]]:
@@ -1388,8 +1577,11 @@ class ClashRuntime:
         全部通道失败回退上次成功下载的本地缓存。
         返回 {path, title, userinfo, nodes, cached}；title 取自 profile-title
         响应头（订阅名），userinfo 为 subscription-userinfo 流量头原文。
+        元数据 sidecar 只在 `target_path` 形如 `clash-sub-{id}.yaml`（按订阅
+        分文件）时才写——共享单文件路径下没有可归属的订阅身份。
         """
         path = target_path or kernel_dir(data_dir) / "config.yaml"
+        meta_id = _subscription_id_of(target_path)
         attempts = self._download_attempts(proxy_url)
 
         async def _fetch(proxy: str | None) -> tuple[str, httpx.Response]:
@@ -1439,10 +1631,21 @@ class ClashRuntime:
                     for t in pending:
                         t.cancel()
                     nodes = parse_node_names(text)
-                    path.write_text(strip_tun_section(text), encoding="utf-8")
+                    # 缓存存**原文**：它是来源证据与离线回读的输入，渲染成运行
+                    # 配置是 materialize_subscription_config 的事（tun 剥离等在
+                    # 那一步做），原文保持订阅原样。
+                    path.write_text(text, encoding="utf-8")
                     # 自动取名链：profile-title → Content-Disposition → URL 末段
                     title = subscription_auto_name(resp.headers, sub_url)
                     userinfo = resp.headers.get("subscription-userinfo")
+                    # 响应头随正文一起持久化：标题与流量只存在于网络响应里，
+                    # 不落盘则降级回读缓存时无从取值（下方降级分支消费它）。
+                    if meta_id is not None:
+                        write_subscription_meta(
+                            data_dir, meta_id,
+                            {"title": title, "userinfo": userinfo,
+                             "fetchedAt": int(time.time() * 1000)},
+                        )
                     log_event(
                         logger,
                         f"订阅下载成功：{len(nodes)} 个节点",
@@ -1457,16 +1660,31 @@ class ClashRuntime:
             for t in pending:
                 t.cancel()
         if path.is_file():
+            # 降级回读缓存：标题与流量取自上次成功时的 sidecar，而不是返回
+            # None ——「这次没抓到」不等于「这份订阅没有名字/流量」，把已有
+            # 事实丢掉会让订阅名与流量在每次网络抖动后被清空。
+            cached_meta = (
+                read_subscription_meta(data_dir, meta_id)
+                if meta_id is not None else {}
+            )
             log_event(
                 logger,
                 "订阅全部通道下载失败，回退上次成功的本地缓存",
                 tag="降级",
                 level=logging.WARNING,
-                detail={"缓存文件": str(path)},
+                detail={"缓存文件": str(path), "沿用元数据": bool(cached_meta)},
             )
             cached_text = path.read_text(encoding="utf-8", errors="ignore")
+            # 元数据缺失（该订阅从未成功拉过、或旧版本未落 sidecar）时，退一步
+            # 从缓存正文里的机场信息占位节点取用量——头与占位节点是同一事实的
+            # 两个来源，有一个就够，不必让流量栏空着。
+            fallback_traffic = cached_meta.get("userinfo") or parse_info_node_traffic(
+                cached_text
+            )
             return {
-                "path": str(path), "title": None, "userinfo": None,
+                "path": str(path),
+                "title": cached_meta.get("title"),
+                "userinfo": fallback_traffic,
                 "nodes": len(parse_node_names(cached_text)), "cached": True,
             }
         raise last_err  # type: ignore[misc]

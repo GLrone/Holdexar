@@ -26,6 +26,60 @@ SUB_URL = "https://example.com/sub?token=abc"
 USERINFO = "upload=100; download=300; total=500; expire=2524608000"
 
 
+@pytest.mark.asyncio
+async def test_single_usable_node_keeps_large_subscription_available(db):
+    sid = await _add_sub(db, last_stats={"traffic": USERINFO})
+    assert not await proxies_service._evaluate_subscription_deprecation(sid, 1, 232)
+
+
+@pytest.mark.asyncio
+async def test_expired_subscription_is_unavailable_despite_old_alive_count(db):
+    sid = await _add_sub(db, last_stats={"traffic": "expire=1; total=1000; download=1"})
+    assert await proxies_service._evaluate_subscription_deprecation(sid, 20, 20)
+
+
+def test_subscription_resource_limits_use_saved_facts():
+    expired = ProxySubscription(last_stats={"traffic": "expire=1"})
+    exhausted = ProxySubscription(last_stats={"traffic": "upload=2; download=8; total=10"})
+    unlimited = ProxySubscription(last_stats={"traffic": "upload=2; download=8; total=0; expire="})
+    assert expired.resource_block_reason() == "订阅已到期"
+    assert exhausted.resource_block_reason() == "订阅流量已用尽"
+    assert unlimited.resource_block_reason() is None
+
+
+@pytest.mark.asyncio
+async def test_unprobed_results_preserve_previous_subscription_verdict(db, monkeypatch):
+    sid = await _add_sub(db, last_stats={"alive": 1, "total": 1})
+    result = await proxies_service._apply_node_results(
+        sid, {}, [{"name": "one", "alive": False, "probed": False}],
+        ["one"], datetime.now(),
+    )
+    assert result[0] == 1 and result[2] is False
+    async with db() as session:
+        sub = await session.get(ProxySubscription, sid)
+        assert sub.last_stats["alive"] == 1 and not sub.deprecated
+
+
+@pytest.mark.asyncio
+async def test_subscription_list_marks_expired_resources_unavailable(db):
+    sid = await _add_sub(db, last_stats={"traffic": "expire=1"})
+    rows = await proxies_service.list_subscriptions("clash")
+    row = next(r for r in rows if r["id"] == sid)
+    assert row["deprecated"] and row["deprecatedReason"] == "订阅已到期"
+
+
+@pytest.mark.asyncio
+async def test_mixed_probe_failure_keeps_unprobed_healthy_node_available(db):
+    sid = await _add_sub(db, last_stats={"alive": 1, "total": 2})
+    result = await proxies_service._apply_node_results(
+        sid, {"known": {"status": "ok", "exit_ip": "1.1.1.1"}},
+        [{"name": "known", "alive": False, "probed": False},
+         {"name": "failed", "alive": False, "probed": True, "ms": None}],
+        ["known", "failed"], datetime.now(),
+    )
+    assert result == (1, 1, False)
+
+
 async def _no_proxy() -> None:
     """策略引擎桩：直连（避免测试环境探本地 Clash 端口）。"""
     return None
@@ -274,7 +328,6 @@ async def test_delete_subscription_cascades_pool_ledger(db):
     from app.domains.proxypool import scheduling as pool_scheduling
     from app.domains.proxypool.models import (
         ProxyNode,
-        ProxyNodeSource,
         SubscriptionSnapshot,
     )
 
@@ -286,9 +339,10 @@ async def test_delete_subscription_cascades_pool_ledger(db):
         await session.flush()
         a, b = sub_a.id, sub_b.id
 
-        def _node(node_id: str, runtime_name: str) -> ProxyNode:
+        def _node(node_id: str, runtime_name: str, sub_id: int) -> ProxyNode:
             return ProxyNode(
                 node_id=node_id, fingerprint=node_id, runtime_name=runtime_name,
+                subscription_id=sub_id, original_name=node_id,
                 proxy_type="ss", server="10.0.0.1",
                 normalized_config={"name": node_id, "type": "ss",
                                    "server": "10.0.0.1", "port": 1},
@@ -296,19 +350,10 @@ async def test_delete_subscription_cascades_pool_ledger(db):
             )
 
         session.add_all([
-            _node("only-a", f"{a}|only-a"),
-            _node("shared", f"{a}|shared"),
-            _node("only-b", f"{b}|only-b"),
-        ])
-        session.add_all([
-            ProxyNodeSource(node_id="only-a", subscription_id=a,
-                            original_name="only-a", first_seen=seen, last_seen=seen),
-            ProxyNodeSource(node_id="shared", subscription_id=a,
-                            original_name="shared", first_seen=seen, last_seen=seen),
-            ProxyNodeSource(node_id="shared", subscription_id=b,
-                            original_name="shared", first_seen=seen, last_seen=seen),
-            ProxyNodeSource(node_id="only-b", subscription_id=b,
-                            original_name="only-b", first_seen=seen, last_seen=seen),
+            _node("only-a", f"{a}|only-a", a),
+            _node("shared-a", f"{a}|shared", a),
+            _node("only-b", f"{b}|only-b", b),
+            _node("shared-b", f"{b}|shared", b),
         ])
         session.add(SubscriptionSnapshot(
             subscription_id=a, sha256="sha-a", format="yaml", raw_path="a.bin",
@@ -320,19 +365,19 @@ async def test_delete_subscription_cascades_pool_ledger(db):
 
     async with db() as session:
         sources_a = (await session.scalars(
-            select(ProxyNodeSource).where(ProxyNodeSource.subscription_id == a))).all()
+            select(ProxyNode).where(ProxyNode.subscription_id == a))).all()
         sources_b = (await session.scalars(
-            select(ProxyNodeSource).where(ProxyNodeSource.subscription_id == b))).all()
+            select(ProxyNode).where(ProxyNode.subscription_id == b))).all()
         snaps_a = (await session.scalars(
             select(SubscriptionSnapshot)
             .where(SubscriptionSnapshot.subscription_id == a))).all()
         nodes = {n.node_id: n for n in (await session.scalars(select(ProxyNode))).all()}
-    assert sources_a == [], "已删订阅的来源行必须整体解除"
-    assert {s.node_id for s in sources_b} == {"shared", "only-b"}
+    assert sources_a == [], "已删订阅的节点必须随删清空"
+    assert {s.original_name for s in sources_b} == {"shared-b", "only-b"}
     assert snaps_a == [], "已删订阅的快照行随订阅走"
-    assert "only-a" in nodes and "shared" in nodes, "身份账本保留"
-    assert nodes["only-a"].state == "STALE", "来源全部流失的节点按状态机降级"
-    assert nodes["shared"].state == "ACTIVE", "仍被别的订阅提供的节点不动"
+    assert "only-a" not in nodes and "shared-a" not in nodes, "节点随订阅删除"
+    assert nodes["only-b"].state == "ACTIVE", "别的订阅的节点不动"
+    assert nodes["shared-b"].state == "ACTIVE"
     assert pool_scheduling.rebuild_pending() is True, "合格集变化必须请求重建"
     pool_scheduling.take_rebuild_pending()
 
@@ -784,6 +829,17 @@ _MINI_CONFIG = (
 _MINI_CONFIG_B = _MINI_CONFIG.replace("A节点", "B节点").replace("17890", "17891")
 
 
+def _seed_sub_cache(target_path) -> None:
+    """顶替 download_subscription 时把缓存文件写出来。
+
+    真实下载函数必然落盘（返回值里的 path 就是刚写的文件）；顶替它却不产文件，
+    下游按约定读该路径就会拿到「文件不存在」，属替身失真而非被测逻辑的问题。
+    """
+    path = Path(target_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_MINI_CONFIG, encoding="utf-8")
+
+
 class _FakeResp:
     def __init__(self, status_code, payload=None):
         self.status_code = status_code
@@ -1056,6 +1112,7 @@ async def test_resolve_startable_falls_back_to_other_subscription(db, monkeypatc
     async def fake_download(sub_url, data_dir, proxy_url=None, *, target_path=None):
         if "dead" in sub_url:
             raise RuntimeError("Client error '404 Not Found'")
+        _seed_sub_cache(target_path)
         return {"path": str(target_path), "title": None, "userinfo": None,
                 "nodes": 3, "cached": False}
 
@@ -1069,7 +1126,8 @@ async def test_resolve_startable_falls_back_to_other_subscription(db, monkeypatc
 
     picked = await proxies_service.resolve_startable_clash(tmp_path, requested_id=dead)
     assert picked["subscription"]["id"] == live
-    assert picked["configPath"].endswith(f"clash-sub-{live}.yaml")
+    assert picked["configPath"].endswith(f"clash-sub-{live}.runtime.yaml")
+    assert picked["rawPath"].endswith(f"clash-sub-{live}.yaml")
     assert [a["id"] for a in picked["attempts"]] == [dead]
     assert "404" in picked["attempts"][0]["error"]
 
@@ -1115,6 +1173,7 @@ async def test_resolve_startable_skips_deprecated_and_orders_newest_first(
         called.append(sub_id)
         if called[-1] != newest:
             raise RuntimeError("Client error '404 Not Found'")
+        _seed_sub_cache(target_path)
         return {"path": str(target_path), "title": None, "userinfo": None,
                 "nodes": 3, "cached": False}
 
@@ -1145,6 +1204,7 @@ async def test_resolve_startable_prefers_fresh_over_stale_cache(db, monkeypatch,
     async def fake_download(sub_url, data_dir, proxy_url=None, *, target_path=None):
         sub_id = int(Path(target_path).stem.split("-")[-1])
         called.append(sub_id)
+        _seed_sub_cache(target_path)
         return {
             "path": str(target_path), "title": None, "userinfo": None, "nodes": 3,
             "cached": "stale" in sub_url,
@@ -1173,6 +1233,7 @@ async def test_resolve_startable_uses_cache_only_when_nothing_fresh(
     newest = await _add_labeled_sub(db, label="乙", url="https://example.com/b")
 
     async def fake_download(sub_url, data_dir, proxy_url=None, *, target_path=None):
+        _seed_sub_cache(target_path)
         return {"path": str(target_path), "title": None, "userinfo": None,
                 "nodes": 3, "cached": True}
 
@@ -1201,6 +1262,7 @@ async def test_resolve_startable_honors_remembered_selection(db, monkeypatch, tm
     async def fake_download(sub_url, data_dir, proxy_url=None, *, target_path=None):
         sub_id = int(Path(target_path).stem.split("-")[-1])
         called.append(sub_id)
+        _seed_sub_cache(target_path)
         return {"path": str(target_path), "title": None, "userinfo": None,
                 "nodes": 3, "cached": False}
 
@@ -1264,3 +1326,458 @@ async def test_download_subscription_cache_fallback_when_all_channels_fail(
     empty_dir = tmp_path / "fresh"
     with pytest.raises(httpx.ConnectError):
         await r.download_subscription("https://dead.example/sub", empty_dir)
+
+
+# ─── 缓存元数据随正文落盘 / 降级不丢名称流量 ─────────────────────
+
+
+def test_subscription_id_of_reads_per_subscription_path(tmp_path):
+    """按订阅分文件的路径能反解 id；共享单文件路径与非法名返回 None。"""
+    assert clash_manager._subscription_id_of(
+        clash_manager.subscription_config_path(tmp_path, 7)
+    ) == 7
+    assert clash_manager._subscription_id_of(clash_manager.kernel_dir(tmp_path) / "config.yaml") is None
+    assert clash_manager._subscription_id_of(None) is None
+    assert clash_manager._subscription_id_of(
+        clash_manager.kernel_dir(tmp_path) / "clash-sub-abc.yaml"
+    ) is None
+
+
+def test_subscription_meta_roundtrip_and_corruption(tmp_path):
+    """sidecar 写入后原样读回；缺失与损坏一律给空 dict（不抛）。"""
+    assert clash_manager.read_subscription_meta(tmp_path, 3) == {}
+
+    clash_manager.write_subscription_meta(
+        tmp_path, 3, {"title": "赔钱机场", "userinfo": USERINFO}
+    )
+    got = clash_manager.read_subscription_meta(tmp_path, 3)
+    assert got["title"] == "赔钱机场"
+    assert got["userinfo"] == USERINFO
+
+    clash_manager.subscription_meta_path(tmp_path, 3).write_text("{坏 json", encoding="utf-8")
+    assert clash_manager.read_subscription_meta(tmp_path, 3) == {}
+
+
+@pytest.mark.asyncio
+async def test_cache_fallback_keeps_last_known_title_and_traffic(monkeypatch, tmp_path):
+    """降级回读缓存时必须沿用上次成功拉到的标题与流量。
+
+    回归：此前降级分支写死 title/userinfo 为 None，一次网络抖动就让订阅名与
+    流量在界面上消失（真实案例：订阅 3 三通道全 ConnectError → label 为空、
+    traffic 为 null）。
+    """
+    r = clash_manager.ClashRuntime()
+
+    class _DownClient:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, **kw):
+            raise httpx.ConnectError("all channels down")
+
+    monkeypatch.setattr(clash_manager.httpx, "AsyncClient", _DownClient)
+
+    target = clash_manager.subscription_config_path(tmp_path, 9)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(_MINI_CONFIG, encoding="utf-8")
+    clash_manager.write_subscription_meta(
+        tmp_path, 9, {"title": "赔钱机场", "userinfo": USERINFO}
+    )
+
+    meta = await r.download_subscription(
+        "https://dead.example/sub", tmp_path, target_path=target
+    )
+    assert meta["cached"] is True
+    assert meta["title"] == "赔钱机场"
+    assert meta["userinfo"] == USERINFO
+
+
+@pytest.mark.asyncio
+async def test_successful_download_persists_meta_sidecar(monkeypatch, tmp_path):
+    """成功下载时响应头（标题/流量）随正文一并落 sidecar，供后续降级取用。"""
+    r = clash_manager.ClashRuntime()
+
+    class _OkClient:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, **kw):
+            return httpx.Response(
+                200, text=_MINI_CONFIG,
+                headers={
+                    "profile-title": "base64:" + base64.b64encode("我的机场".encode()).decode(),
+                    "subscription-userinfo": USERINFO,
+                },
+                request=httpx.Request("GET", url),
+            )
+
+    monkeypatch.setattr(clash_manager.httpx, "AsyncClient", _OkClient)
+
+    target = clash_manager.subscription_config_path(tmp_path, 11)
+    meta = await r.download_subscription(
+        "https://ok.example/sub", tmp_path, target_path=target
+    )
+    assert meta["cached"] is False
+    assert meta["title"] == "我的机场"
+
+    saved = clash_manager.read_subscription_meta(tmp_path, 11)
+    assert saved["title"] == "我的机场"
+    assert saved["userinfo"] == USERINFO
+
+
+# ─── 删除订阅回收缓存产物（孤儿文件回归） ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_delete_subscription_removes_cache_files(db):
+    """删订阅必须连缓存正文与 sidecar 一起回收，磁盘不留孤儿。
+
+    只删库行会在 clash 目录留下无人引用的孤儿文件，「已删除」在文件系统层面
+    不成立。
+    """
+    from app.core.config import get_settings
+
+    data_dir = get_settings().data_dir
+    sub_id = await _add_sub(db)
+    target = clash_manager.subscription_config_path(data_dir, sub_id)
+    target.write_text(_MINI_CONFIG, encoding="utf-8")
+    clash_manager.write_subscription_meta(data_dir, sub_id, {"title": "X"})
+    assert target.is_file()
+    assert clash_manager.subscription_meta_path(data_dir, sub_id).is_file()
+
+    assert await proxies_service.delete_subscription(sub_id) is True
+
+    assert not target.exists()
+    assert not clash_manager.subscription_meta_path(data_dir, sub_id).exists()
+
+
+def test_remove_subscription_artifacts_is_idempotent(tmp_path):
+    """回收是幂等的：目标不存在时不抛，返回空清单。"""
+    assert clash_manager.remove_subscription_artifacts(tmp_path, 404) == []
+
+
+# ─── 流量单调性：失败拉取不得清空已记录值 ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_merge_last_stats_never_clears_traffic(db):
+    """traffic 为空视为「本次没取到」，保留既有值——防止界面流量倒退。"""
+    sid = await _add_sub(db, last_stats={"traffic": USERINFO, "nodes": 5})
+
+    await proxies_service._merge_last_stats(sid, traffic=None, nodes=6)
+
+    async with db() as session:
+        row = await session.get(ProxySubscription, sid)
+    assert row.last_stats["traffic"] == USERINFO
+    assert row.last_stats["nodes"] == 6
+
+
+@pytest.mark.asyncio
+async def test_merge_last_stats_overwrites_traffic_with_fresh_value(db):
+    """拿到新流量时按最新值覆盖（实时量，单调增长）。"""
+    sid = await _add_sub(db, last_stats={"traffic": "download=1"})
+
+    await proxies_service._merge_last_stats(sid, traffic="download=999")
+
+    async with db() as session:
+        row = await session.get(ProxySubscription, sid)
+    assert row.last_stats["traffic"] == "download=999"
+
+
+# ─── 借道口可用性判定 ──────────────────────────────────────────
+
+
+def test_local_mixed_ports_include_own_kernel_default():
+    """程序自己内核的默认混合口 7890 必须在借道口清单里。
+
+    清单只认外部生态默认口时，自家内核在跑但运行时端口未登记会退化成直连，
+    面板域名直连不通即全通道失败。
+    """
+    assert 7890 in clash_manager.LOCAL_MIXED_PORTS
+    assert 7897 in clash_manager.LOCAL_MIXED_PORTS
+
+
+def test_local_channel_egress_ok_direct_always_true():
+    """直连（proxy_url=None）不经过借道口，无需探活。"""
+    assert clash_manager.local_channel_egress_ok(None) is True
+
+
+def test_local_channel_egress_ok_false_on_failure(monkeypatch):
+    """借道口探活失败即判定不可用。"""
+
+    def _boom(*a, **kw):
+        raise httpx.ConnectError("no egress")
+
+    monkeypatch.setattr(clash_manager.httpx, "get", _boom)
+    assert clash_manager.local_channel_egress_ok("http://127.0.0.1:7890") is False
+
+
+# ─── 信息占位节点兜底取用量 ─────────────────────────────────────
+
+
+_INFO_NODE_CONFIG = """\
+mixed-port: 7890
+proxies:
+- name: 🇭🇰|香港-中转 01
+  type: ss
+  server: 10.0.0.1
+  port: 1
+proxy-groups:
+- name: 手动选择
+  type: select
+  proxies:
+  - 剩余流量：19.48 GB
+  - 套餐到期：长期有效
+  - 🇭🇰|香港-中转 01
+"""
+
+
+def test_parse_info_node_traffic_reads_remaining_quota():
+    """响应头缺失时从占位节点取剩余流量（与头的同一事实的第二来源）。"""
+    assert clash_manager.parse_info_node_traffic(_INFO_NODE_CONFIG) == "剩余流量：19.48 GB"
+
+
+def test_parse_info_node_traffic_none_when_absent():
+    """没有占位节点 / 内容坏 / 非映射 一律给 None（不抛）。"""
+    assert clash_manager.parse_info_node_traffic(_MINI_CONFIG) is None
+    assert clash_manager.parse_info_node_traffic(":: 坏 yaml ::") is None
+    assert clash_manager.parse_info_node_traffic("- 不是映射") is None
+
+
+# ─── 名称回退：凭据串不当机场名 ─────────────────────────────────
+
+
+def test_auto_name_skips_opaque_url_token():
+    """URL 末段是长 token 时不给名字——对用户没有辨识度，不如回落显示 URL。
+
+    回归：订阅 3 的链接失效后，自动取名把 32 位 token 写成了「机场名」。
+    """
+    headers = httpx.Headers({})
+    assert clash_manager.subscription_auto_name(
+        headers, "https://cdn.example.com/kcyun/8879fd2fc650be890954f0de66b77b6f?nodeType=1"
+    ) is None
+
+
+def test_auto_name_keeps_readable_url_tail():
+    """可读末段（含中文/短名）照常当名字用。"""
+    headers = httpx.Headers({})
+    assert clash_manager.subscription_auto_name(
+        headers, "https://example.com/sub/我的机场"
+    ) == "我的机场"
+    assert clash_manager.subscription_auto_name(
+        headers, "https://example.com/sub/airport.yaml"
+    ) == "airport.yaml"
+
+
+def test_auto_name_prefers_content_disposition_over_url():
+    """有 Content-Disposition 时优先用它，不走 URL 末段。"""
+    headers = httpx.Headers(
+        {"content-disposition": "attachment; filename*=UTF-8''%E8%B5%94%E9%92%B1%E6%9C%BA%E5%9C%BA"}
+    )
+    assert clash_manager.subscription_auto_name(
+        headers, "https://cdn.example.com/kcyun/8879fd2fc650be890954f0de66b77b6f"
+    ) == "赔钱机场"
+
+
+# ─── 名称三档链（用户改名 > 机场品牌名 > 缓存上次值）─────────────
+
+
+@pytest.mark.asyncio
+async def test_name_chain_uses_panel_name_when_user_never_renamed(db):
+    """① 用户没改过：机场品牌名写进来，并标记来源为 panel。"""
+    sid = await _add_sub(db)
+
+    got = await proxies_service.apply_subscription_name_chain(sid, "赔钱机场")
+
+    assert got == "赔钱机场"
+    async with db() as session:
+        row = await session.get(ProxySubscription, sid)
+    assert row.label == "赔钱机场"
+    assert row.last_stats["labelSource"] == proxies_service.LABEL_SOURCE_PANEL
+
+
+@pytest.mark.asyncio
+async def test_name_chain_follows_panel_rename_when_user_never_renamed(db):
+    """② 用户没改过 → 机场自己改名，界面要跟着更新（不是冻死在旧名上）。"""
+    sid = await _add_sub(db)
+    await proxies_service.apply_subscription_name_chain(sid, "赔钱机场")
+
+    got = await proxies_service.apply_subscription_name_chain(sid, "跑路机场")
+
+    assert got == "跑路机场"
+
+
+@pytest.mark.asyncio
+async def test_name_chain_user_rename_wins_over_panel(db):
+    """③ 用户真改过 → 机场改名不许覆盖（第一顺位锁死）。"""
+    sid = await _add_sub(db)
+    await proxies_service.apply_subscription_name_chain(sid, "赔钱机场")
+    await proxies_service.update_subscription_label(sid, "我的主力机场")
+
+    got = await proxies_service.apply_subscription_name_chain(sid, "跑路机场")
+
+    assert got == "我的主力机场"
+    async with db() as session:
+        row = await session.get(ProxySubscription, sid)
+    assert row.label == "我的主力机场"
+    assert row.last_stats["labelSource"] == proxies_service.LABEL_SOURCE_USER
+
+
+@pytest.mark.asyncio
+async def test_saving_unchanged_name_is_not_a_user_rename(db):
+    """④ 「打开窗口没碰名字就保存」不算改——不能锁死机场名。
+
+    回归关键：判据是「值变了没有」，不是「保存按了没有」。此前保存会把
+    输入框原值重写一遍，等于任何一次路过保存都把机场名永久冻死。
+    """
+    sid = await _add_sub(db)
+    await proxies_service.apply_subscription_name_chain(sid, "赔钱机场")
+
+    # 原样保存（值未变）
+    await proxies_service.update_subscription_label(sid, "赔钱机场")
+
+    async with db() as session:
+        row = await session.get(ProxySubscription, sid)
+    assert row.last_stats.get("labelSource") == proxies_service.LABEL_SOURCE_PANEL
+
+    # 因此机场改名仍能更新过来
+    assert await proxies_service.apply_subscription_name_chain(sid, "跑路机场") == "跑路机场"
+
+
+@pytest.mark.asyncio
+async def test_name_chain_falls_back_to_cached_value(db):
+    """⑤ 本次没有机场名（降级且 sidecar 为空）→ 维持库中已有值，不清空。"""
+    sid = await _add_sub(db)
+    await proxies_service.apply_subscription_name_chain(sid, "赔钱机场")
+
+    got = await proxies_service.apply_subscription_name_chain(sid, None)
+
+    assert got == "赔钱机场"
+
+
+@pytest.mark.asyncio
+async def test_name_chain_returns_none_when_no_source(db):
+    """⑥ 三档全无（新订阅、无名字、本次也没拉到）→ None，由前端回落显示 URL。"""
+    sid = await _add_sub(db)
+
+    assert await proxies_service.apply_subscription_name_chain(sid, None) is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_row_without_source_follows_panel_rename(db):
+    """⑦ 历史行（老版本自动取的名、无来源标记）名等于机场名 → 视为机场名可更新。
+
+    老版本自动取的名没有来源标记；一律当用户命名锁死的话，机场改名
+    永远跟不过来——名字等于机场名的历史行按机场名可更新处理。
+    """
+    sid = await _add_sub(db)
+    async with db() as session:
+        row = await session.get(ProxySubscription, sid)
+        row.label = "赔钱机场"  # 老代码自动取的，没留 labelSource
+        await session.commit()
+
+    got = await proxies_service.apply_subscription_name_chain(sid, "赔钱机场")
+
+    # 名字与机场一致 → 补上 panel 标记，此后可随机场改名更新
+    async with db() as session:
+        row = await session.get(ProxySubscription, sid)
+    assert row.last_stats["labelSource"] == proxies_service.LABEL_SOURCE_PANEL
+    assert got == "赔钱机场"
+
+
+@pytest.mark.asyncio
+async def test_legacy_row_with_divergent_name_is_treated_as_user(db):
+    """⑧ 历史行名字与机场给的不一致 → 视为用户动过，锁死不被覆盖。"""
+    sid = await _add_sub(db)
+    async with db() as session:
+        row = await session.get(ProxySubscription, sid)
+        row.label = "我自己起的名字"
+        await session.commit()
+
+    got = await proxies_service.apply_subscription_name_chain(sid, "机场给的名字")
+
+    assert got == "我自己起的名字"
+    async with db() as session:
+        row = await session.get(ProxySubscription, sid)
+    assert row.label == "我自己起的名字"
+
+
+# ─── 流量链独立于名称链 ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_traffic_takes_fresh_value_over_ledger(db):
+    """本次拿到新流量 → 用新的（实时量，always 最新）。"""
+    sid = await _add_sub(db, last_stats={"traffic": "download=1"})
+
+    assert await proxies_service._resolve_traffic(sid, "download=999") == "download=999"
+
+
+@pytest.mark.asyncio
+async def test_traffic_falls_back_to_ledger_when_fetch_fails(db):
+    """本次没拉到 → 沿用账本里已有的流量，绝不清空。"""
+    sid = await _add_sub(db, last_stats={"traffic": "download=888"})
+
+    assert await proxies_service._resolve_traffic(sid, None) == "download=888"
+    assert await proxies_service._resolve_traffic(sid, "") == "download=888"
+
+
+@pytest.mark.asyncio
+async def test_user_rename_does_not_affect_traffic(db):
+    """名称与流量两条链互不干涉：用户改了名字，流量照样认机场给的最新值。"""
+    sid = await _add_sub(db, last_stats={"traffic": "download=1"})
+    await proxies_service.update_subscription_label(sid, "我的主力机场")
+
+    assert await proxies_service._resolve_traffic(sid, "download=555") == "download=555"
+
+    async with db() as session:
+        row = await session.get(ProxySubscription, sid)
+    assert row.label == "我的主力机场"
+    assert row.last_stats["labelSource"] == proxies_service.LABEL_SOURCE_USER
+
+
+@pytest.mark.asyncio
+async def test_cache_fallback_recovers_traffic_from_info_node(monkeypatch, tmp_path):
+    """从未成功拉过的订阅：sidecar 为空，仍能从缓存正文的占位节点取到用量。
+
+    回归：订阅 3 的链接返回 404，缓存里明明写着「剩余流量：19.48 GB」，
+    界面上流量却是空的。
+    """
+    r = clash_manager.ClashRuntime()
+
+    class _DownClient:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, **kw):
+            raise httpx.ConnectError("all channels down")
+
+    monkeypatch.setattr(clash_manager.httpx, "AsyncClient", _DownClient)
+
+    target = clash_manager.subscription_config_path(tmp_path, 13)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(_INFO_NODE_CONFIG, encoding="utf-8")
+
+    meta = await r.download_subscription(
+        "https://dead.example/sub", tmp_path, target_path=target
+    )
+    assert meta["cached"] is True
+    assert meta["userinfo"] == "剩余流量：19.48 GB"
