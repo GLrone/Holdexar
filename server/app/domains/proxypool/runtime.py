@@ -41,6 +41,9 @@ from app.domains.proxies.clash_manager import (
     PROBE_LANE_PREFIX,
     inject_probe_lanes,
 )
+from app.domains.proxies.runtime_config import (
+    BUILTIN_PROXY_NAMES as _BUILTIN_PROXY_NAMES,
+)
 from app.domains.proxypool.exits import MAX_CRAWL_WORKERS, ExitSlot, select_exit_slots
 from app.domains.proxypool.pool import (
     PoolBuildError,
@@ -49,11 +52,10 @@ from app.domains.proxypool.pool import (
     pool_path,
 )
 
-# 内核内置的逻辑节点（不是池里的节点）。仅用于把 /proxies 里的「多出来的键」
-# 解释清楚；它们随内核版本可能变，所以**不**作为硬门禁参与 ok 判定。
-BUILTIN_PROXY_NAMES = frozenset({
-    "DIRECT", "REJECT", "REJECT-DROP", "GLOBAL", "COMPATIBLE", "PASS", "PASS-RULE",
-})
+# 内核内置的逻辑节点（不是池里的节点）：把 /proxies 里「多出来的键」解释清楚，
+# 同时也是 `dialer-proxy` 的合法目标（走直连/拒绝）。唯一事实源在
+# proxies.runtime_config，这里只转发——两份同名单必然漂移。
+BUILTIN_PROXY_NAMES = _BUILTIN_PROXY_NAMES
 
 DEFAULT_WAIT_TIMEOUT = 15.0
 
