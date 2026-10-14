@@ -9,14 +9,14 @@ from datetime import datetime
 
 import pytest
 import yaml
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from app.core.config import get_settings
 from app.core.database import get_engine, get_session_factory, init_db
 from app.domains.proxies.models import ProxySubscription
 from app.domains.proxypool import admission as adm
 from app.domains.proxypool.admission import exit_from_production, promote_to_active
-from app.domains.proxypool.models import ProxyNode, ProxyNodeSource
+from app.domains.proxypool.models import ProxyNode
 from app.domains.proxypool.pool import eligible_runtime_names
 from app.domains.proxypool.subscription import (
     FetchAttempt, FetchResult, build_snapshot, detect_format, persist_snapshot,
@@ -46,24 +46,24 @@ async def _sub(label: str, url: str) -> int:
         return sub.id
 
 
-async def _node(node_id: str, sources: list[int], state: str = "ACTIVE") -> None:
+async def _node(node_id: str, sub_id: int, state: str = "ACTIVE") -> None:
     async with get_session_factory()() as s:
-        s.add(ProxyNode(node_id=node_id, fingerprint=node_id, runtime_name=f"1|{node_id}",
+        s.add(ProxyNode(node_id=node_id, fingerprint=node_id,
+                        runtime_name=f"{sub_id}|{node_id}",
+                        subscription_id=sub_id, original_name=node_id,
                         proxy_type="http", server="10.0.0.1",
                         normalized_config={"name": node_id, "type": "http",
                                            "server": "10.0.0.1", "port": 1},
                         state=state, first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
-        for sid in sources:
-            s.add(ProxyNodeSource(node_id=node_id, subscription_id=sid,
-                                  original_name=node_id, first_seen=NOW, last_seen=NOW))
         await s.commit()
 
 
-async def _source_count(node_id: str) -> int:
+async def _exists(node_id: str) -> bool:
+    """节点行是否还在（订阅退出后应被删除）。"""
     async with get_session_factory()() as s:
-        return int(await s.scalar(
-            select(func.count()).select_from(ProxyNodeSource)
-            .where(ProxyNodeSource.node_id == node_id)) or 0)
+        return bool(await s.scalar(
+            select(func.count()).select_from(ProxyNode)
+            .where(ProxyNode.node_id == node_id)))
 
 
 async def _admission(sub_id: int) -> str:
@@ -75,12 +75,13 @@ async def _admission(sub_id: int) -> str:
 
 @pytest.mark.asyncio
 async def test_other_subscription_exit_leaves_shared_node_untouched(env, monkeypatch):
-    """A、B 提供 X；C 退出（不提供 X）→ X 不受影响。"""
+    """A、B 各有自己的 X 行；C 退出 → 只删 C 的节点，A/B 的不受影响。"""
     await init_db()
     a, b, c = await _sub("A", "https://a.invalid"), await _sub("B", "https://b.invalid"), \
         await _sub("C", "https://c.invalid")
-    await _node("x", [a, b])
-    await _node("y", [c])
+    await _node("xa", a)
+    await _node("xb", b)
+    await _node("y", c)
     rebuilds: list[int] = []
     monkeypatch.setattr(adm, "request_rebuild", lambda: rebuilds.append(1))
 
@@ -89,38 +90,42 @@ async def test_other_subscription_exit_leaves_shared_node_untouched(env, monkeyp
         await s.commit()
 
     assert result.exited is True and result.removed_sources == 1
-    assert await _source_count("x") == 2, "C 退出不得碰 X 的来源"
-    assert await _source_count("y") == 0
+    assert await _exists("xa") is True, "C 退出不得碰 A 的节点"
+    assert await _exists("xb") is True
+    assert await _exists("y") is False, "C 的节点随退出删除"
     async with get_session_factory()() as s:
         eligible = set(await eligible_runtime_names(s))
-    assert "1|x" in eligible and "1|y" not in eligible
+    assert f"{a}|xa" in eligible and f"{b}|xb" in eligible and f"{c}|y" not in eligible
     assert rebuilds == [1], "合格集变化必须触发既有重建链"
 
 
 @pytest.mark.asyncio
 async def test_one_of_two_sources_exits_keeps_node_eligible(env, monkeypatch):
-    """A、B 都提供 X；A 退出 → X 仍有 B 来源，继续合格。"""
+    """A、B 各有自己的 X 行；A 退出 → 只删 A 的节点，B 的继续合格。"""
     await init_db()
     a, b = await _sub("A", "https://a.invalid"), await _sub("B", "https://b.invalid")
-    await _node("x", [a, b])
+    await _node("xa", a)
+    await _node("xb", b)
     monkeypatch.setattr(adm, "request_rebuild", lambda: [])
 
     async with get_session_factory()() as s:
         await exit_from_production(s, subscription_id=a, now=NOW)
         await s.commit()
 
-    assert await _source_count("x") == 1
+    assert await _exists("xa") is False, "A 的节点随退出删除"
     async with get_session_factory()() as s:
         eligible = set(await eligible_runtime_names(s))
-    assert "1|x" in eligible, "仍有来源的共享节点必须继续合格"
+    assert f"{b}|xb" in eligible, "B 的节点必须继续合格"
+    assert f"{a}|xa" not in eligible
 
 
 @pytest.mark.asyncio
-async def test_last_source_exit_shrinks_eligible_and_keeps_identity(env, monkeypatch):
-    """A、B 都退出 → X 来源 0 → 不再合格；ProxyNode 身份保留。"""
+async def test_last_source_exit_shrinks_eligible_and_deletes_nodes(env, monkeypatch):
+    """A、B 都退出 → 各自的节点都删除，合格集清空。"""
     await init_db()
     a, b = await _sub("A", "https://a.invalid"), await _sub("B", "https://b.invalid")
-    await _node("x", [a, b])
+    await _node("xa", a)
+    await _node("xb", b)
     monkeypatch.setattr(adm, "request_rebuild", lambda: [])
 
     async with get_session_factory()() as s:
@@ -130,14 +135,12 @@ async def test_last_source_exit_shrinks_eligible_and_keeps_identity(env, monkeyp
         await exit_from_production(s, subscription_id=b, now=NOW)
         await s.commit()
 
-    assert await _source_count("x") == 0
     async with get_session_factory()() as s:
         eligible = set(await eligible_runtime_names(s))
         still_there = int(await s.scalar(
-            select(func.count()).select_from(ProxyNode)
-            .where(ProxyNode.node_id == "x")) or 0)
-    assert "1|x" not in eligible, "没有来源的节点必须退出池"
-    assert still_there == 1, "身份账本不得删除"
+            select(func.count()).select_from(ProxyNode)) or 0)
+    assert eligible == set(), "订阅都退出后没有节点合格"
+    assert still_there == 0, "节点随订阅退出删除，不留无主台账"
     assert await _admission(a) == "CANDIDATE" and await _admission(b) == "CANDIDATE"
 
 
@@ -145,7 +148,7 @@ async def test_last_source_exit_shrinks_eligible_and_keeps_identity(env, monkeyp
 async def test_exit_is_idempotent(env, monkeypatch):
     await init_db()
     a = await _sub("A", "https://a.invalid")
-    await _node("x", [a])
+    await _node("x", a)
     rebuilds: list[int] = []
     monkeypatch.setattr(adm, "request_rebuild", lambda: rebuilds.append(1))
 
@@ -187,7 +190,7 @@ async def test_repromote_after_exit_restores_sources(env, monkeypatch):
         await s.commit()
     assert await _admission(a) == "CANDIDATE"
     async with get_session_factory()() as s:
-        assert await s.scalar(select(func.count()).select_from(ProxyNodeSource)) == 0
+        assert await s.scalar(select(func.count()).select_from(ProxyNode)) == 0
 
     async with get_session_factory()() as s:
         again = await promote_to_active(s, subscription_id=a, data_dir=env, now=NOW)
@@ -196,26 +199,25 @@ async def test_repromote_after_exit_restores_sources(env, monkeypatch):
     assert await _admission(a) == "ACTIVE"
     async with get_session_factory()() as s:
         assert (await s.scalar(
-            select(func.count()).select_from(ProxyNodeSource)
-            .where(ProxyNodeSource.subscription_id == a))) == 1
+            select(func.count()).select_from(ProxyNode)
+            .where(ProxyNode.subscription_id == a))) == 1
 
 
 @pytest.mark.asyncio
-async def test_last_source_exit_settles_node_state(env, monkeypatch):
-    """最后一个来源退出 → 节点状态按注册表同一条规则结算（ACTIVE→STALE），
-    共享节点不受影响；账目带回降级数。"""
+async def test_last_source_exit_deletes_only_own_nodes(env, monkeypatch):
+    """A 退出 → 只删 A 的节点，B 的节点原样保留。"""
     await init_db()
     a, b = await _sub("A", "https://a.invalid"), await _sub("B", "https://b.invalid")
-    await _node("x", [a], state="ACTIVE")      # 只由 A 提供 → A 退出后来源全失
-    await _node("y", [a, b], state="ACTIVE")   # B 仍在提供 → 状态不动
+    await _node("xa", a, state="ACTIVE")
+    await _node("xb", b, state="ACTIVE")
 
     async with get_session_factory()() as s:
         result = await exit_from_production(s, subscription_id=a, now=NOW)
         await s.commit()
 
-    assert result.exited is True and result.degraded_nodes == 1
+    assert result.exited is True and result.removed_sources == 1
     async with get_session_factory()() as s:
         states = dict((await s.execute(
             select(ProxyNode.node_id, ProxyNode.state))).all())
-    assert states["x"] == "STALE", "来源全部流失的健康节点按状态机降为 STALE，不是永远 ACTIVE"
-    assert states["y"] == "ACTIVE", "仍有来源的节点不得被误降级"
+    assert "xa" not in states, "A 的节点随退出删除"
+    assert states["xb"] == "ACTIVE", "别的订阅的节点不得被误删或降级"

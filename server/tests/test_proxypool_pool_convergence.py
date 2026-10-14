@@ -10,7 +10,7 @@ from datetime import datetime
 
 import pytest
 import yaml
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.core.config import get_settings
 from app.core.database import get_engine, get_session_factory, init_db
@@ -19,7 +19,7 @@ from app.domains.proxypool import admission as adm
 from app.domains.proxypool import bootstrap as bs
 from app.domains.proxypool import scheduling as sched
 from app.domains.proxypool.admission import promote_to_active
-from app.domains.proxypool.models import ProxyNode, ProxyNodeSource
+from app.domains.proxypool.models import ProxyNode
 from app.domains.proxypool.pool import pool_path
 from app.domains.proxypool.subscription import (
     FetchAttempt, FetchResult, build_snapshot, detect_format, persist_snapshot,
@@ -65,8 +65,9 @@ async def _add_node(node_id: str, state: str = "NEW") -> None:
                                            "server": "10.0.0.1", "port": 1},
                         state=state, first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
         # 合格集口径含「至少一个当前来源」
-        s.add(ProxyNodeSource(node_id=node_id, subscription_id=1, original_name=node_id,
-                              first_seen=NOW, last_seen=NOW))
+        await s.execute(update(ProxyNode)
+            .where(ProxyNode.node_id == node_id)
+            .values(subscription_id=1, original_name=node_id))
         await s.commit()
 
 

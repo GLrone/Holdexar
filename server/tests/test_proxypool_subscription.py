@@ -16,7 +16,7 @@ from pathlib import Path
 import httpx
 import pytest
 import yaml
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,8 +27,9 @@ from app.core.database import get_engine, get_session_factory, init_db  # noqa: 
 from app.domains.proxies.kernel_release import MIHOMO_VERSION  # noqa: E402
 from app.domains.proxies.models import ProxySubscription  # noqa: E402
 from app.domains.proxypool.models import (  # noqa: E402
-    ProxyNode, ProxyNodeSource, SubscriptionSnapshot, make_runtime_name,
+    ProxyNode, SubscriptionSnapshot, make_runtime_name,
     node_fingerprint,
+    subscription_tag,
 )
 from app.domains.proxypool.subscription import (  # noqa: E402
     CHANNEL_DIRECT, CHANNEL_KERNEL, CHANNEL_POOL, FORMAT_AGE, FORMAT_BASE64,
@@ -356,8 +357,9 @@ async def test_missing_node_is_removed_candidate_not_delete(tmp_data_dir):
                 proxy_type=str(n.get("type")), state="ACTIVE",
             ))
             # 来源归属进独立表：节点身份与「谁在提供它」分开记
-            s.add(ProxyNodeSource(node_id=fp[:20], subscription_id=1,
-                                  original_name=n["name"]))
+            await s.execute(update(ProxyNode)
+                .where(ProxyNode.node_id == fp[:20])
+                .values(subscription_id=1, original_name=n["name"]))
         await s.commit()
         before = await s.scalar(select(func.count()).select_from(ProxyNode))
         assert before == 2
@@ -682,29 +684,27 @@ def test_rename_is_unchanged_not_updated():
 
 
 @pytest.mark.asyncio
-async def test_same_config_from_two_subscriptions_is_one_node_two_sources(tmp_data_dir):
-    """同一份配置被两个订阅提供 = 一行节点 + 两行来源；A 撤掉不影响 B。"""
+async def test_same_config_from_two_subscriptions_is_two_nodes(tmp_data_dir):
+    """同一份配置被两个订阅提供 = 两行独立节点（节点跟着订阅走）。"""
     await init_db()
     cfg = _node(name="HK", server="hk.example.net")
-    fp = node_fingerprint(cfg)
     async with get_session_factory()() as s:
-        s.add(ProxyNode(node_id=fp[:20], fingerprint=fp, runtime_name="1|HK",
-                        proxy_type="vmess", state="ACTIVE"))
-        s.add(ProxyNodeSource(node_id=fp[:20], subscription_id=1, original_name="HK"))
-        s.add(ProxyNodeSource(node_id=fp[:20], subscription_id=2,
-                              original_name="香港-HK"))
+        for sid in (1, 2):
+            fp = node_fingerprint(cfg, subscription_tag(f"https://sub{sid}.test/sub"))
+            s.add(ProxyNode(node_id=fp[:20], fingerprint=fp, runtime_name=f"{sid}|HK",
+                            subscription_id=sid, original_name="HK",
+                            proxy_type="vmess", state="ACTIVE"))
         await s.commit()
 
     async with get_session_factory()() as s:
-        assert await s.scalar(select(func.count()).select_from(ProxyNode)) == 1
-        assert await s.scalar(select(func.count()).select_from(ProxyNodeSource)) == 2
-        # 订阅 A 不再提供它：只删 A 的来源行，节点行必须还在（B 还在提供）
-        await s.execute(delete(ProxyNodeSource).where(ProxyNodeSource.subscription_id == 1))
+        assert await s.scalar(select(func.count()).select_from(ProxyNode)) == 2
+        # 订阅 1 不再提供它：只影响自己那份归属
+        await s.execute(delete(ProxyNode).where(ProxyNode.subscription_id == 1))
         await s.commit()
         assert await s.scalar(select(func.count()).select_from(ProxyNode)) == 1
         remaining = (await s.execute(
-            select(ProxyNodeSource.subscription_id))).scalars().all()
-    assert remaining == [2], "A 撤掉后节点应只由 B 提供，而不是整体消失"
+            select(ProxyNode.subscription_id))).scalars().all()
+    assert remaining == [2], "订阅1 撤掉只影响自己那份，订阅2 不受牵连"
 
     # 指纹全局唯一：同一份配置不允许登记第二行节点
     async with get_session_factory()() as s:
@@ -716,17 +716,16 @@ async def test_same_config_from_two_subscriptions_is_one_node_two_sources(tmp_da
 
 @pytest.mark.asyncio
 async def test_fresh_db_matches_locked_identity_model(tmp_data_dir):
-    """新库结构 = 锁定的身份模型：节点表只有身份，来源单独成表且指纹真被约束。"""
+    """新库结构 = 锁定的身份模型：节点表自带归属订阅（一对一），来源表已退役。"""
     await init_db()
     async with get_engine().connect() as conn:
         cols = {r[1] for r in (await conn.exec_driver_sql(
             "PRAGMA table_info(proxy_nodes)")).fetchall()}
-        src_cols = {r[1] for r in (await conn.exec_driver_sql(
-            "PRAGMA table_info(proxy_node_sources)")).fetchall()}
+        tables = {r[0] for r in (await conn.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE type='table'")).fetchall()}
     assert "fingerprint" in cols and "runtime_name" in cols
-    assert not {"subscription_id", "original_name"} & cols, "节点表不得再有单列归属"
-    assert {"node_id", "subscription_id", "original_name",
-            "first_seen", "last_seen"} <= src_cols
+    assert {"subscription_id", "original_name"} <= cols, "归属订阅落节点表（一对一）"
+    assert "proxy_node_sources" not in tables, "来源表已退役"
 
     async with get_session_factory()() as s:
         s.add(ProxyNode(node_id="a" * 20, fingerprint="f" * 64,

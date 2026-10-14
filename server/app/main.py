@@ -72,7 +72,7 @@ async def _autostart_clash() -> None:
             if subs:
                 log_event(
                     logger,
-                    "Clash 订阅全部已废弃（不可用节点超过 95%），跳过内核自启",
+                    "Clash 订阅当前全部不可用，等待订阅或节点恢复",
                     tag="跳过",
                     level=logging.WARNING,
                 )
