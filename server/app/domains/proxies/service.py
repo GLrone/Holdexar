@@ -101,7 +101,6 @@ HEALTH_INTERVAL_HOURS = 6  # 体检间隔（本地软件不常驻，跨重启靠
 SUBSCRIPTION_REFRESH_HOURS = 6  # 订阅重拉间隔（与节点体检同拍，跨重启靠 KV 门槛）
 DEAD_MAX_FAILS = 10  # 累计失败 → dead 终态
 REVIVE_PASSES_REQUIRED = 3  # dead 复活需连续 3-of-3 测通过
-SUBSCRIPTION_DEPRECATE_RATIO = 0.95  # 不可用节点占比 >95% → 订阅废弃
 FIRST_CHECK_REUSE_MINUTES = 5  # 启动/切换触发的首检复用窗口：窗口内检测过就沿用账本，不重测
 # 失败冷却递增（分钟）：30min → 1h → 2h → 4h → 8h → 24h 封顶
 _FAIL_COOLDOWN_MINUTES = [30, 60, 120, 240, 480, 1440]
@@ -880,8 +879,13 @@ async def refresh_clash_subscription(sub_id: int, *, auto_switch: bool = False) 
         # stop/start 切断在途探测的 lane 连接，会把节点误记失败写进账本
         async with _clash_test_lock():
             try:
+                # 刷新后重新渲染运行配置：交给内核的始终是生成结果，地区规则
+                # 不会被这次刷新重新带回内核
+                runtime_path = clash_manager.materialize_subscription_config(
+                    Path(meta["path"])
+                )
                 outcome = await clash_manager.runtime.ensure_running(
-                    detect["path"], meta["path"], subscription_url=sub_url,
+                    detect["path"], str(runtime_path), subscription_url=sub_url,
                     mixed_port=await pinned_kernel_port(),
                 )
                 restarted = bool(outcome.get("reloaded") or outcome.get("started"))
@@ -997,6 +1001,12 @@ async def resolve_startable_clash(data_dir: Path, requested_id: int | None = Non
             meta = await clash_manager.runtime.download_subscription(
                 sub["url"], data_dir, proxy_candidates, target_path=cache_path,
             )
+            # 交给内核的是**项目生成的运行配置**，不是机场原文：原文留作来源
+            # 证据与离线缓存（cache_path），渲染失败（如依赖残缺）按本候选不可用
+            # 处理，继续找下一个候选。
+            runtime_path = clash_manager.materialize_subscription_config(
+                Path(meta["path"])
+            )
         except Exception as e:  # noqa: BLE001 —— 单条候选不可用，换下一条
             attempts.append(
                 {"id": sub["id"], "label": sub["label"], "error": _brief_error(e)}
@@ -1015,7 +1025,8 @@ async def resolve_startable_clash(data_dir: Path, requested_id: int | None = Non
             continue
         entry = {
             "subscription": sub,
-            "configPath": meta["path"],
+            "configPath": str(runtime_path),
+            "rawPath": meta["path"],
             "title": meta.get("title"),
             "userinfo": meta.get("userinfo"),
             "nodes": meta.get("nodes"),

@@ -346,9 +346,11 @@ async def clash_switch(req: ClashSwitch):
                 sub["url"], settings.data_dir, await service._saved_proxy_candidates(),
                 target_path=sub_cache,
             )
+        # 交给内核的是项目生成的运行配置（地区规则/接管设置不进内核）
+        runtime_path = clash_manager.materialize_subscription_config(sub_cache)
         async with service._clash_test_lock():
             new_status = await clash_manager.runtime.ensure_running(
-                detect["path"], str(sub_cache), subscription_url=sub["url"],
+                detect["path"], str(runtime_path), subscription_url=sub["url"],
                 mixed_port=await service.pinned_kernel_port(),
             )
     except ValueError as e:
@@ -469,9 +471,10 @@ async def _effectuate_new_subscription(sub_id: int, url: str) -> dict:
         ):
             if not sub_cache.is_file():
                 return extra
+            runtime_path = clash_manager.materialize_subscription_config(sub_cache)
             async with service._clash_test_lock():
                 new_status = await clash_manager.runtime.ensure_running(
-                    detect["path"], str(sub_cache), subscription_url=url,
+                    detect["path"], str(runtime_path), subscription_url=url,
                     mixed_port=await service.pinned_kernel_port(),
                 )
             # 启动成功即「用户最近一次显式选中」，与启动/切换端点同源

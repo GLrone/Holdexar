@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.core.config import get_settings  # noqa: E402
 from app.core.database import get_engine, get_session_factory, init_db  # noqa: E402
@@ -28,7 +28,7 @@ from app.domains.proxies import clash_manager  # noqa: E402
 from app.domains.proxies.clash_manager import ClashRuntime  # noqa: E402
 from app.domains.proxies.kernel_release import kernel_filename  # noqa: E402
 from app.domains.proxypool.models import (  # noqa: E402
-    ProxyNode, ProxyNodeSource, node_fingerprint,
+    ProxyNode, node_fingerprint,
 )
 from app.domains.proxypool.pool import build_pool, pool_path  # noqa: E402
 from app.domains.proxypool.runtime import (  # noqa: E402
@@ -107,10 +107,9 @@ async def _add(state: str, runtime_name: str, *, server: str) -> None:
             first_seen=NOW, last_seen=NOW, last_source_seen=NOW,
         ))
         # 合格集口径含「至少一个当前来源」：直接登记的行也要给一条来源
-        s.add(ProxyNodeSource(
-            node_id=fp, subscription_id=1, original_name=config["name"],
-            first_seen=NOW, last_seen=NOW,
-        ))
+        await s.execute(update(ProxyNode)
+            .where(ProxyNode.node_id == fp)
+            .values(subscription_id=1, original_name=config["name"]))
         await s.commit()
 
 
