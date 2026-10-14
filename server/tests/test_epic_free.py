@@ -176,7 +176,7 @@ def test_parse_mobile_breaker():
     ]}}
     assert parse_mobile_breaker(payload) == {
         "image": "https://cdn/breaker.jpg",
-        "url": "https://store.epicgames.com/en-US/mobile",
+        "url": "https://store.epicgames.com/mobile",
     }
     assert parse_mobile_breaker({"layout": {}}) is None  # 无 breaker
     assert parse_mobile_breaker({}) is None  # 空结构
@@ -236,6 +236,7 @@ async def test_resolve_mobile_freebie(monkeypatch):
                 "?offers=1-ns-live-and-offer&offers=1-ns-live-ios-offer"),
         "end": "2026-09-24",
         "worth": "$19.99",
+        "direct": True,  # 结账直链 = 登录后一键领取
     }
     # 预告与无 namespace 元素不发起探测
     assert ("ns-up", "android") not in probed
@@ -352,7 +353,7 @@ def test_egs_persisted_uses_shared_headers(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_resolve_store_page_url(monkeypatch):
-    """标题 → 商品页 URL：搜索首条 offerId/sandboxId → catalogNs.pageSlug。"""
+    """标题 → 移动商品页 URL：只认 catalogNs 里 pageType=offer 的映射。"""
     from app.crawler import epic_free as ef
 
     async def fake_persisted(op, variables, sha, proxy=None):
@@ -364,7 +365,11 @@ async def test_resolve_store_page_url(monkeypatch):
         assert op == "getCatalogOffer"
         assert variables["offerId"] == "off" * 8
         return {"data": {"Catalog": {"catalogOffer": {
-            "catalogNs": {"mappings": [{"pageSlug": "some-game-android-52b29b"}]},
+            "catalogNs": {"mappings": [
+                # PC 商店页排在前面：无「免费/获取」按钮，不能当领取入口
+                {"pageType": "productHome", "pageSlug": "some-game"},
+                {"pageType": "offer", "pageSlug": "some-game-android-52b29b"},
+            ]},
             "keyImages": [
                 {"type": "Thumbnail", "url": "https://cdn/thumb.jpg"},
                 {"type": "OfferImageWide", "url": "https://cdn/wide.jpg"},
@@ -380,8 +385,35 @@ async def test_resolve_store_page_url(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_resolve_store_page_url_pc_only_no_mobile(monkeypatch):
+    """官方未建移动 offer（mappings 只剩 PC productHome）→ url=None。
+
+    这是当期「能跳转但领不到」的直接成因：拿 PC 商店页充当移动领取入口。
+    """
+    from app.crawler import epic_free as ef
+
+    async def fake_persisted(op, variables, sha, proxy=None):
+        if op == "primarySearchAutocomplete":
+            return {"data": {"Catalog": {"searchStore": {"elements": [
+                {"offerId": "pc", "sandboxId": "sb", "title": "The Big Con"},
+            ]}}}}
+        return {"data": {"Catalog": {"catalogOffer": {
+            "catalogNs": {"mappings": [
+                {"pageType": "productHome", "pageSlug": "the-big-con"},
+            ]},
+            "keyImages": [{"type": "OfferImageWide", "url": "https://cdn/w.jpg"}],
+        }}}}
+
+    monkeypatch.setattr(ef, "_egs_persisted", fake_persisted)
+    # 无移动 offer：url 缺（调用方退官方移动商店页），封面仍可用
+    assert await ef.resolve_store_page_url("The Big Con") == {
+        "url": None, "image": "https://cdn/w.jpg",
+    }
+
+
+@pytest.mark.asyncio
 async def test_resolve_store_page_url_none_paths(monkeypatch):
-    """搜索无命中/缺 slug 返回 None 或缺键（调用方回落 open 链）。"""
+    """搜索无命中/无任何映射 → None（调用方退官方移动商店页）。"""
     from app.crawler import epic_free as ef
 
     async def no_hit(op, variables, sha, proxy=None):
@@ -390,7 +422,7 @@ async def test_resolve_store_page_url_none_paths(monkeypatch):
     monkeypatch.setattr(ef, "_egs_persisted", no_hit)
     assert await ef.resolve_store_page_url("Unknown") is None
 
-    async def no_slug(op, variables, sha, proxy=None):
+    async def no_mapping(op, variables, sha, proxy=None):
         if op == "primarySearchAutocomplete":
             return {"data": {"Catalog": {"searchStore": {"elements": [
                 {"offerId": "x", "sandboxId": "y"},
@@ -399,8 +431,8 @@ async def test_resolve_store_page_url_none_paths(monkeypatch):
             "keyImages": [{"type": "OfferImageWide", "url": "https://cdn/w2.jpg"}],
         }}}}
 
-    monkeypatch.setattr(ef, "_egs_persisted", no_slug)
-    # 无 slug 但有官方封面：仍返回（url 缺由调用方回落 open 链）
+    monkeypatch.setattr(ef, "_egs_persisted", no_mapping)
+    # 无移动 slug 但有官方封面：仍返回（url 缺由调用方退移动商店页）
     assert await ef.resolve_store_page_url("Whatever") == {
         "url": None, "image": "https://cdn/w2.jpg",
     }
@@ -459,6 +491,116 @@ async def test_resolve_mobile_checkout_none(monkeypatch):
 
     monkeypatch.setattr(ef, "_egs_persisted", no_hit)
     assert await ef.resolve_mobile_checkout("Y") is None
+
+
+# ─── GamerPower 发现链入口优先级（fetch_mobile_freebie）────────────────
+
+
+def _gp_payload(title: str) -> list:
+    return [{
+        "title": f"{title} (Mobile) Giveaway", "status": "Active", "type": "Game",
+        "description": f"{title} (Mobile version) is free on the Epic Games Store App.",
+        "image": "https://gp/img.jpg", "open_giveaway_url": "https://gp/open/x",
+        "published_date": "2026-10-08 11:12:47", "end_date": "2026-10-15 23:59:00",
+        "worth": "$5.99",
+    }]
+
+
+class _FakeResp:
+    def __init__(self, payload, status=200):
+        self._payload = payload
+        self.status = status
+        self.url = "https://gp/open/x"
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def json(self, content_type=None):
+        return self._payload
+
+
+class _FakeSession:
+    """只认 GamerPower 一个 URL 的最小会话替身。"""
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def get(self, url, **kw):
+        assert "gamerpower" in url
+        return _FakeResp(self._payload)
+
+
+@pytest.mark.asyncio
+async def test_fetch_mobile_freebie_falls_back_to_mobile_page(monkeypatch):
+    """结账直链与移动商品页都拿不到 → 官方移动商店页 + direct=False。
+
+    用户报「能跳转到移动端商店却拿不到直接选购界面」的回归：此前会把
+    GamerPower 的 open 链（第三方跳转）当入口，落地仍是移动页。
+    """
+    from app.crawler import epic_free as ef
+
+    monkeypatch.setattr(ef, "resolve_mobile_checkout",
+                        lambda *a, **k: _async_none())
+    monkeypatch.setattr(ef, "resolve_store_page_url",
+                        lambda *a, **k: _async_none())
+
+    out = await ef.fetch_mobile_freebie(session=_FakeSession(_gp_payload("The Big Con")))
+    assert out is not None
+    assert out["title"] == "The Big Con"
+    assert out["url"] == "https://store.epicgames.com/mobile"
+    assert out["direct"] is False  # 入口不是一键领取
+    assert out["end"] == "2026-10-15"
+
+
+@pytest.mark.asyncio
+async def test_fetch_mobile_freebie_checkout_wins(monkeypatch):
+    """结账直链可用 → direct=True（登录后一键结算）。"""
+    from app.crawler import epic_free as ef
+
+    monkeypatch.setattr(ef, "resolve_mobile_checkout",
+                        lambda *a, **k: _async_value({
+                            "url": "https://store.epicgames.com/purchase?offers=1-a-b",
+                            "end": "2026-10-15"}))
+    monkeypatch.setattr(ef, "resolve_store_page_url",
+                        lambda *a, **k: _async_value({"url": "https://x/p/y",
+                                                      "image": "https://cdn/k.jpg"}))
+
+    out = await ef.fetch_mobile_freebie(session=_FakeSession(_gp_payload("Cardpocalypse")))
+    assert out["url"] == "https://store.epicgames.com/purchase?offers=1-a-b"
+    assert out["direct"] is True
+    assert out["image"] == "https://cdn/k.jpg"  # 官方封面优先
+
+
+@pytest.mark.asyncio
+async def test_fetch_mobile_freebie_mobile_page_wins_over_open(monkeypatch):
+    """只有移动商品页可用 → 用商品页（带免费按钮），不走第三方 open 链。"""
+    from app.crawler import epic_free as ef
+
+    monkeypatch.setattr(ef, "resolve_mobile_checkout",
+                        lambda *a, **k: _async_none())
+    monkeypatch.setattr(ef, "resolve_store_page_url",
+                        lambda *a, **k: _async_value({"url": None, "image": None}))
+
+    out = await ef.fetch_mobile_freebie(session=_FakeSession(_gp_payload("Bridge")))
+    assert out["url"] == "https://store.epicgames.com/mobile"
+    assert out["direct"] is False
+
+
+def _async_none():
+    async def _inner(*a, **k):
+        return None
+
+    return _inner()
+
+
+def _async_value(value):
+    async def _inner(*a, **k):
+        return value
+
+    return _inner()
 
 
 # ─── 自动链 ────────────────────────────────────────────────────────

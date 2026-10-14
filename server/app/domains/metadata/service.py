@@ -1048,13 +1048,16 @@ async def _fetch_offers_payload() -> dict | None:
     raw_mobile = freebie or await resolve_mobile_freebie(games, proxy)
     if raw_mobile:
         mobile = {**raw_mobile, "source": "epic"}
+        # direct=False = 入口不是一键领取（官方未公开该期移动 offer，
+        # 只能给移动商店页），前端卡片须如实说明去哪领
+        mobile.setdefault("direct", True)
         # 封面优先用游戏自己的官方 keyImage；缺图才落 breaker 营销图兜底
         if not mobile.get("image") and breaker and breaker.get("image"):
             mobile["image"] = breaker["image"]
     elif breaker:
         mobile = {
             "title": None, "image": breaker["image"], "url": breaker["url"],
-            "end": None, "worth": None, "source": "breaker",
+            "end": None, "worth": None, "source": "breaker", "direct": False,
         }
     else:
         mobile = None
