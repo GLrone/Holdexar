@@ -48,6 +48,8 @@ const props = withDefaults(
 
 const emit = defineEmits<{
   proposal: [payload: { pid: string; approve: boolean }]
+  quote: [text: string]
+  copy: [text: string]
 }>()
 
 const { t } = useI18n()
@@ -217,7 +219,6 @@ function stepText(s: PilotStep): string {
           :live="pi === activeIndex"
           :active="pi === activeIndex"
           :dur-sec="pi === activeIndex ? null : phaseSec(p)"
-          :initial-open="pi === activeIndex"
           :waiting-text="waitingText"
         />
         <p v-if="p.truncated" class="pchain__truncated">{{ t('pilot.think.truncated') }}</p>
@@ -256,7 +257,10 @@ function stepText(s: PilotStep): string {
               v-if="entry.card"
               :cards="[entry.card]"
               :busy-pid="busyPid"
+              actions
               @proposal="emit('proposal', $event)"
+              @quote="emit('quote', $event)"
+              @copy="emit('copy', $event)"
             />
             <div v-else class="pchain__card-skel" role="status" aria-busy="true">
               <HlSkeleton variant="title" />

@@ -490,6 +490,9 @@ export interface PilotEpicFacts {
     url: string
     end?: string | null
     worth?: string | null
+    source?: 'epic' | 'breaker'
+    /** false = 入口是移动商店页（App 内领取），非一键结账 */
+    direct?: boolean
   } | null
   fetchedAt?: string | null
   total?: number
@@ -543,6 +546,8 @@ export interface PilotPhase {
   truncated?: boolean
   /** 该步是终答轮（无工具调用）；步数耗尽的轮次无此标记 */
   terminal?: boolean
+  /** 该步正文只是自述（"我去查一下"），不是结论：终答取正文时跳过它 */
+  narration?: boolean
   steps: PilotStep[]
 }
 
@@ -608,6 +613,8 @@ export interface PilotAskResponse {
   archived_through?: number | null
   /** 本轮随问携带的附件引用（用户消息下的附件芯片与历史还原用；无附件时缺省） */
   attachments?: PilotAttachmentRef[]
+  /** 本轮随问携带的编号引用（n + 正文）：气泡按编号把正文里的标号渲染成胶囊 */
+  quotes?: PilotQuoteRef[]
   /** 本轮实际入库的提问（超长正文被服务端转附件时是收窄后的形态）；展示与账本同源 */
   q?: string
   /** 本轮追问建议（缺此字段时前端按卡片类型自行推导） */
@@ -1023,6 +1030,11 @@ export interface PilotElementRef {
   role: string
 }
 
+export interface PilotQuoteRef {
+  n: number
+  text: string
+}
+
 export async function askPilotStream(
   question: string,
   appid: number | undefined,
@@ -1034,6 +1046,7 @@ export async function askPilotStream(
   attachments?: string[],
   viewContext?: PilotViewContext,
   elementRefs?: PilotElementRef[],
+  quotes?: PilotQuoteRef[],
 ): Promise<void> {
   // 首帧看门狗：连接建好后迟迟不来事件（后端排队 / 闸未通过 / 流被中间层缓冲）
   // 时，调用方会一直停在 streaming 态，发送按钮被「停止」顶掉——观感就是点了没
@@ -1055,6 +1068,7 @@ export async function askPilotStream(
       attachments: attachments?.length ? attachments : undefined,
       view_context: viewContext || undefined,
       element_refs: elementRefs?.length ? elementRefs : undefined,
+      quotes: quotes?.length ? quotes : undefined,
     }),
     signal: ctrl.signal,
   })
@@ -3122,7 +3136,7 @@ export interface EpicMobileOffer {
   title: string | null
   /** 立绘（促销元素官方封面或 CMS breaker 图） */
   image: string
-  /** 领取入口：sandbox 探测拼结账直链 / 移动页兜底 */
+  /** 领取入口：结账直链 / 移动商品页 / 官方移动商店页 */
   url: string
   /** 截止日 YYYY-M-D（零填充；breaker 兜底时 null） */
   end: string | null
@@ -3130,6 +3144,9 @@ export interface EpicMobileOffer {
   worth: string | null
   /** 数据来源：epic=官方数据探测真名真链 / breaker=兜底立绘 */
   source: 'epic' | 'breaker'
+  /** false = 入口不是一键领取（官方未公开该期移动 offer，只能去移动商店页
+   *  在 App 内领取）；true = 登录后直达结算或带「免费」按钮的商品页 */
+  direct?: boolean
 }
 
 export interface EpicOffersPayload {

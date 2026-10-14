@@ -1407,9 +1407,11 @@ html:not(.dark) .gd-link-icon.steamdb { filter: invert(1); }
   align-items: center;
 }
 .history-region { width: 160px; }
-.history-region :deep(.hl-select-wrap) { width: 100%; }
 .history-version { width: 190px; }
-.history-version :deep(.hl-select-wrap) { width: 100%; }
+/* HlSelect 内部 .hl-select-wrap 自带 min-width:170px，比地区宿主（160）宽——
+   wrap 会溢出宿主；收口到宿主宽度，随宿主自适应 */
+.history-region :deep(.hl-select-wrap),
+.history-version :deep(.hl-select-wrap) { width: 100%; min-width: 0; }
 .history-ranges { display: flex; gap: 6px; margin-top: 12px; }
 /* `.range-chip`（胶囊 + 常驻强调色）曾在这里——它与 `tabs-shared.css` 的 `.bill-chip`、
    `game-detail` 的同名块是同一造型的三份副本，已统一到 `HlChip.vue` 的
