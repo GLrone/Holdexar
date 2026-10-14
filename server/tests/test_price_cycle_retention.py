@@ -43,6 +43,57 @@ async def _json_count() -> int:
 
 
 @pytest.mark.asyncio
+async def test_retention_keeps_unfinished_debt_until_a_later_stage_completes():
+    from app.domains.crawl import cycle
+
+    cid = await _cycle(days_ago=91)
+    spec = {"scope": "catalog"}
+    await cycle.record_stage(cid, spec, "deferred", "代理通道正在重建")
+    await crawl_retention.prune_price_cycles()
+    assert await cycle.get(cid) is not None
+    assert await cycle.pending_specs() == [spec]
+    latest = await _cycle(days_ago=1)
+    await cycle.record_stage(latest, spec, "done")
+    await crawl_retention.prune_price_cycles()
+    assert await cycle.get(cid) is None
+    assert await cycle.pending_specs() == []
+
+
+@pytest.mark.asyncio
+async def test_retained_cycle_does_not_resurrect_a_completed_sibling_stage():
+    from app.domains.crawl import cycle
+
+    first = await _cycle(days_ago=95)
+    pool, catalog = {"scope": "pool"}, {"scope": "catalog"}
+    await cycle.record_stage(first, pool, "deferred", "代理体检进行中")
+    await cycle.record_stage(first, catalog, "deferred", "代理体检进行中")
+    closed_pool = await _cycle(days_ago=94)
+    await cycle.record_stage(closed_pool, pool, "done")
+    assert await cycle.pending_specs() == [catalog]
+    await crawl_retention.prune_price_cycles()
+    assert await cycle.pending_specs() == [catalog]
+
+
+@pytest.mark.asyncio
+async def test_retention_preserves_fifo_when_completed_stage_later_becomes_deferred():
+    from app.domains.crawl import cycle
+
+    pool, catalog, specials = {"scope": "pool"}, {"scope": "catalog"}, {"scope": "specials"}
+    first = await _cycle(days_ago=95)
+    await cycle.record_stage(first, pool, "deferred", "让路")
+    await cycle.record_stage(first, catalog, "deferred", "让路")
+    second = await _cycle(days_ago=94)
+    await cycle.record_stage(second, pool, "done")
+    third = await _cycle(days_ago=2)
+    await cycle.record_stage(third, specials, "deferred", "让路")
+    fourth = await _cycle(days_ago=1)
+    await cycle.record_stage(fourth, pool, "deferred", "让路")
+    assert await cycle.pending_specs() == [catalog, specials, pool]
+    await crawl_retention.prune_price_cycles()
+    assert await cycle.pending_specs() == [catalog, specials, pool]
+
+
+@pytest.mark.asyncio
 async def test_prune_deletes_old_rows_keeps_window_rows():
     old_id = await _cycle(days_ago=91)
     fresh_id = await _cycle(days_ago=1)

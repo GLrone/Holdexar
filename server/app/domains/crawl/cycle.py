@@ -9,6 +9,7 @@ Cycle 的 repairing 只记欠账不另发起抓取。状态只由本模块 advan
 from __future__ import annotations
 
 import logging
+import json
 from datetime import datetime
 
 from sqlalchemy import DateTime, Float, Index, Integer, String, Text, JSON, select
@@ -19,6 +20,86 @@ from app.core.logging import log_event
 from app.domains.crawl.models import CrawlJob
 
 logger = logging.getLogger(__name__)
+
+
+def _spec_key(spec: dict) -> str:
+    identity = {k: v for k, v in spec.items() if k != "execution"}
+    if identity.get("kind", "scheduled") in ("manual", "scheduled"):
+        identity.pop("kind", None)
+    return json.dumps(identity, sort_keys=True)
+
+
+async def record_stage(cycle_id: int | None, spec: dict, state: str, reason: str | None = None) -> None:
+    if cycle_id is None:
+        return
+    async with write_session(WritePriority.BACKGROUND) as session:
+        row = await session.get(PriceCycle, cycle_id)
+        if row is None:
+            return
+        specs = [dict(s) for s in row.specs_json or []]
+        match = next((s for s in specs if _spec_key(s) == _spec_key(spec)), None)
+        if match is None:
+            match = {k: v for k, v in spec.items() if k != "execution"}
+            specs.append(match)
+        match["execution"] = {"state": state, "reason": reason}
+        row.specs_json = specs
+        await session.commit()
+
+
+async def _stage_history() -> list:
+    async with get_session_factory()() as session:
+        return (await session.execute(
+            select(PriceCycle.id, PriceCycle.specs_json).order_by(PriceCycle.id)
+        )).all()
+
+
+def _pending_stages(rows: list) -> dict[str, tuple[dict, int]]:
+    pending: dict[str, tuple[dict, int]] = {}
+    for cycle_id, specs in rows:
+        for spec in specs or []:
+            state = (spec.get("execution") or {}).get("state")
+            key = _spec_key(spec)
+            if state in ("pending", "deferred"):
+                pending.setdefault(key, ({k: v for k, v in spec.items() if k != "execution"}, cycle_id))
+            elif state in ("done", "empty", "cancelled"):
+                pending.pop(key, None)
+    return pending
+
+
+async def pending_specs() -> list[dict]:
+    return [spec for spec, _cid in _pending_stages(await _stage_history()).values()]
+
+
+async def pending_cycle_ids() -> set[int]:
+    rows = await _stage_history()
+    keep = {cid for _spec, cid in _pending_stages(rows).values()}
+    latest: dict[str, int] = {}
+    cleared: dict[str, int] = {}
+    by_id = dict(rows)
+    for cid, specs in rows:
+        for spec in specs or []:
+            state = (spec.get("execution") or {}).get("state")
+            if state:
+                latest[_spec_key(spec)] = cid
+            if state in ("done", "empty", "cancelled"):
+                cleared[_spec_key(spec)] = cid
+    pending = list(keep)
+    while pending:
+        for spec in by_id[pending.pop()] or []:
+            for cid in (latest.get(_spec_key(spec)), cleared.get(_spec_key(spec))):
+                if cid is not None and cid not in keep:
+                    keep.add(cid)
+                    pending.append(cid)
+    return keep
+
+
+async def prioritize_specs(specs: list[dict]) -> list[dict]:
+    pending = {_spec_key(s): i for i, s in enumerate(await pending_specs())}
+    return sorted(specs, key=lambda s: pending.get(_spec_key(s), len(pending)))
+
+
+def deferred_stages(specs: list[dict] | None) -> list[dict]:
+    return [s for s in specs or [] if (s.get("execution") or {}).get("state") in ("pending", "deferred")]
 
 PLANNING = "planning"
 RUNNING = "running"
@@ -247,7 +328,8 @@ def expected_units(expected: dict | None) -> int:
 
 
 def decide_terminal(
-    job_statuses: list[str], *, expected_units: int, entered_repairing: bool
+    job_statuses: list[str], *, expected_units: int, entered_repairing: bool,
+    deferred: bool = False,
 ) -> str:
     """终态判定：看整轮 job 结果，不是最后一个 job 的状态。
 
@@ -267,7 +349,7 @@ def decide_terminal(
         return FAILED
     if any(s in ("failed", "stopped") for s in job_statuses):
         return PARTIAL
-    return PARTIAL if entered_repairing else COMPLETED
+    return PARTIAL if entered_repairing or deferred else COMPLETED
 
 
 async def jobs_of(cycle_id: int) -> list[dict]:
@@ -326,6 +408,7 @@ def _to_dict(cycle: PriceCycle) -> dict:
         ),
         "finishedAt": cycle.finished_at.isoformat() if cycle.finished_at else None,
         "error": cycle.error,
+        "deferredSpecs": deferred_stages(cycle.specs_json),
         "stats": _stats_of(cycle),
     }
 
