@@ -22,6 +22,7 @@ const epicFree: Partial<Record<MessageKey, string>> = {
   'epicFree.loadFailed': 'Failed to load free games, retrying hourly',
   'epicFree.mobile': 'Mobile',
   'epicFree.mobileCard': 'This week on mobile',
+  'epicFree.mobileInApp': 'Claim in app',
 }
 
 export default epicFree

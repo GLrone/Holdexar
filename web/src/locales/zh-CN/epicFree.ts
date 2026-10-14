@@ -22,6 +22,7 @@ const epicFree = {
   'epicFree.loadFailed': '喜加一获取失败，每小时自动重试',
   'epicFree.mobile': '移动端',
   'epicFree.mobileCard': '本周移动白送',
+  'epicFree.mobileInApp': 'App 内领取',
 } as const
 
 export default epicFree
