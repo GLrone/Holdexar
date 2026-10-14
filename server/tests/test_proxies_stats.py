@@ -17,6 +17,23 @@ from app.domains.proxies.models import ClashNode, Proxy, ProxySubscription
 
 SUB_URL = "https://example.com/sub?token=abc"
 
+
+@pytest.mark.asyncio
+async def test_expired_subscription_old_healthy_nodes_are_not_available(db, monkeypatch):
+    async with db() as session:
+        sub = ProxySubscription(kind="clash", url=SUB_URL, last_stats={"traffic": "expire=1"})
+        session.add(sub)
+        await session.flush()
+        sid = sub.id
+        session.add(ClashNode(subscription_id=sid, name="one", exit_ip="1.1.1.1", status="ok"))
+        await session.commit()
+    monkeypatch.setattr(clash_manager.runtime, "status", lambda: {
+        "running": True, "port": 7890, "configPath": None, "subscriptionUrl": SUB_URL,
+    })
+    stats = await proxies_service.pool_stats()
+    assert stats["clash"]["nodes"] == 1
+    assert stats["clash"]["okNodes"] == 0 and stats["available"] == 0
+
 CONFIG_TEXT = f"""mixed-port: 7890
 proxies:
   - name: 节点A

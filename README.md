@@ -171,7 +171,7 @@ scoop install holdexar
 | 后端 | FastAPI · SQLAlchemy(async) · APScheduler(21 个定时任务) · aiohttp 爬核 |
 | 前端 | Vue 3 · TypeScript · Vite · 自制 Hl\* 组件体系(深浅双主题 / 中英双语) |
 | 桌面 | pywebview(WebView2) · onedir 绿色包 · 单实例锁 |
-| 网络 | 出网策略引擎(proxy_first 默认 / direct_only / direct_first / proxy_only) · 自备 Clash 订阅 · mihomo 内核与 GeoIP 数据随包内置 |
+| 网络 | 出网策略引擎(proxy_first 默认 / direct_only / direct_first / proxy_only) · 自备 Clash 订阅 · mihomo 内核随包内置 |
 | 认证 | 应用内账号密码登录直调 Steam IAuthenticationService;手动 Cookie 粘贴通道保留;凭据 AES-256-GCM 加密落库 |
 
 ### 业务主线
@@ -210,7 +210,7 @@ python run.py --port N   # 指定端口
 
 首次运行会自动补齐公共数据种子(历史汇率与价格历史切片,约 288MB):种子是二进制大文件,不进 git,由 `run.py` 从 Release 资产拉取。没网也不影响启动,只是【汇率】页没有历史档案,之后重跑 `python scripts/fetch_seed.py` 即可。
 
-随包的还有 Clash 内核(mihomo + GeoIP 数据,约 72MB,版本固定):同为二进制不入库,由 `run.py` 调用 `python scripts/fetch_kernel.py` 从上游补齐;获取失败也不阻断启动,【代理】页会显示「内核缺失」并提供一键安装入口。
+随包的还有 Clash 内核(mihomo,版本固定)及其许可与来源说明:二进制不入库,由 `run.py` 调用 `python scripts/fetch_kernel.py` 从上游补齐;获取失败也不阻断启动,【代理】页会显示「内核缺失」并提供一键安装入口。
 
 ## 打包与发布
 

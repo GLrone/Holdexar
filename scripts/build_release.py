@@ -6,7 +6,7 @@
     python scripts/build_release.py --skip-web         # 跳过前端构建（dist 已是最新）
 产物（三件，全部要上传 Release；清单由 scripts/build_manifest.py 生成）：
 - release/Holdexar-win64-v<版本>.zip —— 应用包，解压双击即用。包内**含
-  mihomo 内核与 GeoIP 数据**（assets/clash → _MEIPASS/clash），用户机器不需要
+  mihomo 内核与许可原文**（assets/clash → _MEIPASS/clash），用户机器不需要
   自装 Clash、也不需要首次联网下载内核；缺该资产即中止出包（见
   ensure_clash_assets）。**不含种子**（按需下载落 data/seed，见
   app/core/seed_fetch.py）。**用户数据不在包内、也不落在程序目录**：打包态数据
@@ -61,11 +61,7 @@ TEMPLATE_DB_SRC = SEED_DIR / TEMPLATE_BASENAME
 if str(SERVER) not in sys.path:
     sys.path.insert(0, str(SERVER))
 from app.core.app_info import APP_NAME, APP_VERSION  # noqa: E402
-from app.domains.proxies.kernel_release import (  # noqa: E402
-    GEO_ASSETS,
-    LICENSE_ASSETS,
-    kernel_filename,
-)
+from app.domains.proxies.kernel_release import bundled_asset_names  # noqa: E402
 
 APP_DIR = DIST_DIR / APP_NAME
 
@@ -87,14 +83,9 @@ def refresh_seed() -> None:
 
 
 def ensure_clash_assets() -> None:
-    """随包内核资产校验：mihomo、GeoIP 数据、上游许可原文缺一即中止出包。
-
-    内核随发行包分发（spec datas 的 `clash/`）并指定版本随包即用，
-    所以它是**发布前提**而非可选项。
-    """
+    """随包内核、许可原文与来源说明缺一即中止出包。"""
     CLASH_DIR.mkdir(parents=True, exist_ok=True)
-    # SOURCE.txt 随包资产自带来源/许可说明（GPL 合规：二进制旁要有许可与来源）
-    expected = (kernel_filename(), *GEO_ASSETS, *LICENSE_ASSETS, "README.txt")
+    expected = bundled_asset_names()
     missing = [name for name in expected if not (CLASH_DIR / name).is_file()]
     if missing:
         sys.exit(
@@ -102,8 +93,8 @@ def ensure_clash_assets() -> None:
             "       先跑 python scripts/fetch_kernel.py 备齐 assets/clash/ 再出包；\n"
             "       离线环境可用 --from-dir 从本机现成内核目录复制（版本需自行核对）。"
         )
-    total = sum(p.stat().st_size for p in CLASH_DIR.iterdir() if p.is_file())
-    print(f"[内核] 随包资产齐备：{total / 1048576:.1f} MB（mihomo + GeoIP 数据 + 许可原文）")
+    total = sum((CLASH_DIR / name).stat().st_size for name in expected)
+    print(f"[内核] 随包资产齐备：{total / 1048576:.1f} MB（mihomo + 许可说明）")
 
 
 def build_web() -> None:
