@@ -181,3 +181,19 @@ test('SVG 图块：流式未闭合状态下自动补全闭合标签并渐进式�
   assert.ok(html.includes('<line x1="20" y1="50" x2="80" y2="50" /></g></svg></div>'))
 })
 
+
+test('SVG 图卡：工具栏带「添加到对话」与「复制代码」两个动作钮', () => {
+  const svg = '<svg viewBox="0 0 10 10"><circle cx="5" cy="5" r="4" /></svg>'
+  const html = mdLiteToHtml(svg, { svgQuoteLabel: '添加到对话', svgCopyLabel: '复制代码' })
+  assert.ok(html.includes('data-action="quote"'))
+  assert.ok(html.includes('aria-label="添加到对话"'))
+  assert.ok(html.includes('data-action="copy"'))
+  assert.ok(html.includes('aria-label="复制代码"'))
+})
+
+test('SVG 图卡：缺省文案回落英文，不渲染空标签', () => {
+  const svg = '<svg viewBox="0 0 10 10"><rect width="5" height="5" /></svg>'
+  const html = mdLiteToHtml(svg)
+  assert.ok(html.includes('data-action="quote"'))
+  assert.ok(html.includes('aria-label="Quote"'))
+})

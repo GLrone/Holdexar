@@ -229,6 +229,8 @@ export interface MdLiteOpts {
   svgPreviewLabel?: string
   svgCodeLabel?: string
   svgCopyLabel?: string
+  /** SVG 图卡「加到对话」按钮文案（引用整块图/代码到输入框） */
+  svgQuoteLabel?: string
   svgDrawingLabel?: string
 }
 
@@ -634,6 +636,7 @@ function renderSvg(src: string, opts?: MdLiteOpts, rawSource?: string): string {
     const previewLabel = escapeHtml(opts?.svgPreviewLabel || 'Preview')
     const codeLabel = escapeHtml(opts?.svgCodeLabel || 'Code')
     const copyLabel = escapeHtml(opts?.svgCopyLabel || 'Copy')
+    const quoteLabel = escapeHtml(opts?.svgQuoteLabel || 'Quote')
     const drawingLabel = escapeHtml(opts?.svgDrawingLabel || 'Drawing...')
     const rawCode = escapeHtml(rawSource ?? sanitized)
     const isDrawing = !complete
@@ -647,6 +650,9 @@ function renderSvg(src: string, opts?: MdLiteOpts, rawSource?: string): string {
       `<div class="pilot-svg-actions">` +
       `<button type="button" class="pilot-svg-tab is-active" data-action="preview">${previewLabel}</button>` +
       `<button type="button" class="pilot-svg-tab" data-action="code">${codeLabel}</button>` +
+      `<button type="button" class="pilot-svg-quote" data-action="quote" title="${quoteLabel}" aria-label="${quoteLabel}">` +
+      `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 7H5a2 2 0 0 0-2 2v3a2 2 0 0 0 2 2h2v1a3 3 0 0 1-3 3"></path><path d="M19 7h-4a2 2 0 0 0-2 2v3a2 2 0 0 0 2 2h2v1a3 3 0 0 1-3 3"></path></svg>` +
+      `</button>` +
       `<button type="button" class="pilot-svg-copy" data-action="copy" title="${copyLabel}" aria-label="${copyLabel}">` +
       `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M15 5H6a2 2 0 0 0-2 2v9"></path></svg>` +
       `</button>` +
