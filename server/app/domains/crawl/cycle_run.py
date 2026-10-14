@@ -151,6 +151,8 @@ async def _run_price_cycle(
         # 账本只记 failed 不记原因等于让使用者面对不可信记录。
         terminal_error: str | None = None
         env_aborted = env_abort_reason(skipped)
+        summary = await price_cycle.get(cycle_id)
+        deferred = (summary or {}).get("deferredSpecs", [])
         if regions is None:
             terminal = price_cycle.FAILED
             terminal_error = "本轮期望集冻结失败，未按本轮口径记录覆盖"
@@ -159,6 +161,7 @@ async def _run_price_cycle(
                 [j["status"] for j in jobs],
                 expected_units=expected_units,
                 entered_repairing=entered_repairing,
+                deferred=bool(deferred),
             )
             if env_aborted is not None and terminal != price_cycle.COMPLETED:
                 # 环境拒因压过通用失败文案：账本上要能看出「本轮是让路停的，
@@ -176,6 +179,8 @@ async def _run_price_cycle(
                 terminal_error = f"本轮没有任何抓取段启动：{detail}"[:200]
             elif terminal == price_cycle.FAILED:
                 terminal_error = f"本轮 {len(jobs)} 个抓取段全部失败，明细见任务列表"
+            elif deferred:
+                terminal_error = "本轮有未更新的游戏，已保留并将在后续更新中优先补跑"
         if not await price_cycle.advance(cycle_id, price_cycle.FINALIZING):
             return True if stop_event.is_set() else started
         # 收尾段（标记刷新/事件检测/统计）分钟级且无抓取在跑：实时告知前端

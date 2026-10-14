@@ -62,12 +62,19 @@ async def prune_price_cycles(
     返回 {"rows_deleted", "details_trimmed", "truncated"}。
     """
     cutoff = (now or datetime.now()) - timedelta(days=row_days)
+    from app.domains.crawl.cycle import pending_cycle_ids
+
+    pending = sorted(await pending_cycle_ids())
+    params = {f"pending_{i}": cid for i, cid in enumerate(pending)}
+    keep_pending = ""
+    if params:
+        keep_pending = " AND id NOT IN (" + ",".join(":" + key for key in params) + ")"
     rows_deleted, truncated_rows = await _chunked_execute(
         "DELETE FROM price_cycles WHERE id IN ("
         "SELECT id FROM price_cycles"
         " WHERE started_at IS NOT NULL AND started_at < :cutoff"
-        " ORDER BY id LIMIT :chunk)",
-        {"cutoff": cutoff},
+        + keep_pending + " ORDER BY id LIMIT :chunk)",
+        {"cutoff": cutoff, **params},
         chunk=chunk,
         max_chunks=max_chunks,
     )

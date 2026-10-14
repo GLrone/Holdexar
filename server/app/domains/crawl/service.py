@@ -1134,6 +1134,7 @@ async def default_queue_specs() -> list[dict]:
       显式设置过的 catalog_refresh 值两种形态都尊重；榜单源另受
       KV `fetch.boards` 门控（discounts/specials scope 内判定）。
 
+    已让路的阶段先补跑，其余阶段保持默认顺序。
     调度器 `_price_refresh_specs` 与 `start_full_queue` 都从这里取组成；
     新增/调整队列段只改本函数。
     """
@@ -1153,7 +1154,9 @@ async def default_queue_specs() -> list[dict]:
     if await get_value("crawl.catalog_refresh", catalog_default):
         specs.append({"scope": "catalog"})
         specs.append({"scope": "specials", "kind": "specials_backfill"})
-    return specs
+    from app.domains.crawl import cycle as price_cycle
+
+    return await price_cycle.prioritize_specs(specs)
 
 
 # 手动全队列链句柄：段间隙占用窗口（_active 已清、下一段未建）的防重入闸
@@ -1307,8 +1310,10 @@ async def run_sequential(
     stop_event 置位时段间隙即退出（当前段由 stop_job 收敛为 stopped），
     链不再推进下一段——取消只能是协作式的，链任务本身不可 cancel。
     """
+    from app.domains.crawl import cycle as price_cycle
+
     results: list[dict] = []
-    for spec in specs:
+    for index, spec in enumerate(specs):
         if stop_event is not None and stop_event.is_set():
             if skip_reasons is not None:
                 skip_reasons.append(f"{spec.get('kind', spec.get('scope'))}：用户已停止")
@@ -1316,6 +1321,8 @@ async def run_sequential(
         # 本机网络被接管时抓取只会堆失败记录与限流：当前段跑完（已爬数据照常
         # 落库）后不再推进下一段，链按协作式停止收敛
         if _tun_mode_suspected():
+            for remaining in specs[index:]:
+                await price_cycle.record_stage(cycle_id, remaining, "deferred", env_check.USER_MESSAGE)
             if stop_event is not None:
                 stop_event.set()
             if skip_reasons is not None:
@@ -1329,6 +1336,7 @@ async def run_sequential(
                 detail={"原因": env_check.USER_MESSAGE},
             )
             break
+        await price_cycle.record_stage(cycle_id, spec, "pending")
         try:
             result = await start_job(
                 scope=spec.get("scope", "appids"),
@@ -1339,6 +1347,9 @@ async def run_sequential(
                 cycle_id=cycle_id,
             )
         except (RuntimeError, ValueError) as e:
+            await price_cycle.record_stage(
+                cycle_id, spec, "empty" if isinstance(e, ValueError) else "deferred", str(e),
+            )
             log_event(
                 logger,
                 "本轮串行链跳过了一个抓取段",
@@ -1355,6 +1366,17 @@ async def run_sequential(
         active = _active
         if active is not None:
             await active.task
+        state = "cancelled" if stop_event is not None and stop_event.is_set() else "done"
+        job = await _load_job(result["id"]) if cycle_id is not None else None
+        stats = job.stats_json if job is not None else result.get("stats")
+        reason = None
+        if state != "cancelled" and (
+            (job is not None and job.status == "failed")
+            or (stats and stats.get("failed", 0) > 0 and not stats.get("success", 0))
+        ):
+            state = "deferred"
+            reason = "本段未能取得价格，稍后自动补跑"
+        await price_cycle.record_stage(cycle_id, spec, state, reason)
     return results
 
 
