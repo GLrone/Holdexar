@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 import yaml
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from app.core.config import get_settings
 from app.core.database import get_engine, get_session_factory, init_db
@@ -29,7 +29,6 @@ from app.domains.proxypool.models import (
     HealthObservation,
     HealthRun,
     ProxyNode,
-    ProxyNodeSource,
     node_fingerprint,
 )
 from app.domains.proxypool.pool import POOL_FILENAME
@@ -181,8 +180,9 @@ async def _seed_pool(tmp_data_dir, *, lane_ports: list[int], ctrl_port: int,
                             proxy_type="http", server="127.0.0.1",
                             normalized_config=config, state="ACTIVE",
                             first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
-            s.add(ProxyNodeSource(node_id=fp, subscription_id=1, original_name="x",
-                                  first_seen=NOW, last_seen=NOW))
+            await s.execute(update(ProxyNode)
+                .where(ProxyNode.node_id == fp)
+                .values(subscription_id=1, original_name="x"))
             await s.commit()
 
 
