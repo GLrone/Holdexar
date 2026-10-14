@@ -1963,7 +1963,7 @@ async def _probe_nodes_via_selector(
                 log_event(
                     logger,
                     "检测后恢复内核路由模式失败，内核可能仍处于 global 模式（重启内核可恢复）",
-                    tag="告警",
+                    tag="注意",
                     level=logging.WARNING,
                     detail={"原模式": prev_mode},
                 )

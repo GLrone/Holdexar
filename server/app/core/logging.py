@@ -196,6 +196,7 @@ _MODULE_LABELS = {
     "app.domains.proxypool.retention": "代理池·清理",
     "app.domains.proxypool.exitstats": "代理池·出口统计",
     "app.domains.proxypool.jobruns": "代理池·作业记录",
+    "app.domains.proxypool.dead_probe": "代理池·死节点回收",
     # 代理订阅与内核
     "app.domains.proxies.clash_manager": "代理内核",
     "app.domains.proxies.service": "代理订阅",
@@ -239,6 +240,7 @@ _MODULE_LABELS = {
     "app.domains.pilot.session": "领航员·会话",
     "app.domains.pilot.router": "领航员·接口",
     "app.domains.pilot.llm": "领航员·模型",
+    "app.domains.pilot.flywheel": "领航员·反馈闭环",
 }
 
 # 三级域兜底：未登记的中文名按 `app.<层>.<名>` 推 `层·名`，至少不让点分路径漏给用户。
