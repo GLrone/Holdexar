@@ -5,7 +5,7 @@
 datas 布局与 app/core/config.py 的 sys.frozen 分支对齐：
   web/         ← web/dist        （web_dist_dir 命中 _MEIPASS/web）
   clash/       ← assets/clash    （clash_dir 命中 _MEIPASS/clash；mihomo 内核 +
-                                  GeoIP 数据 + 上游许可原文，随包分发）
+                                  许可原文与来源说明，随包分发）
   app.ico      ← _MEIPASS 根     （desktop/main.py frozen icon 分支）
   server/app   ← 后端源码落盘    （uvicorn.run("app.main:app") 字符串导入的
                                   磁盘兜底，main.py frozen 态把它插进 sys.path）
@@ -36,6 +36,7 @@ from PyInstaller.utils.win32.versioninfo import (  # noqa: E402
 
 from app.core.app_info import APP_NAME, APP_SUBTITLE, APP_VERSION  # noqa: E402
 from app.core.optional_deps import PYINSTALLER_EXCLUDES  # noqa: E402
+from app.domains.proxies.kernel_release import bundled_asset_names  # noqa: E402
 
 hiddenimports = [
     # uvicorn.run("app.main:app") 字符串导入 + auto 协议模块运行时选择
@@ -104,10 +105,10 @@ a = Analysis(
     binaries=[],
     datas=[
         (os.path.join(ROOT, "web", "dist"), "web"),
-        # 种子不随包（按需下载落 data/seed，见 core/seed_fetch.py）；
-        # 内核随包分发：mihomo 与 GeoIP 数据齐备是发布前提，由
-        # build_release.ensure_clash_assets() 在打包前校验（缺一即中止）
-        (os.path.join(ROOT, "assets", "clash"), "clash"),
+        *[
+            (os.path.join(ROOT, "assets", "clash", name), "clash")
+            for name in bundled_asset_names()
+        ],
         (os.path.join(SERVER, "app"), os.path.join("server", "app")),
         ("app.ico", "."),
         # 许可与第三方声明随包分发：GPL-3.0 要求实体副本随附许可原文（§4），

@@ -1,13 +1,16 @@
 """随包 Clash 内核资产验收。
 
 覆盖五条行为：
-1. 随包目录 → data/clash/ 就位，GeoIP 数据只补缺失、同名不覆盖；
+1. 随包目录 → data/clash/ 就位（只补缺失、同名不覆盖）；
 2. 内核可执行文件版本感知换装：就位版本低于随包版本才替换，不低于
    （用户手换更高版）或版本不可辨时保留；
 3. detect_kernel 只认 data/clash/——随包目录里有内核也不算「已就位」
    （不再检索本机其他 Clash 安装）；
 4. install_kernel 随包优先：随包可用时**不触网**（下载函数被顶替为断言失败）；
 5. 随包缺失时 install_kernel 才回退网络下载。
+
+随包资产只含内核与许可原文，不再含 GeoIP/GeoSite 数据（运行配置不消费
+地理数据，见 test_geo_free_runtime）。
 
 真实资产（`assets/clash/`，gitignored）不进测试：这里在 tmp_path 合成同构目录，
 用 monkeypatch 顶替 bundled_clash_dir()。
@@ -17,11 +20,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.domains.proxies import clash_manager
 from app.domains.proxies.kernel_release import (
-    GEO_ASSETS,
     MIHOMO_VERSION,
     is_windows,
     kernel_filename,
@@ -31,13 +35,12 @@ from app.domains.proxies.kernel_release import (
 
 
 def _make_bundle(tmp_path: Path, *, kernel: bool = True) -> Path:
-    """合成「随包内核目录」：内核可执行文件 + GeoIP 数据（内容不参与判定）。"""
+    """合成「随包内核目录」：内核可执行文件 + 许可原文（内容不参与判定）。"""
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     if kernel:
         (bundle / kernel_filename()).write_bytes(b"MZ" + b"\x00" * 4096)
-    for name in GEO_ASSETS:
-        (bundle / name).write_bytes(b"geo-data")
+    (bundle / "LICENSE-mihomo.txt").write_bytes(b"license")
     return bundle
 
 
@@ -50,7 +53,7 @@ def _fake_kernel_version(monkeypatch, raw: str | None) -> None:
 
 
 def test_ensure_kernel_copies_bundle_into_data_dir(tmp_path: Path, monkeypatch) -> None:
-    """内核与 GeoIP 数据按需复制进 data/clash/，缺失清单随之清空。"""
+    """内核按需复制进 data/clash/，缺失清单随之清空。"""
     bundle = _make_bundle(tmp_path)
     data_dir = tmp_path / "data"
     monkeypatch.setattr(clash_manager, "bundled_clash_dir", lambda: bundle)
@@ -59,21 +62,19 @@ def test_ensure_kernel_copies_bundle_into_data_dir(tmp_path: Path, monkeypatch) 
     result = clash_manager.ensure_kernel(data_dir)
 
     assert result["kernelReady"] is True
-    assert set(result["copied"]) == {kernel_filename(), *GEO_ASSETS}
+    assert result["copied"] == [kernel_filename()]
     assert result["missing"] == []
     assert result["upgraded"] is None  # 无旧版本可比，纯新装
-    for name in (kernel_filename(), *GEO_ASSETS):
-        assert (data_dir / "clash" / name).is_file()
+    assert (data_dir / "clash" / kernel_filename()).is_file()
 
 
 def test_ensure_kernel_keeps_existing_files(tmp_path: Path, monkeypatch) -> None:
-    """已有 GeoIP 数据与内核一律不动（版本不可辨 = 保守保留用户文件）。"""
+    """已有内核一律不动（版本不可辨 = 保守保留用户文件），且不复制地理数据。"""
     bundle = _make_bundle(tmp_path)
     data_dir = tmp_path / "data"
     clash_path = data_dir / "clash"
     clash_path.mkdir(parents=True)
     (clash_path / kernel_filename()).write_bytes(b"user-kernel")
-    (clash_path / "geoip.dat").write_bytes(b"user-geoip")
     monkeypatch.setattr(clash_manager, "bundled_clash_dir", lambda: bundle)
     # 版本不可辨（-v 拿不到可解析输出）：既不证明旧、也不证明新，不替换
     _fake_kernel_version(monkeypatch, None)
@@ -81,11 +82,11 @@ def test_ensure_kernel_keeps_existing_files(tmp_path: Path, monkeypatch) -> None
     result = clash_manager.ensure_kernel(data_dir)
 
     assert (clash_path / kernel_filename()).read_bytes() == b"user-kernel"
-    assert (clash_path / "geoip.dat").read_bytes() == b"user-geoip"
     assert kernel_filename() not in result["copied"]
-    assert "geoip.dat" not in result["copied"]
     assert result["upgraded"] is None
-    assert set(result["copied"]) == {"Country.mmdb", "geosite.dat", "ASN.mmdb"}
+    assert result["copied"] == []
+    assert not list(clash_path.glob("*.mmdb"))
+    assert not list(clash_path.glob("*.dat"))
 
 
 def _bump_target(monkeypatch, version: str) -> None:
@@ -213,6 +214,24 @@ def test_install_kernel_falls_back_to_download(tmp_path: Path, monkeypatch) -> N
 
     assert calls == ["download"]
     assert result["source"] == "github"  # 来自下载分支，而非随包复制
+
+
+@pytest.mark.parametrize("name", ["Country.mmdb", "geoip.dat", "geosite.dat", "ASN.mmdb"])
+def test_kernel_install_does_not_restore_geo(tmp_path: Path, monkeypatch, name) -> None:
+    """随包目录里残留地理数据也不再复制进数据目录。
+
+    历史资产可能还躺在 assets/clash/（未清理），安装链必须按清单办事，
+    不能因为文件在就顺手带走——运行配置不消费地理数据。
+    """
+    bundle = _make_bundle(tmp_path)
+    (bundle / name).write_bytes(b"stale-geo")
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr(clash_manager, "bundled_clash_dir", lambda: bundle)
+    _fake_kernel_version(monkeypatch, None)
+
+    clash_manager.ensure_kernel(data_dir)
+
+    assert not (data_dir / "clash" / name).exists()
 
 
 def test_kernel_release_constants_are_single_source() -> None:

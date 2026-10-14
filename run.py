@@ -1,7 +1,7 @@
 """Holdexar 一键启动脚本。
 
 流程：选解释器（缺 venv 自动创建）→ 补后端依赖 → 补随包资产
-（汇率档案种子 / Clash 内核与 GeoIP 数据，缺失则从上游取）→ 补前端依赖
+（汇率档案种子 / Clash 内核与许可原文，缺失则从上游取）→ 补前端依赖
 （node_modules 缺失自动 npm install）→ 校验前端产物（缺失则构建）
 → 拉起桌面壳。
 
@@ -108,11 +108,10 @@ def ensure_seed(python: Path) -> None:
 
 
 def ensure_kernel(python: Path) -> None:
-    """随包内核资产（mihomo + GeoIP 数据）：缺失则从上游补一份（不进 git）。
-    失败只警告不阻断——代理页可一键安装。"""
+    """补齐随包内核与许可原文，失败只警告不阻断启动。"""
     if KERNEL_EXE.is_file():
         return
-    print("[内核] 未找到随包 Clash 内核，尝试获取（mihomo + GeoIP 数据，约 80MB）…")
+    print("[内核] 未找到随包 Clash 内核，尝试获取内核与许可原文…")
     rc = _run([str(python), str(ROOT / "scripts" / "fetch_kernel.py")])
     if rc != 0:
         print("[警告] 内核资产未获取到：代理页将显示「内核缺失」，可页内一键安装。")

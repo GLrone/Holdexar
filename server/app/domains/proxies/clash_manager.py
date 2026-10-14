@@ -1,6 +1,6 @@
 """Clash 内核管理：随包内核就位 / 检测 / 网络下载兜底 / 订阅启动 / 停止。
 
-内核与 GeoIP 数据**随发行包分发**（版本固定在 kernel_release.MIHOMO_VERSION，
+内核与许可原文**随发行包分发**（版本固定在 kernel_release.MIHOMO_VERSION，
 源目录 assets/clash → 打包后随资源目录），用户机器上不再检索本机装没装 Clash：
 内核由 ensure_kernel() 复制进 data/clash/，detect_kernel() 只认这一处。
 网络下载（download_kernel*）退居兜底，只服务两类场景：源码 clone 尚未补资产、
@@ -34,19 +34,27 @@ from app.core.app_info import APP_SLUG
 from app.core.config import get_settings
 from app.core.logging import log_event
 from app.domains.proxies.kernel_release import (
-    GEO_ASSETS,
     MIHOMO_VERSION,
     MIRRORS,
     is_windows,
     kernel_filename,
     mihomo_url,
 )
+# 运行配置生成与节点依赖解析的唯一实现在 runtime_config；本模块只做转发，
+# 使 clash_manager 保持「内核管理」这一处引用面（订阅侧与池侧共用同一实现）。
+from app.domains.proxies.runtime_config import (  # noqa: F401 —— 对外契约
+    render_subscription_config,
+    resolve_node_dependencies,
+)
 
 logger = logging.getLogger(__name__)
 
-# 兼容旧引用名：镜像链（网络下载兜底用）与内核数据目录需就位的 GeoIP 数据
+# 兼容旧引用名：镜像链（网络下载兜底用）
 _MIRRORS = MIRRORS
-_GEO_FILES = tuple(GEO_ASSETS)
+
+# 生成文件后缀：`clash-sub-{id}.runtime.yaml`。与原始缓存分文件——原文是证据、
+# 生成结果可随时重建，就地改写原文会让「订阅原样」在磁盘上不成立。
+_RUNTIME_SUFFIX = ".runtime.yaml"
 
 
 def bundled_clash_dir() -> Path:
@@ -214,12 +222,12 @@ def _copy_bundled(kernel_path: Path, names: Sequence[str]) -> dict:
 
 
 def ensure_kernel_files(kernel_path: Path) -> dict:
-    """内核目录补齐：可执行文件 + GeoIP 数据（随包资产为唯一来源）。
+    """内核目录补齐：可执行文件与许可原文（随包资产为唯一来源）。
 
     入参是**内核目录本身**（config.yaml 所在处，也是 mihomo `-d` 的工作目录）；
     以 data_dir 为入参的版本见 ensure_kernel()。
     """
-    result = _copy_bundled(kernel_path, (kernel_filename(), *_GEO_FILES))
+    result = _copy_bundled(kernel_path, (kernel_filename(),))
     upgrade = _maybe_upgrade_kernel(kernel_path)
     if upgrade:
         result["upgraded"] = upgrade
@@ -227,14 +235,14 @@ def ensure_kernel_files(kernel_path: Path) -> dict:
 
 
 def ensure_kernel(data_dir: Path) -> dict:
-    """随包内核就位（data_dir 版本）：把内核与 GeoIP 数据补进 data/clash/。
+    """随包内核就位（data_dir 版本）：把内核与许可原文补进 data/clash/。
 
     随包资产落到用户数据目录的唯一入口。返回
     {"kernelReady": bool, "copied": [...], "missing": [...], "bundleDir": str,
      "upgraded": str | None}；发行包缺内核（源码 clone 未补资产）时
     kernelReady=False，由调用方决定是回退网络下载还是提示用户。
     """
-    result = _copy_bundled(kernel_dir(data_dir), (kernel_filename(), *_GEO_FILES))
+    result = _copy_bundled(kernel_dir(data_dir), (kernel_filename(),))
     upgrade = _maybe_upgrade_kernel(kernel_dir(data_dir))
     if upgrade:
         result["upgraded"] = upgrade
@@ -254,12 +262,6 @@ def ensure_kernel(data_dir: Path) -> dict:
             level=logging.WARNING,
             detail={"目录": str(bundled_clash_dir()), "缺失文件": kernel_filename()},
         )
-    elif result["missing"]:
-        log_event(
-            logger,
-            "内核目录缺少部分文件，内核启动时会尝试自行下载（直连网络下可能卡住）",
-            detail={"缺失文件": "、".join(result["missing"])},
-        )
     return {
         "kernelReady": ready,
         "copied": result["copied"],
@@ -267,15 +269,6 @@ def ensure_kernel(data_dir: Path) -> dict:
         "upgraded": upgrade,
         "bundleDir": str(bundled_clash_dir()),
     }
-
-
-def ensure_geo_files(data_dir: Path) -> dict:
-    """内核数据目录缺 GeoIP 库时，从随包目录补齐。
-
-    只补缺失文件、同名不覆盖；随包也没有的（如 ASN 数据）交给内核自行下载。
-    返回 {"copied": [...], "missing": [...]}。
-    """
-    return _copy_bundled(kernel_dir(data_dir), _GEO_FILES)
 
 
 def decode_profile_title(raw: str | None) -> str | None:
