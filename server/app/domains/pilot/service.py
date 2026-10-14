@@ -23,6 +23,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import time
 import uuid
 
@@ -84,6 +85,12 @@ _NUDGE_TRUNCATED = (
     "（系统提示）你刚才的回答看起来没写完就停了。请接着把结论补完整："
     "该给的数据/清单/依据要交代清楚，不要停在一句话中间。"
 )
+# 自我叙述：终答只说了「我要做什么 / 用户问的是什么」，一句结论都没给
+_NUDGE_NARRATION = (
+    "（系统提示）你刚才只是描述了你准备做什么，没有给出用户要的答案。"
+    "请立刻把查到的事实写成结论交给用户：先给结论，再列依据；"
+    "如果确实查不到，就明确说「没有查到相关数据」并说明限制，不要再描述你的计划。"
+)
 _TRUNCATED_MIN_CHARS = 40
 
 
@@ -93,6 +100,130 @@ def _ends_mid_clause(body: str) -> bool:
         return False
     tail = body[-1]
     return tail in "，,、" or tail.isdigit()
+
+
+# 思考外泄：部分模型把推理过程当正文输出（thinking 通道没走通时尤其常见），
+# 用户看到的是一堆自我盘算与内部指令。这些片段只有过程、没有结论，留着就是噪音。
+_LEAK_MARKERS = (
+    "（系统侧同步", "系统侧同步", "弹性 SVG", "视觉降级触发契约", "视觉增强的触发条件",
+    "Per the instructions", "According to my rules", "Let me think",
+    "I need to check", "让我看看有哪些工具", "我的规则", "按照规则",
+    "<｜DSML｜", "emit_card",
+)
+# 外泄正文里常见「自述在做什么」的自指句式，按行判据覆盖（段内没空行也认得出）
+_LEAK_LINE_HINTS = (
+    "我需要", "我应该", "让我", "我手头", "我注意到", "我看一下", "我先确认",
+    "I should", "I need to", "Let me", "I'll check",
+)
+_THINK_LEAD_LEN = 120
+
+
+def _looks_like_thinking(part: str) -> bool:
+    """一段正文是否像外泄的思考：先看内部指令痕迹，再看自指句式密度。"""
+    if any(m in part[:_THINK_LEAD_LEN] for m in _LEAK_MARKERS):
+        return True
+    lines = [ln.strip() for ln in part.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    hits = sum(1 for ln in lines if any(h in ln for h in _LEAK_LINE_HINTS))
+    # 外泄思考往往是开头一大段自述，正文里偶尔一句「我先看看」不算
+    return hits >= 2 or (hits == 1 and len(lines) <= 3)
+
+
+# 工具调用信封：模型把调用块当正文吐出来时，整段都不该给用户看
+_TOOL_ENVELOPE_RE = re.compile(
+    r"<｜DSML｜tool_calls>.*?</｜DSML｜tool_calls>|<｜DSML｜parameter.*?</｜DSML｜parameter>",
+    re.S,
+)
+# 自我叙述：终答里只有「我要做什么 / 用户问的是什么」，没有一句是给用户的结论。
+# 这类输出被模型当终答交了，用户看到的是助手在自言自语——要一次真回答，不是再描述一遍
+_NARRATION_LEAD = (
+    "我来", "让我", "我这就", "我先", "我先去", "我去", "我再", "我重新", "我接着",
+    "我马上", "我看看", "我看一下", "我查一下", "我确认", "我核实", "我试着", "我准备",
+    "我需要", "我要", "我想", "我得", "我把它", "我可以帮你", "我帮你", "我给您",
+    "我注意", "我发现", "我这边",
+)
+_NARRATION_META = (
+    "用户问的是", "用户想知道", "用户可能", "这是一个关于", "这个问题属于",
+    "这个问题得", "这个问题需要", "最合理的做法", "我的规则", "按照规则", "根据规则",
+    "我没有那个上下文", "先说明一个情况", "先说明一个关键事实",
+)
+# 小写也要收：模型常写 "let me / i'll"，既有 _LEAK_LINE_HINTS 只收了首字母大写形态
+_NARRATION_EN = ("let me", "i'll", "i need to", "i should", "let's", "actually,",
+                 "i want to", "i will")
+# 交付信号：正文里确实带了数据 / 清单 / 结论——有这些就不算空转
+_NARRATION_PAYLOAD = ("¥", "元", "%", "|", "## 结论", "**结论", "结论：")
+# 收尾停在自述上时，正文短到这个长度以内才算「计划没走完就交卷」
+_NARRATION_TAIL_MAX_CHARS = 200
+
+
+def _sent_is_narration(s: str) -> bool:
+    """一句正文是否只是助理在自述：自指盘算、内部指令痕迹或复述问题。
+
+    自述未必在句首（"……，我去 Steam 搜一下"），所以整句都找，不只看开头。"""
+    head = s[:26].lower()
+    return (_looks_like_thinking(s)
+            or any(w in s for w in _NARRATION_LEAD)
+            or any(w in s for w in _NARRATION_META)
+            or any(w in head for w in _NARRATION_EN))
+
+
+def _is_self_narration(text: str) -> bool:
+    """终答是否只有自述、没有交付内容：句句在说「我在做什么」，且全文无数据/清单/结论。
+
+    把工具调用信封当正文吐也算——那一整段都不是给用户看的回答。"""
+    body = (text or "").strip()
+    if not body:
+        return True
+    if any(p in body for p in _NARRATION_PAYLOAD):
+        return False
+    if _TOOL_ENVELOPE_RE.search(body):
+        return True
+    sents = [s.strip() for s in re.split(r"[。！？\n]", body) if s.strip()]
+    if not sents:
+        return True
+    if all(_sent_is_narration(s) for s in sents):
+        return True
+    # 收尾停在「我接着去查」上：计划还没走完就被当成终答交了
+    return _sent_is_narration(sents[-1]) and len(body) < _NARRATION_TAIL_MAX_CHARS
+
+
+def _strip_leaked_thinking(text: str) -> str:
+    """从终答里去掉外泄的思考片段与工具调用信封：只留最后一段像结论的正文。
+
+    判据是「段落里有没有内部指令痕迹或自指盘算」，不是「有没有英文」——真回答也会引
+    英文游戏名。命中即丢该段及其之前的内容。
+
+    切完为空时退回原文：那时原文里也许没有一句像给用户的回答，但交白卷更糟——
+    噪声可以忍，空白没法用。
+    """
+    if not text:
+        return text
+    text = _TOOL_ENVELOPE_RE.sub("", text)
+    text = re.sub(r"</?｜DSML｜(invoke|tool_calls|parameter)[^>]*>", "", text)
+    # 外泄的思考通常整段趴在开头（模型先盘算再作答）或结尾（答完又自言自语），
+    # 只切这两端的连续块——从中间某个命中点一路切到末尾会把真正的回答一起删掉。
+    kept = ""
+    for parts in (re.split(r"\n\s*\n", text.strip()), text.strip().splitlines()):
+        parts = [p for p in parts if p.strip()]
+        if not parts:
+            continue
+        head = 0
+        while head < len(parts) and _looks_like_thinking(parts[head]):
+            head += 1
+        tail = len(parts)
+        while tail > head and _looks_like_thinking(parts[tail - 1]):
+            tail -= 1
+        kept = "\n".join(parts[head:tail]).strip()
+        if kept:
+            break
+    kept = _TOOL_ENVELOPE_RE.sub("", kept)
+    # 信封被切掉一半时残留的孤立闭合标签
+    kept = re.sub(r"</?｜DSML｜(invoke|tool_calls|parameter)[^>]*>", "", kept)
+    kept = re.sub(r"\n{3,}", "\n\n", kept).strip()
+    return kept or text.strip()
+
+
 # 确定性预取：数据型问句在首轮模型请求前先把事实取回来注入，模型一轮直接
 # 综合——省掉「模型选工具→执行→再综合」里第一段等待。关键词只收无歧义形态，
 # 目标解析不唯一即弃权交还 agent 循环（低置信不行动）。
@@ -253,6 +384,11 @@ _SYSTEM_PROMPT = (
     "- 日期、价格、折扣、库存、活动场次、账号数据——凡是用户会照着做决定的数字，"
     "必须有工具证据；工具没给就直说「这边没查到」，然后告诉用户去哪能看到。\n"
     "- 严禁按「历年惯例」「通常是」「大概是」补日期和数字。宁可说不知道，也不要给一个像真的错答案。\n"
+    "- **查不到就停在查不到**：别家平台的机制、电竞赛事比分、硬件外设行情、饰品市场、"
+    "真人关系这些本产品没有数据源的问题，说清「这边没有这个数据源」并指一条用户能查到的路；"
+    "绝不允许拿记忆里的游戏机制、版本数值、账号信息去填空——猜错比不答更糟。\n"
+    "- **先确认问的是哪个**：游戏角色名/武器名/模式名在不同游戏里重名很常见（例如「小火龙」「大乱斗」）。"
+    "指认对象之前先说清你按哪个游戏理解，拿不准就先问一句，别默认一个就展开长篇分析。\n"
     "- 价格、折扣、原价这类数字**照抄工具返回值**，不做四舍五入、不做单位换算、不凭记忆改写。\n"
     "- **时间校验**：涉及赛事、活动、发售、比赛结果这类有明确时间点的事实，"
     "先确认它**是否已经发生**。今天之后的赛事/活动**尚未有结果**，一律不得编造冠军、比分、名次。\n"
@@ -1241,6 +1377,9 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
                     elif (tools_ran == 0 and intent in _DATA_INTENTS
                           and any(w in text for w in _ANNOUNCE_WORDS)):
                         nudge = {"role": "system", "content": _NUDGE_ANNOUNCED}
+                    elif _is_self_narration(text):
+                        # 只自述不交付：模型把「我要去查」当成终答交了，追问一次要真结论
+                        nudge = {"role": "system", "content": _NUDGE_NARRATION}
                     elif _looks_truncated(text, tools_ran, cards):
                         # 终答过短却有工具结果/卡片：像是话说到一半断了，追问一次补全
                         nudge = {"role": "system", "content": _NUDGE_TRUNCATED}
@@ -1483,14 +1622,16 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
 
         # 步数耗尽兜底：已跑过工具却未走终答轮时，禁工具再要一次总结——
         # 避免「调了一堆工具却交白卷」（D1 空回答的另一形态）。这次调用不计步数、
-        # 不带工具表，模型只能基于已有工具结果作答
+        # 不带工具表，模型只能基于已有工具结果作答。兜底产出若仍是自述（"我去查一下"），
+        # 带一次反自述提醒再要一轮——否则白卷照交，只是换了个说法
         summary_diagnostic: dict | None = None
-        if exhausted and tools_ran > 0:
+        for attempt in ((_FALLBACK_SUMMARY_PROMPT, _NUDGE_NARRATION)
+                        if exhausted and tools_ran > 0 else ()):
             phase = {"step": step + 1, "thinking": [], "text": [], "steps": [],
                      "cards": [], "think_ms": 0.0, "truncated": False, "terminal": True}
             phases.append(phase)
             yield {"type": "step_start", "step": phase["step"]}
-            messages.append({"role": "system", "content": _FALLBACK_SUMMARY_PROMPT})
+            messages.append({"role": "system", "content": attempt})
             try:
                 async for kind, delta in pilot_llm.chat_stream(
                     protocol=cfg["protocol"], base_url=base_url, api_key=cfg["api_key"],
@@ -1526,8 +1667,18 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
         phase["thinking"] = "".join(phase["thinking"])
         phase["text"] = "".join(phase["text"])
         phase["think_ms"] = int(phase["think_ms"] * 1000) or None
+        # 自述段打标记：前端按 phases 取终答时据此跳过，两端口径同源（不再各判一次）
+        if phase["text"].strip():
+            phase["narration"] = _is_self_narration(phase["text"])
     # phases 是唯一权威记录；thinking / steps / answer 由它派生，供旧前端与旧账本口径消费
-    answer = "".join(phase["text"] for phase in phases)
+    # 末段是自述（"我去查一下"）就丢掉：那是过程不是结论，留着等于替模型把白卷交了。
+    # 只切末尾——前面的前言是流式时真实给用户看过的内容，留着；
+    # phases 与 steps 照原样留档，过程链与步骤账本仍要看到这一轮发生过什么。
+    # 兜底轮整轮自述且只有它一段时（phases 长度 1）不切：那时确实没有别的内容可交
+    _answer_phases = list(phases)
+    while len(_answer_phases) > 1 and _is_self_narration(_answer_phases[-1]["text"]):
+        _answer_phases.pop()
+    answer = _strip_leaked_thinking("".join(p["text"] for p in _answer_phases))
     thinking = "".join(phase["thinking"] for phase in phases) or None
     steps = [s for phase in phases for s in phase["steps"]]
     think_ms = int(think_ms_total * 1000)
