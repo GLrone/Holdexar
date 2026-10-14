@@ -1,6 +1,7 @@
 """优惠与行情类工具：HB 月包 / Epic·Steam 喜加一 / 价格事件 / 汇率 / 日历。"""
 from __future__ import annotations
 
+from app.crawler.epic_free import MOBILE_PAGE_URL
 from app.crawler.utils import get_beijing_time_obj
 from app.domains.agent.tools.base import ToolSpec
 from app.domains.agent.tools.builtin import _shared
@@ -63,7 +64,16 @@ async def epic_free() -> dict:
         "titleKey": "epic",
         "offers": clean_offers,
         "rows": rows,
-        "mobile": mobile,
+        "mobile": {
+            "title": mobile.get("title"),
+            "image": mobile.get("image"),
+            "url": mobile.get("url") or MOBILE_PAGE_URL,
+            "end": mobile.get("end"),
+            "worth": mobile.get("worth"),
+            "source": mobile.get("source"),
+            # direct=false 表示入口是移动商店页（App 内领取），非一键结账
+            "direct": mobile.get("direct", True) is not False,
+        } if mobile else None,
         "fetchedAt": payload.get("fetchedAt"),
         "total": len(clean_offers),
     }

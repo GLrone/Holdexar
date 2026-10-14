@@ -15,8 +15,12 @@
   白送专属表述）→ 商店持久化查询按真名解析 sandbox → sandbox offers
   双端 0 元 Claim → 结账直链 purchase?offers（需浏览器 Epic 登录态，
   未登录 400 Account id missing 属官方行为，登录后直达免费结算）；
-  GamerPower 失败退探测 PC 白送元素池（resolve_mobile_freebie），
-  再退 CMS 移动页 breaker 立绘兜底
+  结账直链拿不到时（官方未把该期移动 offer 放进公开目录）退移动商品
+  页（catalogNs.mappings 里 pageType=offer 的条目才是移动版「免费/
+  获取」按钮所在页，PC productHome 页不是领取入口）；两者皆无则退
+  官方移动商店页（领取动作只在 App 内存在，direct=False 由卡片文案
+  如实传达）；GamerPower 失败退探测 PC 白送元素池
+  （resolve_mobile_freebie），再退 CMS 移动页 breaker 立绘兜底
 
 节流口径（对齐 boards.py 独立轻量会话）：单批拉一次促销端点 +
 每个未匹配标题一次 storesearch；间隔 500ms；不接爬虫主链路 429 熔断。
@@ -43,13 +47,17 @@ logger = logging.getLogger(__name__)
 FREE_GAMES_URL = (
     "https://store-site-backend-static-ipv4.ak.epicgames.com/freeGamesPromotions"
 )
+# 移动端领取兜底入口：官方移动商店页（无 locale 前缀，App 内跳转落地）
+# 领取动作只在 App 内存在——该链接给的是「去哪领」而非「一键领」
+MOBILE_PAGE_URL = "https://store.epicgames.com/mobile"
 # 移动端每周白送兜底信号：官方 CMS 移动页的 Free Giveaway breaker
 # （URL 固定、内容每周四换）。主判别走 GamerPower 真名 → sandbox Claim
 # 结账直链链，breaker 只在自动源全失败时兜底出卡（仅营销图 + 移动页链接）。
 MOBILE_CMS_URL = (
     "https://store-content-ipv4.ak.epicgames.com/api/en-US/content/static/mobile"
 )
-EPIC_MOBILE_PAGE_URL = "https://store.epicgames.com/en-US/mobile"
+# 移动商店页兜底链接（breaker 卡与无入口时的落点）
+EPIC_MOBILE_PAGE_URL = MOBILE_PAGE_URL
 # 移动白送自动源：GamerPower 公共 API 免登记，android 平台限免里收录
 # Epic 移动白送（真名/日期/open 跳转链；描述含 "Epic Games Store App"
 # 与 PC 端 Epic 限免及他站 key 赠品区分）。
@@ -495,18 +503,6 @@ def parse_gamerpower_mobile(payload: list | dict) -> dict | None:
     return best
 
 
-async def _resolve_redirect(url: str, session: aiohttp.ClientSession,
-                            proxy: str | None = None) -> str:
-    """跟随跳转取最终落地 URL（官方领取页）；失败原样返回。"""
-    try:
-        async with session.get(url, headers=STEAM_HTTP_HEADERS,
-                               allow_redirects=True, proxy=proxy) as resp:
-            final = str(resp.url)
-            return final if final.startswith("http") else url
-    except (aiohttp.ClientError, asyncio.TimeoutError):
-        return url
-
-
 async def _egs_persisted(operation: str, variables: dict, sha: str,
                          proxy: str | None = None) -> dict | None:
     """商店持久化查询。走 urllib 线程：CF 按客户端指纹拦截，
@@ -563,13 +559,30 @@ def _pick_key_image(offer: dict) -> str:
     return first
 
 
+def _pick_mobile_slug(catalog: dict) -> str | None:
+    """catalogNs.mappings 里挑移动版商品页 slug（pageType=offer 的条目）。
+
+    PC 白送游戏常把 PC 与移动版挂在同一目录命名空间下：productHome 是
+    PC 商店页（无「免费/获取」按钮），pageType=offer 的条目才是移动版
+    自己的商品页。官方未给该期建移动 offer 时 mappings 只剩 PC 一条，
+    此时返回 None——拿 PC 页充当领取入口就是「能跳转但领不到」的成因。
+    """
+    for m in (catalog.get("catalogNs") or {}).get("mappings") or []:
+        if m.get("pageType") != "offer":
+            continue
+        slug = m.get("pageSlug")
+        if slug:
+            return slug
+    return None
+
+
 async def resolve_store_page_url(title: str, proxy: str | None = None) -> dict | None:
     """标题 → Epic 移动版商品页 {url, image}。
 
-    url = catalogNs.pageSlug（移动白送的目录命名空间页就是「免费/获取」
+    url = catalogNs 里 pageType=offer 的映射（移动白送的「免费/获取」
     按钮所在页）；image = 同一响应里的官方 keyImage（游戏自己封面，
-    替代营销 breaker 图）。搜索无命中/结构变更返回 None（url/image
-    两键独立可用，缺谁补谁）。
+    替代营销 breaker 图）。搜索无命中 / 官方无移动 offer 映射 /
+    结构变更返回 None（url/image 两键独立可用，缺谁补谁）。
     """
     ac = await _egs_persisted("primarySearchAutocomplete", {
         "allowCountries": "CN",
@@ -591,7 +604,7 @@ async def resolve_store_page_url(title: str, proxy: str | None = None) -> dict |
         "offerId": first.get("offerId"), "sandboxId": first.get("sandboxId"),
     }, EGS_OFFER_HASH, proxy)
     catalog = (((offer or {}).get("data") or {}).get("Catalog") or {}).get("catalogOffer") or {}
-    slug = ((catalog.get("catalogNs") or {}).get("mappings") or [{}])[0].get("pageSlug")
+    slug = _pick_mobile_slug(catalog)
     image = _pick_key_image(catalog)
     if not slug and not image:
         return None
@@ -696,9 +709,11 @@ async def fetch_mobile_freebie(proxy: str | None = None,
                                session: aiohttp.ClientSession | None = None) -> dict | None:
     """当期移动白送真名 + 官方领取入口（GamerPower 自动源）。
 
-    url 优先结账直链（标题 → sandbox offers Claim 拼装），商品页次之，
-    open 链跳转兜底；封面用商品页响应里的官方 keyImage。解析失败/网络
-    失败返回 None（调用方退 PC 元素池探测与 breaker 兜底）。
+    领取入口优先级：结账直链（登录后一键结算）→ 移动版商品页（有
+    「免费/获取」按钮）→ 官方移动商店页（entry=app，领取动作在 App
+    内）。direct=False 即入口不是一键领取，卡片须如实说明。封面用
+    商品页响应里的官方 keyImage。解析失败/网络失败返回 None（调用方
+    退 PC 元素池探测与 breaker 兜底）。
     """
     owns_session = session is None
     if owns_session:
@@ -727,11 +742,11 @@ async def fetch_mobile_freebie(proxy: str | None = None,
         freebie = parse_gamerpower_mobile(payload)
         if not freebie:
             return None
-        # 领取入口：结账直链优先，商品页次之，open 链跳转兜底；
-        # 封面用商品页响应里的官方 keyImage
+        # 领取入口：结账直链 → 移动商品页 → 官方移动商店页（App 内领取）
         checkout = await resolve_mobile_checkout(freebie["title"], proxy)
         if checkout:
             freebie["url"] = checkout["url"]
+            freebie["direct"] = True
             if not freebie.get("end") and checkout.get("end"):
                 freebie["end"] = checkout["end"]
         page = await resolve_store_page_url(freebie["title"], proxy)
@@ -740,9 +755,13 @@ async def fetch_mobile_freebie(proxy: str | None = None,
                 freebie["image"] = page["image"]
             if not checkout and page.get("url"):
                 freebie["url"] = page["url"]
-        if not checkout and (not page or not page.get("url")):
-            if freebie.get("url"):
-                freebie["url"] = await _resolve_redirect(freebie["url"], session, proxy)
+                freebie["direct"] = True
+        if not checkout and not (page and page.get("url")):
+            # 官方未公开该期移动 offer：入口只能是移动商店页本身
+            # （领取动作只在 App 内存在），不做 open 链跳转——第三方跳转
+            # 落地同样回到移动页，多绕一跳不增加可达性
+            freebie["url"] = MOBILE_PAGE_URL
+            freebie["direct"] = False
         return freebie
     finally:
         if owns_session:
@@ -788,6 +807,7 @@ async def resolve_mobile_freebie(games: list[EpicFreeGame],
         "url": f"https://store.epicgames.com/purchase?{query}",
         "end": end or None,
         "worth": g.price_original or None,
+        "direct": True,
     }
 
 
