@@ -5,7 +5,7 @@
 - 准入是**订阅（入口）级**的编排角色。它**不是**「当前内核在跑哪条订阅」，**不是**
   Runtime `GLOBAL` 的选择，也**不是** `ProxyNode.state`（节点级健康证据）。
 - `CANDIDATE`：`bootstrap.sync_subscriptions` 抓取 + 落快照后**停止**——不调用
-  `apply_snapshot`，因此不产生 `ProxyNode` / `ProxyNodeSource`、不进 eligible / pool、
+  `apply_snapshot`，因此不产生 `ProxyNode`、不进 eligible / pool、
   不改 `pool_signature`、不触发 rebuild、不进 health，也不进作业台账的来源事实。
 - `ACTIVE`：保持既有行为（`persist_snapshot → apply_snapshot`）。
 - `deprecated` 与本角色**完全独立**：不互相转换、不互相跟随（前者是旧来源的可用性
@@ -34,7 +34,13 @@ from app.domains.proxies.models import (
     ProxySubscription,
 )
 from app.domains.proxies.subscription_secret import UNREADABLE_MESSAGE, open_url
-from app.domains.proxypool.models import SubscriptionSnapshot, node_fingerprint
+from app.domains.proxypool.models import (
+    HealthObservation,
+    ProxyNode,
+    SubscriptionSnapshot,
+    node_fingerprint,
+    subscription_tag,
+)
 from app.domains.proxypool.registry import apply_snapshot, lock_subscription_mutation
 from app.domains.proxypool.scheduling import request_rebuild
 from app.domains.proxypool.subscription import (
@@ -95,13 +101,12 @@ async def exit_from_production(
 
     **只 flush，不 commit**：与晋升同一套事务约定，提交归调用方。
 
-    事务顺序（不变量 `CANDIDATE ⇒ 它的来源行已全部移除`）：
+    事务顺序（不变量 `CANDIDATE ⇒ 它提供的节点行已全部删除`）：
 
-        取写串行化边界 → 读订阅行 → 删本订阅来源行 → 置 CANDIDATE → 节点状态结算
+        取写串行化边界 → 读订阅行 → 删本订阅节点行 → 置 CANDIDATE
 
-    `ProxyNode` 身份账本一行不动：没有任何当前来源的节点由合格集口径自然退出池，
-    仍被别的订阅提供的节点不受影响。退出是**可逆**的——以后要重新进池再走一次
-    Promote（用当前 URL 的最新成功快照），不物理删除订阅行。
+    节点跟着订阅走，故本订阅提供的节点行**随退出物理删除**（连同其健康观测）。
+    别的订阅的节点不受影响——它们的归属与身份都独立。
     """
     await lock_subscription_mutation(session, subscription_id)
 
@@ -116,43 +121,39 @@ async def exit_from_production(
     # 退出会改 eligible 集合 → 用**既有规则**判断要不要重建（与同步/晋升同一条判据）。
     # 函数内 import：`bootstrap` 反向依赖本模块的 `is_admitted`，模块级会成环。
     from app.domains.proxypool.bootstrap import pool_signature
-    from app.domains.proxypool.models import ProxyNodeSource
-    from app.domains.proxypool.registry import settle_nodes_after_source_change
 
     before_sig = await pool_signature(session)
     source_node_ids = set(await session.scalars(
-        select(ProxyNodeSource.node_id)
-        .where(ProxyNodeSource.subscription_id == subscription_id)
+        select(ProxyNode.node_id)
+        .where(ProxyNode.subscription_id == subscription_id)
     ))
     removed = len(source_node_ids)
-    await session.execute(
-        delete(ProxyNodeSource).where(ProxyNodeSource.subscription_id == subscription_id)
-    )
+    if source_node_ids:
+        # 节点跟着订阅走：订阅退出即它的节点整体离场（含健康观测），不留无主台账。
+        await session.execute(
+            delete(HealthObservation)
+            .where(HealthObservation.node_id.in_(source_node_ids))
+        )
+        await session.execute(
+            delete(ProxyNode).where(ProxyNode.subscription_id == subscription_id)
+        )
     sub.admission_status = ADMISSION_CANDIDATE
     await session.flush()
-
-    # 来源全部流失的节点按注册表同一条规则向状态机要一次判定（与快照对齐共用
-    # 收尾路径）：身份账本保留，状态如实反映「订阅已不再提供」。
-    changes = await settle_nodes_after_source_change(
-        session, source_node_ids, now=now
-    )
 
     if await pool_signature(session) != before_sig:
         request_rebuild()
         log_event(
             logger,
             f"订阅 {subscription_id} 退出生产池，合格集变化已请求重建",
-            detail={"订阅编号": subscription_id, "移除来源行数": removed,
-                    "状态降级节点数": len(changes)},
+            detail={"订阅编号": subscription_id, "删除节点行数": removed},
         )
     log_event(
         logger,
         f"订阅 {subscription_id} 退出生产池，置回候选",
-        detail={"订阅编号": subscription_id, "移除来源行数": removed,
-                "状态降级节点数": len(changes)},
+        detail={"订阅编号": subscription_id, "删除节点行数": removed},
     )
     return ExitResult(subscription_id, True, "已退出生产池（置回 CANDIDATE）",
-                      removed, len(changes))
+                      removed, removed)
 
 
 async def promote_to_active(
@@ -222,8 +223,9 @@ async def promote_to_active(
 
     before_sig = await pool_signature(session)
 
+    tag = subscription_tag(url)
     result = await apply_snapshot(
-        session, subscription_id=subscription_id, snapshot=snap, now=now
+        session, subscription_id=subscription_id, snapshot=snap, now=now, tag=tag
     )
     if result.skipped_stale:
         # 兜底（边界内理论上不会发生）：手上有更新的成功快照时，绝不允许把 ACTIVE
@@ -235,7 +237,7 @@ async def promote_to_active(
     sub.admission_status = ADMISSION_ACTIVE
     await session.flush()
 
-    applied = len({node_fingerprint(dict(n)) for n in snap.nodes})
+    applied = len({node_fingerprint(dict(n), tag) for n in snap.nodes})
     if await pool_signature(session) != before_sig:
         request_rebuild()
         log_event(

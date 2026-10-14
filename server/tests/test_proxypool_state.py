@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.domains.proxypool.models import make_runtime_name, node_fingerprint  # noqa: E402
+from app.domains.proxypool.models import make_runtime_name, node_fingerprint, subscription_tag  # noqa: E402
 from app.domains.proxypool.state import (  # noqa: E402
     DEFAULT_RETIRE_AFTER_FAILED_PROBES,
     LANE_DEAD,
@@ -55,6 +55,30 @@ def test_fingerprint_stable_on_key_order() -> None:
     assert node_fingerprint(a) == node_fingerprint(b)
 
 
+def test_fingerprint_is_scoped_to_subscription() -> None:
+    """节点跟着订阅走：同一份配置由两个订阅提供时是两个节点。
+
+    体检结论与删除清理因此各归各的——一个套餐失效不牵连另一个。
+    """
+    cfg = {"type": "trojan", "server": "shared.example.net", "port": 443,
+           "password": "p1", "sni": "a.example.com"}
+    tag_a = subscription_tag("https://a.example.com/sub?token=1")
+    tag_b = subscription_tag("https://b.example.com/sub?token=2")
+    assert tag_a != tag_b
+    assert node_fingerprint(cfg, tag_a) != node_fingerprint(cfg, tag_b)
+
+
+def test_subscription_tag_is_stable_and_distinguishes_plans() -> None:
+    """同一机场的两个套餐是不同的来源：标识必须不同（按订阅而非按机场）。"""
+    a = subscription_tag("https://dash.pqjc.site/v1/sub?plan=basic")
+    b = subscription_tag("https://dash.pqjc.site/v1/sub?plan=pro")
+    assert a != b
+    # 同一链接重复取值稳定（否则每次同步都换身份）
+    assert a == subscription_tag("https://dash.pqjc.site/v1/sub?plan=basic")
+    # 可读片段带上机场域名，排障时能对上
+    assert a.endswith("pqjc.site")
+
+
 def test_fingerprint_ignores_consumer_switches() -> None:
     base = dict(_BASE_CONFIG)
     noisy = dict(
@@ -71,12 +95,25 @@ def test_fingerprint_ignores_consumer_switches() -> None:
     "mutate",
     [
         {"server": "hk02.example.net"},
-        {"port": 8443},
         {"uuid": "99999999-2222-3333-4444-555555555555"},
     ],
 )
 def test_fingerprint_differs_on_connection_params(mutate: dict) -> None:
     assert node_fingerprint({**_BASE_CONFIG, **mutate}) != node_fingerprint(_BASE_CONFIG)
+
+
+def test_fingerprint_ignores_port_when_other_fields_identify() -> None:
+    """有 password/sni 这类字段时端口只是入口：动态端口机场每次拉取都换号，
+    含它会让同一节点反复新生。"""
+    assert node_fingerprint({**_BASE_CONFIG, "port": 8443}) == node_fingerprint(_BASE_CONFIG)
+
+
+def test_fingerprint_keeps_port_when_it_is_the_only_discriminator() -> None:
+    """除端口外没有任何实质字段时，端口是唯一能分辨两个节点的东西（本地
+    代理链的常见形态），此时它必须参与身份，否则两个代理会撞成一条台账。"""
+    a = {"type": "http", "server": "127.0.0.1", "port": 14645}
+    b = {"type": "http", "server": "127.0.0.1", "port": 14646}
+    assert node_fingerprint(a) != node_fingerprint(b)
 
 
 # ── 节点身份：runtime_name（防执行器按 name 静默去重） ────────────

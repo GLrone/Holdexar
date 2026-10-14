@@ -29,7 +29,7 @@ from app.domains.proxies.models import (  # noqa: E402
 )
 from app.domains.proxypool import bootstrap as bs  # noqa: E402
 from app.domains.proxypool.models import (  # noqa: E402
-    ProxyNode, ProxyNodeSource, SubscriptionSnapshot,
+    ProxyNode, SubscriptionSnapshot,
 )
 from app.domains.proxypool.runtime import (  # noqa: E402
     prepare_runtime_config, require_runtime_proxy_url,
@@ -39,6 +39,56 @@ from app.domains.proxypool.subscription import (  # noqa: E402
 )
 
 NOW = datetime(2026, 9, 19, 12, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_automatic_sync_accepts_renewed_resource_header(tmp_data_dir, monkeypatch):
+    from app.domains.proxypool.pool import eligible_nodes
+
+    await init_db()
+    sid = await _add_subscription()
+    async with get_session_factory()() as session:
+        sub = await session.get(ProxySubscription, sid)
+        sub.last_stats = {"traffic": "expire=1", "labelSource": "user"}
+        sub.deprecated = True
+        sub.deprecated_reason = "订阅已到期"
+        await session.commit()
+    renewed = _fetch_ok([_node("renewed", "127.0.0.1")])
+    renewed.userinfo = "expire=2524608000; total=1000; download=1"
+
+    async def fetch(*args, **kwargs):
+        return renewed
+
+    monkeypatch.setattr(bs, "fetch_subscription", fetch)
+    async with get_session_factory()() as session:
+        result = await bs.sync_subscriptions(session, data_dir=tmp_data_dir, now=NOW, only_auto=True)
+        assert not result.failures
+        sub = await session.get(ProxySubscription, sid)
+        assert sub.resource_block_reason() is None and not sub.deprecated
+        assert sub.last_stats["labelSource"] == "user"
+        assert len(await eligible_nodes(session)) == 1
+
+
+@pytest.mark.asyncio
+async def test_subscription_download_preserves_resource_header():
+    from app.domains.proxypool.subscription import Channel, fetch_subscription
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, *args, **kwargs):
+            return httpx.Response(200, content=b"proxies: []\n", headers={
+                "subscription-userinfo": "expire=2524608000",
+            })
+
+    result = await fetch_subscription(
+        "https://example.test/sub", [Channel("direct")], client_factory=lambda _: Client(),
+    )
+    assert result.userinfo == "expire=2524608000"
 
 
 # ── 夹具 ─────────────────────────────────────────────────────────
@@ -280,7 +330,7 @@ async def test_subscription_id_is_proxy_subscriptions_id(
         await s.commit()
 
     async with get_session_factory()() as s:
-        sources = list((await s.execute(select(ProxyNodeSource))).scalars())
+        sources = list((await s.execute(select(ProxyNode))).scalars())
     assert sources and {src.subscription_id for src in sources} == {sub_id}
     # 绝不是 snapshot id
     async with get_session_factory()() as s:
@@ -393,7 +443,7 @@ async def test_sync_records_failure_without_crashing(tmp_data_dir, monkeypatch):
     # savepoint 隔离：失败那条没留下节点/来源，成功那条正常
     async with get_session_factory()() as s:
         n_nodes = await s.scalar(select(func.count()).select_from(ProxyNode))
-        n_src = await s.scalar(select(func.count()).select_from(ProxyNodeSource))
+        n_src = await s.scalar(select(func.count()).select_from(ProxyNode))
     assert (n_nodes, n_src) == (1, 1), "失败条目不得留下半截写入，成功条目要落库"
 
 
@@ -457,3 +507,25 @@ async def test_sync_subscriptions_one_failure_does_not_block_others(
 
     assert len(sync.failures) == 1, "只有失败那条被记账"
     assert len(sync.snapshot_sha256) == 2, "其余两条照常落快照"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,value", [
+    ("port", 8443), ("udp", True), ("dialer-proxy", "DIRECT"),
+])
+async def test_pool_signature_changes_with_connection_parameters(tmp_data_dir, field, value):
+    await init_db()
+    async with get_session_factory()() as session:
+        node = ProxyNode(node_id="connection", fingerprint="identity",
+                         runtime_name="1|connection", subscription_id=1,
+                         proxy_type="ss", server="edge.example.test",
+                         original_name="connection", state="ACTIVE",
+                         normalized_config={"name": "connection", "type": "ss",
+                                            "server": "edge.example.test", "port": 443,
+                                            "cipher": "aes-128-gcm", "password": "fixture"})
+        session.add(node)
+        await session.commit()
+        before = await bs.pool_signature(session)
+        node.normalized_config = {**node.normalized_config, field: value}
+        await session.commit()
+        assert await bs.pool_signature(session) != before

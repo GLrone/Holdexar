@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 
 import pytest
 import yaml
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from app.core.config import get_settings
 from app.core.database import get_engine, get_session_factory, init_db
@@ -27,7 +27,6 @@ from app.domains.proxypool import runtime as rt
 from app.core.orchestration import OrchestrationEvent
 from app.domains.proxypool.models import (
     ProxyNode,
-    ProxyNodeSource,
 )
 from app.domains.proxypool.subscription import (
     FetchAttempt,
@@ -70,8 +69,9 @@ async def _node(node_id: str, sources: list[int]) -> None:
                                            "server": "10.0.0.1", "port": 1},
                         state="ACTIVE", first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
         for sid in sources:
-            s.add(ProxyNodeSource(node_id=node_id, subscription_id=sid,
-                                  original_name=node_id, first_seen=NOW, last_seen=NOW))
+            await s.execute(update(ProxyNode)
+                .where(ProxyNode.node_id == node_id)
+                .values(subscription_id=sid, original_name=node_id))
         await s.commit()
 
 

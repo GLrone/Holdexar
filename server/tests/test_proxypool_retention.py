@@ -2,7 +2,7 @@
 
 保留策略的三条硬要求：
 1. **分块**删除（每块一个事务）——一次删几十万行会长时间持写锁；
-2. **删观测不删身份**：`proxy_nodes` / `proxy_node_sources` / `pool_generations` 一行不碰；
+2. **删观测不删身份**：`proxy_nodes` / `pool_generations` 一行不碰；
 3. 作业台账至少留最近 N 行、快照每订阅至少留最新几条（`latest_snapshot` 依赖的那条永不删）。
 
 不做：VACUUM、快照原始 `.bin` 的 GC（P1.9 既有决定）、任何阈值判定。
@@ -206,16 +206,9 @@ async def test_identity_tables_never_pruned(tmp_data_dir):
         await session.execute(
             text(
                 "INSERT INTO proxy_nodes "
-                "(node_id, fingerprint, runtime_name, proxy_type, server, normalized_config, "
-                " state, first_seen, consecutive_failures) "
-                "VALUES ('n1', 'f1', '1|A', 'ss', '10.0.0.1', '{}', 'ACTIVE', :at, 0)"
-            ),
-            {"at": NOW - timedelta(days=500)},
-        )
-        await session.execute(
-            text(
-                "INSERT INTO proxy_node_sources (node_id, subscription_id, original_name, source_code, first_seen, last_seen) "
-                "VALUES ('n1', 1, 'A', 'ss', :at, :at)"
+                "(node_id, fingerprint, runtime_name, subscription_id, original_name, "
+                " proxy_type, server, normalized_config, state, first_seen, consecutive_failures) "
+                "VALUES ('n1', 'f1', '1|A', 1, 'A', 'ss', '10.0.0.1', '{}', 'ACTIVE', :at, 0)"
             ),
             {"at": NOW - timedelta(days=500)},
         )
@@ -234,7 +227,6 @@ async def test_identity_tables_never_pruned(tmp_data_dir):
 
     async with get_session_factory()() as session:
         assert await _count(session, "proxy_nodes") == 1
-        assert await _count(session, "proxy_node_sources") == 1
         assert await _count(session, "pool_generations") == 1
         assert await _count(session, "health_observations") == 0
 

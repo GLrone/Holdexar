@@ -36,6 +36,7 @@ from app.domains.proxies.models import (  # noqa: E402
     ADMISSION_CANDIDATE,
     ProxySubscription,
 )
+from app.domains.proxies.subscription_secret import open_url  # noqa: E402
 from app.domains.proxypool import bootstrap as bs  # noqa: E402
 from app.domains.proxypool import scheduling  # noqa: E402
 from app.domains.proxypool.admission import (  # noqa: E402
@@ -44,9 +45,9 @@ from app.domains.proxypool.admission import (  # noqa: E402
 )
 from app.domains.proxypool.models import (  # noqa: E402
     ProxyNode,
-    ProxyNodeSource,
     SubscriptionSnapshot,
     node_fingerprint,
+    subscription_tag,
 )
 from app.domains.proxypool.registry import apply_snapshot  # noqa: E402
 from app.domains.proxypool.subscription import (  # noqa: E402
@@ -83,8 +84,17 @@ def _node(name: str, server: str) -> dict:
     return {"name": name, "type": "http", "server": server, "port": 1}
 
 
-def _fps(nodes: list[dict]) -> set[str]:
-    return {node_fingerprint(n) for n in nodes}
+def _fps(nodes: list[dict], url: str = "") -> set[str]:
+    """期望指纹：与生产同源，节点身份含订阅标识。"""
+    tag = subscription_tag(url) if url else ""
+    return {node_fingerprint(n, tag) for n in nodes}
+
+
+async def _sub_url(sub_id: int) -> str:
+    """订阅链接（解密后的明文），用来算与生产一致的节点指纹。"""
+    async with get_session_factory()() as s:
+        sub = await s.get(ProxySubscription, sub_id)
+        return open_url(sub.url) or "" if sub else ""
 
 
 def _fetch_result(nodes: list[dict]) -> FetchResult:
@@ -137,17 +147,23 @@ async def _source_fps(sub_id: int) -> set[str]:
     async with get_session_factory()() as s:
         rows = await s.execute(
             select(ProxyNode.fingerprint)
-            .join(ProxyNodeSource, ProxyNodeSource.node_id == ProxyNode.node_id)
-            .where(ProxyNodeSource.subscription_id == sub_id)
+            .where(ProxyNode.subscription_id == sub_id)
         )
     return {r[0] for r in rows.all()}
 
 
 async def _counts() -> tuple[int, int, int]:
+    """(节点行数, 归属该订阅的节点数, 快照数)。
+
+    第二项数的是「归属该订阅的节点」——节点自带归属，不经过来源关联表。
+    """
     async with get_session_factory()() as s:
         return (
             int(await s.scalar(select(func.count()).select_from(ProxyNode))),
-            int(await s.scalar(select(func.count()).select_from(ProxyNodeSource))),
+            int(await s.scalar(
+                select(func.count()).select_from(ProxyNode)
+                .where(ProxyNode.subscription_id.is_not(None))
+            )),
             int(await s.scalar(select(func.count()).select_from(SubscriptionSnapshot))),
         )
 
@@ -166,7 +182,10 @@ async def _apply_snapshot_nodes(sub_id: int, nodes: list[dict], data_dir) -> Non
         source_channel="test", nodes=nodes,
     )
     async with get_session_factory()() as s:
-        await apply_snapshot(s, subscription_id=sub_id, snapshot=snap, now=NOW)
+        await apply_snapshot(
+            s, subscription_id=sub_id, snapshot=snap, now=NOW,
+            tag=subscription_tag(await _sub_url(sub_id)),
+        )
         await s.commit()
 
 
@@ -237,15 +256,15 @@ async def test_interleave_sync_then_promote(tmp_data_dir, monkeypatch):
     # promote：取边界 → 读 S1 → apply → ACTIVE → commit
     await _promote(sub_id, tmp_data_dir)
     assert await _status(sub_id) == ADMISSION_ACTIVE
-    assert await _source_fps(sub_id) == _fps(s1)
+    assert await _source_fps(sub_id) == _fps(s1, await _sub_url(sub_id))
 
     gate.set()
     await asyncio.wait_for(task, timeout=20)
 
     # 现读准入：sync 看到 ACTIVE → 落 S2 并 apply → 最终是 S2（最新成功快照）
     assert await _status(sub_id) == ADMISSION_ACTIVE
-    assert await _source_fps(sub_id) == _fps(s2), "现读准入后必须落到最新那份"
-    assert await _source_fps(sub_id) != _fps(s1) | _fps(s2), "不得是并集"
+    assert await _source_fps(sub_id) == _fps(s2, await _sub_url(sub_id)), "现读准入后必须落到最新那份"
+    assert await _source_fps(sub_id) != _fps(s1, await _sub_url(sub_id)) | _fps(s2, await _sub_url(sub_id)), "不得是并集"
     nodes, sources, snaps = await _counts()
     # 来源只有 S2 的两条；节点行是身份台账（a2 的来源流失后行仍在，state→DEAD，不删行）
     assert sources == 2
@@ -302,10 +321,10 @@ async def test_promote_boundary_first_sync_waits_then_applies_newest(
     release.set()
     await asyncio.wait_for(promo, timeout=20)
     assert await _status(sub_id) == ADMISSION_ACTIVE
-    assert await _source_fps(sub_id) == _fps(s1)
+    assert await _source_fps(sub_id) == _fps(s1, await _sub_url(sub_id))
 
     await asyncio.wait_for(sync_task, timeout=20)
-    assert await _source_fps(sub_id) == _fps(s2), "sync 必须把最新 S2 应用进 Registry"
+    assert await _source_fps(sub_id) == _fps(s2, await _sub_url(sub_id)), "sync 必须把最新 S2 应用进 Registry"
     assert await _status(sub_id) == ADMISSION_ACTIVE
     async with get_session_factory()() as s:
         row = await s.get(ProxySubscription, sub_id)
@@ -369,9 +388,9 @@ async def test_promote_applies_newest_when_sync_lands_before_boundary(
     go.set()
     await asyncio.wait_for(task, timeout=20)
     assert await _status(sub_id) == ADMISSION_ACTIVE
-    assert await _source_fps(sub_id) == _fps(nodes_b), "必须应用当前最新的 B"
+    assert await _source_fps(sub_id) == _fps(nodes_b, await _sub_url(sub_id)), "必须应用当前最新的 B"
     assert await _source_fps(sub_id) != set(), "绝不允许 ACTIVE + Registry 空"
-    assert await _source_fps(sub_id) != _fps(nodes_a), "不得是旧 A"
+    assert await _source_fps(sub_id) != _fps(nodes_a, await _sub_url(sub_id)), "不得是旧 A"
 
 
 # ══ D. 兜底：apply 被判 skipped_stale 时绝不写 ACTIVE ════════════════
@@ -426,20 +445,20 @@ async def test_interleaved_applies_never_union_last_writer_wins(
 
     import app.domains.proxypool.registry as registry
 
-    real_sources_of = registry._sources_of
+    real_nodes_of = registry._nodes_of
     calls = {"n": 0}
     first_read = asyncio.Event()
     release = asyncio.Event()
 
-    async def _blocking_sources_of(session, subscription_id):
-        rows = await real_sources_of(session, subscription_id)
+    async def _blocking_nodes_of(session, subscription_id):
+        rows = await real_nodes_of(session, subscription_id)
         calls["n"] += 1
         if calls["n"] == 1:  # 第一个 writer 读完后停住（此刻它已持写锁）
             first_read.set()
             await release.wait()
         return rows
 
-    monkeypatch.setattr(registry, "_sources_of", _blocking_sources_of)
+    monkeypatch.setattr(registry, "_nodes_of", _blocking_nodes_of)
     first = asyncio.create_task(
         _apply_snapshot_nodes(sub_id, nodes_first, tmp_data_dir)
     )
@@ -451,12 +470,12 @@ async def test_interleaved_applies_never_union_last_writer_wins(
     assert not second.done(), "第二个 apply 必须在写锁上等待，不能与第一个交错"
     release.set()
     await asyncio.wait_for(asyncio.gather(first, second), timeout=20)
-    monkeypatch.setattr(registry, "_sources_of", real_sources_of)
+    monkeypatch.setattr(registry, "_nodes_of", real_nodes_of)
 
     got = await _source_fps(sub_id)
     assert len(got) == 2, f"来源集合只能是**一份**快照的规模，实得 {len(got)}：{got}"
-    assert got != _fps(nodes_first) | _fps(nodes_second), "绝不能是两份快照的并集"
-    assert got == _fps(nodes_second), "必须严格等于最后生效的那份快照"
+    assert got != _fps(nodes_first, await _sub_url(sub_id)) | _fps(nodes_second, await _sub_url(sub_id)), "绝不能是两份快照的并集"
+    assert got == _fps(nodes_second, await _sub_url(sub_id)), "必须严格等于最后生效的那份快照"
 
 
 @pytest.mark.asyncio
@@ -475,7 +494,7 @@ async def test_concurrent_applies_always_end_at_one_snapshot(tmp_data_dir):
             return_exceptions=True,
         )
         got = await _source_fps(sub_id)
-        assert got in (_fps(sets[0]), _fps(sets[1])), f"出现并集/混合：{got}"
+        assert got in (_fps(sets[0], await _sub_url(sub_id)), _fps(sets[1], await _sub_url(sub_id))), f"出现并集/混合：{got}"
 
 
 # ══ E. 强制时序：第二个 promote 被边界挡住 → 幂等空转 ════════════════
@@ -542,7 +561,7 @@ async def test_forced_interleave_second_promote_waits_then_noops(
     r1 = await asyncio.wait_for(t1, timeout=20)
     assert r1 is True
     assert await _status(sub_id) == ADMISSION_ACTIVE
-    assert await _source_fps(sub_id) == _fps(nodes)
+    assert await _source_fps(sub_id) == _fps(nodes, await _sub_url(sub_id))
 
     # T2 这才继续：取边界 → 读订阅行（新鲜）→ 已是 ACTIVE → 幂等空转
     results = await asyncio.gather(t2, return_exceptions=True)
@@ -551,7 +570,7 @@ async def test_forced_interleave_second_promote_waits_then_noops(
     )
     assert results[0] is False, f"T2 应为幂等空转（已是 ACTIVE），实得 {results[0]!r}"
     assert await _status(sub_id) == ADMISSION_ACTIVE
-    assert await _source_fps(sub_id) == _fps(nodes), "最终仍是一份完整集合"
+    assert await _source_fps(sub_id) == _fps(nodes, await _sub_url(sub_id)), "最终仍是一份完整集合"
 
 
 # ══ F. 顺序语义：最新成功快照胜（out-of-order 不得回退） ═════════════
@@ -578,18 +597,21 @@ async def test_out_of_order_older_snapshot_does_not_regress_registry(tmp_data_di
     snap_a = await _persist_nodes(sub_id, nodes_a, earlier, tmp_data_dir)
     snap_b = await _persist_nodes(sub_id, nodes_b, later, tmp_data_dir)
 
+    tag = subscription_tag(await _sub_url(sub_id))
     async with get_session_factory()() as s:  # B 先
-        await apply_snapshot(s, subscription_id=sub_id, snapshot=snap_b, now=later)
+        await apply_snapshot(
+            s, subscription_id=sub_id, snapshot=snap_b, now=later, tag=tag
+        )
         await s.commit()
-    assert await _source_fps(sub_id) == _fps(nodes_b)
+    assert await _source_fps(sub_id) == _fps(nodes_b, await _sub_url(sub_id))
 
     async with get_session_factory()() as s:  # A 后（更旧）
         result = await apply_snapshot(
-            s, subscription_id=sub_id, snapshot=snap_a, now=later
+            s, subscription_id=sub_id, snapshot=snap_a, now=later, tag=tag
         )
         await s.commit()
     assert result.skipped_stale is True, "更旧的快照必须整体跳过"
-    assert await _source_fps(sub_id) == _fps(nodes_b), "旧快照不得回退 Registry"
+    assert await _source_fps(sub_id) == _fps(nodes_b, await _sub_url(sub_id)), "旧快照不得回退 Registry"
 
     # 反例守卫：新快照仍然照常生效（不能把跳过规则做成"永不更新"）
     nodes_c = [_node("g3", "10.0.0.3")]
@@ -598,11 +620,12 @@ async def test_out_of_order_older_snapshot_does_not_regress_registry(tmp_data_di
     )
     async with get_session_factory()() as s:
         result2 = await apply_snapshot(
-            s, subscription_id=sub_id, snapshot=snap_c, now=datetime(2026, 9, 21, 12, 0, 0)
+            s, subscription_id=sub_id, snapshot=snap_c,
+            now=datetime(2026, 9, 21, 12, 0, 0), tag=tag,
         )
         await s.commit()
     assert result2.skipped_stale is False
-    assert await _source_fps(sub_id) == _fps(nodes_c)
+    assert await _source_fps(sub_id) == _fps(nodes_c, await _sub_url(sub_id))
 
 
 # ══ H. 「最新」的事实源 = 成功落库顺序（id），不是 fetched_at ════════
@@ -636,22 +659,23 @@ async def test_latest_means_last_landed_not_last_fetched(tmp_data_dir):
         "latest_snapshot 必须按落库顺序取到 A"
     )
 
+    tag = subscription_tag(await _sub_url(sub_id))
     async with get_session_factory()() as s:  # 最后成功落库的那份必须能应用
         first = await apply_snapshot(
-            s, subscription_id=sub_id, snapshot=latest, now=fetched_early
+            s, subscription_id=sub_id, snapshot=latest, now=fetched_early, tag=tag
         )
         await s.commit()
     assert first.skipped_stale is False, "最后落库的快照不得被判陈旧"
-    assert await _source_fps(sub_id) == _fps(nodes_a)
+    assert await _source_fps(sub_id) == _fps(nodes_a, await _sub_url(sub_id))
 
     async with get_session_factory()() as s:  # 更早落库的那份必须被跳过
         older = await apply_snapshot(
             s, subscription_id=sub_id, snapshot=_snapshot_of(sub_id, nodes_b, fetched_late),
-            now=fetched_late,
+            now=fetched_late, tag=tag,
         )
         await s.commit()
     assert older.skipped_stale is True
-    assert await _source_fps(sub_id) == _fps(nodes_a), "Registry 必须保持最后落库那份"
+    assert await _source_fps(sub_id) == _fps(nodes_a, await _sub_url(sub_id)), "Registry 必须保持最后落库那份"
 
 
 # ══ G. 双击晋升（同快照并发）→ 不 500，最终仍是一份完整集合 ══════════
@@ -686,4 +710,4 @@ async def test_double_promote_same_snapshot_stays_consistent(tmp_data_dir, monke
     )
     assert any(r is True for r in results), f"至少一个请求应完成晋升：{results}"
     assert await _status(sub_id) == ADMISSION_ACTIVE
-    assert await _source_fps(sub_id) == _fps(nodes), "最终必须是一份完整的来源集合"
+    assert await _source_fps(sub_id) == _fps(nodes, await _sub_url(sub_id)), "最终必须是一份完整的来源集合"

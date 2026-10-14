@@ -9,12 +9,12 @@ from datetime import datetime
 
 import pytest
 import yaml
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.core.config import get_settings
 from app.core.database import get_engine, get_session_factory, init_db
 from app.domains.proxypool import health as H
-from app.domains.proxypool.models import ProxyNode, ProxyNodeSource
+from app.domains.proxypool.models import ProxyNode
 from app.domains.proxypool.pool import pool_path
 from app.domains.proxypool.state import (
     DEFAULT_RETIRE_AFTER_FAILED_PROBES,
@@ -55,8 +55,9 @@ async def _prepare(data_dir, *, state: str = "NEW", failures: int = 0) -> None:
                         normalized_config={"name": "probe-node"}, state=state,
                         consecutive_failures=failures,
                         first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
-        s.add(ProxyNodeSource(node_id=NODE_ID, subscription_id=1,
-                              original_name="probe-node", first_seen=NOW, last_seen=NOW))
+        await s.execute(update(ProxyNode)
+            .where(ProxyNode.node_id == NODE_ID)
+            .values(subscription_id=1, original_name="probe-node"))
         await s.commit()
 
 
@@ -145,3 +146,21 @@ async def test_retire_threshold_consumes_real_count(env, monkeypatch):
     node = await _node()
     assert node.consecutive_failures == DEFAULT_RETIRE_AFTER_FAILED_PROBES
     assert node.state == NODE_RETIRED
+
+
+@pytest.mark.asyncio
+async def test_steam_http_error_does_not_promote_node_to_business_ready(env):
+    await _prepare(env, state="NEW", failures=1)
+    async with get_session_factory()() as session:
+        node = await session.scalar(select(ProxyNode).where(ProxyNode.node_id == NODE_ID))
+        result = H.BusinessResult(
+            runtime_name=NAME, ok=False, http_status=429,
+            final_price_in_cents=None, detail=H.TARGET_SERVICE_FAILED, latency_ms=5,
+        )
+        await H._commit_business_wave(
+            session, [(node, result)], now=NOW, run_id=None,
+            channel="scheduled", target_url=H.business_probe_url(),
+        )
+    node = await _node()
+    assert node.state == "NEW"
+    assert node.consecutive_failures == 1

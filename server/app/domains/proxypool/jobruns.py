@@ -34,7 +34,6 @@ from app.domains.proxypool.models import (
     HealthRun,
     ProxyJobRun,
     ProxyNode,
-    ProxyNodeSource,
     SubscriptionSnapshot,
 )
 from app.domains.proxypool.pool import eligible_nodes, pool_path
@@ -186,14 +185,8 @@ async def _pool_facts(session: AsyncSession, data_dir: Path) -> dict:
     """
     nodes = await eligible_nodes(session)
     node_ids = [n.node_id for n in nodes]
-    sub_ids: list[int] = []
-    if node_ids:
-        rows = await session.execute(
-            select(ProxyNodeSource.subscription_id)
-            .where(ProxyNodeSource.node_id.in_(node_ids))
-            .distinct()
-        )
-        sub_ids = sorted({int(v) for v in rows.scalars()})
+    # 合格节点的归属订阅（节点跟着订阅走，归属直接在节点行上）
+    sub_ids = sorted({int(n.subscription_id) for n in nodes if n.subscription_id})
 
     snapshots: list[int] = []
     if sub_ids:

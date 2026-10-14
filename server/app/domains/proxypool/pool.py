@@ -29,7 +29,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domains.proxypool.models import (
     ProxyNode,
-    ProxyNodeSource,
     is_info_placeholder,
 )
 from app.domains.proxypool.state import NODE_ACTIVE, NODE_NEW, NODE_STALE
@@ -84,52 +83,33 @@ def _is_complete(node: ProxyNode) -> bool:
 
 
 def _render_proxies(nodes: Sequence[ProxyNode]) -> list[dict]:
-    """把台账行变成池条目：配置副本 + 覆盖成持久化运行名。
+    """按订阅改写连接引用，保留节点参数与输入顺序。"""
+    from app.domains.proxies.runtime_config import resolve_node_dependencies
 
-    只改**副本**：`normalized_config` 是这条台账的事实副本，就地改写会污染它。
-    """
-    proxies: list[dict] = []
-    for node in nodes:
-        payload = dict(node.normalized_config)
-        payload["name"] = node.runtime_name
-        proxies.append(payload)
-    _resolve_dialer_refs(proxies)
+    grouped: dict[int | None, list[tuple[int, ProxyNode]]] = {}
+    for index, node in enumerate(nodes):
+        grouped.setdefault(node.subscription_id, []).append((index, node))
+    proxies: list[dict | None] = [None] * len(nodes)
+    for members in grouped.values():
+        names: dict[str, str] = {}
+        ambiguous: set[str] = set()
+        payloads = []
+        for _, node in members:
+            payload = {**dict(node.normalized_config), "name": node.runtime_name}
+            original = str(node.original_name or node.normalized_config.get("name") or "")
+            if original in names and names[original] != node.runtime_name:
+                ambiguous.add(original)
+            names[original] = node.runtime_name
+            payloads.append(payload)
+        if any(p.get("dialer-proxy") in ambiguous for p in payloads):
+            raise PoolBuildError("节点连接依赖有重名，无法确定目标")
+        try:
+            resolved = resolve_node_dependencies(payloads, names)
+        except ValueError as exc:
+            raise PoolBuildError(f"节点连接依赖不完整：{exc}") from exc
+        for (index, _), payload in zip(members, resolved, strict=True):
+            proxies[index] = payload
     return proxies
-
-
-def _resolve_dialer_refs(proxies: list[dict]) -> None:
-    """就地改写 `dialer-proxy`：订阅原名 → 池内真实条目名，映射不到则剥离。
-
-    条目名由 `make_runtime_name` 铸成 `<订阅>|原名`，而订阅下发来的
-    `dialer-proxy` 值仍是**未加前缀的原名**。渲染若只覆盖 name 不动引用，
-    内核 `-t` 校验会以 `dialer-proxy [原名] not found` 拒配——整池起不来，
-    价格/抓取链全部被闸在门外。这里按同一订阅前缀回填；目标不在本次渲染集
-    （未入选或已退役）时剥离该字段——留悬空引用等于把一次订阅改名变成下次
-    启动的拒配。
-    """
-    known = {str(p["name"]) for p in proxies}
-    for payload in proxies:
-        raw = payload.get("dialer-proxy")
-        if not raw:
-            continue
-        name = str(payload.get("name") or "")
-        prefix, _, _ = name.partition("|")
-        resolved = ""
-        if prefix and "|" in name:
-            base = f"{prefix}|{raw}"
-            if base in known:
-                resolved = base
-            else:
-                # 同订阅撞名：make_runtime_name 追加 #2 #3…
-                for suffix in range(2, 10):
-                    alias = f"{base}#{suffix}"
-                    if alias in known:
-                        resolved = alias
-                        break
-        if resolved:
-            payload["dialer-proxy"] = resolved
-        else:
-            payload.pop("dialer-proxy", None)
 
 
 def render_pool(nodes: Sequence[ProxyNode]) -> tuple[str, tuple[str, ...]]:
@@ -137,8 +117,7 @@ def render_pool(nodes: Sequence[ProxyNode]) -> tuple[str, tuple[str, ...]]:
 
     单独暴露是为了让「重名即拒绝」这条规则**不依赖数据库唯一约束兜底**也测得到。
     """
-    proxies = _render_proxies(nodes)
-    names = tuple(str(p["name"]) for p in proxies)
+    names = tuple(str(node.runtime_name) for node in nodes)
 
     seen: set[str] = set()
     duplicates: list[str] = []
@@ -152,6 +131,7 @@ def render_pool(nodes: Sequence[ProxyNode]) -> tuple[str, tuple[str, ...]]:
             "（写盘前即拒绝：宁可不生成，也不生成一个静默少节点的池）"
         )
 
+    proxies = _render_proxies(nodes)
     text = yaml.safe_dump(
         {"proxies": proxies}, allow_unicode=True, sort_keys=False
     )
@@ -164,18 +144,23 @@ async def eligible_nodes(session: AsyncSession) -> list[ProxyNode]:
     维护事务要回答"此刻池里还有谁"（例如恢复 GLOBAL 时要判断原节点是否已出池），
     不能为此写一次池文件——落盘是 `build_pool` 的职责。
 
-    合格 = 状态合格 + 配置完整 + **至少一个当前来源**：身份账本（`ProxyNode`）保留，
-    但没有任何订阅提供它的节点不该占运行位——订阅退出生产池后，只由它提供的节点
-    因此自然退出池，而仍被别的订阅提供的节点不受影响。
+    合格 = 状态合格 + 配置完整 + **仍归属订阅**（`subscription_id` 非空）：解除
+    归属的节点（订阅撤掉它、订阅退出生产池或被删）不再占运行位。
     信息占位节点（机场公告位）即使已混入账本也**永不合格**——它们不是可用的
     代理端点。
     """
-    rows = await session.execute(
+    from app.domains.proxies.models import ProxySubscription
+
+    subscriptions = (await session.execute(select(ProxySubscription))).scalars().all()
+    blocked = {s.id for s in subscriptions if s.resource_block_reason() is not None}
+    query = (
         select(ProxyNode)
         .where(ProxyNode.state.in_(sorted(POOL_ELIGIBLE_STATES)))
-        .where(exists().where(ProxyNodeSource.node_id == ProxyNode.node_id))
-        .order_by(ProxyNode.id)
+        .where(ProxyNode.subscription_id.is_not(None))
     )
+    if blocked:
+        query = query.where(ProxyNode.subscription_id.not_in(blocked))
+    rows = await session.execute(query.order_by(ProxyNode.id))
     return [
         node for node in rows.scalars()
         if _is_complete(node) and not is_info_placeholder(node.runtime_name)

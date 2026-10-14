@@ -19,16 +19,21 @@ from datetime import datetime
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.domains.proxies.models import ProxySubscription
 from app.domains.proxypool.models import (
     ProxyNode,
-    ProxyNodeSource,
     SubscriptionSnapshot,
     is_info_placeholder,
     make_runtime_name,
     node_fingerprint,
-    subscription_code,
 )
-from app.domains.proxypool.state import NODE_NEW, evaluate_node_state
+from app.domains.proxypool.state import (
+    NODE_DEAD,
+    NODE_NEW,
+    NODE_STALE,
+    apply_transition,
+    evaluate_node_state,
+)
 from app.domains.proxypool.subscription import Snapshot
 
 
@@ -56,9 +61,9 @@ async def lock_subscription_mutation(session: AsyncSession, subscription_id: int
     在同一事务里重复调用是幂等的（第二条 UPDATE 命中同一写事务）。
     """
     await session.execute(
-        update(ProxyNodeSource)
-        .where(ProxyNodeSource.subscription_id == subscription_id)
-        .values(last_seen=ProxyNodeSource.last_seen)
+        update(ProxyNode)
+        .where(ProxyNode.subscription_id == subscription_id)
+        .values(last_source_seen=ProxyNode.last_source_seen)
         .execution_options(synchronize_session=False)
     )
 
@@ -66,9 +71,8 @@ async def lock_subscription_mutation(session: AsyncSession, subscription_id: int
 async def _minted_names(session: AsyncSession, subscription_id: int) -> set[str]:
     """本订阅铸过的名字。
 
-    必须包含**来源已流失但节点仍存在**的那些：它们的 `runtime_name` 仍被占用，
-    若漏掉就会给新节点铸出同名（撞全局唯一约束，或静默覆盖别人的名字）。
-    `runtime_name` 形如 `<订阅>|<名>`，故按前缀筛即完整覆盖本订阅。
+    `runtime_name` 形如 `<订阅>|<名>`，按前缀筛即覆盖本订阅；已不再提供但行仍在
+    的节点其名字同样被占用，漏掉会给新节点铸出同名（撞唯一约束或静默覆盖）。
     """
     rows = await session.execute(
         select(ProxyNode.runtime_name).where(
@@ -78,12 +82,12 @@ async def _minted_names(session: AsyncSession, subscription_id: int) -> set[str]
     return {name for (name,) in rows.all()}
 
 
-async def _sources_of(session: AsyncSession, subscription_id: int) -> dict[str, str]:
-    """本订阅现有来源 → {指纹: node_id}。"""
+async def _nodes_of(session: AsyncSession, subscription_id: int) -> dict[str, str]:
+    """本订阅现有节点 → {指纹: node_id}。"""
     rows = await session.execute(
-        select(ProxyNodeSource.node_id, ProxyNode.fingerprint)
-        .join(ProxyNode, ProxyNode.node_id == ProxyNodeSource.node_id)
-        .where(ProxyNodeSource.subscription_id == subscription_id)
+        select(ProxyNode.node_id, ProxyNode.fingerprint).where(
+            ProxyNode.subscription_id == subscription_id
+        )
     )
     return {fingerprint: node_id for node_id, fingerprint in rows.all()}
 
@@ -151,29 +155,31 @@ async def settle_nodes_after_source_change(
 ) -> tuple[tuple[str, str, str], ...]:
     """来源变动后的节点收尾（快照对齐 / 退出 / 删除路径共用，唯一实现）：
 
-    仍有来源 → `last_source_seen` 对齐剩余来源的最近 seen；来源全部流失 → 向
-    状态机要一次判定（`probe_ok=None`）。只 flush，不 commit。
+    仍归属订阅（`subscription_id` 非空）→ 推进 `last_source_seen`；归属被解除
+    （订阅撤掉它、退出生产池或被删）→ 向状态机要一次判定（`probe_ok=None`）。
+    只 flush，不 commit。
     """
     changes: list[tuple[str, str, str]] = []
     for node_id in sorted(node_ids):
         row = (
             await session.execute(select(ProxyNode).where(ProxyNode.node_id == node_id))
         ).scalar_one()
-        remaining = await session.scalar(
-            select(func.count())
-            .select_from(ProxyNodeSource)
-            .where(ProxyNodeSource.node_id == node_id)
-        )
-        if remaining:
-            # last_source_seen 的语义是「全部来源 last_seen 的最大值」——本轮本订阅
-            # 撤掉、别的订阅没刷新时绝不能写 now：那会把节点的"最后见到"时刻凭空
-            # 推到本轮，STALE 候选按新鲜度筛选会因此误判。
-            latest = await session.scalar(
-                select(func.max(ProxyNodeSource.last_seen)).where(
-                    ProxyNodeSource.node_id == node_id
-                )
-            )
-            row.last_source_seen = latest or now
+        if row.subscription_id is not None:
+            row.last_source_seen = now
+            # 来源仍在提供却停在 DEAD 的节点必须放出来重参选：它已经掉出池文件，
+            # 池内核因此不认识它，体检只能拿到「名字没定位到（404）」，而 404 又
+            # 坐实 DEAD —— 订阅每轮刷新都在提供它，状态却永远翻不回来。这里按
+            # 「订阅还在给这个节点」这条来源证据把它放回 STALE（池成员，可被体检
+            # 找到），由下一轮体检用真实结果决定 ACTIVE 还是继续 DEAD；不直接判
+            # ACTIVE，避免未经体检就把流量放给一个刚失败过的出口。
+            if row.state == NODE_DEAD:
+                # 直接走合法转移表：evaluate_node_state 在 probe_ok=None 时
+                # 刻意不让 DEAD 凭来源证据跃回运行集（避免未测节点进池），而这里
+                # 正是要给一次重测机会——目标是 STALE（池成员）而非 ACTIVE，
+                # 能否真正回 ACTIVE 交给下一轮体检的真实结果裁决。
+                row.state = apply_transition(NODE_DEAD, NODE_STALE)
+                row.consecutive_failures = 0
+                changes.append((node_id, NODE_DEAD, NODE_STALE))
             continue
         target = evaluate_node_state(
             row.state,
@@ -195,8 +201,13 @@ async def apply_snapshot(
     subscription_id: int,
     snapshot: Snapshot,
     now: datetime,
+    tag: str = "",
 ) -> ApplyResult:
-    """把订阅 `subscription_id` 的来源证据整体对齐到 `snapshot` 的事实。"""
+    """把订阅 `subscription_id` 的来源证据整体对齐到 `snapshot` 的事实。
+
+    `tag` 是该订阅的标识（`subscription_tag(url)`），进节点指纹——同一份配置
+    由两个订阅提供时是两个节点。不传则退化为纯配置哈希（仅测试造数用）。
+    """
     # 串行化边界：先取写锁，再读（见模块 docstring「并发边界」）。同值 UPDATE 不改数据。
     await lock_subscription_mutation(session, subscription_id)
 
@@ -229,13 +240,11 @@ async def apply_snapshot(
         # 信息占位节点（旧快照重放仍可能携带）不进 Registry——它们不是代理端点
         if is_info_placeholder(str(node.get("name") or "")):
             continue
-        desired.setdefault(node_fingerprint(node), node)
+        desired.setdefault(node_fingerprint(node, tag), node)
     desired_fp = set(desired)
 
-    existing = await _sources_of(session, subscription_id)
+    existing = await _nodes_of(session, subscription_id)
     taken = await _minted_names(session, subscription_id)
-    # 本订阅的特征码：写进每一条来源关联，体检结果据此对齐回池账本
-    code = subscription_code(subscription_id)
 
     created: list[str] = []
     refreshed: list[str] = []
@@ -249,72 +258,55 @@ async def apply_snapshot(
 
         if fingerprint in existing:
             node_id = existing[fingerprint]
-            source = (
+            row = (
                 await session.execute(
-                    select(ProxyNodeSource).where(
-                        ProxyNodeSource.subscription_id == subscription_id,
-                        ProxyNodeSource.node_id == node_id,
-                    )
+                    select(ProxyNode).where(ProxyNode.node_id == node_id)
                 )
             ).scalar_one()
-            source.original_name = original_name
-            source.source_code = code
-            source.last_seen = now
+            row.original_name = original_name
+            row.normalized_config = dict(node)
+            row.last_source_seen = now
             refreshed.append(fingerprint)
             touched.add(node_id)
             continue
 
-        # 新来源：节点身份可能已由别的订阅登记过——那就复用，不重铸任何东西
-        row = (
-            await session.execute(
-                select(ProxyNode).where(ProxyNode.fingerprint == fingerprint)
-            )
-        ).scalar_one_or_none()
-        if row is None:
-            runtime_name = make_runtime_name(subscription_id, original_name, taken)
-            taken.add(runtime_name)
-            if inherit_indexes is None:
-                inherit_indexes = await _exit_ip_indexes(session)
-            row = ProxyNode(
-                node_id=fingerprint,
-                fingerprint=fingerprint,
-                runtime_name=runtime_name,
-                proxy_type=str(node.get("type") or ""),
-                server=node.get("server"),
-                normalized_config=dict(node),
-                state=NODE_NEW,
-                first_seen=now,
-                last_seen=now,
-                last_source_seen=now,
-                # 端点身份相同的旧节点携带着**已知的出口身份**：机场改名单 /
-                # 换内容版本号（指纹变、type|server|port 不变）时把 exit_ip 继承
-                # 过来——否则每次内容更新都要裸探一轮，空窗期内爬取全部被拒
-                exit_ip=_inheritable_exit_ip(inherit_indexes, node),
-            )
-            session.add(row)
-            created.append(fingerprint)
-
-        session.add(
-            ProxyNodeSource(
-                node_id=row.node_id,
-                subscription_id=subscription_id,
-                original_name=original_name,
-                source_code=code,
-                first_seen=now,
-                last_seen=now,
-            )
+        # 指纹含订阅标识 ⇒ 同订阅内重建的节点必是同一行；查不到就是新节点
+        runtime_name = make_runtime_name(subscription_id, original_name, taken)
+        taken.add(runtime_name)
+        if inherit_indexes is None:
+            inherit_indexes = await _exit_ip_indexes(session)
+        row = ProxyNode(
+            node_id=fingerprint,
+            fingerprint=fingerprint,
+            runtime_name=runtime_name,
+            subscription_id=subscription_id,
+            original_name=original_name,
+            proxy_type=str(node.get("type") or ""),
+            server=node.get("server"),
+            normalized_config=dict(node),
+            state=NODE_NEW,
+            first_seen=now,
+            last_seen=now,
+            last_source_seen=now,
+            # 端点身份相同的旧节点携带着**已知的出口身份**：机场改名单 /
+            # 换内容版本号（指纹变、type|server|port 不变）时把 exit_ip 继承
+            # 过来——否则每次内容更新都要裸探一轮，空窗期内爬取全部被拒
+            exit_ip=_inheritable_exit_ip(inherit_indexes, node),
         )
+        session.add(row)
+        created.append(fingerprint)
         touched.add(row.node_id)
 
-    # 本订阅已不再提供的来源：删掉（来源是「当前事实」，不是历史台账）
+    # 本订阅已不再提供的节点：解除归属（挂空订阅，由状态机按来源流失结算）。
+    # 不删行——行是身份台账，且同一节点可能在别的订阅下另有自己的行。
     removed = [fp for fp in existing if fp not in desired_fp]
     if removed:
         removed_ids = [existing[fp] for fp in removed]
         await session.execute(
-            delete(ProxyNodeSource).where(
-                ProxyNodeSource.subscription_id == subscription_id,
-                ProxyNodeSource.node_id.in_(removed_ids),
-            )
+            update(ProxyNode)
+            .where(ProxyNode.node_id.in_(removed_ids))
+            .values(subscription_id=None)
+            .execution_options(synchronize_session=False)
         )
         touched.update(removed_ids)
 

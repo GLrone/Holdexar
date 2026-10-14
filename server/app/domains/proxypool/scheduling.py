@@ -60,6 +60,7 @@ from app.domains.proxypool.health import (
     latest_l0_delays,
     recover_dead_nodes,
 )
+from app.domains.proxypool.dead_probe import recover_dead_nodes_self_hosted
 from app.domains.proxypool.models import HealthRun
 from app.domains.proxypool.pool import eligible_nodes, eligible_runtime_names, pool_file_names
 from app.domains.proxypool.runtime import (
@@ -428,6 +429,13 @@ async def run_l0_cycle(
         await recover_dead_nodes(
             session, controller_url=recovery_controller[0], secret=recovery_controller[1],
             now=now, **extra,
+        )
+    else:
+        # 旧链路内核不在（用户没跑这个可选进程）时，用自建临时内核兜底：从数据库
+        # 现取 DEAD 节点的配置渲染一份最小内核，逐节点探测后立即停掉。没有这条
+        # 路径时，旧链路内核不在 = 恢复通道整体失效 = 判死的节点永久出局。
+        await recover_dead_nodes_self_hosted(
+            session, data_dir=data_dir, now=now, **extra,
         )
     if await eligible_runtime_names(session) != before:
         request_rebuild()
