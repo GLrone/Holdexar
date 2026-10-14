@@ -178,6 +178,7 @@ def test_cluster_cn_only_members_pair_via_cn_name():
 async def _series_db(tmp_path, monkeypatch):
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+    from app.core import database as database_module
     from app.core.database import Base
     from app.domains.games import series as series_mod
 
@@ -187,6 +188,10 @@ async def _series_db(tmp_path, monkeypatch):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
+    # 写路径（write_session）从 database 模块取工厂：只改域模块的属性，
+    # 写回会落到默认库而不是本用例的临时库
+    monkeypatch.setattr(database_module, "get_engine", lambda: engine)
+    monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
     monkeypatch.setattr(series_mod, "get_session_factory", lambda: factory)
     # 覆盖文件路径指 tmp：默认无文件（=无覆盖），用例自行写入
     monkeypatch.setattr(
