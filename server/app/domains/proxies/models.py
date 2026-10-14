@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import time
 
 from sqlalchemy import Boolean, DateTime, Integer, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
@@ -62,8 +63,7 @@ class ProxySubscription(Base):
     """持久化订阅链接，按方式区分：clash（机场 yaml）/ plain（明文代理协议）。
 
     长期保存在本地库；clash 启动与节点导入都从这里取 URL。
-    废弃终态（deprecated）：不可用节点 >95% 时标记，后端选订阅时跳过
-    （不删除——用户手动删）；下次检测恢复达标自动解除。
+    订阅无可用节点或资源失效时停用；资源与节点恢复后自动解除。
     """
 
     __tablename__ = "proxy_subscriptions"
@@ -97,6 +97,24 @@ class ProxySubscription(Base):
     auto_refresh: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default="1"
     )
+
+    def resource_block_reason(self, *, now: float | None = None) -> str | None:
+        traffic = (self.last_stats or {}).get("traffic")
+        values: dict[str, int] = {}
+        for part in str(traffic or "").split(";"):
+            key, sep, value = part.strip().partition("=")
+            if sep:
+                try:
+                    values[key] = int(value.strip())
+                except ValueError:
+                    continue
+        expiry = values.get("expire", 0)
+        if expiry > 0 and expiry <= (time.time() if now is None else now):
+            return "订阅已到期"
+        total = values.get("total", 0)
+        if total > 0 and values.get("upload", 0) + values.get("download", 0) >= total:
+            return "订阅流量已用尽"
+        return None
 
 
 class ClashNode(Base):

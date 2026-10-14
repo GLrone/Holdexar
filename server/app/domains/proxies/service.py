@@ -1366,9 +1366,9 @@ async def list_subscriptions(kind: str | None = None) -> list[dict]:
             "createdAt": s.created_at.isoformat() if s.created_at else None,
             "lastImportedAt": s.last_imported_at.isoformat() if s.last_imported_at else None,
             "lastStats": s.last_stats,
-            "deprecated": bool(s.deprecated),
+            "deprecated": bool(s.deprecated) or s.resource_block_reason() is not None,
             "deprecatedAt": s.deprecated_at.isoformat() if s.deprecated_at else None,
-            "deprecatedReason": s.deprecated_reason,
+            "deprecatedReason": s.resource_block_reason() or s.deprecated_reason,
             # 生产准入（见 models.py 常量说明）：
             # - clash：行上的 admission_status，缺失按 ACTIVE 呈现（历史行兼容）；
             #   新订阅由 add_subscription 显式写成 CANDIDATE；
@@ -1478,8 +1478,8 @@ async def add_subscription(kind: str, url: str, label: str | None = None) -> dic
 
 async def delete_subscription(sub_id: int) -> bool:
     """删除订阅 + 级联清理两本账：clash_nodes（本域）整批删；clash 订阅同时
-    退出生产池并清快照（复用池域的退出登记，同一事务）——来源行不清，池合格
-    判定会把已删订阅的节点继续当「仍被提供」，其健康节点将永远留在生产池里。"""
+    退出生产池——该订阅提供的节点行随退出一并删除（节点跟着订阅走，订阅没了
+    节点不该留），快照行与磁盘产物同批回收。"""
     from app.core.config import get_settings
     from app.domains.proxypool.subscription import snapshot_dir
 
@@ -1508,19 +1508,24 @@ async def delete_subscription(sub_id: int) -> bool:
     shutil.rmtree(
         snapshot_dir(get_settings().data_dir) / str(sub_id), ignore_errors=True
     )
-    # 来源解除必须留痕（与退出端点同一理由）：否则事后只见一批节点降级、找不到原因
+    # 缓存正文与响应头元数据同批回收：只删行不删文件会在 clash 目录留下无人
+    # 引用的孤儿（旧订阅内容继续占盘，且「已删除」在文件系统层面不成立）。
+    removed_files = clash_manager.remove_subscription_artifacts(
+        get_settings().data_dir, sub_id
+    )
+    # 节点随订阅删除必须留痕（与退出端点同一理由）：否则事后只见节点消失、找不到原因
     if exit_result is not None and exit_result.exited:
         from app.core import orchestration as events
 
         await events.record(
             events.KIND_SUBSCRIPTION_EXITED,
-            f"订阅 {sub_id} 删除，随删退出生产池：移除来源 {exit_result.removed_sources} 行",
+            f"订阅 {sub_id} 删除，随删退出生产池：删除节点 {exit_result.removed_sources} 行",
             level=events.LEVEL_WARN,
             payload={
                 "subscriptionId": sub_id,
-                "removedSources": exit_result.removed_sources,
-                "degradedNodes": exit_result.degraded_nodes,
+                "deletedNodes": exit_result.removed_sources,
                 "deleted": True,
+                "removedCacheFiles": removed_files,
             },
         )
     # 删到一条不剩即无出口：回退直连（事务外，避免与写闸重入）
@@ -1994,8 +1999,7 @@ async def _test_clash_nodes_impl(
     - 节点状态机（clash_nodes 表）：ok → 失败冷却递增（30min→24h 封顶）、
       累计 10 次 → dead 终态；dead 复活需本次连续 3-of-3 全过；
       冷却期内跳过检测（不算死也不耗探测时间）
-    - 订阅废弃判定：本次实检节点中不可用占比 >95% → 订阅 deprecated
-      （后端不再选用；不删除，用户手动删）；恢复达标自动解除
+    - 订阅资源失效或没有可用节点时停用，恢复后自动解除
     - 探测通道：内核配置带探测 lane（`inject_probe_lanes` 注入的 20 组
       select + listener）→ 按 lane 并发探测（并发上限 20，节点多于 lane 分波）；
       lane 缺席（配置注入前启动的内核）回退逐节点切 selector 的串行路径
@@ -2316,6 +2320,17 @@ async def _apply_node_results(
     - 账本里有但订阅已无此节点（换订阅内容）→ 保留不删（历史痕迹）
     返回 (alive_count, unique_alive, deprecated)。
     """
+    if node_names and not any(r.get("probed") for r in results):
+        async with get_session_factory()() as session:
+            sub = await session.get(ProxySubscription, sub_id)
+            stats = dict(sub.last_stats or {}) if sub is not None else {}
+            deprecated = bool(sub.deprecated) if sub is not None else False
+            blocked = sub.resource_block_reason() if sub is not None else None
+        alive = min(int(stats.get("alive") or 0), len(node_names))
+        if blocked is not None:
+            deprecated = await _evaluate_subscription_deprecation(sub_id, alive, len(node_names))
+        return alive, int(stats.get("aliveUnique") or 0), deprecated
+
     alive_count = 0
     unique_ips: set[str] = set()
 
@@ -2380,7 +2395,7 @@ async def _apply_node_results(
         await session.commit()
 
     # 冷却跳过的节点按账本口径计入存活统计（上次判定为准）
-    probed_names = {r["name"] for r in results}
+    probed_names = {r["name"] for r in results if r.get("probed")}
     for name in node_names:
         if name in probed_names:
             continue
@@ -2562,6 +2577,10 @@ async def pool_stats() -> dict:
         clash["subscriptionId"] = sub_id
         if sub_id is not None:
             async with get_session_factory()() as session:
+                subscription = await session.get(ProxySubscription, sub_id)
+                subscription_ready = subscription is None or (
+                    not subscription.deprecated and subscription.resource_block_reason() is None
+                )
                 rows = list(
                     (
                         await session.execute(
@@ -2592,7 +2611,7 @@ async def pool_stats() -> dict:
                 # 出口 IP 未知的节点（IP 探测失败）各自算一个
                 ident = r.exit_ip or f"node:{r.id}"
                 all_idents.add(ident)
-                if r.status == "ok":
+                if r.status == "ok" and subscription_ready:
                     clash["okNodes"] += 1
                     ok_idents.add(ident)
             clash["nodes"] = len(rows)
