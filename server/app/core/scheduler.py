@@ -757,10 +757,10 @@ async def _job_fx_refresh() -> None:
 
 
 async def _job_fx_history_repair() -> None:
-    """汇率历史修复（每日 04:00）：本地扫描 → Provider 拉取 → 写 observed。
+    """汇率历史修复（每日 04:00）：本地扫描 → Provider 拉取 → 写 derived。
 
     与 03:00 实时刷新彻底分离，不随每日自动刷新消耗。单源免 Key
-    （bing.currencyapi），无任何配置即可运行。三重门禁，不满足即静默跳过
+    （frankfurter.v2），无任何配置即可运行。三重门禁，不满足即静默跳过
     （不产生失败重试风暴）：
 
     1. 「汇率历史补全」开关开启；

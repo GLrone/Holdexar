@@ -222,7 +222,7 @@ _MODULE_LABELS = {
     "app.domains.rates.service": "汇率刷新",
     "app.domains.rates.history": "汇率历史",
     "app.domains.rates.snapshot": "汇率快照",
-    "app.domains.rates.providers.bing_currency": "汇率源·Bing",
+    "app.domains.rates.providers.frankfurter": "汇率源·Frankfurter",
     "app.domains.alerts.service": "价格提醒",
     "app.domains.alerts.notify": "提醒推送",
     "app.domains.notifications.service": "通知中心",
