@@ -348,8 +348,8 @@ async def test_history_missing_cny_uses_historical_fx_only():
     from app.domains.rates.models import FxRate, FxRateHistory
 
     day_hist = datetime(2026, 3, 10, 12, 0, 0)
-    day_missing = datetime(2026, 3, 11, 12, 0, 0)
-    day_stock = datetime(2026, 3, 12, 12, 0, 0)
+    day_missing = datetime(2026, 3, 27, 12, 0, 0)  # 超出 15 天回溯窗（距 3/10 达 17 天）
+    day_stock = datetime(2026, 3, 28, 12, 0, 0)
     async with get_session_factory()() as session:
         session.add_all([
             GamePriceHistory(

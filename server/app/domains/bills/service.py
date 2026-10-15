@@ -20,7 +20,7 @@ import json
 import logging
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import case, delete, func, select
+from sqlalchemy import and_, case, delete, func, or_, select
 
 from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.database import write_gate
@@ -75,37 +75,52 @@ async def revalue_affected(touched: dict[str, set[date]]) -> dict:
     """历史汇率修复后重估受影响账单：行级 fx_rate/cny_fen 重算 + 汇总重算。
 
     touched = {币种: {被修复覆盖的日期}}。受影响交易 = 币种命中且交易日期落在
-    [覆盖起点 - 15 天回溯窗, 覆盖终点]；用与导入同一规则重算（observed 精确日
+    [该币种被修改的最早日期, 该币种被修改的最晚日期 + 15 天回溯窗]；用与导入同一规则重算（observed 精确日
     → 回溯 ≤ 15 天）——修复前落到 carried/缺失的交易在修复后自动获得真值，
     修复改变了值的交易自动纠偏。汇总按全表现值重算（同一账单的其余行参与总额）。
-    幂等：重算结果只取决于当前 observed 数据。
+    幂等：重算结果只取决于当前 observed/derived 数据。
     """
     if not touched:
         return {"bills": 0, "transactions": 0}
+
     currencies = sorted({str(c).upper() for c in touched})
-    all_days = [d for days in touched.values() for d in days]
-    lookback_start = (min(all_days) - timedelta(days=15)).isoformat()
-    span_end = max(all_days).isoformat()
+    game_conds = []
+    topup_conds = []
+    for c, days in touched.items():
+        if not days:
+            continue
+        c_code = str(c).upper()
+        # 日期 T 的汇率被更新，会影响交易日落在 [T, T + 15] 之间依赖该汇率的交易
+        c_start = min(days).isoformat()
+        c_end = (max(days) + timedelta(days=15)).isoformat()
+        game_conds.append(
+            and_(
+                BillGameTx.currency == c_code,
+                BillGameTx.date >= c_start,
+                BillGameTx.date <= c_end,
+            )
+        )
+        topup_conds.append(
+            and_(
+                BillTopupTx.currency == c_code,
+                BillTopupTx.date >= c_start,
+                BillTopupTx.date <= c_end,
+            )
+        )
+    if not game_conds and not topup_conds:
+        return {"bills": 0, "transactions": 0}
 
     async with write_session(WritePriority.BACKGROUND) as session:
         game_rows = (
             await session.execute(
-                select(BillGameTx).where(
-                    BillGameTx.currency.in_(currencies),
-                    BillGameTx.date >= lookback_start,
-                    BillGameTx.date <= span_end,
-                )
+                select(BillGameTx).where(or_(*game_conds))
             )
-        ).scalars().all()
+        ).scalars().all() if game_conds else []
         topup_rows = (
             await session.execute(
-                select(BillTopupTx).where(
-                    BillTopupTx.currency.in_(currencies),
-                    BillTopupTx.date >= lookback_start,
-                    BillTopupTx.date <= span_end,
-                )
+                select(BillTopupTx).where(or_(*topup_conds))
             )
-        ).scalars().all()
+        ).scalars().all() if topup_conds else []
         if not game_rows and not topup_rows:
             return {"bills": 0, "transactions": 0}
 

@@ -1234,12 +1234,13 @@ async def linked_bundles(appid: int) -> list[dict]:
 
 
 async def _fill_cny_fen_by_history(rows) -> dict[int, int]:
-    """对 cny_fen 缺失的行补算 CNY 分：用 snapshot_at **当日**的 observed 历史汇率。
+    """对 cny_fen 缺失的行补算 CNY 分：用 snapshot_at 历史汇率（最多回溯 15 天）。
 
-    返回 `{行 id: cny_fen}`；当日历史汇率缺失的行不补——绝不用当前汇率折算
+    返回 `{行 id: cny_fen}`；历史汇率缺失的行不补——绝不用当前汇率折算
     历史价格（隐性错误）；补齐后仍无值的点在走势里按缺失呈现。行级一次批量
     取数（按币种聚合窗口），不做逐点查询。
     """
+    from datetime import timedelta
     from app.domains.rates import history as rates_history
 
     need_days: set[date] = set()
@@ -1254,8 +1255,10 @@ async def _fill_cny_fen_by_history(rows) -> dict[int, int]:
         need_days.add(r.snapshot_at.date())
     if not need_days:
         return {}
+    query_start = min(need_days) - timedelta(days=15)
+    query_end = max(need_days)
     fx_map = await rates_history.observed_rate_map(
-        need_currencies, min(need_days), max(need_days)
+        need_currencies, query_start, query_end
     )
     filled: dict[int, int] = {}
     for r in rows:
@@ -1264,7 +1267,16 @@ async def _fill_cny_fen_by_history(rows) -> dict[int, int]:
         currency = (r.currency or REGION_TO_CURRENCY.get(r.region_code.upper()) or "").upper()
         if not currency:
             continue
-        rate = fx_map.get((currency, r.snapshot_at.date().isoformat()))
+        if currency == "CNY":
+            filled[int(r.id)] = round(int(r.price) * 1.0)
+            continue
+        base_day = r.snapshot_at.date()
+        rate = None
+        for delta in range(16):
+            d_str = (base_day - timedelta(days=delta)).isoformat()
+            if (currency, d_str) in fx_map:
+                rate = fx_map[(currency, d_str)]
+                break
         if rate is None:
             continue
         filled[int(r.id)] = round(int(r.price) * rate)

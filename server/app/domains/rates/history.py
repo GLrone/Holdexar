@@ -13,7 +13,7 @@ Bills / Games / 维护脚本一律走本模块，不直接读 `fx_rate_history`�
 - 缺口由本地扫描确定（缺行日 ∪ carried 日），数据由 Provider 决定——不维护
   工作日历、不跳过周末、不猜节假日；
 - 先本地 scan → 日期区间合并 → 每窗一次 Provider 拉取 → 校验 → 只写缺失日
-  与 carried 日（observed 日永不重拉）；单源 bing.currencyapi（免 Key）；
+  与 carried 日（observed 日永不重拉）；单源 frankfurter.v2（免 Key）；
 - 外网失败 / 额度不足即停：不重试风暴、不造假数据。
 """
 from __future__ import annotations
@@ -30,9 +30,9 @@ from app.core.database import write_gate
 from app.core.logging import log_event
 from app.crawler.utils import get_beijing_time_obj
 from .models import FxRateHistory
-from .providers.bing_currency import (
-    PROVIDER_NAME as BING_PROVIDER_NAME,
-    BingCurrencyProvider,
+from .providers.frankfurter import (
+    PROVIDER_NAME as FRANKFURTER_PROVIDER_NAME,
+    FrankfurterCurrencyProvider,
     ProviderError,
 )
 
@@ -42,12 +42,12 @@ logger = logging.getLogger(__name__)
 # 换来更少的请求数）；超过则各自成段。
 _CLUSTER_GAP_DAYS = 7
 
-# 全新安装 bootstrap 起点 = Provider 全历史档位起点（bing chartType=9 自 2012
+# 全新安装 bootstrap 起点 = Provider 全历史起点（frankfurter v2 自 2012
 # 年起）：种子不再携带汇率档案，无任何历史行的币种由扫描以该锚点建窗，
 # 交修复链现抓——否则新装库永远「无锚点跳过」，历史 CNY 换算无从建立。
 FULL_HISTORY_START = date(2012, 1, 1)
 
-# 修复窗口上限：批次化单窗数据量（Bing 按币种请求，窗口大小不影响请求数，
+# 修复窗口上限：批次化单窗数据量（frankfurter 窗口大小控制单次响应体积，
 # 批次语义保留用于逐窗落账与失败定位）
 MAX_WINDOW_DAYS = 365
 
@@ -69,17 +69,17 @@ def _as_date(value: object) -> date | None:
 async def load_observed_series(
     session, currency: str, start: date, end: date
 ) -> list[tuple[str, float]]:
-    """[start, end] 内已观测日线，升序 `[(YYYY-MM-DD, rate_to_cny)]`。
+    """[start, end] 内已观测/衍生日线，升序 `[(YYYY-MM-DD, rate_to_cny)]`。
 
-    只含 `source_kind='observed'` 行——carried 是历史延续值，不能当真实
-    历史汇率消费。调用方负责传日期对象。
+    包含 `source_kind in ('observed', 'derived')` 行——carried 是历史延续值，
+    不能当真实历史汇率消费。调用方负责传日期对象。
     """
     rows = (
         await session.execute(
             select(FxRateHistory.rate_date, FxRateHistory.rate_to_cny)
             .where(
                 FxRateHistory.currency_code == currency.upper(),
-                FxRateHistory.source_kind == "observed",
+                FxRateHistory.source_kind.in_(["observed", "derived"]),
                 FxRateHistory.rate_date.is_not(None),
                 FxRateHistory.rate_date >= start,
                 FxRateHistory.rate_date <= end,
@@ -98,7 +98,7 @@ async def load_observed_series(
 async def observed_rate_map(
     currencies: Iterable[str], start: date, end: date
 ) -> dict[tuple[str, str], float]:
-    """多币种窗口的 observed 汇率表 `{(CODE, 'YYYY-MM-DD'): rate_to_cny}`。
+    """多币种窗口的 observed/derived 汇率表 `{(CODE, 'YYYY-MM-DD'): rate_to_cny}`。
 
     Games 历史价格换算用：一次取齐窗口内全部涉及币种，内存查表。
     """
@@ -114,7 +114,7 @@ async def observed_rate_map(
                     FxRateHistory.rate_to_cny,
                 ).where(
                     FxRateHistory.currency_code.in_(codes),
-                    FxRateHistory.source_kind == "observed",
+                    FxRateHistory.source_kind.in_(["observed", "derived"]),
                     FxRateHistory.rate_date.is_not(None),
                     FxRateHistory.rate_date >= start,
                     FxRateHistory.rate_date <= end,
@@ -132,9 +132,9 @@ async def observed_rate_map(
 def pick_observed_rate(
     rows: list[tuple[str, float]], currency: str, day: str, *, lookback_days: int = 15
 ) -> float | None:
-    """从 observed 日线取 day 的汇率：精确日 → 逐日回溯 ≤ lookback_days 天。
+    """从 observed/derived 日线取 day 的汇率：精确日 → 逐日回溯 ≤ lookback_days 天。
 
-    rows 必须是 observed-only（本模块出口保证）。CNY 恒 1.0；查不到返回
+    rows 必须是 observed/derived（本模块出口保证）。CNY 恒 1.0；查不到返回
     None——明示缺失，不兜底、不猜当前汇率。
     """
     currency = currency.upper()
@@ -147,7 +147,7 @@ def pick_observed_rate(
         base = datetime.strptime(day, "%Y-%m-%d")
     except (TypeError, ValueError):
         return by_day.get(str(day))
-    for delta in range(max(1, lookback_days)):
+    for delta in range(max(1, lookback_days) + 1):
         key = (base - timedelta(days=delta)).strftime("%Y-%m-%d")
         if key in by_day:
             return by_day[key]
@@ -190,12 +190,15 @@ _KIND_RANK = {"carried": 1, "derived": 2, "observed": 3}
 
 
 def _kind_from_source(source: object) -> str:
-    """语义列缺失时的回退推导：backfill 延续值 → carried，其余 → observed。
+    """语义列缺失时的回退推导：backfill/bing 延续值 → carried，其余 → observed。
 
     与 v8 迁移、种子合并同一口径——过渡期写入（不带语义列）的 forward-fill
-    延续值不得被当成真实观测。
+    延续值及已弃用 Bing 记录按 carried 归入待修复范围。
     """
-    return "carried" if str(source or "").lower() == "backfill" else "observed"
+    s = str(source or "").lower()
+    if s in ("backfill", "bing.currencyapi"):
+        return "carried"
+    return "observed"
 
 
 def _stronger_kind(current: str, incoming: str) -> str:
@@ -213,8 +216,8 @@ async def _load_marks() -> dict[str, dict[date, str]]:
 
     - 日期：`rate_date` 有值即用它，否则从 `fetched_at` 取日期部分推导
       （两者都为空的行放弃）；
-    - 语义：`source_kind` 有值即用它，否则按 `source` 推导（见
-      `_kind_from_source`）；
+    - 语义：`source_kind` 有值即用它，旧 Bing 源无论原标记统一视作 carried
+      （纳入待修复），其余按 `source` 推导（见 `_kind_from_source`）；
     - 冲突：同一 (币种, 日) 可能同时存在 canonical 行与旧格式行，
       取更可信的一条（见 `_stronger_kind`）。
     """
@@ -237,7 +240,10 @@ async def _load_marks() -> dict[str, dict[date, str]]:
         day = _as_date(rate_date) or _as_date(fetched_at)
         if day is None:
             continue
-        resolved = str(kind).lower() if kind else _kind_from_source(source)
+        if str(source or "").lower() == "bing.currencyapi":
+            resolved = "carried"
+        else:
+            resolved = str(kind).lower() if kind else _kind_from_source(source)
         bucket = marks.setdefault(code, {})
         bucket[day] = (
             resolved if day not in bucket else _stronger_kind(bucket[day], resolved)
@@ -325,8 +331,8 @@ async def scan_history_gaps(
 # ── 修复 ───────────────────────────────────────────────────
 
 
-async def _write_observed(data: dict[date, dict[str, float]]) -> tuple[int, dict[str, set[date]]]:
-    """写入 observed 行：只写缺失日与 carried 日，observed 日跳过。
+async def _write_rates(data: dict[date, dict[str, float]]) -> tuple[int, dict[str, set[date]]]:
+    """写入汇率行：只写缺失日与 carried 日，observed 日跳过（旧 Bing 源允许替换）。
 
     返回 (写入行数, {code: {date}})——touched 供依赖方重估。
     """
@@ -340,17 +346,20 @@ async def _write_observed(data: dict[date, dict[str, float]]) -> tuple[int, dict
         rows = (
             await session.execute(
                 text(
-                    "SELECT currency_code, rate_date, source_kind FROM fx_rate_history"
+                    "SELECT currency_code, rate_date, source_kind, source FROM fx_rate_history"
                     " WHERE rate_date >= :lo AND rate_date <= :hi"
                 ),
                 {"lo": lo.isoformat(), "hi": hi.isoformat()},
             )
         ).all()
-    existing: dict[tuple[str, date], str] = {}
-    for code, rate_date, kind in rows:
+    existing: dict[tuple[str, date], tuple[str, str]] = {}
+    for code, rate_date, kind, source in rows:
         day = _as_date(rate_date)
         if day is not None:
-            existing[(str(code).upper(), day)] = str(kind or "").lower()
+            existing[(str(code).upper(), day)] = (
+                str(kind or "").lower(),
+                str(source or "").lower(),
+            )
 
     now = get_beijing_time_obj().replace(tzinfo=None)
     values: list[dict] = []
@@ -360,14 +369,19 @@ async def _write_observed(data: dict[date, dict[str, float]]) -> tuple[int, dict
         for code, rate in row.items():
             if code not in ALLOWED_CURRENCIES:
                 continue
-            if existing.get((code, day)) == "observed":
-                continue  # observed 日永不重拉/覆盖
+            cur_info = existing.get((code, day))
+            if cur_info is not None:
+                cur_kind, cur_source = cur_info
+                if cur_kind == "observed" and cur_source != "bing.currencyapi":
+                    continue  # observed 且非 Bing 永不覆盖
+                if cur_source == FRANKFURTER_PROVIDER_NAME:
+                    continue  # 已是当前新源无需重复写
             values.append(
                 {
                     "currency_code": code,
                     "rate_to_cny": float(rate),
-                    "source": BING_PROVIDER_NAME,
-                    "source_kind": "observed",
+                    "source": FRANKFURTER_PROVIDER_NAME,
+                    "source_kind": "derived",
                     "rate_date": day,
                     "fetched_at": now,
                     "observed_at": None,
@@ -397,6 +411,9 @@ async def _write_observed(data: dict[date, dict[str, float]]) -> tuple[int, dict
     return len(values), touched
 
 
+_write_observed = _write_rates
+
+
 async def revalue_dependents(touched: dict[str, set[date]]) -> dict:
     """修复落库后重估依赖方。
 
@@ -419,8 +436,12 @@ async def revalue_dependents(touched: dict[str, set[date]]) -> dict:
     return result
 
 
-def _new_bing_provider() -> BingCurrencyProvider:
-    return BingCurrencyProvider()
+def _new_bing_provider() -> FrankfurterCurrencyProvider:
+    return FrankfurterCurrencyProvider()
+
+
+def _new_provider() -> FrankfurterCurrencyProvider:
+    return _new_bing_provider()
 
 
 async def repair_history_gaps(
@@ -431,13 +452,13 @@ async def repair_history_gaps(
     start: date | None = None,
     end: date | None = None,
 ) -> dict:
-    """拉取真实历史修复缺口：scan → 窗口分批 → Provider 拉取 → 写 observed → 重估。
+    """拉取真实历史修复缺口：scan → 窗口分批 → Provider 拉取 → 写 derived → 重估。
 
     - `dry_run`：只出计划不触网不写库；
     - `max_windows`：单轮最多消费的窗口数（调度侧节流用；None = 不限，仍受
       quota guard 硬拦）；
     - `start`/`end`：限定修复区间（运维用）；
-    - 主源免 Key（bing.currencyapi），无任何配置即可修复。任一次外网失败
+    - 主源免 Key（frankfurter.v2），无任何配置即可修复。任一次外网失败
       即停（不重试风暴）→ `provider_error`。
     """
     scan = await scan_history_gaps(today=today, start=start, end=end)
@@ -458,7 +479,7 @@ async def repair_history_gaps(
     if dry_run:
         return {**result, "status": "dry_run", "planned": planned}
 
-    bing = _new_bing_provider()
+    provider = _new_provider()
     from .service import ALLOWED_CURRENCIES
 
     targets = sorted(ALLOWED_CURRENCIES)
@@ -467,7 +488,7 @@ async def repair_history_gaps(
         start = date.fromisoformat(window["start"])
         end = date.fromisoformat(window["end"])
         try:
-            data = await bing.fetch_timeframe(start, end, targets)
+            data = await provider.fetch_timeframe(start, end, targets)
         except ProviderError as e:
             result["status"] = "provider_error"
             result["error"] = str(e)[:200]
@@ -476,7 +497,7 @@ async def repair_history_gaps(
             result["status"] = "provider_error"
             result["error"] = str(e)[:200]
             break
-        written, part_touched = await _write_observed(data)
+        written, part_touched = await _write_rates(data)
         result["requests"] += 1
         result["written"] += written
         result["windows"].append(
@@ -507,7 +528,7 @@ async def bootstrap_full_history(*, max_windows: int | None = None) -> dict:
     """全新安装的汇率全史 bootstrap（种子不再携带汇率档案）。
 
     判定：全库零历史行 → 扫描以 FULL_HISTORY_START 给全部白名单币种建窗 →
-    复用修复链现抓（bing 免 Key 全历史档位）；已有任何历史行的存量库直接
+    复用修复链现抓（frankfurter 免 Key 全史接口）；已有任何历史行的存量库直接
     返回 no_bootstrap，缺口照常归每日 04:00 修复任务。「汇率历史补全」
     开关关闭时跳过（与定时修复同一闸）。
     """

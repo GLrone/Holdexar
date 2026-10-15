@@ -32,7 +32,7 @@ from app.domains.bills.models import BillGameTx, BillImport  # noqa: E402
 from app.domains.rates import history as rates_history  # noqa: E402
 from app.domains.rates import service as rates_service  # noqa: E402
 from app.domains.rates.models import FxRateHistory  # noqa: E402
-from app.domains.rates.providers.bing_currency import ProviderError  # noqa: E402
+from app.domains.rates.providers.frankfurter import ProviderError  # noqa: E402
 
 XTS = "XTS"  # 合成币种（ISO 测试码；白名单由夹具收窄为 {XTS}）
 TODAY = date(2026, 9, 8)  # 周二；horizon = 9/7
@@ -299,12 +299,12 @@ async def test_repair_writes_observed_and_replaces_carried(db, monkeypatch):
     assert calls == [(date(2026, 9, 2), date(2026, 9, 7))]
     got = await _rows()
     assert got["2026-09-01"] == (6.50, "observed")  # 原 observed 不动
-    assert got["2026-09-02"] == (6.51, "observed")  # carried → observed
-    assert got["2026-09-03"] == (6.52, "observed")
-    assert got["2026-09-04"] == (6.53, "observed")
+    assert got["2026-09-02"] == (6.51, "derived")  # carried → derived
+    assert got["2026-09-03"] == (6.52, "derived")
+    assert got["2026-09-04"] == (6.53, "derived")
     assert got["2026-09-05"] == (6.60, "observed")  # observed 永不重拉
-    assert got["2026-09-06"] == (6.55, "observed")  # 周日也有行（Provider 语义）
-    assert got["2026-09-07"] == (6.56, "observed")
+    assert got["2026-09-06"] == (6.55, "derived")  # 周日也有行（Provider 语义）
+    assert got["2026-09-07"] == (6.56, "derived")
 
 
 @pytest.mark.asyncio
@@ -531,7 +531,7 @@ async def test_missing_target_currency_writes_others_and_keeps_gap(db, monkeypat
 
     assert result["status"] == "ok"
     got = await _rows()
-    assert got["2026-09-02"][1] == "observed"  # XTS 照写
+    assert got["2026-09-02"][1] == "derived"  # XTS 照写
     got2 = await _rows("XTS2")
     assert got2 == {"2026-09-01": (0.5, "observed")}  # XTS2 一个都没写
     scan = await rates_history.scan_history_gaps(today=TODAY)
@@ -578,3 +578,125 @@ async def test_legacy_rows_converge_to_observed_and_scan_clears(db, monkeypatch)
     info2 = scan2["currencies"].get(XTS, {})
     assert info2.get("carried", 0) == 0  # 旧行语义已被 observed 取代
     assert info2.get("missing", 0) == 4  # 9/4 ~ 9/7 仍缺（未修区间）
+
+
+@pytest.mark.asyncio
+async def test_bing_rows_upgraded_to_frankfurter_derived(db, monkeypatch):
+    """旧 Bing 记录在扫描中识别为待修复，修复时被覆写为 frankfurter.v2 / derived。"""
+    await _add_history(
+        XTS,
+        [("2026-09-02", 5.00, "observed")],
+        source="bing.currencyapi",
+    )
+    scan = await rates_history.scan_history_gaps(today=TODAY)
+    assert scan["currencies"][XTS]["carried"] == 1  # 识别为待修复
+
+    calls: list = []
+    rows = {date(2026, 9, 2): {XTS: 7.25}}
+    monkeypatch.setattr(rates_history, "_new_bing_provider", lambda: _fake_provider(rows, calls))
+
+    result = await rates_history.repair_history_gaps(today=TODAY)
+    assert result["status"] == "ok"
+    assert result["written"] == 1
+
+    got = await _rows()
+    assert got["2026-09-02"] == (7.25, "derived")
+
+
+def test_pick_observed_rate_exact_15_days_boundary():
+    """验证 pick_observed_rate 在 0、14、15、16 天的回溯边界。"""
+    rows = [("2024-01-01", 7.0)]
+    assert rates_history.pick_observed_rate(rows, "USD", "2024-01-01") == pytest.approx(7.0)  # 0 天
+    assert rates_history.pick_observed_rate(rows, "USD", "2024-01-15") == pytest.approx(7.0)  # 14 天
+    assert rates_history.pick_observed_rate(rows, "USD", "2024-01-16") == pytest.approx(7.0)  # 15 天（修复边界）
+    assert rates_history.pick_observed_rate(rows, "USD", "2024-01-17") is None  # 16 天超窗
+
+
+@pytest.mark.asyncio
+async def test_game_history_fill_cny_fen_15_days_lookback(db, monkeypatch):
+    """游戏历史价格 cny_fen 补算：支持最多 15 天向前回溯，已有值行不碰。"""
+    from types import SimpleNamespace
+    from app.domains.games.service import _fill_cny_fen_by_history
+
+    await _add_history(XTS, [("2024-01-01", 2.0, "derived")], source="frankfurter.v2")
+
+    rows = [
+        SimpleNamespace(id=1, cny_fen=None, price=100, snapshot_at=datetime(2024, 1, 1, 10, 0), currency=XTS, region_code="US"),
+        SimpleNamespace(id=2, cny_fen=None, price=200, snapshot_at=datetime(2024, 1, 3, 10, 0), currency=XTS, region_code="US"),
+        SimpleNamespace(id=3, cny_fen=None, price=300, snapshot_at=datetime(2024, 1, 16, 10, 0), currency=XTS, region_code="US"),
+        SimpleNamespace(id=4, cny_fen=None, price=400, snapshot_at=datetime(2024, 1, 17, 10, 0), currency=XTS, region_code="US"),
+        SimpleNamespace(id=5, cny_fen=999, price=500, snapshot_at=datetime(2024, 1, 1, 10, 0), currency=XTS, region_code="US"),
+        SimpleNamespace(id=6, cny_fen=None, price=600, snapshot_at=datetime(2024, 1, 5, 10, 0), currency="CNY", region_code="CN"),
+    ]
+
+    filled = await _fill_cny_fen_by_history(rows)
+    assert filled[1] == 200
+    assert filled[2] == 400
+    assert filled[3] == 600
+    assert 4 not in filled
+    assert 5 not in filled
+    assert filled[6] == 600
+
+
+@pytest.mark.asyncio
+async def test_bills_revalue_causal_window_and_no_inflation(db, monkeypatch):
+    """账单重估因果窗口与币种隔离。"""
+    monkeypatch.setattr(rates_service, "ALLOWED_CURRENCIES", frozenset({"USD", "EUR"}))
+    async with database_module.get_session_factory()() as session:
+        session.add(
+            BillImport(
+                id=10, nickname="t", game_net_fen=0, game_spend_fen=0,
+                game_refund_fen=0, orders=0, fx_missing=0,
+            )
+        )
+        session.add(
+            BillGameTx(
+                import_id=10, date="2024-01-05", tx_type="购买", items_json="[]",
+                currency="USD", amount=10.0, sign=1, cny_fen=5000, fx_rate=5.0,
+            )
+        )
+        session.add(
+            BillGameTx(
+                import_id=10, date="2024-01-12", tx_type="购买", items_json="[]",
+                currency="USD", amount=10.0, sign=1, cny_fen=None, fx_rate=None,
+            )
+        )
+        session.add(
+            BillGameTx(
+                import_id=10, date="2024-01-25", tx_type="购买", items_json="[]",
+                currency="USD", amount=10.0, sign=1, cny_fen=None, fx_rate=None,
+            )
+        )
+        session.add(
+            BillGameTx(
+                import_id=10, date="2024-01-26", tx_type="购买", items_json="[]",
+                currency="USD", amount=10.0, sign=1, cny_fen=None, fx_rate=None,
+            )
+        )
+        session.add(
+            BillGameTx(
+                import_id=10, date="2024-06-05", tx_type="购买", items_json="[]",
+                currency="USD", amount=10.0, sign=1, cny_fen=None, fx_rate=None,
+            )
+        )
+        await session.commit()
+
+    await _add_history("USD", [("2024-01-10", 7.0, "derived")], source="frankfurter.v2")
+    await _add_history("EUR", [("2024-06-01", 8.0, "derived")], source="frankfurter.v2")
+
+    touched = {
+        "USD": {date(2024, 1, 10)},
+        "EUR": {date(2024, 6, 1)},
+    }
+    await bills_service.revalue_affected(touched)
+
+    async with database_module.get_session_factory()() as session:
+        rows = (await session.execute(
+            text("SELECT date, fx_rate, cny_fen FROM bill_game_txs WHERE import_id = 10 ORDER BY date")
+        )).all()
+    assert rows[0][0] == "2024-01-05" and float(rows[0][1]) == pytest.approx(5.0) and rows[0][2] == 5000
+    assert rows[1][0] == "2024-01-12" and float(rows[1][1]) == pytest.approx(7.0) and rows[1][2] == 7000
+    assert rows[2][0] == "2024-01-25" and float(rows[2][1]) == pytest.approx(7.0) and rows[2][2] == 7000
+    assert rows[3][0] == "2024-01-26" and rows[3][1] is None
+    assert rows[4][0] == "2024-06-05" and rows[4][1] is None
+
