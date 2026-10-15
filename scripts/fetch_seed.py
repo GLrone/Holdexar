@@ -38,9 +38,9 @@ SEED_DIR = ROOT / "assets" / "seed"
 SEED_DB = SEED_DIR / "holdexar_seed.db"
 ASSET_NAME = "holdexar_seed.db.gz"
 
-# 通道链：先直连，再走国内镜像（GitHub Release 资产直连在国内基本不可用）。
+# 通道链：GitHub 发布资产直连在国内基本不可用，镜像优先、直连兜底。
 # 与 app/core/updater.py 的镜像链同源，改动请两边对齐。
-_MIRRORS = ("", "https://ghfast.top/", "https://gh-proxy.com/")
+_MIRRORS = ("https://ghfast.top/", "https://gh-proxy.com/", "https://gh-proxy.net/", "")
 
 _TIMEOUT_S = 120
 

@@ -86,6 +86,13 @@ def _cdn_seed_url(cache_key: str) -> str:
     return f"{base}?v={cache_key}" if cache_key else base
 
 
+def _mirrors() -> tuple[str, ...]:
+    """GitHub 发布资产的镜像前缀链（与更新模块、取种子脚本同源）。"""
+    from app.core.updater import _MIRRORS
+
+    return _MIRRORS
+
+
 async def _seed_manifest_entry() -> dict:
     """清单里声明的种子分发档条目（含 sha256 与 size）；不可达返回空字典。
 
