@@ -23,7 +23,7 @@ import logging
 import shutil
 from pathlib import Path
 
-from app.core.app_info import DATA_CDN_BASE, GITHUB_REPO
+from app.core.app_info import DATA_CDN_BASE, GITHUB_MIRRORS, GITHUB_REPO
 from app.core.config import get_settings
 from app.core.logging import log_event
 from app.core.seed_assets import merge_seed_incremental, read_seed_meta, seed_db_path
@@ -87,10 +87,8 @@ def _cdn_seed_url(cache_key: str) -> str:
 
 
 def _mirrors() -> tuple[str, ...]:
-    """GitHub 发布资产的镜像前缀链（与更新模块、取种子脚本同源）。"""
-    from app.core.updater import _MIRRORS
-
-    return _MIRRORS
+    """GitHub 发布资产的镜像前缀链（单一事实源 app_info.GITHUB_MIRRORS）。"""
+    return GITHUB_MIRRORS
 
 
 async def _seed_manifest_entry() -> dict:
@@ -167,7 +165,12 @@ async def ensure_seed_online() -> dict:
     _progress_reset()
     _PROGRESS.update({"state": "downloading"})
     try:
-        from app.core.updater import _MIN_PACKAGE_BYTES, _probe_channels, _stream_to_file
+        from app.core.updater import (
+            _MIN_PACKAGE_BYTES,
+            _probe_channels,
+            _stream_to_file,
+            _truncate_to,
+        )
         from app.domains.proxies import clash_manager
 
         seed_dir = _data_seed_dir()
@@ -220,37 +223,45 @@ async def ensure_seed_online() -> dict:
         _PROGRESS.update({"total": total, "percent": 0 if total else None})
         last_err: Exception | None = None
         for idx, probe in enumerate(usable):
+            channel_start_bytes = part.stat().st_size if part.is_file() else 0
             try:
                 await _stream_to_file(
                     probe["url"], probe["proxy"], part, total,
                     min_rate_bps=0 if idx == len(usable) - 1 else 64 * 1024,
                     label=probe["label"],
+                    progress_dict=_PROGRESS,
                 )
                 got = part.stat().st_size if part.is_file() else 0
                 if got < max(_MIN_SEED_BYTES, _MIN_PACKAGE_BYTES):
+                    _truncate_to(part, channel_start_bytes)
                     raise RuntimeError(f"通道返回内容不完整（{got} 字节），换下一通道")
+
+                # 若清单哈希可用，必须在通道循环内即刻校验：
+                # 哈希不符说明镜像返回了错误内容（如错误页或旧版），
+                # 必须清空临时文件并换下一通道，绝不能在循环结束后才抛错中断。
+                if expected_sha:
+                    actual = await asyncio.to_thread(_sha256_of, part)
+                    if actual != expected_sha:
+                        part.unlink(missing_ok=True)
+                        channel_start_bytes = 0
+                        raise RuntimeError(
+                            f"种子哈希与清单不符（实际 {actual[:16]}…，期望 {expected_sha[:16]}…），换下一通道"
+                        )
                 break
             except Exception as e:  # noqa: BLE001 —— 换下一通道
+                if part.is_file() and part.stat().st_size != channel_start_bytes:
+                    _truncate_to(part, channel_start_bytes)
                 log_event(
                     logger,
                     "下载通道不可用，改试下一通道",
-                    detail={"通道": probe["label"], "原因": e or type(e).__name__},
+                    detail={"通道": probe["label"], "原因": str(e) or type(e).__name__},
                 )
                 last_err = e
         else:
             raise RuntimeError(f"所有下载通道均失败：{last_err}")
 
-        # 权威校验：下载到的字节必须就是清单声明的那一份。清单不可达时跳过
-        # （退化为下面的 gzip + 结构校验），此时在日志里留痕，别让「校验通过」
-        # 显得比实际更强。
-        if expected_sha:
-            actual = await asyncio.to_thread(_sha256_of, part)
-            if actual != expected_sha:
-                part.unlink(missing_ok=True)  # 内容不对，续传没有意义
-                raise RuntimeError(
-                    f"种子哈希与清单不符（实际 {actual[:16]}…，期望 {expected_sha[:16]}…）"
-                )
-        else:
+        # 清单不可达时日志留痕，提示仅做结构校验
+        if not expected_sha:
             log_event(
                 logger,
                 "清单哈希不可得，种子仅做结构与压缩校验",

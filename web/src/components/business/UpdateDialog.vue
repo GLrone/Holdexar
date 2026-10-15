@@ -64,9 +64,9 @@ const phase = computed<Phase>(() => {
   if (updater.pendingTag) return 'ready'
   if (updater.downloading) return 'downloading'
   if (updater.failure) return 'failed'
-  if (updater.checking) return 'checking'
+  // 已有更新信息时优先展示（后台刷新期间不切回空白检查态）
   if (info.value?.available) return 'available'
-  // 检查没成功时不能报「已是最新」：available=false 也可能是网络不可达
+  if (updater.checking) return 'checking'
   if (info.value?.reason) return 'unavailable'
   if (info.value) return 'latest'
   return 'checking'

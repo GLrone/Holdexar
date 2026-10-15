@@ -380,6 +380,15 @@ class DesktopApi:
         if exe is None or not exe.is_file():
             return {"ok": False, "error": "仅打包态支持一键重启，请手动重启应用。"}
 
+        # os._exit 不触发 atexit / lifespan 清理：手动停掉代理内核，否则
+        # mihomo.exe 作为孤儿进程继续持有 _internal/ 目录的文件锁，换装
+        # 进程在 os.replace 时会因 PermissionError 失败并回滚。
+        try:
+            from app.domains.proxies import clash_manager
+            clash_manager.runtime.stop()
+        except Exception:  # noqa: BLE001 —— 停不掉不阻断重启（换装进程有兜底清理）
+            pass
+
         child_env = {
             **os.environ,
             f"{ENV_PREFIX}UPDATE_RESTART": "1",
@@ -610,16 +619,33 @@ def _pids_running_from(target: Path) -> list[int]:
 
 
 def _wait_target_idle(target: Path, timeout_s: float = 45.0) -> None:
-    """等所有从 target 目录树里跑着的进程退场（有界）。
+    """等所有从 target 目录树里跑着的进程退场（有界 + 强制清理）。
 
-    超时后照常动手：真有赖着不走的占用者，让位重试会失败并整体回滚，
-    循环终止交给交接账本——这里只负责把「再多等几秒就能成」的窗口吃满。
+    先给 3 秒宽限期等自然退出；仍有残留则强制终止（典型：重启前未被
+    停掉的代理内核 mihomo.exe），避免文件锁导致整轮换装失败回滚。
+    超时后照常动手：让位重试会失败并整体回滚。
     """
+    grace_deadline = time.monotonic() + 3.0
     deadline = time.monotonic() + timeout_s
+    killed = False
     while _pids_running_from(target):
         if time.monotonic() >= deadline:
             _log_update(f"等待程序目录占用进程超时（{timeout_s:.0f}s），按现状继续换装")
             return
+        # 宽限期过后仍有残留进程：强制终止（只执行一轮）
+        if not killed and time.monotonic() >= grace_deadline:
+            for pid in _pids_running_from(target):
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/PID", str(pid)],
+                        capture_output=True, timeout=5,
+                    )
+                    _log_update(f"已强制结束程序目录残留进程 PID {pid}")
+                except Exception as e:  # noqa: BLE001
+                    _log_update(f"结束残留进程 PID {pid} 失败：{e}")
+            killed = True
+            time.sleep(1.0)  # 进程终止后文件锁释放有短延迟
+            continue
         time.sleep(1.0)
 
 

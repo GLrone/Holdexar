@@ -185,7 +185,10 @@ export const useUpdaterStore = defineStore('updater', () => {
    *  顺带把检查结果拉一次——弹窗不能靠「用户先进过某页才查过」碰运气。 */
   async function openDialog(): Promise<void> {
     dialogOpen.value = true
-    await check(true)
+    // 已有检查结果时直接展示，不强制重查网络（避免遮住已知更新内容）
+    if (!info.value && !checking.value) {
+      await check(false)
+    }
   }
 
   function closeDialog(): void {

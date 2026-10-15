@@ -19,6 +19,7 @@ const props = withDefaults(
 
 interface Block {
   kind: 'heading' | 'para' | 'quote' | 'list' | 'table'
+  level?: number
   text?: string
   items?: string[]
   head?: string[]
@@ -27,8 +28,8 @@ interface Block {
 
 /** 中日韩字符（含全角标点）：段落内折行合并时不插空格 */
 const CJK = /[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uff00-\uffef]/
-/** 只由「应用名 + 版本号」构成的一行 */
-const TITLE_LINE = /^(?:holdexar\s*)?v?\d+\.\d+[\w.-]*$/i
+/** 只由「应用名 + 版本号」构成的一行（含可选 Markdown 标题前缀与版本修饰词） */
+const TITLE_LINE = /^(?:#\s*)?(?:holdexar\s*)?v?[\dXxYyZz]+[\w.\s-]*$/i
 
 function clean(line: string): string {
   return line.replace(/\*\*/g, '').replace(/`/g, '').trim()
@@ -46,7 +47,7 @@ function joinLines(lines: string[]): string {
 
 /** 小标题判据：短、无句读、不以标点收尾（清单里的分节名都满足） */
 function isHeading(line: string): boolean {
-  if (line.length > 20) return false
+  if (line.length > 40) return false
   if (/[。；，]/.test(line)) return false
   return !/[.。:：;；,，]$/.test(line)
 }
@@ -120,6 +121,14 @@ const blocks = computed<Block[]>(() => {
       continue
     }
 
+    const headingMatch = line.match(/^(#{1,6})\s+(.+)$/)
+    if (headingMatch) {
+      flushPara()
+      out.push({ kind: 'heading', level: headingMatch[1].length, text: headingMatch[2].trim() })
+      i += 1
+      continue
+    }
+
     if (isHeading(line)) {
       flushPara()
       out.push({ kind: 'heading', text: line })
@@ -139,7 +148,11 @@ const blocks = computed<Block[]>(() => {
 <template>
   <div v-if="blocks.length" class="upd-notes-r">
     <template v-for="(b, idx) in blocks" :key="idx">
-      <h4 v-if="b.kind === 'heading'" class="upd-notes-r__h">{{ b.text }}</h4>
+      <h4
+        v-if="b.kind === 'heading'"
+        class="upd-notes-r__h"
+        :class="b.level === 3 ? 'upd-notes-r__h--sub' : ''"
+      >{{ b.text }}</h4>
       <p v-else-if="b.kind === 'para'" class="upd-notes-r__p">{{ b.text }}</p>
       <blockquote v-else-if="b.kind === 'quote'" class="upd-notes-r__q">
         {{ b.text }}
@@ -179,6 +192,11 @@ const blocks = computed<Block[]>(() => {
   font-weight: 600;
   letter-spacing: 0.02em;
   color: var(--text-primary);
+}
+
+.upd-notes-r__h--sub {
+  font-size: 12px;
+  color: var(--text-secondary);
 }
 
 .upd-notes-r__p {

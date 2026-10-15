@@ -35,6 +35,7 @@ import httpx
 
 from app.core.app_info import (
     APP_NAME,
+    GITHUB_MIRRORS,
     GITHUB_REPO,
     HANDOFF_LEDGER_NAME,
     HANDOFF_UNSUPPORTED_MARK,
@@ -59,10 +60,8 @@ _ASSET_PATTERN = re.compile(rf"^{re.escape(APP_NAME)}-win64-v[\w.-]+\.zip$", re.
 # 与 scripts/build_manifest.py、scripts/publish_release.py 共用一份。
 # 固定 tag 下挂 latest.json：地址与版本号解耦，检查更新只读这一个文件。
 
-# 镜像前缀（空串 = 直连 GitHub）：同一份资产的不同入口，与下面代理列表
-# 笛卡尔积成候选通道表。**全部并发探测**，谁先答且答得对就用谁。
-# 与 scripts/fetch_seed.py 的 _MIRRORS 同源，改动请两边对齐。
-_MIRRORS = ("https://ghfast.top/", "https://gh-proxy.com/", "https://gh-proxy.net/", "")
+# 镜像前缀（单一来源 app.core.app_info.GITHUB_MIRRORS，空串 = 直连 GitHub）。
+_MIRRORS = GITHUB_MIRRORS
 
 STAGING_DIR = STAGING_DIR_NAME  # data/ 下的暂存目录（desktop 侧读同名目录）
 _PENDING_FILE = ".update-pending"  # 换装标记（staging 内 manifest.json 同目录）
@@ -113,26 +112,30 @@ def _pick_asset(assets: list[dict], name: str | None = None) -> dict | None:
 
 
 async def _fetch_manifest() -> dict | None:
-    """按镜像链取 latest.json。全部通道失败返回 None（调用方回落 GitHub API）。"""
-    last_err: Exception | None = None
-    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-        for mirror in _MIRRORS:
-            try:
+    """按镜像链取 latest.json。全通道并发竞速，先到先用；全失败返回 None。"""
+
+    async def _try_one(mirror: str) -> dict | None:
+        try:
+            async with httpx.AsyncClient(timeout=5, follow_redirects=True) as client:
                 resp = await client.get(manifest_url(mirror))
                 if resp.status_code != 200:
-                    last_err = RuntimeError(f"HTTP {resp.status_code}")
-                    continue
+                    return None
                 data = resp.json()
                 if isinstance(data, dict) and data.get("version"):
                     return data
-                last_err = RuntimeError("清单缺 version 字段")
-            except Exception as e:  # noqa: BLE001 —— 换下一镜像
-                last_err = e
+        except Exception:  # noqa: BLE001 —— 单通道失败不影响其余
+            return None
+        return None
+
+    results = await asyncio.gather(*(_try_one(m) for m in _MIRRORS))
+    for data in results:
+        if data is not None:
+            return data
     log_event(
         logger,
         "更新清单不可用，回落 GitHub API",
         tag="降级",
-        detail={"原因": str(last_err)},
+        detail={"原因": "全部镜像均未返回有效清单"},
     )
     return None
 
@@ -229,7 +232,7 @@ async def _check_update_via_api() -> dict:
 _version_gt = version_gt
 
 
-def _plain_notes(body: str, limit: int = 1500) -> str:
+def _plain_notes(body: str, limit: int = 8000) -> str:
     """release body 转可展示纯文本（去 markdown 语法噪音，截断保形）。"""
     text = re.sub(r"```[\s\S]*?```", "（代码块略）", body)
     text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)
@@ -581,8 +584,12 @@ async def _stream_to_file(
     expected_total: int | None = None,
     min_rate_bps: int = 0,
     label: str | None = None,
+    progress_dict: dict | None = None,
 ) -> None:
     """流式下载 + 断点续传 + 停滞/速率双闸换道。失败抛错（调用方换通道）。
+
+    progress_dict：进度写入的目标字典。默认 None = 写本模块的 _PROGRESS。
+    外部调用方（如 seed_fetch）传入各自私有字典，避免并发下载污染彼此进度。
 
     - **续传**：带上已有字节数发 `Range: bytes=N-`；服务端回 200（不认 Range）
       才从头下——不清零会把新流追加到旧文件后面，拼出一个校验必挂的坏包。
@@ -591,6 +598,7 @@ async def _stream_to_file(
     - **速率闸**：试跑 _TRIAL_SECONDS 后平均速率低于下限判「过慢」——只靠停滞
       闸抓不住「慢但在动」的通道（曾有镜像 40KB/s 能一直动，整包要一小时）。
     """
+    prog = progress_dict if progress_dict is not None else _PROGRESS
     resumed = dest.stat().st_size if dest.is_file() else 0
     headers = {"Range": f"bytes={resumed}-"} if resumed else {}
     timeout = httpx.Timeout(_STALL_TIMEOUT, connect=15)
@@ -604,7 +612,7 @@ async def _stream_to_file(
                 resumed = 0  # 服务端不认 Range：必须从头下
             total = _total_from_headers(resp.headers, resp.status_code) or expected_total
             received = resumed
-            _PROGRESS.update({"total": total or None, "channel": label})
+            prog.update({"total": total or None, "channel": label})
 
             started = time.monotonic()
             window_at = started
@@ -629,11 +637,11 @@ async def _stream_to_file(
                     window_bytes += len(chunk)
                     now = time.monotonic()
                     if now - window_at >= 1.0:
-                        _PROGRESS.update({
+                        prog.update({
                             "speed": int(window_bytes / (now - window_at)),
                         })
                         window_at, window_bytes = now, 0
-                    _PROGRESS.update({
+                    prog.update({
                         "received": received,
                         "percent": round(received * 100 / total) if total else None,
                     })
