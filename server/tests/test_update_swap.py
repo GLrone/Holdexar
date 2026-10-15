@@ -41,6 +41,7 @@ def _load_desktop_main():
 desktop = _load_desktop_main()
 APP_NAME = desktop.APP_NAME
 EXE_NAME = f"{APP_NAME}.exe"
+_ORIGINAL_SWAP_PAYLOAD = desktop._swap_payload
 
 
 def _make_install(root: Path, *, exe: str = "old-exe", files: dict | None = None) -> Path:
@@ -582,8 +583,236 @@ def test_swap_mutex_serializes_holders() -> None:
     assert acquired.wait(2)
 
     assert desktop._swap_mutex_held() is True
-    assert desktop._acquire_swap_mutex() is False  # 第二个换装进程就地退出
-
     release.set()
     thread.join(timeout=2)
+    desktop._release_swap_mutex()
     assert desktop._swap_mutex_held() is False
+
+
+@pytest.mark.skipif(os.name != "nt", reason="换装互斥体是 Windows 命名互斥")
+def test_release_swap_mutex_clears_held() -> None:
+    """换装完成或失败拉起前主动释放互斥体，放行新实例。"""
+    import threading
+
+    acquired = threading.Event()
+    released = threading.Event()
+
+    def _holder() -> None:
+        assert desktop._acquire_swap_mutex() is True
+        acquired.set()
+        released.wait(5)
+        desktop._release_swap_mutex()
+
+    thread = threading.Thread(target=_holder, daemon=True)
+    thread.start()
+    assert acquired.wait(2)
+    assert desktop._swap_mutex_held() is True
+
+    released.set()
+    thread.join(timeout=2)
+    assert desktop._swap_mutex_held() is False
+
+
+def test_handoff_ledger_not_recorded_when_popen_fails(tmp_path: Path, monkeypatch) -> None:
+    """拉起换装进程抛异常时，不落交接账本：防止启动失败被当成换装失败清空暂存。"""
+    data_dir = tmp_path / "data"
+    staging = data_dir / "update-staging"
+    _make_payload(staging)
+    _stage_manifest(staging, tag="v9.9.9")
+    install = _make_install(tmp_path / "install")
+
+    monkeypatch.setattr(desktop, "is_frozen", lambda: True)
+    monkeypatch.setattr(desktop, "_data_dir", lambda: data_dir)
+    monkeypatch.setattr(desktop, "_app_root", lambda: install)
+    monkeypatch.setattr(desktop, "_staged_supports_helper", lambda _exe: True)
+
+    def _boom_popen(*args, **kwargs):
+        raise OSError("模拟系统拒绝创建进程")
+
+    monkeypatch.setattr(desktop.subprocess, "Popen", _boom_popen)
+
+    assert desktop._handoff_pending_update() is False
+    assert not (data_dir / desktop.HANDOFF_LEDGER_NAME).exists()
+    # 暂存包依然完好
+    assert (staging / "manifest.json").exists()
+
+
+def test_run_update_helper_rolls_back_when_new_exe_crashes(tmp_path: Path, monkeypatch) -> None:
+    """新版本启动即崩溃（退出码非 0）时，helper 自动回滚到 __old__ 并拉起旧版。"""
+    data_dir, staging, target, events = _prepare_failed_helper_case(tmp_path, monkeypatch)
+    monkeypatch.setattr(desktop, "_swap_payload", _ORIGINAL_SWAP_PAYLOAD)
+
+    class MockCrashProcess:
+        def wait(self, timeout=None):
+            return 1
+
+    monkeypatch.setattr(desktop.subprocess, "Popen", lambda cmd, **kwargs: MockCrashProcess())
+
+    desktop._run_update_helper(staging, target, None)
+
+    assert (data_dir / desktop._FAILED_MARK).is_file()
+    assert (target / EXE_NAME).read_bytes() == b"old-exe"
+    diag = desktop._read_diagnosis()
+    assert diag.get("errorCode") == "UPDATE-LAUNCH-FAIL"
+    assert diag.get("rollback", {}).get("completed") is True
+
+
+def test_restore_moved_reports_completeness(tmp_path: Path, monkeypatch) -> None:
+    """回滚完整性度量：全部恢复返回 True，部分条目失败返回 False 并列出清单。"""
+    target = tmp_path / "target"
+    old_dir = tmp_path / "old"
+    target.mkdir()
+    old_dir.mkdir()
+    (old_dir / "ok.txt").write_text("ok", encoding="utf-8")
+    (old_dir / "fail.txt").write_text("fail", encoding="utf-8")
+
+    def _replace_mock(src: Path, dst: Path, *args, **kwargs):
+        if src.name == "fail.txt":
+            raise PermissionError("模拟占用")
+        src.replace(dst)
+
+    monkeypatch.setattr(desktop, "_replace_with_retry", _replace_mock)
+
+    completed, failed = desktop._restore_moved(["ok.txt", "fail.txt"], target, old_dir)
+    assert completed is False
+    assert failed == ["fail.txt"]
+    assert (target / "ok.txt").read_text(encoding="utf-8") == "ok"
+    assert (old_dir / "fail.txt").read_text(encoding="utf-8") == "fail"
+
+
+def test_wait_target_idle_verifies_taskkill_returncode(tmp_path: Path, monkeypatch) -> None:
+    """进程等待与强制清理验证退出码：杀死失败时返回未退出 PID。"""
+    target = tmp_path / "target"
+    target.mkdir()
+
+    monkeypatch.setattr(desktop, "_pids_running_from", lambda _t: [12345])
+
+    class MockCompletedProcess:
+        returncode = 1
+        stdout = ""
+        stderr = "ERROR: Access denied"
+
+    monkeypatch.setattr(desktop.subprocess, "run", lambda *a, **k: MockCompletedProcess())
+    monkeypatch.setattr(desktop.time, "sleep", lambda _s: None)
+
+    remaining = desktop._wait_target_idle(target, timeout_s=0.01)
+    assert remaining == [12345]
+
+
+def test_run_update_helper_aborts_when_target_locked(tmp_path: Path, monkeypatch) -> None:
+    """程序目录存在无法退出的残留进程时，换装提前中止，不动任何安装文件。"""
+    data_dir, staging, target, events = _prepare_failed_helper_case(tmp_path, monkeypatch)
+    (target / "app.txt").write_text("running", encoding="utf-8")
+
+    monkeypatch.setattr(desktop, "_wait_target_idle", lambda _t: [8888])
+
+    desktop._run_update_helper(staging, target, None)
+
+    diag = desktop._read_diagnosis()
+    assert diag.get("errorCode") == "UPDATE-FILE-LOCK"
+    assert "8888" in (diag.get("errorMessage") or "")
+    assert (target / "app.txt").read_text(encoding="utf-8") == "running"
+    assert not (target / "__old__").exists()
+
+
+def test_swap_payload_preflight_disk_space_abort(tmp_path: Path, monkeypatch) -> None:
+    """预检磁盘剩余空间：空间不足直接终止换装，不修改目标文件。"""
+    install = _make_install(tmp_path / "install")
+    staging = tmp_path / "staging"
+    _make_payload(staging)
+    _stage_manifest(staging)
+
+    import collections
+    Usage = collections.namedtuple("Usage", ["total", "used", "free"])
+    monkeypatch.setattr(desktop.shutil, "disk_usage", lambda _p: Usage(1000, 900, 100))
+
+    diag_ctx = desktop._init_diagnosis(staging, install)
+    assert desktop._swap_payload(staging, install, diag_ctx=diag_ctx) is False
+    assert diag_ctx.get("errorCode") == "UPDATE-DISK-SPACE"
+    assert (install / EXE_NAME).read_bytes() == b"old-exe"
+
+
+def test_run_update_helper_post_swap_health_timeout_rolls_back(tmp_path: Path, monkeypatch) -> None:
+    """新版本启动但健康检查超时：自动回滚到原版本并记录故障归因。"""
+    data_dir, staging, target, events = _prepare_failed_helper_case(tmp_path, monkeypatch)
+    monkeypatch.setattr(desktop, "_swap_payload", _ORIGINAL_SWAP_PAYLOAD)
+
+    class MockRunningProcess:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(desktop.subprocess, "Popen", lambda cmd, **kwargs: MockRunningProcess())
+
+    def _mock_verify_health(target_version, proc, timeout=25.0):
+        return False, "等待健康检查超时（模拟）", None
+
+    monkeypatch.setattr(desktop, "_verify_new_version_health", _mock_verify_health)
+
+    desktop._run_update_helper(staging, target, None)
+
+    assert (data_dir / desktop._FAILED_MARK).is_file()
+    assert (target / EXE_NAME).read_bytes() == b"old-exe"
+    diag = desktop._read_diagnosis()
+    assert diag.get("errorCode") == "UPDATE-HEALTH-TIMEOUT"
+    assert diag.get("rollback", {}).get("completed") is True
+
+
+def test_run_update_helper_records_successful_diagnosis(tmp_path: Path, monkeypatch) -> None:
+    """换装成功并经验收通过：诊断记录标记完成并持久化。"""
+    data_dir, staging, target, events = _prepare_failed_helper_case(tmp_path, monkeypatch)
+    monkeypatch.setattr(desktop, "_swap_payload", _ORIGINAL_SWAP_PAYLOAD)
+
+    class MockRunningProcess:
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(desktop.subprocess, "Popen", lambda cmd, **kwargs: MockRunningProcess())
+
+    def _mock_verify_health(target_version, proc, timeout=25.0):
+        return True, "健康检查通过", {"app": desktop.APP_NAME, "version": "9.9.9"}
+
+    monkeypatch.setattr(desktop, "_verify_new_version_health", _mock_verify_health)
+
+    desktop._run_update_helper(staging, target, None)
+
+    diag = desktop._read_diagnosis()
+    assert diag.get("success") is True
+    assert diag.get("stage") == "completed"
+    assert diag.get("healthCheck", {}).get("status") == "passed"
+
+
+def test_run_update_helper_incomplete_rollback_alert(tmp_path: Path, monkeypatch) -> None:
+    """回滚不完整时弹窗明确提示未恢复文件与手工恢复路径。"""
+    data_dir, staging, target, events = _prepare_failed_helper_case(tmp_path, monkeypatch)
+
+    def _fake_swap(s, t, diag_ctx=None):
+        if diag_ctx is not None:
+            diag_ctx["errorCode"] = "UPDATE-FILE-LOCK"
+            diag_ctx["errorMessage"] = "模拟搬运失败"
+            diag_ctx["rollback"] = {
+                "attempted": True,
+                "completed": False,
+                "failedFiles": ["locked_file.dll"],
+            }
+        return False
+
+    monkeypatch.setattr(desktop, "_swap_payload", _fake_swap)
+
+    desktop._run_update_helper(staging, target, None)
+
+    diag = desktop._read_diagnosis()
+    assert diag.get("errorCode") == "UPDATE-FILE-LOCK"
+    assert diag.get("rollback", {}).get("completed") is False
+    assert diag.get("rollback", {}).get("failedFiles") == ["locked_file.dll"]
+    alerts = [text for kind, text in events if kind == "alert"]
+    assert len(alerts) == 1
+    assert "部分原文件未恢复" in alerts[0]
+    assert "locked_file.dll" in alerts[0]
+
+

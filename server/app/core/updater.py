@@ -25,9 +25,11 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import time
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -35,6 +37,7 @@ import httpx
 
 from app.core.app_info import (
     APP_NAME,
+    ENV_PREFIX,
     GITHUB_MIRRORS,
     GITHUB_REPO,
     HANDOFF_LEDGER_NAME,
@@ -77,6 +80,7 @@ _MIN_CHANNEL_RATE = 64 * 1024  # B/s
 _TRIAL_SECONDS = 15.0
 # 续传落盘的临时名（.part：没校验通过前不得被当成完整包）
 _PART_NAME = "update.zip.part"
+DOWNLOAD_META_NAME = "download_meta.json"
 # 安装包体积下限：小于它必然不是应用包（镜像对不存在的资产常回几百字节的
 # 200 错误页——把它当下载成功，用户会看到「校验失败」而不是「没这个包」）。
 _MIN_PACKAGE_BYTES = 1 * 1024 * 1024
@@ -89,6 +93,9 @@ def staging_dir() -> Path:
 
 def manifest_url(mirror: str = "") -> str:
     """清单地址（mirror 为空 = 直连）。"""
+    base = os.environ.get(f"{ENV_PREFIX}UPDATE_URL", "").rstrip("/")
+    if base:
+        return f"{base}/{MANIFEST_ASSET}"
     return (
         f"{mirror}https://github.com/{GITHUB_REPO}/releases/download/"
         f"{MANIFEST_TAG}/{MANIFEST_ASSET}"
@@ -113,6 +120,18 @@ def _pick_asset(assets: list[dict], name: str | None = None) -> dict | None:
 
 async def _fetch_manifest() -> dict | None:
     """按镜像链取 latest.json。全通道并发竞速，先到先用；全失败返回 None。"""
+    base = os.environ.get(f"{ENV_PREFIX}UPDATE_URL", "").rstrip("/")
+    if base:
+        try:
+            async with httpx.AsyncClient(timeout=5, follow_redirects=True) as client:
+                resp = await client.get(f"{base}/{MANIFEST_ASSET}")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, dict) and data.get("version"):
+                        return data
+        except Exception:  # noqa: BLE001
+            return None
+        return None
 
     async def _try_one(mirror: str) -> dict | None:
         try:
@@ -281,6 +300,20 @@ class _Cancelled(RuntimeError):
     """用户主动取消下载（内部信号，不冒泡到前端当故障展示）。"""
 
 
+def mark_download_starting(tag: str, expected_size: int | None = None) -> bool:
+    """原子化置位下载中状态，防止并发调用竞争。"""
+    if _PROGRESS.get("running"):
+        return False
+    _progress_reset()
+    _CANCEL["flag"] = False
+    _PROGRESS.update({
+        "running": True, "phase": "probe", "received": 0,
+        "total": expected_size or None,
+        "percent": 0 if expected_size else None,
+    })
+    return True
+
+
 async def download_update(
     tag: str,
     expected_sha256: str | None = None,
@@ -306,23 +339,56 @@ async def download_update(
     """
     from app.domains.proxies import clash_manager
 
-    _progress_reset()
-    _CANCEL["flag"] = False
-    # 开头就把总量挂上：探测期（最长 ~8s）还没吐数据，进度条若没有分母
-    # 就完全不动——用户看到的是「点了没反应」。清单体积兜出 0% 起步即可。
-    _PROGRESS.update({
-        "running": True, "phase": "probe", "received": 0,
-        "total": expected_size or None,
-        "percent": 0 if expected_size else None,
-    })
+    if not _PROGRESS.get("running"):
+        _progress_reset()
+        _CANCEL["flag"] = False
+        _PROGRESS.update({
+            "running": True, "phase": "probe", "received": 0,
+            "total": expected_size or None,
+            "percent": 0 if expected_size else None,
+        })
 
     staging = staging_dir()
     staging.mkdir(parents=True, exist_ok=True)
+    (staging / STAGING_MANIFEST_NAME).unlink(missing_ok=True)
     part = staging / _PART_NAME
-    # 续传基线：上次没下完的 .part 直接接着用（换通道/重开应用都不必从 0 开始）。
-    # 体积对不上说明是别的版本的残留，弃掉重来。
-    if part.is_file() and expected_size and part.stat().st_size > expected_size:
-        part.unlink(missing_ok=True)
+    meta_path = staging / DOWNLOAD_META_NAME
+
+    # 续传基线与资产绑定：
+    # 仅当历史元数据与当前下载的目标资产（tag / asset / size / sha256）完全一致时，
+    # 并且已下载字节数不超过目标大小时，才保留 .part 接着下；
+    # 任何一项不符均视为其他版本或损坏残留，丢弃从头开始。
+    meta_valid = False
+    if part.is_file() and meta_path.is_file():
+        try:
+            old_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if (
+                old_meta.get("tag") == tag
+                and old_meta.get("asset") == (asset_name or "")
+                and old_meta.get("size") == (expected_size or 0)
+                and old_meta.get("sha256") == (expected_sha256 or "")
+            ):
+                meta_valid = True
+        except Exception:
+            meta_valid = False
+
+    if part.is_file():
+        if not meta_valid or (expected_size and part.stat().st_size > expected_size):
+            part.unlink(missing_ok=True)
+
+    try:
+        meta_path.write_text(
+            json.dumps({
+                "tag": tag,
+                "asset": asset_name or "",
+                "size": expected_size or 0,
+                "sha256": expected_sha256 or "",
+            }),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
     _PROGRESS.update({"received": part.stat().st_size if part.is_file() else 0})
 
     try:
@@ -375,10 +441,24 @@ async def download_update(
                         + (f"/期望 {expected_size}" if expected_size else "")
                         + "），换下一通道"
                     )
+
+                # SHA256 校验闸（在通道循环内即刻校验）：
+                # 镜像可能完整返回错误内容（如错误页或旧版），此时若直接退出循环
+                # 会导致整体失败；必须立即清理损坏文件并尝试下一可用通道。
+                if expected_sha256:
+                    actual = await asyncio.to_thread(_sha256_of, part)
+                    if actual.lower() != expected_sha256.strip().lower():
+                        part.unlink(missing_ok=True)
+                        baseline = 0
+                        raise RuntimeError(
+                            f"SHA256 校验失败（实际 {actual[:16]}… 期望 {expected_sha256[:16]}…），换下一通道"
+                        )
                 break
             except _Cancelled:
                 raise
             except Exception as e:  # noqa: BLE001 —— 换下一通道
+                if part.is_file() and part.stat().st_size != baseline:
+                    _truncate_to(part, baseline)
                 log_event(
                     logger,
                     "更新下载通道不可用，换下一通道",
@@ -390,12 +470,13 @@ async def download_update(
                 )
                 last_err = e
         else:
+            shutil.rmtree(staging, ignore_errors=True)
             raise RuntimeError(f"所有下载通道均失败：{last_err}")
 
         zip_path = staging / "update.zip"
         part.replace(zip_path)
 
-        # sha256 校验（有期望值才校验）
+        # sha256 校验（安全兜底防线）
         if expected_sha256:
             _PROGRESS.update({"phase": "verify"})
             actual = await asyncio.to_thread(_sha256_of, zip_path)
@@ -408,12 +489,14 @@ async def download_update(
         # 解包到 staging/holdexar/（zip 内根目录即 Holdexar/）
         _PROGRESS.update({"phase": "extract"})
         await asyncio.to_thread(_extract, zip_path, staging)
+        meta_path.unlink(missing_ok=True)
 
         # 换装 manifest（desktop 启动编排读）
         manifest = {
             "tag": tag,
             "sha256": expected_sha256,
             "ready": True,
+            "attempt_id": str(uuid.uuid4()),
         }
         (staging / STAGING_MANIFEST_NAME).write_text(
             json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
@@ -433,7 +516,7 @@ async def download_update(
         )
         return {"ok": True, "staging": str(staging), "tag": tag}
     except _Cancelled:
-        part.unlink(missing_ok=True)
+        # 用户主动取消：保留已下载的 .part（受 download_meta.json 保护），下次可接着下
         _PROGRESS.update({"running": False, "phase": None, "code": "cancelled",
                           "error": "已取消下载"})
         return {"ok": False, "cancelled": True}
@@ -459,6 +542,9 @@ def _error_code(err: Exception) -> str:
 
 async def _resolve_asset_url(tag: str, asset_name: str | None) -> str:
     """确定资产下载地址：清单给了确切名就直连，否则回落到 API 反查。"""
+    base = os.environ.get(f"{ENV_PREFIX}UPDATE_URL", "").rstrip("/")
+    if base and asset_name:
+        return f"{base}/{asset_name}"
     if asset_name:
         return f"https://github.com/{GITHUB_REPO}/releases/download/{tag}/{asset_name}"
     guessed = (
@@ -485,11 +571,14 @@ async def _resolve_asset_url(tag: str, asset_name: str | None) -> str:
 
 
 def _channel_plan(asset_url: str, attempts: list[tuple]) -> list[dict]:
-    """候选通道表 = 出口（直连/内核代理/本地混合端口）× 镜像前缀。
-
-    `direct` 标出「既不经镜像、也不经代理」的那一条——它的判定是**权威的**：
-    GitHub 自己对它说 404，就是真没有这个资产（镜像说 404 可能只是没同步）。
-    """
+    """候选通道表 = 出口（直连/内核代理/本地混合端口）× 镜像前缀。"""
+    if "127.0.0.1" in asset_url or "localhost" in asset_url:
+        return [{
+            "label": "本地测试更新源",
+            "url": asset_url,
+            "proxy": None,
+            "direct": True,
+        }]
     plan: list[dict] = []
     for proxy, label in attempts:
         for mirror in _MIRRORS:

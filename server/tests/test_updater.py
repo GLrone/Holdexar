@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import sys
@@ -420,4 +421,104 @@ async def test_download_respects_cancel(tmp_path: Path, monkeypatch) -> None:
     result = await updater.download_update("v0.2.0", None, "x.zip", expected_size=len(data))
     assert result["ok"] is False and result["cancelled"] is True
     assert updater.download_progress()["code"] == "cancelled"
+    # 取消下载后，保留已下的 .part 供后续续传
+    assert (tmp_path / "staging" / updater._PART_NAME).is_file()
     updater.clear_staging()
+
+
+@pytest.mark.asyncio
+async def test_download_sha256_mismatch_falls_back_to_next_channel(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """镜像返回错误内容（SHA256 不符）时，通道循环内即刻换道下一镜像，最终下载成功。"""
+    payload = tmp_path / "real.zip"
+    with zipfile.ZipFile(payload, "w") as zf:
+        zf.writestr("Holdexar/Holdexar.exe", "MZ-valid")
+    good_bytes = payload.read_bytes()
+    good_sha = hashlib.sha256(good_bytes).hexdigest()
+    bad_bytes = b"corrupt payload from bad mirror"
+
+    called_urls: list[str] = []
+
+    async def fake_stream(url, proxy, target_file: Path, *args, **kwargs):
+        called_urls.append(url)
+        if "bad_mirror" in url:
+            target_file.write_bytes(bad_bytes)
+        else:
+            target_file.write_bytes(good_bytes)
+
+    async def fake_probe(channels, fallback_total):
+        return [
+            {"label": "镜像1", "url": "https://bad_mirror/x.zip", "proxy": None, "missing": False, "bogus": False, "total": len(bad_bytes)},
+            {"label": "镜像2", "url": "https://good_mirror/x.zip", "proxy": None, "missing": False, "bogus": False, "total": len(good_bytes)},
+        ]
+
+    monkeypatch.setattr(updater, "staging_dir", lambda: tmp_path / "staging")
+    monkeypatch.setattr(updater, "_MIN_PACKAGE_BYTES", 0)
+    monkeypatch.setattr(updater, "_probe_channels", fake_probe)
+    monkeypatch.setattr(updater, "_stream_to_file", fake_stream)
+    monkeypatch.setattr(
+        "app.domains.proxies.clash_manager._download_attempts",
+        lambda *_a, **_k: [(None, "直连")],
+    )
+
+    result = await updater.download_update("v0.2.0", expected_sha256=good_sha, asset_name="x.zip")
+    assert result["ok"] is True
+    assert called_urls == ["https://bad_mirror/x.zip", "https://good_mirror/x.zip"]
+    assert updater.pending_status()["pending"] is True
+    assert (tmp_path / "staging" / "Holdexar" / "Holdexar.exe").read_bytes() == b"MZ-valid"
+    updater.clear_staging()
+
+
+def test_download_meta_binding_discards_different_version(tmp_path: Path, monkeypatch) -> None:
+    """旧 .part 文件若属于不同版本或资产，启动下载时必须清除重来，防止损坏拼接。"""
+    staging = tmp_path / "staging"
+    staging.mkdir(parents=True)
+    part = staging / updater._PART_NAME
+    part.write_bytes(b"old-partial-bytes")
+    meta = staging / updater.DOWNLOAD_META_NAME
+    meta.write_text(
+        json.dumps({"tag": "v0.1.0", "asset": "x.zip", "size": 100, "sha256": "oldsha"}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(updater, "staging_dir", lambda: staging)
+
+    import asyncio
+
+    async def fake_probe(channels, fallback_total):
+        # 抛异常终止后续执行，只检验开头的元数据校验与清理行为
+        raise updater._Cancelled()
+
+    monkeypatch.setattr(updater, "_probe_channels", fake_probe)
+    monkeypatch.setattr(
+        "app.domains.proxies.clash_manager._download_attempts",
+        lambda *_a, **_k: [(None, "直连")],
+    )
+
+    asyncio.run(updater.download_update("v0.2.0", expected_sha256="newsha", asset_name="x.zip", expected_size=100))
+    # 因为 tag 不同，旧的 .part 必须已被清空
+    assert not part.exists()
+
+
+def test_mark_download_starting_prevents_race() -> None:
+    """原子化置位标记：第一次标记成功，第二次并发调用被拦截。"""
+    updater._PROGRESS.clear()
+    assert updater.mark_download_starting("v0.2.0", 100) is True
+    assert updater.mark_download_starting("v0.2.0", 100) is False
+    updater._PROGRESS["running"] = False
+
+
+@pytest.mark.asyncio
+async def test_update_url_custom_override(monkeypatch) -> None:
+    """测试指定 HOLDEXAR_UPDATE_URL 时走本地测试更新源。"""
+    monkeypatch.setenv("HOLDEXAR_UPDATE_URL", "http://127.0.0.1:8888")
+    assert updater.manifest_url() == "http://127.0.0.1:8888/latest.json"
+    url = await updater._resolve_asset_url("v0.3.2-beta", "app.zip")
+    assert url == "http://127.0.0.1:8888/app.zip"
+    plan = updater._channel_plan("http://127.0.0.1:8888/app.zip", [])
+    assert len(plan) == 1
+    assert plan[0]["direct"] is True
+    assert plan[0]["proxy"] is None
+
+
