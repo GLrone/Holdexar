@@ -3,12 +3,30 @@ import { ref } from 'vue'
 
 import { settingsApi, type SettingsPayload } from '@/api/client'
 
+const ONBOARDING_DISMISSED_KEY = 'holdexar_onboarding_dismissed'
+
+export function isLocalOnboardingDismissed(): boolean {
+  try {
+    return localStorage.getItem(ONBOARDING_DISMISSED_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+export function setLocalOnboardingDismissed(): void {
+  try {
+    localStorage.setItem(ONBOARDING_DISMISSED_KEY, '1')
+  } catch {
+    /* 静默 */
+  }
+}
+
 /** 应用设置（账户 + 新手教程标志 + 自动价格链开关 + 更新提示锚点/提示开关/静默更新开关）。区服配置在 stores/regions（服务端下发 + crawl_regions 表）。 */
 export const useSettingsStore = defineStore('settings', () => {
   const account = ref<SettingsPayload['account'] | null>(null)
   const loaded = ref(false)
   /** 新手教程完成标志（settingsPayload 初次拉取后填充；null = 未拉到） */
-  const onboardingDone = ref<boolean | null>(null)
+  const onboardingDone = ref<boolean | null>(isLocalOnboardingDismissed() ? true : null)
   /** 自动价格链开关（null = 未拉到，UI 按开处理；定时爬价 + 失败修复的总闸） */
   const autoPrice = ref<boolean | null>(null)
   /** 每日自动备份开关（null = 未拉到，UI 按开处理；启动补备同闸） */
@@ -27,7 +45,16 @@ export const useSettingsStore = defineStore('settings', () => {
     try {
       const s = await settingsApi.get()
       account.value = s.account
-      onboardingDone.value = s.onboarding_done
+      const localDismissed = isLocalOnboardingDismissed()
+      if (s.onboarding_done) {
+        setLocalOnboardingDismissed()
+        onboardingDone.value = true
+      } else if (localDismissed) {
+        onboardingDone.value = true
+        void settingsApi.update({ onboarding_done: true }).catch(() => {})
+      } else {
+        onboardingDone.value = false
+      }
       autoPrice.value = s.auto_price
       backupAuto.value = s.backup_auto
       updateSkipped.value = s.update_skipped
@@ -40,9 +67,10 @@ export const useSettingsStore = defineStore('settings', () => {
     }
   }
 
-  /** 新手教程完成：置标志并落库（失败静默——下次启动会再弹，可接受） */
+  /** 新手教程完成：置标志并落库 */
   async function markOnboardingDone() {
     onboardingDone.value = true
+    setLocalOnboardingDismissed()
     try {
       const s = await settingsApi.update({ onboarding_done: true })
       onboardingDone.value = s.onboarding_done
