@@ -18,8 +18,11 @@ APP_SLUG = APP_NAME.lower()
 # run.py、desktop/main.py 需要在装依赖之前就能取到版本号。
 APP_VERSION = "0.3.1-beta"
 
-# 发布仓库（owner/repo）：更新检查与种子资产下载共用一个来源，勿在两处各写一遍
 GITHUB_REPO = "GLrone/Holdexar"
+
+# GitHub Release 资产下载镜像链（空串 = 直连 GitHub 兜底）。
+# 供 updater、seed_fetch 与 scripts/fetch_seed 三处共用，唯一事实源。
+GITHUB_MIRRORS = ("https://ghfast.top/", "https://gh-proxy.com/", "https://gh-proxy.net/", "")
 
 # 公共数据分发直链（对象存储上的自有入口）。种子这类数百 MB 的资产走它比
 # 走 GitHub 及其代理快一个量级，且不占发布仓库的带宽；不可达时下载链自动

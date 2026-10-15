@@ -135,3 +135,167 @@ def test_status_snapshot_reports_presence(tmp_path: Path, monkeypatch) -> None:
     snap = asyncio.run(seed_fetch.status_snapshot())
     assert snap["present"] is False
     assert snap["path"] is None
+
+
+@pytest.mark.asyncio
+async def test_seed_fetch_sha256_mismatch_falls_back_to_next_mirror(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """镜像内容 SHA256 不符时立即清理坏档并换下一通道，下一通道正确完成。"""
+    seed_dir = tmp_path / "seed"
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    good_db = tmp_path / "origin.db"
+    _make_seed_db(good_db, "2026-10-15 12:00:00")
+    good_gz_bytes = gzip.compress(good_db.read_bytes())
+    good_sha = hashlib.sha256(good_gz_bytes).hexdigest()
+
+    bad_gz_bytes = b"corrupt payload that differs in hash" * 100
+
+    class _S:
+        data_dir = tmp_path
+
+    monkeypatch.setattr(seed_fetch, "get_settings", lambda: _S())
+    monkeypatch.setattr(seed_fetch, "_data_seed_dir", lambda: seed_dir)
+    monkeypatch.setattr(seed_fetch, "seed_db_path", lambda: seed_dir / "holdexar_seed.db")
+    monkeypatch.setattr(seed_fetch, "_MIN_SEED_BYTES", 0)
+
+    import app.core.updater as updater
+
+    monkeypatch.setattr(updater, "_MIN_PACKAGE_BYTES", 0)
+
+    async def _mock_manifest_entry():
+        return {"sha256": good_sha, "size": len(good_gz_bytes)}
+
+    monkeypatch.setattr(seed_fetch, "_seed_manifest_entry", _mock_manifest_entry)
+
+    channels_probed = []
+
+    async def _fake_stream(url, proxy, target_file: Path, *args, **kwargs):
+        channels_probed.append(url)
+        if url == "https://mirror1/seed.db.gz":
+            target_file.write_bytes(bad_gz_bytes)
+        else:
+            target_file.write_bytes(good_gz_bytes)
+
+    async def _fake_probe(channels, fallback_total):
+        return [
+            {"label": "镜像1", "url": "https://mirror1/seed.db.gz", "proxy": None, "missing": False, "bogus": False, "total": len(bad_gz_bytes)},
+            {"label": "镜像2", "url": "https://mirror2/seed.db.gz", "proxy": None, "missing": False, "bogus": False, "total": len(good_gz_bytes)},
+        ]
+
+    async def _fake_merge():
+        pass
+
+    monkeypatch.setattr(updater, "_stream_to_file", _fake_stream)
+    monkeypatch.setattr(updater, "_probe_channels", _fake_probe)
+    monkeypatch.setattr(seed_fetch, "merge_seed_incremental", _fake_merge)
+
+    result = await seed_fetch.ensure_seed_online()
+    assert result["present"] is True
+    assert (seed_dir / "holdexar_seed.db").is_file()
+    assert channels_probed == ["https://mirror1/seed.db.gz", "https://mirror2/seed.db.gz"]
+    # 坏档未残留为 gz 或 part
+    assert not (seed_dir / seed_fetch.SEED_GZ_NAME).exists()
+    assert not (seed_dir / seed_fetch._PART_NAME).exists()
+
+
+@pytest.mark.asyncio
+async def test_seed_fetch_channel_truncation_does_not_corrupt_next_channel(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """通道异常断开导致部分写入时，回滚临时文件到进入该通道前的位置，不污染后续通道。"""
+    seed_dir = tmp_path / "seed"
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    good_db = tmp_path / "origin2.db"
+    _make_seed_db(good_db, "2026-10-15 13:00:00")
+    good_gz_bytes = gzip.compress(good_db.read_bytes())
+    good_sha = hashlib.sha256(good_gz_bytes).hexdigest()
+
+    class _S:
+        data_dir = tmp_path
+
+    monkeypatch.setattr(seed_fetch, "get_settings", lambda: _S())
+    monkeypatch.setattr(seed_fetch, "_data_seed_dir", lambda: seed_dir)
+    monkeypatch.setattr(seed_fetch, "seed_db_path", lambda: seed_dir / "holdexar_seed.db")
+    monkeypatch.setattr(seed_fetch, "_MIN_SEED_BYTES", 0)
+
+    import app.core.updater as updater
+
+    monkeypatch.setattr(updater, "_MIN_PACKAGE_BYTES", 0)
+
+    async def _mock_manifest_entry():
+        return {"sha256": good_sha, "size": len(good_gz_bytes)}
+
+    monkeypatch.setattr(seed_fetch, "_seed_manifest_entry", _mock_manifest_entry)
+
+    channels_probed = []
+
+    async def _fake_stream(url, proxy, target_file: Path, *args, **kwargs):
+        channels_probed.append(url)
+        if url == "https://mirror1/seed.db.gz":
+            # 写入半截并抛出网络中断异常
+            target_file.write_bytes(b"garbage-cut-off")
+            raise ConnectionResetError("Connection lost mid-stream")
+        target_file.write_bytes(good_gz_bytes)
+
+    async def _fake_probe(channels, fallback_total):
+        return [
+            {"label": "镜像1", "url": "https://mirror1/seed.db.gz", "proxy": None, "missing": False, "bogus": False, "total": 1000},
+            {"label": "镜像2", "url": "https://mirror2/seed.db.gz", "proxy": None, "missing": False, "bogus": False, "total": len(good_gz_bytes)},
+        ]
+
+    async def _fake_merge():
+        pass
+
+    monkeypatch.setattr(updater, "_stream_to_file", _fake_stream)
+    monkeypatch.setattr(updater, "_probe_channels", _fake_probe)
+    monkeypatch.setattr(seed_fetch, "merge_seed_incremental", _fake_merge)
+
+    result = await seed_fetch.ensure_seed_online()
+    assert result["present"] is True
+    assert (seed_dir / "holdexar_seed.db").is_file()
+    assert channels_probed == ["https://mirror1/seed.db.gz", "https://mirror2/seed.db.gz"]
+
+
+@pytest.mark.asyncio
+async def test_seed_fetch_all_channels_fail_does_not_install_bad_db(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """所有通道均下载失败或哈希不符时，不生成正式 holdexar_seed.db。"""
+    seed_dir = tmp_path / "seed"
+    seed_dir.mkdir(parents=True, exist_ok=True)
+
+    class _S:
+        data_dir = tmp_path
+
+    monkeypatch.setattr(seed_fetch, "get_settings", lambda: _S())
+    monkeypatch.setattr(seed_fetch, "_data_seed_dir", lambda: seed_dir)
+    monkeypatch.setattr(seed_fetch, "seed_db_path", lambda: seed_dir / "holdexar_seed.db")
+    monkeypatch.setattr(seed_fetch, "_MIN_SEED_BYTES", 0)
+
+    import app.core.updater as updater
+
+    monkeypatch.setattr(updater, "_MIN_PACKAGE_BYTES", 0)
+
+    async def _mock_manifest_entry():
+        return {"sha256": "expected_valid_sha", "size": 100}
+
+    monkeypatch.setattr(seed_fetch, "_seed_manifest_entry", _mock_manifest_entry)
+
+    async def _fake_stream(url, proxy, target_file: Path, *args, **kwargs):
+        target_file.write_bytes(b"bad_bytes")
+
+    async def _fake_probe(channels, fallback_total):
+        return [
+            {"label": "镜像1", "url": "https://mirror1/seed.db.gz", "proxy": None, "missing": False, "bogus": False, "total": 100},
+        ]
+
+    monkeypatch.setattr(updater, "_stream_to_file", _fake_stream)
+    monkeypatch.setattr(updater, "_probe_channels", _fake_probe)
+
+    result = await seed_fetch.ensure_seed_online()
+    assert result["state"] == "failed"
+    snapshot = await seed_fetch.status_snapshot()
+    assert snapshot["present"] is False
+    assert not (seed_dir / "holdexar_seed.db").exists()
+
