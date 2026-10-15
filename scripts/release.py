@@ -51,6 +51,8 @@ MAIN_BRANCH = "main"
 # build_release.py 生成的说明模板占位文案——带着它发版 = 客户端更新提示里
 # 显示「（在此写本次更新内容…）」，属于必须拦住的半成品
 NOTES_PLACEHOLDER = "在此写本次更新内容"
+# 发布正文固定四段式（新增/更新/优化/修复，一条一行）：至少要有一个段标题
+NOTES_SECTIONS = ("新增：", "更新：", "优化：", "修复：")
 
 if str(SERVER) not in sys.path:
     sys.path.insert(0, str(SERVER))
@@ -141,6 +143,8 @@ def notes_ready() -> str | None:
         return f"{NOTES_FILE.name} 是空文件"
     if NOTES_PLACEHOLDER in body:
         return f"{NOTES_FILE.name} 还是模板占位文案，请先写本次更新内容"
+    if not any(section in body for section in NOTES_SECTIONS):
+        return f"{NOTES_FILE.name} 未按四段式撰写（新增/更新/优化/修复，一条一行），请先改成该格式"
     return None
 
 
