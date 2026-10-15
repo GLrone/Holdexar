@@ -33,6 +33,18 @@ def bundled_asset_names() -> tuple[str, ...]:
     return (kernel_filename(), *LICENSE_ASSETS, "README.txt")
 
 
+def bundled_source_note() -> str:
+    """获取和构建共用的随包来源说明。"""
+    return f"""Holdexar 随包内核资产（bundle assets）
+==================================================
+mihomo         {MIHOMO_VERSION}
+               来源 {MIHOMO_REPO}
+               许可 GPL-3.0（原文见同目录 LICENSE-mihomo.txt）
+mihomo 以独立进程运行（非链接、非派生），本项目自身以 GPL-3.0 分发；
+对应源码即上游仓库上述地址，二进制未做任何修改。
+"""
+
+
 def mihomo_asset() -> tuple[str, str]:
     """当前平台的 mihomo 发布资产：返回 (资产名, 打包形状)。
 

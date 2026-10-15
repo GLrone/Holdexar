@@ -92,7 +92,6 @@ def _maybe_upgrade_kernel(kernel_path: Path) -> str | None:
       的 exe 无法覆盖；启动链里 start() 会先 stop/清孤儿再走到这里，
       真正撞上的只有 lifespan 启动期孤儿还活着的窗口，留给下次启动）。
 
-    GeoIP 数据不在此列：滚动数据无版本可比，维持只补缺失不覆盖。
     """
     exe = kernel_path / kernel_filename()
     bundled_exe = bundled_clash_dir() / kernel_filename()
@@ -198,12 +197,7 @@ def _kernel_process_alive() -> bool:
 
 
 def _copy_bundled(kernel_path: Path, names: Sequence[str]) -> dict:
-    """把随包目录里的 `names` 补齐进内核目录（只补缺失，同名一律不覆盖）。
-
-    GeoIP 数据的「不覆盖」是刻意的：用户可能自己更新过数据，静默覆盖
-    等于替用户做决定。可执行文件的升级换代另走 _maybe_upgrade_kernel
-    （版本感知，见其 docstring）。返回 {"copied": [...], "missing": [...]}。
-    """
+    """补齐指定随包资产，同名不覆盖；可执行文件另按版本升级。"""
     bundle = bundled_clash_dir()
     kernel_path.mkdir(parents=True, exist_ok=True)
     copied: list[str] = []
@@ -736,13 +730,7 @@ CONFIG_TEST_TIMEOUT = 15.0
 
 
 def validate_config(exe_path: str, config_path: str, work_dir: Path) -> None:
-    """启动前用内核 `-t` 校验配置（不启动进程），不合法抛 ValueError。
-
-    -d 必须给 geo 数据已就位的真实内核目录：`-t` 遇到 GEOIP 规则而目录里
-    没有 MMDB 时会现场联网下载并长时间阻塞（20s 量级不返回），独立临时目录不可用。
-    校验通过（退出码 0）正常放行；被拒（退出码非 0）抛出内核的 error 行；
-    校验超时视为不可校验（geo 缺失触发下载的场景），放行启动由内核自行处理。
-    """
+    """启动前校验运行配置，拒载时抛错，超时交由启动检查确认。"""
     try:
         result = subprocess.run(
             [exe_path, "-t", "-f", config_path, "-d", str(work_dir)],
@@ -752,7 +740,7 @@ def validate_config(exe_path: str, config_path: str, work_dir: Path) -> None:
     except subprocess.TimeoutExpired:
         log_event(
             logger,
-            "内核配置校验超时（可能在下载 GeoIP 数据），放行启动",
+            "内核配置校验超时，继续检查启动结果",
             tag="跳过",
             level=logging.WARNING,
         )
@@ -895,8 +883,8 @@ def inject_probe_lanes(
         if not (isinstance(g, dict) and str(g.get("name", "")).startswith(PROBE_LANE_PREFIX))
     ]
     listeners = [
-        l for l in (doc.get("listeners") or [])
-        if not (isinstance(l, dict) and str(l.get("name", "")).startswith(PROBE_LANE_PREFIX))
+        entry for entry in (doc.get("listeners") or [])
+        if not (isinstance(entry, dict) and str(entry.get("name", "")).startswith(PROBE_LANE_PREFIX))
     ]
     for i, port in enumerate(ports, start=1):
         group_name = f"{PROBE_LANE_PREFIX}-{i}"

@@ -1,22 +1,4 @@
-"""P1.3-B：Registry → 池文件（只渲染，不做发布协议）。
-
-职责只有一句：**把 Registry 里能用的节点渲染成一个合法的池文件。**
-
-- 资格：`state ∈ {NEW, ACTIVE, STALE}`；`DEAD` / `RETIRED` 不进池
-- 取名：一律用**已持久化**的 `runtime_name`，覆盖 `normalized_config["name"]`
-  （不覆盖就会让 Registry 已经解决的「稳定运行名」在进内核时退化成订阅原名）
-- 三个门禁，**全部在写盘之前**：能重新解析 / 名字无重复 / 写入数 = 预期数。任一
-  不过即 `PoolBuildError`，此时旧池文件一字未动。
-
-**不做**：generation、candidate provider、rollback、Mihomo API reconcile、
-proxy-group、健康检查、lane、worker lease、自动启停内核。池文件写完之后的事
-（内核是否真的加载了它、名字对不对得上）属于下一步，不在这里预支。
-
-落盘沿用本域既有约定（见 `subscription._write_raw`）：先写 `.tmp` 再 `replace`，
-避免半截文件。
-
-事务边界：本函数只读 Registry，**不 commit**——池文件不是数据库事务的一部分。
-"""
+"""Registry 合格节点与订阅连接依赖生成池产物，完整校验后原子写盘。"""
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
@@ -24,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
-from sqlalchemy import exists, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domains.proxypool.models import (
@@ -53,6 +35,7 @@ class PoolBuild:
     expected_count: int
     written_count: int
     runtime_names: tuple[str, ...]
+    auxiliary_names: tuple[str, ...] = ()
 
 
 def pool_path(data_dir: Path) -> Path:
@@ -72,6 +55,15 @@ def pool_file_names(data_dir: Path) -> tuple[str, ...]:
     return tuple(str(entry.get("name")) for entry in (doc.get("proxies") or []))
 
 
+def pool_auxiliary_names(data_dir: Path) -> tuple[str, ...]:
+    """池产物中的连接依赖组名称。"""
+    path = pool_path(data_dir)
+    if not path.is_file():
+        return ()
+    doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return tuple(str(group["name"]) for group in doc.get("proxy-groups", []))
+
+
 def _is_complete(node: ProxyNode) -> bool:
     """资格之外的「配置完整」：池里每一条都必须是内核装载得了的。"""
     if not node.runtime_name:
@@ -82,15 +74,18 @@ def _is_complete(node: ProxyNode) -> bool:
     return all(config.get(key) not in (None, "") for key in _REQUIRED_CONFIG_KEYS)
 
 
-def _render_proxies(nodes: Sequence[ProxyNode]) -> list[dict]:
+def _render_bundle(
+    nodes: Sequence[ProxyNode], source_documents: Mapping[int, Mapping] | None = None,
+) -> dict[str, list[dict]]:
     """按订阅改写连接引用，保留节点参数与输入顺序。"""
-    from app.domains.proxies.runtime_config import resolve_node_dependencies
+    from app.domains.proxies.runtime_config import render_node_bundle
 
     grouped: dict[int | None, list[tuple[int, ProxyNode]]] = {}
     for index, node in enumerate(nodes):
         grouped.setdefault(node.subscription_id, []).append((index, node))
     proxies: list[dict | None] = [None] * len(nodes)
-    for members in grouped.values():
+    groups: list[dict] = []
+    for sid, members in grouped.items():
         names: dict[str, str] = {}
         ambiguous: set[str] = set()
         payloads = []
@@ -101,18 +96,26 @@ def _render_proxies(nodes: Sequence[ProxyNode]) -> list[dict]:
                 ambiguous.add(original)
             names[original] = node.runtime_name
             payloads.append(payload)
-        if any(p.get("dialer-proxy") in ambiguous for p in payloads):
-            raise PoolBuildError("节点连接依赖有重名，无法确定目标")
+        for name in ambiguous:
+            names.pop(name, None)
+        source = (source_documents or {}).get(sid) or {}
         try:
-            resolved = resolve_node_dependencies(payloads, names)
+            bundle = render_node_bundle(
+                payloads, names, groups=source.get("proxy-groups") or (), namespace=str(sid),
+                source_names=[str(node.original_name or node.normalized_config.get("name") or "")
+                              for _, node in members],
+            )
         except ValueError as exc:
             raise PoolBuildError(f"节点连接依赖不完整：{exc}") from exc
-        for (index, _), payload in zip(members, resolved, strict=True):
+        groups.extend(bundle["proxy-groups"])
+        for (index, _), payload in zip(members, bundle["proxies"], strict=True):
             proxies[index] = payload
-    return proxies
+    return {"proxies": proxies, "proxy-groups": groups}
 
 
-def render_pool(nodes: Sequence[ProxyNode]) -> tuple[str, tuple[str, ...]]:
+def render_pool(
+    nodes: Sequence[ProxyNode], *, source_documents: Mapping[int, Mapping] | None = None,
+) -> tuple[str, tuple[str, ...]]:
     """纯渲染层：不碰数据库、不碰磁盘，只做重复名门禁并产出 YAML 文本。
 
     单独暴露是为了让「重名即拒绝」这条规则**不依赖数据库唯一约束兜底**也测得到。
@@ -131,9 +134,11 @@ def render_pool(nodes: Sequence[ProxyNode]) -> tuple[str, tuple[str, ...]]:
             "（写盘前即拒绝：宁可不生成，也不生成一个静默少节点的池）"
         )
 
-    proxies = _render_proxies(nodes)
+    bundle = _render_bundle(nodes, source_documents)
+    if not bundle["proxy-groups"]:
+        bundle.pop("proxy-groups")
     text = yaml.safe_dump(
-        {"proxies": proxies}, allow_unicode=True, sort_keys=False
+        bundle, allow_unicode=True, sort_keys=False
     )
     return text, names
 
@@ -172,12 +177,35 @@ async def eligible_runtime_names(session: AsyncSession) -> tuple[str, ...]:
     return tuple(node.runtime_name for node in await eligible_nodes(session))
 
 
+async def source_documents_for_nodes(
+    session: AsyncSession, nodes: Sequence[ProxyNode], *, data_dir: Path,
+    errors: dict[int, str] | None = None,
+) -> dict[int, dict]:
+    """只为无法由同订阅节点解释的连接目标读取原文。"""
+    from app.domains.proxies.runtime_config import BUILTIN_PROXY_NAMES
+    from app.domains.proxypool.subscription import SnapshotError, load_source_documents
+
+    source_names: dict[int, set[str]] = {}
+    for node in nodes:
+        source_names.setdefault(node.subscription_id, set()).add(str(node.original_name or node.normalized_config.get("name") or ""))
+    needs_source = {
+        node.subscription_id for node in nodes
+        if node.normalized_config.get("dialer-proxy")
+        and node.normalized_config["dialer-proxy"] not in BUILTIN_PROXY_NAMES
+        and node.normalized_config["dialer-proxy"] not in source_names[node.subscription_id]
+    }
+    try:
+        return await load_source_documents(session, needs_source, data_dir=data_dir, errors=errors)
+    except SnapshotError as exc:
+        raise PoolBuildError(f"节点连接依赖来源不可用：{exc}") from exc
+
+
 async def build_pool(session: AsyncSession, *, data_dir: Path) -> PoolBuild:
     """读 Registry → 渲染 → 三门禁 → 落盘 → 复读。"""
     eligible = await eligible_nodes(session)
     expected_count = len(eligible)
-
-    text, names = render_pool(eligible)
+    sources = await source_documents_for_nodes(session, eligible, data_dir=data_dir)
+    text, names = render_pool(eligible, source_documents=sources)
 
     # 门禁一/三：生成的文本自己必须解析得回来，且条目数不能缩水。
     # 都放在写盘之前——失败时旧池保持原样（不靠回滚补）。
@@ -208,4 +236,5 @@ async def build_pool(session: AsyncSession, *, data_dir: Path) -> PoolBuild:
         expected_count=expected_count,
         written_count=written_count,
         runtime_names=names,
+        auxiliary_names=tuple(str(g["name"]) for g in parsed.get("proxy-groups", [])),
     )

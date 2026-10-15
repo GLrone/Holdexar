@@ -545,6 +545,12 @@ async def latest_snapshot(
         row = await session.scalar(stmt.limit(1))
     if row is None:
         return None
+    return _restore_snapshot(row, url=url)
+
+
+def _restore_snapshot(row: SubscriptionSnapshot, *, url: str = "") -> Snapshot:
+    """校验并恢复既有快照的原始内容。"""
+    subscription_id = row.subscription_id
     if not row.raw_path:
         raise SnapshotRecoveryError(subscription_id, "快照行没有 raw_path")
 
@@ -567,7 +573,7 @@ async def latest_snapshot(
     try:
         fmt = detect_format(raw)
         nodes = parse_nodes(raw, row.format or fmt)
-    except SnapshotError as e:
+    except (SnapshotError, yaml.YAMLError) as e:
         raise SnapshotRecoveryError(subscription_id, f"原始字节已不可解析：{e}") from e
 
     return Snapshot(
@@ -585,6 +591,71 @@ async def latest_snapshot(
         source_channel=row.source_channel or "",
         nodes=nodes,
     )
+
+
+async def load_source_documents(
+    session, subscription_ids, *, data_dir: Path, errors: dict[int, str] | None = None,
+) -> dict[int, dict]:
+    """批量读取当前订阅快照；尚无快照时复用原始订阅缓存。"""
+    from app.domains.proxies.clash_manager import subscription_config_path
+    from app.domains.proxies.models import ProxySubscription
+
+    ids = {int(sid) for sid in subscription_ids if sid is not None}
+    if not ids:
+        return {}
+    subscriptions = (await session.scalars(
+        select(ProxySubscription).where(ProxySubscription.id.in_(ids))
+    )).all()
+    urls = {sub.id: open_url(sub.url) or sub.url for sub in subscriptions}
+    rows = (await session.scalars(
+        select(SubscriptionSnapshot)
+        .where(SubscriptionSnapshot.subscription_id.in_(ids))
+        .where(SubscriptionSnapshot.status == "OK")
+        .order_by(SubscriptionSnapshot.id.desc())
+    )).all()
+    selected: dict[int, SubscriptionSnapshot] = {}
+    for row in rows:
+        sid = row.subscription_id
+        if sid in selected or (urls.get(sid) and not url_matches(row.url, urls[sid])):
+            continue
+        selected[sid] = row
+    documents: dict[int, dict] = {}
+    for sid in ids:
+        try:
+            row = selected.get(sid)
+            if row is not None:
+                if row.format and row.format != FORMAT_YAML:
+                    documents[sid] = {}
+                    continue
+                raw = _restore_snapshot(row).raw_content
+            else:
+                path = subscription_config_path(data_dir, sid)
+                if not path.is_file():
+                    documents[sid] = {}
+                    continue
+                try:
+                    raw = path.read_bytes()
+                except OSError as exc:
+                    raise SnapshotRecoveryError(sid, "订阅缓存读不回") from exc
+                try:
+                    fmt = detect_format(raw)
+                except SnapshotError as exc:
+                    raise SnapshotRecoveryError(sid, "订阅缓存无法解析") from exc
+                if fmt not in (FORMAT_YAML, FORMAT_PROVIDER_YAML):
+                    documents[sid] = {}
+                    continue
+            try:
+                doc = yaml.safe_load(decode_utf8(raw))
+            except (SnapshotError, yaml.YAMLError) as exc:
+                raise SnapshotRecoveryError(sid, "订阅原文无法解析") from exc
+            if not isinstance(doc, dict):
+                raise SnapshotRecoveryError(sid, "订阅原文不是映射")
+            documents[sid] = doc
+        except SnapshotRecoveryError as exc:
+            if errors is None:
+                raise
+            errors[sid] = str(exc)
+    return documents
 
 
 # ── Diff ──────────────────────────────────────────────────────────

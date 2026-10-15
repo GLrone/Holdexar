@@ -1,20 +1,4 @@
-"""出池节点（DEAD/RETIRED）的恢复探测：自建临时内核，不依赖任何常驻内核。
-
-── 为什么不能借现有内核 ──────────────────────────────────────
-池内核只渲染**合格**节点（`build_pool` 的输入是 `eligible_nodes`），DEAD 不在
-其中 —— 拿池内 L0 去探必然得到「名字没定位到（HTTP 404）」，而 404 又会坐实
-DEAD，形成「判死 → 出池 → 探不到 → 继续判死」的闭环。旧链路内核（订阅整份
-yaml）虽然认识全部节点，但它是可选的常驻进程，用户没跑它就整条恢复通道失效。
-
-── 本模块的做法 ──────────────────────────────────────────────
-从数据库里现取待恢复节点的 `normalized_config`，渲染一份**只含这些节点**的最小
-内核配置（每节点一个 listener 端口 + 一条 MATCH 兜底），起一个短命内核，逐节点
-用控制器 `/proxies/{name}/delay` 探测，探完立即停进程。整个过程不写池文件、
-不动运行配置、不占用池内端口段。
-
-配置里刻意**不写任何 GEOIP/GEOSITE 规则**（只有 `MATCH`），因此不需要随包
-GeoIP/GeoSite 数据，启动是毫秒级；带规则会在缺数据时现场联网下载并长时间阻塞。
-"""
+"""出池节点恢复：临时内核加载同订阅依赖，仅探测待恢复目标。"""
 from __future__ import annotations
 
 import asyncio
@@ -22,6 +6,7 @@ import json
 import logging
 import subprocess
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -58,6 +43,7 @@ class RecoveredNode:
     runtime_name: str
     original_name: str
     config: dict
+    subscription_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -67,6 +53,7 @@ class ProbeOutcome:
     ok: bool
     delay_ms: int | None
     detail: str
+    node_failure: bool = True
 
 
 def _free_port(preferred: int) -> int | None:
@@ -79,22 +66,66 @@ def _free_port(preferred: int) -> int | None:
     return None
 
 
+def _recovery_bundles(
+    nodes: Sequence[RecoveredNode], *,
+    dependencies: Sequence[RecoveredNode] = (),
+    source_documents: Mapping[int, dict] | None = None,
+    source_errors: Mapping[int, str] | None = None,
+) -> tuple[list[RecoveredNode], dict, list[ProbeOutcome]]:
+    from app.domains.proxies.runtime_config import render_node_bundle
+
+    available = {node.node_id: node for node in (*dependencies, *nodes)}
+    by_subscription: dict[int | None, list[RecoveredNode]] = {}
+    for node in available.values():
+        by_subscription.setdefault(node.subscription_id, []).append(node)
+    documents = source_documents or {}
+    proxies: dict[str, dict] = {}
+    groups: dict[str, dict] = {}
+    ready: list[RecoveredNode] = []
+    rejected: list[ProbeOutcome] = []
+    for node in nodes:
+        peers = by_subscription[node.subscription_id]
+        try:
+            if not node.config.get("server") or not node.config.get("type"):
+                raise ValueError("节点连接配置不完整")
+            bundle = render_node_bundle(
+                [{**peer.config, "name": peer.original_name} for peer in peers],
+                {peer.original_name: peer.runtime_name for peer in peers},
+                groups=documents.get(node.subscription_id, {}).get("proxy-groups") or (),
+                namespace=str(node.subscription_id), roots=[node.original_name],
+            )
+            for proxy in bundle["proxies"]:
+                if not proxy.get("type") or (
+                    proxy.get("type") not in {"direct", "reject"} and not proxy.get("server")
+                ):
+                    raise ValueError(f"节点连接配置不完整：{proxy['name']}")
+        except ValueError as exc:
+            source_error = (source_errors or {}).get(node.subscription_id)
+            detail = f"节点依赖不可用：{exc}"
+            if source_error:
+                detail = f"{detail}；{source_error}"
+            rejected.append(ProbeOutcome(
+                node.node_id, node.runtime_name, False, None,
+                detail, node_failure=False,
+            ))
+            continue
+        ready.append(node)
+        proxies.update((item["name"], item) for item in bundle["proxies"])
+        groups.update((item["name"], item) for item in bundle["proxy-groups"])
+    return ready, {"proxies": list(proxies.values()), "proxy-groups": list(groups.values())}, rejected
+
+
 def _render_config(nodes: list[RecoveredNode], *, controller_port: int, secret: str,
-                   listener_base: int) -> tuple[str, dict[str, int]]:
-    """渲染最小内核配置，返回 (yaml 文本, {runtime_name: 端口})。
-
-    每个节点一个 `mixed` listener，`proxy` 直指该节点 —— 不经过任何规则引擎，
-    所以不需要 GeoIP/GeoSite 数据。
-
-    `dialer-proxy` 按本批节点解析成运行名（与池渲染同一份实现）：目标不在本批
-    且非内置逻辑节点即抛 `ValueError`——绝不把依赖悄悄换成直连。调用方负责
-    先把不可渲染的节点筛掉（见 `probe_out_of_pool_nodes`），本函数只做渲染。
-    """
-    from app.domains.proxies.runtime_config import resolve_node_dependencies
-
-    by_original = {n.original_name: n.runtime_name for n in nodes}
-    payloads = [{**dict(n.config), "name": n.runtime_name} for n in nodes]
-    proxies = resolve_node_dependencies(payloads, by_original)
+                   listener_base: int, dependencies: Sequence[RecoveredNode] = (),
+                   source_documents: Mapping[int, dict] | None = None,
+                   bundle: dict | None = None) -> tuple[str, dict[str, int]]:
+    """依赖仅用于连接，监听端口只分配给恢复目标。"""
+    if bundle is None:
+        _ready, bundle, rejected = _recovery_bundles(
+            nodes, dependencies=dependencies, source_documents=source_documents,
+        )
+        if rejected:
+            raise ValueError(rejected[0].detail)
 
     ports: dict[str, int] = {}
     listeners: list[dict] = []
@@ -115,39 +146,12 @@ def _render_config(nodes: list[RecoveredNode], *, controller_port: int, secret: 
         "bind-address": "127.0.0.1",
         "external-controller": f"127.0.0.1:{controller_port}",
         "secret": secret,
-        "proxies": proxies,
+        **bundle,
         "listeners": listeners,
-        # 一条兜底规则即可：本内核只做「每节点一个本地监听器」，不做分流。
-        # 规则表里没有 GEOIP/GEOSITE，因此不触发地理数据加载。
+        "geo-auto-update": False,
         "rules": ["MATCH,DIRECT"],
     }
     return yaml.safe_dump(doc, allow_unicode=True, sort_keys=False), ports
-
-
-def _renderable_nodes(nodes: list[RecoveredNode]) -> list[RecoveredNode]:
-    """筛出本批可渲染的节点：中转依赖在本批内或为内置逻辑节点。
-
-    本批只装 DEAD/RETIRED，健康的中转节点不在其中——依赖它恢复的节点这轮渲染
-    不出来。跳过（本轮不探、状态不动）好过让整批渲染失败，也好过把依赖换成
-    直连：前者把整批恢复拖死，后者换了用户没要求的连接路径。
-    """
-    from app.domains.proxies.runtime_config import resolve_node_dependencies
-
-    by_original = {n.original_name: n.runtime_name for n in nodes}
-    renderable: list[RecoveredNode] = []
-    for node in nodes:
-        payload = {**dict(node.config), "name": node.runtime_name}
-        try:
-            resolve_node_dependencies([payload], by_original)
-        except ValueError as exc:
-            log_event(
-                logger,
-                "出池节点依赖的中转本轮不在批次，跳过该节点",
-                detail={"节点": node.runtime_name, "原因": str(exc)},
-            )
-            continue
-        renderable.append(node)
-    return renderable
 
 
 async def _wait_controller(base_url: str, secret: str, timeout: float) -> bool:
@@ -165,28 +169,13 @@ async def _wait_controller(base_url: str, secret: str, timeout: float) -> bool:
     return False
 
 
-async def _probe_one(base_url: str, secret: str, name: str, url: str) -> tuple[bool, int | None, str]:
-    headers = {"Authorization": f"Bearer {secret}"} if secret else {}
-    from urllib.parse import quote
+async def _probe_one(base_url: str, secret: str, name: str, url: str):
+    from app.domains.proxypool.health import probe_node
 
-    path = quote(name, safe="")
-    try:
-        async with httpx.AsyncClient(timeout=20.0, trust_env=False, headers=headers) as client:
-            resp = await client.get(
-                f"{base_url}/proxies/{path}/delay",
-                params={"url": url, "timeout": NODE_TIMEOUT_MS},
-            )
-    except Exception as exc:  # noqa: BLE001
-        return False, None, f"控制器请求异常：{type(exc).__name__}"
-    if resp.status_code != 200:
-        return False, None, f"探测未通过（HTTP {resp.status_code}）"
-    try:
-        delay = resp.json().get("delay")
-    except ValueError:
-        return False, None, "探测未通过（响应不是 JSON）"
-    if not isinstance(delay, int) or delay <= 0:
-        return False, None, f"探测未通过（delay={delay!r}）"
-    return True, delay, ""
+    return await probe_node(
+        base_url, secret, name, url=url,
+        timeout_ms=NODE_TIMEOUT_MS, client_timeout=20.0,
+    )
 
 
 async def probe_out_of_pool_nodes(
@@ -195,56 +184,63 @@ async def probe_out_of_pool_nodes(
     exe_path: str,
     work_dir: Path,
     url: str,
+    dependencies: Sequence[RecoveredNode] = (),
+    source_documents: Mapping[int, dict] | None = None,
+    source_errors: Mapping[int, str] | None = None,
 ) -> list[ProbeOutcome]:
-    """起一个短命内核，探测这批节点，返回逐节点结论。任何失败都返回 ok=False。
-
-    `work_dir` 是一个全新的临时目录（调用方负责清理）：内核的 `-d` 指向它，
-    缓存与日志都落在那里，不污染池目录。
-    """
+    """临时内核并发探测；依赖错误与基础设施失败不作为节点失败证据。"""
     if not nodes:
         return []
+    probe_nodes, bundle, rejected = _recovery_bundles(
+        nodes, dependencies=dependencies, source_documents=source_documents,
+        source_errors=source_errors,
+    )
+    if not probe_nodes:
+        return rejected
+
+    def unavailable(detail: str) -> list[ProbeOutcome]:
+        return rejected + [
+            ProbeOutcome(n.node_id, n.runtime_name, False, None, detail, node_failure=False)
+            for n in probe_nodes
+        ]
+
     controller_port = _free_port(PROBE_PORT_BASE)
     if controller_port is None:
-        return [
-            ProbeOutcome(n.node_id, n.runtime_name, False, None, "没有可用的探测端口")
-            for n in nodes
-        ]
+        return unavailable("没有可用的探测端口")
     listener_base = controller_port + 20
     secret = f"dead-probe-{controller_port}"
-    # 依赖的中转不在本批的节点先筛掉：探测它们只会拿到「名字没定位到」的 404，
-    # 进而被记成一次失败、把它往退休线上推——这正是判死闭环的成因。
-    probe_nodes = _renderable_nodes(nodes)
-    if not probe_nodes:
-        return []
-    text, _ports = _render_config(
-        probe_nodes, controller_port=controller_port, secret=secret,
-        listener_base=listener_base,
-    )
-    work_dir.mkdir(parents=True, exist_ok=True)
-    config_path = work_dir / "config.yaml"
-    config_path.write_text(text, encoding="utf-8")
-
-    log_file = open(work_dir / "probe.log", "ab")
+    log_file = None
     proc: subprocess.Popen | None = None
     base_url = f"http://127.0.0.1:{controller_port}"
     try:
+        text, _ports = _render_config(
+            probe_nodes, controller_port=controller_port, secret=secret,
+            listener_base=listener_base, bundle=bundle,
+        )
+        work_dir.mkdir(parents=True, exist_ok=True)
+        config_path = work_dir / "config.yaml"
+        config_path.write_text(text, encoding="utf-8")
+        log_file = open(work_dir / "probe.log", "ab")
         proc = subprocess.Popen(
             [exe_path, "-d", str(work_dir), "-f", str(config_path)],
             stdout=log_file,
             stderr=subprocess.STDOUT,
         )
         if not await _wait_controller(base_url, secret, STARTUP_WAIT):
-            return [
-                ProbeOutcome(n.node_id, n.runtime_name, False, None, "临时内核控制器未就绪")
-                for n in probe_nodes
-            ]
-        outcomes = []
-        for node in probe_nodes:
-            ok, delay, detail = await _probe_one(base_url, secret, node.runtime_name, url)
-            outcomes.append(
-                ProbeOutcome(node.node_id, node.runtime_name, ok, delay, detail)
+            return unavailable("临时内核控制器未就绪")
+        from app.domains.proxypool.health import PROBE_CONCURRENCY
+
+        semaphore = asyncio.Semaphore(PROBE_CONCURRENCY)
+
+        async def probe(node: RecoveredNode) -> ProbeOutcome:
+            async with semaphore:
+                result = await _probe_one(base_url, secret, node.runtime_name, url)
+            return ProbeOutcome(
+                node.node_id, node.runtime_name, result.ok, result.delay_ms, result.detail,
+                node_failure=result.valid,
             )
-        return outcomes
+
+        return rejected + list(await asyncio.gather(*(probe(node) for node in probe_nodes)))
     except Exception as exc:  # noqa: BLE001 —— 恢复探测是尽力而为，失败不阻断周期
         log_event(
             logger,
@@ -253,10 +249,7 @@ async def probe_out_of_pool_nodes(
             level=logging.WARNING,
             detail={"原因": f"{type(exc).__name__}: {exc}"},
         )
-        return [
-            ProbeOutcome(n.node_id, n.runtime_name, False, None, f"探测异常：{type(exc).__name__}")
-            for n in probe_nodes
-        ]
+        return unavailable(f"探测异常：{type(exc).__name__}")
     finally:
         if proc is not None and proc.poll() is None:
             proc.terminate()
@@ -264,7 +257,23 @@ async def probe_out_of_pool_nodes(
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        log_file.close()
+        if log_file is not None:
+            log_file.close()
+
+
+def _recovery_input(node: ProxyNode) -> RecoveredNode:
+    config = node.normalized_config
+    if isinstance(config, str):
+        try:
+            config = json.loads(config)
+        except ValueError:
+            config = {}
+    return RecoveredNode(
+        node_id=str(node.node_id), runtime_name=str(node.runtime_name),
+        original_name=str(node.original_name or node.runtime_name),
+        config=dict(config) if isinstance(config, dict) else {},
+        subscription_id=node.subscription_id,
+    )
 
 
 async def load_recoverable_nodes(
@@ -273,6 +282,8 @@ async def load_recoverable_nodes(
     """取一批待恢复节点（DEAD/RETIRED），按「最久没被探过」轮转。"""
     from app.domains.proxypool.models import HealthObservation
 
+    if batch <= 0:
+        return []
     last_probe = (
         select(
             HealthObservation.node_id.label("node_id"),
@@ -282,31 +293,13 @@ async def load_recoverable_nodes(
         .subquery()
     )
     rows = (await session.execute(
-        select(ProxyNode, ProxyNode.original_name)
+        select(ProxyNode)
         .outerjoin(last_probe, last_probe.c.node_id == ProxyNode.node_id)
         .where(ProxyNode.state.in_((NODE_DEAD, NODE_RETIRED)))
         .order_by(last_probe.c.last_at.asc().nullsfirst(), ProxyNode.node_id)
         .limit(batch)
-    )).all()
-    nodes: list[RecoveredNode] = []
-    for node, original_name in rows:
-        config = node.normalized_config
-        if isinstance(config, str):
-            try:
-                config = json.loads(config)
-            except ValueError:
-                continue
-        if not isinstance(config, dict) or not config.get("server") or not config.get("type"):
-            continue
-        nodes.append(
-            RecoveredNode(
-                node_id=str(node.node_id),
-                runtime_name=str(node.runtime_name),
-                original_name=str(original_name or node.runtime_name),
-                config=dict(config),
-            )
-        )
-    return nodes
+    )).scalars().all()
+    return [_recovery_input(node) for node in rows]
 
 
 async def recover_dead_nodes_self_hosted(
@@ -316,15 +309,7 @@ async def recover_dead_nodes_self_hosted(
     url: str | None = None,
     batch: int = BATCH_SIZE,
 ) -> tuple[ProbeOutcome, ...]:
-    """自建临时内核恢复一批出池节点，并把成功者写回 ACTIVE。
-
-    与 `recover_dead_nodes`（借常驻旧链路内核）取同样的结论口径，区别是本函数
-    自己起内核，因此**不依赖任何常驻进程**——旧链路内核没跑时这才是唯一出路。
-    状态推进沿用同一条规则：成功 → `evaluate_node_state(probe_ok=True)`；
-    失败 → 累加计数（达到退休线由状态机判 RETIRED）。
-
-    停内核、删临时目录都在本函数内完成；写库过写调度器短临界区提交。
-    """
+    """恢复结果记入既有健康观测，仅真实节点探测结果推进节点状态。"""
     from app.domains.proxypool.health import business_probe_url
     from app.domains.proxies.clash_manager import kernel_exe
 
@@ -335,16 +320,35 @@ async def recover_dead_nodes_self_hosted(
     if not exe.is_file():
         return ()
     probe_url = url or business_probe_url()
+    from app.domains.proxypool.subscription import load_source_documents
+
+    subscription_ids = {node.subscription_id for node in nodes if node.subscription_id is not None}
+    peers = (await session.scalars(
+        select(ProxyNode).where(ProxyNode.subscription_id.in_(subscription_ids))
+    )).all()
+    dependencies = [_recovery_input(node) for node in peers]
+    source_errors: dict[int, str] = {}
+    documents = await load_source_documents(
+        session, subscription_ids, data_dir=data_dir, errors=source_errors,
+    )
+    unavailable_sources: dict[int | None, str] = {None: "节点来源不存在"}
+    source_failures = [
+        ProbeOutcome(node.node_id, node.runtime_name, False, None,
+                     unavailable_sources[node.subscription_id], node_failure=False)
+        for node in nodes if node.subscription_id in unavailable_sources
+    ]
+    targets = [node for node in nodes if node.subscription_id not in unavailable_sources]
 
     tmp_root = data_dir / "proxypool" / "_dead_probe"
     work_dir = tmp_root / f"run-{int(time.time() * 1000)}"
     try:
         outcomes = await probe_out_of_pool_nodes(
-            nodes, exe_path=str(exe), work_dir=work_dir, url=probe_url,
+            targets, exe_path=str(exe), work_dir=work_dir, url=probe_url,
+            dependencies=dependencies, source_documents=documents, source_errors=source_errors,
         )
+        by_outcome = {outcome.node_id: outcome for outcome in (*source_failures, *outcomes)}
+        outcomes = [by_outcome[node.node_id] for node in nodes if node.node_id in by_outcome]
     finally:
-        # 临时目录用完即删：它是本轮探测的一次性工作区，不留任何可被误解为
-        # 运行配置的残留（保留失败现场的价值低于目录整洁与磁盘占用）。
         import shutil
 
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -357,29 +361,31 @@ async def recover_dead_nodes_self_hosted(
     from app.domains.proxypool.state import evaluate_node_state as _evaluate
 
     async with write_gate(WritePriority.BACKGROUND, label="dead_probe_recover"):
-        await session.execute(
+        refreshed = (await session.scalars(
             select(ProxyNode)
             .where(ProxyNode.node_id.in_(list(by_id)))
             .execution_options(populate_existing=True)
-        )
+        )).all()
+        fresh_by_id = {node.node_id: node for node in refreshed}
         recovered = 0
+        observations = []
         for outcome in outcomes:
-            node = await session.scalar(
-                select(ProxyNode).where(ProxyNode.node_id == outcome.node_id)
-            )
+            node = fresh_by_id.get(outcome.node_id)
             if node is None:
                 continue
-            failures = 0 if outcome.ok else (node.consecutive_failures or 0) + 1
             previous = node.state
-            node.consecutive_failures = failures
-            node.state = _evaluate(
-                node.state, source_seen=True, probe_ok=outcome.ok,
-                consecutive_failures=failures,
-            )
+            if outcome.ok or outcome.node_failure:
+                failures = 0 if outcome.ok else (node.consecutive_failures or 0) + 1
+                node.consecutive_failures = failures
+                node.state = _evaluate(
+                    node.state, source_seen=node.subscription_id is not None,
+                    probe_ok=outcome.ok,
+                    consecutive_failures=failures,
+                )
+                node.last_l2_at = now
             if outcome.ok:
                 recovered += 1
-                node.last_l2_at = now
-            session.add(
+            observations.append(
                 HealthObservation(
                     node_id=node.node_id,
                     level="L2",
@@ -398,6 +404,7 @@ async def recover_dead_nodes_self_hosted(
                     f"出池节点恢复探测：{node.runtime_name} {previous} → {node.state}",
                     detail={"延迟": outcome.delay_ms, "结论": outcome.detail or "通过"},
                 )
+        session.add_all(observations)
         await session.commit()
 
     log_event(

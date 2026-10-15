@@ -61,7 +61,7 @@ TEMPLATE_DB_SRC = SEED_DIR / TEMPLATE_BASENAME
 if str(SERVER) not in sys.path:
     sys.path.insert(0, str(SERVER))
 from app.core.app_info import APP_NAME, APP_VERSION  # noqa: E402
-from app.domains.proxies.kernel_release import bundled_asset_names  # noqa: E402
+from app.domains.proxies.kernel_release import bundled_asset_names, bundled_source_note  # noqa: E402
 
 APP_DIR = DIST_DIR / APP_NAME
 
@@ -85,6 +85,7 @@ def refresh_seed() -> None:
 def ensure_clash_assets() -> None:
     """随包内核、许可原文与来源说明缺一即中止出包。"""
     CLASH_DIR.mkdir(parents=True, exist_ok=True)
+    (CLASH_DIR / "README.txt").write_text(bundled_source_note(), encoding="utf-8")
     expected = bundled_asset_names()
     missing = [name for name in expected if not (CLASH_DIR / name).is_file()]
     if missing:

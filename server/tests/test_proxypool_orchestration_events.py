@@ -232,11 +232,10 @@ async def test_rebuild_reconcile_rejection_writes_event_outside_caller_transacti
     """重建被对账拒绝 → 抛异常、调用方回滚，事件仍在库里（独立会话）。"""
     await init_db()
 
-    class _Build:
-        runtime_names = ("n1",)
-
     async def _build_pool(session, *, data_dir):
-        return _Build()
+        from app.domains.proxypool.pool import PoolBuild
+
+        return PoolBuild(data_dir / "crawl-pool.yaml", 1, 1, ("n1",))
 
     monkeypatch.setattr(rt, "build_pool", _build_pool)
     monkeypatch.setattr(rt, "prepare_runtime_config", lambda _d, **kw: env / "c.runtime.yaml")

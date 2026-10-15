@@ -32,7 +32,7 @@ from app.domains.proxypool.admission import auto_admit_healthy_candidate, is_adm
 from app.domains.proxypool.exits import select_exit_slots
 from app.domains.proxypool.health import latest_l0_delays
 from app.domains.proxypool.pool import (
-    build_pool, eligible_nodes, eligible_runtime_names, pool_path,
+    build_pool, eligible_nodes, eligible_runtime_names, pool_auxiliary_names, pool_path,
 )
 from app.domains.proxypool.registry import apply_snapshot
 from app.domains.proxypool.runtime import (
@@ -317,6 +317,7 @@ async def runtime_ready(session: AsyncSession, *, data_dir: Path) -> bool:
     ledger = reconcile(
         registry_names=set(artifact), pool_names=set(artifact),
         observed_names=observed,
+        auxiliary_names=set(pool_auxiliary_names(data_dir)),
     )
     return ledger.ok
 
@@ -474,6 +475,7 @@ async def ensure_pool_runtime(
             registry_names=set(build.runtime_names),
             pool_names=set(build.runtime_names),
             observed_names=observed,
+            auxiliary_names=set(build.auxiliary_names),
         )
         if not ledger.ok:
             # 独立会话落库：本函数不再由调用方的写闸/事务包络（调用方只承载读取），
@@ -525,9 +527,14 @@ async def ensure_pool_runtime(
 # （例如来源元数据、无关节点变化）但合格运行集没变时，重启内核毫无意义。
 
 
-async def pool_signature(session: AsyncSession) -> tuple[str, ...]:
-    """按完整连接参数判定运行集变化，节点身份与运行参数分开比较。"""
-    from app.domains.proxypool.pool import eligible_nodes
+async def pool_signature(
+    session: AsyncSession, *, data_dir: Path | None = None,
+) -> tuple[str, ...]:
+    """按完整节点参数及必要连接依赖组判定运行集变化。"""
+    from app.core.config import get_settings
+    from app.domains.proxypool.pool import (
+        PoolBuildError, eligible_nodes, render_pool, source_documents_for_nodes,
+    )
 
     nodes = await eligible_nodes(session)
     signatures = []
@@ -536,6 +543,19 @@ async def pool_signature(session: AsyncSession) -> tuple[str, ...]:
         blob = json.dumps(payload, sort_keys=True, separators=(",", ":"),
                           ensure_ascii=False, default=str)
         signatures.append(f"{node.runtime_name}:{hashlib.sha256(blob.encode('utf-8')).hexdigest()}")
+    errors: dict[int, str] = {}
+    sources = await source_documents_for_nodes(
+        session, nodes, data_dir=data_dir or get_settings().data_dir, errors=errors,
+    )
+    try:
+        text, _ = render_pool(nodes, source_documents=sources)
+        dependencies = yaml.safe_load(text).get("proxy-groups") or []
+    except PoolBuildError as exc:
+        dependencies = {"invalid": str(exc)}
+    if dependencies or errors:
+        blob = json.dumps({"groups": dependencies, "errors": errors}, sort_keys=True,
+                          separators=(",", ":"), ensure_ascii=False)
+        signatures.append(f"dependencies:{hashlib.sha256(blob.encode('utf-8')).hexdigest()}")
     return tuple(signatures)
 
 
@@ -565,7 +585,7 @@ async def handle_subscription_refresh(
     """
     from app.domains.proxypool.scheduling import request_rebuild
 
-    before = await pool_signature(session)
+    before = await pool_signature(session, data_dir=data_dir)
     sync = await sync_subscriptions(
         session, data_dir=data_dir, now=now, only_auto=True
     )
@@ -573,7 +593,7 @@ async def handle_subscription_refresh(
     if not synced:
         return RefreshTriageResult(False, False, "none", None)
 
-    after = await pool_signature(session)
+    after = await pool_signature(session, data_dir=data_dir)
     pool_changed = after != before
 
     if not await runtime_ready(session, data_dir=data_dir):

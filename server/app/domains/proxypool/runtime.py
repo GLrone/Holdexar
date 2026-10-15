@@ -372,7 +372,7 @@ def prepare_runtime_config(data_dir: Path, *, lanes: int | None = None,
 
     names = [str(entry["name"]) for entry in doc["proxies"]]
     n_lanes = lane_count_for(len(names), lanes)
-    groups = [
+    groups = list(doc.get("proxy-groups") or []) + [
         {"name": f"{LANE_GROUP_PREFIX}{i}", "type": "select", "proxies": list(names)}
         for i in range(n_lanes)
     ]
@@ -504,14 +504,14 @@ def reconcile(
     registry_names: set[str] | frozenset[str],
     pool_names: set[str] | frozenset[str],
     observed_names: set[str] | frozenset[str],
+    auxiliary_names: set[str] | frozenset[str] = frozenset(),
 ) -> RuntimeReconcile:
     """三方对账：Registry 合格集、池文件写入集、内核可见集必须**集合相等**。
 
     只比数量是不够的：改名、错位、去重都能让数量对上而集合不同，而名字是池与
     内核之间唯一的对账钥匙。
 
-    内核可见集里除了内置逻辑节点，还有**运行配置自己生成的 lane 组与探测 lane 组**
-    ——它们是运行期条目而不是"池外多出来的节点"，因此同样不参与 `unexpected` 判定。
+    内置节点、通道组及调用方声明的连接依赖组不参与额外节点判定。
     """
     registry = frozenset(registry_names)
     pool = frozenset(pool_names)
@@ -520,7 +520,7 @@ def reconcile(
     runtime_names = observed & pool
     missing = pool - observed
     unexpected = (
-        observed - pool - BUILTIN_PROXY_NAMES
+        observed - pool - BUILTIN_PROXY_NAMES - frozenset(auxiliary_names)
         - {n for n in observed if is_lane_group(n) or is_probe_lane_group(n)}
     )
 
@@ -863,6 +863,7 @@ async def rebuild_runtime(
         registry_names=set(build.runtime_names),
         pool_names=set(build.runtime_names),
         observed_names=observed,
+        auxiliary_names=set(build.auxiliary_names),
     )
     if not ledger.ok:
         # 独立会话：本函数紧接着抛异常，调用方多半整事务回滚——事件必须自己落库，
@@ -944,6 +945,7 @@ async def _hot_apply_rebuild(
         registry_names=set(build.runtime_names),
         pool_names=set(build.runtime_names),
         observed_names=observed,
+        auxiliary_names=set(build.auxiliary_names),
     )
     if not ledger.ok:
         raise RuntimeRebuildError(

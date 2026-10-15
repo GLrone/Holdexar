@@ -63,6 +63,29 @@ from app.domains.proxypool.state import (  # noqa: E402
 NOW = datetime(2026, 9, 19, 12, 0, 0)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("status", "valid"), [(401, False), (403, False), (503, True)])
+async def test_controller_auth_failure_is_not_node_failure(status, valid):
+    class Controller(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(status)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Controller)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        outcome = await probe_node(f"http://127.0.0.1:{server.server_port}", "s", "node")
+        assert not outcome.ok
+        assert outcome.valid is valid
+        assert str(status) in outcome.detail
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 # ── 本地真实 CONNECT 隧道代理（当"可用节点"用）────────────────────
 def _pipe(a: socket.socket, b: socket.socket) -> None:
     try:
