@@ -16,7 +16,7 @@ APP_SLUG = APP_NAME.lower()
 # 便于环境变量覆盖；发布脚本读的也是这里）。发版时只改这一行。
 # 放在 app_info 而非 config：config 要 import pydantic，而发布/构建脚本、
 # run.py、desktop/main.py 需要在装依赖之前就能取到版本号。
-APP_VERSION = "0.3.1-beta"
+APP_VERSION = "0.3.2-beta"
 
 GITHUB_REPO = "GLrone/Holdexar"
 
