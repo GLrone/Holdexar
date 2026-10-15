@@ -229,7 +229,8 @@ def _stub_self_hosted(monkeypatch, outcomes: dict[str, bool]) -> list[str]:
 
     probed: list[str] = []
 
-    async def fake_probe(nodes, *, exe_path, work_dir, url):
+    async def fake_probe(nodes, *, exe_path, work_dir, url, dependencies=(), source_documents=None,
+                         source_errors=None):
         result = []
         for n in nodes:
             ok = outcomes.get(n.node_id, False)
@@ -364,3 +365,439 @@ def test_self_hosted_rejects_missing_dialer_dependency():
             RecoveredNode("endpoint", "1|endpoint", "endpoint",
                           {**CONFIG, "dialer-proxy": "missing-hop"}),
         ], controller_port=23200, secret="s", listener_base=23220)
+
+
+def test_self_hosted_keeps_same_named_relays_in_their_subscription():
+    from types import SimpleNamespace
+    from app.domains.proxypool.dead_probe import _render_config
+
+    def node(node_id, subscription_id, original_name, **extra):
+        return SimpleNamespace(
+            node_id=node_id, subscription_id=subscription_id,
+            runtime_name=f"{subscription_id}|{original_name}",
+            original_name=original_name, config={**CONFIG, **extra},
+        )
+
+    nodes = [
+        node("leaf", 1, "leaf", **{"dialer-proxy": "hop"}),
+        node("hop-one", 1, "hop"),
+        node("hop-two", 2, "hop"),
+    ]
+    text, _ = _render_config(nodes, controller_port=23200, secret="s", listener_base=23220)
+    proxies = {item["name"]: item for item in yaml.safe_load(text)["proxies"]}
+
+    assert proxies["1|leaf"]["dialer-proxy"] == "1|hop"
+
+
+async def _add_recovery_graph(entries):
+    async with get_session_factory()() as session:
+        session.add(ProxySubscription(id=1, kind="plain", url="http://sub.example/list"))
+        session.add_all([
+            ProxyNode(
+                node_id=node_id, fingerprint=node_id, runtime_name=f"1|{node_id}",
+                subscription_id=1, original_name=node_id, proxy_type="http",
+                server="10.0.0.1", normalized_config={**CONFIG, "name": node_id, **extra},
+                state=state, consecutive_failures=1,
+                first_seen=NOW, last_seen=NOW, last_source_seen=NOW,
+            )
+            for node_id, state, extra in entries
+        ])
+        await session.commit()
+
+
+def _stub_ephemeral_kernel(monkeypatch, env):
+    from pathlib import Path
+    from app.domains.proxypool import dead_probe as DP
+
+    _stub_kernel_exe(monkeypatch, env)
+    rendered = []
+    probed = []
+
+    class Process:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout):
+            return 0
+
+    def spawn(command, **kwargs):
+        rendered.append(yaml.safe_load(Path(command[-1]).read_text(encoding="utf-8")))
+        return Process()
+
+    async def ready(*args):
+        return True
+
+    async def probe(base_url, secret, name, url):
+        probed.append(name)
+        return H.ProbeResult(name, True, 7, "")
+
+    monkeypatch.setattr(DP, "_free_port", lambda preferred: preferred)
+    monkeypatch.setattr(DP.subprocess, "Popen", spawn)
+    monkeypatch.setattr(DP, "_wait_controller", ready)
+    monkeypatch.setattr(DP, "_probe_one", probe)
+    return rendered, probed
+
+
+@pytest.mark.asyncio
+async def test_self_hosted_loads_healthy_relay_without_probing_or_updating_it(env, monkeypatch):
+    from app.domains.proxypool import dead_probe as DP
+
+    await init_db()
+    await _add_recovery_graph([
+        ("leaf", NODE_DEAD, {"dialer-proxy": "hop"}),
+        ("hop", NODE_ACTIVE, {}),
+    ])
+    rendered, probed = _stub_ephemeral_kernel(monkeypatch, env)
+
+    async with get_session_factory()() as session:
+        inputs = await DP.load_recoverable_nodes(session)
+        assert getattr(inputs[0], "subscription_id", None) == 1
+        outcomes = await DP.recover_dead_nodes_self_hosted(session, data_dir=env, now=NOW)
+        observations = (await session.scalars(select(HealthObservation))).all()
+
+    assert [outcome.node_id for outcome in outcomes] == ["leaf"]
+    assert probed == ["1|leaf"]
+    assert {proxy["name"] for proxy in rendered[0]["proxies"]} == {"1|leaf", "1|hop"}
+    assert [listener["proxy"] for listener in rendered[0]["listeners"]] == ["1|leaf"]
+    assert [observation.node_id for observation in observations] == ["leaf"]
+    assert (await _node("hop")).consecutive_failures == 1
+    assert (await _node("leaf")).state == NODE_ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_self_hosted_failed_dependencies_advance_rotation_past_full_batch(env, monkeypatch):
+    from app.domains.proxypool import dead_probe as DP
+
+    await init_db()
+    await _add_recovery_graph([
+        *[(f"a-{i:02}", NODE_DEAD, {"dialer-proxy": "missing"}) for i in range(24)],
+        ("z-independent", NODE_DEAD, {}),
+    ])
+    _rendered, probed = _stub_ephemeral_kernel(monkeypatch, env)
+
+    async with get_session_factory()() as session:
+        first = await DP.recover_dead_nodes_self_hosted(session, data_dir=env, now=NOW)
+        second = await DP.recover_dead_nodes_self_hosted(
+            session, data_dir=env, now=NOW + timedelta(minutes=1),
+        )
+        observations = (await session.scalars(select(HealthObservation))).all()
+
+    assert len(first) == 24
+    assert all(not result.ok and "依赖" in result.detail for result in first)
+    assert any(result.node_id == "z-independent" and result.ok for result in second)
+    assert probed == ["1|z-independent"]
+    assert {observation.node_id for observation in observations} == {
+        *[f"a-{i:02}" for i in range(24)], "z-independent",
+    }
+    assert (await _node("a-00")).consecutive_failures == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cycle", [False, True])
+async def test_self_hosted_bad_dependency_chain_does_not_block_independent_target(
+    env, monkeypatch, cycle,
+):
+    from app.domains.proxypool import dead_probe as DP
+
+    await init_db()
+    await _add_recovery_graph([
+        ("a", NODE_DEAD, {"dialer-proxy": "b"}),
+        ("b", NODE_DEAD, {"dialer-proxy": "a" if cycle else "missing"}),
+        ("c", NODE_DEAD, {}),
+    ])
+    _rendered, probed = _stub_ephemeral_kernel(monkeypatch, env)
+
+    async with get_session_factory()() as session:
+        outcomes = await DP.recover_dead_nodes_self_hosted(session, data_dir=env, now=NOW)
+        observations = (await session.scalars(select(HealthObservation))).all()
+
+    by_id = {result.node_id: result for result in outcomes}
+    assert not by_id["a"].ok and not by_id["b"].ok
+    assert by_id["c"].ok
+    assert probed == ["1|c"]
+    assert {item.node_id for item in observations} == {"a", "b", "c"}
+    assert (await _node("a")).consecutive_failures == 1
+    assert (await _node("c")).state == NODE_ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_self_hosted_port_failure_does_not_count_as_node_failure(env, monkeypatch):
+    from app.domains.proxypool import dead_probe as DP
+
+    await init_db()
+    await _add_recovery_graph([("leaf", NODE_DEAD, {})])
+    _stub_kernel_exe(monkeypatch, env)
+    monkeypatch.setattr(DP, "_free_port", lambda preferred: None)
+
+    async with get_session_factory()() as session:
+        outcomes = await DP.recover_dead_nodes_self_hosted(session, data_dir=env, now=NOW)
+        observations = (await session.scalars(select(HealthObservation))).all()
+
+    assert len(outcomes) == 1 and not outcomes[0].ok
+    assert len(observations) == 1 and not observations[0].ok
+    assert (await _node("leaf")).consecutive_failures == 1
+
+
+@pytest.mark.asyncio
+async def test_self_hosted_loads_relay_group_from_existing_source(env, monkeypatch):
+    from app.domains.proxypool import dead_probe as DP
+    from app.domains.proxies.clash_manager import subscription_config_path
+
+    await init_db()
+    await _add_recovery_graph([
+        ("leaf", NODE_DEAD, {"dialer-proxy": "relay"}),
+        ("hop", NODE_ACTIVE, {}),
+    ])
+    source = subscription_config_path(env, 1)
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(yaml.safe_dump({
+        "proxies": [{**CONFIG, "name": "hop"}],
+        "proxy-groups": [{"name": "relay", "type": "select", "proxies": ["hop"]}],
+        "rules": ["GEOSITE,cn,DIRECT"],
+    }), encoding="utf-8")
+    rendered, probed = _stub_ephemeral_kernel(monkeypatch, env)
+
+    async with get_session_factory()() as session:
+        outcomes = await DP.recover_dead_nodes_self_hosted(session, data_dir=env, now=NOW)
+
+    assert len(outcomes) == 1 and outcomes[0].ok
+    assert probed == ["1|leaf"]
+    config = rendered[0]
+    assert config["proxy-groups"][0]["name"] == "HlRelay|1|relay"
+    assert config["proxy-groups"][0]["proxies"] == ["1|hop"]
+    assert next(p for p in config["proxies"] if p["name"] == "1|leaf")["dialer-proxy"] == "HlRelay|1|relay"
+    assert "GEOSITE" not in yaml.safe_dump(config)
+    assert not list((env / "proxypool" / "_dead_probe").glob("run-*"))
+
+
+@pytest.mark.asyncio
+async def test_self_hosted_delays_use_existing_probe_concurrency(env, monkeypatch):
+    import asyncio
+    from app.domains.proxypool import dead_probe as DP
+
+    await init_db()
+    await _add_recovery_graph([("a", NODE_DEAD, {}), ("b", NODE_DEAD, {})])
+    _stub_ephemeral_kernel(monkeypatch, env)
+    started = set()
+    both_started = asyncio.Event()
+
+    async def probe(base_url, secret, name, url):
+        started.add(name)
+        if len(started) == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=1)
+        return H.ProbeResult(name, True, 7, "")
+
+    monkeypatch.setattr(DP, "_probe_one", probe)
+    async with get_session_factory()() as session:
+        outcomes = await DP.recover_dead_nodes_self_hosted(session, data_dir=env, now=NOW)
+
+    assert len(outcomes) == 2 and all(result.ok for result in outcomes)
+    assert started == {"1|a", "1|b"}
+
+
+@pytest.mark.asyncio
+async def test_self_hosted_controller_not_ready_does_not_mark_node_failed(env, monkeypatch):
+    from app.domains.proxypool import dead_probe as DP
+
+    await init_db()
+    await _add_recovery_graph([("leaf", NODE_DEAD, {})])
+    _stub_ephemeral_kernel(monkeypatch, env)
+
+    async def unavailable(*args):
+        return False
+
+    monkeypatch.setattr(DP, "_wait_controller", unavailable)
+    async with get_session_factory()() as session:
+        outcomes = await DP.recover_dead_nodes_self_hosted(session, data_dir=env, now=NOW)
+
+    assert len(outcomes) == 1 and not outcomes[0].ok
+    assert not outcomes[0].node_failure
+    assert (await _node("leaf")).consecutive_failures == 1
+
+
+@pytest.mark.asyncio
+async def test_self_hosted_unloaded_node_is_not_health_failure(env, monkeypatch):
+    import httpx
+    from app.domains.proxypool import dead_probe as DP
+
+    await init_db()
+    await _add_recovery_graph([("leaf", NODE_DEAD, {})])
+    real_probe = DP._probe_one
+    _stub_ephemeral_kernel(monkeypatch, env)
+    monkeypatch.setattr(DP, "_probe_one", real_probe)
+    client_class = httpx.AsyncClient
+    transport = httpx.MockTransport(lambda request: httpx.Response(404, json={"message": "not found"}))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client_class(transport=transport, **kwargs))
+
+    async with get_session_factory()() as session:
+        outcomes = await DP.recover_dead_nodes_self_hosted(session, data_dir=env, now=NOW)
+
+    assert len(outcomes) == 1 and not outcomes[0].ok
+    assert not outcomes[0].node_failure
+    assert (await _node("leaf")).consecutive_failures == 1
+
+
+@pytest.mark.asyncio
+async def test_self_hosted_invalid_auxiliary_config_does_not_block_independent_target(env, monkeypatch):
+    from app.domains.proxypool import dead_probe as DP
+
+    await init_db()
+    await _add_recovery_graph([
+        ("a", NODE_DEAD, {"dialer-proxy": "hop"}),
+        ("hop", NODE_ACTIVE, {"server": None}),
+        ("z", NODE_DEAD, {}),
+    ])
+    rendered, probed = _stub_ephemeral_kernel(monkeypatch, env)
+    async with get_session_factory()() as session:
+        outcomes = await DP.recover_dead_nodes_self_hosted(session, data_dir=env, now=NOW)
+
+    assert [(result.node_id, result.ok) for result in outcomes] == [("a", False), ("z", True)]
+    assert probed == ["1|z"]
+    assert {p["name"] for p in rendered[0]["proxies"]} == {"1|z"}
+
+
+@pytest.mark.asyncio
+async def test_self_hosted_bad_source_only_blocks_its_dependent_targets(env, monkeypatch):
+    from app.domains.proxypool import dead_probe as DP
+    from app.domains.proxies.clash_manager import subscription_config_path
+
+    await init_db()
+    await _add_recovery_graph([
+        ("a-dependent", NODE_DEAD, {"dialer-proxy": "relay"}),
+        ("b-independent", NODE_DEAD, {}),
+    ])
+    async with get_session_factory()() as session:
+        session.add(ProxySubscription(id=2, kind="clash", url="http://second.example/list"))
+        session.add_all([
+            ProxyNode(
+                node_id=node_id, fingerprint=node_id, runtime_name=f"2|{name}",
+                subscription_id=2, original_name=name, proxy_type="http", server="10.0.0.1",
+                normalized_config={**CONFIG, "name": name, **extra}, state=state,
+                consecutive_failures=1, first_seen=NOW, last_source_seen=NOW,
+            )
+            for node_id, name, state, extra in [
+                ("second-leaf", "leaf", NODE_DEAD, {"dialer-proxy": "relay"}),
+                ("second-hop", "hop", NODE_ACTIVE, {}),
+            ]
+        ])
+        await session.commit()
+    bad_source = subscription_config_path(env, 1)
+    bad_source.parent.mkdir(parents=True, exist_ok=True)
+    bad_source.write_text("proxies: [", encoding="utf-8")
+    subscription_config_path(env, 2).write_text(yaml.safe_dump({
+        "proxies": [
+            {**CONFIG, "name": "leaf", "dialer-proxy": "relay"},
+            {**CONFIG, "name": "hop"},
+        ],
+        "proxy-groups": [{"name": "relay", "type": "select", "proxies": ["hop"]}],
+    }), encoding="utf-8")
+    rendered, probed = _stub_ephemeral_kernel(monkeypatch, env)
+    async with get_session_factory()() as session:
+        outcomes = await DP.recover_dead_nodes_self_hosted(session, data_dir=env, now=NOW)
+        observations = (await session.scalars(select(HealthObservation))).all()
+
+    by_id = {result.node_id: result for result in outcomes}
+    assert not by_id["a-dependent"].ok and not by_id["a-dependent"].node_failure
+    assert "快照" in by_id["a-dependent"].detail
+    assert by_id["b-independent"].ok and by_id["second-leaf"].ok
+    assert set(probed) == {"1|b-independent", "2|leaf"}
+    assert {item.node_id for item in observations} == {"a-dependent", "b-independent", "second-leaf"}
+    assert (await _node("a-dependent")).consecutive_failures == 1
+    assert rendered[0]["proxy-groups"][0]["name"] == "HlRelay|2|relay"
+
+
+@pytest.mark.asyncio
+async def test_self_hosted_recovery_uses_source_membership_at_result_commit(env, monkeypatch):
+    from app.domains.proxypool import dead_probe as DP
+    from app.domains.proxypool.state import NODE_STALE
+
+    await init_db()
+    await _add_recovery_graph([("leaf", NODE_DEAD, {})])
+    _stub_kernel_exe(monkeypatch, env)
+
+    async def probe(nodes, **kwargs):
+        async with get_session_factory()() as session:
+            await session.execute(
+                update(ProxyNode).where(ProxyNode.node_id == "leaf")
+                .values(subscription_id=None)
+            )
+            await session.commit()
+        return [DP.ProbeOutcome("leaf", "1|leaf", True, 7, "")]
+
+    monkeypatch.setattr(DP, "probe_out_of_pool_nodes", probe)
+    async with get_session_factory()() as session:
+        outcomes = await DP.recover_dead_nodes_self_hosted(session, data_dir=env, now=NOW)
+        assert await eligible_runtime_names(session) == ()
+
+    node = await _node("leaf")
+    assert outcomes[0].ok
+    assert node.subscription_id is None
+    assert node.state == NODE_STALE
+    assert node.last_l2_at == NOW
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ok", [True, False])
+async def test_self_hosted_valid_verdict_dates_prevent_older_ledger_revival(env, monkeypatch, ok):
+    from app.domains.proxies.models import ClashNode
+    from app.domains.proxypool import bridge, dead_probe as DP
+
+    await init_db()
+    await _add_recovery_graph([("leaf", NODE_DEAD, {})])
+    async with get_session_factory()() as session:
+        node = await session.scalar(select(ProxyNode).where(ProxyNode.node_id == "leaf"))
+        node.last_l2_at = NOW - timedelta(hours=2)
+        session.add(ClashNode(
+            subscription_id=1, name="leaf", status="ok", exit_ip="1.2.3.4",
+            last_checked_at=NOW - timedelta(hours=1), latency_ms=5,
+        ))
+        await session.commit()
+    _stub_kernel_exe(monkeypatch, env)
+    _stub_self_hosted(monkeypatch, {"leaf": ok})
+
+    async with get_session_factory()() as session:
+        await DP.recover_dead_nodes_self_hosted(session, data_dir=env, now=NOW)
+    node = await _node("leaf")
+    assert node.state == (NODE_ACTIVE if ok else NODE_DEAD)
+    if not ok:
+        async with get_session_factory()() as session:
+            result = await bridge.ingest_ledger(session, now=NOW + timedelta(minutes=1))
+            await session.commit()
+        assert result.activated == 0
+        assert (await _node("leaf")).state == NODE_DEAD
+    assert node.last_l2_at == NOW
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["dependency", "controller"])
+async def test_self_hosted_unavailable_probe_preserves_valid_verdict_date(env, monkeypatch, failure):
+    from app.domains.proxypool import dead_probe as DP
+
+    await init_db()
+    config = {"dialer-proxy": "missing"} if failure == "dependency" else {}
+    await _add_recovery_graph([("leaf", NODE_DEAD, config)])
+    previous = NOW - timedelta(hours=2)
+    async with get_session_factory()() as session:
+        node = await session.scalar(select(ProxyNode).where(ProxyNode.node_id == "leaf"))
+        node.last_l2_at = previous
+        await session.commit()
+    _stub_ephemeral_kernel(monkeypatch, env)
+    if failure == "controller":
+        async def unavailable(*args):
+            return False
+
+        monkeypatch.setattr(DP, "_wait_controller", unavailable)
+
+    async with get_session_factory()() as session:
+        outcomes = await DP.recover_dead_nodes_self_hosted(session, data_dir=env, now=NOW)
+        observations = (await session.scalars(select(HealthObservation))).all()
+
+    node = await _node("leaf")
+    assert len(outcomes) == len(observations) == 1
+    assert not outcomes[0].ok and not outcomes[0].node_failure
+    assert node.last_l2_at == previous
+    assert node.state == NODE_DEAD and node.consecutive_failures == 1

@@ -101,6 +101,24 @@ def test_release_accepts_core_assets_without_geo(tmp_path, monkeypatch):
     assert not any((tmp_path / name).exists() for name in GEO_FILES)
 
 
+def test_release_refreshes_stale_source_note_without_fetching(tmp_path, monkeypatch):
+    build = _load_script("build_release", monkeypatch)
+    fetch = _load_script("fetch_kernel", monkeypatch)
+    monkeypatch.setattr(build, "CLASH_DIR", tmp_path)
+    _write_assets(tmp_path, dict.fromkeys(kernel_release.bundled_asset_names(), 16))
+    note = tmp_path / "README.txt"
+    note.write_text("GeoIP GeoSite old bundled assets", encoding="utf-8")
+
+    build.ensure_clash_assets()
+
+    rendered = note.read_text(encoding="utf-8")
+    assert kernel_release.MIHOMO_VERSION in rendered
+    assert "GeoIP" not in rendered and "GeoSite" not in rendered
+    monkeypatch.setattr(fetch, "CLASH_DIR", tmp_path)
+    fetch._write_source_note()
+    assert note.read_text(encoding="utf-8") == rendered
+
+
 def test_packaging_excludes_unlisted_files_from_asset_directory(tmp_path):
     bundle = tmp_path / "assets" / "clash"
     expected = {kernel_release.kernel_filename(), "LICENSE-mihomo.txt", "README.txt"}

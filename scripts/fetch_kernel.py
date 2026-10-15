@@ -39,6 +39,7 @@ from app.domains.proxies.kernel_release import (  # noqa: E402
     MIHOMO_VERSION,
     MIRRORS,
     bundled_asset_names,
+    bundled_source_note,
     kernel_filename,
     mihomo_asset,
     mihomo_url,
@@ -127,20 +128,9 @@ def _copy_from_dir(src_dir: Path) -> list[str]:
     return copied
 
 
-# 来源与许可说明随内核分发。
-_SOURCE_NOTE = """Holdexar 随包内核资产（bundle assets）
-==================================================
-mihomo         {mihomo_version}
-               来源 https://github.com/MetaCubeX/mihomo
-               许可 GPL-3.0（原文见同目录 LICENSE-mihomo.txt）
-mihomo 以独立进程运行（非链接、非派生），本项目自身以 GPL-3.0 分发；
-对应源码即上游仓库上述地址，二进制未做任何修改。
-"""
-
-
 def _write_source_note() -> None:
     (CLASH_DIR / "README.txt").write_text(
-        _SOURCE_NOTE.format(mihomo_version=MIHOMO_VERSION), encoding="utf-8"
+        bundled_source_note(), encoding="utf-8"
     )
 
 

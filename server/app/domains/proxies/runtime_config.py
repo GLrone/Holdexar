@@ -1,50 +1,17 @@
-"""项目自有运行配置生成：订阅原文 → 内核实际加载的纯节点配置。
-
-两处入口共用同一份节点依赖解析能力，不另立第二套：
-
-- `render_subscription_config`：机场整份订阅 → 运行配置。**只留连接需要的东西**
-  （节点、节点来源、必要的中转组、基础解析），剥掉规则引擎与地区分类；
-- `resolve_node_dependencies`：把 `dialer-proxy` 的订阅原名映射成运行名
-  （池渲染与恢复探测共用）。
-
-设计前提：机场配置里的地区规则、rule-providers、地区 DNS 过滤、系统接管设置
-都属于「那台机器上的通用客户端配置」，不是本项目要的形态——本项目自己生成
-选择组、访问通道与解析设置，因此不消费 GeoIP/GeoSite 数据。缺目标不得静默
-改成另一条连接路径，一律报错（fail-closed）。
-"""
+"""生成不消费地理数据的运行配置，并解析同订阅连接依赖。"""
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 import yaml
 
-# 运行配置里不保留的顶层键：规则引擎（规则/规则集/子规则）与本机接管面
-# （tun），以及控制器凭据（本项目经命令行下发，配置文件里的一律不可信）。
-_DROP_TOP_KEYS = frozenset({
-    "rules",
-    "rule-providers",
-    "sub-rules",
-    "tun",
-    "geodata-mode",
-    "external-controller",
-    "external-ui",
-    "secret",
-    "mixed-port",
-    "port",
-    "socks-port",
-    "redir-port",
-    "tproxy-port",
+_DNS_BOOLEAN_KEYS = frozenset({
+    "enable", "ipv6", "prefer-h3", "use-hosts", "use-system-hosts",
 })
-
-# DNS 里会引地理数据或改写解析路径的键：地区过滤（fallback / fallback-filter）、
-# 按域名定策略（nameserver-policy）、fake-ip 例外表都可能写 geosite/geoip。
-_DNS_GEO_KEYS = frozenset({
-    "fallback",
-    "fallback-filter",
-    "nameserver-policy",
-    "fake-ip-filter",
-    "geodata-mode",
+_DNS_RESOLVER_KEYS = frozenset({
+    "nameserver", "default-nameserver", "proxy-server-nameserver", "direct-nameserver",
 })
 
 # 纯节点来源订阅（无内联节点）需要一个组来装载 provider，否则节点不会被加载。
@@ -61,64 +28,151 @@ def resolve_node_dependencies(
     payloads: Sequence[Mapping[str, Any]],
     names: Mapping[str, str],
 ) -> list[dict]:
-    """把节点名与 `dialer-proxy` 从订阅原名映射到运行名。
-
-    `names` = 订阅原名 → 运行名的映射。返回新列表，**不改输入**。目标映射不到
-    即抛 `ValueError`——静默剥离会让内核把这条连接换成另一条路径（例如直连），
-    那是用户没要求的改动，比整份拒载更难排查。内置逻辑节点（DIRECT/REJECT…）
-    原样放行：它们由内核自己解析，不属于订阅节点表。
-    """
-    resolved: list[dict] = []
-    for payload in payloads:
-        item = dict(payload)
-        original_name = str(item.get("name") or "")
-        item["name"] = names.get(original_name, original_name)
-        target = item.get("dialer-proxy")
-        if target:
-            raw_target = str(target)
-            mapped = names.get(raw_target)
-            if not mapped and raw_target not in BUILTIN_PROXY_NAMES:
-                raise ValueError(f"节点连接依赖的目标不存在：{raw_target}")
-            if mapped:
-                item["dialer-proxy"] = mapped
-        resolved.append(item)
-    return resolved
+    """按同一依赖闭包解析节点运行名。"""
+    originals = {runtime: original for original, runtime in names.items()}
+    source_names = [originals.get(str(item.get("name") or ""), str(item.get("name") or ""))
+                    for item in payloads]
+    return render_node_bundle(payloads, names, source_names=source_names)["proxies"]
 
 
-def _needed_groups(groups: list[Mapping], proxies: list[Mapping]) -> set[str]:
-    """被 `dialer-proxy` 依赖到的组（含组间传递）。
+def render_node_bundle(
+    payloads: Sequence[Mapping[str, Any]],
+    names: Mapping[str, str],
+    *,
+    groups: Sequence[Mapping[str, Any]] = (),
+    namespace: str = "",
+    roots: Sequence[str] | None = None,
+    provider_names: Sequence[str] = (),
+    provider_configs: Mapping[str, Mapping[str, Any]] | None = None,
+    source_names: Sequence[str] | None = None,
+) -> dict[str, list[dict]]:
+    """按指定节点取依赖闭包；缺失、歧义和循环依赖均拒绝生成。"""
+    aliases: dict[str, set[int]] = {}
+    runtime_names: list[str] = []
+    for index, payload in enumerate(payloads):
+        payload_name = str(payload.get("name") or "")
+        raw_name = str(source_names[index]) if source_names is not None else payload_name
+        runtime_name = str(names.get(raw_name, payload_name))
+        runtime_names.append(runtime_name)
+        aliases.setdefault(raw_name, set()).add(index)
 
-    其余组属于机场原本的选择逻辑，本项目不用——保留它们等于把机场的分流意图
-    悄悄带进运行配置。
-    """
-    by_name = {str(g.get("name")): g for g in groups if g.get("name")}
-    needed: set[str] = set()
-    frontier = [
-        str(p.get("dialer-proxy"))
-        for p in proxies
-        if isinstance(p, Mapping) and p.get("dialer-proxy")
-    ]
-    while frontier:
-        target = frontier.pop()
-        if target in needed or target not in by_name:
-            continue
-        needed.add(target)
-        for member in by_name[target].get("proxies") or []:
-            name = str(member)
-            if name in by_name and name not in needed:
-                frontier.append(name)
-    return needed
+    group_index: dict[str, list[int]] = {}
+    for index, group in enumerate(groups):
+        if group.get("name"):
+            group_index.setdefault(str(group["name"]), []).append(index)
+    group_names = {
+        name: f"HlRelay|{namespace}|{name}" if namespace else name for name in group_index
+    }
+    visiting: list[tuple[str, int]] = []
+    visited: set[tuple[str, int]] = set()
+    rendered_nodes: dict[int, dict] = {}
+    rendered_groups: dict[int, dict] = {}
+    providers = dict(provider_configs or {name: {} for name in provider_names})
+    provider_index = {name: index for index, name in enumerate(providers)}
+
+    def visit_provider(name: str) -> None:
+        if name not in provider_index:
+            raise ValueError(f"连接依赖的节点来源不存在：{name}")
+        key = ("provider", provider_index[name])
+        if key in visiting:
+            raise ValueError(f"连接依赖存在循环：{name}")
+        if key in visited:
+            return
+        visiting.append(key)
+        provider = providers[name]
+        override = provider.get("override") or {}
+        for target in (provider.get("proxy"), override.get("dialer-proxy")):
+            if target:
+                visit(str(target))
+        visiting.pop()
+        visited.add(key)
+
+    def visit(token: str) -> str:
+        node_ids = aliases.get(token, set())
+        group_ids = group_index.get(token, [])
+        if len(node_ids) + len(group_ids) > 1:
+            raise ValueError(f"连接依赖目标重名：{token}")
+        if not node_ids and not group_ids:
+            if token in BUILTIN_PROXY_NAMES:
+                return token
+            raise ValueError(f"连接依赖目标不存在：{token}")
+        is_group = bool(group_ids)
+        index = group_ids[0] if is_group else next(iter(node_ids))
+        return visit_entry(is_group, index)
+
+    def visit_entry(is_group: bool, index: int) -> str:
+        token = str(groups[index]["name"]) if is_group else (
+            str(source_names[index]) if source_names is not None
+            else str(payloads[index].get("name") or "")
+        )
+        key = ("group" if is_group else "node", index)
+        runtime_name = group_names[token] if is_group else runtime_names[index]
+        if key in visiting:
+            raise ValueError(f"连接依赖存在循环：{token}")
+        if key in visited:
+            return runtime_name
+        visiting.append(key)
+        item = copy.deepcopy(dict(groups[index] if is_group else payloads[index]))
+        item["name"] = runtime_name
+        if item.get("dialer-proxy"):
+            item["dialer-proxy"] = visit(str(item["dialer-proxy"]))
+        if is_group:
+            members = list(item.get("proxies") or [])
+            if item.get("include-all") or item.get("include-all-proxies"):
+                members.extend(str(p.get("name") or "") for p in payloads)
+            uses = list(item.get("use") or [])
+            if item.get("include-all") or item.get("include-all-providers"):
+                uses.extend(providers)
+            for source in uses:
+                visit_provider(str(source))
+            if not members and not uses:
+                raise ValueError(f"连接依赖组没有可用成员：{token}")
+            if members:
+                item["proxies"] = list(dict.fromkeys(visit(str(member)) for member in members))
+            if uses:
+                item["use"] = list(dict.fromkeys(uses))
+            for flag in ("include-all", "include-all-proxies", "include-all-providers"):
+                item.pop(flag, None)
+            item.setdefault("empty-fallback", "REJECT")
+            rendered_groups[index] = item
+        else:
+            rendered_nodes[index] = item
+        visiting.pop()
+        visited.add(key)
+        return runtime_name
+
+    for provider_name in providers:
+        visit_provider(provider_name)
+    if roots is None:
+        for index in range(len(payloads)):
+            visit_entry(False, index)
+    else:
+        for root in roots:
+            visit(str(root))
+    result = {
+        "proxies": [rendered_nodes[i] for i in range(len(payloads)) if i in rendered_nodes],
+        "proxy-groups": [rendered_groups[i] for i in range(len(groups)) if i in rendered_groups],
+    }
+    output_names = [item["name"] for entries in result.values() for item in entries]
+    if len(output_names) != len(set(output_names)):
+        raise ValueError("连接依赖的运行名称重复")
+    return result
 
 
 def _render_dns(raw: Any) -> dict:
-    """解析设置：保留基础能力（上游、模式），清掉一切引地理数据的键。
-
-    全部删除会连节点域名解析一起丢掉；全盘继承又会把地区过滤带回来。
-    折中是保留白名单外的普通键、只去引 geo 的那几个，并固定解析模式。
-    """
+    """仅保留基础解析白名单，策略与未知字段一律不进入运行配置。"""
     out: dict = {}
     if isinstance(raw, Mapping):
-        out = {k: v for k, v in raw.items() if k not in _DNS_GEO_KEYS}
+        for key in _DNS_BOOLEAN_KEYS:
+            if isinstance(raw.get(key), bool):
+                out[key] = raw[key]
+        for key in _DNS_RESOLVER_KEYS:
+            values = raw.get(key)
+            if isinstance(values, list):
+                resolvers = [value for value in values if isinstance(value, str)
+                             and not any(marker in value.lower() for marker in ("geosite:", "geoip:"))]
+                if resolvers:
+                    out[key] = resolvers
     out["enhanced-mode"] = "redir-host"
     return out
 
@@ -145,20 +199,8 @@ def render_subscription_config(text: str) -> str:
         raise ValueError("订阅配置里没有节点，也没有节点来源")
 
     groups = [g for g in (doc.get("proxy-groups") or []) if isinstance(g, Mapping)]
-    needed = _needed_groups(groups, proxies)
-    node_names = {str(p.get("name")) for p in proxies}
-
-    for proxy in proxies:
-        target = proxy.get("dialer-proxy")
-        if (
-            target
-            and str(target) not in node_names
-            and str(target) not in needed
-            and str(target) not in BUILTIN_PROXY_NAMES
-        ):
-            raise ValueError(f"节点连接依赖不完整：{target}")
-
-    out_groups = [dict(g) for g in groups if str(g.get("name")) in needed]
+    bundle = render_node_bundle(proxies, {}, groups=groups, provider_configs=providers)
+    out_groups = bundle["proxy-groups"]
 
     if providers:
         used: set[str] = set()
@@ -180,7 +222,7 @@ def render_subscription_config(text: str) -> str:
         "dns": _render_dns(doc.get("dns")),
     }
     if proxies:
-        doc_out["proxies"] = proxies
+        doc_out["proxies"] = bundle["proxies"]
     if providers:
         doc_out["proxy-providers"] = providers
     if out_groups:

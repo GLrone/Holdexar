@@ -213,6 +213,9 @@ async def probe_node(
     if resp.status_code == 404:
         # 内核不认识这个名字：探错了对象，不是节点访问国外网站超时
         return ProbeResult(runtime_name, False, None, NOT_FOUND_DETAIL, valid=False)
+    if resp.status_code in (401, 403):
+        return ProbeResult(runtime_name, False, None,
+                           f"控制器认证失败（HTTP {resp.status_code}）", valid=False)
     if resp.status_code != 200:
         return ProbeResult(runtime_name, False, None,
                            f"{PROBE_FAILED_DETAIL}（HTTP {resp.status_code}）")
