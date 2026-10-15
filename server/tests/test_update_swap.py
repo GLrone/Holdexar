@@ -69,7 +69,7 @@ def _make_payload(staging: Path, *, exe: str = "new-exe", files: dict | None = N
 
 
 def _stage_manifest(staging: Path, tag: str = "v9.9.9", ready: bool = True) -> None:
-    """默认 tag 必须比现装（app_info.APP_VERSION，0.3.0-beta）新：版本门只放行更新。"""
+    """默认 tag 必须比现装（app_info.APP_VERSION，0.3.1-beta）新：版本门只放行更新。"""
     import json
 
     staging.mkdir(parents=True, exist_ok=True)
@@ -468,7 +468,7 @@ def test_handoff_refuses_stale_version_and_cleans_staging(
     data_dir = tmp_path / "data"
     staging = data_dir / "update-staging"
     _make_payload(staging)
-    _stage_manifest(staging, tag="v0.1.0-beta.2")  # 比现装 0.3.0-beta 旧
+    _stage_manifest(staging, tag="v0.1.0-beta.2")  # 比现装 0.3.1-beta 旧
     install = _make_install(tmp_path / "install")
     spawns: list = []
 
