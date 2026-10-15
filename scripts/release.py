@@ -49,10 +49,10 @@ MANIFEST = RELEASE / "latest.json"
 MAIN_BRANCH = "main"
 
 # build_release.py 生成的说明模板占位文案——带着它发版 = 客户端更新提示里
-# 显示「（在此写本次更新内容…）」，属于必须拦住的半成品
 NOTES_PLACEHOLDER = "在此写本次更新内容"
-# 发布正文固定四段式（新增/更新/优化/修复，一条一行）：至少要有一个段标题
+# 发布正文固定四段式（新增/更新/优化/修复，一条一行）
 NOTES_SECTIONS = ("新增：", "更新：", "优化：", "修复：")
+NOTES_BRACKET_PLACEHOLDER = "写完删掉本括号"
 
 if str(SERVER) not in sys.path:
     sys.path.insert(0, str(SERVER))
@@ -67,7 +67,8 @@ from app.core.app_info import (  # noqa: E402
 )
 
 VERSION_RE = re.compile(r'^APP_VERSION\s*=\s*"([^"]+)"', re.MULTILINE)
-SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+# 支持标准三段式正式版（x.y.z）及预发布版本（如 0.3.1-beta、0.3.1-beta.2、0.1.0-rc.1）
+SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$")
 
 
 # ── 基础设施 ────────────────────────────────────────────────
@@ -134,18 +135,59 @@ def gh_ready() -> bool:
     return code == 0
 
 
-def notes_ready() -> str | None:
-    """说明文件就绪则返回正文，否则返回未就绪的原因。"""
-    if not NOTES_FILE.is_file():
-        return f"缺少 {NOTES_FILE.name}（构建时会自动生成模板，写完再发）"
-    body = NOTES_FILE.read_text(encoding="utf-8").strip()
-    if not body:
-        return f"{NOTES_FILE.name} 是空文件"
-    if NOTES_PLACEHOLDER in body:
-        return f"{NOTES_FILE.name} 还是模板占位文案，请先写本次更新内容"
-    if not any(section in body for section in NOTES_SECTIONS):
-        return f"{NOTES_FILE.name} 未按四段式撰写（新增/更新/优化/修复，一条一行），请先改成该格式"
+def validate_release_notes(body: str, filename: str = "RELEASE_NOTES.md") -> str | None:
+    """校验四段式发布说明正文。返回未就绪原因，就绪返回 None。"""
+    text = body.strip()
+    if not text:
+        return f"{filename} 是空文件"
+    if NOTES_PLACEHOLDER in text or NOTES_BRACKET_PLACEHOLDER in text:
+        return f"{filename} 还是模板占位文案，请先写本次更新内容并删除说明括号"
+
+    missing = [s for s in NOTES_SECTIONS if s not in text]
+    if missing:
+        return f"{filename} 缺少四段式标题（{'、'.join(missing)}）"
+
+    indices = [text.index(s) for s in NOTES_SECTIONS]
+    if indices != sorted(indices):
+        return f"{filename} 四段式标题顺序错误，必须严格按「新增：更新：优化：修复：」顺序排列"
+
+    tail_match = re.search(r"\n##\s+", text[indices[3]:])
+    end_pos = indices[3] + tail_match.start() if tail_match else len(text)
+
+    section_slices = [
+        text[indices[0]:indices[1]],
+        text[indices[1]:indices[2]],
+        text[indices[2]:indices[3]],
+        text[indices[3]:end_pos],
+    ]
+
+    total_items = 0
+    for header, sec_text in zip(NOTES_SECTIONS, section_slices):
+        for line in sec_text.splitlines():
+            line_str = line.strip()
+            if not line_str:
+                continue
+            if line_str == header:
+                continue
+            if line_str.startswith(header):
+                content = line_str[len(header):].strip()
+                if content:
+                    total_items += 1
+            elif not line_str.startswith("#"):
+                total_items += 1
+
+    if total_items == 0:
+        return f"{filename} 各段均无有效更新条目，正文至少需有一条有效更新内容"
+
     return None
+
+
+def notes_ready(path: Path | None = None) -> str | None:
+    """说明文件就绪则返回 None，否则返回未就绪的原因。"""
+    target = path or NOTES_FILE
+    if not target.is_file():
+        return f"缺少 {target.name}（构建时会自动生成模板，写完再发）"
+    return validate_release_notes(target.read_text(encoding="utf-8"), target.name)
 
 
 def preflight(version: str, allow_dirty: bool, allow_republish: bool) -> None:
@@ -224,8 +266,14 @@ def bump(kind: str) -> str:
     """按 kind 递增 app_info.APP_VERSION，返回新版本号。"""
     match = SEMVER_RE.match(APP_VERSION)
     if not match:
-        die(f"当前版本号 {APP_VERSION!r} 不是 x.y.z 形式，无法自动递增；请用 --version 指定")
-    major, minor, patch = (int(g) for g in match.groups())
+        die(f"当前版本号 {APP_VERSION!r} 格式非法，无法自动递增；请用 --version 指定")
+    major_s, minor_s, patch_s, pre = match.groups()
+    if pre:
+        die(
+            f"当前版本号 {APP_VERSION!r} 为预发布版本，无法使用 --bump 自动递增；"
+            f"请显式使用 --version 指定目标版本号（如正式版 {major_s}.{minor_s}.{patch_s} 或下一预发布版）"
+        )
+    major, minor, patch = int(major_s), int(minor_s), int(patch_s)
     if kind == "major":
         major, minor, patch = major + 1, 0, 0
     elif kind == "minor":
@@ -270,8 +318,22 @@ def commit_and_push(version: str, dry: bool, yes: bool) -> None:
     """
     tag = f"v{version}"
     print(f"\n── 提交并推送 {tag} ───────────────────────────")
-    run(["git", "add", str(APP_INFO)], dry, label="提交")
-    run(["git", "commit", "-m", f"chore(release): {tag}"], dry, label="提交")
+
+    code_diff, out_diff = capture(["git", "status", "--porcelain", str(APP_INFO)])
+    has_app_info_diff = bool(out_diff.strip())
+
+    if has_app_info_diff:
+        run(["git", "add", str(APP_INFO)], dry, label="提交")
+        run(["git", "commit", "-m", f"chore(release): {tag}"], dry, label="提交")
+    else:
+        print(f"[提交] 版本号文件 {APP_INFO.name} 无变更，跳过提交")
+
+    code_head, out_head = capture(["git", "rev-parse", "HEAD"])
+    code_remote, out_remote = capture(["git", "rev-parse", f"origin/{MAIN_BRANCH}"])
+    if code_head == 0 and code_remote == 0 and out_head.strip() == out_remote.strip():
+        print(f"[推送] 本地分支已与 origin/{MAIN_BRANCH} 同步，无需推送")
+        return
+
     if not yes and not dry:
         answer = input(f"推送到 origin/{MAIN_BRANCH} 并继续发布 {tag}？[y/N] ").strip().lower()
         if answer not in ("y", "yes"):
@@ -328,15 +390,28 @@ def verify(version: str, dry: bool) -> None:
         problems.append(f"schema 期望 {MANIFEST_SCHEMA}，线上是 {remote.get('schema')}")
     if remote.get("version") != version:
         problems.append(f"版本期望 {version}，线上是 {remote.get('version')}")
-    for role in ("app", "seed"):
+    if NOTES_FILE.is_file():
+        expected_notes = NOTES_FILE.read_text(encoding="utf-8").strip()
+        if local.get("notes") != expected_notes:
+            problems.append(f"本地清单 {MANIFEST.name} 的 notes 与 {NOTES_FILE.name} 不一致")
+        if remote.get("notes") != expected_notes:
+            problems.append(f"线上清单的 notes 与本地 {NOTES_FILE.name} 不一致")
+
+    for role in ("app", "seed", "seed-archive"):
         want = next((a for a in local.get("assets", []) if a.get("role") == role), None)
         got = next((a for a in remote.get("assets", []) if a.get("role") == role), None)
         if want is None:
+            print(f"[复验] 本地清单未包含 {role} 资产（本次未生成）")
             continue
         if got is None:
-            problems.append(f"线上清单缺 {role} 资产（本地有 {want['name']}）")
-        elif got.get("sha256") != want.get("sha256"):
-            problems.append(f"{role} 资产 sha256 不一致：线上 {got.get('sha256')[:12]}… vs 本地 {want.get('sha256')[:12]}…")
+            problems.append(f"线上清单缺 {role} 资产（本地声明有 {want['name']}）")
+        else:
+            if got.get("name") != want.get("name"):
+                problems.append(f"{role} 资产文件名不一致：线上 {got.get('name')} vs 本地 {want.get('name')}")
+            if got.get("size") != want.get("size"):
+                problems.append(f"{role} 资产体积不一致：线上 {got.get('size')} vs 本地 {want.get('size')}")
+            if got.get("sha256") != want.get("sha256"):
+                problems.append(f"{role} 资产 sha256 不一致：线上 {got.get('sha256')[:12]}… vs 本地 {want.get('sha256')[:12]}…")
 
     if problems:
         for p in problems:
@@ -379,7 +454,7 @@ def main() -> None:
 
     version = args.version or (bump(args.bump) if args.bump else APP_VERSION)
     if not SEMVER_RE.match(version):
-        die(f"版本号 {version!r} 不是 x.y.z 形式")
+        die(f"版本号 {version!r} 不是合法的版本格式（需为 x.y.z 或带有预发布后缀如 x.y.z-beta）")
 
     version_changed = version != APP_VERSION
 
