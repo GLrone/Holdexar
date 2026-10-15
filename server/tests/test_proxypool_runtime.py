@@ -130,9 +130,11 @@ async def _build(data_dir: Path):
 
 
 async def _start_and_read(runtime: ClashRuntime, exe: Path, config: Path,
-                          *, timeout: float = 15.0) -> frozenset[str]:
+                          *, timeout: float = 15.0,
+                          must_start: bool = True) -> frozenset[str]:
     status = runtime.start(str(exe), str(config), inject_lanes=False)
-    assert status["controllerUrl"], "内核启动后必须注入/解析出控制器地址"
+    if must_start:
+        assert status["controllerUrl"], "内核启动后必须注入/解析出控制器地址"
     return await wait_proxy_names(
         status["controllerUrl"], runtime.secret, timeout=timeout
     )
@@ -254,10 +256,12 @@ async def test_unloadable_node_makes_the_kernel_die_not_shrink(
 
     monkeypatch.setattr(_cm, "validate_config", lambda *a, **k: None)
 
+    # 内核会因坏协议直接退出：控制器地址解析不出来是对的，要的是下面的
+    # 「控制器不可用」异常，不是「必须活着」这条前置断言
     with pytest.raises(RuntimeUnreachableError, match="不可用"):
         await _start_and_read(
             clash_runtime, kernel_exe_path, prepare_runtime_config(tmp_data_dir),
-            timeout=8.0,
+            timeout=8.0, must_start=False,
         )
 
 
