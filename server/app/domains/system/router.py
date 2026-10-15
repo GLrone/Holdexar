@@ -464,7 +464,7 @@ async def update_download(req: UpdateDownload) -> dict:
     """
     from app.core import updater
 
-    if updater.download_progress().get("running"):
+    if not updater.mark_download_starting(req.tag, req.size):
         raise HTTPException(status_code=409, detail="已有更新下载进行中")
     # fire-and-forget：下载在后台跑，前端轮询 /system/update-progress
     asyncio.get_running_loop().create_task(
