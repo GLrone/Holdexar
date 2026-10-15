@@ -32,25 +32,20 @@ if hasattr(sys.stderr, "reconfigure"):
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
 
-from app.core.app_info import GITHUB_REPO  # noqa: E402
+from app.core.app_info import DATA_CDN_BASE, GITHUB_MIRRORS, GITHUB_REPO  # noqa: E402
 
 SEED_DIR = ROOT / "assets" / "seed"
 SEED_DB = SEED_DIR / "holdexar_seed.db"
 ASSET_NAME = "holdexar_seed.db.gz"
 
-# 通道链：GitHub 发布资产直连在国内基本不可用，镜像优先、直连兜底。
-# 与 app/core/updater.py 的镜像链同源，改动请两边对齐。
-_MIRRORS = ("https://ghfast.top/", "https://gh-proxy.com/", "https://gh-proxy.net/", "")
+# 镜像前缀链（单一来源 app.core.app_info.GITHUB_MIRRORS）。
+_MIRRORS = GITHUB_MIRRORS
 
 _TIMEOUT_S = 120
 
 
 def asset_url(mirror: str = "") -> str:
-    """种子地址：`releases/latest/download/` 恒定指向**最新正式版**发布。
-
-    更新清单 Release（tag `updater`）以 `--latest=false` 创建，不会被标成
-    Latest release，所以这里的 latest 不会被它顶掉——这条地址可以长期不变。
-    """
+    """种子地址：`releases/latest/download/` 恒定指向最新正式版发布。"""
     return f"{mirror}https://github.com/{GITHUB_REPO}/releases/latest/download/{ASSET_NAME}"
 
 
@@ -106,9 +101,14 @@ def fetch(force: bool = False) -> int:
     gz_tmp = SEED_DIR / "holdexar_seed.db.gz.part"
     tmp = SEED_DB.with_suffix(".part")
     last_err = ""
+    endpoints: list[tuple[str, str]] = []
+    if DATA_CDN_BASE:
+        endpoints.append(("自建分发", f"{DATA_CDN_BASE.rstrip('/')}/seed/{ASSET_NAME}"))
+    gh_tail = f"https://github.com/{GITHUB_REPO}/releases/latest/download/{ASSET_NAME}"
     for mirror in _MIRRORS:
-        url = asset_url(mirror)
-        label = mirror or "直连"
+        endpoints.append(("镜像" if mirror else "直连", mirror + gh_tail if mirror else gh_tail))
+
+    for label, url in endpoints:
         print(f"[种子] 下载（{label}）…")
         try:
             gz_tmp.unlink(missing_ok=True)
@@ -120,13 +120,18 @@ def fetch(force: bool = False) -> int:
             ok, detail = seed_ok(tmp)
             if not ok:
                 last_err = f"{label}：下载内容无效（{detail}）"
+                gz_tmp.unlink(missing_ok=True)
+                tmp.unlink(missing_ok=True)
                 continue
             tmp.replace(SEED_DB)
+            gz_tmp.unlink(missing_ok=True)
             size_mb = SEED_DB.stat().st_size / 1048576
             print(f"[种子] 完成：{SEED_DB}（{size_mb:.1f} MB，{detail}）")
             return 0
         except (urllib.error.URLError, OSError, TimeoutError, gzip.BadGzipFile) as e:
             last_err = f"{label}：{e}"
+            gz_tmp.unlink(missing_ok=True)
+            tmp.unlink(missing_ok=True)
             continue
 
     gz_tmp.unlink(missing_ok=True)

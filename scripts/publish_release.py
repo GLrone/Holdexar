@@ -136,14 +136,14 @@ def release_is_draft(tag: str) -> bool:
 
 
 def pick_app_zip(version: str) -> Path:
-    """应用包：优先精确匹配当前版本，否则取 release/ 内最新。"""
+    """应用包：必须精确匹配当前版本，禁止静默选择其他版本的旧 ZIP。"""
     exact = RELEASE / f"{APP_NAME}-win64-v{version}.zip"
     if exact.is_file():
         return exact
-    candidates = sorted(RELEASE.glob(ZIP_GLOB), key=lambda p: p.stat().st_mtime)
-    if not candidates:
-        sys.exit(f"[错误] {RELEASE} 下没有应用包，先跑 scripts/build_release.py")
-    return candidates[-1]
+    sys.exit(
+        f"[错误] 未找到当前版本 v{version} 的应用包（期望 {exact.name}）。\n"
+        f"       不允许静默选择其他版本的旧 ZIP；请先运行 python scripts/build_release.py 出包"
+    )
 
 
 def _with_fallback(primary: Path, fallback: Path, label: str, found: list[Path]) -> None:
@@ -158,12 +158,15 @@ def _with_fallback(primary: Path, fallback: Path, label: str, found: list[Path])
     print(f"[警告] 未找到{label}（{primary} / {fallback}），本次发布不含该件")
 
 
-def _ensure_seed_gz() -> None:
+def _ensure_seed_gz(dry: bool = False) -> None:
     """种子分发形态统一为 .gz：release/ 下没有 gz 时用 raw 副本现场压缩。"""
     if SEED_GZ.is_file():
         return
     if not SEED_RAW_FALLBACK.is_file():
         print(f"[警告] 未找到资产种子（{SEED_GZ.name} / {SEED_RAW_FALLBACK}），本次发布不含该件")
+        return
+    if dry:
+        print(f"[dry-run] 发现源种子 {SEED_RAW_FALLBACK}，将在正式发布时现场压缩为 {SEED_GZ.name}（本次未生成）")
         return
     import gzip
 
@@ -203,26 +206,13 @@ def sync_cdn_seed(dry: bool) -> None:
     )
 
 
-def collect_artifacts(app_zip: Path) -> list[Path]:
-    """版本 Release 的资产全集：release/ 下**全部**待分发产物。
-
-    「全部」是硬要求——漏传一件就是一个半成品发布（源码用户拉不到种子、
-    Scoop 渠道跟进不到清单、用户看不到更新说明）。顺序固定（应用包在首，
-    人工核对与 Scoop checkver 拼 URL 都靠它）：
-        ① 应用包 zip   ② latest.json   ③ 资产种子 holdexar_seed.db.gz
-        ④ 公共目录库模板 holdexar_template.db（有则带）
-        ⑤ Scoop 渠道清单 release/scoop/holdexar.json（有则带）
-    更新说明 RELEASE_NOTES.md 走 --notes-file 成为 Release 正文，不再另挂附件；
-    构建中间产物（build/、work/、build*.log）不是发布物，一律不带。
-    """
+def collect_artifacts(app_zip: Path, dry: bool = False) -> list[Path]:
+    """版本 Release 的资产全集：release/ 下全部待分发产物。"""
     artifacts: list[Path] = [app_zip, MANIFEST]
-    _ensure_seed_gz()
+    _ensure_seed_gz(dry)
     if SEED_GZ.is_file():
         artifacts.append(SEED_GZ)
     _with_fallback(TEMPLATE_DB, TEMPLATE_DB_FALLBACK, "公共目录库模板", artifacts)
-    # Scoop 清单是渠道跟进的入口（checkver 读 latest.json、autoupdate 拼 zip URL），
-    # 属于分发面；更新说明不作附件——它以 --notes-file 成为 Release 正文，
-    # 再挂一份是同一份文字的重复。
     if SCOOP_JSON.is_file():
         artifacts.append(SCOOP_JSON)
     else:
@@ -236,16 +226,20 @@ def publish_version_release(
     tag = f"v{version}"
     title = f"{APP_NAME} v{version}"
     if release_exists(tag):
-        print(f"[发布] {tag} 已存在 → 覆盖上传资产")
+        print(f"[发布] {tag} 已存在 → 覆盖上传资产并更新发布说明")
         run(
             ["gh", "release", "upload", tag, *[str(p) for p in artifacts], "--clobber"],
             dry,
         )
+        edit_cmd = [
+            "gh", "release", "edit", tag,
+            "--title", title,
+            "--notes-file", str(notes_file),
+        ]
         if release_is_draft(tag):
-            # 已存在却是草稿：补发为正发布并置 Latest，否则永远卡在 Draft，
-            # 不进首页 Latest 简报、不带 Latest 徽章
             print(f"[发布] {tag} 是草稿 → 补发为正发布并置 Latest")
-            run(["gh", "release", "edit", tag, "--draft=false", "--latest"], dry)
+            edit_cmd.extend(["--draft=false", "--latest"])
+        run(edit_cmd, dry)
         return
     cmd = [
         "gh", "release", "create", tag,
@@ -359,7 +353,36 @@ def main() -> None:
             + "\n先跑 scripts/build_release.py（含清单生成）"
         )
 
-    artifacts = collect_artifacts(app_zip)
+    # 正文就绪检查（直接调用 publish_release.py 时不能绕过）
+    from release import notes_ready
+    notes_err = notes_ready(notes_file)
+    if notes_err:
+        sys.exit(f"[错误] 发布说明未就绪：{notes_err}")
+
+    # 清单版本、notes 及应用包一致性检查
+    try:
+        manifest_data = json.loads(MANIFEST.read_text(encoding="utf-8"))
+        if manifest_data.get("version") != version:
+            sys.exit(
+                f"[错误] {MANIFEST.name} 声明的版本 ({manifest_data.get('version')}) 与目标版本 ({version}) 不一致。\n"
+                f"       请重新运行 python scripts/build_manifest.py 刷新清单"
+            )
+        if manifest_data.get("notes") != notes_file.read_text(encoding="utf-8").strip():
+            sys.exit(
+                f"[错误] {MANIFEST.name} 中的 notes 与 {notes_file.name} 内容不一致。\n"
+                f"       请重新运行 python scripts/build_manifest.py 刷新清单"
+            )
+        app_asset = next((a for a in manifest_data.get("assets", []) if a.get("role") == "app"), None)
+        if not app_asset:
+            sys.exit(f"[错误] {MANIFEST.name} 中缺少 role='app' 的资产声明")
+        if app_asset.get("name") != app_zip.name:
+            sys.exit(f"[错误] {MANIFEST.name} 声明的应用包名 ({app_asset.get('name')}) 与实际文件 ({app_zip.name}) 不一致")
+        if app_asset.get("size") != app_zip.stat().st_size:
+            sys.exit(f"[错误] {MANIFEST.name} 声明的应用包体积 ({app_asset.get('size')}) 与实际文件 ({app_zip.stat().st_size}) 不一致")
+    except json.JSONDecodeError as e:
+        sys.exit(f"[错误] {MANIFEST.name} 解析失败：{e}")
+
+    artifacts = collect_artifacts(app_zip, dry=args.dry_run)
 
     print(f"[发布] 仓库 {GITHUB_REPO}  版本 v{version}")
     for p in artifacts:

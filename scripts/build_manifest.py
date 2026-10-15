@@ -82,20 +82,20 @@ def sha256_of(path: Path) -> str:
     return h.hexdigest()
 
 
-def pick_zip(explicit: str | None) -> Path:
-    """应用包：显式路径优先，否则取 release/ 内**版本最高**的那个。"""
+def pick_zip(explicit: str | None, version: str) -> Path:
+    """应用包：显式路径优先，否则取 release/ 内与目标版本精确匹配的包。"""
     if explicit:
         path = Path(explicit)
         if not path.is_file():
             sys.exit(f"[错误] 指定的应用包不存在：{path}")
         return path
-    candidates = [p for p in RELEASE.glob("*.zip") if ZIP_PATTERN.match(p.name)]
-    if not candidates:
-        sys.exit(
-            f"[错误] {RELEASE} 下没有应用包。先跑 scripts/build_release.py，"
-            f"或用 --zip 指定路径"
-        )
-    return max(candidates, key=lambda p: (p.stat().st_mtime, p.name))
+    exact = RELEASE / f"{APP_NAME}-win64-v{version}.zip"
+    if exact.is_file():
+        return exact
+    sys.exit(
+        f"[错误] 未找到当前版本 v{version} 的应用包（期望 {exact.name}）。\n"
+        f"       不允许静默选择其他版本的旧 ZIP；请先运行 scripts/build_release.py 出包，或使用 --zip 指定"
+    )
 
 
 def read_notes() -> str:
@@ -187,13 +187,27 @@ def write_json(path: Path, payload: dict) -> None:
 
 
 def build(explicit_zip: str | None = None, version: str | None = None) -> dict:
-    zip_path = pick_zip(explicit_zip)
     version = version or app_version()
+    zip_path = pick_zip(explicit_zip, version)
+    expected_zip_name = f"{APP_NAME}-win64-v{version}.zip"
+    if zip_path.name.lower() != expected_zip_name.lower():
+        sys.exit(
+            f"[错误] 指定的应用包文件名 {zip_path.name} 与目标版本 v{version} 不一致（期望 {expected_zip_name}）"
+        )
     manifest = build_manifest(version, zip_path)
     scoop = build_scoop(version, zip_path, manifest["assets"][0]["sha256"])
 
     write_json(MANIFEST_OUT, manifest)
     write_json(SCOOP_DIR / f"{APP_NAME.lower()}.json", scoop)
+
+    if NOTES_FILE.is_file():
+        try:
+            from release import validate_release_notes
+            notes_err = validate_release_notes(manifest["notes"], NOTES_FILE.name)
+            if notes_err:
+                print(f"[清单] 警告：更新说明未就绪（{notes_err}），发布前请编辑 {NOTES_FILE.name}")
+        except Exception:
+            pass
 
     roles = {a["role"]: a for a in manifest["assets"]}
     print(f"[清单] v{version} 应用包 {roles['app']['name']}"
@@ -202,12 +216,12 @@ def build(explicit_zip: str | None = None, version: str | None = None) -> dict:
         print(f"[清单] v{version} 种子 {roles['seed']['name']}"
               f"（{roles['seed']['size'] / 1048576:.1f} MB）")
     else:
-        print("[清单] 警告：未找到种子资产，本次清单不含 seed 条目")
+        print("[清单] 提示：未找到种子库（assets/seed/holdexar_seed.db），本次清单不含 seed 条目")
     if "seed-archive" in roles:
         print(f"[清单] v{version} 种子分发档 {roles['seed-archive']['name']}"
               f"（{roles['seed-archive']['size'] / 1048576:.1f} MB）")
     else:
-        print("[清单] 警告：未找到种子分发档，客户端下载后无哈希可比对")
+        print("[清单] 提示：未找到种子分发档（release/holdexar_seed.db.gz），客户端下载后无哈希可比对")
     print(f"[清单] → {MANIFEST_OUT}")
     print(f"[清单] → {SCOOP_DIR / f'{APP_NAME.lower()}.json'}")
     print(f"[发布] 下一步：python scripts/publish_release.py（创建 Release 并上传）")
