@@ -7,7 +7,7 @@ import { useCrawlStatusStore } from '@/stores/crawlStatus'
 import { useFactNoticesStore } from '@/stores/factNotices'
 import { useLocaleStore } from '@/stores/locale'
 import { usePilotStore } from '@/stores/pilot'
-import { useSettingsStore } from '@/stores/settings'
+import { isLocalOnboardingDismissed, useSettingsStore } from '@/stores/settings'
 import { useThemeStore } from '@/stores/theme'
 import { useTourStore } from '@/stores/tour'
 import { useUpdaterStore } from '@/stores/updater'
@@ -103,15 +103,16 @@ watch(
 )
 
 /* ── 首次启动产品导览 ──
-   settings KV `ui.onboarding_done` 判定：标志拉取后为 false → 延时 800ms
-   启动（等首屏渲染稳定，避免与页面骨架同时闪）。组件内任何关闭路径写标志。
-   开关来自 tour store：关于页 / 设置页的重看入口与首屏自动弹共用同一实例。 */
+   settings KV `ui.onboarding_done` 与本地存储双保险判定：未标记且本地未跳过时延时 800ms
+   启动。组件内任何关闭路径写标志。开关来自 tour store。 */
 const tour = useTourStore()
 watch(
   () => settingsStore.onboardingDone,
   (done) => {
-    if (done === false) {
-      setTimeout(() => tour.show(), 800)
+    if (done === false && !isLocalOnboardingDismissed()) {
+      setTimeout(() => {
+        if (!isLocalOnboardingDismissed()) tour.show()
+      }, 800)
     }
   },
   { immediate: true },

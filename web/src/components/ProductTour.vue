@@ -4,7 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 
 import { APP_NAME } from '@/appInfo'
 import { useI18n, type MessageKey } from '@/locales'
-import { useSettingsStore } from '@/stores/settings'
+import { setLocalOnboardingDismissed, useSettingsStore } from '@/stores/settings'
 import { useThemeStore } from '@/stores/theme'
 import { HlButton, HlIcon } from '@/components/ui'
 import type { IconName } from '@/components/ui/icons'
@@ -545,8 +545,7 @@ watch(model, async (v, was) => {
     step.value = 0
     capturedStart.value = route.fullPath
     prefetchStepRoutes()
-    // 打开即写标志：导览入口长期在（关于页 hero logo / 设置页「重看教程」），
-    // 「看过一次就不再自动弹」比「必须点完才算完成」更贴合实际使用。
+    setLocalOnboardingDismissed()
     void useSettingsStore().markOnboardingDone()
     return
   }
@@ -560,15 +559,22 @@ watch(model, async (v, was) => {
     void router.push(back)
   }
   finishing.value = true
+  setLocalOnboardingDismissed()
   await useSettingsStore().markOnboardingDone()
   finishing.value = false
 })
+
+function skip() {
+  setLocalOnboardingDismissed()
+  model.value = false
+}
 
 function next() {
   if (step.value < TOUR.length - 1) {
     step.value += 1
     return
   }
+  setLocalOnboardingDismissed()
   model.value = false
 }
 
@@ -645,7 +651,7 @@ onUnmounted(() => {
         </template>
         <p v-if="current.hintKey" class="pt-pop__hint">{{ t(current.hintKey) }}</p>
         <div class="pt-pop__foot">
-          <HlButton size="sm" variant="text" :disabled="finishing" @click="model = false">{{ t('productTour.action.skip') }}</HlButton>
+          <HlButton size="sm" variant="text" :disabled="finishing" @click="skip">{{ t('productTour.action.skip') }}</HlButton>
           <span class="pt-spring" />
           <HlButton v-if="step > 0" size="sm" @click="step -= 1">{{ t('common.prev') }}</HlButton>
           <HlButton size="sm" art="outline" tone="blue" :disabled="finishing" @click="next">
@@ -682,7 +688,7 @@ onUnmounted(() => {
         </template>
         <p v-if="current.hintKey" class="pt-pop__hint">{{ t(current.hintKey) }}</p>
         <div class="pt-pop__foot">
-          <HlButton size="sm" variant="text" :disabled="finishing" @click="model = false">{{ t('productTour.action.skip') }}</HlButton>
+          <HlButton size="sm" variant="text" :disabled="finishing" @click="skip">{{ t('productTour.action.skip') }}</HlButton>
           <span class="pt-spring" />
           <HlButton v-if="step > 0" size="sm" @click="step -= 1">{{ t('common.prev') }}</HlButton>
           <HlButton size="sm" art="outline" tone="blue" :disabled="finishing" @click="next">
