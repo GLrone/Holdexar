@@ -223,6 +223,14 @@ function onClose(): void {
           </header>
 
           <div class="upd-body">
+            <div v-if="updater.swapFailed && phase !== 'downloading'" class="upd-fail">
+              <span class="upd-fail__icon"><HlIcon name="warning" /></span>
+              <div>
+                <p class="upd-fail__hint">{{ t('updateDialog.swapFailedBanner') }}</p>
+                <p class="upd-fail__detail">{{ t('updateDialog.swapFailedHint') }}</p>
+              </div>
+            </div>
+
             <!-- 检查中 -->
             <p v-if="phase === 'checking'" class="upd-line">
               {{ t('updateDialog.checking') }}
@@ -243,15 +251,6 @@ function onClose(): void {
             </div>
 
             <template v-else>
-              <!-- 换装失败投影：上次更新没装上（已回滚），给「重新下载」的出路 -->
-              <div v-if="updater.swapFailed && phase !== 'downloading'" class="upd-fail">
-                <span class="upd-fail__icon"><HlIcon name="warning" /></span>
-                <div>
-                  <p class="upd-fail__hint">{{ t('updateDialog.swapFailedBanner') }}</p>
-                  <p class="upd-fail__detail">{{ t('updateDialog.swapFailedHint') }}</p>
-                </div>
-              </div>
-
               <!-- 版本跃迁说明（下载中/已就绪阶段不再重复这句） -->
               <p v-if="phase === 'available'" class="upd-line">
                 {{

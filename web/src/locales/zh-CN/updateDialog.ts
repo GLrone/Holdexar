@@ -40,7 +40,7 @@ export default {
   'updateDialog.failVerify': '下载完成但校验未通过，已丢弃（不会安装坏包）。请重试或手动下载。',
   'updateDialog.failCancelled': '已取消下载，已下载的部分会保留，下次继续。',
   'updateDialog.failGeneric': '更新失败。可重试，或到发布页手动下载。',
-  'updateDialog.swapFailedBanner': '上次更新未能完成安装，已回滚到原版本。',
+  'updateDialog.swapFailedBanner': '上次更新未能完成安装。',
   'updateDialog.swapFailedHint':
     '可能是文件被占用导致换装中断。重新下载更新即可再试；问题反复出现时请把更新日志发给我们。',
   'updateDialog.readyBody': 'v{version} 已下载并通过校验，重启应用即可完成安装。',
