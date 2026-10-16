@@ -42,6 +42,7 @@ desktop = _load_desktop_main()
 APP_NAME = desktop.APP_NAME
 EXE_NAME = f"{APP_NAME}.exe"
 _ORIGINAL_SWAP_PAYLOAD = desktop._swap_payload
+_ORIGINAL_VERIFY_HEALTH = desktop._verify_new_version_health
 
 
 def _make_install(root: Path, *, exe: str = "old-exe", files: dict | None = None) -> Path:
@@ -338,7 +339,7 @@ def _prepare_failed_helper_case(
     events: list[tuple[str, object]] = []
 
     monkeypatch.setattr(desktop, "_data_dir", lambda: data_dir)
-    monkeypatch.setattr(desktop, "_swap_payload", lambda _s, _t: False)
+    monkeypatch.setattr(desktop, "_swap_payload", lambda _s, _t, **kwargs: False)
     # 互斥体是真实内核对象：helper 单测不碰它（独占语义由专属用例验证）
     monkeypatch.setattr(desktop, "_acquire_swap_mutex", lambda: True)
     monkeypatch.setattr(desktop, "_alert", lambda msg: events.append(("alert", msg)))
@@ -348,6 +349,14 @@ def _prepare_failed_helper_case(
         lambda cmd, **kwargs: events.append(("spawn", cmd[0])),
     )
     monkeypatch.setattr(desktop.threading, "Thread", _SyncThread)
+    monkeypatch.setattr(desktop, "_verify_new_version_health", lambda *a, **k: (True, "ready", {}))
+    def restored(target, **kwargs):
+        exe = desktop._staged_main_exe(target)
+        if exe is None:
+            return False
+        desktop.subprocess.Popen([str(exe)])
+        return True
+    monkeypatch.setattr(desktop, "_relaunch_and_verify_old_version", restored)
     return data_dir, staging, target, events
 
 
@@ -550,7 +559,7 @@ def test_run_update_helper_success_clears_ledger_and_flag(
         tmp_path, monkeypatch
     )
     # 反转前置桩：这次换装成功
-    monkeypatch.setattr(desktop, "_swap_payload", lambda _s, _t: True)
+    monkeypatch.setattr(desktop, "_swap_payload", lambda _s, _t, **kwargs: True)
     (data_dir / desktop._FAILED_MARK).write_text("stale\n", encoding="utf-8")
     (data_dir / desktop.HANDOFF_LEDGER_NAME).write_text(
         '{"tag": "v9.9.9", "count": 1}', encoding="utf-8"
@@ -647,6 +656,7 @@ def test_run_update_helper_rolls_back_when_new_exe_crashes(tmp_path: Path, monke
             return 1
 
     monkeypatch.setattr(desktop.subprocess, "Popen", lambda cmd, **kwargs: MockCrashProcess())
+    monkeypatch.setattr(desktop, "_verify_new_version_health", _ORIGINAL_VERIFY_HEALTH)
 
     desktop._run_update_helper(staging, target, None)
 
@@ -692,11 +702,13 @@ def test_wait_target_idle_verifies_taskkill_returncode(tmp_path: Path, monkeypat
         stdout = ""
         stderr = "ERROR: Access denied"
 
-    monkeypatch.setattr(desktop.subprocess, "run", lambda *a, **k: MockCompletedProcess())
+    calls = []
+    monkeypatch.setattr(desktop.subprocess, "run", lambda *a, **k: calls.append(a) or MockCompletedProcess())
     monkeypatch.setattr(desktop.time, "sleep", lambda _s: None)
 
-    remaining = desktop._wait_target_idle(target, timeout_s=0.01)
+    remaining = desktop._wait_target_idle(target, timeout_s=0.01, grace_s=0)
     assert remaining == [12345]
+    assert calls
 
 
 def test_run_update_helper_aborts_when_target_locked(tmp_path: Path, monkeypatch) -> None:
@@ -816,3 +828,250 @@ def test_run_update_helper_incomplete_rollback_alert(tmp_path: Path, monkeypatch
     assert "locked_file.dll" in alerts[0]
 
 
+
+
+def test_helper_guards_backup_before_starting_new_version(tmp_path, monkeypatch):
+    data, staging, target, events = _prepare_failed_helper_case(tmp_path, monkeypatch)
+    monkeypatch.setattr(desktop, "_swap_payload", _ORIGINAL_SWAP_PAYLOAD)
+    observed = []
+    monkeypatch.setattr(desktop.subprocess, "Popen", lambda *a, **k: observed.append(desktop._health_checking_flag().exists()))
+    monkeypatch.setattr(desktop, "_verify_new_version_health", lambda *a, **k: (True, "ready", {}))
+    desktop._run_update_helper(staging, target, None)
+    assert observed == [True]
+
+
+def test_helper_restores_old_files_when_new_process_cannot_start(tmp_path, monkeypatch):
+    data, staging, target, events = _prepare_failed_helper_case(tmp_path, monkeypatch)
+    monkeypatch.setattr(desktop, "_swap_payload", _ORIGINAL_SWAP_PAYLOAD)
+    def denied(*args, **kwargs):
+        raise PermissionError("launch denied")
+    monkeypatch.setattr(desktop.subprocess, "Popen", denied)
+    monkeypatch.setattr(desktop, "_relaunch_and_verify_old_version", lambda *a, **k: True)
+    desktop._run_update_helper(staging, target, None)
+    assert (target / EXE_NAME).read_bytes() == b"old-exe"
+    assert desktop._read_diagnosis()["rollback"]["completed"] is True
+    assert desktop._swap_failed_flag().exists()
+
+
+def test_helper_confirms_new_tree_exit_before_restoring_files(tmp_path, monkeypatch):
+    data, staging, target, events = _prepare_failed_helper_case(tmp_path, monkeypatch)
+    monkeypatch.setattr(desktop, "_swap_payload", _ORIGINAL_SWAP_PAYLOAD)
+    checks = []
+    monkeypatch.setattr(desktop, "_wait_target_idle", lambda *a, **k: checks.append(k) or [])
+    monkeypatch.setattr(desktop, "_verify_new_version_health", lambda *a, **k: (False, "not ready", None))
+    monkeypatch.setattr(desktop, "_relaunch_and_verify_old_version", lambda *a, **k: True)
+    desktop._run_update_helper(staging, target, None)
+    assert len(checks) >= 2
+    assert (target / EXE_NAME).read_bytes() == b"old-exe"
+
+
+def test_helper_keeps_backup_and_new_files_while_new_tree_is_stuck(tmp_path, monkeypatch):
+    data, staging, target, events = _prepare_failed_helper_case(tmp_path, monkeypatch)
+    monkeypatch.setattr(desktop, "_swap_payload", _ORIGINAL_SWAP_PAYLOAD)
+    checks = []
+    def idle(*args, **kwargs):
+        checks.append(kwargs)
+        return [] if len(checks) == 1 else [12345]
+    monkeypatch.setattr(desktop, "_wait_target_idle", idle)
+    monkeypatch.setattr(desktop, "_verify_new_version_health", lambda *a, **k: (False, "not ready", None))
+    monkeypatch.setattr(desktop, "_relaunch_and_verify_old_version", lambda *a, **k: True)
+    desktop._run_update_helper(staging, target, None)
+    assert (target / "__old__" / EXE_NAME).read_bytes() == b"old-exe"
+    assert (target / EXE_NAME).read_bytes() == b"new-exe"
+    assert desktop._read_diagnosis()["rollback"]["completed"] is False
+
+
+def test_failed_recovery_does_not_claim_old_version_is_open(tmp_path, monkeypatch):
+    data, staging, target, events = _prepare_failed_helper_case(tmp_path, monkeypatch)
+    monkeypatch.setattr(desktop, "_relaunch_and_verify_old_version", lambda *a, **k: False)
+    desktop._run_update_helper(staging, target, None)
+    alerts = [text for kind, text in events if kind == "alert"]
+    assert alerts and "重新打开应用" not in alerts[0]
+    assert desktop._read_diagnosis().get("restoration", {}).get("healthy") is False
+
+
+def test_startup_preserves_staging_during_health_verification(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    staging = data / desktop.STAGING_DIR_NAME
+    staging.mkdir(parents=True)
+    marker = staging / "runtime.txt"
+    marker.write_text("in use", encoding="utf-8")
+    monkeypatch.setattr(desktop, "_data_dir", lambda: data)
+    desktop._health_checking_flag().write_text("verifying", encoding="utf-8")
+    desktop._cleanup_staging_leftover()
+    assert marker.exists()
+
+
+def test_health_rejects_response_from_another_update_attempt(monkeypatch):
+    class Proc:
+        _update_attempt_id = "this-attempt"
+        def poll(self):
+            return None
+    class Response:
+        status_code = 200
+        def json(self):
+            return {"app": desktop.APP_NAME, "version": "9.9.9", "updateAttemptId": "other-attempt"}
+    monkeypatch.setattr(desktop.httpx, "get", lambda *a, **k: Response())
+    ok, _, _ = desktop._verify_new_version_health("9.9.9", Proc(), timeout=0.01)
+    assert not ok
+
+
+def test_health_does_not_accept_version_prefix(monkeypatch):
+    class Proc:
+        _update_attempt_id = "this-attempt"
+        def poll(self):
+            return None
+    class Response:
+        status_code = 200
+        def json(self):
+            return {"app": desktop.APP_NAME, "version": "9.9.90", "updateAttemptId": "this-attempt"}
+    monkeypatch.setattr(desktop.httpx, "get", lambda *a, **k: Response())
+    ok, _, _ = desktop._verify_new_version_health("9.9.9", Proc(), timeout=0.01)
+    assert not ok
+
+
+def test_health_without_process_is_not_success():
+    ok, _, _ = desktop._verify_new_version_health("9.9.9", None, timeout=0.01)
+    assert not ok
+
+
+def test_finished_recovery_is_not_run_again_after_marker_cleanup_failure(tmp_path, monkeypatch):
+    data, staging, target, events = _prepare_failed_helper_case(tmp_path, monkeypatch)
+    monkeypatch.setattr(desktop, "_swap_payload", _ORIGINAL_SWAP_PAYLOAD)
+    monkeypatch.setattr(desktop, "_verify_new_version_health", lambda *a, **k: (False, "not ready", None))
+    calls = []
+    original = Path.unlink
+    def unlink(path, *a, **k):
+        if path.name == desktop._HEALTH_CHECK_MARK:
+            calls.append(path)
+            if len(calls) == 1:
+                raise PermissionError("guard still open")
+        return original(path, *a, **k)
+    monkeypatch.setattr(Path, "unlink", unlink)
+    checks = []
+    monkeypatch.setattr(desktop, "_wait_target_idle", lambda *a, **k: checks.append(k) or [])
+    desktop._run_update_helper(staging, target, None)
+    assert (target / EXE_NAME).read_bytes() == b"old-exe"
+    assert len(checks) == 2
+
+
+def test_recovery_reuses_mutex_already_held_before_launch(tmp_path, monkeypatch):
+    data, staging, target, events = _prepare_failed_helper_case(tmp_path, monkeypatch)
+    (staging / APP_NAME / EXE_NAME).unlink()
+    monkeypatch.setattr(desktop, "_swap_payload", _ORIGINAL_SWAP_PAYLOAD)
+    monkeypatch.setattr(desktop, "_SWAP_MUTEX_HANDLE", 91)
+    acquires = []
+    monkeypatch.setattr(desktop, "_acquire_swap_mutex", lambda: acquires.append(True) or True)
+    monkeypatch.setattr(desktop, "_release_swap_mutex", lambda: None)
+    desktop._run_update_helper(staging, target, None)
+    assert len(acquires) == 1
+    assert (target / EXE_NAME).read_bytes() == b"old-exe"
+
+
+def test_swap_preserves_existing_nonempty_recovery_backup(tmp_path, monkeypatch):
+    install = _make_install(tmp_path / "install")
+    staging = tmp_path / "staging"
+    _make_payload(staging)
+    old = install / "__old__"
+    old.mkdir()
+    marker = old / "only-copy.txt"
+    marker.write_text("keep", encoding="utf-8")
+    assert desktop._swap_payload(staging, install) is False
+    assert marker.read_text(encoding="utf-8") == "keep"
+    assert (install / EXE_NAME).read_bytes() == b"old-exe"
+
+
+def test_helper_reaps_children_of_previous_instance(tmp_path, monkeypatch):
+    data, staging, target, events = _prepare_failed_helper_case(tmp_path, monkeypatch)
+    monkeypatch.setenv(f"{desktop.ENV_PREFIX}PREV_PID", "12345")
+    roots = []
+    monkeypatch.setattr(desktop, "_wait_target_idle", lambda *a, **k: roots.append(k.get("root_pid")) or [])
+    desktop._run_update_helper(staging, target, None)
+    assert roots[0] == 12345
+
+
+def test_helper_uses_staging_parent_as_data_directory(tmp_path, monkeypatch):
+    data, staging, target, events = _prepare_failed_helper_case(tmp_path, monkeypatch)
+    wrong = tmp_path / "wrong-home"
+    monkeypatch.setenv(f"{desktop.ENV_PREFIX}DATA_DIR", str(wrong))
+    monkeypatch.setattr(desktop, "_data_dir", lambda: Path(os.environ[f"{desktop.ENV_PREFIX}DATA_DIR"]))
+    desktop._run_update_helper(staging, target, None)
+    assert (data / "logs" / "update-diagnosis.json").is_file()
+    assert not (wrong / "logs" / "update-diagnosis.json").exists()
+    assert os.environ[f"{desktop.ENV_PREFIX}DATA_DIR"] == str(wrong)
+
+
+@pytest.mark.parametrize("reserved_name", ["data", "Data", "LOGS", "__OLD__"])
+def test_payload_cannot_replace_user_data(tmp_path, reserved_name):
+    target = _make_install(tmp_path / "install")
+    staging = tmp_path / "staging"
+    payload = _make_payload(staging)
+    (payload / reserved_name).mkdir()
+    (payload / reserved_name / "untrusted.txt").write_text("bad", encoding="utf-8")
+    assert desktop._swap_payload(staging, target) is False
+    assert (target / "data" / "holdexar.db").read_bytes() == b"user-data"
+    assert (target / EXE_NAME).read_bytes() == b"old-exe"
+
+
+def test_consumed_manifest_lock_does_not_undo_completed_swap(tmp_path, monkeypatch):
+    target = _make_install(tmp_path / "install")
+    staging = tmp_path / "staging"
+    _make_payload(staging)
+    _stage_manifest(staging)
+    original = Path.unlink
+    def unlink(path, *args, **kwargs):
+        if path == staging / "manifest.json":
+            raise PermissionError("manifest is locked")
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "unlink", unlink)
+    monkeypatch.setattr(desktop, "_data_dir", lambda: tmp_path / "data")
+    assert desktop._swap_payload(staging, target) is True
+    assert (target / "__old__" / EXE_NAME).read_bytes() == b"old-exe"
+
+
+def test_handoff_does_not_remove_active_helper_staging(tmp_path, monkeypatch):
+    data, staging, target, events = _prepare_failed_helper_case(tmp_path, monkeypatch)
+    monkeypatch.setattr(desktop, "is_frozen", lambda: True)
+    monkeypatch.setattr(desktop, "_staged_supports_helper", lambda *a: True)
+    desktop._health_checking_flag().write_text(
+        __import__("json").dumps({"pid": os.getpid(), "attemptId": "active"}), encoding="utf-8"
+    )
+    assert desktop._handoff_pending_update() is False
+    assert (staging / "manifest.json").exists()
+
+
+def test_helper_keeps_working_directory_outside_consumed_staging(tmp_path, monkeypatch):
+    data, staging, target, events = _prepare_failed_helper_case(tmp_path, monkeypatch)
+    observed = []
+    original_cwd = Path.cwd()
+    monkeypatch.setattr(desktop, "_apply_staged_update", lambda *a: observed.append(Path.cwd()))
+    desktop._run_update_helper(staging, target, None)
+    assert observed == [data.resolve()]
+    assert Path.cwd() == original_cwd
+
+
+def test_loopback_health_does_not_need_helper_certificate_files(monkeypatch):
+    class Proc:
+        _update_attempt_id = "owned"
+        def poll(self):
+            return None
+    class Response:
+        status_code = 200
+        def json(self):
+            return {"app": desktop.APP_NAME, "version": "9.9.9", "updateAttemptId": "owned"}
+    def get(*args, **kwargs):
+        if kwargs.get("verify") is not False:
+            raise FileNotFoundError("helper certificates already cleaned")
+        return Response()
+    monkeypatch.setattr(desktop.httpx, "get", get)
+    healthy, _, _ = desktop._verify_new_version_health("9.9.9", Proc(), timeout=.01)
+    assert healthy
+
+
+def test_swap_keeps_case_variant_of_user_data(tmp_path):
+    target = _make_install(tmp_path / "install")
+    (target / "data").rename(target / "Data")
+    staging = tmp_path / "staging"
+    _make_payload(staging)
+    assert desktop._swap_payload(staging, target) is True
+    assert (target / "Data" / "holdexar.db").read_bytes() == b"user-data"

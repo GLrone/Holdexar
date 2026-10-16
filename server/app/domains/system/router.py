@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import platform
 import sqlite3
 import sys
@@ -15,7 +16,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from app.core.app_info import GITHUB_REPO
+from app.core.app_info import ENV_PREFIX, GITHUB_REPO
 from app.core import data_export, keyring, rekey, secretbox
 from app.core.keyring import KeyringError
 from app.core.secretbox import SecretBoxError
@@ -49,7 +50,16 @@ _STARTED_AT = time.time()
 @router.get("/health")
 async def health() -> dict:
     settings = get_settings()
-    return {"status": "ok", "app": settings.app_name, "version": settings.version}
+    data = {
+        "status": "ok",
+        "app": settings.app_name,
+        "version": settings.version,
+        "pid": os.getpid(),
+    }
+    attempt_id = os.environ.get(f"{ENV_PREFIX}UPDATE_ATTEMPT_ID")
+    if attempt_id is not None:
+        data["updateAttemptId"] = attempt_id
+    return data
 
 
 @router.get("/info")

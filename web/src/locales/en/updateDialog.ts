@@ -41,7 +41,7 @@ export default {
     'Download finished but failed verification and was discarded (a broken package is never installed). Retry or download manually.',
   'updateDialog.failCancelled': 'Download cancelled. The partial download is kept for next time.',
   'updateDialog.failGeneric': 'Update failed. Retry, or download manually from the releases page.',
-  'updateDialog.swapFailedBanner': 'The previous update did not finish installing and was rolled back.',
+  'updateDialog.swapFailedBanner': 'The previous update did not finish installing.',
   'updateDialog.swapFailedHint':
     'The swap was likely interrupted by a locked file. Download the update again to retry; if it keeps happening, please send us the update log.',
   'updateDialog.readyBody': 'v{version} is downloaded and verified. Restart the app to install it.',

@@ -437,7 +437,7 @@ _HELPER_FLAG = "--apply-update"
 _MANIFEST_NAME = STAGING_MANIFEST_NAME
 # 不支持安全换装的暂存包落盘标记：避免每次启动重复探测与弹窗
 _UNSUPPORTED_MARK = HANDOFF_UNSUPPORTED_MARK
-# 换装失败并已回滚的安装状态标记（落在数据目录，不随暂存目录被清理）
+# 更新失败标记随数据目录保留。
 _FAILED_MARK = SWAP_FAILED_FLAG
 # 换装健康检查进行中标记：期间新旧实例均不许删除 __old__ 备份
 _HEALTH_CHECK_MARK = ".health-checking"
@@ -649,15 +649,8 @@ def _release_swap_mutex() -> None:
         _SWAP_MUTEX_HANDLE = None
 
 
-def _pids_running_from(target: Path) -> list[int]:
-    """镜像文件落在 target 目录树下的进程 pid 列表（自身除外）。
-
-    让位失败的占用者几乎总是「还有实例从程序目录里跑着」：交接竞态拉起的
-    多余实例、用户在换装窗口期手动双击的新实例。按进程快照逐一核对镜像
-    路径，比只等单个 wait_pid 可靠。
-    """
-    if os.name != "nt":
-        return []
+def _process_snapshot() -> dict[int, tuple[int, str, str | None]]:
+    """批量取得进程父子关系与镜像路径；无法枚举时拒绝继续换装。"""
     import ctypes
 
     kernel32 = ctypes.windll.kernel32
@@ -691,73 +684,171 @@ def _pids_running_from(target: Path) -> list[int]:
         ctypes.c_void_p, ctypes.c_uint32, ctypes.c_wchar_p,
         ctypes.POINTER(ctypes.c_uint32),
     ]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    kernel32.GetLastError.restype = ctypes.c_uint32
 
     snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if not snap or snap == -1:  # 无效句柄（-1）：快照失败按「查不到」处理
-        return []
-    prefix = str(target).rstrip("\\/") + "\\"
-    me = os.getpid()
-    pids: list[int] = []
+    if not snap or snap == ctypes.c_void_p(-1).value:
+        raise OSError(kernel32.GetLastError(), "无法读取换装进程快照")
+    processes: dict[int, tuple[int, str, str | None]] = {}
     try:
         entry = _PROCESSENTRY32W()
         entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
         ok = bool(kernel32.Process32FirstW(snap, ctypes.byref(entry)))
         while ok:
             pid = int(entry.th32ProcessID)
-            if pid and pid != me:
+            if pid:
+                image = None
                 handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
                 if handle:
                     try:
-                        buf = ctypes.create_unicode_buffer(1024)
-                        size = ctypes.c_uint32(1024)
+                        buf = ctypes.create_unicode_buffer(32768)
+                        size = ctypes.c_uint32(32768)
                         if kernel32.QueryFullProcessImageNameW(
                             handle, 0, buf, ctypes.byref(size)
                         ):
-                            image = str(buf.value)
-                            if image and image.lower().startswith(prefix.lower()):
-                                pids.append(pid)
+                            image = buf.value
                     finally:
                         kernel32.CloseHandle(handle)
+                processes[pid] = (int(entry.th32ParentProcessID), entry.szExeFile, image)
             ok = bool(kernel32.Process32NextW(snap, ctypes.byref(entry)))
+        error = kernel32.GetLastError()
+        if error != 18:
+            raise OSError(error, "换装进程快照未完整读取")
     finally:
         kernel32.CloseHandle(snap)
-    return pids
+    return processes
 
 
-def _wait_target_idle(target: Path, timeout_s: float = 30.0) -> list[int]:
-    """等待程序目录树关联进程退出。返回未退出的 PID 列表。"""
-    grace_deadline = time.monotonic() + 2.0
-    deadline = time.monotonic() + timeout_s
-    killed_pids: set[int] = set()
+def _protected_update_pids(
+    processes: dict[int, tuple[int, str, str | None]], target: Path,
+) -> set[int]:
+    """换装助手及其运行目录内的进程不得被清理。"""
+    protected = {os.getpid()}
+    helper_root = Path(sys.executable).resolve().parent
+    if is_frozen() and helper_root != target.resolve():
+        prefix = str(helper_root).rstrip("\\/").casefold() + "\\"
+        protected.update(
+            pid for pid, (_parent, _name, image) in processes.items()
+            if image and image.casefold().startswith(prefix)
+        )
+    return protected
+
+
+def _pids_running_from(target: Path, *, root_pid: int | None = None) -> list[int]:
+    """识别安装目录内的进程及其后代，保留目录外无归属的进程。"""
+    if os.name != "nt":
+        return []
+    processes = _process_snapshot()
+    protected = _protected_update_pids(processes, target)
+    prefix = str(target.resolve()).rstrip("\\/").casefold() + "\\"
+    names = {path.name.casefold() for path in target.rglob("*.exe")}
+    related = {root_pid} if root_pid and root_pid not in protected else set()
+    for pid, (_parent, name, image) in processes.items():
+        if pid in protected:
+            continue
+        if image and image.casefold().startswith(prefix):
+            related.add(pid)
+        elif image is None and name.casefold() in names:
+            if not _wait_pid_exit(pid, timeout=0):
+                raise OSError(5, f"无法核对可能占用程序目录的进程 PID {pid}")
     while True:
-        running = _pids_running_from(target)
+        descendants = {
+            pid for pid, (parent, _name, _image) in processes.items()
+            if parent in related and pid not in protected
+        }
+        if descendants <= related:
+            break
+        related.update(descendants)
+    return sorted(related.intersection(processes).difference(protected))
+
+
+def _terminate_update_pid(pid: int) -> None:
+    """定点结束助手祖先，避免树终止连带关闭换装助手。"""
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.TerminateProcess.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    handle = kernel32.OpenProcess(0x0001, False, pid)
+    if not handle:
+        if not _wait_pid_exit(pid, timeout=0):
+            _log_update(f"无法取得结束进程的权限，PID {pid}")
+        return
+    try:
+        if not kernel32.TerminateProcess(handle, 1):
+            _log_update(f"结束进程 PID {pid} 失败：{kernel32.GetLastError()}")
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _stop_update_processes(pids: list[int], target: Path, timeout_s: float) -> list[int]:
+    """批量结束归属进程并核对退出结果，保留换装助手所在分支。"""
+    processes = _process_snapshot()
+    protected = _protected_update_pids(processes, target)
+    ancestors = set(protected)
+    while True:
+        parents = {processes[pid][0] for pid in ancestors if pid in processes}
+        if parents <= ancestors:
+            break
+        ancestors.update(parents)
+    owned = set(pids).difference(protected)
+    trees = sorted(owned.difference(ancestors))
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    if trees:
+        command = ["taskkill", "/T", "/F"]
+        command.extend(part for pid in trees for part in ("/PID", str(pid)))
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True,
+                timeout=max(0.01, min(5.0, deadline - time.monotonic())),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode:
+                error = (result.stderr or result.stdout or "").strip()
+                _log_update(f"结束程序进程返回 {result.returncode}：{error}")
+        except (OSError, subprocess.SubprocessError) as error:
+            _log_update(f"结束程序进程失败：{error}")
+    for pid in sorted(owned.intersection(ancestors)):
+        _terminate_update_pid(pid)
+    remaining = [
+        pid for pid in sorted(owned)
+        if not _wait_pid_exit(pid, timeout=max(0.0, deadline - time.monotonic()))
+    ]
+    exited = owned.difference(remaining)
+    if exited:
+        _log_update(f"已确认程序进程退出：{sorted(exited)}")
+    return remaining
+
+
+def _wait_target_idle(
+    target: Path, timeout_s: float = 30.0, *,
+    root_pid: int | None = None, grace_s: float = 2.0,
+) -> list[int]:
+    """等待归属进程全部退出，无法核验时拒绝将目录视为空闲。"""
+    grace_deadline = time.monotonic() + max(0.0, grace_s)
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    tracked: set[int] = set()
+    while True:
+        running = set(
+            _pids_running_from(target, root_pid=root_pid)
+            if root_pid else _pids_running_from(target)
+        )
+        running.update(pid for pid in tracked if not _wait_pid_exit(pid, timeout=0))
         if not running:
             return []
+        tracked.update(running)
         if time.monotonic() >= deadline:
-            _log_update(f"等待程序目录占用进程超时（{timeout_s:.0f}s），残留 PID: {running}")
-            return running
+            remaining = sorted(running)
+            _log_update(f"等待程序进程退出超时（{timeout_s:.0f}s），残留 PID: {remaining}")
+            return remaining
         if time.monotonic() >= grace_deadline:
-            for pid in running:
-                if pid in killed_pids:
-                    continue
-                try:
-                    res = subprocess.run(
-                        ["taskkill", "/F", "/PID", str(pid)],
-                        capture_output=True,
-                        text=True,
-                        timeout=5,
-                    )
-                    if res.returncode == 0:
-                        _log_update(f"已强制结束程序目录残留进程 PID {pid}")
-                        killed_pids.add(pid)
-                    else:
-                        err = (res.stderr or res.stdout or "").strip()
-                        _log_update(f"强制结束进程 PID {pid} 失败（退出码 {res.returncode}）：{err}")
-                except Exception as e:  # noqa: BLE001
-                    _log_update(f"调用 taskkill 结束 PID {pid} 异常：{e}")
-            time.sleep(1.0)
-            continue
-        time.sleep(0.5)
+            _stop_update_processes(sorted(running), target, deadline - time.monotonic())
+        time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
 
 
 def _handoff_ledger_path() -> Path:
@@ -834,12 +925,8 @@ def _staged_supports_helper(exe: Path) -> bool:
     return _HELPER_FLAG in ((result.stdout or "") + (result.stderr or ""))
 
 
-def _wait_pid_exit(pid: int, timeout: float = 180.0) -> None:
-    """等旧进程退出（Windows 句柄等待：换装进程要先拿到「程序目录没人占用」）。
-
-    句柄打不开 = 进程已不在（正常路径：旧实例早已退场）——立即放行，等待
-    残余占用的责任交给让位重试；这里多睡一秒都是用户盯着空屏的时间。
-    """
+def _wait_pid_exit(pid: int, timeout: float = 5.0) -> bool:
+    """仅在确认进程退出后返回成功，超时或权限不足均返回失败。"""
     if os.name == "nt":
         try:
             import ctypes
@@ -850,14 +937,29 @@ def _wait_pid_exit(pid: int, timeout: float = 180.0) -> None:
             kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
             kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
             kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel32.CloseHandle.restype = ctypes.c_int
+            kernel32.GetLastError.restype = ctypes.c_uint32
             handle = kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
-            if handle:
-                kernel32.WaitForSingleObject(handle, int(timeout * 1000))
-                return
-        except Exception:  # noqa: BLE001 —— 句柄打不开视为已退出
-            return
-    else:
-        time.sleep(min(timeout, 5.0))
+            if not handle:
+                return kernel32.GetLastError() == 87
+            try:
+                return kernel32.WaitForSingleObject(handle, int(max(0.0, timeout) * 1000)) == 0
+            finally:
+                kernel32.CloseHandle(handle)
+        except (OSError, ValueError):
+            return False
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            return True
+        except (PermissionError, ValueError):
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
 
 
 def _handoff_pending_update() -> bool:
@@ -878,11 +980,24 @@ def _handoff_pending_update() -> bool:
     if not is_frozen():
         return False
 
+    checking = _health_checking_flag()
+    if checking.is_file():
+        try:
+            owner = int(json.loads(checking.read_text(encoding="utf-8"))["pid"])
+            if owner > 0 and not _wait_pid_exit(owner, timeout=0):
+                _log_update("更新仍在验收，本次启动保留暂存与原版本备份")
+                return False
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
+        if not _read_diagnosis().get("success"):
+            _mark_swap_failed(_app_root())
+        _clear_update_marker(checking)
+
     # 上次换装失败过：交接只会在旧进程退出后重演同一次失败，用户看到的是
     # 「点了更新、应用关掉、版本没变」。标记是安装状态，只在重新下载解出
     # 新暂存包时解除（见 app/core/updater.py）。
     if _swap_failed_flag().is_file():
-        _log_update("上次换装失败已回滚，跳过自动换装，按现装启动")
+        _log_update("上次更新未完成，暂停自动安装，按现装启动")
         return False
 
     staging = _data_dir() / STAGING_DIR_NAME
@@ -912,13 +1027,13 @@ def _handoff_pending_update() -> bool:
 
     ledger = _read_handoff_ledger()
     if ledger.get("tag") == tag and int(ledger.get("count", 0) or 0) >= 1:
-        _log_update("同一暂存包已交接过一次（此前换装失败回滚），终止自动换装并清理")
+        _log_update("同一暂存包已交接过一次（此前交接未完成），终止自动换装并清理")
         _remove_path(staging)
         _clear_handoff_ledger()
         threading.Thread(
             target=_alert,
             args=(
-                "[更新] 检测到上次更新未能完成安装（已回滚到原版本），本次启动已"
+                "[更新] 检测到上次更新未能完成安装，本次启动已"
                 "终止自动更新。\n\n可在应用内重新下载更新再试；"
                 f"详情见 {_update_log()}",
             ),
@@ -990,7 +1105,7 @@ def _restore_moved(moved: list[str], target: Path, old_dir: Path) -> tuple[bool,
         try:
             if dst.exists():
                 _remove_path(dst)
-            _replace_with_retry(src, dst, attempts=10, delay=0.5)
+            _replace_with_retry(src, dst, attempts=10, delay=0.5, target_root=target)
         except Exception as e:  # noqa: BLE001
             failed.append(name)
             _log_update(f"回滚 {name} 失败：{e}（原件仍在 {old_dir}，可手工移回）")
@@ -1017,21 +1132,12 @@ def _replace_with_retry(
             if i < attempts - 1:
                 if target_root and i % 3 == 0:
                     running = _pids_running_from(target_root)
-                    if running:
-                        for pid in running:
-                            try:
-                                res = subprocess.run(
-                                    ["taskkill", "/F", "/PID", str(pid)],
-                                    capture_output=True,
-                                    text=True,
-                                    timeout=5,
-                                )
-                                if res.returncode == 0:
-                                    _log_update(f"自愈清理：结束残留占用进程 PID {pid}")
-                                    if recovery_cb:
-                                        recovery_cb(f"killed_pid_{pid}")
-                            except Exception:
-                                pass
+                    remaining = _wait_target_idle(target_root, timeout_s=5.0, grace_s=0)
+                    if remaining:
+                        _log_update(f"改名重试时仍有程序进程未退出：{remaining}")
+                    if recovery_cb:
+                        for pid in set(running).difference(remaining):
+                            recovery_cb(f"killed_pid_{pid}")
                 time.sleep(delay)
     if last_err:
         raise last_err
@@ -1054,6 +1160,13 @@ def _swap_payload(staging: Path, target: Path, diag_ctx: dict | None = None) -> 
             diag_ctx["firstFailure"] = {"stage": "preflight", "error": err_msg}
         return False
 
+    reserved = sorted(entry.name for entry in payload.iterdir() if entry.name.casefold() in _UPDATE_KEEP)
+    if reserved:
+        if diag_ctx is not None:
+            diag_ctx["errorCode"] = "UPDATE-PAYLOAD-CORRUPT"
+            diag_ctx["errorMessage"] = f"更新包包含受保护的数据目录：{reserved}"
+        return False
+
     try:
         payload_bytes = sum(p.stat().st_size for p in payload.rglob("*") if p.is_file())
         target_usage = shutil.disk_usage(target)
@@ -1074,7 +1187,12 @@ def _swap_payload(staging: Path, target: Path, diag_ctx: dict | None = None) -> 
         _log_update(f"磁盘空间检查跳过（{e}）")
 
     if old_dir.exists():
-        shutil.rmtree(old_dir, ignore_errors=True)
+        if any(old_dir.iterdir()):
+            if diag_ctx is not None:
+                diag_ctx["errorCode"] = "UPDATE-FILE-LOCK"
+                diag_ctx["errorMessage"] = "原版本备份尚未处理，本次保留原件并停止安装"
+            return False
+        old_dir.rmdir()
         if old_dir.exists():
             err_msg = "残留 __old__ 清理失败，放弃本次换装"
             _log_update(err_msg)
@@ -1096,7 +1214,7 @@ def _swap_payload(staging: Path, target: Path, diag_ctx: dict | None = None) -> 
     moved: list[str] = []
     try:
         for entry in target.iterdir():
-            if entry.name in _UPDATE_KEEP or entry == old_dir:
+            if entry.name.casefold() in _UPDATE_KEEP or entry == old_dir:
                 continue
             _replace_with_retry(
                 entry,
@@ -1191,7 +1309,7 @@ def _swap_payload(staging: Path, target: Path, diag_ctx: dict | None = None) -> 
             }
         return False
 
-    (staging / _MANIFEST_NAME).unlink(missing_ok=True)
+    _clear_update_marker(staging / _MANIFEST_NAME)
     _log_update(f"换装完成：{got} 个文件落位，上一版在 {old_dir}")
     return True
 
@@ -1213,292 +1331,271 @@ def _check_proc_exit(proc: Any, timeout: float = 0.1) -> int | None:
     return None
 
 
+def _update_health_ports(proc: Any) -> list[tuple[int, int | None]]:
+    target = getattr(proc, "_update_target", None)
+    if target is None:
+        return [(SERVER_PORT, None)]
+    pids = set(_pids_running_from(target, root_pid=proc.pid))
+    if not pids:
+        return []
+    result = subprocess.run(
+        ["netstat", "-ano", "-p", "tcp"], capture_output=True, text=True,
+        errors="replace", timeout=5,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if result.returncode != 0:
+        raise OSError("无法查询更新程序的监听端口")
+    ports = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) == 5 and fields[0] == "TCP" and fields[3] == "LISTENING":
+            if int(fields[4]) in pids:
+                ports.append((int(fields[1].rsplit(":", 1)[1]), int(fields[4])))
+    return list(dict.fromkeys(ports))
+
+
 def _verify_new_version_health(
     target_version: str | None,
     proc: Any,
-    timeout: float = 25.0,
+    timeout: float = HEALTH_TIMEOUT,
 ) -> tuple[bool, str, dict | None]:
-    """轮询新进程健康端点，验证新版本是否正常就绪。"""
+    """按本次启动身份与实际监听端口确认程序就绪。"""
     if proc is None:
-        return True, "已拉起（测试桩模式）", None
-
+        return False, "未取得启动进程", None
     deadline = time.monotonic() + timeout
-    port = int(os.environ.get(f"{ENV_PREFIX}PORT", str(SERVER_PORT)))
-    url = f"http://{SERVER_HOST}:{port}/api/v1/health"
+    expected_attempt = getattr(proc, "_update_attempt_id", None)
+    legacy = getattr(proc, "_update_legacy_health", False)
     while time.monotonic() < deadline:
-        exit_code = _check_proc_exit(proc, timeout=0.2)
-        if exit_code is not None and exit_code != 0:
-            return False, f"新程序异常退出（退出码 {exit_code}）", None
-
+        exit_code = _check_proc_exit(proc, timeout=0.02)
+        if exit_code is not None:
+            return False, f"程序已退出（退出码 {exit_code}）", None
         try:
-            resp = httpx.get(url, timeout=1.5, trust_env=False)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("app") == APP_NAME:
-                    ver = data.get("version")
-                    if not target_version or ver == target_version or ver.startswith(str(target_version).lstrip("v")):
-                        return True, "健康检查通过", data
-                    _log_update(f"健康检查版本不匹配：期望 {target_version}，实得 {ver}")
-                else:
-                    _log_update(f"健康检查身份不匹配：app={data.get('app')}")
-            else:
-                _log_update(f"健康检查非 200：{resp.status_code}")
-        except Exception as e:
-            _log_update(f"健康检查请求异常：{type(e).__name__}: {e}")
-        time.sleep(0.5)
+            for port, owner_pid in _update_health_ports(proc):
+                url = f"http://{SERVER_HOST}:{port}/api/v1/health"
+                response = httpx.get(
+                    url, timeout=min(1.0, max(0.01, deadline - time.monotonic())),
+                    trust_env=False, verify=False,
+                )
+                if response.status_code != 200:
+                    continue
+                data = response.json()
+                if data.get("app") != APP_NAME:
+                    continue
+                if target_version and str(data.get("version", "")).removeprefix("v") != str(target_version).removeprefix("v"):
+                    continue
+                if not legacy and data.get("updateAttemptId") != expected_attempt:
+                    continue
+                if owner_pid is not None and data.get("pid", owner_pid) != owner_pid:
+                    continue
+                data["healthUrl"] = url
+                return True, "健康检查通过", data
+        except Exception as exc:
+            _log_update(f"等待程序就绪：{exc}")
+        time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+    return False, f"等待程序健康检查超时（{timeout:.0f}s）", None
 
-    exit_code = _check_proc_exit(proc, timeout=0.1)
-    if exit_code is not None and exit_code != 0:
-        return False, f"新程序异常退出（退出码 {exit_code}）", None
-    return False, f"等待新程序健康检查超时（{timeout:.0f}s）", None
 
-
-def _relaunch_and_verify_old_version(target: Path, timeout: float = 2.0) -> bool:
-    """回滚后拉起现装并验证恢复健康。"""
+def _relaunch_and_verify_old_version(target: Path, timeout: float = HEALTH_TIMEOUT) -> bool:
+    """恢复旧版并确认其实际服务就绪。"""
     exe = _staged_main_exe(target)
     if exe is None:
-        _log_update("回滚后未在程序目录找到主程序，无法自动拉起")
+        _log_update("原版本主程序缺失，无法自动启动")
         return False
     try:
         proc = subprocess.Popen(
-            [str(exe)],
-            cwd=str(target),
-            close_fds=True,
+            [str(exe)], cwd=str(target), close_fds=True,
             creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
         )
-        _log_update(f"回滚完成，已拉起现装 {exe.name}")
-    except Exception as e:
-        _log_update(f"拉起现装失败：{e}（程序目录已回滚，可手动启动）")
+        proc._update_target = target
+        proc._update_legacy_health = True
+        healthy, reason, _ = _verify_new_version_health(None, proc, timeout=timeout)
+        _log_update(f"原版本恢复验收：{reason}")
+        return healthy
+    except Exception as exc:
+        _log_update(f"原版本未能恢复启动：{exc}")
         return False
 
-    if proc is None:
-        return True
 
-    deadline = time.monotonic() + timeout
-    port = int(os.environ.get(f"{ENV_PREFIX}PORT", str(SERVER_PORT)))
-    url = f"http://{SERVER_HOST}:{port}/api/v1/health"
-    while time.monotonic() < deadline:
+def _finish_failed_update(
+    staging: Path, target: Path, diagnosis: dict,
+    *, restore_files: bool = False, proc: Any = None,
+) -> None:
+    """保留恢复材料，确认退出后恢复旧版并记录实际结果。"""
+    if "restoration" in diagnosis:
+        return
+    diagnosis["stage"] = "recovering"
+    _mark_swap_failed(target)
+    try:
+        (staging / _MANIFEST_NAME).unlink(missing_ok=True)
+    except OSError as exc:
+        _log_update(f"作废更新清单失败：{exc}")
+    old_dir = target / "__old__"
+    if restore_files:
+        completed = False
+        failed_files: list[str] = []
         try:
-            resp = httpx.get(url, timeout=1.0, trust_env=False)
-            if resp.status_code == 200 and resp.json().get("app") == APP_NAME:
-                _log_update("原版本健康验证通过，服务已恢复")
-                return True
-        except Exception:
-            pass
-        time.sleep(0.5)
-    _log_update("原版本已拉起，等待健康检查超时（应用启动中）")
-    return False
+            if _SWAP_MUTEX_HANDLE is None and not _acquire_swap_mutex():
+                raise OSError("另一更新进程正在使用程序目录")
+            remaining = _wait_target_idle(
+                target, timeout_s=15.0, root_pid=getattr(proc, "pid", None), grace_s=0.0,
+            )
+            if remaining:
+                diagnosis["remainingPids"] = remaining
+                raise OSError(f"新程序尚未退出：{remaining}")
+            if not old_dir.is_dir() or not any(old_dir.iterdir()):
+                raise OSError("未找到原版本备份")
+            for entry in target.iterdir():
+                if entry.name.casefold() not in _UPDATE_KEEP and entry != old_dir:
+                    _remove_path(entry)
+            completed, failed_files = _restore_moved(os.listdir(old_dir), target, old_dir)
+        except Exception as exc:
+            _log_update(f"恢复原版本未完成：{exc}")
+            diagnosis["recoveryError"] = str(exc)
+        diagnosis["rollback"] = {
+            "attempted": True, "completed": completed, "failedFiles": failed_files,
+        }
+    rollback = diagnosis.get("rollback", {})
+    files_ready = not rollback.get("attempted") or rollback.get("completed", False)
+    _release_swap_mutex()
+    try:
+        healthy = bool(files_ready and _relaunch_and_verify_old_version(target))
+    except Exception as exc:
+        healthy = False
+        diagnosis["recoveryError"] = str(exc)
+    diagnosis["restoration"] = {"attempted": bool(files_ready), "healthy": healthy}
+    diagnosis.update(stage="failed", success=False, endTime=time.time())
+    _write_diagnosis(diagnosis)
+    _clear_update_marker(_health_checking_flag())
+    if not files_ready:
+        result = f"部分原文件未恢复：{rollback.get('failedFiles', [])}。\n原件保留在 {old_dir}，请勿删除。"
+    elif healthy:
+        result = "原版本已恢复并重新打开应用。"
+    else:
+        result = "原版本文件已保留，但未确认启动成功，请手动打开原程序。"
+    try:
+        _alert(
+            f"[更新] 本次更新未完成（{diagnosis.get('errorCode') or 'UPDATE-SWAP-FAIL'}）。\n\n"
+            f"{result}\n原因：{diagnosis.get('errorMessage') or '文件搬运失败'}\n"
+            f"详情见 {_update_diagnosis_file()}"
+        )
+    except Exception as exc:
+        _log_update(f"更新结果提示未能显示：{exc}")
+
+
+def _clear_update_marker(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        _log_update(f"更新标记暂未清理：{exc}")
 
 
 def _run_update_helper(
-    staging: Path,
-    target: Path,
-    wait_pid: int | None,
-    attempt_id: str | None = None,
+    staging: Path, target: Path, wait_pid: int | None, attempt_id: str | None = None,
 ) -> None:
-    """换装进程入口（由暂存包的新 exe 以 --apply-update 拉起）。"""
+    """交接的暂存位置决定本轮更新唯一的数据目录。"""
+    staging, target = staging.resolve(), target.resolve()
+    key = f"{ENV_PREFIX}DATA_DIR"
+    previous = os.environ.get(key)
+    previous_cwd = Path.cwd()
+    os.environ[key] = str(staging.resolve().parent)
+    try:
+        os.chdir(staging.parent)
+        _apply_staged_update(staging, target, wait_pid, attempt_id)
+    finally:
+        try:
+            os.chdir(previous_cwd)
+        except OSError:
+            pass
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
+
+
+def _apply_staged_update(
+    staging: Path, target: Path, wait_pid: int | None, attempt_id: str | None = None,
+) -> None:
+    """在进程退出后换装，验收失败则恢复原版本。"""
     _log_update(f"换装进程启动：staging={staging} target={target} wait_pid={wait_pid}")
     if not _acquire_swap_mutex():
-        _log_update("已有换装进程在跑，本进程退出")
+        _log_update("已有换装进程在运行")
         return
-
-    diag_ctx = _init_diagnosis(staging, target, attempt_id)
-    _write_diagnosis(diag_ctx)
-
-    if wait_pid:
-        _wait_pid_exit(int(wait_pid))
-    time.sleep(1.5)
-
-    remaining_pids = _wait_target_idle(target)
-    if remaining_pids:
-        err_msg = f"程序目录存在未退出的残留进程 PID: {remaining_pids}"
-        _log_update(err_msg)
-        diag_ctx["stage"] = "preflight"
-        diag_ctx["errorCode"] = "UPDATE-FILE-LOCK"
-        diag_ctx["errorMessage"] = err_msg
-        diag_ctx["endTime"] = time.time()
-        _write_diagnosis(diag_ctx)
-        (staging / _MANIFEST_NAME).unlink(missing_ok=True)
-        _release_swap_mutex()
-        _relaunch_and_verify_old_version(target)
-        threading.Thread(
-            target=_alert,
-            args=(
-                f"[更新] 换装未能完成（错误码: UPDATE-FILE-LOCK）。\n\n"
-                f"程序目录有正在运行的进程未能退出：{remaining_pids}。\n"
-                "本次更新已取消，原版本已重新打开。\n"
-                f"详情见 {_update_diagnosis_file()}",
-            ),
-            daemon=True,
-        ).start()
-        return
-
+    diagnosis = _init_diagnosis(staging, target, attempt_id)
+    _write_diagnosis(diagnosis)
+    swapped = False
+    proc = None
     try:
-        swap_ok = _swap_payload(staging, target, diag_ctx=diag_ctx)
-    except TypeError:
-        swap_ok = _swap_payload(staging, target)
-
-    if not swap_ok:
-        _mark_swap_failed(target)
-        (staging / _MANIFEST_NAME).unlink(missing_ok=True)
-        _release_swap_mutex()
-        diag_ctx["stage"] = "failed"
-        diag_ctx["success"] = False
-        diag_ctx["endTime"] = time.time()
-        _write_diagnosis(diag_ctx)
-
-        _relaunch_and_verify_old_version(target)
-
-        err_code = diag_ctx.get("errorCode") or "UPDATE-SWAP-FAIL"
-        err_msg = diag_ctx.get("errorMessage") or "文件搬运失败"
-        rb = diag_ctx.get("rollback") or {}
-        if rb.get("completed", True):
-            alert_text = (
-                f"[更新] 换装未能完成（错误码: {err_code}），已安全回滚到原版本并重新打开应用。\n\n"
-                f"原因：{err_msg}\n"
-                "本次暂存包已作废（下次启动会清理掉）；\n"
-                f"详情见 {_update_diagnosis_file()}"
-            )
-        else:
-            failed_list = rb.get("failedFiles", [])
-            alert_text = (
-                f"[更新] 换装失败且回滚未完全恢复（错误码: {err_code}）。\n\n"
-                f"部分原文件未恢复：{failed_list}\n"
-                f"原件仍在 {target / '__old__'}，可手工移回。\n"
-                f"详情见 {_update_diagnosis_file()}"
-            )
-
-        threading.Thread(
-            target=_alert,
-            args=(alert_text,),
-            daemon=True,
-        ).start()
-        return
-
-    _clear_handoff_ledger()
-    _swap_failed_flag().unlink(missing_ok=True)
-    _release_swap_mutex()
-    new_exe = _staged_main_exe(target)
-    if new_exe is None:
-        _log_update("新程序已就位，但未找到主程序，请手动启动")
-        diag_ctx["stage"] = "failed"
-        diag_ctx["errorCode"] = "UPDATE-LAUNCH-FAIL"
-        diag_ctx["errorMessage"] = "未在程序目录找到主程序"
-        diag_ctx["endTime"] = time.time()
-        _write_diagnosis(diag_ctx)
-        return
-
-    try:
-        proc = subprocess.Popen(
-            [str(new_exe)],
-            cwd=str(target),
-            close_fds=True,
-            creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
+        if wait_pid:
+            _wait_pid_exit(int(wait_pid), timeout=5.0)
+        previous = os.environ.get(f"{ENV_PREFIX}PREV_PID", "")
+        owner_pid = int(previous) if previous.isdigit() else wait_pid
+        remaining = (
+            _wait_target_idle(target, root_pid=owner_pid)
+            if owner_pid else _wait_target_idle(target)
         )
-    except Exception as e:  # noqa: BLE001
-        _log_update(f"拉起新版本失败：{e}（新程序已就位，可手动启动）")
-        diag_ctx["stage"] = "failed"
-        diag_ctx["errorCode"] = "UPDATE-LAUNCH-FAIL"
-        diag_ctx["errorMessage"] = f"拉起新版本失败：{e}"
-        diag_ctx["endTime"] = time.time()
-        _write_diagnosis(diag_ctx)
-        return
-
-    diag_ctx["stage"] = "health_check"
-    diag_ctx["healthCheck"]["url"] = f"http://{SERVER_HOST}:{SERVER_PORT}/api/v1/health"
-    try:
-        _health_checking_flag().write_text("1", encoding="utf-8")
-    except Exception:
-        pass
-
-    healthy, health_reason, health_data = _verify_new_version_health(
-        diag_ctx.get("targetVersion"), proc, timeout=25.0
-    )
-    _health_checking_flag().unlink(missing_ok=True)
-    if not healthy:
-        _log_update(f"新版本健康验收失败：{health_reason}，执行自动回滚")
-        diag_ctx["stage"] = "failed"
-        diag_ctx["errorCode"] = (
-            "UPDATE-LAUNCH-FAIL"
-            if "退出码" in health_reason
-            else "UPDATE-HEALTH-TIMEOUT"
+        if remaining:
+            diagnosis["errorCode"] = "UPDATE-FILE-LOCK"
+            diagnosis["remainingPids"] = remaining
+            raise OSError(f"程序尚未退出：{remaining}")
+        _health_checking_flag().write_text(
+            json.dumps({"pid": os.getpid(), "attemptId": diagnosis["attemptId"]}),
+            encoding="utf-8",
         )
-        diag_ctx["errorMessage"] = health_reason
-        diag_ctx["healthCheck"] = {
-            "status": "failed",
-            "url": f"http://{SERVER_HOST}:{SERVER_PORT}/api/v1/health",
-            "error": health_reason,
-        }
-
+        swapped = _swap_payload(staging, target, diag_ctx=diagnosis)
+        if not swapped:
+            _finish_failed_update(staging, target, diagnosis)
+            return
+        new_exe = _staged_main_exe(target)
+        if new_exe is None:
+            diagnosis["errorCode"] = "UPDATE-LAUNCH-FAIL"
+            raise FileNotFoundError("新版本主程序缺失")
+        child_env = dict(os.environ)
+        child_env[f"{ENV_PREFIX}UPDATE_ATTEMPT_ID"] = diagnosis["attemptId"]
+        child_env.pop(f"{ENV_PREFIX}UPDATE_RESTART", None)
+        child_env.pop(f"{ENV_PREFIX}PREV_PID", None)
+        _release_swap_mutex()
         try:
-            if hasattr(proc, "terminate"):
-                proc.terminate()
-            if hasattr(proc, "wait"):
-                proc.wait(timeout=2.0)
+            proc = subprocess.Popen(
+                [str(new_exe)], cwd=str(target), env=child_env, close_fds=True,
+                creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
+            )
+            if proc is not None:
+                proc._update_target = target
+                proc._update_attempt_id = diagnosis["attemptId"]
         except Exception:
-            try:
-                if hasattr(proc, "kill"):
-                    proc.kill()
-            except Exception:
-                pass
-
-        old_dir = target / "__old__"
-        rollback_completed = False
-        failed_files: list[str] = []
-        if old_dir.is_dir():
-            for entry in target.iterdir():
-                if entry.name not in _UPDATE_KEEP and entry != old_dir:
-                    _remove_path(entry)
-            rollback_completed, failed_files = _restore_moved(
-                os.listdir(old_dir), target, old_dir
-            )
-
-        diag_ctx["rollback"] = {
-            "attempted": True,
-            "completed": rollback_completed,
-            "failedFiles": failed_files,
+            diagnosis["errorCode"] = "UPDATE-LAUNCH-FAIL"
+            raise
+        diagnosis["stage"] = "health_check"
+        healthy, reason, data = _verify_new_version_health(
+            diagnosis.get("targetVersion"), proc, timeout=HEALTH_TIMEOUT,
+        )
+        diagnosis["healthCheck"] = {
+            "status": "passed" if healthy else "failed",
+            "url": (data or {}).get("healthUrl"), "response": data,
+            "error": None if healthy else reason,
         }
-        diag_ctx["endTime"] = time.time()
-        _write_diagnosis(diag_ctx)
-
-        _mark_swap_failed(target)
-        _relaunch_and_verify_old_version(target)
-
-        err_code = diag_ctx["errorCode"]
-        if rollback_completed:
-            alert_msg = (
-                f"[更新] 新版本启动验收未通过（{err_code}），已自动回滚到原版本。\n\n"
-                f"原因：{health_reason}\n"
-                "本次更新已作废，不会自动重试；\n"
-                f"诊断记录保存在：{_update_diagnosis_file()}"
-            )
-        else:
-            alert_msg = (
-                f"[更新] 新版本启动验收失败且回滚未完全恢复（{err_code}）。\n\n"
-                f"部分旧版文件被占用无法移回：{failed_files}\n"
-                f"原文件完整保存在 {old_dir}，可手动移回覆盖。\n"
-                f"诊断记录保存在：{_update_diagnosis_file()}"
-            )
-
-        threading.Thread(
-            target=_alert,
-            args=(alert_msg,),
-            daemon=True,
-        ).start()
-        return
-
-    _log_update(f"新版本已拉起并通过健康验收（{health_reason}）")
-    diag_ctx["stage"] = "completed"
-    diag_ctx["success"] = True
-    diag_ctx["endTime"] = time.time()
-    diag_ctx["healthCheck"] = {
-        "status": "passed",
-        "url": f"http://{SERVER_HOST}:{SERVER_PORT}/api/v1/health",
-        "response": health_data,
-        "error": None,
-    }
-    _write_diagnosis(diag_ctx)
-    _cleanup_old_dir_async(target / "__old__")
+        if not healthy:
+            diagnosis["errorCode"] = "UPDATE-LAUNCH-FAIL" if "退出码" in reason else "UPDATE-HEALTH-TIMEOUT"
+            diagnosis["errorMessage"] = reason
+            _finish_failed_update(staging, target, diagnosis, restore_files=True, proc=proc)
+            return
+        _clear_handoff_ledger()
+        _clear_update_marker(_swap_failed_flag())
+        _clear_update_marker(_health_checking_flag())
+        diagnosis.update(stage="completed", success=True, endTime=time.time())
+        _write_diagnosis(diagnosis)
+        _log_update(f"新版本已拉起并通过健康验收（{reason}）")
+        _cleanup_old_dir_async(target / "__old__")
+    except Exception as exc:
+        if diagnosis.get("stage") in {"recovering", "failed"}:
+            diagnosis["recoveryError"] = str(exc)
+            _write_diagnosis(diagnosis)
+            return
+        diagnosis["errorCode"] = diagnosis.get("errorCode") or _classify_error(exc)[0]
+        diagnosis["errorMessage"] = str(exc)
+        _finish_failed_update(staging, target, diagnosis, restore_files=swapped, proc=proc)
+    finally:
+        _release_swap_mutex()
 
 
 def _mark_swap_failed(target: Path) -> None:
@@ -1509,7 +1606,7 @@ def _mark_swap_failed(target: Path) -> None:
     """
     try:
         _swap_failed_flag().write_text(
-            f"换装失败已回滚 target={target}\n", encoding="utf-8"
+            f"更新未完成 target={target}\n", encoding="utf-8"
         )
     except Exception as e:  # noqa: BLE001 —— 标记写不进去不阻断回滚后的正常启动
         _log_update(f"写换装失败标记失败：{e}")
@@ -1568,6 +1665,8 @@ def _cleanup_staging_leftover() -> None:
     """
 
     staging = _data_dir() / STAGING_DIR_NAME
+    if _health_checking_flag().is_file():
+        return
     if not staging.is_dir():
         return
     if (staging / _MANIFEST_NAME).is_file() and not _swap_failed_flag().is_file():

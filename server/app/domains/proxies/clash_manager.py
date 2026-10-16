@@ -1499,11 +1499,15 @@ class ClashRuntime:
 
     def stop(self) -> dict:
         if self.process is not None and self.process.poll() is None:
-            self.process.terminate()
             try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=5)
+            except ProcessLookupError:
+                pass
             log_event(logger, "Clash 内核已停止")
         self.process = None
         self.controller_url = None
