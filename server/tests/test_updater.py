@@ -522,3 +522,38 @@ async def test_update_url_custom_override(monkeypatch) -> None:
     assert plan[0]["proxy"] is None
 
 
+def test_truncate_to_never_null_pads(tmp_path: Path) -> None:
+    """_truncate_to 当文件小于期望大小时绝不能截断放大补零。"""
+    p = tmp_path / "test.part"
+    p.write_bytes(b"12345")
+    updater._truncate_to(p, 10)
+    # 小于 10 字节时不能补零到 10 字节，应该直接清理
+    assert not p.exists() or p.stat().st_size <= 5
+
+
+@pytest.mark.asyncio
+async def test_stream_to_file_preserves_partial_on_200_failure(tmp_path: Path, monkeypatch) -> None:
+    """若服务端不认 Range 返回 200 且下载中断，已有的续传文件不应被抹除或补零破坏。"""
+    part = tmp_path / "test.part"
+    part.write_bytes(b"initial-valid-bytes")
+    initial_size = part.stat().st_size
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        class AsyncStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b"small"
+                raise RuntimeError("stream broke")
+
+        return httpx.Response(200, stream=AsyncStream())
+
+    monkeypatch.setattr(updater.httpx, "AsyncClient", _mock_client(handler))
+    with pytest.raises(RuntimeError, match="stream broke"):
+        await updater._stream_to_file("https://mirror/file.zip", None, part, expected_total=100)
+
+    # 初始的续传文件依然完好，没有被 200 的失败下载覆盖或冲掉
+    assert part.is_file()
+    assert part.read_bytes() == b"initial-valid-bytes"
+    assert not (tmp_path / "test.part.full").exists()
+
+
+

@@ -644,8 +644,15 @@ def _truncate_to(path: Path, size: int) -> None:
     响应会拼成一个永远校验不过的缝合怪。
     """
     try:
-        with path.open("r+b") as fh:
-            fh.truncate(size)
+        if not path.is_file():
+            return
+        current = path.stat().st_size
+        if current > size:
+            with path.open("r+b") as fh:
+                fh.truncate(size)
+        elif current < size:
+            # 文件小于基线（如重头下载中断），禁止 truncate 补零膨胀
+            path.unlink(missing_ok=True)
     except Exception:  # noqa: BLE001 —— 截不动就整个删掉，宁可重下
         path.unlink(missing_ok=True)
 
@@ -681,7 +688,8 @@ async def _stream_to_file(
     外部调用方（如 seed_fetch）传入各自私有字典，避免并发下载污染彼此进度。
 
     - **续传**：带上已有字节数发 `Range: bytes=N-`；服务端回 200（不认 Range）
-      才从头下——不清零会把新流追加到旧文件后面，拼出一个校验必挂的坏包。
+      先下载到副产物文件，全包完整后再原子替换——避免中途失败抹掉已有续传进度，
+      更避免向后回滚导致 truncate 补零膨胀成坏包。
     - **停滞闸**：任一字节到达间隔超过 _STALL_TIMEOUT 即判死（长读超时意味着
       「连上了但不吐数据」的半死通道能让进度条干等近一分钟）。
     - **速率闸**：试跑 _TRIAL_SECONDS 后平均速率低于下限判「过慢」——只靠停滞
@@ -697,6 +705,7 @@ async def _stream_to_file(
         async with client.stream("GET", url, headers=headers) as resp:
             if resp.status_code not in (200, 206):
                 resp.raise_for_status()
+            use_sidecar = bool(resumed and resp.status_code == 200)
             if resp.status_code == 200:
                 resumed = 0  # 服务端不认 Range：必须从头下
             total = _total_from_headers(resp.headers, resp.status_code) or expected_total
@@ -706,43 +715,50 @@ async def _stream_to_file(
             started = time.monotonic()
             window_at = started
             window_bytes = 0
-            with dest.open("ab" if received else "wb") as f:
-                chunks = resp.aiter_bytes(1 << 20)
-                while True:
-                    if _CANCEL["flag"]:
-                        raise _Cancelled("已取消下载")
-                    try:
-                        chunk = await asyncio.wait_for(
-                            chunks.__anext__(), timeout=_STALL_TIMEOUT
-                        )
-                    except StopAsyncIteration:  # noqa: PERF203 —— 流结束的正常出口
-                        break
-                    except asyncio.TimeoutError as e:
-                        raise RuntimeError(
-                            f"通道停滞（{_STALL_TIMEOUT:.0f}s 无数据），换下一通道"
-                        ) from e
-                    f.write(chunk)
-                    received += len(chunk)
-                    window_bytes += len(chunk)
-                    now = time.monotonic()
-                    if now - window_at >= 1.0:
-                        prog.update({
-                            "speed": int(window_bytes / (now - window_at)),
-                        })
-                        window_at, window_bytes = now, 0
-                    prog.update({
-                        "received": received,
-                        "percent": round(received * 100 / total) if total else None,
-                    })
-                    if min_rate_bps:
-                        elapsed = now - started
-                        if elapsed >= _TRIAL_SECONDS and (
-                            (received - resumed) / elapsed < min_rate_bps
-                        ):
-                            raise RuntimeError(
-                                f"通道过慢（{(received - resumed) / elapsed / 1024:.0f} KB/s < "
-                                f"{min_rate_bps / 1024:.0f} KB/s），换下一通道"
+            target_path = dest.with_name(dest.name + ".full") if use_sidecar else dest
+            try:
+                with target_path.open("wb" if use_sidecar or not received else "ab") as f:
+                    chunks = resp.aiter_bytes(1 << 20)
+                    while True:
+                        if _CANCEL["flag"]:
+                            raise _Cancelled("已取消下载")
+                        try:
+                            chunk = await asyncio.wait_for(
+                                chunks.__anext__(), timeout=_STALL_TIMEOUT
                             )
+                        except StopAsyncIteration:  # noqa: PERF203 —— 流结束的正常出口
+                            break
+                        except asyncio.TimeoutError as e:
+                            raise RuntimeError(
+                                f"通道停滞（{_STALL_TIMEOUT:.0f}s 无数据），换下一通道"
+                            ) from e
+                        f.write(chunk)
+                        received += len(chunk)
+                        window_bytes += len(chunk)
+                        now = time.monotonic()
+                        if now - window_at >= 1.0:
+                            prog.update({
+                                "speed": int(window_bytes / (now - window_at)),
+                            })
+                            window_at, window_bytes = now, 0
+                        prog.update({
+                            "received": received,
+                            "percent": round(received * 100 / total) if total else None,
+                        })
+                        if min_rate_bps:
+                            elapsed = now - started
+                            if elapsed >= _TRIAL_SECONDS and (
+                                (received - resumed) / elapsed < min_rate_bps
+                            ):
+                                raise RuntimeError(
+                                    f"通道过慢（{(received - resumed) / elapsed / 1024:.0f} KB/s < "
+                                    f"{min_rate_bps / 1024:.0f} KB/s），换下一通道"
+                                )
+                if use_sidecar:
+                    target_path.replace(dest)
+            finally:
+                if use_sidecar and target_path.is_file():
+                    target_path.unlink(missing_ok=True)
 
 
 def cancel_download() -> dict:
