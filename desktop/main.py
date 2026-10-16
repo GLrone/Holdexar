@@ -67,7 +67,13 @@ from app.core.app_info import (  # noqa: E402
     version_from_tag,
     version_gt,
 )
-from app.core.paths import data_dir_filename, is_frozen, resolve_data_dir  # noqa: E402
+from app.core.paths import (  # noqa: E402
+    PORTABLE_FLAG,
+    data_dir_filename,
+    is_frozen,
+    is_inside,
+    resolve_data_dir,
+)
 from app.core.optional_deps import install_optional_dep_resolver  # noqa: E402
 
 # 打包态剔除的可选依赖若被真实路径用到，从这里起可按需补装（见 optional_deps）
@@ -429,6 +435,7 @@ _UPDATE_KEEP = {
     "logs",          # 兼容旧目录名
     "__old__",       # 上一版程序备份（换装时刚移入的）
     STAGING_DIR_NAME,  # 暂存目录自身
+    PORTABLE_FLAG,   # 便携模式声明（丢失会改变数据目录解析）
 }
 
 # 换装助手入口标记：暂存包的新 exe 报出这个长选项才允许自动换装（见探测函数）
@@ -1075,6 +1082,7 @@ def _handoff_pending_update() -> bool:
                 "--target", str(_app_root()),
                 "--wait-pid", str(os.getpid()),
                 "--attempt-id", attempt_id,
+                "--data-dir", str(_data_dir()),
             ],
             cwd=str(staged_exe.parent),
             close_fds=True,
@@ -1251,7 +1259,15 @@ def _swap_payload(staging: Path, target: Path, diag_ctx: dict | None = None) -> 
     landed: list[str] = []
     try:
         for entry in payload.iterdir():
+            name_cf = entry.name.casefold()
+            if name_cf in _UPDATE_KEEP:
+                _log_update(f"载荷包含受保护名称 {entry.name}，跳过")
+                continue
             dst = target / entry.name
+            dst_resolved = dst.resolve()
+            if not is_inside(dst_resolved, target) and dst_resolved != target:
+                _log_update(f"载荷条目 {entry.name} 解析到目标目录外，跳过")
+                continue
             if entry.is_dir():
                 if dst.exists():
                     _remove_path(dst)
@@ -1490,16 +1506,33 @@ def _clear_update_marker(path: Path) -> None:
 
 
 def _run_update_helper(
-    staging: Path, target: Path, wait_pid: int | None, attempt_id: str | None = None,
+    staging: Path, target: Path, wait_pid: int | None,
+    attempt_id: str | None = None, data_dir: Path | None = None,
 ) -> None:
-    """交接的暂存位置决定本轮更新唯一的数据目录。"""
+    """固定数据目录到安装目标侧，换装日志与诊断写入用户可保留的位置。
+
+    data_dir 优先级：显式传入 > 从 target 推导（便携标记 / 已有库 / 同盘 data）。
+    旧版本交接不传 --data-dir 时走推导，保证向后兼容。
+    """
     staging, target = staging.resolve(), target.resolve()
+    if data_dir is None:
+        # 从安装目标推导：便携模式 / 已有数据库 → target/data；否则同盘 data
+        if (target / PORTABLE_FLAG).is_file() or (
+            target / "data" / data_dir_filename()
+        ).is_file():
+            data_dir = target / "data"
+        else:
+            data_dir = target / "data"
+    data_dir = data_dir.resolve()
+    # 安全校验：数据目录不得位于暂存树内（暂存树会被清理）
+    if is_inside(data_dir, staging):
+        data_dir = target / "data"
     key = f"{ENV_PREFIX}DATA_DIR"
     previous = os.environ.get(key)
     previous_cwd = Path.cwd()
-    os.environ[key] = str(staging.resolve().parent)
+    os.environ[key] = str(data_dir)
     try:
-        os.chdir(staging.parent)
+        os.chdir(target)
         _apply_staged_update(staging, target, wait_pid, attempt_id)
     finally:
         try:
@@ -2656,6 +2689,7 @@ def main() -> None:
     parser.add_argument("--target", help=argparse.SUPPRESS)
     parser.add_argument("--wait-pid", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--attempt-id", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--data-dir", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     # 换装进程优先分流：不挂孤儿防线、不协商端口、不起服务与窗口——只做换装
@@ -2668,6 +2702,7 @@ def main() -> None:
             Path(args.target),
             args.wait_pid,
             attempt_id=getattr(args, "attempt_id", None),
+            data_dir=Path(args.data_dir) if args.data_dir else None,
         )
         return
 

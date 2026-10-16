@@ -990,15 +990,31 @@ def test_helper_reaps_children_of_previous_instance(tmp_path, monkeypatch):
     assert roots[0] == 12345
 
 
-def test_helper_uses_staging_parent_as_data_directory(tmp_path, monkeypatch):
+def test_helper_resolves_data_dir_from_target(tmp_path, monkeypatch):
     data, staging, target, events = _prepare_failed_helper_case(tmp_path, monkeypatch)
     wrong = tmp_path / "wrong-home"
     monkeypatch.setenv(f"{desktop.ENV_PREFIX}DATA_DIR", str(wrong))
     monkeypatch.setattr(desktop, "_data_dir", lambda: Path(os.environ[f"{desktop.ENV_PREFIX}DATA_DIR"]))
     desktop._run_update_helper(staging, target, None)
-    assert (data / "logs" / "update-diagnosis.json").is_file()
+    # 诊断写入安装目标的 data 目录而非暂存目录的父级
+    target_data = target / "data"
+    assert (target_data / "logs" / "update-diagnosis.json").is_file()
     assert not (wrong / "logs" / "update-diagnosis.json").exists()
+    # 环境变量在调用后必须恢复
     assert os.environ[f"{desktop.ENV_PREFIX}DATA_DIR"] == str(wrong)
+
+
+def test_helper_uses_explicit_data_dir_argument(tmp_path, monkeypatch):
+    data, staging, target, events = _prepare_failed_helper_case(tmp_path, monkeypatch)
+    explicit = tmp_path / "custom-data"
+    # 让 _data_dir 读环境变量（匹配真实行为）
+    monkeypatch.setattr(
+        desktop, "_data_dir",
+        lambda: Path(os.environ.get(f"{desktop.ENV_PREFIX}DATA_DIR", str(data))),
+    )
+    desktop._run_update_helper(staging, target, None, data_dir=explicit)
+    assert (explicit / "logs" / "update-diagnosis.json").is_file()
+    assert not (target / "data" / "logs" / "update-diagnosis.json").exists()
 
 
 @pytest.mark.parametrize("reserved_name", ["data", "Data", "LOGS", "__OLD__"])
@@ -1011,6 +1027,15 @@ def test_payload_cannot_replace_user_data(tmp_path, reserved_name):
     assert desktop._swap_payload(staging, target) is False
     assert (target / "data" / "holdexar.db").read_bytes() == b"user-data"
     assert (target / EXE_NAME).read_bytes() == b"old-exe"
+
+
+def test_portable_flag_survives_swap(tmp_path):
+    target = _make_install(tmp_path / "install")
+    (target / "portable.flag").write_text("", encoding="utf-8")
+    staging = tmp_path / "staging"
+    _make_payload(staging)
+    assert desktop._swap_payload(staging, target) is True
+    assert (target / "portable.flag").is_file()
 
 
 def test_consumed_manifest_lock_does_not_undo_completed_swap(tmp_path, monkeypatch):
@@ -1046,7 +1071,7 @@ def test_helper_keeps_working_directory_outside_consumed_staging(tmp_path, monke
     original_cwd = Path.cwd()
     monkeypatch.setattr(desktop, "_apply_staged_update", lambda *a: observed.append(Path.cwd()))
     desktop._run_update_helper(staging, target, None)
-    assert observed == [data.resolve()]
+    assert observed == [target.resolve()]
     assert Path.cwd() == original_cwd
 
 
