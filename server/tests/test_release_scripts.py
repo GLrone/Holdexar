@@ -104,6 +104,26 @@ def test_validate_release_notes_success() -> None:
     assert release.validate_release_notes(valid_notes) is None
 
 
+def test_validate_release_notes_standard_031_format_success() -> None:
+    """0.3.1 标准版式（含 ## 本次更新 与 ### 分级标题）顺利通过校验。"""
+    standard_notes = (
+        "# Holdexar v0.3.1 Beta\n\n"
+        "> 建议直接使用应用内「检查更新」升级\n\n"
+        "Windows x64 便携版，解压双击即用。\n\n"
+        "## 本次更新\n\n"
+        "### 新增功能 (New Features)\n"
+        "- **奖杯大厅**：成就页集中上线猎手等级与段位\n\n"
+        "### 问题修复 (Bug Fixes)\n"
+        "- **网络与代理**：修复本机网络被其他软件接管时的误判\n\n"
+        "### 体验优化 (Improvements)\n"
+        "- **领航员问答**：纯数据咨询直接给出答案\n\n"
+        "## 安装与更新\n\n"
+        "**方式一 · 应用内更新（推荐）**\n"
+        "- 打开应用点击更新\n"
+    )
+    assert release.validate_release_notes(standard_notes) is None
+
+
 def test_validate_release_notes_allows_empty_section_if_has_content() -> None:
     """允许部分段落为空，但正文整体至少有一条有效更新。"""
     valid_notes = (
