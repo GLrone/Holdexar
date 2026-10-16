@@ -54,6 +54,15 @@ NOTES_PLACEHOLDER = "在此写本次更新内容"
 NOTES_SECTIONS = ("新增：", "更新：", "优化：", "修复：")
 NOTES_BRACKET_PLACEHOLDER = "写完删掉本括号"
 
+# 0.3.1 标准版式分级标题匹配模式
+STANDARD_SECTION_PATTERNS = [
+    re.compile(r"^#{2,4}\s*(?:新增功能|新增特性|新增|New Features?)", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^#{2,4}\s*(?:问题修复|缺陷修复|修复|Bug Fixes?)", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^#{2,4}\s*(?:体验优化|优化|改进|Improvements?)", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^#{2,4}\s*(?:更新内容|本次更新|更新|Changes?|Changelog)", re.IGNORECASE | re.MULTILINE),
+]
+
+
 if str(SERVER) not in sys.path:
     sys.path.insert(0, str(SERVER))
 from app.core.app_info import (  # noqa: E402
@@ -136,13 +145,43 @@ def gh_ready() -> bool:
 
 
 def validate_release_notes(body: str, filename: str = "RELEASE_NOTES.md") -> str | None:
-    """校验四段式发布说明正文。返回未就绪原因，就绪返回 None。"""
+    """校验发布说明正文：优先支持 0.3.1 标准分级 Markdown 版式，兼容传统四段式。"""
     text = body.strip()
     if not text:
         return f"{filename} 是空文件"
     if NOTES_PLACEHOLDER in text or NOTES_BRACKET_PLACEHOLDER in text:
         return f"{filename} 还是模板占位文案，请先写本次更新内容并删除说明括号"
 
+    # 1. 0.3.1 标准分级 Markdown 结构识别
+    is_standard = "## 本次更新" in text or any(p.search(text) for p in STANDARD_SECTION_PATTERNS)
+    if is_standard:
+        lines = text.splitlines()
+        in_update = ("## 本次更新" not in text)
+        total_items = 0
+        for line in lines:
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith("## 本次更新"):
+                in_update = True
+                continue
+            elif s.startswith("## ") and in_update and "## 本次更新" in text:
+                in_update = False
+                continue
+            if in_update:
+                if any(p.match(s) for p in STANDARD_SECTION_PATTERNS):
+                    continue
+                if s.startswith("#"):
+                    continue
+                if s.startswith(("- ", "* ", "1. ", "2. ", "3. ", "4. ", "5. ")):
+                    total_items += 1
+                elif len(s) > 2 and not s.startswith(">") and not s.startswith("|"):
+                    total_items += 1
+        if total_items == 0:
+            return f"{filename} 各段均无有效更新条目，正文至少需有一条有效更新内容"
+        return None
+
+    # 2. 传统四段式校验
     missing = [s for s in NOTES_SECTIONS if s not in text]
     if missing:
         return f"{filename} 缺少四段式标题（{'、'.join(missing)}）"
