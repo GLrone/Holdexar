@@ -17,6 +17,7 @@ export default {
   'updateDialog.headUpdated': '🎉 升级成功！已更新至 v{version}',
   'updateDialog.updatedSub': '从 v{from} 顺利升级至 v{to}',
   'updateDialog.updatedBody': '当前版本：v{version}',
+  'updateDialog.updatedBodyWithPrev': '已成功从 v{from} 顺利升级至 v{version}',
   'updateDialog.updatedHint': '新版本已就绪，所有数据与设置已平滑保留。祝你使用愉快！',
   'updateDialog.gotIt': '我知道了',
 

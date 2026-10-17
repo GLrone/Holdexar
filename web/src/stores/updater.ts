@@ -43,7 +43,7 @@ export const useUpdaterStore = defineStore('updater', () => {
   /** 全局「已下载，需重启」弹窗是否已被用户关掉（本次会话内不再打扰） */
   const pendingDialogDismissed = ref(false)
   /** 刚刚完成换装更新并首次启动（展示更新成功弹窗的依据） */
-  const justUpdated = ref<{ previousVersion: string; currentVersion: string } | null>(null)
+  const justUpdated = ref<{ previousVersion: string; currentVersion: string; notes?: string } | null>(null)
   const LAST_SEEN_KEY = 'holdexar_last_seen_version'
 
   /** 全局更新弹窗（模糊幕布）是否展开：更新模块已从设置页搬到这里 */
@@ -120,7 +120,11 @@ export const useUpdaterStore = defineStore('updater', () => {
       pendingTag.value = p.pending ? (p.tag || '') : ''
       swapFailed.value = p.swapFailed === true
       if (p.justUpdated) {
-        justUpdated.value = p.justUpdated
+        justUpdated.value = {
+          previousVersion: p.justUpdated.previousVersion,
+          currentVersion: p.justUpdated.currentVersion,
+          notes: p.justUpdated.notes || undefined,
+        }
       } else {
         try {
           const infoRes = await systemApi.info()
@@ -163,6 +167,7 @@ export const useUpdaterStore = defineStore('updater', () => {
         latest.sha256 ?? extractSha(latest.notes),
         latest.asset,
         latest.sizeBytes,
+        latest.notes,
       )
       startPolling()
       void poll()

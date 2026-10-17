@@ -602,8 +602,9 @@ def test_just_updated_status_and_acknowledge(tmp_path: Path, monkeypatch) -> Non
         json.dumps({
             "success": True,
             "stage": "committed",
-            "currentVersion": "0.3.1-beta",
+            "sourceVersion": "0.3.1-beta",
             "targetVersion": updater.APP_VERSION,
+            "notes": "Feature 1\nFeature 2",
             "acknowledged": False,
         }),
         encoding="utf-8",
@@ -613,6 +614,7 @@ def test_just_updated_status_and_acknowledge(tmp_path: Path, monkeypatch) -> Non
     assert status == {
         "previousVersion": "0.3.1-beta",
         "currentVersion": updater.APP_VERSION,
+        "notes": "Feature 1\nFeature 2",
     }
     assert updater.pending_status()["justUpdated"] == status
 

@@ -48,7 +48,12 @@ async function ensureReleasesUrl(): Promise<void> {
 }
 
 watch(open, (visible) => {
-  if (visible) void ensureReleasesUrl()
+  if (visible) {
+    void ensureReleasesUrl()
+    if (phase.value === 'updated' && !notes.value) {
+      void updater.check(true)
+    }
+  }
 })
 
 type Phase =
@@ -76,6 +81,10 @@ const phase = computed<Phase>(() => {
 
 const latestVersion = computed(() => (info.value?.latest || '').replace(/^v/, ''))
 const pendingVersion = computed(() => updater.pendingTag.replace(/^v/, ''))
+const fromVersion = computed(() => {
+  const prev = updater.justUpdated?.previousVersion || ''
+  return prev.replace(/^v/, '')
+})
 /** 头部展示的版本：换装成功用当前版本，待重启用暂存 tag，其余用清单里的最新版 */
 const showVersion = computed(() => {
   if (phase.value === 'updated') {
@@ -151,7 +160,12 @@ const failureHint = computed(() => {
   return t('updateDialog.failGeneric')
 })
 
-const notes = computed(() => info.value?.notes || '')
+const notes = computed(() => {
+  if (phase.value === 'updated') {
+    return updater.justUpdated?.notes || info.value?.notes || ''
+  }
+  return info.value?.notes || ''
+})
 
 function fmtSize(bytes: number): string {
   if (!bytes) return '0 B'
@@ -224,9 +238,9 @@ function onClose(): void {
             </span>
             <div class="upd-head__text">
               <h2 class="upd-head__title">{{ headTitle }}</h2>
-              <p v-if="phase === 'updated' && updater.justUpdated?.previousVersion" class="upd-head__date">
+              <p v-if="phase === 'updated' && fromVersion" class="upd-head__date">
                 <HlIcon name="sparkles" :size="12" />
-                <span>{{ t('updateDialog.updatedSub', { from: updater.justUpdated.previousVersion, to: showVersion }) }}</span>
+                <span>{{ t('updateDialog.updatedSub', { from: fromVersion, to: showVersion }) }}</span>
               </p>
               <p v-else-if="releaseDate" class="upd-head__date">
                 <HlIcon name="calendar" :size="12" />
@@ -258,17 +272,21 @@ function onClose(): void {
                 <span class="upd-ready__icon"><HlIcon name="check-circle" /></span>
                 <div>
                   <p class="upd-ready__text">
-                    {{ t('updateDialog.updatedBody', { version: showVersion }) }}
+                    {{
+                      fromVersion
+                        ? t('updateDialog.updatedBodyWithPrev', { from: fromVersion, version: showVersion })
+                        : t('updateDialog.updatedBody', { version: showVersion })
+                    }}
                   </p>
                   <p class="upd-ready__hint">{{ t('updateDialog.updatedHint') }}</p>
                 </div>
               </div>
 
               <!-- 更新说明与亮点 -->
-              <section v-if="notes" class="upd-notes">
+              <section v-if="notes || phase === 'updated'" class="upd-notes">
                 <h3 class="upd-notes__title">{{ t('updateDialog.whatsNew') }}</h3>
                 <div class="upd-notes__body">
-                  <UpdateNotes :notes="notes" :version="showVersion" />
+                  <UpdateNotes :notes="notes || t('updateDialog.notesEmpty')" :version="showVersion" />
                 </div>
               </section>
             </template>

@@ -17,6 +17,7 @@ export default {
   'updateDialog.headUpdated': '🎉 Successfully Updated to v{version}',
   'updateDialog.updatedSub': 'Updated from v{from} to v{to}',
   'updateDialog.updatedBody': 'Current Version: v{version}',
+  'updateDialog.updatedBodyWithPrev': 'Successfully updated from v{from} to v{version}',
   'updateDialog.updatedHint': 'The new version is ready. All your data and settings are preserved. Enjoy!',
   'updateDialog.gotIt': 'Got it',
 
