@@ -645,5 +645,57 @@ def test_just_updated_status_ignores_mismatched_version(tmp_path: Path, monkeypa
     assert updater.just_updated_status() is None
 
 
+def test_pick_asset_prefers_matching_patch() -> None:
+    """当清单中包含与当前版本匹配的差量包时优先选择差量包。"""
+    assets = [
+        {"role": "app", "name": "Holdexar-win64-v0.3.6.zip", "size": 50000000, "sha256": "app-sha"},
+        {"role": "patch", "name": "Holdexar-patch-v0.3.5-to-v0.3.6.zip", "size": 2500000, "sha256": "patch-sha", "fromVersion": "0.3.5"},
+    ]
+
+    # 1. 当前版本匹配差量包 -> 选中差量包
+    picked = updater._pick_asset(assets, from_version="0.3.5")
+    assert picked is not None
+    assert picked["role"] == "patch"
+    assert picked["name"] == "Holdexar-patch-v0.3.5-to-v0.3.6.zip"
+
+    # 2. 当前版本不匹配差量包 -> 自动回退完整应用包
+    fallback = updater._pick_asset(assets, from_version="0.2.0")
+    assert fallback is not None
+    assert fallback["role"] == "app"
+    assert fallback["name"] == "Holdexar-win64-v0.3.6.zip"
+
+    # 3. 显式指定文件名 -> 精确命中
+    explicit = updater._pick_asset(assets, name="Holdexar-win64-v0.3.6.zip", from_version="0.3.5")
+    assert explicit is not None
+    assert explicit["name"] == "Holdexar-win64-v0.3.6.zip"
+
+
+def test_payload_from_manifest_with_patch(monkeypatch) -> None:
+    """清单解析正确暴露差量包信息与体积对比。"""
+    manifest_data = {
+        "version": "0.3.6",
+        "tag": "v0.3.6",
+        "notes": "Feature notes",
+        "assets": [
+            {"role": "app", "name": "Holdexar-win64-v0.3.6.zip", "size": 50000000, "sha256": "app-sha"},
+            {"role": "patch", "name": "Holdexar-patch-v0.3.5-to-v0.3.6.zip", "size": 3000000, "sha256": "patch-sha", "fromVersion": "0.3.5"},
+        ],
+    }
+
+    # 当前版本为 0.3.5 时，选中差量包
+    class DummySettings:
+        version = "0.3.5"
+    monkeypatch.setattr(updater, "get_settings", lambda: DummySettings())
+
+    payload = updater._payload_from_manifest(manifest_data)
+    assert payload["available"] is True
+    assert payload["isPatch"] is True
+    assert payload["patchFromVersion"] == "0.3.5"
+    assert payload["sizeBytes"] == 3000000
+    assert payload["fullSizeBytes"] == 50000000
+    assert payload["asset"] == "Holdexar-patch-v0.3.5-to-v0.3.6.zip"
+
+
+
 
 

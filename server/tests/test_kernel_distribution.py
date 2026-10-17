@@ -121,10 +121,10 @@ def test_release_refreshes_stale_source_note_without_fetching(tmp_path, monkeypa
 
 def test_packaging_excludes_unlisted_files_from_asset_directory(tmp_path):
     bundle = tmp_path / "assets" / "clash"
-    expected = {kernel_release.kernel_filename(), "LICENSE-mihomo.txt", "README.txt"}
+    expected = set(kernel_release.release_asset_names())
     _write_assets(
         bundle,
-        dict.fromkeys((*expected, *GEO_FILES, "LICENSE-meta-rules-dat.txt", "extra.bin"), 16),
+        dict.fromkeys((*expected, kernel_release.kernel_filename(), *GEO_FILES, "LICENSE-meta-rules-dat.txt", "extra.bin"), 16),
     )
     tree = ast.parse((ROOT / "desktop" / "holdexar.spec").read_text(encoding="utf-8"))
     analysis = next(
@@ -139,7 +139,7 @@ def test_packaging_excludes_unlisted_files_from_asset_directory(tmp_path):
         "ROOT": str(tmp_path),
         "SERVER": str(tmp_path / "server"),
         "os": os,
-        "bundled_asset_names": getattr(kernel_release, "bundled_asset_names", None),
+        "release_asset_names": getattr(kernel_release, "release_asset_names", None),
     }
 
     inputs = eval(compile(ast.Expression(datas), "holdexar.spec", "eval"), namespace)
@@ -147,3 +147,4 @@ def test_packaging_excludes_unlisted_files_from_asset_directory(tmp_path):
 
     assert {source.name for source in clash_inputs} == expected
     assert all(source.parent == bundle and source.is_file() for source in clash_inputs)
+

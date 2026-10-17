@@ -381,6 +381,52 @@ def test_install_rejects_traversal_version_name(tmp_path):
         update_host.install_version_payload(root, staging, "../escape")
 
 
+def test_install_version_payload_differential_patch(tmp_path):
+    from app.core.differential_patch import create_differential_patch
+    import zipfile
+
+    root = tmp_path / "app"
+    base_ver = "0.3.5"
+    target_ver = "0.3.6"
+
+    # 基准版本已安装在 versions/0.3.5
+    base_dir = layout.get_version_dir(root, base_ver)
+    base_dir.mkdir(parents=True)
+    (base_dir / f"{APP_NAME}.exe").write_bytes(b"base-launcher-content")
+    (base_dir / "_internal").mkdir()
+    (base_dir / "_internal" / "keep.dll").write_bytes(b"keep-content")
+    (base_dir / "_internal" / "remove.dll").write_bytes(b"remove-content")
+
+    # 目标新版本内容
+    target_mock = tmp_path / "target_mock"
+    target_mock.mkdir()
+    (target_mock / f"{APP_NAME}.exe").write_bytes(b"new-launcher-content")
+    (target_mock / "_internal").mkdir()
+    (target_mock / "_internal" / "keep.dll").write_bytes(b"keep-content")
+    (target_mock / "_internal" / "added.dll").write_bytes(b"added-content")
+
+    # 生成差量包并解包到 staging
+    patch_zip = tmp_path / "patch.zip"
+    create_differential_patch(base_dir, target_mock, base_ver, target_ver, patch_zip)
+
+    staging = tmp_path / "staging"
+    staging_payload = staging / APP_NAME
+    staging_payload.mkdir(parents=True)
+    with zipfile.ZipFile(patch_zip, "r") as zf:
+        zf.extractall(staging_payload)
+
+    # 执行差量安装
+    dest = update_host.install_version_payload(root, staging, target_ver)
+
+    assert dest == layout.get_version_dir(root, target_ver)
+    assert layout.is_version_valid(root, target_ver)
+    assert (dest / f"{APP_NAME}.exe").read_bytes() == b"new-launcher-content"
+    assert (dest / "_internal" / "keep.dll").read_bytes() == b"keep-content"
+    assert (dest / "_internal" / "added.dll").read_bytes() == b"added-content"
+    assert not (dest / "_internal" / "remove.dll").exists()
+
+
+
 # ── 旧版首次迁移：任何阶段失败都留着可双击的旧版入口 ─────────────────────
 
 

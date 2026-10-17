@@ -215,9 +215,33 @@ def install_version_payload(
         shutil.rmtree(dest, ignore_errors=True)
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    # 1. 载荷自带多版本布局（含 versions/ 子目录）
     versions_sub = payload / "versions"
-    if versions_sub.is_dir():
+
+    # 0. 检查是否为文件级差量包（patch-manifest.json）
+    patch_file = next(
+        (p for p in (payload / "patch-manifest.json", staging_dir / "patch-manifest.json") if p.is_file()),
+        None,
+    )
+    if patch_file is not None:
+        from app.core.differential_patch import apply_differential_patch
+
+        patch_manifest = json.loads(patch_file.read_text(encoding="utf-8"))
+        from_ver = patch_manifest.get("fromVersion")
+        if not from_ver:
+            raise RuntimeError("差量更新清单缺少来源版本号（fromVersion）")
+        base_ver_dir = layout.get_version_dir(root, from_ver)
+        if not base_ver_dir.is_dir() or not layout.is_version_valid(root, from_ver):
+            raise RuntimeError(f"差量更新所需的基准版本不存在或损坏：{from_ver}")
+
+        _log_update(root, f"正在应用文件级差量包（从 v{from_ver} 升级至 v{target_version}）...")
+        apply_differential_patch(
+            patch_source=patch_file.parent,
+            base_dir=base_ver_dir,
+            target_dest_dir=dest,
+        )
+
+    # 1. 载荷自带多版本布局（含 versions/ 子目录）
+    elif versions_sub.is_dir():
         src_ver = versions_sub / target_version
         if not src_ver.is_dir():
             # 载荷版本目录名与清单版本不一致即为错包：绝不拿别的目录冒充目标版本
@@ -232,7 +256,7 @@ def install_version_payload(
     if not layout.is_version_valid(root, target_version):
         raise RuntimeError(f"安装到 {dest} 失败：缺少主可执行程序")
 
-    if versions_sub.is_dir():
+    if (versions_sub.is_dir() or patch_file is not None):
         src_launcher = payload / f"{APP_NAME}.exe"
         if src_launcher.is_file():
             _safe_replace_executable(src_launcher, root / f"{APP_NAME}.exe")
@@ -240,6 +264,7 @@ def install_version_payload(
         if src_updater.is_file():
             (root / "updater").mkdir(parents=True, exist_ok=True)
             _safe_replace_executable(src_updater, root / "updater" / "UpdateHost.exe")
+
 
     _log_update(root, f"新版本文件已就绪：{dest}")
     return dest

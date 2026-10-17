@@ -24,19 +24,11 @@ if SERVER not in sys.path:
     sys.path.insert(0, SERVER)
 
 from PyInstaller.utils.hooks import collect_submodules  # noqa: E402
-from PyInstaller.utils.win32.versioninfo import (  # noqa: E402
-    FixedFileInfo,
-    StringFileInfo,
-    StringStruct,
-    StringTable,
-    VarFileInfo,
-    VarStruct,
-    VSVersionInfo,
-)
+from app.core.app_info import APP_NAME, APP_VERSION  # noqa: E402
 
-from app.core.app_info import APP_NAME, APP_SUBTITLE, APP_VERSION  # noqa: E402
 from app.core.optional_deps import PYINSTALLER_EXCLUDES  # noqa: E402
-from app.domains.proxies.kernel_release import bundled_asset_names  # noqa: E402
+from app.domains.proxies.kernel_release import release_asset_names  # noqa: E402
+
 
 hiddenimports = [
     # uvicorn.run("app.main:app") 字符串导入 + auto 协议模块运行时选择
@@ -60,44 +52,13 @@ hiddenimports = [
 hiddenimports += collect_submodules("app")
 
 
-def numeric_version(text):
-    """语义化版本 → PE 要求的四段数字（0.3.0-beta → (0, 3, 0, 0)）。"""
-    parts = [int(n) for n in re.findall(r"\d+", text)[:4]]
-    return tuple((parts + [0, 0, 0, 0])[:4])
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
+from desktop.version_resource import get_vs_version_info  # noqa: E402
 
-# 文件版本取 PE 四段数字（属性页按数字版本读），产品版本保留语义化原文
-file_version = ".".join(str(n) for n in numeric_version(APP_VERSION))
+version_info = get_vs_version_info("desktop")
 
-# exe 的 VERSIONINFO 资源：字段值取 APP_VERSION 单一来源，发版无需另改。
-version_info = VSVersionInfo(
-    ffi=FixedFileInfo(
-        filevers=numeric_version(APP_VERSION),
-        prodvers=numeric_version(APP_VERSION),
-        mask=0x3F,
-        flags=0x0,
-        OS=0x40004,
-        fileType=0x1,
-        subtype=0x0,
-        date=(0, 0),
-    ),
-    kids=[
-        StringFileInfo([
-            StringTable("040904B0", [
-                StringStruct("CompanyName", APP_NAME),
-                StringStruct("FileDescription", f"{APP_NAME} — {APP_SUBTITLE}"),
-                StringStruct("FileVersion", file_version),
-                StringStruct("InternalName", APP_NAME),
-                StringStruct("LegalCopyright",
-                             f"Copyright (c) {APP_NAME} contributors. Licensed under GPL-3.0."),
-                StringStruct("OriginalFilename", f"{APP_NAME}.exe"),
-                StringStruct("ProductName", APP_NAME),
-                StringStruct("ProductVersion", APP_VERSION),
-            ]),
-        ]),
-        VarFileInfo([VarStruct("Translation", [1033, 1200])]),
-    ],
-)
 
 a = Analysis(
     ["main.py"],
@@ -107,8 +68,10 @@ a = Analysis(
         (os.path.join(ROOT, "web", "dist"), "web"),
         *[
             (os.path.join(ROOT, "assets", "clash", name), "clash")
-            for name in bundled_asset_names()
+            for name in release_asset_names()
+            if os.path.exists(os.path.join(ROOT, "assets", "clash", name))
         ],
+
         (os.path.join(SERVER, "app"), os.path.join("server", "app")),
         ("app.ico", "."),
         # 许可与第三方声明随包分发：GPL-3.0 要求实体副本随附许可原文（§4），
