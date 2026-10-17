@@ -200,24 +200,33 @@ def test_frozen_fresh_install_keeps_data_on_app_disk(fake_env, monkeypatch):
     assert not (fake_env["local"] / paths.APP_SLUG).exists()
 
 
-def test_frozen_existing_machine_db_stays_in_place(fake_env, monkeypatch):
-    """老用户升级：机器级已有库一律原地续用，不因新默认而被当成新装。
-
-    这条是「升级后数据看着全没了」的根因防线——程序目录旁 data/ 可写且不等于
-    该用它，先看存量在哪。
-    """
+def test_frozen_existing_machine_db_migrates_to_portable(fake_env, monkeypatch):
+    """老用户 AppData 存量库：只读迁移至安装目录 data/，原文件保持完整。"""
+    import sqlite3
     _freeze(monkeypatch)
     machine = fake_env["local"] / paths.APP_SLUG
     machine.mkdir(parents=True, exist_ok=True)
-    (machine / paths.data_dir_filename()).write_bytes(b"")
-    assert paths.resolve_data_dir() == machine
+    db_path = machine / paths.data_dir_filename()
+    conn = sqlite3.connect(db_path.as_posix())
+    conn.execute("CREATE TABLE test_data (id INTEGER PRIMARY KEY, note TEXT)")
+    conn.execute("INSERT INTO test_data (note) VALUES ('legacy_appdata')")
+    conn.commit()
+    conn.close()
+
+    resolved = paths.resolve_data_dir()
+    target_data = fake_env["app_dir"] / "data"
+    assert resolved == target_data
+    assert (target_data / paths.data_dir_filename()).is_file()
+    assert (target_data / "migration.json").is_file()
+    assert db_path.is_file()  # C 盘历史文件原样保留
 
 
-def test_frozen_app_dir_readonly_falls_back_to_machine_dir(fake_env, monkeypatch):
-    """程序目录只读（装进受限位置）：回落机器级目录，而不是起不来。"""
+def test_frozen_app_dir_readonly_raises_permission_error(fake_env, monkeypatch):
+    """程序目录不可写时坚决不写 C 盘，抛出明确的 PermissionError。"""
     _freeze(monkeypatch)
     monkeypatch.setattr(paths, "_ensure", _only_machine_writable(fake_env["local"]))
-    assert paths.resolve_data_dir() == fake_env["local"] / paths.APP_SLUG
+    with pytest.raises(PermissionError):
+        paths.resolve_data_dir()
 
 
 def _only_machine_writable(local: Path):
@@ -239,14 +248,14 @@ def test_layout_labels(fake_env, monkeypatch):
     # 新装：与程序同盘
     assert paths.describe_layout(paths.resolve_data_dir()) == "appdir"
     assert paths.describe_layout(fake_env["tmp"] / "elsewhere") == "custom"
-    # 机器级已有库：原地续用并标 machine
+    # 机器级已有库：标 machine
     machine = fake_env["local"] / paths.APP_SLUG
     machine.mkdir(parents=True, exist_ok=True)
     (machine / paths.data_dir_filename()).write_bytes(b"")
-    assert paths.describe_layout(paths.resolve_data_dir()) == "machine"
-    # 程序目录 data/ 但无库：仍是 appdir（系统目录不可写时的兜底）
+    assert paths.describe_layout(machine) == "machine"
+    # 程序目录 data/ 但无库：仍是 appdir
     assert paths.describe_layout(fake_env["app_dir"] / "data") == "appdir"
-    # 造出程序目录存量库后，同一个位置改判 legacy（放在最后：seed 会留下文件）
+    # 造出程序目录存量库后，同一个位置改判 legacy
     assert paths.describe_layout(_seed_repo_db(fake_env["app_dir"])) == "legacy"
 
 

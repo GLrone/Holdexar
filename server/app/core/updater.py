@@ -37,6 +37,7 @@ import httpx
 
 from app.core.app_info import (
     APP_NAME,
+    APP_VERSION,
     ENV_PREFIX,
     GITHUB_MIRRORS,
     GITHUB_REPO,
@@ -87,7 +88,10 @@ _MIN_PACKAGE_BYTES = 1 * 1024 * 1024
 
 
 def staging_dir() -> Path:
-    d = get_settings().data_dir / STAGING_DIR
+    from app.core.paths import staging_dir as get_staging_dir
+
+    d = get_staging_dir()
+    d.mkdir(parents=True, exist_ok=True)
     return d
 
 
@@ -497,6 +501,7 @@ async def download_update(
             "sha256": expected_sha256,
             "ready": True,
             "attempt_id": str(uuid.uuid4()),
+            "source_version": APP_VERSION,
         }
         (staging / STAGING_MANIFEST_NAME).write_text(
             json.dumps(manifest, ensure_ascii=False), encoding="utf-8"

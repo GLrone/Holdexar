@@ -230,6 +230,8 @@ async def test_download_and_pending_flow(tmp_path: Path, monkeypatch) -> None:
     status = updater.pending_status()
     assert status["pending"] is True and status["tag"] == "v0.2.0"
     assert (tmp_path / "staging" / "Holdexar" / "Holdexar.exe").is_file()
+    manifest_data = json.loads((tmp_path / "staging" / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest_data.get("source_version") == updater.APP_VERSION
 
     # clear 后 pending 复位
     updater.clear_staging()
