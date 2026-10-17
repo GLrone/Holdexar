@@ -157,6 +157,7 @@ def assemble_versioned_layout(version: str, python: Path) -> None:
         "--version-file", str(launcher_ver_file),
         "--distpath", str(launcher_dist),
         "--workpath", str(WORK_DIR / "launcher"),
+        "--specpath", str(WORK_DIR),
         "--name", APP_NAME,
         str(DESKTOP / "launcher_main.py"),
     ])
@@ -173,6 +174,7 @@ def assemble_versioned_layout(version: str, python: Path) -> None:
         "--version-file", str(updater_ver_file),
         "--distpath", str(updater_dist),
         "--workpath", str(WORK_DIR / "updater"),
+        "--specpath", str(WORK_DIR),
         "--name", "UpdateHost",
         str(DESKTOP / "update_host_main.py"),
     ])

@@ -39,6 +39,7 @@ P?AN.md
 /nul
 # 根目录下划线开头的调研/实测残留脚本（本机专用，不入库）
 /_*.py
+/*.spec
 # CDP 调试浏览器实例数据（含 Cookies/History，绝不入库）
 /.tmp-chrome-profile/
 

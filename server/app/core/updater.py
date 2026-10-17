@@ -346,6 +346,7 @@ async def download_update(
     expected_sha256: str | None = None,
     asset_name: str | None = None,
     expected_size: int | None = None,
+    notes: str | None = None,
 ) -> dict:
     """下载 release zip 到 data/update-staging/ 并解包 + 校验。
 
@@ -539,6 +540,7 @@ async def download_update(
             "source_version": APP_VERSION,
             "is_patch": is_patch,
             "patch_from_version": patch_from,
+            "notes": notes or "",
         }
         (staging / STAGING_MANIFEST_NAME).write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -861,10 +863,45 @@ def just_updated_status() -> dict | None:
     target_ver = data.get("targetVersion") or ""
     if target_ver and target_ver != APP_VERSION:
         return None
-    prev_ver = data.get("currentVersion") or ""
+    prev_ver = (
+        data.get("sourceVersion")
+        or data.get("previousVersion")
+        or data.get("currentVersion")
+        or ""
+    )
+    if not prev_ver:
+        from app.core import layout
+        try:
+            st = layout.read_current_state(install_root())
+            prev_ver = st.get("lastKnownGood") or st.get("previousVersion") or ""
+        except Exception:
+            pass
+
+    notes = data.get("notes") or ""
+    if not notes:
+        for notes_cand in [
+            install_root() / "release" / "latest.json",
+            install_root() / "latest.json",
+            install_root() / "RELEASE_NOTES.md",
+            install_root() / "release" / "RELEASE_NOTES.md",
+        ]:
+            if notes_cand.is_file():
+                try:
+                    if notes_cand.suffix == ".json":
+                        j = json.loads(notes_cand.read_text(encoding="utf-8"))
+                        if j.get("notes"):
+                            notes = _plain_notes(str(j["notes"]))
+                            break
+                    elif notes_cand.suffix == ".md":
+                        notes = _plain_notes(notes_cand.read_text(encoding="utf-8"))
+                        break
+                except Exception:
+                    pass
+
     return {
         "previousVersion": prev_ver,
         "currentVersion": target_ver or APP_VERSION,
+        "notes": notes,
     }
 
 

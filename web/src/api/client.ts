@@ -2239,6 +2239,7 @@ export interface UpdatePending {
   justUpdated?: {
     previousVersion: string
     currentVersion: string
+    notes?: string | null
   } | null
 }
 
@@ -2345,12 +2346,14 @@ export const systemApi = {
     sha256?: string | null,
     asset?: string | null,
     size?: number | null,
+    notes?: string | null,
   ) =>
     request<{ started: boolean }>('POST', '/system/update-download', {
       tag,
       sha256: sha256 ?? null,
       asset: asset ?? null,
       size: size ?? null,
+      notes: notes ?? null,
     }),
   updateProgress: () => request<UpdateProgress>('GET', '/system/update-progress'),
   updatePending: () => request<UpdatePending>('GET', '/system/update-pending'),

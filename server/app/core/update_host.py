@@ -943,9 +943,20 @@ def execute_update(
         return False
 
     curr_state = layout.read_current_state(root)
+    staging_meta: dict[str, Any] = {}
+    if (staging_dir / "manifest.json").is_file():
+        try:
+            staging_meta = json.loads((staging_dir / "manifest.json").read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    notes = str(staging_meta.get("notes") or "")
+    staging_source = staging_meta.get("source_version") or staging_meta.get("previousVersion")
     s_ver = (
         source_version
+        or staging_source
         or (curr_state.get("version") if curr_state else None)
+        or (curr_state.get("lastKnownGood") if curr_state else None)
         or "legacy_version"
     )
     expected_data_dir = _resolve_data_dir(root, data_dir)
@@ -957,6 +968,9 @@ def execute_update(
         "attemptId": aid,
         "targetVersion": t_ver,
         "sourceVersion": s_ver,
+        "previousVersion": s_ver,
+        "currentVersion": s_ver,
+        "notes": notes,
         "dataDir": str(expected_data_dir),
         "startTime": time.time(),
         "stage": layout.STAGE_SWITCHING,
