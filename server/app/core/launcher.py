@@ -31,7 +31,12 @@ logger = logging.getLogger(__name__)
 
 
 def find_target_version(root: Path) -> str | None:
-    """定位当前应启动的目标版本，必要时自动执行自愈回滚。"""
+    """定位当前应启动的目标版本，必要时自动执行自愈回滚。
+
+    指针与回退目标都不可用时，先认旧式扁平安装留在版本目录里的恢复入口
+    （`previousVersion`），再才按目录时间挑最新版本——旧版若还在，绝不为了
+    「看起来新」去拉起一个从未通过验收的版本。
+    """
     curr = read_current_state(root)
     if curr:
         active = curr.get("version")
@@ -46,6 +51,12 @@ def find_target_version(root: Path) -> str | None:
             )
             write_current_state(root, last_good, last_known_good=None)
             return last_good
+
+        previous = curr.get("previousVersion")
+        if previous and is_version_valid(root, previous):
+            logger.warning("当前版本 %s 损坏，恢复旧版入口 %s", active, previous)
+            write_current_state(root, previous, last_known_good=None)
+            return previous
 
     # 状态丢失或指定版本均不可用：扫描 versions/ 中最新有效版本
     installed = list_installed_versions(root)
@@ -114,27 +125,33 @@ def run_launcher(
     (root / "updater").mkdir(parents=True, exist_ok=True)
     (root / "update-staging").mkdir(parents=True, exist_ok=True)
 
-    # 2. 检查老版本 AppData 数据并只读平滑迁移
+    # 2. 检查老版本 AppData 数据并只读平滑迁移。
+    #    迁移没完成就不启动：两处都有库（冲突）或快照失败时，起服务等于在一个
+    #    可能被建成空库的目录上操作——用户看不到自己的历史数据还以为丢了。
     try:
         locs = detect_legacy_data_locations(root)
         if locs.get("hasAppdataDb") and not locs.get("hasTargetDb"):
             appdata_dir = locs.get("appdataDataDir")
             if appdata_dir:
-                migrate_appdata_to_portable(appdata_dir, root / "data")
+                result = migrate_appdata_to_portable(appdata_dir, root / "data")
+                if not result.get("completed"):
+                    _show_fatal(
+                        f"旧数据迁移未完成（{result.get('reason') or result.get('status')}），"
+                        f"已停止启动以免生成空数据库。\n旧库位置：{appdata_dir}"
+                    )
+                    return 1
     except Exception as exc:  # noqa: BLE001
-        logger.warning("启动器检查历史迁移异常：%s", exc)
+        logger.error("启动器历史迁移失败：%s", exc)
+        _show_fatal(f"旧数据迁移失败，已停止启动以免生成空数据库：{exc}")
+        return 1
 
     # 3. 定位有效版本
     target_ver = find_target_version(root)
     if not target_ver:
-        err_msg = f"未能在 {root / 'versions'} 找到任何可运行的有效版本。\n请检查安装目录或重新解压完整发行包。"
-        print(f"[错误] {err_msg}", file=sys.stderr)
-        try:
-            if os.name == "nt":
-                import ctypes
-                ctypes.windll.user32.MessageBoxW(0, err_msg, "Holdexar 启动失败", 0x10)
-        except Exception:  # noqa: BLE001
-            pass
+        _show_fatal(
+            f"未能在 {root / 'versions'} 找到任何可运行的有效版本。\n"
+            "请检查安装目录或重新解压完整发行包。"
+        )
         return 1
 
     # 4. 拉起目标版本
@@ -143,4 +160,20 @@ def run_launcher(
         return 0
     except Exception as exc:  # noqa: BLE001
         logger.error("拉起版本 %s 失败：%s", target_ver, exc)
+        _show_fatal(f"启动 {target_ver} 失败：{exc}")
         return 1
+
+
+def _show_fatal(message: str) -> None:
+    """启动器无窗口：失败必须弹系统对话框，否则用户双击后什么都没发生。"""
+    try:
+        print(f"[错误] {message}", file=sys.stderr)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(0, message, "Holdexar 启动失败", 0x10)
+    except Exception:  # noqa: BLE001
+        pass
