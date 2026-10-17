@@ -509,3 +509,70 @@ def test_legacy_conversion_writes_typed_version_dir(tmp_path):
     curr = layout.read_current_state(target)
     assert curr["version"] == "0.3.2-beta"
     assert curr["pendingVersion"] == "0.3.2-beta"
+
+
+def test_legacy_conversion_preserves_true_legacy_binary_after_launcher_prep(tmp_path):
+    """关键回归：prepare_launcher_only 之后执行 convert_legacy_layout，旧版版本目录内
+    必须是真正的旧版主程序（b'old_exe'），而不是被新版 Launcher（b'app_binary'）篡改。"""
+    target = tmp_path / "installed"
+    staging = tmp_path / "staging"
+    _flat_legacy(target)
+    _create_mock_app_payload(staging, "0.3.6", has_exe=True)
+
+    ok = update_host.prepare_launcher_only(
+        target, staging, source_version="0.3.2-beta", attempt_id="att-1"
+    )
+    assert ok is True
+    # 根目录此时是 Launcher
+    assert (target / f"{APP_NAME}.exe").read_bytes() == b"app_binary"
+    assert (target / "__legacy__" / f"{APP_NAME}.exe").read_bytes() == b"old_exe"
+
+    ok_conv, reason = update_host.convert_legacy_layout(
+        target, source_version="0.3.2-beta", attempt_id="att-1"
+    )
+    assert ok_conv is True
+    # 检查版本目录内的 EXE：必须是真正的旧版主程序！
+    dest_exe = target / "versions" / "0.3.2-beta" / f"{APP_NAME}.exe"
+    assert dest_exe.is_file()
+    assert dest_exe.read_bytes() == b"old_exe"
+
+    # 根目录依然是 Launcher
+    assert (target / f"{APP_NAME}.exe").read_bytes() == b"app_binary"
+
+
+def test_legacy_version_name_rejects_data_directory_names(tmp_path):
+    """安全门禁：即使传入 data 或 holdexar 字符串，也不能被认作版本名。"""
+    root = tmp_path / "installed"
+    root.mkdir()
+    staging = tmp_path / "staging"
+    staging.mkdir()
+
+    assert update_host._legacy_version_name(root, "data", staging) == "legacy_version"
+    assert update_host._legacy_version_name(root, "Holdexar", staging) == "legacy_version"
+    assert update_host._legacy_version_name(root, "versions", staging) == "legacy_version"
+
+
+def test_safe_replace_executable_fallback(tmp_path, monkeypatch):
+    """运行中文档锁场景：shutil.copy2 报 PermissionError 时自动重命名原文件后再覆盖。"""
+    src = tmp_path / "new.exe"
+    dest = tmp_path / "running.exe"
+    src.write_bytes(b"new_content")
+    dest.write_bytes(b"old_content")
+
+    real_copy = update_host.shutil.copy2
+    copied_once = False
+
+    def mock_copy(s, d):
+        nonlocal copied_once
+        if not copied_once:
+            copied_once = True
+            raise PermissionError("WinError 32: The process cannot access the file")
+        return real_copy(s, d)
+
+    monkeypatch.setattr(update_host.shutil, "copy2", mock_copy)
+    update_host._safe_replace_executable(src, dest)
+    assert dest.read_bytes() == b"new_content"
+    old_files = list(tmp_path.glob("running.old_*.exe"))
+    assert len(old_files) == 1
+    update_host.cleanup_old_executables(tmp_path)
+    assert len(list(tmp_path.glob("running.old_*.exe"))) == 0

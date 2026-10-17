@@ -167,6 +167,72 @@ def get_versions_dir(install_root: Path) -> Path:
     return d
 
 
+def read_pe_product_version(exe_path: Path) -> str | None:
+    """读取 Windows PE 文件的 ProductVersion 字符串。"""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        version_dll = getattr(ctypes.windll, "version", None)
+        if version_dll is None:
+            return None
+        size = version_dll.GetFileVersionInfoSizeW(str(exe_path), None)
+        if not size:
+            return None
+        buf = ctypes.create_string_buffer(size)
+        if not version_dll.GetFileVersionInfoW(str(exe_path), 0, size, buf):
+            return None
+        sub_blocks = [
+            r"\StringFileInfo\040904b0\ProductVersion",
+            r"\StringFileInfo\080404b0\ProductVersion",
+            r"\StringFileInfo\000004b0\ProductVersion",
+            r"\StringFileInfo\040904e4\ProductVersion",
+            r"\StringFileInfo\080404e4\ProductVersion",
+        ]
+        val_ptr = ctypes.c_void_p()
+        val_len = wintypes.UINT()
+        for sub in sub_blocks:
+            if version_dll.VerQueryValueW(buf, sub, ctypes.byref(val_ptr), ctypes.byref(val_len)):
+                if val_len.value > 0 and val_ptr.value:
+                    ver_str = ctypes.wstring_at(val_ptr.value).strip()
+                    if ver_str:
+                        return ver_str
+    except Exception:
+        pass
+    return None
+
+
+def detect_installed_version(target: Path) -> str | None:
+    """检测安装目录当前的程序版本。"""
+    if not target.is_dir():
+        return None
+
+    for app_info_rel in (
+        Path("_internal") / "server" / "app" / "core" / "app_info.py",
+        Path("_internal") / "app" / "core" / "app_info.py",
+    ):
+        app_info = target / app_info_rel
+        if app_info.is_file():
+            try:
+                import re
+
+                match = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', app_info.read_text(encoding="utf-8"))
+                if match:
+                    return match.group(1).strip()
+            except Exception:
+                pass
+
+    main_exe = target / f"{APP_NAME}.exe"
+    if main_exe.is_file():
+        pe_ver = read_pe_product_version(main_exe)
+        if pe_ver:
+            return pe_ver
+
+    return None
+
+
 def get_version_dir(install_root: Path, version: str) -> Path:
     return install_root / VERSIONS_DIR_NAME / version
 
@@ -178,7 +244,18 @@ def is_managed_version_name(name: str) -> bool:
         return False
     if text != text.strip():
         return False
-    return not any(sep in text for sep in ("/", "\\", ":"))
+    if any(sep in text for sep in ("/", "\\", ":")):
+        return False
+    # 明确排除保留字和目录名，防止 data 或 holdexar 被当作版本目录
+    if text.lower() in {
+        "data", "holdexar", "app", "logs", "updater",
+        "state", "versions", "update-staging", "_internal",
+        "__old__", "__legacy__", "cache", "temp", "tmp",
+    }:
+        return False
+    if not (text[0].isdigit() or text == "legacy_version"):
+        return False
+    return True
 
 
 def get_version_exe(install_root: Path, version: str) -> Path:
@@ -187,11 +264,18 @@ def get_version_exe(install_root: Path, version: str) -> Path:
 
 def is_version_valid(install_root: Path, version: str) -> bool:
     """验证版本目录及其主可执行文件是否完整存在。"""
+    if not is_managed_version_name(version):
+        return False
     vdir = get_version_dir(install_root, version)
     if not vdir.is_dir():
         return False
     exe = get_version_exe(install_root, version)
-    return exe.is_file()
+    if not exe.is_file():
+        return False
+    internal = vdir / "_internal"
+    if internal.exists() and not (internal.is_dir() and any(internal.iterdir())):
+        return False
+    return True
 
 
 def list_installed_versions(install_root: Path) -> list[str]:

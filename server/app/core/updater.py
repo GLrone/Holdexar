@@ -474,7 +474,6 @@ async def download_update(
                 )
                 last_err = e
         else:
-            shutil.rmtree(staging, ignore_errors=True)
             raise RuntimeError(f"所有下载通道均失败：{last_err}")
 
         zip_path = staging / "update.zip"

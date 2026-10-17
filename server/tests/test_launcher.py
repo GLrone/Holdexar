@@ -90,3 +90,58 @@ def test_launch_version_env_and_args(tmp_path, monkeypatch):
     assert captured_env[f"{ENV_PREFIX}INSTALL_ROOT"] == str(root)
     assert captured_env[f"{ENV_PREFIX}DATA_DIR"] == str(root / "data")
     assert captured_env["WEBVIEW2_USER_DATA_FOLDER"] == str(root / "data" / "cache" / "webview")
+
+
+def test_run_launcher_data_conflict_stops(tmp_path, monkeypatch):
+    """双库冲突检测：目标目录与 AppData 同时存在且未完成收口时，Launcher 拒绝启动。"""
+    root = tmp_path / "app"
+    _create_version(root, "0.3.5", has_exe=True)
+    layout.write_current_state(root, "0.3.5")
+
+    # 创建目标库
+    target_data = root / "data"
+    target_data.mkdir(parents=True)
+    (target_data / "holdexar.db").write_bytes(b"target_db")
+
+    # 模拟发现 AppData 库，形成冲突
+    appdata_dir = tmp_path / "appdata"
+    appdata_dir.mkdir(parents=True)
+    (appdata_dir / "holdexar.db").write_bytes(b"appdata_db")
+
+    monkeypatch.setattr(
+        launcher,
+        "detect_legacy_data_locations",
+        lambda r: {
+            "targetDataDir": target_data,
+            "hasTargetDb": True,
+            "appdataDataDir": appdata_dir,
+            "hasAppdataDb": True,
+            "hasConflict": True,
+            "isFresh": False,
+        },
+    )
+    monkeypatch.setattr(launcher, "_show_fatal", lambda msg: None)
+
+    code = launcher.run_launcher(install_root_override=root, detached=False)
+    assert code == 1
+
+
+def test_run_launcher_cleans_old_executables(tmp_path, monkeypatch):
+    """启动器主流程自动清理 updater/ 与根目录下历史换装遗留的 *.old_* 临时文件。"""
+    root = tmp_path / "app"
+    _create_version(root, "0.3.5", has_exe=True)
+    layout.write_current_state(root, "0.3.5")
+
+    updater_dir = root / "updater"
+    updater_dir.mkdir(parents=True)
+    old_host = updater_dir / "UpdateHost.old_abc123.exe"
+    old_host.write_bytes(b"old_host")
+
+    old_launcher = root / f"{APP_NAME}.old_def456.exe"
+    old_launcher.write_bytes(b"old_launcher")
+
+    monkeypatch.setattr(launcher, "launch_version", lambda *a, **k: None)
+    code = launcher.run_launcher(install_root_override=root, detached=False)
+    assert code == 0
+    assert not old_host.exists()
+    assert not old_launcher.exists()

@@ -24,8 +24,13 @@ from app.core.layout import (
     read_current_state,
     write_current_state,
 )
-from app.core.migration import detect_legacy_data_locations, migrate_appdata_to_portable
+from app.core.migration import (
+    detect_legacy_data_locations,
+    migrate_appdata_to_portable,
+    resolve_data_dir_conflict,
+)
 from app.core.paths import install_root
+from app.core.update_host import cleanup_old_executables
 
 logger = logging.getLogger(__name__)
 
@@ -117,20 +122,33 @@ def run_launcher(
     """启动器主流程。"""
     root = install_root_override or install_root()
 
-    # 1. 确保基础目录结构齐全
+    # 1. 确保基础目录结构齐全，清理历史更新遗留文件
     get_state_dir(root)
     (root / "data").mkdir(parents=True, exist_ok=True)
     (root / "logs").mkdir(parents=True, exist_ok=True)
     (root / "versions").mkdir(parents=True, exist_ok=True)
     (root / "updater").mkdir(parents=True, exist_ok=True)
     (root / "update-staging").mkdir(parents=True, exist_ok=True)
+    cleanup_old_executables(root / "updater")
+    cleanup_old_executables(root)
 
     # 2. 检查老版本 AppData 数据并只读平滑迁移。
     #    迁移没完成就不启动：两处都有库（冲突）或快照失败时，起服务等于在一个
     #    可能被建成空库的目录上操作——用户看不到自己的历史数据还以为丢了。
     try:
         locs = detect_legacy_data_locations(root)
-        if locs.get("hasAppdataDb") and not locs.get("hasTargetDb"):
+        if locs.get("hasConflict"):
+            res = resolve_data_dir_conflict(root / "data")
+            if not res.get("completed"):
+                appdata_dir = locs.get("appdataDataDir")
+                _show_fatal(
+                    "检测到安装目录与 AppData 同时存在用户数据，无法判断该使用哪一份，已停止启动。\n\n"
+                    f"安装目录数据：{root / 'data'}\n"
+                    f"AppData 数据：{appdata_dir}\n\n"
+                    "请保留要继续使用的一份，删除另一份后重新启动。"
+                )
+                return 1
+        elif locs.get("hasAppdataDb") and not locs.get("hasTargetDb"):
             appdata_dir = locs.get("appdataDataDir")
             if appdata_dir:
                 result = migrate_appdata_to_portable(appdata_dir, root / "data")

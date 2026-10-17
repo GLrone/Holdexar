@@ -2804,15 +2804,17 @@ def main() -> None:
         if not args.staging or not args.target:
             print("[更新] 换装进程缺少 --staging/--target，退出。")
             return
-        _run_update_helper(
-            Path(args.staging),
-            Path(args.target),
-            args.wait_pid,
+        from app.core.update_host import bridge_legacy_update
+
+        ok = bridge_legacy_update(
+            staging=Path(args.staging),
+            target=Path(args.target),
+            wait_pid=args.wait_pid,
             attempt_id=getattr(args, "attempt_id", None),
             data_dir=Path(args.data_dir) if args.data_dir else None,
             current_version=getattr(args, "current_version", None),
         )
-        return
+        sys.exit(0 if ok else 1)
 
     # 孤儿实例防线最早挂上：换装/端口协商/服务线程任何阶段包装进程死亡，
     # 本进程都不应存活成无主实例（防线语义见 _watch_launcher 顶注）

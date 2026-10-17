@@ -63,7 +63,10 @@ HEALTH_TIMEOUT = 30.0
 
 def version_from_tag(tag: str) -> str:
     """release tag → 版本号（v0.3.0-beta → 0.3.0-beta）。"""
-    return str(tag or "").strip().lstrip("vV")
+    t = str(tag or "").strip()
+    if (t.startswith("v") or t.startswith("V")) and len(t) > 1 and t[1].isdigit():
+        return t[1:]
+    return t
 
 
 def version_gt(a: str, b: str) -> bool:
