@@ -72,6 +72,9 @@ ALLOW: dict[tuple[str, str], tuple[frozenset[str], str]] = {
     ("core/migration.py", "migrate_appdata_to_portable"): (
         frozenset({"execute"}),
         "VACUUM INTO 迁移对源库只读，产出自洽新文件"),
+    ("core/migration.py", "adopt_source_database"): (
+        frozenset({"execute"}),
+        "同一 VACUUM INTO 快照（对源库只读），函数拆分后写点随之迁移"),
     ("domains/family/service.py", "_absorb_local_members"): (
         frozenset({"commit"}),
         "调用点已 write_gate 包裹（吸收即调用方事务的一步）"),

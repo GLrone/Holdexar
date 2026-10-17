@@ -73,8 +73,13 @@ def write_current_state(
     version: str,
     last_known_good: str | None = None,
     extra: dict[str, Any] | None = None,
+    **fields: Any,
 ) -> dict[str, Any]:
-    """原子更新 state/current.json 指针。"""
+    """原子更新 state/current.json 指针。
+
+    额外字段（previousVersion / pendingVersion / attemptId …）与指针同一次落盘：
+    回退目标必须和「当前指向哪个版本」一起原子生效，否则回退时读到的是旧目标。
+    """
     sdir = get_state_dir(install_root)
     target = sdir / CURRENT_STATE_FILE
     tmp = sdir / f"{CURRENT_STATE_FILE}.tmp"
@@ -86,6 +91,7 @@ def write_current_state(
     }
     if extra:
         state.update(extra)
+    state.update(fields)
 
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(target)
@@ -165,6 +171,16 @@ def get_version_dir(install_root: Path, version: str) -> Path:
     return install_root / VERSIONS_DIR_NAME / version
 
 
+def is_managed_version_name(name: str) -> bool:
+    """版本目录名能否安全用作相对路径（载荷目录名带分隔符时不得跳出 versions/）。"""
+    text = str(name or "")
+    if not text or text in {".", ".."}:
+        return False
+    if text != text.strip():
+        return False
+    return not any(sep in text for sep in ("/", "\\", ":"))
+
+
 def get_version_exe(install_root: Path, version: str) -> Path:
     return get_version_dir(install_root, version) / f"{APP_NAME}.exe"
 
@@ -232,3 +248,53 @@ def prune_versions(
                 logger.warning("清理版本目录 %s 失败：%s", v, exc)
 
     return pruned
+
+
+def confirm_version(install_root: Path, version: str) -> dict[str, Any]:
+    """把 version 正式确认为当前版本：指针回正、清空回退目标与验收中标记。
+
+    验收前已把指针指向目标版本（启动器只认指针），提交时不再重写指针落点，
+    只补齐「已验收」这一事实：`pendingVersion` 清空、`lastKnownGood` 指向源版本。
+    """
+    sdir = get_state_dir(install_root)
+    target = sdir / CURRENT_STATE_FILE
+    tmp = sdir / f"{CURRENT_STATE_FILE}.tmp"
+    state = read_current_state(install_root) or {}
+    state.pop("pendingVersion", None)
+    state["version"] = version
+    state["confirmedAt"] = time.time()
+    if not state.get("lastKnownGood"):
+        state["lastKnownGood"] = state.get("previousVersion")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(target)
+    return state
+
+
+def abort_version(install_root: Path, attempted: str) -> bool:
+    """撤掉一个安装完成却未通过验收的版本，把指针交还给 lastKnownGood。
+
+    返回 True = 指针已指向可回退版本。调用方必须通过 `is_version_valid`
+    确认该版本目录仍可用；无法交还时保持原指针（宁可停在已知损坏的版本上
+    让下次启动重新走自愈，也不能回退到一个不存在的版本）。
+    """
+    state = read_current_state(install_root) or {}
+    fallback = state.get("lastKnownGood") or state.get("previousVersion")
+    if not fallback or fallback == attempted:
+        return False
+    if not is_version_valid(install_root, fallback):
+        return False
+    write_current_state(install_root, fallback, last_known_good=None)
+    try:
+        shutil.rmtree(get_version_dir(install_root, attempted), ignore_errors=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("清理未通过验收的版本 %s 失败：%s", attempted, exc)
+    return True
+
+
+def previous_version_entry(install_root: Path) -> Path | None:
+    """旧式扁平安装的恢复入口：根目录程序此前被移入的版本目录。"""
+    state = read_current_state(install_root) or {}
+    name = state.get("previousVersion")
+    if not name or not is_managed_version_name(str(name)):
+        return None
+    return get_version_exe(install_root, str(name))
