@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
+
+import pytest
 
 from app.core import layout, update_host
 from app.core.app_info import APP_NAME, STAGING_MANIFEST_NAME
@@ -207,3 +210,302 @@ def test_bridge_legacy_update_converts_flat_layout(tmp_path):
     curr = layout.read_current_state(target)
     assert curr["version"] == "0.3.3-beta"
     assert curr["lastKnownGood"] == "0.3.2-beta"
+
+
+# ── 健康验收：只认本次拉起、目标版本、目标数据目录、本次事务的进程 ──────────
+
+
+def _health_payload(root: Path, version: str = "0.3.6", aid: str = "att-1") -> dict:
+    return {
+        "app": APP_NAME,
+        "version": version,
+        "pid": 4242,
+        "dataDir": str(root / "data"),
+        "executable": str(layout.get_version_exe(root, version)),
+        "updateAttemptId": aid,
+    }
+
+
+def test_verify_health_accepts_matching_identity(tmp_path):
+    root = tmp_path / "app"
+    reason = update_host.verify_health_response(
+        _health_payload(root),
+        target_version="0.3.6",
+        attempt_id="att-1",
+        exe=layout.get_version_exe(root, "0.3.6"),
+        data_dir=root / "data",
+    )
+    assert reason is None
+
+
+def test_verify_health_rejects_other_version_instance(tmp_path):
+    """端口上恰好是另一个同版本以外的实例：版本不符即拒，不能算健康。"""
+    root = tmp_path / "app"
+    reason = update_host.verify_health_response(
+        _health_payload(root, version="0.3.5"),
+        target_version="0.3.6",
+        attempt_id="att-1",
+        exe=layout.get_version_exe(root, "0.3.6"),
+        data_dir=root / "data",
+    )
+    assert reason is not None and "版本" in reason
+
+
+def test_verify_health_rejects_foreign_attempt(tmp_path):
+    root = tmp_path / "app"
+    reason = update_host.verify_health_response(
+        _health_payload(root, aid="someone-else"),
+        target_version="0.3.6",
+        attempt_id="att-1",
+        exe=layout.get_version_exe(root, "0.3.6"),
+        data_dir=root / "data",
+    )
+    assert reason is not None and "事务标识" in reason
+
+
+def test_verify_health_rejects_other_data_dir(tmp_path):
+    root = tmp_path / "app"
+    payload = _health_payload(root)
+    payload["dataDir"] = str(tmp_path / "elsewhere" / "data")
+    reason = update_host.verify_health_response(
+        payload,
+        target_version="0.3.6",
+        attempt_id="att-1",
+        exe=layout.get_version_exe(root, "0.3.6"),
+        data_dir=root / "data",
+    )
+    assert reason is not None and "数据目录" in reason
+
+
+def test_verify_health_rejects_other_executable(tmp_path):
+    root = tmp_path / "app"
+    payload = _health_payload(root)
+    payload["executable"] = str(layout.get_version_exe(root, "0.3.5"))
+    reason = update_host.verify_health_response(
+        payload,
+        target_version="0.3.6",
+        attempt_id="att-1",
+        exe=layout.get_version_exe(root, "0.3.6"),
+        data_dir=root / "data",
+    )
+    assert reason is not None and "进程镜像" in reason
+
+
+def test_probe_rejects_health_from_foreign_process(tmp_path, monkeypatch):
+    """本次拉起的进程还活着，但端口上应答的是别人的实例：验收必须失败。"""
+    root = tmp_path / "app"
+    vdir = layout.get_version_dir(root, "0.3.6")
+    vdir.mkdir(parents=True, exist_ok=True)
+    exe = vdir / f"{APP_NAME}.exe"
+    exe.write_bytes(b"bin")
+
+    class _Proc:
+        pid = 999001
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            return None
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"app": APP_NAME, "version": "0.3.6", "pid": 777,
+                    "updateAttemptId": "att-1"}
+
+    monkeypatch.setattr(update_host.subprocess, "Popen", lambda *a, **k: _Proc())
+    monkeypatch.setattr(update_host, "_listen_ports", lambda pid: ([28765], 777))
+    monkeypatch.setattr(update_host, "process_image_path", lambda pid: str(exe))
+    monkeypatch.setattr(update_host.httpx, "get", lambda *a, **k: _Resp())
+
+    healthy, reason = update_host.probe_version_health(
+        root, "0.3.6", attempt_id="att-1", timeout=0.6,
+    )
+    assert healthy is False
+    assert update_host.HEALTH_BINDING_ERROR in reason
+
+
+def test_health_failure_rolls_back_files_and_pointer(tmp_path, monkeypatch):
+    """验收失败：撤下目标版本、指针交还源版本（源版本即使不是标准版本名也一样）。"""
+    root = tmp_path / "app"
+    staging = tmp_path / "staging"
+    legacy = layout.get_version_dir(root, "legacy_version")
+    legacy.mkdir(parents=True, exist_ok=True)
+    (legacy / f"{APP_NAME}.exe").write_bytes(b"old")
+    layout.write_current_state(root, "legacy_version")
+
+    _create_mock_app_payload(staging, "0.3.6", has_exe=True)
+    monkeypatch.setattr(
+        update_host, "probe_version_health", lambda *a, **k: (False, "服务崩溃")
+    )
+
+    ok = update_host.execute_update(
+        root=root, staging_dir=staging, target_version="0.3.6",
+        source_version="legacy_version", launch_on_finish=False,
+    )
+    assert ok is False
+    assert layout.read_current_state(root)["version"] == "legacy_version"
+    assert not layout.get_version_dir(root, "0.3.6").exists()
+
+
+# ── 载荷与版本目录身份 ──────────────────────────────────────────────────
+
+
+def test_install_rejects_payload_version_mismatch(tmp_path):
+    """载荷 versions/ 下的目录名与目标版本不一致即为错包，不得拿别的目录冒充。"""
+    root = tmp_path / "app"
+    staging = tmp_path / "staging"
+    payload = staging / APP_NAME / "versions"
+    (payload / "0.9.9").mkdir(parents=True)
+    (payload / "0.9.9" / f"{APP_NAME}.exe").write_bytes(b"x")
+
+    with pytest.raises(RuntimeError):
+        update_host.install_version_payload(root, staging, "0.3.6")
+    assert not layout.get_version_dir(root, "0.3.6").exists()
+
+
+def test_install_rejects_traversal_version_name(tmp_path):
+    root = tmp_path / "app"
+    staging = tmp_path / "staging"
+    (staging / APP_NAME).mkdir(parents=True)
+    with pytest.raises(RuntimeError):
+        update_host.install_version_payload(root, staging, "../escape")
+
+
+# ── 旧版首次迁移：任何阶段失败都留着可双击的旧版入口 ─────────────────────
+
+
+def _flat_legacy(target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    (target / f"{APP_NAME}.exe").write_bytes(b"old_exe")
+    (target / "_internal").mkdir()
+    (target / "_internal" / "python313.dll").write_bytes(b"old_dll")
+    (target / "data").mkdir()
+    (target / "data" / "holdexar.db").write_bytes(b"user_database")
+
+
+def test_legacy_launcher_lands_before_legacy_moves(tmp_path):
+    target = tmp_path / "installed"
+    staging = tmp_path / "staging"
+    _flat_legacy(target)
+    _create_mock_app_payload(staging, "0.3.6", has_exe=True)
+
+    ok = update_host.prepare_launcher_only(
+        target, staging, source_version="0.3.2-beta", attempt_id="att-l"
+    )
+    assert ok is True
+    # 根目录换成了新启动器，旧版主程序已备份且版本目录尚未开始搬
+    assert (target / f"{APP_NAME}.exe").read_bytes() == b"app_binary"
+    assert (target / "__legacy__" / f"{APP_NAME}.exe").is_file()
+    assert (target / "_internal").is_dir()
+    curr = layout.read_current_state(target)
+    assert curr["version"] == "0.3.2-beta"
+    assert curr["previousVersion"] == "0.3.2-beta"
+
+
+def test_legacy_migration_failure_keeps_root_exe(tmp_path, monkeypatch):
+    """数据迁移失败即终止：根目录启动器在、旧版主程序仍在根目录、版本目录未建。"""
+    target = tmp_path / "installed"
+    staging = tmp_path / "staging"
+    appdata = tmp_path / "appdata" / "holdexar"
+    _flat_legacy(target)
+    # 旧版数据在 AppData（外置），安装根 data/ 还没有库
+    (target / "data" / "holdexar.db").unlink()
+    appdata.mkdir(parents=True)
+    (appdata / "holdexar.db").write_bytes(b"legacy_database")
+    _create_mock_app_payload(staging, "0.3.6", has_exe=True)
+    monkeypatch.setattr(update_host, "_launch_entry", lambda root: True)
+
+    def _boom(*a, **k):
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    monkeypatch.setattr(
+        "app.core.migration.migrate_appdata_to_portable", _boom, raising=True
+    )
+
+    ok = update_host.bridge_legacy_update(
+        staging=staging,
+        target=target,
+        data_dir=appdata,
+        current_version="0.3.2-beta",
+        skip_health_check=True,
+        launch_on_finish=False,
+    )
+    assert ok is False
+    assert (target / f"{APP_NAME}.exe").is_file()          # 新版启动入口在位
+    assert (target / "__legacy__" / f"{APP_NAME}.exe").is_file()  # 旧入口有备份
+    assert not (target / "versions").exists() or not any(
+        (target / "versions").iterdir()
+    )
+    # 迁移失败不得在 data/ 建新库替代历史数据
+    assert not (target / "data" / "holdexar.db").exists()
+
+
+def test_legacy_migration_conflict_stops_update(tmp_path, monkeypatch):
+    """两处都有库：拒绝覆盖，换装不开始。"""
+    target = tmp_path / "installed"
+    staging = tmp_path / "staging"
+    appdata = tmp_path / "appdata" / "holdexar"
+    _flat_legacy(target)
+    appdata.mkdir(parents=True)
+    (appdata / "holdexar.db").write_bytes(b"legacy_database")
+    _create_mock_app_payload(staging, "0.3.6", has_exe=True)
+    monkeypatch.setattr(update_host, "_launch_entry", lambda root: True)
+
+    ok = update_host.bridge_legacy_update(
+        staging=staging,
+        target=target,
+        data_dir=appdata,
+        current_version="0.3.2-beta",
+        skip_health_check=True,
+        launch_on_finish=False,
+    )
+    assert ok is False
+    # 安装根那份库不被旧库覆盖
+    assert (target / "data" / "holdexar.db").read_bytes() == b"user_database"
+
+
+def test_legacy_conversion_failure_restores_flat_layout(tmp_path, monkeypatch):
+    """版本目录转换失败：把已移动的条目搬回根目录，根目录仍有旧版主程序。"""
+    target = tmp_path / "installed"
+    _flat_legacy(target)
+
+    real_move = update_host._move_legacy_entry
+
+    def _move(root, source, dest):
+        if str(source).endswith(f"{APP_NAME}.exe") and dest.parent.name == "0.3.2-beta":
+            raise PermissionError("文件被占用")
+        return real_move(root, source, dest)
+
+    monkeypatch.setattr(update_host, "_move_legacy_entry", _move)
+
+    ok, reason = update_host.convert_legacy_layout(
+        target, source_version="0.3.2-beta"
+    )
+    assert ok is False
+    assert "文件被占用" in reason
+    # _internal 已搬入版本目录后被发现主程序搬不动，必须搬回根目录
+    assert (target / "_internal" / "python313.dll").is_file()
+    assert (target / f"{APP_NAME}.exe").read_bytes() == b"old_exe"
+
+
+def test_legacy_conversion_writes_typed_version_dir(tmp_path):
+    target = tmp_path / "installed"
+    _flat_legacy(target)
+
+    ok, _ = update_host.convert_legacy_layout(target, source_version="v0.3.2-beta")
+    assert ok is True
+    assert (target / "versions" / "0.3.2-beta" / f"{APP_NAME}.exe").is_file()
+    assert (target / "versions" / "0.3.2-beta" / "_internal" / "python313.dll").is_file()
+    curr = layout.read_current_state(target)
+    assert curr["version"] == "0.3.2-beta"
+    assert curr["pendingVersion"] == "0.3.2-beta"

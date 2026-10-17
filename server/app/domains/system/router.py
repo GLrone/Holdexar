@@ -55,6 +55,8 @@ async def health() -> dict:
         "app": settings.app_name,
         "version": settings.version,
         "pid": os.getpid(),
+        "dataDir": str(settings.data_dir),
+        "executable": os.path.abspath(sys.executable),
     }
     attempt_id = os.environ.get(f"{ENV_PREFIX}UPDATE_ATTEMPT_ID")
     if attempt_id is not None:
