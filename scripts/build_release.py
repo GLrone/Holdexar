@@ -59,6 +59,8 @@ TEMPLATE_DB_SRC = SEED_DIR / TEMPLATE_BASENAME
 
 # 品牌常量与应用版本同源（app.core.app_info 是纯标准库模块，可直接导入；
 # kernel_release 同为纯标准库，故可在装依赖之前取到内核资产清单）
+if str(SERVER) not in sys.path:
+    sys.path.insert(0, str(SERVER))
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from app.core.app_info import APP_NAME, APP_VERSION  # noqa: E402
