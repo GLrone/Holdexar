@@ -659,30 +659,33 @@ class DbWriter:
         return known.get(appid, {}), latest.get(appid, {})
 
     async def _query_baselines(self, session, appids: list[int]):
-        """批量取基线：每个 (appid, region) 只取最新一趟快照。
-
-        按 ux_gph_snapshot 的 (appid, region_code, snapshot_at) 前缀做组内
-        MAX 直取顶趟快照，免掉窗口函数对整段历史的排序——这条查询每批写库
-        前各跑一次，是写路径上最大的固定开销。一趟快照的行同时派生版本名
-        基线（known）：子版本名与地区无关，顶趟快照里出现的 (appid, sub_id)
-        后缀即当前基线；已从最新一趟消失的 sub 不再留旧值当 prev。
-        """
+        """沿索引跳过旧历史，读取各区最新快照的全部版本。"""
         known: dict[int, dict[int, str]] = {}
         latest: dict[int, dict[tuple[str, int], tuple]] = {}
         ids = [int(a) for a in dict.fromkeys(appids) if a]
         for chunk in _chunks(ids, 400):
             params = {f"a{i}": v for i, v in enumerate(chunk)}
-            placeholders = ",".join(f":a{i}" for i in range(len(chunk)))
+            values = ",".join(f"(:a{i})" for i in range(len(chunk)))
             rows = await session.execute(
                 text(
+                    f"WITH RECURSIVE requested(appid) AS (VALUES {values}),"
+                    " history_regions(appid, region_code) AS ("
+                    " SELECT appid, (SELECT MIN(region_code) FROM game_price_history"
+                    " WHERE appid=requested.appid) FROM requested"
+                    " UNION ALL"
+                    " SELECT appid, (SELECT MIN(region_code) FROM game_price_history"
+                    " WHERE appid=history_regions.appid"
+                    " AND region_code>history_regions.region_code)"
+                    " FROM history_regions WHERE region_code IS NOT NULL)"
                     "SELECT h.appid, h.region_code, h.sub_id, h.price, "
                     "h.original_price, h.discount_percent, h.version_suffix, "
-                    "h.is_gold FROM game_price_history h JOIN ("
-                    "  SELECT appid, region_code, MAX(snapshot_at) AS ms"
-                    "  FROM game_price_history"
-                    f"  WHERE appid IN ({placeholders}) GROUP BY appid, region_code"
-                    ") t ON h.appid = t.appid AND h.region_code = t.region_code"
-                    " AND h.snapshot_at = t.ms"
+                    "h.is_gold FROM history_regions r JOIN game_price_history h"
+                    " ON h.appid=r.appid AND h.region_code=r.region_code"
+                    " AND h.snapshot_at=(SELECT MAX(snapshot_at) FROM game_price_history"
+                    " WHERE appid=r.appid AND region_code=r.region_code)"
+                    " WHERE r.region_code IS NOT NULL"
+                    " ORDER BY h.appid, h.region_code, COALESCE(h.sub_id,-1),"
+                    " COALESCE(h.price,0), COALESCE(h.is_gold,0)"
                 ),
                 params,
             )

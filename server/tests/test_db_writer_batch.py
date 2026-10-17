@@ -59,6 +59,71 @@ async def _history_count(db, appid):
 
 
 @pytest.mark.asyncio
+async def test_baselines_keep_all_latest_versions_without_current_rows(db):
+    from sqlalchemy import insert
+
+    old = datetime(2026, 1, 1)
+    recent = datetime(2026, 1, 2)
+    rows = [
+        dict(appid=APPID_A, region_code="CN", sub_id=1, price=100,
+             version_suffix="retired", snapshot_at=old),
+        dict(appid=APPID_A, region_code="CN", sub_id=2, price=200,
+             version_suffix="deluxe", snapshot_at=recent),
+        dict(appid=APPID_A, region_code="CN", sub_id=3, price=300,
+             version_suffix=None, snapshot_at=recent, is_gold=True),
+        dict(appid=APPID_A, region_code="AR", sub_id=None, price=None,
+             version_suffix=None, snapshot_at=old),
+        dict(appid=APPID_A, region_code="TR", sub_id=2, price=400,
+             version_suffix="regional", snapshot_at=old),
+        dict(appid=APPID_B, region_code="CN", sub_id=1, price=500,
+             version_suffix=None, snapshot_at=None),
+    ]
+    async with db() as session:
+        await session.execute(insert(GamePriceHistory), rows)
+        await session.commit()
+        known, latest = await DbWriter()._query_baselines(
+            session, [APPID_B, APPID_A, APPID_A, 0, None]
+        )
+        assert known == {APPID_A: {2: "regional"}}
+        assert latest == {APPID_A: {
+            ("AR", 0): (None, None, 0, None, False),
+            ("CN", 2): (200, None, 0, "deluxe", False),
+            ("CN", 3): (300, None, 0, None, True),
+            ("TR", 2): (400, None, 0, "regional", False),
+        }}
+        assert await DbWriter()._query_baselines(session, []) == ({}, {})
+
+
+@pytest.mark.asyncio
+async def test_baseline_work_stays_small_with_long_history(db):
+    from datetime import timedelta
+    from sqlalchemy import insert
+
+    first = datetime(2026, 1, 1)
+    rows = [
+        dict(appid=APPID_A, region_code=region, sub_id=1, price=i,
+             snapshot_at=first + timedelta(seconds=i))
+        for region in ("CN", "US") for i in range(4000)
+    ]
+    async with db() as session:
+        await session.execute(insert(GamePriceHistory), rows)
+        await session.commit()
+        connection = await session.connection()
+        raw = await connection.get_raw_connection()
+        driver = raw.driver_connection
+        ticks = []
+        await driver.set_progress_handler(lambda: ticks.append(1), 1000)
+        try:
+            _, latest = await DbWriter()._query_baselines(session, [APPID_A])
+        finally:
+            await driver.set_progress_handler(None, 0)
+        assert {key: value[0] for key, value in latest[APPID_A].items()} == {
+            ("CN", 1): 3999, ("US", 1): 3999,
+        }
+        assert len(ticks) < 20, "latest baselines must not scan old snapshots"
+
+
+@pytest.mark.asyncio
 async def test_batch_writes_every_entry(db):
     """一批多款一次写入：逐款都落 current，价格正确。"""
     w = DbWriter()
