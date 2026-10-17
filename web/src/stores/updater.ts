@@ -42,6 +42,9 @@ export const useUpdaterStore = defineStore('updater', () => {
   const swapFailed = ref(false)
   /** 全局「已下载，需重启」弹窗是否已被用户关掉（本次会话内不再打扰） */
   const pendingDialogDismissed = ref(false)
+  /** 刚刚完成换装更新并首次启动（展示更新成功弹窗的依据） */
+  const justUpdated = ref<{ previousVersion: string; currentVersion: string } | null>(null)
+  const LAST_SEEN_KEY = 'holdexar_last_seen_version'
 
   /** 全局更新弹窗（模糊幕布）是否展开：更新模块已从设置页搬到这里 */
   const dialogOpen = ref(false)
@@ -116,6 +119,22 @@ export const useUpdaterStore = defineStore('updater', () => {
       const p = await systemApi.updatePending()
       pendingTag.value = p.pending ? (p.tag || '') : ''
       swapFailed.value = p.swapFailed === true
+      if (p.justUpdated) {
+        justUpdated.value = p.justUpdated
+      } else {
+        try {
+          const infoRes = await systemApi.info()
+          const curVer = infoRes.version
+          const lastSeen = localStorage.getItem(LAST_SEEN_KEY)
+          if (lastSeen && curVer && lastSeen !== curVer) {
+            justUpdated.value = { previousVersion: lastSeen, currentVersion: curVer }
+          } else if (!lastSeen && curVer) {
+            localStorage.setItem(LAST_SEEN_KEY, curVer)
+          }
+        } catch {
+          /* 忽略本地版本比对异常 */
+        }
+      }
     } catch {
       /* 拉不到保持现值 */
     }
@@ -243,6 +262,24 @@ export const useUpdaterStore = defineStore('updater', () => {
     }
   }
 
+  /** 关闭更新成功弹窗并闭合确认账本 */
+  async function dismissUpdated(): Promise<void> {
+    try {
+      await systemApi.updateAck()
+    } catch {
+      /* 忽略提交确认异常 */
+    }
+    if (justUpdated.value?.currentVersion) {
+      try {
+        localStorage.setItem(LAST_SEEN_KEY, justUpdated.value.currentVersion)
+      } catch {
+        /* 忽略存储异常 */
+      }
+    }
+    justUpdated.value = null
+    dialogOpen.value = false
+  }
+
   return {
     info,
     checking,
@@ -254,6 +291,7 @@ export const useUpdaterStore = defineStore('updater', () => {
     pendingTag,
     swapFailed,
     pendingDialogDismissed,
+    justUpdated,
     dialogOpen,
     skipped,
     failure,
@@ -262,6 +300,7 @@ export const useUpdaterStore = defineStore('updater', () => {
     download,
     cancel,
     dismissPendingDialog,
+    dismissUpdated,
     openDialog,
     closeDialog,
     skipVersion,

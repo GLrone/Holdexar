@@ -501,6 +501,14 @@ async def update_pending() -> dict:
     return updater.pending_status()
 
 
+@router.post("/system/update-ack")
+async def update_ack() -> dict:
+    """确认本次更新报告已查看，闭合账本状态。"""
+    from app.core import updater
+
+    return updater.acknowledge_update()
+
+
 @router.get("/system/seed/status")
 async def seed_status() -> dict:
     """公共数据种子状态：是否在位（含版本）+ 按需下载进度。"""

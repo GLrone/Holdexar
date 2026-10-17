@@ -102,6 +102,16 @@ watch(
   },
 )
 
+/* ── 换装升级完成：首次启动弹出更新成功窗口 ── */
+watch(
+  () => updaterStore.justUpdated,
+  (info) => {
+    if (!info) return
+    void updaterStore.openDialog()
+  },
+  { immediate: true },
+)
+
 /* ── 首次启动产品导览 ──
    settings KV `ui.onboarding_done` 与本地存储双保险判定：未标记且本地未跳过时延时 800ms
    启动。组件内任何关闭路径写标志。开关来自 tour store。 */

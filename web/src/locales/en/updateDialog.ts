@@ -14,6 +14,11 @@ export default {
   'updateDialog.headDownloading': 'Downloading v{version}',
   'updateDialog.headReady': 'v{version} is ready',
   'updateDialog.headFailed': 'Update failed',
+  'updateDialog.headUpdated': '🎉 Successfully Updated to v{version}',
+  'updateDialog.updatedSub': 'Updated from v{from} to v{to}',
+  'updateDialog.updatedBody': 'Current Version: v{version}',
+  'updateDialog.updatedHint': 'The new version is ready. All your data and settings are preserved. Enjoy!',
+  'updateDialog.gotIt': 'Got it',
 
   'updateDialog.checking': 'Checking for updates…',
   'updateDialog.upToDate': 'You are on the latest version (v{version})',

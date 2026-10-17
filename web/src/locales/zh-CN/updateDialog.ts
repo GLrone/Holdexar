@@ -14,6 +14,11 @@ export default {
   'updateDialog.headDownloading': '正在下载 v{version}',
   'updateDialog.headReady': 'v{version} 已就绪',
   'updateDialog.headFailed': '更新失败',
+  'updateDialog.headUpdated': '🎉 升级成功！已更新至 v{version}',
+  'updateDialog.updatedSub': '从 v{from} 顺利升级至 v{to}',
+  'updateDialog.updatedBody': '当前版本：v{version}',
+  'updateDialog.updatedHint': '新版本已就绪，所有数据与设置已平滑保留。祝你使用愉快！',
+  'updateDialog.gotIt': '我知道了',
 
   'updateDialog.checking': '正在检查更新…',
   'updateDialog.upToDate': '当前已是最新版本（v{version}）',
