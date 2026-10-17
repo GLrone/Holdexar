@@ -74,9 +74,8 @@ def test_detect_and_migrate_appdata(tmp_path, monkeypatch):
     assert (target_data / "migration.json").is_file()
     assert (target_data / "MIGRATION_FROM_APPDATA.txt").is_file()
 
-    # 验证原文件毫发无损
-    assert src_db.is_file()
-    assert (src_dir / "config" / "user.json").is_file()
+    # 验证原文件已被安全清理以避免留存 C 盘
+    assert not src_dir.exists()
 
     # 验证迁移后的库可用性
     conn = sqlite3.connect((target_data / "test_app.db").as_posix())
@@ -87,16 +86,37 @@ def test_detect_and_migrate_appdata(tmp_path, monkeypatch):
         conn.close()
 
 
-def test_migrate_conflict_prevented(tmp_path):
+def test_migrate_conflict_auto_resolved_src_wins(tmp_path):
     src_dir = tmp_path / "src"
     target_dir = tmp_path / "target"
-    _create_sample_db(src_dir / "test_app.db", "src_table")
-    _create_sample_db(target_dir / "test_app.db", "target_table")
+    # 源数据库有 games 记录，权重远高于目标库
+    _create_sample_db(src_dir / "test_app.db", "games")
+    _create_sample_db(target_dir / "test_app.db", "empty_placeholder")
 
-    # 目标已存在库，拒绝覆盖
     res = migration.migrate_appdata_to_portable(src_dir, target_dir, slug="test_app")
+    assert res["completed"] is True
+    assert res["reason"] == "auto_resolved"
+    assert res["migrated"] is True
+    # 确认源库被收编，目标原库已被备份
+    backups = list((target_dir / "backups").glob("*.db"))
+    assert len(backups) == 1
+    # 确认 C 盘历史目录已自动清理
+    assert not src_dir.exists()
+
+
+def test_migrate_conflict_auto_resolved_target_wins(tmp_path):
+    src_dir = tmp_path / "src"
+    target_dir = tmp_path / "target"
+    # 目标库有 games 记录
+    _create_sample_db(src_dir / "test_app.db", "old_scratch")
+    _create_sample_db(target_dir / "test_app.db", "games")
+
+    res = migration.migrate_appdata_to_portable(src_dir, target_dir, slug="test_app")
+    assert res["completed"] is True
+    assert res["reason"] == "auto_resolved"
     assert res["migrated"] is False
-    assert res["reason"] == "dest_db_exists"
+    # 确认 C 盘历史目录已自动清理
+    assert not src_dir.exists()
 
 
 def test_migrate_corrupted_aborts_cleanly(tmp_path):

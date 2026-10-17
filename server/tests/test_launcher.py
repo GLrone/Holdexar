@@ -126,6 +126,56 @@ def test_run_launcher_data_conflict_stops(tmp_path, monkeypatch):
     assert code == 1
 
 
+def test_run_launcher_data_conflict_auto_resolved(tmp_path, monkeypatch):
+    """双库冲突时 Launcher 自动进行仲裁裁决，收编最全库并安全拉起。"""
+    import sqlite3
+    root = tmp_path / "app"
+    _create_version(root, "0.3.5", has_exe=True)
+    layout.write_current_state(root, "0.3.5")
+
+    target_data = root / "data"
+    target_data.mkdir(parents=True)
+    target_db = target_data / "holdexar.db"
+    conn = sqlite3.connect(target_db.as_posix())
+    conn.execute("CREATE TABLE placeholder (id INT)")
+    conn.commit()
+    conn.close()
+
+    appdata_dir = tmp_path / "appdata"
+    appdata_dir.mkdir(parents=True)
+    appdata_db = appdata_dir / "holdexar.db"
+    conn = sqlite3.connect(appdata_db.as_posix())
+    conn.execute("CREATE TABLE games (id INT, title TEXT)")
+    conn.execute("INSERT INTO games VALUES (1, 'Test Game')")
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(
+        launcher,
+        "detect_legacy_data_locations",
+        lambda r: {
+            "targetDataDir": target_data,
+            "hasTargetDb": True,
+            "appdataDataDir": appdata_dir,
+            "hasAppdataDb": True,
+            "hasConflict": True,
+            "isFresh": False,
+        },
+    )
+    launched = []
+    monkeypatch.setattr(
+        launcher,
+        "launch_version",
+        lambda root, ver, argv=None, detached=True: launched.append((ver, detached)),
+    )
+
+    code = launcher.run_launcher(install_root_override=root, detached=False)
+    assert code == 0
+    assert len(launched) == 1
+    assert launched[0][0] == "0.3.5"
+    assert not appdata_dir.exists()
+
+
 def test_run_launcher_cleans_old_executables(tmp_path, monkeypatch):
     """启动器主流程自动清理 updater/ 与根目录下历史换装遗留的 *.old_* 临时文件。"""
     root = tmp_path / "app"
@@ -141,6 +191,16 @@ def test_run_launcher_cleans_old_executables(tmp_path, monkeypatch):
     old_launcher.write_bytes(b"old_launcher")
 
     monkeypatch.setattr(launcher, "launch_version", lambda *a, **k: None)
+    monkeypatch.setattr(
+        launcher,
+        "detect_legacy_data_locations",
+        lambda r: {
+            "isFresh": True,
+            "hasTargetDb": False,
+            "hasAppdataDb": False,
+            "hasConflict": False,
+        },
+    )
     code = launcher.run_launcher(install_root_override=root, detached=False)
     assert code == 0
     assert not old_host.exists()

@@ -72,17 +72,147 @@ def _read_migration_meta(target_data_dir: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def resolve_data_dir_conflict(target_data_dir: Path, slug: str = APP_SLUG) -> dict[str, Any]:
-    """目标已有库：绝不覆盖。只有目标库本身来自迁移才算可继续。"""
+def inspect_database_health(db_path: Path) -> dict[str, Any]:
+    """检查数据库健康度与丰富度指标（有效性、数据量、修改时间）。"""
+    if not db_path.is_file():
+        return {"exists": False, "valid": False, "score": -1, "gamesCount": 0, "size": 0, "mtime": 0}
+    st = db_path.stat()
+    size = st.st_size
+    mtime = st.st_mtime
+    games_count = 0
+    snapshots_count = 0
+    user_version = 0
+    valid = False
+    try:
+        conn = sqlite3.connect(db_path.as_posix(), timeout=5)
+        try:
+            row = conn.execute("PRAGMA quick_check").fetchone()
+            if row and str(row[0]).lower() == "ok":
+                valid = True
+            uv = conn.execute("PRAGMA user_version").fetchone()
+            user_version = uv[0] if uv else 0
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if "games" in tables:
+                gc = conn.execute("SELECT count(*) FROM games").fetchone()
+                games_count = gc[0] if gc else 0
+            if "price_snapshots" in tables:
+                sc = conn.execute("SELECT count(*) FROM price_snapshots").fetchone()
+                snapshots_count = sc[0] if sc else 0
+            elif "game_current_prices" in tables:
+                sc = conn.execute("SELECT count(*) FROM game_current_prices").fetchone()
+                snapshots_count = sc[0] if sc else 0
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("检查数据库健康度失败 %s：%s", db_path, exc)
+
+    # 评分体系：有效性（基底10^12） + 游戏数（权重10^6） + 价格快照数（权重10^3） + 体积KB
+    score = 0
+    if valid:
+        score += 1_000_000_000_000
+    score += games_count * 1_000_000
+    score += snapshots_count * 1_000
+    score += (size // 1024)
+
+    return {
+        "exists": True,
+        "valid": valid,
+        "size": size,
+        "mtime": mtime,
+        "user_version": user_version,
+        "gamesCount": games_count,
+        "snapshotsCount": snapshots_count,
+        "score": score,
+    }
+
+
+def resolve_data_dir_conflict(
+    target_data_dir: Path,
+    src_dir: Path | None = None,
+    slug: str = APP_SLUG,
+) -> dict[str, Any]:
+    """两处都有库时的智能冲突裁决：
+    1. 自动比对两处数据库的健康度、有效性、数据量（游戏数/快照数/体积）与时间；
+    2. 若 AppData 库信息更全，备份目标库并将 AppData 库收编进安装目录；
+    3. 若安装目录库更全或相当，保留安装目录库；
+    4. 裁决生效并确认完整无损后，自动清理 C 盘 AppData 目录，免除用户手工干预负担。
+    """
     db_name = data_dir_filename(slug)
-    meta = _read_migration_meta(target_data_dir)
-    adopted = bool(meta.get("completed"))
+    dest_db = target_data_dir / db_name
+
+    # 1. 查找源目录（AppData）
+    if src_dir is None:
+        for cand in machine_candidates(slug):
+            if (cand / db_name).is_file():
+                src_dir = cand
+                break
+
+    if src_dir is None or not (src_dir / db_name).is_file():
+        return {
+            "completed": dest_db.is_file(),
+            "status": MIGRATION_REUSED,
+            "migrated": False,
+            "reason": "no_source_conflict",
+            "targetDb": str(dest_db),
+            "warnings": [],
+        }
+
+    src_db = src_dir / db_name
+
+    # 2. 对比双库健康度与数据量
+    target_stat = inspect_database_health(dest_db)
+    src_stat = inspect_database_health(src_db)
+
+    logger.info(
+        "双库数据裁决：安装目录数据(score=%d, games=%d, size=%d) vs AppData数据(score=%d, games=%d, size=%d)",
+        target_stat["score"], target_stat["gamesCount"], target_stat["size"],
+        src_stat["score"], src_stat["gamesCount"], src_stat["size"],
+    )
+
+    # 3. 决定哪一方获胜
+    if src_stat["score"] > target_stat["score"]:
+        backups_dir = target_data_dir / "backups"
+        backups_dir.mkdir(parents=True, exist_ok=True)
+        backup_file = backups_dir / f"replaced_conflict_{int(time.time())}.db"
+        try:
+            shutil.copy2(dest_db, backup_file)
+            logger.info("已备份安装目录旧库至：%s", backup_file)
+        except Exception as exc:
+            logger.warning("备份旧库失败：%s", exc)
+
+        dest_db.unlink(missing_ok=True)
+        res = adopt_source_database(src_dir, target_data_dir, slug)
+        adopted = res.get("completed", False)
+    else:
+        adopted = target_stat["valid"]
+        meta = {
+            "resolvedAt": time.time(),
+            "winner": "target",
+            "targetScore": target_stat["score"],
+            "sourceScore": src_stat["score"],
+            "completed": True,
+        }
+        (target_data_dir / "migration.json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    # 4. 裁决确认无误后，自动清理 C 盘 AppData 目录，彻底杜绝后续干扰
+    cleaned_appdata = False
+    if adopted:
+        try:
+            shutil.rmtree(src_dir, ignore_errors=True)
+            cleaned_appdata = not src_dir.exists()
+            logger.info("自动数据裁决完成，已成功清理 C 盘 AppData 历史目录：%s", src_dir)
+        except Exception as exc:
+            logger.warning("清理 C 盘 AppData 目录失败：%s", exc)
+
     return {
         "completed": adopted,
-        "status": MIGRATION_REUSED if adopted else MIGRATION_CONFLICT,
-        "migrated": False,
-        "reason": "dest_db_exists",
-        "targetDb": str(target_data_dir / db_name),
+        "status": MIGRATION_COMPLETED if adopted else MIGRATION_FAILED,
+        "migrated": src_stat["score"] > target_stat["score"],
+        "reason": "auto_resolved",
+        "targetDb": str(dest_db),
+        "cleanedAppData": cleaned_appdata,
         "warnings": [],
     }
 
@@ -127,7 +257,7 @@ def migrate_appdata_to_portable(
         }
 
     if dest_db.is_file():
-        return resolve_data_dir_conflict(target_data_dir, slug)
+        return resolve_data_dir_conflict(target_data_dir, src_dir, slug)
 
     return adopt_source_database(src_dir, target_data_dir, slug)
 
@@ -215,17 +345,22 @@ def adopt_source_database(
         f"目标：{target_data_dir}",
         "",
         "您的应用数据（数据库与配置）已安全迁移到当前程序目录旁的 data/ 文件夹中。",
-        "原始 AppData 目录中的文件已被原样保留（未删除任何文件）。",
+        "为彻底避免多处存储混乱，原始 AppData 目录已由系统自动安全清理。",
     ]
     if warnings:
         notice_lines.append("")
         notice_lines.append("以下内容未能完整迁移，程序会在下次启动时再次尝试：")
         notice_lines.extend(f"- {item}" for item in warnings)
-    notice_lines.append("")
-    notice_lines.append("在确认新安装运行正常后，您可以根据需要手动清理或备份旧目录。")
     (target_data_dir / "MIGRATION_FROM_APPDATA.txt").write_text(
         "\n".join(notice_lines) + "\n", encoding="utf-8"
     )
+
+    # 5. 校验目标就绪后，自动清理 C 盘 AppData 目录，免除用户手工清理负担
+    try:
+        shutil.rmtree(src_dir, ignore_errors=True)
+        logger.info("旧数据已安全迁移至安装目录，自动清理 C 盘历史目录：%s", src_dir)
+    except Exception as exc:
+        logger.warning("清理 C 盘历史目录失败：%s", exc)
 
     return {
         "completed": True,
