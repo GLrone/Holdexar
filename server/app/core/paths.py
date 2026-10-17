@@ -46,11 +46,47 @@ def is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False))
 
 
-def app_dir() -> Path:
-    """程序目录：打包态 = exe 所在目录；开发态 = 仓库根。"""
+def install_root() -> Path:
+    """安装根目录：所有子模块的标准基准。"""
+    override = os.environ.get(f"{ENV_PREFIX}INSTALL_ROOT", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
     if is_frozen():
-        return Path(sys.executable).resolve().parent
+        exe = Path(sys.executable).resolve()
+        # 1. 运行在 versions/<version>/Holdexar.exe
+        if exe.parent.parent.name == "versions":
+            return exe.parent.parent.parent
+        # 2. 运行在 updater/UpdateHost.exe
+        if exe.parent.name == "updater":
+            return exe.parent.parent
+        # 3. 运行在根目录 Holdexar.exe (Launcher 或旧式扁平)
+        return exe.parent
     return PROJECT_ROOT
+
+
+def state_dir() -> Path:
+    return install_root() / "state"
+
+
+def versions_dir() -> Path:
+    return install_root() / "versions"
+
+
+def updater_dir() -> Path:
+    return install_root() / "updater"
+
+
+def staging_dir() -> Path:
+    return install_root() / "update-staging"
+
+
+def logs_dir() -> Path:
+    return install_root() / "logs"
+
+
+def app_dir() -> Path:
+    """程序安装根目录（兼容旧调用）。"""
+    return install_root()
 
 
 def _candidates_for(name: str) -> list[Path]:
@@ -122,38 +158,45 @@ def resolve_data_dir(slug: str = APP_SLUG, env_prefix: str = ENV_PREFIX) -> Path
     """按判定顺序解析数据目录，返回已就绪（存在且可写）的绝对路径。"""
     explicit = os.environ.get(f"{env_prefix}DATA_DIR", "").strip()
     if explicit:
-        return _ensure(Path(explicit).expanduser())
+        return _ensure(Path(explicit).expanduser().resolve())
 
-    base = app_dir()
+    root = install_root()
 
-    # 便携显式声明：程序目录内 data/ 即数据目录（随包搬走）
-    if (base / PORTABLE_FLAG).is_file():
-        return _ensure(base / "data")
-
-    # 存量布局：已有库就原地继续用，绝不擅自搬家（升级不丢数据的根因防线）
-    if (base / "data" / data_dir_filename(slug)).is_file():
-        return _ensure(base / "data")
-
-    # 开发态：指针文件写明的目录优先，其次机器级 dev 目录；两者都让运行时写入不落工作树
+    # 开发态：指针文件或机器级 dev 目录，避免运行时写污染工作树
     if not is_frozen():
-        pointed = read_dev_pointer()
+        if (root / PORTABLE_FLAG).is_file():
+            return _ensure(root / "data")
+        if (root / "data" / data_dir_filename(slug)).is_file():
+            return _ensure(root / "data")
+        pointed = read_dev_pointer(root)
         if pointed is not None:
             try:
                 return _ensure(pointed)
             except OSError:
                 pass
-        return _first_writable(dev_machine_candidates(slug), base / "data")
+        return _first_writable(dev_machine_candidates(slug), root / "data")
 
-    # 打包态机器级存量库原地续用：删旧目录重装、换解压位置都不产生空白环境
-    for candidate in machine_candidates(slug):
-        if (candidate / data_dir_filename(slug)).is_file():
-            try:
-                return _ensure(candidate)
-            except OSError:
-                continue
+    # 打包态（正式运行）：永远落安装根目录 data/
+    target = root / "data"
+    try:
+        _ensure(target)
+    except OSError as e:
+        raise PermissionError(f"安装目录数据文件夹不可写，请更换安装位置或检查权限：{target}") from e
 
-    # 打包态新装：数据与解压位置同盘；程序目录不可写（只读盘/受限目录）才落机器级
-    return _first_writable([base / "data", *machine_candidates(slug)], base / "data")
+    # 存量/新装判定与平滑迁移：
+    # 若目标尚未存在数据库，检测机器级 AppData 是否有老版本数据并触发只读迁移
+    db_file = target / data_dir_filename(slug)
+    if not db_file.is_file():
+        try:
+            from app.core.migration import detect_legacy_data_locations, migrate_appdata_to_portable
+
+            locs = detect_legacy_data_locations(root, slug)
+            if locs.get("hasAppdataDb") and locs.get("appdataDataDir"):
+                migrate_appdata_to_portable(locs["appdataDataDir"], target, slug)
+        except Exception:
+            pass
+
+    return target
 
 
 def describe_layout(data_dir: Path, slug: str = APP_SLUG) -> str:
@@ -161,22 +204,21 @@ def describe_layout(data_dir: Path, slug: str = APP_SLUG) -> str:
 
     只做归类不做决策：决策唯一入口是 resolve_data_dir，避免两套判定漂移。
     """
-    path = Path(data_dir)
-    if path in machine_candidates(slug):
+    path = Path(data_dir).resolve()
+    root = install_root().resolve()
+    if any(path == cand.resolve() for cand in machine_candidates(slug)):
         return "machine"
-    if path in dev_machine_candidates(slug):
+    if any(path == cand.resolve() for cand in dev_machine_candidates(slug)):
         return "dev-machine"
-    if path == app_dir() / "data":
-        # 便携 / 存量两支必须**先于** is_frozen() 判定：它们与「是否打包」无关，
-        # 放在其后会让未打包时这两支永远不可达、统统被标成 dev。
-        if (app_dir() / PORTABLE_FLAG).is_file():
+    if path == (root / "data").resolve():
+        if (root / PORTABLE_FLAG).is_file():
             return "portable"
-        if (app_dir() / "data" / data_dir_filename(slug)).is_file():
+        if (root / "data" / data_dir_filename(slug)).is_file():
             return "legacy"
         return "appdir" if is_frozen() else "dev"
     if not is_frozen():
-        pointed = read_dev_pointer()
-        if pointed is not None and path == pointed:
+        pointed = read_dev_pointer(root)
+        if pointed is not None and path == pointed.resolve():
             return "dev-pointer"
     return "custom"
 
@@ -238,10 +280,16 @@ __all__ = [
     "data_dir_filename",
     "describe_layout",
     "dev_machine_candidates",
+    "install_root",
     "is_frozen",
     "is_inside",
     "layout_warning",
+    "logs_dir",
     "machine_candidates",
     "read_dev_pointer",
     "resolve_data_dir",
+    "staging_dir",
+    "state_dir",
+    "updater_dir",
+    "versions_dir",
 ]

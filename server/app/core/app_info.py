@@ -16,7 +16,7 @@ APP_SLUG = APP_NAME.lower()
 # 便于环境变量覆盖；发布脚本读的也是这里）。发版时只改这一行。
 # 放在 app_info 而非 config：config 要 import pydantic，而发布/构建脚本、
 # run.py、desktop/main.py 需要在装依赖之前就能取到版本号。
-APP_VERSION = "0.3.2-beta"
+APP_VERSION = "0.3.5-beta"
 
 GITHUB_REPO = "GLrone/Holdexar"
 
@@ -56,6 +56,9 @@ ENV_PREFIX = "HOLDEXAR_"
 # 暂存包（包括没有摘除 manifest 逻辑的旧构建）都能把它拖成死循环——终止判据
 # 必须落在现装侧，不能指望暂存包自己守规矩。换装成功/用户重新下载时清零。
 HANDOFF_LEDGER_NAME = "update-handoff.json"
+
+# 健康检查超时阈值（秒）
+HEALTH_TIMEOUT = 30.0
 
 
 def version_from_tag(tag: str) -> str:

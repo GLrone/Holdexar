@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -70,6 +71,7 @@ from app.core.app_info import (  # noqa: E402
 from app.core.paths import (  # noqa: E402
     PORTABLE_FLAG,
     data_dir_filename,
+    install_root,
     is_frozen,
     is_inside,
     resolve_data_dir,
@@ -413,10 +415,8 @@ class DesktopApi:
         return {"ok": True}
 
 def _app_root() -> Path:
-    """程序根目录：打包态 = exe 所在目录；开发态 = 项目根。"""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return PROJECT_ROOT
+    """程序安装根目录。"""
+    return install_root()
 
 
 def _data_dir() -> Path:
@@ -515,7 +515,75 @@ def _classify_error(e: Exception) -> tuple[str, int | None]:
     return "UPDATE-UNKNOWN", winerr
 
 
-def _init_diagnosis(staging: Path, target: Path, attempt_id: str | None = None) -> dict:
+def _read_pe_product_version(exe_path: Path) -> str | None:
+    """读取 Windows PE 文件的 ProductVersion 字符串。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        version_dll = getattr(ctypes.windll, "version", None)
+        if version_dll is None:
+            return None
+        size = version_dll.GetFileVersionInfoSizeW(str(exe_path), None)
+        if not size:
+            return None
+        buf = ctypes.create_string_buffer(size)
+        if not version_dll.GetFileVersionInfoW(str(exe_path), 0, size, buf):
+            return None
+        sub_blocks = [
+            r"\StringFileInfo\040904b0\ProductVersion",
+            r"\StringFileInfo\080404b0\ProductVersion",
+            r"\StringFileInfo\000004b0\ProductVersion",
+            r"\StringFileInfo\040904e4\ProductVersion",
+            r"\StringFileInfo\080404e4\ProductVersion",
+        ]
+        val_ptr = ctypes.c_void_p()
+        val_len = wintypes.UINT()
+        for sub in sub_blocks:
+            if version_dll.VerQueryValueW(buf, sub, ctypes.byref(val_ptr), ctypes.byref(val_len)):
+                if val_len.value > 0 and val_ptr.value:
+                    ver_str = ctypes.wstring_at(val_ptr.value).strip()
+                    if ver_str:
+                        return ver_str
+    except Exception:
+        pass
+    return None
+
+
+def _detect_installed_version(target: Path) -> str | None:
+    """检测安装目录当前的程序版本。"""
+    if not target.is_dir():
+        return None
+
+    app_info = target / "_internal" / "server" / "app" / "core" / "app_info.py"
+    if app_info.is_file():
+        try:
+            content = app_info.read_text(encoding="utf-8", errors="replace")
+            m = re.search(r'''APP_VERSION\s*=\s*["']([^"']+)["']''', content)
+            if m and m.group(1).strip():
+                return m.group(1).strip()
+        except Exception:
+            pass
+
+    exe_candidates = [
+        target / f"{APP_NAME}.exe",
+        _staged_main_exe(target),
+    ]
+    for exe in exe_candidates:
+        if exe and exe.is_file():
+            ver = _read_pe_product_version(exe)
+            if ver:
+                return ver
+
+    return None
+
+
+def _init_diagnosis(
+    staging: Path,
+    target: Path,
+    attempt_id: str | None = None,
+    current_version: str | None = None,
+) -> dict:
     """初始化结构化换装诊断记录。"""
     manifest_file = staging / _MANIFEST_NAME
     manifest_info: dict = {}
@@ -527,11 +595,19 @@ def _init_diagnosis(staging: Path, target: Path, attempt_id: str | None = None) 
     aid = attempt_id or manifest_info.get("attempt_id") or str(uuid.uuid4())
     tag = str(manifest_info.get("tag") or "")
     target_ver = version_from_tag(tag) or tag
+    cur_ver = (
+        current_version
+        or os.environ.get(f"{ENV_PREFIX}SOURCE_VERSION")
+        or manifest_info.get("source_version")
+        or manifest_info.get("current_version")
+        or _detect_installed_version(target)
+        or "unknown"
+    )
     return {
         "attemptId": aid,
         "stage": "idle",
         "targetVersion": target_ver,
-        "currentVersion": APP_VERSION,
+        "currentVersion": cur_ver,
         "startTime": time.time(),
         "endTime": None,
         "success": False,
@@ -1007,7 +1083,9 @@ def _handoff_pending_update() -> bool:
         _log_update("上次更新未完成，暂停自动安装，按现装启动")
         return False
 
-    staging = _data_dir() / STAGING_DIR_NAME
+    staging = _app_root() / STAGING_DIR_NAME
+    if not (staging / _MANIFEST_NAME).is_file():
+        staging = _data_dir() / STAGING_DIR_NAME
     payload = staging / APP_NAME
     manifest = staging / _MANIFEST_NAME
     if not manifest.is_file() or not payload.is_dir():
@@ -1074,17 +1152,38 @@ def _handoff_pending_update() -> bool:
 
 
     attempt_id = str(info.get("attempt_id") or uuid.uuid4())
+    child_env = dict(os.environ)
+    child_env[f"{ENV_PREFIX}SOURCE_VERSION"] = APP_VERSION
+
+    update_host_exe = _app_root() / "updater" / "UpdateHost.exe"
+    if update_host_exe.is_file():
+        cmd = [
+            str(update_host_exe),
+            "--staging", str(staging),
+            "--target", str(_app_root()),
+            "--wait-pid", str(os.getpid()),
+            "--attempt-id", attempt_id,
+            "--target-version", staged_version,
+            "--source-version", APP_VERSION,
+        ]
+        cwd = str(update_host_exe.parent)
+    else:
+        cmd = [
+            str(staged_exe), _HELPER_FLAG,
+            "--staging", str(staging),
+            "--target", str(_app_root()),
+            "--wait-pid", str(os.getpid()),
+            "--attempt-id", attempt_id,
+            "--data-dir", str(_data_dir()),
+            "--current-version", APP_VERSION,
+        ]
+        cwd = str(staged_exe.parent)
+
     try:
         subprocess.Popen(
-            [
-                str(staged_exe), _HELPER_FLAG,
-                "--staging", str(staging),
-                "--target", str(_app_root()),
-                "--wait-pid", str(os.getpid()),
-                "--attempt-id", attempt_id,
-                "--data-dir", str(_data_dir()),
-            ],
-            cwd=str(staged_exe.parent),
+            cmd,
+            cwd=cwd,
+            env=child_env,
             close_fds=True,
             creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
         )
@@ -1508,16 +1607,18 @@ def _clear_update_marker(path: Path) -> None:
 def _run_update_helper(
     staging: Path, target: Path, wait_pid: int | None,
     attempt_id: str | None = None, data_dir: Path | None = None,
+    current_version: str | None = None,
 ) -> None:
     """固定数据目录到安装目标侧，换装日志与诊断写入用户可保留的位置。
 
-    data_dir 优先级：显式传入 > 从 target 推导（便携标记 / 已有库 / 同盘 data）。
-    旧版本交接不传 --data-dir 时走推导，保证向后兼容。
+    data_dir 优先级：显式传入 > staging.parent 存量推导 > target/data 推导。
+    旧版本交接不传 --data-dir 时优先从 staging.parent 恢复旧数据目录。
     """
     staging, target = staging.resolve(), target.resolve()
     if data_dir is None:
-        # 从安装目标推导：便携模式 / 已有数据库 → target/data；否则同盘 data
-        if (target / PORTABLE_FLAG).is_file() or (
+        if (staging.parent / data_dir_filename()).is_file():
+            data_dir = staging.parent
+        elif (target / PORTABLE_FLAG).is_file() or (
             target / "data" / data_dir_filename()
         ).is_file():
             data_dir = target / "data"
@@ -1533,7 +1634,9 @@ def _run_update_helper(
     os.environ[key] = str(data_dir)
     try:
         os.chdir(target)
-        _apply_staged_update(staging, target, wait_pid, attempt_id)
+        _apply_staged_update(
+            staging, target, wait_pid, attempt_id, current_version
+        )
     finally:
         try:
             os.chdir(previous_cwd)
@@ -1546,14 +1649,17 @@ def _run_update_helper(
 
 
 def _apply_staged_update(
-    staging: Path, target: Path, wait_pid: int | None, attempt_id: str | None = None,
+    staging: Path, target: Path, wait_pid: int | None,
+    attempt_id: str | None = None, current_version: str | None = None,
 ) -> None:
     """在进程退出后换装，验收失败则恢复原版本。"""
     _log_update(f"换装进程启动：staging={staging} target={target} wait_pid={wait_pid}")
     if not _acquire_swap_mutex():
         _log_update("已有换装进程在运行")
         return
-    diagnosis = _init_diagnosis(staging, target, attempt_id)
+    diagnosis = _init_diagnosis(
+        staging, target, attempt_id, current_version=current_version
+    )
     _write_diagnosis(diagnosis)
     swapped = False
     proc = None
@@ -2690,7 +2796,8 @@ def main() -> None:
     parser.add_argument("--wait-pid", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--attempt-id", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--data-dir", default=None, help=argparse.SUPPRESS)
-    args = parser.parse_args()
+    parser.add_argument("--current-version", default=None, help=argparse.SUPPRESS)
+    args, _ = parser.parse_known_args()
 
     # 换装进程优先分流：不挂孤儿防线、不协商端口、不起服务与窗口——只做换装
     if getattr(args, "apply_update"):
@@ -2703,6 +2810,7 @@ def main() -> None:
             args.wait_pid,
             attempt_id=getattr(args, "attempt_id", None),
             data_dir=Path(args.data_dir) if args.data_dir else None,
+            current_version=getattr(args, "current_version", None),
         )
         return
 

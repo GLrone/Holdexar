@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import shutil
 import subprocess
 import sys
@@ -122,6 +123,80 @@ def run_pyinstaller(python: Path) -> None:
     ])
 
 
+def assemble_versioned_layout(version: str, python: Path) -> None:
+    """将 PyInstaller onedir 产物组装为新架构布局：
+    Holdexar/
+    ├── Holdexar.exe (Launcher)
+    ├── updater/UpdateHost.exe
+    ├── versions/<version>/ (完整独立版本运行文件)
+    └── state/current.json
+    """
+    print(f"[布局] 组装多版本安装布局（版本 {version}）...")
+    temp_app = DIST_DIR / "_app_temp"
+    if temp_app.exists():
+        shutil.rmtree(temp_app)
+    shutil.move(str(APP_DIR), str(temp_app))
+
+    # 编译轻量启动器 Holdexar.exe
+    print("[启动器] 编译 Holdexar.exe (Launcher)...")
+    launcher_dist = DIST_DIR / "_launcher_build"
+    subprocess.check_call([
+        str(python), "-m", "PyInstaller", "--onefile", "--noconfirm", "--clean",
+        "--paths", str(SERVER),
+        "--icon", str(DESKTOP / "app.ico"),
+        "--distpath", str(launcher_dist),
+        "--workpath", str(WORK_DIR / "launcher"),
+        "--name", APP_NAME,
+        str(DESKTOP / "launcher_main.py"),
+    ])
+
+    # 编译独立更新宿主 UpdateHost.exe
+    print("[更新宿主] 编译 UpdateHost.exe...")
+    updater_dist = DIST_DIR / "_updater_build"
+    subprocess.check_call([
+        str(python), "-m", "PyInstaller", "--onefile", "--noconfirm", "--clean",
+        "--paths", str(SERVER),
+        "--icon", str(DESKTOP / "app.ico"),
+        "--distpath", str(updater_dist),
+        "--workpath", str(WORK_DIR / "updater"),
+        "--name", "UpdateHost",
+        str(DESKTOP / "update_host_main.py"),
+    ])
+
+    # 重建 APP_DIR 并组装布局
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 1. 移动完整应用运行文件至 versions/<version>/
+    v_dir = APP_DIR / "versions" / version
+    v_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(temp_app), str(v_dir))
+
+    # 2. 根目录放置轻量启动器 Holdexar.exe
+    shutil.copy2(launcher_dist / f"{APP_NAME}.exe", APP_DIR / f"{APP_NAME}.exe")
+
+    # 3. updater 目录放置独立 UpdateHost.exe
+    updater_dir = APP_DIR / "updater"
+    updater_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(updater_dist / "UpdateHost.exe", updater_dir / "UpdateHost.exe")
+
+    # 4. state/current.json 版本指针
+    state_dir = APP_DIR / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    current_state = {
+        "version": version,
+        "installedAt": 0,
+        "lastKnownGood": None,
+    }
+    (state_dir / "current.json").write_text(
+        json.dumps(current_state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    # 清理构建临时产物
+    shutil.rmtree(launcher_dist, ignore_errors=True)
+    shutil.rmtree(updater_dist, ignore_errors=True)
+    print(f"[布局] 多版本结构组装完成：{APP_DIR}")
+
+
 def sanitize() -> None:
     """产物消毒：任何用户数据/日志/db 残留即删除并复检，仍有则中止发布。
 
@@ -190,6 +265,9 @@ def stage_seed_asset() -> Path | None:
         return None
     RELEASE.mkdir(parents=True, exist_ok=True)
     dest = RELEASE / SEED_GZ_NAME
+    if dest.is_file() and dest.stat().st_size > 0 and dest.stat().st_mtime >= SEED_DB.stat().st_mtime:
+        print(f"[发布] 种子资产沿用现有：{dest.name}（{dest.stat().st_size / 1048576:.1f} MB）")
+        return dest
     import gzip
 
     with SEED_DB.open("rb") as fin, gzip.open(dest, "wb", compresslevel=9) as fout:
@@ -279,8 +357,9 @@ def main() -> None:
     python = pick_python()
     ensure_pyinstaller(python)
     run_pyinstaller(python)
-    sanitize()
     version = app_version()
+    assemble_versioned_layout(version, python)
+    sanitize()
     stage_seed_asset()
     stage_template_asset()
     zip_path, sha256 = make_zip(version)

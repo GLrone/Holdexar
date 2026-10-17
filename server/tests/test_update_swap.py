@@ -1100,3 +1100,63 @@ def test_swap_keeps_case_variant_of_user_data(tmp_path):
     _make_payload(staging)
     assert desktop._swap_payload(staging, target) is True
     assert (target / "Data" / "holdexar.db").read_bytes() == b"user-data"
+
+
+def test_detect_installed_version_from_app_info(tmp_path: Path):
+    target = tmp_path / "target"
+    core_dir = target / "_internal" / "server" / "app" / "core"
+    core_dir.mkdir(parents=True)
+    (core_dir / "app_info.py").write_text('APP_VERSION = "0.3.2-beta"\n', encoding="utf-8")
+    assert desktop._detect_installed_version(target) == "0.3.2-beta"
+
+
+def test_init_diagnosis_records_accurate_source_version(tmp_path: Path, monkeypatch):
+    import json
+
+    target = tmp_path / "target"
+    core_dir = target / "_internal" / "server" / "app" / "core"
+    core_dir.mkdir(parents=True)
+    (core_dir / "app_info.py").write_text('APP_VERSION = "0.3.2-beta"\n', encoding="utf-8")
+
+    staging = tmp_path / "staging"
+    staging.mkdir(parents=True)
+    (staging / "manifest.json").write_text(
+        json.dumps({"tag": "v0.3.4-beta", "sha256": "abc"}), encoding="utf-8"
+    )
+
+    diag = desktop._init_diagnosis(staging, target)
+    assert diag["currentVersion"] == "0.3.2-beta"
+    assert diag["targetVersion"] == "0.3.4-beta"
+
+    (staging / "manifest.json").write_text(
+        json.dumps({"tag": "v0.3.4-beta", "source_version": "0.3.3-beta"}), encoding="utf-8"
+    )
+    diag = desktop._init_diagnosis(staging, target)
+    assert diag["currentVersion"] == "0.3.3-beta"
+
+    monkeypatch.setenv(f"{desktop.ENV_PREFIX}SOURCE_VERSION", "0.3.3-beta.2")
+    diag = desktop._init_diagnosis(staging, target)
+    assert diag["currentVersion"] == "0.3.3-beta.2"
+
+    diag = desktop._init_diagnosis(staging, target, current_version="0.3.3-beta.3")
+    assert diag["currentVersion"] == "0.3.3-beta.3"
+
+    empty_target = tmp_path / "empty"
+    empty_target.mkdir()
+    monkeypatch.delenv(f"{desktop.ENV_PREFIX}SOURCE_VERSION", raising=False)
+    (staging / "manifest.json").write_text(
+        json.dumps({"tag": "v0.3.4-beta"}), encoding="utf-8"
+    )
+    diag = desktop._init_diagnosis(staging, empty_target)
+    assert diag["currentVersion"] == "unknown"
+
+
+def test_read_pe_product_version_safe_on_invalid_or_missing_file(tmp_path: Path):
+    missing = tmp_path / "missing.exe"
+    assert desktop._read_pe_product_version(missing) is None
+
+    invalid = tmp_path / "not_a_pe.exe"
+    invalid.write_text("plain text", encoding="utf-8")
+    assert desktop._read_pe_product_version(invalid) is None
+
+
