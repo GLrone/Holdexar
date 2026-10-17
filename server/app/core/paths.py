@@ -184,37 +184,35 @@ def resolve_data_dir(slug: str = APP_SLUG, env_prefix: str = ENV_PREFIX) -> Path
         raise PermissionError(f"安装目录数据文件夹不可写，请更换安装位置或检查权限：{target}") from e
 
     # 存量/新装判定与平滑迁移：
-    # 目标还没有库、机器级却有旧库时先把旧库收进来；迁移没完成（冲突 / 快照失败）
-    # 就不许在这个目录上建新库——宁可起不来并说清原因，也不能让用户对着空库操作。
+    # 检查是否有旧版本 AppData 数据与冲突，自动完成仲裁、备份与收拢
     db_file = target / data_dir_filename(slug)
-    if not db_file.is_file():
-        from app.core.migration import (
-            MIGRATION_CONFLICT,
-            detect_legacy_data_locations,
-            migrate_appdata_to_portable,
-        )
+    from app.core.migration import (
+        detect_legacy_data_locations,
+        migrate_appdata_to_portable,
+        resolve_data_dir_conflict,
+    )
 
-        try:
-            locs = detect_legacy_data_locations(root, slug)
-            old_dir = locs.get("appdataDataDir")
-            if locs.get("hasAppdataDb") and old_dir:
-                result = migrate_appdata_to_portable(old_dir, target, slug)
-                if result.get("status") == MIGRATION_CONFLICT:
-                    raise PermissionError(
-                        f"检测到两处用户数据库：安装目录 {target} 与旧数据目录 {old_dir}。"
-                        "为避免覆盖任何一份，程序没有启动。请保留需要继续使用的那一份，"
-                        "删掉另一份后重新打开。"
-                    )
-                if not db_file.is_file():
-                    raise PermissionError(
-                        f"旧数据迁移未完成，已停止启动以免生成空库。旧库位置：{old_dir}"
-                    )
-        except PermissionError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise PermissionError(
-                f"旧数据迁移失败，已停止启动以免生成空库：{exc}"
-            ) from exc
+    try:
+        locs = detect_legacy_data_locations(root, slug)
+        old_dir = locs.get("appdataDataDir")
+        if locs.get("hasConflict") and old_dir:
+            res = resolve_data_dir_conflict(target, old_dir, slug)
+            if not res.get("completed"):
+                raise PermissionError(
+                    f"检测到数据库损坏且自动恢复失败，已停止启动以保护数据：{target} 与 {old_dir}"
+                )
+        elif locs.get("hasAppdataDb") and old_dir and not db_file.is_file():
+            result = migrate_appdata_to_portable(old_dir, target, slug)
+            if not result.get("completed"):
+                raise PermissionError(
+                    f"旧数据迁移未完成，已停止启动以免生成空库。旧库位置：{old_dir}"
+                )
+    except PermissionError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise PermissionError(
+            f"旧数据迁移失败，已停止启动以免生成空库：{exc}"
+        ) from exc
 
     return target
 

@@ -138,14 +138,13 @@ def run_launcher(
     try:
         locs = detect_legacy_data_locations(root)
         if locs.get("hasConflict"):
-            res = resolve_data_dir_conflict(root / "data")
+            appdata_dir = locs.get("appdataDataDir")
+            res = resolve_data_dir_conflict(root / "data", appdata_dir)
             if not res.get("completed"):
-                appdata_dir = locs.get("appdataDataDir")
                 _show_fatal(
-                    "检测到安装目录与 AppData 同时存在用户数据，无法判断该使用哪一份，已停止启动。\n\n"
+                    "检测到数据库文件损坏且自动恢复失败，已停止启动以保护数据。\n\n"
                     f"安装目录数据：{root / 'data'}\n"
-                    f"AppData 数据：{appdata_dir}\n\n"
-                    "请保留要继续使用的一份，删除另一份后重新启动。"
+                    f"AppData 数据：{appdata_dir}\n"
                 )
                 return 1
         elif locs.get("hasAppdataDb") and not locs.get("hasTargetDb"):
