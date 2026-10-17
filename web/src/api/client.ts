@@ -2235,6 +2235,11 @@ export interface UpdatePending {
   tag?: string
   /** 上次换装失败已回滚（前端给「重新下载」出路的依据） */
   swapFailed?: boolean
+  /** 刚刚完成换装并首次启动（弹窗提醒升级成功） */
+  justUpdated?: {
+    previousVersion: string
+    currentVersion: string
+  } | null
 }
 
 /** 密钥保护状态：凭据静态加密的密钥托管方式与解锁态 */
@@ -2350,6 +2355,7 @@ export const systemApi = {
   updateProgress: () => request<UpdateProgress>('GET', '/system/update-progress'),
   updatePending: () => request<UpdatePending>('GET', '/system/update-pending'),
   updateCancel: () => request<{ cleared: boolean }>('POST', '/system/update-cancel'),
+  updateAck: () => request<{ acknowledged: boolean }>('POST', '/system/update-ack'),
 }
 
 /** 运行日志 SSE 订阅地址（EventSource 直连） */

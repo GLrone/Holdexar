@@ -1020,6 +1020,7 @@ def _commit(
         "stage": layout.STAGE_COMMITTED,
         "success": True,
         "endTime": time.time(),
+        "acknowledged": False,
     })
     _write_diagnosis(root, diagnosis)
     return True

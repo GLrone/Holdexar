@@ -792,25 +792,91 @@ def _extract(zip_path: Path, staging: Path) -> None:
 # ── 换装状态查询 ─────────────────────────────────────────────────────
 
 
+def just_updated_status() -> dict | None:
+    """换装升级完成状态投影（首次启动向用户展示「更新成功」报告）。
+
+    单一事实源：logs/update-diagnosis.json（UpdateHost 换装提交时写入）。
+    只有当换装成功（success=True 且 stage="committed"）、尚未向用户提示（not acknowledged）、
+    且 targetVersion 等于当前 APP_VERSION 时才向上汇报。
+    """
+    from app.core.paths import install_root, logs_dir
+
+    candidates = [
+        logs_dir() / "update-diagnosis.json",
+        install_root() / "logs" / "update-diagnosis.json",
+        install_root() / "data" / "logs" / "update-diagnosis.json",
+    ]
+    diag_file = next((p for p in candidates if p.is_file()), None)
+    if not diag_file:
+        return None
+    try:
+        data = json.loads(diag_file.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not (data.get("success") is True and data.get("stage") == "committed"):
+        return None
+    if data.get("acknowledged") is True:
+        return None
+    target_ver = data.get("targetVersion") or ""
+    if target_ver and target_ver != APP_VERSION:
+        return None
+    prev_ver = data.get("currentVersion") or ""
+    return {
+        "previousVersion": prev_ver,
+        "currentVersion": target_ver or APP_VERSION,
+    }
+
+
+def acknowledge_update() -> dict:
+    """用户已查看更新成功报告，闭合账本标记为已确认。"""
+    from app.core.paths import install_root, logs_dir
+
+    candidates = [
+        logs_dir() / "update-diagnosis.json",
+        install_root() / "logs" / "update-diagnosis.json",
+        install_root() / "data" / "logs" / "update-diagnosis.json",
+    ]
+    updated = False
+    for diag_file in candidates:
+        if not diag_file.is_file():
+            continue
+        try:
+            data = json.loads(diag_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("acknowledged") is not True:
+                data["acknowledged"] = True
+                tmp = diag_file.with_suffix(".tmp")
+                tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                tmp.replace(diag_file)
+                updated = True
+        except Exception:
+            pass
+    return {"acknowledged": True, "updated": updated}
+
+
 def pending_status() -> dict:
     """staging 就绪状态（前端「重启以完成更新」提示的依据）。
 
     swapFailed 投影换装失败标记：换装失败只有原生弹窗一个出口，前端拿不到
     这个事实就没法给「重新下载」的出路（账本同源：标记是唯一事实源，这里只读）。
+    justUpdated 投影换装成功首次启动事实，前端据此弹出更新成功报告。
     """
     staging = staging_dir()
     manifest = staging / "manifest.json"
     swap_failed = (staging.parent / SWAP_FAILED_FLAG).is_file()
+    just_updated = just_updated_status()
     if not manifest.is_file():
-        return {"pending": False, "swapFailed": swap_failed}
+        return {"pending": False, "swapFailed": swap_failed, "justUpdated": just_updated}
     try:
         data = json.loads(manifest.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 —— 坏 manifest 视为无暂存
-        return {"pending": False, "swapFailed": swap_failed}
+        return {"pending": False, "swapFailed": swap_failed, "justUpdated": just_updated}
     return {
         "pending": bool(data.get("ready")),
         "tag": data.get("tag"),
         "swapFailed": swap_failed,
+        "justUpdated": just_updated,
     }
 
 

@@ -59,8 +59,10 @@ type Phase =
   | 'downloading'
   | 'ready'
   | 'failed'
+  | 'updated'
 
 const phase = computed<Phase>(() => {
+  if (updater.justUpdated) return 'updated'
   if (updater.pendingTag) return 'ready'
   if (updater.downloading) return 'downloading'
   if (updater.failure) return 'failed'
@@ -74,10 +76,13 @@ const phase = computed<Phase>(() => {
 
 const latestVersion = computed(() => (info.value?.latest || '').replace(/^v/, ''))
 const pendingVersion = computed(() => updater.pendingTag.replace(/^v/, ''))
-/** 头部展示的版本：待重启用暂存 tag，其余用清单里的最新版 */
-const showVersion = computed(() =>
-  phase.value === 'ready' ? pendingVersion.value : latestVersion.value,
-)
+/** 头部展示的版本：换装成功用当前版本，待重启用暂存 tag，其余用清单里的最新版 */
+const showVersion = computed(() => {
+  if (phase.value === 'updated') {
+    return (updater.justUpdated?.currentVersion || latestVersion.value).replace(/^v/, '')
+  }
+  return phase.value === 'ready' ? pendingVersion.value : latestVersion.value
+})
 
 /** 发布日期：ISO 日期段（清单时间是 UTC，截取即发布当天的稳定口径） */
 const releaseDate = computed(() => (info.value?.publishedAt || '').slice(0, 10))
@@ -85,6 +90,8 @@ const releaseDate = computed(() => (info.value?.publishedAt || '').slice(0, 10))
 const headTitle = computed(() => {
   const version = showVersion.value
   switch (phase.value) {
+    case 'updated':
+      return t('updateDialog.headUpdated', { version })
     case 'available':
       return t('updateDialog.headAvailable', { version })
     case 'downloading':
@@ -188,10 +195,18 @@ function openReleases(): void {
   if (releasesUrl.value) window.open(releasesUrl.value, '_blank')
 }
 
+async function onDismissUpdated(): Promise<void> {
+  await updater.dismissUpdated()
+}
+
 function onClose(): void {
   // 下载中不允许关窗：进度会失去可见落点，用户容易以为卡死了
   if (phase.value === 'downloading') {
     message.info(t('updateDialog.toastCloseBlocked'))
+    return
+  }
+  if (phase.value === 'updated') {
+    void updater.dismissUpdated()
     return
   }
   updater.closeDialog()
@@ -204,10 +219,16 @@ function onClose(): void {
       <div v-if="open" class="upd-overlay" @click.self="onClose">
         <div class="upd-modal" role="dialog" aria-modal="true" :aria-label="t('updateDialog.title')">
           <header class="upd-head">
-            <span class="upd-head__icon"><HlIcon name="download" :size="20" /></span>
+            <span class="upd-head__icon" :class="{ 'upd-head__icon--success': phase === 'updated' }">
+              <HlIcon :name="phase === 'updated' ? 'check-circle' : 'download'" :size="20" />
+            </span>
             <div class="upd-head__text">
               <h2 class="upd-head__title">{{ headTitle }}</h2>
-              <p v-if="releaseDate" class="upd-head__date">
+              <p v-if="phase === 'updated' && updater.justUpdated?.previousVersion" class="upd-head__date">
+                <HlIcon name="sparkles" :size="12" />
+                <span>{{ t('updateDialog.updatedSub', { from: updater.justUpdated.previousVersion, to: showVersion }) }}</span>
+              </p>
+              <p v-else-if="releaseDate" class="upd-head__date">
                 <HlIcon name="calendar" :size="12" />
                 <span>{{ t('updateDialog.releaseDate', { date: releaseDate }) }}</span>
               </p>
@@ -231,8 +252,29 @@ function onClose(): void {
               </div>
             </div>
 
+            <!-- 升级成功提示 -->
+            <template v-if="phase === 'updated'">
+              <div class="upd-ready">
+                <span class="upd-ready__icon"><HlIcon name="check-circle" /></span>
+                <div>
+                  <p class="upd-ready__text">
+                    {{ t('updateDialog.updatedBody', { version: showVersion }) }}
+                  </p>
+                  <p class="upd-ready__hint">{{ t('updateDialog.updatedHint') }}</p>
+                </div>
+              </div>
+
+              <!-- 更新说明与亮点 -->
+              <section v-if="notes" class="upd-notes">
+                <h3 class="upd-notes__title">{{ t('updateDialog.whatsNew') }}</h3>
+                <div class="upd-notes__body">
+                  <UpdateNotes :notes="notes" :version="showVersion" />
+                </div>
+              </section>
+            </template>
+
             <!-- 检查中 -->
-            <p v-if="phase === 'checking'" class="upd-line">
+            <p v-else-if="phase === 'checking'" class="upd-line">
               {{ t('updateDialog.checking') }}
             </p>
 
@@ -328,7 +370,14 @@ function onClose(): void {
           </div>
 
           <footer class="upd-foot">
-            <template v-if="phase === 'downloading'">
+            <template v-if="phase === 'updated'">
+              <HlButton art="combo" tone="green" @click="onDismissUpdated">
+                <HlIcon name="check" />
+                {{ t('updateDialog.gotIt') }}
+              </HlButton>
+            </template>
+
+            <template v-else-if="phase === 'downloading'">
               <HlButton variant="text" @click="onCancel">{{ t('updateDialog.cancel') }}</HlButton>
               <HlButton art="combo" tone="blue" disabled>
                 {{ t('updateDialog.downloading') }}
@@ -444,6 +493,11 @@ function onClose(): void {
   border-radius: 12px;
   background: var(--accent-soft);
   color: var(--accent);
+}
+
+.upd-head__icon--success {
+  background: var(--success-a15);
+  color: var(--success);
 }
 
 .upd-head__text {

@@ -586,4 +586,64 @@ async def test_download_all_channels_fail_preserves_part_file(tmp_path: Path, mo
     assert part.read_bytes() == b"downloaded-50MB-chunk"
 
 
+def test_just_updated_status_and_acknowledge(tmp_path: Path, monkeypatch) -> None:
+    """换装升级成功状态判定与账本确认闭合。"""
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("app.core.paths.logs_dir", lambda: logs_dir)
+    monkeypatch.setattr("app.core.paths.install_root", lambda: tmp_path)
+
+    # 1. 无诊断文件返回 None
+    assert updater.just_updated_status() is None
+
+    # 2. 诊断文件标记换装成功但未确认
+    diag = logs_dir / "update-diagnosis.json"
+    diag.write_text(
+        json.dumps({
+            "success": True,
+            "stage": "committed",
+            "currentVersion": "0.3.1-beta",
+            "targetVersion": updater.APP_VERSION,
+            "acknowledged": False,
+        }),
+        encoding="utf-8",
+    )
+
+    status = updater.just_updated_status()
+    assert status == {
+        "previousVersion": "0.3.1-beta",
+        "currentVersion": updater.APP_VERSION,
+    }
+    assert updater.pending_status()["justUpdated"] == status
+
+    # 3. 确认后不再重复汇报
+    ack = updater.acknowledge_update()
+    assert ack["acknowledged"] is True
+    assert updater.just_updated_status() is None
+    assert updater.pending_status()["justUpdated"] is None
+
+
+def test_just_updated_status_ignores_mismatched_version(tmp_path: Path, monkeypatch) -> None:
+    """目标版本与当前运行版本不匹配时不汇报成功。"""
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("app.core.paths.logs_dir", lambda: logs_dir)
+    monkeypatch.setattr("app.core.paths.install_root", lambda: tmp_path)
+
+    diag = logs_dir / "update-diagnosis.json"
+    diag.write_text(
+        json.dumps({
+            "success": True,
+            "stage": "committed",
+            "currentVersion": "0.3.1-beta",
+            "targetVersion": "99.99.99",
+            "acknowledged": False,
+        }),
+        encoding="utf-8",
+    )
+
+    assert updater.just_updated_status() is None
+
+
+
 
