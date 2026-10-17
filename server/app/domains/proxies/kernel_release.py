@@ -29,8 +29,14 @@ def kernel_filename() -> str:
 
 
 def bundled_asset_names() -> tuple[str, ...]:
-    """获取、构建与打包共用的随包资产清单。"""
+    """获取与本地资产补齐共用的资产清单。"""
     return (kernel_filename(), *LICENSE_ASSETS, "README.txt")
+
+
+def release_asset_names() -> tuple[str, ...]:
+    """发布包随包的轻量资产（仅许可与说明，内核二进制按需独立下载维护）。"""
+    return (*LICENSE_ASSETS, "README.txt")
+
 
 
 def bundled_source_note() -> str:

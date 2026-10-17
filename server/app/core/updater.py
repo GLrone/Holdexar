@@ -106,20 +106,35 @@ def manifest_url(mirror: str = "") -> str:
     )
 
 
-def _pick_asset(assets: list[dict], name: str | None = None) -> dict | None:
-    """挑应用包资产：显式 name 精确匹配 → role=app（清单标记）→ 命名模式。
+def _pick_asset(
+    assets: list[dict],
+    name: str | None = None,
+    from_version: str | None = None,
+) -> dict | None:
+    """挑应用包资产：显式 name 精确匹配 → 差量包 (role=patch & fromVersion匹配) → role=app → 命名模式。
 
-    一个函数同时吃两种输入：清单里的 assets（带 role）与 GitHub API 的
-    release.assets（不带 role，只有文件名）。
+    优先自动匹配差量包以节省下载体积；若未匹配到差量包则回退完整应用包。
     """
     if name:
         hit = next((a for a in assets if str(a.get("name")) == name), None)
         if hit:
             return hit
+    if from_version:
+        patch_hit = next(
+            (
+                a for a in assets
+                if str(a.get("role") or "") == "patch"
+                and str(a.get("fromVersion") or "") == from_version
+            ),
+            None,
+        )
+        if patch_hit:
+            return patch_hit
     hit = next((a for a in assets if str(a.get("role") or "") == "app"), None)
     if hit:
         return hit
     return next((a for a in assets if _ASSET_PATTERN.match(str(a.get("name", "")))), None)
+
 
 
 async def _fetch_manifest() -> dict | None:
@@ -186,11 +201,15 @@ def _payload_from_manifest(data: dict) -> dict:
     if not latest:
         return {"available": False, "reason": "bad_manifest"}
 
-    asset = _pick_asset(data.get("assets") or [])
+    current = settings.version
+    assets = data.get("assets") or []
+    asset = _pick_asset(assets, from_version=current)
     if not asset:
         return {"available": False, "reason": "no_asset"}
 
-    current = settings.version
+    is_patch = (asset.get("role") == "patch")
+    full_app = next((a for a in assets if str(a.get("role") or "") == "app"), None)
+
     return {
         "available": version_gt(latest, current),
         "current": current,
@@ -203,7 +222,11 @@ def _payload_from_manifest(data: dict) -> dict:
         "asset": asset.get("name"),
         "publishedAt": data.get("publishedAt"),
         "source": "manifest",
+        "isPatch": is_patch,
+        "patchFromVersion": asset.get("fromVersion") if is_patch else None,
+        "fullSizeBytes": full_app.get("size") if full_app else asset.get("size"),
     }
+
 
 
 async def _check_update_via_api() -> dict:
@@ -495,16 +518,32 @@ async def download_update(
         meta_path.unlink(missing_ok=True)
 
         # 换装 manifest（desktop 启动编排读）
+        patch_manifest_file = next(
+            (p for p in (staging / "patch-manifest.json", staging / APP_NAME / "patch-manifest.json") if p.is_file()),
+            None,
+        )
+        is_patch = patch_manifest_file is not None
+        patch_from = None
+        if patch_manifest_file:
+            try:
+                patch_data = json.loads(patch_manifest_file.read_text(encoding="utf-8"))
+                patch_from = patch_data.get("fromVersion")
+            except Exception:
+                pass
+
         manifest = {
             "tag": tag,
             "sha256": expected_sha256,
             "ready": True,
             "attempt_id": str(uuid.uuid4()),
             "source_version": APP_VERSION,
+            "is_patch": is_patch,
+            "patch_from_version": patch_from,
         }
         (staging / STAGING_MANIFEST_NAME).write_text(
-            json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+
         # 新暂存包重新具备交接资格：上一包的「不支持换装」标记随包作废，
         # 上次换装失败的安装状态标记与交接账本一并解除——否则重新下载同一版本
         # 会被旧标记/旧账一直挡在自动换装之外。

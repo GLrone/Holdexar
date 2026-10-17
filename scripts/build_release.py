@@ -59,10 +59,17 @@ TEMPLATE_DB_SRC = SEED_DIR / TEMPLATE_BASENAME
 
 # 品牌常量与应用版本同源（app.core.app_info 是纯标准库模块，可直接导入；
 # kernel_release 同为纯标准库，故可在装依赖之前取到内核资产清单）
-if str(SERVER) not in sys.path:
-    sys.path.insert(0, str(SERVER))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 from app.core.app_info import APP_NAME, APP_VERSION  # noqa: E402
-from app.domains.proxies.kernel_release import bundled_asset_names, bundled_source_note  # noqa: E402
+from app.domains.proxies.kernel_release import (  # noqa: E402
+    bundled_source_note,
+    kernel_filename,
+    release_asset_names,
+)
+from desktop.version_resource import verify_exe_version_resources, write_version_file  # noqa: E402
+
+
 
 APP_DIR = DIST_DIR / APP_NAME
 
@@ -84,19 +91,18 @@ def refresh_seed() -> None:
 
 
 def ensure_clash_assets() -> None:
-    """随包内核、许可原文与来源说明缺一即中止出包。"""
+    """随包许可原文与来源说明就位（内核二进制按需独立维护，不随应用包分发）。"""
     CLASH_DIR.mkdir(parents=True, exist_ok=True)
     (CLASH_DIR / "README.txt").write_text(bundled_source_note(), encoding="utf-8")
-    expected = bundled_asset_names()
+    expected = release_asset_names()
     missing = [name for name in expected if not (CLASH_DIR / name).is_file()]
     if missing:
         sys.exit(
-            f"[错误] 随包内核资产缺失：{', '.join(missing)}\n"
-            "       先跑 python scripts/fetch_kernel.py 备齐 assets/clash/ 再出包；\n"
-            "       离线环境可用 --from-dir 从本机现成内核目录复制（版本需自行核对）。"
+            f"[错误] 内核许可与说明资产缺失：{', '.join(missing)}\n"
+            "       先跑 python scripts/fetch_kernel.py 补齐 assets/clash/ 后再出包。"
         )
-    total = sum((CLASH_DIR / name).stat().st_size for name in expected)
-    print(f"[内核] 随包资产齐备：{total / 1048576:.1f} MB（mihomo + 许可说明）")
+    print(f"[内核] 轻量包模式：不捆绑 {kernel_filename()} 二进制（节省约 35MB），运行时按需下载独立维护")
+
 
 
 def build_web() -> None:
@@ -140,10 +146,13 @@ def assemble_versioned_layout(version: str, python: Path) -> None:
     # 编译轻量启动器 Holdexar.exe
     print("[启动器] 编译 Holdexar.exe (Launcher)...")
     launcher_dist = DIST_DIR / "_launcher_build"
+    launcher_ver_file = WORK_DIR / "launcher_version_info.txt"
+    write_version_file(launcher_ver_file, role="launcher", version=version)
     subprocess.check_call([
         str(python), "-m", "PyInstaller", "--onefile", "--noconfirm", "--clean",
         "--paths", str(SERVER),
         "--icon", str(DESKTOP / "app.ico"),
+        "--version-file", str(launcher_ver_file),
         "--distpath", str(launcher_dist),
         "--workpath", str(WORK_DIR / "launcher"),
         "--name", APP_NAME,
@@ -153,10 +162,13 @@ def assemble_versioned_layout(version: str, python: Path) -> None:
     # 编译独立更新宿主 UpdateHost.exe
     print("[更新宿主] 编译 UpdateHost.exe...")
     updater_dist = DIST_DIR / "_updater_build"
+    updater_ver_file = WORK_DIR / "updater_version_info.txt"
+    write_version_file(updater_ver_file, role="updater", version=version)
     subprocess.check_call([
         str(python), "-m", "PyInstaller", "--onefile", "--noconfirm", "--clean",
         "--paths", str(SERVER),
         "--icon", str(DESKTOP / "app.ico"),
+        "--version-file", str(updater_ver_file),
         "--distpath", str(updater_dist),
         "--workpath", str(WORK_DIR / "updater"),
         "--name", "UpdateHost",
@@ -191,24 +203,33 @@ def assemble_versioned_layout(version: str, python: Path) -> None:
         json.dumps(current_state, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
+    # 5. 校验最终发行包内三个 EXE 的 Windows 版本属性
+    print("[校验] 检查发行包内三个 EXE 的 Windows 版本属性...")
+    pe_info = verify_exe_version_resources(APP_DIR, version)
+    for role, props in pe_info.items():
+        print(f"  ✓ [{role}] {props.get('FileDescription')} | FileVersion={props.get('FileVersion')} | ProductVersion={props.get('ProductVersion')}")
+
     # 清理构建临时产物
     shutil.rmtree(launcher_dist, ignore_errors=True)
     shutil.rmtree(updater_dist, ignore_errors=True)
     print(f"[布局] 多版本结构组装完成：{APP_DIR}")
 
 
+
 def sanitize() -> None:
-    """产物消毒：任何用户数据/日志/db 残留即删除并复检，仍有则中止发布。
+    """产物消毒：任何用户数据/日志/db 与内核二进制残留即删除并复检，仍有则中止发布。
 
     种子不随包（spec datas 已移除 seed/），产物里出现任何 .db 都是残留。
+    内核二进制独立维护（按需下载），产物里出现任何 mihomo 可执行文件均清理。
     """
     assert APP_DIR.is_dir(), f"打包产物缺失：{APP_DIR}"
     residue: list[Path] = []
     for path in APP_DIR.rglob("*"):
         if path.is_dir() and path.name == "data":
             residue.append(path)
-        elif path.is_file() and path.suffix.lower() in (
-            ".log", ".db", ".sqlite3", ".db-wal", ".db-shm",
+        elif path.is_file() and (
+            path.suffix.lower() in (".log", ".db", ".sqlite3", ".db-wal", ".db-shm")
+            or path.name.lower() in ("mihomo.exe", "mihomo")
         ):
             residue.append(path)
     for path in residue:
@@ -219,11 +240,18 @@ def sanitize() -> None:
     residue = [
         p for p in APP_DIR.rglob("*")
         if (p.is_dir() and p.name == "data")
-        or (p.is_file() and p.suffix.lower() in (".log", ".db", ".sqlite3", ".db-wal", ".db-shm"))
+        or (
+            p.is_file()
+            and (
+                p.suffix.lower() in (".log", ".db", ".sqlite3", ".db-wal", ".db-shm")
+                or p.name.lower() in ("mihomo.exe", "mihomo")
+            )
+        )
     ]
     if residue:
         sys.exit(f"[错误] 产物消毒复检仍有残留，中止发布：{residue}")
-    print(f"[消毒] 产物干净（{sum(1 for _ in APP_DIR.rglob('*'))} 个文件，无 data/日志/db 残留）")
+    print(f"[消毒] 产物干净（{sum(1 for _ in APP_DIR.rglob('*'))} 个文件，无 data/日志/db/内核二进制 残留）")
+
 
 
 def make_zip(version: str) -> tuple[Path, str]:

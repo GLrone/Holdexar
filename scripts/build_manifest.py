@@ -139,6 +139,33 @@ def build_manifest(version: str, zip_path: Path) -> dict:
                 "sha256": sha256_of(SEED_GZ),
             }
         )
+
+    # 扫描与收录本版本的目标差量包（Holdexar-patch-v*-to-v{version}.zip）
+    import zipfile
+
+    for p in sorted(RELEASE.glob(f"{APP_NAME}-patch-*.zip")):
+        if not p.is_file():
+            continue
+        try:
+            with zipfile.ZipFile(p, "r") as zf:
+                if "patch-manifest.json" in zf.namelist():
+                    pdata = json.loads(zf.read("patch-manifest.json").decode("utf-8"))
+                    from_v = pdata.get("fromVersion")
+                    to_v = pdata.get("toVersion")
+                    if to_v == version:
+                        assets.append(
+                            {
+                                "role": "patch",
+                                "name": p.name,
+                                "size": p.stat().st_size,
+                                "sha256": sha256_of(p),
+                                "fromVersion": from_v,
+                                "toVersion": to_v,
+                            }
+                        )
+        except Exception:
+            pass
+
     return {
         "schema": MANIFEST_SCHEMA,
         "app": APP_NAME,
