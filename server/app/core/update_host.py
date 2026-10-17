@@ -99,7 +99,7 @@ def _write_diagnosis(root: Path, record: dict[str, Any]) -> None:
 
 
 def wait_process_exit(pid: int, timeout: float = 10.0) -> bool:
-    """等待指定 PID 进程退出。"""
+    """等待指定 PID 进程退出，超时尝试强制终止进程树。"""
     if os.name != "nt":
         return True
     try:
@@ -110,9 +110,26 @@ def wait_process_exit(pid: int, timeout: float = 10.0) -> bool:
             return True
         try:
             res = kernel32.WaitForSingleObject(handle, int(timeout * 1000))
-            return res == 0
+            if res == 0:
+                return True
         finally:
             kernel32.CloseHandle(handle)
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(pid)],
+                capture_output=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception:
+            pass
+        handle2 = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+        if not handle2:
+            return True
+        try:
+            res2 = kernel32.WaitForSingleObject(handle2, 2000)
+            return res2 == 0
+        finally:
+            kernel32.CloseHandle(handle2)
     except Exception:  # noqa: BLE001
         return True
 
@@ -142,6 +159,42 @@ def process_image_path(pid: int) -> str | None:
             kernel32.CloseHandle(handle)
     except Exception:  # noqa: BLE001
         return None
+
+
+def _safe_replace_executable(src: Path, dest: Path) -> None:
+    """安全覆盖可执行文件（针对 Windows 运行中文件锁做重命名保护）。"""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if not dest.exists():
+        shutil.copy2(src, dest)
+        return
+    try:
+        shutil.copy2(src, dest)
+        return
+    except (PermissionError, OSError):
+        pass
+    suffix = uuid.uuid4().hex[:8]
+    old_dest = dest.with_name(f"{dest.stem}.old_{suffix}{dest.suffix}")
+    try:
+        os.replace(dest, old_dest)
+    except OSError:
+        pass
+    shutil.copy2(src, dest)
+
+
+def cleanup_old_executables(directory: Path) -> None:
+    """清理历史由于运行期重命名产生的 *.old_* 临时文件。"""
+    if not directory.is_dir():
+        return
+    for item in directory.glob("*.old_*"):
+        try:
+            if item.is_file():
+                item.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+    # 2. 载荷多版本布局时同步刷新根目录启动器与 updater/UpdateHost.exe。
+    #    利用 _safe_replace_executable 处理 Windows 运行期 EXE 文件锁。
 
 
 def install_version_payload(
@@ -179,16 +232,14 @@ def install_version_payload(
     if not layout.is_version_valid(root, target_version):
         raise RuntimeError(f"安装到 {dest} 失败：缺少主可执行程序")
 
-    # 2. 载荷多版本布局时同步刷新根目录启动器与 updater/UpdateHost.exe。
-    #    宿主自身 EXE 已映射进进程、不再按路径读取，覆盖当前正在运行的文件是安全的。
     if versions_sub.is_dir():
         src_launcher = payload / f"{APP_NAME}.exe"
         if src_launcher.is_file():
-            shutil.copy2(src_launcher, root / f"{APP_NAME}.exe")
+            _safe_replace_executable(src_launcher, root / f"{APP_NAME}.exe")
         src_updater = payload / "updater" / "UpdateHost.exe"
         if src_updater.is_file():
             (root / "updater").mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_updater, root / "updater" / "UpdateHost.exe")
+            _safe_replace_executable(src_updater, root / "updater" / "UpdateHost.exe")
 
     _log_update(root, f"新版本文件已就绪：{dest}")
     return dest
@@ -371,10 +422,9 @@ def probe_version_health(
 
     proc = None
     try:
-        # 不能带 --server：无窗口模式在健康就绪后会把进程退掉（退出码 0），
-        # 验收期随之变成「进程已退出」。带窗口模式不做这步自检，进程会一直活着。
+        # 带 --server：仅起本地服务做健康检查，不打开 WebView2 窗口
         proc = subprocess.Popen(
-            [str(exe)],
+            [str(exe), "--server"],
             cwd=str(exe.parent),
             env=child_env,
             creationflags=flags,
@@ -553,7 +603,7 @@ def _fail(
 
 
 def _legacy_version_name(root: Path, source_version: str | None, staging_dir: Path) -> str:
-    """旧版真实版本号：显式传入 > 暂存清单记载 > 现存指针 > legacy_version。"""
+    """旧版真实版本号：显式传入 > 暂存清单记载 > 现存指针 > PE版本/app_info > legacy_version。"""
     for candidate in (source_version, _read_manifest(staging_dir).get("source_version")):
         text = version_from_tag(str(candidate or ""))
         if text and layout.is_managed_version_name(text):
@@ -561,6 +611,11 @@ def _legacy_version_name(root: Path, source_version: str | None, staging_dir: Pa
     current = layout.get_current_version(root)
     if current and layout.is_managed_version_name(current):
         return current
+    detected = layout.detect_installed_version(root)
+    if detected:
+        text = version_from_tag(detected)
+        if text and layout.is_managed_version_name(text):
+            return text
     return "legacy_version"
 
 
@@ -647,39 +702,50 @@ def convert_legacy_layout(
     source_version: str | None = None,
     attempt_id: str | None = None,
 ) -> tuple[bool, str]:
-    """旧式扁平布局 → 独立版本目录。根目录启动器必须先就位。
+    """旧式扁平布局 → 独立版本目录。
 
-    返回 (是否成功, 说明)。任何一步失败都会把已移动的旧版条目搬回根目录，
-    保证根目录仍有可双击的旧版主程序。
+    返回 (是否成功, 说明)。任何一步失败都会把已移动的旧版条目搬回原位，
+    保证仍有可双击的旧版主程序。
     """
     legacy_ver = _legacy_version_name(root, source_version, root)
     legacy_dir = layout.get_version_dir(root, legacy_ver)
     interrupted = legacy_dir.exists() and any(legacy_dir.iterdir())
 
-    moved: list[str] = []
+    moved: list[tuple[Path, Path]] = []
     try:
-        for item_name in ("_internal", f"{APP_NAME}.exe"):
-            item = root / item_name
-            if not item.exists():
-                continue
-            if interrupted and moved:
-                # 同一安装根上第二次转换：根目录的 _internal 属于新启动器包，
-                # 只接管旧版主程序，依赖目录保留在根目录
-                _log_update(root, "版本目录已有内容，只补充旧版主程序")
-                if (legacy_dir / "_internal").is_dir():
-                    continue
-            _move_legacy_entry(root, item, legacy_dir / item_name)
-            moved.append(item_name)
+        # 1. 搬运 _internal
+        root_internal = root / "_internal"
+        dest_internal = legacy_dir / "_internal"
+        if root_internal.exists():
+            if not (interrupted and dest_internal.is_dir() and any(dest_internal.iterdir())):
+                _move_legacy_entry(root, root_internal, dest_internal)
+                moved.append((dest_internal, root_internal))
+
+        # 2. 搬运旧版主程序：
+        #    如果 prepare_launcher_only 已经执行，旧版真实可执行文件在 __legacy__/Holdexar.exe，
+        #    根目录的 Holdexar.exe 已经是新 Launcher，绝不能将 Launcher 移入旧版目录！
+        legacy_backup = root / "__legacy__" / f"{APP_NAME}.exe"
+        root_exe = root / f"{APP_NAME}.exe"
+        dest_exe = legacy_dir / f"{APP_NAME}.exe"
+
+        if legacy_backup.is_file():
+            _move_legacy_entry(root, legacy_backup, dest_exe)
+            moved.append((dest_exe, legacy_backup))
+            shutil.rmtree(root / "__legacy__", ignore_errors=True)
+        elif root_exe.is_file():
+            _move_legacy_entry(root, root_exe, dest_exe)
+            moved.append((dest_exe, root_exe))
+
         if not layout.is_version_valid(root, legacy_ver):
             raise RuntimeError("旧版主程序未完整进入版本目录")
     except Exception as exc:  # noqa: BLE001
-        for name in reversed(moved):
+        for dest_path, orig_path in reversed(moved):
             try:
-                _move_legacy_entry(root, legacy_dir / name, root / name)
+                _move_legacy_entry(root, dest_path, orig_path)
             except Exception as back_exc:  # noqa: BLE001
-                _log_update(root, f"搬回旧版条目 {name} 失败：{back_exc}")
-        restorable = (root / f"{APP_NAME}.exe").is_file()
-        _log_update(root, f"旧版布局转换失败：{exc}（根目录可启动：{restorable}）")
+                _log_update(root, f"搬回旧版条目 {dest_path.name} 失败：{back_exc}")
+        restorable = (root / f"{APP_NAME}.exe").is_file() or (root / "__legacy__" / f"{APP_NAME}.exe").is_file()
+        _log_update(root, f"旧版布局转换失败：{exc}（可启动旧版在位：{restorable}）")
         return False, str(exc)
 
     layout.write_current_state(
@@ -770,7 +836,7 @@ def bridge_legacy_update(
     if flat_layout:
         ok, reason = convert_legacy_layout(
             target,
-            source_version=current_version or actual_data_dir.name,
+            source_version=current_version,
             attempt_id=aid,
         )
         if not ok:
@@ -795,6 +861,16 @@ def _restore_entry_only(root: Path) -> None:
     换装宿主由已经退出的旧进程拉起，它退出后不会有任何窗口——这里必须拉起
     可运行的那一份。拉起失败只记日志：调用方紧接着会弹窗说明。
     """
+    installed = layout.list_installed_versions(root)
+    legacy_backup = root / "__legacy__" / f"{APP_NAME}.exe"
+    if not installed and legacy_backup.is_file():
+        try:
+            root_exe = root / f"{APP_NAME}.exe"
+            shutil.copy2(legacy_backup, root_exe)
+            _log_update(root, "已还原旧版主程序至根目录")
+        except Exception as exc:  # noqa: BLE001
+            _log_update(root, f"还原旧版主程序失败：{exc}")
+
     if not _entry_available(root):
         return
     try:
@@ -934,6 +1010,8 @@ def _commit(
         return False
 
     shutil.rmtree(staging_dir, ignore_errors=True)
+    cleanup_old_executables(root / "updater")
+    cleanup_old_executables(root)
     layout.update_transaction(root, layout.STAGE_COMMITTED)
     pruned = layout.prune_versions(root, min_keep=2)
     _log_update(root, f"换装成功！清理历史版本：{pruned}")

@@ -558,4 +558,32 @@ async def test_stream_to_file_preserves_partial_on_200_failure(tmp_path: Path, m
     assert not (tmp_path / "test.part.full").exists()
 
 
+@pytest.mark.asyncio
+async def test_download_all_channels_fail_preserves_part_file(tmp_path: Path, monkeypatch) -> None:
+    """所有通道失败时不应清空暂存区，需保留 .part 文件以便下次续传。"""
+    staging = tmp_path / "update-staging"
+    staging.mkdir()
+    part = staging / "update.zip.part"
+    part.write_bytes(b"downloaded-50MB-chunk")
+    meta = staging / "download_meta.json"
+    meta.write_text(json.dumps({"tag": "v0.3.6", "asset": "", "size": 0, "sha256": ""}), encoding="utf-8")
+
+    def handler(_request: httpx.Request):
+        raise httpx.ConnectError("network down")
+
+    monkeypatch.setattr(updater.httpx, "AsyncClient", _mock_client(handler))
+    monkeypatch.setattr(updater, "staging_dir", lambda: staging)
+    monkeypatch.setattr(
+        "app.domains.proxies.clash_manager._download_attempts",
+        lambda *_a, **_k: [(None, "直连")],
+    )
+
+    with pytest.raises(RuntimeError, match="所有下载通道均失败"):
+        await updater.download_update("v0.3.6")
+
+    # .part 文件依然存在，未被清空
+    assert part.is_file()
+    assert part.read_bytes() == b"downloaded-50MB-chunk"
+
+
 
