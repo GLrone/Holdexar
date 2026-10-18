@@ -3,7 +3,7 @@
  * 负责主岛、副岛、多活动排序、用户手动选择与总览面板状态控制。
  * 业务数据变化不会无故冲刷用户的当前选择。
  */
-import { computed, ref, watch } from 'vue'
+import { ref } from 'vue'
 import { activityManager, ActivityManager } from './activityManager.ts'
 import type { Activity } from './types.ts'
 
@@ -18,6 +18,7 @@ export class IslandController {
   readonly isExpanded = ref(false)
   readonly isOverviewOpen = ref(false)
   readonly isHovered = ref(false)
+  readonly swapRequest = ref(0)
 
   constructor(manager: ActivityManager = activityManager) {
     this._manager = manager
@@ -110,6 +111,10 @@ export class IslandController {
     this._userSelectedId.value = newPrimary
     this._primaryId.value = newPrimary
     this._secondaryId.value = this._order[1] ?? null
+  }
+
+  requestSwap(): void {
+    this.swapRequest.value += 1
   }
 
   /** 手动选择指定活动作为主岛（如从总览列表中点击某项） */

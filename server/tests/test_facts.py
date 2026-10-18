@@ -137,8 +137,25 @@ async def test_publish_rotation_new_items_only(db):
     assert rows[0].source == "epic_free" and rows[0].kind == "free_rotation"
     assert rows[0].data["count"] == 1
     assert rows[0].data["titles"] == ["三号游戏"]
+    assert rows[0].data["appid"] == 3
     assert "appid:3" in rows[0].fact_key
 
     # 同一批新增重复刷新（fact_key 相同）不落第二行
     await metadata_service._publish_epic_rotation(old, new)
     assert len(await _all_rows(db)) == 1
+
+
+@pytest.mark.asyncio
+async def test_publish_rotation_omits_cover_appid_for_multiple_games(db):
+    old = _payload({"appid": 1, "title": "A"})
+    new = _payload(
+        {"appid": 1, "title": "A"},
+        {"appid": 2, "title": "B"},
+        {"appid": 3, "title": "C"},
+    )
+
+    await metadata_service._publish_epic_rotation(old, new)
+
+    rows = await _all_rows(db)
+    assert len(rows) == 1
+    assert "appid" not in rows[0].data

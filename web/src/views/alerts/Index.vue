@@ -13,6 +13,7 @@ import {
 } from '@/api/client'
 import { formatCnyFen, flagUrl } from '@/api/regions'
 import { currencyName, formatMinor } from '@/api/currencies'
+import { pilotCoverUrl } from '@/lib/pilotView'
 import { useI18n } from '@/locales'
 import { useRegionsStore } from '@/stores/regions'
 import RegionFlag from '@/components/RegionFlag.vue'
@@ -180,25 +181,27 @@ async function add() {
   }
   let value = form.targetValue.trim() === '' ? undefined : Number(form.targetValue)
   if (form.targetType !== 'historic_low' && value === undefined) {
-    message.warning(t('alerts.toast.enterTarget'))
+    message.warning(t('alerts.toast.enterTarget'), { iconImageUrl: pilotCoverUrl(form.appid) })
     return
   }
   // price 类按元输入 → 人民币分（阈值口径）；pct 保持百分数
   if (form.targetType === 'price' && value !== undefined) value = Math.round(value * 100)
   try {
     await alertsApi.add(form.appid, form.region, form.targetType, value)
-    message.success(t('alerts.toast.added'))
+    message.success(t('alerts.toast.added'), { iconImageUrl: pilotCoverUrl(form.appid) })
     clearSearch()
     form.targetValue = ''
     await load()
   } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
+    message.error(e instanceof Error ? e.message : String(e), { iconImageUrl: pilotCoverUrl(form.appid) })
   }
 }
 
 async function toggle(alert: PriceAlertItem) {
   await alertsApi.update(alert.id, { active: !alert.active })
-  message.success(alert.active ? t('alerts.toast.disabled') : t('alerts.toast.enabled'))
+  message.success(alert.active ? t('alerts.toast.disabled') : t('alerts.toast.enabled'), {
+    iconImageUrl: pilotCoverUrl(alert.appid),
+  })
   await load()
 }
 
@@ -214,10 +217,10 @@ async function remove(alert: PriceAlertItem) {
   if (!ok) return
   try {
     await alertsApi.remove(alert.id)
-    message.success(t('alerts.toast.removed', { id: alert.id }))
+    message.success(t('alerts.toast.removed', { id: alert.id }), { iconImageUrl: pilotCoverUrl(alert.appid) })
     await load()
   } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
+    message.error(e instanceof Error ? e.message : String(e), { iconImageUrl: pilotCoverUrl(alert.appid) })
   }
 }
 
@@ -232,10 +235,10 @@ async function removeEvent(ev: AlertEventItem) {
   if (!ok) return
   try {
     await alertsApi.removeEvent(ev.id)
-    message.success(t('alerts.toast.eventRemoved'))
+    message.success(t('alerts.toast.eventRemoved'), { iconImageUrl: pilotCoverUrl(ev.appid) })
     await load()
   } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
+    message.error(e instanceof Error ? e.message : String(e), { iconImageUrl: pilotCoverUrl(ev.appid) })
   }
 }
 
@@ -281,7 +284,7 @@ function cancelEdit() {
 async function saveEdit(alert: PriceAlertItem) {
   let value = editForm.targetValue.trim() === '' ? undefined : Number(editForm.targetValue)
   if (editForm.targetType !== 'historic_low' && value === undefined) {
-    message.warning(t('alerts.toast.enterTarget'))
+    message.warning(t('alerts.toast.enterTarget'), { iconImageUrl: pilotCoverUrl(alert.appid) })
     return
   }
   // price 类按元输入 → 人民币分（阈值口径）；pct 保持百分数
@@ -292,11 +295,11 @@ async function saveEdit(alert: PriceAlertItem) {
       targetValue: value,
       region: editForm.region,
     })
-    message.success(t('alerts.toast.updated'))
+    message.success(t('alerts.toast.updated'), { iconImageUrl: pilotCoverUrl(alert.appid) })
     editingId.value = null
     await load()
   } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
+    message.error(e instanceof Error ? e.message : String(e), { iconImageUrl: pilotCoverUrl(alert.appid) })
   }
 }
 

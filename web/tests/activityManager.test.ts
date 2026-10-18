@@ -119,24 +119,6 @@ test('ActivityManager：移除活动与订阅监听器触发', () => {
   assert.equal(notified, 2)
 })
 
-test('ActivityManager：语义色彩静音拦截与批量清除', () => {
-  const mgr = new ActivityManager()
-  mgr.register({ id: 'act-info', source: 'notice', tone: 'info', title: '普通提示' })
-  mgr.register({ id: 'act-warn', source: 'notice', tone: 'warning', title: '警告提示' })
-  assert.equal(mgr.count, 2)
-
-  // 静音 info
-  mgr.muteTone('info')
-  assert.equal(mgr.count, 1)
-  assert.equal(mgr.get('act-info'), undefined)
-  assert.ok(mgr.get('act-warn'))
-
-  // 静音后新进相同语义项被丢弃
-  const blocked = mgr.register({ id: 'act-info-2', source: 'notice', tone: 'info', title: '再次提示' })
-  assert.equal(blocked, null)
-  assert.equal(mgr.count, 1)
-})
-
 test('ActivityManager：默认 progress 为 undefined，在完成或失败时自动清除以防误显示进度条', () => {
   const mgr = new ActivityManager()
 

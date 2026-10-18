@@ -25,6 +25,8 @@ export interface MessageOptions {
   to?: string
   /** 详情动作按钮文案 */
   toLabel?: string
+  /** 消息明确对应单款游戏时使用的封面图 */
+  iconImageUrl?: string
 }
 
 const DEFAULT_DURATION = 2400
@@ -44,6 +46,7 @@ function show(type: MessageType, text: string, opts?: number | MessageOptions): 
     retry: o.retry ?? null,
     to: o.to ?? '',
     toLabel: o.toLabel ?? '',
+    iconImageUrl: o.iconImageUrl,
   })
 }
 

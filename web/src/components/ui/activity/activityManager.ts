@@ -3,13 +3,12 @@
  * 管理全局业务活动与提示的生命周期、去重、状态跃迁与生命周期定时器。
  * 纯状态逻辑，不直接耦合具体的动画与展示组件。
  */
-import { reactive, shallowRef } from 'vue'
+import { shallowRef } from 'vue'
 import type { Activity, ActivityRegistration, ActivityTone } from './types.ts'
 
 export class ActivityManager {
   private readonly _items = shallowRef<Activity[]>([])
   private readonly _timers = new Map<string, ReturnType<typeof setTimeout>>()
-  private readonly _mutedTones = reactive<Record<string, boolean>>({})
   private readonly _listeners = new Set<() => void>()
 
   /** 优先级默认值配置 */
@@ -32,10 +31,6 @@ export class ActivityManager {
 
   /** 注册或原地更新活动；相同 id 自动去重并保留既有创建时间戳 */
   register(reg: ActivityRegistration): Activity | null {
-    if (reg.tone && this._mutedTones[reg.tone]) {
-      return null
-    }
-
     const now = Date.now()
     const index = this._items.value.findIndex((item) => item.id === reg.id)
     const kind = reg.kind ?? 'task'
@@ -56,6 +51,7 @@ export class ActivityManager {
         title: reg.title,
         detail: reg.detail ?? existing.detail,
         icon: reg.icon ?? existing.icon,
+        iconImageUrl: reg.iconImageUrl !== undefined ? reg.iconImageUrl : existing.iconImageUrl,
         tone: reg.tone ?? existing.tone,
         progress: reg.progress !== undefined ? reg.progress : existing.progress,
         priority: reg.priority ?? existing.priority,
@@ -84,6 +80,7 @@ export class ActivityManager {
       title: reg.title,
       detail: reg.detail,
       icon: reg.icon,
+      iconImageUrl: reg.iconImageUrl,
       tone: reg.tone,
       progress: reg.progress !== undefined ? reg.progress : undefined,
       priority: reg.priority ?? fallbackPriority,
@@ -122,6 +119,7 @@ export class ActivityManager {
       ...(patch.title !== undefined ? { title: patch.title } : {}),
       ...(patch.detail !== undefined ? { detail: patch.detail } : {}),
       ...(patch.icon !== undefined ? { icon: patch.icon } : {}),
+      ...(patch.iconImageUrl !== undefined ? { iconImageUrl: patch.iconImageUrl } : {}),
       ...(patch.tone !== undefined ? { tone: patch.tone } : {}),
       progress,
       ...(patch.priority !== undefined ? { priority: patch.priority } : {}),
@@ -187,25 +185,6 @@ export class ActivityManager {
   /** 查询指定活动 */
   get(id: string): Activity | undefined {
     return this._items.value.find((item) => item.id === id)
-  }
-
-  /** 按语义色彩静音，同时清除已有匹配项并阻止后续入队 */
-  muteTone(tone: ActivityTone): void {
-    this._mutedTones[tone] = true
-    const toRemove = this._items.value.filter((item) => item.tone === tone)
-    for (const item of toRemove) {
-      this.remove(item.id)
-    }
-  }
-
-  /** 解除语义静音 */
-  unmuteTone(tone: ActivityTone): void {
-    this._mutedTones[tone] = false
-  }
-
-  /** 查询语义静音状态 */
-  isToneMuted(tone: ActivityTone): boolean {
-    return Boolean(this._mutedTones[tone])
   }
 
   /** 订阅活动变更 */

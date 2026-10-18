@@ -10,11 +10,13 @@ import { computed, onBeforeUnmount, ref } from 'vue'
 import HlButton from '@/components/ui/HlButton.vue'
 import HlDrawer from '@/components/ui/HlDrawer.vue'
 import HlIcon from '@/components/ui/HlIcon.vue'
+import { pilotCoverUrl } from '@/lib/pilotView'
 import { useI18n } from '@/locales'
 
+import { setExpanded } from '../island'
 import { activityManager } from './activityManager'
 import { islandController } from './islandController'
-import type { Activity } from './types'
+import type { Activity, ActivityRegistration } from './types'
 
 const emit = defineEmits<{ (e: 'close'): void }>()
 const { t } = useI18n()
@@ -56,6 +58,7 @@ const unsubscribe = activityManager.subscribe(() => {
 /* ── 连续进度定时器 ── */
 const continuousTimer = ref<ReturnType<typeof setInterval> | null>(null)
 const continuousProgress = ref(0)
+const iconCycleTimer = ref<ReturnType<typeof setInterval> | null>(null)
 
 function stopContinuous() {
   if (continuousTimer.value) {
@@ -64,14 +67,23 @@ function stopContinuous() {
   }
 }
 
+function stopIconCycle() {
+  if (iconCycleTimer.value) {
+    clearInterval(iconCycleTimer.value)
+    iconCycleTimer.value = null
+  }
+}
+
 onBeforeUnmount(() => {
   unsubscribe()
   stopContinuous()
+  stopIconCycle()
 })
 
 /* ── 仅清理 dev: 命名空间的活动 ── */
 function clearDevActivities() {
   stopContinuous()
+  stopIconCycle()
   const devActs = activityManager.activities.filter((a) => a.id.startsWith('dev:'))
   for (const act of devActs) {
     activityManager.remove(act.id)
@@ -213,17 +225,101 @@ function applyPreset(preset: string) {
       addLog('Injected preset: Updater Download')
       break
 
-    case 'progress':
+    case 'sync':
       activityManager.register({
-        id: 'dev:progress-demo',
-        source: 'download',
+        id: 'dev:bills-sync',
+        source: 'bills',
         kind: 'task',
         status: 'running',
-        title: t('island.playground.mockDownloadTitle'),
-        progress: 15,
-        priority: 25,
+        title: t('island.playground.mockSyncTitle'),
+        detail: t('island.playground.mockSyncDetail'),
+        progress: 64,
+        priority: 32,
       })
-      addLog('Injected preset: Progress Demo')
+      addLog('Injected preset: Bills Sync')
+      break
+
+    case 'business-mix':
+      activityManager.register({
+        id: 'dev:mixed-crawl',
+        source: 'crawler',
+        kind: 'task',
+        status: 'running',
+        title: t('island.playground.mockCrawlTitle', { done: 48, total: 100 }),
+        progress: 48,
+        priority: 38,
+      })
+      activityManager.register({
+        id: 'dev:mixed-sync',
+        source: 'bills',
+        kind: 'task',
+        status: 'running',
+        title: t('island.playground.mockSyncTitle'),
+        progress: 64,
+        priority: 34,
+      })
+      activityManager.register({
+        id: 'dev:mixed-updater',
+        source: 'updater',
+        kind: 'task',
+        status: 'running',
+        title: t('island.playground.mockUpdaterTitle'),
+        progress: 82,
+        priority: 30,
+      })
+      addLog('Injected preset: Crawl, bills sync, and update')
+      break
+
+    case 'updater-available':
+      activityManager.register({
+        id: 'dev:updater-available',
+        source: 'updater',
+        kind: 'notice',
+        status: 'attention',
+        title: t('island.playground.mockUpdateAvailableTitle'),
+        metadata: { type: 'available' },
+        priority: 42,
+      })
+      addLog('Injected preset: Update Available')
+      break
+
+    case 'updater-ready':
+      activityManager.register({
+        id: 'dev:updater-ready',
+        source: 'updater',
+        kind: 'system',
+        status: 'attention',
+        title: t('island.playground.mockUpdateReadyTitle'),
+        metadata: { type: 'ready' },
+        priority: 45,
+      })
+      addLog('Injected preset: Update Ready')
+      break
+
+    case 'updater-failed':
+      activityManager.register({
+        id: 'dev:updater-failed',
+        source: 'updater',
+        kind: 'task',
+        status: 'failed',
+        title: t('island.playground.mockUpdateFailedTitle'),
+        detail: t('island.playground.mockUpdateFailedDetail'),
+        priority: 45,
+      })
+      addLog('Injected preset: Update Failed')
+      break
+
+    case 'progress':
+      startContinuousProgress({
+        id: 'dev:progress-demo',
+        source: 'download',
+        initialProgress: 15,
+        title: t('island.playground.mockDownloadTitle'),
+        priority: 25,
+        completionTitle: t('island.playground.mockDownloadDoneTitle'),
+        completionDetail: t('island.playground.mockDownloadDoneDetail'),
+      })
+      addLog('Started dynamic progress preset at 15%')
       break
 
     case 'alert':
@@ -249,6 +345,7 @@ function applyPreset(preset: string) {
         status: 'attention',
         title: t('island.playground.mockNoticeTitle'),
         detail: t('island.playground.mockNoticeDetail'),
+        iconImageUrl: pilotCoverUrl(1245620),
         priority: 40,
         tone: 'accent',
       })
@@ -258,6 +355,115 @@ function applyPreset(preset: string) {
 }
 
 /* ── 极端情况与边缘测试 ── */
+function toggleIconCycle() {
+  if (iconCycleTimer.value) {
+    stopIconCycle()
+    addLog('Stopped icon transition demo')
+    return
+  }
+
+  clearDevActivities()
+  const steps: ActivityRegistration[] = [
+    {
+      id: 'dev:icon-cycle',
+      source: 'crawler',
+      kind: 'task',
+      status: 'running',
+      title: t('island.playground.mockCrawlTitle', { done: 45, total: 100 }),
+      detail: t('island.playground.mockCrawlDetail'),
+      icon: 'refresh',
+      iconImageUrl: '',
+      progress: 45,
+      priority: 50,
+    },
+    {
+      id: 'dev:icon-cycle',
+      source: 'bills',
+      kind: 'task',
+      status: 'running',
+      title: t('island.playground.mockSyncTitle'),
+      detail: t('island.playground.mockSyncDetail'),
+      icon: 'database',
+      iconImageUrl: '',
+      progress: 64,
+      priority: 50,
+    },
+    {
+      id: 'dev:icon-cycle',
+      source: 'updater',
+      kind: 'task',
+      status: 'running',
+      title: t('island.playground.mockUpdaterTitle'),
+      detail: t('island.playground.mockUpdaterDetail', { pct: 78 }),
+      icon: 'download',
+      iconImageUrl: '',
+      progress: 78,
+      priority: 50,
+    },
+    {
+      id: 'dev:icon-cycle',
+      source: 'price-alert',
+      kind: 'notice',
+      status: 'attention',
+      title: t('island.playground.mockNoticeTitle'),
+      detail: t('island.playground.mockNoticeDetail'),
+      icon: 'bell',
+      iconImageUrl: pilotCoverUrl(1245620),
+      progress: null,
+      priority: 50,
+    },
+  ]
+
+  let stepIndex = 0
+  const applyStep = () => activityManager.register(steps[stepIndex])
+  applyStep()
+  iconCycleTimer.value = setInterval(() => {
+    stepIndex = (stepIndex + 1) % steps.length
+    applyStep()
+  }, 1400)
+  addLog('Started icon transition demo')
+}
+
+function startContinuousProgress(options: {
+  id: string
+  source: string
+  initialProgress: number
+  title: string
+  priority: number
+  completionTitle: string
+  completionDetail: string
+  titleForProgress?: (progress: number) => string
+}) {
+  continuousProgress.value = options.initialProgress
+  activityManager.register({
+    id: options.id,
+    source: options.source,
+    kind: 'task',
+    status: 'running',
+    title: options.titleForProgress?.(continuousProgress.value) ?? options.title,
+    progress: continuousProgress.value,
+    priority: options.priority,
+  })
+
+  continuousTimer.value = setInterval(() => {
+    continuousProgress.value = Math.min(100, continuousProgress.value + 5)
+    const progress = continuousProgress.value
+    if (progress >= 100) {
+      activityManager.complete(options.id, {
+        title: options.completionTitle,
+        detail: options.completionDetail,
+      })
+      stopContinuous()
+      addLog('Continuous progress completed at 100%')
+    } else {
+      activityManager.update(options.id, {
+        progress,
+        ...(options.titleForProgress ? { title: options.titleForProgress(progress) } : {}),
+      })
+    }
+  }, 250)
+}
+
 function toggleContinuousProgress() {
   if (continuousTimer.value) {
     stopContinuous()
@@ -265,34 +471,17 @@ function toggleContinuousProgress() {
     return
   }
 
-  continuousProgress.value = 0
-  activityManager.register({
+  startContinuousProgress({
     id: 'dev:continuous',
     source: 'simulation',
-    kind: 'task',
-    status: 'running',
+    initialProgress: 0,
     title: t('island.playground.mockContinuousTitle'),
-    progress: 0,
     priority: 50,
+    completionTitle: t('island.playground.mockContinuousDone'),
+    completionDetail: t('island.playground.mockContinuousDoneDetail'),
+    titleForProgress: (progress) => t('island.playground.mockContinuousTitlePct', { pct: progress }),
   })
   addLog('Started continuous progress simulation')
-
-  continuousTimer.value = setInterval(() => {
-    continuousProgress.value += 5
-    if (continuousProgress.value >= 100) {
-      activityManager.complete('dev:continuous', {
-        title: t('island.playground.mockContinuousDone'),
-        detail: t('island.playground.mockContinuousDoneDetail'),
-      })
-      stopContinuous()
-      addLog('Continuous progress completed at 100%')
-    } else {
-      activityManager.update('dev:continuous', {
-        progress: continuousProgress.value,
-        title: t('island.playground.mockContinuousTitlePct', { pct: continuousProgress.value }),
-      })
-    }
-  }, 250)
 }
 
 function simulateDuplicateUpdate() {
@@ -347,8 +536,24 @@ function simulateSuddenEnd() {
 }
 
 function triggerSwap() {
-  islandController.swap()
-  addLog(`Triggered swap: primary is now ${islandController.primaryId ?? 'none'}`)
+  if (!islandController.hasSecondary) {
+    addLog('Add a second activity before testing the island swap')
+    return
+  }
+  islandController.requestSwap()
+  addLog('Requested the primary and secondary island transition')
+}
+
+function toggleIslandExpanded() {
+  const expanded = !islandController.isExpanded.value
+  setExpanded(expanded)
+  addLog(expanded ? 'Expanded the primary island' : 'Collapsed the primary island')
+}
+
+function toggleActivityOverview() {
+  const open = !islandController.isOverviewOpen.value
+  islandController.setOverview(open)
+  addLog(open ? 'Opened the activity overview' : 'Closed the activity overview')
 }
 
 /* ── 表格行快捷操作 ── */
@@ -384,6 +589,7 @@ const activeList = computed(() => activityManager.activities)
 /* ── 阶段真实验收测试 ── */
 const p1Verified = ref(false)
 const p2Verified = ref(false)
+const p3Verified = ref(false)
 const isVerifying = ref(false)
 
 async function runLiveAcceptanceCheck() {
@@ -391,6 +597,7 @@ async function runLiveAcceptanceCheck() {
   isVerifying.value = true
   p1Verified.value = false
   p2Verified.value = false
+  p3Verified.value = false
   addLog('── Starting Live Acceptance Validation ──')
 
   try {
@@ -494,12 +701,27 @@ async function runLiveAcceptanceCheck() {
 
     p2Verified.value = true
     addLog('✓ P2 Multi-activity Swap, Pin & Priority Preemption: PASSED')
+
+    // 7. 验证 P3: 活动总览面板状态与直接选定主岛
+    islandController.setOverview(true)
+    if (!islandController.isOverviewOpen.value) {
+      throw new Error('P3 overview open failed')
+    }
+    islandController.selectPrimary('dev:task-b')
+    if (islandController.primaryId !== 'dev:task-b') {
+      throw new Error('P3 select primary from overview failed')
+    }
+    islandController.setOverview(false)
+    p3Verified.value = true
+    addLog('✓ P3 Overview Hub & Direct Selection: PASSED')
+
     addLog('All Live Checks Passed')
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err)
     addLog(`✗ Acceptance check failed: ${msg}`)
   } finally {
     islandController.unpin()
+    islandController.setOverview(false)
     clearDevActivities()
     isVerifying.value = false
   }
@@ -532,6 +754,60 @@ async function runLiveAcceptanceCheck() {
         </HlButton>
       </div>
 
+      <!-- 预设场景快速注入 -->
+      <div class="island-playground__section">
+        <div class="island-playground__section-title">
+          {{ t('island.playground.presets') }}
+        </div>
+        <div class="island-playground__btn-grid">
+          <HlButton size="sm" @click="applyPreset('crawl')">
+            {{ t('island.playground.presetCrawl') }}
+          </HlButton>
+          <HlButton size="sm" @click="applyPreset('sync')">
+            {{ t('island.playground.presetSync') }}
+          </HlButton>
+          <HlButton size="sm" @click="applyPreset('updater')">
+            {{ t('island.playground.presetUpdater') }}
+          </HlButton>
+          <HlButton size="sm" variant="primary" @click="applyPreset('business-mix')">
+            {{ t('island.playground.presetBusinessMix') }}
+          </HlButton>
+          <HlButton size="sm" @click="applyPreset('updater-available')">
+            {{ t('island.playground.presetUpdateAvailable') }}
+          </HlButton>
+          <HlButton size="sm" @click="applyPreset('updater-ready')">
+            {{ t('island.playground.presetUpdateReady') }}
+          </HlButton>
+          <HlButton size="sm" variant="warning" @click="applyPreset('updater-failed')">
+            {{ t('island.playground.presetUpdateFailed') }}
+          </HlButton>
+          <HlButton size="sm" @click="applyPreset('notice')">
+            {{ t('island.playground.presetNotice') }}
+          </HlButton>
+          <HlButton size="sm" @click="applyPreset('single')">
+            {{ t('island.playground.presetSingle') }}
+          </HlButton>
+          <HlButton size="sm" @click="applyPreset('dual')">
+            {{ t('island.playground.presetDual') }}
+          </HlButton>
+          <HlButton size="sm" @click="applyPreset('quad')">
+            {{ t('island.playground.presetQuad') }}
+          </HlButton>
+          <HlButton size="sm" @click="applyPreset('ten')">
+            {{ t('island.playground.presetTen') }}
+          </HlButton>
+          <HlButton size="sm" @click="applyPreset('progress')">
+            {{ t('island.playground.presetProgress') }}
+          </HlButton>
+          <HlButton size="sm" variant="warning" @click="applyPreset('alert')">
+            {{ t('island.playground.presetAlert') }}
+          </HlButton>
+          <HlButton size="sm" variant="danger" @click="applyPreset('clear')">
+            {{ t('island.playground.presetClear') }}
+          </HlButton>
+        </div>
+      </div>
+
       <!-- 阶段能力状态矩阵 -->
       <div class="island-playground__section">
         <div class="island-playground__section-header">
@@ -558,9 +834,11 @@ async function runLiveAcceptanceCheck() {
               {{ p2Verified ? t('island.playground.statusVerified') : t('island.playground.statusUnverified') }}
             </span>
           </div>
-          <div class="matrix-card is-pending">
+          <div class="matrix-card" :class="p3Verified ? 'is-pass' : 'is-unverified'">
             <span class="matrix-card__name">{{ t('island.playground.p3Status') }}</span>
-            <span class="matrix-card__badge is-pending">{{ t('island.playground.notImplemented') }}</span>
+            <span class="matrix-card__badge" :class="p3Verified ? 'is-pass' : 'is-unverified'">
+              {{ p3Verified ? t('island.playground.statusVerified') : t('island.playground.statusUnverified') }}
+            </span>
           </div>
         </div>
       </div>
@@ -594,41 +872,19 @@ async function runLiveAcceptanceCheck() {
         </div>
       </div>
 
-      <!-- 预设场景快速注入 -->
       <div class="island-playground__section">
         <div class="island-playground__section-title">
-          {{ t('island.playground.presets') }}
+          {{ t('island.playground.visualControls') }}
         </div>
         <div class="island-playground__btn-grid">
-          <HlButton size="sm" variant="danger" @click="applyPreset('clear')">
-            {{ t('island.playground.presetClear') }}
+          <HlButton size="sm" @click="toggleIslandExpanded">
+            {{ islandController.isExpanded.value ? t('island.playground.collapseIsland') : t('island.playground.expandIsland') }}
           </HlButton>
-          <HlButton size="sm" @click="applyPreset('single')">
-            {{ t('island.playground.presetSingle') }}
+          <HlButton size="sm" @click="toggleActivityOverview">
+            {{ islandController.isOverviewOpen.value ? t('island.playground.closeOverview') : t('island.playground.openOverview') }}
           </HlButton>
-          <HlButton size="sm" @click="applyPreset('dual')">
-            {{ t('island.playground.presetDual') }}
-          </HlButton>
-          <HlButton size="sm" @click="applyPreset('quad')">
-            {{ t('island.playground.presetQuad') }}
-          </HlButton>
-          <HlButton size="sm" @click="applyPreset('ten')">
-            {{ t('island.playground.presetTen') }}
-          </HlButton>
-          <HlButton size="sm" @click="applyPreset('crawl')">
-            {{ t('island.playground.presetCrawl') }}
-          </HlButton>
-          <HlButton size="sm" @click="applyPreset('updater')">
-            {{ t('island.playground.presetUpdater') }}
-          </HlButton>
-          <HlButton size="sm" @click="applyPreset('progress')">
-            {{ t('island.playground.presetProgress') }}
-          </HlButton>
-          <HlButton size="sm" variant="warning" @click="applyPreset('alert')">
-            {{ t('island.playground.presetAlert') }}
-          </HlButton>
-          <HlButton size="sm" @click="applyPreset('notice')">
-            {{ t('island.playground.presetNotice') }}
+          <HlButton size="sm" variant="primary" @click="triggerSwap">
+            {{ t('island.playground.simSwap') }}
           </HlButton>
         </div>
       </div>
@@ -639,6 +895,13 @@ async function runLiveAcceptanceCheck() {
           {{ t('island.playground.manualOps') }}
         </div>
         <div class="island-playground__btn-grid">
+          <HlButton
+            size="sm"
+            :variant="iconCycleTimer ? 'warning' : 'primary'"
+            @click="toggleIconCycle"
+          >
+            {{ iconCycleTimer ? t('island.playground.simIconCycleStop') : t('island.playground.simIconCycle') }}
+          </HlButton>
           <HlButton
             size="sm"
             :variant="continuousTimer ? 'warning' : 'default'"
@@ -654,9 +917,6 @@ async function runLiveAcceptanceCheck() {
           </HlButton>
           <HlButton size="sm" @click="simulateSuddenEnd">
             {{ t('island.playground.simSuddenEnd') }}
-          </HlButton>
-          <HlButton size="sm" variant="primary" @click="triggerSwap">
-            {{ t('island.playground.simSwap') }}
           </HlButton>
           <HlButton size="sm" variant="ghost" @click="clearDevActivities">
             {{ t('island.playground.clearDevOnly') }}

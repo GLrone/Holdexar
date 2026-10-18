@@ -1,19 +1,22 @@
 <script setup lang="ts">
 /**
  * SecondaryIsland — 副岛紧凑胶囊组件
- * 多任务时在主岛旁侧呈现次要活动的精简图标与计数，点击可交换为主岛。
- * 支持悬停预览详情、点击余量进入总览面板与键盘无障碍访问。
+ * 双任务时呈现为 36px 完整圆形模块徽标；三任务及以上延伸为 36px 高、至少 58px 宽的小胶囊。
+ * 绝不用通用 Spinner 覆盖模块图标；支持悬停预览详情、点击余量进入总览面板、全套键盘快捷交互与空间切移动画。
  */
 import { computed, onBeforeUnmount, ref } from 'vue'
-import { useI18n } from '@/locales'
+
 import HlIcon from '@/components/ui/HlIcon.vue'
-import HlSpinner from '@/components/ui/HlSpinner.vue'
+import { useI18n } from '@/locales'
+
+import ActivityMark from './ActivityMark.vue'
+import { resolvePresentation } from './presentationResolver'
 import type { Activity } from './types'
 
 const props = defineProps<{
   activity: Activity | null
   extraCount?: number
-  isSwapping?: boolean
+  isSwapHidden?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -26,26 +29,10 @@ const { t } = useI18n()
 const showPreview = ref(false)
 let previewTimer: ReturnType<typeof setTimeout> | null = null
 
-const iconName = computed(() => {
-  if (!props.activity) return 'info'
-  if (props.activity.icon) return props.activity.icon
-  if (props.activity.status === 'failed') return 'x-circle'
-  if (props.activity.status === 'success') return 'check-circle'
-  if (props.activity.status === 'running') return 'refresh'
-  return 'info'
-})
+/** 模块视觉呈现解析 */
+const presentation = computed(() => resolvePresentation(props.activity))
 
-const isSpinning = computed(() => props.activity?.status === 'running')
-
-const toneClass = computed(() => {
-  if (!props.activity) return ''
-  if (props.activity.status === 'failed') return 'is-error'
-  if (props.activity.status === 'success') return 'is-success'
-  if (props.activity.status === 'running') return 'is-progress'
-  if (props.activity.tone) return `is-${props.activity.tone}`
-  return ''
-})
-
+/** 提示文本 */
 const tooltipText = computed(() => {
   if (!props.activity) return ''
   const swapLabel = t('island.swap')
@@ -83,7 +70,9 @@ function onMouseEnter() {
 
 function onMouseLeave() {
   if (previewTimer) clearTimeout(previewTimer)
-  showPreview.value = false
+  previewTimer = setTimeout(() => {
+    showPreview.value = false
+  }, 120)
 }
 
 onBeforeUnmount(() => {
@@ -95,7 +84,16 @@ onBeforeUnmount(() => {
   <div
     v-if="activity"
     class="hl-secondary-island"
-    :class="{ 'is-swapping-secondary': isSwapping }"
+    :class="[
+      {
+        'is-circle': !extraCount || extraCount <= 0,
+        'is-capsule': extraCount && extraCount > 0,
+        'is-swap-hidden': isSwapHidden,
+      },
+    ]"
+    :data-activity-id="activity.id"
+    :aria-hidden="isSwapHidden ? 'true' : undefined"
+    :inert="isSwapHidden"
     role="button"
     tabindex="0"
     :title="tooltipText"
@@ -106,12 +104,16 @@ onBeforeUnmount(() => {
     @mouseleave="onMouseLeave"
     @contextmenu.prevent="emit('openOverview')"
   >
-    <div class="hl-secondary-island__lead">
-      <HlSpinner v-if="isSpinning" class="hl-secondary-island__spin" />
-      <HlIcon v-else :name="iconName" :size="12" class="hl-secondary-island__icon" :class="toneClass" />
-    </div>
+    <!-- 模块专属标识（进度加载动效完整嵌入 Logo 环，杜绝外部悬挂与通用覆盖） -->
+    <ActivityMark
+      class="hl-secondary-island__lead"
+      :presentation="presentation"
+      :progress="activity.progress"
+      :image-url="activity.iconImageUrl"
+      :animation-key="activity.id"
+    />
 
-    <!-- 余量计数徽章：点击可直接进入活动总览面板 -->
+    <!-- 余量计数徽章：仅 3 个及以上活动时呈现，点击直通活动总览面板 -->
     <span
       v-if="extraCount && extraCount > 0"
       class="hl-secondary-island__count"
@@ -139,17 +141,27 @@ onBeforeUnmount(() => {
             {{ activity.progress }}%
           </span>
         </div>
+
         <p v-if="activity.detail" class="hl-secondary-preview__detail">
           {{ activity.detail }}
         </p>
+
         <div v-if="activity.progress !== undefined" class="hl-secondary-preview__bar">
           <i
             :style="activity.progress !== null ? { width: `${activity.progress}%` } : undefined"
             :class="{ 'is-slide': activity.progress === null }"
           />
         </div>
-        <div class="hl-secondary-preview__tip">
-          {{ t('island.previewHint') }}
+
+        <div class="hl-secondary-preview__footer">
+          <span class="hl-secondary-preview__tip">{{ t('island.previewHint') }}</span>
+          <button
+            type="button"
+            class="hl-secondary-preview__hub-btn"
+            @click.stop="emit('openOverview')"
+          >
+            {{ t('island.hub') }}
+          </button>
         </div>
       </div>
     </Transition>
@@ -161,29 +173,41 @@ onBeforeUnmount(() => {
   position: relative;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  height: 30px;
-  padding: 0 8px;
-  border-radius: 15px;
+  height: 36px;
   background: var(--island-bg);
   box-shadow: var(--shadow-island);
   color: var(--text-primary);
+  border: none;
+  outline: none;
   cursor: pointer;
   user-select: none;
+  box-sizing: border-box;
   transition:
+    width calc(var(--duration-3) * var(--motion-scale)) var(--ease-island),
     transform calc(var(--duration-3) * var(--motion-scale)) var(--ease-island),
     box-shadow calc(var(--duration-3) * var(--motion-scale)) var(--ease-out),
     opacity calc(var(--duration-3) * var(--motion-scale)) var(--ease-out);
 }
 
-.hl-secondary-island:hover {
-  transform: scale(1.05);
+/* 双活动收起态：完整的圆形，直径 36px，居中对齐 */
+.hl-secondary-island.is-circle {
+  width: 36px;
+  border-radius: 18px;
+  padding: 0;
+  justify-content: center;
 }
 
-.hl-secondary-island.is-swapping-secondary {
-  transform: translateX(-12px) scale(1.08);
-  opacity: 0.82;
-  transition: transform 140ms var(--ease-island), opacity 140ms var(--ease-out);
+/* 三个及以上活动：适度延展为 36px 高、至少 58px 宽的小胶囊 */
+.hl-secondary-island.is-capsule {
+  min-width: 58px;
+  border-radius: 18px;
+  padding: 0 8px;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.hl-secondary-island:hover {
+  transform: scale(1.04);
 }
 
 .hl-secondary-island:focus-visible {
@@ -191,57 +215,41 @@ onBeforeUnmount(() => {
   outline-offset: 2px;
 }
 
-.hl-secondary-island__lead {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.hl-secondary-island__spin {
-  width: 12px;
-  height: 12px;
-}
-
-.hl-secondary-island__icon.is-success {
-  color: var(--success);
-}
-
-.hl-secondary-island__icon.is-error {
-  color: var(--danger);
-}
-
-.hl-secondary-island__icon.is-progress {
-  color: var(--accent);
+.hl-secondary-island.is-swap-hidden {
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .hl-secondary-island__count {
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
+  font-variant-numeric: tabular-nums;
   color: var(--text-muted);
-  padding: 1px 4px;
-  border-radius: 8px;
+  padding: 1px 5px;
+  border-radius: 9px;
+  background: var(--island-btn);
   transition: background var(--transition), color var(--transition);
 }
 
 .hl-secondary-island__count:hover {
-  background: var(--island-btn);
-  color: var(--accent);
+  background: var(--accent);
+  color: var(--on-accent-fill);
 }
 
 .hl-secondary-preview {
   position: absolute;
   top: calc(100% + 8px);
   right: 0;
-  width: 220px;
+  width: 230px;
   padding: 10px 12px;
-  border-radius: 10px;
+  border-radius: 12px;
   background: var(--island-bg);
   box-shadow: var(--shadow-island);
   border: 1px solid var(--border-soft);
   color: var(--text-primary);
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 7px;
   z-index: 10001;
   pointer-events: auto;
   text-align: left;
@@ -279,7 +287,7 @@ onBeforeUnmount(() => {
 .hl-secondary-preview__pct {
   font-size: 11px;
   font-weight: 600;
-  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
   color: var(--accent);
 }
 
@@ -317,11 +325,36 @@ onBeforeUnmount(() => {
   animation: hlIslandBar 1.4s var(--ease-inout) infinite;
 }
 
+.hl-secondary-preview__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  border-top: 1px solid var(--border-soft);
+  padding-top: 6px;
+}
+
 .hl-secondary-preview__tip {
   font-size: 10px;
   color: var(--text-muted);
-  border-top: 1px solid var(--border-soft);
-  padding-top: 5px;
+  flex: 1 1 auto;
+}
+
+.hl-secondary-preview__hub-btn {
+  border: none;
+  background: var(--island-btn);
+  color: var(--text-primary);
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.hl-secondary-preview__hub-btn:hover {
+  background: var(--accent);
+  color: var(--on-accent-fill);
 }
 
 .secondary-preview-fade-enter-active,
@@ -347,11 +380,6 @@ onBeforeUnmount(() => {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .hl-secondary-island.is-swapping-secondary {
-    transform: none;
-    transition: none;
-  }
-
   .hl-secondary-preview__bar > i.is-slide {
     animation: none;
   }

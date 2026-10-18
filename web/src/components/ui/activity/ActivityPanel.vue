@@ -19,13 +19,14 @@ const emit = defineEmits<{
   (e: 'pin', id: string): void
   (e: 'action', activity: Activity): void
   (e: 'close'): void
+  (e: 'afterClose'): void
 }>()
 
 const { t } = useI18n()
 </script>
 
 <template>
-  <Transition name="activity-panel">
+  <Transition name="activity-panel" @after-leave="emit('afterClose')">
     <div
       v-if="open"
       class="hl-activity-panel"

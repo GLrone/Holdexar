@@ -56,6 +56,7 @@ test('islandBridge：pushNotice 与 dropNotice/updateNotice 正确桥接至 Acti
     retry: null,
     to: '',
     toLabel: '',
+    iconImageUrl: 'https://example.test/game-cover.jpg',
   })
 
   assert.ok(id > 0)
@@ -68,6 +69,7 @@ test('islandBridge：pushNotice 与 dropNotice/updateNotice 正确桥接至 Acti
   assert.equal(act.title, '设置已保存')
   assert.equal(act.detail, '配置已生效')
   assert.equal(act.tone, 'success')
+  assert.equal(act.iconImageUrl, 'https://example.test/game-cover.jpg')
 
   // updateNotice 原位更新
   updateNotice(id, '设置已同步至云端')

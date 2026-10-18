@@ -1,12 +1,16 @@
 <script setup lang="ts">
 /**
  * ActivityItem — 活动总览列表项组件脚手架
- * 呈现单个活动的图标、标题、进度或异常状态，并支持设为主岛或跳转。
+ * 呈现单个活动的模块标识、标题、进度或异常状态，并支持设为主岛或跳转。
+ * 遵循收口契约：模块专属标识永不被通用 Spinner 替代。
  */
 import { computed } from 'vue'
+
 import HlIcon from '@/components/ui/HlIcon.vue'
-import HlSpinner from '@/components/ui/HlSpinner.vue'
 import { useI18n } from '@/locales'
+
+import ActivityMark from './ActivityMark.vue'
+import { resolvePresentation } from './presentationResolver'
 import type { Activity } from './types'
 
 const props = defineProps<{
@@ -23,23 +27,7 @@ const emit = defineEmits<{
 
 const { t } = useI18n()
 
-const iconName = computed(() => {
-  if (props.activity.icon) return props.activity.icon
-  if (props.activity.status === 'failed') return 'x-circle'
-  if (props.activity.status === 'success') return 'check-circle'
-  if (props.activity.status === 'running') return 'refresh'
-  return 'info'
-})
-
-const isSpinning = computed(() => props.activity.status === 'running')
-
-const toneClass = computed(() => {
-  if (props.activity.status === 'failed') return 'is-error'
-  if (props.activity.status === 'success') return 'is-success'
-  if (props.activity.status === 'running') return 'is-progress'
-  if (props.activity.tone) return `is-${props.activity.tone}`
-  return ''
-})
+const presentation = computed(() => resolvePresentation(props.activity))
 
 function onRowClick() {
   emit('select', props.activity.id)
@@ -67,10 +55,15 @@ function onActionClick(e: MouseEvent) {
     @click="onRowClick"
     @keydown="onKeydown"
   >
-    <div class="hl-activity-item__lead">
-      <HlSpinner v-if="isSpinning" class="hl-activity-item__spin" />
-      <HlIcon v-else :name="iconName" :size="14" class="hl-activity-item__icon" :class="toneClass" />
-    </div>
+    <!-- 模块专属标识（进度加载动效完整嵌入 Logo 环，杜绝外部悬挂与通用覆盖） -->
+    <ActivityMark
+      class="hl-activity-item__lead"
+      :presentation="presentation"
+      :progress="activity.progress"
+      :image-url="activity.iconImageUrl"
+      :animation-key="activity.id"
+      :icon-size="14"
+    />
 
     <div class="hl-activity-item__content">
       <div class="hl-activity-item__header">
@@ -99,6 +92,7 @@ function onActionClick(e: MouseEvent) {
       >
         <HlIcon name="target" :size="12" />
       </button>
+
       <button
         v-if="activity.to"
         type="button"
@@ -127,33 +121,8 @@ function onActionClick(e: MouseEvent) {
   background: var(--surface-hover);
 }
 
-.hl-activity-item.is-primary {
-  border: 1px solid var(--accent);
-}
-
 .hl-activity-item.is-attention {
   border-left: 3px solid var(--danger);
-}
-
-.hl-activity-item__lead {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 22px;
-  flex: 0 0 auto;
-}
-
-.hl-activity-item__icon.is-success {
-  color: var(--success);
-}
-
-.hl-activity-item__icon.is-error {
-  color: var(--danger);
-}
-
-.hl-activity-item__icon.is-progress {
-  color: var(--accent);
 }
 
 .hl-activity-item__content {

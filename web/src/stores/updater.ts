@@ -1,7 +1,9 @@
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { defineStore } from 'pinia'
 
 import { systemApi, type UpdateCheckResult, type UpdateProgress } from '@/api/client'
+import { activityManager } from '@/components/ui/activity'
+import { useI18n } from '@/locales'
 import { useSettingsStore } from '@/stores/settings'
 
 /**
@@ -284,6 +286,84 @@ export const useUpdaterStore = defineStore('updater', () => {
     justUpdated.value = null
     dialogOpen.value = false
   }
+
+  const UPDATER_ACTIVITY_ID = 'updater:activity'
+
+  function syncUpdaterActivity(): void {
+    const { t } = useI18n()
+    if (downloading.value && progress.value) {
+      const p = progress.value
+      const pct =
+        p.total && p.total > 0
+          ? Math.min(100, Math.round((p.downloaded / p.total) * 100))
+          : p.downloaded > 0
+            ? 50
+            : 0
+      activityManager.register({
+        id: UPDATER_ACTIVITY_ID,
+        source: 'updater',
+        kind: 'task',
+        status: 'running',
+        title: t('island.updater.downloading', { pct }),
+        detail: p.speed ? `${p.speed}` : undefined,
+        progress: pct,
+        priority: 45,
+        to: '/settings',
+        metadata: { type: 'download' },
+      })
+      return
+    }
+    if (pendingTag.value) {
+      activityManager.register({
+        id: UPDATER_ACTIVITY_ID,
+        source: 'updater',
+        kind: 'system',
+        status: 'attention',
+        title: t('island.updater.ready'),
+        priority: 50,
+        to: '/settings',
+        metadata: { type: 'ready', tag: pendingTag.value },
+      })
+      return
+    }
+    if (failure.value) {
+      activityManager.register({
+        id: UPDATER_ACTIVITY_ID,
+        source: 'updater',
+        kind: 'notice',
+        status: 'failed',
+        tone: 'error',
+        title: t('island.updater.failed'),
+        detail: failure.value.message || failure.value.code,
+        priority: 60,
+        to: '/settings',
+        metadata: { type: 'failed' },
+      })
+      return
+    }
+    if (hasUpdate.value && info.value?.tag && skipped.value !== info.value.tag) {
+      activityManager.register({
+        id: UPDATER_ACTIVITY_ID,
+        source: 'updater',
+        kind: 'notice',
+        status: 'attention',
+        title: t('island.updater.available', { tag: info.value.tag }),
+        priority: 25,
+        to: '/settings',
+        metadata: { type: 'available', tag: info.value.tag },
+      })
+      return
+    }
+    activityManager.remove(UPDATER_ACTIVITY_ID)
+  }
+
+  watch(
+    [hasUpdate, downloading, pendingTag, failure, skipped, () => progress.value?.downloaded, () => info.value?.tag],
+    () => {
+      syncUpdaterActivity()
+    },
+    { immediate: true },
+  )
 
   return {
     info,
