@@ -9,6 +9,9 @@ get_session_factory / get_engine（对齐 test_backup.py / test_account_wallet
 """
 from __future__ import annotations
 
+import asyncio
+import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -20,6 +23,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.core import backup as backup_module  # noqa: E402
 from app.core import database as database_module  # noqa: E402
 
 
@@ -110,10 +114,124 @@ async def test_migration_chain_applies_and_resumes(isolated_db: Path) -> None:
     con = sqlite3.connect(str(isolated_db))
     try:
         rows = sorted(v for (v,) in con.execute("SELECT v FROM _mig_probe").fetchall())
-        # v3 行不因重放翻倍（v3 已在账本内跳过，非靠 SQL 幂等兜底）
         assert rows == ["v3-done", "v4-done"]
     finally:
         con.close()
+
+
+@pytest.mark.asyncio
+async def test_migration_failure_rolls_back_ddl_and_data(isolated_db: Path, monkeypatch) -> None:
+    """SQLite 驱动上迁移中途失败时，DDL、DML 与版本号必须整体回滚。"""
+    await database_module.init_db()
+    monkeypatch.setattr(database_module, "_snapshot_before_migration", _noop_snapshot)
+
+    async def _partial(conn):
+        await conn.execute(text("CREATE TABLE _atomic_probe (id INTEGER PRIMARY KEY, v TEXT)"))
+        await conn.execute(text("INSERT INTO _atomic_probe (v) VALUES ('partial')"))
+        await conn.execute(text("INSERT INTO _missing_probe (v) VALUES ('fail')"))
+
+    database_module._MIGRATIONS.append((2, "atomic probe", _partial))
+    with pytest.raises(Exception):
+        await database_module._run_schema_migrations()
+
+    assert _user_version(isolated_db) == 1
+    con = sqlite3.connect(str(isolated_db))
+    try:
+        assert con.execute("SELECT name FROM sqlite_master WHERE name='_atomic_probe'").fetchone() is None
+    finally:
+        con.close()
+
+
+async def _noop_snapshot(_current: int, _target: int) -> None:
+    return None
+
+
+@pytest.mark.asyncio
+async def test_newer_schema_version_refuses_start_before_create_all(isolated_db: Path) -> None:
+    """回滚旧程序不得把比自身更新的数据库当作可运行结构。"""
+    con = sqlite3.connect(str(isolated_db))
+    try:
+        con.execute(f"PRAGMA user_version = {database_module.SCHEMA_VERSION + 1}")
+        con.commit()
+    finally:
+        con.close()
+
+    with pytest.raises(RuntimeError, match="高于当前程序支持的数据库版本"):
+        await database_module.init_db()
+
+    con = sqlite3.connect(str(isolated_db))
+    try:
+        assert con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall() == []
+    finally:
+        con.close()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_failure_blocks_migration(isolated_db: Path, monkeypatch) -> None:
+    """用户库迁移前回滚点创建失败时，不得开始写入 schema。"""
+    await database_module.init_db()
+
+    async def _snapshot_error(_current: int, _target: int) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(database_module, "_snapshot_before_migration", _snapshot_error)
+    database_module._MIGRATIONS.append((2, "snapshot admission probe", [
+        "CREATE TABLE _snapshot_probe (id INTEGER PRIMARY KEY)",
+    ]))
+    with pytest.raises(OSError, match="disk full"):
+        await database_module._run_schema_migrations()
+    assert _user_version(isolated_db) == 1
+    con = sqlite3.connect(str(isolated_db))
+    try:
+        assert con.execute("SELECT name FROM sqlite_master WHERE name='_snapshot_probe'").fetchone() is None
+    finally:
+        con.close()
+
+
+@pytest.mark.asyncio
+async def test_init_db_cleans_stale_legacy_maintenance_lock(isolated_db: Path) -> None:
+    lock = isolated_db.parent / "backups" / ".restore.lock"
+    lock.parent.mkdir(parents=True)
+    lock.write_text("2020-01-01T00:00:00", encoding="utf-8")
+    os.utime(lock, (1, 1))
+
+    await database_module.init_db()
+
+    assert not lock.exists()
+
+
+@pytest.mark.asyncio
+async def test_init_db_refuses_live_maintenance_lock_before_create_all(isolated_db: Path) -> None:
+    lock = isolated_db.parent / "backups" / ".restore.lock"
+    lock.parent.mkdir(parents=True)
+    current_pid = os.getpid()
+    lock.write_text(json.dumps({"pid": current_pid, "token": "live-maintenance"}), encoding="utf-8")
+
+    assert Path(database_module.get_engine().url.database) == isolated_db
+    assert backup_module._pid_is_running(current_pid), f"pid={current_pid} was not detected"
+    assert not backup_module._restore_lock_is_stale(lock), f"payload={lock.read_text(encoding='utf-8')}"
+
+    with pytest.raises(RuntimeError, match="维护正在进行中"):
+        await database_module.init_db()
+
+    con = sqlite3.connect(str(isolated_db))
+    try:
+        assert con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall() == []
+    finally:
+        con.close()
+
+
+@pytest.mark.asyncio
+async def test_init_db_waits_for_write_maintenance_barrier(isolated_db: Path) -> None:
+    lease = await database_module.acquire_write_maintenance_barrier()
+    task = asyncio.create_task(database_module.init_db())
+    try:
+        await asyncio.sleep(0.05)
+        assert not task.done()
+    finally:
+        lease.release()
+    await task
+    assert _user_version(isolated_db) == 1
 
 
 @pytest.mark.asyncio
@@ -246,12 +364,14 @@ async def test_v4_index_is_actually_enforcing(isolated_db: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_v4_skips_index_when_duplicates_exist(isolated_db: Path) -> None:
-    """库内已有重复行时**不删数据也不建索引**（只告警），避免静默删用户历史。"""
+async def test_v4_refuses_index_when_duplicates_exist(isolated_db: Path, monkeypatch) -> None:
+    """库内已有重复行时保留原数据并阻止迁移版本前进。"""
+    monkeypatch.setattr(database_module, "_snapshot_before_migration", _noop_snapshot)
     # 先造一张无索引的表并塞入重复行——模拟「此前无约束写入」的存量库
     con = sqlite3.connect(str(isolated_db))
     try:
         con.execute(_GPH_DDL)
+        con.execute("PRAGMA user_version = 3")
         for _ in range(2):
             con.execute(
                 "INSERT INTO game_price_history (appid, region_code, snapshot_at, sub_id, price)"
@@ -261,18 +381,30 @@ async def test_v4_skips_index_when_duplicates_exist(isolated_db: Path) -> None:
     finally:
         con.close()
 
-    # 只跑 v4 这一步（init_db 会 create_all，把那两行留在原地即可）
-    conn_engine = database_module.get_engine()
-    async with conn_engine.begin() as conn:
-        await database_module._migrate_gph_snapshot_unique(conn)
 
-    assert "ux_gph_snapshot" not in _index_names(isolated_db)
+@pytest.mark.asyncio
+async def test_gph_migration_replaces_wrong_index_with_same_name(isolated_db: Path) -> None:
     con = sqlite3.connect(str(isolated_db))
     try:
-        assert con.execute("SELECT COUNT(*) FROM game_price_history").fetchone()[0] == 2
+        con.execute(_GPH_DDL)
+        con.execute("CREATE UNIQUE INDEX ux_gph_snapshot ON game_price_history (appid)")
+        con.commit()
     finally:
         con.close()
 
+    async with database_module.get_engine().begin() as conn:
+        await database_module._migrate_gph_snapshot_unique(conn)
+
+    con = sqlite3.connect(str(isolated_db))
+    try:
+        sql = con.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='ux_gph_snapshot'"
+        ).fetchone()[0]
+        normalized = "".join(sql.lower().split())
+        assert "ongame_price_history(appid,region_code,snapshot_at" in normalized
+        assert "coalesce(sub_id,-1),coalesce(price,0),coalesce(is_gold,0)" in normalized
+    finally:
+        con.close()
 
 # ── v5：wishlist_items 愿望单成员标记回填 ──────────────────────────
 #

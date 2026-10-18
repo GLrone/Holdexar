@@ -32,7 +32,6 @@ from pathlib import Path
 from sqlalchemy import and_, or_, select, update
 
 from app.core.database import WritePriority, get_session_factory, write_session
-from app.core.database import write_gate
 from app.core.logging import log_event
 from app.domains.games.models import Game
 
@@ -546,7 +545,7 @@ async def refresh_series() -> int:
     批量 executemany 单事务提交。幂等：结果不变的行零写入。
     """
     overrides = load_overrides()
-    async with write_session(WritePriority.BACKGROUND) as session:
+    async with get_session_factory()() as session:
         rows = (
             (
                 await session.execute(
@@ -570,24 +569,23 @@ async def refresh_series() -> int:
             _mark_overrides_consumed()
             return 0
 
-        clusters = await asyncio.to_thread(
-            build_clusters, [(r.appid, r.name, r.name_en) for r in rows], overrides
-        )
-        new_map: dict[int, str] = {}
-        for name, appids in clusters:
-            for a in appids:
-                new_map[a] = name
-        for r in rows:
-            new_map.setdefault(r.appid, "")
+    clusters = await asyncio.to_thread(
+        build_clusters, [(r.appid, r.name, r.name_en) for r in rows], overrides
+    )
+    new_map: dict[int, str] = {}
+    for name, appids in clusters:
+        for a in appids:
+            new_map[a] = name
+    for r in rows:
+        new_map.setdefault(r.appid, "")
 
-        updates = [
-            {"appid": r.appid, "series_id": new_map[r.appid]}
-            for r in rows
-            # None ≠ ''：NULL（未计算）→ ''（已算落单）必须落库，否则
-            # has_unassigned 对落单行永远为真，爬后链每轮空转重算
-            if r.series_id != new_map[r.appid]
-        ]
-        if updates:
+    updates = [
+        {"appid": r.appid, "series_id": new_map[r.appid]}
+        for r in rows
+        if r.series_id != new_map[r.appid]
+    ]
+    if updates:
+        async with write_session(WritePriority.BACKGROUND) as session:
             await session.execute(update(Game), updates)
             await session.commit()
     _mark_overrides_consumed()

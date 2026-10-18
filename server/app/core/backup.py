@@ -28,6 +28,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -45,6 +46,7 @@ META_SUFFIX = ".gz.json"  # 归档元数据（sha256/游戏数/原始体积）
 COMPRESS_LEVEL = 6  # 每日常规档的压缩档：更高档省得少、慢得多
 _BACKUP_DIR_NAME = "backups"
 _LOCK_FILE = ".restore.lock"
+_LEGACY_LOCK_STALE_SECONDS = 24 * 60 * 60
 MANUAL_LABEL = "manual"  # 手动备份的文件名标记：独立轮转，仅保留最新一份
 _REPLACE_ATTEMPTS = 6  # 主库替换重试次数（每次重试前重关一次引擎）
 _REPLACE_RETRY_SECONDS = 0.3
@@ -64,6 +66,129 @@ def _ts() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        open_process.restype = wintypes.HANDLE
+        handle = open_process(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if handle:
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = (wintypes.HANDLE,)
+            close_handle.restype = wintypes.BOOL
+            close_handle(handle)
+            return True
+        # ERROR_INVALID_PARAMETER means the PID no longer exists; access denial and
+        # other OS errors fail closed so a live maintenance lock is never discarded.
+        return ctypes.get_last_error() != 87
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError as exc:
+        return getattr(exc, "winerror", None) != 87 and exc.errno != 3
+
+
+def _restore_lock_is_stale(lock_path: Path) -> bool:
+    try:
+        stat = lock_path.stat()
+        payload = lock_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        metadata = json.loads(payload)
+    except (json.JSONDecodeError, TypeError):
+        metadata = None
+    if isinstance(metadata, dict) and isinstance(metadata.get("pid"), int):
+        return not _pid_is_running(metadata["pid"])
+    return time.time() - stat.st_mtime >= _LEGACY_LOCK_STALE_SECONDS
+
+
+def _remove_stale_restore_lock(lock_path: Path) -> bool:
+    try:
+        before = lock_path.stat()
+    except FileNotFoundError:
+        return True
+    if not _restore_lock_is_stale(lock_path):
+        return False
+    try:
+        after = lock_path.stat()
+        if (before.st_ino, before.st_mtime_ns, before.st_size) != (
+            after.st_ino, after.st_mtime_ns, after.st_size
+        ):
+            return False
+        lock_path.unlink()
+        return True
+    except FileNotFoundError:
+        return True
+
+
+def ensure_restore_lock_available(
+    db_path: Path | None = None, *, maintenance_token: str | None = None
+) -> None:
+    """启动时清理可证明陈旧的锁；仍有进程持有时拒绝打开数据库。"""
+    lock_path = (
+        db_path.parent / _BACKUP_DIR_NAME / _LOCK_FILE
+        if db_path is not None
+        else backup_dir() / _LOCK_FILE
+    )
+    if not lock_path.exists():
+        return
+    if maintenance_token:
+        try:
+            metadata = json.loads(lock_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            metadata = None
+        if isinstance(metadata, dict) and metadata.get("token") == maintenance_token:
+            return
+    if _remove_stale_restore_lock(lock_path):
+        log_event(logger, "已清理中断维护留下的旧锁文件", level=logging.WARNING)
+        return
+    raise RuntimeError("数据库维护正在进行中，拒绝启动或备份")
+
+
+def _acquire_restore_lock() -> tuple[Path, str]:
+    lock_path = backup_dir() / _LOCK_FILE
+    _remove_stale_restore_lock(lock_path)
+    token = f"{os.getpid()}-{time.time_ns()}-{os.urandom(6).hex()}"
+    payload = json.dumps({
+        "pid": os.getpid(),
+        "created_at": datetime.now().isoformat(),
+        "token": token,
+    }).encode("utf-8")
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as exc:
+        raise RuntimeError("已有数据库维护操作在进行中") from exc
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+    except BaseException:
+        lock_path.unlink(missing_ok=True)
+        raise
+    finally:
+        os.close(fd)
+    return lock_path, token
+
+
+def _release_restore_lock(lock_path: Path, token: str) -> None:
+    try:
+        metadata = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(metadata, dict) and metadata.get("token") == token:
+        lock_path.unlink(missing_ok=True)
+
+
 # ─── 创建 / 校验 / 列表 ─────────────────────────────────────
 
 
@@ -75,17 +200,24 @@ async def create_backup(label: str | None = None, manual: bool = False) -> dict:
     产出文件名：holdexar-YYYYmmdd-HHMMSS[-label][-manual].db.gz
     返回 {path, name, sizeBytes, rawBytes, sha256, integrityOk, games}；备份失败抛 RuntimeError。
     """
-    import asyncio
-
     src = _db_path()
     if not src.is_file():
         raise RuntimeError(f"数据库文件不存在: {src}")
     # 恢复/收缩进行中不得再开一份快照：那期间引擎已断开、主库正在被替换，
     # 此刻的 VACUUM INTO 会读到一个句柄已释放或正在换位的库。
-    if (backup_dir() / _LOCK_FILE).exists():
-        raise RuntimeError("已有恢复或空间回收操作在进行中，请稍后再备份")
+    ensure_restore_lock_available()
     if label and not all(c.isalnum() or c in "-_" for c in label):
         raise ValueError("label 只允许字母数字和 -_")
+    lock_path, lock_token = _acquire_restore_lock()
+    try:
+        return await _create_backup_locked(src, label, manual)
+    finally:
+        _release_restore_lock(lock_path, lock_token)
+
+
+async def _create_backup_locked(src: Path, label: str | None, manual: bool) -> dict:
+    import asyncio
+
     name = f"{src.stem}-{_ts()}"
     if label:
         name += f"-{label}"
@@ -138,6 +270,24 @@ async def create_backup(label: str | None = None, manual: bool = False) -> dict:
         "games": games,
         "createdAt": datetime.now().isoformat(),
     }
+
+
+async def _wait_for_active_crawl(crawl_service, operation: str) -> None:
+    """等待当前爬取完整收尾；超时则中止维护，不带着活任务换库。"""
+    import asyncio
+
+    active = crawl_service._active
+    if active is None or active.task.done():
+        return
+    try:
+        await asyncio.wait_for(asyncio.shield(active.task), timeout=60)
+    except asyncio.TimeoutError as exc:
+        log_event(
+            logger,
+            f"{operation}未开始：爬取任务 60 秒内没有结束",
+            level=logging.ERROR,
+        )
+        raise RuntimeError(f"{operation}未执行：正在运行的价格更新没有及时结束") from exc
 
 
 def snapshot_to(src: Path, dest: Path) -> None:
@@ -235,30 +385,25 @@ async def compact_main_db() -> dict:
     src = _db_path()
     if not src.is_file():
         raise RuntimeError(f"数据库文件不存在: {src}")
-    lock_path = backup_dir() / _LOCK_FILE
-    if lock_path.exists():
-        raise RuntimeError("已有维护操作在进行中（锁文件存在）")
+    ensure_restore_lock_available()
 
     from ..core.scheduler import start_scheduler, stop_scheduler
     from app.domains.crawl import service as crawl_service
+    from .database import acquire_write_maintenance_barrier
 
-    before = _footprint(src)
-    before_main = src.stat().st_size
-    lock_path.write_text(datetime.now().isoformat(), encoding="utf-8")
+    barrier = None
+    lock_path = None
+    lock_token = None
+    scheduler_stopped = False
     engine_ok = False
     try:
         stop_scheduler()
-        active = crawl_service._active
-        if active is not None and not active.task.done():
-            try:
-                await asyncio.wait_for(asyncio.shield(active.task), timeout=60)
-            except asyncio.TimeoutError:
-                log_event(
-                    logger,
-                    "空间回收前爬取任务 60 秒未结束，继续收缩",
-                    level=logging.WARNING,
-                )
-        await asyncio.sleep(2)
+        scheduler_stopped = True
+        await _wait_for_active_crawl(crawl_service, "空间回收")
+        barrier = await acquire_write_maintenance_barrier()
+        lock_path, lock_token = _acquire_restore_lock()
+        before = _footprint(src)
+        before_main = src.stat().st_size
         await _dispose_engine()
         try:
             await asyncio.to_thread(_vacuum_file, src)
@@ -294,8 +439,16 @@ async def compact_main_db() -> dict:
             "mainDbAfterBytes": after_main,
         }
     finally:
-        start_scheduler()
-        lock_path.unlink(missing_ok=True)
+        try:
+            if lock_path is not None and lock_token is not None:
+                _release_restore_lock(lock_path, lock_token)
+        finally:
+            try:
+                if barrier is not None:
+                    barrier.release()
+            finally:
+                if scheduler_stopped:
+                    start_scheduler()
 
 
 async def _truncate_wal() -> None:
@@ -561,9 +714,7 @@ async def restore_backup(name: str) -> dict:
     if not path.is_file():
         raise FileNotFoundError(f"备份不存在: {name}")
 
-    lock_path = backup_dir() / _LOCK_FILE
-    if lock_path.exists():
-        raise RuntimeError("已有恢复操作在进行中（锁文件存在）")
+    ensure_restore_lock_available()
 
     src = _db_path()
     rollback = src.with_suffix(".rollback.db")
@@ -594,6 +745,17 @@ async def restore_backup(name: str) -> dict:
             raise RuntimeError(
                 f"备份缺表（版本过旧，恢复会丢数据）: {', '.join(sorted(missing))}"
             )
+        backup_version = await asyncio.to_thread(_user_version, verify_target)
+        from . import database as database_module
+
+        supported_version = max(
+            (version for version, _, _ in database_module._MIGRATIONS),
+            default=database_module.SCHEMA_VERSION,
+        )
+        if backup_version > supported_version:
+            raise RuntimeError(
+                f"备份数据库结构版本 v{backup_version} 高于当前程序支持的 v{supported_version}，拒绝恢复"
+            )
     except Exception:
         probe.unlink(missing_ok=True)
         raise
@@ -601,34 +763,29 @@ async def restore_backup(name: str) -> dict:
     # ── 段 2：回滚档 → 停写入面（调度器 + 爬取 + 引擎连接）──
     # 回滚档必须在停引擎之前做：VACUUM INTO 是在线快照、不需独占；停引擎后再复制
     # 大库的那数十秒里，任何请求都会重建引擎并重持主库句柄，替换必然被拒。
-    lock_path.write_text(datetime.now().isoformat(), encoding="utf-8")
-    replaced = False
-    try:
-        from ..core.scheduler import start_scheduler, stop_scheduler
-        from app.domains.crawl import service as crawl_service
+    from ..core.scheduler import start_scheduler, stop_scheduler
+    from app.domains.crawl import service as crawl_service
+    from .database import acquire_write_maintenance_barrier
 
+    barrier = None
+    lock_path = None
+    lock_token = None
+    replaced = False
+    engine_disposed = False
+    scheduler_stopped = False
+    try:
+        stop_scheduler()
+        scheduler_stopped = True
+        await _wait_for_active_crawl(crawl_service, "数据库恢复")
+        barrier = await acquire_write_maintenance_barrier()
+        lock_path, lock_token = _acquire_restore_lock()
         rollback.unlink(missing_ok=True)
         staging.unlink(missing_ok=True)
         await asyncio.to_thread(snapshot_to, src, rollback)
 
-        stop_scheduler()
-        active = crawl_service._active
-        if active is not None and not active.task.done():
-            log_event(logger, "数据库恢复前等待进行中的爬取任务结束")
-            try:
-                await asyncio.wait_for(asyncio.shield(active.task), timeout=60)
-            except asyncio.TimeoutError:
-                log_event(
-                    logger,
-                    "爬取任务 60 秒未结束，继续恢复，该任务将被中断",
-                    level=logging.WARNING,
-                )
-        # 调度器停令已下（shutdown wait=False），给在途 job 一点落地时间，
-        # 避免未归还连接导致 dispose 后仍持有文件句柄
-        await asyncio.sleep(2)
-
         # 关闭 SQLAlchemy 引擎（async engine 的同步底座），释放文件句柄
         await _dispose_engine()
+        engine_disposed = True
 
         # ── 段 3：文件轮换替换 + 引擎重建 ──
         if compressed:
@@ -642,17 +799,19 @@ async def restore_backup(name: str) -> dict:
         src.with_name(src.name + "-wal").unlink(missing_ok=True)
         src.with_name(src.name + "-shm").unlink(missing_ok=True)
 
-        engine_ok = await _rebuild_engine()
+        engine_ok = await _rebuild_engine(initialize=True, maintenance_token=lock_token)
         if not engine_ok:
             # 回滚：把回滚档换回去
             log_event(logger, "恢复后数据库引擎重建失败，回滚原库", level=logging.ERROR)
             await _replace_main_db(rollback, src)
             src.with_name(src.name + "-wal").unlink(missing_ok=True)
             src.with_name(src.name + "-shm").unlink(missing_ok=True)
-            engine_ok = await _rebuild_engine()
+            engine_ok = await _rebuild_engine(initialize=True, maintenance_token=lock_token)
             if not engine_ok:
                 raise RuntimeError("恢复失败且回滚失败——请手动检查 data 目录")
+            engine_disposed = False
         else:
+            engine_disposed = False
             rollback.unlink(missing_ok=True)  # 成功后清理回滚档
             log_event(
                 logger,
@@ -661,16 +820,28 @@ async def restore_backup(name: str) -> dict:
                 detail={"备份文件名": name},
             )
 
-        start_scheduler()
-        log_event(logger, "数据库恢复完成，调度器已重启")
+        log_event(logger, "数据库恢复完成，调度器即将重启")
         return {"restored": True, "name": name, "rolledBack": False}
     finally:
-        probe.unlink(missing_ok=True)
-        if not replaced:
-            # 主库未被改动，就位档与回滚档都是纯残留
-            staging.unlink(missing_ok=True)
-            rollback.unlink(missing_ok=True)
-        lock_path.unlink(missing_ok=True)
+        try:
+            if engine_disposed:
+                await _rebuild_engine(initialize=True, maintenance_token=lock_token)
+            probe.unlink(missing_ok=True)
+            if not replaced:
+                # 主库未被改动，就位档与回滚档都是纯残留
+                staging.unlink(missing_ok=True)
+                rollback.unlink(missing_ok=True)
+        finally:
+            try:
+                if lock_path is not None and lock_token is not None:
+                    _release_restore_lock(lock_path, lock_token)
+            finally:
+                try:
+                    if barrier is not None:
+                        barrier.release()
+                finally:
+                    if scheduler_stopped:
+                        start_scheduler()
 
 
 def _table_names(path: Path) -> set[str]:
@@ -680,6 +851,14 @@ def _table_names(path: Path) -> set[str]:
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         ).fetchall()
         return {r[0] for r in rows}
+    finally:
+        conn.close()
+
+
+def _user_version(path: Path) -> int:
+    conn = sqlite3.connect(path.as_posix())
+    try:
+        return int(conn.execute("PRAGMA user_version").fetchone()[0])
     finally:
         conn.close()
 
@@ -725,12 +904,16 @@ async def _replace_main_db(staging: Path, src: Path) -> None:
     ) from last
 
 
-async def _rebuild_engine() -> bool:
-    """重建引擎并做一次探活查询。"""
+async def _rebuild_engine(
+    *, initialize: bool = False, maintenance_token: str | None = None
+) -> bool:
+    """重建引擎；数据库恢复后先按当前程序版本完成迁移再探活。"""
     try:
-        from .database import get_session_factory
+        from .database import get_session_factory, init_db
         from sqlalchemy import text
 
+        if initialize:
+            await init_db(maintenance_token=maintenance_token)
         factory = get_session_factory()
         async with factory() as session:
             await session.execute(text("SELECT 1"))

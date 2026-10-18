@@ -36,6 +36,20 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 APP_DIR = Path(__file__).resolve().parent.parent / "server" / "app"
+BLOCKED_GATE_CALLS = {
+    "gather", "create_task", "ensure_future", "TaskGroup", "sleep",
+    "open", "read_text", "read_bytes", "write_text", "write_bytes", "unlink",
+    "mkdir", "iterdir", "glob",
+}
+DATABASE_THREAD_CALLS = {
+    "_merge_current_prices_sync", "_merge_game_tags_sync", "_merge_history_chunk",
+    "_merge_bundles_sync",
+}
+BLOCKED_IO_MODULES = {
+    "httpx", "requests", "aiohttp", "urllib", "socket", "smtplib",
+    "subprocess", "ftplib", "websocket", "websockets",
+}
+NETWORK_METHODS = {"request", "get", "post", "put", "patch", "delete", "send", "fetch"}
 
 # 写事务豁免登记（文件后缀, 函数名）→ (豁免语句种类, 理由)。kind ∈
 # {"commit", "flush", "execute"}：按语句种类豁免（如只豁免 flush，该函数
@@ -108,11 +122,21 @@ class _Visitor(ast.NodeVisitor):
         self.hits: list[tuple[int, str]] = []
         self._parents: dict[ast.AST, ast.AST] = {}
         self._func_stack: list[str] = []
+        self._module_aliases: dict[str, str] = {}
+        self._direct_aliases: dict[str, str] = {}
 
     def build_parents(self, tree: ast.AST) -> None:
         for node in ast.walk(tree):
             for child in ast.iter_child_nodes(node):
                 self._parents[child] = node
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    self._module_aliases[alias.asname or alias.name.split(".")[0]] = alias.name
+            elif isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                if module.split(".")[0] in BLOCKED_IO_MODULES or module == "asyncio":
+                    for alias in node.names:
+                        self._direct_aliases[alias.asname or alias.name] = f"{module}.{alias.name}"
 
     def _enclosing_funcs(self, node: ast.AST) -> list[str]:
         names: list[str] = []
@@ -137,6 +161,41 @@ class _Visitor(ast.NodeVisitor):
                             return True
             cur = self._parents.get(cur)
         return False
+
+    @staticmethod
+    def _call_parts(node: ast.AST) -> list[str]:
+        if isinstance(node, ast.Name):
+            return [node.id]
+        if isinstance(node, ast.Attribute):
+            return _Visitor._call_parts(node.value) + [node.attr]
+        return []
+
+    def _gate_effect_reason(self, node: ast.Call) -> str | None:
+        parts = self._call_parts(node.func)
+        if not parts:
+            return None
+        name = ".".join(parts)
+        direct = self._direct_aliases.get(parts[0])
+        module_root = self._module_aliases.get(parts[0], parts[0]).split(".")[0]
+        if direct:
+            name = direct + ("." + ".".join(parts[1:]) if len(parts) > 1 else "")
+            module_root = direct.split(".")[0]
+        leaf = parts[-1]
+        if direct and direct.split(".")[-1] in BLOCKED_GATE_CALLS:
+            return "闸内禁止并发派生、等待与文件读写"
+        if leaf in BLOCKED_GATE_CALLS:
+            return "闸内禁止并发派生、等待与文件读写"
+        if leaf == "to_thread" or (direct and direct.endswith(".to_thread")):
+            target_parts = self._call_parts(node.args[0]) if node.args else []
+            if not target_parts or target_parts[-1] not in DATABASE_THREAD_CALLS:
+                return "闸内线程池调用仅允许登记过的 SQLite 批量写入"
+        if module_root in BLOCKED_IO_MODULES:
+            return "闸内禁止网络、子进程及外部文件 IO"
+        if leaf in NETWORK_METHODS and parts[0].lower() in {
+            "client", "http", "api", "steam", "smtp", "transport", "websocket",
+        }:
+            return "闸内禁止外部网络 IO"
+        return None
 
     def _allow(self, node: ast.AST) -> str | None:
         funcs = self._enclosing_funcs(node)
@@ -170,6 +229,10 @@ class _Visitor(ast.NodeVisitor):
         return False
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
+        if self._in_gate(node):
+            reason = self._gate_effect_reason(node)
+            if reason:
+                self.hits.append((node.lineno, f"FAIL_GATE_EFFECT:{reason}"))
         f = node.func
         if isinstance(f, ast.Attribute) and f.attr in (
             "commit", "flush", "execute", "executescript", "executemany",
@@ -240,17 +303,27 @@ class _Visitor(ast.NodeVisitor):
         return None
 
 
-def audit_file(path: Path) -> tuple[list[tuple[int, str]], list[tuple[int, str]], list[tuple[int, str]]]:
-    tree = ast.parse(path.read_text(encoding="utf-8"))
+def audit_source(source: str, file_suffix: str = "<test>") -> tuple[
+    list[tuple[int, str]], list[tuple[int, str]], list[tuple[int, str]], list[tuple[int, str]]
+]:
+    tree = ast.parse(source)
     v = _Visitor()
     v.build_parents(tree)
-    v._file_suffix = path.relative_to(APP_DIR).as_posix()
-    v.source_lines = path.read_text(encoding="utf-8").splitlines()
+    v._file_suffix = file_suffix
+    v.source_lines = source.splitlines()
     v.visit(tree)
     fails = [(ln, k) for ln, k in v.hits if k == "FAIL"]
     exceptions = [(ln, k) for ln, k in v.hits if k == "EXCEPTION"]
     composites = [(ln, k) for ln, k in v.hits if k == "FAIL_COMPOSITE"]
-    return fails, exceptions, composites
+    effects = [(ln, k.split(":", 1)[1]) for ln, k in v.hits if k.startswith("FAIL_GATE_EFFECT:")]
+    return fails, exceptions, composites, effects
+
+
+def audit_file(path: Path) -> tuple[list[tuple[int, str]], list[tuple[int, str]], list[tuple[int, str]], list[tuple[int, str]]]:
+    return audit_source(
+        path.read_text(encoding="utf-8"),
+        path.relative_to(APP_DIR).as_posix(),
+    )
 
 
 def main() -> int:
@@ -259,7 +332,7 @@ def main() -> int:
     total_exc = 0
     for path in sorted(APP_DIR.rglob("*.py")):
         try:
-            fails, exceptions, composites = audit_file(path)
+            fails, exceptions, composites, effects = audit_file(path)
         except SyntaxError as e:
             print(f"FAIL {path.relative_to(APP_DIR.parent)}: 解析失败 {e}")
             total_fail += 1
@@ -275,10 +348,13 @@ def main() -> int:
             print(f"FAIL {rel}:{lineno}")
             print(f"    {src}")
             print("    闸内新建会话必须走 write_session（事务起点显式取写锁）")
+        for lineno, reason in effects:
+            print(f"FAIL {rel}:{lineno}")
+            print(f"    {reason}")
         for lineno, _ in exceptions:
             if verbose:
                 print(f"EXCEPTION {rel}:{lineno}（ALLOW 已登记）")
-        total_fail += len(fails) + len(composites)
+        total_fail += len(fails) + len(composites) + len(effects)
         total_exc += len(exceptions)
     if verbose:
         print(f"EXCEPTION 合计 {total_exc}（ALLOW 登记，见脚本头）")
