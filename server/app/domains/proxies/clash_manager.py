@@ -418,23 +418,7 @@ def local_channel_egress_ok(proxy_url: str | None, timeout: float = 8.0) -> bool
 def _download_attempts(
     runtime_port: int | None = None, proxy_url: str | list[str] | None = None
 ) -> list[tuple[str | None, str]]:
-    """下载通道链：本内核代理 → 项目保存的可用代理 → 本地常见混合端口 → 直连。
-
-    订阅/内核下载全是"鸡生蛋"场景：首次添加订阅时本内核必然没跑
-    （无 config.yaml 起不来），面板域名又多被墙——此时直连是唯一通道，
-    排序自然退化为「只有直连」。
-
-    **代理通道排在前、直连垫底**：订阅面板域名绝大多数时候直连不通，
-    直连打头意味着每次刷新都先等满一次超时；经自己管理的出口（内核 /
-    体检过的已保存代理）取订阅与 Clash Verge Rev 的「经当前代理更新」
-    同向。已保存代理排在本机混合端口之前——自己管理、自己体检过的
-    出口优先于借道用户自启的 Verge（后者只探端口在听，出口是否可用
-    无人担保）。
-
-    `proxy_url` 可传单个 URL，也可传 URL 列表（逐个作为后续通道）。
-    传列表是给「项目保存的可用代理」用的：池里挑一条也可能它自己正
-    失效，一次只试一条等于把「借道」变成掷骰子。
-    """
+    """Build generic asset download paths from managed, saved, local, and direct exits."""
     attempts: list[tuple[str | None, str]] = []
     if runtime_port:
         attempts.append((f"http://127.0.0.1:{runtime_port}", "经内核代理"))

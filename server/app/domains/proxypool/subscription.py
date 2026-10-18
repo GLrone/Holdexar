@@ -344,17 +344,7 @@ def build_channels(
     pool_channels: list[Channel] | None = None,
     local_proxies: list[str] | None = None,
 ) -> list[Channel]:
-    """直连 → 现有 Mihomo 内核 → proxypool 已可用代理 → 本机在听的常见混合端口。
-
-    面板域名多被墙、直连失败是常态，**只留直连一条通道等于把订阅刷新交给运气**：
-    通道耗尽时快照停止更新，订阅提供的节点随之判定退休、池再也建不起来。
-    因此这条链与内核下载保持同一套语义（`clash_manager._download_attempts`），
-    出口优先级也一样——自己管理、自己体检过的出口（内核 / 池）排在借道用户
-    自启 Clash 的本地混合端口之前。
-
-    后三通道未就绪时**自然跳过**（内核没跑、池为空、本地端口没在听）。
-    `local_proxies=None` 即现探本机常见混合端口；传列表可显式指定（测试用）。
-    """
+    """Build subscription paths from direct, managed, healthy pool, and local exits."""
     channels = [Channel(CHANNEL_DIRECT, None, CHANNEL_DIRECT)]
     if kernel_proxy:
         channels.append(Channel(CHANNEL_KERNEL, kernel_proxy, "runtime"))
