@@ -18,13 +18,14 @@ from app.domains.agent.tools.builtin import (
     runtime_tools,
     system,
     tracking,
+    ui,
 )
 from app.domains.agent.tools.base import ToolSpec
 from app.domains.agent.tools.projection import budget_for
 from app.domains.agent.tools.registry import REGISTRY
 
 _SPEC_BY_NAME: dict[str, ToolSpec] = {}
-for _mod in (catalog, prices, tracking, offers, account, system, runtime_tools, navigate, prefs, attachment, info):
+for _mod in (catalog, prices, tracking, offers, account, system, runtime_tools, navigate, prefs, attachment, info, ui):
     for _spec in _mod.SPECS:
         if _spec.name in _SPEC_BY_NAME:
             raise ValueError(f"重复注册工具: {_spec.name}")
@@ -99,6 +100,7 @@ _ORDER = (
     "audit_follows_workflow",
     "read_attachment",
     "list_tools",
+    "present_ui",
 )
 
 if set(_ORDER) != set(_SPEC_BY_NAME) or len(_ORDER) != len(_SPEC_BY_NAME):

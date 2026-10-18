@@ -70,6 +70,8 @@ import island from './island'
 import steamEvents from './steamEvents'
 // ── Pilot assistant (components/business/HlPilotDrawer.vue + settings Pilot card) ──
 import pilot from './pilot'
+// ── Structured UI System ──
+import structured from './structured'
 
 const messages: Partial<Record<MessageKey, string>> = {
   ...common,
@@ -118,6 +120,7 @@ const messages: Partial<Record<MessageKey, string>> = {
   ...island,
   ...steamEvents,
   ...pilot,
+  ...structured,
 }
 
 export default messages

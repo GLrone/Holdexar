@@ -17,6 +17,8 @@ import {
   type ProxySubscriptionItem,
 } from '@/api/client'
 import { HlButton, HlDialog, HlIcon, HlSegmented, HlSwitch, message } from '@/components/ui'
+import StructuredRenderer from '@/components/structured/StructuredRenderer.vue'
+import type { StatusBoardData, StatusBoardItem, StructuredBlock } from '@/components/structured/types'
 import { useI18n, type MessageKey } from '@/locales'
 import { useProxyTasksStore } from '@/stores/proxyTasks'
 import { useSettingsStore } from '@/stores/settings'
@@ -245,6 +247,69 @@ function shortUrl(url: string): string {
 }
 
 const enabledCount = computed(() => items.value.filter((p) => p.enabled).length)
+
+const proxyStatusBlock = computed<StructuredBlock<StatusBoardData>>(() => {
+  const isRunning = Boolean(clash.value?.running)
+  const entryReady = clash.value?.entryReady !== false
+  const clashStatus = isRunning ? (entryReady ? 'healthy' : 'critical') : 'inactive'
+
+  const testAlive = clashTest.value?.alive ?? 0
+  const testTotal = clashTest.value?.nodes?.length ?? 0
+  const probeStatus = testTotal > 0 ? (testAlive > 0 ? 'healthy' : 'warning') : 'unknown'
+
+  const poolActive = enabledCount.value > 0
+  const poolStatus = poolActive ? 'healthy' : 'inactive'
+
+  const boardItems: StatusBoardItem[] = [
+    {
+      id: 'clash-kernel',
+      name: t('proxies.section.clash'),
+      status: clashStatus,
+      statusText: isRunning
+        ? (entryReady ? t('structured.statusBoard.healthy') : t('proxies.clash.entryNotReady', { port: clash.value?.port ?? 7890 }))
+        : t('proxies.clash.stopped'),
+      metrics: [
+        { label: t('proxies.port.label'), value: clash.value?.port ?? 7890 },
+      ],
+    },
+    {
+      id: 'exit-nodes',
+      name: t('proxies.clash.testNodes'),
+      status: probeStatus,
+      statusText: testTotal > 0 ? `${testAlive}/${testTotal}` : t('structured.statusBoard.unknown'),
+      metrics: [
+        { label: t('structured.coverageMatrix.status.ok'), value: testAlive },
+      ],
+    },
+    {
+      id: 'proxy-pool',
+      name: t('proxies.hero.title'),
+      status: poolStatus,
+      statusText: poolActive ? `${enabledCount.value}/${items.value.length}` : t('structured.statusBoard.inactive'),
+      metrics: [
+        { label: t('proxies.node.enabled'), value: enabledCount.value },
+      ],
+    },
+  ]
+
+  return {
+    id: 'proxies-status-board',
+    componentId: 'status-board',
+    title: t('proxies.hero.title'),
+    density: 'compact',
+    status: 'ready',
+    data: {
+      items: boardItems,
+      columns: 3,
+      summary: {
+        total: boardItems.length,
+        healthy: boardItems.filter((i) => i.status === 'healthy').length,
+        warning: boardItems.filter((i) => i.status === 'warning').length,
+        critical: boardItems.filter((i) => i.status === 'critical').length,
+      },
+    },
+  }
+})
 
 async function load() {
   loading.value = true
@@ -888,6 +953,11 @@ async function loadHealthRuns() {
         <h2>{{ t('proxies.hero.title') }}</h2>
         <p>{{ t('proxies.hero.subtitle') }}</p>
       </div>
+    </div>
+
+    <!-- 运行状态总览看板（HSUI 结构化组件复用） -->
+    <div class="proxyx-section">
+      <StructuredRenderer :block="proxyStatusBlock" />
     </div>
 
     <!-- 路由策略 -->

@@ -420,6 +420,7 @@ _SYSTEM_PROMPT = (
     "多维对比且无卡片时用标准 Markdown 表格（| 表头 |），禁止用空格对齐的纯文本代码块。\n"
     "- 价格/列表等结构化数据交给界面卡片，正文不重复罗列长数据；"
     "工具结果里的 _ui_card.status 为 rendered 时卡片已在界面上，正文不要再抄一遍报表。\n"
+    "- 当需要对比分析、多维指标盘点、趋势走势、覆盖率矩阵或服务状态概览时，主动调用 `present_ui` 呈现结构化组件（支持 metric-grid, data-table, time-series, coverage-matrix, status-board 等）。\n"
     "- 涉及多版本拆解、决策树、排障链路、时间线这类没有现成卡片的结构化场景，"
     "主动在正文输出标准 <svg>...</svg> 辅助呈现。遵循深海蓝工业美学："
     "禁止死黑大底与生硬直折线，折线用平滑贝塞尔曲线（C 连接），"
@@ -662,6 +663,8 @@ def _card_of(tool_name: str, result: dict) -> dict | None:
         }
     if kind == "navigate" and result.get("path"):
         return {"kind": "navigate", "target": result["target"], "path": result["path"]}
+    if tool_name == "present_ui" or result.get("componentId") or result.get("component_id"):
+        return result
     return None
 
 
@@ -686,6 +689,7 @@ _CARD_KIND_HINTS: dict[str, str] = {
     "propose_bulk": "proposal",
     "propose_delete": "proposal",
     "navigate": "navigate",
+    "present_ui": "structured",
 }
 
 _CARD_HINT_ROWS_TOOLS = ("proxy_exit_detail", "proxy_latency_test")
@@ -703,22 +707,27 @@ def _card_kind_hint(tool_name: str) -> str | None:
     return None
 
 
+_STRUCTURED_KINDS = frozenset({
+    "structured", "metric-grid", "data-table", "time-series", "coverage-matrix", "status-board",
+})
+
 _CORE_CARD_KINDS = {
     "proposal", "stepper", "price", "regions", "compare",
     "games", "family", "achievements", "epic",
+    *_STRUCTURED_KINDS,
 }
-_MAX_CARDS_PER_TURN = 2
+_MAX_CARDS_PER_TURN = 4
 
 
 def _should_admit_card(card: dict | None, current_cards: list[dict]) -> bool:
-    """卡片准入判定：单轮最多两张，核心卡优先，辅助诊断卡去重。"""
+    """卡片准入判定：单轮预算与并发限制，核心卡优先，辅助诊断卡去重。"""
     if card is None or card in current_cards:
         return False
     if len(current_cards) >= _MAX_CARDS_PER_TURN:
         return False
     kind = card.get("kind")
     has_core = any(c.get("kind") in _CORE_CARD_KINDS for c in current_cards)
-    if has_core and kind not in _CORE_CARD_KINDS:
+    if has_core and kind not in _CORE_CARD_KINDS and not card.get("componentId"):
         return False
     if kind == "rows" and any(c.get("kind") == "rows" for c in current_cards):
         return False

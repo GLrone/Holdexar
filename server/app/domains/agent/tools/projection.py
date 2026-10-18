@@ -38,6 +38,7 @@ _READ_TOOLS = (
     "read_session",
     "read_attachment",
     "web_search",
+    "present_ui",
 )
 
 _NET_TOOLS = ("web_search",)
@@ -140,6 +141,12 @@ def tool_step(name: str, result: dict) -> dict:
         return {
             "label": LABELS.get(name, name),
             "status": "ok" if ok else "empty",
+            "data": {},
+        }
+    if name == "present_ui":
+        return {
+            "label": "presentUI",
+            "status": "ok" if result.get("componentId") or (result.get("kind") and result.get("kind") != "denied") else "empty",
             "data": {},
         }
     if name == "get_region_prices":
@@ -314,6 +321,7 @@ LABELS: dict[str, str] = {
     "system_diagnostics": "diagnostics",
     "sync_subscriptions": "syncSubs",
     "list_tools": "listTools",
+    "present_ui": "presentUI",
 }
 
 
@@ -332,6 +340,7 @@ CORE_TOOLS: frozenset[str] = frozenset({
     "propose_bulk", "propose_delete", "find_deletables",
     "read_session", "get_user_preferences", "set_user_preference",
     "navigate", "read_attachment",
+    "present_ui",
     LIST_TOOLS,
 })
 
@@ -356,6 +365,7 @@ CARD_KIND_HINTS: dict[str, str] = {
     "propose_bulk": "proposal",
     "propose_delete": "proposal",
     "navigate": "navigate",
+    "present_ui": "structured",
 }
 CARD_HINT_ROWS_TOOLS: tuple[str, ...] = ("proxy_exit_detail", "proxy_latency_test")
 CARD_TOOLS: frozenset[str] = frozenset(CARD_KIND_HINTS) | frozenset(CARD_HINT_ROWS_TOOLS)

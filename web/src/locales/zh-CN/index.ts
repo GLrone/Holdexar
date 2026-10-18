@@ -69,6 +69,8 @@ import island from './island'
 import steamEvents from './steamEvents'
 // ── 领航员（components/business/HlPilotDrawer.vue 与设置页领航员卡）──
 import pilot from './pilot'
+// ── 统一结构化展示系统（components/structured/*）──
+import structured from './structured'
 
 /** 全量中文词典 */
 export const messages = {
@@ -118,6 +120,7 @@ export const messages = {
   ...island,
   ...steamEvents,
   ...pilot,
+  ...structured,
 } as const
 
 export type MessageKey = keyof typeof messages
