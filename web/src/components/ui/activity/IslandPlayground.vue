@@ -380,6 +380,130 @@ function removeActivity(act: Activity) {
 
 /* 当前活动明细列表 */
 const activeList = computed(() => activityManager.activities)
+
+/* ── 阶段真实验收测试 ── */
+const p1Verified = ref(false)
+const p2Verified = ref(false)
+const isVerifying = ref(false)
+
+async function runLiveAcceptanceCheck() {
+  if (isVerifying.value) return
+  isVerifying.value = true
+  p1Verified.value = false
+  p2Verified.value = false
+  addLog('── Starting Live Acceptance Validation ──')
+
+  try {
+    // 1. 清理环境
+    clearDevActivities()
+    await new Promise((r) => setTimeout(r, 60))
+
+    // 2. 验证 P1: 注册单任务与明确进度
+    activityManager.register({
+      id: 'dev:test-p1',
+      source: 'crawler',
+      kind: 'task',
+      status: 'running',
+      title: 'P1 Live Validation Task',
+      progress: 45,
+      priority: 30,
+    })
+    await new Promise((r) => setTimeout(r, 60))
+    const p1Item = activityManager.get('dev:test-p1')
+    if (!p1Item || p1Item.progress !== 45 || islandController.primaryId !== 'dev:test-p1') {
+      throw new Error('P1 task registration or progress assertion failed')
+    }
+
+    // 3. 验证 P1: 完成状态清除进度条（消除误显示）
+    activityManager.complete('dev:test-p1', { title: 'P1 Completed' })
+    await new Promise((r) => setTimeout(r, 60))
+    const p1Completed = activityManager.get('dev:test-p1')
+    if (p1Completed && p1Completed.progress !== undefined) {
+      throw new Error('P1 progress cleanup on complete failed: progress still lingers')
+    }
+    p1Verified.value = true
+    addLog('✓ P1 Activity Model & Progress Clearing: PASSED')
+
+    // 4. 验证 P2: 双任务与副岛建立
+    clearDevActivities()
+    await new Promise((r) => setTimeout(r, 60))
+
+    activityManager.register({
+      id: 'dev:task-a',
+      source: 'test',
+      kind: 'task',
+      status: 'running',
+      title: 'Task Alpha',
+      priority: 40,
+    })
+    activityManager.register({
+      id: 'dev:task-b',
+      source: 'test',
+      kind: 'task',
+      status: 'running',
+      title: 'Task Beta',
+      priority: 20,
+    })
+    await new Promise((r) => setTimeout(r, 60))
+    if (!islandController.hasSecondary || islandController.primaryId !== 'dev:task-a' || islandController.secondaryId !== 'dev:task-b') {
+      throw new Error('P2 dual task island controller assignment failed')
+    }
+
+    // 5. 验证 P2: 主副岛交换
+    islandController.swap()
+    await new Promise((r) => setTimeout(r, 60))
+    if (islandController.primaryId !== 'dev:task-b' || islandController.secondaryId !== 'dev:task-a') {
+      throw new Error('P2 island swap failed')
+    }
+
+    // 6. 验证 P2: 固定 (Pin) 与抢占 (Attention)
+    islandController.pin('dev:task-b')
+    await new Promise((r) => setTimeout(r, 60))
+    if (islandController.pinnedId !== 'dev:task-b') {
+      throw new Error('P2 pin failed')
+    }
+
+    // 注入更高优先级但非紧急的任务，固定项仍应保持主岛
+    activityManager.register({
+      id: 'dev:task-c',
+      source: 'test',
+      kind: 'task',
+      status: 'running',
+      title: 'Task Gamma',
+      priority: 90,
+    })
+    await new Promise((r) => setTimeout(r, 60))
+    if (islandController.primaryId !== 'dev:task-b') {
+      throw new Error('P2 pinned activity was wrongly preempted by non-urgent task')
+    }
+
+    // 注入紧急任务，应优先置顶抢占主岛
+    activityManager.register({
+      id: 'dev:urgent-alert',
+      source: 'system',
+      kind: 'system',
+      status: 'failed',
+      needsAttention: true,
+      priority: 99,
+      title: 'Urgent Alert',
+    })
+    await new Promise((r) => setTimeout(r, 60))
+    if (islandController.primaryId !== 'dev:urgent-alert') {
+      throw new Error('P2 urgent needsAttention failed to preempt pinned activity')
+    }
+
+    p2Verified.value = true
+    addLog('✓ P2 Multi-activity Swap, Pin & Priority Preemption: PASSED')
+    addLog('All Live Checks Passed')
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err)
+    addLog(`✗ Acceptance check failed: ${msg}`)
+  } finally {
+    islandController.unpin()
+    clearDevActivities()
+    isVerifying.value = false
+  }
+}
 </script>
 
 <template>
@@ -410,21 +534,33 @@ const activeList = computed(() => activityManager.activities)
 
       <!-- 阶段能力状态矩阵 -->
       <div class="island-playground__section">
-        <div class="island-playground__section-title">
-          {{ t('island.playground.phaseStatus') }}
+        <div class="island-playground__section-header">
+          <span class="island-playground__section-title">{{ t('island.playground.phaseStatus') }}</span>
+          <HlButton
+            size="sm"
+            :variant="p1Verified && p2Verified ? 'primary' : 'default'"
+            :disabled="isVerifying"
+            @click="runLiveAcceptanceCheck"
+          >
+            {{ isVerifying ? t('island.playground.verifying') : t('island.playground.runVerify') }}
+          </HlButton>
         </div>
         <div class="island-playground__matrix">
-          <div class="matrix-card is-pass">
+          <div class="matrix-card" :class="p1Verified ? 'is-pass' : 'is-unverified'">
             <span class="matrix-card__name">{{ t('island.playground.p1Status') }}</span>
-            <span class="matrix-card__badge is-pass">{{ t('island.playground.implemented') }} (PASS)</span>
+            <span class="matrix-card__badge" :class="p1Verified ? 'is-pass' : 'is-unverified'">
+              {{ p1Verified ? t('island.playground.statusVerified') : t('island.playground.statusUnverified') }}
+            </span>
           </div>
-          <div class="matrix-card is-pass">
+          <div class="matrix-card" :class="p2Verified ? 'is-pass' : 'is-unverified'">
             <span class="matrix-card__name">{{ t('island.playground.p2Status') }}</span>
-            <span class="matrix-card__badge is-pass">{{ t('island.playground.implemented') }} (PASS)</span>
+            <span class="matrix-card__badge" :class="p2Verified ? 'is-pass' : 'is-unverified'">
+              {{ p2Verified ? t('island.playground.statusVerified') : t('island.playground.statusUnverified') }}
+            </span>
           </div>
           <div class="matrix-card is-pending">
             <span class="matrix-card__name">{{ t('island.playground.p3Status') }}</span>
-            <span class="matrix-card__badge is-pending">{{ t('island.playground.notImplemented') }} (PENDING)</span>
+            <span class="matrix-card__badge is-pending">{{ t('island.playground.notImplemented') }}</span>
           </div>
         </div>
       </div>
@@ -682,6 +818,10 @@ const activeList = computed(() => activityManager.activities)
 
 .matrix-card__badge.is-pass {
   color: var(--color-success);
+}
+
+.matrix-card__badge.is-unverified {
+  color: var(--text-muted);
 }
 
 .matrix-card__badge.is-pending {

@@ -85,7 +85,7 @@ export class ActivityManager {
       detail: reg.detail,
       icon: reg.icon,
       tone: reg.tone,
-      progress: reg.progress ?? null,
+      progress: reg.progress !== undefined ? reg.progress : undefined,
       priority: reg.priority ?? fallbackPriority,
       needsAttention,
       createdAt: now,
@@ -109,16 +109,21 @@ export class ActivityManager {
     if (index < 0) return null
 
     const existing = this._items.value[index]
+    const nextStatus = patch.status ?? existing.status
+    const progress = patch.progress !== undefined
+      ? patch.progress
+      : (nextStatus === 'success' || nextStatus === 'failed' ? undefined : existing.progress)
+
     const updated: Activity = {
       ...existing,
       ...(patch.source ? { source: patch.source } : {}),
       ...(patch.kind ? { kind: patch.kind } : {}),
-      ...(patch.status ? { status: patch.status } : {}),
+      status: nextStatus,
       ...(patch.title !== undefined ? { title: patch.title } : {}),
       ...(patch.detail !== undefined ? { detail: patch.detail } : {}),
       ...(patch.icon !== undefined ? { icon: patch.icon } : {}),
       ...(patch.tone !== undefined ? { tone: patch.tone } : {}),
-      ...(patch.progress !== undefined ? { progress: patch.progress } : {}),
+      progress,
       ...(patch.priority !== undefined ? { priority: patch.priority } : {}),
       ...(patch.needsAttention !== undefined ? { needsAttention: patch.needsAttention } : {}),
       ...(patch.duration !== undefined ? { duration: patch.duration } : {}),
@@ -146,6 +151,7 @@ export class ActivityManager {
       status: 'success',
       tone: opts?.tone ?? 'success',
       needsAttention: false,
+      progress: undefined,
       ...(opts?.title ? { title: opts.title } : {}),
       ...(opts?.detail ? { detail: opts.detail } : {}),
       duration: opts?.duration ?? 3000,
@@ -158,6 +164,7 @@ export class ActivityManager {
       status: 'failed',
       tone: 'error',
       needsAttention: true,
+      progress: undefined,
       ...(opts?.title ? { title: opts.title } : {}),
       ...(opts?.detail ? { detail: opts.detail } : {}),
       ...(opts?.retry ? { retry: opts.retry } : {}),

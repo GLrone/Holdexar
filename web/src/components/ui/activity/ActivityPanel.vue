@@ -26,10 +26,23 @@ const { t } = useI18n()
 
 <template>
   <Transition name="activity-panel">
-    <div v-if="open" class="hl-activity-panel" role="dialog" :aria-label="t('island.label')">
+    <div
+      v-if="open"
+      class="hl-activity-panel"
+      role="dialog"
+      :aria-label="t('island.hub')"
+      tabindex="-1"
+      @keydown.esc.stop="emit('close')"
+    >
       <div class="hl-activity-panel__header">
-        <span class="hl-activity-panel__title">{{ t('island.label') }}</span>
-        <button type="button" class="hl-activity-panel__close" @click="emit('close')">
+        <span class="hl-activity-panel__title">{{ t('island.hub') }}</span>
+        <button
+          type="button"
+          class="hl-activity-panel__close"
+          :title="t('island.dismiss')"
+          :aria-label="t('island.dismiss')"
+          @click="emit('close')"
+        >
           ✕
         </button>
       </div>

@@ -134,6 +134,17 @@ export class IslandController {
     }
   }
 
+  /** 切换固定状态 */
+  togglePin(id?: string): void {
+    const target = id ?? this._primaryId.value
+    if (!target) return
+    if (this._pinnedId.value === target) {
+      this.unpin()
+    } else {
+      this.pin(target)
+    }
+  }
+
   /** 解除固定 */
   unpin(): void {
     this._pinnedId.value = null
@@ -141,6 +152,11 @@ export class IslandController {
       this._order = this.sortedActivities.map((a) => a.id)
     }
     this._syncOrder()
+  }
+
+  /** 切换总览面板开合 */
+  toggleOverview(): void {
+    this.setOverview(!this.isOverviewOpen.value)
   }
 
   /** 重置用户手动选择（恢复按队列优先级自动展示） */
