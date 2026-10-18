@@ -3,6 +3,7 @@ import { computed, ref } from 'vue'
 
 import { crawlApi } from '@/api/client'
 import { message } from '@/components/ui'
+import { activityManager } from '@/components/ui/activity'
 import { beginTask, endTask, updateTask } from '@/components/ui/island'
 import { CYCLE_ACTIVE } from '@/lib/headerStatus'
 import { useI18n } from '@/locales'
@@ -221,6 +222,29 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
   let source: EventSource | null = null
   let started = false
 
+  const CRAWL_ACTIVITY_ID = 'crawler:job'
+
+  function syncCrawlActivity(): void {
+    if (running.value && total.value > 0) {
+      const pDone = roundTracking.value ? roundDone.value + done.value : done.value
+      const pTotal = roundTracking.value ? Math.max(roundTotal.value, startedTotal.value, total.value) : total.value
+      const pct = pTotal > 0 ? Math.min(100, Math.round((pDone / pTotal) * 100)) : null
+      const { t } = useI18n()
+      activityManager.register({
+        id: CRAWL_ACTIVITY_ID,
+        source: 'crawler',
+        kind: 'task',
+        status: 'running',
+        title: t('island.task.running', { done: pDone, total: pTotal }),
+        progress: pct,
+        to: '/crawl',
+        priority: 30,
+      })
+    } else {
+      activityManager.remove(CRAWL_ACTIVITY_ID)
+    }
+  }
+
   /** SSE 断线重连后事件可能有缺口（收尾事件丢失会让「进行中」标志卡住）：
       连接建立即以执行占用的 REST 账本对账；轮次快照的重读由 running 的
       watch 链与消费方的定时兜底完成。 */
@@ -228,6 +252,7 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
     try {
       const a = await crawlApi.active()
       running.value = a.busy === true || a.activeJobId !== null
+      syncCrawlActivity()
       /* 断线窗口里的体检开始/结束事件可能丢失：以维护账本投影对账 */
       applyMaintenanceInfo(a.maintenanceInfo ?? null)
     } catch {
@@ -260,6 +285,7 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
       }
       total.value = data.total ?? done.value + qsize.value
       lastEventAt.value = new Date().toLocaleTimeString()
+      syncCrawlActivity()
     })
 
     source.addEventListener('job.started', (e) => {
@@ -272,6 +298,7 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
       total.value = 0
       etaSpeed.value = 0 // 新段速度未知：先不报预计结束时间
       void syncRoundScope()
+      syncCrawlActivity()
     })
 
     source.addEventListener('job.status', (e) => {
@@ -286,6 +313,7 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
         }
         running.value = false
         activeJobId.value = null
+        syncCrawlActivity()
         /* 任务终态=一轮写价落地：无 Cycle 的任务只有这一条收敛信号 */
         dataEpoch.value++
       }
@@ -295,6 +323,7 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
        收尾事件，进度事件置起的「进行中」靠这一条拉回 */
     source.addEventListener('crawl.idle', () => {
       running.value = false
+      syncCrawlActivity()
     })
 
     /* 价格周期收敛（completed / partial / failed / cancelled）。判定与去重在

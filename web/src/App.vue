@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch, watchEffect } from 'vue'
+import { computed, defineAsyncComponent, onMounted, onUnmounted, ref, watch, watchEffect } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import { useAccountStore } from '@/stores/account'
@@ -54,6 +54,14 @@ const accountStore = useAccountStore()
 const pilotStore = usePilotStore()
 const updaterStore = useUpdaterStore()
 const { t } = useI18n()
+
+/* ── 灵动岛测试实验室（仅 DEV 环境注入，生产构建由 Rollup/Vite 彻底剔除） ── */
+const isDev = import.meta.env.DEV
+const IslandPlayground = isDev
+  ? defineAsyncComponent(() => import('@/components/ui/activity/IslandPlayground.vue'))
+  : null
+const showPlayground = ref(false)
+
 onMounted(() => {
   crawl.start()
   // 内容链事实通知（HB 当月包 / Epic 喜加一）：60s 轮询增量上岛
@@ -344,6 +352,17 @@ async function manualRefreshWallet() {
             {{ t('pilot.title') }}
           </button>
 
+          <!-- 灵动岛实验室入口（仅开发环境渲染） -->
+          <button
+            v-if="isDev"
+            class="header-pill header-pill--dev"
+            :title="t('island.playground.buttonTitle')"
+            @click="showPlayground = true"
+          >
+            <HlIcon name="terminal" style="font-size: 13px" />
+            {{ t('island.playground.buttonText') }}
+          </button>
+
           <!-- 语言切换（中/EN）：文案显示目标语言，与主题钮同属外观组 -->
           <HlLangToggle :locale="localeStore.locale" @toggle="localeStore.toggle()" />
 
@@ -483,6 +502,13 @@ async function manualRefreshWallet() {
          全局唯一实例——要跨路由存活，挂页面里的实例会被 router.push 卸载 -->
     <HlIsland />
 
+    <!-- 灵动岛开发实验室面板（仅开发环境渲染） -->
+    <component
+      :is="IslandPlayground"
+      v-if="isDev && showPlayground"
+      @close="showPlayground = false"
+    />
+
     <!-- 关窗幕布：桌面壳弹出「最小化 / 退出程序」原生弹窗前调用 __hlxCloseCurtain(true)
          拉起（见 desktop/main.py 的 _toggle_close_curtain），弹窗落定后撤下。
          幕布放页面里而非原生壳另开遮罩窗：后者会让 DWM 整块重新合成，把弹窗
@@ -523,6 +549,21 @@ async function manualRefreshWallet() {
 
 .header-pill--wallet.is-open {
   border-color: var(--accent);
+}
+
+.header-pill--dev {
+  cursor: pointer;
+  border-color: var(--border-soft);
+  color: var(--color-warning);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.header-pill--dev:hover {
+  border-color: var(--color-warning);
 }
 
 /* 未绑定引导态：虚线描边 + 弱化文字，与真实余额胶囊区分 */

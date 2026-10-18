@@ -1,10 +1,11 @@
 /* ════════════════════════════════════════════════════════════════════
-   island.ts — 灵动岛状态层
-   消息队列与展示态的唯一事实来源：message.ts 命令式推入，
-   HlIsland.vue 响应式读取。
-   notices[0] 为当前展示项：新消息入队首，进行中项由结果消息就地顶替。
+   island.ts — 灵动岛兼容桥接层
+   保持既有命令式接口（pushNotice, beginTask, updateTask, endTask）
+   与响应式 island 状态完全不变，底层统一桥接至 ActivityManager。
    ════════════════════════════════════════════════════════════════════ */
 import { reactive } from 'vue'
+import { activityManager } from './activity/activityManager.ts'
+import { islandController } from './activity/islandController.ts'
 
 /** 消息语义：四种结果态 + 进行中态 */
 export type IslandTone = 'success' | 'error' | 'warning' | 'info' | 'progress'
@@ -64,11 +65,11 @@ export const island = reactive<IslandState>({
 })
 
 let seq = 0
-let timer: number | null = null
+let timer: ReturnType<typeof setTimeout> | null = null
 
 function clearTimer() {
   if (timer !== null) {
-    window.clearTimeout(timer)
+    clearTimeout(timer)
     timer = null
   }
 }
@@ -76,16 +77,23 @@ function clearTimer() {
 /** 当前展示项的就地移除 */
 export function dropNotice(id: number) {
   const at = island.notices.findIndex((n) => n.id === id)
-  if (at < 0) return
-  island.notices.splice(at, 1)
+  if (at >= 0) {
+    island.notices.splice(at, 1)
+  }
+  activityManager.remove(`notice:${id}`)
   armTimer()
 }
 
 /** 按语义静音：清空该语义的在队项，并令其后续入队请求落空 */
 export function muteTone(tone: IslandTone) {
   island.muted[tone] = true
+  activityManager.muteTone(tone)
   for (let i = island.notices.length - 1; i >= 0; i -= 1) {
-    if (island.notices[i].tone === tone) island.notices.splice(i, 1)
+    if (island.notices[i].tone === tone) {
+      const targetId = island.notices[i].id
+      island.notices.splice(i, 1)
+      activityManager.remove(`notice:${targetId}`)
+    }
   }
   armTimer()
 }
@@ -96,8 +104,11 @@ export function armTimer() {
   const head = island.notices[0]
   if (!head || head.sticky || !head.duration) return
   if (island.expanded || island.hovered) return
-  timer = window.setTimeout(() => {
-    island.notices.shift()
+  timer = setTimeout(() => {
+    const expired = island.notices.shift()
+    if (expired) {
+      activityManager.remove(`notice:${expired.id}`)
+    }
     armTimer()
   }, head.duration)
 }
@@ -109,14 +120,39 @@ export function pushNotice(notice: Omit<IslandNotice, 'id'>): number {
   /* 进行中与结果共用同一个展示槽位：两者的在队项各自只留一条 */
   const stickyAt = island.notices.findIndex((n) => n.sticky)
   if (notice.sticky) {
-    if (stickyAt >= 0) island.notices.splice(stickyAt, 1)
+    if (stickyAt >= 0) {
+      const removed = island.notices.splice(stickyAt, 1)[0]
+      if (removed) activityManager.remove(`notice:${removed.id}`)
+    }
   } else if (stickyAt >= 0) {
-    island.notices.splice(stickyAt, 1)
+    const removed = island.notices.splice(stickyAt, 1)[0]
+    if (removed) activityManager.remove(`notice:${removed.id}`)
   }
 
   const item: IslandNotice = { ...notice, id: (seq += 1) }
   island.notices.unshift(item)
-  if (island.notices.length > QUEUE_MAX) island.notices.length = QUEUE_MAX
+  if (island.notices.length > QUEUE_MAX) {
+    const dropped = island.notices.splice(QUEUE_MAX)
+    for (const d of dropped) {
+      activityManager.remove(`notice:${d.id}`)
+    }
+  }
+
+  // 同步桥接至 ActivityManager
+  activityManager.register({
+    id: `notice:${item.id}`,
+    source: 'notice',
+    kind: 'notice',
+    status: item.tone === 'error' ? 'failed' : (item.sticky ? 'running' : 'success'),
+    title: item.text,
+    detail: item.detail,
+    tone: item.tone,
+    duration: item.sticky ? 0 : item.duration,
+    retry: item.retry,
+    to: item.to,
+    toLabel: item.toLabel,
+    needsAttention: item.tone === 'error',
+  })
 
   armTimer()
   return item.id
@@ -125,19 +161,21 @@ export function pushNotice(notice: Omit<IslandNotice, 'id'>): number {
 /** 更新在队项的文案（进行中的进度文本走这里） */
 export function updateNotice(id: number, text: string) {
   const item = island.notices.find((n) => n.id === id)
-  if (item) item.text = text
+  if (item) {
+    item.text = text
+    activityManager.update(`notice:${id}`, { title: text })
+  }
 }
 
 /** 展开面的开合；收起后恢复倒计时 */
 export function setExpanded(on: boolean) {
   island.expanded = on
+  islandController.setExpanded(on)
   armTimer()
 }
 
 /* ── 全局长任务注册层 ──
-   store 发起的长任务（同步 / 检验 / 批量激活 / 内核下载）跨页存活，进度与
-   完成情况走这里：任务在岛上是独立展示位，不占用消息槽位——结果消息入队
-   不会顶掉还在跑的任务气泡，多个任务并存时展示最新一个、其余计数。 */
+   store 发起的长任务跨页存活，进度与完成情况在此维护并桥接至 ActivityManager */
 
 /** 注册（或就地刷新）一个进行中任务；同 key 重复注册视为续接 */
 export function beginTask(key: string, text: string, opts?: { percent?: number | null; to?: string }) {
@@ -145,6 +183,18 @@ export function beginTask(key: string, text: string, opts?: { percent?: number |
   const task: IslandTask = { key, text, percent: opts?.percent ?? null, to: opts?.to ?? '' }
   if (at >= 0) island.tasks.splice(at, 1)
   island.tasks.unshift(task)
+
+  const sourceDomain = key.split('-')[0] || 'task'
+  activityManager.register({
+    id: `task:${key}`,
+    source: sourceDomain,
+    kind: 'task',
+    status: 'running',
+    title: text,
+    progress: task.percent,
+    to: task.to,
+    needsAttention: false,
+  })
 }
 
 /** 更新在跑任务的进度行与定量进度 */
@@ -153,16 +203,23 @@ export function updateTask(key: string, text: string, percent?: number | null) {
   if (!task) return
   task.text = text
   if (percent !== undefined) task.percent = percent
+
+  activityManager.update(`task:${key}`, {
+    title: text,
+    ...(percent !== undefined ? { progress: percent } : {}),
+  })
 }
 
-/** 任务收场：撤下展示位（完成结果由发起方经 message 走消息队列） */
+/** 任务收场：撤下展示位 */
 export function endTask(key: string) {
   const at = island.tasks.findIndex((task) => task.key === key)
   if (at >= 0) island.tasks.splice(at, 1)
+  activityManager.remove(`task:${key}`)
 }
 
 /** 悬停态切换；进入即挂起倒计时，离开即恢复 */
 export function setHovered(on: boolean) {
   island.hovered = on
+  islandController.setHovered(on)
   armTimer()
 }
