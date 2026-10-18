@@ -31,6 +31,7 @@ from app.domains.proxies.clash_manager import ClashRuntime  # noqa: E402
 from app.domains.proxies.kernel_release import kernel_filename  # noqa: E402
 from app.domains.proxypool.health import (  # noqa: E402
     BUSINESS_OK,
+    BusinessResult,
     EXIT_IP_TARGET_URL,
     INVALID_BUSINESS_RESPONSE,
     PROBE_TARGET_URL,
@@ -40,6 +41,7 @@ from app.domains.proxypool.health import (  # noqa: E402
     exit_ip_check_pool,
     health_check_pool,
     probe_node,
+    _commit_business_wave,
 )
 from app.domains.proxypool.models import (  # noqa: E402
     HealthObservation,
@@ -719,11 +721,13 @@ async def test_l2_serial_switch_attributes_business_response(
 
 # ── L2-3. 业务目标故障：不改变节点状态 ───────────────────────────
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", [502, 503, 504])
 async def test_l2_target_service_failure_never_changes_state(
-    tmp_data_dir, kernel_exe_path, clash_runtime, local_proxies, fake_browse
+    tmp_data_dir, kernel_exe_path, clash_runtime, local_proxies, fake_browse,
+    status: int,
 ) -> None:
     await init_db()
-    browse_port, _ = fake_browse({"message": "boom"}, status=503)
+    browse_port, _ = fake_browse({"message": "boom"}, status=status)
     await _add(NODE_ACTIVE, "1|香港01", port=local_proxies(browse_port))
     await _set_exit_ip("1|香港01", "198.51.100.7")
     base, secret = await _start_kernel(clash_runtime, kernel_exe_path, tmp_data_dir)
@@ -732,16 +736,47 @@ async def test_l2_target_service_failure_never_changes_state(
 
     assert not outcome.ok
     assert TARGET_SERVICE_FAILED in outcome.detail
-    assert outcome.http_status == 503
+    assert outcome.http_status == status
 
     node = await _node("1|香港01")
     assert node.state == NODE_ACTIVE, (
         "业务目标 503 不得判节点死——否则就是让外部服务状态决定代理池健康"
     )
+    assert node.consecutive_failures == 0
     assert node.exit_ip == "198.51.100.7"
 
     (obs,) = await _l2_observations()
     assert obs.level == "L2" and obs.ok is False and obs.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [502, 504])
+async def test_l2_gateway_status_is_not_counted_as_node_failure(status: int):
+    await init_db()
+    node_id = await _add(NODE_ACTIVE, "1|gateway-response", port=1)
+    async with get_session_factory()() as session:
+        node = (await session.execute(
+            select(ProxyNode).where(ProxyNode.node_id == node_id)
+        )).scalar_one()
+        await _commit_business_wave(
+            session,
+            [(node, BusinessResult(
+                runtime_name=node.runtime_name,
+                ok=False,
+                http_status=status,
+                final_price_in_cents=None,
+                detail=f"{TARGET_SERVICE_FAILED}: HTTP {status}",
+                latency_ms=12,
+            ))],
+            now=NOW,
+            run_id=None,
+            channel="test",
+            target_url=LOCAL_BUSINESS_TARGET,
+        )
+
+    node = await _node("1|gateway-response")
+    assert node.state == NODE_ACTIVE
+    assert node.consecutive_failures == 0
 
 
 # ── L2-4. HTTP 200 但业务响应非法 ────────────────────────────────

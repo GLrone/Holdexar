@@ -78,6 +78,18 @@ async def _add_snapshots(session, count: int, *, sub_id: int, at: datetime) -> N
         )
 
 
+async def _add_failed_snapshots(session, count: int, *, sub_id: int, at: datetime) -> None:
+    for _ in range(count):
+        await session.execute(
+            text(
+                "INSERT INTO subscription_snapshots "
+                "(subscription_id, sha256, format, node_count, status, fetched_at) "
+                "VALUES (:s, '', 'unknown', 0, 'FAILED', :at)"
+            ),
+            {"s": sub_id, "at": at},
+        )
+
+
 async def _count(session, table: str) -> int:
     return int((await session.execute(text(f"SELECT COUNT(*) FROM {table}"))).scalar() or 0)
 
@@ -169,6 +181,40 @@ async def test_snapshots_keep_newest_per_subscription(tmp_data_dir):
         by_sub.setdefault(int(sub_id), []).append(int(sid))
     assert by_sub[1] == [8, 9, 10]
     assert by_sub[2] == [11, 12]
+
+
+@pytest.mark.asyncio
+async def test_failed_attempts_do_not_age_out_last_success_snapshot(tmp_data_dir):
+    await init_db()
+    async with get_session_factory()() as session:
+        await _add_snapshots(session, 1, sub_id=1, at=NOW - timedelta(days=400))
+        await _add_failed_snapshots(session, 3, sub_id=1, at=NOW - timedelta(days=1))
+        await session.commit()
+
+    async with get_session_factory()() as session:
+        result = await retention.prune_telemetry(session, NOW)
+
+    assert result.snapshots == 0
+    async with get_session_factory()() as session:
+        statuses = list((await session.execute(text(
+            "SELECT status FROM subscription_snapshots ORDER BY id"
+        ))).scalars())
+    assert statuses == ["OK", "FAILED", "FAILED", "FAILED"]
+
+
+@pytest.mark.asyncio
+async def test_failure_only_snapshots_are_pruned_by_age(tmp_data_dir):
+    await init_db()
+    async with get_session_factory()() as session:
+        await _add_failed_snapshots(session, 4, sub_id=1, at=NOW - timedelta(days=400))
+        await session.commit()
+
+    async with get_session_factory()() as session:
+        result = await retention.prune_telemetry(session, NOW)
+
+    assert result.snapshots == 4
+    async with get_session_factory()() as session:
+        assert await _count(session, "subscription_snapshots") == 0
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,4 @@
-"""订阅节点体检 → 池账本：把体检结论对齐到 Registry。
+"""订阅节点体检 → ProxyNode：记录健康事实并刷新兼容 UI 投影。
 
 前端「节点体检」探的是**生产端点**（IStoreBrowseService/GetItems）与出口 IP，
 这正是池健康账本的 L2（真实业务）与 L1（出口身份）证据。本模块把它们按
@@ -6,10 +6,9 @@
 
     (subscription_id, 节点名)  →  ProxyNode（按归属订阅 + 原名匹配）
 
-命中节点按成功证据推进状态（evaluate_node_state(probe_ok=True)）、清零失败
-计数、带上出口 IP 与 L1/L2 观测。判定标准只有一条：**体检通过的健康出口节点
-必须被池用上**——体检是比池内 L0 更强的证据（L0 只证明内核能连，L2 证明能服务
-生产流量），所以它能复活池里的 DEAD / RETIRED 行。
+命中节点按有效 L2 成功或真实传输失败推进唯一状态机，并分别记录 L1 出口与 L2
+业务证据。普通 HTTP 错误响应和无效正文只记观测，不作为节点故障。健康状态只由
+ProxyNode 保存，旧表只供 UI 与检测节流读取。
 
 不做的事：不新建调度、不新建生命周期、不重铸名字、不降级节点。合格集或出口集
 变化只置既有的 rebuild_pending，重建仍归既有的池重建通道。
@@ -18,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,7 +34,9 @@ from app.domains.proxypool.models import (
 )
 from app.domains.proxypool.registry import _name_base
 from app.domains.proxypool.state import (
+    NODE_ACTIVE,
     NODE_DEAD,
+    NODE_NEW,
     NODE_RETIRED,
     NODE_STALE,
     evaluate_node_state,
@@ -43,13 +44,13 @@ from app.domains.proxypool.state import (
 
 logger = logging.getLogger(__name__)
 
-# 落库的体检结论只在这个窗口内当作「当前健康证据」。更早的 ok 行代表过去
-# 某一刻的事实，不能直接当今天的健康——池内 L0/L2 每拍会重新给出结论。
-LEDGER_FRESH_HOURS = 72
-
 # 观测明细标签（HealthObservation.detail 是固定枚举，不放自由文本）
 CLASH_STEAM_OK_DETAIL = "CLASH_STEAM_OK"
-CLASH_STEAM_FAIL_DETAIL = "CLASH_STEAM_FAIL"
+CLASH_STEAM_HTTP_ERROR_DETAIL = "CLASH_STEAM_HTTP_ERROR"
+CLASH_STEAM_HTTP_502_DETAIL = "CLASH_STEAM_HTTP_502"
+CLASH_STEAM_HTTP_504_DETAIL = "CLASH_STEAM_HTTP_504"
+CLASH_STEAM_INVALID_DETAIL = "CLASH_STEAM_INVALID_RESPONSE"
+CLASH_STEAM_TRANSPORT_DETAIL = "CLASH_STEAM_TRANSPORT_FAILURE"
 CLASH_EXIT_IP_DETAIL = "CLASH_EXIT_IP"
 
 
@@ -59,13 +60,30 @@ class IngestionResult:
 
     matched: int = 0
     activated: int = 0
+    deactivated: int = 0
     exit_ips_added: int = 0
     unmatched: list[str] = field(default_factory=list)
-    skipped_stale: int = 0
 
     @property
     def changed(self) -> bool:
-        return bool(self.activated or self.exit_ips_added)
+        return bool(self.activated or self.deactivated or self.exit_ips_added)
+
+
+def project_node_health(row: ClashNode, node: ProxyNode) -> tuple[str, str | None]:
+    """把权威节点状态投影到旧 UI 行，返回投影前的状态与出口地址。"""
+    prior_status, prior_exit = row.status, row.exit_ip
+    if node.state in (NODE_DEAD, NODE_RETIRED):
+        row.status = "dead"
+    elif node.state in (NODE_ACTIVE, NODE_STALE) and node.last_l2_at is not None:
+        row.status = "ok"
+    elif node.state in (NODE_NEW, NODE_ACTIVE):
+        row.status = "unknown"
+    else:
+        row.status = "dead"
+    row.fail_count = int(node.consecutive_failures or 0)
+    row.revive_passes = 0
+    row.exit_ip = node.exit_ip
+    return prior_status, prior_exit
 
 
 def _name_keys(name: str) -> list[str]:
@@ -226,8 +244,8 @@ async def ingest_node_check(
 
     results 是 test_clash_nodes 的逐节点结果（含 name / alive / exitIp / ms）。
     存活节点按成功证据推进（复活 + 出口 IP 落账）；失败节点是**同一把
-    Steam 判据下的失败证据**——失败计数 +1 并由状态机判死（与 L2 业务探测
-    同一语义，可被下一轮成功或恢复轮复活），不是只记不罚的第二套账。
+    Steam 有效响应推进业务健康；收到 HTTP 错误或无效业务正文只记为目标响应，
+    不惩罚节点。只有 Steam 与出口身份探测都无法完成时才记节点传输失败。
     """
     by_source, by_runtime = await _load_index(session)
     outcome = IngestionResult()
@@ -246,14 +264,42 @@ async def ingest_node_check(
         exit_ip = row.get("exitIp")
         latency_ms = row.get("ms")
         if not row.get("alive"):
-            _apply_steam_failure(node, now=now)
+            exit_added = bool(exit_ip and not node.exit_ip)
+            if exit_ip:
+                node.exit_ip = str(exit_ip)
+                node.last_l1_at = now
+                session.add(
+                    HealthObservation(
+                        node_id=node.node_id,
+                        level=L1_LEVEL,
+                        ok=True,
+                        detail=CLASH_EXIT_IP_DETAIL,
+                        observed_at=now,
+                        run_id=run_id,
+                        channel=channel,
+                    )
+                )
+                if exit_added:
+                    outcome.exit_ips_added += 1
+            if row.get("steamStatus") is None and not exit_ip:
+                if _apply_steam_failure(node, now=now):
+                    outcome.deactivated += 1
+            status = row.get("steamStatus")
+            detail = (
+                CLASH_STEAM_TRANSPORT_DETAIL
+                if status is None and not exit_ip
+                else CLASH_STEAM_INVALID_DETAIL if status == 200
+                else CLASH_STEAM_HTTP_502_DETAIL if status == 502
+                else CLASH_STEAM_HTTP_504_DETAIL if status == 504
+                else CLASH_STEAM_HTTP_ERROR_DETAIL
+            )
             session.add(
                 HealthObservation(
                     node_id=node.node_id,
                     level=L2_LEVEL,
                     ok=False,
                     latency_ms=latency_ms if isinstance(latency_ms, int) else None,
-                    detail=CLASH_STEAM_FAIL_DETAIL,
+                    detail=detail,
                     observed_at=now,
                     run_id=run_id,
                     channel=channel,
@@ -287,52 +333,81 @@ async def ingest_ledger(
     session: AsyncSession,
     *,
     now: datetime,
-    fresh_hours: int = LEDGER_FRESH_HOURS,
 ) -> IngestionResult:
-    """把已落库的节点体检结论对齐进池账本（覆盖全部订阅）。
+    """将 ProxyNode 状态同步到旧 UI/节流表；不从旧表反向改变健康结论。"""
+    from app.domains.proxypool.models import ProxyNode as RegistryNode
 
-    前端点一次体检只覆盖当时内核在跑的那条订阅；clash_nodes 账本里还留着
-    其它订阅的最近结论。本函数按来源把它对齐进池，让「每一条已证健康的出口
-    节点」都参与容量，而不是只有当前内核那条订阅。
-    """
-    cutoff = now - timedelta(hours=max(1, int(fresh_hours)))
-    by_source, by_runtime = await _load_index(session)
-    rows = (
-        await session.execute(select(ClashNode).where(ClashNode.status == "ok"))
-    ).scalars().all()
-
-    outcome = IngestionResult()
-    for row in rows:
-        checked_at = row.last_checked_at
-        if checked_at is not None and checked_at < cutoff:
-            outcome.skipped_stale += 1
-            continue
-        node = _match(by_source, by_runtime, int(row.subscription_id), str(row.name))
-        if node is None:
-            continue
-        # 池内已有**更新**的业务结论（L2 维护 / 生产证据都盖 last_l2_at）且节点
-        # 正被池判坏时，不用更早的体检结论复活它：否则「池判死 → 体检账本再
-        # 复活」每拍互相推翻，节点状态永远翻烧饼。节点健康或账本更新时照常
-        # 对齐——复活依据是更强的证据，出口 IP 回填也不受影响。
-        if (
-            node.last_l2_at is not None
-            and checked_at is not None
-            and node.last_l2_at > checked_at
-            and node.state in (NODE_STALE, NODE_DEAD, NODE_RETIRED)
-        ):
-            continue
-        outcome.matched += 1
-        state_changed, exit_added = _apply_success(
-            node, exit_ip=row.exit_ip, latency_ms=row.latency_ms, now=now
-        )
-        if state_changed:
-            outcome.activated += 1
-        if exit_added:
-            outcome.exit_ips_added += 1
-        if state_changed or exit_added:
-            _write_observations(
-                session, node, exit_ip=row.exit_ip, latency_ms=row.latency_ms, now=now
+    nodes = list((await session.execute(select(RegistryNode))).scalars())
+    observations: dict[str, HealthObservation] = {}
+    if nodes:
+        rows = (await session.execute(
+            select(HealthObservation)
+            .where(
+                HealthObservation.node_id.in_([node.node_id for node in nodes]),
+                HealthObservation.level == L2_LEVEL,
             )
+            .order_by(HealthObservation.observed_at.desc(), HealthObservation.id.desc())
+        )).scalars()
+        for observation in rows:
+            observations.setdefault(observation.node_id, observation)
+
+    legacy_rows = list((await session.execute(select(ClashNode))).scalars())
+    legacy_by_key = {(row.subscription_id, row.name): row for row in legacy_rows}
+    outcome = IngestionResult()
+    for node in nodes:
+        if not node.original_name:
+            continue
+        source_id = node.subscription_id
+        if source_id is None:
+            prefix, separator, _ = str(node.runtime_name).partition("|")
+            source_id = int(prefix) if separator and prefix.isdigit() else None
+        if source_id is None:
+            continue
+        key = (int(source_id), str(node.original_name))
+        row = legacy_by_key.get(key)
+        if row is None:
+            row = ClashNode(
+                subscription_id=key[0], name=key[1], created_at=now,
+            )
+            session.add(row)
+            legacy_by_key[key] = row
+        prior_status, prior_exit = project_node_health(row, node)
+        latest = observations.get(node.node_id)
+        if latest is not None:
+            row.latency_ms = latest.latency_ms
+            if row.last_checked_at is None:
+                row.last_checked_at = node.last_l2_at or latest.observed_at
+        outcome.matched += 1
+        if row.status == "ok" and prior_status != "ok":
+            outcome.activated += 1
+        if row.status == "dead" and prior_status != "dead":
+            outcome.deactivated += 1
+        if node.exit_ip and node.exit_ip != prior_exit:
+            outcome.exit_ips_added += 1
+
+    projected_keys = {
+        (int(node.subscription_id) if node.subscription_id is not None else None,
+         str(node.original_name or ""))
+        for node in nodes
+        if node.subscription_id is not None and node.original_name
+    }
+    projected_keys.update(
+        (int(str(node.runtime_name).partition("|")[0]), str(node.original_name))
+        for node in nodes
+        if node.subscription_id is None
+        and node.original_name
+        and str(node.runtime_name).partition("|")[0].isdigit()
+    )
+    for key, row in legacy_by_key.items():
+        if key in projected_keys:
+            continue
+        if row.status == "ok":
+            outcome.deactivated += 1
+        row.status = "unknown"
+        row.fail_count = 0
+        row.revive_passes = 0
+        row.exit_ip = None
+        row.latency_ms = None
     return outcome
 
 

@@ -23,8 +23,7 @@ from app.domains.proxypool.state import NODE_DEAD, NODE_RETIRED
 
 logger = logging.getLogger(__name__)
 
-# 短命内核的端口段：与池内核（21100 探测段 + 动态段）、旧链路内核（7890 段）
-# 都不重叠，避免三方抢口。
+# 短命内核使用独立端口段，避免与其他 Runtime 的监听端口冲突。
 PROBE_PORT_BASE = 23200
 PROBE_PORT_SPAN = 200
 # 每批探测的节点数上限：一个进程内每个节点占一个 listener，批次越大启动越慢
