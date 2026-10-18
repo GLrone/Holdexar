@@ -17,6 +17,7 @@ from app.domains.notifications.policy import (
     CATEGORY_EVENT_TYPES,
     CATEGORY_LABELS,
     MAX_ATTEMPTS,
+    UNKNOWN,
     load_prefs,
     save_prefs,
 )
@@ -57,7 +58,7 @@ async def get_prefs():
         row = (
             await session.execute(
                 select(NotificationCandidate)
-                .where(NotificationCandidate.status.in_(("delivered", "failed")))
+                .where(NotificationCandidate.status.in_(("delivered", "failed", UNKNOWN)))
                 .order_by(NotificationCandidate.updated_at.desc())
             )
         ).scalars().first()
@@ -65,7 +66,9 @@ async def get_prefs():
     if row is not None:
         last = {
             "status": row.status,
-            "at": row.delivered_at.isoformat() if row.delivered_at else None,
+            "at": (row.delivered_at or row.updated_at).isoformat()
+            if row.delivered_at or row.updated_at
+            else None,
             "attempts": row.attempts,
             # 失败原因原文可能含服务端细节，只给用户一句可行动的提示
             "reason": row.reason,
@@ -190,6 +193,7 @@ async def stats():
         "pending": counts.get("pending", {"count": 0})["count"],
         "suppressed": counts.get("suppressed", {"count": 0})["count"],
         "sending": counts.get("sending", {"count": 0})["count"],
+        "unknown": counts.get(UNKNOWN, {"count": 0})["count"],
         "failed": failed,
         # 失败里还能再试的（临时故障且未到次数上限）与已经永久放弃的
         "retryable": can_retry,

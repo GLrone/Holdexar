@@ -50,6 +50,7 @@ CATEGORY_EVENT_TYPES: dict[str, tuple[str, ...]] = {
 PENDING = "pending"
 SUPPRESSED = "suppressed"
 SENDING = "sending"
+UNKNOWN = "unknown"
 DELIVERED = "delivered"
 FAILED = "failed"
 

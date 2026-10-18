@@ -10,13 +10,12 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.database import WritePriority, get_session_factory, write_session
-from app.core.database import write_gate
 from app.core.logging import log_event
 from app.domains.alerts.notify import send_mail_ex, smtp_config
 from app.domains.crawl import events as events_service
@@ -35,7 +34,9 @@ from app.domains.notifications.policy import (
     CATEGORY_LABELS,
     FAILED,
     MAX_ATTEMPTS,
+    SENDING,
     UNDELIVERED,
+    UNKNOWN,
     decide,
     load_prefs,
 )
@@ -77,6 +78,7 @@ def retryable(error: str | None) -> bool:
 
 # 单轮事件读取上限：一轮候选数量级是对象 × 地区，足够且不炸内存
 EVENT_LIMIT = 1000
+SENDING_TIMEOUT = timedelta(minutes=30)
 
 _TYPE_TO_CATEGORY = {
     event_type: category
@@ -149,12 +151,22 @@ async def _undelivered() -> list[NotificationCandidate]:
 
     失败候选只在「临时故障 且 未超过次数上限」时才回到队列；授权码错、配置错
     这类一次就永久失败。**以候选状态为准，不用"最近一次 Cycle ID"猜。**
-    `sending` 不在其中：进程在投递途中被杀的候选不重发（宁丢一封不重发）。
+    `sending` / `unknown` 不在其中：未确认 SMTP 是否已接收时不重发。
     """
     async with get_session_factory()() as session:
         rows = (
             await session.execute(
-                select(NotificationCandidate).order_by(NotificationCandidate.id)
+                select(NotificationCandidate)
+                .where(
+                    or_(
+                        NotificationCandidate.status.in_(UNDELIVERED),
+                        and_(
+                            NotificationCandidate.status == FAILED,
+                            NotificationCandidate.attempts < MAX_ATTEMPTS,
+                        ),
+                    )
+                )
+                .order_by(NotificationCandidate.id)
             )
         ).scalars().all()
     return [
@@ -165,18 +177,66 @@ async def _undelivered() -> list[NotificationCandidate]:
     ]
 
 
-async def _claim(candidates: list[NotificationCandidate]) -> None:
-    """投递前占位：sending + 计数。单写者串行，无需分布式锁。"""
+async def _recover_stuck_sending(now: datetime | None = None) -> int:
+    """把超时的在途候选标为 unknown；外部是否已接收邮件无法安全推断。"""
+    now = now or datetime.now()
+    cutoff = now - SENDING_TIMEOUT
+    async with write_session(WritePriority.BACKGROUND, "notification_recover") as session:
+        result = await session.execute(
+            update(NotificationCandidate)
+            .where(
+                NotificationCandidate.status == SENDING,
+                or_(
+                    NotificationCandidate.updated_at.is_(None),
+                    NotificationCandidate.updated_at < cutoff,
+                ),
+            )
+            .values(
+                status=UNKNOWN,
+                reason="投递中断，外部是否已接收无法确认",
+                last_error="sending 超时，投递结果未知",
+                updated_at=now,
+            )
+        )
+        await session.commit()
+    return int(result.rowcount or 0)
+
+
+async def _claim(candidates: list[NotificationCandidate]) -> list[NotificationCandidate]:
+    """以状态和版本字段作条件更新；多进程重复扫描时仅一个能占位。"""
     now = datetime.now()
+    claimed: list[NotificationCandidate] = []
     async with write_session(WritePriority.BACKGROUND) as session:
         for candidate in candidates:
-            row = await session.get(NotificationCandidate, candidate.id)
-            if row is None:
-                continue
-            row.status = "sending"
-            row.attempts = int(row.attempts or 0) + 1
-            row.updated_at = now
+            version_filter = (
+                NotificationCandidate.updated_at.is_(None)
+                if candidate.updated_at is None
+                else NotificationCandidate.updated_at == candidate.updated_at
+            )
+            error_filter = (
+                NotificationCandidate.last_error.is_(None)
+                if candidate.last_error is None
+                else NotificationCandidate.last_error == candidate.last_error
+            )
+            result = await session.execute(
+                update(NotificationCandidate)
+                .where(
+                    NotificationCandidate.id == candidate.id,
+                    NotificationCandidate.status == candidate.status,
+                    NotificationCandidate.attempts == int(candidate.attempts or 0),
+                    error_filter,
+                    version_filter,
+                )
+                .values(
+                    status=SENDING,
+                    attempts=NotificationCandidate.attempts + 1,
+                    updated_at=now,
+                )
+            )
+            if result.rowcount:
+                claimed.append(candidate)
         await session.commit()
+    return claimed
 
 
 async def _settle(
@@ -273,9 +333,17 @@ async def dispatch(cycle_id: int) -> dict:
     """
     result = {
         "created": 0, "sent": 0, "deferred": 0, "failed": 0,
-        "retried": 0, "retryable": False,
+        "retried": 0, "retryable": False, "unknown": 0,
     }
     try:
+        result["unknown"] = await _recover_stuck_sending()
+        if result["unknown"]:
+            log_event(
+                logger,
+                "超时的通知投递已标记为结果未知，避免重复发送",
+                detail={"候选": result["unknown"]},
+                level=logging.WARNING,
+            )
         prefs = await load_prefs()
         recipient = (await smtp_config()).get("to_addr") or ""
         events = await events_service.list_events(cycle_id=cycle_id, limit=EVENT_LIMIT)
@@ -333,7 +401,29 @@ async def dispatch(cycle_id: int) -> dict:
             when=datetime.now(),
         )
         subject = f"Holdexar 本轮价格更新：{len(candidates)} 条变化"
-        await _claim(candidates)
+        claimed = await _claim(candidates)
+        if not claimed:
+            return result
+        if len(claimed) != len(candidates):
+            candidates = claimed
+            result["retried"] = sum(1 for c in candidates if c.status == FAILED)
+            result["deferred"] = sum(1 for c in candidates if c.cycle_id != cycle_id)
+            counts = {}
+            for candidate in candidates:
+                label = CATEGORY_LABELS.get(
+                    candidate.category, event_label(candidate.event_type)
+                )
+                counts[label] = counts.get(label, 0) + 1
+            details, games = await _digest_rows(candidates)
+            html = digest_mail_html(
+                counts=sorted(counts.items(), key=lambda kv: -kv[1]),
+                details=details if prefs.get("includeDetails", True) else [],
+                total=len(candidates),
+                games=games,
+                deferred=result["deferred"],
+                when=datetime.now(),
+            )
+            subject = f"Holdexar 本轮价格更新：{len(candidates)} 条变化"
         ok, error = await send_mail_ex(subject, html)
         if ok:
             await _settle(candidates, "delivered", None, None)

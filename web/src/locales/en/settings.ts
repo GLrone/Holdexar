@@ -246,6 +246,7 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.notification.off': 'Notifications off',
   'settings.notification.on': 'Notifications on — waiting for the next refresh',
   'settings.notification.lastOk': 'Last email delivered ({time})',
+  'settings.notification.lastUnknown': 'Email sending stopped before delivery could be confirmed. Check your inbox; it will not be sent again automatically.',
   'settings.notification.lastFailed': 'Last email failed: {reason}',
   'settings.notification.lastRetryable': 'Temporary failure — will retry next refresh (attempt {n})',
   'settings.notification.lastPermanent': 'Gave up retrying — check mailbox and authorization code',
@@ -253,6 +254,7 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.notification.testSent': 'Test email sent — check your inbox',
   'settings.notification.stats':
     'Delivered {delivered} · failed {failed} ({retryable} can retry)',
+  'settings.notification.unknownCount': '{unknown} email delivery result(s) could not be confirmed',
 }
 
 export default settings

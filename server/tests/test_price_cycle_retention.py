@@ -14,6 +14,7 @@ from sqlalchemy import select
 from app.core.database import get_session_factory
 from app.domains.crawl import retention as crawl_retention
 from app.domains.crawl.cycle import COMPLETED, PriceCycle
+from app.domains.crawl.events import PriceEvent
 
 
 async def _cycle(
@@ -152,3 +153,27 @@ async def test_prune_truncated_flag_on_chunk_cap():
 
     assert result["rows_deleted"] == 1
     assert result["truncated"] is True, "块上限截断必须如实上报"
+
+
+@pytest.mark.asyncio
+async def test_prune_removes_price_events_outside_the_shared_90_day_window():
+    now = datetime.now()
+    async with get_session_factory()() as session:
+        old = PriceEvent(
+            cycle_id=-1, appid=1001, event_type="PRICE_DROP",
+            occurred_at=now - timedelta(days=91), created_at=now - timedelta(days=91),
+        )
+        fresh = PriceEvent(
+            cycle_id=-2, appid=1002, event_type="PRICE_DROP",
+            occurred_at=now - timedelta(days=1), created_at=now - timedelta(days=1),
+        )
+        session.add_all([old, fresh])
+        await session.commit()
+        old_id, fresh_id = old.id, fresh.id
+
+    result = await crawl_retention.prune_price_cycles(now=now)
+
+    async with get_session_factory()() as session:
+        assert await session.get(PriceEvent, old_id) is None
+        assert await session.get(PriceEvent, fresh_id) is not None
+    assert result["events_deleted"] == 1
