@@ -1,11 +1,11 @@
 """schema 缺列登记 + 老库自愈。
 
-`subscription_snapshots` 的 `http_status` / `content_type` / `source_channel`
-三列必须登记进 `_TABLE_EXTRA_COLUMNS`：老形状的库缺列时，首次同步的
+`subscription_snapshots` 的 HTTP、出口和尝试诊断字段必须登记进
+`_TABLE_EXTRA_COLUMNS`：老形状的库缺列时，首次同步的
 INSERT 直接报 `table subscription_snapshots has no column named http_status`。
 
 本文件钉两件事：
-1. 这 3 列确实登记在 `_TABLE_EXTRA_COLUMNS["subscription_snapshots"]`（防被误删）；
+1. 这些列确实登记在 `_TABLE_EXTRA_COLUMNS["subscription_snapshots"]`（防被误删）；
 2. 老形状的库跑一次 `init_db()` 就能被补齐，且补齐后 `persist_snapshot` 可成功写入。
 """
 from __future__ import annotations
@@ -59,11 +59,21 @@ def tmp_data_dir(tmp_path, monkeypatch):
 def test_snapshot_extra_columns_are_registered():
     """真实生产缺的 3 列必须登记在册（未登记 → 启动不会补，首次同步必失败）。"""
     reg = _TABLE_EXTRA_COLUMNS["subscription_snapshots"]
-    for col in ("http_status", "content_type", "source_channel"):
+    for col in (
+        "http_status", "content_type", "source_channel", "source_egress",
+        "profile_title", "content_disposition", "userinfo", "duration_ms",
+        "attempts_json", "provider_nodes_json",
+    ):
         assert col in reg, f"{col} 未登记进 _TABLE_EXTRA_COLUMNS"
     # 登记口径与模型一致（只登记加列；不碰 SCHEMA_VERSION / 迁移链）
     model_cols = {c.name for c in Base.metadata.tables["subscription_snapshots"].columns}
     assert set(reg) <= model_cols
+    subscription_reg = _TABLE_EXTRA_COLUMNS["proxy_subscriptions"]
+    subscription_cols = {
+        c.name for c in Base.metadata.tables["proxy_subscriptions"].columns
+    }
+    assert "cache_url_identity" in subscription_reg
+    assert "cache_url_identity" in subscription_cols
 
 
 @pytest.mark.asyncio
@@ -112,3 +122,24 @@ async def test_init_db_heals_legacy_snapshot_table(tmp_data_dir):
     assert [(r[0], r[1], r[2], r[3], open_url(r[4]), r[5]) for r in row] == [
         ("OK", 200, "text/yaml", "direct", "https://heal.invalid/x", 1)
     ]
+
+
+@pytest.mark.asyncio
+async def test_init_db_adds_subscription_cache_identity_to_existing_table(tmp_data_dir):
+    from sqlalchemy import create_engine
+
+    db = tmp_data_dir / "holdexar.db"
+    sync_engine = create_engine(f"sqlite:///{db}")
+    Base.metadata.tables["proxy_subscriptions"].create(sync_engine)
+    sync_engine.dispose()
+    con = sqlite3.connect(db)
+    con.execute("ALTER TABLE proxy_subscriptions DROP COLUMN cache_url_identity")
+    con.commit()
+    con.close()
+
+    await init_db()
+
+    con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    actual = {row[1] for row in con.execute("PRAGMA table_info(proxy_subscriptions)")}
+    con.close()
+    assert "cache_url_identity" in actual

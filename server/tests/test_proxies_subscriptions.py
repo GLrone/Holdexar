@@ -1,6 +1,6 @@
 """proxies 订阅域测试：手动改名 / 流量实时回填 / 级联删除 / 账本收敛 / 存活落库。
 
-不触真实网络/内核——monkeypatch fetch_subscription_headers 与策略引擎；
+不触真实网络/内核——替换规范下载与策略引擎；
 库隔离到临时 sqlite（同 test_proxies_stats.py 范式）。
 """
 import base64
@@ -144,9 +144,18 @@ async def test_update_subscription_rename_only(db):
 
 
 @pytest.mark.asyncio
-async def test_update_subscription_url_change_triggers_sync(db, monkeypatch):
+async def test_update_subscription_url_change_triggers_sync(db, monkeypatch, tmp_path):
     """换链接的 clash 订阅保存即自动重拉：synced=True，节点/流量并道回传。"""
+    from types import SimpleNamespace
+    from app.domains.proxypool.subscription import subscription_url_identity
+
     sub_id = await _add_sub(db)
+    clash_manager.write_subscription_meta(tmp_path, sub_id, {
+        "urlIdentity": subscription_url_identity(SUB_URL),
+    })
+    monkeypatch.setattr(
+        "app.core.config.get_settings", lambda: SimpleNamespace(data_dir=tmp_path)
+    )
     calls: list[int] = []
     switches: list[bool] = []
 
@@ -173,6 +182,7 @@ async def test_update_subscription_url_change_triggers_sync(db, monkeypatch):
     assert res["label"] == "新名字"
     assert secretbox.is_encrypted((await _get_sub(db, sub_id)).url)
     assert open_url((await _get_sub(db, sub_id)).url) == "https://example.com/sub?token=xyz"
+    assert clash_manager.read_subscription_meta(tmp_path, sub_id)["urlIdentity"] is None
 
 
 @pytest.mark.asyncio
@@ -222,6 +232,8 @@ async def test_update_subscription_sync_failure_keeps_changes(db, monkeypatch):
     assert row.label == "新名字"
     assert secretbox.is_encrypted(row.url)
     assert open_url(row.url) == "https://example.com/sub?token=xyz"
+    from app.domains.proxypool.subscription import subscription_url_identity
+    assert row.cache_url_identity == subscription_url_identity(SUB_URL)
 
 
 @pytest.mark.asyncio
@@ -242,25 +254,20 @@ async def test_update_subscription_missing(db):
 
 @pytest.mark.asyncio
 async def test_refresh_traffic_merges_last_stats(db, monkeypatch):
-    """流量头局部合并进 last_stats——既有键（nodes/cached）不丢。"""
+    """流量刷新复用统一订阅刷新并要求在线流量头。"""
+    sub_id = await _add_sub(db)
+    calls = []
 
-    async def _fake_headers(url, proxy_url=None):
-        return {"userinfo": USERINFO}
+    async def _fake_refresh(requested_id, *, _require_fresh_traffic=False):
+        calls.append((requested_id, _require_fresh_traffic))
+        return {"id": requested_id, "traffic": USERINFO}
 
-    monkeypatch.setattr(
-        clash_manager.runtime, "fetch_subscription_headers", _fake_headers
-    )
-    monkeypatch.setattr(proxies_service, "resolve_proxy_url", _no_proxy)
-
-    sub_id = await _add_sub(db, last_stats={"nodes": 5, "cached": False})
+    monkeypatch.setattr(proxies_service, "refresh_clash_subscription", _fake_refresh)
 
     result = await proxies_service.refresh_subscription_traffic(sub_id)
 
-    assert result["traffic"] == USERINFO
-    stats = (await _get_sub(db, sub_id)).last_stats
-    assert stats["traffic"] == USERINFO
-    assert stats["nodes"] == 5
-    assert stats["cached"] is False  # 局部合并不清空其他键
+    assert result == {"id": sub_id, "traffic": USERINFO}
+    assert calls == [(sub_id, True)]
 
 
 @pytest.mark.asyncio
@@ -274,15 +281,13 @@ async def test_refresh_traffic_plain_rejected(db):
 
 @pytest.mark.asyncio
 async def test_refresh_traffic_no_header(db, monkeypatch):
-    """面板没回流量头：报错（保留旧值，不写空统计）。"""
+    """统一刷新没有在线流量头时保留旧值并报错。"""
 
-    async def _fake_headers(url, proxy_url=None):
-        return {"userinfo": None}
+    async def _fake_refresh(requested_id, *, _require_fresh_traffic=False):
+        assert _require_fresh_traffic is True
+        raise ValueError("面板未返回在线流量头")
 
-    monkeypatch.setattr(
-        clash_manager.runtime, "fetch_subscription_headers", _fake_headers
-    )
-    monkeypatch.setattr(proxies_service, "resolve_proxy_url", _no_proxy)
+    monkeypatch.setattr(proxies_service, "refresh_clash_subscription", _fake_refresh)
 
     sub_id = await _add_sub(db, last_stats={"traffic": "upload=1; download=2; total=3"})
     with pytest.raises(ValueError, match="流量头"):
@@ -514,6 +519,8 @@ async def test_start_switches_subscription_when_running(monkeypatch, tmp_path):
     monkeypatch.setattr(clash_manager.subprocess, "Popen", lambda *a, **kw: _FakeProc())
     monkeypatch.setattr(clash_manager.ClashRuntime, "_kill_orphans", lambda self, exe, cfgp: 0)
     monkeypatch.setattr(clash_manager, "ensure_kernel_files", lambda d: None)
+    monkeypatch.setattr(clash_manager.ClashRuntime, "_wait_mixed_port", lambda self: True)
+    monkeypatch.setattr(clash_manager, "_port_owned_by_process", lambda *_a: True)
 
     r = clash_manager.ClashRuntime()
     r.start("exe", str(cfg), subscription_url="https://a.example/sub")
@@ -913,6 +920,8 @@ def _patch_kernel_launch(monkeypatch):
     monkeypatch.setattr(clash_manager.subprocess, "Popen", lambda *a, **kw: _FakeProc())
     monkeypatch.setattr(clash_manager.ClashRuntime, "_kill_orphans", lambda self, exe, cfgp: 0)
     monkeypatch.setattr(clash_manager, "ensure_kernel_files", lambda d: None)
+    monkeypatch.setattr(clash_manager.ClashRuntime, "_wait_mixed_port", lambda self: True)
+    monkeypatch.setattr(clash_manager, "_port_owned_by_process", lambda *_a: True)
 
 
 @pytest.mark.asyncio
@@ -944,6 +953,47 @@ async def test_ensure_running_switches_via_hot_reload(monkeypatch, tmp_path):
     # external-controller 只经命令行下发（resolve_controller 契约），文件里不该有
     assert "HlProbeLane" in text and "external-controller" not in text
     r.stop()
+
+
+@pytest.mark.asyncio
+async def test_hot_reload_rejects_mixed_port_owned_by_another_process(monkeypatch, tmp_path):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(_MINI_CONFIG, encoding="utf-8")
+    _patch_kernel_launch(monkeypatch)
+
+    r = clash_manager.ClashRuntime()
+    r.start("exe", str(cfg), subscription_url="https://a.example/sub")
+    cfg.write_text(_MINI_CONFIG_B, encoding="utf-8")
+    _FakeControllerClient.known = {"B节点", "GLOBAL", "DIRECT", "REJECT", "COMPATIBLE", "Pass"}
+    monkeypatch.setattr(clash_manager.httpx, "AsyncClient", _FakeControllerClient)
+    monkeypatch.setattr(clash_manager, "_port_listening", lambda _port: True)
+    owners = iter([False, True, True, True])
+    monkeypatch.setattr(
+        clash_manager, "_port_owned_by_process", lambda _port, _pid: next(owners)
+    )
+
+    outcome = await r.ensure_running("exe", str(cfg), subscription_url="https://b.example/sub")
+
+    assert outcome["started"] is True and outcome["reloaded"] is False
+    assert r.entry_listening() is True
+    r.stop()
+
+
+def test_entry_listener_must_belong_to_the_live_runtime(monkeypatch):
+    runtime = clash_manager.ClashRuntime()
+
+    class Process:
+        pid = 6789
+
+        def poll(self):
+            return None
+
+    runtime.process = Process()
+    runtime.port = 41234
+    monkeypatch.setattr(clash_manager, "_port_listening", lambda _port: True)
+    monkeypatch.setattr(clash_manager, "_port_owned_by_process", lambda _port, _pid: False)
+
+    assert runtime.entry_listening() is False
 
 
 @pytest.mark.asyncio
@@ -990,10 +1040,41 @@ async def test_ensure_running_same_subscription_unchanged_is_idle(monkeypatch, t
     r.start("exe", str(cfg), subscription_url="https://a.example/sub")
     _FakeControllerClient.puts = []
     monkeypatch.setattr(clash_manager.httpx, "AsyncClient", _FakeControllerClient)
+    monkeypatch.setattr(clash_manager, "_port_listening", lambda _port: True)
 
     outcome = await r.ensure_running("exe", str(cfg), subscription_url="https://a.example/sub")
     assert outcome["reloaded"] is False and outcome["started"] is False
     assert _FakeControllerClient.puts == [], "内容没变不打控制器"
+    r.stop()
+
+
+@pytest.mark.asyncio
+async def test_ensure_running_reallocates_auto_port_when_listener_is_lost(monkeypatch, tmp_path):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(_MINI_CONFIG, encoding="utf-8")
+    _patch_kernel_launch(monkeypatch)
+
+    r = clash_manager.ClashRuntime()
+    r.start("exe", str(cfg), subscription_url="https://a.example/sub")
+    first_proc = r.process
+    old_port = r.port
+    new_port = old_port + 1
+    monkeypatch.setattr(clash_manager, "_free_local_port", lambda: new_port)
+    monkeypatch.setattr(clash_manager, "_port_listening", lambda _port: True)
+    monkeypatch.setattr(
+        clash_manager, "_port_owned_by_process", lambda port, _pid: port == new_port,
+    )
+
+    assert r.status()["entryReady"] is False
+    result = await r.ensure_running(
+        "exe", str(cfg), subscription_url="https://a.example/sub",
+        allocate_mixed_port=True,
+    )
+
+    assert result["started"] is True and result["reloaded"] is False
+    assert r.process is not first_proc
+    assert r.port == new_port
+    assert r.entry_listening() is True
     r.stop()
 
 
@@ -1324,8 +1405,130 @@ async def test_download_subscription_cache_fallback_when_all_channels_fail(
     assert meta["nodes"] == 1
 
     empty_dir = tmp_path / "fresh"
-    with pytest.raises(httpx.ConnectError):
+    from app.domains.proxypool.subscription import FetchFailedError
+
+    with pytest.raises(FetchFailedError):
         await r.download_subscription("https://dead.example/sub", empty_dir)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_only_uses_valid_subscription_cache_when_snapshot_is_absent(
+    db, monkeypatch, tmp_path,
+):
+    sub_id = await _add_sub(db)
+    async with db() as session:
+        subscription = await session.get(ProxySubscription, sub_id)
+        subscription.auto_refresh = False
+        await session.commit()
+
+    target = clash_manager.subscription_config_path(tmp_path, sub_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(_MINI_CONFIG, encoding="utf-8")
+
+    async def unexpected_fetch(*_args, **_kwargs):
+        raise AssertionError("snapshot-only startup must not access the network")
+
+    from app.domains.proxypool import subscription as subscription_fetch
+    monkeypatch.setattr(subscription_fetch, "fetch_subscription", unexpected_fetch)
+
+    result = await clash_manager.ClashRuntime().download_subscription(
+        SUB_URL, tmp_path, [], target_path=target, snapshot_only=True,
+    )
+
+    assert result["cached"] is True
+    assert result["nodes"] == 1
+    assert Path(result["path"]).read_text(encoding="utf-8") == _MINI_CONFIG
+
+
+@pytest.mark.asyncio
+async def test_snapshot_only_rejects_cache_tagged_for_previous_subscription_url(
+    db, monkeypatch, tmp_path,
+):
+    from app.domains.proxypool.subscription import subscription_url_identity
+
+    sub_id = await _add_sub(db)
+    new_url = "https://example.com/sub?token=new"
+    async with db() as session:
+        subscription = await session.get(ProxySubscription, sub_id)
+        subscription.url = new_url
+        await session.commit()
+
+    target = clash_manager.subscription_config_path(tmp_path, sub_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(_MINI_CONFIG, encoding="utf-8")
+    clash_manager.write_subscription_meta(tmp_path, sub_id, {
+        "urlIdentity": subscription_url_identity(SUB_URL),
+    })
+
+    async def unexpected_fetch(*_args, **_kwargs):
+        raise AssertionError("snapshot-only startup must not access the network")
+
+    from app.domains.proxypool import subscription as subscription_fetch
+    monkeypatch.setattr(subscription_fetch, "fetch_subscription", unexpected_fetch)
+
+    with pytest.raises(RuntimeError, match="没有可恢复的成功快照或有效订阅缓存"):
+        await clash_manager.ClashRuntime().download_subscription(
+            new_url, tmp_path, [], target_path=target, snapshot_only=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_snapshot_only_rejects_legacy_cache_when_database_identity_is_stale(
+    db, monkeypatch, tmp_path,
+):
+    from app.domains.proxypool.subscription import subscription_url_identity
+
+    sub_id = await _add_sub(db)
+    new_url = "https://example.com/sub?token=new"
+    async with db() as session:
+        subscription = await session.get(ProxySubscription, sub_id)
+        subscription.url = new_url
+        subscription.cache_url_identity = subscription_url_identity(SUB_URL)
+        await session.commit()
+
+    target = clash_manager.subscription_config_path(tmp_path, sub_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(_MINI_CONFIG, encoding="utf-8")
+
+    async def unexpected_fetch(*_args, **_kwargs):
+        raise AssertionError("snapshot-only startup must not access the network")
+
+    from app.domains.proxypool import subscription as subscription_fetch
+    monkeypatch.setattr(subscription_fetch, "fetch_subscription", unexpected_fetch)
+
+    with pytest.raises(RuntimeError, match="没有可恢复的成功快照或有效订阅缓存"):
+        await clash_manager.ClashRuntime().download_subscription(
+            new_url, tmp_path, [], target_path=target, snapshot_only=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_url_change_sidecar_write_failure_cannot_reuse_previous_cache(
+    db, monkeypatch, tmp_path,
+):
+    from types import SimpleNamespace
+
+    sub_id = await _add_sub(db)
+    new_url = "https://example.com/sub?token=new"
+    target = clash_manager.subscription_config_path(tmp_path, sub_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(_MINI_CONFIG, encoding="utf-8")
+    monkeypatch.setattr(
+        "app.core.config.get_settings", lambda: SimpleNamespace(data_dir=tmp_path)
+    )
+    monkeypatch.setattr(clash_manager, "write_subscription_meta", lambda *_a, **_kw: None)
+
+    async def failing_refresh(*_args, **_kwargs):
+        raise ValueError("temporary fetch failure")
+
+    monkeypatch.setattr(proxies_service, "refresh_clash_subscription", failing_refresh)
+    result = await proxies_service.update_subscription(sub_id, url=new_url)
+    assert "自动重拉失败" in result["warning"]
+
+    with pytest.raises(RuntimeError, match="没有可恢复的成功快照或有效订阅缓存"):
+        await clash_manager.ClashRuntime().download_subscription(
+            new_url, tmp_path, [], target_path=target, snapshot_only=True,
+        )
 
 
 # ─── 缓存元数据随正文落盘 / 降级不丢名称流量 ─────────────────────
@@ -1499,14 +1702,8 @@ async def test_merge_last_stats_overwrites_traffic_with_fresh_value(db):
 # ─── 借道口可用性判定 ──────────────────────────────────────────
 
 
-def test_local_mixed_ports_include_own_kernel_default():
-    """程序自己内核的默认混合口 7890 必须在借道口清单里。
-
-    清单只认外部生态默认口时，自家内核在跑但运行时端口未登记会退化成直连，
-    面板域名直连不通即全通道失败。
-    """
-    assert 7890 in clash_manager.LOCAL_MIXED_PORTS
-    assert 7897 in clash_manager.LOCAL_MIXED_PORTS
+def test_local_mixed_ports_do_not_scan_holdexar_runtime_port():
+    assert clash_manager.LOCAL_MIXED_PORTS == (7897,)
 
 
 def test_local_channel_egress_ok_direct_always_true():

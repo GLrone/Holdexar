@@ -29,7 +29,7 @@ from app.domains.proxies.models import (  # noqa: E402
 )
 from app.domains.proxypool import bootstrap as bs  # noqa: E402
 from app.domains.proxypool.models import (  # noqa: E402
-    ProxyNode, SubscriptionSnapshot,
+    HealthObservation, ProxyNode, SubscriptionSnapshot,
 )
 from app.domains.proxypool.runtime import (  # noqa: E402
     prepare_runtime_config, require_runtime_proxy_url,
@@ -66,6 +66,8 @@ async def test_automatic_sync_accepts_renewed_resource_header(tmp_data_dir, monk
         sub = await session.get(ProxySubscription, sid)
         assert sub.resource_block_reason() is None and not sub.deprecated
         assert sub.last_stats["labelSource"] == "user"
+        from app.domains.proxypool.subscription import subscription_url_identity
+        assert sub.cache_url_identity == subscription_url_identity(sub.url)
         assert len(await eligible_nodes(session)) == 1
 
 
@@ -81,7 +83,8 @@ async def test_subscription_download_preserves_resource_header():
             pass
 
         async def get(self, *args, **kwargs):
-            return httpx.Response(200, content=b"proxies: []\n", headers={
+            body = yaml.safe_dump({"proxies": [_node("valid", "edge.example.test")]})
+            return httpx.Response(200, content=body.encode("utf-8"), headers={
                 "subscription-userinfo": "expire=2524608000",
             })
 
@@ -316,6 +319,88 @@ async def test_failed_fetch_keeps_crawler_unavailable(
         require_runtime_proxy_url(tmp_data_dir)
 
 
+@pytest.mark.asyncio
+async def test_unreadable_subscription_records_failure_without_replacing_success(
+    tmp_data_dir, monkeypatch,
+) -> None:
+    await init_db()
+    sub_id = await _add_subscription()
+    previous_success = datetime(2026, 9, 18, 12, 0, 0)
+    async with get_session_factory()() as session:
+        sub = await session.get(ProxySubscription, sub_id)
+        sub.snapshot_sha256 = "previous-success"
+        sub.snapshot_version = 4
+        sub.last_success_at = previous_success
+        sub.last_fetch_status = "OK"
+        await session.commit()
+
+    monkeypatch.setattr(bs, "open_url", lambda _value: None)
+
+    async def unexpected_fetch(*_args, **_kwargs):
+        raise AssertionError("unreadable subscription must not make a network request")
+
+    monkeypatch.setattr(bs, "fetch_subscription", unexpected_fetch)
+    async with get_session_factory()() as session:
+        result = await bs.sync_subscriptions(session, data_dir=tmp_data_dir, now=NOW)
+
+    row = await _sub_row(sub_id)
+    assert result.failures[sub_id]
+    assert row.last_fetch_at == NOW
+    assert row.last_fetch_status == "FAILED"
+    assert row.last_error == result.failures[sub_id]
+    assert row.snapshot_sha256 == "previous-success"
+    assert row.snapshot_version == 4
+    assert row.last_success_at == previous_success
+
+
+@pytest.mark.asyncio
+async def test_empty_pre_sync_signature_still_triggers_rebuild_after_new_nodes(
+    tmp_data_dir, monkeypatch,
+) -> None:
+    await init_db()
+    sub_id = 7
+    sync = bs.SyncResult(
+        subscription_count=1,
+        snapshot_sha256={sub_id: "new-snapshot"},
+        node_count={sub_id: 1},
+        pool_names=(),
+        pool_changed=True,
+        failures={},
+        pool_signature_before=(),
+    )
+    signature_reads = 0
+    rebuilds: list[bool] = []
+
+    async def signature(*_args, **_kwargs):
+        nonlocal signature_reads
+        signature_reads += 1
+        return ("new-node",)
+
+    async def remaining_sync(*_args, **kwargs):
+        assert kwargs["skip_sub_ids"] == {sub_id}
+        return bs.SyncResult(0, {}, {}, (), False, {})
+
+    async def runtime_is_ready(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(bs, "pool_signature", signature)
+    monkeypatch.setattr(bs, "sync_subscriptions", remaining_sync)
+    monkeypatch.setattr(bs, "runtime_ready", runtime_is_ready)
+    from app.domains.proxypool import scheduling
+    monkeypatch.setattr(scheduling, "request_rebuild", lambda: rebuilds.append(True))
+
+    async with get_session_factory()() as session:
+        result = await bs.handle_subscription_refresh(
+            session, data_dir=tmp_data_dir, runtime=object(), exe_path="mihomo",
+            now=NOW, sync_result=sync,
+        )
+
+    assert signature_reads == 1
+    assert result.pool_changed is True
+    assert result.action == "rebuild_requested"
+    assert rebuilds == [True]
+
+
 # ══ 7. subscription_id 就是 proxy_subscriptions.id ══════════════
 @pytest.mark.asyncio
 async def test_subscription_id_is_proxy_subscriptions_id(
@@ -357,6 +442,7 @@ async def test_snapshot_sha_canonical_and_projection_after_persist(
     assert len(snaps) == 1
     canonical = snaps[0].sha256
     assert sync.snapshot_sha256[sub_id] == canonical
+    assert sync.snapshots[sub_id].sha256 == canonical
     assert (await _sub_row(sub_id)).snapshot_sha256 == canonical, "投影=事实源（成功后）"
 
     # 失败时不得写投影：先清空，再让抓取失败
@@ -452,14 +538,15 @@ async def test_sync_records_failure_without_crashing(tmp_data_dir, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_sync_subscriptions_downloads_concurrently(tmp_data_dir, monkeypatch):
-    """订阅下载并发进行：串行会被任意一条慢/失效订阅拖住，后面的只能干等。
-
-    失效订阅要逐通道试满超时，串行下整轮耗时等于各条之和。
-    """
+    """多订阅更新并发运行，同时限制整轮的活动下载数量。"""
     await init_db()
-    await _add_subscription("https://a.invalid/1")
-    await _add_subscription("https://b.invalid/2")
-    await _add_subscription("https://c.invalid/3")
+    async with get_session_factory()() as session:
+        for index in range(8):
+            session.add(ProxySubscription(
+                kind="clash", url=f"https://sub{index}.invalid/{index}",
+                created_at=NOW, admission_status=ADMISSION_ACTIVE,
+            ))
+        await session.commit()
 
     live = 0
     peak = 0
@@ -480,8 +567,192 @@ async def test_sync_subscriptions_downloads_concurrently(tmp_data_dir, monkeypat
         sync = await bs.sync_subscriptions(s, data_dir=tmp_data_dir, now=NOW)
         await s.commit()
 
-    assert sync.subscription_count == 3
-    assert peak >= 2, f"订阅下载没有并发（峰值 {peak}）"
+    assert sync.subscription_count == 8
+    assert 2 <= peak <= 5, f"订阅抓取并发峰值不在有界范围内：{peak}"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_refreshes_of_same_subscription_share_one_fetch(
+    tmp_data_dir, monkeypatch,
+):
+    await init_db()
+    sub_id = await _add_subscription()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def fake_fetch(url, channels, **kwargs):
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return _fetch_ok([_node("one", "10.0.0.1")])
+
+    monkeypatch.setattr(bs, "fetch_subscription", fake_fetch)
+
+    async def run_sync():
+        async with get_session_factory()() as session:
+            return await bs.sync_subscriptions(
+                session, data_dir=tmp_data_dir, now=NOW, only_sub_id=sub_id,
+            )
+
+    first = asyncio.create_task(run_sync())
+    await started.wait()
+    second = asyncio.create_task(run_sync())
+    await asyncio.sleep(0)
+    release.set()
+    results = await asyncio.gather(first, second)
+
+    async with get_session_factory()() as session:
+        rows = list((await session.scalars(
+            select(SubscriptionSnapshot).where(SubscriptionSnapshot.subscription_id == sub_id)
+        )).all())
+    assert calls == 1
+    assert len(rows) == 1
+    assert all(not result.failures for result in results)
+
+
+@pytest.mark.asyncio
+async def test_refresh_discards_response_when_subscription_url_changes_in_flight(
+    tmp_data_dir, monkeypatch,
+):
+    await init_db()
+    sub_id = await _add_subscription()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_fetch(url, channels, **kwargs):
+        started.set()
+        await release.wait()
+        return _fetch_ok([_node("old", "10.0.0.1")])
+
+    monkeypatch.setattr(bs, "fetch_subscription", fake_fetch)
+
+    async def run_sync():
+        async with get_session_factory()() as session:
+            return await bs.sync_subscriptions(
+                session, data_dir=tmp_data_dir, now=NOW, only_sub_id=sub_id,
+            )
+
+    task = asyncio.create_task(run_sync())
+    await started.wait()
+    async with get_session_factory()() as session:
+        sub = await session.get(ProxySubscription, sub_id)
+        sub.url = "https://sub.invalid/renewed"
+        await session.commit()
+    release.set()
+    result = await task
+
+    async with get_session_factory()() as session:
+        snapshot_count = await session.scalar(
+            select(func.count(SubscriptionSnapshot.id)).where(
+                SubscriptionSnapshot.subscription_id == sub_id,
+            )
+        )
+        sub = await session.get(ProxySubscription, sub_id)
+    assert sub.url == "https://sub.invalid/renewed"
+    assert snapshot_count == 0
+    assert sub.snapshot_sha256 is None
+    assert result.failures[sub_id]
+
+
+@pytest.mark.asyncio
+async def test_provider_only_subscription_is_registered_from_canonical_snapshot(
+    tmp_data_dir, monkeypatch,
+):
+    from app.domains.proxypool.subscription import (
+        Channel, fetch_subscription, latest_snapshot,
+    )
+
+    await init_db()
+    sub_id = await _add_subscription("https://sub.invalid/provider")
+    root = yaml.safe_dump({
+        "proxy-providers": {
+            "edge": {"type": "http", "url": "https://provider.invalid/nodes?key=secret"}
+        },
+        "proxy-groups": [{"name": "All", "type": "select", "use": ["edge"]}],
+    }).encode()
+    provider = yaml.safe_dump({"proxies": [_node("edge-node", "edge.example.test")]})
+    provider_raw = provider.encode()
+
+    def factory(channel):
+        def handler(request):
+            if request.url.host == "sub.invalid":
+                return httpx.Response(200, content=root)
+            if request.url.host == "provider.invalid":
+                return httpx.Response(200, content=provider_raw)
+            return httpx.Response(502)
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def canonical_fetch(url, _channels, **kwargs):
+        return await fetch_subscription(
+            url, [Channel("direct")], client_factory=factory, **kwargs,
+        )
+
+    monkeypatch.setattr(bs, "fetch_subscription", canonical_fetch)
+    async with get_session_factory()() as session:
+        result = await bs.sync_subscriptions(
+            session, data_dir=tmp_data_dir, now=NOW, only_sub_id=sub_id,
+        )
+        assert not result.failures
+        assert result.node_count[sub_id] == 1
+        nodes = (await session.scalars(
+            select(ProxyNode).where(ProxyNode.subscription_id == sub_id)
+        )).all()
+        restored = await latest_snapshot(
+            session, sub_id, url="https://sub.invalid/provider",
+        )
+        await session.commit()
+
+    assert len(nodes) == 1 and nodes[0].original_name == "edge-node"
+    assert restored is not None and restored.nodes[0]["server"] == "edge.example.test"
+
+
+@pytest.mark.asyncio
+async def test_healthy_other_subscription_lane_is_a_fetch_egress(
+    tmp_data_dir, monkeypatch,
+):
+    """订阅 A 的抓取通道可借用另一条订阅 B 的近期业务健康出口。"""
+    from app.domains.proxies import clash_manager
+    from app.domains.proxypool import runtime as pool_runtime
+
+    await init_db()
+    async with get_session_factory()() as session:
+        session.add_all([
+            ProxySubscription(kind="clash", url="https://sub-a.invalid/a",
+                              created_at=NOW, admission_status=ADMISSION_ACTIVE),
+            ProxySubscription(kind="clash", url="https://sub-b.invalid/b",
+                              created_at=NOW, admission_status=ADMISSION_ACTIVE),
+        ])
+        session.add(ProxyNode(
+            node_id="b" * 20, fingerprint="b" * 64, runtime_name="2|B",
+            subscription_id=2, original_name="B", proxy_type="ss",
+            server="edge.example.test", exit_ip="203.0.113.10", state="ACTIVE",
+            last_l2_at=NOW, consecutive_failures=0,
+        ))
+        session.add(HealthObservation(
+            node_id="b" * 20, level="L2", ok=True, observed_at=NOW,
+        ))
+        await session.commit()
+
+        class RunningPool:
+            def status(self):
+                return {"running": True}
+
+        monkeypatch.setattr(clash_manager, "pool_runtime", RunningPool())
+        monkeypatch.setattr(pool_runtime, "lane_bindings", lambda _path: [{
+            "lane": 0, "url": "http://127.0.0.1:15555",
+            "exitIp": "203.0.113.10", "node": "2|B",
+        }])
+
+        channels = await bs._healthy_pool_channels(
+            session, data_dir=tmp_data_dir, now=NOW,
+        )
+
+    assert len(channels) == 1
+    assert channels[0].exit_ip == "203.0.113.10"
+    assert channels[0].egress_id == "exit:203.0.113.10"
+    assert channels[0].proxy == "http://127.0.0.1:15555"
 
 
 @pytest.mark.asyncio
@@ -507,6 +778,13 @@ async def test_sync_subscriptions_one_failure_does_not_block_others(
 
     assert len(sync.failures) == 1, "只有失败那条被记账"
     assert len(sync.snapshot_sha256) == 2, "其余两条照常落快照"
+    async with get_session_factory()() as session:
+        failed = (await session.execute(
+            select(SubscriptionSnapshot).where(SubscriptionSnapshot.status == "FAILED")
+        )).scalars().all()
+    assert len(failed) == 1
+    assert failed[0].error == "Client error '404 Not Found'"
+    assert failed[0].fetched_at == NOW
 
 
 @pytest.mark.asyncio
@@ -515,9 +793,11 @@ async def test_sync_subscriptions_one_failure_does_not_block_others(
 ])
 async def test_pool_signature_changes_with_connection_parameters(tmp_data_dir, field, value):
     await init_db()
+    subscription_id = await _add_subscription()
     async with get_session_factory()() as session:
         node = ProxyNode(node_id="connection", fingerprint="identity",
-                         runtime_name="1|connection", subscription_id=1,
+                         runtime_name=f"{subscription_id}|connection",
+                         subscription_id=subscription_id,
                          proxy_type="ss", server="edge.example.test",
                          original_name="connection", state="ACTIVE",
                          normalized_config={"name": "connection", "type": "ss",

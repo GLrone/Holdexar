@@ -14,11 +14,11 @@ import asyncio
 import hashlib
 import json
 import logging
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import yaml
@@ -50,17 +50,27 @@ from app.domains.proxypool.runtime import (
     wait_proxy_names,
 )
 from app.domains.proxypool.subscription import (
+    Channel,
     build_channels,
     build_snapshot,
+    fetch_egress_success_scores,
     fetch_subscription,
     parse_nodes,
+    persist_fetch_failure,
     persist_snapshot,
+    preferred_fetch_egresses,
+    saved_proxy_channels,
+    subscription_url_identity,
 )
 from app.domains.proxypool.models import subscription_tag
 
 _single_flight = asyncio.Lock()
+_subscription_sync_locks: dict[int, asyncio.Lock] = {}
 
 logger = logging.getLogger(__name__)
+
+MAX_CONCURRENT_SUBSCRIPTION_FETCHES = 5
+POOL_FETCH_HEALTH_MAX_AGE = timedelta(hours=72)
 
 
 @dataclass(frozen=True)
@@ -74,6 +84,8 @@ class SyncResult:
     # 本次只落快照、**未进 Registry** 的订阅（生产准入为 CANDIDATE）。
     # 事实留存（快照 + 字节），生产侧无感：不产生节点/来源、不进 eligible、不改签名。
     skipped_candidates: tuple[int, ...] = ()
+    snapshots: dict[int, object] = field(default_factory=dict)
+    pool_signature_before: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +96,80 @@ class BootstrapResult:
     controller_url: str | None
     pool_names: tuple[str, ...]
     detail: str
+
+
+async def _healthy_pool_channels(session: AsyncSession, *, data_dir: Path,
+                                 now: datetime) -> list:
+    """Return live pool lanes backed by a recent successful L2 observation."""
+    from app.domains.proxies import clash_manager
+    from app.domains.proxypool.models import HealthObservation, ProxyNode
+    from app.domains.proxypool.runtime import lane_bindings
+    from app.domains.proxypool.state import NODE_ACTIVE
+    from app.domains.proxypool.subscription import Channel, CHANNEL_POOL
+
+    try:
+        if not clash_manager.pool_runtime.status().get("running"):
+            return []
+        bindings = lane_bindings(data_dir)
+    except Exception:  # noqa: BLE001 —— an unavailable pool is not a fetch dependency
+        return []
+    lane_nodes = {
+        str(binding.get("node")): binding
+        for binding in bindings
+        if binding.get("node") and binding.get("exitIp") and binding.get("url")
+    }
+    if not lane_nodes:
+        return []
+
+    nodes = (
+        await session.execute(
+            select(ProxyNode).where(ProxyNode.runtime_name.in_(lane_nodes))
+        )
+    ).scalars().all()
+    by_name = {str(node.runtime_name): node for node in nodes}
+    node_ids = [str(node.node_id) for node in nodes]
+    latest_l2: dict[str, HealthObservation] = {}
+    if node_ids:
+        observations = (
+            await session.execute(
+                select(HealthObservation)
+                .where(HealthObservation.node_id.in_(node_ids))
+                .where(HealthObservation.level == "L2")
+                .order_by(HealthObservation.observed_at.desc(),
+                          HealthObservation.id.desc())
+            )
+        ).scalars().all()
+        for observation in observations:
+            latest_l2.setdefault(str(observation.node_id), observation)
+
+    cutoff = now - POOL_FETCH_HEALTH_MAX_AGE
+    channels: list[Channel] = []
+    used_exits: set[str] = set()
+    for runtime_name, binding in lane_nodes.items():
+        node = by_name.get(runtime_name)
+        if (
+            node is None
+            or node.state != NODE_ACTIVE
+            or int(node.consecutive_failures or 0) != 0
+            or str(node.exit_ip or "") != str(binding.get("exitIp") or "")
+        ):
+            continue
+        observation = latest_l2.get(str(node.node_id))
+        if (
+            observation is None
+            or not observation.ok
+            or observation.observed_at is None
+            or not cutoff <= observation.observed_at <= now
+        ):
+            continue
+        exit_ip = str(node.exit_ip)
+        if exit_ip in used_exits:
+            continue
+        used_exits.add(exit_ip)
+        channels.append(Channel(
+            CHANNEL_POOL, str(binding["url"]), f"exit:{exit_ip}", exit_ip,
+        ))
+    return channels
 
 
 async def subscription_sources(session: AsyncSession) -> list[ProxySubscription]:
@@ -99,20 +185,66 @@ async def subscription_sources(session: AsyncSession) -> list[ProxySubscription]
     return list(rows.scalars())
 
 
+def subscription_sync_lock(subscription_id: int) -> asyncio.Lock:
+    """Return the process-local lock shared by URL edits and subscription refreshes."""
+    return _subscription_sync_locks.setdefault(int(subscription_id), asyncio.Lock())
+
+
 async def sync_subscriptions(
     session: AsyncSession, *, data_dir: Path, now: datetime,
     kernel_proxy: str | None = None,
     pool_proxy: str | None = None,
     only_auto: bool = False,
     only_sub_id: int | None = None,
+    saved_proxies: list[str] | None = None,
+    skip_sub_ids: set[int] | None = None,
+) -> SyncResult:
+    if session.new or session.dirty or session.deleted:
+        raise RuntimeError("订阅同步不能复用含未提交修改的会话")
+    initial = await subscription_sources(session)
+    if only_sub_id is not None:
+        initial = [sub for sub in initial if sub.id == only_sub_id]
+    elif only_auto:
+        initial = [sub for sub in initial if _auto_refresh_on(sub)]
+    if skip_sub_ids:
+        initial = [sub for sub in initial if sub.id not in skip_sub_ids]
+    locked_ids = {int(sub.id) for sub in initial}
+    baseline = {
+        int(sub.id): (sub.last_fetch_at, open_url(sub.url) or "")
+        for sub in initial
+    }
+    locks = [subscription_sync_lock(sub_id) for sub_id in sorted(locked_ids)]
+    acquired: list[asyncio.Lock] = []
+    try:
+        for lock in locks:
+            await lock.acquire()
+            acquired.append(lock)
+        return await _sync_subscriptions_under_locks(
+            session, data_dir=data_dir, now=now, kernel_proxy=kernel_proxy,
+            pool_proxy=pool_proxy, only_auto=only_auto, only_sub_id=only_sub_id,
+            saved_proxies=saved_proxies, skip_sub_ids=skip_sub_ids,
+            locked_ids=locked_ids, baseline=baseline,
+        )
+    finally:
+        for lock in reversed(acquired):
+            lock.release()
+
+
+async def _sync_subscriptions_under_locks(
+    session: AsyncSession, *, data_dir: Path, now: datetime,
+    kernel_proxy: str | None,
+    pool_proxy: str | None,
+    only_auto: bool,
+    only_sub_id: int | None,
+    saved_proxies: list[str] | None,
+    skip_sub_ids: set[int] | None,
+    locked_ids: set[int],
+    baseline: dict[int, tuple[datetime | None, str]],
 ) -> SyncResult:
     """订阅 → 快照 → Registry。**Runtime 层不参与，也拿不到 subscription URL。**
 
-    生产准入（见 `admission.py`）：**CANDIDATE 在落完快照后停止**——不调用
-    `apply_snapshot`，因此不产生 ProxyNode、不进 eligible/pool、
-    不改 `pool_signature`、不触发 rebuild、不进健康与作业台账的来源事实；
-    它的证据仍然完整（`subscription_snapshots` 行 + 内容寻址字节）。
-    ACTIVE 保持既有行为（persist → apply）。
+    每份成功快照都会对齐节点身份与来源。CANDIDATE 仍由准入状态挡在生产池外，
+    但它的节点身份和健康证据可以与通用代理 Runtime 共用。
 
     抓取走既有通道链语义：`direct → kernel_proxy → pool_proxy → 本机混合端口`。
     直连被墙/超时是常态，所以 kernel_proxy（现有 Mihomo 内核的代理）是真实可用的
@@ -140,27 +272,68 @@ async def sync_subscriptions(
                 detail={"订阅编号": "、".join(str(i) for i in off)},
             )
         subs = auto_subs
-    before = await eligible_runtime_names(session)
+    if skip_sub_ids:
+        subs = [sub for sub in subs if sub.id not in skip_sub_ids]
+    subs = [sub for sub in subs if int(sub.id) in locked_ids]
+    for sub in subs:
+        await session.refresh(sub)
     shas: dict[int, str] = {}
     counts: dict[int, int] = {}
+    snapshots: dict[int, object] = {}
     failures: dict[int, str] = {}
     skipped: list[int] = []
-    channels = build_channels(kernel_proxy=kernel_proxy, pool_proxy=pool_proxy)
+    selected_count = len(subs)
+    coalesced: set[int] = set()
+    from app.domains.proxypool.subscription import latest_snapshot
 
-    # ── 并发下载（纯 I/O），落库仍串行（SQLite 单写者）──
-    # 串行下载会被任意一条慢/失效订阅拖住：失效订阅要逐通道试满超时，后面的订阅
-    # 只能干等；各订阅的抓取互相独立，先并发取回，再按原顺序串行落库（savepoint /
-    # 事件 / 投影语义完全不变）。订阅条数是个位数量级，一次性小扇出不设池。
-    sub_urls: dict[int, str] = {}
+    for sub in subs:
+        sub_id = int(sub.id)
+        prior_fetch_at, prior_url = baseline.get(sub_id, (None, ""))
+        current_url = open_url(sub.url) or ""
+        if current_url != prior_url or sub.last_fetch_at == prior_fetch_at:
+            continue
+        coalesced.add(sub_id)
+        if sub.last_fetch_status == "OK" and current_url:
+            snapshot = await latest_snapshot(session, sub_id, url=current_url)
+            if snapshot is not None:
+                snapshots[sub_id] = snapshot
+                shas[sub_id] = snapshot.sha256
+                counts[sub_id] = snapshot.node_count
+                continue
+        failures[sub_id] = sub.last_error or "并发刷新已完成，但没有可恢复的成功快照"
+    subs = [sub for sub in subs if int(sub.id) not in coalesced]
+    apply_ids = tuple(int(sub.id) for sub in subs)
+    healthy_pool_channels = await _healthy_pool_channels(
+        session, data_dir=data_dir, now=now,
+    )
+    channels = build_channels(
+        kernel_proxy=kernel_proxy, pool_proxy=pool_proxy,
+        pool_channels=healthy_pool_channels,
+    )
+    existing_proxies = {channel.proxy for channel in channels}
+    channels.extend(
+        channel for channel in saved_proxy_channels(saved_proxies or [])
+        if channel.proxy not in existing_proxies
+    )
+    # ── 有界并发下载（纯 I/O），落库仍串行（SQLite 单写者）──
+    sub_urls = {sub.id: open_url(sub.url) or "" for sub in subs}
     fetched: dict[int, object] = {}
+    readable_urls = {sid: url for sid, url in sub_urls.items() if url}
+    egress_scores = await fetch_egress_success_scores(session)
+    preferred_egresses = await preferred_fetch_egresses(session, readable_urls)
+    fetch_slots = asyncio.Semaphore(MAX_CONCURRENT_SUBSCRIPTION_FETCHES)
 
     async def _prefetch(sub) -> None:
-        url = open_url(sub.url)
-        sub_urls[sub.id] = url
+        url = sub_urls[sub.id]
         if not url:
             return
         try:
-            fetched[sub.id] = await fetch_subscription(url, channels)
+            async with fetch_slots:
+                fetched[sub.id] = await fetch_subscription(
+                    url, channels,
+                    preferred_egress=preferred_egresses.get(sub.id),
+                    egress_scores=egress_scores,
+                )
         except Exception as exc:  # noqa: BLE001 —— 失败在下方按订阅记账
             fetched[sub.id] = exc
 
@@ -168,7 +341,18 @@ async def sync_subscriptions(
 
     # 落库段进闸：并发下载已在闸外完成，闸内只允许本轮流库 I/O（savepoint /
     # 事件 / 投影）与收尾提交——网络等待进闸会横持写者位，饿死全体写。
+    await session.rollback()
     async with write_gate(WritePriority.BACKGROUND, label="subscription_apply"):
+        await session.execute(text("BEGIN IMMEDIATE"))
+        current = {
+            int(sub.id): sub for sub in await subscription_sources(session)
+            if int(sub.id) in set(apply_ids)
+        }
+        for missing_id in set(apply_ids) - set(current):
+            failures[missing_id] = "订阅在刷新期间已删除，本次结果未应用"
+        subs = [current[sub_id] for sub_id in apply_ids if sub_id in current]
+        before = await eligible_runtime_names(session)
+        signature_before = await pool_signature(session, data_dir=data_dir)
         for sub in subs:
             sub_id = sub.id  # 先取出来：savepoint 回滚后 ORM 对象会过期，不能再靠它
             try:
@@ -179,21 +363,48 @@ async def sync_subscriptions(
                     if not sub_url:
                         # 链接解不开（密钥属主机绑定）：本轮跳过并留原因，不伪装成抓取失败
                         skipped.append(sub_id)
-                        failures[sub_id] = UNREADABLE_MESSAGE
+                        message = UNREADABLE_MESSAGE
+                        failures[sub_id] = message
+                        await session.execute(
+                            update(ProxySubscription)
+                            .where(ProxySubscription.id == sub_id)
+                            .values(last_fetch_at=now, last_fetch_status="FAILED", last_error=message)
+                        )
+                        await events.record(
+                            events.KIND_SUBSCRIPTION_FAILED,
+                            f"订阅 {sub_id} 同步失败：{message}",
+                            level=events.LEVEL_WARN,
+                            payload={"subscriptionId": sub_id},
+                            session=session,
+                            now=now,
+                        )
                         continue
                     result = fetched.get(sub_id)
                     if isinstance(result, Exception):
                         raise result
                     if result is None:  # 预取缺失（不可达）：按失败记账，不静默丢
                         raise RuntimeError("订阅下载未返回结果")
-                    nodes = parse_nodes(result.raw, result.fmt)
+                    await session.refresh(sub)
+                    if (open_url(sub.url) or "") != sub_url:
+                        message = "订阅地址在刷新期间发生变化，本次结果未应用"
+                        failures[sub_id] = message
+                        await events.record(
+                            events.KIND_SUBSCRIPTION_FAILED,
+                            f"订阅 {sub_id} 旧地址的刷新结果已丢弃",
+                            level=events.LEVEL_WARN,
+                            payload={"subscriptionId": sub_id, "reason": "stale_url"},
+                            session=session,
+                            now=now,
+                        )
+                        continue
+                    nodes = result.resolved_nodes or parse_nodes(result.raw, result.fmt)
                     snap = build_snapshot(sub_id, sub_url, result, nodes, now=now)
                     await persist_snapshot(session, snap, data_dir=data_dir)
+                    snapshots[sub_id] = snap
                     # 准入判定必须**现读**：`subs` 是轮询开始时加载的，抓取可能耗时几十秒，
                     # 期间这条订阅可能已经被晋升（或本来就是候选）。用陈旧对象判定会出现：
                     # 同步落盘了更新的快照、却因为"当初是候选"而跳过 apply → 订阅已是 ACTIVE
                     # 而 Registry 仍停在旧快照。刷新一次再判，代价是一条 SELECT。
-                    await session.refresh(sub)
                     if result.userinfo is not None:
                         was_blocked = sub.resource_block_reason() is not None
                         sub.last_stats = {**(sub.last_stats or {}), "traffic": result.userinfo}
@@ -201,11 +412,11 @@ async def sync_subscriptions(
                             sub.deprecated = False
                             sub.deprecated_at = None
                             sub.deprecated_reason = None
+                    applied = await apply_snapshot(
+                        session, subscription_id=sub_id, snapshot=snap, now=now,
+                        tag=subscription_tag(sub_url),
+                    )
                     if is_admitted(sub):
-                        applied = await apply_snapshot(
-                            session, subscription_id=sub_id, snapshot=snap, now=now,
-                            tag=subscription_tag(sub_url),
-                        )
                         # 出库留痕：快照对齐删除的来源与随之结算的节点是最高频的
                         # 出库通道，零日志会让「这批节点为什么变 STALE」不可追溯
                         if applied.removed_sources or applied.state_changes:
@@ -251,6 +462,27 @@ async def sync_subscriptions(
                             )
             except Exception as exc:  # noqa: BLE001 —— 单条订阅失败不阻断其它
                 message = str(exc)[:500] or type(exc).__name__
+                fetch_error = fetched.get(sub_id)
+                if sub_urls.get(sub_id) and isinstance(fetch_error, Exception):
+                    attempts = getattr(fetch_error, "attempts", [])
+                    try:
+                        async with session.begin_nested():
+                            await persist_fetch_failure(
+                                session, subscription_id=sub_id,
+                                url=sub_urls[sub_id], attempts=attempts,
+                                error=message,
+                                duration_ms=getattr(fetch_error, "duration_ms", 0),
+                                now=now,
+                            )
+                            await session.flush()
+                    except Exception:  # noqa: BLE001 —— 原始失败投影仍需落地
+                        log_event(
+                            logger,
+                            f"订阅 {sub_id} 抓取失败明细保存失败",
+                            level=logging.ERROR,
+                            exc_info=True,
+                            detail={"订阅编号": sub_id},
+                        )
                 # savepoint 已把本条目回滚掉；失败用 Core UPDATE 记录，**不碰已过期的 ORM
                 # 对象**——真实生产已复现：flush 失败后再读 sub.* 会抛 PendingRollbackError，
                 # 于是原始失败反而没有被记录下来。
@@ -278,6 +510,7 @@ async def sync_subscriptions(
             sub.last_fetch_status = "OK"
             sub.last_success_at = now
             sub.last_error = None
+            sub.cache_url_identity = subscription_url_identity(sub_url)
             shas[sub.id] = snap.sha256
             counts[sub.id] = len(nodes)
 
@@ -287,13 +520,15 @@ async def sync_subscriptions(
 
     names = await eligible_runtime_names(session)
     return SyncResult(
-        subscription_count=len(subs),
+        subscription_count=selected_count,
         snapshot_sha256=shas,
         node_count=counts,
         pool_names=names,
         pool_changed=names != before,
         failures=failures,
         skipped_candidates=tuple(skipped),
+        snapshots=snapshots,
+        pool_signature_before=signature_before,
     )
 
 
@@ -574,6 +809,7 @@ async def handle_subscription_refresh(
     runtime: _KernelRuntime,
     exe_path: str,
     now: datetime,
+    sync_result: SyncResult | None = None,
 ) -> RefreshTriageResult:
     """订阅刷新后的严格分流（**绝不在这里 stop/start Runtime**）：
 
@@ -585,11 +821,22 @@ async def handle_subscription_refresh(
     """
     from app.domains.proxypool.scheduling import request_rebuild
 
-    before = await pool_signature(session, data_dir=data_dir)
-    sync = await sync_subscriptions(
-        session, data_dir=data_dir, now=now, only_auto=True
+    sync = sync_result
+    before = (
+        sync.pool_signature_before
+        if sync is not None and sync.pool_signature_before is not None
+        else await pool_signature(session, data_dir=data_dir)
     )
-    synced = bool(sync.snapshot_sha256)
+    remaining = await sync_subscriptions(
+        session, data_dir=data_dir, now=now, only_auto=True,
+        skip_sub_ids=(
+            set(sync.snapshot_sha256) | set(sync.failures)
+            if sync is not None else None
+        ),
+    )
+    synced = bool(
+        remaining.snapshot_sha256 or (sync is not None and sync.snapshot_sha256)
+    )
     if not synced:
         return RefreshTriageResult(False, False, "none", None)
 

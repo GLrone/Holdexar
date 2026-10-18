@@ -267,6 +267,41 @@ async def test_refresh_keeps_user_label(db, monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cached", "userinfo"),
+    [(True, USERINFO), (False, None)],
+)
+async def test_traffic_refresh_rejects_cached_or_missing_header(
+    db, monkeypatch, tmp_path, cached, userinfo,
+):
+    sub_id = await _seed_sub(db)
+    cfg = _stub_runtime(monkeypatch, tmp_path, subscription_url=SUB_URL)
+
+    async def _fake_download(url, data_dir, proxy_url=None, *, target_path=None):
+        cfg.write_text(_config_text(), encoding="utf-8")
+        return {
+            "path": str(cfg), "title": None, "userinfo": userinfo,
+            "nodes": 2, "cached": cached,
+        }
+
+    monkeypatch.setattr(clash_manager.runtime, "download_subscription", _fake_download)
+    previous = {"traffic": "upload=1; download=2; total=3", "nodes": 2}
+    async with db() as session:
+        sub = await session.get(ProxySubscription, sub_id)
+        sub.last_stats = previous
+        await session.commit()
+
+    with pytest.raises(ValueError, match="在线流量头"):
+        await proxies_service.refresh_clash_subscription(
+            sub_id, _require_fresh_traffic=True
+        )
+
+    async with db() as session:
+        sub = await session.get(ProxySubscription, sub_id)
+        assert sub.last_stats == previous
+
+
+@pytest.mark.asyncio
 async def test_refresh_uses_saved_proxies_after_direct(db, monkeypatch, tmp_path):
     """直连失败自动借道项目保存的可用代理：候选传入下载通道（排在直连后）。"""
     from app.domains.proxies.models import Proxy

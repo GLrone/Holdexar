@@ -17,7 +17,7 @@ from apscheduler.events import EVENT_JOB_MAX_INSTANCES, EVENT_JOB_MISSED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app.core.external_time import local_next_grid, probe_next_grid
-from app.core.database import WritePriority, get_session_factory, write_gate, write_session
+from app.core.database import WritePriority, write_gate, write_session
 from app.core.logging import log_event
 
 logger = logging.getLogger(__name__)
@@ -304,7 +304,6 @@ async def _stamp_uncrawled_missing(appids: list[int]) -> int:
     from sqlalchemy import select as _select
     from sqlalchemy.dialects.sqlite import insert as _insert
 
-    from app.core.database import get_session_factory
     from app.domains.games.models import Game, GameCurrentPrice
     from app.crawler.utils import get_beijing_time_obj
 
@@ -825,22 +824,8 @@ _REFRESH_STAGGER = timedelta(minutes=4)
 _BILLS_STAGGER = timedelta(minutes=2)
 
 
-async def _startup_pool_runtime() -> None:
-    """启动链的一步：首次建立池 Runtime（bootstrap 原语）+ **首轮出口身份发现**。
-
-    **失败绝不让应用启动失败**：没有订阅 / 下载失败 / 解析失败 / 内核起不来，都只是
-    "Runtime 不可用 → crawler 保持 fail-closed"，应用与调度器继续跑，30min 后的订阅
-    刷新就是下一次 bootstrap 机会。否则会把"失败下周期再试"的设计自己破坏掉。
-
-    顺序是契约的一部分（本步在 `start_scheduler()` 之前，因此它跑完前不会有任何价格
-    刷新）：
-
-        bootstrap → Runtime ready → 有界 L1（建出口身份）
-                  → 出口集变化则重建（listener 数对齐出口槽）→ 交出 Runtime
-
-    少了中间两步，首次价格刷新会在"一个出口 IP 都没探到"的状态下开跑，容量模型退化
-    成按节点计（真实链路上出现过：首轮 job 的 `pool_exit_ip_count` 为 NULL）。
-    """
+async def _startup_pool_runtime(*, skip_sync: bool = False) -> None:
+    """Prepare the pool Runtime and discover exit identities."""
     from datetime import datetime
 
     from app.core.config import get_settings
@@ -859,14 +844,14 @@ async def _startup_pool_runtime() -> None:
         async with get_session_factory()() as session:
             result = await _bs.ensure_pool_runtime(
                 session, data_dir=data_dir, runtime=_cm.pool_runtime,
-                exe_path=exe_path, now=datetime.now(),
+                exe_path=exe_path, now=datetime.now(), skip_sync=skip_sync,
             )
         log_event(
             logger,
             "代理池运行时已就绪" if result.ready else "代理池运行时不可用",
             detail={"详情": result.detail},
         )
-        if not result.ready:
+        if not result.ready or not result.bootstrapped:
             return
 
         # ── 首轮出口身份发现：只探没有 exit_ip 的节点，有界（节点数 + 时间预算）──
@@ -922,16 +907,8 @@ async def _startup_pool_runtime() -> None:
         )
 
 
-async def _startup_subscription_sync() -> None:
-    """启动链的一步：订阅同步（排在池 Runtime 就位**之后**，只刷自动更新的订阅）。
-
-    内核就位不等订阅下载——bootstrap 冷路径直接吃持久化 Registry 起核，本步
-    按 30min 刷新同一口径拉一遍（`only_auto=True`：限时订阅关了自动更新就不在
-    启动时撞死链，换链接后的重拉是用户的手动动作）。池签名变化 → 置
-    `rebuild_pending` 并就地消费一次（热重载优先，启动期 crawler 必然空闲）；
-    Runtime 尚不可用时不消费——把它拉起来是 bootstrap 的职责，交给 30min 刷新
-    的 `ensure_pool_runtime`。失败只留日志：下一拍订阅刷新是下一次机会。
-    """
+async def _startup_subscription_sync():
+    """Refresh automatic subscription snapshots and request a pool rebuild if needed."""
     from datetime import datetime
 
     from app.core.config import get_settings
@@ -957,7 +934,7 @@ async def _startup_subscription_sync() -> None:
                 "启动时订阅同步完成，代理池配置无变化",
                 detail={"失败订阅数": failed},
             )
-            return
+            return sync
         try:
             base, secret = controller_endpoint_of(data_dir)
         except (RuntimeConfigError, OSError):
@@ -965,7 +942,7 @@ async def _startup_subscription_sync() -> None:
                 logger,
                 "订阅同步后代理池配置有变化，但运行时未就绪，重建交由订阅刷新链处理",
             )
-            return
+            return sync
         _sched.request_rebuild()
         # 重建段零 DB 写入（文件渲染+内核操作），不持闸
         async with get_session_factory()() as session:
@@ -981,6 +958,7 @@ async def _startup_subscription_sync() -> None:
                 "失败订阅数": failed,
             },
         )
+        return sync
     except Exception:  # noqa: BLE001
         log_event(
             logger,
@@ -988,6 +966,7 @@ async def _startup_subscription_sync() -> None:
             level=logging.ERROR,
             exc_info=True,
         )
+        return None
 
 
 async def _exit_snapshot_or_empty() -> dict:
@@ -1158,8 +1137,10 @@ async def _job_subscription_refresh() -> None:
             detail={"原因": "爬虫占线"},
         )
         return
+    sync_result = None
     try:
         result = await proxies_service.maybe_refresh_active_clash_subscription()
+        sync_result = result.get("_syncResult")
     except Exception:  # noqa: BLE001
         log_event(logger, "代理订阅重拉异常", level=logging.ERROR, exc_info=True)
     else:
@@ -1204,6 +1185,7 @@ async def _job_subscription_refresh() -> None:
             triage = await _bs.handle_subscription_refresh(
                 session, data_dir=data_dir, runtime=_cm.pool_runtime,
                 exe_path=str(_cm.kernel_exe(data_dir)), now=datetime.now(),
+                sync_result=sync_result,
             )
         log_event(
             logger,

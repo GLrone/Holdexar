@@ -92,6 +92,7 @@ class ProxySubscription(Base):
     last_error: Mapped[str | None] = mapped_column(String(500))
     snapshot_sha256: Mapped[str | None] = mapped_column(String(64))
     snapshot_version: Mapped[int] = mapped_column(Integer, default=0)
+    cache_url_identity: Mapped[str | None] = mapped_column(String(64))
     # 自动更新订阅：False = 定时刷新跳过它，只保留手动重拉。
     # 限时订阅（只在窗口内可下载、下载后长期可用）关掉即不再每轮撞失败。
     auto_refresh: Mapped[bool] = mapped_column(
@@ -118,12 +119,7 @@ class ProxySubscription(Base):
 
 
 class ClashNode(Base):
-    """Clash 节点级状态账本（2026-09 节点状态存储）。
-
-    每次 test_clash_nodes 的逐节点结果 UPSERT 到这里；跨重启持久，
-    体检门槛（6h）、冷却递增、dead 三连复活都以此表为唯一事实源。
-    status: ok（通 Steam）| dead（累计失败转终态，3-of-3 连测通过才复活）
-    """
+    """Clash 节点 UI 投影与体检节流时间；健康状态事实归 ProxyNode。"""
 
     __tablename__ = "clash_nodes"
 
@@ -131,10 +127,10 @@ class ClashNode(Base):
     subscription_id: Mapped[int] = mapped_column(Integer)  # proxy_subscriptions.id
     name: Mapped[str] = mapped_column(String(255))
     exit_ip: Mapped[str | None] = mapped_column(String(64))
-    status: Mapped[str] = mapped_column(String(10), default="unknown")  # ok|dead|unknown
+    status: Mapped[str] = mapped_column(String(10), default="unknown")  # ProxyNode.state 投影
     latency_ms: Mapped[int | None] = mapped_column(Integer)
-    fail_count: Mapped[int] = mapped_column(Integer, default=0)  # 累计失败（10 → dead）
-    revive_passes: Mapped[int] = mapped_column(Integer, default=0)  # dead 后连续通过计数（3 → 复活）
+    fail_count: Mapped[int] = mapped_column(Integer, default=0)  # ProxyNode.consecutive_failures 投影
+    revive_passes: Mapped[int] = mapped_column(Integer, default=0)  # 兼容字段，恒为 0
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime)
     cooldown_until: Mapped[datetime | None] = mapped_column(DateTime)  # 冷却期内跳过检测
     created_at: Mapped[datetime | None] = mapped_column(DateTime)

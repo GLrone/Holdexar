@@ -244,7 +244,10 @@ async def test_interleave_sync_then_promote(tmp_data_dir, monkeypatch):
 
     # 第一轮（候选）：S1 快照落盘，Registry 一行不建
     await _sync(tmp_data_dir)
-    assert (await _counts())[:2] == (0, 0)
+    assert (await _counts())[:2] == (2, 2)
+    from app.domains.proxypool.pool import eligible_nodes
+    async with get_session_factory()() as session:
+        assert await eligible_nodes(session) == []
 
     # 第二轮卡在抓取处
     task = asyncio.create_task(_sync(tmp_data_dir))
@@ -336,10 +339,10 @@ async def test_promote_boundary_first_sync_waits_then_applies_newest(
 async def test_promote_applies_newest_when_sync_lands_before_boundary(
     tmp_data_dir, monkeypatch
 ):
-    """初始：候选 + Snapshot A + Registry 空。
+    """初始：候选 + Snapshot A + 节点身份已登记但未获准进入生产池。
 
       T1 Promote 启动 → **暂停在取边界之前**
-      T2 Sync 完整跑一轮：落盘更新的 Snapshot B，因仍是候选而跳过 apply
+      T2 Sync 完整跑一轮：落盘并登记更新的 Snapshot B，生产池仍由准入状态阻挡
       T1 继续 → 取边界 → 读到的已是最新 B → 必须应用 B 之后才允许 ACTIVE
 
     修复前：T1 拿着 A 进入 apply → 被"最新快照胜"守卫跳过 → 仍写 ACTIVE
@@ -355,8 +358,8 @@ async def test_promote_applies_newest_when_sync_lands_before_boundary(
         return _fetch_result(nodes_a)
 
     monkeypatch.setattr(bs, "fetch_subscription", _fetch_a)
-    await _sync_at(tmp_data_dir, NOW)  # Snapshot A（候选 → 只落快照）
-    assert await _source_fps(sub_id) == set()
+    await _sync_at(tmp_data_dir, NOW)
+    assert await _source_fps(sub_id) == _fps(nodes_a, await _sub_url(sub_id))
 
     import app.domains.proxypool.admission as adm
 
@@ -376,14 +379,14 @@ async def test_promote_applies_newest_when_sync_lands_before_boundary(
     task = asyncio.create_task(_promote(sub_id, tmp_data_dir))
     await asyncio.wait_for(started.wait(), 5)
 
-    # 并发 sync 完整一轮：B 落盘 + 候选跳过
+    # 并发 sync 完整一轮：B 落盘并更新节点身份，生产池仍排除该候选
     async def _fetch_b(url, channels, **kw):
         return _fetch_result(nodes_b)
 
     monkeypatch.setattr(bs, "fetch_subscription", _fetch_b)
     await _sync_at(tmp_data_dir, later)
     assert await _status(sub_id) == ADMISSION_CANDIDATE
-    assert await _source_fps(sub_id) == set(), "候选跳过，Registry 仍空"
+    assert await _source_fps(sub_id) == _fps(nodes_b, await _sub_url(sub_id))
 
     go.set()
     await asyncio.wait_for(task, timeout=20)
@@ -399,7 +402,7 @@ async def test_promote_never_active_when_apply_is_skipped_stale(
     tmp_data_dir, monkeypatch
 ):
     """把已被取代的 S1 硬塞给 promote（打桩 latest_snapshot）→ apply 必被判
-    `skipped_stale` → promote 必须**失败并保持 CANDIDATE**，Registry 保持空。
+    `skipped_stale` → promote 必须**失败并保持 CANDIDATE**，Registry 保持较新的快照。
     这条直接钉死"skipped_stale 后照样 ACTIVE"。
     """
     await init_db()
@@ -410,6 +413,7 @@ async def test_promote_never_active_when_apply_is_skipped_stale(
 
     snap_a = await _persist_nodes(sub_id, nodes_a, NOW, tmp_data_dir)
     await _persist_nodes(sub_id, nodes_b, later, tmp_data_dir)  # 更新的 B 已在库里
+    await _apply_snapshot_nodes(sub_id, nodes_b, tmp_data_dir)
 
     import app.domains.proxypool.admission as adm
 
@@ -424,7 +428,7 @@ async def test_promote_never_active_when_apply_is_skipped_stale(
             )
         await s.rollback()
     assert await _status(sub_id) == ADMISSION_CANDIDATE, "必须保持候选"
-    assert await _source_fps(sub_id) == set(), "不得留下任何来源"
+    assert await _source_fps(sub_id) == _fps(nodes_b, await _sub_url(sub_id))
 
 
 # ══ C. 两份不同快照交错：最终严格等于最后生效那份，绝不是并集 ═══════

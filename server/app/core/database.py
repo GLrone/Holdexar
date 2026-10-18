@@ -178,6 +178,7 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "last_error": "VARCHAR(500)",
         "snapshot_sha256": "VARCHAR(64)",
         "snapshot_version": "INTEGER DEFAULT 0",
+        "cache_url_identity": "VARCHAR(64)",
         # 生产准入（订阅级）：库层默认 ACTIVE —— **只为把已存在的历史行兼容成
         # ACTIVE**；新行由模型默认 CANDIDATE（见 proxies/models.py 常量说明）。
         "admission_status": "VARCHAR(16) DEFAULT 'ACTIVE'",
@@ -192,11 +193,17 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
     },
     "subscription_snapshots": {
         "url": "VARCHAR(500)",
-        # 模型里有、但更早建成的库里缺这 3 列：不登记则首次真实同步 INSERT 直接
-        # 报 "no column named http_status"。登记后启动幂等补齐。
+        # 模型里有、但更早建成的库里缺这些列：登记后启动幂等补齐。
         "http_status": "INTEGER",
         "content_type": "VARCHAR(100)",
         "source_channel": "VARCHAR(32)",
+        "source_egress": "VARCHAR(100)",
+        "profile_title": "VARCHAR(100)",
+        "content_disposition": "VARCHAR(255)",
+        "userinfo": "VARCHAR(500)",
+        "duration_ms": "INTEGER",
+        "attempts_json": "TEXT",
+        "provider_nodes_json": "TEXT",
     },
     # account 域多账号在线状态（GetPlayerSummaries/miniprofile 双通道）
     "steam_accounts": {
