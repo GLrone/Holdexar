@@ -1564,6 +1564,18 @@ def parse_plain_proxy_line(line: str) -> dict | None:
     return None
 
 
+def _parse_plain_proxy_content(raw: bytes, _fmt: str) -> list[dict]:
+    parsed = []
+    for line in raw.decode("utf-8").splitlines():
+        try:
+            item = parse_plain_proxy_line(line)
+        except (TypeError, ValueError):
+            continue
+        if item:
+            parsed.append(item)
+    return parsed
+
+
 async def import_plain_subscription(sub_id: int, timeout: float = 30.0) -> dict:
     """拉取明文代理订阅并导入节点池（按 host:port:user 去重）。"""
     sub = await get_subscription(sub_id)
@@ -1574,24 +1586,90 @@ async def import_plain_subscription(sub_id: int, timeout: float = 30.0) -> dict:
     sub_url = open_url(sub.url)
     if not sub_url:
         raise ValueError(UNREADABLE_MESSAGE)
-    # 订阅源直连大多被墙：代理优先（内核在跑走内核，其次池，最后直连）
-    proxy = None
-    try:
-        proxy = await resolve_proxy_url()
-    except Exception:  # noqa: BLE001
-        proxy = None
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, proxy=proxy, trust_env=False) as client:
-        resp = await client.get(sub_url)
-        resp.raise_for_status()
-        text = resp.text
+    from app.core.config import get_settings
+    from app.domains.proxypool.bootstrap import _healthy_pool_channels, default_kernel_proxy
+    from app.domains.proxypool.subscription import (
+        DEFAULT_FETCH_TIMEOUT,
+        SnapshotError,
+        build_channels,
+        build_snapshot,
+        fetch_egress_success_scores,
+        fetch_subscription,
+        persist_fetch_failure,
+        persist_snapshot,
+        saved_proxy_channels,
+        subscription_url_identity,
+    )
 
-    parsed = []
-    for line in text.splitlines():
-        item = parse_plain_proxy_line(line)
-        if item:
-            parsed.append(item)
+    settings = get_settings()
+    fetched_at = _naive(get_beijing_time_obj())
+    async with get_session_factory()() as session:
+        pool_channels = await _healthy_pool_channels(
+            session, data_dir=settings.data_dir, now=fetched_at,
+        )
+        egress_scores = await fetch_egress_success_scores(session)
+    channels = build_channels(
+        kernel_proxy=default_kernel_proxy(), pool_channels=pool_channels,
+    )
+    existing_channels = {channel.proxy for channel in channels}
+    channels.extend(
+        channel for channel in saved_proxy_channels(await _saved_proxy_candidates())
+        if channel.proxy not in existing_channels
+    )
+    try:
+        fetched = await fetch_subscription(
+            sub_url,
+            channels,
+            request_timeout=min(DEFAULT_FETCH_TIMEOUT, max(0.1, float(timeout))),
+            egress_scores=egress_scores,
+            response_parser=_parse_plain_proxy_content,
+        )
+    except SnapshotError as exc:
+        fetched_at = _naive(get_beijing_time_obj())
+        async with write_session(WritePriority.BACKGROUND) as session:
+            current = await session.get(ProxySubscription, sub_id)
+            if current is not None and open_url(current.url) == sub_url:
+                current.last_fetch_at = fetched_at
+                current.last_fetch_status = "FAILED"
+                current.last_error = str(exc)[:500]
+                await persist_fetch_failure(
+                    session, subscription_id=sub_id, url=sub_url,
+                    attempts=getattr(exc, "attempts", []), error=str(exc),
+                    duration_ms=getattr(exc, "duration_ms", 0), now=fetched_at,
+                )
+                await session.commit()
+        await record_event(
+            kind="import", target=f"plain:{sub_id}",
+            proxy_label=f"plain:{sub_id}",
+            status_code=next((a.http_status for a in reversed(getattr(exc, "attempts", []))
+                              if a.http_status is not None), None),
+            duration_ms=getattr(exc, "duration_ms", 0), error=str(exc),
+        )
+        raise ValueError(str(exc)) from exc
+
+    parsed = [
+        {
+            **item,
+            "scheme": item.get("scheme") or "http",
+            "username": item.get("username"),
+            "password": item.get("password"),
+        }
+        for item in fetched.resolved_nodes
+    ]
     if not parsed:
         raise ValueError("订阅内容没有可解析的代理行")
+
+    snapshot = build_snapshot(sub_id, sub_url, fetched, parsed, now=fetched_at)
+    async with write_session(WritePriority.BACKGROUND) as session:
+        current = await session.get(ProxySubscription, sub_id)
+        if current is None or open_url(current.url) != sub_url:
+            raise ValueError("订阅地址在刷新期间发生变化，本次结果未应用")
+        await persist_snapshot(session, snapshot, data_dir=settings.data_dir)
+        current.cache_url_identity = subscription_url_identity(sub_url)
+        current.last_fetch_at = fetched_at
+        current.last_fetch_status = "OK"
+        current.last_error = None
+        await session.commit()
 
     existing = {(p.host, p.port, p.username or "") for p in await list_proxies()}
     existing_before_add = set(existing)
@@ -1642,7 +1720,8 @@ async def import_plain_subscription(sub_id: int, timeout: float = 30.0) -> dict:
         )
     await mark_imported(sub_id, stats)
     await record_event(
-        kind="import", target=sub_url, proxy_label=f"plain:{sub_id}", error=None
+        kind="import", target=f"plain:{sub_id}", proxy_label=f"plain:{sub_id}",
+        status_code=fetched.http_status, duration_ms=fetched.duration_ms, error=None,
     )
     # 订阅有效（体检有存活节点）且用户处在默认直连 → 自动切代理优先
     if stats.get("alive") and await maybe_autoswitch_on_subscription(stats["alive"]):

@@ -20,6 +20,7 @@ from app.core.database import Base
 from app.domains.proxies import clash_manager, service as proxies_service
 from app.domains.proxies.subscription_secret import open_url
 from app.domains.proxies.models import ClashNode, Proxy, ProxySubscription
+from app.domains.proxypool import subscription as subscription_core
 from app.domains.settings import service as settings_service
 
 SUB_URL = "https://example.com/sub?token=abc"
@@ -586,15 +587,7 @@ async def test_apply_node_results_records_alive(db):
 
 
 async def _stub_sub_fetch(monkeypatch, text: str) -> None:
-    """明文订阅拉取桩：resolve 直连（同域内既有桩法），GET 返回固定行集。"""
-
-    class _Resp:
-        status_code = 200
-        raise_for_status = staticmethod(lambda: None)
-
-        @property
-        def text(self):
-            return text
+    """明文订阅响应桩：通过共享下载器的 direct 通道返回固定行集。"""
 
     class _Client:
         def __init__(self, **kw):
@@ -606,10 +599,17 @@ async def _stub_sub_fetch(monkeypatch, text: str) -> None:
         async def __aexit__(self, *exc):
             return False
 
-        async def get(self, url):
-            return _Resp()
+        async def get(self, url, headers=None):
+            return httpx.Response(
+                200, content=text.encode("utf-8"),
+                headers={"content-type": "text/plain"},
+            )
 
-    monkeypatch.setattr(proxies_service, "resolve_proxy_url", _no_proxy)
+    monkeypatch.setattr(
+        subscription_core, "build_channels", lambda **_kwargs: [
+            subscription_core.Channel("direct", None, "direct")
+        ],
+    )
     monkeypatch.setattr(proxies_service.httpx, "AsyncClient", _Client)
 
 
@@ -712,6 +712,75 @@ async def test_import_plain_check_errors_do_not_break_stats(db, monkeypatch):
 
         rows = (await session.execute(select(Proxy))).scalars().all()
     assert len(rows) == 1 and rows[0].status == "unknown"  # 行保留，未被删除
+
+
+@pytest.mark.asyncio
+async def test_import_plain_uses_shared_subscription_fetcher(db, monkeypatch):
+    sub_id = await _add_sub(db, kind="plain")
+    await _stub_single_check(monkeypatch, {("8.8.8.8", 3128): ("ok", 120)})
+    calls = []
+
+    async def _fetch(url, channels, **options):
+        calls.append((url, channels, options))
+        return subscription_core.FetchResult(
+            raw=b"8.8.8.8:3128\n", http_status=200,
+            content_type="text/plain", channel="direct",
+            fmt=subscription_core.FORMAT_UNKNOWN,
+            resolved_nodes=[{"scheme": "http", "host": "8.8.8.8", "port": 3128}],
+        )
+
+    monkeypatch.setattr(subscription_core, "fetch_subscription", _fetch)
+    monkeypatch.setattr(
+        subscription_core, "build_channels", lambda **_kwargs: [
+            subscription_core.Channel("direct", None, "direct")
+        ],
+    )
+
+    stats = await proxies_service.import_plain_subscription(sub_id)
+
+    assert stats["fetched"] == 1 and stats["alive"] == 1
+    assert len(calls) == 1
+    assert calls[0][2].get("response_parser") is not None
+
+
+@pytest.mark.asyncio
+async def test_plain_import_failure_keeps_last_success_snapshot(db, monkeypatch):
+    from sqlalchemy import select
+    from app.domains.proxypool.models import SubscriptionSnapshot
+
+    sub_id = await _add_sub(db, kind="plain")
+    async with db() as session:
+        session.add(SubscriptionSnapshot(
+            subscription_id=sub_id, sha256="a" * 64, format="unknown",
+            raw_path="last-success.bin", url="sealed", node_count=1,
+            status="OK", fetched_at=datetime(2026, 10, 1),
+        ))
+        await session.commit()
+
+    async def _fail(*_args, **_kwargs):
+        raise subscription_core.FetchFailedError(
+            SUB_URL,
+            [subscription_core.FetchAttempt(
+                "direct", False, None, subscription_core.FORMAT_UNKNOWN,
+                "request_timeout", "timeout", 12000, "direct",
+            )],
+            duration_ms=12000,
+        )
+
+    monkeypatch.setattr(subscription_core, "fetch_subscription", _fail)
+    with pytest.raises(ValueError, match="订阅抓取失败"):
+        await proxies_service.import_plain_subscription(sub_id)
+
+    async with db() as session:
+        snapshots = (await session.scalars(
+            select(SubscriptionSnapshot)
+            .where(SubscriptionSnapshot.subscription_id == sub_id)
+            .order_by(SubscriptionSnapshot.id)
+        )).all()
+    assert [item.status for item in snapshots] == ["OK", "FAILED"]
+    assert snapshots[0].sha256 == "a" * 64
+    assert snapshots[0].raw_path == "last-success.bin"
+    assert (await _get_sub(db, sub_id)).last_fetch_status == "FAILED"
 
 
 # ── 订阅自动取名链（行为对齐：profile-title → Content-Disposition → URL 末段）──

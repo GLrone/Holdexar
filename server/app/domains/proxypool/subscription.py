@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib.parse import urlsplit
 
 import httpx
@@ -436,8 +436,12 @@ def default_client_factory(channel: Channel, *, timeout: float = DEFAULT_FETCH_T
     )
 
 
-def _validate_fetch_response(resp: httpx.Response, channel: Channel, elapsed_ms: int
-                             ) -> tuple[FetchResult | None, FetchAttempt, str | None]:
+def _validate_fetch_response(
+    resp: httpx.Response,
+    channel: Channel,
+    elapsed_ms: int,
+    response_parser: Callable[[bytes, str], list[dict]] | None = None,
+) -> tuple[FetchResult | None, FetchAttempt, str | None]:
     raw = resp.content
     egress_id = channel.egress_id or channel.name
     if resp.status_code != 200:
@@ -461,6 +465,7 @@ def _validate_fetch_response(resp: httpx.Response, channel: Channel, elapsed_ms:
             egress_id=egress_id,
         ), "invalid_utf8"
 
+    parsed_nodes: list[dict] | None = None
     if fmt == FORMAT_YAML:
         try:
             parse_nodes(raw, fmt)
@@ -485,6 +490,17 @@ def _validate_fetch_response(resp: httpx.Response, channel: Channel, elapsed_ms:
                 error="invalid_provider_subscription", stage="validation",
                 elapsed_ms=elapsed_ms, egress_id=egress_id,
             ), fmt
+    elif response_parser is not None and fmt in {FORMAT_URI, FORMAT_UNKNOWN}:
+        try:
+            parsed_nodes = response_parser(raw, fmt)
+        except (UnicodeError, ValueError, TypeError):
+            parsed_nodes = []
+        if not parsed_nodes:
+            return None, FetchAttempt(
+                channel.name, False, resp.status_code, fmt,
+                error="invalid_subscription_content", stage="validation",
+                elapsed_ms=elapsed_ms, egress_id=egress_id,
+            ), "invalid_subscription_content"
     else:
         return None, FetchAttempt(
             channel.name, False, resp.status_code, fmt,
@@ -506,6 +522,8 @@ def _validate_fetch_response(resp: httpx.Response, channel: Channel, elapsed_ms:
     )
     if fmt == FORMAT_YAML:
         result.resolved_nodes = parse_nodes(raw, fmt)
+    elif parsed_nodes is not None:
+        result.resolved_nodes = parsed_nodes
     return result, FetchAttempt(
         channel.name, True, resp.status_code, fmt, stage="complete",
         elapsed_ms=elapsed_ms, egress_id=egress_id,
@@ -764,6 +782,7 @@ async def fetch_subscription(
     max_parallel_channels: int = DEFAULT_FETCH_PARALLELISM,
     preferred_egress: str | None = None,
     egress_scores: Mapping[str, float] | None = None,
+    response_parser: Callable[[bytes, str], list[dict]] | None = None,
 ) -> FetchResult:
     """有限竞速，返回第一份格式和节点内容都有效的订阅。"""
     ordered = list(channels)
@@ -827,7 +846,9 @@ async def fetch_subscription(
                 "transport", elapsed, channel.egress_id or channel.name,
             ), None, []
         elapsed = int((time.monotonic() - channel_started) * 1000)
-        result, attempt, issue = _validate_fetch_response(response, channel, elapsed)
+        result, attempt, issue = _validate_fetch_response(
+            response, channel, elapsed, response_parser=response_parser,
+        )
         if result is None or issue is not None:
             return result, attempt, issue, []
         if result.fmt == FORMAT_PROVIDER_YAML:

@@ -133,6 +133,32 @@ async def test_direct_success_does_not_touch_later_channels():
 
 
 @pytest.mark.asyncio
+async def test_shared_fetcher_accepts_validated_plain_content_after_bad_html():
+    calls: list[str] = []
+
+    def parse_plain(raw: bytes, _fmt: str) -> list[dict]:
+        rows = []
+        for line in raw.decode("utf-8").splitlines():
+            host, sep, port = line.partition(":")
+            if sep and port.isdigit():
+                rows.append({"scheme": "http", "host": host, "port": int(port)})
+        return rows
+
+    result = await fetch_subscription(
+        SUB_URL,
+        build_channels(kernel_proxy="http://127.0.0.1:1", local_proxies=[]),
+        client_factory=_scripted({CHANNEL_DIRECT: (200, b"<html>login</html>"),
+                                  CHANNEL_KERNEL: (200, b"8.8.8.8:8080\n")},
+                                 calls, []),
+        response_parser=parse_plain,
+    )
+
+    assert calls == [CHANNEL_DIRECT, CHANNEL_KERNEL]
+    assert result.channel == CHANNEL_KERNEL
+    assert result.resolved_nodes == [{"scheme": "http", "host": "8.8.8.8", "port": 8080}]
+
+
+@pytest.mark.asyncio
 async def test_provider_only_subscription_resolves_nodes_on_winning_channel(tmp_data_dir):
     root = yaml.safe_dump({
         "proxy-providers": {
