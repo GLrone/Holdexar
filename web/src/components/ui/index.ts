@@ -65,6 +65,17 @@ import HlTree from './HlTree.vue'
 
 export { ICONS, isIconName, type IconName } from './icons'
 export { message, type MessageType } from './message'
+export {
+  activityManager,
+  ActivityManager,
+  islandController,
+  IslandController,
+  type Activity,
+  type ActivityStatus,
+  type ActivityKind,
+  type ActivityTone,
+  type ActivityRegistration,
+} from './activity'
 export type { HlSelectOption } from './HlSelect.vue'
 export type { HlTableColumn } from './HlTable.vue'
 export type { HlTabItem } from './HlTabs.vue'
