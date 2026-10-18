@@ -15,10 +15,16 @@ schema 演进双层机制：
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import errno
+import hashlib
 import logging
 import math
+import os
 import re
 import sys
+import tempfile
+import threading
 import time
 from collections import deque
 from collections.abc import AsyncIterator
@@ -413,7 +419,7 @@ def _ensure_schema(sync_conn) -> None:
 #   2. _MIGRATIONS 追加 (版本号, 描述, SQL 列表)；SQL 须幂等（中断续跑 +
 #      用户库版本乱序防御），复杂逻辑可登记 async fn(engine) 同位元素
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 # 零小数货币（Steam 以整数计价）：旧捆绑包链路的除数表按 1 处理，与「统一存分」
 # 的新约定差 100 倍——v2 归一的目标集合
@@ -598,7 +604,7 @@ async def _migrate_alert_targets_to_cny(conn) -> None:
         )
 
 
-async def _migrate_gph_snapshot_unique(conn) -> None:
+async def _migrate_gph_snapshot_unique(conn) -> bool:
     """补建 game_price_history 的幂等唯一索引。
 
     写入侧（crawler/db_writer、历史导入脚本）用 `INSERT OR REPLACE` 去重，
@@ -610,10 +616,27 @@ async def _migrate_gph_snapshot_unique(conn) -> None:
     把每个 NULL 视为互不相等，直接索引这三列等于不约束——必须 COALESCE 归一。
     索引定义与库内既有形态逐字一致，否则同名不同义会造成两库行为分叉。
 
-    **非破坏性**：库内已有重复行时只告警、不建索引、更不删行。无索引的库本就在
-    无约束地写入，静默删用户数据不可接受；重复行留待人工核对后再跑一次迁移收口。
+    **非破坏性**：重复行会阻止建索引并回滚本次迁移；不静默删用户数据，结构版本
+    不前进，避免继续以无约束形态写入。已有正确索引则快速返回，不扫描整张历史表。
     """
     from sqlalchemy import text
+
+    expected_sql = (
+        "CREATE UNIQUE INDEX ux_gph_snapshot ON game_price_history ("
+        "appid, region_code, snapshot_at, COALESCE(sub_id, -1), "
+        "COALESCE(price, 0), COALESCE(is_gold, 0))"
+    )
+    existing_sql = (
+        await conn.execute(
+            text("SELECT sql FROM sqlite_master WHERE type='index' AND name='ux_gph_snapshot'")
+        )
+    ).scalar_one_or_none()
+    if existing_sql:
+        normalized_existing = re.sub(r"\s+", "", str(existing_sql)).lower().replace('"', "")
+        normalized_expected = re.sub(r"\s+", "", expected_sql).lower()
+        if normalized_existing == normalized_expected:
+            return True
+        await conn.execute(text("DROP INDEX ux_gph_snapshot"))
 
     dup_groups = (
         await conn.execute(
@@ -638,13 +661,11 @@ async def _migrate_gph_snapshot_unique(conn) -> None:
                 "重复判定": "同一游戏、同一区服、同一快照时刻、同一购买包、同一价格与史低标记",
             },
         )
-        return
-    await conn.execute(
-        text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS ux_gph_snapshot ON game_price_history ("
-            "appid, region_code, snapshot_at, COALESCE(sub_id, -1),"
-            " COALESCE(price, 0), COALESCE(is_gold, 0))"
+        raise RuntimeError(
+            "价格历史重复记录阻止唯一索引迁移；结构版本不会前进，需先核对重复记录"
         )
+    await conn.execute(
+        text(expected_sql)
     )
     log_event(
         logger,
@@ -652,6 +673,7 @@ async def _migrate_gph_snapshot_unique(conn) -> None:
         tag="成功",
         detail={"索引名": "ux_gph_snapshot"},
     )
+    return True
 
 
 async def _migrate_fx_history_canonical(conn) -> None:
@@ -1281,6 +1303,8 @@ _MIGRATIONS: list[tuple[int, str, object]] = [    (2, "bundle_region_prices 零�
          "（从 proxy_node_sources 回填后退役该表）、指纹与 node_id 按「订阅标识 +"
          " 配置」重算、同配置同订阅的重复化身合并为一行",
      _migrate_proxynode_subscription_identity),
+    (18, "重检价格历史去重索引，修复早期迁移跳过后仍前进版本的问题",
+     _migrate_gph_snapshot_unique),
 ]
 
 
@@ -1329,9 +1353,7 @@ async def _snapshot_before_migration(current: int, target: int) -> None:
     **落在库文件旁边**：迁移前快照是「本次升级的回滚点」，一次性、用完即弃，
     不进 `backups/` 轮转（那是「用户可恢复的历史点」，`BACKUP_KEEP=5`）。
 
-    **失败不阻断启动**：快照失败（库被独占、磁盘满）时迁移本身大概率也会失败
-    并留全栈日志；在启动路径上因快照失败直接拒绝启动，比原问题更难自查。此处
-    记 error 级日志，把「正在无快照迁移」这件事显式留痕。
+    快照失败时拒绝继续迁移，避免唯一回滚点缺失时改写用户数据。
     """
     src = _db_file_path()
     if src is None or not src.is_file() or src.stat().st_size == 0:
@@ -1356,6 +1378,7 @@ async def _snapshot_before_migration(current: int, target: int) -> None:
             },
         )
     except Exception:  # noqa: BLE001
+        dest.unlink(missing_ok=True)
         log_event(
             logger,
             "升级前快照失败，这次迁移没有回滚点——迁移若中断或结果异常，"
@@ -1364,6 +1387,7 @@ async def _snapshot_before_migration(current: int, target: int) -> None:
             exc_info=True,
             detail={"当前版本": current, "目标版本": target},
         )
+        raise RuntimeError("迁移前快照未完成，已阻止数据库结构变更")
 
 
 def _headline(text: str) -> str:
@@ -1385,7 +1409,7 @@ async def _run_schema_migrations() -> None:
 
     - 存量库 user_version=0（从未用过版本账本）→ 视为 v1 之前，直接登 v1
       （v1 本身无数据变更，纯账本启用；真变更从 v2 起）
-    - 每步一个事务（engine.begin），成功提交时同事务内 UPDATE user_version
+    - 每步显式 BEGIN IMMEDIATE，DDL、DML 与 user_version 在 SQLite 驱动事务中一起提交
       ——中断在任意步，重启后从断点续跑，重放已成功步骤由幂等 SQL 吸收
     - 迁移抛错：向上抛给 init_db 调用方（启动日志留全栈），不静默吞——
       结构性变更失败意味着新旧 schema 混存，静默会让后续写入路径更炸
@@ -1394,30 +1418,28 @@ async def _run_schema_migrations() -> None:
     engine = get_engine()
     from sqlalchemy import text
 
+    latest = max((v for v, _, _ in _MIGRATIONS), default=SCHEMA_VERSION)
+
     async with engine.connect() as conn:
-        current = (
-            await conn.execute(text("PRAGMA user_version"))
-        ).scalar_one()
+        current = (await conn.execute(text("PRAGMA user_version"))).scalar_one()
+    if current > latest:
+        raise RuntimeError(
+            f"数据库结构版本 v{current} 高于当前程序支持的数据库版本 v{latest}，拒绝启动"
+        )
 
     if current == 0:
         # 首登版本账本：v1 = 账本启用（无数据变更）
-        async with engine.begin() as conn:
-            await conn.execute(text("PRAGMA user_version = 1"))
-        current = 1
-
-    latest = max((v for v, _, _ in _MIGRATIONS), default=1)
-    if current > latest:
-        # 高于本代码链 = 步骤被移除，或账本被外部写脏（如测试夹具把临时步骤
-        # 泄漏进真实链后在生产库上跑过 init_db）——此时差额迁移会**全部静默
-        # 跳过**，必须留痕
-        log_event(
-            logger,
-            f"数据库结构版本 v{current} 比本程序认识的最高版本 v{latest} 还新，"
-            "差额迁移会全部跳过，请核对版本账本",
-            tag="跳过",
-            level=logging.WARNING,
-            detail={"库结构版本": current, "代码迁移链最高版本": latest},
-        )
+        async with engine.connect() as conn:
+            await conn.exec_driver_sql("BEGIN IMMEDIATE")
+            try:
+                current = (await conn.execute(text("PRAGMA user_version"))).scalar_one()
+                if current == 0:
+                    await conn.execute(text("PRAGMA user_version = 1"))
+                    current = 1
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
 
     pending = [m for m in _MIGRATIONS if m[0] > current]
     if pending:
@@ -1431,18 +1453,41 @@ async def _run_schema_migrations() -> None:
             f"把数据库结构升级到 v{target_version}：{_headline(description)}",
             detail={"目标版本": target_version, "变更说明": description},
         )
-        async with engine.begin() as conn:
-            if callable(body):
-                await body(conn)
-            else:
-                for ddl in body:
-                    await conn.execute(text(ddl))
-            await conn.execute(text(f"PRAGMA user_version = {target_version}"))
-        current = target_version
+        async with engine.connect() as conn:
+            await conn.exec_driver_sql("BEGIN IMMEDIATE")
+            try:
+                live_version = (await conn.execute(text("PRAGMA user_version"))).scalar_one()
+                if live_version > latest:
+                    raise RuntimeError(
+                        f"数据库结构版本 v{live_version} 高于当前程序支持的数据库版本 v{latest}，拒绝启动"
+                    )
+                if live_version >= target_version:
+                    await conn.rollback()
+                    current = live_version
+                    continue
+                if callable(body):
+                    await body(conn)
+                else:
+                    for ddl in body:
+                        await conn.execute(text(ddl))
+                await conn.execute(text(f"PRAGMA user_version = {target_version}"))
+                await conn.commit()
+                current = target_version
+            except Exception:
+                await conn.rollback()
+                raise
 
 
-async def init_db() -> None:
+async def init_db(*, maintenance_token: str | None = None) -> None:
     """建表 + 基础种子数据。M1 用 create_all，首次 schema 变更前引入 Alembic。"""
+    from pathlib import Path
+
+    from app.core.backup import ensure_restore_lock_available
+
+    db_path = get_engine().url.database
+    if db_path and db_path != ":memory:":
+        ensure_restore_lock_available(Path(db_path), maintenance_token=maintenance_token)
+
     # 导入各域模型模块，确保表注册到 Base.metadata
     from app.core import orchestration as _core_orchestration  # noqa: F401
     from app.domains.agent import models as _agent_models  # noqa: F401
@@ -1469,12 +1514,29 @@ async def init_db() -> None:
     from app.domains.account import models as _account_models  # noqa: F401
     from app.domains.redeem import models as _redeem_models  # noqa: F401
 
-    async with get_engine().begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        await conn.run_sync(_ensure_schema)
+    async def _prepare_schema() -> None:
+        async with get_engine().connect() as conn:
+            current = (await conn.execute(text("PRAGMA user_version"))).scalar_one()
+        latest = max((v for v, _, _ in _MIGRATIONS), default=SCHEMA_VERSION)
+        if current > latest:
+            raise RuntimeError(
+                f"数据库结构版本 v{current} 高于当前程序支持的数据库版本 v{latest}，拒绝启动"
+            )
 
-    # 结构性迁移链（user_version 账本；v1 起步）
-    await _run_schema_migrations()
+        async with get_engine().begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(_ensure_schema)
+
+        # 结构性迁移链（user_version 账本；v1 起步）
+        await _run_schema_migrations()
+
+    if maintenance_token is None:
+        async with write_maintenance_barrier():
+            await _prepare_schema()
+    else:
+        if not _current_task_owns_process_write_lock():
+            raise RuntimeError("数据库恢复初始化必须持有维护屏障")
+        await _prepare_schema()
 
     # 区服配置种子：CC_LIST → crawl_regions（含旧 crawl.enabled_regions 键迁移）
     from app.domains.regions import service as regions_service
@@ -1618,6 +1680,8 @@ class WriteScheduler:
         self._owner_label: str | None = None
         self._depth = 0
         self._hold_started = 0.0
+        self._hold_watchdog: asyncio.TimerHandle | None = None
+        self._hold_warned = False
         self._waiters: dict[WritePriority, deque[tuple[asyncio.Task, asyncio.Future[None], str | None]]] = {
             WritePriority.INTERACTIVE: deque(),
             WritePriority.BACKGROUND: deque(),
@@ -1696,6 +1760,7 @@ class WriteScheduler:
             # 闸可能在取消送达前已移交本任务（fut 已写入结果）：代为释放，
             # 否则写者位停在已消失的任务名下，后续写者全部饿死。
             if fut.done() and not fut.cancelled():
+                self._cancel_hold_watchdog()
                 self._owner = None
                 self._owner_priority = None
                 self._owner_label = None
@@ -1716,7 +1781,7 @@ class WriteScheduler:
         if self._owner_priority is not None:
             hold_ms = (time.perf_counter() - self._hold_started) * 1000
             self.metrics[self._owner_priority].observe_hold(hold_ms)
-            if hold_ms > _HOLD_WARN_MS:
+            if hold_ms > _HOLD_WARN_MS and not self._hold_warned:
                 self._record_event("hold", self._owner_priority, self._owner_label, hold_ms)
                 log_event(
                     logger,
@@ -1724,6 +1789,7 @@ class WriteScheduler:
                     level=logging.WARNING,
                     detail=_write_state_detail(self.snapshot()),
                 )
+        self._cancel_hold_watchdog()
         self._owner = None
         self._owner_priority = None
         self._owner_label = None
@@ -1731,11 +1797,37 @@ class WriteScheduler:
 
     def _grant(self, task: asyncio.Task, priority: WritePriority,
                label: str | None = None) -> None:
+        self._cancel_hold_watchdog()
         self._owner = task
         self._owner_priority = priority
         self._owner_label = label
         self._depth = 1
         self._hold_started = time.perf_counter()
+        self._hold_warned = False
+        self._hold_watchdog = asyncio.get_running_loop().call_later(
+            _HOLD_WARN_MS / 1000, self._watchdog_expired, task
+        )
+
+    def _watchdog_expired(self, owner: asyncio.Task) -> None:
+        if self._owner is not owner or self._hold_warned or self._owner_priority is None:
+            return
+        hold_ms = (time.perf_counter() - self._hold_started) * 1000
+        self.metrics[self._owner_priority].observe_hold(hold_ms)
+        self._record_event("hold", self._owner_priority, self._owner_label, hold_ms)
+        log_event(
+            logger,
+            f"{_priority_label(self._owner_priority)}写事务占用写锁已超过 {hold_ms / 1000:.1f} 秒",
+            level=logging.WARNING,
+            detail=_write_state_detail(self.snapshot()),
+        )
+        self._hold_warned = True
+        self._hold_watchdog = None
+
+    def _cancel_hold_watchdog(self) -> None:
+        if self._hold_watchdog is not None:
+            self._hold_watchdog.cancel()
+            self._hold_watchdog = None
+        self._hold_warned = False
 
     def _handoff(self) -> None:
         """写者位空出：交互队列优先，其次后台队列；被取消的排队者跳过。"""
@@ -1765,6 +1857,143 @@ class WriteScheduler:
 
 
 _schedulers: dict[asyncio.AbstractEventLoop, WriteScheduler] = {}
+_process_write_locks: dict[str, threading.Lock] = {}
+_process_write_locks_guard = threading.Lock()
+
+
+def _process_write_lock_path() -> Path:
+    """同一数据库的跨进程写锁文件路径；文件只承载操作系统锁，不存业务状态。"""
+    database = get_engine().url.database
+    if not database or database == ":memory:":
+        identity = f"memory:{id(get_engine().sync_engine)}"
+    else:
+        identity = str(Path(database).resolve())
+    digest = hashlib.sha256(os.path.normcase(identity).encode("utf-8")).hexdigest()[:24]
+    return Path(tempfile.gettempdir()) / f"holdexar-write-{digest}.lock"
+
+
+def _local_process_lock(path: Path) -> threading.Lock:
+    key = os.path.normcase(str(path))
+    with _process_write_locks_guard:
+        return _process_write_locks.setdefault(key, threading.Lock())
+
+
+def _try_lock_file(fd: int) -> bool:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError as exc:
+        if isinstance(exc, BlockingIOError) or exc.errno in (errno.EACCES, errno.EAGAIN):
+            return False
+        if getattr(exc, "winerror", None) in (33, 36, 158):
+            return False
+        raise
+
+
+class _CrossProcessWriteLock:
+    """SQLite 写者共享的进程内与跨进程独占锁。"""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.local_lock: threading.Lock | None = None
+        self.fd: int | None = None
+        self.locked = False
+
+    async def acquire(self) -> _CrossProcessWriteLock:
+        self.local_lock = _local_process_lock(self.path)
+        while not self.local_lock.acquire(blocking=False):
+            await asyncio.sleep(0.025)
+        try:
+            self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+            if os.fstat(self.fd).st_size == 0:
+                os.write(self.fd, b"\0")
+            while True:
+                if _try_lock_file(self.fd):
+                    self.locked = True
+                    return self
+                await asyncio.sleep(0.025)
+        except BaseException:
+            self._release_handles(unlock=self.locked)
+            raise
+
+    def release(self) -> None:
+        self._release_handles(unlock=self.locked)
+
+    def _release_handles(self, *, unlock: bool = False) -> None:
+        try:
+            if self.fd is not None:
+                fd = self.fd
+                try:
+                    if unlock:
+                        if os.name == "nt":
+                            import msvcrt
+
+                            os.lseek(fd, 0, os.SEEK_SET)
+                            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                        else:
+                            import fcntl
+
+                            fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+                    self.fd = None
+                    self.locked = False
+        finally:
+            if self.local_lock is not None:
+                self.local_lock.release()
+                self.local_lock = None
+
+
+_ACTIVE_PROCESS_WRITE_LOCK: contextvars.ContextVar[
+    tuple[asyncio.Task, _CrossProcessWriteLock] | None
+] = contextvars.ContextVar("holdexar_active_process_write_lock", default=None)
+
+
+def _current_task_owns_process_write_lock() -> bool:
+    active = _ACTIVE_PROCESS_WRITE_LOCK.get()
+    return active is not None and active[0] is asyncio.current_task()
+
+
+class _WriteLockLease:
+    def __init__(self, lock: _CrossProcessWriteLock, token: contextvars.Token) -> None:
+        self._lock = lock
+        self._token = token
+
+    def release(self) -> None:
+        if self._token is None:
+            return
+        _ACTIVE_PROCESS_WRITE_LOCK.reset(self._token)
+        self._token = None
+        self._lock.release()
+
+
+async def acquire_write_maintenance_barrier() -> _WriteLockLease:
+    """排空所有进程内写入并阻止维护窗口期间新的 write_gate 写入。"""
+    if _current_task_owns_process_write_lock():
+        raise RuntimeError("维护屏障不能嵌套在现有写事务中")
+    lock = await _CrossProcessWriteLock(_process_write_lock_path()).acquire()
+    task = asyncio.current_task()
+    assert task is not None
+    token = _ACTIVE_PROCESS_WRITE_LOCK.set((task, lock))
+    return _WriteLockLease(lock, token)
+
+
+@asynccontextmanager
+async def write_maintenance_barrier() -> AsyncIterator[None]:
+    """异步维护屏障：获取后其他进程与当前服务都无法开启新写事务。"""
+    lease = await acquire_write_maintenance_barrier()
+    try:
+        yield
+    finally:
+        lease.release()
 
 
 def _scheduler_for_loop() -> WriteScheduler:
@@ -1783,6 +2012,7 @@ class _WriteGate:
         self._priority = priority
         self._label = label
         self._scheduler: WriteScheduler | None = None
+        self._process_lease: _WriteLockLease | None = None
 
     async def __aenter__(self) -> None:
         self._scheduler = _scheduler_for_loop()
@@ -1793,10 +2023,22 @@ class _WriteGate:
             # 任何巨型持闸都必须能回答「是谁」。
             frame = sys._getframe(1)
             label = f"auto:{frame.f_code.co_filename.replace(chr(92), '/').rsplit('/', 1)[-1]}:{frame.f_lineno}"
+        reentrant = self._scheduler.owned_by_current_task()
         await self._scheduler.acquire(self._priority, label)
+        if reentrant or _current_task_owns_process_write_lock():
+            return
+        try:
+            self._process_lease = await acquire_write_maintenance_barrier()
+        except BaseException:
+            self._scheduler.release()
+            self._scheduler = None
+            raise
 
     async def __aexit__(self, *exc: object) -> None:
         if self._scheduler is not None:
+            if self._scheduler._depth == 1 and self._process_lease is not None:
+                self._process_lease.release()
+                self._process_lease = None
             self._scheduler.release()
             self._scheduler = None
 
@@ -1817,6 +2059,11 @@ def write_gate(
 def scheduler_task_owns_gate() -> bool:
     """当前任务是否已持写闸（重入上下文判定，供闸内自有会话分支）。"""
     return _scheduler_for_loop().owned_by_current_task()
+
+
+_ACTIVE_WRITE_SESSION: contextvars.ContextVar[tuple[asyncio.Task, AsyncSession] | None] = (
+    contextvars.ContextVar("holdexar_active_write_session", default=None)
+)
 
 
 def _caller_auto_label() -> str:
@@ -1852,19 +2099,25 @@ async def write_session(
     闸内新建会话的唯一入口。会话首语句显式取 SQLite 写锁：「先读后写中途
     升级」在跨进程直写形态下会触发 WAL 快照失效快速失败（busy_timeout 不
     重试该错误），锁在事务起点取得后该失败构造性不可能；进程内本就闸序
-    串行，提前取锁零额外成本。重入上下文（同任务已持闸，外层事务在跑）
-    保持驱动默认 deferred——新连接再取写锁只会撞自己。begin 耗时记在
+    串行，提前取锁零额外成本。同任务嵌套新会话会在打开连接前拒绝，避免
+    第二连接撞上外层事务自锁。begin 耗时记在
     会话属性 `_hx_begin_ms`（[写账]「起事务」字段）。
     """
     if label is None:
         label = _caller_auto_label()
-    reentrant = _scheduler_for_loop().owned_by_current_task()
+    active = _ACTIVE_WRITE_SESSION.get()
+    task = asyncio.current_task()
+    if active is not None and active[0] is task:
+        raise RuntimeError("禁止嵌套 write_session；复用外层会话完成同一事务")
     async with write_gate(priority, label=label), get_session_factory()() as session:
-        if not reentrant:
-            _tb = time.perf_counter()
-            await session.execute(text("BEGIN IMMEDIATE"))
-            session._hx_begin_ms = round((time.perf_counter() - _tb) * 1000)
-        yield session
+        _tb = time.perf_counter()
+        await session.execute(text("BEGIN IMMEDIATE"))
+        session._hx_begin_ms = round((time.perf_counter() - _tb) * 1000)
+        token = _ACTIVE_WRITE_SESSION.set((task, session))
+        try:
+            yield session
+        finally:
+            _ACTIVE_WRITE_SESSION.reset(token)
 
 
 def write_scheduler_diagnostics() -> dict:

@@ -112,8 +112,8 @@ async def test_rotation_keeps_recent(data_env):
         await core_backup.create_backup(label=f"t{i}")
     names = [b["name"] for b in core_backup.list_backups()]
     assert len(names) == 3
-    assert any(f"t4" in n for n in names)  # 最新的保留
-    assert not any(f"t0" in n for n in names)  # 最老的清掉
+    assert any("t4" in n for n in names)  # 最新的保留
+    assert not any("t0" in n for n in names)  # 最老的清掉
 
 
 @pytest.mark.asyncio
@@ -199,6 +199,30 @@ async def test_corrupt_backup_rejected_for_restore(data_env):
         await core_backup.restore_backup("bad.db")
 
 
+@pytest.mark.asyncio
+async def test_restore_rejects_backup_from_newer_schema_before_replacing(data_env):
+    tmp, holder = data_env
+    current = tmp / "holdexar.db"
+    backup = core_backup.backup_dir() / "newer-schema.db"
+    from app.core import database as database_module
+
+    supported = max(version for version, _, _ in database_module._MIGRATIONS)
+    conn = sqlite3.connect(backup.as_posix())
+    try:
+        conn.execute("CREATE TABLE games (appid INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("INSERT INTO games VALUES (620, 'Portal 2')")
+        conn.execute(f"PRAGMA user_version = {supported + 1}")
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(RuntimeError, match="高于当前程序支持"):
+        await core_backup.restore_backup(backup.name)
+
+    assert holder["conn"].execute("SELECT appid FROM games").fetchall() == [(620,)]
+    assert current.exists()
+
+
 @pytest.fixture
 def maintenance_mock(monkeypatch):
     """恢复链单元层替身：调度器/引擎/爬取位全部 mock，只验文件轮换与数据正确性。"""
@@ -207,7 +231,7 @@ def maintenance_mock(monkeypatch):
     async def _noop_dispose():
         return None
 
-    async def _noop_rebuild():
+    async def _noop_rebuild(*, initialize=False, maintenance_token=None):
         return True
 
     class _Sched:
@@ -523,3 +547,39 @@ def test_vacuum_translates_disk_full(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(core_backup.sqlite3, "connect", lambda *a, **k: _Conn())
     with pytest.raises(RuntimeError, match="磁盘空间不足"):
         core_backup._vacuum_file(tmp_path / "x.db")
+
+
+def test_startup_removes_only_proven_stale_legacy_restore_lock(data_env):
+    tmp, _ = data_env
+    lock = core_backup.backup_dir() / ".restore.lock"
+    lock.write_text("2020-01-01T00:00:00", encoding="utf-8")
+    os.utime(lock, (1, 1))
+
+    core_backup.ensure_restore_lock_available(tmp / "holdexar.db")
+
+    assert not lock.exists()
+
+
+def test_live_restore_lock_blocks_startup_and_is_not_removed(data_env):
+    import json
+
+    tmp, _ = data_env
+    lock = core_backup.backup_dir() / ".restore.lock"
+    lock.write_text(json.dumps({"pid": os.getpid(), "token": "live"}), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="维护正在进行中"):
+        core_backup.ensure_restore_lock_available(tmp / "holdexar.db")
+
+    assert lock.exists()
+
+
+def test_restore_lock_is_exclusive_and_release_is_token_owned(data_env):
+    lock, token = core_backup._acquire_restore_lock()
+    try:
+        with pytest.raises(RuntimeError, match="维护操作在进行中"):
+            core_backup._acquire_restore_lock()
+        core_backup._release_restore_lock(lock, "another-operation")
+        assert lock.exists()
+    finally:
+        core_backup._release_restore_lock(lock, token)
+    assert not lock.exists()

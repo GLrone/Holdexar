@@ -6,6 +6,7 @@ SQLite 同一时刻只允许一个写事务；调度器把「谁下一个写」�
 from __future__ import annotations
 
 import asyncio
+import sys
 
 import pytest
 
@@ -160,6 +161,23 @@ async def test_metrics_recorded():
 
 
 @pytest.mark.asyncio
+async def test_hold_watchdog_reports_before_gate_is_released(monkeypatch):
+    """持闸超过阈值时应在闸仍占用期间记录告警事件。"""
+    import app.core.database as dbmod
+
+    monkeypatch.setattr(dbmod, "_HOLD_WARN_MS", 10.0)
+    scheduler = WriteScheduler()
+    await scheduler.acquire(WritePriority.BACKGROUND, "watchdog_probe")
+    try:
+        await asyncio.sleep(0.05)
+        events = scheduler.diagnostics()["events"]
+        assert any(e["kind"] == "hold" and e["label"] == "watchdog_probe" for e in events)
+        assert scheduler.snapshot()["busy"], "看门狗只告警，不擅自释放正在使用的事务闸"
+    finally:
+        scheduler.release()
+
+
+@pytest.mark.asyncio
 async def test_diagnostics_reports_owner_and_metrics():
     """诊断快照：占用归属（优先级+label）与分优先级指标同框输出。"""
     s = WriteScheduler()
@@ -243,11 +261,8 @@ async def test_write_session_begins_immediate_and_holds_sqlite_lock(tmp_path, mo
 
 
 @pytest.mark.asyncio
-async def test_write_session_reentrant_skips_immediate_begin(tmp_path, monkeypatch):
-    """重入上下文（同任务已持闸）不再发起 BEGIN IMMEDIATE：外层事务已取
-    SQLite 写锁，新连接再取只会撞自己；内层保持驱动默认 deferred。"""
-    import sqlite3
-
+async def test_nested_write_session_is_rejected(tmp_path, monkeypatch):
+    """同任务嵌套新建第二会话会造成 SQLite 自锁，必须在打开内层事务前拒绝。"""
     from sqlalchemy import text
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -265,12 +280,32 @@ async def test_write_session_reentrant_skips_immediate_begin(tmp_path, monkeypat
     async with write_session(WritePriority.BACKGROUND, label="outer") as outer:
         assert hasattr(outer, "_hx_begin_ms")
         await outer.execute(text("INSERT INTO t (v) VALUES ('outer')"))
-        async with write_session(WritePriority.BACKGROUND, label="inner") as inner:
-            # 重入分支保持 deferred：不发 BEGIN（新连接再取写锁只会撞外层）
-            assert not hasattr(inner, "_hx_begin_ms")
-            # 读不被外层写事务阻塞（WAL 读者语义）
-            rows = (await inner.execute(text("SELECT count(*) FROM t"))).scalar()
-            assert rows == 0
+        with pytest.raises(RuntimeError, match="嵌套 write_session"):
+            async with write_session(WritePriority.BACKGROUND, label="inner"):
+                pass
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_write_session_under_manual_gate_starts_immediate(tmp_path, monkeypatch):
+    """手动 write_gate 只提供调度互斥，内层唯一会话仍要主动取得 SQLite 写锁。"""
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    import app.core.database as dbmod
+    from app.core.database import write_gate, write_session
+
+    db = tmp_path / "manual-gate.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db}")
+    monkeypatch.setattr(dbmod, "get_session_factory", lambda: async_sessionmaker(engine, expire_on_commit=False))
+    async with engine.begin() as conn:
+        await conn.execute(text("CREATE TABLE t (id INTEGER PRIMARY KEY)"))
+
+    async with write_gate(WritePriority.BACKGROUND, label="manual_outer"):
+        async with write_session(WritePriority.BACKGROUND, label="inner_session") as session:
+            assert hasattr(session, "_hx_begin_ms")
+            await session.execute(text("INSERT INTO t DEFAULT VALUES"))
+            await session.commit()
     await engine.dispose()
 
 
@@ -298,3 +333,41 @@ async def test_write_session_autolabels_real_caller(tmp_path, monkeypatch):
         label = write_scheduler_diagnostics()["owner_label"]
     assert label.startswith("auto:test_core_write_scheduler"), label
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cross_process_write_lock_serializes_a_second_process(tmp_path):
+    """跨进程写者必须等现持锁进程释放 OS 锁后才进入。"""
+    from pathlib import Path
+
+    import app.core.database as dbmod
+
+    lock_path = tmp_path / "shared-write.lock"
+    current = await dbmod._CrossProcessWriteLock(lock_path).acquire()
+    child_code = (
+        "import asyncio, sys\n"
+        "from pathlib import Path\n"
+        "from app.core.database import _CrossProcessWriteLock\n"
+        "async def main():\n"
+        "    lock = await _CrossProcessWriteLock(Path(sys.argv[1])).acquire()\n"
+        "    print('ACQUIRED', flush=True)\n"
+        "    lock.release()\n"
+        "asyncio.run(main())\n"
+    )
+    child = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        child_code,
+        str(lock_path),
+        cwd=str(Path(__file__).resolve().parents[1]),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        await asyncio.sleep(0.2)
+        assert child.returncode is None
+    finally:
+        current.release()
+    stdout, stderr = await asyncio.wait_for(child.communicate(), timeout=5)
+    assert child.returncode == 0, stderr.decode("utf-8", errors="replace")
+    assert b"ACQUIRED" in stdout
