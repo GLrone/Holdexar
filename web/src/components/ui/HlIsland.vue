@@ -67,7 +67,6 @@ function headLineCount(text: string, wrapWidth: number): number {
   return Math.max(1, Math.ceil(width / wrapWidth))
 }
 
-const DECK_MAX = 2
 const rootEl = ref<HTMLElement | null>(null)
 
 /** 当前主岛活动 */
@@ -108,9 +107,14 @@ const visible = computed(() => mode.value !== 'idle' || priceStale.value)
 const progDone = computed(() => crawl.roundProgress?.done ?? crawl.done)
 const progTotal = computed(() => crawl.roundProgress?.total ?? crawl.total)
 
+const isDevPrimary = computed(() => primaryAct.value?.id.startsWith('dev:') ?? false)
+
 const taskPercent = computed<number | null>(() => {
   const act = primaryAct.value
-  if (act && act.progress !== undefined) return act.progress
+  if (act) {
+    if (act.progress !== undefined) return act.progress
+    return null
+  }
   const n = legacyNotice.value
   if (n && n.sticky) return null
   if (legacyTask.value) return legacyTask.value.percent
@@ -120,13 +124,13 @@ const taskPercent = computed<number | null>(() => {
 
 const crawlOnlyTask = computed(() => {
   const act = primaryAct.value
-  if (act) return act.source === 'crawler' && act.status === 'running'
+  if (act) return act.source === 'crawler' && act.status === 'running' && !act.id.startsWith('dev:')
   return !legacyNotice.value && !legacyTask.value && crawlRunning.value
 })
 
 const expandedIsTask = computed(() => {
   const act = primaryAct.value
-  if (act) return act.kind === 'task' && act.source === 'crawler'
+  if (act) return act.kind === 'task' && act.source === 'crawler' && !act.id.startsWith('dev:')
   return !legacyNotice.value && crawlRunning.value
 })
 
@@ -139,7 +143,10 @@ const canRetry = computed(() => Boolean(primaryAct.value?.retry || legacyNotice.
 
 const busy = computed(() => {
   const act = primaryAct.value
-  if (act) return act.status === 'running' || act.progress !== undefined
+  if (act) {
+    if (act.status !== 'running') return false
+    return act.progress !== undefined || act.kind === 'task'
+  }
   return Boolean(legacyNotice.value?.sticky || crawlRunning.value || legacyTask.value)
 })
 
@@ -214,7 +221,12 @@ const leadToneClass = computed(() => {
   return `is-${n.tone}`
 })
 
-const showBar = computed(() => busy.value)
+const showBar = computed(() => {
+  if (primaryAct.value) {
+    return primaryAct.value.status === 'running' && (primaryAct.value.progress !== undefined || primaryAct.value.kind === 'task')
+  }
+  return busy.value
+})
 
 const trailing = computed(() => {
   if (mode.value !== 'expanded') return ''
@@ -230,8 +242,6 @@ const detailText = computed(() => {
   if (legacyNotice.value) return legacyNotice.value.detail ?? ''
   return showingPrice.value ? priceDetail.value : ''
 })
-
-const deckDepth = computed(() => Math.min(DECK_MAX, waiting.value))
 
 const idleWidth = computed(() => Math.min(240, Math.max(124, 60 + priceLabel.value.length * 13)))
 
@@ -305,10 +315,19 @@ function mute() {
 
 function retry() {
   const act = primaryAct.value
-  const fn = act?.retry ?? legacyNotice.value?.retry ?? null
   islandController.setExpanded(false)
   setExpanded(false)
-  if (act) activityManager.remove(act.id)
+  if (act) {
+    if (act.id.startsWith('dev:')) {
+      activityManager.update(act.id, { status: 'running', tone: 'info', progress: 0 })
+      return
+    }
+    const fn = act.retry ?? null
+    activityManager.remove(act.id)
+    fn?.()
+    return
+  }
+  const fn = legacyNotice.value?.retry ?? null
   if (legacyNotice.value) dropNotice(legacyNotice.value.id)
   fn?.()
 }
@@ -318,6 +337,7 @@ function goDetail() {
   if (!target) return
   islandController.setExpanded(false)
   setExpanded(false)
+  if (isDevPrimary.value) return
   void router.push(target)
 }
 
@@ -326,13 +346,19 @@ function goTask() {
   if (!target) return
   islandController.setExpanded(false)
   setExpanded(false)
+  if (isDevPrimary.value) return
   void router.push(target)
 }
 
 async function cancelTask() {
-  const id = crawl.activeJobId
   islandController.setExpanded(false)
   setExpanded(false)
+  const act = primaryAct.value
+  if (act?.id.startsWith('dev:')) {
+    activityManager.fail(act.id, { detail: 'Cancelled in test' })
+    return
+  }
+  const id = crawl.activeJobId
   if (id === null) return
   try {
     await crawlApi.stop(id)
@@ -344,6 +370,7 @@ async function cancelTask() {
 function openTask() {
   islandController.setExpanded(false)
   setExpanded(false)
+  if (isDevPrimary.value) return
   void router.push('/crawl')
 }
 
@@ -355,8 +382,19 @@ function onDocDown(e: MouseEvent) {
   setExpanded(false)
 }
 
+const isSwapping = ref(false)
+let swapTimer: ReturnType<typeof setTimeout> | null = null
+
 function onSecondarySwap() {
-  islandController.swap()
+  if (isSwapping.value) return
+  isSwapping.value = true
+  if (swapTimer) clearTimeout(swapTimer)
+  swapTimer = setTimeout(() => {
+    islandController.swap()
+    swapTimer = setTimeout(() => {
+      isSwapping.value = false
+    }, 140)
+  }, 140)
 }
 
 function onSelectActivity(id: string) {
@@ -364,8 +402,15 @@ function onSelectActivity(id: string) {
   islandController.setOverview(false)
 }
 
+function onPinActivity(id: string) {
+  islandController.togglePin(id)
+}
+
 onMounted(() => document.addEventListener('mousedown', onDocDown))
-onBeforeUnmount(() => document.removeEventListener('mousedown', onDocDown))
+onBeforeUnmount(() => {
+  document.removeEventListener('mousedown', onDocDown)
+  if (swapTimer) clearTimeout(swapTimer)
+})
 </script>
 
 <template>
@@ -374,7 +419,7 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocDown))
       <!-- 主岛容器 -->
       <div
         class="hl-island"
-        :class="[`hl-island--${mode}`, { 'is-stacked': headStacked }]"
+        :class="[`hl-island--${mode}`, { 'is-stacked': headStacked, 'is-swapping-primary': isSwapping }]"
         :style="islandStyle"
         role="status"
         aria-live="polite"
@@ -387,6 +432,7 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocDown))
         <PrimaryIsland
           :activity="primaryAct"
           :mode="mode"
+          :is-pinned="islandController.pinnedId === primaryAct?.id"
           :lead-spin="leadSpin"
           :lead-icon="leadIcon"
           :lead-tone-class="leadToneClass"
@@ -415,32 +461,28 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocDown))
           @go-task="goTask"
           @open-task="openTask"
         />
-
-        <!-- 排队堆叠 -->
-        <Transition name="island-deck">
-          <span v-if="deckDepth" class="hl-island__deck" aria-hidden="true">
-            <i v-for="n in deckDepth" :key="n" />
-          </span>
-        </Transition>
       </div>
 
-      <!-- 副岛脚手架（多活动时浮现，点击交换） -->
+      <!-- 副岛（多活动时浮现，点击交换，支持悬停预览与总览触发） -->
       <Transition name="secondary-island-pop">
         <SecondaryIsland
           v-if="islandController.hasSecondary"
           :activity="secondaryAct"
           :extra-count="islandController.waitingCount"
+          :is-swapping="isSwapping"
           @swap="onSecondarySwap"
+          @open-overview="islandController.setOverview(true)"
         />
       </Transition>
 
-      <!-- 活动总览面板脚手架 -->
+      <!-- 活动总览面板 -->
       <ActivityPanel
         :activities="islandController.sortedActivities"
         :primary-id="islandController.primaryId"
         :pinned-id="islandController.pinnedId"
         :open="islandController.isOverviewOpen.value"
         @select="onSelectActivity"
+        @pin="onPinActivity"
         @close="islandController.setOverview(false)"
       />
     </div>
@@ -504,6 +546,15 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocDown))
 
 .hl-island--idle :deep(.hl-island__row) {
   justify-content: center;
+}
+
+:deep(.hl-island__pinned) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+  margin-left: 2px;
+  flex: 0 0 auto;
 }
 
 :deep(.hl-island__lead) {
@@ -771,44 +822,10 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocDown))
   color: var(--text-primary);
 }
 
-.hl-island__deck {
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 100%;
-  margin-top: -5px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 2px;
-  pointer-events: none;
-}
-
-.hl-island__deck > i {
-  display: block;
-  height: 8px;
-  border-radius: 4px;
-  background: var(--island-bg);
-  box-shadow: var(--shadow-island);
-}
-
-.hl-island__deck > i:nth-child(1) {
-  width: 86%;
-}
-
-.hl-island__deck > i:nth-child(2) {
-  width: 72%;
+.hl-island.is-swapping-primary {
+  transform: translateX(12px) scale(0.96);
   opacity: 0.72;
-}
-
-.island-deck-enter-active,
-.island-deck-leave-active {
-  transition: opacity calc(var(--duration-3) * var(--motion-scale)) var(--ease-out);
-}
-
-.island-deck-enter-from,
-.island-deck-leave-to {
-  opacity: 0;
+  transition: transform 140ms var(--ease-island), opacity 140ms var(--ease-out);
 }
 
 .island-retract-enter-active,
@@ -838,6 +855,11 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocDown))
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .hl-island.is-swapping-primary {
+    transform: none;
+    transition: none;
+  }
+
   .secondary-island-pop-enter-active,
   .secondary-island-pop-leave-active {
     transition: opacity calc(var(--duration-2) * var(--motion-scale)) var(--ease-out);

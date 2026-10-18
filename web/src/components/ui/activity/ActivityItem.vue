@@ -45,6 +45,13 @@ function onRowClick() {
   emit('select', props.activity.id)
 }
 
+function onKeydown(e: KeyboardEvent) {
+  if (e.key === 'Enter' || e.key === ' ') {
+    e.preventDefault()
+    emit('select', props.activity.id)
+  }
+}
+
 function onActionClick(e: MouseEvent) {
   e.stopPropagation()
   emit('action', props.activity)
@@ -58,6 +65,7 @@ function onActionClick(e: MouseEvent) {
     role="button"
     tabindex="0"
     @click="onRowClick"
+    @keydown="onKeydown"
   >
     <div class="hl-activity-item__lead">
       <HlSpinner v-if="isSpinning" class="hl-activity-item__spin" />
@@ -81,6 +89,16 @@ function onActionClick(e: MouseEvent) {
     </div>
 
     <div class="hl-activity-item__actions">
+      <button
+        type="button"
+        class="hl-activity-item__pin-btn"
+        :class="{ 'is-pinned': isPinned }"
+        :title="isPinned ? t('island.unpin') : t('island.pin')"
+        :aria-label="isPinned ? t('island.unpin') : t('island.pin')"
+        @click.stop="emit('pin', activity.id)"
+      >
+        <HlIcon name="target" :size="12" />
+      </button>
       <button
         v-if="activity.to"
         type="button"
@@ -195,6 +213,35 @@ function onActionClick(e: MouseEvent) {
 .hl-activity-item__fill.is-slide {
   width: 40%;
   animation: hlIslandBar 1.4s var(--ease-inout) infinite;
+}
+
+.hl-activity-item__actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.hl-activity-item__pin-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: color var(--transition), background var(--transition);
+}
+
+.hl-activity-item__pin-btn:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.hl-activity-item__pin-btn.is-pinned {
+  color: var(--accent);
 }
 
 .hl-activity-item__btn {

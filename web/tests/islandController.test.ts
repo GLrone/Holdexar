@@ -238,3 +238,29 @@ test('IslandController：多任务动态增删与自然收缩回单岛/空闲', 
   assert.equal(ctrl.primaryId, null)
   assert.equal(ctrl.secondaryId, null)
 })
+
+test('IslandController：togglePin 与 toggleOverview 控制流验证', () => {
+  const mgr = new ActivityManager()
+  const ctrl = new IslandController(mgr)
+
+  mgr.register({ id: 'task-1', source: 'a', title: 'Task 1' })
+  mgr.register({ id: 'task-2', source: 'b', title: 'Task 2' })
+
+  // 1. togglePin 锁定
+  assert.equal(ctrl.pinnedId, null)
+  ctrl.togglePin('task-2')
+  assert.equal(ctrl.pinnedId, 'task-2')
+  assert.equal(ctrl.primaryId, 'task-2')
+
+  // 再次调用同一 ID 解锁
+  ctrl.togglePin('task-2')
+  assert.equal(ctrl.pinnedId, null)
+
+  // 2. toggleOverview 开关
+  assert.equal(ctrl.isOverviewOpen.value, false)
+  ctrl.toggleOverview()
+  assert.equal(ctrl.isOverviewOpen.value, true)
+  assert.equal(ctrl.isExpanded.value, false)
+  ctrl.toggleOverview()
+  assert.equal(ctrl.isOverviewOpen.value, false)
+})

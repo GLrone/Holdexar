@@ -11,6 +11,7 @@ import type { Activity } from './types'
 defineProps<{
   activity: Activity | null
   mode: 'idle' | 'notice' | 'task' | 'expanded'
+  isPinned?: boolean
   leadSpin: boolean
   leadIcon: string
   leadToneClass: string
@@ -69,6 +70,9 @@ const { t } = useI18n()
       >
         {{ headText }}
       </span>
+      <span v-if="isPinned" class="hl-island__pinned" :title="t('island.pinned')">
+        <HlIcon name="target" :size="11" />
+      </span>
       <span v-if="trailing" class="hl-island__trail">{{ trailing }}</span>
       <button v-if="crawlOnlyTask && mode === 'task'" class="hl-island__btn is-tiny" @click.stop="emit('cancel')">
         {{ t('island.task.cancel') }}
@@ -76,7 +80,7 @@ const { t } = useI18n()
     </div>
 
     <!-- 进度条：任务态常显，展开中的任务同样保留 -->
-    <span v-if="showBar" class="hl-island__bar" :class="{ 'is-slide': taskPercent === null }">
+    <span v-if="showBar && taskPercent !== undefined" class="hl-island__bar" :class="{ 'is-slide': taskPercent === null }">
       <i :style="taskPercent === null ? undefined : { width: `${taskPercent}%` }" />
     </span>
 

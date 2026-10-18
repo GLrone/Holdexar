@@ -136,3 +136,23 @@ test('ActivityManager：语义色彩静音拦截与批量清除', () => {
   assert.equal(blocked, null)
   assert.equal(mgr.count, 1)
 })
+
+test('ActivityManager：默认 progress 为 undefined，在完成或失败时自动清除以防误显示进度条', () => {
+  const mgr = new ActivityManager()
+
+  // 1. 未指定 progress 时必须为 undefined，而非 null
+  const notice = mgr.register({ id: 'test-notice', source: 'notice', title: '提示消息' })
+  assert.equal(notice?.progress, undefined)
+
+  // 2. 带进度的任务转为完成时，progress 自动清除为 undefined
+  mgr.register({ id: 'test-prog', source: 'crawler', status: 'running', title: '抓取', progress: 50 })
+  assert.equal(mgr.get('test-prog')?.progress, 50)
+
+  mgr.complete('test-prog')
+  assert.equal(mgr.get('test-prog')?.progress, undefined)
+
+  // 3. 失败时同样清除进度
+  mgr.register({ id: 'test-fail', source: 'updater', status: 'running', title: '下载', progress: 70 })
+  mgr.fail('test-fail')
+  assert.equal(mgr.get('test-fail')?.progress, undefined)
+})
