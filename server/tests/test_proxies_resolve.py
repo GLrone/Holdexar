@@ -3,6 +3,7 @@
 不触真实网络/内核——monkeypatch ClashRuntime 状态；settings 键值层隔离到临时库。
 """
 import sys
+import socket
 from pathlib import Path
 
 import pytest
@@ -263,9 +264,134 @@ def test_subscription_view_strips_mixed_port():
     assert a == b
 
 
-def test_fallback_ports_cover_ecosystem_and_own_default():
-    """兜底借道口 = 生态默认 7897 + 本程序内核默认 7890，与工作端口设置无关。"""
-    assert clash_manager.LOCAL_MIXED_PORTS == (7890, 7897)
+def test_fallback_ports_cover_external_proxy_default_only():
+    assert clash_manager.LOCAL_MIXED_PORTS == (7897,)
+
+
+@pytest.mark.asyncio
+async def test_new_install_uses_auto_runtime_port(db, monkeypatch):
+    values = {"proxy.strategy": "direct_only"}
+    writes = {}
+
+    async def get_value(key, default=None):
+        return values.get(key, default)
+
+    async def set_value(key, value):
+        writes[key] = value
+        values[key] = value
+
+    monkeypatch.setattr("app.domains.settings.service.get_value", get_value)
+    monkeypatch.setattr("app.domains.settings.service.set_value", set_value)
+    monkeypatch.setattr(clash_manager.runtime, "status", lambda: {
+        "running": False, "port": None, "entryReady": False,
+    })
+
+    result = await proxies_service.get_strategy()
+
+    assert result["clashPortMode"] == "auto"
+    assert result["clashPort"] is None
+    assert writes["proxy.clash_port_mode"] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_existing_saved_port_migrates_to_fixed_mode(db, monkeypatch):
+    values = {"proxy.strategy": "direct_only", "proxy.clash_port": 7890}
+    writes = {}
+
+    async def get_value(key, default=None):
+        return values.get(key, default)
+
+    async def set_value(key, value):
+        writes[key] = value
+        values[key] = value
+
+    monkeypatch.setattr("app.domains.settings.service.get_value", get_value)
+    monkeypatch.setattr("app.domains.settings.service.set_value", set_value)
+    monkeypatch.setattr(clash_manager.runtime, "status", lambda: {
+        "running": False, "port": None, "entryReady": False,
+    })
+
+    result = await proxies_service.get_strategy()
+
+    assert result["clashPortMode"] == "fixed"
+    assert result["clashPort"] == 7890
+    assert writes["proxy.clash_port_mode"] == "fixed"
+
+
+@pytest.mark.asyncio
+async def test_switch_to_auto_keeps_running_port_and_does_not_restart(db, monkeypatch):
+    values = {"proxy.clash_port_mode": "fixed", "proxy.clash_port": 7891}
+    writes = {}
+    restarted = []
+
+    async def get_value(key, default=None):
+        return values.get(key, default)
+
+    async def set_value(key, value):
+        writes[key] = value
+        values[key] = value
+
+    async def restart(port):
+        restarted.append(port)
+
+    monkeypatch.setattr("app.domains.settings.service.get_value", get_value)
+    monkeypatch.setattr("app.domains.settings.service.set_value", set_value)
+    monkeypatch.setattr(proxies_service, "_restart_kernel_for_port", restart)
+
+    await proxies_service.set_strategy(clash_port_mode="auto")
+
+    assert values["proxy.clash_port_mode"] == "auto"
+    assert values["proxy.clash_port"] == 7891
+    assert not restarted
+
+
+def test_dynamic_port_start_retries_when_listener_is_not_owned(tmp_path, monkeypatch):
+    runtime = clash_manager.ClashRuntime()
+    config = tmp_path / "runtime.yaml"
+    config.write_text(yaml.safe_dump({"proxies": [{
+        "name": "one", "type": "http", "server": "127.0.0.1", "port": 1,
+    }]}), encoding="utf-8")
+    ports = iter([43123, 43124])
+    owners = iter([False, True, True])
+    processes = []
+
+    class Process:
+        def __init__(self, *args, **kwargs):
+            self.pid = 5000 + len(processes)
+            self.returncode = None
+            processes.append(self)
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = 0
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(clash_manager, "_free_local_port", lambda: next(ports))
+    monkeypatch.setattr(clash_manager, "_port_owned_by_process", lambda p, pid: next(owners))
+    monkeypatch.setattr(clash_manager, "ensure_kernel_files", lambda _p: None)
+    monkeypatch.setattr(clash_manager, "validate_config", lambda *_a: None)
+    monkeypatch.setattr(runtime, "_kill_orphans", lambda *_a: 0)
+    monkeypatch.setattr(runtime, "_wait_mixed_port", lambda: True)
+    monkeypatch.setattr(clash_manager, "_port_listening", lambda _port: True)
+    monkeypatch.setattr(clash_manager, "resolve_controller", lambda _text: (
+        "http://127.0.0.1:45000", "secret",
+    ))
+    monkeypatch.setattr(clash_manager.subprocess, "Popen", Process)
+
+    status = runtime.start(
+        "mihomo", str(config), inject_lanes=False, allocate_mixed_port=True,
+    )
+
+    assert status["port"] == 43124
+    assert status["entryReady"] is True
+    assert len(processes) == 2
 
 
 @pytest.mark.asyncio
@@ -276,7 +402,17 @@ async def test_set_strategy_port_change_restarts_kernel(db, monkeypatch):
     async def fake_restart(port: int) -> None:
         called.append(port)
 
+    values = {}
+
+    async def get_value(key, default=None):
+        return values.get(key, default)
+
+    async def set_value(key, value):
+        values[key] = value
+
     monkeypatch.setattr(proxies_service, "_restart_kernel_for_port", fake_restart)
+    monkeypatch.setattr("app.domains.settings.service.get_value", get_value)
+    monkeypatch.setattr("app.domains.settings.service.set_value", set_value)
     await proxies_service.set_strategy(clash_port=7891)
     assert called == [7891]
     called.clear()

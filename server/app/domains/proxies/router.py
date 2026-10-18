@@ -68,6 +68,7 @@ class ProxyUpdate(BaseModel):
 class StrategyUpdate(BaseModel):
     strategy: str | None = None
     clashPort: int | None = None
+    clashPortMode: str | None = None
     # 内核随服务自启开关（None = 不变）
     autostart: bool | None = None
     # 自动节点体检开关（None = 不变；手动检测不受闸）
@@ -195,7 +196,8 @@ async def proxy_stats():
 async def set_strategy(req: StrategyUpdate):
     try:
         await service.set_strategy(
-            req.strategy, req.clashPort, req.autostart, req.healthAuto
+            req.strategy, req.clashPort, req.autostart, req.healthAuto,
+            req.clashPortMode,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -272,9 +274,10 @@ async def clash_start(req: ClashStart):
     sub_url = sub["url"]
 
     try:
+        port_options = await service.kernel_port_options()
         status = await clash_manager.runtime.ensure_running(
             detect["path"], picked["configPath"], subscription_url=sub_url,
-            mixed_port=await service.pinned_kernel_port(),
+            **port_options,
         )
     except Exception as e:  # noqa: BLE001 —— 配置已到手，起不来是内核侧问题
         raise HTTPException(status_code=502, detail=f"内核启动失败: {e}")
@@ -349,9 +352,10 @@ async def clash_switch(req: ClashSwitch):
         # 交给内核的是项目生成的运行配置（地区规则/接管设置不进内核）
         runtime_path = clash_manager.materialize_subscription_config(sub_cache)
         async with service._clash_test_lock():
+            port_options = await service.kernel_port_options()
             new_status = await clash_manager.runtime.ensure_running(
                 detect["path"], str(runtime_path), subscription_url=sub["url"],
-                mixed_port=await service.pinned_kernel_port(),
+                **port_options,
             )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -473,9 +477,10 @@ async def _effectuate_new_subscription(sub_id: int, url: str) -> dict:
                 return extra
             runtime_path = clash_manager.materialize_subscription_config(sub_cache)
             async with service._clash_test_lock():
+                port_options = await service.kernel_port_options()
                 new_status = await clash_manager.runtime.ensure_running(
                     detect["path"], str(runtime_path), subscription_url=url,
-                    mixed_port=await service.pinned_kernel_port(),
+                    **port_options,
                 )
             # 启动成功即「用户最近一次显式选中」，与启动/切换端点同源
             await service.remember_selected_clash_sub(sub_id)
@@ -495,16 +500,8 @@ async def _effectuate_new_subscription(sub_id: int, url: str) -> dict:
         extra["warning"] = f"订阅已保存，但自动启动内核失败：{e}（可稍后手动启动）"
         return extra
 
-    async def _sync_then_first_check() -> None:
-        # 先喂池（快照落盘）再首检：首检健康后的自动转正要求快照已存在，
-        # 顺序颠倒会在全新安装上把生效推迟一个同步拍
-        try:
-            await service._pool_sync_single(sub_id)
-        finally:
-            if clash_manager.runtime.status()["running"]:
-                _spawn_first_check(sub_id)
-
-    asyncio.get_running_loop().create_task(_sync_then_first_check())
+    if clash_manager.runtime.status()["running"]:
+        _spawn_first_check(sub_id)
     return extra
 
 

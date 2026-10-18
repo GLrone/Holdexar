@@ -8,7 +8,7 @@ import yaml
 
 from app.core.config import get_settings
 from app.core.database import get_engine, get_session_factory, init_db
-from app.domains.proxies.models import ProxySubscription
+from app.domains.proxies.models import ADMISSION_ACTIVE, ProxySubscription
 from app.domains.proxies.runtime_config import render_subscription_config
 from app.domains.proxypool.models import ProxyNode, SubscriptionSnapshot, node_fingerprint
 from app.domains.proxypool.pool import PoolBuildError, build_pool
@@ -97,7 +97,10 @@ async def _register(session, data_dir, sid, doc):
     raw = yaml.safe_dump(doc).encode()
     path = data_dir / f"source-{sid}.yaml"
     path.write_bytes(raw)
-    session.add(ProxySubscription(id=sid, kind="clash", url=f"https://example.test/{sid}"))
+    session.add(ProxySubscription(
+        id=sid, kind="clash", url=f"https://example.test/{sid}",
+        admission_status=ADMISSION_ACTIVE,
+    ))
     session.add(SubscriptionSnapshot(
         subscription_id=sid, sha256=hashlib.sha256(raw).hexdigest(), format="yaml",
         raw_path=str(path), node_count=len(doc["proxies"]), status="OK", url=f"https://example.test/{sid}",
@@ -179,6 +182,111 @@ async def test_existing_subscription_cache_supplies_groups_when_no_snapshot(sour
         path.write_text(yaml.safe_dump(doc), encoding="utf-8")
         build = await build_pool(session, data_dir=source_dir)
         assert build.auxiliary_names == ("HlRelay|1|relay-group",)
+
+
+@pytest.mark.asyncio
+async def test_provider_snapshot_keeps_group_needed_by_expanded_node(source_dir):
+    import json
+
+    await init_db()
+    doc = _source()
+    doc["proxy-providers"] = {
+        "remote": {
+            "type": "http", "url": "https://provider.invalid/nodes",
+            "override": {"dialer-proxy": "relay-group"},
+        }
+    }
+    raw = yaml.safe_dump(doc).encode()
+    path = source_dir / "source-1.yaml"
+    path.write_bytes(raw)
+    provider_node = {
+        "name": "remote-node", "type": "http", "server": "remote.example",
+        "port": 8080, "dialer-proxy": "relay-group",
+    }
+    async with get_session_factory()() as session:
+        session.add(ProxySubscription(
+            id=1, kind="clash", url="https://example.test/1",
+            admission_status=ADMISSION_ACTIVE,
+        ))
+        session.add(SubscriptionSnapshot(
+            subscription_id=1, sha256=hashlib.sha256(raw).hexdigest(),
+            format="provider_yaml", raw_path=str(path), node_count=3,
+            status="OK", url="https://example.test/1",
+            provider_nodes_json=json.dumps({"remote": [provider_node]}),
+        ))
+        for payload in [*doc["proxies"], provider_node]:
+            fp = node_fingerprint(payload, "1")
+            session.add(ProxyNode(
+                node_id=fp, fingerprint=fp, subscription_id=1,
+                original_name=payload["name"], runtime_name=f"1|{payload['name']}",
+                normalized_config=payload, proxy_type=payload["type"],
+                server=payload["server"], state="ACTIVE",
+                first_seen=datetime.now(), last_seen=datetime.now(),
+            ))
+        await session.commit()
+
+        build = await build_pool(session, data_dir=source_dir)
+        assert build.expected_count == 3
+        assert "HlRelay|1|relay-group" in build.auxiliary_names
+
+
+@pytest.mark.asyncio
+async def test_provider_snapshot_expands_group_members_before_pool_render(source_dir):
+    import json
+
+    await init_db()
+    doc = {
+        "proxies": [
+            {"name": "front", "type": "trojan", "server": "front.example",
+             "port": 443, "password": "front-secret", "dialer-proxy": "provider-group"},
+        ],
+        "proxy-providers": {
+            "remote": {
+                "type": "http", "url": "https://provider.invalid/nodes",
+                "override": {"additional-prefix": "remote-"},
+            },
+        },
+        "proxy-groups": [{
+            "name": "provider-group", "type": "select", "use": ["remote"],
+        }],
+    }
+    raw = yaml.safe_dump(doc).encode()
+    path = source_dir / "source-1.yaml"
+    path.write_bytes(raw)
+    provider_node = {
+        "name": "remote-node", "type": "http", "server": "remote.example",
+        "port": 8080,
+    }
+    expanded_provider_node = {**provider_node, "name": "remote-remote-node"}
+    async with get_session_factory()() as session:
+        session.add(ProxySubscription(
+            id=1, kind="clash", url="https://example.test/1",
+            admission_status=ADMISSION_ACTIVE,
+        ))
+        session.add(SubscriptionSnapshot(
+            subscription_id=1, sha256=hashlib.sha256(raw).hexdigest(),
+            format="provider_yaml", raw_path=str(path), node_count=2,
+            status="OK", url="https://example.test/1",
+            provider_nodes_json=json.dumps({"remote": [provider_node]}),
+        ))
+        for payload in [doc["proxies"][0], expanded_provider_node]:
+            fp = node_fingerprint(payload, "1")
+            session.add(ProxyNode(
+                node_id=fp, fingerprint=fp, subscription_id=1,
+                original_name=payload["name"], runtime_name=f"1|{payload['name']}",
+                normalized_config=payload, proxy_type=payload["type"],
+                server=payload["server"], state="ACTIVE",
+                first_seen=datetime.now(), last_seen=datetime.now(),
+            ))
+        await session.commit()
+
+        build = await build_pool(session, data_dir=source_dir)
+        rendered = yaml.safe_load(build.path.read_text(encoding="utf-8"))
+        group = next(g for g in rendered["proxy-groups"] if g["name"] in build.auxiliary_names)
+        front = next(p for p in rendered["proxies"] if p["name"] == "1|front")
+        assert group["proxies"] == ["1|remote-remote-node"]
+        assert "use" not in group
+        assert front["dialer-proxy"] == group["name"]
 
 
 @pytest.mark.asyncio

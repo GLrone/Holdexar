@@ -16,7 +16,7 @@ import {
   type ProxyStrategy,
   type ProxySubscriptionItem,
 } from '@/api/client'
-import { HlButton, HlDialog, HlIcon, HlSwitch, message } from '@/components/ui'
+import { HlButton, HlDialog, HlIcon, HlSegmented, HlSwitch, message } from '@/components/ui'
 import { useI18n, type MessageKey } from '@/locales'
 import { useProxyTasksStore } from '@/stores/proxyTasks'
 import { useSettingsStore } from '@/stores/settings'
@@ -40,7 +40,7 @@ const {
 const items = ref<ProxyItem[]>([])
 const subscriptions = ref<ProxySubscriptionItem[]>([])
 // 空串 = 尚未拉到策略：不预置任何模式，避免首屏假高亮（load 后由后端值决定）
-const strategy = ref<ProxyStrategy>({ strategy: '', clashPort: 7890 })
+const strategy = ref<ProxyStrategy>({ strategy: '', clashPort: null, clashPortMode: 'auto' })
 const events = ref<Awaited<ReturnType<typeof proxiesApi.events>>>([])
 const clash = ref<ClashStatus | null>(null)
 const loading = ref(true)
@@ -53,6 +53,10 @@ const clashRunningText = computed(() => {
   }
   return t('proxies.clash.running', { port: clash.value.port })
 })
+const portModeOptions = computed(() => [
+  { value: 'auto', label: t('proxies.port.mode.auto') },
+  { value: 'fixed', label: t('proxies.port.mode.fixed') },
+])
 const testingAll = ref(false)
 const testingId = ref<number | null>(null)
 
@@ -547,7 +551,30 @@ async function applyStrategy() {
   }
 }
 
-/** 本地混合端口独立保存（后端三字段可空独立落库，不随策略切换） */
+async function saveClashPortMode(mode: string | number) {
+  const portMode = String(mode) as 'auto' | 'fixed'
+  try {
+    const savedPort = strategy.value.clashPort ?? clash.value?.port
+    const fixedPort = Number(savedPort)
+    if (
+      portMode === 'fixed' &&
+      (!Number.isInteger(fixedPort) || fixedPort < 1024 || fixedPort > 65535)
+    ) {
+      message.warning(t('proxies.port.invalid'))
+      return
+    }
+    const clashPort = portMode === 'fixed' ? fixedPort : undefined
+    strategy.value = await proxiesApi.setStrategy({
+      clashPortMode: portMode,
+      ...(clashPort === undefined ? {} : { clashPort }),
+    })
+    message.success(t('proxies.port.updated'))
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+    await load()
+  }
+}
+
 async function saveClashPort() {
   const port = Number(strategy.value.clashPort)
   if (!Number.isInteger(port) || port < 1024 || port > 65535) {
@@ -556,10 +583,11 @@ async function saveClashPort() {
     return
   }
   try {
-    await proxiesApi.setStrategy({ clashPort: port })
+    strategy.value = await proxiesApi.setStrategy({ clashPortMode: 'fixed', clashPort: port })
     message.success(t('proxies.port.updated'))
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e))
+    await load()
   }
 }
 
@@ -952,19 +980,36 @@ async function loadHealthRuns() {
             {{ t(clash?.kernel.found ? 'proxies.kernel.ready' : 'proxies.kernel.missing') }}
           </span>
           <span v-if="clash?.version" class="tag">{{ clash.version.slice(0, 36) }}</span>
-          <!-- 本地混合端口：代理优先的回落探测指向它（自启 Verge 的接入点） -->
           <span class="proxyx-clash-port">
-            <label for="clash-port-input">{{ t('proxies.port.label') }}</label>
-            <input
-              id="clash-port-input"
-              v-model.number="strategy.clashPort"
-              class="pxinput pxinput--sm proxyx-clash-port__input"
-              type="number"
-              min="1024"
-              max="65535"
-              :title="t('proxies.port.title')"
-              @change="saveClashPort"
-            />
+            <span class="proxyx-port-status">
+              {{ strategy.clashPortMode === 'auto'
+                ? t('proxies.port.autoStatus', { port: clash?.running ? clash.port : t('proxies.port.stopped') })
+                : t('proxies.port.fixedStatus', { port: strategy.clashPort ?? t('proxies.port.stopped') }) }}
+            </span>
+            <details class="proxyx-port-advanced">
+              <summary>{{ t('proxies.port.advanced') }}</summary>
+              <div class="proxyx-port-advanced__body">
+                <HlSegmented
+                  v-model="strategy.clashPortMode"
+                  :options="portModeOptions"
+                  @update:model-value="saveClashPortMode"
+                />
+                <label v-if="strategy.clashPortMode === 'fixed'" for="clash-port-input">
+                  {{ t('proxies.port.fixedLabel') }}
+                </label>
+                <input
+                  v-if="strategy.clashPortMode === 'fixed'"
+                  id="clash-port-input"
+                  v-model.number="strategy.clashPort"
+                  class="pxinput pxinput--sm proxyx-clash-port__input"
+                  type="number"
+                  min="1024"
+                  max="65535"
+                  :title="t('proxies.port.title')"
+                  @change="saveClashPort"
+                />
+              </div>
+            </details>
           </span>
         </div>
 
@@ -1699,6 +1744,30 @@ async function loadHealthRuns() {
   margin-left: auto;
   font-size: 12px;
   color: var(--text-muted);
+}
+
+.proxyx-port-advanced {
+  position: relative;
+}
+
+.proxyx-port-advanced summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+}
+
+.proxyx-port-advanced__body {
+  position: absolute;
+  z-index: 12;
+  right: 0;
+  top: calc(100% + 8px);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  background: var(--surface-pop);
+  box-shadow: var(--shadow-md);
 }
 
 /* 自动维护开关行（内核自启 / 定期体检）：两枚开关横向排布 */

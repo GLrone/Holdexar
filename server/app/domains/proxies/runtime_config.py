@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -229,3 +230,108 @@ def render_subscription_config(text: str) -> str:
         doc_out["proxy-groups"] = out_groups
 
     return yaml.safe_dump(doc_out, allow_unicode=True, sort_keys=False)
+
+
+def apply_provider_overrides(
+    nodes: Sequence[Mapping[str, Any]], provider_config: Mapping[str, Any],
+    provider_name: str = "",
+) -> list[dict]:
+    override = provider_config.get("override") or {}
+    if not isinstance(override, Mapping):
+        raise ValueError(f"节点来源 {provider_name} 的覆盖配置无效")
+    if override.get("override-expr"):
+        raise ValueError(f"节点来源 {provider_name} 使用了当前运行配置不支持的表达式覆盖")
+    prefixes = override.get("additional-prefix", "")
+    suffixes = override.get("additional-suffix", "")
+    if not isinstance(prefixes, str) or not isinstance(suffixes, str):
+        raise ValueError(f"节点来源 {provider_name} 的名称覆盖无效")
+    name_rules = override.get("proxy-name") or []
+    if isinstance(name_rules, Mapping):
+        name_rules = [name_rules]
+    if not isinstance(name_rules, list) or any(
+        not isinstance(rule, Mapping)
+        or not isinstance(rule.get("pattern"), str)
+        or not isinstance(rule.get("target"), str)
+        for rule in name_rules
+    ):
+        raise ValueError(f"节点来源 {provider_name} 的名称替换无效")
+    try:
+        compiled_rules = [
+            (re.compile(rule["pattern"]), rule["target"])
+            for rule in name_rules
+        ]
+    except re.error as exc:
+        raise ValueError(f"节点来源 {provider_name} 的名称替换无效") from exc
+
+    resolved: list[dict] = []
+    for source in nodes:
+        if not isinstance(source, Mapping):
+            continue
+        node = copy.deepcopy(dict(source))
+        name = f"{prefixes}{str(node.get('name') or '')}{suffixes}"
+        for pattern, target in compiled_rules:
+            replacement = re.sub(
+                r"\$(\d+)",
+                lambda match: rf"\g<{match.group(1)}>",
+                target,
+            )
+            name = pattern.sub(replacement, name)
+        if name:
+            node["name"] = name
+        for key, value in override.items():
+            if key not in {
+                "additional-prefix", "additional-suffix", "proxy-name",
+                "override-expr",
+            }:
+                node[key] = copy.deepcopy(value)
+        resolved.append(node)
+    return resolved
+
+
+def expand_provider_nodes(text: str, provider_nodes: Mapping[str, Sequence[Mapping[str, Any]]]) -> str:
+    """Replace remote provider references with nodes resolved by the subscription snapshot."""
+    try:
+        doc = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ValueError("订阅配置不是合法 YAML") from exc
+    if not isinstance(doc, dict):
+        raise ValueError("订阅配置不是 YAML 映射")
+    providers = doc.get("proxy-providers") or {}
+    if not isinstance(providers, dict):
+        raise ValueError("订阅配置的节点来源无效")
+
+    resolved_providers: dict[str, list[dict]] = {}
+    for provider_name, provider_config in providers.items():
+        if not isinstance(provider_config, Mapping):
+            raise ValueError(f"节点来源 {provider_name} 的配置无效")
+        resolved_providers[str(provider_name)] = apply_provider_overrides(
+            provider_nodes.get(provider_name, ()), provider_config, str(provider_name),
+        )
+
+    proxies = [dict(node) for node in (doc.get("proxies") or []) if isinstance(node, Mapping)]
+    proxies.extend(
+        node
+        for provider_name in providers
+        for node in resolved_providers.get(str(provider_name), ())
+    )
+    groups = doc.get("proxy-groups") or []
+    if isinstance(groups, list):
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            used_providers = list(group.get("use") or [])
+            if group.pop("include-all-providers", False):
+                used_providers.extend(providers)
+            names = [
+                str(node.get("name"))
+                for provider_name in used_providers
+                for node in resolved_providers.get(str(provider_name), ())
+                if isinstance(node, Mapping) and node.get("name")
+            ]
+            current = [str(name) for name in (group.get("proxies") or [])]
+            group["proxies"] = list(dict.fromkeys([*current, *names]))
+            group.pop("use", None)
+
+    doc.pop("proxy-providers", None)
+    doc["proxies"] = proxies
+    return yaml.safe_dump(doc, allow_unicode=True, sort_keys=False)

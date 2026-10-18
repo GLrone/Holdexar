@@ -33,11 +33,17 @@ const proxies: Partial<Record<MessageKey, string>> = {
   'proxies.strategy.off': 'Off',
   'proxies.strategy.updated': 'Routing policy updated (takes effect on the next job)',
 
-  /* Local mixed port (standalone config, unaffected by policy) */
-  'proxies.port.label': 'Kernel port',
-  'proxies.port.title': 'Mixed port our own kernel listens on — all program proxy traffic goes through it; the Verge fallback probes 7897 regardless of this setting',
+  /* Kernel proxy port */
+  'proxies.port.mode.auto': 'Automatic',
+  'proxies.port.mode.fixed': 'Fixed port',
+  'proxies.port.advanced': 'Advanced port settings',
+  'proxies.port.autoStatus': 'Automatic · current port {port}',
+  'proxies.port.fixedStatus': 'Fixed port · {port}',
+  'proxies.port.fixedLabel': 'Listening port',
+  'proxies.port.stopped': 'kernel stopped',
+  'proxies.port.title': 'The kernel listens on this device only; automatic mode assigns a port at startup, while fixed mode keeps existing settings',
   'proxies.port.invalid': 'Port must be an integer between 1024 and 65535',
-  'proxies.port.updated': 'Clash port updated',
+  'proxies.port.updated': 'Proxy port settings updated',
 
   /* Auto-maintenance switches (kernel autostart / periodic health check; manual tests bypass) */
   'proxies.auto.autostartLabel': 'Start kernel with the app',
