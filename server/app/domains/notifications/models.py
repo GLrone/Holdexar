@@ -46,7 +46,8 @@ class NotificationCandidate(Base):
     status 是投递状态，不是事实状态：
     - `pending`    待投递（本轮摘要会带上）
     - `suppressed` 静默期顺延：不是丢掉，等下一个非静默批次一并投递
-    - `sending`    投递中（瞬态；进程在 SMTP 期间被杀会停在该态，不重发）
+    - `sending`    投递中（超过回收时限转为 unknown，不重发）
+    - `unknown`    投递结果未知（进程中断时可能已发出，禁止自动重发）
     - `delivered`  已投递
     - `failed`     投递失败（reason 记原因；不自动重试，重试会放大成重复投递）
     """

@@ -243,6 +243,7 @@ const settings = {
   'settings.notification.off': '通知未开启',
   'settings.notification.on': '通知已开启，等待下一轮价格刷新',
   'settings.notification.lastOk': '最近一次邮件已送出（{time}）',
+  'settings.notification.lastUnknown': '邮件发送中断，无法确认是否送达。请先检查收件箱；应用不会自动重发。',
   'settings.notification.lastFailed': '最近一次邮件发送失败：{reason}',
   'settings.notification.lastRetryable': '临时故障，下一轮会自动重试（已尝试 {n} 次）',
   'settings.notification.lastPermanent': '已放弃重试，请检查邮箱与授权码',
@@ -250,6 +251,7 @@ const settings = {
   'settings.notification.testSent': '测试邮件已发送，请到收件箱确认',
   'settings.notification.stats':
     '已投递 {delivered} 条 · 失败 {failed} 条（其中 {retryable} 条可重试）',
+  'settings.notification.unknownCount': '另有 {unknown} 封邮件的送达结果无法确认',
 } as const
 
 export default settings

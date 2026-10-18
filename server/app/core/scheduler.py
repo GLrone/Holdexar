@@ -1104,12 +1104,19 @@ async def _job_proxypool_retention() -> None:
 
 
 async def _job_price_cycle_retention() -> None:
-    """价格周期台账保留（每日 04:37）：90 天窗整行删除 + 存量 JSON 明细
-    置 NULL（除最近 8 轮），收敛调度账本最大无界点。异常只记日志。"""
+    """每日清理过期价格事件、周期记录与已结束通知结果。"""
     from app.domains.crawl import retention as crawl_retention
+    from app.domains.notifications import retention as notification_retention
 
     try:
-        await crawl_retention.prune_price_cycles()
+        price_result = await crawl_retention.prune_price_cycles()
+        notification_result = await notification_retention.prune_notification_candidates()
+        if price_result["truncated"] or notification_result["truncated"]:
+            log_event(
+                logger,
+                "价格与通知记录清理达到单轮上限，后续计划会继续",
+                tag="延后",
+            )
     except Exception:  # noqa: BLE001 —— 清理失败不拖垮调度器
         log_event(logger, "价格周期台账保留清理异常", level=logging.ERROR, exc_info=True)
 

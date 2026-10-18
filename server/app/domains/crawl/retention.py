@@ -89,17 +89,28 @@ async def prune_price_cycles(
         chunk=chunk,
         max_chunks=max_chunks,
     )
-    if rows_deleted or details_trimmed:
+    events_deleted, truncated_events = await _chunked_execute(
+        "DELETE FROM price_events WHERE id IN ("
+        "SELECT id FROM price_events"
+        " WHERE occurred_at IS NOT NULL AND occurred_at < :cutoff"
+        " ORDER BY id LIMIT :chunk)",
+        {"cutoff": cutoff},
+        chunk=chunk,
+        max_chunks=max_chunks,
+    )
+    if rows_deleted or details_trimmed or events_deleted:
         log_event(
             logger,
-            "价格周期台账保留完成，回收过窗的周期记录与存量明细",
+            "价格周期台账保留完成，回收过窗的周期记录、价格事件与存量明细",
             detail={
                 "删除行数": rows_deleted,
+                "价格事件": events_deleted,
                 "置空明细轮数": details_trimmed,
             },
         )
     return {
         "rows_deleted": rows_deleted,
+        "events_deleted": events_deleted,
         "details_trimmed": details_trimmed,
-        "truncated": truncated_rows or truncated_details,
+        "truncated": truncated_rows or truncated_details or truncated_events,
     }

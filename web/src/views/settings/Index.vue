@@ -968,13 +968,18 @@ async function patchNotifications(patch: NotificationPrefsUpdate) {
 
 /** 通知是否真的可用——开关开了但出口没配好，界面必须说清楚 */
 const notifyReady = computed(() => !!notifyPrefs.value?.smtp.configured)
+const notifyStateIsBad = computed(() => {
+  const status = notifyPrefs.value?.lastDelivery?.status
+  return !notifyReady.value || status === 'failed' || status === 'unknown'
+})
 
 const notifyStateKey = computed<MessageKey>(() => {
   const prefs = notifyPrefs.value
   if (!prefs) return 'settings.notification.off'
+  const last = prefs.lastDelivery
+  if (last?.status === 'unknown') return 'settings.notification.lastUnknown'
   if (!prefs.smtp.configured) return 'settings.notification.smtpMissing'
   if (!prefs.enabled) return 'settings.notification.off'
-  const last = prefs.lastDelivery
   if (last?.status === 'delivered') return 'settings.notification.lastOk'
   if (last?.status === 'failed') {
     return last.retryable
@@ -2076,7 +2081,7 @@ onUnmounted(stopLoginPolling)
 
         <!-- 状态：出口是否可用 + 最近一次投递结果（不展示任何凭据） -->
         <div class="settings-row">
-          <div class="notify-status" :class="{ 'is-bad': !notifyReady }">
+          <div class="notify-status" :class="{ 'is-bad': notifyStateIsBad }">
             <span class="notify-status__dot" />
             <span>{{ t(notifyStateKey, notifyStateParams) }}</span>
           </div>
@@ -2096,6 +2101,9 @@ onUnmounted(stopLoginPolling)
               failed: notifyStats.failed,
               retryable: notifyStats.retryable,
             }) }}
+          </div>
+          <div v-if="notifyStats && notifyStats.unknown > 0" class="section-desc">
+            {{ t('settings.notification.unknownCount', { unknown: notifyStats.unknown }) }}
           </div>
         </div>
 

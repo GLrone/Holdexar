@@ -2771,6 +2771,7 @@ export interface NotificationStats {
   pending: number
   suppressed: number
   sending: number
+  unknown: number
   failed: number
   /** 失败里还能再试的（临时故障且未到次数上限） */
   retryable: number
@@ -2810,12 +2811,13 @@ export interface FactNotice {
     | 'challenge_completed'
     | 'achievement_unlocked_batch'
     | string
-  /** 消费参数：HB = {label, productName, count}；Epic = {count, titles[]}；
-   *  成就 = {fromLevel, toLevel} / {challengeId} / {count, titles[]} */
+  /** 消费参数：HB = {label, productName, count}；Epic = {count, appid?, titles[]}；
+   *  成就 = {fromLevel, toLevel} / {challengeId} / {count, appid?, titles[]} */
   data: {
     label?: string
     productName?: string
     count?: number
+    appid?: number
     titles?: string[]
     fromLevel?: number
     toLevel?: number

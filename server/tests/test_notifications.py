@@ -6,6 +6,7 @@
 隔离：tmp 库 + get_session_factory 逐模块打桩；send_mail 用桩记录调用，
 不出网、不发真邮件。
 """
+import asyncio
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -439,6 +440,50 @@ async def test_sending_candidates_are_not_requeued(db, delivery):
 
 
 @pytest.mark.asyncio
+async def test_stale_sending_becomes_unknown_without_resending(db, delivery):
+    await _enable(db)
+    await _seed_game(db)
+    cid = await _cycle(db)
+    await _seed_event(db, cid, "PRICE_DROP",
+                      previous={"price": 19900}, current={"price": 9900})
+    await notification_service.dispatch(cid)
+    row = (await _candidates(db))[0]
+    async with db() as session:
+        row = await session.get(NotificationCandidate, row.id)
+        row.status = "sending"
+        row.updated_at = datetime.now() - notification_service.SENDING_TIMEOUT - timedelta(minutes=1)
+        await session.commit()
+
+    sent_before = len(delivery)
+    result = await notification_service.dispatch(cid)
+
+    assert result["unknown"] == 1
+    assert result["sent"] == 0
+    assert len(delivery) == sent_before
+    row = (await _candidates(db))[0]
+    assert row.status == "unknown"
+    assert "无法确认" in row.reason
+
+
+@pytest.mark.asyncio
+async def test_concurrent_dispatch_claims_each_candidate_once(db, delivery):
+    await _enable(db)
+    await _seed_game(db)
+    cid = await _cycle(db)
+    await _seed_event(db, cid, "PRICE_DROP",
+                      previous={"price": 19900}, current={"price": 9900})
+
+    results = await asyncio.gather(
+        notification_service.dispatch(cid),
+        notification_service.dispatch(cid),
+    )
+
+    assert sum(result["sent"] for result in results) == 1
+    assert len(delivery) == 1
+    assert [row.status for row in await _candidates(db)] == ["delivered"]
+
+
+@pytest.mark.asyncio
 async def test_notification_failure_never_breaks_cycle_finalizing(db, monkeypatch):
     """通知层抛异常也只记日志：编排侧包住后 Cycle 照常收敛 completed。"""
     from app.domains.crawl import cycle_run
@@ -582,3 +627,34 @@ async def test_prefs_endpoint_smtp_view(db, monkeypatch):
     assert payload["smtp"]["useSsl"] is True
     assert payload["smtp"]["hasPassword"] is True
     assert "password" not in payload["smtp"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_delivery_is_visible_in_notification_status(db, monkeypatch):
+    from app.domains.notifications import router as notif_router
+
+    now = datetime.now()
+    async with db() as session:
+        session.add(NotificationCandidate(
+            event_id=987654, cycle_id=12, appid=APP, event_type="PRICE_DROP",
+            category="price", recipient=RECIPIENT, status="unknown",
+            reason="投递中断，外部是否已接收无法确认", last_error="sending 超时",
+            created_at=now - timedelta(hours=1), updated_at=now,
+        ))
+        await session.commit()
+
+    async def _smtp_view():
+        return {
+            "host": "smtp.example.com", "port": 465, "user": "sender@example.com",
+            "password": "", "hasPassword": True, "toAddr": RECIPIENT, "useSsl": True,
+        }
+
+    monkeypatch.setattr(notif_router, "get_session_factory", lambda: db)
+    monkeypatch.setattr(notif_router, "get_smtp_config", _smtp_view)
+
+    payload = await notif_router.get_prefs()
+    stats = await notif_router.stats()
+
+    assert payload["lastDelivery"]["status"] == "unknown"
+    assert payload["lastDelivery"]["at"] is not None
+    assert stats["unknown"] == 1
