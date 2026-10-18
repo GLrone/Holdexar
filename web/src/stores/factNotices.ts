@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 
 import { notificationsApi, type FactNotice } from '@/api/client'
 import { message } from '@/components/ui'
+import { pilotCoverUrl } from '@/lib/pilotView'
 import { useI18n, type MessageKey } from '@/locales'
 
 /* ════════════════════════════════════════════════════════════════════
@@ -80,10 +81,12 @@ export const useFactNoticesStore = defineStore('factNotices', () => {
     if (!textKey) return
     const { t } = useI18n()
     const params = factParams(item, t)
+    const appid = Number(item.data?.appid)
     message.info(t(textKey, params), {
       duration: 8000,
       detail: FACT_DETAIL[shape] ? t(FACT_DETAIL[shape], params) : '',
       to: FACT_TO[item.source] ?? FACT_TO._default,
+      iconImageUrl: Number.isSafeInteger(appid) && appid > 0 ? pilotCoverUrl(appid) : undefined,
     })
   }
 

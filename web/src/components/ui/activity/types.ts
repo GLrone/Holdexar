@@ -29,6 +29,8 @@ export interface Activity {
   detail?: string
   /** 图标名称（对应 icons.ts 认可图标） */
   icon?: string
+  /** 可选业务图片标识；仅明确指向单款游戏时传入封面 */
+  iconImageUrl?: string
   /** 图标语义色彩 */
   tone?: ActivityTone
   /** 进度 0-100；null 为滑动进度条；undefined 为无进度条 */
@@ -62,6 +64,7 @@ export interface ActivityRegistration {
   title: string
   detail?: string
   icon?: string
+  iconImageUrl?: string
   tone?: ActivityTone
   progress?: number | null
   priority?: number

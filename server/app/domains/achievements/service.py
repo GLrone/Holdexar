@@ -975,6 +975,13 @@ def _xp_marker(source: str, source_ref: str) -> dict:
             "note": "baseline marker"}
 
 
+def _single_unlock_appid(items: list[dict]) -> int | None:
+    if not items or any(item.get("appid") is None for item in items):
+        return None
+    appids = {int(item["appid"]) for item in items}
+    return next(iter(appids)) if len(appids) == 1 else None
+
+
 async def _award_sync_xp(steamid: str) -> None:
     """同步收尾经验记账：基线回填/差分批量落账 → 涨级与新解锁事实 → 挑战重算。
 
@@ -1039,6 +1046,7 @@ async def _award_sync_xp(steamid: str) -> None:
                     entries.append({"source": level.SOURCE_UNLOCK, "source_ref": ref,
                                     "xp": xp, "multiplier": mult})
                     awarded_unlocks.append({
+                        "appid": int(st.appid),
                         "name": (d.name if d is not None and d.name else st.image_name),
                         "unlockTime": int(st.unlock_time or 0),
                     })
@@ -1082,6 +1090,7 @@ async def _award_sync_xp(steamid: str) -> None:
                 kind="achievement_unlocked_batch",
                 fact_key=f"{steamid}:unlock_batch:{max(a['unlockTime'] for a in awarded_unlocks)}",
                 data={"count": len(awarded_unlocks),
+                      **({"appid": appid} if (appid := _single_unlock_appid(awarded_unlocks)) is not None else {}),
                       "titles": [a["name"] for a in awarded_unlocks]},
             )
         except Exception:  # noqa: BLE001 —— 事实落库失败不影响主链

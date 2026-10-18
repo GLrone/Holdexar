@@ -837,6 +837,7 @@ async def _publish_epic_rotation(old_payload: dict | None, new_payload: dict) ->
     if not fresh:
         return
     identities = sorted(_offer_identity(offer) or "" for offer in fresh)
+    appid = int(fresh[0]["appid"]) if len(fresh) == 1 and fresh[0].get("appid") else None
     from app.domains.notifications import facts as facts_service
 
     await facts_service.record_fact(
@@ -845,6 +846,7 @@ async def _publish_epic_rotation(old_payload: dict | None, new_payload: dict) ->
         fact_key=f"epic_free:{'|'.join(identities)}",
         data={
             "count": len(fresh),
+            **({"appid": appid} if appid is not None else {}),
             "titles": [
                 str(offer.get("titleCn") or offer.get("title") or "").strip()
                 for offer in fresh

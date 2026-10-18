@@ -27,6 +27,8 @@ export interface IslandNotice {
   to: string
   /** 详情动作的按钮文案键；留空时按通用文案渲染 */
   toLabel: string
+  /** 单款游戏事实可携带封面图；多个游戏时留空 */
+  iconImageUrl?: string
 }
 
 export interface IslandState {
@@ -37,8 +39,6 @@ export interface IslandState {
   expanded: boolean
   /** 指针停留在岛内，队列倒计时在此期间挂起 */
   hovered: boolean
-  /** 按消息语义静音，命中的入队请求被丢弃 */
-  muted: Record<string, boolean>
 }
 
 /** 全局长任务：进度行与完成情况由发起方 store 持续喂养，结束即撤下 */
@@ -61,7 +61,6 @@ export const island = reactive<IslandState>({
   tasks: [],
   expanded: false,
   hovered: false,
-  muted: {},
 })
 
 let seq = 0
@@ -84,20 +83,6 @@ export function dropNotice(id: number) {
   armTimer()
 }
 
-/** 按语义静音：清空该语义的在队项，并令其后续入队请求落空 */
-export function muteTone(tone: IslandTone) {
-  island.muted[tone] = true
-  activityManager.muteTone(tone)
-  for (let i = island.notices.length - 1; i >= 0; i -= 1) {
-    if (island.notices[i].tone === tone) {
-      const targetId = island.notices[i].id
-      island.notices.splice(i, 1)
-      activityManager.remove(`notice:${targetId}`)
-    }
-  }
-  armTimer()
-}
-
 /** 队首展示项的存活倒计时：队首更替即重排，悬停与展开期间挂起 */
 export function armTimer() {
   clearTimer()
@@ -113,10 +98,8 @@ export function armTimer() {
   }, head.duration)
 }
 
-/** 入队一条消息，返回其 id。被静音的语义返回 -1 */
+/** 入队一条消息，返回其 id */
 export function pushNotice(notice: Omit<IslandNotice, 'id'>): number {
-  if (island.muted[notice.tone]) return -1
-
   /* 进行中与结果共用同一个展示槽位：两者的在队项各自只留一条 */
   const stickyAt = island.notices.findIndex((n) => n.sticky)
   if (notice.sticky) {
@@ -146,6 +129,7 @@ export function pushNotice(notice: Omit<IslandNotice, 'id'>): number {
     status: item.tone === 'error' ? 'failed' : (item.sticky ? 'running' : 'success'),
     title: item.text,
     detail: item.detail,
+    iconImageUrl: item.iconImageUrl,
     tone: item.tone,
     duration: item.sticky ? 0 : item.duration,
     retry: item.retry,

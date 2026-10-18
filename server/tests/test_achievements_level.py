@@ -102,6 +102,16 @@ def test_streak_multiplier_bands():
     ]
 
 
+def test_unlock_batch_cover_is_selected_only_for_one_game():
+    same_game = [{"appid": 620}, {"appid": 620}]
+    mixed_games = [{"appid": 620}, {"appid": 440}]
+    missing_game = [{"appid": 620}, {}]
+
+    assert achievements_service._single_unlock_appid(same_game) == 620
+    assert achievements_service._single_unlock_appid(mixed_games) is None
+    assert achievements_service._single_unlock_appid(missing_game) is None
+
+
 # ─── 记账与基线 ───────────────────────────────────────────────
 
 

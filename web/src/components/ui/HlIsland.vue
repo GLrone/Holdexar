@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
 import { crawlApi } from '@/api/client'
@@ -12,8 +12,14 @@ import { islandController } from './activity/islandController'
 import ActivityPanel from './activity/ActivityPanel.vue'
 import PrimaryIsland from './activity/PrimaryIsland.vue'
 import SecondaryIsland from './activity/SecondaryIsland.vue'
-import type { Activity, ActivityTone } from './activity/types'
-import { dropNotice, island, muteTone, setExpanded, setHovered } from './island'
+import {
+  createRectKeyframes,
+  islandSwapDuration,
+  islandSwapEasing,
+  type IslandMotionRect,
+} from './activity/islandMotionGeometry'
+import type { Activity } from './activity/types'
+import { dropNotice, island, setExpanded, setHovered } from './island'
 
 /**
  * 灵动岛宿主组件（HlIsland）：
@@ -43,12 +49,10 @@ const TONE_ICON: Record<string, string> = {
   progress: 'refresh',
 }
 
-/* 四态尺寸 */
+/* 基础尺寸规格：收起态高度恒定 36px，全圆角 18px */
 const SHAPE = {
-  idle: { h: 30, r: 15 },
-  notice: { h: 34, r: 17 },
-  task: { w: 348, h: 58, r: 20 },
-  expanded: { w: 420, r: 28 },
+  compact: { h: 36, r: 18 },
+  expanded: { w: 420, r: 24 },
 } as const
 
 const EXPANDED_TEXT_W = 350
@@ -273,10 +277,13 @@ const expandedHeight = computed(() => {
 
 const size = computed(() => {
   const m = mode.value
-  if (m === 'idle') return { w: idleWidth.value, h: SHAPE.idle.h, r: SHAPE.idle.r }
-  if (m === 'notice') return { w: noticeWidth.value, h: SHAPE.notice.h, r: SHAPE.notice.r }
   if (m === 'expanded') return { w: SHAPE.expanded.w, h: expandedHeight.value, r: SHAPE.expanded.r }
-  return { w: SHAPE.task.w, h: SHAPE.task.h, r: SHAPE.task.r }
+  // 多活动模式时，主岛推荐固定宽度 240px，高度 36px，圆角 18px
+  if (islandController.hasSecondary) {
+    return { w: 240, h: SHAPE.compact.h, r: SHAPE.compact.r }
+  }
+  if (m === 'idle') return { w: idleWidth.value, h: SHAPE.compact.h, r: SHAPE.compact.r }
+  return { w: Math.min(320, Math.max(160, noticeWidth.value)), h: SHAPE.compact.h, r: SHAPE.compact.r }
 })
 
 const islandStyle = computed(() => ({
@@ -286,6 +293,7 @@ const islandStyle = computed(() => ({
 }))
 
 function onIslandClick() {
+  if (isSwapBusy.value) return
   const next = !islandController.isExpanded.value
   islandController.setExpanded(next)
   setExpanded(next)
@@ -300,17 +308,6 @@ function dismiss() {
   }
   const n = legacyNotice.value
   if (n) dropNotice(n.id)
-}
-
-function mute() {
-  islandController.setExpanded(false)
-  setExpanded(false)
-  const act = primaryAct.value
-  if (act && act.tone) {
-    muteTone(act.tone as ActivityTone)
-  } else if (legacyNotice.value) {
-    muteTone(legacyNotice.value.tone)
-  }
 }
 
 function retry() {
@@ -382,45 +379,280 @@ function onDocDown(e: MouseEvent) {
   setExpanded(false)
 }
 
-const isSwapping = ref(false)
-let swapTimer: ReturnType<typeof setTimeout> | null = null
+const isSwapBusy = ref(false)
+const hideSwapRoots = ref(false)
+const pendingSelectionId = ref<string | null>(null)
+const swapAnimations: Animation[] = []
+const swapClones: HTMLElement[] = []
+let swapSequence = 0
+let expectedSwapIds: string | null = null
+let applyingSwap = false
 
-function onSecondarySwap() {
-  if (isSwapping.value) return
-  isSwapping.value = true
-  if (swapTimer) clearTimeout(swapTimer)
-  swapTimer = setTimeout(() => {
-    islandController.swap()
-    swapTimer = setTimeout(() => {
-      isSwapping.value = false
-    }, 140)
-  }, 140)
+function motionRect(element: HTMLElement): IslandMotionRect {
+  const rect = element.getBoundingClientRect()
+  return {
+    left: rect.left,
+    top: rect.top,
+    width: rect.width,
+    height: rect.height,
+    borderRadius: getComputedStyle(element).borderRadius,
+  }
 }
 
+function createMotionClone(element: HTMLElement): HTMLElement {
+  const rect = motionRect(element)
+  const clone = element.cloneNode(true) as HTMLElement
+  clone.removeAttribute('id')
+  clone.removeAttribute('data-v-app')
+  clone.setAttribute('aria-hidden', 'true')
+  clone.inert = true
+  clone.querySelectorAll('[id]').forEach((child) => child.removeAttribute('id'))
+  clone.querySelectorAll('.hl-secondary-preview').forEach((preview) => preview.remove())
+  Object.assign(clone.style, {
+    position: 'fixed',
+    left: `${rect.left}px`,
+    top: `${rect.top}px`,
+    right: 'auto',
+    bottom: 'auto',
+    width: `${rect.width}px`,
+    height: `${rect.height}px`,
+    borderRadius: rect.borderRadius,
+    margin: '0',
+    flex: 'none',
+    transform: 'none',
+    transition: 'none',
+    pointerEvents: 'none',
+    zIndex: '10002',
+  })
+  clone.style.opacity = String(
+    Number(getComputedStyle(element).opacity) * Number(getComputedStyle(rootEl.value!).opacity),
+  )
+  document.body.appendChild(clone)
+  swapClones.push(clone)
+  return clone
+}
+
+function clearSwapVisuals() {
+  for (const animation of swapAnimations.splice(0)) animation.cancel()
+  for (const clone of swapClones.splice(0)) clone.remove()
+  hideSwapRoots.value = false
+  rootEl.value?.querySelectorAll<HTMLElement>('.hl-island, .hl-secondary-island').forEach((element) => {
+    element.classList.remove('is-swap-hidden')
+    element.removeAttribute('aria-hidden')
+    element.inert = false
+    element.style.removeProperty('opacity')
+    element.style.removeProperty('transition')
+  })
+  isSwapBusy.value = false
+  expectedSwapIds = null
+}
+
+function cancelSwapForStateChange() {
+  if (!isSwapBusy.value) return
+  swapSequence += 1
+  clearSwapVisuals()
+}
+
+function waitForTransition(element: HTMLElement, property: string, fallbackMs: number): Promise<void> {
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) return Promise.resolve()
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      element.removeEventListener('transitionend', onTransitionEnd)
+      resolve()
+    }
+    const onTransitionEnd = (event: TransitionEvent) => {
+      if (event.target === element && event.propertyName === property) finish()
+    }
+    const timer = setTimeout(finish, fallbackMs)
+    element.addEventListener('transitionend', onTransitionEnd)
+  })
+}
+
+async function onSecondarySwap() {
+  if (isSwapBusy.value || !islandController.hasSecondary) return
+  isSwapBusy.value = true
+  const run = ++swapSequence
+  const host = rootEl.value
+  const main = host?.querySelector<HTMLElement>('.hl-island')
+  if (!host || !main) {
+    islandController.swap()
+    isSwapBusy.value = false
+    return
+  }
+
+  if (islandController.isExpanded.value || island.expanded) {
+    const collapse = waitForTransition(main, 'width', 480)
+    islandController.setExpanded(false)
+    setExpanded(false)
+    await collapse
+    if (run !== swapSequence) return
+  }
+
+  const oldMain = host.querySelector<HTMLElement>('.hl-island')
+  const oldSecondary = host.querySelector<HTMLElement>('.hl-secondary-island')
+  if (!oldMain || !oldSecondary) {
+    islandController.swap()
+    isSwapBusy.value = false
+    return
+  }
+
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    islandController.swap()
+    isSwapBusy.value = false
+    return
+  }
+
+  const oldMainId = islandController.primaryId
+  const mainClone = createMotionClone(oldMain)
+  const secondaryClone = createMotionClone(oldSecondary)
+  const mainStart = motionRect(oldMain)
+  const secondaryStart = motionRect(oldSecondary)
+  hideSwapRoots.value = true
+  await nextTick()
+
+  applyingSwap = true
+  islandController.swap()
+  expectedSwapIds = `${islandController.primaryId ?? ''}:${islandController.secondaryId ?? ''}`
+  applyingSwap = false
+  await nextTick()
+
+  const newMain = host.querySelector<HTMLElement>('.hl-island')
+  const newSecondary = host.querySelector<HTMLElement>('.hl-secondary-island')
+  const currentIds = `${islandController.primaryId ?? ''}:${islandController.secondaryId ?? ''}`
+  if (!newMain || !newSecondary || currentIds !== expectedSwapIds || run !== swapSequence) {
+    clearSwapVisuals()
+    return
+  }
+
+  const mainTarget = motionRect(newMain)
+  const secondaryTarget = motionRect(newSecondary)
+  const twoActivities = islandController.count === 2 && oldMainId === islandController.secondaryId
+  for (const element of [newMain, newSecondary]) {
+    element.style.opacity = '0'
+    element.style.transition = 'none'
+  }
+  hideSwapRoots.value = false
+  await nextTick()
+
+  const mainFrames = createRectKeyframes(secondaryStart, mainTarget)
+  mainFrames[0].offset = 0
+  mainFrames[1].offset = 0.78
+  mainFrames.push({ ...mainFrames[1], offset: 1, opacity: 0 })
+
+  const mainMotion = secondaryClone.animate(mainFrames, {
+    duration: islandSwapDuration,
+    easing: islandSwapEasing,
+    fill: 'both',
+  })
+  swapAnimations.push(mainMotion)
+
+  if (twoActivities) {
+    const secondaryFrames = createRectKeyframes(mainStart, secondaryTarget)
+    secondaryFrames[0].opacity = 1
+    secondaryFrames[1].opacity = 0.2
+    const secondaryMotion = mainClone.animate(secondaryFrames, {
+      duration: islandSwapDuration,
+      easing: islandSwapEasing,
+      fill: 'both',
+    })
+    swapAnimations.push(secondaryMotion)
+  } else {
+    const outgoingMotion = mainClone.animate(
+      [{ opacity: 1 }, { opacity: 0 }],
+      { duration: islandSwapDuration, easing: islandSwapEasing, fill: 'both' },
+    )
+    swapAnimations.push(outgoingMotion)
+  }
+
+  for (const element of [newMain, newSecondary]) {
+    element.removeAttribute('aria-hidden')
+    element.inert = false
+    const reveal = element.animate(
+      [{ opacity: 0 }, { opacity: 1 }],
+      {
+        delay: islandSwapDuration * 0.68,
+        duration: islandSwapDuration * 0.32,
+        easing: 'linear',
+        fill: 'both',
+      },
+    )
+    swapAnimations.push(reveal)
+  }
+
+  try {
+    await Promise.all(swapAnimations.map((animation) => animation.finished.catch(() => undefined)))
+  } finally {
+    if (run === swapSequence) clearSwapVisuals()
+  }
+}
+
+watch(islandController.swapRequest, () => void onSecondarySwap())
+watch(
+  () => `${islandController.primaryId ?? ''}:${islandController.secondaryId ?? ''}`,
+  (ids) => {
+    if (isSwapBusy.value && !applyingSwap && expectedSwapIds && ids !== expectedSwapIds) {
+      cancelSwapForStateChange()
+    }
+  },
+  { flush: 'sync' },
+)
+
 function onSelectActivity(id: string) {
-  islandController.selectPrimary(id)
+  if (!activityManager.get(id)) return
+  pendingSelectionId.value = id === islandController.primaryId ? null : id
   islandController.setOverview(false)
+}
+
+function onActivityPanelAfterLeave() {
+  const id = pendingSelectionId.value
+  pendingSelectionId.value = null
+  if (id && activityManager.get(id)) islandController.selectPrimary(id)
 }
 
 function onPinActivity(id: string) {
   islandController.togglePin(id)
 }
 
+function onPanelAction(act: Activity) {
+  islandController.setOverview(false)
+  if (act.to && !act.id.startsWith('dev:')) {
+    void router.push(act.to)
+  }
+}
+
 onMounted(() => document.addEventListener('mousedown', onDocDown))
 onBeforeUnmount(() => {
   document.removeEventListener('mousedown', onDocDown)
-  if (swapTimer) clearTimeout(swapTimer)
+  swapSequence += 1
+  clearSwapVisuals()
 })
 </script>
 
 <template>
   <Transition name="island-retract">
-    <div v-if="visible" ref="rootEl" class="hl-island-host">
+    <div
+      v-if="visible"
+      ref="rootEl"
+      class="hl-island-host"
+    >
       <!-- 主岛容器 -->
       <div
         class="hl-island"
-        :class="[`hl-island--${mode}`, { 'is-stacked': headStacked, 'is-swapping-primary': isSwapping }]"
+        :class="[
+          `hl-island--${mode}`,
+          {
+            'is-stacked': headStacked,
+            'is-swap-hidden': hideSwapRoots,
+          },
+        ]"
         :style="islandStyle"
+        :data-activity-id="primaryAct?.id"
+        :aria-hidden="hideSwapRoots ? 'true' : undefined"
+        :inert="hideSwapRoots"
         role="status"
         aria-live="polite"
         :aria-label="t('island.label')"
@@ -456,7 +688,6 @@ onBeforeUnmount(() => {
           @cancel="cancelTask"
           @retry="retry"
           @dismiss="dismiss"
-          @mute="mute"
           @go-detail="goDetail"
           @go-task="goTask"
           @open-task="openTask"
@@ -469,7 +700,7 @@ onBeforeUnmount(() => {
           v-if="islandController.hasSecondary"
           :activity="secondaryAct"
           :extra-count="islandController.waitingCount"
-          :is-swapping="isSwapping"
+          :is-swap-hidden="hideSwapRoots"
           @swap="onSecondarySwap"
           @open-overview="islandController.setOverview(true)"
         />
@@ -482,7 +713,9 @@ onBeforeUnmount(() => {
         :pinned-id="islandController.pinnedId"
         :open="islandController.isOverviewOpen.value"
         @select="onSelectActivity"
+        @after-close="onActivityPanelAfterLeave"
         @pin="onPinActivity"
+        @action="onPanelAction"
         @close="islandController.setOverview(false)"
       />
     </div>
@@ -508,6 +741,8 @@ onBeforeUnmount(() => {
   background: var(--island-bg);
   cursor: pointer;
   box-shadow: var(--shadow-island);
+  border: none;
+  outline: none;
   transition:
     width calc(var(--duration-5) * var(--motion-scale)) var(--ease-island),
     height calc(var(--duration-5) * var(--motion-scale)) var(--ease-island),
@@ -524,10 +759,6 @@ onBeforeUnmount(() => {
   justify-content: center;
   padding: 0 16px;
   box-sizing: border-box;
-}
-
-.hl-island--task :deep(.hl-island__body) {
-  gap: 9px;
 }
 
 .hl-island--expanded :deep(.hl-island__body) {
@@ -822,10 +1053,9 @@ onBeforeUnmount(() => {
   color: var(--text-primary);
 }
 
-.hl-island.is-swapping-primary {
-  transform: translateX(12px) scale(0.96);
-  opacity: 0.72;
-  transition: transform 140ms var(--ease-island), opacity 140ms var(--ease-out);
+.hl-island.is-swap-hidden {
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .island-retract-enter-active,
@@ -855,11 +1085,6 @@ onBeforeUnmount(() => {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .hl-island.is-swapping-primary {
-    transform: none;
-    transition: none;
-  }
-
   .secondary-island-pop-enter-active,
   .secondary-island-pop-leave-active {
     transition: opacity calc(var(--duration-2) * var(--motion-scale)) var(--ease-out);
