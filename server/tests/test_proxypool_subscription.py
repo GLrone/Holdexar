@@ -10,7 +10,9 @@ REMOVED ≠ DELETE、UPDATED ∩ REMOVED = ∅、快照不可变、事务归调�
 """
 from __future__ import annotations
 
+import asyncio
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -33,11 +35,14 @@ from app.domains.proxypool.models import (  # noqa: E402
 )
 from app.domains.proxypool.subscription import (  # noqa: E402
     CHANNEL_DIRECT, CHANNEL_KERNEL, CHANNEL_POOL, FORMAT_AGE, FORMAT_BASE64,
-    FORMAT_HTML, FORMAT_PROVIDER_YAML, FORMAT_URI, FORMAT_YAML, SUB_USER_AGENT,
-    EmptyNodeSetError, FetchFailedError, InvalidEncodingError, Snapshot,
+    FORMAT_HTML, FORMAT_PROVIDER_YAML, FORMAT_UNKNOWN, FORMAT_URI, FORMAT_YAML,
+    SUB_USER_AGENT,
+    EmptyNodeSetError, FetchAttempt, FetchFailedError, FetchResult,
+    InvalidEncodingError, Snapshot,
     SnapshotRecoveryError, UnsupportedFormatError,
     build_channels, build_snapshot, compute_diff, decode_utf8, detect_format,
-    fetch_subscription, latest_snapshot, node_key, parse_nodes, persist_snapshot,
+    fetch_subscription, latest_snapshot, node_key, parse_nodes, persist_fetch_failure,
+    persist_snapshot,
     snapshot_dir,
 )
 
@@ -125,6 +130,240 @@ async def test_direct_success_does_not_touch_later_channels():
                                  calls, []),
     )
     assert calls == [CHANNEL_DIRECT]
+
+
+@pytest.mark.asyncio
+async def test_provider_only_subscription_resolves_nodes_on_winning_channel(tmp_data_dir):
+    root = yaml.safe_dump({
+        "proxy-providers": {
+            "edge": {
+                "type": "http",
+                "url": "https://provider.invalid/nodes?token=private",
+            "override": {"additional-prefix": "Edge | ", "udp": True},
+            }
+        },
+        "proxy-groups": [{"name": "All", "type": "select", "use": ["edge"]}],
+    }).encode()
+    provider = _yaml_bytes([_node(name="provider-node")])
+    calls: list[str] = []
+    requests: list[str] = []
+
+    def factory(channel):
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(str(request.url))
+            if request.url.host == "sub.invalid":
+                return httpx.Response(200, content=root)
+            if request.url.host == "provider.invalid":
+                return httpx.Response(200, content=provider)
+            return httpx.Response(500)
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    result = await fetch_subscription(
+        SUB_URL, build_channels(kernel_proxy="http://127.0.0.1:1", local_proxies=[]),
+        client_factory=factory,
+    )
+
+    assert result.fmt == FORMAT_PROVIDER_YAML
+    assert result.resolved_nodes == [{"name": "Edge | provider-node", "type": "vmess",
+                                      "server": "hk01.example.net", "port": 443,
+                                      "uuid": "u1", "udp": True}]
+    assert result.provider_nodes == {"edge": [{
+        "name": "provider-node", "type": "vmess", "server": "hk01.example.net",
+        "port": 443, "uuid": "u1",
+    }]}
+    assert result.channel == CHANNEL_DIRECT
+    assert len(requests) == 2
+    assert all("private" not in str(attempt) for attempt in result.attempts)
+    await init_db()
+    snap = build_snapshot(1, SUB_URL, result, result.resolved_nodes)
+    async with get_session_factory()() as session:
+        await persist_snapshot(session, snap, data_dir=tmp_data_dir)
+        await session.commit()
+        restored = await latest_snapshot(session, 1, url=SUB_URL)
+    assert restored is not None
+    assert restored.nodes == snap.nodes
+    assert restored.provider_nodes == snap.provider_nodes
+
+    from app.domains.proxies.runtime_config import (
+        expand_provider_nodes, render_subscription_config,
+    )
+
+    expanded = expand_provider_nodes(root.decode(), result.provider_nodes)
+    expanded_doc = yaml.safe_load(expanded)
+    assert expanded_doc["proxy-groups"][0]["proxies"] == ["Edge | provider-node"]
+    assert "use" not in expanded_doc["proxy-groups"][0]
+    runtime_doc = yaml.safe_load(render_subscription_config(expanded))
+    assert "proxy-providers" not in runtime_doc
+    assert [node["name"] for node in runtime_doc["proxies"]] == ["Edge | provider-node"]
+
+
+def test_provider_override_is_applied_before_provider_references_are_expanded():
+    from app.domains.proxies.runtime_config import expand_provider_nodes
+
+    source = yaml.safe_dump({
+        "proxies": [{"name": "relay", "type": "ss", "server": "relay.invalid",
+                     "port": 443, "cipher": "aes-128-gcm", "password": "secret"}],
+        "proxy-providers": {
+            "edge": {
+                "type": "http", "url": "https://provider.invalid/nodes",
+                "override": {
+                    "additional-prefix": "Edge | ",
+                    "dialer-proxy": "relay",
+                    "udp": True,
+                },
+            }
+        },
+        "proxy-groups": [{"name": "All", "type": "select", "use": ["edge"]}],
+    })
+    expanded = yaml.safe_load(expand_provider_nodes(
+        source,
+        {"edge": [{"name": "node", "type": "ss", "server": "node.invalid",
+                   "port": 8443, "cipher": "aes-128-gcm", "password": "secret"}]},
+    ))
+
+    provider_node = next(node for node in expanded["proxies"] if node["name"] == "Edge | node")
+    assert provider_node["dialer-proxy"] == "relay"
+    assert provider_node["udp"] is True
+    assert expanded["proxy-groups"][0]["proxies"] == ["Edge | node"]
+
+
+@pytest.mark.asyncio
+async def test_provider_direct_route_is_independent_of_winning_subscription_channel():
+    root = yaml.safe_dump({
+        "proxy-providers": {
+            "edge": {
+                "type": "http", "url": "https://provider.invalid/nodes",
+                "proxy": "DIRECT",
+            }
+        },
+        "proxy-groups": [{"name": "All", "type": "select", "use": ["edge"]}],
+    }).encode()
+    provider = _yaml_bytes([_node(name="provider-node")])
+    calls: list[tuple[str, str]] = []
+
+    def factory(channel):
+        async def handler(request: httpx.Request) -> httpx.Response:
+            calls.append((channel.name, request.url.host))
+            if request.url.host == "sub.invalid":
+                if channel.name == CHANNEL_DIRECT:
+                    return httpx.Response(503)
+                return httpx.Response(200, content=root)
+            if request.url.host == "provider.invalid":
+                return httpx.Response(200, content=provider)
+            return httpx.Response(500)
+
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    result = await fetch_subscription(
+        SUB_URL,
+        build_channels(kernel_proxy="http://127.0.0.1:1234", local_proxies=[]),
+        client_factory=factory,
+        hedge_delay=0.01,
+    )
+
+    assert result.channel == CHANNEL_KERNEL
+    assert (CHANNEL_DIRECT, "provider.invalid") in calls
+    provider_attempt = next(
+        attempt for attempt in result.attempts
+        if attempt.channel == "provider:edge"
+    )
+    assert provider_attempt.egress_id == CHANNEL_DIRECT
+    assert provider_attempt.stage == "provider_complete"
+
+
+@pytest.mark.asyncio
+async def test_failed_provider_snapshot_retains_successful_sibling_attempts():
+    root = yaml.safe_dump({
+        "proxy-providers": {
+            "good": {"type": "http", "url": "https://good.invalid/nodes",
+                     "proxy": "DIRECT"},
+            "bad": {"type": "http", "url": "https://bad.invalid/nodes",
+                    "proxy": "DIRECT"},
+        },
+        "proxy-groups": [{"name": "All", "type": "select", "use": ["good", "bad"]}],
+    }).encode()
+
+    def factory(_channel):
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "sub.invalid":
+                return httpx.Response(200, content=root)
+            if request.url.host == "good.invalid":
+                return httpx.Response(200, content=_yaml_bytes([_node(name="good-node")]))
+            return httpx.Response(503)
+
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    with pytest.raises(UnsupportedFormatError) as exc:
+        await fetch_subscription(
+            SUB_URL, build_channels(local_proxies=[]), client_factory=factory,
+        )
+
+    provider_attempts = [a for a in exc.value.attempts if a.channel.startswith("provider:")]
+    assert {(a.channel, a.ok) for a in provider_attempts} == {
+        ("provider:good", True), ("provider:bad", False),
+    }
+
+
+@pytest.mark.asyncio
+async def test_unknown_provider_proxy_is_reported_as_provider_routing_failure():
+    root = yaml.safe_dump({
+        "proxy-providers": {
+            "edge": {
+                "type": "http", "url": "https://provider.invalid/nodes",
+                "proxy": "subscription-owned-proxy",
+            }
+        },
+        "proxy-groups": [{"name": "All", "type": "select", "use": ["edge"]}],
+    }).encode()
+
+    def factory(_channel):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=root if request.url.host == "sub.invalid"
+                                  else _yaml_bytes([_node()]))
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    with pytest.raises(UnsupportedFormatError) as exc:
+        await fetch_subscription(
+            SUB_URL, build_channels(local_proxies=[]), client_factory=factory,
+        )
+
+    assert any(attempt.stage == "provider_proxy" for attempt in exc.value.attempts)
+
+
+@pytest.mark.asyncio
+async def test_provider_group_route_is_reported_as_unsupported():
+    root = yaml.safe_dump({
+        "proxy-providers": {
+            "edge": {
+                "type": "http", "url": "https://provider.invalid/nodes",
+                "proxy": "relay-group",
+            }
+        },
+        "proxy-groups": [{"name": "relay-group", "type": "select", "proxies": ["relay"]}],
+        "proxies": [_node(name="relay")],
+    }).encode()
+    provider_requests: list[str] = []
+
+    def factory(_channel):
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "provider.invalid":
+                provider_requests.append(request.url.host)
+            return httpx.Response(200, content=root)
+
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    with pytest.raises(UnsupportedFormatError) as exc:
+        await fetch_subscription(
+            SUB_URL, build_channels(local_proxies=[]), client_factory=factory,
+        )
+
+    assert not provider_requests
+    assert any(
+        attempt.error == "provider_proxy_group_unsupported"
+        and attempt.stage == "provider_proxy"
+        for attempt in exc.value.attempts
+    )
+    assert "同一配置中的代理组" in str(exc.value)
 
 
 @pytest.mark.asyncio
@@ -734,3 +973,143 @@ async def test_fresh_db_matches_locked_identity_model(tmp_data_dir):
                         runtime_name="1|B", proxy_type="vmess"))
         with pytest.raises(IntegrityError):
             await s.commit()
+
+
+@pytest.mark.asyncio
+async def test_invalid_http_200_content_falls_through_to_healthy_egress():
+    calls: list[str] = []
+    result = await fetch_subscription(
+        SUB_URL,
+        build_channels(kernel_proxy="http://127.0.0.1:1234", local_proxies=[]),
+        client_factory=_scripted(
+            {
+                CHANNEL_DIRECT: (200, _yaml_bytes([])),
+                CHANNEL_KERNEL: (200, _yaml_bytes([_node()])),
+            },
+            calls,
+            [],
+        ),
+    )
+
+    assert result.channel == CHANNEL_KERNEL
+    assert calls == [CHANNEL_DIRECT, CHANNEL_KERNEL]
+    assert result.attempts[0].ok is False
+
+
+@pytest.mark.asyncio
+async def test_hedged_fetch_returns_valid_result_and_cancels_slow_egress():
+    cancelled = asyncio.Event()
+
+    def client_factory(channel):
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            if channel.name == CHANNEL_DIRECT:
+                try:
+                    await asyncio.sleep(1)
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+                return httpx.Response(500)
+            return httpx.Response(200, content=_yaml_bytes([_node()]))
+
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    result = await fetch_subscription(
+        SUB_URL,
+        build_channels(kernel_proxy="http://127.0.0.1:1234", local_proxies=[]),
+        client_factory=client_factory,
+        hedge_delay=0.01,
+        request_timeout=0.5,
+        total_timeout=1.0,
+    )
+
+    assert result.channel == CHANNEL_KERNEL
+    assert cancelled.is_set(), "获胜后必须取消并等待慢通道退出"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_attempt_ledger_keeps_egress_timing_without_secret_url(tmp_data_dir):
+    await init_db()
+    result = FetchResult(
+        raw=_yaml_bytes([_node()]), http_status=200, content_type="text/yaml",
+        channel=CHANNEL_POOL, fmt=FORMAT_YAML, egress_id="exit:203.0.113.10",
+        userinfo="upload=1; total=3", profile_title="base64:YWJj",
+        content_disposition="attachment; filename=plan.yaml",
+        duration_ms=42, attempts=[FetchAttempt(
+            CHANNEL_POOL, True, 200, FORMAT_YAML, stage="complete",
+            elapsed_ms=42, egress_id="exit:203.0.113.10",
+        )],
+    )
+    snapshot = build_snapshot(1, SUB_URL, result, parse_nodes(result.raw, result.fmt))
+    async with get_session_factory()() as session:
+        row = await persist_snapshot(session, snapshot, data_dir=tmp_data_dir)
+        await session.commit()
+
+    assert row.source_egress == "exit:203.0.113.10"
+    assert row.userinfo == "upload=1; total=3"
+    assert row.profile_title == "base64:YWJj"
+    assert row.content_disposition == "attachment; filename=plan.yaml"
+    assert row.duration_ms == 42
+    assert '"egress_id":"exit:203.0.113.10"' in row.attempts_json
+    assert "token=x" not in row.attempts_json
+
+
+@pytest.mark.asyncio
+async def test_failed_attempt_is_recorded_without_replacing_last_success(tmp_data_dir):
+    await init_db()
+    success, _ = await _refresh(
+        1, build_channels(),
+        _scripted({CHANNEL_DIRECT: (200, _yaml_bytes([_node()]))}, [], []),
+    )
+    failure = FetchAttempt(
+        CHANNEL_POOL, False, None, FORMAT_UNKNOWN, "ConnectTimeout",
+        "timeout", 3000, "exit:203.0.113.10",
+    )
+    async with get_session_factory()() as session:
+        await persist_snapshot(session, success, data_dir=tmp_data_dir)
+        failed = await persist_fetch_failure(
+            session, subscription_id=1, url=SUB_URL, attempts=[failure],
+            error="subscription deadline exceeded", duration_ms=4000,
+            now=datetime(2026, 10, 18, 12, 0, 0),
+        )
+        await session.commit()
+        recovered = await latest_snapshot(session, 1, url=SUB_URL)
+
+    assert failed.status == "FAILED"
+    assert '"stage":"timeout"' in failed.attempts_json
+    assert recovered is not None and recovered.sha256 == success.sha256
+
+
+def test_saved_proxy_egress_identity_is_stable_and_contains_no_credentials():
+    from app.domains.proxypool.subscription import saved_proxy_egress_id
+
+    first = saved_proxy_egress_id("http://user:secret@proxy.invalid:8080")
+    second = saved_proxy_egress_id("http://user:secret@proxy.invalid:8080")
+
+    assert first == second
+    assert first.startswith("saved:")
+    assert "user" not in first and "secret" not in first
+    assert first != saved_proxy_egress_id("http://other:secret@proxy.invalid:8080")
+
+
+@pytest.mark.asyncio
+async def test_egress_scores_ignore_target_http_failures(tmp_data_dir):
+    from app.domains.proxypool.subscription import fetch_egress_success_scores
+
+    await init_db()
+    egress_id = "saved:0123456789abcdef"
+    attempts = [
+        FetchAttempt("saved", False, 403, FORMAT_UNKNOWN, "http_403", "http", 10,
+                     egress_id),
+        FetchAttempt("saved", False, None, FORMAT_UNKNOWN, "ConnectError", "connect",
+                     20, egress_id),
+    ]
+    async with get_session_factory()() as session:
+        await persist_fetch_failure(
+            session, subscription_id=9, url=SUB_URL, attempts=attempts,
+            error="subscription unavailable", duration_ms=30,
+            now=datetime(2026, 10, 18, 12, 0, 0),
+        )
+        await session.commit()
+        scores = await fetch_egress_success_scores(session)
+
+    assert scores[egress_id] == pytest.approx(1 / 3)
