@@ -992,11 +992,10 @@ async def _commit_business_wave(
                 .execution_options(populate_existing=True)
             )
         for node, result in probed:
-            # 只有有效业务响应能晋升；目标限流与探测通道故障不奖惩节点。
+            # 只有有效业务响应能晋升；收到 HTTP 响应说明请求已到达目标服务，
+            # 包括 5xx 在内都不作为节点故障证据。
             if result.ok:
                 probe_ok: bool | None = True
-            elif result.http_status in (502, 504):
-                probe_ok = False
             elif result.http_status is not None:
                 probe_ok = None
             elif result.detail.startswith(NODE_PROBE_FAILED):

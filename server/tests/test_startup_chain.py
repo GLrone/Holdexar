@@ -102,6 +102,10 @@ def chain_calls(monkeypatch):
         monkeypatch.setattr(target, fn.__name__, step(name))
 
     monkeypatch.setattr(main_mod, "_autostart_clash", step("clash_autostart"))
+    monkeypatch.setattr(
+        main_mod, "_kick_startup_proxy_maintenance",
+        lambda: calls.append("proxy_maintenance_start"),
+    )
 
     def kick_health():
         calls.append("clash_health")
@@ -162,8 +166,7 @@ async def test_chain_order_and_scheduler_last(db, chain_calls):
         "rates_cleanup", "legacy_sub_migrate", "legacy_kv_migrate",
         "credential_seal", "subscription_seal",
         "hl_flags", "pp_flags", "sort_cache", "series_refresh",
-        "kernel_ensure", "clash_autostart", "clash_health", "pool_runtime",
-        "subscription_sync",
+        "kernel_ensure", "proxy_maintenance_start",
         "rates_stale", "rates_gap_scan", "bundles_sort", "bundles_warm",
         "epic_preheat", "steam_events_warm", "scheduler_start",
         "seed_fetch", "fx_bootstrap",
@@ -188,7 +191,15 @@ async def test_chain_survives_step_failure(db, chain_calls):
     assert "scheduler_start" in chain_calls.calls
     assert "hl_flags" in chain_calls.calls
     assert "sort_cache" in chain_calls.calls
-    assert "clash_autostart" in chain_calls.calls
+    assert "proxy_maintenance_start" in chain_calls.calls
+
+
+@pytest.mark.asyncio
+async def test_proxy_startup_sync_is_shared_and_maintenance_runs_after_it(db, chain_calls):
+    await main_mod._startup_proxy_maintenance()
+    assert chain_calls.calls == [
+        "subscription_sync", "clash_autostart", "clash_health", "pool_runtime",
+    ]
 
 
 @pytest.mark.asyncio

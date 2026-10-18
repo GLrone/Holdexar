@@ -31,7 +31,6 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
-    UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -348,6 +347,13 @@ class SubscriptionSnapshot(Base):
     content_type: Mapped[str | None] = mapped_column(String(100))
     # 抓取成功的通道名（direct / mihomo / proxypool / local）
     source_channel: Mapped[str | None] = mapped_column(String(32))
+    source_egress: Mapped[str | None] = mapped_column(String(100))
+    profile_title: Mapped[str | None] = mapped_column(String(100))
+    content_disposition: Mapped[str | None] = mapped_column(String(255))
+    userinfo: Mapped[str | None] = mapped_column(String(500))
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    attempts_json: Mapped[str | None] = mapped_column(Text)
+    provider_nodes_json: Mapped[str | None] = mapped_column(Text)
     error: Mapped[str | None] = mapped_column(Text)
     fetched_at: Mapped[datetime | None] = mapped_column(DateTime)
 

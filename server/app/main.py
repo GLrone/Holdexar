@@ -46,7 +46,7 @@ from app.domains.wishlist.router import router as wishlist_router
 logger = logging.getLogger(__name__)
 
 
-async def _autostart_clash() -> None:
+async def _autostart_clash(*, snapshot_only: bool = False) -> None:
     """Clash 内核随服务自启（后台任务，不阻塞 lifespan）。
 
     有内置内核 + 已存 clash 订阅才拉起；取配置按候选遍历：某条订阅下载
@@ -83,7 +83,9 @@ async def _autostart_clash() -> None:
         # 下一条，内核起不来不允许是「下载失败」一个原因——节点好不好交给
         # 启动后的首检与定时体检
         try:
-            picked = await proxies_service.resolve_startable_clash(settings.data_dir)
+            picked = await proxies_service.resolve_startable_clash(
+                settings.data_dir, snapshot_only=snapshot_only
+            )
         except ValueError as e:
             log_event(
                 logger,
@@ -95,9 +97,10 @@ async def _autostart_clash() -> None:
             return
         sub = picked["subscription"]
         config_path = picked["configPath"]
+        port_options = await proxies_service.kernel_port_options()
         status = await clash_manager.runtime.ensure_running(
             detect["path"], config_path, subscription_url=sub["url"],
-            mixed_port=await proxies_service.pinned_kernel_port(),
+            **port_options,
         )
         # 账本收敛：启动用的是上面这份配置内容，已下线/改名节点的旧行随启动清理
         # （订阅名不再自动回填——手动改名，见 proxies 域）
@@ -134,6 +137,30 @@ def _kick_startup_health_check() -> None:
     from app.domains.proxies import service as proxies_service
 
     asyncio.get_running_loop().create_task(proxies_service.maybe_run_clash_health_check())
+
+
+async def _startup_proxy_maintenance() -> None:
+    """Warm both proxy runtimes from one subscription sync in the background."""
+    from app.core import scheduler as core_scheduler
+
+    sync = await core_scheduler._startup_subscription_sync()
+    try:
+        await _autostart_clash(snapshot_only=True)
+        _kick_startup_health_check()
+    except Exception:  # noqa: BLE001
+        log_event(logger, "通用代理运行时启动失败，不影响服务运行", level=logging.ERROR, exc_info=True)
+    try:
+        await core_scheduler._startup_pool_runtime(skip_sync=True)
+    except Exception:  # noqa: BLE001
+        log_event(logger, "代理池运行时启动装配失败，生产代理继续保持不可用", level=logging.ERROR, exc_info=True)
+    if sync is None:
+        log_event(logger, "代理启动同步未取得结果，继续检查可恢复的本地状态")
+
+
+def _kick_startup_proxy_maintenance() -> None:
+    asyncio.get_running_loop().create_task(
+        _startup_proxy_maintenance(), name="startup-proxy-maintenance"
+    )
 
 
 async def _post_startup_chain() -> None:
@@ -257,11 +284,7 @@ async def _post_startup_chain() -> None:
     except Exception:  # noqa: BLE001
         log_event(logger, "系列归组初始化失败，不阻塞启动", level=logging.ERROR, exc_info=True)
 
-    # 随包内核就位：mihomo 与 GeoIP 数据随发行包分发，复制进 data/clash/
-    # （GeoIP 只补缺失；内核低版本时升级替换，见 clash_manager）。必须早于
-    # 内核自启——自启与代理策略都以内核就位为前提。失败不阻断启动：前端
-    # 「内核缺失」态与自动安装入口仍可兜底。-v 版本探测走子进程，放线程池
-    # 不占事件循环。
+    # 内核资产检查必须早于内核自启；失败由前端安装入口兜底。
     from app.domains.proxies import clash_manager
 
     try:
@@ -279,33 +302,8 @@ async def _post_startup_chain() -> None:
     except Exception:  # noqa: BLE001
         log_event(logger, "随包 Clash 内核就位失败，不阻塞启动", level=logging.ERROR, exc_info=True)
 
-    # Clash 内核随服务自启（常驻后台语义）：有内核 + 有 clash 订阅即拉起。
-    # 服务重启后 proxy_first 策略才不会降级直连（Steam 域直连基本不可用）。
-    try:
-        await _autostart_clash()
-        # 启动体检后台点火（6h 门槛节流不变）：全量探测分钟级，链上 await
-        # 曾是「开机到能用 ~230s」的绝对大头；lane 一致性闸不依赖体检结果
-        _kick_startup_health_check()
-    except Exception:  # noqa: BLE001
-        log_event(logger, "Clash 节点启动体检失败，不阻塞启动", level=logging.ERROR, exc_info=True)
-
-    # 池 Runtime bootstrap：首次把「订阅 → Snapshot → Registry → Pool → Runtime」建起来。
-    # 幂等（已有可用 Runtime 直接返回）；**失败不阻塞启动**——crawler 保持 fail-closed，
-    # 30min 后的订阅刷新就是下一次机会。放在内核就位之后：bootstrap 需要内核可执行文件。
-    from app.core import scheduler as core_scheduler
-
-    try:
-        await core_scheduler._startup_pool_runtime()
-    except Exception:  # noqa: BLE001 —— 与链内其它步骤同约定：本步异常只留日志
-        log_event(logger, "代理池运行时启动装配失败，不阻塞启动", level=logging.ERROR, exc_info=True)
-
-    # 订阅同步（下载后置）：内核就位不等订阅下载——冷启动直接吃持久化 Registry
-    # 起核，本步在 Runtime 就位后全量拉一遍订阅；池签名变化就地消费一次重建
-    # （热重载优先）。失败不阻塞启动，30min 刷新是下一次机会。
-    try:
-        await core_scheduler._startup_subscription_sync()
-    except Exception:  # noqa: BLE001 —— 与链内其它步骤同约定：本步异常只留日志
-        log_event(logger, "代理订阅启动同步失败，不阻塞启动", level=logging.ERROR, exc_info=True)
+    # Proxy refresh and runtime initialization do not gate scheduler availability.
+    _kick_startup_proxy_maintenance()
 
     # 汇率启动兜底：错过每日 03:00 定点（关机/服务重启）时按快照龄补刷新，
     # 保证"每日自动抓取"承诺不因服务频繁重启落空（内含 >12h 阈值，幂等安全）

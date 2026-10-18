@@ -401,8 +401,8 @@ async def run_l0_cycle(
                     detail={
                         "命中": ingested.matched,
                         "复活": ingested.activated,
+                        "失活": ingested.deactivated,
                         "新增出口": ingested.exit_ips_added,
-                        "陈久跳过": ingested.skipped_stale,
                     },
                 )
             await session.commit()

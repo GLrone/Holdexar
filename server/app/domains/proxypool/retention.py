@@ -8,7 +8,7 @@
 | `health_runs` | ~22 行/天 | 90 天 |
 | `health_observations` | **L0 每 5min × 池内每个节点** → 68 节点 ≈ 19.6k 行/天 | 30 天 |
 | `orchestration_events` | 事件驱动，低频 | 90 天 |
-| `subscription_snapshots` | 每次抓取一行（行小） | 180 天，且每订阅最新 3 条永不删 |
+| `subscription_snapshots` | 每次抓取一行（行小） | 180 天，且每订阅最新 3 份成功快照永不删 |
 | `proxy_nodes` / `proxy_node_sources` | 节点身份与来源 | **永不清理** |
 | `pool_generations` | 每次重建一行（审计链） | 不清理 |
 | 快照原始 `.bin` | 内容寻址、只增不减 | 本模块不 GC（P1.9 既有决定） |
@@ -42,8 +42,7 @@ DEFAULT_EVENT_DAYS = 90
 DEFAULT_SNAPSHOT_DAYS = 180
 DEFAULT_CHUNK = 5000
 DEFAULT_MAX_CHUNKS = 20
-# 每个订阅保留的快照行数：最新 3 条覆盖「最新 OK + 最新 FAILED + 1 条余量」，
-# `latest_snapshot()` 依赖的那条永远不会被删。
+# 连续失败不能挤掉可回退的成功快照。
 KEEP_SNAPSHOTS_PER_SUB = 3
 
 
@@ -90,7 +89,7 @@ async def _delete_chunked(
 
 
 async def _keep_ids_per_subscription(session: AsyncSession) -> list[int]:
-    """每个订阅保留最新 `KEEP_SNAPSHOTS_PER_SUB` 条快照行的 id。
+    """每个订阅保留最新 `KEEP_SNAPSHOTS_PER_SUB` 条成功快照的 id。
 
     在 Python 里算而不是写窗口函数：订阅只有个位数，可读性优先；`ROW_NUMBER`
     也能做，但为一个「保留几行」的规则引入窗口函数不值得。
@@ -106,6 +105,7 @@ async def _keep_ids_per_subscription(session: AsyncSession) -> list[int]:
             await session.execute(
                 select(SubscriptionSnapshot.id)
                 .where(SubscriptionSnapshot.subscription_id == sub_id)
+                .where(SubscriptionSnapshot.status == "OK")
                 .order_by(SubscriptionSnapshot.id.desc())
                 .limit(KEEP_SNAPSHOTS_PER_SUB)
             )
@@ -193,14 +193,14 @@ async def prune_telemetry(
     truncated = truncated or more
 
     keep = await _keep_ids_per_subscription(session)
-    keep_sql = ",".join(str(int(v)) for v in keep) if keep else "NULL"
+    preserve = f"AND id NOT IN ({','.join(str(int(v)) for v in keep)})" if keep else ""
     snapshots, more = await _delete_chunked(
         session,
         f"""
         DELETE FROM subscription_snapshots WHERE id IN (
             SELECT id FROM subscription_snapshots
             WHERE fetched_at IS NOT NULL AND fetched_at < :cutoff
-              AND id NOT IN ({keep_sql})
+              {preserve}
             ORDER BY id LIMIT :chunk
         )
         """,

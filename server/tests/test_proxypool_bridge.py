@@ -1,8 +1,7 @@
-"""订阅节点体检 → 池账本 桥接层：体检通过的健康出口节点必须被池用上。
+"""订阅节点体检记录唯一健康事实，旧 UI 状态只作为 ProxyNode 投影。
 
-前端「节点体检」探生产端点（L2）与出口 IP（L1），比池内 L0 更强：命中节点
-按成功证据复活（DEAD / RETIRED → ACTIVE）、出口 IP 落进池账本、订阅来源特征码
-回到体检结果行。失败结论不在这里降级，池内状态机自有口径。
+前端「节点体检」探生产端点（L2）与出口 IP（L1）；有效响应可恢复 DEAD / RETIRED，
+目标服务错误只记观测，不单独增加节点故障数。
 """
 from __future__ import annotations
 
@@ -244,14 +243,18 @@ async def test_check_does_not_demote_on_failure(env):
 
 @pytest.mark.asyncio
 async def test_ledger_sweep_covers_other_subscriptions(env):
-    """已落库的体检结论按来源对齐进池——覆盖当前内核没在跑的订阅。"""
+    """全订阅兼容表由 ProxyNode 投影刷新，旧状态不能反向复活节点。"""
     await init_db()
-    await _add_node("n5", NODE_DEAD, sub_id=2, name="sub-x")
-    await _add_node("n6", NODE_DEAD, sub_id=3, name="sub-y")
+    await _add_node("n5", NODE_ACTIVE, sub_id=2, name="sub-x", exit_ip="8.8.8.8")
+    await _add_node("n6", NODE_DEAD, sub_id=3, name="sub-y", exit_ip="7.7.7.7")
     async with get_session_factory()() as s:
+        n5 = (await s.execute(select(ProxyNode).where(ProxyNode.node_id == "n5"))).scalar_one()
+        n6 = (await s.execute(select(ProxyNode).where(ProxyNode.node_id == "n6"))).scalar_one()
+        n5.last_l2_at = NOW - timedelta(hours=1)
+        n6.last_l2_at = NOW - timedelta(hours=1)
         s.add(
             ClashNode(
-                subscription_id=2, name="sub-x", status="ok", exit_ip="8.8.8.8",
+                subscription_id=2, name="sub-x", status="dead", exit_ip=None,
                 latency_ms=70, last_checked_at=NOW - timedelta(hours=1),
             )
         )
@@ -264,16 +267,16 @@ async def test_ledger_sweep_covers_other_subscriptions(env):
         await s.commit()
 
     async with get_session_factory()() as s:
-        outcome = await B.ingest_ledger(s, now=NOW, fresh_hours=72)
+        outcome = await B.ingest_ledger(s, now=NOW)
         await s.commit()
 
     assert outcome.activated == 1
+    assert outcome.deactivated == 1
     assert outcome.exit_ips_added == 1
-    assert outcome.skipped_stale == 1, "超过新鲜窗口的旧结论不当当前健康"
     fresh = await _node("n5")
     assert fresh.state == NODE_ACTIVE and fresh.exit_ip == "8.8.8.8"
     stale = await _node("n6")
-    assert stale.state == NODE_DEAD and stale.exit_ip is None
+    assert stale.state == NODE_DEAD and stale.exit_ip == "7.7.7.7"
 
 
 @pytest.mark.asyncio
@@ -426,9 +429,8 @@ async def test_ledger_does_not_override_newer_pool_verdict(env):
 
 
 @pytest.mark.asyncio
-async def test_ledger_resurrects_when_check_newer_than_pool_verdict(env):
-    """账本检测比池内业务结论更新时照常复活：守卫只拦「池更新 × 节点判坏」，
-    不拦「账本更新」与「节点本就健康」两条正常对齐路径。"""
+async def test_legacy_check_never_resurrects_registry_node(env):
+    """即使旧体检时间较新，兼容投影也不能反向改变 ProxyNode 健康状态。"""
     await init_db()
     await _add_node("n8", NODE_DEAD, sub_id=2, name="sub-x")
     async with get_session_factory()() as s:
@@ -448,8 +450,34 @@ async def test_ledger_resurrects_when_check_newer_than_pool_verdict(env):
         outcome = await B.ingest_ledger(s, now=NOW)
         await s.commit()
 
-    assert outcome.activated == 1
-    assert (await _node("n8")).state == NODE_ACTIVE
+    assert outcome.activated == 0
+    assert outcome.deactivated == 1
+    assert (await _node("n8")).state == NODE_DEAD
+
+
+@pytest.mark.asyncio
+async def test_target_http_error_is_observation_not_node_failure(env):
+    await init_db()
+    await _add_node("http-error", NODE_ACTIVE, sub_id=4, name="http-error")
+    async with get_session_factory()() as session:
+        result = await B.ingest_node_check(
+            session,
+            subscription_id=4,
+            results=[{
+                "name": "http-error", "alive": False, "steamStatus": 502,
+                "exitIp": "9.8.7.6", "ms": 18, "probed": True,
+            }],
+            now=NOW,
+        )
+        await session.commit()
+
+    node = await _node("http-error")
+    assert result.matched == 1
+    assert node.state == NODE_ACTIVE and node.consecutive_failures == 0
+    assert node.exit_ip == "9.8.7.6"
+    observations = await _observations("http-error")
+    assert [(row.level, row.ok) for row in observations] == [("L1", True), ("L2", False)]
+    assert observations[-1].detail == B.CLASH_STEAM_HTTP_502_DETAIL
 
 
 @pytest.mark.asyncio

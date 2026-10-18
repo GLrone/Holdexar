@@ -154,7 +154,7 @@ async def eligible_nodes(session: AsyncSession) -> list[ProxyNode]:
     信息占位节点（机场公告位）即使已混入账本也**永不合格**——它们不是可用的
     代理端点。
     """
-    from app.domains.proxies.models import ProxySubscription
+    from app.domains.proxies.models import ADMISSION_ACTIVE, ProxySubscription
 
     subscriptions = (await session.execute(select(ProxySubscription))).scalars().all()
     blocked = {s.id for s in subscriptions if s.resource_block_reason() is not None}
@@ -162,6 +162,11 @@ async def eligible_nodes(session: AsyncSession) -> list[ProxyNode]:
         select(ProxyNode)
         .where(ProxyNode.state.in_(sorted(POOL_ELIGIBLE_STATES)))
         .where(ProxyNode.subscription_id.is_not(None))
+        .join(ProxySubscription, ProxySubscription.id == ProxyNode.subscription_id)
+        .where(
+            (ProxySubscription.admission_status == ADMISSION_ACTIVE)
+            | ProxySubscription.admission_status.is_(None)
+        )
     )
     if blocked:
         query = query.where(ProxyNode.subscription_id.not_in(blocked))
