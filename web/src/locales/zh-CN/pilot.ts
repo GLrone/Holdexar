@@ -702,6 +702,11 @@ const pilot = {
   'pilot.settings.saved': '已保存',
   'pilot.task.priceRefresh': '全部价格刷新',
   'pilot.task.priceRepair': '补抓缺价格的游戏',
+  'pilot.cards.collapse': '收起',
+  'pilot.cards.expandMore': '展开更多',
+  'pilot.card.advice.belowMedian': '低于中位数',
+  'pilot.card.advice.deepDiscount': '深度折扣',
+  'pilot.card.advice.nearHigh': '接近高位',
 } as const
 
 export default pilot

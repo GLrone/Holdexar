@@ -14,11 +14,16 @@ from app.domains.pilot import tools as pilot_tools
 
 logger = logging.getLogger(__name__)
 
+_STRUCTURED_KINDS = frozenset({
+    "structured", "metric-grid", "data-table", "time-series", "coverage-matrix", "status-board",
+})
+
 _CORE_CARD_KINDS = {
     "proposal", "stepper", "price", "regions", "compare",
     "games", "family", "achievements", "epic",
+    *_STRUCTURED_KINDS,
 }
-_MAX_CARDS_PER_TURN = 2
+_MAX_CARDS_PER_TURN = 4
 
 # 典型非价格咨询特征词（涉及硬件、性能、玩法、剧情等）
 _NON_PRICE_KEYWORDS = (
@@ -649,6 +654,10 @@ class DecisionAgent:
         if kind == "navigate":
             target = card.get("target") or card.get("path") or ""
             return f"页面导航卡片已在用户界面呈现：目标「{target}」"
+        if card.get("componentId") or kind in _STRUCTURED_KINDS:
+            c_id = card.get("componentId") or kind
+            title = card.get("title") or c_id
+            return f"结构化 UI 组件已在用户界面呈现：【{title}】({c_id})"
         return f"{kind} 可视化卡片已在用户界面呈现"
 
     def enhance_model_view(self, result: dict, decision: CardDecision) -> dict:

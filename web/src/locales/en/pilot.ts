@@ -702,6 +702,11 @@ const pilot = {
   'pilot.settings.saved': 'Saved',
   'pilot.task.priceRefresh': 'Full price refresh',
   'pilot.task.priceRepair': 'Repair missing prices',
+  'pilot.cards.collapse': 'Collapse',
+  'pilot.cards.expandMore': 'Expand more',
+  'pilot.card.advice.belowMedian': 'Below median',
+  'pilot.card.advice.deepDiscount': 'Deep discount',
+  'pilot.card.advice.nearHigh': 'Near high',
 } as const
 
 export default pilot

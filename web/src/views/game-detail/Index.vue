@@ -35,6 +35,8 @@ import HlEmpty from '@/components/ui/HlEmpty.vue'
 import HlImg from '@/components/ui/HlImg.vue'
 import HlSkeleton from '@/components/ui/HlSkeleton.vue'
 import PriceTrendChart from '@/components/business/PriceTrendChart.vue'
+import StructuredRenderer from '@/components/structured/StructuredRenderer.vue'
+import type { CoverageMatrixData, MatrixCell, MatrixRow, StructuredBlock } from '@/components/structured/types'
 
 /** 价格奖牌（金/银/铜 = 非 CN 最低价前三，与卡片 GPW 同一规则） */
 const TROPHIES = ['/assets/trophy_gold.png', '/assets/trophy_silver.png', '/assets/trophy_copper.png']
@@ -132,6 +134,57 @@ const asRow = (row: unknown): RegionRow => row as RegionRow
 
 /** HlTable rows prop 类型适配 */
 const tableRows = computed(() => regionRows.value as unknown as Record<string, unknown>[])
+
+const priceViewMode = ref<'table' | 'matrix'>('table')
+
+const priceCoverageBlock = computed<StructuredBlock<CoverageMatrixData>>(() => {
+  const cols = regionRows.value.map((r) => ({
+    id: r.code,
+    label: r.name,
+    flag: r.flag,
+  }))
+
+  const cells: Record<string, MatrixCell> = {}
+  for (const r of regionRows.value) {
+    cells[r.code] = {
+      colId: r.code,
+      status: r.locked ? 'locked' : (r.free || r.cnyFen > 0 ? 'ok' : 'unknown'),
+      label: r.free ? t('gameDetail.price.free') : (r.locked ? '—' : formatCnyFen(r.cnyFen)),
+      tooltip: `${r.name}: ${r.nativePrice} (${formatCnyFen(r.cnyFen)})`,
+    }
+  }
+
+  const okCount = regionRows.value.filter((r) => !r.locked && (r.cnyFen > 0 || r.free)).length
+  const total = regionRows.value.length
+
+  const rows: MatrixRow[] = [
+    {
+      rowId: `game-${detail.value?.appid ?? 0}`,
+      name: detail.value?.name ?? '',
+      subText: `AppID ${detail.value?.appid ?? ''}`,
+      avatar: detail.value?.headerImage,
+      cells,
+    },
+  ]
+
+  return {
+    id: `coverage-${detail.value?.appid ?? 0}`,
+    componentId: 'coverage-matrix',
+    title: t('gameDetail.section.priceDetail'),
+    density: 'standard',
+    status: 'ready',
+    data: {
+      columns: cols,
+      rows,
+      stats: {
+        totalUnits: total,
+        okUnits: okCount,
+        failedUnits: total - okCount,
+        coverageRate: total > 0 ? (okCount / total) * 100 : 0,
+      },
+    },
+  }
+})
 
 /** 后端 chinese_support 的取值（crawler/utils.py detect_chinese_support 产出
     '无中文' / '简体中文' / '繁体中文'）——这是**数据值不是文案**：不建词条、
@@ -696,6 +749,14 @@ onMounted(load)
                 <HlButton variant="text" class="gd-pilot-btn" @click="pilotStore.openPilot({ appid: detail.appid, name: detail.name })">
                   {{ t('pilot.ask.entry') }}
                 </HlButton>
+                <HlButton
+                  size="sm"
+                  art="outline"
+                  tone="blue"
+                  @click="priceViewMode = priceViewMode === 'table' ? 'matrix' : 'table'"
+                >
+                  {{ priceViewMode === 'table' ? t('structured.view.matrix') : t('structured.view.table') }}
+                </HlButton>
                 <div v-if="medalItems.length" class="gd-medal-row">
                   <span class="gd-medal-label">{{ t('gameDetail.price.top3') }}</span>
                   <span v-for="m in medalItems" :key="m.code" class="gd-medal-item">
@@ -706,8 +767,12 @@ onMounted(load)
                 </div>
               </div>
             </div>
+            <StructuredRenderer
+              v-if="priceViewMode === 'matrix'"
+              :block="priceCoverageBlock"
+            />
             <HlTable
-              v-if="regionRows.length"
+              v-else-if="regionRows.length"
               :columns="PRICE_COLUMNS"
               :rows="tableRows"
               :align="PRICE_ALIGN"
@@ -763,7 +828,7 @@ onMounted(load)
                 </span>
               </template>
             </HlTable>
-            <HlEmpty v-else size="sm" icon="" :text="t('gameDetail.price.empty')" />
+            <HlEmpty v-else-if="priceViewMode !== 'matrix'" size="sm" icon="" :text="t('gameDetail.price.empty')" />
           </div>
 
           <!-- ④ 历史价格走势 -->
