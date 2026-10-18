@@ -13,7 +13,7 @@ from app.core.app_info import ENV_PREFIX
 def resolve_proxy_url() -> str | None:
     """返回本次运行的固定代理 URL；未设置则直连。
 
-    环境变量：<ENV_PREFIX>PROXY_URL，如 http://127.0.0.1:7890 或 socks5://user:pass@host:port
+    环境变量：<ENV_PREFIX>PROXY_URL，如 http://127.0.0.1:<port> 或 socks5://user:pass@host:port
     """
     url = os.environ.get(f"{ENV_PREFIX}PROXY_URL", "").strip()
     return url or None
