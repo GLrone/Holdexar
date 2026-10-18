@@ -1,4 +1,4 @@
-"""Clash 节点状态机测试：冷却递增 / dead 三连复活 / 订阅废弃判定 / 6h 体检门槛。
+"""Clash 节点状态投影：注册表健康事实 / 冷却 / 订阅废弃 / 6h 体检门槛。
 
 不触真实网络/内核——直接调用 _apply_node_results / _evaluate_subscription_deprecation /
 maybe_run_clash_health_check，mock 探测结果与内核状态；库隔离到临时文件。
@@ -18,6 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.core.database import Base
 from app.domains.proxies import clash_manager, service as proxies_service
 from app.domains.proxies.models import ClashNode, ProxySubscription
+from app.domains.proxypool.models import ProxyNode as RegistryNode
+from app.domains.proxypool.state import NODE_ACTIVE, NODE_DEAD, NODE_RETIRED
 
 
 @pytest.fixture
@@ -45,19 +47,49 @@ def _node(session_rows, name: str) -> ClashNode:
     return next(n for n in session_rows if n.name == name)
 
 
+async def _seed_registry_node(db, sub_id: int, name: str, state: str = NODE_ACTIVE):
+    async with db() as session:
+        session.add(RegistryNode(
+            node_id=f"{sub_id}-{name}",
+            fingerprint=f"{sub_id}-{name}",
+            runtime_name=f"{sub_id}|{name}",
+            proxy_type="http",
+            server="127.0.0.1",
+            normalized_config={"name": name, "type": "http", "server": "127.0.0.1", "port": 80},
+            state=state,
+            subscription_id=sub_id,
+            original_name=name,
+            first_seen=proxies_service.get_beijing_time_obj(),
+            last_source_seen=proxies_service.get_beijing_time_obj(),
+        ))
+        await session.commit()
+
+
+async def _apply_canonical_probe(db, sub_id: int, result: dict, now):
+    from app.domains.proxypool.bridge import ingest_node_check
+
+    async with db() as session:
+        await ingest_node_check(
+            session, subscription_id=sub_id, results=[result], now=now
+        )
+        await session.commit()
+    return await proxies_service._apply_node_results(
+        sub_id, {}, [result], [result["name"]], now
+    )
+
+
 # ─── 冷却递增 ───────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_fail_cooldown_ladder(db):
-    """失败冷却阶梯：第 1 次失败 30min，第 2 次 1h，第 3 次 2h……24h 封顶。"""
+    """冷却只从权威节点连续失败数投影，不在兼容表累加第二份计数。"""
     sub_id = await _seed_sub(db)
+    await _seed_registry_node(db, sub_id, "n1")
     now = proxies_service._naive(proxies_service.get_beijing_time_obj())
 
     for expected_minutes in [30, 60, 120, 240, 480, 1440, 1440, 1440]:
-        _, _, _ = await proxies_service._apply_node_results(
-            sub_id, {}, [_fail("n1")], ["n1"], now
-        )
+        _, _, _ = await _apply_canonical_probe(db, sub_id, _fail("n1"), now)
         async with db() as session:
             rows = (await session.execute(select(ClashNode))).scalars().all()
             n = _node(rows, "n1")
@@ -70,11 +102,12 @@ async def test_fail_cooldown_ladder(db):
 
 @pytest.mark.asyncio
 async def test_ok_resets_cooldown(db):
-    """通过即清零：fail_count 归零、冷却解除、状态 ok。"""
+    """健康证据复活 ProxyNode；兼容投影跟随新状态并清除节流时间。"""
     sub_id = await _seed_sub(db)
+    await _seed_registry_node(db, sub_id, "n1")
     now = proxies_service._naive(proxies_service.get_beijing_time_obj())
-    await proxies_service._apply_node_results(sub_id, {}, [_fail("n1")], ["n1"], now)
-    await proxies_service._apply_node_results(sub_id, {}, [_ok("n1")], ["n1"], now)
+    await _apply_canonical_probe(db, sub_id, _fail("n1"), now)
+    await _apply_canonical_probe(db, sub_id, _ok("n1"), now)
     async with db() as session:
         rows = (await session.execute(select(ClashNode))).scalars().all()
         n = _node(rows, "n1")
@@ -83,70 +116,61 @@ async def test_ok_resets_cooldown(db):
         assert n.status == "ok"
 
 
-# ─── dead 终态 + 3-of-3 复活 ─────────────────────────────────
+# ─── 权威节点状态投影与恢复 ─────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_dead_after_10_fails(db):
-    """累计失败 10 次 → dead 终态（冷却清空，不再轮转）。"""
+async def test_registry_retirement_is_projected_without_a_second_threshold(db):
+    """ProxyNode 退休状态与失败数原样投影，旧节点表不再计算自己的阈值。"""
     sub_id = await _seed_sub(db)
+    await _seed_registry_node(db, sub_id, "n1")
     now = proxies_service._naive(proxies_service.get_beijing_time_obj())
-    for _ in range(proxies_service.DEAD_MAX_FAILS):
-        await proxies_service._apply_node_results(sub_id, {}, [_fail("n1")], ["n1"], now)
+    for _ in range(3):
+        await _apply_canonical_probe(db, sub_id, _fail("n1"), now)
     async with db() as session:
         rows = (await session.execute(select(ClashNode))).scalars().all()
         n = _node(rows, "n1")
         assert n.status == "dead"
-        assert n.cooldown_until is None
+        assert n.fail_count == 3
+        registry = await session.scalar(select(RegistryNode).where(RegistryNode.runtime_name == f"{sub_id}|n1"))
+        assert registry.state == NODE_RETIRED
 
 
 @pytest.mark.asyncio
-async def test_dead_revive_requires_3_consecutive_passes(db):
-    """dead 复活语义：连续 3 次通过才转 ok（用户确认的 3-of-3 严格标准）。"""
+async def test_registry_health_success_restores_retired_node(db):
+    """一次新的有效业务证据按 ProxyNode 状态机恢复 RETIRED 节点。"""
     sub_id = await _seed_sub(db)
+    await _seed_registry_node(db, sub_id, "n1")
     now = proxies_service._naive(proxies_service.get_beijing_time_obj())
-    for _ in range(proxies_service.DEAD_MAX_FAILS):
-        await proxies_service._apply_node_results(sub_id, {}, [_fail("n1")], ["n1"], now)
-
-    # dead 后第 1、2 次通过：仍是 dead（复活计数累加）
-    await proxies_service._apply_node_results(sub_id, {}, [_ok("n1")], ["n1"], now)
-    async with db() as session:
-        rows = (await session.execute(select(ClashNode))).scalars().all()
-        assert _node(rows, "n1").status == "dead"
-        assert _node(rows, "n1").revive_passes == 1
-
-    await proxies_service._apply_node_results(sub_id, {}, [_ok("n1")], ["n1"], now)
-    async with db() as session:
-        rows = (await session.execute(select(ClashNode))).scalars().all()
-        assert _node(rows, "n1").status == "dead"
-        assert _node(rows, "n1").revive_passes == 2
-
-    # 第 3 次连续通过 → 复活
-    await proxies_service._apply_node_results(sub_id, {}, [_ok("n1")], ["n1"], now)
+    for _ in range(3):
+        await _apply_canonical_probe(db, sub_id, _fail("n1"), now)
+    await _apply_canonical_probe(db, sub_id, _ok("n1"), now)
     async with db() as session:
         rows = (await session.execute(select(ClashNode))).scalars().all()
         n = _node(rows, "n1")
         assert n.status == "ok"
         assert n.revive_passes == 0
         assert n.fail_count == 0
+        registry = await session.scalar(select(RegistryNode).where(RegistryNode.runtime_name == f"{sub_id}|n1"))
+        assert registry.state == NODE_ACTIVE
 
 
 @pytest.mark.asyncio
-async def test_dead_revive_streak_broken_by_fail(db):
-    """复活连测被失败打断：revive_passes 归零，重新计数。"""
+async def test_failed_probe_after_recovery_updates_only_registry_state(db):
+    """复活后的再次故障只由 ProxyNode 状态机计数。"""
     sub_id = await _seed_sub(db)
+    await _seed_registry_node(db, sub_id, "n1")
     now = proxies_service._naive(proxies_service.get_beijing_time_obj())
-    for _ in range(proxies_service.DEAD_MAX_FAILS):
-        await proxies_service._apply_node_results(sub_id, {}, [_fail("n1")], ["n1"], now)
-
-    await proxies_service._apply_node_results(sub_id, {}, [_ok("n1")], ["n1"], now)  # passes=1
-    await proxies_service._apply_node_results(sub_id, {}, [_ok("n1")], ["n1"], now)  # passes=2
-    await proxies_service._apply_node_results(sub_id, {}, [_fail("n1")], ["n1"], now)  # 打断
+    for _ in range(3):
+        await _apply_canonical_probe(db, sub_id, _fail("n1"), now)
+    await _apply_canonical_probe(db, sub_id, _ok("n1"), now)
+    await _apply_canonical_probe(db, sub_id, _fail("n1"), now)
     async with db() as session:
         rows = (await session.execute(select(ClashNode))).scalars().all()
         n = _node(rows, "n1")
         assert n.revive_passes == 0
-        assert n.status == "dead"  # 失败不改变 dead 终态
+        assert n.status == "dead"
+        assert n.fail_count == 1
 
 
 # ─── 订阅停用判定（无可用节点 / 资源失效）─────────────────────
@@ -450,12 +474,15 @@ def test_inject_probe_lanes_adds_20_lanes_and_keeps_subscription() -> None:
     injected = inject_probe_lanes(_sub_config())
     doc = yaml.safe_load(injected)
     lanes = [g for g in doc["proxy-groups"] if g["name"].startswith("HlProbeLane")]
-    listeners = [l for l in doc["listeners"] if l["name"].startswith("HlProbeLane")]
+    listeners = [listener for listener in doc["listeners"] if listener["name"].startswith("HlProbeLane")]
     assert len(lanes) == PROBE_LANE_COUNT
     assert len(listeners) == PROBE_LANE_COUNT
     assert all(g["type"] == "select" and g.get("include-all") for g in lanes)
     # listener 逐条指向本组，且不碰订阅自己的组与混合口
-    assert all(l["proxy"] == l["name"].removesuffix("-in") for l in listeners)
+    assert all(
+        listener["proxy"] == listener["name"].removesuffix("-in")
+        for listener in listeners
+    )
     assert doc["mixed-port"] == 7890
     assert any(g["name"] == "机场选择" for g in doc["proxy-groups"])
     assert [p["name"] for p in doc["proxies"]] == ["节点A", "节点B"]

@@ -2225,7 +2225,7 @@ export interface UpdateProgress {
   code: 'asset_missing' | 'network' | 'verify_failed' | 'cancelled' | 'error' | null
   /** 瞬时速率（B/s，后端每秒刷新一次；0 = 暂无） */
   speed: number
-  /** 当前通道名（"直连" / "直连·镜像" / "本地混合端口 7890"…） */
+  /** 当前通道名（"直连" / "直连·镜像" / "本地混合端口"…） */
   channel: string | null
 }
 
@@ -2384,7 +2384,10 @@ export interface ProxyItem {
 
 export interface ProxyStrategy {
   strategy: string
-  clashPort: number
+  clashPort: number | null
+  clashPortMode: 'auto' | 'fixed'
+  runtimeRunning?: boolean
+  runtimeEntryReady?: boolean
   /** 内核随服务自启开关（undefined = 未拉到，UI 按开处理） */
   autostart?: boolean
   /** 自动节点体检开关（undefined = 未拉到，UI 按开处理） */

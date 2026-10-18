@@ -33,11 +33,17 @@ const proxies = {
   'proxies.strategy.off': '关闭',
   'proxies.strategy.updated': '路由策略已更新（下个任务生效）',
 
-  /* 本地混合端口（纯配置，不随策略切换） */
-  'proxies.port.label': '内核工作端口',
-  'proxies.port.title': '本程序内核监听的混合端口，程序的代理流量统一走它；兜底探测自启 Verge 固定 7897，与此设置无关',
+  /* 内核代理端口 */
+  'proxies.port.mode.auto': '自动分配',
+  'proxies.port.mode.fixed': '固定端口',
+  'proxies.port.advanced': '高级端口设置',
+  'proxies.port.autoStatus': '自动分配 · 当前端口 {port}',
+  'proxies.port.fixedStatus': '固定端口 · {port}',
+  'proxies.port.fixedLabel': '监听端口',
+  'proxies.port.stopped': '内核停止',
+  'proxies.port.title': '内核只在本机监听；自动模式会在启动时分配端口，固定模式用于兼容已有设置',
   'proxies.port.invalid': '端口须为 1024–65535 的整数',
-  'proxies.port.updated': 'Clash 端口已更新',
+  'proxies.port.updated': '代理端口设置已更新',
 
   /* 自动维护开关（内核自启 / 定期体检；手动检测不受闸） */
   'proxies.auto.autostartLabel': '随服务自启内核',
