@@ -218,7 +218,7 @@ export interface CoverageMatrixData {
 export interface StatusBoardItem {
   id: string
   name: string
-  status: 'online' | 'offline' | 'degraded' | 'busy' | 'idle' | 'warn'
+  status: 'online' | 'offline' | 'degraded' | 'busy' | 'idle' | 'warn' | 'healthy' | 'warning' | 'critical' | 'inactive' | 'unknown'
   statusText?: string
   subTitle?: string
   metrics?: { label: string; value: string | number }[]

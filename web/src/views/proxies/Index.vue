@@ -269,7 +269,7 @@ const proxyStatusBlock = computed<StructuredBlock<StatusBoardData>>(() => {
         ? (entryReady ? t('structured.statusBoard.healthy') : t('proxies.clash.entryNotReady', { port: clash.value?.port ?? 7890 }))
         : t('proxies.clash.stopped'),
       metrics: [
-        { label: t('proxies.port.label'), value: clash.value?.port ?? 7890 },
+        { label: t('proxies.port.fixedLabel'), value: clash.value?.port ?? 7890 },
       ],
     },
     {
@@ -295,18 +295,15 @@ const proxyStatusBlock = computed<StructuredBlock<StatusBoardData>>(() => {
   return {
     id: 'proxies-status-board',
     componentId: 'status-board',
-    title: t('proxies.hero.title'),
+    version: '1.0',
     density: 'compact',
     status: 'ready',
     data: {
-      items: boardItems,
-      columns: 3,
-      summary: {
-        total: boardItems.length,
-        healthy: boardItems.filter((i) => i.status === 'healthy').length,
-        warning: boardItems.filter((i) => i.status === 'warning').length,
-        critical: boardItems.filter((i) => i.status === 'critical').length,
-      },
+      groups: [{
+        id: 'proxy-overview',
+        title: t('structured.statusBoard.title'),
+        items: boardItems,
+      }],
     },
   }
 })
