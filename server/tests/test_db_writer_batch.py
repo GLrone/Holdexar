@@ -59,6 +59,49 @@ async def _history_count(db, appid):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("batch", [False, True])
+async def test_replayed_snapshot_updates_details_without_losing_batch(db, monkeypatch, batch):
+    writer = DbWriter()
+    game = _game(APPID_A)
+    assert await writer.upsert_task_batch([(game, _prices(APPID_A, 10000, 20000, 50))]) == [True]
+    async with db() as session:
+        first_id = (await session.execute(select(GamePriceHistory.id))).scalar_one()
+
+    async def no_fallback(_entries):
+        pytest.fail("snapshot conflicts must not retry the whole batch")
+
+    monkeypatch.setattr(writer, "_upsert_task_batch_slow", no_fallback)
+    changed = _prices(APPID_A, 10000, 25000, 60)
+    if batch:
+        assert await writer.upsert_task_batch([
+            (game, changed), (_game(APPID_B), _prices(APPID_B, 3000, 5000, 40)),
+        ]) == [True, True]
+    else:
+        assert await writer.upsert_game_and_prices(game, changed)
+    assert await _history_count(db, APPID_A) == 1
+    async with db() as session:
+        history = (await session.execute(
+            select(GamePriceHistory).where(GamePriceHistory.appid == APPID_A)
+        )).scalar_one()
+        current = await session.get(GameCurrentPrice, (APPID_A, "CN"))
+        assert (history.id, history.original_price, history.discount_percent) == (first_id, 25000, 60)
+        assert (current.original_price, current.discount_percent) == (25000, 60)
+    if batch:
+        assert await _history_count(db, APPID_B) == 1
+
+
+@pytest.mark.asyncio
+async def test_single_writer_scope_cannot_open_second_transaction():
+    from app.core.database import write_session
+    from app.crawler.db_writer import _session_scope
+
+    async with write_session():
+        with pytest.raises(RuntimeError, match="嵌套 write_session"):
+            async with _session_scope(None):
+                pass
+
+
+@pytest.mark.asyncio
 async def test_baselines_keep_all_latest_versions_without_current_rows(db):
     from sqlalchemy import insert
 

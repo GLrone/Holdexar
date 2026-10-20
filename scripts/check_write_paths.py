@@ -1,6 +1,6 @@
 """写事务路径机械审计：裸写事务（未过写调度器）进不了仓库。
 
-SQLite 单写者约束下，server/app 内所有写事务必须位于 write_gate() 调度上下文
+SQLite 单写者约束下，应用与维护脚本写事务必须位于共享写锁上下文
 （见 app/core/database.py 的「全局写入调度器」）。本脚本用 AST 静态扫描：
 
 - 检测点：`.commit()` / `.flush()` 调用；`.execute()` / `.executescript()` /
@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ast
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -35,7 +36,8 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-APP_DIR = Path(__file__).resolve().parent.parent / "server" / "app"
+ROOT = Path(__file__).resolve().parent.parent
+APP_DIR = ROOT / "server" / "app"
 BLOCKED_GATE_CALLS = {
     "gather", "create_task", "ensure_future", "TaskGroup", "sleep",
     "open", "read_text", "read_bytes", "write_text", "write_bytes", "unlink",
@@ -51,63 +53,63 @@ BLOCKED_IO_MODULES = {
 }
 NETWORK_METHODS = {"request", "get", "post", "put", "patch", "delete", "send", "fetch"}
 
-# 写事务豁免登记（文件后缀, 函数名）→ (豁免语句种类, 理由)。kind ∈
-# {"commit", "flush", "execute"}：按语句种类豁免（如只豁免 flush，该函数
-# 日后新增的裸 commit 仍会被拦）。豁免 = 调用点已在 write_gate 内、或写锁
-# 天然独占的启动机制；新增豁免须先在此登记并同步 CONSTRAINTS §八。
-ALLOW: dict[tuple[str, str], tuple[frozenset[str], str]] = {
-    ("crawler/db_writer.py", "_session_scope"): (
-        frozenset({"execute"}),
-        "自有会话事务起点 BEGIN IMMEDIATE（调用点在 write_gate/write_session 上下文内，防跨进程先读后写快照失效）"),
+# (文件, 函数) → (语句种类及调用点上限, 理由)。
+ALLOW: dict[tuple[str, str], tuple[dict[str, int], str]] = {
     ("core/seed_assets.py", "apply_curated_rows"): (
-        frozenset({"execute"}),
+        {"execute": 1},
         "人工列批量补挂语句体（调用点在 write_session/段内保存点事务内，事务边界在调用方）"),
     ("core/seed_assets.py", "_merge_history_chunk"): (
-        frozenset({"commit", "execute"}),
+        {"commit": 2, "execute": 8},
         "线程池原生连接历史合并（调用点已 write_gate 包裹（分块续跑），缺键 INSERT + 派生列差异覆写 UPDATE，价格键不回拨）"),
     ("core/seed_assets.py", "_merge_bundles_sync"): (
-        frozenset({"commit", "execute"}),
+        {"commit": 1, "execute": 6},
         "线程池原生连接捆绑包合并（调用点已 write_gate 包裹，与历史合并同形态）"),
     ("core/seed_assets.py", "_merge_current_prices_sync"): (
-        frozenset({"commit", "execute"}),
+        {"commit": 1, "execute": 4},
         "线程池原生连接现价快照合并（调用点已 write_gate 包裹，与历史合并同形态）"),
     ("core/seed_assets.py", "_merge_game_tags_sync"): (
-        frozenset({"commit", "execute"}),
+        {"commit": 1, "execute": 4},
         "线程池原生连接玩家标签合并（调用点已 write_gate 包裹，与历史合并同形态）"),
     ("core/database.py", "_ensure_schema"): (
-        frozenset({"execute"}),
+        {"execute": 2},
         "启动链建表与存量回填（sync 引擎独占窗口执行，写调度器管不到同步连接）"),
     ("core/backup.py", "_vacuum_file"): (
-        frozenset({"execute"}),
+        {"execute": 1},
         "原地 VACUUM（停写入面的独占窗口执行，靠调用方调度保证独占）"),
     ("core/backup.py", "snapshot_to"): (
-        frozenset({"execute"}),
+        {"execute": 1},
         "VACUUM INTO 在线快照（对源库只读，产出自洽新文件）"),
     ("core/migration.py", "migrate_appdata_to_portable"): (
-        frozenset({"execute"}),
+        {"execute": 1},
         "VACUUM INTO 迁移对源库只读，产出自洽新文件"),
     ("core/migration.py", "adopt_source_database"): (
-        frozenset({"execute"}),
+        {"execute": 1},
         "同一 VACUUM INTO 快照（对源库只读），函数拆分后写点随之迁移"),
     ("domains/family/service.py", "_absorb_local_members"): (
-        frozenset({"commit"}),
+        {"commit": 1},
         "调用点已 write_gate 包裹（吸收即调用方事务的一步）"),
     ("domains/proxypool/registry.py", "settle_nodes_after_source_change"): (
-        frozenset({"flush"}), "flush-only 共用收尾（快照对齐/退出/清理），事务边界在调用方闸内"),
+        {"flush": 1}, "flush-only 共用收尾（快照对齐/退出/清理），事务边界在调用方闸内"),
     ("domains/monitoring/service.py", "_ensure_target"): (
-        frozenset({"flush"}), "flush-only，事务边界在调用方闸内（ensure_source 等）"),
+        {"flush": 1}, "flush-only，事务边界在调用方闸内（ensure_source 等）"),
     ("domains/proxypool/admission.py", "exit_from_production"): (
-        frozenset({"flush"}), "flush-only，事务边界在调用方闸内"),
+        {"flush": 1}, "flush-only，事务边界在调用方闸内"),
     ("domains/proxypool/admission.py", "promote_to_active"): (
-        frozenset({"flush"}), "flush-only，事务边界在调用方闸内"),
+        {"flush": 1}, "flush-only，事务边界在调用方闸内"),
     ("domains/proxypool/registry.py", "apply_snapshot"): (
-        frozenset({"flush"}), "flush-only，事务边界在调用方闸内（账本对齐/转正）"),
+        {"flush": 1}, "flush-only，事务边界在调用方闸内（账本对齐/转正）"),
     ("domains/proxypool/subscription.py", "persist_snapshot"): (
-        frozenset({"flush"}), "flush-only，事务边界在调用方闸内（订阅同步）"),
+        {"flush": 1}, "flush-only，事务边界在调用方闸内（订阅同步）"),
     ("domains/proxypool/jobruns.py", "start_run"): (
-        frozenset({"flush"}), "flush-only，事务边界在调用方闸内（record_start）"),
+        {"flush": 1}, "flush-only，事务边界在调用方闸内（record_start）"),
     ("domains/proxypool/exitstats.py", "record_run_exits"): (
-        frozenset({"commit"}), "提交由调用方 write_run_exits 的 write_gate 覆盖"),
+        {"commit": 1}, "提交由调用方 write_run_exits 的 write_gate 覆盖"),
+    ("scripts/export_seed.py", "export"): (
+        {"executescript": 1, "executemany": 9, "commit": 1}, "只读源库并新建种子产物"),
+    ("scripts/export_cloud_packs.py", "export_pack"): (
+        {"execute": 3}, "只读模板并新建数据包"),
+    ("server/scripts/export_template_db.py", "main"): (
+        {"execute": 6, "commit": 1}, "只读源库并新建模板产物"),
 }
 
 SQL_WRITE_RE = re.compile(
@@ -124,6 +126,7 @@ class _Visitor(ast.NodeVisitor):
         self._func_stack: list[str] = []
         self._module_aliases: dict[str, str] = {}
         self._direct_aliases: dict[str, str] = {}
+        self._allow_used: dict[tuple[str, str], int] = {}
 
     def build_parents(self, tree: ast.AST) -> None:
         for node in ast.walk(tree):
@@ -157,7 +160,7 @@ class _Visitor(ast.NodeVisitor):
                         f = ctx.func
                         name = f.id if isinstance(f, ast.Name) else (
                             f.attr if isinstance(f, ast.Attribute) else None)
-                        if name in ("write_gate", "write_session"):
+                        if name in ("write_gate", "write_session", "sync_write_gate"):
                             return True
             cur = self._parents.get(cur)
         return False
@@ -174,11 +177,9 @@ class _Visitor(ast.NodeVisitor):
         parts = self._call_parts(node.func)
         if not parts:
             return None
-        name = ".".join(parts)
         direct = self._direct_aliases.get(parts[0])
         module_root = self._module_aliases.get(parts[0], parts[0]).split(".")[0]
         if direct:
-            name = direct + ("." + ".".join(parts[1:]) if len(parts) > 1 else "")
             module_root = direct.split(".")[0]
         leaf = parts[-1]
         if direct and direct.split(".")[-1] in BLOCKED_GATE_CALLS:
@@ -209,7 +210,10 @@ class _Visitor(ast.NodeVisitor):
         for fname in reversed(funcs):
             entry = ALLOW.get((self._file_suffix, fname))
             if entry and self.kind in entry[0]:
-                return entry[1]
+                key = (fname, self.kind)
+                used = self._allow_used.get(key, 0) + 1
+                self._allow_used[key] = used
+                return entry[1] if used <= entry[0][self.kind] else None
         return None
 
     file_suffix = ""
@@ -322,22 +326,34 @@ def audit_source(source: str, file_suffix: str = "<test>") -> tuple[
 def audit_file(path: Path) -> tuple[list[tuple[int, str]], list[tuple[int, str]], list[tuple[int, str]], list[tuple[int, str]]]:
     return audit_source(
         path.read_text(encoding="utf-8"),
-        path.relative_to(APP_DIR).as_posix(),
+        path.relative_to(APP_DIR).as_posix() if path.is_relative_to(APP_DIR) else path.relative_to(ROOT).as_posix(),
     )
+
+
+def source_paths() -> list[Path]:
+    result = subprocess.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "--",
+         "scripts", "server/scripts"],
+        cwd=ROOT, capture_output=True, text=True, check=True,
+    )
+    return sorted(set(APP_DIR.rglob("*.py")) | {
+        ROOT / name for name in result.stdout.splitlines()
+        if name.endswith(".py") and (ROOT / name).is_file()
+    })
 
 
 def main() -> int:
     verbose = "--verbose" in sys.argv
     total_fail = 0
     total_exc = 0
-    for path in sorted(APP_DIR.rglob("*.py")):
+    for path in source_paths():
         try:
             fails, exceptions, composites, effects = audit_file(path)
         except SyntaxError as e:
-            print(f"FAIL {path.relative_to(APP_DIR.parent)}: 解析失败 {e}")
+            print(f"FAIL {path.relative_to(ROOT)}: 解析失败 {e}")
             total_fail += 1
             continue
-        rel = path.relative_to(APP_DIR.parent).as_posix()
+        rel = path.relative_to(ROOT).as_posix()
         for lineno, _ in fails:
             src = " ".join(path.read_text(encoding="utf-8").splitlines()[lineno - 1].split())[:100]
             print(f"FAIL {rel}:{lineno}")

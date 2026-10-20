@@ -11,9 +11,9 @@ game_price_history 里 version_suffix 为空的行（历史档案导入行天生
 """
 from __future__ import annotations
 
-import shutil
 import sqlite3
 import sys
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
@@ -27,6 +27,8 @@ if hasattr(sys.stderr, "reconfigure"):
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
 from app.core.paths import resolve_data_dir  # noqa: E402 —— 数据目录判定的单一来源
+from app.core.backup import snapshot_to  # noqa: E402
+from app.core.database import sync_write_gate  # noqa: E402
 
 
 def main() -> None:
@@ -37,11 +39,11 @@ def main() -> None:
     backup = db_path.with_name(
         f"holdexar_backup_suffix_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
     )
-    shutil.copy2(db_path, backup)
+    snapshot_to(db_path, backup)
     print(f"[备份] {db_path} → {backup}")
 
-    conn = sqlite3.connect(db_path)
-    try:
+    with sync_write_gate(db_path), closing(sqlite3.connect(db_path)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
         # 每个 (appid, sub_id) 的最新非空版本名（sub_id>0 才是真实 SKU，
         # 0 是无 sub 游戏的伪占位，不参与）
         known: dict[tuple[int, int], str] = {
@@ -76,8 +78,6 @@ def main() -> None:
             f"[完成] 全表 {total} 行，回填 {cur.rowcount} 行"
             f"（参照 {len(known)} 个 (appid, sub_id) 组的已知版本名）"
         )
-    finally:
-        conn.close()
 
 
 if __name__ == "__main__":

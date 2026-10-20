@@ -28,7 +28,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from enum import IntEnum
 from functools import lru_cache
@@ -607,10 +607,7 @@ async def _migrate_alert_targets_to_cny(conn) -> None:
 async def _migrate_gph_snapshot_unique(conn) -> bool:
     """补建 game_price_history 的幂等唯一索引。
 
-    写入侧（crawler/db_writer、历史导入脚本）用 `INSERT OR REPLACE` 去重，
-    靠的就是这个唯一索引。缺了它**新装的库**表建出来没有约束，OR REPLACE
-    退化成普通 INSERT：同一天同一 sub 反复堆积，表现是走势图出现同日重复点、
-    史低次数虚高、`count` 与库内行数对不上（「数据对不上」的一类）。
+    写入侧依赖此索引合并同一观测，重复写入更新详情并保留行身份。
 
     表达式索引而非列索引：sub_id / price / is_gold 都可为空，而 SQLite 的唯一索引
     把每个 NULL 视为互不相等，直接索引这三列等于不约束——必须 COALESCE 归一。
@@ -1236,7 +1233,7 @@ _MIGRATIONS: list[tuple[int, str, object]] = [    (2, "bundle_region_prices 零�
          " WHERE item_kind IS NULL OR item_kind = -1",
      ]),
     (4, "game_price_history 幂等唯一索引 ux_gph_snapshot 补建"
-        "（写入侧靠 INSERT OR REPLACE 去重，缺该索引时新库会退化成无约束插入）",
+        "（同一观测依赖唯一键合并，缺失索引时新库失去去重约束）",
      _migrate_gph_snapshot_unique),
     (5, "wishlist_items 愿望单成员标记回填（监控池三模块语义："
         "愿望单与星标关注识别为爬取队列第一优先级）",
@@ -1359,12 +1356,13 @@ async def _snapshot_before_migration(current: int, target: int) -> None:
     if src is None or not src.is_file() or src.stat().st_size == 0:
         return
     dest = src.with_name(src.name + _PRE_MIGRATION_SUFFIX)
+    staging = dest.with_name(dest.name + ".tmp")
     from .backup import snapshot_to
 
     try:
-        # VACUUM INTO 的目标文件已存在会直接报错，先清
-        dest.unlink(missing_ok=True)
-        await asyncio.to_thread(snapshot_to, src, dest)
+        staging.unlink(missing_ok=True)
+        await asyncio.to_thread(snapshot_to, src, staging)
+        staging.replace(dest)
         size_mb = dest.stat().st_size / 1024 / 1024
         log_event(
             logger,
@@ -1378,11 +1376,10 @@ async def _snapshot_before_migration(current: int, target: int) -> None:
             },
         )
     except Exception:  # noqa: BLE001
-        dest.unlink(missing_ok=True)
+        staging.unlink(missing_ok=True)
         log_event(
             logger,
-            "升级前快照失败，这次迁移没有回滚点——迁移若中断或结果异常，"
-            "请从 backups/ 里最近一份备份恢复",
+            "升级前快照未完成，已停止本次数据库升级",
             level=logging.ERROR,
             exc_info=True,
             detail={"当前版本": current, "目标版本": target},
@@ -1404,7 +1401,7 @@ def _headline(text: str) -> str:
     return "".join(kept).strip("，。；;： ")
 
 
-async def _run_schema_migrations() -> None:
+async def _run_schema_migrations(*, snapshot_ready: bool = False) -> None:
     """按 user_version 差额执行迁移链；每步成功即落版本号。
 
     - 存量库 user_version=0（从未用过版本账本）→ 视为 v1 之前，直接登 v1
@@ -1427,6 +1424,10 @@ async def _run_schema_migrations() -> None:
             f"数据库结构版本 v{current} 高于当前程序支持的数据库版本 v{latest}，拒绝启动"
         )
 
+    pending = [m for m in _MIGRATIONS if m[0] > max(current, 1)]
+    if pending and not snapshot_ready:
+        await _snapshot_before_migration(current, pending[-1][0])
+
     if current == 0:
         # 首登版本账本：v1 = 账本启用（无数据变更）
         async with engine.connect() as conn:
@@ -1440,10 +1441,6 @@ async def _run_schema_migrations() -> None:
             except Exception:
                 await conn.rollback()
                 raise
-
-    pending = [m for m in _MIGRATIONS if m[0] > current]
-    if pending:
-        await _snapshot_before_migration(current, pending[-1][0])
 
     for target_version, description, body in _MIGRATIONS:
         if target_version <= current:
@@ -1523,12 +1520,16 @@ async def init_db(*, maintenance_token: str | None = None) -> None:
                 f"数据库结构版本 v{current} 高于当前程序支持的数据库版本 v{latest}，拒绝启动"
             )
 
+        pending = [m for m in _MIGRATIONS if m[0] > max(current, 1)]
+        if pending:
+            await _snapshot_before_migration(current, pending[-1][0])
+
         async with get_engine().begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
             await conn.run_sync(_ensure_schema)
 
         # 结构性迁移链（user_version 账本；v1 起步）
-        await _run_schema_migrations()
+        await _run_schema_migrations(snapshot_ready=bool(pending))
 
     if maintenance_token is None:
         async with write_maintenance_barrier():
@@ -1598,17 +1599,7 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(get_engine(), expire_on_commit=False)
 
 
-# ── 全局写入调度器（SQLite 单写者约束）───────────────────────────────
-# SQLite 同一时刻只允许一个写事务；WAL 下读并发不受此约束。全部写事务经
-# write_gate() 进入调度，任何绕过闸的写事务都会在文件锁层与其他写者互撞
-# （busy_timeout 60s 吸收不掉持续进站的写者）。机械防线见
-# scripts/check_write_paths.py（裸 commit/flush/裸 SQL 写入进不了仓库）。
-# 调度规则：交互写（用户操作）优先于后台批量；后台大批次分段提交让出写者，
-# 用户写不被整批堵住。串行依赖的全局状态 = SQLite 单写者，同一任务内嵌套
-# 过闸（批量回退路径、工具函数复用）按重入处理——单任务顺序事务不破坏单写者。
-# 互斥边界：调度器按事件循环各持一份（见 _schedulers），互斥范围 = 单个
-# event loop 内的任务；跨线程的独立 event loop、独立进程不在其管辖内
-# （跨进程一致性由 SQLite 文件锁与运行约束兜底，如启动链种子合并例外）。
+# SQLite 单写者：交互写优先，后台分块提交；进程间锁按数据库路径共享。
 
 
 class WritePriority(IntEnum):
@@ -1642,6 +1633,7 @@ class _SchedulerMetrics:
 
 _WAIT_WARN_MS = {WritePriority.INTERACTIVE: 1000.0, WritePriority.BACKGROUND: 15000.0}
 _HOLD_WARN_MS = 5000.0
+_WRITE_WAIT_TIMEOUT = 60.0
 
 
 _PRIORITY_LABELS = {"INTERACTIVE": "交互", "BACKGROUND": "后台"}
@@ -1755,8 +1747,9 @@ class WriteScheduler:
         fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._waiters[priority].append((task, fut, label))
         try:
-            await fut
-        except asyncio.CancelledError:
+            async with asyncio.timeout(_WRITE_WAIT_TIMEOUT):
+                await fut
+        except (asyncio.CancelledError, TimeoutError):
             # 闸可能在取消送达前已移交本任务（fut 已写入结果）：代为释放，
             # 否则写者位停在已消失的任务名下，后续写者全部饿死。
             if fut.done() and not fut.cancelled():
@@ -1861,9 +1854,9 @@ _process_write_locks: dict[str, threading.Lock] = {}
 _process_write_locks_guard = threading.Lock()
 
 
-def _process_write_lock_path() -> Path:
+def _process_write_lock_path(database_path: Path | None = None) -> Path:
     """同一数据库的跨进程写锁文件路径；文件只承载操作系统锁，不存业务状态。"""
-    database = get_engine().url.database
+    database = str(database_path) if database_path is not None else get_engine().url.database
     if not database or database == ":memory:":
         identity = f"memory:{id(get_engine().sync_engine)}"
     else:
@@ -1908,21 +1901,43 @@ class _CrossProcessWriteLock:
         self.locked = False
 
     async def acquire(self) -> _CrossProcessWriteLock:
-        self.local_lock = _local_process_lock(self.path)
-        while not self.local_lock.acquire(blocking=False):
-            await asyncio.sleep(0.025)
         try:
-            self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
-            if os.fstat(self.fd).st_size == 0:
-                os.write(self.fd, b"\0")
-            while True:
-                if _try_lock_file(self.fd):
-                    self.locked = True
-                    return self
-                await asyncio.sleep(0.025)
+            async with asyncio.timeout(_WRITE_WAIT_TIMEOUT):
+                local_lock = _local_process_lock(self.path)
+                while not local_lock.acquire(blocking=False):
+                    await asyncio.sleep(0.025)
+                self.local_lock = local_lock
+                self._open_file()
+                while not _try_lock_file(self.fd):
+                    await asyncio.sleep(0.025)
+                self.locked = True
+                return self
         except BaseException:
             self._release_handles(unlock=self.locked)
             raise
+
+    def acquire_sync(self) -> _CrossProcessWriteLock:
+        deadline = time.monotonic() + _WRITE_WAIT_TIMEOUT
+        local_lock = _local_process_lock(self.path)
+        if not local_lock.acquire(timeout=_WRITE_WAIT_TIMEOUT):
+            raise TimeoutError("等待数据库写入超时")
+        self.local_lock = local_lock
+        try:
+            self._open_file()
+            while not _try_lock_file(self.fd):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("等待数据库写入超时")
+                time.sleep(0.025)
+            self.locked = True
+            return self
+        except BaseException:
+            self._release_handles(unlock=self.locked)
+            raise
+
+    def _open_file(self) -> None:
+        self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        if os.fstat(self.fd).st_size == 0:
+            os.write(self.fd, b"\0")
 
     def release(self) -> None:
         self._release_handles(unlock=self.locked)
@@ -1962,6 +1977,12 @@ def _current_task_owns_process_write_lock() -> bool:
     return active is not None and active[0] is asyncio.current_task()
 
 
+def _reject_inherited_write_lock() -> None:
+    active = _ACTIVE_PROCESS_WRITE_LOCK.get()
+    if active is not None and active[0] is not asyncio.current_task() and active[1].locked:
+        raise RuntimeError("子任务不能申请父任务仍持有的写锁；请在同一任务内顺序完成事务")
+
+
 class _WriteLockLease:
     def __init__(self, lock: _CrossProcessWriteLock, token: contextvars.Token) -> None:
         self._lock = lock
@@ -1977,6 +1998,7 @@ class _WriteLockLease:
 
 async def acquire_write_maintenance_barrier() -> _WriteLockLease:
     """排空所有进程内写入并阻止维护窗口期间新的 write_gate 写入。"""
+    _reject_inherited_write_lock()
     if _current_task_owns_process_write_lock():
         raise RuntimeError("维护屏障不能嵌套在现有写事务中")
     lock = await _CrossProcessWriteLock(_process_write_lock_path()).acquire()
@@ -1994,6 +2016,16 @@ async def write_maintenance_barrier() -> AsyncIterator[None]:
         yield
     finally:
         lease.release()
+
+
+@contextmanager
+def sync_write_gate(database_path: Path | None = None):
+    """同步维护工具复用同一数据库的进程间写锁。"""
+    lock = _CrossProcessWriteLock(_process_write_lock_path(database_path)).acquire_sync()
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def _scheduler_for_loop() -> WriteScheduler:
@@ -2015,6 +2047,7 @@ class _WriteGate:
         self._process_lease: _WriteLockLease | None = None
 
     async def __aenter__(self) -> None:
+        _reject_inherited_write_lock()
         self._scheduler = _scheduler_for_loop()
         label = self._label
         if label is None:

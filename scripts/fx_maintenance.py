@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import sqlite3
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -50,7 +51,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
 
 from sqlalchemy import delete  # noqa: E402
 
-from app.core.database import get_session_factory, init_db  # noqa: E402
+from app.core.database import init_db, sync_write_gate, write_session  # noqa: E402
 
 
 from app.domains.rates import history as rates_history  # noqa: E402
@@ -128,6 +129,17 @@ def _sqlite_connect() -> "sqlite3.Connection":
     return con
 
 
+def _write_archive_batch(con, batch) -> None:
+    with sync_write_gate(_sqlite_path()):
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            con.executemany(_ARCHIVE_INSERT_SQL, batch)
+            con.commit()
+        except BaseException:
+            con.rollback()
+            raise
+
+
 def import_pg(dsn: str) -> None:
     import psycopg2
 
@@ -166,8 +178,7 @@ def import_pg(dsn: str) -> None:
                 )
                 inserted += 1
             if batch:
-                con.executemany(_ARCHIVE_INSERT_SQL, batch)
-                con.commit()
+                _write_archive_batch(con, batch)
                 print(f"[import-pg] ... 已写 {inserted}")
                 batch = []
         cur.close()
@@ -212,13 +223,11 @@ def import_fxdb(src: str = DEFAULT_FXDB) -> None:
                       day.isoformat(), f"{day.isoformat()} 12:00:00"))
         inserted += 1
         if len(batch) >= 5000:
-            con.executemany(_ARCHIVE_INSERT_SQL, batch)
-            con.commit()
+            _write_archive_batch(con, batch)
             print(f"[import-fxdb] ... 已写 {inserted}")
             batch = []
     if batch:
-        con.executemany(_ARCHIVE_INSERT_SQL, batch)
-        con.commit()
+        _write_archive_batch(con, batch)
     src_con.close()
     con.close()
     print(f"[import-fxdb] 完成：插入 {inserted} 行，跳过（白名单外/已有）{skipped} 行")
@@ -264,13 +273,11 @@ def import_fxjson(src: str = DEFAULT_FXJSON) -> None:
                           day.isoformat(), f"{day.isoformat()} 00:00:00"))
             inserted += 1
             if len(batch) >= 5000:
-                con.executemany(_ARCHIVE_INSERT_SQL, batch)
-                con.commit()
+                _write_archive_batch(con, batch)
                 print(f"[import-fxjson] ... 已写 {inserted}")
                 batch = []
     if batch:
-        con.executemany(_ARCHIVE_INSERT_SQL, batch)
-        con.commit()
+        _write_archive_batch(con, batch)
     con.close()
     print(f"[import-fxjson] 完成：插入 {inserted} 行，跳过（白名单外/已有）{skipped} 行")
 
@@ -339,7 +346,7 @@ async def repair(
 async def cleanup() -> None:
     await init_db()
     allowed = sorted(ALLOWED_CURRENCIES)
-    async with get_session_factory()() as session:
+    async with write_session() as session:
         h = await session.execute(delete(FxRateHistory).where(FxRateHistory.currency_code.not_in(allowed)))
         s = await session.execute(delete(FxRate).where(FxRate.currency_code.not_in(allowed)))
         await session.commit()
