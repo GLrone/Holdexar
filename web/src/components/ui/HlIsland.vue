@@ -8,38 +8,19 @@ import { useI18n } from '@/locales'
 import { useCrawlStatusStore } from '@/stores/crawlStatus'
 
 import { activityManager } from './activity/activityManager'
-import { islandController } from './activity/islandController'
+import { IDLE_EXPANDED_ID, islandController } from './activity/islandController'
+import type { IslandLayoutAction } from './activity/islandController'
 import ActivityPanel from './activity/ActivityPanel.vue'
 import PrimaryIsland from './activity/PrimaryIsland.vue'
 import SecondaryIsland from './activity/SecondaryIsland.vue'
-import {
-  createRectKeyframes,
-  islandSwapDuration,
-  islandSwapEasing,
-  type IslandMotionRect,
-} from './activity/islandMotionGeometry'
+import { IslandLayoutMotion } from './activity/islandLayoutMotion'
 import type { Activity } from './activity/types'
-import { dropNotice, island, setExpanded, setHovered } from './island'
-
-/**
- * 灵动岛宿主组件（HlIsland）：
- * 顶部悬浮的活动胶囊宿主，单活动时呈现经典单岛，多活动时接入副岛与总览面板。
- * 业务活动通过 ActivityManager 统一协调，展示状态由 IslandController 解耦驱动。
- */
+import { armTimer, dropNotice, endTask, island, setHovered } from './island'
 
 const router = useRouter()
 const crawl = useCrawlStatusStore()
 const { t } = useI18n()
-
-/* 空闲态即价格更新状态：结论与展开面正文同一数据源、同一口径 */
-const {
-  kind: priceKind,
-  label: priceLabel,
-  color: priceColor,
-  tip: priceTip,
-  detail: priceDetail,
-  stale: priceStale,
-} = usePriceStatus()
+const { kind: priceKind, label: priceLabel, color: priceColor, tip: priceTip, detail: priceDetail, stale: priceStale } = usePriceStatus()
 
 const TONE_ICON: Record<string, string> = {
   success: 'check-circle',
@@ -49,78 +30,35 @@ const TONE_ICON: Record<string, string> = {
   progress: 'refresh',
 }
 
-/* 基础尺寸规格：收起态高度恒定 36px，全圆角 18px */
-const SHAPE = {
-  compact: { h: 36, r: 18 },
-  expanded: { w: 420, r: 24 },
-} as const
-
-const EXPANDED_TEXT_W = 350
-const EXPANDED_MAX_LINES = 4
-const EXPANDED_LINE_H = 17
-const EXPANDED_LEAD_H = 26
-const EXPANDED_CHROME_H = 63
-const EXPANDED_DETAIL_H = 39
-const EXPANDED_BAR_H = 12
-const WIDE_GLYPH = /[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7FF\uF900-\uFAFF\uFE30-\uFE6F\uFF00-\uFFEF]/
-const EXPANDED_TRAIL_W = 72
-
-function headLineCount(text: string, wrapWidth: number): number {
-  let width = 0
-  for (const ch of text) width += WIDE_GLYPH.test(ch) ? 13 : 10
-  return Math.max(1, Math.ceil(width / wrapWidth))
-}
-
 const rootEl = ref<HTMLElement | null>(null)
-
-/** 当前主岛活动 */
+const idleStatusDismissed = ref(false)
 const primaryAct = computed(() => islandController.primaryActivity)
-
-/** 当前副岛活动 */
 const secondaryAct = computed(() => islandController.secondaryActivity)
-
-/** 兼容旧版 notices / tasks */
-const legacyNotice = computed(() => island.notices[0] ?? null)
-const legacyTask = computed(() => island.tasks[0] ?? null)
+const expandedAct = computed(() => islandController.expandedActivity)
+const legacyNotice = computed(() => island.notices.find((notice) => !activityManager.get('notice:' + notice.id)) ?? null)
+const legacyTask = computed(() => island.tasks.find((task) => !activityManager.get('task:' + task.key)) ?? null)
 const crawlRunning = computed(() => crawl.running && crawl.total > 0)
+const progDone = computed(() => crawl.roundProgress?.done ?? crawl.done)
+const progTotal = computed(() => crawl.roundProgress?.total ?? crawl.total)
 
-const waiting = computed(() => Math.max(0, activityManager.count - 1))
-
-/** 当前展示模式 */
-const mode = computed<'idle' | 'notice' | 'task' | 'expanded'>(() => {
-  if (islandController.isExpanded.value || island.expanded) return 'expanded'
+const mode = computed<'idle' | 'notice' | 'task'>(() => {
   const act = primaryAct.value
-  if (act) {
-    if (act.kind === 'task' || act.status === 'running') return 'task'
-    return 'notice'
-  }
-  if (legacyNotice.value) {
-    return legacyNotice.value.sticky ? 'task' : 'notice'
-  }
+  if (act) return act.kind === 'task' || act.status === 'running' ? 'task' : 'notice'
+  if (legacyNotice.value) return legacyNotice.value.sticky ? 'task' : 'notice'
   if (legacyTask.value || crawlRunning.value) return 'task'
   return 'idle'
 })
 
-/** 是否处于价格空闲态 */
 const showingPrice = computed(() => !primaryAct.value && !legacyNotice.value && !crawlRunning.value && !legacyTask.value)
-
-/** 岛体可见性 */
-const visible = computed(() => mode.value !== 'idle' || priceStale.value)
-
-/* 进度口径 */
-const progDone = computed(() => crawl.roundProgress?.done ?? crawl.done)
-const progTotal = computed(() => crawl.roundProgress?.total ?? crawl.total)
-
-const isDevPrimary = computed(() => primaryAct.value?.id.startsWith('dev:') ?? false)
+const visible = computed(() => !idleStatusDismissed.value && (mode.value !== 'idle' || priceStale.value || islandController.isExpanded.value))
+const showCompactMain = computed(() => !(showingPrice.value && islandController.isIdleExpanded))
+const waiting = computed(() => islandController.waitingCount)
+const isDevExpanded = computed(() => expandedAct.value?.id.startsWith('dev:') ?? false)
 
 const taskPercent = computed<number | null>(() => {
   const act = primaryAct.value
-  if (act) {
-    if (act.progress !== undefined) return act.progress
-    return null
-  }
-  const n = legacyNotice.value
-  if (n && n.sticky) return null
+  if (act) return act.progress ?? null
+  if (legacyNotice.value?.sticky) return null
   if (legacyTask.value) return legacyTask.value.percent
   if (!progTotal.value) return null
   return Math.min(100, Math.round((progDone.value / progTotal.value) * 100))
@@ -131,189 +69,232 @@ const crawlOnlyTask = computed(() => {
   if (act) return act.source === 'crawler' && act.status === 'running' && !act.id.startsWith('dev:')
   return !legacyNotice.value && !legacyTask.value && crawlRunning.value
 })
-
-const expandedIsTask = computed(() => {
-  const act = primaryAct.value
-  if (act) return act.kind === 'task' && act.source === 'crawler' && !act.id.startsWith('dev:')
-  return !legacyNotice.value && crawlRunning.value
-})
-
-const expandedShowsTasks = computed(() => {
-  if (primaryAct.value) return false
-  return !legacyNotice.value && !!legacyTask.value
-})
-
 const canRetry = computed(() => Boolean(primaryAct.value?.retry || legacyNotice.value?.retry))
-
 const busy = computed(() => {
   const act = primaryAct.value
-  if (act) {
-    if (act.status !== 'running') return false
-    return act.progress !== undefined || act.kind === 'task'
-  }
+  if (act) return act.status === 'running' && (act.progress !== undefined || act.kind === 'task')
   return Boolean(legacyNotice.value?.sticky || crawlRunning.value || legacyTask.value)
 })
-
-const taskLines = computed(() => {
-  return island.tasks.slice(1, 4)
-})
-
+const taskLines = computed(() => island.tasks.slice(1, 4))
 const taskGoto = computed(() => legacyTask.value?.to ?? '')
 
 const goto = computed(() => {
   const act = primaryAct.value
   if (act) return act.to || (act.status === 'failed' || act.tone === 'error' ? '/logs' : '')
-  const n = legacyNotice.value
-  if (!n) return ''
-  return n.to || (n.tone === 'error' ? '/logs' : '')
+  const notice = legacyNotice.value
+  return notice ? notice.to || (notice.tone === 'error' ? '/logs' : '') : ''
 })
-
 const gotoLabel = computed(() => {
   const act = primaryAct.value
-  if (act) {
-    if (act.toLabel) return act.toLabel
-    return goto.value === '/logs' ? t('island.viewLogs') : t('island.view')
-  }
-  const n = legacyNotice.value
-  if (!n) return ''
-  if (n.toLabel) return n.toLabel
+  if (act?.toLabel) return act.toLabel
+  const notice = legacyNotice.value
+  if (notice?.toLabel) return notice.toLabel
   return goto.value === '/logs' ? t('island.viewLogs') : t('island.view')
 })
 
 const headText = computed(() => {
   if (showingPrice.value) return priceLabel.value
-  const act = primaryAct.value
-  if (act) return act.title
-  const n = legacyNotice.value
-  if (n) return n.text
+  if (primaryAct.value) return primaryAct.value.title
+  if (legacyNotice.value) return legacyNotice.value.text
   if (legacyTask.value) return legacyTask.value.text
   return t('island.task.running', { done: progDone.value, total: progTotal.value })
 })
+const headTextStyle = computed(() => showingPrice.value ? { color: priceColor.value } : {})
+const headTruncated = computed(() => headText.value.length > 32)
+const trailing = computed(() => '')
 
-const leadIcon = computed(() => {
-  if (showingPrice.value) return 'refresh'
-  const act = primaryAct.value
-  if (act) {
-    if (act.icon) return act.icon
-    if (act.tone && TONE_ICON[act.tone]) return TONE_ICON[act.tone]
-    if (act.status === 'failed') return 'x-circle'
-    if (act.status === 'success') return 'check-circle'
-    return 'refresh'
-  }
-  const n = legacyNotice.value
-  return n ? TONE_ICON[n.tone] || 'refresh' : 'refresh'
-})
+function iconFor(activity: Activity | null, price: boolean, tone?: string): string {
+  if (price) return 'refresh'
+  if (activity?.icon) return activity.icon
+  if (activity?.tone && TONE_ICON[activity.tone]) return TONE_ICON[activity.tone]
+  if (activity?.status === 'failed') return 'x-circle'
+  if (activity?.status === 'success') return 'check-circle'
+  if (tone && TONE_ICON[tone]) return TONE_ICON[tone]
+  return 'refresh'
+}
 
+const leadIcon = computed(() => iconFor(primaryAct.value, showingPrice.value, legacyNotice.value?.tone))
 const leadSpin = computed(() => {
   if (showingPrice.value) return priceKind.value === 'running'
-  const act = primaryAct.value
-  if (act) return act.status === 'running'
+  if (primaryAct.value) return primaryAct.value.status === 'running'
   if (mode.value === 'task') return true
   return Boolean(legacyNotice.value?.sticky)
 })
-
 const leadToneClass = computed(() => {
   if (showingPrice.value) return ''
   const act = primaryAct.value
-  if (act) {
-    if (act.status === 'failed') return 'is-error'
-    if (act.tone) return `is-${act.tone}`
-    return 'is-progress'
-  }
-  const n = legacyNotice.value
-  if (!n) return 'is-progress'
-  return `is-${n.tone}`
+  if (act?.status === 'failed') return 'is-error'
+  if (act?.tone) return 'is-' + act.tone
+  if (act) return 'is-progress'
+  return legacyNotice.value ? 'is-' + legacyNotice.value.tone : 'is-progress'
 })
-
 const showBar = computed(() => {
   if (primaryAct.value) {
     return primaryAct.value.status === 'running' && (primaryAct.value.progress !== undefined || primaryAct.value.kind === 'task')
   }
   return busy.value
 })
+const detailText = computed(() => primaryAct.value?.detail ?? legacyNotice.value?.detail ?? (showingPrice.value ? priceDetail.value : ''))
 
-const trailing = computed(() => {
-  if (mode.value !== 'expanded') return ''
-  if (taskPercent.value !== null) return `${taskPercent.value}%`
-  if (activityManager.count > 1) return t('island.more', { n: activityManager.count - 1 })
-  if (waiting.value) return t('island.more', { n: waiting.value })
+const expandedShowingPrice = computed(() => islandController.isIdleExpanded)
+const expandedShowsTasks = computed(() => !expandedAct.value && !legacyNotice.value && Boolean(legacyTask.value))
+const expandedTaskLines = computed(() => island.tasks.slice(1, 4))
+const expandedTaskGoto = computed(() => legacyTask.value?.to ?? '')
+const expandedText = computed(() => {
+  if (expandedAct.value) return expandedAct.value.title
+  if (legacyNotice.value) return legacyNotice.value.text
+  if (legacyTask.value) return legacyTask.value.text
+  return priceLabel.value
+})
+const expandedProgress = computed<number | null>(() => {
+  if (expandedAct.value) return expandedAct.value.progress ?? null
+  if (legacyNotice.value?.sticky) return null
+  if (legacyTask.value) return legacyTask.value.percent
+  if (crawlRunning.value && progTotal.value) return Math.min(100, Math.round((progDone.value / progTotal.value) * 100))
+  return null
+})
+const expandedIcon = computed(() => iconFor(expandedAct.value, expandedShowingPrice.value, legacyNotice.value?.tone))
+const expandedSpin = computed(() => {
+  if (expandedShowingPrice.value) return priceKind.value === 'running'
+  if (expandedAct.value) return expandedAct.value.status === 'running'
+  return Boolean(legacyNotice.value?.sticky || legacyTask.value || crawlRunning.value)
+})
+const expandedToneClass = computed(() => {
+  if (expandedShowingPrice.value) return ''
+  if (expandedAct.value?.status === 'failed') return 'is-error'
+  if (expandedAct.value?.tone) return 'is-' + expandedAct.value.tone
+  if (expandedAct.value) return 'is-progress'
+  return legacyNotice.value ? 'is-' + legacyNotice.value.tone : 'is-progress'
+})
+const expandedIsTask = computed(() => {
+  if (expandedAct.value) return expandedAct.value.kind === 'task' && expandedAct.value.source === 'crawler' && !expandedAct.value.id.startsWith('dev:')
+  return !legacyNotice.value && crawlRunning.value
+})
+const expandedCanRetry = computed(() => Boolean(expandedAct.value?.retry || legacyNotice.value?.retry))
+const expandedGoto = computed(() => {
+  if (expandedAct.value) return expandedAct.value.to || (expandedAct.value.status === 'failed' || expandedAct.value.tone === 'error' ? '/logs' : '')
+  if (legacyNotice.value) return legacyNotice.value.to || (legacyNotice.value.tone === 'error' ? '/logs' : '')
   return ''
 })
-
-const detailText = computed(() => {
-  const act = primaryAct.value
-  if (act && act.detail) return act.detail
-  if (legacyNotice.value) return legacyNotice.value.detail ?? ''
-  return showingPrice.value ? priceDetail.value : ''
+const expandedGotoLabel = computed(() => {
+  if (expandedAct.value?.toLabel) return expandedAct.value.toLabel
+  if (legacyNotice.value?.toLabel) return legacyNotice.value.toLabel
+  return expandedGoto.value === '/logs' ? t('island.viewLogs') : t('island.view')
 })
-
-const idleWidth = computed(() => Math.min(240, Math.max(124, 60 + priceLabel.value.length * 13)))
-
-const noticeWidth = computed(() => {
-  const act = primaryAct.value
-  const len = act ? act.title.length : (legacyNotice.value?.text.length ?? 0)
-  return Math.min(400, Math.max(168, 76 + len * 13))
+const expandedDetail = computed(() => expandedAct.value?.detail ?? legacyNotice.value?.detail ?? (expandedShowingPrice.value ? priceDetail.value : ''))
+const expandedShowBar = computed(() => {
+  if (expandedAct.value) return expandedAct.value.status === 'running' && (expandedAct.value.progress !== undefined || expandedAct.value.kind === 'task')
+  return Boolean(legacyTask.value || crawlRunning.value)
 })
-
-const headWrapWidth = computed(() => EXPANDED_TEXT_W - (trailing.value ? EXPANDED_TRAIL_W : 0))
-const headRawLines = computed(() => headLineCount(headText.value, headWrapWidth.value))
-const headLines = computed(() => Math.min(EXPANDED_MAX_LINES, headRawLines.value))
-const headTruncated = computed(() => headRawLines.value > EXPANDED_MAX_LINES)
-const headStacked = computed(() => mode.value === 'expanded' && headLines.value > 1)
-
-const headTextStyle = computed(() => {
-  const style: Record<string, string> = {}
-  if (showingPrice.value) style.color = priceColor.value
-  if (mode.value === 'expanded') style.webkitLineClamp = String(EXPANDED_MAX_LINES)
+const expandedTrailing = computed(() => {
+  if (expandedProgress.value !== null) return String(expandedProgress.value) + '%'
+  return waiting.value ? t('island.more', { n: waiting.value }) : ''
+})
+const expandedHeadLines = computed(() => Math.min(4, headLineCount(expandedText.value, 350)))
+const expandedHeadStyle = computed(() => {
+  const style: Record<string, string> = { webkitLineClamp: '4' }
+  if (expandedShowingPrice.value) style.color = priceColor.value
   return style
 })
-
 const expandedHeight = computed(() => {
-  const row = Math.max(EXPANDED_LEAD_H, headLines.value * EXPANDED_LINE_H)
-  const detail = detailText.value ? EXPANDED_DETAIL_H : 0
-  const bar = showBar.value ? EXPANDED_BAR_H : 0
-  return EXPANDED_CHROME_H + row + detail + bar
+  const row = Math.max(26, expandedHeadLines.value * 17)
+  return 63 + row + (expandedDetail.value ? 39 : 0) + (expandedShowBar.value ? 12 : 0)
 })
-
-const size = computed(() => {
-  const m = mode.value
-  if (m === 'expanded') return { w: SHAPE.expanded.w, h: expandedHeight.value, r: SHAPE.expanded.r }
-  // 多活动模式时，主岛推荐固定宽度 240px，高度 36px，圆角 18px
-  if (islandController.hasSecondary) {
-    return { w: 240, h: SHAPE.compact.h, r: SHAPE.compact.r }
-  }
-  if (m === 'idle') return { w: idleWidth.value, h: SHAPE.compact.h, r: SHAPE.compact.r }
-  return { w: Math.min(320, Math.max(160, noticeWidth.value)), h: SHAPE.compact.h, r: SHAPE.compact.r }
-})
-
-const islandStyle = computed(() => ({
-  width: `${size.value.w}px`,
-  height: `${size.value.h}px`,
-  borderRadius: `${size.value.r}px`,
+const expandedStyle = computed(() => ({
+  width: 'min(420px, calc(100vw - 24px))',
+  height: String(expandedHeight.value) + 'px',
+  borderRadius: '24px',
 }))
 
+const idleWidth = computed(() => Math.min(240, Math.max(146, 82 + priceLabel.value.length * 13)))
+const noticeWidth = computed(() => {
+  const title = primaryAct.value?.title ?? legacyNotice.value?.text ?? ''
+  return Math.min(320, Math.max(160, 76 + title.length * 13))
+})
+const size = computed(() => {
+  if (islandController.hasSecondary) return { w: 240, h: 36, r: 18 }
+  if (mode.value === 'idle') return { w: idleWidth.value, h: 36, r: 18 }
+  return { w: noticeWidth.value, h: 36, r: 18 }
+})
+const islandStyle = computed(() => ({
+  width: String(size.value.w) + 'px',
+  height: String(size.value.h) + 'px',
+  borderRadius: String(size.value.r) + 'px',
+}))
+const mainDataId = computed(() => primaryAct.value?.id ?? (showingPrice.value ? IDLE_EXPANDED_ID : undefined))
+
+function headLineCount(text: string, wrapWidth: number): number {
+  const wideGlyph = /[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7FF\uF900-\uFAFA\uFE30-\uFE6F\uFF00-\uFFEF]/
+  let width = 0
+  for (const character of text) width += wideGlyph.test(character) ? 13 : 10
+  return Math.max(1, Math.ceil(width / wrapWidth))
+}
+
+let activeMotion: IslandLayoutMotion | null = null
+let applyingControllerMutation = false
+
+function syncExpandedBridge() {
+  island.expanded = islandController.isExpanded.value
+  armTimer()
+}
+
+async function transitionLayout(change: () => void) {
+  activeMotion?.finish()
+  activeMotion = null
+  const motion = rootEl.value ? new IslandLayoutMotion(rootEl.value) : null
+  activeMotion = motion
+  applyingControllerMutation = true
+  try {
+    change()
+  } finally {
+    applyingControllerMutation = false
+  }
+  syncExpandedBridge()
+  await nextTick()
+  if (activeMotion !== motion) return
+  await motion?.play()
+  if (activeMotion === motion) activeMotion = null
+}
+
 function onIslandClick() {
-  if (isSwapBusy.value) return
-  const next = !islandController.isExpanded.value
-  islandController.setExpanded(next)
-  setExpanded(next)
+  void transitionLayout(() => islandController.openMain())
+}
+
+function onSecondaryAction() {
+  if (!islandController.hasSecondary) return
+  void transitionLayout(() => islandController.openSecondary())
+}
+
+function returnToPreviousLayout() {
+  void transitionLayout(() => islandController.returnPreviousLayout())
+}
+
+function collapseExpanded() {
+  void transitionLayout(() => islandController.collapseExpanded())
 }
 
 function dismiss() {
-  islandController.setExpanded(false)
-  setExpanded(false)
-  const act = primaryAct.value
+  const act = expandedAct.value ?? primaryAct.value
   if (act) {
-    activityManager.remove(act.id)
+    if (act.id.startsWith('notice:')) dropNotice(Number(act.id.slice('notice:'.length)))
+    else if (act.id.startsWith('task:')) endTask(act.id.slice('task:'.length))
+    else activityManager.remove(act.id)
+    return
   }
-  const n = legacyNotice.value
-  if (n) dropNotice(n.id)
+  if (legacyNotice.value) {
+    dropNotice(legacyNotice.value.id)
+    return
+  }
+  if (showingPrice.value) {
+    idleStatusDismissed.value = true
+    void transitionLayout(() => islandController.collapseExpanded())
+  }
 }
 
 function retry() {
-  const act = primaryAct.value
-  islandController.setExpanded(false)
-  setExpanded(false)
+  const act = expandedAct.value ?? primaryAct.value
+  islandController.collapseExpanded()
+  syncExpandedBridge()
   if (act) {
     if (act.id.startsWith('dev:')) {
       activityManager.update(act.id, { status: 'running', tone: 'info', progress: 0 })
@@ -330,27 +311,28 @@ function retry() {
 }
 
 function goDetail() {
-  const target = goto.value
+  const target = expandedGoto.value || goto.value
   if (!target) return
-  islandController.setExpanded(false)
-  setExpanded(false)
-  if (isDevPrimary.value) return
+  const isDev = (expandedAct.value ?? primaryAct.value)?.id.startsWith('dev:') ?? false
+  islandController.collapseExpanded()
+  syncExpandedBridge()
+  if (isDev) return
   void router.push(target)
 }
 
 function goTask() {
-  const target = taskGoto.value
+  const target = expandedTaskGoto.value
   if (!target) return
-  islandController.setExpanded(false)
-  setExpanded(false)
-  if (isDevPrimary.value) return
+  islandController.collapseExpanded()
+  syncExpandedBridge()
+  if (isDevExpanded.value) return
   void router.push(target)
 }
 
 async function cancelTask() {
-  islandController.setExpanded(false)
-  setExpanded(false)
-  const act = primaryAct.value
+  const act = expandedAct.value ?? primaryAct.value
+  islandController.collapseExpanded()
+  syncExpandedBridge()
   if (act?.id.startsWith('dev:')) {
     activityManager.fail(act.id, { detail: 'Cancelled in test' })
     return
@@ -365,270 +347,79 @@ async function cancelTask() {
 }
 
 function openTask() {
-  islandController.setExpanded(false)
-  setExpanded(false)
-  if (isDevPrimary.value) return
-  void router.push('/crawl')
+  const act = expandedAct.value ?? primaryAct.value
+  islandController.collapseExpanded()
+  syncExpandedBridge()
+  if (act?.id.startsWith('dev:')) return
+  void router.push(act?.to || '/crawl')
 }
 
-function onDocDown(e: MouseEvent) {
-  if (!islandController.isExpanded.value && !island.expanded && !islandController.isOverviewOpen.value) return
-  if (rootEl.value?.contains(e.target as Node)) return
-  islandController.setExpanded(false)
-  islandController.setOverview(false)
-  setExpanded(false)
+function openOverview() {
+  void transitionLayout(() => islandController.setOverview(true))
 }
 
-const isSwapBusy = ref(false)
-const hideSwapRoots = ref(false)
-const pendingSelectionId = ref<string | null>(null)
-const swapAnimations: Animation[] = []
-const swapClones: HTMLElement[] = []
-let swapSequence = 0
-let expectedSwapIds: string | null = null
-let applyingSwap = false
-
-function motionRect(element: HTMLElement): IslandMotionRect {
-  const rect = element.getBoundingClientRect()
-  return {
-    left: rect.left,
-    top: rect.top,
-    width: rect.width,
-    height: rect.height,
-    borderRadius: getComputedStyle(element).borderRadius,
-  }
-}
-
-function createMotionClone(element: HTMLElement): HTMLElement {
-  const rect = motionRect(element)
-  const clone = element.cloneNode(true) as HTMLElement
-  clone.removeAttribute('id')
-  clone.removeAttribute('data-v-app')
-  clone.setAttribute('aria-hidden', 'true')
-  clone.inert = true
-  clone.querySelectorAll('[id]').forEach((child) => child.removeAttribute('id'))
-  clone.querySelectorAll('.hl-secondary-preview').forEach((preview) => preview.remove())
-  Object.assign(clone.style, {
-    position: 'fixed',
-    left: `${rect.left}px`,
-    top: `${rect.top}px`,
-    right: 'auto',
-    bottom: 'auto',
-    width: `${rect.width}px`,
-    height: `${rect.height}px`,
-    borderRadius: rect.borderRadius,
-    margin: '0',
-    flex: 'none',
-    transform: 'none',
-    transition: 'none',
-    pointerEvents: 'none',
-    zIndex: '10002',
-  })
-  clone.style.opacity = String(
-    Number(getComputedStyle(element).opacity) * Number(getComputedStyle(rootEl.value!).opacity),
-  )
-  document.body.appendChild(clone)
-  swapClones.push(clone)
-  return clone
-}
-
-function clearSwapVisuals() {
-  for (const animation of swapAnimations.splice(0)) animation.cancel()
-  for (const clone of swapClones.splice(0)) clone.remove()
-  hideSwapRoots.value = false
-  rootEl.value?.querySelectorAll<HTMLElement>('.hl-island, .hl-secondary-island').forEach((element) => {
-    element.classList.remove('is-swap-hidden')
-    element.removeAttribute('aria-hidden')
-    element.inert = false
-    element.style.removeProperty('opacity')
-    element.style.removeProperty('transition')
-  })
-  isSwapBusy.value = false
-  expectedSwapIds = null
-}
-
-function cancelSwapForStateChange() {
-  if (!isSwapBusy.value) return
-  swapSequence += 1
-  clearSwapVisuals()
-}
-
-function waitForTransition(element: HTMLElement, property: string, fallbackMs: number): Promise<void> {
-  if (matchMedia('(prefers-reduced-motion: reduce)').matches) return Promise.resolve()
-  return new Promise((resolve) => {
-    let settled = false
-    const finish = () => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      element.removeEventListener('transitionend', onTransitionEnd)
-      resolve()
-    }
-    const onTransitionEnd = (event: TransitionEvent) => {
-      if (event.target === element && event.propertyName === property) finish()
-    }
-    const timer = setTimeout(finish, fallbackMs)
-    element.addEventListener('transitionend', onTransitionEnd)
+function onDocDown(event: MouseEvent) {
+  if (!islandController.isExpanded.value && !islandController.isOverviewOpen.value) return
+  if (rootEl.value?.contains(event.target as Node)) return
+  void transitionLayout(() => {
+    islandController.collapseExpanded()
+    islandController.setOverview(false)
   })
 }
 
-async function onSecondarySwap() {
-  if (isSwapBusy.value || !islandController.hasSecondary) return
-  isSwapBusy.value = true
-  const run = ++swapSequence
-  const host = rootEl.value
-  const main = host?.querySelector<HTMLElement>('.hl-island')
-  if (!host || !main) {
-    islandController.swap()
-    isSwapBusy.value = false
-    return
+watch(islandController.swapRequest, () => onSecondaryAction())
+watch(islandController.layoutRequest, () => {
+  const action = islandController.takeLayoutAction()
+  if (!action) return
+  const actions: Record<IslandLayoutAction, () => void> = {
+    main: () => islandController.openMain(),
+    secondary: () => islandController.openSecondary(),
+    collapse: () => islandController.collapseExpanded(),
+    return: () => islandController.returnPreviousLayout(),
   }
-
-  if (islandController.isExpanded.value || island.expanded) {
-    const collapse = waitForTransition(main, 'width', 480)
-    islandController.setExpanded(false)
-    setExpanded(false)
-    await collapse
-    if (run !== swapSequence) return
-  }
-
-  const oldMain = host.querySelector<HTMLElement>('.hl-island')
-  const oldSecondary = host.querySelector<HTMLElement>('.hl-secondary-island')
-  if (!oldMain || !oldSecondary) {
-    islandController.swap()
-    isSwapBusy.value = false
-    return
-  }
-
-  if (matchMedia('(prefers-reduced-motion: reduce)').matches) {
-    islandController.swap()
-    isSwapBusy.value = false
-    return
-  }
-
-  const oldMainId = islandController.primaryId
-  const mainClone = createMotionClone(oldMain)
-  const secondaryClone = createMotionClone(oldSecondary)
-  const mainStart = motionRect(oldMain)
-  const secondaryStart = motionRect(oldSecondary)
-  hideSwapRoots.value = true
-  await nextTick()
-
-  applyingSwap = true
-  islandController.swap()
-  expectedSwapIds = `${islandController.primaryId ?? ''}:${islandController.secondaryId ?? ''}`
-  applyingSwap = false
-  await nextTick()
-
-  const newMain = host.querySelector<HTMLElement>('.hl-island')
-  const newSecondary = host.querySelector<HTMLElement>('.hl-secondary-island')
-  const currentIds = `${islandController.primaryId ?? ''}:${islandController.secondaryId ?? ''}`
-  if (!newMain || !newSecondary || currentIds !== expectedSwapIds || run !== swapSequence) {
-    clearSwapVisuals()
-    return
-  }
-
-  const mainTarget = motionRect(newMain)
-  const secondaryTarget = motionRect(newSecondary)
-  const twoActivities = islandController.count === 2 && oldMainId === islandController.secondaryId
-  for (const element of [newMain, newSecondary]) {
-    element.style.opacity = '0'
-    element.style.transition = 'none'
-  }
-  hideSwapRoots.value = false
-  await nextTick()
-
-  const mainFrames = createRectKeyframes(secondaryStart, mainTarget)
-  mainFrames[0].offset = 0
-  mainFrames[1].offset = 0.78
-  mainFrames.push({ ...mainFrames[1], offset: 1, opacity: 0 })
-
-  const mainMotion = secondaryClone.animate(mainFrames, {
-    duration: islandSwapDuration,
-    easing: islandSwapEasing,
-    fill: 'both',
-  })
-  swapAnimations.push(mainMotion)
-
-  if (twoActivities) {
-    const secondaryFrames = createRectKeyframes(mainStart, secondaryTarget)
-    secondaryFrames[0].opacity = 1
-    secondaryFrames[1].opacity = 0.2
-    const secondaryMotion = mainClone.animate(secondaryFrames, {
-      duration: islandSwapDuration,
-      easing: islandSwapEasing,
-      fill: 'both',
-    })
-    swapAnimations.push(secondaryMotion)
-  } else {
-    const outgoingMotion = mainClone.animate(
-      [{ opacity: 1 }, { opacity: 0 }],
-      { duration: islandSwapDuration, easing: islandSwapEasing, fill: 'both' },
-    )
-    swapAnimations.push(outgoingMotion)
-  }
-
-  for (const element of [newMain, newSecondary]) {
-    element.removeAttribute('aria-hidden')
-    element.inert = false
-    const reveal = element.animate(
-      [{ opacity: 0 }, { opacity: 1 }],
-      {
-        delay: islandSwapDuration * 0.68,
-        duration: islandSwapDuration * 0.32,
-        easing: 'linear',
-        fill: 'both',
-      },
-    )
-    swapAnimations.push(reveal)
-  }
-
-  try {
-    await Promise.all(swapAnimations.map((animation) => animation.finished.catch(() => undefined)))
-  } finally {
-    if (run === swapSequence) clearSwapVisuals()
-  }
-}
-
-watch(islandController.swapRequest, () => void onSecondarySwap())
+  void transitionLayout(actions[action])
+})
+watch(islandController.isExpanded, (expanded) => {
+  if (island.expanded === expanded) return
+  island.expanded = expanded
+  armTimer()
+}, { immediate: true })
 watch(
-  () => `${islandController.primaryId ?? ''}:${islandController.secondaryId ?? ''}`,
-  (ids) => {
-    if (isSwapBusy.value && !applyingSwap && expectedSwapIds && ids !== expectedSwapIds) {
-      cancelSwapForStateChange()
-    }
+  () => [primaryAct.value?.id, legacyNotice.value?.id, legacyTask.value?.key, priceKind.value, priceLabel.value, priceStale.value],
+  () => { idleStatusDismissed.value = false },
+)
+watch(
+  () => JSON.stringify(islandController.layout),
+  () => {
+    if (applyingControllerMutation) return
+    activeMotion?.finish()
+    activeMotion = null
   },
   { flush: 'sync' },
 )
 
 function onSelectActivity(id: string) {
   if (!activityManager.get(id)) return
-  pendingSelectionId.value = id === islandController.primaryId ? null : id
-  islandController.setOverview(false)
-}
-
-function onActivityPanelAfterLeave() {
-  const id = pendingSelectionId.value
-  pendingSelectionId.value = null
-  if (id && activityManager.get(id)) islandController.selectPrimary(id)
+  void transitionLayout(() => {
+    islandController.setOverview(false)
+    if (id !== islandController.primaryId) islandController.selectPrimary(id)
+  })
 }
 
 function onPinActivity(id: string) {
-  islandController.togglePin(id)
+  void transitionLayout(() => islandController.togglePin(id))
 }
 
-function onPanelAction(act: Activity) {
-  islandController.setOverview(false)
-  if (act.to && !act.id.startsWith('dev:')) {
-    void router.push(act.to)
-  }
+function onPanelAction(activity: Activity) {
+  void transitionLayout(() => islandController.setOverview(false))
+  if (activity.to && !activity.id.startsWith('dev:')) void router.push(activity.to)
 }
 
 onMounted(() => document.addEventListener('mousedown', onDocDown))
 onBeforeUnmount(() => {
   document.removeEventListener('mousedown', onDocDown)
-  swapSequence += 1
-  clearSwapVisuals()
+  activeMotion?.finish()
+  activeMotion = null
 })
 </script>
 
@@ -641,18 +432,12 @@ onBeforeUnmount(() => {
     >
       <!-- 主岛容器 -->
       <div
+        v-if="showCompactMain"
         class="hl-island"
-        :class="[
-          `hl-island--${mode}`,
-          {
-            'is-stacked': headStacked,
-            'is-swap-hidden': hideSwapRoots,
-          },
-        ]"
+        :class="['hl-island--' + mode]"
         :style="islandStyle"
-        :data-activity-id="primaryAct?.id"
-        :aria-hidden="hideSwapRoots ? 'true' : undefined"
-        :inert="hideSwapRoots"
+        :data-activity-id="mainDataId"
+        data-island-slot="main"
         role="status"
         aria-live="polite"
         :aria-label="t('island.label')"
@@ -669,6 +454,7 @@ onBeforeUnmount(() => {
           :lead-icon="leadIcon"
           :lead-tone-class="leadToneClass"
           :showing-price="showingPrice"
+          :can-dismiss-status="!islandController.isExpanded.value"
           :price-color="priceColor"
           :head-text="headText"
           :head-text-style="headTextStyle"
@@ -700,11 +486,57 @@ onBeforeUnmount(() => {
           v-if="islandController.hasSecondary"
           :activity="secondaryAct"
           :extra-count="islandController.waitingCount"
-          :is-swap-hidden="hideSwapRoots"
-          @swap="onSecondarySwap"
-          @open-overview="islandController.setOverview(true)"
+          @swap="onSecondaryAction"
+          @open-overview="openOverview"
         />
       </Transition>
+
+      <div
+        v-if="islandController.isExpanded.value"
+        class="hl-island hl-expanded-island hl-island--expanded"
+        :class="{ 'is-stacked': expandedHeadLines > 1, 'is-idle-expanded': expandedShowingPrice }"
+        :style="expandedStyle"
+        :data-activity-id="islandController.expandedId"
+        data-island-slot="expanded"
+        role="group"
+        :aria-label="expandedText"
+        @click.stop
+      >
+        <PrimaryIsland
+          :activity="expandedAct"
+          mode="expanded"
+          :is-pinned="islandController.pinnedId === expandedAct?.id"
+          :lead-spin="expandedSpin"
+          :lead-icon="expandedIcon"
+          :lead-tone-class="expandedToneClass"
+          :showing-price="expandedShowingPrice"
+          :can-dismiss-status="true"
+          :price-color="priceColor"
+          :head-text="expandedText"
+          :head-text-style="expandedHeadStyle"
+          :head-truncated="expandedHeadLines >= 4"
+          :trailing="expandedTrailing"
+          :crawl-only-task="expandedIsTask"
+          :show-bar="expandedShowBar"
+          :task-percent="expandedProgress"
+          :expanded-shows-tasks="expandedShowsTasks"
+          :task-lines="expandedTaskLines"
+          :task-goto="expandedTaskGoto"
+          :detail-text="expandedDetail"
+          :expanded-is-task="expandedIsTask"
+          :can-retry="expandedCanRetry"
+          :goto="expandedGoto"
+          :goto-label="expandedGotoLabel"
+          @cancel="cancelTask"
+          @retry="retry"
+          @dismiss="dismiss"
+          @go-detail="goDetail"
+          @go-task="goTask"
+          @open-task="openTask"
+          @return="returnToPreviousLayout"
+          @collapse="collapseExpanded"
+        />
+      </div>
 
       <!-- 活动总览面板 -->
       <ActivityPanel
@@ -713,7 +545,6 @@ onBeforeUnmount(() => {
         :pinned-id="islandController.pinnedId"
         :open="islandController.isOverviewOpen.value"
         @select="onSelectActivity"
-        @after-close="onActivityPanelAfterLeave"
         @pin="onPinActivity"
         @action="onPanelAction"
         @close="islandController.setOverview(false)"
@@ -727,26 +558,68 @@ onBeforeUnmount(() => {
   position: fixed;
   top: var(--island-top);
   left: 50%;
-  transform: translateX(-50%);
   z-index: 9999;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
+  width: 0;
+  height: 36px;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.hl-island-host :deep(*) {
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .hl-island {
-  position: relative;
-  color: var(--text-primary);
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform: translateX(-50%);
+  --text-primary: var(--island-shell-fg);
+  --text-secondary: var(--island-shell-fg);
+  --text-muted: var(--island-shell-muted);
+  --island-bg: var(--island-shell-bg);
+  --island-btn: var(--island-shell-btn);
+  --surface-track: var(--island-shell-track);
+  color: var(--island-shell-fg);
   font-family: var(--font-sans);
-  background: var(--island-bg);
+  background: var(--island-shell-bg);
   cursor: pointer;
   box-shadow: var(--shadow-island);
   border: none;
   outline: none;
   transition:
-    width calc(var(--duration-5) * var(--motion-scale)) var(--ease-island),
-    height calc(var(--duration-5) * var(--motion-scale)) var(--ease-island),
-    border-radius calc(var(--duration-5) * var(--motion-scale)) var(--ease-island);
+    width calc(320ms * var(--motion-scale)) cubic-bezier(0.22, 1, 0.36, 1),
+    height calc(320ms * var(--motion-scale)) cubic-bezier(0.22, 1, 0.36, 1),
+    border-radius calc(320ms * var(--motion-scale)) cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+:deep(.hl-secondary-island) {
+  position: absolute;
+  top: 0;
+  left: 128px;
+  --text-primary: var(--island-shell-fg);
+  --text-secondary: var(--island-shell-fg);
+  --text-muted: var(--island-shell-muted);
+  --island-btn: var(--island-shell-btn);
+  background: var(--island-shell-bg);
+  color: var(--island-shell-fg);
+}
+
+.hl-expanded-island {
+  position: fixed;
+  top: calc(var(--island-top) + 44px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10000;
+  max-width: calc(100vw - 24px);
+  box-sizing: border-box;
+  overflow: hidden;
+  cursor: default;
+}
+
+.hl-expanded-island.is-idle-expanded {
+  top: var(--island-top);
 }
 
 :deep(.hl-island__body) {
@@ -876,6 +749,25 @@ onBeforeUnmount(() => {
   color: var(--text-muted);
   flex: 0 0 auto;
   animation: hlIslandDrop 280ms var(--ease-island) 60ms both;
+}
+
+:deep(.hl-island__slot-control) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 22px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  color: var(--text-muted);
+  background: var(--island-btn);
+  cursor: pointer;
+}
+
+:deep(.hl-island__slot-control:hover) {
+  color: var(--text-primary);
 }
 
 :deep(.hl-island__fold) {
@@ -1053,11 +945,6 @@ onBeforeUnmount(() => {
   color: var(--text-primary);
 }
 
-.hl-island.is-swap-hidden {
-  visibility: hidden;
-  pointer-events: none;
-}
-
 .island-retract-enter-active,
 .island-retract-leave-active {
   transition:
@@ -1068,7 +955,7 @@ onBeforeUnmount(() => {
 .island-retract-enter-from,
 .island-retract-leave-to {
   opacity: 0;
-  transform: translateX(-50%) translateY(-12px);
+  transform: translateY(-12px);
 }
 
 .secondary-island-pop-enter-active,
@@ -1095,6 +982,10 @@ onBeforeUnmount(() => {
     transform: none;
   }
 
+  .hl-island {
+    transition: none;
+  }
+
   :deep(.hl-island__bar.is-slide > i) {
     animation: none;
   }
@@ -1105,5 +996,19 @@ onBeforeUnmount(() => {
   :deep(.hl-island__actions > *) {
     animation: none;
   }
+}
+
+.hl-island--expanded :deep(.hl-island__lead) {
+  border-radius: 9px;
+}
+
+.hl-island--expanded :deep(.hl-island__text) {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.hl-island--expanded :deep(.hl-island__detail),
+.hl-island--expanded :deep(.hl-island__taskpct) {
+  color: var(--island-shell-muted);
 }
 </style>

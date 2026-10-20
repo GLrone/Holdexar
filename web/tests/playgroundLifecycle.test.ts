@@ -124,7 +124,7 @@ test('IslandPlayground 乱序事件与突然结束：安全降级与平滑回退
   assert.equal(ctrl.hasSecondary, false)
 })
 
-test('IslandPlayground 紧急状态插队与 P2 副岛交换验证', () => {
+test('IslandPlayground 副岛直开后紧急状态仍能插队', () => {
   const mgr = new ActivityManager()
   const ctrl = new IslandController(mgr)
 
@@ -144,10 +144,10 @@ test('IslandPlayground 紧急状态插队与 P2 副岛交换验证', () => {
   assert.equal(ctrl.primaryId, 'dev:task-normal')
   assert.equal(ctrl.secondaryId, 'dev:task-secondary')
 
-  // 1. P2 交换测试
   ctrl.swap()
-  assert.equal(ctrl.primaryId, 'dev:task-secondary')
-  assert.equal(ctrl.secondaryId, 'dev:task-normal')
+  assert.equal(ctrl.primaryId, 'dev:task-normal')
+  assert.equal(ctrl.secondaryId, null)
+  assert.equal(ctrl.expandedId, 'dev:task-secondary')
 
   // 2. 突发紧急异常 (needsAttention: true)
   mgr.register({
@@ -162,4 +162,5 @@ test('IslandPlayground 紧急状态插队与 P2 副岛交换验证', () => {
 
   // 无论当前用户选了谁，needsAttention 强制插队成为主岛
   assert.equal(ctrl.primaryId, 'dev:alert')
+  assert.equal(ctrl.expandedId, 'dev:task-secondary')
 })

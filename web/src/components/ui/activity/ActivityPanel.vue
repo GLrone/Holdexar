@@ -19,14 +19,13 @@ const emit = defineEmits<{
   (e: 'pin', id: string): void
   (e: 'action', activity: Activity): void
   (e: 'close'): void
-  (e: 'afterClose'): void
 }>()
 
 const { t } = useI18n()
 </script>
 
 <template>
-  <Transition name="activity-panel" @after-leave="emit('afterClose')">
+  <Transition name="activity-panel">
     <div
       v-if="open"
       class="hl-activity-panel"
@@ -66,19 +65,30 @@ const { t } = useI18n()
 
 <style scoped>
 .hl-activity-panel {
+  --text-primary: var(--island-panel-fg);
+  --text-secondary: var(--island-panel-fg);
+  --text-muted: var(--island-panel-muted);
+  --island-btn: var(--island-panel-surface);
+  --island-bg: var(--island-panel-bg);
+  --surface-track: var(--island-shell-track);
+  --surface-hover: var(--island-panel-hover);
+  --border-soft: var(--island-panel-divider);
   position: absolute;
   top: calc(100% + 8px);
-  right: 0;
-  width: 320px;
+  left: 0;
+  right: auto;
+  transform: translateX(-50%);
+  transform-origin: top center;
+  width: min(320px, calc(100vw - 24px));
   max-height: 380px;
-  border-radius: 12px;
+  border-radius: 16px;
   background: var(--island-bg);
   box-shadow: var(--shadow-island);
-  border: 1px solid var(--border-soft);
+  border: none;
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  z-index: 10000;
+  z-index: 10003;
 }
 
 .hl-activity-panel__header {
@@ -114,13 +124,13 @@ const { t } = useI18n()
 
 .activity-panel-enter-active,
 .activity-panel-leave-active {
-  transition: opacity calc(var(--duration-3) * var(--motion-scale)) var(--ease-out),
-              transform calc(var(--duration-3) * var(--motion-scale)) var(--ease-island);
+  transition: opacity calc(var(--duration-1) * var(--motion-scale)) var(--ease-out),
+              transform calc(var(--duration-1) * var(--motion-scale)) var(--ease-island);
 }
 
 .activity-panel-enter-from,
 .activity-panel-leave-to {
   opacity: 0;
-  transform: translateY(-8px);
+  transform: translate(-50%, -8px);
 }
 </style>

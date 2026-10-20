@@ -21,6 +21,7 @@ const props = defineProps<{
   leadIcon: string
   leadToneClass: string
   showingPrice: boolean
+  canDismissStatus?: boolean
   priceColor?: string
   headText: string
   headTextStyle: Record<string, string>
@@ -46,6 +47,8 @@ const emit = defineEmits<{
   (e: 'goDetail'): void
   (e: 'goTask'): void
   (e: 'openTask'): void
+  (e: 'return'): void
+  (e: 'collapse'): void
 }>()
 
 const { t } = useI18n()
@@ -71,7 +74,7 @@ const compactPercent = computed<number | null>(() => {
 </script>
 
 <template>
-  <div class="hl-island__body">
+  <div class="hl-island__body" data-island-content>
     <!-- 头部行：四态共用一组元素，展开只换布局，不换实例 -->
     <div class="hl-island__row">
       <!-- 模块专属标识（进度加载动效完整嵌入 Logo 环，杜绝外部悬挂与通用覆盖） -->
@@ -81,21 +84,19 @@ const compactPercent = computed<number | null>(() => {
         :progress="mode === 'expanded' ? taskPercent : activity?.progress"
         :image-url="activity?.iconImageUrl"
         :animation-key="activity?.id"
+        :activity-id="activity?.id ?? (showingPrice ? '@price-status' : undefined)"
         :icon-color="showingPrice ? priceColor : undefined"
       />
 
       <!-- 标题文本 -->
-      <Transition name="island-content-switch" mode="out-in">
-        <span
-          :key="activity?.id ?? (showingPrice ? 'price-status' : headText)"
-          class="hl-island__text"
-          :class="{ 'is-status': showingPrice }"
-          :style="headTextStyle"
-          :title="headTruncated ? headText : undefined"
-        >
-          {{ headText }}
-        </span>
-      </Transition>
+      <span
+        class="hl-island__text"
+        :class="{ 'is-status': showingPrice }"
+        :style="headTextStyle"
+        :title="headTruncated ? headText : undefined"
+      >
+        {{ headText }}
+      </span>
 
       <!-- 固定主岛标记 -->
       <span v-if="isPinned" class="hl-island__pinned" :title="t('island.pinned')">
@@ -109,6 +110,37 @@ const compactPercent = computed<number | null>(() => {
 
       <!-- 展开态尾部说明 -->
       <span v-if="trailing" class="hl-island__trail">{{ trailing }}</span>
+
+      <button
+        v-if="mode === 'expanded'"
+        class="hl-island__slot-control"
+        type="button"
+        :title="t('island.returnToPrevious')"
+        :aria-label="t('island.returnToPrevious')"
+        @click.stop="emit('return')"
+      >
+        <HlIcon name="chevron-left" :size="12" />
+      </button>
+      <button
+        v-if="mode === 'expanded'"
+        class="hl-island__slot-control"
+        type="button"
+        :title="t('island.collapse')"
+        :aria-label="t('island.collapse')"
+        @click.stop="emit('collapse')"
+      >
+        <HlIcon name="chevron-down" :size="12" />
+      </button>
+      <button
+        v-if="showingPrice && canDismissStatus"
+        class="hl-island__slot-control"
+        type="button"
+        :title="t('island.hideStatus')"
+        :aria-label="t('island.hideStatus')"
+        @click.stop="emit('dismiss')"
+      >
+        <HlIcon name="close" :size="12" />
+      </button>
 
       <!-- 快速取消按钮 -->
       <button v-if="crawlOnlyTask && mode === 'task'" class="hl-island__btn is-tiny" @click.stop="emit('cancel')">
@@ -183,23 +215,6 @@ const compactPercent = computed<number | null>(() => {
 </template>
 
 <style scoped>
-.island-content-switch-enter-active,
-.island-content-switch-leave-active {
-  transition:
-    opacity calc(var(--duration-3) * var(--motion-scale)) var(--ease-out),
-    transform calc(var(--duration-3) * var(--motion-scale)) var(--ease-out);
-}
-
-.island-content-switch-enter-from {
-  opacity: 0;
-  transform: translateX(6px);
-}
-
-.island-content-switch-leave-to {
-  opacity: 0;
-  transform: translateX(-6px);
-}
-
 .hl-island__pct {
   font-size: 11px;
   font-weight: 600;
