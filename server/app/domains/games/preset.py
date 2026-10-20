@@ -1,18 +1,4 @@
-"""预设游戏池登记：导入文件（关注数据）与 TOP 榜两条来源的 appid 账本。
-
-预设 = 本机导入的精选游戏（池页「导入文件」） + TOP 榜 5 页（初始游戏库）。
-两条来源写同一张 preset_games 表：本机侧它们照常走既有通道（导入入池 +
-首爬、榜单反哺入库），本表只做**登记**；导出资产种子（scripts/export_seed.py）
-时整表随包下发，客户端并入（seed_assets.merge_preset_seed）把缺行的 appid
-落成 games 行——新用户开箱即有初始游戏库，全池主轮随即接管价格刷新。
-
-语义边界：
-- 本模块不触发爬取、不参与调度（落库/爬取由调用方负责）；
-- 导入来源只增不改：同一 appid 重复导入保留首次来源与落档时间；
-- 榜单来源整批替换：预设的 TOP 部分 = 最近一次成功抓取的榜（清单大小
-  稳定在榜单封顶内，不随历史累积膨胀）；
-- 登记失败不应阻断主链路：调用方吞异常记日志。
-"""
+"""预设登记将本机导入来源与可分发的公开榜单来源分开标记。"""
 from __future__ import annotations
 
 import logging
@@ -22,14 +8,14 @@ from sqlalchemy import delete, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.database import WritePriority, write_session
-from app.core.database import write_gate
 from app.domains.games.models import Game, PresetGame
 
 logger = logging.getLogger(__name__)
 
-# 榜单来源标记（与导出/并入侧约定同名；文件来源直接用文件名）
+# 榜单来源标记（与导出/并入侧约定同名）
 BOARD_SOURCE = "topsellers"
 MAX_SOURCE_LEN = 80
+IMPORT_SOURCE_PREFIX = "file:"
 
 
 def _clean(appids: list[int]) -> list[int]:
@@ -56,15 +42,12 @@ async def _names_of(session, appids: list[int]) -> dict[int, str | None]:
 
 
 async def record_imported(appids: list[int], source: str) -> int:
-    """登记「导入文件」来源的 appid（source = 文件名）。返回新登记行数。
-
-    只增不改（INSERT OR IGNORE 语义）：同一 appid 重复导入（换文件、重导入）
-    保留首次来源与落档时间——预设清单是首见即定档的出厂集。
-    """
+    """登记本机导入来源的 appid，返回新登记行数。"""
     clean = _clean(appids)
-    src = (source or "").strip()[:MAX_SOURCE_LEN]
-    if not clean or not src:
+    raw_source = (source or "").strip()
+    if not clean or not raw_source:
         return 0
+    src = f"{IMPORT_SOURCE_PREFIX}{raw_source[:MAX_SOURCE_LEN - len(IMPORT_SOURCE_PREFIX)]}"
 
     async with write_session(WritePriority.BACKGROUND) as session:
         existing = {
@@ -90,11 +73,7 @@ async def record_imported(appids: list[int], source: str) -> int:
 
 
 async def record_board(appids: list[int], source: str = BOARD_SOURCE) -> int:
-    """登记榜单来源（整批替换）：先清该来源旧行，再落本轮榜。
-
-    与导入来源共表时 appid 冲突保留首次行（导入优先）——已登记过的游戏
-    不需要榜单再补。榜单抓取失败（空集）由调用方拦住，不触发替换。
-    """
+    """登记本轮公开榜单来源；公开来源覆盖同一游戏的本机导入标记。"""
     clean = _clean(appids)
     if not clean:
         return 0
@@ -103,15 +82,21 @@ async def record_board(appids: list[int], source: str = BOARD_SOURCE) -> int:
         await session.execute(delete(PresetGame).where(PresetGame.source == source))
         names = await _names_of(session, clean)
         now = datetime.now()
+        statement = sqlite_insert(PresetGame).values(
+            [
+                {"appid": a, "name": names.get(a), "source": source, "added_at": now}
+                for a in clean
+            ]
+        )
         await session.execute(
-            sqlite_insert(PresetGame)
-            .values(
-                [
-                    {"appid": a, "name": names.get(a), "source": source, "added_at": now}
-                    for a in clean
-                ]
+            statement.on_conflict_do_update(
+                index_elements=["appid"],
+                set_={
+                    "name": statement.excluded.name,
+                    "source": statement.excluded.source,
+                    "added_at": statement.excluded.added_at,
+                },
             )
-            .on_conflict_do_nothing(index_elements=["appid"])
         )
         await session.commit()
         return len(clean)

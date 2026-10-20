@@ -1302,8 +1302,7 @@ async def add_pool_items(
     （已在关注）/ fail（无效 appid）。auto_crawl=True 且池内有变化时触发一次
     首爬（kind="pool_add"）；任务占用等失败只记日志，下轮全池刷新兜底。
 
-    source 非空（池页「导入文件」传文件名）时把这些 appid 登记进预设池
-    清单（games/preset.py）：登记只记档不建爬取，失败不阻断加入主链。
+    source 非空（池页「导入文件」传文件名）时登记本机导入来源，不进入种子。
     """
     results: list[dict] = []
     clean: list[int] = []
@@ -1363,7 +1362,7 @@ async def add_pool_items(
                 detail={"新增": len(touched), "原因": e},
             )
 
-    # 预设池登记（池页「导入文件」来源，见 games/preset.py）：登记失败不阻断入池
+    # 本机导入来源登记失败不阻断入池。
     if source and clean:
         from app.domains.games import preset as preset_mod
 

@@ -107,8 +107,7 @@ class PoolItemsRequest(BaseModel):
     """监控条目批量操作请求（单批上限 500，前端超出时分批调用）。"""
 
     appids: list[int] = Field(min_length=1, max_length=500)
-    # 导入文件来源（池页「导入文件」传文件名，仅添加端点消费）：非空时把
-    # appid 登记进预设池清单（随资产种子分发的出厂游戏集，见 games/preset.py）
+    # 导入文件来源仅在本机登记，不进入资产种子。
     source: str | None = Field(default=None, max_length=80)
 
 
