@@ -14,7 +14,7 @@ from sqlalchemy import select, update
 
 from app.core.config import get_settings
 from app.core.database import get_engine, get_session_factory, init_db
-from app.domains.proxies.models import ProxySubscription
+from app.domains.proxies.models import ADMISSION_ACTIVE, ProxySubscription
 from app.domains.proxypool import admission as adm
 from app.domains.proxypool import bootstrap as bs
 from app.domains.proxypool import scheduling as sched
@@ -59,6 +59,9 @@ def _write_pool(data_dir, names: list[str]) -> None:
 
 async def _add_node(node_id: str, state: str = "NEW") -> None:
     async with get_session_factory()() as s:
+        if await s.get(ProxySubscription, 1) is None:
+            s.add(ProxySubscription(id=1, kind="clash", url="https://source.invalid/1",
+                                    admission_status=ADMISSION_ACTIVE))
         s.add(ProxyNode(node_id=node_id, fingerprint=node_id, runtime_name=f"1|{node_id}",
                         proxy_type="http", server="10.0.0.1",
                         normalized_config={"name": node_id, "type": "http",

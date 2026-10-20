@@ -25,6 +25,7 @@ from app.domains.proxypool.health import (
     exit_ip_check_pool,
     pool_probe_lanes,
 )
+from app.domains.proxies.models import ADMISSION_ACTIVE, ProxySubscription
 from app.domains.proxypool.models import (
     HealthObservation,
     HealthRun,
@@ -176,6 +177,9 @@ async def _seed_pool(tmp_data_dir, *, lane_ports: list[int], ctrl_port: int,
                   "server": "127.0.0.1", "port": 9000 + i}
         fp = node_fingerprint(config)
         async with get_session_factory()() as s:
+            if await s.get(ProxySubscription, 1) is None:
+                s.add(ProxySubscription(id=1, kind="clash", url="https://source.invalid/1",
+                                        admission_status=ADMISSION_ACTIVE))
             s.add(ProxyNode(node_id=fp, fingerprint=fp, runtime_name=name,
                             proxy_type="http", server="127.0.0.1",
                             normalized_config=config, state="ACTIVE",

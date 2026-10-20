@@ -29,6 +29,7 @@ from app.core.database import get_engine, get_session_factory, init_db  # noqa: 
 from app.domains.proxies import clash_manager  # noqa: E402
 from app.domains.proxies.clash_manager import ClashRuntime  # noqa: E402
 from app.domains.proxies.kernel_release import kernel_filename  # noqa: E402
+from app.domains.proxies.models import ADMISSION_ACTIVE, ProxySubscription
 from app.domains.proxypool.health import (  # noqa: E402
     BUSINESS_OK,
     BusinessResult,
@@ -353,6 +354,9 @@ async def _add(state: str, runtime_name: str, *, port: int,
               "server": "127.0.0.1", "port": port}
     fp = node_fingerprint(config)
     async with get_session_factory()() as s:
+        if with_source and await s.get(ProxySubscription, 1) is None:
+            s.add(ProxySubscription(id=1, kind="clash", url="https://source.invalid/1",
+                                    admission_status=ADMISSION_ACTIVE))
         s.add(ProxyNode(
             node_id=fp, fingerprint=fp, runtime_name=runtime_name,
             proxy_type="http", server="127.0.0.1", normalized_config=config,

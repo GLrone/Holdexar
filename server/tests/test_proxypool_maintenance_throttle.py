@@ -12,6 +12,7 @@ from sqlalchemy import select, update
 
 from app.core.config import get_settings
 from app.core.database import get_engine, get_session_factory, init_db
+from app.domains.proxies.models import ADMISSION_ACTIVE, ProxySubscription
 from app.domains.proxypool.models import HealthRun, ProxyNode, node_fingerprint
 from app.domains.proxypool.scheduling import (
     MAINTENANCE_INTERVAL_HOURS_KEY,
@@ -43,6 +44,9 @@ async def _seed_eligible_nodes() -> None:
                   "server": "127.0.0.1", "port": 9000 + i}
         fp = node_fingerprint(config)
         async with get_session_factory()() as s:
+            if await s.get(ProxySubscription, 1) is None:
+                s.add(ProxySubscription(id=1, kind="clash", url="https://source.invalid/1",
+                                        admission_status=ADMISSION_ACTIVE))
             s.add(ProxyNode(node_id=fp, fingerprint=fp, runtime_name=name,
                             proxy_type="http", server="127.0.0.1",
                             normalized_config=config, state="ACTIVE",
