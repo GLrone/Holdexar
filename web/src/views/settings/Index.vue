@@ -18,6 +18,7 @@ import {
   type SecurityStatus,
   type ExportItem,
   type SteamAccountItem,
+  type LocalSteamAccountCandidate,
 } from '@/api/client'
 import { useI18n, type MessageKey } from '@/locales'
 import { useAccountStore } from '@/stores/account'
@@ -53,6 +54,9 @@ const steamId = ref('')
 const apiKeyInput = ref('')
 const apiKeyMasked = ref('')
 const hasApiKey = ref(false)
+const localSteamAccounts = ref<LocalSteamAccountCandidate[]>([])
+const localSteamLoading = ref(false)
+const importingLocalSteamId = ref('')
 
 /* ── 领航员（pilot）：多供应商绑定（左导航 + 右详情；密钥密文落库） ── */
 const pilotEnabled = ref(false)
@@ -660,6 +664,38 @@ async function save() {
     errorMsg.value = e instanceof Error ? e.message : String(e)
   } finally {
     saving.value = false
+  }
+}
+
+async function findLocalSteamAccounts() {
+  localSteamLoading.value = true
+  localSteamAccounts.value = []
+  try {
+    const result = await settingsApi.getLocalSteamAccounts()
+    localSteamAccounts.value = result.accounts
+    if (!result.accounts.length) message.warning(t('settings.account.localSteamNone'))
+  } catch {
+    message.error(t('settings.account.localSteamFindFailed'))
+  } finally {
+    localSteamLoading.value = false
+  }
+}
+
+async function importLocalSteamAccount(candidate: LocalSteamAccountCandidate) {
+  importingLocalSteamId.value = candidate.steam_id
+  try {
+    const imported = await settingsApi.importLocalSteamAccount(candidate.steam_id)
+    steamId.value = imported.steam_id
+    localSteamAccounts.value = []
+    message.success(
+      t('settings.account.localSteamImported', {
+        name: imported.persona_name || imported.steam_id,
+      }),
+    )
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : t('settings.account.localSteamFindFailed'))
+  } finally {
+    importingLocalSteamId.value = ''
   }
 }
 
@@ -1485,6 +1521,47 @@ onUnmounted(stopLoginPolling)
         </div>
 
         <div class="settings-row">
+          <label class="hl-form-label">{{ t('settings.account.localSteamLabel') }}</label>
+          <div class="settings-row__line">
+            <HlButton
+              art="outline"
+              tone="blue"
+              size="sm"
+              :disabled="localSteamLoading || !!importingLocalSteamId"
+              :loading="localSteamLoading"
+              @click="findLocalSteamAccounts"
+            >
+              {{ t('settings.account.localSteamFind') }}
+            </HlButton>
+            <span class="section-desc">{{ t('settings.account.localSteamHint') }}</span>
+          </div>
+          <div v-if="localSteamAccounts.length" class="local-steam-list">
+            <div
+              v-for="candidate in localSteamAccounts"
+              :key="candidate.steam_id"
+              class="local-steam-row"
+            >
+              <div class="local-steam-row__identity">
+                <span class="local-steam-row__name">
+                  {{ candidate.persona_name || t('settings.account.localSteamUnnamed') }}
+                </span>
+                <span class="local-steam-row__id">{{ candidate.steam_id }}</span>
+              </div>
+              <HlButton
+                art="outline"
+                tone="green"
+                size="sm"
+                :disabled="!!importingLocalSteamId"
+                :loading="importingLocalSteamId === candidate.steam_id"
+                @click="importLocalSteamAccount(candidate)"
+              >
+                {{ t('settings.account.localSteamImport') }}
+              </HlButton>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-row">
           <label class="hl-form-label">
             Steam Web API Key
             <span class="section-desc" style="display: inline; margin-left: 8px">
@@ -2260,6 +2337,43 @@ onUnmounted(stopLoginPolling)
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+.local-steam-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.local-steam-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--bg-soft);
+  flex-wrap: wrap;
+}
+
+.local-steam-row__identity {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.local-steam-row__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.local-steam-row__id {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 
 /* ── 数据备份列表 ── */
