@@ -4,7 +4,9 @@ from __future__ import annotations
 import copy
 import re
 from collections.abc import Mapping, Sequence
+from pathlib import PurePosixPath
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -23,6 +25,144 @@ _PROVIDER_GROUP_NAME = "HlSubProviders"
 BUILTIN_PROXY_NAMES = frozenset({
     "DIRECT", "REJECT", "REJECT-DROP", "GLOBAL", "COMPATIBLE", "PASS", "PASS-RULE",
 })
+
+_GEO_CONFIG_KEYS = frozenset({
+    "geo-auto-update", "geo-update-interval", "geodata-mode", "geodata-loader",
+    "geosite-matcher", "geox-url",
+})
+_GEO_RULE_TYPES = frozenset({
+    "GEOIP", "GEOSITE", "SRC-GEOIP", "IP-ASN", "SRC-IP-ASN", "RULE-SET",
+})
+_LOGIC_RULE_TYPES = frozenset({"AND", "OR", "NOT"})
+_GEO_SELECTOR_PREFIXES = ("geosite:", "geoip:", "ip-asn:", "rule-set:")
+
+
+def _geo_selector(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().lower().startswith(_GEO_SELECTOR_PREFIXES)
+
+
+def _contains_geo_selector(value: Any) -> bool:
+    if _geo_selector(value):
+        return True
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return any(_contains_geo_selector(item) for item in value)
+    return False
+
+
+def _contains_geo_rule(value: Any) -> bool:
+    if isinstance(value, str):
+        if value.split(",", 1)[0].strip().upper() in _GEO_RULE_TYPES:
+            return True
+        return any(
+            match.group(1).upper() in _GEO_RULE_TYPES
+            for match in re.finditer(r"\(([A-Za-z][A-Za-z0-9-]*),", value)
+        )
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            rule_type = str(key).strip().upper()
+            if rule_type in _GEO_RULE_TYPES:
+                return True
+            if rule_type in _LOGIC_RULE_TYPES or rule_type.lower() in {"type", "rule", "rules"}:
+                if _contains_geo_rule(item):
+                    return True
+            elif isinstance(item, (Mapping, list, tuple)) and _contains_geo_rule(item):
+                return True
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return any(_contains_geo_rule(item) for item in value)
+    return False
+
+
+def _geo_database_path(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    name = PurePosixPath(value.replace("\\", "/")).name.lower()
+    if name.endswith(".mmdb"):
+        return True
+    stem = name.removesuffix(".dat")
+    return name.endswith(".dat") and (
+        stem in {"geoip", "geosite", "asn", "country"}
+        or stem.startswith(("geoip-", "geosite-", "asn-", "country-"))
+    )
+
+
+def _geo_database_reference(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    path = urlsplit(value).path if "://" in value else value
+    return _geo_database_path(path)
+
+
+def validate_geo_free_config(config: Mapping[str, Any] | str) -> None:
+    """Reject runtime configurations that make Mihomo consume geographic data."""
+    if isinstance(config, str):
+        try:
+            parsed = yaml.safe_load(config)
+        except yaml.YAMLError as exc:
+            raise ValueError(f"运行配置不是合法 YAML：{exc}") from None
+    else:
+        parsed = config
+    if not isinstance(parsed, Mapping):
+        raise ValueError("运行配置不是 YAML 映射")
+
+    keys = {str(key).lower() for key in parsed}
+    configured = sorted(keys.intersection(_GEO_CONFIG_KEYS))
+    if configured:
+        raise ValueError(f"运行配置包含地理数据加载设置：{configured[0]}")
+    if parsed.get("rule-providers"):
+        raise ValueError("运行配置包含可能读取地理数据的规则集")
+    if parsed.get("sub-rules"):
+        raise ValueError("运行配置包含可能读取地理数据的子规则")
+    if _contains_geo_rule(parsed.get("rules")):
+        raise ValueError("运行配置包含依赖地理数据的规则")
+
+    providers = parsed.get("proxy-providers")
+    if isinstance(providers, Mapping):
+        for provider in providers.values():
+            if isinstance(provider, Mapping) and any(
+                _geo_database_reference(provider.get(field)) for field in ("path", "url")
+            ):
+                raise ValueError("节点来源指向地理数据库文件")
+
+    dns = parsed.get("dns")
+    if not isinstance(dns, Mapping):
+        return
+    for key in (
+        "nameserver", "default-nameserver", "proxy-server-nameserver",
+        "direct-nameserver", "fallback",
+    ):
+        values = dns.get(key)
+        if _geo_selector(values):
+            raise ValueError(f"DNS {key} 指向地理数据规则")
+        if isinstance(values, Sequence) and not isinstance(values, (str, bytes, bytearray)):
+            if any(_geo_selector(value) for value in values):
+                raise ValueError(f"DNS {key} 指向地理数据规则")
+
+    for key in ("nameserver-policy", "proxy-server-nameserver-policy"):
+        policy = dns.get(key)
+        if isinstance(policy, Mapping) and any(
+            _geo_selector(selector) or _contains_geo_selector(resolvers)
+            for selector, resolvers in policy.items()
+        ):
+            raise ValueError(f"DNS {key} 使用地理数据规则")
+
+    fallback = dns.get("fallback")
+    fallback_filter = dns.get("fallback-filter")
+    if (
+        isinstance(fallback, Sequence)
+        and not isinstance(fallback, (str, bytes, bytearray))
+        and fallback
+    ):
+        if not isinstance(fallback_filter, Mapping) or fallback_filter.get("geoip") is not False:
+            raise ValueError("DNS fallback 默认启用地理数据库筛选")
+    if isinstance(fallback_filter, Mapping):
+        if fallback_filter.get("geoip") is True or fallback_filter.get("geosite"):
+            raise ValueError("DNS fallback-filter 使用地理数据")
+        if "geoip-code" in fallback_filter:
+            raise ValueError("DNS fallback-filter 指定地理 IP 区域")
+
+    fake_ip_filter = dns.get("fake-ip-filter")
+    if _contains_geo_rule(fake_ip_filter) or _contains_geo_selector(fake_ip_filter):
+        raise ValueError("DNS fake-ip-filter 使用地理数据规则")
 
 
 def resolve_node_dependencies(
@@ -170,8 +310,7 @@ def _render_dns(raw: Any) -> dict:
         for key in _DNS_RESOLVER_KEYS:
             values = raw.get(key)
             if isinstance(values, list):
-                resolvers = [value for value in values if isinstance(value, str)
-                             and not any(marker in value.lower() for marker in ("geosite:", "geoip:"))]
+                resolvers = [value for value in values if isinstance(value, str)]
                 if resolvers:
                     out[key] = resolvers
     out["enhanced-mode"] = "redir-host"
@@ -219,7 +358,6 @@ def render_subscription_config(text: str) -> str:
         "mode": "global",
         "allow-lan": False,
         "bind-address": "127.0.0.1",
-        "geo-auto-update": False,
         "dns": _render_dns(doc.get("dns")),
     }
     if proxies:
@@ -229,6 +367,7 @@ def render_subscription_config(text: str) -> str:
     if out_groups:
         doc_out["proxy-groups"] = out_groups
 
+    validate_geo_free_config(doc_out)
     return yaml.safe_dump(doc_out, allow_unicode=True, sort_keys=False)
 
 

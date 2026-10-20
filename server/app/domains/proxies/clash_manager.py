@@ -20,6 +20,7 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
 import urllib.parse
 import zipfile
@@ -45,6 +46,7 @@ from app.domains.proxies.kernel_release import (
 from app.domains.proxies.runtime_config import (  # noqa: F401 —— 对外契约
     render_subscription_config,
     resolve_node_dependencies,
+    validate_geo_free_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -705,6 +707,7 @@ CONFIG_TEST_TIMEOUT = 15.0
 
 def validate_config(exe_path: str, config_path: str, work_dir: Path) -> None:
     """启动前校验运行配置，拒载时抛错，超时交由启动检查确认。"""
+    validate_geo_free_config(Path(config_path).read_text(encoding="utf-8", errors="ignore"))
     try:
         result = subprocess.run(
             [exe_path, "-t", "-f", config_path, "-d", str(work_dir)],
@@ -728,6 +731,15 @@ def validate_config(exe_path: str, config_path: str, work_dir: Path) -> None:
     ]
     detail = "；".join(lines[:5]) or f"退出码 {result.returncode}"
     raise ValueError(f"内核拒绝配置（-t 校验未通过）：{detail}")
+
+
+def _validate_config_text(exe_path: str, text: str, work_dir: Path) -> None:
+    """Validate the final in-memory configuration without replacing a live file."""
+    validate_geo_free_config(text)
+    with tempfile.TemporaryDirectory(prefix=".mihomo-config-check-", dir=work_dir) as folder:
+        candidate = Path(folder) / "config.yaml"
+        candidate.write_text(text, encoding="utf-8")
+        validate_config(exe_path, str(candidate), work_dir)
 
 
 def config_unchanged(startup_text: str | None, disk_text: str) -> bool:
@@ -938,15 +950,20 @@ def materialize_subscription_config(raw_path: Path) -> Path:
     原文不动——它是来源证据，且同一份原文总是渲染出同一份运行配置（幂等：
     重复刷新相同内容不触发重启）。
 
-    入参已是生成文件时原样返回，让「已有生成结果」的调用点（如按端口重启，
-    手里拿的已经是运行配置路径）无需区分来源。
+    入参已是生成文件时优先从配对的原始缓存重新生成，避免旧运行缓存携带过期
+    配置；原始缓存不存在时才从该运行配置重建。
     """
     raw_path = Path(raw_path)
+    out = raw_path
     if raw_path.name.endswith(_RUNTIME_SUFFIX):
-        return raw_path
-    raw_text = raw_path.read_text(encoding="utf-8", errors="ignore")
+        source_name = f"{raw_path.name[:-len(_RUNTIME_SUFFIX)]}.yaml"
+        paired_source = raw_path.with_name(source_name)
+        source_path = paired_source if paired_source.is_file() else raw_path
+    else:
+        source_path = raw_path
+        out = raw_path.with_name(f"{raw_path.stem}{_RUNTIME_SUFFIX}")
+    raw_text = source_path.read_text(encoding="utf-8", errors="ignore")
     rendered = render_subscription_config(raw_text)
-    out = raw_path.with_name(f"{raw_path.stem}{_RUNTIME_SUFFIX}")
     tmp = out.with_name(f"{out.name}.tmp")
     tmp.write_text(rendered, encoding="utf-8")
     tmp.replace(out)
@@ -1254,6 +1271,7 @@ class ClashRuntime:
     def start(
         self, exe_path: str, config_path: str, *,
         restart_if_changed: bool = False,
+        force_restart: bool = False,
         inject_lanes: bool = True,
         subscription_url: str | None = None,
         mixed_port: int | None = None,
@@ -1267,11 +1285,15 @@ class ClashRuntime:
         subscription_url：本次启动归属的订阅（「在跑哪条」的事实源，
         检测归属与订阅重拉的重启开关都认它）。
         mixed_port：钉死本内核的混合监听口（程序工作端口）——给了就覆写
-        配置里的端口，订阅写什么不再决定监听口；不给保持订阅原样（池内核）。"""
-        if self.status()["running"]:
+        配置里的端口，订阅写什么不再决定监听口；不给保持订阅原样（池内核）。
+        force_restart：先校验完整的新配置，再替换现役进程。"""
+        running = self.status()["running"]
+        if running and not force_restart:
+            disk_text = Path(config_path).read_text(encoding="utf-8", errors="ignore")
+            validate_geo_free_config(disk_text)
             if not restart_if_changed:
                 # 已在跑：同订阅（或调用方未带归属）幂等返回；带了**不同**的
-                # 订阅 URL = 用户要求切换订阅 → 停掉当前实例，走下方完整启动
+                # 订阅 URL = 用户要求切换订阅，走下方完整启动
                 target = (subscription_url or "").strip()
                 if not target or self.subscription_url == target:
                     return self.status()
@@ -1280,24 +1302,21 @@ class ClashRuntime:
                     "切换订阅：停掉当前内核并按新订阅重启",
                     detail={"当前订阅": self.subscription_url, "新订阅": target},
                 )
-                self.stop()
             else:
-                disk_text = Path(config_path).read_text(encoding="utf-8", errors="ignore")
                 if self.config_path == config_path and config_unchanged(
                     self._startup_text, disk_text
-                ):
+                ) and (mixed_port is None or self.port == mixed_port) and not allocate_mixed_port:
                     return self.status()
-                self.stop()
-        try:
-            self._kill_orphans(exe_path, config_path)
-        except Exception as e:  # noqa: BLE001 —— 清理失败不阻断启动（psutil 缺失等）
-            log_event(
-                logger,
-                "残留内核进程清理跳过",
-                tag="跳过",
-                level=logging.WARNING,
-                detail={"原因": str(e)},
-            )
+        config_text = Path(config_path).read_text(encoding="utf-8", errors="ignore")
+        selected_port = _free_local_port() if allocate_mixed_port else mixed_port
+        if selected_port:
+            pinned = pin_mixed_port(config_text, selected_port)
+            config_text = pinned
+        stripped = strip_tun_section(config_text)
+        config_text = stripped
+        text = inject_probe_lanes(config_text) if inject_lanes else config_text
+        _validate_config_text(exe_path, text, Path(config_path).parent)
+
         try:
             ensure_kernel_files(Path(config_path).parent)
         except Exception as e:  # noqa: BLE001 —— 清理失败不阻断启动（psutil 缺失等）
@@ -1308,33 +1327,31 @@ class ClashRuntime:
                 level=logging.WARNING,
                 detail={"原因": str(e)},
             )
-        config_text = Path(config_path).read_text(encoding="utf-8", errors="ignore")
-        selected_port = _free_local_port() if allocate_mixed_port else mixed_port
-        if selected_port:
-            pinned = pin_mixed_port(config_text, selected_port)
-            if pinned != config_text:
-                Path(config_path).write_text(pinned, encoding="utf-8")
-                config_text = pinned
-        stripped = strip_tun_section(config_text)
-        if stripped != config_text:
-            Path(config_path).write_text(stripped, encoding="utf-8")
-            config_text = stripped
-        validate_config(exe_path, config_path, Path(config_path).parent)
-        self.port = parse_mixed_port(config_text)
+        if running or self.process is not None:
+            self.stop()
+        try:
+            self._kill_orphans(exe_path, config_path)
+        except Exception as e:  # noqa: BLE001 —— 清理失败不阻断启动（psutil 缺失等）
+            log_event(
+                logger,
+                "残留内核进程清理跳过",
+                tag="跳过",
+                level=logging.WARNING,
+                detail={"原因": str(e)},
+            )
+        tmp_path = Path(f"{config_path}.tmp")
+        tmp_path.write_text(text, encoding="utf-8")
+        tmp_path.replace(config_path)
+
+        self.port = parse_mixed_port(text)
         # 控制器经命令行参数下发（-ext-ctl / -secret）：优先级高于配置文件，
         # 配置里订阅自带的控制器行不再构成劫持面，文件本身保持订阅原样
-        self.controller_url, self.secret = resolve_controller(config_text)
+        self.controller_url, self.secret = resolve_controller(text)
         controller_addr = self.controller_url.split("://", 1)[-1]
-        self.probe_lanes = []
-        text = config_text
-        if inject_lanes:
-            text = inject_probe_lanes(text)
-            self.probe_lanes = parse_probe_lanes(text)
-        if text != config_text:
-            Path(config_path).write_text(text, encoding="utf-8")
+        self.probe_lanes = parse_probe_lanes(text) if inject_lanes else []
         self.config_path = config_path
         self.subscription_url = (subscription_url or "").strip() or None
-        self._startup_text = text if inject_lanes else config_text
+        self._startup_text = text
         # stdout/stderr 追加到内核目录的 kernel.log：内核对控制器绑定失败等
         # 异常只打日志不退出，没有这份日志这些失败完全不可见
         log_path = Path(config_path).parent / "kernel.log"
@@ -1361,6 +1378,7 @@ class ClashRuntime:
                 )
                 return self.start(
                     exe_path, config_path, restart_if_changed=restart_if_changed,
+                    force_restart=force_restart,
                     inject_lanes=inject_lanes, subscription_url=subscription_url,
                     allocate_mixed_port=True, _port_retry=_port_retry + 1,
                 )
@@ -1403,6 +1421,7 @@ class ClashRuntime:
 
     def _running_kernel_text(
         self, config_path: str, *, mixed_port: int | None = None,
+        exe_path: str | None = None,
     ) -> tuple[str, str]:
         """给**运行中**内核热重载用的配置文本：做合法性预检（YAML 可解析
         + 有节点段），不合法抛 _ReloadRejected——坏配置不该走到内核面前。
@@ -1426,7 +1445,16 @@ class ClashRuntime:
         if mixed_port:
             text = pin_mixed_port(text, mixed_port)
         text = strip_tun_section(text)
-        Path(config_path).write_text(text, encoding="utf-8")
+        try:
+            if exe_path:
+                _validate_config_text(exe_path, text, Path(config_path).parent)
+            else:
+                validate_geo_free_config(text)
+        except ValueError as exc:
+            raise _ReloadRejected(str(exc)) from None
+        tmp_path = Path(f"{config_path}.tmp")
+        tmp_path.write_text(text, encoding="utf-8")
+        tmp_path.replace(config_path)
         return text, prev_file_text
 
     async def _verify_reloaded(self, injected_text: str) -> None:
@@ -1460,6 +1488,7 @@ class ClashRuntime:
     async def ensure_running(
         self, exe_path: str, config_path: str, *, subscription_url: str | None = None,
         mixed_port: int | None = None, allocate_mixed_port: bool = False,
+        force_restart: bool = False,
     ) -> dict:
         """确保内核跑着指定订阅的配置：没跑就启动；在跑时**热重载**生效
         （切换订阅 / 同订阅内容更新都走控制器 PUT /configs，内核进程不动——
@@ -1474,10 +1503,9 @@ class ClashRuntime:
                 mixed_port = self.port
                 allocate_mixed_port = False
             else:
-                self.stop()
                 status = self.start(
                     exe_path, config_path, subscription_url=sub_url,
-                    allocate_mixed_port=True,
+                    allocate_mixed_port=True, force_restart=True,
                 )
                 return {**status, "started": True, "reloaded": False}
         if not running:
@@ -1486,7 +1514,15 @@ class ClashRuntime:
                 allocate_mixed_port=allocate_mixed_port,
             )
             return {**status, "started": True, "reloaded": False}
+        if force_restart:
+            status = self.start(
+                exe_path, config_path, subscription_url=sub_url, mixed_port=mixed_port,
+                allocate_mixed_port=allocate_mixed_port, force_restart=True,
+            )
+            return {**status, "started": True, "reloaded": False}
 
+        candidate_text = Path(config_path).read_text(encoding="utf-8", errors="ignore")
+        validate_geo_free_config(candidate_text)
         same_sub = bool(sub_url and self.subscription_url == sub_url)
         if (
             same_sub
@@ -1494,8 +1530,7 @@ class ClashRuntime:
             and (mixed_port is None or self.port == mixed_port)
             and self.entry_listening()
             and config_unchanged(
-                self._startup_text,
-                Path(config_path).read_text(encoding="utf-8", errors="ignore"),
+                self._startup_text, candidate_text,
             )
         ):
             # 同订阅且订阅内容没变：不重载（幂等）
@@ -1505,7 +1540,7 @@ class ClashRuntime:
         wrote = False
         try:
             injected, prev_file_text = self._running_kernel_text(
-                config_path, mixed_port=mixed_port,
+                config_path, mixed_port=mixed_port, exe_path=exe_path,
             )
             wrote = True
             headers = {"Authorization": f"Bearer {self.secret}"} if self.secret else {}

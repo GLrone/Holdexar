@@ -20,6 +20,7 @@ from app.core.database import WritePriority, write_gate
 from app.core.logging import log_event
 from app.domains.proxypool.models import ProxyNode
 from app.domains.proxypool.state import NODE_DEAD, NODE_RETIRED
+from app.domains.proxies.runtime_config import validate_geo_free_config
 
 logger = logging.getLogger(__name__)
 
@@ -147,10 +148,11 @@ def _render_config(nodes: list[RecoveredNode], *, controller_port: int, secret: 
         "secret": secret,
         **bundle,
         "listeners": listeners,
-        "geo-auto-update": False,
         "rules": ["MATCH,DIRECT"],
     }
-    return yaml.safe_dump(doc, allow_unicode=True, sort_keys=False), ports
+    text = yaml.safe_dump(doc, allow_unicode=True, sort_keys=False)
+    validate_geo_free_config(text)
+    return text, ports
 
 
 async def _wait_controller(base_url: str, secret: str, timeout: float) -> bool:
