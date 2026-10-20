@@ -236,7 +236,7 @@ async def set_strategy(
 
 
 async def _restart_kernel_for_port(new_port: int) -> None:
-    """工作端口变化即生效：内核在跑就停掉并按新端口重启。"""
+    """工作端口变化即生效：校验新配置后再重启现役内核。"""
     from app.core.config import get_settings
 
     detect = clash_manager.detect_kernel(get_settings().data_dir)
@@ -250,25 +250,25 @@ async def _restart_kernel_for_port(new_port: int) -> None:
     if not config_path:
         return
     try:
-        clash_manager.runtime.stop()
         outcome = await clash_manager.runtime.ensure_running(
-            detect["path"], config_path, subscription_url=sub_url, mixed_port=new_port,
+            detect["path"], config_path, subscription_url=sub_url,
+            mixed_port=new_port, force_restart=True,
         )
         if not outcome.get("entryReady"):
             raise RuntimeError("代理入口没有成功监听")
         log_event(logger, f"内核工作端口已切换为 {new_port}，已按新端口重启", tag="成功")
     except Exception as exc:  # noqa: BLE001 —— restore the previous working port on failure
-        try:
-            clash_manager.runtime.stop()
-            await clash_manager.runtime.ensure_running(
-                detect["path"], config_path, subscription_url=sub_url,
-                mixed_port=status.get("port"),
-            )
-        except Exception:
-            log_event(
-                logger, "端口切换失败后原代理入口也未能恢复",
-                level=logging.ERROR, exc_info=True,
-            )
+        if not clash_manager.runtime.status()["running"]:
+            try:
+                await clash_manager.runtime.ensure_running(
+                    detect["path"], config_path, subscription_url=sub_url,
+                    mixed_port=status.get("port"),
+                )
+            except Exception:
+                log_event(
+                    logger, "端口切换失败后原代理入口也未能恢复",
+                    level=logging.ERROR, exc_info=True,
+                )
         log_event(
             logger,
             "内核按新工作端口重启失败",

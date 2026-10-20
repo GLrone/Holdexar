@@ -43,6 +43,7 @@ from app.domains.proxies.clash_manager import (
 )
 from app.domains.proxies.runtime_config import (
     BUILTIN_PROXY_NAMES as _BUILTIN_PROXY_NAMES,
+    validate_geo_free_config,
 )
 from app.domains.proxypool.exits import MAX_CRAWL_WORKERS, ExitSlot, select_exit_slots
 from app.domains.proxypool.pool import (
@@ -420,6 +421,7 @@ def prepare_runtime_config(data_dir: Path, *, lanes: int | None = None,
         port_span=POOL_PROBE_LANE_PORT_SPAN,
         pin_ports=pinned["probe_lane_ports"] if pinned else None,
     )
+    validate_geo_free_config(text)
     tmp = out.with_suffix(".tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(out)
@@ -637,6 +639,10 @@ async def reload_runtime_config(
     内核拒绝这份配置；加载是否真的成立（节点集合、入口监听）由调用方的对账
     与等待步骤确认，任何一步不过都回退冷通道。
     """
+    try:
+        validate_geo_free_config(Path(config_path).read_text(encoding="utf-8", errors="ignore"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeRebuildError(f"运行配置未通过地理数据准入：{exc}") from None
     async with httpx.AsyncClient(trust_env=False, timeout=timeout, headers=_headers(secret)) as client:
         resp = await client.put(
             f"{controller_url}/configs?force=true", json={"path": config_path}
