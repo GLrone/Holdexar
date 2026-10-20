@@ -21,6 +21,7 @@ from app.core.config import get_settings  # noqa: E402
 from app.core.database import get_engine, get_session_factory, init_db  # noqa: E402
 from app.crawler.occupancy import end_crawl  # noqa: E402
 from app.crawler.runner import CrawlRunConfig, run_crawl  # noqa: E402
+from app.domains.proxies.models import ADMISSION_ACTIVE, ProxySubscription
 from app.domains.proxypool import jobruns  # noqa: E402
 from app.domains.proxypool import runtime as runtime_module  # noqa: E402
 from app.domains.proxypool.models import (  # noqa: E402
@@ -59,6 +60,11 @@ def _no_occupancy():
 async def _add_node(
     session, runtime_name: str, *, sub_id: int = 1, exit_ip: str | None = None
 ) -> ProxyNode:
+    if await session.get(ProxySubscription, sub_id) is None:
+        session.add(ProxySubscription(
+            id=sub_id, kind="clash", url=f"https://source.invalid/{sub_id}",
+            admission_status=ADMISSION_ACTIVE,
+        ))
     node = ProxyNode(
         node_id=runtime_name,
         fingerprint=runtime_name,

@@ -46,7 +46,7 @@ async def test_auto_off_subscription_skipped_by_schedule(tmp_path, monkeypatch) 
 
     fetched: list[str] = []
 
-    async def _fetch(url, _channels):
+    async def _fetch(url, _channels, *, preferred_egress=None, egress_scores=None):
         fetched.append(url)
         raise bs.FetchFailedError("boom")
 
@@ -71,7 +71,7 @@ async def test_manual_sync_ignores_switch(tmp_path, monkeypatch) -> None:
 
     fetched: list[str] = []
 
-    async def _fetch(url, _channels):
+    async def _fetch(url, _channels, *, preferred_egress=None, egress_scores=None):
         fetched.append(url)
         raise bs.FetchFailedError("boom")
 
