@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 from . import service
+from . import steam_local
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
@@ -20,6 +21,10 @@ def _mask_key(key: str) -> str:
 class AccountPayload(BaseModel):
     steam_id: str | None = None
     steam_api_key: str | None = None
+
+
+class LocalSteamAccountImport(BaseModel):
+    steam_id: str = Field(min_length=17, max_length=17)
 
 
 class SettingsUpdate(BaseModel):
@@ -209,6 +214,27 @@ async def update_settings(payload: SettingsUpdate) -> SettingsPayload:
     return await get_settings()
 
 
+@router.get("/steam-local-accounts")
+async def get_local_steam_accounts() -> dict[str, list[dict[str, str]]]:
+    return {"accounts": steam_local.discover_local_steam_accounts()}
+
+
+@router.post("/steam-local-accounts/import")
+async def import_local_steam_account(payload: LocalSteamAccountImport) -> dict[str, str]:
+    account = next(
+        (
+            candidate
+            for candidate in steam_local.discover_local_steam_accounts()
+            if candidate["steam_id"] == payload.steam_id
+        ),
+        None,
+    )
+    if account is None:
+        raise HTTPException(status_code=404, detail="本机 Steam 账号记录已不可用")
+    await service.set_value("account.steam_id", account["steam_id"])
+    return account
+
+
 async def _read_fetch_settings() -> FetchSettingsPayload:
     fields: dict[str, bool] = {}
     for field, key in _FETCH_SETTING_KEYS.items():
@@ -270,7 +296,7 @@ async def update_fetch_settings(payload: FetchSettingsUpdate) -> FetchSettingsPa
         # 只落偏好：价格轮每轮开工时现读，改动从下一轮生效
         await service.set_value("crawl.catalog_refresh", bool(payload.catalog_refresh))
     # 内容源自定义节奏：落 KV + 调度在跑时立即重排（下次启动按 KV 再应用）
-    from app.core.scheduler import CONTENT_SCHEDULE_KEYS, apply_content_schedule
+    from app.core.scheduler import CONTENT_SCHEDULE_KEYS
 
     for field, job_id in (("hb_schedule", "hb_choice"), ("epic_schedule", "epic_free")):
         cfg = getattr(payload, field)

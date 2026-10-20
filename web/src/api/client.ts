@@ -231,8 +231,19 @@ export interface FetchSettingsPayload {
   epic_schedule: ContentSchedule
 }
 
+export interface LocalSteamAccountCandidate {
+  steam_id: string
+  persona_name: string
+}
+
 export const settingsApi = {
   get: () => request<SettingsPayload>('GET', '/settings'),
+  getLocalSteamAccounts: () =>
+    request<{ accounts: LocalSteamAccountCandidate[] }>('GET', '/settings/steam-local-accounts'),
+  importLocalSteamAccount: (steamId: string) =>
+    request<LocalSteamAccountCandidate>('POST', '/settings/steam-local-accounts/import', {
+      steam_id: steamId,
+    }),
   update: (payload: {
     account?: { steam_id?: string; steam_api_key?: string }
     onboarding_done?: boolean
