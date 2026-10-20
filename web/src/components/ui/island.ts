@@ -154,7 +154,7 @@ export function updateNotice(id: number, text: string) {
 /** 展开面的开合；收起后恢复倒计时 */
 export function setExpanded(on: boolean) {
   island.expanded = on
-  islandController.setExpanded(on)
+  islandController.requestExpanded(on)
   armTimer()
 }
 

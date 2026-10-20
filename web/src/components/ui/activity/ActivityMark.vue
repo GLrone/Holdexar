@@ -12,6 +12,7 @@ const props = withDefaults(defineProps<{
   progress?: number | null
   imageUrl?: string
   animationKey?: string
+  activityId?: string
   iconSize?: number
   iconColor?: string
 }>(), {
@@ -51,6 +52,7 @@ const badgeText = computed(() => (
     class="hl-activity-mark"
     :class="[`is-${presentation.tone}`, `is-motion-${presentation.motion}`]"
     :style="iconColor ? { color: iconColor } : undefined"
+    :data-activity-logo="activityId"
     aria-hidden="true"
   >
     <svg v-if="presentation.motion === 'orbit'" class="hl-activity-mark__orbit" viewBox="0 0 24 24">

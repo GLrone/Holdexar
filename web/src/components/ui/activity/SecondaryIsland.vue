@@ -6,7 +6,6 @@
  */
 import { computed, onBeforeUnmount, ref } from 'vue'
 
-import HlIcon from '@/components/ui/HlIcon.vue'
 import { useI18n } from '@/locales'
 
 import ActivityMark from './ActivityMark.vue'
@@ -92,6 +91,7 @@ onBeforeUnmount(() => {
       },
     ]"
     :data-activity-id="activity.id"
+    data-island-slot="secondary"
     :aria-hidden="isSwapHidden ? 'true' : undefined"
     :inert="isSwapHidden"
     role="button"
@@ -111,12 +111,14 @@ onBeforeUnmount(() => {
       :progress="activity.progress"
       :image-url="activity.iconImageUrl"
       :animation-key="activity.id"
+      :activity-id="activity.id"
     />
 
     <!-- 余量计数徽章：仅 3 个及以上活动时呈现，点击直通活动总览面板 -->
     <span
       v-if="extraCount && extraCount > 0"
       class="hl-secondary-island__count"
+      data-queue-origin
       :title="t('island.hub')"
       :aria-label="t('island.hub')"
       @click.stop="emit('openOverview')"
@@ -184,7 +186,7 @@ onBeforeUnmount(() => {
   box-sizing: border-box;
   transition:
     width calc(var(--duration-3) * var(--motion-scale)) var(--ease-island),
-    transform calc(var(--duration-3) * var(--motion-scale)) var(--ease-island),
+    filter calc(var(--duration-3) * var(--motion-scale)) var(--ease-out),
     box-shadow calc(var(--duration-3) * var(--motion-scale)) var(--ease-out),
     opacity calc(var(--duration-3) * var(--motion-scale)) var(--ease-out);
 }
@@ -207,7 +209,7 @@ onBeforeUnmount(() => {
 }
 
 .hl-secondary-island:hover {
-  transform: scale(1.04);
+  filter: brightness(1.12);
 }
 
 .hl-secondary-island:focus-visible {
@@ -237,15 +239,22 @@ onBeforeUnmount(() => {
 }
 
 .hl-secondary-preview {
+  --text-primary: var(--island-panel-fg);
+  --text-secondary: var(--island-panel-fg);
+  --text-muted: var(--island-panel-muted);
+  --island-btn: var(--island-panel-surface);
+  --island-bg: var(--island-panel-bg);
+  --surface-track: var(--island-shell-track);
+  --border-soft: var(--island-panel-divider);
   position: absolute;
   top: calc(100% + 8px);
   right: 0;
   width: 230px;
   padding: 10px 12px;
-  border-radius: 12px;
+  border-radius: 14px;
   background: var(--island-bg);
   box-shadow: var(--shadow-island);
-  border: 1px solid var(--border-soft);
+  border: none;
   color: var(--text-primary);
   display: flex;
   flex-direction: column;

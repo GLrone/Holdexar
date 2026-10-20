@@ -111,7 +111,7 @@ function onActionClick(e: MouseEvent) {
   align-items: center;
   gap: 10px;
   padding: 8px 10px;
-  border-radius: 8px;
+  border-radius: 10px;
   background: var(--island-btn);
   cursor: pointer;
   transition: background var(--transition);
@@ -122,7 +122,7 @@ function onActionClick(e: MouseEvent) {
 }
 
 .hl-activity-item.is-attention {
-  border-left: 3px solid var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, var(--island-panel-surface));
 }
 
 .hl-activity-item__content {

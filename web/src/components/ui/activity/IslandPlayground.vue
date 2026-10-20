@@ -656,11 +656,11 @@ async function runLiveAcceptanceCheck() {
       throw new Error('P2 dual task island controller assignment failed')
     }
 
-    // 5. 验证 P2: 主副岛交换
-    islandController.swap()
+    // 5. 验证 P2: 副岛直接进入展开位
+    islandController.requestSwap()
     await new Promise((r) => setTimeout(r, 60))
-    if (islandController.primaryId !== 'dev:task-b' || islandController.secondaryId !== 'dev:task-a') {
-      throw new Error('P2 island swap failed')
+    if (islandController.primaryId !== 'dev:task-a' || islandController.secondaryId !== null || islandController.expandedId !== 'dev:task-b') {
+      throw new Error('P2 secondary direct expansion failed')
     }
 
     // 6. 验证 P2: 固定 (Pin) 与抢占 (Attention)
