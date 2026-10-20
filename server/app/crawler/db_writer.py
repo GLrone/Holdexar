@@ -19,7 +19,6 @@ from app.core import seed_assets
 from app.core.database import (
     WritePriority,
     get_session_factory,
-    scheduler_task_owns_gate,
     write_gate,
     write_scheduler_diagnostics,
     write_session,
@@ -43,24 +42,35 @@ _BATCH_WRITE_CHUNK = 100
 
 
 @asynccontextmanager
-async def _session_scope(session, *, begin_immediate: bool = False):
-    """批量写传入共享 session：不提交、不关闭；未传则开自有 session 并在退出时关闭。
-
-    自有会话即事务所有者：begin_immediate=True 时起点显式取 SQLite 写锁
-    （防跨进程先读后写快照失效）；调用方必须在过闸**前**判好重入态传入。
-    """
+async def _session_scope(session):
+    """复用调用方会话；自有事务统一由 write_session 管理。"""
     if session is not None:
         yield session
     else:
-        async with get_session_factory()() as own:
-            if begin_immediate:
-                await own.execute(text("BEGIN IMMEDIATE"))
+        async with write_session(WritePriority.BACKGROUND, label="price_single") as own:
             yield own
 
 
 def _chunks(items: list, size: int):
     for i in range(0, len(items), size):
         yield items[i : i + size]
+
+
+def _history_upsert():
+    stmt = sqlite_insert(GamePriceHistory)
+    return stmt.on_conflict_do_update(
+        index_elements=[
+            GamePriceHistory.appid, GamePriceHistory.region_code, GamePriceHistory.snapshot_at,
+            text("COALESCE(sub_id, -1)"), text("COALESCE(price, 0)"), text("COALESCE(is_gold, 0)"),
+        ],
+        set_={
+            key: getattr(stmt.excluded, key)
+            for key in (
+                "currency", "original_price", "discount_percent", "version_suffix",
+                "is_bundle", "price_status", "cny_fen", "discount_end_ts", "steam_event_key",
+            )
+        },
+    )
 
 
 def _ms_since(t0: float) -> int:
@@ -542,12 +552,9 @@ class DbWriter:
             game_values, free_state = self._normalize_game_row(game_data, prices_data)
             now_dt = game_values["updated_at"]
 
-            # 单款独占事务过写调度器；批量慢路径传入共享 session 时按重入放行。
-            # 重入态在过闸前判定：自有会话是顶层事务时起点显式取写锁
-            reentrant = scheduler_task_owns_gate()
             async with (
                 write_gate(WritePriority.BACKGROUND),
-                _session_scope(session, begin_immediate=not reentrant) as session,
+                _session_scope(session) as session,
             ):
                 if baseline is None:
                     baseline = await self._load_baseline(
@@ -629,22 +636,18 @@ class DbWriter:
 
                     if history_batch:
                         await session.execute(
-                            sqlite_insert(GamePriceHistory).values(history_batch)
+                            _history_upsert().values(history_batch)
                         )
 
                 if not commit:
                     return True
                 await session.commit()
-                # 复活清标：抓到数据 = 商店健在。removed_at 非空时由榜单
-                # 复活通道反哺至此，清除后恢复关注层监控（在 with 外调用，
-                # 避免 clear 内层事务与未提交的本事务交叉）
-                appid_int = int(game_data.get("appid") or 0)
-                if appid_int:
-                    await self.clear_removed_mark(appid_int)
-                # 种子人工列补挂：新游戏入库即贴上随包维护的
-                # xgp/epic/hb/series 标记（种子为空时零开销）
-                await seed_assets.apply_curated(appid_int)
-                return True
+
+            appid_int = int(game_data.get("appid") or 0)
+            if appid_int:
+                await self.clear_removed_mark(appid_int)
+            await seed_assets.apply_curated(appid_int)
+            return True
 
         except Exception as e:
             log_event(logger, "游戏价格写入失败", level=logging.ERROR, detail={"原因": e})
@@ -867,7 +870,7 @@ class DbWriter:
 
                 if all_history:
                     _th = time.perf_counter()
-                    hist_stmt = sqlite_insert(GamePriceHistory)
+                    hist_stmt = _history_upsert()
                     for chunk in _chunks(all_history, _INSERT_CHUNK_ROWS):
                         await session.execute(hist_stmt, chunk)
                     history_ms = _ms_since(_th)

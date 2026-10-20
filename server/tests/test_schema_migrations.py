@@ -147,6 +147,45 @@ async def _noop_snapshot(_current: int, _target: int) -> None:
 
 
 @pytest.mark.asyncio
+async def test_init_snapshot_precedes_unversioned_schema_changes(isolated_db, monkeypatch):
+    with sqlite3.connect(isolated_db) as conn:
+        conn.execute("CREATE TABLE existing_data (id INTEGER PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO existing_data VALUES (1, 'before')")
+        conn.execute("PRAGMA user_version=1")
+    database_module._MIGRATIONS.append((2, "probe", ["CREATE TABLE versioned_probe (id INTEGER)"]))
+
+    def prepare_schema(conn):
+        conn.exec_driver_sql("UPDATE existing_data SET value='after'")
+        conn.exec_driver_sql("CREATE TABLE preparation_probe (id INTEGER)")
+
+    monkeypatch.setattr(database_module, "_ensure_schema", prepare_schema)
+    await database_module.init_db()
+    snapshot = isolated_db.with_name(isolated_db.name + ".pre-migration.bak")
+    with sqlite3.connect(snapshot) as conn:
+        assert conn.execute("SELECT value FROM existing_data").fetchone()[0] == "before"
+        assert conn.execute("SELECT name FROM sqlite_master WHERE name='preparation_probe'").fetchone() is None
+        assert conn.execute("SELECT name FROM sqlite_master WHERE name='games'").fetchone() is None
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_init_snapshot_failure_prevents_schema_preparation(isolated_db, monkeypatch):
+    with sqlite3.connect(isolated_db) as conn:
+        conn.execute("CREATE TABLE existing_data (id INTEGER PRIMARY KEY)")
+        conn.execute("PRAGMA user_version=1")
+    database_module._MIGRATIONS.append((2, "probe", ["CREATE TABLE versioned_probe (id INTEGER)"]))
+
+    async def fail_snapshot(_current, _target):
+        raise RuntimeError("snapshot unavailable")
+
+    monkeypatch.setattr(database_module, "_snapshot_before_migration", fail_snapshot)
+    with pytest.raises(RuntimeError, match="snapshot unavailable"):
+        await database_module.init_db()
+    with sqlite3.connect(isolated_db) as conn:
+        assert conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall() == [("existing_data",)]
+
+
+@pytest.mark.asyncio
 async def test_newer_schema_version_refuses_start_before_create_all(isolated_db: Path) -> None:
     """回滚旧程序不得把比自身更新的数据库当作可运行结构。"""
     con = sqlite3.connect(str(isolated_db))
@@ -223,15 +262,42 @@ async def test_init_db_refuses_live_maintenance_lock_before_create_all(isolated_
 
 @pytest.mark.asyncio
 async def test_init_db_waits_for_write_maintenance_barrier(isolated_db: Path) -> None:
-    lease = await database_module.acquire_write_maintenance_barrier()
+    acquired = asyncio.Event()
+    release = asyncio.Event()
+
+    async def holder():
+        async with database_module.write_maintenance_barrier():
+            acquired.set()
+            await release.wait()
+
+    holder_task = asyncio.create_task(holder())
+    await acquired.wait()
     task = asyncio.create_task(database_module.init_db())
     try:
         await asyncio.sleep(0.05)
         assert not task.done()
     finally:
-        lease.release()
+        release.set()
+        await holder_task
     await task
     assert _user_version(isolated_db) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_snapshot_keeps_previous_recovery_point(isolated_db, monkeypatch):
+    with sqlite3.connect(isolated_db) as conn:
+        conn.execute("CREATE TABLE existing_data (id INTEGER)")
+    snapshot = isolated_db.with_name(isolated_db.name + ".pre-migration.bak")
+    snapshot.write_bytes(b"previous-recovery-point")
+
+    def fail_snapshot(src, dest):
+        dest.write_bytes(b"incomplete")
+        raise OSError("snapshot interrupted")
+
+    monkeypatch.setattr(backup_module, "snapshot_to", fail_snapshot)
+    with pytest.raises(RuntimeError, match="快照"):
+        await database_module._snapshot_before_migration(1, 2)
+    assert snapshot.read_bytes() == b"previous-recovery-point"
 
 
 @pytest.mark.asyncio

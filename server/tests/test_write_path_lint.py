@@ -48,3 +48,20 @@ async def update(session):
     fails, _, _, effects = check_write_paths.audit_source(source)
     assert fails == []
     assert effects == []
+
+
+def test_allow_does_not_exempt_new_statement_of_same_kind():
+    source = """
+def snapshot_to(conn):
+    conn.execute("VACUUM INTO 'backup.db'")
+    conn.execute("DELETE FROM games")
+"""
+    fails, exceptions, _, _ = check_write_paths.audit_source(source, "core/backup.py")
+    assert len(exceptions) == 1
+    assert len(fails) == 1
+
+
+def test_script_write_paths_are_included():
+    paths = {p.relative_to(REPO_ROOT).as_posix() for p in check_write_paths.source_paths()}
+    assert {"scripts/fx_maintenance.py", "scripts/backfill_version_suffix.py",
+            "server/scripts/export_template_db.py"} <= paths

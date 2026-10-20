@@ -1,8 +1,4 @@
-"""全局写调度器：单写者互斥、交互优先、同任务重入、取消安全、指标留痕。
-
-SQLite 同一时刻只允许一个写事务；调度器把「谁下一个写」收敛到事件循环内
-一处仲裁。这里钉住调度语义本身（不碰数据库）。
-"""
+"""写入调度：互斥、优先级、取消、跨进程锁与真实数据库连接收尾。"""
 from __future__ import annotations
 
 import asyncio
@@ -11,6 +7,23 @@ import sys
 import pytest
 
 from app.core.database import WritePriority, WriteScheduler
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("maintenance", [False, True])
+async def test_child_write_is_rejected_without_waiting_for_parent(maintenance):
+    from app.core.database import write_gate, write_maintenance_barrier, write_scheduler_diagnostics
+
+    async def child():
+        context = write_maintenance_barrier() if maintenance else write_gate()
+        with pytest.raises(RuntimeError, match="子任务"):
+            async with context:
+                pytest.fail("child must not acquire its parent's write lock")
+
+    async with write_gate(label="parent"):
+        await asyncio.wait_for(asyncio.create_task(child()), 0.2)
+        assert write_scheduler_diagnostics()["depth"] == 1
+    assert not write_scheduler_diagnostics()["busy"]
 
 
 @pytest.mark.asyncio
@@ -44,6 +57,37 @@ async def test_single_writer_exclusion():
     await asyncio.wait_for(got.wait(), 1)
     await task
     await t2
+
+
+@pytest.mark.asyncio
+async def test_write_wait_timeout_leaves_owner_and_queue_usable(monkeypatch, tmp_path):
+    import app.core.database as dbmod
+
+    monkeypatch.setattr(dbmod, "_WRITE_WAIT_TIMEOUT", 0.03)
+    scheduler = WriteScheduler()
+    await scheduler.acquire(WritePriority.BACKGROUND)
+
+    async def waiter():
+        with pytest.raises(TimeoutError):
+            await scheduler.acquire(WritePriority.INTERACTIVE)
+
+    try:
+        await asyncio.wait_for(asyncio.create_task(waiter()), 0.3)
+        assert scheduler.snapshot()["waiting_interactive"] == 0
+        assert scheduler.owned_by_current_task()
+    finally:
+        scheduler.release()
+    await scheduler.acquire(WritePriority.INTERACTIVE)
+    scheduler.release()
+
+    lock = await dbmod._CrossProcessWriteLock(tmp_path / "timeout.lock").acquire()
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(dbmod._CrossProcessWriteLock(lock.path).acquire(), 0.3)
+    finally:
+        lock.release()
+    retry = await dbmod._CrossProcessWriteLock(lock.path).acquire()
+    retry.release()
 
 
 @pytest.mark.asyncio
@@ -336,7 +380,8 @@ async def test_write_session_autolabels_real_caller(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_cross_process_write_lock_serializes_a_second_process(tmp_path):
+@pytest.mark.parametrize("sync", [False, True])
+async def test_cross_process_write_lock_serializes_a_second_process(tmp_path, sync):
     """跨进程写者必须等现持锁进程释放 OS 锁后才进入。"""
     from pathlib import Path
 
@@ -349,7 +394,8 @@ async def test_cross_process_write_lock_serializes_a_second_process(tmp_path):
         "from pathlib import Path\n"
         "from app.core.database import _CrossProcessWriteLock\n"
         "async def main():\n"
-        "    lock = await _CrossProcessWriteLock(Path(sys.argv[1])).acquire()\n"
+        "    lock = _CrossProcessWriteLock(Path(sys.argv[1]))\n"
+        "    lock.acquire_sync() if sys.argv[2] == 'sync' else await lock.acquire()\n"
         "    print('ACQUIRED', flush=True)\n"
         "    lock.release()\n"
         "asyncio.run(main())\n"
@@ -359,6 +405,7 @@ async def test_cross_process_write_lock_serializes_a_second_process(tmp_path):
         "-c",
         child_code,
         str(lock_path),
+        "sync" if sync else "async",
         cwd=str(Path(__file__).resolve().parents[1]),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -371,3 +418,94 @@ async def test_cross_process_write_lock_serializes_a_second_process(tmp_path):
     stdout, stderr = await asyncio.wait_for(child.communicate(), timeout=5)
     assert child.returncode == 0, stderr.decode("utf-8", errors="replace")
     assert b"ACQUIRED" in stdout
+
+
+@pytest.mark.asyncio
+async def test_many_database_writers_wait_without_borrowing_connections():
+    from sqlalchemy import func, select
+    from sqlalchemy.dialects.sqlite import insert
+
+    from app.core.database import get_engine, get_session_factory, write_scheduler_diagnostics, write_session
+    from app.domains.settings.models import AppSetting
+
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def holder():
+        async with write_session(label="concurrent_holder") as session:
+            entered.set()
+            await release.wait()
+            await session.commit()
+
+    async def write_batch(index):
+        async with write_session(label=f"concurrent_{index}") as session:
+            await session.execute(insert(AppSetting), [
+                {"key": f"concurrent.{index}.{row}", "value_json": row} for row in range(5)
+            ])
+            await session.commit()
+
+    owner = asyncio.create_task(holder())
+    await asyncio.wait_for(entered.wait(), 2)
+    writers = [asyncio.create_task(write_batch(index)) for index in range(24)]
+    try:
+        async with asyncio.timeout(2):
+            while write_scheduler_diagnostics()["waiting_background"] != 24:
+                await asyncio.sleep(0)
+        assert get_engine().pool.checkedout() == 1
+    finally:
+        release.set()
+        await asyncio.gather(owner, *writers)
+
+    async with get_session_factory()() as session:
+        count = await session.scalar(select(func.count()).select_from(AppSetting).where(
+            AppSetting.key.like("concurrent.%")
+        ))
+    assert count == 120
+    assert get_engine().pool.checkedout() == 0
+    assert not write_scheduler_diagnostics()["busy"]
+
+
+@pytest.mark.asyncio
+async def test_database_wait_timeout_preserves_owner_connection_and_allows_retry(monkeypatch):
+    from sqlalchemy import select
+    from sqlalchemy.dialects.sqlite import insert
+
+    import app.core.database as database
+    from app.domains.settings.models import AppSetting
+
+    monkeypatch.setattr(database, "_WRITE_WAIT_TIMEOUT", 0.05)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def holder():
+        async with database.write_session(label="timeout_holder") as session:
+            await session.execute(insert(AppSetting).values(key="timeout.owner", value_json=1))
+            entered.set()
+            await release.wait()
+            await session.commit()
+
+    async def waiter():
+        with pytest.raises(TimeoutError):
+            async with database.write_session(label="timeout_waiter"):
+                pytest.fail("blocked writer must not open a transaction")
+
+    owner = asyncio.create_task(holder())
+    await asyncio.wait_for(entered.wait(), 2)
+    try:
+        await asyncio.gather(*(waiter() for _ in range(8)))
+        assert database.get_engine().pool.checkedout() == 1
+        diagnostics = database.write_scheduler_diagnostics()
+        assert diagnostics["busy"]
+        assert diagnostics["waiting_background"] == 0
+    finally:
+        release.set()
+        await owner
+
+    async with database.write_session(label="timeout_retry") as session:
+        await session.execute(insert(AppSetting).values(key="timeout.retry", value_json=2))
+        await session.commit()
+    async with database.get_session_factory()() as session:
+        rows = (await session.execute(select(AppSetting.key).where(
+            AppSetting.key.like("timeout.%")
+        ))).scalars().all()
+    assert set(rows) == {"timeout.owner", "timeout.retry"}
+    assert database.get_engine().pool.checkedout() == 0
+    assert not database.write_scheduler_diagnostics()["busy"]
