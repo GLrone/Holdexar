@@ -405,8 +405,8 @@ async def test_import_appids_writes_no_monitoring(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_add_pool_items_records_preset_source(db, monkeypatch):
-    """池页「导入文件」带 source：appid 登记进 preset_games，名字随库内主档带回。"""
+async def test_add_pool_items_source_cannot_masquerade_as_board(db, monkeypatch):
+    """导入来源前缀化，避免用户文件名伪装成公开榜单来源。"""
     from sqlalchemy import select
 
     from app.domains.games.models import Game, PresetGame
@@ -418,7 +418,7 @@ async def test_add_pool_items_records_preset_source(db, monkeypatch):
         await session.commit()
 
     out = await wishlist_service.add_pool_items(
-        [620, 570], source="上传优先.json"
+        [620, 570], source="topsellers"
     )
     assert out["added"] == 2
 
@@ -429,26 +429,42 @@ async def test_add_pool_items_records_preset_source(db, monkeypatch):
             .all()
         )
     assert [(r.appid, r.source) for r in rows] == [
-        (570, "上传优先.json"),
-        (620, "上传优先.json"),
+        (570, "file:topsellers"),
+        (620, "file:topsellers"),
     ]
     assert rows[1].name == "Portal 2"  # 已入库的带名；未爬过的留空（导出侧再兜底）
     assert rows[0].name is None
 
 
 @pytest.mark.asyncio
-async def test_add_pool_items_preset_source_only_first_wins(db, monkeypatch):
-    """重复导入（换文件重导）不覆盖首次来源——预设清单首见即定档。"""
+async def test_board_source_replaces_private_import_source(db, monkeypatch):
+    """同一游戏进入公开热销榜后，种子标记只保留公开来源。"""
     await _seed_account(db)
     _mock_primary(monkeypatch, PRIMARY)
     from app.domains.games.models import PresetGame
+    from app.domains.games.preset import record_board
 
-    await wishlist_service.add_pool_items([620], source="上传优先.json")
-    await wishlist_service.add_pool_items([620], source="visual_novel_synced.json")
+    await wishlist_service.add_pool_items([620], source="用户清单.csv")
+    await record_board([620])
 
     async with db() as session:
         row = await session.get(PresetGame, 620)
-    assert row is not None and row.source == "上传优先.json"
+    assert row is not None and row.source == "topsellers"
+
+
+@pytest.mark.asyncio
+async def test_empty_import_source_is_not_recorded(db):
+    """空来源不生成无法解释的预设记录。"""
+    from sqlalchemy import select
+
+    from app.domains.games.models import PresetGame
+    from app.domains.games.preset import record_imported
+
+    assert await record_imported([620], source="") == 0
+
+    async with db() as session:
+        rows = (await session.execute(select(PresetGame))).scalars().all()
+    assert rows == []
 
 
 @pytest.mark.asyncio

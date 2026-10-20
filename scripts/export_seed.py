@@ -1,9 +1,8 @@
-"""资产种子导出：生产库公共切片 → assets/seed/holdexar_seed.db。
+"""资产种子导出：固定市场数据切片 → assets/seed/holdexar_seed.db。
 
-白名单制：只读六块公共数据（games 人工策划列（含 name 身份列）/ 预设游戏池
-清单 / games 主档目录行 + game_current_prices 现价快照 / game_tags 玩家标签 /
-game_price_history 全量价格历史 / bundles + bundle_region_prices 捆绑包），
-结构上不可能带出凭据表。**不含汇率**：由 rates 域免 Key Provider 现抓回填。
+只读游戏目录、价格、标签、捆绑包和策划名单，不读取账号、账单、设置或凭据表。
+预设清单仅导出同时有公开榜单来源记录的热销榜条目；本机文件导入来源留在本机。**不含汇率**：由
+rates 域免 Key Provider 现抓回填。
 独立分发（按需下载），启动时并入：各通道按种子版本独立合并（老用户库也并入）。
 
 用法（发布机）：
@@ -15,9 +14,8 @@ game_price_history 全量价格历史 / bundles + bundle_region_prices 捆绑包
 (appid, region_code) 原样带出；price_history 依赖源库 ux_gph_snapshot 唯一索引
 （六段逻辑键含 COALESCE(price,0)）天然无重复，种子侧建同款索引。
 
-人工列名单与预设池随种子下发完整 games 行：合并侧对本地缺行的 appid 直接
-落行（name 取种子），新用户开箱即有初始目录；名单行 updated_at 非空，不被
-孤儿补抓层捡去爬——监控范围只由愿望单驱动，名单 ≠ 监控。
+人工列名单与公开热销榜预设随种子下发完整 games 行：合并侧对本地缺行的 appid
+直接落行（name 取种子）。种子并入只补游戏目录，不创建账户或监控来源。
 
 现价快照（games_catalog + game_current_prices）：库内有现价的游戏整表带出
 （主档最小列集 + 全区现价行），新用户开箱即有全量目录与现价，找游戏页
@@ -181,17 +179,23 @@ def export(db_path: Path, out_path: Path) -> dict:
             "WHERE xgp_tier IS NOT NULL OR epic_date IS NOT NULL OR is_epic = 1 "
             "OR is_hb = 1 OR hb_data IS NOT NULL OR series_id IS NOT NULL"
         ).fetchall()
-        # 预设游戏池（老源库缺表 = 切片为空）：无关名的行不进种子（并入侧落完整
-        # games 行必须带 name）；名字以库内爬取结果为准、登记时带回的名字兜底
+        # 预设池只导出有当前榜单来源佐证的公开热销榜条目。
         has_preset = src.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='preset_games'"
         ).fetchone() is not None
+        has_monitor_sources = src.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='monitor_sources'"
+        ).fetchone() is not None
         preset: list[tuple] = []
-        if has_preset:
+        if has_preset and has_monitor_sources:
             preset = src.execute(
                 "SELECT p.appid, COALESCE(g.name, p.name), p.source, p.added_at "
                 "FROM preset_games p LEFT JOIN games g ON g.appid = p.appid "
-                "WHERE TRIM(COALESCE(g.name, p.name, '')) != '' "
+                "WHERE p.source = 'topsellers' "
+                "AND EXISTS (SELECT 1 FROM monitor_sources m "
+                "WHERE m.target_type = 'game' AND m.target_id = p.appid "
+                "AND m.source = 'board' AND m.active = 1) "
+                "AND TRIM(COALESCE(g.name, p.name, '')) != '' "
                 "ORDER BY p.appid"
             ).fetchall()
         # 现价快照（同缺表语义）：有现价的游戏整表带出——主档目录行（最小

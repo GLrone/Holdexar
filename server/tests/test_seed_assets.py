@@ -283,6 +283,8 @@ def test_export_seed_whitelist_and_dedup(tmp_path: Path) -> None:
             is_epic INTEGER, is_hb INTEGER, hb_data TEXT, series_id TEXT);
         CREATE TABLE preset_games (
             appid INTEGER PRIMARY KEY, name TEXT, source TEXT, added_at TEXT);
+        CREATE TABLE monitor_sources (
+            target_type TEXT, target_id INTEGER, source TEXT, active INTEGER);
         CREATE TABLE game_price_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             appid INTEGER, region_code TEXT, currency TEXT, price INTEGER,
@@ -309,14 +311,19 @@ def test_export_seed_whitelist_and_dedup(tmp_path: Path) -> None:
         "INSERT INTO games VALUES (997202, NULL, NULL, NULL, 0, 0, NULL, NULL)"
     )
     con.execute("INSERT INTO steam_accounts VALUES ('765', 'secret')")
-    # 预设池：已在库行（名字以库内为准）+ 未在库但登记时带名 + 两处都无名（不得进种子）
+    # 种子预设必须同时具备榜单标签和有效公开榜单来源。
     con.executemany(
         "INSERT INTO preset_games (appid, name, source, added_at) VALUES (?, ?, ?, ?)",
         [
             (997201, "旧登记名", "上传优先.json", "2026-01-07 00:00:00"),
             (997203, "文件带来的名", "上传优先.json", "2026-01-07 00:00:00"),
             (997202, None, "视觉小说.json", "2026-01-07 00:00:00"),
+            (997204, "热销榜游戏", "topsellers", "2026-01-07 00:00:00"),
+            (997205, "旧来源误标榜单", "topsellers", "2026-01-07 00:00:00"),
         ],
+    )
+    con.execute(
+        "INSERT INTO monitor_sources VALUES ('game', 997204, 'board', 1)"
     )
     # 价格历史整表带出（老源库缺新列按 NULL 带出）
     con.executemany(
@@ -353,14 +360,13 @@ def test_export_seed_whitelist_and_dedup(tmp_path: Path) -> None:
         assert s.execute(
             "SELECT name, xgp_tier, is_epic, hb_data FROM games_curated"
         ).fetchall() == [("正版名A", "GPU", 1, "HB24-1")]
-        # 预设池：库内名字优先（COALESCE）、登记名兜底；两处无名的行不进种子
+        # 预设池只下发公开热销榜来源，私人导入来源不得进入种子。
         assert s.execute(
             "SELECT appid, name, source FROM preset_games ORDER BY appid"
         ).fetchall() == [
-            (997201, "正版名A", "上传优先.json"),
-            (997203, "文件带来的名", "上传优先.json"),
+            (997204, "热销榜游戏", "topsellers"),
         ]
-        assert meta["rows_preset"] == "2"
+        assert meta["rows_preset"] == "1"
         # 价格历史整表带出（种子=完整库镜像）；老源库缺列按 NULL 带出
         assert meta["rows_price_history"] == "2"
         hist = s.execute(
