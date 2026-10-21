@@ -36,11 +36,17 @@ def test_probe_url_same_host_and_path_as_production():
 
 
 class _Resp:
-    def __init__(self, status_code: int = 200, payload=None, non_json: bool = False):
+    def __init__(
+        self, status_code: int = 200, payload=None, non_json: bool = False,
+        raw_text: str | None = None,
+    ):
         self.status_code = status_code
         self._payload = payload
         self._non_json = non_json
-        self.text = "not json at all" if non_json else json.dumps(payload or {})
+        if raw_text is not None:
+            self.text = raw_text
+        else:
+            self.text = "not json at all" if non_json else json.dumps(payload or {})
 
     def json(self):
         if self._non_json:
@@ -125,3 +131,48 @@ async def test_transport_error_is_target_service_failed(monkeypatch):
     result = await _probe()
     assert result.ok is False
     assert result.detail.startswith(H.TARGET_SERVICE_FAILED)
+
+
+@pytest.mark.asyncio
+async def test_gateway_502_with_failed_control_probe_is_node_tunnel_failed(monkeypatch):
+    _patch(monkeypatch, resp=_Resp(502, raw_text=""))
+
+    async def _control_fail(*a, **kw):
+        return H.ProbeResult("1|probe", False, None, "内核探测失败（HTTP 503）", valid=True)
+
+    monkeypatch.setattr(H, "probe_node", _control_fail)
+    result = await _probe()
+    assert result.ok is False
+    assert result.http_status == 502
+    assert result.attribution == H.ATTR_NODE
+    assert result.detail.startswith(H.NODE_TUNNEL_FAILED)
+
+
+@pytest.mark.asyncio
+async def test_gateway_502_with_passing_control_probe_is_target_service_failed(monkeypatch):
+    _patch(monkeypatch, resp=_Resp(502, raw_text=""))
+
+    async def _control_ok(*a, **kw):
+        return H.ProbeResult("1|probe", True, 18, "", valid=True)
+
+    monkeypatch.setattr(H, "probe_node", _control_ok)
+    result = await _probe()
+    assert result.ok is False
+    assert result.http_status == 502
+    assert result.attribution == H.ATTR_TARGET
+    assert result.detail.startswith(H.TARGET_SERVICE_FAILED)
+
+
+@pytest.mark.asyncio
+async def test_gateway_502_with_invalid_control_probe_is_uncertain_failure(monkeypatch):
+    _patch(monkeypatch, resp=_Resp(502, raw_text=""))
+
+    async def _control_invalid(*a, **kw):
+        return H.ProbeResult("1|probe", False, None, "控制器请求异常：ConnectError", valid=False)
+
+    monkeypatch.setattr(H, "probe_node", _control_invalid)
+    result = await _probe()
+    assert result.ok is False
+    assert result.http_status == 502
+    assert result.attribution == H.ATTR_UNCERTAIN
+    assert result.detail.startswith(H.UNCERTAIN_FAILURE)

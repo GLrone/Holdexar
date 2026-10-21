@@ -43,10 +43,21 @@ async def _writeback_production_evidence(
         if not node_id:
             continue
         agg = by_node.setdefault(node_id, {"ok": 0, "noresp": 0})
-        ok = int(row.get("success") or 0) + int(row.get("e429") or 0)             + int(row.get("e5xx") or 0)
+        if row.get("uncertain"):
+            continue
+        ok = (
+            int(row.get("success") or 0)
+            + int(row.get("e429") or 0)
+            + int(row.get("e5xx") or 0)
+        )
+        tunnel_failed = (
+            int(row.get("timeout") or 0)
+            + int(row.get("connect_error") or 0)
+            + int(row.get("tunnel_error") or 0)
+        )
         if ok > 0:
             agg["ok"] += 1
-        elif int(row.get("timeout") or 0) + int(row.get("connect_error") or 0) > 0:
+        elif tunnel_failed > 0:
             agg["noresp"] += 1
     if not by_node:
         return
@@ -142,8 +153,6 @@ async def write_run_exits(
 async def run_exit_rows(run_id: int) -> list[dict]:
     """读某次作业的出口账本（按出口聚合，供报表/排障）。"""
     from sqlalchemy import select
-
-    from app.core.database import get_session_factory
 
     async with get_session_factory()() as session:
         rows = (

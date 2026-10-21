@@ -43,6 +43,7 @@ from app.domains.proxypool.runtime import (
     controller_endpoint_of,
     current_global_selection,
     current_runtime_proxy_url,
+    invalidate_lane_plan,
     prepare_runtime_config,
     reconcile,
     restore_selection,
@@ -699,6 +700,7 @@ async def ensure_pool_runtime(
             await eligible_nodes(session), delays=await latest_l0_delays(session)
         )
         config = prepare_runtime_config(data_dir, lanes=len(slots) or None)
+        invalidate_lane_plan(data_dir)
         runtime.stop()
         status = runtime.start(exe_path, str(config), inject_lanes=False)
         base = status["controllerUrl"]

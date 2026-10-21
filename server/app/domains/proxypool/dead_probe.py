@@ -18,9 +18,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import WritePriority, write_gate
 from app.core.logging import log_event
+from app.domains.proxies import clash_manager
+from app.domains.proxies.kernel_process import (
+    PRECHECK_ADMISSION,
+    KernelPrecheckError,
+    confirm_config_text,
+    spawn_kernel,
+)
+from app.domains.proxies.runtime_config import validate_execution_config
 from app.domains.proxypool.models import ProxyNode
 from app.domains.proxypool.state import NODE_DEAD, NODE_RETIRED
-from app.domains.proxies.runtime_config import validate_geo_free_config
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +53,15 @@ class RecoveredNode:
     subscription_id: int | None = None
 
 
+# 恢复探测结论的归因：只有 NODE 属于节点失败证据，其余都是「这一探没测到节点」。
+CAUSE_NODE = "node"
+CAUSE_DEPENDENCY = "dependency"
+CAUSE_CONFIG = "config"
+CAUSE_KERNEL = "kernel"
+CAUSE_CONTROLLER = "controller"
+CAUSE_INFRA = "infra"
+
+
 @dataclass(frozen=True)
 class ProbeOutcome:
     node_id: str
@@ -54,6 +70,7 @@ class ProbeOutcome:
     delay_ms: int | None
     detail: str
     node_failure: bool = True
+    cause: str = CAUSE_NODE
 
 
 def _free_port(preferred: int) -> int | None:
@@ -106,7 +123,7 @@ def _recovery_bundles(
                 detail = f"{detail}；{source_error}"
             rejected.append(ProbeOutcome(
                 node.node_id, node.runtime_name, False, None,
-                detail, node_failure=False,
+                detail, node_failure=False, cause=CAUSE_DEPENDENCY,
             ))
             continue
         ready.append(node)
@@ -151,7 +168,7 @@ def _render_config(nodes: list[RecoveredNode], *, controller_port: int, secret: 
         "rules": ["MATCH,DIRECT"],
     }
     text = yaml.safe_dump(doc, allow_unicode=True, sort_keys=False)
-    validate_geo_free_config(text)
+    validate_execution_config(text)
     return text, ports
 
 
@@ -199,9 +216,10 @@ async def probe_out_of_pool_nodes(
     if not probe_nodes:
         return rejected
 
-    def unavailable(detail: str) -> list[ProbeOutcome]:
+    def unavailable(detail: str, cause: str = CAUSE_INFRA) -> list[ProbeOutcome]:
         return rejected + [
-            ProbeOutcome(n.node_id, n.runtime_name, False, None, detail, node_failure=False)
+            ProbeOutcome(n.node_id, n.runtime_name, False, None, detail,
+                         node_failure=False, cause=cause)
             for n in probe_nodes
         ]
 
@@ -214,21 +232,38 @@ async def probe_out_of_pool_nodes(
     proc: subprocess.Popen | None = None
     base_url = f"http://127.0.0.1:{controller_port}"
     try:
-        text, _ports = _render_config(
-            probe_nodes, controller_port=controller_port, secret=secret,
-            listener_base=listener_base, bundle=bundle,
-        )
+        try:
+            text, _ports = _render_config(
+                probe_nodes, controller_port=controller_port, secret=secret,
+                listener_base=listener_base, bundle=bundle,
+            )
+        except ValueError as exc:
+            return unavailable(f"恢复探测配置未通过准入：{exc}", CAUSE_CONFIG)
         work_dir.mkdir(parents=True, exist_ok=True)
         config_path = work_dir / "config.yaml"
         config_path.write_text(text, encoding="utf-8")
+        try:
+            clash_manager.validate_config(exe_path, str(config_path), work_dir)
+            confirm_config_text(config_path, text)
+        except KernelPrecheckError as exc:
+            log_event(
+                logger,
+                "出池节点恢复探测的内核预检未通过，本轮跳过",
+                tag="跳过",
+                level=logging.WARNING,
+                detail={"预检类型": exc.kind, "原因": str(exc)},
+            )
+            cause = CAUSE_CONFIG if exc.kind == PRECHECK_ADMISSION else CAUSE_KERNEL
+            return unavailable(f"临时内核预检未通过（{exc.kind}）：{exc}", cause)
         log_file = open(work_dir / "probe.log", "ab")
-        proc = subprocess.Popen(
-            [exe_path, "-d", str(work_dir), "-f", str(config_path)],
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-        )
+        try:
+            proc = spawn_kernel(
+                exe_path, ["-d", str(work_dir), "-f", str(config_path)], log_file=log_file,
+            )
+        except OSError as exc:
+            return unavailable(f"临时内核无法启动：{type(exc).__name__}", CAUSE_KERNEL)
         if not await _wait_controller(base_url, secret, STARTUP_WAIT):
-            return unavailable("临时内核控制器未就绪")
+            return unavailable("临时内核控制器未就绪", CAUSE_CONTROLLER)
         from app.domains.proxypool.health import PROBE_CONCURRENCY
 
         semaphore = asyncio.Semaphore(PROBE_CONCURRENCY)
@@ -239,6 +274,7 @@ async def probe_out_of_pool_nodes(
             return ProbeOutcome(
                 node.node_id, node.runtime_name, result.ok, result.delay_ms, result.detail,
                 node_failure=result.valid,
+                cause=CAUSE_NODE if result.valid else CAUSE_CONTROLLER,
             )
 
         return rejected + list(await asyncio.gather(*(probe(node) for node in probe_nodes)))
@@ -335,7 +371,8 @@ async def recover_dead_nodes_self_hosted(
     unavailable_sources: dict[int | None, str] = {None: "节点来源不存在"}
     source_failures = [
         ProbeOutcome(node.node_id, node.runtime_name, False, None,
-                     unavailable_sources[node.subscription_id], node_failure=False)
+                     unavailable_sources[node.subscription_id], node_failure=False,
+                     cause=CAUSE_DEPENDENCY)
         for node in nodes if node.subscription_id in unavailable_sources
     ]
     targets = [node for node in nodes if node.subscription_id not in unavailable_sources]

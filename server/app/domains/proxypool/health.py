@@ -65,8 +65,15 @@ PROBE_CONCURRENCY = 20
 # L1 失败必须能区分「节点/选择失败」与「目标服务故障」——否则会建立一个
 # 「公网 IP 回显服务健康状态决定代理池健康」的错误系统。
 NODE_PROBE_FAILED = "NODE_PROBE_FAILED"
+NODE_TUNNEL_FAILED = "NODE_TUNNEL_FAILED"
 TARGET_SERVICE_FAILED = "TARGET_SERVICE_FAILED"
+UNCERTAIN_FAILURE = "UNCERTAIN_FAILURE"
 INVALID_IP_RESPONSE = "INVALID_IP_RESPONSE"
+
+ATTR_NODE = "node_tunnel_failed"
+ATTR_TARGET = "target_service_failed"
+ATTR_UNCERTAIN = "uncertain_failure"
+TUNNEL_FAILURE_STATUS = 502
 
 # ── L2：生产业务（StoreBrowse）────────────────────────────────────
 L2_LEVEL = "L2"
@@ -830,6 +837,7 @@ class BusinessResult:
     final_price_in_cents: int | None
     detail: str
     latency_ms: int | None
+    attribution: str | None = None
 
 
 @dataclass(frozen=True)
@@ -841,6 +849,42 @@ class BusinessOutcome:
     final_price_in_cents: int | None
     detail: str
     latency_ms: int | None
+    attribution: str | None = None
+
+
+async def _attribute_gateway_502(
+    controller_url: str,
+    secret: str,
+    runtime_name: str,
+    *,
+    target_url: str,
+    body: str,
+    timeout: float,
+) -> tuple[str, str]:
+    """区分上游业务返回 502 与本地内核代理入口无法建隧返回的空体 502。"""
+    if body.strip():
+        return f"{TARGET_SERVICE_FAILED}: HTTP {TUNNEL_FAILURE_STATUS}", ATTR_TARGET
+    control_timeout_ms = max(1000, min(DEFAULT_TIMEOUT_MS, int(timeout * 1000)))
+    control_timeout = max(2.0, min(timeout, control_timeout_ms / 1000.0 + 2.0))
+    control = await probe_node(
+        controller_url,
+        secret,
+        runtime_name,
+        url=target_url or PROBE_TARGET_URL,
+        timeout_ms=control_timeout_ms,
+        client_timeout=control_timeout,
+    )
+    if control.ok:
+        return f"{TARGET_SERVICE_FAILED}: HTTP {TUNNEL_FAILURE_STATUS}", ATTR_TARGET
+    if control.valid:
+        return (
+            f"{NODE_TUNNEL_FAILED}: HTTP {TUNNEL_FAILURE_STATUS}（{control.detail}）",
+            ATTR_NODE,
+        )
+    return (
+        f"{UNCERTAIN_FAILURE}: HTTP {TUNNEL_FAILURE_STATUS}（{control.detail}）",
+        ATTR_UNCERTAIN,
+    )
 
 
 def _validate_business(payload, appid: int) -> tuple[bool, str, int | None]:
@@ -904,10 +948,18 @@ async def probe_business(
     if status is None:
         return BusinessResult(runtime_name, False, None, None,
                               f"{TARGET_SERVICE_FAILED}: {exc}", None)
+    if status == TUNNEL_FAILURE_STATUS:
+        detail, attr = await _attribute_gateway_502(
+            controller_url, secret, runtime_name,
+            target_url=target, body=text, timeout=timeout,
+        )
+        return BusinessResult(
+            runtime_name, False, status, None, detail, latency_ms, attribution=attr,
+        )
     if status != 200:
         return BusinessResult(runtime_name, False, status, None,
                               f"{TARGET_SERVICE_FAILED}: HTTP {status}",
-                              latency_ms)
+                              latency_ms, attribution=ATTR_TARGET)
     try:
         payload = json.loads(text)
     except ValueError:
@@ -950,10 +1002,18 @@ async def probe_business_lane(
     if status is None:
         return BusinessResult(runtime_name, False, None, None,
                               f"{TARGET_SERVICE_FAILED}: {exc}", None)
+    if status == TUNNEL_FAILURE_STATUS:
+        detail, attr = await _attribute_gateway_502(
+            controller_url, secret, runtime_name,
+            target_url=target, body=text, timeout=timeout,
+        )
+        return BusinessResult(
+            runtime_name, False, status, None, detail, latency_ms, attribution=attr,
+        )
     if status != 200:
         return BusinessResult(runtime_name, False, status, None,
                               f"{TARGET_SERVICE_FAILED}: HTTP {status}",
-                              latency_ms)
+                              latency_ms, attribution=ATTR_TARGET)
     try:
         payload = json.loads(text)
     except ValueError:
@@ -992,13 +1052,17 @@ async def _commit_business_wave(
                 .execution_options(populate_existing=True)
             )
         for node, result in probed:
-            # 只有有效业务响应能晋升；收到 HTTP 响应说明请求已到达目标服务，
-            # 包括 5xx 在内都不作为节点故障证据。
+            # 只有有效业务响应能晋升；目标服务返回错误或归因不确定不罚节点，
+            # 本地代理入口建隧失败与请求超时/连不上计入节点失败证据。
             if result.ok:
                 probe_ok: bool | None = True
+            elif result.attribution == ATTR_NODE or result.detail.startswith(NODE_TUNNEL_FAILED):
+                probe_ok = False
+            elif result.attribution in (ATTR_TARGET, ATTR_UNCERTAIN):
+                probe_ok = None
             elif result.http_status is not None:
                 probe_ok = None
-            elif result.detail.startswith(NODE_PROBE_FAILED):
+            elif result.detail.startswith((NODE_PROBE_FAILED, UNCERTAIN_FAILURE)):
                 probe_ok = None
             else:  # 经节点发请求超时/连不上：节点失败证据
                 probe_ok = False
@@ -1096,6 +1160,7 @@ async def business_check_pool(
             final_price_in_cents=result.final_price_in_cents,
             detail=result.detail,
             latency_ms=result.latency_ms,
+            attribution=result.attribution,
         ) for node, result in probed)
         await _commit_business_wave(
             session, probed, now=now, run_id=run_id, channel=channel,
