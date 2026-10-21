@@ -182,18 +182,29 @@ def _purpose_key(purpose: str, data_dir: str) -> bytes:
 
 
 def _candidate_keys(purpose: str, data_dir: str) -> list[bytes]:
-    """解密候选密钥：当前主密钥优先，non-legacy 模式追加 legacy 兜底。
+    """解密候选密钥：当前主密钥 → 换钥过渡记录里的旧主密钥 → legacy 兜底。
 
-    兜底只用于覆盖换钥崩溃窗口（新 DMK 已落盘、旧密文尚未迁完）。口令模式
-    未解锁时 `_purpose_key` 直接抛错，不会走到 legacy——锁定态不得绕过。
+    顺序即优先级：正常路径第一把就成功。后两把只覆盖换钥崩溃窗口——
+    过渡记录（`secret.master.staging`）保存旧主密钥，任意方向被打断后
+    库内旧密文仍可解；legacy 兜底是历史行为，过渡记录缺席时仍然有用。
+
+    口令模式未解锁时 `_purpose_key` 直接抛错，不会走到后续候选——锁定态
+    不得绕过。
     """
     keys = [_purpose_key(purpose, data_dir)]
+    root = Path(data_dir)
     try:
-        mode = keyring.mode_of(Path(data_dir))
+        staged = keyring.staging_master(root)
+    except keyring.KeyringError:
+        staged = None
+    if staged is not None:
+        keys.append(derive_purpose_key(staged, purpose))
+    try:
+        mode = keyring.mode_of(root)
     except keyring.KeyringError as exc:
         raise SecretBoxError(str(exc)) from exc
     if mode != keyring.MODE_LEGACY:
-        keys.append(derive_purpose_key(legacy_master(Path(data_dir)), purpose))
+        keys.append(derive_purpose_key(legacy_master(root), purpose))
     return keys
 
 

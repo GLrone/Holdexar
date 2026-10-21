@@ -325,6 +325,139 @@ def restore_record(data_dir: Path, raw: bytes | None) -> None:
         path.chmod(0o600)
 
 
+# ── 换钥过渡记录（崩溃恢复的唯一依据）────────────────────────
+#
+# 换钥要同时改两处：密钥文件与库内密文。两者不是同一个原子事务，中途被
+# 强杀必然出现「密钥文件已是新的、库内密文还是旧的」。旧实现只对 legacy
+# 有兜底（legacy 主密钥可由本机材料重算），dpapi / passphrase 之间的任意
+# 方向都会永久解不开。
+#
+# 过渡记录把**旧主密钥**用与当前模式同等的强度封装后落盘，换钥期间与
+# 密钥文件并存。崩溃后无论库内密文归哪一边，都能解开；迁移完成后删除。
+# 记录本身不含明文密钥：dpapi 模式走系统凭据，passphrase 模式走口令派生
+# 的 KEK，legacy 模式不需要（可重算）。
+STAGING_FILE = "secret.master.staging"
+
+# 过渡记录的用途串：用**新主密钥**派生独立子密钥封装旧主密钥。
+# 新主密钥一旦落盘，任何后续进程都能自行解开，不依赖用户口令，
+# 也不依赖切换前的防护模式。
+_STAGING_INFO = b"holdexar:keyring:rekey-staging:v1"
+
+
+def _staging_path(data_dir: Path) -> Path:
+    return Path(data_dir) / STAGING_FILE
+
+
+def wrap_staging(old_master: bytes, new_master: bytes) -> dict:
+    """用新主密钥封装旧主密钥（AES-256-GCM，独立用途子密钥）。"""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    key = HKDF(
+        algorithm=hashes.SHA256(), length=_KEY_BYTES, salt=None, info=_STAGING_INFO
+    ).derive(new_master)
+    nonce = secrets.token_bytes(_NONCE_BYTES)
+    sealed = AESGCM(key).encrypt(nonce, old_master, None)
+    return {
+        "v": _FILE_VERSION,
+        "kind": "rekey-staging",
+        "nonce": _b64(nonce),
+        "ct": _b64(sealed),
+    }
+
+
+def unwrap_staging(record: dict, new_master: bytes) -> bytes | None:
+    """解出旧主密钥；记录不是本格式或新密钥不符时返回 None。"""
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    if record.get("kind") != "rekey-staging":
+        return None
+    try:
+        nonce = _unb64(str(record["nonce"]))
+        sealed = _unb64(str(record["ct"]))
+    except (KeyError, ValueError):
+        return None
+    key = HKDF(
+        algorithm=hashes.SHA256(), length=_KEY_BYTES, salt=None, info=_STAGING_INFO
+    ).derive(new_master)
+    try:
+        return AESGCM(key).decrypt(nonce, sealed, None)
+    except InvalidTag:
+        return None
+
+
+def write_staging(data_dir: Path, record: dict) -> None:
+    """落过渡记录（先写临时文件再替换：断电时要么旧要么新，不留半截）。"""
+    data_dir = Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    path = _staging_path(data_dir)
+    tmp = path.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+        if sys.platform != "win32":
+            tmp.chmod(0o600)
+        tmp.replace(path)
+    except OSError as exc:
+        raise KeyringError(f"换钥过渡记录写入失败：{exc}") from exc
+
+
+def read_staging(data_dir: Path) -> dict | None:
+    """读取过渡记录（不存在返回 None；损坏抛 KeyringError）。"""
+    path = _staging_path(data_dir)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        record = json.loads(text)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise KeyringError(f"换钥过渡记录损坏：{path}") from exc
+    return record if isinstance(record, dict) else None
+
+
+def remove_staging(data_dir: Path) -> None:
+    """迁移完成后删除过渡记录。"""
+    _staging_path(data_dir).unlink(missing_ok=True)
+
+
+def staging_master(data_dir: Path, passphrase: str | None = None) -> bytes | None:
+    """从过渡记录解出旧主密钥；解不出返回 None（不抛）。
+
+    过渡记录用**当前**主密钥封装（见 `wrap_staging`），因此正常情况下
+    不需要口令——`passphrase` 只为兼容早期用旧模式封装的记录。
+    """
+    record = read_staging(data_dir)
+    if not record:
+        return None
+    if record.get("kind") == "rekey-staging":
+        try:
+            current = resolve_dmk(data_dir)
+        except (KeyringError, KeyLockedError):
+            return None
+        return unwrap_staging(record, current)
+    # 兼容旧格式：按记录自带的 mode 解
+    mode = str(record.get("mode") or "")
+    try:
+        if mode == MODE_LEGACY:
+            return _legacy_master(data_dir)
+        if mode == MODE_DPAPI:
+            return _unwrap_dpapi(record)
+        if mode == MODE_PASSPHRASE:
+            secret = passphrase
+            if secret is None and _unlocked_key is not None:
+                return _unlocked_key
+            if secret is None:
+                return None
+            return _unwrap_passphrase(record, secret)
+    except (KeyringError, KeyLockedError):
+        return None
+    return None
+
+
 # ── DPAPI（ctypes 直调，避免引入 pywin32 增大打包体积）──────
 
 
@@ -380,6 +513,7 @@ __all__ = [
     "MODE_LEGACY",
     "MODE_PASSPHRASE",
     "MODES",
+    "STAGING_FILE",
     "KeyLockedError",
     "KeyringError",
     "dpapi_available",
@@ -388,14 +522,20 @@ __all__ = [
     "lock",
     "mode_of",
     "read_record",
+    "read_staging",
     "remove_record",
+    "remove_staging",
     "reset_state",
     "resolve_dmk",
     "restore_record",
     "snapshot_record",
+    "staging_master",
     "status",
     "unlock",
+    "unwrap_staging",
     "wrap_dpapi",
     "wrap_passphrase",
+    "wrap_staging",
     "write_record",
+    "write_staging",
 ]
