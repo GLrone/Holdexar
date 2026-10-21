@@ -43,9 +43,22 @@ from app.domains.proxies.kernel_release import (
 )
 # 运行配置生成与节点依赖解析的唯一实现在 runtime_config；本模块只做转发，
 # 使 clash_manager 保持「内核管理」这一处引用面（订阅侧与池侧共用同一实现）。
+from app.domains.proxies.kernel_process import (
+    PRECHECK_ADMISSION,
+    PRECHECK_CHANGED,
+    PRECHECK_REJECTED,
+    PRECHECK_TIMEOUT,
+    PRECHECK_UNLAUNCHABLE,
+    KernelPrecheckError,
+    confirm_config_text,
+    run_kernel_cli,
+    spawn_kernel,
+)
 from app.domains.proxies.runtime_config import (  # noqa: F401 —— 对外契约
     render_subscription_config,
+    PROBE_LANE_GROUP_PREFIX,
     resolve_node_dependencies,
+    validate_execution_config,
     validate_geo_free_config,
 )
 
@@ -616,10 +629,7 @@ def download_kernel_linux(data_dir: Path) -> dict:
 
 def kernel_version(exe_path: Path) -> str | None:
     try:
-        result = subprocess.run(
-            [str(exe_path), "-v"], capture_output=True, timeout=10,
-            encoding="utf-8", errors="replace",
-        )
+        result = run_kernel_cli(exe_path, ["-v"], timeout=10)
         first = (result.stdout or result.stderr).splitlines()
         return first[0] if first else None
     except Exception:  # noqa: BLE001
@@ -706,22 +716,33 @@ CONFIG_TEST_TIMEOUT = 15.0
 
 
 def validate_config(exe_path: str, config_path: str, work_dir: Path) -> None:
-    """启动前校验运行配置，拒载时抛错，超时交由启动检查确认。"""
-    validate_geo_free_config(Path(config_path).read_text(encoding="utf-8", errors="ignore"))
+    """启动前校验运行配置：先静态准入再跑内核 `-t`；任何失败都抛 `KernelPrecheckError`。"""
+    config_file = Path(config_path)
+    raw = config_file.read_bytes()
     try:
-        result = subprocess.run(
-            [exe_path, "-t", "-f", config_path, "-d", str(work_dir)],
-            capture_output=True, timeout=CONFIG_TEST_TIMEOUT,
-            encoding="utf-8", errors="replace",
+        validate_execution_config(raw.decode("utf-8", errors="ignore"))
+    except KernelPrecheckError:
+        raise
+    except ValueError as exc:
+        raise KernelPrecheckError(PRECHECK_ADMISSION, str(exc)) from None
+    try:
+        result = run_kernel_cli(
+            exe_path, ["-t", "-f", config_path, "-d", str(work_dir)],
+            timeout=CONFIG_TEST_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        log_event(
-            logger,
-            "内核配置校验超时，继续检查启动结果",
-            tag="跳过",
-            level=logging.WARNING,
+        raise KernelPrecheckError(
+            PRECHECK_TIMEOUT,
+            f"内核配置校验超时（{CONFIG_TEST_TIMEOUT}s），禁止启动",
+        ) from None
+    except OSError as exc:
+        raise KernelPrecheckError(
+            PRECHECK_UNLAUNCHABLE, f"内核无法执行：{type(exc).__name__}",
+        ) from None
+    if config_file.read_bytes() != raw:
+        raise KernelPrecheckError(
+            PRECHECK_CHANGED, "运行配置在预检期间被改动，拒绝启动",
         )
-        return
     if result.returncode == 0:
         return
     lines = [
@@ -730,12 +751,14 @@ def validate_config(exe_path: str, config_path: str, work_dir: Path) -> None:
         if "level=error" in line
     ]
     detail = "；".join(lines[:5]) or f"退出码 {result.returncode}"
-    raise ValueError(f"内核拒绝配置（-t 校验未通过）：{detail}")
+    raise KernelPrecheckError(
+        PRECHECK_REJECTED, f"内核拒绝配置（-t 校验未通过）：{detail}",
+    )
 
 
 def _validate_config_text(exe_path: str, text: str, work_dir: Path) -> None:
     """Validate the final in-memory configuration without replacing a live file."""
-    validate_geo_free_config(text)
+    validate_execution_config(text)
     with tempfile.TemporaryDirectory(prefix=".mihomo-config-check-", dir=work_dir) as folder:
         candidate = Path(folder) / "config.yaml"
         candidate.write_text(text, encoding="utf-8")
@@ -791,7 +814,7 @@ def _subscription_view(config_text: str) -> dict | None:
 # （绕过规则引擎与 GLOBAL）——节点检测因此无需切 selector、无需切 mode，可
 # PROBE_LANE_COUNT 路并发。组用 include-all：成员随内核当前节点集自动变化，
 # 注入内容与订阅内容无关，配置比较时剥掉即可。
-PROBE_LANE_PREFIX = "HlProbeLane"
+PROBE_LANE_PREFIX = PROBE_LANE_GROUP_PREFIX
 PROBE_LANE_COUNT = 20
 # 端口从固定基址起确定性分配：同占用态 → 同端口。避开默认混合口/控制器段与
 # Windows 临时端口段（49152+，池内核 listener 落在那里）。
@@ -1290,7 +1313,7 @@ class ClashRuntime:
         running = self.status()["running"]
         if running and not force_restart:
             disk_text = Path(config_path).read_text(encoding="utf-8", errors="ignore")
-            validate_geo_free_config(disk_text)
+            validate_execution_config(disk_text)
             if not restart_if_changed:
                 # 已在跑：同订阅（或调用方未带归属）幂等返回；带了**不同**的
                 # 订阅 URL = 用户要求切换订阅，走下方完整启动
@@ -1342,6 +1365,7 @@ class ClashRuntime:
         tmp_path = Path(f"{config_path}.tmp")
         tmp_path.write_text(text, encoding="utf-8")
         tmp_path.replace(config_path)
+        confirm_config_text(config_path, text)
 
         self.port = parse_mixed_port(text)
         # 控制器经命令行参数下发（-ext-ctl / -secret）：优先级高于配置文件，
@@ -1356,11 +1380,11 @@ class ClashRuntime:
         # 异常只打日志不退出，没有这份日志这些失败完全不可见
         log_path = Path(config_path).parent / "kernel.log"
         log_file = open(log_path, "ab")  # noqa: SIM115 —— 句柄随子进程存活，父进程不持有
-        self.process = subprocess.Popen(
-            [exe_path, "-f", config_path, "-d", str(Path(config_path).parent),
+        self.process = spawn_kernel(
+            exe_path,
+            ["-f", config_path, "-d", str(Path(config_path).parent),
              "-ext-ctl", controller_addr, "-secret", self.secret],
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
+            log_file=log_file,
         )
         log_file.close()
         self.entry_ready = bool(
@@ -1449,7 +1473,7 @@ class ClashRuntime:
             if exe_path:
                 _validate_config_text(exe_path, text, Path(config_path).parent)
             else:
-                validate_geo_free_config(text)
+                validate_execution_config(text)
         except ValueError as exc:
             raise _ReloadRejected(str(exc)) from None
         tmp_path = Path(f"{config_path}.tmp")
@@ -1522,7 +1546,7 @@ class ClashRuntime:
             return {**status, "started": True, "reloaded": False}
 
         candidate_text = Path(config_path).read_text(encoding="utf-8", errors="ignore")
-        validate_geo_free_config(candidate_text)
+        validate_execution_config(candidate_text)
         same_sub = bool(sub_url and self.subscription_url == sub_url)
         if (
             same_sub
@@ -1543,6 +1567,10 @@ class ClashRuntime:
                 config_path, mixed_port=mixed_port, exe_path=exe_path,
             )
             wrote = True
+            try:
+                confirm_config_text(config_path, injected)
+            except KernelPrecheckError as exc:
+                raise _ReloadRejected(str(exc)) from None
             headers = {"Authorization": f"Bearer {self.secret}"} if self.secret else {}
             async with httpx.AsyncClient(timeout=15, headers=headers, trust_env=False) as client:
                 put = await client.put(

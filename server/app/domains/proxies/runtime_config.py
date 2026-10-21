@@ -1,4 +1,4 @@
-"""生成不消费地理数据的运行配置，并解析同订阅连接依赖。"""
+"""生成不消费地理数据的运行配置，解析同订阅连接依赖，并给最终运行配置做统一准入。"""
 from __future__ import annotations
 
 import copy
@@ -17,9 +17,6 @@ _DNS_RESOLVER_KEYS = frozenset({
     "nameserver", "default-nameserver", "proxy-server-nameserver", "direct-nameserver",
 })
 
-# 纯节点来源订阅（无内联节点）需要一个组来装载 provider，否则节点不会被加载。
-_PROVIDER_GROUP_NAME = "HlSubProviders"
-
 # 内核自己解析的内置逻辑节点：`dialer-proxy` 指向它们属于合法用法（走直连/
 # 拒绝），不经过订阅节点表，因此不做映射也不能判为「目标不存在」。
 BUILTIN_PROXY_NAMES = frozenset({
@@ -35,6 +32,20 @@ _GEO_RULE_TYPES = frozenset({
 })
 _LOGIC_RULE_TYPES = frozenset({"AND", "OR", "NOT"})
 _GEO_SELECTOR_PREFIXES = ("geosite:", "geoip:", "ip-asn:", "rule-set:")
+
+# 注入的探测 lane 组前缀：唯一允许使用 include-all 的执行组。
+PROBE_LANE_GROUP_PREFIX = "HlProbeLane"
+# 最终运行配置里允许存在的代理组类型：成员的选择只由程序决定。
+_EXECUTION_GROUP_TYPES = frozenset({"select", "relay"})
+# 来源订阅里可确定性降级为 select 的自动组（保留成员声明顺序，默认取首位）。
+_DETERMINISTIC_DOWNGRADE_TYPES = frozenset({"url-test", "fallback"})
+_GROUP_AUTONOMY_KEYS = (
+    "url", "interval", "lazy", "timeout", "max-failed-times", "expected-status",
+    "tolerance", "strategy", "filter", "exclude-filter", "exclude-type", "use",
+    "include-all", "include-all-proxies", "include-all-providers",
+)
+_GROUP_MEMBER_FILTER_KEYS = ("filter", "exclude-filter", "exclude-type")
+_EXTERNAL_UI_KEYS = ("external-ui", "external-ui-url", "external-ui-name")
 
 
 def _geo_selector(value: Any) -> bool:
@@ -76,6 +87,8 @@ def _geo_database_path(value: Any) -> bool:
     if not isinstance(value, str):
         return False
     name = PurePosixPath(value.replace("\\", "/")).name.lower()
+    if name in {"geoip.db", "geoip.metadb"}:
+        return True
     if name.endswith(".mmdb"):
         return True
     stem = name.removesuffix(".dat")
@@ -92,8 +105,7 @@ def _geo_database_reference(value: Any) -> bool:
     return _geo_database_path(path)
 
 
-def validate_geo_free_config(config: Mapping[str, Any] | str) -> None:
-    """Reject runtime configurations that make Mihomo consume geographic data."""
+def _parse_config(config: Mapping[str, Any] | str) -> Mapping[str, Any]:
     if isinstance(config, str):
         try:
             parsed = yaml.safe_load(config)
@@ -103,6 +115,12 @@ def validate_geo_free_config(config: Mapping[str, Any] | str) -> None:
         parsed = config
     if not isinstance(parsed, Mapping):
         raise ValueError("运行配置不是 YAML 映射")
+    return parsed
+
+
+def validate_geo_free_config(config: Mapping[str, Any] | str) -> None:
+    """Reject runtime configurations that make Mihomo consume geographic data."""
+    parsed = _parse_config(config)
 
     keys = {str(key).lower() for key in parsed}
     configured = sorted(keys.intersection(_GEO_CONFIG_KEYS))
@@ -122,6 +140,8 @@ def validate_geo_free_config(config: Mapping[str, Any] | str) -> None:
                 _geo_database_reference(provider.get(field)) for field in ("path", "url")
             ):
                 raise ValueError("节点来源指向地理数据库文件")
+
+    _validate_sniffer(parsed)
 
     dns = parsed.get("dns")
     if not isinstance(dns, Mapping):
@@ -163,6 +183,64 @@ def validate_geo_free_config(config: Mapping[str, Any] | str) -> None:
     fake_ip_filter = dns.get("fake-ip-filter")
     if _contains_geo_rule(fake_ip_filter) or _contains_geo_selector(fake_ip_filter):
         raise ValueError("DNS fake-ip-filter 使用地理数据规则")
+
+
+def _validate_sniffer(parsed: Mapping[str, Any]) -> None:
+    """Reject sniffer configurations that consume GeoSite data."""
+    sniffer = parsed.get("sniffer")
+    if not isinstance(sniffer, Mapping):
+        return
+    for field in ("force-domain", "skip-domain", "skip-src-address", "skip-dst-address"):
+        if _contains_geo_selector(sniffer.get(field)):
+            raise ValueError(f"sniffer.{field} 使用地理数据规则")
+
+
+def _configured(value: Any) -> bool:
+    return value not in (None, False, 0, "", [], {})
+
+
+def validate_external_resource_config(config: Mapping[str, Any] | str) -> None:
+    """Reject runtime configurations that let Mihomo fetch or update resources on its own."""
+    parsed = _parse_config(config)
+    if _configured(parsed.get("proxy-providers")):
+        raise ValueError("运行配置包含未展开的节点来源，节点必须由程序获取后写成具体节点")
+    for key in _EXTERNAL_UI_KEYS:
+        if _configured(parsed.get(key)):
+            raise ValueError(f"运行配置包含界面资源设置：{key}")
+
+
+def validate_group_autonomy(config: Mapping[str, Any] | str) -> None:
+    """Reject proxy groups through which Mihomo would probe or choose members by itself."""
+    parsed = _parse_config(config)
+    groups = parsed.get("proxy-groups")
+    if groups is None:
+        return
+    if not isinstance(groups, Sequence) or isinstance(groups, (str, bytes, bytearray)):
+        raise ValueError("运行配置的代理组形态不对")
+    for group in groups:
+        if not isinstance(group, Mapping):
+            raise ValueError("运行配置的代理组形态不对")
+        name = str(group.get("name") or "")
+        group_type = str(group.get("type") or "").lower()
+        if group_type not in _EXECUTION_GROUP_TYPES:
+            raise ValueError(
+                f"代理组 {name} 的类型 {group_type or '未知'} 会让内核自行决定出口"
+            )
+        probe_lane = group_type == "select" and name.startswith(PROBE_LANE_GROUP_PREFIX)
+        for key in _GROUP_AUTONOMY_KEYS:
+            if not _configured(group.get(key)):
+                continue
+            if probe_lane and key == "include-all" and group.get(key) is True:
+                continue
+            raise ValueError(f"代理组 {name} 含内核自主选路或探活设置：{key}")
+
+
+def validate_execution_config(config: Mapping[str, Any] | str) -> None:
+    """Admission for every final kernel configuration: geo data, outside resources, group autonomy."""
+    parsed = _parse_config(config)
+    validate_geo_free_config(parsed)
+    validate_external_resource_config(parsed)
+    validate_group_autonomy(parsed)
 
 
 def resolve_node_dependencies(
@@ -259,6 +337,15 @@ def render_node_bundle(
             item["dialer-proxy"] = visit(str(item["dialer-proxy"]))
         if is_group:
             members = list(item.get("proxies") or [])
+            group_type = str(item.get("type") or "select").lower()
+            if group_type in _DETERMINISTIC_DOWNGRADE_TYPES:
+                group_type = "select"
+            elif group_type not in _EXECUTION_GROUP_TYPES:
+                raise ValueError(f"连接依赖组 {token} 的类型 {group_type} 无法确定性执行")
+            if any(item.get(flag) for flag in (
+                "include-all", "include-all-proxies", "include-all-providers", "use",
+            )) and any(item.get(key) for key in _GROUP_MEMBER_FILTER_KEYS):
+                raise ValueError(f"连接依赖组 {token} 使用节点过滤，无法确定性展开")
             if item.get("include-all") or item.get("include-all-proxies"):
                 members.extend(str(p.get("name") or "") for p in payloads)
             uses = list(item.get("use") or [])
@@ -274,6 +361,12 @@ def render_node_bundle(
                 item["use"] = list(dict.fromkeys(uses))
             for flag in ("include-all", "include-all-proxies", "include-all-providers"):
                 item.pop(flag, None)
+            item["type"] = group_type
+            for autonomy_key in (
+                "url", "interval", "lazy", "timeout", "max-failed-times", "expected-status",
+                "tolerance", "strategy", *_GROUP_MEMBER_FILTER_KEYS,
+            ):
+                item.pop(autonomy_key, None)
             item.setdefault("empty-fallback", "REJECT")
             rendered_groups[index] = item
         else:
@@ -320,8 +413,9 @@ def _render_dns(raw: Any) -> dict:
 def render_subscription_config(text: str) -> str:
     """机场整份配置 → 项目运行配置（YAML 文本）。
 
-    保留：节点、节点来源（proxy-providers，含纯 provider 订阅）、中转组、
-    基础解析。剥离：规则/规则集/子规则、tun 接管、控制器凭据、地区 DNS 过滤。
+    保留：节点、中转组（自动组降为 select，成员顺序即默认选择）、基础解析。
+    剥离：规则/规则集/子规则、tun 接管、控制器凭据、地区 DNS 过滤。
+    节点来源（proxy-providers）必须已由程序展开，否则拒绝生成。
 
     `dialer-proxy` 指向的节点或组必须存在，否则抛 `ValueError`——缺依赖的配置
     交给内核只会被 `-t` 拒配，早点在生成阶段点名更好定位。
@@ -334,25 +428,14 @@ def render_subscription_config(text: str) -> str:
         raise ValueError("订阅配置不是 YAML 映射")
 
     proxies = [p for p in (doc.get("proxies") or []) if isinstance(p, Mapping)]
-    providers = dict(doc.get("proxy-providers") or {})
-    if not proxies and not providers:
-        raise ValueError("订阅配置里没有节点，也没有节点来源")
+    if doc.get("proxy-providers"):
+        raise ValueError("订阅配置含未展开的节点来源，须先由程序获取并展开为具体节点")
+    if not proxies:
+        raise ValueError("订阅配置里没有节点")
 
     groups = [g for g in (doc.get("proxy-groups") or []) if isinstance(g, Mapping)]
-    bundle = render_node_bundle(proxies, {}, groups=groups, provider_configs=providers)
+    bundle = render_node_bundle(proxies, {}, groups=groups)
     out_groups = bundle["proxy-groups"]
-
-    if providers:
-        used: set[str] = set()
-        for group in out_groups:
-            used.update(str(name) for name in (group.get("use") or []))
-        missing = [name for name in providers if name not in used]
-        if missing:
-            out_groups.append({
-                "name": _PROVIDER_GROUP_NAME,
-                "type": "select",
-                "use": missing,
-            })
 
     doc_out: dict = {
         "mode": "global",
@@ -360,14 +443,11 @@ def render_subscription_config(text: str) -> str:
         "bind-address": "127.0.0.1",
         "dns": _render_dns(doc.get("dns")),
     }
-    if proxies:
-        doc_out["proxies"] = bundle["proxies"]
-    if providers:
-        doc_out["proxy-providers"] = providers
+    doc_out["proxies"] = bundle["proxies"]
     if out_groups:
         doc_out["proxy-groups"] = out_groups
 
-    validate_geo_free_config(doc_out)
+    validate_execution_config(doc_out)
     return yaml.safe_dump(doc_out, allow_unicode=True, sort_keys=False)
 
 

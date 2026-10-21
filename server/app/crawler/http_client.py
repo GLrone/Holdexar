@@ -324,6 +324,21 @@ class SteamHttpClient:
                         )
 
                     else:
+                        body_5xx = (await response.text()) if response.status == 502 else ""
+                        is_gateway_tunnel_fail = (
+                            response.status == 502
+                            and not body_5xx.strip()
+                            and "Content-Type" not in getattr(response, "headers", {})
+                        )
+                        if is_gateway_tunnel_fail:
+                            self._record("connect_error", started, url)
+                            self._consec_connect_errors += 1
+                            raise aiohttp.ClientResponseError(
+                                response.request_info,
+                                response.history,
+                                status=response.status,
+                                message="HTTP 502 proxy tunnel failed",
+                            )
                         self._record("e5xx" if response.status >= 500 else "e4xx",
                                      started, url)
                         if attempt < self.max_retries - 1:
@@ -347,7 +362,7 @@ class SteamHttpClient:
                 # 连接建立失败是通道侧故障：同出口上重试只会把超时预算烧在
                 # 同一个坏出口上，立即上抛交给重推换出口（成功路径在
                 # _record("ok") 里复位计数）
-                if isinstance(e, aiohttp.ClientConnectorError):
+                if isinstance(e, (aiohttp.ClientConnectorError, aiohttp.ClientHttpProxyError)):
                     self._consec_connect_errors += 1
                     raise
                 if attempt < self.max_retries - 1:

@@ -640,24 +640,12 @@ async def test_cycle_when_idle_rebuilds_then_maintains(
 
     # 本用例断言的是「pending 被消费后保持空」这一条：L1 固定为空结果，
     # 出口身份不变，因此不会因身份变化再次置位（那条由下面专门的用例覆盖）。
-    import dataclasses
-
-    from app.domains.proxypool import health as _hm
     import app.domains.proxypool.scheduling as sched_mod
 
     async def _no_l1(*a, **kw):
         return ()
 
-    _orig_lane = _hm.probe_business_lane
-
-    async def _lane_with_dead_c(*a, **kw):
-        res = await _orig_lane(*a, **kw)
-        if res.runtime_name == "1|C" and not res.ok:
-            return dataclasses.replace(res, http_status=None)
-        return res
-
     monkeypatch.setattr(sched_mod, "exit_ip_check_pool", _no_l1)
-    monkeypatch.setattr(_hm, "probe_business_lane", _lane_with_dead_c)
 
     async with get_session_factory()() as s:
         first = await _cycle(

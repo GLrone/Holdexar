@@ -406,11 +406,27 @@ async def _add_recovery_graph(entries):
         await session.commit()
 
 
+def _stub_precheck(monkeypatch, failure=None):
+    """替换内核 `-t` 预检：明确给出放行或拒绝结论，并记录收到的调用。"""
+    from app.domains.proxies import clash_manager as cm
+
+    calls = []
+
+    def precheck(exe_path, config_path, work_dir):
+        calls.append(config_path)
+        if failure is not None:
+            raise failure
+
+    monkeypatch.setattr(cm, "validate_config", precheck)
+    return calls
+
+
 def _stub_ephemeral_kernel(monkeypatch, env):
     from pathlib import Path
     from app.domains.proxypool import dead_probe as DP
 
     _stub_kernel_exe(monkeypatch, env)
+    _stub_precheck(monkeypatch)
     rendered = []
     probed = []
 
@@ -598,6 +614,89 @@ async def test_self_hosted_delays_use_existing_probe_concurrency(env, monkeypatc
 
     assert len(outcomes) == 2 and all(result.ok for result in outcomes)
     assert started == {"1|a", "1|b"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind, cause", [
+    ("admission", "config"), ("rejected", "kernel"), ("timeout", "kernel"),
+    ("unlaunchable", "kernel"), ("changed", "kernel"),
+])
+async def test_self_hosted_precheck_failure_refuses_launch_without_node_evidence(
+    env, monkeypatch, kind, cause,
+):
+    from app.domains.proxies.kernel_process import KernelPrecheckError
+    from app.domains.proxypool import dead_probe as DP
+
+    await init_db()
+    await _add_recovery_graph([("leaf", NODE_DEAD, {})])
+    _stub_kernel_exe(monkeypatch, env)
+    calls = _stub_precheck(monkeypatch, KernelPrecheckError(kind, f"预检拒绝：{kind}"))
+    monkeypatch.setattr(DP, "_free_port", lambda preferred: preferred)
+    monkeypatch.setattr(
+        DP.subprocess, "Popen",
+        lambda *a, **k: pytest.fail("未通过预检的配置不得拉起内核"),
+    )
+
+    async with get_session_factory()() as session:
+        outcomes = await DP.recover_dead_nodes_self_hosted(session, data_dir=env, now=NOW)
+        observations = (await session.scalars(select(HealthObservation))).all()
+
+    assert len(calls) == 1
+    assert len(outcomes) == 1 and not outcomes[0].ok and not outcomes[0].node_failure
+    assert outcomes[0].cause == cause and kind in outcomes[0].detail
+    assert len(observations) == 1 and not observations[0].ok
+    node = await _node("leaf")
+    assert node.state == NODE_DEAD and node.consecutive_failures == 1, "基础设施失败不得累计节点失败"
+
+
+@pytest.mark.asyncio
+async def test_self_hosted_launch_failure_and_controller_failure_have_distinct_causes(
+    env, monkeypatch,
+):
+    from app.domains.proxypool import dead_probe as DP
+
+    await init_db()
+    await _add_recovery_graph([("leaf", NODE_DEAD, {})])
+    _stub_kernel_exe(monkeypatch, env)
+    _stub_precheck(monkeypatch)
+    monkeypatch.setattr(DP, "_free_port", lambda preferred: preferred)
+
+    def cannot_start(*args, **kwargs):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(DP.subprocess, "Popen", cannot_start)
+    async with get_session_factory()() as session:
+        launch = await DP.recover_dead_nodes_self_hosted(session, data_dir=env, now=NOW)
+    assert launch[0].cause == "kernel" and not launch[0].node_failure
+
+    _stub_ephemeral_kernel(monkeypatch, env)
+
+    async def unavailable(*args):
+        return False
+
+    monkeypatch.setattr(DP, "_wait_controller", unavailable)
+    async with get_session_factory()() as session:
+        controller = await DP.recover_dead_nodes_self_hosted(session, data_dir=env, now=NOW)
+    assert controller[0].cause == "controller" and not controller[0].node_failure
+    assert (await _node("leaf")).consecutive_failures == 1
+
+
+@pytest.mark.asyncio
+async def test_self_hosted_genuine_connect_failure_is_node_evidence(env, monkeypatch):
+    from app.domains.proxypool import dead_probe as DP
+
+    await init_db()
+    await _add_recovery_graph([("leaf", NODE_DEAD, {})])
+    _stub_ephemeral_kernel(monkeypatch, env)
+
+    async def dead_node(base_url, secret, name, url):
+        return H.ProbeResult(name, False, None, "内核探测失败（HTTP 504）")
+
+    monkeypatch.setattr(DP, "_probe_one", dead_node)
+    async with get_session_factory()() as session:
+        outcomes = await DP.recover_dead_nodes_self_hosted(session, data_dir=env, now=NOW)
+    assert outcomes[0].node_failure and outcomes[0].cause == "node"
+    assert (await _node("leaf")).consecutive_failures == 2
 
 
 @pytest.mark.asyncio

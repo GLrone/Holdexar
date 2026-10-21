@@ -44,13 +44,28 @@ def test_subscription_runtime_preserves_nodes_without_geo_consumers():
     assert runtime["dns"]["enhanced-mode"] == "redir-host"
 
 
-def test_provider_only_subscription_retains_node_source():
+def test_provider_only_subscription_must_be_expanded_before_rendering():
     providers = {"remote": {"type": "http", "url": "https://example.invalid/nodes",
                              "path": "./provider.yaml", "interval": 3600,
                              "override": {"udp": True}}}
-    runtime = _render(_source(proxies=[], **{"proxy-providers": providers}))
-    assert runtime["proxy-providers"] == providers
-    assert any("remote" in group.get("use", []) for group in runtime["proxy-groups"])
+    with pytest.raises(ValueError, match="展开"):
+        _render(_source(proxies=[], **{"proxy-providers": providers}))
+
+
+def test_expanded_provider_subscription_keeps_nodes_without_remote_definitions():
+    providers = {"remote": {"type": "http", "url": "https://example.invalid/nodes",
+                             "override": {"udp": True}}}
+    source = _source(proxies=[], **{"proxy-providers": providers})
+    nodes = [{"name": "p-1", "type": "trojan", "server": "p1.example", "port": 443,
+              "password": "x"},
+             {"name": "p-2", "type": "ss", "server": "p2.example", "port": 8388,
+              "cipher": "aes-256-gcm", "password": "x"}]
+    expanded = runtime_config.expand_provider_nodes(source, {"remote": nodes})
+    runtime = _render(expanded)
+    assert [p["name"] for p in runtime["proxies"]] == ["p-1", "p-2"]
+    assert all(p["udp"] is True for p in runtime["proxies"])
+    assert "proxy-providers" not in runtime
+    runtime_config.validate_execution_config(runtime)
 
 
 def test_geo_words_in_nodes_and_resolver_urls_are_preserved():

@@ -177,7 +177,19 @@ async def _set_exit_ip(runtime_name: str, exit_ip: str) -> None:
         await s.commit()
 
 
+async def _ensure_subscription() -> None:
+    """合格集口径要求节点归属一条在册订阅：先保证 id=1 的订阅行存在。"""
+    from app.domains.proxies.models import ADMISSION_ACTIVE, ProxySubscription
+
+    async with get_session_factory()() as s:
+        if await s.get(ProxySubscription, 1) is None:
+            s.add(ProxySubscription(id=1, kind="plain", url="http://sub.example/list",
+                                    admission_status=ADMISSION_ACTIVE))
+            await s.commit()
+
+
 async def _add(runtime_name: str, *, port: int, state: str = NODE_ACTIVE) -> None:
+    await _ensure_subscription()
     config = {"name": runtime_name.split("|", 1)[-1], "type": "http",
               "server": "127.0.0.1", "port": port}
     fp = node_fingerprint(config)

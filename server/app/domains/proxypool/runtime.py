@@ -43,8 +43,9 @@ from app.domains.proxies.clash_manager import (
 )
 from app.domains.proxies.runtime_config import (
     BUILTIN_PROXY_NAMES as _BUILTIN_PROXY_NAMES,
-    validate_geo_free_config,
+    validate_execution_config,
 )
+from app.domains.proxies.kernel_process import KernelPrecheckError, confirm_config_text
 from app.domains.proxypool.exits import MAX_CRAWL_WORKERS, ExitSlot, select_exit_slots
 from app.domains.proxypool.pool import (
     PoolBuildError,
@@ -132,6 +133,14 @@ def write_lane_plan(data_dir: Path, plan: Sequence[Mapping]) -> Path:
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(out)
     return out
+
+
+def invalidate_lane_plan(data_dir: Path) -> None:
+    """作废 lane 计划：内核即将重载或重启，旧绑定从此刻起不再可信。
+
+    新计划只在 lane 绑定逐条回读确认后才由 `align_lanes` 写回；中途失败时
+    没有计划，爬取入口按「出口身份未确认」拒绝，不会沿用旧计划放行。"""
+    lane_plan_path(data_dir).unlink(missing_ok=True)
 
 
 def read_lane_plan(data_dir: Path) -> list[dict]:
@@ -421,7 +430,7 @@ def prepare_runtime_config(data_dir: Path, *, lanes: int | None = None,
         port_span=POOL_PROBE_LANE_PORT_SPAN,
         pin_ports=pinned["probe_lane_ports"] if pinned else None,
     )
-    validate_geo_free_config(text)
+    validate_execution_config(text)
     tmp = out.with_suffix(".tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(out)
@@ -640,10 +649,15 @@ async def reload_runtime_config(
     与等待步骤确认，任何一步不过都回退冷通道。
     """
     try:
-        validate_geo_free_config(Path(config_path).read_text(encoding="utf-8", errors="ignore"))
+        admitted = Path(config_path).read_text(encoding="utf-8", errors="ignore")
+        validate_execution_config(admitted)
     except (OSError, ValueError) as exc:
-        raise RuntimeRebuildError(f"运行配置未通过地理数据准入：{exc}") from None
+        raise RuntimeRebuildError(f"运行配置未通过准入：{exc}") from None
     async with httpx.AsyncClient(trust_env=False, timeout=timeout, headers=_headers(secret)) as client:
+        try:
+            confirm_config_text(config_path, admitted)
+        except KernelPrecheckError as exc:
+            raise RuntimeRebuildError(f"运行配置未通过准入：{exc}") from None
         resp = await client.put(
             f"{controller_url}/configs?force=true", json={"path": config_path}
         )
@@ -839,6 +853,7 @@ async def rebuild_runtime(
         await eligible_nodes(session), delays=await latest_l0_delays(session)
     )
 
+    invalidate_lane_plan(data_dir)
     if controller_url and await controller_alive(controller_url, secret):
         try:
             return await _hot_apply_rebuild(
@@ -942,6 +957,7 @@ async def _hot_apply_rebuild(
     再走一遍完整流程。
     """
     config = prepare_runtime_config(data_dir, lanes=len(slots) or None, pin_running=True)
+    invalidate_lane_plan(data_dir)
     await reload_runtime_config(controller_url, secret, str(config))
     observed = await wait_proxy_names(controller_url, secret, timeout=wait_timeout)
     # 入口就绪晚于控制器就绪（重载会重绑 listener）：不等它，交出去的地址会 ConnectError

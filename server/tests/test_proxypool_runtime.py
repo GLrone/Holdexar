@@ -90,7 +90,19 @@ def clash_runtime():
     runtime.stop()
 
 
+async def _ensure_subscription() -> None:
+    """合格集口径要求节点归属一条在册订阅：先保证 id=1 的订阅行存在。"""
+    from app.domains.proxies.models import ADMISSION_ACTIVE, ProxySubscription
+
+    async with get_session_factory()() as s:
+        if await s.get(ProxySubscription, 1) is None:
+            s.add(ProxySubscription(id=1, kind="plain", url="http://sub.example/list",
+                                    admission_status=ADMISSION_ACTIVE))
+            await s.commit()
+
+
 async def _add(state: str, runtime_name: str, *, server: str) -> None:
+    await _ensure_subscription()
     config = {
         "name": runtime_name.split("|", 1)[-1],
         "type": "ss",
@@ -258,7 +270,7 @@ async def test_unloadable_node_makes_the_kernel_die_not_shrink(
 
     # 内核会因坏协议直接退出：控制器地址解析不出来是对的，要的是下面的
     # 「控制器不可用」异常，不是「必须活着」这条前置断言
-    with pytest.raises(RuntimeUnreachableError, match="不可用"):
+    with pytest.raises((RuntimeUnreachableError, RuntimeError), match="不可用|未由内核进程监听"):
         await _start_and_read(
             clash_runtime, kernel_exe_path, prepare_runtime_config(tmp_data_dir),
             timeout=8.0, must_start=False,
