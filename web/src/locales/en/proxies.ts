@@ -124,6 +124,7 @@ const proxies: Partial<Record<MessageKey, string>> = {
   'proxies.sub.edited': 'Subscription updated',
   'proxies.sub.editedSynced': 'Subscription updated and re-fetched ({parts})',
   'proxies.sub.urlInvalid': 'The subscription URL must be an http(s) link',
+  'proxies.sub.urlUnavailable': 'Could not read the full URL — please enter it again',
   'proxies.sub.savedNodes': 'Subscription saved ({nodes} nodes)',
   'proxies.sub.saved': 'Subscription saved',
   'proxies.sub.savedPlain': 'Subscription saved (kept locally for the long term)',

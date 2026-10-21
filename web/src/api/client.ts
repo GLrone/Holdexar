@@ -106,6 +106,8 @@ async function request<T>(
   const promise = (async (): Promise<T> => {
     const response = await fetch(`${BASE}${path}`, {
       method,
+      // 本地会话以 HttpOnly Cookie 承载，同源请求必须显式带上
+      credentials: 'same-origin',
       headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
       body: body !== undefined ? JSON.stringify(body) : undefined,
     })
@@ -1069,6 +1071,7 @@ export async function askPilotStream(
   const watchdog = setTimeout(() => ctrl.abort(), PILOT_FIRST_EVENT_TIMEOUT_MS)
   const resp = await fetch(`${BASE}/pilot/ask/stream`, {
     method: 'POST',
+    credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       question,
@@ -2535,6 +2538,9 @@ export const proxiesApi = {
       'GET',
       `/proxies/subscriptions${toQuery({ kind })}`,
     ),
+  /** 显式取用完整订阅链接（列表里是掩码，编辑时才拉一次） */
+  revealSubscriptionUrl: (id: number) =>
+    request<{ id: number; url: string }>('GET', `/proxies/subscriptions/${id}/url`),
   addSubscription: (kind: 'clash' | 'plain', url: string, label?: string) =>
     request<{
       id: number

@@ -193,7 +193,7 @@ async def test_export_excludes_seed_and_decrypts_secrets(db, tmp_path):
 @pytest.mark.asyncio
 async def test_create_export_writes_file(db, tmp_path):
     await _seed_user_rows()
-    info = await data_export.create_export("exportpw")
+    info = await data_export.create_export("exportpw-123456")
     out = Path(info["path"])
     assert out.is_file() and out.suffix == data_export.EXPORT_SUFFIX
     assert data_export.safe_export_path(out.name) == out

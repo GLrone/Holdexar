@@ -24,6 +24,7 @@ export const useThemeStore = defineStore('theme', () => {
     // 影响弹窗配色，无碍功能。
     void fetch('/api/v1/settings', {
       method: 'PUT',
+      credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ theme: isDark.value ? 'dark' : 'light' }),
     }).catch(() => {})
