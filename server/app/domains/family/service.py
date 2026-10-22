@@ -606,12 +606,13 @@ async def add_family_member(
     now = datetime.utcnow()
     async with write_session(WritePriority.INTERACTIVE) as session:
         row = await session.get(FamilyGroup, owner)
-        if owner != LOCAL_GROUP_SID:
-            await _absorb_local_members(session, sid)
+        absorbed = owner != LOCAL_GROUP_SID and await _absorb_local_members(session, sid)
         members = [m for m in ((row.members_json if row else None) or []) if isinstance(m, dict)]
         target = next((m for m in members if str(m.get("steamid")) == sid), None)
         if target is not None:
             if not target.get("excluded"):
+                if absorbed:
+                    await session.commit()
                 return {"ok": True, "duplicate": True}
             target.pop("excluded", None)  # 重新添加 = 解除移除
             # JSON 条目原位变异不触发列变更检测，须显式标脏
@@ -641,11 +642,11 @@ async def add_family_member(
     return {"ok": True}
 
 
-async def _absorb_local_members(session, steamid: str) -> None:
+async def _absorb_local_members(session, steamid: str) -> bool:
     """绑定前落在本地组的手动条目迁回主账号组（投影与增删随之同源）。"""
     local_row = await session.get(FamilyGroup, LOCAL_GROUP_SID)
     if local_row is None:
-        return
+        return False
     local_members = [m for m in (local_row.members_json or []) if isinstance(m, dict)]
     kept = [m for m in local_members
             if not (str(m.get("steamid")) == steamid and not m.get("excluded"))]
@@ -653,8 +654,8 @@ async def _absorb_local_members(session, steamid: str) -> None:
         local_row.members_json = kept
         flag_modified(local_row, "members_json")
         local_row.updated_at = datetime.utcnow()
-        await session.commit()
-        log_event(logger, "家庭成员条目迁移到主账号组", detail={"SteamID": steamid})
+        return True
+    return False
 
 
 async def remove_family_member(steamid: str, group_steamid: str | None = None) -> dict:

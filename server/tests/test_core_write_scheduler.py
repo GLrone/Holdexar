@@ -495,6 +495,9 @@ async def test_database_wait_timeout_preserves_owner_connection_and_allows_retry
         diagnostics = database.write_scheduler_diagnostics()
         assert diagnostics["busy"]
         assert diagnostics["waiting_background"] == 0
+        assert diagnostics["pool"]["checkedOut"] == 1
+        assert diagnostics["pool"]["type"] == "AsyncAdaptedQueuePool"
+        assert diagnostics["pool"]["size"] >= 1
     finally:
         release.set()
         await owner
@@ -509,3 +512,4 @@ async def test_database_wait_timeout_preserves_owner_connection_and_allows_retry
     assert set(rows) == {"timeout.owner", "timeout.retry"}
     assert database.get_engine().pool.checkedout() == 0
     assert not database.write_scheduler_diagnostics()["busy"]
+    assert database.write_scheduler_diagnostics()["pool"]["checkedOut"] == 0

@@ -89,12 +89,9 @@ watch(kernelDownloading, (on, was) => {
 // 订阅管理（双方式）
 const selectedClashSubId = ref<number | null>(null)
 const switchingSub = ref(false)
-/** 内核当前跑的订阅 id：radio 重复选它时免打扰，切换失败时回弹锚点 */
-const runningSubId = computed(() => {
-  const url = clash.value?.subscriptionUrl
-  if (!url) return null
-  return clashSubs.value.find((s) => s.url === url)?.id ?? null
-})
+/** 内核当前跑的订阅 id：radio 重复选它时免打扰，切换失败时回弹锚点。
+ *  用后端登记的 selectedSubscriptionId，不比 URL——列表里的链接已是掩码。 */
+const runningSubId = computed(() => clash.value?.selectedSubscriptionId ?? null)
 
 /** 选中即切换：内核在跑 → 热重载切到所选订阅（气泡提示，内核进程不动）；
  *  内核没跑 → 点选落库（跨页面与重启保留），「启动」会直接用它。 */
@@ -408,13 +405,21 @@ async function removeSubscription(sub: ProxySubscriptionItem) {
   await load()
 }
 
-/** 打开编辑弹窗：名称与链接一起呈现，改名换链一次完成 */
-function openEditSubscription(sub: ProxySubscriptionItem) {
+/** 打开编辑弹窗：名称与链接一起呈现，改名换链一次完成。
+ *  列表里的链接是掩码（token 不外泄），编辑时才向服务端显式取一次完整链接。 */
+async function openEditSubscription(sub: ProxySubscriptionItem) {
   editSub.value = sub
   editLabel.value = sub.label ?? ''
-  editUrl.value = sub.url
+  editUrl.value = ''
   editAutoRefresh.value = sub.autoRefresh !== false
   editDialog.value = true
+  try {
+    const res = await proxiesApi.revealSubscriptionUrl(sub.id)
+    editUrl.value = res.url
+  } catch {
+    // 取不到（密钥不可用 / 订阅已删）：留空让用户重填，不阻塞弹窗
+    message.warning(t('proxies.sub.urlUnavailable'))
+  }
 }
 
 /** 保存编辑：链接变更的 Clash 订阅由后端自动重拉（直连优先，失败借道已保存代理） */

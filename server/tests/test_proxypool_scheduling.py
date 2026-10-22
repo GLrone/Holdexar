@@ -820,10 +820,11 @@ async def test_proxypool_rebuild_leaves_subscription_runtime_alone(
     )
     legacy = ClashRuntime()
     legacy.start(str(kernel_exe_path), str(legacy_dir / "config.yaml"))
-    assert await wait_proxy_names(f"http://127.0.0.1:{legacy_controller}",
-                                  "legacy-secret", timeout=20) is not None
 
     try:
+        legacy_secret = legacy.secret
+        assert legacy_secret != "legacy-secret"
+        assert await wait_proxy_names(legacy.controller_url, legacy_secret, timeout=20) is not None
         legacy_pid = legacy.process.pid
         base, secret = await _boot(proxy_runtime, kernel_exe_path, tmp_data_dir)
         async with get_session_factory()() as s:
@@ -834,6 +835,7 @@ async def test_proxypool_rebuild_leaves_subscription_runtime_alone(
             await s.commit()
 
         assert legacy.process.pid == legacy_pid, "池重建不得动老订阅内核进程"
+        assert legacy.secret == legacy_secret
         assert _listening(legacy_controller), "老 controller 仍可访问"
         assert _listening(legacy_mixed), "老 mixed-port 仍可用"
         assert proxy_runtime.process.pid != legacy_pid

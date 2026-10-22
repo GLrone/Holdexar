@@ -360,13 +360,66 @@ def _server_port_listening() -> bool:
         return False
 
 
+def _session_entry_url(app_url: str) -> str:
+    """带一次性票据的入口地址：先换 HttpOnly 会话 Cookie 再跳回首页。
+
+    会话令牌只在后端进程内存里（见 app.core.access），页面自己拿不到。
+    桌面壳与后端同进程，直接取票据；导航到 bootstrap 端点后服务端写
+    Cookie 并 303 回首页，之后页面所有请求（含 EventSource）自动携带。
+    取不到票据时退回裸地址——至少让页面能加载并显示「缺少会话」提示，
+    比窗口停在转圈页可诊断。
+    """
+    try:
+        from app.domains.system.session_router import create_bootstrap
+
+        nonce = create_bootstrap()
+    except Exception:  # noqa: BLE001 —— 票据不可用时退回裸地址
+        return app_url
+    return f"{app_url}/api/v1/session/bootstrap?nonce={nonce}"
+
+
+def _install_navigation_guard(window, app_url: str) -> None:
+    """导航白名单：窗口只许停留在本机回环地址上。
+
+    主窗带 `js_api`（暴露 `restart_app`），一旦被导航到外部页面，那个页面
+    就能调用桌面桥。pywebview 没有提供导航拦截钩子，这里用「加载完成后
+    检查当前 URL、越界即退回首页」的方式收口——副作用窗口只有一次
+    加载，且外部页面拿不到会话 Cookie（跨站不发送）。
+
+    用户主动点击外链（Steam 商店页等）由 `target="_blank"` 交给系统浏览器，
+    不经过本窗口，因此不会被这条规则误伤。
+    """
+
+    def _guard() -> None:
+        try:
+            current = str(window.get_current_url() or "")
+        except Exception:  # noqa: BLE001 —— 窗口销毁中
+            return
+        if not current:
+            return
+        if current.startswith(app_url):
+            return
+        if current.startswith(("http://127.0.0.1:", "http://localhost:")):
+            return
+        try:
+            window.load_url(app_url)
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        window.events.loaded += _guard
+    except Exception:  # noqa: BLE001 —— 旧版 pywebview 无该事件：不阻断启动
+        pass
+
+
 def _wait_and_navigate(window, app_url: str) -> None:
     """health 就绪后把窗口从内联等待页切到真实应用（webview.start 后的
     后台线程）。90s 未就绪不在此处理——watchdog 线程负责弹窗报错，本线程
     停止轮询即可，窗口停在转圈页。"""
     if _wait_health(HEALTH_TIMEOUT):
+        _install_navigation_guard(window, app_url)
         try:
-            window.load_url(app_url)
+            window.load_url(_session_entry_url(app_url))
         except Exception:  # noqa: BLE001 —— 窗口已销毁（托盘退出）：无需跳转
             pass
 
@@ -1131,7 +1184,9 @@ def _handoff_pending_update() -> bool:
         _alert("[更新] 暂存包缺少主程序，本次换装已跳过（现装保持完好）。")
         return False
 
-    if not _staged_supports_helper(staged_exe):
+    from app.core.update_host import supports_data_protocol
+
+    if not supports_data_protocol(staged_exe):
         if not (staging / _UNSUPPORTED_MARK).exists():
             (staging / _UNSUPPORTED_MARK).write_text(
                 f"{info.get('tag')} 由旧版本生成，不支持安全换装\n", encoding="utf-8"
@@ -1143,8 +1198,7 @@ def _handoff_pending_update() -> bool:
                 target=_alert,
                 args=(
                     "[更新] 该更新包由旧版本生成，不支持安全换装，已跳过——现装保持完好。\n\n"
-                    "请到发布页下载新版压缩包，解压后覆盖本程序目录完成升级；\n"
-                    "用户数据不在程序目录内，覆盖解压不会影响它。",
+                    "当前版本仍可继续使用，请重新下载支持安全升级的更新包。",
                 ),
                 daemon=True,
             ).start()
@@ -1155,8 +1209,8 @@ def _handoff_pending_update() -> bool:
     child_env = dict(os.environ)
     child_env[f"{ENV_PREFIX}SOURCE_VERSION"] = APP_VERSION
 
-    update_host_exe = _app_root() / "updater" / "UpdateHost.exe"
-    if update_host_exe.is_file():
+    update_host_exe = payload / "updater" / "UpdateHost.exe"
+    if update_host_exe.is_file() and supports_data_protocol(update_host_exe):
         cmd = [
             str(update_host_exe),
             "--staging", str(staging),
@@ -1165,6 +1219,7 @@ def _handoff_pending_update() -> bool:
             "--attempt-id", attempt_id,
             "--target-version", staged_version,
             "--source-version", APP_VERSION,
+            "--data-dir", str(_data_dir()),
         ]
         cwd = str(update_host_exe.parent)
     else:
@@ -2783,6 +2838,10 @@ def _apply_webview2_static_args() -> None:
 
 
 def main() -> None:
+    from app.core.update_host import report_data_protocol
+
+    if report_data_protocol(sys.argv[1:]):
+        return
     parser = argparse.ArgumentParser(description=f"{APP_NAME} 桌面启动器")
     parser.add_argument("--server", action="store_true", help="无窗口模式，仅启动本地服务")
     # 换装进程入口（见 _run_update_helper）。⚠️ 必须出现在 --help 里：
@@ -2815,6 +2874,25 @@ def main() -> None:
             current_version=getattr(args, "current_version", None),
         )
         sys.exit(0 if ok else 1)
+
+    from app.core.update_data import validate_startup
+
+    try:
+        update_token = validate_startup(_data_dir())
+    except RuntimeError as exc:
+        _log_update(f"已停止启动以保护数据：{exc}")
+        if not os.environ.get(f"{ENV_PREFIX}UPDATE_ATTEMPT_ID"):
+            _alert("上次更新尚未恢复完成，请从安装目录的主程序重新打开应用。")
+        sys.exit(1)
+    if not update_token and is_frozen():
+        from app.core import layout as managed_layout
+
+        current = managed_layout.get_current_version(_app_root())
+        executable = Path(sys.executable).resolve()
+        if current and executable.parent.parent == (_app_root() / "versions").resolve():
+            if executable != managed_layout.get_version_exe(_app_root(), current).resolve():
+                _alert("当前程序版本已退出使用，请从安装目录的主程序打开应用。")
+                sys.exit(1)
 
     # 孤儿实例防线最早挂上：换装/端口协商/服务线程任何阶段包装进程死亡，
     # 本进程都不应存活成无主实例（防线语义见 _watch_launcher 顶注）
@@ -2850,21 +2928,22 @@ def main() -> None:
     # 交接先于锁会让双开实例各交一次，拉起两个换装进程并发毁坏安装目录。
     # 换装进行中（互斥体被持有）则本实例直接让位：换装进程完成时会拉起新版
     # 或回滚现装，不该带着「程序目录即将被搬空」继续起服务。
-    if _swap_mutex_held():
+    if not update_token and _swap_mutex_held():
         _log_update("检测到换装进程进行中，本实例退出等待其完成")
         sys.stdout.flush()
         os._exit(0)
 
     # 换装：暂存就绪则把换装交给暂存包的新 exe（本进程立即退出，不再起服务）；
     # 交接失败（旧版暂存包/拉不起来）就照常启动现装，下次启动再试
-    if _handoff_pending_update():
+    if not update_token and _handoff_pending_update():
         sys.stdout.flush()
         os._exit(0)
 
     # 换装残留清理：已消费的暂存目录（无 manifest）+ 上一版程序备份 __old__
-    _cleanup_staging_leftover()
+    if not update_token:
+        _cleanup_staging_leftover()
     _stale_old_dir = _app_root() / "__old__"
-    if _should_clean_old_dir(_stale_old_dir):
+    if not update_token and _should_clean_old_dir(_stale_old_dir):
         _cleanup_old_dir_async(_stale_old_dir)
 
     ready = threading.Event()

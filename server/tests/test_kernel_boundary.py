@@ -198,12 +198,25 @@ def test_start_launches_exactly_the_validated_file_with_clean_environment(
 ):
     config = _config(tmp_path)
     runtime = _runtime_for_start(monkeypatch)
+    validated = []
+    validate = clash_manager._validate_config_text
+
+    def observe(exe, text, directory):
+        validated.append(text)
+        return validate(exe, text, directory)
+
+    monkeypatch.setattr(clash_manager, "_validate_config_text", observe)
     with pytest.raises(RuntimeError):  # stub 不监听端口：入口就绪检查按设计拒绝
         runtime.start(str(stub.path), str(config), inject_lanes=False, mixed_port=17894)
     args = json.loads((stub.dir / "args_run.json").read_text(encoding="utf-8"))
     assert args[args.index("-f") + 1] == str(config)
     _assert_clean(stub.env("run"))
-    assert yaml.safe_load(config.read_text(encoding="utf-8"))["mixed-port"] == 17894
+    actual = config.read_text(encoding="utf-8")
+    assert actual == validated[-1]
+    loaded = yaml.safe_load(actual)
+    assert loaded["mixed-port"] == 17894
+    assert loaded["secret"] == args[args.index("-secret") + 1]
+    assert len(loaded["secret"]) >= 32
 
 
 def test_pool_reload_applies_the_same_final_admission(tmp_path, monkeypatch):

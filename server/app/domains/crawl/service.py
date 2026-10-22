@@ -130,7 +130,9 @@ async def prune_crawl_jobs(
     每块一个事务过写闸，块间写者位空出；单轮块上限内删不完留给下一日续删。
     """
     from sqlalchemy import text
+    from app.domains.crawl.retention import unfinished_job_units_sql
 
+    await _unobserved_job_targets(0, settle=True, limit_rows=0)
     cutoff = datetime.now() - timedelta(days=days)
     deleted = 0
     for _ in range(max_chunks):
@@ -141,6 +143,9 @@ async def prune_crawl_jobs(
                     "SELECT id FROM crawl_jobs"
                     " WHERE finished_at IS NOT NULL AND finished_at < :cutoff"
                     " AND status NOT IN ('pending', 'running')"
+                    " AND NOT EXISTS (SELECT 1 FROM price_events e WHERE e.cycle_id=-crawl_jobs.id)"
+                    " AND NOT EXISTS (SELECT 1 FROM notification_candidates n WHERE n.cycle_id=-crawl_jobs.id)"
+                    " AND NOT (" + unfinished_job_units_sql() + ")"
                     " ORDER BY id LIMIT :chunk)"
                 ),
                 {"cutoff": cutoff, "chunk": chunk},
@@ -442,10 +447,118 @@ async def _missing_tasks(
     """
     from app.crawler.db_writer import DbWriter
 
+    from app.crawler.browse_store import DEFAULT_BATCH_SIZE
+
     db = DbWriter()
-    return await db.generate_missing_tasks(
+    tasks = await db.generate_missing_tasks(
         cooldown_minutes=cooldown_minutes, limit_rows=limit_rows
     )
+    pairs = {(int(aid), task["region"].upper()) for task in tasks for aid in task["appids"]}
+    pending = await _unobserved_job_targets(
+        cooldown_minutes, settle=True,
+        limit_rows=max(0, limit_rows - len(pairs)) if limit_rows > 0 else -1,
+    )
+    for pair in sorted(pending):
+        if limit_rows > 0 and len(pairs) >= limit_rows:
+            break
+        pairs.add(pair)
+    by_region: dict[str, list[int]] = {}
+    for aid, cc in sorted(pairs):
+        by_region.setdefault(cc.lower(), []).append(aid)
+    return [{"type": "app", "id": f"{cc}:补{i // DEFAULT_BATCH_SIZE + 1}",
+             "region": cc, "appids": appids[i:i + DEFAULT_BATCH_SIZE]}
+            for cc, appids in by_region.items()
+            for i in range(0, len(appids), DEFAULT_BATCH_SIZE)]
+
+
+_JOB_TARGET_UNITS_SQL = """
+WITH target_jobs AS MATERIALIZED (
+    SELECT id, json_extract(stats_json, '$.targets.appids') AS appids,
+           json_extract(stats_json, '$.targets.regions') AS regions,
+           json_extract(stats_json, '$.targets.tasks') AS tasks,
+           replace(json_extract(stats_json, '$.targetStartedAt'), 'T', ' ') AS threshold
+    FROM crawl_jobs
+    WHERE status IN ('failed','interrupted')
+      AND json_type(stats_json, '$.targets') = 'object'
+      AND json_extract(stats_json, '$.targetStartedAt') IS NOT NULL
+      AND (:job_id IS NULL OR id = :job_id)
+), units AS (
+    SELECT j.id AS job_id, CAST(a.value AS INTEGER) AS appid,
+           upper(r.value) AS region, j.threshold
+    FROM target_jobs j, json_each(j.appids) a, json_each(j.regions) r
+    UNION ALL
+    SELECT j.id, CAST(a.value AS INTEGER),
+           upper(json_extract(t.value, '$.region')), j.threshold
+    FROM target_jobs j, json_each(j.tasks) t,
+         json_each(t.value, '$.appids') a
+), skipped AS (
+    SELECT s.value AS unit,
+           MAX(replace(json_extract(j.stats_json, '$.targetStartedAt'), 'T', ' ')) AS threshold
+    FROM crawl_jobs j, json_each(j.stats_json, '$.skipUnits') s
+    WHERE replace(json_extract(j.stats_json, '$.targetStartedAt'), 'T', ' ')
+          >= (SELECT MIN(threshold) FROM target_jobs)
+    GROUP BY s.value
+), unit_results AS (
+    SELECT u.*, CASE WHEN (
+        p.price_status IN ('ok','locked','missing','blocked')
+        AND (p.updated_at >= u.threshold OR p.last_success_at >= u.threshold)
+    ) OR s.threshold >= u.threshold THEN 1 ELSE 0 END AS settled
+    FROM units u
+    LEFT JOIN game_current_prices p ON p.appid = u.appid AND p.region_code = u.region
+    LEFT JOIN skipped s ON s.unit = CAST(u.appid AS TEXT) || ':' || u.region
+), unresolved AS (
+    SELECT DISTINCT appid, region, threshold FROM unit_results WHERE settled = 0
+)
+"""
+
+
+async def _unobserved_job_targets(
+    cooldown_minutes: int, *, settle: bool = False, limit_rows: int = MISSING_BATCH_ROW_LIMIT,
+) -> set[tuple[int, str]]:
+    cutoff = get_beijing_time_obj().replace(tzinfo=None) - timedelta(minutes=cooldown_minutes)
+    pending = set()
+    async with get_session_factory()() as session:
+        if limit_rows != 0:
+            rows = await session.execute(text(_JOB_TARGET_UNITS_SQL + """
+                SELECT DISTINCT appid, region FROM unresolved
+                WHERE threshold < :cutoff LIMIT :limit_rows
+            """), {"job_id": None, "cutoff": cutoff, "limit_rows": limit_rows})
+            pending.update((int(aid), cc) for aid, cc in rows)
+        changed = list((await session.execute(text(_JOB_TARGET_UNITS_SQL +
+            "SELECT DISTINCT job_id FROM unit_results WHERE settled = 1"), {"job_id": None})).scalars()) if settle else []
+    if changed:
+        from app.crawler.browse_store import DEFAULT_BATCH_SIZE
+
+        for start in range(0, len(changed), 50):
+            async with write_session(WritePriority.BACKGROUND, label="crawl_targets_resolved") as session:
+                updates = []
+                for job_id in changed[start:start + 50]:
+                    targets = (await session.execute(text(_JOB_TARGET_UNITS_SQL + """
+                        SELECT CASE WHEN COUNT(*) = 0 THEN NULL
+                        WHEN COUNT(*) = COUNT(DISTINCT appid) * COUNT(DISTINCT region) THEN
+                            json_object('appids', json_group_array(DISTINCT appid),
+                                        'regions', json_group_array(DISTINCT region))
+                        ELSE json_object('tasks', json((
+                            SELECT json_group_array(json_object('region', region, 'appids', json(appids)))
+                            FROM (
+                                SELECT region, bucket, json_group_array(appid) AS appids
+                                FROM (
+                                    SELECT appid, region,
+                                           (ROW_NUMBER() OVER (PARTITION BY region ORDER BY appid)-1) / :batch_size AS bucket
+                                    FROM unresolved
+                                ) GROUP BY region, bucket ORDER BY region, bucket
+                            )
+                        ))) END FROM unresolved
+                    """), {"job_id": job_id, "batch_size": DEFAULT_BATCH_SIZE})).scalar_one()
+                    updates.append({"job_id": job_id, "targets": targets})
+                await session.execute(text(
+                    "UPDATE crawl_jobs SET stats_json = CASE WHEN :targets IS NULL THEN "
+                    "json_remove(stats_json, '$.targets') ELSE "
+                    "json_set(stats_json, '$.targets', json(:targets)) END "
+                    "WHERE id = :job_id AND status IN ('failed','interrupted')"
+                ), updates)
+                await session.commit()
+    return pending
 
 
 async def has_pending_missing(
@@ -468,7 +581,7 @@ async def has_pending_missing(
             )
             .limit(1)
         )
-    return row.first() is not None
+    return row.first() is not None or bool(await _unobserved_job_targets(cooldown_minutes, limit_rows=1))
 
 
 async def _load_job(job_id: int) -> CrawlJob | None:
@@ -484,7 +597,7 @@ async def _finish_job(job_id: int, status: str, stats: dict | None = None, error
                 return
             job.status = status
             # stats=None（异常收尾）保留启动时落的初始账本——分母不能丢
-            job.stats_json = stats if stats is not None else job.stats_json
+            job.stats_json = {**(job.stats_json or {}), **stats} if stats is not None else job.stats_json
             job.finished_at = datetime.now()
             job.error = error
             if job.cycle_id is not None:
@@ -680,8 +793,9 @@ async def _execute(
             crawl_job_id=job_id,
         )
         stats["elapsed_seconds"] = round(time.monotonic() - started, 1)
-        status = "stopped" if stop_event.is_set() else "done"
-        await _finish_job(job_id, status, stats)
+        status = "stopped" if stop_event.is_set() else "failed" if stats.get("unpersistedUnits") else "done"
+        error = "部分地区数据未能保存，将自动补全" if stats.get("unpersistedUnits") else None
+        await _finish_job(job_id, status, stats, error)
         log_event(
             logger,
             f"爬取任务 {job_id} 已结束，共处理 {stats.get('processed')}/{stats.get('total')} 项",
@@ -1082,6 +1196,14 @@ async def start_job(
                     cycle_id=cycle_id,
                     stats_json={
                         "total": initial_total, "processed": 0, "success": 0, "failed": 0,
+                        "targetStartedAt": get_beijing_time_obj().replace(tzinfo=None).isoformat(),
+                        "targets": {"tasks": [
+                            {"region": str(t["region"]).upper(), "appids": list(dict.fromkeys(t["appids"]))}
+                            for t in pre_tasks
+                        ]} if pre_tasks else {
+                            "appids": list(dict.fromkeys(int(aid) for aid, _ in pairs)),
+                            "regions": list(dict.fromkeys(str(cc).upper() for cc in effective)),
+                        },
                     },
                 )
                 session.add(job)

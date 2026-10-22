@@ -12,10 +12,12 @@ if str(SERVER) not in sys.path:
 import argparse
 
 from app.core.launcher import run_launcher
-from app.core.update_host import bridge_legacy_update
+from app.core.update_host import bridge_legacy_update, report_data_protocol
 
 
 def main() -> None:
+    if report_data_protocol(sys.argv[1:]):
+        return
     parser = argparse.ArgumentParser(description="Holdexar 启动器")
     parser.add_argument(
         "--apply-update",

@@ -346,10 +346,20 @@ async def _run_crawl_locked(
                 )
         # failure_ledger：browse 层重试耗尽的批次只记账本不抛异常，调度器
         # 对外口径（进度事件与这里的返回统计）必须把账本并入「失败」
+        unpersisted: set[tuple[int, str]] = set()
+
+        def record_error(exc):
+            from .db_writer import RegionStatusWriteError
+
+            if isinstance(exc, RegionStatusWriteError):
+                unpersisted.update(exc.pairs)
+            if error_sink is not None:
+                error_sink(exc)
+
         scheduler = CrawlerScheduler(
             router, http_client, db, worker_count=config.workers, stop_event=stop_event,
             failure_ledger=bs.FAILED_TASKS,
-            error_sink=error_sink,
+            error_sink=record_error,
             client_factory=client_factory,
             # 入口总数即出口兵源数：大于 worker 数时多出的部分是待用出口池，
             # 被隔离的 lane 由它们顶替（worker 岗位数不掉）
@@ -363,6 +373,8 @@ async def _run_crawl_locked(
             "processed": done,
             "success": ok,
             "failed": failed,
+            "unpersistedUnits": [f"{aid}:{cc}" for aid, cc in sorted(unpersisted)],
+            "skipUnits": [f"{aid}:{cc}" for aid, cc in sorted(bs.SKIPPED_UNITS)],
             "skipped_no_discount": 0,
             "discount_ended": 0,
             "elapsed_seconds": 0,  # scheduler.run 内部已日志，此处由调用方补充

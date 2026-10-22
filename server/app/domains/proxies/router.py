@@ -247,7 +247,7 @@ async def clash_start(req: ClashStart):
 
     # 订阅从持久化订阅表取（可存多条，按 kind=clash 区分）；
     # 废弃订阅（不可用 >95%）跳过——后端不再选用，但保留给用户手动处理
-    subs = await service.list_subscriptions("clash")
+    subs = await service.list_subscriptions("clash", reveal=True)
     if not subs:
         raise HTTPException(status_code=400, detail="尚未保存 Clash 订阅链接，请先添加")
     if req.subscriptionId is not None:
@@ -323,7 +323,7 @@ async def clash_switch(req: ClashSwitch):
             status_code=400,
             detail="Clash 未运行：点「启动」拉起内核，启动时将使用选中的订阅",
         )
-    subs = await service.list_subscriptions("clash")
+    subs = await service.list_subscriptions("clash", reveal=True)
     sub = next((s for s in subs if s["id"] == req.subscriptionId), None)
     if sub is None:
         raise HTTPException(status_code=404, detail="指定的订阅不存在")
@@ -372,7 +372,7 @@ async def clash_switch(req: ClashSwitch):
 async def clash_select(req: ClashSelect):
     """内核未运行时记录订阅行点选：落库跨页面与重启保留，供「启动」缺省
     与前端回显。内核在跑时点选走 /clash/switch（选中即切换），不经这里。"""
-    subs = await service.list_subscriptions("clash")
+    subs = await service.list_subscriptions("clash", reveal=True)
     if not any(s["id"] == req.subscriptionId for s in subs):
         raise HTTPException(status_code=404, detail="指定的订阅不存在")
     await service.remember_selected_clash_sub(req.subscriptionId)
@@ -440,6 +440,19 @@ async def events(limit: int = 200):
 @router.get("/subscriptions")
 async def list_subscriptions(kind: str | None = None):
     return {"items": await service.list_subscriptions(kind)}
+
+
+@router.get("/subscriptions/{sub_id}/url")
+async def reveal_subscription_url(sub_id: int):
+    """显式取用完整订阅链接（编辑 / 复制用）。
+
+    列表投影一律掩码；这里是链接明文的唯一出口，按用户主动动作调用。
+    """
+    try:
+        url = await service.reveal_subscription_url(sub_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"id": sub_id, "url": url}
 
 
 @router.post("/subscriptions")

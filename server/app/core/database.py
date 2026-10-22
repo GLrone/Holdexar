@@ -31,7 +31,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from enum import IntEnum
-from functools import lru_cache
+from functools import lru_cache, partial
 from pathlib import Path
 
 from sqlalchemy import event, text
@@ -250,6 +250,7 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
     "notification_candidates": {
         "attempts": "INTEGER DEFAULT 0",
         "last_error": "TEXT",
+        "delivery_history_json": "JSON",
     },
     # 汇率历史 canonical 语义列（数据回填与唯一索引在 v8 迁移链，见
     # _migrate_fx_history_canonical；此处只保证老库列存在，迁移链信任本层先跑）
@@ -290,6 +291,7 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "stale_count": "INTEGER",
         "duration_seconds": "REAL",
         "stage_ms_json": "JSON",
+        "notification_scan_json": "JSON",
         "batches_expected": "INTEGER",
         "batches_done": "INTEGER",
         # missing/blocked 拆分（units_failed 的拆分来源，覆盖读路径由统计列重建）
@@ -304,6 +306,9 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
 
 # 增量索引（CREATE INDEX IF NOT EXISTS 幂等）
 _TABLE_EXTRA_INDEXES: dict[str, list[str]] = {
+    "notification_candidates": [
+        "CREATE INDEX IF NOT EXISTS ix_notification_cycle ON notification_candidates(cycle_id)",
+    ],
     # 活动窗口标签回贴的增量扫描（snapshot_at 范围谓词）；唯一索引
     # ux_gph_snapshot 首列 appid 服务不了该谓词
     "game_price_history": [
@@ -419,7 +424,7 @@ def _ensure_schema(sync_conn) -> None:
 #   2. _MIGRATIONS 追加 (版本号, 描述, SQL 列表)；SQL 须幂等（中断续跑 +
 #      用户库版本乱序防御），复杂逻辑可登记 async fn(engine) 同位元素
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 # 零小数货币（Steam 以整数计价）：旧捆绑包链路的除数表按 1 处理，与「统一存分」
 # 的新约定差 100 倍——v2 归一的目标集合
@@ -1222,6 +1227,127 @@ async def _migrate_proxynode_subscription_identity(conn) -> None:
     ))
 
 
+def _identity_table_ddl(sql: str, name: str) -> str | None:
+    start, end = sql.find("("), sql.rfind(")")
+    if start < 0 or end < start or "WITHOUT ROWID" in sql[end:].upper():
+        raise RuntimeError(f"无法安全迁移 {name} 的整数身份结构")
+    body = sql[start + 1:end]
+    parts: list[str] = []
+    depth, quote, offset, index = 0, "", 0, 0
+    while index < len(body):
+        char = body[index]
+        if quote:
+            if char == quote:
+                if index + 1 < len(body) and body[index + 1] == quote:
+                    index += 1
+                else:
+                    quote = ""
+        elif char in "'\"`[":
+            quote = "]" if char == "[" else char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append(body[offset:index])
+            offset = index + 1
+        index += 1
+    parts.append(body[offset:])
+    identifier = r'(?:id|"id"|`id`|\[id\])'
+    pk = re.compile(rf"^\s*PRIMARY\s+KEY\s*\(\s*{identifier}\s*\)\s*$", re.I)
+    column = re.compile(rf"^(\s*{identifier}\s+INTEGER)\b(.*)$", re.I | re.S)
+    primary_count = 0
+    already_autoincrement = False
+    converted: list[str] = []
+    for part in parts:
+        if pk.fullmatch(part):
+            primary_count += 1
+            continue
+        match = column.fullmatch(part)
+        if match:
+            rest = match.group(2)
+            syntax = re.sub(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^\]]*\]|/\*.*?\*/|--[^\n]*",
+                            lambda m: " " * len(m.group()), rest, flags=re.S)
+            primary = re.search(r"\bPRIMARY\s+KEY\b", syntax, re.I)
+            if primary:
+                if re.search(r"\bDESC\b", syntax, re.I):
+                    raise RuntimeError(f"无法安全迁移 {name} 的整数身份约束")
+                if re.search(r"\bPRIMARY\s+KEY\s+AUTOINCREMENT\b", syntax, re.I):
+                    already_autoincrement = True
+                else:
+                    rest = rest[:primary.end()] + " AUTOINCREMENT" + rest[primary.end():]
+                primary_count += 1
+                converted.append(match.group(1) + rest)
+            else:
+                converted.append(match.group(1) + " PRIMARY KEY AUTOINCREMENT" + rest)
+        else:
+            converted.append(part)
+    if primary_count != 1 or not any(column.fullmatch(p) for p in parts):
+        raise RuntimeError(f"无法安全迁移 {name} 的主键定义")
+    if already_autoincrement:
+        return None
+    return f'CREATE TABLE "{name}_identity_new" (' + ",".join(converted) + sql[end:]
+
+
+async def _migrate_notification_identity(conn) -> None:
+    """保留价格事实及来源的整数身份与现有结构。"""
+    references = {
+        "price_events": "SELECT event_id AS value FROM notification_candidates",
+        "price_cycles": (
+            "SELECT cycle_id AS value FROM price_events WHERE cycle_id > 0 UNION ALL "
+            "SELECT cycle_id FROM notification_candidates WHERE cycle_id > 0 UNION ALL "
+            "SELECT cycle_id FROM crawl_jobs WHERE cycle_id > 0"
+        ),
+        "crawl_jobs": (
+            "SELECT -cycle_id AS value FROM price_events WHERE cycle_id < 0 UNION ALL "
+            "SELECT -cycle_id FROM notification_candidates WHERE cycle_id < 0"
+        ),
+    }
+    tables = (await conn.execute(text(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+    ))).scalars().all()
+    for table in tables:
+        escaped = str(table).replace('"', '""')
+        foreign_keys = (await conn.execute(text(f'PRAGMA foreign_key_list("{escaped}")'))).all()
+        if foreign_keys and (str(table).casefold() in references
+                             or any(str(row[2]).casefold() in references for row in foreign_keys)):
+            raise RuntimeError("价格身份迁移发现未知外键关联，已保留原结构与数据并停止升级")
+    for name, reference_sql in references.items():
+        sql = (await conn.execute(text(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=:name"
+        ), {"name": name})).scalar_one()
+        highwater = int((await conn.execute(text(
+            f'SELECT COALESCE(MAX(value),0) FROM (SELECT id AS value FROM "{name}" '
+            f"UNION ALL {reference_sql})"
+        ))).scalar_one())
+        rebuilt_ddl = _identity_table_ddl(sql, name)
+        if rebuilt_ddl is not None:
+            objects = (await conn.execute(text(
+                "SELECT sql FROM sqlite_master WHERE tbl_name=:name"
+                " AND type IN ('index','trigger') AND sql IS NOT NULL ORDER BY type,name"
+            ), {"name": name})).scalars().all()
+            columns = (await conn.execute(text(f'PRAGMA table_xinfo("{name}")'))).all()
+            column_names = ",".join('"' + str(row[1]).replace('"', '""') + '"'
+                                    for row in columns if not row[6])
+            await conn.execute(text(rebuilt_ddl))
+            await conn.execute(text(
+                f'INSERT INTO "{name}_identity_new" ({column_names}) '
+                f'SELECT {column_names} FROM "{name}"'
+            ))
+            await conn.execute(text(f'DROP TABLE "{name}"'))
+            await conn.execute(text(f'ALTER TABLE "{name}_identity_new" RENAME TO "{name}"'))
+            for definition in objects:
+                await conn.execute(text(definition))
+        await conn.execute(text(
+            "INSERT INTO sqlite_sequence(name,seq) SELECT :name,:highwater"
+            " WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name=:name)"
+        ), {"name": name, "highwater": highwater})
+        await conn.execute(text(
+            "UPDATE sqlite_sequence SET seq=MAX(seq,:highwater) WHERE name=:name"
+        ), {"name": name, "highwater": highwater})
+    await _migrate_gph_snapshot_unique(conn)
+
+
 # (目标版本, 说明, 迁移体)：迁移体 = SQL 语句列表，或 async callable(engine)
 _MIGRATIONS: list[tuple[int, str, object]] = [    (2, "bundle_region_prices 零小数货币单位归一（元→分 + cny_fen 去虚高）",
      _migrate_bundle_price_units),
@@ -1302,6 +1428,8 @@ _MIGRATIONS: list[tuple[int, str, object]] = [    (2, "bundle_region_prices 零�
      _migrate_proxynode_subscription_identity),
     (18, "重检价格历史去重索引，修复早期迁移跳过后仍前进版本的问题",
      _migrate_gph_snapshot_unique),
+    (19, "价格事件与执行来源使用不可复用整数身份并保留通知引用高水位",
+     _migrate_notification_identity),
 ]
 
 
@@ -1339,29 +1467,17 @@ def sqlite_file_path() -> Path | None:
 
 
 async def _snapshot_before_migration(current: int, target: int) -> None:
-    """迁移前落一份快照到 `<db>.pre-migration.bak`（每次覆盖，只留最近一份）。
-
-    **必须有**：结构性迁移（数据回填 / 列拆并 / 表重建）不可逆。单位归一那类
-    步骤若跑错方向，用户整段价格史就变成错值，而此刻线上唯一副本就是它自己；
-    `BACKUP_KEEP` 轮转里的日备最多只能把损失缩到一天前。幂等建索引这类步骤
-    风险低，但迁移链是追加式的，下一条是什么无从预判——按统一规则兜底，
-    不为「这一步看起来安全」开例外。
-
-    **落在库文件旁边**：迁移前快照是「本次升级的回滚点」，一次性、用完即弃，
-    不进 `backups/` 轮转（那是「用户可恢复的历史点」，`BACKUP_KEEP=5`）。
-
-    快照失败时拒绝继续迁移，避免唯一回滚点缺失时改写用户数据。
-    """
+    """原子更新原库旁的迁移前快照，失败时保留旧快照并阻止迁移。"""
     src = _db_file_path()
     if src is None or not src.is_file() or src.stat().st_size == 0:
         return
     dest = src.with_name(src.name + _PRE_MIGRATION_SUFFIX)
     staging = dest.with_name(dest.name + ".tmp")
-    from .backup import snapshot_to
+    from .backup import _remove_transient, snapshot_to
 
     try:
         staging.unlink(missing_ok=True)
-        await asyncio.to_thread(snapshot_to, src, staging)
+        await complete_db_thread(snapshot_to, src, staging)
         staging.replace(dest)
         size_mb = dest.stat().st_size / 1024 / 1024
         log_event(
@@ -1375,8 +1491,11 @@ async def _snapshot_before_migration(current: int, target: int) -> None:
                 "大小MB": round(size_mb, 1),
             },
         )
+    except asyncio.CancelledError:
+        _remove_transient(staging)
+        raise
     except Exception:  # noqa: BLE001
-        staging.unlink(missing_ok=True)
+        _remove_transient(staging)
         log_event(
             logger,
             "升级前快照未完成，已停止本次数据库升级",
@@ -1485,6 +1604,18 @@ async def init_db(*, maintenance_token: str | None = None) -> None:
     if db_path and db_path != ":memory:":
         ensure_restore_lock_available(Path(db_path), maintenance_token=maintenance_token)
 
+    if maintenance_token is not None:
+        if _maintenance_authorized_token() != maintenance_token:
+            if not _current_task_owns_process_write_lock():
+                raise RuntimeError("数据库初始化缺少当前任务的维护授权")
+            with maintenance_authorization(maintenance_token):
+                await init_db(maintenance_token=maintenance_token)
+            return
+        if not _current_task_owns_process_write_lock():
+            async with write_maintenance_barrier():
+                await init_db(maintenance_token=maintenance_token)
+            return
+
     # 导入各域模型模块，确保表注册到 Base.metadata
     from app.core import orchestration as _core_orchestration  # noqa: F401
     from app.domains.agent import models as _agent_models  # noqa: F401
@@ -1525,6 +1656,7 @@ async def init_db(*, maintenance_token: str | None = None) -> None:
             await _snapshot_before_migration(current, pending[-1][0])
 
         async with get_engine().begin() as conn:
+            await conn.execute(text("BEGIN IMMEDIATE"))
             await conn.run_sync(Base.metadata.create_all)
             await conn.run_sync(_ensure_schema)
 
@@ -1567,13 +1699,29 @@ async def init_db(*, maintenance_token: str | None = None) -> None:
 @lru_cache
 def get_engine():
     engine = create_async_engine(get_settings().db_url, echo=False)
+    database_name = engine.url.database
+
+    def check_read_access():
+        if database_name and database_name != ":memory:":
+            from .backup import ensure_database_read_available
+
+            ensure_database_read_available(
+                Path(database_name), maintenance_token=_maintenance_authorized_token()
+            )
+
+    @event.listens_for(engine.sync_engine, "do_connect")
+    def _check_before_connect(_dialect, _record, _args, _kwargs):
+        check_read_access()
+
+    @event.listens_for(engine.sync_engine, "checkout")
+    def _check_before_checkout(_connection, _record, _proxy):
+        check_read_access()
 
     @event.listens_for(engine.sync_engine, "connect")
     def _sqlite_pragma(dbapi_conn, _record):
         cursor = dbapi_conn.cursor()
         cursor.execute("PRAGMA journal_mode=WAL")
-        # WAL 的标准搭配：NORMAL 下 commit 不再逐笔 fsync（进程崩溃不丢数据，
-        # 断电最多丢最近几笔——价格数据下一轮自动重爬，可接受）
+        # NORMAL 保持事务一致性，但操作系统崩溃或断电可能丢失最近提交。
         cursor.execute("PRAGMA synchronous=NORMAL")
         # WAL 物理收缩：autocheckpoint 只把逻辑尾推回头部复用，文件物理大小
         # 会停在增长过的峰值（可达与主库同量级）。超限即截，
@@ -1971,6 +2119,35 @@ _ACTIVE_PROCESS_WRITE_LOCK: contextvars.ContextVar[
     tuple[asyncio.Task, _CrossProcessWriteLock] | None
 ] = contextvars.ContextVar("holdexar_active_process_write_lock", default=None)
 
+_MAINTENANCE_AUTHORIZATION: contextvars.ContextVar[tuple[asyncio.Task, str] | None] = (
+    contextvars.ContextVar("holdexar_maintenance_authorization", default=None)
+)
+
+
+def _maintenance_authorized_token() -> str | None:
+    active = _MAINTENANCE_AUTHORIZATION.get()
+    return active[1] if active is not None and active[0] is asyncio.current_task() else None
+
+
+@contextmanager
+def maintenance_authorization(token: str):
+    task = asyncio.current_task()
+    if task is None:
+        raise RuntimeError("维护授权必须绑定初始化任务")
+    reset = _MAINTENANCE_AUTHORIZATION.set((task, token))
+    try:
+        yield
+    finally:
+        _MAINTENANCE_AUTHORIZATION.reset(reset)
+
+
+def _check_write_maintenance(database_path: Path | None = None, *, maintenance_token: str | None = None) -> None:
+    from app.core.backup import ensure_restore_lock_available
+
+    database = database_path if database_path is not None else sqlite_file_path()
+    if database is not None:
+        ensure_restore_lock_available(database, maintenance_token=maintenance_token)
+
 
 def _current_task_owns_process_write_lock() -> bool:
     active = _ACTIVE_PROCESS_WRITE_LOCK.get()
@@ -1984,28 +2161,54 @@ def _reject_inherited_write_lock() -> None:
 
 
 class _WriteLockLease:
-    def __init__(self, lock: _CrossProcessWriteLock, token: contextvars.Token) -> None:
+    def __init__(self, lock: _CrossProcessWriteLock, token: contextvars.Token, scheduler: WriteScheduler | None = None) -> None:
         self._lock = lock
         self._token = token
+        self._scheduler = scheduler
 
     def release(self) -> None:
         if self._token is None:
             return
         _ACTIVE_PROCESS_WRITE_LOCK.reset(self._token)
         self._token = None
-        self._lock.release()
+        try:
+            self._lock.release()
+        finally:
+            if self._scheduler is not None:
+                self._scheduler.release()
+                self._scheduler = None
 
 
-async def acquire_write_maintenance_barrier() -> _WriteLockLease:
-    """排空所有进程内写入并阻止维护窗口期间新的 write_gate 写入。"""
-    _reject_inherited_write_lock()
-    if _current_task_owns_process_write_lock():
-        raise RuntimeError("维护屏障不能嵌套在现有写事务中")
+async def _acquire_process_write_lease() -> _WriteLockLease:
+    token_value = _maintenance_authorized_token()
+    _check_write_maintenance(maintenance_token=token_value)
     lock = await _CrossProcessWriteLock(_process_write_lock_path()).acquire()
+    try:
+        _check_write_maintenance(maintenance_token=token_value)
+    except BaseException:
+        lock.release()
+        raise
     task = asyncio.current_task()
     assert task is not None
     token = _ACTIVE_PROCESS_WRITE_LOCK.set((task, lock))
     return _WriteLockLease(lock, token)
+
+
+async def acquire_write_maintenance_barrier() -> _WriteLockLease:
+    """排空写入，并以同一锁顺序阻止维护期间的新写入。"""
+    _reject_inherited_write_lock()
+    if _current_task_owns_process_write_lock():
+        raise RuntimeError("维护屏障不能嵌套在现有写事务中")
+    _check_write_maintenance(maintenance_token=_maintenance_authorized_token())
+    scheduler = _scheduler_for_loop()
+    await scheduler.acquire(WritePriority.BACKGROUND, "database_maintenance")
+    try:
+        lease = await _acquire_process_write_lease()
+        lease._scheduler = scheduler
+        return lease
+    except BaseException:
+        scheduler.release()
+        raise
 
 
 @asynccontextmanager
@@ -2019,10 +2222,12 @@ async def write_maintenance_barrier() -> AsyncIterator[None]:
 
 
 @contextmanager
-def sync_write_gate(database_path: Path | None = None):
+def sync_write_gate(database_path: Path | None = None, *, maintenance_token: str | None = None):
     """同步维护工具复用同一数据库的进程间写锁。"""
+    _check_write_maintenance(database_path, maintenance_token=maintenance_token)
     lock = _CrossProcessWriteLock(_process_write_lock_path(database_path)).acquire_sync()
     try:
+        _check_write_maintenance(database_path, maintenance_token=maintenance_token)
         yield
     finally:
         lock.release()
@@ -2048,6 +2253,7 @@ class _WriteGate:
 
     async def __aenter__(self) -> None:
         _reject_inherited_write_lock()
+        _check_write_maintenance(maintenance_token=_maintenance_authorized_token())
         self._scheduler = _scheduler_for_loop()
         label = self._label
         if label is None:
@@ -2061,7 +2267,7 @@ class _WriteGate:
         if reentrant or _current_task_owns_process_write_lock():
             return
         try:
-            self._process_lease = await acquire_write_maintenance_barrier()
+            self._process_lease = await _acquire_process_write_lease()
         except BaseException:
             self._scheduler.release()
             self._scheduler = None
@@ -2074,6 +2280,28 @@ class _WriteGate:
                 self._process_lease = None
             self._scheduler.release()
             self._scheduler = None
+
+
+async def complete_db_thread(function, /, *args, **kwargs):
+    """取消调用者也须等同步数据库操作关闭连接后再交还资源。"""
+    worker = asyncio.get_running_loop().run_in_executor(
+        None, contextvars.copy_context().run, partial(function, *args, **kwargs)
+    )
+    cancelled = None
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+        except BaseException:
+            if cancelled is None:
+                raise
+            break
+    if cancelled is not None:
+        if not worker.cancelled():
+            worker.exception()
+        raise cancelled
+    return worker.result()
 
 
 def write_gate(
@@ -2155,7 +2383,16 @@ async def write_session(
 
 def write_scheduler_diagnostics() -> dict:
     """当前事件循环写调度器的诊断快照（写者被堵时的取证出口）。"""
-    return _scheduler_for_loop().diagnostics()
+    snapshot = _scheduler_for_loop().diagnostics()
+    pool = get_engine().sync_engine.pool
+    occupancy = {"type": type(pool).__name__, "status": pool.status()}
+    for name, method in (("size", "size"), ("checkedOut", "checkedout"),
+                         ("checkedIn", "checkedin"), ("overflow", "overflow")):
+        read = getattr(pool, method, None)
+        if callable(read):
+            occupancy[name] = read()
+    snapshot["pool"] = occupancy
+    return snapshot
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:

@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 
 import { settingsApi, type SettingsPayload } from '@/api/client'
+import { useThemeStore } from '@/stores/theme'
 
 const ONBOARDING_DISMISSED_KEY = 'holdexar_onboarding_dismissed'
 
@@ -44,6 +45,7 @@ export const useSettingsStore = defineStore('settings', () => {
     if (loaded.value) return
     try {
       const s = await settingsApi.get()
+      useThemeStore().hydrate(s.theme)
       account.value = s.account
       const localDismissed = isLocalOnboardingDismissed()
       if (s.onboarding_done) {

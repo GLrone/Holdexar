@@ -112,7 +112,9 @@ async def test_add_and_list_subscription_encrypted_at_rest(db, monkeypatch):
     assert stored.startswith("enc1:") and URL_A not in stored  # 落库即密文
     listed = await proxies_service.list_subscriptions("clash")
     target = next(s for s in listed if s["id"] == result["id"])
-    assert target["url"] == URL_A  # 面板取到的是开封后的明文
+    assert target["url"] == "https://provider.example/***"
+    revealed = await proxies_service.list_subscriptions("clash", reveal=True)
+    assert next(s for s in revealed if s["id"] == result["id"])["url"] == URL_A
 
 
 @pytest.mark.asyncio

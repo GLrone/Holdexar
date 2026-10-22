@@ -11,6 +11,12 @@ from app.core import layout, update_host
 from app.core.app_info import APP_NAME, STAGING_MANIFEST_NAME
 
 
+@pytest.fixture(autouse=True)
+def _mock_payload_protocol(request, monkeypatch):
+    if "protocol_detection" not in request.node.name:
+        monkeypatch.setattr(update_host, "supports_data_protocol", lambda exe: True)
+
+
 def _create_mock_app_payload(staging_dir: Path, target_version: str, has_exe: bool = True) -> Path:
     payload = staging_dir / APP_NAME
     payload.mkdir(parents=True, exist_ok=True)
@@ -172,7 +178,7 @@ def test_update_host_retention_prunes_older_versions(tmp_path):
     assert not layout.get_version_dir(root, "0.3.4").exists()
 
 
-def test_bridge_legacy_update_converts_flat_layout(tmp_path):
+def test_bridge_legacy_update_converts_flat_layout(tmp_path, monkeypatch):
     target = tmp_path / "installed"
     target.mkdir()
     staging = tmp_path / "staging"
@@ -182,22 +188,27 @@ def test_bridge_legacy_update_converts_flat_layout(tmp_path):
     (target / "_internal").mkdir()
     (target / "_internal" / "python313.dll").write_bytes(b"old_dll")
     (target / "data").mkdir()
-    (target / "data" / "holdexar.db").write_bytes(b"user_database")
+    connection = sqlite3.connect(target / "data" / "holdexar.db")
+    connection.execute("CREATE TABLE user_record (value TEXT)")
+    connection.commit()
+    connection.close()
+    original_bytes = (target / "data" / "holdexar.db").read_bytes()
 
     # 构造新版本 0.3.3-beta 暂存包
     _create_mock_app_payload(staging, "0.3.3-beta", has_exe=True)
+    monkeypatch.setattr(update_host, "probe_version_health", lambda *a, **kw: (True, "ready"))
 
     ok = update_host.bridge_legacy_update(
         staging=staging,
         target=target,
         current_version="0.3.2-beta",
-        skip_health_check=True,
+        skip_health_check=False,
         launch_on_finish=False,
     )
     assert ok is True
 
     # 验证用户数据完好
-    assert (target / "data" / "holdexar.db").read_bytes() == b"user_database"
+    assert (target / "data" / "holdexar.db").read_bytes() == original_bytes
 
     # 验证旧版已被组织进 versions/0.3.2-beta/
     assert (target / "versions" / "0.3.2-beta" / "_internal" / "python313.dll").is_file()
@@ -326,6 +337,8 @@ def test_probe_rejects_health_from_foreign_process(tmp_path, monkeypatch):
     monkeypatch.setattr(update_host, "_listen_ports", lambda pid: ([28765], 777))
     monkeypatch.setattr(update_host, "process_image_path", lambda pid: str(exe))
     monkeypatch.setattr(update_host.httpx, "get", lambda *a, **k: _Resp())
+    monkeypatch.setattr("app.core.update_process.ProbeTree.assign", lambda *a: None)
+    monkeypatch.setattr("app.core.update_process.ProbeTree.stop", lambda *a: None)
 
     healthy, reason = update_host.probe_version_health(
         root, "0.3.6", attempt_id="att-1", timeout=0.6,
@@ -458,8 +471,7 @@ def test_legacy_launcher_lands_before_legacy_moves(tmp_path):
     assert curr["previousVersion"] == "0.3.2-beta"
 
 
-def test_legacy_migration_failure_keeps_root_exe(tmp_path, monkeypatch):
-    """数据迁移失败即终止：根目录启动器在、旧版主程序仍在根目录、版本目录未建。"""
+def test_legacy_invalid_external_database_stays_in_place(tmp_path, monkeypatch):
     target = tmp_path / "installed"
     staging = tmp_path / "staging"
     appdata = tmp_path / "appdata" / "holdexar"
@@ -471,13 +483,6 @@ def test_legacy_migration_failure_keeps_root_exe(tmp_path, monkeypatch):
     _create_mock_app_payload(staging, "0.3.6", has_exe=True)
     monkeypatch.setattr(update_host, "_launch_entry", lambda root: True)
 
-    def _boom(*a, **k):
-        raise sqlite3.DatabaseError("database disk image is malformed")
-
-    monkeypatch.setattr(
-        "app.core.migration.migrate_appdata_to_portable", _boom, raising=True
-    )
-
     ok = update_host.bridge_legacy_update(
         staging=staging,
         target=target,
@@ -488,11 +493,8 @@ def test_legacy_migration_failure_keeps_root_exe(tmp_path, monkeypatch):
     )
     assert ok is False
     assert (target / f"{APP_NAME}.exe").is_file()          # 新版启动入口在位
-    assert (target / "__legacy__" / f"{APP_NAME}.exe").is_file()  # 旧入口有备份
-    assert not (target / "versions").exists() or not any(
-        (target / "versions").iterdir()
-    )
-    # 迁移失败不得在 data/ 建新库替代历史数据
+    assert layout.get_version_exe(target, "0.3.2-beta").is_file()
+    assert (appdata / "holdexar.db").read_bytes() == b"legacy_database"
     assert not (target / "data" / "holdexar.db").exists()
 
 
@@ -622,3 +624,262 @@ def test_safe_replace_executable_fallback(tmp_path, monkeypatch):
     assert len(old_files) == 1
     update_host.cleanup_old_executables(tmp_path)
     assert len(list(tmp_path.glob("running.old_*.exe"))) == 0
+
+
+@pytest.mark.parametrize("failure_point", ["before", "migration", "health", "page"])
+def test_failed_upgrade_restores_database_before_relaunching_source(tmp_path, monkeypatch, failure_point):
+    root = tmp_path / "app"
+    staging = tmp_path / "staging"
+    old = layout.get_version_dir(root, "0.3.5")
+    old.mkdir(parents=True)
+    (old / f"{APP_NAME}.exe").write_bytes(b"old")
+    layout.write_current_state(root, "0.3.5")
+    _create_mock_app_payload(staging, "0.3.6")
+    data_dir = root / "data"
+    data_dir.mkdir()
+    db_path = data_dir / "holdexar.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE user_record (id INTEGER PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO user_record VALUES (1, 'before')")
+        conn.execute("PRAGMA user_version=17")
+    conn.close()
+
+    calls = []
+
+    def fail_after_migration(*_args, **_kwargs):
+        calls.append(True)
+        if failure_point == "before" or len(calls) > 1:
+            return False, "injected failure"
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("ALTER TABLE user_record ADD COLUMN new_version TEXT")
+            if failure_point != "migration":
+                conn.execute("PRAGMA user_version=18")
+        conn.close()
+        return failure_point == "page", "injected failure"
+
+    relaunched = []
+
+    def observe_source(_root, _version):
+        with sqlite3.connect(db_path) as conn:
+            relaunched.append((conn.execute("PRAGMA user_version").fetchone()[0],
+                               conn.execute("SELECT value FROM user_record").fetchone()[0]))
+
+    monkeypatch.setattr(update_host, "probe_version_health", fail_after_migration)
+    monkeypatch.setattr(update_host, "_relaunch_previous", observe_source)
+    assert update_host.execute_update(
+        root, staging, target_version="0.3.6", source_version="0.3.5",
+        data_dir=data_dir, launch_on_finish=False,
+    ) is False
+    assert relaunched == [(17, "before")]
+    with sqlite3.connect(db_path) as conn:
+        assert [row[1] for row in conn.execute("PRAGMA table_info(user_record)")] == ["id", "value"]
+
+
+def test_protocol_detection_does_not_run_unknown_desktop_switch(tmp_path, monkeypatch):
+    exe = tmp_path / "old.exe"
+    exe.write_bytes(b"old")
+    commands = []
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        return update_host.subprocess.CompletedProcess(command, 0, "--server --apply-update", "")
+
+    monkeypatch.setattr(update_host.subprocess, "run", run)
+    assert update_host.supports_data_protocol(exe) is False
+    assert commands == [[str(exe), "--update-protocol", "--help"]]
+
+
+def test_protocol_detection_requires_matching_response(tmp_path, monkeypatch):
+    exe = tmp_path / "new.exe"
+    exe.write_bytes(b"new")
+    def run(command, **kwargs):
+        Path(kwargs["env"]["HOLDEXAR_UPDATE_PROTOCOL_RESULT"]).write_text('{"updateDataProtocol":1}')
+        return update_host.subprocess.CompletedProcess(command, 0, b"", b"")
+
+    monkeypatch.setattr(update_host.subprocess, "run", run)
+    assert update_host.supports_data_protocol(exe) is True
+
+
+def test_waiting_old_instance_failure_does_not_install(tmp_path, monkeypatch):
+    root = tmp_path / "app"
+    staging = tmp_path / "staging"
+    _create_mock_app_payload(staging, "0.3.6")
+    monkeypatch.setattr(update_host, "wait_process_exit", lambda *args, **kwargs: False)
+    assert update_host.execute_update(root, staging, target_version="0.3.6", wait_pid=901) is False
+    assert layout.read_current_state(root) is None
+    assert not layout.get_version_dir(root, "0.3.6").exists()
+
+
+def test_recovery_does_not_release_startup_when_pointer_finish_failed(tmp_path, monkeypatch):
+    root = tmp_path / "app"
+    layout.start_transaction(root, "0.3.6", "0.3.5", attempt_id="previous")
+    layout.update_transaction(root, "recovery_required", dataPrepared=True,
+                              dataRecoveryPhase="restored", dataDir=str(root / "data"))
+    monkeypatch.setattr(update_host, "_fail", lambda *a, **kw: False)
+    with pytest.raises(RuntimeError):
+        update_host.recover_interrupted_update(root)
+
+
+@pytest.mark.parametrize("previous_phase", ["preparing", "restored", "accepted"])
+def test_new_update_cannot_overwrite_unfinished_data_ownership(tmp_path, monkeypatch, previous_phase):
+    from app.core import update_data
+
+    root = tmp_path / "app"
+    staging = tmp_path / "staging"
+    old = layout.get_version_dir(root, "0.3.5")
+    old.mkdir(parents=True)
+    (old / f"{APP_NAME}.exe").write_bytes(b"old")
+    layout.write_current_state(root, "0.3.5")
+    _create_mock_app_payload(staging, "0.3.7")
+    layout.start_transaction(root, "0.3.6", "0.3.5", attempt_id="previous")
+    layout.update_transaction(root, "recovery_required", dataPrepared=previous_phase != "preparing",
+                              dataRecoveryPhase=previous_phase, dataAccepted=previous_phase == "accepted",
+                              dataDir=str(root / "data"))
+
+    def unfinished(*args, **kwargs):
+        raise RuntimeError("previous ownership cannot finish")
+
+    monkeypatch.setattr(update_data, "abort_preparation", unfinished)
+    monkeypatch.setattr(update_data, "rollback", unfinished)
+    monkeypatch.setattr(update_data, "accept", unfinished)
+    assert update_host.execute_update(root, staging, target_version="0.3.7", skip_health_check=True,
+                                      launch_on_finish=False) is False
+    assert layout.read_transaction(root)["attemptId"] == "previous"
+    assert not layout.get_version_dir(root, "0.3.7").exists()
+
+
+@pytest.mark.parametrize("target,source", [("0.3.5", "0.3.5"), ("0.3.6", "0.3.4")])
+def test_stale_update_request_cannot_replace_active_program(tmp_path, target, source):
+    root = tmp_path / "app"
+    active = layout.get_version_dir(root, "0.3.5")
+    active.mkdir(parents=True)
+    exe = active / f"{APP_NAME}.exe"
+    exe.write_bytes(b"preserve-active")
+    layout.write_current_state(root, "0.3.5")
+    layout.start_transaction(root, "0.3.5", "0.3.4", attempt_id="accepted-previous")
+    assert update_host.execute_update(root, tmp_path / "missing-payload", target_version=target,
+                                      source_version=source, skip_health_check=True, launch_on_finish=False) is False
+    assert exe.read_bytes() == b"preserve-active"
+    assert layout.read_transaction(root)["attemptId"] == "accepted-previous"
+
+
+def test_accepted_update_only_falls_back_to_verified_compatible_program(tmp_path):
+    root = tmp_path / "app"
+    old = layout.get_version_dir(root, "0.3.5")
+    old.mkdir(parents=True)
+    (old / f"{APP_NAME}.exe").write_bytes(b"compatible")
+    layout.write_current_state(root, "0.3.6", last_known_good="0.3.5")
+    data = root / "data"
+    data.mkdir()
+    conn = sqlite3.connect(data / "holdexar.db")
+    conn.execute("PRAGMA user_version=18")
+    conn.close()
+    layout.write_data_compatibility(root, {"dataDir": str(data), "schemaVersion": 18,
+                                          "versions": ["0.3.5", "0.3.6"]})
+    layout.start_transaction(root, "0.3.6", "0.3.5", attempt_id="accepted")
+    layout.update_transaction(root, layout.STAGE_COMMITTED, dataPrepared=True, dataAccepted=True,
+                              dataRecoveryPhase="accepted", dataSchemaVersion=18, dataToken="accepted",
+                              dataDir=str(data), dataDbPath=str(data / "holdexar.db"))
+    assert update_host.recover_interrupted_update(root) is True
+    assert layout.get_current_version(root) == "0.3.5"
+
+
+@pytest.mark.parametrize("target", ["0.3.5-BETA", "0.3.5-beta."])
+def test_windows_target_alias_cannot_replace_active_program(tmp_path, target):
+    import os
+
+    if os.name != "nt":
+        pytest.skip("Windows path identity")
+    root = tmp_path / "app"
+    active = layout.get_version_exe(root, "0.3.5-beta")
+    active.parent.mkdir(parents=True)
+    active.write_bytes(b"preserve-active")
+    assert layout.get_version_dir(root, target).samefile(active.parent)
+    layout.write_current_state(root, "0.3.5-beta")
+    layout.start_transaction(root, "0.3.5-beta", "0.3.4-beta", attempt_id="accepted-previous")
+    staging = tmp_path / "staging"
+    _create_mock_app_payload(staging, target)
+    assert update_host.execute_update(root, staging, target_version=target,
+                                      skip_health_check=True, launch_on_finish=False) is False
+    assert active.read_bytes() == b"preserve-active"
+    assert layout.read_transaction(root)["attemptId"] == "accepted-previous"
+
+
+def test_direct_install_cannot_replace_current_version(tmp_path):
+    root = tmp_path / "app"
+    active = layout.get_version_exe(root, "0.3.5")
+    active.parent.mkdir(parents=True)
+    active.write_bytes(b"preserve-active")
+    layout.write_current_state(root, "0.3.5")
+    staging = tmp_path / "staging"
+    _create_mock_app_payload(staging, "0.3.5")
+    with pytest.raises(RuntimeError):
+        update_host.install_version_payload(root, staging, "0.3.5")
+    assert active.read_bytes() == b"preserve-active"
+
+
+def test_legacy_bridge_stops_before_changing_files_when_old_process_is_running(tmp_path, monkeypatch):
+    root = tmp_path / "app"
+    root.mkdir()
+    (root / f"{APP_NAME}.exe").write_bytes(b"original")
+    (root / "_internal").mkdir()
+    staging = tmp_path / "staging"
+    _create_mock_app_payload(staging, "0.3.6")
+    monkeypatch.setattr(update_host, "wait_process_exit", lambda *args, **kwargs: False)
+    changed = []
+    monkeypatch.setattr(update_host, "prepare_launcher_only", lambda *a, **kw: changed.append(True) or False)
+    assert update_host.bridge_legacy_update(staging, root, wait_pid=901, launch_on_finish=False) is False
+    assert changed == []
+    assert (root / f"{APP_NAME}.exe").read_bytes() == b"original"
+
+
+def test_legacy_bridge_keeps_external_data_and_its_staged_payload(tmp_path, monkeypatch):
+    root = tmp_path / "app"
+    _flat_legacy(root)
+    (root / "data" / "holdexar.db").unlink()
+    data = tmp_path / "external-data"
+    staging = data / "update-staging"
+    _create_mock_app_payload(staging, "0.3.6")
+    conn = sqlite3.connect(data / "holdexar.db")
+    conn.execute("CREATE TABLE user_record(value TEXT)")
+    conn.execute("INSERT INTO user_record VALUES ('preserved')")
+    conn.commit()
+    conn.close()
+    (data / "other-user-file").write_bytes(b"preserved")
+    monkeypatch.setattr(update_host, "probe_version_health", lambda *a, **kw: (True, "ready"))
+    assert update_host.bridge_legacy_update(staging, root, data_dir=data,
+        current_version="0.3.2-beta", launch_on_finish=False) is True
+    assert layout.read_transaction(root)["dataDir"] == str(data.resolve())
+    assert (data / "other-user-file").read_bytes() == b"preserved"
+    assert not (root / "data" / "holdexar.db").exists()
+    conn = sqlite3.connect(data / "holdexar.db")
+    assert conn.execute("SELECT value FROM user_record").fetchall() == [("preserved",)]
+    conn.close()
+
+
+def test_stale_legacy_bridge_cannot_rewrite_current_pointer(tmp_path):
+    root = tmp_path / "app"
+    active = layout.get_version_exe(root, "2.0.0")
+    active.parent.mkdir(parents=True)
+    active.write_bytes(b"active")
+    layout.write_current_state(root, "2.0.0")
+    staging = tmp_path / "staging"
+    _create_mock_app_payload(staging, "3.0.0")
+    assert update_host.bridge_legacy_update(staging, root, current_version="1.0.0",
+        skip_health_check=True, launch_on_finish=False) is False
+    assert layout.get_current_version(root) == "2.0.0"
+    assert active.read_bytes() == b"active"
+
+
+def test_legacy_bridge_rejects_version_folder_as_install_root(tmp_path):
+    root = tmp_path / "app"
+    active = layout.get_version_exe(root, "1.0.0")
+    active.parent.mkdir(parents=True)
+    active.write_bytes(b"active")
+    layout.write_current_state(root, "1.0.0")
+    staging = tmp_path / "staging"
+    _create_mock_app_payload(staging, "2.0.0")
+    assert update_host.bridge_legacy_update(staging, active.parent,
+        current_version="1.0.0", skip_health_check=True, launch_on_finish=False) is False
+    assert not (active.parent / "versions").exists()
+    assert layout.get_current_version(root) == "1.0.0"

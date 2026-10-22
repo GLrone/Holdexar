@@ -36,7 +36,7 @@ FORMAT_VERSION = 1
 EXPORT_DIR_NAME = "exports"
 EXPORT_SUFFIX = ".hxexport"
 
-_MIN_PASSWORD_LEN = 6
+_MIN_PASSWORD_LEN = 12
 _SCRYPT_N = 1 << 15
 _SCRYPT_R = 8
 _SCRYPT_P = 1
@@ -108,8 +108,14 @@ _EXCLUDES_LABELS = (
 
 
 def export_dir(data_dir: Path) -> Path:
+    """导出目录（创建时即收紧权限：内含凭据副本）。"""
     path = Path(data_dir) / EXPORT_DIR_NAME
     path.mkdir(parents=True, exist_ok=True)
+    if sys.platform != "win32":
+        try:
+            path.chmod(0o700)
+        except OSError:
+            pass
     return path
 
 

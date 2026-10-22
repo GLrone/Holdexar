@@ -66,7 +66,7 @@ def stored_password(monkeypatch):
     async def fake_get_value(key, default=None):
         return {"smtp.password": "saved-pass"}.get(key, default)
 
-    monkeypatch.setattr(notify, "get_value", fake_get_value)
+    monkeypatch.setattr(notify, "get_secret_value", fake_get_value)
 
 
 FORM = dict(host="smtp.qq.com", port=465, user="me@qq.com", password="", to_addr="to@qq.com", use_ssl=True)
@@ -104,7 +104,7 @@ async def test_missing_config_raises_with_field_names(fake_smtp, monkeypatch):
     async def no_password(key, default=None):
         return default
 
-    monkeypatch.setattr(notify, "get_value", no_password)
+    monkeypatch.setattr(notify, "get_secret_value", no_password)
     with pytest.raises(ValueError) as ei:
         await notify.send_test_mail(**{**FORM, "host": "", "to_addr": ""})
     msg = str(ei.value)

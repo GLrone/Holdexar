@@ -89,12 +89,61 @@ def write_current_state(
         "installedAt": time.time(),
         "lastKnownGood": last_known_good,
     }
+    previous = read_current_state(install_root)
+    if previous is not None and "dataCompatibility" in previous:
+        state["dataCompatibility"] = previous["dataCompatibility"]
     if extra:
         state.update(extra)
     state.update(fields)
 
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(target)
+    return state
+
+
+def _validated_data_compatibility(compatibility: Any) -> dict[str, Any]:
+    if not isinstance(compatibility, dict):
+        raise RuntimeError("数据与程序的相容记录无效")
+    directory = compatibility.get("dataDir")
+    schema = compatibility.get("schemaVersion")
+    versions = compatibility.get("versions")
+    if (
+        not isinstance(directory, str) or not directory or not Path(directory).is_absolute()
+        or type(schema) is not int or schema < 0
+        or not isinstance(versions, list) or not versions
+        or any(not isinstance(version, str) or not is_managed_version_name(version) for version in versions)
+    ):
+        raise RuntimeError("数据与程序的相容记录不完整，已停止选择程序")
+    return {"dataDir": str(Path(directory).resolve()), "schemaVersion": schema,
+            "versions": list(dict.fromkeys(versions))}
+
+
+def read_data_compatibility(install_root: Path, *, data_dir: Path | None = None) -> dict[str, Any] | None:
+    state = read_current_state(install_root)
+    if state is None:
+        if (install_root / STATE_DIR_NAME / CURRENT_STATE_FILE).exists():
+            raise RuntimeError("程序指向记录无法读取，已停止选择程序")
+        return None
+    if "dataCompatibility" not in state:
+        return None
+    compatibility = _validated_data_compatibility(state["dataCompatibility"])
+    if data_dir is not None and Path(compatibility["dataDir"]) != data_dir.resolve():
+        raise RuntimeError("数据相容记录属于其他数据目录，已停止选择程序")
+    return compatibility
+
+
+def write_data_compatibility(install_root: Path, compatibility: dict[str, Any]) -> dict[str, Any]:
+    compatibility = _validated_data_compatibility(compatibility)
+    state = read_current_state(install_root)
+    if state is None:
+        raise RuntimeError("缺少有效程序指向，不能保存数据相容记录")
+    state["dataCompatibility"] = compatibility
+    target = get_state_dir(install_root) / CURRENT_STATE_FILE
+    tmp = target.with_name(CURRENT_STATE_FILE + ".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(target)
+    with target.open("rb+") as stream:
+        os.fsync(stream.fileno())
     return state
 
 
@@ -242,7 +291,7 @@ def is_managed_version_name(name: str) -> bool:
     text = str(name or "")
     if not text or text in {".", ".."}:
         return False
-    if text != text.strip():
+    if text != text.strip() or text.endswith("."):
         return False
     if any(sep in text for sep in ("/", "\\", ":")):
         return False
@@ -256,6 +305,15 @@ def is_managed_version_name(name: str) -> bool:
     if not (text[0].isdigit() or text == "legacy_version"):
         return False
     return True
+
+
+def same_version_directory(install_root: Path, first: str, second: str) -> bool:
+    left = get_version_dir(install_root, first)
+    right = get_version_dir(install_root, second)
+    try:
+        return left.samefile(right)
+    except FileNotFoundError:
+        return left.resolve() == right.resolve()
 
 
 def get_version_exe(install_root: Path, version: str) -> Path:
@@ -363,7 +421,8 @@ def abort_version(install_root: Path, attempted: str) -> bool:
     """
     state = read_current_state(install_root) or {}
     fallback = state.get("lastKnownGood") or state.get("previousVersion")
-    if not fallback or fallback == attempted:
+    if (not fallback or not is_managed_version_name(attempted)
+            or same_version_directory(install_root, fallback, attempted)):
         return False
     if not is_version_valid(install_root, fallback):
         return False

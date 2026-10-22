@@ -30,8 +30,10 @@ class Proxy(Base):
     scheme: Mapped[str] = mapped_column(String(10), default="http")  # http | socks5
     host: Mapped[str] = mapped_column(String(255))
     port: Mapped[int] = mapped_column(Integer)
-    username: Mapped[str | None] = mapped_column(String(100))
-    password: Mapped[str | None] = mapped_column(String(100))
+    # 代理账号口令属长期凭据：与 Steam Cookie 同级，落库为 `enc1:` 密文。
+    # 列宽按密文长度放宽（AES-GCM 密文 + base64 后远大于原口令）。
+    username: Mapped[str | None] = mapped_column(String(255))
+    password: Mapped[str | None] = mapped_column(String(255))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     status: Mapped[str] = mapped_column(String(20), default="unknown")  # ok|failed|unknown
     latency_ms: Mapped[int | None] = mapped_column(Integer)
@@ -40,6 +42,11 @@ class Proxy(Base):
     created_at: Mapped[datetime | None] = mapped_column(DateTime)
 
     def url(self) -> str:
+        """运行时 URL（明文账号口令）：仅供进程内出网使用，不得进响应体。
+
+        读写库一律走 `app.domains.proxies.credentials`，那一层负责加解密；
+        本方法接到的已是解密后的明文（或干脆是内存里构造的未落库对象）。
+        """
         auth = f"{self.username}:{self.password}@" if self.username else ""
         return f"{self.scheme}://{auth}{self.host}:{self.port}"
 
