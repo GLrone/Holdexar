@@ -179,6 +179,18 @@ async def _post_startup_chain() -> None:
     """
     from app.core.seed_assets import merge_seed_incremental
 
+    from app.domains.notifications.service import recover_delivery_state, resume_event_scans
+
+    try:
+        await recover_delivery_state()
+    except Exception:
+        log_event(logger, "提醒投递状态恢复失败，不阻塞启动", level=logging.ERROR, exc_info=True)
+
+    try:
+        await resume_event_scans()
+    except Exception:
+        log_event(logger, "未完成的提醒生成仍保留，后续继续恢复", level=logging.ERROR, exc_info=True)
+
     try:
         await merge_seed_incremental()
     except Exception:  # noqa: BLE001

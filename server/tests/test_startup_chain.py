@@ -35,6 +35,7 @@ from app.domains.family import service as family_service
 from app.domains.games import service as games_service
 from app.domains.games import series as games_series
 from app.domains.metadata import service as metadata_service
+from app.domains.notifications import service as notifications_service
 from app.domains.proxies import service as proxies_service
 from app.domains.rates import history as rates_history_mod
 from app.domains.rates import service as rates_service
@@ -68,6 +69,8 @@ def chain_calls(monkeypatch):
         return _impl
 
     for name, fn in [
+        ("notifications_recover", notifications_service.recover_delivery_state),
+        ("notifications_resume", notifications_service.resume_event_scans),
         ("merge_seeds", seed_assets.merge_seed_incremental),
         ("family_warm", family_service.cached_family_library),
         ("orphan_cleanup", crawl_service.cleanup_orphan_jobs),
@@ -88,7 +91,8 @@ def chain_calls(monkeypatch):
         ("fx_bootstrap", rates_history_mod.bootstrap_full_history),
     ]:
         # main 里是函数内局部 import 再以模块属性调用：桩必须挂在源模块上
-        target = {"merge_seeds": seed_assets,
+        target = {"notifications_recover": notifications_service, "notifications_resume": notifications_service,
+                  "merge_seeds": seed_assets,
                   "family_warm": family_service, "orphan_cleanup": crawl_service,
                   "rates_cleanup": rates_service, "legacy_sub_migrate": proxies_service,
                   "legacy_kv_migrate": account_service, "credential_seal": account_service,
@@ -162,7 +166,7 @@ async def test_chain_order_and_scheduler_last(db, chain_calls):
     """全链顺序：种子 → … → 标记三连 + 系列归组 → 内核 → 自启 → 池 Runtime → 订阅同步 → 汇率 → 捆绑包预热 → Epic 预热 → 活动日历 → 调度器 → 按需补齐（种子/汇率全史）。"""
     await main_mod._post_startup_chain()
     expected = [
-        "merge_seeds", "family_warm", "orphan_cleanup",
+        "notifications_recover", "notifications_resume", "merge_seeds", "family_warm", "orphan_cleanup",
         "rates_cleanup", "legacy_sub_migrate", "legacy_kv_migrate",
         "credential_seal", "subscription_seal",
         "hl_flags", "pp_flags", "sort_cache", "series_refresh",
@@ -186,6 +190,7 @@ async def test_startup_chain_never_repairs_history(db, chain_calls):
 async def test_chain_survives_step_failure(db, chain_calls):
     """种子合并炸了不拖垮后续：标记刷新照常、调度器照常启动。"""
     chain_calls.errors["merge_seeds"] = RuntimeError("种子库损坏")
+    chain_calls.errors["notifications_recover"] = RuntimeError("notification storage unavailable")
     chain_calls.errors["pp_flags"] = RuntimeError("窗口函数不兼容")
     await main_mod._post_startup_chain()
     assert "scheduler_start" in chain_calls.calls
@@ -230,13 +235,13 @@ async def test_lifespan_listens_without_waiting_for_chain(db, chain_calls, monke
     test_scope = types.SimpleNamespace(tasks=[])
     monkeypatch.setattr(asyncio, "create_task", tracked_create_task)
 
-    async with main_mod.lifespan(None):
+    async with main_mod.lifespan(types.SimpleNamespace(state=types.SimpleNamespace())):
         # lifespan 已开门（yield 返回）：此刻链只应刚起步，一步都没跑完
         assert started.is_set()
         assert chain_calls.calls == []
         await asyncio.sleep(0.05)
         # 闸不放行，链仍卡在第一步——证明 yield 没等它
-        assert chain_calls.calls == ["merge_seeds"] or chain_calls.calls == []
+        assert chain_calls.calls == ["notifications_recover", "notifications_resume", "merge_seeds"] or chain_calls.calls == []
         # 放行收尾
         chain_calls.gates["merge_seeds"].set()
         await asyncio.wait_for(test_scope.tasks[0], timeout=5)

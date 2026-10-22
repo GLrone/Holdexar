@@ -75,10 +75,12 @@ class NotificationCandidate(Base):
     created_at: Mapped[datetime | None] = mapped_column(DateTime)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime)
+    delivery_history_json: Mapped[list | None] = mapped_column(JSON)
 
     __table_args__ = (
         Index(
             "ux_notification_candidate", "event_id", "recipient", unique=True
         ),
         Index("ix_notification_status", "status"),
+        Index("ix_notification_cycle", "cycle_id"),
     )

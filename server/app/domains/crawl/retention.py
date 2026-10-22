@@ -29,6 +29,16 @@ _CHUNK = 50
 _MAX_CHUNKS = 20
 
 
+def unfinished_job_units_sql(alias: str = "crawl_jobs") -> str:
+    return (f"CASE WHEN json_valid({alias}.stats_json) THEN "
+            f"COALESCE(json_array_length({alias}.stats_json, '$.retryUnits'), 0) + "
+            f"CASE WHEN {alias}.status IN ('failed','interrupted') THEN "
+            f"COALESCE(json_array_length({alias}.stats_json, '$.targets.appids'), 0) * "
+            f"COALESCE(json_array_length({alias}.stats_json, '$.targets.regions'), 0) + "
+            f"COALESCE(json_array_length({alias}.stats_json, '$.targets.tasks'), 0) "
+            "ELSE 0 END ELSE 0 END > 0")
+
+
 async def _chunked_execute(
     sql: str, params: dict, *, chunk: int, max_chunks: int
 ) -> tuple[int, bool]:
@@ -69,10 +79,25 @@ async def prune_price_cycles(
     keep_pending = ""
     if params:
         keep_pending = " AND id NOT IN (" + ",".join(":" + key for key in params) + ")"
+    events_deleted, truncated_events = await _chunked_execute(
+        "DELETE FROM price_events WHERE id IN ("
+        "SELECT id FROM price_events"
+        " WHERE occurred_at IS NOT NULL AND occurred_at < :cutoff"
+        " AND NOT EXISTS (SELECT 1 FROM notification_candidates n WHERE n.event_id=price_events.id)"
+        " AND NOT EXISTS (SELECT 1 FROM price_cycles c WHERE c.id=price_events.cycle_id"
+        " AND json_extract(c.notification_scan_json, '$.state') IN ('pending','scanning'))"
+        " ORDER BY id LIMIT :chunk)",
+        {"cutoff": cutoff}, chunk=chunk, max_chunks=max_chunks,
+    )
     rows_deleted, truncated_rows = await _chunked_execute(
         "DELETE FROM price_cycles WHERE id IN ("
         "SELECT id FROM price_cycles"
         " WHERE started_at IS NOT NULL AND started_at < :cutoff"
+        " AND status IN ('completed','partial','failed','cancelled')"
+        " AND NOT EXISTS (SELECT 1 FROM price_events e WHERE e.cycle_id=price_cycles.id)"
+        " AND NOT EXISTS (SELECT 1 FROM notification_candidates n WHERE n.cycle_id=price_cycles.id)"
+        " AND NOT EXISTS (SELECT 1 FROM crawl_jobs j WHERE j.cycle_id=price_cycles.id)"
+        " AND COALESCE(json_extract(notification_scan_json, '$.state'),'') NOT IN ('pending','scanning')"
         + keep_pending + " ORDER BY id LIMIT :chunk)",
         {"cutoff": cutoff, **params},
         chunk=chunk,
@@ -86,15 +111,6 @@ async def prune_price_cycles(
         "  ORDER BY id DESC LIMIT :keep)"
         " ORDER BY id LIMIT :chunk)",
         {"keep": detail_keep},
-        chunk=chunk,
-        max_chunks=max_chunks,
-    )
-    events_deleted, truncated_events = await _chunked_execute(
-        "DELETE FROM price_events WHERE id IN ("
-        "SELECT id FROM price_events"
-        " WHERE occurred_at IS NOT NULL AND occurred_at < :cutoff"
-        " ORDER BY id LIMIT :chunk)",
-        {"cutoff": cutoff},
         chunk=chunk,
         max_chunks=max_chunks,
     )

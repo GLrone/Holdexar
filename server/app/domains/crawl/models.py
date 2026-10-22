@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, String, Text, JSON
+from sqlalchemy import DateTime, Index, Integer, String, Text, JSON
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -11,6 +11,10 @@ from app.core.database import Base
 
 class CrawlJob(Base):
     __tablename__ = "crawl_jobs"
+    __table_args__ = (
+        Index("ix_crawl_jobs_cycle", "cycle_id"),
+        {"sqlite_autoincrement": True},
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     kind: Mapped[str] = mapped_column(String(20))  # manual | scheduled | wishlist_sync
