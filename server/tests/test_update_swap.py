@@ -218,7 +218,7 @@ def test_handoff_refuses_legacy_payload_without_touching_files(
     monkeypatch.setattr(desktop, "is_frozen", lambda: True)
     monkeypatch.setattr(desktop, "_data_dir", lambda: data_dir)
     monkeypatch.setattr(desktop, "_app_root", lambda: install)
-    monkeypatch.setattr(desktop, "_staged_supports_helper", lambda _exe: False)
+    monkeypatch.setattr("app.core.update_host.supports_data_protocol", lambda _exe: False)
     monkeypatch.setattr(desktop, "_alert", lambda msg: alerts.append(msg))
 
     assert desktop._handoff_pending_update() is False
@@ -248,7 +248,7 @@ def test_handoff_spawns_helper_with_wait_pid(tmp_path: Path, monkeypatch) -> Non
     monkeypatch.setattr(desktop, "is_frozen", lambda: True)
     monkeypatch.setattr(desktop, "_data_dir", lambda: data_dir)
     monkeypatch.setattr(desktop, "_app_root", lambda: install)
-    monkeypatch.setattr(desktop, "_staged_supports_helper", lambda _exe: True)
+    monkeypatch.setattr("app.core.update_host.supports_data_protocol", lambda _exe: True)
     monkeypatch.setattr(desktop.os, "getpid", lambda: 4242)
     monkeypatch.setattr(
         desktop.subprocess, "Popen", lambda cmd, **kwargs: calls.append((cmd, kwargs))
@@ -406,7 +406,7 @@ def test_handoff_refuses_after_failed_swap(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(desktop, "is_frozen", lambda: True)
     monkeypatch.setattr(desktop, "_data_dir", lambda: data_dir)
     monkeypatch.setattr(desktop, "_app_root", lambda: install)
-    monkeypatch.setattr(desktop, "_staged_supports_helper", lambda _exe: True)
+    monkeypatch.setattr("app.core.update_host.supports_data_protocol", lambda _exe: True)
     monkeypatch.setattr(
         desktop.subprocess, "Popen", lambda cmd, **kwargs: spawns.append((cmd, kwargs))
     )
@@ -509,7 +509,7 @@ def test_handoff_ledger_terminates_second_handoff(tmp_path: Path, monkeypatch) -
     monkeypatch.setattr(desktop, "is_frozen", lambda: True)
     monkeypatch.setattr(desktop, "_data_dir", lambda: data_dir)
     monkeypatch.setattr(desktop, "_app_root", lambda: install)
-    monkeypatch.setattr(desktop, "_staged_supports_helper", lambda _exe: True)
+    monkeypatch.setattr("app.core.update_host.supports_data_protocol", lambda _exe: True)
     monkeypatch.setattr(
         desktop.subprocess, "Popen", lambda cmd, **kwargs: spawns.append(cmd)
     )
@@ -633,7 +633,7 @@ def test_handoff_ledger_not_recorded_when_popen_fails(tmp_path: Path, monkeypatc
     monkeypatch.setattr(desktop, "is_frozen", lambda: True)
     monkeypatch.setattr(desktop, "_data_dir", lambda: data_dir)
     monkeypatch.setattr(desktop, "_app_root", lambda: install)
-    monkeypatch.setattr(desktop, "_staged_supports_helper", lambda _exe: True)
+    monkeypatch.setattr("app.core.update_host.supports_data_protocol", lambda _exe: True)
 
     def _boom_popen(*args, **kwargs):
         raise OSError("模拟系统拒绝创建进程")
@@ -1057,7 +1057,7 @@ def test_consumed_manifest_lock_does_not_undo_completed_swap(tmp_path, monkeypat
 def test_handoff_does_not_remove_active_helper_staging(tmp_path, monkeypatch):
     data, staging, target, events = _prepare_failed_helper_case(tmp_path, monkeypatch)
     monkeypatch.setattr(desktop, "is_frozen", lambda: True)
-    monkeypatch.setattr(desktop, "_staged_supports_helper", lambda *a: True)
+    monkeypatch.setattr("app.core.update_host.supports_data_protocol", lambda *a: True)
     desktop._health_checking_flag().write_text(
         __import__("json").dumps({"pid": os.getpid(), "attemptId": "active"}), encoding="utf-8"
     )
