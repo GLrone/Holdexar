@@ -157,6 +157,7 @@ export interface RegionInfo {
 }
 
 export interface SettingsPayload {
+  theme: 'dark' | 'light'
   account: {
     steam_id: string
     steam_api_key: string
@@ -247,6 +248,7 @@ export const settingsApi = {
       steam_id: steamId,
     }),
   update: (payload: {
+    theme?: 'dark' | 'light'
     account?: { steam_id?: string; steam_api_key?: string }
     onboarding_done?: boolean
     auto_price?: boolean
