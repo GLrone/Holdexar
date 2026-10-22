@@ -900,19 +900,18 @@ async def _sync_profile_row(steam_id: str, cookies: str, now: datetime) -> None:
     """
     # 取数段在会话外：网络拉取不占连接池位（与 refresh_online_states 同形态）
     fetched = await fetch_profile(steam_id, proxy_url=await _strategy_proxy())
-    async with get_session_factory()() as session:
+    async with write_session(WritePriority.INTERACTIVE, label="account_sync") as session:
         row = await session.get(SteamAccount, steam_id)
         if row is None:
             return
-        async with write_gate(WritePriority.INTERACTIVE, label="account_sync"):
-            if fetched.get("persona_name") and not row.persona_name:
-                row.persona_name = fetched["persona_name"]
-            new_avatar = fetched.get("avatar_url", "")
-            if new_avatar and new_avatar != row.avatar_url:
-                row.avatar_url = new_avatar
-            row.is_online = bool(fetched.get("online"))
-            row.in_game = (fetched.get("in_game_name") or "")[:200]
-            await session.commit()
+        if fetched.get("persona_name") and not row.persona_name:
+            row.persona_name = fetched["persona_name"]
+        new_avatar = fetched.get("avatar_url", "")
+        if new_avatar and new_avatar != row.avatar_url:
+            row.avatar_url = new_avatar
+        row.is_online = bool(fetched.get("online"))
+        row.in_game = (fetched.get("in_game_name") or "")[:200]
+        await session.commit()
 
 
 async def refresh_online_states(rows: list[SteamAccount] | None = None) -> dict:

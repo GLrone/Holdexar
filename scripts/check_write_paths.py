@@ -54,9 +54,6 @@ NETWORK_METHODS = {"request", "get", "post", "put", "patch", "delete", "send", "
 
 # (文件, 函数) → (语句种类及调用点上限, 理由)。
 ALLOW: dict[tuple[str, str], tuple[dict[str, int], str]] = {
-    ("domains/family/service.py", "_absorb_local_members"): (
-        {"commit": 1},
-        "调用点已 write_gate 包裹（吸收即调用方事务的一步）"),
     ("core/update_data.py", "_read_only_source"): (
         {"execute": 1}, "同步维护锁内排空原库写者并保持快照窗口"),
     ("core/update_data.py", "prepare"): (

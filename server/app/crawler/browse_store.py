@@ -32,7 +32,7 @@ from app.core.database import WritePriority, get_session_factory, write_gate, wr
 from app.core.logging import log_event
 from app.crawler import tag_names
 from app.crawler.config import CC_LIST
-from app.crawler.db_writer import DbWriter
+from app.crawler.db_writer import DbWriter, RegionStatusWriteError
 from app.crawler.http_client import SteamRateLimitError
 from app.crawler.network_check import network_checker
 from app.crawler.utils import (
@@ -104,6 +104,7 @@ CURRENCY_BY_CC = {cc: cur for cc, _, cur in CC_LIST}
 META: dict[int, dict] = {}          # appid → browse 元数据
 PRESERVED: dict[int, dict] = {}     # appid → 库内原值（browse 拿不到的列）
 FAILED_TASKS: list[str] = []
+SKIPPED_UNITS: set[tuple[int, str]] = set()
 NO_OPTIONS_COUNT = 0                # 「可见但无购买选项」计数（判 locked）
 PARENT_FOLLOWED = 0                 # 子 app 跟父补齐计数
 BUNDLES_DISCOVERED = 0             # purchase_options 捆绑包发现计数（链尾刷新自动抓价）
@@ -111,7 +112,7 @@ FOLLOW_PARENT = True
 EXTRAS_ENABLED = True
 DRY_RUN = False
 
-# 已进入落库循环的批次（兜底路径据此判断「本批是否一行都没写」）
+# 已有价格成功提交的批次。
 _WRITE_STARTED: set[str] = set()
 
 
@@ -121,6 +122,7 @@ def reset_run_state() -> None:
     META.clear()
     PRESERVED.clear()
     FAILED_TASKS.clear()
+    SKIPPED_UNITS.clear()
     _WRITE_STARTED.clear()
     NO_OPTIONS_COUNT = 0
     PARENT_FOLLOWED = 0
@@ -850,14 +852,7 @@ async def _follow_parent_apps(context, items: dict, appids: list[int], cc: str) 
 
 
 async def handle_browse_price_task(context) -> None:
-    """任务入口：**任何**未预期异常都在这里兜住并重推，绝不让它逃到调度器。
-
-    调度器 `_worker` 对 handler 抛出的异常只做 `fail_count += 1` 然后丢弃，
-    **不重推**（重推一律由 handler 自己 `context.queue.put` 完成）。本函数覆盖
-    整条链——fetch 一发与 `_follow_parent_apps` 里补发父 app 的请求都在 try 内，
-    任一处异常逃到调度器都会让该批 appid 的行永久丢失（曾出现整批 400 个 appid
-    的 RU 行缺失）。
-    """
+    """网络异常在批次内重推；持久化失败交由任务收尾与既有补抓处理。"""
     task = context.task
     task_id = task.get("id")
     cc = task.get("region")
@@ -865,7 +860,9 @@ async def handle_browse_price_task(context) -> None:
     try:
         await _browse_price_task_inner(context)
         return
-    except Exception as e:  # noqa: BLE001 —— 兜底：任何异常都不得逃到调度器
+    except RegionStatusWriteError:
+        raise
+    except Exception as e:  # noqa: BLE001
         retries = task.get("retries", 0)
         if network_checker.is_offline:
             if not await _wait_network_online(context):
@@ -997,7 +994,6 @@ async def _browse_price_task_inner(context) -> bool:
     currency = CURRENCY_BY_CC.get(cc, "USD")
     now_dt = get_beijing_time_obj()
     counts = {"ok": 0, "free_promo": 0, "locked": 0, "missing": 0, "skip": 0, "write_fail": 0}
-    _WRITE_STARTED.add(str(task_id))
     pending_writes: list[tuple] = []
     # 「看见了但不落价」的目标：批量失败整批记 missing 时可能误标过它们，
     # 这些陈欠行没有任何爬取路径会再写（跳过分支永不 bump），不清就是
@@ -1167,16 +1163,23 @@ async def _browse_price_task_inner(context) -> bool:
 
     # 整批一次事务落库：一批一次基线查询 + 一次 commit（逐 appid 各开事务会
     # 让 1600 万行 history 的基线扫描与提交数按「款数 × 区数」膨胀）
+    failed_writes: list[tuple[int, str]] = []
     if pending_writes:
-        results = await context.db_writer.upsert_task_batch(
-            [(g, p) for _, g, p, _, _ in pending_writes]
-        )
+        try:
+            results = await context.db_writer.upsert_task_batch(
+                [(g, p) for _, g, p, _, _ in pending_writes]
+            )
+        except Exception as e:
+            raise RegionStatusWriteError([(aid, cc) for aid, *_ in pending_writes]) from e
+        if any(results):
+            _WRITE_STARTED.add(str(task_id))
         extra_entries: list[tuple] = []
         for (appid, game_data, prices_arr, status, opts), ok in zip(
             pending_writes, results
         ):
             if not ok:
                 counts["write_fail"] += 1
+                failed_writes.append((appid, cc))
                 ledger_missing.append((appid, cc))
                 continue
             if status == "ok" and opts:
@@ -1229,10 +1232,13 @@ async def _browse_price_task_inner(context) -> bool:
 
     if cleared_missing and not DRY_RUN:
         await context.db_writer.clear_missing_regions(cleared_missing)
+        SKIPPED_UNITS.update((int(aid), str(region).upper()) for aid, region in cleared_missing)
     if truncated_missing and not DRY_RUN:
         await _mark_missing_async(context.db_writer, truncated_missing, cc)
     if ledger_missing and not DRY_RUN:
         await context.db_writer.mark_region_status_missing_batch(ledger_missing)
+    if counts["write_fail"]:
+        raise RegionStatusWriteError(failed_writes)
 
     log_event(
         logger,
