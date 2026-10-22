@@ -46,7 +46,7 @@ def delivery(monkeypatch):
     """send_mail / SMTP 配置 / 监控池范围的桩：记录调用，不出网。"""
     calls: list[dict] = []
 
-    async def _send_mail_ex(subject, html_body):
+    async def _send_mail_ex(subject, html_body, *, recipient=None):
         calls.append({"subject": subject, "html": html_body})
         return True, None
 
@@ -324,7 +324,7 @@ async def test_permanent_smtp_failure_marks_candidates_failed_only(db, delivery,
     await _seed_event(db, cid, "PRICE_DROP",
                       previous={"price": 19900}, current={"price": 9900})
 
-    async def _auth_fail(subject, html):
+    async def _auth_fail(subject, html, *, recipient=None):
         return False, "535 Authentication failed"
 
     monkeypatch.setattr(notification_service, "send_mail_ex", _auth_fail)
@@ -351,14 +351,14 @@ async def test_temporary_smtp_failure_is_retried_next_cycle(db, delivery, monkey
     await _seed_event(db, cid, "PRICE_DROP",
                       previous={"price": 19900}, current={"price": 9900})
 
-    async def _net_fail(subject, html):
+    async def _net_fail(subject, html, *, recipient=None):
         return False, "Connection unexpectedly closed"
 
     monkeypatch.setattr(notification_service, "send_mail_ex", _net_fail)
     first = await notification_service.dispatch(cid)
     assert first["failed"] == 1 and first["retryable"] is True
 
-    async def _recovered(subject, html):
+    async def _recovered(subject, html, *, recipient=None):
         delivery.append({"subject": subject, "html": html})
         return True, None
 
@@ -383,7 +383,7 @@ async def test_retry_is_bounded_by_max_attempts(db, delivery, monkeypatch):
     await _seed_event(db, cid, "PRICE_DROP",
                       previous={"price": 19900}, current={"price": 9900})
 
-    async def _net_fail(subject, html):
+    async def _net_fail(subject, html, *, recipient=None):
         return False, "Connection unexpectedly closed"
 
     monkeypatch.setattr(notification_service, "send_mail_ex", _net_fail)
