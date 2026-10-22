@@ -1109,8 +1109,8 @@ async def _job_price_cycle_retention() -> None:
     from app.domains.notifications import retention as notification_retention
 
     try:
-        price_result = await crawl_retention.prune_price_cycles()
         notification_result = await notification_retention.prune_notification_candidates()
+        price_result = await crawl_retention.prune_price_cycles()
         if price_result["truncated"] or notification_result["truncated"]:
             log_event(
                 logger,

@@ -147,6 +147,35 @@ async def _noop_snapshot(_current: int, _target: int) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["create_all", "ensure_schema"])
+async def test_schema_preparation_failure_rolls_back_all_changes(isolated_db, monkeypatch, phase):
+    with sqlite3.connect(isolated_db) as conn:
+        conn.execute("CREATE TABLE existing_data (id INTEGER PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO existing_data VALUES (1, 'before')")
+        conn.execute("PRAGMA user_version=1")
+
+    def fail_preparation(conn):
+        conn.exec_driver_sql("ALTER TABLE existing_data ADD COLUMN partial_value TEXT")
+        conn.exec_driver_sql("CREATE TABLE preparation_probe (id INTEGER)")
+        conn.exec_driver_sql("UPDATE existing_data SET value='partial'")
+        raise RuntimeError("preparation failed")
+
+    if phase == "create_all":
+        monkeypatch.setattr(database_module.Base.metadata, "create_all", fail_preparation)
+    else:
+        monkeypatch.setattr(database_module, "_ensure_schema", fail_preparation)
+
+    with pytest.raises(RuntimeError, match="preparation failed"):
+        await database_module.init_db()
+
+    with sqlite3.connect(isolated_db) as conn:
+        assert conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall() == [("existing_data",)]
+        assert [row[1] for row in conn.execute("PRAGMA table_info(existing_data)")] == ["id", "value"]
+        assert conn.execute("SELECT value FROM existing_data").fetchone()[0] == "before"
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
 async def test_init_snapshot_precedes_unversioned_schema_changes(isolated_db, monkeypatch):
     with sqlite3.connect(isolated_db) as conn:
         conn.execute("CREATE TABLE existing_data (id INTEGER PRIMARY KEY, value TEXT)")
@@ -228,15 +257,15 @@ async def test_snapshot_failure_blocks_migration(isolated_db: Path, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_init_db_cleans_stale_legacy_maintenance_lock(isolated_db: Path) -> None:
+async def test_init_db_keeps_old_maintenance_lock_without_owner(isolated_db: Path) -> None:
     lock = isolated_db.parent / "backups" / ".restore.lock"
     lock.parent.mkdir(parents=True)
     lock.write_text("2020-01-01T00:00:00", encoding="utf-8")
     os.utime(lock, (1, 1))
 
-    await database_module.init_db()
-
-    assert not lock.exists()
+    with pytest.raises(RuntimeError, match="身份无法确认"):
+        await database_module.init_db()
+    assert lock.exists()
 
 
 @pytest.mark.asyncio
@@ -854,6 +883,7 @@ async def test_extra_columns_add_price_cycle_split_stats(tmp_path: Path, monkeyp
             " started_at DATETIME, running_at DATETIME, repairing_at DATETIME,"
             " finalizing_at DATETIME, finished_at DATETIME, error TEXT)"
         )
+        con.execute("CREATE VIRTUAL TABLE games_name_fts USING fts5(appid UNINDEXED, name_bi)")
         con.execute("PRAGMA user_version = 15")
         con.commit()
     finally:

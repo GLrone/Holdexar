@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -205,3 +206,50 @@ def test_run_launcher_cleans_old_executables(tmp_path, monkeypatch):
     assert code == 0
     assert not old_host.exists()
     assert not old_launcher.exists()
+
+
+@pytest.mark.parametrize("compatible", [False, True])
+def test_file_fallback_respects_accepted_database_versions(tmp_path, compatible):
+    root = tmp_path / "app"
+    _create_version(root, "0.3.5")
+    layout.write_current_state(root, "0.3.6", last_known_good="0.3.5")
+    data = root / "data"
+    data.mkdir()
+    conn = sqlite3.connect(data / "holdexar.db")
+    conn.execute("PRAGMA user_version=18")
+    conn.close()
+    layout.write_data_compatibility(root, {
+        "dataDir": str(data), "schemaVersion": 18,
+        "versions": ["0.3.5", "0.3.6"] if compatible else ["0.3.6"],
+    })
+    assert launcher.find_target_version(root) == ("0.3.5" if compatible else None)
+
+
+def test_launch_uses_accepted_external_data_directory(tmp_path, monkeypatch):
+    root = tmp_path / "app"
+    _create_version(root, "0.3.6")
+    layout.write_current_state(root, "0.3.6")
+    external = tmp_path / "external-data"
+    external.mkdir()
+    conn = sqlite3.connect(external / "holdexar.db")
+    conn.execute("PRAGMA user_version=18")
+    conn.close()
+    layout.write_data_compatibility(root, {"dataDir": str(external), "schemaVersion": 18, "versions": ["0.3.6"]})
+    environments = []
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *a, **kw: environments.append(kw["env"]))
+    launcher.launch_version(root, "0.3.6", argv=[])
+    assert environments[0][f"{ENV_PREFIX}DATA_DIR"] == str(external)
+
+
+def test_schema_drift_stops_file_fallback(tmp_path):
+    root = tmp_path / "app"
+    _create_version(root, "0.3.6")
+    layout.write_current_state(root, "0.3.6")
+    data = root / "data"
+    data.mkdir()
+    conn = sqlite3.connect(data / "holdexar.db")
+    conn.execute("PRAGMA user_version=19")
+    conn.close()
+    layout.write_data_compatibility(root, {"dataDir": str(data), "schemaVersion": 18, "versions": ["0.3.6"]})
+    with pytest.raises(RuntimeError):
+        launcher.find_target_version(root)

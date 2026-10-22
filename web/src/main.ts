@@ -1,5 +1,5 @@
 import { createPinia } from 'pinia'
-import { computed, createApp } from 'vue'
+import { computed, createApp, nextTick } from 'vue'
 
 import App from './App.vue'
 import router from './router'
@@ -74,9 +74,48 @@ provideGlobalConfig(
 )
 document.title = APP_NAME
 
+/** 本地会话自举：桌面壳经 bootstrap 票据已拿到 HttpOnly Cookie；开发态
+ *  （Vite 直连后端）没有桌面壳，向 dev 端点要一次。发行版该端点不存在，
+ *  返回 404 时静默——正常路径不经过这里。 */
+async function ensureSession(): Promise<void> {
+  try {
+    const probe = await fetch('/api/v1/settings', { credentials: 'same-origin' })
+    if (probe.status !== 401) return
+    await fetch('/api/v1/session/dev', { credentials: 'same-origin' })
+  } catch {
+    /* 网络未就绪：后续请求会各自报错，此处不阻塞挂载 */
+  }
+}
+
 // 区服元数据：挂载前从服务端拉一次（priceMatrix/下拉/筛选都依赖，本地接口毫秒级）
-useRegionsStore(pinia)
-  .load()
-  .finally(() => {
+ensureSession()
+  .then(() => useRegionsStore(pinia).load())
+  .finally(async () => {
+    const root = document.getElementById('app')
+    let health: { writeProtected?: boolean; updateDataProtocol?: number; updateAttemptId?: string }
+    try {
+      health = await (await fetch('/api/v1/health')).json()
+    } catch {
+      health = {}
+    }
+    if (root) root.inert = Boolean(health.writeProtected)
     app.mount('#app')
+    await router.isReady()
+    await nextTick()
+    try {
+      if (health.writeProtected && health.updateDataProtocol === 1) {
+        await fetch('/api/v1/system/update-ready', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ attemptId: health.updateAttemptId }),
+        })
+        while (health.writeProtected) {
+          await new Promise(resolve => setTimeout(resolve, 100))
+          health = await (await fetch('/api/v1/health')).json()
+        }
+      }
+      if (root) root.inert = false
+    } catch {
+      // 更新验收由宿主在超时后处理。
+    }
   })

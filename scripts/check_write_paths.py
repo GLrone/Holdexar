@@ -3,9 +3,8 @@
 SQLite 单写者约束下，应用与维护脚本写事务必须位于共享写锁上下文
 （见 app/core/database.py 的「全局写入调度器」）。本脚本用 AST 静态扫描：
 
-- 检测点：`.commit()` / `.flush()` 调用；`.execute()` / `.executescript()` /
-  `.executemany()` 的 SQL 字面量含写语句（INSERT/UPDATE/DELETE/REPLACE/
-  BEGIN IMMEDIATE/DDL/VACUUM/ATTACH/ANALYZE/REINDEX）；`engine.begin()` /
+- 检测点：`.commit()` / `.flush()`；execute/executescript/executemany/exec_driver_sql
+  的 SQL 字面量含写语句或结构元数据 PRAGMA 赋值；`engine.begin()` /
   `session.begin()` 事务块（排除 begin_nested）内的 execute/executemany
   整体按写对待（提交在块退出自动发生）。
 - 已知 AST 数据流边界（fail-closed 之外）：别名绑定调用（`c = s.commit` 后
@@ -55,6 +54,19 @@ NETWORK_METHODS = {"request", "get", "post", "put", "patch", "delete", "send", "
 
 # (文件, 函数) → (语句种类及调用点上限, 理由)。
 ALLOW: dict[tuple[str, str], tuple[dict[str, int], str]] = {
+    ("domains/family/service.py", "_absorb_local_members"): (
+        {"commit": 1},
+        "调用点已 write_gate 包裹（吸收即调用方事务的一步）"),
+    ("core/update_data.py", "_read_only_source"): (
+        {"execute": 1}, "同步维护锁内排空原库写者并保持快照窗口"),
+    ("core/update_data.py", "prepare"): (
+        {"gate:open": 1}, "维护窗口内同步不可变原始快照"),
+    ("core/update_data.py", "rollback"): (
+        {"gate:open": 1}, "维护窗口内同步待落位恢复副本"),
+    ("core/update_data.py", "finish_rollback"): (
+        {"gate:open": 1}, "解除保护前同步已恢复的程序指针"),
+    ("core/update_data.py", "_release_completed_rollback"): (
+        {"gate:open": 1}, "重入已结束恢复时确认终态记录持久化"),
     ("core/seed_assets.py", "apply_curated_rows"): (
         {"execute": 1},
         "人工列批量补挂语句体（调用点在 write_session/段内保存点事务内，事务边界在调用方）"),
@@ -73,9 +85,41 @@ ALLOW: dict[tuple[str, str], tuple[dict[str, int], str]] = {
     ("core/database.py", "_ensure_schema"): (
         {"execute": 2},
         "启动链建表与存量回填（sync 引擎独占窗口执行，写调度器管不到同步连接）"),
+    ("core/database.py", "init_db"): (
+        {"execute": 1}, "维护屏障内的建表与补列事务起点"),
+    ("core/database.py", "_run_schema_migrations"): (
+        {"execute": 2, "exec_driver_sql": 2, "commit": 2}, "维护屏障内的版本登记与迁移事务"),
+    ("core/database.py", "_migrate_alert_targets_to_cny"): (
+        {"execute": 1}, "迁移事务内批量归一提醒金额"),
+    ("core/database.py", "_migrate_bundle_price_units"): (
+        {"execute": 1}, "迁移事务内批量归一捆绑包金额"),
+    ("core/database.py", "_migrate_cycle_coverage_snapshot"): (
+        {"execute": 1}, "迁移事务内补齐周期覆盖字段"),
+    ("core/database.py", "_migrate_drop_redundant_gph_indexes"): (
+        {"execute": 1}, "迁移事务内删除冗余历史索引"),
+    ("core/database.py", "_migrate_fts_trigger_when_gate"): (
+        {"execute": 2}, "迁移事务内更新全文检索触发器"),
+    ("core/database.py", "_migrate_fx_history_canonical"): (
+        {"execute": 4}, "迁移事务内归一汇率历史"),
+    ("core/database.py", "_migrate_games_name_fts"): (
+        {"execute": 6}, "迁移事务内创建游戏全文检索"),
+    ("core/database.py", "_migrate_gph_snapshot_unique"): (
+        {"execute": 1}, "迁移事务内补齐历史观测唯一索引"),
+    ("core/database.py", "_migrate_notification_identity"): (
+        {"execute": 5}, "迁移事务内保留事件及来源身份高水位"),
+    ("core/database.py", "_migrate_monitoring_bootstrap"): (
+        {"execute": 5}, "迁移事务内建立监控来源"),
+    ("core/database.py", "_migrate_player_tags"): (
+        {"execute": 1}, "迁移事务内移除旧玩家标签"),
+    ("core/database.py", "_migrate_pool_flags_retire"): (
+        {"execute": 9}, "迁移事务内替换旧代理池标记"),
+    ("core/database.py", "_migrate_proxynode_subscription_identity"): (
+        {"execute": 9}, "迁移事务内归一节点订阅身份"),
     ("core/backup.py", "_vacuum_file"): (
         {"execute": 1},
         "原地 VACUUM（停写入面的独占窗口执行，靠调用方调度保证独占）"),
+    ("core/backup.py", "_protect_restore_recovery"): (
+        {"flush": 1}, "维护屏障内同步恢复保护文件缓冲"),
     ("core/backup.py", "snapshot_to"): (
         {"execute": 1},
         "VACUUM INTO 在线快照（对源库只读，产出自洽新文件）"),
@@ -85,9 +129,6 @@ ALLOW: dict[tuple[str, str], tuple[dict[str, int], str]] = {
     ("core/migration.py", "adopt_source_database"): (
         {"execute": 1},
         "同一 VACUUM INTO 快照（对源库只读），函数拆分后写点随之迁移"),
-    ("domains/family/service.py", "_absorb_local_members"): (
-        {"commit": 1},
-        "调用点已 write_gate 包裹（吸收即调用方事务的一步）"),
     ("domains/proxypool/registry.py", "settle_nodes_after_source_change"): (
         {"flush": 1}, "flush-only 共用收尾（快照对齐/退出/清理），事务边界在调用方闸内"),
     ("domains/monitoring/service.py", "_ensure_target"): (
@@ -113,8 +154,9 @@ ALLOW: dict[tuple[str, str], tuple[dict[str, int], str]] = {
 }
 
 SQL_WRITE_RE = re.compile(
-    r"^\s*(INSERT\s+OR\s+REPLACE|INSERT|UPDATE|DELETE|REPLACE\s+INTO|"
-    r"BEGIN\s+IMMEDIATE|CREATE|DROP|ALTER|VACUUM|ATTACH|ANALYZE|REINDEX)\b",
+    r"^\s*(?:(INSERT\s+OR\s+REPLACE|INSERT|UPDATE|DELETE|REPLACE\s+INTO|"
+    r"BEGIN\s+IMMEDIATE|CREATE|DROP|ALTER|VACUUM|ATTACH|ANALYZE|REINDEX)\b|"
+    r"PRAGMA\s+(?:\w+\.)?(?:user_version|application_id|schema_version|writable_schema)\s*(?:=|\())",
     re.IGNORECASE,
 )
 
@@ -126,6 +168,7 @@ class _Visitor(ast.NodeVisitor):
         self._func_stack: list[str] = []
         self._module_aliases: dict[str, str] = {}
         self._direct_aliases: dict[str, str] = {}
+        self._assigned_aliases: dict[str, list[str]] = {}
         self._allow_used: dict[tuple[str, str], int] = {}
 
     def build_parents(self, tree: ast.AST) -> None:
@@ -137,7 +180,7 @@ class _Visitor(ast.NodeVisitor):
                     self._module_aliases[alias.asname or alias.name.split(".")[0]] = alias.name
             elif isinstance(node, ast.ImportFrom):
                 module = node.module or ""
-                if module.split(".")[0] in BLOCKED_IO_MODULES or module == "asyncio":
+                if module.split(".")[0] in BLOCKED_IO_MODULES or module in {"asyncio", "app.core.database"}:
                     for alias in node.names:
                         self._direct_aliases[alias.asname or alias.name] = f"{module}.{alias.name}"
 
@@ -157,9 +200,8 @@ class _Visitor(ast.NodeVisitor):
                 for item in cur.items:
                     ctx = item.context_expr
                     if isinstance(ctx, ast.Call):
-                        f = ctx.func
-                        name = f.id if isinstance(f, ast.Name) else (
-                            f.attr if isinstance(f, ast.Attribute) else None)
+                        parts = self._resolved_parts(ctx.func)
+                        name = parts[-1] if parts else None
                         if name in ("write_gate", "write_session", "sync_write_gate"):
                             return True
             cur = self._parents.get(cur)
@@ -174,7 +216,7 @@ class _Visitor(ast.NodeVisitor):
         return []
 
     def _gate_effect_reason(self, node: ast.Call) -> str | None:
-        parts = self._call_parts(node.func)
+        parts = self._resolved_parts(node.func)
         if not parts:
             return None
         direct = self._direct_aliases.get(parts[0])
@@ -187,7 +229,9 @@ class _Visitor(ast.NodeVisitor):
         if leaf in BLOCKED_GATE_CALLS:
             return "闸内禁止并发派生、等待与文件读写"
         if leaf == "to_thread" or (direct and direct.endswith(".to_thread")):
-            target_parts = self._call_parts(node.args[0]) if node.args else []
+            return "闸内同步数据库操作必须使用取消安全的线程收尾"
+        if leaf == "complete_db_thread":
+            target_parts = self._resolved_parts(node.args[0]) if node.args else []
             if not target_parts or target_parts[-1] not in DATABASE_THREAD_CALLS:
                 return "闸内线程池调用仅允许登记过的 SQLite 批量写入"
         if module_root in BLOCKED_IO_MODULES:
@@ -198,14 +242,46 @@ class _Visitor(ast.NodeVisitor):
             return "闸内禁止外部网络 IO"
         return None
 
+    def _resolved_parts(self, node: ast.AST) -> list[str]:
+        parts = self._call_parts(node)
+        if parts and parts[0] in self._assigned_aliases:
+            parts = self._assigned_aliases[parts[0]] + parts[1:]
+        if parts and parts[0] in self._direct_aliases:
+            parts = self._direct_aliases[parts[0]].split(".") + parts[1:]
+        return parts
+
+    def visit_Assign(self, node: ast.Assign) -> None:  # noqa: N802
+        self.generic_visit(node)
+        parts = self._resolved_parts(node.value)
+        for target in node.targets:
+            for name in ast.walk(target):
+                if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store):
+                    self._assigned_aliases.pop(name.id, None)
+                    if isinstance(target, ast.Name) and parts:
+                        self._assigned_aliases[name.id] = parts
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:  # noqa: N802
+        self.generic_visit(node)
+        if node.value is not None and isinstance(node.target, ast.Name):
+            parts = self._resolved_parts(node.value)
+            self._assigned_aliases.pop(node.target.id, None)
+            if parts:
+                self._assigned_aliases[node.target.id] = parts
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+        outer = self._assigned_aliases
+        self._assigned_aliases = outer.copy()
+        args = node.args
+        for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg]:
+            if arg:
+                self._assigned_aliases.pop(arg.arg, None)
+        self.generic_visit(node)
+        self._assigned_aliases = outer
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
     def _allow(self, node: ast.AST) -> str | None:
         funcs = self._enclosing_funcs(node)
-        # schema 迁移链：启动初始化机制，写锁天然独占窗口，整族豁免
-        if self._file_suffix == "core/database.py" and (
-            "init_db" in funcs or "_run_schema_migrations" in funcs
-            or any(f.startswith("_migrate_") for f in funcs)
-        ):
-            return "schema 迁移链（启动初始化，写锁天然独占窗口）"
         # 文件内豁免按「任意外层函数名」匹配（内层 helper 属于外层事务）
         for fname in reversed(funcs):
             entry = ALLOW.get((self._file_suffix, fname))
@@ -236,16 +312,20 @@ class _Visitor(ast.NodeVisitor):
         if self._in_gate(node):
             reason = self._gate_effect_reason(node)
             if reason:
-                self.hits.append((node.lineno, f"FAIL_GATE_EFFECT:{reason}"))
+                self.kind = f"gate:{self._call_parts(node.func)[-1]}"
+                if self._allow(node):
+                    self.hits.append((node.lineno, "EXCEPTION"))
+                else:
+                    self.hits.append((node.lineno, f"FAIL_GATE_EFFECT:{reason}"))
         f = node.func
         if isinstance(f, ast.Attribute) and f.attr in (
-            "commit", "flush", "execute", "executescript", "executemany",
+            "commit", "flush", "execute", "executescript", "executemany", "exec_driver_sql",
         ):
             flagged = f.attr in ("commit", "flush")
             if not flagged and node.args:
                 sql = self._sql_text(node.args[0])
                 flagged = bool(sql and SQL_WRITE_RE.match(sql))
-            if not flagged and f.attr in ("execute", "executemany") and self._in_begin_tx(node):
+            if not flagged and f.attr in ("execute", "executemany", "exec_driver_sql") and self._in_begin_tx(node):
                 flagged = True
             if flagged and not self._in_gate(node):
                 self.kind = f.attr
@@ -260,17 +340,13 @@ class _Visitor(ast.NodeVisitor):
 
     visit_With = visit_AsyncWith
 
-    @staticmethod
-    def _ctx_name(ctx: ast.expr) -> str | None:
+    def _ctx_name(self, ctx: ast.expr) -> str | None:
         """with 上下文名（解包 get_session_factory()() 这类嵌套调用）。"""
         f = ctx.func if isinstance(ctx, ast.Call) else ctx
         while isinstance(f, ast.Call):
             f = f.func
-        if isinstance(f, ast.Name):
-            return f.id
-        if isinstance(f, ast.Attribute):
-            return f.attr
-        return None
+        parts = self._resolved_parts(f)
+        return parts[-1] if parts else None
 
     def _check_gate_session_composite(self, node: ast.AST) -> None:
         """write_gate 与 get_session_factory 同 with 复合 → FAIL。

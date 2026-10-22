@@ -1,15 +1,4 @@
-"""Holdexar 独立更新宿主（UpdateHost）核心逻辑。
-
-职责：
-1. 等待原有应用进程与相关句柄彻底退出；
-2. 把历史外置数据（旧版 AppData 目录）迁入安装根 data/，迁移未完成即终止换装；
-3. 将更新载荷就地安装至 versions/<target_version>/，验证完整性；
-4. 旧式扁平布局先备齐恢复入口，再转换版本目录；任一阶段失败都交还原入口；
-5. 原子切换 state/current.json 版本指针；
-6. 健康验收：只接受本次拉起、目标版本、目标数据目录、本次事务的进程；
-   - 验收通过：提交事务，清理暂存，按保留策略（当前版 + 上一版）清理更老历史版本；
-   - 验收失败：撤下目标版本、指针交还上一有效版本、恢复旧版运行并写入诊断。
-"""
+"""协调程序换装、受保护数据验收与失败恢复。"""
 from __future__ import annotations
 
 import argparse
@@ -22,6 +11,7 @@ import socket
 import subprocess
 import threading
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -32,7 +22,6 @@ import httpx
 from app.core import layout
 from app.core.app_info import (
     APP_NAME,
-    APP_SLUG,
     ENV_PREFIX,
     HEALTH_TIMEOUT,
     STAGING_MANIFEST_NAME,
@@ -42,6 +31,7 @@ from app.core.paths import data_dir_filename, install_root as resolve_default_in
 
 DEFAULT_SERVER_HOST = "127.0.0.1"
 DEFAULT_SERVER_PORT = 28765
+UPDATE_DATA_PROTOCOL = 1
 
 # 健康验收失败归因（写入事务与诊断报告的 error 字段前缀）
 HEALTH_BINDING_ERROR = "健康验收未绑定本事务"
@@ -54,6 +44,14 @@ PAYLOAD_ERROR = "更新载荷不完整"
 _RELATIVE_LAUNCHER_DIR = ".launcher"
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_update_root(root: Path) -> None:
+    root = root.resolve()
+    owner = root.parent.parent
+    if (root.parent.name == layout.VERSIONS_DIR_NAME
+            and (owner / layout.STATE_DIR_NAME / layout.CURRENT_STATE_FILE).is_file()):
+        raise RuntimeError("更新目标必须是安装目录，不能是其中的版本目录")
 
 
 def _log_update(root: Path, message: str) -> None:
@@ -99,39 +97,35 @@ def _write_diagnosis(root: Path, record: dict[str, Any]) -> None:
 
 
 def wait_process_exit(pid: int, timeout: float = 10.0) -> bool:
-    """等待指定 PID 进程退出，超时尝试强制终止进程树。"""
+    """仅在能确认指定进程退出时继续更新。"""
     if os.name != "nt":
-        return True
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            except OSError:
+                return False
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
     try:
         kernel32 = ctypes.windll.kernel32
-        SYNCHRONIZE = 0x00100000
-        handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = kernel32.OpenProcess(0x00100000, False, pid)
         if not handle:
-            return True
+            return kernel32.GetLastError() == 87
         try:
-            res = kernel32.WaitForSingleObject(handle, int(timeout * 1000))
-            if res == 0:
-                return True
+            return kernel32.WaitForSingleObject(handle, int(max(0, timeout) * 1000)) == 0
         finally:
             kernel32.CloseHandle(handle)
-        try:
-            subprocess.run(
-                ["taskkill", "/T", "/F", "/PID", str(pid)],
-                capture_output=True,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except Exception:
-            pass
-        handle2 = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
-        if not handle2:
-            return True
-        try:
-            res2 = kernel32.WaitForSingleObject(handle2, 2000)
-            return res2 == 0
-        finally:
-            kernel32.CloseHandle(handle2)
     except Exception:  # noqa: BLE001
-        return True
+        return False
 
 
 def process_image_path(pid: int) -> str | None:
@@ -203,12 +197,18 @@ def install_version_payload(
     target_version: str,
 ) -> Path:
     """将暂存载荷安装到 versions/<target_version>/。"""
+    _validate_update_root(root)
     if not layout.is_managed_version_name(target_version):
         raise RuntimeError(f"目标版本号不可用作目录名：{target_version!r}")
+    active = layout.get_current_version(root)
+    if active and layout.same_version_directory(root, active, target_version):
+        raise RuntimeError("更新载荷不得覆盖正在使用的版本目录")
 
     payload = staging_dir / APP_NAME
     if not payload.is_dir():
         payload = staging_dir
+    if not payload.is_dir():
+        raise RuntimeError("更新载荷目录不存在")
 
     dest = layout.get_version_dir(root, target_version)
     if dest.exists():
@@ -373,6 +373,33 @@ def _same_path(a: str | Path, b: str | Path) -> bool:
         return str(a).casefold() == str(b).casefold()
 
 
+def supports_data_protocol(exe: Path) -> bool:
+    try:
+        with tempfile.TemporaryDirectory(prefix="holdexar-update-protocol-") as tmp:
+            result_path = Path(tmp) / "capability.json"
+            env = dict(os.environ, HOLDEXAR_UPDATE_PROTOCOL_RESULT=str(result_path))
+            result = subprocess.run(
+                [str(exe), "--update-protocol", "--help"], env=env,
+                capture_output=True, timeout=25,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return result.returncode == 0 and json.loads(result_path.read_text(encoding="utf-8")).get("updateDataProtocol") == UPDATE_DATA_PROTOCOL
+    except (OSError, ValueError, AttributeError, subprocess.TimeoutExpired):
+        return False
+
+
+def report_data_protocol(argv: list[str]) -> bool:
+    if "--update-protocol" not in argv:
+        return False
+    payload = {"updateDataProtocol": UPDATE_DATA_PROTOCOL}
+    result = os.environ.get(f"{ENV_PREFIX}UPDATE_PROTOCOL_RESULT")
+    if result:
+        Path(result).write_text(json.dumps(payload), encoding="utf-8")
+    else:
+        print(json.dumps(payload))
+    return True
+
+
 def verify_health_response(
     data: dict[str, Any],
     *,
@@ -381,6 +408,7 @@ def verify_health_response(
     exe: Path,
     data_dir: Path,
     process_image: str | None = None,
+    require_guard: bool = False,
 ) -> str | None:
     """健康响应的身份校验：不匹配返回原因，全部匹配返回 None。
 
@@ -393,6 +421,11 @@ def verify_health_response(
     打包态主程序就是验收进程本身；开发态直接跑脚本时 `sys.executable` 是解释器，
     该字段由 `process_image` 传入实际拉起的进程映像，二者比对同一事实。
     """
+    if require_guard:
+        if any(key not in data for key in ("pid", "dataDir", "executable")):
+            return "健康响应缺少程序或数据身份"
+        if data.get("updateDataProtocol") != UPDATE_DATA_PROTOCOL or data.get("writeProtected") is not True:
+            return "更新期间的数据写入保护未生效"
     version = str(data.get("version") or "").removeprefix("v")
     if version != str(target_version).removeprefix("v"):
         return f"版本不符：响应 {version or '(空)'} / 目标 {target_version}"
@@ -417,6 +450,9 @@ def probe_version_health(
     *,
     data_dir: Path | None = None,
     target_exe: Path | None = None,
+    require_window: bool = False,
+    keep_running: bool = False,
+    require_guard: bool | None = None,
 ) -> tuple[bool, str]:
     """启动新版本进行健康验收：只认本次拉起、目标版本、目标数据目录的进程。"""
     exe = target_exe or layout.get_version_exe(root, target_version)
@@ -424,11 +460,21 @@ def probe_version_health(
         return False, f"{HEALTH_BINDING_ERROR}：主程序不存在"
 
     expected_data_dir = (data_dir or (root / "data")).resolve()
+    transaction = layout.read_transaction(root) or {}
+    protected = bool(transaction.get("dataPrepared") and not transaction.get("dataAccepted")
+                     and transaction.get("dataRecoveryPhase") != "restored") if require_guard is None else require_guard
+    from app.core.update_process import ProbeTree
 
     child_env = dict(os.environ)
     child_env[f"{ENV_PREFIX}INSTALL_ROOT"] = str(root)
     child_env[f"{ENV_PREFIX}DATA_DIR"] = str(expected_data_dir)
     child_env[f"{ENV_PREFIX}UPDATE_ATTEMPT_ID"] = attempt_id
+    if protected:
+        child_env[f"{ENV_PREFIX}UPDATE_DATA_TOKEN"] = str(transaction["dataToken"])
+    else:
+        child_env.pop(f"{ENV_PREFIX}UPDATE_DATA_TOKEN", None)
+        if require_guard is False:
+            child_env.pop(f"{ENV_PREFIX}UPDATE_ATTEMPT_ID", None)
     child_env["WEBVIEW2_USER_DATA_FOLDER"] = str(expected_data_dir / "cache" / "webview")
     child_env["NO_PROXY"] = "127.0.0.1,localhost"
     child_env["no_proxy"] = "127.0.0.1,localhost"
@@ -438,7 +484,8 @@ def probe_version_health(
     child_env.pop(f"{ENV_PREFIX}PORT", None)
     # 验收只看「装上以后能不能起来」，不能继承宿主身上的开发态调试变量：
     # 一旦带上开发服务器地址，子进程会去等一个不存在的 Vite，永远起不来。
-    for debug_key in (f"{ENV_PREFIX}DEV_URL", f"{ENV_PREFIX}LAUNCHER_PID"):
+    for debug_key in (f"{ENV_PREFIX}DEV_URL", f"{ENV_PREFIX}LAUNCHER_PID",
+                      f"{ENV_PREFIX}UPDATE_RESTART", f"{ENV_PREFIX}PREV_PID"):
         child_env.pop(debug_key, None)
 
     flags = 0
@@ -446,15 +493,31 @@ def probe_version_health(
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
     proc = None
+    tree = ProbeTree()
+    preserved = False
+    if protected:
+        layout.update_transaction(root, layout.STAGE_VERIFYING,
+                                  dataProbeRegistrationRequired=True, launchPending=True)
     try:
         # 带 --server：仅起本地服务做健康检查，不打开 WebView2 窗口
         proc = subprocess.Popen(
-            [str(exe), "--server"],
+            [str(exe), *([] if require_window else ["--server"])],
             cwd=str(exe.parent),
             env=child_env,
             creationflags=flags,
         )
+        tree.assign(proc)
+        if protected:
+            children = list((layout.read_transaction(root) or {}).get("children", []))
+            children.append({"pid": proc.pid, "image": process_image_path(proc.pid), "stopped": False})
+            layout.update_transaction(root, layout.STAGE_VERIFYING, children=children, launchPending=False)
     except Exception as exc:  # noqa: BLE001
+        if proc is not None:
+            proc.terminate()
+            proc.wait(timeout=5)
+        tree.close()
+        if protected:
+            layout.update_transaction(root, layout.STAGE_VERIFYING, launchPending=False)
         return False, f"{STARTUP_ERROR}：{exc}"
 
     deadline = time.monotonic() + timeout
@@ -495,6 +558,16 @@ def probe_version_health(
                 if owner_pid is not None and int(owner_pid) != int(proc.pid):
                     last_reason = f"{HEALTH_BINDING_ERROR}：监听者 {owner_pid}≠本次进程 {proc.pid}"
                     continue
+                if require_guard is False and "dataDir" not in data:
+                    try:
+                        info_response = httpx.get(
+                            f"http://{DEFAULT_SERVER_HOST}:{candidate}/api/v1/info",
+                            timeout=3.0, trust_env=False,
+                        )
+                        info = info_response.json() if info_response.status_code == 200 else {}
+                        data["dataDir"] = info.get("data_dir")
+                    except (OSError, ValueError, httpx.HTTPError):
+                        continue
                 reason = verify_health_response(
                     data,
                     target_version=target_version,
@@ -502,23 +575,43 @@ def probe_version_health(
                     exe=exe,
                     data_dir=expected_data_dir,
                     process_image=expected_image,
+                    require_guard=protected,
                 )
+                if require_guard is False:
+                    reason = None if (
+                        str(data.get("version", "")).removeprefix("v") == target_version.removeprefix("v")
+                        and data.get("dataDir") and _same_path(data["dataDir"], expected_data_dir)
+                        and expected_image and _same_path(expected_image, exe)
+                    ) else "原版本或数据目录不匹配"
                 if reason:
                     last_reason = f"{HEALTH_BINDING_ERROR}：{reason}"
                     continue
+                if require_window and data.get("pageReady") is not True:
+                    last_reason = "程序服务已启动，等待应用页面完成加载"
+                    continue
+                if keep_running:
+                    if protected:
+                        from app.core import update_data
+
+                        update_data.accept(root)
+                    tree.detach()
+                    preserved = True
                 return True, "健康检查通过"
             time.sleep(0.5)
         return False, f"{HEALTH_TIMEOUT_ERROR}（{timeout}s）：{last_reason}"
     finally:
-        if proc and proc.poll() is None:
+        if proc and not preserved:
             try:
-                proc.terminate()
-                proc.wait(timeout=3.0)
-            except Exception:  # noqa: BLE001
-                try:
-                    proc.kill()
-                except Exception:  # noqa: BLE001
-                    pass
+                tree.stop(proc)
+                if protected:
+                    current = layout.read_transaction(root) or {}
+                    children = current.get("children", [])
+                    for child in children:
+                        if child.get("pid") == proc.pid:
+                            child["stopped"] = True
+                    layout.update_transaction(root, current.get("stage", layout.STAGE_VERIFYING), children=children)
+            finally:
+                tree.close()
 
 
 def _read_manifest(staging_dir: Path) -> dict[str, Any]:
@@ -541,26 +634,43 @@ def _resolve_data_dir(root: Path, requested: Path | None) -> Path:
 def _spawn_detached(root: Path, exe: Path, argv: list[str] | None = None) -> None:
     """脱离宿主进程拉起目标：宿主退出后窗口不能跟着消失。"""
     command = [str(exe), *(argv or [])]
+    env = dict(os.environ)
+    for key in ("UPDATE_DATA_TOKEN", "UPDATE_ATTEMPT_ID", "LAUNCHER_PID", "DEV_URL", "UPDATE_RESTART", "PREV_PID"):
+        env.pop(f"{ENV_PREFIX}{key}", None)
+    env[f"{ENV_PREFIX}INSTALL_ROOT"] = str(root)
+    tx = layout.read_transaction(root) or {}
+    env[f"{ENV_PREFIX}DATA_DIR"] = str(tx.get("dataDir") or (root / "data"))
     subprocess.Popen(
         command,
         cwd=str(exe.parent),
         close_fds=True,
         creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
+        env=env,
     )
     _log_update(root, f"已拉起：{exe} {' '.join(argv or [])}".strip())
 
 
-def _relaunch_previous(root: Path, version: str | None) -> None:
+def _relaunch_previous(root: Path, version: str | None) -> bool:
     """验收或安装失败后，把上一有效版本拉起来，用户不至于面对没有窗口。"""
     target_ver = version or layout.get_current_version(root)
     if not target_ver or not layout.is_version_valid(root, target_ver):
-        _launch_entry(root)
-        return
+        return False
     exe = layout.get_version_exe(root, target_ver)
     try:
+        tx = layout.read_transaction(root) or {}
+        healthy, reason = probe_version_health(
+            root, target_ver, str(tx.get("attemptId") or "recovery"),
+            data_dir=Path(tx.get("dataDir") or root / "data"), require_guard=False,
+        )
+        layout.update_transaction(root, tx.get("stage", layout.STAGE_ROLLED_BACK), sourceServiceHealthy=healthy)
+        if not healthy:
+            _log_update(root, f"原程序尚未恢复运行，数据已保留：{reason}")
+            return False
         _spawn_detached(root, exe)
+        return True
     except Exception as exc:  # noqa: BLE001
         _log_update(root, f"拉起回退版本 {target_ver} 失败：{exc}")
+        return False
 
 
 def _launch_entry(root: Path) -> bool:
@@ -606,6 +716,30 @@ def _fail(
 ) -> bool:
     """统一失败出口：撤下未验收的目标版本、指针交还、恢复旧版并留痕。"""
     _log_update(root, f"换装故障：{error}，执行回滚...")
+    tx = layout.read_transaction(root) or {}
+    if tx.get("dataAccepted"):
+        diagnosis.update(success=False, error=error, dataPreserved=True, stage="accepted_failure")
+        _write_diagnosis(root, diagnosis)
+        return False
+    if tx.get("dataPrepared"):
+        from app.core import update_data
+
+        try:
+            update_data.rollback(root, children_stopped=True)
+        except Exception as exc:
+            error = f"{error}；数据恢复未完成，已保留现场：{exc}"
+            layout.update_transaction(root, "recovery_required", error=error)
+            diagnosis.update(success=False, error=error, dataPreserved=True, stage="recovery_required")
+            _write_diagnosis(root, diagnosis)
+            return False
+    elif tx.get("dataDir"):
+        from app.core import update_data
+
+        try:
+            update_data.abort_preparation(root, data_dir=Path(tx["dataDir"]))
+        except Exception as exc:
+            layout.update_transaction(root, "recovery_required", error=f"恢复点准备未结束：{exc}")
+            return False
     target_ver = str(diagnosis.get("targetVersion") or "")
     pointer = launched_version or layout.get_current_version(root)
     if target_ver and pointer == target_ver:
@@ -614,7 +748,18 @@ def _fail(
             _log_update(root, f"已撤下未通过验收的版本 {target_ver}，指针交还上一有效版本")
         else:
             _log_update(root, f"未能交还版本指针（目标 {target_ver} 无可用回退版本）")
-    layout.update_transaction(root, layout.STAGE_ROLLED_BACK, error=error)
+    layout.update_transaction(root, layout.STAGE_ROLLED_BACK, error=error, relaunchPrevious=launch_previous)
+    if tx.get("dataPrepared"):
+        from app.core import update_data
+
+        try:
+            update_data.finish_rollback(root)
+        except Exception as exc:
+            error = f"{error}；程序与数据恢复尚未完成：{exc}"
+            layout.update_transaction(root, "recovery_required", error=error, relaunchPrevious=False)
+            diagnosis.update(success=False, error=error, stage="recovery_required", dataPreserved=True)
+            _write_diagnosis(root, diagnosis)
+            return False
     diagnosis.update({
         "stage": layout.STAGE_ROLLED_BACK,
         "success": False,
@@ -622,8 +767,6 @@ def _fail(
         "endTime": time.time(),
     })
     _write_diagnosis(root, diagnosis)
-    if launch_previous:
-        _relaunch_previous(root, str(diagnosis.get("sourceVersion") or "") or None)
     return False
 
 
@@ -796,67 +939,74 @@ def bridge_legacy_update(
     skip_health_check: bool = False,
     launch_on_finish: bool = True,
 ) -> bool:
-    """旧版交接协议兼容桥：把老式扁平布局转换为新架构（versions/ + state/ + Launcher）。
+    from app.core.update_process import update_mutex
 
-    顺序即安全顺序：先让根目录启动器就位（旧版仍可启动），再迁入历史数据，
-    最后才转换版本目录并换装。任一步失败都退回「根目录仍可双击旧版」的形态。
+    try:
+        with update_mutex():
+            result, reopen_entry = _bridge_legacy_update_locked(
+                staging, target, wait_pid, attempt_id, data_dir, current_version,
+                skip_health_check, launch_on_finish,
+            )
+    except Exception as exc:
+        _log_update(target, f"更新未完成，保留数据等待恢复：{exc}")
+        return False
+    if reopen_entry and launch_on_finish:
+        _launch_entry(target)
+    return _finish_update_result(target, result)
 
-    本函数可能跑在暂存包内部（旧版调起 `.../<data>/update-staging/Holdexar/Holdexar.exe --apply-update`），
-    此时按自身位置推算的「安装根」是暂存目录，不是用户安装的地方。交接方传进来的
-    `target` 才是安装根——入口、版本目录、数据都要落到它下面。
-    """
+
+def _bridge_legacy_update_locked(
+    staging: Path, target: Path, wait_pid: int | None, attempt_id: str | None,
+    data_dir: Path | None, current_version: str | None,
+    skip_health_check: bool, launch_on_finish: bool,
+) -> tuple[bool, bool]:
+    """保持现用数据目录，将旧安装转换为可验收的多版本布局。"""
     staging, target = staging.resolve(), target.resolve()
+    _validate_update_root(target)
     _log_update(target, f"兼容桥接收交接请求：staging={staging} target={target} wait_pid={wait_pid}")
 
     if wait_pid:
         _log_update(target, f"等待旧版进程 PID {wait_pid} 退出...")
-        wait_process_exit(wait_pid, timeout=15.0)
+        if not wait_process_exit(wait_pid, timeout=15.0):
+            _log_update(target, "原程序尚未退出，停止更新以保护数据")
+            return False, False
 
-    aid = attempt_id or _read_manifest(staging).get("attempt_id") or str(uuid.uuid4())
+    if (layout.read_transaction(target) or {}).get("dataDir"):
+        recover_interrupted_update(target)
+
+    manifest = _read_manifest(staging)
+    active_version = layout.get_current_version(target)
+    requested_source = current_version or manifest.get("source_version") or manifest.get("previousVersion")
+    requested_target = version_from_tag(str(manifest.get("tag") or ""))
+    if active_version and (
+        (requested_source and requested_source != active_version)
+        or (requested_target and layout.same_version_directory(target, requested_target, active_version))
+    ):
+        _log_update(target, "更新交接与当前程序不一致，保留现有程序与数据")
+        return False, False
+    aid = attempt_id or manifest.get("attempt_id") or str(uuid.uuid4())
     db_name = data_dir_filename()
     actual_data_dir = _resolve_data_dir(target, data_dir)
     if not (actual_data_dir / db_name).is_file() and (staging.parent / db_name).is_file():
         actual_data_dir = staging.parent.resolve()
 
     flat_layout = (target / "_internal").is_dir()
+    if not flat_layout and active_version:
+        result = _execute_update_locked(
+            target, staging, None, requested_source, None, aid,
+            skip_health_check, launch_on_finish, actual_data_dir,
+        )
+        return result, False
 
     # 1. 先修入口：根目录启动器就该落在调用方给的 target（用户真正的安装根）
     if not prepare_launcher_only(
         target, staging, source_version=current_version, attempt_id=aid,
     ):
         _log_update(target, "新版入口未能就位，终止换装（旧版仍在根目录）")
-        if launch_on_finish:
-            _launch_entry(target)
-        return False
+        _restore_entry_only(target, launch=False)
+        return False, True
     if not flat_layout:
         _log_update(target, "根目录已是新启动器（旧版扁平布局已转换），从入口继续换装")
-    # 2. 数据迁移：未完成即终止，绝不带着半套历史数据换装
-    target_data_dir = (target / "data").resolve()
-    if actual_data_dir != target_data_dir and (actual_data_dir / db_name).is_file():
-        from app.core.migration import migrate_appdata_to_portable
-
-        try:
-            result = migrate_appdata_to_portable(actual_data_dir, target_data_dir)
-        except Exception as exc:  # noqa: BLE001
-            _log_update(target, f"历史数据迁移失败，终止换装：{exc}")
-            _notify(
-                "旧的用户数据未能迁移，本次更新已停止，当前版本可以继续使用。\n\n"
-                f"旧数据位置：{actual_data_dir}\n原因：{exc}"
-            )
-            _restore_entry_only(target)
-            return False
-        if not result.get("completed"):
-            reason = result.get("reason") or result.get("status")
-            _log_update(target, f"历史数据未迁移完成（{reason}），终止换装")
-            _notify(
-                "检测到两份用户数据，无法判断该用哪一份，本次更新已停止。\n\n"
-                f"安装目录：{target_data_dir}\n旧数据位置：{actual_data_dir}\n"
-                "请保留要继续使用的那一份，删掉另一份后重新打开应用。"
-            )
-            _restore_entry_only(target)
-            return False
-        _log_update(target, f"历史数据迁移结果：{result.get('status')} {result.get('warnings') or ''}")
-
     # 3. 扁平布局转换为版本目录（失败已自行搬回，根目录仍是旧版）
     if flat_layout:
         ok, reason = convert_legacy_layout(
@@ -866,26 +1016,19 @@ def bridge_legacy_update(
         )
         if not ok:
             _log_update(target, f"旧版布局转换失败，终止换装：{reason}")
-            _restore_entry_only(target)
-            return False
+            _restore_entry_only(target, launch=False)
+            return False, True
 
     # 4. 调用更新宿主标准换装
-    return execute_update(
-        root=target,
-        staging_dir=staging,
-        attempt_id=aid,
-        data_dir=target_data_dir,
-        skip_health_check=skip_health_check,
-        launch_on_finish=launch_on_finish,
+    result = _execute_update_locked(
+        target, staging, None, None, None, aid,
+        skip_health_check, launch_on_finish, actual_data_dir,
     )
+    return result, False
 
 
-def _restore_entry_only(root: Path) -> None:
-    """换装未开始时失败：只把能用的入口拉起来，不动文件。
-
-    换装宿主由已经退出的旧进程拉起，它退出后不会有任何窗口——这里必须拉起
-    可运行的那一份。拉起失败只记日志：调用方紧接着会弹窗说明。
-    """
+def _restore_entry_only(root: Path, *, launch: bool = True) -> None:
+    """必要时恢复旧入口，并在许可允许时重新打开。"""
     installed = layout.list_installed_versions(root)
     legacy_backup = root / "__legacy__" / f"{APP_NAME}.exe"
     if not installed and legacy_backup.is_file():
@@ -896,7 +1039,7 @@ def _restore_entry_only(root: Path) -> None:
         except Exception as exc:  # noqa: BLE001
             _log_update(root, f"还原旧版主程序失败：{exc}")
 
-    if not _entry_available(root):
+    if not launch or not _entry_available(root):
         return
     try:
         _launch_entry(root)
@@ -924,12 +1067,80 @@ def execute_update(
     launch_on_finish: bool = True,
     data_dir: Path | None = None,
 ) -> bool:
+    from app.core.update_process import update_mutex
+
+    try:
+        with update_mutex():
+            _validate_update_root(root)
+            result = _execute_update_locked(
+                root, staging_dir, target_version, source_version, wait_pid,
+                attempt_id, skip_health_check, launch_on_finish, data_dir,
+            )
+    except Exception as exc:
+        _log_update(root, f"更新未完成，保留数据等待恢复：{exc}")
+        return False
+    return _finish_update_result(root, result)
+
+
+def _finish_update_result(root: Path, result: bool) -> bool:
+    tx = layout.read_transaction(root) or {}
+    if not result and tx.get("relaunchPrevious"):
+        layout.update_transaction(root, tx["stage"], relaunchPrevious=False)
+        _relaunch_previous(root, tx.get("sourceVersion"))
+    return result
+
+
+def recover_interrupted_update(root: Path) -> bool:
+    from app.core import update_data
+    from app.core.update_process import update_mutex
+
+    with update_mutex():
+        tx = layout.read_transaction(root) or {}
+        if tx.get("dataRollbackReleased"):
+            update_data.finish_rollback(root)
+            if layout.get_current_version(root) != tx.get("sourceVersion"):
+                raise RuntimeError("已恢复的数据与当前程序指向不一致，已停止启动并保留数据")
+            return True
+        if tx.get("dataAccepted"):
+            update_data.accept(root)
+            from app.core.launcher import find_target_version
+
+            compatible = find_target_version(root)
+            if not compatible:
+                raise RuntimeError("缺少与当前数据相容的程序，数据已保留；请重新解压已验收版本")
+            layout.confirm_version(root, compatible)
+            layout.update_transaction(root, layout.STAGE_COMMITTED, currentVersion=compatible)
+            return True
+        if tx.get("dataPrepared"):
+            diagnosis = {
+                "attemptId": tx["attemptId"], "targetVersion": tx["targetVersion"],
+                "sourceVersion": tx["sourceVersion"], "dataDir": tx["dataDir"],
+            }
+            _fail(root, diagnosis, "上次更新中断，恢复原程序与数据", launch_previous=False)
+            current = layout.read_transaction(root) or {}
+            if (current.get("dataRollbackReleased") is not True
+                    or current.get("stage") != layout.STAGE_ROLLED_BACK
+                    or layout.get_current_version(root) != current.get("sourceVersion")
+                    or update_data._marker_path(Path(current["dataDir"])).exists()):
+                raise RuntimeError("更新恢复尚未完成，原始快照与故障数据均已保留，请查看更新诊断")
+        elif tx.get("dataDir"):
+            update_data.abort_preparation(root, data_dir=Path(tx["dataDir"]))
+        return True
+
+
+def _execute_update_locked(
+    root: Path, staging_dir: Path, target_version: str | None,
+    source_version: str | None, wait_pid: int | None, attempt_id: str | None,
+    skip_health_check: bool, launch_on_finish: bool, data_dir: Path | None,
+) -> bool:
     """执行换装事务。"""
     _log_update(root, f"开始换装：staging={staging_dir} root={root}")
 
     if wait_pid:
         _log_update(root, f"等待旧实例（PID {wait_pid}）退出...")
-        wait_process_exit(wait_pid, timeout=15.0)
+        if not wait_process_exit(wait_pid, timeout=15.0):
+            _log_update(root, "原程序尚未退出，停止更新以保护数据")
+            return False
 
     manifest_data = _read_manifest(staging_dir)
     aid = attempt_id or manifest_data.get("attempt_id") or str(uuid.uuid4())
@@ -942,6 +1153,14 @@ def execute_update(
         _log_update(root, f"错误：目标版本号不可用作目录名：{t_ver!r}")
         return False
 
+    previous_tx = layout.read_transaction(root) or {}
+    if previous_tx.get("dataDir"):
+        recover_interrupted_update(root)
+        if (not previous_tx.get("dataAccepted") and not previous_tx.get("dataRollbackReleased")
+                and previous_tx.get("stage") != layout.STAGE_ROLLED_BACK):
+            current_tx = layout.read_transaction(root) or {}
+            layout.update_transaction(root, current_tx.get("stage", layout.STAGE_ROLLED_BACK), relaunchPrevious=True)
+            return False
     curr_state = layout.read_current_state(root)
     staging_meta: dict[str, Any] = {}
     if (staging_dir / "manifest.json").is_file():
@@ -963,6 +1182,12 @@ def execute_update(
     pending_self = curr_state.get("pendingVersion") if curr_state else None
     recovering = pending_self is not None and str(pending_self) == t_ver
 
+    active_version = curr_state.get("version") if curr_state else None
+    if active_version and (layout.same_version_directory(root, t_ver, active_version)
+                           or s_ver != active_version):
+        _log_update(root, "更新请求与当前程序版本不一致或目标已安装，保留现有程序与数据")
+        return False
+
     layout.start_transaction(root, t_ver, s_ver, attempt_id=aid)
     diagnosis: dict[str, Any] = {
         "attemptId": aid,
@@ -979,7 +1204,7 @@ def execute_update(
     }
     _write_diagnosis(root, diagnosis)
 
-    layout.update_transaction(root, layout.STAGE_SWITCHING)
+    layout.update_transaction(root, layout.STAGE_SWITCHING, dataDir=str(expected_data_dir))
     if recovering:
         # 上次换装装完文件却没来得及提交：指针已在本版本上，回退目标已落盘
         _log_update(root, f"检测到未完成的换装（版本 {t_ver}），直接沿用已落盘文件重新验收")
@@ -989,7 +1214,21 @@ def execute_update(
         except Exception as exc:  # noqa: BLE001
             return _fail(root, diagnosis, f"{PAYLOAD_ERROR}：{exc}")
 
-    # 验收前把指针指向目标版本：启动器先认指针，回退目标也随指针一起落盘
+    from app.core import update_data
+
+    db_exists = update_data._db_path(expected_data_dir).is_file()
+    if skip_health_check and db_exists:
+        return _fail(root, diagnosis, "已有用户数据时不能跳过安全验收")
+    if not skip_health_check:
+        if not supports_data_protocol(layout.get_version_exe(root, t_ver)):
+            return _fail(root, diagnosis, "目标程序缺少数据保护协议，原数据未改动")
+        try:
+            from app.core import update_data
+
+            update_data.prepare(root, expected_data_dir, aid)
+        except Exception as exc:
+            return _fail(root, diagnosis, f"无法准备升级恢复点：{exc}")
+
     layout.write_current_state(
         root, t_ver,
         last_known_good=s_ver,
@@ -1011,7 +1250,6 @@ def execute_update(
     if not healthy:
         return _fail(root, diagnosis, f"健康检查失败：{reason}", launched_version=t_ver)
 
-    layout.confirm_version(root, t_ver)
     return _commit(root, staging_dir, t_ver, diagnosis, launch_on_finish)
 
 
@@ -1022,13 +1260,25 @@ def _commit(
     diagnosis: dict[str, Any],
     launch_on_finish: bool,
 ) -> bool:
-    """验收通过后的收尾：打开正式界面、清暂存、提交事务、按保留策略修剪。
+    """正式页面验收及接受完成后提交程序指针，再清理暂存。"""
+    transaction = layout.read_transaction(root) or {}
+    protected = transaction.get("dataPrepared", False)
+    launched = not protected
+    if protected:
+        try:
+            launched, reason = probe_version_health(
+                root, target_version, diagnosis["attemptId"],
+                data_dir=Path(diagnosis["dataDir"]), require_window=True, keep_running=launch_on_finish,
+            )
+            if not launched:
+                return _fail(root, diagnosis, f"页面验收失败：{reason}")
+            if not launch_on_finish:
+                from app.core import update_data
 
-    验收进程是被探针 terminate 掉的无窗口实例，必须由这里把新版本正式拉起来。
-    提交写在拉起成功之后：拉起失败的更新不能以「已提交」留在事务账本里。
-    """
-    launched = True
-    if launch_on_finish:
+                update_data.accept(root)
+        except Exception as exc:
+            return _fail(root, diagnosis, f"页面验收未完成：{exc}")
+    elif launch_on_finish:
         _log_update(root, "健康验收通过，拉起正式界面")
         try:
             launched = _launch_gui(root)
@@ -1036,27 +1286,26 @@ def _commit(
             _log_update(root, f"拉起正式界面失败：{exc}")
             launched = False
     if not launched:
-        _log_update(root, "拉起新版失败，交还指针到上一有效版本")
-        layout.abort_version(root, target_version)
-        diagnosis.update({
-            "stage": layout.STAGE_ROLLED_BACK,
-            "success": False,
-            "error": f"{STARTUP_ERROR}：新版已安装但未能拉起",
-            "endTime": time.time(),
-        })
-        _write_diagnosis(root, diagnosis)
-        _relaunch_previous(root, str(diagnosis.get("sourceVersion") or "") or None)
-        return False
+        return _fail(root, diagnosis, f"{STARTUP_ERROR}：新版未能拉起")
 
-    shutil.rmtree(staging_dir, ignore_errors=True)
+    layout.confirm_version(root, target_version)
+    try:
+        running_from_staging = Path(sys.executable).resolve().is_relative_to(staging_dir.resolve())
+    except OSError:
+        running_from_staging = True
+    if running_from_staging:
+        (staging_dir / STAGING_MANIFEST_NAME).unlink(missing_ok=True)
+    else:
+        shutil.rmtree(staging_dir, ignore_errors=True)
     cleanup_old_executables(root / "updater")
     cleanup_old_executables(root)
-    layout.update_transaction(root, layout.STAGE_COMMITTED)
+    layout.update_transaction(root, layout.STAGE_COMMITTED, currentVersion=target_version)
     pruned = layout.prune_versions(root, min_keep=2)
     _log_update(root, f"换装成功！清理历史版本：{pruned}")
 
     diagnosis.update({
         "stage": layout.STAGE_COMMITTED,
+        "currentVersion": target_version,
         "success": True,
         "endTime": time.time(),
         "acknowledged": False,
@@ -1066,6 +1315,8 @@ def _commit(
 
 
 def main(argv: list[str] | None = None) -> None:
+    if report_data_protocol(argv if argv is not None else sys.argv[1:]):
+        return
     parser = argparse.ArgumentParser(description=f"{APP_NAME} 独立更新宿主")
     parser.add_argument("--staging", required=True, help="更新载荷暂存目录")
     parser.add_argument("--target", default=None, help="安装根目录")
@@ -1094,7 +1345,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     if not ok:
         _alert(
-            f"[更新] 本次更新未完成，已恢复到原版本。\n\n"
+            f"[更新] 本次更新未完成。数据恢复状态与处理方法见诊断说明。\n\n"
             f"详情见 {root / 'logs' / 'update-diagnosis.json'}"
         )
         sys.exit(1)
