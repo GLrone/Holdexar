@@ -31,7 +31,7 @@ from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.logging import log_event
 from app.crawler.browse_store import StoreBrowseAPI
 from app.crawler.utils import get_beijing_time_obj
-from . import clash_manager
+from . import clash_manager, credentials
 from .models import (
     ADMISSION_ACTIVE,
     ADMISSION_CANDIDATE,
@@ -517,7 +517,7 @@ async def _round_robin(enabled: list[Proxy]) -> str:
     idx = int(await get_value("proxy.rr_index", 0) or 0)
     chosen = enabled[idx % len(enabled)]
     await set_value("proxy.rr_index", idx + 1)
-    return chosen.url()
+    return _runtime_url(chosen)
 
 
 async def _weighted_pick(enabled: list[Proxy]) -> str:
@@ -573,7 +573,27 @@ async def _weighted_pick(enabled: list[Proxy]) -> str:
     # SPEED_FLOOR × 2^-(MAX-1) × WEIGHT_SCALE，不会因取整掉到 0
     weights = [round(s * WEIGHT_SCALE) for s in scores]
     chosen = random.choices(enabled, weights=weights, k=1)[0]
-    return chosen.url()
+    return _runtime_url(chosen)
+
+
+def _runtime_url(proxy: Proxy) -> str:
+    """库内对象 → 出网用 URL（账号口令在此处解密）。
+
+    唯一解密点：任何需要真出网的地方都从这里取 URL，库内与响应体保持密文
+    或掩码。代理无账号口令时不会触碰密钥层（避免无谓的解封开销）。
+    """
+    if not proxy.username:
+        return f"{proxy.scheme}://{proxy.host}:{proxy.port}"
+    from app.domains.proxies.credentials import open_value
+
+    user = open_value(proxy.username)
+    secret = open_value(proxy.password)
+    if not user:
+        # 密钥不可用（换机/拷库）：退化成无认证 URL，让请求自然失败，
+        # 而不是拿密文当口令发出去。
+        return f"{proxy.scheme}://{proxy.host}:{proxy.port}"
+    auth = f"{quote(user, safe='')}:{quote(secret, safe='')}@"
+    return f"{proxy.scheme}://{auth}{proxy.host}:{proxy.port}"
 
 
 async def _saved_proxy_candidates(limit: int = 3) -> list[str]:
@@ -697,7 +717,10 @@ async def update_subscription_label(sub_id: int, label: str) -> dict:
             stats["labelSource"] = LABEL_SOURCE_USER if label else None
             sub.last_stats = stats
         await session.commit()
-        return {"id": sub.id, "kind": sub.kind, "url": open_url(sub.url), "label": sub.label}
+        return {
+            "id": sub.id, "kind": sub.kind,
+            "url": mask_url(open_url(sub.url)), "label": sub.label,
+        }
 
 
 async def update_subscription(
@@ -967,7 +990,7 @@ async def resolve_startable_clash(
     attempts 记录被淘汰候选的失败原因；全军覆没抛 ValueError（文案面向
     用户，聚合各候选原因）。
     """
-    subs = [s for s in await list_subscriptions("clash") if not s["deprecated"]]
+    subs = [s for s in await list_subscriptions("clash", reveal=True) if not s["deprecated"]]
     if not subs:
         raise ValueError(
             "没有可用的 Clash 订阅（全部已废弃或尚未添加），"
@@ -1097,7 +1120,7 @@ async def maybe_refresh_active_clash_subscription() -> dict:
         if elapsed is not None and elapsed < timedelta(hours=SUBSCRIPTION_REFRESH_HOURS):
             return {"state": "throttled", **skip}
 
-    usable = [s for s in await list_subscriptions("clash") if not s["deprecated"]]
+    usable = [s for s in await list_subscriptions("clash", reveal=True) if not s["deprecated"]]
     if not usable:
         return {"state": "no_subscription", **skip}
     # 从新到旧找「URL 出现在启动文本里」的那条（与「最近一条」默认序一致）
@@ -1157,6 +1180,11 @@ async def list_proxies(enabled_only: bool = False) -> list[Proxy]:
 
 
 def _proxy_dict(p: Proxy, mask_auth: bool = True) -> dict:
+    """对外投影：账号口令一律掩码，只有 `hasAuth` 说明是否配置过。
+
+    库内是密文、出网才解密；响应体永远不出现明文（连「解出来再掩码」
+    都不做——没有解密就没有泄露面）。
+    """
     return {
         "id": p.id,
         "label": p.label,
@@ -1164,11 +1192,11 @@ def _proxy_dict(p: Proxy, mask_auth: bool = True) -> dict:
         "host": p.host,
         "port": p.port,
         "hasAuth": bool(p.username),
-        "url": p.url().replace(
-            f"{p.username}:{p.password}@", f"{p.username}:****@"
-        )
-        if (p.username and not mask_auth)
-        else (f"{p.scheme}://{p.host}:{p.port}" if not p.username else f"{p.scheme}://***@{p.host}:{p.port}"),
+        "url": (
+            f"{p.scheme}://{p.host}:{p.port}"
+            if not p.username
+            else f"{p.scheme}://***@{p.host}:{p.port}"
+        ),
         "enabled": p.enabled,
         "status": p.status,
         "latencyMs": p.latency_ms,
@@ -1200,6 +1228,7 @@ async def add_proxy(
             username=username, password=password, enabled=True,
             created_at=_naive(get_beijing_time_obj()),
         )
+        credentials.seal_proxy(proxy)
         session.add(proxy)
         await session.commit()
         return _proxy_dict(proxy)
@@ -1286,7 +1315,9 @@ async def _check(proxy: Proxy) -> tuple[str, int | None, str | None]:
     started = time.monotonic()
     status, latency, error = "failed", None, None
     try:
-        async with httpx.AsyncClient(timeout=TEST_TIMEOUT, proxy=proxy.url()) as client:
+        async with httpx.AsyncClient(
+            timeout=TEST_TIMEOUT, proxy=_runtime_url(proxy)
+        ) as client:
             resp = await client.get(TEST_URL, params=TEST_PARAMS)
             latency = int((time.monotonic() - started) * 1000)
             if _steam_payload_ok(resp):
@@ -1357,18 +1388,46 @@ async def migrate_legacy_subscription() -> None:
     await set_value("proxy.subscription_url", None)
 
 
-async def list_subscriptions(kind: str | None = None) -> list[dict]:
+def mask_url(url: str) -> str:
+    """订阅链接掩码：保留主机名，隐藏路径与查询串（token 都在那里）。
+
+    展示层只需要「这是哪家机场」，恢复完整链接是显式的、单独的取用动作。
+    """
+    if not url:
+        return ""
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "***"
+    host = parts.hostname or "***"
+    return f"{parts.scheme}://{host}/***" if parts.scheme else f"{host}/***"
+
+
+async def list_subscriptions(kind: str | None = None, *, reveal: bool = False) -> list[dict]:
+    """订阅列表投影。
+
+    默认 `url` 为掩码——响应体不出现明文 token，即便调用方持有合法会话，
+    也不该在列表里顺手拿到全部订阅凭据。进程内部需要真实 URL 的逻辑
+    （启动候选遍历、内核归属判定）用 `reveal=True` 取明文；那是库内解密，
+    不经过任何响应体。
+    """
     query = select(ProxySubscription).order_by(ProxySubscription.id)
     if kind:
         query = query.where(ProxySubscription.kind == kind)
     async with get_session_factory()() as session:
         rows = (await session.execute(query)).scalars().all()
+
+    def _url(stored: str | None) -> str:
+        plain = open_url(stored)
+        return plain if reveal else mask_url(plain)
+
     return [
         {
             "id": s.id,
             "kind": s.kind,
-            # 面板展示用明文（本地管理 UI 自有语义）；行内存的是密文
-            "url": open_url(s.url),
+            "url": _url(s.url),
             "label": s.label,
             "createdAt": s.created_at.isoformat() if s.created_at else None,
             "lastImportedAt": s.last_imported_at.isoformat() if s.last_imported_at else None,
@@ -1671,7 +1730,12 @@ async def import_plain_subscription(sub_id: int, timeout: float = 30.0) -> dict:
         current.last_error = None
         await session.commit()
 
-    existing = {(p.host, p.port, p.username or "") for p in await list_proxies()}
+    # 去重键用**解密后**的用户名：库内是随机 nonce 的密文，同一条目每次
+    # 加密结果都不同，拿密文当键会失去去重能力（重复导入同一个订阅会翻倍）。
+    existing = {
+        (p.host, p.port, credentials.open_value(p.username) or "")
+        for p in await list_proxies()
+    }
     existing_before_add = set(existing)
     added = skipped = 0
     async with write_session(WritePriority.BACKGROUND) as session:
@@ -1681,14 +1745,14 @@ async def import_plain_subscription(sub_id: int, timeout: float = 30.0) -> dict:
                 skipped += 1
                 continue
             existing.add(key)
-            session.add(
-                Proxy(
-                    label=item["username"] and f"{item['host']}:{item['port']}({item['username']})" or None,
-                    scheme=item["scheme"], host=item["host"], port=item["port"],
-                    username=item["username"], password=item["password"],
-                    enabled=True, created_at=_naive(get_beijing_time_obj()),
-                )
+            proxy = Proxy(
+                label=item["username"] and f"{item['host']}:{item['port']}({item['username']})" or None,
+                scheme=item["scheme"], host=item["host"], port=item["port"],
+                username=item["username"], password=item["password"],
+                enabled=True, created_at=_naive(get_beijing_time_obj()),
             )
+            credentials.seal_proxy(proxy)
+            session.add(proxy)
             added += 1
         await session.commit()
 
@@ -1700,7 +1764,7 @@ async def import_plain_subscription(sub_id: int, timeout: float = 30.0) -> dict:
         new_keys = existing - existing_before_add
         fresh = [
             p for p in await list_proxies()
-            if (p.host, p.port, p.username or "") in new_keys
+            if (p.host, p.port, credentials.open_value(p.username) or "") in new_keys
         ]
         results = await asyncio.gather(
             *[_check_single(p) for p in fresh], return_exceptions=True
@@ -2823,3 +2887,45 @@ async def seal_subscription_urls() -> int:
             detail={"条数": sealed},
         )
     return sealed
+
+
+async def seal_proxy_credentials() -> int:
+    """存量明文代理账号口令封装为密文（启动幂等步骤）。
+
+    与订阅链接同一口径：带密文前缀或空值的行跳过；读取侧对存量明文兼容
+    （`credentials.open_value` 按前缀分流）。返回封装条目数。
+    """
+    sealed = 0
+    async with write_session(WritePriority.BACKGROUND) as session:
+        rows = (await session.execute(select(Proxy))).scalars().all()
+        for row in rows:
+            touched = False
+            for field in ("username", "password"):
+                value = getattr(row, field) or ""
+                if not value or secretbox.is_encrypted(value):
+                    continue
+                setattr(row, field, credentials.seal(value))
+                touched = True
+            if touched:
+                sealed += 1
+        await session.commit()
+    if sealed:
+        log_event(
+            logger,
+            f"存量明文代理凭据已加密落库 {sealed} 条",
+            tag="已修复",
+            detail={"条数": sealed},
+        )
+    return sealed
+
+
+async def reveal_subscription_url(sub_id: int) -> str:
+    """显式取用完整订阅链接（编辑 / 复制场景）。
+
+    与列表投影分开：列表一律掩码，只有用户主动点「查看」才解一次密。
+    这个函数是订阅链接明文的**唯一**出口，调用点必须是有会话保护的端点。
+    """
+    row = await get_subscription(sub_id)
+    if row is None:
+        raise ValueError("订阅不存在")
+    return open_url(row.url)

@@ -21,6 +21,7 @@ smtp.to_addr / smtp.use_ssl（默认 True，QQ/163 邮箱 465 端口）。
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import smtplib
@@ -32,7 +33,7 @@ from html import escape
 
 from app.core.app_info import APP_NAME
 from app.core.logging import log_event
-from app.domains.settings.service import get_value, set_value
+from app.domains.settings.service import get_secret_value, get_value
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,7 @@ async def smtp_config() -> dict:
         "host": await get_value("smtp.host", ""),
         "port": int(await get_value("smtp.port", 465) or 465),
         "user": await get_value("smtp.user", ""),
-        "password": await get_value("smtp.password", ""),
+        "password": await get_secret_value("smtp.password", ""),
         "to_addr": await get_value("smtp.to_addr", ""),
         "use_ssl": await get_value("smtp.use_ssl", True),
     }
@@ -82,13 +83,29 @@ async def update_smtp_config(
     use_ssl: bool,
 ) -> dict:
     """更新 SMTP 配置。password 为空字符串时保持原密码不变。"""
-    await set_value("smtp.host", host)
-    await set_value("smtp.port", port)
-    await set_value("smtp.user", user)
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+    from app.core.database import WritePriority, write_session
+    from app.domains.notifications.service import retarget_candidates
+    from app.domains.settings.models import AppSetting
+
+    values = {"smtp.host": host, "smtp.port": port, "smtp.user": user,
+              "smtp.to_addr": to_addr, "smtp.use_ssl": use_ssl}
     if password:
-        await set_value("smtp.password", password)
-    await set_value("smtp.to_addr", to_addr)
-    await set_value("smtp.use_ssl", use_ssl)
+        from app.core import secretbox
+        from app.domains.settings.service import _secret_purpose
+
+        values["smtp.password"] = secretbox.encrypt_secret(password, _secret_purpose("smtp.password"))
+    now = datetime.now()
+    async with write_session(WritePriority.INTERACTIVE, "smtp_settings") as session:
+        stmt = sqlite_insert(AppSetting)
+        await session.execute(stmt.on_conflict_do_update(index_elements=[AppSetting.key],
+                              set_={"value_json": stmt.excluded.value_json,
+                                    "updated_at": stmt.excluded.updated_at}),
+                              [{"key": key, "value_json": value, "updated_at": now}
+                               for key, value in values.items()])
+        await retarget_candidates(session, to_addr)
+        await session.commit()
     log_event(
         logger,
         "SMTP 配置已更新",
@@ -138,29 +155,58 @@ def _smtp_auth_reason(e: smtplib.SMTPAuthenticationError) -> str:
     )
 
 
-async def send_mail_ex(subject: str, html_body: str) -> tuple[bool, str | None]:
+_UNKNOWN_DELIVERY = "SMTPDeliveryUnknown:"
+_REJECTED_DELIVERY = "SMTPRejected:"
+
+
+def is_delivery_unknown(error: str | None) -> bool:
+    return bool(error and error.startswith(_UNKNOWN_DELIVERY))
+
+
+def delivery_rejection_code(error: str | None) -> int | None:
+    match = re.match(r"^SMTPRejected: ([45][0-9]{2})(?: |$)", error or "")
+    return int(match.group(1)) if match else None
+
+
+async def send_mail_ex(subject: str, html_body: str,
+                       *, recipient: str | None = None) -> tuple[bool, str | None]:
     """发一封邮件，返回 (是否成功, 失败原因)。
 
     与 `send_mail` 是同一条投递路径，只是把失败原因交回调用方——通知层靠它
     区分「临时网络错误（可有限重试）」与「凭据/配置错误（不该重试）」。
     """
     cfg = await smtp_config()
+    if recipient is not None:
+        cfg["to_addr"] = recipient
     if not (cfg["host"] and cfg["user"] and cfg["password"] and cfg["to_addr"]):
         log_event(logger, "SMTP 未配置，跳过邮件通知", tag="跳过")
         return False, "SMTP 未配置"
+    return await asyncio.to_thread(_send_mail_sync, cfg, subject, html_body)
+
+
+def _send_mail_sync(cfg: dict, subject: str, html_body: str) -> tuple[bool, str | None]:
+    server = None
+    data_started = False
     try:
         if cfg["use_ssl"]:
             server = smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=20)
         else:
             server = smtplib.SMTP(cfg["host"], cfg["port"], timeout=20)
             server.starttls()
-        with server:
-            _smtp_login(server, cfg["user"], cfg["password"])
-            message = MIMEText(html_body, "html", "utf-8")
-            message["Subject"] = Header(subject, "utf-8")
-            message["From"] = formataddr((APP_NAME, cfg["user"]))
-            message["To"] = cfg["to_addr"]
-            server.sendmail(cfg["user"], [cfg["to_addr"]], message.as_string())
+        _smtp_login(server, cfg["user"], cfg["password"])
+        original_data = getattr(server, "data", None)
+        if original_data is not None:
+            def track_data(message):
+                nonlocal data_started
+                data_started = True
+                return original_data(message)
+
+            server.data = track_data
+        message = MIMEText(html_body, "html", "utf-8")
+        message["Subject"] = Header(subject, "utf-8")
+        message["From"] = formataddr((APP_NAME, cfg["user"]))
+        message["To"] = cfg["to_addr"]
+        server.sendmail(cfg["user"], [cfg["to_addr"]], message.as_string())
         log_event(logger, "邮件已发送", tag="成功", detail={"主题": subject})
         return True, None
     except smtplib.SMTPAuthenticationError as e:
@@ -168,10 +214,33 @@ async def send_mail_ex(subject: str, html_body: str) -> tuple[bool, str | None]:
         log_event(logger, "邮件发送认证被拒", detail={"原因": reason}, level=logging.ERROR)
         return False, reason
     except Exception as e:  # noqa: BLE001
+        code = e.smtp_code if isinstance(e, smtplib.SMTPResponseException) else None
+        if isinstance(e, smtplib.SMTPRecipientsRefused):
+            codes = [int(reply[0]) for reply in e.recipients.values()]
+            code = max(codes) if codes else None
+        if code is not None and 400 <= code < 600:
+            log_event(logger, "邮件发送被服务器明确拒绝", detail={"错误码": code}, level=logging.ERROR)
+            return False, f"{_REJECTED_DELIVERY} {code} {type(e).__name__}: {e}"
+        if data_started:
+            log_event(logger, "邮件发送结果无法确认，保留记录且不自动重发", level=logging.WARNING)
+            return False, f"{_UNKNOWN_DELIVERY} {type(e).__name__}: {e}"
         log_event(logger, "邮件发送失败", detail={"原因": e}, level=logging.ERROR)
         # 返回里带上异常类型名：错误文本会被系统语言本地化（中文 Windows 的
         # socket 错误是中文），只有类型名是与语言无关的稳定判据
         return False, f"{type(e).__name__}: {e}"
+    finally:
+        if server is not None:
+            try:
+                server.quit()
+            except Exception:  # noqa: BLE001
+                log_event(logger, "邮件连接收尾失败，保留投递结果", level=logging.WARNING, exc_info=True)
+            finally:
+                close = getattr(server, "close", None)
+                if close is not None:
+                    try:
+                        close()
+                    except Exception:  # noqa: BLE001
+                        log_event(logger, "邮件连接关闭失败，保留投递结果", level=logging.WARNING, exc_info=True)
 
 
 async def send_mail(subject: str, html_body: str) -> bool:
@@ -989,7 +1058,7 @@ async def send_test_mail(
     成功返回 {"ok": True}。
     """
     if not password:  # 表单密码留空 = 沿用已存密码
-        password = await get_value("smtp.password", "")
+        password = await get_secret_value("smtp.password", "")
     missing = [
         name
         for name, val in (
@@ -1005,39 +1074,17 @@ async def send_test_mail(
 
     subject = f"欢迎使用 {APP_NAME} · 邮箱连通性测试"
     html = _test_mail_html(host=host, port=port, user=user, to_addr=to_addr, use_ssl=use_ssl)
-    try:
-        if use_ssl:
-            server = smtplib.SMTP_SSL(host, port, timeout=20)
-        else:
-            server = smtplib.SMTP(host, port, timeout=20)
-            server.starttls()
-        with server:
-            _smtp_login(server, user, password)
-            message = MIMEText(html, "html", "utf-8")
-            message["Subject"] = Header(subject, "utf-8")
-            message["From"] = formataddr((APP_NAME, user))
-            message["To"] = to_addr
-            server.sendmail(user, [to_addr], message.as_string())
-        log_event(
-            logger,
-            "连通性测试邮件已发送",
-            tag="成功",
-            detail={"发件": user, "收件": to_addr},
-        )
+    ok, error = await asyncio.to_thread(_send_mail_sync, {
+        "host": host, "port": port, "user": user, "password": password,
+        "to_addr": to_addr, "use_ssl": use_ssl,
+    }, subject, html)
+    if ok:
         return {"ok": True}
-    except ValueError:
-        raise
-    except smtplib.SMTPAuthenticationError as e:
-        log_event(
-            logger,
-            "连通性测试邮件认证被拒",
-            detail={"错误码": e.smtp_code, "服务器回复": e.smtp_error},
-            level=logging.WARNING,
-        )
-        raise ValueError(_smtp_auth_reason(e)) from e
-    except Exception as e:  # noqa: BLE001 — SMTP 错误原文回传前端
-        log_event(logger, "连通性测试邮件发送失败", detail={"原因": e}, level=logging.WARNING)
-        raise ValueError(f"连接失败：{e}") from e
+    if error and error.startswith("SMTPAuthenticationError: "):
+        raise ValueError(error.removeprefix("SMTPAuthenticationError: "))
+    if is_delivery_unknown(error):
+        raise ValueError("邮件发送结果无法确认，请先检查收件箱再决定是否重新测试")
+    raise ValueError(f"连接失败：{error}")
 
 
 def _lowest_hint(items: list[dict]) -> str:

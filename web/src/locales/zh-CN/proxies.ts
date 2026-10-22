@@ -124,6 +124,7 @@ const proxies = {
   'proxies.sub.edited': '订阅已更新',
   'proxies.sub.editedSynced': '订阅已更新并重新拉取（{parts}）',
   'proxies.sub.urlInvalid': '订阅链接必须是 http(s) 链接',
+  'proxies.sub.urlUnavailable': '无法读取完整链接，请重新填写',
   'proxies.sub.savedNodes': '订阅已保存（{nodes} 节点）',
   'proxies.sub.saved': '订阅已保存',
   'proxies.sub.savedPlain': '订阅已保存（长期保留在本地库）',

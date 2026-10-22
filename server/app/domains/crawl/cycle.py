@@ -145,6 +145,7 @@ class PriceCycle(Base):
     expected_json: Mapped[dict | None] = mapped_column(JSON)
     # 冻结的本轮阶段（spec 列表原样留存，供回溯「这轮跑了哪几段」）
     specs_json: Mapped[list | None] = mapped_column(JSON)
+    notification_scan_json: Mapped[dict | None] = mapped_column(JSON)
     started_at: Mapped[datetime | None] = mapped_column(DateTime)
     # 进入各阶段的真实时刻（NULL = 本轮没进过该阶段）；阶段耗时由它们相减得出
     running_at: Mapped[datetime | None] = mapped_column(DateTime)
@@ -188,7 +189,10 @@ class PriceCycle(Base):
     # {"planning": ms, "running": ms, "repairing": ms, "finalizing": ms}
     stage_ms_json: Mapped[dict | None] = mapped_column(JSON)
 
-    __table_args__ = (Index("ix_price_cycle_status", "status", "started_at"),)
+    __table_args__ = (
+        Index("ix_price_cycle_status", "status", "started_at"),
+        {"sqlite_autoincrement": True},
+    )
 
 
 async def create(kind: str, scope: str = "") -> int:

@@ -15,6 +15,7 @@ import ctypes
 import json
 import os
 import platform
+import secrets
 import subprocess
 import sys
 import threading
@@ -36,7 +37,6 @@ from app.domains.proxypool.runtime import (
     RUNTIME_BIND_ADDRESS,
     RUNTIME_CONFIG_FILENAME,
     RUNTIME_CONTROLLER_HOST,
-    RUNTIME_CONTROLLER_SECRET,
     RUNTIME_MODE,
     _free_local_port,
     _port_listening,
@@ -438,7 +438,7 @@ def _render_tier_config(
         "allow-lan": False,
         "bind-address": RUNTIME_BIND_ADDRESS,
         "external-controller": f"{RUNTIME_CONTROLLER_HOST}:{_free_local_port()}",
-        "secret": RUNTIME_CONTROLLER_SECRET,
+        "secret": secrets.token_urlsafe(32),
         "mixed-port": _free_local_port(),
         "proxies": [dict(p) for p in proxies],
         "proxy-groups": groups,

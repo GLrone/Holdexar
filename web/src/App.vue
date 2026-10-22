@@ -169,6 +169,10 @@ const logo = computed(() =>
   themeStore.isDark ? '/assets/logo_dark.ico' : '/assets/logo_light.ico',
 )
 
+async function toggleTheme() {
+  if (!await themeStore.toggle()) message.error(t('settings.update.switchFailed'))
+}
+
 /* ── 侧边栏：按用户目的分三组——首页 / 领航台不带组名直接置顶，游戏商店 /
    捆绑包 / 游戏库 / 我的关注 / 价格提醒同属浏览与追踪入口；「更多」
    收具体业务功能；「系统」收技术 / 维护入口。工具箱不进一级导航，
@@ -367,7 +371,7 @@ async function manualRefreshWallet() {
           <HlLangToggle :locale="localeStore.locale" @toggle="localeStore.toggle()" />
 
           <!-- 主题外观切换（纯图标圆钮）—— 与钱包胶囊换位后居前 -->
-          <HlThemeToggle :dark="themeStore.isDark" @toggle="themeStore.toggle()" />
+          <HlThemeToggle :dark="themeStore.isDark" @toggle="toggleTheme" />
 
           <!-- Steam 钱包余额胶囊（主题钮后、头像前）：默认显示主账号余额，点击弹出
                全部账号余额列表，再点关闭；未绑定时显示引导态 -->

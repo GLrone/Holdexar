@@ -3,16 +3,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.core.app_info import APP_NAME
+from app.core.app_info import APP_NAME, ENV_PREFIX
+from app.core.access import LocalAccessMiddleware
 from app.core.config import get_settings
 from app.core.database import init_db
 from app.core.logging import log_event, setup_logging
@@ -41,6 +44,7 @@ from app.domains.regions.router import router as regions_router
 from app.domains.settings.router import router as settings_router
 from app.domains.steam_events.router import router as steam_events_router
 from app.domains.system.router import router as system_router
+from app.domains.system.session_router import router as session_router
 from app.domains.wishlist.router import router as wishlist_router
 
 logger = logging.getLogger(__name__)
@@ -66,7 +70,7 @@ async def _autostart_clash(*, snapshot_only: bool = False) -> None:
         if not detect["found"]:
             log_event(logger, "本机没有 Clash 内核，跳过内核自启", tag="跳过")
             return
-        subs = await proxies_service.list_subscriptions("clash")
+        subs = await proxies_service.list_subscriptions("clash", reveal=True)
         usable = [s for s in subs if not s.get("deprecated")]
         if not usable:
             if subs:
@@ -175,6 +179,18 @@ async def _post_startup_chain() -> None:
     """
     from app.core.seed_assets import merge_seed_incremental
 
+    from app.domains.notifications.service import recover_delivery_state, resume_event_scans
+
+    try:
+        await recover_delivery_state()
+    except Exception:
+        log_event(logger, "提醒投递状态恢复失败，不阻塞启动", level=logging.ERROR, exc_info=True)
+
+    try:
+        await resume_event_scans()
+    except Exception:
+        log_event(logger, "未完成的提醒生成仍保留，后续继续恢复", level=logging.ERROR, exc_info=True)
+
     try:
         await merge_seed_incremental()
     except Exception:  # noqa: BLE001
@@ -257,6 +273,21 @@ async def _post_startup_chain() -> None:
         await proxies_service.seal_subscription_urls()
     except Exception:  # noqa: BLE001 —— 读取侧兼容明文，本步失败不阻塞启动
         log_event(logger, "订阅链接静态加密失败，不阻塞启动", level=logging.ERROR, exc_info=True)
+
+    # 存量明文代理账号口令静态加密（幂等）：proxies 表两列，出网时解密
+    try:
+        await proxies_service.seal_proxy_credentials()
+    except Exception:  # noqa: BLE001 —— 读取侧兼容明文，本步失败不阻塞启动
+        log_event(logger, "代理凭据静态加密失败，不阻塞启动", level=logging.ERROR, exc_info=True)
+
+    # 节点认证明文的落盘约束：收紧既有产物权限 + 清理上次崩溃留下的可重建副本
+    try:
+        from app.domains.proxies import node_secret_files
+
+        node_secret_files.tighten_all(get_settings().data_dir)
+        node_secret_files.sweep_transient(get_settings().data_dir)
+    except Exception:  # noqa: BLE001 —— 权限收紧失败不阻塞启动
+        log_event(logger, "节点配置文件权限收紧失败", level=logging.WARNING, exc_info=True)
 
     # 史低标记 + 永降标记 + 排序缓存预计算列 + 系列归组全库初始化
     # （秒级；爬取后另有增量刷新）
@@ -407,7 +438,7 @@ async def _post_startup_chain() -> None:
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
+async def lifespan(application: FastAPI):
     """监听前只做「不收拾完就不能开门」的最小集，其余全部移交后台链。
 
     监听前（阻塞端口监听，即用户等待时间）：
@@ -421,7 +452,28 @@ async def lifespan(_: FastAPI):
     """
     settings = get_settings()
     setup_logging(settings.data_dir)
-    await init_db()
+    update_attempt = os.environ.get(f"{ENV_PREFIX}UPDATE_ATTEMPT_ID")
+    from app.core import layout as update_layout, update_data
+
+    with update_data.startup_authorization(settings.data_dir) as update_token:
+        await init_db(maintenance_token=update_token)
+    application.state.update_verification = {
+        "protected": bool(update_token), "pageReady": False,
+    }
+
+    from app.core import rekey
+
+    async def resume_keys():
+        try:
+            await rekey.resume_pending_migration(settings.data_dir)
+        except Exception:
+            log_event(
+                logger, "密钥换装收尾失败，保留过渡记录待下次续跑", level=logging.ERROR,
+                exc_info=True,
+            )
+
+    if not update_token:
+        await resume_keys()
 
     # 数据目录布局入日志：本机支持多布局（系统数据目录 / 便携 / 存量便携），
     # 「数据跑哪去了」是最高频的排查问题，启动即亮明。
@@ -437,10 +489,37 @@ async def lifespan(_: FastAPI):
             "端口": settings.port,
         },
     )
-    asyncio.create_task(_post_startup_chain())
-    yield
-    stop_scheduler()
-    log_event(logger, f"{APP_NAME} 已停止")
+    async def start_after_acceptance():
+        if update_token:
+            root = Path(os.environ[f"{ENV_PREFIX}INSTALL_ROOT"])
+            while True:
+                transaction = update_layout.read_transaction(root) or {}
+                if (transaction.get("attemptId") == update_attempt
+                        and transaction.get("dataToken") == update_token
+                        and transaction.get("dataAccepted") is True):
+                    from app.core.backup import ensure_restore_lock_available
+
+                    try:
+                        ensure_restore_lock_available(settings.data_dir / settings.db_filename)
+                    except RuntimeError:
+                        pass
+                    else:
+                        application.state.update_verification["protected"] = False
+                        os.environ.pop(f"{ENV_PREFIX}UPDATE_ATTEMPT_ID", None)
+                        os.environ.pop(f"{ENV_PREFIX}UPDATE_DATA_TOKEN", None)
+                        break
+                await asyncio.sleep(0.1)
+            await resume_keys()
+        await _post_startup_chain()
+
+    startup_task = asyncio.create_task(start_after_acceptance() if update_token else _post_startup_chain())
+    try:
+        yield
+    finally:
+        startup_task.cancel()
+        await asyncio.gather(startup_task, return_exceptions=True)
+        stop_scheduler()
+        log_event(logger, f"{APP_NAME} 已停止")
 
 
 # vite 构建产物带 8 位内容指纹；public/ 拷贝物（logo、奖杯、flags）与构建产物
@@ -523,16 +602,47 @@ def create_app() -> FastAPI:
     # compresslevel 取 6 而非默认 9：捆绑包全量列表是 50MB 级 JSON，9 下单次
     # 压缩为秒级 CPU，而压缩比只高约 4%——6 是压缩率与单请求 CPU 的平衡点。
     app.add_middleware(GZipMiddleware, compresslevel=6)
+    # 本地准入：加在 CORS 之后 → 位于其外层，预检由本层直接放行、其余 API
+    # 先过 Host 与会话校验。中间件顺序即洋葱顺序，最后一个 add 在最外层。
+    app.add_middleware(LocalAccessMiddleware)
 
     @app.middleware("http")
     async def _add_static_cache_headers(request, call_next):
-        response = await call_next(request)
+        verification = getattr(request.app.state, "update_verification", {})
+        if (verification.get("protected")
+                and request.url.path.startswith("/api/")
+                and request.method not in {"GET", "HEAD", "OPTIONS"}
+                and request.url.path != "/api/v1/system/update-ready"):
+            response = JSONResponse({"detail": "正在完成更新，请稍后再试"}, status_code=503)
+        else:
+            response = await call_next(request)
         cache_control = _cache_control_for(request.url.path.lstrip("/"))
         if cache_control:
             response.headers.setdefault("Cache-Control", cache_control)
+        # 基础安全响应头：本应用只服务自己的页面，不需要被任何外部页面嵌入，
+        # 也不该让浏览器去猜内容类型。
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        # CSP：页面只加载同源资源；内联样式与脚本是当前构建产物的现实
+        # （Vue 注入的 style 标签、index.html 的内联引导），这里放开
+        # unsafe-inline 但禁止一切外部来源与 object/embed。
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            "img-src 'self' data: https://cdn.cloudflare.steamstatic.com "
+            "https://shared.akamai.steamstatic.com https://store.fastly.steamstatic.com; "
+            "style-src 'self' 'unsafe-inline'; "
+            "script-src 'self' 'unsafe-inline'; "
+            "connect-src 'self'; "
+            "frame-ancestors 'none'; "
+            "object-src 'none'; "
+            "base-uri 'self'",
+        )
         return response
 
     app.include_router(system_router, prefix="/api/v1")
+    app.include_router(session_router, prefix="/api/v1")
     app.include_router(agent_router, prefix="/api/v1")
     app.include_router(settings_router, prefix="/api/v1")
     app.include_router(games_router, prefix="/api/v1")

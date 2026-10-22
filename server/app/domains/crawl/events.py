@@ -22,7 +22,6 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import WritePriority, get_session_factory, write_session, Base
-from app.core.database import write_gate
 from app.domains.crawl.cycle import PriceCycle
 from app.domains.games.models import Game, GameCurrentPrice
 
@@ -151,6 +150,7 @@ class PriceEvent(Base):
         ),
         Index("ix_price_events_cycle", "cycle_id"),
         Index("ix_price_events_appid", "appid", "occurred_at"),
+        {"sqlite_autoincrement": True},
     )
 
 
@@ -484,20 +484,61 @@ async def _persist(events: list[dict]) -> list[dict]:
     written: list[dict] = []
     now = datetime.now()
     async with write_session(WritePriority.BACKGROUND) as session:
-        for item in events:
-            stmt = (
-                sqlite_insert(PriceEvent)
-                .values(**item, created_at=now)
-                .on_conflict_do_nothing()
+        for offset in range(0, len(events), 500):
+            result = await session.execute(
+                sqlite_insert(PriceEvent.__table__).on_conflict_do_nothing()
+                .returning(*PriceEvent.__table__.c),
+                [dict(item, created_at=now) for item in events[offset:offset + 500]],
             )
-            result = await session.execute(stmt)
-            if result.rowcount:
-                written.append(item)
+            written.extend(dict(row) for row in result.mappings())
+        source_ids = {row["cycle_id"] for row in written if row["cycle_id"] > 0}
+        if source_ids:
+            sources = (await session.execute(select(PriceCycle).where(
+                PriceCycle.id.in_(source_ids)
+            ))).scalars().all()
+            for source in sources:
+                scan = source.notification_scan_json or {}
+                if scan.get("state") not in ("pending", "scanning"):
+                    source.notification_scan_json = {
+                        "state": "pending", "cursor": int(scan.get("cursor") or 0),
+                    }
         await session.commit()
     return written
 
 
 # ── 只读查询 ──
+
+
+async def notification_batches(cycle_id: int, watched: set[int], *, batch: int = 1000,
+                               after: int = 0, upper: int | None = None):
+    """按固定身份上界分页消费本轮关注事件。"""
+    if not watched:
+        return
+    if upper is None:
+        async with get_session_factory()() as session:
+            upper = int((await session.execute(select(func.max(PriceEvent.id)).where(
+                PriceEvent.cycle_id == cycle_id
+            ))).scalar_one() or 0)
+    scope = func.json_each(json.dumps(sorted(watched))).table_valued("value")
+    while after < upper:
+        async with get_session_factory()() as session:
+            rows = (await session.execute(select(PriceEvent).where(
+                PriceEvent.cycle_id == cycle_id, PriceEvent.id > after,
+                PriceEvent.id <= upper, PriceEvent.appid.in_(select(scope.c.value)),
+            ).order_by(PriceEvent.id).limit(batch))).scalars().all()
+        if not rows:
+            return
+        after = int(rows[-1].id)
+        yield [_event_payload(row) for row in rows]
+
+
+def _event_payload(event: PriceEvent) -> dict:
+    return {
+        "id": event.id, "cycleId": event.cycle_id, "appid": event.appid,
+        "region": event.region_code, "eventType": event.event_type,
+        "previous": event.previous_json, "current": event.current_json,
+        "occurredAt": event.occurred_at.isoformat() if event.occurred_at else None,
+    }
 
 
 async def list_events(
@@ -522,16 +563,4 @@ async def list_events(
         stmt = stmt.where(PriceEvent.event_type == event_type)
     async with get_session_factory()() as session:
         rows = (await session.execute(stmt)).scalars().all()
-    return [
-        {
-            "id": e.id,
-            "cycleId": e.cycle_id,
-            "appid": e.appid,
-            "region": e.region_code,
-            "eventType": e.event_type,
-            "previous": e.previous_json,
-            "current": e.current_json,
-            "occurredAt": e.occurred_at.isoformat() if e.occurred_at else None,
-        }
-        for e in rows
-    ]
+    return [_event_payload(row) for row in rows]

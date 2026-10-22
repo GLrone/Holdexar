@@ -17,6 +17,7 @@ import io
 import logging
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -31,7 +32,6 @@ from pathlib import Path
 import httpx
 import yaml
 
-from app.core.app_info import APP_SLUG
 from app.core.config import get_settings
 from app.core.logging import log_event
 from app.domains.proxies.kernel_release import (
@@ -681,22 +681,23 @@ def strip_tun_section(config_text: str) -> str:
 
 
 CONTROLLER_PORT = 19090
-CONTROLLER_SECRET = APP_SLUG
+
+
+def _new_controller_secret() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _with_controller_secret(config_text: str, secret: str) -> str:
+    line = f"secret: {secret}"
+    if re.search(r"^secret\s*:", config_text, re.MULTILINE):
+        return re.sub(r"^secret\s*:.*$", line, config_text, count=1, flags=re.MULTILINE)
+    return f"{config_text.rstrip()}\n{line}\n"
 
 
 def resolve_controller(config_text: str) -> tuple[str, str]:
-    """解析本次启动的控制器端点，返回 (base_url, secret)。
-
-    控制器只经内核命令行参数（-ext-ctl / -secret）下发——配置文件里的
-    external-controller / secret 行一律不信任也不改写：订阅 yaml 自带的
-    控制器行可能指向已被占用的端口，沿用会让所有控制通信打到占用者的
-    内核上（PUT /configs 会把配置灌进运行中的其他内核进程，必须写自有内核的端点）。
-    端口被占时从 CONTROLLER_PORT 起避让扫描（内核对「绑定失败但继续跑」
-    的行为只打日志不退出，必须启动前保证端口空闲）。
-    """
+    """分配自有回环控制端点和随机密钥；端口占用时从基址避让。"""
     match = re.search(r"^external-controller\s*:\s*['\"]?([^'\"\n#]+)", config_text, re.MULTILINE)
-    secret_match = re.search(r"^secret\s*:\s*['\"]?([^'\"\n#]+)", config_text, re.MULTILINE)
-    secret = secret_match.group(1).strip() if secret_match else CONTROLLER_SECRET
+    secret = _new_controller_secret()
     port: int | None = None
     if match:
         addr = match.group(1).strip()
@@ -782,7 +783,7 @@ def config_unchanged(startup_text: str | None, disk_text: str) -> bool:
 
 
 def _subscription_view(config_text: str) -> dict | None:
-    """配置的订阅内容视图：剥掉探测 lane 与混合口后的 yaml 结构（等价比较用）。
+    """配置的订阅内容视图：剥掉探测 lane、混合口与控制密钥后的 yaml 结构。
 
     mixed-port 一并剥掉：监听口归程序管（pin_mixed_port 钉成工作端口），
     不属于订阅内容——端口漂移不触发重启的语义由这里兑现。"""
@@ -794,6 +795,7 @@ def _subscription_view(config_text: str) -> dict | None:
         return None
     view = dict(doc)
     view.pop("mixed-port", None)
+    view.pop("secret", None)
     for key in ("proxy-groups", "listeners"):
         entries = view.get(key)
         if isinstance(entries, list):
@@ -990,6 +992,10 @@ def materialize_subscription_config(raw_path: Path) -> Path:
     tmp = out.with_name(f"{out.name}.tmp")
     tmp.write_text(rendered, encoding="utf-8")
     tmp.replace(out)
+    from app.domains.proxies import node_secret_files
+
+    node_secret_files.tighten(out)
+    node_secret_files.tighten(source_path)
     return out
 
 
@@ -1338,6 +1344,8 @@ class ClashRuntime:
         stripped = strip_tun_section(config_text)
         config_text = stripped
         text = inject_probe_lanes(config_text) if inject_lanes else config_text
+        controller_url, controller_secret = resolve_controller(text)
+        text = _with_controller_secret(text, controller_secret)
         _validate_config_text(exe_path, text, Path(config_path).parent)
 
         try:
@@ -1365,12 +1373,15 @@ class ClashRuntime:
         tmp_path = Path(f"{config_path}.tmp")
         tmp_path.write_text(text, encoding="utf-8")
         tmp_path.replace(config_path)
+        from app.domains.proxies import node_secret_files
+
+        node_secret_files.tighten(Path(config_path))
         confirm_config_text(config_path, text)
 
         self.port = parse_mixed_port(text)
         # 控制器经命令行参数下发（-ext-ctl / -secret）：优先级高于配置文件，
-        # 配置里订阅自带的控制器行不再构成劫持面，文件本身保持订阅原样
-        self.controller_url, self.secret = resolve_controller(text)
+        # 文件与命令行使用同一次生成的控制密钥。
+        self.controller_url, self.secret = controller_url, controller_secret
         controller_addr = self.controller_url.split("://", 1)[-1]
         self.probe_lanes = parse_probe_lanes(text) if inject_lanes else []
         self.config_path = config_path
@@ -1452,8 +1463,7 @@ class ClashRuntime:
         返回 (注入 lane 后文本, 写盘前的文件原内容)：拒载回滚恢复的是**这个
         文件自己**被覆盖前的内容——每订阅各存一份缓存后，目标文件与运行中
         订阅经常不是同一条，用运行文本回滚会把别的订阅内容写进这份缓存。
-        控制器不需写入文本：端点由启动时的命令行参数固定，热重载不会把它
-        搬回配置文件里的值（PUT /configs 之后控制器仍保持在命令行端点）。
+        控制器端点由命令行固定；文件密钥同步当前进程的实际密钥。
         mixed_port 给了就一并钉死混合监听口（程序工作端口不随订阅走）。"""
         prev_file_text = ""
         if Path(config_path).is_file():
@@ -1469,6 +1479,8 @@ class ClashRuntime:
         if mixed_port:
             text = pin_mixed_port(text, mixed_port)
         text = strip_tun_section(text)
+        if self.secret:
+            text = _with_controller_secret(text, self.secret)
         try:
             if exe_path:
                 _validate_config_text(exe_path, text, Path(config_path).parent)
@@ -1479,6 +1491,9 @@ class ClashRuntime:
         tmp_path = Path(f"{config_path}.tmp")
         tmp_path.write_text(text, encoding="utf-8")
         tmp_path.replace(config_path)
+        from app.domains.proxies import node_secret_files
+
+        node_secret_files.tighten(Path(config_path))
         return text, prev_file_text
 
     async def _verify_reloaded(self, injected_text: str) -> None:

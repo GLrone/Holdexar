@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import socket
 import time
 from collections.abc import Mapping, Sequence
@@ -83,9 +84,10 @@ LANE_PLAN_FILENAME = "crawl-lanes.yaml"
 RUNTIME_MODE = "global"          # GLOBAL 是维护入口；生产流量走 lane，不经过它
 RUNTIME_BIND_ADDRESS = "127.0.0.1"  # 默认是 '*'：测出口 IP 不该把本机入口开给局域网
 RUNTIME_CONTROLLER_HOST = "127.0.0.1"
-# 池 Runtime 自己的 controller 凭据（本机回环专用）。刻意**不随每次重建轮换**：
-# 轮换只会制造"拿旧凭据访问新实例"的陷阱，而 controller 的隔离靠端口就够。
-RUNTIME_CONTROLLER_SECRET = "holdexar-proxypool"
+# 池 Runtime 的 controller 凭据：冷启动每次随机生成（见 prepare_runtime_config），
+# 热重载沿用现役值（换密钥会让已交接出去的控制器连接失效）。
+# 固定常量会让同机任意进程拿它 PUT /configs 灌配置进本内核；
+# 「只绑回环」降低的是网络可达性，挡不住本机进程。
 
 # ── lane：一个内核进程内互不干扰的固定出口工位 ──────────────────
 # 结构 = 一个 `select` 组（成员是池内全部节点）+ 一个 mixed listener，listener 的
@@ -414,7 +416,9 @@ def prepare_runtime_config(data_dir: Path, *, lanes: int | None = None,
                 pinned["controller"] if pinned
                 else f"{RUNTIME_CONTROLLER_HOST}:{_free_local_port()}"
             ),
-            "secret": pinned["secret"] if pinned else RUNTIME_CONTROLLER_SECRET,
+            # 热重载沿现役密钥（换密钥会让已交接出去的控制器连接失效）；
+            # 冷启动每次新生成——固定的可预测密钥等于把控制面对本机全开。
+            "secret": pinned["secret"] if pinned else secrets.token_urlsafe(32),
             "mixed-port": pinned["mixed_port"] if pinned else _free_local_port(),
             "proxies": list(doc["proxies"]),
             "proxy-groups": groups,
@@ -434,6 +438,13 @@ def prepare_runtime_config(data_dir: Path, *, lanes: int | None = None,
     tmp = out.with_suffix(".tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(out)
+    # 运行配置含节点认证明文（内核必须读）：落盘即收紧权限，
+    # 并同步收紧池文件（同样含 proxies 段）。
+    from app.domains.proxies import node_secret_files
+
+    node_secret_files.tighten(out)
+    node_secret_files.tighten(pool)
+    node_secret_files.tighten_dir(out.parent)
     return out
 
 

@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -21,6 +21,7 @@ from app.core import data_export, keyring, rekey, secretbox
 from app.core.keyring import KeyringError
 from app.core.secretbox import SecretBoxError
 from app.core.backup import (
+    RestoreFailure,
     create_backup as create_backup_impl,
     list_backups as list_backups_impl,
     restore_backup as restore_backup_impl,
@@ -38,7 +39,6 @@ from app.core.database import (
     write_scheduler_diagnostics,
     write_session,
 )
-from app.core.database import write_gate
 from app.core.logging import ring_log_handler
 from app.domains.games.models import Game, GameCurrentPrice, GamePriceHistory
 
@@ -48,7 +48,7 @@ _STARTED_AT = time.time()
 
 
 @router.get("/health")
-async def health() -> dict:
+async def health(request: Request) -> dict:
     settings = get_settings()
     data = {
         "status": "ok",
@@ -61,7 +61,22 @@ async def health() -> dict:
     attempt_id = os.environ.get(f"{ENV_PREFIX}UPDATE_ATTEMPT_ID")
     if attempt_id is not None:
         data["updateAttemptId"] = attempt_id
+        verification = getattr(request.app.state, "update_verification", {})
+        data["updateDataProtocol"] = 1
+        data["writeProtected"] = verification.get("protected", False)
+        data["pageReady"] = verification.get("pageReady", False)
     return data
+
+
+@router.post("/system/update-ready")
+async def update_page_ready(request: Request) -> dict:
+    verification = getattr(request.app.state, "update_verification", {})
+    body = await request.json()
+    attempt = os.environ.get(f"{ENV_PREFIX}UPDATE_ATTEMPT_ID")
+    if not attempt or not verification.get("protected") or body.get("attemptId") != attempt:
+        raise HTTPException(status_code=409, detail="当前不在更新验收期间")
+    verification["pageReady"] = True
+    return {"ready": True}
 
 
 @router.get("/info")
@@ -219,6 +234,10 @@ async def export_data(req: ExportRequest) -> dict:
 
     不含随包种子与公共目录/价格数据（由发布包与爬虫重建）。需当前主密钥可用
     （口令保护模式下先解锁），凭据类列解密后随正文重新加密封装。
+
+    安全边界：本接口产出的文件内含全部凭据明文的口令封装，等价于「导出即
+    交出凭据」。因此只接受本地会话（统一准入层已强制），且口令由调用方指定
+    ——不替用户生成，避免产出「没人知道口令、却已落盘」的副本。
     """
     try:
         return await data_export.create_export(req.password)
@@ -324,7 +343,7 @@ class BackupCreate(BaseModel):
 
 @router.post("/system/backup")
 async def backup_create(req: BackupCreate) -> dict:
-    """立即备份（手动档：在线快照不打断写入，独立轮转仅保留最新一份）。"""
+    """立即生成包含已提交数据的手动备份，独立轮转仅保留最新一份。"""
     try:
         return await create_backup_impl(req.label, manual=True)
     except ValueError as e:
@@ -375,12 +394,18 @@ async def backup_verify(name: str, req: BackupVerify | None = None) -> dict:
 async def backup_restore(name: str) -> dict:
     """从备份恢复（三段式：校验 → 停写入面 → 轮换替换，失败自动回滚）。
 
-    恢复期间调度器与爬取暂停，完成后自动重启调度器。
+    恢复失败返回原始原因和原库是否可用。
     """
     try:
         return await restore_backup_impl(name)
     except (ValueError, FileNotFoundError) as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except RestoreFailure as e:
+        return JSONResponse(status_code=500, content={
+            "detail": str(e), "restored": False, "name": e.name,
+            "rolledBack": e.rolled_back, "databaseAvailable": e.database_available,
+            "recoveryBackup": e.recovery_backup,
+        })
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
 

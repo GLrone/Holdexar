@@ -22,6 +22,8 @@ from app.core.layout import (
     is_version_valid,
     list_installed_versions,
     read_current_state,
+    read_data_compatibility,
+    read_transaction,
     write_current_state,
 )
 from app.core.migration import (
@@ -35,6 +37,12 @@ from app.core.update_host import cleanup_old_executables
 logger = logging.getLogger(__name__)
 
 
+def _active_data_dir(root: Path) -> Path:
+    compatibility = read_data_compatibility(root)
+    transaction = read_transaction(root) or {}
+    return Path(compatibility["dataDir"] if compatibility else transaction.get("dataDir") or root / "data").resolve()
+
+
 def find_target_version(root: Path) -> str | None:
     """定位当前应启动的目标版本，必要时自动执行自愈回滚。
 
@@ -43,14 +51,26 @@ def find_target_version(root: Path) -> str | None:
     「看起来新」去拉起一个从未通过验收的版本。
     """
     curr = read_current_state(root)
+    compatibility = read_data_compatibility(root)
+    allowed = None
+    if compatibility is not None:
+        from app.core.update_data import read_schema_version
+
+        if read_schema_version(Path(compatibility["dataDir"])) != compatibility["schemaVersion"]:
+            raise RuntimeError("数据结构已变化，拒绝选择未经相容验收的程序")
+        allowed = set(compatibility["versions"])
+
+    def usable(version):
+        return version and is_version_valid(root, version) and (allowed is None or version in allowed)
+
     if curr:
         active = curr.get("version")
-        if active and is_version_valid(root, active):
+        if usable(active):
             return active
 
         # 目标版本损坏或丢失，尝试上一有效版本
         last_good = curr.get("lastKnownGood")
-        if last_good and is_version_valid(root, last_good):
+        if usable(last_good):
             logger.warning(
                 "当前版本 %s 损坏，自动回退到上一有效版本 %s", active, last_good
             )
@@ -58,13 +78,13 @@ def find_target_version(root: Path) -> str | None:
             return last_good
 
         previous = curr.get("previousVersion")
-        if previous and is_version_valid(root, previous):
+        if usable(previous):
             logger.warning("当前版本 %s 损坏，恢复旧版入口 %s", active, previous)
             write_current_state(root, previous, last_known_good=None)
             return previous
 
     # 状态丢失或指定版本均不可用：扫描 versions/ 中最新有效版本
-    installed = list_installed_versions(root)
+    installed = [version for version in list_installed_versions(root) if usable(version)]
     if not installed:
         return None
 
@@ -89,9 +109,12 @@ def launch_version(
         raise FileNotFoundError(f"版本主程序不存在：{exe}")
 
     child_env = dict(os.environ)
+    data_dir = _active_data_dir(root)
+    for key in ("UPDATE_ATTEMPT_ID", "UPDATE_DATA_TOKEN", "LAUNCHER_PID", "DEV_URL", "UPDATE_RESTART", "PREV_PID"):
+        child_env.pop(f"{ENV_PREFIX}{key}", None)
     child_env[f"{ENV_PREFIX}INSTALL_ROOT"] = str(root)
-    child_env[f"{ENV_PREFIX}DATA_DIR"] = str(root / "data")
-    child_env["WEBVIEW2_USER_DATA_FOLDER"] = str(root / "data" / "cache" / "webview")
+    child_env[f"{ENV_PREFIX}DATA_DIR"] = str(data_dir)
+    child_env["WEBVIEW2_USER_DATA_FOLDER"] = str(data_dir / "cache" / "webview")
 
     flags = 0
     if detached and os.name == "nt":
@@ -122,6 +145,14 @@ def run_launcher(
     """启动器主流程。"""
     root = install_root_override or install_root()
 
+    try:
+        from app.core.update_host import recover_interrupted_update
+
+        recover_interrupted_update(root)
+    except Exception as exc:
+        _show_fatal(f"上次更新需要恢复，已停止启动以保护数据。\n{exc}\n详情见 {root / 'logs' / 'update-diagnosis.json'}")
+        return 1
+
     # 1. 确保基础目录结构齐全，清理历史更新遗留文件
     get_state_dir(root)
     (root / "data").mkdir(parents=True, exist_ok=True)
@@ -136,7 +167,8 @@ def run_launcher(
     #    迁移没完成就不启动：两处都有库（冲突）或快照失败时，起服务等于在一个
     #    可能被建成空库的目录上操作——用户看不到自己的历史数据还以为丢了。
     try:
-        locs = detect_legacy_data_locations(root)
+        known_data = read_data_compatibility(root) is not None or (read_transaction(root) or {}).get("dataDir")
+        locs = {} if known_data else detect_legacy_data_locations(root)
         if locs.get("hasConflict"):
             appdata_dir = locs.get("appdataDataDir")
             res = resolve_data_dir_conflict(root / "data", appdata_dir)
@@ -163,7 +195,11 @@ def run_launcher(
         return 1
 
     # 3. 定位有效版本
-    target_ver = find_target_version(root)
+    try:
+        target_ver = find_target_version(root)
+    except Exception as exc:
+        _show_fatal(f"当前程序与数据不相容，数据已保留，请重新解压已验收版本。\n{exc}")
+        return 1
     if not target_ver:
         _show_fatal(
             f"未能在 {root / 'versions'} 找到任何可运行的有效版本。\n"

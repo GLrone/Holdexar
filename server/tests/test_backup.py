@@ -10,6 +10,7 @@
 import asyncio
 import os
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
@@ -20,6 +21,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core import backup as core_backup
 from app.core.config import get_settings
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows process lifetime")
+def test_exited_process_with_open_handle_is_not_a_live_lock_owner():
+    process = subprocess.Popen([sys.executable, "-c", "pass"],
+                               creationflags=subprocess.CREATE_NO_WINDOW)
+    process.wait(timeout=5)
+    assert process._handle is not None
+    assert core_backup._pid_is_running(process.pid) is False
 
 
 @pytest.fixture
@@ -241,7 +251,9 @@ def maintenance_mock(monkeypatch):
     monkeypatch.setattr(core_backup, "_dispose_engine", _noop_dispose)
     monkeypatch.setattr(core_backup, "_rebuild_engine", _noop_rebuild)
     import app.core.scheduler as sched_mod
+    from types import SimpleNamespace
 
+    monkeypatch.setattr(sched_mod, "scheduler", SimpleNamespace(running=True))
     monkeypatch.setattr(sched_mod, "stop_scheduler", _Sched())
     monkeypatch.setattr(sched_mod, "start_scheduler", _Sched())
     import app.domains.crawl.service as crawl_service
@@ -291,16 +303,90 @@ async def test_restore_replaces_production_db(data_env, maintenance_mock):
         assert rows == [(620,)]
     finally:
         conn.close()
-
-    # 陈旧 WAL 已清理（新库打开不会重放旧帧）
     assert not db.with_name(db.name + "-wal").exists()
-    # 成功后回滚档与就位档清理
     assert not db.with_suffix(".rollback.db").exists()
     assert not db.with_suffix(".restoring.db").exists()
-    assert len(maintenance_mock) == 2  # stop + start
-    # 解档探针不留备份目录
+    assert len(maintenance_mock) == 2
     assert not list(core_backup.backup_dir().glob("*.verify.tmp"))
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["compact", "restore"])
+async def test_cancelled_maintenance_waits_for_open_sqlite_thread(
+    data_env, maintenance_mock, monkeypatch, operation
+):
+    import threading
+    from app.core import database
+
+    tmp, holder = data_env
+    db = tmp / "holdexar.db"
+    result = await core_backup.create_backup(label="cancel")
+    holder["conn"].close()
+    monkeypatch.setattr(database, "sqlite_file_path", lambda: db)
+    entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+    acquired = asyncio.Event()
+    real_snapshot = core_backup.snapshot_to
+
+    def block_thread(src, dest=None):
+        if dest is not None:
+            real_snapshot(src, dest)
+        conn = sqlite3.connect(dest or src)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            entered.set()
+            assert release.wait(4)
+            conn.rollback()
+        finally:
+            conn.close()
+            closed.set()
+
+    monkeypatch.setattr(core_backup, "_vacuum_file", block_thread)
+    monkeypatch.setattr(core_backup, "snapshot_to", block_thread)
+    action = core_backup.compact_main_db() if operation == "compact" else core_backup.restore_backup(result["name"])
+    task = asyncio.create_task(action)
+    waiter = None
+
+    async def maintenance():
+        with pytest.raises(RuntimeError, match="维护正在进行"):
+            async with database.write_maintenance_barrier():
+                acquired.set()
+
+    try:
+        async with asyncio.timeout(3):
+            while not entered.is_set():
+                await asyncio.sleep(0.005)
+        task.cancel()
+        await asyncio.sleep(0.02)
+        task.cancel()
+        waiter = asyncio.create_task(maintenance())
+        await asyncio.sleep(0.02)
+        assert not task.done()
+        assert (core_backup.backup_dir() / core_backup._LOCK_FILE).exists()
+        assert not acquired.is_set()
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        if waiter is not None:
+            await waiter
+    assert task.cancelled()
+    assert closed.is_set()
+    assert not (core_backup.backup_dir() / core_backup._LOCK_FILE).exists()
+    assert not db.with_suffix(".rollback.db").exists()
+    async with database.write_maintenance_barrier():
+        assert closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_maintenance_does_not_start_a_previously_stopped_scheduler(
+    data_env, maintenance_mock, monkeypatch
+):
+    import app.core.scheduler as sched_mod
+
+    sched_mod.scheduler.running = False
+    data_env[1]["conn"].close()
+    monkeypatch.setattr(core_backup, "_vacuum_file", lambda _: None)
+    await core_backup.compact_main_db()
+    assert maintenance_mock == []
 
 @pytest.mark.asyncio
 async def test_restore_from_legacy_plain_db_still_works(data_env, maintenance_mock):
@@ -374,6 +460,112 @@ async def test_restore_failure_leaves_no_leftovers(data_env, maintenance_mock, m
     assert not db.with_suffix(".restoring.db").exists()
     assert not list(core_backup.backup_dir().glob("*.verify.tmp"))
     assert not (core_backup.backup_dir() / core_backup._LOCK_FILE).exists()
+
+
+@pytest.mark.asyncio
+async def test_restore_initialization_failure_is_not_reported_as_success(
+    data_env, maintenance_mock, monkeypatch
+):
+    tmp, holder = data_env
+    result = await core_backup.create_backup(label="rollback")
+    holder["conn"].execute("INSERT INTO games VALUES (440, 'TF2')")
+    holder["conn"].close()
+    calls = []
+
+    async def fail_then_recover(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise RuntimeError("injected initialization failure")
+        return True
+
+    monkeypatch.setattr(core_backup, "_rebuild_engine", fail_then_recover)
+    with pytest.raises(RuntimeError, match="恢复失败") as caught:
+        await core_backup.restore_backup(result["name"])
+    assert caught.value.rolled_back is True
+    assert caught.value.database_available is True
+    assert "injected initialization failure" in str(caught.value)
+    conn = sqlite3.connect(tmp / "holdexar.db")
+    try:
+        assert conn.execute("SELECT appid FROM games ORDER BY appid").fetchall() == [(440,), (620,)]
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_restore_and_failed_recovery_preserve_snapshot_and_block_writes(
+    data_env, maintenance_mock, monkeypatch
+):
+    from app.core import database
+
+    tmp, holder = data_env
+    result = await core_backup.create_backup(label="fail-all")
+    holder["conn"].execute("INSERT INTO games VALUES (440, 'TF2')")
+    holder["conn"].close()
+    monkeypatch.setattr(database, "sqlite_file_path", lambda: tmp / "holdexar.db")
+
+    async def failed(**kwargs):
+        raise RuntimeError("injected unavailable engine")
+
+    monkeypatch.setattr(core_backup, "_rebuild_engine", failed)
+    with pytest.raises(core_backup.RestoreFailure) as caught:
+        await core_backup.restore_backup(result["name"])
+    assert caught.value.database_available is False
+    assert caught.value.rolled_back is False
+    assert maintenance_mock == [1]
+    rollback = tmp / "holdexar.rollback.db"
+    assert rollback.exists()
+    conn = sqlite3.connect(rollback)
+    try:
+        assert conn.execute("SELECT appid FROM games ORDER BY appid").fetchall() == [(440,), (620,)]
+    finally:
+        conn.close()
+    with pytest.raises(RuntimeError, match="恢复未完成"):
+        async with database.write_gate():
+            pytest.fail("unavailable engine must not reopen for ordinary writes")
+    assert not database.write_scheduler_diagnostics()["busy"]
+
+
+@pytest.mark.asyncio
+async def test_failed_original_database_replacement_cannot_be_unlocked_by_owner_exit(
+    data_env, maintenance_mock, monkeypatch
+):
+    import json
+
+    tmp, holder = data_env
+    result = await core_backup.create_backup(label="unrecovered")
+    holder["conn"].execute("INSERT INTO games VALUES (440, 'original-user-data')")
+    holder["conn"].close()
+    replace = core_backup._replace_main_db
+    replacements = []
+
+    async def failed_init(**kwargs):
+        raise RuntimeError("target initialization failed")
+
+    async def replace_once(staging, src):
+        replacements.append(1)
+        if len(replacements) > 1:
+            raise RuntimeError("original file replacement failed")
+        await replace(staging, src)
+
+    monkeypatch.setattr(core_backup, "_rebuild_engine", failed_init)
+    monkeypatch.setattr(core_backup, "_replace_main_db", replace_once)
+    with pytest.raises(core_backup.RestoreFailure) as caught:
+        await core_backup.restore_backup(result["name"])
+    assert caught.value.database_available is False
+    lock = core_backup.backup_dir() / core_backup._LOCK_FILE
+    metadata = json.loads(lock.read_text(encoding="utf-8"))
+    monkeypatch.setattr(core_backup, "_pid_is_running", lambda _: False)
+    with pytest.raises(RuntimeError, match="原库恢复未完成"):
+        core_backup.ensure_restore_lock_available(tmp / "holdexar.db")
+    assert lock.exists()
+    assert metadata["rollbackPath"] == str(tmp / "holdexar.rollback.db")
+    for path, expected in [(tmp / "holdexar.db", [(620,)]),
+                           (tmp / "holdexar.rollback.db", [(440,), (620,)])]:
+        conn = sqlite3.connect(path)
+        try:
+            assert conn.execute("SELECT appid FROM games ORDER BY appid").fetchall() == expected
+        finally:
+            conn.close()
 
 
 @pytest.mark.asyncio
@@ -474,7 +666,7 @@ async def test_create_backup_refuses_while_maintenance_lock_held(data_env):
     """维护锁在位（恢复/收缩进行中）时拒绝再开一份快照。"""
     core_backup.backup_dir().joinpath(core_backup._LOCK_FILE).write_text("x", encoding="utf-8")
     try:
-        with pytest.raises(RuntimeError, match="在进行中"):
+        with pytest.raises(RuntimeError, match="身份无法确认"):
             await core_backup.create_backup(label="lk")
     finally:
         core_backup.backup_dir().joinpath(core_backup._LOCK_FILE).unlink(missing_ok=True)
@@ -549,15 +741,59 @@ def test_vacuum_translates_disk_full(tmp_path: Path, monkeypatch) -> None:
         core_backup._vacuum_file(tmp_path / "x.db")
 
 
-def test_startup_removes_only_proven_stale_legacy_restore_lock(data_env):
+def test_startup_keeps_old_restore_lock_without_proven_owner(data_env):
     tmp, _ = data_env
     lock = core_backup.backup_dir() / ".restore.lock"
     lock.write_text("2020-01-01T00:00:00", encoding="utf-8")
     os.utime(lock, (1, 1))
 
-    core_backup.ensure_restore_lock_available(tmp / "holdexar.db")
+    with pytest.raises(RuntimeError, match="身份无法确认"):
+        core_backup.ensure_restore_lock_available(tmp / "holdexar.db")
+    assert lock.exists()
 
+
+@pytest.mark.parametrize("payload", ["{broken", "{}", '{"pid":0}', '{"pid":-1}', '{"pid":true}',
+                                     '{"pid":123,"purpose":"unknown"}',
+                                     '{"pid":123,"purpose":null}', '{"pid":123,"purpose":[]}',
+                                     '{"pid":123,"purpose":{}}'])
+def test_invalid_restore_owner_never_expires_by_age(data_env, monkeypatch, payload):
+    tmp, _ = data_env
+    lock = core_backup.backup_dir() / core_backup._LOCK_FILE
+    lock.write_text(payload, encoding="utf-8")
+    os.utime(lock, (1, 1))
+    monkeypatch.setattr(core_backup, "_pid_is_running", lambda _: False)
+    with pytest.raises(RuntimeError, match="身份无法确认"):
+        core_backup.ensure_restore_lock_available(tmp / "holdexar.db")
+    assert lock.exists()
+
+
+def test_positive_dead_legacy_owner_can_be_cleared_but_live_owner_never_expires(data_env, monkeypatch):
+    import json
+
+    tmp, _ = data_env
+    lock = core_backup.backup_dir() / core_backup._LOCK_FILE
+    lock.write_text(json.dumps({"pid": 123, "token": "legacy"}), encoding="utf-8")
+    os.utime(lock, (1, 1))
+    monkeypatch.setattr(core_backup, "_pid_is_running", lambda _: True)
+    with pytest.raises(RuntimeError, match="维护正在进行"):
+        core_backup.ensure_restore_lock_available(tmp / "holdexar.db")
+    assert lock.exists()
+    monkeypatch.setattr(core_backup, "_pid_is_running", lambda _: False)
+    core_backup.ensure_restore_lock_available(tmp / "holdexar.db")
     assert not lock.exists()
+
+
+def test_restore_recovery_message_does_not_claim_missing_original_snapshot(data_env):
+    import json
+
+    tmp, _ = data_env
+    lock = core_backup.backup_dir() / core_backup._LOCK_FILE
+    missing = tmp / "missing.rollback.db"
+    lock.write_text(json.dumps({"pid": 123, "purpose": "restore", "rollbackPath": str(missing)}), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="未找到原库副本") as caught:
+        core_backup.ensure_restore_lock_available(tmp / "holdexar.db")
+    assert "副本保留在" not in str(caught.value)
+    assert lock.exists()
 
 
 def test_live_restore_lock_blocks_startup_and_is_not_removed(data_env):
@@ -583,3 +819,188 @@ def test_restore_lock_is_exclusive_and_release_is_token_owned(data_env):
     finally:
         core_backup._release_restore_lock(lock, token)
     assert not lock.exists()
+
+
+@pytest.mark.asyncio
+async def test_compaction_recovers_engine_after_one_rebuild_failure(
+    data_env, maintenance_mock, monkeypatch
+):
+    data_env[1]["conn"].close()
+    monkeypatch.setattr(core_backup, "_vacuum_file", lambda _: None)
+    calls = []
+
+    async def rebuild(**kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("injected rebuild failure")
+        return True
+
+    monkeypatch.setattr(core_backup, "_rebuild_engine", rebuild)
+    with pytest.raises(RuntimeError, match="injected rebuild failure"):
+        await core_backup.compact_main_db()
+    assert calls == [1, 1]
+    assert maintenance_mock == [1, 1]
+    assert not (core_backup.backup_dir() / core_backup._LOCK_FILE).exists()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_restored_database_initialization_rolls_back(
+    data_env, maintenance_mock, monkeypatch
+):
+    tmp, holder = data_env
+    result = await core_backup.create_backup(label="cancel-init")
+    holder["conn"].execute("INSERT INTO games VALUES (440, 'TF2')")
+    holder["conn"].close()
+    entered = asyncio.Event()
+    cleanup_entered, cleanup_release = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def rebuild(**kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            entered.set()
+            await asyncio.Event().wait()
+        cleanup_entered.set()
+        await cleanup_release.wait()
+        return True
+
+    monkeypatch.setattr(core_backup, "_rebuild_engine", rebuild)
+    task = asyncio.create_task(core_backup.restore_backup(result["name"]))
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        task.cancel()
+        await asyncio.wait_for(cleanup_entered.wait(), 3)
+        task.cancel()
+        await asyncio.sleep(0.02)
+        assert not task.done()
+        assert (core_backup.backup_dir() / core_backup._LOCK_FILE).exists()
+    finally:
+        cleanup_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+    assert task.cancelled()
+    conn = sqlite3.connect(tmp / "holdexar.db")
+    try:
+        assert conn.execute("SELECT appid FROM games ORDER BY appid").fetchall() == [(440,), (620,)]
+    finally:
+        conn.close()
+    assert not (core_backup.backup_dir() / core_backup._LOCK_FILE).exists()
+    assert maintenance_mock == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_restore_http_failure_exposes_original_reason_and_preserved_database(monkeypatch):
+    import json
+    from app.domains.system import router as system_router
+
+    async def failed(name):
+        raise core_backup.RestoreFailure(name, RuntimeError("original failure"),
+                                         rolled_back=True, database_available=True)
+
+    monkeypatch.setattr(system_router, "restore_backup_impl", failed)
+    response = await system_router.backup_restore("backup.db")
+    assert response.status_code == 500
+    body = json.loads(response.body)
+    assert body["restored"] is False
+    assert body["rolledBack"] is True
+    assert body["databaseAvailable"] is True
+    assert "original failure" in body["detail"]
+
+
+@pytest.mark.asyncio
+async def test_restore_cleanup_file_occupancy_does_not_hide_initial_failure(
+    data_env, maintenance_mock, monkeypatch
+):
+    _, holder = data_env
+    result = await core_backup.create_backup(label="held-cleanup")
+    holder["conn"].close()
+    calls = []
+    unlink = Path.unlink
+
+    async def rebuild(**kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("original failure before cleanup")
+        return True
+
+    def held_probe(path, **kwargs):
+        if path.name.endswith(".verify.tmp"):
+            raise PermissionError("held cleanup probe")
+        return unlink(path, **kwargs)
+
+    monkeypatch.setattr(core_backup, "_rebuild_engine", rebuild)
+    monkeypatch.setattr(Path, "unlink", held_probe)
+    with pytest.raises(core_backup.RestoreFailure, match="original failure before cleanup"):
+        await core_backup.restore_backup(result["name"])
+    assert not (core_backup.backup_dir() / core_backup._LOCK_FILE).exists()
+
+
+@pytest.mark.asyncio
+async def test_restored_database_remains_success_when_old_snapshot_cleanup_is_held(
+    data_env, maintenance_mock, monkeypatch, caplog
+):
+    tmp, holder = data_env
+    result = await core_backup.create_backup(label="chosen")
+    holder["conn"].execute("INSERT INTO games VALUES (440, 'original-user-data')")
+    holder["conn"].close()
+    unlink = Path.unlink
+
+    def held_rollback(path, **kwargs):
+        if path.name.endswith(".rollback.db") and path.exists():
+            raise PermissionError("held old snapshot")
+        return unlink(path, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", held_rollback)
+    restored = await core_backup.restore_backup(result["name"])
+    assert restored["restored"] is True
+    assert restored["rolledBack"] is False
+    assert restored["cleanupPending"] is True
+    for path, expected in [(tmp / "holdexar.db", [(620,)]),
+                           (tmp / "holdexar.rollback.db", [(440,), (620,)])]:
+        conn = sqlite3.connect(path)
+        try:
+            assert conn.execute("SELECT appid FROM games ORDER BY appid").fetchall() == expected
+        finally:
+            conn.close()
+    assert "临时备份文件暂未清理" in caplog.text
+    assert not (core_backup.backup_dir() / core_backup._LOCK_FILE).exists()
+    assert maintenance_mock == [1, 1]
+
+
+def test_process_exit_after_database_replacement_keeps_recovery_protection(tmp_path):
+    src = tmp_path / "holdexar.db"
+    chosen = tmp_path / "chosen.db"
+    for path, value in [(src, "original-user-data"), (chosen, "chosen-backup-data")]:
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE result (value TEXT)")
+        conn.execute("INSERT INTO result VALUES (?)", (value,))
+        conn.commit()
+        conn.close()
+    code = """
+import os, sys
+from pathlib import Path
+from app.core import backup
+from app.core.database import sync_write_gate
+src, chosen = map(Path, sys.argv[1:])
+with sync_write_gate(src):
+    lock, token = backup._acquire_restore_lock(db_path=src)
+    rollback = src.with_suffix('.rollback.db')
+    backup.snapshot_to(src, rollback)
+    backup._protect_restore_recovery(lock, token, src, rollback, backup.sha256_of(rollback))
+    os.replace(chosen, src)
+    os._exit(0)
+"""
+    kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+    child = subprocess.run([sys.executable, "-c", code, str(src), str(chosen)],
+                           cwd=Path(__file__).resolve().parents[1], capture_output=True,
+                           timeout=10, **kwargs)
+    assert child.returncode == 0, child.stderr.decode(errors="replace")
+    with pytest.raises(RuntimeError, match="原库恢复未完成"):
+        core_backup.ensure_restore_lock_available(src)
+    assert (tmp_path / "backups" / core_backup._LOCK_FILE).exists()
+    for path, expected in [(src, "chosen-backup-data"),
+                           (src.with_suffix(".rollback.db"), "original-user-data")]:
+        conn = sqlite3.connect(path)
+        try:
+            assert conn.execute("SELECT value FROM result").fetchone() == (expected,)
+        finally:
+            conn.close()

@@ -12,7 +12,6 @@ apply_curated() 补挂人工列。
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import sqlite3
@@ -23,7 +22,7 @@ from sqlalchemy import select, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.config import get_settings
-from app.core.database import WritePriority, write_gate, write_session
+from app.core.database import WritePriority, complete_db_thread, write_gate, write_session
 from app.core.logging import log_event
 from app.domains.games.models import Game
 
@@ -185,7 +184,7 @@ async def apply_curated(appid: int, seed_path: Path | None = None) -> None:
         if not row:
             return
         sets = _curated_sets()
-        from app.core.database import WritePriority, write_gate
+        from app.core.database import WritePriority
 
         async with write_session(WritePriority.BACKGROUND, label="seed_curated_apply") as session:
             await session.execute(
@@ -435,7 +434,7 @@ async def merge_current_seed(seed_path: Path | None = None) -> dict | None:
     # 线程池内的原生 sqlite 写事务也在写调度器管辖内：闸在事件循环侧持住
     # （与价格历史合并同理由），跑在线程池里的原生连接不再是无主写者。
     async with write_gate(WritePriority.BACKGROUND, label="seed_current_merge"):
-        prices_inserted = await asyncio.to_thread(
+        prices_inserted = await complete_db_thread(
             _merge_current_prices_sync, db_file, path, version
         )
     if prices_inserted < 0:
@@ -520,7 +519,7 @@ async def merge_game_tags_seed(seed_path: Path | None = None) -> dict | None:
         return None
 
     async with write_gate(WritePriority.BACKGROUND, label="seed_game_tags_merge"):
-        inserted = await asyncio.to_thread(_merge_game_tags_sync, db_file, path)
+        inserted = await complete_db_thread(_merge_game_tags_sync, db_file, path)
     if inserted < 0:
         # 种子不含标签表（schema 6 及以前）：静默，待下个 schema 7+ 种子再并
         return None
@@ -688,7 +687,7 @@ async def merge_history_seed(seed_path: Path | None = None) -> dict | None:
     total = {"overwritten": 0, "inserted": 0}
     while True:
         async with write_gate(WritePriority.BACKGROUND, label="seed_history_merge"):
-            stats = await asyncio.to_thread(_merge_history_chunk, db_file, path, version)
+            stats = await complete_db_thread(_merge_history_chunk, db_file, path, version)
         if stats is None:
             # 种子不含历史表（旧格式种子）：静默，待下个新格式种子再并
             return None
@@ -790,7 +789,7 @@ async def merge_bundles_seed(seed_path: Path | None = None) -> dict | None:
         return None
 
     async with write_gate(WritePriority.BACKGROUND, label="seed_bundles_merge"):
-        stats = await asyncio.to_thread(_merge_bundles_sync, db_file, path, version)
+        stats = await complete_db_thread(_merge_bundles_sync, db_file, path, version)
     if not stats:
         return None
     log_event(
@@ -880,7 +879,7 @@ async def merge_curated_seed(seed_path: Path | None = None) -> dict | None:
     except ValueError:
         stamped = datetime.now()
 
-    from app.core.database import WritePriority, write_gate
+    from app.core.database import WritePriority
 
     async with write_session(WritePriority.BACKGROUND, label="seed_curated_merge") as session:
         present = {
@@ -993,7 +992,7 @@ async def merge_preset_seed(seed_path: Path | None = None) -> dict | None:
     except ValueError:
         stamped = datetime.now()
 
-    from app.core.database import WritePriority, write_gate
+    from app.core.database import WritePriority
 
     async with write_session(WritePriority.BACKGROUND, label="seed_preset_merge") as session:
         present = {

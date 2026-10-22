@@ -331,7 +331,12 @@ async def test_cold_rebuild_replaces_endpoints(
         fresh = await _get_through(result.mixed_port, "http://probe.invalid/x",
                                    timeout=20)
         assert fresh.status_code == 204, "重建后新端口必须立即可用"
-        assert await _global_now(result.controller_url, secret) == "1|A"
+        assert clash_runtime.secret != secret
+        assert await _global_now(result.controller_url, clash_runtime.secret) == "1|A"
+        async with httpx.AsyncClient(
+            trust_env=False, headers={"Authorization": f"Bearer {secret}"},
+        ) as client:
+            assert (await client.get(f"{result.controller_url}/version")).status_code == 401
     finally:
         server.shutdown()
 

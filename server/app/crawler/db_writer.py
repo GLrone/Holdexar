@@ -41,6 +41,12 @@ logger = logging.getLogger(__name__)
 _BATCH_WRITE_CHUNK = 100
 
 
+class RegionStatusWriteError(RuntimeError):
+    def __init__(self, pairs: list[tuple[int, str]]):
+        self.pairs = sorted({(int(aid), str(cc).upper()) for aid, cc in pairs})
+        super().__init__(f"地区数据未能保存：{len(self.pairs)} 项")
+
+
 @asynccontextmanager
 async def _session_scope(session):
     """复用调用方会话；自有事务统一由 write_session 管理。"""
@@ -1025,6 +1031,7 @@ class DbWriter:
                     commit_ms += _ms_since(_tm)
                 except Exception as e:
                     # 段级失败只作废本段（其余段照常），与主路径段语义对齐
+                    results[start : start + len(chunk)] = [False] * len(chunk)
                     log_event(
                         logger,
                         "逐款隔离写段失败",
@@ -1279,6 +1286,7 @@ class DbWriter:
                 await session.commit()
         except Exception as e:
             log_event(logger, "记录区域异常状态失败", level=logging.ERROR, detail={"原因": e})
+            raise RegionStatusWriteError([(appid, region_code)]) from e
 
     async def mark_region_status_missing_batch(self, pairs: list[tuple[int, str]]) -> int:
         """批量记 missing 欠账（一次闸一事务）：行形状与 mark_region_status
@@ -1337,7 +1345,7 @@ class DbWriter:
                 level=logging.ERROR,
                 detail={"行数": len(rows), "原因": e},
             )
-            return 0
+            raise RegionStatusWriteError(list(seen)) from e
 
     async def clear_missing_regions(self, pairs: list[tuple[int, str]]) -> int:
         """批量清除误标的 missing 现价行（只删 missing 状态行，历史不动）。
@@ -1373,7 +1381,7 @@ class DbWriter:
                 level=logging.ERROR,
                 detail={"原因": e},
             )
-            return 0
+            raise RegionStatusWriteError(pairs) from e
 
     async def mark_coming_soon(self, appid: int) -> None:
         """coming_soon 无包（未开放预购/未上线）暂缓语义：type=COMING_SOON 挂名行。

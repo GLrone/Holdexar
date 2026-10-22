@@ -151,6 +151,7 @@ async def list_candidates(limit: int = Query(50, ge=1, le=500)):
                 "reason": c.reason,
                 "attempts": c.attempts,
                 "deliveredAt": c.delivered_at.isoformat() if c.delivered_at else None,
+                "deliveryHistory": c.delivery_history_json or [],
             }
             for c in rows
         ]

@@ -1,25 +1,20 @@
-"""通知投递：价格事件 → 策略 → 候选 → 聚合摘要 → 邮件。
-
-触发点只有一个：Price Refresh Cycle 的 finalizing（`core/scheduler` 在事件检测
-之后调用 `dispatch`）。**没有也不允许有通知 scheduler**——通知是 Cycle 的下游
-副作用，不是第二套调度系统。
-
-投递失败只影响候选状态：`send_mail` 返回 False 时候选落 `failed`，事件 / Cycle /
-抓取结果一律不回滚；候选也绝不回写 `price_events`。
-"""
+"""周期下游消费价格事实并投递摘要，投递结果只更新通知候选。"""
 from __future__ import annotations
 
+import asyncio
+from copy import deepcopy
 import logging
 from datetime import datetime, timedelta
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, bindparam, delete, func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.logging import log_event
-from app.domains.alerts.notify import send_mail_ex, smtp_config
+from app.domains.alerts.notify import delivery_rejection_code, is_delivery_unknown, send_mail_ex, smtp_config
 from app.domains.crawl import events as events_service
 from app.domains.crawl import service as crawl_service
+from app.domains.crawl.cycle import PriceCycle
 from app.domains.games.models import Game
 from app.domains.notifications import policy as policy_mod
 from app.domains.notifications.mail import (
@@ -69,15 +64,17 @@ def retryable(error: str | None) -> bool:
     只认明确的临时故障；未知错误按不可重试处理——宁可丢一封，也不要在诊断
     不清的情况下循环发送。
     """
-    if not error:
+    if not error or is_delivery_unknown(error):
         return False
+    code = delivery_rejection_code(error)
+    if code is not None:
+        return code < 500
     text = error.lower()
     if any(hint in text for hint in _PERMANENT_HINTS):
         return False
     return any(hint in text for hint in _RETRYABLE_HINTS)
 
-# 单轮事件读取上限：一轮候选数量级是对象 × 地区，足够且不炸内存
-EVENT_LIMIT = 1000
+EVENT_BATCH = 1000
 SENDING_TIMEOUT = timedelta(minutes=30)
 
 _TYPE_TO_CATEGORY = {
@@ -95,55 +92,264 @@ async def _watched_appids() -> set[int]:
     """关注范围 = 监控池（与爬取同一口径）。目录层只是价格库维护，不通知。"""
     try:
         return set(await crawl_service.plan_scope_appids("pool"))
-    except Exception:  # noqa: BLE001 —— 范围解析失败按「无关注」处理，不产生候选
+    except Exception:  # noqa: BLE001
         log_event(
             logger,
             "监控池范围解析失败，本轮不产生通知候选",
             level=logging.ERROR,
             exc_info=True,
         )
-        return set()
+        raise
 
 
 async def _create_candidates(
-    cycle_id: int, events: list[dict], prefs: dict, watched: set[int], recipient: str
+    cycle_id: int, events: list[dict], prefs: dict, watched: set[int], recipient: str,
+    *, scan: dict | None = None,
 ) -> int:
     """事件 → 候选（幂等：同一事实对同一收件人只有一条，重复处理不新增）。"""
     now = datetime.now()
+    payloads = []
+    for event in events:
+        decision = decide(event_type=event["eventType"], appid=int(event["appid"]),
+                          prefs=prefs, watched=watched,
+                          recipient=recipient or ("pending" if scan else ""), now=now)
+        if decision.notify:
+            payloads.append(dict(event_id=int(event["id"]), cycle_id=cycle_id,
+                                 appid=int(event["appid"]), region_code=event.get("region"),
+                                 event_type=event["eventType"], category=decision.category or "price",
+                                 recipient=recipient, status=decision.status, reason=decision.reason,
+                                 attempts=0, created_at=now, updated_at=now))
+    if not payloads and scan is None:
+        return 0
     created = 0
     async with write_session(WritePriority.BACKGROUND) as session:
-        for event in events:
-            decision = decide(
-                event_type=event["eventType"],
-                appid=int(event["appid"]),
-                prefs=prefs,
-                watched=watched,
-                recipient=recipient,
-                now=now,
-            )
-            if not decision.notify:
-                continue
-            stmt = (
-                sqlite_insert(NotificationCandidate)
-                .values(
-                    event_id=int(event["id"]),
-                    cycle_id=cycle_id,
-                    appid=int(event["appid"]),
-                    region_code=event.get("region"),
-                    event_type=event["eventType"],
-                    category=decision.category or "price",
-                    recipient=recipient,
-                    status=decision.status,
-                    reason=decision.reason,
-                    created_at=now,
-                    updated_at=now,
-                )
-                .on_conflict_do_nothing(index_elements=["event_id", "recipient"])
-            )
-            cursor = await session.execute(stmt)
-            created += cursor.rowcount or 0
+        source = None
+        progress = None
+        if scan is not None:
+            source = await session.get(PriceCycle, cycle_id)
+            progress = dict(source.notification_scan_json or {}) if source else {}
+            if progress.get("state") != "scanning" or progress.get("upper") != scan["upper"]:
+                return 0
+            page_end = max(event["id"] for event in events)
+            cursor = int(progress.get("cursor") or 0)
+            if cursor >= page_end:
+                return 0
+            payloads = [row for row in payloads if row["event_id"] > cursor]
+        recipient = await _saved_recipient(session, recipient)
+        if not recipient and payloads and scan is not None:
+            raise RuntimeError("提醒收件邮箱已清空，保留未消费事件等待配置恢复")
+        if not recipient and scan is None:
+            return 0
+        for row in payloads:
+            row["recipient"] = recipient
+        ids = [row["event_id"] for row in payloads]
+        facts = {row.id: row for row in (await session.execute(
+            select(events_service.PriceEvent).where(events_service.PriceEvent.id.in_(ids))
+        )).scalars().all()} if ids else {}
+        existing = set((await session.execute(select(NotificationCandidate.event_id).where(
+            NotificationCandidate.event_id.in_(ids)
+        ))).scalars().all()) if ids else set()
+        payloads = [row for row in payloads if row["event_id"] not in existing
+                    and (fact := facts.get(row["event_id"])) is not None
+                    and (fact.cycle_id, fact.appid, fact.region_code, fact.event_type) ==
+                    (cycle_id, row["appid"], row["region_code"], row["event_type"])]
+        if payloads:
+            result = await session.execute(sqlite_insert(NotificationCandidate.__table__)
+                                           .on_conflict_do_nothing(index_elements=["event_id", "recipient"]),
+                                           payloads)
+            created = int(result.rowcount or 0)
+        if source is not None:
+            source.notification_scan_json = dict(progress, cursor=page_end)
         await session.commit()
     return created
+
+
+async def _open_scan(cycle_id: int, prefs: dict, watched: set[int], recipient: str):
+    async with write_session(WritePriority.BACKGROUND, "notification_scan") as session:
+        source = await session.get(PriceCycle, cycle_id)
+        if source is None:
+            return False, None
+        progress = source.notification_scan_json or {}
+        if progress.get("state") == "scanning":
+            return True, deepcopy(progress)
+        if progress.get("state") == "done":
+            return True, None
+        cursor = int(progress.get("cursor") or 0)
+        upper = int((await session.execute(select(func.max(events_service.PriceEvent.id)).where(
+            events_service.PriceEvent.cycle_id == cycle_id
+        ))).scalar_one() or cursor)
+        if not prefs.get("enabled") or not recipient:
+            source.notification_scan_json = {"state": "done", "cursor": upper}
+            await session.commit()
+            return True, None
+        appids = set((await session.execute(select(events_service.PriceEvent.appid).where(
+            events_service.PriceEvent.cycle_id == cycle_id,
+            events_service.PriceEvent.id > cursor, events_service.PriceEvent.id <= upper,
+        ).distinct())).scalars().all())
+        progress = {"state": "scanning", "cursor": cursor, "upper": upper,
+                    "prefs": deepcopy(prefs), "appids": sorted(watched & appids)}
+        source.notification_scan_json = progress
+        await session.commit()
+        return True, deepcopy(progress)
+
+
+async def _complete_scan(cycle_id: int, scan: dict) -> None:
+    async with write_session(WritePriority.BACKGROUND, "notification_scan") as session:
+        source = await session.get(PriceCycle, cycle_id)
+        current = source.notification_scan_json or {} if source else {}
+        if current.get("state") != "scanning" or current.get("upper") != scan["upper"]:
+            return
+        latest = int((await session.execute(select(func.max(events_service.PriceEvent.id)).where(
+            events_service.PriceEvent.cycle_id == cycle_id
+        ))).scalar_one() or scan["upper"])
+        source.notification_scan_json = {
+            "state": "pending" if latest > scan["upper"] else "done", "cursor": scan["upper"],
+        }
+        await session.commit()
+
+
+async def resume_event_scans(cycle_id: int | None = None, *, prefs: dict | None = None,
+                             recipient: str | None = None) -> int:
+    async with get_session_factory()() as session:
+        ids = list((await session.execute(select(PriceCycle.id).where(
+            func.json_extract(PriceCycle.notification_scan_json, "$.state").in_(("pending", "scanning"))
+        ).order_by(PriceCycle.id))).scalars().all())
+    if cycle_id is not None and cycle_id not in ids:
+        ids.append(cycle_id)
+    if not ids:
+        return 0
+    prefs = prefs if prefs is not None else await load_prefs()
+    recipient = recipient if recipient is not None else (await smtp_config()).get("to_addr") or ""
+    watched = await _watched_appids() if prefs.get("enabled") and recipient else set()
+    created = 0
+    for identity in ids:
+        owned, scan = await _open_scan(identity, prefs, watched, recipient)
+        if owned and scan is None:
+            continue
+        scan_prefs = scan["prefs"] if scan else prefs
+        scope = set(scan["appids"]) if scan else watched
+        async for page in events_service.notification_batches(
+            identity, scope, batch=EVENT_BATCH,
+            after=int(scan["cursor"]) if scan else 0, upper=scan["upper"] if scan else None,
+        ):
+            created += await _create_candidates(identity, page, scan_prefs, scope, recipient, scan=scan)
+        if scan is not None:
+            await _complete_scan(identity, scan)
+    return created
+
+
+def _deliverable_statement():
+    return select(NotificationCandidate).where(or_(
+        NotificationCandidate.status.in_(UNDELIVERED),
+        and_(NotificationCandidate.status == FAILED, NotificationCandidate.attempts < MAX_ATTEMPTS),
+    )).order_by(NotificationCandidate.id)
+
+
+def _eligible(rows):
+    return [row for row in rows if row.status in UNDELIVERED
+            or (row.status == FAILED and int(row.attempts or 0) < MAX_ATTEMPTS
+                and retryable(row.last_error))]
+
+
+async def _saved_recipient(session, fallback: str) -> str:
+    from app.domains.settings.models import AppSetting
+
+    setting = await session.get(AppSetting, "smtp.to_addr")
+    return str(setting.value_json or "") if setting is not None else fallback
+
+
+async def retarget_candidates(session, recipient: str) -> int:
+    """未发送候选随目的地转移，合并时保留失败预算与路由历史。"""
+    if not recipient:
+        return 0
+    rows = (await session.execute(select(NotificationCandidate).where(
+        NotificationCandidate.status.in_((*UNDELIVERED, FAILED)),
+    ).order_by(NotificationCandidate.id))).scalars().all()
+    if not rows:
+        return 0
+    event_ids = {row.event_id for row in rows}
+    targets = {}
+    ids = sorted(event_ids)
+    for offset in range(0, len(ids), 500):
+        candidates = (await session.execute(select(NotificationCandidate).where(
+            NotificationCandidate.event_id.in_(ids[offset:offset + 500])
+        ).order_by(NotificationCandidate.id))).scalars().all()
+        for row in candidates:
+            target = targets.get(row.event_id)
+            protected = row.status not in (*UNDELIVERED, FAILED)
+            if target is None or (protected and target.status in (*UNDELIVERED, FAILED)) \
+                    or (target.status in (*UNDELIVERED, FAILED) and row.recipient == recipient):
+                targets[row.event_id] = row
+    now = datetime.now()
+    moved = 0
+    merged_ids = []
+    for row in rows:
+        target = targets[row.event_id]
+        if target is row and row.recipient == recipient:
+            continue
+        history = [*(row.delivery_history_json or []), {
+            "recipient": row.recipient, "status": row.status,
+            "attempts": int(row.attempts or 0), "lastError": row.last_error,
+            "reason": row.reason, "at": row.updated_at.isoformat() if row.updated_at else None,
+        }]
+        moved += 1
+        if target is row:
+            row.recipient = recipient
+            row.delivery_history_json = history
+            row.updated_at = now
+            continue
+        target.delivery_history_json = [*(target.delivery_history_json or []), *history]
+        if target.status in (*UNDELIVERED, FAILED):
+            target.attempts = int(target.attempts or 0) + int(row.attempts or 0)
+            if row.status == FAILED:
+                if target.status != FAILED or retryable(target.last_error):
+                    target.reason, target.last_error = row.reason, row.last_error
+                target.status = FAILED
+            target.updated_at = now
+        merged_ids.append(row.id)
+    for offset in range(0, len(merged_ids), 500):
+        await session.execute(delete(NotificationCandidate).where(
+            NotificationCandidate.id.in_(merged_ids[offset:offset + 500])
+        ))
+    return moved
+
+
+async def _retarget(recipient: str) -> int:
+    async with write_session(WritePriority.BACKGROUND, "notification_recipient") as session:
+        recipient = await _saved_recipient(session, recipient)
+        moved = await retarget_candidates(session, recipient)
+        await session.commit()
+    return moved
+
+
+def _matching_fact():
+    fact = events_service.PriceEvent
+    return select(fact.id).where(
+        fact.id == NotificationCandidate.event_id, fact.cycle_id == NotificationCandidate.cycle_id,
+        fact.appid == NotificationCandidate.appid, fact.event_type == NotificationCandidate.event_type,
+        fact.region_code.is_not_distinct_from(NotificationCandidate.region_code),
+        fact.created_at <= NotificationCandidate.created_at,
+    ).exists()
+
+
+async def _quarantine_invalid() -> int:
+    async with write_session(WritePriority.BACKGROUND, "notification_integrity") as session:
+        result = await session.execute(update(NotificationCandidate).where(
+            NotificationCandidate.status.in_((*UNDELIVERED, FAILED, SENDING)),
+            ~_matching_fact(),
+        ).values(status=UNKNOWN, reason="提醒依据缺失或不一致，已停止发送并保留记录",
+                 last_error="price event identity mismatch", updated_at=datetime.now()))
+        await session.commit()
+    return int(result.rowcount or 0)
+
+
+async def recover_delivery_state() -> dict[str, int]:
+    recovered = await _recover_stuck_sending()
+    invalid = await _quarantine_invalid()
+    if recovered or invalid:
+        log_event(logger, "无法确认的提醒已停止自动发送并保留记录",
+                  level=logging.WARNING, detail={"超时": recovered, "依据异常": invalid})
+    return {"recovered": recovered, "invalid": invalid}
 
 
 async def _undelivered() -> list[NotificationCandidate]:
@@ -154,27 +360,8 @@ async def _undelivered() -> list[NotificationCandidate]:
     `sending` / `unknown` 不在其中：未确认 SMTP 是否已接收时不重发。
     """
     async with get_session_factory()() as session:
-        rows = (
-            await session.execute(
-                select(NotificationCandidate)
-                .where(
-                    or_(
-                        NotificationCandidate.status.in_(UNDELIVERED),
-                        and_(
-                            NotificationCandidate.status == FAILED,
-                            NotificationCandidate.attempts < MAX_ATTEMPTS,
-                        ),
-                    )
-                )
-                .order_by(NotificationCandidate.id)
-            )
-        ).scalars().all()
-    return [
-        row
-        for row in rows
-        if row.status in UNDELIVERED
-        or (row.status == FAILED and row.attempts < MAX_ATTEMPTS and retryable(row.last_error))
-    ]
+        rows = (await session.execute(_deliverable_statement())).scalars().all()
+    return _eligible(rows)
 
 
 async def _recover_stuck_sending(now: datetime | None = None) -> int:
@@ -202,41 +389,68 @@ async def _recover_stuck_sending(now: datetime | None = None) -> int:
     return int(result.rowcount or 0)
 
 
-async def _claim(candidates: list[NotificationCandidate]) -> list[NotificationCandidate]:
+async def _claim(candidates: list[NotificationCandidate] | None = None,
+                 *, recipient: str | None = None) -> list[NotificationCandidate]:
     """以状态和版本字段作条件更新；多进程重复扫描时仅一个能占位。"""
     now = datetime.now()
     claimed: list[NotificationCandidate] = []
     async with write_session(WritePriority.BACKGROUND) as session:
-        for candidate in candidates:
-            version_filter = (
-                NotificationCandidate.updated_at.is_(None)
-                if candidate.updated_at is None
-                else NotificationCandidate.updated_at == candidate.updated_at
-            )
-            error_filter = (
-                NotificationCandidate.last_error.is_(None)
-                if candidate.last_error is None
-                else NotificationCandidate.last_error == candidate.last_error
-            )
-            result = await session.execute(
-                update(NotificationCandidate)
-                .where(
-                    NotificationCandidate.id == candidate.id,
-                    NotificationCandidate.status == candidate.status,
-                    NotificationCandidate.attempts == int(candidate.attempts or 0),
-                    error_filter,
-                    version_filter,
-                )
-                .values(
-                    status=SENDING,
-                    attempts=NotificationCandidate.attempts + 1,
-                    updated_at=now,
-                )
-            )
-            if result.rowcount:
-                claimed.append(candidate)
+        if recipient is not None:
+            recipient = await _saved_recipient(session, recipient)
+            if not recipient:
+                return []
+            await retarget_candidates(session, recipient)
+            candidates = _eligible((await session.execute(_deliverable_statement().where(
+                NotificationCandidate.recipient == recipient
+            ))).scalars().all())
+        candidates = candidates or []
+        for offset in range(0, len(candidates), 100):
+            batch = candidates[offset:offset + 100]
+            predicates = [and_(NotificationCandidate.id == c.id,
+                               NotificationCandidate.event_id == c.event_id,
+                               NotificationCandidate.recipient == c.recipient,
+                               NotificationCandidate.status == c.status,
+                               NotificationCandidate.attempts == int(c.attempts or 0),
+                               NotificationCandidate.updated_at.is_not_distinct_from(c.updated_at),
+                               NotificationCandidate.last_error.is_not_distinct_from(c.last_error))
+                          for c in batch]
+            ids = set((await session.execute(update(NotificationCandidate).where(
+                or_(*predicates), _matching_fact(),
+            ).values(status=SENDING, attempts=NotificationCandidate.attempts + 1,
+                     updated_at=now).returning(NotificationCandidate.id)
+              .execution_options(synchronize_session=False))).scalars().all())
+            claimed.extend(c for c in batch if c.id in ids)
         await session.commit()
+    for candidate in claimed:
+        candidate._delivery_previous = {
+            "status": candidate.status, "reason": candidate.reason, "last_error": candidate.last_error,
+            "attempts": int(candidate.attempts or 0), "updated_at": candidate.updated_at,
+        }
+        candidate.attempts = int(candidate.attempts or 0) + 1
+        candidate.updated_at = now
     return claimed
+
+
+async def _release_unstarted(candidates: list[NotificationCandidate]) -> int:
+    """仅撤销尚未进入邮件协议的本次认领并归还尝试次数。"""
+    table = NotificationCandidate.__table__
+    statement = update(table).where(
+        table.c.id == bindparam("claim_id"), table.c.event_id == bindparam("claim_event"),
+        table.c.recipient == bindparam("claim_recipient"), table.c.status == SENDING,
+        table.c.attempts == bindparam("claim_attempts"), table.c.updated_at == bindparam("claim_at"),
+    ).values(**{key: bindparam("prior_" + key)
+                for key in ("status", "reason", "last_error", "attempts", "updated_at")})
+    restored = 0
+    async with write_session(WritePriority.BACKGROUND, "notification_prepare") as session:
+        for offset in range(0, len(candidates), 100):
+            payloads = [{"claim_id": c.id, "claim_event": c.event_id, "claim_recipient": c.recipient,
+                         "claim_attempts": c.attempts, "claim_at": c.updated_at,
+                         **{"prior_" + key: value for key, value in c._delivery_previous.items()}}
+                        for c in candidates[offset:offset + 100]]
+            result = await session.execute(statement, payloads)
+            restored += int(result.rowcount or 0)
+        await session.commit()
+    return restored
 
 
 async def _settle(
@@ -244,20 +458,26 @@ async def _settle(
     status: str,
     reason: str | None,
     error: str | None = None,
-) -> None:
+) -> int:
     now = datetime.now()
+    settled = 0
     async with write_session(WritePriority.BACKGROUND) as session:
-        for candidate in candidates:
-            row = await session.get(NotificationCandidate, candidate.id)
-            if row is None:
-                continue
-            row.status = status
-            row.reason = reason
-            row.last_error = error
-            row.updated_at = now
+        for offset in range(0, len(candidates), 100):
+            predicates = [and_(NotificationCandidate.id == c.id,
+                               NotificationCandidate.event_id == c.event_id,
+                               NotificationCandidate.recipient == c.recipient,
+                               NotificationCandidate.attempts == c.attempts,
+                               NotificationCandidate.updated_at == c.updated_at)
+                          for c in candidates[offset:offset + 100]]
+            values = dict(status=status, reason=reason, last_error=error, updated_at=now)
             if status == "delivered":
-                row.delivered_at = now
+                values["delivered_at"] = now
+            result = await session.execute(update(NotificationCandidate).where(
+                NotificationCandidate.status == SENDING, or_(*predicates),
+            ).values(**values).execution_options(synchronize_session=False))
+            settled += int(result.rowcount or 0)
         await session.commit()
+    return settled
 
 
 async def _region_names(codes: set[str]) -> dict[str, str]:
@@ -280,8 +500,9 @@ async def _region_names(codes: set[str]) -> dict[str, str]:
 
 async def _digest_rows(candidates: list[NotificationCandidate]) -> tuple[list[str], int]:
     """候选 → 明细行 + 涉及游戏数（明细超出 MAX_DETAIL_ROWS 的不逐条列）。"""
-    appids = {c.appid for c in candidates}
-    event_ids = [c.event_id for c in candidates]
+    detail_candidates = candidates[:MAX_DETAIL_ROWS]
+    appids = {c.appid for c in detail_candidates}
+    event_ids = [c.event_id for c in detail_candidates]
     async with get_session_factory()() as session:
         names = {
             int(appid): name
@@ -326,48 +547,33 @@ async def _digest_rows(candidates: list[NotificationCandidate]) -> tuple[list[st
 
 
 async def dispatch(cycle_id: int) -> dict:
-    """本轮事件 → 候选 → 聚合摘要 → 邮件。返回计数（供日志与测试断言）。
-
-    任何失败都不上抛：通知是下游副作用，出错只能让候选落 `failed`，
-    不能让 Cycle 变 failed，更不能让用户少一轮价格。
-    """
+    """消费本轮事实并投递已认领摘要，通知失败不回滚价格结果。"""
     result = {
         "created": 0, "sent": 0, "deferred": 0, "failed": 0,
         "retried": 0, "retryable": False, "unknown": 0,
     }
     try:
-        result["unknown"] = await _recover_stuck_sending()
-        if result["unknown"]:
-            log_event(
-                logger,
-                "超时的通知投递已标记为结果未知，避免重复发送",
-                detail={"候选": result["unknown"]},
-                level=logging.WARNING,
-            )
+        recovery = await recover_delivery_state()
+        result["unknown"] = recovery["recovered"] + recovery["invalid"]
         prefs = await load_prefs()
         recipient = (await smtp_config()).get("to_addr") or ""
-        events = await events_service.list_events(cycle_id=cycle_id, limit=EVENT_LIMIT)
+        result["created"] += await resume_event_scans(cycle_id, prefs=prefs, recipient=recipient)
+        prefs = await load_prefs()
+        recipient = (await smtp_config()).get("to_addr") or ""
         if not prefs.get("enabled") or not recipient:
-            # 总开关关闭 / 出口未配置：不产生候选也不留积压（以后开启不补发旧账）
             log_event(
                 logger,
                 "本轮事件不进入通知（通知总开关关闭或收件出口未配置）",
                 tag="跳过",
                 detail={
-                    "事件": len(events),
                     "通知开关": "开" if prefs.get("enabled") else "关",
                     "收件出口": "已配置" if recipient else "未配置",
                 },
             )
             return result
 
-        watched = await _watched_appids()
-        result["created"] = await _create_candidates(
-            cycle_id, events, prefs, watched, recipient
-        )
+        await _retarget(recipient)
 
-        # 静默期 = 本轮不投递：候选已顺延（suppressed），等下一个非静默批次一并送，
-        # 而不是丢掉。不判断这条就等于静默期形同虚设——候选刚建完就被自己投出去。
         if policy_mod.in_quiet_window(datetime.now(), prefs):
             result["deferred"] = len(await _undelivered())
             log_event(
@@ -378,59 +584,34 @@ async def dispatch(cycle_id: int) -> dict:
             )
             return result
 
-        candidates = await _undelivered()
+        candidates = await _claim(recipient=recipient)
         if not candidates:
             return result
-        result["retried"] = sum(1 for c in candidates if c.status == "failed")
-
-        counts: dict[str, int] = {}
-        for candidate in candidates:
-            label = CATEGORY_LABELS.get(
-                candidate.category, event_label(candidate.event_type)
-            )
-            counts[label] = counts.get(label, 0) + 1
-        result["deferred"] = sum(1 for c in candidates if c.cycle_id != cycle_id)
-        details, games = await _digest_rows(candidates)
-
-        html = digest_mail_html(
-            counts=sorted(counts.items(), key=lambda kv: -kv[1]),
-            details=details if prefs.get("includeDetails", True) else [],
-            total=len(candidates),
-            games=games,
-            deferred=result["deferred"],
-            when=datetime.now(),
-        )
-        subject = f"Holdexar 本轮价格更新：{len(candidates)} 条变化"
-        claimed = await _claim(candidates)
-        if not claimed:
-            return result
-        if len(claimed) != len(candidates):
-            candidates = claimed
-            result["retried"] = sum(1 for c in candidates if c.status == FAILED)
-            result["deferred"] = sum(1 for c in candidates if c.cycle_id != cycle_id)
-            counts = {}
+        try:
+            result["retried"] = sum(1 for c in candidates if c.status == "failed")
+            counts: dict[str, int] = {}
             for candidate in candidates:
-                label = CATEGORY_LABELS.get(
-                    candidate.category, event_label(candidate.event_type)
-                )
+                label = CATEGORY_LABELS.get(candidate.category, event_label(candidate.event_type))
                 counts[label] = counts.get(label, 0) + 1
+            result["deferred"] = sum(1 for c in candidates if c.cycle_id != cycle_id)
             details, games = await _digest_rows(candidates)
             html = digest_mail_html(
                 counts=sorted(counts.items(), key=lambda kv: -kv[1]),
                 details=details if prefs.get("includeDetails", True) else [],
-                total=len(candidates),
-                games=games,
-                deferred=result["deferred"],
-                when=datetime.now(),
+                total=len(candidates), games=games, deferred=result["deferred"], when=datetime.now(),
             )
             subject = f"Holdexar 本轮价格更新：{len(candidates)} 条变化"
-        ok, error = await send_mail_ex(subject, html)
+        except (Exception, asyncio.CancelledError):
+            await _release_unstarted(candidates)
+            raise
+        ok, error = await send_mail_ex(subject, html, recipient=candidates[0].recipient)
         if ok:
-            await _settle(candidates, "delivered", None, None)
-            result["sent"] = len(candidates)
+            result["sent"] = await _settle(candidates, "delivered", None, None)
+        elif is_delivery_unknown(error):
+            result["unknown"] += await _settle(
+                candidates, UNKNOWN, "邮件发送结果无法确认，已停止自动重发", error)
         else:
-            await _settle(candidates, "failed", f"smtp: {error}", error)
-            result["failed"] = len(candidates)
+            result["failed"] = await _settle(candidates, "failed", f"smtp: {error}", error)
             result["retryable"] = retryable(error)
         log_event(
             logger,
@@ -442,6 +623,7 @@ async def dispatch(cycle_id: int) -> dict:
                 "重试": result["retried"],
                 "成功": result["sent"],
                 "失败": result["failed"],
+                "结果未知": result["unknown"],
             },
         )
         return result

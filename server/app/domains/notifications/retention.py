@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 
 from sqlalchemy import delete, func, select
 
-from app.core.database import WritePriority, get_session_factory, write_session
+from app.core.database import WritePriority, write_session
 from app.core.logging import log_event
 from app.domains.notifications.models import NotificationCandidate
 from app.domains.notifications.policy import DELIVERED, FAILED, MAX_ATTEMPTS, UNKNOWN
@@ -39,7 +39,7 @@ async def prune_notification_candidates(
     truncated = False
 
     for index in range(max_chunks):
-        async with get_session_factory()() as session:
+        async with write_session(WritePriority.BACKGROUND, "notification_retention") as session:
             rows = (
                 await session.execute(
                     select(
@@ -57,23 +57,22 @@ async def prune_notification_candidates(
                     .limit(chunk)
                 )
             ).all()
-        if not rows:
-            break
-        cursor = int(rows[-1].id)
-        terminal_ids = [
-            int(row.id)
-            for row in rows
-            if row.status in (DELIVERED, UNKNOWN)
-            or (
-                row.status == FAILED
-                and (
-                    int(row.attempts or 0) >= MAX_ATTEMPTS
-                    or not retryable(row.last_error)
+            if not rows:
+                break
+            cursor = int(rows[-1].id)
+            terminal_ids = [
+                int(row.id)
+                for row in rows
+                if row.status in (DELIVERED, UNKNOWN)
+                or (
+                    row.status == FAILED
+                    and (
+                        int(row.attempts or 0) >= MAX_ATTEMPTS
+                        or not retryable(row.last_error)
+                    )
                 )
-            )
-        ]
-        if terminal_ids:
-            async with write_session(WritePriority.BACKGROUND, "notification_retention") as session:
+            ]
+            if terminal_ids:
                 result = await session.execute(
                     delete(NotificationCandidate).where(
                         NotificationCandidate.id.in_(terminal_ids),
@@ -82,7 +81,7 @@ async def prune_notification_candidates(
                     )
                 )
                 await session.commit()
-            deleted += int(result.rowcount or 0)
+                deleted += int(result.rowcount or 0)
         if len(rows) < chunk:
             break
         if index == max_chunks - 1:
