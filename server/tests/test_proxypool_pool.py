@@ -42,16 +42,28 @@ NOW = datetime(2026, 9, 19, 12, 0, 0)
 
 @pytest.mark.asyncio
 async def test_expired_source_is_excluded_but_shared_live_source_keeps_node(tmp_data_dir):
-    from app.domains.proxies.models import ProxySubscription
+    from app.domains.proxies.models import ADMISSION_ACTIVE, ProxySubscription
 
     await init_db()
     nid = await _add(NODE_ACTIVE, "shared", server="shared.example.test")
     async with get_session_factory()() as session:
-        session.add_all([
-            ProxySubscription(id=1, kind="clash", url="https://example.test/expired",
-                              last_stats={"traffic": "expire=1"}),
-            ProxySubscription(id=2, kind="clash", url="https://example.test/live"),
-        ])
+        await session.merge(
+            ProxySubscription(
+                id=1,
+                kind="clash",
+                url="https://example.test/expired",
+                admission_status=ADMISSION_ACTIVE,
+                last_stats={"traffic": "expire=1"},
+            )
+        )
+        session.add(
+            ProxySubscription(
+                id=2,
+                kind="clash",
+                url="https://example.test/live",
+                admission_status=ADMISSION_ACTIVE,
+            )
+        )
         await session.commit()
         assert await pool_module.eligible_nodes(session) == []
         await session.execute(
@@ -92,8 +104,17 @@ async def _add(state: str, runtime_name: str, *, server: str, name: str | None =
     cfg = config if config is not None else _config(
         name=name or runtime_name, server=server
     )
+    from app.domains.proxies.models import ADMISSION_ACTIVE, ProxySubscription
+
     fp = node_fingerprint(cfg)
     async with get_session_factory()() as s:
+        if await s.get(ProxySubscription, 1) is None:
+            s.add(ProxySubscription(
+                id=1,
+                kind="clash",
+                url="https://example.test/sub-1",
+                admission_status=ADMISSION_ACTIVE,
+            ))
         s.add(ProxyNode(
             node_id=fp, fingerprint=fp, runtime_name=runtime_name,
             proxy_type=str(cfg.get("type") or ""), server=cfg.get("server"),

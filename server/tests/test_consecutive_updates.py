@@ -29,7 +29,29 @@ def _create_version_installation(
     return vdir
 
 
-def test_consecutive_updates_with_differential_patches_and_data_isolation(tmp_path: Path) -> None:
+def test_consecutive_updates_with_differential_patches_and_data_isolation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.core import update_data
+
+    def _fake_prepare(root, data_dir, attempt):
+        from app.core import layout
+        layout.update_transaction(root, layout.read_transaction(root)["stage"],
+                                  dataPrepared=True, dataAccepted=False,
+                                  dataDir=str(data_dir), dataDbPath=str(data_dir / "holdexar.db"),
+                                  dataToken="test-token", dataRecoveryPhase="prepared")
+
+    def _fake_accept(root):
+        from app.core import layout
+        tx = layout.read_transaction(root) or {}
+        layout.update_transaction(root, tx["stage"],
+                                  dataAccepted=True, dataRecoveryPhase="accepted")
+
+    monkeypatch.setattr(update_host, "supports_data_protocol", lambda exe: True)
+    monkeypatch.setattr(update_host, "probe_version_health", lambda *a, **kw: (True, "ready"))
+    monkeypatch.setattr(update_data, "prepare", _fake_prepare)
+    monkeypatch.setattr(update_data, "accept", _fake_accept)
+
     root = tmp_path / "installed_app"
     data_dir = root / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -96,7 +118,6 @@ def test_consecutive_updates_with_differential_patches_and_data_isolation(tmp_pa
         staging_dir=staging_1,
         target_version="0.3.6",
         source_version="0.3.5",
-        skip_health_check=True,
         launch_on_finish=False,
     )
     assert ok1 is True
@@ -153,7 +174,6 @@ def test_consecutive_updates_with_differential_patches_and_data_isolation(tmp_pa
         staging_dir=staging_2,
         target_version="0.3.7",
         source_version="0.3.6",
-        skip_health_check=True,
         launch_on_finish=False,
     )
     assert ok2 is True

@@ -1,6 +1,8 @@
 # CI：后端测试 + 敏感面门禁 + 前端构建门禁。
 #
-# push 到 main / PR / 手动触发均运行；公开仓库标准 runner 免额度，作为云端
+# push 到 main / PR 跑快速选测（L2 冒烟），覆盖受影响模块；
+# 手动触发（workflow_dispatch）设 full_test=true 跑全量，--durations=20 记录耗时；
+# 发布前务必手动触发一次全量。公开仓库标准 runner 免额度，作为云端
 # 兜底门禁，快速反馈仍由本地 L1 选测与 L2 冒烟承担。timeout-minutes 兜底：
 # 单 job 卡死必出结论，不无限占用 runner。
 #
@@ -19,6 +21,11 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      full_test:
+        description: '全量测试（发布前使用）'
+        type: boolean
+        default: false
 
 # 同一分支的新触发取消上一轮未完成的运行，省 runner 也少噪音
 concurrency:
@@ -50,8 +57,14 @@ jobs:
         # 放在测试之前：门禁失败时没必要再花几分钟跑测试
         run: python scripts/check_secrets.py --all
 
-      - name: 后端测试
-        run: python -m pytest -q
+      - name: 后端测试（快速选测）
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.full_test == false }}
+        run: python scripts/test_select.py --smoke --run
+
+      - name: 后端测试（全量）
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_test == true }}
+        working-directory: server
+        run: python -m pytest -q --durations=20
 
   frontend:
     name: 前端（Node ${{ matrix.node-version }}）

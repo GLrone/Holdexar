@@ -128,7 +128,7 @@ async def test_update_subscription_compares_and_seals(db):
 
     # 换链：开封比较不等 → 新链接密封落库，返回明文
     r2 = await proxies_service.update_subscription(sub_id, url=URL_B)
-    assert r2["url"] == URL_B
+    assert r2["url"] == "https://provider.example/***"
     stored = await _row_url(sub_id)
     assert secretbox.is_encrypted(stored) and open_url(stored) == URL_B
 
