@@ -328,6 +328,8 @@ async def test_source_loading_reports_one_corrupt_source_and_retains_other(sourc
 
 @pytest.mark.parametrize("field", ["proxy", "dialer-proxy"])
 def test_provider_connection_dependency_keeps_required_group(field):
+    from app.domains.proxies.runtime_config import expand_provider_nodes, render_node_bundle
+
     doc = _source()
     del doc["proxies"][0]["dialer-proxy"]
     provider = {"type": "http", "url": "https://example.invalid/nodes", "path": "./nodes.yaml"}
@@ -336,15 +338,36 @@ def test_provider_connection_dependency_keeps_required_group(field):
     else:
         provider["override"] = {field: "relay-group"}
     doc["proxy-providers"] = {"remote": provider}
-    runtime = yaml.safe_load(render_subscription_config(yaml.safe_dump(doc)))
-    assert "relay-group" in {g["name"] for g in runtime["proxy-groups"]}
+    bundle = render_node_bundle(
+        doc["proxies"], {}, groups=doc["proxy-groups"], provider_configs=doc["proxy-providers"],
+    )
+    assert "relay-group" in {g["name"] for g in bundle["proxy-groups"]}
+
+    if field == "dialer-proxy":
+        expanded = expand_provider_nodes(
+            yaml.safe_dump(doc),
+            {"remote": [{"name": "remote-node", "type": "socks5", "server": "r.example", "port": 1080}]},
+        )
+        runtime = yaml.safe_load(render_subscription_config(expanded))
+        assert "relay-group" in {g["name"] for g in runtime["proxy-groups"]}
 
 
 def test_provider_missing_dependency_is_rejected():
+    from app.domains.proxies.runtime_config import expand_provider_nodes
+
     doc = _source()
-    doc["proxy-providers"] = {"remote": {"type": "http", "proxy": "absent"}}
-    with pytest.raises(ValueError, match="依赖"):
+    doc["proxy-providers"] = {
+        "remote": {"type": "http", "override": {"dialer-proxy": "absent"}},
+    }
+    with pytest.raises(ValueError, match="未展开"):
         render_subscription_config(yaml.safe_dump(doc))
+
+    expanded = expand_provider_nodes(
+        yaml.safe_dump(doc),
+        {"remote": [{"name": "remote-node", "type": "socks5", "server": "r.example", "port": 1080}]},
+    )
+    with pytest.raises(ValueError, match="依赖"):
+        render_subscription_config(expanded)
 
 
 @pytest.mark.asyncio

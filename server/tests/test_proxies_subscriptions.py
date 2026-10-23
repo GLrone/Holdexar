@@ -137,7 +137,7 @@ async def test_update_subscription_rename_only(db):
     res = await proxies_service.update_subscription(sub_id, label="  我的机场  ")
     assert res["synced"] is False
     assert res["label"] == "我的机场"
-    assert res["url"] == SUB_URL
+    assert res["url"] == "https://example.com/***"
     assert (await _get_sub(db, sub_id)).label == "我的机场"
 
     res2 = await proxies_service.update_subscription(sub_id, label="   ")
@@ -212,7 +212,7 @@ async def test_update_subscription_plain_url_change_no_sync(db, monkeypatch):
         sub_id, url="https://example.com/plain2"
     )
     assert res["synced"] is False
-    assert res["url"] == "https://example.com/plain2"
+    assert res["url"] == "https://example.com/***"
 
 
 @pytest.mark.asyncio

@@ -141,6 +141,7 @@ TAG_SEVERITY = {
     "已修复": "info",
     "忽略": "info",
     "复用": "info",
+    "延后": "info",
     "注意": "warning",
     "降级": "warning",
     "未完成": "warning",
@@ -159,7 +160,6 @@ _MODULE_LABELS = {
     "app.core.backup": "数据备份",
     "app.core.updater": "应用更新",
     "app.core.optional_deps": "可选依赖",
-    "app.domains.crawl.retention": "价格保留",
     "app.domains.pilot.context": "领航员上下文",
     "app.core.rekey": "密钥换装",
     "app.core.external_time": "时间校准",
@@ -168,6 +168,7 @@ _MODULE_LABELS = {
     "app.core.data_export": "数据导出",
     "app.core.orchestration": "编排事件",
     "app.core.logging": "日志",
+    "app.domains.system.session_router": "本地会话",
     # 爬取
     "app.domains.crawl.retention": "价格保留",
     "app.crawler.scheduler": "爬取调度",
@@ -202,6 +203,8 @@ _MODULE_LABELS = {
     "app.domains.proxies.service": "代理订阅",
     "app.domains.proxies.router": "代理接口",
     "app.domains.proxies.subscription_secret": "代理订阅·密钥",
+    "app.domains.proxies.credentials": "代理凭据",
+    "app.domains.proxies.node_secret_files": "代理节点·凭据文件",
     # 账户与资产
     "app.domains.account.service": "Steam 账号",
     "app.domains.account.login": "Steam 登录",
@@ -227,6 +230,7 @@ _MODULE_LABELS = {
     "app.domains.alerts.notify": "提醒推送",
     "app.domains.notifications.service": "通知中心",
     "app.domains.notifications.facts": "通知·事实",
+    "app.domains.notifications.retention": "通知·保留",
     "app.domains.redeem.service": "兑换",
     "app.domains.regions.service": "区域",
     # 运行账本与领航员

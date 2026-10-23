@@ -449,6 +449,18 @@ async def resolve_system_proxy_url() -> str | None:
     return resolved
 
 
+async def strategy_proxy_or_direct() -> str | None:
+    """供业务域取用的策略代理：引擎不可用时按直连处理。
+
+    与 `resolve_proxy_url` 的差别只在失败语义：本入口吞掉解析异常返回 None，
+    用于「拿不到代理也要把这次同步跑完」的后台链路。
+    """
+    try:
+        return await resolve_proxy_url()
+    except Exception:  # noqa: BLE001 — 后台同步失败不改写为直连以外的语义
+        return None
+
+
 async def resolve_proxy_url() -> str | None:
     """策略引擎：为本次任务解析代理 URL。None = 直连。
 
@@ -489,25 +501,6 @@ async def resolve_proxy_url() -> str | None:
         raise RuntimeError(f"策略 {strategy} 需要至少一条启用的代理")
     return await _weighted_pick(enabled)
 
-
-async def resolve_failover_proxy_url() -> str | None:
-    """失败换代理取值口（direct_first 的 failover 通道）：强制取一个代理出口。
-
-    与 resolve_proxy_url 的差异：direct 类策略平时返回 None（直连），
-    但失败换代理时需要「有什么代理用什么」——Clash 在跑走内核工作端口，
-    池有节点走加权随机，再探用户自启 Verge 的兜底口，全无 → None（真没有代理）。
-    """
-    status = clash_manager.runtime.status()
-    # 入口硬闸同 resolve_proxy_url：端口没在听不交假地址
-    if status["running"] and status.get("port") and clash_manager.runtime.entry_listening():
-        return f"http://127.0.0.1:{status['port']}"
-    enabled = await list_proxies(enabled_only=True)
-    if enabled:
-        return await _weighted_pick(enabled)
-    fallback = await _local_fallback_port()
-    if fallback:
-        return f"http://127.0.0.1:{fallback}"
-    return None
 
 
 async def _round_robin(enabled: list[Proxy]) -> str:
@@ -769,7 +762,7 @@ async def update_subscription(
                     url_changed = True
             await session.commit()
             result: dict = {
-                "id": sub.id, "kind": sub.kind, "url": open_url(sub.url),
+                "id": sub.id, "kind": sub.kind, "url": mask_url(open_url(sub.url)),
                 "label": sub.label, "synced": False,
                 "autoRefresh": bool(sub.auto_refresh)
                 if sub.auto_refresh is not None else True,
@@ -2544,7 +2537,7 @@ async def _apply_node_results(
         )
     # 账本收敛：已不在订阅内容里的节点行随检测清理（检测读的就是当前配置）
     pruned = await prune_clash_node_ledger(sub_id, set(node_names))
-    # 存活统计落库——订阅行「存活 x/y」标签的数据源（此前前端等这个字段）
+    # 存活统计落库——订阅行「存活 x/y」标签的数据源
     if not target_response_only:
         await _merge_last_stats(sub_id, alive=alive_count, total=len(node_names))
     if pruned:

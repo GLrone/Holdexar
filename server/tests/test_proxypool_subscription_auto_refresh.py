@@ -109,7 +109,7 @@ async def test_switch_off_does_not_drop_nodes_or_sources(tmp_path) -> None:
         assert items[0]["autoRefresh"] is False
         # 行本身与链接、准入都还在
         assert items[0]["admissionStatus"] == ADMISSION_ACTIVE
-        assert items[0]["url"] == "http://example.invalid/3"
+        assert items[0]["url"] == "http://example.invalid/***"
     finally:
         svc.get_session_factory = original
         database_module.get_session_factory = original_db
