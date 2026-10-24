@@ -1,0 +1,10 @@
+#!/bin/sh
+# Holdexar 提交信息门禁 —— commit-msg（配置：git config core.hooksPath .githooks）
+#
+# 单人仓库不接受共同作者尾注：任何工具自动追加的 Co-Authored-By 署名
+# 都会被 GitHub 计入 Contributors 并永久留痕，因此一律拦截。
+if grep -qi '^[[:space:]]*co-authored-by:' "$1"; then
+  echo "✗ 提交信息含共同作者尾注，提交止步。删除该行后重新提交。" >&2
+  grep -ni '^[[:space:]]*co-authored-by:' "$1" >&2
+  exit 1
+fi

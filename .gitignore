@@ -20,10 +20,11 @@ desktop/__pycache__/
 # ── 文档 ──
 # 上传的说明文档只保留 README.md 与 LICENSE（GPL-3.0），其余全部本地保留：
 # docs/ 整体屏蔽——DEV_LOG.md 含完整的绕行参数与内部档案，计划/交接/复盘
-# 文档同属内部资料；THIRD_PARTY_NOTICES.md 仍随发布包分发（构建合规所需），
-# 只是不再随仓库公开。AGENTS.md / CONTRIBUTING.md / SECURITY.md 同为本地
+# 文档同属内部资料；第三方许可声明已并在 README 致谢与 LICENSE 中。AGENTS.md / CONTRIBUTING.md / SECURITY.md 同为本地
 # 约束文档，不上传。
-docs/*
+# 整目录忽略（含目录本身）：docs/ 内含独立本地文档仓库（.git），
+# 用 `docs/*` 只忽略内容、不忽略目录，`git add -A` 会把它当嵌入仓库加进来。
+docs/
 AGENTS.md
 CONTRIBUTING.md
 SECURITY.md
@@ -95,6 +96,7 @@ release/
 # seed = 汇率档案种子；clash = mihomo 内核 + GeoIP 数据 + 许可原文
 assets/seed/
 assets/clash/
+assets/bin/
 
 # ── 运行时数据 ──
 data/

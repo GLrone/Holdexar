@@ -11,3 +11,11 @@ if ! python scripts/check_secrets.py --all; then
   exit 1
 fi
 echo "[pre-push] ✓ 通过"
+
+echo "[pre-push] 共同作者尾注检查（阻止外部工具署名进 Contributors）..."
+if git log --format='%B' | grep -qi '^[[:space:]]*co-authored-by:'; then
+  echo "✗ 待推送提交含共同作者尾注，推送止步。" >&2
+  git log --format='%h %s' | head -20 >&2
+  exit 1
+fi
+echo "[pre-push] ✓ 通过"
