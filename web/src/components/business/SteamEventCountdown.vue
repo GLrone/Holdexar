@@ -9,7 +9,6 @@
  * （夏令时/冬令时分别对北京时间凌晨 1 点 / 2 点，口径见 lib/steamEvents）。
  */
 import { computed } from 'vue'
-import { useRouter } from 'vue-router'
 
 import type { SteamEventItem } from '@/api/client'
 import { HlEmpty, HlSkeleton } from '@/components/ui'
@@ -19,7 +18,6 @@ import { useI18n } from '@/locales'
 import { useLocaleStore } from '@/stores/locale'
 import { useSteamEventsStore } from '@/stores/steamEvents'
 
-const router = useRouter()
 const { t } = useI18n()
 const localeStore = useLocaleStore()
 const store = useSteamEventsStore()

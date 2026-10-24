@@ -22,9 +22,5 @@ export const useTrendDrawerStore = defineStore('trendDrawer', () => {
     activeAppid.value = null
   }
 
-  function isOpen(appid: number): boolean {
-    return activeAppid.value === appid
-  }
-
-  return { activeAppid, toggle, close, isOpen }
+  return { activeAppid, toggle, close }
 })

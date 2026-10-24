@@ -111,7 +111,6 @@ const modelDialogOpen = ref(false)
 const modelDialogCustom = ref('')
 const modelStatus = ref<Record<string, { state: 'testing' | 'ok' | 'fail'; ms?: number; reason?: string }>>({})
 const pilotDetecting = ref(false)
-const pilotTesting = ref(false)
 
 const selectedProvider = computed(() => pilotProviders.value.find((p) => p.id === selectedPid.value) || null)
 const activeProviderName = computed(
@@ -2809,11 +2808,6 @@ onUnmounted(stopLoginPolling)
   font-size: 13px;
   text-align: left;
   cursor: pointer;
-}
-
-.pilot-model-row.is-pick {
-  border-color: var(--accent);
-  background: var(--accent-a08);
 }
 
 .pilot-model-row {

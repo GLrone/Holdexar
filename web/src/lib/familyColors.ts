@@ -58,16 +58,6 @@ export const TIER_COLORS: readonly string[] = [
   PALETTE.violet,
 ]
 
-/** 成长曲线色（FamGrowth） */
-export const GROWTH_COLORS: readonly string[] = [
-  PALETTE.teal,
-  PALETTE.blue,
-  PALETTE.orange,
-  PALETTE.green,
-  PALETTE.salmon,
-  PALETTE.iris,
-]
-
 /** 按下标取成员色（越界回到开头） */
 export function memberColor(index: number): string {
   return MEMBER_COLORS[index % MEMBER_COLORS.length]!

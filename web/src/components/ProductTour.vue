@@ -225,7 +225,6 @@ const popStyle = computed(() => {
     return { top: '50%', left: '50%', transform: 'translate(-50%, -50%)', width: `${cw}px`, maxWidth: `${cw}px` }
   }
   const b = box.value
-  const h = currentPopH()
   const left = Math.max(MARGIN, Math.min(b.left + b.width / 2 - w / 2, vw - w - MARGIN))
   const pos: Record<string, string> = { left: `${left}px`, width: `${w}px`, maxWidth: `${w}px` }
   if (popPlacement.value === 'bottom') pos.top = `${b.top + b.height + MARGIN}px`

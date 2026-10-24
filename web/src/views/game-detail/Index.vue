@@ -186,12 +186,7 @@ const priceCoverageBlock = computed<StructuredBlock<CoverageMatrixData>>(() => {
   }
 })
 
-/** 后端 chinese_support 的取值（crawler/utils.py detect_chinese_support 产出
-    '无中文' / '简体中文' / '繁体中文'）——这是**数据值不是文案**：不建词条、
-    值原样渲染，这里只判它决定标签配色。
-    用正则字面量而不是 `=== '无中文'`：双语红线的 no-hardcoded-cjk 把正则字面量
-    排除在「文案」之外（规则判不了字符集里是数据还是文案），而同一个中文字符串写成
-    字符串字面量会被判成待迁文案。语义与 `=== '无中文'` 完全等价。 */
+/** chinese_support 是后端数据值，按有无中文决定标签配色。 */
 const NO_CHINESE = /^无中文$/
 
 const cnRow = computed(() => regionRows.value.find((r) => r.code === 'CN') ?? null)
@@ -1644,10 +1639,6 @@ html:not(.dark) .gd-link-icon.steamdb { filter: invert(1); }
   color: var(--text-dim);
   font-size: 11.5px;
   white-space: nowrap;
-}
-
-@media (max-width: 768px) {
-  .gd-trend-stats { grid-template-columns: repeat(2, 1fr); }
 }
 
 @media (max-width: 768px) {

@@ -10,8 +10,6 @@ import { useI18n, type MessageKey } from '@/locales'
 import { HlPaneSwitch, HlSelect, HlTabs, message } from '@/components/ui'
 import type { HlSelectOption, HlTabItem } from '@/components/ui'
 import FamContrib from './tabs/FamContrib.vue'
-// 增长趋势暂时隐藏：与入库热力图信息重叠，代码保留待回归
-// import FamGrowth from './tabs/FamGrowth.vue'
 import FamHeat from './tabs/FamHeat.vue'
 import FamBuy from './tabs/FamBuy.vue'
 import FamWish from './tabs/FamWish.vue'
@@ -229,7 +227,6 @@ const TAB_KEYS: { key: string; labelKey: MessageKey }[] = [
   { key: 'wish', labelKey: 'family.tab.wish' },
   // 游玩动态与家庭库两页签在游戏库页（views/gamelib/tabs/GlPlay.vue、
   // views/gamelib/tabs/FamilyLib.vue），词条 famPlay.* / famLib.* 随之。
-  // 增长趋势与共享冷却为停用实现（语义待定），代码保留但不出现在 tab 列表。
 ]
 
 const tabItems = computed<HlTabItem[]>(() =>
@@ -252,8 +249,6 @@ const PANES: Record<string, Component> = {
   heat: FamHeat,
   buy: FamBuy,
   wish: FamWish,
-  // growth: FamGrowth,  // 停用（与热力图信息重叠），回归时与上面的 import、tabs 一起放开
-  // cool: …,           // 停用（语义待研究），回归时见模板内保留的块
 }
 
 /**
@@ -395,21 +390,6 @@ const avatarColors: Record<string, string> = {
 
 /* ─ 贡献分布（堆叠条形+环形+近半年增量+范围切换）在独立组件 FamContrib.vue ── */
 
-/* ── 共享冷却（真数据：GetSharedLibraryApps 排除清单）——tab 未启用（语义待定），代码保留 ─
-const shareableCount = computed(() => libStore.games.filter((g) => g.inSharedLib && !g.excluded).length)
-const excludedCount = computed(() => libStore.games.filter((g) => g.excluded).length)
-const excludedBySteamid = computed(() => {
-  // 后端 exclude 数据粒度到 app；按拥有者归组（近似到成员）
-  const map = new Map<string, number[]>()
-  for (const g of libStore.games) {
-    if (!g.excluded) continue
-    const sid = g.owners[0] ?? 'unknown'
-    if (!map.has(sid)) map.set(sid, [])
-    map.get(sid)!.push(g.appid)
-  }
-  return map.size ? map : null
-})
-*/
 </script>
 
 <template>
@@ -607,50 +587,6 @@ const excludedBySteamid = computed(() => {
           <component :is="PANES[activeTab]" />
         </HlPaneSwitch>
 
-          <!-- ── 以下两块为**停用实现**，代码原样保留待回归；回归时注意两点 ──
-               ① 面板要加进上面的 PANES 映射与 tabs 数组，不要改回 v-if 链；
-               ② 那三张统计卡改用 <HlStat>，其原 .fx-mini-stat 样式已随统一收敛删除。 -->
-
-          <!-- 增长趋势（月度入库累计折线）——暂时隐藏（与热力图信息重叠），代码保留待回归
-          <FamGrowth />
-          增长趋势隐藏块结束 -->
-
-          <!-- 共享冷却（真实数据：被 Steam 排除出共享库的成员/游戏）——tab 暂时隐藏（语义待研究），代码保留待回归。
-               回归时补回最外层 `<div v-if="activeTab === 'cool'" class="tabs__pane is-on">`（或把整块做成 cool 的 PANES 条目），
-               下方 `</template>` 之后的收尾已对齐。
-          <div v-if="libStore.error || (!libStore.ready && libStore.loading)" class="lib-empty-tab">
-          {{ libStore.error || '家庭库数据拉取中…' }}
-          </div>
-          <div v-else-if="libStore.games.length === 0" class="lib-empty-tab">
-          暂无家庭库数据——同步家庭组后展示共享冷却状态
-          </div>
-          <template v-else>
-          <div class="fx-grid--3" style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px">
-          <div class="fx-mini-stat">
-          <div class="fx-mini-stat__num fx-mini-stat__num--good">{{ shareableCount }}</div>
-          <div class="fx-mini-stat__lbl">共享库内游戏（正常共享）</div>
-          </div>
-          <div class="fx-mini-stat">
-          <div class="fx-mini-stat__num fx-mini-stat__num--warn">{{ excludedCount }}</div>
-          <div class="fx-mini-stat__lbl">被排除出共享库（Steam 侧限制）</div>
-          </div>
-          <div class="fx-mini-stat">
-          <div class="fx-mini-stat__num">{{ excludedBySteamid ? excludedBySteamid.size : 0 }}</div>
-          <div class="fx-mini-stat__lbl">涉及成员数</div>
-          </div>
-          </div>
-          <div v-if="excludedCount > 0" style="margin-top: 10px; font-size: 11.5px; color: var(--text-muted); line-height: 1.8; background: var(--surface-inset); border-radius: var(--radius); padding: 10px 13px">
-          <b style="color: var(--warning)">排除清单：</b>
-          <span v-for="(appids, sid) in excludedBySteamid" :key="sid">
-          {{ libStore.memberName(String(sid)) }}（{{ appids.length }} 款：{{ appids.slice(0, 5).map((a) => libStore.games.find((g) => g.appid === a)?.name || a).join('、') }}{{ appids.length > 5 ? '…' : '' }}）；
-          </span>
-          </div>
-          <div style="margin-top: 12px; font-size: 11.5px; color: var(--text-muted); line-height: 1.8; background: var(--surface-inset); border-radius: var(--radius); padding: 10px 13px">
-          Steam 家庭共享冷却机制：成员退出家庭组后需等待 1 年方可重新加入；跨区账号可能触发地区冷却。
-          冷却期内成员无法享受家庭库共享权益。Steam Web API 不开放冷却剩余时间，此处按共享库排除清单实时呈现。
-          </div>
-          </template>
-共享冷却隐藏块结束 -->
       </HlTabs>
     </div>
   </section>
@@ -690,30 +626,6 @@ const excludedBySteamid = computed(() => {
 .fx-module__icon svg { width: 19px; height: 19px; }
 .fx-module__title { font-size: 15px; font-weight: 700; color: var(--text-primary); }
 .fx-module__sub { font-size: 12px; color: var(--text-muted); margin: 2px 0 14px 44px; }
-.fx-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
-.fx-grid--3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
-@media (max-width: 1100px) { .fx-grid, .fx-grid--3 { grid-template-columns: 1fr; } }
-.fx-empty-mini {
-  padding: 26px 20px;
-  text-align: center;
-  font-size: 12.5px;
-  color: var(--text-dim);
-  background: var(--surface-inset);
-  border: 1px dashed var(--border-soft);
-  border-radius: var(--radius);
-  line-height: 1.8;
-}
-
-/* 统计卡：本文件已无活引用（唯一使用处是上面「共享冷却」停用块，它用的是类名
-   而不是这套规则）。卡片本体统一到 components/ui/HlStat.vue，故删除。
-   ⚠️ 回归「共享冷却」时把那三张卡改写成 <HlStat> 即可，别再恢复本块样式。 */
-
-/* 比例条 */
-.ratio-row { display: flex; align-items: center; gap: 9px; margin-bottom: 9px; font-size: 12px; }
-.ratio-row__name { width: 64px; color: var(--text-secondary); flex-shrink: 0; }
-.ratio-row__track { flex: 1; height: 8px; border-radius: 999px; background: var(--surface-track); overflow: hidden; }
-.ratio-row__fill { height: 100%; border-radius: 999px; transition: width 0.9s var(--ease-out); }
-.ratio-row__val { width: 52px; text-align: right; font-family: var(--font-mono); color: var(--text-muted); font-size: 11px; flex-shrink: 0; }
 
 /* 家庭成员行卡 */
 .fam-list {
@@ -1027,15 +939,5 @@ const excludedBySteamid = computed(() => {
   text-align: center;
   font-size: 12px;
   color: var(--text-dim);
-}
-/* tabs 内诚实空态（未绑 Cookie / 未同步家庭组） */
-.lib-empty-tab {
-  text-align: center;
-  padding: 26px 16px;
-  border: 1px dashed var(--border-soft);
-  border-radius: var(--radius);
-  background: var(--surface-inset);
-  font-size: 12.5px;
-  color: var(--text-secondary);
 }
 </style>

@@ -30,23 +30,14 @@ export const useSteamEventsStore = defineStore('steamEvents', () => {
   }
 
   let started = false
-  let timer: number | undefined
 
   /** 首个消费者挂载时启动：即拉一次 + 每小时轮询（store 生命周期内只起一次） */
   function start(): void {
     if (started) return
     started = true
     void load()
-    timer = window.setInterval(() => void load(), HOUR_MS)
+    window.setInterval(() => void load(), HOUR_MS)
   }
 
-  function stopPolling(): void {
-    if (timer !== undefined) {
-      window.clearInterval(timer)
-      timer = undefined
-    }
-    started = false
-  }
-
-  return { payload, state, load, start, stopPolling }
+  return { payload, state, load, start }
 })

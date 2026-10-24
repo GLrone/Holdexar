@@ -594,19 +594,6 @@ onMounted(() => void loadBills())
   font-size: 12px;
   color: var(--text-dim);
 }
-
-.key-hint {
-  font-size: 11px;
-  color: var(--text-dim);
-  margin-left: auto;
-}
-
-.key-progress-meta {
-  font-size: 11px;
-  color: var(--text-muted);
-  display: flex;
-  justify-content: space-between;
-}
 </style>
 
 <style scoped>
@@ -696,7 +683,6 @@ onMounted(() => void loadBills())
 .key-row:last-child { border-bottom: none; }
 .key-row__idx { color: var(--text-dim); font-size: 10.5px; min-width: 16px; text-align: right; flex-shrink: 0; }
 .key-row__code { color: var(--text-secondary); letter-spacing: 0.4px; }
-.key-row__game { font-family: var(--font-sans); color: var(--text-muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 .key-st { font-size: 11px; padding: 2px 9px; border-radius: 999px; white-space: nowrap; display: inline-flex; align-items: center; gap: 4px; font-family: var(--font-sans); }
 .key-st::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .key-st--wait { background: var(--surface-chip-2); color: var(--text-dim); }

@@ -36,7 +36,7 @@ const crawl: Partial<Record<MessageKey, string>> = {
   'crawl.stop.none': 'No job is running',
   'crawl.jobs.refresh': 'Refresh job history',
 
-  /* Live progress (SSE). done/total counts batches (1 batch = 1 region × ≤400 apps);
+  /* Live progress (SSE). done/total counts batches (1 batch = 1 region × ≤300 apps);
      during a price round they accumulate across its chained segments as one total
      queue; ok/fail/qsize/speed stay per-segment live counts. Speed is per minute */
   'crawl.progress.meta':

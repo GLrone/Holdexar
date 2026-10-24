@@ -1909,16 +1909,6 @@ onBeforeUnmount(() => {
 .bundles-view {
   padding: 16px 18px 40px;
 }
-.bundles-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 14px;
-}
-.bundles-stats {
-  font-size: 13px;
-  color: var(--text-secondary);
-}
 /* `.bundles-loading` 随加载态改骨架屏删除（描述文字不再是「加载中…」样式） */
 .bundles-error {
   text-align: center;
@@ -1932,17 +1922,8 @@ onBeforeUnmount(() => {
   gap: 8px;
   margin-top: 10px;
 }
-.lowest-flag {
-  font-size: 10px;
-  color: var(--success);
-  border: 1px solid var(--success-a40);
-  border-radius: 3px;
-  padding: 0 4px;
-  margin-left: 6px;
-}
 /* 前三低价区行：对齐游戏卡 price-row 结构（label = 旗+名+奖牌 flex 内联） */
-.top3-row .price-label,
-.price-row .price-label.is-top3 {
+.top3-row .price-label {
   display: inline-flex;
   align-items: center;
   gap: 5px;
