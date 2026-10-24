@@ -178,51 +178,6 @@ def test_update_host_retention_prunes_older_versions(tmp_path):
     assert not layout.get_version_dir(root, "0.3.4").exists()
 
 
-def test_bridge_legacy_update_converts_flat_layout(tmp_path, monkeypatch):
-    target = tmp_path / "installed"
-    target.mkdir()
-    staging = tmp_path / "staging"
-
-    # 构造老版本扁平安装目录：0.3.2-beta
-    (target / f"{APP_NAME}.exe").write_bytes(b"old_exe")
-    (target / "_internal").mkdir()
-    (target / "_internal" / "python313.dll").write_bytes(b"old_dll")
-    (target / "data").mkdir()
-    connection = sqlite3.connect(target / "data" / "holdexar.db")
-    connection.execute("CREATE TABLE user_record (value TEXT)")
-    connection.commit()
-    connection.close()
-    original_bytes = (target / "data" / "holdexar.db").read_bytes()
-
-    # 构造新版本 0.3.3-beta 暂存包
-    _create_mock_app_payload(staging, "0.3.3-beta", has_exe=True)
-    monkeypatch.setattr(update_host, "probe_version_health", lambda *a, **kw: (True, "ready"))
-
-    ok = update_host.bridge_legacy_update(
-        staging=staging,
-        target=target,
-        current_version="0.3.2-beta",
-        skip_health_check=False,
-        launch_on_finish=False,
-    )
-    assert ok is True
-
-    # 验证用户数据完好
-    assert (target / "data" / "holdexar.db").read_bytes() == original_bytes
-
-    # 验证旧版已被组织进 versions/0.3.2-beta/
-    assert (target / "versions" / "0.3.2-beta" / "_internal" / "python313.dll").is_file()
-    assert (target / "versions" / "0.3.2-beta" / f"{APP_NAME}.exe").is_file()
-
-    # 验证新版已安装至 versions/0.3.3-beta/
-    assert (target / "versions" / "0.3.3-beta" / f"{APP_NAME}.exe").is_file()
-
-    # 验证版本指针
-    curr = layout.read_current_state(target)
-    assert curr["version"] == "0.3.3-beta"
-    assert curr["lastKnownGood"] == "0.3.2-beta"
-
-
 # ── 健康验收：只认本次拉起、目标版本、目标数据目录、本次事务的进程 ──────────
 
 
@@ -439,167 +394,6 @@ def test_install_version_payload_differential_patch(tmp_path):
     assert not (dest / "_internal" / "remove.dll").exists()
 
 
-
-# ── 旧版首次迁移：任何阶段失败都留着可双击的旧版入口 ─────────────────────
-
-
-def _flat_legacy(target: Path) -> None:
-    target.mkdir(parents=True, exist_ok=True)
-    (target / f"{APP_NAME}.exe").write_bytes(b"old_exe")
-    (target / "_internal").mkdir()
-    (target / "_internal" / "python313.dll").write_bytes(b"old_dll")
-    (target / "data").mkdir()
-    (target / "data" / "holdexar.db").write_bytes(b"user_database")
-
-
-def test_legacy_launcher_lands_before_legacy_moves(tmp_path):
-    target = tmp_path / "installed"
-    staging = tmp_path / "staging"
-    _flat_legacy(target)
-    _create_mock_app_payload(staging, "0.3.6", has_exe=True)
-
-    ok = update_host.prepare_launcher_only(
-        target, staging, source_version="0.3.2-beta", attempt_id="att-l"
-    )
-    assert ok is True
-    # 根目录换成了新启动器，旧版主程序已备份且版本目录尚未开始搬
-    assert (target / f"{APP_NAME}.exe").read_bytes() == b"app_binary"
-    assert (target / "__legacy__" / f"{APP_NAME}.exe").is_file()
-    assert (target / "_internal").is_dir()
-    curr = layout.read_current_state(target)
-    assert curr["version"] == "0.3.2-beta"
-    assert curr["previousVersion"] == "0.3.2-beta"
-
-
-def test_legacy_invalid_external_database_stays_in_place(tmp_path, monkeypatch):
-    target = tmp_path / "installed"
-    staging = tmp_path / "staging"
-    appdata = tmp_path / "appdata" / "holdexar"
-    _flat_legacy(target)
-    # 旧版数据在 AppData（外置），安装根 data/ 还没有库
-    (target / "data" / "holdexar.db").unlink()
-    appdata.mkdir(parents=True)
-    (appdata / "holdexar.db").write_bytes(b"legacy_database")
-    _create_mock_app_payload(staging, "0.3.6", has_exe=True)
-    monkeypatch.setattr(update_host, "_launch_entry", lambda root: True)
-
-    ok = update_host.bridge_legacy_update(
-        staging=staging,
-        target=target,
-        data_dir=appdata,
-        current_version="0.3.2-beta",
-        skip_health_check=True,
-        launch_on_finish=False,
-    )
-    assert ok is False
-    assert (target / f"{APP_NAME}.exe").is_file()          # 新版启动入口在位
-    assert layout.get_version_exe(target, "0.3.2-beta").is_file()
-    assert (appdata / "holdexar.db").read_bytes() == b"legacy_database"
-    assert not (target / "data" / "holdexar.db").exists()
-
-
-def test_legacy_migration_conflict_stops_update(tmp_path, monkeypatch):
-    """两处都有库：拒绝覆盖，换装不开始。"""
-    target = tmp_path / "installed"
-    staging = tmp_path / "staging"
-    appdata = tmp_path / "appdata" / "holdexar"
-    _flat_legacy(target)
-    appdata.mkdir(parents=True)
-    (appdata / "holdexar.db").write_bytes(b"legacy_database")
-    _create_mock_app_payload(staging, "0.3.6", has_exe=True)
-    monkeypatch.setattr(update_host, "_launch_entry", lambda root: True)
-
-    ok = update_host.bridge_legacy_update(
-        staging=staging,
-        target=target,
-        data_dir=appdata,
-        current_version="0.3.2-beta",
-        skip_health_check=True,
-        launch_on_finish=False,
-    )
-    assert ok is False
-    # 安装根那份库不被旧库覆盖
-    assert (target / "data" / "holdexar.db").read_bytes() == b"user_database"
-
-
-def test_legacy_conversion_failure_restores_flat_layout(tmp_path, monkeypatch):
-    """版本目录转换失败：把已移动的条目搬回根目录，根目录仍有旧版主程序。"""
-    target = tmp_path / "installed"
-    _flat_legacy(target)
-
-    real_move = update_host._move_legacy_entry
-
-    def _move(root, source, dest):
-        if str(source).endswith(f"{APP_NAME}.exe") and dest.parent.name == "0.3.2-beta":
-            raise PermissionError("文件被占用")
-        return real_move(root, source, dest)
-
-    monkeypatch.setattr(update_host, "_move_legacy_entry", _move)
-
-    ok, reason = update_host.convert_legacy_layout(
-        target, source_version="0.3.2-beta"
-    )
-    assert ok is False
-    assert "文件被占用" in reason
-    # _internal 已搬入版本目录后被发现主程序搬不动，必须搬回根目录
-    assert (target / "_internal" / "python313.dll").is_file()
-    assert (target / f"{APP_NAME}.exe").read_bytes() == b"old_exe"
-
-
-def test_legacy_conversion_writes_typed_version_dir(tmp_path):
-    target = tmp_path / "installed"
-    _flat_legacy(target)
-
-    ok, _ = update_host.convert_legacy_layout(target, source_version="v0.3.2-beta")
-    assert ok is True
-    assert (target / "versions" / "0.3.2-beta" / f"{APP_NAME}.exe").is_file()
-    assert (target / "versions" / "0.3.2-beta" / "_internal" / "python313.dll").is_file()
-    curr = layout.read_current_state(target)
-    assert curr["version"] == "0.3.2-beta"
-    assert curr["pendingVersion"] == "0.3.2-beta"
-
-
-def test_legacy_conversion_preserves_true_legacy_binary_after_launcher_prep(tmp_path):
-    """关键回归：prepare_launcher_only 之后执行 convert_legacy_layout，旧版版本目录内
-    必须是真正的旧版主程序（b'old_exe'），而不是被新版 Launcher（b'app_binary'）篡改。"""
-    target = tmp_path / "installed"
-    staging = tmp_path / "staging"
-    _flat_legacy(target)
-    _create_mock_app_payload(staging, "0.3.6", has_exe=True)
-
-    ok = update_host.prepare_launcher_only(
-        target, staging, source_version="0.3.2-beta", attempt_id="att-1"
-    )
-    assert ok is True
-    # 根目录此时是 Launcher
-    assert (target / f"{APP_NAME}.exe").read_bytes() == b"app_binary"
-    assert (target / "__legacy__" / f"{APP_NAME}.exe").read_bytes() == b"old_exe"
-
-    ok_conv, reason = update_host.convert_legacy_layout(
-        target, source_version="0.3.2-beta", attempt_id="att-1"
-    )
-    assert ok_conv is True
-    # 检查版本目录内的 EXE：必须是真正的旧版主程序！
-    dest_exe = target / "versions" / "0.3.2-beta" / f"{APP_NAME}.exe"
-    assert dest_exe.is_file()
-    assert dest_exe.read_bytes() == b"old_exe"
-
-    # 根目录依然是 Launcher
-    assert (target / f"{APP_NAME}.exe").read_bytes() == b"app_binary"
-
-
-def test_legacy_version_name_rejects_data_directory_names(tmp_path):
-    """安全门禁：即使传入 data 或 holdexar 字符串，也不能被认作版本名。"""
-    root = tmp_path / "installed"
-    root.mkdir()
-    staging = tmp_path / "staging"
-    staging.mkdir()
-
-    assert update_host._legacy_version_name(root, "data", staging) == "legacy_version"
-    assert update_host._legacy_version_name(root, "Holdexar", staging) == "legacy_version"
-    assert update_host._legacy_version_name(root, "versions", staging) == "legacy_version"
-
-
 def test_safe_replace_executable_fallback(tmp_path, monkeypatch):
     """运行中文档锁场景：shutil.copy2 报 PermissionError 时自动重命名原文件后再覆盖。"""
     src = tmp_path / "new.exe"
@@ -805,6 +599,45 @@ def test_windows_target_alias_cannot_replace_active_program(tmp_path, target):
     assert layout.read_transaction(root)["attemptId"] == "accepted-previous"
 
 
+def test_update_rejects_version_folder_as_install_root(tmp_path):
+    root = tmp_path / "app"
+    active = layout.get_version_exe(root, "0.3.5")
+    active.parent.mkdir(parents=True)
+    active.write_bytes(b"active")
+    layout.write_current_state(root, "0.3.5")
+    staging = tmp_path / "staging"
+    _create_mock_app_payload(staging, "0.3.6")
+
+    assert update_host.execute_update(
+        root=active.parent, staging_dir=staging, launch_on_finish=False,
+    ) is False
+    assert layout.get_current_version(root) == "0.3.5"
+    assert active.read_bytes() == b"active"
+
+
+def test_update_preserves_explicit_external_data_directory(tmp_path, monkeypatch):
+    root = tmp_path / "app"
+    active = layout.get_version_exe(root, "0.3.5")
+    active.parent.mkdir(parents=True)
+    active.write_bytes(b"active")
+    layout.write_current_state(root, "0.3.5")
+    data = tmp_path / "external-data"
+    staging = data / "update-staging"
+    _create_mock_app_payload(staging, "0.3.6")
+    with sqlite3.connect(data / "holdexar.db") as db:
+        db.execute("CREATE TABLE user_record(value TEXT)")
+        db.execute("INSERT INTO user_record VALUES ('preserved')")
+    monkeypatch.setattr(update_host, "probe_version_health", lambda *args, **kwargs: (True, "ready"))
+
+    assert update_host.execute_update(
+        root=root, staging_dir=staging, data_dir=data, launch_on_finish=False,
+    ) is True
+    assert layout.read_transaction(root)["dataDir"] == str(data.resolve())
+    assert not (root / "data" / "holdexar.db").exists()
+    with sqlite3.connect(data / "holdexar.db") as db:
+        assert db.execute("SELECT value FROM user_record").fetchone() == ("preserved",)
+
+
 def test_direct_install_cannot_replace_current_version(tmp_path):
     root = tmp_path / "app"
     active = layout.get_version_exe(root, "0.3.5")
@@ -816,70 +649,3 @@ def test_direct_install_cannot_replace_current_version(tmp_path):
     with pytest.raises(RuntimeError):
         update_host.install_version_payload(root, staging, "0.3.5")
     assert active.read_bytes() == b"preserve-active"
-
-
-def test_legacy_bridge_stops_before_changing_files_when_old_process_is_running(tmp_path, monkeypatch):
-    root = tmp_path / "app"
-    root.mkdir()
-    (root / f"{APP_NAME}.exe").write_bytes(b"original")
-    (root / "_internal").mkdir()
-    staging = tmp_path / "staging"
-    _create_mock_app_payload(staging, "0.3.6")
-    monkeypatch.setattr(update_host, "wait_process_exit", lambda *args, **kwargs: False)
-    changed = []
-    monkeypatch.setattr(update_host, "prepare_launcher_only", lambda *a, **kw: changed.append(True) or False)
-    assert update_host.bridge_legacy_update(staging, root, wait_pid=901, launch_on_finish=False) is False
-    assert changed == []
-    assert (root / f"{APP_NAME}.exe").read_bytes() == b"original"
-
-
-def test_legacy_bridge_keeps_external_data_and_its_staged_payload(tmp_path, monkeypatch):
-    root = tmp_path / "app"
-    _flat_legacy(root)
-    (root / "data" / "holdexar.db").unlink()
-    data = tmp_path / "external-data"
-    staging = data / "update-staging"
-    _create_mock_app_payload(staging, "0.3.6")
-    conn = sqlite3.connect(data / "holdexar.db")
-    conn.execute("CREATE TABLE user_record(value TEXT)")
-    conn.execute("INSERT INTO user_record VALUES ('preserved')")
-    conn.commit()
-    conn.close()
-    (data / "other-user-file").write_bytes(b"preserved")
-    monkeypatch.setattr(update_host, "probe_version_health", lambda *a, **kw: (True, "ready"))
-    assert update_host.bridge_legacy_update(staging, root, data_dir=data,
-        current_version="0.3.2-beta", launch_on_finish=False) is True
-    assert layout.read_transaction(root)["dataDir"] == str(data.resolve())
-    assert (data / "other-user-file").read_bytes() == b"preserved"
-    assert not (root / "data" / "holdexar.db").exists()
-    conn = sqlite3.connect(data / "holdexar.db")
-    assert conn.execute("SELECT value FROM user_record").fetchall() == [("preserved",)]
-    conn.close()
-
-
-def test_stale_legacy_bridge_cannot_rewrite_current_pointer(tmp_path):
-    root = tmp_path / "app"
-    active = layout.get_version_exe(root, "2.0.0")
-    active.parent.mkdir(parents=True)
-    active.write_bytes(b"active")
-    layout.write_current_state(root, "2.0.0")
-    staging = tmp_path / "staging"
-    _create_mock_app_payload(staging, "3.0.0")
-    assert update_host.bridge_legacy_update(staging, root, current_version="1.0.0",
-        skip_health_check=True, launch_on_finish=False) is False
-    assert layout.get_current_version(root) == "2.0.0"
-    assert active.read_bytes() == b"active"
-
-
-def test_legacy_bridge_rejects_version_folder_as_install_root(tmp_path):
-    root = tmp_path / "app"
-    active = layout.get_version_exe(root, "1.0.0")
-    active.parent.mkdir(parents=True)
-    active.write_bytes(b"active")
-    layout.write_current_state(root, "1.0.0")
-    staging = tmp_path / "staging"
-    _create_mock_app_payload(staging, "2.0.0")
-    assert update_host.bridge_legacy_update(staging, active.parent,
-        current_version="1.0.0", skip_health_check=True, launch_on_finish=False) is False
-    assert not (active.parent / "versions").exists()
-    assert layout.get_current_version(root) == "1.0.0"
