@@ -391,12 +391,10 @@ def _hb_headers() -> dict:
 
 
 async def _strategy_proxy() -> str | None:
-    try:
-        from app.domains.proxies import service as proxies_service
+    """按代理策略引擎解析出网代理；引擎不可用时 None（直连）。"""
+    from app.domains.proxies.service import strategy_proxy_or_direct
 
-        return await proxies_service.resolve_proxy_url()
-    except Exception:  # noqa: BLE001
-        return None
+    return await strategy_proxy_or_direct()
 
 
 async def _fetch_membership_page(

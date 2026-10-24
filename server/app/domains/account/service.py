@@ -1379,17 +1379,10 @@ async def after_bind(steam_id: str) -> None:
 
 
 async def _strategy_proxy() -> str | None:
-    """按代理策略引擎解析本次出网代理（代理策略走代理，直连策略 None）。
+    """按代理策略引擎解析出网代理；引擎不可用时 None（直连）。"""
+    from app.domains.proxies.service import strategy_proxy_or_direct
 
-    steamcommunity / api.steampowered.com 直连常被墙，默认策略应为 proxy_first。
-    策略引擎不可用（表缺失等）时回退直连。
-    """
-    try:
-        from app.domains.proxies import service as proxies_service
-
-        return await proxies_service.resolve_proxy_url()
-    except Exception:  # noqa: BLE001
-        return None
+    return await strategy_proxy_or_direct()
 
 
 # ── 旧单账号 KV → 多账号表 迁移（启动幂等）──────────────────

@@ -86,8 +86,6 @@ GRAY_SUFFIX = "_BW"
 # 游戏行来源（achievement_games.source）
 SOURCE_OWNED = "owned"    # 本号已购（含玩过的免费游戏）
 SOURCE_SHARED = "shared"  # 库外：家庭共享池里本号未拥有、但已达成成就
-SOURCE_MANUAL = "manual"  # 手动补录（免费周末 / 已移除那类无法枚举的库外游戏）
-EXTERNAL_SOURCES = (SOURCE_SHARED, SOURCE_MANUAL)
 
 
 class SyncError(Exception):

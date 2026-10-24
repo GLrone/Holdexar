@@ -61,10 +61,6 @@ class Board:
     # False=临时队列——只补游戏商店差集、不落监控池（specials 专用）
     pool: bool = False
 
-    @property
-    def cache_key(self) -> str:
-        return self.key
-
 
 BOARDS: dict[str, Board] = {
         # 热销榜：发现面拉满 5 页 = 500 条（初始游戏库的来源之一，预设池登记
@@ -129,12 +125,10 @@ _board_locks: dict[str, asyncio.Lock] = {key: asyncio.Lock() for key in BOARDS}
 
 
 async def _strategy_proxy() -> str | None:
-    try:
-        from app.domains.proxies import service as proxies_service
+    """按代理策略引擎解析出网代理；引擎不可用时 None（直连）。"""
+    from app.domains.proxies.service import strategy_proxy_or_direct
 
-        return await proxies_service.resolve_proxy_url()
-    except Exception:  # noqa: BLE001
-        return None
+    return await strategy_proxy_or_direct()
 
 
 def _board_of(key: str) -> Board:

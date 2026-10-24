@@ -256,7 +256,7 @@ def _family_region_prices(
     （baseline 语义），其余行若 appids 与主产品无交集（异种产品，见 bundle
     61597 = sub 347440 污染），整行剔除——锁区判定/最低价不再被带偏。
     同一行的 app_ids 在本函数里要用三次以上（挑主行 / 同族过滤 / 区域表），
-    逐行只解析一次——14 万行各跑两遍 json.loads 曾是聚合耗时的大头之一。
+    逐行只解析一次（同一行要用三次以上，重复 json.loads 是纯开销）。
     memo 挂在行主键上且只活在本次调用里（局部字典，不占常驻内存）。
 
     返回 (region_prices, baseline_appids)；条目字段：
@@ -603,8 +603,8 @@ async def _load_all_locked(
     key: tuple, rates: dict[str, float], sort: str
 ) -> tuple[list, dict[int, list], dict[str, float]]:
     global _DATA_CACHE
-    # Core 列查询（不构造 ORM 实体）：14.1 万行价格装载从 2.2s 降到亚秒级——
-    # identity map 与实体构造对只读行是纯开销（这些行从不回写）。
+    # Core 列查询（不构造 ORM 实体）：identity map 与实体构造对只读行是纯开销
+    # （这些行从不回写）。
     # 排序在 SQL 层完成（ORDER BY 排序快照列：diff_fen | smart_score DESC，
     # 排序参数决定；smart_score NULL 排尾部——快照未重建的行不冒充前排）——
     # GET 不做 Python sort；等价 id 序（bundle_id）保证同分/同差价时分页/缓存稳定。
