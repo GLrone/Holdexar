@@ -12,7 +12,7 @@
    模块级缓存，跨页签、跨页签重挂载复用。 */
 import { ref } from 'vue'
 
-import { gamesApi, type FamilyLibGame, type GamePriceContext, type GamePriceContextItem } from '@/api/client'
+import { gamesApi, type FamilyLibGame, type GamePriceContextItem } from '@/api/client'
 
 export interface HitGame {
   appid: number

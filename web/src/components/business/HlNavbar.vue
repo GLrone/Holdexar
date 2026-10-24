@@ -257,15 +257,6 @@ onBeforeUnmount(() => {
   border-radius: 6px;
   overflow: hidden;
 }
-</style>
-
-<style scoped>
-.layout-switch {
-  display: flex;
-  border: 1px solid var(--border-soft);
-  border-radius: 6px;
-  overflow: hidden;
-}
 
 .layout-switch__btn {
   border: none;

@@ -44,9 +44,5 @@ export const useOwnershipStore = defineStore('ownership', () => {
     }
   }
 
-  function invalidate() {
-    map.value = {}
-  }
-
-  return { map, ensure, invalidate }
+  return { map, ensure }
 })

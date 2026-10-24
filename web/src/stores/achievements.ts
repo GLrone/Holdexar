@@ -149,12 +149,6 @@ export const useAchievementsStore = defineStore('achievements', () => {
     }
   }
 
-  /** 取全量游戏行（排序交给本地 computed；后端排序参数仅供其它调用方） */
-  async function refreshGames(): Promise<void> {
-    const payload = await achievementsApi.games('all', 'name', '', account.value)
-    allGames.value = payload.games
-  }
-
   async function load(force = false): Promise<void> {
     if (loading.value) return
     // keep-alive 重进时数据已在内存且非强制 → 直接用现值（切回零请求零重渲）。
@@ -239,7 +233,6 @@ export const useAchievementsStore = defineStore('achievements', () => {
     account,
     accounts,
     summary,
-    allGames,
     games,
     loading,
     error,
@@ -249,16 +242,13 @@ export const useAchievementsStore = defineStore('achievements', () => {
     sync,
     activeSync,
     syncing,
-    kicked,
     load,
     loadAccounts,
     setAccount,
     attach,
     startSync,
-    refreshGames,
     setFilter,
     setSort,
     setSearch,
-    stopPolling,
   }
 })

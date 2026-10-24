@@ -39,7 +39,7 @@ import HlChip from '@/components/ui/HlChip.vue'
 import HlDropdown from '@/components/ui/HlDropdown.vue'
 import HlInput from '@/components/ui/HlInput.vue'
 import { message } from '@/components/ui'
-import { useElementPicker, type PickedElement } from '@/composables/useElementPicker'
+import { useElementPicker } from '@/composables/useElementPicker'
 
 /**
  * 领航台对话核心（抽屉与整页 /pilot 共用同一实现——一事实一实现）。
@@ -311,8 +311,6 @@ const scrollBox = ref<HTMLDivElement | null>(null)
 const pilotModel = ref('')
 // 三态：null=尚未拿到配置（不渲染，避免误报「未配置」）/ true=可用 / false=确认未配
 const pilotReady = ref<boolean | null>(null)
-const pilotModels = ref<string[]>([])
-const pilotDisabled = ref<string[]>([])
 // 多供应商：菜单按厂商分组收敛/展开（活跃组默认展开）
 const pilotProviders = ref<PilotProvider[]>([])
 const pilotActiveId = ref('')
@@ -492,16 +490,6 @@ function dropDraft(sid: string) {
 }
 
 const OPEN_SIDS_KEY = 'holdexar-pilot-open-sids'
-
-function readOpenSids(): string[] {
-  try {
-    const raw = localStorage.getItem(OPEN_SIDS_KEY)
-    const arr = raw ? JSON.parse(raw) : []
-    return Array.isArray(arr) ? arr.filter((x) => typeof x === 'string') : []
-  } catch {
-    return []
-  }
-}
 
 function saveOpenSids() {
   try {
@@ -3431,7 +3419,7 @@ function triggerFollowUp(prompt: string) {
                 </div>
                 <div class="pilot-modelpick__foot">
                   <button type="button" class="pilot-modelpick__manage" @click="goSettings">
-                    {{ t(pilotModels.length ? 'pilot.modelMenu.manage' : 'pilot.modelMenu.empty') }}
+                    {{ t('pilot.modelMenu.empty') }}
                   </button>
                 </div>
               </div>
@@ -4008,10 +3996,6 @@ function triggerFollowUp(prompt: string) {
 .pilot-tab.is-current {
   border-color: var(--accent-a30);
   background: var(--accent-a10);
-}
-
-.pilot-tab.is-armed {
-  border-color: var(--danger);
 }
 
 .pilot-tab__cur {
@@ -5840,13 +5824,6 @@ function triggerFollowUp(prompt: string) {
   font-weight: 600;
   color: var(--text-secondary);
   margin-bottom: 6px;
-}
-
-.pilot-briefing__text {
-  margin: 0;
-  font-size: 13px;
-  line-height: 1.7;
-  color: var(--text-primary);
 }
 
 .pilot-cands-grid {

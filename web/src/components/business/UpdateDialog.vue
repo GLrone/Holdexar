@@ -707,10 +707,6 @@ function onClose(): void {
   color: var(--text-muted);
 }
 
-.upd-auto {
-  font-size: 12.5px;
-}
-
 .upd-prefs {
   display: flex;
   flex-direction: column;

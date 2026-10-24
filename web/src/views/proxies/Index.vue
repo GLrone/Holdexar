@@ -2054,19 +2054,6 @@ async function loadHealthRuns() {
   cursor: not-allowed;
 }
 
-.pxbtn--primary {
-  background: var(--accent-fill);
-  border-color: var(--accent-fill);
-  color: var(--on-accent-fill);
-  font-weight: 600;
-}
-
-.pxbtn--primary:hover:not(:disabled) {
-  background: var(--accent-fill-hover);
-  border-color: var(--accent-fill-hover);
-  color: var(--on-accent-fill);
-}
-
 .pxbtn--danger:hover:not(:disabled) {
   border-color: var(--danger);
   color: var(--danger);

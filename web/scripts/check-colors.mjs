@@ -79,19 +79,6 @@ const ALLOW = [
       '逐个色值登记等于把同一份色板抄两遍，改一处必漏另一处。',
   },
   {
-    file: 'src/components/ui/HlGooeyNav.vue',
-    colors: [
-      '#66c0f4', '#1a9fff', '#a4ce3d', '#60a820',
-      '#ab57dd', '#782bb0', '#e5e4e2', '#8f98a0',
-      '#ffffff',
-    ],
-    reason:
-      'GooeyNav 的 **8 色粒子色板**（`COLOR_VARS`，写进行内 `--color` 供 .hl-gn-point 取用）：' +
-      '粒子要的是「彼此可区分」而非语义，且刻意不随主题变。' +
-      '（导航项本身的选中色不在这里——那是 CSS 的 `var(--accent)` + `var(--on-accent)`。）' +
-      "`#ffffff` 是 `COLOR_VARS[color] ?? '#fff'` 的回退值，与 `var(--x, 字面量)` 同性质。",
-  },
-  {
     file: 'src/views/achievements/Index.vue',
     colors: ['#ffffff'], // 比对用归一化值（源码写 #fff，norm() 后为 #ffffff）
     reason:

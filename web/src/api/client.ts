@@ -54,7 +54,6 @@ const inflightGets = new Map<string, Promise<unknown>>()
  * 要么登记在这里，要么调用 request 时显式传 { noCache: true }。 */
 const NO_CACHE_PATHS = [
   '/account', // 顶栏每分钟轮转（在线状态/游戏中）
-  '/proxies/stats', // 仪表盘 30s 轮询
   '/bills/sync', // 账单同步进行中的快照轮询
   '/crawl/active', // 任务状态（页内刷新）
   '/crawl/jobs',
@@ -149,12 +148,6 @@ async function request<T>(
 }
 
 // ─── 类型 ────────────────────────────────────────────────
-
-export interface RegionInfo {
-  code: string
-  name: string
-  currency: string
-}
 
 export interface SettingsPayload {
   theme: 'dark' | 'light'
@@ -640,9 +633,7 @@ export interface PilotAskResponse {
 export interface PilotAttachmentRef {
   id: string
   name: string
-  /** 字符数 */
   chars: number
-  /** 行数 */
   lines: number
   created_at?: string | null
 }
@@ -710,8 +701,6 @@ export const pilotApi = {
   ) => request<PilotProvider>('PUT', `/pilot/providers/${encodeURIComponent(id)}`, payload),
   deleteProvider: (id: string) =>
     request<{ ok: boolean }>('DELETE', `/pilot/providers/${encodeURIComponent(id)}`),
-  ask: (question: string, appid?: number) =>
-    request<PilotAskResponse>('POST', '/pilot/ask', { question, appid }),
   /** 长文本落盘为附件：粘贴超阈值时先存，提问只带引用 id */
   createAttachment: (sessionId: string, text: string, name?: string) =>
     request<PilotAttachmentRef>('POST', '/pilot/attachments', {
@@ -731,12 +720,6 @@ export const pilotApi = {
   /** 会话账本读取（历史轮还原）；无会话返回 404 */
   getSession: (sessionId: string) =>
     request<PilotSessionOut>('GET', `/pilot/sessions/${encodeURIComponent(sessionId)}`, undefined, { noCache: true }),
-  /** 手动归档：早期轮次蒸馏进要点存档（与自动压缩同一实现）；机器码见 reason */
-  compactSession: (sessionId: string) =>
-    request<{ ok: boolean; reason?: string | null; summary_through?: number; turn_total?: number }>(
-      'POST',
-      `/pilot/sessions/${encodeURIComponent(sessionId)}/compact`,
-    ),
   /** 历史会话清单（mtime 倒序投影；置顶在前）。q 给定时按关键词过滤 */
   listSessions: (limit = 50, q = '') =>
     request<{ items: PilotSessionListItem[] }>(
@@ -807,9 +790,6 @@ export const pilotApi = {
 
 /** 运行账本（agent 域）：后台任务的只读投影 + 取消。与调度器同一事实源 */
 export const agentApi = {
-  /** 可调度任务形态白名单（kind → 标签键，后端登记表投影） */
-  listTasks: () =>
-    request<{ kind: string; label: string }[]>('GET', '/agent/tasks', undefined, { noCache: true }),
   /** 最近运行列表（新→旧）；status 给定时按状态过滤 */
   listRuns: (status?: string, limit = 20) =>
     request<{ items: AgentRunView[] }>(
@@ -824,14 +804,6 @@ export const agentApi = {
       'POST',
       `/agent/runs/${encodeURIComponent(runId)}/cancel`,
       { reason },
-    ),
-  /** 运行事件回放（after_seq 游标续读） */
-  listEvents: (runId: string, afterSeq = 0, limit = 200) =>
-    request<{ run_id: string; items: AgentEventItem[] }>(
-      'GET',
-      `/agent/runs/${encodeURIComponent(runId)}/events?after_seq=${afterSeq}&limit=${limit}`,
-      undefined,
-      { noCache: true },
     ),
 }
 
@@ -848,13 +820,6 @@ export interface AgentRunView {
   created_at: string | null
   started_at: string | null
   finished_at: string | null
-}
-
-export interface AgentEventItem {
-  seq: number
-  event_type: string
-  payload: Record<string, unknown> | null
-  created_at: string | null
 }
 
 /** 会话账本里的一轮问答：后端落盘的历史投影，前端按其还原历史轮 */
@@ -897,7 +862,6 @@ export interface PilotSessionOut {
   session_id: string
   turns: PilotSessionTurn[]
   updated_at: string | null
-  /** 账本总轮数 */
   turn_total: number
   /** 已压缩进要点存档的轮数边界 */
   summary_through: number
@@ -1205,7 +1169,6 @@ export interface AccountStatus {
 
 export const accountApi = {
   status: () => request<AccountStatus>('GET', '/account'),
-  list: () => request<SteamAccountItem[]>('GET', '/account/list'),
   bindCookies: (cookies: string) =>
     request<AccountStatus>('PUT', '/account/cookies', { cookies }),
   setActive: (steamId: string) =>
@@ -1553,10 +1516,6 @@ export interface GamePriceContextItem {
   lowest: { cnyFen: number; discount: number; snapshotAt: string | null } | null
 }
 
-export interface GamePriceContext extends GamePriceContextItem {
-  region: string
-}
-
 export interface LinkedBundle {
   bundleId: number
   name: string
@@ -1796,9 +1755,6 @@ export const gamesApi = {
     ),
   versions: (appid: number | string) =>
     request<{ versions: GameVersionPrices[] }>('GET', `/games/${appid}/versions`),
-  // 截至某日的价格上下文（账单许可证命中条）：当时价 + 历史最低（标准版序列）
-  priceContext: (appid: number | string, date: string, region = 'cn') =>
-    request<GamePriceContext>('GET', `/games/${appid}/price-context${toQuery({ date, region })}`),
   // 批量（账单消费明细展开行补拉；服务端 ≤200 对截断）
   priceContextBatch: (items: { appid: number; date: string }[]) =>
     request<{ results: GamePriceContextItem[] }>('POST', '/games/price-context-batch', { items }),
@@ -2012,8 +1968,6 @@ export const watchPoolApi = {
 // ─── follows（关注列表：游戏卡星标 = 追踪池 manual 条目）──────────────────
 
 export const followsApi = {
-  /** 当前关注的 appid 全集（升序；星标状态一次性整表拉取） */
-  list: () => request<{ appids: number[] }>('GET', '/follows'),
   /** 关注：入追踪池 + manual 标（爬取最优先、同步免疫） */
   add: (appid: number) =>
     request<{ appid: number; followed: boolean }>('PUT', `/follows/${appid}`),
@@ -2502,28 +2456,12 @@ export interface ProxyEventItem {
   error: string | null
 }
 
-/** 仪表盘口径统计：手动池逐条计，Clash 按出口 IP 去重（一个出口 IP = 一个代理） */
-export interface ProxyPoolStats {
-  pool: { total: number; ok: number }
-  clash: {
-    running: boolean
-    subscriptionId: number | null
-    nodes: number
-    okNodes: number
-    exitIps: number
-    okExitIps: number
-  }
-  available: number
-  total: number
-}
-
 export const proxiesApi = {
   list: () =>
     request<{ items: ProxyItem[]; strategy: ProxyStrategy; subscriptions: ProxySubscriptionItem[] }>(
       'GET',
       '/proxies',
     ),
-  stats: () => request<ProxyPoolStats>('GET', '/proxies/stats'),
   add: (url: string, label?: string) =>
     request<{ added: number; items: ProxyItem[] }>('POST', '/proxies', { url, label }),
   update: (id: number, payload: { enabled?: boolean; label?: string }) =>
@@ -2535,11 +2473,6 @@ export const proxiesApi = {
     request<ProxyStrategy>('PUT', '/proxies/strategy', payload),
   events: (limit = 100) => request<ProxyEventItem[]>('GET', `/proxies/events${toQuery({ limit })}`),
   // 订阅（clash / plain 双方式，长期保存）
-  subscriptions: (kind?: 'clash' | 'plain') =>
-    request<{ items: ProxySubscriptionItem[] }>(
-      'GET',
-      `/proxies/subscriptions${toQuery({ kind })}`,
-    ),
   /** 显式取用完整订阅链接（列表里是掩码，编辑时才拉一次） */
   revealSubscriptionUrl: (id: number) =>
     request<{ id: number; url: string }>('GET', `/proxies/subscriptions/${id}/url`),
@@ -2601,8 +2534,6 @@ export const proxiesApi = {
       /** 订阅有效且导入时处于默认直连：已自动切到代理优先 */
       strategySwitched?: boolean
     }>('POST', `/proxies/subscriptions/${id}/import`),
-  /** 当前代理策略下解析出的代理 URL（null=直连）；商店页空态诊断用 */
-  resolveProxy: () => request<{ proxyUrl: string | null }>('GET', '/proxies/resolve'),
   clashStatus: () => request<ClashStatus>('GET', '/proxies/clash'),
   clashInstall: () =>
     request<{ ok: boolean; path?: string; version?: string; error?: string }>(
@@ -2630,11 +2561,6 @@ export const proxiesApi = {
     request<{ selected: number }>('POST', '/proxies/clash/select', { subscriptionId }),
   clashTestStart: () => request<ClashTestProgress>('POST', '/proxies/clash/test'),
   clashTestProgress: () => request<ClashTestProgress>('GET', '/proxies/clash/test/progress'),
-  clashHealthCheck: (force = false) =>
-    request<{ state: string; intervalHours: number }>(
-      'POST',
-      `/proxies/clash/health_check${toQuery({ force })}`,
-    ),
   clashStop: () => request<ClashStatus>('POST', '/proxies/clash/stop'),
 }
 
@@ -2681,11 +2607,9 @@ export const alertsApi = {
     request<PriceAlertItem>('PUT', `/alerts/${id}`, payload),
   remove: (id: number) => request<{ removed: boolean }>('DELETE', `/alerts/${id}`),
   events: (limit = 50) => request<AlertEventItem[]>('GET', `/alerts/events${toQuery({ limit })}`),
-  /** 删除单条触发历史 */
   removeEvent: (id: number) => request<{ removed: boolean }>('DELETE', `/alerts/events/${id}`),
   /** 清空全部触发历史，返回删除条数 */
   clearEvents: () => request<{ removed: number }>('DELETE', '/alerts/events'),
-  // SMTP 邮件设置
   getSmtp: () => request<SmtpConfig>('GET', '/alerts/smtp'),
   updateSmtp: (payload: SmtpConfigPayload) => request<SmtpConfig>('PUT', '/alerts/smtp', payload),
   /** 连通性测试：按表单当前值发测试邮件（密码空 = 用已存密码） */
@@ -3131,8 +3055,6 @@ export interface RedeemActivationList {
 export const redeemApi = {
   activateKeys: (keys: string[]) =>
     request<RedeemBatchResult>('POST', '/redeem/keys', { keys }),
-  freeClaims: (subids: number[]) =>
-    request<RedeemBatchResult>('POST', '/redeem/free', { subids }),
   quota: () => request<RedeemQuota>('GET', '/redeem/quota'),
   activations: (q: { limit?: number; offset?: number } = {}) =>
     request<RedeemActivationList>(
@@ -3912,8 +3834,6 @@ export interface ProxyJobRunItem {
   workers: number | null
   subscriptionIds: number[]
   snapshotIds: number[]
-  /** Active/Candidate 尚未实现：现在恒为 null */
-  activeSubscriptionId: number | null
   /** null = 此行没有错误汇总（与「零失败」不是一回事） */
   byError: Record<string, number> | null
   errorSummaryTruncated: boolean
@@ -4030,10 +3950,4 @@ export interface SteamEventsPayload {
 
 export const steamEventsApi = {
   list: () => request<SteamEventsPayload>('GET', '/steam-events'),
-  sync: () => request<{ count: number; backfilled: number; fetchedAt: string }>(
-    'POST',
-    '/steam-events/sync',
-    undefined,
-    { noCache: true },
-  ),
 }
