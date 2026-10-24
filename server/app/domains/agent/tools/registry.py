@@ -1,7 +1,7 @@
 """工具注册表：ToolSpec 登记（重名即错）、分组过滤与模型视图投影。"""
 from __future__ import annotations
 
-from app.domains.agent.tools.base import Group, Risk, ToolSpec
+from app.domains.agent.tools.base import Group, ToolSpec
 
 
 class ToolRegistry:
@@ -55,9 +55,6 @@ class ToolRegistry:
     def names_of_group(self, group: Group) -> frozenset[str]:
         return frozenset(n for n, s in self._specs.items() if s.group == group)
 
-    def risk_of(self, name: str) -> Risk | None:
-        s = self._specs.get(name)
-        return s.risk if s else None
 
 
 REGISTRY = ToolRegistry()

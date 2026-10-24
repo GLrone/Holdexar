@@ -20,34 +20,6 @@ _QUERY_CLEAN_RE = re.compile(
 )
 
 
-def clean_query_tokens(question: str) -> list[str]:
-    """问句清洗后的搜索词：先整句清洗，再拆 token（滤掉纯数字与单字）。"""
-    cleaned = _QUERY_CLEAN_RE.sub(" ", question or "").strip()
-    if not cleaned:
-        return []
-    tokens = [t for t in cleaned.split() if len(t) >= 2 and not t.isdigit()]
-    return [cleaned] + [t for t in tokens if t != cleaned]
-
-
-def extract_title(question: str) -> str | None:
-    """问句里《书名号》中的游戏名（写意图解析对象的优先词）。"""
-    m = _PRICE_TAG_RE.search(question or "")
-    return m.group(1) if m else None
-
-
-def extract_alert(question: str) -> tuple[str, float | None]:
-    """解析提醒条件。返回 (target_type, target_value_fen)：史低类无值；
-    价格类按「低于 N 块/元」取 N×100 分；解析不出数值返回 price + None
-    （调用方转指引，不臆造阈值）。"""
-    q = question or ""
-    if "史低" in q:
-        return "historic_low", None
-    m = _THRESH_RE.search(q)
-    if m:
-        return "price", int(float(m.group(1)) * 100)
-    return "price", None
-
-
 def pilot_store():
     """会话账本入口（延迟导入：pilot service 依赖工具层，反向取须函数内进行）。"""
     from app.domains.pilot import service as pilot_service

@@ -5,8 +5,6 @@
 """
 from __future__ import annotations
 
-import re
-
 # 视觉意图识别关键词（用于动态增强提示）
 _VISUAL_KEYWORDS = (
     "画", "图", "svg", "SVG", "绘制", "流程图", "架构图", "拓扑图", "走势图",

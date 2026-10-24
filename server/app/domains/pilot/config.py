@@ -25,7 +25,7 @@ from app.domains.pilot import model_windows as MODEL_WINDOWS
 from app.domains.settings import service as settings_service
 
 DEFAULT_MONTHLY_CAP = 0
-# 旧版默认上限：曾按 50 万 token 熔断月度用量——存量库迁移为不限（0）
+# 存量库里的旧默认上限：用于把已迁移为不限（0）的月度用量识别出来
 _LEGACY_DEFAULT_CAP = 500_000
 
 _ENABLED_KEY = "pilot.llm.enabled"
@@ -77,11 +77,6 @@ def _clean_tool_limit(raw) -> int:
     if value <= 0:
         return TOOL_CONTENT_LIMIT_DEFAULT
     return max(TOOL_CONTENT_LIMIT_MIN, min(TOOL_CONTENT_LIMIT_MAX, value))
-
-
-async def tool_content_limit() -> int:
-    """历史轮工具结果的保留预算（字符）；未设置回落默认。"""
-    return _clean_tool_limit(await settings_service.get_value(_TOOL_LIMIT_KEY, None))
 
 
 def _resolve_window(manual: int | None, auto: int | None) -> tuple[int | None, str]:

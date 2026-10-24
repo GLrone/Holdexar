@@ -186,3 +186,111 @@ async def test_detect_uses_provider_key_not_active(monkeypatch):
     assert captured["key"] == ""
     assert r.models == ["m"]
     assert r.reason is None
+
+
+OPENAI_FRAMES = [
+    'data: {"choices":[{"delta":{"reasoning_content":"想"}}]}',
+    'data: {"choices":[{"delta":{"content":"答"}}]}',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"f","arguments":"{\\"a\\""}}]}}]}',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":":1}"}}]}}]}',
+    'data: not-json',
+    'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+    'data: {"usage":{"prompt_tokens":100,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":60}}}',
+    'data: [DONE]',
+]
+
+RESPONSES_FRAMES = [
+    'data: {"type":"response.reasoning_summary_text.delta","delta":"思"}',
+    'data: {"type":"response.output_text.delta","delta":"文"}',
+    'data: {"type":"response.output_item.added","item":{"type":"function_call","item_id":"i1","call_id":"c1","name":"f","arguments":""}}',
+    'data: {"type":"response.function_call_arguments.delta","item_id":"i1","delta":"{\\"x\\":1}"}',
+    'data: {"type":"response.output_item.done","item":{"type":"function_call","item_id":"i1","call_id":"c1","name":"f","arguments":"{\\"x\\":1}"}}',
+    'data: {"type":"response.completed","response":{"usage":{"input_tokens":50,"output_tokens":9,"input_tokens_details":{"cached_tokens":10}}}}',
+]
+
+ANTHROPIC_FRAMES = [
+    'data: {"type":"message_start","message":{"usage":{"input_tokens":80,"cache_read_input_tokens":20,"cache_creation_input_tokens":5}}}',
+    'data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"推"}}',
+    'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"f"}}',
+    'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"p\\":2}"}}',
+    'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"文"}}',
+    'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":6}}',
+    'data: {"type":"message_stop"}',
+]
+
+OLLAMA_FRAMES = [
+    '{"message":{"thinking":"想"}}',
+    '{"message":{"content":"答"}}',
+    '{"message":{"tool_calls":[{"function":{"name":"f","arguments":{"a":1}}},{"function":{"name":"g","arguments":"{\\"b\\":2}"}}]}}',
+    '{"done":true,"prompt_eval_count":11,"eval_count":3}',
+]
+
+
+@pytest.mark.parametrize("protocol,frames,calls,usage,cache", [
+    ("openai", OPENAI_FRAMES, [{"id": "c1", "name": "f", "arguments": {"a": 1}}], (100, 7), 0.6),
+    ("responses", RESPONSES_FRAMES, [{"id": "c1", "name": "f", "arguments": {"x": 1}}], (50, 9), 0.2),
+    ("anthropic", ANTHROPIC_FRAMES, [{"id": "t1", "name": "f", "arguments": {"p": 2}}], (80, 6), 20 / 105),
+    ("ollama", OLLAMA_FRAMES, [
+        {"id": "ol-f-0", "name": "f", "arguments": {"a": 1}},
+        {"id": "ol-g-1", "name": "g", "arguments": {"b": 2}},
+    ], (11, 3), None),
+])
+@pytest.mark.asyncio
+async def test_protocol_stream_preserves_answer_tools_and_usage(protocol, frames, calls, usage, cache):
+    async def lines():
+        for frame in frames:
+            yield frame
+
+    events = [event async for event in getattr(pilot_llm, f"_{protocol}_parse")(lines())]
+    values = dict(events)
+    assert values["answer"] in ("答", "文")
+    assert values["thinking"] in ("想", "思", "推")
+    assert values["tool_calls"] == calls
+    assert values["usage"] == usage
+    assert values["context"] == (105 if protocol == "anthropic" else usage[0])
+    if cache is not None:
+        assert values["cache"]["rate"] == pytest.approx(cache)
+
+
+@pytest.mark.parametrize("protocol,frames,expected", [
+    ("openai", ['data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c9","function":{"name":"g","arguments":"{}"}}]}}]}'],
+     {"id": "c9", "name": "g", "arguments": {}}),
+    ("responses", RESPONSES_FRAMES[:5], {"id": "c1", "name": "f", "arguments": {"x": 1}}),
+])
+@pytest.mark.asyncio
+async def test_protocol_stream_flushes_tools_without_finish_frame(protocol, frames, expected):
+    async def lines():
+        for frame in frames:
+            yield frame
+
+    events = [event async for event in getattr(pilot_llm, f"_{protocol}_parse")(lines())]
+    assert dict(events)["tool_calls"] == [expected]
+
+
+@pytest.mark.parametrize("protocol", ["openai", "responses", "anthropic", "ollama"])
+def test_protocol_requests_preserve_tool_calls_and_results(protocol):
+    messages = [
+        {"role": "system", "content": "s"}, {"role": "user", "content": "u"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "f", "arguments": '{"a":1}'}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "res"},
+    ]
+    tools = [{"type": "function", "function": {
+        "name": "f", "description": "d", "parameters": {"type": "object"}}}]
+    _, _, body = getattr(pilot_llm, f"_{protocol}_request")("https://x/v1", "sk", "m", messages, tools)
+    assert body["stream"] is True
+    if protocol == "responses":
+        assert body["input"][-2:] == [
+            {"type": "function_call", "call_id": "c1", "name": "f", "arguments": '{"a":1}'},
+            {"type": "function_call_output", "call_id": "c1", "output": "res"},
+        ]
+        assert body["instructions"] == "s"
+    elif protocol == "anthropic":
+        assert body["messages"][-2]["content"] == [{"type": "tool_use", "id": "c1", "name": "f", "input": {"a": 1}}]
+        assert body["messages"][-1]["content"] == [{"type": "tool_result", "tool_use_id": "c1", "content": "res"}]
+        assert body["max_tokens"] == 6144
+    else:
+        assert body["messages"][-2]["content"] == ""
+        assert body["messages"][-1]["content"] == "res"
+        expected = {"name": "f", "arguments": {"a": 1}} if protocol == "ollama" else {"name": "f", "arguments": '{"a":1}'}
+        assert body["messages"][-2]["tool_calls"][0]["function"] == expected

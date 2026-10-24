@@ -1,6 +1,6 @@
-"""builtin 工具集：67 个 ToolSpec 按旧 tool_specs() 顺序登记进注册表。
+"""builtin 工具集：各 ToolSpec 按固定顺序登记进注册表。
 
-每工具预算（timeout_s）统一取 projection.budget_for（旧 tool_budget_s 分类），
+每工具预算（timeout_s）统一取 projection.budget_for（按工具分类取值），
 等价性由 test_agent_tools.py 全量对比钉住。"""
 from __future__ import annotations
 

@@ -7,7 +7,6 @@ import statistics
 from app.domains.account import service as account_service
 from app.domains.agent.tools.base import ToolSpec
 from app.domains.agent.tools.builtin import _shared
-from app.domains.agent.tools.projection import budget_for
 from app.domains.crawl import service as crawl_service
 from app.domains.games import service as games_service
 

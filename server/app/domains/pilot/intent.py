@@ -121,7 +121,4 @@ def route(question: str) -> str:
         return PRICE_ANALYSIS
     if any(w in q for w in _FIND_WORDS):
         return FIND_GAMES
-    if not guarded and any(w in q for w in _HOW_TO_WORDS):
-        # 守卫命中时疑问句落指引（教用户自己去操作），不放行写工具
-        return HOW_TO
     return CHAT

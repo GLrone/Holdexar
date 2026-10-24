@@ -4,17 +4,13 @@ P3 语义：写工具 + 守卫问句 → deny（模型改走 propose_bulk 交用
 审批挂起/恢复分支 P5 激活，deny 之外的判定序届时扩展，fail-closed。"""
 from __future__ import annotations
 
-from app.domains.agent.tools.base import Group, Risk, ToolSpec
+from app.domains.agent.tools.base import Group, ToolSpec
 
 GUARD_WORDS = ("清空", "删除", "移除", "移出", "停用", "停止", "批量", "全部", "所有")
 
 
 def is_guarded(text: str) -> bool:
     return any(w in (text or "") for w in GUARD_WORDS)
-
-
-def risk_of(spec: ToolSpec) -> Risk:
-    return spec.risk
 
 
 def decide(spec: ToolSpec, *, guarded: bool) -> str:

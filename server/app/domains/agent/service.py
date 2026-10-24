@@ -67,15 +67,6 @@ async def _next_seq(session, run_id: str) -> int:
     return int(current or 0) + 1
 
 
-async def create_session(title: str | None = None) -> dict:
-    sid = _new_id()
-    ts = _now()
-    async with write_session(WritePriority.INTERACTIVE, "agent_session") as session:
-        session.add(AgentSession(id=sid, title=title, created_at=ts, updated_at=ts))
-        await session.commit()
-    return {"session_id": sid, "title": title}
-
-
 async def create_run(
     *,
     session_id: str | None = None,
