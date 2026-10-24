@@ -49,10 +49,6 @@ _PRUNE_CHUNK = 5000
 _PRUNE_MAX_CHUNKS = 20
 
 
-def current_run_id() -> str | None:
-    return _current_run.get()
-
-
 async def _append_step(run_id: str, step: str, summary: dict | None) -> bool:
     try:
         await agent_service.append_event(

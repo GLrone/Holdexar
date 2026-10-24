@@ -668,37 +668,15 @@ def _card_of(tool_name: str, result: dict) -> dict | None:
     return None
 
 
-# 工具名 → 预期卡片类型（tool_start 事件的骨架占位提示）；行卡类工具回落 rows。
-# 与 _card_of 的结果→卡片映射同源维护，新增产卡工具两边同步。
-_CARD_KIND_HINTS: dict[str, str] = {
-    "get_price_briefing": "price",
-    "get_region_prices": "regions",
-    "compare_games": "compare",
-    "search_games": "games",
-    "recommend_games": "games",
-    "search_steam": "games",
-    "top_games": "games",
-    "price_drops": "games",
-    "epic_free": "epic",
-    "list_wishlist": "games",
-    "list_owned": "games",
-    "list_family_library": "games",
-    "audit_follows_workflow": "stepper",
-    "achievements_summary": "achievements",
-    "family_status": "family",
-    "propose_bulk": "proposal",
-    "propose_delete": "proposal",
-    "navigate": "navigate",
-    "present_ui": "structured",
-}
-
-_CARD_HINT_ROWS_TOOLS = ("proxy_exit_detail", "proxy_latency_test")
+# 行卡类工具回落 rows；卡片类型映射唯一事实源在 agent/tools/projection.py
+_CARD_HINT_ROWS_TOOLS = pilot_tools._CARD_HINT_ROWS_TOOLS
 
 
 def _card_kind_hint(tool_name: str) -> str | None:
     """tool_start 事件的卡片类型预告：前端在工具执行期先挂骨架占位卡。"""
-    if tool_name in _CARD_KIND_HINTS:
-        return _CARD_KIND_HINTS[tool_name]
+    hints = pilot_tools._CARD_KIND_HINTS
+    if tool_name in hints:
+        return hints[tool_name]
     if tool_name in _CARD_HINT_ROWS_TOOLS:
         return "rows"
     if tool_name in (pilot_tools._READ_TOOLS + pilot_tools._WRITE_TOOLS
@@ -711,27 +689,7 @@ _STRUCTURED_KINDS = frozenset({
     "structured", "metric-grid", "data-table", "time-series", "coverage-matrix", "status-board",
 })
 
-_CORE_CARD_KINDS = {
-    "proposal", "stepper", "price", "regions", "compare",
-    "games", "family", "achievements", "epic",
-    *_STRUCTURED_KINDS,
-}
 _MAX_CARDS_PER_TURN = 4
-
-
-def _should_admit_card(card: dict | None, current_cards: list[dict]) -> bool:
-    """卡片准入判定：单轮预算与并发限制，核心卡优先，辅助诊断卡去重。"""
-    if card is None or card in current_cards:
-        return False
-    if len(current_cards) >= _MAX_CARDS_PER_TURN:
-        return False
-    kind = card.get("kind")
-    has_core = any(c.get("kind") in _CORE_CARD_KINDS for c in current_cards)
-    if has_core and kind not in _CORE_CARD_KINDS and not card.get("componentId"):
-        return False
-    if kind == "rows" and any(c.get("kind") == "rows" for c in current_cards):
-        return False
-    return True
 
 
 # 跨轮卡片账本的回看窗口（轮数）与清单（供决策代理与模型同步消费）

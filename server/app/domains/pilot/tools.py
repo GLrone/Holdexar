@@ -6,12 +6,9 @@
 统一承载。"""
 from __future__ import annotations
 
-import re
-
 from app.domains.account import service as account_service
 from app.domains.achievements import service as achievements_service
 from app.domains.alerts import service as alerts_service
-from app.domains.alerts.notify import get_smtp_config, send_test_mail
 from app.domains.bills import service as bills_service
 from app.domains.bundles import service as bundles_service
 from app.domains.crawl import events as crawl_events_service
@@ -29,117 +26,40 @@ from app.domains.wishlist import follows as wishlist_follows
 from app.domains.wishlist import service as wishlist_service
 from app.domains.agent.runtime import executor as _executor
 from app.domains.agent.tools.builtin import _shared
-from app.domains.agent.tools.builtin.account import (
-    achievements_summary,
-    bills_summary,
-    family_status,
-    list_accounts,
-    list_family_library,
-    list_owned,
-    list_wishlist,
-    redeem_quota,
-    sync_achievements,
-    sync_bills,
-    sync_family,
-    sync_library,
-    sync_wallet,
-)
-from app.domains.agent.tools.builtin.catalog import (
-    _game_item,
-    _steam_storesearch,
-    ingest_appids,
-    recommend_games,
-    recommend_games_by_filters,
-    search_games,
-    search_steam,
-    top_games,
-)
-from app.domains.agent.tools.builtin.navigate import NAV_TARGETS
-from app.domains.agent.tools.builtin.offers import (
-    calendar_events,
-    epic_free,
-    hb_monthly,
-    price_drops,
-    rates_overview,
-    steam_free,
-)
-from app.domains.agent.tools.builtin.prefs import _get_user_preferences, _set_user_preference  # noqa: F401
+from app.domains.agent.tools.builtin.catalog import recommend_games, search_games
 from app.domains.agent.tools.builtin.prices import (
     _trend_series,
     compare_games,
-    diagnose_price,
     price_facts,
-    region_prices,
 )
-from app.domains.agent.tools.builtin.runtime_tools import (
-    _TASK_STATUS_ROW,
-    _task_row,
-    cancel_task,
-    list_sessions,
-    list_tasks,
-    read_session,
-    start_task,
-)
-from app.domains.agent.tools.builtin.system import (
-    _parse_ddg,
-    notify_test,
-    proxy_pool_status,
-    recent_job_failures,
-    refresh_game_price,
-    web_search,
-    write_gate_status,
-)
-from app.domains.agent.tools.builtin.tracking import (
-    audit_follows_workflow,
-    bundle_follow,
-    find_deletables,
-    list_alerts,
-    list_bundles,
-    list_bundle_follows,
-    list_follows,
-    monitor_add,
-    monitor_include,
-    alert_add,
-    propose_bulk,
-    propose_delete,
-    retry_removed,
-    region_toggle,
-    update_price_alert,
-    _scan_deletables,
-)
+from app.domains.agent.tools.builtin.system import _parse_ddg
+from app.domains.agent.tools.builtin.tracking import alert_add, monitor_add
 from app.domains.agent.tools.projection import (
     BUDGET_DEFAULT_S as _BUDGET_DEFAULT_S,
     BUDGET_SLOW_S as _BUDGET_SLOW_S,
     BUDGET_TASK_S as _BUDGET_TASK_S,
+    CARD_HINT_ROWS_TOOLS as _CARD_HINT_ROWS_TOOLS,
+    CARD_KIND_HINTS as _CARD_KIND_HINTS,
     CARD_TOOLS as _CARD_TOOLS,
     CORE_TOOLS as _CORE_TOOLS,
-    LABELS as _LABELS,
     LIST_TOOLS as _LIST_TOOLS,
     QUICK_TOOLS,
-    _NET_TOOLS,
     _READ_TOOLS,
     _SYNC_TOOLS,
     _TASK_TOOLS,
-    _TOOL_BUDGET_S,
     _WRITE_TOOLS,
     tool_step,
 )
 from app.domains.agent.tools.registry import REGISTRY
 
-# 触发 builtin 登记（58 个 ToolSpec 进注册表）
-from app.domains.agent.tools.builtin import catalog as _catalog  # noqa: F401 — 触发 58 工具注册
+# 触发 builtin 登记（工具全集由注册表自持，此处不保存数量）
+from app.domains.agent.tools.builtin import catalog as _catalog  # noqa: F401 — 触发内置工具注册
 
-_FIND_LIMIT = _shared._FIND_LIMIT
-_READ_ROWS_LIMIT = _shared._READ_ROWS_LIMIT
 _BULK_MAX_ITEMS = _shared._BULK_MAX_ITEMS
-_BULK_ACTIONS = _shared._BULK_ACTIONS
-_STEAM_SEARCH_LIMIT = 5
 _INGEST_MAX = 20
-_COMPARE_MAX = 3
 _TREND_MAX_POINTS = 72
 
 _PRICE_TAG_RE = _shared._PRICE_TAG_RE
-_PRICE_NUM_RE = _shared._PRICE_NUM_RE
 _THRESH_RE = _shared._THRESH_RE
 _QUERY_CLEAN_RE = _shared._QUERY_CLEAN_RE
 
@@ -154,14 +74,6 @@ CORE_TOOLS = _CORE_TOOLS
 
 LIST_TOOLS = _LIST_TOOLS
 """按需解锁工具（builtin/info.py）。"""
-
-ATTACHMENT_TOOL = "read_attachment"
-"""附件读取工具（builtin/attachment.py）。
-
-常驻可见，不随轮次增减：工具表是请求前缀的一部分，按轮开关会让「system +
-工具表」这截前缀在两态之间来回翻，每次翻转都要把整段历史按未缓存重算一遍。
-常驻的代价只是一份固定说明。"""
-
 
 def clean_query_tokens(question: str) -> list[str]:
     """问句清洗后的搜索词：先整句清洗，再拆 token（滤掉纯数字与单字）。"""

@@ -114,12 +114,6 @@ def budget_for(name: str) -> float:
     return _TOOL_BUDGET_S.get(name, BUDGET_DEFAULT_S)
 
 
-# 旧名兼容（test 断言引用）
-_BUDGET_DEFAULT_S = BUDGET_DEFAULT_S
-_BUDGET_SLOW_S = BUDGET_SLOW_S
-_BUDGET_TASK_S = BUDGET_TASK_S
-
-
 def tool_step(name: str, result: dict) -> dict:
     """工具执行结果 → 时间线步骤条目。
 
@@ -252,7 +246,7 @@ def tool_step(name: str, result: dict) -> dict:
 
 
 # 机器名 → 用户面步骤词条片段（label 与 i18n key `pilot.step.{label}` 对应）。
-# 机器名只进模型协议与日志，不进用户面。来源：旧 TOOL_META 全量 58 条（+感知三件 63）。
+# 机器名只进模型协议与日志，不进用户面。
 LABELS: dict[str, str] = {
     "search_games": "search",
     "get_price_briefing": "price",

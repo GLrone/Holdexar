@@ -30,18 +30,6 @@ EV_TASK_STARTED = "task.started"
 EV_TASK_PROGRESS = "task.progress"
 EV_TASK_FAILED = "task.failed"
 
-EVENT_TYPES = (
-    EV_RUN_STATE,
-    EV_RUN_FINISHED,
-    EV_TURN_RECEIVED,
-    EV_STEP_STARTED,
-    EV_STEP_COMPLETED,
-    EV_CANCEL_REQUESTED,
-    EV_TASK_STARTED,
-    EV_TASK_PROGRESS,
-    EV_TASK_FAILED,
-)
-
 # 事件类型 → 允许入账的 payload 键集（lifecycle / message / step / task /
 # cancel 元数据各归其类；usage / tool / approval / decision 元数据
 # 随对应阶段接入时在此登记）
