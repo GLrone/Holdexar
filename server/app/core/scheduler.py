@@ -1032,12 +1032,6 @@ async def _job_proxypool_cycle() -> None:
     try:
         # DEAD 恢复探测要打在**持有这些节点配置的内核**上：DEAD 不在池文件里，
         # 池内核不认识它们的名字；旧链路内核跑的就是整条订阅，认识全部节点。
-        # 旧链路内核没在跑（controller_url 为空）时本项自动跳过。
-        legacy = _cm.runtime
-        legacy_controller = (
-            (legacy.controller_url, legacy.secret)
-            if getattr(legacy, "controller_url", None) else None
-        )
         # 探测/重建/维护全程不持写闸：周期可达分钟级，长持闸会把交互写入
         # 饿死到 busy_timeout。周期内落库各自在 write_gate 短临界区内完成
         # （含 rebuild 段），此处会话只承载读取与兜底收尾提交。
@@ -1050,7 +1044,6 @@ async def _job_proxypool_cycle() -> None:
                 runtime=_cm.pool_runtime,
                 exe_path=str(_cm.kernel_exe(data_dir)),
                 now=datetime.now(),
-                recovery_controller=legacy_controller,
             )
             async with write_gate(WritePriority.BACKGROUND):
                 await session.commit()
@@ -1073,7 +1066,7 @@ async def _job_proxypool_retention() -> None:
 
     删的是**观测**，不是身份：`proxy_job_runs` / `health_observations` /
     `orchestration_events` / `subscription_snapshots` 按各自保留期分块清理；
-    `proxy_nodes` / `proxy_node_sources` / `pool_generations` 一行不碰。
+    `proxy_nodes` / `pool_generations` 一行不碰。
 
     独立定时任务而非启动链一步：保留是**周期性**事务，不是启动一次性事务——本地软件
     不常驻，放启动链会在长会话里永远不跑。删除按
@@ -1213,10 +1206,10 @@ async def _job_subscription_refresh() -> None:
 
 
 async def _job_proxy_health() -> None:
-    """代理体检：手动代理池全测 + Clash 节点状态机检测。
+    """代理体检：手动代理池全测 + 订阅健康摘要（按权威节点账本聚合，不做探测）。
 
-    Clash 侧真正的节流靠 clash_nodes 账本 last_checked_at 的 6h 门槛
-    （跨重启有效——本地软件不常驻）；APScheduler 间隔只是兜底频率。
+    节点级探测归池维护（5min 拍内的 L1/L2）；本任务只把已落账事实聚合成
+    订阅行口径并驱动降级判定，替代旧的 6h 全量重测。
     """
     if not await content_fetch_enabled("proxy.health_auto"):
         await scheduler_bridge_note("proxy_health", {"skipped": "自动节点体检已关闭"})
@@ -1231,11 +1224,11 @@ async def _job_proxy_health() -> None:
             log_event(logger, "代理节点体检失败", level=logging.ERROR, exc_info=True)
 
     try:
-        state = await proxies_service.maybe_run_clash_health_check()
-        if state == "checked":
-            log_event(logger, "代理节点体检完成")
+        state = await proxies_service.refresh_subscription_health_summary()
+        if state == "refreshed":
+            log_event(logger, "订阅健康摘要已按节点账本刷新")
     except Exception:  # noqa: BLE001
-        log_event(logger, "代理节点体检失败", level=logging.ERROR, exc_info=True)
+        log_event(logger, "订阅健康摘要刷新失败", level=logging.ERROR, exc_info=True)
 
     # 体检后判定通道健康度：全灭 / 可用占比过低才发告警（12h 冷却，
     # 未配置任何通道视为用户选择，不告警）

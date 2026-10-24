@@ -32,7 +32,6 @@ class Settings(BaseSettings):
     # 版本号来源见 app_info.APP_VERSION（发版只改那一处）；此处的字段名保留
     # 是为了让 HOLDEXAR_VERSION 仍能覆盖它（打包/预发布时用得着）。
     version: str = APP_VERSION
-    host: str = "127.0.0.1"
     port: int = 28765
     data_dir: Path = Field(default_factory=_default_data_dir)
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:8080", "http://127.0.0.1:8080"]
@@ -44,10 +43,6 @@ class Settings(BaseSettings):
     @property
     def db_url(self) -> str:
         return f"sqlite+aiosqlite:///{(self.data_dir / self.db_filename).as_posix()}"
-
-    @property
-    def logs_dir(self) -> Path:
-        return self.data_dir / "logs"
 
     @property
     def web_dist_dir(self) -> Path:

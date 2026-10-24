@@ -37,19 +37,6 @@ from app.domains.settings.router import (  # noqa: E402
 )
 
 
-@pytest.fixture
-def tmp_data_dir(tmp_path, monkeypatch):
-    """临时数据目录 + 建表（teardown 清三重 lru_cache，防跨文件外溢）。"""
-    monkeypatch.setenv("HOLDEXAR_DATA_DIR", str(tmp_path))
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-    yield tmp_path
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-
-
 @pytest.mark.asyncio
 async def test_fetch_settings_defaults_and_roundtrip(tmp_data_dir):
     await init_db()
@@ -192,13 +179,12 @@ async def test_strategy_switches_roundtrip(tmp_data_dir):
 
 
 @pytest.mark.asyncio
-async def test_health_check_gate_respects_force(tmp_data_dir):
+async def test_health_summary_gate_respects_switch(tmp_data_dir):
     await init_db()
     await settings_service.set_value("proxy.health_auto", False)
-    assert await proxies_service.maybe_run_clash_health_check() == "disabled"
-    # force=True（页面手动检测）不受闸；此处内核未运行，落到 not_running 分支
-    state = await proxies_service.maybe_run_clash_health_check(force=True)
-    assert state == "clash_not_running"
+    assert await proxies_service.refresh_subscription_health_summary() == "disabled"
+    await settings_service.set_value("proxy.health_auto", True)
+    assert await proxies_service.refresh_subscription_health_summary() == "refreshed"
 
 
 @pytest.mark.asyncio

@@ -55,7 +55,7 @@ HISTORY_MARKER_KEY = "seed.history_imported_version"
 BUNDLES_MARKER_KEY = "seed.bundles_imported_version"
 
 # game_price_history 种子列（与 export_seed.py 的 GPH_COLS 同序同集，不含自增
-# id；不带 attach_browse_extras 的促销富化列）
+# id；不带促销描述与捆绑包扩展列）
 GPH_COLS = (
     "appid", "region_code", "currency", "price", "original_price",
     "discount_percent", "sub_id", "is_gold", "version_suffix", "is_bundle",

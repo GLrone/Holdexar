@@ -276,11 +276,6 @@ def decrypt_secret(token: str, purpose: str) -> str:
     raise last or SecretBoxError("凭据解密失败")
 
 
-def current_master() -> bytes:
-    """当前主密钥（换钥编排用）；锁定 / 损坏时抛 SecretBoxError。"""
-    return _current_master()
-
-
 def _current_master() -> bytes:
     try:
         return keyring.resolve_dmk(_data_dir())
@@ -311,7 +306,6 @@ __all__ = [
     "PREFIX",
     "SecretBoxError",
     "clear_key_cache",
-    "current_master",
     "decrypt_secret",
     "decrypt_with",
     "derive_purpose_key",

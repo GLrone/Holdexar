@@ -5,7 +5,9 @@ import asyncio
 import logging
 import os
 import re
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -132,15 +134,16 @@ async def _autostart_clash(*, snapshot_only: bool = False) -> None:
 
 
 def _kick_startup_health_check() -> None:
-    """启动体检后台点火（不阻塞收拾链）。
+    """订阅健康摘要后台点火（不阻塞收拾链）。
 
-    全量节点探测分钟级，在链上 await 曾是「开机到能用 ~230s」的绝对大头；
-    体检只刷新节点新鲜度，池 Runtime 装配与 lane 一致性闸（fail-closed）
-    不依赖它。6h 门槛节流不变；后台任务异常由体检函数自身吞掉。
+    只做账本聚合（存活统计/降级判定），不做探测——池 Runtime 装配与 lane
+    一致性闸（fail-closed）不依赖它；异常由摘要函数自身吞掉。
     """
     from app.domains.proxies import service as proxies_service
 
-    asyncio.get_running_loop().create_task(proxies_service.maybe_run_clash_health_check())
+    asyncio.get_running_loop().create_task(
+        proxies_service.refresh_subscription_health_summary()
+    )
 
 
 async def _startup_proxy_maintenance() -> None:
@@ -167,89 +170,83 @@ def _kick_startup_proxy_maintenance() -> None:
     )
 
 
-async def _post_startup_chain() -> None:
-    """监听后的「先开门，再收拾」链（约束见 AGENTS.md 启动链红线）。
+@dataclass(frozen=True)
+class _StartupStep:
+    """收拾链一步：fail_log 为空表示该步自兜异常或属必经动作（异常照常上抛）。"""
 
-    每步独立 try/except，失败只留日志不拖垮后续步骤；**顺序有语义**
-    （种子合并先于标记刷新——种子价格历史是史低/永降的输入；内核就位
-    先于 Clash 自启——自启以内核存在为前提），与旧 lifespan 内联顺序
-    逐一对齐，不做乱序调度。跑完才 `start_scheduler()`：种子合并单事务
-    BEGIN IMMEDIATE 持锁可达十几秒，引擎连接的 busy_timeout 若先到期，
-    定时任务的钱包/愿望单写入会撞锁失败——调度器排在链尾即无竞态。
-    """
-    from app.core.seed_assets import merge_seed_incremental
+    body: Callable[[], Awaitable[None]]
+    fail_log: str | None = None
+    level: int = logging.ERROR
+    tag: str | None = None
+    log_exc: bool = True
 
-    from app.domains.notifications.service import recover_delivery_state, resume_event_scans
 
-    try:
+async def _run_startup_steps(steps: list[_StartupStep]) -> None:
+    for step in steps:
+        if step.fail_log is None:
+            await step.body()
+            continue
+        try:
+            await step.body()
+        except Exception:  # noqa: BLE001 —— 收拾链各步互不拖垮，只留日志
+            log_event(
+                logger,
+                step.fail_log,
+                level=step.level,
+                exc_info=step.log_exc,
+                tag=step.tag,
+            )
+
+
+def _startup_steps() -> list[_StartupStep]:
+    async def recover_delivery() -> None:
+        from app.domains.notifications.service import recover_delivery_state
+
         await recover_delivery_state()
-    except Exception:
-        log_event(logger, "提醒投递状态恢复失败，不阻塞启动", level=logging.ERROR, exc_info=True)
 
-    try:
+    async def resume_scans() -> None:
+        from app.domains.notifications.service import resume_event_scans
+
         await resume_event_scans()
-    except Exception:
-        log_event(logger, "未完成的提醒生成仍保留，后续继续恢复", level=logging.ERROR, exc_info=True)
 
-    try:
+    async def merge_seeds() -> None:
+        from app.core.seed_assets import merge_seed_incremental
+
         await merge_seed_incremental()
-    except Exception:  # noqa: BLE001
-        log_event(logger, "增量种子合并失败，不阻塞启动", level=logging.ERROR, exc_info=True)
 
-    # 家庭库后台预热：实时聚合要逐成员调 Steam HTTPS（代理、秒级起步），
-    # 不预热的话每次启动后的首次打开都要干等。cached_family_library 自带
-    # 「快照优先 + 后台拉新」语义，这里只是把它提前到启动时触发；失败
-    # （无快照且实时不可用）只记日志，不影响启动。
-    from app.domains.family import service as family_service
+    async def warm_family_library() -> None:
+        from app.domains.family import service as family_service
 
-    try:
         await family_service.cached_family_library()
-    except Exception:  # noqa: BLE001
-        log_event(
-            logger,
-            "家庭库启动预热失败（无快照且实时聚合不可用），跳过",
-            tag="跳过",
-        )
 
-    from app.domains.crawl.service import cleanup_orphan_jobs
+    async def cleanup_orphans() -> None:
+        from app.domains.crawl.service import cleanup_orphan_jobs
 
-    try:
         await cleanup_orphan_jobs()
-    except Exception:  # noqa: BLE001
-        log_event(logger, "孤儿爬取任务清理失败，不阻塞启动", level=logging.ERROR, exc_info=True)
 
-    # 代理池两本台账（作业/体检）的上一进程遗留行收尸：函数内自兜失败
-    from app.domains.proxypool import jobruns as proxypool_jobruns
+    async def reap_jobruns() -> None:
+        from app.domains.proxypool import jobruns as proxypool_jobruns
 
-    await proxypool_jobruns.record_interrupted()
+        await proxypool_jobruns.record_interrupted()
 
-    # 汇率白名单清洗：41 区货币集（+ TRY/ARS 预留）之外的历史币种数据清除
-    from app.domains.rates import service as rates_service
+    async def cleanup_rates() -> None:
+        from app.domains.rates import service as rates_service
 
-    try:
         await rates_service.cleanup_disallowed()
-    except Exception:  # noqa: BLE001
-        log_event(logger, "汇率白名单清洗失败，不阻塞启动", level=logging.ERROR, exc_info=True)
 
-    # 旧 Clash 订阅设置 → 订阅表（一次性）
-    from app.domains.proxies import service as proxies_service
+    async def migrate_legacy_subscription() -> None:
+        from app.domains.proxies import service as proxies_service
 
-    try:
         await proxies_service.migrate_legacy_subscription()
-    except Exception:  # noqa: BLE001
-        log_event(logger, "旧版 Clash 订阅迁移失败，不阻塞启动", level=logging.ERROR, exc_info=True)
 
-    # 无出口自愈：订阅删光或全废弃后仍停在代理形态，作业会一直等不存在的
-    # 出口；按稳定事实校正回直连（用户显式选过的策略不动）
-    try:
+    async def revert_to_direct_if_abandoned() -> None:
+        from app.domains.proxies import service as proxies_service
+
         await proxies_service.maybe_revert_to_direct()
-    except Exception:  # noqa: BLE001
-        log_event(logger, "无代理出口策略自愈失败，不阻塞启动", level=logging.ERROR, exc_info=True)
 
-    # 旧单账号 Cookie KV → steam_accounts 多账号表（一次性）
-    from app.domains.account import service as account_service
+    async def migrate_legacy_kv() -> None:
+        from app.domains.account import service as account_service
 
-    try:
         migrated = await account_service.migrate_legacy_kv()
         if migrated:
             log_event(
@@ -257,68 +254,55 @@ async def _post_startup_chain() -> None:
                 "旧单账号 Cookie 已迁移至 Steam 多账号表",
                 detail={"迁移账号数": migrated},
             )
-    except Exception:  # noqa: BLE001
-        log_event(logger, "旧单账号 Cookie 迁移失败，不阻塞启动", level=logging.ERROR, exc_info=True)
 
-    # 存量明文凭据静态加密（幂等）：账号 Cookie 行与凭据类设置键封装为
-    # AES-256-GCM 密文，读取侧使用时解密；已带密文前缀的原样跳过
-    try:
+    async def seal_account_credentials() -> None:
+        from app.domains.account import service as account_service
+
         await account_service.seal_credentials_at_rest()
-    except Exception:  # noqa: BLE001 —— 读取侧兼容明文，本步失败不阻塞启动
-        log_event(logger, "存量凭据静态加密失败，不阻塞启动", level=logging.ERROR, exc_info=True)
 
-    # 存量明文订阅链接静态加密（幂等）：订阅表 + 快照 provenance 列封装为
-    # AES-256-GCM 密文，读取侧使用时解密；已带密文前缀的原样跳过
-    try:
+    async def seal_subscription_urls() -> None:
+        from app.domains.proxies import service as proxies_service
+
         await proxies_service.seal_subscription_urls()
-    except Exception:  # noqa: BLE001 —— 读取侧兼容明文，本步失败不阻塞启动
-        log_event(logger, "订阅链接静态加密失败，不阻塞启动", level=logging.ERROR, exc_info=True)
 
-    # 存量明文代理账号口令静态加密（幂等）：proxies 表两列，出网时解密
-    try:
+    async def seal_proxy_credentials() -> None:
+        from app.domains.proxies import service as proxies_service
+
         await proxies_service.seal_proxy_credentials()
-    except Exception:  # noqa: BLE001 —— 读取侧兼容明文，本步失败不阻塞启动
-        log_event(logger, "代理凭据静态加密失败，不阻塞启动", level=logging.ERROR, exc_info=True)
 
-    # 节点认证明文的落盘约束：收紧既有产物权限 + 清理上次崩溃留下的可重建副本
-    try:
+    async def tighten_node_secret_files() -> None:
         from app.domains.proxies import node_secret_files
 
         node_secret_files.tighten_all(get_settings().data_dir)
         node_secret_files.sweep_transient(get_settings().data_dir)
-    except Exception:  # noqa: BLE001 —— 权限收紧失败不阻塞启动
-        log_event(logger, "节点配置文件权限收紧失败", level=logging.WARNING, exc_info=True)
 
-    # 史低标记 + 永降标记 + 排序缓存预计算列 + 系列归组全库初始化
-    # （秒级；爬取后另有增量刷新）
-    from app.domains.games import service as games_service
-    from app.domains.games import series as games_series
+    async def refresh_hl_flags() -> None:
+        from app.domains.games import service as games_service
 
-    try:
         refreshed = await games_service.refresh_hl_flags()
         log_event(logger, "史低标记初始化完成", detail={"款数": refreshed})
-    except Exception:  # noqa: BLE001
-        log_event(logger, "史低标记初始化失败，不阻塞启动", level=logging.ERROR, exc_info=True)
-    try:
+
+    async def refresh_pp_flags() -> None:
+        from app.domains.games import service as games_service
+
         refreshed = await games_service.refresh_pp_flags()
         log_event(logger, "永降标记初始化完成", detail={"款数": refreshed})
-    except Exception:  # noqa: BLE001
-        log_event(logger, "永降标记初始化失败，不阻塞启动", level=logging.ERROR, exc_info=True)
-    try:
+
+    async def refresh_sort_cache() -> None:
+        from app.domains.games import service as games_service
+
         refreshed = await games_service.refresh_sort_cache()
         log_event(logger, "排序缓存初始化完成", detail={"款数": refreshed})
-    except Exception:  # noqa: BLE001
-        log_event(logger, "排序缓存初始化失败，不阻塞启动", level=logging.ERROR, exc_info=True)
-    try:
+
+    async def refresh_series() -> None:
+        from app.domains.games import series as games_series
+
         refreshed = await games_series.refresh_series()
         log_event(logger, "系列归组初始化完成", detail={"款数": refreshed})
-    except Exception:  # noqa: BLE001
-        log_event(logger, "系列归组初始化失败，不阻塞启动", level=logging.ERROR, exc_info=True)
 
-    # 内核资产检查必须早于内核自启；失败由前端安装入口兜底。
-    from app.domains.proxies import clash_manager
+    async def ensure_kernel() -> None:
+        from app.domains.proxies import clash_manager
 
-    try:
         installed = await asyncio.to_thread(
             clash_manager.ensure_kernel, get_settings().data_dir
         )
@@ -330,21 +314,16 @@ async def _post_startup_chain() -> None:
             )
         if installed.get("upgraded"):
             log_event(logger, "随包 Clash 内核已升级", detail={"版本": installed["upgraded"]})
-    except Exception:  # noqa: BLE001
-        log_event(logger, "随包 Clash 内核就位失败，不阻塞启动", level=logging.ERROR, exc_info=True)
 
-    # Proxy refresh and runtime initialization do not gate scheduler availability.
-    _kick_startup_proxy_maintenance()
+    async def kick_proxy_maintenance() -> None:
+        _kick_startup_proxy_maintenance()
 
-    # 汇率启动兜底：错过每日 03:00 定点（关机/服务重启）时按快照龄补刷新，
-    # 保证"每日自动抓取"承诺不因服务频繁重启落空（内含 >12h 阈值，幂等安全）
-    try:
+    async def refresh_rates_if_stale() -> None:
+        from app.domains.rates import service as rates_service
+
         await rates_service.refresh_if_stale()
-    except Exception:  # noqa: BLE001
-        log_event(logger, "汇率过期体检失败，不阻塞启动", level=logging.ERROR, exc_info=True)
-    # 历史缺口扫描（纯本地，零网络）：只记录待修复规模；外网修复归每日
-    # 04:00 的 fx_history_repair——配置 Provider Key 后启动不烧任何配额
-    try:
+
+    async def scan_rates_history_gaps() -> None:
         from app.domains.rates import history as rates_history
 
         scan = await rates_history.scan_history_gaps()
@@ -354,87 +333,120 @@ async def _post_startup_chain() -> None:
                 "汇率历史发现缺口，留待每日 04:00 修复任务处理",
                 detail={"缺口窗口数": len(scan["windows"]), "待修复对数": scan["totalPairs"]},
             )
-    except Exception:  # noqa: BLE001
-        log_event(logger, "汇率历史缺口扫描失败，不阻塞启动", level=logging.ERROR, exc_info=True)
 
-    # 捆绑包列表预热：全量聚合（25.8k 包 / 14.1 万行区域价）+ 12MB 预序列化
-    # 是秒级重活，不预热则用户首次进捆绑包页要干等整段聚合。排在汇率兜底
-    # 之后——列表缓存按汇率指纹失效，先刷汇率才不会预热出一份随即作废的
-    # 缓存。失败只记日志：请求路径仍按需重算，功能不受影响。
-    from app.domains.bundles import service as bundles_service
+    async def rebuild_bundle_sort_cache() -> None:
+        from app.domains.bundles import service as bundles_service
 
-    # 排序快照全库重建（bundles.min_cny_fen/diff_fen/is_lowest/smart_score）：
-    # 与 games 排序缓存同位——列表排序读快照列，不在请求期现算。必须早于列表
-    # 预热（预热出的是含快照字段的完整载荷）。
-    try:
         rebuilt = await bundles_service.refresh_bundle_sort_cache()
         log_event(logger, "捆绑包排序快照初始化完成", detail={"包数": rebuilt})
-    except Exception:  # noqa: BLE001
-        log_event(logger, "捆绑包排序快照初始化失败，不阻塞启动", level=logging.ERROR, exc_info=True)
-    # 快照重建后强制失效聚合/序列化缓存：开门（health 200）到本步完成之间，
-    # 早到的请求会用「重建前」的快照行建缓存，指纹不变就一直是旧行——预热
-    # 拿到的是过期载荷。失效后预热必然以新快照重建。
-    bundles_service.invalidate_bundles_cache()
 
-    try:
+    async def invalidate_bundles_cache() -> None:
+        from app.domains.bundles import service as bundles_service
+
+        bundles_service.invalidate_bundles_cache()
+
+    async def warmup_bundles() -> None:
+        from app.domains.bundles import service as bundles_service
+
         size = await bundles_service.warmup()
         log_event(logger, "捆绑包列表预热完成", detail={"体积MB": round(size / 1e6, 1)})
-    except Exception:  # noqa: BLE001
-        log_event(logger, "捆绑包列表预热失败，不阻塞启动", level=logging.ERROR, exc_info=True)
 
-    # Epic 喜加一快照预热：启动即后台拉新（不 await 网络轮），用户打开仪表盘
-    # 时刷新多半已完成；快照新鲜（30 分钟内）时零开销；失败只记日志，
-    # 请求路径仍有 stale-while-revalidate。
-    from app.domains.metadata import service as metadata_service
+    async def preheat_epic() -> None:
+        from app.domains.metadata import service as metadata_service
 
-    try:
         await metadata_service.preheat_epic_offers()
-    except Exception:  # noqa: BLE001
-        log_event(logger, "Epic 喜加一快照预热失败，不阻塞启动", level=logging.ERROR, exc_info=True)
 
-    # Steam 活动日历兜底同步：错过每日 05:00 定点时按快照龄补（>72h 才真正
-    # 抓取，幂等安全）；活动窗口是价格观测行周期标签的来源，排在调度器启动
-    # 前可让首轮观测带上标签。失败只记日志，旧数据继续展示。
-    try:
+    async def refresh_steam_events() -> None:
         from app.domains.steam_events import service as steam_events_service
 
         await steam_events_service.refresh_if_stale()
-    except Exception:  # noqa: BLE001
-        log_event(logger, "Steam 活动日历兜底同步失败，不阻塞启动", level=logging.ERROR, exc_info=True)
 
-    # 调度器在收拾链跑完后才启动（链首说明的写锁竞态；空窗几秒~十几秒
-    # 对 15min/6h 拍完全无感）
-    # Agent 孤儿 run 收尸：执行者随上轮进程消失，未终态 run 不可能再推进
-    try:
+    async def reap_agent_runs() -> None:
         from app.domains.agent import service as agent_service
 
         await agent_service.reconcile_orphan_runs()
-    except Exception:  # noqa: BLE001
-        log_event(logger, "Agent 孤儿运行收尸失败，不阻塞启动", level=logging.ERROR, exc_info=True)
-    start_scheduler()
-    # 内容源自定义刷新节奏（自动抓取页 KV）：注册用默认，这里落用户值
-    try:
+
+    async def start_core_scheduler() -> None:
+        start_scheduler()
+
+    async def apply_content_schedules() -> None:
         from app.core.scheduler import apply_content_schedules_from_settings
 
         await apply_content_schedules_from_settings()
-    except Exception:  # noqa: BLE001
-        log_event(logger, "内容源自定义刷新节奏应用失败，保持默认拍点", level=logging.ERROR, exc_info=True)
-    log_event(logger, "后台收拾链完成，服务已就绪（调度器已启动）")
 
-    # 按需补齐（调度器启动后，网络步骤不占开门链）：种子缺失时后台下载并
-    # 并入；全新安装的汇率全史 bootstrap。两者失败只留状态/日志，下次启动重来。
-    try:
+    async def announce_ready() -> None:
+        log_event(logger, "后台收拾链完成，服务已就绪（调度器已启动）")
+
+    async def ensure_seed_online() -> None:
         from app.core import seed_fetch
 
         await seed_fetch.ensure_seed_online()
-    except Exception:  # noqa: BLE001
-        log_event(logger, "种子按需获取失败，不阻塞启动", level=logging.ERROR, exc_info=True)
-    try:
+
+    async def bootstrap_rates_history() -> None:
         from app.domains.rates import history as rates_history
 
         await rates_history.bootstrap_full_history()
-    except Exception:  # noqa: BLE001
-        log_event(logger, "汇率全史初始化失败，不阻塞启动", level=logging.ERROR, exc_info=True)
+
+    return [
+        _StartupStep(recover_delivery, "提醒投递状态恢复失败，不阻塞启动"),
+        _StartupStep(resume_scans, "未完成的提醒生成仍保留，后续继续恢复"),
+        # 种子现价历史是史低/永降标记的输入，必须先合并再刷新标记
+        _StartupStep(merge_seeds, "增量种子合并失败，不阻塞启动"),
+        _StartupStep(
+            warm_family_library,
+            "家庭库启动预热失败（无快照且实时聚合不可用），跳过",
+            level=logging.INFO,
+            tag="跳过",
+            log_exc=False,
+        ),
+        _StartupStep(cleanup_orphans, "孤儿爬取任务清理失败，不阻塞启动"),
+        _StartupStep(reap_jobruns),  # 台账收尸函数内自兜失败
+        _StartupStep(cleanup_rates, "汇率白名单清洗失败，不阻塞启动"),
+        _StartupStep(migrate_legacy_subscription, "旧版 Clash 订阅迁移失败，不阻塞启动"),
+        # 无出口自愈：订阅删光仍停代理形态会让作业空等不存在的出口
+        _StartupStep(revert_to_direct_if_abandoned, "无代理出口策略自愈失败，不阻塞启动"),
+        _StartupStep(migrate_legacy_kv, "旧单账号 Cookie 迁移失败，不阻塞启动"),
+        # 三段静态加密均幂等且读取侧兼容明文，失败不阻塞启动
+        _StartupStep(seal_account_credentials, "存量凭据静态加密失败，不阻塞启动"),
+        _StartupStep(seal_subscription_urls, "订阅链接静态加密失败，不阻塞启动"),
+        _StartupStep(seal_proxy_credentials, "代理凭据静态加密失败，不阻塞启动"),
+        _StartupStep(tighten_node_secret_files, "节点配置文件权限收紧失败", level=logging.WARNING),
+        _StartupStep(refresh_hl_flags, "史低标记初始化失败，不阻塞启动"),
+        _StartupStep(refresh_pp_flags, "永降标记初始化失败，不阻塞启动"),
+        _StartupStep(refresh_sort_cache, "排序缓存初始化失败，不阻塞启动"),
+        _StartupStep(refresh_series, "系列归组初始化失败，不阻塞启动"),
+        # 内核就位必须早于 Clash 自启（自启以内核存在为前提），失败由前端安装入口兜底
+        _StartupStep(ensure_kernel, "随包 Clash 内核就位失败，不阻塞启动"),
+        # 代理刷新与运行时初始化是后台任务，不阻塞调度器可用性
+        _StartupStep(kick_proxy_maintenance),
+        _StartupStep(refresh_rates_if_stale, "汇率过期体检失败，不阻塞启动"),
+        # 只做本地缺口扫描，外网修复归每日 04:00 任务——启动不烧配额
+        _StartupStep(scan_rates_history_gaps, "汇率历史缺口扫描失败，不阻塞启动"),
+        # 汇率兜底在前防列表缓存按旧汇率指纹预热；排序快照必须早于列表预热
+        _StartupStep(rebuild_bundle_sort_cache, "捆绑包排序快照初始化失败，不阻塞启动"),
+        # 快照重建后强制失效聚合缓存，防预热拿到重建前的旧行
+        _StartupStep(invalidate_bundles_cache),
+        _StartupStep(warmup_bundles, "捆绑包列表预热失败，不阻塞启动"),
+        _StartupStep(preheat_epic, "Epic 喜加一快照预热失败，不阻塞启动"),
+        _StartupStep(refresh_steam_events, "Steam 活动日历兜底同步失败，不阻塞启动"),
+        _StartupStep(reap_agent_runs, "Agent 孤儿运行收尸失败，不阻塞启动"),
+        # 调度器最后启动：种子合并持锁可达十几秒，定时任务先跑会撞锁
+        _StartupStep(start_core_scheduler),
+        _StartupStep(apply_content_schedules, "内容源自定义刷新节奏应用失败，保持默认拍点"),
+        _StartupStep(announce_ready),
+        # 按需补齐是网络步骤，排调度器后不占开门链，失败下次启动重来
+        _StartupStep(ensure_seed_online, "种子按需获取失败，不阻塞启动"),
+        _StartupStep(bootstrap_rates_history, "汇率全史初始化失败，不阻塞启动"),
+    ]
+
+
+async def _post_startup_chain() -> None:
+    """监听后的「先开门，再收拾」链（约束见 AGENTS.md 启动链红线）。
+
+    步骤按 `_startup_steps()` 声明顺序执行，顺序不变量随表内注释标注；
+    `fail_log` 为空的步骤不兜异常（自兜或必经动作）。
+    """
+    await _run_startup_steps(_startup_steps())
 
 
 @asynccontextmanager

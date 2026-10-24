@@ -82,7 +82,7 @@ _SEED_TABLES = (
 _RUNTIME_TABLES = (
     "price_cycles", "crawl_jobs", "price_events", "subscription_snapshots",
     "proxy_job_runs", "proxy_events", "health_runs", "health_observations",
-    "worker_leases", "proxy_run_exits", "proxy_nodes", "proxy_node_sources",
+    "worker_leases", "proxy_run_exits", "proxy_nodes",
     "exit_groups", "lanes", "pool_generations", "orchestration_events",
     "notification_candidates", "agent_sessions", "agent_runs", "agent_events",
 )

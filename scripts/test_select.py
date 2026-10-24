@@ -112,13 +112,10 @@ def _scan_imports(path: Path) -> set[str]:
     pkg_parts = own.split(".")
     found: set[str] = set()
 
-    def _add(target: str) -> None:
-        found.add(target)
-
     for node in _structural_imports(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                _add(alias.name)
+                found.add(alias.name)
         elif isinstance(node, ast.ImportFrom):
             if node.level == 0:
                 base: list[str] = node.module.split(".") if node.module else []
@@ -132,10 +129,10 @@ def _scan_imports(path: Path) -> set[str]:
                 continue
             # 只记精确目标：包本身（__init__ 会执行）+ 点名的子模块；
             # 不记更高层祖先——否则一改 core 下任何文件就全图爆炸
-            _add(".".join(base))
+            found.add(".".join(base))
             for alias in node.names:
                 if alias.name != "*":
-                    _add(".".join(base + [alias.name]))
+                    found.add(".".join(base + [alias.name]))
     return found
 
 
