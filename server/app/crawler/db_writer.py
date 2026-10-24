@@ -1,7 +1,6 @@
 """SQLite 落库（SQLAlchemy async）。
 
 核心语义：UPSERT / 标准版选择（每区取 sub_id 最小）/ cny_fen 计算。
-bundle / repair 写入方法随对应功能迁入。
 """
 from __future__ import annotations
 
@@ -12,7 +11,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
-from sqlalchemy import case, delete, or_, select, text, update
+from sqlalchemy import case, delete, func, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core import seed_assets
@@ -32,8 +31,7 @@ from app.domains.games.models import (
 )
 from app.domains.rates.models import FxRate
 
-from .config import STALE_HOURS
-from .utils import get_beijing_time_obj, is_near_steam_refresh
+from .utils import get_beijing_time_obj
 
 logger = logging.getLogger(__name__)
 
@@ -70,11 +68,17 @@ def _history_upsert():
             text("COALESCE(sub_id, -1)"), text("COALESCE(price, 0)"), text("COALESCE(is_gold, 0)"),
         ],
         set_={
-            key: getattr(stmt.excluded, key)
-            for key in (
-                "currency", "original_price", "discount_percent", "version_suffix",
-                "is_bundle", "price_status", "cny_fen", "discount_end_ts", "steam_event_key",
-            )
+            **{
+                key: getattr(stmt.excluded, key)
+                for key in (
+                    "currency", "original_price", "discount_percent", "version_suffix",
+                    "is_bundle", "price_status", "cny_fen", "discount_end_ts", "steam_event_key",
+                )
+            },
+            **{
+                key: func.coalesce(getattr(stmt.excluded, key), getattr(GamePriceHistory, key))
+                for key in ("discount_desc", "bundle_id", "bundle_discount_pct")
+            },
         },
     )
 
@@ -106,8 +110,7 @@ _CURRENT_UPDATABLE = (
 # 超过即终态化（blocked），防止"该区根本无货"被当成可重试错误死磕。
 MISSING_MAX_RETRIES = 5
 
-# 批量 INSERT 的行数分块：SQLite 默认绑定变量上限 32766（15 列史行 ≈ 2184 行），
-# 400 款 × 多区多版本的全量史行一次 values() 会越限、整批炸到慢路径
+# 批量参数列表分块，限制单段内存与驱动调用规模。
 _INSERT_CHUNK_ROWS = 2000
 
 _GAME_DEFAULTED_COLUMNS = frozenset(
@@ -416,6 +419,9 @@ class DbWriter:
                             "price_status": status,
                             "cny_fen": cny_fen,
                             "discount_end_ts": p.get("discount_end_ts"),
+                            "discount_desc": p.get("discount_desc"),
+                            "bundle_id": p.get("bundle_id"),
+                            "bundle_discount_pct": p.get("bundle_discount_pct"),
                             "steam_event_key": event_key,
                             "snapshot_at": now_dt,
                         }
@@ -712,7 +718,7 @@ class DbWriter:
     async def upsert_task_batch(
         self, entries: list[tuple[dict, list[dict] | None]]
     ) -> list[bool]:
-        """一区一批（≤400 款）写完：拆 ~100 款的段逐段过写调度器提交。
+        """一区一批（≤300 款）写完：拆 ~100 款的段逐段过写调度器提交。
 
         每段独立事务（基线一次 + 决策纯函数化 + 四条批量语句 games / current /
         欠账结转 / history，段内含收尾保存点），段与段之间写者位空出——交互写
@@ -1029,7 +1035,7 @@ class DbWriter:
                     _tm = time.perf_counter()
                     await session.commit()
                     commit_ms += _ms_since(_tm)
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 — 段级失败只作废本段
                     # 段级失败只作废本段（其余段照常），与主路径段语义对齐
                     results[start : start + len(chunk)] = [False] * len(chunk)
                     log_event(
@@ -1071,57 +1077,6 @@ class DbWriter:
             await seed_assets.apply_curated(int(appid))
         except Exception as e:
             log_event(logger, "补建游戏占位行失败", level=logging.ERROR, detail={"原因": e})
-
-    async def get_known_bundle_ids(self, sub_ids: set[int]) -> set[int]:
-        """已入库的 bundle_id（bundle-as-sub 探测的持久缓存，跨重启免重复探测）。"""
-        if not sub_ids:
-            return set()
-        try:
-            async with get_session_factory()() as session:
-                rows = await session.execute(
-                    select(Bundle.bundle_id).where(Bundle.bundle_id.in_(sub_ids))
-                )
-                return {int(r) for r in rows.scalars()}
-        except Exception as e:
-            log_event(logger, "查询已知捆绑包失败", level=logging.ERROR, detail={"原因": e})
-            return set()
-
-    async def upsert_bundle_candidate(
-        self, bundle_id: int, name: str, app_ids: list[int]
-    ) -> None:
-        """bundle-as-sub 回填 bundles 表（must_purchase_as_set=1 语义）。
-
-        只写 name/app_ids/mps/updated_at 四列——header_image/url 等
-        其他来源（PG 导入/页面渠道）的字段不覆盖。
-        """
-        try:
-            async with write_session(WritePriority.BACKGROUND) as session:
-                stmt = sqlite_insert(Bundle).values(
-                    bundle_id=int(bundle_id),
-                    name=name or f"Bundle_{bundle_id}",
-                    must_purchase_as_set=1,
-                    app_ids=[int(a) for a in app_ids],
-                    updated_at=_naive(get_beijing_time_obj()),
-                )
-                await session.execute(
-                    stmt.on_conflict_do_update(
-                        index_elements=[Bundle.bundle_id],
-                        set_={
-                            "name": stmt.excluded.name,
-                            "app_ids": stmt.excluded.app_ids,
-                            "must_purchase_as_set": 1,
-                            "updated_at": stmt.excluded.updated_at,
-                        },
-                    )
-                )
-                await session.commit()
-        except Exception as e:
-            log_event(
-                logger,
-                f"回填捆绑包 {bundle_id} 失败",
-                level=logging.ERROR,
-                detail={"捆绑包": bundle_id, "原因": e},
-            )
 
     async def record_bundle_discoveries(self, discoveries: list[dict]) -> int:
         """捆绑包发现桩落库（游戏条目 purchase_options 白送的数据）。
@@ -1500,34 +1455,6 @@ class DbWriter:
         )
         return len(rows)
 
-    async def clear_removed_marks_batch(self, appids: list[int]) -> int:
-        """批量复活清标（独立调用方）：一次闸一事务。批量写路径走段内
-        保存点内联（_write_task_chunk），不经此处。"""
-        ids = [int(a) for a in dict.fromkeys(appids) if a]
-        if not ids:
-            return 0
-        try:
-            async with write_session(WritePriority.BACKGROUND) as session:
-                cleared = await self._clear_removed_marks_statements(session, ids)
-                if not cleared:
-                    return 0
-                await session.commit()
-                log_event(
-                    logger,
-                    f"{cleared} 款游戏重新有数据，已清除下架标记",
-                    tag="已修复",
-                    detail={"数量": cleared},
-                )
-                return cleared
-        except Exception as e:
-            log_event(
-                logger,
-                "批量清除下架标记失败",
-                level=logging.ERROR,
-                detail={"原因": e},
-            )
-            return 0
-
     async def coming_soon_retry_pairs(self, cooldown_days: int, limit: int) -> list[tuple[int, str]]:
         """COMING_SOON 重探候选：updated_at 冷却期满的暂缓行，appid 升序限量。
 
@@ -1641,44 +1568,6 @@ class DbWriter:
             )
         return tasks
 
-    async def get_discounted_appids(self) -> set[int]:
-        """获取所有当前正在打折的 appid。"""
-        try:
-            async with get_session_factory()() as session:
-                rows = await session.execute(
-                    select(GameCurrentPrice.appid).where(
-                        GameCurrentPrice.discount_percent > 0
-                    )
-                )
-                return {int(r) for r in rows.scalars()}
-        except Exception as e:
-            log_event(logger, "查询正在打折的游戏失败", level=logging.ERROR, detail={"原因": e})
-            return set()
-
-    async def get_crawled_appids(self) -> set[int]:
-        """已爬过价格的游戏 appid（白名单：ok 且有价的价格行存在）。
-
-        消费方（runner 首爬放行）以"不在白名单"判定未爬——天然覆盖
-        games 无行的从未入库形态（TOP100 反哺/手动列表的全新 appid）。
-        """
-        try:
-            async with get_session_factory()() as session:
-                rows = await session.execute(
-                    select(GameCurrentPrice.appid).where(
-                        GameCurrentPrice.price_status == "ok",
-                        GameCurrentPrice.price.is_not(None),
-                    )
-                )
-                return {int(r) for r in rows.scalars()}
-        except Exception as e:
-            log_event(
-                logger,
-                "查询已爬取价格的游戏失败",
-                level=logging.ERROR,
-                detail={"原因": e},
-            )
-            return set()
-
     async def get_uncrawled_appids(self) -> set[int]:
         """未爬过价格的游戏 appid（当前库内有行的部分）。
 
@@ -1716,46 +1605,3 @@ class DbWriter:
                 detail={"原因": e},
             )
             return set()
-
-    async def generate_queue_from_db(self, mode: str = "app") -> list[dict]:
-        """按新鲜度/打折状态生成任务队列（当前仅 app 模式；bundle/repair 待迁入）。"""
-        if mode != "app":
-            raise NotImplementedError(f"mode={mode} 尚未支持（待 bundle/repair 迁入）")
-
-        now_beijing = get_beijing_time_obj()
-        cutoff = now_beijing - timedelta(hours=STALE_HOURS)
-        tasks: list[dict] = []
-
-        async with get_session_factory()() as session:
-            force_all = is_near_steam_refresh(window_minutes=30)
-            if force_all:
-                log_event(logger, "检测到 Steam 折扣刷新时间窗口，本轮改为全量更新")
-            else:
-                log_event(
-                    logger,
-                    f"按超过 {STALE_HOURS} 小时未更新或当前正在打折的条件生成爬取队列",
-                    detail={"过期小时": STALE_HOURS},
-                )
-
-            query = select(Game.appid, Game.name).where(Game.type.in_(["GAME", "DLC"]))
-            if not force_all:
-                discounted = select(GameCurrentPrice.appid).where(
-                    GameCurrentPrice.discount_percent > 0
-                )
-                query = query.where(
-                    or_(
-                        Game.updated_at.is_(None),
-                        Game.updated_at < cutoff,
-                        Game.appid.in_(discounted),
-                    )
-                )
-            query = query.order_by(Game.appid)
-            for appid, name in (await session.execute(query)).all():
-                tasks.append({"type": "app", "id": int(appid), "name": name or ""})
-
-        log_event(
-            logger,
-            f"爬取队列生成完成，共 {len(tasks)} 个任务",
-            detail={"模式": mode, "任务数": len(tasks)},
-        )
-        return tasks

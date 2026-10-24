@@ -1,6 +1,6 @@
 """爬取内核配置。
 
-含端点、区服清单与限速参数（默认 60 请求/5 分钟）。
+含端点、区服清单与限速参数（数值以 rate_limit 的常量为准）。
 """
 from __future__ import annotations
 

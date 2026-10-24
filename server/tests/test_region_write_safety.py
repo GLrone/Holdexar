@@ -16,6 +16,81 @@ from app.domains.crawl.models import CrawlJob
 from app.domains.games.models import Game, GameCurrentPrice
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rate_limited", [False, True])
+async def test_request_retries_share_one_budget_and_record_missing_once(monkeypatch, rate_limited):
+    bs.reset_run_state()
+    requests, delays, missing = [], [], []
+
+    async def fetch(*args):
+        requests.append(1)
+        raise bs.SteamRateLimitError() if rate_limited else TimeoutError()
+
+    async def sleep(delay):
+        delays.append(delay)
+
+    async def mark(pairs):
+        missing.append(pairs)
+        return len(pairs)
+
+    monkeypatch.setattr(bs.StoreBrowseAPI, "fetch_batch", fetch)
+    monkeypatch.setattr(bs.asyncio, "sleep", sleep)
+    monkeypatch.setattr(bs, "network_checker", SimpleNamespace(is_offline=False))
+    context = SimpleNamespace(task={"type": "app", "id": "cn:1", "region": "cn", "appids": [991001]},
+        queue=asyncio.Queue(), db_writer=SimpleNamespace(mark_region_status_missing_batch=mark))
+    for attempt in range(bs.MAX_PARTIAL_RETRIES + 1):
+        await bs.handle_browse_price_task(context)
+        if attempt < bs.MAX_PARTIAL_RETRIES:
+            context.task = context.queue.get_nowait()
+            assert context.task["retries"] == attempt + 1
+    assert len(requests) == bs.MAX_PARTIAL_RETRIES + 1
+    assert delays == ([5.0, 10.0, 20.0] if rate_limited else [1.0, 1.0, 1.0])
+    assert missing == [[(991001, "cn")]]
+    assert bs.FAILED_TASKS == ["cn:1"]
+    assert context.queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_browse_batch_saves_extras_and_discovers_bundles_once(monkeypatch):
+    from app.domains.games.models import GamePriceHistory
+
+    bs.reset_run_state()
+    ids = [991001, 991002]
+    calls = []
+    items = {aid: {"appid": aid, "item_type": 0, "type": 0, "success": 1, "visible": True,
+        "name": str(aid), "purchase_options": [
+            {"packageid": aid, "purchase_option_name": str(aid), "final_price_in_cents": "1000",
+             "original_price_in_cents": "2000", "discount_pct": 50, "bundle_discount_pct": 10,
+             "active_discounts": [{"discount_end_date": 1792688400, "discount_description": "special"}]},
+            {"bundleid": 123, "purchase_option_name": "Collection"},
+        ]} for aid in ids}
+
+    async def fetch(*args):
+        return items, set(), 100
+
+    writer = DbWriter()
+    record = writer.record_bundle_discoveries
+
+    async def discoveries(rows):
+        calls.append(rows)
+        return await record(rows)
+
+    monkeypatch.setattr(bs.StoreBrowseAPI, "fetch_batch", fetch)
+    monkeypatch.setattr(bs, "PRESERVED", {aid: {"name": str(aid), "type": "GAME"} for aid in ids})
+    monkeypatch.setattr(writer, "record_bundle_discoveries", discoveries)
+    context = SimpleNamespace(task={"type": "app", "id": "cn:1", "region": "cn", "appids": ids},
+                              db_writer=writer, http_client=None, session=None)
+    await bs.handle_browse_price_task(context)
+    assert bs.FAILED_TASKS == []
+    assert len(calls) == 1
+    assert [row["bundle_id"] for row in calls[0]] == [123]
+    async with get_session_factory()() as session:
+        rows = (await session.execute(select(GamePriceHistory))).scalars().all()
+        assert len(rows) == 2
+        assert {(r.discount_end_ts, r.discount_desc, r.bundle_discount_pct) for r in rows} == {
+            (1792688400, "special", 10)}
+
+
 def now():
     return get_beijing_time_obj().replace(tzinfo=None)
 

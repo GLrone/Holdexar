@@ -73,12 +73,8 @@ class CrawlerScheduler:
         self.error_sink = error_sink
 
         # 统计
-        self.success_count = 0
-        self.skip_count = 0
         self.fail_count = 0
         self.total_processed = 0
-        self.skip_no_discount_count = 0
-        self.discount_ended_count = 0
         self._counter_lock = asyncio.Lock()
 
         # 进度发布口径（crawl.progress 的 done/ok/fail/total 都从这里取）：
@@ -237,7 +233,6 @@ class CrawlerScheduler:
                     await self.router.route(context)
                 async with self._counter_lock:
                     self.total_processed += 1
-                    self.success_count += 1
                     self._completed_ids.add(str(task_id))
             except Exception as e:
                 async with self._counter_lock:
@@ -343,11 +338,6 @@ class CrawlerScheduler:
         join_task.cancel()
 
         elapsed = time.time() - start_time
-        extras = []
-        if self.skip_no_discount_count:
-            extras.append(f"未打折跳过 {self.skip_no_discount_count}")
-        if self.discount_ended_count:
-            extras.append(f"打折结束 {self.discount_ended_count}")
         done, ok, fails = self._derived_counts()
         speed = (done / elapsed) if elapsed > 0 else 0.0
         log_event(
@@ -360,7 +350,6 @@ class CrawlerScheduler:
                 "总处理": self.total_processed,
                 "成功": ok,
                 "失败": fails,
-                "折扣相关": " | ".join(extras) or "无",
                 "耗时秒": round(elapsed, 1),
                 "速度": f"{speed:.1f} 项/秒",
             },

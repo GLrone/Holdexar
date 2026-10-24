@@ -3,7 +3,7 @@
 与旧 appdetails 链路的关系：
 - 并发调度**原封不动**：仍用 CrawlerScheduler（worker 池）+ SteamHttpClient
   （全局限流 / 429 熔断 / 指数退避 / Connection: close）。
-- 抓取层换成 IStoreBrowseService/GetItems/v1：单区 × ≤400 appid 一发批量，
+- 抓取层换成 IStoreBrowseService/GetItems/v1：单区 × ≤300 appid 一发批量，
   元数据（名称/开发商/好评率/发售日/头图/家庭共享/卡牌/成人标记）全部由
   同一发响应白送，替掉 appdetails + appreviews 两次请求。**价格按请求参数
   country_code 判定**——出口 IP 不参与数据判定，直连与代理拿到同一份数据，
@@ -25,10 +25,8 @@ import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import text
 from yarl import URL
 
-from app.core.database import WritePriority, get_session_factory, write_gate, write_session
 from app.core.logging import log_event
 from app.crawler import tag_names
 from app.crawler.config import CC_LIST
@@ -52,9 +50,8 @@ BROWSE_URL = "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/"
 # 必须 GET（POST → 405）；input_json 只能放查询参数。
 # 最小转义：保留 `{}",:` 与数字/小写字母（全转义会让单发条数掉到 ~260）
 _URL_SAFE = '{}",:0123456789abcdefghijklmnopqrstuvwxyz-_.'
-# 单发 URL 长度上限：服务端按请求行长度拒绝，边界落在 6.5KB~6.8KB 之间
-# （340 条 / 6474 字节仍回 200；360 条 / 6834 字节回 414；400 条 / 7554 字节回 400，
-# 直连与经本地内核结果一致）。取 6000 留余量：请求行还含方法、路径与协议版本。
+# 单发 URL 长度上限：服务端按请求行长度拒绝，边界约 6.5KB。取 6000 留余量：
+# 请求行还含方法、路径与协议版本。
 MAX_URL_LEN = 6000
 # 单发条数上限：7 位 appid 每条约 12 字符，6.5KB 边界折算 ~313 条即拒收——
 # 取 300 留余量；URL 长度兜底再切仍由 plan_id_batches 负责（spec 更长时收紧）
@@ -105,9 +102,6 @@ META: dict[int, dict] = {}          # appid → browse 元数据
 PRESERVED: dict[int, dict] = {}     # appid → 库内原值（browse 拿不到的列）
 FAILED_TASKS: list[str] = []
 SKIPPED_UNITS: set[tuple[int, str]] = set()
-NO_OPTIONS_COUNT = 0                # 「可见但无购买选项」计数（判 locked）
-PARENT_FOLLOWED = 0                 # 子 app 跟父补齐计数
-BUNDLES_DISCOVERED = 0             # purchase_options 捆绑包发现计数（链尾刷新自动抓价）
 FOLLOW_PARENT = True
 EXTRAS_ENABLED = True
 DRY_RUN = False
@@ -118,14 +112,11 @@ _WRITE_STARTED: set[str] = set()
 
 def reset_run_state() -> None:
     """每轮 crawl 开始前清空运行态（防上一轮残留串味）。"""
-    global NO_OPTIONS_COUNT, PARENT_FOLLOWED
     META.clear()
     PRESERVED.clear()
     FAILED_TASKS.clear()
     SKIPPED_UNITS.clear()
     _WRITE_STARTED.clear()
-    NO_OPTIONS_COUNT = 0
-    PARENT_FOLLOWED = 0
 
 
 # ══════════════════════════════════════════════════════════════
@@ -141,12 +132,6 @@ def _to_int(v) -> int | None:
         return int(float(v))
     except (TypeError, ValueError):
         return None
-
-
-def _naive(dt: datetime | None) -> datetime | None:
-    if dt is not None and dt.tzinfo is not None:
-        return dt.replace(tzinfo=None)
-    return dt
 
 
 def _fmt_release_ts(ts) -> str:
@@ -204,13 +189,6 @@ async def _wait_network_online(context) -> bool:
     return await network_checker.wait_until_online(getattr(context, "stop_event", None))
 
 
-def _visible_without_options(item: dict | None) -> bool:
-    """可见但一发购买选项都没有 = 该区不售（判 locked，仅用于计数）。"""
-    if not item or item.get("success") != 1 or not item.get("visible") or item.get("is_free"):
-        return False
-    return not (item.get("purchase_options") or item.get("best_purchase_option"))
-
-
 def _item_tags(item: dict | None) -> list[tuple[int, int]]:
     """browse item → [(tagid, weight), ...]（票重降序 = 店铺页热门标签顺序）。
 
@@ -243,7 +221,7 @@ async def _mark_missing_async(db_writer, appids: list[int], cc: str) -> int:
 
 
 class StoreBrowseAPI:
-    """IStoreBrowseService/GetItems 适配器：批量（≤400）× 单区。"""
+    """IStoreBrowseService/GetItems 适配器：批量（≤300）× 单区。"""
 
     @staticmethod
     def build_ids_url(
@@ -263,8 +241,8 @@ class StoreBrowseAPI:
             {"input_json": json.dumps(body, separators=(",", ":"))}, safe=_URL_SAFE
         )
         # ⚠ 坑：aiohttp 用 yarl 建 URL，会把 `{ } "` 再百分号编码一遍，
-        # 7.5KB 的 400 条 URL 被撑到 ~9.2KB → Steam 直接 400。encoded=True 声明
-        # 「已编码、别再动」，保住 400 条/发的硬限制。
+        # 7.5KB 的 300 条 URL 被撑到 ~9.2KB → Steam 直接 400。encoded=True 声明
+        # 「已编码、别再动」，保住 300 条/发的硬限制。
         return URL(f"{BROWSE_URL}?{qs}", encoded=True)
 
     @staticmethod
@@ -539,9 +517,8 @@ class StoreBrowseAPI:
             "family_sharing": CAT_FAMILY_SHARING in features,
             "trading_cards": CAT_TRADING_CARDS in features,
             "is_adult": bool(ADULT_DESCRIPTOR_IDS & descriptors),
-            # 评测摘要（0-100 口径，写库层再 ×100）。此前 computed-but-dropped：
-            # 算了没进返回值，写库层永远拿 None 回落库内旧值——browse 首爬
-            # 建的新行全库评测量成 0
+            # 评测摘要（0-100 口径，写库层再 ×100）。必须随响应返回：
+            # 缺失会让写库层回落库内旧值，首爬新建行拿不到评测量。
             "review_count": review_count,
             "positive_rate": pct,
         }
@@ -642,169 +619,8 @@ def build_game_data(appid: int, meta: dict | None, now_dt) -> dict | None:
 
 
 # ══════════════════════════════════════════════════════════════
-# DbWriter 扩展：browse 独有字段落库口
-# ══════════════════════════════════════════════════════════════
-
-GPH_EXTRA_COLUMNS = {
-    "discount_end_ts": "INTEGER",      # 促销截止 Unix 时间戳
-    "discount_desc": "VARCHAR(60)",    # 促销类型（#discount_desc_preset_special）
-    "bundle_id": "INTEGER",            # bundle 选项身份
-    "bundle_discount_pct": "INTEGER",  # bundle 叠折
-}
-
-
-class BrowseDbWriter(DbWriter):
-    """沿用生产写入语义，另加 browse 独有字段的落库口。"""
-
-    _extras_ready: bool | None = None
-
-    @classmethod
-    async def _extras_columns_present(cls) -> bool:
-        """game_price_history 是否已有 browse 扩展列（生产库未迁移前自动跳过）。"""
-        if cls._extras_ready is not None:
-            return cls._extras_ready
-        try:
-            async with get_session_factory()() as session:
-                res = await session.execute(
-                    text("PRAGMA table_info(game_price_history)")
-                )
-                cols = {row[1] for row in res.fetchall()}
-            cls._extras_ready = set(GPH_EXTRA_COLUMNS) <= cols
-            if not cls._extras_ready:
-                log_event(
-                    logger,
-                    "价格历史表缺少浏览扩展列，扩展字段落库跳过（需迁移后才有促销截止/促销类型/捆绑包归属）",
-                    tag="跳过",
-                    level=logging.WARNING,
-                    detail={"缺少列": "/".join(sorted(set(GPH_EXTRA_COLUMNS) - cols))},
-                )
-        except Exception as e:  # noqa: BLE001
-            log_event(
-                logger,
-                "探测价格历史表扩展列失败",
-                level=logging.WARNING,
-                detail={"原因": e},
-            )
-            cls._extras_ready = False
-        return cls._extras_ready
-
-    async def ensure_extra_columns(self) -> None:
-        """自建 browse 独有列（测试隔离库用；生产库请走正式迁移）。"""
-        import sqlite3 as _sq
-
-        from app.core.config import get_settings
-
-        db_path = Path(get_settings().data_dir) / "holdexar.db"
-        async with write_gate(WritePriority.BACKGROUND):
-            conn = _sq.connect(db_path.as_posix())
-            try:
-                existing = {r[1] for r in conn.execute("PRAGMA table_info(game_price_history)")}
-                for name, ddl in GPH_EXTRA_COLUMNS.items():
-                    if name not in existing:
-                        conn.execute(
-                            f"ALTER TABLE game_price_history ADD COLUMN {name} {ddl}"
-                        )
-                        log_event(
-                            logger,
-                            "价格历史表新增了一个浏览扩展列",
-                            detail={"列名": name},
-                        )
-                conn.commit()
-            finally:
-                conn.close()
-        type(self)._extras_ready = None
-
-    async def attach_browse_extras(
-        self, appid: int, cc: str, now_dt, extras_by_sub: dict[int, dict]
-    ) -> None:
-        """把 browse 独有字段贴回本批刚写的 history 行（键 = appid+区+sub+快照）。"""
-        if not extras_by_sub:
-            return
-        if not await self._extras_columns_present():
-            return
-        params = [
-            {
-                "e": opt.get("discount_end_ts"),
-                "d": opt.get("discount_desc"),
-                "b": opt.get("bundle_id"),
-                "bd": opt.get("bundle_discount_pct"),
-                "a": int(appid),
-                "r": cc.upper(),
-                "s": int(sub_id),
-                "t": _naive(now_dt),
-            }
-            for sub_id, opt in extras_by_sub.items()
-        ]
-        try:
-            async with write_session(WritePriority.BACKGROUND) as session:
-                await session.execute(
-                    text(
-                        "UPDATE game_price_history SET discount_end_ts=:e, "
-                        "discount_desc=:d, bundle_id=:b, bundle_discount_pct=:bd "
-                        "WHERE appid=:a AND region_code=:r AND sub_id=:s AND snapshot_at=:t"
-                    ),
-                    params,
-                )
-                await session.commit()
-        except Exception as e:  # noqa: BLE001 —— 扩展字段不阻断主链路
-            log_event(
-                logger,
-                f"游戏 {appid} 的 {cc} 区浏览扩展字段落库失败",
-                level=logging.WARNING,
-                detail={"游戏": appid, "区": cc, "原因": e},
-            )
-
-    async def attach_browse_extras_batch(self, entries) -> None:
-        """一批扩展字段一次事务回贴（entries = (appid, cc, now_dt, extras_by_sub)）。
-
-        逐 appid 各开事务会把批内 commit 数放大到批大小，这里折进同一事务一次提交。
-        """
-        rows = [
-            (int(appid), cc, now_dt, extras_by_sub)
-            for appid, cc, now_dt, extras_by_sub in entries
-            if extras_by_sub
-        ]
-        if not rows or not await self._extras_columns_present():
-            return
-        try:
-            async with write_gate(WritePriority.BACKGROUND):
-                async with write_session(WritePriority.BACKGROUND) as session:
-                    for appid, cc, now_dt, extras_by_sub in rows:
-                        params = [
-                            {
-                                "e": opt.get("discount_end_ts"),
-                                "d": opt.get("discount_desc"),
-                                "b": opt.get("bundle_id"),
-                                "bd": opt.get("bundle_discount_pct"),
-                                "a": appid,
-                                "r": cc.upper(),
-                                "s": int(sub_id),
-                                "t": _naive(now_dt),
-                            }
-                            for sub_id, opt in extras_by_sub.items()
-                        ]
-                        await session.execute(
-                            text(
-                                "UPDATE game_price_history SET discount_end_ts=:e, "
-                                "discount_desc=:d, bundle_id=:b, bundle_discount_pct=:bd "
-                                "WHERE appid=:a AND region_code=:r AND sub_id=:s AND snapshot_at=:t"
-                            ),
-                            params,
-                        )
-                    await session.commit()
-        except Exception as e:  # noqa: BLE001 —— 扩展字段不阻断主链路
-            log_event(
-                logger,
-                "浏览扩展字段批量落库失败",
-                level=logging.WARNING,
-                detail={"原因": e},
-            )
-
-
-# ══════════════════════════════════════════════════════════════
 # 任务处理器
 # ══════════════════════════════════════════════════════════════
-
 
 async def _follow_parent_apps(context, items: dict, appids: list[int], cc: str) -> int:
     """把「子 app」的购买选项从其父 app 补齐（原地改写 items）。返回补齐条数。
@@ -870,10 +686,10 @@ async def handle_browse_price_task(context) -> None:
             await context.queue.put(dict(task))
             return
         if retries < MAX_PARTIAL_RETRIES:
-            delay = 5.0 * (2**retries) if isinstance(e, SteamRateLimitError) else 2.0
+            delay = 5.0 * (2**retries) if isinstance(e, SteamRateLimitError) else 1.0
             log_event(
                 logger,
-                f"价格抓取批次 {task_id} 出现未预期异常，{delay:.0f} 秒后重推",
+                f"价格抓取批次 {task_id} 处理失败，{delay:.0f} 秒后重推",
                 level=logging.WARNING,
                 detail={
                     "批次": task_id or "未标注",
@@ -887,7 +703,7 @@ async def handle_browse_price_task(context) -> None:
             return
         # 穷尽：若本批一行都没写（异常发生在落库循环之前），整批记 missing
         # 进补抓账本，让补抓层下个周期只补这些失败区——绝不能静默丢行。
-        if task_id not in _WRITE_STARTED:
+        if str(task_id) not in _WRITE_STARTED:
             n = await _mark_missing_async(context.db_writer, appids, cc)
             log_event(
                 logger,
@@ -907,17 +723,11 @@ async def handle_browse_price_task(context) -> None:
         _WRITE_STARTED.discard(str(task_id))
 
 
-async def _browse_price_task_inner(context) -> bool:
-    """browse 价格任务：一发批量（单区 × ≤400 appid）→ 逐 appid 落库。
-
-    返回 True = 任务已重推仍待重跑；False = 已终态
-    （成功 / 穷尽 / 丢弃）。退避重推 / 断网守卫 / 欠账语义保持一致。
-    """
-    global PARENT_FOLLOWED, NO_OPTIONS_COUNT
+async def _browse_price_task_inner(context) -> None:
+    """一区一批抓取、解析并批量保存价格。"""
     task = context.task
     cc = task["region"]
     appids: list[int] = task["appids"]
-    retries = task.get("retries", 0)
     task_id = task.get("id")
 
     if network_checker.is_offline and not await _wait_network_online(context):
@@ -928,56 +738,18 @@ async def _browse_price_task_inner(context) -> bool:
             level=logging.WARNING,
             detail={"批次": task_id or "未标注"},
         )
-        return False
+        return
 
     started = time.monotonic()
-    try:
-        items, missing_ids, size = await StoreBrowseAPI.fetch_batch(
-            context, appids, cc, "english", EXTRAS_ENABLED
-        )
-    except Exception as e:  # noqa: BLE001
-        rate_limited = isinstance(e, SteamRateLimitError)
-        # 断网守卫：网络故障烧掉的预算不算数，等恢复后原样重推
-        if network_checker.is_offline:
-            if not await _wait_network_online(context):
-                return False
-            await context.queue.put(dict(task))
-            return True
-        if retries < MAX_PARTIAL_RETRIES:
-            delay = 5.0 * (2**retries) if rate_limited else 1.0
-            log_event(
-                logger,
-                f"价格抓取批次 {task_id} 抓取失败，{delay:.0f} 秒后重推",
-                level=logging.WARNING,
-                detail={
-                    "批次": task_id or "未标注",
-                    "异常": type(e).__name__,
-                    "等待": f"{delay:.0f}秒",
-                    "重试次数": retries + 1,
-                },
-            )
-            await asyncio.sleep(delay)
-            await context.queue.put({**task, "retries": retries + 1})
-            return True
-        # 穷尽：本批必然一行未写 → 整批记 missing 进账本（补抓层下轮只补失败区）
-        n = await _mark_missing_async(context.db_writer, appids, cc)
-        log_event(
-            logger,
-            f"价格抓取批次 {task_id} 抓取失败且已达最大重试，{n} 条记缺失数据进补抓账本",
-            level=logging.ERROR,
-            detail={"批次": task_id or "未标注", "异常": e, "条数": n},
-        )
-        FAILED_TASKS.append(str(task_id))
-        return False
-
+    items, missing_ids, size = await StoreBrowseAPI.fetch_batch(
+        context, appids, cc, "english", EXTRAS_ENABLED
+    )
 
     # ── 子 app 跟父：type=14 / related_items.parent_appid 的条目自身没有购买
     #    选项（如 42710 "CoD: BO - Multiplayer" 之于 42700）。旧链路 appdetails
     #    对这类 appid 会重定向到父 app 返回父的价格，为保价格口径一致，这里
     #    显式补一发父 appid 并把父的 purchase_options 挂回子 appid ──
-    followed = await _follow_parent_apps(context, items, appids, cc)
-    if followed:
-        PARENT_FOLLOWED += followed
+    await _follow_parent_apps(context, items, appids, cc)
 
     log_event(
         logger,
@@ -1032,9 +804,6 @@ async def _browse_price_task_inner(context) -> bool:
             items.get(appid),
             (meta or {}).get("name_en") or (keep or {}).get("name_en") or "",
         )
-
-        if status == "locked" and _visible_without_options(items.get(appid)):
-            NO_OPTIONS_COUNT += 1
 
         # 即将推出且该区无购买选项（未开放预购）→ COMING_SOON 暂缓（同旧链路：
         # 「无价格付费游戏不入库」；有包预购走正常链路），由 coming_soon 重探转正
@@ -1091,6 +860,9 @@ async def _browse_price_task_inner(context) -> bool:
                     "price_status": "ok",
                     "steam_answer": "ok",
                     "discount_end_ts": o.get("discount_end_ts"),
+                    "discount_desc": o.get("discount_desc"),
+                    "bundle_id": o.get("bundle_id"),
+                    "bundle_discount_pct": o.get("bundle_discount_pct"),
                     "crawled_at": now_dt,
                 }
                 for o in opts
@@ -1158,7 +930,7 @@ async def _browse_price_task_inner(context) -> bool:
             cleared_missing.append((appid, cc))
             counts["skip"] += 1
             continue
-        pending_writes.append((appid, game_data, prices_arr, status, opts))
+        pending_writes.append((appid, game_data, prices_arr))
 
 
     # 整批一次事务落库：一批一次基线查询 + 一次 commit（逐 appid 各开事务会
@@ -1167,38 +939,23 @@ async def _browse_price_task_inner(context) -> bool:
     if pending_writes:
         try:
             results = await context.db_writer.upsert_task_batch(
-                [(g, p) for _, g, p, _, _ in pending_writes]
+                [(g, p) for _, g, p in pending_writes]
             )
         except Exception as e:
             raise RegionStatusWriteError([(aid, cc) for aid, *_ in pending_writes]) from e
         if any(results):
             _WRITE_STARTED.add(str(task_id))
-        extra_entries: list[tuple] = []
-        for (appid, game_data, prices_arr, status, opts), ok in zip(
-            pending_writes, results
-        ):
+        discoveries: dict[int, dict] = {}
+        for (appid, _, _), ok in zip(pending_writes, results):
             if not ok:
                 counts["write_fail"] += 1
                 failed_writes.append((appid, cc))
                 ledger_missing.append((appid, cc))
                 continue
-            if status == "ok" and opts:
-                extra_entries.append(
-                    (
-                        appid,
-                        cc,
-                        now_dt,
-                        {o["sub_id"]: o for o in opts if o.get("sub_id")},
-                    )
-                )
-            # ── 捆绑包发现（purchase_options 白送）：只在写入成功后收。
-            #    没有的包写发现桩（无价 + updated_at NULL），随主轮链尾整区抓价；
-            #    失败只计数不抛：发现是副产物，绝不拖垮主价格链路。
+            # 仅收集价格保存成功的条目，捆绑包按批去重后保存。
             try:
-                found = _discover_bundles_from_item(items.get(appid))
-                if found:
-                    await context.db_writer.record_bundle_discoveries(found)
-                    BUNDLES_DISCOVERED += len(found)
+                for found in _discover_bundles_from_item(items.get(appid)):
+                    discoveries.setdefault(found["bundle_id"], found)
             except Exception as e:  # noqa: BLE001
                 log_event(
                     logger,
@@ -1206,8 +963,12 @@ async def _browse_price_task_inner(context) -> bool:
                     level=logging.DEBUG,
                     detail={"批次": task_id or "未标注", "原因": e},
                 )
-        if extra_entries:
-            await context.db_writer.attach_browse_extras_batch(extra_entries)
+        if discoveries:
+            try:
+                await context.db_writer.record_bundle_discoveries(list(discoveries.values()))
+            except Exception as e:  # noqa: BLE001
+                log_event(logger, "捆绑包发现批量保存失败", level=logging.DEBUG,
+                          detail={"批次": task_id or "未标注", "原因": e})
 
     # ── 热门用户标签（include_tag_count 白送，与价格同发）：按 appid 整批替换。
     #    标签是区域无关的目录事实，不看本区价格状态——locked/无购买选项的条目
@@ -1254,7 +1015,6 @@ async def _browse_price_task_inner(context) -> bool:
             "写库失败": counts["write_fail"],
         },
     )
-    return False
 
 
 def _discover_bundles_from_item(item: dict | None) -> list[dict]:

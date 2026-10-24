@@ -72,6 +72,8 @@ async def test_replayed_snapshot_updates_details_without_losing_batch(db, monkey
 
     monkeypatch.setattr(writer, "_upsert_task_batch_slow", no_fallback)
     changed = _prices(APPID_A, 10000, 25000, 60)
+    changed[0].update(discount_end_ts=1792688400, discount_desc="special",
+                      bundle_id=123, bundle_discount_pct=10)
     if batch:
         assert await writer.upsert_task_batch([
             (game, changed), (_game(APPID_B), _prices(APPID_B, 3000, 5000, 40)),
@@ -85,9 +87,51 @@ async def test_replayed_snapshot_updates_details_without_losing_batch(db, monkey
         )).scalar_one()
         current = await session.get(GameCurrentPrice, (APPID_A, "CN"))
         assert (history.id, history.original_price, history.discount_percent) == (first_id, 25000, 60)
+        assert (history.discount_end_ts, history.discount_desc, history.bundle_id,
+                history.bundle_discount_pct) == (1792688400, "special", 123, 10)
         assert (current.original_price, current.discount_percent) == (25000, 60)
+    assert await writer.upsert_game_and_prices(game, _prices(APPID_A, 10000, 20000, 50))
+    async with db() as session:
+        history = (await session.execute(
+            select(GamePriceHistory).where(GamePriceHistory.appid == APPID_A)
+        )).scalar_one()
+        assert (history.discount_desc, history.bundle_id, history.bundle_discount_pct) == ("special", 123, 10)
     if batch:
         assert await _history_count(db, APPID_B) == 1
+
+
+@pytest.mark.asyncio
+async def test_history_extras_use_isolated_fallback_transaction(db):
+    prices = _prices(APPID_A, 10000, 20000, 50)
+    prices[0].update(discount_end_ts=1792688400, discount_desc="special",
+                     bundle_id=123, bundle_discount_pct=10)
+    assert await DbWriter()._upsert_task_batch_slow([(_game(APPID_A), prices)]) == [True]
+    async with db() as session:
+        history = (await session.execute(select(GamePriceHistory))).scalar_one()
+        assert (history.discount_end_ts, history.discount_desc, history.bundle_id,
+                history.bundle_discount_pct) == (1792688400, "special", 123, 10)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch", [False, True])
+async def test_history_extras_commit_failure_leaves_no_partial_price(db, monkeypatch, batch):
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from app.domains.games.models import Game
+
+    async def reject(_):
+        raise RuntimeError("price commit rejected")
+
+    monkeypatch.setattr(AsyncSession, "commit", reject)
+    prices = _prices(APPID_A, 10000, 20000, 50)
+    prices[0].update(discount_desc="special", bundle_id=123, bundle_discount_pct=10)
+    writer = DbWriter()
+    if batch:
+        assert await writer.upsert_task_batch([(_game(APPID_A), prices)]) == [False]
+    else:
+        assert not await writer.upsert_game_and_prices(_game(APPID_A), prices)
+    async with db() as session:
+        for model in (Game, GameCurrentPrice, GamePriceHistory):
+            assert (await session.execute(select(func.count()).select_from(model))).scalar_one() == 0
 
 
 @pytest.mark.asyncio

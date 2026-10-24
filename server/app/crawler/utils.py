@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from .config import EDITION_DICT
@@ -15,66 +15,6 @@ def get_beijing_time_obj() -> datetime:
     return datetime.now(BEIJING_TZ)
 
 
-def strip_html_tags(text: str | None) -> str:
-    if not text:
-        return ""
-    text = re.sub(r"<br\s*/?>", " ", text, flags=re.IGNORECASE)
-    clean = re.sub(r"<.*?>", "", text)
-    return clean.replace("\u00A0", " ").replace("&nbsp;", " ").strip()
-
-
-def detect_chinese_support(supported_text: str | None) -> str:
-    if not supported_text:
-        return "无中文"
-    text = supported_text.lower()
-    if "简体" in text or "simplified chinese" in text:
-        return "简体中文"
-    if "繁体" in text or "traditional chinese" in text:
-        return "繁体中文"
-    return "无中文"
-
-
-def parse_formatted_price(formatted_price: str | None, currency: str = "USD") -> int | None:
-    """把 Steam 格式化价格串（"$53.99" / "¥ 398" / "29,102 ₸"）解析为分（int）。"""
-    if not formatted_price:
-        return None
-
-    cleaned = re.sub(r"[^\d.,]", "", formatted_price)
-    if not cleaned:
-        return None
-
-    last_dot = cleaned.rfind(".")
-    last_comma = cleaned.rfind(",")
-
-    if last_dot >= 0 and last_comma >= 0:
-        # 两者都在 —— 靠后的那个是小数分隔符
-        if last_dot > last_comma:
-            value_str = cleaned.replace(",", "")
-        else:
-            value_str = cleaned.replace(".", "").replace(",", ".")
-    elif last_dot >= 0:
-        parts = cleaned.split(".")
-        if len(parts) == 2 and len(parts[1]) <= 2:
-            value_str = cleaned
-        else:
-            value_str = cleaned.replace(".", "")
-    elif last_comma >= 0:
-        parts = cleaned.split(",")
-        if len(parts) == 2 and len(parts[1]) <= 2:
-            value_str = cleaned.replace(",", ".")
-        else:
-            value_str = cleaned.replace(",", "")
-    else:
-        value_str = cleaned
-
-    try:
-        value = float(value_str)
-    except Exception:
-        return None
-
-    return int(round(value * 100))
-
-
 def is_gold_edition(package_name: str | None) -> bool:
     if not package_name:
         return False
@@ -82,42 +22,6 @@ def is_gold_edition(package_name: str | None) -> bool:
     if "commercial license" in name_lower:
         return False
     return "gold edition" in name_lower or "黄金版" in package_name
-
-
-def is_pacific_dst(now_utc: datetime | None = None) -> bool:
-    """判断当前太平洋时间是否处于夏令时（PDT）。"""
-    if now_utc is None:
-        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
-    year = now_utc.year
-    march1 = datetime(year, 3, 1)
-    days_to_first_sunday = (6 - march1.weekday()) % 7
-    second_sunday_march = march1 + timedelta(days=days_to_first_sunday + 7)
-    dst_start = second_sunday_march.replace(hour=2)
-    nov1 = datetime(year, 11, 1)
-    days_to_first_sunday = (6 - nov1.weekday()) % 7
-    first_sunday_nov = nov1 + timedelta(days=days_to_first_sunday)
-    dst_end = first_sunday_nov.replace(hour=2)
-    return dst_start <= now_utc < dst_end
-
-
-def get_steam_refresh_hour_beijing() -> int:
-    """Steam 折扣刷新时间对应的北京时间小时数。"""
-    return 1 if is_pacific_dst() else 2
-
-
-def is_near_steam_refresh(window_minutes: int = 30) -> bool:
-    """当前北京时间是否处于 Steam 折扣刷新窗口内。"""
-    now_beijing = datetime.now(BEIJING_TZ)
-    refresh_hour = get_steam_refresh_hour_beijing()
-    refresh_time = now_beijing.replace(hour=refresh_hour, minute=0, second=0, microsecond=0)
-    diff_seconds = abs((now_beijing - refresh_time).total_seconds())
-    return diff_seconds <= window_minutes * 60
-
-
-def contains_chinese(text: str | None) -> bool:
-    if not text:
-        return False
-    return bool(re.search(r"[\u4e00-\u9fff]", text))
 
 
 # ── 价格段判定（各区 option_text 尾巴形态）──
