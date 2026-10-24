@@ -86,12 +86,10 @@ def _record_activation(steamid: str) -> None:
 
 
 async def _strategy_proxy() -> str | None:
-    try:
-        from app.domains.proxies import service as proxies_service
+    """按代理策略引擎解析出网代理；引擎不可用时 None（直连）。"""
+    from app.domains.proxies.service import strategy_proxy_or_direct
 
-        return await proxies_service.resolve_proxy_url()
-    except Exception:  # noqa: BLE001
-        return None
+    return await strategy_proxy_or_direct()
 
 
 async def _login_session() -> tuple[dict, str, str]:
@@ -480,15 +478,3 @@ async def quota_status() -> dict:
         "used": _account_usage(steamid) if steamid else 0,
         "limit": ACT_LIMIT,
     }
-
-
-__all__ = [
-    "ACT_LIMIT",
-    "ACT_WINDOW_SECONDS",
-    "activate_batch",
-    "activate_key",
-    "add_free_license",
-    "add_free_licenses",
-    "list_activations",
-    "quota_status",
-]

@@ -42,7 +42,6 @@ OWNED_GAMES_URL = "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/
 SHARED_LIBRARY_URL = "https://api.steampowered.com/IFamilyGroupsService/GetSharedLibraryApps/v1/"
 
 STEAM64_BASE = 76561197960265728
-MAX_FAMILY = 6
 
 
 def _norm_avatar(url: str | None) -> str:
@@ -53,12 +52,10 @@ def _norm_avatar(url: str | None) -> str:
 
 
 async def _strategy_proxy() -> str | None:
-    try:
-        from app.domains.proxies import service as proxies_service
+    """按代理策略引擎解析出网代理；引擎不可用时 None（直连）。"""
+    from app.domains.proxies.service import strategy_proxy_or_direct
 
-        return await proxies_service.resolve_proxy_url()
-    except Exception:  # noqa: BLE001
-        return None
+    return await strategy_proxy_or_direct()
 
 
 def _is_ssl_error(exc: Exception) -> bool:
@@ -315,30 +312,6 @@ async def _backfill_member_countries(row: FamilyGroup) -> None:
                 await session.commit()
     except Exception:  # noqa: BLE001 —— 写回失败不影响本次返回
         log_event(logger, "成员资料国家写回失败", level=logging.ERROR, exc_info=True)
-
-
-async def fetch_member_owned_games(token: str, steamid: str) -> list[dict]:
-    """拉某成员已购库（家庭组内公开资料即可读，access_token 通道免 Key）。"""
-    try:
-        resp = await _steam_get(
-            OWNED_GAMES_URL,
-            {
-                "access_token": token,
-                "steamid": steamid,
-                "include_appinfo": 0,
-                "include_played_free_games": 1,
-            },
-        )
-        games = resp.json().get("response", {}).get("games", []) or []
-        return [{"appid": int(g["appid"])} for g in games if g.get("appid")]
-    except Exception as e:  # noqa: BLE001 —— 单成员失败不阻断
-        log_event(
-            logger,
-            "家庭成员已购库获取失败",
-            level=logging.WARNING,
-            detail={"SteamID": steamid, "原因": str(e)},
-        )
-        return []
 
 
 # ─── 绑定 / 同步 ────────────────────────────────────────────
@@ -1119,9 +1092,8 @@ async def fetch_family_library(steam_id: str | None = None) -> dict:
     member_play: dict[str, list[dict]] = {}   # steamid → [{appid, minutes, last}]
     member_owned_count: dict[str, int] = {}
 
-    # 成员已购/游玩**并发**拉取（此前串行：每成员一趟代理 HTTPS，2-10s/人 ×
-    # 全组累计 30s+；任一人超时整个聚合直接失败——游玩动态「经常失败」的主因）。
-    # gather + return_exceptions：单成员失败只缺席该成员明细，不再拖垮全家聚合。
+    # 成员已购/游玩**并发**拉取：gather + return_exceptions，单成员失败只缺席
+    # 该成员明细，不再拖垮全家聚合。
     owned_results = await asyncio.gather(
         *(fetch_member_owned_games_full(token, m["steamid"]) for m in member_rows),
         return_exceptions=True,
@@ -1258,8 +1230,8 @@ async def fetch_family_library(steam_id: str | None = None) -> dict:
     await _upsert_library_snapshot(group["family_groupid"], games_out)
 
     # 游玩明细随组档案落库（play_json）：库快照表只有 app 级字段，成员游玩
-    # 明细此前不落盘——实时聚合一失败、落到快照兜底路径，memberPlay 恒空，
-    # 游玩动态就只剩空态（「经常失败」的另一半）。成功即存，兜底也有数据。
+    # 明细必须由本路径落盘——实时聚合失败落到快照兜底时，memberPlay 才有数据。
+    # 成功即存，兜底也有数据。
     if owner and member_play:
         try:
             async with write_session(WritePriority.BACKGROUND) as session:
@@ -1484,7 +1456,7 @@ async def _library_from_snapshot(
             })
 
     # 游玩明细（组档案的 play_json 快照）：实时聚合成功时随组落库，
-    # 兜底路径同样有游玩数据——此前恒空 dict，游玩动态只能空态
+    # 兜底路径同样带游玩数据，游玩动态不会只剩空态
     play_saved = (
         fam_row.play_json
         if fam_row is not None and isinstance(fam_row.play_json, dict)
@@ -1547,7 +1519,7 @@ async def cached_family_library(steam_id: str | None = None) -> dict:
 
     ⚠️ 兜底/快照条目同样入缓存（TTL 更短，见 _SNAPSHOT_TTL_SECONDS）。只让成功
     路径写缓存的话，Cookie 失效期间每个请求都要先付一次完整的失败
-    HTTPS 往返才回退快照（2.1~3.3s/次）——这也是「板块切换 1-2 秒」的主因。
+    HTTPS 往返才回退快照。
     """
     sid = steam_id or await get_primary_steamid()
     now = datetime.utcnow()
@@ -1751,7 +1723,3 @@ async def save_member_regions(regions: dict[str, str]) -> dict:
     await settings_service.set_value(KEY_MEMBER_REGIONS, merged)
     return merged
 
-
-async def get_member_regions() -> dict:
-    saved = await settings_service.get_value(KEY_MEMBER_REGIONS, None)
-    return saved if isinstance(saved, dict) else {}

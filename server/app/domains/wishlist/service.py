@@ -44,16 +44,10 @@ STEAMID64_REGEX = r"7656119\d{10}"
 
 
 async def _strategy_proxy() -> str | None:
-    """按代理策略引擎解析出网代理；直连策略/引擎不可用时 None（直连）。
+    """按代理策略引擎解析出网代理；引擎不可用时 None（直连）。"""
+    from app.domains.proxies.service import strategy_proxy_or_direct
 
-    api.steampowered.com 在直连网络下常被墙，同步必须能跟随 clash 策略。
-    """
-    try:
-        from app.domains.proxies import service as proxies_service
-
-        return await proxies_service.resolve_proxy_url()
-    except Exception:  # noqa: BLE001
-        return None
+    return await strategy_proxy_or_direct()
 
 
 def _naive(dt: datetime) -> datetime:
@@ -198,7 +192,7 @@ def _parse_owned_payload(data: dict) -> list[dict]:
 async def fetch_owned_games_via_jwt(steamid: str, token: str) -> list[dict]:
     """已购拉取（免 Key 通道）：主账号 Cookie 的 webapi_token 直调。
 
-    与 family 域 fetch_member_owned_games 同款用法（access_token query 参数）。
+    与 family 域 fetch_member_owned_games_full 同款用法（access_token query 参数）。
     401/403 抛 OwnedFetchError（token 失效/无权读该账号）。
     """
     from app.domains.family.service import _steam_get
@@ -693,8 +687,6 @@ async def _sync_account_inflight(steamid: str, auto_crawl: bool) -> dict:
     )
 
     if auto_crawl and new_appids:
-        import asyncio
-
         from app.domains.crawl import service as crawl_service
 
         # 首次入库场景禁用打折预检（无历史数据可判断"刷新跳过"）。

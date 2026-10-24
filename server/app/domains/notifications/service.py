@@ -25,7 +25,6 @@ from app.domains.notifications.mail import (
 )
 from app.domains.notifications.models import NotificationCandidate
 from app.domains.notifications.policy import (
-    CATEGORIES,
     CATEGORY_LABELS,
     FAILED,
     MAX_ATTEMPTS,
@@ -76,17 +75,6 @@ def retryable(error: str | None) -> bool:
 
 EVENT_BATCH = 1000
 SENDING_TIMEOUT = timedelta(minutes=30)
-
-_TYPE_TO_CATEGORY = {
-    event_type: category
-    for category in CATEGORIES
-    for event_type in policy_mod.CATEGORY_EVENT_TYPES[category]
-}
-
-
-def _category_of(event_type: str) -> str:
-    return _TYPE_TO_CATEGORY.get(event_type, "price")
-
 
 async def _watched_appids() -> set[int]:
     """关注范围 = 监控池（与爬取同一口径）。目录层只是价格库维护，不通知。"""

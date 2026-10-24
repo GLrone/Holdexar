@@ -320,16 +320,6 @@ def _region_store_url(appid, region: str = "") -> str:
     return f"{base}?cc={cc}&l=schinese" if cc else base
 
 
-def _bundle_store_url(url, bundle_id, item_kind: int = -1) -> str:
-    """捆绑包商店直链：库内 url 优先，缺失按形态（bundle / sub）兜底。"""
-    if url:
-        return str(url)
-    if not bundle_id:
-        return ""
-    kind = "sub" if int(item_kind or -1) == 1 else "bundle"
-    return f"https://store.steampowered.com/{kind}/{int(bundle_id)}/"
-
-
 # ══════════════════════════════════════════════════════════════════
 # 二、原子组件
 # ══════════════════════════════════════════════════════════════════

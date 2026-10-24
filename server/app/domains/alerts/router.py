@@ -8,7 +8,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from . import service
+from . import notify, service
 
 router = APIRouter(prefix="/alerts", tags=["alerts"])
 
@@ -78,12 +78,12 @@ async def clear_events():
 
 @router.get("/smtp")
 async def get_smtp():
-    return await service.get_smtp_config()
+    return await notify.get_smtp_config()
 
 
 @router.put("/smtp")
 async def update_smtp(req: SmtpUpdate):
-    return await service.update_smtp_config(
+    return await notify.update_smtp_config(
         host=req.host,
         port=req.port,
         user=req.user,
@@ -101,7 +101,7 @@ async def test_smtp(req: SmtpUpdate):
     detail 为可直接展示的中文原因。
     """
     try:
-        return await service.test_smtp_config(
+        return await notify.send_test_mail(
             host=req.host,
             port=req.port,
             user=req.user,

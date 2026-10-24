@@ -18,7 +18,7 @@ import re
 import time
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import and_, asc, bindparam, delete, desc, exists, func, or_, select, text, update
+from sqlalchemy import and_, asc, bindparam, case, delete, desc, exists, func, null, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -893,7 +893,7 @@ async def _catalog_rows(session: AsyncSession, q: str, limit: int) -> list:
                     )
                 ).scalars()
             )[:_FTS_APPID_CAP]
-        except Exception:
+        except Exception:  # noqa: BLE001 — 影子表不可用时退回 LIKE 通道
             # 影子表缺失/异常（未跑迁移的异常库）→ LIKE 通道仍可用
             appids = []
     cn = aliased(GameCurrentPrice)
@@ -1843,8 +1843,7 @@ async def refresh_hl_flags(appids: list[int] | None = None) -> int:
             updates.append((int(appid), flag))
 
         if updates:
-            from sqlalchemy import case
-
+            
             # SQLite 绑定变量上限，按批执行 CASE UPDATE
             BATCH = 400
             for i in range(0, len(updates), BATCH):
@@ -1880,8 +1879,7 @@ async def refresh_pp_flags(appids: list[int] | None = None) -> int:
     """
     from datetime import datetime as _dt
 
-    from sqlalchemy import case
-
+    
     h = GamePriceHistory
     c = aliased(GameCurrentPrice)
     inner = (
@@ -1987,8 +1985,7 @@ async def refresh_pp_flags(appids: list[int] | None = None) -> int:
             # SQLite 绑定变量上限，按批执行 CASE UPDATE（与 hl_flag 同款）。
             # pp_changed_at 的映射必须覆盖全量 targets：空 case 会生成非法 SQL，
             # 且无跳变的 appid 要显式写 NULL（幂等重算要求清掉旧值）。
-            from sqlalchemy import null
-
+            
             BATCH = 400
             for i in range(0, len(updates), BATCH):
                 batch = updates[i : i + BATCH]
@@ -2074,8 +2071,7 @@ async def refresh_sort_cache(
     games sort → bundles sort」串进同一事务（GET 只可能读到旧快照或新快照；
     smart_score 同事务落库，排序与展示差价不跨汇率基准）。
     """
-    from sqlalchemy import bindparam, text
-
+    
     lowest_filter = "AND appid IN :appids" if appids else ""
     sql = text(
         f"""

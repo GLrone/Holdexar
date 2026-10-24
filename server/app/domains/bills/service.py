@@ -827,8 +827,6 @@ async def game_txs(
     async with get_session_factory()() as session:
         rows = (await session.execute(rows_stmt)).scalars().all()
         # HAVING 语义计数：SQLite 无 contains 过滤后的 count 便利，直接复用 stmt
-        from sqlalchemy import func
-
         total = (
             await session.execute(select(func.count()).select_from(stmt.subquery()))
         ).scalar_one()
@@ -852,8 +850,6 @@ async def topup_txs(import_id: int, limit: int = 200, offset: int = 0) -> dict:
                 .offset(offset)
             )
         ).scalars().all()
-        from sqlalchemy import func
-
         total = (
             await session.execute(
                 select(func.count())
@@ -879,8 +875,6 @@ async def cdk_games(
                 stmt.order_by(BillCdkGame.date.desc(), BillCdkGame.id.desc()).limit(limit).offset(offset)
             )
         ).scalars().all()
-        from sqlalchemy import func
-
         total = (
             await session.execute(select(func.count()).select_from(stmt.subquery()))
         ).scalar_one()

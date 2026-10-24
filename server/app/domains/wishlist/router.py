@@ -15,16 +15,6 @@ class AccountAdd(BaseModel):
     kinds: dict | None = None
 
 
-class AccountSyncResult(BaseModel):
-    steamid: str
-    wishlistCount: int
-    ownedCount: int
-    added: int
-    active: int
-    newAppids: list[int]
-    crawlTriggered: bool | None = None
-
-
 class AccountKinds(BaseModel):
     wishlist: bool | None = None
     owned: bool | None = None
