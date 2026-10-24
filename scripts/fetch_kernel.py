@@ -10,6 +10,7 @@
 用法：
     python scripts/fetch_kernel.py                    # 缺则补齐；已齐且有效则跳过
     python scripts/fetch_kernel.py --force            # 强制重下（升版本后用）
+    python scripts/fetch_kernel.py --license-only     # 仅准备随包许可文本与说明（轻量构建模式）
     python scripts/fetch_kernel.py --from-dir <目录>  # 从本机现成内核目录复制
                                                       #（离线场景；版本按原样，需自行核对）
 """
@@ -43,10 +44,12 @@ from app.domains.proxies.kernel_release import (  # noqa: E402
     kernel_filename,
     mihomo_asset,
     mihomo_url,
+    release_asset_names,
 )
 
 CLASH_DIR = ROOT / "assets" / "clash"
 KERNEL_FILE = CLASH_DIR / kernel_filename()
+LOCAL_LICENSE_SRC = ROOT / "packaging" / "licenses" / "LICENSE-mihomo.txt"
 
 # 有效性下限：拒绝半截下载与占位文件。
 _MIN_KERNEL_BYTES = 5 * 1024 * 1024
@@ -146,12 +149,32 @@ def _missing() -> list[str]:
     return missing
 
 
-def fetch(force: bool = False, from_dir: Path | None = None) -> int:
+def fetch(force: bool = False, from_dir: Path | None = None, license_only: bool = False) -> int:
     """补齐随包内核资产。返回进程退出码（0 成功/已就绪，1 失败）。"""
     CLASH_DIR.mkdir(parents=True, exist_ok=True)
     _write_source_note()
+    if LOCAL_LICENSE_SRC.is_file():
+        dest_license = CLASH_DIR / "LICENSE-mihomo.txt"
+        if not dest_license.is_file() or force:
+            shutil.copy2(LOCAL_LICENSE_SRC, dest_license)
     if from_dir is not None:
         _copy_from_dir(from_dir)
+
+    if license_only:
+        missing_lic = [name for name in release_asset_names() if not (CLASH_DIR / name).is_file()]
+        if not missing_lic and not force:
+            print(f"[内核] 随包许可与说明资产已就绪（{CLASH_DIR}），跳过")
+            return 0
+        for name, url in LICENSE_ASSETS.items():
+            target = CLASH_DIR / name
+            if target.is_file() and not force:
+                continue
+            ok, err = _fetch(url, target, _MIN_LICENSE_BYTES, name)
+            if not ok:
+                print(f"[内核] 许可原文 {name} 获取失败：{err}")
+                return 1
+        print(f"[内核] 许可与说明资产已就绪：{CLASH_DIR}")
+        return 0
 
     if not force:
         missing = _missing()
@@ -189,6 +212,7 @@ def fetch(force: bool = False, from_dir: Path | None = None) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Holdexar 随包内核资产获取")
     parser.add_argument("--force", action="store_true", help="已有资产也强制重下")
+    parser.add_argument("--license-only", action="store_true", help="仅准备随包许可文本与说明（轻量构建模式）")
     parser.add_argument(
         "--from-dir", type=Path, default=None,
         help="从本机现成内核目录复制内核与许可原文（离线场景；版本按原样复制）",
@@ -196,7 +220,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.from_dir is not None and not args.from_dir.is_dir():
         sys.exit(f"[内核] 目录不存在：{args.from_dir}")
-    sys.exit(fetch(force=args.force, from_dir=args.from_dir))
+    sys.exit(fetch(force=args.force, from_dir=args.from_dir, license_only=args.license_only))
 
 
 if __name__ == "__main__":

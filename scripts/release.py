@@ -18,7 +18,7 @@
     python scripts/release.py --check                  # 只预检，不改任何东西
     python scripts/release.py --bump patch --dry-run   # 全流程演练（不出网、不推送）
     python scripts/release.py --bump patch             # 正式发版
-    python scripts/release.py --version 0.1.0 --yes    # 免交互
+    python scripts/release.py --version 0.3.5-beta --yes    # 免交互
 
 前置：gh auth login（说明见 scripts/publish_release.py 顶部）。
 """
@@ -258,6 +258,15 @@ def preflight(version: str, allow_dirty: bool, allow_republish: bool) -> None:
             "gh CLI 不可用或未登录：winget install --id GitHub.cli && gh auth login\n"
             "        （没有 gh 也可用 scripts/publish_release.py 打印手工发布清单）"
         )
+
+    # 文档与构建一致性快速检查（版本/资产/调度/安全建议/许可证）
+    consistency_script = SCRIPTS / "check_docs_consistency.py"
+    if consistency_script.is_file():
+        c_code, c_out = capture([str(pick_python()), str(consistency_script)])
+        if c_code != 0:
+            errors.append(f"文档与构建一致性检查未通过：\n{c_out.strip()}")
+        else:
+            print("[预检] 文档与构建一致性核验通过")
 
     reason = notes_ready()
     if reason:

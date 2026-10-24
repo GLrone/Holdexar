@@ -12,7 +12,7 @@
 用法：
     python scripts/build_manifest.py                 # 自动取 release/ 内应用包
     python scripts/build_manifest.py --zip <路径>     # 指定应用包
-    python scripts/build_manifest.py --version 0.1.0 # 覆盖版本号（默认读后端配置）
+    python scripts/build_manifest.py --version 0.3.5-beta # 覆盖版本号（默认读后端配置）
 
 清单 schema 变更时同步递增 app_info.MANIFEST_SCHEMA，客户端按需兼容。
 """
@@ -67,11 +67,6 @@ def manifest_url(mirror: str = "") -> str:
 
 def asset_url(name: str, tag: str) -> str:
     return f"https://github.com/{GITHUB_REPO}/releases/download/{tag}/{name}"
-
-
-def app_version() -> str:
-    """版本号取自单一来源 app.core.app_info.APP_VERSION。"""
-    return APP_VERSION
 
 
 def sha256_of(path: Path) -> str:
@@ -214,7 +209,7 @@ def write_json(path: Path, payload: dict) -> None:
 
 
 def build(explicit_zip: str | None = None, version: str | None = None) -> dict:
-    version = version or app_version()
+    version = version or APP_VERSION
     zip_path = pick_zip(explicit_zip, version)
     expected_zip_name = f"{APP_NAME}-win64-v{version}.zip"
     if zip_path.name.lower() != expected_zip_name.lower():

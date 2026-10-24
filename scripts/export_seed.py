@@ -77,8 +77,7 @@ GC_COLS = (
 GAME_TAGS_COLS = ("appid", "tagid", "weight")
 
 # 价格历史种子列（与 seed_assets.GPH_COLS 同序同集，不含自增 id）。
-# 不带 attach_browse_extras 的促销富化列（discount_desc/bundle_id/
-# bundle_discount_pct）——每轮刷新由该通道重贴，非持久观测事实
+# 不带促销描述与捆绑包扩展列。
 GPH_COLS = (
     "appid", "region_code", "currency", "price", "original_price",
     "discount_percent", "sub_id", "is_gold", "version_suffix", "is_bundle",

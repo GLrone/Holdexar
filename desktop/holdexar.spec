@@ -78,7 +78,6 @@ a = Analysis(
         # 包内那些 dist-info 只覆盖各自的依赖，本项目自己的 LICENSE 与聚合
         # 声明必须单独入包，缺了等于发出去一份没有许可的软件。
         (os.path.join(ROOT, "LICENSE"), "."),
-        (os.path.join(ROOT, "docs", "THIRD_PARTY_NOTICES.md"), "."),
     ],
     hiddenimports=hiddenimports,
     hookspath=[],
