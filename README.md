@@ -6,7 +6,7 @@
 
 **本地 Steam 多区价格监控终端**
 
-[![Version](https://img.shields.io/badge/version-v0.1.0-orange)](../../releases)
+[![Version](https://img.shields.io/badge/version-v0.3.5--beta-orange)](../../releases)
 [![Python 3.13+](https://img.shields.io/badge/Python-3.13%2B-blue?logo=python&logoColor=white)](https://www.python.org)
 [![FastAPI](https://img.shields.io/badge/Backend-FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Vue 3](https://img.shields.io/badge/Frontend-Vue%203-42b883?logo=vuedotjs&logoColor=white)](https://vuejs.org)
@@ -81,32 +81,32 @@
 ## 首次运行安全提示
 
 > [!IMPORTANT]
-> 本应用发布包**未经代码签名**，首次运行会遇到三类安全提示，均为无签名程序的正常现象，不是病毒：
+> 本应用发布包**未经商业代码签名**（个人开源项目），首次在 Windows 运行可能会遇到系统或安全软件的风险拦截提示，特此说明其背景与安全建议：
 >
-> 1. **Windows SmartScreen 弹窗**（「Windows 已保护你的电脑」）：点 **更多信息 → 仍要运行** 即可。
-> 2. **Windows Smart App Control 硬阻断**（「此应用已被阻止」，**没有**「仍要运行」按钮）：这是 Windows 11 对未签名程序的强制拦截，不给放行按钮。先确认下载来自官方 [Releases](../../releases) 页并核对 SHA256，确需运行则在「Windows 安全中心 → 应用和浏览器控制 → Smart App Control 设置」中关闭该功能（关闭后杀毒软件仍在保护）。
-> 3. **杀毒软件报毒 / 主动防御弹窗**（如「正在创建 BITS 任务」）：选 **允许 / 信任**，不要阻止——阻止可能影响窗口渲染。建议把整个程序目录加入杀软白名单。
->
-> 请只从官方 [Releases](../../releases) 页下载，并用页内公布的 SHA256 校验安装包。
+> 1. **核对官方发布哈希（最重要防线）**：请**务必**只从官方 [Releases](../../releases) 页面下载，并在下载后核对官方公布的 SHA256 校验和（PowerShell 命令：`Get-FileHash Holdexar-win64-*.zip -Algorithm SHA256`）。只要哈希一致，即可确认为未经篡改的官方构建版本。
+> 2. **优先推荐源码运行**：若你对未签名二进制心存疑虑，或系统安全策略禁止运行未签名程序，**强烈建议直接以源码方式运行**（执行 `git clone` 并运行 `python run.py`）。源码完全公开、依赖透明可审计，无需放行任何未经签名的二进制。
+> 3. **Windows SmartScreen 提示**（「Windows 已保护你的电脑」）：属于系统对无签名新程序的通用警示。在确认下载自官方 Releases 且 SHA256 校验匹配后，可点击 **更多信息 → 仍要运行**。
+> 4. **Smart App Control 阻断**：Windows 11 的 Smart App Control 可能会直接拦截未经签名的可执行文件。**不建议为了运行单个软件关闭系统级安全防护**；若遇阻断，推荐直接采用源码模式运行（`python run.py`）。
+> 5. **安全软件误报说明**：PyInstaller 打包的便携应用与代理网络组件偶见启发式误报。如遇告警，可将压缩包上传至 VirusTotal 等多引擎平台复验；确认官方校验和一致且决定信任后，可仅针对主程序单文件设置排除，不建议盲目关闭全局防护。
 
 ## 常见问题（FAQ）
 
 <details>
 <summary>首次运行弹出「Windows 已保护你的电脑」？</summary>
 
-Windows 对未签名程序的标准提示，与病毒无关。点 **更多信息 → 仍要运行** 即可，同一版本之后不会再弹。
+Windows 系统对无商业签名程序的标准警示。请先核对下载包的 SHA256 与官方 Release 公布值是否一致；确认无误后点击 **更多信息 → 仍要运行** 即可，同一版本后续不会重复提示。
 </details>
 
 <details>
-<summary>弹出「此应用已被阻止」，而且没有「仍要运行」？</summary>
+<summary>弹出「此应用已被阻止」（Smart App Control）？</summary>
 
-这是 Windows 11 的 Smart App Control 在拦截未签名程序，它比上面那条更严格——不给放行按钮。先确认安装包来自官方 [Releases](../../releases) 页且 SHA256 一致，确需运行再在「Windows 安全中心 → 应用和浏览器控制 → Smart App Control 设置」里把它关掉（关掉后杀毒软件仍然在工作）。
+这是 Windows 11 Smart App Control 对未签名程序的系统级拦截策略。我们**不建议为了单个软件关闭系统的安全防护功能**。遇到此类阻断时，建议通过源码运行（克隆仓库后执行 `python run.py`），源码环境完全可审计，无需依赖打包二进制。
 </details>
 
 <details>
-<summary>杀毒软件报毒？</summary>
+<summary>安全软件提示风险或报毒？</summary>
 
-无签名程序常见误报；随包分发的代理内核（开源的 mihomo，见文末致谢）也常被标记。处置：把整个程序目录加入白名单，弹窗选「允许」。
+无签名便携程序及网络代理组件常被部分杀毒软件的启发式规则误标记。建议将安装包上传至 VirusTotal 等平台进行多引擎核验；如官方 SHA256 一致且确认信任，可仅对本程序执行文件添加信任规则，切勿盲目关闭防病毒软件。
 </details>
 
 <details>
@@ -128,9 +128,16 @@ Windows 对未签名程序的标准提示，与病毒无关。点 **更多信息
 </details>
 
 <details>
-<summary>我的账号密码安全吗？数据存在哪？</summary>
+<summary>我的账号密码安全吗？数据存在哪？连接了哪些网络服务？</summary>
 
-账号密码登录走 Steam 官方接口，密码只在登录那一刻在内存里用一次，**不落盘、不写日志**；登录成功后的凭据加密存放在本机数据库里。全部数据（`holdexar.db`）都在你自己的电脑上（默认 `%LOCALAPPDATA%\Holdexar`，便携模式在程序目录 `data/`）。零云端、零遥测——除了 Steam 官方接口和你自备的代理订阅，不连接任何第三方服务。
+1. **凭据安全**：账号密码登录直调 Steam 官方认证接口，密码仅在登录鉴权时于内存中临时使用，**绝不落盘、不写日志**；鉴权成功后的凭据采用 AES-256-GCM 本地加密保存。
+2. **数据存储**：全部数据（SQLite 数据库与日志）保存在你自己的电脑上，新装默认优先保存在程序根目录 `data/` 下（完全便携同盘携带），若程序目录无写权限则自动安全回退至 `%LOCALAPPDATA%\Holdexar`。
+3. **网络服务与隐私**：**零云端服务器、零账号系统、零行为遥测与隐私上报**。为了实现比价与资讯功能，程序直接与以下公开服务通信：
+   - Steam 商店与用户数据相关网络请求；
+   - Frankfurter API（欧洲央行公开基准汇率折算）；
+   - Epic Games Store / Humble Bundle / Barter.vg（公开促销与免费游戏资讯）；
+   - GitHub Releases 与加速镜像（检查更新与按需下载数据种子）；
+   - 用户自备并主动接入的代理订阅源或 SMTP 邮件通知服务。
 </details>
 
 <details>
@@ -158,7 +165,11 @@ scoop bucket add holdexar https://github.com/GLrone/scoop-bucket
 scoop install holdexar
 ```
 
-每个版本 Release 附带三件资产：应用包 zip（解压即用）、公共数据种子 `holdexar_seed.db`（仅源码运行需要，发布包已内置）、更新清单 `latest.json`（客户端检查更新读取）。
+每个版本 Release 附带的核心资产：
+- 轻量应用包 `Holdexar-win64-v<版本>.zip`：解压即用，随包附带开源许可原文与来源说明，不捆绑内核二进制与数百兆种子；
+- 公共数据种子 `holdexar_seed.db.gz`：独立资产（压缩分发），应用首次启动按需下载，源码用户亦可通过 `run.py` 自动获取；
+- 公共目录库模板 `holdexar_template.db`：初始公共游戏目录模板（若随版发布）；
+- 更新清单 `latest.json`：挂载于固定 tag `updater` 供客户端检查更新读取。
 
 ---
 
@@ -168,10 +179,10 @@ scoop install holdexar
 
 | 层 | 组件 |
 |---|---|
-| 后端 | FastAPI · SQLAlchemy(async) · APScheduler(21 个定时任务) · aiohttp 爬核 |
+| 后端 | FastAPI · SQLAlchemy(async) · APScheduler(25 个定时任务) · aiohttp 爬核 |
 | 前端 | Vue 3 · TypeScript · Vite · 自制 Hl\* 组件体系(深浅双主题 / 中英双语) |
 | 桌面 | pywebview(WebView2) · onedir 绿色包 · 单实例锁 |
-| 网络 | 出网策略引擎(proxy_first 默认 / direct_only / direct_first / proxy_only) · 自备 Clash 订阅 · mihomo 内核随包内置 |
+| 网络 | 出网策略引擎(proxy_first 默认 / direct_only / direct_first / proxy_only) · 自备 Clash 订阅 · mihomo 内核按需获取与轻量分发 |
 | 认证 | 应用内账号密码登录直调 Steam IAuthenticationService;手动 Cookie 粘贴通道保留;凭据 AES-256-GCM 加密落库 |
 
 ### 业务主线
@@ -208,9 +219,9 @@ python run.py --dev      # 对接 Vite 热更新开发
 python run.py --port N   # 指定端口
 ```
 
-首次运行会自动补齐公共数据种子(历史汇率与价格历史切片,约 288MB):种子是二进制大文件,不进 git,由 `run.py` 从 Release 资产拉取。没网也不影响启动,只是【汇率】页没有历史档案,之后重跑 `python scripts/fetch_seed.py` 即可。
+首次运行会自动补齐公共数据种子(历史汇率与价格历史切片压缩包 `holdexar_seed.db.gz`):种子是二进制大文件,不进 git,由 `run.py` 从 Release 资产拉取。没网也不影响启动,只是【汇率】页没有历史档案,之后重跑 `python scripts/fetch_seed.py` 即可。
 
-随包的还有 Clash 内核(mihomo,版本固定)及其许可与来源说明:二进制不入库,由 `run.py` 调用 `python scripts/fetch_kernel.py` 从上游补齐;获取失败也不阻断启动,【代理】页会显示「内核缺失」并提供一键安装入口。
+随包内核采用轻量模式分发：内置开源许可原文与来源说明，不捆绑内核二进制；运行所需内核由客户端在首次使用时按需下载或由用户自备。源码用户可通过 `python scripts/fetch_kernel.py` 获取完整内核，或通过 `--license-only` 仅就地准备许可材料。
 
 ## 打包与发布
 
@@ -227,7 +238,7 @@ python scripts/publish_release.py             # 正式发布(需 gh CLI 且已 g
 
 | Release | tag | 内容 | 作用 |
 |---|---|---|---|
-| 版本发布 | `v<版本>` | zip + `holdexar_seed.db` + `latest.json` | 给用户下载的那一条,带 changelog |
+| 版本发布 | `v<版本>` | zip + `holdexar_seed.db.gz` + `holdexar_template.db` + `latest.json` | 给用户下载的那一条,带 changelog |
 | 更新清单 | `updater` | 只有 `latest.json` | 机器读的那一条,地址恒定 |
 
 要点:
@@ -295,4 +306,4 @@ Holdexar/
 
 ## 致谢
 
-- [mihomo](https://github.com/MetaCubeX/mihomo) — Clash 代理内核（随包分发，GPL-3.0）
+- [mihomo](https://github.com/MetaCubeX/mihomo) — Clash 代理内核（外部按需组件，GPL-3.0）

@@ -1,20 +1,18 @@
-"""Holdexar 发布构建：npm build → PyInstaller onedir → 产物消毒 → 绿色 zip。
+r"""Holdexar 发布构建：npm build → PyInstaller onedir → 产物消毒 → 绿色 zip。
 
 用法（发布机，建议用 server/.venv 的解释器运行）：
     python scripts/build_release.py                    # 常规出包（沿用现有种子）
     python scripts/build_release.py --refresh-seed     # 先从生产库重导资产种子
     python scripts/build_release.py --skip-web         # 跳过前端构建（dist 已是最新）
-产物（三件，全部要上传 Release；清单由 scripts/build_manifest.py 生成）：
-- release/Holdexar-win64-v<版本>.zip —— 应用包，解压双击即用。包内**含
-  mihomo 内核与许可原文**（assets/clash → _MEIPASS/clash），用户机器不需要
-  自装 Clash、也不需要首次联网下载内核；缺该资产即中止出包（见
-  ensure_clash_assets）。**不含种子**（按需下载落 data/seed，见
-  app/core/seed_fetch.py）。**用户数据不在包内、也不落在程序目录**：打包态数据
-  目录判定见 app/core/paths.py（默认落 %LOCALAPPDATA% 下的同名目录），因此
-  覆盖解压、换目录、整包删除重装都不会碰到用户数据。
-- release/holdexar_seed.db.gz —— 公共数据种子独立资产（games 人工策划列
-  + 预设池 + 目录/现价 + 玩家标签；不含汇率与价格历史），供应用首启按需下载
-  与源码 clone 用户（run.py 首次启动）经 scripts/fetch_seed.py 自动获取。
+产物（全部要上传 Release；清单由 scripts/build_manifest.py 生成）：
+- release/Holdexar-win64-v<版本>.zip —— 应用包，解压双击即用。轻量包模式：
+  **随包附带 mihomo 许可原文与来源说明**（assets/clash → _MEIPASS/clash），
+  **不捆绑内核二进制**（按需独立维护或自备），**不含种子**（首次启动按需下载）。
+  **用户数据支持完全便携**：打包态优先落在程序目录 `data/` 下（完全便携同盘携带），
+  不可写时自动安全回退 `%LOCALAPPDATA%\Holdexar`。
+- release/holdexar_seed.db.gz —— 公共数据种子独立资产（压缩分发），供应用首启
+  按需下载与源码 clone 用户（run.py 首次启动）经 scripts/fetch_seed.py 自动获取。
+- release/holdexar_template.db —— 公共目录库模板（若有，作为独立资产上传）。
 - release/latest.json —— 更新清单，挂到固定 tag `updater` 供客户端检查更新。
   加 Scoop 渠道时另出 release/scoop/（用法见 packaging/scoop/README.md）。
 """
@@ -82,11 +80,6 @@ def pick_python() -> Path:
     return Path(sys.executable)
 
 
-def app_version() -> str:
-    """版本号取自单一来源 app.core.app_info.APP_VERSION（纯标准库，装依赖前也可导入）。"""
-    return APP_VERSION
-
-
 def refresh_seed() -> None:
     print("[种子] 从生产库重导资产种子 ...")
     subprocess.check_call([str(pick_python()), str(ROOT / "scripts" / "export_seed.py")])
@@ -96,12 +89,26 @@ def ensure_clash_assets() -> None:
     """随包许可原文与来源说明就位（内核二进制按需独立维护，不随应用包分发）。"""
     CLASH_DIR.mkdir(parents=True, exist_ok=True)
     (CLASH_DIR / "README.txt").write_text(bundled_source_note(), encoding="utf-8")
+    # 优先从仓库受版本控制的 packaging/licenses/ 复制许可原文
+    local_lic = ROOT / "packaging" / "licenses" / "LICENSE-mihomo.txt"
+    dest_lic = CLASH_DIR / "LICENSE-mihomo.txt"
+    if local_lic.is_file() and not dest_lic.is_file():
+        shutil.copy2(local_lic, dest_lic)
+
     expected = release_asset_names()
     missing = [name for name in expected if not (CLASH_DIR / name).is_file()]
     if missing:
+        # 尝试调用 fetch_kernel 仅下载随包许可文本
+        try:
+            import scripts.fetch_kernel as fk
+            fk.fetch(license_only=True)
+            missing = [name for name in expected if not (CLASH_DIR / name).is_file()]
+        except Exception:
+            pass
+    if missing:
         sys.exit(
             f"[错误] 内核许可与说明资产缺失：{', '.join(missing)}\n"
-            "       先跑 python scripts/fetch_kernel.py 补齐 assets/clash/ 后再出包。"
+            "       先跑 python scripts/fetch_kernel.py --license-only 补齐 assets/clash/ 后再出包。"
         )
     print(f"[内核] 轻量包模式：不捆绑 {kernel_filename()} 二进制（节省约 35MB），运行时按需下载独立维护")
 
@@ -389,7 +396,7 @@ def main() -> None:
     python = pick_python()
     ensure_pyinstaller(python)
     run_pyinstaller(python)
-    version = app_version()
+    version = APP_VERSION
     assemble_versioned_layout(version, python)
     sanitize()
     stage_seed_asset()

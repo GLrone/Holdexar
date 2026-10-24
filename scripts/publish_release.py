@@ -73,11 +73,6 @@ from app.core.app_info import (  # noqa: E402
 ZIP_GLOB = f"{APP_NAME}-win64-v*.zip"
 
 
-def app_version() -> str:
-    """版本号取自单一来源 app.core.app_info.APP_VERSION。"""
-    return APP_VERSION
-
-
 def run(cmd: list[str], dry: bool) -> None:
     printable = " ".join(f'"{c}"' if " " in c else c for c in cmd)
     if dry:
@@ -341,7 +336,7 @@ def main() -> None:
     parser.add_argument("--scoop-dir", help="Scoop bucket 仓库本地路径（顺带写入清单）")
     args = parser.parse_args()
 
-    version = args.version or app_version()
+    version = args.version or APP_VERSION
     app_zip = pick_app_zip(version)
     notes_file = Path(args.notes_file)
 
