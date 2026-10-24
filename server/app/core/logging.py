@@ -100,9 +100,6 @@ _REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (_ENV_ASSIGN, r"\1\2***"),
 )
 
-REDACTED = "***"
-
-
 def redact(text: str) -> str:
     """抹掉一行文本里的凭据值，保留字段名。
 
@@ -239,7 +236,6 @@ _MODULE_LABELS = {
     "app.domains.agent.runtime.scheduler_bridge": "运行账本·调度桥",
     "app.domains.agent.runtime.executor": "运行账本·工具执行",
     "app.domains.agent.runtime.fake": "运行账本·模拟运行",
-    "app.domains.agent.providers.registry": "运行账本·模型来源",
     "app.domains.pilot.service": "领航员·编排",
     "app.domains.pilot.session": "领航员·会话",
     "app.domains.pilot.router": "领航员·接口",

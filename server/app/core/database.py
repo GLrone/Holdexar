@@ -131,8 +131,7 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "last_success_at": "DATETIME",
     },
     # bundle-as-sub 识别标记（版本显示修复）
-    # + browse 促销元数据四列（与 browse_store.GPH_EXTRA_COLUMNS 一一对应：
-    #   attach_browse_extras 回贴促销截止/促销类型/bundle 归属）
+    # 促销元数据随价格历史同事务写入。
     "game_price_history": {
         "is_bundle": "BOOLEAN DEFAULT 0",
         "discount_end_ts": "INTEGER",
@@ -173,6 +172,10 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
     "tags": {
         "name_en": "VARCHAR(100)",
     },
+    # 节点行上挂最近成功 L0 延迟（出口槽排序键的持久化形态；成功不落观测行）
+    "proxy_nodes": {
+        "l0_delay_ms": "INTEGER",
+    },
     # 订阅废弃终态（节点状态存储：>95% 不可用 → deprecated）
     "proxy_subscriptions": {
         "deprecated": "BOOLEAN DEFAULT 0",
@@ -191,11 +194,6 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         # 自动更新订阅：0 = 只手动重拉。限时订阅（只能在其窗口内下载、下载后
         # 可长期使用）关掉它，就不会每轮定时刷新都去撞一次注定失败的抓取。
         "auto_refresh": "BOOLEAN DEFAULT 1",
-    },
-    # 订阅来源特征码：节点来源关联上挂的稳定短标识（sd<订阅 id>），
-    # 体检结果按它对齐回池账本，同机场多订阅也互不混淆
-    "proxy_node_sources": {
-        "source_code": "VARCHAR(32) NOT NULL DEFAULT ''",
     },
     "subscription_snapshots": {
         "url": "VARCHAR(500)",
@@ -2258,7 +2256,7 @@ class _WriteGate:
         label = self._label
         if label is None:
             # 归属兜底：未显式标注时从调用栈取「谁在过闸」（auto:文件:行号）。
-            # owner_label=None 的观测盲区曾让 135-233s 级持闸无法点名——
+            # owner_label=None 的观测盲区会让超长持闸无法点名——
             # 任何巨型持闸都必须能回答「是谁」。
             frame = sys._getframe(1)
             label = f"auto:{frame.f_code.co_filename.replace(chr(92), '/').rsplit('/', 1)[-1]}:{frame.f_lineno}"
@@ -2393,9 +2391,3 @@ def write_scheduler_diagnostics() -> dict:
             occupancy[name] = read()
     snapshot["pool"] = occupancy
     return snapshot
-
-
-async def get_session() -> AsyncIterator[AsyncSession]:
-    """FastAPI 依赖：请求级会话。"""
-    async with get_session_factory()() as session:
-        yield session

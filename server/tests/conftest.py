@@ -212,6 +212,8 @@ def _forward_session_factory_imports(monkeypatch):
         "get_engine": _ORIG_ENGINE,
     }
     for name, names in _FACTORY_IMPORTERS.items():
+        if name.startswith("test_") and name not in sys.modules:
+            continue
         module = importlib.import_module(name)
         for attr in names:
             current = getattr(module, attr, None)
@@ -353,3 +355,38 @@ def _isolate_data_dir(request, _db_caches_fresh_before_each):
     orig_factory.cache_clear()
     orig_settings.cache_clear()
     shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@pytest.fixture
+def tmp_data_dir(tmp_path, monkeypatch):
+    # teardown 必须再清三个 lru_cache：get_settings 若不清，tmp 目录配置会
+    # 外溢到后续用例（曾致 seed_assets 假失败）。
+    from app.core.config import get_settings
+    from app.core.database import get_engine, get_session_factory
+
+    monkeypatch.setenv("HOLDEXAR_DATA_DIR", str(tmp_path))
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+    yield tmp_path
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+
+
+@pytest.fixture
+def kernel_exe_path(tmp_data_dir) -> Path:
+    from app.domains.proxies import clash_manager
+    from app.domains.proxies.kernel_release import kernel_filename
+
+    for candidate in (
+        clash_manager.kernel_exe(tmp_data_dir),
+        clash_manager.bundled_clash_dir() / kernel_filename(),
+        *(
+            sorted(Path(os.environ["LOCALAPPDATA"]).glob(f"holdexar*/clash/{kernel_filename()}"))
+            if os.environ.get("LOCALAPPDATA") else []
+        ),
+    ):
+        if candidate.is_file():
+            return candidate
+    pytest.skip("本机没有可用的 mihomo 内核资产（assets/clash/ 不随仓库分发）")

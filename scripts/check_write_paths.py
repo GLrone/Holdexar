@@ -290,7 +290,6 @@ class _Visitor(ast.NodeVisitor):
         return None
 
     file_suffix = ""
-    source_lines: list[str] = []
     kind = "commit"
 
     def _in_begin_tx(self, node: ast.AST) -> bool:
@@ -387,7 +386,6 @@ def audit_source(source: str, file_suffix: str = "<test>") -> tuple[
     v = _Visitor()
     v.build_parents(tree)
     v._file_suffix = file_suffix
-    v.source_lines = source.splitlines()
     v.visit(tree)
     fails = [(ln, k) for ln, k in v.hits if k == "FAIL"]
     exceptions = [(ln, k) for ln, k in v.hits if k == "EXCEPTION"]
