@@ -1,6 +1,6 @@
 """Run 级 lane 快照：active lanes ≤ 当前唯一出口数，且 run 内固定。
 
-被测：`runtime.select_run_lanes` / `runtime.lane_run_plan`（生产唯一取值口）。
+被测：`runtime.select_run_lanes`。
 
 背景（真实链路发现）：内核的 listener 数是上一次重建时定下的，而出口身份（L1）之后
 还会被刷新——两者之间存在重建窗口，窗口期内「lane 数」可能多于「当前唯一出口数」
@@ -104,47 +104,6 @@ def test_empty_snapshot_falls_back_to_node_capacity() -> None:
     chosen = rt.select_run_lanes(bindings, {}, max_lanes=60)
     assert len(chosen) == 58
     assert all(b["exitIp"] in (None, "") for b in chosen)
-
-
-def test_run_plan_keeps_lane_keys_when_exit_unknown(tmp_path) -> None:
-    """没有出口身份时键退回 `lane:<序号>`（同 lane 共享预算）。
-
-    入口就绪是 fail-closed 判据，所以这里占住真实端口当「listener 在听」。
-    """
-    import socket
-
-    import yaml
-
-    from app.domains.proxypool.pool import POOL_FILENAME
-
-    path = tmp_path / "proxypool" / POOL_FILENAME
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump({"proxies": [
-        {"name": f"n{i}", "type": "ss", "server": f"s{i}.example.net", "port": 1,
-         "cipher": "aes-128-gcm", "password": "x"} for i in range(3)
-    ]}, allow_unicode=True, sort_keys=False), encoding="utf-8")
-    rt.prepare_runtime_config(tmp_path)
-
-    holders = []
-    try:
-        doc = yaml.safe_load(rt.runtime_config_path(tmp_path).read_text(encoding="utf-8"))
-        for entry in doc["listeners"]:
-            sock = socket.socket()
-            sock.bind(("127.0.0.1", 0))
-            sock.listen(64)
-            holders.append(sock)
-            entry["port"] = int(sock.getsockname()[1])
-        rt.runtime_config_path(tmp_path).write_text(
-            yaml.safe_dump(doc, allow_unicode=True, sort_keys=False), encoding="utf-8"
-        )
-        plan = rt.lane_run_plan(tmp_path, exit_by_node={})
-    finally:
-        for sock in holders:
-            sock.close()
-
-    assert plan["exit_keys"] == ["lane:0", "lane:1", "lane:2"]
-    assert plan["nodes"] == ["", "", ""]
-    assert plan["known_exits"] == 0
 
 
 # ── 4. Run 级快照：run 内固定，后台变化不影响本次 run ─────────────

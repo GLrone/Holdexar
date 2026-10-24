@@ -25,14 +25,13 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import WritePriority, write_gate
-from app.core.logging import log_event
 from app.core.tls import ssl_context as _ssl_context
 from app.crawler.browse_store import StoreBrowseAPI, _to_int
 from app.domains.proxies.clash_manager import _port_listening, parse_probe_lanes
 from app.domains.proxypool.models import HealthObservation, HealthRun, ProxyNode
 from app.domains.proxypool.pool import pool_file_names
 from app.domains.proxypool.runtime import mixed_port_of, runtime_config_path
-from app.domains.proxypool.state import NODE_DEAD, NODE_RETIRED, evaluate_node_state
+from app.domains.proxypool.state import evaluate_node_state
 
 logger = logging.getLogger(__name__)
 
@@ -365,26 +364,13 @@ async def latest_l0_delays(session: AsyncSession) -> dict[str, int]:
     """每个节点最近一次**成功** L0 探测的延迟（node_id → ms）。
 
     出口槽排序的延迟事实源：缺条目 = 没测过或没成功过（排序按未测处理，
-    不凭空造默认值）。只取 ok=True 的观测——失败观测的 latency_ms 是空的
-    或是目标服务耗时，不构成「这个节点多快」的证据。
+    不凭空造默认值）。延迟挂在节点行（L0 成功只更新 `l0_delay_ms`，不落
+    观测行——全池 5min 一拍的延迟流水会把观测表撑成每天数万行）。
     """
-    latest = (
-        select(
-            HealthObservation.node_id.label("node_id"),
-            func.max(HealthObservation.observed_at).label("mx"),
-        )
-        .where(HealthObservation.level == PROBE_LEVEL, HealthObservation.ok.is_(True))
-        .group_by(HealthObservation.node_id)
-        .subquery()
-    )
     rows = await session.execute(
-        select(HealthObservation.node_id, HealthObservation.latency_ms)
-        .join(
-            latest,
-            (latest.c.node_id == HealthObservation.node_id)
-            & (latest.c.mx == HealthObservation.observed_at),
+        select(ProxyNode.node_id, ProxyNode.l0_delay_ms).where(
+            ProxyNode.l0_delay_ms.is_not(None)
         )
-        .where(HealthObservation.level == PROBE_LEVEL, HealthObservation.ok.is_(True))
     )
     return {
         node_id: int(ms)
@@ -436,104 +422,18 @@ async def health_check_pool(
                 state_push=False,
             )
             outcomes.append(outcome)
-            observations.append(observation)
-        async with write_gate(WritePriority.BACKGROUND, label="health_observation"):
-            for observation in observations:
-                session.add(HealthObservation(**observation))
-            await session.commit()
-    return tuple(outcomes)
-
-
-async def recover_dead_nodes(
-    session: AsyncSession, *,
-    controller_url: str,
-    secret: str,
-    now: datetime,
-    url: str | None = None,
-    timeout_ms: int = DEFAULT_TIMEOUT_MS,
-    batch: int = RECOVERY_BATCH_SIZE,
-) -> tuple[HealthOutcome, ...]:
-    """对 DEAD 节点分批做恢复探测：目标默认 **Steam 业务端点**（与生死判据同一标准），
-    成功回 `ACTIVE` 并清零计数，失败保持 `DEAD` 并累加。
-
-    分批轮转：按「最久没有被探过」排序（`health_observations` 的最后一条），一次只取
-    `batch` 个——退休线不可达的慢性失败节点若永远排在最前，其余节点要等轮转一整圈才
-    回到，回收覆盖率会长期为零。DEAD 不一次性全打出去，也不新建调度系统。成功使节点
-    重新合格，合格集变化由 `run_l0_cycle` 既有的 before/after 比较去请求重建。
-
-    `controller_url` 指向**持有这些节点配置的内核**（DEAD 不在池文件里，池内核不认识
-    它们的名字）。没有来源名的节点无法定位到内核里的配置，跳过不动它。
-    """
-    if batch <= 0:
-        return ()
-
-    last_probe = (
-        select(
-            HealthObservation.node_id.label("node_id"),
-            func.max(HealthObservation.observed_at).label("last_at"),
-        )
-        .group_by(HealthObservation.node_id)
-        .subquery()
-    )
-    rows = (await session.execute(
-        select(ProxyNode, ProxyNode.original_name)
-        .outerjoin(last_probe, last_probe.c.node_id == ProxyNode.node_id)
-        .where(ProxyNode.state.in_((NODE_DEAD, NODE_RETIRED)))
-        .order_by(
-            last_probe.c.last_at.asc().nullsfirst(),
-            ProxyNode.node_id,
-        )
-        .limit(batch)
-    )).all()
-
-    probe_url = url or business_probe_url()
-    outcomes: list[HealthOutcome] = []
-    pending: list[tuple[ProxyNode, dict, tuple[int, str] | None]] = []
-    for node, original_name in rows:
-        outcome, observation, mutations = await _probe_and_decide(
-            session, node, controller_url=controller_url, secret=secret,
-            probe_name=str(original_name), now=now, url=probe_url,
-            timeout_ms=timeout_ms,
-        )
-        outcomes.append(outcome)
-        pending.append((node, observation, mutations))
-
-    # 探测（网络）与落库分离：状态变更与观测在写调度器内一次落库提交
-    async with write_gate(WritePriority.BACKGROUND, label="health_recovery"):
-        # 防丢失更新（与 business_check_pool 同一防线）：补探是分钟级网络段，
-        # 载入时的 state / consecutive_failures 早已陈旧——闸内按主键重读
-        # （刷新本会话同一对象）后用新鲜基线重算状态迁移，窗口内手动体检
-        # ingest 与订阅 settle 的写入不因陈旧基线被覆盖。
-        if pending:
-            await session.execute(
-                select(ProxyNode)
-                .where(ProxyNode.node_id.in_([n.node_id for n, _, _ in pending]))
-                .execution_options(populate_existing=True)
-            )
-        for node, observation, mutations in pending:
-            if mutations is not None:
-                ok = bool(observation.get("ok"))
-                failures = 0 if ok else (node.consecutive_failures or 0) + 1
-                node.consecutive_failures = failures
-                node.state = evaluate_node_state(
-                    node.state,
-                    source_seen=True,
-                    probe_ok=ok,
-                    consecutive_failures=failures,
-                )
-            session.add(HealthObservation(**observation))
-        await session.commit()
-    if outcomes:
-        still_out = sum(1 for o in outcomes if o.state in (NODE_DEAD, NODE_RETIRED))
-        log_event(
-            logger,
-            f"出池节点恢复探测完成：补探 {len(outcomes)} 个，成功 {len(outcomes) - still_out} 个，仍未回池 {still_out} 个",
-            detail={
-                "补探节点数": len(outcomes),
-                "恢复成功数": len(outcomes) - still_out,
-                "仍未回池数": still_out,
-            },
-        )
+            # L0 成功只把延迟挂到节点行（排序键的持久化形态），观测行只留失败
+            # 证据——每天 288 拍 × 全池的成功流水没有任何读取方。
+            if result.ok and isinstance(result.delay_ms, int) and result.delay_ms > 0:
+                node.l0_delay_ms = result.delay_ms
+                node.last_l0_at = now
+            else:
+                observations.append(observation)
+        if observations:
+            async with write_gate(WritePriority.BACKGROUND, label="health_observation"):
+                for observation in observations:
+                    session.add(HealthObservation(**observation))
+                await session.commit()
     return tuple(outcomes)
 
 
@@ -619,12 +519,6 @@ async def _select_selector(controller_url: str, secret: str, selector: str,
     return None
 
 
-async def _select_global(controller_url: str, secret: str, runtime_name: str,
-                         timeout: float) -> str | None:
-    """把 `GLOBAL` 切到指定节点（lane 组变体见 `_select_selector`）。"""
-    return await _select_selector(controller_url, secret, "GLOBAL", runtime_name, timeout)
-
-
 async def _request_via_port(
     port: int, target: str, timeout: float,
 ) -> tuple[int | None, str, int | None, str]:
@@ -647,54 +541,16 @@ async def probe_exit_ip(
     secret: str,
     mixed_port: int,
     runtime_name: str, *,
+    selector: str = "GLOBAL",
     url: str = EXIT_IP_TARGET_URL,
     timeout: float = DEFAULT_L1_TIMEOUT,
 ) -> ExitIpResult:
-    """选中该节点，再经 mixed-port 发一次真实请求，读回它的出口 IP。
-
-    **必须串行调用**：`GLOBAL` 是全局选择器，切换是全局状态；并发探测会让
-    「这个出口 IP 属于哪个节点」不可信。这是测量正确性问题，不是性能问题。
-    并行通道见 `probe_exit_ip_lane`（每组选择互不干扰）。
-    """
-    failure = await _select_global(controller_url, secret, runtime_name, timeout)
+    """Select a node and probe its listener; calls sharing a selector must be serial."""
+    failure = await _select_selector(controller_url, secret, selector, runtime_name, timeout)
     if failure is not None:
         return ExitIpResult(runtime_name, False, None, failure, None)
 
     status, text, latency_ms, exc = await _request_via_port(mixed_port, url, timeout)
-    if status is None:
-        return ExitIpResult(runtime_name, False, None,
-                            f"{TARGET_SERVICE_FAILED}: {exc}", None)
-    if status != 200:
-        return ExitIpResult(runtime_name, False, None,
-                            f"{TARGET_SERVICE_FAILED}: HTTP {status}", latency_ms)
-    exit_ip = _extract_ip(text)
-    if exit_ip is None:
-        return ExitIpResult(runtime_name, False, None,
-                            f"{INVALID_IP_RESPONSE}: {text.strip()[:60]!r}",
-                            latency_ms)
-    return ExitIpResult(runtime_name, True, exit_ip, "", latency_ms)
-
-
-async def probe_exit_ip_lane(
-    controller_url: str,
-    secret: str,
-    lane_group: str,
-    lane_port: int,
-    runtime_name: str, *,
-    url: str = EXIT_IP_TARGET_URL,
-    timeout: float = DEFAULT_L1_TIMEOUT,
-) -> ExitIpResult:
-    """经探测 lane 的出口 IP 变体：切**本 lane 组** → 经该组 listener 端口请求。
-
-    同一条 lane 内切组与请求必须顺序执行（组选择是组内状态）；不同 lane 的
-    选择互不干扰，可并发。回读 `now` 不对齐按探不到处理，与 GLOBAL 归因纪律
-    同一条。"""
-    failure = await _select_selector(controller_url, secret, lane_group,
-                                     runtime_name, timeout)
-    if failure is not None:
-        return ExitIpResult(runtime_name, False, None, failure, None)
-
-    status, text, latency_ms, exc = await _request_via_port(lane_port, url, timeout)
     if status is None:
         return ExitIpResult(runtime_name, False, None,
                             f"{TARGET_SERVICE_FAILED}: {exc}", None)
@@ -730,6 +586,9 @@ async def _commit_exit_ip_wave(
         for node, result in probed:
             if result.ok and result.exit_ip:
                 node.exit_ip = result.exit_ip
+                # 出口身份的可信时刻：维护/启动/爬前补探三条 L1 路径经此统一落账，
+                # 出口槽排序按它取「最近确认的身份」。
+                node.last_l1_at = now
             session.add(HealthObservation(
                 node_id=node.node_id,
                 level=L1_LEVEL,
@@ -786,8 +645,8 @@ async def exit_ip_check_pool(
         if lanes:
             pairs = [(lanes[i], name) for i, name in enumerate(chunk) if name in by_name]
             results = await asyncio.gather(*(
-                probe_exit_ip_lane(controller_url, secret, group, port, name,
-                                   url=url, timeout=timeout)
+                probe_exit_ip(controller_url, secret, port, name,
+                              selector=group, url=url, timeout=timeout)
                 for (group, port), name in pairs
             ))
             probed = [(by_name[name], result)
@@ -929,76 +788,19 @@ async def probe_business(
     secret: str,
     mixed_port: int,
     runtime_name: str, *,
+    selector: str = "GLOBAL",
     url: str | None = None,
     appid: int = DEFAULT_BUSINESS_APPID,
     timeout: float = DEFAULT_L2_TIMEOUT,
 ) -> BusinessResult:
-    """选中该节点，经 mixed-port 打一次**生产 StoreBrowse** 业务请求。
-
-    `url` 不传就用 `business_probe_url(appid)`（与 crawler 同一契约）；测试传本地目标。
-    **必须串行调用**（同 L1：`GLOBAL` 是全局状态）。并行通道见 `probe_business_lane`。
-    """
+    """Select a node and probe its listener; calls sharing a selector must be serial."""
     target = url or business_probe_url(appid)
 
-    failure = await _select_global(controller_url, secret, runtime_name, timeout)
+    failure = await _select_selector(controller_url, secret, selector, runtime_name, timeout)
     if failure is not None:
         return BusinessResult(runtime_name, False, None, None, failure, None)
 
     status, text, latency_ms, exc = await _request_via_port(mixed_port, target, timeout)
-    if status is None:
-        return BusinessResult(runtime_name, False, None, None,
-                              f"{TARGET_SERVICE_FAILED}: {exc}", None)
-    if status == TUNNEL_FAILURE_STATUS:
-        detail, attr = await _attribute_gateway_502(
-            controller_url, secret, runtime_name,
-            target_url=target, body=text, timeout=timeout,
-        )
-        return BusinessResult(
-            runtime_name, False, status, None, detail, latency_ms, attribution=attr,
-        )
-    if status != 200:
-        return BusinessResult(runtime_name, False, status, None,
-                              f"{TARGET_SERVICE_FAILED}: HTTP {status}",
-                              latency_ms, attribution=ATTR_TARGET)
-    try:
-        payload = json.loads(text)
-    except ValueError:
-        return BusinessResult(runtime_name, False, 200, None,
-                              f"{INVALID_BUSINESS_RESPONSE}: 响应不是 JSON",
-                              latency_ms)
-
-    ok, reason, final = _validate_business(payload, appid)
-    if not ok:
-        return BusinessResult(runtime_name, False, 200, None,
-                              f"{INVALID_BUSINESS_RESPONSE}: {reason}", latency_ms)
-    return BusinessResult(
-        runtime_name, True, 200, final,
-        f"{BUSINESS_OK} appid={appid} final_price_in_cents={final}", latency_ms
-    )
-
-
-async def probe_business_lane(
-    controller_url: str,
-    secret: str,
-    lane_group: str,
-    lane_port: int,
-    runtime_name: str, *,
-    url: str | None = None,
-    appid: int = DEFAULT_BUSINESS_APPID,
-    timeout: float = DEFAULT_L2_TIMEOUT,
-) -> BusinessResult:
-    """经探测 lane 的业务变体：切**本 lane 组** → 经该组 listener 端口打生产请求。
-
-    同一条 lane 内切组与请求必须顺序执行；不同 lane 互相独立。业务校验与
-    GLOBAL 变体共用同一契约（`_validate_business`）。"""
-    target = url or business_probe_url(appid)
-
-    failure = await _select_selector(controller_url, secret, lane_group,
-                                     runtime_name, timeout)
-    if failure is not None:
-        return BusinessResult(runtime_name, False, None, None, failure, None)
-
-    status, text, latency_ms, exc = await _request_via_port(lane_port, target, timeout)
     if status is None:
         return BusinessResult(runtime_name, False, None, None,
                               f"{TARGET_SERVICE_FAILED}: {exc}", None)
@@ -1075,9 +877,8 @@ async def _commit_business_wave(
                     probe_ok=probe_ok,
                     consecutive_failures=failures,
                 )
-                # 业务结论时间随结论落章：体检账本对齐（bridge.ingest_ledger）
-                # 靠它与账本检测时刻比新旧，缺了它「池判死 → 旧账本复活」
-                # 的翻烧饼守卫永远不生效
+                # 业务结论时间随结论落章：首检复用窗与 6h 体检门槛
+                # 都按它判「最近检测过」
                 node.last_l2_at = now
             session.add(HealthObservation(
                 node_id=node.node_id,
@@ -1111,7 +912,7 @@ async def business_check_pool(
     拿到任何响应（200 / 429 / 503）都算传输成功——Steam 侧故障不罚节点（否则
     Steam 一抖整池陪葬）；只有超时/连不上归为节点失败证据，喂 `evaluate_node_state`
     （连续 3 次达退休线）。200 但契约不符是业务质量观测，记录不罚——契约变化
-    不该杀节点。不擦 `exit_ip`、不碰 `last_l0_at` / `last_l1_at` / `capacity_score`。
+    不该杀节点。不擦 `exit_ip`、不碰 `last_l0_at` / `last_l1_at`。
 
     探测 lane 在位时分波并发：每条 lane 一个独立组选择，波内 (lane, 节点) 各自
     顺序执行（切组 → 业务 GET），波末一次短提交；无 lane 退回 GLOBAL 串行路径
@@ -1137,8 +938,8 @@ async def business_check_pool(
         if lanes:
             pairs = [(lanes[i], name) for i, name in enumerate(chunk) if name in by_name]
             results = await asyncio.gather(*(
-                probe_business_lane(controller_url, secret, group, port, name,
-                                    url=url, appid=appid, timeout=timeout)
+                probe_business(controller_url, secret, port, name,
+                               selector=group, url=url, appid=appid, timeout=timeout)
                 for (group, port), name in pairs
             ))
             probed = [(by_name[name], result)

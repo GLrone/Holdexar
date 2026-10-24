@@ -21,7 +21,6 @@ Generation/rollback、worker lease、健康排序、空转闸（归调度层测�
 """
 from __future__ import annotations
 
-import os
 import threading
 import socket
 from datetime import datetime
@@ -30,13 +29,12 @@ from pathlib import Path
 
 import httpx
 import pytest
+
+from proxy_helpers import RedirectProxy as _RedirectProxy
 from sqlalchemy import select, update
 
-from app.core.config import get_settings  # noqa: E402
-from app.core.database import get_engine, get_session_factory, init_db  # noqa: E402
-from app.domains.proxies import clash_manager  # noqa: E402
+from app.core.database import get_session_factory, init_db  # noqa: E402
 from app.domains.proxies.clash_manager import ClashRuntime  # noqa: E402
-from app.domains.proxies.kernel_release import kernel_filename  # noqa: E402
 from app.domains.proxypool.models import (  # noqa: E402
     ProxyNode, node_fingerprint,
 )
@@ -58,66 +56,6 @@ def _closed_port() -> int:
 
 
 # ── 本地夹具：CONNECT 跳板（mihomo 的 http 节点出站走 CONNECT 隧道）──
-def _pipe(a: socket.socket, b: socket.socket) -> None:
-    try:
-        while True:
-            chunk = a.recv(65536)
-            if not chunk:
-                break
-            b.sendall(chunk)
-    except OSError:
-        pass
-    finally:
-        for s in (a, b):
-            try:
-                s.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-
-
-class _RedirectProxy:
-    """本地 CONNECT 代理：忽略目标，一律隧道到指定回显端口。"""
-
-    def __init__(self, redirect_to: int) -> None:
-        self._redirect_to = redirect_to
-        self._sock = socket.socket()
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(("127.0.0.1", 0))
-        self._sock.listen(32)
-        self.port = self._sock.getsockname()[1]
-        threading.Thread(target=self._serve, daemon=True).start()
-
-    def _serve(self) -> None:
-        while True:
-            try:
-                conn, _ = self._sock.accept()
-            except OSError:
-                return
-            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
-
-    def _handle(self, conn: socket.socket) -> None:
-        upstream = None
-        try:
-            head = conn.recv(8192)
-            if not head:
-                return
-            upstream = socket.create_connection(("127.0.0.1", self._redirect_to),
-                                                timeout=8)
-            if head.split(b" ", 1)[0].upper() == b"CONNECT":
-                conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            else:
-                upstream.sendall(head)
-            threading.Thread(target=_pipe, args=(conn, upstream), daemon=True).start()
-            _pipe(upstream, conn)
-        except Exception:  # noqa: BLE001
-            pass
-        finally:
-            for s in (conn, upstream):
-                if s is not None:
-                    try:
-                        s.close()
-                    except OSError:
-                        pass
 
 
 class _Echo(BaseHTTPRequestHandler):
@@ -130,31 +68,6 @@ class _Echo(BaseHTTPRequestHandler):
 
 
 # ── fixtures ─────────────────────────────────────────────────────
-@pytest.fixture
-def tmp_data_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOLDEXAR_DATA_DIR", str(tmp_path))
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-    yield tmp_path
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-
-
-@pytest.fixture
-def kernel_exe_path(tmp_data_dir) -> Path:
-    for candidate in (
-        clash_manager.kernel_exe(tmp_data_dir),
-        clash_manager.bundled_clash_dir() / kernel_filename(),
-        *(
-            sorted(Path(os.environ["LOCALAPPDATA"]).glob(f"holdexar*/clash/{kernel_filename()}"))
-            if os.environ.get("LOCALAPPDATA") else []
-        ),
-    ):
-        if candidate.is_file():
-            return candidate
-    pytest.skip("本机没有可用的 mihomo 内核资产（assets/clash/ 不随仓库分发）")
 
 
 @pytest.fixture

@@ -1,4 +1,4 @@
-"""proxypool 域模型：节点注册表、出口组、lane 租约与运行台账。
+"""proxypool 域模型：节点注册表、健康观测与运行台账。
 
 Registry 是事实源，pool 文件只是它的运行时产物：节点身份、健康证据与调度
 台账都落在这里，下游只读不反倒写。
@@ -26,7 +26,6 @@ from sqlalchemy import (
     JSON,
     Boolean,
     DateTime,
-    Float,
     Index,
     Integer,
     String,
@@ -35,7 +34,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
-from app.domains.proxypool.state import LANE_EMPTY, NODE_NEW
+from app.domains.proxypool.state import NODE_NEW
 
 # 不参与节点身份的键：命名必然随来源而变，开关由消费侧自行覆盖，
 # 两者都不改变「这个节点是谁」。
@@ -176,46 +175,15 @@ class ProxyNode(Base):
     last_seen: Mapped[datetime | None] = mapped_column(DateTime)
     # 最后一次出现在订阅快照里的时刻（登记/刷新时推进）
     last_source_seen: Mapped[datetime | None] = mapped_column(DateTime)
+    # 最近一次成功 L0 探测的延迟与时刻（出口槽排序键的持久化形态）。
+    # L0 成功只更新这两列、不落观测行——全池 5min 一拍的延迟流水会把
+    # health_observations 撑成每天数万行；失败才留观测（证据归流水）。
     last_l0_at: Mapped[datetime | None] = mapped_column(DateTime)
+    l0_delay_ms: Mapped[int | None] = mapped_column(Integer)
     last_l1_at: Mapped[datetime | None] = mapped_column(DateTime)
     last_l2_at: Mapped[datetime | None] = mapped_column(DateTime)
     exit_ip: Mapped[str | None] = mapped_column(String(64), index=True)
-    exit_group_id: Mapped[int | None] = mapped_column(Integer)
     consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
-    # 业务容量：由 L2 真实批次测得；L0 的小负载延迟不参与（NULL=未测）
-    capacity_score: Mapped[float | None] = mapped_column(Float)
-
-
-class ExitGroup(Base):
-    """出口组：以出口 IP 为身份聚合共享出口的节点，调度按组而非按节点记账。"""
-
-    __tablename__ = "exit_groups"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    exit_id: Mapped[str] = mapped_column(String(64), unique=True)
-    exit_ip: Mapped[str] = mapped_column(String(64), unique=True, index=True)
-    primary_node_id: Mapped[str | None] = mapped_column(String(64))
-    node_count: Mapped[int] = mapped_column(Integer, default=0)
-    l2_ok: Mapped[bool | None] = mapped_column(Boolean)
-    last_verified_at: Mapped[datetime | None] = mapped_column(DateTime)
-    capacity_score: Mapped[float | None] = mapped_column(Float)
-    first_seen: Mapped[datetime | None] = mapped_column(DateTime)
-    last_seen: Mapped[datetime | None] = mapped_column(DateTime)
-
-
-class Lane(Base):
-    """爬虫 worker 的稳定代理工位：一个 listener + 当前出口组 / 节点绑定。"""
-
-    __tablename__ = "lanes"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    lane_index: Mapped[int] = mapped_column(Integer, unique=True)
-    listener_port: Mapped[int] = mapped_column(Integer)
-    state: Mapped[str] = mapped_column(String(16), default=LANE_EMPTY)
-    exit_group_id: Mapped[int | None] = mapped_column(Integer)
-    node_id: Mapped[str | None] = mapped_column(String(64))
-    generation: Mapped[int | None] = mapped_column(Integer)
-    last_switch_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
 class ProxyRunExit(Base):
@@ -249,38 +217,6 @@ class ProxyRunExit(Base):
     other: Mapped[int] = mapped_column(Integer, default=0)
     duration_ms: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime | None] = mapped_column(DateTime)
-
-
-class PoolGeneration(Base):
-    """池发布的版本号：写盘前落 PENDING，内核对账数相符才置 COMMITTED。"""
-
-    __tablename__ = "pool_generations"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    generation: Mapped[int] = mapped_column(Integer, unique=True, index=True)
-    pool_sha256: Mapped[str] = mapped_column(String(64))
-    expected_node_count: Mapped[int] = mapped_column(Integer)
-    observed_node_count: Mapped[int | None] = mapped_column(Integer)
-    status: Mapped[str] = mapped_column(String(16), default="PENDING")
-    error: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime | None] = mapped_column(DateTime)
-    committed_at: Mapped[datetime | None] = mapped_column(DateTime)
-
-
-class WorkerLease(Base):
-    """Worker 租约：worker 只见 lease，不直接操纵节点与内核。"""
-
-    __tablename__ = "worker_leases"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    lease_id: Mapped[str] = mapped_column(String(64), unique=True)
-    worker_id: Mapped[str] = mapped_column(String(64), index=True)
-    lane_index: Mapped[int] = mapped_column(Integer)
-    generation: Mapped[int] = mapped_column(Integer)
-    acquired_at: Mapped[datetime | None] = mapped_column(DateTime)
-    released_at: Mapped[datetime | None] = mapped_column(DateTime)
-    request_count: Mapped[int] = mapped_column(Integer, default=0)
-    error_count: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class HealthObservation(Base):
@@ -364,9 +300,9 @@ class SubscriptionSnapshot(Base):
 class ProxyJobRun(Base):
     """生产作业台账：一次真实 `run_crawl` = 一行，**只记事实，不下健康结论**。
 
-    边界（定稿见 `docs/PROXYPOOL_HANDOVER_P1.7_NEXT.md` §13/§14）：
+    边界：
 
-    - **不按 HTTP 请求记账**。爬虫的计量单位是「任务 = 一区 × 一批 ≤400 appid」
+    - **不按 HTTP 请求记账**。爬虫的计量单位是「任务 = 一区 × 一批 ≤300 appid」
       （`CrawlerScheduler.counts()`），所以字段是 `task_count`，不是 request_count。
       `task_count` 的口径是**计划任务数**（`scheduler.total_target`）：中断的作业里
       它可以大于 `success_count + error_count`（计划 2、完成 1 就记 2/1/0）。
@@ -376,8 +312,8 @@ class ProxyJobRun(Base):
     - `selected_node` / `node_exit_ip` 是**一等列而非 mapping**：运行时是
       `mode: global` + 单个 mixed-port，一轮作业全程只有一个 GLOBAL 选中节点，
       `error_summary` 里放 `by_node` 字典反而会让人以为一轮跑过很多节点。
-    - `active_subscription_id` 目前**恒为 NULL**：Active/Candidate 尚未实现，
-      当下的事实是「池内合格节点的全部来源订阅」→ `subscription_ids_json`。
+    - 池内合格节点的来源订阅是**全部计入** `subscription_ids_json`——池是多订阅
+      共享的，不存在单一「生产订阅」。
     - `error_summary` 只放**固定枚举**计数（见 `jobruns.ERROR_KINDS`），不放自由文本：
       异常串可能带 URL/凭据，且长度无界。
     - 主键 `id` 就是作业身份，**不另造 `run_id`**（两套身份是本项目明令禁止的形态）。
@@ -413,9 +349,6 @@ class ProxyJobRun(Base):
     # 池内合格节点的全部来源订阅 + 各订阅最新 OK 快照（事实，不是「生产订阅」）
     subscription_ids_json: Mapped[list | None] = mapped_column(JSON)
     snapshot_ids_json: Mapped[list | None] = mapped_column(JSON)
-    # **v1 恒 NULL**：留给 Active/Candidate 落地后回填（不预留 pool_generation——
-    # 那个概念连事实源都还没有，等发布协议真落地再加列）
-    active_subscription_id: Mapped[int | None] = mapped_column(Integer)
     task_count: Mapped[int | None] = mapped_column(Integer)
     success_count: Mapped[int | None] = mapped_column(Integer)
     error_count: Mapped[int | None] = mapped_column(Integer)

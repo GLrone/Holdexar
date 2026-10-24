@@ -523,6 +523,7 @@ async def test_l2_tunnel_failure_vs_target_vs_uncertain_state_and_exitstats(
             }
             assert obs[rows["1|uncertain-502"].node_id].startswith(H.UNCERTAIN_FAILURE)
 
+            # 环境级失败：本作业所有出口零响应（断网/上游全断）不构成节点证据
             await E._writeback_production_evidence(
                 s,
                 [
@@ -536,9 +537,27 @@ async def test_l2_tunnel_failure_vs_target_vs_uncertain_state_and_exitstats(
                 now,
             )
             await s.commit()
-            assert rows["1|target-502"].consecutive_failures == 3
+            assert rows["1|target-502"].consecutive_failures == 2
+            assert rows["1|target-502"].state == NODE_ACTIVE
+
+            # 出口级失败：环境确认存活（有出口拿到 Steam 响应）时，零响应出口
+            # 判 DEAD（可复活）但不累加探测死亡计数——退休只归健康探测。
+            await E._writeback_production_evidence(
+                s,
+                [
+                    {"exit_ip": "198.51.100.3", "success": 2},
+                    {"exit_ip": "198.51.100.1", "success": 0, "tunnel_error": 1},
+                ],
+                {
+                    "198.51.100.3": rows["1|uncertain-502"].node_id,
+                    "198.51.100.1": rows["1|target-502"].node_id,
+                },
+                now,
+            )
+            await s.commit()
+            assert rows["1|target-502"].consecutive_failures == 2
             assert rows["1|target-502"].state == NODE_DEAD
-            assert rows["1|uncertain-502"].consecutive_failures == 2
+            assert rows["1|uncertain-502"].consecutive_failures == 0
             assert rows["1|uncertain-502"].state == NODE_ACTIVE
     finally:
         get_settings.cache_clear()

@@ -43,7 +43,6 @@ from app.crawler.occupancy import (
     maintenance_kind,
 )
 from app.domains.proxypool.bridge import (
-    ingest_ledger,
     purge_orphan_subscription_sources,
     rebind_missing_sources,
 )
@@ -58,7 +57,6 @@ from app.domains.proxypool.health import (
     exit_ip_check_pool,
     health_check_pool,
     latest_l0_delays,
-    recover_dead_nodes,
 )
 from app.domains.proxypool.dead_probe import recover_dead_nodes_self_hosted
 from app.domains.proxypool.models import HealthRun
@@ -351,24 +349,22 @@ async def run_l0_cycle(
     secret: str,
     now: datetime,
     target_url: str | None = None,
-    recovery_controller: tuple[str, str] | None = None,
 ) -> tuple[HealthOutcome, ...]:
     """L0：传输层健康。**可与 crawl 并行**（不动 `GLOBAL`）。
 
     只做两件事：改 `state`；若合格集因此变化，置 `rebuild_pending`。
     重建交给空闲时的 `run_pending_rebuild()`——占线时绝不 stop 内核。
 
-    池内 L0 之外，还对 DEAD 节点分批做恢复探测（`recovery_controller` = 持有这些节点
-    配置的内核）：DEAD 不在池文件里，池内 L0 永远探不到它，没有这条路径节点一旦 DEAD
+    池内 L0 之外，还对 DEAD 节点分批做恢复探测（自建临时内核逐节点渲染探测）：DEAD 不在池文件里，池内 L0 永远探不到它，没有这条路径节点一旦 DEAD
     就永久出局、失败计数也停住。恢复成功使节点重新合格，合格集变化由下面的
     before/after 比较去请求重建。
 
     **写锁窗口**：池内探针按 `L0_COMMIT_EVERY` 分块，逐块提交——整池一次提交会随池规模
     把写锁按住数分钟，同时段其它 job 的写入会撞满 `busy_timeout`。
     """
-    # 两账本对齐（体检 → 池）：先按已准入订阅的最新成功快照补回缺失的来源关联
-    # （缺来源在合格集口径里等于出局，不补回就永久不可探），再把已落库的节点体检
-    # 结论按来源推进池账本。前沿放在合格集快照之前——复活节点带来的合格集变化由
+    # 来源自愈（体检 → 池）：先按已准入订阅的最新成功快照补回缺失的来源关联
+    # （缺来源在合格集口径里等于出局，不补回就永久不可探），再清理失主来源。
+    # 前沿放在合格集快照之前——复活节点带来的合格集变化由
     # 下面的 before/after 比较照常请求重建，不新增调度、不新增信号。
     # 对齐失败只记日志：它是维护动作，不得拖垮 L0 与重建判定。
     # 对齐是写事务：过写调度器提交，随后的合格集读才不会把挂起写入
@@ -393,18 +389,6 @@ async def run_l0_cycle(
                     tag="已修复",
                     detail={"订阅编号": "、".join(str(i) for i in repaired)},
                 )
-            ingested = await ingest_ledger(session, now=now)
-            if ingested.changed:
-                log_event(
-                    logger,
-                    f"体检结果与池账本对齐：命中 {ingested.matched} 个节点",
-                    detail={
-                        "命中": ingested.matched,
-                        "复活": ingested.activated,
-                        "失活": ingested.deactivated,
-                        "新增出口": ingested.exit_ips_added,
-                    },
-                )
             await session.commit()
         except Exception:  # noqa: BLE001 —— 对齐失败不阻断 L0 与重建判定
             log_event(
@@ -425,18 +409,12 @@ async def run_l0_cycle(
             session, data_dir=data_dir, controller_url=controller_url, secret=secret,
             now=now, names=chunk, **extra,
         ))
-    if recovery_controller is not None:
-        await recover_dead_nodes(
-            session, controller_url=recovery_controller[0], secret=recovery_controller[1],
-            now=now, **extra,
-        )
-    else:
-        # 旧链路内核不在（用户没跑这个可选进程）时，用自建临时内核兜底：从数据库
-        # 现取 DEAD 节点的配置渲染一份最小内核，逐节点探测后立即停掉。没有这条
-        # 路径时，旧链路内核不在 = 恢复通道整体失效 = 判死的节点永久出局。
-        await recover_dead_nodes_self_hosted(
-            session, data_dir=data_dir, now=now, **extra,
-        )
+    # 恢复探测一律走自建临时内核：从数据库现取 DEAD 节点的配置渲染一份最小
+    # 内核，逐节点探测后立即停掉——不依赖旧链路内核在场（旧内核不在 ≠ 节点
+    # 永久出局）。
+    await recover_dead_nodes_self_hosted(
+        session, data_dir=data_dir, now=now, **extra,
+    )
     if await eligible_runtime_names(session) != before:
         request_rebuild()
     return tuple(outcomes)
@@ -628,21 +606,32 @@ async def _rebuild_skip_reason(session: AsyncSession, *, data_dir: Path) -> str 
         if set(pool_file_names(data_dir)) != eligible:
             return None
         ports = runtime_lane_ports(data_dir)
-        slots = select_exit_slots(
-            await eligible_nodes(session), delays=await latest_l0_delays(session)
-        )
+        nodes = await eligible_nodes(session)
+        slots = select_exit_slots(nodes, delays=await latest_l0_delays(session))
         # 期望 lane 数必须与重建的口径一致（`len(slots) or None` 走 lane_count_for），
         # 否则闸会放过/误伤与重建产物不同的现状
         expected_lanes = lane_count_for(len(eligible), len(slots) or None)
         if len(ports) != expected_lanes:
             return None
         plan = {int(e.get("lane", -1)): e for e in read_lane_plan(data_dir)}
-        for i, slot in enumerate(slots):
-            entry = plan.get(i) or {}
-            node = str(entry.get("node") or "")
-            exit_ip = str(entry["exitIp"]) if entry.get("exitIp") else None
-            if node != slot.runtime_name or exit_ip != slot.exit_ip:
+        # 重建必要性按**稳定身份**比较：出口集合一致 + 每个 lane 绑定的节点仍合格
+        # 且其当前出口身份未变。延迟排序漂移只换同一出口的代表节点，不换容量与
+        # 限流预算——不构成重建目标，避免 L0 刷新驱动无谓重建。双方都无出口身份
+        # 时（未跑过 L1）保留原口径：池文件一致 + lane 数一致即可。
+        plan_exits = {str(e["exitIp"]) for e in plan.values() if e.get("exitIp")}
+        slot_exits = {s.exit_ip for s in slots if s.exit_ip}
+        if plan_exits or slot_exits:
+            if plan_exits != slot_exits:
                 return None
+            by_name = {n.runtime_name: n for n in nodes}
+            plan_by_exit = {
+                str(e["exitIp"]): str(e.get("node") or "")
+                for e in plan.values() if e.get("exitIp")
+            }
+            for exit_ip, node_name in plan_by_exit.items():
+                node = by_name.get(node_name)
+                if node is None or (node.exit_ip or "") != exit_ip:
+                    return None
         if alive:
             return "池与 lane 计划均与现状一致：重建无目标差异"
         return None
@@ -787,7 +776,6 @@ async def run_proxypool_cycle(
     l1_url: str | None = None,
     l2_url: str | None = None,
     appid: int = DEFAULT_BUSINESS_APPID,
-    recovery_controller: tuple[str, str] | None = None,
 ) -> ProxypoolCycleResult:
     """一个周期的固定顺序：**先判断节点是否坏了，再决定重建，重建后才做依赖 GLOBAL 的维护。**
 
@@ -808,7 +796,7 @@ async def run_proxypool_cycle(
     """
     l0 = await run_l0_cycle(
         session, data_dir=data_dir, controller_url=controller_url, secret=secret,
-        now=now, target_url=l0_target_url, recovery_controller=recovery_controller,
+        now=now, target_url=l0_target_url,
     )
     # L0 段的提交边界（docstring「L0 独立提交一次」）：池函数已内部过闸提交，
     # 此处兜住任何未在内部提交的 L0 段写入，维护开始前写锁必已放开

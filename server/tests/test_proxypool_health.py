@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import json
-import os
 import socket
 import threading
 from datetime import datetime
@@ -21,14 +20,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+
+from proxy_helpers import pipe as _pipe
 from sqlalchemy import select, update
 
 from app.crawler.browse_store import StoreBrowseAPI  # noqa: E402
-from app.core.config import get_settings  # noqa: E402
-from app.core.database import get_engine, get_session_factory, init_db  # noqa: E402
-from app.domains.proxies import clash_manager  # noqa: E402
+from app.core.database import get_session_factory, init_db  # noqa: E402
 from app.domains.proxies.clash_manager import ClashRuntime  # noqa: E402
-from app.domains.proxies.kernel_release import kernel_filename  # noqa: E402
 from app.domains.proxies.models import ADMISSION_ACTIVE, ProxySubscription
 from app.domains.proxypool.health import (  # noqa: E402
     BUSINESS_OK,
@@ -90,21 +88,6 @@ async def test_controller_auth_failure_is_not_node_failure(status, valid):
 
 
 # ── 本地真实 CONNECT 隧道代理（当"可用节点"用）────────────────────
-def _pipe(a: socket.socket, b: socket.socket) -> None:
-    try:
-        while True:
-            chunk = a.recv(65536)
-            if not chunk:
-                break
-            b.sendall(chunk)
-    except OSError:
-        pass
-    finally:
-        for s in (a, b):
-            try:
-                s.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
 
 
 def _tunnel(conn: socket.socket, redirect_to: int | None = None) -> None:
@@ -241,31 +224,6 @@ def _closed_port() -> int:
 
 
 # ── fixtures ─────────────────────────────────────────────────────
-@pytest.fixture
-def tmp_data_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOLDEXAR_DATA_DIR", str(tmp_path))
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-    yield tmp_path
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-
-
-@pytest.fixture
-def kernel_exe_path(tmp_data_dir) -> Path:
-    for candidate in (
-        clash_manager.kernel_exe(tmp_data_dir),
-        clash_manager.bundled_clash_dir() / kernel_filename(),
-        *(
-            sorted(Path(os.environ["LOCALAPPDATA"]).glob(f"holdexar*/clash/{kernel_filename()}"))
-            if os.environ.get("LOCALAPPDATA") else []
-        ),
-    ):
-        if candidate.is_file():
-            return candidate
-    pytest.skip("本机没有可用的 mihomo 内核资产（assets/clash/ 不随仓库分发）")
 
 
 @pytest.fixture
@@ -415,10 +373,14 @@ async def test_working_node_gets_a_delay(tmp_data_dir, kernel_exe_path,
     assert isinstance(outcome.delay_ms, int) and outcome.delay_ms >= 0
     assert outcome.runtime_name == "1|香港01"
 
+    # L0 成功只把延迟挂到节点行（不落观测行——成功流水没有读取方）
     async with get_session_factory()() as s:
-        obs = (await s.execute(select(HealthObservation))).scalar_one()
-    assert obs.level == "L0" and obs.ok is True
-    assert obs.latency_ms == outcome.delay_ms and obs.observed_at == NOW
+        node = (await s.execute(
+            select(ProxyNode).where(ProxyNode.runtime_name == "1|香港01")
+        )).scalar_one()
+        assert node.l0_delay_ms == outcome.delay_ms
+        assert node.last_l0_at is not None
+        assert (await s.execute(select(HealthObservation))).scalar_one_or_none() is None
 
     assert PROBE_TARGET_URL == "http://www.gstatic.com/generate_204", (
         "L0 只证传输可用：目标必须是最轻的连通性探测，且不得是生产业务主机"
@@ -633,7 +595,7 @@ async def test_l1_success_records_observation_and_exit_ip_only(
     assert node.exit_ip == "203.0.113.10"
     assert node.state == NODE_ACTIVE, "L1 只记录观测，状态归规则层"
     assert node.last_l0_at is None, "L1 不得把耗时写进 L0 字段"
-    assert node.capacity_score is None and node.consecutive_failures == 0
+    assert node.consecutive_failures == 0
 
     async with get_session_factory()() as s:
         rows = list((await s.execute(select(HealthObservation))).scalars())

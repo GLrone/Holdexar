@@ -11,6 +11,7 @@ from pathlib import Path
 import httpx
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -53,7 +54,7 @@ async def test_unprobed_results_preserve_previous_subscription_verdict(db, monke
     sid = await _add_sub(db, last_stats={"alive": 1, "total": 1})
     result = await proxies_service._apply_node_results(
         sid, {}, [{"name": "one", "alive": False, "probed": False}],
-        ["one"], datetime.now(),
+        ["one"], datetime.now(), {},
     )
     assert result[0] == 1 and result[2] is False
     async with db() as session:
@@ -71,12 +72,16 @@ async def test_subscription_list_marks_expired_resources_unavailable(db):
 
 @pytest.mark.asyncio
 async def test_mixed_probe_failure_keeps_unprobed_healthy_node_available(db):
+    from datetime import timedelta
+
     sid = await _add_sub(db, last_stats={"alive": 1, "total": 2})
+    await _seed_registry_node(db, sid, "known", exit_ip="1.1.1.1")
     result = await proxies_service._apply_node_results(
-        sid, {"known": {"status": "ok", "exit_ip": "1.1.1.1"}},
+        sid, {"known": datetime.now() + timedelta(minutes=30)},
         [{"name": "known", "alive": False, "probed": False},
          {"name": "failed", "alive": False, "probed": True, "ms": None}],
         ["known", "failed"], datetime.now(),
+        await _registry_map(db, sid, ["known", "failed"]),
     )
     assert result == (1, 1, False)
 
@@ -104,6 +109,40 @@ async def _get_sub(db, sub_id: int) -> ProxySubscription:
         return await session.get(ProxySubscription, sub_id)
 
 
+async def _seed_registry_node(db, sub_id: int, name: str, *, exit_ip: str | None = None) -> None:
+    """权威账本节点种子：冷却跳过节点的存活口径读它。"""
+    from datetime import timedelta
+
+    from app.domains.proxypool.models import ProxyNode
+    from app.domains.proxypool.state import NODE_ACTIVE
+
+    async with db() as session:
+        session.add(ProxyNode(
+            node_id=f"{sub_id}-{name}", fingerprint=f"{sub_id}-{name}",
+            runtime_name=f"{sub_id}|{name}", proxy_type="http", server="127.0.0.1",
+            normalized_config={"name": name, "type": "http", "server": "127.0.0.1", "port": 80},
+            state=NODE_ACTIVE, subscription_id=sub_id, original_name=name,
+            exit_ip=exit_ip, last_l2_at=datetime.now() - timedelta(seconds=1),
+        ))
+        await session.commit()
+
+
+async def _registry_map(db, sub_id: int, names: list[str]) -> dict:
+    from app.domains.proxypool.models import ProxyNode
+
+    async with db() as session:
+        rows = (
+            await session.execute(
+                select(ProxyNode).where(
+                    ProxyNode.original_name.in_(names),
+                    (ProxyNode.subscription_id == sub_id)
+                    | ProxyNode.runtime_name.like(f"{sub_id}|%"),
+                )
+            )
+        ).scalars().all()
+        return {n.original_name: n for n in rows if n.original_name}
+
+
 # ─── 手动改名 ────────────────────────────────────────────────
 
 
@@ -112,10 +151,10 @@ async def test_rename_set_and_clear(db):
     """改名正常落库；空串清名回 None（订阅名由用户手动维护）。"""
     sub_id = await _add_sub(db)
 
-    renamed = await proxies_service.update_subscription_label(sub_id, "  我的机场  ")
+    renamed = await proxies_service.update_subscription(sub_id, label="  我的机场  ")
     assert renamed["label"] == "我的机场"
 
-    cleared = await proxies_service.update_subscription_label(sub_id, "   ")
+    cleared = await proxies_service.update_subscription(sub_id, label="   ")
     assert cleared["label"] is None
     assert (await _get_sub(db, sub_id)).label is None
 
@@ -123,7 +162,7 @@ async def test_rename_set_and_clear(db):
 @pytest.mark.asyncio
 async def test_rename_missing_subscription(db):
     with pytest.raises(ValueError, match="订阅不存在"):
-        await proxies_service.update_subscription_label(999, "x")
+        await proxies_service.update_subscription(999, label="x")
 
 
 # ─── 编辑订阅（改名 + 换链接自动重拉）─────────────────────────
@@ -564,7 +603,7 @@ async def test_apply_node_results_records_alive(db):
          "ms": 200, "duplicate": False, "probed": True},
     ]
     alive, unique_alive, deprecated = await proxies_service._apply_node_results(
-        sub_id, {}, results, ["节点A", "节点B"], datetime(2026, 9, 5, 12, 0, 0)
+        sub_id, {}, results, ["节点A", "节点B"], datetime(2026, 9, 5, 12, 0, 0), {}
     )
 
     assert alive == 1
@@ -1154,7 +1193,7 @@ def test_download_attempts_proxy_channels_before_direct(monkeypatch):
     """内核在跑、有已存代理、本地口可达 → 直连排最后（订阅域名直连多数
     被墙，直连打头会让每次刷新都先白等一次超时）。"""
     monkeypatch.setattr(clash_manager, "LOCAL_MIXED_PORTS", (7897,))
-    monkeypatch.setattr(clash_manager, "_port_reachable", lambda port: port == 7897)
+    monkeypatch.setattr(clash_manager, "_port_listening", lambda port: port == 7897)
     attempts = clash_manager._download_attempts(
         runtime_port=17890, proxy_url=["http://1.2.3.4:8080"]
     )
@@ -1443,44 +1482,6 @@ async def test_remembered_selection_roundtrip(db):
 
 
 @pytest.mark.asyncio
-async def test_download_subscription_cache_fallback_when_all_channels_fail(
-    monkeypatch, tmp_path,
-):
-    """全部下载通道失败且该订阅有本地缓存 → 用缓存启动语义成立（cached=True）；
-    无缓存才抛最后一错。这是「订阅失效不让内核起不来」的兜底一环。"""
-    r = clash_manager.ClashRuntime()
-
-    class _DownClient:
-        def __init__(self, **kw):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc):
-            return False
-
-        async def get(self, url, **kw):
-            raise httpx.ConnectError("all channels down")
-
-    monkeypatch.setattr(clash_manager.httpx, "AsyncClient", _DownClient)
-
-    cache = clash_manager.kernel_dir(tmp_path) / "config.yaml"
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    cache.write_text(_MINI_CONFIG, encoding="utf-8")
-
-    meta = await r.download_subscription("https://dead.example/sub", tmp_path)
-    assert meta["cached"] is True
-    assert meta["nodes"] == 1
-
-    empty_dir = tmp_path / "fresh"
-    from app.domains.proxypool.subscription import FetchFailedError
-
-    with pytest.raises(FetchFailedError):
-        await r.download_subscription("https://dead.example/sub", empty_dir)
-
-
-@pytest.mark.asyncio
 async def test_snapshot_only_uses_valid_subscription_cache_when_snapshot_is_absent(
     db, monkeypatch, tmp_path,
 ):
@@ -1520,14 +1521,12 @@ async def test_snapshot_only_rejects_cache_tagged_for_previous_subscription_url(
     async with db() as session:
         subscription = await session.get(ProxySubscription, sub_id)
         subscription.url = new_url
+        subscription.cache_url_identity = subscription_url_identity(SUB_URL)
         await session.commit()
 
     target = clash_manager.subscription_config_path(tmp_path, sub_id)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(_MINI_CONFIG, encoding="utf-8")
-    clash_manager.write_subscription_meta(tmp_path, sub_id, {
-        "urlIdentity": subscription_url_identity(SUB_URL),
-    })
 
     async def unexpected_fetch(*_args, **_kwargs):
         raise AssertionError("snapshot-only startup must not access the network")
@@ -1631,39 +1630,31 @@ def test_subscription_meta_roundtrip_and_corruption(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_cache_fallback_keeps_last_known_title_and_traffic(monkeypatch, tmp_path):
-    """降级回读缓存时必须沿用上次成功拉到的标题与流量。
+async def test_snapshot_only_cache_fallback_keeps_last_known_title_and_traffic(
+    db, monkeypatch, tmp_path,
+):
+    """快照缺失降级回读缓存时沿用上次成功拉到的标题与流量。
 
     回归：此前降级分支写死 title/userinfo 为 None，一次网络抖动就让订阅名与
     流量在界面上消失（真实案例：订阅 3 三通道全 ConnectError → label 为空、
     traffic 为 null）。
     """
-    r = clash_manager.ClashRuntime()
-
-    class _DownClient:
-        def __init__(self, **kw):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc):
-            return False
-
-        async def get(self, url, **kw):
-            raise httpx.ConnectError("all channels down")
-
-    monkeypatch.setattr(clash_manager.httpx, "AsyncClient", _DownClient)
-
-    target = clash_manager.subscription_config_path(tmp_path, 9)
+    sub_id = await _add_sub(db)
+    target = clash_manager.subscription_config_path(tmp_path, sub_id)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(_MINI_CONFIG, encoding="utf-8")
     clash_manager.write_subscription_meta(
-        tmp_path, 9, {"title": "赔钱机场", "userinfo": USERINFO}
+        tmp_path, sub_id, {"title": "赔钱机场", "userinfo": USERINFO}
     )
 
-    meta = await r.download_subscription(
-        "https://dead.example/sub", tmp_path, target_path=target
+    async def unexpected_fetch(*_args, **_kwargs):
+        raise AssertionError("snapshot-only startup must not access the network")
+
+    from app.domains.proxypool import subscription as subscription_fetch
+    monkeypatch.setattr(subscription_fetch, "fetch_subscription", unexpected_fetch)
+
+    meta = await clash_manager.ClashRuntime().download_subscription(
+        SUB_URL, tmp_path, [], target_path=target, snapshot_only=True,
     )
     assert meta["cached"] is True
     assert meta["title"] == "赔钱机场"
@@ -1671,40 +1662,31 @@ async def test_cache_fallback_keeps_last_known_title_and_traffic(monkeypatch, tm
 
 
 @pytest.mark.asyncio
-async def test_successful_download_persists_meta_sidecar(monkeypatch, tmp_path):
-    """成功下载时响应头（标题/流量）随正文一并落 sidecar，供后续降级取用。"""
-    r = clash_manager.ClashRuntime()
+async def test_successful_download_persists_meta_sidecar(db, monkeypatch, tmp_path):
+    """成功同步后响应头（标题/流量）随快照落 sidecar，供离线降级取用。"""
+    sub_id = await _add_sub(db)
+    target = clash_manager.subscription_config_path(tmp_path, sub_id)
 
-    class _OkClient:
-        def __init__(self, **kw):
-            pass
+    from app.domains.proxypool import bootstrap as bs
+    from app.domains.proxypool.subscription import FORMAT_YAML, FetchResult
 
-        async def __aenter__(self):
-            return self
+    async def ok_fetch(_url, _channels, **_kw):
+        return FetchResult(
+            raw=_MINI_CONFIG.encode("utf-8"), http_status=200,
+            content_type="text/yaml", channel="direct", fmt=FORMAT_YAML,
+            profile_title="base64:" + base64.b64encode("我的机场".encode()).decode(),
+            userinfo=USERINFO,
+        )
 
-        async def __aexit__(self, *exc):
-            return False
+    monkeypatch.setattr(bs, "fetch_subscription", ok_fetch)
 
-        async def get(self, url, **kw):
-            return httpx.Response(
-                200, text=_MINI_CONFIG,
-                headers={
-                    "profile-title": "base64:" + base64.b64encode("我的机场".encode()).decode(),
-                    "subscription-userinfo": USERINFO,
-                },
-                request=httpx.Request("GET", url),
-            )
-
-    monkeypatch.setattr(clash_manager.httpx, "AsyncClient", _OkClient)
-
-    target = clash_manager.subscription_config_path(tmp_path, 11)
-    meta = await r.download_subscription(
-        "https://ok.example/sub", tmp_path, target_path=target
+    meta = await clash_manager.ClashRuntime().download_subscription(
+        SUB_URL, tmp_path, [], target_path=target,
     )
     assert meta["cached"] is False
     assert meta["title"] == "我的机场"
 
-    saved = clash_manager.read_subscription_meta(tmp_path, 11)
+    saved = clash_manager.read_subscription_meta(tmp_path, sub_id)
     assert saved["title"] == "我的机场"
     assert saved["userinfo"] == USERINFO
 
@@ -1810,19 +1792,6 @@ proxy-groups:
 """
 
 
-def test_parse_info_node_traffic_reads_remaining_quota():
-    """响应头缺失时从占位节点取剩余流量（与头的同一事实的第二来源）。"""
-    assert clash_manager.parse_info_node_traffic(_INFO_NODE_CONFIG) == "剩余流量：19.48 GB"
-
-
-def test_parse_info_node_traffic_none_when_absent():
-    """没有占位节点 / 内容坏 / 非映射 一律给 None（不抛）。"""
-    assert clash_manager.parse_info_node_traffic(_MINI_CONFIG) is None
-    assert clash_manager.parse_info_node_traffic(":: 坏 yaml ::") is None
-    assert clash_manager.parse_info_node_traffic("- 不是映射") is None
-
-
-# ─── 名称回退：凭据串不当机场名 ─────────────────────────────────
 
 
 def test_auto_name_skips_opaque_url_token():
@@ -1890,7 +1859,7 @@ async def test_name_chain_user_rename_wins_over_panel(db):
     """③ 用户真改过 → 机场改名不许覆盖（第一顺位锁死）。"""
     sid = await _add_sub(db)
     await proxies_service.apply_subscription_name_chain(sid, "赔钱机场")
-    await proxies_service.update_subscription_label(sid, "我的主力机场")
+    await proxies_service.update_subscription(sid, label="我的主力机场")
 
     got = await proxies_service.apply_subscription_name_chain(sid, "跑路机场")
 
@@ -1912,7 +1881,7 @@ async def test_saving_unchanged_name_is_not_a_user_rename(db):
     await proxies_service.apply_subscription_name_chain(sid, "赔钱机场")
 
     # 原样保存（值未变）
-    await proxies_service.update_subscription_label(sid, "赔钱机场")
+    await proxies_service.update_subscription(sid, label="赔钱机场")
 
     async with db() as session:
         row = await session.get(ProxySubscription, sid)
@@ -2004,7 +1973,7 @@ async def test_traffic_falls_back_to_ledger_when_fetch_fails(db):
 async def test_user_rename_does_not_affect_traffic(db):
     """名称与流量两条链互不干涉：用户改了名字，流量照样认机场给的最新值。"""
     sid = await _add_sub(db, last_stats={"traffic": "download=1"})
-    await proxies_service.update_subscription_label(sid, "我的主力机场")
+    await proxies_service.update_subscription(sid, label="我的主力机场")
 
     assert await proxies_service._resolve_traffic(sid, "download=555") == "download=555"
 
@@ -2014,36 +1983,3 @@ async def test_user_rename_does_not_affect_traffic(db):
     assert row.last_stats["labelSource"] == proxies_service.LABEL_SOURCE_USER
 
 
-@pytest.mark.asyncio
-async def test_cache_fallback_recovers_traffic_from_info_node(monkeypatch, tmp_path):
-    """从未成功拉过的订阅：sidecar 为空，仍能从缓存正文的占位节点取到用量。
-
-    回归：订阅 3 的链接返回 404，缓存里明明写着「剩余流量：19.48 GB」，
-    界面上流量却是空的。
-    """
-    r = clash_manager.ClashRuntime()
-
-    class _DownClient:
-        def __init__(self, **kw):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc):
-            return False
-
-        async def get(self, url, **kw):
-            raise httpx.ConnectError("all channels down")
-
-    monkeypatch.setattr(clash_manager.httpx, "AsyncClient", _DownClient)
-
-    target = clash_manager.subscription_config_path(tmp_path, 13)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(_INFO_NODE_CONFIG, encoding="utf-8")
-
-    meta = await r.download_subscription(
-        "https://dead.example/sub", tmp_path, target_path=target
-    )
-    assert meta["cached"] is True
-    assert meta["userinfo"] == "剩余流量：19.48 GB"

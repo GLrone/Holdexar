@@ -7,10 +7,53 @@
 from __future__ import annotations
 
 import json
+from urllib.parse import quote
 
 import pytest
 
 from app.domains.proxypool import health as H
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("probe_name", ["probe_exit_ip", "probe_business"])
+@pytest.mark.parametrize("selector", [None, "probe lane/1"])
+@pytest.mark.parametrize("selected", ["1|probe", "other-node"])
+async def test_probe_verifies_its_selector_before_request(
+    monkeypatch, probe_name, selector, selected,
+):
+    control_calls = []
+    outbound = []
+    client_type = H.httpx.AsyncClient
+
+    def control(request):
+        control_calls.append((request.method, request.url.raw_path.decode()))
+        if request.method == "PUT":
+            assert json.loads(request.content) == {"name": "1|probe"}
+            return H.httpx.Response(204)
+        return H.httpx.Response(200, json={"now": selected})
+
+    async def request(port, target, timeout):
+        outbound.append((port, target))
+        body = {"ip": "203.0.113.1"} if probe_name == "probe_exit_ip" else _VALID_PAYLOAD
+        return 200, json.dumps(body), 7, ""
+
+    monkeypatch.setattr(
+        H.httpx, "AsyncClient",
+        lambda **kw: client_type(transport=H.httpx.MockTransport(control), **kw),
+    )
+    monkeypatch.setattr(H, "_request_via_port", request)
+    kwargs = {} if selector is None else {"selector": selector}
+    result = await getattr(H, probe_name)(
+        "http://controller", "secret", 41001, "1|probe",
+        url="https://probe.invalid/test", **kwargs,
+    )
+
+    path = f"/proxies/{quote(selector or 'GLOBAL', safe='')}"
+    assert control_calls == [("PUT", path), ("GET", path)]
+    assert result.ok is (selected == "1|probe")
+    assert outbound == ([(41001, "https://probe.invalid/test")] if result.ok else [])
+    if not result.ok:
+        assert result.detail.startswith(H.NODE_PROBE_FAILED)
 
 _VALID_PAYLOAD = {
     "response": {
@@ -75,7 +118,7 @@ def _patch(monkeypatch, *, resp=None, exc=None) -> None:
     async def _select_ok(*a, **kw):
         return None  # 选中成功
 
-    monkeypatch.setattr(H, "_select_global", _select_ok)
+    monkeypatch.setattr(H, "_select_selector", _select_ok)
     monkeypatch.setattr(H.httpx, "AsyncClient", lambda **kw: _Client(resp, exc))
 
 

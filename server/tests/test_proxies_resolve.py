@@ -125,8 +125,7 @@ async def test_resolve_direct_only_rides_system_proxy(db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_resolve_direct_first_stays_raw_direct(db, monkeypatch):
-    """direct_first（本机优先，失败才换代理）不走系统代理——恒 None，
-    failover 由 resolve_failover_proxy_url 单独负责。"""
+    """direct_first（本机优先，失败才换代理）不走系统代理——恒 None。"""
     await settings_service.set_value("proxy.strategy", "direct_first")
 
     async def _alive():

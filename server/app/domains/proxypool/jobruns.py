@@ -1,8 +1,7 @@
 """生产作业台账（`proxy_job_runs`）：一次真实 `run_crawl` = 一行。
 
 这个模块只做两件事：**把事实写下来**、**把事实读出来**。它不产出健康度、
-健康等级，也不参与判死——阈值要等真实数据积累之后再谈（定稿见
-`docs/PROXYPOOL_HANDOVER_P1.7_NEXT.md` §13/§14）。
+健康等级，也不参与判死——阈值要等真实数据积累之后再谈。
 
 四条边界（改这个文件前先读）：
 
@@ -68,9 +67,6 @@ ERROR_KINDS: tuple[str, ...] = (
 # error_summary 单行大小上限（字节）。枚举键有界，正常不会碰到；留着防将来加子映射
 # 时把一行写无界。
 _SUMMARY_MAX_BYTES = 8192
-
-DEFAULT_KEEP_JOB_DAYS = 90
-DEFAULT_MIN_JOB_RUNS = 200
 
 
 # ══ 错误分类 ═════════════════════════════════════════════════════
@@ -266,7 +262,6 @@ async def start_run(
         node_exit_ip=exit_ip,
         subscription_ids_json=facts["subscription_ids"],
         snapshot_ids_json=facts["snapshot_ids"],
-        # active_subscription_id 留空：Active/Candidate 尚未实现，不伪造生产订阅
         created_at=now,
     )
     session.add(row)
@@ -476,7 +471,6 @@ def _row_payload(row: ProxyJobRun) -> dict:
         "workers": row.workers,
         "subscriptionIds": list(row.subscription_ids_json or []),
         "snapshotIds": list(row.snapshot_ids_json or []),
-        "activeSubscriptionId": row.active_subscription_id,
         "byError": _by_error(row),
         "errorSummaryTruncated": bool(summary.get("truncated")),
         "interrupted": bool(summary.get("interrupted")),

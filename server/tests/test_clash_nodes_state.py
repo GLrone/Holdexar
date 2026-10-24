@@ -47,7 +47,8 @@ def _node(session_rows, name: str) -> ClashNode:
     return next(n for n in session_rows if n.name == name)
 
 
-async def _seed_registry_node(db, sub_id: int, name: str, state: str = NODE_ACTIVE):
+async def _seed_registry_node(db, sub_id: int, name: str, state: str = NODE_ACTIVE, *,
+                              last_l2_at=None, consecutive_failures: int = 0):
     async with db() as session:
         session.add(RegistryNode(
             node_id=f"{sub_id}-{name}",
@@ -61,8 +62,25 @@ async def _seed_registry_node(db, sub_id: int, name: str, state: str = NODE_ACTI
             original_name=name,
             first_seen=proxies_service.get_beijing_time_obj(),
             last_source_seen=proxies_service.get_beijing_time_obj(),
+            last_l2_at=last_l2_at,
+            consecutive_failures=consecutive_failures,
         ))
         await session.commit()
+
+
+async def _registry_map(db, sub_id: int, names: list[str]) -> dict:
+    """权威账本按原名的索引（_apply_node_results 的新读侧口径）。"""
+    async with db() as session:
+        rows = (
+            await session.execute(
+                select(RegistryNode).where(
+                    RegistryNode.original_name.in_(names),
+                    (RegistryNode.subscription_id == sub_id)
+                    | RegistryNode.runtime_name.like(f"{sub_id}|%"),
+                )
+            )
+        ).scalars().all()
+        return {n.original_name: n for n in rows if n.original_name}
 
 
 async def _apply_canonical_probe(db, sub_id: int, result: dict, now):
@@ -73,8 +91,9 @@ async def _apply_canonical_probe(db, sub_id: int, result: dict, now):
             session, subscription_id=sub_id, results=[result], now=now
         )
         await session.commit()
+    registry = await _registry_map(db, sub_id, [result["name"]])
     return await proxies_service._apply_node_results(
-        sub_id, {}, [result], [result["name"]], now
+        sub_id, {}, [result], [result["name"]], now, registry
     )
 
 
@@ -102,7 +121,7 @@ async def test_fail_cooldown_ladder(db):
 
 @pytest.mark.asyncio
 async def test_ok_resets_cooldown(db):
-    """健康证据复活 ProxyNode；兼容投影跟随新状态并清除节流时间。"""
+    """健康证据复活权威账本节点并清除节流时间。"""
     sub_id = await _seed_sub(db)
     await _seed_registry_node(db, sub_id, "n1")
     now = proxies_service._naive(proxies_service.get_beijing_time_obj())
@@ -111,29 +130,31 @@ async def test_ok_resets_cooldown(db):
     async with db() as session:
         rows = (await session.execute(select(ClashNode))).scalars().all()
         n = _node(rows, "n1")
-        assert n.fail_count == 0
         assert n.cooldown_until is None
-        assert n.status == "ok"
+        registry = await session.scalar(
+            select(RegistryNode).where(RegistryNode.runtime_name == f"{sub_id}|n1")
+        )
+        assert registry.state == NODE_ACTIVE
+        assert registry.consecutive_failures == 0
 
 
-# ─── 权威节点状态投影与恢复 ─────────────────────────────────
+# ─── 权威节点状态与恢复 ─────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_registry_retirement_is_projected_without_a_second_threshold(db):
-    """ProxyNode 退休状态与失败数原样投影，旧节点表不再计算自己的阈值。"""
+async def test_registry_retirement_without_a_second_threshold(db):
+    """退休判据只在权威账本算一次：连续 3 次失败 → RETIRED。"""
     sub_id = await _seed_sub(db)
     await _seed_registry_node(db, sub_id, "n1")
     now = proxies_service._naive(proxies_service.get_beijing_time_obj())
     for _ in range(3):
         await _apply_canonical_probe(db, sub_id, _fail("n1"), now)
     async with db() as session:
-        rows = (await session.execute(select(ClashNode))).scalars().all()
-        n = _node(rows, "n1")
-        assert n.status == "dead"
-        assert n.fail_count == 3
-        registry = await session.scalar(select(RegistryNode).where(RegistryNode.runtime_name == f"{sub_id}|n1"))
+        registry = await session.scalar(
+            select(RegistryNode).where(RegistryNode.runtime_name == f"{sub_id}|n1")
+        )
         assert registry.state == NODE_RETIRED
+        assert registry.consecutive_failures == 3
 
 
 @pytest.mark.asyncio
@@ -146,13 +167,11 @@ async def test_registry_health_success_restores_retired_node(db):
         await _apply_canonical_probe(db, sub_id, _fail("n1"), now)
     await _apply_canonical_probe(db, sub_id, _ok("n1"), now)
     async with db() as session:
-        rows = (await session.execute(select(ClashNode))).scalars().all()
-        n = _node(rows, "n1")
-        assert n.status == "ok"
-        assert n.revive_passes == 0
-        assert n.fail_count == 0
-        registry = await session.scalar(select(RegistryNode).where(RegistryNode.runtime_name == f"{sub_id}|n1"))
+        registry = await session.scalar(
+            select(RegistryNode).where(RegistryNode.runtime_name == f"{sub_id}|n1")
+        )
         assert registry.state == NODE_ACTIVE
+        assert registry.consecutive_failures == 0
 
 
 @pytest.mark.asyncio
@@ -166,11 +185,11 @@ async def test_failed_probe_after_recovery_updates_only_registry_state(db):
     await _apply_canonical_probe(db, sub_id, _ok("n1"), now)
     await _apply_canonical_probe(db, sub_id, _fail("n1"), now)
     async with db() as session:
-        rows = (await session.execute(select(ClashNode))).scalars().all()
-        n = _node(rows, "n1")
-        assert n.revive_passes == 0
-        assert n.status == "dead"
-        assert n.fail_count == 1
+        registry = await session.scalar(
+            select(RegistryNode).where(RegistryNode.runtime_name == f"{sub_id}|n1")
+        )
+        assert registry.state == NODE_DEAD
+        assert registry.consecutive_failures == 1
 
 
 # ─── 订阅停用判定（无可用节点 / 资源失效）─────────────────────
@@ -184,7 +203,7 @@ async def test_subscription_deprecated_when_no_alive_node(db):
     # 100 节点全不通：没有可用出口即停用
     results = [_fail(f"bad{i}") for i in range(100)]
     names = [r["name"] for r in results]
-    alive, _, deprecated = await proxies_service._apply_node_results(sub_id, {}, results, names, now)
+    alive, _, deprecated = await proxies_service._apply_node_results(sub_id, {}, results, names, now, {})
     assert alive == 0
     assert deprecated is True
     async with db() as session:
@@ -202,7 +221,7 @@ async def test_subscription_stays_active_with_few_alive_nodes(db):
     # 100 节点只有 1 个通：仍可用，不触发停用
     results = [_ok("ok0")] + [_fail(f"bad{i}") for i in range(99)]
     names = [r["name"] for r in results]
-    alive, _, deprecated = await proxies_service._apply_node_results(sub_id, {}, results, names, now)
+    alive, _, deprecated = await proxies_service._apply_node_results(sub_id, {}, results, names, now, {})
     assert alive == 1
     assert deprecated is False
 
@@ -214,10 +233,10 @@ async def test_subscription_deprecated_auto_recover(db):
     now = proxies_service._naive(proxies_service.get_beijing_time_obj())
     bad = [_fail(f"bad{i}") for i in range(96)] + [_ok(f"ok{i}") for i in range(4)]
     names = [r["name"] for r in bad]
-    await proxies_service._apply_node_results(sub_id, {}, [_fail(f"bad{i}") for i in range(100)], names, now)
+    await proxies_service._apply_node_results(sub_id, {}, [_fail(f"bad{i}") for i in range(100)], names, now, {})
     # 修复到 50 个通
     fixed = [_ok(f"ok{i}") for i in range(50)] + [_fail(f"bad{i}") for i in range(50)]
-    _, _, deprecated = await proxies_service._apply_node_results(sub_id, {}, fixed, names, now)
+    _, _, deprecated = await proxies_service._apply_node_results(sub_id, {}, fixed, names, now, {})
     assert deprecated is False
     async with db() as session:
         sub = await session.get(ProxySubscription, sub_id)
@@ -226,62 +245,49 @@ async def test_subscription_deprecated_auto_recover(db):
 
 
 @pytest.mark.asyncio
-async def test_cooldown_nodes_counted_by_ledger(db):
-    """冷却跳过的节点按账本口径计入存活统计（上次判定为准）。"""
+async def test_cooldown_nodes_counted_by_registry(db):
+    """冷却跳过的节点按权威账本口径计入存活统计（上次判定为准）。"""
     sub_id = await _seed_sub(db)
     now = proxies_service._naive(proxies_service.get_beijing_time_obj())
-    # 先把 n1 测活
-    await proxies_service._apply_node_results(sub_id, {}, [_ok("n1"), _fail("n2")], ["n1", "n2"], now)
-    ledger = await proxies_service._load_clash_node_ledger(sub_id, ["n1", "n2"])
-    # n2 进入冷却；第二次只测 n1（模拟 n2 冷却中）——但 n1 这次失败
-    _, _, _ = await proxies_service._apply_node_results(sub_id, ledger, [_fail("n1")], ["n1", "n2"], now)
-    # n1 失败、n2 冷却跳过按账本 dead？n2 上次 fail——ledger 状态不是 ok
-    # 再验证：n2 的账本 status 应保留（非 dead 状态下失败不清 ok）
-    # n2 上次失败后 status 保留 unknown（新节点失败初始为 unknown 非 dead）
-    async with db() as session:
-        rows = (await session.execute(select(ClashNode))).scalars().all()
-        n2 = _node(rows, "n2")
-        assert n2.cooldown_until is not None  # n2 冷却递增过
+    await _seed_registry_node(db, sub_id, "n2", last_l2_at=now)
+    # n2 冷却跳过：本轮只探 n1（失败）
+    cooldowns = {"n2": now + timedelta(minutes=30)}
+    registry = await _registry_map(db, sub_id, ["n1", "n2"])
+    alive, _, _ = await proxies_service._apply_node_results(
+        sub_id, cooldowns, [_fail("n1")], ["n1", "n2"], now, registry
+    )
+    assert alive == 1, "n1 探测失败、n2 冷却跳过按权威账本存活计入"
 
 
 # ─── 6h 体检门槛 ────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_health_check_throttled_within_6h(db, monkeypatch):
-    """距上次全量检测 <6h → throttled（不真跑，本地软件不常驻的节流语义）。"""
+async def test_health_summary_refresh_updates_alive_stats(db):
+    """6h 摘要从权威账本聚合存活（不做探测）。"""
     sub_id = await _seed_sub(db)
     now = proxies_service._naive(proxies_service.get_beijing_time_obj())
-    await proxies_service._apply_node_results(sub_id, {}, [_ok("n1")], ["n1"], now)
-
-    monkeypatch.setattr(
-        clash_manager.runtime, "status",
-        lambda: {"running": True, "port": 7890, "configPath": "x", "controllerUrl": "y"},
-    )
-    state = await proxies_service.maybe_run_clash_health_check()
-    assert state == "throttled"
+    await _seed_registry_node(db, sub_id, "n1", last_l2_at=now)
+    state = await proxies_service.refresh_subscription_health_summary()
+    assert state == "refreshed"
+    async with db() as session:
+        sub = await session.get(ProxySubscription, sub_id)
+        assert sub.last_stats["alive"] == 1
+        assert sub.last_stats["total"] == 1
+        assert not sub.deprecated
 
 
 @pytest.mark.asyncio
-async def test_health_check_runs_after_6h(db, monkeypatch):
-    """距上次检测 ≥6h → 真跑检测（mock 掉 test_clash_nodes 全流程）。"""
+async def test_health_summary_marks_subscription_without_alive_nodes_deprecated(db):
+    """账本里没有存活证据 → 订阅降级判定生效（含原因）。"""
     sub_id = await _seed_sub(db)
-    now = proxies_service._naive(proxies_service.get_beijing_time_obj())
-    old = now - timedelta(hours=6, minutes=1)
-    # 直接落一条 6h 前的检测记录
+    await _seed_registry_node(db, sub_id, "n1")  # 无 last_l2_at → 不计存活
+    state = await proxies_service.refresh_subscription_health_summary()
+    assert state == "refreshed"
     async with db() as session:
-        session.add(ClashNode(subscription_id=sub_id, name="n1", status="ok", last_checked_at=old, created_at=old))
-        await session.commit()
-
-    monkeypatch.setattr(
-        clash_manager.runtime, "status",
-        lambda: {"running": True, "port": 7890, "configPath": "x", "controllerUrl": "y"},
-    )
-    called = []
-    monkeypatch.setattr(proxies_service, "test_clash_nodes", lambda *a, **kw: called.append(1) or _async_none())
-    state = await proxies_service.maybe_run_clash_health_check()
-    assert state == "checked"
-    assert called
+        sub = await session.get(ProxySubscription, sub_id)
+        assert sub.deprecated is True
+        assert "没有可用节点" in sub.deprecated_reason
 
 
 async def _async_none():
@@ -655,7 +661,7 @@ async def test_clash_nodes_fresh_within_reuse_window(db):
     """窗口内检测过 → fresh（首检沿用账本结论）。"""
     sub_id = await _seed_sub(db)
     now = proxies_service._naive(proxies_service.get_beijing_time_obj())
-    await proxies_service._apply_node_results(sub_id, {}, [_ok("n1")], ["n1"], now)
+    await _seed_registry_node(db, sub_id, "n1", last_l2_at=now)
     assert await proxies_service.clash_nodes_fresh(sub_id) is True
 
 
@@ -665,7 +671,7 @@ async def test_clash_nodes_stale_beyond_reuse_window(db):
     sub_id = await _seed_sub(db)
     now = proxies_service._naive(proxies_service.get_beijing_time_obj())
     stale = now - timedelta(minutes=proxies_service.FIRST_CHECK_REUSE_MINUTES + 1)
-    await proxies_service._apply_node_results(sub_id, {}, [_ok("n1")], ["n1"], stale)
+    await _seed_registry_node(db, sub_id, "n1", last_l2_at=stale)
     assert await proxies_service.clash_nodes_fresh(sub_id) is False
 
 
@@ -683,7 +689,7 @@ async def test_spawn_first_check_skips_when_ledger_fresh(db, monkeypatch):
 
     sub_id = await _seed_sub(db)
     now = proxies_service._naive(proxies_service.get_beijing_time_obj())
-    await proxies_service._apply_node_results(sub_id, {}, [_ok("n1")], ["n1"], now)
+    await _seed_registry_node(db, sub_id, "n1", last_l2_at=now)
 
     called: list[int] = []
 

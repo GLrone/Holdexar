@@ -51,10 +51,4 @@ def seal_proxy(proxy) -> None:
         proxy.password = seal(proxy.password)
 
 
-def open_proxy(proxy) -> None:
-    """把代理对象上的密文就地替换为明文（出网前调用）。"""
-    proxy.username = open_value(proxy.username) or None
-    proxy.password = open_value(proxy.password) or None
-
-
-__all__ = ["PURPOSE", "open_proxy", "open_value", "seal", "seal_proxy"]
+__all__ = ["PURPOSE", "open_value", "seal", "seal_proxy"]

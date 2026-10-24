@@ -14,23 +14,10 @@ from datetime import datetime, timedelta
 import pytest
 from sqlalchemy import text
 
-from app.core.config import get_settings  # noqa: E402
 from app.core.database import get_engine, get_session_factory, init_db  # noqa: E402
 from app.domains.proxypool import retention  # noqa: E402
 
 NOW = datetime(2026, 9, 19, 12, 0, 0)
-
-
-@pytest.fixture
-def tmp_data_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOLDEXAR_DATA_DIR", str(tmp_path))
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-    yield tmp_path
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
 
 
 async def _add_observations(session, count: int, *, at: datetime) -> None:
@@ -61,6 +48,28 @@ async def _add_job_runs(session, count: int, *, at: datetime) -> None:
             text(
                 "INSERT INTO proxy_job_runs (status, kind, started_at, finished_at, duration_ms, created_at) "
                 "VALUES ('success', 'crawl', :at, :at, 1000, :at)"
+            ),
+            {"at": at},
+        )
+
+
+async def _add_run_exits(session, count: int, *, at: datetime, run_id: int = 1) -> None:
+    for _ in range(count):
+        await session.execute(
+            text(
+                "INSERT INTO proxy_run_exits (run_id, exit_ip, endpoint, node, requests, "
+                "success, e429, e4xx, e5xx, timeout, connect_error, other, duration_ms, created_at) "
+                "VALUES (:r, '203.0.113.9', 'store', NULL, 1, 1, 0, 0, 0, 0, 0, 0, 100, :at)"
+            ),
+            {"r": run_id, "at": at},
+        )
+
+
+async def _add_proxy_events(session, count: int, *, at: datetime) -> None:
+    for _ in range(count):
+        await session.execute(
+            text(
+                "INSERT INTO proxy_events (ts, kind, target) VALUES (:at, 'clash', 't')"
             ),
             {"at": at},
         )
@@ -104,6 +113,10 @@ async def test_prunes_by_age(tmp_data_dir):
         await _add_events(session, 1, at=NOW - timedelta(days=1))
         await _add_job_runs(session, 2, at=NOW - timedelta(days=100))
         await _add_job_runs(session, 1, at=NOW - timedelta(days=1))
+        await _add_run_exits(session, 3, at=NOW - timedelta(days=100))
+        await _add_run_exits(session, 1, at=NOW - timedelta(days=1))
+        await _add_proxy_events(session, 2, at=NOW - timedelta(days=100))
+        await _add_proxy_events(session, 1, at=NOW - timedelta(days=1))
         # sub1：4 条过期 + 2 条新；每订阅保留最新 3 条 → 过期里只有最老的 3 条会被删
         await _add_snapshots(session, 4, sub_id=1, at=NOW - timedelta(days=200))
         await _add_snapshots(session, 2, sub_id=1, at=NOW - timedelta(days=1))
@@ -116,9 +129,11 @@ async def test_prunes_by_age(tmp_data_dir):
 
     assert result.as_dict() == {
         "job_runs": 2,
+        "run_exits": 3,
         "health_runs": 0,
         "health_observations": 3,
         "orchestration_events": 2,
+        "proxy_events": 2,
         "snapshots": 3,
     }
     assert result.truncated is False
@@ -127,6 +142,8 @@ async def test_prunes_by_age(tmp_data_dir):
         assert await _count(session, "health_observations") == 2
         assert await _count(session, "orchestration_events") == 1
         assert await _count(session, "proxy_job_runs") == 1
+        assert await _count(session, "proxy_run_exits") == 1
+        assert await _count(session, "proxy_events") == 1
         assert await _count(session, "subscription_snapshots") == 3
 
 
@@ -248,6 +265,12 @@ async def test_chunk_loop_and_truncation(tmp_data_dir):
 async def test_identity_tables_never_pruned(tmp_data_dir):
     """删观测不删身份：节点/来源/池代一行不碰（它们是历史本身）。"""
     await init_db()
+    async with get_engine().begin() as connection:
+        await connection.execute(text(
+            "CREATE TABLE pool_generations (id INTEGER PRIMARY KEY, generation INTEGER, "
+            "pool_sha256 VARCHAR(64), expected_node_count INTEGER, status VARCHAR(20), "
+            "created_at DATETIME)"
+        ))
     async with get_session_factory()() as session:
         await session.execute(
             text(
@@ -292,9 +315,11 @@ async def test_second_run_deletes_nothing(tmp_data_dir):
     assert first.health_observations == 5
     assert second.as_dict() == {
         "job_runs": 0,
+        "run_exits": 0,
         "health_runs": 0,
         "health_observations": 0,
         "orchestration_events": 0,
+        "proxy_events": 0,
         "snapshots": 0,
     }
 
@@ -359,14 +384,3 @@ async def test_retention_job_is_registered_next_to_wal_truncate(monkeypatch):
     # 紧邻既有 WAL 收缩（04:30），不撞同一分钟
     _, wal_trigger, wal_kw = added["wal_truncate"]
     assert (wal_kw.get("hour"), wal_kw.get("minute")) == (4, 30)
-
-
-@pytest.mark.asyncio
-async def test_count_helper(tmp_data_dir):
-    await init_db()
-    async with get_session_factory()() as session:
-        await _add_observations(session, 3, at=NOW - timedelta(days=40))
-        await _add_observations(session, 1, at=NOW - timedelta(days=1))
-        await session.commit()
-    async with get_session_factory()() as session:
-        assert await retention.count_old_observations(session, NOW, 30) == 3

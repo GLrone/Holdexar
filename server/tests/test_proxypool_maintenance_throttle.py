@@ -10,8 +10,7 @@ from datetime import datetime, timedelta
 import pytest
 from sqlalchemy import select, update
 
-from app.core.config import get_settings
-from app.core.database import get_engine, get_session_factory, init_db
+from app.core.database import get_session_factory, init_db
 from app.domains.proxies.models import ADMISSION_ACTIVE, ProxySubscription
 from app.domains.proxypool.models import HealthRun, ProxyNode, node_fingerprint
 from app.domains.proxypool.scheduling import (
@@ -23,18 +22,6 @@ from app.domains.proxypool.scheduling import (
 from app.domains.settings.service import get_value, set_value
 
 NOW = datetime(2026, 9, 21, 10, 0, 0)
-
-
-@pytest.fixture
-def tmp_data_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOLDEXAR_DATA_DIR", str(tmp_path))
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-    yield tmp_path
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
 
 
 async def _seed_eligible_nodes() -> None:

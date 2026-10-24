@@ -10,8 +10,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from app.core.config import get_settings
-from app.core.database import get_engine, get_session_factory, init_db
+from app.core.database import get_session_factory, init_db
 from app.domains.proxypool.models import HealthRun
 
 NOW = datetime(2026, 10, 12, 12, 0, 0)
@@ -20,18 +19,6 @@ _RUN_KEYS = {
     "id", "channel", "subscriptionId", "startedAt", "finishedAt", "durationMs",
     "total", "steamOk", "ipKnown", "failed", "endReason",
 }
-
-
-@pytest.fixture
-def tmp_data_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOLDEXAR_DATA_DIR", str(tmp_path))
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-    yield tmp_path
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
 
 
 async def _seed_rows(session):

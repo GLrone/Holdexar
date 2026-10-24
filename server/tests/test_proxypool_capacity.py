@@ -1,7 +1,6 @@
 """生产容量模型：独立出口 IP 是容量单位，worker 上限 60。
 
-被测：`proxypool/exits.py` 的 `select_exit_slots` / `group_exit_candidates` /
-`assign_lane_indexes`，以及它到 lane 计划、worker 收敛的联动。
+被测：`proxypool/exits.py` 的 `select_exit_slots` / `group_exit_candidates`，以及 worker 收敛的联动。
 
 关键口径（每条都有反例用例）：
 - 出口 IP 相同的一批节点**只占一个槽**（节点数 ≠ 出口数）；
@@ -17,10 +16,8 @@ import pytest
 
 from app.domains.proxypool.exits import (
     MAX_CRAWL_WORKERS,
-    assign_lane_indexes,
     group_exit_candidates,
     select_exit_slots,
-    slots_to_plan,
 )
 from app.domains.proxypool.models import ProxyNode
 from app.domains.proxypool.state import NODE_ACTIVE, NODE_NEW, NODE_STALE
@@ -133,35 +130,10 @@ def test_max_workers_override_is_honoured() -> None:
     assert len(select_exit_slots(nodes, max_workers=0)) == 0
 
 
-# ── 4. 槽 → lane 计划 ───────────────────────────────────────────
-def test_assign_lane_indexes_is_positional() -> None:
-    nodes = [_node(i, exit_ip=f"10.0.0.{i}") for i in range(3)]
-    slots = assign_lane_indexes(select_exit_slots(nodes))
-    assert [s.lane_index for s in slots] == [0, 1, 2]
-
-
-def test_slots_to_plan_pairs_lane_with_port_and_exit() -> None:
-    nodes = [_node(i, exit_ip=f"10.0.0.{i}") for i in range(2)]
-    slots = select_exit_slots(nodes)
-    plan = slots_to_plan(slots, [41001, 41002])
-    assert plan == [
-        {"lane": 0, "port": 41001, "exitIp": "10.0.0.0", "node": "1|node0",
-         "alternatives": []},
-        {"lane": 1, "port": 41002, "exitIp": "10.0.0.1", "node": "1|node1",
-         "alternatives": []},
-    ]
-
-
-def test_slots_to_plan_tolerates_missing_ports() -> None:
-    slots = select_exit_slots([_node(0, exit_ip="10.0.0.1")])
-    assert slots_to_plan(slots, [])[0]["port"] is None
-
-
 # ── 5. 空池 ─────────────────────────────────────────────────────
 def test_empty_pool_yields_no_slots() -> None:
     assert select_exit_slots([]) == []
     assert select_exit_slots([_node(0, exit_ip=None)]) == []
-    assert slots_to_plan([], []) == []
 
 # ── 6. 延迟优先 ──────────────────────────────────────────────────
 def test_lower_delay_exit_takes_slot_first() -> None:

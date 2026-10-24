@@ -14,20 +14,15 @@ from datetime import datetime, timedelta
 
 import pytest
 import yaml
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select
 
-from app.core.config import get_settings
-from app.core.database import get_engine, get_session_factory, init_db
+from app.core.database import get_session_factory, init_db
 from app.domains.proxies.models import ProxySubscription
 from app.domains.proxypool import admission as adm
 from app.domains.proxypool import bootstrap as bs
 from app.core import orchestration as events
-from app.domains.proxypool import router as pp_router
 from app.domains.proxypool import runtime as rt
 from app.core.orchestration import OrchestrationEvent
-from app.domains.proxypool.models import (
-    ProxyNode,
-)
 from app.domains.proxypool.subscription import (
     FetchAttempt,
     FetchFailedError,
@@ -41,15 +36,8 @@ NOW = datetime(2026, 9, 21, 9, 0, 0)
 
 
 @pytest.fixture
-def env(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOLDEXAR_DATA_DIR", str(tmp_path))
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-    yield tmp_path
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
+def env(tmp_data_dir):
+    return tmp_data_dir
 
 
 async def _sub(label: str, url: str, *, status: str) -> int:
@@ -59,20 +47,6 @@ async def _sub(label: str, url: str, *, status: str) -> int:
         s.add(sub)
         await s.commit()
         return sub.id
-
-
-async def _node(node_id: str, sources: list[int]) -> None:
-    async with get_session_factory()() as s:
-        s.add(ProxyNode(node_id=node_id, fingerprint=node_id, runtime_name=f"1|{node_id}",
-                        proxy_type="http", server="10.0.0.1",
-                        normalized_config={"name": node_id, "type": "http",
-                                           "server": "10.0.0.1", "port": 1},
-                        state="ACTIVE", first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
-        for sid in sources:
-            await s.execute(update(ProxyNode)
-                .where(ProxyNode.node_id == node_id)
-                .values(subscription_id=sid, original_name=node_id))
-        await s.commit()
 
 
 async def _persist_ok_snapshot(sub_id: int, data_dir, nodes: list[dict]) -> str:
@@ -162,30 +136,7 @@ async def test_event_written_with_session_follows_caller_rollback(env):
     assert await _events("probe_kind") == []
 
 
-# ── 2. 订阅退出 / 晋升：路由生产路径 ──────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_exit_writes_event_and_idempotent_second_call_writes_nothing(env, monkeypatch):
-    await init_db()
-    a = await _sub("A", "https://a.invalid", status="ACTIVE")
-    await _node("x", [a])
-    monkeypatch.setattr(adm, "request_rebuild", lambda: [])
-
-    first = await pp_router.exit_subscription(a)
-    assert first["exited"] is True
-
-    rows = await _events(events.KIND_SUBSCRIPTION_EXITED)
-    assert len(rows) == 1
-    assert rows[0].payload_json == {
-        "subscriptionId": a, "removedSources": 1, "degradedNodes": 1,
-    }
-    assert rows[0].level == events.LEVEL_WARN
-
-    # 幂等空转：本来就不在池里 → 不写第二行（同一生命周期只有一次退出）
-    second = await pp_router.exit_subscription(a)
-    assert second["exited"] is False
-    assert len(await _events(events.KIND_SUBSCRIPTION_EXITED)) == 1
+# ── 2. 订阅晋升：路由生产路径（首检健康自动转正）─────────────────
 
 
 @pytest.mark.asyncio
@@ -196,8 +147,9 @@ async def test_promote_writes_event_with_real_snapshot_facts(env, monkeypatch):
     sha = await _persist_ok_snapshot(a, env, nodes)
     monkeypatch.setattr(adm, "request_rebuild", lambda: [])
 
-    first = await pp_router.promote_subscription(a)
-    assert first["promoted"] is True
+    from app.domains.proxies import router as proxies_router
+
+    await proxies_router._auto_promote_after_check(a, alive=1)
 
     rows = await _events(events.KIND_SUBSCRIPTION_PROMOTED)
     assert len(rows) == 1
@@ -207,8 +159,8 @@ async def test_promote_writes_event_with_real_snapshot_facts(env, monkeypatch):
     assert sha[:10] in rows[0].message
     assert rows[0].ts is not None
 
-    second = await pp_router.promote_subscription(a)
-    assert second["promoted"] is False
+    # 幂等空转：已 ACTIVE 再转正不写第二行（同一生命周期只有一次晋升事件）
+    await proxies_router._auto_promote_after_check(a, alive=1)
     assert len(await _events(events.KIND_SUBSCRIPTION_PROMOTED)) == 1
 
 

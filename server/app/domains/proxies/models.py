@@ -19,7 +19,6 @@ from app.core.database import Base
 # 与 `deprecated`（旧来源的可用性弃用）**完全独立**：两者互不转换、互不跟随。
 ADMISSION_ACTIVE = "ACTIVE"
 ADMISSION_CANDIDATE = "CANDIDATE"
-ADMISSION_STATUSES = (ADMISSION_ACTIVE, ADMISSION_CANDIDATE)
 
 
 class Proxy(Base):
@@ -40,15 +39,6 @@ class Proxy(Base):
     consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime | None] = mapped_column(DateTime)
-
-    def url(self) -> str:
-        """运行时 URL（明文账号口令）：仅供进程内出网使用，不得进响应体。
-
-        读写库一律走 `app.domains.proxies.credentials`，那一层负责加解密；
-        本方法接到的已是解密后的明文（或干脆是内存里构造的未落库对象）。
-        """
-        auth = f"{self.username}:{self.password}@" if self.username else ""
-        return f"{self.scheme}://{auth}{self.host}:{self.port}"
 
 
 class ProxyEvent(Base):
@@ -93,12 +83,11 @@ class ProxySubscription(Base):
         String(16), default=ADMISSION_CANDIDATE, server_default=ADMISSION_ACTIVE
     )
     # ── proxypool 抓取 / 快照元数据（仅增列，不影响既有代理链路）──
+    # 快照身份的唯一事实源是 subscription_snapshots 表（sha256/版本都在那边）。
     last_fetch_at: Mapped[datetime | None] = mapped_column(DateTime)
     last_fetch_status: Mapped[str | None] = mapped_column(String(32))
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime)
     last_error: Mapped[str | None] = mapped_column(String(500))
-    snapshot_sha256: Mapped[str | None] = mapped_column(String(64))
-    snapshot_version: Mapped[int] = mapped_column(Integer, default=0)
     cache_url_identity: Mapped[str | None] = mapped_column(String(64))
     # 自动更新订阅：False = 定时刷新跳过它，只保留手动重拉。
     # 限时订阅（只在窗口内可下载、下载后长期可用）关掉即不再每轮撞失败。
@@ -137,7 +126,6 @@ class ClashNode(Base):
     status: Mapped[str] = mapped_column(String(10), default="unknown")  # ProxyNode.state 投影
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     fail_count: Mapped[int] = mapped_column(Integer, default=0)  # ProxyNode.consecutive_failures 投影
-    revive_passes: Mapped[int] = mapped_column(Integer, default=0)  # 兼容字段，恒为 0
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime)
     cooldown_until: Mapped[datetime | None] = mapped_column(DateTime)  # 冷却期内跳过检测
     created_at: Mapped[datetime | None] = mapped_column(DateTime)

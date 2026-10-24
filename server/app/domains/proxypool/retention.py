@@ -5,12 +5,14 @@
 | 表 | 速率 | 保留 |
 |---|---|---|
 | `proxy_job_runs` | 十几~几十行/天 | 90 天，且至少留最近 200 行 |
+| `proxy_run_exits` | 每作业×出口数（高频聚合） | 90 天（与作业台账同周期） |
 | `health_runs` | ~22 行/天 | 90 天 |
-| `health_observations` | **L0 每 5min × 池内每个节点** → 68 节点 ≈ 19.6k 行/天 | 30 天 |
+| `health_observations` | L1/L2 维护 + L0 失败证据（L0 成功只挂节点行不落流水） | 30 天 |
 | `orchestration_events` | 事件驱动，低频 | 90 天 |
+| `proxy_events` | 走线日志 | 90 天 |
 | `subscription_snapshots` | 每次抓取一行（行小） | 180 天，且每订阅最新 3 份成功快照永不删 |
-| `proxy_nodes` / `proxy_node_sources` | 节点身份与来源 | **永不清理** |
-| `pool_generations` | 每次重建一行（审计链） | 不清理 |
+| `proxy_nodes` | 节点身份 | **永不清理** |
+| `pool_generations` | 审计链表，当前无写入方 | 不清理 |
 | 快照原始 `.bin` | 内容寻址、只增不减 | 本模块不 GC（P1.9 既有决定） |
 
 **分块删除是硬要求**：一次删几十万行会长时间持写锁，与爬取/调度抢锁。这里每块
@@ -49,9 +51,11 @@ KEEP_SNAPSHOTS_PER_SUB = 3
 @dataclass(frozen=True)
 class PruneResult:
     job_runs: int
+    run_exits: int
     health_runs: int
     health_observations: int
     orchestration_events: int
+    proxy_events: int
     snapshots: int
     # 有一轮撞到 max_chunks 上限（还有剩）——下一轮继续，不是失败
     truncated: bool
@@ -59,9 +63,11 @@ class PruneResult:
     def as_dict(self) -> dict[str, int]:
         return {
             "job_runs": self.job_runs,
+            "run_exits": self.run_exits,
             "health_runs": self.health_runs,
             "health_observations": self.health_observations,
             "orchestration_events": self.orchestration_events,
+            "proxy_events": self.proxy_events,
             "snapshots": self.snapshots,
         }
 
@@ -147,6 +153,22 @@ async def prune_telemetry(
     )
     truncated = truncated or more
 
+    # 出口账本：每作业×出口数一行，是代理体系增长最快的表，必须封顶。
+    run_exits, more = await _delete_chunked(
+        session,
+        """
+        DELETE FROM proxy_run_exits WHERE id IN (
+            SELECT id FROM proxy_run_exits
+            WHERE created_at IS NOT NULL AND created_at < :cutoff
+            ORDER BY id LIMIT :chunk
+        )
+        """,
+        {"cutoff": _cutoff(now, job_days)},
+        chunk=chunk,
+        max_chunks=max_chunks,
+    )
+    truncated = truncated or more
+
     health_runs, more = await _delete_chunked(
         session,
         """
@@ -192,6 +214,21 @@ async def prune_telemetry(
     )
     truncated = truncated or more
 
+    proxy_events, more = await _delete_chunked(
+        session,
+        """
+        DELETE FROM proxy_events WHERE id IN (
+            SELECT id FROM proxy_events
+            WHERE ts IS NOT NULL AND ts < :cutoff
+            ORDER BY id LIMIT :chunk
+        )
+        """,
+        {"cutoff": _cutoff(now, job_days)},
+        chunk=chunk,
+        max_chunks=max_chunks,
+    )
+    truncated = truncated or more
+
     keep = await _keep_ids_per_subscription(session)
     preserve = f"AND id NOT IN ({','.join(str(int(v)) for v in keep)})" if keep else ""
     snapshots, more = await _delete_chunked(
@@ -210,7 +247,10 @@ async def prune_telemetry(
     )
     truncated = truncated or more
 
-    result = PruneResult(job_runs, health_runs, observations, events, snapshots, truncated)
+    result = PruneResult(
+        job_runs, run_exits, health_runs, observations, events, proxy_events,
+        snapshots, truncated,
+    )
     if any(result.as_dict().values()):
         log_event(
             logger,
@@ -218,23 +258,13 @@ async def prune_telemetry(
             tag="成功",
             detail={
                 "清理作业行数": result.job_runs,
+                "清理出口账本行数": result.run_exits,
                 "清理体检台账行数": result.health_runs,
                 "清理健康观测行数": result.health_observations,
                 "清理编排事件行数": result.orchestration_events,
+                "清理走线日志行数": result.proxy_events,
                 "清理快照行数": result.snapshots,
                 "还有剩余": "是" if truncated else "否",
             },
         )
     return result
-
-
-async def count_old_observations(session: AsyncSession, now: datetime, days: int) -> int:
-    """测试/排查用：当前超出保留期的健康观测行数。"""
-    result = await session.execute(
-        text(
-            "SELECT COUNT(*) FROM health_observations "
-            "WHERE observed_at IS NOT NULL AND observed_at < :cutoff"
-        ),
-        {"cutoff": _cutoff(now, days)},
-    )
-    return int(result.scalar() or 0)

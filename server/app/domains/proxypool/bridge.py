@@ -1,4 +1,4 @@
-"""订阅节点体检 → ProxyNode：记录健康事实并刷新兼容 UI 投影。
+"""订阅节点体检 → ProxyNode：健康事实只落权威节点账本。
 
 前端「节点体检」探的是**生产端点**（IStoreBrowseService/GetItems）与出口 IP，
 这正是池健康账本的 L2（真实业务）与 L1（出口身份）证据。本模块把它们按
@@ -7,8 +7,8 @@
     (subscription_id, 节点名)  →  ProxyNode（按归属订阅 + 原名匹配）
 
 命中节点按有效 L2 成功或真实传输失败推进唯一状态机，并分别记录 L1 出口与 L2
-业务证据。普通 HTTP 错误响应和无效正文只记观测，不作为节点故障。健康状态只由
-ProxyNode 保存，旧表只供 UI 与检测节流读取。
+业务证据。普通 HTTP 错误响应和无效正文只记观测，不作为节点故障。健康状态
+只由 ProxyNode 保存。本模块还承载两个权威来源自愈（补缺失来源/清失主来源）。
 
 不做的事：不新建调度、不新建生命周期、不重铸名字、不降级节点。合格集或出口集
 变化只置既有的 rebuild_pending，重建仍归既有的池重建通道。
@@ -22,7 +22,6 @@ from datetime import datetime
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domains.proxies.models import ClashNode
 from app.domains.proxies.subscription_secret import open_url
 from app.domains.proxypool.health import L1_LEVEL, L2_LEVEL
 from app.domains.proxypool.models import (
@@ -34,11 +33,6 @@ from app.domains.proxypool.models import (
 )
 from app.domains.proxypool.registry import _name_base
 from app.domains.proxypool.state import (
-    NODE_ACTIVE,
-    NODE_DEAD,
-    NODE_NEW,
-    NODE_RETIRED,
-    NODE_STALE,
     evaluate_node_state,
 )
 
@@ -67,23 +61,6 @@ class IngestionResult:
     @property
     def changed(self) -> bool:
         return bool(self.activated or self.deactivated or self.exit_ips_added)
-
-
-def project_node_health(row: ClashNode, node: ProxyNode) -> tuple[str, str | None]:
-    """把权威节点状态投影到旧 UI 行，返回投影前的状态与出口地址。"""
-    prior_status, prior_exit = row.status, row.exit_ip
-    if node.state in (NODE_DEAD, NODE_RETIRED):
-        row.status = "dead"
-    elif node.state in (NODE_ACTIVE, NODE_STALE) and node.last_l2_at is not None:
-        row.status = "ok"
-    elif node.state in (NODE_NEW, NODE_ACTIVE):
-        row.status = "unknown"
-    else:
-        row.status = "dead"
-    row.fail_count = int(node.consecutive_failures or 0)
-    row.revive_passes = 0
-    row.exit_ip = node.exit_ip
-    return prior_status, prior_exit
 
 
 def _name_keys(name: str) -> list[str]:
@@ -326,88 +303,6 @@ async def ingest_node_check(
         row["sourceCode"] = code
         row["poolState"] = node.state
 
-    return outcome
-
-
-async def ingest_ledger(
-    session: AsyncSession,
-    *,
-    now: datetime,
-) -> IngestionResult:
-    """将 ProxyNode 状态同步到旧 UI/节流表；不从旧表反向改变健康结论。"""
-    from app.domains.proxypool.models import ProxyNode as RegistryNode
-
-    nodes = list((await session.execute(select(RegistryNode))).scalars())
-    observations: dict[str, HealthObservation] = {}
-    if nodes:
-        rows = (await session.execute(
-            select(HealthObservation)
-            .where(
-                HealthObservation.node_id.in_([node.node_id for node in nodes]),
-                HealthObservation.level == L2_LEVEL,
-            )
-            .order_by(HealthObservation.observed_at.desc(), HealthObservation.id.desc())
-        )).scalars()
-        for observation in rows:
-            observations.setdefault(observation.node_id, observation)
-
-    legacy_rows = list((await session.execute(select(ClashNode))).scalars())
-    legacy_by_key = {(row.subscription_id, row.name): row for row in legacy_rows}
-    outcome = IngestionResult()
-    for node in nodes:
-        if not node.original_name:
-            continue
-        source_id = node.subscription_id
-        if source_id is None:
-            prefix, separator, _ = str(node.runtime_name).partition("|")
-            source_id = int(prefix) if separator and prefix.isdigit() else None
-        if source_id is None:
-            continue
-        key = (int(source_id), str(node.original_name))
-        row = legacy_by_key.get(key)
-        if row is None:
-            row = ClashNode(
-                subscription_id=key[0], name=key[1], created_at=now,
-            )
-            session.add(row)
-            legacy_by_key[key] = row
-        prior_status, prior_exit = project_node_health(row, node)
-        latest = observations.get(node.node_id)
-        if latest is not None:
-            row.latency_ms = latest.latency_ms
-            if row.last_checked_at is None:
-                row.last_checked_at = node.last_l2_at or latest.observed_at
-        outcome.matched += 1
-        if row.status == "ok" and prior_status != "ok":
-            outcome.activated += 1
-        if row.status == "dead" and prior_status != "dead":
-            outcome.deactivated += 1
-        if node.exit_ip and node.exit_ip != prior_exit:
-            outcome.exit_ips_added += 1
-
-    projected_keys = {
-        (int(node.subscription_id) if node.subscription_id is not None else None,
-         str(node.original_name or ""))
-        for node in nodes
-        if node.subscription_id is not None and node.original_name
-    }
-    projected_keys.update(
-        (int(str(node.runtime_name).partition("|")[0]), str(node.original_name))
-        for node in nodes
-        if node.subscription_id is None
-        and node.original_name
-        and str(node.runtime_name).partition("|")[0].isdigit()
-    )
-    for key, row in legacy_by_key.items():
-        if key in projected_keys:
-            continue
-        if row.status == "ok":
-            outcome.deactivated += 1
-        row.status = "unknown"
-        row.fail_count = 0
-        row.revive_passes = 0
-        row.exit_ip = None
-        row.latency_ms = None
     return outcome
 
 

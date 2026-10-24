@@ -223,34 +223,6 @@ def _patch_lane_port(data_dir: Path, index: int, port: int) -> None:
     )
 
 
-def test_require_lane_proxy_urls_fails_closed_when_lanes_not_ready(tmp_path) -> None:
-    _write_pool(tmp_path, ["a", "b"])
-    rt.prepare_runtime_config(tmp_path)
-    with pytest.raises(rt.RuntimeUnavailableError):
-        rt.require_lane_proxy_urls(tmp_path)
-
-
-def test_require_lane_proxy_urls_falls_back_to_global_without_lanes(tmp_path) -> None:
-    """旧产物（运行配置里没有 lane）：退回同一 Runtime 的 GLOBAL 入口，而不是报错。"""
-    _write_pool(tmp_path, ["a"])
-    rt.prepare_runtime_config(tmp_path)
-    doc = yaml.safe_load(rt.runtime_config_path(tmp_path).read_text(encoding="utf-8"))
-    doc.pop("listeners")
-    rt.runtime_config_path(tmp_path).write_text(
-        yaml.safe_dump(doc, allow_unicode=True, sort_keys=False), encoding="utf-8"
-    )
-
-    sock, held = _holding_port()
-    try:
-        doc["mixed-port"] = held
-        rt.runtime_config_path(tmp_path).write_text(
-            yaml.safe_dump(doc, allow_unicode=True, sort_keys=False), encoding="utf-8"
-        )
-        assert rt.require_lane_proxy_urls(tmp_path) == [f"http://127.0.0.1:{held}"]
-    finally:
-        sock.close()
-
-
 # ── 3. lane 绑定 ─────────────────────────────────────────────────
 def test_plan_lane_assignment_keeps_previous_and_never_duplicates() -> None:
     plan = rt.plan_lane_assignment(["b", "a"], ["a", "b", "c", "d"], lanes=2)

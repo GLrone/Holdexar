@@ -1,7 +1,7 @@
 """proxypool 状态机：状态常量 + 显式转移表 + 唯一出口。
 
-调用方**不得**直接给 `node.state` / `lane.state` 赋值，一律经本模块的
-`apply_transition` / `apply_lane_transition`：非法转移立刻抛
+调用方**不得**直接给 `node.state` 赋值，一律经本模块的
+`apply_transition`：非法转移立刻抛
 `IllegalTransitionError`（异常自带 from / to 与合法目标集）。
 
 节点四态语义（写在这里，不靠调用方猜）：
@@ -24,20 +24,6 @@ NODE_STALE = "STALE"
 NODE_DEAD = "DEAD"
 NODE_RETIRED = "RETIRED"
 
-LANE_EMPTY = "EMPTY"
-LANE_INIT = "INIT"
-LANE_READY = "READY"
-LANE_DEGRADED = "DEGRADED"
-LANE_SWITCHING = "SWITCHING"
-LANE_DEAD = "DEAD"
-
-NODE_STATES: frozenset[str] = frozenset(
-    {NODE_NEW, NODE_ACTIVE, NODE_STALE, NODE_DEAD, NODE_RETIRED}
-)
-LANE_STATES: frozenset[str] = frozenset(
-    {LANE_EMPTY, LANE_INIT, LANE_READY, LANE_DEGRADED, LANE_SWITCHING, LANE_DEAD}
-)
-
 # 退休阈值的缺省值。业务侧一律显式传参，便于后续用长周期运行数据校准。
 DEFAULT_RETIRE_AFTER_FAILED_PROBES = 3
 
@@ -51,15 +37,6 @@ _NODE_TRANSITIONS: dict[str, frozenset[str]] = {
     NODE_STALE: frozenset({NODE_ACTIVE, NODE_DEAD, NODE_RETIRED}),
     NODE_DEAD: frozenset({NODE_ACTIVE, NODE_STALE, NODE_RETIRED}),
     NODE_RETIRED: frozenset({NODE_ACTIVE, NODE_STALE}),
-}
-
-_LANE_TRANSITIONS: dict[str, frozenset[str]] = {
-    LANE_EMPTY: frozenset({LANE_INIT}),
-    LANE_INIT: frozenset({LANE_READY, LANE_EMPTY}),
-    LANE_READY: frozenset({LANE_SWITCHING, LANE_DEGRADED, LANE_DEAD, LANE_EMPTY}),
-    LANE_SWITCHING: frozenset({LANE_READY, LANE_DEGRADED, LANE_DEAD}),
-    LANE_DEGRADED: frozenset({LANE_READY, LANE_SWITCHING, LANE_DEAD, LANE_EMPTY}),
-    LANE_DEAD: frozenset({LANE_EMPTY, LANE_INIT, LANE_READY}),
 }
 
 
@@ -89,50 +66,12 @@ def legal_targets(current: str) -> frozenset[str]:
     return _NODE_TRANSITIONS.get(current, frozenset())
 
 
-def can_transition(current: str, nxt: str) -> bool:
-    return nxt in legal_targets(current)
-
-
 def apply_transition(current: str, nxt: str) -> str:
     """节点状态变更的唯一出口；非法组合抛 `IllegalTransitionError`。"""
     allowed = legal_targets(current)
     if nxt not in allowed:
         raise IllegalTransitionError(current, nxt, allowed)
     return nxt
-
-
-# ── Lane ──────────────────────────────────────────────────────────
-# Lane 单独一套函数：两个域都有 DEAD，但合法目标完全不相交
-# （节点 DEAD → ACTIVE/STALE/RETIRED；Lane DEAD → EMPTY/INIT/READY），
-# 合成一个泛型函数会把两者混成一团。
-def legal_lane_targets(current: str) -> frozenset[str]:
-    return _LANE_TRANSITIONS.get(current, frozenset())
-
-
-def can_transition_lane(current: str, nxt: str) -> bool:
-    return nxt in legal_lane_targets(current)
-
-
-def apply_lane_transition(current: str, nxt: str) -> str:
-    allowed = legal_lane_targets(current)
-    if nxt not in allowed:
-        raise IllegalTransitionError(current, nxt, allowed)
-    return nxt
-
-
-# ── 退休判定 ──────────────────────────────────────────────────────
-def should_retire(
-    state: str,
-    consecutive_failures: int,
-    retire_after_failed_probes: int = DEFAULT_RETIRE_AFTER_FAILED_PROBES,
-) -> bool:
-    """连续失败是否已达退休线。
-
-    起点限定在 STALE / DEAD：NEW / ACTIVE 必须先经 DEAD 或 STALE，
-    RETIRED 已经退出，不再重复判。
-    """
-    _check_threshold(retire_after_failed_probes)
-    return state in _RETIRE_FROM and consecutive_failures >= retire_after_failed_probes
 
 
 # ── 决策函数 ──────────────────────────────────────────────────────

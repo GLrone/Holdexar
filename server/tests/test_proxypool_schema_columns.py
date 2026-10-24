@@ -16,14 +16,7 @@ from datetime import datetime
 import pytest
 import yaml
 
-from app.core.config import get_settings  # noqa: E402
-from app.core.database import (  # noqa: E402
-    _TABLE_EXTRA_COLUMNS,
-    Base,
-    get_engine,
-    get_session_factory,
-    init_db,
-)
+from app.core.database import _TABLE_EXTRA_COLUMNS, Base, get_session_factory, init_db
 
 NOW = datetime(2026, 9, 20, 12, 0, 0)
 
@@ -42,18 +35,6 @@ CREATE TABLE subscription_snapshots (
     fetched_at DATETIME
 )
 """
-
-
-@pytest.fixture
-def tmp_data_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOLDEXAR_DATA_DIR", str(tmp_path))
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-    yield tmp_path
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
 
 
 def test_snapshot_extra_columns_are_registered():
@@ -143,3 +124,48 @@ async def test_init_db_adds_subscription_cache_identity_to_existing_table(tmp_da
     actual = {row[1] for row in con.execute("PRAGMA table_info(proxy_subscriptions)")}
     con.close()
     assert "cache_url_identity" in actual
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_init_db_preserves_retired_pool_tables_and_serves_history(tmp_data_dir, legacy):
+    import httpx
+    from fastapi import FastAPI
+
+    from app.domains.proxypool.models import HealthRun
+    from app.domains.proxypool.router import router
+
+    tables = {
+        "exit_groups": ("exit_ip VARCHAR(64)", "203.0.113.1"),
+        "lanes": ("lane_index INTEGER", 2),
+        "pool_generations": ("generation INTEGER", 3),
+        "worker_leases": ("worker_id VARCHAR(64)", "legacy-worker"),
+    }
+    db = tmp_data_dir / "holdexar.db"
+    with sqlite3.connect(db) as connection:
+        if legacy:
+            for table, (column, value) in tables.items():
+                connection.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY, {column})")
+                connection.execute(f"INSERT INTO {table} VALUES (1, ?)", (value,))
+        before = dict(connection.execute("SELECT name, sql FROM sqlite_master WHERE type='table'"))
+
+    await init_db()
+    await init_db()
+    async with get_session_factory()() as session:
+        session.add(HealthRun(channel="manual", started_at=NOW, total=1, steam_ok=1))
+        await session.commit()
+
+    app = FastAPI()
+    app.include_router(router, prefix="/api/v1")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as client:
+        response = await client.get("/api/v1/proxypool/health-runs")
+    assert response.status_code == 200
+    assert [(row["channel"], row["steamOk"]) for row in response.json()["runs"]] == [("manual", 1)]
+    with sqlite3.connect(db) as connection:
+        after = dict(connection.execute("SELECT name, sql FROM sqlite_master WHERE type='table'"))
+        for table, (_, value) in tables.items():
+            if legacy:
+                assert after[table] == before[table]
+                assert connection.execute(f"SELECT * FROM {table}").fetchall() == [(1, value)]
+            else:
+                assert table not in after

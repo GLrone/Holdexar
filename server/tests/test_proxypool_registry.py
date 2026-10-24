@@ -40,19 +40,6 @@ from app.domains.proxypool.subscription import (  # noqa: E402
 NOW = datetime(2026, 9, 19, 12, 0, 0)
 
 
-@pytest.fixture
-def tmp_data_dir(tmp_path, monkeypatch):
-    """临时数据目录 + 建表（收尾必须清 `get_settings` 的 lru_cache，见同域测试注）。"""
-    monkeypatch.setenv("HOLDEXAR_DATA_DIR", str(tmp_path))
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-    yield tmp_path
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-
-
 def _node(name: str, *, server: str | None = None, port: int = 443,
           password: str = "pw") -> dict:
     return {
