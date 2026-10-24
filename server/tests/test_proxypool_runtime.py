@@ -22,8 +22,7 @@ import pytest
 import yaml
 from sqlalchemy import select, update
 
-from app.core.config import get_settings  # noqa: E402
-from app.core.database import get_engine, get_session_factory, init_db  # noqa: E402
+from app.core.database import get_session_factory, init_db  # noqa: E402
 from app.domains.proxies import clash_manager  # noqa: E402
 from app.domains.proxies.clash_manager import ClashRuntime  # noqa: E402
 from app.domains.proxies.kernel_release import kernel_filename  # noqa: E402
@@ -51,18 +50,6 @@ from app.domains.proxypool.state import (  # noqa: E402
 )
 
 NOW = datetime(2026, 9, 19, 12, 0, 0)
-
-
-@pytest.fixture
-def tmp_data_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOLDEXAR_DATA_DIR", str(tmp_path))
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-    yield tmp_path
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
 
 
 def _kernel_candidates(data_dir: Path):

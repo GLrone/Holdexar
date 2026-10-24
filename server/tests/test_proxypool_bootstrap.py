@@ -8,21 +8,17 @@
 from __future__ import annotations
 
 import asyncio
-import os
-import socket
 from datetime import datetime
-from pathlib import Path
 
 import httpx
 import pytest
 import yaml
 from sqlalchemy import func, select
 
-from app.core.config import get_settings  # noqa: E402
-from app.core.database import get_engine, get_session_factory, init_db  # noqa: E402
+from app.core.database import get_session_factory, init_db  # noqa: E402
+from app.core.net import free_local_port as _free_port  # noqa: E402
 from app.domains.proxies import clash_manager  # noqa: E402
 from app.domains.proxies.clash_manager import ClashRuntime  # noqa: E402
-from app.domains.proxies.kernel_release import kernel_filename  # noqa: E402
 from app.domains.proxies.models import (  # noqa: E402
     ADMISSION_ACTIVE,
     ProxySubscription,
@@ -32,7 +28,7 @@ from app.domains.proxypool.models import (  # noqa: E402
     HealthObservation, ProxyNode, SubscriptionSnapshot,
 )
 from app.domains.proxypool.runtime import (  # noqa: E402
-    prepare_runtime_config, require_runtime_proxy_url,
+    current_runtime_proxy_url, prepare_runtime_config,
 )
 from app.domains.proxypool.subscription import (  # noqa: E402
     CHANNEL_DIRECT, FORMAT_YAML, FetchResult,
@@ -95,31 +91,6 @@ async def test_subscription_download_preserves_resource_header():
 
 
 # ── 夹具 ─────────────────────────────────────────────────────────
-@pytest.fixture
-def tmp_data_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOLDEXAR_DATA_DIR", str(tmp_path))
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-    yield tmp_path
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-
-
-@pytest.fixture
-def kernel_exe_path(tmp_data_dir) -> Path:
-    for candidate in (
-        clash_manager.kernel_exe(tmp_data_dir),
-        clash_manager.bundled_clash_dir() / kernel_filename(),
-        *(
-            sorted(Path(os.environ["LOCALAPPDATA"]).glob(f"holdexar*/clash/{kernel_filename()}"))
-            if os.environ.get("LOCALAPPDATA") else []
-        ),
-    ):
-        if candidate.is_file():
-            return candidate
-    pytest.skip("本机没有可用的 mihomo 内核资产（assets/clash/ 不随仓库分发）")
 
 
 @pytest.fixture
@@ -133,14 +104,6 @@ def pool_runtime():
 def _stub_channels(monkeypatch):
     """不发真实网络请求：订阅内容由脚本化 FetchResult 提供。"""
     monkeypatch.setattr(bs, "build_channels", lambda *a, **k: [])
-
-
-def _free_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 def _node(name: str, server: str) -> dict:
@@ -294,8 +257,7 @@ async def test_no_subscription_cannot_bootstrap(tmp_data_dir, kernel_exe_path,
     # 与"有订阅但抓取失败"必须是**不同**的原因（真实运行诊断需要区分）
     assert "没有可 bootstrap 的订阅" in result.detail
     assert "订阅抓取失败" not in result.detail
-    with pytest.raises(Exception, match="代理通道尚未就绪"):
-        require_runtime_proxy_url(tmp_data_dir)
+    assert current_runtime_proxy_url(tmp_data_dir) is None
 
 
 # ══ 6. 任一步失败 → 不启动 crawler、不退旧代理/直连 ═════════════
@@ -314,9 +276,8 @@ async def test_failed_fetch_keeps_crawler_unavailable(
 
     assert result.ready is False
     row = await _sub_row(sub_id)
-    assert row.last_fetch_status == "FAILED" and row.snapshot_sha256 is None
-    with pytest.raises(Exception, match="代理通道尚未就绪"):
-        require_runtime_proxy_url(tmp_data_dir)
+    assert row.last_fetch_status == "FAILED"
+    assert current_runtime_proxy_url(tmp_data_dir) is None
 
 
 @pytest.mark.asyncio
@@ -328,8 +289,6 @@ async def test_unreadable_subscription_records_failure_without_replacing_success
     previous_success = datetime(2026, 9, 18, 12, 0, 0)
     async with get_session_factory()() as session:
         sub = await session.get(ProxySubscription, sub_id)
-        sub.snapshot_sha256 = "previous-success"
-        sub.snapshot_version = 4
         sub.last_success_at = previous_success
         sub.last_fetch_status = "OK"
         await session.commit()
@@ -348,8 +307,6 @@ async def test_unreadable_subscription_records_failure_without_replacing_success
     assert row.last_fetch_at == NOW
     assert row.last_fetch_status == "FAILED"
     assert row.last_error == result.failures[sub_id]
-    assert row.snapshot_sha256 == "previous-success"
-    assert row.snapshot_version == 4
     assert row.last_success_at == previous_success
 
 
@@ -443,24 +400,7 @@ async def test_snapshot_sha_canonical_and_projection_after_persist(
     canonical = snaps[0].sha256
     assert sync.snapshot_sha256[sub_id] == canonical
     assert sync.snapshots[sub_id].sha256 == canonical
-    assert (await _sub_row(sub_id)).snapshot_sha256 == canonical, "投影=事实源（成功后）"
-
-    # 失败时不得写投影：先清空，再让抓取失败
-    async with get_session_factory()() as s:
-        row = (await s.execute(
-            select(ProxySubscription).where(ProxySubscription.id == sub_id)
-        )).scalar_one()
-        row.snapshot_sha256 = None
-        await s.commit()
-
-    async def _boom(url, channels, **kw):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(bs, "fetch_subscription", _boom)
-    async with get_session_factory()() as s:
-        await bs.sync_subscriptions(s, data_dir=tmp_data_dir, now=NOW)
-        await s.commit()
-    assert (await _sub_row(sub_id)).snapshot_sha256 is None, "失败不得回写投影"
+    assert (await _sub_row(sub_id)).last_fetch_status == "OK"
 
 
 # ══ 9. 两个调用点并发 → 只有一次真正 bootstrap ══════════════════
@@ -524,7 +464,7 @@ async def test_sync_records_failure_without_crashing(tmp_data_dir, monkeypatch):
     bad_row, good_row = await _sub_row(bad), await _sub_row(good)
     assert bad_row.last_fetch_status == "FAILED", "失败必须被记录下来"
     assert bad_row.last_error == "no column named http_status"
-    assert good_row.last_fetch_status == "OK" and good_row.snapshot_version == 1
+    assert good_row.last_fetch_status == "OK"
 
     # savepoint 隔离：失败那条没留下节点/来源，成功那条正常
     async with get_session_factory()() as s:
@@ -652,7 +592,6 @@ async def test_refresh_discards_response_when_subscription_url_changes_in_flight
         sub = await session.get(ProxySubscription, sub_id)
     assert sub.url == "https://sub.invalid/renewed"
     assert snapshot_count == 0
-    assert sub.snapshot_sha256 is None
     assert result.failures[sub_id]
 
 
@@ -713,7 +652,6 @@ async def test_healthy_other_subscription_lane_is_a_fetch_egress(
     tmp_data_dir, monkeypatch,
 ):
     """订阅 A 的抓取通道可借用另一条订阅 B 的近期业务健康出口。"""
-    from app.domains.proxies import clash_manager
     from app.domains.proxypool import runtime as pool_runtime
 
     await init_db()
@@ -750,7 +688,7 @@ async def test_healthy_other_subscription_lane_is_a_fetch_egress(
         )
 
     assert len(channels) == 1
-    assert channels[0].exit_ip == "203.0.113.10"
+    # 出口身份记在 egress_id（exit:<ip>）；Channel 不再携带独立身份字段
     assert channels[0].egress_id == "exit:203.0.113.10"
     assert channels[0].proxy == "http://127.0.0.1:15555"
 

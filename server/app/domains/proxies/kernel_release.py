@@ -40,14 +40,15 @@ def release_asset_names() -> tuple[str, ...]:
 
 
 def bundled_source_note() -> str:
-    """获取和构建共用的随包来源说明。"""
-    return f"""Holdexar 随包内核资产（bundle assets）
+    """获取和构建共用的代理内核来源与许可说明。"""
+    return f"""Holdexar 代理内核资产与许可说明（按需组件）
 ==================================================
 mihomo         {MIHOMO_VERSION}
                来源 {MIHOMO_REPO}
                许可 GPL-3.0（原文见同目录 LICENSE-mihomo.txt）
 mihomo 以独立进程运行（非链接、非派生），本项目自身以 GPL-3.0 分发；
-对应源码即上游仓库上述地址，二进制未做任何修改。
+内核二进制不随安装包内置，由用户按需下载或自备维护；
+对应源码即上游仓库上述地址，所用二进制未做任何修改。
 """
 
 

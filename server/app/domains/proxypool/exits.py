@@ -20,7 +20,7 @@
 """
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -42,23 +42,15 @@ class ExitSlot:
 
     `alternatives` 是同出口的其它候选运行名——同落地不同入口。代表节点失效时可以在
     **不改容量模型**的前提下换一个节点顶上（槽还是那个槽）。
+    预算/熔断/统计一律按出口 IP 记账（不按 lane 序号）：同一出口上无论放几个
+    worker，共享同一份预算与同一个熔断器——按序号记账会让「多开一个 worker」
+    凭空多出一份额度。
     """
 
     exit_ip: str
     runtime_name: str
     node_id: str
     alternatives: tuple[str, ...] = ()
-    lane_index: int = -1
-    listener_port: int | None = None
-
-    @property
-    def key(self) -> str:
-        """预算/熔断/统计的账本键：按出口 IP，不按 lane 序号。
-
-        同一个出口上将来放几个 worker，它们共享同一份预算与同一个熔断器——按序号记账
-        会让「多开一个 worker」凭空多出一份额度。
-        """
-        return self.exit_ip
 
 
 def _time_key(value: datetime | None) -> float:
@@ -136,31 +128,6 @@ def select_exit_slots(
     ranked.sort(key=lambda item: item[0])
     limit = max(0, int(max_workers))
     return [slot for _key, slot in ranked[:limit]]
-
-
-def assign_lane_indexes(slots: Sequence[ExitSlot]) -> list[ExitSlot]:
-    """给槽表编上 lane 序号（槽序即 lane 序，一次 run 内不变）。"""
-    return [
-        ExitSlot(
-            exit_ip=s.exit_ip, runtime_name=s.runtime_name, node_id=s.node_id,
-            alternatives=s.alternatives, lane_index=i, listener_port=s.listener_port,
-        )
-        for i, s in enumerate(slots)
-    ]
-
-
-def slots_to_plan(slots: Sequence[ExitSlot], ports: Sequence[int]) -> list[dict]:
-    """槽表 + listener 端口 → 可持久化的 lane 计划（供归因与诊断读取）。"""
-    plan: list[dict] = []
-    for i, slot in enumerate(slots):
-        plan.append({
-            "lane": i,
-            "port": int(ports[i]) if i < len(ports) else None,
-            "exitIp": slot.exit_ip,
-            "node": slot.runtime_name,
-            "alternatives": list(slot.alternatives),
-        })
-    return plan
 
 
 async def exit_snapshot(session) -> dict[str, str]:

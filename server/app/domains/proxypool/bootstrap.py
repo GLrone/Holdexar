@@ -5,8 +5,8 @@ rebuild_runtime=已存在因池变化重建。幂等严格定义：池非空+入
 进程内一把锁串行，第二个等锁后重查，不落持久化状态。失败语义：无订阅或任一步
 失败 → Runtime 不可用 → crawler fail-closed，不退旧订阅代理不退直连，下个调度
 周期再试；不新增 BOOTSTRAP_FAILED 状态（失败是操作结果不是状态资产）。
-数据语义：snapshot sha256 唯一事实源在 subscription_snapshots.sha256，订阅行上
-的 snapshot_sha256 只是投影，且仅在快照落库成功后回写。
+数据语义：snapshot sha256 唯一事实源在 subscription_snapshots.sha256，订阅行
+只保留抓取结果标记（last_fetch_*），不投影快照身份。
 """
 from __future__ import annotations
 
@@ -168,7 +168,7 @@ async def _healthy_pool_channels(session: AsyncSession, *, data_dir: Path,
             continue
         used_exits.add(exit_ip)
         channels.append(Channel(
-            CHANNEL_POOL, str(binding["url"]), f"exit:{exit_ip}", exit_ip,
+            CHANNEL_POOL, str(binding["url"]), f"exit:{exit_ip}",
         ))
     return channels
 
@@ -194,7 +194,6 @@ def subscription_sync_lock(subscription_id: int) -> asyncio.Lock:
 async def sync_subscriptions(
     session: AsyncSession, *, data_dir: Path, now: datetime,
     kernel_proxy: str | None = None,
-    pool_proxy: str | None = None,
     only_auto: bool = False,
     only_sub_id: int | None = None,
     saved_proxies: list[str] | None = None,
@@ -222,7 +221,7 @@ async def sync_subscriptions(
             acquired.append(lock)
         return await _sync_subscriptions_under_locks(
             session, data_dir=data_dir, now=now, kernel_proxy=kernel_proxy,
-            pool_proxy=pool_proxy, only_auto=only_auto, only_sub_id=only_sub_id,
+            only_auto=only_auto, only_sub_id=only_sub_id,
             saved_proxies=saved_proxies, skip_sub_ids=skip_sub_ids,
             locked_ids=locked_ids, baseline=baseline,
         )
@@ -234,7 +233,6 @@ async def sync_subscriptions(
 async def _sync_subscriptions_under_locks(
     session: AsyncSession, *, data_dir: Path, now: datetime,
     kernel_proxy: str | None,
-    pool_proxy: str | None,
     only_auto: bool,
     only_sub_id: int | None,
     saved_proxies: list[str] | None,
@@ -247,7 +245,7 @@ async def _sync_subscriptions_under_locks(
     每份成功快照都会对齐节点身份与来源。CANDIDATE 仍由准入状态挡在生产池外，
     但它的节点身份和健康证据可以与通用代理 Runtime 共用。
 
-    抓取走既有通道链语义：`direct → kernel_proxy → pool_proxy → 本机混合端口`。
+    抓取走既有通道链语义：`direct → kernel_proxy → 池 lane → 本机混合端口`。
     直连被墙/超时是常态，所以 kernel_proxy（现有 Mihomo 内核的代理）是真实可用的
     第二通道——但它**只是订阅获取的辅助通道**，绝不是 crawler 的代理，也不构成
     proxypool Runtime 的回退。`kernel_proxy` 不给就现取（老 Clash 在跑就用它），
@@ -308,7 +306,7 @@ async def _sync_subscriptions_under_locks(
         session, data_dir=data_dir, now=now,
     )
     channels = build_channels(
-        kernel_proxy=kernel_proxy, pool_proxy=pool_proxy,
+        kernel_proxy=kernel_proxy,
         pool_channels=healthy_pool_channels,
     )
     existing_proxies = {channel.proxy for channel in channels}
@@ -438,6 +436,21 @@ async def _sync_subscriptions_under_locks(
                             session, subscription_id=sub_id, data_dir=data_dir, now=now
                         )
                         if admitted is not None:
+                            # 与首检自动转正同一事件类型：转正不管走哪条生产路径，
+                            # 事件流里都是同一种事实（订阅晋升 ACTIVE）。
+                            await events.record(
+                                events.KIND_SUBSCRIPTION_PROMOTED,
+                                f"订阅 {admitted.subscription_id} 晋升 ACTIVE："
+                                f"应用快照 {str(admitted.snapshot_sha256 or '')[:10]}，"
+                                f"对齐节点 {admitted.applied_nodes}",
+                                payload={
+                                    "subscriptionId": admitted.subscription_id,
+                                    "snapshotSha256": admitted.snapshot_sha256,
+                                    "appliedNodes": admitted.applied_nodes,
+                                },
+                                session=session,
+                                now=now,
+                            )
                             log_event(
                                 logger,
                                 f"订阅 {sub_id} 体检健康，自动转正进生产池",
@@ -504,9 +517,7 @@ async def _sync_subscriptions_under_locks(
                 failures[sub_id] = message
                 continue
 
-            # 投影必须在**快照落库成功之后**；事实源始终是 subscription_snapshots.sha256
-            sub.snapshot_sha256 = snap.sha256
-            sub.snapshot_version = int(sub.snapshot_version or 0) + 1
+            # 事实源始终是 subscription_snapshots.sha256；订阅行不再投影快照身份
             sub.last_fetch_at = now
             sub.last_fetch_status = "OK"
             sub.last_success_at = now
@@ -617,7 +628,6 @@ async def ensure_pool_runtime(
     wait_timeout: float = DEFAULT_WAIT_TIMEOUT,
     skip_sync: bool = False,
     kernel_proxy: str | None = None,
-    pool_proxy: str | None = None,
 ) -> BootstrapResult:
     """幂等原语：**池文件与合格集集合相等、且 Runtime 可达**才算"已有可用 Runtime"。
 
@@ -687,7 +697,6 @@ async def ensure_pool_runtime(
                 kernel_proxy=(
                     default_kernel_proxy() if kernel_proxy is None else kernel_proxy
                 ),
-                pool_proxy=pool_proxy,
             )
         if not await eligible_runtime_names(session):
             return BootstrapResult(

@@ -1,4 +1,4 @@
-"""P1.3-C：池文件 → 内核运行时的**事实读取**与对账。
+"""池文件 → 内核运行时的**事实读取**与对账。
 
 这一层只做三件事，且刻意只做三件：
 
@@ -24,7 +24,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
-import socket
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -38,12 +37,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import orchestration as events
 from app.core.logging import log_event
+from app.core.net import free_local_port as _free_local_port
+from app.core.net import port_listening as _port_listening
 from app.domains.proxies.clash_manager import (
     PROBE_LANE_PREFIX,
     inject_probe_lanes,
 )
+# 内核内置的逻辑节点（不是池里的节点）：把 /proxies 里「多出来的键」解释清楚，
+# 同时也是 `dialer-proxy` 的合法目标（走直连/拒绝）。唯一事实源在
+# proxies.runtime_config，这里只导入复用——两份同名单必然漂移。
 from app.domains.proxies.runtime_config import (
-    BUILTIN_PROXY_NAMES as _BUILTIN_PROXY_NAMES,
+    BUILTIN_PROXY_NAMES,
     validate_execution_config,
 )
 from app.domains.proxies.kernel_process import KernelPrecheckError, confirm_config_text
@@ -54,11 +58,6 @@ from app.domains.proxypool.pool import (
     eligible_nodes,
     pool_path,
 )
-
-# 内核内置的逻辑节点（不是池里的节点）：把 /proxies 里「多出来的键」解释清楚，
-# 同时也是 `dialer-proxy` 的合法目标（走直连/拒绝）。唯一事实源在
-# proxies.runtime_config，这里只转发——两份同名单必然漂移。
-BUILTIN_PROXY_NAMES = _BUILTIN_PROXY_NAMES
 
 DEFAULT_WAIT_TIMEOUT = 15.0
 
@@ -155,29 +154,6 @@ def read_lane_plan(data_dir: Path) -> list[dict]:
     return [dict(e) for e in entries if isinstance(e, Mapping)] if isinstance(entries, list) else []
 
 
-def exit_ip_for_lane(data_dir: Path, index: int) -> str | None:
-    """第 `index` 条 lane 绑定的出口 IP（未记录 → None）。"""
-    for entry in read_lane_plan(data_dir):
-        try:
-            if int(entry.get("lane", -1)) == int(index):
-                value = entry.get("exitIp")
-                return str(value) if value else None
-        except (TypeError, ValueError):
-            continue
-    return None
-
-
-def _free_local_port() -> int:
-    """让系统分配一个空闲的本机 TCP 端口（L1 的代理入口）。
-
-    首版刻意**不做端口租约**：真撞上时内核会暴露失败（日志里不会出现
-    「Mixed proxy listening」），到真实使用中出现证据再决定要不要做端口管理。
-    """
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
 def mixed_port_of(data_dir: Path) -> int:
     """读运行配置里的 mixed-port——GLOBAL 入口，维护路径经它发真实请求。"""
     path = runtime_config_path(data_dir)
@@ -215,12 +191,6 @@ def runtime_lane_ports(data_dir: Path) -> tuple[int, ...]:
     return tuple(by_index[i] for i in sorted(by_index))
 
 
-def _port_listening(port: int, timeout: float = 0.3) -> bool:
-    with socket.socket() as sock:
-        sock.settimeout(timeout)
-        return sock.connect_ex(("127.0.0.1", port)) == 0
-
-
 def lane_proxy_urls(data_dir: Path) -> list[str]:
     """生产入口：每条 lane 一个本机代理地址（按 lane 序号）。
 
@@ -256,10 +226,6 @@ async def wait_lane_ports(
     raise RuntimeUnreachableError(
         f"lane 入口 {ports} 在 {timeout}s 内没有全部开始监听（控制器起来了但入口没起）"
     )
-
-
-def lane_group_name(index: int) -> str:
-    return f"{LANE_GROUP_PREFIX}{index}"
 
 
 def is_lane_group(name: str) -> bool:
@@ -482,10 +448,8 @@ async def wait_mixed_port(
     port = mixed_port_of(data_dir)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        with socket.socket() as sock:
-            sock.settimeout(0.3)
-            if sock.connect_ex(("127.0.0.1", port)) == 0:
-                return port
+        if _port_listening(port):
+            return port
         await asyncio.sleep(0.05)
     raise RuntimeUnreachableError(
         f"mixed-port {port} 在 {timeout}s 内没有开始监听（控制器起来了但入口没起）"
@@ -1037,38 +1001,9 @@ def current_runtime_proxy_url(data_dir: Path) -> str | None:
     except (RuntimeConfigError, OSError):
         # 连运行配置都没有（首次启动）也是"不可用"，不是异常
         return None
-    with socket.socket() as sock:
-        sock.settimeout(0.3)
-        if sock.connect_ex(("127.0.0.1", port)) != 0:
-            return None
+    if not _port_listening(port):
+        return None
     return f"http://127.0.0.1:{port}"
-
-
-def require_runtime_proxy_url(data_dir: Path) -> str:
-    """同 `current_runtime_proxy_url`，但拿不到就抛 `RuntimeUnavailableError`。"""
-    proxy_url = current_runtime_proxy_url(data_dir)
-    if proxy_url is None:
-        raise RuntimeUnavailableError(
-            "代理通道尚未就绪：内核还在拉起出口，等十几秒再点一次启动"
-        )
-    return proxy_url
-
-
-def require_lane_proxy_urls(data_dir: Path) -> list[str]:
-    """受管爬取的生产入口：每条 lane 一个地址，worker 按序号绑定。
-
-    降级边界只有一条：运行配置里**没有 lane**（旧产物）时退回同一个 Runtime 的
-    GLOBAL 入口——仍是池内出口，不构成"退回直连或旧订阅代理"。有 lane 但入口没全
-    就绪属于 Runtime 不可用，直接抛错（fail closed），不把半就绪的入口交出去。
-    """
-    if runtime_lane_ports(data_dir):
-        urls = lane_proxy_urls(data_dir)
-        if not urls:
-            raise RuntimeUnavailableError(
-                "代理通道尚未就绪：内核还在拉起出口，等十几秒再点一次启动"
-            )
-        return urls
-    return [require_runtime_proxy_url(data_dir)]
 
 
 def lane_bindings(data_dir: Path) -> list[dict]:
@@ -1345,48 +1280,4 @@ async def crawl_lane_plan(
         "bindings": active,
         "runtime_lanes": len(bindings),
         "known_exits": len({v for v in known.values() if v}),
-    }
-
-
-def lane_run_plan(
-    data_dir: Path,
-    *,
-    exit_by_node: Mapping[str, str] | None = None,
-    max_lanes: int | None = None,
-) -> dict:
-    """**非生产**取值口（诊断 / 验证脚本用）：不做一致性校验，空快照时退回按节点计。
-
-    生产爬取一律走 `crawl_lane_plan()`——它会校验「池 / lane / 出口快照」三者一致并
-    fail closed。本函数保留给诊断与脚本，避免把校验逻辑复制成第二套。
-    """
-    """受管爬取一次 run 需要的入口三元组：地址 / 出口键 / 执行节点（三者同序）。
-
-    **唯一取值口**：生产路径与验证脚本都从这里取。`exit_by_node` 是**当前**出口身份
-    快照（`ProxyNode.runtime_name -> exit_ip`）；给了就按 `select_run_lanes` 收敛成
-    本次 run 的 active lane 表（保证 `active_lanes ≤ 唯一出口数`），并把它作为
-    **run 级快照**返回——run 一旦开始，后台维护改了出口集也不会影响它：调用方拿到的是
-    一份已经定型的列表，`CrawlRunConfig.proxy_urls` 在 run 内不再变动。
-
-    出口身份缺失时键退回 `lane:<序号>`——它仍能保证同出口共享一份预算（同一 lane 上的
-    worker 同键），只是不跨 lane 合并同出口。
-    """
-    bindings = lane_bindings(data_dir)
-    if not bindings:
-        urls = require_lane_proxy_urls(data_dir)
-        bindings = [
-            {"lane": i, "url": url, "exitIp": None, "node": None}
-            for i, url in enumerate(urls)
-        ]
-    active = select_run_lanes(bindings, exit_by_node, max_lanes=max_lanes)
-    if not active:
-        # 收敛后一条都不剩（现有 listener 绑的节点全都没有出口身份）：保留全部入口，
-        # 走 `lane:<序号>` 键——宁可退化，也不让本次 run 无入口可用。
-        active = [dict(b) for b in bindings]
-    return {
-        "urls": [b["url"] for b in active],
-        "exit_keys": [b["exitIp"] or f"lane:{b['lane']}" for b in active],
-        "nodes": [b["node"] or "" for b in active],
-        "bindings": active,
-        "runtime_lanes": len(bindings),
-        "known_exits": len({v for v in (exit_by_node or {}).values() if v}),
     }

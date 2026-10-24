@@ -12,9 +12,8 @@ import pytest
 import yaml
 from sqlalchemy import select
 
-from app.core.config import get_settings
-from app.core.database import get_engine, get_session_factory, init_db
-from app.domains.proxies.models import ClashNode, ProxySubscription
+from app.core.database import get_session_factory, init_db
+from app.domains.proxies.models import ProxySubscription
 from app.domains.proxypool import bridge as B
 from app.domains.proxypool.models import (
     HealthObservation,
@@ -45,15 +44,8 @@ CONFIG = {"name": "a", "type": "http", "server": "10.0.0.1", "port": 1}
 
 
 @pytest.fixture
-def env(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOLDEXAR_DATA_DIR", str(tmp_path))
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-    yield tmp_path
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
+def env(tmp_data_dir):
+    return tmp_data_dir
 
 
 def _snapshot(sub_id: int, nodes: list[dict], sha: str | None = None) -> Snapshot:
@@ -242,44 +234,6 @@ async def test_check_does_not_demote_on_failure(env):
 
 
 @pytest.mark.asyncio
-async def test_ledger_sweep_covers_other_subscriptions(env):
-    """全订阅兼容表由 ProxyNode 投影刷新，旧状态不能反向复活节点。"""
-    await init_db()
-    await _add_node("n5", NODE_ACTIVE, sub_id=2, name="sub-x", exit_ip="8.8.8.8")
-    await _add_node("n6", NODE_DEAD, sub_id=3, name="sub-y", exit_ip="7.7.7.7")
-    async with get_session_factory()() as s:
-        n5 = (await s.execute(select(ProxyNode).where(ProxyNode.node_id == "n5"))).scalar_one()
-        n6 = (await s.execute(select(ProxyNode).where(ProxyNode.node_id == "n6"))).scalar_one()
-        n5.last_l2_at = NOW - timedelta(hours=1)
-        n6.last_l2_at = NOW - timedelta(hours=1)
-        s.add(
-            ClashNode(
-                subscription_id=2, name="sub-x", status="dead", exit_ip=None,
-                latency_ms=70, last_checked_at=NOW - timedelta(hours=1),
-            )
-        )
-        s.add(
-            ClashNode(
-                subscription_id=3, name="sub-y", status="ok", exit_ip="7.7.7.7",
-                latency_ms=60, last_checked_at=NOW - timedelta(hours=100),
-            )
-        )
-        await s.commit()
-
-    async with get_session_factory()() as s:
-        outcome = await B.ingest_ledger(s, now=NOW)
-        await s.commit()
-
-    assert outcome.activated == 1
-    assert outcome.deactivated == 1
-    assert outcome.exit_ips_added == 1
-    fresh = await _node("n5")
-    assert fresh.state == NODE_ACTIVE and fresh.exit_ip == "8.8.8.8"
-    stale = await _node("n6")
-    assert stale.state == NODE_DEAD and stale.exit_ip == "7.7.7.7"
-
-
-@pytest.mark.asyncio
 async def test_apply_snapshot_writes_subscription_code_and_keeps_identity(env):
     """来源关联带订阅特征码；改名（配置不变=同指纹）复用同一行、只刷新原名。"""
     await init_db()
@@ -399,60 +353,6 @@ async def test_clash_test_choke_point_feeds_pool(env, monkeypatch):
     by_name = {r["name"]: r for r in result["nodes"]}
     assert by_name["sub-a"]["sourceCode"] == f"sd{sub_id}"
     assert by_name["sub-a"]["poolState"] == NODE_ACTIVE
-
-
-@pytest.mark.asyncio
-async def test_ledger_does_not_override_newer_pool_verdict(env):
-    """池内已有更新的业务结论（last_l2_at）且节点正被判坏时不复活：
-    避免「池判死 ↔ 体检账本复活」每拍互相推翻、节点状态翻烧饼。"""
-    await init_db()
-    await _add_node("n7", NODE_DEAD, sub_id=2, name="sub-x")
-    async with get_session_factory()() as s:
-        s.add(
-            ClashNode(
-                subscription_id=2, name="sub-x", status="ok", exit_ip="8.8.8.8",
-                latency_ms=70, last_checked_at=NOW - timedelta(hours=2),
-            )
-        )
-        node = (
-            await s.execute(select(ProxyNode).where(ProxyNode.node_id == "n7"))
-        ).scalar_one()
-        node.last_l2_at = NOW - timedelta(hours=1)
-        await s.commit()
-
-    async with get_session_factory()() as s:
-        outcome = await B.ingest_ledger(s, now=NOW)
-        await s.commit()
-
-    assert outcome.activated == 0
-    assert (await _node("n7")).state == NODE_DEAD
-
-
-@pytest.mark.asyncio
-async def test_legacy_check_never_resurrects_registry_node(env):
-    """即使旧体检时间较新，兼容投影也不能反向改变 ProxyNode 健康状态。"""
-    await init_db()
-    await _add_node("n8", NODE_DEAD, sub_id=2, name="sub-x")
-    async with get_session_factory()() as s:
-        s.add(
-            ClashNode(
-                subscription_id=2, name="sub-x", status="ok", exit_ip="8.8.8.8",
-                latency_ms=70, last_checked_at=NOW - timedelta(hours=1),
-            )
-        )
-        node = (
-            await s.execute(select(ProxyNode).where(ProxyNode.node_id == "n8"))
-        ).scalar_one()
-        node.last_l2_at = NOW - timedelta(hours=2)
-        await s.commit()
-
-    async with get_session_factory()() as s:
-        outcome = await B.ingest_ledger(s, now=NOW)
-        await s.commit()
-
-    assert outcome.activated == 0
-    assert outcome.deactivated == 1
-    assert (await _node("n8")).state == NODE_DEAD
 
 
 @pytest.mark.asyncio

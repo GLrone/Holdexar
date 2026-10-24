@@ -20,6 +20,15 @@ from app.domains.proxypool.models import ProxyRunExit
 logger = logging.getLogger(__name__)
 
 
+def _row_ok(row: dict) -> int:
+    """该出口行拿到的 Steam 侧响应数（429/5xx 是目标响应，不罚节点）。"""
+    return (
+        int(row.get("success") or 0)
+        + int(row.get("e429") or 0)
+        + int(row.get("e5xx") or 0)
+    )
+
+
 async def _writeback_production_evidence(
     session: AsyncSession,
     rows: list[dict],
@@ -28,9 +37,13 @@ async def _writeback_production_evidence(
 ) -> None:
     """生产结果回写节点健康账本（统一账本的第三条写入通道）。
 
-    「能不能访问 Steam」= 经该出口是否拿到 Steam 的任何响应：success>0 或
-    e429/e5xx>0 都算传输成功（429/5xx 是 Steam 侧响应，不罚节点）；整行零响应
-    且全是超时/连不上才是节点失败证据（fail-fast 判死，可被下一轮成功复活）。
+    错误分类（与探测证据分桶，互不累加）：
+    - **环境级失败**：本作业所有出口都没拿到任何 Steam 响应（本机断网/上游全断）
+      ——不构成任何节点证据，交给健康探测裁决，防止一次断网误杀全池；
+    - **出口级失败**：环境确认存活（至少一个出口拿到过响应）时，零响应出口的
+      节点判 DEAD——DEAD 可自由复活，且**不累加** `consecutive_failures`：
+      退休判据只归健康探测，生产抖动永远无法把节点推向 RETIRED；
+    - **成功**：清零失败计数并回 ACTIVE/STALE（可复活的最强证据）。
     """
     from sqlalchemy import select
 
@@ -45,22 +58,17 @@ async def _writeback_production_evidence(
         agg = by_node.setdefault(node_id, {"ok": 0, "noresp": 0})
         if row.get("uncertain"):
             continue
-        ok = (
-            int(row.get("success") or 0)
-            + int(row.get("e429") or 0)
-            + int(row.get("e5xx") or 0)
-        )
-        tunnel_failed = (
+        if _row_ok(row) > 0:
+            agg["ok"] += 1
+        elif (
             int(row.get("timeout") or 0)
             + int(row.get("connect_error") or 0)
             + int(row.get("tunnel_error") or 0)
-        )
-        if ok > 0:
-            agg["ok"] += 1
-        elif tunnel_failed > 0:
+        ) > 0:
             agg["noresp"] += 1
     if not by_node:
         return
+    environment_alive = any(_row_ok(row) > 0 for row in rows if not row.get("uncertain"))
     node_rows = (await session.execute(
         select(ProxyNode).where(ProxyNode.node_id.in_(by_node))
     )).scalars().all()
@@ -76,12 +84,11 @@ async def _writeback_production_evidence(
                 probe_ok=True, consecutive_failures=0,
             )
             node.last_l2_at = stamp
-        elif agg["noresp"] > 0:
-            failures = (node.consecutive_failures or 0) + 1
-            node.consecutive_failures = failures
+        elif agg["noresp"] > 0 and environment_alive:
             node.state = evaluate_node_state(
                 node.state, source_seen=node.node_id in sourced,
-                probe_ok=False, consecutive_failures=failures,
+                probe_ok=False,
+                consecutive_failures=node.consecutive_failures or 0,
             )
             node.last_l2_at = stamp
 

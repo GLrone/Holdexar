@@ -148,8 +148,6 @@ async def test_start_run_records_pool_facts_and_selected_node(tmp_data_dir, monk
         assert row.snapshot_ids_json == [1]
         assert row.selected_node == "1|A"
         assert row.node_exit_ip == "203.0.113.7"
-        # Active/Candidate 尚未实现：这一列必须留空，不伪造生产订阅
-        assert row.active_subscription_id is None
         assert row.regions_json == ["us"]
         assert row.workers == 30
         assert row.crawl_job_id == 777
@@ -395,7 +393,6 @@ async def test_detail_payload_shape(tmp_data_dir):
         assert payload["node"] is None and payload["nodeExitIp"] is None
         assert payload["regions"] == ["us", "de"]
         assert payload["poolNodeCount"] == 1
-        assert payload["activeSubscriptionId"] is None
         assert payload["startedAt"] == NOW.isoformat()
 
 

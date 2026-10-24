@@ -34,6 +34,8 @@ import yaml
 
 from app.core.config import get_settings
 from app.core.logging import log_event
+from app.core.net import free_local_port as _free_local_port
+from app.core.net import port_listening as _port_listening
 from app.domains.proxies.kernel_release import (
     MIHOMO_VERSION,
     MIRRORS,
@@ -384,17 +386,6 @@ def _looks_like_opaque_token(text: str) -> bool:
 _SUB_HEADERS = {"User-Agent": f"clash.meta/{MIHOMO_VERSION.lstrip('v')}"}
 
 
-def _port_reachable(port: int, host: str = "127.0.0.1", timeout: float = 0.3) -> bool:
-    """本地端口探活（订阅/内核下载借道本地混合端口的判据）。"""
-    import socket
-
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
-
-
 # External local proxy defaults. Holdexar's own listener comes from runtime status.
 LOCAL_MIXED_PORTS: tuple[int, ...] = (7897,)
 # 借道口探活后的最小可用性验证：口在听不代表出口能出网
@@ -407,7 +398,7 @@ def local_mixed_channels(exclude_port: int | None = None) -> list[str]:
     return [
         f"http://127.0.0.1:{port}"
         for port in LOCAL_MIXED_PORTS
-        if port != exclude_port and _port_reachable(port)
+        if port != exclude_port and _port_listening(port)
     ]
 
 
@@ -444,7 +435,7 @@ def _download_attempts(
     for port in LOCAL_MIXED_PORTS:
         if port == runtime_port:
             continue
-        if _port_reachable(port):
+        if _port_listening(port):
             attempts.append((f"http://127.0.0.1:{port}", f"本地混合端口 {port}"))
     # 直连放最后：订阅面板域名多数被墙，直连通常要等满超时才轮到下一条通道，
     # 排在最前会让每次刷新都白等（与 Clash Verge Rev「经当前代理更新订阅」同向）。
@@ -833,12 +824,6 @@ def _port_free(port: int) -> bool:
             return False
 
 
-def _free_local_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
 def _port_owned_by_process(port: int, process_id: int) -> bool:
     if os.name == "nt":
         try:
@@ -874,13 +859,6 @@ def _port_owned_by_process(port: int, process_id: int) -> bool:
         )
     except (ImportError, OSError, PermissionError):
         return False
-
-
-def _port_listening(port: int) -> bool:
-    """端口有进程在听（connect 探测）——热重载后校验 lane listener 存活用。"""
-    with socket.socket() as sock:
-        sock.settimeout(0.3)
-        return sock.connect_ex(("127.0.0.1", port)) == 0
 
 
 def _alloc_probe_ports(
@@ -997,38 +975,6 @@ def materialize_subscription_config(raw_path: Path) -> Path:
     node_secret_files.tighten(out)
     node_secret_files.tighten(source_path)
     return out
-
-
-def parse_info_node_traffic(config_text: str) -> str | None:
-    """从机场信息占位节点里提取剩余流量（响应头拿不到时的兜底来源）。
-
-    部分机场不发 subscription-userinfo 头，而把用量写进占位节点名
-    （`剩余流量：19.48 GB`；占位节点识别复用 pool 域的 `is_info_placeholder`，
-    不在这里另立一份名称特征表）。返回的字符串形如 `剩余流量：19.48 GB`，
-    与响应头原文同为「给人看的事实」，上层按原文展示即可。
-    """
-    from app.domains.proxypool.models import is_info_placeholder
-
-    try:
-        doc = yaml.safe_load(config_text)
-    except yaml.YAMLError:
-        return None
-    if not isinstance(doc, dict):
-        return None
-    entries = doc.get("proxy-groups")
-    if not isinstance(entries, list):
-        return None
-    for group in entries:
-        if not isinstance(group, dict):
-            continue
-        members = group.get("proxies")
-        if not isinstance(members, list):
-            continue
-        for name in members:
-            text = str(name or "")
-            if "剩余" in text and is_info_placeholder(text):
-                return text.strip()
-    return None
 
 
 def _subscription_id_of(config_path: Path | None) -> int | None:
@@ -1678,9 +1624,10 @@ class ClashRuntime:
     ) -> dict:
         """Return the current subscription snapshot in the legacy config-file location."""
         from app.domains.proxypool.subscription import (
-            build_channels, detect_format, fetch_subscription,
-            latest_snapshot, parse_nodes, subscription_url_identity,
-            saved_proxy_channels,
+            detect_format,
+            latest_snapshot,
+            parse_nodes,
+            subscription_url_identity,
         )
 
         path = target_path or kernel_dir(data_dir) / "config.yaml"
@@ -1721,13 +1668,6 @@ class ClashRuntime:
                             requested_identity = subscription_url_identity(sub_url)
                             stored_identity = subscription.cache_url_identity
                             if stored_identity is not None and stored_identity != requested_identity:
-                                raise RuntimeError(
-                                    "没有可恢复的成功快照或有效订阅缓存"
-                                )
-                            if (
-                                "urlIdentity" in cached_meta
-                                and cached_meta.get("urlIdentity") != requested_identity
-                            ):
                                 raise RuntimeError(
                                     "没有可恢复的成功快照或有效订阅缓存"
                                 )
@@ -1775,8 +1715,7 @@ class ClashRuntime:
                         write_subscription_meta(
                             data_dir, meta_id,
                             {"title": title, "userinfo": userinfo,
-                             "fetchedAt": int(time.time() * 1000),
-                             "urlIdentity": subscription_url_identity(sub_url)},
+                             "fetchedAt": int(time.time() * 1000)},
                         )
                     else:
                         cached_meta = read_subscription_meta(data_dir, meta_id)
@@ -1788,91 +1727,7 @@ class ClashRuntime:
                         "_sync_result": sync,
                     }
 
-        runtime_proxy = (
-            f"http://127.0.0.1:{self.port}"
-            if self.status()["running"] and self.port and self.entry_listening()
-            else None
-        )
-        channels = build_channels(
-            kernel_proxy=runtime_proxy,
-            local_proxies=local_mixed_channels(self.port if runtime_proxy else None),
-        )
-        existing_proxies = {channel.proxy for channel in channels}
-        channels.extend(
-            channel for channel in saved_proxy_channels(saved)
-            if channel.proxy not in existing_proxies
-        )
-
-        last_err: Exception | None = None
-        try:
-            result = await fetch_subscription(sub_url, channels)
-            nodes = result.resolved_nodes or parse_nodes(result.raw, result.fmt)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if result.provider_nodes:
-                from app.domains.proxies.runtime_config import expand_provider_nodes
-
-                runtime_source = expand_provider_nodes(
-                    result.raw.decode("utf-8"), result.provider_nodes
-                ).encode("utf-8")
-            else:
-                runtime_source = result.raw
-            path.write_bytes(runtime_source)
-            title = subscription_auto_name({
-                "profile-title": result.profile_title,
-                "content-disposition": result.content_disposition,
-            }, sub_url)
-            if meta_id is not None:
-                write_subscription_meta(
-                    data_dir, meta_id,
-                    {"title": title, "userinfo": result.userinfo,
-                     "fetchedAt": int(time.time() * 1000),
-                     "urlIdentity": subscription_url_identity(sub_url)},
-                )
-            log_event(
-                logger,
-                f"订阅下载成功：{len(nodes)} 个节点",
-                tag="成功",
-                detail={
-                    "通道": result.channel,
-                    "出口": result.egress_id,
-                    "节点数": len(nodes),
-                    "耗时毫秒": result.duration_ms,
-                },
-            )
-            return {
-                "path": str(path), "title": title, "userinfo": result.userinfo,
-                "nodes": len(nodes), "cached": False,
-            }
-        except Exception as exc:  # noqa: BLE001 —— shared fetch failure may use last cache
-            last_err = exc
-        if path.is_file():
-            cached_meta = (
-                read_subscription_meta(data_dir, meta_id)
-                if meta_id is not None else {}
-            )
-            cached_raw = path.read_bytes()
-            cached_text = cached_raw.decode("utf-8")
-            nodes = parse_nodes(cached_raw, "yaml")
-            log_event(
-                logger,
-                "订阅全部通道下载失败，回退上次成功的本地缓存",
-                tag="降级",
-                level=logging.WARNING,
-                detail={"沿用元数据": bool(cached_meta), "原因类型": type(last_err).__name__},
-            )
-            fallback_traffic = cached_meta.get("userinfo") or parse_info_node_traffic(
-                cached_text
-            )
-            return {
-                "path": str(path),
-                "title": cached_meta.get("title"),
-                "userinfo": fallback_traffic,
-                "nodes": len(nodes), "cached": True,
-            }
-        if last_err is not None:
-            raise last_err
-        raise RuntimeError("订阅抓取未返回结果")
-
+        raise RuntimeError("订阅缓存归属未解析：目标路径不是 clash-sub-{id} 形态")
 
 runtime = ClashRuntime()
 # 池专用实例：与订阅功能那个 `runtime` 是**两套东西**——配置目录、`-d`、

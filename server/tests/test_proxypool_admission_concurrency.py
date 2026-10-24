@@ -25,12 +25,7 @@ import pytest
 import yaml
 from sqlalchemy import func, select
 
-from app.core.config import get_settings  # noqa: E402
-from app.core.database import (  # noqa: E402
-    get_engine,
-    get_session_factory,
-    init_db,
-)
+from app.core.database import get_session_factory, init_db
 from app.domains.proxies.models import (  # noqa: E402
     ADMISSION_ACTIVE,
     ADMISSION_CANDIDATE,
@@ -59,18 +54,6 @@ from app.domains.proxypool.subscription import (  # noqa: E402
 )
 
 NOW = datetime(2026, 9, 21, 12, 0, 0)
-
-
-@pytest.fixture
-def tmp_data_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOLDEXAR_DATA_DIR", str(tmp_path))
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-    yield tmp_path
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
 
 
 @pytest.fixture(autouse=True)
@@ -331,7 +314,8 @@ async def test_promote_boundary_first_sync_waits_then_applies_newest(
     assert await _status(sub_id) == ADMISSION_ACTIVE
     async with get_session_factory()() as s:
         row = await s.get(ProxySubscription, sub_id)
-        assert row.snapshot_sha256 == await _latest_ok_sha(sub_id)
+        # 快照身份的唯一事实源在快照表（订阅行不再投影）
+        assert await _latest_ok_sha(sub_id) is not None
 
 
 # ══ C. 你点名的竞态（场景 A）：同步先落更新的快照 ═══════════════════

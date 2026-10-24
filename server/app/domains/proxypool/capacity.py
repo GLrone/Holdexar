@@ -59,8 +59,6 @@ STEAM_TARGET_URL = (
 
 DEFAULT_LADDER: tuple[int, ...] = (8, 16, 32, 48, 64, 80, 96, 128, 160, 192, 256, 320)
 
-REPORT_SCHEMA = "proxypool-capacity-report/1"
-
 
 @dataclass(frozen=True)
 class CapacityCriteria:

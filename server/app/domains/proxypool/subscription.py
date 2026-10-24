@@ -27,8 +27,6 @@ from app.domains.proxies.subscription_secret import open_url, seal_url, url_matc
 from app.domains.proxypool.models import (
     SubscriptionSnapshot,
     is_info_placeholder,
-    node_fingerprint,
-    port_is_identity,
 )
 
 # UA 必须与内核拉取 provider 时同款：面板按 UA 分流订阅格式，不含 clash 关键字会
@@ -51,8 +49,6 @@ FORMAT_HTML = "html"
 FORMAT_JSON = "json"
 FORMAT_EMPTY = "empty"
 FORMAT_UNKNOWN = "unknown"
-
-PARSEABLE_FORMATS = frozenset({FORMAT_YAML, FORMAT_PROVIDER_YAML})
 
 CHANNEL_DIRECT = "direct"
 CHANNEL_KERNEL = "mihomo"
@@ -172,7 +168,6 @@ class Channel:
     name: str
     proxy: str | None = None
     egress_id: str | None = None
-    exit_ip: str | None = None
 
 
 @dataclass(frozen=True)
@@ -260,43 +255,6 @@ class Snapshot:
         )
 
 
-@dataclass(frozen=True)
-class NodeUpdate:
-    """端点未变、配置已变的节点：旧指纹被这条新配置**取代**了。
-
-    旧指纹必须显式带出来：`removed` 不包含「被取代」的旧
-    指纹（见 `compute_diff`），旧指纹只能从这里取。搬历史的一方需要它把来源关联与健康
-    /容量历史从旧行搬到新行——没有它就只剩「新登记一条 + 旧行靠来源流失自然
-    退休」，同一逻辑节点的历史会被腰斩。
-
-    `previous_fingerprint` 是**上一份快照里**的指纹，不是 Registry 里那一行的
-    现值；两者在连续多次变更后可能不同，调用方按指纹查行、查不到就当新增处理。
-    """
-
-    previous_fingerprint: str
-    node: dict
-
-
-@dataclass
-class Diff:
-    """相对上一份快照的差异。**removed 是 STALE 候选，不是删除指令。**
-
-    不变量：`updated` 携带的 previous_fingerprint 与 `removed` **交集为空**，
-    且 `unchanged` 与 `removed` 交集为空——同一个逻辑节点不允许既被更新又被
-    判为消失（P1.3 会先按 UPDATED 更新、再按 REMOVED 标 STALE，注册表当场就错）。
-
-    注意本对象是**报告**而非指令集：P1.3 对来源集合要按当前快照整体替换
-    （sources(S) = {fingerprint(n) for n in N}），不要按 diff 逐条重放。
-    """
-
-    added: list[dict] = field(default_factory=list)      # 新增节点配置
-    updated: list[NodeUpdate] = field(default_factory=list)  # 端点相同、指纹变化
-    unchanged: list[str] = field(default_factory=list)   # 指纹
-    removed: list[str] = field(default_factory=list)     # 指纹 → Registry 转 STALE
-    unchanged_snapshot: bool = False                     # 与上份快照字节相同
-    node_count: int = 0
-
-
 # ── 格式判定 ──────────────────────────────────────────────────────
 def decode_utf8(raw: bytes) -> str:
     """严格 UTF-8 解码：非法字节一律抛 `InvalidEncodingError`。
@@ -340,7 +298,6 @@ def detect_format(raw: bytes) -> str:
 def build_channels(
     *,
     kernel_proxy: str | None = None,
-    pool_proxy: str | None = None,
     pool_channels: list[Channel] | None = None,
     local_proxies: list[str] | None = None,
 ) -> list[Channel]:
@@ -348,8 +305,6 @@ def build_channels(
     channels = [Channel(CHANNEL_DIRECT, None, CHANNEL_DIRECT)]
     if kernel_proxy:
         channels.append(Channel(CHANNEL_KERNEL, kernel_proxy, "runtime"))
-    if pool_proxy:
-        channels.append(Channel(CHANNEL_POOL, pool_proxy, "proxypool"))
     channels.extend(pool_channels or [])
     if local_proxies is None:
         local_proxies = _local_mixed_proxies(kernel_proxy)
@@ -975,26 +930,6 @@ def parse_nodes(raw: bytes, fmt: str) -> list[dict]:
     return nodes
 
 
-def node_key(config: dict) -> str:
-    """端点身份 `type|server`（端口仅在它是唯一区分依据时参与）。
-
-    与 fingerprint（全配置哈希、Registry 主键）分工：凭据/参数轮换时指纹变、端点键
-    不变，据此把它识别为 UPDATED 而不是「删一条 + 加一条」。端口按 `port_is_identity`
-    分档——动态端口机场每次拉取都换号，含它会让同一节点被反复判成新节点。
-    """
-    base = f"{config.get('type', '')}|{config.get('server', '')}"
-    return f"{base}|{config.get('port', '')}" if port_is_identity(config) else base
-
-
-def _key_map(nodes: list[dict]) -> dict[str, dict]:
-    """端点键 → 节点。同一快照内端点键撞车时退回指纹，避免互相覆盖。"""
-    counts = Counter(node_key(n) for n in nodes)
-    return {
-        (node_fingerprint(n) if counts[node_key(n)] > 1 else node_key(n)): n
-        for n in nodes
-    }
-
-
 # ── 快照 ──────────────────────────────────────────────────────────
 def snapshot_dir(data_dir: Path) -> Path:
     return Path(data_dir) / "proxypool" / "snapshots"
@@ -1405,51 +1340,3 @@ async def load_source_documents(
                 raise
             errors[sid] = str(exc)
     return documents
-
-
-# ── Diff ──────────────────────────────────────────────────────────
-def compute_diff(
-    previous: Snapshot | None, nodes: list[dict], sha256: str, tag: str = ""
-) -> Diff:
-    """与上一份快照比对。
-
-    previous 为 None（首次）→ 全部 ADDED。
-    字节完全一致 → 全部 UNCHANGED，不产生 UPDATED（避免无意义的写放大）。
-
-    `tag` 是订阅标识，与 `node_fingerprint` 同源——比较始终发生在同一条订阅内，
-    两边用同一个 `tag` 才不会把「同一份快照」判成变了。
-
-    互斥性不变量：`updated` 的 previous_fingerprint 与 `removed` 交集为空。
-    旧实现用 `prev_fp - 当前指纹集` 算 removed，于是「端点没变、凭据/参数变了」
-    的节点会**同时**落进 UPDATED 与 REMOVED——P1.3 先按 UPDATED 更新注册表、再
-    按 REMOVED 把同一个节点标 STALE，注册表当场就是错的。故 removed 重定义为
-    「上一份里**没有被任何当前节点接管**的指纹」，被取代的旧指纹只出现在
-    `updated[].previous_fingerprint` 里。
-    """
-    if previous is not None and previous.sha256 == sha256 and previous.node_count == len(nodes):
-        return Diff(unchanged=[node_fingerprint(n, tag) for n in nodes],
-                    unchanged_snapshot=True, node_count=len(nodes))
-
-    prev_fp = {node_fingerprint(n, tag) for n in previous.nodes} if previous else set()
-    cur_map = _key_map(nodes)
-    prev_map = _key_map(previous.nodes) if previous else {}
-
-    added: list[dict] = []
-    updated: list[NodeUpdate] = []
-    unchanged: list[str] = []
-    matched: set[str] = set()  # 已被当前快照接管的上一份指纹（含被取代的旧指纹）
-    for key, node in cur_map.items():
-        fp = node_fingerprint(node, tag)
-        if fp in prev_fp:
-            unchanged.append(fp)
-            matched.add(fp)
-        elif key in prev_map:
-            superseded = node_fingerprint(prev_map[key], tag)
-            updated.append(NodeUpdate(previous_fingerprint=superseded, node=node))
-            matched.add(superseded)
-        else:
-            added.append(node)
-
-    removed = sorted(prev_fp - matched)
-    return Diff(added=added, updated=updated, unchanged=unchanged, removed=removed,
-                unchanged_snapshot=False, node_count=len(nodes))

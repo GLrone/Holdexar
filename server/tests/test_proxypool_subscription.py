@@ -18,7 +18,7 @@ from pathlib import Path
 import httpx
 import pytest
 import yaml
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,8 +40,9 @@ from app.domains.proxypool.subscription import (  # noqa: E402
     EmptyNodeSetError, FetchAttempt, FetchFailedError, FetchResult,
     InvalidEncodingError, Snapshot,
     SnapshotRecoveryError, UnsupportedFormatError,
-    build_channels, build_snapshot, compute_diff, decode_utf8, detect_format,
-    fetch_subscription, latest_snapshot, node_key, parse_nodes, persist_fetch_failure,
+    Channel,
+    build_channels, build_snapshot, decode_utf8, detect_format,
+    fetch_subscription, latest_snapshot, parse_nodes, persist_fetch_failure,
     persist_snapshot,
     snapshot_dir,
 )
@@ -78,32 +79,12 @@ def _scripted(script, calls, ua_seen):
     return factory
 
 
-async def _refresh(sub_id, channels, client_factory, previous: Snapshot | None = None):
-    """一次完整「抓取 → 解析 → 快照 → diff」。失败时异常向上传播。"""
+async def _refresh(sub_id, channels, client_factory):
+    """一次完整「抓取 → 解析 → 快照」。失败时异常向上传播。"""
     result = await fetch_subscription(SUB_URL, channels, client_factory=client_factory)
     nodes = parse_nodes(result.raw, result.fmt)
     snap = build_snapshot(sub_id, SUB_URL, result, nodes)
-    return snap, compute_diff(previous, nodes, snap.sha256)
-
-
-@pytest.fixture
-def tmp_data_dir(tmp_path, monkeypatch):
-    """临时数据目录 + 建表。
-
-    ⚠ teardown 必须再清一次三个 lru_cache：项目 conftest 的自动 fixture 只守护
-    `get_engine` / `get_session_factory`，**不覆盖 `get_settings`**。而
-    `get_settings()` 同样是 lru_cache —— 只在 setup 清一次的话，测试结束后它仍
-    缓存着 tmp 目录配置，后续测试会读到这份配置而找不到种子数据（曾导致
-    test_seed_assets 4 条假失败）。
-    """
-    monkeypatch.setenv("HOLDEXAR_DATA_DIR", str(tmp_path))
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-    yield tmp_path
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
+    return snap
 
 
 # ── 1~5 通道链 ────────────────────────────────────────────────────
@@ -124,8 +105,10 @@ async def test_sub_user_agent_is_clash_meta():
 async def test_direct_success_does_not_touch_later_channels():
     calls: list[str] = []
     await fetch_subscription(
-        SUB_URL, build_channels(kernel_proxy="http://127.0.0.1:1",
-                                pool_proxy="http://127.0.0.1:2"),
+        SUB_URL, build_channels(
+            kernel_proxy="http://127.0.0.1:1",
+            pool_channels=[Channel(CHANNEL_POOL, "http://127.0.0.1:2", "pool")],
+        ),
         client_factory=_scripted({CHANNEL_DIRECT: (200, _yaml_bytes([_node()]))},
                                  calls, []),
     )
@@ -409,8 +392,10 @@ async def test_direct_fails_then_kernel_succeeds():
 async def test_kernel_fails_then_pool_succeeds():
     calls: list[str] = []
     result = await fetch_subscription(
-        SUB_URL, build_channels(kernel_proxy="http://127.0.0.1:1",
-                                pool_proxy="http://127.0.0.1:2"),
+        SUB_URL, build_channels(
+            kernel_proxy="http://127.0.0.1:1",
+            pool_channels=[Channel(CHANNEL_POOL, "http://127.0.0.1:2", "pool")],
+        ),
         client_factory=_scripted({CHANNEL_DIRECT: (500, b""),
                                   CHANNEL_KERNEL: (500, b""),
                                   CHANNEL_POOL: (200, _yaml_bytes([_node()]))},
@@ -425,9 +410,11 @@ async def test_all_channels_fail_raises_fetch_failed():
     calls: list[str] = []
     with pytest.raises(FetchFailedError) as exc:
         await fetch_subscription(
-            SUB_URL, build_channels(kernel_proxy="http://127.0.0.1:1",
-                                    pool_proxy="http://127.0.0.1:2",
-                                    local_proxies=[]),
+            SUB_URL, build_channels(
+                kernel_proxy="http://127.0.0.1:1",
+                pool_channels=[Channel(CHANNEL_POOL, "http://127.0.0.1:2", "pool")],
+                local_proxies=[],
+            ),
             client_factory=_scripted({}, calls, []),
         )
     assert len(exc.value.attempts) == 3
@@ -439,7 +426,7 @@ async def test_http_404_and_500_do_not_overwrite_snapshot(tmp_data_dir):
     await init_db()
 
     good = _yaml_bytes([_node()])
-    snap, _ = await _refresh(1, build_channels(),
+    snap = await _refresh(1, build_channels(),
                              _scripted({CHANNEL_DIRECT: (200, good)}, [], []))
     async with get_session_factory()() as s:
         await persist_snapshot(s, snap, data_dir=tmp_data_dir)
@@ -463,7 +450,7 @@ async def test_http_404_and_500_do_not_overwrite_snapshot(tmp_data_dir):
 async def test_html_pseudo_yaml_does_not_overwrite_snapshot(tmp_data_dir):
     await init_db()
 
-    snap, _ = await _refresh(1, build_channels(),
+    snap = await _refresh(1, build_channels(),
                              _scripted({CHANNEL_DIRECT: (200, _yaml_bytes([_node()]))},
                                        [], []))
     async with get_session_factory()() as s:
@@ -485,7 +472,7 @@ async def test_html_pseudo_yaml_does_not_overwrite_snapshot(tmp_data_dir):
 async def test_empty_node_list_does_not_overwrite_snapshot(tmp_data_dir):
     await init_db()
 
-    snap, _ = await _refresh(1, build_channels(),
+    snap = await _refresh(1, build_channels(),
                              _scripted({CHANNEL_DIRECT: (200, _yaml_bytes([_node()]))},
                                        [], []))
     async with get_session_factory()() as s:
@@ -510,7 +497,7 @@ async def test_yaml_with_zero_nodes_is_explicit_failure():
     assert exc.value.format == FORMAT_YAML
 
 
-# ── 10~13 diff 语义 ───────────────────────────────────────────────
+# ── 快照构造工具 ──────────────────────────────────────────────────
 def _snap_of(nodes, sub_id=1, channel=CHANNEL_DIRECT, raw=None):
     from app.domains.proxypool.subscription import FetchResult
     raw = raw if raw is not None else _yaml_bytes(nodes)
@@ -518,120 +505,6 @@ def _snap_of(nodes, sub_id=1, channel=CHANNEL_DIRECT, raw=None):
                           FetchResult(raw=raw, http_status=200,
                                       content_type="text/plain", channel=channel,
                                       fmt=FORMAT_YAML), nodes)
-
-
-@pytest.mark.asyncio
-async def test_identical_sha_produces_no_updated():
-    nodes = [_node()]
-    prev = _snap_of(nodes)
-    snap, diff = await _refresh(
-        1, build_channels(),
-        _scripted({CHANNEL_DIRECT: (200, _yaml_bytes(nodes))}, [], []),
-        previous=prev,
-    )
-    assert snap.sha256 == prev.sha256
-    assert diff.unchanged_snapshot is True
-    assert not diff.added and not diff.updated and not diff.removed
-
-
-@pytest.mark.asyncio
-async def test_new_node_is_added():
-    prev = _snap_of([_node(name="A", server="a.example.net")])
-    _, diff = await _refresh(
-        1, build_channels(),
-        _scripted({CHANNEL_DIRECT: (200, _yaml_bytes([
-            _node(name="A", server="a.example.net"),
-            _node(name="B", server="b.example.net"),
-        ]))}, [], []),
-        previous=prev,
-    )
-    assert len(diff.added) == 1
-    assert diff.added[0]["name"] == "B"
-    assert not diff.updated
-
-
-@pytest.mark.asyncio
-async def test_changed_attributes_is_updated_not_added():
-    """同端点（type|server|port）换凭据 → UPDATED，不是「删一条 + 加一条」。"""
-    prev = _snap_of([_node(name="A", server="a.example.net", port=443, uuid="old")])
-    _, diff = await _refresh(
-        1, build_channels(),
-        _scripted({CHANNEL_DIRECT: (200, _yaml_bytes([
-            _node(name="A", server="a.example.net", port=443, uuid="new")]))}, [], []),
-        previous=prev,
-    )
-    assert len(diff.updated) == 1
-    assert diff.updated[0].node["uuid"] == "new"
-    assert not diff.added
-    # 端点键没变，才可能被识别成 updated
-    assert node_key(diff.updated[0].node) == node_key(prev.nodes[0])
-
-
-@pytest.mark.asyncio
-async def test_changed_attributes_is_updated_not_removed():
-    """回归：被取代的旧指纹绝不能同时落进 REMOVED（UPDATED ∩ REMOVED = ∅）。
-
-    旧实现按 `上一份指纹集 - 当前指纹集` 算 removed，端点没变、凭据变了的节点
-    会同时出现在 UPDATED 与 REMOVED 里；P1.3 先更新再标 STALE，注册表当场就错。
-    这里连同「真消失的节点」一起验，确保修 removed 没有把该报的消失吞掉。
-    """
-    gone = _node(name="GONE", server="gone.example.net")
-    prev = _snap_of([
-        _node(name="ROTATED", server="rot.example.net", port=443, uuid="old"),
-        gone,
-    ])
-    nodes = [_node(name="ROTATED", server="rot.example.net", port=443, uuid="new")]
-    _, diff = await _refresh(
-        1, build_channels(),
-        _scripted({CHANNEL_DIRECT: (200, _yaml_bytes(nodes))}, [], []),
-        previous=prev,
-    )
-
-    superseded = node_fingerprint(prev.nodes[0])
-    assert [u.previous_fingerprint for u in diff.updated] == [superseded]
-    assert diff.updated[0].node["uuid"] == "new"
-    # 被取代 ≠ 消失：只有真不见了的那个端点该进 REMOVED
-    assert diff.removed == [node_fingerprint(gone)]
-    assert superseded not in diff.removed
-    assert set(u.previous_fingerprint for u in diff.updated).isdisjoint(diff.removed)
-    assert set(diff.unchanged).isdisjoint(diff.removed)
-    assert not diff.added
-
-
-@pytest.mark.asyncio
-async def test_missing_node_is_removed_candidate_not_delete(tmp_data_dir):
-    await init_db()
-
-    gone = _node(name="GONE", server="gone.example.net")
-    prev = _snap_of([gone, _node(name="KEEP", server="keep.example.net")])
-    _, diff = await _refresh(
-        1, build_channels(),
-        _scripted({CHANNEL_DIRECT: (200, _yaml_bytes([
-            _node(name="KEEP", server="keep.example.net")]))}, [], []),
-        previous=prev,
-    )
-    assert diff.removed == [node_fingerprint(gone)]
-
-    # Registry 侧：把上一份快照的节点写入后再看——REMOVED 不得删除任何一行
-    async with get_session_factory()() as s:
-        for n in prev.nodes:
-            fp = node_fingerprint(n)
-            s.add(ProxyNode(
-                node_id=fp[:20], fingerprint=fp,
-                runtime_name=make_runtime_name(1, n["name"], set()),
-                proxy_type=str(n.get("type")), state="ACTIVE",
-            ))
-            # 来源归属进独立表：节点身份与「谁在提供它」分开记
-            await s.execute(update(ProxyNode)
-                .where(ProxyNode.node_id == fp[:20])
-                .values(subscription_id=1, original_name=n["name"]))
-        await s.commit()
-        before = await s.scalar(select(func.count()).select_from(ProxyNode))
-        assert before == 2
-
-    async with get_session_factory()() as s:
-        after = await s.scalar(select(func.count()).select_from(ProxyNode))
-    assert after == before, "REMOVED 不得删除 Registry 行（消费方应转 STALE）"
 
 
 # ── 14~15 命名空间隔离 ────────────────────────────────────────────
@@ -704,11 +577,10 @@ async def test_e2e_real_subscription_snapshot_diff_and_failure_isolation(tmp_dat
         await s.commit()
 
     nodes = [_node(name="A", server="a.example.net"), _node(name="B", server="b.example.net")]
-    snap, diff = await _refresh(sub_id, build_channels(),
-                                _scripted({CHANNEL_DIRECT: (200, _yaml_bytes(nodes))},
-                                          [], []))
-    assert diff.node_count == 2
-    assert len(diff.added) == 2
+    snap = await _refresh(sub_id, build_channels(),
+                          _scripted({CHANNEL_DIRECT: (200, _yaml_bytes(nodes))},
+                                    [], []))
+    assert snap.node_count == 2
 
     async with get_session_factory()() as s:
         row = await persist_snapshot(s, snap, data_dir=tmp_data_dir)
@@ -775,8 +647,10 @@ async def test_unsupported_fallback_takes_precedence_over_encoding_error():
     """异常优先级：拿到过「可解码但不支持的正文」时报格式错（更有指向性）。"""
     with pytest.raises(UnsupportedFormatError) as exc:
         await fetch_subscription(
-            SUB_URL, build_channels(kernel_proxy="http://127.0.0.1:1",
-                                    pool_proxy="http://127.0.0.1:2"),
+            SUB_URL, build_channels(
+                kernel_proxy="http://127.0.0.1:1",
+                pool_channels=[Channel(CHANNEL_POOL, "http://127.0.0.1:2", "pool")],
+            ),
             client_factory=_scripted({CHANNEL_DIRECT: (200, b"<html>x</html>"),
                                       CHANNEL_KERNEL: (200, _BAD_BYTES),
                                       CHANNEL_POOL: (500, b"")}, [], []),
@@ -798,7 +672,7 @@ def test_decode_utf8_rejects_invalid_bytes():
 async def test_invalid_utf8_does_not_overwrite_snapshot(tmp_data_dir):
     """非法字节 → 无新快照、无 Registry 变更、最后一次健康快照不被覆盖。"""
     await init_db()
-    snap, _ = await _refresh(1, build_channels(),
+    snap = await _refresh(1, build_channels(),
                              _scripted({CHANNEL_DIRECT: (200, _yaml_bytes([_node()]))},
                                        [], []))
     async with get_session_factory()() as s:
@@ -825,7 +699,7 @@ async def test_invalid_utf8_does_not_overwrite_snapshot(tmp_data_dir):
 async def test_persist_snapshot_does_not_commit(tmp_data_dir):
     """回滚必须能把 persist_snapshot 写的行丢掉——它自己 commit 就做不到。"""
     await init_db()
-    snap, _ = await _refresh(1, build_channels(),
+    snap = await _refresh(1, build_channels(),
                              _scripted({CHANNEL_DIRECT: (200, _yaml_bytes([_node()]))},
                                        [], []))
     async with get_session_factory()() as s:
@@ -845,7 +719,7 @@ async def test_persist_snapshot_does_not_commit(tmp_data_dir):
 async def test_persist_snapshot_does_not_commit_unrelated_pending_changes(tmp_data_dir):
     """会话里其它 pending 行不得被顺手提交（提交一个自己不知道的写集）。"""
     await init_db()
-    snap, _ = await _refresh(1, build_channels(),
+    snap = await _refresh(1, build_channels(),
                              _scripted({CHANNEL_DIRECT: (200, _yaml_bytes([_node()]))},
                                        [], []))
     async with get_session_factory()() as s:
@@ -886,7 +760,7 @@ async def test_latest_snapshot_recovers_previous_baseline(tmp_data_dir):
     await init_db()
     nodes = [_node(name="A", server="a.example.net"),
              _node(name="B", server="b.example.net")]
-    snap, _ = await _refresh(1, build_channels(),
+    snap = await _refresh(1, build_channels(),
                              _scripted({CHANNEL_DIRECT: (200, _yaml_bytes(nodes))}, [], []))
     async with get_session_factory()() as s:
         await persist_snapshot(s, snap, data_dir=tmp_data_dir)
@@ -900,10 +774,6 @@ async def test_latest_snapshot_recovers_previous_baseline(tmp_data_dir):
     assert [n["name"] for n in back.nodes] == ["A", "B"]
     assert back.fmt == FORMAT_YAML
     assert back.source_channel == CHANNEL_DIRECT
-    # 恢复出来的基线必须能直接喂 diff：内容没变 → 不产生任何变更
-    d = compute_diff(back, nodes, snap.sha256)
-    assert d.unchanged_snapshot is True
-    assert not d.added and not d.updated and not d.removed
 
 
 @pytest.mark.asyncio
@@ -918,7 +788,7 @@ async def test_latest_snapshot_returns_none_when_absent(tmp_data_dir):
 async def test_latest_snapshot_fails_closed_when_blob_unreadable(tmp_data_dir):
     """行在、字节没了或对不上 sha → 必须抛，不许静默当成「没有上一份」。"""
     await init_db()
-    snap, _ = await _refresh(1, build_channels(),
+    snap = await _refresh(1, build_channels(),
                              _scripted({CHANNEL_DIRECT: (200, _yaml_bytes([_node()]))},
                                        [], []))
     async with get_session_factory()() as s:
@@ -939,15 +809,6 @@ async def test_latest_snapshot_fails_closed_when_blob_unreadable(tmp_data_dir):
 
 
 # ── 跨订阅节点身份（锁定模型）────────────────────────────────────
-def test_rename_is_unchanged_not_updated():
-    """改名不进指纹：订阅侧改名不得让身份或池内名漂移。"""
-    prev = _snap_of([_node(name="香港01")])
-    nodes = [_node(name="香港01-改名")]
-    d = compute_diff(prev, nodes, "sha-different")  # 强制走慢路径
-    assert d.unchanged == [node_fingerprint(nodes[0])]
-    assert not d.updated and not d.added and not d.removed
-
-
 @pytest.mark.asyncio
 async def test_same_config_from_two_subscriptions_is_two_nodes(tmp_data_dir):
     """同一份配置被两个订阅提供 = 两行独立节点（节点跟着订阅走）。"""
@@ -1082,7 +943,7 @@ async def test_snapshot_attempt_ledger_keeps_egress_timing_without_secret_url(tm
 @pytest.mark.asyncio
 async def test_failed_attempt_is_recorded_without_replacing_last_success(tmp_data_dir):
     await init_db()
-    success, _ = await _refresh(
+    success = await _refresh(
         1, build_channels(),
         _scripted({CHANNEL_DIRECT: (200, _yaml_bytes([_node()]))}, [], []),
     )

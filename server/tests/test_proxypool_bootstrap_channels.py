@@ -10,18 +10,14 @@
 """
 from __future__ import annotations
 
-import os
 from datetime import datetime
-from pathlib import Path
 
 import pytest
 import yaml
 
-from app.core.config import get_settings  # noqa: E402
-from app.core.database import get_engine, get_session_factory, init_db  # noqa: E402
+from app.core.database import get_session_factory, init_db  # noqa: E402
 from app.domains.proxies import clash_manager  # noqa: E402
 from app.domains.proxies.clash_manager import ClashRuntime  # noqa: E402
-from app.domains.proxies.kernel_release import kernel_filename  # noqa: E402
 from app.domains.proxies.models import (  # noqa: E402
     ADMISSION_ACTIVE,
     ProxySubscription,
@@ -32,33 +28,6 @@ from app.domains.proxypool.subscription import (  # noqa: E402
 )
 
 NOW = datetime(2026, 9, 19, 12, 0, 0)
-
-
-@pytest.fixture
-def tmp_data_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOLDEXAR_DATA_DIR", str(tmp_path))
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-    yield tmp_path
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-
-
-@pytest.fixture
-def kernel_exe_path(tmp_data_dir) -> Path:
-    for candidate in (
-        clash_manager.kernel_exe(tmp_data_dir),
-        clash_manager.bundled_clash_dir() / kernel_filename(),
-        *(
-            sorted(Path(os.environ["LOCALAPPDATA"]).glob(f"holdexar*/clash/{kernel_filename()}"))
-            if os.environ.get("LOCALAPPDATA") else []
-        ),
-    ):
-        if candidate.is_file():
-            return candidate
-    pytest.skip("本机没有可用的 mihomo 内核资产（assets/clash/ 不随仓库分发）")
 
 
 @pytest.fixture
@@ -145,10 +114,9 @@ async def test_all_channels_fail_surfaces_reason(
     assert result.ready is False
     assert "订阅抓取失败" in result.detail, "detail 必须能直接看到抓取失败"
     assert "ConnectTimeout" in result.detail, "并带出真实原因（通道级）"
-    from app.domains.proxypool.runtime import require_runtime_proxy_url
+    from app.domains.proxypool.runtime import current_runtime_proxy_url
 
-    with pytest.raises(Exception, match="代理通道尚未就绪"):
-        require_runtime_proxy_url(tmp_data_dir)
+    assert current_runtime_proxy_url(tmp_data_dir) is None
     # 持久化诊断事实仍在
     from sqlalchemy import select
     async with get_session_factory()() as s:
@@ -207,9 +175,9 @@ async def test_kernel_channel_never_becomes_crawler_proxy(
     result = await _ensure(tmp_data_dir, pool_runtime, kernel_exe_path,
                            kernel_proxy="http://127.0.0.1:7890")
 
-    from app.domains.proxypool.runtime import require_runtime_proxy_url
+    from app.domains.proxypool.runtime import current_runtime_proxy_url
 
-    crawler_proxy = require_runtime_proxy_url(tmp_data_dir)
+    crawler_proxy = current_runtime_proxy_url(tmp_data_dir)
     assert crawler_proxy == result.proxy_url
     assert crawler_proxy != "http://127.0.0.1:7890", (
         "老 Clash 只是订阅获取辅助通道，绝不能变 crawler 的代理"

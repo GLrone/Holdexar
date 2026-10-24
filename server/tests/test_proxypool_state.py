@@ -15,26 +15,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.domains.proxypool.models import make_runtime_name, node_fingerprint, subscription_tag  # noqa: E402
 from app.domains.proxypool.state import (  # noqa: E402
     DEFAULT_RETIRE_AFTER_FAILED_PROBES,
-    LANE_DEAD,
-    LANE_DEGRADED,
-    LANE_EMPTY,
-    LANE_INIT,
-    LANE_READY,
-    LANE_SWITCHING,
     NODE_ACTIVE,
     NODE_DEAD,
     NODE_NEW,
     NODE_RETIRED,
     NODE_STALE,
     IllegalTransitionError,
-    apply_lane_transition,
     apply_transition,
-    can_transition,
-    can_transition_lane,
     evaluate_node_state,
-    legal_lane_targets,
     legal_targets,
-    should_retire,
 )
 
 _BASE_CONFIG = {
@@ -154,7 +143,7 @@ _LEGAL_NODE = [
 
 @pytest.mark.parametrize("current,nxt", _LEGAL_NODE)
 def test_all_legal_node_transitions(current: str, nxt: str) -> None:
-    assert can_transition(current, nxt)
+    assert nxt in legal_targets(current)
     assert apply_transition(current, nxt) == nxt
 
 
@@ -171,7 +160,7 @@ def test_all_legal_node_transitions(current: str, nxt: str) -> None:
     ],
 )
 def test_illegal_node_transitions_raise(current: str, nxt: str) -> None:
-    assert not can_transition(current, nxt)
+    assert nxt not in legal_targets(current)
     with pytest.raises(IllegalTransitionError) as exc:
         apply_transition(current, nxt)
     err = exc.value
@@ -179,52 +168,13 @@ def test_illegal_node_transitions_raise(current: str, nxt: str) -> None:
     assert err.allowed == legal_targets(current)
 
 
-# ── Lane 状态转移 ─────────────────────────────────────────────────
-_LEGAL_LANE = [
-    (LANE_EMPTY, LANE_INIT),
-    (LANE_INIT, LANE_READY), (LANE_INIT, LANE_EMPTY),
-    (LANE_READY, LANE_SWITCHING), (LANE_READY, LANE_DEGRADED),
-    (LANE_READY, LANE_DEAD), (LANE_READY, LANE_EMPTY),
-    (LANE_SWITCHING, LANE_READY), (LANE_SWITCHING, LANE_DEGRADED),
-    (LANE_SWITCHING, LANE_DEAD),
-    (LANE_DEGRADED, LANE_READY), (LANE_DEGRADED, LANE_SWITCHING),
-    (LANE_DEGRADED, LANE_DEAD), (LANE_DEGRADED, LANE_EMPTY),
-    (LANE_DEAD, LANE_EMPTY), (LANE_DEAD, LANE_INIT), (LANE_DEAD, LANE_READY),
-]
-
-
-@pytest.mark.parametrize("current,nxt", _LEGAL_LANE)
-def test_lane_transitions(current: str, nxt: str) -> None:
-    assert can_transition_lane(current, nxt)
-    assert apply_lane_transition(current, nxt) == nxt
-
-
-@pytest.mark.parametrize(
-    "current,nxt",
-    [
-        (LANE_EMPTY, LANE_READY), (LANE_INIT, LANE_DEAD),
-        (LANE_SWITCHING, LANE_EMPTY), (LANE_DEAD, LANE_DEGRADED),
-        (LANE_EMPTY, LANE_EMPTY),
-    ],
-)
-def test_lane_illegal_transitions_raise(current: str, nxt: str) -> None:
-    assert not can_transition_lane(current, nxt)
-    with pytest.raises(IllegalTransitionError) as exc:
-        apply_lane_transition(current, nxt)
-    assert exc.value.allowed == legal_lane_targets(current)
-
-
-def test_node_dead_and_lane_dead_have_different_targets() -> None:
-    """两个域共用 DEAD 字样但语义不同 —— 这是 Lane 单独一张表的理由。"""
+def test_dead_has_recovery_and_retirement_targets() -> None:
     assert legal_targets(NODE_DEAD) == frozenset({NODE_ACTIVE, NODE_STALE, NODE_RETIRED})
-    assert legal_lane_targets(LANE_DEAD) == frozenset({LANE_EMPTY, LANE_INIT, LANE_READY})
 
 
 # ── 退休语义 ──────────────────────────────────────────────────────
 def test_stale_retires_after_threshold() -> None:
     below = DEFAULT_RETIRE_AFTER_FAILED_PROBES - 1
-    assert not should_retire(NODE_STALE, below)
-    assert should_retire(NODE_STALE, DEFAULT_RETIRE_AFTER_FAILED_PROBES)
     assert evaluate_node_state(
         NODE_STALE, source_seen=False, probe_ok=False, consecutive_failures=below
     ) == NODE_DEAD
@@ -236,8 +186,6 @@ def test_stale_retires_after_threshold() -> None:
 
 def test_retire_threshold_is_configurable() -> None:
     """阈值必须是入参：传 5 时 3 次连续失败不许退休（证明不是写死常量）。"""
-    assert not should_retire(NODE_DEAD, 3, retire_after_failed_probes=5)
-    assert should_retire(NODE_DEAD, 5, retire_after_failed_probes=5)
     assert evaluate_node_state(
         NODE_STALE, source_seen=False, probe_ok=False,
         consecutive_failures=3, retire_after_failed_probes=5,
@@ -249,9 +197,9 @@ def test_retire_threshold_is_configurable() -> None:
 
 
 def test_retired_recovery_paths() -> None:
-    assert can_transition(NODE_RETIRED, NODE_ACTIVE)
-    assert can_transition(NODE_RETIRED, NODE_STALE)
-    assert not can_transition(NODE_RETIRED, NODE_DEAD)
+    assert NODE_ACTIVE in legal_targets(NODE_RETIRED)
+    assert NODE_STALE in legal_targets(NODE_RETIRED)
+    assert NODE_DEAD not in legal_targets(NODE_RETIRED)
     assert evaluate_node_state(
         NODE_RETIRED, source_seen=True, probe_ok=True, consecutive_failures=9
     ) == NODE_ACTIVE
@@ -266,7 +214,6 @@ def test_retired_recovery_paths() -> None:
 
 def test_dead_is_not_retired() -> None:
     """DEAD 是「暂时不通」，不等于退休：可自由复活，也不被失败计数误判。"""
-    assert not should_retire(NODE_DEAD, 1)
     assert evaluate_node_state(
         NODE_DEAD, source_seen=True, probe_ok=False, consecutive_failures=1
     ) == NODE_DEAD
@@ -326,12 +273,10 @@ def test_evaluate_node_state_matrix(
     assert got == expected
     # 决策函数的输出必须是合法转移（或原地空转）——不许绕过状态机
     if got != current:
-        assert can_transition(current, got)
+        assert got in legal_targets(current)
 
 
 def test_evaluate_rejects_bad_threshold() -> None:
-    with pytest.raises(ValueError):
-        should_retire(NODE_STALE, 3, retire_after_failed_probes=0)
     with pytest.raises(ValueError):
         evaluate_node_state(
             NODE_STALE, source_seen=False, probe_ok=False,

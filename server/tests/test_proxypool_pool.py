@@ -19,8 +19,7 @@ import pytest
 import yaml
 from sqlalchemy import select, update
 
-from app.core.config import get_settings  # noqa: E402
-from app.core.database import get_engine, get_session_factory, init_db  # noqa: E402
+from app.core.database import get_session_factory, init_db  # noqa: E402
 from app.domains.proxypool import pool as pool_module  # noqa: E402
 from app.domains.proxypool.models import ProxyNode, node_fingerprint  # noqa: E402
 from app.domains.proxypool.pool import (  # noqa: E402
@@ -73,18 +72,6 @@ async def test_expired_source_is_excluded_but_shared_live_source_keeps_node(tmp_
         )
         await session.commit()
         assert [n.node_id for n in await pool_module.eligible_nodes(session)] == [nid]
-
-
-@pytest.fixture
-def tmp_data_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOLDEXAR_DATA_DIR", str(tmp_path))
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-    yield tmp_path
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
 
 
 def _config(*, name: str, server: str, port: int = 443, password: str = "pw") -> dict:

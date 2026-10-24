@@ -59,8 +59,7 @@ def _hold_ports(data_dir, ports: list[int] | None = None) -> list[socket.socket]
 
 
 def _slot(name: str, exit_ip: str, idx: int = 0) -> ExitSlot:
-    return ExitSlot(exit_ip=exit_ip, runtime_name=name, node_id=f"n{idx}",
-                    lane_index=idx)
+    return ExitSlot(exit_ip=exit_ip, runtime_name=name, node_id=f"n{idx}")
 
 
 def _write_lane_plan(data_dir, entries: list[dict]) -> None:
@@ -170,8 +169,8 @@ async def test_case4_global_available_but_crawl_pool_empty_still_refused(
 ) -> None:
     """fail-closed 的核心回归：GLOBAL/mixed-port 可用**不能**让爬取放行。
 
-    把「维护视角可用」做到最强（mixed-port 在听、legacy GLOBAL 入口返回 URL、
-    `current_runtime_proxy_url` 明确给值），爬取口仍必须拒绝。
+    把「维护视角可用」做到最强（mixed-port 在听、`current_runtime_proxy_url`
+    明确给值），爬取口仍必须拒绝。
     """
     _write_pool(tmp_path, [])                       # 爬取池为空
     rt.prepare_runtime_config(tmp_path, lanes=1)
@@ -181,11 +180,6 @@ async def test_case4_global_available_but_crawl_pool_empty_still_refused(
         assert rt.current_runtime_proxy_url(tmp_path) is not None
         monkeypatch.setattr(rt, "current_runtime_proxy_url",
                             lambda _d: "http://127.0.0.1:1")
-        monkeypatch.setattr(rt, "require_runtime_proxy_url",
-                            lambda _d: "http://127.0.0.1:1")
-        assert rt.require_lane_proxy_urls(tmp_path) == ["http://127.0.0.1:1"], (
-            "旧的非生产取值口在无 lane 时会回退 GLOBAL —— 这正是生产禁止的路径"
-        )
         # 生产口：必须拒绝，且不得把 GLOBAL 地址当作 lane 交出去
         session = await _empty_pool_session(tmp_path)
         try:

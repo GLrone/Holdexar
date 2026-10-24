@@ -22,8 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
-import socket
 import threading
 import time
 from datetime import datetime, timedelta
@@ -32,16 +30,17 @@ from pathlib import Path
 
 import httpx
 import pytest
+
+from proxy_helpers import RedirectProxy as _RedirectProxy
 from sqlalchemy import select, update
 
-from app.core.config import get_settings  # noqa: E402
-from app.core.database import get_engine, get_session_factory, init_db  # noqa: E402
+from app.core.database import get_session_factory, init_db  # noqa: E402
+from app.core.net import free_local_port as _free_port  # noqa: E402
+from app.core.net import port_listening as _listening  # noqa: E402
 from app.crawler.occupancy import CrawlerBusyError, begin_crawl, crawler_busy, end_crawl, end_maintenance  # noqa: E402
 from app.crawler.runner import CrawlRunConfig, run_crawl  # noqa: E402
 from app.domains.crawl import service as crawl_service  # noqa: E402
-from app.domains.proxies import clash_manager  # noqa: E402
 from app.domains.proxies.clash_manager import ClashRuntime  # noqa: E402
-from app.domains.proxies.kernel_release import kernel_filename  # noqa: E402
 from app.domains.proxies.models import ADMISSION_ACTIVE, ProxySubscription  # noqa: E402
 from app.domains.proxypool.models import (  # noqa: E402
     ProxyNode, node_fingerprint,
@@ -62,69 +61,6 @@ DEFAULT_CONTROLLER_PORT = 19090  # 项目注入的共享默认值——proxypool
 
 
 # ── 本地夹具 ─────────────────────────────────────────────────────
-def _pipe(a: socket.socket, b: socket.socket) -> None:
-    try:
-        while True:
-            chunk = a.recv(65536)
-            if not chunk:
-                break
-            b.sendall(chunk)
-    except OSError:
-        pass
-    finally:
-        for s in (a, b):
-            try:
-                s.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-
-
-class _RedirectProxy:
-    """本地 CONNECT 代理：忽略目标，一律隧道到同一回显。"""
-
-    def __init__(self, redirect_to: int) -> None:
-        self._redirect_to = redirect_to
-        self._sock = socket.socket()
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(("127.0.0.1", 0))
-        self._sock.listen(32)
-        self.port = self._sock.getsockname()[1]
-        threading.Thread(target=self._serve, daemon=True).start()
-
-    def _serve(self) -> None:
-        while True:
-            try:
-                conn, _ = self._sock.accept()
-            except OSError:
-                return
-            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
-
-    def _handle(self, conn: socket.socket) -> None:
-        upstream = None
-        try:
-            head = conn.recv(8192)
-            if not head:
-                return
-            upstream = socket.create_connection(("127.0.0.1", self._redirect_to),
-                                                timeout=8)
-            if head.split(b" ", 1)[0].upper() == b"CONNECT":
-                conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            else:
-                upstream.sendall(head)
-            threading.Thread(target=_pipe, args=(conn, upstream), daemon=True).start()
-            _pipe(upstream, conn)
-        except Exception:  # noqa: BLE001
-            pass
-        finally:
-            for s in (conn, upstream):
-                if s is not None:
-                    try:
-                        s.close()
-                    except OSError:
-                        pass
-
-    def close(self) -> None:
-        self._sock.close()
 
 
 class _ProbeEcho(BaseHTTPRequestHandler):
@@ -149,31 +85,7 @@ class _ProbeEcho(BaseHTTPRequestHandler):
         pass
 
 
-def _free_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
-def _listening(port: int) -> bool:
-    with socket.socket() as s:
-        s.settimeout(0.3)
-        return s.connect_ex(("127.0.0.1", port)) == 0
-
-
 # ── fixtures ─────────────────────────────────────────────────────
-@pytest.fixture
-def tmp_data_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOLDEXAR_DATA_DIR", str(tmp_path))
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-    yield tmp_path
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
 
 
 @pytest.fixture(autouse=True)
@@ -188,21 +100,6 @@ def clean_scheduling_state():
     end_maintenance()
     if crawler_busy():
         end_crawl()
-
-
-@pytest.fixture
-def kernel_exe_path(tmp_data_dir) -> Path:
-    for candidate in (
-        clash_manager.kernel_exe(tmp_data_dir),
-        clash_manager.bundled_clash_dir() / kernel_filename(),
-        *(
-            sorted(Path(os.environ["LOCALAPPDATA"]).glob(f"holdexar*/clash/{kernel_filename()}"))
-            if os.environ.get("LOCALAPPDATA") else []
-        ),
-    ):
-        if candidate.is_file():
-            return candidate
-    pytest.skip("本机没有可用的 mihomo 内核资产（assets/clash/ 不随仓库分发）")
 
 
 @pytest.fixture
@@ -312,7 +209,6 @@ async def _select(base: str, secret: str, name: str) -> str | None:
     ) as c:
         await c.put(f"{base}/proxies/GLOBAL", json={"name": name})
         return (await c.get(f"{base}/proxies/GLOBAL")).json().get("now")
-
 
 
 async def _set_exit_ip(runtime_name: str, exit_ip: str) -> None:
@@ -500,15 +396,6 @@ async def test_maintenance_restores_global_from_current_pool(
     monkeypatch
 ) -> None:
     await init_db()
-    from app.domains.proxypool import health as _hm
-
-    async def _ok_business(controller_url, secret, mixed_port, runtime_name, *,
-                           url=None, appid=None, timeout=None):
-        return _hm.BusinessResult(runtime_name=runtime_name, ok=True,
-                                  http_status=200, final_price_in_cents=999,
-                                  detail=_hm.BUSINESS_OK, latency_ms=5)
-
-    monkeypatch.setattr(_hm, "probe_business", _ok_business)
     # 第二轮 L2 跳过：B 被手动置 DEAD 后，一次业务失败即判死的 fail-fast 语义
     # 没法让 B「活着但不在池」，跳过本轮 L2 才能单测 restore 的落位规则
     import app.domains.proxypool.scheduling as _sched

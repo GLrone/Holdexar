@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import WritePriority, write_gate
 from app.core.logging import log_event
+from app.core.net import port_listening
 from app.domains.proxies import clash_manager
 from app.domains.proxies.kernel_process import (
     PRECHECK_ADMISSION,
@@ -75,10 +76,8 @@ class ProbeOutcome:
 
 def _free_port(preferred: int) -> int | None:
     """优先用 preferred，被占则向上顺延；整段占满返回 None。"""
-    from app.domains.proxies.clash_manager import _port_listening
-
     for port in range(preferred, preferred + 8):
-        if not _port_listening(port):
+        if not port_listening(port):
             return port
     return None
 

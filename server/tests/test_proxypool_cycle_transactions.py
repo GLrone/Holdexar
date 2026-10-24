@@ -14,24 +14,12 @@ import yaml
 from sqlalchemy import func, select
 
 from app.core.config import get_settings
-from app.core.database import get_engine, get_session_factory, init_db
+from app.core.database import get_session_factory, init_db
 from app.domains.proxypool import health as health_mod
 from app.domains.proxypool import scheduling as sched
 from app.domains.proxypool.models import HealthObservation, ProxyNode
 
 NOW = datetime(2026, 9, 20, 22, 0, 0)
-
-
-@pytest.fixture
-def tmp_data_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOLDEXAR_DATA_DIR", str(tmp_path))
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
-    yield tmp_path
-    get_settings.cache_clear()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
 
 
 class _EmptyResult:
