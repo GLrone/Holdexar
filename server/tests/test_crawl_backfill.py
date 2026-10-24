@@ -78,12 +78,7 @@ async def _seed():
 
 @pytest.mark.asyncio
 async def test_get_uncrawled_appids():
-    """未爬集合：挂名孤儿（updated_at NULL）入选、已爬（ok 价格行）排除。
-
-    无 games 行的 appid（APPID4）不在任何表里——集合只含库内有孤儿行
-    的部分；从未入库的 appid 由 runner 侧白名单反转兜住
-    （get_crawled_appids：不在白名单 = 未爬，天然覆盖无行形态）。
-    """
+    """未爬集合只含库内挂名孤儿，已有成功价格或库内无行的对象不入选。"""
     db = DbWriter()
     ids = await db.get_uncrawled_appids()
     assert APPID in ids

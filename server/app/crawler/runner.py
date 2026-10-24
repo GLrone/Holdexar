@@ -4,10 +4,8 @@
 CrawlerScheduler + SteamHttpClient 原装组件（请求频率由全局限流闸统一约束，
 见 crawler/rate_limit.py）。
 
-任务模型与旧 appdetails 链路的差异：
-- 旧：1 任务 = 1 appid × 全区（appdetails 只能逐 appid 逐区请求）
-- 新：1 任务 = 1 区 × ≤400 appid（browse 一发批量），补抓层同款——
-  欠账账本按区分组凑批发（generate_missing_tasks），不再逐行一发。
+任务模型：1 任务 = 1 区 × ≤300 appid（browse 一发批量），补抓层同款——
+欠账账本按区分组凑批发（generate_missing_tasks），不再逐行一发。
 """
 from __future__ import annotations
 
@@ -270,7 +268,7 @@ async def _run_crawl_locked(
     if not regions:
         raise ValueError("任务缺少区服配置，拒绝全区回退（请检查「我」页区服设置）")
 
-    db = bs.BrowseDbWriter()
+    db = bs.DbWriter()
     await db.connect()
 
     # browse 拿不到的 games 列（chinese_support/is_visual_novel…）保留库内原值，

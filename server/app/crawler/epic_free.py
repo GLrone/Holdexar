@@ -96,15 +96,7 @@ STORESEARCH_URL = "https://store.steampowered.com/api/storesearch/"
 EN_PARAMS = {"locale": "en-US", "country": "US"}
 CN_PARAMS = {"locale": "zh-CN", "country": "CN"}
 
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json",
-    "Accept-Language": "en-US,en;q=0.9",
-}
-_REQUEST_INTERVAL = 0.5  # Steam 匿名轻端点通用请求头（浏览器 UA 指纹，epic/领航台检索共用）；storesearch 批间隔 500ms（对齐 boards 批间隔）
+_REQUEST_INTERVAL = 0.5  # storesearch 批间隔 500ms（对齐 boards 批间隔）
 
 
 @dataclass(frozen=True)

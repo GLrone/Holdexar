@@ -428,7 +428,7 @@ MISSING_RETRY_COOLDOWN_MINUTES = 24 * 60
 REPAIR_RETRY_COOLDOWN_MINUTES = 4
 
 # 单轮补抓行数上限（按账本行计，非请求数）。补抓按区分组批量后一发可装
-# ≤400 行，请求量天然被压住；这个上限挡的是「积压账本一轮吃满」挤占
+# ≤300 行，请求量天然被压住；这个上限挡的是「积压账本一轮吃满」挤占
 # 关注层——老账先补，余量留给下一轮。8000 行 ≈ 单区 20 发，写入量与
 # 主轮常态持平。
 MISSING_BATCH_ROW_LIMIT = 8000
@@ -1214,7 +1214,7 @@ async def start_job(
             _execute(job_id, pairs, config, stop_event, pre_tasks=pre_tasks)
         )
         _active = JobHandle(id=job_id, task=task, stop_event=stop_event)
-    except BaseException:
+    except BaseException:  # noqa: BLE001 — 清理后原样重抛
         # 启动半途失败（无欠账/范围空/lane 规划拒绝等）：释放预取的占用
         end_crawl()
         raise
