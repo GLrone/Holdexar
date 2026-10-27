@@ -35,19 +35,7 @@ async def _auto_promote_after_check(sub_id: int, alive: int) -> None:
             )
             await session.commit()
         if result.promoted:
-            from app.core import orchestration as events
 
-            # 事件在业务事务提交之后写：只有真的落库了的晋升才留痕（幂等空转不写）
-            await events.record(
-                events.KIND_SUBSCRIPTION_PROMOTED,
-                f"订阅 {result.subscription_id} 晋升 ACTIVE："
-                f"应用快照 {str(result.snapshot_sha256 or '')[:10]}，对齐节点 {result.applied_nodes}",
-                payload={
-                    "subscriptionId": result.subscription_id,
-                    "snapshotSha256": result.snapshot_sha256,
-                    "appliedNodes": result.applied_nodes,
-                },
-            )
             log_event(
                 logger,
                 f"订阅 {sub_id} 首检健康（可用 {alive} 个节点），已自动转正进池",

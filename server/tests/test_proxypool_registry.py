@@ -88,7 +88,7 @@ async def _apply(snapshot: Snapshot, *, now: datetime = NOW):
 async def _node_row(fingerprint: str) -> ProxyNode:
     async with get_session_factory()() as s:
         return (await s.execute(
-            select(ProxyNode).where(ProxyNode.fingerprint == fingerprint)
+            select(ProxyNode).where(ProxyNode.node_id == fingerprint)
         )).scalar_one()
 
 
@@ -117,7 +117,7 @@ async def _set_state(fingerprint: str, state: str) -> None:
     """模拟健康模块此前的判定结果（Registry 自己不产生 ACTIVE/DEAD/RETIRED）。"""
     async with get_session_factory()() as s:
         row = (await s.execute(
-            select(ProxyNode).where(ProxyNode.fingerprint == fingerprint)
+            select(ProxyNode).where(ProxyNode.node_id == fingerprint)
         )).scalar_one()
         row.state = state
         await s.commit()
@@ -179,7 +179,7 @@ async def test_same_config_from_two_subscriptions_makes_two_nodes(tmp_data_dir) 
     rows = await _all_nodes()
     assert sorted(r.runtime_name for r in rows) == ["1|香港01", "2|香港01"]
     assert {r.subscription_id for r in rows} == {1, 2}
-    assert len({r.fingerprint for r in rows}) == 2, "归属订阅进身份，指纹必须不同"
+    assert len({r.node_id for r in rows}) == 2, "归属订阅进身份，指纹必须不同"
 
 
 # ── 4. 一个订阅撤掉它 → 只影响自己那份 ───────────────────────────
@@ -333,7 +333,7 @@ async def test_released_dead_node_resets_failure_count(tmp_data_dir) -> None:
     await _apply(_snap([node]))
     async with get_session_factory()() as s:
         row = (await s.execute(
-            select(ProxyNode).where(ProxyNode.fingerprint == fp)
+            select(ProxyNode).where(ProxyNode.node_id == fp)
         )).scalar_one()
         row.state = NODE_DEAD
         row.consecutive_failures = 2

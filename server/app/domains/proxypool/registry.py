@@ -16,10 +16,9 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domains.proxies.models import ProxySubscription
 from app.domains.proxypool.models import (
     ProxyNode,
     SubscriptionSnapshot,
@@ -80,16 +79,6 @@ async def _minted_names(session: AsyncSession, subscription_id: int) -> set[str]
         )
     )
     return {name for (name,) in rows.all()}
-
-
-async def _nodes_of(session: AsyncSession, subscription_id: int) -> dict[str, str]:
-    """本订阅现有节点 → {指纹: node_id}。"""
-    rows = await session.execute(
-        select(ProxyNode.node_id, ProxyNode.fingerprint).where(
-            ProxyNode.subscription_id == subscription_id
-        )
-    )
-    return {fingerprint: node_id for node_id, fingerprint in rows.all()}
 
 
 async def _exit_ip_indexes(
@@ -235,15 +224,28 @@ async def apply_snapshot(
         if newest_id is not None and incoming_id < newest_id:
             return ApplyResult((), (), (), (), skipped_stale=True)
 
+    return await _apply_nodes(session, subscription_id=subscription_id, nodes=snapshot.nodes,
+                              now=now, tag=tag)
+
+
+async def _apply_nodes(
+    session: AsyncSession, *, subscription_id: int, nodes: Iterable[Mapping],
+    now: datetime, tag: str, restore_only: bool = False,
+) -> ApplyResult:
+    """登记节点身份；缓存恢复只补缺口，不刷新健康或替换当前来源集合。"""
     desired: dict[str, Mapping] = {}
-    for node in snapshot.nodes:
+    for node in nodes:
         # 信息占位节点（旧快照重放仍可能携带）不进 Registry——它们不是代理端点
         if is_info_placeholder(str(node.get("name") or "")):
             continue
         desired.setdefault(node_fingerprint(node, tag), node)
     desired_fp = set(desired)
 
-    existing = await _nodes_of(session, subscription_id)
+    rows = (await session.execute(select(ProxyNode).where(
+        (ProxyNode.subscription_id == subscription_id) | ProxyNode.node_id.in_(desired_fp)
+    ))).scalars().all()
+    existing = {row.node_id for row in rows if row.subscription_id == subscription_id}
+    by_id = {row.node_id: row for row in rows}
     taken = await _minted_names(session, subscription_id)
 
     created: list[str] = []
@@ -256,18 +258,18 @@ async def apply_snapshot(
     for fingerprint, node in desired.items():
         original_name = str(node.get("name") or "")
 
-        if fingerprint in existing:
-            node_id = existing[fingerprint]
-            row = (
-                await session.execute(
-                    select(ProxyNode).where(ProxyNode.node_id == node_id)
-                )
-            ).scalar_one()
+        row = by_id.get(fingerprint)
+        if row is not None:
+            if restore_only:
+                continue
+            if row.subscription_id not in (None, subscription_id):
+                raise ValueError("节点身份已归属其他订阅，未覆盖来源")
+            row.subscription_id = subscription_id
             row.original_name = original_name
             row.normalized_config = dict(node)
             row.last_source_seen = now
             refreshed.append(fingerprint)
-            touched.add(node_id)
+            touched.add(fingerprint)
             continue
 
         # 指纹含订阅标识 ⇒ 同订阅内重建的节点必是同一行；查不到就是新节点
@@ -277,7 +279,6 @@ async def apply_snapshot(
             inherit_indexes = await _exit_ip_indexes(session)
         row = ProxyNode(
             node_id=fingerprint,
-            fingerprint=fingerprint,
             runtime_name=runtime_name,
             subscription_id=subscription_id,
             original_name=original_name,
@@ -287,7 +288,7 @@ async def apply_snapshot(
             state=NODE_NEW,
             first_seen=now,
             last_seen=now,
-            last_source_seen=now,
+            last_source_seen=None if restore_only else now,
             # 端点身份相同的旧节点携带着**已知的出口身份**：机场改名单 /
             # 换内容版本号（指纹变、type|server|port 不变）时把 exit_ip 继承
             # 过来——否则每次内容更新都要裸探一轮，空窗期内爬取全部被拒
@@ -299,20 +300,15 @@ async def apply_snapshot(
 
     # 本订阅已不再提供的节点：解除归属（挂空订阅，由状态机按来源流失结算）。
     # 不删行——行是身份台账，且同一节点可能在别的订阅下另有自己的行。
-    removed = [fp for fp in existing if fp not in desired_fp]
+    removed = [] if restore_only else [fp for fp in existing if fp not in desired_fp]
     if removed:
-        removed_ids = [existing[fp] for fp in removed]
-        await session.execute(
-            update(ProxyNode)
-            .where(ProxyNode.node_id.in_(removed_ids))
-            .values(subscription_id=None)
-            .execution_options(synchronize_session=False)
-        )
-        touched.update(removed_ids)
+        for fingerprint in removed:
+            by_id[fingerprint].subscription_id = None
+        touched.update(removed)
 
     await session.flush()
 
-    changes = await settle_nodes_after_source_change(session, touched, now=now)
+    changes = () if restore_only else await settle_nodes_after_source_change(session, touched, now=now)
     return ApplyResult(
         created_nodes=tuple(created),
         refreshed_nodes=tuple(refreshed),

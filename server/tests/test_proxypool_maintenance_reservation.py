@@ -223,8 +223,7 @@ async def test_run_l0_cycle_never_reserves(tmp_data_dir):
 
 @pytest.mark.asyncio
 async def test_maintenance_envelope_publishes_start_end_events(tmp_data_dir):
-    """体检包络开始/结束 → SSE 事件 + 编排事件留痕（账本打通的实时面）。"""
-    from app.core import orchestration
+    """体检包络开始/结束 → SSE 事件。"""
     from app.core.database import WritePriority, write_gate
     from app.core.events import bus
 
@@ -247,20 +246,6 @@ async def test_maintenance_envelope_publishes_start_end_events(tmp_data_dir):
             types.append(sub.critical.get_nowait().type)
         assert types[0] == "maintenance.started"
         assert types[-1] == "maintenance.ended"
-        async with write_gate(WritePriority.BACKGROUND), get_session_factory()() as s:
-            rows = await s.execute(
-                select(orchestration.OrchestrationEvent.kind).where(
-                    orchestration.OrchestrationEvent.kind.in_([
-                        orchestration.KIND_MAINTENANCE_STARTED,
-                        orchestration.KIND_MAINTENANCE_ENDED,
-                    ])
-                )
-            )
-            kinds = {k for (k,) in rows}
-        assert kinds == {
-            orchestration.KIND_MAINTENANCE_STARTED,
-            orchestration.KIND_MAINTENANCE_ENDED,
-        }
     finally:
         monkey.undo()
         bus.unsubscribe(sub)

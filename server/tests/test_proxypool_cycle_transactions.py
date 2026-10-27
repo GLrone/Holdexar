@@ -253,12 +253,7 @@ async def test_probe_pools_return_committed_session(tmp_data_dir, monkeypatch):
         encoding="utf-8",
     )
     async with get_session_factory()() as s:
-        s.add(ProxyNode(
-            node_id="fp-n1", fingerprint="fp-n1", runtime_name="1|n1",
-            proxy_type="http", server="10.0.0.1",
-            normalized_config={"name": "n1"},
-            state="NEW", first_seen=NOW, last_seen=NOW, last_source_seen=NOW,
-        ))
+        s.add(ProxyNode(node_id='fp-n1', runtime_name='1|n1', proxy_type='http', server='10.0.0.1', normalized_config={'name': 'n1'}, state='NEW', first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
         await s.commit()
 
     async def fake_probe_exit_ip(controller_url, secret, mixed_port, name, **kw):
@@ -314,6 +309,14 @@ async def test_job_proxypool_cycle_does_not_hold_write_gate(tmp_data_dir, monkey
         lambda data_dir: ("http://127.0.0.1:19090", "s"),
     )
     monkeypatch.setattr(sched, "run_proxypool_cycle", _fake_cycle)
+    from app.domains.proxies import clash_manager
+    from app.domains.proxypool import bootstrap
+
+    async def ready(*args, **kwargs):
+        return SimpleNamespace(ready=True)
+
+    monkeypatch.setattr(clash_manager, "ensure_kernel", lambda data_dir: None)
+    monkeypatch.setattr(bootstrap, "ensure_pool_runtime", ready)
 
     await core_sched._job_proxypool_cycle()
 

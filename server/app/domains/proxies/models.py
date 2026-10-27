@@ -112,20 +112,3 @@ class ProxySubscription(Base):
         if total > 0 and values.get("upload", 0) + values.get("download", 0) >= total:
             return "订阅流量已用尽"
         return None
-
-
-class ClashNode(Base):
-    """Clash 节点 UI 投影与体检节流时间；健康状态事实归 ProxyNode。"""
-
-    __tablename__ = "clash_nodes"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    subscription_id: Mapped[int] = mapped_column(Integer)  # proxy_subscriptions.id
-    name: Mapped[str] = mapped_column(String(255))
-    exit_ip: Mapped[str | None] = mapped_column(String(64))
-    status: Mapped[str] = mapped_column(String(10), default="unknown")  # ProxyNode.state 投影
-    latency_ms: Mapped[int | None] = mapped_column(Integer)
-    fail_count: Mapped[int] = mapped_column(Integer, default=0)  # ProxyNode.consecutive_failures 投影
-    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime)
-    cooldown_until: Mapped[datetime | None] = mapped_column(DateTime)  # 冷却期内跳过检测
-    created_at: Mapped[datetime | None] = mapped_column(DateTime)

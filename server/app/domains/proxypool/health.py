@@ -255,37 +255,6 @@ def pool_probe_lanes(data_dir: Path) -> list[tuple[str, int]]:
     return [lane for lane in parse_probe_lanes(text) if _port_listening(lane[1])]
 
 
-async def _probe_and_decide(
-    session: AsyncSession, node: ProxyNode, *,
-    controller_url: str,
-    secret: str,
-    probe_name: str,
-    now: datetime,
-    url: str,
-    timeout_ms: int,
-    state_push: bool = True,
-) -> tuple[HealthOutcome, dict, tuple[int, str] | None]:
-    """一次传输层探测 + 结论判定（**零写入**）；是否推进状态由 `state_push` 决定。
-
-    返回 `(结论, 观测行参数, 待应用状态变更)`：探测的网络等待与源计数读不得
-    压着未提交写事务（会话有挂起写入时这次读会 autoflush 出闸外写锁），观测
-    与状态变更由调用方在写调度器内落库。
-
-    **池内 L0 巡检传 `state_push=False`（纯记录）**：传输层可达性不再是节点生死
-    判据——生死归 Steam 业务探测（`business_check_pool`）与恢复探测。`state_push=True`
-    只用于 DEAD 恢复探测（目标已是 Steam 端点）：成功回 ACTIVE、失败累加计数。
-    `probe_name` 是**执行探测的内核认识的名字**：池内节点用 `runtime_name`（池内核的
-    运行配置里就是它），DEAD 节点不在池文件里、池内核不认识，改用订阅原名
-    （`ProxyNode.original_name`）打到持有全量订阅节点的旧链路内核上。
-    """
-    result = await probe_node(controller_url, secret, probe_name,
-                              url=url, timeout_ms=timeout_ms)
-    return await _decide_probe_result(
-        session, node, result, now=now, url=url, timeout_ms=timeout_ms,
-        state_push=state_push,
-    )
-
-
 async def _decide_probe_result(
     session: AsyncSession, node: ProxyNode, result: ProbeResult, *,
     now: datetime,
@@ -293,7 +262,7 @@ async def _decide_probe_result(
     timeout_ms: int,
     state_push: bool = True,
 ) -> tuple[HealthOutcome, dict, tuple[int, str] | None]:
-    """探测结论判定（结论已由调用方取得；与 `_probe_and_decide` 共用同一套规则）。"""
+    """探测结论判定（结论已由调用方取得）。"""
     if state_push:
         # 归属订阅仍在 = 来源在场（节点跟着订阅走，归属是一对一的身份组成部分）
         source_seen = node.subscription_id is not None

@@ -65,20 +65,7 @@ async def _add_node(
             id=sub_id, kind="clash", url=f"https://source.invalid/{sub_id}",
             admission_status=ADMISSION_ACTIVE,
         ))
-    node = ProxyNode(
-        node_id=runtime_name,
-        fingerprint=runtime_name,
-        runtime_name=runtime_name,
-        subscription_id=sub_id,
-        original_name=runtime_name,
-        proxy_type="ss",
-        server="10.0.0.1",
-        normalized_config={
-            "name": runtime_name, "type": "ss", "server": "10.0.0.1", "port": 443
-        },
-        state=NODE_ACTIVE,
-        exit_ip=exit_ip,
-    )
+    node = ProxyNode(node_id=f"fp-{runtime_name}", runtime_name=runtime_name, subscription_id=sub_id, original_name=runtime_name, proxy_type='ss', server='10.0.0.1', normalized_config={'name': runtime_name, 'type': 'ss', 'server': '10.0.0.1', 'port': 443}, state=NODE_ACTIVE, exit_ip=exit_ip)
     session.add(node)
     await session.flush()
     return node

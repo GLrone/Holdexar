@@ -143,10 +143,7 @@ async def _add(runtime_name: str, *, port: int, state: str = NODE_ACTIVE) -> Non
         if await s.get(ProxySubscription, 1) is None:
             s.add(ProxySubscription(id=1, kind="plain", url="http://sub.example/list",
                                     admission_status=ADMISSION_ACTIVE))
-        s.add(ProxyNode(node_id=fp, fingerprint=fp, runtime_name=runtime_name,
-                        proxy_type="http", server="127.0.0.1",
-                        normalized_config=config, state=state,
-                        first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
+        s.add(ProxyNode(node_id=fp, runtime_name=runtime_name, proxy_type='http', server='127.0.0.1', normalized_config=config, state=state, first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
         await s.execute(update(ProxyNode)
             .where(ProxyNode.node_id == fp)
             .values(subscription_id=1, original_name="x"))
@@ -477,6 +474,15 @@ async def test_scheduler_job_calls_proxypool_cycle(tmp_data_dir, monkeypatch) ->
         )
 
     monkeypatch.setattr(sched, "run_proxypool_cycle", _fake_cycle)
+    from types import SimpleNamespace
+    from app.domains.proxies import clash_manager
+    from app.domains.proxypool import bootstrap
+
+    async def _ready(*args, **kwargs):
+        return SimpleNamespace(ready=True)
+
+    monkeypatch.setattr(clash_manager, "ensure_kernel", lambda data_dir: None)
+    monkeypatch.setattr(bootstrap, "ensure_pool_runtime", _ready)
     await core_scheduler._job_proxypool_cycle()
 
     assert calls and calls[0]["data_dir"] == tmp_data_dir

@@ -8,12 +8,11 @@
 | `proxy_run_exits` | 每作业×出口数（高频聚合） | 90 天（与作业台账同周期） |
 | `health_runs` | ~22 行/天 | 90 天 |
 | `health_observations` | L1/L2 维护 + L0 失败证据（L0 成功只挂节点行不落流水） | 30 天 |
-| `orchestration_events` | 事件驱动，低频 | 90 天 |
 | `proxy_events` | 走线日志 | 90 天 |
 | `subscription_snapshots` | 每次抓取一行（行小） | 180 天，且每订阅最新 3 份成功快照永不删 |
 | `proxy_nodes` | 节点身份 | **永不清理** |
 | `pool_generations` | 审计链表，当前无写入方 | 不清理 |
-| 快照原始 `.bin` | 内容寻址、只增不减 | 本模块不 GC（P1.9 既有决定） |
+| 快照原始 `.bin` | 内容寻址 | 随本轮删行回收失去最后引用的正文 |
 
 **分块删除是硬要求**：一次删几十万行会长时间持写锁，与爬取/调度抢锁。这里每块
 `chunk` 行一个事务（`session.commit()` 在循环内），并有一轮最多 `max_chunks` 块的
@@ -25,6 +24,8 @@
 from __future__ import annotations
 
 import logging
+import re
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -54,7 +55,6 @@ class PruneResult:
     run_exits: int
     health_runs: int
     health_observations: int
-    orchestration_events: int
     proxy_events: int
     snapshots: int
     # 有一轮撞到 max_chunks 上限（还有剩）——下一轮继续，不是失败
@@ -66,7 +66,6 @@ class PruneResult:
             "run_exits": self.run_exits,
             "health_runs": self.health_runs,
             "health_observations": self.health_observations,
-            "orchestration_events": self.orchestration_events,
             "proxy_events": self.proxy_events,
             "snapshots": self.snapshots,
         }
@@ -94,30 +93,76 @@ async def _delete_chunked(
     return deleted, True
 
 
-async def _keep_ids_per_subscription(session: AsyncSession) -> list[int]:
-    """每个订阅保留最新 `KEEP_SNAPSHOTS_PER_SUB` 条成功快照的 id。
+async def _prune_snapshots(session: AsyncSession, now: datetime, *, days: int,
+                           chunk: int, max_chunks: int) -> tuple[int, bool]:
+    from app.core.config import get_settings
+    from app.domains.proxypool.bootstrap import subscription_sync_lock
+    from app.domains.proxypool.subscription import snapshot_dir
 
-    在 Python 里算而不是写窗口函数：订阅只有个位数，可读性优先；`ROW_NUMBER`
-    也能做，但为一个「保留几行」的规则引入窗口函数不值得。
-    """
-    sub_ids = (
-        await session.execute(
-            select(SubscriptionSnapshot.subscription_id).distinct()
-        )
-    ).scalars().all()
-    keep: list[int] = []
-    for sub_id in sub_ids:
-        rows = (
-            await session.execute(
-                select(SubscriptionSnapshot.id)
-                .where(SubscriptionSnapshot.subscription_id == sub_id)
-                .where(SubscriptionSnapshot.status == "OK")
-                .order_by(SubscriptionSnapshot.id.desc())
-                .limit(KEEP_SNAPSHOTS_PER_SUB)
-            )
-        ).scalars().all()
-        keep.extend(int(v) for v in rows if v is not None)
-    return keep
+    cutoff = _cutoff(now, days)
+    sub_ids = (await session.execute(select(SubscriptionSnapshot.subscription_id).where(
+        SubscriptionSnapshot.fetched_at < cutoff,
+    ).distinct())).scalars().all()
+    root = snapshot_dir(Path(get_settings().data_dir)).resolve()
+    deleted = 0
+    chunks = 0
+    for sub_id in sorted(sub_ids):
+        if chunks >= max(1, int(max_chunks)):
+            return deleted, True
+        # 与两条快照写入路径共用订阅锁；释放写闸后才读引用与删文件。
+        async with subscription_sync_lock(sub_id):
+            while chunks < max(1, int(max_chunks)):
+                async with write_gate(WritePriority.BACKGROUND):
+                    rows = (await session.execute(text("""
+                        DELETE FROM subscription_snapshots WHERE id IN (
+                            SELECT id FROM subscription_snapshots
+                            WHERE subscription_id=:sid AND fetched_at < :cutoff
+                              AND id NOT IN (
+                                  SELECT id FROM subscription_snapshots
+                                  WHERE subscription_id=:sid AND status='OK'
+                                  ORDER BY id DESC LIMIT :keep
+                              )
+                            ORDER BY id LIMIT :chunk
+                        ) RETURNING sha256,raw_path
+                    """), {"sid": sub_id, "cutoff": cutoff,
+                           "keep": KEEP_SNAPSHOTS_PER_SUB, "chunk": int(chunk)})).all()
+                    await session.commit()
+                if rows:
+                    chunks += 1
+                deleted += len(rows)
+                candidates = {}
+                for sha, raw_path in set(rows):
+                    if not raw_path or not re.fullmatch(r"[0-9a-f]{64}", sha or ""):
+                        continue
+                    expected = root / str(sub_id) / f"{sha}.bin"
+                    path = Path(raw_path).resolve()
+                    if path == expected and path.is_relative_to(root):
+                        candidates[path] = (sha, raw_path)
+                if candidates:
+                    shas, raw_paths = map(set, zip(*candidates.values()))
+                    live = (await session.execute(select(
+                        SubscriptionSnapshot.subscription_id, SubscriptionSnapshot.sha256,
+                        SubscriptionSnapshot.raw_path,
+                    ).where(
+                        SubscriptionSnapshot.raw_path.in_(raw_paths)
+                        | ((SubscriptionSnapshot.subscription_id == sub_id)
+                           & SubscriptionSnapshot.sha256.in_(shas))
+                    ))).all()
+                    live_paths = {row.raw_path for row in live}
+                    live_shas = {row.sha256 for row in live if row.subscription_id == sub_id}
+                    for path, (sha, raw_path) in candidates.items():
+                        if raw_path in live_paths or sha in live_shas:
+                            continue
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError as exc:
+                            log_event(logger, "订阅快照正文清理失败", level=logging.WARNING,
+                                      detail={"订阅": sub_id, "原因": repr(exc)})
+                if len(rows) < int(chunk):
+                    break
+                if chunks >= max(1, int(max_chunks)):
+                    return deleted, True
+    return deleted, False
 
 
 async def prune_telemetry(
@@ -199,21 +244,6 @@ async def prune_telemetry(
     )
     truncated = truncated or more
 
-    events, more = await _delete_chunked(
-        session,
-        """
-        DELETE FROM orchestration_events WHERE id IN (
-            SELECT id FROM orchestration_events
-            WHERE ts IS NOT NULL AND ts < :cutoff
-            ORDER BY id LIMIT :chunk
-        )
-        """,
-        {"cutoff": _cutoff(now, event_days)},
-        chunk=chunk,
-        max_chunks=max_chunks,
-    )
-    truncated = truncated or more
-
     proxy_events, more = await _delete_chunked(
         session,
         """
@@ -229,26 +259,13 @@ async def prune_telemetry(
     )
     truncated = truncated or more
 
-    keep = await _keep_ids_per_subscription(session)
-    preserve = f"AND id NOT IN ({','.join(str(int(v)) for v in keep)})" if keep else ""
-    snapshots, more = await _delete_chunked(
-        session,
-        f"""
-        DELETE FROM subscription_snapshots WHERE id IN (
-            SELECT id FROM subscription_snapshots
-            WHERE fetched_at IS NOT NULL AND fetched_at < :cutoff
-              {preserve}
-            ORDER BY id LIMIT :chunk
-        )
-        """,
-        {"cutoff": _cutoff(now, snapshot_days)},
-        chunk=chunk,
-        max_chunks=max_chunks,
+    snapshots, more = await _prune_snapshots(
+        session, now, days=snapshot_days, chunk=chunk, max_chunks=max_chunks,
     )
     truncated = truncated or more
 
     result = PruneResult(
-        job_runs, run_exits, health_runs, observations, events, proxy_events,
+        job_runs, run_exits, health_runs, observations, proxy_events,
         snapshots, truncated,
     )
     if any(result.as_dict().values()):
@@ -261,7 +278,6 @@ async def prune_telemetry(
                 "清理出口账本行数": result.run_exits,
                 "清理体检台账行数": result.health_runs,
                 "清理健康观测行数": result.health_observations,
-                "清理编排事件行数": result.orchestration_events,
                 "清理走线日志行数": result.proxy_events,
                 "清理快照行数": result.snapshots,
                 "还有剩余": "是" if truncated else "否",

@@ -817,9 +817,7 @@ async def test_same_config_from_two_subscriptions_is_two_nodes(tmp_data_dir):
     async with get_session_factory()() as s:
         for sid in (1, 2):
             fp = node_fingerprint(cfg, subscription_tag(f"https://sub{sid}.test/sub"))
-            s.add(ProxyNode(node_id=fp[:20], fingerprint=fp, runtime_name=f"{sid}|HK",
-                            subscription_id=sid, original_name="HK",
-                            proxy_type="vmess", state="ACTIVE"))
+            s.add(ProxyNode(node_id=fp[:20], runtime_name=f'{sid}|HK', subscription_id=sid, original_name='HK', proxy_type='vmess', state='ACTIVE'))
         await s.commit()
 
     async with get_session_factory()() as s:
@@ -834,8 +832,7 @@ async def test_same_config_from_two_subscriptions_is_two_nodes(tmp_data_dir):
 
     # 指纹全局唯一：同一份配置不允许登记第二行节点
     async with get_session_factory()() as s:
-        s.add(ProxyNode(node_id="other", fingerprint=fp, runtime_name="2|HK",
-                        proxy_type="vmess"))
+        s.add(ProxyNode(node_id=fp[:20], runtime_name='2|other', proxy_type='vmess'))
         with pytest.raises(IntegrityError):
             await s.commit()
 
@@ -849,15 +846,14 @@ async def test_fresh_db_matches_locked_identity_model(tmp_data_dir):
             "PRAGMA table_info(proxy_nodes)")).fetchall()}
         tables = {r[0] for r in (await conn.exec_driver_sql(
             "SELECT name FROM sqlite_master WHERE type='table'")).fetchall()}
-    assert "fingerprint" in cols and "runtime_name" in cols
+    assert {"node_id", "runtime_name"} <= cols
+    assert "fingerprint" not in cols
     assert {"subscription_id", "original_name"} <= cols, "归属订阅落节点表（一对一）"
     assert "proxy_node_sources" not in tables, "来源表已退役"
 
     async with get_session_factory()() as s:
-        s.add(ProxyNode(node_id="a" * 20, fingerprint="f" * 64,
-                        runtime_name="1|A", proxy_type="vmess"))
-        s.add(ProxyNode(node_id="b" * 20, fingerprint="f" * 64,
-                        runtime_name="1|B", proxy_type="vmess"))
+        s.add(ProxyNode(node_id='a' * 20, runtime_name='1|A', proxy_type='vmess'))
+        s.add(ProxyNode(node_id='a' * 20, runtime_name='1|B', proxy_type='vmess'))
         with pytest.raises(IntegrityError):
             await s.commit()
 

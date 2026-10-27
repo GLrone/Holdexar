@@ -30,11 +30,7 @@ def _reset_pending():
 async def test_l2_exception_keeps_l1_telemetry(tmp_data_dir, monkeypatch, caplog):
     await init_db()
     async with get_session_factory()() as s:
-        s.add(ProxyNode(
-            node_id="fp-l1", fingerprint="fp-l1", runtime_name="1|l1-node",
-            proxy_type="http", server="10.0.0.1", normalized_config={"name": "l1-node"},
-            state="NEW", first_seen=NOW, last_seen=NOW, last_source_seen=NOW,
-        ))
+        s.add(ProxyNode(node_id='fp-l1', runtime_name='1|l1-node', proxy_type='http', server='10.0.0.1', normalized_config={'name': 'l1-node'}, state='NEW', first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
         await s.commit()
 
     async def fake_l1(session, **kw):  # noqa: ANN001 —— 模拟 L1 真实写入

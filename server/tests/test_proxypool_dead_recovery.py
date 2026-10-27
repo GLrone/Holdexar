@@ -42,11 +42,7 @@ async def _add_node(*, node_id: str, state: str, failures: int = 0,
         if await s.get(ProxySubscription, 1) is None:
             s.add(ProxySubscription(id=1, kind="plain", url="http://sub.example/list",
                                     admission_status=ADMISSION_ACTIVE))
-        s.add(ProxyNode(node_id=node_id, fingerprint=node_id, runtime_name=f"1|{node_id}",
-                        proxy_type="http", server="10.0.0.1",
-                        normalized_config=dict(CONFIG), state=state,
-                        consecutive_failures=failures,
-                        first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
+        s.add(ProxyNode(node_id=node_id, runtime_name=f'1|{node_id}', proxy_type='http', server='10.0.0.1', normalized_config=dict(CONFIG), state=state, consecutive_failures=failures, first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
         await s.execute(update(ProxyNode)
             .where(ProxyNode.node_id == node_id)
             .values(subscription_id=1, original_name=f"sub-{node_id}"))
@@ -238,13 +234,7 @@ async def _add_recovery_graph(entries):
     async with get_session_factory()() as session:
         session.add(ProxySubscription(id=1, kind="plain", url="http://sub.example/list"))
         session.add_all([
-            ProxyNode(
-                node_id=node_id, fingerprint=node_id, runtime_name=f"1|{node_id}",
-                subscription_id=1, original_name=node_id, proxy_type="http",
-                server="10.0.0.1", normalized_config={**CONFIG, "name": node_id, **extra},
-                state=state, consecutive_failures=1,
-                first_seen=NOW, last_seen=NOW, last_source_seen=NOW,
-            )
+            ProxyNode(node_id=node_id, runtime_name=f'1|{node_id}', subscription_id=1, original_name=node_id, proxy_type='http', server='10.0.0.1', normalized_config={**CONFIG, 'name': node_id, **extra}, state=state, consecutive_failures=1, first_seen=NOW, last_seen=NOW, last_source_seen=NOW)
             for node_id, state, extra in entries
         ])
         await session.commit()
@@ -617,12 +607,7 @@ async def test_self_hosted_bad_source_only_blocks_its_dependent_targets(env, mon
     async with get_session_factory()() as session:
         session.add(ProxySubscription(id=2, kind="clash", url="http://second.example/list"))
         session.add_all([
-            ProxyNode(
-                node_id=node_id, fingerprint=node_id, runtime_name=f"2|{name}",
-                subscription_id=2, original_name=name, proxy_type="http", server="10.0.0.1",
-                normalized_config={**CONFIG, "name": name, **extra}, state=state,
-                consecutive_failures=1, first_seen=NOW, last_source_seen=NOW,
-            )
+            ProxyNode(node_id=node_id, runtime_name=f'2|{name}', subscription_id=2, original_name=name, proxy_type='http', server='10.0.0.1', normalized_config={**CONFIG, 'name': name, **extra}, state=state, consecutive_failures=1, first_seen=NOW, last_source_seen=NOW)
             for node_id, name, state, extra in [
                 ("second-leaf", "leaf", NODE_DEAD, {"dialer-proxy": "relay"}),
                 ("second-hop", "hop", NODE_ACTIVE, {}),

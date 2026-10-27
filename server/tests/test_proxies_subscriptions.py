@@ -20,7 +20,7 @@ from app.core import secretbox
 from app.core.database import Base
 from app.domains.proxies import clash_manager, service as proxies_service
 from app.domains.proxies.subscription_secret import open_url
-from app.domains.proxies.models import ClashNode, Proxy, ProxySubscription
+from app.domains.proxies.models import Proxy, ProxySubscription
 from app.domains.proxypool import subscription as subscription_core
 from app.domains.settings import service as settings_service
 
@@ -52,10 +52,7 @@ def test_subscription_resource_limits_use_saved_facts():
 @pytest.mark.asyncio
 async def test_unprobed_results_preserve_previous_subscription_verdict(db, monkeypatch):
     sid = await _add_sub(db, last_stats={"alive": 1, "total": 1})
-    result = await proxies_service._apply_node_results(
-        sid, {}, [{"name": "one", "alive": False, "probed": False}],
-        ["one"], datetime.now(), {},
-    )
+    result = await proxies_service._summarize_node_results(sid, [{'name': 'one', 'alive': False, 'probed': False}], ['one'], datetime.now(), {})
     assert result[0] == 1 and result[2] is False
     async with db() as session:
         sub = await session.get(ProxySubscription, sid)
@@ -76,13 +73,7 @@ async def test_mixed_probe_failure_keeps_unprobed_healthy_node_available(db):
 
     sid = await _add_sub(db, last_stats={"alive": 1, "total": 2})
     await _seed_registry_node(db, sid, "known", exit_ip="1.1.1.1")
-    result = await proxies_service._apply_node_results(
-        sid, {"known": datetime.now() + timedelta(minutes=30)},
-        [{"name": "known", "alive": False, "probed": False},
-         {"name": "failed", "alive": False, "probed": True, "ms": None}],
-        ["known", "failed"], datetime.now(),
-        await _registry_map(db, sid, ["known", "failed"]),
-    )
+    result = await proxies_service._summarize_node_results(sid, [{'name': 'known', 'alive': False, 'probed': False}, {'name': 'failed', 'alive': False, 'probed': True, 'ms': None}], ['known', 'failed'], datetime.now(), await _registry_map(db, sid, ['known', 'failed']))
     assert result == (1, 1, False)
 
 
@@ -117,13 +108,7 @@ async def _seed_registry_node(db, sub_id: int, name: str, *, exit_ip: str | None
     from app.domains.proxypool.state import NODE_ACTIVE
 
     async with db() as session:
-        session.add(ProxyNode(
-            node_id=f"{sub_id}-{name}", fingerprint=f"{sub_id}-{name}",
-            runtime_name=f"{sub_id}|{name}", proxy_type="http", server="127.0.0.1",
-            normalized_config={"name": name, "type": "http", "server": "127.0.0.1", "port": 80},
-            state=NODE_ACTIVE, subscription_id=sub_id, original_name=name,
-            exit_ip=exit_ip, last_l2_at=datetime.now() - timedelta(seconds=1),
-        ))
+        session.add(ProxyNode(node_id=f'{sub_id}-{name}', runtime_name=f'{sub_id}|{name}', proxy_type='http', server='127.0.0.1', normalized_config={'name': name, 'type': 'http', 'server': '127.0.0.1', 'port': 80}, state=NODE_ACTIVE, subscription_id=sub_id, original_name=name, exit_ip=exit_ip, last_l2_at=datetime.now() - timedelta(seconds=1)))
         await session.commit()
 
 
@@ -205,7 +190,7 @@ async def test_update_subscription_url_change_triggers_sync(db, monkeypatch, tmp
         return {
             "id": sid, "label": "新名字", "nodes": 7, "traffic": USERINFO,
             "alive": 3, "total": 7, "usedCache": False,
-            "restarted": False, "prunedLedger": 0,
+            "restarted": False,
         }
 
     monkeypatch.setattr(proxies_service, "refresh_clash_subscription", fake_refresh)
@@ -222,7 +207,7 @@ async def test_update_subscription_url_change_triggers_sync(db, monkeypatch, tmp
     assert res["label"] == "新名字"
     assert secretbox.is_encrypted((await _get_sub(db, sub_id)).url)
     assert open_url((await _get_sub(db, sub_id)).url) == "https://example.com/sub?token=xyz"
-    assert clash_manager.read_subscription_meta(tmp_path, sub_id)["urlIdentity"] is None
+    assert (await _get_sub(db, sub_id)).cache_url_identity == subscription_url_identity(SUB_URL)
 
 
 @pytest.mark.asyncio
@@ -339,28 +324,6 @@ async def test_refresh_traffic_no_header(db, monkeypatch):
 # ─── 删除订阅级联清理账本 ────────────────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_delete_subscription_cascades_ledger(db):
-    """删订阅连带删其账本行；别的订阅的行不受影响。"""
-    sub_a = await _add_sub(db)
-    sub_b = await _add_sub(db)
-    async with db() as session:
-        session.add_all(
-            [
-                ClashNode(subscription_id=sub_a, name="A1"),
-                ClashNode(subscription_id=sub_a, name="A2"),
-                ClashNode(subscription_id=sub_b, name="B1"),
-            ]
-        )
-        await session.commit()
-
-    assert await proxies_service.delete_subscription(sub_a) is True
-
-    async with db() as session:
-        from sqlalchemy import select
-
-        rows = (await session.execute(select(ClashNode))).scalars().all()
-    assert sorted(r.name for r in rows) == ["B1"]
 
 
 @pytest.mark.asyncio
@@ -385,14 +348,7 @@ async def test_delete_subscription_cascades_pool_ledger(db):
         a, b = sub_a.id, sub_b.id
 
         def _node(node_id: str, runtime_name: str, sub_id: int) -> ProxyNode:
-            return ProxyNode(
-                node_id=node_id, fingerprint=node_id, runtime_name=runtime_name,
-                subscription_id=sub_id, original_name=node_id,
-                proxy_type="ss", server="10.0.0.1",
-                normalized_config={"name": node_id, "type": "ss",
-                                   "server": "10.0.0.1", "port": 1},
-                state="ACTIVE", first_seen=seen, last_seen=seen, last_source_seen=seen,
-            )
+            return ProxyNode(node_id=node_id, runtime_name=runtime_name, subscription_id=sub_id, original_name=node_id, proxy_type='ss', server='10.0.0.1', normalized_config={'name': node_id, 'type': 'ss', 'server': '10.0.0.1', 'port': 1}, state='ACTIVE', first_seen=seen, last_seen=seen, last_source_seen=seen)
 
         session.add_all([
             _node("only-a", f"{a}|only-a", a),
@@ -426,62 +382,13 @@ async def test_delete_subscription_cascades_pool_ledger(db):
     assert pool_scheduling.rebuild_pending() is True, "合格集变化必须请求重建"
     pool_scheduling.take_rebuild_pending()
 
-    from app.core import orchestration as events
-    from app.core.orchestration import OrchestrationEvent
-
-    async with db() as session:
-        ev = (await session.scalars(
-            select(OrchestrationEvent)
-            .where(OrchestrationEvent.kind == events.KIND_SUBSCRIPTION_EXITED)
-            .order_by(OrchestrationEvent.id.desc())
-        )).first()
-    assert ev is not None and "删除" in ev.message, "来源解除必须留痕（与退出端点同一理由）"
 
 
 # ─── 账本收敛 ────────────────────────────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_prune_ledger_removes_stale_nodes(db):
-    """已不在订阅内容里的节点行删除，当前节点保留（状态不动）。"""
-    sub_id = await _add_sub(db)
-    async with db() as session:
-        session.add_all(
-            [
-                ClashNode(subscription_id=sub_id, name="节点A", status="ok", fail_count=0),
-                ClashNode(subscription_id=sub_id, name="节点B", status="dead", fail_count=10),
-                ClashNode(subscription_id=sub_id, name="旧节点", status="ok"),
-            ]
-        )
-        await session.commit()
-
-    removed = await proxies_service.prune_clash_node_ledger(sub_id, {"节点A", "节点B"})
-
-    assert removed == 1
-    async with db() as session:
-        from sqlalchemy import select
-
-        rows = (await session.execute(select(ClashNode))).scalars().all()
-    assert sorted(r.name for r in rows) == ["节点A", "节点B"]
-    by_name = {r.name: r for r in rows}
-    assert by_name["节点B"].status == "dead"  # 保留行的状态机原样
 
 
-@pytest.mark.asyncio
-async def test_prune_ledger_empty_names_is_noop(db):
-    """空节点集防呆：不删（全删等于销账，宁可保留）。"""
-    sub_id = await _add_sub(db)
-    async with db() as session:
-        session.add(ClashNode(subscription_id=sub_id, name="节点A"))
-        await session.commit()
-
-    assert await proxies_service.prune_clash_node_ledger(sub_id, set()) == 0
-
-    async with db() as session:
-        from sqlalchemy import select
-
-        rows = (await session.execute(select(ClashNode))).scalars().all()
-    assert len(rows) == 1
 
 
 # ─── 内核重启归属判断（共用缓存不串台）──────────────────────
@@ -582,29 +489,17 @@ async def test_start_switches_subscription_when_running(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_apply_node_results_records_alive(db):
+async def test_node_summary_records_alive(db):
     """节点检测后存活/总数落进订阅 last_stats（订阅行「存活 x/y」数据源），
-    且账本收敛删除已下线节点的旧行。"""
+    订阅统计合并保留流量及内容节点数。"""
     sub_id = await _add_sub(db, last_stats={"traffic": USERINFO, "nodes": 3})
-    async with db() as session:
-        session.add_all(
-            [
-                ClashNode(subscription_id=sub_id, name="节点A", status="ok"),
-                ClashNode(subscription_id=sub_id, name="节点B", status="unknown"),
-                ClashNode(subscription_id=sub_id, name="旧节点", status="ok"),
-            ]
-        )
-        await session.commit()
-
     results = [
         {"name": "节点A", "alive": True, "steamOk": True, "exitIp": "1.1.1.1",
          "ms": 100, "duplicate": False, "probed": True},
         {"name": "节点B", "alive": False, "steamOk": False, "exitIp": None,
          "ms": 200, "duplicate": False, "probed": True},
     ]
-    alive, unique_alive, deprecated = await proxies_service._apply_node_results(
-        sub_id, {}, results, ["节点A", "节点B"], datetime(2026, 9, 5, 12, 0, 0), {}
-    )
+    alive, unique_alive, deprecated = await proxies_service._summarize_node_results(sub_id, results, ['节点A', '节点B'], datetime(2026, 9, 5, 12, 0, 0), {})
 
     assert alive == 1
     assert unique_alive == 1
@@ -614,13 +509,6 @@ async def test_apply_node_results_records_alive(db):
     assert stats["total"] == 2
     assert stats["traffic"] == USERINFO  # 合并不覆盖既有键
     assert stats["nodes"] == 3
-
-    async with db() as session:
-        from sqlalchemy import select
-
-        rows = (await session.execute(select(ClashNode))).scalars().all()
-    assert sorted(r.name for r in rows) == ["节点A", "节点B"]  # 旧节点行已收敛
-
 
 # ─── 明文订阅导入即体检（新节点入库自动校验标记）──
 
@@ -1508,6 +1396,91 @@ async def test_snapshot_only_uses_valid_subscription_cache_when_snapshot_is_abse
     assert result["cached"] is True
     assert result["nodes"] == 1
     assert Path(result["path"]).read_text(encoding="utf-8") == _MINI_CONFIG
+    from datetime import timedelta
+    from app.domains.proxypool.models import ProxyNode, SubscriptionSnapshot, node_fingerprint, subscription_tag
+    identity = node_fingerprint(subscription_core.parse_nodes(_MINI_CONFIG.encode(), "yaml")[0], subscription_tag(SUB_URL))
+    async with db() as session:
+        assert (await session.execute(select(SubscriptionSnapshot))).scalars().all() == []
+        node = await session.scalar(select(ProxyNode).where(ProxyNode.node_id == identity))
+        assert node is not None and node.subscription_id == sub_id
+        assert node.last_source_seen is None
+        node.state = "DEAD"
+        node.consecutive_failures = 3
+        node.cooldown_until = datetime.now() + timedelta(hours=4)
+        node.subscription_id = None
+        deadline = node.cooldown_until
+        before = await session.get(ProxySubscription, sub_id)
+        admission = (before.admission_status, before.last_fetch_at, before.last_success_at)
+        await session.commit()
+    from sqlalchemy import event
+    from app.core.database import get_engine
+    commits = []
+    def record_commit(_connection):
+        commits.append(True)
+    event.listen(get_engine().sync_engine, "commit", record_commit)
+    try:
+        await clash_manager.ClashRuntime().download_subscription(
+            SUB_URL, tmp_path, [], target_path=target, snapshot_only=True,
+        )
+    finally:
+        event.remove(get_engine().sync_engine, "commit", record_commit)
+    assert commits == []
+    async with db() as session:
+        node = await session.scalar(select(ProxyNode).where(ProxyNode.node_id == identity))
+        assert (node.state, node.consecutive_failures, node.cooldown_until) == ("DEAD", 3, deadline)
+        assert node.subscription_id is None
+        after = await session.get(ProxySubscription, sub_id)
+        assert (after.admission_status, after.last_fetch_at, after.last_success_at) == admission
+    import yaml
+    from app.domains.proxypool.subscription import parse_nodes
+    original_node = parse_nodes(_MINI_CONFIG.encode(), "yaml")[0]
+    added = {**original_node, "name": "added", "server": "192.0.2.44"}
+    target.write_text(yaml.safe_dump({"proxies": [original_node, added]}), encoding="utf-8")
+    await clash_manager.ClashRuntime().download_subscription(
+        SUB_URL, tmp_path, [], target_path=target, snapshot_only=True,
+    )
+    async with db() as session:
+        existing = await session.scalar(select(ProxyNode).where(ProxyNode.node_id == identity))
+        assert (existing.subscription_id, existing.state, existing.consecutive_failures, existing.cooldown_until) == (None, "DEAD", 3, deadline)
+        new_identity = node_fingerprint(added, subscription_tag(SUB_URL))
+        new_node = await session.scalar(select(ProxyNode).where(ProxyNode.node_id == new_identity))
+        assert (new_node.subscription_id, new_node.state, new_node.last_source_seen) == (sub_id, "NEW", None)
+        assert (await session.execute(select(SubscriptionSnapshot))).scalars().all() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["url", "snapshot"])
+async def test_cache_registration_rechecks_source_inside_write_transaction(db, monkeypatch, tmp_path, change):
+    from contextlib import asynccontextmanager
+    from app.core import database
+    from app.domains.proxypool.models import ProxyNode, SubscriptionSnapshot
+
+    sub_id = await _add_sub(db)
+    target = clash_manager.subscription_config_path(tmp_path, sub_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(_MINI_CONFIG, encoding="utf-8")
+    original = database.write_session
+
+    @asynccontextmanager
+    async def changed_source(*args, **kwargs):
+        async with original() as session:
+            if change == "url":
+                sub = await session.get(ProxySubscription, sub_id)
+                sub.url = "https://example.test/changed"
+            else:
+                session.add(SubscriptionSnapshot(subscription_id=sub_id, url=SUB_URL, status="OK",
+                                                 sha256="newer", format="yaml", node_count=1,
+                                                 raw_path="not-read", fetched_at=datetime.now()))
+            await session.commit()
+        async with original(*args, **kwargs) as session:
+            yield session
+
+    monkeypatch.setattr(database, "write_session", changed_source)
+    with pytest.raises(RuntimeError, match="来源已变化"):
+        await clash_manager.ClashRuntime().download_subscription(
+            SUB_URL, tmp_path, [], target_path=target, snapshot_only=True)
+    async with db() as session:
+        assert (await session.execute(select(ProxyNode))).scalars().all() == []
 
 
 @pytest.mark.asyncio

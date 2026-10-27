@@ -167,10 +167,7 @@ async def _seed_pool(tmp_data_dir, *, lane_ports: list[int], ctrl_port: int,
             if await s.get(ProxySubscription, 1) is None:
                 s.add(ProxySubscription(id=1, kind="clash", url="https://source.invalid/1",
                                         admission_status=ADMISSION_ACTIVE))
-            s.add(ProxyNode(node_id=fp, fingerprint=fp, runtime_name=name,
-                            proxy_type="http", server="127.0.0.1",
-                            normalized_config=config, state="ACTIVE",
-                            first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
+            s.add(ProxyNode(node_id=fp, runtime_name=name, proxy_type='http', server='127.0.0.1', normalized_config=config, state='ACTIVE', first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
             await s.execute(update(ProxyNode)
                 .where(ProxyNode.node_id == fp)
                 .values(subscription_id=1, original_name="x"))

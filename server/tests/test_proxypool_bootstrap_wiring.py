@@ -90,7 +90,7 @@ async def test_startup_chain_invokes_bootstrap(tmp_data_dir, monkeypatch) -> Non
         return bs.BootstrapResult(True, True, "http://127.0.0.1:1", None, (), "stub")
 
     monkeypatch.setattr(bs, "ensure_pool_runtime", _fake_ensure)
-    await core_scheduler._startup_pool_runtime()
+    await core_scheduler._job_proxypool_cycle()
     assert called == ["ensure"]
 
 
@@ -108,7 +108,7 @@ async def test_bootstrap_failure_does_not_block_startup(
 
     monkeypatch.setattr(bs, "ensure_pool_runtime", _boom)
     # 不抛异常 = 应用与 scheduler 都能继续
-    await core_scheduler._startup_pool_runtime()
+    await core_scheduler._job_proxypool_cycle()
 
 
 # ══ 3. 无 Runtime + 同步成功 → 直接 bootstrap，不产生额外 rebuild ══

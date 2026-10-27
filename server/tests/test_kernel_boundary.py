@@ -466,13 +466,7 @@ async def test_l2_tunnel_failure_vs_target_vs_uncertain_state_and_exitstats(
                 cfg = {"name": name, "type": "ss", "server": f"10.0.0.{idx}",
                        "port": 443, "cipher": "aes-128-gcm", "password": "p"}
                 fp = node_fingerprint(cfg)
-                s.add(ProxyNode(
-                    node_id=fp, fingerprint=fp, runtime_name=name,
-                    proxy_type="ss", server=cfg["server"], normalized_config=cfg,
-                    state=NODE_ACTIVE, consecutive_failures=2,
-                    subscription_id=1, original_name=name,
-                    first_seen=now, last_seen=now, last_source_seen=now,
-                ))
+                s.add(ProxyNode(node_id=fp, runtime_name=name, proxy_type='ss', server=cfg['server'], normalized_config=cfg, state=NODE_ACTIVE, consecutive_failures=2, subscription_id=1, original_name=name, first_seen=now, last_seen=now, last_source_seen=now))
             await s.commit()
 
         async with get_session_factory()() as s:
@@ -531,8 +525,8 @@ async def test_l2_tunnel_failure_vs_target_vs_uncertain_state_and_exitstats(
                     {"exit_ip": "198.51.100.2", "success": 0, "e5xx": 1, "uncertain": True},
                 ],
                 {
-                    "198.51.100.1": rows["1|target-502"].node_id,
-                    "198.51.100.2": rows["1|uncertain-502"].node_id,
+                    "198.51.100.1": rows["1|target-502"].runtime_name,
+                    "198.51.100.2": rows["1|uncertain-502"].runtime_name,
                 },
                 now,
             )
@@ -549,8 +543,8 @@ async def test_l2_tunnel_failure_vs_target_vs_uncertain_state_and_exitstats(
                     {"exit_ip": "198.51.100.1", "success": 0, "tunnel_error": 1},
                 ],
                 {
-                    "198.51.100.3": rows["1|uncertain-502"].node_id,
-                    "198.51.100.1": rows["1|target-502"].node_id,
+                    "198.51.100.3": rows["1|uncertain-502"].runtime_name,
+                    "198.51.100.1": rows["1|target-502"].runtime_name,
                 },
                 now,
             )
@@ -559,7 +553,59 @@ async def test_l2_tunnel_failure_vs_target_vs_uncertain_state_and_exitstats(
             assert rows["1|target-502"].state == NODE_DEAD
             assert rows["1|uncertain-502"].consecutive_failures == 0
             assert rows["1|uncertain-502"].state == NODE_ACTIVE
+            assert rows["1|uncertain-502"].last_l2_at == now
+            assert rows["1|target-502"].last_l2_at == now
     finally:
         get_settings.cache_clear()
         get_engine.cache_clear()
         get_session_factory.cache_clear()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_write", [False, True])
+async def test_runtime_exit_health_and_observation_commit_together(fail_write):
+    from datetime import datetime, timedelta
+    from sqlalchemy import event, select
+    from app.core.database import get_engine, get_session_factory, write_session
+    from app.crawler.exit_stats import ExitStatsCollector
+    from app.domains.proxypool.exitstats import write_run_exits
+    from app.domains.proxypool.models import ProxyJobRun, ProxyNode, ProxyRunExit, node_fingerprint
+
+    old = datetime(2026, 10, 21)
+    now = old + timedelta(hours=1)
+    config = {"type": "ss", "server": "192.0.2.1", "port": 443, "cipher": "aes-128-gcm", "password": "fixture"}
+    identities = [node_fingerprint(config, tag=str(i)) for i in (1, 2)]
+    async with write_session() as session:
+        session.add(ProxyJobRun(id=1, status="success", started_at=old))
+        for i, identity in enumerate(identities, 1):
+            session.add(ProxyNode(node_id=identity, runtime_name=f"{i}|shared-name",
+                                  subscription_id=i, proxy_type="ss", normalized_config=config,
+                                  state="DEAD", consecutive_failures=2,
+                                  last_l2_at=old, cooldown_until=now + timedelta(hours=1)))
+        await session.commit()
+    collector = ExitStatsCollector()
+    collector.record(exit_key="203.0.113.1", url="https://api.steampowered.com/IStoreBrowseService/GetItems/v1/",
+                     outcome="ok", duration_ms=10)
+    def inject(_c, _cur, statement, _parameters, _ctx, _many):
+        if fail_write and statement.lstrip().upper().startswith("INSERT INTO PROXY_RUN_EXITS"):
+            raise RuntimeError("controlled exit ledger write failure")
+    engine = get_engine().sync_engine
+    event.listen(engine, "before_cursor_execute", inject)
+    try:
+        assert await write_run_exits(run_id=1, collector=collector,
+                                    node_by_exit={"203.0.113.1": "1|shared-name"}, now=now) == (0 if fail_write else 1)
+    finally:
+        event.remove(engine, "before_cursor_execute", inject)
+    async with get_session_factory()() as session:
+        nodes = (await session.execute(select(ProxyNode).order_by(ProxyNode.subscription_id))).scalars().all()
+        affected, other = nodes
+        assert affected.node_id == identities[0] != affected.runtime_name
+        assert affected.state == ("DEAD" if fail_write else "ACTIVE")
+        assert affected.consecutive_failures == (2 if fail_write else 0)
+        assert affected.last_l2_at == (old if fail_write else now)
+        assert affected.cooldown_until == (now + timedelta(hours=1) if fail_write else None)
+        assert (other.state, other.consecutive_failures, other.last_l2_at) == ("DEAD", 2, old)
+        exits = (await session.execute(select(ProxyRunExit))).scalars().all()
+        assert len(exits) == (0 if fail_write else 1)
+        if exits:
+            assert exits[0].node == "1|shared-name" and exits[0].success == 1

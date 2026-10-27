@@ -2,22 +2,22 @@
 
 前端「节点体检」探的是**生产端点**（IStoreBrowseService/GetItems）与出口 IP，
 这正是池健康账本的 L2（真实业务）与 L1（出口身份）证据。本模块把它们按
-「订阅来源」对齐到 Registry：
+实际运行配置指纹对齐到 Registry：
 
-    (subscription_id, 节点名)  →  ProxyNode（按归属订阅 + 原名匹配）
+    运行节点名 → node_id → ProxyNode（保留订阅隔离）
 
 命中节点按有效 L2 成功或真实传输失败推进唯一状态机，并分别记录 L1 出口与 L2
 业务证据。普通 HTTP 错误响应和无效正文只记观测，不作为节点故障。健康状态
 只由 ProxyNode 保存。本模块还承载两个权威来源自愈（补缺失来源/清失主来源）。
 
-不做的事：不新建调度、不新建生命周期、不重铸名字、不降级节点。合格集或出口集
+不新建调度、不新建生命周期、不重铸名字。合格集或出口集
 变化只置既有的 rebuild_pending，重建仍归既有的池重建通道。
 """
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -46,6 +46,7 @@ CLASH_STEAM_HTTP_504_DETAIL = "CLASH_STEAM_HTTP_504"
 CLASH_STEAM_INVALID_DETAIL = "CLASH_STEAM_INVALID_RESPONSE"
 CLASH_STEAM_TRANSPORT_DETAIL = "CLASH_STEAM_TRANSPORT_FAILURE"
 CLASH_EXIT_IP_DETAIL = "CLASH_EXIT_IP"
+_FAIL_COOLDOWN_MINUTES = (30, 60, 120, 240, 480, 1440)
 
 
 @dataclass
@@ -56,7 +57,6 @@ class IngestionResult:
     activated: int = 0
     deactivated: int = 0
     exit_ips_added: int = 0
-    unmatched: list[str] = field(default_factory=list)
 
     @property
     def changed(self) -> bool:
@@ -75,56 +75,39 @@ def _name_keys(name: str) -> list[str]:
     return keys
 
 
-async def _load_index(
-    session: AsyncSession,
-) -> tuple[dict[tuple[int, str], ProxyNode], dict[str, ProxyNode]]:
-    """来源关联索引：(订阅, 原名) → 节点；运行名 → 节点。
-
-    运行名索引服务「体检直接读池内核配置」的形态——那时体检拿到的名字已经是
-    runtime_name，按来源名匹配不到。
-    """
-    # by_runtime 覆盖**全部身份行**：来源关联缺失的节点（订阅抓取失败、来源关联
-    # 丢过一拍）仍必须能被体检结论按运行名命中，否则手动体检证明健康的节点永远
-    # 进不了池——身份行的可见性不能挂在「有没有来源关联」上。
-    by_runtime: dict[str, ProxyNode] = {
-        str(node.runtime_name): node
-        for node in (await session.execute(select(ProxyNode))).scalars()
-    }
-    by_source: dict[tuple[int, str], ProxyNode] = {
-        (int(node.subscription_id), str(node.original_name)): node
-        for node in by_runtime.values()
-        if node.subscription_id is not None
-    }
-    return by_source, by_runtime
-
-
 def _match(
     by_source: dict[tuple[int, str], ProxyNode],
     by_runtime: dict[str, ProxyNode],
     subscription_id: int,
     name: str,
 ) -> ProxyNode | None:
-    """把体检结果里的一个节点名定位到池账本行；定位不到返回 None。
+    """历史冷却迁移按旧节点名定位身份；定位不到返回 None。
 
     名称有两套口径，必须都试：体检给的是**订阅原名**，池账本的 runtime_name
     形如「订阅id|原名」。只按来源名匹配，会让「来源关联缺失但身份行在」或
     「体检内核报的是运行名」的结论全部落空——手动体检出健康节点却进不了池。
     """
     sub = int(subscription_id)
+    def owned(node: ProxyNode | None) -> bool:
+        return node is not None and (
+            node.subscription_id == sub
+            or (node.subscription_id is None and node.runtime_name.startswith(f"{sub}|"))
+        )
+
     for key in _name_keys(name):
         node = by_source.get((sub, key))
         if node is not None:
             return node
     for key in _name_keys(name):
         node = by_runtime.get(f"{sub}|{key}")
-        if node is not None:
+        if owned(node):
             return node
     node = by_runtime.get(name)
-    if node is not None:
+    if owned(node):
         return node
     # 名字可能带着池内前缀「订阅|原名」：拆出来按来源再试一次
     prefix, sep, rest = str(name or "").partition("|")
-    if sep and prefix.isdigit():
+    if sep and prefix == str(sub):
         for key in _name_keys(rest):
             node = by_source.get((int(prefix), key))
             if node is not None:
@@ -216,6 +199,7 @@ async def ingest_node_check(
     now: datetime,
     run_id: int | None = None,
     channel: str = "manual",
+    node_ids: dict[str, str],
 ) -> IngestionResult:
     """把一轮体检结果对齐进池账本。
 
@@ -224,7 +208,8 @@ async def ingest_node_check(
     Steam 有效响应推进业务健康；收到 HTTP 错误或无效业务正文只记为目标响应，
     不惩罚节点。只有 Steam 与出口身份探测都无法完成时才记节点传输失败。
     """
-    by_source, by_runtime = await _load_index(session)
+    nodes = (await session.execute(select(ProxyNode).where(ProxyNode.node_id.in_(node_ids.values())))).scalars()
+    by_id = {node.node_id: node for node in nodes}
     outcome = IngestionResult()
     code = subscription_code(subscription_id)
 
@@ -232,11 +217,11 @@ async def ingest_node_check(
         if row.get("probed") is False:
             continue
         name = str(row.get("name") or "")
-        node = _match(by_source, by_runtime, int(subscription_id), name)
+        node = by_id.get(node_ids.get(name))
         if node is None:
-            if name:
-                outcome.unmatched.append(name)
-            continue
+            raise ValueError("运行节点身份未登记，体检结果未落账")
+        if node.subscription_id not in (None, subscription_id):
+            raise ValueError("运行节点身份已归属其他订阅，体检结果未落账")
         outcome.matched += 1
         exit_ip = row.get("exitIp")
         latency_ms = row.get("ms")
@@ -261,6 +246,10 @@ async def ingest_node_check(
             if row.get("steamStatus") is None and not exit_ip:
                 if _apply_steam_failure(node, now=now):
                     outcome.deactivated += 1
+                tier = min(max(node.consecutive_failures or 1, 1), len(_FAIL_COOLDOWN_MINUTES)) - 1
+                node.cooldown_until = now + timedelta(minutes=_FAIL_COOLDOWN_MINUTES[tier])
+            else:
+                node.cooldown_until = None
             status = row.get("steamStatus")
             detail = (
                 CLASH_STEAM_TRANSPORT_DETAIL
@@ -288,6 +277,7 @@ async def ingest_node_check(
         state_changed, exit_added = _apply_success(
             node, exit_ip=exit_ip, latency_ms=latency_ms, now=now
         )
+        node.cooldown_until = None
         if state_changed:
             outcome.activated += 1
         if exit_added:
@@ -348,7 +338,7 @@ async def rebind_missing_sources(
         }
         have = set(
             await session.scalars(
-                select(ProxyNode.fingerprint).where(
+                select(ProxyNode.node_id).where(
                     ProxyNode.subscription_id == int(sub.id)
                 )
             )

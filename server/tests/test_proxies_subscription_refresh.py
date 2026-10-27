@@ -450,9 +450,6 @@ async def test_start_scheduler_registers_refresh_job(monkeypatch):
 
     monkeypatch.setattr(sched_mod.scheduler, "add_job", _fake_add_job)
     monkeypatch.setattr(sched_mod.scheduler, "start", lambda: None)
-    monkeypatch.setattr(sched_mod, "_anchor_probe_after_start", _noop)
-    monkeypatch.setattr(sched_mod, "_job_backup_catchup", _noop)
-    monkeypatch.setattr(sched_mod, "_job_bartervg_catchup", _noop)
 
     sched_mod.start_scheduler()
 

@@ -102,12 +102,7 @@ async def _add(state: str, runtime_name: str, *, server: str, name: str | None =
                 url="https://example.test/sub-1",
                 admission_status=ADMISSION_ACTIVE,
             ))
-        s.add(ProxyNode(
-            node_id=fp, fingerprint=fp, runtime_name=runtime_name,
-            proxy_type=str(cfg.get("type") or ""), server=cfg.get("server"),
-            normalized_config=cfg, state=state,
-            first_seen=NOW, last_seen=NOW, last_source_seen=NOW,
-        ))
+        s.add(ProxyNode(node_id=fp, runtime_name=runtime_name, proxy_type=str(cfg.get('type') or ''), server=cfg.get('server'), normalized_config=cfg, state=state, first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
         # 合格集口径含「至少一个当前来源」：直接登记的行也要给一条来源
         await s.execute(update(ProxyNode)
             .where(ProxyNode.node_id == fp)
@@ -181,18 +176,8 @@ def test_duplicate_runtime_name_fails_before_write() -> None:
     库里 `runtime_name` 已是唯一约束，正常情况下造不出重复——所以这一条直接
     打纯渲染层：它的作用是**不依赖数据库兜底**，让生成器自己先拦住。
     """
-    a = ProxyNode(
-        node_id="a" * 64, fingerprint="a" * 64, runtime_name="1|香港01",
-        proxy_type="ss", server="hk1.example.net",
-        normalized_config=_config(name="香港01", server="hk1.example.net"),
-        state=NODE_ACTIVE,
-    )
-    b = ProxyNode(
-        node_id="b" * 64, fingerprint="b" * 64, runtime_name="1|香港01",
-        proxy_type="ss", server="hk2.example.net",
-        normalized_config=_config(name="香港01", server="hk2.example.net"),
-        state=NODE_ACTIVE,
-    )
+    a = ProxyNode(node_id='a' * 64, runtime_name='1|香港01', proxy_type='ss', server='hk1.example.net', normalized_config=_config(name='香港01', server='hk1.example.net'), state=NODE_ACTIVE)
+    b = ProxyNode(node_id='b' * 64, runtime_name='1|香港01', proxy_type='ss', server='hk2.example.net', normalized_config=_config(name='香港01', server='hk2.example.net'), state=NODE_ACTIVE)
 
     with pytest.raises(PoolBuildError, match="重复"):
         render_pool([a, b])

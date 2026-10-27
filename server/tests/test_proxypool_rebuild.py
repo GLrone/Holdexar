@@ -107,10 +107,7 @@ async def _add(runtime_name: str, *, port: int, state: str = NODE_ACTIVE) -> Non
               "server": "127.0.0.1", "port": port}
     fp = node_fingerprint(config)
     async with get_session_factory()() as s:
-        s.add(ProxyNode(node_id=fp, fingerprint=fp, runtime_name=runtime_name,
-                        proxy_type="http", server="127.0.0.1",
-                        normalized_config=config, state=state,
-                        first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
+        s.add(ProxyNode(node_id=fp, runtime_name=runtime_name, proxy_type='http', server='127.0.0.1', normalized_config=config, state=state, first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
         await s.execute(update(ProxyNode)
             .where(ProxyNode.node_id == fp)
             .values(subscription_id=1, original_name="x"))

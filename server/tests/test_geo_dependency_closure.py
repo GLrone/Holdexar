@@ -107,12 +107,7 @@ async def _register(session, data_dir, sid, doc):
     ))
     for payload in doc["proxies"]:
         fp = node_fingerprint(payload, str(sid))
-        session.add(ProxyNode(
-            node_id=fp, fingerprint=fp, subscription_id=sid,
-            original_name=payload["name"], runtime_name=f"{sid}|{payload['name']}",
-            normalized_config=payload, proxy_type=payload["type"], server=payload["server"],
-            state="ACTIVE", first_seen=datetime.now(), last_seen=datetime.now(),
-        ))
+        session.add(ProxyNode(node_id=fp, subscription_id=sid, original_name=payload['name'], runtime_name=f"{sid}|{payload['name']}", normalized_config=payload, proxy_type=payload['type'], server=payload['server'], state='ACTIVE', first_seen=datetime.now(), last_seen=datetime.now()))
     await session.flush()
 
 
@@ -216,13 +211,7 @@ async def test_provider_snapshot_keeps_group_needed_by_expanded_node(source_dir)
         ))
         for payload in [*doc["proxies"], provider_node]:
             fp = node_fingerprint(payload, "1")
-            session.add(ProxyNode(
-                node_id=fp, fingerprint=fp, subscription_id=1,
-                original_name=payload["name"], runtime_name=f"1|{payload['name']}",
-                normalized_config=payload, proxy_type=payload["type"],
-                server=payload["server"], state="ACTIVE",
-                first_seen=datetime.now(), last_seen=datetime.now(),
-            ))
+            session.add(ProxyNode(node_id=fp, subscription_id=1, original_name=payload['name'], runtime_name=f"1|{payload['name']}", normalized_config=payload, proxy_type=payload['type'], server=payload['server'], state='ACTIVE', first_seen=datetime.now(), last_seen=datetime.now()))
         await session.commit()
 
         build = await build_pool(session, data_dir=source_dir)
@@ -271,13 +260,7 @@ async def test_provider_snapshot_expands_group_members_before_pool_render(source
         ))
         for payload in [doc["proxies"][0], expanded_provider_node]:
             fp = node_fingerprint(payload, "1")
-            session.add(ProxyNode(
-                node_id=fp, fingerprint=fp, subscription_id=1,
-                original_name=payload["name"], runtime_name=f"1|{payload['name']}",
-                normalized_config=payload, proxy_type=payload["type"],
-                server=payload["server"], state="ACTIVE",
-                first_seen=datetime.now(), last_seen=datetime.now(),
-            ))
+            session.add(ProxyNode(node_id=fp, subscription_id=1, original_name=payload['name'], runtime_name=f"1|{payload['name']}", normalized_config=payload, proxy_type=payload['type'], server=payload['server'], state='ACTIVE', first_seen=datetime.now(), last_seen=datetime.now()))
         await session.commit()
 
         build = await build_pool(session, data_dir=source_dir)

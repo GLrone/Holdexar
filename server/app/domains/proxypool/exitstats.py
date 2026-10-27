@@ -50,12 +50,12 @@ async def _writeback_production_evidence(
     from app.domains.proxypool.models import ProxyNode
     from app.domains.proxypool.state import evaluate_node_state
 
-    by_node: dict[str, dict] = {}
+    by_runtime: dict[str, dict] = {}
     for row in rows:
-        node_id = mapping.get(str(row.get("exit_ip") or ""))
-        if not node_id:
+        runtime_name = mapping.get(str(row.get("exit_ip") or ""))
+        if not runtime_name:
             continue
-        agg = by_node.setdefault(node_id, {"ok": 0, "noresp": 0})
+        agg = by_runtime.setdefault(runtime_name, {"ok": 0, "noresp": 0})
         if row.get("uncertain"):
             continue
         if _row_ok(row) > 0:
@@ -66,19 +66,21 @@ async def _writeback_production_evidence(
             + int(row.get("tunnel_error") or 0)
         ) > 0:
             agg["noresp"] += 1
-    if not by_node:
+    if not by_runtime:
         return
     environment_alive = any(_row_ok(row) > 0 for row in rows if not row.get("uncertain"))
+    # lane绑定提供运行名，节点指纹是另一种身份，不能拿运行名查node_id。
     node_rows = (await session.execute(
-        select(ProxyNode).where(ProxyNode.node_id.in_(by_node))
+        select(ProxyNode).where(ProxyNode.runtime_name.in_(by_runtime))
     )).scalars().all()
     # 仍归属订阅的节点才算「有来源」（归属是一对一的身份组成部分）
     sourced = {n.node_id for n in node_rows if n.subscription_id is not None}
     stamp = now or datetime.now()
     for node in node_rows:
-        agg = by_node[node.node_id]
+        agg = by_runtime[node.runtime_name]
         if agg["ok"] > 0:
             node.consecutive_failures = 0
+            node.cooldown_until = None
             node.state = evaluate_node_state(
                 node.state, source_seen=node.node_id in sourced,
                 probe_ok=True, consecutive_failures=0,
