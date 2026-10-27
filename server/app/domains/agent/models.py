@@ -7,11 +7,11 @@
 - `agent_runs` 是运行聚合投影：当前状态、起止时间、错误码由状态机
   跃迁入口（service.apply_transition）与事件同事务写入，绝不散落赋值。
   对话消息历史从事件派生，不建平行 message 表。
-- `agent_sessions` 是会话载体；context_snapshot / context_version /
-  context_updated_at 是上下文快照扩展点（完整 context manager 后续
-  接入），恢复不依赖「重放全部历史事件」。
+- `agent_sessions` 只承载执行会话身份与创建/更新时间；运行事件按 seq 分页读取。
+  模型对话上下文由 Pilot 文件会话持有，不在这里复制。
 
-保留策略：P1 不自动清理；session 删除级联删除其 runs 与 events
+保留策略：定时清理创建超过30天的 job 运行及其事件；task/fake 不定时清理。
+session 删除级联删除其 runs 与 events
 （FK ondelete=CASCADE，引擎侧 foreign_keys=ON）。状态枚举与合法迁移
 见 runtime/state.py，事件类型与 payload 边界见 runtime/events.py。
 """
@@ -26,17 +26,11 @@ from app.core.database import Base
 
 
 class AgentSession(Base):
-    """会话：跨运行的上下文载体。id 为服务端生成的 uuid4 hex。"""
+    """执行会话身份。id 为服务端生成的 uuid4 hex。"""
 
     __tablename__ = "agent_sessions"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    title: Mapped[str | None] = mapped_column(String(200))
-    # 上下文快照扩展点：快照内容 / 快照版本号 / 快照写入时刻。
-    # 空快照 = 会话仍以事件回放为唯一恢复路径。
-    context_snapshot: Mapped[dict | None] = mapped_column(JSON)
-    context_version: Mapped[int] = mapped_column(Integer, default=0)
-    context_updated_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime | None] = mapped_column(DateTime)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime)
 

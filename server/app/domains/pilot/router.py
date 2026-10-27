@@ -11,8 +11,6 @@ from fastapi.responses import StreamingResponse
 
 from app.core.logging import log_event
 
-logger = logging.getLogger(__name__)
-
 from . import attachments as pilot_attachments
 from . import config as pilot_config
 from . import llm as pilot_llm
@@ -32,6 +30,7 @@ from .schemas import (AskRequest, AskResponse, DetectRequest, DetectResponse,
                       ToolRunRequest, ToolRunResponse,
                       TestRequest, TestResponse)
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/pilot", tags=["pilot"])
 
 
@@ -321,7 +320,6 @@ async def delete_session(session_id: str) -> dict:
         raise HTTPException(status_code=404, detail="session not found")
     if result != "deleted":
         raise HTTPException(status_code=502, detail=result)
-    pilot_attachments.purge(session_id)
     return {"ok": True}
 
 

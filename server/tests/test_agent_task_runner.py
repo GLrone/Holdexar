@@ -1,42 +1,28 @@
-"""任务执行器语义测试：登记表 / 受理 / 采样 / 取消 / 接管 / 运行面 API。
-
-隔离口径与 test_agent_runtime 一致（独立 tmp SQLite + 真实 write_gate）。
-任务本体全部打桩——本文件证明的是「调度语义」，不触网、不动价格链。
-"""
+"""Price runs are read-only views of domain records, with exact live cancellation."""
 from __future__ import annotations
 
 import asyncio
-import time
+from datetime import datetime, timedelta
 
 import pytest
-import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import event
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy import event, func, select
 
-from app.core.database import Base
 from app.domains.agent import service as agent_service
 from app.domains.agent.models import AgentEvent, AgentRun, AgentSession
 from app.domains.agent.router import router as agent_router
-from app.domains.agent.runtime import events as ev
-from app.domains.agent.runtime import task_runner, tasks as task_registry
 from app.domains.agent.runtime.cancellation import REGISTRY
-from app.domains.agent.runtime.state import (
-    RUN_CANCELLED,
-    RUN_DONE,
-    RUN_FAILED,
-    RUN_RUNNING,
-)
-from app.domains.agent.runtime.tasks import TaskSpec
+from app.domains.crawl import service as crawl_service
+from app.domains.crawl.cycle import PriceCycle
+from app.domains.crawl.models import CrawlJob
 
 
 @pytest.fixture
 def db():
-    """完整库（隔离数据目录，外键与生产同开）；url 供重启模拟另开引擎。"""
-    from app.core.database import get_session_factory, get_settings
+    from app.core.database import get_session_factory
 
-    yield {"factory": get_session_factory(), "url": get_settings().db_url}
+    yield get_session_factory()
     for rid in REGISTRY.active_ids():
         entry = REGISTRY.pop(rid)
         if entry and entry.task and not entry.task.done():
@@ -44,363 +30,374 @@ def db():
 
 
 @pytest.fixture
-def fast_runner(monkeypatch):
-    """把采样节拍调到毫秒级：用例断言的是语义，不是真实等待。"""
-    monkeypatch.setattr(task_runner, "POLL_INTERVAL", 0.01)
-    monkeypatch.setattr(task_runner, "START_GRACE", 0.3)
+def client():
+    app = FastAPI()
+    app.include_router(agent_router, prefix="/api/v1")
+    return AsyncClient(transport=ASGITransport(app=app), base_url="http://t")
 
 
-@pytest.fixture
-def stub_kind(monkeypatch):
-    """注册一个可观察的桩任务，返回它的调用记录。"""
-    log: dict = {"start": 0, "stop": 0, "observations": 0}
-
-    def install(*, start=None, observe=None, stop=None) -> TaskSpec:
-        async def _start() -> dict:
-            log["start"] += 1
-            if start is not None:
-                return await start()
-            return {"total": 3}
-
-        async def _observe(ref: dict) -> dict:
-            log["observations"] += 1
-            return await observe(ref)
-
-        async def _stop() -> bool:
-            log["stop"] += 1
-            return True
-
-        spec = TaskSpec(
-            kind="stub", label="priceRefresh", start=_start, observe=_observe,
-            stop=_stop if stop is None else stop,
-        )
-        monkeypatch.setitem(task_registry._REGISTRY, "stub", spec)
-        return spec
-
-    install.log = log
-    return install
+async def seed(db, *rows):
+    async with db() as session:
+        session.add_all(rows)
+        await session.commit()
 
 
-async def wait_status(run_id: str, statuses: set[str], timeout: float = 5.0) -> dict:
-    deadline = time.monotonic() + timeout
-    run: dict | None = None
-    while time.monotonic() < deadline:
-        run = await agent_service.get_run(run_id)
-        if run and run["status"] in statuses:
-            return run
-        await asyncio.sleep(0.01)
-    raise AssertionError(f"timeout waiting for {statuses}, last={run}")
+async def counts(db):
+    async with db() as session:
+        return tuple([await session.scalar(select(func.count()).select_from(model))
+                      for model in (AgentSession, AgentRun, AgentEvent)])
 
 
-async def events_of(run_id: str) -> list[dict]:
-    return await agent_service.list_events(run_id)
-
-
-async def launch(kind: str = "stub", **meta) -> str:
-    created = await agent_service.create_run(
-        runner="task", meta={"task": kind, **meta},
+@pytest.mark.asyncio
+async def test_domain_projection_is_read_only_and_deduplicated(db, monkeypatch):
+    ts = datetime(2026, 1, 1)
+    await seed(db,
+        PriceCycle(id=1, kind="scheduled", status="partial", started_at=ts,
+                   batches_done=3, batches_expected=4, units_failed=2),
+        CrawlJob(id=1, kind="scheduled", status="done", cycle_id=1, started_at=ts),
+        CrawlJob(id=2, kind="repair", status="done", started_at=ts + timedelta(seconds=1),
+                 stats_json={"processed": 5, "total": 5, "failed": 3, "trigger": "manual"}),
     )
-    await agent_service.start_run(created["run_id"])
-    return created["run_id"]
+    legacy = await agent_service.create_run(runner="task", meta={"task": "price_refresh"})
+    await agent_service.create_run(runner="task", meta={"task": "retired_unknown"})
+    legacy_job = await agent_service.create_run(runner="job", meta={"task": "price_repair"})
+    await agent_service.append_event(legacy["run_id"], "task.progress", {"done": 1})
+    other = await agent_service.create_run(runner="job", meta={"job": "wallet_sync"})
+    before = await counts(db)
+    rows = await agent_service.list_runs()
+    assert {r["run_id"] for r in rows} == {"cycle:1", "crawl:2", other["run_id"]}
+    cycle = await agent_service.get_run("cycle:1")
+    assert cycle["session_id"] == "runtime" and cycle["runner"] == "task"
+    assert cycle["trigger"] == "scheduled" and cycle["status"] == "done"
+    assert cycle["meta"]["domainStatus"] == "partial"
+    assert cycle["meta"]["progress"] == {"done": 3, "total": 4, "failed": 2}
+    job = await agent_service.get_run("crawl:2")
+    assert job["status"] == "done" and job["trigger"] == "manual"
+    assert job["meta"]["progress"]["failed"] == 3
+    assert job["meta"]["task"] == "price_repair"
+    assert await agent_service.get_run("crawl:1") is None
+    assert await agent_service.list_events("cycle:1") == []
+    assert await agent_service.get_run(legacy_job["run_id"]) is not None
+    assert len(await agent_service.list_events(legacy["run_id"])) == 1
+    assert await counts(db) == before
 
 
-class TestRegistry:
-    def test_builtin_kinds_are_static_whitelist(self):
-        assert task_registry.TASK_KINDS == ("price_refresh", "price_repair")
-        assert task_registry.label_of("price_refresh") == "priceRefresh"
-        assert task_registry.label_of("price_repair") == "priceRepair"
-
-    def test_unknown_kind_is_not_registered(self):
-        assert task_registry.get("delete_everything") is None
-        # 未登记 kind 的标签回落到 kind 本身，不抛异常
-        assert task_registry.label_of("delete_everything") == "delete_everything"
-
-    def test_specs_have_start_and_observe(self):
-        for spec in task_registry.all_specs():
-            assert callable(spec.start) and callable(spec.observe)
-            assert spec.kind and spec.label
+@pytest.mark.asyncio
+@pytest.mark.parametrize("domain_status,expected", [
+    ("planning", "running"), ("repairing", "running"), ("finalizing", "running"),
+    ("completed", "done"), ("partial", "done"), ("failed", "failed"),
+    ("cancelled", "cancelled"), ("interrupted", "failed"), ("mystery", "failed"),
+])
+async def test_cycle_status_preserves_domain_verdict(db, domain_status, expected):
+    await seed(db, PriceCycle(id=1, kind="manual", status=domain_status))
+    row = await agent_service.get_run("cycle:1")
+    assert row["status"] == expected
+    assert row["meta"]["domainStatus"] == domain_status
+    assert [r["run_id"] for r in await agent_service.list_runs(status=expected)] == ["cycle:1"]
 
 
-class TestTaskLifecycle:
-    @pytest.mark.asyncio
-    async def test_progress_sampled_and_terminal_done(self, db, fast_runner, stub_kind):
-        state = {"n": 0}
-
-        async def observe(ref):
-            state["n"] += 1
-            if state["n"] >= 3:
-                return {"active": False, "phase": "idle", "done": 3, "total": 3}
-            return {"active": True, "phase": "running", "done": state["n"], "total": 3}
-
-        stub_kind(observe=observe)
-        run_id = await launch()
-        run = await wait_status(run_id, {RUN_DONE})
-        assert run["error_code"] is None
-        events = await events_of(run_id)
-        kinds = [e["event_type"] for e in events]
-        assert kinds[0] == ev.EV_RUN_STATE and kinds[-1] == ev.EV_RUN_FINISHED
-        assert ev.EV_TASK_STARTED in kinds
-        progress = [e for e in events if e["event_type"] == ev.EV_TASK_PROGRESS]
-        # 采样去重：进度变化才上账（不同 done 值 → 多条；重复值不重复记）
-        assert len(progress) >= 2
-        assert progress[-1]["payload"]["phase"] == "idle"
-        assert stub_kind.log["start"] == 1
-
-    @pytest.mark.asyncio
-    async def test_business_rejection_is_failed_not_retried(self, db, fast_runner, stub_kind):
-        async def boom():
-            raise RuntimeError("已有爬取任务在运行")
-
-        async def observe(ref):  # pragma: no cover - 拒绝路径不该进入观察
-            return {"active": False, "phase": "idle"}
-
-        stub_kind(start=boom, observe=observe)
-        run_id = await launch()
-        run = await wait_status(run_id, {RUN_FAILED})
-        assert run["error_code"] == "rejected"
-        events = await events_of(run_id)
-        failed = [e for e in events if e["event_type"] == ev.EV_TASK_FAILED]
-        assert failed and "已有爬取任务在运行" in failed[0]["payload"]["reason"]
-        # 拒绝即终态：没有再观察、没有任务启动事件
-        assert stub_kind.log["observations"] == 0
-        assert stub_kind.log["start"] == 1
-
-    @pytest.mark.asyncio
-    async def test_unknown_task_kind_fails(self, db, fast_runner):
-        run_id = await launch("no_such_task")
-        run = await wait_status(run_id, {RUN_FAILED})
-        assert run["error_code"] == "unknown_task"
-
-    @pytest.mark.asyncio
-    async def test_cancel_requests_domain_stop_and_converges(
-        self, db, fast_runner, stub_kind
-    ):
-        async def observe(ref):
-            return {"active": True, "phase": "running", "done": 1, "total": 9}
-
-        stub_kind(observe=observe)
-        run_id = await launch()
-        await wait_status(run_id, {RUN_RUNNING})
-        res = await agent_service.cancel_run(run_id, reason="user")
-        assert res["accepted"] is True
-        run = await wait_status(run_id, {RUN_CANCELLED})
-        assert run["status"] == RUN_CANCELLED
-        assert stub_kind.log["stop"] == 1
-        events = await events_of(run_id)
-        assert ev.EV_CANCEL_REQUESTED in [e["event_type"] for e in events]
-
-    @pytest.mark.asyncio
-    async def test_adopted_run_does_not_restart_domain_task(
-        self, db, fast_runner, stub_kind
-    ):
-        state = {"n": 0}
-
-        async def observe(ref):
-            state["n"] += 1
-            return {"active": state["n"] < 2, "phase": "running" if state["n"] < 2 else "idle"}
-
-        stub_kind(start=observe, observe=observe)
-        run_id = await launch(adopted=True, ref={"total": 5})
-        await wait_status(run_id, {RUN_DONE})
-        # 受理已在调用方完成 → 执行器不得重复发起
-        assert stub_kind.log["start"] == 0
-
-    @pytest.mark.asyncio
-    async def test_observe_failure_is_fail_soft(self, db, fast_runner, stub_kind):
-        state = {"n": 0}
-
-        async def observe(ref):
-            state["n"] += 1
-            if state["n"] == 1:
-                raise RuntimeError("库抖了一下")
-            return {"active": state["n"] < 4, "phase": "running" if state["n"] < 4 else "idle"}
-
-        stub_kind(observe=observe)
-        run_id = await launch()
-        run = await wait_status(run_id, {RUN_DONE})
-        assert run["status"] == RUN_DONE
+@pytest.mark.asyncio
+@pytest.mark.parametrize("domain_status,expected", [
+    ("pending", "queued"), ("running", "running"), ("done", "done"),
+    ("failed", "failed"), ("stopped", "cancelled"), ("interrupted", "failed"),
+])
+async def test_job_status_and_unknown_source(db, domain_status, expected):
+    await seed(db, CrawlJob(id=1, kind="manual", status=domain_status))
+    row = await agent_service.get_run("crawl:1")
+    assert row["status"] == expected and row["trigger"] == "unknown"
+    assert row["meta"].get("task") != "price_repair"
+    assert row["meta"]["cancellable"] is False
 
 
-class TestAgentApi:
-    @pytest.mark.asyncio
-    async def test_task_catalog_endpoint(self, db):
-        app = FastAPI()
-        app.include_router(agent_router, prefix="/api/v1")
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
-            r = await c.get("/api/v1/agent/tasks")
-        assert r.status_code == 200
-        kinds = [i["kind"] for i in r.json()]
-        assert kinds == ["price_refresh", "price_repair"]
-
-    @pytest.mark.asyncio
-    async def test_create_run_rejects_unknown_task_kind(self, db):
-        app = FastAPI()
-        app.include_router(agent_router, prefix="/api/v1")
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
-            bad = await c.post("/api/v1/agent/runs",
-                               json={"runner": "task", "task": "rm_rf"})
-            assert bad.status_code == 422
-            ok = await c.post("/api/v1/agent/runs", json={"runner": "fake", "steps": 1})
-            assert ok.status_code == 200
-            listed = await c.get("/api/v1/agent/runs")
-        assert listed.status_code == 200
-        items = listed.json()["items"]
-        assert any(i["runner"] == "fake" for i in items)
-
-    @pytest.mark.asyncio
-    async def test_list_runs_filters_by_status(self, db):
-        created = await agent_service.create_run(runner="fake", meta={"steps": 1})
-        rows = await agent_service.list_runs(limit=5)
-        assert any(r["run_id"] == created["run_id"] for r in rows)
-        assert await agent_service.list_runs(status="done", limit=5) == []
+@pytest.mark.asyncio
+async def test_filter_before_limit_and_stable_merged_order(db):
+    ts = datetime(2026, 1, 1)
+    await seed(db,
+        *[PriceCycle(id=i, kind="manual", status="completed", started_at=ts)
+          for i in range(1, 15)],
+        PriceCycle(id=20, kind="manual", status="running", started_at=ts - timedelta(days=1)),
+        CrawlJob(id=1, kind="repair", status="running", started_at=ts),
+        CrawlJob(id=2, kind="manual", status="done", started_at=ts + timedelta(days=1)),
+    )
+    fake = await agent_service.create_run()
+    assert [r["run_id"] for r in await agent_service.list_runs(status="running", limit=2)] == ["crawl:1", "cycle:20"]
+    assert [r["run_id"] for r in await agent_service.list_runs(status="done", limit=3)] == ["crawl:2", "cycle:9", "cycle:8"]
+    assert (await agent_service.list_runs(limit=1))[0]["run_id"] == fake["run_id"]
 
 
-class TestPilotDispatch:
-    """pilot 第三层权限：调度只经登记表，不获得写数据能力。"""
+@pytest.mark.asyncio
+async def test_read_queries_are_bounded_and_never_write(db):
+    await seed(db, *[PriceCycle(id=i, kind="manual", status="running") for i in range(1, 16)])
+    statements = []
+    engine = db.kw["bind"].sync_engine
+    def observe(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+    event.listen(engine, "before_cursor_execute", observe)
+    try:
+        assert len(await agent_service.list_runs(limit=15)) == 15
+    finally:
+        event.remove(engine, "before_cursor_execute", observe)
+    assert len(statements) <= 3
+    assert all(sql.lstrip().upper().startswith("SELECT") for sql in statements)
 
-    @pytest.mark.asyncio
-    async def test_start_task_admits_then_creates_run(
-        self, db, fast_runner, stub_kind
-    ):
-        from app.domains.pilot import tools as pilot_tools
 
-        state = {"n": 0}
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run_id", ["cycle:0", "cycle:-1", "cycle:01", "crawl:1x", "crawl:999", "cycle:999"])
+async def test_missing_or_invalid_exact_domain_id(db, run_id):
+    await seed(db, PriceCycle(id=1, kind="manual", status="failed"))
+    assert await agent_service.get_run(run_id) is None
 
-        async def observe(ref):
-            state["n"] += 1
-            return {"active": state["n"] < 2, "phase": "running" if state["n"] < 2 else "idle",
-                    "done": state["n"], "total": 3}
 
-        async def _ok():
-            return {"total": 3}
-
-        stub_kind(start=_ok, observe=observe)
-        result = await pilot_tools.execute_tool("start_task", {"kind": "stub"})
-        assert result["kind"] == "rows" and result["titleKey"] == "tasks"
-        row = result["rows"][0]
-        assert row["kindKey"] == "pilot.task.priceRefresh"
-        assert row["vKey"] in ("taskRunning", "taskDone")
-        assert stub_kind.log["start"] == 1  # 受理在本次调用内完成
-        runs = [r for r in await agent_service.list_runs(limit=5) if r["runner"] == "task"]
-        assert len(runs) == 1 and runs[0]["meta"]["adopted"] is True
-
-    @pytest.mark.asyncio
-    async def test_start_task_busy_does_not_create_run(self, db, fast_runner, stub_kind):
-        from app.domains.pilot import tools as pilot_tools
-
-        async def busy():
-            raise RuntimeError("已有爬取任务在运行")
-
-        async def observe(ref):  # pragma: no cover
-            return {"active": False, "phase": "idle"}
-
-        stub_kind(start=busy, observe=observe)
-        result = await pilot_tools.execute_tool("start_task", {"kind": "stub"})
-        row = result["rows"][0]
-        assert row["vKey"] == "taskBusy" and row["tone"] == "warn"
-        assert await agent_service.list_runs(limit=5) == []
-
-    @pytest.mark.asyncio
-    async def test_start_task_unknown_kind_is_rejected(self, db):
-        from app.domains.pilot import tools as pilot_tools
-
-        result = await pilot_tools.execute_tool("start_task", {"kind": "rm_rf"})
-        assert result["rows"][0]["vKey"] == "taskUnknown"
-
-    @pytest.mark.asyncio
-    async def test_list_and_cancel_task(self, db, fast_runner, stub_kind):
-        from app.domains.pilot import tools as pilot_tools
-
-        async def observe(ref):
-            return {"active": True, "phase": "running", "done": 1, "total": 4}
-
-        async def _ok2():
-            return {"total": 4}
-
-        stub_kind(start=_ok2, observe=observe)
-        await pilot_tools.execute_tool("start_task", {"kind": "stub"})
-        run = (await agent_service.list_runs(limit=5))[0]
-        await wait_status(run["run_id"], {RUN_RUNNING})  # 执行器已接管再查投影
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:  # 等首次进度采样落账
-            if await agent_service.latest_progress(run["run_id"]):
+@pytest.mark.asyncio
+async def test_task_api_retired_and_fake_preserved(db, client):
+    async with client:
+        catalog = await client.get("/api/v1/agent/tasks")
+        assert catalog.json() == [{"kind": "price_refresh", "label": "priceRefresh"},
+                                  {"kind": "price_repair", "label": "priceRepair"},
+                                  {"kind": "price_missing", "label": "priceMissing"},
+                                  {"kind": "dev_pytest", "label": "devPytest"}]
+        before = await counts(db)
+        for kind in ("price_refresh", "rm_rf"):
+            response = await client.post("/api/v1/agent/runs", json={"runner": "task", "task": kind})
+            assert response.status_code == 410
+        assert await counts(db) == before
+        response = await client.post("/api/v1/agent/runs", json={"runner": "fake", "steps": 1})
+        assert response.status_code == 200
+        for _ in range(100):
+            run = await agent_service.get_run(response.json()["run_id"])
+            if run["status"] == "done":
                 break
-            await asyncio.sleep(0.01)
-        listed = await pilot_tools.execute_tool("list_tasks", {})
-        assert listed["titleKey"] == "tasks"
-        assert listed["total"] == 1
-        assert listed["rows"][0]["vKey"] == "taskRunning"
-        assert listed["rows"][0]["v"] == "1/4"
-        cancelled = await pilot_tools.execute_tool("cancel_task", {"kind": "stub"})
-        assert cancelled["rows"][0]["vKey"] == "taskCancelled"
-        final = await wait_status(run["run_id"], {RUN_CANCELLED})
-        assert final["status"] == RUN_CANCELLED
-
-    @pytest.mark.asyncio
-    async def test_cancel_without_running_task(self, db):
-        from app.domains.pilot import tools as pilot_tools
-
-        result = await pilot_tools.execute_tool("cancel_task", {})
-        assert result["rows"][0]["vKey"] == "taskNoRunning"
+            await asyncio.sleep(.01)
+        assert run["status"] == "done"
 
 
-class TestDomainOutcomeMapping:
-    """域终态 → run 终态投影：run 记调度事实，业务结论按映射收口。"""
+@pytest.mark.asyncio
+async def test_domain_events_api_and_missing(db, client):
+    await seed(db, PriceCycle(id=1, kind="manual", status="completed"))
+    async with client:
+        assert (await client.get("/api/v1/agent/runs/cycle:1/events")).json()["items"] == []
+        assert (await client.get("/api/v1/agent/runs/cycle:2")).status_code == 404
 
-    @staticmethod
-    def _sequenced_observations(stub_kind, sequence):
-        remaining = list(sequence)
 
-        async def _observe(ref):
-            return remaining.pop(0) if remaining else {
-                "active": False, "phase": "idle",
-            }
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["cycle", "crawl"])
+async def test_exact_cancel_first_only_no_agent_writes(db, monkeypatch, kind):
+    await seed(db, PriceCycle(id=1, kind="manual", status="running"),
+               CrawlJob(id=2, kind="repair", status="running"))
+    monkeypatch.setattr(crawl_service, "active_cycle_id", lambda: 1, raising=False)
+    monkeypatch.setattr(crawl_service, "active_job_id", lambda: 2)
+    calls = []
+    async def stop(*args, **kwargs):
+        calls.append((args, kwargs))
+        return len(calls) == 1
+    monkeypatch.setattr(crawl_service, "stop_job", stop)
+    rid = "cycle:1" if kind == "cycle" else "crawl:2"
+    assert (await agent_service.get_run(rid))["meta"]["cancellable"] is True
+    before = await counts(db)
+    assert await agent_service.cancel_run(rid) == {"accepted": True, "status": "running"}
+    assert await agent_service.cancel_run(rid) == {"accepted": False, "status": "running"}
+    expected = ((), {"cycle_id": 1, "whole_chain": True}) if kind == "cycle" else ((2,), {"whole_chain": False})
+    assert calls == [expected, expected]
+    assert await counts(db) == before
 
-        stub_kind(observe=_observe)
 
-    @pytest.mark.asyncio
-    async def test_domain_failed_outcome_fails_run(self, db, fast_runner, stub_kind):
-        self._sequenced_observations(stub_kind, [
-            {"active": True, "phase": "running", "done": 1, "total": 3},
-            {"active": False, "phase": "idle", "outcome": "failed"},
-        ])
-        rid = await launch()
-        run = await wait_status(rid, {"failed"})
-        assert run["error_code"] == "domain_failed"
-        events = await events_of(rid)
-        assert any(
-            e["event_type"] == "task.failed" and e["payload"]["reason"] == "domain_status=failed"
-            for e in events
-        )
+@pytest.mark.asyncio
+async def test_cancel_mismatch_and_unsupported_return_conflict(db, monkeypatch, client):
+    await seed(db, PriceCycle(id=1, kind="manual", status="running"),
+               CrawlJob(id=2, kind="repair", status="running"))
+    monkeypatch.setattr(crawl_service, "active_cycle_id", lambda: 9, raising=False)
+    monkeypatch.setattr(crawl_service, "active_job_id", lambda: 9)
+    async def never(*args, **kwargs):
+        pytest.fail("must not stop a different live run")
+    monkeypatch.setattr(crawl_service, "stop_job", never)
+    legacy = await agent_service.create_run(runner="task", meta={"task": "price_refresh"})
+    job = await agent_service.create_run(runner="job", meta={"job": "wallet_sync"})
+    before = await counts(db)
+    async with client:
+        for rid in ("cycle:1", "crawl:2", legacy["run_id"], job["run_id"]):
+            response = await client.post(f"/api/v1/agent/runs/{rid}/cancel", json={})
+            assert response.status_code == 409
+    assert await counts(db) == before
+    assert (await agent_service.get_run(legacy["run_id"]))["status"] == "queued"
 
-    @pytest.mark.asyncio
-    async def test_domain_cancelled_outcome(self, db, fast_runner, stub_kind):
-        self._sequenced_observations(stub_kind, [
-            {"active": True, "phase": "running", "done": 1, "total": 3},
-            {"active": False, "phase": "idle", "outcome": "stopped"},
-        ])
-        rid = await launch()
-        run = await wait_status(rid, {"cancelled"})
-        assert run["error_code"] is None  # 域侧停止不是用户取消，无错误码语义混入
 
-    @pytest.mark.asyncio
-    async def test_partial_domain_outcome_maps_to_done(self, db, fast_runner, stub_kind):
-        """partial（部分成功）的业务细节归 price_cycles，run 收 done。"""
-        self._sequenced_observations(stub_kind, [
-            {"active": True, "phase": "running", "done": 2, "total": 3},
-            {"active": False, "phase": "idle", "outcome": "partial"},
-        ])
-        rid = await launch()
-        await wait_status(rid, {"done"})
+@pytest.mark.asyncio
+async def test_terminal_cancel_noop_and_old_runner_never_starts_fake(db):
+    await seed(db, PriceCycle(id=1, kind="manual", status="partial"))
+    assert await agent_service.cancel_run("cycle:1") == {"accepted": False, "status": "done"}
+    for runner in ("task", "job"):
+        created = await agent_service.create_run(runner=runner)
+        with pytest.raises(ValueError):
+            await agent_service.start_run(created["run_id"])
+        assert REGISTRY.token_of(created["run_id"]) is None
 
-    @pytest.mark.asyncio
-    async def test_outcome_ignored_without_observed_activity(self, db, fast_runner, stub_kind):
-        """没观察到活动（域对象未认领）→ 不下业务结论，done（error_code 空）。"""
-        self._sequenced_observations(stub_kind, [
-            {"active": False, "phase": "idle", "outcome": "failed"},
-        ])
-        rid = await launch()
-        run = await wait_status(rid, {"done"})
-        assert run["error_code"] is None
-        events = await events_of(rid)
-        assert not any(e["event_type"] == "task.failed" for e in events)
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind,source,rid", [("price_refresh", "start_full_queue", "cycle:7"),
+                                           ("price_repair", "start_job", "crawl:8")])
+async def test_pilot_starts_domain_directly_without_mirror(db, monkeypatch, kind, source, rid):
+    from app.domains.agent.tools.builtin import runtime_tools
+    calls = []
+    async def start(**kwargs):
+        calls.append(kwargs)
+        return {"cycleId": 7, "total": 3} if source == "start_full_queue" else {"id": 8, "count": 3}
+    monkeypatch.setattr(crawl_service, source, start)
+    if source == "start_full_queue":
+        await seed(db, PriceCycle(id=7, kind="manual", status="running"))
+    else:
+        await seed(db, CrawlJob(id=8, kind="repair", status="running"))
+    before = await counts(db)
+    result = await runtime_tools.start_task(kind)
+    assert result["kind"] == "rows" and result["rows"][0]["run_id"] == rid
+    assert result["rows"][0]["vKey"] == "taskRunning"
+    assert calls == ([{}] if source == "start_full_queue" else [{"scope": "appids", "kind": "repair", "missing_cooldown": 0, "trigger": "manual"}])
+    assert await counts(db) == before
+
+
+@pytest.mark.asyncio
+async def test_pilot_busy_unknown_and_no_running_remain_explicit(db, monkeypatch):
+    from app.domains.agent.tools.builtin import runtime_tools
+    async def busy():
+        raise RuntimeError("busy")
+    monkeypatch.setattr(crawl_service, "start_full_queue", busy)
+    assert (await runtime_tools.start_task("price_refresh"))["rows"][0]["vKey"] == "taskBusy"
+    assert (await runtime_tools.start_task("rm_rf"))["rows"][0]["vKey"] == "taskUnknown"
+    assert (await runtime_tools.cancel_task())["rows"][0]["vKey"] == "taskNoRunning"
+    assert await counts(db) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_pilot_lists_whitelisted_tasks_and_requests_stop(db, monkeypatch):
+    from app.domains.agent.tools.builtin import runtime_tools
+    await seed(db, PriceCycle(id=1, kind="manual", status="running", batches_done=1, batches_expected=4),
+               CrawlJob(id=2, kind="manual", status="running"))
+    monkeypatch.setattr(crawl_service, "active_cycle_id", lambda: 1, raising=False)
+    async def stop(**kwargs):
+        return True
+    monkeypatch.setattr(crawl_service, "stop_job", stop)
+    listed = await runtime_tools.list_tasks()
+    assert listed["total"] == 1 and listed["rows"][0]["v"] == "1/4"
+    result = await runtime_tools.cancel_task(run_id="cycle:1")
+    assert result["rows"][0]["vKey"] == "taskStopRequested"
+    assert (await agent_service.get_run("cycle:1"))["status"] == "running"
+    assert await counts(db) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_run_progress_does_not_copy_frozen_targets(db):
+    await seed(db, CrawlJob(id=1, kind="repair", status="running", stats_json={
+        "total": 100, "processed": 10, "success": 8, "failed": 2,
+        "trigger": "manual", "targets": {"appids": list(range(1000))},
+        "targetStartedAt": "2026-01-01T00:00:00",
+    }))
+    row = await agent_service.get_run("crawl:1")
+    assert row["meta"]["progress"] == {"done": 10, "total": 100, "success": 8, "failed": 2}
+    assert "targets" not in (await agent_service.list_runs())[0]["meta"]["progress"]
+
+
+@pytest.mark.asyncio
+async def test_pilot_missing_accepted_record_is_an_error(db, monkeypatch):
+    from app.domains.agent.tools.builtin import runtime_tools
+    async def missing():
+        return {"cycleId": 123}
+    monkeypatch.setattr(crawl_service, "start_full_queue", missing)
+    with pytest.raises(LookupError):
+        await runtime_tools.start_task("price_refresh")
+    assert await counts(db) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_cancel_returns_current_domain_status(db, monkeypatch):
+    await seed(db, CrawlJob(id=1, kind="repair", status="running"))
+    monkeypatch.setattr(crawl_service, "active_job_id", lambda: 1)
+    async def stop(*args, **kwargs):
+        async with db() as session:
+            row = await session.get(CrawlJob, 1)
+            row.status = "stopped"
+            await session.commit()
+        return True
+    monkeypatch.setattr(crawl_service, "stop_job", stop)
+    assert await agent_service.cancel_run("crawl:1") == {"accepted": True, "status": "cancelled"}
+
+
+@pytest.mark.asyncio
+async def test_single_game_tool_records_manual_source(db, monkeypatch):
+    from app.domains.agent.tools.builtin import system
+    seen = []
+    async def start(**kwargs):
+        seen.append(kwargs)
+        return {"id": 1}
+    monkeypatch.setattr(crawl_service, "start_job", start)
+    await system.refresh_game_price(42)
+    assert seen == [{"scope": "appids", "appids": [42], "kind": "manual", "trigger": "manual"}]
+
+
+@pytest.mark.asyncio
+async def test_pilot_filters_price_tasks_before_limit(db, monkeypatch):
+    from app.domains.agent.tools.builtin import runtime_tools
+    ts = datetime(2026, 1, 1)
+    await seed(db, AgentSession(id="bulk", created_at=ts, updated_at=ts))
+    await seed(db, PriceCycle(id=1, kind="manual", status="running", started_at=ts),
+               CrawlJob(id=1, kind="repair", status="running", started_at=ts),
+               *[CrawlJob(id=i + 2, kind="manual", status="done", started_at=ts + timedelta(days=1))
+                 for i in range(105)],
+               *[AgentRun(id=f"bulk{i}", session_id="bulk", runner="job", status="done",
+                          created_at=ts + timedelta(days=2), meta={"job": "wallet_sync"})
+                 for i in range(105)])
+    monkeypatch.setattr(crawl_service, "active_cycle_id", lambda: 1)
+    monkeypatch.setattr(crawl_service, "active_job_id", lambda: 1)
+    listed = await runtime_tools.list_tasks()
+    assert listed["total"] == 2
+    assert {row["run_id"] for row in listed["rows"]} == {"cycle:1", "crawl:1"}
+    calls = []
+    async def stop(**kwargs):
+        calls.append(kwargs)
+        return True
+    monkeypatch.setattr(crawl_service, "stop_job", stop)
+    assert (await runtime_tools.cancel_task(kind="price_refresh"))["rows"][0]["vKey"] == "taskStopRequested"
+    assert calls == [{"cycle_id": 1, "whole_chain": True}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run_id", ["cycle:9223372036854775808", "crawl:" + "9" * 100])
+async def test_oversized_domain_id_is_not_found(db, client, run_id):
+    assert await agent_service.get_run(run_id) is None
+    async with client:
+        assert (await client.get(f"/api/v1/agent/runs/{run_id}")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_catalog_ingest_tool_records_manual_source(db, monkeypatch):
+    from app.domains.agent.tools.builtin import catalog
+    seen = []
+    async def imported(appids):
+        return {"results": [{"appid": appid, "status": "ok"} for appid in appids]}
+    async def start(**kwargs):
+        seen.append(kwargs)
+        return {"id": 1}
+    monkeypatch.setattr(crawl_service, "import_appids", imported)
+    monkeypatch.setattr(crawl_service, "start_job", start)
+    await catalog.ingest_appids([42])
+    assert seen == [{"scope": "appids", "appids": [42], "kind": "import", "trigger": "manual"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind,params,expected", [
+    ("price_repair", {"regions": ["US"], "appids": [12], "cooldown_minutes": 7},
+     {"scope": "appids", "kind": "repair", "regions": ["US"], "appids": [12], "missing_cooldown": 7, "trigger": "manual"}),
+    ("price_missing", {}, {"scope": "appids", "kind": "missing", "trigger": "manual"}),
+])
+async def test_parameterized_price_actions_keep_domain_identity_without_mirrors(db, monkeypatch, kind, params, expected):
+    from app.domains.agent.tools.builtin import runtime_tools
+    calls = []
+    async def start(**kwargs):
+        calls.append(kwargs)
+        return {"id": 29}
+    monkeypatch.setattr(crawl_service, "start_job", start)
+    await seed(db, CrawlJob(id=29, kind=expected["kind"], status="running"))
+    before = await counts(db)
+    result = await runtime_tools.start_task(kind, params)
+    assert calls == [expected]
+    assert result["rows"][0]["run_id"] == "crawl:29"
+    assert result["rows"][0]["taskKind"] == kind
+    assert await counts(db) == before

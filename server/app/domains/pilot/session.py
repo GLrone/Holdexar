@@ -220,19 +220,25 @@ class SessionStore:
                 log_event(logger, f"会话 {sid} 飞轮记录清理失败，已保留会话",
                           level=logging.WARNING, detail={"会话": sid})
                 return "cleanup_failed"
-            try:
-                path.unlink()
-            except OSError as e:
-                log_event(
-                    logger,
-                    f"会话 {sid} 删除失败",
-                    level=logging.WARNING,
-                    detail={"会话": sid, "原因": repr(e)},
-                )
-                return "delete_failed"
-            self._cache.pop(sid, None)
-            self._list_cache.pop(sid, None)
-            return "deleted"
+            return self._delete_files(sid)
+
+    def _delete_files(self, sid: str) -> str:
+        from app.domains.pilot import attachments
+
+        try:
+            self._path(sid).unlink()
+        except OSError as e:
+            log_event(logger, f"会话 {sid} 删除失败", level=logging.WARNING,
+                      detail={"会话": sid, "原因": repr(e)})
+            return "delete_failed"
+        self._cache.pop(sid, None)
+        self._list_cache.pop(sid, None)
+        try:
+            attachments.purge(sid, sessions_base=self.base)
+        except OSError as e:
+            log_event(logger, f"会话 {sid} 已删除，附件清理未完成",
+                      level=logging.WARNING, detail={"会话": sid, "原因": repr(e)})
+        return "deleted"
 
     async def delete(self, sid: str) -> bool:
         """删除会话与其飞轮影子记录、派生训练文件，并逐出缓存。"""
@@ -512,16 +518,11 @@ class SessionStore:
         except OSError:
             return
         expired = files[: max(0, len(files) - SESSION_MAX_FILES)]
-        for path in expired:
-            sid = path.stem
-            if valid_sid(sid) and not pilot_flywheel.purge_session(self.base, sid):
-                log_event(logger, f"旧会话 {sid} 飞轮记录清理失败，已保留会话",
-                          level=logging.WARNING, detail={"会话": sid})
-                continue
-            try:
-                path.unlink()
-            except OSError:
-                pass
+        targets = {path.stem for path in expired if valid_sid(path.stem)}
+        if not pilot_flywheel.purge_sessions(self.base, targets):
+            return
+        for sid in targets:
+            self._delete_files(sid)
 
     # ── 路径与缓存 ────────────────────────────────────────────────────
 

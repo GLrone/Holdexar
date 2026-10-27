@@ -1,16 +1,10 @@
-"""Agent Runtime 路由：运行面（创建 / 查询 / 列表 / 事件回放 / 取消）。
-
-执行器两类：fake（Runtime 骨架自证）与 task（登记表内的真实长任务）。
-错误口径：NotFound → 404；LookupError/非法迁移 → 400/409 由端点翻译；
-服务端异常 → 502（与既有域一致）。
-"""
+"""Agent run queries, historical replay and exact cancellation."""
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
 from . import memory as agent_memory
 from . import service
-from .runtime import tasks as task_registry
 from .runtime.state import IllegalRunTransition
 from .schemas import (
     AgentCancelRequest,
@@ -34,18 +28,16 @@ _FAKE_SCENARIOS = ("success", "failure")
 
 @router.get("/tasks")
 async def list_tasks() -> list[AgentTaskItem]:
-    """可调度的任务形态（登记表静态白名单，顺序即登记顺序）。"""
+    """两种价格动作的固定名称。"""
     return [
-        AgentTaskItem(kind=s.kind, label=s.label) for s in task_registry.all_specs()
+        AgentTaskItem(kind=kind, label=label) for kind, label in service.TASK_LABELS.items()
     ]
 
 
 @router.post("/runs")
 async def create_run(payload: AgentRunCreate) -> AgentRunCreated:
     if payload.runner == "task":
-        if not payload.task or task_registry.get(payload.task) is None:
-            raise HTTPException(status_code=422, detail="unknown task kind")
-        meta = {"task": payload.task, "ref": payload.ref}
+        raise HTTPException(status_code=410, detail="start price work through the crawl domain")
     else:
         if payload.scenario not in _FAKE_SCENARIOS:
             raise HTTPException(status_code=422, detail="unknown scenario")
@@ -104,6 +96,8 @@ async def cancel_run(run_id: str, payload: AgentCancelRequest) -> AgentCancelRes
         result = await service.cancel_run(run_id, reason=payload.reason)
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
+    except service.RunCancellationUnavailable as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(e)) from e
     return AgentCancelResult(**result)
@@ -143,4 +137,3 @@ async def clear_memories(category: str | None = None) -> dict:
     """清空长期记忆。"""
     count = await agent_memory.clear_memories(category=category)
     return {"ok": True, "count": count}
-

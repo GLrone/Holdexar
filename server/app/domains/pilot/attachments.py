@@ -240,22 +240,19 @@ def list_of(sid: str) -> list[dict]:
     return out
 
 
-def purge(sid: str) -> int:
+def purge(sid: str, *, sessions_base: Path | None = None) -> int:
     """清理某会话的全部附件（删除会话时调用）；返回删除的文件数。"""
-    directory = _sid_dir(sid)
+    root = sessions_base.parent / "attachments" if sessions_base is not None else base_dir()
+    directory = root / sid if pilot_session.valid_sid(sid) else None
     if directory is None or not directory.is_dir():
         return 0
+    if directory.resolve().parent != root.resolve():
+        raise OSError("附件目录超出会话资源范围")
     removed = 0
     for path in list(directory.glob("*")):
-        try:
-            path.unlink()
-            removed += 1
-        except OSError:
-            continue
-    try:
-        directory.rmdir()
-    except OSError:
-        pass
+        path.unlink()
+        removed += 1
+    directory.rmdir()
     return removed
 
 

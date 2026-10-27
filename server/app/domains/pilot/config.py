@@ -10,8 +10,7 @@
 - pilot.ctx.tool_content_limit 历史轮工具结果保留预算（字符；头尾保留、中段省略）
 - pilot.usage.<YYYYMM>         当月已用 token 累计（用量台账，跨月自然换键）
 
-存量单配置（pilot.llm.protocol/base_url/models/api_key）在账本键缺失时
-幂等迁移为一条「默认接入」供应商，密钥随迁；load_config 输出保持平面
+存量单配置由数据库升级一次迁入供应商账本并清源；load_config 输出保持平面
 形态（protocol/base_url/api_key/model/models 解析自活跃供应商），消费方无感。
 协议：openai（兼容生态）/ openai-responses / anthropic / ollama。
 """
@@ -19,6 +18,7 @@ from __future__ import annotations
 
 from uuid import uuid4
 
+from app.core.database import WritePriority, write_gate
 from app.crawler.utils import get_beijing_time_obj
 from app.domains.pilot import llm as pilot_llm
 from app.domains.pilot import model_windows as MODEL_WINDOWS
@@ -29,16 +29,10 @@ DEFAULT_MONTHLY_CAP = 0
 _LEGACY_DEFAULT_CAP = 500_000
 
 _ENABLED_KEY = "pilot.llm.enabled"
-_PROTOCOL_KEY = "pilot.llm.protocol"
-_BASE_URL_KEY = "pilot.llm.base_url"
 _MODEL_KEY = "pilot.llm.model"
-_MODELS_KEY = "pilot.llm.models"
-_MODELS_DISABLED_KEY = "pilot.llm.models_disabled"
-_API_KEY_KEY = "pilot.llm.api_key"
 _CAP_KEY = "pilot.llm.monthly_cap"
 _PROVIDERS_KEY = "pilot.llm.providers"
 _ACTIVE_KEY = "pilot.llm.active"
-_CONTEXT_WINDOW_KEY = "pilot.llm.context_window"
 # 窗口上限：防手滑填爆（1M 级窗口已覆盖现役模型；未知填 0/清空即回落固定预算）
 _CONTEXT_WINDOW_MAX = 2_000_000
 
@@ -114,35 +108,10 @@ def _usage_key() -> str:
 
 
 async def load_providers() -> list[dict]:
-    """供应商账本（含存量单配置幂等迁移；返回体不带密钥原文，带 has_key）。"""
-    raw = await settings_service.get_value(_PROVIDERS_KEY, None)
-    if isinstance(raw, list) and raw:
-        providers = [_clean_provider(r) for r in raw if isinstance(r, dict)]
-    else:
-        providers = await _migrate_legacy_provider()
+    """读取唯一供应商账本；返回体不带密钥原文，带 has_key。"""
+    raw = await settings_service.get_value(_PROVIDERS_KEY, [])
+    providers = [_clean_provider(r) for r in raw if isinstance(r, dict)] if isinstance(raw, list) else []
     return [await _with_key_flag(p) for p in providers]
-
-
-async def _migrate_legacy_provider() -> list[dict]:
-    """存量单配置 → 供应商账本（幂等：仅账本键缺失时执行一次）。"""
-    legacy_base = str(await settings_service.get_value(_BASE_URL_KEY, "") or "").strip()
-    legacy_models = _models_of(await settings_service.get_value(_MODELS_KEY, None))
-    if not (legacy_base or legacy_models):
-        await settings_service.set_value(_PROVIDERS_KEY, [])
-        return []
-    pid = "main"
-    provider = _clean_provider({
-        "id": pid, "name": "默认接入",
-        "protocol": await settings_service.get_value(_PROTOCOL_KEY, "openai"),
-        "base_url": legacy_base, "models": legacy_models,
-        "models_disabled": await settings_service.get_value(_MODELS_DISABLED_KEY, None),
-    })
-    legacy_key = await settings_service.get_secret_value(_API_KEY_KEY, "")
-    if legacy_key:
-        await settings_service.set_secret_value(_provider_key_name(pid), legacy_key)
-    await settings_service.set_value(_PROVIDERS_KEY, [provider])
-    await settings_service.set_value(_ACTIVE_KEY, pid)
-    return [provider]
 
 
 async def _with_key_flag(provider: dict) -> dict:
@@ -150,80 +119,73 @@ async def _with_key_flag(provider: dict) -> dict:
     return {**provider, "has_key": bool(stored)}
 
 
-async def _write_providers(providers: list[dict]) -> None:
-    await settings_service.set_value(_PROVIDERS_KEY, providers)
+def _active_model(provider: dict, model: str) -> str:
+    disabled = set(provider["models_disabled"])
+    enabled = [m for m in provider["models"] if m not in disabled]
+    return enabled[0] if enabled and model not in enabled else model
 
 
 async def create_provider(record: dict) -> dict:
-    """新增供应商（id 服务端生成；api_key 有值即加密落库）。返回清洗后记录。"""
-    provider = _clean_provider({"id": uuid4().hex[:12], **record})
-    providers = await load_providers()
-    api_key = record.get("api_key")
-    if api_key:
-        await settings_service.set_secret_value(_provider_key_name(provider["id"]), str(api_key))
-    providers.append(await _with_key_flag(provider))
-    await _write_providers(providers)
-    if len(providers) == 1:
-        await set_active_provider(provider["id"])
-    return await _with_key_flag(provider)
+    """新增供应商，清单、密钥与首次激活在同一写边界提交。"""
+    async with write_gate(WritePriority.INTERACTIVE, label="pilot_config"):
+        provider = _clean_provider({**record, "id": uuid4().hex[:12]})
+        providers = await load_providers()
+        values = {_PROVIDERS_KEY: [*providers, provider]}
+        if not providers:
+            model = str(await settings_service.get_value(_MODEL_KEY, "") or "")
+            values.update({_ACTIVE_KEY: provider["id"], _MODEL_KEY: _active_model(provider, model)})
+        secrets = {_provider_key_name(provider["id"]): record["api_key"]} if record.get("api_key") else {}
+        await settings_service.set_values(values, secret_values=secrets)
+        return await _with_key_flag(provider)
 
 
 async def update_provider(pid: str, update: dict) -> dict:
-    """更新供应商字段；api_key 三态（缺省不改 / 空串清空 / 有值重写）。
-
-    base_url 这类端点字段空值不静默覆盖既有生效配置：编辑其他字段（如模型
-    清单）时即使端点框为空也不该把已配好的地址冲掉，否则供应商整体失活。"""
-    providers = await load_providers()
-    target = next((p for p in providers if p["id"] == pid), None)
-    if target is None:
-        raise LookupError(f"provider not found: {pid}")
-    patch = {k: v for k, v in update.items() if k != "api_key"}
-    if not str(patch.get("base_url") or "").strip() and str(target.get("base_url") or "").strip():
-        patch["base_url"] = target["base_url"]
-    merged = _clean_provider({**target, **patch})
-    if "api_key" in update:
-        await settings_service.set_secret_value(_provider_key_name(pid), update["api_key"])
-    providers[providers.index(target)] = merged
-    await _write_providers(providers)
-    active_id = str(await settings_service.get_value(_ACTIVE_KEY, "") or "")
-    if pid == active_id or not active_id:
-        await _ensure_active_model(merged)
-    return await _with_key_flag(merged)
+    """更新供应商；密钥缺省不改，空值清空；空地址不覆盖已生效地址。"""
+    async with write_gate(WritePriority.INTERACTIVE, label="pilot_config"):
+        providers = await load_providers()
+        target = next((p for p in providers if p["id"] == pid), None)
+        if target is None:
+            raise LookupError(f"provider not found: {pid}")
+        patch = {k: v for k, v in update.items() if k not in {"api_key", "id"}}
+        if not str(patch.get("base_url") or "").strip() and target["base_url"]:
+            patch["base_url"] = target["base_url"]
+        merged = _clean_provider({**target, **patch})
+        providers[providers.index(target)] = merged
+        values = {_PROVIDERS_KEY: providers}
+        active_id = str(await settings_service.get_value(_ACTIVE_KEY, "") or "")
+        if pid == active_id or not active_id:
+            model = str(await settings_service.get_value(_MODEL_KEY, "") or "")
+            values[_MODEL_KEY] = _active_model(merged, model)
+        secrets = {_provider_key_name(pid): update["api_key"]} if "api_key" in update else {}
+        await settings_service.set_values(values, secret_values=secrets)
+        return await _with_key_flag(merged)
 
 
 async def delete_provider(pid: str) -> None:
-    """删除供应商（密钥键随删）；删的是活跃家时交接给第一家（无则清空模型）。"""
-    providers = await load_providers()
-    remaining = [p for p in providers if p["id"] != pid]
-    await _write_providers(remaining)
-    await settings_service.set_value(_provider_key_name(pid), "")
-    active = str(await settings_service.get_value(_ACTIVE_KEY, "") or "")
-    if active == pid:
-        await settings_service.set_value(_ACTIVE_KEY, remaining[0]["id"] if remaining else "")
-        if not remaining:
-            await settings_service.set_value(_MODEL_KEY, "")
+    """删除供应商及密钥；删活跃家时交接首家，无则清空当前模型。"""
+    async with write_gate(WritePriority.INTERACTIVE, label="pilot_config"):
+        providers = await load_providers()
+        remaining = [p for p in providers if p["id"] != pid]
+        values = {_PROVIDERS_KEY: remaining, _provider_key_name(pid): ""}
+        active = str(await settings_service.get_value(_ACTIVE_KEY, "") or "")
+        if active == pid:
+            values[_ACTIVE_KEY] = remaining[0]["id"] if remaining else ""
+            if not remaining:
+                values[_MODEL_KEY] = ""
+        await settings_service.set_values(values)
 
 
 async def set_active_provider(pid: str) -> dict:
-    """切换活跃供应商；当前模型不属于新家启用清单时回落其首个启用模型。
-
-    已生效的模型不被静默清空：启用清单为空（模型全被禁用 / 尚未配置）时保留
-    既有模型，避免切换动作把正在用的模型冲成空导致领航员整体失活。"""
-    providers = await load_providers()
-    target = next((p for p in providers if p["id"] == pid), None)
-    if target is None:
-        raise LookupError(f"provider not found: {pid}")
-    await settings_service.set_value(_ACTIVE_KEY, pid)
-    disabled = set(target["models_disabled"])
-    enabled = [m for m in target["models"] if m not in disabled]
-    model = str(await settings_service.get_value(_MODEL_KEY, "") or "").strip()
-    stored = model
-    if model not in enabled and enabled:
-        stored = enabled[0]
-    # 启用清单为空时不重置：保留既有模型，不静默清空
-    if stored != model:
-        await settings_service.set_value(_MODEL_KEY, stored)
-    return {"active": pid, "model": stored}
+    """切换活跃家；仅在启用模型清单非空时回落首个模型。"""
+    async with write_gate(WritePriority.INTERACTIVE, label="pilot_config"):
+        providers = await load_providers()
+        target = next((p for p in providers if p["id"] == pid), None)
+        if target is None:
+            raise LookupError(f"provider not found: {pid}")
+        model = str(await settings_service.get_value(_MODEL_KEY, "") or "").strip()
+        stored = _active_model(target, model)
+        await settings_service.set_values({_ACTIVE_KEY: pid, _MODEL_KEY: stored})
+        return {"active": pid, "model": stored}
 
 
 async def load_config() -> dict:
@@ -243,22 +205,18 @@ async def load_config() -> dict:
     api_key = ""
     if active:
         api_key = str(await settings_service.get_secret_value(_provider_key_name(active["id"]), "") or "")
-    else:
-        # 无供应商账本时回落存量单配置读取（全新库两路皆空）
-        api_key = str(await settings_service.get_secret_value(_API_KEY_KEY, "") or "")
     model = str(await settings_service.get_value(_MODEL_KEY, "") or "").strip()
-    stored_window = active["context_window"] if active else _clean_window(
-        await settings_service.get_value(_CONTEXT_WINDOW_KEY, None))
+    stored_window = active["context_window"] if active else None
     # 手填优先，没手填就按模型名问内置表——填了 a 家地址却忘了窗口也能工作
     auto_window = MODEL_WINDOWS.guess_context_window(model)
     window, window_source = _resolve_window(stored_window, auto_window)
     return {
-        "protocol": active["protocol"] if active else str(await settings_service.get_value(_PROTOCOL_KEY, "openai") or "openai").strip(),
+        "protocol": active["protocol"] if active else "openai",
         "enabled": bool(await settings_service.get_value(_ENABLED_KEY, False)),
-        "base_url": active["base_url"] if active else str(await settings_service.get_value(_BASE_URL_KEY, "") or "").strip(),
+        "base_url": active["base_url"] if active else "",
         "model": str(await settings_service.get_value(_MODEL_KEY, "") or "").strip(),
-        "models": active["models"] if active else _models_of(await settings_service.get_value(_MODELS_KEY, None)),
-        "models_disabled": active["models_disabled"] if active else _models_of(await settings_service.get_value(_MODELS_DISABLED_KEY, None)),
+        "models": active["models"] if active else [],
+        "models_disabled": active["models_disabled"] if active else [],
         "api_key": api_key,
         "monthly_cap": cap,
         "context_window": window,
@@ -271,90 +229,48 @@ async def load_config() -> dict:
 
 
 async def save_config(update: dict) -> None:
-    """按提交字段写入；api_key 空 = 清空（set_secret_value 的既有语义）。
-
-    供应商级字段（protocol/base_url/models/models_disabled/api_key）在多供应
-    商语义下写入**活跃供应商**账本；无账本（全新库）回落存量单键。"""
-    if "active" in update and update["active"]:
-        try:
-            await set_active_provider(str(update["active"]))
-        except LookupError:
-            pass
-    if "protocol" in update:
-        protocol = str(update["protocol"] or "openai").strip()
-        if protocol not in pilot_llm.PROTOCOLS:
-            protocol = "openai"
-        await _patch_active_provider({"protocol": protocol}) or await settings_service.set_value(_PROTOCOL_KEY, protocol)
-    if "enabled" in update:
-        await settings_service.set_value(_ENABLED_KEY, bool(update["enabled"]))
-    if "base_url" in update:
-        await _patch_active_provider({"base_url": str(update["base_url"] or "").strip()}) or await settings_service.set_value(_BASE_URL_KEY, str(update["base_url"] or "").strip())
-    if "model" in update:
-        await settings_service.set_value(_MODEL_KEY, str(update["model"] or "").strip())
-    if "models" in update:
-        models = update["models"]
-        if isinstance(models, list):
-            cleaned = [str(m) for m in models if str(m).strip()][:50]
-            await _patch_active_provider({"models": cleaned}) or await settings_service.set_value(_MODELS_KEY, cleaned)
-    if "models_disabled" in update:
-        disabled = update["models_disabled"]
-        if isinstance(disabled, list):
-            cleaned = [str(m) for m in disabled if str(m).strip()][:50]
-            await _patch_active_provider({"models_disabled": cleaned}) or await settings_service.set_value(_MODELS_DISABLED_KEY, cleaned)
-    if "api_key" in update:
+    """平面 API 的供方和全局配置在原设置账本一次提交，首次保存创建默认接入。"""
+    async with write_gate(WritePriority.INTERACTIVE, label="pilot_config"):
+        values = {}
+        secrets = {}
+        patch = {key: update[key] for key in (
+            "protocol", "base_url", "models", "models_disabled", "context_window",
+        ) if key in update and (key not in {"models", "models_disabled"} or isinstance(update[key], list))}
+        providers = await load_providers()
         active_id = str(await settings_service.get_value(_ACTIVE_KEY, "") or "")
-        if active_id:
-            await settings_service.set_secret_value(_provider_key_name(active_id), update["api_key"])
-        else:
-            await settings_service.set_secret_value(_API_KEY_KEY, update["api_key"])
-    if "monthly_cap" in update:
-        try:
-            cap = max(0, int(update["monthly_cap"]))
-        except (TypeError, ValueError):
-            cap = DEFAULT_MONTHLY_CAP
-        await settings_service.set_value(_CAP_KEY, cap)
-    if "context_window" in update:
-        cleaned = _clean_window(update["context_window"])
-        # 显式空 = 清除（回落固定预算）；无供应商账本时落存量单键
-        if not await _patch_active_provider({"context_window": cleaned}):
-            await settings_service.set_value(_CONTEXT_WINDOW_KEY, cleaned or 0)
-    if "tool_content_limit" in update:
-        await settings_service.set_value(
-            _TOOL_LIMIT_KEY, _clean_tool_limit(update["tool_content_limit"]))
+        selected = next((p for p in providers if p["id"] == str(update.get("active") or "")), None)
+        if selected:
+            active_id = selected["id"]
+            values[_ACTIVE_KEY] = active_id
+        if patch or "api_key" in update or selected:
+            if not providers:
+                providers = [_clean_provider({"id": uuid4().hex[:12], "name": "默认接入"})]
+            target = next((p for p in providers if p["id"] == active_id), providers[0])
+            merged = _clean_provider({**target, **patch})
+            providers[providers.index(target)] = merged
+            model = str(await settings_service.get_value(_MODEL_KEY, "") or "").strip()
+            values.update({_PROVIDERS_KEY: providers, _ACTIVE_KEY: merged["id"],
+                           _MODEL_KEY: _active_model(merged, model)})
+            if "api_key" in update:
+                secrets[_provider_key_name(merged["id"])] = update["api_key"]
+        if "enabled" in update:
+            values[_ENABLED_KEY] = bool(update["enabled"])
+        if "model" in update:
+            values[_MODEL_KEY] = str(update["model"] or "").strip()
+        if "monthly_cap" in update:
+            try:
+                values[_CAP_KEY] = max(0, int(update["monthly_cap"]))
+            except (TypeError, ValueError):
+                values[_CAP_KEY] = DEFAULT_MONTHLY_CAP
+        if "tool_content_limit" in update:
+            values[_TOOL_LIMIT_KEY] = _clean_tool_limit(update["tool_content_limit"])
+        await settings_service.set_values(values, secret_values=secrets)
 
 
 def _models_of(raw) -> list[str]:
     if not isinstance(raw, list):
         return []
     return [str(m) for m in raw if str(m).strip()][:50]
-
-
-async def _patch_active_provider(patch: dict) -> bool:
-    """把供应商级字段补丁写到活跃供应商账本；无账本返回 False（调用方回落单键）。"""
-    providers = await load_providers()
-    if not providers:
-        return False
-    active_id = str(await settings_service.get_value(_ACTIVE_KEY, "") or "")
-    target = next((p for p in providers if p["id"] == active_id), providers[0])
-    merged = _clean_provider({**target, **patch})
-    providers[providers.index(target)] = merged
-    await _write_providers(providers)
-    if merged["id"] == active_id or not active_id:
-        await _ensure_active_model(merged)
-    return True
-
-
-async def _ensure_active_model(provider: dict) -> None:
-    """添加即生效：活跃供应商有启用模型而当前模型为空/失效时，自动选中首个启用模型。
-
-    只在模型「不可用」时兜底，不覆盖用户已做的选择。"""
-    disabled = set(provider["models_disabled"])
-    enabled = [m for m in provider["models"] if m not in disabled]
-    if not enabled:
-        return
-    model = str(await settings_service.get_value(_MODEL_KEY, "") or "").strip()
-    if model not in enabled:
-        await settings_service.set_value(_MODEL_KEY, enabled[0])
 
 
 async def usage_month() -> dict:

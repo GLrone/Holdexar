@@ -84,7 +84,7 @@ class PilotConfigUpdate(BaseModel):
     api_key: str | None = None
     monthly_cap: int | None = None
     context_window: int | None = None
-    """无供应商账本时的存量单键写路径；显式空 = 清除（回落固定历史预算）。"""
+    """保存到活跃供应商；显式空 = 清除手填窗口。"""
     tool_content_limit: int | None = None
     """历史轮工具结果保留预算（字符，服务端夹在 500–20000）。"""
     active: str | None = None

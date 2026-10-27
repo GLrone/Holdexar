@@ -17,9 +17,18 @@ def _spec(name):
 
 
 def test_registry_holds_all_tools():
-    assert len(REGISTRY.names()) == 68
-    assert len(set(REGISTRY.names())) == 68
+    assert len(REGISTRY.names()) == 95
+    assert len(set(REGISTRY.names())) == 95
     assert set(REGISTRY.names()) == set(projection.LABELS)
+
+
+@pytest.mark.parametrize("acknowledged,status", [(True, "ok"), (False, "empty")])
+def test_update_confirmation_step_matches_shared_result(acknowledged, status):
+    step = projection.tool_step("acknowledge_update", {
+        "acknowledged": acknowledged, "updated": acknowledged,
+    })
+    assert step["status"] == status
+    assert step["label"] == "updateStatus"
 
 
 def test_views_shape_and_order():
@@ -285,3 +294,24 @@ class TestPerceptionTools:
             assert spec is not None
             assert spec.timeout_s == projection.budget_for(name)
         assert "sync_subscriptions" in projection._SYNC_TOOLS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("items,total", [([], 0), ([{
+    "bundleId": 42, "name": "fixture bundle", "cnCnyFen": 100,
+    "lowestCnyFen": 80, "lowestRegion": "jp",
+}], 312)])
+async def test_list_bundles_projects_paginated_service(items, total, monkeypatch):
+    from app.domains.agent.tools.builtin import tracking
+
+    async def page(sort):
+        assert sort == "diff"
+        return {"bundles": items, "total": total, "offset": 0, "limit": 120}
+
+    monkeypatch.setattr(tracking.bundles_service, "list_bundles", page)
+    result = await tracking.list_bundles()
+    assert result["kind"] == "rows"
+    assert result["total"] == total
+    assert len(result["rows"]) == len(items)
+    if items:
+        assert result["rows"][0]["data"] == {"priceFen": 100, "lowFen": 80, "bundleId": 42}

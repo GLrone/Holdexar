@@ -12,14 +12,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+from datetime import datetime
 import uuid
 
-from sqlalchemy import func, select
+from sqlalchemy import String, and_, cast, func, literal, not_, or_, select
 
 from app.core.database import (
     WritePriority,
     get_session_factory,
-    write_gate,
     write_session,
 )
 from app.core.logging import log_event
@@ -30,14 +31,33 @@ from app.domains.agent.runtime.cancellation import REGISTRY
 from app.domains.agent.runtime.state import (
     RUN_AWAITING_APPROVAL,
     RUN_CANCELLED,
+    RUN_FAILED,
     RUN_QUEUED,
     RUN_RUNNING,
     TERMINAL_STATES,
     assert_transition,
     is_terminal,
+    DOMAIN_TERMINAL_TO_RUN,
 )
 
 logger = logging.getLogger(__name__)
+
+TASK_LABELS = {"price_refresh": "priceRefresh", "price_repair": "priceRepair",
+               "price_missing": "priceMissing", "dev_pytest": "devPytest"}
+PRICE_TASKS = ("price_refresh", "price_repair", "price_missing")
+_DOMAIN_STATUSES = {
+    **DOMAIN_TERMINAL_TO_RUN,
+    "pending": RUN_QUEUED,
+    "planning": RUN_RUNNING,
+    "running": RUN_RUNNING,
+    "repairing": RUN_RUNNING,
+    "finalizing": RUN_RUNNING,
+    "interrupted": RUN_FAILED,
+}
+
+
+class RunCancellationUnavailable(ValueError):
+    """No live execution handle belongs to the requested run."""
 
 # 事件回放单页上限：客户端以 after_seq 游标翻页，页大小不改变账本全量可读性
 _REPLAY_PAGE_LIMIT = 200
@@ -124,50 +144,34 @@ async def ensure_system_session() -> str:
     return SYSTEM_SESSION_ID
 
 
-async def adopt_task_run(
-    *, kind: str, ref: dict | None = None, trigger: str = "manual"
-) -> dict:
-    """受纳运行：受理已在域内完成（用户入口直接调了域受理口）时建 task 型
-    run 并拉起观察执行器（adopted=True，不重复受理）。受理被域拒绝时
-    调用方根本走不到这里——HTTP 4xx 即拒绝记录，不为按钮重试造账。"""
-    await ensure_system_session()
-    created = await create_run(
-        session_id=SYSTEM_SESSION_ID,
-        runner="task",
-        trigger=trigger,
-        meta={"task": kind, "adopted": True, "ref": dict(ref or {})},
-    )
-    await start_run(created["run_id"])
-    return created
-
-
 async def start_run(run_id: str) -> dict:
-    """启动执行器（仅 queued 可启动）。令牌先注册再拉起任务，保证
-    取消请求从第一刻起就可见。执行器按 `runner` 列分派。"""
+    """启动真实开发任务或模拟运行；价格执行留在原领域入口。"""
     run = await get_run(run_id)
     if run is None:
         raise LookupError(f"run not found: {run_id}")
+    if run["runner"] == "task" and (run.get("meta") or {}).get("task") == "dev_pytest":
+        from app.domains.agent.runtime import dev_tasks
+
+        selection = str((run.get("meta") or {}).get("select") or "")
+        dev_tasks.command(selection)
+        assert_transition(run["status"], RUN_RUNNING)
+        REGISTRY.register(run_id)
+        task = asyncio.create_task(dev_tasks.execute_run(run_id, selection=selection))
+        REGISTRY.attach_task(run_id, task)
+        return {"run_id": run_id, "started": True}
+    if run["runner"] != "fake":
+        raise ValueError("this runner has no executor here")
     assert_transition(run["status"], RUN_RUNNING)
     REGISTRY.register(run_id)
     meta = run.get("meta") or {}
-    if run["runner"] == "task":
-        from app.domains.agent.runtime import task_runner
+    from app.domains.agent.runtime import fake
 
-        task = asyncio.create_task(task_runner.execute_task_run(
-            run_id,
-            kind=str(meta.get("task") or ""),
-            ref=meta.get("ref") if isinstance(meta.get("ref"), dict) else None,
-            adopted=bool(meta.get("adopted")),
-        ))
-    else:
-        from app.domains.agent.runtime import fake  # 延迟导入：fake 依赖本模块
-
-        task = asyncio.create_task(fake.execute_fake_run(
-            run_id,
-            scenario=str(meta.get("scenario") or "success"),
-            steps=int(meta.get("steps") or 3),
-            step_delay=float(meta.get("step_delay") or 0.0),
-        ))
+    task = asyncio.create_task(fake.execute_fake_run(
+        run_id,
+        scenario=str(meta.get("scenario") or "success"),
+        steps=int(meta.get("steps") or 3),
+        step_delay=float(meta.get("step_delay") or 0.0),
+    ))
     REGISTRY.attach_task(run_id, task)
     return {"run_id": run_id, "started": True}
 
@@ -230,71 +234,128 @@ async def append_event(run_id: str, event_type: str, payload: dict | None = None
         return seq
 
 
+def _domain_key(run_id: str) -> tuple[str, int] | None:
+    match = re.fullmatch(r"(cycle|crawl):([1-9][0-9]{0,18})", run_id)
+    return (match[1], int(match[2])) if match and int(match[2]) <= 2**63 - 1 else None
+
+
+def _live_domain_ids() -> tuple[int | None, int | None]:
+    from app.domains.crawl import service as crawl_service
+
+    return crawl_service.active_cycle_id(), crawl_service.active_job_id()
+
+
+def _agent_view(row: AgentRun) -> dict:
+    token = REGISTRY.token_of(row.id)
+    meta = {**(row.meta or {}), "cancellable": not is_terminal(row.status) and (
+        token is not None or row.runner == "fake"
+    )}
+    return {
+        "run_id": row.id, "session_id": row.session_id, "runner": row.runner,
+        "trigger": row.trigger, "meta": meta, "status": row.status,
+        "error_code": row.error_code, "created_at": row.created_at,
+        "started_at": row.started_at, "finished_at": row.finished_at,
+    }
+
+
+def _domain_view(row, source: str, live: tuple[int | None, int | None]) -> dict:
+    status = _DOMAIN_STATUSES.get(row.status, RUN_FAILED)
+    if source == "cycle":
+        task = "price_refresh"
+        trigger = row.kind
+        progress = {"done": row.batches_done, "total": row.batches_expected,
+                    "failed": row.units_failed}
+        active_id = live[0]
+    else:
+        task = {"repair": "price_repair", "missing": "price_missing"}.get(row.kind)
+        stats = row.stats_json or {}
+        trigger = stats.get("trigger") or "unknown"
+        progress = {"done": stats.get("processed"), "total": stats.get("total"), **{
+            key: stats[key] for key in ("success", "failed", "skipped_no_discount", "discount_ended")
+            if key in stats
+        }}
+        active_id = live[1]
+    meta = {"domainStatus": row.status, "progress": progress,
+            "cancellable": not is_terminal(status) and active_id == row.id}
+    if task:
+        meta["task"] = task
+    else:
+        meta["job"] = row.kind
+    return {
+        "run_id": f"{source}:{row.id}", "session_id": SYSTEM_SESSION_ID,
+        "runner": "task", "trigger": trigger, "meta": meta, "status": status,
+        "error_code": row.error, "created_at": row.started_at,
+        "started_at": row.started_at, "finished_at": row.finished_at,
+    }
+
+
 async def get_run(run_id: str) -> dict | None:
+    key = _domain_key(run_id)
+    if key is not None:
+        from app.domains.crawl.cycle import PriceCycle
+        from app.domains.crawl.models import CrawlJob
+
+        source, domain_id = key
+        async with get_session_factory()() as session:
+            row = await session.get(PriceCycle if source == "cycle" else CrawlJob, domain_id)
+            if row is None or (source == "crawl" and row.cycle_id is not None):
+                return None
+            return _domain_view(row, source, _live_domain_ids())
+    if run_id.startswith(("cycle:", "crawl:")):
+        return None
     async with get_session_factory()() as session:
-        run = await session.get(AgentRun, run_id)
-        if run is None:
-            return None
-        return {
-            "run_id": run.id,
-            "session_id": run.session_id,
-            "runner": run.runner,
-            "trigger": run.trigger,
-            "meta": run.meta,
-            "status": run.status,
-            "error_code": run.error_code,
-            "created_at": run.created_at,
-            "started_at": run.started_at,
-            "finished_at": run.finished_at,
-        }
+        row = await session.get(AgentRun, run_id)
+        return _agent_view(row) if row is not None else None
 
 
-async def list_runs(*, status: str | None = None, limit: int = 20) -> list[dict]:
-    """运行列表（新→旧）。运行中与终态一视同仁，调用方按 status 过滤；
-    只读投影，不改变任何状态。"""
+async def list_runs(
+    *, status: str | None = None, limit: int = 20, price_tasks_only: bool = False,
+) -> list[dict]:
+    """Merge source-filtered read-only views, excluding historical price mirrors."""
+    from app.domains.crawl.cycle import PriceCycle
+    from app.domains.crawl.models import CrawlJob
+
     limit = max(1, min(int(limit), 100))
+    live = _live_domain_ids()
     async with get_session_factory()() as session:
-        stmt = select(AgentRun)
+        result = []
+        stmt = select(AgentRun).where(
+            or_(AgentRun.runner != "task", func.coalesce(AgentRun.meta["task"].as_string(), "") == "dev_pytest"),
+            not_(and_(AgentRun.runner == "job",
+                func.coalesce(AgentRun.meta["task"].as_string(), "").in_(PRICE_TASKS))),
+        )
+        if price_tasks_only:
+            stmt = stmt.where(AgentRun.runner == "task", AgentRun.meta["task"].as_string() == "dev_pytest")
         if status:
             stmt = stmt.where(AgentRun.status == status)
-        rows = (await session.execute(
-            stmt.order_by(AgentRun.created_at.desc(), AgentRun.id.desc()).limit(limit)
-        )).scalars().all()
-        return [
-            {
-                "run_id": r.id,
-                "session_id": r.session_id,
-                "runner": r.runner,
-                "trigger": r.trigger,
-                "meta": r.meta,
-                "status": r.status,
-                "error_code": r.error_code,
-                "created_at": r.created_at,
-                "started_at": r.started_at,
-                "finished_at": r.finished_at,
-            }
-            for r in rows
-        ]
-
-
-async def latest_progress(run_id: str) -> dict | None:
-    """最近一条进度采样（运行中任务的进度投影；从未采样则 None）。"""
-    async with get_session_factory()() as session:
-        row = await session.scalar(
-            select(AgentEvent)
-            .where(
-                AgentEvent.run_id == run_id,
-                AgentEvent.event_type == agent_events_spec.EV_TASK_PROGRESS,
-            )
-            .order_by(AgentEvent.seq.desc())
-            .limit(1)
-        )
-        return dict(row.payload or {}) if row is not None else None
+        rows = (await session.scalars(stmt.order_by(
+            AgentRun.created_at.desc(), AgentRun.id.desc()).limit(limit))).all()
+        result.extend(_agent_view(row) for row in rows)
+        for source, model in (("cycle", PriceCycle), ("crawl", CrawlJob)):
+            stmt = select(model)
+            if source == "crawl":
+                stmt = stmt.where(model.cycle_id.is_(None))
+                if price_tasks_only:
+                    stmt = stmt.where(model.kind.in_(("repair", "missing")))
+            if status:
+                matches = [value for value, mapped in _DOMAIN_STATUSES.items() if mapped == status]
+                condition = model.status.in_(matches)
+                if status == RUN_FAILED:
+                    condition = condition | model.status.not_in(tuple(_DOMAIN_STATUSES))
+                stmt = stmt.where(condition)
+            run_id = literal(source + ":") + cast(model.id, String)
+            rows = (await session.scalars(stmt.order_by(
+                model.started_at.desc(), run_id.desc()).limit(limit))).all()
+            result.extend(_domain_view(row, source, live) for row in rows)
+    result.sort(key=lambda row: (row["created_at"] or datetime.min, row["run_id"]), reverse=True)
+    return result[:limit]
 
 
 async def list_events(run_id: str, *, after_seq: int = 0,
                       limit: int = _REPLAY_PAGE_LIMIT) -> list[dict]:
     """按 seq 升序回放；after_seq 游标之后的事件，支持从任意断点续读。"""
+    if _domain_key(run_id) is not None:
+        return []
     limit = max(1, min(int(limit), _REPLAY_PAGE_LIMIT))
     async with get_session_factory()() as session:
         rows = (await session.execute(
@@ -315,14 +376,31 @@ async def list_events(run_id: str, *, after_seq: int = 0,
 
 
 async def cancel_run(run_id: str, *, reason: str = "user") -> dict:
-    """取消请求（幂等）。有活跃执行者 → 置令牌交执行器收敛（令牌置位
-    与判定之间无 await，进程内原子）；无执行者（queued / 孤儿）→ 单事务
-    内原子收敛：请求事件 + 状态跃迁 + 终态事件一次落账，并发重复请求
-    读到终态即返回 accepted=False，不产生第二条请求事件。"""
+    """Request the exact domain stop handle or the existing fake cancellation path."""
     run = await get_run(run_id)
     if run is None:
         raise LookupError(f"run not found: {run_id}")
+    if is_terminal(run["status"]):
+        return {"accepted": False, "status": run["status"]}
+    key = _domain_key(run_id)
+    if key is not None:
+        from app.domains.crawl import service as crawl_service
+
+        source, domain_id = key
+        live_cycle, live_job = _live_domain_ids()
+        if domain_id != (live_cycle if source == "cycle" else live_job):
+            raise RunCancellationUnavailable("run has no matching live execution")
+        if source == "cycle":
+            accepted = await crawl_service.stop_job(cycle_id=domain_id, whole_chain=True)
+        else:
+            accepted = await crawl_service.stop_job(domain_id, whole_chain=False)
+        fresh = await get_run(run_id)
+        if fresh is None:
+            raise LookupError(f"run not found: {run_id}")
+        return {"accepted": accepted, "status": fresh["status"]}
     token = REGISTRY.token_of(run_id)
+    if token is None and run["runner"] != "fake":
+        raise RunCancellationUnavailable("run has no live stop handle")
     if token is not None:
         first = not token.requested
         if first:
