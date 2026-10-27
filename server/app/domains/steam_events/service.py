@@ -235,7 +235,7 @@ def _write_snapshot(lang: str, raw: str) -> None:
 
 
 # 回贴水位 KV：每窗口已回贴推进到的时刻，与该窗回贴同事务落位（断点续跑
-# 形态同 seed.history_progress）；键缺失的窗口（首次 / 日历新增活动）全窗口回贴
+# 断点形态：键缺失的窗口（首次 / 日历新增活动）全窗口回贴
 _BACKFILL_WATERMARK_KEY = "steam_events.backfill_watermark"
 # 水位回看余量：吸收写库与回贴两侧时钟的偏差，多扫段由 NULL 条件幂等兜底
 _BACKFILL_WATERMARK_MARGIN = timedelta(hours=1)

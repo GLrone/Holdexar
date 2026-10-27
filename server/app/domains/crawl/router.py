@@ -2,14 +2,12 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.core.events import bus
-from app.core.logging import log_event
 from . import coverage as coverage_service
 from . import cycle as cycle_service
 from . import events as events_service
@@ -18,35 +16,9 @@ from . import service
 
 router = APIRouter(tags=["crawl"])
 
-logger = logging.getLogger(__name__)
-
-
-async def _adopt_run(kind: str, accepted: dict) -> None:
-    """手动受理的登记长任务同口径入运行账（adopted：受理已完成，执行器
-    只接管观察与取消）。账本失败不影响已受理的任务。"""
-    from datetime import datetime
-
-    from app.domains.agent import service as agent_service
-
-    try:
-        await agent_service.adopt_task_run(
-            kind=kind,
-            trigger="manual",
-            ref={**accepted, "startedAt": datetime.now().isoformat()},
-        )
-    except Exception:  # noqa: BLE001 —— 运行账不可用不拖垮已受理任务
-        log_event(
-            logger,
-            "手动任务登记运行账失败，任务已受理不受影响",
-            level=logging.ERROR,
-            exc_info=True,
-            detail={"任务类型": kind},
-        )
-
-
 class CrawlRunRequest(BaseModel):
     scope: str = "appids"
-    # all（默认全队列：与自动价格轮同组成，后台串行链）| appids | wishlist
+    # all（全部符合条件的游戏）| appids | wishlist
     # | wishlist_only | owned | pool（全池，愿望单优先序排前）
     appids: list[int] | None = None
     regions: list[str] | None = None
@@ -66,8 +38,6 @@ async def run(req: CrawlRunRequest):
     try:
         if req.scope == "all":
             accepted = await service.start_full_queue()
-            # 手动全队列与 pilot 发起同口径入运行账（登记任务 kind）
-            await _adopt_run("price_refresh", accepted)
             return accepted
         accepted = await service.start_job(
             scope=req.scope,
@@ -75,10 +45,8 @@ async def run(req: CrawlRunRequest):
             regions=req.regions,
             kind=req.kind,
             missing_cooldown=req.cooldown,
+            trigger="manual",
         )
-        if req.kind == "repair":
-            # 任务页「补游戏价格」：登记任务 kind，与 pilot 发起同口径
-            await _adopt_run("price_repair", accepted)
         return accepted
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
@@ -133,37 +101,7 @@ async def active():
     全局限流窗口外排队的请求数——任务已启动但请求还没放行时，任务页
     据此显示「排队等发送窗口」而不是让用户以为卡死。
     """
-    from app.crawler.occupancy import (
-        MAINTENANCE_HEALTH,
-        current_holder,
-        maintenance_kind,
-        maintenance_reason,
-    )
-    from app.crawler.rate_limit import steam_rate_limiter
-    from app.domains.proxypool import health as pool_health
-    from app.domains.proxypool import scheduling as pool_scheduling
-
-    job_id = service.active_job_id()
-    kind_now = maintenance_kind()
-    maintenance_info = None
-    if kind_now is not None:
-        maintenance_info: dict = {"kind": kind_now, "reason": maintenance_reason()}
-        live = await pool_health.current_maintenance_run()
-        if live is not None:
-            maintenance_info["startedAt"] = live["startedAt"]
-            maintenance_info["probed"] = live["probed"]
-            totals = live.get("totals")
-            if totals is not None:
-                maintenance_info["totals"] = totals
-    return {
-        "activeJobId": job_id,
-        # busy 只表达「抓取在跑」（爬取占用位）：体检/重建由 maintenance 单独表达，
-        # 混进 busy 会让前端把维护期误亮成「抓取进行中」
-        "busy": job_id is not None or current_holder() is not None,
-        "maintenance": kind_now == MAINTENANCE_HEALTH,
-        "maintenanceInfo": maintenance_info,
-        "throttled": steam_rate_limiter.waiting,
-    }
+    return await service.active_snapshot()
 
 
 @router.get("/crawl/cycles")
@@ -196,11 +134,7 @@ async def cycle_coverage(cycle_id: int):
 
 @router.get("/crawl/freshness")
 async def freshness(appid: list[int] = Query(default=[])):
-    """价格数据新鲜度：每个对象的最后观察时刻与档位（fresh / lagging / stale）。
-
-    观察时间来源是 `game_current_prices.updated_at`；没有任何价格记录的对象
-    两者为 null。与覆盖率是两个维度，不合并成综合评分。
-    """
+    """按持久成功观察返回各地区新鲜度、尝试时间与待补情况。"""
     appids = list(dict.fromkeys(int(a) for a in appid))
     if not appids:
         raise HTTPException(status_code=400, detail="缺少 appid 参数")

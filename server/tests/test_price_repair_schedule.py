@@ -55,9 +55,6 @@ def db(monkeypatch):
     # 漏桩的模块会把 Cycle 收尾写进隔离外的库——逐个对齐本文件工厂
 
 
-    # 让路重试与空壳重试的等待拍归零：本文件断言编排语义，不测等待时长
-    monkeypatch.setattr(sched_mod, "_SPEC_YIELD_WAIT_SECONDS", 0)
-
     return get_session_factory()
 @pytest_asyncio.fixture(autouse=True)
 async def _seed(db):
@@ -152,9 +149,6 @@ def _stub_start_env(monkeypatch, *, captured_specs=None):
 
     monkeypatch.setattr(crawl_service.alerts_service, "check_appids", _noop)
     monkeypatch.setattr(crawl_service.alerts_service, "check_new_lows", _noop)
-    monkeypatch.setattr(crawl_service.games_service, "refresh_hl_flags", _noop)
-    monkeypatch.setattr(crawl_service.games_service, "refresh_pp_flags", _noop)
-    monkeypatch.setattr(crawl_service.games_service, "refresh_sort_cache", _noop)
 
     # run_crawl 打桩短路（stats 形态对齐 runner 返回）
     async def _run_crawl(pairs, *, config, stop_event=None, pre_tasks=None, crawl_job_id=None):
@@ -216,12 +210,6 @@ async def test_crawler_busy_when_any_job_running(db, monkeypatch):
 
 def test_crawler_idle_when_task_finished(db):
     """任务已 done（_active 残留未清）→ 视为空闲——修复可进场。"""
-    async def _done():
-        return
-
-    task = asyncio.ensure_future(_done())
-    asyncio.get_event_loop_policy()  # noqa: pointless
-    # 同步上下文拿不到运行循环里的结果——直接构造已完成的假 task
     class _FakeDone:
         done = staticmethod(lambda: True)
 
@@ -238,19 +226,22 @@ def test_crawler_idle_when_task_finished(db):
 
 @pytest.mark.asyncio
 async def test_repair_job_runs_when_idle(db, monkeypatch):
-    """空闲档：repair 轮真实走 run_sequential→start_job（run_crawl 打桩），
+    """空闲档：repair 轮直接调用 start_job（run_crawl 打桩），
     job 行 kind=repair 落库——端到端接线验证。"""
     _stub_start_env(monkeypatch)
     sched_mod._price_cycle_busy = False
     crawl_service._active = None
 
     await sched_mod._job_price_repair()
+    if crawl_service._active is not None:
+        await crawl_service._active.task
     async with db() as session:
         rows = (await session.execute(
             __import__("sqlalchemy").select(CrawlJob)
         )).scalars().all()
     kinds = [r.kind for r in rows]
-    assert "repair" in kinds, f"repair job 未启动：{kinds}"
+    assert kinds == ["repair"], f"每拍只受理一次 repair：{kinds}"
+    assert rows[0].stats_json["trigger"] == "scheduled"
 
 
 @pytest.mark.asyncio
@@ -259,6 +250,8 @@ async def test_repair_picks_only_expired_missing(db, monkeypatch):
     冷却中（APPID2）与终态 blocked（APPID3）不进。"""
     _stub_start_env(monkeypatch)
     result = await crawl_service.start_job(kind="repair")
+    if crawl_service._active is not None:
+        await crawl_service._active.task
     async with db() as session:
         job = await session.get(CrawlJob, result["id"])
     assert job is not None and job.kind == "repair"
@@ -286,14 +279,14 @@ async def test_repair_cooldown_semantics(db):
 
 @pytest.mark.asyncio
 async def test_repair_yields_when_busy(db, monkeypatch):
-    """主价格刷新占线（busy）→ 修复轮整体让路（不触 run_sequential）。"""
+    """主价格刷新占线（busy）→ 修复轮整体让路（不触 start_job）。"""
     called = []
 
-    async def _spy(specs, **kw):
-        called.append(specs)
-        return []
+    async def _spy(**kw):
+        called.append(kw)
+        return {}
 
-    monkeypatch.setattr(crawl_service, "run_sequential", _spy)
+    monkeypatch.setattr(crawl_service, "start_job", _spy)
     sched_mod._price_cycle_busy = True
     crawl_service._active = None
     await sched_mod._job_price_repair()
@@ -305,11 +298,11 @@ async def test_repair_yields_when_job_running(db, monkeypatch):
     """任何爬取任务在跑 → 修复让路（看任务表，非 6h 间隔）。"""
     called = []
 
-    async def _spy(specs, **kw):
-        called.append(specs)
-        return []
+    async def _spy(**kw):
+        called.append(kw)
+        return {}
 
-    monkeypatch.setattr(crawl_service, "run_sequential", _spy)
+    monkeypatch.setattr(crawl_service, "start_job", _spy)
 
     async def _slow():
         await asyncio.sleep(30)
@@ -329,9 +322,9 @@ async def test_repair_yields_when_job_running(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_price_refresh_sets_busy_and_drains(db, monkeypatch):
+async def test_price_refresh_sets_busy_around_cycle(db, monkeypatch):
     """主轮 busy 生命周期：置位 → 修复探测让路 → 链完成 → 复位。
-    busy 置位于排干等待之前（等待窗口内修复也让路）。"""
+    busy 覆盖整次价格周期调用。"""
     monkeypatch.setattr(external_time, "fetch_pacific_dst",
                         lambda: asyncio.sleep(0, result=(True, "stub")))
     _stub_bundle_tail(monkeypatch)
@@ -340,8 +333,6 @@ async def test_price_refresh_sets_busy_and_drains(db, monkeypatch):
 
     async def _spy(specs, **kw):
         states.append(sched_mod._price_cycle_busy)
-        # 返回非空 = 本轮真的启动了任务：主轮据此不触发「被同拍挤占」的
-        # 让路重试（重试会让 states 追加第二轮，观测到的是重试而非首轮）
         return [{"id": 1}]
 
     monkeypatch.setattr(crawl_service, "run_sequential", _spy)
@@ -352,49 +343,50 @@ async def test_price_refresh_sets_busy_and_drains(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_price_refresh_drains_running_repair_before_chain(db, monkeypatch):
-    """排干等待：修复任务在跑时主轮等它结束再开三层链（不撞锁丢 spec）。"""
+async def test_price_refresh_calls_once_and_defers_to_next_repair_tick(db, monkeypatch):
+    """主轮只调用一次域编排；现役任务不排干，修复留给下一正常拍。"""
+    from app.domains.crawl import cycle_run
+
     monkeypatch.setattr(external_time, "fetch_pacific_dst",
                         lambda: asyncio.sleep(0, result=(True, "stub")))
     _stub_bundle_tail(monkeypatch)
-    # 排干轮询提速（10s × 60 太慢）：0.05s × 200
-    monkeypatch.setattr(sched_mod, "_DRAIN_POLL_SECONDS", 0.05)
-    monkeypatch.setattr(sched_mod, "_DRAIN_MAX_POLLS", 200)
-
-    chain_specs: list[dict] = []
-
-    async def _spy(specs, **kw):
-        chain_specs.append(specs)
-        return []
-
-    monkeypatch.setattr(crawl_service, "run_sequential", _spy)
-
     release = asyncio.Event()
-
-    async def _repair_running():
-        await release.wait()
-
-    repair_task = asyncio.create_task(_repair_running())
+    repair_task = asyncio.create_task(release.wait())
     crawl_service._active = crawl_service.JobHandle(
-        id=501, task=repair_task, stop_event=asyncio.Event()
+        id=501, task=repair_task, stop_event=asyncio.Event(),
     )
+    cycles = []
+    repairs = []
 
-    async def _release_soon():
-        await asyncio.sleep(0.2)
-        release.set()
-        await repair_task
+    async def cycle_once(specs, **kwargs):
+        cycles.append((specs, kwargs))
+        assert sched_mod._price_cycle_busy is True
+        assert not repair_task.done()
+        return False
 
-    asyncio.create_task(_release_soon())
+    async def start_repair(**kwargs):
+        repairs.append(kwargs)
+        return {"id": 502}
+
+    monkeypatch.setattr(cycle_run, "run_price_cycle", cycle_once)
+    monkeypatch.setattr(crawl_service, "start_job", start_repair)
     sched_mod._price_cycle_busy = False
     try:
-        await sched_mod._job_price_refresh()
-        # 排干完成 → busy=True 期间三层链才启动
-        assert chain_specs, "排干后三层链必须执行"
+        await asyncio.wait_for(sched_mod._job_price_refresh(), timeout=1)
+        assert len(cycles) == 1 and cycles[0][1] == {"kind": "scheduled"}
+        assert not repair_task.done(), "主轮不应等待现役任务排干"
         assert sched_mod._price_cycle_busy is False
+        await sched_mod._job_price_repair()
+        assert repairs == [], "现役任务仍占用时正常补抓拍让路"
+        release.set()
+        await repair_task
+        crawl_service._active = None
+        await sched_mod._job_price_repair()
+        assert repairs == [{"kind": "repair", "missing_cooldown": 4, "trigger": "scheduled"}]
+        assert len(cycles) == 1, "不补跑额外主轮"
     finally:
         release.set()
-        with __import__("contextlib").suppress(asyncio.CancelledError):
-            await repair_task
+        await repair_task
         crawl_service._active = None
 
 
@@ -492,11 +484,11 @@ async def test_price_auto_disabled_blocks_repair_cycle(db, monkeypatch):
 
     called = []
 
-    async def _spy(specs, **kw):
-        called.append(specs)
-        return []
+    async def _spy(**kw):
+        called.append(kw)
+        return {}
 
-    monkeypatch.setattr(crawl_service, "run_sequential", _spy)
+    monkeypatch.setattr(crawl_service, "start_job", _spy)
     crawl_service._active = None
     sched_mod._price_cycle_busy = False
 

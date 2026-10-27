@@ -1,3 +1,4 @@
+from app.domains.games import derived as games_derived
 """games 列表查询的行为验收（三层兜底查表模式）。
 
 以 priceMatrix（区服键控 {"CN": [formatted, cnyFen, cents, null]}）为独立事实源，
@@ -52,7 +53,7 @@ def _require_populated_library():
 @pytest_asyncio.fixture(autouse=True)
 async def _setup():
     await init_db()
-    await service.refresh_sort_cache()  # 幂等，保证预计算列最新
+    await games_derived.update_price_derived(None, history=False)  # 幂等，保证预计算列最新
     yield
 
 
@@ -375,7 +376,7 @@ async def _seed_family_filter(monkeypatch):
             WishlistItem(steamid=FRIEND_SID, appid=APP_FAMILY, active=True, owned=True),
         ])
         await session.commit()
-    await service.refresh_sort_cache()
+    await games_derived.update_price_derived(None, history=False)
 
     async def _primary():
         return PRIMARY_SID

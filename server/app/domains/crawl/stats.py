@@ -72,18 +72,6 @@ async def cycle_stats(cycle_id: int) -> dict | None:
         if cycle is None:
             return None
         appids = [int(a) for a in ((cycle.expected_json or {}).get("appids") or [])]
-        stages = stage_ms(
-            started_at=cycle.started_at,
-            running_at=cycle.running_at,
-            repairing_at=cycle.repairing_at,
-            finalizing_at=cycle.finalizing_at,
-            finished_at=cycle.finished_at,
-        )
-        duration = (
-            round((cycle.finished_at - cycle.started_at).total_seconds(), 1)
-            if cycle.started_at is not None and cycle.finished_at is not None
-            else None
-        )
 
     coverage = await coverage_mod.cycle_coverage(cycle_id)
     if coverage is None:
@@ -103,8 +91,22 @@ async def cycle_stats(cycle_id: int) -> dict | None:
         "unitsMissing": coverage["missing"],
         "unitsBlocked": coverage["blocked"],
         "staleCount": sum(1 for f in fresh if f["freshness"] == "stale"),
-        "durationSeconds": duration,
-        "stageMs": stages,
+        **timing_stats(cycle),
+    }
+
+
+def timing_stats(cycle: PriceCycle) -> dict:
+    """时长直接取同一行真实边界，读列表与收敛统计共用。"""
+    return {
+        "durationSeconds": (
+            round((cycle.finished_at - cycle.started_at).total_seconds(), 1)
+            if cycle.started_at is not None and cycle.finished_at is not None else None
+        ),
+        "stageMs": stage_ms(
+            started_at=cycle.started_at, running_at=cycle.running_at,
+            repairing_at=cycle.repairing_at, finalizing_at=cycle.finalizing_at,
+            finished_at=cycle.finished_at,
+        ),
     }
 
 

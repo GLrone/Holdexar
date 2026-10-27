@@ -15,7 +15,6 @@ game_current_prices（夹具清理，不污染真实库），验证：
 追踪区通过打桩 _tracked_region_codes 控制（模块级依赖 regions.service，
 不打桩会读到生产 crawl_regions 表——启用集随「我」页漂移，断言不稳定）。
 """
-import asyncio
 import sys
 from pathlib import Path
 
@@ -80,14 +79,20 @@ def _bp(bid: int, region: str, price: int | None, cny_fen: int | None, aids: lis
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _seed(monkeypatch):
+async def _seed(monkeypatch, tmp_path):
+    from app.core import database
+    from app.core.config import get_settings
+
+    monkeypatch.setenv("HOLDEXAR_DATA_DIR", str(tmp_path))
+    get_settings.cache_clear()
+    database.get_engine.cache_clear()
+    get_session_factory.cache_clear()
     await init_db()
     # 打桩追踪区：默认全量（None）；需要过滤语义的用例自行覆盖返回值
     async def _all_regions():
         return None
 
     monkeypatch.setattr(service, "_tracked_region_codes", _all_regions)
-    await init_db()
     async with get_session_factory()() as session:
         session.add_all(
             [
@@ -141,20 +146,16 @@ async def _seed(monkeypatch):
             ]
         )
         await session.commit()
-    # 种子直写绕过服务写入口 → 排序快照（bundles.min_cny_fen/diff_fen/is_lowest）
-    # 必须显式重建：生产由写侧（刷新链尾/导入/追踪区变更/启动/汇率刷新）触发，
-    # 任何 GET 都不现算。随后失效聚合缓存（每用例起步冷缓存，与生产「写入即
-    # 失效」语义对齐）；用例中途直写由用例自行重建 + 失效
+    # 直接播种后补齐写时排序快照。
     await service.refresh_bundle_sort_cache([BID_A, BID_B, BID_C])
-    service.invalidate_bundles_cache()
     yield
-    service.invalidate_bundles_cache()
     async with get_session_factory()() as session:
         await session.execute(delete(GameCurrentPrice).where(GameCurrentPrice.appid.in_([APPID_1, APPID_2])))
         await session.execute(delete(Game).where(Game.appid.in_([APPID_1, APPID_2])))
         await session.execute(delete(BundleRegionPrice).where(BundleRegionPrice.bundle_id.in_([BID_A, BID_B, BID_C])))
         await session.execute(delete(Bundle).where(Bundle.bundle_id.in_([BID_A, BID_B, BID_C])))
         await session.commit()
+    await database.get_engine().dispose()
 
 
 # ─── 导入（链接识别 → 单包刷新语义落库） ────────────────────────────────
@@ -315,9 +316,118 @@ async def test_import_bundle_sub_and_errors(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_list_pages_keep_global_totals_and_stable_order():
+    first = await service.list_bundles(limit=1)
+    second = await service.list_bundles(limit=1, offset=1)
+    assert first["total"] == second["total"] == 2
+    assert first["completableCount"] == 2
+    assert [i["bundleId"] for i in first["bundles"] + second["bundles"]] == [BID_A, BID_C]
+    empty = await service.list_bundles(limit=1, offset=2)
+    assert empty["bundles"] == [] and empty["total"] == 2
+
+
+@pytest.mark.asyncio
+async def test_list_http_contract_bounds_page_and_keeps_global_counts():
+    import httpx
+    from fastapi import FastAPI
+    from app.domains.bundles.router import router
+
+    app = FastAPI()
+    app.include_router(router, prefix="/api/v1")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/api/v1/bundles", params={"limit": 1, "offset": 1})
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["total"] == 2 and len(payload["bundles"]) == 1
+        assert payload["bundles"][0]["bundleId"] == BID_C
+        assert (await client.get("/api/v1/bundles", params={"limit": 201})).status_code == 422
+        assert (await client.get("/api/v1/bundles", params={"offset": -1})).status_code == 422
+        assert (await client.get("/api/v1/bundles", params={"price_min": "nan"})).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_list_filters_apply_before_pagination_and_use_clean_regions():
+    page = await service.list_bundles(query="混写", limit=1)
+    assert page["total"] == 1 and page["bundles"][0]["bundleId"] == BID_C
+    assert (await service.list_bundles(price_min=150))["total"] == 1
+    assert (await service.list_bundles(region="RU", region_mode="cheaper"))["total"] == 0
+    assert (await service.list_bundles(region="RU", region_mode="locked"))["total"] == 2
+    assert (await service.list_bundles(only_discounted=True))["total"] == 0
+    giftable = await service.list_bundles(gift_only=True, limit=1)
+    assert giftable["total"] == 1 and giftable["bundles"][0]["bundleId"] == BID_A
+    percent = await service.list_bundles(region="JP", diff_type="percent", diff_min=-50, diff_max=-50)
+    assert percent["total"] == 1 and percent["bundles"][0]["bundleId"] == BID_A
+
+
+@pytest.mark.asyncio
+async def test_list_region_anchor_and_discount_sort_across_pages():
+    async with get_session_factory()() as session:
+        jp = (await session.execute(select(BundleRegionPrice).where(
+            BundleRegionPrice.bundle_id == BID_A, BundleRegionPrice.region_code == "JP"
+        ))).scalar_one()
+        jp.cny_fen = 1000
+        jp.discount_percent = 25
+        cn = (await session.execute(select(BundleRegionPrice).where(
+            BundleRegionPrice.bundle_id == BID_C, BundleRegionPrice.region_code == "CN"
+        ))).scalar_one()
+        cn.discount_percent = 60
+        session.add(_bp(BID_C, "US", 6000, 6000, [APPID_1, APPID_2, APPID_3]))
+        await session.commit()
+    await service.refresh_bundle_sort_cache([BID_A, BID_C])
+    assert (await service.list_bundles("smart", limit=1))["bundles"][0]["bundleId"] == BID_C
+    for sort in ("smart", "diff", "discount"):
+        page = await service.list_bundles(sort, region="JP", limit=1)
+        assert page["bundles"][0]["bundleId"] == BID_A
+        assert page["total"] == 2
+    assert (await service.list_bundles("discount", limit=1))["bundles"][0]["bundleId"] == BID_C
+
+
+@pytest.mark.asyncio
+async def test_list_ownership_filters_count_all_valid_members_before_limit(monkeypatch):
+    from app.domains.account import service as account_service
+    from app.domains.wishlist.models import TrackedAccount, WishlistItem
+
+    async def primary():
+        return "bundle-self"
+
+    monkeypatch.setattr(account_service, "get_primary_steam_id", primary)
+    async with get_session_factory()() as session:
+        session.add_all([
+            TrackedAccount(steamid="bundle-self", label="Self"),
+            TrackedAccount(steamid="bundle-family", label="Family"),
+            WishlistItem(steamid="bundle-self", appid=APPID_1, owned=True, active=True),
+            WishlistItem(steamid="bundle-family", appid=APPID_2, owned=True, active=True),
+        ])
+        cn = (await session.execute(select(BundleRegionPrice).where(
+            BundleRegionPrice.bundle_id == BID_C, BundleRegionPrice.region_code == "CN"
+        ))).scalar_one()
+        cn.app_ids = [APPID_2]
+        await session.commit()
+    try:
+        first = await service.list_bundles(limit=1)
+        second = await service.list_bundles(limit=1, offset=1)
+        assert first["bundles"][0]["ownership"]["type"] == "owned"
+        assert second["bundles"][0]["ownership"] == {"type": "family", "account": "Family"}
+        owned_hidden = await service.list_bundles(hide_owned=True, limit=1)
+        assert owned_hidden["total"] == 1
+        assert owned_hidden["bundles"][0]["bundleId"] == BID_C
+        assert owned_hidden["bundles"][0]["ownership"] == {"type": "family", "account": "Family"}
+        family_hidden = await service.list_bundles(hide_family=True, limit=1)
+        assert family_hidden["total"] == 1
+        assert family_hidden["bundles"][0]["bundleId"] == BID_A
+        assert family_hidden["bundles"][0]["ownership"]["type"] == "owned"
+        assert (await service.list_bundles(hide_owned=True, hide_family=True))["total"] == 0
+    finally:
+        async with get_session_factory()() as session:
+            await session.execute(delete(WishlistItem).where(WishlistItem.steamid.in_(["bundle-self", "bundle-family"])))
+            await session.execute(delete(TrackedAccount).where(TrackedAccount.steamid.in_(["bundle-self", "bundle-family"])))
+            await session.commit()
+
+
+@pytest.mark.asyncio
 async def test_list_aggregation():
     """区键大写去重取有价行、基准 appids、锁区数、最低区、差价下限、差价降序。"""
-    items = await service.list_bundles()
+    items = (await service.list_bundles())["bundles"]
     a = next(i for i in items if i["bundleId"] == BID_A)
     assert a["name"] == "测试补齐包"
     assert set(a["regionPrices"].keys()) == {"CN", "JP", "US"}  # jp/JP 去重
@@ -340,7 +450,7 @@ async def test_list_aggregation():
 @pytest.mark.asyncio
 async def test_diff_floor_zero_and_order():
     """CN 高于最低区时差价 = CN−最低；列表按差价降序。"""
-    items = await service.list_bundles()
+    items = (await service.list_bundles())["bundles"]
     a = next(i for i in items if i["bundleId"] == BID_A)
     # US 36000 分最低? CN 10000 < 36000，JP 15000 → 最低 CN，差价 0（已验证）
     # 这里验证列表排序字段存在且非负
@@ -363,8 +473,7 @@ async def test_list_price_data_freshness():
         for i, r in enumerate(rows):
             r.crawled_at = now - timedelta(hours=2 + i)
         await session.commit()
-    service.invalidate_bundles_cache()
-    items = await service.list_bundles()
+    items = (await service.list_bundles())["bundles"]
     a = next(i for i in items if i["bundleId"] == BID_A)
     pd = a["priceData"]
     assert pd["observedAt"] is not None
@@ -373,6 +482,28 @@ async def test_list_price_data_freshness():
     assert "coverage" not in pd  # 捆绑包无 Cycle 归属，不给覆盖率
     c = next(i for i in items if i["bundleId"] == BID_C)
     assert c["priceData"] == {"observedAt": None, "ageHours": None, "freshness": None}
+
+
+@pytest.mark.asyncio
+async def test_native_sort_uses_same_rules_and_keeps_callers_transaction():
+    import sqlite3
+    from app.core.database import sqlite_file_path
+
+    connection = sqlite3.connect(sqlite_file_path())
+    service.register_bundle_sql_functions(connection)
+    try:
+        connection.execute("BEGIN")
+        connection.execute("UPDATE bundle_region_prices SET cny_fen=5000 WHERE bundle_id=? AND region_code='US'", (BID_A,))
+        sql, params = service.bundle_sort_sql([BID_A], None)
+        connection.execute(sql, params)
+        row = connection.execute("SELECT min_cny_fen,diff_fen,is_lowest FROM bundles WHERE bundle_id=?", (BID_A,)).fetchone()
+        assert row == (5000, 5000, 0)
+        connection.rollback()
+    finally:
+        connection.close()
+    detail = await service.get_bundle_detail(BID_A)
+    assert detail["regionPrices"]["US"]["cnyFen"] == 36000
+    assert detail["diffFen"] == 0
 
 
 @pytest.mark.asyncio
@@ -424,8 +555,7 @@ async def test_sort_snapshot_diff_and_incremental():
     assert a.diff_fen == 10000 - 6000
     assert a.is_lowest is False  # 外区实质更低（超出 ±5 元容差）
     assert c.min_cny_fen is None  # 未刷的包保持原快照
-    service.invalidate_bundles_cache()
-    items = await service.list_bundles()  # SQL ORDER BY 快照：有差价的 A 排在 C 之前
+    items = (await service.list_bundles())["bundles"]  # SQL ORDER BY 快照：有差价的 A 排在 C 之前
     order = [i["bundleId"] for i in items]
     assert order.index(BID_A) < order.index(BID_C)
     a_item = next(i for i in items if i["bundleId"] == BID_A)
@@ -455,8 +585,7 @@ async def test_tracked_region_filter(monkeypatch):
     # 追踪区集合变化 = 写侧事件：快照必须重建（生产由 regions.set_enabled 触发），
     # GET 只读快照
     await service.refresh_bundle_sort_cache([BID_A, BID_B, BID_C])
-    service.invalidate_bundles_cache()
-    items = await service.list_bundles()
+    items = (await service.list_bundles())["bundles"]
     a = next(i for i in items if i["bundleId"] == BID_A)
     assert set(a["regionPrices"].keys()) == {"CN", "US"}  # JP 被过滤
     # CN 10000 < US 36000 → 最低 CN（JP 15000 若混入不影响，但已剔）
@@ -468,7 +597,6 @@ async def test_tracked_region_filter(monkeypatch):
         session.add(_bp(BID_C, "pk", 100, 100, [APPID_1, APPID_2, APPID_3]))
         session.add(_bp(BID_C, "BD", 90, 90, [APPID_1, APPID_2, APPID_3]))
         await session.commit()
-    service.invalidate_bundles_cache()  # 直写绕过写入口 → 手动失效聚合缓存
 
     async def _with_pk():
         return {"CN", "PK"}
@@ -493,8 +621,7 @@ async def test_tracked_region_filter(monkeypatch):
         )
         await session.commit()
     await service.refresh_bundle_sort_cache([BID_C])  # 直写绕过写入口 → 手动重建快照
-    service.invalidate_bundles_cache()  # 直写绕过写入口 → 手动失效聚合缓存
-    items = await service.list_bundles()
+    items = (await service.list_bundles())["bundles"]
     c = next(i for i in items if i["bundleId"] == BID_C)
     assert "TR" not in c["regionPrices"]
     assert c["lowestRegion"] == "cn"  # 未被 TR 的 5 分带偏
@@ -511,7 +638,7 @@ async def test_tracked_region_filter(monkeypatch):
 @pytest.mark.asyncio
 async def test_dual_product_isolation():
     """双轨混写行（异种 appids）整行剔除：最低价/区域表不被 sub 污染行带偏。"""
-    items = await service.list_bundles()
+    items = (await service.list_bundles())["bundles"]
     c = next(i for i in items if i["bundleId"] == BID_C)
     # RU 污染行（APPID_SUB，cny=800）被剔除，不进区域表也不进最低价
     assert "RU" not in c["regionPrices"]
@@ -526,7 +653,7 @@ async def test_dual_product_isolation():
 @pytest.mark.asyncio
 async def test_image_normalization_and_fallback():
     """fastly/queniuqe 图片域归一到 akamai；无封面按 mps 分 bundle/sub 兜底路径。"""
-    items = await service.list_bundles()
+    items = (await service.list_bundles())["bundles"]
     c = next(i for i in items if i["bundleId"] == BID_C)
     assert c["headerImage"].startswith("https://shared.akamai.steamstatic.com/store_item_assets/steam/bundles/")
     # BID_A 无封面（header_image 为 NULL）→ mps=0 走 bundles 路径
@@ -597,7 +724,6 @@ async def test_smart_score_snapshot_and_sort():
             )
             await session.commit()
         await service.refresh_bundle_sort_cache([BID_A, BID_D])
-        service.invalidate_bundles_cache()
 
         async with get_session_factory()() as session:
             row = (
@@ -607,19 +733,18 @@ async def test_smart_score_snapshot_and_sort():
         assert row.smart_score is not None
         assert 0.5 < row.smart_score < 0.6
 
-        items_smart = await service.list_bundles("smart")
+        items_smart = (await service.list_bundles("smart"))["bundles"]
         # 真实库与合成包同场（测试跑在开发数据目录）：断言相对顺序而非绝对
         # 第一——大差价包必须排在夹具零差价包（A/C）之前，两种排序一致
         ids_smart = [i["bundleId"] for i in items_smart]
         assert ids_smart.index(BID_D) < ids_smart.index(BID_A)
-        items_diff = await service.list_bundles("diff")
+        items_diff = (await service.list_bundles("diff"))["bundles"]
         ids_diff = [i["bundleId"] for i in items_diff]
         assert ids_diff.index(BID_D) < ids_diff.index(BID_A)
         # 排序参数归一：未知值回落 diff，不抛错
-        ids_fallback = [i["bundleId"] for i in await service.list_bundles("bogus")]
+        ids_fallback = [i["bundleId"] for i in (await service.list_bundles("bogus"))["bundles"]]
         assert ids_fallback.index(BID_D) < ids_fallback.index(BID_A)
     finally:
-        service.invalidate_bundles_cache()
         async with get_session_factory()() as session:
             await session.execute(
                 delete(BundleRegionPrice).where(BundleRegionPrice.bundle_id == BID_D)
@@ -653,58 +778,6 @@ async def test_sort_snapshot_rebuild_over_bind_limit():
         written = await service.refresh_bundle_sort_cache()
         assert written > n
     finally:
-        service.invalidate_bundles_cache()
         async with get_session_factory()() as session:
             await session.execute(delete(Bundle).where(Bundle.bundle_id >= base))
             await session.commit()
-
-
-@pytest.mark.asyncio
-async def test_list_json_serves_stale_and_rebuilds_in_background():
-    """失效后列表出口立即回上一版字节（SWR），重建挂后台单飞。
-
-    回归：缓存失效后首个请求同步冷重建（全量聚合+序列化秒级~十秒级）
-    压在请求路径上，进页要干等整个重建——失效必须秒回陈旧字节。"""
-    service._STALE_JSON.clear()
-    service._STALE_GZIP.clear()
-    try:
-        first = await service.list_bundles_json()
-        assert first
-        service.invalidate_bundles_cache()
-        assert service._STALE_JSON  # 上一版进陈旧槽而非丢弃
-        stale = await service.list_bundles_json()
-        assert stale == first
-        assert service._LIST_CACHE is None  # 陈旧兑底未同步重建
-        tasks = [t for t in service._REBUILD_TASKS if not t.done()]
-        assert tasks  # 后台重建已挂
-        await asyncio.gather(*tasks)
-        assert service._LIST_CACHE is not None  # 新鲜载荷后台就位
-        assert not service._STALE_JSON  # 建成且仍是当前指纹 → 陈旧槽退役
-        assert await service.list_bundles_json() == first  # 同数据重建内容一致
-    finally:
-        service._STALE_JSON.clear()
-        service._STALE_GZIP.clear()
-
-
-@pytest.mark.asyncio
-async def test_gzip_stale_serve_and_disk_seed():
-    """压缩变体同走 SWR；新鲜构建落磁盘档，进程重启后内存空档由磁盘兑底。"""
-    service._STALE_JSON.clear()
-    service._STALE_GZIP.clear()
-    disk_flag = service._DISK_STALE_LOADED
-    try:
-        gz = await service.list_bundles_gzip_json()
-        assert gz.startswith(b"\x1f\x8b")  # gzip magic
-        assert service._disk_stale_path("diff").read_bytes() == gz  # 新鲜构建已落盘
-        service.invalidate_bundles_cache()
-        service._STALE_JSON.clear()
-        service._STALE_GZIP.clear()
-        service._DISK_STALE_LOADED = False  # 模拟重启：内存档全空
-        served = await service.list_bundles_gzip_json()
-        assert served == gz  # 磁盘档秒回，不进同步重建
-        assert service._REBUILDING  # 后台重建已挂
-        await asyncio.gather(*[t for t in service._REBUILD_TASKS if not t.done()])
-    finally:
-        service._STALE_JSON.clear()
-        service._STALE_GZIP.clear()
-        service._DISK_STALE_LOADED = disk_flag

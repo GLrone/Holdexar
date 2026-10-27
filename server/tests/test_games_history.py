@@ -30,6 +30,8 @@ def _h(
     suffix: str | None,
     at: datetime,
     status: str = "ok",
+    product_unknown: bool = False,
+    source: str = "steam",
 ) -> GamePriceHistory:
     return GamePriceHistory(
         appid=appid,
@@ -44,6 +46,8 @@ def _h(
         price_status=status,
         cny_fen=price,  # 直接给 CNY 分，规避汇率换算依赖
         snapshot_at=at,
+        product_unknown=product_unknown,
+        source=source,
     )
 
 
@@ -399,3 +403,51 @@ async def test_history_missing_cny_uses_historical_fx_only():
             await session.execute(delete(FxRate).where(FxRate.currency_code == "XTS"))
             await session.commit()
         await _cleanup(FX_HIST_APPID)
+
+
+@pytest.mark.asyncio
+async def test_unknown_product_series_isolated_from_standard():
+    """商品身份未知的行不进标准版序列，也不冒充 versions 里的标准条目；
+    product=unknown 取独立序列。"""
+    now = datetime.now()
+    unknown_rows = [
+        _h(APPID, "CN", 6000, 0, 0, False, None, now - timedelta(days=300),
+           product_unknown=True, source="community"),
+        _h(APPID, "CN", 4500, 25, 0, False, None, now - timedelta(days=40),
+           product_unknown=True, source="community"),
+    ]
+    async with get_session_factory()() as session:
+        session.add_all(unknown_rows)
+        await session.commit()
+
+    # 缺省（标准版）：未知行绝不混入——价格仍是有身份的标准版三切片
+    default = await service.get_game_history(APPID, region="cn")
+    assert [p["cnyFen"] for p in default["points"]] == [10000, 8000, 9000]
+
+    # versions：标准条目带 product=standard；未知是显式独立条目（非标准冒充）
+    std_entry = next(v for v in default["versions"] if v["subId"] == STANDARD_SUB)
+    unknown_entry = next(v for v in default["versions"] if v.get("product") == "unknown")
+    assert std_entry["product"] == "standard"
+    assert unknown_entry["subId"] is None and unknown_entry["suffix"] is None
+
+    # 独立未知序列
+    unknown = await service.get_game_history(APPID, region="cn", product="unknown")
+    assert [p["cnyFen"] for p in unknown["points"]] == [6000, 4500]
+
+
+@pytest.mark.asyncio
+async def test_price_context_excludes_unknown_product_rows():
+    """账单价格上下文只认有身份的标准版序列；未知行不参与当时价/史低。"""
+    now = datetime.now()
+    day = (now - timedelta(days=20)).strftime("%Y-%m-%d")
+    ctx_without = await service.get_price_context(APPID, day, region="cn")
+
+    async with get_session_factory()() as session:
+        session.add_all([
+            _h(APPID, "CN", 3000, 0, 0, False, None, now - timedelta(days=20),
+               product_unknown=True, source="community"),
+        ])
+        await session.commit()
+
+    ctx_with = await service.get_price_context(APPID, day, region="cn")
+    assert ctx_with["lowest"] == ctx_without["lowest"]  # 未知行不拉低史低

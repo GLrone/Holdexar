@@ -58,6 +58,8 @@ async def _price(db, appid, region, status, *, hours_ago: float = 0.0) -> None:
             price=9900 if status == "ok" else None, sub_id=1,
             price_status=status, fail_count=0,
             updated_at=datetime.now() - timedelta(hours=hours_ago),
+            attempt_outcome="success" if status in ("ok", "locked") else "failed",
+            last_success_at=datetime.now() - timedelta(hours=hours_ago) if status in ("ok", "locked") else None,
         ))
         await session.commit()
 
@@ -165,7 +167,6 @@ async def test_full_cycle_stats(db):
     async with db() as session:
         row = await session.get(PriceCycle, cid)
         assert row.units_missing == 0 and row.units_blocked == 0
-        assert row.coverage_json is None, "新轮不再写快照列"
 
 
 # ── 部分 Cycle：口径关系 ──
@@ -250,15 +251,15 @@ async def test_stale_count_counts_objects(db):
 
 
 @pytest.mark.asyncio
-async def test_fresh_object_with_one_stale_region_is_not_stale(db):
-    """对象级口径：只要有任一区在阈值内，整个对象就不算 stale。"""
+async def test_one_stale_region_remains_visible_in_object_statistics(db):
+    """一处地区陈旧仍计入对象陈旧数。"""
     cid = await _make_cycle(db, [APP_A], REGIONS)
     await _price(db, APP_A, "cn", "ok", hours_ago=1.0)
     await _price(db, APP_A, "ru", "ok", hours_ago=30.0)
     await _finish(cid)
 
     recorded = await stats_mod.record_stats(cid)
-    assert recorded["staleCount"] == 0
+    assert recorded["staleCount"] == 1
 
 
 # ── 没有统计 vs 有统计 ──

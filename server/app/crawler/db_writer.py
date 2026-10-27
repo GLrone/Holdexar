@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -14,7 +15,6 @@ from datetime import datetime, timedelta
 from sqlalchemy import case, delete, func, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from app.core import seed_assets
 from app.core.database import (
     WritePriority,
     get_session_factory,
@@ -30,6 +30,7 @@ from app.domains.games.models import (
     GamePriceHistory,
 )
 from app.domains.rates.models import FxRate
+from app.domains.games.derived import catalog_inputs, update_price_derived
 
 from .utils import get_beijing_time_obj
 
@@ -98,12 +99,24 @@ _CURRENT_UPDATABLE = (
     "cny_fen",
     "discount_end_ts",
     "updated_at",
-    # 尝试观察三元组：批量成功观察随行盖章（失败路径走 mark_region_status /
-    # 账本 bump，不在此列——它们不得触碰 last_success_at）
+    # 失败观察只推进尝试，冲突更新保留上次成功事实。
     "attempt_outcome",
     "steam_answer",
     "last_success_at",
 )
+
+
+def _current_updates(excluded) -> dict:
+    return {
+        key: getattr(excluded, key) if key in (
+            "updated_at", "price_status", "attempt_outcome", "steam_answer",
+        ) else case(
+            (excluded.attempt_outcome == "failed", getattr(GameCurrentPrice, key)),
+            else_=getattr(excluded, key),
+        )
+        for key in _CURRENT_UPDATABLE
+    }
+
 
 # 补抓账本参数：免费游戏 price=0 合法（parse_all_sub_prices is_free 路径），
 # 只有 status=ok 且 price=None 才是"成功响应里的坏数据"；连续补抓失败上限，
@@ -246,6 +259,7 @@ def _missing_ledger_bump() -> dict:
         ),
         "fail_count": GameCurrentPrice.fail_count + 1,
         "attempt_outcome": "failed",
+        "steam_answer": None,
     }
 
 
@@ -423,6 +437,7 @@ class DbWriter:
                             "bundle_id": p.get("bundle_id"),
                             "bundle_discount_pct": p.get("bundle_discount_pct"),
                             "steam_event_key": event_key,
+                            "source": "steam",
                             "snapshot_at": now_dt,
                         }
                     )
@@ -524,10 +539,12 @@ class DbWriter:
                 }
             )
 
-        # 尝试观察盖章：批量写 = 成功观察（拿到了 Steam 对该区的明确答复，
-        # 含 locked / 无购买选项）。answer 缺省时按状态推导（导入 / 旧调用
-        # 方路径不带显式 answer）。
+        # 门禁降级是失败观察；明确答复含 locked / 无购买选项。
+        # 导入和旧调用方没有显式 answer 时按状态推导。
         for row in current_batch:
+            if row["region_code"] in degraded_regions:
+                row.update(attempt_outcome="failed", last_success_at=None, steam_answer=None)
+                continue
             row["attempt_outcome"] = "success"
             row["last_success_at"] = row["updated_at"]
             if not row.get("steam_answer"):
@@ -572,6 +589,9 @@ class DbWriter:
                     baseline = await self._load_baseline(
                         session, int(game_data.get("appid") or 0)
                     )
+                from app.domains.games.derived import catalog_inputs, update_price_derived
+
+                catalog_before = await catalog_inputs(session, [int(game_data["appid"])])
                 insert_game = sqlite_insert(Game).values(**game_values)
                 upsert_set = {
                     c: getattr(insert_game.excluded, c)
@@ -617,7 +637,7 @@ class DbWriter:
                                     GameCurrentPrice.appid,
                                     GameCurrentPrice.region_code,
                                 ],
-                                set_={c: getattr(insert_cp.excluded, c) for c in _CURRENT_UPDATABLE},
+                                set_=_current_updates(insert_cp.excluded),
                             )
                         )
 
@@ -651,6 +671,7 @@ class DbWriter:
                             _history_upsert().values(history_batch)
                         )
 
+                await update_price_derived([int(game_data["appid"])], session=session, catalog_before=catalog_before)
                 if not commit:
                     return True
                 await session.commit()
@@ -658,7 +679,6 @@ class DbWriter:
             appid_int = int(game_data.get("appid") or 0)
             if appid_int:
                 await self.clear_removed_mark(appid_int)
-            await seed_assets.apply_curated(appid_int)
             return True
 
         except Exception as e:
@@ -750,7 +770,6 @@ class DbWriter:
             for game_data, _ in entries
             if int(game_data.get("appid") or 0)
         ]
-        curated_rows = seed_assets.prepare_curated_rows(ok_ids)
         # 写调度器在取连接之前：排队等写者位的段不占连接池，读请求不被写侧挤占
         async with write_session(WritePriority.BACKGROUND, label="price_batch") as session:
             try:
@@ -790,6 +809,9 @@ class DbWriter:
                     )
                 plan_ms = _ms_since(_tplan)
 
+                from app.domains.games.derived import catalog_inputs, update_price_derived
+
+                catalog_before = await catalog_inputs(session, ok_ids)
                 insert_game = sqlite_insert(Game)
                 game_ms = current_ms = ledger_ms = history_ms = 0
                 commit_ms = 0
@@ -846,7 +868,7 @@ class DbWriter:
                             GameCurrentPrice.appid,
                             GameCurrentPrice.region_code,
                         ],
-                        set_={c: getattr(insert_cp.excluded, c) for c in _CURRENT_UPDATABLE},
+                        set_=_current_updates(insert_cp.excluded),
                     )
                     _tp = time.perf_counter()
                     for chunk in _chunks(all_current, _INSERT_CHUNK_ROWS):
@@ -886,7 +908,7 @@ class DbWriter:
                     for chunk in _chunks(all_history, _INSERT_CHUNK_ROWS):
                         await session.execute(hist_stmt, chunk)
                     history_ms = _ms_since(_th)
-                # 收尾（复活清标 / 种子补挂）保存点内联：与主段同事务一次
+                # 收尾（复活清标）保存点内联：与主段同事务一次
                 # 提交，段后不再两次重排写闸；失败只回滚保存点不拖垮主段
                 _tp = time.perf_counter()
                 sp = await session.begin_nested()
@@ -894,7 +916,6 @@ class DbWriter:
                     cleared = await self._clear_removed_marks_statements(
                         session, ok_ids
                     )
-                    await seed_assets.apply_curated_rows(session, curated_rows)
                     await sp.commit()
                 except Exception as e:  # noqa: BLE001 —— 收尾失败不影响价格链
                     await sp.rollback()
@@ -913,6 +934,7 @@ class DbWriter:
                             detail={"数量": cleared},
                         )
                 post_ms = _ms_since(_tp)
+                await update_price_derived(ok_ids, session=session, catalog_before=catalog_before)
                 _tm = time.perf_counter()
                 await session.commit()
                 commit_ms = _ms_since(_tm)
@@ -1019,9 +1041,6 @@ class DbWriter:
                     sp = await session.begin_nested()
                     try:
                         await self._clear_removed_marks_statements(session, chunk_ok_ids)
-                        await seed_assets.apply_curated_rows(
-                            session, seed_assets.prepare_curated_rows(chunk_ok_ids)
-                        )
                         await sp.commit()
                     except Exception as e:  # noqa: BLE001
                         await sp.rollback()
@@ -1064,6 +1083,7 @@ class DbWriter:
         """确保 games 表有记录（满足外键约束）。"""
         try:
             async with write_session(WritePriority.BACKGROUND) as session:
+                before = await catalog_inputs(session, [int(appid)])
                 stmt = sqlite_insert(Game).values(
                     appid=int(appid), name=name,
                     created_at=_naive(get_beijing_time_obj()),
@@ -1072,9 +1092,8 @@ class DbWriter:
                 await session.execute(
                     stmt.on_conflict_do_nothing(index_elements=[Game.appid])
                 )
+                await update_price_derived([int(appid)], session=session, catalog_before=before)
                 await session.commit()
-            # 回补链路只插行不抓价，人工列在此同步补挂（与主 upsert 同语义）
-            await seed_assets.apply_curated(int(appid))
         except Exception as e:
             log_event(logger, "补建游戏占位行失败", level=logging.ERROR, detail={"原因": e})
 
@@ -1139,6 +1158,7 @@ class DbWriter:
         """
         try:
             async with write_session(WritePriority.BACKGROUND) as session:
+                before = await catalog_inputs(session, [int(appid)])
                 stmt = sqlite_insert(Game).values(
                     appid=int(appid),
                     name=f"AppID_{appid}",
@@ -1155,6 +1175,7 @@ class DbWriter:
                         },
                     )
                 )
+                await update_price_derived([int(appid)], session=session, catalog_before=before)
                 await session.commit()
         except Exception as e:
             log_event(logger, "标记非游戏类型失败", level=logging.ERROR, detail={"原因": e})
@@ -1238,6 +1259,9 @@ class DbWriter:
                         },
                     )
                 await session.execute(stmt)
+                from app.domains.games.derived import update_price_derived
+
+                await update_price_derived([int(appid)], session=session)
                 await session.commit()
         except Exception as e:
             log_event(logger, "记录区域异常状态失败", level=logging.ERROR, detail={"原因": e})
@@ -1291,6 +1315,9 @@ class DbWriter:
                 WritePriority.BACKGROUND, label="missing_ledger_batch"
             ) as session:
                 await session.execute(upsert, rows)
+                from app.domains.games.derived import update_price_derived
+
+                await update_price_derived([a for a, _ in seen], session=session)
                 await session.commit()
             return len(rows)
         except Exception as e:
@@ -1327,6 +1354,9 @@ class DbWriter:
                         GameCurrentPrice.price_status == "missing",
                     )
                 )
+                from app.domains.games.derived import update_price_derived
+
+                await update_price_derived([int(a) for a, _ in pairs], session=session)
                 await session.commit()
                 return int(result.rowcount or 0)
         except Exception as e:
@@ -1348,6 +1378,7 @@ class DbWriter:
         """
         try:
             async with write_session(WritePriority.BACKGROUND) as session:
+                before = await catalog_inputs(session, [int(appid)])
                 stmt = sqlite_insert(Game).values(
                     appid=int(appid),
                     name=f"AppID_{appid}",
@@ -1368,6 +1399,7 @@ class DbWriter:
                         },
                     )
                 )
+                await update_price_derived([int(appid)], session=session, catalog_before=before)
                 await session.commit()
         except Exception as e:
             log_event(logger, "标记即将推出暂缓失败", level=logging.ERROR, detail={"原因": e})
@@ -1485,7 +1517,7 @@ class DbWriter:
             return []
 
     async def generate_missing_tasks(
-        self, cooldown_minutes: int = 10, limit_rows: int = 0
+        self, cooldown_minutes: int = 10, limit_rows: int = 0, *, excluded_appids: set[int] | None = None,
     ) -> list[dict]:
         """从欠账账本生成定向补抓任务（按区分组批量：1 任务 = 1 区 × ≤300 appid）。
 
@@ -1528,10 +1560,6 @@ class DbWriter:
                         f"已清除 {removed} 行空区的补抓尝试痕迹",
                         detail={"行数": removed},
                     )
-                # 不按业务状态排除欠账：下架/免费态的 missing 行若被排除，
-                # 而它们同样不在 pool/catalog 的爬取集合里——账本行将永远
-                # 无消费路径的死账。可补抓性交给补抓本身：真不可
-                # 得的区由逐项判定重新记账并走 fail_count 穷尽转 blocked。
                 query = (
                     select(GameCurrentPrice.appid, GameCurrentPrice.region_code)
                     .where(
@@ -1541,6 +1569,10 @@ class DbWriter:
                     )
                     .order_by(GameCurrentPrice.updated_at)
                 )
+                if excluded_appids:
+                    query = query.where(text(
+                        "game_current_prices.appid NOT IN (SELECT CAST(value AS INTEGER) FROM json_each(:excluded_appids))"
+                    ).bindparams(excluded_appids=json.dumps(sorted(excluded_appids))))
                 if limit_rows > 0:
                     query = query.limit(limit_rows)
                 rows = (await session.execute(query)).all()

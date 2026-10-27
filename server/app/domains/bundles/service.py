@@ -1,39 +1,13 @@
-"""捆绑包域服务：列表聚合 + 详情（补齐计算数据源）+ 排序快照维护。
-
-聚合语义：按 bundle_id 分组区域价 → 双产品隔离 → 追踪区过滤 → 以 app_ids
-最多的区为基准推算各区锁区游戏数；最低价/差价/smart 评分一律读 bundles
-排序快照（min_cny_fen/diff_fen/is_lowest/smart_score，由
-refresh_bundle_sort_cache 在写时维护，与 games 的 refresh_sort_cache 同构）。
-
-分层约束（排序快照 ≠ 请求期计算）：
-- 数据采集层：bundle_region_prices 原始价 + cny_fen（爬取/导入落库）；
-- 派生计算层：refresh_bundle_sort_cache →
-  bundles.min_cny_fen/diff_fen/is_lowest/smart_score；
-- 查询层：WHERE + ORDER BY（diff_fen | smart_score，排序参数）+ LIMIT
-  （SQL，见 _load_all_locked）。
-**任何 GET 不得现算排序所依赖的派生值**（GET → calculate cny / lowest /
-diff、Python sort 都视为架构倒退）；展示层的 lowestRegion/lowestCnyFen
-只是对快照的查表（全区最低 = min(国区价, 非国区最低快照)）。
-
-数据形态约定：
-- 存 minor units + cny_fen，展示字符串按展示时汇率现算。
-- pk 爬虫端即"南亚"双区，无独立 BD 区，不需要镜像补 BD 逻辑。
-- 归属推演只做"全部 appid 已拥有/家庭共享"条件（前端 ownership store）。
-"""
+"""捆绑包分页查询、详情与写时排序快照。"""
 from __future__ import annotations
 
-import asyncio
 import json
-import logging
 import re
-import zlib
 
-from sqlalchemy import select, text
+from sqlalchemy import literal_column, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import WritePriority, get_session_factory, write_session
-from app.core.database import write_gate
-from app.core.logging import log_event
 from app.domains.crawl import freshness as freshness_service
 from app.domains.games.models import Bundle, BundleRegionPrice, Game, GameCurrentPrice
 from app.domains.games.pricing import (
@@ -49,7 +23,6 @@ from app.domains.games.scoring import (
     quality_score,
     save_score,
 )
-from app.domains.games.service import get_rates
 
 # Steam 图片 CDN 三域同库：akamai 域国内直连可达（fastly 被墙/不稳定，
 # queniuqe 为历史镜像域）。入库原样保留，展示期统一归一到 akamai。
@@ -57,117 +30,6 @@ _IMG_CDN_HOSTS = re.compile(
     r"^https?://shared\.(?:fastly\.steamstatic|cdn\.queniuqe)\.com", re.IGNORECASE
 )
 _IMG_CDN_REPLACEMENT = "https://shared.akamai.steamstatic.com"
-
-# ── 进程内缓存（列表页每次进/每次刷新都全量重算：装载 25.8k 包 + 14.1 万行
-# 区域价、逐包聚合、再序列化 12MB；数据只在刷新/导入时变化，失效式缓存比
-# 按 TTL 更准）──────────────────────────────────────────────────────────
-# 分层（见模块 docstring）：排序快照（min_cny_fen/diff_fen/is_lowest）由
-# refresh_bundle_sort_cache 在写侧维护，聚合只读快照 + 组装展示区表——
-# 请求期不现算最低/差价、不排序。
-# 缓存有效性 = 写入失效（invalidate_bundles_cache，挂在刷新链尾/导入/追踪区
-# 变更/汇率原子刷新四个写侧出口）+ 输入指纹（汇率表 / 追踪区集合任一变化
-# 自动重算——两者都会改变聚合结果，且都是运行时可变的用户可见状态，不能只
-# 靠写失效）。
-# _LIST_JSON_CACHE 是列表的**预序列化 bytes**：FastAPI 的 dict 返回路径每次
-# 请求都要重跑 jsonable_encoder + JSON 编码（15k 条 2s 级），而两次请求
-# 之间内容并不变——编码一次、按指纹复用。三份缓存同源同失效、指纹一致；
-# 数据/列表缓存按 (指纹, 排序参数) 分键（smart/diff 各一份），JSON 缓存按
-# 键分槽（dict），切换排序不重复编码。
-# _LIST_GZIP_CACHE 是同一份载荷的**预压缩 bytes**（见 list_bundles_gzip_json）：
-# 传输压缩中间件对非流式响应必须收齐整包才开始下发，50MB 级载荷会把响应起送
-# 从毫秒推到秒级；预压缩把这份 CPU 挪到缓存构建时一次，请求期只读 bytes。
-_DATA_CACHE: tuple[tuple, tuple[list, dict[int, list], dict[str, float]]] | None = None
-_LIST_CACHE: tuple[tuple, list[dict]] | None = None
-_LIST_JSON_CACHE: dict[tuple, bytes] = {}
-_LIST_GZIP_CACHE: dict[tuple, bytes] = {}
-
-# 陈旧兑底（stale-while-revalidate）：失效时把上一版字节搬进来而不是丢弃，
-# 重建完成前的请求秒回旧版——数据只在刷新/汇率/追踪区变化时变，重建窗口
-# 内的陈旧以秒计且内容仍是最近一轮刷新的合法快照。_STALE_GZIP 另有一份
-# 磁盘档（data/cache/），进程重启后内存为空时读盘兜底，覆盖启动链预热
-# 完成前进页的窗口。
-_STALE_JSON: dict[str, bytes] = {}
-_STALE_GZIP: dict[str, bytes] = {}
-_REBUILDING: set[str] = set()
-_REBUILD_TASKS: set[asyncio.Task] = set()
-_DISK_STALE_LOADED = False
-
-# 列表排序参数（bundle 排序快照列）：diff = 差价降序（历史默认），
-# smart = 智能评分降序（games 商店同款四因子，见 _bundle_smart_score）
-_SORTS = ("diff", "smart")
-
-
-def _normalize_sort(sort: str | None) -> str:
-    """列表排序参数归一：仅接受 smart，其余（含空/未知）一律回落 diff。"""
-    return "smart" if sort == "smart" else "diff"
-
-# 并发互斥：启动预热与用户请求会在「缓存未建」时同时进来（页面开得比预热快
-# 是常态），没有锁就各自全量重算一遍（装载秒级 + 聚合秒级 ×2）。双检锁
-# 保证只跑一次，其余请求等锁后直接吃缓存。两把锁分开拿、不嵌套（先 _load_all
-# 后聚合），asyncio.Lock 不可重入，嵌套即死锁。
-_DATA_LOCK = asyncio.Lock()
-_LIST_LOCK = asyncio.Lock()
-
-
-def _rates_fp(rates: dict[str, float]) -> tuple:
-    """汇率指纹：币种→汇率的稳定排序元组（round 防 float 尾噪）。"""
-    return tuple(sorted((k, round(v, 8)) for k, v in rates.items()))
-
-
-def _list_fp(tracked: set[str] | None, rates: dict[str, float]) -> tuple:
-    """列表缓存指纹：追踪区集合（None=全量语义，按空集归一）+ 汇率表。"""
-    return (tuple(sorted(tracked)) if tracked else (), _rates_fp(rates))
-
-
-def invalidate_bundles_cache() -> None:
-    """捆绑包数据变更后调用（refresh / import / 爬虫补包共用写入口已挂）。
-
-    上一版预序列化字节先搬进陈旧槽再清活缓存：失效后的首个请求立即拿到
-    旧版并触发后台重建，不再把 15s 级冷重建压进请求路径。"""
-    global _DATA_CACHE, _LIST_CACHE
-    for key, payload in _LIST_JSON_CACHE.items():
-        _STALE_JSON[key[1]] = payload
-    for key, payload in _LIST_GZIP_CACHE.items():
-        _STALE_GZIP[key[1]] = payload
-    _DATA_CACHE = None
-    _LIST_CACHE = None
-    _LIST_JSON_CACHE.clear()
-    _LIST_GZIP_CACHE.clear()
-
-
-async def _bundle_blocked_ids() -> set[int]:
-    """用户已移除/已排除的包（monitoring released + excluded，与刷新候选集同口径）。"""
-    try:
-        from app.domains.monitoring import service as monitoring_service
-
-        return await monitoring_service.blocked_ids("bundle")
-    except Exception:  # noqa: BLE001
-        log_event(
-            logger,
-            "读取已移除监控名单失败，捆绑包列表改按全量展示",
-            tag="降级",
-            level=logging.ERROR,
-            exc_info=True,
-        )
-        return set()
-
-
-async def _bundle_followed_ids() -> set[int]:
-    """星标关注的包（monitoring favorite 来源，升序去重）。"""
-    try:
-        from app.domains.monitoring import service as monitoring_service
-
-        return set(await monitoring_service.ids_with_source("bundle", "favorite"))
-    except Exception:  # noqa: BLE001
-        log_event(
-            logger,
-            "读取星标关注名单失败，捆绑包列表不做置顶",
-            tag="降级",
-            level=logging.ERROR,
-            exc_info=True,
-        )
-        return set()
-
 
 def _normalize_image(url: str | None) -> str | None:
     """图片 CDN 域归一化：fastly/queniuqe → akamai（路径不变，同图可达）。"""
@@ -389,522 +251,320 @@ def _aggregate(
     }
 
 
-# ── 排序快照（bundles.min_cny_fen/diff_fen/is_lowest/smart_score）────────
-# 铁律：排序所依赖的派生值一律在写时算好（本函数组），任何 GET 只读快照。
-_SNAPSHOT_TOLERANCE_FEN = 500  # 「国区 ≈ 追踪区最低」容差（±5 元，对齐 games isLowest）
-_SNAPSHOT_BATCH = 400  # 回写批量（SQLite 绑定变量上限内）
-_PRICE_LOAD_CHUNK = 9000  # 区域价装载批量：全库包数可超单条 IN 的绑定变量上限
-
-
-def _bundle_smart_score(
-    diff_fen: int,
-    baseline_appids: list[int],
-    region_prices: dict[str, dict],
-    review_stats: dict[int, tuple[int | None, int | None, str | None]],
-) -> float:
-    """捆绑包 smart 评分（0~1）：四因子复刻 games/scoring.py，权重同构。
-
-    - S_save        = save_score(diff_fen)，同公式：外区相对国区的折算差价，
-                      对数压缩、¥200 封顶；
-    - S_quality     = 成员游戏质量均值（SteamDB 置信度收缩同公式；成员零评价
-                      按发行成熟度计，与 games 同口径）；
-                      无成员入库数据 = 0.5 中性；
-    - S_timing      = 限时叠加促销 1.0 / 常态 0。捆绑包无史低跟踪，促销信号 =
-                      现折扣超过结构化基础档（discount_percent >
-                      bundle_base_discount，Steam 促销期在档位折扣上额外叠加），
-                      促销中即最佳购买时机，不做分档；
-    - S_familiarity = 成员游戏评测规模均值（log10，10 万封顶，轻权重）。
-    """
-    s_save = save_score(diff_fen)
-    rated = [review_stats[a] for a in baseline_appids if a in review_stats]
-    if rated:
-        s_quality = sum(quality_score(p, n, rd) for p, n, rd in rated) / len(rated)
-        s_familiarity = sum(familiarity_score(n) for _, n, _ in rated) / len(rated)
-    else:
-        s_quality, s_familiarity = 0.5, 0.0
-    promo = any(
-        rp["discountPercent"] > rp["baseDiscount"]
-        for rp in region_prices.values()
-        if rp["cnyFen"] is not None
-    )
-    s_timing = 1.0 if promo else 0.0
-    return (
-        W_SAVE * s_save
-        + W_QUALITY * s_quality
-        + W_TIMING * s_timing
-        + W_FAMILIARITY * s_familiarity
-    )
-
-
-def _snapshot_values(
-    bundle: Bundle,
-    price_rows: list,
-    tracked: set[str] | None,
-    review_stats: dict[int, tuple[int | None, int | None, str | None]],
-) -> tuple[int | None, int, bool, list[int], float]:
-    """单包排序快照：min_cny_fen / diff_fen / is_lowest / 基准 appids / smart_score。
-
-    与列表展示严格同源（_family_region_prices：双产品隔离 + 追踪区过滤）：
-    - min_cny_fen = 非 CN 各区有价行最低 CNY 分（原始值，无则 NULL）；
-    - diff_fen = MAX(国区价 − COALESCE(最低, 国区价), 0)（无国区价 = 0）；
-    - is_lowest = 国区价 ≈ 追踪区最低（±5 元）——国区买即（近似）全球最低，
-      判据对齐 games 的 isLowest 筛选语义；无国区价（锁区/无数据）恒 False；
-    - smart_score = _bundle_smart_score（成员游戏 = 基准 appids 与 games 表
-      的交集，评测数据由 refresh 调用方一次装载传入）。
-    """
-    region_prices, baseline_appids = _family_region_prices(bundle, price_rows, tracked)
-    others = [
-        rp["cnyFen"]
-        for code, rp in region_prices.items()
-        if code != "CN" and rp["cnyFen"] is not None and rp["cnyFen"] > 0
-    ]
-    min_cny_fen = min(others) if others else None
-    cn_cny_fen = region_prices.get("CN", {}).get("cnyFen")
-    if cn_cny_fen is None:
-        return (
-            min_cny_fen,
-            0,
-            False,
-            baseline_appids,
-            _bundle_smart_score(0, baseline_appids, region_prices, review_stats),
-        )
-    reference = min_cny_fen if min_cny_fen is not None else cn_cny_fen
-    diff_fen = max(cn_cny_fen - reference, 0)
-    is_lowest = reference >= cn_cny_fen - _SNAPSHOT_TOLERANCE_FEN
-    return (
-        min_cny_fen,
-        diff_fen,
-        is_lowest,
-        baseline_appids,
-        _bundle_smart_score(diff_fen, baseline_appids, region_prices, review_stats),
-    )
+def register_bundle_sql_functions(connection) -> None:
+    for name, count, function in (
+        ("bundle_lower", 1, lambda value: (value or "").lower()),
+        ("bundle_save_score", 1, save_score),
+        ("bundle_quality_score", 3, quality_score),
+        ("bundle_familiarity_score", 1, familiarity_score),
+    ):
+        connection.create_function(name, count, function, deterministic=True)
 
 
 async def refresh_bundle_sort_cache(
     bundle_ids: list[int] | None = None, *, session: AsyncSession | None = None
 ) -> int:
-    """重算 bundles.min_cny_fen / diff_fen / is_lowest / smart_score（列表排序快照）。
-
-    bundle_ids=None 全库（启动 / 汇率变更 / 追踪区变更）；列表 = 增量
-    （刷新链尾 / 单包导入）。口径同列表聚合（双产品隔离 + 追踪区过滤）——
-    追踪区集合变化会改变最低价所在区，故追踪区变更必须整库重建。
-    smart_score 因子（成员游戏评测）随追踪区无关，但与 min/diff 同事务写入，
-    不做增量拆分。
-
-    session 注入时不自行提交：汇率原子刷新用它把「汇率 → cny_fen →
-    games sort → bundles sort」串进同一事务，GET 只可能读到旧快照或新快照。
-    返回写入行数。
-    """
-    if session is not None:
-        return await _refresh_bundle_sort_cache(bundle_ids, session)
-    async with write_session(WritePriority.BACKGROUND) as own:
-        written = await _refresh_bundle_sort_cache(bundle_ids, own)
-        await own.commit()
-    return written
-
-
-async def _refresh_bundle_sort_cache(
-    bundle_ids: list[int] | None, db: AsyncSession
-) -> int:
-    bundle_ids = [int(b) for b in bundle_ids] if bundle_ids is not None else None
-    if bundle_ids is not None and not bundle_ids:
+    """批量更新指定包排序快照；注入会话时沿用调用方事务。"""
+    if bundle_ids == []:
         return 0
+    if session is None:
+        async with write_session(WritePriority.BACKGROUND) as own:
+            written = await refresh_bundle_sort_cache(bundle_ids, session=own)
+            await own.commit()
+            return written
+    from app.core.database import write_gate
 
-    stmt = select(Bundle)
-    if bundle_ids is not None:
-        stmt = stmt.where(Bundle.bundle_id.in_(bundle_ids))
-    bundles = (await db.execute(stmt)).scalars().all()
-    if not bundles:
-        return 0
-
-    ids = [b.bundle_id for b in bundles]
-    price_cols = (
-        BundleRegionPrice.id,
-        BundleRegionPrice.bundle_id,
-        BundleRegionPrice.region_code,
-        BundleRegionPrice.price,
-        BundleRegionPrice.currency,
-        BundleRegionPrice.discount_percent,
-        BundleRegionPrice.bundle_base_discount,
-        BundleRegionPrice.discount_end_ts,
-        BundleRegionPrice.cny_fen,
-        BundleRegionPrice.app_ids,
-    )
-    price_rows: list = []
-    for i in range(0, len(ids), _PRICE_LOAD_CHUNK):
-        chunk = ids[i : i + _PRICE_LOAD_CHUNK]
-        price_rows.extend(
-            (
-                await db.execute(
-                    select(*price_cols).where(
-                        BundleRegionPrice.bundle_id.in_(chunk)
-                    )
-                )
-            ).all()
-        )
-    by_bundle: dict[int, list] = {}
-    for p in price_rows:
-        by_bundle.setdefault(p.bundle_id, []).append(p)
-
-    tracked = await _tracked_region_codes()
-    # smart 评分的成员游戏评测数据：全表四列一次装载（后台重活，与 14.1 万行
-    # 价格装载同量级），逐包按基准 appids 查表
-    stat_rows = (
-        await db.execute(
-            select(Game.appid, Game.positive_rate, Game.review_count, Game.release_date)
-        )
-    ).all()
-    review_stats = {
-        r.appid: (r.positive_rate, r.review_count, r.release_date) for r in stat_rows
-    }
-    updates = []
-    for b in bundles:
-        min_fen, diff_fen, is_lowest, _baseline, smart = _snapshot_values(
-            b,
-            by_bundle.get(b.bundle_id, []),
-            tracked,
-            review_stats,
-        )
-        updates.append(
-            {
-                "b": b.bundle_id,
-                "m": min_fen,
-                "d": diff_fen,
-                "l": 1 if is_lowest else 0,
-                "s": smart,
-            }
-        )
-
-    sql = text(
-        "UPDATE bundles SET min_cny_fen = :m, diff_fen = :d, is_lowest = :l, "
-        "smart_score = :s WHERE bundle_id = :b"
-    )
-    for i in range(0, len(updates), _SNAPSHOT_BATCH):
-        await db.execute(sql, updates[i : i + _SNAPSHOT_BATCH])
-    return len(updates)
+    async with write_gate():
+        await session.flush()
+        connection = await session.connection()
+        await connection.run_sync(lambda conn: register_bundle_sql_functions(conn.connection.dbapi_connection))
+        sql, params = bundle_sort_sql(bundle_ids, await _tracked_region_codes())
+        await session.execute(text(sql), params)
+        return int((await session.execute(text("SELECT changes()"))).scalar() or 0)
 
 
-async def _load_all(sort: str = "diff") -> tuple[list, dict[int, list], dict[str, float]]:
-    sort = _normalize_sort(sort)
-    global _DATA_CACHE
-    rates = await get_rates()
-    fp = _rates_fp(rates)
-    key = (fp, sort)
-    if _DATA_CACHE is not None and _DATA_CACHE[0] == key:
-        return _DATA_CACHE[1]
-    async with _DATA_LOCK:
-        # 双检：等锁期间别的协程可能已经建好
-        if _DATA_CACHE is not None and _DATA_CACHE[0] == key:
-            return _DATA_CACHE[1]
-        return await _load_all_locked(key, rates, sort)
-
-
-async def _load_all_locked(
-    key: tuple, rates: dict[str, float], sort: str
-) -> tuple[list, dict[int, list], dict[str, float]]:
-    global _DATA_CACHE
-    # Core 列查询（不构造 ORM 实体）：identity map 与实体构造对只读行是纯开销
-    # （这些行从不回写）。
-    # 排序在 SQL 层完成（ORDER BY 排序快照列：diff_fen | smart_score DESC，
-    # 排序参数决定；smart_score NULL 排尾部——快照未重建的行不冒充前排）——
-    # GET 不做 Python sort；等价 id 序（bundle_id）保证同分/同差价时分页/缓存稳定。
-    order_by = (
-        (Bundle.smart_score.desc(), Bundle.bundle_id.asc())
-        if sort == "smart"
-        else (Bundle.diff_fen.desc(), Bundle.bundle_id.asc())
-    )
-    async with get_session_factory()() as session:
-        bundles = (
-            await session.execute(
-                select(
-                    Bundle.bundle_id,
-                    Bundle.name,
-                    Bundle.header_image,
-                    Bundle.must_purchase_as_set,
-                    Bundle.item_kind,
-                    Bundle.url,
-                    Bundle.min_cny_fen,
-                    Bundle.diff_fen,
-                    Bundle.smart_score,
-                ).order_by(*order_by)
-            )
-        ).all()
-        price_rows = (
-            await session.execute(
-                select(
-                    BundleRegionPrice.id,
-                    BundleRegionPrice.bundle_id,
-                    BundleRegionPrice.region_code,
-                    BundleRegionPrice.price,
-                    BundleRegionPrice.currency,
-                    BundleRegionPrice.discount_percent,
-                    BundleRegionPrice.bundle_base_discount,
-                    BundleRegionPrice.discount_end_ts,
-                    BundleRegionPrice.cny_fen,
-                    BundleRegionPrice.app_ids,
-                    BundleRegionPrice.crawled_at,
-                )
-            )
-        ).all()
-    prices_by_bundle: dict[int, list] = {}
-    for p in price_rows:
-        prices_by_bundle.setdefault(p.bundle_id, []).append(p)
-    _DATA_CACHE = (key, (bundles, prices_by_bundle, rates))
-    return _DATA_CACHE[1]
-
-
-# 列表投影剥掉的区级字段：抽屉与补齐计算器才消费，列表渲染零引用。
-# 逐区 appIds（锁区检测依据）+ lockedCount（相对基准区缺几款）+ formatted
-# （服务端格式化串）合计约占全量载荷的 28%。
 _LIST_REGION_DROP = ("appIds", "lockedCount", "formatted")
 
 
-def _build_list_items(bundles, prices_by_bundle, tracked) -> list[dict]:
-    """全量聚合 + 剔除追踪区内无价包（列表与其 JSON 出口共用）。
-
-    顺序 = 加载查询的 SQL ORDER BY（排序快照 diff_fen DESC）——不做
-    Python sort（GET → Python sort 是架构倒退）。
-
-    列表是**投影视图**：逐区剥掉只有抽屉/计算器消费的字段
-    （_LIST_REGION_DROP），那些消费点一律改读详情（get_bundle_detail 走完整
-    聚合）。列表与详情因此不再是同一份区表。
-    """
-    items = [
-        _aggregate(b, prices_by_bundle.get(b.bundle_id, []), tracked)
-        for b in bundles
-    ]
-    for item in items:
-        for rp in item["regionPrices"].values():
-            for key in _LIST_REGION_DROP:
-                rp.pop(key, None)
-    return [i for i in items if i["regionPrices"]]
+def _json_array_sql(column: str) -> str:
+    return (f"CASE WHEN json_valid({column}) THEN CASE WHEN json_type({column}) = 'array' "
+            f"THEN {column} ELSE '[]' END ELSE '[]' END")
 
 
-async def list_bundles(sort: str = "diff", *, removed: bool = False) -> list[dict]:
-    """全量捆绑包列表（sort=diff 差价降序 | smart 评分降序）。
+def _region_rows_sql(target_where: str = ":bundle_ids IS NULL OR b.bundle_id IN (SELECT value FROM json_each(:bundle_ids))") -> str:
+    return f"""
+WITH targets AS MATERIALIZED (
+    SELECT bundle_id, name, must_purchase_as_set, min_cny_fen, diff_fen, smart_score
+    FROM bundles b WHERE {target_where}
+), raw AS MATERIALIZED (
+    SELECT p.id, p.bundle_id, p.cny_fen, p.discount_percent, p.bundle_base_discount,
+           UPPER(p.region_code) AS code,
+           {_json_array_sql('p.app_ids')} AS aids
+    FROM targets t JOIN bundle_region_prices p USING (bundle_id)
+    WHERE TRIM(COALESCE(p.region_code, '')) != ''
+), ranked AS (
+    SELECT bundle_id, aids, ROW_NUMBER() OVER (
+        PARTITION BY bundle_id ORDER BY json_array_length(aids) DESC, id
+    ) AS n FROM raw
+), baseline AS MATERIALIZED (
+    SELECT bundle_id, aids FROM ranked WHERE n = 1
+), family AS (
+    SELECT r.*, ROW_NUMBER() OVER (
+        PARTITION BY r.bundle_id, r.code ORDER BY r.cny_fen IS NULL, r.id
+    ) AS n
+    FROM raw r JOIN baseline b USING (bundle_id)
+    WHERE (json_array_length(b.aids) = 0 OR EXISTS (
+        SELECT 1 FROM json_each(r.aids) a JOIN json_each(b.aids) m
+        ON CAST(a.value AS INTEGER) = CAST(m.value AS INTEGER)
+    )) AND (:tracked IS NULL OR r.code = 'CN' OR
+        (r.code IN ('PK', 'BD') AND EXISTS (
+            SELECT 1 FROM json_each(:tracked) WHERE value = 'PK'
+        )) OR (r.code NOT IN ('PK', 'BD') AND EXISTS (
+            SELECT 1 FROM json_each(:tracked) WHERE value = r.code
+        )))
+), regions AS MATERIALIZED (
+    SELECT * FROM family WHERE n = 1
+), prices AS (
+    SELECT bundle_id, MAX(CASE WHEN code = 'CN' THEN cny_fen END) AS cn,
+           MAX(CASE WHEN code = :region THEN cny_fen END) AS regional,
+           MAX(COALESCE(discount_percent, 0)) AS discount,
+           COALESCE(MAX(CASE WHEN code = :region THEN discount_percent END), 0) AS regional_discount,
+           MAX(CASE WHEN code != 'CN' AND cny_fen > 0 THEN 1 ELSE 0 END) AS gift,
+           MIN(CASE WHEN code != 'CN' AND cny_fen > 0 THEN cny_fen END) AS minimum,
+           MAX(CASE WHEN cny_fen IS NOT NULL AND COALESCE(discount_percent, 0)
+               > COALESCE(bundle_base_discount, 0) THEN 1 ELSE 0 END) AS timing
+    FROM regions GROUP BY bundle_id
+)
+"""
 
-    区域价/最低价/差价按追踪区（crawl_regions 启用集）过滤——
-    未启用任何区时全量展示（对齐游戏卡 GPW 语义）。
-    聚合结果缓存（失效见 invalidate_bundles_cache + 汇率/追踪区指纹）；
-    返回的是缓存对象，调用方只读（无改写方）。
 
-    监控作用域（removed 参数）：
-    - False（默认）：隐藏用户已移除/已排除的包（monitoring 的
-      released + excluded 集合，与刷新候选集同一口径），关注过的包
-      置顶（组内保持 SQL 排序的稳定分区，不重排）；
-    - True：只出已移除/已排除的包（恢复视图），不走聚合缓存。
-    """
-    sort = _normalize_sort(sort)
-    global _LIST_CACHE
-    tracked = await _tracked_region_codes()
-    bundles, prices_by_bundle, rates = await _load_all(sort)
-    if removed:
-        blocked = await _bundle_blocked_ids()
-        return _build_list_items(
-            [b for b in bundles if b.bundle_id in blocked], prices_by_bundle, tracked
-        )
-    # tracked=None 是合法语义（未启用任何区 = 全量展示），指纹按空集归一
-    fp = _list_fp(tracked, rates)
-    key = (fp, sort)
-    if _LIST_CACHE is not None and _LIST_CACHE[0] == key:
-        return _LIST_CACHE[1]
-    async with _LIST_LOCK:
-        # 双检：等锁期间（预热/并发请求）可能已经建好
-        if _LIST_CACHE is not None and _LIST_CACHE[0] == key:
-            return _LIST_CACHE[1]
-        blocked = await _bundle_blocked_ids()
-        if blocked:
-            bundles = [b for b in bundles if b.bundle_id not in blocked]
-        items = await asyncio.to_thread(_build_list_items, bundles, prices_by_bundle, tracked)
-        followed = await _bundle_followed_ids()
-        if followed:
-            # 关注置顶 = 稳定分区（关注组 / 其余组各自保持 SQL 排序），不重排
-            items = [i for i in items if i["bundleId"] in followed] + [
-                i for i in items if i["bundleId"] not in followed
-            ]
-        _LIST_CACHE = (key, items)
-        return items
-
-
-def _dump_items(items: list[dict]) -> bytes:
-    return json.dumps({"bundles": items}, ensure_ascii=False, separators=(",", ":")).encode(
-        "utf-8"
+def bundle_sort_sql(bundle_ids: list[int] | None, tracked: set[str] | None) -> tuple[str, dict]:
+    sql = _region_rows_sql() + f"""
+    , reviews AS (
+        SELECT b.bundle_id,
+            AVG(bundle_quality_score(g.positive_rate, g.review_count, g.release_date)) AS quality,
+            AVG(bundle_familiarity_score(g.review_count)) AS familiarity
+        FROM baseline b JOIN json_each(b.aids) a
+        JOIN games g ON g.appid = CAST(a.value AS INTEGER) GROUP BY b.bundle_id
+    ), result AS (
+        SELECT b.bundle_id, p.minimum,
+            MAX(COALESCE(p.cn - p.minimum, 0), 0) AS difference,
+            p.cn IS NOT NULL AND COALESCE(p.minimum, p.cn) >= p.cn - 500 AS lowest,
+            COALESCE(v.quality, 0.5) AS quality, COALESCE(v.familiarity, 0) AS familiarity,
+            COALESCE(p.timing, 0) AS timing
+        FROM targets b LEFT JOIN prices p USING (bundle_id) LEFT JOIN reviews v USING (bundle_id)
     )
+    UPDATE bundles AS b SET min_cny_fen = r.minimum, diff_fen = r.difference,
+        is_lowest = r.lowest, smart_score = {W_SAVE} * bundle_save_score(r.difference)
+            + {W_QUALITY} * r.quality + {W_TIMING} * r.timing + {W_FAMILIARITY} * r.familiarity
+    FROM result r WHERE b.bundle_id = r.bundle_id
+    """
+    return sql, {"bundle_ids": json.dumps(bundle_ids) if bundle_ids is not None else None,
+                 "tracked": json.dumps(sorted(tracked)) if tracked else None, "region": ""}
 
 
-def _disk_stale_path(sort: str):
-    from pathlib import Path
-
-    from app.core.paths import resolve_data_dir
-
-    return Path(resolve_data_dir()) / "cache" / f"bundles-list-{sort}.json.gz"
-
-
-def _write_disk_stale(sort: str, payload: bytes) -> None:
-    """陈旧档落盘（原子替换）；失败只记日志——磁盘档只是重启窗口的兑底。"""
-    try:
-        path = _disk_stale_path(sort)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_bytes(payload)
-        tmp.replace(path)
-    except OSError:
-        log_event(
-            logger,
-            "捆绑包列表陈旧档写入失败，重启兜底退化为内存档",
-            level=logging.WARNING,
-            exc_info=True,
-        )
+def _visible_bundle_sql() -> str:
+    basis = (f"(SELECT {_json_array_sql('m.app_ids')} FROM bundle_region_prices m "
+             "WHERE m.bundle_id=b.bundle_id AND TRIM(COALESCE(m.region_code,''))!='' "
+             f"ORDER BY json_array_length({_json_array_sql('m.app_ids')}) DESC,m.id LIMIT 1)")
+    return f"""EXISTS (SELECT 1 FROM bundle_region_prices p
+        WHERE p.bundle_id=b.bundle_id AND TRIM(COALESCE(p.region_code,''))!=''
+        AND (:tracked IS NULL OR UPPER(p.region_code)='CN' OR
+            (UPPER(p.region_code) IN ('PK','BD') AND EXISTS (
+                SELECT 1 FROM json_each(:tracked) WHERE value='PK')) OR
+            (UPPER(p.region_code) NOT IN ('PK','BD') AND EXISTS (
+                SELECT 1 FROM json_each(:tracked) WHERE value=UPPER(p.region_code))))
+        AND (EXISTS (SELECT 1 FROM json_each({_json_array_sql('p.app_ids')}) a
+            JOIN json_each({basis}) m ON CAST(a.value AS INTEGER)=CAST(m.value AS INTEGER))
+            OR json_array_length({basis})=0))"""
 
 
-def _stale_gzip_for(sort: str) -> bytes | None:
-    """陈旧压缩载荷：内存槽优先；进程重启后首轮请求读一次磁盘档。"""
-    global _DISK_STALE_LOADED
-    cached = _STALE_GZIP.get(sort)
-    if cached is not None:
-        return cached
-    if _DISK_STALE_LOADED:
-        return None
-    _DISK_STALE_LOADED = True
-    try:
-        data = _disk_stale_path(sort).read_bytes()
-    except OSError:
-        return None
-    if data:
-        _STALE_GZIP[sort] = data
-    return _STALE_GZIP.get(sort)
+_OWNERSHIP_SQL = """
+, owned_apps AS MATERIALIZED (
+    SELECT w.appid, MAX(:primary = '' OR w.steamid = :primary) AS self_owned,
+        MIN(CASE WHEN :primary != '' AND w.steamid != :primary THEN
+            COALESCE(NULLIF(a.label, ''), NULLIF(a.persona_name, ''), a.steamid) END) AS family_account
+    FROM wishlist_items w JOIN tracked_accounts a ON a.steamid = w.steamid
+    WHERE w.active = 1 AND w.owned = 1 GROUP BY w.appid
+), ownership AS MATERIALIZED (
+    SELECT b.bundle_id,
+        CASE WHEN COUNT(*)=COUNT(o.appid) THEN CASE WHEN SUM(COALESCE(o.self_owned,0))>0 THEN 'owned'
+            WHEN MIN(o.family_account) IS NOT NULL THEN 'family' ELSE 'owned' END END AS ownership_type,
+        MIN(o.family_account) AS family_account
+    FROM baseline b JOIN json_each(b.aids) m
+    JOIN games g ON g.appid=CAST(m.value AS INTEGER) AND COALESCE(g.name,'')!=''
+    LEFT JOIN owned_apps o ON o.appid=g.appid GROUP BY b.bundle_id
+)
+"""
 
 
-def _schedule_rebuild(sort: str) -> None:
-    """后台重建单飞：陈旧兑底已回给请求方，这里把新鲜载荷补建出来。
-
-    重建成功且建出的键仍是当前指纹时才退役陈旧槽；中途又被失效的轮次
-    保留旧档（它仍是下一轮重建完成前唯一可秒回的兑底）。"""
-    if sort in _REBUILDING:
+async def _page_ownership(session: AsyncSession, items: list[dict], primary: str) -> None:
+    if not items:
         return
-    _REBUILDING.add(sort)
-
-    async def _run() -> None:
-        try:
-            # 直呼同步构建（不过陈旧快路径——否则重建任务自己又回陈旧字节空转）
-            await _build_json_bytes(sort)
-            await _build_gzip_bytes(sort)
-            key = _LIST_CACHE[0] if _LIST_CACHE is not None else None
-            if key is not None and key[1] == sort:
-                _STALE_JSON.pop(sort, None)
-                _STALE_GZIP.pop(sort, None)
-        except Exception:  # noqa: BLE001
-            log_event(
-                logger,
-                "捆绑包列表后台重建失败，陈旧载荷继续兑底",
-                level=logging.ERROR,
-                exc_info=True,
-            )
-        finally:
-            _REBUILDING.discard(sort)
-
-    task = asyncio.create_task(_run())
-    _REBUILD_TASKS.add(task)
-    task.add_done_callback(_REBUILD_TASKS.discard)
+    sql = """WITH baseline AS (
+        SELECT json_extract(value,'$.id') AS bundle_id, json_extract(value,'$.aids') AS aids
+        FROM json_each(:page)
+    )""" + _OWNERSHIP_SQL + " SELECT * FROM ownership"
+    rows = (await session.execute(text(sql), {
+        "primary": primary, "page": json.dumps([{"id": item["bundleId"], "aids": item["appIds"]} for item in items]),
+    })).mappings().all()
+    by_id = {row["bundle_id"]: row for row in rows}
+    for item in items:
+        row = by_id.get(item["bundleId"])
+        kind = row["ownership_type"] if row else None
+        item["ownership"] = {"type": kind, "account": row["family_account"] if kind == "family" else None}
 
 
-async def _build_json_bytes(sort: str) -> bytes:
-    """同步构建路径（跳过陈旧快路径）：后台重建任务与冷启动兜底共用。"""
-    items = await list_bundles(sort)
-    payload = await asyncio.to_thread(_dump_items, items)
-    fresh_key = _LIST_CACHE[0] if _LIST_CACHE is not None else None
-    if fresh_key is not None and fresh_key[1] == sort:
-        _LIST_JSON_CACHE[fresh_key] = payload
-    return payload
+async def list_bundles(
+    sort: str = "diff", *, offset: int = 0, limit: int = 120, removed: bool = False,
+    query: str = "", region: str = "", region_mode: str = "all",
+    followed_only: bool = False, completable_only: bool = False,
+    cn_lowest_only: bool = False, only_discounted: bool = False, gift_only: bool = False,
+    hide_owned: bool = False, hide_family: bool = False,
+    price_min: float | None = None, price_max: float | None = None,
+    diff_min: float | None = None, diff_max: float | None = None, diff_type: str = "absolute",
+) -> dict:
+    from app.domains.account import service as account_service
+    from app.domains.games.derived import maintain_derived
+    from app.domains.settings.service import get_value
 
-
-async def _build_gzip_bytes(sort: str) -> bytes:
-    """压缩变体同步构建；新鲜档建成时顺手落盘，供下次重启兜底。"""
-    payload = await list_bundles_json(sort)
-    compressed = await asyncio.to_thread(_gzip_payload, payload)
-    fresh_key = _LIST_CACHE[0] if _LIST_CACHE is not None else None
-    if fresh_key is not None and fresh_key[1] == sort:
-        _LIST_GZIP_CACHE[fresh_key] = compressed
-        await asyncio.to_thread(_write_disk_stale, sort, compressed)
-    return compressed
-
-
-async def list_bundles_json(sort: str = "diff") -> bytes:
-    """列表的预序列化 UTF-8 JSON（路由出口用），内容与 list_bundles() 等值。
-
-    差别只在**只编码一次**：FastAPI 对 dict 返回值每次请求都要重跑
-    jsonable_encoder + JSON 编码（15k 条聚合结果 2s 级），而列表内容
-    只在数据/汇率/追踪区变化时变——聚合与编码都按同一指纹缓存。
-    按排序分槽（dict）：smart/diff 两份共存，切换排序不再重复编码。
-
-    缓存未命中时先查陈旧槽：有上一版字节就立即回旧版 + 后台单飞重建
-    （SWR），只在进程启动后从无任何版本时才同步重建（启动预热通常
-    已覆盖该窗口）。编码在后台线程跑，不阻塞事件循环。"""
-    sort = _normalize_sort(sort)
+    await maintain_derived()
+    primary = (await account_service.get_primary_steam_id()) or (await get_value("account.steam_id", "")) or ""
+    region = region.strip().upper()
     tracked = await _tracked_region_codes()
-    rates = await get_rates()
-    key = (_list_fp(tracked, rates), sort)
-    if _LIST_CACHE is not None and _LIST_CACHE[0] == key:
-        cached = _LIST_JSON_CACHE.get(key)
-        if cached is not None:
-            return cached
-        payload = await asyncio.to_thread(_dump_items, _LIST_CACHE[1])
-        _LIST_JSON_CACHE[key] = payload
-        return payload
-    stale = _STALE_JSON.get(sort)
-    if stale is not None:
-        _schedule_rebuild(sort)
-        return stale
-    return await _build_json_bytes(sort)
+    params = {"tracked": json.dumps(sorted(tracked)) if tracked else None,
+              "region": region.strip().upper(), "offset": max(0, offset), "limit": max(1, min(limit, 200)),
+              "removed": int(removed), "query": query.strip().lower(), "primary": primary, "bundle_ids": None,
+              "price_min": price_min, "price_max": price_max, "diff_min": diff_min, "diff_max": diff_max}
+    from app.domains.monitoring.models import MonitorTarget, NON_CRAWL_STATES
 
-
-def _gzip_payload(payload: bytes) -> bytes:
-    """载荷预压缩（level 6）。
-
-    9（zlib 默认）在 50MB 级 JSON 上是秒级 CPU，压缩比只高约 4%——6 是压缩率
-    与单次构建 CPU 的平衡点。成本只落在缓存构建时（启动预热含此步），不在
-    请求期。zlib.compress 带 wbits 一把产出 gzip 流，无流式收尾步骤。
+    blocked = select(MonitorTarget.id).where(
+        MonitorTarget.target_type == "bundle", MonitorTarget.target_id == literal_column("b.bundle_id"),
+        MonitorTarget.state.in_(NON_CRAWL_STATES),
+    ).exists().compile(compile_kwargs={"literal_binds": True})
+    target_conditions = [f"({blocked})=:removed"]
+    conditions = []
+    if query.strip():
+        target_conditions.append("instr(bundle_lower(b.name), :query)>0")
+    if followed_only:
+        target_conditions.append("EXISTS (SELECT 1 FROM monitor_sources s WHERE s.target_type='bundle' "
+            "AND s.target_id=b.bundle_id AND s.source='favorite' AND s.active=1)")
+    if completable_only:
+        target_conditions.append("b.must_purchase_as_set=0")
+    if region and region_mode == "cheaper":
+        conditions.append("cn > regional")
+        target_conditions.append("EXISTS (SELECT 1 FROM bundle_region_prices r WHERE r.bundle_id=b.bundle_id "
+            "AND UPPER(r.region_code)=:region AND r.cny_fen IS NOT NULL)")
+    elif region and region_mode == "locked":
+        conditions.append("regional IS NULL")
+    if cn_lowest_only:
+        conditions.append("cn IS NOT NULL AND (min_cny_fen IS NULL OR cn <= min_cny_fen)")
+    if only_discounted:
+        conditions.append("discount > 0")
+    if gift_only:
+        conditions.append("cn > 0 AND gift = 1")
+    if hide_owned:
+        conditions.append("COALESCE(ownership_type, '') != 'owned'")
+    if hide_family:
+        conditions.append("COALESCE(ownership_type, '') != 'family'")
+    for name, operator in (("price_min", ">="), ("price_max", "<=")):
+        if params[name] is not None:
+            conditions.append(f"cn {operator} :{name} * 100")
+    diff_value = "diff_value * 100.0 / NULLIF(cn, 0)" if diff_type == "percent" else "diff_value / 100.0"
+    if diff_type == "percent" and (diff_min is not None or diff_max is not None):
+        conditions.append("cn > 0")
+    for name, operator in (("diff_min", ">="), ("diff_max", "<=")):
+        if params[name] is not None:
+            conditions.append(f"({diff_value}) {operator} :{name}")
+    score = "b.smart_score" if sort == "smart" else "b.diff_fen"
+    if sort == "discount":
+        discount = "regional_discount" if region else "discount"
+        order = f"{discount} DESC, diff_fen DESC, followed DESC, bundle_id"
+    elif region and sort == "smart":
+        order = ("bundle_save_score(COALESCE(cn - regional, 0)) + "
+                 "MAX(0, COALESCE(smart_score, 0) - bundle_save_score(COALESCE(diff_fen, 0))) DESC, "
+                 "followed DESC, smart_score DESC, bundle_id")
+    elif region:
+        order = "cn - regional DESC, followed DESC, diff_fen DESC, bundle_id"
+    else:
+        order = "followed DESC, score DESC, bundle_id"
+    ownership_filter = hide_owned or hide_family
+    ownership_cte = _OWNERSHIP_SQL if ownership_filter else ""
+    ownership_columns = "o.ownership_type, o.family_account" if ownership_filter else "NULL AS ownership_type, NULL AS family_account"
+    ownership_join = "LEFT JOIN ownership o USING (bundle_id)" if ownership_filter else ""
+    sql = _region_rows_sql(" AND ".join(target_conditions)) + ownership_cte + f"""
+    , candidates AS (
+        SELECT b.*, p.*, {score} AS score,
+               CASE WHEN :region != '' AND p.cn IS NOT NULL AND p.regional IS NOT NULL
+                    THEN p.cn - p.regional ELSE COALESCE(b.diff_fen, 0) END AS diff_value,
+               EXISTS (SELECT 1 FROM monitor_sources s WHERE s.target_type = 'bundle'
+                   AND s.target_id = b.bundle_id AND s.source = 'favorite' AND s.active = 1) AS followed,
+               {ownership_columns}
+        FROM targets b JOIN prices p USING (bundle_id)
+        {ownership_join}
+    ), matched AS MATERIALIZED (
+        SELECT * FROM candidates WHERE {" AND ".join(conditions) or "1"}
+    ), page AS (
+        SELECT * FROM matched ORDER BY {order}
+        LIMIT :limit OFFSET :offset
+    )
+    SELECT COUNT(*) AS total, COALESCE(SUM(must_purchase_as_set = 0), 0) AS completable,
+           (SELECT json_group_array(json_object('id', bundle_id, 'type', ownership_type,
+                'account', CASE WHEN ownership_type = 'family' THEN family_account END)) FROM page) AS items FROM matched
     """
-    return zlib.compress(payload, 6, 16 + zlib.MAX_WBITS)
+    fast_sql = f"""WITH matched AS MATERIALIZED (
+        SELECT b.bundle_id,b.must_purchase_as_set,{score} AS score,
+            EXISTS (SELECT 1 FROM monitor_sources s WHERE s.target_type='bundle' AND s.target_id=b.bundle_id
+                AND s.source='favorite' AND s.active=1) AS followed
+        FROM bundles b WHERE {" AND ".join(target_conditions)} AND {_visible_bundle_sql()}
+    ), page AS (SELECT * FROM matched ORDER BY followed DESC,score DESC,bundle_id LIMIT :limit OFFSET :offset)
+    SELECT COUNT(*) AS total,COALESCE(SUM(must_purchase_as_set=0),0) AS completable,
+        (SELECT json_group_array(json_object('id',bundle_id,'type',NULL,'account',NULL)) FROM page) AS items
+    FROM matched"""
+    fast_eligible = not region and sort != "discount" and not any((
+        cn_lowest_only, only_discounted, gift_only, price_min is not None,
+        price_max is not None, diff_min is not None, diff_max is not None,
+    ))
+    async with get_session_factory()() as session:
+        connection = await session.connection()
+        await connection.run_sync(lambda conn: register_bundle_sql_functions(conn.connection.dbapi_connection))
+        await session.execute(text("BEGIN"))
+        owned_rows = ownership_filter and bool((await session.execute(text(
+            "SELECT EXISTS (SELECT 1 FROM wishlist_items w JOIN tracked_accounts a ON a.steamid=w.steamid "
+            "WHERE w.active=1 AND w.owned=1)"
+        ))).scalar())
+        use_fast = fast_eligible and not owned_rows
+        stats = (await session.execute(text(fast_sql if use_fast else sql), params)).mappings().one()
+        page = json.loads(stats["items"])
+        ids = [row["id"] for row in page]
+        bundles, prices_by_bundle = await _load_bundles(session, ids)
+        by_id = {b.bundle_id: b for b in bundles}
+        items = []
+        for row in page:
+            bid = row["id"]
+            item = _aggregate(by_id[bid], prices_by_bundle.get(bid, []), tracked)
+            item["ownership"] = {"type": row["type"], "account": row["account"]}
+            for rp in item["regionPrices"].values():
+                for field in _LIST_REGION_DROP:
+                    rp.pop(field, None)
+            items.append(item)
+        if not ownership_filter or use_fast:
+            await _page_ownership(session, items, primary)
+    return {"bundles": items, "total": stats["total"],
+            "completableCount": stats["completable"], "offset": params["offset"], "limit": params["limit"]}
 
 
-async def list_bundles_gzip_json(sort: str = "diff") -> bytes:
-    """列表载荷的 gzip 变体（与 list_bundles_json 同内容、同指纹、同失效）。
-
-    传输压缩中间件对非流式响应必须收齐整包才开始下发，50MB 级载荷会把响应
-    起送从毫秒推到秒级——列表是**预序列化缓存载荷**，压缩一步同样按缓存槽
-    复用即可。路由按 Accept-Encoding 在原始/压缩两份中选择。
-
-    SWR 语义与 list_bundles_json 一致：陈旧压缩档直接回（含重启后读磁盘
-    档），新鲜压缩档建成时顺手落盘供下次重启兜底。"""
-    sort = _normalize_sort(sort)
-    tracked = await _tracked_region_codes()
-    rates = await get_rates()
-    key = (_list_fp(tracked, rates), sort)
-    if _LIST_CACHE is not None and _LIST_CACHE[0] == key:
-        cached = _LIST_GZIP_CACHE.get(key)
-        if cached is not None:
-            return cached
-    stale = _stale_gzip_for(sort)
-    if stale is not None:
-        _schedule_rebuild(sort)
-        return stale
-    return await _build_gzip_bytes(sort)
-
-
-async def warmup() -> int:
-    """启动链预热（后台）：把首次全量聚合 + 序列化的秒级成本挪到开门之后。
-
-    smart / diff 两种排序各暖一份（页内切换排序零等待），压缩变体一并预热
-    （否则首次带 Accept-Encoding 的请求要现付预压缩 CPU）。返回预序列化
-    载荷总字节数（日志用）。调用方兜异常——预热失败只会让用户首次进
-    捆绑包页重新等一次聚合，不影响功能。
-    """
-    total = 0
-    for sort in _SORTS:
-        total += len(await list_bundles_json(sort))
-        await list_bundles_gzip_json(sort)
-    return total
+async def _load_bundles(session: AsyncSession, ids: list[int]) -> tuple[list, dict[int, list]]:
+    if not ids:
+        return [], {}
+    bundles = (await session.execute(select(Bundle).where(Bundle.bundle_id.in_(ids)))).scalars().all()
+    prices = (await session.execute(select(BundleRegionPrice).where(
+        BundleRegionPrice.bundle_id.in_(ids)
+    ).order_by(BundleRegionPrice.id))).scalars().all()
+    by_bundle: dict[int, list] = {}
+    for price in prices:
+        by_bundle.setdefault(price.bundle_id, []).append(price)
+    return bundles, by_bundle
 
 
 async def get_bundle_detail(bundle_id: int) -> dict | None:
@@ -914,9 +574,12 @@ async def get_bundle_detail(bundle_id: int) -> dict | None:
     cny_fen（price_status=ok）。游戏未入库（games 表无行）时 name 为 None，
     前端回退 AppID 展示，且计算器按既定规则将无数据项自动排除。
     """
-    # 详情按 id 查表，与列表排序无关；固定走 diff 缓存（default 槽）
-    bundles, prices_by_bundle, _rates = await _load_all("diff")
-    bundle = next((b for b in bundles if b.bundle_id == bundle_id), None)
+    from app.domains.games.derived import maintain_derived
+
+    await maintain_derived()
+    async with get_session_factory()() as session:
+        bundles, prices_by_bundle = await _load_bundles(session, [bundle_id])
+    bundle = bundles[0] if bundles else None
     if bundle is None:
         return None
     # 详情同样按追踪区过滤（列表与抽屉同一口径）
@@ -971,7 +634,6 @@ async def get_bundle_detail(bundle_id: int) -> dict | None:
 # 用户显式设置的排除语义不被恢复动作洗掉
 REMOVAL_EXCLUSION_REASON = "bundle_removed"
 
-logger = logging.getLogger(__name__)
 
 
 async def remove_bundle(bundle_id: int) -> dict:
@@ -993,7 +655,6 @@ async def remove_bundle(bundle_id: int) -> dict:
 
     await monitoring_service.stop("bundle", bid)
     await monitoring_service.set_exclusion("bundle", bid, True, REMOVAL_EXCLUSION_REASON)
-    invalidate_bundles_cache()
     return {"removed": True, "bundleId": bid}
 
 
@@ -1011,7 +672,6 @@ async def restore_bundle(bundle_id: int) -> dict:
     if reason != REMOVAL_EXCLUSION_REASON:
         return {"restored": False, "bundleId": bid}
     await monitoring_service.track("bundle", bid, "import")
-    invalidate_bundles_cache()
     return {"restored": True, "bundleId": bid}
 
 
@@ -1021,9 +681,7 @@ async def follow_bundle(bundle_id: int) -> dict:
     from app.domains.monitoring import service as monitoring_service
 
     # 关注 = 用户显式要求盯住它：解除「别再爬它」后挂来源（与游戏星标同语义）
-    await monitoring_service.set_exclusion("bundle", bid, False, "followed")
-    await monitoring_service.ensure_source("bundle", bid, "favorite")
-    invalidate_bundles_cache()
+    await monitoring_service.ensure_source("bundle", bid, "favorite", clear_exclusion=True)
     return {"bundleId": bid, "followed": True}
 
 
@@ -1040,7 +698,6 @@ async def unfollow_bundle(bundle_id: int) -> dict:
     await monitoring_service.detach_source("bundle", bid, "favorite")
     if sources.get(bid, set()) == {"favorite"}:
         await monitoring_service.forget("bundle", bid)
-    invalidate_bundles_cache()
     return {"bundleId": bid, "followed": False}
 
 

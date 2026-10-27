@@ -8,11 +8,12 @@ Cycle 的 repairing 只记欠账不另发起抓取。状态只由本模块 advan
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import json
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, Index, Integer, String, Text, JSON, select
+from sqlalchemy import DateTime, Index, Integer, String, Text, JSON, select, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import WritePriority, get_session_factory, write_session, Base
@@ -23,13 +24,13 @@ logger = logging.getLogger(__name__)
 
 
 def _spec_key(spec: dict) -> str:
-    identity = {k: v for k, v in spec.items() if k != "execution"}
+    identity = {k: v for k, v in spec.items() if k not in ("execution", "resolved_appids", "resolved_regions")}
     if identity.get("kind", "scheduled") in ("manual", "scheduled"):
         identity.pop("kind", None)
     return json.dumps(identity, sort_keys=True)
 
 
-async def record_stage(cycle_id: int | None, spec: dict, state: str, reason: str | None = None) -> None:
+async def record_stage(cycle_id: int | None, spec: dict, state: str, reason: str | None = None, *, job_id: int | None = None) -> None:
     if cycle_id is None:
         return
     async with write_session(WritePriority.BACKGROUND) as session:
@@ -41,7 +42,9 @@ async def record_stage(cycle_id: int | None, spec: dict, state: str, reason: str
         if match is None:
             match = {k: v for k, v in spec.items() if k != "execution"}
             specs.append(match)
-        match["execution"] = {"state": state, "reason": reason}
+        match["execution"] = {**(match.get("execution") or {}), "state": state, "reason": reason}
+        if job_id is not None:
+            match["execution"]["jobId"] = job_id
         row.specs_json = specs
         await session.commit()
 
@@ -59,7 +62,7 @@ def _pending_stages(rows: list) -> dict[str, tuple[dict, int]]:
         for spec in specs or []:
             state = (spec.get("execution") or {}).get("state")
             key = _spec_key(spec)
-            if state in ("pending", "deferred"):
+            if state in ("pending", "deferred", "recovering"):
                 pending.setdefault(key, ({k: v for k, v in spec.items() if k != "execution"}, cycle_id))
             elif state in ("done", "empty", "cancelled"):
                 pending.pop(key, None)
@@ -99,7 +102,79 @@ async def prioritize_specs(specs: list[dict]) -> list[dict]:
 
 
 def deferred_stages(specs: list[dict] | None) -> list[dict]:
-    return [s for s in specs or [] if (s.get("execution") or {}).get("state") in ("pending", "deferred")]
+    return [s for s in specs or [] if (s.get("execution") or {}).get("state") in ("pending", "deferred", "recovering")]
+
+
+async def recover_pending_stages() -> None:
+    """将中断周期的未启动计划交还原任务记录与地区补抓通道。"""
+    async with write_session(WritePriority.BACKGROUND, label="crawl_plan_recovery") as session:
+        rows = (await session.execute(select(PriceCycle).where(
+            PriceCycle.status.in_((FAILED, PARTIAL)),
+            text("""EXISTS (SELECT 1 FROM json_each(price_cycles.specs_json) s
+                WHERE json_type(s.value, '$.resolved_appids') = 'array'
+                AND COALESCE(json_extract(s.value, '$.execution.state'), 'pending')
+                    IN ('pending','deferred','recovering'))"""),
+        ))).scalars().all()
+        changes = []
+        new_jobs = []
+        for row in rows:
+            specs = [dict(s) for s in row.specs_json or []]
+            for spec in specs:
+                execution = dict(spec.get("execution") or {})
+                if execution.get("state", "pending") not in ("pending", "deferred", "recovering"):
+                    continue
+                if "resolved_appids" not in spec:
+                    continue
+                job = await session.get(CrawlJob, execution["jobId"]) if execution.get("jobId") else None
+                if job is None and not execution.get("jobId") and spec["resolved_appids"]:
+                    job = CrawlJob(
+                        kind=spec.get("kind", row.kind), status="interrupted", mode="app",
+                        cycle_id=row.id, regions_json=spec.get("resolved_regions") or [],
+                        started_at=row.started_at, finished_at=row.finished_at,
+                        error="进程中断，未完成地区将自动补全",
+                        stats_json={"targetStartedAt": row.started_at.isoformat(), "targets": {
+                            "appids": spec["resolved_appids"], "regions": spec.get("resolved_regions") or [],
+                        }},
+                    )
+                    new_jobs.append(job)
+                changes.append((row, specs, spec, execution, job))
+        session.add_all(new_jobs)
+        if new_jobs:
+            await session.flush()
+        changed = False
+        for row, specs, spec, execution, job in changes:
+            if job is not None:
+                execution["jobId"] = job.id
+            execution["state"] = (
+                "cancelled" if job is not None and job.status == "stopped" else
+                "recovering" if job is not None and job.status != "done" and (job.stats_json or {}).get("targets") else "done"
+            )
+            if execution != spec.get("execution"):
+                spec["execution"] = execution
+                changed = True
+            row.specs_json = specs
+        if changed:
+            await session.commit()
+
+
+async def cancel_open_stages(since: datetime, *, cycle_id: int | None = None) -> None:
+    """整轮停止意图随周期持久保存，单段停止不调用此入口。"""
+    async with write_session(WritePriority.INTERACTIVE) as session:
+        rows = (await session.execute(select(PriceCycle).where(
+            PriceCycle.status.in_(OPEN_STATES), PriceCycle.started_at >= since,
+            *([PriceCycle.id == cycle_id] if cycle_id is not None else []),
+        ))).scalars().all()
+        for row in rows:
+            row.specs_json = [
+                {**s, "execution": {**(s.get("execution") or {}), "state": "cancelled"}}
+                if (s.get("execution") or {}).get("state") not in ("done", "empty") else s
+                for s in row.specs_json or []
+            ]
+            row.status = CANCELLED
+            row.finished_at = datetime.now()
+            row.error = "用户已停止"
+        if rows:
+            await session.commit()
 
 PLANNING = "planning"
 RUNNING = "running"
@@ -179,15 +254,8 @@ class PriceCycle(Base):
     units_missing: Mapped[int | None] = mapped_column(Integer)
     units_blocked: Mapped[int | None] = mapped_column(Integer)
     units_unobserved: Mapped[int | None] = mapped_column(Integer)
-    coverage: Mapped[float | None] = mapped_column(Float)
-    coverage_confirmed: Mapped[float | None] = mapped_column(Float)
-    # 存量轮冻结快照（对象级五桶明细）；新轮不再写入，读路径走统计列
-    coverage_json: Mapped[dict | None] = mapped_column(JSON)
     # 对象级：价格记录的最后观察时刻已 ≥ STALE_HOURS 的对象数（与 Freshness 同口径）
     stale_count: Mapped[int | None] = mapped_column(Integer)
-    duration_seconds: Mapped[float | None] = mapped_column(Float)
-    # {"planning": ms, "running": ms, "repairing": ms, "finalizing": ms}
-    stage_ms_json: Mapped[dict | None] = mapped_column(JSON)
 
     __table_args__ = (
         Index("ix_price_cycle_status", "status", "started_at"),
@@ -195,15 +263,18 @@ class PriceCycle(Base):
     )
 
 
-async def create(kind: str, scope: str = "") -> int:
+async def create(kind: str, scope: str = "", *, stop_event: asyncio.Event | None = None) -> int:
     """创建 Cycle（planning）。返回 cycle_id。
 
     写事务过写调度器：不过闸的 commit 会在 SQLite 写锁上排到
     busy_timeout 超时，整轮价格刷新就没了归属。
     """
     async with write_session(WritePriority.BACKGROUND) as session:
+        cancelled = stop_event is not None and stop_event.is_set()
         cycle = PriceCycle(
-            kind=kind, status=PLANNING, scope=scope, started_at=datetime.now()
+            kind=kind, status=CANCELLED if cancelled else PLANNING, scope=scope,
+            started_at=datetime.now(), finished_at=datetime.now() if cancelled else None,
+            error="用户已停止" if cancelled else None,
         )
         session.add(cycle)
         await session.commit()
@@ -243,12 +314,19 @@ async def freeze_expected(cycle_id: int, specs: list[dict]) -> tuple[list[str] |
     appids: list[int] = []
     seen: set[int] = set()
     batches_expected = 0
+    planned = []
     for spec in specs:
+        frozen = {k: v for k, v in spec.items() if k not in ("resolved_appids", "resolved_regions")}
+        planned.append(frozen)
         scope = spec.get("scope")
         if not scope:
             continue
+        frozen["resolved_regions"] = list(regions)
+        frozen["resolved_appids"] = []
         try:
-            resolved = await crawl_service.plan_scope_appids(scope, spec.get("appids"))
+            resolved = spec.get("resolved_appids")
+            if resolved is None:
+                resolved = await crawl_service.plan_scope_appids(scope, spec.get("appids"))
         except ValueError as e:
             # 该阶段本轮无可刷对象（空列表 / 未知 scope）：与 run_sequential
             # 同款容忍——跳过该阶段，不让它掀翻整轮记账
@@ -259,21 +337,24 @@ async def freeze_expected(cycle_id: int, specs: list[dict]) -> tuple[list[str] |
                 detail={"阶段": scope, "原因": e},
             )
             continue
-        # 批次按段算：pool 与 catalog 的对象互斥，并集会低估桶数
-        batches_expected += -(-len(resolved) // DEFAULT_BATCH_SIZE)
         for appid in resolved:
             if appid not in seen:
                 seen.add(appid)
                 appids.append(appid)
+                frozen["resolved_appids"].append(appid)
+        batches_expected += -(-len(frozen["resolved_appids"]) // DEFAULT_BATCH_SIZE)
     batches_expected *= len(regions)
 
     async with write_session(WritePriority.BACKGROUND) as session:
         cycle = await session.get(PriceCycle, cycle_id)
         if cycle is not None:
+            if cycle.status == CANCELLED:
+                planned = [{**s, "execution": {"state": "cancelled"}} for s in planned]
             cycle.expected_json = {"appids": appids, "regions": regions}
-            cycle.specs_json = [dict(s) for s in specs]
+            cycle.specs_json = planned
             cycle.batches_expected = batches_expected
             await session.commit()
+    specs[:] = planned
     return regions, len(appids) * len(regions)
 
 
@@ -377,6 +458,10 @@ def _stats_of(cycle: PriceCycle) -> dict | None:
     """
     if cycle.units_expected is None:
         return None
+    from .coverage import coverage_ratios
+    from .stats import timing_stats
+
+    coverage, confirmed = coverage_ratios(cycle.units_expected, cycle.units_ok, cycle.units_locked)
     return {
         "targetsTotal": cycle.targets_total,
         "targetsDone": cycle.targets_done,
@@ -385,11 +470,10 @@ def _stats_of(cycle: PriceCycle) -> dict | None:
         "unitsLocked": cycle.units_locked,
         "unitsFailed": cycle.units_failed,
         "unitsUnobserved": cycle.units_unobserved,
-        "coverage": cycle.coverage,
-        "coverageConfirmed": cycle.coverage_confirmed,
+        "coverage": coverage,
+        "coverageConfirmed": confirmed,
         "staleCount": cycle.stale_count,
-        "durationSeconds": cycle.duration_seconds,
-        "stageMs": cycle.stage_ms_json,
+        **timing_stats(cycle),
     }
 
 
@@ -436,11 +520,7 @@ async def write_stats(cycle_id: int, stats: dict) -> bool:
         cycle.units_missing = stats["unitsMissing"]
         cycle.units_blocked = stats["unitsBlocked"]
         cycle.units_unobserved = stats["unitsUnobserved"]
-        cycle.coverage = stats["coverage"]
-        cycle.coverage_confirmed = stats["coverageConfirmed"]
         cycle.stale_count = stats["staleCount"]
-        cycle.duration_seconds = stats["durationSeconds"]
-        cycle.stage_ms_json = stats["stageMs"]
         await session.commit()
     return True
 
@@ -461,24 +541,31 @@ async def list_cycles(limit: int = 10) -> list[dict]:
         ).scalars().all()
         out = [_to_dict(c) for c in rows]
         ids = [c.id for c in rows]
-    jobs: dict[int, list[dict]] = {}
-    for cid in ids:
-        jobs[cid] = await jobs_of(cid)
+        jobs: dict[int, list[dict]] = {}
+        if ids:
+            for cid, jid, kind, status in await session.execute(
+                select(CrawlJob.cycle_id, CrawlJob.id, CrawlJob.kind, CrawlJob.status)
+                .where(CrawlJob.cycle_id.in_(ids)).order_by(CrawlJob.id)
+            ):
+                jobs.setdefault(cid, []).append({"id": jid, "kind": kind, "status": status})
     for item in out:
         item["jobs"] = jobs.get(item["id"], [])
     return out
 
 
-async def cleanup_orphan_cycles() -> int:
+async def cleanup_orphan_cycles(*, before: datetime | None = None) -> int:
     """进程启动时把上一进程遗留的未收敛 Cycle 收敛到 failed。
 
     与 `cleanup_orphan_jobs` 同一步骤：遗留的 running Cycle 若不清，
     「这一轮跑到哪了」永远无解（状态卡在中间态、finished_at 空着）。
     """
     async with write_session(WritePriority.BACKGROUND) as session:
+        statement = select(PriceCycle).where(PriceCycle.status.in_(OPEN_STATES))
+        if before is not None:
+            statement = statement.where((PriceCycle.started_at < before) | PriceCycle.started_at.is_(None))
         rows = (
             await session.execute(
-                select(PriceCycle).where(PriceCycle.status.in_(OPEN_STATES))
+                statement
             )
         ).scalars().all()
         for cycle in rows:

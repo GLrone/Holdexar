@@ -111,7 +111,7 @@ async def test_price_data_is_a_nested_structure(db):
     await _add_prices(db, [_row(880001, "cn", "ok", now - timedelta(hours=1))])
 
     item = await _item(880001)
-    assert set(item["priceData"]) == {"observedAt", "ageHours", "freshness", "coverage"}
+    assert set(item["priceData"]) == {"observedAt", "ageHours", "freshness", "coverage", "regions"}
     # 报价字段仍在顶层，没有被 priceData 收编
     assert "basePriceFen" in item and "priceMatrix" in item
 
@@ -140,8 +140,8 @@ async def test_freshness_buckets_are_object_level(db):
 
 
 @pytest.mark.asyncio
-async def test_observed_at_is_max_over_regions(db):
-    """观察时刻取全区最大 updated_at：单区新刷新就代表这个对象新。"""
+async def test_old_region_is_not_hidden_by_a_recent_region(db):
+    """新鲜度保留最旧成功地区的年龄。"""
     now = datetime.now()
     await _seed(db, [880001])
     await _add_prices(db, [
@@ -150,8 +150,25 @@ async def test_observed_at_is_max_over_regions(db):
     ])
 
     data = (await _item(880001))["priceData"]
-    assert data["freshness"] == "fresh"
-    assert data["ageHours"] == pytest.approx(1.0, abs=0.1)
+    assert data["freshness"] == "lagging"
+    assert data["ageHours"] == pytest.approx(9.0, abs=0.1)
+    assert data["regions"]["CN"]["needsUpdate"] is True
+    assert data["regions"]["RU"]["needsUpdate"] is False
+    assert data["regions"]["UA"]["pending"] is True
+
+
+@pytest.mark.asyncio
+async def test_recent_failure_keeps_success_time_and_names_region(db):
+    now = datetime.now()
+    await _seed(db, [880001])
+    await _add_prices(db, [_row(880001, "cn", "ok", now, outcome="failed",
+                               last_success=now - timedelta(days=2))])
+    data = (await _item(880001))["priceData"]
+    assert data["freshness"] == "stale"
+    unit = data["regions"]["CN"]
+    assert unit["lastAttemptAt"] == now.isoformat()
+    assert unit["lastSuccessAt"] == (now - timedelta(days=2)).isoformat()
+    assert unit["pending"] is True and unit["needsUpdate"] is True
 
 
 @pytest.mark.asyncio

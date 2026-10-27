@@ -23,6 +23,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import WritePriority, get_session_factory, write_session, Base
 from app.domains.crawl.cycle import PriceCycle
+from app.domains.games.identity import STANDARD_PRODUCT_SQL
 from app.domains.games.models import Game, GameCurrentPrice
 
 logger = logging.getLogger(__name__)
@@ -57,11 +58,7 @@ _FAILED_STATUSES = ("missing", "blocked")
 
 # 证据查询在 SQL 侧按观察单元下推（每单元一次索引探测取 argmax/聚合行），
 # 结果集与全史解耦；region_code 库内单一来源大写，SQL 按大写对齐索引前缀。
-_GPH_STANDARD = (
-    "(is_gold IS NULL OR is_gold = 0) "
-    "AND (version_suffix IS NULL OR version_suffix = '') "
-    "AND (is_bundle IS NULL OR is_bundle = 0)"
-)
+_GPH_STANDARD = STANDARD_PRODUCT_SQL
 _GPH_SNAP_SQL = text(
     "SELECT w.a, w.r, h2.price, h2.original_price, h2.cny_fen, h2.snapshot_at, h2.id "
     "FROM (SELECT value->>'a' AS a, value->>'r' AS r, CAST(value->>'s' AS INTEGER) AS s "
@@ -79,11 +76,11 @@ _GPH_SNAP_SQL = text(
 ).bindparams(bindparam("started", type_=DateTime), bindparam("ended", type_=DateTime))
 _GPH_PREV_SQL = text(
     "SELECT w.a, w.r, "
-    "(SELECT MIN(h1.price) FROM game_price_history h1 "
+    f"CASE WHEN w.r = '{BENCHMARK_REGION}' THEN (SELECT MIN(h1.price) FROM game_price_history h1 "
     " WHERE h1.appid = w.a AND h1.region_code = w.r AND COALESCE(h1.sub_id, 0) = w.s "
     " AND h1.snapshot_at IS NOT NULL AND h1.snapshot_at < :started "
     " AND h1.price IS NOT NULL AND h1.price != 0 "
-    f"AND {_GPH_STANDARD}) AS low, "
+    f"AND {_GPH_STANDARD}) END AS low, "
     "h2.price, h2.original_price, h2.cny_fen, h2.snapshot_at, h2.id "
     "FROM (SELECT value->>'a' AS a, value->>'r' AS r, CAST(value->>'s' AS INTEGER) AS s "
     "FROM json_each(:want)) w "

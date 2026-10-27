@@ -226,7 +226,6 @@ async def test_job_persistence_errors_do_not_report_done(monkeypatch):
         return {"total": 1, "processed": 1, "success": 0, "failed": 1, "unpersistedUnits": ["991001:CN"]}
 
     monkeypatch.setattr(crawl, "run_crawl", run)
-    monkeypatch.setattr(crawl, "_spawn_post_crawl_chain", lambda *args, **kwargs: None)
     await crawl._execute(jid, [], SimpleNamespace(occupancy_tag=None), asyncio.Event())
     async with get_session_factory()() as session:
         assert (await session.get(CrawlJob, jid)).status == "failed"

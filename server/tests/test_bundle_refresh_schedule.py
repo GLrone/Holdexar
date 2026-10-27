@@ -46,7 +46,7 @@ def _stub_chain_env(monkeypatch, *, events, auto=True):
             {"scope": "specials", "kind": "specials_backfill"},
         ]
 
-    monkeypatch.setattr(sched_mod, "_price_refresh_specs", _fixed_specs)
+    monkeypatch.setattr(crawl_service, "default_queue_specs", _fixed_specs)
 
     async def _run_sequential(specs, **kwargs):
         events.append(("chain", [s.get("kind", s.get("scope")) for s in specs]))

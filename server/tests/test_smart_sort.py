@@ -1,3 +1,4 @@
+from app.domains.games import derived as games_derived
 """smart 排序（sort=smart）的行为验收：打破「折扣硬墙」。
 
 合成 99xxxx 探针行（真实库只读前提 + 幂等清理），只造两款的对照组：
@@ -44,11 +45,11 @@ async def _seed() -> None:
             appid=P1, name="smart-probe-flat", type="GAME",
             positive_rate=9700, review_count=200000, hl_flag=0, diff_fen=0,
         ))
-        s.add(GameCurrentPrice(
+        s.add(GameCurrentPrice(attempt_outcome="success",
             appid=P1, region_code="CN", price_status="ok", currency="CNY",
             price=10000, original_price=10000, discount_percent=0, cny_fen=10000,
         ))
-        s.add(GameCurrentPrice(
+        s.add(GameCurrentPrice(attempt_outcome="success",
             appid=P1, region_code="US", price_status="ok", currency="USD",
             price=1000, original_price=1000, discount_percent=0, cny_fen=7000,
         ))
@@ -57,17 +58,17 @@ async def _seed() -> None:
             appid=P2, name="smart-probe-discount", type="GAME",
             positive_rate=8000, review_count=50, hl_flag=1, diff_fen=0,
         ))
-        s.add(GameCurrentPrice(
+        s.add(GameCurrentPrice(attempt_outcome="success",
             appid=P2, region_code="CN", price_status="ok", currency="CNY",
             price=10000, original_price=33333, discount_percent=70, cny_fen=10000,
         ))
-        s.add(GameCurrentPrice(
+        s.add(GameCurrentPrice(attempt_outcome="success",
             appid=P2, region_code="US", price_status="ok", currency="USD",
             price=1400, original_price=1400, discount_percent=0, cny_fen=9900,
         ))
         await s.commit()
     # 预计算列（diff_fen / smart_score）按增量刷新生效
-    await games_service.refresh_sort_cache([P1, P2])
+    await games_derived.update_price_derived([P1, P2], history=False)
 
 
 async def _cleanup() -> None:
@@ -168,18 +169,18 @@ async def _seed_zero_review() -> None:
             positive_rate=6000, review_count=15, hl_flag=1, diff_fen=0,
         ))
         for appid, cn_price, low_fen in ((P3, 10000, 7000), (P4, 10000, 7000), (P5, 10000, 8000)):
-            s.add(GameCurrentPrice(
+            s.add(GameCurrentPrice(attempt_outcome="success",
                 appid=appid, region_code="CN", price_status="ok", currency="CNY",
                 price=cn_price, original_price=int(cn_price / 0.7), discount_percent=30,
                 cny_fen=cn_price,
             ))
-            s.add(GameCurrentPrice(
+            s.add(GameCurrentPrice(attempt_outcome="success",
                 appid=appid, region_code="US", price_status="ok", currency="USD",
                 price=low_fen // 10, original_price=low_fen // 10, discount_percent=0,
                 cny_fen=low_fen,
             ))
         await s.commit()
-    await games_service.refresh_sort_cache([P3, P4, P5])
+    await games_derived.update_price_derived([P3, P4, P5], history=False)
 
 
 async def _cleanup_zero_review() -> None:

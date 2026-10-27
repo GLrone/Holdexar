@@ -20,7 +20,6 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.database import WritePriority, get_session_factory, write_session
-from app.core.database import write_gate
 from app.core.logging import log_event
 from app.crawler.config import CC_LIST
 from app.crawler.utils import get_beijing_time_obj
@@ -186,9 +185,7 @@ async def refresh_rates() -> dict:
     from app.domains.games.service import invalidate_rates_cache
 
     invalidate_rates_cache()
-    from app.domains.bundles.service import invalidate_bundles_cache
 
-    invalidate_bundles_cache()
 
     log_event(
         logger,
@@ -213,33 +210,29 @@ STALE_THRESHOLD_HOURS = 12
 
 
 async def refresh_if_stale() -> bool:
-    """数据过期即补刷新（启动兜底）。返回是否触发了刷新。
-
-    interval 调度从启动起算，服务频繁重启时 24h 永远到不了点——
-    启动时检查最后快照龄，超过阈值（半天）就补一次，保证"每日自动抓取"承诺。
-    """
+    """正常维护入口：缺少海外汇率或快照超过半天即刷新。"""
     from app.domains.settings.service import get_value
 
     if not await get_value("crawl.auto_refresh_rates", True):
         return False  # 「汇率更新」开关关闭：启动兜底与定时刷新同闸，手动刷新不受影响
     async with get_session_factory()() as session:
-        row = (await session.execute(select(func.max(FxRate.fetched_at)))).scalar()
-    if row is None:
-        return False
-    last = _naive(row)
-    age_hours = (_naive(get_beijing_time_obj()) - last).total_seconds() / 3600
+        row = (await session.execute(select(func.max(FxRate.fetched_at)).where(
+            FxRate.currency_code != "CNY"
+        ))).scalar()
+    age_hours = ((_naive(get_beijing_time_obj()) - _naive(row)).total_seconds() / 3600
+                 if row is not None else float("inf"))
     if age_hours < STALE_THRESHOLD_HOURS:
         return False
     log_event(
         logger,
-        "汇率快照已过期，启动补刷新",
+        "汇率快照缺失或已过期，执行正常刷新",
         detail={"过期小时": f"{age_hours:.1f}"},
     )
     try:
         await refresh_rates()
         return True
     except Exception:  # noqa: BLE001
-        log_event(logger, "启动汇率补刷新失败，等待下次调度", level=logging.ERROR, exc_info=True)
+        log_event(logger, "汇率刷新失败，等待下次调度", level=logging.ERROR, exc_info=True)
         return False
 
 
@@ -320,21 +313,3 @@ async def _delete_disallowed(session) -> tuple[int, int]:
         delete(FxRateHistory).where(FxRateHistory.currency_code.not_in(allowed))
     )
     return (res_rate.rowcount or 0, res_hist.rowcount or 0)
-
-
-async def cleanup_disallowed() -> tuple[int, int]:
-    """数据库清洗：41 区货币集（+ TRY/ARS 预留）之外的币种数据一律清除。
-
-    启动时调用一次；refresh_rates 落库后也会顺带执行，保证幂等。
-    """
-    async with write_session(WritePriority.BACKGROUND) as session:
-        removed = await _delete_disallowed(session)
-        if any(removed):
-            await session.commit()
-            log_event(
-                logger,
-                "汇率白名单清洗完成，已清除名单外币种数据",
-                tag="成功",
-                detail={"快照删除": removed[0], "历史删除": removed[1]},
-            )
-    return removed

@@ -29,8 +29,7 @@ from app.domains.crawl.models import CrawlJob
 from app.domains.games.models import Game, GameCurrentPrice
 # pool / catalog 作用域现在走 Monitoring 层：表要注册进 Base.metadata
 from app.domains.monitoring import models as _monitoring_models  # noqa: F401
-from app.core.orchestration import KIND_PRICE_CYCLE_FINISHED, OrchestrationEvent
-from app.domains.monitoring.models import MonitorTarget
+from app.domains.monitoring.models import MonitorSource, MonitorTarget
 
 APPIDS = (760001, 760002)
 
@@ -89,9 +88,6 @@ def _crawl_env(monkeypatch):
 
     monkeypatch.setattr(crawl_service.alerts_service, "check_appids", _noop)
     monkeypatch.setattr(crawl_service.alerts_service, "check_new_lows", _noop)
-    monkeypatch.setattr(crawl_service.games_service, "refresh_hl_flags", _noop)
-    monkeypatch.setattr(crawl_service.games_service, "refresh_pp_flags", _noop)
-    monkeypatch.setattr(crawl_service.games_service, "refresh_sort_cache", _noop)
 
     # 忠实模拟：真实爬取按 config.regions 把每款对象的各期望区服现价行都刷掉
     # （pairs 第二位是区码覆盖位，空串=跑本轮全部区服）。空壳轮终态判定以
@@ -144,9 +140,10 @@ async def _seed_games(db, appids):
             session.add(Game(appid=appid, name=f"g{appid}", created_at=now,
                              updated_at=now))
             session.add(MonitorTarget(
-                target_type="game", target_id=appid, state="active",
+                target_type="game", target_id=appid,
                 created_at=now, updated_at=now, activated_at=now,
             ))
+            session.add(MonitorSource(target_type="game", target_id=appid, source="manual", priority=60, active=True))
         await session.commit()
 
 
@@ -324,7 +321,7 @@ async def test_all_round_jobs_share_one_cycle(db, monkeypatch):
     await _seed_missing(db, 760003)
 
 
-    await sched_mod._run_price_cycle([{"kind": "missing"}, {"scope": "pool"}])
+    await cycle_run.run_price_cycle([{"kind": "missing"}, {"scope": "pool"}])
 
     cycles = await cycle_mod.list_cycles(10)
     assert len(cycles) == 1
@@ -482,7 +479,7 @@ async def test_chain_exception_lands_on_failed(db, monkeypatch):
 
     monkeypatch.setattr(crawl_service, "run_sequential", _boom)
 
-    await sched_mod._run_price_cycle([{"scope": "pool"}])
+    await cycle_run.run_price_cycle([{"scope": "pool"}])
 
     rows = await cycle_mod.list_cycles(5)
     assert rows and rows[0]["status"] == cycle_mod.FAILED
@@ -504,7 +501,7 @@ async def test_finalization_exception_lands_on_failed(db, monkeypatch):
 
     monkeypatch.setattr(cycle_mod, "advance", _boom)
 
-    await sched_mod._run_price_cycle([{"scope": "pool"}])
+    await cycle_run.run_price_cycle([{"scope": "pool"}])
 
     # 断言不走 list_cycles（它内部也调 jobs_of；advance 已被桩住）
     async with db() as session:
@@ -518,30 +515,30 @@ async def test_finalization_exception_lands_on_failed(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_occupied_specs_yield_and_retry_once(db, monkeypatch):
-    """主轮被同拍任务挤占：空结果让路重试一次，不整轮背锅 failed。"""
+async def test_occupied_round_keeps_one_plan_for_normal_repair(db, monkeypatch):
     _crawl_env(monkeypatch)
+    _stub_scheduler_env(monkeypatch)
     await _seed_games(db, APPIDS)
-    monkeypatch.setattr(sched_mod, "_SPEC_YIELD_WAIT_SECONDS", 0)
+    calls = []
 
-    real_run = crawl_service.run_sequential
-    calls = {"n": 0}
+    async def occupied(**kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("crawler busy")
 
-    async def _occupied_then_free(specs, **kw):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return []
-        return await real_run(specs, **kw)
+    async def no_sleep(_seconds):
+        return None
 
-    monkeypatch.setattr(crawl_service, "run_sequential", _occupied_then_free)
+    async def specs():
+        return [{"scope": "pool"}]
 
-    await sched_mod._run_price_cycle([{"scope": "pool"}])
-
-    assert calls["n"] == 2, "空结果必须触发一次让路重试"
-    jobs = await _job_rows(db)
-    assert jobs, "重试后任务真实启动并挂到本轮 Cycle"
+    monkeypatch.setattr(crawl_service, "start_job", occupied)
+    monkeypatch.setattr(crawl_service, "default_queue_specs", specs)
+    monkeypatch.setattr(sched_mod.asyncio, "sleep", no_sleep)
+    await sched_mod._job_price_refresh()
     rows = await cycle_mod.list_cycles(5)
-    assert rows and rows[0]["jobs"], "重试启动的 job 归属本轮 Cycle"
+    assert len(rows) == 1
+    assert len(calls) == 1
+    assert rows[0]["deferredSpecs"]
 
 
 # ── 轮批次总账（任务页「总队列」）──
@@ -553,7 +550,7 @@ async def test_freeze_records_batch_ledger(db, monkeypatch):
     _crawl_env(monkeypatch)
     await _seed_games(db, APPIDS)
 
-    await sched_mod._run_price_cycle([{"scope": "pool"}])
+    await cycle_run.run_price_cycle([{"scope": "pool"}])
 
     rows = await cycle_mod.list_cycles(5)
     assert rows and rows[0]["batchesExpected"] is not None
@@ -596,7 +593,7 @@ async def test_start_job_records_initial_batch_total(db, monkeypatch):
     _crawl_env(monkeypatch)
     await _seed_games(db, APPIDS)
 
-    await sched_mod._run_price_cycle([{"scope": "pool"}])
+    await cycle_run.run_price_cycle([{"scope": "pool"}])
 
     jobs = await _job_rows(db)
     assert jobs, "本轮应启动 pool 段任务"
@@ -624,7 +621,7 @@ async def test_no_enabled_region_fails_cycle_but_chain_still_attempted(
 
     monkeypatch.setattr(crawl_service, "run_sequential", _spy)
 
-    await sched_mod._run_price_cycle([{"scope": "pool"}])
+    await cycle_run.run_price_cycle([{"scope": "pool"}])
 
     assert called, "区服不可用同样要让链走一遍（既有行为）"
     rows = await cycle_mod.list_cycles(5)
@@ -649,7 +646,7 @@ async def test_cycle_create_failure_does_not_block_crawl(db, monkeypatch):
 
     monkeypatch.setattr(cycle_mod, "create", _boom)
 
-    await sched_mod._run_price_cycle([{"scope": "pool"}])
+    await cycle_run.run_price_cycle([{"scope": "pool"}])
 
     assert called, "记账失败不得让用户少一轮价格"
     assert await cycle_mod.list_cycles(5) == []
@@ -672,7 +669,7 @@ async def test_stopped_round_lands_on_cancelled(db, monkeypatch):
 
     monkeypatch.setattr(crawl_service, "run_sequential", _stopped)
 
-    await sched_mod._run_price_cycle([{"scope": "pool"}])
+    await cycle_run.run_price_cycle([{"scope": "pool"}])
 
     rows = await cycle_mod.list_cycles(5)
     assert rows and rows[0]["status"] == cycle_mod.CANCELLED
@@ -685,7 +682,7 @@ async def test_pending_missing_marks_repairing(db, monkeypatch):
     await _seed_games(db, APPIDS)
     await _seed_missing(db, 760004)
 
-    await sched_mod._run_price_cycle([{"scope": "pool"}])
+    await cycle_run.run_price_cycle([{"scope": "pool"}])
 
     rows = await cycle_mod.list_cycles(5)
     assert rows and rows[0]["enteredRepairing"] is True
@@ -699,7 +696,7 @@ async def test_clean_round_without_debt_is_completed(db, monkeypatch):
     _crawl_env(monkeypatch)
     await _seed_games(db, APPIDS)
 
-    await sched_mod._run_price_cycle([{"scope": "pool"}])
+    await cycle_run.run_price_cycle([{"scope": "pool"}])
 
     rows = await cycle_mod.list_cycles(5)
     assert rows and rows[0]["status"] == cycle_mod.COMPLETED
@@ -753,24 +750,14 @@ async def test_settle_broadcasts_once_with_cycle_id_and_status(db, monkeypatch):
     await _seed_games(db, APPIDS)
     events = _capture_cycle_events(monkeypatch)
 
-    await sched_mod._run_price_cycle([{"scope": "pool"}])
+    await cycle_run.run_price_cycle([{"scope": "pool"}])
 
     assert len(events) == 1, f"一轮只广播一次：{events}"
     rows = await cycle_mod.list_cycles(5)
     assert events[0]["cycleId"] == rows[0]["id"]
     assert events[0]["status"] == rows[0]["status"] == cycle_mod.COMPLETED
 
-    # 编排事件留痕：终态收敛同步落 orchestration_events（进程重启后仍可回溯）
-    import app.core.database as database_module
 
-    async with database_module.get_session_factory()() as s:
-        evs = (await s.execute(
-            select(OrchestrationEvent).where(
-                OrchestrationEvent.kind == KIND_PRICE_CYCLE_FINISHED)
-        )).scalars().all()
-    assert len(evs) == 1, f"一轮终态只留一行编排事件：{len(evs)}"
-    assert evs[0].payload_json["cycle_id"] == rows[0]["id"]
-    assert evs[0].payload_json["status"] == cycle_mod.COMPLETED
 
 
 @pytest.mark.asyncio
@@ -789,7 +776,7 @@ async def test_finalizing_broadcast_precedes_terminal(db, monkeypatch):
 
     monkeypatch.setattr(events_mod.bus, "publish", _capture)
 
-    await sched_mod._run_price_cycle([{"scope": "pool"}])
+    await cycle_run.run_price_cycle([{"scope": "pool"}])
 
     assert types == ["price_cycle.finalizing", "price_cycle.completed"]
 
@@ -806,7 +793,7 @@ async def test_failed_round_also_broadcasts_its_terminal_status(db, monkeypatch)
 
     monkeypatch.setattr(crawl_service, "run_sequential", _boom)
 
-    await sched_mod._run_price_cycle([{"scope": "pool"}])
+    await cycle_run.run_price_cycle([{"scope": "pool"}])
 
     assert [p["status"] for p in events] == [cycle_mod.FAILED]
 

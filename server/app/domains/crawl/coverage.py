@@ -5,7 +5,7 @@
 
 最小单元 = `(appid, region_code)`，与 `game_current_prices` 主键同形。每个期望
 单元落进五个桶之一：`ok` / `locked` / `missing` / `blocked` / `unobserved`。
-前四个沿用 `price_status` 的现状取值，第五个表示本轮窗口内没有任何结果。
+`locked` 汇总明确不可购买，含无购买选项；观察失败不因保留旧价算成功。
 
 两个口径并存，不合并成一个数：
 
@@ -28,7 +28,7 @@ from datetime import datetime
 from sqlalchemy import func, select
 
 from app.core.database import get_session_factory
-from app.domains.crawl.cycle import TERMINAL_STATES, PriceCycle
+from app.domains.crawl.cycle import PriceCycle
 from app.domains.games.models import GameCurrentPrice
 
 logger = logging.getLogger(__name__)
@@ -36,17 +36,25 @@ logger = logging.getLogger(__name__)
 # 计数桶顺序即结果字段顺序
 BUCKETS = ("ok", "locked", "missing", "blocked", "unobserved")
 
-# 期望单元里「Steam 给了明确答复」的两种状态
-_CONFIRMED_STATUSES = ("ok", "locked")
-
 # appid 分批宽度：避开 SQLite 变量上限，一条 IN 不装整池
 _CHUNK = 500
 
 
-def _bucket_of(price_status: str | None) -> str:
-    """`price_status` → 覆盖率桶。未知取值按未确认计（不虚构价格状态）。"""
+def _bucket_of(price_status: str | None, outcome: str | None, answer: str | None) -> str:
+    """观察结果优先，旧行按价格状态兼容。"""
     status = (price_status or "").strip().lower()
+    if outcome == "failed":
+        return "blocked" if status == "blocked" else "missing"
+    if outcome == "success" and answer in ("locked", "no_options"):
+        return "locked"
     return status if status in ("ok", "locked", "missing", "blocked") else "missing"
+
+
+def coverage_ratios(expected: int, ok: int, locked: int) -> tuple[float | None, float | None]:
+    """冻结计数的两个比例；空期望集不表达成功或失败。"""
+    if not expected:
+        return None, None
+    return round(ok / expected, 4), round((ok + locked) / expected, 4)
 
 
 def _result(
@@ -57,18 +65,10 @@ def _result(
     *,
     targets_total: int = 0,
     targets_done: int = 0,
-    coverage: float | None = None,
-    coverage_confirmed: float | None = None,
 ) -> dict:
     """计数 → 覆盖率结果。期望集为空时两个比值为 null（0/0 无意义）。"""
     ok = counts["ok"]
-    confirmed = ok + counts["locked"]
-    if coverage is None:
-        coverage = round(ok / expected_units, 4) if expected_units else None
-    if coverage_confirmed is None:
-        coverage_confirmed = (
-            round(confirmed / expected_units, 4) if expected_units else None
-        )
+    coverage, coverage_confirmed = coverage_ratios(expected_units, ok, counts["locked"])
     return {
         "cycleId": cycle_id,
         "status": status,
@@ -115,15 +115,13 @@ async def cycle_coverage(cycle_id: int) -> dict | None:
             cycle.units_missing,
             cycle.units_blocked,
             cycle.units_unobserved,
-            cycle.coverage,
-            cycle.coverage_confirmed,
             cycle.targets_total,
             cycle.targets_done,
         )
 
     if frozen_units is not None:
         units_ok, units_locked, units_failed, units_missing, units_blocked, \
-            units_unobserved, coverage, coverage_confirmed, targets_total, \
+            units_unobserved, targets_total, \
             targets_done = frozen
         missing = units_missing
         blocked = units_blocked
@@ -143,8 +141,6 @@ async def cycle_coverage(cycle_id: int) -> dict | None:
             },
             targets_total=targets_total,
             targets_done=targets_done,
-            coverage=coverage,
-            coverage_confirmed=coverage_confirmed,
         )
 
     appids = [int(a) for a in (expected.get("appids") or [])]
@@ -174,17 +170,20 @@ async def cycle_coverage(cycle_id: int) -> dict | None:
                     select(
                         GameCurrentPrice.appid,
                         GameCurrentPrice.price_status,
+                        GameCurrentPrice.attempt_outcome,
+                        GameCurrentPrice.steam_answer,
                         func.count(),
                     )
                     .where(*conds)
-                    .group_by(GameCurrentPrice.appid, GameCurrentPrice.price_status)
+                    .group_by(GameCurrentPrice.appid, GameCurrentPrice.price_status,
+                              GameCurrentPrice.attempt_outcome, GameCurrentPrice.steam_answer)
                 )
             ).all()
-            for appid, price_status, n in rows:
+            for appid, price_status, outcome, answer, n in rows:
                 buckets = buckets_by_appid.setdefault(
                     int(appid), {b: 0 for b in BUCKETS}
                 )
-                buckets[_bucket_of(price_status)] += n
+                buckets[_bucket_of(price_status, outcome, answer)] += n
 
     counts = {
         b: sum(buckets.get(b, 0) for buckets in buckets_by_appid.values())

@@ -16,11 +16,11 @@ import pytest_asyncio
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core import database as database_module
-from app.core import scheduler as scheduler_mod
+from app.domains.crawl import service as crawl_service
 from app.core.database import init_db
 from app.domains.games import boards as boards_mod
 from app.domains.games.models import Game
-from app.domains.monitoring.models import MonitorTarget
+from app.domains.monitoring.models import MonitorExclusion, MonitorSource, MonitorTarget
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -48,8 +48,9 @@ async def _seed_games() -> None:
             Game(appid=500, name="Game500", type="game", free_kind="f2p"),
         ])
         session.add(MonitorTarget(
-            target_type="game", target_id=300, state="active", priority=60,
+            target_type="game", target_id=300,
         ))
+        session.add(MonitorSource(target_type="game", target_id=300, source="manual", priority=60, active=True))
         await session.commit()
 
 
@@ -119,18 +120,18 @@ async def test_price_refresh_specs_gate_catalog_segment():
 
     # 代理形态（显式选择）：默认全量——目录层 + 特惠榜差值段随默认开关打开
     await settings_service.set_value("proxy.strategy", "proxy_first")
-    assert await scheduler_mod._price_refresh_specs() == (
+    assert await crawl_service.default_queue_specs() == (
         base + [{"scope": "catalog"}, tail]
     )
 
     await settings_service.set_value("crawl.catalog_refresh", True)
-    assert await scheduler_mod._price_refresh_specs() == (
+    assert await crawl_service.default_queue_specs() == (
         base + [{"scope": "catalog"}, tail]
     )
 
     # 只盯特定游戏：目录层与特惠榜差值段一并停
     await settings_service.set_value("crawl.catalog_refresh", False)
-    assert await scheduler_mod._price_refresh_specs() == base
+    assert await crawl_service.default_queue_specs() == base
 
 
 @pytest.mark.asyncio
@@ -145,18 +146,18 @@ async def test_direct_only_defaults_catalog_segments_off():
     base = [{"kind": "missing"}, {"scope": "pool"}]
 
     await settings_service.set_value("proxy.strategy", "direct_only")
-    assert await scheduler_mod._price_refresh_specs() == base + [discounts]
+    assert await crawl_service.default_queue_specs() == base + [discounts]
 
     # 显式打开 = 用户明确要目录层，直连形态同样执行（折扣段与目录段并存）
     await settings_service.set_value("crawl.catalog_refresh", True)
-    assert await scheduler_mod._price_refresh_specs() == (
+    assert await crawl_service.default_queue_specs() == (
         base + [discounts, {"scope": "catalog"}, tail]
     )
 
     # 代理形态未显式设置时仍默认开（无折扣段——目录层覆盖大盘子）
     await settings_service.set_value("proxy.strategy", "proxy_first")
     await settings_service.delete_value("crawl.catalog_refresh")
-    assert await scheduler_mod._price_refresh_specs() == (
+    assert await crawl_service.default_queue_specs() == (
         base + [{"scope": "catalog"}, tail]
     )
 
@@ -211,7 +212,7 @@ async def test_manual_full_queue_shares_one_composition(monkeypatch):
 
     monkeypatch.setattr(boards_mod, "get_board", _fake_board)
 
-    scheduled = await scheduler_mod._price_refresh_specs()
+    scheduled = await crawl_service.default_queue_specs()
     composed = await crawl_service.default_queue_specs()
     assert composed == scheduled
 
@@ -235,6 +236,7 @@ async def test_manual_full_queue_shares_one_composition(monkeypatch):
         {"name": "specials", "count": 0},
     ]
     assert ack["total"] == 3
+    assert ack["cycleId"] == crawl_service.active_cycle_id()
     assert captured == []
 
     # 链在跑时重入被挡（防段间隙双开链）
@@ -244,9 +246,12 @@ async def test_manual_full_queue_shares_one_composition(monkeypatch):
     await crawl_service._queue_chain_task  # 等后台链收尾，防泄漏到别的用例
     assert captured == [[
         {"kind": "missing"},
-        {"scope": "pool", "kind": "manual"},
-        {"scope": "catalog", "kind": "manual"},
-        {"scope": "specials", "kind": "specials_backfill"},
+        {"scope": "pool", "kind": "manual", "resolved_appids": [300],
+         "resolved_regions": await crawl_service.effective_regions(None)},
+        {"scope": "catalog", "kind": "manual", "resolved_appids": [100, 200],
+         "resolved_regions": await crawl_service.effective_regions(None)},
+        {"scope": "specials", "kind": "specials_backfill", "resolved_appids": [],
+         "resolved_regions": await crawl_service.effective_regions(None)},
     ]]
 
 
@@ -289,8 +294,9 @@ async def test_catalog_scope_excludes_non_crawl_states():
     async with get_session_factory()() as session:
         session.add(Game(appid=600, name="Game600", type="game"))
         session.add_all([
-            MonitorTarget(target_type="game", target_id=100, state="released"),
-            MonitorTarget(target_type="game", target_id=200, state="excluded"),
+            MonitorTarget(target_type="game", target_id=100),
+            MonitorTarget(target_type="game", target_id=200),
+            MonitorExclusion(target_type="game", target_id=200, active=True),
         ])
         await session.commit()
 

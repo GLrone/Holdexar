@@ -274,10 +274,6 @@ async def test_start_job_success_releases_at_execute_end(db, monkeypatch):
 
     for attr in ("check_appids", "check_new_lows"):
         monkeypatch.setattr(crawl_service.alerts_service, attr, _noop)
-    for attr in ("refresh_hl_flags", "refresh_pp_flags", "refresh_sort_cache"):
-        monkeypatch.setattr(crawl_service.games_service, attr, _noop)
-    monkeypatch.setattr(crawl_service.games_series, "has_unassigned", _noop)
-    monkeypatch.setattr(crawl_service.games_series, "overrides_changed", _noop)
     import app.domains.wishlist.service as wishlist_service
 
     monkeypatch.setattr(wishlist_service, "release_free_games", _noop)
