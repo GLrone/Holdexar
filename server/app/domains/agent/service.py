@@ -178,12 +178,12 @@ async def start_run(run_id: str) -> dict:
 
 async def apply_transition(
     run_id: str, target: str, *, reason: str | None = None,
-    error_code: str | None = None,
+    error_code: str | None = None, priority: WritePriority = WritePriority.INTERACTIVE,
 ) -> dict:
     """状态跃迁唯一入口：校验 → 状态行 → run.state 事件 → 终态补
     run.finished 事件，全部在单一写事务内。非法迁移抛
     IllegalRunTransition 且不产生任何写入。"""
-    async with write_session(WritePriority.INTERACTIVE, "agent_run") as session:
+    async with write_session(priority, "agent_run") as session:
         run = await session.get(AgentRun, run_id)
         if run is None:
             raise LookupError(f"run not found: {run_id}")
@@ -453,7 +453,7 @@ async def reconcile_orphan_runs() -> int:
     count = 0
     for rid in ids:
         try:
-            await apply_transition(rid, RUN_CANCELLED, reason="runtime_restarted")
+            await apply_transition(rid, RUN_CANCELLED, reason="runtime_restarted", priority=WritePriority.BACKGROUND)
             count += 1
         except LookupError:  # 并发窗口内已被收敛，跳过
             continue

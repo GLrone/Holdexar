@@ -92,9 +92,18 @@ def test_scheduler_uses_normal_jobs_for_first_maintenance(monkeypatch):
         coro.close()
         raise AssertionError("maintenance must belong to registered jobs")
     monkeypatch.setattr(asyncio, "create_task", untracked)
+    now = datetime.now()
     sched.start_scheduler()
-    for key in ("wishlist_sync", "price_repair", "fx_refresh", "subscription_refresh", "proxypool_cycle", "mini_seed"):
-        assert jobs[key]["next_run_time"] <= datetime.now() + timedelta(seconds=1)
+    expected_staggers = {
+        "proxypool_cycle": sched._STARTUP_STAGGER_PROXYPOOL_CYCLE,
+        "price_repair": sched._STARTUP_STAGGER_PRICE_REPAIR,
+        "subscription_refresh": sched._STARTUP_STAGGER_SUBSCRIPTION_REFRESH,
+        "fx_refresh": sched._STARTUP_STAGGER_FX_REFRESH,
+        "mini_seed": sched._STARTUP_STAGGER_MINI_SEED,
+        "wishlist_sync": sched._STARTUP_STAGGER_WISHLIST_SYNC,
+    }
+    for key, stagger in expected_staggers.items():
+        assert abs((jobs[key]["next_run_time"] - (now + stagger)).total_seconds()) <= 1.0
     assert jobs["auto_backup"]["next_run_time"] <= datetime.now() + timedelta(minutes=5, seconds=1)
 
 

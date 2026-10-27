@@ -1,14 +1,27 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" style="background:#1b2838;color:#c7d5e0;">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="dark" />
     <link rel="icon" href="/logo.ico" />
     <title>Holdexar</title>
+    <style>
+      html, body { height: 100%; margin: 0; background: #1b2838; color: #c7d5e0; }
+      .hl-boot-splash { display: flex; align-items: center; justify-content: center; height: 100%; font: 15px/1.8 'Segoe UI', system-ui, sans-serif; user-select: none; }
+      .hl-boot-spin { width: 32px; height: 32px; margin: 0 auto 16px; border-radius: 50%; border: 3px solid rgba(199,213,224,.15); border-top-color: #66c0f4; animation: hl-r .8s linear infinite; }
+      @keyframes hl-r { to { transform: rotate(360deg); } }
+    </style>
   </head>
-  <body>
-    <div id="app"></div>
+  <body style="background:#1b2838;color:#c7d5e0;margin:0;">
+    <div id="app">
+      <div class="hl-boot-splash">
+        <div style="text-align:center">
+          <div class="hl-boot-spin"></div>
+          <div>正在载入主界面…</div>
+        </div>
+      </div>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

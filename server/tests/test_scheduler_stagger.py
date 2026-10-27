@@ -48,7 +48,7 @@ def test_refresh_and_bills_are_staggered_off_the_cycle_grid(monkeypatch, tmp_dat
     bills = recorded["bills_sync"]
     cycle = recorded["proxypool_cycle"]
 
-    assert refresh["next_run_time"] == cycle["next_run_time"]
+    assert cycle["next_run_time"] < refresh["next_run_time"] < bills["next_run_time"]
     assert bills["next_run_time"] > refresh["next_run_time"]
     assert bills["next_run_time"] - refresh["next_run_time"] <= timedelta(minutes=2, seconds=1)
 

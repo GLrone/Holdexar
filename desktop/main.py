@@ -49,10 +49,6 @@ SERVER_ROOT = PROJECT_ROOT / "server"
 if not getattr(sys, "frozen", False):
     if str(SERVER_ROOT) not in sys.path:
         sys.path.insert(0, str(SERVER_ROOT))
-else:
-    _bundled_server = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / "server"
-    if (_bundled_server / "app" / "main.py").is_file() and str(_bundled_server) not in sys.path:
-        sys.path.insert(0, str(_bundled_server))
 from app.core.app_info import (  # noqa: E402
     APP_NAME,
     APP_SLUG,
@@ -72,10 +68,6 @@ from app.core.paths import (  # noqa: E402
     is_frozen,
     resolve_data_dir,
 )
-from app.core.optional_deps import install_optional_dep_resolver  # noqa: E402
-
-# 打包态剔除的可选依赖若被真实路径用到，从这里起可按需补装（见 optional_deps）
-install_optional_dep_resolver()
 
 # WebView2 Runtime（Evergreen 固定产品 GUID）注册表探测 + 官方离线安装链
 _WEBVIEW2_REG_KEYS = (
@@ -116,6 +108,9 @@ HEALTH_TIMEOUT = 90.0
 WINDOW_TITLE = APP_NAME
 DEFAULT_SIZE = (1280, 860)
 MIN_SIZE = (960, 600)
+_background_mode = False
+_ui_active = False
+_activation = threading.Event()
 
 
 def _acquire_lock() -> socket.socket | None:
@@ -138,7 +133,10 @@ def _health_is_ours(response) -> bool:
     if getattr(response, "status_code", None) != 200:
         return False
     try:
-        return response.json().get("app") == APP_NAME
+        payload = response.json()
+        return payload.get("app") == APP_NAME and (
+            "dataDir" not in payload or Path(payload["dataDir"]).resolve() == _data_dir().resolve()
+        )
     except Exception:  # noqa: BLE001 —— 非 JSON 响应一律非本应用
         return False
 
@@ -233,21 +231,95 @@ def _start_server(ready: threading.Event, error_box: list[str]) -> None:
     # sys.path 已在模块头部按开发/打包态配好；此处无需再注入
     try:
         import uvicorn
+        from app.main import app
 
-        uvicorn.run("app.main:app", host=SERVER_HOST, port=SERVER_PORT, log_level="info")
+        uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT, log_level="info")
     except Exception:  # noqa: BLE001 —— 启动失败要完整带回主线程
         error_box.append(traceback.format_exc())
     finally:
         ready.set()
+        _activation.set()
+        if _background_mode and _ui_active:
+            os._exit(1)
+
+
+def _listen_activation(lock: socket.socket) -> None:
+    global _background_mode
+    while True:
+        try:
+            connection, _ = lock.accept()
+        except OSError:
+            return
+        try:
+            with connection:
+                connection.settimeout(1.0)
+                command = connection.recv(16)
+                if command == b"background":
+                    _background_mode = True
+                    os.environ[f"{ENV_PREFIX}BACKGROUND"] = "1"
+                    connection.sendall(b"ok")
+                elif command == b"show":
+                    _activation.set()
+        except OSError:
+            continue
+
+
+def _activate_running(*, background: bool = False) -> bool:
+    try:
+        with socket.create_connection((SERVER_HOST, LOCK_PORT), timeout=1.0) as connection:
+            connection.sendall(b"background" if background else b"show")
+            if background:
+                return connection.recv(16) == b"ok"
+        return True
+    except OSError:
+        return False
+
+
+def _wait_service_exit(pid: int) -> int:
+    """启动任务等待已有服务退出，监督期间不创建第二份调度实例。"""
+    if os.name != "nt":
+        while not _wait_pid_exit(pid, timeout=3600):
+            pass
+        return 1
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel.OpenProcess(0x00100000 | 0x1000, False, pid)
+    if not handle:
+        return 1
+    try:
+        if kernel.WaitForSingleObject(handle, 0xFFFFFFFF) != 0:
+            return 1
+        code = wintypes.DWORD()
+        return int(code.value) if kernel.GetExitCodeProcess(handle, ctypes.byref(code)) else 1
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def _background_loop(ready: threading.Event, url: str, *, show: bool) -> None:
+    global _ui_active
+    if show:
+        _activation.set()
+    while not ready.is_set():
+        _activation.wait()
+        _activation.clear()
+        if ready.is_set():
+            break
+        _ui_active = True
+        try:
+            _open_window(url)
+        finally:
+            _ui_active = False
 
 
 def _watch_launcher() -> None:
-    """包装进程（run.py）死亡 → 本进程随之退出：孤儿实例防线。
-
-    Windows 硬杀父进程不连带收割子进程，无主实例会占住服务端口与单实例锁；
-    watcher 线程等包装进程句柄，触发即 os._exit。直接拉起（无 LAUNCHER_PID
-    环境，如打包态 exe、--server）不设防——本无可监视的父进程。
-    """
+    """普通实例随启动器退出；已转后台运行的实例继续服务。"""
     if os.name != "nt":
         return
     raw = os.environ.get(f"{ENV_PREFIX}LAUNCHER_PID", "").strip()
@@ -265,12 +337,16 @@ def _watch_launcher() -> None:
         kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
         kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
         kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
         handle = kernel32.OpenProcess(SYNCHRONIZE, False, ppid)
         if not handle:
             return  # 包装进程已不在/句柄打不开：无孤儿风险，不设防
 
         def _await_death() -> None:
             kernel32.WaitForSingleObject(handle, INFINITE)
+            kernel32.CloseHandle(handle)
+            if _background_mode:
+                return
             print(f"[退出] 启动器进程 {ppid} 已终止，本实例随之退出。")
             sys.stdout.flush()
             os._exit(0)
@@ -340,7 +416,7 @@ def _wait_health(timeout: float) -> bool:
             if _health_is_ours(httpx.get(url, timeout=2.0, trust_env=False)):
                 return True
         except Exception:  # noqa: BLE001 —— 服务未就绪属预期
-            time.sleep(0.3)
+            time.sleep(0.05)
     return False
 
 
@@ -460,7 +536,7 @@ class DesktopApi:
             close_fds=True,
             creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
         )
-        threading.Timer(0.5, lambda: os._exit(0)).start()
+        threading.Timer(0.5, lambda: os._exit(75 if _background_mode else 0)).start()
         return {"ok": True}
 
 def _app_root() -> Path:
@@ -1677,6 +1753,8 @@ def _make_closing_guard(window):
     def _guard() -> bool:
         if _tray_state["quit"]:
             return True  # 托盘「退出」：放行真关闭
+        if _background_mode:
+            return True
         owner = getattr(window, "native", None)
         intent = _ask_close_intent(owner, window)
         if intent == "quit":
@@ -1727,9 +1805,34 @@ def _run_tray(window) -> None:
     try:
         import System.Windows.Forms as WinForms  # noqa: F401 —— pythonnet 装配件
 
-        WinForms.Application.Run()  # 托盘线程消息泵，直至 Application.ExitThread
+        context = WinForms.ApplicationContext()
+        exit_tray = context.ExitThread
+        ready_check = WinForms.Timer()
+        ready_check.Interval = 1
+
+        def check_closed(_sender, _event):
+            ready_check.Stop()
+            if window.events.closed.is_set():
+                exit_tray()
+
+        ready_check.Tick += check_closed
+        window.events.closed += exit_tray
+        try:
+            ready_check.Start()
+            if not window.events.closed.is_set():
+                WinForms.Application.Run(context)
+        finally:
+            window.events.closed -= exit_tray
+            ready_check.Tick -= check_closed
+            ready_check.Dispose()
+            context.Dispose()
     except Exception:  # noqa: BLE001 —— 托盘失效不拖垮主窗口
         pass
+    finally:
+        tray.Visible = False
+        tray.Dispose()
+        if _tray_state.get("tray") is tray:
+            _tray_state["tray"] = None
 
 
 def _open_window(app_url: str) -> None:
@@ -1758,15 +1861,19 @@ def _open_window(app_url: str) -> None:
         # 放开原生文本选择：默认 text_select=False 会显式关掉 WebView2 的
         # IsTextSelectionEnabled；置 True 后与浏览器一致（拖选 + Ctrl+C）。
         "text_select": True,
+        "background_color": "#1b2838",
     }
     try:
         window = webview.create_window(WINDOW_TITLE, html=_SPLASH_HTML, **kwargs)
-        # 关窗语义：点 X = 隐藏到托盘，后端（uvicorn 线程 + 调度器）随进程
-        # 常驻继续更新数据；托盘「退出」置 quit 后放行真关闭。closed 事件
-        # 保留为终审兜底（两条退出路径都汇聚到 os._exit，不走解释器收尾
-        # 的延迟路径——后台线程随进程内核直接终结）。
+        # 关闭窗口按后台设置释放窗口或退出应用。
         window.events.closing += _make_closing_guard(window)
-        window.events.closed += lambda: (sys.stdout.flush(), os._exit(0))
+        def closed():
+            if _background_mode and not _tray_state["quit"]:
+                return
+            sys.stdout.flush()
+            os._exit(0)
+
+        window.events.closed += closed
         start_kwargs = {}
         icon = _app_icon()
         if icon:
@@ -1774,19 +1881,20 @@ def _open_window(app_url: str) -> None:
             # 传了会 TypeError 顶层炸穿兜底）
             start_kwargs["icon"] = icon
         # 托盘与 health 跳转都在窗口建好后由 start(func) 拉起（时序见 _run_tray）
-        webview.start(_on_window_ready, (window, app_url), **start_kwargs)  # 阻塞至窗口真关闭（仅托盘退出可达）
+        webview.start(_on_window_ready, (window, app_url), **start_kwargs)
     except Exception as e:  # noqa: BLE001 —— 窗口创建/渲染层初始化失败一并降级浏览器
         _browser_fallback(app_url, f"窗口初始化失败：{e}")
         return
     sys.stdout.flush()
-    os._exit(0)
+    if not _background_mode:
+        os._exit(0)
 
 
 def _focus_running_window() -> bool:
     """置前已在运行的本应用窗口（FindWindow 精确标题匹配）。
 
     单实例唤醒语义：找到窗口 → 还原最小化 + 前台；找不到（服务在跑但
-    无窗口，如 --server 模式）→ 返回 False 由调用方降级 webbrowser。
+    无窗口，如 --server 模式）→ 返回 False 由调用方请求重新显示。
     """
     try:
         import ctypes
@@ -1819,13 +1927,24 @@ def _apply_webview2_static_args() -> None:
 
 
 def main() -> None:
+    global _background_mode, _ui_active
     from app.core.update_host import report_data_protocol
 
     if report_data_protocol(sys.argv[1:]):
         return
     parser = argparse.ArgumentParser(description=f"{APP_NAME} 桌面启动器")
     parser.add_argument("--server", action="store_true", help="无窗口模式，仅启动本地服务")
+    parser.add_argument("--background", action="store_true", help="关闭窗口后继续更新，重新打开应用可显示原窗口")
+    parser.add_argument("--data-dir", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    _background_mode = args.server or args.background or os.environ.get(f"{ENV_PREFIX}BACKGROUND") == "1"
+    if _background_mode:
+        os.environ[f"{ENV_PREFIX}BACKGROUND"] = "1"
+    if args.data_dir:
+        os.environ[f"{ENV_PREFIX}DATA_DIR"] = str(Path(args.data_dir).resolve())
+        from app.core.config import get_settings
+
+        get_settings.cache_clear()
 
     from app.core.update_data import validate_startup
 
@@ -1848,7 +1967,8 @@ def main() -> None:
 
     # 孤儿实例防线最早挂上：换装/端口协商/服务线程任何阶段包装进程死亡，
     # 本进程都不应存活成无主实例（防线语义见 _watch_launcher 顶注）
-    _watch_launcher()
+    if not _background_mode:
+        _watch_launcher()
 
     # WebView2 静态参数须在任何窗口创建前就位（webview.start 建环境时读取）
     _apply_webview2_static_args()
@@ -1869,7 +1989,14 @@ def main() -> None:
         # 锁没拿到：真实例（探活命中→置前唤醒）或外来占坑（降级告警）
         if _probe_running():
             print(f"{APP_NAME} 已在运行。")
+            if args.server:
+                if not _activate_running(background=True):
+                    sys.exit(1)
+                health = httpx.get(f"http://{SERVER_HOST}:{SERVER_PORT}/api/v1/health", trust_env=False, timeout=2).json()
+                sys.exit(_wait_service_exit(int(health["pid"])))
             if not _focus_running_window():
+                if _activate_running():
+                    return
                 # 无窗口实例（--server 模式）：才退到浏览器唤醒
                 webbrowser.open(f"http://{SERVER_HOST}:{SERVER_PORT}")
             return
@@ -1883,13 +2010,13 @@ def main() -> None:
     if not update_token and _swap_mutex_held():
         _log_update("检测到换装进程进行中，本实例退出等待其完成")
         sys.stdout.flush()
-        os._exit(0)
+        os._exit(75 if _background_mode else 0)
 
     # 换装：暂存就绪则把换装交给暂存包的新 exe（本进程立即退出，不再起服务）；
     # 交接失败（旧版暂存包/拉不起来）就照常启动现装，下次启动再试
     if not update_token and _handoff_pending_update():
         sys.stdout.flush()
-        os._exit(0)
+        os._exit(75 if _background_mode else 0)
 
     # 换装残留清理：已消费的暂存目录（无 manifest）+ 上一版程序备份 __old__
     if not update_token:
@@ -1901,6 +2028,8 @@ def main() -> None:
     ready = threading.Event()
     error_box: list[str] = []
     threading.Thread(target=_start_server, args=(ready, error_box), daemon=True).start()
+    if lock is not None:
+        threading.Thread(target=_listen_activation, args=(lock,), daemon=True).start()
 
     url = os.environ.get(f"{ENV_PREFIX}DEV_URL") or f"http://{SERVER_HOST}:{SERVER_PORT}"
     if args.server:
@@ -1913,11 +2042,12 @@ def main() -> None:
                 print(f"{HEALTH_TIMEOUT:.0f}s 内健康检查未通过")
             sys.exit(1)
         print(f"服务已就绪：{url}（Ctrl+C 退出）")
+    if _background_mode:
         try:
-            while True:
-                time.sleep(3600)
+            _background_loop(ready, url, show=not args.server)
         except KeyboardInterrupt:
             return
+        sys.exit(1)
 
     # 窗口模式：窗口初始化（CLR/WebView2）与后端 lifespan 并行——窗口先载
     # 内联等待页（不经网络，后端未监听也不受影响），health 就绪后整窗跳转
@@ -1945,7 +2075,14 @@ def main() -> None:
                 print(detail)
 
     threading.Thread(target=_watchdog, daemon=True).start()
-    _open_window(url)
+    _ui_active = True
+    try:
+        _open_window(url)
+    finally:
+        _ui_active = False
+    if _background_mode:
+        _background_loop(ready, url, show=False)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

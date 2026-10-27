@@ -253,3 +253,21 @@ def test_schema_drift_stops_file_fallback(tmp_path):
     layout.write_data_compatibility(root, {"dataDir": str(data), "schemaVersion": 18, "versions": ["0.3.6"]})
     with pytest.raises(RuntimeError):
         launcher.find_target_version(root)
+
+
+def test_background_launcher_returns_supervised_child_exit(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    root = tmp_path / "app"
+    _create_version(root, "0.3.5", has_exe=True)
+    layout.write_current_state(root, "0.3.5")
+    calls = []
+
+    def launch(*args, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(wait=lambda: 75)
+
+    monkeypatch.setattr(launcher, "launch_version", launch)
+    monkeypatch.setattr(launcher, "detect_legacy_data_locations", lambda root: {})
+    assert launcher.run_launcher(install_root_override=root, argv=["--server"]) == 75
+    assert calls[0]["detached"] is False
