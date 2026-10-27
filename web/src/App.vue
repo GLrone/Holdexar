@@ -17,7 +17,6 @@ import { buildRateMap, formatWalletCny, walletToCny, type RateMap } from '@/lib/
 import { walletSyncOk, walletSyncedAt } from '@/lib/walletSync'
 import { APP_NAME } from '@/appInfo'
 import ProductTour from '@/components/ProductTour.vue'
-import HlPilotDrawer from '@/components/business/HlPilotDrawer.vue'
 import UpdateDialog from '@/components/business/UpdateDialog.vue'
 import UpdateBubble from '@/components/business/UpdateBubble.vue'
 import {
@@ -52,6 +51,9 @@ const themeStore = useThemeStore()
 const localeStore = useLocaleStore()
 const accountStore = useAccountStore()
 const pilotStore = usePilotStore()
+const HlPilotDrawer = defineAsyncComponent(() => import('@/components/business/HlPilotDrawer.vue'))
+const pilotDrawerMounted = ref(pilotStore.open)
+watch(() => pilotStore.open, () => { pilotDrawerMounted.value = true }, { once: true })
 const updaterStore = useUpdaterStore()
 const { t } = useI18n()
 
@@ -68,11 +70,6 @@ onMounted(() => {
   factNotices.start()
   settingsStore.load()
   accountStore.load()
-  // 闲时预热成就殿堂视图 chunk（内含 echarts 大包）：只在浏览器空闲时跑、
-  // 不设强制期限——首屏加载与请求链完成前不与当前页争抢
-  const warmAchievements = () => { void import('./views/achievements/Index.vue') }
-  if ('requestIdleCallback' in window) requestIdleCallback(warmAchievements)
-  else setTimeout(warmAchievements, 10_000)
   // 钱包快照轮询：后端每分钟轮转刷新，前端只读拉取最新快照（不打 Steam）
   setInterval(() => accountStore.load(), 60_000)
   // 与后端对齐更新状态：上次会话下载好却没重启的暂存，这次启动要弹「重启完成更新」
@@ -500,7 +497,7 @@ async function manualRefreshWallet() {
     <UpdateDialog />
 
     <!-- 领航台：领航员问答抽屉（全局唯一实例；顶栏 / 找游戏 / 游戏详情三处入口共开） -->
-    <HlPilotDrawer v-model="pilotStore.open" :game="pilotStore.game" />
+    <HlPilotDrawer v-if="pilotDrawerMounted" v-model="pilotStore.open" :game="pilotStore.game" />
 
     <!-- 灵动岛消息面：顶部悬浮的独立胶囊，状态 / 消息 / 任务 / 详情四态就地切换。
          全局唯一实例——要跨路由存活，挂页面里的实例会被 router.push 卸载 -->
