@@ -23,8 +23,6 @@ import uuid
 import webbrowser
 from pathlib import Path
 
-import httpx
-
 
 def _ensure_stdio() -> None:
     """补齐缺失的标准句柄（windowed 打包 / pythonw 下 sys.stdout/stderr 为 None）。
@@ -68,6 +66,7 @@ from app.core.paths import (  # noqa: E402
     is_frozen,
     resolve_data_dir,
 )
+from app.core.update_host import _http_get_json  # noqa: E402
 
 # WebView2 Runtime（Evergreen 固定产品 GUID）注册表探测 + 官方离线安装链
 _WEBVIEW2_REG_KEYS = (
@@ -124,16 +123,15 @@ def _acquire_lock() -> socket.socket | None:
         return None
 
 
-def _health_is_ours(response) -> bool:
+def _health_is_ours(status, payload) -> bool:
     """健康响应身份校验：200 且载荷 app 字段等于本应用名才算本应用。
 
     health 载荷自带 {"app": APP_NAME, ...}（system/router.py）；非 JSON /
     缺字段 / 异名一律视为外来占坑，避免唤醒到同端口的他服务。
     """
-    if getattr(response, "status_code", None) != 200:
+    if status != 200:
         return False
     try:
-        payload = response.json()
         return payload.get("app") == APP_NAME and (
             "dataDir" not in payload or Path(payload["dataDir"]).resolve() == _data_dir().resolve()
         )
@@ -142,28 +140,8 @@ def _health_is_ours(response) -> bool:
 
 
 def _probe_running(timeout_s: float = 8.0, quick: bool = False) -> bool:
-    """轮询主端口健康端点，判定是否真有本应用实例在跑（含身份校验）。
-
-    留重试窗口覆盖「双击两次、前者还在启动中」的竞态。quick=True 单发
-    一次（150ms 超时），用于锁已被本进程持有、仅需排除竞态窗口的场景。
-    本地回环一律 trust_env=False 直连（见 _wait_health）。
-    """
-    url = f"http://{SERVER_HOST}:{SERVER_PORT}/api/v1/health"
-    if quick:
-        try:
-            return _health_is_ours(httpx.get(url, timeout=0.15, trust_env=False))
-        except Exception:  # noqa: BLE001
-            return False
-    deadline = time.time() + timeout_s
-    while True:
-        try:
-            if _health_is_ours(httpx.get(url, timeout=1.5, trust_env=False)):
-                return True
-        except Exception:  # noqa: BLE001 无实例/未就绪均属预期
-            pass
-        if time.time() >= deadline:
-            return False
-        time.sleep(0.5)
+    """等待同一数据目录的服务，快速探测最多使用 150ms 网络预算。"""
+    return _wait_health(0.15 if quick else timeout_s)
 
 
 def _port_free(port: int) -> bool:
@@ -400,23 +378,13 @@ def _app_icon() -> str | None:
 
 
 def _wait_health(timeout: float) -> bool:
-    """轮询本机健康端点直到就绪/超时。
-
-    本机回环请求必须 trust_env=False 直连：httpx 读注册表系统代理，且其
-    逗号分隔的 no-proxy 判定对 Windows 分号分隔的 ProxyOverride 无效，
-    本机探测会被转发到代理端口（HTTP(S)_PROXY 环境变量同理）。
-    """
-    deadline = time.time() + timeout
-    url = f"http://{SERVER_HOST}:{SERVER_PORT}/api/v1/health"
-    while time.time() < deadline:
-        try:
-            # 身份校验同 _probe_running：万一端口号被外来服务抢先绑定，
-            # 对方对 health 回 200 也不算本应用就绪（否则窗口会加载到
-            # 对方的页面还显示"服务已就绪"）
-            if _health_is_ours(httpx.get(url, timeout=2.0, trust_env=False)):
-                return True
-        except Exception:  # noqa: BLE001 —— 服务未就绪属预期
-            time.sleep(0.05)
+    """直连回环并校验服务身份；每次网络等待均受剩余预算约束。"""
+    deadline = time.monotonic() + timeout
+    while (remaining := deadline - time.monotonic()) > 0:
+        response = _http_get_json(SERVER_HOST, SERVER_PORT, "/api/v1/health", timeout=min(2.0, remaining))
+        if _health_is_ours(*response):
+            return True
+        time.sleep(max(0, min(0.05, deadline - time.monotonic())))
     return False
 
 
@@ -484,14 +452,8 @@ def _install_navigation_guard(window, app_url: str) -> None:
         pass
 
 
-def _wait_and_navigate(window, app_url: str, splash_rendered: threading.Event | None = None) -> None:
-    """等待内联页完成首绘且 health 就绪后平滑切到真实应用。
-
-    防过早跳转：等待页 DOM/CSS 首绘完成前不发起新导航，避免 WebView2
-    丢弃首绘回退到纯深蓝空白底色。
-    """
-    if splash_rendered is not None:
-        splash_rendered.wait(timeout=5.0)
+def _wait_and_navigate(window, app_url: str) -> None:
+    """后端就绪后导航，原生窗口调度由 pywebview 负责。"""
     if _wait_health(HEALTH_TIMEOUT):
         _install_navigation_guard(window, app_url)
         try:
@@ -1789,13 +1751,6 @@ def _make_closing_guard(window):
     return _guard
 
 
-def _on_window_ready(window, app_url: str) -> None:
-    """webview.start(func) 入口：窗口真正建好后拉起两件后台事——
-    health 等待跳转线程（等待页 → 真实应用）与托盘线程。"""
-    threading.Thread(target=_wait_and_navigate, args=(window, app_url), daemon=True).start()
-    _run_tray(window)
-
-
 def _run_tray(window) -> None:
     """托盘线程入口（经 webview.start(func) 在窗口建好后拉起）。
 
@@ -1839,26 +1794,8 @@ def _run_tray(window) -> None:
             _tray_state["tray"] = None
 
 
-def _apply_native_styling(window) -> None:
-    """WinForms 宿主与 WebView2 控件原生暗色背景注入。"""
-    try:
-        from System.Drawing import ColorTranslator
-        from webview.platforms.winforms import BrowserView
-
-        form = BrowserView.instances.get(window.uid)
-        if form:
-            dark_color = ColorTranslator.FromHtml("#1b2838")
-            form.BackColor = dark_color
-            for c in form.Controls:
-                c.BackColor = dark_color
-                if hasattr(c, "DefaultBackgroundColor"):
-                    c.DefaultBackgroundColor = dark_color
-    except Exception:  # noqa: BLE001
-        pass
-
-
 def _open_window(app_url: str) -> None:
-    """开主窗。就绪前首绘内联等待页并在首绘与 health 双就绪后平滑切到真实应用。"""
+    """并行创建窗口和等待服务；导航完成后显示唯一窗口。"""
     try:
         import webview
     except ImportError:
@@ -1885,34 +1822,15 @@ def _open_window(app_url: str) -> None:
         "hidden": True,
     }
     try:
-        backend_already_ready = _server_port_listening() and _wait_health(0.05)
-        target_url = _session_entry_url(app_url) if backend_already_ready else None
-
-        splash_rendered = threading.Event()
-        window_revealed = threading.Event()
-
-        def _reveal_window() -> None:
-            if not window_revealed.is_set():
-                window_revealed.set()
-                try:
-                    window.show()
-                except Exception:
-                    pass
+        window = webview.create_window(WINDOW_TITLE, html=_SPLASH_HTML, **kwargs)
+        revealed = threading.Event()
 
         def _on_loaded() -> None:
-            if not splash_rendered.is_set():
-                splash_rendered.set()
-            _reveal_window()
+            if not revealed.is_set() and not window.events.closed.is_set():
+                revealed.set()
+                window.show()
 
-        if target_url:
-            window = webview.create_window(WINDOW_TITLE, url=target_url, **kwargs)
-            _install_navigation_guard(window, app_url)
-        else:
-            window = webview.create_window(WINDOW_TITLE, html=_SPLASH_HTML, **kwargs)
-
-        window.events.before_show += lambda: _apply_native_styling(window)
         window.events.loaded += _on_loaded
-        threading.Timer(2.5, _reveal_window).start()
 
         # 关闭窗口按后台设置释放窗口或退出应用。
         window.events.closing += _make_closing_guard(window)
@@ -1931,8 +1849,7 @@ def _open_window(app_url: str) -> None:
             start_kwargs["icon"] = icon
 
         def _on_ready(win, url):
-            if not target_url:
-                threading.Thread(target=_wait_and_navigate, args=(win, url, splash_rendered), daemon=True).start()
+            threading.Thread(target=_wait_and_navigate, args=(win, url), daemon=True).start()
             _run_tray(win)
 
         # 托盘与 health 跳转都在窗口建好后由 start(func) 拉起（时序见 _run_tray）
@@ -1977,6 +1894,7 @@ def _apply_webview2_static_args() -> None:
     user-data 目录下所有 WebView2 环境参数必须一致。
     """
     key = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"
+    os.environ.setdefault("WEBVIEW2_DEFAULT_BACKGROUND_COLOR", "FF1B2838")
     if not os.environ.get(key):
         os.environ[key] = "--disable-component-update --disable-background-networking"
 
@@ -2047,7 +1965,7 @@ def main() -> None:
             if args.server:
                 if not _activate_running(background=True):
                     sys.exit(1)
-                health = httpx.get(f"http://{SERVER_HOST}:{SERVER_PORT}/api/v1/health", trust_env=False, timeout=2).json()
+                _, health = _http_get_json(SERVER_HOST, SERVER_PORT, "/api/v1/health", timeout=2)
                 sys.exit(_wait_service_exit(int(health["pid"])))
             if not _focus_running_window():
                 if _activate_running():

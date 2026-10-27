@@ -9,7 +9,6 @@
 import sys
 from pathlib import Path
 
-import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "desktop"))
@@ -18,57 +17,55 @@ import main as desktop_main  # noqa: E402  （desktop/main.py，自带 sys.path 
 from app.core.app_info import APP_NAME  # noqa: E402
 
 
-def _resp(status: int, body) -> httpx.Response:
-    if isinstance(body, str):
-        return httpx.Response(status, text=body)
-    return httpx.Response(status, json=body)
+def _resp(status: int, body):
+    return status, body
 
 
 def test_health_payload_with_own_app_name_is_ours():
     """200 + app=本应用名 → 本应用实例（真实 health 载荷形态）。"""
     r = _resp(200, {"status": "ok", "app": APP_NAME, "version": "0.1.0"})
-    assert desktop_main._health_is_ours(r) is True
+    assert desktop_main._health_is_ours(*r) is True
 
 
 def test_health_payload_with_foreign_app_name_rejected():
     """200 但 app 异名（或占坑服务仿造的 200）→ 外来占坑，不唤醒。"""
     r = _resp(200, {"status": "ok", "app": "another-local-app"})
-    assert desktop_main._health_is_ours(r) is False
+    assert desktop_main._health_is_ours(*r) is False
 
 
 def test_health_payload_missing_app_field_rejected():
     """200 但载荷无 app 字段 → 无法锚定身份，视为外来。"""
     r = _resp(200, {"status": "ok"})
-    assert desktop_main._health_is_ours(r) is False
+    assert desktop_main._health_is_ours(*r) is False
 
 
 def test_non_json_200_rejected():
     """200 但响应体不是 JSON（如裸 HTML 欢迎页）→ 外来。"""
-    assert desktop_main._health_is_ours(_resp(200, "<html>hello</html>")) is False
+    assert desktop_main._health_is_ours(*_resp(200, "<html>hello</html>")) is False
 
 
 def test_non_200_rejected():
     """404（对方无此路由）→ 外来。"""
     r = _resp(404, {"detail": "Not Found"})
-    assert desktop_main._health_is_ours(r) is False
+    assert desktop_main._health_is_ours(*r) is False
 
 
 def test_probe_quick_uses_identity(monkeypatch):
     """quick 探活走身份校验：异名 200 不算"已在运行"。"""
     seen: list[str] = []
 
-    def fake_get(url, **kw):
+    def fake_get(host, port, url, **kw):
         seen.append(url)
         return _resp(200, {"status": "ok", "app": "another-local-app"})
 
-    monkeypatch.setattr(desktop_main.httpx, "get", fake_get)
+    monkeypatch.setattr(desktop_main, "_http_get_json", fake_get)
     assert desktop_main._probe_running(quick=True) is False
     assert seen and seen[0].endswith("/api/v1/health")
 
     monkeypatch.setattr(
-        desktop_main.httpx,
-        "get",
-        lambda url, **kw: _resp(200, {"status": "ok", "app": APP_NAME}),
+        desktop_main,
+        "_http_get_json",
+        lambda host, port, url, **kw: _resp(200, {"status": "ok", "app": APP_NAME}),
     )
     assert desktop_main._probe_running(quick=True) is True
 
@@ -76,10 +73,10 @@ def test_probe_quick_uses_identity(monkeypatch):
 def test_wait_health_rejects_foreign_200(monkeypatch):
     """--server 启动等待同样校验身份：外来 200 不算就绪（超时返回 False）。"""
 
-    def fake_get(url, **kw):
+    def fake_get(host, port, url, **kw):
         return _resp(200, {"status": "ok", "app": "another-local-app"})
 
-    monkeypatch.setattr(desktop_main.httpx, "get", fake_get)
+    monkeypatch.setattr(desktop_main, "_http_get_json", fake_get)
     assert desktop_main._wait_health(0.2) is False
 
 
