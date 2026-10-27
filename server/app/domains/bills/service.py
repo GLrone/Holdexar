@@ -11,7 +11,7 @@
 - 钱包充值单独成流水（不入游戏支出，防双计）；账户价值 = 自购净额 + CDK 手动计价合计。
 
 历史汇率修复（rates.history.repair_history_gaps）落库后会回调
-`revalue_affected`：受影响交易重算 fx_rate/cny_fen + 汇总重算，账单不会
+`revalue_affected`：受影响交易重算 fx_rate/cny_fen，汇总直接读取交易，账单不会
 永久固化在首次导入时的错误汇率上。
 """
 from __future__ import annotations
@@ -23,7 +23,6 @@ from datetime import date, datetime, timedelta
 from sqlalchemy import and_, case, delete, func, or_, select
 
 from app.core.database import WritePriority, get_session_factory, write_session
-from app.core.database import write_gate
 from app.core.logging import log_event
 from app.crawler.utils import get_beijing_time_obj
 from .models import BillCdkGame, BillGameTx, BillImport, BillTopupTx
@@ -72,12 +71,12 @@ def _fx_note(tx: dict) -> str:
 
 
 async def revalue_affected(touched: dict[str, set[date]]) -> dict:
-    """历史汇率修复后重估受影响账单：行级 fx_rate/cny_fen 重算 + 汇总重算。
+    """历史汇率修复后重估受影响交易的 fx_rate/cny_fen。
 
     touched = {币种: {被修复覆盖的日期}}。受影响交易 = 币种命中且交易日期落在
     [该币种被修改的最早日期, 该币种被修改的最晚日期 + 15 天回溯窗]；用与导入同一规则重算（observed 精确日
     → 回溯 ≤ 15 天）——修复前落到 carried/缺失的交易在修复后自动获得真值，
-    修复改变了值的交易自动纠偏。汇总按全表现值重算（同一账单的其余行参与总额）。
+    修复改变了值的交易自动纠偏；读取面聚合交易现值，无需回写账单头。
     幂等：重算结果只取决于当前 observed/derived 数据。
     """
     if not touched:
@@ -136,48 +135,6 @@ async def revalue_affected(touched: dict[str, set[date]]) -> dict:
                 changed += 1
             import_ids.add(int(row.import_id))
 
-        for imp_id in sorted(import_ids):
-            agg = (
-                await session.execute(
-                    select(
-                        func.coalesce(
-                            func.sum(
-                                case(
-                                    (BillGameTx.is_refund.is_(False),
-                                     func.coalesce(BillGameTx.cny_fen, 0)),
-                                    else_=0,
-                                )
-                            ),
-                            0,
-                        ),
-                        func.coalesce(
-                            func.sum(
-                                case(
-                                    (BillGameTx.is_refund.is_(True),
-                                     func.abs(func.coalesce(BillGameTx.cny_fen, 0))),
-                                    else_=0,
-                                )
-                            ),
-                            0,
-                        ),
-                        func.coalesce(
-                            func.sum(case((BillGameTx.cny_fen.is_(None), 1), else_=0)), 0
-                        ),
-                        func.coalesce(
-                            func.sum(case((BillGameTx.is_refund.is_(False), 1), else_=0)), 0
-                        ),
-                    ).where(BillGameTx.import_id == imp_id)
-                )
-            ).one()
-            spend, refund, fx_missing, orders = (int(v or 0) for v in agg)
-            imp = await session.get(BillImport, imp_id)
-            if imp is None:
-                continue
-            imp.game_spend_fen = spend
-            imp.game_refund_fen = refund
-            imp.game_net_fen = spend - refund
-            imp.fx_missing = fx_missing
-            imp.orders = orders
         await session.commit()
 
     log_event(
@@ -228,8 +185,6 @@ async def import_report(data: dict, source_file: str = "") -> dict:
 
         fx_missing = 0
         topup_fx_missing = 0
-        spend_fen = 0
-        refund_fen = 0
         for tx in parsed["game_txs"]:
             rate = await _rate_for(session, tx["currency"], tx["date"], series_cache)
             if rate is None:
@@ -238,10 +193,6 @@ async def import_report(data: dict, source_file: str = "") -> dict:
             else:
                 cny = tx["amount"] * tx["sign"] * rate
                 cny_fen = _fen(cny)
-                if tx["is_refund"]:
-                    refund_fen += abs(cny_fen)
-                else:
-                    spend_fen += cny_fen
             session.add(
                 BillGameTx(
                     import_id=imp.id,
@@ -276,17 +227,11 @@ async def import_report(data: dict, source_file: str = "") -> dict:
                 )
             )
 
-        topup_spend_fen = 0
-        topup_refund_fen = 0
         for tx in parsed["topup_txs"]:
             rate = await _rate_for(session, tx["currency"], tx["date"], series_cache)
             cny_fen = None if rate is None else _fen(tx["amount"] * tx["sign"] * rate)
             if rate is None:
                 topup_fx_missing += 1
-            elif tx["is_refund"]:
-                topup_refund_fen += abs(cny_fen or 0)
-            else:
-                topup_spend_fen += cny_fen or 0
             session.add(
                 BillTopupTx(
                     import_id=imp.id,
@@ -316,11 +261,6 @@ async def import_report(data: dict, source_file: str = "") -> dict:
                 )
             )
 
-        imp.game_net_fen = spend_fen - refund_fen
-        imp.game_spend_fen = spend_fen
-        imp.game_refund_fen = refund_fen
-        imp.orders = sum(1 for t in parsed["game_txs"] if not t["is_refund"])
-        imp.fx_missing = fx_missing
         await session.commit()
 
     log_event(
@@ -350,10 +290,6 @@ async def import_report(data: dict, source_file: str = "") -> dict:
 
 # 同步状态快照（settings 键）——前端展示「自动同步」最近一次结果
 KEY_BILLS_SYNC = "bills.sync_snapshot"
-
-# 首屏探测结果键（settings 键）：True=上轮探测无新交易跳过。有新交易时清除
-KEY_BILLS_PROBE_SKIPPED = "bills.probe_skipped"
-
 
 async def _latest_known_tx_date() -> str | None:
     """库内最新一笔交易日期（YYYY-MM-DD；无任何账单返回 None）。
@@ -488,9 +424,7 @@ async def sync_bills(*, force: bool = False) -> dict:
             await settings_service.set_value(KEY_BILLS_SYNC, {
                 "running": False, "probedSkip": True, "syncedAt": now.isoformat(),
             })
-            await settings_service.set_value(KEY_BILLS_PROBE_SKIPPED, True)
             return {"ok": True, "status": "probed_skip", "historyRows": 0, "licenseRows": 0}
-        await settings_service.set_value(KEY_BILLS_PROBE_SKIPPED, False)
 
     async def _progress(info: dict) -> None:
         # 阶段进度写进快照 KV：GET /bills/sync 的轮询方（前端进度气泡）实时可读；
@@ -553,20 +487,35 @@ async def get_sync_snapshot() -> dict:
 async def list_imports() -> list[dict]:
     """已导入账单列表（新→旧）。"""
     async with get_session_factory()() as session:
-        rows = (await session.execute(select(BillImport).order_by(BillImport.id.desc()))).scalars().all()
+        rows = (await session.execute(
+            select(
+                BillImport,
+                func.coalesce(func.sum(case(
+                    (BillGameTx.is_refund.is_(False), BillGameTx.cny_fen), else_=0,
+                )), 0),
+                func.coalesce(func.sum(case(
+                    (BillGameTx.is_refund.is_(True), func.abs(BillGameTx.cny_fen)), else_=0,
+                )), 0),
+                func.count(case((BillGameTx.is_refund.is_(False), BillGameTx.id))),
+                func.count(case((BillGameTx.cny_fen.is_(None), BillGameTx.id))),
+            )
+            .outerjoin(BillGameTx, BillGameTx.import_id == BillImport.id)
+            .group_by(BillImport.id)
+            .order_by(BillImport.id.desc())
+        )).all()
     return [
         {
             "id": r.id,
             "nickname": r.nickname,
             "sourceFile": r.source_file,
             "importedAt": r.imported_at.isoformat() if r.imported_at else None,
-            "gameNetFen": r.game_net_fen,
-            "gameSpendFen": r.game_spend_fen,
-            "gameRefundFen": r.game_refund_fen,
-            "orders": r.orders,
-            "fxMissing": r.fx_missing,
+            "gameNetFen": spend - refund,
+            "gameSpendFen": spend,
+            "gameRefundFen": refund,
+            "orders": orders,
+            "fxMissing": missing,
         }
-        for r in rows
+        for r, spend, refund, orders, missing in rows
     ]
 
 
@@ -779,7 +728,7 @@ async def overview(import_id: int) -> dict:
                 "refundFen": refund_fen,
                 "orders": sum(1 for t in game_dicts if not t["isRefund"]),
                 "txCount": len(game_dicts),
-                "fxMissing": imp.fx_missing,
+                "fxMissing": sum(t["cnyFen"] is None for t in game_dicts),
                 **quota,
                 "accountValueFen": account_value_fen,
                 "cdkPriced": len(cdk_priced),

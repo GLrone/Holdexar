@@ -74,6 +74,22 @@ async def _enable(db, **over):
     return await load_prefs()
 
 
+@pytest.mark.asyncio
+async def test_normal_maintenance_recovers_pending_scan_without_new_cycle(db, delivery):
+    await _enable(db)
+    await _seed_game(db)
+    cid = await _cycle(db)
+    await _seed_event(db, cid, "PRICE_DROP", previous={"price": 19900}, current={"price": 9900})
+    async with db() as session:
+        row = await session.get(PriceCycle, cid)
+        row.notification_scan_json = {"state": "pending", "cursor": 0}
+        await session.commit()
+    result = await notification_service.dispatch()
+    assert result["created"] == 1 and result["sent"] == 1
+    assert (await notification_service.dispatch())["sent"] == 0
+    assert len(delivery) == 1
+
+
 async def _cycle(db) -> int:
     async with db() as session:
         cycle = PriceCycle(

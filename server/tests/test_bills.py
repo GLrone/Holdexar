@@ -987,6 +987,7 @@ async def test_sync_bills_probe_skip_when_no_new(db, monkeypatch):
     assert res["ok"] is True and res["status"] == "probed_skip"
     assert calls == []  # 全量抓取零调用——整轮只有探测 1 个 GET
     assert store[bills_service.KEY_BILLS_SYNC]["probedSkip"] is True
+    assert set(store) == {bills_service.KEY_BILLS_SYNC}
 
 
 @pytest.mark.asyncio

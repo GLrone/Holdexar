@@ -77,6 +77,61 @@ def _no_network(monkeypatch):
 
 # ─── 页面夹具（与真实社区页结构逐字段同构）────────────────────
 
+
+@pytest.mark.asyncio
+async def test_platinum_follows_counts_when_definition_refresh_has_no_player_state(db, monkeypatch):
+    from app.core.database import write_session
+    from app.domains.achievements import level
+
+    await achievements_service._apply_progress(PRIMARY, {620: {"total": 1, "unlocked": 1}}, {620})
+    async with write_session() as session:
+        row = await session.get(AchievementGame, (PRIMARY, 620))
+        await level.record_xp_events(session, PRIMARY, [
+            {"source": "platinum", "source_ref": "620", "xp": 200},
+        ])
+        await session.commit()
+
+    async def new_defs(*_args):
+        return [{"key": f"ACH_{i}", "name": f"ach{i}", "description": "", "icon_url": "",
+                 "global_percent": 10.0, "order": i}
+                for i in range(2)]
+
+    async def unavailable(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(achievements_service, "fetch_defs_api", new_defs)
+    monkeypatch.setattr(achievements_service, "fetch_states_api", unavailable)
+    monkeypatch.setattr(achievements_service, "_community_get", unavailable)
+    await achievements_service._sync_game(PRIMARY, row, [])
+    async with db() as session:
+        current = await session.get(AchievementGame, (PRIMARY, 620))
+        assert (current.total_achievements, current.unlocked, current.platinum) == (2, 1, False)
+        assert current.state_synced_at is None
+        assert (await session.execute(select(AchievementGame.appid).where(
+            AchievementGame.platinum.is_(True)
+        ))).scalars().all() == []
+        assert await level.total_xp(session, PRIMARY) == 200
+        assert await level.ensure_baseline(session, PRIMARY) is None
+
+
+@pytest.mark.asyncio
+async def test_platinum_python_and_sql_share_current_counts(db):
+    from app.core.database import write_session
+
+    assert AchievementGame(total_achievements=None, unlocked=None).platinum is False
+    async with write_session() as session:
+        session.add_all([AchievementGame(steamid=PRIMARY, appid=i, total_achievements=total, unlocked=unlocked)
+                         for i, total, unlocked in ((1, 0, 0), (2, 3, 2), (3, 3, 3), (4, 3, 4))])
+        await session.commit()
+    async with db() as session:
+        assert (await session.execute(select(AchievementGame.platinum).order_by(AchievementGame.appid))).scalars().all() == [False, False, True, True]
+        row = await session.get(AchievementGame, (PRIMARY, 2))
+        row.unlocked = 3
+        assert row.platinum is True
+        await session.rollback()
+    async with db() as session:
+        assert (await session.get(AchievementGame, (PRIMARY, 2))).platinum is False
+
 def global_html(appid: int, items: list[tuple]) -> str:
     """items: [(image, name, desc, percent)]"""
     rows = "".join(
@@ -578,14 +633,13 @@ async def test_multi_account_isolation(db, _creds):
     other = "76561198000000002"
     async with db() as session:
         session.add(AchievementGame(steamid=PRIMARY, appid=620, name="Portal 2",
-                                    playtime_min=900, total_achievements=3, unlocked=3,
-                                    platinum=True))
+                                    playtime_min=900, total_achievements=3, unlocked=3))
         session.add(AchievementGame(steamid=PRIMARY, appid=268910, name="Cuphead",
                                     total_achievements=42, unlocked=10, source="shared"))
         session.add(AchievementGame(steamid=other, appid=440, name="Team Fortress 2",
                                     playtime_min=60, total_achievements=10, unlocked=1))
         session.add(AchievementGame(steamid=other, appid=570, name="Dota 2",
-                                    total_achievements=5, unlocked=5, platinum=True))
+                                    total_achievements=5, unlocked=5))
         await session.commit()
 
     mine = await achievements_service.get_summary()
@@ -659,7 +713,7 @@ async def _seed(db):
         session.add(Game(appid=620, name="Portal 2", header_image="https://x/620.jpg"))
         session.add(AchievementGame(steamid=PRIMARY, appid=620, name="Portal 2",
                                     playtime_min=900, last_played=NOW - 86400,
-                                    total_achievements=3, unlocked=3, platinum=True))
+                                    total_achievements=3, unlocked=3))
         session.add(AchievementGame(steamid=PRIMARY, appid=440, name="Team Fortress 2",
                                     playtime_min=60, total_achievements=10, unlocked=8))
         session.add(AchievementGame(steamid=PRIMARY, appid=730, name="CS2", playtime_min=10))
@@ -825,7 +879,7 @@ async def _seed_career(db):
         session.add(GameTag(appid=440, tagid=19, weight=100))   # 动作
         session.add(AchievementGame(steamid=PRIMARY, appid=620, name="Portal 2",
                                     playtime_min=900, last_played=_ts(CAREER_DAYS_EARLY, 8),
-                                    total_achievements=6, unlocked=6, platinum=True))
+                                    total_achievements=6, unlocked=6))
         session.add(AchievementGame(steamid=PRIMARY, appid=440, name="Team Fortress 2",
                                     playtime_min=60, last_played=_ts(CAREER_DAYS_LATE, 12),
                                     total_achievements=10, unlocked=5))
@@ -1070,8 +1124,7 @@ async def _seed_series(db):
         session.add(Game(appid=620, name="Portal 2", series_id="Portal"))
         session.add(Game(appid=440, name="Team Fortress 2", series_id="Portal"))
         session.add(AchievementGame(steamid=PRIMARY, appid=620, name="Portal 2",
-                                    playtime_min=900, total_achievements=6, unlocked=6,
-                                    platinum=True))
+                                    playtime_min=900, total_achievements=6, unlocked=6))
         session.add(AchievementGame(steamid=PRIMARY, appid=440, name="Team Fortress 2",
                                     playtime_min=60, total_achievements=10, unlocked=5))
         # 有系列但一款没碰（进度 0、无 nextGame、封面取任一款）
@@ -1086,11 +1139,9 @@ async def _seed_series(db):
         session.add(Game(appid=810, name="英雄传说：闪之轨迹I", series_id="Legend Of Heroes"))
         session.add(Game(appid=811, name="英雄传说：闪之轨迹II", series_id="Legend Of Heroes"))
         session.add(AchievementGame(steamid=PRIMARY, appid=810, name="英雄传说：闪之轨迹I",
-                                    playtime_min=100, total_achievements=5, unlocked=5,
-                                    platinum=True))
+                                    playtime_min=100, total_achievements=5, unlocked=5))
         session.add(AchievementGame(steamid=PRIMARY, appid=811, name="英雄传说：闪之轨迹II",
-                                    playtime_min=50, total_achievements=5, unlocked=5,
-                                    platinum=True))
+                                    playtime_min=50, total_achievements=5, unlocked=5))
         await session.commit()
 
 

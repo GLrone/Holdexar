@@ -21,7 +21,6 @@ import httpx
 from sqlalchemy import delete, func, select
 
 from app.core.database import WritePriority, get_session_factory, write_session
-from app.core.database import write_gate
 from app.core.logging import log_event
 from app.domains.account import service as account_service
 from app.domains.achievements.models import AchievementDef, AchievementGame, AchievementState
@@ -1161,7 +1160,6 @@ async def _apply_progress(
                 session.add(row)
             row.total_achievements = p["total"]
             row.unlocked = p["unlocked"]
-            row.platinum = p["total"] > 0 and p["unlocked"] >= p["total"]
             row.source = SOURCE_OWNED if owned else SOURCE_SHARED
             if not owned and not row.name and names.get(appid):
                 row.name = names[appid]
@@ -1318,7 +1316,6 @@ async def _sync_game(steamid: str, row: AchievementGame, creds: list[tuple[str, 
                         d.icon_gray_url = r["gray_icon"]
             unlocked = sum(1 for r in merged.values() if r["achieved"])
             row.unlocked = unlocked
-            row.platinum = row.total_achievements > 0 and unlocked >= row.total_achievements
             row.state_synced_at = now
             row.updated_at = now
         else:

@@ -393,7 +393,8 @@ async def test_retention_preserves_incomplete_job_units_and_its_cycle(db):
     cid = await _cycle(db)
     async with db() as session:
         job = CrawlJob(kind="manual", status="failed", cycle_id=cid,
-                       finished_at=old, stats_json={"retryUnits": [f"{APP}:CN"]})
+                       finished_at=old,
+                       stats_json={"targets": {"appids": [APP], "regions": ["CN"]}})
         session.add(job)
         await session.execute(update(PriceCycle).where(PriceCycle.id == cid).values(started_at=old))
         await session.commit()
@@ -401,7 +402,8 @@ async def test_retention_preserves_incomplete_job_units_and_its_cycle(db):
     assert await prune_crawl_jobs() == 0
     assert (await retention.prune_price_cycles())["rows_deleted"] == 0
     async with db() as session:
-        await session.execute(update(CrawlJob).where(CrawlJob.id == jid).values(stats_json={"retryUnits": []}))
+        await session.execute(update(CrawlJob).where(CrawlJob.id == jid).values(
+            stats_json={"targets": {"appids": [], "regions": []}}))
         await session.commit()
     assert await prune_crawl_jobs() == 1
     assert (await retention.prune_price_cycles())["rows_deleted"] == 1

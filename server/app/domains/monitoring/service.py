@@ -1,10 +1,9 @@
 """monitoring 域服务：来源 → 监控对象 → crawl 资格 的生命周期。
 
-三层语义（互相不可互相推导）：
+三层语义（资格直接读取来源与排除）：
 
 - **Source**（`monitor_sources`）：谁想监控它。家族愿望单只是来源之一。
-- **Monitoring**（`monitor_targets`）：当前是否处于监控中，状态为
-  active / released / excluded。
+- **Monitoring**（`monitor_targets`）：在册身份与生命周期时刻，状态由来源和排除计算。
 - **Crawl Queue**：这一轮爬谁、按什么顺序。由 crawl 域按 Monitoring 的
   状态与优先级决定，本域不参与排队。
 
@@ -22,10 +21,9 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import bindparam, delete, func, select
 
 from app.core.database import WritePriority, get_session_factory, write_session
-from app.core.database import write_gate
 from app.domains.monitoring.models import (
     NON_CRAWL_STATES,
     STATE_ACTIVE,
@@ -61,7 +59,6 @@ DEFAULT_SOURCE_PRIORITY = 10
 # 集）。项目自加来源（favorite / manual / board）由各自动作直写监控层，不在
 # 账户对账的输入之列。
 _WISHLIST_SOURCE_FLAGS: tuple[tuple[str, str], ...] = (
-    ("manual", "favorite"),
     ("wishlisted", "family_wishlist"),
     ("owned", "owned"),
 )
@@ -85,80 +82,59 @@ def _priority_of(source: str) -> int:
     return SOURCE_PRIORITY.get(source, DEFAULT_SOURCE_PRIORITY)
 
 
-# ── 内部：行维护 + 状态重算 ────────────────────────────────────
+# ── 内部：在册身份与生命周期 ──────────────────────────────────
 
 
-async def _ensure_target(session, target_type: str, target_id: int) -> MonitorTarget:
-    row = (
+async def _target_states(
+    session, target_type: str, target_ids: list[int],
+) -> dict[int, tuple[str, int]]:
+    rows = await session.execute(
+        select(MonitorTarget.target_id, MonitorTarget.state, MonitorTarget.priority).where(
+            MonitorTarget.target_type == target_type, MonitorTarget.target_id.in_(target_ids),
+        )
+    )
+    return {int(tid): (state, int(priority)) for tid, state, priority in rows}
+
+
+async def _ensure_targets(
+    session, target_type: str, target_ids: list[int], now: datetime,
+) -> dict[int, tuple[str, int]]:
+    previous = await _target_states(session, target_type, target_ids)
+    missing = [
+        {"target_type": target_type, "target_id": tid, "created_at": now, "updated_at": now}
+        for tid in target_ids if tid not in previous
+    ]
+    if missing:
+        await session.execute(MonitorTarget.__table__.insert(), missing)
+    return previous
+
+
+async def _record_lifecycle(
+    session, target_type: str, target_ids: list[int],
+    previous: dict[int, tuple[str, int]], now: datetime,
+) -> dict[int, str]:
+    """记录原有生命周期时刻；资格和排序本身不落副本。"""
+    current = await _target_states(session, target_type, target_ids)
+    changes: dict[str, list[dict]] = {}
+    for tid, (state, priority) in current.items():
+        if previous.get(tid, (STATE_RELEASED, 0)) != (state, priority):
+            changes.setdefault(state, []).append({"_target_id": tid})
+    for state, records in changes.items():
+        column = {STATE_ACTIVE: "activated_at", STATE_RELEASED: "released_at", STATE_EXCLUDED: "excluded_at"}[state]
         await session.execute(
-            select(MonitorTarget).where(
+            MonitorTarget.__table__.update().where(
                 MonitorTarget.target_type == target_type,
-                MonitorTarget.target_id == target_id,
-            )
+                MonitorTarget.target_id == bindparam("_target_id"),
+            ).values(updated_at=now, **{column: now}), records,
         )
-    ).scalar_one_or_none()
-    if row is None:
-        now = _now()
-        row = MonitorTarget(
-            target_type=target_type,
-            target_id=target_id,
-            state=STATE_RELEASED,
-            priority=0,
-            created_at=now,
-            updated_at=now,
-        )
-        session.add(row)
-        await session.flush()
-    return row
+    return {tid: state for tid, (state, _) in current.items()}
 
 
-def _next_state(has_source: bool, excluded: bool) -> str:
-    if excluded:
-        return STATE_EXCLUDED
-    return STATE_ACTIVE if has_source else STATE_RELEASED
-
-
-def _apply_state(row: MonitorTarget, state: str, priority: int, now: datetime) -> None:
-    if row.state == state and row.priority == priority:
-        return
-    row.state = state
-    row.priority = priority
-    row.updated_at = now
-    if state == STATE_ACTIVE:
-        row.activated_at = now
-    elif state == STATE_RELEASED:
-        row.released_at = now
-    elif state == STATE_EXCLUDED:
-        row.excluded_at = now
-
-
-async def _recompute(session, target_type: str, target_id: int) -> str:
-    """按「排除门 → 来源 → 优先级」重算一个监控对象的状态。"""
-    now = _now()
-    excluded = (
-        await session.execute(
-            select(MonitorExclusion.id).where(
-                MonitorExclusion.target_type == target_type,
-                MonitorExclusion.target_id == target_id,
-                MonitorExclusion.active.is_(True),
-            )
-        )
-    ).scalar_one_or_none() is not None
-
-    best = (
-        await session.execute(
-            select(func.max(MonitorSource.priority)).where(
-                MonitorSource.target_type == target_type,
-                MonitorSource.target_id == target_id,
-                MonitorSource.active.is_(True),
-            )
-        )
-    ).scalar_one_or_none()
-    has_source = best is not None
-
-    row = await _ensure_target(session, target_type, target_id)
-    _apply_state(row, _next_state(has_source, excluded), int(best or 0), now)
-    return row.state
+async def _clear_exclusions(session, target_type: str, target_ids: list[int], now: datetime) -> None:
+    await session.execute(MonitorExclusion.__table__.update().where(
+        MonitorExclusion.target_type == target_type, MonitorExclusion.target_id.in_(target_ids),
+        MonitorExclusion.active.is_(True),
+    ).values(active=False, cleared_at=now))
 
 
 # ── 对外：来源维护 ────────────────────────────────────────────
@@ -169,6 +145,7 @@ async def sync_sources(
     desired: dict[int, set[str]],
     *,
     managed: set[str] | frozenset[str] | None = None,
+    clear_exclusion: bool = False,
 ) -> dict[int, str]:
     """按给定来源集合幂等重算一批监控对象（多账户去重后的并集）。
 
@@ -180,43 +157,36 @@ async def sync_sources(
     if not desired:
         return {}
     now = _now()
-    result: dict[int, str] = {}
-    async with write_session(WritePriority.BACKGROUND, label="monitoring") as session:
+    priority = WritePriority.INTERACTIVE if clear_exclusion else WritePriority.BACKGROUND
+    async with write_session(priority, label="monitoring") as session:
         targets = list(desired)
-        existing = {
-            (int(r.target_id), r.source): r
-            for r in (
-                await session.execute(
-                    select(MonitorSource).where(
-                        MonitorSource.target_type == target_type,
-                        MonitorSource.target_id.in_(targets),
-                    )
+        previous = await _ensure_targets(session, target_type, targets, now)
+        if clear_exclusion:
+            await _clear_exclusions(session, target_type, targets, now)
+        existing: dict[int, dict[str, MonitorSource]] = {}
+        for row in (
+            await session.execute(
+                select(MonitorSource).where(
+                    MonitorSource.target_type == target_type,
+                    MonitorSource.target_id.in_(targets),
                 )
             )
-            .scalars()
-            .all()
-        }
+        ).scalars():
+            existing.setdefault(int(row.target_id), {})[row.source] = row
+        added = []
         for target_id, sources in desired.items():
             sources = {s for s in (sources or set()) if s}
             if managed is not None:
                 sources = {s for s in sources if s in managed}
-            current = {
-                src: row for (tid, src), row in existing.items() if tid == target_id
-            }
+            current = existing.get(target_id, {})
             for src in sources:
                 row = current.get(src)
                 if row is None:
-                    session.add(
-                        MonitorSource(
-                            target_type=target_type,
-                            target_id=target_id,
-                            source=src,
-                            priority=_priority_of(src),
-                            active=True,
-                            created_at=now,
-                            updated_at=now,
-                        )
-                    )
+                    added.append({
+                        "target_type": target_type, "target_id": target_id, "source": src,
+                        "priority": _priority_of(src), "active": True,
+                        "created_at": now, "updated_at": now,
+                    })
                 elif not row.active:
                     row.active = True
                     row.priority = _priority_of(src)
@@ -227,12 +197,16 @@ async def sync_sources(
                 if src not in sources and row.active:
                     row.active = False
                     row.updated_at = now
-            result[target_id] = await _recompute(session, target_type, target_id)
+        if added:
+            await session.execute(MonitorSource.__table__.insert(), added)
+        result = await _record_lifecycle(session, target_type, targets, previous, now)
         await session.commit()
     return result
 
 
-async def ensure_source(target_type: str, target_id: int, source: str) -> str:
+async def ensure_source(
+    target_type: str, target_id: int, source: str, *, clear_exclusion: bool = False,
+) -> str:
     """确保某个来源为激活态，**不动该对象的其它来源**。
 
     与 `attach_source` 的分工：attach 把来源集合收敛成只含这一个（切换来源
@@ -240,7 +214,11 @@ async def ensure_source(target_type: str, target_id: int, source: str) -> str:
     把 Steam 愿望单等来源顺手洗掉。
     """
     now = _now()
+    target_id = int(target_id)
     async with write_session(WritePriority.INTERACTIVE, label="monitoring") as session:
+        previous = await _ensure_targets(session, target_type, [target_id], now)
+        if clear_exclusion:
+            await _clear_exclusions(session, target_type, [target_id], now)
         row = (
             await session.execute(
                 select(MonitorSource).where(
@@ -266,7 +244,7 @@ async def ensure_source(target_type: str, target_id: int, source: str) -> str:
             row.active = True
             row.priority = _priority_of(source)
             row.updated_at = now
-        state = await _recompute(session, target_type, int(target_id))
+        state = (await _record_lifecycle(session, target_type, [target_id], previous, now))[target_id]
         await session.commit()
     return state
 
@@ -321,7 +299,10 @@ async def attach_source(target_type: str, target_id: int, source: str) -> str:
 
 async def detach_source(target_type: str, target_id: int, source: str) -> str:
     """摘掉一个来源；最后一个来源摘掉后状态转 released。"""
+    target_id = int(target_id)
+    now = _now()
     async with write_session(WritePriority.INTERACTIVE, label="monitoring") as session:
+        previous = await _ensure_targets(session, target_type, [target_id], now)
         row = (
             await session.execute(
                 select(MonitorSource).where(
@@ -333,15 +314,18 @@ async def detach_source(target_type: str, target_id: int, source: str) -> str:
         ).scalar_one_or_none()
         if row is not None and row.active:
             row.active = False
-            row.updated_at = _now()
-        state = await _recompute(session, target_type, int(target_id))
+            row.updated_at = now
+        state = (await _record_lifecycle(session, target_type, [target_id], previous, now))[target_id]
         await session.commit()
     return state
 
 
 async def detach_all_sources(target_type: str, target_id: int) -> str:
     """摘掉全部来源（「停止监控」）：对象留在 Catalog，状态转 released。"""
+    target_id = int(target_id)
+    now = _now()
     async with write_session(WritePriority.INTERACTIVE, label="monitoring") as session:
+        previous = await _ensure_targets(session, target_type, [target_id], now)
         rows = (
             await session.execute(
                 select(MonitorSource).where(
@@ -351,11 +335,10 @@ async def detach_all_sources(target_type: str, target_id: int) -> str:
                 )
             )
         ).scalars().all()
-        now = _now()
         for row in rows:
             row.active = False
             row.updated_at = now
-        state = await _recompute(session, target_type, int(target_id))
+        state = (await _record_lifecycle(session, target_type, [target_id], previous, now))[target_id]
         await session.commit()
     return state
 
@@ -369,17 +352,13 @@ async def set_exclusion(
     """设置 / 解除排除。解除时行保留（只翻 active + 记 cleared_at）。"""
     target_id = int(target_id)
     async with write_session(WritePriority.INTERACTIVE, label="monitoring") as session:
-        row = (
-            await session.execute(
-                select(MonitorExclusion).where(
-                    MonitorExclusion.target_type == target_type,
-                    MonitorExclusion.target_id == target_id,
-                    MonitorExclusion.active.is_(True),
-                )
-            )
-        ).scalar_one_or_none()
         now = _now()
+        previous = await _ensure_targets(session, target_type, [target_id], now)
         if excluded:
+            row = (await session.execute(select(MonitorExclusion).where(
+                MonitorExclusion.target_type == target_type,
+                MonitorExclusion.target_id == target_id, MonitorExclusion.active.is_(True),
+            ))).scalar_one_or_none()
             if row is None:
                 session.add(
                     MonitorExclusion(
@@ -392,10 +371,9 @@ async def set_exclusion(
                 )
             elif reason and row.reason != reason[:200]:
                 row.reason = reason[:200]
-        elif row is not None:
-            row.active = False
-            row.cleared_at = now
-        state = await _recompute(session, target_type, target_id)
+        else:
+            await _clear_exclusions(session, target_type, [target_id], now)
+        state = (await _record_lifecycle(session, target_type, [target_id], previous, now))[target_id]
         await session.commit()
     return state
 
@@ -433,8 +411,8 @@ async def exclusion_reason(target_type: str, target_id: int) -> str | None:
 
 async def track(target_type: str, target_id: int, source: str = "manual") -> str:
     """重新监控：清排除 + 挂来源。排除是资格门，只有显式动作能打开。"""
-    await set_exclusion(target_type, target_id, False)
-    return await attach_source(target_type, target_id, source)
+    tid = int(target_id)
+    return (await sync_sources(target_type, {tid: {source}}, clear_exclusion=True))[tid]
 
 
 async def stop(target_type: str, target_id: int) -> str:
@@ -445,9 +423,8 @@ async def stop(target_type: str, target_id: int) -> str:
 async def forget(target_type: str, target_id: int) -> bool:
     """抹掉对象的监控记录（target 行 + 来源历史），回到「无记录」基线。
 
-    只服务「无记录即默认参与」的对象语义——捆绑包没有监控记录时默认
-    参与整表刷新，取消关注后不得停留在 released（released 会把它挡在
-    刷新候选集之外）。有激活来源或激活排除时拒绝执行（调用方语义错误）；
+    纯星标包取消关注后恢复普通列表展示，不留下 released 移除标记；
+    无记录的包仍不参与监控刷新。有激活来源或激活排除时拒绝执行；
     排除历史行保留（排除/解除可回溯）。
     """
     tid = int(target_id)
@@ -541,12 +518,21 @@ async def active_ids(target_type: str) -> list[int]:
     async with get_session_factory()() as session:
         rows = (
             await session.execute(
-                select(MonitorTarget.target_id)
+                select(MonitorSource.target_id)
+                .join(MonitorTarget, (
+                    (MonitorTarget.target_type == MonitorSource.target_type)
+                    & (MonitorTarget.target_id == MonitorSource.target_id)
+                ))
                 .where(
-                    MonitorTarget.target_type == target_type,
-                    MonitorTarget.state == STATE_ACTIVE,
+                    MonitorSource.target_type == target_type, MonitorSource.active.is_(True),
+                    ~select(MonitorExclusion.id).where(
+                        MonitorExclusion.target_type == MonitorSource.target_type,
+                        MonitorExclusion.target_id == MonitorSource.target_id,
+                        MonitorExclusion.active.is_(True),
+                    ).exists(),
                 )
-                .order_by(MonitorTarget.priority.desc(), MonitorTarget.target_id)
+                .group_by(MonitorSource.target_id)
+                .order_by(func.max(MonitorSource.priority).desc(), MonitorSource.target_id)
             )
         ).scalars().all()
     return [int(a) for a in rows]
@@ -768,24 +754,15 @@ async def stats() -> dict:
         catalog_bundle = int(
             (await session.execute(select(func.count()).select_from(Bundle))).scalar_one()
         )
-        states = {
-            str(s): int(n)
-            for s, n in (
-                await session.execute(
-                    select(MonitorTarget.state, func.count()).group_by(MonitorTarget.state)
-                )
-            ).all()
-        }
-        by_type = {
-            f"{t}/{s}": int(n)
-            for t, s, n in (
-                await session.execute(
-                    select(
-                        MonitorTarget.target_type, MonitorTarget.state, func.count()
-                    ).group_by(MonitorTarget.target_type, MonitorTarget.state)
-                )
-            ).all()
-        }
+        counts = await session.execute(
+            select(MonitorTarget.target_type, MonitorTarget.state, func.count())
+            .group_by(MonitorTarget.target_type, MonitorTarget.state)
+        )
+        states: dict[str, int] = {}
+        by_type = {}
+        for target_type, state, count in counts:
+            states[state] = states.get(state, 0) + int(count)
+            by_type[f"{target_type}/{state}"] = int(count)
         sources = {
             str(s): int(n)
             for s, n in (

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Integer, String, JSON
+from sqlalchemy import BigInteger, Boolean, DateTime, String, JSON
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -27,7 +27,6 @@ class TrackedAccount(Base):
     avatar_url: Mapped[str | None] = mapped_column(String(500))
     kinds_json: Mapped[dict | None] = mapped_column(JSON)  # {"wishlist":true,"owned":false}
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime)
-    item_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 

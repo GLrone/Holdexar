@@ -24,12 +24,6 @@ class BillImport(Base):
     avatar_base64: Mapped[str] = mapped_column(Text, default="")
     source_file: Mapped[str] = mapped_column(String(300), default="")
     imported_at: Mapped[datetime | None] = mapped_column(DateTime)
-    # 解析汇总（导入时计算冻结；明细行变更后可重算）
-    game_net_fen: Mapped[int] = mapped_column(BigInteger, default=0)
-    game_spend_fen: Mapped[int] = mapped_column(BigInteger, default=0)
-    game_refund_fen: Mapped[int] = mapped_column(BigInteger, default=0)
-    orders: Mapped[int] = mapped_column(Integer, default=0)
-    fx_missing: Mapped[int] = mapped_column(Integer, default=0)
     warnings_json: Mapped[str] = mapped_column(Text, default="[]")
 
 

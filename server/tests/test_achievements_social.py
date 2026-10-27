@@ -135,7 +135,7 @@ async def test_compare_aggregates_from_ledgers(db):
             session.add(
                 AchievementState(steamid=PRIMARY, appid=620, image_name=img, achieved=ach, unlock_time=ts)
             )
-        session.add(AchievementGame(steamid=PRIMARY, appid=620, playtime_min=600, platinum=True))
+        session.add(AchievementGame(steamid=PRIMARY, appid=620, playtime_min=600, total_achievements=1, unlocked=1))
         session.add(AchievementDef(appid=440, image_name="O1", global_percent=90.0))
         session.add(AchievementState(steamid=OTHER, appid=440, image_name="O1", achieved=True, unlock_time=1760000050))
         await level_mod.record_xp_events(session, PRIMARY, [{"source": "comment", "source_ref": "620:U", "xp": 40}])
@@ -144,7 +144,7 @@ async def test_compare_aggregates_from_ledgers(db):
             text(
                 "CREATE TABLE IF NOT EXISTS challenge_progress ("
                 "steamid VARCHAR(20) NOT NULL, challenge_id VARCHAR(40) NOT NULL, "
-                "progress INTEGER NOT NULL DEFAULT 0, target INTEGER NOT NULL, "
+                "progress INTEGER NOT NULL DEFAULT 0, "
                 "status VARCHAR(12) NOT NULL DEFAULT 'active', completed_at DATETIME, "
                 "claimed_at DATETIME, updated_at DATETIME, "
                 "PRIMARY KEY (steamid, challenge_id))"
@@ -152,9 +152,9 @@ async def test_compare_aggregates_from_ledgers(db):
         )
         await session.execute(
             text(
-                "INSERT INTO challenge_progress (steamid, challenge_id, progress, target, status, updated_at) VALUES "
-                "(:p, 'a', 1, 1, 'completed', '2026-01-01 00:00:00'), (:p, 'b', 1, 1, 'claimed', '2026-01-01 00:00:00'), "
-                "(:p, 'c', 0, 1, 'active', '2026-01-01 00:00:00'), (:o, 'a', 1, 1, 'active', '2026-01-01 00:00:00')"
+                "INSERT INTO challenge_progress (steamid, challenge_id, progress, status, updated_at) VALUES "
+                "(:p, 'a', 1, 'completed', '2026-01-01 00:00:00'), (:p, 'b', 1, 'claimed', '2026-01-01 00:00:00'), "
+                "(:p, 'c', 0, 'active', '2026-01-01 00:00:00'), (:o, 'a', 1, 'active', '2026-01-01 00:00:00')"
             ),
             {"p": PRIMARY, "o": OTHER},
         )

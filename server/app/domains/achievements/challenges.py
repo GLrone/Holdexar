@@ -1,7 +1,7 @@
 """挑战中心：challenge_progress 是挑战进度唯一账本，目录为代码常量（无外键）。
 
 进度只读既有账本（成就快照 / 生涯连击口径 / 批注表 / 可切换账号清单）幂等重算，
-批量 upsert 落行、target 恒随目录回填、status 只进不退；领取经 level.record_xp_events
+批量 upsert 落行、target 直接读目录、status 只进不退；领取经 level.record_xp_events
 发目录定值，status 守卫与 xp_events 唯一键双保险防重。service 的账号口径在调用点
 延迟导入——集成步同步钩子会反向 import 本模块，顶层互引成环。
 """
@@ -85,8 +85,6 @@ class ChallengeProgress(Base):
     steamid: Mapped[str] = mapped_column(String(20), primary_key=True)
     challenge_id: Mapped[str] = mapped_column(String(40), primary_key=True)
     progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    # 重算时从目录常量回填，目录变更自动跟随
-    target: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(12), nullable=False, default=STATUS_ACTIVE)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime)
@@ -194,7 +192,7 @@ def _idle_rows() -> list[dict]:
 async def recompute_challenges(target: str | None = None) -> list[dict]:
     """幂等重算：度量账本 → 批量 upsert → 新完成项落岛上事实；返回目录序行读数。
 
-    completed/claimed 行保留既有状态与时刻（status 只进不退）；target 恒随目录回填。
+    completed/claimed 行保留既有状态与时刻（status 只进不退）；target 直接读目录。
     """
     from . import service
 
@@ -238,7 +236,6 @@ async def recompute_challenges(target: str | None = None) -> list[dict]:
                 "steamid": steamid,
                 "challenge_id": spec.id,
                 "progress": progress,
-                "target": spec.target,
                 "status": status,
                 "completed_at": completed_at,
                 "claimed_at": claimed_at,
@@ -264,7 +261,6 @@ async def recompute_challenges(target: str | None = None) -> list[dict]:
                 index_elements=["steamid", "challenge_id"],
                 set_={
                     "progress": insert_stmt.excluded.progress,
-                    "target": insert_stmt.excluded.target,
                     "status": insert_stmt.excluded.status,
                     "completed_at": insert_stmt.excluded.completed_at,
                     "updated_at": insert_stmt.excluded.updated_at,

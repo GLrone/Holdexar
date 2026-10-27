@@ -534,7 +534,7 @@ async def _digest_rows(candidates: list[NotificationCandidate]) -> tuple[list[st
     return details, len({c.appid for c in candidates})
 
 
-async def dispatch(cycle_id: int) -> dict:
+async def dispatch(cycle_id: int | None = None) -> dict:
     """消费本轮事实并投递已认领摘要，通知失败不回滚价格结果。"""
     result = {
         "created": 0, "sent": 0, "deferred": 0, "failed": 0,
@@ -546,8 +546,6 @@ async def dispatch(cycle_id: int) -> dict:
         prefs = await load_prefs()
         recipient = (await smtp_config()).get("to_addr") or ""
         result["created"] += await resume_event_scans(cycle_id, prefs=prefs, recipient=recipient)
-        prefs = await load_prefs()
-        recipient = (await smtp_config()).get("to_addr") or ""
         if not prefs.get("enabled") or not recipient:
             log_event(
                 logger,

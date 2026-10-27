@@ -50,6 +50,8 @@ _STARTED_AT = time.time()
 @router.get("/health")
 async def health(request: Request) -> dict:
     settings = get_settings()
+    from app.core.scheduler import scheduler
+
     data = {
         "status": "ok",
         "app": settings.app_name,
@@ -57,6 +59,7 @@ async def health(request: Request) -> dict:
         "pid": os.getpid(),
         "dataDir": str(settings.data_dir),
         "executable": os.path.abspath(sys.executable),
+        "schedulerReady": scheduler.running,
     }
     attempt_id = os.environ.get(f"{ENV_PREFIX}UPDATE_ATTEMPT_ID")
     if attempt_id is not None:
@@ -66,6 +69,36 @@ async def health(request: Request) -> dict:
         data["writeProtected"] = verification.get("protected", False)
         data["pageReady"] = verification.get("pageReady", False)
     return data
+
+
+@router.get("/system/readiness")
+async def readiness(request: Request) -> dict:
+    from app.core.scheduler import scheduler, price_auto_enabled
+    from app.domains.crawl import service as crawl
+    from app.domains.regions.service import enabled_regions
+    from app.domains.settings.service import get_value
+    from app.domains.proxypool.runtime import exit_slot_snapshot, lane_bindings, lane_plan_consistency
+
+    protected = getattr(request.app.state, "update_verification", {}).get("protected", False)
+    regions = await enabled_regions()
+    strategy = await get_value("proxy.strategy", "proxy_first")
+    transport_ready = strategy == "direct_only"
+    reason = "" if transport_ready else "代理通道尚未就绪"
+    lanes = 0
+    if not transport_ready:
+        async with get_session_factory()() as session:
+            slots = await exit_slot_snapshot(session)
+        bindings = lane_bindings(get_settings().data_dir)
+        transport_ready, reason = lane_plan_consistency(bindings, slots)
+        lanes = len(bindings) if transport_ready else 0
+    return {
+        "httpReady": True, "schedulerReady": scheduler.running,
+        "collectionReady": bool(scheduler.running and not protected and regions and transport_ready),
+        "writeProtected": protected, "automaticEnabled": await price_auto_enabled(),
+        "transportReady": transport_ready, "strategy": strategy, "lanes": lanes,
+        "reason": "升级验收仍保护数据" if protected else "未启用采集地区" if not regions else reason,
+        "activeJobId": crawl.active_job_id(),
+    }
 
 
 @router.post("/system/update-ready")
@@ -143,82 +176,57 @@ async def import_legacy(req: LegacyImport) -> dict:
 
     games, prices, prices_total = await asyncio.to_thread(_fetch_legacy_snapshot, src)
 
-    games_upserted = 0
-    async with write_session(WritePriority.BACKGROUND) as session:
-        for row in games:
-            stmt = sqlite_insert(Game).values(
-                appid=int(row["appid"]),
-                name=row["name"] or f"AppID_{row['appid']}",
-            )
-            await session.execute(
-                stmt.on_conflict_do_update(
-                    index_elements=[Game.appid], set_={"name": stmt.excluded.name}
-                )
-            )
-            games_upserted += 1
+    from sqlalchemy import text
+    from app.domains.games.derived import catalog_inputs, update_price_derived
 
-        # 每个 (appid, region) 的最新一条写 current，history 落同一条
+    ids = list({int(row["appid"]) for row in games} | {int(row["appid"]) for row in prices})
+    now = datetime.now()
+    async with write_session(WritePriority.BACKGROUND) as session:
+        before = await catalog_inputs(session, ids)
+        game_rows = [{"appid": int(r["appid"]), "name": r["name"] or f"AppID_{r['appid']}"} for r in games]
+        if game_rows:
+            stmt = sqlite_insert(Game)
+            await session.execute(stmt.on_conflict_do_update(
+                index_elements=[Game.appid], set_={"name": stmt.excluded.name}
+            ), game_rows)
+        current, history = [], []
         for row in prices:
-            appid = int(row["appid"])
-            region = row["region_code"].upper()
-            price = row["price"]
             status = row["price_status"] or "ok"
-            # 从 history 重建属于人工修复动作：按快照状态补观察章
-            # （ok/locked = 成功观察并推进 last_success_at；missing/blocked
-            # = 失败态快照，last_success_at 留空待下次真实观察）
-            outcome = "success" if status in ("ok", "locked") else "failed"
-            answer = "locked" if status == "locked" else "ok" if status == "ok" else None
-            success_at = datetime.now() if outcome == "success" else None
-            stmt = sqlite_insert(GameCurrentPrice).values(
-                appid=appid,
-                region_code=region,
-                currency=row["currency"] or "",
-                price=int(price) if price is not None else None,
-                original_price=int(row["original_price"]) if row["original_price"] is not None else None,
-                discount_percent=row["discount_percent"] or 0,
-                sub_id=row["sub_id"],
-                price_status=status,
-                attempt_outcome=outcome,
-                steam_answer=answer,
-                last_success_at=success_at,
-                updated_at=datetime.now(),
-            )
-            await session.execute(
-                stmt.on_conflict_do_update(
-                    index_elements=[GameCurrentPrice.appid, GameCurrentPrice.region_code],
-                    set_={
-                        "currency": stmt.excluded.currency,
-                        "price": stmt.excluded.price,
-                        "original_price": stmt.excluded.original_price,
-                        "discount_percent": stmt.excluded.discount_percent,
-                        "sub_id": stmt.excluded.sub_id,
-                        "price_status": stmt.excluded.price_status,
-                        "attempt_outcome": stmt.excluded.attempt_outcome,
-                        "steam_answer": stmt.excluded.steam_answer,
-                        "last_success_at": stmt.excluded.last_success_at,
-                        "updated_at": stmt.excluded.updated_at,
-                    },
-                )
-            )
-            session.add(
-                GamePriceHistory(
-                    appid=appid,
-                    region_code=region,
-                    currency=row["currency"] or "",
-                    price=int(price) if price is not None else None,
-                    original_price=int(row["original_price"]) if row["original_price"] is not None else None,
-                    discount_percent=row["discount_percent"] or 0,
-                    sub_id=row["sub_id"],
-                    is_gold=bool(row["is_gold"]),
-                    version_suffix=row["version_suffix"],
-                    price_status=row["price_status"] or "ok",
-                    snapshot_at=datetime.now(),
-                )
-            )
+            success = status in ("ok", "locked")
+            values = {
+                "appid": int(row["appid"]), "region_code": row["region_code"].upper(),
+                "currency": row["currency"] or "", "price": row["price"],
+                "original_price": row["original_price"],
+                "discount_percent": row["discount_percent"] or 0,
+                "sub_id": row["sub_id"], "price_status": status,
+            }
+            current.append({**values, "attempt_outcome": "success" if success else "failed",
+                "steam_answer": "locked" if status == "locked" else "ok" if status == "ok" else None,
+                "last_success_at": now if success else None, "updated_at": now})
+            history.append({**values, "is_gold": bool(row["is_gold"]),
+                "version_suffix": row["version_suffix"], "snapshot_at": now})
+        if current:
+            stmt = sqlite_insert(GameCurrentPrice)
+            await session.execute(stmt.on_conflict_do_update(
+                index_elements=[GameCurrentPrice.appid, GameCurrentPrice.region_code],
+                set_={key: getattr(stmt.excluded, key) for key in current[0] if key not in ("appid", "region_code")},
+            ), current)
+            await session.execute(sqlite_insert(GamePriceHistory), history)
+            await session.execute(text(
+                "UPDATE game_current_prices AS p SET cny_fen=price_cny_fen(p.price,r.rate_to_cny) "
+                "FROM fx_rates r WHERE UPPER(p.currency)=r.currency_code AND p.price IS NOT NULL "
+                "AND p.appid IN (SELECT value FROM json_each(:ids))"
+            ), {"ids": json.dumps(ids)})
+            await session.execute(text(
+                "UPDATE game_price_history AS p SET cny_fen=price_cny_fen(p.price,r.rate_to_cny) "
+                "FROM fx_rates r WHERE UPPER(p.currency)=r.currency_code AND p.price IS NOT NULL "
+                "AND p.appid IN (SELECT value FROM json_each(:ids)) AND p.snapshot_at=:at"
+            ), {"ids": json.dumps(ids), "at": now.strftime("%Y-%m-%d %H:%M:%S.%f")})
+        await update_price_derived(ids, session=session, catalog_before=before)
         await session.commit()
 
     return {
-        "games": games_upserted,
+        "games": len(games),
         "priceRows": prices_total,
         "currentUpserted": len(prices),
     }
@@ -488,7 +496,7 @@ async def update_check() -> dict:
 
 class UpdateDownload(BaseModel):
     tag: str
-    sha256: str | None = None  # 清单内的校验值；缺省跳过校验
+    sha256: str | None = None  # 清单内的校验值；缺失即拒绝下载（无无校验放行）
     asset: str | None = None  # 清单给出的确切资产名（省掉一次 API 反查）
     size: int | None = None  # 清单体积：通道不给 Content-Length 时兜底百分比
     notes: str | None = None  # 更新说明（供换装后首次启动展示）
@@ -498,10 +506,13 @@ class UpdateDownload(BaseModel):
 async def update_download(req: UpdateDownload) -> dict:
     """下载 release zip → data/update-staging/ 解包校验；重启后由桌面壳换装。
 
-    sha256 期望值缺省时跳过校验（前端展示「未提供校验值」）。
+    校验值必填：缺失即 400 拒绝——清单路径的值来自验签清单，API 路径
+    来自 GitHub 资产 digest，缺它就没有可信完整性锚点。
     """
     from app.core import updater
 
+    if not (req.sha256 or "").strip():
+        raise HTTPException(status_code=400, detail="更新源未提供校验值，已拒绝下载")
     if not updater.mark_download_starting(req.tag, req.size):
         raise HTTPException(status_code=409, detail="已有更新下载进行中")
     # fire-and-forget：下载在后台跑，前端轮询 /system/update-progress
@@ -533,25 +544,6 @@ async def update_ack() -> dict:
     from app.core import updater
 
     return updater.acknowledge_update()
-
-
-@router.get("/system/seed/status")
-async def seed_status() -> dict:
-    """公共数据种子状态：是否在位（含版本）+ 按需下载进度。"""
-    from app.core import seed_fetch
-
-    return await seed_fetch.status_snapshot()
-
-
-@router.post("/system/seed/fetch")
-async def seed_fetch_now() -> dict:
-    """手动触发种子按需获取（已就绪时空转返回；进行中 409）。"""
-    from app.core import seed_fetch
-
-    if seed_fetch.status().get("state") in ("downloading", "extracting", "merging"):
-        raise HTTPException(status_code=409, detail="种子获取已在进行中")
-    asyncio.get_running_loop().create_task(seed_fetch.ensure_seed_online())
-    return {"started": True}
 
 
 @router.post("/system/update-cancel")
