@@ -129,7 +129,15 @@ export function priceDataView(
   return {
     age: agePart(data?.ageHours),
     coverage: coverageView(data?.coverage),
-    tips: coverageTipParts(data?.coverage, regionName),
+    tips: [
+      ...coverageTipParts(data?.coverage, regionName),
+      ...Object.entries(data?.regions ?? {})
+        .filter(([, info]) => info.outcome === 'success' && info.needsUpdate)
+        .map(([code, info]): TextPart => ({
+          key: 'gameCard.priceData.tipRegion.outdated',
+          params: { region: regionName?.(code) ?? code, time: shortTime(info.lastSuccessAt ?? '') },
+        })),
+    ],
     freshness: data?.freshness ?? null,
   }
 }

@@ -81,6 +81,7 @@ const gameCard: Partial<Record<MessageKey, string>> = {
   'gameCard.priceData.tipRegion.failedStale':
     '{region}: fetch failed this round, showing data from {time}',
   'gameCard.priceData.tipRegion.notAttempted': '{region}: not fetched yet',
+  'gameCard.priceData.tipRegion.outdated': '{region}: last updated successfully at {time}, update needed',
 
   /* Card action row */
   'gameCard.regionPrice.title': 'All regions',

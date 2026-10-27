@@ -1,7 +1,5 @@
 <script setup lang="ts">
-/* 后台任务面板：agent 域运行账本（agent_runs）的只读投影 + 取消。
-   账本同源——调度器每次 job 调用写一行 run，这里只看不写，不另立账本。
-   两个挂点：整页模式挂在会话列头部（variant=side），抽屉模式挂标签栏（variant=tab）。 */
+/* 后台任务的只读汇总与停止请求，保留会话列和标签栏两个挂点。 */
 import { onBeforeUnmount, ref } from 'vue'
 
 import { agentApi, type AgentRunView } from '@/api/client'
@@ -14,6 +12,7 @@ const { t } = useI18n()
 const open = ref(false)
 const runs = ref<AgentRunView[]>([])
 const busyId = ref('')
+const loadFailed = ref(false)
 let timer: ReturnType<typeof setInterval> | null = null
 
 const RUN_TERMINAL = new Set(['done', 'failed', 'cancelled', 'budget_exhausted'])
@@ -22,8 +21,9 @@ async function loadRuns() {
   try {
     const data = await agentApi.listRuns(undefined, 20)
     runs.value = data.items
+    loadFailed.value = false
   } catch {
-    runs.value = []
+    loadFailed.value = true
   }
 }
 
@@ -55,7 +55,7 @@ function runLabel(r: AgentRunView): string {
   if (job) {
     const key = `pilot.runs.job.${job}` as MessageKey
     const text = t(key)
-    return text === key ? job : text
+    return text === key ? (r.run_id.startsWith('crawl:') ? t('pilot.runs.crawl') : job) : text
   }
   const task = typeof meta.task === 'string' ? meta.task : ''
   if (task) {
@@ -68,6 +68,8 @@ function runLabel(r: AgentRunView): string {
 
 /** 状态词条：未登记的机器码原样显示（不猜） */
 function runStatusLabel(r: AgentRunView): string {
+  if (r.meta?.domainStatus === 'partial') return t('pilot.runs.status.partial')
+  if (r.meta?.domainStatus === 'completed' || (r.run_id.startsWith('crawl:') && r.status === 'done')) return t('pilot.runs.status.ended')
   const key = `pilot.runs.status.${r.status}` as MessageKey
   const text = t(key)
   return text === key ? r.status : text
@@ -85,23 +87,36 @@ function runDuration(r: AgentRunView): string {
   return t(r.finished_at ? 'pilot.runs.duration' : 'pilot.runs.runningFor', { n: span })
 }
 
-/** 触发来源：scheduled = 定时，其余（manual/cli/…）一律标手动 */
+/** 缺少来源的历史任务明确显示未知。 */
 function runTriggerLabel(r: AgentRunView): string {
   const meta = (r.meta ?? {}) as Record<string, unknown>
   const entry = typeof meta.entry === 'string' ? meta.entry : r.trigger
-  return entry === 'scheduled' ? t('pilot.runs.triggerScheduled') : t('pilot.runs.triggerManual')
+  if (entry === 'scheduled') return t('pilot.runs.triggerScheduled')
+  if (entry === 'manual') return t('pilot.runs.triggerManual')
+  if (entry === 'automatic') return t('pilot.runs.triggerAutomatic')
+  return t('pilot.runs.triggerUnknown')
 }
 
-function isTerminal(r: AgentRunView): boolean {
-  return RUN_TERMINAL.has(r.status)
+function canCancel(r: AgentRunView): boolean {
+  return !RUN_TERMINAL.has(r.status) && r.meta?.cancellable === true
+}
+
+function runProgress(r: AgentRunView): string {
+  const progress = r.meta?.progress as Record<string, unknown> | undefined
+  if (!progress) return ''
+  const counts = typeof progress.done === 'number' && typeof progress.total === 'number'
+    ? `${progress.done}/${progress.total}` : ''
+  const failed = typeof progress.failed === 'number'
+    ? t('pilot.runs.failedCount', { n: progress.failed }) : ''
+  return [counts, failed].filter(Boolean).join(' · ')
 }
 
 async function cancelRun(r: AgentRunView) {
   if (busyId.value) return
   busyId.value = r.run_id
   try {
-    await agentApi.cancelRun(r.run_id, 'user')
-    message.success(t('pilot.runs.cancelled'))
+    const result = await agentApi.cancelRun(r.run_id, 'user')
+    if (result.accepted) message.success(t('pilot.runs.cancelled'))
     await loadRuns()
   } catch {
     message.error(t('pilot.runs.cancelFailed'))
@@ -171,17 +186,19 @@ document.addEventListener('click', onDocClick)
             </svg>
           </button>
         </div>
-        <div v-if="!runs.length" class="pilot-runs__empty">{{ t('pilot.runs.empty') }}</div>
+        <div v-if="loadFailed" class="pilot-runs__empty" role="status">{{ t('pilot.runs.loadFailed') }}</div>
+        <div v-if="!runs.length && !loadFailed" class="pilot-runs__empty">{{ t('pilot.runs.empty') }}</div>
         <div v-for="r in runs" :key="r.run_id" class="pilot-runs__row">
-          <span class="pilot-runs__dot" :class="`is-${r.status}`" aria-hidden="true"></span>
+          <span class="pilot-runs__dot" :class="`is-${r.meta?.domainStatus === 'partial' ? 'partial' : r.status}`" aria-hidden="true"></span>
           <span class="pilot-runs__main">
             <span class="pilot-runs__name">{{ runLabel(r) }}</span>
             <span class="pilot-runs__meta">
               {{ runStatusLabel(r) }} · {{ runDuration(r) }} · {{ runTriggerLabel(r) }}
+              <span v-if="runProgress(r)"> · {{ runProgress(r) }}</span>
             </span>
           </span>
           <button
-            v-if="!isTerminal(r)"
+            v-if="canCancel(r)"
             type="button"
             class="pilot-runs__cancel"
             :disabled="busyId === r.run_id"
@@ -338,7 +355,8 @@ document.addEventListener('click', onDocClick)
   opacity: 0.5;
 }
 
-.pilot-runs__dot.is-awaiting_approval {
+.pilot-runs__dot.is-awaiting_approval,
+.pilot-runs__dot.is-partial {
   background: var(--warning);
 }
 

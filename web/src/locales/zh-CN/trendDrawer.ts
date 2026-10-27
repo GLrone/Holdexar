@@ -12,6 +12,7 @@ const trendDrawer = {
 
   /* 版本标签 */
   'trendDrawer.version.standard': '标准版',
+  'trendDrawer.version.unknown': '版本未识别（社区数据源）',
   'trendDrawer.version.gold': 'Gold 版',
 
   /* 史低事件标记 */
@@ -42,6 +43,12 @@ const trendDrawer = {
      ProductTour 将来要指向本节，target 写 `[data-section="trendDrawer.versions.title"]`。 */
   'trendDrawer.versions.title': '全部版本',
   'trendDrawer.versions.hint': '（当前地区价 · 点击切换走势）',
+
+  /* 历史回填（无历史时的按需采集状态） */
+  'trendDrawer.backfill.running': '正在获取历史价格，完成后自动显示',
+  'trendDrawer.backfill.error': '历史数据获取失败',
+  'trendDrawer.backfill.retry': '重试',
+  'trendDrawer.backfill.empty': '该地区暂无可获取的历史数据',
 
   /* 抽屉底部详情入口（箭头 → 留在组件侧） */
   'trendDrawer.detail.viewFull': '查看完整详情',

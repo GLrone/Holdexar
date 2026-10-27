@@ -210,7 +210,7 @@ function openReleases(): void {
 }
 
 async function onDismissUpdated(): Promise<void> {
-  await updater.dismissUpdated()
+  if (!(await updater.dismissUpdated())) message.error(t('updateDialog.toastAckFailed'))
 }
 
 function onClose(): void {
@@ -220,7 +220,7 @@ function onClose(): void {
     return
   }
   if (phase.value === 'updated') {
-    void updater.dismissUpdated()
+    void onDismissUpdated()
     return
   }
   updater.closeDialog()

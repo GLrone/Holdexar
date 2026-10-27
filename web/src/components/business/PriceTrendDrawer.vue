@@ -91,7 +91,7 @@ async function probeRegionHistory() {
 }
 
 const region = ref('cn')
-/** 0 = 标准版（请求不带 subId）；其余 = sub 包号 */
+/** -1 = 商品身份未知序列（product=unknown）；0 = 标准版（请求不带 subId）；其余 = sub 包号 */
 const versionKey = ref(0)
 /** 可见时间窗（天）：0=全部。历史全量一次拉齐，缩放在图表端进行（SteamDB 式导航条） */
 const days = ref(0)
@@ -112,28 +112,133 @@ function initialRegion(): string {
   return (trackedRegionOptions.value[0]?.value as string) ?? 'cn'
 }
 
-async function load() {
+/** 静默重拉当前视图（不进加载态；正常加载与回填轮询共用同一 seq 序） */
+async function silentReload(): Promise<HistoryPayload | null> {
   const seq = ++requestSeq
-  loading.value = true
   try {
-    // days=0 全量拉齐：时间窗缩放全部在图表端（时间 chips / 导航条），不回源
     const res = await gamesApi.history(
       props.game.appid,
       region.value,
       0,
-      versionKey.value || undefined,
+      versionKey.value > 0 ? versionKey.value : undefined,
+      versionKey.value === -1 ? 'unknown' : undefined,
     )
-    if (seq !== requestSeq) return // 已有更新请求，丢弃旧响应
+    if (seq !== requestSeq) return null // 已有更新请求，丢弃旧响应
     history.value = res
     // 版本列表随地区/响应刷新，当前选择可能已不在列表 → 回落标准版
     if (versionKey.value !== 0 && !versionOptions.value.some((v) => v.value === versionKey.value)) {
       versionKey.value = 0
     }
+    return res
   } catch {
     if (seq === requestSeq) history.value = null
-  } finally {
-    if (seq === requestSeq) loading.value = false
+    return null
   }
+}
+
+let loadSeq = 0
+
+/** 标准版空而未知序列有数据时自动切过去（每区一次）：诚实标注的独立序列
+ *  优于「暂无历史」空幕布——未知保持未知，但有的看就给看 */
+const autoSwitchedRegions = ref(new Set<string>())
+
+function maybeAutoSwitchToUnknown(res: HistoryPayload | null) {
+  if (versionKey.value !== 0 || (res?.points.length ?? 0) > 0) return
+  const hasUnknown = (res?.versions ?? []).some((v) => v.product === 'unknown')
+  if (!hasUnknown) return
+  const key = `${props.game.appid}:${region.value}`
+  if (autoSwitchedRegions.value.has(key)) return
+  autoSwitchedRegions.value.add(key)
+  versionKey.value = -1 // watch → load()，按未知序列重拉
+}
+
+async function load() {
+  const seq = ++loadSeq
+  loading.value = true
+  try {
+    const res = await silentReload()
+    if (seq === loadSeq) {
+      maybeAutoSwitchToUnknown(res)
+      maybeStartBackfill(res)
+    }
+  } finally {
+    // 只认最新一次显式加载：回填轮询共享 requestSeq，不得锁死加载态
+    if (seq === loadSeq) loading.value = false
+  }
+}
+
+// ─── 历史回填（无历史时派发一次后台采集；轮询本地只读接口拿新点）───
+// 只对当前查看地区的标准版空幕布触发一次：请求量与真实查看成比例，
+// 已试过/在飞/服务端确认无数据/失败都不再自动重发（失败可手动重试）。
+const backfillTriedRegions = ref(new Set<string>())
+const backfillState = ref<'idle' | 'running' | 'ok' | 'empty' | 'error'>('idle')
+let backfillTimer: ReturnType<typeof setInterval> | null = null
+
+function stopBackfillPoll() {
+  if (backfillTimer) {
+    clearInterval(backfillTimer)
+    backfillTimer = null
+  }
+}
+
+/** 已有数据但上次成功回填超过此天数 → 视图再触发一次增量重取
+ *  （上游全量返回 + 幂等去重，重取即增量补抓；仍受每次开抽屉每区一次约束） */
+const BACKFRESH_STALE_DAYS = 7
+
+function backfillIsStale(bf: HistoryPayload['backfill'] | undefined): boolean {
+  if (!bf?.lastOkAt) return false
+  const ageMs = Date.now() - new Date(bf.lastOkAt).getTime()
+  return Number.isFinite(ageMs) && ageMs > BACKFRESH_STALE_DAYS * 86_400_000
+}
+
+function maybeStartBackfill(res: HistoryPayload | null) {
+  if (versionKey.value !== 0 && versionKey.value !== -1) return
+  const hasData = (res?.points.length ?? 0) > 0
+  const bf = res?.backfill
+  if (hasData && !backfillIsStale(bf)) return
+  if (bf && (bf.state === 'running' || bf.state === 'empty')) {
+    backfillState.value = bf.state
+    if (bf.state === 'running') startBackfillPoll()
+    return
+  }
+  const key = `${props.game.appid}:${region.value}`
+  if (backfillTriedRegions.value.has(key)) return
+  backfillTriedRegions.value.add(key)
+  void triggerBackfill()
+}
+
+async function triggerBackfill() {
+  backfillState.value = 'running'
+  try {
+    await gamesApi.historyBackfill(props.game.appid, region.value)
+  } catch {
+    backfillState.value = 'error'
+    return
+  }
+  startBackfillPoll()
+}
+
+function startBackfillPoll() {
+  stopBackfillPoll()
+  let tries = 0
+  backfillTimer = setInterval(async () => {
+    tries += 1
+    const res = await silentReload()
+    // 回填完成的标准序列仍可能为空（未知序列承载数据）——轮询拍点
+    // 同样要尝试自动切换，否则切换只挂在显式 load 上，轮询路径永远到不了
+    maybeAutoSwitchToUnknown(res)
+    const bf = res?.backfill
+    const has = (res?.points.length ?? 0) > 0
+    if (has || tries >= 10 || bf?.state === 'empty' || bf?.state === 'error') {
+      stopBackfillPoll()
+      backfillState.value = has ? 'ok' : (bf?.state ?? 'idle')
+    }
+  }, 3000)
+}
+
+function retryBackfill() {
+  backfillTriedRegions.value.delete(`${props.game.appid}:${region.value}`)
+  void triggerBackfill()
 }
 
 // ─── 全版本区块（全部版本收拢到抽屉，版本 × 地区连锁）───
@@ -176,7 +281,13 @@ function selectVersion(subId: number) {
 }
 
 watch(visible, (open) => {
-  if (!open) return
+  if (!open) {
+    stopBackfillPoll()
+    return
+  }
+  backfillTriedRegions.value = new Set()
+  autoSwitchedRegions.value = new Set()
+  backfillState.value = 'idle'
   region.value = initialRegion()
   versionKey.value = 0
   days.value = 0
@@ -193,8 +304,12 @@ watch(region, () => {
 // 时间窗是纯前端开窗，不再触发回源
 watch(versionKey, () => load())
 
+// 版本下拉出现条件：有变体，或存在商品身份未知序列（后者必须有显式
+// 切换入口与「版本未识别」标注——未知保持未知，也要看得见自己在看未知）
 const hasMultipleVersions = computed(
-  () => selectableVariants(history.value?.versions ?? []).length > 0,
+  () =>
+    selectableVariants(history.value?.versions ?? []).length > 0 ||
+    (history.value?.versions ?? []).some((v) => v.product === 'unknown'),
 )
 
 const versionOptions = computed(() => versionSelectOptions(history.value?.versions ?? [], t))
@@ -383,6 +498,18 @@ watch(visible, (open) => {
         <div style="font-size: 32px; margin-bottom: 10px">📉</div>
         <div>{{ t('trendDrawer.empty.noData') }}</div>
         <div style="font-size: 11px; margin-top: 4px">{{ t('trendDrawer.empty.hint') }}</div>
+        <div v-if="backfillState === 'running'" class="trend-drawer__backfill">
+          {{ t('trendDrawer.backfill.running') }}
+        </div>
+        <div v-else-if="backfillState === 'error'" class="trend-drawer__backfill is-error">
+          <span>{{ t('trendDrawer.backfill.error') }}</span>
+          <button type="button" class="trend-drawer__backfill-retry" @click="retryBackfill">
+            {{ t('trendDrawer.backfill.retry') }}
+          </button>
+        </div>
+        <div v-else-if="backfillState === 'empty'" class="trend-drawer__backfill is-muted">
+          {{ t('trendDrawer.backfill.empty') }}
+        </div>
       </div>
       </HlPaneSwitch>
 
@@ -523,6 +650,32 @@ watch(visible, (open) => {
   color: var(--text-muted);
   text-align: center;
   padding: 24px 16px;
+}
+
+.trend-drawer__backfill {
+  margin-top: 10px;
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.trend-drawer__backfill.is-error {
+  color: var(--warning);
+}
+
+.trend-drawer__backfill.is-muted {
+  color: var(--text-dim);
+}
+
+.trend-drawer__backfill-retry {
+  font-size: 11px;
+  color: var(--accent);
+  background: none;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 2px 10px;
+  cursor: pointer;
 }
 
 .trend-drawer__detail-link {
