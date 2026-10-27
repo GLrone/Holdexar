@@ -136,7 +136,7 @@ Windows 系统对无商业签名程序的标准警示。请先核对下载包的
    - Steam 商店与用户数据相关网络请求；
    - Frankfurter API（欧洲央行公开基准汇率折算）；
    - Epic Games Store / Humble Bundle / Barter.vg（公开促销与免费游戏资讯）；
-   - GitHub Releases 与加速镜像（检查更新与按需下载数据种子）；
+   - GitHub Releases 与加速镜像（检查更新与下载内核等发行资产）；
    - 用户自备并主动接入的代理订阅源或 SMTP 邮件通知服务。
 </details>
 
@@ -166,9 +166,7 @@ scoop install holdexar
 ```
 
 每个版本 Release 附带的核心资产：
-- 轻量应用包 `Holdexar-win64-v<版本>.zip`：解压即用，随包附带开源许可原文与来源说明，不捆绑内核二进制与数百兆种子；
-- 公共数据种子 `holdexar_seed.db.gz`：独立资产（压缩分发），应用首次启动按需下载，源码用户亦可通过 `run.py` 自动获取；
-- 公共目录库模板 `holdexar_template.db`：初始公共游戏目录模板（若随版发布）；
+- 轻量应用包 `Holdexar-win64-v<版本>.zip`：解压即用，随包附带开源许可原文与来源说明，并内置一份约 4 MB 的离线目录种子（游戏目录、系列归组等人工标记与捆绑包名单，不含任何价格数据）——现价与历史价格由客户端采集逐步建立；
 - 更新清单 `latest.json`：挂载于固定 tag `updater` 供客户端检查更新读取。
 
 ---
@@ -219,7 +217,7 @@ python run.py --dev      # 对接 Vite 热更新开发
 python run.py --port N   # 指定端口
 ```
 
-首次运行会自动补齐公共数据种子(历史汇率与价格历史切片压缩包 `holdexar_seed.db.gz`):种子是二进制大文件,不进 git,由 `run.py` 从 Release 资产拉取。没网也不影响启动,只是【汇率】页没有历史档案,之后重跑 `python scripts/fetch_seed.py` 即可。
+首次运行即拥有可检索的游戏目录与捆绑包名单（随包离线种子，不含价格）；绑定 Steam 账户或添加关注后，客户端自动抓取现价并持续积累；打开走势图时按需补齐历史价格，数据长期保存在本机。没网也不影响启动。
 
 随包内核采用轻量模式分发：内置开源许可原文与来源说明，不捆绑内核二进制；运行所需内核由客户端在首次使用时按需下载或由用户自备。源码用户可通过 `python scripts/fetch_kernel.py` 获取完整内核，或通过 `--license-only` 仅就地准备许可材料。
 
@@ -238,12 +236,12 @@ python scripts/publish_release.py             # 正式发布(需 gh CLI 且已 g
 
 | Release | tag | 内容 | 作用 |
 |---|---|---|---|
-| 版本发布 | `v<版本>` | zip + `holdexar_seed.db.gz` + `holdexar_template.db` + `latest.json` | 给用户下载的那一条,带 changelog |
+| 版本发布 | `v<版本>` | zip + `latest.json` | 给用户下载的那一条,带 changelog |
 | 更新清单 | `updater` | 只有 `latest.json` | 机器读的那一条,地址恒定 |
 
 要点:
 
-- 清单 Release **必须不是 Latest release**(`gh release create ... --latest=false`,脚本已处理)。否则 `releases/latest` 与 RSS 会被带偏,源码用户取种子会失效。
+- 清单 Release **必须不是 Latest release**(`gh release create ... --latest=false`,脚本已处理)。否则 `releases/latest` 与 RSS 会被带偏,客户端检查更新会取错清单。
 - 资产名固定为 `Holdexar-win64-v<版本>.zip`(不带时间戳),渠道自动跟进(Scoop 的 `checkver` / `autoupdate`)才能按版本号拼出 URL。
 - tag 已存在时脚本改走 `gh release upload --clobber`,重复发布会覆盖资产而非失败。
 - 客户端检查链:清单(镜像链)→ 失败回落 GitHub API。没发过时功能照常,只是享受不到免限速与内置 SHA256。
@@ -256,7 +254,7 @@ python scripts/publish_release.py             # 正式发布(需 gh CLI 且已 g
 Holdexar/
 ├── run.py            # 一键启动器
 ├── desktop/          # pywebview 壳 + PyInstaller spec
-├── scripts/          # 发布脚本(出包 / 清单 / 发布 / 取种子)
+├── scripts/          # 发布脚本(出包 / 清单 / 发布)
 ├── packaging/scoop/  # Scoop 渠道用法(清单一并构建产出,不入库)
 ├── server/app/
 │   ├── core/         # 配置 / 数据库 / 调度器 / 更新器 / 数据目录判定

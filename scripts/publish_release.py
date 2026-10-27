@@ -50,21 +50,13 @@ RELEASE = ROOT / "release"
 SCOOP_JSON = RELEASE / "scoop" / "holdexar.json"
 NOTES_FILE = RELEASE / "RELEASE_NOTES.md"
 MANIFEST = RELEASE / "latest.json"
-# build_release.py 会把种子 gz 另存到 release/ 作为独立资产；源码树里的 raw 副本
-# 可现场压缩兜底（避免「种子明明在却报没有」）
-SEED_GZ = RELEASE / "holdexar_seed.db.gz"
-SEED_RAW_FALLBACK = ROOT / "assets" / "seed" / "holdexar_seed.db"
-# 公共目录库模板（server/scripts/export_template_db.py 产物）：导出脚本的落点
-# 是 assets/seed/，构建期另存到 release/ 之后由本脚本一并上传
-TEMPLATE_DB = RELEASE / "holdexar_template.db"
-TEMPLATE_DB_FALLBACK = ROOT / "assets" / "seed" / "holdexar_template.db"
 
 if str(SERVER) not in sys.path:
     sys.path.insert(0, str(SERVER))
+from app.core import update_signing  # noqa: E402
 from app.core.app_info import (  # noqa: E402
     APP_NAME,
     APP_VERSION,
-    DATA_CDN_BASE,
     GITHUB_REPO,
     MANIFEST_ASSET,
     MANIFEST_TAG,
@@ -153,61 +145,9 @@ def _with_fallback(primary: Path, fallback: Path, label: str, found: list[Path])
     print(f"[警告] 未找到{label}（{primary} / {fallback}），本次发布不含该件")
 
 
-def _ensure_seed_gz(dry: bool = False) -> None:
-    """种子分发形态统一为 .gz：release/ 下没有 gz 时用 raw 副本现场压缩。"""
-    if SEED_GZ.is_file():
-        return
-    if not SEED_RAW_FALLBACK.is_file():
-        print(f"[警告] 未找到资产种子（{SEED_GZ.name} / {SEED_RAW_FALLBACK}），本次发布不含该件")
-        return
-    if dry:
-        print(f"[dry-run] 发现源种子 {SEED_RAW_FALLBACK}，将在正式发布时现场压缩为 {SEED_GZ.name}（本次未生成）")
-        return
-    import gzip
-
-    with SEED_RAW_FALLBACK.open("rb") as fin, gzip.open(SEED_GZ, "wb", compresslevel=9) as fout:
-        while chunk := fin.read(1 << 20):
-            fout.write(chunk)
-    print(f"[发布] 种子 gz 现场压缩：{SEED_RAW_FALLBACK} → {SEED_GZ.name}")
-
-
-def sync_cdn_seed(dry: bool) -> None:
-    """把种子分发档推到自建分发（对象存储），并核对线上哈希与本地一致。
-
-    客户端下载种子的首选通道是它（大体积资产在该入口上通常比走 GitHub 快一个
-    数量级）；推不上去不影响发布——客户端的候选表里还有 GitHub 及其镜像，
-    探测阶段会自动选到能用的那条。
-
-    上传工具与凭据是维护机本机文件（不入库），公开克隆里没有——缺了就只打印
-    手工指引，不报错。
-    """
-    if not SEED_GZ.is_file():
-        print(f"[自建分发] 跳过：没有 {SEED_GZ.name}")
-        return
-    if not DATA_CDN_BASE:
-        print("[自建分发] 跳过：未配置分发地址")
-        return
-    target = f"{DATA_CDN_BASE}/seed/{SEED_GZ.name}"
-    size = SEED_GZ.stat().st_size / 1048576
-    uploader = ROOT / "scripts" / "upload_cloud_packs.py"
-    if not uploader.is_file():
-        print(f"[自建分发] 手工上传 {SEED_GZ.name}（{size:.1f} MB）→ {target}")
-        return
-    if dry:
-        print(f"[dry-run] 上传 {SEED_GZ.name}（{size:.1f} MB）→ {target}")
-        return
-    subprocess.check_call(
-        [sys.executable, str(uploader), "--seed"]
-    )
-
-
 def collect_artifacts(app_zip: Path, dry: bool = False) -> list[Path]:
     """版本 Release 的资产全集：release/ 下全部待分发产物。"""
     artifacts: list[Path] = [app_zip, MANIFEST]
-    _ensure_seed_gz(dry)
-    if SEED_GZ.is_file():
-        artifacts.append(SEED_GZ)
-    _with_fallback(TEMPLATE_DB, TEMPLATE_DB_FALLBACK, "公共目录库模板", artifacts)
     if SCOOP_JSON.is_file():
         artifacts.append(SCOOP_JSON)
     else:
@@ -357,6 +297,12 @@ def main() -> None:
     # 清单版本、notes 及应用包一致性检查
     try:
         manifest_data = json.loads(MANIFEST.read_text(encoding="utf-8"))
+        signed_ok, sign_reason = update_signing.verify_manifest(manifest_data)
+        if not signed_ok:
+            sys.exit(
+                f"[错误] {MANIFEST.name} 签名校验未通过：{sign_reason}\n"
+                f"       客户端只认验签清单，发出去等于断更。请用签名私钥重新运行 python scripts/build_manifest.py"
+            )
         if manifest_data.get("version") != version:
             sys.exit(
                 f"[错误] {MANIFEST.name} 声明的版本 ({manifest_data.get('version')}) 与目标版本 ({version}) 不一致。\n"
@@ -398,7 +344,6 @@ def main() -> None:
     publish_version_release(version, artifacts, notes_file, args.prerelease, args.dry_run)
     if not args.skip_manifest:
         publish_manifest_release(args.dry_run)
-    sync_cdn_seed(args.dry_run)
     if args.scoop_dir:
         sync_scoop(Path(args.scoop_dir), args.dry_run)
 
@@ -406,7 +351,6 @@ def main() -> None:
     print(f"  版本 Release : https://github.com/{GITHUB_REPO}/releases/tag/v{version}")
     print(f"  更新清单     : https://github.com/{GITHUB_REPO}/releases/download/"
           f"{MANIFEST_TAG}/{MANIFEST_ASSET}")
-    print(f"  源码取种子   : python scripts/fetch_seed.py")
 
 
 if __name__ == "__main__":

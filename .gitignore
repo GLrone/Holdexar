@@ -113,6 +113,9 @@ data/
 *.db-wal
 *.db.pre-migration.bak
 secret.salt
+secret.master
+secret.master.staging
+secret.machine.key
 *.sqlite3
 *.log
 *.pid

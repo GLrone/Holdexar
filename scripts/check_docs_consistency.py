@@ -96,19 +96,21 @@ def check_license_files_presence() -> tuple[bool, str]:
 
 def check_release_assets_consistency() -> tuple[bool, str]:
     readme_text = _read_text(README_FILE)
-
-    # 检查是否存在同一事实的相反描述
-    if "发布包已内置" in readme_text and "种子" in readme_text:
-        return False, "README 存在矛盾描述：发布包为轻量包，不内置种子，应通过 holdexar_seed.db.gz 按需下载"
-
-    if "holdexar_seed.db.gz" not in readme_text:
-        return False, "README 缺少对种子分发压缩包 holdexar_seed.db.gz 的正确描述"
-
     build_text = _read_text(BUILD_RELEASE_FILE)
-    if "holdexar_seed.db.gz" not in build_text or "latest.json" not in build_text:
-        return False, "build_release.py 产物定义中缺少种子或清单资产"
 
-    return True, "打包资产与种子内容描述一致（轻量包模式 + holdexar_seed.db.gz 独立资产）"
+    # 旧价格种子链必须彻底退役：任何大种子/模板资产的提法都是倒退
+    for banned in ("holdexar_seed.db.gz", "holdexar_template.db"):
+        if banned in readme_text or banned in build_text:
+            return False, f"存在已退役价格种子资产的提法：{banned}"
+
+    # 包内预置的只有轻量目录种子（不含价格）：README 与打包脚本两侧口径一致
+    if "holdexar_mini_seed.db" not in build_text:
+        return False, "build_release.py 缺少小种子（holdexar_mini_seed.db）装配定义"
+
+    if "latest.json" not in readme_text or "latest.json" not in build_text:
+        return False, "README 或 build_release.py 缺少更新清单 latest.json 描述"
+
+    return True, "打包资产描述一致（轻量包 + 离线目录小种子，无价格种子）"
 
 
 def check_safety_guidance() -> tuple[bool, str]:

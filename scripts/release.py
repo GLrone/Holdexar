@@ -445,7 +445,7 @@ def verify(version: str, dry: bool) -> None:
         if remote.get("notes") != expected_notes:
             problems.append(f"线上清单的 notes 与本地 {NOTES_FILE.name} 不一致")
 
-    for role in ("app", "seed", "seed-archive"):
+    for role in ("app",):
         want = next((a for a in local.get("assets", []) if a.get("role") == role), None)
         got = next((a for a in remote.get("assets", []) if a.get("role") == role), None)
         if want is None:
@@ -474,7 +474,6 @@ def summarize(version: str) -> None:
     print(f"  更新清单     : https://github.com/{GITHUB_REPO}/releases/download/"
           f"{MANIFEST_TAG}/{MANIFEST_ASSET}")
     print(f"  Scoop 清单   : release/scoop/{APP_SLUG}.json（提交进 bucket 仓库后生效）")
-    print(f"  源码取种子   : python scripts/fetch_seed.py")
 
 
 # ── 主流程 ──────────────────────────────────────────────────

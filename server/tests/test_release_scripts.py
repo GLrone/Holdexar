@@ -216,53 +216,25 @@ def test_pick_zip_accepts_matching_version(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_build_manifest_assets_coverage(tmp_path: Path, monkeypatch) -> None:
-    """清单同时声明 app、seed 以及实际分发的 seed-archive，且哈希与体积一致。"""
+    """清单声明 app 资产且哈希与体积一致；无预置数据库时清单不含种子角色。"""
     app_zip = tmp_path / f"{build_manifest.APP_NAME}-win64-v0.3.1-beta.zip"
     app_zip.write_bytes(b"app-data" * 10)
-
-    seed_db = tmp_path / "holdexar_seed.db"
-    seed_db.write_bytes(b"seed-data" * 20)
-
-    seed_gz = tmp_path / "holdexar_seed.db.gz"
-    seed_gz.write_bytes(b"seed-gz-data" * 5)
 
     notes_file = tmp_path / "RELEASE_NOTES.md"
     notes_file.write_text("新增：\n- 功能\n更新：\n优化：\n修复：\n", encoding="utf-8")
 
-    monkeypatch.setattr(build_manifest, "SEED_DB", seed_db)
-    monkeypatch.setattr(build_manifest, "SEED_GZ", seed_gz)
     monkeypatch.setattr(build_manifest, "NOTES_FILE", notes_file)
 
     manifest = build_manifest.build_manifest("0.3.1-beta", app_zip)
     roles = {asset["role"]: asset for asset in manifest["assets"]}
 
     assert "app" in roles
-    assert "seed" in roles
-    assert "seed-archive" in roles
-
-    archive = roles["seed-archive"]
-    assert archive["name"] == "holdexar_seed.db.gz"
-    assert archive["size"] == len(b"seed-gz-data" * 5)
-    assert archive["sha256"] == build_manifest.sha256_of(seed_gz)
+    assert "seed" not in roles and "seed-archive" not in roles
+    assert roles["app"]["sha256"] == build_manifest.sha256_of(app_zip)
     assert manifest["notes"] == notes_file.read_text(encoding="utf-8").strip()
 
 
 # ── 5. 发布脚本干跑与覆盖更新安全性 ────────────────────────────
-
-
-def test_publish_release_dry_run_no_side_effects(tmp_path: Path, monkeypatch) -> None:
-    """--dry-run 收集产物时不触发 gzip 压缩等写盘副作用。"""
-    seed_db = tmp_path / "holdexar_seed.db"
-    seed_db.write_bytes(b"uncompressed-seed-data")
-    seed_gz = tmp_path / "holdexar_seed.db.gz"
-
-    monkeypatch.setattr(publish_release, "SEED_RAW_FALLBACK", seed_db)
-    monkeypatch.setattr(publish_release, "SEED_GZ", seed_gz)
-
-    # 在 dry=True 模式下 _ensure_seed_gz 不应在磁盘上生成 gz 文件
-    gz_target = publish_release._ensure_seed_gz(dry=True)
-    assert gz_target is None
-    assert not seed_gz.exists()
 
 
 def test_publish_release_updates_existing_release_notes(monkeypatch) -> None:

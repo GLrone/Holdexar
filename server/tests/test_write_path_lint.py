@@ -71,15 +71,24 @@ def snapshot_to(conn):
     conn.execute("VACUUM INTO 'backup.db'")
     conn.execute("DELETE FROM games")
 """
-    fails, exceptions, _, _ = check_write_paths.audit_source(source, "core/backup.py")
+    fails, exceptions, _, _ = check_write_paths.audit_source(source, "core/db_safety.py")
     assert len(exceptions) == 1
     assert len(fails) == 1
 
 
-def test_script_write_paths_are_included():
-    paths = {p.relative_to(REPO_ROOT).as_posix() for p in check_write_paths.source_paths()}
-    assert {"scripts/fx_maintenance.py", "scripts/backfill_version_suffix.py",
-            "server/scripts/export_template_db.py"} <= paths
+def test_script_write_paths_are_included(tmp_path, monkeypatch):
+    import subprocess
+
+    expected = {"scripts/maintenance.py", "server/scripts/maintenance.py", "server/app/model.py"}
+    for rel in expected:
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    monkeypatch.setattr(check_write_paths, "ROOT", tmp_path)
+    monkeypatch.setattr(check_write_paths, "APP_DIR", tmp_path / "server/app")
+    paths = {p.relative_to(tmp_path).as_posix() for p in check_write_paths.source_paths()}
+    assert paths == expected
 
 
 def test_migration_name_does_not_implicitly_allow_writes():
@@ -98,6 +107,18 @@ async def init_db(conn):
     await conn.execute("BEGIN IMMEDIATE")
     await conn.execute("DELETE FROM games")
 """
+    fails, exceptions, _, _ = check_write_paths.audit_source(source, "core/database.py")
+    assert len(fails) == 1
+    assert len(exceptions) == 1
+
+
+def test_legacy_schema_preparation_has_separate_exact_budget():
+    source = '''
+async def _prepare_legacy_v10_columns(conn):
+    await conn.execute("PRAGMA table_info(tracked_accounts)")
+    await conn.execute("ALTER TABLE tracked_accounts ADD COLUMN item_count INTEGER")
+    await conn.execute("DELETE FROM games")
+'''
     fails, exceptions, _, _ = check_write_paths.audit_source(source, "core/database.py")
     assert len(fails) == 1
     assert len(exceptions) == 1

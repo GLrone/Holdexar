@@ -64,24 +64,9 @@ ALLOW: dict[tuple[str, str], tuple[dict[str, int], str]] = {
         {"gate:open": 1}, "解除保护前同步已恢复的程序指针"),
     ("core/update_data.py", "_release_completed_rollback"): (
         {"gate:open": 1}, "重入已结束恢复时确认终态记录持久化"),
-    ("core/seed_assets.py", "apply_curated_rows"): (
-        {"execute": 1},
-        "人工列批量补挂语句体（调用点在 write_session/段内保存点事务内，事务边界在调用方）"),
-    ("core/seed_assets.py", "_merge_history_chunk"): (
-        {"commit": 2, "execute": 8},
-        "线程池原生连接历史合并（调用点已 write_gate 包裹（分块续跑），缺键 INSERT + 派生列差异覆写 UPDATE，价格键不回拨）"),
-    ("core/seed_assets.py", "_merge_bundles_sync"): (
-        {"commit": 1, "execute": 6},
-        "线程池原生连接捆绑包合并（调用点已 write_gate 包裹，与历史合并同形态）"),
-    ("core/seed_assets.py", "_merge_current_prices_sync"): (
-        {"commit": 1, "execute": 4},
-        "线程池原生连接现价快照合并（调用点已 write_gate 包裹，与历史合并同形态）"),
-    ("core/seed_assets.py", "_merge_game_tags_sync"): (
-        {"commit": 1, "execute": 4},
-        "线程池原生连接玩家标签合并（调用点已 write_gate 包裹，与历史合并同形态）"),
     ("core/database.py", "_ensure_schema"): (
-        {"execute": 2},
-        "启动链建表与存量回填（sync 引擎独占窗口执行，写调度器管不到同步连接）"),
+        {"execute": 1},
+        "维护屏障内同步补列，事务由初始化持有"),
     ("core/database.py", "init_db"): (
         {"execute": 1}, "维护屏障内的建表与补列事务起点"),
     ("core/database.py", "_run_schema_migrations"): (
@@ -104,6 +89,24 @@ ALLOW: dict[tuple[str, str], tuple[dict[str, int], str]] = {
         {"execute": 1}, "迁移事务内补齐历史观测唯一索引"),
     ("core/database.py", "_migrate_notification_identity"): (
         {"execute": 5}, "迁移事务内保留事件及来源身份高水位"),
+    ("core/database.py", "_migrate_retire_orchestration"): (
+        {"execute": 1}, "迁移事务内退役无消费运行记录"),
+    ("core/database.py", "_migrate_retire_coverage_snapshot"): (
+        {"execute": 1}, "迁移事务内退役周期覆盖明细副本"),
+    ("core/database.py", "_migrate_proxy_ledger_columns"): (
+        {"execute": 7}, "迁移事务内保全节点与冷却并退役重复列"),
+    ("core/database.py", "_migrate_pilot_provider_config"): (
+        {"execute": 2}, "既有迁移事务内批量迁入供方配置并清除旧键"),
+    ("core/database.py", "_drop_projection_columns"): (
+        {"execute": 1}, "既有迁移事务校验依赖后退役派生列；不独立提交"),
+    ("core/database.py", "_prepare_legacy_v10_columns"): (
+        {"execute": 1}, "初始化维护事务内补齐旧v10临时计数列"),
+    ("core/database.py", "_migrate_monitoring_projection"): (
+        {"execute": 1}, "既有迁移事务内校验并退役两项监控投影索引"),
+    ("core/database.py", "_migrate_node_cooldown"): (
+        {"execute": 2}, "既有迁移事务批量迁入节点冷却并退役旧表"),
+    ("core/database.py", "_migrate_unused_session_state"): (
+        {"execute": 1}, "既有迁移事务内退役无消费的账单探测键"),
     ("core/database.py", "_migrate_monitoring_bootstrap"): (
         {"execute": 5}, "迁移事务内建立监控来源"),
     ("core/database.py", "_migrate_player_tags"): (
@@ -117,7 +120,9 @@ ALLOW: dict[tuple[str, str], tuple[dict[str, int], str]] = {
         "原地 VACUUM（停写入面的独占窗口执行，靠调用方调度保证独占）"),
     ("core/backup.py", "_protect_restore_recovery"): (
         {"flush": 1}, "维护屏障内同步恢复保护文件缓冲"),
-    ("core/backup.py", "snapshot_to"): (
+    ("core/db_safety.py", "_acquire_restore_lock"): (
+        {"flush": 1}, "维护屏障内同步恢复锁文件落盘缓冲"),
+    ("core/db_safety.py", "snapshot_to"): (
         {"execute": 1},
         "VACUUM INTO 在线快照（对源库只读，产出自洽新文件）"),
     ("core/migration.py", "migrate_appdata_to_portable"): (
@@ -128,13 +133,11 @@ ALLOW: dict[tuple[str, str], tuple[dict[str, int], str]] = {
         "同一 VACUUM INTO 快照（对源库只读），函数拆分后写点随之迁移"),
     ("domains/proxypool/registry.py", "settle_nodes_after_source_change"): (
         {"flush": 1}, "flush-only 共用收尾（快照对齐/退出/清理），事务边界在调用方闸内"),
-    ("domains/monitoring/service.py", "_ensure_target"): (
-        {"flush": 1}, "flush-only，事务边界在调用方闸内（ensure_source 等）"),
     ("domains/proxypool/admission.py", "exit_from_production"): (
         {"flush": 1}, "flush-only，事务边界在调用方闸内"),
     ("domains/proxypool/admission.py", "promote_to_active"): (
         {"flush": 1}, "flush-only，事务边界在调用方闸内"),
-    ("domains/proxypool/registry.py", "apply_snapshot"): (
+    ("domains/proxypool/registry.py", "_apply_nodes"): (
         {"flush": 1}, "flush-only，事务边界在调用方闸内（账本对齐/转正）"),
     ("domains/proxypool/subscription.py", "persist_snapshot"): (
         {"flush": 1}, "flush-only，事务边界在调用方闸内（订阅同步）"),
@@ -142,12 +145,6 @@ ALLOW: dict[tuple[str, str], tuple[dict[str, int], str]] = {
         {"flush": 1}, "flush-only，事务边界在调用方闸内（record_start）"),
     ("domains/proxypool/exitstats.py", "record_run_exits"): (
         {"commit": 1}, "提交由调用方 write_run_exits 的 write_gate 覆盖"),
-    ("scripts/export_seed.py", "export"): (
-        {"executescript": 1, "executemany": 9, "commit": 1}, "只读源库并新建种子产物"),
-    ("scripts/export_cloud_packs.py", "export_pack"): (
-        {"execute": 3}, "只读模板并新建数据包"),
-    ("server/scripts/export_template_db.py", "main"): (
-        {"execute": 6, "commit": 1}, "只读源库并新建模板产物"),
 }
 
 SQL_WRITE_RE = re.compile(
