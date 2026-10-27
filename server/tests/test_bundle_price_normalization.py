@@ -29,7 +29,7 @@ CPC = 0.001
 
 @pytest_asyncio.fixture
 async def isolated_db(tmp_path: Path, monkeypatch):
-    """tmp 独立 SQLite 库：schema 就绪（user_version=1），迁移链保持真实登记。"""
+    """tmp 独立 SQLite 库：schema 就绪，仅重放 v2/v3 专项迁移。"""
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{(tmp_path / 't.db').as_posix()}", echo=False
     )
@@ -40,6 +40,11 @@ async def isolated_db(tmp_path: Path, monkeypatch):
         lambda: async_sessionmaker(engine, expire_on_commit=False),
     )
     await database_module.init_db()
+    monkeypatch.setattr(
+        database_module,
+        "_MIGRATIONS",
+        [m for m in database_module._MIGRATIONS if m[0] in (2, 3)],
+    )
     yield engine
     await engine.dispose()
 
@@ -81,7 +86,7 @@ async def _prices(engine) -> dict[tuple[int, str], tuple[int | None, int | None]
 async def _apply(engine) -> None:
     """让 v2 在已播种数据上跑一次，再直接重放迁移体一次以验幂等。
 
-    夹具里的 init_db 已在空表上跑过 v2（user_version=2），故先把账本退回 1，
+    夹具里的 init_db 已在空表上跑过迁移，故先把账本退回 1，
     否则差额迁移会跳过——这正是中断续跑/重放场景。
     """
     async with engine.begin() as conn:
@@ -132,7 +137,7 @@ async def test_three_historical_shapes_normalized_and_idempotent(isolated_db) ->
                 text("SELECT bundle_id, item_kind FROM bundles")
             )).all()
         )
-    assert version == database_module.SCHEMA_VERSION >= 2
+    assert version == 3
     # v3 形态回填：item_kind 沿用 mps 旧值（形状当时即 mps 的旧语义之一）
     assert kinds == {900_001: 0, 900_002: 1, 900_003: 1, 900_004: 0, 900_005: 0, 900_006: 0}
 

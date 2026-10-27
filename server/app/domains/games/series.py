@@ -7,13 +7,12 @@
 中英文写法漂移），由数据目录下的系列覆盖文件兜底（series_overrides.json，
 键=系列名，值=appid 列表）：覆盖成员先预成组、组名以文件键为准，再与
 名称启发式的边合并——成员经名称规则命中的邻居（重制版等）自动并入。
-文件被改过时爬后链的空转闸会触发全库重算。
+覆盖文件内容版本变更时重新归组；目录变化只处理受影响的已有系列和新邻居。
 
 语义约定：
 - NULL = 未计算（新入库还没跑过识别）；'' = 已计算但落单（无同系列）；
   非空 = 系列标识（展示用名，取成员英文名的最长公共词前缀）。
-  空串哨兵是给爬后链的「有未归组行吗」探测用的：全库扫过一遍后落单行
-  不再是 NULL，探测就不会每轮空转重算。
+  空串表示规则已确认无系列，不能作为待计算状态。
 
 算法：分桶（英文首词 / 次词 / 中文前两字）缩小两两比对范围 + 并查集聚类，
 避免 O(N²) 全量比对。判定规则宁缺毋滥——并查集有传递性，一条错边会污染
@@ -29,7 +28,7 @@ from collections import defaultdict
 from difflib import SequenceMatcher
 from pathlib import Path
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import text, and_, or_, select
 
 from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.logging import log_event
@@ -150,28 +149,6 @@ def load_overrides() -> dict[str, list[int]]:
         if ids:
             out[name] = sorted(set(ids))
     return out
-
-
-_overrides_mtime_seen: float | None = None
-
-
-def overrides_changed() -> bool:
-    """覆盖文件被改过、还没被全库重算消费过吗（爬后链空转闸的第二触发
-    条件，与 has_unassigned 互补）。文件不存在恒 False；消费后记录 mtime，
-    同一版本不再触发。"""
-    try:
-        mtime = _overrides_path().stat().st_mtime
-    except OSError:
-        return False
-    return _overrides_mtime_seen is None or mtime != _overrides_mtime_seen
-
-
-def _mark_overrides_consumed() -> None:
-    global _overrides_mtime_seen
-    try:
-        _overrides_mtime_seen = _overrides_path().stat().st_mtime
-    except OSError:
-        _overrides_mtime_seen = None
 
 
 def _series_tokens(name_en: str | None, name: str) -> list[str]:
@@ -528,67 +505,79 @@ def _display_name_for(names: list[str], fallback: str) -> str:
     return fallback
 
 
-async def has_unassigned() -> bool:
-    """还有没跑过识别的可聚类行吗（爬后链的空转闸）。"""
-    q = select(1).where(Game.series_id.is_(None), or_(*_clusterable_conds())).limit(1)
-    async with get_session_factory()() as session:
-        return bool((await session.execute(q)).scalar())
+def _affected_rows(rows, changed: dict[int, str], overrides):
+    by_id = {r.appid: r for r in rows}
+    groups = defaultdict(set)
+    buckets = defaultdict(set)
+    for row in rows:
+        if row.series_id:
+            groups[row.series_id].add(row.appid)
+        for key in _bucket_keys(_Member(row.appid, row.name or "", row.name_en)):
+            buckets[key].add(row.appid)
+    affected = set(changed)
+    for group in changed.values():
+        affected.update(groups[group])
+    for ids in overrides.values():
+        if set(ids).intersection(changed):
+            affected.update(ids)
+            for aid in ids:
+                if aid in by_id:
+                    affected.update(groups[by_id[aid].series_id])
+    for aid in changed:
+        row = by_id.get(aid)
+        if row is None:
+            continue
+        candidates = set().union(*(buckets[key] for key in _bucket_keys(_Member(aid, row.name or "", row.name_en))))
+        for other_id in candidates:
+            other = by_id[other_id]
+            if is_same_series(row.name or "", row.name_en, other.name or "", other.name_en):
+                affected.add(other_id)
+                affected.update(groups[other.series_id])
+    return [r for r in rows if r.appid in affected]
 
 
-async def refresh_series() -> int:
-    """全库重算 series_id（差异写回），返回更新的行数。
+async def refresh_series(*, session=None, changed: dict[int, str] | None = None) -> int:
+    if session is None:
+        async with write_session(WritePriority.BACKGROUND, "game_series") as own:
+            count = await refresh_series(session=own, changed=changed)
+            await own.commit()
+            return count
+    from app.core.database import write_gate
 
-    series_id 语义：NULL=未计算；''=已算落单；非空=系列标识。落单行写
-    空串而非 NULL，has_unassigned 才不会对同一批行每轮空转重算。
-    覆盖文件（load_overrides）参与合并：文件点名的 appid 不受可聚类类型
-    限制，整组以文件键为名。CPU 聚类放线程池，不占事件循环；写回按主键
-    批量 executemany 单事务提交。幂等：结果不变的行零写入。
-    """
     overrides = load_overrides()
-    async with get_session_factory()() as session:
-        rows = (
-            (
-                await session.execute(
-                    select(Game.appid, Game.name, Game.name_en, Game.series_id).where(
-                        or_(*_clusterable_conds())
-                    )
-                )
-            ).all()
-        )
-        listed = {a for ids in overrides.values() for a in ids} - {r.appid for r in rows}
-        if listed:
-            extra = (
-                await session.execute(
-                    select(Game.appid, Game.name, Game.name_en, Game.series_id).where(
-                        Game.appid.in_(sorted(listed))
-                    )
-                )
-            ).all()
-            rows = list(rows) + list(extra)
-        if not rows:
-            _mark_overrides_consumed()
-            return 0
+    rows = (await session.execute(
+        select(Game.appid, Game.name, Game.name_en, Game.series_id).where(or_(*_clusterable_conds()))
+    )).all()
+    listed = {a for ids in overrides.values() for a in ids} - {r.appid for r in rows}
+    if listed:
+        rows = list(rows) + list((await session.execute(
+            select(Game.appid, Game.name, Game.name_en, Game.series_id).where(Game.appid.in_(sorted(listed)))
+        )).all())
+    if changed is not None:
+        saved = (await session.execute(text(
+            "SELECT value_json FROM app_settings WHERE key='games.derived_inputs'"
+        ))).scalar()
+        version = json.loads(saved) if saved else {}
+        if version.get("series") == overrides:
+            rows = _affected_rows(rows, changed, overrides)
+        else:
+            from .derived import save_input_version
 
+            await save_input_version(session, {**version, "series": overrides})
     clusters = await asyncio.to_thread(
         build_clusters, [(r.appid, r.name, r.name_en) for r in rows], overrides
     )
-    new_map: dict[int, str] = {}
-    for name, appids in clusters:
-        for a in appids:
-            new_map[a] = name
-    for r in rows:
-        new_map.setdefault(r.appid, "")
-
-    updates = [
-        {"appid": r.appid, "series_id": new_map[r.appid]}
-        for r in rows
-        if r.series_id != new_map[r.appid]
-    ]
+    new_map = {aid: name for name, aids in clusters for aid in aids}
+    updates = [{"appid": r.appid, "series_id": new_map.get(r.appid, "")}
+               for r in rows if r.series_id != new_map.get(r.appid, "")]
+    excluded = (await session.execute(select(Game.appid).where(
+        ~or_(*_clusterable_conds()), Game.series_id.is_not(None), Game.series_id != "",
+        Game.appid.not_in([aid for ids in overrides.values() for aid in ids]),
+    ))).scalars()
+    updates.extend({"appid": aid, "series_id": ""} for aid in excluded)
     if updates:
-        async with write_session(WritePriority.BACKGROUND) as session:
-            await session.execute(update(Game), updates)
-            await session.commit()
-    _mark_overrides_consumed()
+        async with write_gate():
+            await session.execute(text("UPDATE games SET series_id=:series_id WHERE appid=:appid"), updates)
     return len(updates)
 
 

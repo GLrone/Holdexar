@@ -19,10 +19,8 @@ from app.domains.games.models import Game, GameCurrentPrice  # noqa: E402
 from app.domains.games import series as series_mod  # noqa: E402
 from app.domains.games.series import (  # noqa: E402
     build_clusters,
-    has_unassigned,
     is_same_series,
     load_overrides,
-    overrides_changed,
     refresh_series,
     series_members,
 )
@@ -197,7 +195,6 @@ async def _series_db(tmp_path, monkeypatch):
     monkeypatch.setattr(
         series_mod, "_overrides_path", lambda: tmp_path / "series_overrides.json"
     )
-    monkeypatch.setattr(series_mod, "_overrides_mtime_seen", None)
     yield factory
     await engine.dispose()
 
@@ -229,7 +226,6 @@ async def _seed_and_clean(_series_db):
 
 @pytest.mark.asyncio
 async def test_refresh_series_writes_groups_and_sentinel(_seed_and_clean, _series_db):
-    assert await has_unassigned() is True
     changed = await refresh_series()
     assert changed == len(ALL_APPS) - 1  # 可聚类行首刷全动（DLC 行不参与）
     async with _series_db() as session:
@@ -247,7 +243,6 @@ async def test_refresh_series_writes_groups_and_sentinel(_seed_and_clean, _serie
         # DLC 不参与聚类，series_id 保持 NULL
         assert dlc.series_id is None
     # 幂等：无变化时零写入
-    assert await has_unassigned() is False
     assert await refresh_series() == 0
 
 
@@ -331,44 +326,3 @@ def test_load_overrides_skips_bad_entries(tmp_path, monkeypatch):
     assert load_overrides() == {}
     p.unlink()
     assert load_overrides() == {}
-
-
-@pytest.mark.asyncio
-async def test_refresh_series_applies_override_file_and_mtime_gate(
-    _seed_and_clean, _series_db, tmp_path, monkeypatch
-):
-    from app.domains.games import series as series_mod
-
-    p = tmp_path / "series_overrides.json"
-    monkeypatch.setattr(series_mod, "_overrides_path", lambda: p)
-    p.write_text(json.dumps({"Portal Saga": [APP_PORTAL, APP_W3]}), encoding="utf-8")
-
-    assert overrides_changed() is True
-    await refresh_series()
-    async with _series_db() as session:
-        # 点名的 Portal / Witcher3 连同两者各自的启发式邻居（Portal2、
-        # Witcher2）全落到文件键名下；无关行不受影响
-        for appid in (APP_PORTAL, APP_PORTAL2, APP_W3, APP_W2):
-            assert (await session.get(Game, appid)).series_id == "Portal Saga"
-        assert (await session.get(Game, APP_ALONE)).series_id == ""
-    # 消费后同版本不再触发；重算幂等零写入
-    assert overrides_changed() is False
-    assert await refresh_series() == 0
-
-    # 文件改键名：mtime 推进触发重算，新键名覆盖旧值
-    st = p.stat()
-    p.write_text(json.dumps({"Portal 传说": [APP_PORTAL, APP_W3]}), encoding="utf-8")
-    os.utime(p, (st.st_atime, st.st_mtime + 10))
-    assert overrides_changed() is True
-    await refresh_series()
-    async with _series_db() as session:
-        assert (await session.get(Game, APP_PORTAL)).series_id == "Portal 传说"
-
-    # 坏文件整份忽略：回落纯启发式命名，不抛异常
-    p.write_text("{broken", encoding="utf-8")
-    os.utime(p, (st.st_atime, st.st_mtime + 20))
-    assert overrides_changed() is True
-    await refresh_series()
-    async with _series_db() as session:
-        assert (await session.get(Game, APP_PORTAL)).series_id == "Portal"
-        assert (await session.get(Game, APP_W2)).series_id == "Witcher"

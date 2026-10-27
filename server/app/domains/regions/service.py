@@ -16,7 +16,6 @@ from sqlalchemy import select
 
 from app.crawler.config import CC_LIST
 from app.core.database import WritePriority, get_session_factory, write_session
-from app.core.database import write_gate
 from app.core.logging import log_event
 from app.crawler.utils import get_beijing_time_obj
 from app.domains.regions.models import CrawlRegion
@@ -150,27 +149,15 @@ async def set_enabled(codes: list[str] | None) -> None:
             if new_enabled != row.enabled:
                 row.enabled = new_enabled
                 row.updated_at = now
-        await session.commit()
-    # 追踪区集合变化 → 捆绑包排序快照（按追踪区过滤的派生列）整库重建：
-    # 快照只能在写侧算（GET 不得现算最低价/差价），列表缓存同步失效。
-    # 失败只记日志：快照沿用旧集合，等下次改动/下一轮刷新自愈。
-    try:
-        from app.domains.bundles import service as bundles_service
+        from sqlalchemy import text
+        from app.domains.bundles.service import bundle_sort_sql, register_bundle_sql_functions
 
-        rebuilt = await bundles_service.refresh_bundle_sort_cache()
-        bundles_service.invalidate_bundles_cache()
-        log_event(
-            logger,
-            "追踪区变更，捆绑包排序快照已重建",
-            detail={"重建包数": rebuilt},
-        )
-    except Exception:  # noqa: BLE001
-        log_event(
-            logger,
-            "追踪区变更后捆绑包排序快照重建失败，快照沿用旧集合",
-            level=logging.ERROR,
-            exc_info=True,
-        )
+        await session.flush()
+        connection = await session.connection()
+        await connection.run_sync(lambda c: register_bundle_sql_functions(c.connection.dbapi_connection))
+        sql, params = bundle_sort_sql(None, {c.upper() for c in wanted} or None)
+        await session.execute(text(sql), params)
+        await session.commit()
 
 
 async def effective_regions(explicit: list[str] | None) -> list[str]:

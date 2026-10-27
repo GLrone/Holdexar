@@ -1,15 +1,4 @@
-"""价格数据新鲜度（Freshness）：当前数据距离现在有多新。
-
-与 Coverage 是**不同维度**，不可互相推导——Coverage 说「这一轮刷得全不全」，
-Freshness 说「手上的数据离现在多久」。两者可以任意组合（100% 覆盖 + stale、
-60% 覆盖 + fresh 都成立），因此不合并成任何综合评分。
-
-观察时刻 = 该对象全部价格行的 MAX(updated_at)，按年龄分档（对象级，不按地区）：
-
-    fresh    age < 6h       一个刷新网格内
-    lagging  6h ≤ age < 12h
-    stale    age ≥ 12h      与 crawler/config.STALE_HOURS 同口径
-"""
+"""地区价格新鲜度来自成功观察；对象摘要保留最旧地区的年龄。"""
 from __future__ import annotations
 
 import logging
@@ -60,31 +49,54 @@ def freshness_of(observed_at: datetime | None, *, now: datetime | None = None) -
 
 
 async def appid_freshness(appids: list[int]) -> list[dict]:
-    """每个对象价格记录的最后观察时刻与新鲜度档位。
+    """批量读取各地区的成功观察与更新状态。"""
+    from app.domains.regions.service import enabled_regions
 
-    观察时刻 = 该对象全部区服价格行的 `MAX(updated_at)`：失败记录同样算「被
-    观察过」（观察动作发生了），故不按 `price_status` 过滤。列表里没查到任何
-    行的对象照样返回，新鲜度为 null。
-    """
     ids = [int(a) for a in appids]
-    observed: dict[int, datetime] = {}
+    by_appid: dict[int, list] = {}
+    regions = await enabled_regions()
     if ids:
         async with get_session_factory()() as session:
             for start in range(0, len(ids), _CHUNK):
                 rows = (
                     await session.execute(
-                        select(
-                            GameCurrentPrice.appid,
-                            func.max(GameCurrentPrice.updated_at),
-                        )
+                        select(GameCurrentPrice)
                         .where(GameCurrentPrice.appid.in_(ids[start : start + _CHUNK]))
-                        .group_by(GameCurrentPrice.appid)
                     )
-                ).all()
-                for appid, last_seen in rows:
-                    if last_seen is not None:
-                        observed[int(appid)] = last_seen
-    return [{"appid": a, **freshness_of(observed.get(a))} for a in ids]
+                ).scalars().all()
+                for row in rows:
+                    by_appid.setdefault(row.appid, []).append(row)
+    from app.domains.crawl.service import _unobserved_job_targets
+
+    pending = await _unobserved_job_targets(0, limit_rows=-1, appids=ids) if ids else set()
+    return [{"appid": a, **regional_freshness(by_appid.get(a, []), regions, pending)} for a in ids]
+
+
+def regional_freshness(rows: list, regions: list[str] | None = None, pending_units: set | None = None) -> dict:
+    """同一份价格行生成地区明细和对象新鲜度，不重新取价。"""
+    indexed = {p.region_code.upper(): p for p in rows if p.region_code}
+    codes = [cc.upper() for cc in regions] if regions else list(indexed)
+    units = {}
+    successes = []
+    now = datetime.now()
+    for code in codes:
+        row = indexed.get(code)
+        success_at = row.last_success_at if row is not None else None
+        if success_at is not None:
+            successes.append(success_at)
+        age = freshness_of(success_at, now=now)
+        outcome = (row.attempt_outcome or "failed") if row is not None else "notAttempted"
+        pending = bool(row is not None and pending_units and (row.appid, code) in pending_units)
+        units[code] = {
+            "status": row.price_status if row is not None else "notAttempted",
+            "outcome": outcome, "answer": row.steam_answer if row is not None else None,
+            "lastSuccessAt": age["observedAt"],
+            "lastAttemptAt": row.updated_at.isoformat() if row is not None and row.updated_at else None,
+            "ageHours": age["ageHours"], "freshness": age["freshness"],
+            "pending": pending or (outcome != "success" and (row is None or row.price_status != "blocked")),
+            "needsUpdate": pending or outcome != "success" or age["ageHours"] is None or age["ageHours"] >= FRESH_HOURS,
+        }
+    return {**freshness_of(min(successes) if successes else None, now=now), "regions": units}
 
 
 async def latest_price_observation() -> datetime | None:

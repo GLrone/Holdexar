@@ -40,7 +40,6 @@ import aiohttp
 from sqlalchemy import case, func, or_, select, update
 
 from app.core.database import WritePriority, get_session_factory, write_session
-from app.core.database import write_gate
 from app.core.logging import log_event
 from app.crawler.epic_free import (
     fetch_free_games,
@@ -459,6 +458,9 @@ async def _mark_game_hb(appid: int, title: str, label: str) -> None:
 
     now = get_beijing_time_obj().replace(tzinfo=None)
     async with write_session(WritePriority.BACKGROUND, label="metadata_batch") as session:
+        from app.domains.games.derived import catalog_inputs, update_price_derived
+
+        before = await catalog_inputs(session, [int(appid)])
         row = await session.get(Game, int(appid))
         if row is None:
             session.add(
@@ -473,6 +475,7 @@ async def _mark_game_hb(appid: int, title: str, label: str) -> None:
             if label not in old:
                 row.hb_data = f"{old}, {label}" if old else label
             row.is_hb = True
+        await update_price_derived([int(appid)], session=session, catalog_before=before)
         await session.commit()
 
 
@@ -717,7 +720,7 @@ async def backfill_hb_prices() -> dict:
     if not appids:
         return {"source": "hb-backfill", "ok": True, "pending": 0, "started": False}
     results = await crawl_service.run_sequential(
-        [{"scope": "appids", "appids": appids, "kind": "hb_backfill"}]
+        [{"scope": "appids", "appids": appids, "kind": "hb_backfill"}], trigger="automatic"
     )
     return {
         "source": "hb-backfill", "ok": True, "pending": len(appids),
@@ -879,6 +882,9 @@ async def _mark_game_epic(appid: int, title: str, free_start: str | None) -> boo
 
     now = get_beijing_time_obj().replace(tzinfo=None)
     async with write_session(WritePriority.BACKGROUND, label="metadata_batch") as session:
+        from app.domains.games.derived import catalog_inputs, update_price_derived
+
+        before = await catalog_inputs(session, [int(appid)])
         row = await session.get(Game, int(appid))
         if row is None:
             session.add(
@@ -897,6 +903,7 @@ async def _mark_game_epic(appid: int, title: str, free_start: str | None) -> boo
             if free_start is not None and not row.epic_date:
                 row.epic_date = free_start
                 changed = True
+        await update_price_derived([int(appid)], session=session, catalog_before=before)
         await session.commit()
     return changed
 
@@ -1181,22 +1188,6 @@ async def _epic_fetch_enabled() -> bool:
     return bool(await get_value("fetch.epic_free", True))
 
 
-async def preheat_epic_offers() -> None:
-    """启动链预热：快照新鲜即零开销；过期只触发后台刷新（不 await 网络轮）。
-
-    排在收拾链尾：用户打开仪表盘时刷新多半已完成或近尾，卡片不再顶着
-    「刷新中」干等整段 Epic 抓取。刷新失败保留旧快照，请求路径的
-    stale-while-revalidate 语义不变。
-    """
-    await _ensure_offers_cache_hydrated()
-    if not await _epic_fetch_enabled():
-        return  # 开关关闭：预热不触网，卡片回落到已有快照
-    fresh = (
-        _epic_offers_cache["payload"] is not None
-        and time.time() - _epic_offers_cache["at"] < _EPIC_OFFERS_TTL_SECONDS
-    )
-    if not fresh:
-        _start_offers_refresh()
 
 
 def get_beijing_now_iso() -> str:

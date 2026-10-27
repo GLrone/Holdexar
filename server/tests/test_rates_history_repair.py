@@ -154,48 +154,34 @@ async def test_scan_bootstraps_empty_library(db):
     assert all(w["days"] <= 365 for w in scan["windows"])
 
 
+@pytest.mark.asyncio
+async def test_normal_repair_handles_empty_library_with_batch_limit(db, monkeypatch):
+    calls = []
+    monkeypatch.setattr(rates_history, "_new_bing_provider", lambda: _fake_provider({}, calls))
+    result = await rates_history.repair_history_gaps(today=TODAY, max_windows=2)
+    assert result["status"] == "ok" and result["requests"] == 2
+    assert len(calls) == 2
+    assert calls[0][0] == date(2012, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_normal_history_maintenance_respects_fetch_toggle(db, monkeypatch):
+    from app.core import scheduler
+    from app.domains.settings.service import set_value
+    await set_value("fetch.fx_history", False)
+    async def forbidden(**kwargs):
+        raise AssertionError("disabled maintenance cannot consume upstream quota")
+    monkeypatch.setattr(rates_history, "repair_history_gaps", forbidden)
+    await scheduler._job_fx_history_repair()
+
+
 # ── 全新安装 bootstrap 入口 ─────────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_bootstrap_noop_when_history_exists(db, monkeypatch):
-    """存量库（有任何历史行）不得触发全史 bootstrap。"""
-    await _seed_gap()
-
-    async def _fail(**kwargs):
-        raise AssertionError("存量库不得触发全史 bootstrap")
-
-    monkeypatch.setattr(rates_history, "repair_history_gaps", _fail)
-    assert await rates_history.bootstrap_full_history() == {"status": "no_bootstrap"}
 
 
-@pytest.mark.asyncio
-async def test_bootstrap_repairs_when_library_empty(db, monkeypatch):
-    """零历史行库：bootstrap 复用修复链（参数透传）。"""
-    calls: list[dict] = []
-
-    async def fake_repair(**kwargs):
-        calls.append(kwargs)
-        return {"status": "ok", "written": 1}
-
-    monkeypatch.setattr(rates_history, "repair_history_gaps", fake_repair)
-    result = await rates_history.bootstrap_full_history(max_windows=3)
-    assert result == {"status": "ok", "written": 1}
-    assert calls == [{"max_windows": 3}]
 
 
-@pytest.mark.asyncio
-async def test_bootstrap_respects_fetch_toggle(db, monkeypatch):
-    """「汇率历史补全」开关关闭时 bootstrap 跳过（与定时修复同一闸）。"""
-    from app.domains.settings import service as settings_service
-
-    async def fake_get_value(key, default=None):
-        if key == "fetch.fx_history":
-            return False
-        return default
-
-    monkeypatch.setattr(settings_service, "get_value", fake_get_value)
-    assert await rates_history.bootstrap_full_history() == {"status": "disabled"}
 
 
 @pytest.mark.asyncio
@@ -391,8 +377,7 @@ async def test_repair_revalues_bills(db, monkeypatch):
     async with database_module.get_session_factory()() as session:
         session.add(
             BillImport(
-                id=1, nickname="t", game_net_fen=0, game_spend_fen=0,
-                game_refund_fen=0, orders=0, fx_missing=1,
+                id=1, nickname="t",
             )
         )
         session.add(
@@ -424,10 +409,10 @@ async def test_repair_revalues_bills(db, monkeypatch):
         )).one()
         assert float(tx[0]) == pytest.approx(0.05)
         assert int(tx[1]) == round(100.0 * 0.05 * 100)  # 500 分
-        imp = (await session.execute(
-            text("SELECT game_spend_fen, game_net_fen, fx_missing FROM bill_imports WHERE id = 1")
-        )).one()
-        assert imp[0] == 500 and imp[1] == 500 and imp[2] == 0
+    from app.domains.bills.service import list_imports
+
+    imp = (await list_imports())[0]
+    assert imp["gameSpendFen"] == 500 and imp["gameNetFen"] == 500 and imp["fxMissing"] == 0
 
 
 @pytest.mark.asyncio
@@ -645,8 +630,7 @@ async def test_bills_revalue_causal_window_and_no_inflation(db, monkeypatch):
     async with database_module.get_session_factory()() as session:
         session.add(
             BillImport(
-                id=10, nickname="t", game_net_fen=0, game_spend_fen=0,
-                game_refund_fen=0, orders=0, fx_missing=0,
+                id=10, nickname="t",
             )
         )
         session.add(
@@ -699,4 +683,3 @@ async def test_bills_revalue_causal_window_and_no_inflation(db, monkeypatch):
     assert rows[2][0] == "2024-01-25" and float(rows[2][1]) == pytest.approx(7.0) and rows[2][2] == 7000
     assert rows[3][0] == "2024-01-26" and rows[3][1] is None
     assert rows[4][0] == "2024-06-05" and rows[4][1] is None
-

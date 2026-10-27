@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import json
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from sqlalchemy import or_, select, text
+from sqlalchemy import bindparam, or_, select, text
 
-from app.core.database import WritePriority, get_session_factory, write_gate, write_session
+from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.events import bus
 from app.core.logging import log_event
 from app.crawler.config import DEFAULT_WORKER_COUNT, HTTP_TIMEOUT, WORKERS_MAX
@@ -23,8 +24,6 @@ from app.domains.alerts import service as alerts_service
 from app.domains.crawl import cycle as price_cycle
 from app.domains.crawl.models import CrawlJob
 from app.domains.games.models import Game, GameCurrentPrice
-from app.domains.games import service as games_service
-from app.domains.games import series as games_series
 from app.domains.proxies import env_check
 from app.domains.regions.service import effective_regions
 from app.domains.wishlist.models import WishlistItem
@@ -41,6 +40,7 @@ class JobHandle:
     task: asyncio.Task
     stop_event: asyncio.Event
     started_monotonic: float = field(default_factory=time.monotonic)
+    cycle_id: int | None = None
 
 
 # 进程内活动任务表（单任务模型）
@@ -49,17 +49,25 @@ _active: JobHandle | None = None
 # 链级停止位：在跑的 run_price_cycle（自动轮/手动全队列同源）登记，stop 端点
 # 置位后链不再推进后续段；单任务模型下同一时刻至多一条链在跑
 _chain_stop: asyncio.Event | None = None
+_chain_cycle_id: int | None = None
 
 
-def register_chain_stop(ev: asyncio.Event) -> None:
-    global _chain_stop
+def register_chain_stop(ev: asyncio.Event, *, cycle_id: int | None = None) -> None:
+    global _chain_stop, _chain_cycle_id
+    if _chain_stop is not ev or cycle_id is not None:
+        _chain_cycle_id = cycle_id
     _chain_stop = ev
 
 
+def active_cycle_id() -> int | None:
+    return _chain_cycle_id
+
+
 def unregister_chain_stop(ev: asyncio.Event) -> None:
-    global _chain_stop
+    global _chain_stop, _chain_cycle_id
     if _chain_stop is ev:
         _chain_stop = None
+        _chain_cycle_id = None
 
 
 def chain_stop_requested() -> bool:
@@ -72,6 +80,42 @@ JOB_OCCUPANCY_TAG = "crawl_job"
 
 def active_job_id() -> int | None:
     return _active.id if _active else None
+
+
+async def active_snapshot() -> dict:
+    """当前活动任务、爬取占用与系统侧活动（/crawl/active 与工具面的同一事实源）。
+
+    busy 只表达「抓取在跑」；体检/重建由 maintenance 单独表达，混进 busy
+    会让前端把维护期误亮成「抓取进行中」。maintenanceInfo 是体检账本的
+    实时投影（开跑时刻 / 已探测数 / totals）。"""
+    from app.crawler.occupancy import (
+        MAINTENANCE_HEALTH,
+        current_holder,
+        maintenance_kind,
+        maintenance_reason,
+    )
+    from app.crawler.rate_limit import steam_rate_limiter
+    from app.domains.proxypool import health as pool_health
+
+    job_id = active_job_id()
+    kind_now = maintenance_kind()
+    maintenance_info = None
+    if kind_now is not None:
+        maintenance_info: dict = {"kind": kind_now, "reason": maintenance_reason()}
+        live = await pool_health.current_maintenance_run()
+        if live is not None:
+            maintenance_info["startedAt"] = live["startedAt"]
+            maintenance_info["probed"] = live["probed"]
+            totals = live.get("totals")
+            if totals is not None:
+                maintenance_info["totals"] = totals
+    return {
+        "activeJobId": job_id,
+        "busy": job_id is not None or current_holder() is not None,
+        "maintenance": kind_now == MAINTENANCE_HEALTH,
+        "maintenanceInfo": maintenance_info,
+        "throttled": steam_rate_limiter.waiting,
+    }
 
 
 # 进程启动时刻（模块导入即进程启动）：只用于识别「上一个进程遗留」的任务——
@@ -106,7 +150,8 @@ async def cleanup_orphan_jobs() -> None:
                 level=logging.WARNING,
                 detail={"数量": len(rows)},
             )
-    await price_cycle.cleanup_orphan_cycles()
+    await price_cycle.cleanup_orphan_cycles(before=_PROCESS_STARTED_AT)
+    await price_cycle.recover_pending_stages()
 
 
 # 爬取任务台账保留窗：与 proxy_job_runs 同为 90 天——两层台账靠时序对应，
@@ -365,6 +410,7 @@ async def resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tup
             return []
         board_ids = await games_boards.get_board("specials")
         excluded = await _excluded_removed_appids() | await _excluded_free_appids()
+        excluded |= await monitoring_service.blocked_ids("game")
         known = set(await monitoring_service.active_ids("game"))
         async with get_session_factory()() as session:
             catalog_rows = (
@@ -398,10 +444,11 @@ async def resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tup
             return []
         board_ids = await games_boards.get_board("specials")
         excluded = await _excluded_removed_appids() | await _excluded_free_appids()
+        excluded |= await monitoring_service.blocked_ids("game")
         monitored = set(await monitoring_service.active_ids("game"))
         return [
             (int(a), "")
-            for a in board_ids
+            for a in dict.fromkeys(board_ids)
             if int(a) not in monitored and int(a) not in excluded
         ]
 
@@ -449,19 +496,39 @@ async def _missing_tasks(
 
     from app.crawler.browse_store import DEFAULT_BATCH_SIZE
 
+    await price_cycle.recover_pending_stages()
+    excluded = await _recovery_excluded_appids()
+    if excluded:
+        async with write_session(WritePriority.BACKGROUND) as session:
+            jobs = (await session.execute(select(CrawlJob).where(
+                CrawlJob.status.in_(("failed", "interrupted")),
+            ))).scalars().all()
+            for job in jobs:
+                stats = job.stats_json or {}
+                targets = stats.get("targets") or {}
+                skipped = set(stats.get("skipUnits") or [])
+                tasks = targets.get("tasks") or [{"appids": targets.get("appids", []), "region": cc}
+                                                 for cc in targets.get("regions", [])]
+                skipped.update(f"{aid}:{str(task['region']).upper()}" for task in tasks
+                               for aid in task.get("appids", []) if int(aid) in excluded)
+                if skipped != set(stats.get("skipUnits") or []):
+                    job.stats_json = {**stats, "skipUnits": sorted(skipped)}
+            await session.commit()
     db = DbWriter()
     tasks = await db.generate_missing_tasks(
-        cooldown_minutes=cooldown_minutes, limit_rows=limit_rows
+        cooldown_minutes=cooldown_minutes, limit_rows=limit_rows, excluded_appids=excluded,
     )
     pairs = {(int(aid), task["region"].upper()) for task in tasks for aid in task["appids"]}
     pending = await _unobserved_job_targets(
         cooldown_minutes, settle=True,
         limit_rows=max(0, limit_rows - len(pairs)) if limit_rows > 0 else -1,
+        excluded_appids=excluded,
     )
     for pair in sorted(pending):
         if limit_rows > 0 and len(pairs) >= limit_rows:
             break
         pairs.add(pair)
+    pairs = {(aid, cc) for aid, cc in pairs if aid not in excluded}
     by_region: dict[str, list[int]] = {}
     for aid, cc in sorted(pairs):
         by_region.setdefault(cc.lower(), []).append(aid)
@@ -469,6 +536,13 @@ async def _missing_tasks(
              "region": cc, "appids": appids[i:i + DEFAULT_BATCH_SIZE]}
             for cc, appids in by_region.items()
             for i in range(0, len(appids), DEFAULT_BATCH_SIZE)]
+
+
+async def _recovery_excluded_appids() -> set[int]:
+    from app.domains.monitoring import service as monitoring_service
+
+    return (await monitoring_service.blocked_ids("game")
+            | await _excluded_removed_appids() | await _excluded_free_appids())
 
 
 _JOB_TARGET_UNITS_SQL = """
@@ -479,6 +553,7 @@ WITH target_jobs AS MATERIALIZED (
            replace(json_extract(stats_json, '$.targetStartedAt'), 'T', ' ') AS threshold
     FROM crawl_jobs
     WHERE status IN ('failed','interrupted')
+      AND NOT EXISTS (SELECT 1 FROM price_cycles c WHERE c.id = crawl_jobs.cycle_id AND c.status = 'cancelled')
       AND json_type(stats_json, '$.targets') = 'object'
       AND json_extract(stats_json, '$.targetStartedAt') IS NOT NULL
       AND (:job_id IS NULL OR id = :job_id)
@@ -514,15 +589,26 @@ WITH target_jobs AS MATERIALIZED (
 
 async def _unobserved_job_targets(
     cooldown_minutes: int, *, settle: bool = False, limit_rows: int = MISSING_BATCH_ROW_LIMIT,
+    appids: list[int] | None = None,
+    excluded_appids: set[int] | None = None,
 ) -> set[tuple[int, str]]:
     cutoff = get_beijing_time_obj().replace(tzinfo=None) - timedelta(minutes=cooldown_minutes)
     pending = set()
     async with get_session_factory()() as session:
-        if limit_rows != 0:
-            rows = await session.execute(text(_JOB_TARGET_UNITS_SQL + """
+        if limit_rows != 0 and appids != []:
+            statement = text(_JOB_TARGET_UNITS_SQL + """
                 SELECT DISTINCT appid, region FROM unresolved
-                WHERE threshold < :cutoff LIMIT :limit_rows
-            """), {"job_id": None, "cutoff": cutoff, "limit_rows": limit_rows})
+                WHERE threshold < :cutoff
+            """ + (" AND appid IN :appids" if appids is not None else "")
+                + (" AND appid NOT IN (SELECT CAST(value AS INTEGER) FROM json_each(:excluded_appids))" if excluded_appids else "")
+                + " LIMIT :limit_rows")
+            parameters = {"job_id": None, "cutoff": cutoff, "limit_rows": limit_rows}
+            if excluded_appids:
+                parameters["excluded_appids"] = json.dumps(sorted(excluded_appids))
+            if appids is not None:
+                statement = statement.bindparams(bindparam("appids", expanding=True))
+                parameters["appids"] = appids
+            rows = await session.execute(statement, parameters)
             pending.update((int(aid), cc) for aid, cc in rows)
         changed = list((await session.execute(text(_JOB_TARGET_UNITS_SQL +
             "SELECT DISTINCT job_id FROM unit_results WHERE settled = 1"), {"job_id": None})).scalars()) if settle else []
@@ -564,13 +650,15 @@ async def _unobserved_job_targets(
 async def has_pending_missing(
     cooldown_minutes: int = REPAIR_RETRY_COOLDOWN_MINUTES,
 ) -> bool:
-    """是否存在待补抓欠账（EXISTS 直查：不经任务生成、无写副作用）。
+    """接续未启动计划后检查可重试的地区欠账。
 
     空区行（region_code=''）是即拾即清的尝试痕迹，不算待补欠账——与
     generate_missing_tasks 清账后的实际可抓集合同口径。"""
     cutoff = get_beijing_time_obj().replace(tzinfo=None) - timedelta(
         minutes=cooldown_minutes
     )
+    await price_cycle.recover_pending_stages()
+    excluded = await _recovery_excluded_appids()
     async with get_session_factory()() as session:
         row = await session.execute(
             select(GameCurrentPrice.appid)
@@ -578,10 +666,14 @@ async def has_pending_missing(
                 GameCurrentPrice.price_status == "missing",
                 GameCurrentPrice.region_code != "",
                 GameCurrentPrice.updated_at < cutoff,
+                text("game_current_prices.appid NOT IN (SELECT CAST(value AS INTEGER) FROM json_each(:excluded))")
+                .bindparams(excluded=json.dumps(sorted(excluded))),
             )
             .limit(1)
         )
-    return row.first() is not None or bool(await _unobserved_job_targets(cooldown_minutes, limit_rows=1))
+    return row.first() is not None or bool(await _unobserved_job_targets(
+        cooldown_minutes, limit_rows=1, excluded_appids=excluded,
+    ))
 
 
 async def _load_job(job_id: int) -> CrawlJob | None:
@@ -590,39 +682,40 @@ async def _load_job(job_id: int) -> CrawlJob | None:
 
 
 async def _finish_job(job_id: int, status: str, stats: dict | None = None, error: str | None = None) -> None:
-    async with write_gate(WritePriority.BACKGROUND):
-        async with write_session(WritePriority.BACKGROUND) as session:
-            job = await session.get(CrawlJob, job_id)
-            if job is None:
-                return
+    async with write_session(WritePriority.BACKGROUND) as session:
+        job = await session.get(CrawlJob, job_id)
+        if job is None:
+            return
+        changed = job.status not in ("done", "failed", "stopped", "interrupted")
+        if changed:
             job.status = status
-            # stats=None（异常收尾）保留启动时落的初始账本——分母不能丢
-            job.stats_json = {**(job.stats_json or {}), **stats} if stats is not None else job.stats_json
             job.finished_at = datetime.now()
             job.error = error
-            if job.cycle_id is not None:
-                # 轮批次完成账：挂轮各 job 的已处理量之和，收尾一拍重算
-                # （不增量累加——停止/失败后的重跑会把同一批计两次）。
-                # 先 flush 本 job 的统计再聚合，原生 SQL 才能看到本笔。
-                from app.domains.crawl.cycle import PriceCycle
+        # stats=None（异常收尾）保留启动时落的初始账本——分母不能丢
+        job.stats_json = {**(job.stats_json or {}), **stats} if stats is not None else job.stats_json
+        if job.cycle_id is not None:
+            # 轮批次完成账：挂轮各 job 的已处理量之和，收尾一拍重算
+            # （不增量累加——停止/失败后的重跑会把同一批计两次）。
+            # 先 flush 本 job 的统计再聚合，原生 SQL 才能看到本笔。
+            from app.domains.crawl.cycle import PriceCycle
 
-                await session.flush()
-                row = await session.execute(
-                    text(
-                        "SELECT COALESCE(SUM(json_extract(stats_json, '$.processed')), 0) "
-                        "FROM crawl_jobs WHERE cycle_id = :cid"
-                    ),
-                    {"cid": job.cycle_id},
-                )
-                cycle = await session.get(PriceCycle, job.cycle_id)
-                if cycle is not None:
-                    cycle.batches_done = int(row.scalar_one())
-            await session.commit()
-    bus.publish("job.status", job_id=job_id, status=status, error=error)
+            await session.flush()
+            row = await session.execute(
+                text(
+                    "SELECT COALESCE(SUM(json_extract(stats_json, '$.processed')), 0) "
+                    "FROM crawl_jobs WHERE cycle_id = :cid"
+                ),
+                {"cid": job.cycle_id},
+            )
+            cycle = await session.get(PriceCycle, job.cycle_id)
+            if cycle is not None:
+                cycle.batches_done = int(row.scalar_one())
+        await session.commit()
+    if changed:
+        bus.publish("job.status", job_id=job_id, status=status, error=error)
 
 
 # 后台标记链的强引用集：create_task 产物只有被持有时才不会被 GC
-_post_crawl_tasks: set[asyncio.Task] = set()
 
 
 def _crawled_appids(
@@ -639,141 +732,23 @@ def _crawled_appids(
     ]
 
 
-def _spawn_post_crawl_chain(crawled: list[int], job_id: int) -> None:
-    """任务收尾下游链转后台：事件检测 → 提醒 → 史低 → 新史低邮件 → 永降
-    → 排序缓存 → 系列归组 → 免费脱池。串行顺序与前台版一致，逐段兜异常
-    不影响任务状态。
-    """
-    async def _chain() -> None:
-        try:
-            # 非周期执行（job 无 Cycle：手动单发 / 补抓拍）的价格变化同样进
-            # 事件账本——检测逻辑与挂轮共用一份（events.detect_window），
-            # 归属键取 -job_id，窗口=本 job 起止时刻
-            job = await _load_job(job_id)
-            if job is not None and job.cycle_id is None and crawled:
-                from app.domains.crawl import events as crawl_events
+async def _finish_price_outputs(crawled: list[int], job_id: int) -> None:
+    from app.domains.crawl import events as crawl_events
+    from app.domains.wishlist import service as wishlist_service
 
-                written = await crawl_events.detect_window(
-                    crawled,
-                    job.regions_json or [],
-                    job.started_at,
-                    job.finished_at or datetime.now(),
-                    cycle_id=-job_id,
-                )
-                if written:
-                    log_event(
-                        logger,
-                        f"任务 {job_id} 检测到 {len(written)} 条价格变化事件",
-                        detail={
-                            "任务": job_id,
-                            "事件数": len(written),
-                            "类型": "/".join(sorted({e["event_type"] for e in written})),
-                        },
-                    )
-        except Exception:  # noqa: BLE001
-            log_event(
-                logger,
-                f"任务 {job_id} 的价格变化事件检测失败（不影响任务结果）",
-                level=logging.ERROR,
-                exc_info=True,
-                detail={"任务": job_id},
-            )
+    job = await _load_job(job_id)
+    if job is not None and job.cycle_id is None and crawled:
         try:
-            await alerts_service.check_appids(crawled)
-        except Exception:  # noqa: BLE001
-            log_event(
-                logger,
-                "爬取收尾的提醒检查失败（不影响任务结果）",
-                level=logging.ERROR,
-                exc_info=True,
-            )
+            await crawl_events.detect_window(crawled, job.regions_json or [], job.started_at,
+                                            job.finished_at or datetime.now(), cycle_id=-job_id)
+        except Exception:
+            log_event(logger, "价格已保存，变化事件检测未完成", level=logging.ERROR, exc_info=True)
+    for consume in (alerts_service.check_appids, alerts_service.check_new_lows,
+                    wishlist_service.release_free_games):
         try:
-            refreshed = await games_service.refresh_hl_flags(crawled)
-            log_event(
-                logger,
-                f"史低标记已刷新 {refreshed} 款游戏",
-                tag="成功",
-                detail={"数量": refreshed},
-            )
+            await consume(crawled)
         except Exception:  # noqa: BLE001
-            log_event(
-                logger, "史低标记刷新失败（不影响任务结果）",
-                level=logging.ERROR, exc_info=True,
-            )
-        try:
-            # 新史低邮件：基于刚落库的 hl_flag 增量（差集对历史游标），
-            # 在 refresh_hl_flags 之后才有数据可查
-            await alerts_service.check_new_lows(crawled)
-        except Exception:  # noqa: BLE001
-            log_event(
-                logger, "新史低邮件检查失败（不影响任务结果）",
-                level=logging.ERROR, exc_info=True,
-            )
-        try:
-            refreshed = await games_service.refresh_pp_flags(crawled)
-            log_event(
-                logger,
-                f"永降标记已刷新 {refreshed} 款游戏",
-                tag="成功",
-                detail={"数量": refreshed},
-            )
-        except Exception:  # noqa: BLE001
-            log_event(
-                logger, "永降标记刷新失败（不影响任务结果）",
-                level=logging.ERROR, exc_info=True,
-            )
-        try:
-            refreshed = await games_service.refresh_sort_cache(crawled)
-            log_event(
-                logger,
-                f"排序缓存已增量刷新 {refreshed} 款游戏",
-                tag="成功",
-                detail={"数量": refreshed},
-            )
-        except Exception:  # noqa: BLE001
-            log_event(
-                logger, "排序缓存刷新失败（不影响任务结果）",
-                level=logging.ERROR, exc_info=True,
-            )
-        try:
-            # 系列归组：库里有未识别行（series_id NULL）或系列覆盖文件被
-            # 改过时才全库重算，否则是零成本探测
-            if await games_series.has_unassigned() or games_series.overrides_changed():
-                refreshed = await games_series.refresh_series()
-                log_event(
-                    logger,
-                    f"系列归组已刷新 {refreshed} 款游戏",
-                    tag="成功",
-                    detail={"数量": refreshed},
-                )
-        except Exception:  # noqa: BLE001
-            log_event(
-                logger, "系列归组刷新失败（不影响任务结果）",
-                level=logging.ERROR, exc_info=True,
-            )
-        try:
-            # 永久免费自动脱池：本轮爬到 free_kind='f2p' 的游戏移出监控池
-            # （价格事实已定，留在池里只会每轮空转配额）；promo 不脱，赠送
-            # 结束前要持续跟踪
-            from app.domains.wishlist import service as wishlist_service
-
-            released = await wishlist_service.release_free_games(crawled)
-            if released:
-                log_event(
-                    logger,
-                    f"永久免费游戏已自动脱池 {released} 款",
-                    tag="成功",
-                    detail={"数量": released},
-                )
-        except Exception:  # noqa: BLE001
-            log_event(
-                logger, "永久免费游戏自动脱池失败（不影响任务结果）",
-                level=logging.ERROR, exc_info=True,
-            )
-
-    task = asyncio.create_task(_chain())
-    _post_crawl_tasks.add(task)
-    task.add_done_callback(_post_crawl_tasks.discard)
+            log_event(logger, "价格已保存，后续通知处理未完成", level=logging.ERROR, exc_info=True)
 
 
 async def _execute(
@@ -816,11 +791,8 @@ async def _execute(
             # 手动停止：跳过提醒检查 / 史低刷新 / 排序缓存（对未爬完的数据无意义）
             return
 
-        # 爬取落库后的下游链整段转后台：任务状态不等它。史低/永降/排序都是
-        # 派生数据（晚几秒可见；进程退出丢一轮由下一轮重算自愈），提前释放
-        # 的是抓取占用与任务收尾时长
         crawled = _crawled_appids(appid_pairs, pre_tasks)
-        _spawn_post_crawl_chain(crawled, job_id=job_id)
+        await _finish_price_outputs(crawled, job_id)
     except Exception as e:  # noqa: BLE001
         log_event(
             logger,
@@ -1020,6 +992,7 @@ async def start_job(
     kind: str = "manual",
     missing_cooldown: int | None = None,
     cycle_id: int | None = None,
+    trigger: str = "unknown",
 ) -> dict:
     """启动爬取任务。返回任务摘要；已有任务运行时抛 RuntimeError。
 
@@ -1053,6 +1026,8 @@ async def start_job(
 
     if crawler_busy():
         raise RuntimeError(maintenance_reason() or "已有爬取任务在运行")
+    if _chain_stop is not None and cycle_id is None:
+        raise RuntimeError("价格更新正在进行")
     if _active is not None and not _active.task.done():
         raise RuntimeError(maintenance_reason() or "已有爬取任务在运行")
     try:
@@ -1185,35 +1160,35 @@ async def start_job(
             initial_total = len(pre_tasks)
         else:
             initial_total = -(-len(pairs) // DEFAULT_BATCH_SIZE) * len(effective)
-        async with write_gate(WritePriority.BACKGROUND):
-            async with write_session(WritePriority.BACKGROUND) as session:
-                job = CrawlJob(
-                    kind=kind,
-                    status="running",
-                    mode="app",
-                    regions_json=effective,
-                    started_at=datetime.now(),
-                    cycle_id=cycle_id,
-                    stats_json={
-                        "total": initial_total, "processed": 0, "success": 0, "failed": 0,
-                        "targetStartedAt": get_beijing_time_obj().replace(tzinfo=None).isoformat(),
-                        "targets": {"tasks": [
-                            {"region": str(t["region"]).upper(), "appids": list(dict.fromkeys(t["appids"]))}
-                            for t in pre_tasks
-                        ]} if pre_tasks else {
-                            "appids": list(dict.fromkeys(int(aid) for aid, _ in pairs)),
-                            "regions": list(dict.fromkeys(str(cc).upper() for cc in effective)),
-                        },
+        async with write_session(WritePriority.BACKGROUND) as session:
+            job = CrawlJob(
+                kind=kind,
+                status="running",
+                mode="app",
+                regions_json=effective,
+                started_at=datetime.now(),
+                cycle_id=cycle_id,
+                stats_json={
+                    "trigger": trigger,
+                    "total": initial_total, "processed": 0, "success": 0, "failed": 0,
+                    "targetStartedAt": get_beijing_time_obj().replace(tzinfo=None).isoformat(),
+                    "targets": {"tasks": [
+                        {"region": str(t["region"]).upper(), "appids": list(dict.fromkeys(t["appids"]))}
+                        for t in pre_tasks
+                    ]} if pre_tasks else {
+                        "appids": list(dict.fromkeys(int(aid) for aid, _ in pairs)),
+                        "regions": list(dict.fromkeys(str(cc).upper() for cc in effective)),
                     },
-                )
-                session.add(job)
-                await session.commit()
-                job_id = job.id
+                },
+            )
+            session.add(job)
+            await session.commit()
+            job_id = job.id
         stop_event = asyncio.Event()
         task = asyncio.create_task(
             _execute(job_id, pairs, config, stop_event, pre_tasks=pre_tasks)
         )
-        _active = JobHandle(id=job_id, task=task, stop_event=stop_event)
+        _active = JobHandle(id=job_id, task=task, stop_event=stop_event, cycle_id=cycle_id)
     except BaseException:  # noqa: BLE001 — 清理后原样重抛
         # 启动半途失败（无欠账/范围空/lane 规划拒绝等）：释放预取的占用
         end_crawl()
@@ -1241,25 +1216,8 @@ async def start_job(
     return {"id": job_id, "scope": scope, "count": count, "regions": effective}
 
 
-async def default_queue_specs() -> list[dict]:
-    """默认爬取队列组成（唯一来源：自动价格轮与任务页「全部」档共用）。
-
-    - 常驻两段：欠账补抓（missing）→ 监控层（pool：有来源且未排除的对象，
-      愿望单/关注按来源优先级排前）；
-    - 代理形态：目录层（catalog：games 主档减监控层）与特惠榜差值段
-      （specials：榜单翻页队列去重后的差集）随 KV `crawl.catalog_refresh`
-      （默认开）决定是否带上——关闭后只抓监控层，差值段是目录发现通道随之一并停；
-    - 直连形态：目录段默认关（单出口预算留给监控层，用户未关注的大盘子不
-      自动出网），改带折扣队列段（discounts：search specials 接口的折扣游戏
-      全量作爬取对象，榜内在库游戏由它刷新价格）——直连下的自动更新范围
-      = 关注层 + 当前折扣游戏。
-      显式设置过的 catalog_refresh 值两种形态都尊重；榜单源另受
-      KV `fetch.boards` 门控（discounts/specials scope 内判定）。
-
-    已让路的阶段先补跑，其余阶段保持默认顺序。
-    调度器 `_price_refresh_specs` 与 `start_full_queue` 都从这里取组成；
-    新增/调整队列段只改本函数。
-    """
+async def default_queue_specs(*, full_library: bool = False) -> list[dict]:
+    """自动维护按策略选范围；手动全部始终包含符合条件的目录。"""
     from app.domains.settings.service import get_value
 
     specs: list[dict] = [
@@ -1271,10 +1229,12 @@ async def default_queue_specs() -> list[dict]:
         (await get_value("proxy.strategy", "direct_only")) == "direct_only"
     )
     catalog_default = False if direct_mode else True
-    if direct_mode:
+    if direct_mode and not full_library:
         specs.append({"scope": "discounts", "kind": "discounts"})
-    if await get_value("crawl.catalog_refresh", catalog_default):
+    catalog_refresh = await get_value("crawl.catalog_refresh", catalog_default)
+    if full_library or catalog_refresh:
         specs.append({"scope": "catalog"})
+    if catalog_refresh:
         specs.append({"scope": "specials", "kind": "specials_backfill"})
     from app.domains.crawl import cycle as price_cycle
 
@@ -1288,18 +1248,11 @@ _queue_accepting = False
 
 
 async def start_full_queue() -> dict:
-    """任务页「全部」档：按默认队列组成后台串行启动整条链。
-
-    与自动价格轮同一编排（`cycle_run.run_price_cycle`，kind='manual'），范围/
-    冻结/覆盖/事件/通知全部一致，手动轮同样挂 PriceCycle——手动跑一次与等
-    6h 自动跑一次是同一件事。受理前按同出口预解析各段款数：全空 ValueError
-    （路由 400），占用 RuntimeError（409），链句柄防重入；无显式 kind 的
-    scope 段 job 行记 manual（missing/specials_backfill 是段身份标签，保留）。
-    """
+    """手动全库更新，复用价格周期编排与范围解析。"""
     global _queue_chain_task, _queue_accepting
     from app.crawler.occupancy import crawler_busy, maintenance_reason
 
-    if crawler_busy() or (_active is not None and not _active.task.done()):
+    if _chain_stop is not None or crawler_busy() or (_active is not None and not _active.task.done()):
         raise RuntimeError(maintenance_reason() or "已有爬取任务在运行")
     if _queue_accepting or (
         _queue_chain_task is not None and not _queue_chain_task.done()
@@ -1307,8 +1260,11 @@ async def start_full_queue() -> dict:
         raise RuntimeError("全量队列已在启动中")
     # 检查与置位之间无 await（同 start_job 预取占用判例）
     _queue_accepting = True
+    chain_stop = asyncio.Event()
+    register_chain_stop(chain_stop)
+    handed_off = False
     try:
-        composed = await default_queue_specs()
+        composed = await default_queue_specs(full_library=True)
 
         missing_pending = await has_pending_missing()
         segment_plan: list[dict] = [{"name": "missing", "count": 1 if missing_pending else 0}]
@@ -1316,8 +1272,9 @@ async def start_full_queue() -> dict:
             scope = spec.get("scope")
             if not scope:
                 continue
+            spec["resolved_appids"] = await plan_scope_appids(scope, spec.get("appids"))
             segment_plan.append(
-                {"name": scope, "count": len(await plan_scope_appids(scope, None))}
+                {"name": scope, "count": len(spec["resolved_appids"])}
             )
         if not any(p["count"] for p in segment_plan):
             raise ValueError(
@@ -1332,6 +1289,9 @@ async def start_full_queue() -> dict:
             else spec
             for spec in composed
         ]
+        cycle_id = await price_cycle.create("manual", "all", stop_event=chain_stop)
+        register_chain_stop(chain_stop, cycle_id=cycle_id)
+        regions, expected = await price_cycle.freeze_expected(cycle_id, specs)
 
         async def _chain() -> None:
             # 编排本体在 crawl 域内，与自动轮共用一份；链级停止位由 run_price_cycle
@@ -1339,12 +1299,12 @@ async def start_full_queue() -> dict:
             from app.domains.crawl import cycle_run
 
             try:
-                started = await cycle_run.run_price_cycle(specs, kind="manual")
+                await cycle_run.run_price_cycle(
+                    specs, kind="manual", prepared=(cycle_id, regions, expected), stop_event=chain_stop,
+                )
                 log_event(
                     logger,
-                    "手动全队列已跑完，部分或全部段已启动"
-                    if started
-                    else "手动全队列已跑完，没有可抓的段（全部为空或被占用）",
+                    "手动全队列执行已结束",
                 )
             except Exception:  # noqa: BLE001 —— 链级异常只记日志，段内已各自兜底
                 log_event(
@@ -1355,8 +1315,11 @@ async def start_full_queue() -> dict:
                 )
 
         _queue_chain_task = asyncio.create_task(_chain())
+        handed_off = True
     finally:
         _queue_accepting = False
+        if not handed_off:
+            unregister_chain_stop(chain_stop)
     segment_names = [p["name"] for p in segment_plan]
     log_event(
         logger,
@@ -1369,35 +1332,43 @@ async def start_full_queue() -> dict:
     return {
         "queued": True,
         "scope": "all",
+        "cycleId": cycle_id,
         "total": sum(p["count"] for p in segment_plan if p["name"] != "missing"),
         "segments": segment_plan,
     }
 
 
-async def stop_job(job_id: int | None = None, *, whole_chain: bool = True) -> bool:
-    """请求停止。默认同时置位链级停止位：当前段结束后整轮不再推进后续段
-    （自动轮与手动全队列同源）；whole_chain=False 保持旧语义只停当前段。
-    返回是否命中可停止的对象（链在跑即算命中，含规划阶段与段间隙）。"""
-    chain_hit = False
-    if whole_chain and _chain_stop is not None:
+async def stop_job(
+    job_id: int | None = None, *, whole_chain: bool = True, cycle_id: int | None = None,
+) -> bool:
+    """按活动身份请求协作停止；重复请求不重复写入。"""
+    handle = _active
+    if cycle_id is not None and (_chain_stop is None or _chain_cycle_id != cycle_id):
+        return False
+    if job_id is not None and (handle is None or handle.id != job_id):
+        return False
+    if cycle_id is not None and handle is not None and handle.cycle_id != cycle_id:
+        handle = None
+    chain_hit = whole_chain and _chain_stop is not None and not _chain_stop.is_set()
+    job_hit = handle is not None and not handle.stop_event.is_set()
+    if chain_hit:
         _chain_stop.set()
-        chain_hit = True
-    if _active is None:
-        return chain_hit
-    if job_id is not None and _active.id != job_id:
-        return chain_hit
-    _active.stop_event.set()
-    log_event(
-        logger,
-        f"已请求停止爬取任务 {_active.id}",
-        detail={"任务": _active.id, "整轮": "是" if chain_hit else "否"},
-    )
-    return True
+    if job_hit:
+        handle.stop_event.set()
+    if chain_hit:
+        await price_cycle.cancel_open_stages(_PROCESS_STARTED_AT, cycle_id=_chain_cycle_id)
+    if job_hit:
+        await _finish_job(handle.id, "stopped", error="用户已停止")
+        log_event(
+            logger, f"已请求停止爬取任务 {handle.id}",
+            detail={"任务": handle.id, "整轮": "是" if chain_hit else "否"},
+        )
+    return bool(chain_hit or job_hit)
 
 
 def full_queue_running() -> bool:
     """手动全队列链是否在跑（含段间隙——链句柄未完成即算在跑）。"""
-    return _queue_chain_task is not None and not _queue_chain_task.done()
+    return _queue_accepting or (_queue_chain_task is not None and not _queue_chain_task.done())
 
 
 async def stop_full_queue() -> bool:
@@ -1419,6 +1390,7 @@ async def run_sequential(
     cycle_id: int | None = None,
     skip_reasons: list[str] | None = None,
     stop_event: asyncio.Event | None = None,
+    trigger: str = "unknown",
 ) -> list[dict]:
     """串行链式启动多个爬取任务（单任务模型下唯一的多 spec 方式）。
 
@@ -1437,6 +1409,8 @@ async def run_sequential(
     results: list[dict] = []
     for index, spec in enumerate(specs):
         if stop_event is not None and stop_event.is_set():
+            for remaining in specs[index:]:
+                await price_cycle.record_stage(cycle_id, remaining, "cancelled", "用户已停止")
             if skip_reasons is not None:
                 skip_reasons.append(f"{spec.get('kind', spec.get('scope'))}：用户已停止")
             break
@@ -1461,12 +1435,13 @@ async def run_sequential(
         await price_cycle.record_stage(cycle_id, spec, "pending")
         try:
             result = await start_job(
-                scope=spec.get("scope", "appids"),
-                appids=spec.get("appids"),
-                regions=spec.get("regions"),
+                scope="appids" if "resolved_appids" in spec else spec.get("scope", "appids"),
+                appids=spec.get("resolved_appids", spec.get("appids")),
+                regions=spec.get("resolved_regions", spec.get("regions")),
                 kind=spec.get("kind", "scheduled"),
                 missing_cooldown=missing_cooldown,
                 cycle_id=cycle_id,
+                trigger=trigger,
             )
         except (RuntimeError, ValueError) as e:
             await price_cycle.record_stage(
@@ -1485,6 +1460,7 @@ async def run_sequential(
                 skip_reasons.append(f"{spec.get('kind', spec.get('scope'))}：{e}")
             continue
         results.append(result)
+        await price_cycle.record_stage(cycle_id, spec, "pending", job_id=result["id"])
         active = _active
         if active is not None:
             await active.task

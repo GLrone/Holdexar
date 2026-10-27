@@ -3,8 +3,7 @@
 自动轮与手动全队列走同一份编排，仅 `kind` 不同——口径不可能分叉。四段
 （planning / running / repairing / finalizing）各自独立可失败，任一段失败
 不得让用户少一轮价格：建轮/冻结失败不阻断抓取（cycle_id=None 全段照跑）；
-收尾段整体兜异常，防 Cycle 行僵死中间态。让路语义属调度器（调用方处理），
-编排对「一个段都没跑起来」按 `decide_terminal` 如实判 failed。
+收尾段整体兜异常，防 Cycle 行僵死中间态。未启动目标留给正常补抓。
 """
 from __future__ import annotations
 
@@ -14,12 +13,6 @@ import logging
 
 from app.core.events import bus
 from app.core.logging import log_event
-from app.core.orchestration import (
-    KIND_PRICE_CYCLE_FINISHED,
-    LEVEL_ERROR,
-    LEVEL_INFO,
-    record,
-)
 from app.domains.crawl import cycle as price_cycle
 from app.domains.crawl import events as price_events
 from app.domains.crawl import service as crawl_service
@@ -39,31 +32,29 @@ def env_abort_reason(skipped: list[str]) -> str | None:
 async def run_price_cycle(
     specs: list[dict], *, kind: str = "scheduled",
     stop_event: asyncio.Event | None = None,
+    prepared: tuple[int, list[str] | None, int] | None = None,
 ) -> bool:
-    """跑完一轮价格刷新，返回**本轮是否值得让调用方让路重试**。
-
-    返回 False 仅当本轮一个任务都没起来且属于「被占、稍后跑得动」；链异常与
-    建轮失败返回 True（重试只会重复建轮、二次广播同一终态）。`kind` 仅作
-    归属标签落 `price_cycles.kind`（scheduled=定时网格 / manual=用户手动）。
-    `stop_event` 缺省时自建并登记为链级停止位（stop 端点经 service 置位即停
-    整轮）；传入时直接用作链令牌。"""
+    """执行一轮价格刷新；占用时留给下一正常调度，停止信号贯穿整轮。"""
     chain_stop = stop_event if stop_event is not None else asyncio.Event()
+    if (crawl_service._chain_stop is not None and crawl_service._chain_stop is not chain_stop) or (prepared is None and crawl_service.full_queue_running()):
+        return False
     crawl_service.register_chain_stop(chain_stop)
     try:
-        return await _run_price_cycle(specs, kind=kind, stop_event=chain_stop)
+        return await _run_price_cycle(specs, kind=kind, stop_event=chain_stop, prepared=prepared)
     finally:
         crawl_service.unregister_chain_stop(chain_stop)
 
 
 async def _run_price_cycle(
-    specs: list[dict], *, kind: str, stop_event: asyncio.Event
+    specs: list[dict], *, kind: str, stop_event: asyncio.Event,
+    prepared: tuple[int, list[str] | None, int] | None = None,
 ) -> bool:
     """一轮编排本体（建轮 → 冻结 → 跑链 → 收尾），链级停止位由入口登记。"""
     cycle_id: int | None = None
     regions: list[str] | None = None
     expected_units = 0
     try:
-        cycle_id = await price_cycle.create(kind, "pool")
+        cycle_id = prepared[0] if prepared else await price_cycle.create(kind, "pool", stop_event=stop_event)
     except Exception:  # noqa: BLE001
         log_event(
             logger,
@@ -73,8 +64,12 @@ async def _run_price_cycle(
             exc_info=True,
         )
     if cycle_id is not None:
+        crawl_service.register_chain_stop(stop_event, cycle_id=cycle_id)
         try:
-            regions, expected_units = await price_cycle.freeze_expected(cycle_id, specs)
+            if prepared:
+                cycle_id, regions, expected_units = prepared
+            else:
+                regions, expected_units = await price_cycle.freeze_expected(cycle_id, specs)
         except Exception:  # noqa: BLE001
             # 冻结失败不影响抓取：本轮照跑，终态按「无区可爬 / 无期望集」收 failed
             log_event(
@@ -92,7 +87,7 @@ async def _run_price_cycle(
     try:
         await price_cycle.advance(cycle_id, price_cycle.RUNNING)
         results = await crawl_service.run_sequential(
-            specs, cycle_id=cycle_id, skip_reasons=skipped, stop_event=stop_event
+            specs, cycle_id=cycle_id, skip_reasons=skipped, stop_event=stop_event, trigger=kind
         )
         started = bool(results)
         if not results and specs:
@@ -120,9 +115,6 @@ async def _run_price_cycle(
                 cycle_id, price_cycle.REPAIRING
             )
     except Exception as e:  # noqa: BLE001
-        # 链异常 = 本轮确实跑过（跑崩了），不是「被占用」。返回 True 让调用方
-        # 不触发让路重试：重试一个崩掉的链只会再崩一遍，并把同一轮的失败
-        # 广播两次（终态推进第二次会被 advance 拒绝，但事件已发出去）。
         log_event(
             logger,
             "本轮价格链执行异常",
@@ -138,8 +130,6 @@ async def _run_price_cycle(
         return True
 
     if cycle_id is None:
-        # 建轮失败：抓取照常跑完了（本轮没有归属可查）。返回 True 让调用方
-        # 不重试——重试解决的是「被别的任务挤占」，与建轮失败无关。
         return True
     # 收尾段（job 汇总 → finalizing → 事件 → 终态 → 通知 → 统计）必须兜异常：
     # 这些库操作撞上写锁竞争时若异常外逃，Cycle 行会永久停在中间态——直到
@@ -233,11 +223,7 @@ async def _run_price_cycle(
             await settle_cycle(cycle_id, price_cycle.FAILED, error=str(e)[:200])
         with contextlib.suppress(Exception):
             await record_stats(cycle_id)
-        # 本轮抓取已经跑完（收尾崩的是记账，不是抓取）——同异常路径，
-        # 返回 True 让调用方不重试，重试不会补上抓取只会重复广播
         return True
-    # 停止的轮返回 True：调用方（调度器让路重试）不得把「用户喊停」当成
-    # 「被占、稍后重跑」再拉起一轮
     return True if stop_event.is_set() else started
 
 
@@ -252,15 +238,6 @@ async def settle_cycle(
     if not await price_cycle.advance(cycle_id, terminal, error=error):
         return False
     bus.publish("price_cycle.completed", cycleId=cycle_id, status=terminal)
-    # 事实留痕（独立会话，fail-soft）：进程重启后仍能回答「上一轮价格刷新何时、
-    # 以何种终态收敛、失败原因是什么」；SSE 广播只覆盖在线时刻。
-    if cycle_id is not None:
-        await record(
-            KIND_PRICE_CYCLE_FINISHED,
-            error or f"价格刷新轮 #{cycle_id} 收敛：{terminal}",
-            level=LEVEL_ERROR if error else LEVEL_INFO,
-            payload={"cycle_id": cycle_id, "status": terminal},
-        )
     return True
 
 

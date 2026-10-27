@@ -26,7 +26,6 @@ from sqlalchemy import select, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.database import WritePriority, get_session_factory, write_session
-from app.core.database import write_gate
 from app.core.logging import log_event
 from app.crawler.utils import get_beijing_time_obj
 from .models import FxRateHistory
@@ -522,22 +521,3 @@ async def repair_history_gaps(
         },
     )
     return result
-
-
-async def bootstrap_full_history(*, max_windows: int | None = None) -> dict:
-    """全新安装的汇率全史 bootstrap（种子不再携带汇率档案）。
-
-    判定：全库零历史行 → 扫描以 FULL_HISTORY_START 给全部白名单币种建窗 →
-    复用修复链现抓（frankfurter 免 Key 全史接口）；已有任何历史行的存量库直接
-    返回 no_bootstrap，缺口照常归每日 04:00 修复任务。「汇率历史补全」
-    开关关闭时跳过（与定时修复同一闸）。
-    """
-    from app.core.scheduler import content_fetch_enabled
-
-    if not await content_fetch_enabled("fetch.fx_history"):
-        return {"status": "disabled"}
-    marks = await _load_marks()
-    if marks:
-        return {"status": "no_bootstrap"}
-    log_event(logger, "全新安装汇率全史补全启动，全库零历史行，现抓全时间范围")
-    return await repair_history_gaps(max_windows=max_windows)

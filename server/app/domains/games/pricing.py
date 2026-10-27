@@ -71,6 +71,10 @@ def convert_minor_to_cny_fen(amount_minor: int, currency: str, rates: dict[str, 
     rate = rates.get(currency.upper())
     if rate is None:
         return None
+    return cny_fen_at_rate(amount_minor, rate)
+
+
+def cny_fen_at_rate(amount_minor: int, rate: float) -> int:
     return round(amount_minor * rate)
 
 

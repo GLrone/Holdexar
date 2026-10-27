@@ -103,9 +103,6 @@ def _crawl_env(monkeypatch):
 
     monkeypatch.setattr(crawl_service.alerts_service, "check_appids", _noop)
     monkeypatch.setattr(crawl_service.alerts_service, "check_new_lows", _noop)
-    monkeypatch.setattr(crawl_service.games_service, "refresh_hl_flags", _noop)
-    monkeypatch.setattr(crawl_service.games_service, "refresh_pp_flags", _noop)
-    monkeypatch.setattr(crawl_service.games_service, "refresh_sort_cache", _noop)
 
     # 忠实模拟：真实爬取按 config.regions 把每款对象的各期望区服现价行都刷掉
     # （pairs 第二位是区码覆盖位，空串=跑本轮全部区服）。空壳轮终态判定以

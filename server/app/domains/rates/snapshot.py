@@ -10,7 +10,7 @@
       BEGIN
         fx_rates                     ← 调用方（rates.service.refresh_rates）写入
         recompute_cny_fen_all        → game_current_prices / bundle_region_prices
-        games.refresh_sort_cache     → games.min_cny_fen / diff_fen
+        games.update_price_derived     → games.min_cny_fen / diff_fen
         bundles.refresh_bundle_sort_cache → bundles.min_cny_fen / diff_fen / is_lowest
       COMMIT
 
@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 _RECOMPUTE_GAMES_SQL = text(
     """
     UPDATE game_current_prices AS p
-       SET cny_fen = CAST(ROUND(p.price * r.rate_to_cny) AS INTEGER)
+       SET cny_fen = price_cny_fen(p.price, r.rate_to_cny)
       FROM fx_rates AS r
      WHERE r.currency_code = UPPER(p.currency)
        AND p.price IS NOT NULL AND p.price > 0
@@ -51,7 +51,7 @@ _RECOMPUTE_GAMES_SQL = text(
 _RECOMPUTE_BUNDLES_SQL = text(
     """
     UPDATE bundle_region_prices AS p
-       SET cny_fen = CAST(ROUND(p.price * r.rate_to_cny) AS INTEGER)
+       SET cny_fen = price_cny_fen(p.price, r.rate_to_cny)
       FROM fx_rates AS r
      WHERE r.currency_code = UPPER(p.currency)
        AND p.price IS NOT NULL AND p.price > 0
@@ -80,14 +80,14 @@ async def recompute_cny_fen_all(session: AsyncSession) -> dict[str, int]:
 async def rebuild_sort_snapshots(session: AsyncSession) -> dict[str, int]:
     """重建两域排序快照（同事务调用，读到的 cny_fen 一定是本事务刚算的）。
 
-    games：min_cny_fen / diff_fen（refresh_sort_cache）
+    games：min_cny_fen / diff_fen（update_price_derived）
     bundles：min_cny_fen / diff_fen / is_lowest（refresh_bundle_sort_cache）
     不提交。返回各域写入行数 {"games": n, "bundles": m}。
     """
     from app.domains.bundles import service as bundles_service
-    from app.domains.games import service as games_service
+    from app.domains.games.derived import update_price_derived
 
-    games = await games_service.refresh_sort_cache(session=session)
+    games = await update_price_derived(None, session=session, history=False)
     bundles = await bundles_service.refresh_bundle_sort_cache(session=session)
     log_event(
         logger,

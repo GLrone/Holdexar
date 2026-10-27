@@ -42,18 +42,18 @@ class Game(Base):
     # refresh_bundle_counts 维护——只写有计数的行，无记录者保持 NULL
     bundle_count: Mapped[int | None] = mapped_column(Integer)
     series_id: Mapped[str | None] = mapped_column(String(100))  # 游戏系列（如 GTA / Resident Evil）
-    hl_flag: Mapped[int] = mapped_column(Integer, default=0)  # 0=无 1=新史低 2=平史低 3=打折非史低（refresh_hl_flags 维护）
-    pp_flag: Mapped[int] = mapped_column(Integer, default=0)  # 0=无 1=永降 2=永涨（refresh_pp_flags 维护：国区原价最近一次调价方向）
+    hl_flag: Mapped[int] = mapped_column(Integer, default=0)  # 0=无 1=新史低 2=平史低 3=打折非史低（update_price_derived 维护）
+    pp_flag: Mapped[int] = mapped_column(Integer, default=0)  # 0=无 1=永降 2=永涨（update_price_derived 维护：国区原价最近一次调价方向）
     # 最近一次原价跳变（相邻快照原价不同）的时刻；徽章时效判据——
     # 前端只在变化后 14 天内展示永降/永涨，无值或过期即隐藏
     pp_changed_at: Mapped[datetime | None] = mapped_column(DateTime)
-    # ── 排序缓存预计算列（refresh_sort_cache 维护）──
+    # ── 排序缓存预计算列（update_price_derived 维护）──
     # min_cny_fen = 非 CN 各区 ok 价的最低 CNY 分（原始值，无其他区价为 NULL；
     # 查询侧用 COALESCE(min_cny_fen, cn.price) 取最低价）
     min_cny_fen: Mapped[int | None] = mapped_column(BigInteger)
     # diff_fen = CN 价 - COALESCE(最低, CN 价)（下限 0；无 CN 价时为 0）
     diff_fen: Mapped[int] = mapped_column(Integer, default=0)
-    # smart 排序评分预计算列（refresh_sort_cache 维护，公式见 scoring.py；
+    # smart 排序评分预计算列（update_price_derived 维护，公式见 scoring.py；
     # 0~1 浮点，NULL=尚未计算——DESC 排序天然沉底）
     smart_score: Mapped[float | None] = mapped_column(Float)
     is_adult: Mapped[bool] = mapped_column(Boolean, default=False)  # 成人内容
@@ -158,7 +158,38 @@ class GamePriceHistory(Base):
     # 所属 Steam 活动周期标签（steam_events.event_key；观测写入时打标 +
     # 同步后按窗口回贴；PT 活动日归属口径，边界误差至多一天）
     steam_event_key: Mapped[str | None] = mapped_column(String(60))
+    # 观测来源：steam=官方渠道爬取观测，community=社区历史源回填
+    source: Mapped[str] = mapped_column(
+        String(20), default="steam", server_default="steam"
+    )
+    # 商品身份未知（社区历史源的 appid 级序列，上游不区分版本）：不并入
+    # 标准版或任何具体版本——未知保持未知（判定的唯一事实源 games/identity）
+    product_unknown: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0"
+    )
     snapshot_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class HistoryBackfillState(Base):
+    """历史回填同步状态（行为状态，非事实账本）：appid × region 一行。
+
+    丢失可安全重建——重抓幂等去重（唯一索引 INSERT OR IGNORE），不回拨
+    本地观测。状态只描述同步行为，历史事实的唯一事实源始终是
+    game_price_history。
+    """
+
+    __tablename__ = "history_backfill_state"
+
+    appid: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    region_code: Mapped[str] = mapped_column(String(10), primary_key=True)
+    # 最近一次成功拿到点集 / 上游确认无数据 / 请求失败
+    last_ok_at: Mapped[datetime | None] = mapped_column(DateTime)
+    last_empty_at: Mapped[datetime | None] = mapped_column(DateTime)
+    last_error_at: Mapped[datetime | None] = mapped_column(DateTime)
+    last_error: Mapped[str | None] = mapped_column(String(200))
+    # 最近一次成功回填的新增行数（观测用途，不参与任何判定）
+    points_stored: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
 class Bundle(Base):

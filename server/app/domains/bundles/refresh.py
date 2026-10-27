@@ -36,8 +36,7 @@ import aiohttp
 from sqlalchemy import delete, func, select
 
 from app.core import database as _database
-from app.core.database import WritePriority, get_session_factory, write_session
-from app.core.database import write_gate
+from app.core.database import WritePriority, write_session
 from app.core.logging import log_event
 from app.crawler import browse_store as bs
 from app.crawler.config import CC_LIST
@@ -45,7 +44,7 @@ from app.domains.games.models import Bundle, BundleRegionPrice, Game
 from app.domains.games.pricing import convert_minor_to_cny_fen
 from app.domains.games.service import get_rates
 
-from .service import invalidate_bundles_cache, refresh_bundle_sort_cache
+from .service import refresh_bundle_sort_cache
 
 
 def get_session_factory():
@@ -521,7 +520,6 @@ async def refresh_bundles() -> dict:
         ]
     if not want:
         log_event(logger, "没有关注的捆绑包，本轮跳过刷新", tag="跳过")
-        invalidate_bundles_cache()
         return {
             "ok": True, "updated": 0, "total": 0, "regionPrices": 0,
             "failed": [],
@@ -607,7 +605,6 @@ async def refresh_bundles() -> dict:
         "failed": failed,
         "droppedSingletons": dropped_singletons,
     }
-    invalidate_bundles_cache()
     # ── 包内 appid 检测 → app 爬取队列联动 ──
     try:
         enqueued, skipped = await _enqueue_new_bundle_apps()
@@ -719,7 +716,6 @@ async def import_bundle(text: str) -> dict:
     # 包内新 appid 即时进 app 爬取队列——后台跑：预检（每轮限量）+ 小批量
     # 爬取是分钟级长事务，导入交互要求落库后立即回显（与全量刷新的同步
     # 计数语义不同，失败只记日志不影响导入结果）
-    invalidate_bundles_cache()
 
     async def _enqueue_bg() -> None:
         try:

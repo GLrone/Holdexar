@@ -68,12 +68,14 @@ async def test_refresh_if_stale_triggers_on_stale_snapshot(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_refresh_if_stale_empty_db_returns_false(db, monkeypatch):
-    """空库（无快照行）→ 不视为过期（首刷走正常调度/手动）。"""
+async def test_refresh_if_stale_initializes_missing_foreign_snapshot(db, monkeypatch):
+    """首装只有 CNY 基准时，正常维护入口也必须取得海外汇率。"""
     called = []
-    monkeypatch.setattr(rates_service, "refresh_rates", lambda: called.append(1))
-    assert await rates_service.refresh_if_stale() is False
-    assert called == []
+    async def refresh():
+        called.append(1)
+    monkeypatch.setattr(rates_service, "refresh_rates", refresh)
+    assert await rates_service.refresh_if_stale() is True
+    assert called == [1]
 
 
 @pytest.mark.asyncio

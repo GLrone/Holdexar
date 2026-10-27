@@ -77,18 +77,18 @@ async def _seed(db):
                 GameCurrentPrice(
                     appid=APPID, region_code="CN", currency="CNY",
                     price=10000, original_price=10000, discount_percent=0,
-                    price_status="ok", cny_fen=10000,
+                    price_status="ok", attempt_outcome="success", cny_fen=10000,
                 ),
                 GameCurrentPrice(
                     appid=APPID, region_code="US", currency="USD",
                     price=500, original_price=500, discount_percent=0,
-                    price_status="ok", cny_fen=4000,
+                    price_status="ok", attempt_outcome="success", cny_fen=4000,
                 ),
                 # 无对应汇率（TRY 不在本轮 fx_rates 里）：保留原值
                 GameCurrentPrice(
                     appid=APPID_TRY, region_code="TR", currency="TRY",
                     price=5000, original_price=5000, discount_percent=0,
-                    price_status="ok", cny_fen=1234,
+                    price_status="ok", attempt_outcome="success", cny_fen=1234,
                 ),
             ]
         )
@@ -116,6 +116,20 @@ def _stub_rate_source(monkeypatch):
         return {"USD": NEW_USD_RATE}
 
     monkeypatch.setattr(rates_service, "_fetch_augmentedsteam", _fake)
+
+
+@pytest.mark.asyncio
+async def test_exchange_rounding_matches_writer_for_half_cent(db, monkeypatch):
+    async def source():
+        return {"USD": 0.005}
+    monkeypatch.setattr(rates_service, "_fetch_augmentedsteam", source)
+    await rates_service.refresh_rates()
+    async with db() as session:
+        price = await session.get(GameCurrentPrice, (APPID, "US"))
+        game = await session.get(Game, APPID)
+        bundle = (await session.execute(select(Bundle).where(Bundle.bundle_id == BID))).scalar_one()
+        assert price.cny_fen == round(500 * 0.005) == 2
+        assert game.min_cny_fen == bundle.min_cny_fen == 2
 
 
 @pytest.mark.asyncio
@@ -188,8 +202,8 @@ async def test_refresh_rates_rolls_back_all_on_failure(db, monkeypatch):
 
     async def _boom(*args, **kwargs):
         raise RuntimeError("排序快照重建失败")
-
-    monkeypatch.setattr(games_service, "refresh_sort_cache", _boom)
+    from app.domains.games import derived
+    monkeypatch.setattr(derived, "update_price_derived", _boom)
 
     with pytest.raises(RuntimeError):
         await rates_service.refresh_rates()

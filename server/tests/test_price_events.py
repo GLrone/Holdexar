@@ -24,6 +24,31 @@ from app.domains.crawl.events import PriceEvent
 from app.domains.games.models import Game, GameCurrentPrice, GamePriceHistory
 
 APP = 800001
+
+
+@pytest.mark.asyncio
+async def test_previous_evidence_only_scans_history_low_for_benchmark_region(db):
+    import json
+    import sqlite3
+    from app.core.database import get_engine
+
+    for region in ("CN", "US"):
+        await _hist(db, APP, region, price=700, hours_ago=8)
+        await _hist(db, APP, region, price=1000, hours_ago=5)
+    seen = []
+    with sqlite3.connect(get_engine().url.database) as conn:
+        conn.create_function("history_probe", 1, lambda value: seen.append(value) or value)
+        sql = str(events_mod._GPH_PREV_SQL).replace("MIN(h1.price)", "MIN(history_probe(h1.price))")
+        rows = conn.execute(sql, {
+            "want": json.dumps([{"a": APP, "r": r, "s": 1} for r in ("CN", "US")]),
+            "started": (datetime.now() - timedelta(hours=1)).isoformat(" "),
+        }).fetchall()
+    evidence = {r[1]: r for r in rows}
+    assert evidence["CN"][2:4] == (700, 1000)
+    assert evidence["US"][2:4] == (None, 1000)
+    assert seen == [700, 1000]
+
+
 BEFORE = 5.0  # 窗口前的快照（小时前）
 INSIDE = 0.5  # 本轮窗口内的快照（小时前）
 NEXT = 0.05  # 「下一轮」窗口内的观察时刻（3 分钟前，晚于上一轮快照）

@@ -67,6 +67,8 @@ async def _price(db, appid, region, status, *, hours_ago: float = 0.0) -> None:
             price=9900 if status == "ok" else None, sub_id=1,
             price_status=status, fail_count=0,
             updated_at=datetime.now() - timedelta(hours=hours_ago),
+            attempt_outcome="success" if status in ("ok", "locked") else "failed",
+            last_success_at=datetime.now() - timedelta(hours=hours_ago) if status in ("ok", "locked") else None,
         ))
         await session.commit()
 
@@ -272,14 +274,14 @@ async def test_freshness_three_buckets(db):
 
 
 @pytest.mark.asyncio
-async def test_freshness_uses_latest_observation_across_regions(db):
-    """多区取最新观察时刻（最后一次被观察是什么时候）。"""
+async def test_recent_failure_does_not_refresh_successful_observation(db):
+    """失败尝试不刷新成功价格年龄。"""
     await _price(db, APP_A, "cn", "ok", hours_ago=30.0)
     await _price(db, APP_A, "ru", "missing", hours_ago=2.0)
 
     item = (await freshness_mod.appid_freshness([APP_A]))[0]
-    assert item["freshness"] == "fresh"
-    assert 1.9 < item["ageHours"] < 2.2
+    assert item["freshness"] == "stale"
+    assert 29.9 < item["ageHours"] < 30.2
 
 
 def test_freshness_boundaries():
@@ -396,7 +398,7 @@ async def test_freshness_latest_endpoint(db):
 
 @pytest.mark.asyncio
 async def test_convergence_records_split_stat_columns(db):
-    """收敛统计落列：missing/blocked 拆分入列，coverage_json 不再写入。"""
+    """收敛统计落列：missing/blocked 拆分入列。"""
     cid = await _make_cycle(db, [APP_A, APP_B], REGIONS, started_hours_ago=2.0)
     await _price(db, APP_A, "cn", "ok", hours_ago=1.8)
     await _price(db, APP_A, "ru", "locked", hours_ago=1.8)
@@ -413,7 +415,6 @@ async def test_convergence_records_split_stat_columns(db):
         cycle = await session.get(PriceCycle, cid)
         assert cycle.units_missing == 1
         assert cycle.units_blocked == 1
-        assert cycle.coverage_json is None, "新轮不再写快照列"
 
 
 async def _touch_price(db, appid, region, status, *, hours_ago: float = 0.0) -> None:
@@ -470,8 +471,6 @@ async def test_legacy_rows_without_split_columns_rebuild_merged(db):
         cycle.units_missing = None
         cycle.units_blocked = None
         cycle.units_unobserved = 0
-        cycle.coverage = 0.5
-        cycle.coverage_confirmed = 1.0
         cycle.targets_total = 1
         cycle.targets_done = 1
         await session.commit()
@@ -509,3 +508,94 @@ async def test_window_scan_excludes_objects_outside_expected_set(db):
     result = await coverage_mod.cycle_coverage(cid)
     assert result["targetsTotal"] == 1
     assert (result["ok"], result["unobserved"]) == (2, 0)
+
+
+@pytest.mark.asyncio
+async def test_freshness_includes_unfinished_job_even_with_recent_old_price(db, monkeypatch):
+    from app.domains.crawl.models import CrawlJob
+    from app.domains.regions import service as regions
+
+    async def enabled():
+        return ["cn"]
+
+    monkeypatch.setattr(regions, "enabled_regions", enabled)
+    await _price(db, APP_A, "CN", "ok", hours_ago=0.2)
+    async with db() as session:
+        session.add(CrawlJob(kind="manual", status="failed", stats_json={
+            "targetStartedAt": (datetime.now() - timedelta(minutes=5)).isoformat(),
+            "targets": {"appids": [APP_A], "regions": ["CN"]},
+        }))
+        await session.commit()
+    unit = (await freshness_mod.appid_freshness([APP_A]))[0]["regions"]["CN"]
+    assert unit["freshness"] == "fresh"
+    assert unit["pending"] is True and unit["needsUpdate"] is True
+
+
+@pytest.mark.asyncio
+async def test_explicit_unavailable_answer_is_confirmed_without_price_coverage(db):
+    cid = await _make_cycle(db, [APP_A], ["cn"])
+    async with db() as session:
+        session.add(GameCurrentPrice(
+            appid=APP_A, region_code="CN", currency="CNY", price_status="missing",
+            attempt_outcome="success", steam_answer="no_options", updated_at=datetime.now(),
+            last_success_at=datetime.now(), fail_count=0,
+        ))
+        await session.commit()
+    result = await coverage_mod.cycle_coverage(cid)
+    assert (result["coverage"], result["coverageConfirmed"], result["missing"]) == (0.0, 1.0, 0)
+    assert (await stats_mod.cycle_stats(cid))["unitsFailed"] == 0
+    await stats_mod.record_stats(cid)
+    async with db() as session:
+        row = await session.get(GameCurrentPrice, (APP_A, "CN"))
+        row.price_status = "ok"
+        row.steam_answer = "ok"
+        row.price = 9900
+        row.updated_at = datetime.now()
+        await session.commit()
+    assert await coverage_mod.cycle_coverage(cid) == result
+
+
+@pytest.mark.asyncio
+async def test_failed_observation_with_retained_price_does_not_count_as_success(db):
+    cid = await _make_cycle(db, [APP_A], ["cn"])
+    async with db() as session:
+        session.add(GameCurrentPrice(
+            appid=APP_A, region_code="CN", currency="CNY", price=9900, price_status="ok",
+            attempt_outcome="failed", updated_at=datetime.now(), fail_count=1,
+            last_success_at=datetime.now() - timedelta(days=1),
+        ))
+        await session.commit()
+    result = await coverage_mod.cycle_coverage(cid)
+    assert (result["coverage"], result["coverageConfirmed"], result["missing"]) == (0.0, 0.0, 1)
+
+
+@pytest.mark.asyncio
+async def test_rejected_price_reaches_coverage_and_clock_api_without_false_success(db):
+    from httpx import ASGITransport, AsyncClient
+    from app import main
+    from app.core import access
+    from app.crawler.db_writer import DbWriter
+
+    previous = datetime.now() - timedelta(days=1)
+    game = {"appid": APP_A, "name": "Controlled price", "updated_at": previous}
+    price = {"appid": APP_A, "region_code": "CN", "currency": "CNY", "price": 9900,
+             "original_price": 9900, "price_status": "ok", "sub_id": 1}
+    writer = DbWriter()
+    assert await writer.upsert_task_batch([(game, [price])]) == [True]
+    cid = await _make_cycle(db, [APP_A], ["cn"])
+    game["updated_at"] = datetime.now()
+    price["price"] = None
+    assert await writer.upsert_task_batch([(game, [price])]) == [True]
+
+    async with AsyncClient(transport=ASGITransport(app=main.create_app()),
+                           base_url="http://127.0.0.1",
+                           headers={access.SESSION_HEADER: access.session_token()}) as client:
+        coverage = await client.get(f"/api/v1/crawl/cycles/{cid}/coverage")
+        clock = await client.get("/api/v1/crawl/freshness/latest")
+    assert coverage.status_code == clock.status_code == 200
+    result = coverage.json()
+    assert (result["coverage"], result["coverageConfirmed"], result["missing"]) == (0.0, 0.0, 1)
+    assert datetime.fromisoformat(clock.json()["lastSuccessAt"]) == previous
+    async with db() as session:
+        row = await session.get(GameCurrentPrice, (APP_A, "CN"))
+        assert (row.price, row.last_success_at, row.attempt_outcome) == (9900, previous, "failed")

@@ -1,13 +1,8 @@
 """games 域服务：列表 / 详情 / 历史价格。
 
-三层兜底架构（SQLite 版）：
-- 第一层（MV）→ games 表预计算列 min_cny_fen / diff_fen（refresh_sort_cache 维护，
-  启动全库 + 爬取落库增量刷新，恒新鲜 → 无需第二层降级路径）；
-- 第二层（动态 CTE）→ 由预计算列吸收（COALESCE(g.min_cny_fen, cn.price) 表达 lowest_prices CTE）；
-- SQL 级分页（ORDER BY + LIMIT/OFFSET）+ COUNT(*) 分离 + limit+1 探测 hasMore；
-- 价格明细只按页内 appid 批量拉取；
-- 排序规则统一在 sorting.py；
-- 汇率进程内 TTL 缓存。
+价格事实与派生快照由 games.derived 在同一写事务维护。
+列表读取持久排序值，通过 SQL 筛选、排序与分页；明细只批量读取本页 ID。
+日历与系列覆盖文件变化由原调度任务及读取入口检查已有输入版本。
 响应结构（priceMatrix 为区服键控对象）。
 """
 from __future__ import annotations
@@ -18,18 +13,19 @@ import re
 import time
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import and_, asc, bindparam, case, delete, desc, exists, func, null, or_, select, text, update
+from sqlalchemy import and_, asc, delete, desc, exists, func, or_, select, text
+
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.core.database import WritePriority, get_session_factory, write_session
-from app.core.database import write_gate
 from app.core.logging import log_event
 from app.crawler.utils import get_beijing_time_obj
 from app.domains.crawl import freshness as freshness_service
 from app.domains.regions.service import effective_regions
 from app.domains.games import tags as game_tags
+from app.domains.games.identity import standard_product_where
 from app.domains.games.models import (
     Game,
     Bundle,
@@ -42,7 +38,6 @@ from app.domains.games.scoring import (
     familiarity_score,
     quality_score,
     save_score,
-    smart_score,
     timing_score,
 )
 from app.domains.games.sorting import build_order_by
@@ -351,7 +346,7 @@ def _build_filter_conditions(
         conditions.append(g.is_epic.is_(True))
     if only_xgp:
         conditions.append(g.xgp_tier.is_not(None))
-    # [flag] 史低/永降标记过滤（refresh_hl_flags/refresh_pp_flags 维护）。
+    # [flag] 史低/永降标记过滤（update_price_derived 维护）。
     # hl/pp/any：降价动态 feed 的三值；new/flat/nonhl 史低三态细分可逗号
     # 组合按 OR 叠加（游戏库史低三态 checkbox 是多选——hl_flag 1=新史低
     # 2=平史低 3=打折非史低 0=无标记，「非史低」= 1/2 之外）
@@ -364,7 +359,7 @@ def _build_filter_conditions(
         # 史低行恒入（前端必有新史低/平史低徽章）；永降行只收时效窗内的
         # 跳变且不打折——窗外跳变或打折中的 pp 行前端都不打永降徽章，
         # 混进 feed 即成无徽章原价行（板块失真）。pp_changed_at 与
-        # refresh_pp_flags 写入同钟基（naive 北京时间），窗口起点用同一时钟。
+        # update_price_derived 写入同钟基（naive 北京时间），窗口起点用同一时钟。
         conditions.append(
             or_(
                 g.hl_flag.in_((1, 2)),
@@ -521,6 +516,9 @@ async def list_games(
       重排 + 切片分页（SQLite 无 array_position 的等价实现，其余
       筛选条件照常叠加，与 top100 WHERE 注入语义一致）。
     """
+    from .derived import maintain_derived
+
+    await maintain_derived()
     if sort == "top100":
         return await _list_games_top100(
             limit=limit,
@@ -633,12 +631,14 @@ async def list_games(
     except ValueError:
         regions_expected = []
 
+    pending_units = await _pending_price_units(appid_list)
     items = [
         _build_list_item(
             game,
             cn_row,
             price_rows.get(game.appid, []),
             regions_expected,
+            pending_units,
         )
         for game, cn_row in rows
     ]
@@ -667,6 +667,12 @@ async def _load_page_prices(session, appid_list: list[int]) -> dict[int, list[Ga
         for p in all_prices:
             price_rows.setdefault(p.appid, []).append(p)
     return price_rows
+
+
+async def _pending_price_units(appids: list[int]) -> set:
+    from app.domains.crawl.service import _unobserved_job_targets
+
+    return await _unobserved_job_targets(0, appids=appids, limit_rows=-1)
 
 
 async def _list_games_top100(
@@ -791,9 +797,10 @@ async def _list_games_top100(
         regions_expected = [r.upper() for r in await effective_regions(None)]
     except ValueError:
         regions_expected = []
+    pending_units = await _pending_price_units(appid_list)
     items = [
         _build_list_item(
-            game, cn_row, price_rows.get(game.appid, []), regions_expected
+            game, cn_row, price_rows.get(game.appid, []), regions_expected, pending_units
         )
         for game, cn_row in page
     ]
@@ -836,7 +843,7 @@ async def price_diagnosis(appid: int) -> dict | None:
     cn_row = next(
         (p for p in price_rows if (p.region_code or "").upper() == "CN"), None
     )
-    item = _build_list_item(game, cn_row, price_rows, regions_expected)
+    item = _build_list_item(game, cn_row, price_rows, regions_expected, await _pending_price_units([appid]))
     cn_col = (item.get("priceMatrix") or {}).get("CN")
     price_data = item.get("priceData") or {}
     return {
@@ -977,6 +984,9 @@ async def briefs_for(appids: list[int]) -> dict[int, dict]:
 
 async def get_game_detail(appid: int) -> dict | None:
     """游戏详情：元数据 + 全区当前价 + 版本列表（捆绑包域未建，返回空列表）。"""
+    from .derived import maintain_derived
+
+    await maintain_derived()
     rates = await get_rates()
 
     async with get_session_factory()() as session:
@@ -1046,15 +1056,9 @@ async def get_game_detail(appid: int) -> dict | None:
     cn_cny_fen = cn_data["cnyFen"] if cn_data else None
     cn_discount = cn_data["discount"] if cn_data else 0
 
-    lowest_cny_fen = None
-    lowest_region_code = ""
-    for code, data in price_map.items():
-        # 0 价（免费）不参与最低区：全 0 时「最低区 ¥0.00」无展示意义
-        if code == "CN" or not data["cnyFen"]:
-            continue
-        if lowest_cny_fen is None or data["cnyFen"] < lowest_cny_fen:
-            lowest_cny_fen = data["cnyFen"]
-            lowest_region_code = code.lower()
+    lowest_cny_fen = game.min_cny_fen
+    lowest_region_code = next((code.lower() for code, data in price_map.items()
+        if code != "CN" and lowest_cny_fen is not None and data["cnyFen"] == lowest_cny_fen), "")
 
     versions = [
         {"suffix": v.version_suffix, "isGold": v.is_gold, "subId": v.sub_id}
@@ -1115,11 +1119,7 @@ async def get_game_detail(appid: int) -> dict | None:
         "cnDiscountEndsAt": (cn_data["discountEndsAt"] if cn_data else None),
         "lowestCnyFen": lowest_cny_fen,
         "lowestRegionCode": lowest_region_code,
-        "savingsFen": (
-            max(cn_cny_fen - lowest_cny_fen, 0)
-            if cn_cny_fen is not None and lowest_cny_fen is not None
-            else 0
-        ),
+        "savingsFen": int(game.diff_fen or 0),
         "versions": versions,
         "linkedBundles": await linked_bundles(appid),
     }
@@ -1283,15 +1283,30 @@ async def _fill_cny_fen_by_history(rows) -> dict[int, int]:
     return filled
 
 
+async def _history_backfill_brief(appid: int, region: str) -> dict:
+    """图表附带的最小回填同步状态（行为状态，来自社区历史源适配器）。"""
+    from app.crawler.community_history import backfill_brief
+
+    return await backfill_brief(appid, region)
+
+
 async def get_game_history(
-    appid: int, region: str = "cn", days: int = 0, sub_id: int | None = None
+    appid: int,
+    region: str = "cn",
+    days: int = 0,
+    sub_id: int | None = None,
+    product: str | None = None,
 ) -> dict:
     """历史价格走势（按版本切片）。返回 {region, points, lowest, highest, count, versions}。
 
     sub_id 缺省 = 标准版；传入 = 指定 sub 包。days 缺省 **0 = 全部时间**——
     时间窗由前端在图表端开窗（导航条/chips），不回源；此处若给 365 之类的
     默认值，任何漏传 days 的调用方都会静默拿到被截断的序列。
-    versions 为该 appid+region 库内 distinct 版本（前端下拉数据源）。
+    versions 为该 appid+region 库内 distinct 版本（前端下拉数据源）；商品
+    身份未知的行以显式 unknown 条目出现（product='unknown'），经
+    product='unknown' 取独立序列——未知保持未知，不并入标准版。
+    归属三要素：每个序列可说明购买商品（sub/版本/未知）、地区、来源
+    （行级 source 列）。
 
     标准版语义：**跨 sub 代际的标准版序列**。Steam 改包内容就换 sub_id，
     只认单个 sub 会把换代之前的历史整段滤掉（872410/CN 只出 2 个点而库里
@@ -1300,21 +1315,19 @@ async def get_game_history(
 
         标准版 = 该区所有标准版行 ∪ 该区当前在售 sub 的所有行
 
-    标准版判据与写入侧 db_writer.py 的 is_standard 同口径（非 gold ∧ 无版本
-    后缀 ∧ 非捆绑包），读取侧不得独立演化。并集右项是必要的兜底：红警 3 这类
+    标准版判据唯一事实源 games/identity.py（写入侧与读取侧同口径），
+    读取侧不得独立演化。并集右项是必要的兜底：红警 3 这类
     只在捆绑包 sub 下售卖的游戏，其区服唯一在售 sub 会被识别成 bundle-as-sub，
     若一并排除就会得到空图（全库 0 个区服只靠捆绑行活着，故此项不产生回归）。
     """
     region = region.lower()
+    standard = standard_product_where(GamePriceHistory)
 
-    # 标准版判据（对齐 db_writer.py:187-192 的 is_standard）
-    standard = and_(
-        or_(GamePriceHistory.is_gold.is_(False), GamePriceHistory.is_gold.is_(None)),
-        or_(GamePriceHistory.version_suffix.is_(None), GamePriceHistory.version_suffix == ""),
-        or_(GamePriceHistory.is_bundle.is_(False), GamePriceHistory.is_bundle.is_(None)),
-    )
-
-    if sub_id is None:
+    if product == "unknown":
+        # 商品身份未知序列（社区历史源 appid 级数据）：独立呈现，
+        # 永不与标准版/具体版本混合
+        version_cond = GamePriceHistory.product_unknown.is_(True)
+    elif sub_id is None:
         async with get_session_factory()() as session:
             sale_sub = (
                 await session.execute(
@@ -1331,8 +1344,19 @@ async def get_game_history(
             ).scalar_one_or_none()
         # 注意 sub_id 可能是 0（db_writer 用 `or 0` 把 None 归一成 0），
         # 那不是有效 sub，不能进并集，否则会匹配到一堆 sub_id=0 的杂行。
+        # 并集右支只认已识别行：包归属已知但版本分类未验证（未知态）的
+        # 行不得借道在售 sub 混进标准序列（未知保持未知）。
         version_cond = (
-            or_(standard, GamePriceHistory.sub_id == sale_sub)
+            or_(
+                standard,
+                and_(
+                    GamePriceHistory.sub_id == sale_sub,
+                    or_(
+                        GamePriceHistory.product_unknown.is_(False),
+                        GamePriceHistory.product_unknown.is_(None),
+                    ),
+                ),
+            )
             if sale_sub
             else standard
         )
@@ -1375,10 +1399,22 @@ async def get_game_history(
                     GamePriceHistory.appid == appid,
                     GamePriceHistory.region_code == region.upper(),
                     GamePriceHistory.price_status == "ok",
+                    # 商品身份未知的行不进版本枚举——它们是独立 unknown 序列
+                    GamePriceHistory.product_unknown.is_(False),
                 )
                 .distinct()
             )
         ).all()
+        has_unknown = (
+            await session.execute(
+                select(GamePriceHistory.product_unknown).where(
+                    GamePriceHistory.appid == appid,
+                    GamePriceHistory.region_code == region.upper(),
+                    GamePriceHistory.price_status == "ok",
+                    GamePriceHistory.product_unknown.is_(True),
+                ).limit(1)
+            )
+        ).first() is not None
 
     def _version_sort_key(v):
         suffix = v.version_suffix or ""
@@ -1386,9 +1422,22 @@ async def get_game_history(
         return (0 if (not suffix and not is_gold) else 1, suffix, is_gold)
 
     versions = [
-        {"subId": v.sub_id, "suffix": v.version_suffix, "isGold": bool(v.is_gold)}
+        {
+            "subId": v.sub_id,
+            "suffix": v.version_suffix,
+            "isGold": bool(v.is_gold),
+            # 归属标注：标准版 / 具体 sub（变体）
+            "product": (
+                "standard" if (not (v.version_suffix or "") and not v.is_gold) else "sub"
+            ),
+        }
         for v in sorted(version_rows, key=_version_sort_key)
     ]
+    if has_unknown:
+        # 商品身份未知的独立序列（社区历史源）：显式条目，永不冒充标准版
+        versions.append(
+            {"subId": None, "suffix": None, "isGold": False, "product": "unknown"}
+        )
 
     if not rows:
         return {
@@ -1398,6 +1447,7 @@ async def get_game_history(
             "highest": None,
             "count": 0,
             "versions": versions,
+            "backfill": await _history_backfill_brief(appid, region),
         }
 
     region_info = next((entry for entry in CC_LIST if entry[0] == region), None)
@@ -1434,6 +1484,7 @@ async def get_game_history(
             "lowest": None,
             "highest": None,
             "versions": versions,
+            "backfill": await _history_backfill_brief(appid, region),
         }
 
     lowest = min(valid)
@@ -1472,6 +1523,7 @@ async def get_game_history(
         "count": len(points),
         "lowestHits": lowest_hits,
         "versions": versions,
+        "backfill": await _history_backfill_brief(appid, region),
     }
 
 
@@ -1493,9 +1545,7 @@ async def get_price_context(appid: int, date: str, region: str = "cn") -> dict:
 
     # 标准版判据与 get_game_history 逐字同口径（读取侧不得独立演化）
     standard = and_(
-        or_(GamePriceHistory.is_gold.is_(False), GamePriceHistory.is_gold.is_(None)),
-        or_(GamePriceHistory.version_suffix.is_(None), GamePriceHistory.version_suffix == ""),
-        or_(GamePriceHistory.is_bundle.is_(False), GamePriceHistory.is_bundle.is_(None)),
+        standard_product_where(GamePriceHistory),
     )
     async with get_session_factory()() as session:
         sale_sub = (
@@ -1536,7 +1586,6 @@ async def get_price_context(appid: int, date: str, region: str = "cn") -> dict:
     fx_filled = await _fill_cny_fen_by_history(rows)
     points: list[dict] = []
     for r in rows:
-        price_cents = int(r.price) if r.price is not None else None
         cny_fen = int(r.cny_fen) if r.cny_fen is not None else None
         if cny_fen is None:
             cny_fen = fx_filled.get(int(r.id))
@@ -1564,11 +1613,11 @@ async def get_price_context_batch(items: list[tuple[int, str]]) -> dict:
     项直接回 null 对，不抛错——调用方按缺价格段渲染。
     """
     results = []
-    for appid, date in items[:200]:
-        if appid <= 0 or not date:
-            results.append({"appid": appid, "date": date, "at": None, "lowest": None})
+    for appid, day in items[:200]:
+        if appid <= 0 or not day:
+            results.append({"appid": appid, "date": day, "at": None, "lowest": None})
             continue
-        results.append(await get_price_context(appid, date))
+        results.append(await get_price_context(appid, day))
     return {"results": results}
 
 
@@ -1669,451 +1718,13 @@ async def get_game_versions(appid: int) -> dict:
     return {"versions": versions}
 
 
-# 新史低判定参数。同价带 0.1 元：导入的历史价快照只精确到角且进一
-# （如 9207 分记成 9210），现价与既往最低差在带内视作同一价位；
-# NEW_LOW_ERA_DAYS 是兜底窗——仅当历史短程看不到既往期（无法背书
-# 「首次到该价」）时，折扣期起点超窗即回落平史低。
-LOW_EQUAL_BAND_FEN = 10
-NEW_LOW_ERA_DAYS = 30
-
-# 折扣期解析：h = 国区标准版历史（口径与 prior 相同，价格按 0.1 元取整）；
-# cur = 现价取整；lastdiff = 最近一次「非现价」快照；era = 现价在其之后
-# 的连续同价快照段起点（即折扣期起点）及其之前的最低价。
-_ERA_INFO_SQL = text(
-    """
-    WITH h AS (
-        SELECT appid, snapshot_at, cny_fen,
-               CAST(ROUND(cny_fen / 10.0) AS INTEGER) AS norm_fen
-        FROM game_price_history
-        WHERE appid IN :hids
-          AND region_code = 'CN'
-          AND price_status = 'ok'
-          AND cny_fen IS NOT NULL AND cny_fen > 0
-          AND (is_gold = 0 OR is_gold IS NULL)
-          AND (version_suffix IS NULL OR version_suffix = '')
-          AND (is_bundle = 0 OR is_bundle IS NULL)
-    ),
-    cur AS (
-        SELECT appid, CAST(ROUND(cny_fen / 10.0) AS INTEGER) AS cur_norm
-        FROM game_current_prices
-        WHERE appid IN :cids
-          AND region_code = 'CN'
-          AND price_status = 'ok'
-          AND cny_fen IS NOT NULL AND cny_fen > 0
-    ),
-    lastdiff AS (
-        SELECT h.appid, MAX(h.snapshot_at) AS last_diff_at
-        FROM h JOIN cur ON cur.appid = h.appid
-        WHERE h.norm_fen != cur.cur_norm
-        GROUP BY h.appid
-    ),
-    era AS (
-        SELECT cur.appid, MIN(h.snapshot_at) AS era_start
-        FROM h
-        JOIN cur ON cur.appid = h.appid
-        LEFT JOIN lastdiff ld ON ld.appid = cur.appid
-        WHERE h.norm_fen = cur.cur_norm
-          AND (ld.last_diff_at IS NULL OR h.snapshot_at >= ld.last_diff_at)
-        GROUP BY cur.appid
-    )
-    SELECT era.appid, era.era_start,
-           MIN(CASE WHEN h.snapshot_at < era.era_start THEN h.cny_fen END) AS prior_era_min
-    FROM era JOIN h ON h.appid = era.appid
-    GROUP BY era.appid, era.era_start
-    """
-)
-
-
-async def refresh_hl_flags(appids: list[int] | None = None) -> int:
-    """刷新 games.hl_flag（新史低 / 平史低标记）。
-
-    判定锚是**当前折扣期起点**：现价（按 0.1 元取整对齐）在国区标准版
-    历史里最近一段连续同价快照的最早时刻。新史低只属于**首次到达该价的
-    那个折扣期**：期前最低价比现价便宜 ≥1 角 → 本期是新低期，整期记 1；
-    同一价位之后的折扣期期前最低已含上一期，diff 落回 ±1 角带内 → 2
-    （平史低）；明显高于历史最低记 3（打折）/ 0（无折扣）。历史全部落在
-    现价期内（首发即打折、历史短程看不到既往期）无法用既往期背书，按
-    30 天兜底窗记 1、超期回落 2；从未变价且无折扣记 0；现价在历史里没有
-    同期快照按无既往处理（3/0）。appids=None 全库刷新（启动时），否则
-    增量（爬取落库后调用）。
-    """
-    from sqlalchemy.orm import aliased
-
-    h = GamePriceHistory
-    cn_cur = aliased(GameCurrentPrice)
-    async with write_session(WritePriority.BACKGROUND) as session:
-        prior_q = (
-            select(h.appid, func.min(h.cny_fen))
-            .select_from(h)
-            .join(cn_cur, and_(cn_cur.appid == h.appid, cn_cur.region_code == "CN"))
-            .where(
-                h.region_code == "CN",
-                h.price_status == "ok",
-                h.cny_fen.is_not(None),
-                h.cny_fen > 0,
-                or_(h.is_gold.is_(False), h.is_gold.is_(None)),
-                or_(h.version_suffix.is_(None), h.version_suffix == ""),
-                # bundle-as-sub（不支持补齐的捆绑包）不参与史低计算——
-                # 提取修复前它们 suffix 为空混进标准版，产生假史低
-                or_(h.is_bundle.is_(False), h.is_bundle.is_(None)),
-                h.snapshot_at < cn_cur.updated_at,
-            )
-            .group_by(h.appid)
-        )
-        if appids:
-            prior_q = prior_q.where(h.appid.in_(appids))
-        prior_rows = (await session.execute(prior_q)).all()
-        prior_low = {appid: int(min_fen) for appid, min_fen in prior_rows if min_fen is not None}
-
-        cur_q = select(Game.appid, GameCurrentPrice.discount_percent, GameCurrentPrice.cny_fen).join(
-            GameCurrentPrice,
-            and_(
-                GameCurrentPrice.appid == Game.appid,
-                GameCurrentPrice.region_code == "CN",
-                GameCurrentPrice.price_status == "ok",
-            ),
-        )
-        if appids:
-            cur_q = cur_q.where(Game.appid.in_(appids))
-        cur_rows = (await session.execute(cur_q)).all()
-
-        # 折扣期只解析给「处于史低带内」的游戏——明显高于历史最低的必是
-        # 3/0，与期起点无关，不进 CTE 查询（候选集 ≈ 史低游戏数，远小于全库）。
-        # 无既往（本周期才首次落快照）的打折游戏也是首发即打折的形态，一并解析
-        band = LOW_EQUAL_BAND_FEN
-        cands = sorted(
-            {
-                int(appid)
-                for appid, discount, fen in cur_rows
-                if fen is not None
-                and fen > 0
-                and (
-                    (
-                        prior_low.get(int(appid)) is not None
-                        and prior_low[int(appid)] - fen > -band
-                    )
-                    or (prior_low.get(int(appid)) is None and (discount or 0) > 0)
-                )
-            }
-        )
-        # 库内 DateTime 列统一存 naive 北京时间（与 db_writer._naive 同口径）
-        now_dt = get_beijing_time_obj().replace(tzinfo=None)
-        era_window = timedelta(days=NEW_LOW_ERA_DAYS)
-        era_info: dict[int, tuple[datetime | None, int | None]] = {}
-        for i in range(0, len(cands), 400):
-            chunk = cands[i : i + 400]
-            rows = (
-                await session.execute(
-                    _ERA_INFO_SQL.bindparams(
-                        bindparam("hids", expanding=True),
-                        bindparam("cids", expanding=True),
-                    ),
-                    {"hids": chunk, "cids": chunk},
-                )
-            ).all()
-            for appid, era_start, prior_era_min in rows:
-                if isinstance(era_start, str):
-                    era_start = datetime.fromisoformat(era_start)
-                era_info[int(appid)] = (era_start, prior_era_min)
-
-        updates: list[tuple[int, int]] = []  # (appid, flag)
-        for appid, discount, cn_fen in cur_rows:
-            discount = discount or 0
-            era_start, prior_era_min = era_info.get(int(appid), (None, None))
-            if era_start is None:
-                # 现价在历史里没有同期快照（从未落快照 / 不在史低带内）
-                flag = 3 if discount > 0 else 0
-            elif prior_era_min is None:
-                # 历史全部落在现价期内（首发即打折 / 历史短程看不到既往期）：
-                # 无法用既往期背书「首次到该价」，按 30 天兜底窗记 1，超期回落 2；
-                # 从未变价且无折扣不入史低
-                in_window = now_dt - era_start <= era_window
-                flag = (1 if in_window else 2) if discount > 0 else 0
-            else:
-                diff = prior_era_min - cn_fen
-                if diff >= band:
-                    # 期前最低 ≥1 角高于现价：本期是首次到该价的折扣期，整期
-                    # 持续记新史低；同价位之后再现的折扣期期前最低已含上一期，
-                    # diff 落回带内判平史低——新史低只属于第一个到达该价的期
-                    flag = 1
-                elif diff > -band:
-                    flag = 2
-                else:
-                    flag = 3 if discount > 0 else 0
-            updates.append((int(appid), flag))
-
-        if updates:
-            
-            # SQLite 绑定变量上限，按批执行 CASE UPDATE
-            BATCH = 400
-            for i in range(0, len(updates), BATCH):
-                batch = updates[i : i + BATCH]
-                await session.execute(
-                    update(Game)
-                    .where(Game.appid.in_([a for a, _ in batch]))
-                    .values(hl_flag=case(dict(batch), value=Game.appid))
-                )
-            await session.commit()
-    return len(updates)
-
-
-async def refresh_pp_flags(appids: list[int] | None = None) -> int:
-    """刷新 games.pp_flag + pp_changed_at（永降/永涨标记与跳变时刻）。
-
-    判定：当前国区标准版原价 vs 历史上最近一次「不同的原价」（原价序列
-    上的上一个台阶）→ 1=永降 2=永涨；从未变过价 → 0。
-
-    pp_changed_at = 最近一次原价跳变（相邻快照 original 不同）的快照时刻，
-    是前端徽章时效判据（变化后 14 天内才展示）。它与 flag 判定独立成查询：
-    flag 的比较锚是「当前价行」，必须排除当前刻快照（snapshot_at < updated_at），
-    否则本次刚写入的行会自己跟自己比出 0；跳变时刻恰恰**要**看到本次写入——
-    不加该条件，变化要等下一轮爬取才计入时效窗（最长偏移一个抓取间隔）。
-
-    - 只比原价（original_price，本地币种）不比折后价：打折不动原价，
-      原价变化 = 真调价，与折扣状态无关（打折期间照样可能被永久下调）
-    - 历史口径与史低一致：CN 区、ok、非黄金版、无版本后缀、非 bundle-as-sub
-    - 当前行挂真实 sub_id 时只比同 sub 的历史（标准版多 sub 择优，
-      换 sub 不误报）；sub_id=0 视作未挂不限定
-    - 无状态可重算：每次从快照序列重建「最近一次调价方向」，启动全库
-      刷新与爬取增量（appids）语义一致，重复执行幂等
-    """
-    from datetime import datetime as _dt
-
-    
-    h = GamePriceHistory
-    c = aliased(GameCurrentPrice)
-    inner = (
-        select(
-            h.appid,
-            c.original_price.label("cur_original"),
-            h.original_price.label("prior_original"),
-            func.row_number()
-            .over(partition_by=h.appid, order_by=h.snapshot_at.desc())
-            .label("rn"),
-        )
-        .join(c, and_(c.appid == h.appid, c.region_code == "CN"))
-        .where(
-            h.region_code == "CN",
-            h.price_status == "ok",
-            h.original_price.is_not(None),
-            h.original_price != c.original_price,
-            c.original_price.is_not(None),
-            c.price_status == "ok",
-            h.snapshot_at < c.updated_at,
-            or_(h.is_gold.is_(False), h.is_gold.is_(None)),
-            or_(h.version_suffix.is_(None), h.version_suffix == ""),
-            or_(c.sub_id.is_(None), c.sub_id == 0, h.sub_id == c.sub_id),
-        )
-    )
-    if appids:
-        inner = inner.where(h.appid.in_(appids))
-    subq = inner.subquery()
-
-    # 最近一次原价跳变：标准版快照序列按时间排，LAG 出上一条快照的原价，
-    # 取「与上一条不同」的最近一条 → 那条快照的时刻即变化发生的观测点
-    prev_original = func.lag(h.original_price).over(
-        partition_by=h.appid, order_by=h.snapshot_at
-    )
-    seq = (
-        select(
-            h.appid,
-            h.original_price,
-            h.snapshot_at,
-            prev_original.label("prev_original"),
-        )
-        .join(c, and_(c.appid == h.appid, c.region_code == "CN"))
-        .where(
-            h.region_code == "CN",
-            h.price_status == "ok",
-            h.original_price.is_not(None),
-            c.original_price.is_not(None),
-            c.price_status == "ok",
-            or_(h.is_gold.is_(False), h.is_gold.is_(None)),
-            or_(h.version_suffix.is_(None), h.version_suffix == ""),
-            or_(h.is_bundle.is_(False), h.is_bundle.is_(None)),
-            or_(c.sub_id.is_(None), c.sub_id == 0, h.sub_id == c.sub_id),
-        )
-    )
-    if appids:
-        seq = seq.where(h.appid.in_(appids))
-    seq_sub = seq.subquery()
-    latest_jump = (
-        select(
-            seq_sub.c.appid,
-            seq_sub.c.snapshot_at.label("changed_at"),
-            func.row_number()
-            .over(partition_by=seq_sub.c.appid, order_by=seq_sub.c.snapshot_at.desc())
-            .label("rn"),
-        ).where(
-            seq_sub.c.prev_original.is_not(None),
-            seq_sub.c.prev_original != seq_sub.c.original_price,
-        )
-    ).subquery()
-
-    def _as_dt(value) -> _dt | None:
-        if isinstance(value, _dt):
-            return value
-        try:
-            return _dt.fromisoformat(str(value))
-        except ValueError:
-            return None
-
-    async with write_session(WritePriority.BACKGROUND) as session:
-        rows = (
-            await session.execute(
-                select(subq.c.appid, subq.c.cur_original, subq.c.prior_original).where(
-                    subq.c.rn == 1
-                )
-            )
-        ).all()
-        flags = {int(appid): (1 if cur < prior else 2) for appid, cur, prior in rows}
-
-        jump_rows = (
-            await session.execute(
-                select(latest_jump.c.appid, latest_jump.c.changed_at).where(latest_jump.c.rn == 1)
-            )
-        ).all()
-        changed = {int(appid): _as_dt(ts) for appid, ts in jump_rows}
-
-        if appids:
-            targets = [int(a) for a in appids]
-        else:
-            targets = [int(a) for (a,) in (await session.execute(select(Game.appid))).all()]
-        updates = [(a, flags.get(a, 0), changed.get(a)) for a in targets]
-
-        if updates:
-            # SQLite 绑定变量上限，按批执行 CASE UPDATE（与 hl_flag 同款）。
-            # pp_changed_at 的映射必须覆盖全量 targets：空 case 会生成非法 SQL，
-            # 且无跳变的 appid 要显式写 NULL（幂等重算要求清掉旧值）。
-            
-            BATCH = 400
-            for i in range(0, len(updates), BATCH):
-                batch = updates[i : i + BATCH]
-                await session.execute(
-                    update(Game)
-                    .where(Game.appid.in_([a for a, _, _ in batch]))
-                    .values(
-                        pp_flag=case({a: f for a, f, _ in batch}, value=Game.appid),
-                        pp_changed_at=case(
-                            {a: (t if t is not None else null()) for a, _, t in batch},
-                            value=Game.appid,
-                        ),
-                    )
-                )
-            await session.commit()
-    return len(updates)
-
-
-async def _refresh_smart_scores(session: AsyncSession, appids: list[int] | None) -> int:
-    """重算 games.smart_score（refresh_sort_cache 的组成部分）。
-
-    输入列 diff_fen / hl_flag / release_date 必须已刷新（启动链与爬取增量路径
-    均保证 hl_flags → sort_cache 顺序）；CN 折扣左联取 ok 行，无行按无折扣计。
-    Python 侧算分（公式见 scoring.py），不依赖 SQLite 数学函数。
-    """
-    stmt = (
-        select(
-            Game.appid,
-            Game.diff_fen,
-            Game.positive_rate,
-            Game.review_count,
-            Game.hl_flag,
-            Game.release_date,
-            func.coalesce(GameCurrentPrice.discount_percent, 0),
-        )
-        .join(
-            GameCurrentPrice,
-            and_(
-                GameCurrentPrice.appid == Game.appid,
-                GameCurrentPrice.region_code == "CN",
-                GameCurrentPrice.price_status == "ok",
-            ),
-            isouter=True,
-        )
-        # 免费游戏（f2p/限时赠送）不参与评分：它们被商店主门 price>0
-        # 挡在列表之外，smart_score 只服务商店排序的可见集
-        .where(Game.free_kind.is_(None))
-    )
-    if appids is not None:
-        if not appids:
-            return 0
-        stmt = stmt.where(Game.appid.in_(appids))
-
-    rows = (await session.execute(stmt)).all()
-    if not rows:
-        return 0
-    await session.execute(
-        update(Game),
-        [
-            {
-                "appid": appid,
-                "smart_score": smart_score(diff, rate, reviews, hl, disc, rd),
-            }
-            for appid, diff, rate, reviews, hl, rd, disc in rows
-        ],
-    )
-    return len(rows)
-
-
-async def refresh_sort_cache(
-    appids: list[int] | None = None, *, session: AsyncSession | None = None
-) -> int:
-    """刷新 games.min_cny_fen / diff_fen / smart_score 预计算列（对齐 mv_game_sort_cache 构建 SQL）。
-
-    appids=None 全库刷新（启动 / 汇率变更）；否则增量（爬取落库后调用，
-    lowest 限定目标集合）。
-    语义：min_cny_fen = 非 CN 各区 ok 价最低 CNY 分（原始值，无则 NULL）；
-    diff_fen = MAX(CN 价 - COALESCE(最低, CN 价), 0)；smart_score 由
-    diff_fen / hl_flag / 评测数据按 scoring.py 公式重算（本函数尾部）。
-    需要 SQLite ≥ 3.33（UPDATE ... FROM）。
-
-    session 注入时不自行提交——汇率原子刷新用它把「汇率 → cny_fen →
-    games sort → bundles sort」串进同一事务（GET 只可能读到旧快照或新快照；
-    smart_score 同事务落库，排序与展示差价不跨汇率基准）。
-    """
-    
-    lowest_filter = "AND appid IN :appids" if appids else ""
-    sql = text(
-        f"""
-        WITH lowest AS (
-            SELECT appid, MIN(cny_fen) AS min_fen
-            FROM game_current_prices
-            WHERE region_code != 'CN' AND price_status = 'ok'
-              AND cny_fen IS NOT NULL AND cny_fen > 0
-              {lowest_filter}
-            GROUP BY appid
-        )
-        UPDATE games AS g SET
-            min_cny_fen = l.min_fen,
-            diff_fen = COALESCE(MAX(cn.price - COALESCE(l.min_fen, cn.price), 0), 0)
-        FROM lowest l
-        LEFT JOIN game_current_prices cn
-          ON cn.appid = l.appid AND cn.region_code = 'CN'
-         AND cn.price_status = 'ok' AND cn.price IS NOT NULL AND cn.price > 0
-        WHERE l.appid = g.appid
-        """
-    )
-    params: dict = {"appids": list(appids)} if appids else {}
-    if appids:
-        sql = sql.bindparams(bindparam("appids", expanding=True))
-
-    if session is not None:
-        result = await session.execute(sql, params)
-        await _refresh_smart_scores(session, appids)
-        return result.rowcount or 0
-
-    async with write_session(WritePriority.BACKGROUND) as own:
-        result = await own.execute(sql, params)
-        await _refresh_smart_scores(own, appids)
-        await own.commit()
-    return result.rowcount or 0
-
 
 def _build_list_item(
     game: Game,
     cn_row: GameCurrentPrice | None,
     price_rows: list,
     regions_expected: list[str] | None = None,
+    pending_units: set | None = None,
 ) -> dict:
     """对齐 route.ts buildGameResponse。cn_row=None 为锁区（无国区行，LEFT JOIN）。
 
@@ -2147,7 +1758,7 @@ def _build_list_item(
         price_map[code] = {"cents": price_cents, "cnyFen": cny_fen, "stale": stale}
 
     all_prices: dict[str, list] = {}
-    lowest_cny_fen = base_cn_price
+    lowest_cny_fen = min((v for v in (base_cn_price, game.min_cny_fen) if v is not None), default=None)
     for code, _, currency in CC_LIST:
         data = price_map.get(code.upper())
         if not data:
@@ -2156,24 +1767,7 @@ def _build_list_item(
             format_minor_units(data["cents"], currency), data["cnyFen"] or 0, data["cents"], None,
             data["stale"],
         ]
-        # 全区最低只认成功观察：stale 旧价（传输失败前的残留）不得参与
-        # isLowest 判定——否则一个转 missing 的促销区会永久压住国区徽章
-        if (
-            data["cnyFen"] is not None
-            and not data["stale"]
-            and code.upper() != "CN"
-            and (lowest_cny_fen is None or data["cnyFen"] < lowest_cny_fen)
-        ):
-            lowest_cny_fen = data["cnyFen"]
-
-    if lowest_cny_fen is None:
-        lowest_cny_fen = base_cn_price
-
-    diff = (
-        max(base_cn_price - lowest_cny_fen, 0)
-        if base_cn_price is not None and lowest_cny_fen is not None
-        else 0
-    )
+    diff = int(game.diff_fen or 0)
     discount = cn_row.discount_percent or 0 if cn_row is not None else 0
     cn_original_fen = (
         int(cn_row.original_price)
@@ -2267,17 +1861,7 @@ def _build_list_item(
         "hlFlag": game.hl_flag or 0,
         "ppFlag": game.pp_flag or 0,
         # smart 评分（0~1 加权和）与四因子拆解（实验池对照展示用）
-        "smartScore": round(
-            smart_score(
-                game.diff_fen,
-                game.positive_rate,
-                game.review_count,
-                game.hl_flag,
-                discount,
-                game.release_date,
-            ),
-            4,
-        ),
+        "smartScore": round(game.smart_score or 0, 4),
         "smartFactors": smart_factors,
         # 最近一次原价跳变时刻：永降/永涨徽章 14 天时效判据（前端判定显隐）
         "ppChangedAt": game.pp_changed_at.isoformat() if game.pp_changed_at else None,
@@ -2285,12 +1869,7 @@ def _build_list_item(
         # 价格数据状态：observedAt/freshness 是价格观察时间（≠ updatedAt 的实体
         # 更新时间）；coverage 从活表尝试状态现算（分母 = 启用区服）
         "priceData": {
-            **freshness_service.freshness_of(
-                max(
-                    (p.updated_at for p in price_rows if p.updated_at is not None),
-                    default=None,
-                )
-            ),
+            **freshness_service.regional_freshness(price_rows, regions_expected, pending_units),
             "coverage": coverage,
         },
         "familySharing": game.family_sharing or False,
@@ -2332,7 +1911,7 @@ async def retry_removed_game(appid: int) -> dict:
 
     try:
         result = await crawl_service.start_job(
-            scope="appids", appids=[int(appid)], kind="removed_retry",
+            scope="appids", appids=[int(appid)], kind="removed_retry", trigger="manual",
         )
         return {"ok": True, "jobId": result["id"], "requeued": True}
     except (RuntimeError, ValueError) as e:
@@ -2440,7 +2019,7 @@ async def restore_games(appids: list[int]) -> dict:
         from app.domains.crawl import service as crawl_service
 
         try:
-            await crawl_service.start_job(scope="appids", appids=recrawl, kind="catalog_restore")
+            await crawl_service.start_job(scope="appids", appids=recrawl, kind="catalog_restore", trigger="manual")
         except (RuntimeError, ValueError) as e:
             # 已有任务在跑 / 空列表：恢复已生效，取价留给下一轮手动刷新
             log_event(

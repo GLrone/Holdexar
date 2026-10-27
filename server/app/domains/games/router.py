@@ -134,9 +134,27 @@ async def game_history(
     region: str = Query("cn", max_length=5),
     days: int = Query(0, ge=0, le=3650),
     subId: int | None = Query(None, ge=1),
+    product: str | None = Query(None, pattern="^(unknown)$"),
 ):
-    """历史价格走势。subId 缺省=标准版；days=0=全部时间。"""
-    return await service.get_game_history(appid, region=region, days=days, sub_id=subId)
+    """历史价格走势。subId 缺省=标准版；days=0=全部时间；
+    product=unknown=商品身份未知序列（社区历史源，独立呈现）。"""
+    return await service.get_game_history(
+        appid, region=region, days=days, sub_id=subId, product=product
+    )
+
+
+@router.post("/{appid}/history/backfill")
+async def game_history_backfill(
+    appid: int,
+    region: str = Query("cn", max_length=5),
+):
+    """派发一次社区历史源回填（同键在飞直接返回运行态，不重复派发）。
+
+    只改历史事实与同步状态，不动价格事件/告警管线；派发后由前端轮询
+    本地只读的 /history 拿新点。"""
+    from app.crawler.community_history import start_backfill
+
+    return await start_backfill(appid, region)
 
 
 @router.get("/{appid}/price-context")

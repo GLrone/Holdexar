@@ -21,13 +21,14 @@ timing 只认 hl_flag 分档，不叠加 discount_percent——史低+90%off 是
 件事，不重复奖励（因子相关性）。pp_flag 是近期调价方向（新闻信号），
 与「长期低价」语义错位，不参与评分。
 
-全部在 Python 侧计算（refresh_sort_cache 落库），不依赖 SQLite 数学函数
+全部在 Python 侧计算（update_price_derived 落库），不依赖 SQLite 数学函数
 ——打包产物捆绑的 sqlite 未验证 SQLITE_ENABLE_MATH_FUNCTIONS。
 """
 from __future__ import annotations
 
 import math
 from datetime import date
+from app.crawler.utils import get_beijing_time_obj
 
 # ── 权重（调参改这里，不动公式）──
 W_SAVE = 0.50
@@ -66,7 +67,7 @@ def _release_age_years(release_date: str | None) -> float:
         day = date.fromisoformat(str(release_date)[:10])
     except ValueError:
         return 0.0
-    return max(0.0, (date.today() - day).days / 365.25)
+    return max(0.0, (get_beijing_time_obj().date() - day).days / 365.25)
 
 
 def quality_score(
