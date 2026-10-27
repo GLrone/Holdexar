@@ -516,12 +516,17 @@ async def download_update(
         await asyncio.to_thread(_extract, zip_path, staging)
         meta_path.unlink(missing_ok=True)
 
+        # 逐文件校验值入清单：换装宿主据此核验暂存载荷——解包后到换装前
+        # 的窗口期内文件缺失/被改（含杀软隔离）都能在换装前被拒
+        payload_root = staging / APP_NAME
+        files = await asyncio.to_thread(_payload_hashes, payload_root)
         manifest = {
             "tag": tag,
             "sha256": expected_sha256,
             "ready": True,
             "attempt_id": str(uuid.uuid4()),
             "source_version": APP_VERSION,
+            "files": files,
             "notes": notes or "",
         }
         (staging / STAGING_MANIFEST_NAME).write_text(
@@ -810,6 +815,14 @@ def _extract(zip_path: Path, staging: Path) -> None:
     with zipfile.ZipFile(zip_path) as zf:
         zf.extractall(staging)
     zip_path.unlink(missing_ok=True)
+
+
+def _payload_hashes(payload_root: Path) -> dict[str, str]:
+    """暂存载荷逐文件 sha256（相对载荷根，posix 路径键）。"""
+    return {
+        path.relative_to(payload_root).as_posix(): _sha256_of(path)
+        for path in sorted(payload_root.rglob("*")) if path.is_file()
+    }
 
 
 # ── 换装状态查询 ─────────────────────────────────────────────────────

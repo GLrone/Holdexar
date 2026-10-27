@@ -687,3 +687,34 @@ def test_strict_diagnosis_writer_does_not_hide_storage_failure(tmp_path, monkeyp
     with pytest.raises(OSError, match="disk failure"):
         update_host._write_diagnosis(tmp_path, {"stage": "committed"}, strict=True)
     assert not (tmp_path / "logs/update-diagnosis.json").exists()
+
+
+def test_verify_staging_payload_accepts_matching_files(tmp_path):
+    import hashlib
+
+    payload = tmp_path / APP_NAME
+    payload.mkdir()
+    (payload / "version.txt").write_text("1.2.3", encoding="utf-8")
+    manifest = {"files": {"version.txt": hashlib.sha256(b"1.2.3").hexdigest()}}
+    assert update_host._verify_staging_payload(tmp_path, manifest) == ""
+
+
+def test_verify_staging_payload_rejects_tampered_file(tmp_path):
+    import hashlib
+
+    payload = tmp_path / APP_NAME
+    payload.mkdir()
+    (payload / "version.txt").write_text("1.2.3", encoding="utf-8")
+    manifest = {"files": {"version.txt": hashlib.sha256(b"tampered").hexdigest()}}
+    assert "校验不符" in update_host._verify_staging_payload(tmp_path, manifest)
+
+
+def test_verify_staging_payload_rejects_missing_file(tmp_path):
+    payload = tmp_path / APP_NAME
+    payload.mkdir()
+    manifest = {"files": {"gone.exe": "0" * 64}}
+    assert "缺失" in update_host._verify_staging_payload(tmp_path, manifest)
+
+
+def test_verify_staging_payload_skips_legacy_manifest(tmp_path):
+    assert update_host._verify_staging_payload(tmp_path, {"tag": "v1"}) == ""
