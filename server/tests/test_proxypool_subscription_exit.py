@@ -40,13 +40,7 @@ async def _sub(label: str, url: str) -> int:
 
 async def _node(node_id: str, sub_id: int, state: str = "ACTIVE") -> None:
     async with get_session_factory()() as s:
-        s.add(ProxyNode(node_id=node_id, fingerprint=node_id,
-                        runtime_name=f"{sub_id}|{node_id}",
-                        subscription_id=sub_id, original_name=node_id,
-                        proxy_type="http", server="10.0.0.1",
-                        normalized_config={"name": node_id, "type": "http",
-                                           "server": "10.0.0.1", "port": 1},
-                        state=state, first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
+        s.add(ProxyNode(node_id=node_id, runtime_name=f'{sub_id}|{node_id}', subscription_id=sub_id, original_name=node_id, proxy_type='http', server='10.0.0.1', normalized_config={'name': node_id, 'type': 'http', 'server': '10.0.0.1', 'port': 1}, state=state, first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
         await s.commit()
 
 

@@ -100,11 +100,7 @@ async def _add(state: str, runtime_name: str, *, server: str) -> None:
     }
     fp = node_fingerprint(config)
     async with get_session_factory()() as s:
-        s.add(ProxyNode(
-            node_id=fp, fingerprint=fp, runtime_name=runtime_name,
-            proxy_type="ss", server=server, normalized_config=config, state=state,
-            first_seen=NOW, last_seen=NOW, last_source_seen=NOW,
-        ))
+        s.add(ProxyNode(node_id=fp, runtime_name=runtime_name, proxy_type='ss', server=server, normalized_config=config, state=state, first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
         # 合格集口径含「至少一个当前来源」：直接登记的行也要给一条来源
         await s.execute(update(ProxyNode)
             .where(ProxyNode.node_id == fp)

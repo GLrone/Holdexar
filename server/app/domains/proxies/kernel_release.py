@@ -7,7 +7,7 @@ import platform
 MIHOMO_VERSION = "v1.19.32"
 
 # 通道链：国内直连 GitHub 发布资产基本不可用，镜像优先、直连兜底。
-# 与 app/core/updater.py、scripts/fetch_seed.py 的镜像链同源，改动请三处对齐。
+# 与 app/core/updater.py 的镜像链同源，改动请两处对齐。
 MIRRORS: tuple[str, ...] = ("https://ghfast.top/", "https://gh-proxy.com/", "")
 
 _GITHUB = "https://github.com"

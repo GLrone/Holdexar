@@ -15,6 +15,7 @@ import base64
 import ctypes
 import io
 import logging
+import threading
 import os
 import re
 import secrets
@@ -245,6 +246,9 @@ def ensure_kernel_files(kernel_path: Path) -> dict:
     return result
 
 
+_KERNEL_FILES_LOCK = threading.Lock()
+
+
 def ensure_kernel(data_dir: Path) -> dict:
     """随包内核就位（data_dir 版本）：把内核与许可原文补进 data/clash/。
 
@@ -253,33 +257,34 @@ def ensure_kernel(data_dir: Path) -> dict:
      "upgraded": str | None}；发行包缺内核（源码 clone 未补资产）时
     kernelReady=False，由调用方决定是回退网络下载还是提示用户。
     """
-    result = _copy_bundled(kernel_dir(data_dir), (kernel_filename(),))
-    upgrade = _maybe_upgrade_kernel(kernel_dir(data_dir))
-    if upgrade:
-        result["upgraded"] = upgrade
-    ready = kernel_exe(data_dir).is_file()
-    if result["copied"]:
-        log_event(
-            logger,
-            "随包内核资产已就位",
-            tag="成功",
-            detail={"文件": "、".join(result["copied"])},
-        )
-    if not ready:
-        log_event(
-            logger,
-            "随包内核不可用，将回退网络下载",
-            tag="降级",
-            level=logging.WARNING,
-            detail={"目录": str(bundled_clash_dir()), "缺失文件": kernel_filename()},
-        )
-    return {
-        "kernelReady": ready,
-        "copied": result["copied"],
-        "missing": result["missing"],
-        "upgraded": upgrade,
-        "bundleDir": str(bundled_clash_dir()),
-    }
+    with _KERNEL_FILES_LOCK:
+        result = _copy_bundled(kernel_dir(data_dir), (kernel_filename(),))
+        upgrade = _maybe_upgrade_kernel(kernel_dir(data_dir))
+        if upgrade:
+            result["upgraded"] = upgrade
+        ready = kernel_exe(data_dir).is_file()
+        if result["copied"]:
+            log_event(
+                logger,
+                "随包内核资产已就位",
+                tag="成功",
+                detail={"文件": "、".join(result["copied"])},
+            )
+        if not ready:
+            log_event(
+                logger,
+                "随包内核不可用，将回退网络下载",
+                tag="降级",
+                level=logging.WARNING,
+                detail={"目录": str(bundled_clash_dir()), "缺失文件": kernel_filename()},
+            )
+        return {
+            "kernelReady": ready,
+            "copied": result["copied"],
+            "missing": result["missing"],
+            "upgraded": upgrade,
+            "bundleDir": str(bundled_clash_dir()),
+        }
 
 
 def decode_profile_title(raw: str | None) -> str | None:
@@ -1038,13 +1043,6 @@ def write_subscription_meta(data_dir: Path, sub_id: int, meta: dict) -> None:
         )
 
 
-def invalidate_subscription_cache_identity(data_dir: Path, sub_id: int) -> None:
-    """Mark an existing raw cache as unrelated to the subscription's new URL."""
-    meta = read_subscription_meta(data_dir, sub_id)
-    meta["urlIdentity"] = None
-    write_subscription_meta(data_dir, sub_id, meta)
-
-
 def remove_subscription_artifacts(data_dir: Path, sub_id: int) -> list[str]:
     """删除一条订阅的全部本地缓存产物（原文 + 生成配置 + 元数据），返回删掉的文件名。
 
@@ -1635,97 +1633,85 @@ class ClashRuntime:
         saved = [proxy_url] if isinstance(proxy_url, str) else list(proxy_url or [])
         if meta_id is not None:
             from datetime import datetime
+            from sqlalchemy import func, select
 
-            from app.core.database import get_session_factory
+            from app.core.database import WritePriority, get_session_factory, write_session
             from app.domains.proxies.models import ProxySubscription
             from app.domains.proxies.subscription_secret import open_url
-            from app.domains.proxypool.bootstrap import sync_subscriptions
+            from app.domains.proxypool.bootstrap import subscription_sync_lock, sync_subscriptions
+            from app.domains.proxypool.models import ProxyNode, SubscriptionSnapshot, is_info_placeholder, node_fingerprint, subscription_tag
+            from app.domains.proxypool.registry import _apply_nodes
 
-            async with get_session_factory()() as session:
-                subscription = await session.get(ProxySubscription, meta_id)
-                if subscription is not None:
-                    stored_url = open_url(subscription.url)
-                    if stored_url != sub_url:
+            sync = None
+            if not snapshot_only:
+                async with get_session_factory()() as session:
+                    subscription = await session.get(ProxySubscription, meta_id)
+                    if subscription is None or open_url(subscription.url) != sub_url:
                         raise ValueError("订阅地址与缓存归属不一致")
-                    sync = None
-                    if snapshot_only:
-                        snapshot = await latest_snapshot(session, meta_id, url=sub_url)
-                        cached = True
-                    else:
-                        sync = await sync_subscriptions(
-                            session, data_dir=data_dir, now=datetime.now(),
-                            only_sub_id=meta_id, saved_proxies=saved,
-                        )
-                        snapshot = sync.snapshots.get(meta_id)
-                        cached = snapshot is None
-                    if snapshot is None and not snapshot_only:
-                        snapshot = await latest_snapshot(
-                            session, meta_id, url=sub_url,
-                        )
+                    sync = await sync_subscriptions(session, data_dir=data_dir, now=datetime.now(),
+                                                    only_sub_id=meta_id, saved_proxies=saved)
+            cached = snapshot_only or meta_id not in sync.snapshots
+            latest_id = select(func.max(SubscriptionSnapshot.id)).where(
+                SubscriptionSnapshot.subscription_id == meta_id, SubscriptionSnapshot.status == "OK"
+            )
+            async with subscription_sync_lock(meta_id):
+                async with get_session_factory()() as session:
+                    subscription = await session.get(ProxySubscription, meta_id)
+                    if subscription is None or open_url(subscription.url) != sub_url:
+                        raise ValueError("订阅地址与缓存归属不一致")
+                    baseline_id = await session.scalar(latest_id)
+                    baseline_identity = subscription.cache_url_identity
+                    snapshot = await latest_snapshot(session, meta_id, url=sub_url)
+                    cached_meta = read_subscription_meta(data_dir, meta_id)
                     if snapshot is None:
-                        if snapshot_only:
-                            cached_meta = read_subscription_meta(data_dir, meta_id)
-                            requested_identity = subscription_url_identity(sub_url)
-                            stored_identity = subscription.cache_url_identity
-                            if stored_identity is not None and stored_identity != requested_identity:
-                                raise RuntimeError(
-                                    "没有可恢复的成功快照或有效订阅缓存"
-                                )
-                            try:
-                                cached_raw = path.read_bytes()
-                                cached_nodes = parse_nodes(
-                                    cached_raw, detect_format(cached_raw),
-                                )
-                            except Exception as exc:  # noqa: BLE001
-                                raise RuntimeError(
-                                    "没有可恢复的成功快照或有效订阅缓存"
-                                ) from exc
-                            return {
-                                "path": str(path),
-                                "title": cached_meta.get("title") or
-                                    subscription_auto_name({}, sub_url),
-                                "userinfo": cached_meta.get("userinfo"),
-                                "nodes": len(cached_nodes),
-                                "cached": True,
-                                "_sync_result": None,
-                            }
-                        detail = (sync.failures.get(meta_id) if sync is not None else None)
-                        detail = detail or "订阅没有可恢复的成功快照"
-                        raise RuntimeError(detail)
-
+                        if not snapshot_only:
+                            raise RuntimeError(sync.failures.get(meta_id) or "订阅没有可恢复的成功快照")
+                        if baseline_identity is not None and baseline_identity != subscription_url_identity(sub_url):
+                            raise RuntimeError("没有可恢复的成功快照或有效订阅缓存")
+                        try:
+                            runtime_source = path.read_bytes()
+                            nodes = parse_nodes(runtime_source, detect_format(runtime_source))
+                        except Exception as exc:  # noqa: BLE001
+                            raise RuntimeError("没有可恢复的成功快照或有效订阅缓存") from exc
+                        title = cached_meta.get("title") or subscription_auto_name({}, sub_url)
+                        userinfo = cached_meta.get("userinfo")
+                    else:
+                        nodes = [node for node in snapshot.nodes if not is_info_placeholder(str(node.get("name") or ""))]
+                        if snapshot.provider_nodes:
+                            from app.domains.proxies.runtime_config import expand_provider_nodes
+                            runtime_source = expand_provider_nodes(snapshot.raw_content.decode("utf-8"), snapshot.provider_nodes).encode("utf-8")
+                        else:
+                            runtime_source = snapshot.raw_content
+                        headers = httpx.Headers({key: value for key, value in {
+                            "profile-title": snapshot.profile_title, "content-disposition": snapshot.content_disposition,
+                        }.items() if value})
+                        title = subscription_auto_name(headers, sub_url)
+                        userinfo = snapshot.userinfo
+                        if cached:
+                            title = cached_meta.get("title") or title
+                            userinfo = cached_meta.get("userinfo") or userinfo
+                    identities = {node_fingerprint(node, subscription_tag(sub_url)) for node in nodes}
+                    registered = set((await session.execute(select(ProxyNode.node_id).where(
+                        ProxyNode.node_id.in_(identities)
+                    ))).scalars())
+                if identities - registered:
+                    async with write_session(WritePriority.BACKGROUND) as session:
+                        current = await session.get(ProxySubscription, meta_id)
+                        if (current is None or open_url(current.url) != sub_url
+                                or current.cache_url_identity != baseline_identity
+                                or await session.scalar(latest_id) != baseline_id):
+                            raise RuntimeError("订阅缓存恢复期间来源已变化，未登记旧节点")
+                        await _apply_nodes(session, subscription_id=meta_id, nodes=nodes,
+                                           now=datetime.now(), tag=subscription_tag(sub_url), restore_only=True)
+                        await session.commit()
+                # 正文与sidecar读写均在写闸外，缓存不伪造成功抓取或推进健康状态。
+                if snapshot is not None:
                     path.parent.mkdir(parents=True, exist_ok=True)
-                    if snapshot.provider_nodes:
-                        from app.domains.proxies.runtime_config import expand_provider_nodes
-
-                        runtime_source = expand_provider_nodes(
-                            snapshot.raw_content.decode("utf-8"), snapshot.provider_nodes
-                        ).encode("utf-8")
-                    else:
-                        runtime_source = snapshot.raw_content
                     path.write_bytes(runtime_source)
-                    headers = httpx.Headers({
-                        key: value for key, value in {
-                            "profile-title": snapshot.profile_title,
-                            "content-disposition": snapshot.content_disposition,
-                        }.items() if value
-                    })
-                    title = subscription_auto_name(headers, sub_url)
-                    userinfo = snapshot.userinfo
-                    if not cached:
-                        write_subscription_meta(
-                            data_dir, meta_id,
-                            {"title": title, "userinfo": userinfo,
-                             "fetchedAt": int(time.time() * 1000)},
-                        )
-                    else:
-                        cached_meta = read_subscription_meta(data_dir, meta_id)
-                        title = cached_meta.get("title") or title
-                        userinfo = cached_meta.get("userinfo") or userinfo
-                    return {
-                        "path": str(path), "title": title, "userinfo": userinfo,
-                        "nodes": snapshot.node_count, "cached": cached,
-                        "_sync_result": sync,
-                    }
+                if not cached:
+                    write_subscription_meta(data_dir, meta_id, {"title": title, "userinfo": userinfo})
+                return {"path": str(path), "title": title, "userinfo": userinfo,
+                        "nodes": len(nodes), "cached": cached, "_sync_result": sync}
 
         raise RuntimeError("订阅缓存归属未解析：目标路径不是 clash-sub-{id} 形态")
 

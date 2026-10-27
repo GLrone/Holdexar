@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -13,19 +14,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.database import Base
 from app.domains.proxies import clash_manager, service as proxies_service
-from app.domains.proxies.models import ClashNode, Proxy, ProxySubscription
+from app.domains.proxies.models import Proxy, ProxySubscription
+from app.domains.proxypool.models import ProxyNode, node_fingerprint, subscription_tag
 
 SUB_URL = "https://example.com/sub?token=abc"
 
 
 @pytest.mark.asyncio
 async def test_expired_subscription_old_healthy_nodes_are_not_available(db, monkeypatch):
+    monkeypatch.setattr(clash_manager.runtime, "_startup_text", yaml.safe_dump({"proxies": [NODE_CONFIGS["one"]]}))
     async with db() as session:
         sub = ProxySubscription(kind="clash", url=SUB_URL, last_stats={"traffic": "expire=1"})
         session.add(sub)
         await session.flush()
         sid = sub.id
-        session.add(ClashNode(subscription_id=sid, name="one", exit_ip="1.1.1.1", status="ok"))
+        session.add(ProxyNode(
+            node_id=node_fingerprint(NODE_CONFIGS["one"], subscription_tag(SUB_URL)), subscription_id=sid, original_name="one",
+            runtime_name=f"{sid}|one", proxy_type="http", normalized_config=NODE_CONFIGS["one"],
+            state="ACTIVE", last_l2_at=proxies_service.get_beijing_time_obj(),
+        ))
         await session.commit()
     monkeypatch.setattr(clash_manager.runtime, "status", lambda: {
         "running": True, "port": 7890, "configPath": None, "subscriptionUrl": SUB_URL,
@@ -34,23 +41,40 @@ async def test_expired_subscription_old_healthy_nodes_are_not_available(db, monk
     assert stats["clash"]["nodes"] == 1
     assert stats["clash"]["okNodes"] == 0 and stats["available"] == 0
 
-CONFIG_TEXT = f"""mixed-port: 7890
-proxies:
-  - name: 节点A
-    type: ss
-  - name: 节点B
-    type: ss
-  - name: 节点C
-    type: ss
-  - name: 节点D
-    type: ss
-  - name: 节点E
-    type: ss
-proxy-groups:
-  - name: GLOBAL
-    type: select
-{SUB_URL}
-"""
+NODE_CONFIGS = {name: {"name": name, "type": "http", "server": "127.0.0.1", "port": 10000+i}
+                for i,name in enumerate(["节点A", "节点B", "节点C", "节点D", "节点E", "旧节点", "one"])}
+CONFIG_TEXT = yaml.safe_dump({"mixed-port": 7890, "proxies": [NODE_CONFIGS[name] for name in list(NODE_CONFIGS)[:5]]})
+
+
+@pytest.fixture(autouse=True)
+def _runtime_facts(monkeypatch):
+    monkeypatch.setattr(clash_manager.runtime, "subscription_url", SUB_URL)
+    monkeypatch.setattr(clash_manager.runtime, "_startup_text", CONFIG_TEXT)
+
+
+@pytest.mark.asyncio
+async def test_running_old_url_remains_readable_without_rebinding_source(db, monkeypatch):
+    from sqlalchemy import select
+    config = NODE_CONFIGS["one"]
+    identity = node_fingerprint(config, subscription_tag(SUB_URL))
+    async with db() as session:
+        sub = ProxySubscription(kind="clash", url="https://example.test/new-url")
+        session.add(sub)
+        await session.flush()
+        sub_id = sub.id
+        session.add(ProxyNode(node_id=identity, runtime_name=f"{sub_id}|one", subscription_id=None,
+                              original_name="one", proxy_type="http", normalized_config=config,
+                              state="ACTIVE", last_l2_at=proxies_service.get_beijing_time_obj()))
+        await session.commit()
+    status = {"running": True, "configPath": f"clash-sub-{sub_id}.runtime.yaml"}
+    monkeypatch.setattr(clash_manager.runtime, "_startup_text", yaml.safe_dump({"proxies": [config]}))
+    monkeypatch.setattr(clash_manager.runtime, "status", lambda: status)
+    assert (await proxies_service.pool_stats())["clash"]["nodes"] == 1
+    assert (await proxies_service.clash_nodes_overview())["nodes"][0]["name"] == "one"
+    with pytest.raises(ValueError, match="不一致"):
+        await proxies_service._runtime_check_nodes(status, None)
+    async with db() as session:
+        assert (await session.scalar(select(ProxyNode))).subscription_id is None
 
 
 @pytest.fixture
@@ -78,16 +102,20 @@ async def test_pool_stats_exit_ip_dedup(db, tmp_path, monkeypatch):
         session.add(sub)
         await session.flush()
         sub_id = sub.id
-        session.add_all(
-            [
-                ClashNode(subscription_id=sub_id, name="节点A", exit_ip="1.2.3.4", status="ok"),
-                ClashNode(subscription_id=sub_id, name="节点B", exit_ip="1.2.3.4", status="ok"),
-                ClashNode(subscription_id=sub_id, name="节点C", exit_ip="5.6.7.8", status="ok"),
-                ClashNode(subscription_id=sub_id, name="节点D", exit_ip="9.9.9.9", status="dead"),
-                ClashNode(subscription_id=sub_id, name="节点E", exit_ip=None, status="ok"),
-                ClashNode(subscription_id=sub_id, name="旧节点", exit_ip="8.8.8.8", status="ok"),
-            ]
-        )
+        for name, exit_ip, state in (
+            ("节点A", "1.2.3.4", "ACTIVE"),
+            ("节点B", "1.2.3.4", "ACTIVE"),
+            ("节点C", "5.6.7.8", "ACTIVE"),
+            ("节点D", "9.9.9.9", "DEAD"),
+            ("节点E", None, "ACTIVE"),
+            ("旧节点", "8.8.8.8", "ACTIVE"),
+        ):
+            session.add(ProxyNode(
+                node_id=node_fingerprint(NODE_CONFIGS[name], subscription_tag(SUB_URL)), subscription_id=sub_id,
+                original_name=name, runtime_name=f"{sub_id}|{name}",
+                proxy_type="http", normalized_config=NODE_CONFIGS[name], state=state,
+                exit_ip=exit_ip, last_l2_at=proxies_service.get_beijing_time_obj(),
+            ))
         session.add_all(
             [
                 Proxy(scheme="http", host="1.1.1.1", port=8080, enabled=True, status="ok"),

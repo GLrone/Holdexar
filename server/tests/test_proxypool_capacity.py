@@ -35,12 +35,7 @@ def _node(
     name: str | None = None,
 ) -> ProxyNode:
     """构造一条台账行：只填容量模型用得到的字段。"""
-    return ProxyNode(
-        id=idx, node_id=f"n{idx}", fingerprint=f"f{idx}",
-        runtime_name=name or f"1|node{idx}", proxy_type="ss",
-        server=f"s{idx}.example.net", state=state, exit_ip=exit_ip,
-        last_l1_at=l1, last_l2_at=l2,
-    )
+    return ProxyNode(id=idx, node_id=f'n{idx}', runtime_name=name or f'1|node{idx}', proxy_type='ss', server=f's{idx}.example.net', state=state, exit_ip=exit_ip, last_l1_at=l1, last_l2_at=l2)
 
 
 # ── 1. 出口去重 ──────────────────────────────────────────────────

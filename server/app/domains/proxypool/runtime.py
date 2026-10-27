@@ -35,7 +35,6 @@ import httpx
 import yaml
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core import orchestration as events
 from app.core.logging import log_event
 from app.core.net import free_local_port as _free_local_port
 from app.core.net import port_listening as _port_listening
@@ -862,13 +861,11 @@ async def rebuild_runtime(
         auxiliary_names=set(build.auxiliary_names),
     )
     if not ledger.ok:
-        # 独立会话：本函数紧接着抛异常，调用方多半整事务回滚——事件必须自己落库，
-        # 否则「重建被对账拒绝」这个事实最需要留痕的一条，恰恰会随回滚一起消失
-        await events.record(
-            events.KIND_RECONCILE_REJECTED,
+        log_event(
+            logger,
             f"重建后对账失败：缺 {sorted(ledger.missing)}，多 {sorted(ledger.unexpected)}",
-            level=events.LEVEL_ERROR,
-            payload={
+            level=logging.ERROR,
+            detail={
                 "phase": "rebuild",
                 "registryCount": len(ledger.registry_names),
                 "poolCount": len(ledger.pool_names),

@@ -34,7 +34,6 @@ from . import clash_manager, credentials
 from .models import (
     ADMISSION_ACTIVE,
     ADMISSION_CANDIDATE,
-    ClashNode,
     Proxy,
     ProxyEvent,
     ProxySubscription,
@@ -94,11 +93,9 @@ SPEED_FLOOR = 0.5  # 最慢出口仍保留的速度分（不归零：否则慢�
 UNTESTED_SPEED = 0.7  # 未测速节点的速度分：中游，够它分到流量被测出来
 WEIGHT_SCALE = 100_000  # 权重分辨率，不影响各出口的相对份额
 
-# ── Clash 节点兼容投影与探测节流 ───────────────────────────────
+# ── Clash 订阅刷新与探测复用 ───────────────────────────────
 SUBSCRIPTION_REFRESH_HOURS = 6  # 订阅重拉间隔（与节点体检同拍，跨重启靠 KV 门槛）
 FIRST_CHECK_REUSE_MINUTES = 5  # 启动/切换触发的首检复用窗口：窗口内检测过就沿用账本，不重测
-# 失败冷却递增（分钟）：30min → 1h → 2h → 4h → 8h → 24h 封顶
-_FAIL_COOLDOWN_MINUTES = [30, 60, 120, 240, 480, 1440]
 
 
 def _naive(dt: datetime) -> datetime:
@@ -689,7 +686,7 @@ async def update_subscription(
     """编辑订阅：改名 + 换链接 + 自动更新开关；链接变更的 clash 订阅**保存即自动重拉**。
 
     链接是订阅的唯一身份——换了链接等于换了一个机场，磁盘上的 config.yaml
-    与 clash_nodes 账本都还属于旧链接，不重拉就一直对不上。重拉通道同
+    与节点来源都还属于旧链接，不重拉就一直对不上。重拉通道同
     「重拉」按钮：直连优先，失败自动借道项目保存的可用代理（见
     _saved_proxy_candidates）。
 
@@ -740,12 +737,6 @@ async def update_subscription(
                 "autoRefresh": bool(sub.auto_refresh)
                 if sub.auto_refresh is not None else True,
             }
-        if url_changed and result["kind"] == "clash":
-            from app.core.config import get_settings
-
-            clash_manager.invalidate_subscription_cache_identity(
-                get_settings().data_dir, sub_id,
-            )
     if url_changed and result["kind"] == "clash":
         try:
             sync = await refresh_clash_subscription(sub_id, auto_switch=True)
@@ -857,9 +848,7 @@ async def refresh_clash_subscription(
     current_names = set(clash_manager.parse_node_names(
         Path(meta["path"]).read_text(encoding="utf-8", errors="ignore")
     ))
-    pruned = 0
     if current_names:
-        pruned = await prune_clash_node_ledger(sub_id, current_names)
 
         # 存活统计读权威节点账本：新下载节点尚无证据 → 从 0 起算
         from app.domains.proxypool.models import ProxyNode
@@ -927,7 +916,6 @@ async def refresh_clash_subscription(
         "total": fields.get("total", 0),
         "usedCache": meta.get("cached", False),
         "restarted": restarted,
-        "prunedLedger": pruned,
     }
     if _include_sync:
         result["_syncResult"] = meta.get("_sync_result")
@@ -1047,6 +1035,66 @@ def _brief_error(exc: Exception) -> str:
     """给用户看的失败原因一句话：保留状态码/关键信息，剥掉多行 traceback 尾巴。"""
     text = " ".join(str(exc).split())
     return text if len(text) <= 160 else text[:157] + "…"
+
+
+async def ensure_clash_running(*, snapshot_only: bool = True) -> None:
+    """按现有自启设置和本地订阅快照确保通用内核运行。"""
+    try:
+        from app.core.config import get_settings
+        from app.domains.proxies import service as proxies_service
+        from app.domains.settings.service import get_value
+
+        if clash_manager.runtime.status().get("running"):
+            return
+        if not await get_value("proxy.autostart", True):
+            log_event(logger, "内核自启开关已关闭，跳过 Clash 内核自启", tag="跳过")
+            return
+
+        settings = get_settings()
+        await asyncio.to_thread(clash_manager.ensure_kernel, settings.data_dir)
+        detect = clash_manager.detect_kernel(settings.data_dir)
+        if not detect["found"]:
+            log_event(logger, "本机没有 Clash 内核，跳过内核自启", tag="跳过")
+            return
+        subs = await proxies_service.list_subscriptions("clash", reveal=True)
+        usable = [s for s in subs if not s.get("deprecated")]
+        if not usable:
+            if subs:
+                log_event(
+                    logger,
+                    "Clash 订阅当前全部不可用，等待订阅或节点恢复",
+                    tag="跳过",
+                    level=logging.WARNING,
+                )
+            else:
+                log_event(logger, "还没有 Clash 订阅，跳过内核自启", tag="跳过")
+            return
+        # 取配置按候选遍历（新→旧）：某条订阅链接失效且无本地缓存时降级到
+        # 下一条，内核起不来不允许是「下载失败」一个原因——节点好不好交给
+        # 启动后的首检与定时体检
+        try:
+            picked = await proxies_service.resolve_startable_clash(
+                settings.data_dir, snapshot_only=snapshot_only
+            )
+        except ValueError as e:
+            log_event(
+                logger,
+                "内核自启放弃，没有能选出的可用订阅",
+                tag="跳过",
+                level=logging.WARNING,
+                detail={"原因": str(e)},
+            )
+            return
+        sub = picked["subscription"]
+        config_path = picked["configPath"]
+        port_options = await proxies_service.kernel_port_options()
+        status = await clash_manager.runtime.ensure_running(
+            detect["path"], config_path, subscription_url=sub["url"],
+            **port_options,
+        )
+        log_event(logger, "Clash 内核已随服务自启", detail={"端口": status.get("port")})
+    except Exception:  # noqa: BLE001 —— 自启失败不阻塞服务
+        log_event(logger, "Clash 内核自启失败，不影响服务运行", level=logging.ERROR, exc_info=True)
 
 
 async def maybe_refresh_active_clash_subscription() -> dict:
@@ -1487,8 +1535,7 @@ async def add_subscription(kind: str, url: str, label: str | None = None) -> dic
 
 
 async def delete_subscription(sub_id: int) -> bool:
-    """删除订阅 + 级联清理两本账：clash_nodes（本域）整批删；clash 订阅同时
-    退出生产池——该订阅提供的节点行随退出一并删除（节点跟着订阅走，订阅没了
+    """删除订阅并退出生产池——该订阅提供的节点行随退出一并删除（节点跟着订阅走，订阅没了
     节点不该留），快照行与磁盘产物同批回收。"""
     from app.core.config import get_settings
     from app.domains.proxypool.subscription import snapshot_dir
@@ -1497,15 +1544,11 @@ async def delete_subscription(sub_id: int) -> bool:
         sub = await session.get(ProxySubscription, sub_id)
         if sub is None:
             return False
-        await session.execute(
-            delete(ClashNode).where(ClashNode.subscription_id == sub_id)
-        )
-        exit_result = None
         if sub.kind == "clash":
             from app.domains.proxypool.admission import exit_from_production
             from app.domains.proxypool.models import SubscriptionSnapshot
 
-            exit_result = await exit_from_production(
+            await exit_from_production(
                 session, subscription_id=sub_id, now=_naive(get_beijing_time_obj())
             )
             await session.execute(
@@ -1520,24 +1563,9 @@ async def delete_subscription(sub_id: int) -> bool:
     )
     # 缓存正文与响应头元数据同批回收：只删行不删文件会在 clash 目录留下无人
     # 引用的孤儿（旧订阅内容继续占盘，且「已删除」在文件系统层面不成立）。
-    removed_files = clash_manager.remove_subscription_artifacts(
+    clash_manager.remove_subscription_artifacts(
         get_settings().data_dir, sub_id
     )
-    # 节点随订阅删除必须留痕（与退出端点同一理由）：否则事后只见节点消失、找不到原因
-    if exit_result is not None and exit_result.exited:
-        from app.core import orchestration as events
-
-        await events.record(
-            events.KIND_SUBSCRIPTION_EXITED,
-            f"订阅 {sub_id} 删除，随删退出生产池：删除节点 {exit_result.removed_sources} 行",
-            level=events.LEVEL_WARN,
-            payload={
-                "subscriptionId": sub_id,
-                "deletedNodes": exit_result.removed_sources,
-                "deleted": True,
-                "removedCacheFiles": removed_files,
-            },
-        )
     # 删到一条不剩即无出口：回退直连（事务外，避免与写闸重入）
     await maybe_revert_to_direct()
     return True
@@ -1606,7 +1634,7 @@ async def import_plain_subscription(sub_id: int, timeout: float = 30.0) -> dict:
     if not sub_url:
         raise ValueError(UNREADABLE_MESSAGE)
     from app.core.config import get_settings
-    from app.domains.proxypool.bootstrap import _healthy_pool_channels, default_kernel_proxy
+    from app.domains.proxypool.bootstrap import _healthy_pool_channels, default_kernel_proxy, subscription_sync_lock
     from app.domains.proxypool.subscription import (
         DEFAULT_FETCH_TIMEOUT,
         SnapshotError,
@@ -1679,7 +1707,7 @@ async def import_plain_subscription(sub_id: int, timeout: float = 30.0) -> dict:
         raise ValueError("订阅内容没有可解析的代理行")
 
     snapshot = build_snapshot(sub_id, sub_url, fetched, parsed, now=fetched_at)
-    async with write_session(WritePriority.BACKGROUND) as session:
+    async with subscription_sync_lock(sub_id), write_session(WritePriority.BACKGROUND) as session:
         current = await session.get(ProxySubscription, sub_id)
         if current is None or open_url(current.url) != sub_url:
             raise ValueError("订阅地址在刷新期间发生变化，本次结果未应用")
@@ -1776,30 +1804,6 @@ async def _fetch_exit_ip(client: httpx.AsyncClient) -> str | None:
         except Exception:  # noqa: BLE001
             continue
     return None
-
-
-async def _active_clash_subscription_id(status: dict) -> int | None:
-    """内核正在跑的订阅 id：按启动时登记的订阅 URL 匹配 > 最近一条 clash 订阅。
-
-    节点检测与统计（pool_stats）共用——「当前订阅」只有这一个定义。
-    兜底取最近一条是内核没带归属信息（登记机制上线前启动）时的兼容口径：
-    无法判定时检测结果记到最近添加的订阅账本。
-    """
-    async with get_session_factory()() as session:
-        subs = (
-            await session.execute(
-                select(ProxySubscription)
-                .where(ProxySubscription.kind == "clash")
-                .order_by(ProxySubscription.id)
-            )
-        ).scalars().all()
-    active_url = (status.get("subscriptionUrl") or "").strip()
-    if active_url:
-        for s in subs:
-            # 行内是密文，与内核登记的明文归属按解密口径比对
-            if open_url(s.url) == active_url:
-                return s.id
-    return subs[-1].id if subs else None
 
 
 # ─── Clash 节点检测会话（进度快照）──────────────────────────────
@@ -2075,6 +2079,39 @@ def _mark_same_exit(results: list[dict], order: dict[str, int]) -> None:
             row["duplicate"] = row is not primary
 
 
+async def _runtime_check_nodes(status: dict, subscription_id: int | None, *, require_current_url: bool = True):
+    """以运行正文及URL确定本轮节点身份；缺少归属证据时不猜订阅。"""
+    from app.domains.proxypool.models import ProxyNode, node_fingerprint, subscription_tag
+    from app.domains.proxypool.subscription import detect_format, parse_nodes
+
+    url = clash_manager.runtime.subscription_url
+    config_text = clash_manager.runtime._startup_text
+    if not url or not config_text:
+        raise ValueError("内核运行配置或订阅归属不可确认，请重新启动订阅")
+    path_id = re.fullmatch(r"clash-sub-(\d+)(?:\.runtime)?\.yaml", Path(status.get("configPath") or "").name)
+    running_id = int(path_id.group(1)) if path_id else None
+    if subscription_id is not None and running_id is not None and subscription_id != running_id:
+        raise ValueError("检测订阅与内核实际运行订阅不一致")
+    async with get_session_factory()() as session:
+        subs = (await session.execute(select(ProxySubscription).where(
+            ProxySubscription.kind == "clash"
+        ))).scalars().all()
+        matches = [sub for sub in subs if (open_url(sub.url) == url or (not require_current_url and sub.id == running_id))
+                   and (subscription_id is None or sub.id == subscription_id)
+                   and (running_id is None or sub.id == running_id)]
+        if len(matches) != 1:
+            raise ValueError("检测订阅与内核实际运行订阅不一致")
+        sub_id = matches[0].id
+        nodes = parse_nodes(config_text.encode("utf-8"), detect_format(config_text.encode("utf-8")))
+        node_ids = {str(node["name"]): node_fingerprint(node, subscription_tag(url)) for node in nodes}
+        rows = (await session.execute(select(ProxyNode).where(ProxyNode.node_id.in_(node_ids.values())))).scalars().all()
+    by_id = {node.node_id: node for node in rows}
+    if any(identity not in by_id or by_id[identity].subscription_id not in (None, sub_id)
+           for identity in node_ids.values()):
+        raise ValueError("运行节点身份未登记，体检未开始；请刷新订阅后重试")
+    return sub_id, url, config_text, node_ids, {name: by_id[identity] for name, identity in node_ids.items()}
+
+
 async def _test_clash_nodes_impl(
     subscription_id: int | None = None, *, probe_all: bool = False,
 ) -> dict:
@@ -2085,7 +2122,7 @@ async def _test_clash_nodes_impl(
     - 出口 IP 仅用于去重：Steam API 不回显出口 IP（无 Set-Cookie/IP 头），
       与存活探测并发执行不增耗时；出口 IP 相同 = 同落地（机场多入口
       同落地很常见），duplicate 标记
-    - 节点状态来自 ProxyNode；兼容表只记录最近体检时间与节流期限
+    - 节点身份、健康与节流期限同源于 ProxyNode
     - 冷却期内跳过检测（不算死也不耗探测时间）
     - 订阅资源失效或没有可用节点时停用，恢复后自动解除
     - 探测通道：内核配置带探测 lane（`inject_probe_lanes` 注入的 20 组
@@ -2102,46 +2139,23 @@ async def _test_clash_nodes_impl(
         status = clash_manager.runtime.status()
         if not status["running"]:
             raise ValueError("Clash 未运行：请先在 Clash 接入选择订阅并启动")
+        running_process = clash_manager.runtime.process
         base = status["controllerUrl"]
         secret = clash_manager.runtime.secret
         headers = {"Authorization": f"Bearer {secret}"} if secret else {}
         mixed_port = status["port"]
 
-        # 本次检测归属的订阅：显式指定 > 内核配置文件对应 > 最近一条 clash 订阅
-        sub_id = subscription_id
-        if sub_id is None:
-            sub_id = await _active_clash_subscription_id(status)
-            if sub_id is None:
-                raise ValueError("无 Clash 订阅记录：请先在订阅区保存订阅")
+        sub_id, running_url, running_text, node_ids, registry = await _runtime_check_nodes(status, subscription_id)
+        node_names = list(node_ids)
 
         async with httpx.AsyncClient(timeout=10, headers=headers, trust_env=False) as ctl:
             resp = await ctl.get(f"{base}/proxies")
             resp.raise_for_status()
             all_proxies = resp.json().get("proxies", {})
 
-        # 真实节点：来自配置文件的 proxies 段（排除内置与策略组）
-        config_text = ""
-        if status.get("configPath"):
-            from pathlib import Path
-
-            config_text = Path(status["configPath"]).read_text(encoding="utf-8", errors="ignore")
-        node_names = clash_manager.parse_node_names(config_text)
-        if not node_names:
-            # 订阅用 proxy-providers 时退回控制器类型过滤
-            node_names = [
-                name for name, info in all_proxies.items()
-                if str(info.get("type", "")).lower() not in clash_manager._NON_NODE_TYPES
-                and name not in ("DIRECT", "REJECT", "GLOBAL", "COMPATIBLE", "Pass")
-            ]
-
-        # 节点状态账本：定时体检按冷却跳过（结果沿用账本 status）；
-        # probe_all（手动检测/首检）全量探测——20 并发下全量成本很低，
-        # 且用户要的是「当前完整结论」，恢复的节点应当场发现
-        ledger = await _load_clash_cooldowns(sub_id, node_names)
-        to_probe = (
-            list(node_names) if probe_all
-            else [n for n in node_names if not _in_cooldown(ledger.get(n))]
-        )
+        # 手动全测沿用同一身份集合，自动体检按节点自身冷却跳过。
+        to_probe = (list(node_names) if probe_all else
+                    [name for name in node_names if not _in_cooldown(registry[name].cooldown_until)])
         now = _naive(get_beijing_time_obj())
 
         # 路由组（selector 自愈用；探测 lane 的组是检测专用通道，不作路由组）
@@ -2202,74 +2216,42 @@ async def _test_clash_nodes_impl(
         results.sort(key=lambda r: order.get(r["name"], len(order)))
         _mark_same_exit(results, order)
 
-        # ── 体检结果写入权威节点状态 ──
-        try:
-            from app.domains.proxypool.bridge import ingest_node_check
-            from app.domains.proxypool.models import HealthRun
-            from app.domains.proxypool.scheduling import request_rebuild
-
-            async with write_session(WritePriority.BACKGROUND) as session:
-                # 手动体检的运行台账：独立计时 + 节点级汇总（前端「本次体检耗时」
-                # 的唯一事实源），逐节点观测经 run_id 归属
-                run = HealthRun(
-                    channel="manual", subscription_id=sub_id,
-                    started_at=now, total=len(results),
-                    steam_ok=sum(1 for r in results if r.get("alive")),
-                    failed=sum(1 for r in results if not r.get("alive")),
-                    ip_known=len({r["exitIp"] for r in results
-                                  if r.get("alive") and r.get("exitIp")}),
-                )
-                session.add(run)
-                await session.flush()
-                fresh = await ingest_node_check(
-                    session, subscription_id=sub_id, results=results, now=now,
-                    run_id=run.id,
-                )
-                run.finished_at = datetime.now()
-                run.duration_ms = int(
-                    (run.finished_at - run.started_at).total_seconds() * 1000
-                )
-                await session.commit()
-            if fresh.changed:
-                request_rebuild()
-            log_event(
-                logger,
-                f"体检结果对齐池账本：本轮命中 {fresh.matched} 个",
-                detail={
-                    "本轮命中": fresh.matched,
-                    "本轮复活": fresh.activated,
-                    "本轮新增出口": fresh.exit_ips_added,
-                    "本轮未匹配": len(fresh.unmatched),
-                },
-            )
-        except Exception:  # noqa: BLE001 —— 对齐失败不改体检结论
-            log_event(
-                logger,
-                "体检结果对齐池账本失败，不影响节点账本",
-                level=logging.ERROR,
-                exc_info=True,
-            )
-
-        # 冷却跳过节点的存活口径与 selector 自愈都读权威账本
-        from app.domains.proxypool.models import ProxyNode
+        # 健康、观测与冷却同一事务；落账失败不能继续写一份冷却结果。
+        from app.domains.proxypool.bridge import ingest_node_check
+        from app.domains.proxypool.models import HealthRun, ProxyNode
+        from app.domains.proxypool.scheduling import request_rebuild
         from app.domains.proxypool.state import NODE_ACTIVE, NODE_STALE
 
+        async with write_session(WritePriority.BACKGROUND) as session:
+            sub = await session.get(ProxySubscription, sub_id)
+            if (sub is None or open_url(sub.url) != running_url
+                    or clash_manager.runtime.subscription_url != running_url
+                    or clash_manager.runtime._startup_text != running_text
+                    or clash_manager.runtime.process is not running_process
+                    or (running_process is not None and running_process.poll() is not None)):
+                raise ValueError("体检期间运行配置或订阅归属已变化，结果未落账")
+            run = HealthRun(channel="manual", subscription_id=sub_id, started_at=now,
+                            total=len(results), steam_ok=sum(bool(r.get("alive")) for r in results),
+                            failed=sum(not r.get("alive") for r in results),
+                            ip_known=len({r["exitIp"] for r in results if r.get("alive") and r.get("exitIp")}))
+            session.add(run)
+            await session.flush()
+            fresh = await ingest_node_check(session, subscription_id=sub_id, results=results,
+                                            now=now, run_id=run.id, node_ids=node_ids)
+            run.finished_at = datetime.now()
+            run.duration_ms = int((run.finished_at - run.started_at).total_seconds()*1000)
+            await session.commit()
+        if fresh.changed:
+            request_rebuild()
+        log_event(logger, f"体检结果对齐池账本：本轮命中 {fresh.matched} 个",
+                  detail={"本轮命中": fresh.matched, "本轮复活": fresh.activated,
+                          "本轮新增出口": fresh.exit_ips_added})
         async with get_session_factory()() as session:
-            registry = {
-                n.original_name: n
-                for n in (await session.execute(
-                    select(ProxyNode).where(
-                        (ProxyNode.subscription_id == sub_id)
-                        | ProxyNode.runtime_name.like(f"{sub_id}|%"),
-                        ProxyNode.original_name.in_(node_names),
-                    )
-                )).scalars()
-                if n.original_name
-            }
-
-        # ── 生成订阅体检结果和节流台账，不维护第二套健康状态 ──
-        alive_count, unique_alive, deprecated = await _apply_node_results(
-            sub_id, ledger, results, node_names, now, registry
+            rows = (await session.execute(select(ProxyNode).where(ProxyNode.node_id.in_(node_ids.values())))).scalars().all()
+        by_id = {node.node_id: node for node in rows}
+        registry = {name: by_id[identity] for name, identity in node_ids.items()}
+        alive_count, unique_alive, deprecated = await _summarize_node_results(
+            sub_id, results, node_names, now, registry
         )
 
         # ── selector 自愈：当前选中节点已死 → 切最快健康节点 ──
@@ -2284,7 +2266,7 @@ async def _test_clash_nodes_impl(
                 current_node is not None
                 and current_node.state in (NODE_ACTIVE, NODE_STALE)
                 and current_node.last_l2_at is not None
-                and not _in_cooldown(ledger.get(current))
+                and not _in_cooldown(current_node.cooldown_until)
             )
             if healthy and not current_alive:
                 self_heal_target = healthy[0]["name"]
@@ -2316,51 +2298,9 @@ async def _test_clash_nodes_impl(
             "subscriptionId": sub_id,
             "deprecated": deprecated,
             "nodes": [r for r in results] + _cooldown_nodes_payload(
-                ledger, node_names, {r["name"] for r in results}, registry
+                node_names, {r["name"] for r in results}, registry
             ),
         }
-
-
-async def prune_clash_node_ledger(sub_id: int, current_names: set[str] | None = None) -> int:
-    """账本收敛：删除已不在订阅当前内容里的节点行（改名/下架的历史痕迹）。
-
-    之前「保留不删」的设计在改名即新行的现实下会永久累积；改为每次
-    订阅刷新/检测时按当前内容收敛——改名节点 = 旧行删除 + 新行从零
-    开始（诚实反映「这是新节点」，绕过状态机的收益只剩一次性未知态）。
-    current_names 缺省时从内核当前配置文件解析；空集防呆不删
-    （解析不到节点宁可不裁，全删等于销账）。
-    """
-    if current_names is None:
-        status = clash_manager.runtime.status()
-        if not status.get("configPath") or not Path(status["configPath"]).is_file():
-            return 0
-        text = Path(status["configPath"]).read_text(encoding="utf-8", errors="ignore")
-        current_names = set(clash_manager.parse_node_names(text))
-    if not current_names:
-        return 0
-    async with write_session(WritePriority.BACKGROUND) as session:
-        result = await session.execute(
-            delete(ClashNode).where(
-                ClashNode.subscription_id == sub_id,
-                ClashNode.name.notin_(current_names),
-            )
-        )
-        await session.commit()
-        return result.rowcount or 0
-
-
-async def _load_clash_cooldowns(sub_id: int, node_names: list[str]) -> dict[str, datetime | None]:
-    """读探测冷却时刻（旧链体检节流专用；健康事实一律归权威节点账本）。"""
-    async with get_session_factory()() as session:
-        rows = (
-            await session.execute(
-                select(ClashNode.name, ClashNode.cooldown_until).where(
-                    ClashNode.subscription_id == sub_id,
-                    ClashNode.name.in_(node_names),
-                )
-            )
-        ).all()
-        return {name: until for name, until in rows}
 
 
 def _in_cooldown(cooldown_until: datetime | None) -> bool:
@@ -2371,7 +2311,6 @@ def _in_cooldown(cooldown_until: datetime | None) -> bool:
 
 
 def _cooldown_nodes_payload(
-    cooldowns: dict[str, datetime | None],
     node_names: list[str],
     probed: set[str],
     registry: dict,
@@ -2381,7 +2320,7 @@ def _cooldown_nodes_payload(
 
     payload = []
     for name in node_names:
-        if name in probed or name not in cooldowns:
+        if name in probed:
             continue
         node = registry.get(name)
         alive = bool(
@@ -2404,15 +2343,10 @@ def _cooldown_nodes_payload(
     return payload
 
 
-async def _apply_node_results(
-    sub_id: int,
-    cooldowns: dict[str, datetime | None],
-    results: list[dict],
-    node_names: list[str],
-    now: datetime,
-    registry: dict,
+async def _summarize_node_results(
+    sub_id: int, results: list[dict], node_names: list[str], now: datetime, registry: dict,
 ) -> tuple[int, int, bool]:
-    """刷新探测节流台账并落订阅存活统计；健康状态只归权威节点账本。"""
+    """节点体检摘要消费Registry健康，落订阅统计和既有操作事件。"""
     from app.domains.proxypool.state import NODE_ACTIVE, NODE_STALE
 
     if node_names and not any(r.get("probed") for r in results):
@@ -2429,41 +2363,11 @@ async def _apply_node_results(
     alive_count = 0
     unique_ips: set[str] = set()
 
-    async with write_session(WritePriority.BACKGROUND) as session:
-        # 冷却台账只记节流事实（何时该再测）；健康结论一律归 ProxyNode
-        cooldown_rows = {
-            n.name: n
-            for n in (
-                await session.execute(
-                    select(ClashNode).where(ClashNode.subscription_id == sub_id)
-                )
-            ).scalars()
-        }
-        for r in results:
-            if not r.get("probed"):
-                continue  # selector 切换失败的节点不入账本
-            name = r["name"]
-            row = cooldown_rows.get(name)
-            if row is None:
-                row = ClashNode(
-                    subscription_id=sub_id, name=name, created_at=now,
-                )
-                session.add(row)
-                cooldown_rows[name] = row
-            if r["alive"]:
-                alive_count += 1
-                if r.get("exitIp"):
-                    unique_ips.add(r["exitIp"])
-                row.cooldown_until = None
-            elif r.get("steamStatus") is not None or r.get("exitIp"):
-                row.cooldown_until = None
-            else:
-                canonical = registry.get(name)
-                failures = int(canonical.consecutive_failures or 0) if canonical else 1
-                tier = min(max(failures, 1), len(_FAIL_COOLDOWN_MINUTES)) - 1
-                row.cooldown_until = now + timedelta(minutes=_FAIL_COOLDOWN_MINUTES[tier])
-
-        await session.commit()
+    for row in results:
+        if row.get("probed") and row.get("alive"):
+            alive_count += 1
+            if row.get("exitIp"):
+                unique_ips.add(row["exitIp"])
 
     # 冷却跳过节点的存活口径读权威账本（与投影期 ok 判定同语义）
     probed_names = {r["name"] for r in results if r.get("probed")}
@@ -2491,17 +2395,9 @@ async def _apply_node_results(
         deprecated = await _evaluate_subscription_deprecation(
             sub_id, alive_count, len(node_names)
         )
-    # 账本收敛：已不在订阅内容里的节点行随检测清理（检测读的就是当前配置）
-    pruned = await prune_clash_node_ledger(sub_id, set(node_names))
     # 存活统计落库——订阅行「存活 x/y」标签的数据源
     if not target_response_only:
         await _merge_last_stats(sub_id, alive=alive_count, total=len(node_names))
-    if pruned:
-        log_event(
-            logger,
-            f"订阅 {sub_id} 的节点账本已收敛：删除 {pruned} 个已下线节点行",
-            detail={"订阅编号": sub_id, "删除行数": pruned},
-        )
 
     await record_event(
         kind="clash", target="node-test",
@@ -2646,7 +2542,6 @@ async def pool_stats() -> dict:
     - Clash：机场多入口常同落地，按出口 IP 去重；只统计内核正在跑的当前订阅，
       健康判定直接读节点账本（state + 最近业务证据时间）
     """
-    from app.domains.proxypool.models import ProxyNode
     from app.domains.proxypool.state import NODE_ACTIVE, NODE_STALE
 
     async with get_session_factory()() as session:
@@ -2665,55 +2560,30 @@ async def pool_stats() -> dict:
         "okExitIps": 0,
     }
     if running:
-        sub_id = await _active_clash_subscription_id(status)
+        sub_id, _, _, _, runtime_nodes = await _runtime_check_nodes(status, None, require_current_url=False)
         clash["subscriptionId"] = sub_id
-        if sub_id is not None:
-            async with get_session_factory()() as session:
-                subscription = await session.get(ProxySubscription, sub_id)
-                subscription_ready = subscription is None or (
-                    not subscription.deprecated and subscription.resource_block_reason() is None
-                )
-                nodes = list(
-                    (
-                        await session.execute(
-                            select(ProxyNode).where(
-                                (ProxyNode.subscription_id == sub_id)
-                                | ProxyNode.runtime_name.like(f"{sub_id}|%")
-                            )
-                        )
-                    ).scalars()
-                )
-            # 只统计当前订阅内容里仍在的节点（换订阅后账本保留历史行不删）
-            current_names: set[str] | None = None
-            if status.get("configPath"):
-                try:
-                    text = Path(status["configPath"]).read_text(
-                        encoding="utf-8", errors="ignore"
-                    )
-                    names = clash_manager.parse_node_names(text)
-                    if names:
-                        current_names = set(names)
-                except Exception:  # noqa: BLE001
-                    current_names = None
-            if current_names is not None:
-                nodes = [n for n in nodes if n.original_name in current_names]
-
-            all_idents: set[str] = set()
-            ok_idents: set[str] = set()
-            for n in nodes:
-                # 出口 IP 未知的节点（IP 探测失败）各自算一个
-                ident = n.exit_ip or f"node:{n.node_id}"
-                all_idents.add(ident)
-                if (
-                    n.state in (NODE_ACTIVE, NODE_STALE)
-                    and n.last_l2_at is not None
-                    and subscription_ready
-                ):
-                    clash["okNodes"] += 1
-                    ok_idents.add(ident)
-            clash["nodes"] = len(nodes)
-            clash["exitIps"] = len(all_idents)
-            clash["okExitIps"] = len(ok_idents)
+        async with get_session_factory()() as session:
+            subscription = await session.get(ProxySubscription, sub_id)
+            subscription_ready = subscription is not None and (
+                not subscription.deprecated and subscription.resource_block_reason() is None
+            )
+        nodes = list({node.node_id: node for node in runtime_nodes.values()}.values())
+        all_idents: set[str] = set()
+        ok_idents: set[str] = set()
+        for n in nodes:
+            # 出口 IP 未知的节点（IP 探测失败）各自算一个
+            ident = n.exit_ip or f"node:{n.node_id}"
+            all_idents.add(ident)
+            if (
+                n.state in (NODE_ACTIVE, NODE_STALE)
+                and n.last_l2_at is not None
+                and subscription_ready
+            ):
+                clash["okNodes"] += 1
+                ok_idents.add(ident)
+        clash["nodes"] = len(nodes)
+        clash["exitIps"] = len(all_idents)
+        clash["okExitIps"] = len(ok_idents)
 
     return {
         "pool": {"total": pool_total, "ok": pool_ok},
@@ -2732,7 +2602,7 @@ async def clash_nodes_overview() -> dict:
     只读 ProxyNode 与各节点最近一次 L2 观测，不做任何探测；内核未跑或
     无活跃订阅返回空清单。"""
     from app.domains.proxypool.health import L2_LEVEL
-    from app.domains.proxypool.models import HealthObservation, ProxyNode
+    from app.domains.proxypool.models import HealthObservation
     from app.domains.proxypool.state import (
         NODE_ACTIVE, NODE_DEAD, NODE_RETIRED, NODE_STALE,
     )
@@ -2740,20 +2610,11 @@ async def clash_nodes_overview() -> dict:
     status = clash_manager.runtime.status()
     if not bool(status["running"]):
         return {"running": False, "nodes": []}
-    sub_id = await _active_clash_subscription_id(status)
-    if sub_id is None:
-        return {"running": True, "nodes": []}
+    _, _, _, _, runtime_nodes = await _runtime_check_nodes(status, None, require_current_url=False)
+    by_identity = {node.node_id: node for node in runtime_nodes.values()}
+    rows = list(by_identity.values())
+    runtime_names = {node.node_id: name for name, node in runtime_nodes.items()}
     async with get_session_factory()() as session:
-        rows = list(
-            (
-                await session.execute(
-                    select(ProxyNode).where(
-                        (ProxyNode.subscription_id == sub_id)
-                        | ProxyNode.runtime_name.like(f"{sub_id}|%")
-                    )
-                )
-            ).scalars()
-        )
         latest_l2: dict[str, HealthObservation] = {}
         if rows:
             observations = (await session.execute(
@@ -2768,18 +2629,6 @@ async def clash_nodes_overview() -> dict:
             )).scalars()
             for observation in observations:
                 latest_l2.setdefault(observation.node_id, observation)
-    current_names: set[str] | None = None
-    if status.get("configPath"):
-        try:
-            text = Path(status["configPath"]).read_text(encoding="utf-8", errors="ignore")
-            names = clash_manager.parse_node_names(text)
-            if names:
-                current_names = set(names)
-        except Exception:  # noqa: BLE001
-            current_names = None
-    if current_names is not None:
-        rows = [r for r in rows if r.original_name in current_names]
-
     def _status(state: str) -> str:
         if state in (NODE_DEAD, NODE_RETIRED):
             return "dead"
@@ -2789,7 +2638,7 @@ async def clash_nodes_overview() -> dict:
 
     nodes = [
         {
-            "name": r.original_name or r.runtime_name,
+            "name": runtime_names[r.node_id],
             "status": _status(r.state),
             "latency_ms": latest_l2[r.node_id].latency_ms if r.node_id in latest_l2 else None,
             "exit_ip": r.exit_ip,

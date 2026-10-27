@@ -54,11 +54,7 @@ async def _add_node(node_id: str, state: str = "NEW") -> None:
         if await s.get(ProxySubscription, 1) is None:
             s.add(ProxySubscription(id=1, kind="clash", url="https://source.invalid/1",
                                     admission_status=ADMISSION_ACTIVE))
-        s.add(ProxyNode(node_id=node_id, fingerprint=node_id, runtime_name=f"1|{node_id}",
-                        proxy_type="http", server="10.0.0.1",
-                        normalized_config={"name": node_id, "type": "http",
-                                           "server": "10.0.0.1", "port": 1},
-                        state=state, first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
+        s.add(ProxyNode(node_id=node_id, runtime_name=f'1|{node_id}', proxy_type='http', server='10.0.0.1', normalized_config={'name': node_id, 'type': 'http', 'server': '10.0.0.1', 'port': 1}, state=state, first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
         # 合格集口径含「至少一个当前来源」
         await s.execute(update(ProxyNode)
             .where(ProxyNode.node_id == node_id)

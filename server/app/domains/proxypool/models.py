@@ -138,7 +138,7 @@ def subscription_code(subscription_id: int | str) -> str:
 class ProxyNode(Base):
     """节点注册表行：一个「订阅里的一个出口」实现一条台账，跨刷新不删、不丢历史。
 
-    **身份**：`fingerprint`（订阅标识 + 整份配置的规范化哈希）就是全局节点身份，
+    **身份**：`node_id`（订阅标识 + 整份配置的规范化哈希）就是全局节点身份，
     故它**全局唯一**。同一份配置被两个订阅提供时是**两行**——订阅标识进了身份。
 
     归属订阅落本表（`subscription_id` / `original_name`），不再另立来源关联表：
@@ -154,7 +154,6 @@ class ProxyNode(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     node_id: Mapped[str] = mapped_column(String(64), unique=True)
-    fingerprint: Mapped[str] = mapped_column(String(64), unique=True)
     # 首次登记时铸造（<来源订阅>|<原名>，撞名加 #N），此后绝不重算：
     # 重算会让已绑定的 lane / 池文件条目指向一个不存在的名字
     runtime_name: Mapped[str] = mapped_column(String(400), unique=True)
@@ -163,7 +162,7 @@ class ProxyNode(Base):
     normalized_config: Mapped[dict | None] = mapped_column(JSON)
     state: Mapped[str] = mapped_column(String(16), default=NODE_NEW)
     first_seen: Mapped[datetime | None] = mapped_column(DateTime)
-    # 归属订阅与它在订阅里的原名：节点跟着订阅走，归属是身份的一部分（`fingerprint`
+    # 归属订阅与它在订阅里的原名：节点跟着订阅走，归属是身份的一部分（`node_id`
     # 已含订阅标识），因此直接落本表而不是另立来源关联表。同一份配置由两个订阅
     # 提供时是两行，各自记账。原名只作观测与审计（改名不影响身份），体检要拿它去
     # 定位旧链路内核里的节点名。
@@ -184,6 +183,7 @@ class ProxyNode(Base):
     last_l2_at: Mapped[datetime | None] = mapped_column(DateTime)
     exit_ip: Mapped[str | None] = mapped_column(String(64), index=True)
     consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
+    cooldown_until: Mapped[datetime | None] = mapped_column(DateTime)
 
 
 class ProxyRunExit(Base):
@@ -294,7 +294,6 @@ class SubscriptionSnapshot(Base):
     fetched_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
-# 编排事件（orchestration_events）已提升为跨域共享层：app/core/orchestration.py
 
 
 class ProxyJobRun(Base):

@@ -129,7 +129,7 @@ async def _status(sub_id: int) -> str | None:
 async def _source_fps(sub_id: int) -> set[str]:
     async with get_session_factory()() as s:
         rows = await s.execute(
-            select(ProxyNode.fingerprint)
+            select(ProxyNode.node_id)
             .where(ProxyNode.subscription_id == sub_id)
         )
     return {r[0] for r in rows.all()}
@@ -433,20 +433,19 @@ async def test_interleaved_applies_never_union_last_writer_wins(
 
     import app.domains.proxypool.registry as registry
 
-    real_nodes_of = registry._nodes_of
+    real_apply_nodes = registry._apply_nodes
     calls = {"n": 0}
     first_read = asyncio.Event()
     release = asyncio.Event()
 
-    async def _blocking_nodes_of(session, subscription_id):
-        rows = await real_nodes_of(session, subscription_id)
+    async def _blocking_apply_nodes(session, **kwargs):
         calls["n"] += 1
-        if calls["n"] == 1:  # 第一个 writer 读完后停住（此刻它已持写锁）
+        if calls["n"] == 1:  # 第一个writer已取写锁；在共享节点集读写前暂停
             first_read.set()
             await release.wait()
-        return rows
+        return await real_apply_nodes(session, **kwargs)
 
-    monkeypatch.setattr(registry, "_nodes_of", _blocking_nodes_of)
+    monkeypatch.setattr(registry, "_apply_nodes", _blocking_apply_nodes)
     first = asyncio.create_task(
         _apply_snapshot_nodes(sub_id, nodes_first, tmp_data_dir)
     )
@@ -458,7 +457,7 @@ async def test_interleaved_applies_never_union_last_writer_wins(
     assert not second.done(), "第二个 apply 必须在写锁上等待，不能与第一个交错"
     release.set()
     await asyncio.wait_for(asyncio.gather(first, second), timeout=20)
-    monkeypatch.setattr(registry, "_nodes_of", real_nodes_of)
+    monkeypatch.setattr(registry, "_apply_nodes", real_apply_nodes)
 
     got = await _source_fps(sub_id)
     assert len(got) == 2, f"来源集合只能是**一份**快照的规模，实得 {len(got)}：{got}"

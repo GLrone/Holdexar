@@ -662,12 +662,7 @@ async def test_healthy_other_subscription_lane_is_a_fetch_egress(
             ProxySubscription(kind="clash", url="https://sub-b.invalid/b",
                               created_at=NOW, admission_status=ADMISSION_ACTIVE),
         ])
-        session.add(ProxyNode(
-            node_id="b" * 20, fingerprint="b" * 64, runtime_name="2|B",
-            subscription_id=2, original_name="B", proxy_type="ss",
-            server="edge.example.test", exit_ip="203.0.113.10", state="ACTIVE",
-            last_l2_at=NOW, consecutive_failures=0,
-        ))
+        session.add(ProxyNode(node_id='b' * 20, runtime_name='2|B', subscription_id=2, original_name='B', proxy_type='ss', server='edge.example.test', exit_ip='203.0.113.10', state='ACTIVE', last_l2_at=NOW, consecutive_failures=0))
         session.add(HealthObservation(
             node_id="b" * 20, level="L2", ok=True, observed_at=NOW,
         ))
@@ -733,14 +728,7 @@ async def test_pool_signature_changes_with_connection_parameters(tmp_data_dir, f
     await init_db()
     subscription_id = await _add_subscription()
     async with get_session_factory()() as session:
-        node = ProxyNode(node_id="connection", fingerprint="identity",
-                         runtime_name=f"{subscription_id}|connection",
-                         subscription_id=subscription_id,
-                         proxy_type="ss", server="edge.example.test",
-                         original_name="connection", state="ACTIVE",
-                         normalized_config={"name": "connection", "type": "ss",
-                                            "server": "edge.example.test", "port": 443,
-                                            "cipher": "aes-128-gcm", "password": "fixture"})
+        node = ProxyNode(node_id='connection', runtime_name=f'{subscription_id}|connection', subscription_id=subscription_id, proxy_type='ss', server='edge.example.test', original_name='connection', state='ACTIVE', normalized_config={'name': 'connection', 'type': 'ss', 'server': 'edge.example.test', 'port': 443, 'cipher': 'aes-128-gcm', 'password': 'fixture'})
         session.add(node)
         await session.commit()
         before = await bs.pool_signature(session)

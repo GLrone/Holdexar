@@ -22,6 +22,7 @@ from app.domains.proxypool.subscription import (
     CHANNEL_KERNEL,
     CHANNEL_LOCAL,
     CHANNEL_POOL,
+    Channel,
     FetchFailedError,
     build_channels,
 )
@@ -42,7 +43,7 @@ def test_local_channel_appended_when_port_listening(monkeypatch) -> None:
         monkeypatch.setattr(clash_manager, "LOCAL_MIXED_PORTS", (port,))
         channels = build_channels(
             kernel_proxy="http://127.0.0.1:7890",
-            pool_proxy="http://127.0.0.1:1234",
+            pool_channels=[Channel(CHANNEL_POOL, "http://127.0.0.1:1234", "controlled-exit")],
         )
     finally:
         holder.close()

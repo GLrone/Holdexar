@@ -5,7 +5,7 @@
 2. **删观测不删身份**：`proxy_nodes` / `pool_generations` 一行不碰；
 3. 作业台账至少留最近 N 行、快照每订阅至少留最新几条（`latest_snapshot` 依赖的那条永不删）。
 
-不做：VACUUM、快照原始 `.bin` 的 GC（P1.9 既有决定）、任何阈值判定。
+不做：VACUUM、全目录扫描、任何阈值判定。
 """
 from __future__ import annotations
 
@@ -31,15 +31,6 @@ async def _add_observations(session, count: int, *, at: datetime) -> None:
         )
 
 
-async def _add_events(session, count: int, *, at: datetime, kind: str = "test") -> None:
-    for _ in range(count):
-        await session.execute(
-            text(
-                "INSERT INTO orchestration_events (ts, kind, level, message, payload_json) "
-                "VALUES (:at, :kind, 'INFO', 'm', NULL)"
-            ),
-            {"at": at, "kind": kind},
-        )
 
 
 async def _add_job_runs(session, count: int, *, at: datetime) -> None:
@@ -109,8 +100,6 @@ async def test_prunes_by_age(tmp_data_dir):
     async with get_session_factory()() as session:
         await _add_observations(session, 3, at=NOW - timedelta(days=40))
         await _add_observations(session, 2, at=NOW - timedelta(days=10))
-        await _add_events(session, 2, at=NOW - timedelta(days=100))
-        await _add_events(session, 1, at=NOW - timedelta(days=1))
         await _add_job_runs(session, 2, at=NOW - timedelta(days=100))
         await _add_job_runs(session, 1, at=NOW - timedelta(days=1))
         await _add_run_exits(session, 3, at=NOW - timedelta(days=100))
@@ -132,7 +121,6 @@ async def test_prunes_by_age(tmp_data_dir):
         "run_exits": 3,
         "health_runs": 0,
         "health_observations": 3,
-        "orchestration_events": 2,
         "proxy_events": 2,
         "snapshots": 3,
     }
@@ -140,7 +128,6 @@ async def test_prunes_by_age(tmp_data_dir):
 
     async with get_session_factory()() as session:
         assert await _count(session, "health_observations") == 2
-        assert await _count(session, "orchestration_events") == 1
         assert await _count(session, "proxy_job_runs") == 1
         assert await _count(session, "proxy_run_exits") == 1
         assert await _count(session, "proxy_events") == 1
@@ -275,9 +262,9 @@ async def test_identity_tables_never_pruned(tmp_data_dir):
         await session.execute(
             text(
                 "INSERT INTO proxy_nodes "
-                "(node_id, fingerprint, runtime_name, subscription_id, original_name, "
+                "(node_id, runtime_name, subscription_id, original_name, "
                 " proxy_type, server, normalized_config, state, first_seen, consecutive_failures) "
-                "VALUES ('n1', 'f1', '1|A', 1, 'A', 'ss', '10.0.0.1', '{}', 'ACTIVE', :at, 0)"
+                "VALUES ('n1', '1|A', 1, 'A', 'ss', '10.0.0.1', '{}', 'ACTIVE', :at, 0)"
             ),
             {"at": NOW - timedelta(days=500)},
         )
@@ -318,7 +305,6 @@ async def test_second_run_deletes_nothing(tmp_data_dir):
         "run_exits": 0,
         "health_runs": 0,
         "health_observations": 0,
-        "orchestration_events": 0,
         "proxy_events": 0,
         "snapshots": 0,
     }
@@ -370,9 +356,6 @@ async def test_retention_job_is_registered_next_to_wal_truncate(monkeypatch):
 
     monkeypatch.setattr(sched_mod.scheduler, "add_job", _fake_add_job)
     monkeypatch.setattr(sched_mod.scheduler, "start", lambda: None)
-    monkeypatch.setattr(sched_mod, "_anchor_probe_after_start", _noop)
-    monkeypatch.setattr(sched_mod, "_job_backup_catchup", _noop)
-    monkeypatch.setattr(sched_mod, "_job_bartervg_catchup", _noop)
 
     sched_mod.start_scheduler()
 

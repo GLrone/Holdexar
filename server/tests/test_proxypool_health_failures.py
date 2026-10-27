@@ -42,11 +42,7 @@ async def _prepare(data_dir, *, state: str = "NEW", failures: int = 0) -> None:
         encoding="utf-8",
     )
     async with get_session_factory()() as s:
-        s.add(ProxyNode(node_id=NODE_ID, fingerprint=NODE_ID, runtime_name=NAME,
-                        proxy_type="http", server="10.0.0.1",
-                        normalized_config={"name": "probe-node"}, state=state,
-                        consecutive_failures=failures,
-                        first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
+        s.add(ProxyNode(node_id=NODE_ID, runtime_name=NAME, proxy_type='http', server='10.0.0.1', normalized_config={'name': 'probe-node'}, state=state, consecutive_failures=failures, first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
         await s.execute(update(ProxyNode)
             .where(ProxyNode.node_id == NODE_ID)
             .values(subscription_id=1, original_name="probe-node"))

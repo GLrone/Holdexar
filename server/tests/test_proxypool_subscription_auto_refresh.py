@@ -108,7 +108,9 @@ async def test_switch_off_does_not_drop_nodes_or_sources(tmp_path) -> None:
         items = await list_subscriptions("clash")
         assert items[0]["autoRefresh"] is False
         # 行本身与链接、准入都还在
-        assert items[0]["admissionStatus"] == ADMISSION_ACTIVE
+        assert items[0]["id"] == 3
+        async with factory() as session:
+            assert (await session.get(ProxySubscription, 3)).admission_status == ADMISSION_ACTIVE
         assert items[0]["url"] == "http://example.invalid/***"
     finally:
         svc.get_session_factory = original

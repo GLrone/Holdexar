@@ -68,7 +68,6 @@ async def _seed_account(db, steamid=PRIMARY, kinds=None):
                 steamid=steamid,
                 label=None,
                 kinds_json=kinds or {"wishlist": True, "owned": True},
-                item_count=0,
             )
         )
         await session.commit()

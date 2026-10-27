@@ -315,11 +315,7 @@ async def _add(state: str, runtime_name: str, *, port: int,
         if with_source and await s.get(ProxySubscription, 1) is None:
             s.add(ProxySubscription(id=1, kind="clash", url="https://source.invalid/1",
                                     admission_status=ADMISSION_ACTIVE))
-        s.add(ProxyNode(
-            node_id=fp, fingerprint=fp, runtime_name=runtime_name,
-            proxy_type="http", server="127.0.0.1", normalized_config=config,
-            state=state, first_seen=NOW, last_seen=NOW, last_source_seen=NOW,
-        ))
+        s.add(ProxyNode(node_id=fp, runtime_name=runtime_name, proxy_type='http', server='127.0.0.1', normalized_config=config, state=state, first_seen=NOW, last_seen=NOW, last_source_seen=NOW))
         if with_source:
             await s.execute(update(ProxyNode)
                 .where(ProxyNode.node_id == fp)

@@ -26,7 +26,6 @@ import yaml
 from app.domains.proxies.models import ProxySubscription
 from app.domains.proxies.subscription_secret import UNREADABLE_MESSAGE, open_url
 from app.core.database import WritePriority, write_gate
-from app.core import orchestration as events
 from app.core.logging import log_event
 from app.domains.proxypool.admission import auto_admit_healthy_candidate, is_admitted
 from app.domains.proxypool.exits import select_exit_slots
@@ -369,14 +368,6 @@ async def _sync_subscriptions_under_locks(
                             .where(ProxySubscription.id == sub_id)
                             .values(last_fetch_at=now, last_fetch_status="FAILED", last_error=message)
                         )
-                        await events.record(
-                            events.KIND_SUBSCRIPTION_FAILED,
-                            f"订阅 {sub_id} 同步失败：{message}",
-                            level=events.LEVEL_WARN,
-                            payload={"subscriptionId": sub_id},
-                            session=session,
-                            now=now,
-                        )
                         continue
                     result = fetched.get(sub_id)
                     if isinstance(result, Exception):
@@ -387,14 +378,6 @@ async def _sync_subscriptions_under_locks(
                     if (open_url(sub.url) or "") != sub_url:
                         message = "订阅地址在刷新期间发生变化，本次结果未应用"
                         failures[sub_id] = message
-                        await events.record(
-                            events.KIND_SUBSCRIPTION_FAILED,
-                            f"订阅 {sub_id} 旧地址的刷新结果已丢弃",
-                            level=events.LEVEL_WARN,
-                            payload={"subscriptionId": sub_id, "reason": "stale_url"},
-                            session=session,
-                            now=now,
-                        )
                         continue
                     nodes = result.resolved_nodes or parse_nodes(result.raw, result.fmt)
                     snap = build_snapshot(sub_id, sub_url, result, nodes, now=now)
@@ -436,21 +419,6 @@ async def _sync_subscriptions_under_locks(
                             session, subscription_id=sub_id, data_dir=data_dir, now=now
                         )
                         if admitted is not None:
-                            # 与首检自动转正同一事件类型：转正不管走哪条生产路径，
-                            # 事件流里都是同一种事实（订阅晋升 ACTIVE）。
-                            await events.record(
-                                events.KIND_SUBSCRIPTION_PROMOTED,
-                                f"订阅 {admitted.subscription_id} 晋升 ACTIVE："
-                                f"应用快照 {str(admitted.snapshot_sha256 or '')[:10]}，"
-                                f"对齐节点 {admitted.applied_nodes}",
-                                payload={
-                                    "subscriptionId": admitted.subscription_id,
-                                    "snapshotSha256": admitted.snapshot_sha256,
-                                    "appliedNodes": admitted.applied_nodes,
-                                },
-                                session=session,
-                                now=now,
-                            )
                             log_event(
                                 logger,
                                 f"订阅 {sub_id} 体检健康，自动转正进生产池",
@@ -504,15 +472,6 @@ async def _sync_subscriptions_under_locks(
                     update(ProxySubscription)
                     .where(ProxySubscription.id == sub_id)
                     .values(last_fetch_at=now, last_fetch_status="FAILED", last_error=message)
-                )
-                # 事件与 FAILED 投影同事务：两者说的是同一件事，一起提交或一起回滚
-                await events.record(
-                    events.KIND_SUBSCRIPTION_FAILED,
-                    f"订阅 {sub_id} 同步失败：{message}",
-                    level=events.LEVEL_WARN,
-                    payload={"subscriptionId": sub_id},
-                    session=session,
-                    now=now,
                 )
                 failures[sub_id] = message
                 continue
@@ -724,13 +683,11 @@ async def ensure_pool_runtime(
             auxiliary_names=set(build.auxiliary_names),
         )
         if not ledger.ok:
-            # 独立会话落库：本函数不再由调用方的写闸/事务包络（调用方只承载读取），
-            # 「bootstrap 对账拒绝」这个事实必须自己留痕，不随调用方回滚消失
-            await events.record(
-                events.KIND_RECONCILE_REJECTED,
+            log_event(
+                logger,
                 f"bootstrap 对账拒绝：缺 {sorted(ledger.missing)}",
-                level=events.LEVEL_ERROR,
-                payload={
+                level=logging.ERROR,
+                detail={
                     "phase": "bootstrap",
                     "registryCount": len(ledger.registry_names),
                     "poolCount": len(ledger.pool_names),
@@ -739,7 +696,6 @@ async def ensure_pool_runtime(
                     "unexpectedCount": len(ledger.unexpected),
                     "observedTotal": ledger.observed_total,
                 },
-                now=now,
             )
             return BootstrapResult(
                 False, True, None, base, build.runtime_names,

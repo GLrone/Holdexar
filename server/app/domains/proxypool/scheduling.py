@@ -184,11 +184,10 @@ async def _record_maintenance_signature(session: AsyncSession) -> None:
 
 
 async def _announce_maintenance(kind: str, *, totals: dict | None = None) -> None:
-    """维护开始播报：用户可见日志 + SSE 实时事件 + 编排事件留痕（均 fail-soft）。
+    """维护开始播报：用户可见日志 + SSE 实时事件（均 fail-soft）。
 
     维护期间爬取被预约位拒绝，这是前端与灵动岛唯一能投影「体检进行中 /
     重建进行中」的窗口——没有这一步，维护就是一段用户完全看不见的静默期。"""
-    from app.core import orchestration
     from app.core.events import bus
 
     payload: dict = {"kind": kind}
@@ -210,11 +209,6 @@ async def _announce_maintenance(kind: str, *, totals: dict | None = None) -> Non
         )
     try:
         bus.publish("maintenance.started", **payload)
-        await orchestration.record(
-            orchestration.KIND_MAINTENANCE_STARTED,
-            f"{_MAINTENANCE_EVENT_LABELS[kind]}开始：期间价格抓取自动让路",
-            payload=payload,
-        )
     except Exception:  # noqa: BLE001 —— 观测不是生产依赖
         pass
 
@@ -222,9 +216,8 @@ async def _announce_maintenance(kind: str, *, totals: dict | None = None) -> Non
 async def _conclude_maintenance(
     kind: str, *, elapsed_s: float, summary: dict | None = None,
 ) -> None:
-    """维护收场播报：用户可见日志 + SSE 事件 + 编排事件（fail-soft）。summary 带节点级结论
+    """维护收场播报：用户可见日志 + SSE 事件（fail-soft）。summary 带节点级结论
     （total/ok/failed），异常中断路径没有结论，只有耗时。"""
-    from app.core import orchestration
     from app.core.events import bus
 
     payload: dict = {"kind": kind, "durationMs": int(elapsed_s * 1000)}
@@ -252,11 +245,6 @@ async def _conclude_maintenance(
         )
     try:
         bus.publish("maintenance.ended", **payload)
-        await orchestration.record(
-            orchestration.KIND_MAINTENANCE_ENDED,
-            f"{_MAINTENANCE_EVENT_LABELS[kind]}结束（{elapsed_s:.0f} 秒）",
-            payload=payload,
-        )
     except Exception:  # noqa: BLE001
         pass
 
@@ -664,7 +652,7 @@ async def run_pending_rebuild(
 
     只持 `_rebuild_lock`，**不持写闸**：重建本体是文件渲染 + 内核生命周期操作
     （热重载 / stop/start）+ HTTP 等待，对 session 零写入；事件留痕走
-    orchestration.record 的独立短写闸。重建段整段持闸会把交互写饿死在
+    现有写入边界。重建段整段持闸会把交互写饿死在
     写者位上——网络与内核操作禁止进闸（写事务纪律第 1 条）。
     重建全程持维护预约位：先预约后消费，预约取得失败 pending 原样保留给下一拍。
     """
