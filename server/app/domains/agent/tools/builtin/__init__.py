@@ -10,22 +10,27 @@ from app.domains.agent.tools.builtin import (
     account,
     attachment,
     catalog,
+    crawlops,
+    dataview,
     info,
     navigate,
     offers,
     prefs,
     prices,
+    proxy_ops,
     runtime_tools,
     system,
     tracking,
     ui,
+    userview,
 )
 from app.domains.agent.tools.base import ToolSpec
 from app.domains.agent.tools.projection import budget_for
 from app.domains.agent.tools.registry import REGISTRY
 
 _SPEC_BY_NAME: dict[str, ToolSpec] = {}
-for _mod in (catalog, prices, tracking, offers, account, system, runtime_tools, navigate, prefs, attachment, info, ui):
+for _mod in (catalog, prices, tracking, offers, account, system, runtime_tools,
+             crawlops, proxy_ops, userview, dataview, navigate, prefs, attachment, info, ui):
     for _spec in _mod.SPECS:
         if _spec.name in _SPEC_BY_NAME:
             raise ValueError(f"重复注册工具: {_spec.name}")
@@ -55,6 +60,13 @@ _ORDER = (
     "list_alerts",
     "list_bundle_follows",
     "diagnose_price",
+    "game_detail",
+    "game_price_history",
+    "game_versions",
+    "linked_bundles",
+    "bundle_detail",
+    "rates_history",
+    "regions_config",
     "recent_job_failures",
     "proxy_pool_status",
     "proxy_exit_detail",
@@ -68,6 +80,17 @@ _ORDER = (
     "cancel_task",
     "list_sessions",
     "read_session",
+    "agent_runs_list",
+    "agent_run_events",
+    "crawl_active",
+    "price_freshness",
+    "recent_cycles",
+    "price_events",
+    "crawl_stop",
+    "subscriptions_list",
+    "subscription_sync",
+    "pool_health_history",
+    "pool_job_runs",
     "hb_monthly",
     "epic_free",
     "steam_free",
@@ -85,6 +108,15 @@ _ORDER = (
     "bills_summary",
     "family_status",
     "redeem_quota",
+    "account_status",
+    "notifications_status",
+    "notification_history",
+    "achievements_near_completion",
+    "achievements_game_detail",
+    "bills_spend_query",
+    "alert_history",
+    "update_status",
+    "acknowledge_update",
     "list_bundles",
     "update_price_alert",
     "bundle_follow",

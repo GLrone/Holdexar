@@ -10,9 +10,9 @@ class AgentRunCreate(BaseModel):
     session_id: str | None = None
     prompt: str | None = Field(default=None, max_length=2000)
     trigger: str = "manual"
-    # 执行器：fake（Runtime 骨架）/ task（登记表内的真实长任务）
+    # task 保留为兼容请求值，由端点明确拒绝。
     runner: str = Field(default="fake", pattern="^(fake|task)$")
-    # task 执行器参数（登记表 kind）；fake 参数 scenario/steps/step_delay
+    # 历史 task 请求参数。
     task: str | None = Field(default=None, max_length=32)
     ref: dict | None = None
     # fake 执行器参数（scenario：success / failure）
@@ -22,7 +22,7 @@ class AgentRunCreate(BaseModel):
 
 
 class AgentTaskItem(BaseModel):
-    """可调度任务形态（登记表投影：kind 是静态白名单，由后端给出）。"""
+    """价格动作的固定名称。"""
 
     kind: str
     label: str
@@ -96,4 +96,3 @@ class AgentMemoryUpsert(BaseModel):
 
 class AgentMemoryListOut(BaseModel):
     items: list[AgentMemoryItem]
-

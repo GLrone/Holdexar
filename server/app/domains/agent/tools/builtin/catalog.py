@@ -162,7 +162,7 @@ async def ingest_appids(appids: list) -> dict:
     started = False
     if fresh:
         try:
-            await crawl_service.start_job(scope="appids", appids=fresh, kind="import")
+            await crawl_service.start_job(scope="appids", appids=fresh, kind="import", trigger="manual")
             started = True
         except RuntimeError:
             started = False  # 已有任务在跑：目录已导入，首爬让位现役任务

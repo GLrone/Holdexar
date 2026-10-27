@@ -453,9 +453,9 @@ def test_achievements_card_shape(monkeypatch):
 def test_list_bundles_rows(monkeypatch):
     monkeypatch.setattr(
         pilot_tools.bundles_service, "list_bundles",
-        _async_return([
+        _async_return({"bundles": [
             {"bundleId": 9, "name": "黑魂合集", "cnCnyFen": 19900, "lowestRegion": "AR", "lowestCnyFen": 8900, "diffFen": 11000},
-        ]),
+        ], "total": 1}),
     )
     import asyncio
     out = asyncio.run(pilot_tools.execute_tool("list_bundles", {}))
@@ -642,8 +642,8 @@ def test_search_steam_empty_term_and_failure(monkeypatch):
 def test_ingest_appids_imports_and_starts_first_crawl(monkeypatch):
     started = []
 
-    async def _start_job(*, scope, appids, kind):
-        started.append((scope, tuple(appids), kind))
+    async def _start_job(*, scope, appids, kind, trigger):
+        started.append((scope, tuple(appids), kind, trigger))
         return {"id": 1, "count": len(appids)}
 
     monkeypatch.setattr(
@@ -658,7 +658,7 @@ def test_ingest_appids_imports_and_starts_first_crawl(monkeypatch):
         pilot_tools.games_service, "names_for", _async_return({1794880: "卡赞"}))
     out = asyncio.run(pilot_tools.execute_tool(
         "ingest_appids", {"appids": [1794880, 620, 99, "x", 0, 1794880]}))
-    assert started == [("appids", (1794880,), "import")]
+    assert started == [("appids", (1794880,), "import", "manual")]
     vkeys = {r["v"]: r["vKey"] for r in out["rows"]}
     assert vkeys == {"#1794880": "ingestQueued", "#620": "ingestOwned", "#99": "ingestFail"}
     assert out["titleKey"] == "ingest"

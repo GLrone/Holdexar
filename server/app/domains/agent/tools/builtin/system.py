@@ -17,6 +17,13 @@ from app.domains.games import service as games_service
 from app.domains.proxies import service as proxies_service
 
 
+async def acknowledge_update(args: dict, sid: str | None = None) -> dict:
+    """与更新弹窗共用确认入口，写入失败由公共执行器返回错误。"""
+    from app.core import updater
+
+    return updater.acknowledge_update()
+
+
 async def recent_job_failures() -> dict:
     """最近失败的抓取任务与原因（crawl_jobs 账本只读投影）。"""
     jobs = await crawl_service.list_jobs(20)
@@ -52,7 +59,7 @@ async def proxy_pool_status() -> dict:
 
 
 async def proxy_exit_detail() -> dict:
-    """出口节点明细（clash_nodes 账本只读投影）：逐节点状态/延迟/出口 IP。
+    """出口节点明细（ProxyNode 账本只读投影）：逐节点状态/延迟/出口 IP。
 
     只读最近一次检测留下的账本事实，不发起探测；存活节点按延迟升序在前。"""
     overview = await proxies_service.clash_nodes_overview()
@@ -186,7 +193,7 @@ async def refresh_game_price(appid: int) -> dict:
     names = await games_service.names_for([appid])
     name = names.get(appid, f"AppID {appid}")
     try:
-        await crawl_service.start_job(scope="appids", appids=[appid], kind="manual")
+        await crawl_service.start_job(scope="appids", appids=[appid], kind="manual", trigger="manual")
     except RuntimeError:
         return _shared.rows_result("refresh", [{"k": name, "vKey": "refreshBusy", "tone": "warn"}])
     except ValueError:
@@ -367,6 +374,13 @@ async def _notify_test(args: dict, sid: str | None = None) -> dict:
 
 
 SPECS = [
+    ToolSpec(
+        name="acknowledge_update", group="write", risk="low", idempotent=True,
+        description="确认已查看本次更新成功报告，之后不再重复提示。仅在用户明确要求确认更新完成时调用；"
+                    "不会下载、安装或重启应用，先用 update_status 查看更新结果。",
+        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        handler=acknowledge_update, step_label="updateStatus",
+    ),
     ToolSpec(
         name="web_search", group="read", risk="medium",
         description="联网搜索（全互联网，不只 Steam）。用户问『最新的 XX 消息/网上怎么说/帮我查一下 XX』"

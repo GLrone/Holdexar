@@ -39,12 +39,37 @@ _READ_TOOLS = (
     "read_attachment",
     "web_search",
     "present_ui",
+    "crawl_active",
+    "price_freshness",
+    "recent_cycles",
+    "price_events",
+    "subscriptions_list",
+    "pool_health_history",
+    "pool_job_runs",
+    "account_status",
+    "notifications_status",
+    "notification_history",
+    "achievements_near_completion",
+    "achievements_game_detail",
+    "bills_spend_query",
+    "alert_history",
+    "update_status",
+    "agent_runs_list",
+    "agent_run_events",
+    "game_detail",
+    "game_price_history",
+    "game_versions",
+    "linked_bundles",
+    "bundle_detail",
+    "rates_history",
+    "regions_config",
 )
 
 _NET_TOOLS = ("web_search",)
 
 # 写工具（守卫词命中即拒）：单对象、可逆、1:1 用户动作
 _WRITE_TOOLS = (
+    "acknowledge_update",
     "add_follow",
     "create_price_alert",
     "update_price_alert",
@@ -71,6 +96,7 @@ _SYNC_TOOLS = (
     "sync_bills",
     "sync_family",
     "sync_subscriptions",
+    "subscription_sync",
     "refresh_rates",
     "ingest_appids",
     "refresh_game_price",
@@ -83,6 +109,7 @@ _TASK_TOOLS = (
     "list_tasks",
     "start_task",
     "cancel_task",
+    "crawl_stop",
 )
 
 # 逐工具执行预算（秒）：只读与网络类防「永不返回」；写与同步类的等待多为共享
@@ -100,6 +127,7 @@ _TOOL_BUDGET_S: dict[str, float] = {
     "list_family_library": 60.0, "list_owned": 60.0, "top_games": 60.0,
     "price_drops": 60.0, "list_bundles": 60.0, "read_session": 60.0,
     "find_deletables": 90.0, "audit_follows_workflow": 90.0,
+    "achievements_near_completion": 60.0, "bills_spend_query": 60.0,
     # 全量出口检测（逐节点探测，分钟级；工具内轮询窗 170s 略小于此预算）
     "proxy_latency_test": 180.0,
 }
@@ -214,6 +242,12 @@ def tool_step(name: str, result: dict) -> dict:
             "status": "denied" if tone == "bad" else ("empty" if tone == "warn" else "ok"),
             "data": {},
         }
+    if name == "acknowledge_update":
+        return {
+            "label": LABELS[name],
+            "status": "ok" if result.get("acknowledged") is True else "empty",
+            "data": {},
+        }
     if name in _WRITE_TOOLS or name in _SYNC_TOOLS:
         # 写与同步的结果也是行卡：时间线只给动作名（结果进卡片与正文）
         rows = result.get("rows") or []
@@ -316,6 +350,33 @@ LABELS: dict[str, str] = {
     "sync_subscriptions": "syncSubs",
     "list_tools": "listTools",
     "present_ui": "presentUI",
+    "crawl_active": "crawlActive",
+    "price_freshness": "freshness",
+    "recent_cycles": "cycles",
+    "price_events": "priceEvents",
+    "crawl_stop": "crawlStop",
+    "subscriptions_list": "subsList",
+    "subscription_sync": "subSync",
+    "pool_health_history": "healthHistory",
+    "pool_job_runs": "jobRuns",
+    "account_status": "accountStatus",
+    "notifications_status": "notifyStatus",
+    "notification_history": "notifyHistory",
+    "achievements_near_completion": "achNearDone",
+    "achievements_game_detail": "achGame",
+    "bills_spend_query": "billsQuery",
+    "alert_history": "alertHistory",
+    "update_status": "updateStatus",
+    "acknowledge_update": "updateStatus",
+    "agent_runs_list": "agentRuns",
+    "agent_run_events": "agentEvents",
+    "game_detail": "gameDetail",
+    "game_price_history": "priceHistory",
+    "game_versions": "gameVersions",
+    "linked_bundles": "linkedBundles",
+    "bundle_detail": "bundleDetail",
+    "rates_history": "ratesHistory",
+    "regions_config": "regionsConfig",
 }
 
 

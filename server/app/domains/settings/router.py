@@ -51,6 +51,8 @@ class SettingsUpdate(BaseModel):
     # 前端 apply() 每次 apply/toggle 都镜像一份到这里，关闭弹窗（独立
     # WinForms 窗）按它跟随主题。
     theme: str | None = None
+    # MCP 服务开关（外部 AI 接入面；写入即运行时启停，非重启生效）
+    mcp_enabled: bool | None = None
 
 
 class SettingsPayload(BaseModel):
@@ -66,6 +68,11 @@ class SettingsPayload(BaseModel):
     update_auto: bool = False
     direct_notice_seen: bool = False
     theme: str = "dark"
+    # MCP 面：KV 开关值 + 运行态（running=会话管理器在役；error 为空串=无故障）
+    mcp_enabled: bool = False
+    mcp_running: bool = False
+    mcp_error: str = ""
+    mcp_forced_by_env: bool = False
 
 
 # 「自动抓取」页的六个内容源开关：payload 字段 → app_settings KV。
@@ -151,6 +158,9 @@ async def get_settings() -> SettingsPayload:
     update_auto = await service.get_value("ui.update_auto", False)
     direct_notice_seen = await service.get_value("ui.direct_notice_seen", False)
     theme = await service.get_value("ui.theme", "dark")
+    from app.domains.agent import mcp as agent_mcp
+
+    mcp_state = agent_mcp.status()
     return SettingsPayload(
         account={
             "steam_id": steam_id or "",
@@ -166,6 +176,10 @@ async def get_settings() -> SettingsPayload:
         update_auto=bool(update_auto),
         direct_notice_seen=bool(direct_notice_seen),
         theme=str(theme or "dark"),
+        mcp_enabled=bool(await service.get_value("mcp.enabled", False)),
+        mcp_running=bool(mcp_state["running"]),
+        mcp_error=str(mcp_state["error"]),
+        mcp_forced_by_env=bool(mcp_state["forcedByEnv"]),
     )
 
 
@@ -210,6 +224,13 @@ async def update_settings(payload: SettingsUpdate) -> SettingsPayload:
         # 主题镜像只认两值：异常值忽略（防脏数据把弹窗配色带歪）
         if payload.theme in ("dark", "light"):
             await service.set_value("ui.theme", payload.theme)
+
+    if payload.mcp_enabled is not None:
+        from app.core.config import get_settings as get_app_settings
+        from app.domains.agent import mcp as agent_mcp
+
+        await service.set_value("mcp.enabled", bool(payload.mcp_enabled))
+        await agent_mcp.reapply(get_app_settings().data_dir)
 
     return await get_settings()
 

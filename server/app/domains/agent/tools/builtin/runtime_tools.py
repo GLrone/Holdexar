@@ -1,14 +1,8 @@
-"""运行面与会话工具：长任务调度（第三层权限）与历史会话读取。
-
-调度与写工具的本质区别：本组**不获得任何写数据权限**——调度只把已存在于
-用户界面的长任务交给运行账本（agent_runs），业务写入仍由域内编排按既有
-规则执行；kind 是登记表静态白名单（app.domains.agent.runtime.tasks），
-模型不能自由拼参数；破坏性动作（删除 / 停用 / 清空）不入登记表。"""
+"""Long-running domain work and historical conversation tools."""
 from __future__ import annotations
 
 from app.domains.agent.tools.base import ToolSpec
 from app.domains.agent.tools.builtin import _shared
-from app.crawler.utils import get_beijing_time_obj
 
 # 运行状态 → （行值词条, 色调）；一级状态语义见 runtime/state.py
 _TASK_STATUS_ROW: dict[str, tuple[str, str]] = {
@@ -32,37 +26,40 @@ def _task_row(run: dict, progress: dict | None = None, *,
               vKey: str | None = None, tone: str | None = None,
               v: str | None = None) -> dict:
     """任务行：左侧走 kindKey（任务名词条）、右侧走状态词条 + 进度原值。"""
-    from app.domains.agent.runtime import tasks as task_registry
+    from app.domains.agent import service as agent_service
 
     kind = str((run.get("meta") or {}).get("task") or "")
     default_vKey, default_tone = _TASK_STATUS_ROW.get(str(run.get("status")), ("taskQueued", "warn"))
+    if (run.get("meta") or {}).get("domainStatus") == "partial":
+        default_vKey, default_tone = "taskPartial", "warn"
     vKey = vKey or default_vKey
     tone = tone or default_tone
     if v is None:
-        prog = progress or {}
+        prog = progress or (run.get("meta") or {}).get("progress") or {}
         done, total = prog.get("done"), prog.get("total")
         v = f"{done}/{total}" if done is not None and total else None
     return {
         "k": "",
-        "kindKey": f"pilot.task.{task_registry.label_of(kind)}",
+        "kindKey": f"pilot.task.{agent_service.TASK_LABELS.get(kind, kind)}",
         "vKey": vKey,
         "tone": tone,
         "v": v or "",
         "taskKind": kind,
+        "run_id": run.get("run_id"),
     }
 
 
 async def list_tasks() -> dict:
-    """运行中的长任务与最近终态（运行账本只读投影，进度来自采样事件）。"""
+    """运行中的价格任务与最近终态，进度直接来自域记录。"""
     from app.domains.agent import service as agent_service
     from app.domains.agent.runtime import state as agent_state
 
-    runs = await agent_service.list_runs(limit=20)
-    ours = [r for r in runs if r.get("runner") == "task"]
+    runs = await agent_service.list_runs(limit=100, price_tasks_only=True)
+    ours = [r for r in runs if (r.get("meta") or {}).get("task") in agent_service.TASK_LABELS]
     live = [r for r in ours if r.get("status") not in agent_state.TERMINAL_STATES]
     rows: list[dict] = []
     for r in live:
-        rows.append(_task_row(r, await agent_service.latest_progress(r["run_id"])))
+        rows.append(_task_row(r))
     for r in [r for r in ours if r.get("status") in agent_state.TERMINAL_STATES][:3]:
         rows.append(_task_row(r))
     if not rows:
@@ -70,32 +67,53 @@ async def list_tasks() -> dict:
     return _shared.rows_result("tasks", rows, total=len(live))
 
 
-async def start_task(kind: str) -> dict:
-    """发起登记表内的长任务；受理在本次调用内完成，不等任务跑完。"""
+async def start_task(kind: str, params: dict | None = None) -> dict:
+    """调用原价格入口或真实开发任务，返回实际运行身份。"""
     from app.domains.agent import service as agent_service
-    from app.domains.agent.runtime import tasks as task_registry
+    from app.domains.crawl import service as crawl_service
 
-    spec = task_registry.get(kind)
-    if spec is None:
+    label = agent_service.TASK_LABELS.get(kind)
+    if label is None:
         return _shared.rows_result("tasks", [{"k": "", "vKey": "taskUnknown", "tone": "bad", "v": ""}])
+    params = params or {}
     try:
-        accepted = await spec.start()
+        if kind == "dev_pytest":
+            from app.domains.agent.runtime import dev_tasks
+
+            selection = str(params.get("select") or "")
+            dev_tasks.command(selection)
+            accepted = await agent_service.create_run(runner="task", trigger="manual",
+                meta={"task": kind, "select": selection})
+            run_id = accepted["run_id"]
+            await agent_service.start_run(run_id)
+        elif kind == "price_refresh":
+            accepted = await crawl_service.start_full_queue()
+            run_id = f"cycle:{accepted['cycleId']}"
+        else:
+            options = {}
+            if kind == "price_repair":
+                options = {
+                    "regions": [str(r) for r in (params.get("regions") or [])][:20] or None,
+                    "appids": [int(a) for a in (params.get("appids") or []) if int(a) > 0][:300] or None,
+                }
+                options = {key: value for key, value in options.items() if value is not None}
+            cooldown = params.get("cooldown_minutes")
+            if cooldown is not None or kind == "price_repair":
+                options["missing_cooldown"] = int(cooldown) if cooldown is not None else 0
+            accepted = await crawl_service.start_job(
+                scope="appids", kind="missing" if kind == "price_missing" else "repair",
+                trigger="manual", **options,
+            )
+            run_id = f"crawl:{accepted['id']}"
     except (RuntimeError, ValueError) as e:
-        # 域侧业务拒绝（已有任务在跑 / 无可抓对象）：如实回灌，不建空转账本
         return _shared.rows_result("tasks", [
-            {"k": "", "kindKey": f"pilot.task.{spec.label}",
+            {"k": "", "kindKey": f"pilot.task.{label}",
              "vKey": "taskBusy", "tone": "warn", "v": str(e)[:60]},
         ])
-    ref = dict(accepted or {})
-    ref["startedAt"] = get_beijing_time_obj().replace(tzinfo=None).isoformat()
-    created = await agent_service.create_run(
-        trigger="manual", runner="task",
-        meta={"task": kind, "ref": ref, "adopted": True},
-    )
-    await agent_service.start_run(created["run_id"])
-    return _shared.rows_result("tasks", [_task_row(
-        {"meta": {"task": kind}, "status": "running"}, {"total": ref.get("total")},
-    )])
+    run = await agent_service.get_run(run_id)
+    if run is None:
+        raise LookupError(f"accepted run not found: {run_id}")
+    return _shared.rows_result("tasks", [_task_row(run)])
 
 
 async def cancel_task(run_id: str | None = None, kind: str | None = None) -> dict:
@@ -103,14 +121,17 @@ async def cancel_task(run_id: str | None = None, kind: str | None = None) -> dic
     from app.domains.agent import service as agent_service
     from app.domains.agent.runtime import state as agent_state
 
-    runs = await agent_service.list_runs(limit=20)
+    runs = await agent_service.list_runs(limit=100, price_tasks_only=True)
     live = [
         r for r in runs
-        if r.get("runner") == "task" and r.get("status") not in agent_state.TERMINAL_STATES
+        if (r.get("meta") or {}).get("task") in agent_service.TASK_LABELS
+        and r.get("status") not in agent_state.TERMINAL_STATES
     ]
     target: dict | None = None
     if run_id:
-        target = next((r for r in live if r["run_id"] == run_id), None)
+        candidate = await agent_service.get_run(run_id)
+        if candidate and (candidate.get("meta") or {}).get("task") in agent_service.TASK_LABELS:
+            target = candidate
     elif kind:
         target = next((r for r in live if (r.get("meta") or {}).get("task") == kind), None)
     elif len(live) == 1:
@@ -118,9 +139,12 @@ async def cancel_task(run_id: str | None = None, kind: str | None = None) -> dic
     if target is None:
         empty_key = "taskNoRunning" if not live else "taskAmbiguous"
         return _shared.rows_result("tasks", [{"k": "", "vKey": empty_key, "tone": "warn", "v": ""}])
-    res = await agent_service.cancel_run(target["run_id"], reason="user")
+    try:
+        res = await agent_service.cancel_run(target["run_id"], reason="user")
+    except agent_service.RunCancellationUnavailable:
+        return _shared.rows_result("tasks", [_task_row(target, vKey="taskStopUnavailable", tone="warn")])
     return _shared.rows_result("tasks", [_task_row(
-        target, vKey="taskCancelled" if res.get("accepted") else None,
+        target, vKey="taskStopRequested" if res.get("accepted") else None,
     )])
 
 
@@ -183,7 +207,11 @@ async def _list_tasks(args: dict, sid: str | None = None) -> dict:
 
 
 async def _start_task(args: dict, sid: str | None = None) -> dict:
-    return await start_task(str(args.get("kind") or ""))
+    params = args.get("params")
+    return await start_task(
+        str(args.get("kind") or ""),
+        dict(params) if isinstance(params, dict) else None,
+    )
 
 
 async def _cancel_task(args: dict, sid: str | None = None) -> dict:
@@ -195,6 +223,44 @@ async def _cancel_task(args: dict, sid: str | None = None) -> dict:
 
 async def _list_sessions(args: dict, sid: str | None = None) -> dict:
     return await list_sessions()
+
+
+async def _agent_runs_list(args: dict, sid: str | None = None) -> dict:
+    """运行账本清单：长任务/编排运行的当前态与最近终态（只读投影）。"""
+    from app.domains.agent import service as agent_service
+
+    limit = max(1, min(30, int(args.get("limit") or 10)))
+    runs = await agent_service.list_runs(limit=limit)
+    rows = [
+        {"k": str(r.get("run_id"))[:8], "run_id": r["run_id"], "v": str(r.get("status") or ""),
+         "v2": str((r.get("meta") or {}).get("task") or r.get("runner") or ""),
+         "at": r.get("finished_at") or r.get("started_at") or r.get("created_at")}
+        for r in runs
+    ]
+    return _shared.rows_result("agentRuns", rows, total=len(rows))
+
+
+async def _agent_run_events(args: dict, sid: str | None = None) -> dict:
+    """单个运行的事件回放（受理/进度/终态，只读）。"""
+    from app.domains.agent import service as agent_service
+
+    run_id = str(args.get("run_id") or "")
+    if not run_id:
+        return {"kind": "empty", "note": "no_run_id"}
+    run = await agent_service.get_run(run_id)
+    if run is None:
+        return {"kind": "empty", "note": "no_run"}
+    after = int(args.get("after_seq") or 0)
+    limit = max(1, min(100, int(args.get("limit") or 30)))
+    events = await agent_service.list_events(run_id, after_seq=after, limit=limit)
+    rows = [
+        {"k": str(e.get("event_type") or ""), "v": str(e.get("seq")), "at": e.get("created_at")}
+        for e in events
+    ]
+    out = _shared.rows_result("agentEvents", rows, total=len(rows))
+    out["runId"] = run_id
+    out["runStatus"] = run.get("status")
+    return out
 
 
 async def _read_session(args: dict, sid: str | None = None) -> dict:
@@ -216,11 +282,32 @@ SPECS = [
     ToolSpec(
         name="start_task", group="read", risk="high",
         description="发起一个耗时后台任务，受理后立即返回、不阻塞回答。"
-                    "kind 只能取 price_refresh（全部价格刷新）或 price_repair（补抓缺价格的游戏）。"
-                    "仅当用户明确要求刷新价格 / 补价格时调用；发起后告知可在对话里问进度或让它停下",
+                    "kind 可取 price_refresh（全部价格刷新）、price_repair（补抓缺价/失败的游戏）、"
+                    "price_missing（按欠账账本批量补抓，冷却 24h）、"
+                    "dev_pytest（开发验收：跑仓库自动测试选集，仅源码环境）。"
+                    "price_repair 支持可选 params：regions（地区代码，只补这些区）、"
+                    "appids（对象列表）、cooldown_minutes（冷却覆盖分钟数，默认 0 立即补）；"
+                    "dev_pytest 的 params.select 取 smoke/agent/mcp/crawl/db。"
+                    "仅当用户明确要求刷新 / 补价格 / 跑测试时调用；发起后告知可问进度或让它停下",
         parameters={"type": "object", "properties": {
-            "kind": {"type": "string", "enum": ["price_refresh", "price_repair"],
+            "kind": {"type": "string",
+                     "enum": ["price_refresh", "price_repair", "price_missing", "dev_pytest"],
                      "description": "任务类型"},
+            "params": {
+                "type": "object",
+                "description": "任务参数（白名单字段，未支持的任务忽略）",
+                "properties": {
+                    "regions": {"type": "array", "items": {"type": "string"},
+                                "description": "地区代码列表（如 cn/us/ru）"},
+                    "appids": {"type": "array", "items": {"type": "integer"},
+                               "description": "对象 appid 列表（≤300）"},
+                    "cooldown_minutes": {"type": "integer",
+                                         "description": "补抓冷却覆盖（分钟）"},
+                    "select": {"type": "string",
+                               "enum": ["smoke", "agent", "mcp", "crawl", "db"],
+                               "description": "开发测试选集（dev_pytest 用）"},
+                },
+            },
         }, "required": ["kind"]},
         handler=_start_task, step_label="taskStart",
     ),
@@ -230,7 +317,8 @@ SPECS = [
                     "只有一个任务在跑时可只给 kind 或都不给",
         parameters={"type": "object", "properties": {
             "run_id": {"type": "string", "description": "运行标识（来自 list_tasks 结果）"},
-            "kind": {"type": "string", "enum": ["price_refresh", "price_repair"]},
+            "kind": {"type": "string",
+                     "enum": ["price_refresh", "price_repair", "price_missing", "dev_pytest"]},
         }},
         handler=_cancel_task, step_label="taskCancel",
     ),
@@ -255,5 +343,25 @@ SPECS = [
             "count": {"type": "integer", "description": "本次读取的轮数，默认 8，最多 30"},
         }, "required": ["sid"]},
         handler=_read_session, step_label="sessionRead",
+    ),
+    ToolSpec(
+        name="agent_runs_list", group="read", risk="low",
+        description="查看后台运行账本：最近的长任务与编排运行的状态"
+                    "（排队/运行/完成/失败/取消）。核对任务真实执行与终态时调用",
+        parameters={"type": "object", "properties": {
+            "limit": {"type": "integer", "description": "返回条数，默认 10，最多 30"},
+        }},
+        handler=_agent_runs_list, step_label="agentRuns",
+    ),
+    ToolSpec(
+        name="agent_run_events", group="read", risk="low",
+        description="读取某个后台运行的事件回放（受理/进度采样/终态），"
+                    "配合 agent_runs_list 的运行标识使用；after_seq 支持增量续读",
+        parameters={"type": "object", "properties": {
+            "run_id": {"type": "string", "description": "运行标识（来自运行账本清单）"},
+            "after_seq": {"type": "integer", "description": "只取该序号之后的事件，默认 0"},
+            "limit": {"type": "integer", "description": "返回条数，默认 30，最多 100"},
+        }, "required": ["run_id"]},
+        handler=_agent_run_events, step_label="agentEvents",
     ),
 ]

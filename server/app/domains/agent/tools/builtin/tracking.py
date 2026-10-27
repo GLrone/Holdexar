@@ -109,7 +109,7 @@ async def bundle_follow(bundle_id: int, *, follow: bool = True) -> dict:
 
 async def list_bundles() -> dict:
     """捆绑包列表前列（diff 差价降序，缓存聚合零外网）。"""
-    bundles = await bundles_service.list_bundles("diff")
+    page = await bundles_service.list_bundles("diff")
     rows = [
         {
             "k": b.get("name") or f"Bundle {b.get('bundleId')}",
@@ -117,9 +117,9 @@ async def list_bundles() -> dict:
             "data": {"priceFen": b.get("cnCnyFen"), "lowFen": b.get("lowestCnyFen"), "bundleId": b.get("bundleId")},
             "v": str(b.get("lowestRegion") or "").upper(),
         }
-        for b in bundles
+        for b in page["bundles"]
     ]
-    return _shared.rows_result("bundlesAll", rows, total=len(rows))
+    return _shared.rows_result("bundlesAll", rows, total=page["total"])
 
 
 async def monitor_add(appid: int) -> dict:

@@ -1,4 +1,4 @@
-"""运行账本桥语义测试：job 入账 / 异常归因 / 终态采样 / 段位流水 / 受纳运行 / 保留窗。
+"""运行账本桥语义测试：job 入账 / 异常归因 / 段位流水 / 保留窗。
 
 隔离口径与 test_agent_task_runner 一致（独立 tmp SQLite + 外键开启 + 真实
 write_gate）。job 本体全部打桩——本文件证明的是「账本桥语义」。
@@ -18,9 +18,7 @@ from app.core.database import Base
 from app.domains.agent import service as agent_service
 from app.domains.agent.models import AgentEvent, AgentRun, AgentSession
 from app.domains.agent.runtime import scheduler_bridge
-from app.domains.agent.runtime import tasks as task_registry
 from app.domains.agent.runtime.cancellation import REGISTRY
-from app.domains.agent.runtime.tasks import TaskSpec
 
 
 @pytest.fixture
@@ -33,32 +31,6 @@ def db():
         entry = REGISTRY.pop(rid)
         if entry and entry.task and not entry.task.done():
             entry.task.cancel()
-
-
-@pytest.fixture
-def stub_kind(monkeypatch):
-    def install(observe) -> TaskSpec:
-        async def _start() -> dict:
-            return {"total": 2}
-
-        spec = TaskSpec(
-            kind="stub", label="priceRefresh", start=_start, observe=observe,
-        )
-        monkeypatch.setitem(task_registry._REGISTRY, "stub", spec)
-        return spec
-
-    return install
-
-
-async def wait_status(run_id: str, statuses: set[str], timeout: float = 5.0) -> dict:
-    deadline = time.monotonic() + timeout
-    run: dict | None = None
-    while time.monotonic() < deadline:
-        run = await agent_service.get_run(run_id)
-        if run and run["status"] in statuses:
-            return run
-        await asyncio.sleep(0.01)
-    raise AssertionError(f"timeout waiting for {statuses}, last={run}")
 
 
 class TestRunAccounted:
@@ -110,76 +82,23 @@ class TestRunAccounted:
 
         assert await scheduler_bridge.run_accounted("j", _job) == "fine"
 
-    @pytest.mark.asyncio
-    async def test_task_kind_samples_domain_outcome(self, db, stub_kind):
-        async def _observe(ref):
-            return {"active": False, "phase": "idle", "outcome": "failed"}
+    def test_bridge_has_no_domain_sampling_interface(self):
+        import inspect
 
-        stub_kind(_observe)
-
-        async def _job():
-            return None
-
-        # fn 正常结束但域账本终态 failed → run 收 failed + domain_failed
-        await scheduler_bridge.run_accounted(
-            "mapped_job", _job, task_kind="stub", ref={"startedAt": "2026-01-01T00:00:00"},
-        )
-        runs = await agent_service.list_runs(status="failed")
-        run = next(r for r in runs if (r.get("meta") or {}).get("job") == "mapped_job")
-        assert run["error_code"] == "domain_failed"
+        assert "task_kind" not in inspect.signature(scheduler_bridge.run_accounted).parameters
+        assert not hasattr(scheduler_bridge, "_sample_outcome")
 
     @pytest.mark.asyncio
-    async def test_task_kind_unknown_kind_still_done(self, db):
-        async def _job():
-            return 1
+    async def test_result_is_not_reinterpreted_as_domain_verdict(self, db):
+        async def job():
+            return {"status": "failed", "outcome": "failed"}
 
-        assert await scheduler_bridge.run_accounted(
-            "j2", _job, task_kind="not_registered"
-        ) == 1
-        runs = await agent_service.list_runs(status="done")
-        assert any((r.get("meta") or {}).get("job") == "j2" for r in runs)
-
-    @pytest.mark.asyncio
-    async def test_task_kind_without_ref_gets_start_anchor(self, db, stub_kind):
-        """桥接采样不传 ref：建账时刻自动作 startedAt 锚点，observe 拿到它
-        （跳过拍不得把历史 job/cycle 的业务终态错收进本次 run）。"""
-        seen: dict = {}
-
-        async def _observe(ref):
-            seen.update(ref)
-            return {"active": False, "phase": "idle", "outcome": "completed"}
-
-        stub_kind(_observe)
-
-        async def _job():
-            return None
-
-        await scheduler_bridge.run_accounted("anchored_job", _job, task_kind="stub")
-        assert seen.get("startedAt"), "observe 必须拿到本 run 的建账时刻锚点"
-        runs = await agent_service.list_runs()
-        run = next(
-            r for r in runs if (r.get("meta") or {}).get("job") == "anchored_job"
-        )
-        assert (run.get("meta") or {}).get("ref", {}).get("startedAt")
-
-    @pytest.mark.asyncio
-    async def test_task_kind_keeps_caller_started_at(self, db, stub_kind):
-        """调用方已给 startedAt（受理路径）时不覆盖。"""
-        seen: dict = {}
-
-        async def _observe(ref):
-            seen.update(ref)
-            return {"active": False, "phase": "idle"}
-
-        stub_kind(_observe)
-
-        async def _job():
-            return None
-
-        await scheduler_bridge.run_accounted(
-            "kept_job", _job, task_kind="stub", ref={"startedAt": "2020-01-01T00:00:00"},
-        )
-        assert seen["startedAt"] == "2020-01-01T00:00:00"
+        result = await scheduler_bridge.run_accounted("generic_job", job)
+        assert result == {"status": "failed", "outcome": "failed"}
+        run = (await agent_service.list_runs())[0]
+        assert run["status"] == "done" and run["error_code"] is None
+        assert "task" not in run["meta"]
+        assert run["meta"]["ref"] == {}
 
 
 class TestNoteStep:
@@ -299,11 +218,11 @@ class TestSkipNotes:
         async def enabled(key):
             return True
 
-        async def no_gaps():
-            return {"windows": []}
+        async def no_gaps(**kwargs):
+            return {"status": "no_gaps"}
 
         monkeypatch.setattr(sched, "content_fetch_enabled", enabled)
-        monkeypatch.setattr(rates_history, "scan_history_gaps", no_gaps)
+        monkeypatch.setattr(rates_history, "repair_history_gaps", no_gaps)
         await scheduler_bridge.run_accounted("fx_history_repair", sched._job_fx_history_repair)
         run, steps = await self._last_skip("fx_history_repair")
         assert run["status"] == "done"
@@ -394,23 +313,6 @@ class TestNoteJobSkipped:
             assert scheduler_bridge._RUNNING_JOB_RUNS["map_job2"] == "foreign_run"
         finally:
             scheduler_bridge._RUNNING_JOB_RUNS.pop("map_job2", None)
-
-
-class TestAdoptTaskRun:
-    @pytest.mark.asyncio
-    async def test_adopted_run_converges_done(self, db, stub_kind):
-        async def _observe(ref):
-            return {"active": False, "phase": "idle", "outcome": "completed"}
-
-        stub_kind(_observe)
-
-        created = await agent_service.adopt_task_run(
-            kind="stub", ref={"startedAt": datetime.now().isoformat(), "count": 2},
-        )
-        run = await wait_status(created["run_id"], {"done"})
-        assert run["runner"] == "task"
-        assert run["meta"]["adopted"] is True
-        assert run["meta"]["task"] == "stub"
 
 
 class TestPruneCrawlJobs:

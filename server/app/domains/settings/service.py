@@ -13,18 +13,20 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core import secretbox
 from app.core.database import WritePriority, get_session_factory, write_session
-from app.core.database import write_gate
 from app.core.secretbox import SecretBoxError
 from app.domains.settings.models import AppSetting
 from app.crawler.utils import get_beijing_time_obj
 
 # 凭据类设置键：落库即 AES-256-GCM 密文（secretbox 按机器派生密钥），
 # 读取时解密；存量明文由启动加密步骤（seal_secret_values）封装
-SECRET_KEYS = ("account.steam_api_key", "pilot.llm.api_key")
+SECRET_KEYS = ("account.steam_api_key", "pilot.llm.api_key", "pilot.llm.provider_key.legacy-v1")
 
 
 def _secret_purpose(key: str) -> str:
     """凭据键的加密用途串（每键独立派生密钥）。"""
+    # 迁入的旧单配置密文保持原用途；已发布的 main 供应商仍用它自己的用途。
+    if key == "pilot.llm.provider_key.legacy-v1":
+        return "kv:pilot.llm.api_key"
     return f"kv:{key}"
 
 
@@ -44,11 +46,21 @@ async def delete_value(key: str) -> None:
 
 
 async def set_value(key: str, value) -> None:
+    await set_values({key: value})
+
+
+async def set_values(values: dict, *, secret_values: dict | None = None) -> None:
+    """同一次配置操作批量提交；凭据在现有设置边界密封。"""
+    values = dict(values)
+    for key, value in (secret_values or {}).items():
+        values[key] = secretbox.encrypt_secret(str(value), _secret_purpose(key)) if value not in (None, "") else value
+    if not values:
+        return
     now = get_beijing_time_obj().replace(tzinfo=None)
     async with write_session(WritePriority.INTERACTIVE, label="settings") as session:
-        stmt = sqlite_insert(AppSetting).values(
-            key=key, value_json=value, updated_at=now
-        )
+        stmt = sqlite_insert(AppSetting).values([
+            {"key": key, "value_json": value, "updated_at": now} for key, value in values.items()
+        ])
         await session.execute(
             stmt.on_conflict_do_update(
                 index_elements=[AppSetting.key],
@@ -77,10 +89,7 @@ async def get_secret_value(key: str, default=None):
 
 async def set_secret_value(key: str, value) -> None:
     """凭据键写入：非空值封装为密文落库；空值 / None 原样落库（清空语义）。"""
-    if value is None or value == "":
-        await set_value(key, value)
-        return
-    await set_value(key, secretbox.encrypt_secret(str(value), _secret_purpose(key)))
+    await set_values({}, secret_values={key: value})
 
 
 async def seal_secret_values() -> int:
