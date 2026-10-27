@@ -21,21 +21,18 @@ APP_VERSION = "0.3.5-beta"
 GITHUB_REPO = "GLrone/Holdexar"
 
 # GitHub Release 资产下载镜像链（空串 = 直连 GitHub 兜底）。
-# 供 updater、seed_fetch 与 scripts/fetch_seed 三处共用，唯一事实源。
+# 供 updater 与 desktop 壳共用，唯一事实源。
 GITHUB_MIRRORS = ("https://ghfast.top/", "https://gh-proxy.com/", "https://gh-proxy.net/", "")
-
-# 公共数据分发直链（对象存储上的自有入口）。种子这类数百 MB 的资产走它比
-# 走 GitHub 及其代理快一个量级，且不占发布仓库的带宽；不可达时下载链自动
-# 换回下面的 GitHub 通道，不需要用户做任何选择。
-# 空串 = 该通道不参与（自建分发未就绪时不产生无效候选）。
-DATA_CDN_BASE = "https://data.steamhl.com"
 
 # 更新清单落在一个**固定 tag** 的 Release 资产下，与版本号解耦：
 # 客户端检查更新永远只读这一个地址，不打 api.github.com（免限速、国内可达）。
 # 发布端的对应动作在 scripts/publish_release.py（刷该 tag 的资产）。
 MANIFEST_TAG = "updater"
 MANIFEST_ASSET = "latest.json"
-MANIFEST_SCHEMA = 1
+# schema 2 起：清单附 Ed25519 签名（signature 字段），客户端只认内嵌公钥
+# （core/update_signing.TRUSTED_PUBKEYS）。schema 1 的旧客户端忽略新字段，
+# 字段集保持向后兼容。
+MANIFEST_SCHEMA = 2
 
 # 换装暂存落点与交接标记：desktop/main.py 与 app/core/updater.py 共用一份——
 # 写标记的一方与判标记的一方各写一套字符串，必然漂移成「落下去了但没判住」。
@@ -57,8 +54,10 @@ ENV_PREFIX = "HOLDEXAR_"
 # 必须落在现装侧，不能指望暂存包自己守规矩。换装成功/用户重新下载时清零。
 HANDOFF_LEDGER_NAME = "update-handoff.json"
 
-# 健康检查超时阈值（秒）
-HEALTH_TIMEOUT = 30.0
+# 健康检查超时阈值（秒）。换装验收对象是**新拷贝落盘、从未运行过**的二进制：
+# 冷启动含杀软同步扫描与建库导入，须与桌面壳自身的首跑等待预算（desktop/main
+# 的 90s）同量级——压得过低会把「还在启动」误判为「不健康」，好更新被回滚。
+HEALTH_TIMEOUT = 90.0
 
 
 def version_from_tag(tag: str) -> str:

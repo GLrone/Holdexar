@@ -10,29 +10,23 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from app.core import backup, database, layout
+from app.core import layout
+from app.core.app_info import APP_SLUG
+from app.core import db_safety
 
 _REGISTRATION_WAIT_SECONDS = 3.0
 
 
 def _db_path(data_dir: Path) -> Path:
-    return data_dir.resolve() / database.get_settings().db_filename
+    return data_dir.resolve() / f"{APP_SLUG}.db"
 
 
 def read_schema_version(data_dir: Path) -> int:
-    db = _db_path(data_dir)
-    try:
-        connection = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=0)
-        try:
-            return int(connection.execute("PRAGMA user_version").fetchone()[0])
-        finally:
-            connection.close()
-    except sqlite3.Error as exc:
-        raise RuntimeError("数据库结构版本无法读取，已停止选择程序") from exc
+    return db_safety.read_schema_version(data_dir, f"{APP_SLUG}.db")
 
 
 def _marker_path(data_dir: Path) -> Path:
-    return data_dir.resolve() / backup._BACKUP_DIR_NAME / backup._LOCK_FILE
+    return data_dir.resolve() / db_safety._BACKUP_DIR_NAME / db_safety._LOCK_FILE
 
 
 def _read_marker(data_dir: Path) -> dict | None:
@@ -96,11 +90,11 @@ def prepare(root: Path, data_dir: Path, attempt: str) -> dict:
     data_dir.mkdir(parents=True, exist_ok=True)
     db = _db_path(data_dir)
     name = hashlib.sha256(attempt.encode("utf-8")).hexdigest()[:24]
-    snapshot = data_dir / backup._BACKUP_DIR_NAME / f"update-{name}.original.db"
+    snapshot = data_dir / db_safety._BACKUP_DIR_NAME / f"update-{name}.original.db"
     if snapshot.exists():
         raise RuntimeError("本次升级的原始快照已存在，拒绝覆盖")
-    with database.sync_write_gate(db):
-        marker, token = backup._acquire_restore_lock(
+    with db_safety.sync_write_gate(db):
+        marker, token = db_safety._acquire_restore_lock(
             db_path=db, purpose="update", install_root=root, attempt_id=attempt,
         )
         snapshot_ready = False
@@ -109,10 +103,10 @@ def prepare(root: Path, data_dir: Path, attempt: str) -> dict:
             digest = None
             if had_database:
                 with _read_only_source(db):
-                    backup.snapshot_to(db, snapshot)
-                if not backup._verify_file(snapshot, True)[0]:
+                    db_safety.snapshot_to(db, snapshot)
+                if not db_safety._verify_file(snapshot, True)[0]:
                     raise RuntimeError("升级原始数据库快照校验失败")
-                digest = backup.sha256_of(snapshot)
+                digest = db_safety.sha256_of(snapshot)
                 with snapshot.open("rb+") as stream:
                     os.fsync(stream.fileno())
             snapshot_ready = True
@@ -125,7 +119,7 @@ def prepare(root: Path, data_dir: Path, attempt: str) -> dict:
             )
         except BaseException:
             if not snapshot_ready:
-                backup._release_restore_lock(marker, token)
+                db_safety._release_restore_lock(marker, token)
             raise
 
 
@@ -133,7 +127,7 @@ def validate_startup(data_dir: Path) -> str | None:
     data_dir = data_dir.resolve()
     marker = _read_marker(data_dir)
     if marker is not None and marker.get("purpose") != "update":
-        backup.ensure_restore_lock_available(_db_path(data_dir))
+        db_safety.ensure_restore_lock_available(_db_path(data_dir))
         marker = _read_marker(data_dir)
     attempt = os.environ.get("HOLDEXAR_UPDATE_ATTEMPT_ID")
     if marker is None and not attempt:
@@ -146,7 +140,7 @@ def validate_startup(data_dir: Path) -> str | None:
     tx = _transaction(root)
     deadline = time.monotonic() + _REGISTRATION_WAIT_SECONDS
     while tx.get("dataProbeRegistrationRequired"):
-        if not backup._pid_is_running(marker.get("pid", 0)):
+        if not db_safety._pid_is_running(marker.get("pid", 0)):
             raise RuntimeError("升级宿主已退出，拒绝初始化受保护数据库")
         registered = any(
             isinstance(child, dict) and child.get("pid") == os.getpid()
@@ -176,6 +170,8 @@ def startup_authorization(data_dir: Path):
     if token is None:
         yield None
     else:
+        from app.core import database
+
         with database.maintenance_authorization(token):
             yield token
 
@@ -185,7 +181,7 @@ def _require_children_stopped(tx: dict, children_stopped: bool) -> None:
         raise RuntimeError("尚未确认升级验收进程全部退出，拒绝恢复数据")
     for child in tx.get("children", []):
         pid = child.get("pid") if isinstance(child, dict) else None
-        if not isinstance(pid, int) or pid <= 0 or backup._pid_is_running(pid):
+        if not isinstance(pid, int) or pid <= 0 or db_safety._pid_is_running(pid):
             raise RuntimeError("升级验收进程尚未退出或身份无法确认")
 
 
@@ -194,8 +190,8 @@ def _check_snapshot(tx: dict) -> Path | None:
         return None
     path = Path(tx.get("dataSnapshot") or "")
     if (
-        not path.is_file() or backup.sha256_of(path) != tx.get("dataSnapshotSha256")
-        or not backup._verify_file(path, True)[0]
+        not path.is_file() or db_safety.sha256_of(path) != tx.get("dataSnapshotSha256")
+        or not db_safety._verify_file(path, True)[0]
     ):
         raise RuntimeError("升级原始快照已损坏或不完整，拒绝覆盖当前数据")
     return path
@@ -240,7 +236,7 @@ def rollback(root: Path, *, children_stopped: bool) -> dict:
     _require_children_stopped(tx, children_stopped)
     db = Path(tx["dataDbPath"])
     _matching_marker(root, tx)
-    with database.sync_write_gate(db, maintenance_token=tx["dataToken"]):
+    with db_safety.sync_write_gate(db, maintenance_token=tx["dataToken"]):
         tx = _transaction(root)
         _matching_marker(root, tx)
         if tx.get("dataAccepted"):
@@ -277,23 +273,23 @@ def rollback(root: Path, *, children_stopped: bool) -> dict:
                 raise RuntimeError("恢复目标出现未知数据库侧车文件，已停止覆盖")
         if phase == "restoring":
             if db.exists():
-                if snapshot is None or backup.sha256_of(db) != tx["dataSnapshotSha256"]:
+                if snapshot is None or db_safety.sha256_of(db) != tx["dataSnapshotSha256"]:
                     raise RuntimeError("恢复目标出现未知数据，拒绝覆盖")
             elif snapshot is not None:
                 staging = snapshot.with_name(snapshot.name + ".restore-copy")
                 shutil.copyfile(snapshot, staging)
-                if backup.sha256_of(staging) != tx["dataSnapshotSha256"]:
+                if db_safety.sha256_of(staging) != tx["dataSnapshotSha256"]:
                     raise RuntimeError("数据库恢复副本校验失败")
                 with staging.open("rb+") as stream:
                     os.fsync(stream.fileno())
                 os.replace(staging, db)
-            if snapshot is not None and not backup._verify_file(db, True)[0]:
+            if snapshot is not None and not db_safety._verify_file(db, True)[0]:
                 raise RuntimeError("恢复后的数据库校验失败")
             _record(root, dataRecoveryPhase="restored")
         elif phase != "restored":
             raise RuntimeError("数据库恢复阶段无法识别")
         elif (snapshot is None and db.exists()) or (
-            snapshot is not None and (not db.is_file() or backup.sha256_of(db) != tx["dataSnapshotSha256"])
+            snapshot is not None and (not db.is_file() or db_safety.sha256_of(db) != tx["dataSnapshotSha256"])
         ):
             raise RuntimeError("已恢复数据库出现未知变更，已保留保护")
         return {"restored": True, "alreadyRestored": phase == "restored", "dataDir": str(db.parent)}
@@ -304,14 +300,14 @@ def _release_completed_rollback(root: Path, tx: dict) -> None:
     if _read_marker(db.parent) is None:
         return
     _matching_marker(root, tx)
-    with database.sync_write_gate(db, maintenance_token=tx["dataToken"]):
+    with db_safety.sync_write_gate(db, maintenance_token=tx["dataToken"]):
         current = _transaction(root)
         if current["attemptId"] != tx["attemptId"] or not current.get("dataRollbackReleased"):
             raise RuntimeError("回退完成记录已变化，保留数据保护")
         _matching_marker(root, current)
         with (root / layout.STATE_DIR_NAME / layout.TRANSACTION_FILE).open("rb+") as stream:
             os.fsync(stream.fileno())
-        backup._release_restore_lock(_marker_path(db.parent), current["dataToken"])
+        db_safety._release_restore_lock(_marker_path(db.parent), current["dataToken"])
 
 
 def _check_rollback_terminal(root: Path, tx: dict) -> None:
@@ -336,7 +332,7 @@ def finish_rollback(root: Path) -> dict:
     _check_rollback_terminal(root, tx)
     _matching_marker(root, tx)
     db = Path(tx["dataDbPath"])
-    with database.sync_write_gate(db, maintenance_token=tx["dataToken"]):
+    with db_safety.sync_write_gate(db, maintenance_token=tx["dataToken"]):
         tx = _transaction(root)
         _check_rollback_terminal(root, tx)
         _matching_marker(root, tx)
@@ -344,13 +340,13 @@ def finish_rollback(root: Path) -> dict:
         if any(db.with_name(db.name + suffix).exists() for suffix in ("-wal", "-shm")):
             raise RuntimeError("已恢复数据库出现未知侧车文件，保留数据保护")
         if (not tx.get("dataHadDatabase") and db.exists()) or (
-            tx.get("dataHadDatabase") and (not db.is_file() or backup.sha256_of(db) != tx["dataSnapshotSha256"])
+            tx.get("dataHadDatabase") and (not db.is_file() or db_safety.sha256_of(db) != tx["dataSnapshotSha256"])
         ):
             raise RuntimeError("已恢复数据库出现未知变更，保留数据保护")
         with (root / layout.STATE_DIR_NAME / layout.CURRENT_STATE_FILE).open("rb+") as stream:
             os.fsync(stream.fileno())
         _record(root, dataRollbackReleased=True)
-        backup._release_restore_lock(_marker_path(db.parent), tx["dataToken"])
+        db_safety._release_restore_lock(_marker_path(db.parent), tx["dataToken"])
         return {"released": True, "alreadyReleased": False, "dataDir": tx["dataDir"]}
 
 
@@ -388,7 +384,7 @@ def abort_preparation(root: Path, *, data_dir: Path | None = None) -> dict:
     marker = _preparation_marker(root, data_dir, tx)
     if marker is None:
         return {"aborted": True, "alreadyReleased": True, "dataDir": str(data_dir)}
-    with database.sync_write_gate(_db_path(data_dir), maintenance_token=marker["token"]):
+    with db_safety.sync_write_gate(_db_path(data_dir), maintenance_token=marker["token"]):
         current = _transaction(root)
         if current["attemptId"] != tx["attemptId"]:
             raise RuntimeError("升级准备事务已变化，拒绝解除保护")
@@ -396,7 +392,7 @@ def abort_preparation(root: Path, *, data_dir: Path | None = None) -> dict:
         current_marker = _preparation_marker(root, data_dir, current)
         if current_marker is None or current_marker["token"] != marker["token"]:
             raise RuntimeError("升级准备保护已变化，拒绝解除")
-        backup._release_restore_lock(_marker_path(data_dir), marker["token"])
+        db_safety._release_restore_lock(_marker_path(data_dir), marker["token"])
         return {"aborted": True, "alreadyReleased": False, "dataDir": str(data_dir)}
 
 
@@ -422,11 +418,11 @@ def accept(root: Path) -> dict:
     db = Path(tx["dataDbPath"])
     marker = _read_marker(db.parent)
     if marker is not None and marker.get("purpose") != "update":
-        backup.ensure_restore_lock_available(db)
+        db_safety.ensure_restore_lock_available(db)
         marker = _read_marker(db.parent)
     if marker is not None or not tx.get("dataAccepted"):
         _matching_marker(root, tx)
-    with database.sync_write_gate(db, maintenance_token=tx["dataToken"]):
+    with db_safety.sync_write_gate(db, maintenance_token=tx["dataToken"]):
         current = _transaction(root)
         if current["attemptId"] != tx["attemptId"]:
             raise RuntimeError("升级验收事务已变化，保留数据保护")
@@ -443,5 +439,5 @@ def accept(root: Path) -> dict:
             tx = _record(root, dataAccepted=True, dataSchemaVersion=schema, dataRecoveryPhase="accepted")
         layout.write_data_compatibility(root, compatibility)
         if marker is not None:
-            backup._release_restore_lock(_marker_path(db.parent), tx["dataToken"])
+            db_safety._release_restore_lock(_marker_path(db.parent), tx["dataToken"])
         return tx

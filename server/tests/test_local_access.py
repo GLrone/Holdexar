@@ -202,3 +202,26 @@ def test_host_allowed_matrix():
     assert not access.host_allowed("evil.example:28765")
     assert not access.host_allowed("127.0.0.1.evil.example:28765")
     assert not access.host_allowed("")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/v1/health", "/api/v1/session/dev"])
+async def test_public_route_rejects_rebinding_host(path):
+    async with _client(_app(), host="evil.example:28765") as client:
+        response = await client.get(path)
+        assert response.status_code == 421
+        assert access.SESSION_COOKIE not in response.cookies
+
+
+@pytest.mark.asyncio
+async def test_dev_session_rejects_other_local_origin():
+    async with _client(_app()) as client:
+        response = await client.get("/api/v1/session/dev", headers={"Origin": "http://127.0.0.1:9000"})
+        assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_public_dev_session_accepts_same_ipv6_origin():
+    async with _client(_app(), host="[::1]:28765") as client:
+        response = await client.get("/api/v1/session/dev", headers={"Origin": "http://[::1]:28765"})
+        assert response.status_code == 200

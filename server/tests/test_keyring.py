@@ -170,7 +170,7 @@ async def test_export_excludes_seed_and_decrypts_secrets(db, tmp_path):
 
     # 种子 / 公共目录表不进导出
     for table in ("games", "game_current_prices", "game_price_history", "fx_rates",
-                  "crawl_regions", "bundles"):
+                  "crawl_regions", "bundles", "clash_nodes", "proxy_nodes"):
         assert table not in payload["tables"]
     # 种子 marker 键被剔除
     keys = {row["key"]: row["value"] for row in payload["tables"]["app_settings"]}

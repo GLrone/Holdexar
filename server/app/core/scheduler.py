@@ -2,7 +2,7 @@
 
 价格网格锚=Steam 折扣刷新时刻（北京 01:00 夏令时 / 02:00 冬令时）+ 6h 步进，
 每轮用外部时间重算下一格（DST 自动换轨）；三层串行 欠账补抓 → 监控层 →
-目录层，每轮由一个 PriceCycle 统管（`_run_price_cycle`）。
+目录层，每轮由一个 PriceCycle 统管（`cycle_run.run_price_cycle`）。
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from app.core.logging import log_event
 
 logger = logging.getLogger(__name__)
 
-scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
+scheduler = AsyncIOScheduler(timezone="Asia/Shanghai", job_defaults={"coalesce": True, "max_instances": 1})
 
 _BOARD_LABELS = {
     "topsellers": "热销榜",
@@ -35,6 +35,7 @@ _JOB_LABELS = {
     "wishlist_sync": "心愿单同步",
     "price_refresh": "价格刷新",
     "price_repair": "价格补抓",
+    "mini_seed": "基础资料同步",
     "fx_refresh": "汇率刷新",
     "fx_history_repair": "汇率历史补抓",
     "proxy_health": "代理体检",
@@ -187,7 +188,7 @@ async def _job_wishlist_sync() -> None:
         try:
             uniq = sorted(set(pending_new))
             results = await crawl_service.run_sequential(
-                [{"scope": "appids", "appids": uniq, "kind": "wishlist_sync"}],
+                [{"scope": "appids", "appids": uniq, "kind": "wishlist_sync"}], trigger="scheduled",
             )
             if results:
                 log_event(
@@ -219,7 +220,7 @@ async def _job_wishlist_sync() -> None:
                         "scope": "appids",
                         "appids": appids,
                         "kind": "wishlist_sync",
-                    }],
+                    }], trigger="scheduled",
                 )
                 if results:
                     log_event(
@@ -373,7 +374,7 @@ async def price_refresh_interval_hours() -> int:
     return max(1, min(72, hours))
 
 
-async def _reanchor_price_refresh(reason: str) -> None:
+async def _reanchor_price_refresh(reason: str, *, external: bool = True) -> None:
     """用外部时间重算 price_refresh 下一格并重锚（自续约核心）。
 
     永不抛异常——重锚失败时保留现有 next_run_time，interval 兜底
@@ -381,7 +382,8 @@ async def _reanchor_price_refresh(reason: str) -> None:
     """
     try:
         hours = await price_refresh_interval_hours()
-        nxt, hour, is_dst, source = await probe_next_grid(timedelta(hours=hours))
+        nxt, hour, is_dst, source = (await probe_next_grid(timedelta(hours=hours)) if external
+            else local_next_grid(timedelta(hours=hours)))
         scheduler.modify_job("price_refresh", next_run_time=nxt)
         log_event(
             logger,
@@ -406,21 +408,8 @@ async def _reanchor_price_refresh(reason: str) -> None:
         )
 
 
-# ── 5min 失败记录修复线程 ──
-# 主价格刷新轮结束工作后到下一轮之间的空窗，每 5 分钟扫全库失败记录
-# （price_status='missing'）定向重抓；空闲门禁看任务表不看 6h 间隔——
-# 任何爬取任务（含用户手动）在跑 = 爬虫未结束工作，本轮让路。
-# 撞锁保护：主价格刷新轮开头置 _price_cycle_busy（修复轮让路）+ 排干
-# 等待在跑任务结束后再开三层链（run_sequential 撞锁 spec 整条丢弃）。
+# 主轮执行期间，普通补抓拍让路。
 _price_cycle_busy = False
-
-# 排干等待参数：修复轮/用户任务占锁时主轮等它结束再开三层链
-_DRAIN_POLL_SECONDS = 10
-_DRAIN_MAX_POLLS = 60  # 60 × 10s = 10min 上限，超时放行（走撞锁跳过语义）
-
-# 链内让路重试：开链后仍被同拍任务挤占（修复拍/榜单反哺/促销重试逐个
-# 抢走单任务爬虫）时的每拍等待秒数
-_SPEC_YIELD_WAIT_SECONDS = 30
 
 
 async def price_auto_enabled() -> bool:
@@ -537,124 +526,37 @@ def _crawler_idle() -> bool:
 
 
 async def _job_price_repair() -> None:
-    """失败记录修复（5min 一轮）：扫全库 missing 失败记录定向重抓。
-
-    复用 kind='repair'（与主轮 missing 层同通道：按区批量定向补抓、
-    低 worker、无打折预检）——抓取逻辑与主爬虫一致；
-    仍失败由 handler 照常 mark_region_status('missing') 计账（失败
-    标志保留，fail_count 递增，连续 5 次转 blocked 终态停烧配额，
-    主轮 watch 层全区重爬仍是恢复通道），成功则清账自愈闭环。
-
-    冷却 4min（< 轮转 5min）：上一轮刚标失败的区下一轮修复即可复访，
-    不必等主轮 24h 冷却；不设 0 是防同轮内重复拾取。
-
-    归属边界：本轮启动的 job 不挂 Price Cycle（`cycle_id` 为 NULL）——修复
-    候选是全库 missing 账本，与某一轮的期望集没有确定性关联，不做时间
-    猜测式归属；归属留给按缺口单元承接的阶段。
-
-    门禁三层：主价格刷新轮占线（busy）让路；任何爬取任务在跑让路
-    （用户手动/愿望单同步/榜单反哺都算「爬虫未结束工作」）；无欠账
-    （ValueError）静默跳过。撞锁（RuntimeError）静默——上轮修复还在
-    收尾，下轮再来。
-    """
-    global _price_cycle_busy
-    if not _crawler_idle():
-        await scheduler_bridge_note("price_repair", {"skipped": "crawler_busy"})
-        return
-    if not await price_auto_enabled():
-        await scheduler_bridge_note("price_repair", {"skipped": "auto_price_off"})
-        return
+    """维护派生视图、价格欠项与未完提醒，失败交给下一拍。"""
     from app.domains.crawl import service as crawl_service
+    from app.domains.games.derived import maintain_derived
+    from app.domains.notifications import service as notifications
 
-    try:
-        result = await crawl_service.run_sequential(
-            [{"kind": "repair"}],
-            missing_cooldown=4,
-        )
-        if result:
-            log_event(
-                logger,
-                "失败记录修复完成",
-                detail={
-                    "任务数": len(result),
-                    "任务编号": "、".join(str(r["id"]) for r in result[:5]),
-                },
-            )
-    except ValueError as e:
-        # 无欠账：本轮零出网，原因上运行账（用户语言原样）
-        await scheduler_bridge_note("price_repair", {"skipped": str(e)[:120]})
-    except RuntimeError as e:
-        # 撞锁：上轮修复还在收尾，下轮再来
-        await scheduler_bridge_note("price_repair", {"skipped": f"busy: {str(e)[:100]}"})
-    except Exception:  # noqa: BLE001
-        log_event(
-            logger,
-            "失败记录修复轮异常",
-            level=logging.ERROR,
-            exc_info=True,
-        )
-
-
-async def _run_price_cycle(specs: list[dict]) -> None:
-    """价格网格主轮驱动段：编排委托 `cycle_run.run_price_cycle`（与手动全队列
-    同一份）；本函数只留调度器策略——与修复拍/榜单反哺同拍被占时让路等待
-    （两拍 × 30s），仍被占按空结果走终态判定。
-    """
-    from app.domains.crawl import cycle_run
-
-    if await cycle_run.run_price_cycle(specs, kind="scheduled"):
-        return
-    # 主轮整点常与 5min 修复拍 / 榜单反哺 / 免费促销重试同拍，单任务
-    # 爬虫被先到者占住时各 spec 会被逐个跳过——直接记 failed 等于让
-    # 主轮替别人的占用背锅。让路等待后再试一次（有界，两拍 × 30s），
-    # 仍被占才按空结果走终态判定。
-    from app.domains.crawl import service as crawl_service
-
-    for _ in range(2):
-        await asyncio.sleep(_SPEC_YIELD_WAIT_SECONDS)
-        handle = crawl_service._active
-        if handle is None or handle.task.done():
-            break
-    await cycle_run.run_price_cycle(specs, kind="scheduled")
-
-
-async def _price_refresh_specs() -> list[dict]:
-    """价格轮队列组成——委托 `default_queue_specs()`（唯一来源，与任务页
-    「全部」档同源同组成）。"""
-    from app.domains.crawl import service as crawl_service
-
-    return await crawl_service.default_queue_specs()
+    await maintain_derived()
+    if _crawler_idle() and await price_auto_enabled():
+        await _reanchor_price_refresh("正常周期校准", external=False)
+        await _kick_stale_price_refresh()
+        try:
+            await crawl_service.start_job(kind="repair", missing_cooldown=4, trigger="scheduled")
+        except (ValueError, RuntimeError) as exc:
+            log_event(logger, "本次自动价格补抓未启动", tag="跳过", detail={"原因": str(exc)})
+    await notifications.dispatch(None)
 
 
 async def _job_price_refresh() -> None:
-    """池价格爬取（6h 锚点网格）：重锚 → 排干等待（修复/用户任务先走，每 10s
-    探一次上限 10min；busy 标志在排干前置位让修复轮同窗让路）→ 组队列 →
-    主轮；链尾捆绑包刷新只覆盖监控层在册的包，出网直连共享限流预算，
-    异常只记日志不拖垮主链。`crawl.auto_price` 关闭整链停转。
-    """
+    """每拍执行一次价格周期，再刷新关注的捆绑包。"""
     global _price_cycle_busy
+    if _price_cycle_busy:
+        return
     if not await price_auto_enabled():
-        await scheduler_bridge_note("price_refresh", {"skipped": "auto_price_off"})
+        log_event(logger, "自动价格更新已关闭，本轮未启动", tag="跳过")
         return
     _price_cycle_busy = True
     try:
         await _reanchor_price_refresh("轮转重锚")
 
-        from app.crawler.occupancy import crawler_busy
-        from app.domains.crawl import service as crawl_service
+        from app.domains.crawl import cycle_run, service as crawl_service
 
-        # 排干等待：锁被上一轮修复/用户任务占着时等它结束再开链（占用面
-        # 同查，bundles 直调路径不在任务表上）
-        for _ in range(_DRAIN_MAX_POLLS):
-            active = crawl_service._active
-            if (
-                (active is None or active.task.done())
-                and not crawler_busy()
-            ):
-                break
-            await asyncio.sleep(_DRAIN_POLL_SECONDS)
-        specs = await _price_refresh_specs()
-        await _run_price_cycle(specs)
+        await cycle_run.run_price_cycle(await crawl_service.default_queue_specs(), kind="scheduled")
 
         # 链尾段：捆绑包刷新（游戏侧跑完才轮到它，busy 窗口内修复轮
         # 继续让路；发现桩首抓并入同一次全量刷新，成败细节由
@@ -662,14 +564,7 @@ async def _job_price_refresh() -> None:
         try:
             from app.domains.bundles import refresh as bundles_refresh
 
-            bundle_result = await bundles_refresh.refresh_bundles()
-            if isinstance(bundle_result, dict):
-                await scheduler_bridge_note("bundle_refresh", {
-                    "ok": bool(bundle_result.get("ok")),
-                    "updated": bundle_result.get("updated"),
-                    "total": bundle_result.get("total"),
-                    "failed": len(bundle_result.get("failed") or []),
-                })
+            await bundles_refresh.refresh_bundles()
         except Exception:  # noqa: BLE001
             log_event(
                 logger,
@@ -677,7 +572,6 @@ async def _job_price_refresh() -> None:
                 level=logging.ERROR,
                 exc_info=True,
             )
-            await scheduler_bridge_note("bundle_refresh", {"ok": False, "error": "exception"})
     finally:
         _price_cycle_busy = False
 
@@ -750,7 +644,7 @@ async def _job_fx_refresh() -> None:
         await scheduler_bridge_note("fx_refresh", {"skipped": "汇率自动更新已关闭"})
         return
     try:
-        await rates_service.refresh_rates()
+        await rates_service.refresh_if_stale()
     except Exception:  # noqa: BLE001
         log_event(logger, "汇率刷新失败", level=logging.ERROR, exc_info=True)
 
@@ -774,20 +668,11 @@ async def _job_fx_history_repair() -> None:
     if not await content_fetch_enabled("fetch.fx_history"):
         await scheduler_bridge_note("fx_history_repair", {"skipped": "汇率历史补全已关闭"})
         return  # 「汇率历史补全」开关关闭
-    try:
-        scan = await rates_history.scan_history_gaps()
-    except Exception:  # noqa: BLE001
-        log_event(logger, "汇率历史缺口扫描失败", level=logging.ERROR, exc_info=True)
-        return
-    if not scan["windows"]:
-        await scheduler_bridge_note("fx_history_repair", {"skipped": "历史汇率没有缺漏，暂不补齐"})
-        return
     if not _crawler_idle():
         log_event(
             logger,
             "汇率历史修复跳过：爬虫正在占用，缺口留待下一轮",
             tag="跳过",
-            detail={"待补窗口数": len(scan["windows"])},
         )
         return
     try:
@@ -802,7 +687,9 @@ async def _job_fx_history_repair() -> None:
                     "修复窗口数": len(result["windows"]),
                 },
             )
-        elif result["status"] != "no_gaps":
+        elif result["status"] == "no_gaps":
+            await scheduler_bridge_note("fx_history_repair", {"skipped": "历史汇率没有缺漏，暂不补齐"})
+        else:
             log_event(
                 logger,
                 "汇率历史修复中止",
@@ -820,183 +707,11 @@ _FX_REPAIR_MAX_WINDOWS = 8
 
 # 30 分钟重活的错峰位移：proxypool 周期固定在 5 分钟网格整点起跑，这两个 job 若与
 # 它同秒起跑会一起抢 SQLite 写锁（真实生产已出现 `database is locked`）。
-_REFRESH_STAGGER = timedelta(minutes=4)
 _BILLS_STAGGER = timedelta(minutes=2)
 
 
-async def _startup_pool_runtime(*, skip_sync: bool = False) -> None:
-    """Prepare the pool Runtime and discover exit identities."""
-    from datetime import datetime
-
-    from app.core.config import get_settings
-    from app.core.database import get_session_factory
-    from app.domains.proxies import clash_manager as _cm
-    from app.domains.proxypool import bootstrap as _bs
-    from app.domains.proxypool import scheduling as _sched
-    from app.domains.proxypool.exits import slot_signature
-    from app.domains.proxypool.runtime import controller_endpoint_of
-
-    try:
-        data_dir = get_settings().data_dir
-        exe_path = str(_cm.kernel_exe(data_dir))
-        # 会话只承载读取：ensure 的写入各自进闸（订阅同步段闸内提交、事件独立
-        # 落库），内核 start/HTTP 等待不进闸——持闸横跨启动段会饿死全体写者
-        async with get_session_factory()() as session:
-            result = await _bs.ensure_pool_runtime(
-                session, data_dir=data_dir, runtime=_cm.pool_runtime,
-                exe_path=exe_path, now=datetime.now(), skip_sync=skip_sync,
-            )
-        log_event(
-            logger,
-            "代理池运行时已就绪" if result.ready else "代理池运行时不可用",
-            detail={"详情": result.detail},
-        )
-        if not result.ready or not result.bootstrapped:
-            return
-
-        # ── 首轮出口身份发现：只探没有 exit_ip 的节点，有界（节点数 + 时间预算）──
-        before = await _exit_snapshot_or_empty()
-        if before:
-            return  # 库里已有出口身份（重启场景）：不重复探测，交给维护周期刷新
-        base, secret = controller_endpoint_of(data_dir)
-        # 探测不进闸（exit_ip_check_pool 内部逐块过闸提交），外层只兜收尾提交
-        async with get_session_factory()() as session:
-            outcomes = await _sched.run_startup_l1(
-                session, data_dir=data_dir, controller_url=base, secret=secret,
-                now=datetime.now(),
-            )
-            async with write_gate(WritePriority.BACKGROUND):
-                await session.commit()
-        log_event(
-            logger,
-            "首次探测代理出口身份完成",
-            detail={
-                "探测节点数": len(outcomes),
-                "成功节点数": sum(1 for o in outcomes if o.ok),
-            },
-        )
-        after = await _exit_snapshot_or_empty()
-        if slot_signature(after) == slot_signature(before):
-            return
-        # 出口集变了：当前 listener 数是按"还没有出口身份"时的节点数开的，必须重建一次
-        # 才能让工位数与出口槽一致（重建在启动链内，门已开、后台执行）
-        from app.domains.proxypool.scheduling import request_rebuild, run_pending_rebuild
-
-        request_rebuild()
-        # 重建段零 DB 写入（文件渲染+内核操作），不持闸
-        async with get_session_factory()() as session:
-            rebuilt = await run_pending_rebuild(
-                session, data_dir=data_dir, controller_url=base, secret=secret,
-                runtime=_cm.pool_runtime, exe_path=exe_path,
-            )
-        if rebuilt is not None:
-            log_event(
-                logger,
-                "出口身份建立后已重建代理池运行时",
-                detail={
-                    "通道数": len(rebuilt.lane_urls),
-                    "已知出口数": len(rebuilt.lane_exits),
-                },
-            )
-    except Exception:  # noqa: BLE001
-        log_event(
-            logger,
-            "代理池运行时装配失败，应用继续运行但爬虫保持不可用",
-            level=logging.ERROR,
-            exc_info=True,
-        )
-
-
-async def _startup_subscription_sync():
-    """Refresh automatic subscription snapshots and request a pool rebuild if needed."""
-    from datetime import datetime
-
-    from app.core.config import get_settings
-    from app.core.database import get_session_factory
-    from app.domains.proxies import clash_manager as _cm
-    from app.domains.proxypool import bootstrap as _bs
-    from app.domains.proxypool import scheduling as _sched
-    from app.domains.proxypool.runtime import RuntimeConfigError, controller_endpoint_of
-
-    try:
-        data_dir = get_settings().data_dir
-        # 下载在 sync_subscriptions 闸外完成、落库段闸内提交；会话只承载读取与签名对比
-        async with get_session_factory()() as session:
-            before = await _bs.pool_signature(session)
-            sync = await _bs.sync_subscriptions(
-                session, data_dir=data_dir, now=datetime.now(), only_auto=True
-            )
-            after = await _bs.pool_signature(session)
-        failed = len(sync.failures)
-        if after == before:
-            log_event(
-                logger,
-                "启动时订阅同步完成，代理池配置无变化",
-                detail={"失败订阅数": failed},
-            )
-            return sync
-        try:
-            base, secret = controller_endpoint_of(data_dir)
-        except (RuntimeConfigError, OSError):
-            log_event(
-                logger,
-                "订阅同步后代理池配置有变化，但运行时未就绪，重建交由订阅刷新链处理",
-            )
-            return sync
-        _sched.request_rebuild()
-        # 重建段零 DB 写入（文件渲染+内核操作），不持闸
-        async with get_session_factory()() as session:
-            rebuilt = await _sched.run_pending_rebuild(
-                session, data_dir=data_dir, controller_url=base, secret=secret,
-                runtime=_cm.pool_runtime, exe_path=str(_cm.kernel_exe(data_dir)),
-            )
-        log_event(
-            logger,
-            "订阅同步触发代理池重建",
-            detail={
-                "结果": "已执行" if rebuilt is not None else "本轮未执行",
-                "失败订阅数": failed,
-            },
-        )
-        return sync
-    except Exception:  # noqa: BLE001
-        log_event(
-            logger,
-            "启动时订阅同步步骤失败，应用继续运行，下次订阅刷新重试",
-            level=logging.ERROR,
-            exc_info=True,
-        )
-        return None
-
-
-async def _exit_snapshot_or_empty() -> dict:
-    """当前出口身份快照；读不到返回空（启动链不该因观测失败而中断）。"""
-    from app.core.database import get_session_factory
-    from app.domains.proxypool.exits import exit_snapshot
-
-    try:
-        async with get_session_factory()() as session:
-            return await exit_snapshot(session)
-    except Exception:  # noqa: BLE001
-        log_event(
-            logger,
-            "出口身份快照读取失败，按空快照处理",
-            level=logging.ERROR,
-            exc_info=True,
-        )
-        return {}
-
-
 async def _job_proxypool_cycle() -> None:
-    """proxypool 周期：L0 → 占用判断 → 消费 pending 重建 → L1/L2。
-
-    **刻意只注册一个 job**：拆成三个独立定时任务会让 L0 / 维护 / 重建互相竞争
-    （occupancy 只挡得住 crawler，挡不住 proxypool 自己人）。阶段划分留在
-    `run_proxypool_cycle` 内部。
-
-    前置条件：必须已存在可用的池 Runtime（运行配置 + 内核在跑）。没有就跳过本轮——
-    bootstrap 不属于本阶段职责。
-    """
+    """先复用本地记录确保运行时，再执行正常L0/L1/L2维护。"""
     from datetime import datetime
 
     from app.core.config import get_settings
@@ -1005,7 +720,7 @@ async def _job_proxypool_cycle() -> None:
     from app.domains.proxies.env_check import USER_MESSAGE, tun_mode_suspected
     from app.domains.proxypool import scheduling as _sched
     from app.domains.proxypool.runtime import (
-        RuntimeConfigError, controller_endpoint_of,
+        controller_endpoint_of,
     )
 
     if tun_mode_suspected():
@@ -1020,8 +735,19 @@ async def _job_proxypool_cycle() -> None:
         return
     data_dir = get_settings().data_dir
     try:
+        from app.domains.proxypool.bootstrap import ensure_pool_runtime
+
+        await asyncio.to_thread(_cm.ensure_kernel, data_dir)
+        async with get_session_factory()() as session:
+            prepared = await ensure_pool_runtime(
+                session, data_dir=data_dir, runtime=_cm.pool_runtime,
+                exe_path=str(_cm.kernel_exe(data_dir)), now=datetime.now(), skip_sync=True,
+            )
+        if not prepared.ready:
+            log_event(logger, "代理池尚不可用，留待正常维护重试", tag="跳过", detail={"原因": prepared.detail})
+            return
         base, secret = controller_endpoint_of(data_dir)
-    except (RuntimeConfigError, OSError) as e:
+    except Exception as e:
         log_event(
             logger,
             "代理池周期跳过：池运行时尚未就绪",
@@ -1065,7 +791,7 @@ async def _job_proxypool_retention() -> None:
     """proxypool 遥测保留（每日 04:35，紧随 04:30 的 WAL 收缩）。
 
     删的是**观测**，不是身份：`proxy_job_runs` / `health_observations` /
-    `orchestration_events` / `subscription_snapshots` 按各自保留期分块清理；
+    `subscription_snapshots` 按保留期分块清理；
     `proxy_nodes` / `pool_generations` 一行不碰。
 
     独立定时任务而非启动链一步：保留是**周期性**事务，不是启动一次性事务——本地软件
@@ -1087,7 +813,6 @@ async def _job_proxypool_retention() -> None:
             detail={
                 "作业记录": result.job_runs,
                 "健康观测": result.health_observations,
-                "编排事件": result.orchestration_events,
                 "订阅快照": result.snapshots,
                 "已达单轮上限": "是" if result.truncated else "否",
             },
@@ -1115,18 +840,7 @@ async def _job_price_cycle_retention() -> None:
 
 
 async def _job_subscription_refresh() -> None:
-    """Clash 订阅重拉（30min 一拍；真间隔由 service 侧 6h 门槛决定）。
-
-    门槛落在库里（KV），跨重启有效——本地软件不常驻，APScheduler 的间隔
-    只是兜底频率，短会话靠启动自启那次下载。只拉「内核正在跑的那条」，
-    内核没跑或认不出在跑哪条就跳过（见 service.maybe_refresh_active_...）。
-
-    爬虫占线让路：配置有变化会重启内核，在跑的爬取连接会被切断——门槛
-    不消费，等到空闲的那一刻照拉。
-
-    重拉带新配置（内核已重启）时接一次节点检测：新节点在账本里是空行，
-    「存活 x/y」与仪表盘可用数否则会停在账本口径等下个 6h 体检窗口。
-    """
+    """空闲时刷新到期订阅，复用同次快照维护通用及池运行时。"""
     from app.domains.proxies import service as proxies_service
 
     if not _crawler_idle():
@@ -1203,6 +917,12 @@ async def _job_subscription_refresh() -> None:
             level=logging.ERROR,
             exc_info=True,
         )
+
+    try:
+        await proxies_service.ensure_clash_running()
+        await proxies_service.refresh_subscription_health_summary()
+    except Exception:
+        log_event(logger, "通用代理运行时维护失败，下一轮重试", level=logging.ERROR, exc_info=True)
 
 
 async def _job_proxy_health() -> None:
@@ -1374,7 +1094,7 @@ def _make_board_job(
     监控层 board 来源，不落账户名下、不要求绑定账户）。
 
     specials 不走本工厂：特惠+热门榜的去重爬取随价格轮尾段进行
-    （`_price_refresh_specs` 的 specials 段），避免与独立 job 双爬。
+    （`default_queue_specs` 的 specials 段），避免与独立 job 双爬。
 
     反哺限量（backfill_limit）：首跑反哺可达千级（热销榜封顶拉 500 条），
     按 Steam 返回的热度序每轮限量消化，避免单轮 run_sequential 跑几千个
@@ -1466,7 +1186,7 @@ def _make_board_job(
         try:
             specs = await boards_mod.backfill_specs(board_key, limit=backfill_limit)
             if specs:
-                results = await crawl_service.run_sequential(specs)
+                results = await crawl_service.run_sequential(specs, trigger="scheduled")
                 log_event(
                     logger,
                     f"{_board_label(board_key)}条目反哺抓取完成",
@@ -1487,11 +1207,7 @@ def _make_board_job(
 
 
 BACKUP_STALE_HOURS = 24.0
-"""启动补备的判据：最新备份龄超过这个值才补一份。
 
-与 `auto_backup` 的 24h interval 同宽——interval 从启动起算，常驻才准；
-本判据负责「不常驻」的那一半（见 `_job_backup_catchup`）。
-"""
 
 
 async def _job_wal_truncate() -> None:
@@ -1539,18 +1255,21 @@ async def _job_wal_truncate() -> None:
 
 
 async def _job_backup() -> None:
-    """每日自动备份（VACUUM INTO 在线快照：不打断写入、含 WAL 已提交事务）。
-
-    **interval 从启动起算**：APScheduler 的 interval 触发器首跑在
-    `now + 24h`，所以只跑 8 小时就关机的用法永远等不到它——那一半由
-    `_job_backup_catchup` 在启动后补。
-    """
+    """自动备份只在最近快照超过保留间隔时创建。"""
     if not await content_fetch_enabled("backup.auto"):
         await scheduler_bridge_note("auto_backup", {"skipped": "自动备份已关闭"})
         return  # 「每日自动备份」开关关闭：定时与启动补备一并停转，手动备份不受影响
     from app.core import backup as core_backup
 
     try:
+        items = core_backup.list_backups()
+        if items:
+            try:
+                latest = datetime.fromisoformat(items[0].get("createdAt") or "")
+                if (datetime.now() - latest).total_seconds() < BACKUP_STALE_HOURS * 3600:
+                    return
+            except (TypeError, ValueError):
+                log_event(logger, "备份时间记录不可读取，继续创建安全副本", level=logging.WARNING)
         result = await core_backup.create_backup()
         log_event(
             logger,
@@ -1585,53 +1304,6 @@ async def _job_backup() -> None:
                 level=logging.ERROR,
                 exc_info=True,
             )
-
-
-async def _job_backup_catchup() -> None:
-    """启动补备：最新备份已过期（或压根没有）才补一份。
-
-    判据是「备份龄」而不是「是否启动过」：`BACKUP_KEEP=5` 是「保留最近 5 份」
-    而不是「每天一份」，不加判据会让一天重启五次把 5 个位子全占满、把真正
-    有历史价值的日备挤掉。
-
-    延迟 5 分钟：启动期 init_db / 首轮爬取正在写库，此刻开 VACUUM INTO
-    既抢 IO 又让快照落在最没代表性的时刻（半空的库）。
-    """
-    from app.core import backup as core_backup
-    from app.domains.agent.runtime import scheduler_bridge
-
-    try:
-        await asyncio.sleep(300)
-        items = core_backup.list_backups()  # 新→旧；只查元数据不开库
-        if items:
-            newest = items[0].get("createdAt") or ""
-            age_h = (
-                datetime.now() - datetime.fromisoformat(newest)
-            ).total_seconds() / 3600
-            if age_h < BACKUP_STALE_HOURS:
-                log_event(
-                    logger,
-                    "启动补备跳过：最新备份仍较新",
-                    tag="跳过",
-                    detail={"备份龄": f"{age_h:.1f}小时"},
-                )
-                return
-            log_event(
-                logger,
-                "启动补备触发：最新备份已过期",
-                detail={"备份龄": f"{age_h:.1f}小时"},
-            )
-        else:
-            log_event(logger, "启动补备触发：尚无任何备份")
-        # 与定时拍同口径入运行账（job_id 带 catchup 后缀区分补跑拍）
-        await scheduler_bridge.run_accounted("auto_backup_catchup", _job_backup)
-    except Exception:  # noqa: BLE001
-        log_event(
-            logger,
-            "启动补备异常，不阻塞启动",
-            level=logging.ERROR,
-            exc_info=True,
-        )
 
 
 async def _job_hb_choice() -> None:
@@ -1838,26 +1510,6 @@ async def _job_bartervg_bundles() -> None:
         )
 
 
-async def _job_bartervg_catchup() -> None:
-    """启动补跑：首次部署/长期停机等不到每日定点，启动窗口 90s 后补跑
-    一轮（48h 新鲜度闸内静默跳过，重启风暴无代价）。"""
-    from app.domains.agent.runtime import scheduler_bridge
-
-    try:
-        await asyncio.sleep(90)
-        # 与定时拍同口径入运行账（job_id 带 catchup 后缀区分补跑拍）
-        await scheduler_bridge.run_accounted(
-            "bartervg_bundles_catchup", _job_bartervg_bundles
-        )
-    except Exception:  # noqa: BLE001
-        log_event(
-            logger,
-            "捆绑包进包计数启动补跑异常，不阻塞启动",
-            level=logging.ERROR,
-            exc_info=True,
-        )
-
-
 async def _job_coming_soon_retry() -> None:
     """COMING_SOON 重探层（每日 10:00，限量 20 个）：
 
@@ -1890,7 +1542,7 @@ async def _job_coming_soon_retry() -> None:
         # 走 kind=scheduled 正常 worker 通道（重探目标量小、多为元数据短路）
         results = await crawl_service.run_sequential(
             [{"scope": "appids", "appids": [a for a, _ in pairs],
-              "kind": "comingsoon_retry"}],
+              "kind": "comingsoon_retry"}], trigger="scheduled",
         )
         if results:
             log_event(
@@ -1954,7 +1606,7 @@ async def _job_free_promo_retry() -> None:
         return
     try:
         await crawl_service.run_sequential(
-            [{"scope": "appids", "appids": appids, "kind": "free_promo_retry"}],
+            [{"scope": "appids", "appids": appids, "kind": "free_promo_retry"}], trigger="scheduled",
         )
         log_event(
             logger,
@@ -1971,30 +1623,25 @@ async def _job_free_promo_retry() -> None:
 
 
 # ── 启动新鲜度补偿 ──
-# 判定口径：池内 active 游戏对象中，24h 内有过价格观察的占比。占比低于
-# _STARTUP_STALE_SHARE（长时间停机、出口空窗导致整轮丢失后重启等）即视为
-# 池数据整体过期，把 price_refresh 首轮从下一个网格点提前到启动后
-# _STARTUP_KICK_DELAY_SECONDS；该轮照常走 PriceCycle 统计，跑完由
-# 「轮转重锚」归位网格，日常节奏不变。按占比而非全池最新观察龄判定：
-# 手动爬取等零星成功会抬高最新龄，掩盖池整体过期的状态。
+# 启动只补一轮，后续恢复原网格；所有启用地区都近期成功才算对象新鲜。
 _STARTUP_STALE_HOURS = 24
 _STARTUP_STALE_SHARE = 0.5
 _STARTUP_KICK_DELAY_SECONDS = 120
 
 
 async def _pool_fresh_ratio() -> tuple[int, float] | None:
-    """池内 active 游戏对象中 _STARTUP_STALE_HOURS 内有价格观察的占比。
-
-    观察判定与地区无关：任一区的价格行足够新即算该对象新鲜。
-    空池（无 active 监控对象）返回 None——无池即无补偿对象。
-    """
+    """监控对象在全部启用地区近期成功观察的占比。"""
     from sqlalchemy import func, select
 
     from app.core.database import get_session_factory
     from app.domains.games.models import GameCurrentPrice
     from app.domains.monitoring.models import MonitorTarget
+    from app.domains.regions.service import enabled_regions
 
     cutoff = datetime.now() - timedelta(hours=_STARTUP_STALE_HOURS)
+    regions = [r.upper() for r in await enabled_regions()]
+    if not regions:
+        return None
     pool_where = (
         MonitorTarget.target_type == "game",
         MonitorTarget.state == "active",
@@ -2010,8 +1657,11 @@ async def _pool_fresh_ratio() -> tuple[int, float] | None:
                 *pool_where,
                 MonitorTarget.target_id.in_(
                     select(GameCurrentPrice.appid).where(
-                        GameCurrentPrice.updated_at >= cutoff
+                        GameCurrentPrice.region_code.in_(regions),
+                        GameCurrentPrice.last_success_at >= cutoff,
                     )
+                    .group_by(GameCurrentPrice.appid)
+                    .having(func.count(func.distinct(GameCurrentPrice.region_code)) == len(regions))
                 ),
             )
         )
@@ -2019,17 +1669,30 @@ async def _pool_fresh_ratio() -> tuple[int, float] | None:
 
 
 async def _kick_stale_price_refresh() -> None:
-    """池数据整体过期时，把 price_refresh 首轮提前到启动后两分钟。
-
-    网格点本身已近在眼前（≤ 提前时刻）时不改排程——正常轮即刻就是补偿。
-    自动价格链总开关关闭时整个补偿停转。
-    """
+    """优先接续地区欠项；错过网格或监控价格过期时只提前一轮。"""
     if not await price_auto_enabled():
         return
-    ratio = await _pool_fresh_ratio()
-    if ratio is None or ratio[1] >= _STARTUP_STALE_SHARE:
+    from app.domains.crawl import service as crawl_service
+
+    if await crawl_service.has_pending_missing(cooldown_minutes=0):
+        job = scheduler.get_job("price_repair")
+        earliest = datetime.now().astimezone() + timedelta(seconds=_STARTUP_KICK_DELAY_SECONDS)
+        if job is not None and (job.next_run_time is None or job.next_run_time > earliest):
+            scheduler.modify_job("price_repair", next_run_time=earliest)
         return
-    total, share = ratio
+    ratio = await _pool_fresh_ratio()
+    from sqlalchemy import func, select
+    from app.core.database import get_session_factory
+    from app.domains.crawl.cycle import PriceCycle
+
+    async with get_session_factory()() as session:
+        last_cycle = await session.scalar(select(func.max(PriceCycle.started_at)).where(PriceCycle.kind == "scheduled"))
+    interval = await price_refresh_interval_hours()
+    previous_grid = local_next_grid(step=timedelta(hours=interval))[0] - timedelta(hours=interval)
+    missed = last_cycle is not None and last_cycle < previous_grid.replace(tzinfo=None)
+    if not missed and (ratio is None or ratio[1] >= _STARTUP_STALE_SHARE):
+        return
+    total, share = ratio or (0, 0.0)
     job = scheduler.get_job("price_refresh")
     if job is None:
         return
@@ -2042,7 +1705,7 @@ async def _kick_stale_price_refresh() -> None:
     scheduler.modify_job("price_refresh", next_run_time=earliest)
     log_event(
         logger,
-        "启动时监控池数据整体过期，价格刷新已提前",
+        "正常维护发现价格刷新需要补执行，已提前安排",
         detail={
             "池内对象数": total,
             "24 小时内有更新的占比": f"{round(share * 100)}%",
@@ -2052,39 +1715,13 @@ async def _kick_stale_price_refresh() -> None:
     )
 
 
-async def _anchor_probe_after_start() -> None:
-    """启动后外部时间纠偏探针：初锚是本地 zoneinfo 推算（同步上下文
-    无法请求外网），异步请求外部时间权威源核对——非切换日两者恒一致，
-    切换日/时钟偏差场景由本探针保证网格跟权威源走。
-
-    服务频繁重启是常态，10s 延时避免启动风暴撞网；启动后第一格
-    网格最远 6h，第一轮 price_refresh 触发时还会再重锚一次（双保险）。
-    重锚尾随启动新鲜度补偿：池数据整体过期时把首轮提前
-    （见 _kick_stale_price_refresh）。
-    """
-    try:
-        await asyncio.sleep(10)
-        await _reanchor_price_refresh("启动纠偏探针")
-        await _kick_stale_price_refresh()
-    except Exception:  # noqa: BLE001
-        log_event(
-            logger,
-            "启动后时间纠偏探针异常，不阻塞启动",
-            level=logging.ERROR,
-            exc_info=True,
-        )
-
-
-def _acct(job_id: str, fn, *, task_kind: str | None = None):
-    """job 注册包装：每次调用入运行账本（开始/结束/异常，桥内全 fail-soft）。
-
-    task_kind 给定时（job 对应任务登记表条目）结束后按域账本终态采样收口。
-    """
+def _acct(job_id: str, fn):
+    """为没有领域执行记录的调用保留运行事实。"""
     from app.domains.agent.runtime import scheduler_bridge
 
     @functools.wraps(fn)
     async def _wrapped():
-        await scheduler_bridge.run_accounted(job_id, fn, task_kind=task_kind)
+        await scheduler_bridge.run_accounted(job_id, fn)
 
     return _wrapped
 
@@ -2151,33 +1788,31 @@ def _on_job_skipped(event) -> None:
         logger.debug("调度跳拍事件处理失败", exc_info=True)
 
 
-# 启动期后台任务的强引用集：create_task 产物只有被持有时才不会被 GC
-_STARTUP_TASKS: set[asyncio.Task] = set()
+async def _job_mini_seed() -> None:
+    from app.core.mini_seed import import_mini_seed
 
-
-def _hold_startup_task(task: asyncio.Task) -> None:
-    _STARTUP_TASKS.add(task)
-    task.add_done_callback(_STARTUP_TASKS.discard)
+    await import_mini_seed()
 
 
 def start_scheduler() -> None:
     if scheduler.running:
         return
-    scheduler.add_job(_acct("wishlist_sync", _job_wishlist_sync), "interval", minutes=15, id="wishlist_sync")
+    now = datetime.now()
+    scheduler.add_job(_acct("wishlist_sync", _job_wishlist_sync), "interval", minutes=15, id="wishlist_sync", next_run_time=now)
     # 失败记录修复：5min 一轮，job 内部自判空闲（busy/任务表），占线即静默让路
-    scheduler.add_job(_acct("price_repair", _job_price_repair, task_kind="price_repair"), "interval", minutes=5, id="price_repair")
+    scheduler.add_job(_job_price_repair, "interval", minutes=5, id="price_repair", next_run_time=now)
     # 池价格爬取：interval 6h 只做兜底（重锚链断裂也不脱轨；真实步长由
     # 设置 crawl.price_interval_hours 决定，初锚的 6h 网格点在启动 10s
     # 纠偏探针处按用户步长重算，注册期同步上下文读不到 KV）
     # 真实节奏由 _reanchor_price_refresh 手改 next_run_time
     # 主导（job 内 modify 的排程不受触发器覆盖）
     scheduler.add_job(
-        _acct("price_refresh", _job_price_refresh_with_mails, task_kind="price_refresh"),
+        _job_price_refresh_with_mails,
         "interval", hours=6, id="price_refresh",
         next_run_time=local_next_grid()[0],
         coalesce=True, misfire_grace_time=None,
     )
-    scheduler.add_job(_acct("fx_refresh", _job_fx_refresh), "cron", hour=3, minute=0, id="fx_refresh")
+    scheduler.add_job(_acct("fx_refresh", _job_fx_refresh), "cron", hour=3, minute=0, id="fx_refresh", next_run_time=now)
     # 汇率历史修复：与实时刷新分离的独立任务（配额账本 + 缺口 + 爬虫空闲门禁）
     scheduler.add_job(
         _acct("fx_history_repair", _job_fx_history_repair), "cron", hour=4, minute=0, id="fx_history_repair"
@@ -2187,7 +1822,7 @@ def start_scheduler() -> None:
     # 爬虫空闲门禁——占线错过一拍不消费门槛，下一拍补上
     scheduler.add_job(
         _acct("subscription_refresh", _job_subscription_refresh), "interval", minutes=30, id="subscription_refresh",
-        next_run_time=datetime.now() + _REFRESH_STAGGER,
+        next_run_time=now,
     )
     scheduler.add_job(_acct("wallet_sync", _job_wallet_sync), "interval", minutes=1, id="wallet_sync")
     scheduler.add_job(
@@ -2203,7 +1838,7 @@ def start_scheduler() -> None:
     )
     scheduler.add_job(_acct("board_popularnew", _make_board_job("popularnew")), "interval", hours=24, id="board_popularnew")
     # specials 不设独立 job：特惠+热门榜的去重爬取随价格轮尾段进行
-    # （`_price_refresh_specs`），与内部队列重合的对象不重复爬
+    # （`default_queue_specs`），与内部队列重合的对象不重复爬
     scheduler.add_job(_acct("board_comingsoon", _make_board_job("comingsoon")), "interval", hours=24, id="board_comingsoon")
     scheduler.add_job(_acct("comingsoon_retry", _job_coming_soon_retry), "cron", hour=10, minute=0, id="comingsoon_retry")
     # 限时赠送复查：到期（或 1h 内到期）的 promo 重爬翻转状态；通常 0 候选
@@ -2216,7 +1851,7 @@ def start_scheduler() -> None:
     scheduler.add_job(
         _acct("steam_events_sync", _job_steam_events_sync), "cron", hour=5, minute=0, id="steam_events_sync"
     )
-    scheduler.add_job(_acct("bartervg_bundles", _job_bartervg_bundles), "cron", hour=5, minute=40, id="bartervg_bundles")
+    scheduler.add_job(_acct("bartervg_bundles", _job_bartervg_bundles), "cron", hour=5, minute=40, id="bartervg_bundles", next_run_time=now + timedelta(seconds=90))
     scheduler.add_job(_acct("wal_truncate", _job_wal_truncate), "cron", hour=4, minute=30, id="wal_truncate")
     # proxypool 遥测保留：每日 04:35（紧随 WAL 收缩，不与 04:30 的重活撞同一分钟）。
     # 分块删除 + 单轮块上限在函数内部；max_instances=1 防叠轮。
@@ -2228,13 +1863,13 @@ def start_scheduler() -> None:
     # ——max_instances=1 + coalesce 防「定时拍与补备拍」叠成两份并行快照。
     scheduler.add_job(
         _acct("auto_backup", _job_backup), "interval", hours=24, id="auto_backup",
-        max_instances=1, coalesce=True,
+        next_run_time=now + timedelta(minutes=5), max_instances=1, coalesce=True,
     )
     # proxypool 周期：**只注册这一个**（L0 / pending 重建 / L1-L2 都在它内部按序发生）。
     # 池 Runtime 未就绪时函数内部自行跳过；max_instances=1 防上一轮未跑完又叠一轮。
     scheduler.add_job(
         _acct("proxypool_cycle", _job_proxypool_cycle), "interval", minutes=5, id="proxypool_cycle",
-        max_instances=1, coalesce=True,
+        next_run_time=now, max_instances=1, coalesce=True,
     )
     # 运行账本保留：job 型 run 过窗清理（级联事件），每日 04:36
     scheduler.add_job(
@@ -2249,39 +1884,8 @@ def start_scheduler() -> None:
     # 跳拍事件监听（并发上限让路/到点错失）：remove 先行幂等，防 stop→start 重入双注册
     scheduler.remove_listener(_on_job_skipped)
     scheduler.add_listener(_on_job_skipped, EVENT_JOB_MAX_INSTANCES | EVENT_JOB_MISSED)
+    scheduler.add_job(_acct("mini_seed", _job_mini_seed), "interval", minutes=30, id="mini_seed", next_run_time=now)
     scheduler.start()
-    # 外部时间纠偏探针（异步，10s 延时错开启动风暴）；无事件循环的
-    # 同步上下文静默跳过——初锚已可用，首轮触发时重锚会再核对一次
-    try:
-        _hold_startup_task(asyncio.create_task(_anchor_probe_after_start()))
-    except RuntimeError:
-        log_event(
-            logger,
-            "没有运行中的事件循环，跳过外部时间纠偏探针",
-            tag="跳过",
-            level=logging.WARNING,
-            detail={"说明": "初始锚点仍生效"},
-        )
-    # 备份补备（异步，5min 延时）：interval 从启动起算，不常驻的用法等不到
-    try:
-        _hold_startup_task(asyncio.create_task(_job_backup_catchup()))
-    except RuntimeError:
-        log_event(
-            logger,
-            "没有运行中的事件循环，跳过启动补备",
-            tag="跳过",
-            level=logging.WARNING,
-        )
-    # Barter.vg bundle 计数启动补跑（异步，90s 延时；48h 闸内静默跳过）
-    try:
-        _hold_startup_task(asyncio.create_task(_job_bartervg_catchup()))
-    except RuntimeError:
-        log_event(
-            logger,
-            "没有运行中的事件循环，跳过捆绑包进包计数启动补跑",
-            tag="跳过",
-            level=logging.WARNING,
-        )
     log_event(
         logger,
         "调度器已启动，全部定时任务按预定节奏注册完成",

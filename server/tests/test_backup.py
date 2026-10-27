@@ -19,7 +19,7 @@ import pytest_asyncio
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.core import backup as core_backup
+from app.core import backup as core_backup, db_safety
 from app.core.config import get_settings
 
 
@@ -29,7 +29,7 @@ def test_exited_process_with_open_handle_is_not_a_live_lock_owner():
                                creationflags=subprocess.CREATE_NO_WINDOW)
     process.wait(timeout=5)
     assert process._handle is not None
-    assert core_backup._pid_is_running(process.pid) is False
+    assert db_safety._pid_is_running(process.pid) is False
 
 
 @pytest.fixture
@@ -554,7 +554,7 @@ async def test_failed_original_database_replacement_cannot_be_unlocked_by_owner_
     assert caught.value.database_available is False
     lock = core_backup.backup_dir() / core_backup._LOCK_FILE
     metadata = json.loads(lock.read_text(encoding="utf-8"))
-    monkeypatch.setattr(core_backup, "_pid_is_running", lambda _: False)
+    monkeypatch.setattr(db_safety, "_pid_is_running", lambda _: False)
     with pytest.raises(RuntimeError, match="原库恢复未完成"):
         core_backup.ensure_restore_lock_available(tmp / "holdexar.db")
     assert lock.exists()
@@ -761,7 +761,7 @@ def test_invalid_restore_owner_never_expires_by_age(data_env, monkeypatch, paylo
     lock = core_backup.backup_dir() / core_backup._LOCK_FILE
     lock.write_text(payload, encoding="utf-8")
     os.utime(lock, (1, 1))
-    monkeypatch.setattr(core_backup, "_pid_is_running", lambda _: False)
+    monkeypatch.setattr(db_safety, "_pid_is_running", lambda _: False)
     with pytest.raises(RuntimeError, match="身份无法确认"):
         core_backup.ensure_restore_lock_available(tmp / "holdexar.db")
     assert lock.exists()
@@ -774,11 +774,11 @@ def test_positive_dead_legacy_owner_can_be_cleared_but_live_owner_never_expires(
     lock = core_backup.backup_dir() / core_backup._LOCK_FILE
     lock.write_text(json.dumps({"pid": 123, "token": "legacy"}), encoding="utf-8")
     os.utime(lock, (1, 1))
-    monkeypatch.setattr(core_backup, "_pid_is_running", lambda _: True)
+    monkeypatch.setattr(db_safety, "_pid_is_running", lambda _: True)
     with pytest.raises(RuntimeError, match="维护正在进行"):
         core_backup.ensure_restore_lock_available(tmp / "holdexar.db")
     assert lock.exists()
-    monkeypatch.setattr(core_backup, "_pid_is_running", lambda _: False)
+    monkeypatch.setattr(db_safety, "_pid_is_running", lambda _: False)
     core_backup.ensure_restore_lock_available(tmp / "holdexar.db")
     assert not lock.exists()
 
@@ -812,7 +812,7 @@ def test_live_restore_lock_blocks_startup_and_is_not_removed(data_env):
 def test_restore_lock_is_exclusive_and_release_is_token_owned(data_env):
     lock, token = core_backup._acquire_restore_lock()
     try:
-        with pytest.raises(RuntimeError, match="维护操作在进行中"):
+        with pytest.raises(RuntimeError, match="维护正在进行中"):
             core_backup._acquire_restore_lock()
         core_backup._release_restore_lock(lock, "another-operation")
         assert lock.exists()

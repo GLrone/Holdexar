@@ -1,3 +1,4 @@
+from app.domains.games import derived as games_derived
 """games 域永降标记测试：refresh_pp_flags 的原价台阶检测。
 
 判定语义：当前国区标准版原价 vs 历史上最近一次不同的原价 → 1=永降 2=永涨。
@@ -74,7 +75,7 @@ async def test_pp_flag_drop_and_raise(db):
         ])
         await session.commit()
 
-    refreshed = await games_service.refresh_pp_flags([100, 200, 300])
+    refreshed = await games_derived.update_price_derived([100, 200, 300])
     assert refreshed == 3
     assert await _flag(db, 100) == 1
     assert await _flag(db, 200) == 2
@@ -93,7 +94,7 @@ async def test_pp_flag_ignores_discount_price_moves(db):
         ])
         await session.commit()
 
-    await games_service.refresh_pp_flags([400])
+    await games_derived.update_price_derived([400])
     assert await _flag(db, 400) == 0
 
 
@@ -113,7 +114,7 @@ async def test_pp_flag_sub_id_isolation(db):
         ])
         await session.commit()
 
-    await games_service.refresh_pp_flags([500])
+    await games_derived.update_price_derived([500])
     assert await _flag(db, 500) == 1
 
 
@@ -130,7 +131,7 @@ async def test_pp_flag_incremental_only_touches_targets(db):
         ])
         await session.commit()
 
-    await games_service.refresh_pp_flags([700])
+    await games_derived.update_price_derived([700])
     assert await _flag(db, 600) == 0
     assert await _flag(db, 700) == 2
 
@@ -150,7 +151,7 @@ async def test_pp_changed_at_is_latest_jump_snapshot(db):
         ])
         await session.commit()
 
-    await games_service.refresh_pp_flags([800])
+    await games_derived.update_price_derived([800])
     assert await _flag(db, 800) == 1
     changed = await _changed_at(db, 800)
     assert changed is not None and abs((changed - jump_at).total_seconds()) < 1
@@ -168,7 +169,7 @@ async def test_pp_changed_at_none_when_price_never_changed(db):
         ])
         await session.commit()
 
-    await games_service.refresh_pp_flags([900])
+    await games_derived.update_price_derived([900])
     assert await _flag(db, 900) == 0
     assert await _changed_at(db, 900) is None
 
@@ -186,7 +187,7 @@ async def test_pp_changed_at_ignores_discount_price_moves(db):
         ])
         await session.commit()
 
-    await games_service.refresh_pp_flags([1000])
+    await games_derived.update_price_derived([1000])
     assert await _flag(db, 1000) == 0
     assert await _changed_at(db, 1000) is None
 
@@ -207,6 +208,6 @@ async def test_refresh_pp_flags_accepts_missing_batch_flattened_appids(db):
         {"type": "app", "id": "kz:补1", "region": "kz", "appids": [6001]},
         {"type": "app", "id": "tr:补1", "region": "tr", "appids": [6001]},
     ]
-    refreshed = await games_service.refresh_pp_flags(_crawled_appids([], pre_tasks))
+    refreshed = await games_derived.update_price_derived(_crawled_appids([], pre_tasks))
     assert refreshed >= 1
     assert await _flag(db, 6001) == 1  # 原价台阶 6900 → 5900 = 永降

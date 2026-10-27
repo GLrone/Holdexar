@@ -8,12 +8,14 @@
 
 换装流程三段式（解压暂存 → 旧文件移备份目录 → 新文件落位），换装时机
 放在**下次启动**（PyInstaller onedir 在 Windows 下运行中替换自身文件
-句柄风险高；desktop/main.py --apply-update 在 uvicorn 线程起来之前完成
-换装，无文件锁）。
+句柄风险高）：桌面壳把换装交给暂存包内的独立更新宿主进程完成。
 
 数据安全（本项目核心承诺，优先于一切花哨功能）：
+- 更新清单必须经内嵌公钥验签（core/update_signing）；验不过的清单不进
+  检查/下载/换装链——镜像只当字节运输，不产生任何信任
 - 换装只动程序目录，data/ 等用户目录跳过（desktop 侧白名单）
-- 下载产物落 data/update-staging/，sha256 校验不过不进换装链
+- 下载产物落 data/update-staging/，sha256 校验不过不进换装链（校验值
+  缺失同样拒绝，不存在「无校验值放行」）
 - 旧程序目录整体移 __old__，失败可手工移回 = 永远有退路
 
 网络通道：复用 clash_manager._download_attempts 的镜像 + 本地代理
@@ -52,6 +54,7 @@ from app.core.app_info import (
 )
 from app.core.config import get_settings
 from app.core.logging import log_event
+from app.core import update_signing
 
 logger = logging.getLogger(__name__)
 
@@ -106,30 +109,12 @@ def manifest_url(mirror: str = "") -> str:
     )
 
 
-def _pick_asset(
-    assets: list[dict],
-    name: str | None = None,
-    from_version: str | None = None,
-) -> dict | None:
-    """挑应用包资产：显式 name 精确匹配 → 差量包 (role=patch & fromVersion匹配) → role=app → 命名模式。
-
-    优先自动匹配差量包以节省下载体积；若未匹配到差量包则回退完整应用包。
-    """
+def _pick_asset(assets: list[dict], name: str | None = None) -> dict | None:
+    """挑应用包资产：显式 name 精确匹配 → role=app → 命名模式。"""
     if name:
         hit = next((a for a in assets if str(a.get("name")) == name), None)
         if hit:
             return hit
-    if from_version:
-        patch_hit = next(
-            (
-                a for a in assets
-                if str(a.get("role") or "") == "patch"
-                and str(a.get("fromVersion") or "") == from_version
-            ),
-            None,
-        )
-        if patch_hit:
-            return patch_hit
     hit = next((a for a in assets if str(a.get("role") or "") == "app"), None)
     if hit:
         return hit
@@ -138,7 +123,12 @@ def _pick_asset(
 
 
 async def _fetch_manifest() -> dict | None:
-    """按镜像链取 latest.json。全通道并发竞速，先到先用；全失败返回 None。"""
+    """按镜像链取 latest.json。全通道并发取回，按镜像优先级取**第一个验签通过**者；全失败返回 None。
+
+    信任模型：镜像只是运输——清单必须经内嵌公钥验签（update_signing），
+    伪造/篡改/无签名清单按通道失败处理。显式 HOLDEXAR_UPDATE_URL 指向的
+    本地测试源豁免验签（本机自控调试面，能设该变量的进程本就控制本机）。
+    """
     base = os.environ.get(f"{ENV_PREFIX}UPDATE_URL", "").rstrip("/")
     if base:
         try:
@@ -152,6 +142,10 @@ async def _fetch_manifest() -> dict | None:
             return None
         return None
 
+    def _trusted(data: dict) -> bool:
+        ok, _reason = update_signing.verify_manifest(data)
+        return ok
+
     async def _try_one(mirror: str) -> dict | None:
         try:
             async with httpx.AsyncClient(timeout=5, follow_redirects=True) as client:
@@ -159,7 +153,7 @@ async def _fetch_manifest() -> dict | None:
                 if resp.status_code != 200:
                     return None
                 data = resp.json()
-                if isinstance(data, dict) and data.get("version"):
+                if isinstance(data, dict) and data.get("version") and _trusted(data):
                     return data
         except Exception:  # noqa: BLE001 —— 单通道失败不影响其余
             return None
@@ -173,7 +167,7 @@ async def _fetch_manifest() -> dict | None:
         logger,
         "更新清单不可用，回落 GitHub API",
         tag="降级",
-        detail={"原因": "全部镜像均未返回有效清单"},
+        detail={"原因": "全部镜像均未返回有效签名清单"},
     )
     return None
 
@@ -203,12 +197,12 @@ def _payload_from_manifest(data: dict) -> dict:
 
     current = settings.version
     assets = data.get("assets") or []
-    asset = _pick_asset(assets, from_version=current)
+    asset = _pick_asset(assets)
     if not asset:
         return {"available": False, "reason": "no_asset"}
-
-    is_patch = (asset.get("role") == "patch")
-    full_app = next((a for a in assets if str(a.get("role") or "") == "app"), None)
+    # 资产缺 sha256 = 发布侧残缺：有更新也不能进「无校验下载」的口子
+    if not str(asset.get("sha256") or "").strip():
+        return {"available": False, "reason": "bad_manifest"}
 
     return {
         "available": version_gt(latest, current),
@@ -222,9 +216,6 @@ def _payload_from_manifest(data: dict) -> dict:
         "asset": asset.get("name"),
         "publishedAt": data.get("publishedAt"),
         "source": "manifest",
-        "isPatch": is_patch,
-        "patchFromVersion": asset.get("fromVersion") if is_patch else None,
-        "fullSizeBytes": full_app.get("size") if full_app else asset.get("size"),
     }
 
 
@@ -258,8 +249,12 @@ async def _check_update_via_api() -> dict:
     latest = tag.lstrip("vV")
     current = settings.version
     newer = version_gt(latest, current)
-    # GitHub 的 release 资产自带 digest（形如 "sha256:..."），有则用作校验值
+    # GitHub 的 release 资产自带 digest（形如 "sha256:..."）——API 路径的
+    # 完整性锚点。缺它就不宣告可用更新：宁可「暂不可更新」，不造「有更新
+    # 却在下载端被拒」的悬空态。
     digest = str(asset.get("digest") or "")
+    if not digest.startswith("sha256:"):
+        return {"available": False, "reason": "bad_manifest", "error": "发布资产缺少校验值"}
     return {
         "available": newer,
         "current": current,
@@ -267,7 +262,7 @@ async def _check_update_via_api() -> dict:
         "tag": tag,
         "notes": _plain_notes(release.get("body") or ""),
         "sizeBytes": asset.get("size"),
-        "sha256": digest.split(":", 1)[1] if digest.startswith("sha256:") else None,
+        "sha256": digest.split(":", 1)[1],
         "asset": asset.get("name"),
         "publishedAt": release.get("published_at"),
         "source": "api",
@@ -361,11 +356,14 @@ async def download_update(
     API 反查（资产名含时间戳，猜不出来，只能反查或由清单提供）。
     expected_size：清单里的体积。通道不给 Content-Length（镜像分块响应）时
     用它当总量——否则百分比恒为空，前端进度条看着像卡死。
-    expected_sha256：清单内的校验值优先；API 路径下取 release body 的
-    `SHA256: <hex>` 行。两者皆无则跳过校验（前端展示「未提供校验值」）。
+    expected_sha256：完整性校验值，**必填**——清单路径下来自验签清单、API
+    路径下来自 GitHub 资产 digest；缺失即拒绝下载（不存在无校验放行）。
     校验不过 → 清 staging 抛错，绝不进换装链。
     """
     from app.domains.proxies import clash_manager
+
+    if not expected_sha256 or not str(expected_sha256).strip():
+        raise RuntimeError("更新源未提供完整性校验值，已拒绝下载（更新源不可信或残缺）")
 
     if not _PROGRESS.get("running"):
         _progress_reset()
@@ -518,28 +516,12 @@ async def download_update(
         await asyncio.to_thread(_extract, zip_path, staging)
         meta_path.unlink(missing_ok=True)
 
-        # 换装 manifest（desktop 启动编排读）
-        patch_manifest_file = next(
-            (p for p in (staging / "patch-manifest.json", staging / APP_NAME / "patch-manifest.json") if p.is_file()),
-            None,
-        )
-        is_patch = patch_manifest_file is not None
-        patch_from = None
-        if patch_manifest_file:
-            try:
-                patch_data = json.loads(patch_manifest_file.read_text(encoding="utf-8"))
-                patch_from = patch_data.get("fromVersion")
-            except Exception:
-                pass
-
         manifest = {
             "tag": tag,
             "sha256": expected_sha256,
             "ready": True,
             "attempt_id": str(uuid.uuid4()),
             "source_version": APP_VERSION,
-            "is_patch": is_patch,
-            "patch_from_version": patch_from,
             "notes": notes or "",
         }
         (staging / STAGING_MANIFEST_NAME).write_text(
@@ -578,7 +560,7 @@ async def download_update(
 def _error_code(err: Exception) -> str:
     """失败归因（机器可读）：前端据此给不同文案，不靠解析错误字符串。"""
     text = str(err) or type(err).__name__
-    if "SHA256" in text:
+    if "SHA256" in text or "校验值" in text:
         return "verify_failed"
     if "所有下载通道" in text:
         return "network"
@@ -730,7 +712,7 @@ async def _stream_to_file(
     """流式下载 + 断点续传 + 停滞/速率双闸换道。失败抛错（调用方换通道）。
 
     progress_dict：进度写入的目标字典。默认 None = 写本模块的 _PROGRESS。
-    外部调用方（如 seed_fetch）传入各自私有字典，避免并发下载污染彼此进度。
+    外部调用方传入各自私有字典，避免并发下载污染彼此进度。
 
     - **续传**：带上已有字节数发 `Range: bytes=N-`；服务端回 200（不认 Range）
       先下载到副产物文件，全包完整后再原子替换——避免中途失败抹掉已有续传进度，
@@ -833,29 +815,54 @@ def _extract(zip_path: Path, staging: Path) -> None:
 # ── 换装状态查询 ─────────────────────────────────────────────────────
 
 
-def just_updated_status() -> dict | None:
-    """换装升级完成状态投影（首次启动向用户展示「更新成功」报告）。
+def _completed_update_transaction(transaction: dict | None) -> bool:
+    return bool(
+        isinstance(transaction, dict) and transaction.get("attemptId")
+        and transaction.get("stage") == "committed"
+        and transaction.get("currentVersion") == transaction.get("targetVersion") == APP_VERSION
+        and (transaction.get("dataAccepted") is True or (
+            transaction.get("dataHadDatabase") is False and transaction.get("dataPrepared") is not True
+        ))
+    )
 
-    单一事实源：logs/update-diagnosis.json（UpdateHost 换装提交时写入）。
-    只有当换装成功（success=True 且 stage="committed"）、尚未向用户提示（not acknowledged）、
-    且 targetVersion 等于当前 APP_VERSION 时才向上汇报。
-    """
+
+def _read_update_diagnosis() -> dict:
+    from app.core import layout
     from app.core.paths import install_root, logs_dir
 
-    candidates = [
-        logs_dir() / "update-diagnosis.json",
-        install_root() / "logs" / "update-diagnosis.json",
-        install_root() / "data" / "logs" / "update-diagnosis.json",
-    ]
-    diag_file = next((p for p in candidates if p.is_file()), None)
-    if not diag_file:
-        return None
-    try:
-        data = json.loads(diag_file.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    if not isinstance(data, dict):
-        return None
+    root = install_root()
+    transaction = layout.read_transaction(root) or {}
+    records = []
+    for path in (root / "logs/update-diagnosis.json", logs_dir() / "update-diagnosis.json",
+                 root / "data/logs/update-diagnosis.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            records.append(data)
+    if transaction.get("attemptId"):
+        data = next((r for r in records if r.get("attemptId") == transaction["attemptId"]
+                     and r.get("targetVersion") == transaction.get("targetVersion")), {})
+    else:
+        data = records[0] if records else {}
+    if _completed_update_transaction(transaction):
+        acknowledged = (data.get("stage") == "committed" and data.get("success") is True
+                        and data.get("acknowledged") is True)
+        data = dict(data, attemptId=transaction["attemptId"], targetVersion=APP_VERSION,
+                    currentVersion=APP_VERSION, sourceVersion=transaction.get("sourceVersion"),
+                    stage="committed", success=True, acknowledged=acknowledged)
+    return data
+
+
+def just_updated_status() -> dict | None:
+    """投影已提交的更新事实及同次尚未确认的成功提示。"""
+    return _just_updated_status(_read_update_diagnosis())
+
+
+def _just_updated_status(data: dict) -> dict | None:
+    from app.core.paths import install_root
+
     if not (data.get("success") is True and data.get("stage") == "committed"):
         return None
     if data.get("acknowledged") is True:
@@ -906,29 +913,22 @@ def just_updated_status() -> dict | None:
 
 
 def acknowledge_update() -> dict:
-    """用户已查看更新成功报告，闭合账本标记为已确认。"""
-    from app.core.paths import install_root, logs_dir
+    """在更新互斥内持久化当前成功提示的确认，写入失败保留未确认状态。"""
+    from app.core import update_host
+    from app.core.update_process import update_mutex
+    from app.core.paths import install_root
 
-    candidates = [
-        logs_dir() / "update-diagnosis.json",
-        install_root() / "logs" / "update-diagnosis.json",
-        install_root() / "data" / "logs" / "update-diagnosis.json",
-    ]
-    updated = False
-    for diag_file in candidates:
-        if not diag_file.is_file():
-            continue
-        try:
-            data = json.loads(diag_file.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and data.get("acknowledged") is not True:
-                data["acknowledged"] = True
-                tmp = diag_file.with_suffix(".tmp")
-                tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-                tmp.replace(diag_file)
-                updated = True
-        except Exception:
-            pass
-    return {"acknowledged": True, "updated": updated}
+    root = install_root()
+    with update_mutex():
+        data = _read_update_diagnosis()
+        if not (data.get("success") is True and data.get("stage") == "committed"
+                and data.get("targetVersion", APP_VERSION) == APP_VERSION):
+            return {"acknowledged": False, "updated": False}
+        if data.get("acknowledged") is True:
+            return {"acknowledged": True, "updated": False}
+        data["acknowledged"] = True
+        update_host._write_diagnosis(root, data, strict=True)
+    return {"acknowledged": True, "updated": True}
 
 
 def pending_status() -> dict:
@@ -938,22 +938,42 @@ def pending_status() -> dict:
     这个事实就没法给「重新下载」的出路（账本同源：标记是唯一事实源，这里只读）。
     justUpdated 投影换装成功首次启动事实，前端据此弹出更新成功报告。
     """
+    from app.core import layout
+    from app.core.paths import install_root
+
+    transaction = layout.read_transaction(install_root())
+    diagnosis = _read_update_diagnosis()
+    installing = bool(
+        isinstance(transaction, dict)
+        and transaction.get("attemptId")
+        and transaction.get("targetVersion") == APP_VERSION
+        and transaction.get("stage") in (layout.STAGE_VERIFYING, layout.STAGE_COMMITTED)
+        and diagnosis.get("attemptId") == transaction["attemptId"]
+        and diagnosis.get("targetVersion") == APP_VERSION
+        and diagnosis.get("stage") == layout.STAGE_SWITCHING
+        and not diagnosis.get("error")
+    )
     staging = staging_dir()
     manifest = staging / "manifest.json"
     swap_failed = (staging.parent / SWAP_FAILED_FLAG).is_file()
-    just_updated = just_updated_status()
+    result = {
+        "pending": False,
+        "installing": installing,
+        "swapFailed": swap_failed,
+        "justUpdated": _just_updated_status(diagnosis),
+    }
     if not manifest.is_file():
-        return {"pending": False, "swapFailed": swap_failed, "justUpdated": just_updated}
+        return result
     try:
         data = json.loads(manifest.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 —— 坏 manifest 视为无暂存
-        return {"pending": False, "swapFailed": swap_failed, "justUpdated": just_updated}
-    return {
-        "pending": bool(data.get("ready")),
-        "tag": data.get("tag"),
-        "swapFailed": swap_failed,
-        "justUpdated": just_updated,
-    }
+        return result
+    tag = data.get("tag")
+    completed = (diagnosis.get("stage") == "committed" and diagnosis.get("success") is True
+                 and diagnosis.get("targetVersion") == APP_VERSION)
+    installed_target = (installing or completed) and str(tag or "").removeprefix("v") == APP_VERSION
+    result.update(pending=bool(data.get("ready")) and not installed_target, tag=tag)
+    return result
 
 
 def clear_staging() -> dict:

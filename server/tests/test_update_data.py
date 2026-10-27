@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from app.core import backup, database, layout
+from app.core import backup, database, db_safety, layout
 
 
 @pytest.mark.asyncio
@@ -86,7 +86,7 @@ async def test_protected_startup_defers_key_recovery_until_acceptance(tmp_path, 
     monkeypatch.setattr(module(), "startup_authorization", authorize)
     monkeypatch.setattr(main, "init_db", initialize)
     monkeypatch.setattr(rekey, "resume_pending_migration", resume)
-    monkeypatch.setattr(main, "_post_startup_chain", chain)
+    monkeypatch.setattr(main, "_initialize_runtime", chain)
     monkeypatch.setattr(main, "stop_scheduler", lambda: None)
     monkeypatch.setattr(backup, "ensure_restore_lock_available", lambda _path: None)
     monkeypatch.setattr(layout, "read_transaction", lambda _root: {
@@ -147,12 +147,118 @@ def test_prepare_records_verified_immutable_snapshot(update_env):
     assert lock["purpose"] == "update" and lock["attemptId"] == "attempt-one"
 
 
+@pytest.mark.parametrize("stage", ["write", "flush"])
+def test_prepare_marker_storage_failure_leaves_startup_and_retry_usable(update_env, monkeypatch, stage):
+    import errno
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    root, data, db = update_env
+    fdopen = os.fdopen
+    streams = []
+
+    def fail(*_args):
+        raise OSError(errno.ENOSPC, "marker storage failed")
+
+    @contextmanager
+    def failing_stream(*args, **kwargs):
+        with fdopen(*args, **kwargs) as stream:
+            streams.append(stream)
+            proxy = SimpleNamespace(write=stream.write, flush=stream.flush, fileno=stream.fileno)
+            setattr(proxy, stage, fail)
+            yield proxy
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "fdopen", failing_stream)
+        with pytest.raises(OSError, match="marker storage failed"):
+            prepare(update_env)
+
+    assert streams and all(stream.closed for stream in streams)
+    assert not (data / "backups" / ".restore.lock").exists()
+    assert not layout.read_transaction(root).get("dataPrepared")
+    assert module().validate_startup(data) is None
+    with closing(sqlite3.connect(db)) as conn:
+        assert conn.execute("SELECT value FROM original").fetchall() == [("before",)]
+    assert prepare(update_env)["dataPrepared"]
+
+
+def test_recovery_finishes_abandoned_probe_registration(update_env, monkeypatch):
+    from app.core import update_host
+
+    root, data, db = update_env
+    prepare(update_env)
+    layout.update_transaction(root, layout.STAGE_VERIFYING, launchPending=True,
+                              launchImage=str(layout.get_version_exe(root, "2.0.0")))
+    monkeypatch.setattr(update_host, "_probe_processes", lambda _exe: [], raising=False)
+    assert update_host.recover_interrupted_update(root) is True
+    assert layout.read_transaction(root)["launchPending"] is False
+    assert not module()._marker_path(data).exists()
+    with closing(sqlite3.connect(db)) as conn:
+        assert conn.execute("SELECT value FROM original").fetchall() == [("before",)]
+
+
+@pytest.mark.parametrize("live", [True, False])
+def test_unproven_probe_registration_retains_protection(update_env, monkeypatch, live):
+    from app.core import update_host
+
+    root, data, _ = update_env
+    prepare(update_env)
+    layout.update_transaction(root, layout.STAGE_VERIFYING, launchPending=True)
+
+    def inspect(_exe):
+        if not live:
+            raise OSError("process inventory unavailable")
+        return [987654]
+
+    monkeypatch.setattr(update_host, "_probe_processes", inspect, raising=False)
+    with pytest.raises(RuntimeError):
+        update_host.recover_interrupted_update(root)
+    assert layout.read_transaction(root)["launchPending"] is True
+    assert module()._marker_path(data).exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows process inventory")
+def test_unregistered_real_process_blocks_recovery_until_exit(update_env):
+    import shutil
+    import subprocess
+    import sys
+
+    from app.core import update_host
+
+    root, data, db = update_env
+    prepare(update_env)
+    exe = layout.get_version_exe(root, "2.0.0")
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(sys._base_executable, exe)
+    env = dict(os.environ, PYTHONHOME=sys.base_prefix,
+               PATH=str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", ""))
+    proc = subprocess.Popen(
+        [str(exe), "-c", "import time; print('ready', flush=True); time.sleep(60)"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        assert proc.stdout.readline().strip() == "ready"
+        layout.update_transaction(root, layout.STAGE_VERIFYING, launchPending=True, launchImage=str(exe))
+        with pytest.raises(RuntimeError, match="仍在运行"):
+            update_host.recover_interrupted_update(root)
+        assert layout.read_transaction(root)["launchPending"] is True
+        assert module()._marker_path(data).exists()
+    finally:
+        proc.terminate()
+        proc.communicate(timeout=5)
+    assert update_host.recover_interrupted_update(root) is True
+    assert not module()._marker_path(data).exists()
+    with closing(sqlite3.connect(db)) as conn:
+        assert conn.execute("SELECT value FROM original").fetchall() == [("before",)]
+
+
 def test_snapshot_failure_keeps_live_database_and_releases_marker(update_env, monkeypatch):
     root, data, db = update_env
     def fail(src, dest):
         dest.write_bytes(b"incomplete")
         raise OSError("snapshot failed")
-    monkeypatch.setattr(backup, "snapshot_to", fail)
+    monkeypatch.setattr(db_safety, "snapshot_to", fail)
     with pytest.raises(OSError, match="snapshot failed"):
         prepare(update_env)
     assert not (data / "backups" / ".restore.lock").exists()
@@ -204,7 +310,7 @@ def test_accept_is_irreversible_and_does_not_erase_later_writes(update_env):
 def test_update_marker_is_not_removed_for_dead_owner(update_env, monkeypatch):
     _, data, db = update_env
     prepare(update_env)
-    monkeypatch.setattr(backup, "_pid_is_running", lambda pid: False)
+    monkeypatch.setattr(db_safety, "_pid_is_running", lambda pid: False)
     with pytest.raises(RuntimeError):
         backup.ensure_restore_lock_available(db)
     assert (data / "backups" / ".restore.lock").exists()
@@ -380,7 +486,7 @@ def test_correct_sync_token_still_requires_os_lock(update_env, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
     _, _, db = update_env
     metadata = prepare(update_env)
-    monkeypatch.setattr(database, "_WRITE_WAIT_TIMEOUT", 0.02)
+    monkeypatch.setattr(db_safety, "_WRITE_WAIT_TIMEOUT", 0.02)
     def contender():
         with database.sync_write_gate(db, maintenance_token=metadata["dataToken"]):
             pytest.fail("another writer bypassed OS lock")
@@ -481,7 +587,7 @@ def test_released_rollback_preserves_later_writes_despite_pid_reuse(update_env, 
     with closing(sqlite3.connect(db)) as conn, conn:
         conn.execute("INSERT INTO original VALUES('after rollback')")
     layout.update_transaction(root, layout.STAGE_ROLLED_BACK, children=[{"pid": os.getpid(), "stopped": True}])
-    monkeypatch.setattr(backup, "_pid_is_running", lambda pid: True)
+    monkeypatch.setattr(db_safety, "_pid_is_running", lambda pid: True)
     assert module().rollback(root, children_stopped=False)["alreadyRestored"]
     assert module().finish_rollback(root)["released"]
     with closing(sqlite3.connect(db)) as conn:
@@ -493,15 +599,15 @@ def test_finish_rollback_resumes_marker_release_after_durable_commit(update_env,
     prepare(update_env)
     module().rollback(root, children_stopped=True)
     layout.update_transaction(root, layout.STAGE_ROLLED_BACK)
-    release = backup._release_restore_lock
+    release = db_safety._release_restore_lock
     def fail(*args):
         raise OSError("release interrupted")
-    monkeypatch.setattr(backup, "_release_restore_lock", fail)
+    monkeypatch.setattr(db_safety, "_release_restore_lock", fail)
     with pytest.raises(OSError, match="release interrupted"):
         module().finish_rollback(root)
     assert layout.read_transaction(root)["dataRollbackReleased"] is True
     assert (data / "backups" / ".restore.lock").exists()
-    monkeypatch.setattr(backup, "_release_restore_lock", release)
+    monkeypatch.setattr(db_safety, "_release_restore_lock", release)
     with closing(sqlite3.connect(db)) as conn, conn:
         conn.execute("INSERT INTO original VALUES('new data')")
     layout.update_transaction(root, layout.STAGE_ROLLED_BACK, children=[{"pid": os.getpid()}])
@@ -654,7 +760,7 @@ def test_startup_cleans_only_safe_dead_maintenance_marker(update_env, monkeypatc
     marker = module()._marker_path(data)
     marker.parent.mkdir(parents=True)
     marker.write_text(json.dumps({"pid": 901, "purpose": "maintenance"}))
-    monkeypatch.setattr(backup, "_pid_is_running", lambda pid: False)
+    monkeypatch.setattr(db_safety, "_pid_is_running", lambda pid: False)
     assert module().validate_startup(data) is None
     assert not marker.exists()
 
@@ -664,7 +770,7 @@ def test_startup_preserves_dangerous_restore_marker_with_recovery_message(update
     marker = module()._marker_path(data)
     marker.parent.mkdir(parents=True)
     marker.write_text(json.dumps({"pid": 901, "purpose": "restore", "rollbackPath": "original.rollback.db"}))
-    monkeypatch.setattr(backup, "_pid_is_running", lambda pid: False)
+    monkeypatch.setattr(db_safety, "_pid_is_running", lambda pid: False)
     with pytest.raises(RuntimeError, match="原库"):
         module().validate_startup(data)
     assert marker.exists()
@@ -678,7 +784,7 @@ def test_accepted_repair_keeps_restore_protection_and_original_location(update_e
     original.write_bytes(b"preserved original")
     marker = module()._marker_path(data)
     marker.write_text(json.dumps({"pid": 901, "purpose": "restore", "rollbackPath": str(original)}))
-    monkeypatch.setattr(backup, "_pid_is_running", lambda pid: False)
+    monkeypatch.setattr(db_safety, "_pid_is_running", lambda pid: False)
     with pytest.raises(RuntimeError, match="原库") as error:
         module().accept(root)
     assert str(original) in str(error.value)
@@ -692,6 +798,6 @@ def test_accepted_repair_cleans_safe_dead_maintenance_only(update_env, monkeypat
     module().accept(root)
     marker = module()._marker_path(data)
     marker.write_text(json.dumps({"pid": 901, "purpose": "maintenance"}))
-    monkeypatch.setattr(backup, "_pid_is_running", lambda pid: False)
+    monkeypatch.setattr(db_safety, "_pid_is_running", lambda pid: False)
     module().accept(root)
     assert not marker.exists()

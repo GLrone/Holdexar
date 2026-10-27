@@ -26,6 +26,12 @@ async def _tmp_db(monkeypatch, tmp_path):
     database_module.get_engine.cache_clear()
     database_module.get_session_factory.cache_clear()
     await init_db()
+    from app.domains.regions import service as regions
+
+    async def enabled():
+        return ["cn"]
+
+    monkeypatch.setattr(regions, "enabled_regions", enabled)
     yield
     database_module.get_settings.cache_clear()
     database_module.get_engine.cache_clear()
@@ -37,18 +43,23 @@ async def _seed_target(appid: int, *, state: str = "active",
     """落一个监控对象；price_age 非空时带一条对应龄的价格观察行。"""
     from app.core.database import get_session_factory
     from app.domains.games.models import GameCurrentPrice
-    from app.domains.monitoring.models import MonitorTarget
+    from app.domains.monitoring.models import MonitorExclusion, MonitorSource, MonitorTarget
 
     async with get_session_factory()() as session:
         session.add(MonitorTarget(
-            target_type="game", target_id=appid, state=state, priority=60,
+            target_type="game", target_id=appid,
         ))
+        if state == "active":
+            session.add(MonitorSource(target_type="game", target_id=appid, source="manual", priority=60, active=True))
+        elif state == "excluded":
+            session.add(MonitorExclusion(target_type="game", target_id=appid, active=True))
         if price_age is not None:
             session.add(GameCurrentPrice(
                 appid=appid, region_code="CN", currency="CNY",
                 price=1999, original_price=1999, discount_percent=0,
                 sub_id=0, price_status="ok", cny_fen=1999,
                 updated_at=datetime.now() - price_age,
+                last_success_at=datetime.now() - price_age, attempt_outcome="success",
                 fail_count=0, discount_end_ts=0,
             ))
         await session.commit()
@@ -82,6 +93,18 @@ async def test_ratio_counts_only_active_pool_with_recent_observation():
     await _seed_target(103, state="released", price_age=timedelta(hours=1))
     total, share = await scheduler_mod._pool_fresh_ratio()
     assert (total, round(share, 4)) == (2, 0.5)
+
+
+@pytest.mark.asyncio
+async def test_one_recent_region_does_not_hide_an_unobserved_region(monkeypatch):
+    from app.domains.regions import service as regions
+
+    async def enabled():
+        return ["cn", "us"]
+
+    monkeypatch.setattr(regions, "enabled_regions", enabled)
+    await _seed_target(101, price_age=timedelta(hours=1))
+    assert await scheduler_mod._pool_fresh_ratio() == (1, 0.0)
 
 
 @pytest.mark.asyncio

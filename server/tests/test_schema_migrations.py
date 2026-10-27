@@ -23,8 +23,11 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.core import db_safety
 from app.core import backup as backup_module  # noqa: E402
 from app.core import database as database_module  # noqa: E402
+
+_OBSERVATION_BACKFILL = next((m for m in database_module._MIGRATIONS if m[0] == 20), None)
 
 
 @pytest_asyncio.fixture
@@ -276,8 +279,8 @@ async def test_init_db_refuses_live_maintenance_lock_before_create_all(isolated_
     lock.write_text(json.dumps({"pid": current_pid, "token": "live-maintenance"}), encoding="utf-8")
 
     assert Path(database_module.get_engine().url.database) == isolated_db
-    assert backup_module._pid_is_running(current_pid), f"pid={current_pid} was not detected"
-    assert not backup_module._restore_lock_is_stale(lock), f"payload={lock.read_text(encoding='utf-8')}"
+    assert db_safety._pid_is_running(current_pid), f"pid={current_pid} was not detected"
+    assert not db_safety._restore_lock_is_stale(lock), f"payload={lock.read_text(encoding='utf-8')}"
 
     with pytest.raises(RuntimeError, match="维护正在进行中"):
         await database_module.init_db()
@@ -752,6 +755,12 @@ async def test_v10_retires_pool_flags(tmp_path: Path, monkeypatch) -> None:
     finally:
         con.close()
 
+    # 已标v9的库必须含v9生成的账户来源，不能省略owned/favorite事实。
+    async with engine.begin() as conn:
+        await conn.run_sync(database_module.Base.metadata.create_all)
+        await database_module._prepare_legacy_v10_columns(conn)
+        bootstrap = next(body for version, _, body in database_module._MIGRATIONS if version == 9)
+        await bootstrap(conn)
     await database_module.init_db()
     try:
         assert _user_version(db) == database_module.SCHEMA_VERSION
@@ -783,18 +792,18 @@ async def test_v10_retires_pool_flags(tmp_path: Path, monkeypatch) -> None:
                     "SELECT target_id FROM monitor_exclusions WHERE active = 1"
                 ).fetchall()
             }
-            states = {
-                r[0]: r[1]
-                for r in con.execute(
-                    "SELECT target_id, state FROM monitor_targets"
-                ).fetchall()
-            }
             item_count = con.execute(
-                "SELECT item_count FROM tracked_accounts WHERE steamid = '1'"
+                "SELECT COUNT(*) FROM wishlist_items WHERE steamid = '1' AND active=1"
             ).fetchone()[0]
+            assert "item_count" not in {r[1] for r in con.execute("PRAGMA table_info(tracked_accounts)")}
         finally:
             con.close()
 
+        from sqlalchemy import select
+        from app.domains.monitoring.models import MonitorTarget
+
+        async with database_module.get_session_factory()() as session:
+            states = dict((await session.execute(select(MonitorTarget.target_id, MonitorTarget.state))).all())
         # 混合行保留且旗标清零；纯项目行删除
         assert set(rows) == {100, 300, 600}
         assert rows[300][4] == 0 and rows[300][1] == 1, "已购行只清榜单旗标"
@@ -802,7 +811,7 @@ async def test_v10_retires_pool_flags(tmp_path: Path, monkeypatch) -> None:
         assert rows[100][3] == 1, "愿望单事实行不动"
         # 监控真身：项目条目全部补齐（来源激活），移除行落排除
         assert states == {
-            200: "active", 300: "active",
+            100: "active", 200: "active", 300: "active",
             500: "active", 600: "active", 400: "excluded",
         }
         assert board_sources == {200: 1, 300: 1, 600: 1}
@@ -815,10 +824,21 @@ async def test_v10_retires_pool_flags(tmp_path: Path, monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_v11_adds_cycle_coverage_snapshot_column(tmp_path: Path, monkeypatch) -> None:
-    """v10 时代存量库（user_version=10）首启补跑 v11：price_cycles 补
-    coverage_json 列；**新装库**（create_all 已带列）重放不撞重复列名。
-    **走真实迁移链**（v11 步骤就是生产那一条）。"""
+async def test_v11_snapshot_step_remains_compatible_with_current_upgrade(tmp_path: Path, monkeypatch) -> None:
+    """旧库经过原 v11 补列后，由当前迁移安全退役明细。"""
+    original = next(fn for version, _, fn in database_module._MIGRATIONS if version == 11)
+    reached = []
+
+    async def check_legacy_step(conn):
+        await original(conn)
+        columns = {row[1] for row in await conn.execute(text("PRAGMA table_info(price_cycles)"))}
+        assert "coverage_json" in columns
+        reached.append(11)
+
+    monkeypatch.setattr(database_module, "_MIGRATIONS", [
+        (version, label, check_legacy_step if version == 11 else fn)
+        for version, label, fn in database_module._MIGRATIONS
+    ])
     db = tmp_path / "legacy.db"
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{db.as_posix()}", echo=False
@@ -850,7 +870,8 @@ async def test_v11_adds_cycle_coverage_snapshot_column(tmp_path: Path, monkeypat
         con = sqlite3.connect(str(db))
         try:
             cols = {r[1] for r in con.execute("PRAGMA table_info(price_cycles)")}
-            assert "coverage_json" in cols
+            assert "coverage_json" not in cols
+            assert reached == [11]
             # 幂等重放：第二次 init_db 不得因列已存在而抛错
         finally:
             con.close()
@@ -1000,3 +1021,49 @@ async def test_v14_new_library_has_no_redundant_indexes(isolated_db: Path) -> No
 
     assert _user_version(isolated_db) == 14
     assert _index_names(isolated_db) == {"ux_gph_snapshot", "ix_gph_snapshot_at"}
+
+
+@pytest.mark.asyncio
+async def test_schema_preparation_does_not_rescan_price_observations(isolated_db):
+    from sqlalchemy import event
+
+    await database_module.init_db()
+    statements = []
+    engine = database_module.get_engine()
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _many):
+        statements.append(statement.lower())
+
+    event.listen(engine.sync_engine, "before_cursor_execute", capture)
+    try:
+        await database_module.init_db()
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", capture)
+    assert not any("update game_current_prices set" in sql for sql in statements)
+
+
+@pytest.mark.asyncio
+async def test_observation_backfill_migrates_once_and_preserves_existing_facts(isolated_db):
+    await database_module.init_db()
+    async with database_module.get_engine().begin() as conn:
+        await conn.execute(text(
+            "INSERT INTO game_current_prices(appid,region_code,currency,price_status,updated_at,attempt_outcome,steam_answer,discount_percent,fail_count) "
+            "VALUES (1,'CN','CNY','ok','2026-01-01',NULL,NULL,0,0),"
+            "(2,'CN','CNY','locked','2026-01-01',NULL,NULL,0,0),"
+            "(3,'CN','CNY','missing','2026-01-01',NULL,NULL,0,0),"
+            "(4,'CN','CNY','missing','2026-01-01','success','no_options',0,0)"
+        ))
+    assert _OBSERVATION_BACKFILL is not None
+    database_module._MIGRATIONS.append(_OBSERVATION_BACKFILL)
+    await database_module._run_schema_migrations()
+    assert _user_version(isolated_db) == 20
+    async with database_module.get_engine().connect() as conn:
+        rows = (await conn.execute(text(
+            "SELECT attempt_outcome,steam_answer,last_success_at FROM game_current_prices ORDER BY appid"
+        ))).all()
+    assert rows == [
+        ("success", "ok", "2026-01-01"), ("success", "locked", "2026-01-01"),
+        ("failed", None, None), ("success", "no_options", None),
+    ]
+    await database_module._run_schema_migrations()
+    assert _user_version(isolated_db) == 20

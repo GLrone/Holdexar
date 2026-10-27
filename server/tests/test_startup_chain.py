@@ -1,248 +1,147 @@
-"""启动链「先开门，再收拾」行为验收。
-
-约束（AGENTS.md 启动链红线）：lifespan 监听前只允许 setup_logging +
-init_db（表结构/迁移不收拾完请求会踩混存 schema）；其余全部后台收拾
-（`_post_startup_chain`），且：
-
-1. **顺序有语义**：种子合并先于史低/永降/排序刷新（种子现价快照是标记
-   的输入）；内核就位先于 Clash 自启；`start_scheduler` 在按需补齐两步
-   （种子下载 / 汇率全史 bootstrap）**之前**——网络补齐不挡调度器，但
-   排在调度器后避免与首轮定时任务抢跑窗口。
-2. **健壮性**：链中任一步抛异常只留日志，后续步骤照常执行、调度器照常启动。
-3. **监听不被收拾阻塞**：lifespan yield 前不得 await 任何收拾步骤。
-
-隔离：全部依赖打桩（tmp 库 / 无网络 / 无内核复制），只验证链的编排语义，
-不验证各步骤自身行为（各域已有各自测试）。
-"""
+"""HTTP开门、兼容安全与正常调度入口的行为契约。"""
 import asyncio
-import sys
-import types
-from pathlib import Path
+from contextlib import contextmanager
+from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
-import pytest_asyncio
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-import app.core.database as database_module
-import app.core.scheduler as sched_mod
-from app.core import seed_fetch
-from app.domains.account import service as account_service
-from app.domains.bundles import service as bundles_service
-from app.domains.crawl import service as crawl_service
-from app.domains.family import service as family_service
-from app.domains.games import service as games_service
-from app.domains.games import series as games_series
-from app.domains.metadata import service as metadata_service
-from app.domains.notifications import service as notifications_service
-from app.domains.proxies import service as proxies_service
-from app.domains.rates import history as rates_history_mod
-from app.domains.rates import service as rates_service
-from app.domains.steam_events import service as steam_events_service
-from app.core import seed_assets
-
-import app.main as main_mod
+from app.core import scheduler as sched
+import app.main as main
 
 
 @pytest.fixture
-def db():
-    from app.core.database import get_session_factory
+def prepared(monkeypatch, tmp_path):
+    from app.core import backup, layout, rekey, update_data
+    from app.domains.account import service as accounts
+    from app.domains.agent import service as agents
+    from app.domains.crawl import service as crawl
+    from app.domains.proxies import node_secret_files, service as proxies
+    from app.domains.proxypool import jobruns
 
-    return get_session_factory()
-@pytest.fixture
-def chain_calls(monkeypatch):
-    """把收拾链的全部依赖换成记录桩，返回调用序列与放行闸。"""
-    calls: list[str] = []
-    gates: dict[str, asyncio.Event] = {}
-    errors: dict[str, Exception] = {}
-
+    calls, gates, failures = [], {}, set()
+    started = asyncio.Event()
     def step(name):
-        async def _impl(*args, **kwargs):
+        async def run(*args, **kwargs):
             calls.append(name)
-            gate = gates.get(name)
-            if gate is not None:
-                await gate.wait()
-            err = errors.get(name)
-            if err is not None:
-                raise err
-        return _impl
-
-    for name, fn in [
-        ("notifications_recover", notifications_service.recover_delivery_state),
-        ("notifications_resume", notifications_service.resume_event_scans),
-        ("merge_seeds", seed_assets.merge_seed_incremental),
-        ("family_warm", family_service.cached_family_library),
-        ("orphan_cleanup", crawl_service.cleanup_orphan_jobs),
-        ("rates_cleanup", rates_service.cleanup_disallowed),
-        ("legacy_sub_migrate", proxies_service.migrate_legacy_subscription),
-        ("legacy_kv_migrate", account_service.migrate_legacy_kv),
-        ("credential_seal", account_service.seal_credentials_at_rest),
-        ("subscription_seal", proxies_service.seal_subscription_urls),
-        ("hl_flags", games_service.refresh_hl_flags),
-        ("pp_flags", games_service.refresh_pp_flags),
-        ("sort_cache", games_service.refresh_sort_cache),
-        ("series_refresh", games_series.refresh_series),
-        ("bundles_sort", bundles_service.refresh_bundle_sort_cache),
-        ("bundles_warm", bundles_service.warmup),
-        ("epic_preheat", metadata_service.preheat_epic_offers),
-        ("steam_events_warm", steam_events_service.refresh_if_stale),
-        ("seed_fetch", seed_fetch.ensure_seed_online),
-        ("fx_bootstrap", rates_history_mod.bootstrap_full_history),
-    ]:
-        # main 里是函数内局部 import 再以模块属性调用：桩必须挂在源模块上
-        target = {"notifications_recover": notifications_service, "notifications_resume": notifications_service,
-                  "merge_seeds": seed_assets,
-                  "family_warm": family_service, "orphan_cleanup": crawl_service,
-                  "rates_cleanup": rates_service, "legacy_sub_migrate": proxies_service,
-                  "legacy_kv_migrate": account_service, "credential_seal": account_service,
-                  "subscription_seal": proxies_service, "hl_flags": games_service,
-                  "pp_flags": games_service, "sort_cache": games_service,
-                  "series_refresh": games_series,
-                  "bundles_sort": bundles_service, "bundles_warm": bundles_service,
-                  "epic_preheat": metadata_service,
-                  "steam_events_warm": steam_events_service,
-                  "seed_fetch": seed_fetch, "fx_bootstrap": rates_history_mod}[name]
-        monkeypatch.setattr(target, fn.__name__, step(name))
-
-    monkeypatch.setattr(main_mod, "_autostart_clash", step("clash_autostart"))
-    monkeypatch.setattr(
-        main_mod, "_kick_startup_proxy_maintenance",
-        lambda: calls.append("proxy_maintenance_start"),
-    )
-
-    def kick_health():
-        calls.append("clash_health")
-
-    # 体检出链后是同步点火（create_task 后台跑，链上不再 await）——桩为同步函数
-    monkeypatch.setattr(main_mod, "_kick_startup_health_check", kick_health)
-    # 池 Runtime bootstrap：链内以模块属性调用（`core_scheduler._startup_pool_runtime`）
-    monkeypatch.setattr(sched_mod, "_startup_pool_runtime", step("pool_runtime"))
-    # 订阅同步（下载后置）：链内以模块属性调用
-    monkeypatch.setattr(sched_mod, "_startup_subscription_sync", step("subscription_sync"))
-
-    async def fake_gap_scan(**kwargs):
-        calls.append("rates_gap_scan")
-        return {"currencies": {}, "windows": [], "totalDays": 0, "totalPairs": 0,
-                "horizon": "2026-09-19"}
-
-    async def fake_gap_repair(**kwargs):
-        # 启动链不得触发外网历史修复（配置 Key 后启动烧配额是回归）
-        calls.append("rates_gap_repair")
-        raise AssertionError("启动链不得触发外网历史修复")
-
-    monkeypatch.setattr(rates_service, "refresh_if_stale", step("rates_stale"))
-    monkeypatch.setattr(rates_history_mod, "scan_history_gaps", fake_gap_scan)
-    monkeypatch.setattr(rates_history_mod, "repair_history_gaps", fake_gap_repair)
-
-    # 内核就位：真实实现是同步函数（链内走 asyncio.to_thread），桩保持同步签名
-    def fake_ensure_kernel(data_dir):
-        calls.append("kernel_ensure")
-        return {"kernelReady": True, "copied": [], "missing": [],
-                "upgraded": None, "bundleDir": str(data_dir)}
-
-    from app.domains.proxies import clash_manager
-
-    monkeypatch.setattr(clash_manager, "ensure_kernel", fake_ensure_kernel)
-
-    started = asyncio.Event()
-
-    def fake_start_scheduler():
-        calls.append("scheduler_start")
-        started.set()
-
-    monkeypatch.setattr(sched_mod, "start_scheduler", fake_start_scheduler)
-    # main 以 `from app.core.scheduler import start_scheduler` 拿的名字引用
-    monkeypatch.setattr(main_mod, "start_scheduler", fake_start_scheduler)
-
-    probe = types.SimpleNamespace(
-        calls=calls, gates=gates, errors=errors, started=started
-    )
-    return probe
+            if name in gates:
+                await gates[name].wait()
+            if name in failures:
+                raise RuntimeError("controlled failure")
+        return run
+    for module, attr, name in (
+        (accounts, "migrate_legacy_kv", "account_migrate"),
+        (accounts, "seal_credentials_at_rest", "account_seal"),
+        (proxies, "migrate_legacy_subscription", "subscription_migrate"),
+        (proxies, "maybe_revert_to_direct", "exit_policy"),
+        (proxies, "seal_subscription_urls", "subscription_seal"),
+        (proxies, "seal_proxy_credentials", "proxy_seal"),
+        (crawl, "cleanup_orphan_jobs", "crawl_recovery"),
+        (jobruns, "record_interrupted", "pool_recovery"),
+        (agents, "reconcile_orphan_runs", "agent_recovery"),
+        (rekey, "resume_pending_migration", "rekey"),
+    ):
+        monkeypatch.setattr(module, attr, step(name))
+    for attr in ("tighten_all", "sweep_transient"):
+        monkeypatch.setattr(node_secret_files, attr, lambda *args, name=attr: calls.append(name))
+    @contextmanager
+    def authorization(_):
+        yield None
+    monkeypatch.setattr(update_data, "startup_authorization", authorization)
+    monkeypatch.setattr(main, "get_settings", lambda: SimpleNamespace(
+        data_dir=tmp_path, db_filename="holdexar.db", version="test", port=12345))
+    monkeypatch.setattr(main, "setup_logging", lambda *args: None)
+    monkeypatch.setattr(main, "init_db", step("database"))
+    monkeypatch.setattr(main, "start_scheduler", lambda: (calls.append("scheduler"), started.set()))
+    monkeypatch.setattr(main, "stop_scheduler", lambda: calls.append("stopped"))
+    monkeypatch.setattr(sched, "apply_content_schedules_from_settings", step("schedules"))
+    return SimpleNamespace(calls=calls, gates=gates, failures=failures, started=started)
 
 
 @pytest.mark.asyncio
-async def test_chain_order_and_scheduler_last(db, chain_calls):
-    """全链顺序：种子 → … → 标记三连 + 系列归组 → 内核 → 自启 → 池 Runtime → 订阅同步 → 汇率 → 捆绑包预热 → Epic 预热 → 活动日历 → 调度器 → 按需补齐（种子/汇率全史）。"""
-    await main_mod._post_startup_chain()
-    expected = [
-        "notifications_recover", "notifications_resume", "merge_seeds", "family_warm", "orphan_cleanup",
-        "rates_cleanup", "legacy_sub_migrate", "legacy_kv_migrate",
-        "credential_seal", "subscription_seal",
-        "hl_flags", "pp_flags", "sort_cache", "series_refresh",
-        "kernel_ensure", "proxy_maintenance_start",
-        "rates_stale", "rates_gap_scan", "bundles_sort", "bundles_warm",
-        "epic_preheat", "steam_events_warm", "scheduler_start",
-        "seed_fetch", "fx_bootstrap",
-    ]
-    assert chain_calls.calls == expected
+async def test_http_opens_without_waiting_for_required_compatibility(prepared):
+    prepared.gates["account_migrate"] = asyncio.Event()
+    application = SimpleNamespace(state=SimpleNamespace())
+    async with main.lifespan(application):
+        assert not prepared.started.is_set()
+        await asyncio.sleep(0.02)
+        assert "account_migrate" in prepared.calls
+        prepared.gates["account_migrate"].set()
+        await asyncio.wait_for(prepared.started.wait(), 2)
+        assert prepared.calls.index("account_migrate") < prepared.calls.index("account_seal")
+        assert prepared.calls.index("subscription_migrate") < prepared.calls.index("subscription_seal")
+        assert "sweep_transient" in prepared.calls
+    assert prepared.calls[-1] == "stopped"
 
 
 @pytest.mark.asyncio
-async def test_startup_chain_never_repairs_history(db, chain_calls):
-    """启动链只做本地缺口扫描，绝不触发外网历史修复（配额不被启动烧掉）。"""
-    await main_mod._post_startup_chain()
-    assert "rates_gap_scan" in chain_calls.calls
-    assert "rates_gap_repair" not in chain_calls.calls
+async def test_recoverable_preparation_failure_keeps_other_safety_work(prepared):
+    prepared.failures.add("subscription_seal")
+    async with main.lifespan(SimpleNamespace(state=SimpleNamespace())):
+        await asyncio.wait_for(prepared.started.wait(), 2)
+        assert {"account_seal", "proxy_seal", "crawl_recovery", "pool_recovery", "agent_recovery"} <= set(prepared.calls)
+
+
+def test_scheduler_uses_normal_jobs_for_first_maintenance(monkeypatch):
+    jobs = {}
+    scheduler = SimpleNamespace(running=False,
+        add_job=lambda fn, trigger, **kw: jobs.setdefault(kw["id"], kw),
+        start=lambda: None, remove_listener=lambda *args: None, add_listener=lambda *args: None)
+    monkeypatch.setattr(sched, "scheduler", scheduler)
+    def untracked(coro, **kwargs):
+        coro.close()
+        raise AssertionError("maintenance must belong to registered jobs")
+    monkeypatch.setattr(asyncio, "create_task", untracked)
+    sched.start_scheduler()
+    for key in ("wishlist_sync", "price_repair", "fx_refresh", "subscription_refresh", "proxypool_cycle", "mini_seed"):
+        assert jobs[key]["next_run_time"] <= datetime.now() + timedelta(seconds=1)
+    assert jobs["auto_backup"]["next_run_time"] <= datetime.now() + timedelta(minutes=5, seconds=1)
 
 
 @pytest.mark.asyncio
-async def test_chain_survives_step_failure(db, chain_calls):
-    """种子合并炸了不拖垮后续：标记刷新照常、调度器照常启动。"""
-    chain_calls.errors["merge_seeds"] = RuntimeError("种子库损坏")
-    chain_calls.errors["notifications_recover"] = RuntimeError("notification storage unavailable")
-    chain_calls.errors["pp_flags"] = RuntimeError("窗口函数不兼容")
-    await main_mod._post_startup_chain()
-    assert "scheduler_start" in chain_calls.calls
-    assert "hl_flags" in chain_calls.calls
-    assert "sort_cache" in chain_calls.calls
-    assert "proxy_maintenance_start" in chain_calls.calls
+async def test_repair_maintains_views_and_pending_mail_when_collection_disabled(monkeypatch):
+    from app.domains.games import derived
+    from app.domains.notifications import service as notifications
+    calls = []
+    async def maintain(): calls.append("derived")
+    async def dispatch(cycle_id=None): calls.append("notifications")
+    async def disabled(): return False
+    monkeypatch.setattr(derived, "maintain_derived", maintain)
+    monkeypatch.setattr(notifications, "dispatch", dispatch)
+    monkeypatch.setattr(sched, "price_auto_enabled", disabled)
+    monkeypatch.setattr(sched, "_crawler_idle", lambda: True)
+    await sched._job_price_repair()
+    assert calls == ["derived", "notifications"]
 
 
 @pytest.mark.asyncio
-async def test_proxy_startup_sync_is_shared_and_maintenance_runs_after_it(db, chain_calls):
-    await main_mod._startup_proxy_maintenance()
-    assert chain_calls.calls == [
-        "subscription_sync", "clash_autostart", "clash_health", "pool_runtime",
-    ]
+async def test_price_execution_does_not_wait_for_delivery(monkeypatch):
+    from app.domains.crawl import service as crawl
+    from app.domains.games import derived
+    from app.domains.notifications import service as notifications
+    calls = []
+    async def maintain(): calls.append("derived")
+    async def dispatch(cycle_id=None): calls.append("notifications")
+    async def collect(**kwargs): calls.append("crawl")
+    async def enabled(): return True
+    async def noop(*args, **kwargs): pass
+    monkeypatch.setattr(derived, "maintain_derived", maintain)
+    monkeypatch.setattr(notifications, "dispatch", dispatch)
+    monkeypatch.setattr(crawl, "start_job", collect)
+    monkeypatch.setattr(sched, "price_auto_enabled", enabled)
+    monkeypatch.setattr(sched, "_crawler_idle", lambda: True)
+    monkeypatch.setattr(sched, "_reanchor_price_refresh", noop)
+    monkeypatch.setattr(sched, "_kick_stale_price_refresh", noop)
+    await sched._job_price_repair()
+    assert calls == ["derived", "crawl", "notifications"]
 
 
 @pytest.mark.asyncio
-async def test_lifespan_listens_without_waiting_for_chain(db, chain_calls, monkeypatch):
-    """监听不被收拾阻塞：lifespan yield 返回时收拾链仍在跑（闸未放行）。"""
-    from app.core.database import Base
-
-    async with db.kw["bind"].begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    # 种子合并后放闸不放行 → 链停在第一步
-    chain_calls.gates["merge_seeds"] = asyncio.Event()
-
-    # init_db 是监听前的合法阻塞项，原样执行（tmp 库建表很快）
-    monkeypatch.setattr(main_mod, "init_db", database_module.init_db)
-
-    started = asyncio.Event()
-    real_create_task = asyncio.create_task
-
-    def tracked_create_task(coro, **kw):
-        task = real_create_task(coro, **kw)
-        if coro.__name__ == "_post_startup_chain":
-            # 捕获链任务供收尾，避免事件循环结束时报「任务未等待」
-            test_scope.tasks.append(task)
-            started.set()
-        return task
-
-    test_scope = types.SimpleNamespace(tasks=[])
-    monkeypatch.setattr(asyncio, "create_task", tracked_create_task)
-
-    async with main_mod.lifespan(types.SimpleNamespace(state=types.SimpleNamespace())):
-        # lifespan 已开门（yield 返回）：此刻链只应刚起步，一步都没跑完
-        assert started.is_set()
-        assert chain_calls.calls == []
-        await asyncio.sleep(0.05)
-        # 闸不放行，链仍卡在第一步——证明 yield 没等它
-        assert chain_calls.calls == ["notifications_recover", "notifications_resume", "merge_seeds"] or chain_calls.calls == []
-        # 放行收尾
-        chain_calls.gates["merge_seeds"].set()
-        await asyncio.wait_for(test_scope.tasks[0], timeout=5)
-    assert "scheduler_start" in chain_calls.calls
+async def test_mini_seed_uses_normal_import_entry(monkeypatch):
+    from app.core import mini_seed
+    calls = []
+    async def imported():
+        calls.append("imported")
+    monkeypatch.setattr(mini_seed, "import_mini_seed", imported)
+    await sched._job_mini_seed()
+    assert calls == ["imported"]

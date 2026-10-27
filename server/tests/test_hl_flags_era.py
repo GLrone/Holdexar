@@ -1,3 +1,4 @@
+from app.domains.games import derived as games_derived
 """refresh_hl_flags 折扣期语义（新史低只属首个到达该价的折扣期 + 兜底窗）。
 
 - 新低期：现价比折扣期起点之前的最低价便宜 ≥1 角 → 本期首次到该价，
@@ -93,7 +94,7 @@ async def test_new_low_era_persists_across_refresh_cycles():
         _hist(session, A_ERA, 23115, 6, discount=33)
         await session.commit()
 
-    await games_service.refresh_hl_flags(None)
+    await games_derived.update_price_derived(None)
     assert await _flag(A_ERA) == 1
 
     # 下一轮：现价行 updated_at 推进、价格不变（无新历史行），再刷新仍新史低
@@ -101,7 +102,7 @@ async def test_new_low_era_persists_across_refresh_cycles():
         row = await session.get(GameCurrentPrice, (A_ERA, "CN"))
         row.updated_at = now
         await session.commit()
-    await games_service.refresh_hl_flags([A_ERA])
+    await games_derived.update_price_derived([A_ERA])
     assert await _flag(A_ERA) == 1
 
 
@@ -121,7 +122,7 @@ async def test_rounded_prior_within_band_is_flat():
         _hist(session, A_BAND_EDGE, 9200, 1, discount=67)
         await session.commit()
 
-    await games_service.refresh_hl_flags(None)
+    await games_derived.update_price_derived(None)
     assert await _flag(A_BAND) == 2
     assert await _flag(A_BAND_EDGE) == 1
 
@@ -137,7 +138,7 @@ async def test_first_low_era_persists_past_30d():
         _hist(session, A_OLD, 23115, 40, discount=33)
         await session.commit()
 
-    await games_service.refresh_hl_flags(None)
+    await games_derived.update_price_derived(None)
     assert await _flag(A_OLD) == 1
 
 
@@ -152,7 +153,7 @@ async def test_second_same_price_period_is_flat():
         _hist(session, A_REP, 23115, 15, discount=33)
         await session.commit()
 
-    await games_service.refresh_hl_flags(None)
+    await games_derived.update_price_derived(None)
     assert await _flag(A_REP) == 1
 
     # 第二期：涨回原价（10 天前）后再打同价折（3 天前开始，现行价）
@@ -163,7 +164,7 @@ async def test_second_same_price_period_is_flat():
         _hist(session, A_REP, 23115, 3, discount=33)
         await session.commit()
 
-    await games_service.refresh_hl_flags(None)
+    await games_derived.update_price_derived(None)
     assert await _flag(A_REP) == 2
 
 
@@ -177,7 +178,7 @@ async def test_short_history_fallback_caps_at_30d():
         _hist(session, A_CAP, 23115, 40, discount=33)
         await session.commit()
 
-    await games_service.refresh_hl_flags(None)
+    await games_derived.update_price_derived(None)
     assert await _flag(A_CAP) == 2
 
 
@@ -191,7 +192,7 @@ async def test_first_sale_counts_as_new_low():
         _hist(session, A_FIRST, 23115, 6, discount=33)
         await session.commit()
 
-    await games_service.refresh_hl_flags(None)
+    await games_derived.update_price_derived(None)
     assert await _flag(A_FIRST) == 1
 
 
@@ -209,7 +210,7 @@ async def test_price_above_low_not_flagged():
         _hist(session, A_ABOVE_N, 15000, 5)
         await session.commit()
 
-    await games_service.refresh_hl_flags(None)
+    await games_derived.update_price_derived(None)
     assert await _flag(A_ABOVE_D) == 3
     assert await _flag(A_ABOVE_N) == 0
 
@@ -223,5 +224,5 @@ async def test_constant_price_nondiscounted_is_zero():
         _hist(session, A_CONST, 10000, 40)
         await session.commit()
 
-    await games_service.refresh_hl_flags(None)
+    await games_derived.update_price_derived(None)
     assert await _flag(A_CONST) == 0

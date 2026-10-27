@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hmac
 import secrets
+from typing import Callable
 
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -39,6 +40,18 @@ PUBLIC_PATHS = frozenset(
 _API_PREFIX = "/api/"
 
 _token: str | None = None
+
+# MCP 路由闸（由 agent 域 mcp 模块注册）：Host/Origin 闸之后、会话闸之前生效。
+# 外部本机进程拿不到进程内会话令牌，凭数据目录令牌文件准入；
+# 未注册或未启用时该前缀一律 404。
+_mcp_path_prefix: str | None = None
+_mcp_gate: Callable[[Scope], bool | None] | None = None
+
+
+def register_mcp_gate(path_prefix: str, gate: Callable[[Scope], bool | None]) -> None:
+    global _mcp_path_prefix, _mcp_gate
+    _mcp_path_prefix = path_prefix
+    _mcp_gate = gate
 
 
 def session_token() -> str:
@@ -125,18 +138,14 @@ def origin_allowed(scope: Scope) -> bool:
 
     try:
         parts = urlsplit(origin)
+        request = urlsplit("//" + _header_value(scope, b"host"))
+        if parts.scheme not in {"http", "https"} or not host_allowed(parts.netloc):
+            return False
+        origin_port = parts.port or (443 if parts.scheme == "https" else 80)
+        request_port = request.port or (443 if scope.get("scheme") == "https" else 80)
+        return parts.hostname == request.hostname and origin_port == request_port
     except ValueError:
         return False
-    if parts.scheme not in {"http", "https"}:
-        return False
-    origin_host = (parts.hostname or "").lower()
-    if not host_allowed(origin_host):
-        return False
-    # 端口必须一致：这正是跨端口场景要挡住的东西。
-    request_host = _header_value(scope, b"host").strip().lower()
-    request_hostname = request_host.rsplit(":", 1)[0] if ":" in request_host else request_host
-    request_port = request_host.rsplit(":", 1)[1] if ":" in request_host else ""
-    return origin_host == request_hostname and str(parts.port or "") == request_port
 
 
 class LocalAccessMiddleware:
@@ -155,8 +164,7 @@ class LocalAccessMiddleware:
             return
 
         path = scope.get("path", "")
-        # 预检不带 Cookie 也不产生副作用，放行给 CORS 中间件应答。
-        if scope["method"] == "OPTIONS" or not _is_api(path) or path in PUBLIC_PATHS:
+        if not _is_api(path):
             await self.app(scope, receive, send)
             return
 
@@ -165,9 +173,28 @@ class LocalAccessMiddleware:
             await response(scope, receive, send)
             return
 
+        if scope["method"] == "OPTIONS":
+            await self.app(scope, receive, send)
+            return
+
         if not origin_allowed(scope):
             response = JSONResponse({"detail": "请求来源与应用不同源"}, status_code=403)
             await response(scope, receive, send)
+            return
+
+        if _mcp_path_prefix and path.startswith(_mcp_path_prefix):
+            verdict = _mcp_gate(scope) if _mcp_gate is not None else None
+            if verdict is not True:
+                status = 401 if verdict is False else 404
+                response = JSONResponse({"detail": "not found" if status == 404
+                                         else "缺少有效的 MCP 令牌"}, status_code=status)
+                await response(scope, receive, send)
+                return
+            await self.app(scope, receive, send)
+            return
+
+        if path in PUBLIC_PATHS:
+            await self.app(scope, receive, send)
             return
 
         if not _authorized(scope):

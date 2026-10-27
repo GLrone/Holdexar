@@ -1,3 +1,4 @@
+from app.domains.games import derived as games_derived
 """版本显示链路验收。
 
 四条链路（合成 appid 播种 game_price_history，夹具清理）：
@@ -230,7 +231,7 @@ async def test_hl_flags_excludes_bundle_rows():
     async with get_session_factory()() as session:
         _seed_history(session, 1, "CN", 10000, days_ago=0)
         await session.commit()
-    await games_service.refresh_hl_flags([APPID])
+    await games_derived.update_price_derived([APPID])
     async with get_session_factory()() as session:
         game = await session.get(Game, APPID)
         assert game.hl_flag == 1

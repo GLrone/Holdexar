@@ -156,8 +156,7 @@ def local_next_grid(
     """启动初锚（同步零网络）：本地 zoneinfo 判 DST → 下一网格时刻。
 
     start_scheduler 同步上下文无法 await 外部请求，先用本地推算立即
-    挂上锚点网格；随后 _anchor_probe_after_start 异步请求外部时间纠偏
-    （权威源；非切换日两者恒一致，切换日探针保证网格换轨）。
+    挂上锚点网格；正常价格轮续约时再按外部时间校准。
     """
     is_dst = datetime.now(PACIFIC_TZ).dst() != timedelta(0)
     hour = anchor_hour(is_dst)

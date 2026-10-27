@@ -291,7 +291,7 @@ def test_probe_rejects_health_from_foreign_process(tmp_path, monkeypatch):
     monkeypatch.setattr(update_host.subprocess, "Popen", lambda *a, **k: _Proc())
     monkeypatch.setattr(update_host, "_listen_ports", lambda pid: ([28765], 777))
     monkeypatch.setattr(update_host, "process_image_path", lambda pid: str(exe))
-    monkeypatch.setattr(update_host.httpx, "get", lambda *a, **k: _Resp())
+    monkeypatch.setattr(update_host, "_http_get_json", lambda *a, **k: (200, {"app": APP_NAME, "version": "0.3.6", "pid": 777, "updateAttemptId": "att-1"}))
     monkeypatch.setattr("app.core.update_process.ProbeTree.assign", lambda *a: None)
     monkeypatch.setattr("app.core.update_process.ProbeTree.stop", lambda *a: None)
 
@@ -349,41 +349,18 @@ def test_install_rejects_traversal_version_name(tmp_path):
         update_host.install_version_payload(root, staging, "../escape")
 
 
-def test_install_version_payload_differential_patch(tmp_path):
-    from app.core.differential_patch import create_differential_patch
-    import zipfile
-
+def test_install_version_payload_flat_package(tmp_path):
+    """扁平单版本载荷直接作为版本目录落位（差量链退役后的唯一通道之一）。"""
     root = tmp_path / "app"
-    base_ver = "0.3.5"
     target_ver = "0.3.6"
 
-    # 基准版本已安装在 versions/0.3.5
-    base_dir = layout.get_version_dir(root, base_ver)
-    base_dir.mkdir(parents=True)
-    (base_dir / f"{APP_NAME}.exe").write_bytes(b"base-launcher-content")
-    (base_dir / "_internal").mkdir()
-    (base_dir / "_internal" / "keep.dll").write_bytes(b"keep-content")
-    (base_dir / "_internal" / "remove.dll").write_bytes(b"remove-content")
-
-    # 目标新版本内容
-    target_mock = tmp_path / "target_mock"
-    target_mock.mkdir()
-    (target_mock / f"{APP_NAME}.exe").write_bytes(b"new-launcher-content")
-    (target_mock / "_internal").mkdir()
-    (target_mock / "_internal" / "keep.dll").write_bytes(b"keep-content")
-    (target_mock / "_internal" / "added.dll").write_bytes(b"added-content")
-
-    # 生成差量包并解包到 staging
-    patch_zip = tmp_path / "patch.zip"
-    create_differential_patch(base_dir, target_mock, base_ver, target_ver, patch_zip)
-
     staging = tmp_path / "staging"
-    staging_payload = staging / APP_NAME
-    staging_payload.mkdir(parents=True)
-    with zipfile.ZipFile(patch_zip, "r") as zf:
-        zf.extractall(staging_payload)
+    payload = staging / APP_NAME
+    (payload / "_internal").mkdir(parents=True)
+    (payload / f"{APP_NAME}.exe").write_bytes(b"new-launcher-content")
+    (payload / "_internal" / "keep.dll").write_bytes(b"keep-content")
+    (payload / "_internal" / "added.dll").write_bytes(b"added-content")
 
-    # 执行差量安装
     dest = update_host.install_version_payload(root, staging, target_ver)
 
     assert dest == layout.get_version_dir(root, target_ver)
@@ -391,7 +368,6 @@ def test_install_version_payload_differential_patch(tmp_path):
     assert (dest / f"{APP_NAME}.exe").read_bytes() == b"new-launcher-content"
     assert (dest / "_internal" / "keep.dll").read_bytes() == b"keep-content"
     assert (dest / "_internal" / "added.dll").read_bytes() == b"added-content"
-    assert not (dest / "_internal" / "remove.dll").exists()
 
 
 def test_safe_replace_executable_fallback(tmp_path, monkeypatch):
@@ -576,6 +552,54 @@ def test_accepted_update_only_falls_back_to_verified_compatible_program(tmp_path
                               dataDir=str(data), dataDbPath=str(data / "holdexar.db"))
     assert update_host.recover_interrupted_update(root) is True
     assert layout.get_current_version(root) == "0.3.5"
+    diag = json.loads((root / "logs" / "update-diagnosis.json").read_text(encoding="utf-8"))
+    assert diag["success"] is False
+    assert diag["currentVersion"] == "0.3.5"
+
+
+@pytest.mark.parametrize("diagnosis_state", ["switching", "committed", "missing", "other_attempt"])
+def test_accepted_recovery_closes_success_diagnosis_without_repeating_ack(tmp_path, diagnosis_state):
+    from app.core import updater
+
+    root = tmp_path / "app"
+    data = root / "data"
+    data.mkdir(parents=True)
+    target = updater.APP_VERSION
+    for version in ("0.3.4", target):
+        exe = layout.get_version_exe(root, version)
+        exe.parent.mkdir(parents=True)
+        exe.write_bytes(b"compatible")
+    layout.write_current_state(root, target, last_known_good="0.3.4")
+    with sqlite3.connect(data / "holdexar.db") as conn:
+        conn.execute("PRAGMA user_version=18")
+    layout.write_data_compatibility(root, {"dataDir": str(data), "schemaVersion": 18, "versions": [target]})
+    layout.start_transaction(root, target, "0.3.4", attempt_id="accepted")
+    layout.update_transaction(root, layout.STAGE_VERIFYING, dataPrepared=True, dataAccepted=True,
+                              dataRecoveryPhase="accepted", dataSchemaVersion=18, dataToken="accepted",
+                              dataDir=str(data), dataDbPath=str(data / "holdexar.db"))
+    diag_file = root / "logs" / "update-diagnosis.json"
+    if diagnosis_state != "missing":
+        diag_file.parent.mkdir()
+        diag_file.write_text(json.dumps({
+            "attemptId": "other" if diagnosis_state == "other_attempt" else "accepted",
+            "stage": diagnosis_state, "targetVersion": target, "notes": "release notes",
+            "success": diagnosis_state == "committed", "acknowledged": diagnosis_state == "committed",
+        }), encoding="utf-8")
+
+    assert update_host.recover_interrupted_update(root) is True
+    tx = layout.read_transaction(root)
+    assert tx["stage"] == layout.STAGE_COMMITTED
+    diag = json.loads(diag_file.read_text(encoding="utf-8"))
+    assert diag["attemptId"] == "accepted"
+    assert diag["targetVersion"] == target
+    assert diag["currentVersion"] == target
+    assert diag["sourceVersion"] == "0.3.4"
+    assert diag["stage"] == layout.STAGE_COMMITTED
+    assert diag["success"] is True
+    assert diag["acknowledged"] is (diagnosis_state == "committed")
+    assert diag.get("notes", "") == ("release notes" if diagnosis_state in ("switching", "committed") else "")
+    assert update_host.recover_interrupted_update(root) is True
+    assert json.loads(diag_file.read_text(encoding="utf-8"))["acknowledged"] == diag["acknowledged"]
 
 
 @pytest.mark.parametrize("target", ["0.3.5-BETA", "0.3.5-beta."])
@@ -649,3 +673,17 @@ def test_direct_install_cannot_replace_current_version(tmp_path):
     with pytest.raises(RuntimeError):
         update_host.install_version_payload(root, staging, "0.3.5")
     assert active.read_bytes() == b"preserve-active"
+
+
+def test_strict_diagnosis_writer_does_not_hide_storage_failure(tmp_path, monkeypatch):
+    write = Path.write_text
+
+    def fail(path, *args, **kwargs):
+        if path.name == "update-diagnosis.tmp":
+            raise OSError("diagnosis disk failure")
+        return write(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail)
+    with pytest.raises(OSError, match="disk failure"):
+        update_host._write_diagnosis(tmp_path, {"stage": "committed"}, strict=True)
+    assert not (tmp_path / "logs/update-diagnosis.json").exists()

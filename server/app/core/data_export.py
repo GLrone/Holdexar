@@ -58,7 +58,6 @@ _USER_TABLES = (
     "fact_notices",
     "proxies",
     "proxy_subscriptions",
-    "clash_nodes",
     "steam_events",
     "achievement_states",
     "achievement_games",

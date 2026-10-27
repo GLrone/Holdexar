@@ -17,7 +17,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-import httpx
+import http.client
+
 
 from app.core import layout
 from app.core.app_info import (
@@ -28,6 +29,21 @@ from app.core.app_info import (
     version_from_tag,
 )
 from app.core.paths import install_root as resolve_default_install_root
+
+def _http_get_json(host: str, port: int, path: str, timeout: float = 3.0) -> tuple[int, dict | None]:
+    try:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        conn.request("GET", path, headers={"Host": host, "Connection": "close"})
+        resp = conn.getresponse()
+        status = resp.status
+        raw = resp.read()
+        conn.close()
+        try:
+            return status, json.loads(raw.decode("utf-8"))
+        except Exception:
+            return status, None
+    except Exception:
+        return 0, None
 
 DEFAULT_SERVER_HOST = "127.0.0.1"
 DEFAULT_SERVER_PORT = 28765
@@ -82,7 +98,7 @@ def _notify(msg: str) -> None:
     threading.Thread(target=_alert, args=(f"[更新] {msg}",), daemon=True).start()
 
 
-def _write_diagnosis(root: Path, record: dict[str, Any]) -> None:
+def _write_diagnosis(root: Path, record: dict[str, Any], *, strict: bool = False) -> None:
     try:
         diag_file = root / "logs" / "update-diagnosis.json"
         diag_file.parent.mkdir(parents=True, exist_ok=True)
@@ -91,6 +107,37 @@ def _write_diagnosis(root: Path, record: dict[str, Any]) -> None:
         tmp.replace(diag_file)
     except Exception as exc:  # noqa: BLE001
         _log_update(root, f"写入诊断报告失败：{exc}")
+        if strict:
+            raise
+
+
+def _finish_diagnosis(root: Path, current_version: str, record: dict | None = None) -> None:
+    transaction = layout.read_transaction(root) or {}
+    if record is None:
+        try:
+            record = json.loads((root / "logs" / "update-diagnosis.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            record = {}
+    same_attempt = (isinstance(record, dict)
+                    and record.get("attemptId") == transaction.get("attemptId")
+                    and record.get("targetVersion") == transaction.get("targetVersion"))
+    record = dict(record) if same_attempt else {}
+    success = current_version == transaction.get("targetVersion")
+    acknowledged = success and record.get("stage") == layout.STAGE_COMMITTED and record.get("acknowledged") is True
+    record.update({
+        "attemptId": transaction.get("attemptId"),
+        "sourceVersion": transaction.get("sourceVersion"),
+        "targetVersion": transaction.get("targetVersion"),
+        "currentVersion": current_version,
+        "dataDir": transaction.get("dataDir"),
+        "startTime": transaction.get("startTime"),
+        "stage": layout.STAGE_COMMITTED if success else "accepted_failure",
+        "success": success,
+        "error": None if success else "已保留已接受数据，当前使用相容版本",
+        "endTime": (record.get("endTime") or time.time()) if acknowledged else time.time(),
+        "acknowledged": acknowledged,
+    })
+    _write_diagnosis(root, record)
 
 
 def wait_process_exit(pid: int, timeout: float = 10.0) -> bool:
@@ -214,31 +261,8 @@ def install_version_payload(
 
     versions_sub = payload / "versions"
 
-    # 0. 检查是否为文件级差量包（patch-manifest.json）
-    patch_file = next(
-        (p for p in (payload / "patch-manifest.json", staging_dir / "patch-manifest.json") if p.is_file()),
-        None,
-    )
-    if patch_file is not None:
-        from app.core.differential_patch import apply_differential_patch
-
-        patch_manifest = json.loads(patch_file.read_text(encoding="utf-8"))
-        from_ver = patch_manifest.get("fromVersion")
-        if not from_ver:
-            raise RuntimeError("差量更新清单缺少来源版本号（fromVersion）")
-        base_ver_dir = layout.get_version_dir(root, from_ver)
-        if not base_ver_dir.is_dir() or not layout.is_version_valid(root, from_ver):
-            raise RuntimeError(f"差量更新所需的基准版本不存在或损坏：{from_ver}")
-
-        _log_update(root, f"正在应用文件级差量包（从 v{from_ver} 升级至 v{target_version}）...")
-        apply_differential_patch(
-            patch_source=patch_file.parent,
-            base_dir=base_ver_dir,
-            target_dest_dir=dest,
-        )
-
     # 1. 载荷自带多版本布局（含 versions/ 子目录）
-    elif versions_sub.is_dir():
+    if versions_sub.is_dir():
         src_ver = versions_sub / target_version
         if not src_ver.is_dir():
             # 载荷版本目录名与清单版本不一致即为错包：绝不拿别的目录冒充目标版本
@@ -253,7 +277,7 @@ def install_version_payload(
     if not layout.is_version_valid(root, target_version):
         raise RuntimeError(f"安装到 {dest} 失败：缺少主可执行程序")
 
-    if (versions_sub.is_dir() or patch_file is not None):
+    if versions_sub.is_dir():
         src_launcher = payload / f"{APP_NAME}.exe"
         if src_launcher.is_file():
             _safe_replace_executable(src_launcher, root / f"{APP_NAME}.exe")
@@ -494,7 +518,8 @@ def probe_version_health(
     preserved = False
     if protected:
         layout.update_transaction(root, layout.STAGE_VERIFYING,
-                                  dataProbeRegistrationRequired=True, launchPending=True)
+                                  dataProbeRegistrationRequired=True, launchPending=True,
+                                  launchImage=str(exe.resolve()))
     try:
         # 带 --server：仅起本地服务做健康检查，不打开 WebView2 窗口
         proc = subprocess.Popen(
@@ -535,18 +560,8 @@ def probe_version_health(
             for candidate in ports:
                 if not _answers_http(candidate):
                     continue
-                url = f"http://{DEFAULT_SERVER_HOST}:{candidate}/api/v1/health"
-                try:
-                    resp = httpx.get(url, timeout=3.0, trust_env=False)
-                except Exception:  # noqa: BLE001
-                    continue
-                if resp.status_code != 200:
-                    continue
-                try:
-                    data = resp.json()
-                except Exception:  # noqa: BLE001
-                    continue
-                if not isinstance(data, dict) or data.get("app") != APP_NAME:
+                status, data = _http_get_json(DEFAULT_SERVER_HOST, candidate, "/api/v1/health", timeout=3.0)
+                if status != 200 or not isinstance(data, dict) or data.get("app") != APP_NAME:
                     continue
                 pid = data.get("pid")
                 if pid is not None and int(pid) != int(proc.pid):
@@ -556,14 +571,10 @@ def probe_version_health(
                     last_reason = f"{HEALTH_BINDING_ERROR}：监听者 {owner_pid}≠本次进程 {proc.pid}"
                     continue
                 if require_guard is False and "dataDir" not in data:
-                    try:
-                        info_response = httpx.get(
-                            f"http://{DEFAULT_SERVER_HOST}:{candidate}/api/v1/info",
-                            timeout=3.0, trust_env=False,
-                        )
-                        info = info_response.json() if info_response.status_code == 200 else {}
+                    status_info, info = _http_get_json(DEFAULT_SERVER_HOST, candidate, "/api/v1/info", timeout=3.0)
+                    if status_info == 200 and isinstance(info, dict):
                         data["dataDir"] = info.get("data_dir")
-                    except (OSError, ValueError, httpx.HTTPError):
+                    else:
                         continue
                 reason = verify_health_response(
                     data,
@@ -801,6 +812,37 @@ def _finish_update_result(root: Path, result: bool) -> bool:
     return result
 
 
+def _probe_processes(exe: Path) -> list[int]:
+    if os.name != "nt":
+        raise RuntimeError("当前平台无法核对未登记的验收进程，保留数据保护")
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+         "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); "
+         "Get-CimInstance Win32_Process | Select-Object ProcessId,Name,ExecutablePath | ConvertTo-Json -Compress"],
+        capture_output=True, encoding="utf-8-sig", check=True, timeout=15,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    rows = json.loads(result.stdout)
+    if not rows:
+        raise RuntimeError("无法取得进程列表，保留数据保护")
+    if isinstance(rows, dict):
+        rows = [rows]
+    active = []
+    for row in rows:
+        pid = int(row["ProcessId"])
+        if pid == os.getpid() or str(row["Name"]).casefold() != exe.name.casefold():
+            continue
+        image = row.get("ExecutablePath") or process_image_path(pid)
+        if not image:
+            from app.core.db_safety import _pid_is_running
+
+            if _pid_is_running(pid):
+                raise RuntimeError("验收进程身份无法确认，保留数据保护")
+        elif _same_path(image, exe):
+            active.append(pid)
+    return active
+
+
 def recover_interrupted_update(root: Path) -> bool:
     from app.core import update_data
     from app.core.update_process import update_mutex
@@ -821,8 +863,20 @@ def recover_interrupted_update(root: Path) -> bool:
                 raise RuntimeError("缺少与当前数据相容的程序，数据已保留；请重新解压已验收版本")
             layout.confirm_version(root, compatible)
             layout.update_transaction(root, layout.STAGE_COMMITTED, currentVersion=compatible)
+            _finish_diagnosis(root, compatible)
             return True
         if tx.get("dataPrepared"):
+            if tx.get("launchPending"):
+                candidate = dict(tx, launchPending=False)
+                update_data._require_children_stopped(candidate, True)
+                exe = Path(tx.get("launchImage") or layout.get_version_exe(root, tx["targetVersion"]))
+                try:
+                    active = _probe_processes(exe)
+                except Exception as exc:
+                    raise RuntimeError("无法确认验收进程退出，保留更新数据保护") from exc
+                if active:
+                    raise RuntimeError("验收进程仍在运行，保留更新数据保护")
+                layout.update_transaction(root, tx["stage"], launchPending=False)
             diagnosis = {
                 "attemptId": tx["attemptId"], "targetVersion": tx["targetVersion"],
                 "sourceVersion": tx["sourceVersion"], "dataDir": tx["dataDir"],
@@ -1014,14 +1068,7 @@ def _commit(
     pruned = layout.prune_versions(root, min_keep=2)
     _log_update(root, f"换装成功！清理历史版本：{pruned}")
 
-    diagnosis.update({
-        "stage": layout.STAGE_COMMITTED,
-        "currentVersion": target_version,
-        "success": True,
-        "endTime": time.time(),
-        "acknowledged": False,
-    })
-    _write_diagnosis(root, diagnosis)
+    _finish_diagnosis(root, target_version, diagnosis)
     return True
 
 

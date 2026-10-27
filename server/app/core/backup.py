@@ -22,16 +22,23 @@ integrity_check；恢复时解档后仍做完整自检（段 1），旧的未压
 from __future__ import annotations
 
 import gzip
-import hashlib
 import json
 import logging
 import os
 import shutil
 import sqlite3
-import time
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
+
+from app.core.db_safety import (
+    snapshot_to,
+    sha256_of,
+    _verify_file,
+    _release_restore_lock,
+    _acquire_restore_lock as _db_acquire_restore_lock,
+    ensure_restore_lock_available as _db_ensure_restore_lock_available,
+)
 
 from .config import get_settings
 from .database import complete_db_thread
@@ -67,141 +74,13 @@ def _ts() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
-def _pid_is_running(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        import ctypes
-        from ctypes import wintypes
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        open_process = kernel32.OpenProcess
-        open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-        open_process.restype = wintypes.HANDLE
-        handle = open_process(0x00101000, False, pid)
-        if handle:
-            close_handle = kernel32.CloseHandle
-            close_handle.argtypes = (wintypes.HANDLE,)
-            close_handle.restype = wintypes.BOOL
-            wait = kernel32.WaitForSingleObject
-            wait.argtypes = (wintypes.HANDLE, wintypes.DWORD)
-            wait.restype = wintypes.DWORD
-            try:
-                return wait(handle, 0) != 0
-            finally:
-                close_handle(handle)
-        # ERROR_INVALID_PARAMETER means the PID no longer exists; access denial and
-        # other OS errors fail closed so a live maintenance lock is never discarded.
-        return ctypes.get_last_error() != 87
-    try:
-        os.kill(pid, 0)
-        return True
-    except PermissionError:
-        return True
-    except ProcessLookupError:
-        return False
-    except OSError as exc:
-        return getattr(exc, "winerror", None) != 87 and exc.errno != 3
-
-
-def _ordinary_maintenance_marker(metadata) -> bool:
-    return isinstance(metadata, dict) and (
-        "purpose" not in metadata or metadata["purpose"] == "maintenance"
-    )
-
-
-def _restore_lock_is_stale(lock_path: Path) -> bool:
-    try:
-        payload = lock_path.read_text(encoding="utf-8")
-    except OSError:
-        return False
-    try:
-        metadata = json.loads(payload)
-    except (json.JSONDecodeError, TypeError):
-        metadata = None
-    if isinstance(metadata, dict) and metadata.get("purpose") in ("update", "restore"):
-        return False
-    if (_ordinary_maintenance_marker(metadata)
-            and type(metadata.get("pid")) is int and metadata["pid"] > 0):
-        return not _pid_is_running(metadata["pid"])
-    return False
-
-
-def _remove_stale_restore_lock(lock_path: Path) -> bool:
-    try:
-        before = lock_path.stat()
-    except FileNotFoundError:
-        return True
-    if not _restore_lock_is_stale(lock_path):
-        return False
-    try:
-        after = lock_path.stat()
-        if (before.st_ino, before.st_mtime_ns, before.st_size) != (
-            after.st_ino, after.st_mtime_ns, after.st_size
-        ):
-            return False
-        lock_path.unlink()
-        return True
-    except FileNotFoundError:
-        return True
-
-
 def ensure_restore_lock_available(
     db_path: Path | None = None, *, maintenance_token: str | None = None
 ) -> None:
-    """启动时清理可证明陈旧的锁；仍有进程持有时拒绝打开数据库。"""
-    lock_path = (
-        db_path.parent / _BACKUP_DIR_NAME / _LOCK_FILE
-        if db_path is not None
-        else backup_dir() / _LOCK_FILE
+    _db_ensure_restore_lock_available(
+        db_path, lock_path=backup_dir() / _LOCK_FILE if db_path is None else None,
+        maintenance_token=maintenance_token,
     )
-    if not lock_path.exists():
-        return
-    if maintenance_token:
-        try:
-            metadata = json.loads(lock_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            metadata = None
-        if isinstance(metadata, dict) and metadata.get("token") == maintenance_token:
-            return
-    if _remove_stale_restore_lock(lock_path):
-        log_event(logger, "已清理中断维护留下的旧锁文件", level=logging.WARNING)
-        return
-    try:
-        metadata = json.loads(lock_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        metadata = None
-    if isinstance(metadata, dict) and metadata.get("purpose") == "restore":
-        rollback = metadata.get("rollbackPath")
-        original = Path(rollback) if isinstance(rollback, str) and rollback else None
-        snapshot = (f"待校验的原库副本保留在 {original}。"
-                    if original is not None and original.is_file()
-                    else "未找到原库副本，当前数据状态尚未确认。")
-        raise RuntimeError(
-            f"上次原库恢复未完成，已停止写入；{snapshot}"
-            "请保留整个数据目录并联系维护者恢复原库，勿删除维护保护文件"
-        )
-    if (not isinstance(metadata, dict) or type(metadata.get("pid")) is not int
-            or metadata["pid"] <= 0 or not (
-                _ordinary_maintenance_marker(metadata) or metadata.get("purpose") == "update")):
-        raise RuntimeError("数据库维护保护身份无法确认，已停止写入；请保留数据目录和保护记录，勿按文件年龄清理")
-    raise RuntimeError("数据库维护正在进行中，拒绝启动或备份")
-
-
-def ensure_database_read_available(db_path: Path, *, maintenance_token: str | None = None) -> None:
-    lock_path = db_path.parent / _BACKUP_DIR_NAME / _LOCK_FILE
-    if not lock_path.exists():
-        return
-    try:
-        metadata = json.loads(lock_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        metadata = None
-    if isinstance(metadata, dict) and metadata.get("purpose") == "update":
-        return
-    if (_ordinary_maintenance_marker(metadata) and type(metadata.get("pid")) is int
-            and metadata["pid"] > 0):
-        return
-    ensure_restore_lock_available(db_path, maintenance_token=maintenance_token)
 
 
 def _acquire_restore_lock(
@@ -209,40 +88,10 @@ def _acquire_restore_lock(
     install_root: Path | None = None, attempt_id: str | None = None,
     token: str | None = None,
 ) -> tuple[Path, str]:
-    lock_path = (db_path.parent / _BACKUP_DIR_NAME if db_path is not None else backup_dir()) / _LOCK_FILE
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    _remove_stale_restore_lock(lock_path)
-    token = token or f"{os.getpid()}-{time.time_ns()}-{os.urandom(6).hex()}"
-    payload = json.dumps({
-        "pid": os.getpid(),
-        "created_at": datetime.now().isoformat(),
-        "token": token,
-        "purpose": purpose,
-        "installRoot": str(install_root.resolve()) if install_root is not None else None,
-        "attemptId": attempt_id,
-    }).encode("utf-8")
-    try:
-        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError as exc:
-        raise RuntimeError("已有数据库维护操作在进行中") from exc
-    try:
-        os.write(fd, payload)
-        os.fsync(fd)
-    except BaseException:
-        lock_path.unlink(missing_ok=True)
-        raise
-    finally:
-        os.close(fd)
-    return lock_path, token
-
-
-def _release_restore_lock(lock_path: Path, token: str) -> None:
-    try:
-        metadata = json.loads(lock_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-    if isinstance(metadata, dict) and metadata.get("token") == token:
-        lock_path.unlink(missing_ok=True)
+    return _db_acquire_restore_lock(
+        db_path=db_path, lock_path=backup_dir() / _LOCK_FILE if db_path is None else None,
+        purpose=purpose, install_root=install_root, attempt_id=attempt_id, token=token,
+    )
 
 
 def _protect_restore_recovery(lock_path: Path, token: str, src: Path,
@@ -369,33 +218,7 @@ async def _wait_for_active_crawl(crawl_service, operation: str) -> None:
         raise RuntimeError(f"{operation}未执行：正在运行的价格更新没有及时结束") from exc
 
 
-def snapshot_to(src: Path, dest: Path) -> None:
-    """VACUUM INTO 快照：独立短连接，只读源库，产出自洽新文件。
-
-    isolation_level=None 必须显式设——VACUUM 不能在事务内执行，
-    sqlite3 默认隔离模式会隐式开事务导致 OperationalError。
-
-    公共入口：`create_backup` / `restore_backup` 的轮换档与 `database`
-    的迁移前快照共用这一份实现（VACUUM 不能在事务内执行，见上）。
-    """
-    conn = sqlite3.connect(src.as_posix(), timeout=30, isolation_level=None)
-    try:
-        conn.execute("PRAGMA busy_timeout=30000")
-        conn.execute("VACUUM INTO ?", (dest.as_posix(),))
-    finally:
-        conn.close()
-
-
 # ─── 归档压缩与哈希 ─────────────────────────────────────────
-
-
-def sha256_of(path: Path) -> str:
-    """整文件 sha256（分块读，不一次吞进内存）。"""
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def _compress_to_archive(snapshot: Path, dest: Path) -> str:
@@ -614,42 +437,6 @@ def _vacuum_file(src: Path) -> None:
                     "磁盘空间不足，无法收缩（需要约一个数据库文件大小的空闲空间）"
                 ) from e
             raise
-    finally:
-        conn.close()
-
-
-def _verify_file(path: Path, deep: bool = False) -> tuple[bool, int]:
-    """独立打开 + 一致性自检 + 核心表行数。返回 (是否自洽, games 行数)。
-
-    `deep=False` 走 `quick_check`（复杂度 O(N)），`deep=True` 走
-    `integrity_check`（O(N log N)，大库上慢一个数量级）：日常校验用前者，
-    后者留给恢复前与用户显式要求的深度校验。quick_check 不验证 UNIQUE 约束
-    与索引内容匹配，取舍见调用方说明。
-
-    损坏文件（非 SQLite 格式）执行自检会直接抛 DatabaseError——按不自洽处理，
-    不让异常穿透到调用方。
-    """
-    if not path.is_file():
-        return False, 0
-    try:
-        conn = sqlite3.connect(path.as_posix())
-    except sqlite3.Error:
-        return False, 0
-    try:
-        try:
-            row = conn.execute(
-                "PRAGMA integrity_check" if deep else "PRAGMA quick_check"
-            ).fetchone()
-        except sqlite3.DatabaseError:
-            return False, 0  # 非 SQLite 格式 / 页头损坏
-        if not row or row[0] != "ok":
-            return False, 0
-        games = 0
-        try:
-            games = conn.execute("SELECT COUNT(*) FROM games").fetchone()[0]
-        except sqlite3.OperationalError:
-            pass  # 空库/无 games 表：备份合法但计 0
-        return True, games
     finally:
         conn.close()
 

@@ -16,15 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import errno
-import hashlib
 import logging
 import math
-import os
 import re
 import sys
-import tempfile
-import threading
 import time
 from collections import deque
 from collections.abc import AsyncIterator
@@ -39,7 +34,11 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
+from app.core import db_safety
 from app.core.config import get_settings
+from app.core.db_safety import (
+    _CrossProcessWriteLock,
+)
 from app.core.logging import log_event
 
 logger = logging.getLogger(__name__)
@@ -90,7 +89,7 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         # 排序缓存预计算列（对齐 mv_game_sort_cache）
         "min_cny_fen": "BIGINT",
         "diff_fen": "INTEGER DEFAULT 0",
-        # smart 排序评分（refresh_sort_cache 维护；NULL=未计算）
+        # smart 排序评分（update_price_derived 维护；NULL=未计算）
         "smart_score": "REAL",
         # 商店移除监控：下架判定时间戳 + 连续全 404 轮数
         "removed_at": "DATETIME",
@@ -141,6 +140,10 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         # 所属 Steam 活动周期标签（steam_events.event_key；观测写入时打标 +
         # 同步后按窗口回贴，NULL = 不属于任何已知活动窗口）
         "steam_event_key": "VARCHAR(60)",
+        # 观测来源：steam=官方渠道爬取观测，community=社区历史源回填
+        "source": "VARCHAR(20) NOT NULL DEFAULT 'steam'",
+        # 商品身份未知（社区历史源 appid 级序列）：不并入标准版，未知保持未知
+        "product_unknown": "BOOLEAN NOT NULL DEFAULT 0",
     },
     # 捆绑包形态列：链接/CDN 用（与购买语义 mps 解耦）
     # + 排序快照预计算列（对齐 games：min_cny_fen/diff_fen/is_lowest；
@@ -174,6 +177,7 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
     },
     # 节点行上挂最近成功 L0 延迟（出口槽排序键的持久化形态；成功不落观测行）
     "proxy_nodes": {
+        "cooldown_until": "DATETIME",
         "l0_delay_ms": "INTEGER",
     },
     # 订阅废弃终态（节点状态存储：>95% 不可用 → deprecated）
@@ -284,11 +288,7 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "units_locked": "INTEGER",
         "units_failed": "INTEGER",
         "units_unobserved": "INTEGER",
-        "coverage": "REAL",
-        "coverage_confirmed": "REAL",
         "stale_count": "INTEGER",
-        "duration_seconds": "REAL",
-        "stage_ms_json": "JSON",
         "notification_scan_json": "JSON",
         "batches_expected": "INTEGER",
         "batches_done": "INTEGER",
@@ -328,10 +328,6 @@ _TABLE_EXTRA_INDEXES: dict[str, list[str]] = {
     "fx_rate_history": [
         "CREATE INDEX IF NOT EXISTS ix_frh_currency_id ON fx_rate_history(currency_code, id)",
     ],
-    # 节点状态账本按订阅取全量（test_clash_nodes UPSERT / 体检门槛查询）
-    "clash_nodes": [
-        "CREATE INDEX IF NOT EXISTS ix_clash_nodes_sub_name ON clash_nodes(subscription_id, name)",
-    ],
     # 周期归属回查：本轮挂了哪些 job
     "crawl_jobs": [
         "CREATE INDEX IF NOT EXISTS ix_crawl_jobs_cycle ON crawl_jobs(cycle_id)",
@@ -366,29 +362,6 @@ def _ensure_schema(sync_conn) -> None:
                 sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
                 added_columns.append(f"{table}.{name}")
 
-    # 观察三元组回填：存量行按 price_status 推导（ok/locked=成功观察并带
-    # last_success_at；其余=失败态）。WHERE attempt_outcome IS NULL 保证幂等。
-    gcp_cols = {
-        row[1]
-        for row in sync_conn.execute(
-            text("PRAGMA table_info(game_current_prices)")
-        ).fetchall()
-    }
-    backfilled = 0
-    if "attempt_outcome" in gcp_cols:
-        backfilled = sync_conn.execute(
-            text(
-                "UPDATE game_current_prices SET "
-                "attempt_outcome = CASE WHEN price_status IN ('ok', 'locked') "
-                "  THEN 'success' ELSE 'failed' END, "
-                "steam_answer = CASE price_status WHEN 'ok' THEN 'ok' "
-                "  WHEN 'locked' THEN 'locked' ELSE NULL END, "
-                "last_success_at = CASE WHEN price_status IN ('ok', 'locked') "
-                "  THEN updated_at ELSE NULL END "
-                "WHERE attempt_outcome IS NULL"
-            )
-        ).rowcount
-
     existing_indexes = {
         row[0] for row in sync_conn.execute(
             text("SELECT name FROM sqlite_master WHERE type='index'")
@@ -410,8 +383,6 @@ def _ensure_schema(sync_conn) -> None:
 
     if added_columns:
         log_event(logger, "存量库结构补列", detail={"列": added_columns})
-    if backfilled:
-        log_event(logger, "观察三元组存量回填", detail={"行数": backfilled})
     if added_indexes:
         log_event(logger, "存量库补索引", detail={"索引": added_indexes})
 
@@ -422,7 +393,8 @@ def _ensure_schema(sync_conn) -> None:
 #   2. _MIGRATIONS 追加 (版本号, 描述, SQL 列表)；SQL 须幂等（中断续跑 +
 #      用户库版本乱序防御），复杂逻辑可登记 async fn(engine) 同位元素
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 32
+
 
 # 零小数货币（Steam 以整数计价）：旧捆绑包链路的除数表按 1 处理，与「统一存分」
 # 的新约定差 100 倍——v2 归一的目标集合
@@ -1225,7 +1197,7 @@ async def _migrate_proxynode_subscription_identity(conn) -> None:
     ))
 
 
-def _identity_table_ddl(sql: str, name: str) -> str | None:
+def _table_declarations(sql: str, name: str) -> tuple[list[str], str]:
     start, end = sql.find("("), sql.rfind(")")
     if start < 0 or end < start or "WITHOUT ROWID" in sql[end:].upper():
         raise RuntimeError(f"无法安全迁移 {name} 的整数身份结构")
@@ -1251,6 +1223,11 @@ def _identity_table_ddl(sql: str, name: str) -> str | None:
             offset = index + 1
         index += 1
     parts.append(body[offset:])
+    return parts, sql[end:]
+
+
+def _identity_table_ddl(sql: str, name: str) -> str | None:
+    parts, suffix = _table_declarations(sql, name)
     identifier = r'(?:id|"id"|`id`|\[id\])'
     pk = re.compile(rf"^\s*PRIMARY\s+KEY\s*\(\s*{identifier}\s*\)\s*$", re.I)
     column = re.compile(rf"^(\s*{identifier}\s+INTEGER)\b(.*)$", re.I | re.S)
@@ -1284,7 +1261,7 @@ def _identity_table_ddl(sql: str, name: str) -> str | None:
         raise RuntimeError(f"无法安全迁移 {name} 的主键定义")
     if already_autoincrement:
         return None
-    return f'CREATE TABLE "{name}_identity_new" (' + ",".join(converted) + sql[end:]
+    return f'CREATE TABLE "{name}_identity_new" (' + ",".join(converted) + suffix
 
 
 async def _migrate_notification_identity(conn) -> None:
@@ -1347,6 +1324,360 @@ async def _migrate_notification_identity(conn) -> None:
 
 
 # (目标版本, 说明, 迁移体)：迁移体 = SQL 语句列表，或 async callable(engine)
+async def _migrate_price_snapshot(conn) -> None:
+    from app.domains.games.derived import install_functions, input_version, save_input_version, update_price_derived
+    from app.domains.games.series import refresh_series
+    from app.domains.bundles.service import bundle_sort_sql, register_bundle_sql_functions
+    await conn.run_sync(lambda c: install_functions(c.connection.dbapi_connection))
+    from app.domains.rates.snapshot import recompute_cny_fen_all
+
+    await recompute_cny_fen_all(conn)
+    await update_price_derived(None, session=conn)
+    await refresh_series(session=conn)
+    tracked = {row[0].upper() for row in await conn.execute(text("SELECT code FROM crawl_regions WHERE enabled=1"))}
+    await conn.run_sync(lambda c: register_bundle_sql_functions(c.connection.dbapi_connection))
+    sql, params = bundle_sort_sql(None, tracked or None)
+    await conn.execute(text(sql), params)
+    await save_input_version(conn, input_version())
+
+
+async def _migrate_retire_orchestration(conn) -> None:
+    extensions = (await conn.execute(text(
+        "SELECT name,sql FROM sqlite_master WHERE type IN ('view','trigger') AND sql IS NOT NULL"
+    ))).all()
+    if any(re.search(r"\borchestration_events\b", ddl, re.I) for _, ddl in extensions):
+        raise RuntimeError("运行记录仍被扩展视图或触发器引用，已保留原结构与数据并停止升级")
+    tables = (await conn.execute(text(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+    ))).scalars().all()
+    for table in tables:
+        escaped = str(table).replace('"', '""')
+        references = (await conn.execute(text(f'PRAGMA foreign_key_list("{escaped}")'))).all()
+        if any(str(row[2]).casefold() == "orchestration_events" for row in references):
+            raise RuntimeError("运行记录迁移发现未知外键关联，已保留原结构与数据并停止升级")
+    await conn.execute(text("DROP TABLE IF EXISTS orchestration_events"))
+
+
+async def _migrate_retire_coverage_snapshot(conn) -> None:
+    columns = (await conn.execute(text("PRAGMA table_info(price_cycles)"))).all()
+    if "coverage_json" in {row[1] for row in columns}:
+        await conn.execute(text("ALTER TABLE price_cycles DROP COLUMN coverage_json"))
+
+
+async def _migrate_proxy_ledger_columns(conn) -> None:
+    columns = (await conn.execute(text("PRAGMA table_info(proxy_nodes)"))).all()
+    if "fingerprint" in {row[1] for row in columns}:
+        mismatch = (await conn.execute(text(
+            "SELECT 1 FROM proxy_nodes WHERE node_id IS NOT fingerprint LIMIT 1"
+        ))).first()
+        if mismatch:
+            raise RuntimeError("节点身份不一致，已保留原结构与数据并停止升级")
+        tables = (await conn.execute(text(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ))).scalars().all()
+        for table in tables:
+            escaped = str(table).replace('"', '""')
+            references = (await conn.execute(text(f'PRAGMA foreign_key_list("{escaped}")'))).all()
+            if any(str(row[2]).casefold() == "proxy_nodes" for row in references):
+                raise RuntimeError("节点身份迁移发现未知外键关联，已保留原结构与数据并停止升级")
+        extras = (await conn.execute(text(
+            "SELECT type,sql FROM sqlite_master WHERE tbl_name='proxy_nodes' "
+            "AND type IN ('index','trigger') AND sql IS NOT NULL"
+        ))).all()
+        if any(kind == "trigger" and re.search(r"\bfingerprint\b", ddl, re.I) for kind, ddl in extras):
+            raise RuntimeError("节点身份仍被扩展触发器引用，已停止升级")
+        original = (await conn.execute(text(
+            "SELECT sql FROM sqlite_master WHERE name='proxy_nodes' AND type='table'"
+        ))).scalar_one()
+        parts, suffix = _table_declarations(original, "proxy_nodes")
+        identifier = r'(?:fingerprint|"fingerprint"|`fingerprint`|\[fingerprint\])'
+        kept = [part for part in parts if not re.match(rf"^\s*{identifier}\s", part, re.I)
+                and not re.fullmatch(rf"\s*UNIQUE\s*\(\s*{identifier}\s*\)\s*", part, re.I)]
+        sequence = 0
+        if "sqlite_sequence" in tables:
+            sequence = (await conn.execute(text(
+                "SELECT seq FROM sqlite_sequence WHERE name='proxy_nodes'"
+            ))).scalar_one_or_none() or 0
+        await conn.execute(text('CREATE TABLE proxy_nodes_identity_new (' + ",".join(kept) + suffix))
+        names = ",".join('"' + row[1].replace('"', '""') + '"' for row in columns if row[1] != "fingerprint")
+        await conn.execute(text(f"INSERT INTO proxy_nodes_identity_new ({names}) SELECT {names} FROM proxy_nodes"))
+        await conn.execute(text("DROP TABLE proxy_nodes"))
+        await conn.execute(text("ALTER TABLE proxy_nodes_identity_new RENAME TO proxy_nodes"))
+        for _, ddl in extras:
+            if re.fullmatch(
+                r"CREATE\s+UNIQUE\s+INDEX\s+ux_proxy_nodes_fingerprint\s+ON\s+proxy_nodes\s*\(\s*fingerprint\s*\)",
+                ddl, re.I,
+            ):
+                continue
+            await conn.execute(text(ddl))
+        if sequence:
+            await conn.execute(text("UPDATE sqlite_sequence SET seq=MAX(seq,:seq) WHERE name='proxy_nodes'"),
+                               {"seq": sequence})
+    cooldown_columns = {row[1] for row in await conn.execute(text("PRAGMA table_info(clash_nodes)"))}
+    for name in ("exit_ip", "status", "latency_ms", "fail_count", "last_checked_at", "created_at", "revive_passes"):
+        if name in cooldown_columns:
+            await conn.execute(text(f'ALTER TABLE clash_nodes DROP COLUMN "{name}"'))
+
+
+async def _drop_projection_columns(conn, retired: dict[str, set[str]]) -> None:
+    extensions = (await conn.execute(text(
+        "SELECT name,sql FROM sqlite_master WHERE type IN ('view','trigger') AND sql IS NOT NULL"
+    ))).all()
+    tables = (await conn.execute(text(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+    ))).scalars().all()
+    for table, names in retired.items():
+        columns = {r[1] for r in await conn.execute(text(f'PRAGMA table_info("{table}")'))}
+        if not names & columns:
+            continue
+        if any(re.search(rf"\b{table}\b", ddl, re.I) for _, ddl in extensions):
+            raise RuntimeError(f"{table}仍被扩展视图或触发器引用，已停止汇总列退役")
+        for owner in tables:
+            escaped = owner.replace('"', '""')
+            references = await conn.execute(text(f'PRAGMA foreign_key_list("{escaped}")'))
+            if any(r[2].casefold() == table and (r[4] or "").casefold() in names for r in references):
+                raise RuntimeError(f"{table}汇总列仍被外键引用，已停止升级")
+        for name in sorted(names & columns):
+            await conn.execute(text(f'ALTER TABLE "{table}" DROP COLUMN "{name}"'))
+
+
+async def _prepare_legacy_v10_columns(conn) -> None:
+    # 已发布v9/v10仍会写这些列；仅给旧链补齐，末步迁移在同次初始化退役。
+    for table, declarations in {
+        "tracked_accounts": {"item_count": "INTEGER DEFAULT 0"},
+        "monitor_targets": {"state": "VARCHAR(16) DEFAULT 'released'", "priority": "INTEGER DEFAULT 0"},
+    }.items():
+        columns = {r[1] for r in await conn.execute(text(f'PRAGMA table_info("{table}")'))}
+        for name, ddl in declarations.items():
+            if name not in columns:
+                await conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN "{name}" {ddl}'))
+
+
+async def _migrate_transaction_projections(conn) -> None:
+    await _drop_projection_columns(conn, {
+        "bill_imports": {"game_net_fen", "game_spend_fen", "game_refund_fen", "orders", "fx_missing"},
+        "tracked_accounts": {"item_count"},
+    })
+
+
+async def _migrate_cycle_timing_projection(conn) -> None:
+    from sqlalchemy import DateTime, Float, JSON
+
+    from app.domains.crawl.stats import timing_stats
+
+    names = {"duration_seconds", "stage_ms_json"}
+    columns = {r[1] for r in await conn.execute(text("PRAGMA table_info(price_cycles)"))}
+    if names & columns and not names <= columns:
+        raise RuntimeError("周期历史耗时列不完整，已保留原结构并停止升级")
+    if names <= columns:
+        rows = await conn.execute(text(
+            "SELECT id,started_at,running_at,repairing_at,finalizing_at,finished_at,"
+            "duration_seconds,stage_ms_json FROM price_cycles WHERE units_expected IS NOT NULL"
+        ).columns(started_at=DateTime(), running_at=DateTime(), repairing_at=DateTime(),
+                  finalizing_at=DateTime(), finished_at=DateTime(),
+                  duration_seconds=Float(), stage_ms_json=JSON()))
+        for row in rows:
+            timings = timing_stats(row)
+            if row.duration_seconds != timings["durationSeconds"] or row.stage_ms_json != timings["stageMs"]:
+                raise RuntimeError(f"周期{row.id}的历史耗时与时间边界不一致，已保留原值并停止升级")
+    await _drop_projection_columns(conn, {"price_cycles": names})
+
+
+async def _migrate_monitoring_projection(conn) -> None:
+    from sqlalchemy import literal_column, select
+    from app.domains.monitoring.models import MonitorTarget
+
+    names = {"state", "priority"}
+    columns = {r[1] for r in await conn.execute(text("PRAGMA table_info(monitor_targets)"))}
+    if names & columns and not names <= columns:
+        raise RuntimeError("监控资格旧列不完整，已保留原结构并停止升级")
+    if names <= columns:
+        rows = await conn.execute(select(
+            MonitorTarget.id, MonitorTarget.state, MonitorTarget.priority,
+            literal_column("monitor_targets.state"), literal_column("monitor_targets.priority"),
+        ))
+        for identity, state, priority, old_state, old_priority in rows:
+            if (state, priority) != (old_state, old_priority):
+                raise RuntimeError(f"监控对象{identity}资格与来源或排除不一致，已保留原值并停止升级")
+    for name, expected in (
+        ("ix_monitor_target_state", ["target_type", "state"]),
+        ("ix_monitor_target_order", ["state", "priority", "target_id"]),
+    ):
+        owner = (await conn.execute(text(
+            "SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=:name COLLATE NOCASE"
+        ), {"name": name})).scalar_one_or_none()
+        if owner is not None:
+            listed = next((r for r in await conn.execute(text('PRAGMA index_list("monitor_targets")'))
+                           if r[1].casefold() == name), None)
+            keys = [(r[2], r[3], r[4]) for r in await conn.execute(text(f'PRAGMA index_xinfo("{name}")')) if r[5]]
+            if (owner.casefold() != "monitor_targets" or listed is None or listed[2] or listed[4]
+                    or keys != [(column, 0, "BINARY") for column in expected]):
+                raise RuntimeError(f"监控旧索引{name}结构未知，已停止升级")
+        await conn.execute(text(f'DROP INDEX IF EXISTS "{name}"'))
+    await _drop_projection_columns(conn, {"monitor_targets": names})
+
+
+async def _migrate_achievement_projections(conn) -> None:
+    from sqlalchemy import literal_column, select
+    from app.domains.achievements.models import AchievementGame
+    from app.domains.achievements.challenges import CATALOG_BY_ID
+
+    columns = {r[1] for r in await conn.execute(text("PRAGMA table_info(achievement_games)"))}
+    if "platinum" in columns:
+        rows = await conn.execute(select(
+            AchievementGame.steamid, AchievementGame.appid, AchievementGame.platinum,
+            literal_column("achievement_games.platinum"),
+        ))
+        for steamid, appid, platinum, old_platinum in rows:
+            if platinum != old_platinum:
+                raise RuntimeError(f"成就{steamid}/{appid}的白金状态与计数不一致，已保留原值并停止升级")
+    columns = {r[1] for r in await conn.execute(text("PRAGMA table_info(challenge_progress)"))}
+    if "target" in columns:
+        rows = await conn.execute(text("SELECT challenge_id,target FROM challenge_progress"))
+        for challenge_id, target in rows:
+            spec = CATALOG_BY_ID.get(challenge_id)
+            if spec is None or spec.target != target:
+                raise RuntimeError("挑战目标与现有目录不一致，已保留原值并停止升级")
+    await _drop_projection_columns(conn, {
+        "achievement_games": {"platinum"}, "challenge_progress": {"target"},
+    })
+
+
+async def _migrate_unused_session_state(conn) -> None:
+    names = {"title", "context_snapshot", "context_version", "context_updated_at"}
+    columns = {r[1] for r in await conn.execute(text("PRAGMA table_info(agent_sessions)"))}
+    if names & columns and not names <= columns:
+        raise RuntimeError("执行会话旧扩展列不完整，已保留原结构并停止升级")
+    if names <= columns:
+        nonempty = (await conn.execute(text(
+            "SELECT 1 FROM agent_sessions WHERE COALESCE(title,'') != '' "
+            "OR (context_snapshot IS NOT NULL AND context_snapshot != 'null') "
+            "OR COALESCE(context_version,0) != 0 OR context_updated_at IS NOT NULL LIMIT 1"
+        ))).first()
+        if nonempty:
+            raise RuntimeError("执行会话含未知上下文或标题，已保留原值并停止升级")
+    await _drop_projection_columns(conn, {"agent_sessions": names})
+    await conn.execute(text("DELETE FROM app_settings WHERE key='bills.probe_skipped'"))
+
+
+async def _migrate_node_cooldown(conn) -> None:
+    from sqlalchemy import DateTime, bindparam, select, update
+    from app.crawler.utils import get_beijing_time_obj
+    from app.domains.proxypool.bridge import _match
+    from app.domains.proxypool.models import ProxyNode
+
+    columns = {r[1] for r in await conn.execute(text("PRAGMA table_info(clash_nodes)"))}
+    if not columns:
+        return
+    if columns != {"id", "subscription_id", "name", "cooldown_until"}:
+        raise RuntimeError("旧节点冷却结构未知，已保留原数据并停止升级")
+    extensions = await conn.execute(text(
+        "SELECT sql FROM sqlite_master WHERE type IN ('view','trigger') AND sql IS NOT NULL"
+    ))
+    if any(re.search(r"\bclash_nodes\b", row[0], re.I) for row in extensions):
+        raise RuntimeError("旧节点冷却仍被扩展视图或触发器引用，已停止升级")
+    tables = (await conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))).scalars().all()
+    for table in tables:
+        escaped = table.replace('"', '""')
+        if any(r[2].casefold() == "clash_nodes" for r in await conn.execute(text(f'PRAGMA foreign_key_list("{escaped}")'))):
+            raise RuntimeError("旧节点冷却仍被外键引用，已停止升级")
+    for index in await conn.execute(text("PRAGMA index_list(clash_nodes)")):
+        if index[1] != "ix_clash_nodes_sub_name" or index[2] or index[4]:
+            raise RuntimeError("旧节点冷却索引未知，已停止升级")
+        keys = [(r[2],r[3],r[4]) for r in await conn.execute(text('PRAGMA index_xinfo("ix_clash_nodes_sub_name")')) if r[5]]
+        if keys != [("subscription_id",0,"BINARY"),("name",0,"BINARY")]:
+            raise RuntimeError("旧节点冷却索引未知，已停止升级")
+    nodes = (await conn.execute(select(ProxyNode.node_id, ProxyNode.runtime_name, ProxyNode.subscription_id,
+                                       ProxyNode.original_name, ProxyNode.cooldown_until))).all()
+    by_runtime = {row.runtime_name: row for row in nodes}
+    by_source = {}
+    ambiguous = object()
+    for row in nodes:
+        if row.subscription_id is not None:
+            key = (row.subscription_id, row.original_name)
+            by_source[key] = ambiguous if key in by_source else row
+    rows = await conn.execute(text("SELECT subscription_id,name,cooldown_until FROM clash_nodes").columns(cooldown_until=DateTime()))
+    deadlines = {}
+    now = get_beijing_time_obj().replace(tzinfo=None)
+    for sub_id, name, until in rows:
+        if until is None:
+            continue
+        node = _match(by_source, by_runtime, sub_id, name)
+        if node is None or node is ambiguous:
+            if until > now:
+                raise RuntimeError("旧节点存在未能唯一归属的有效冷却，已保留原值并停止升级")
+            continue
+        deadlines[node.node_id] = max(value for value in (deadlines.get(node.node_id), node.cooldown_until, until) if value is not None)
+    if deadlines:
+        await conn.execute(update(ProxyNode.__table__).where(ProxyNode.node_id == bindparam("identity"))
+                           .values(cooldown_until=bindparam("until")),
+                           [{"identity": identity, "until": until} for identity, until in deadlines.items()])
+    await conn.execute(text("DROP TABLE clash_nodes"))
+
+
+async def _migrate_cycle_coverage_projection(conn) -> None:
+    from app.domains.crawl.coverage import coverage_ratios
+
+    names = {"coverage", "coverage_confirmed"}
+    columns = {r[1] for r in await conn.execute(text("PRAGMA table_info(price_cycles)"))}
+    if names & columns and not names <= columns:
+        raise RuntimeError("周期覆盖比率列不完整，已保留原结构并停止升级")
+    if names <= columns:
+        rows = await conn.execute(text(
+            "SELECT id,units_expected,units_ok,units_locked,coverage,coverage_confirmed FROM price_cycles"
+        ))
+        for identity, expected, ok, locked, coverage, confirmed in rows:
+            if expected is None:
+                ratios = (None, None)
+            elif (not isinstance(expected, int) or expected < 0
+                  or (expected > 0 and any(not isinstance(n, int) or n < 0 for n in (ok, locked)))):
+                raise RuntimeError(f"周期{identity}的冻结计数不完整，已保留原值并停止升级")
+            else:
+                ratios = coverage_ratios(expected, ok, locked)
+            if (coverage, confirmed) != ratios:
+                raise RuntimeError(f"周期{identity}的历史覆盖比率与冻结计数不一致，已保留原值并停止升级")
+    await _drop_projection_columns(conn, {"price_cycles": names})
+
+
+async def _migrate_pilot_provider_config(conn) -> None:
+    from sqlalchemy import delete, select
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+    from app.domains.pilot.config import _clean_provider
+    from app.domains.settings.models import AppSetting
+
+    legacy_keys = {f"pilot.llm.{name}" for name in (
+        "protocol", "base_url", "models", "models_disabled", "api_key", "context_window",
+    )}
+    keys = legacy_keys | {"pilot.llm.providers", "pilot.llm.provider_key.legacy-v1"}
+    values = dict((await conn.execute(
+        select(AppSetting.key, AppSetting.value_json).where(AppSetting.key.in_(keys))
+    )).all())
+    if not legacy_keys.intersection(values):
+        return
+    if not isinstance(values.get("pilot.llm.providers"), list):
+        if "pilot.llm.provider_key.legacy-v1" in values:
+            raise RuntimeError("旧供应商迁移身份已被占用，已保留原配置并停止升级")
+        provider = _clean_provider({
+            "id": "legacy-v1", "name": "默认接入",
+            **{key.removeprefix("pilot.llm."): value for key, value in values.items()},
+        })
+        migrated = {"pilot.llm.providers": [provider], "pilot.llm.active": provider["id"]}
+        stored = values.get("pilot.llm.api_key")
+        if stored:
+            key = f"pilot.llm.provider_key.{provider['id']}"
+            migrated[key] = stored
+        statement = sqlite_insert(AppSetting).values([
+            {"key": key, "value_json": value, "updated_at": datetime.now()}
+            for key, value in migrated.items()
+        ])
+        await conn.execute(statement.on_conflict_do_update(
+            index_elements=[AppSetting.key],
+            set_={"value_json": statement.excluded.value_json, "updated_at": statement.excluded.updated_at},
+        ))
+    await conn.execute(delete(AppSetting).where(AppSetting.key.in_(legacy_keys)))
+
+
 _MIGRATIONS: list[tuple[int, str, object]] = [    (2, "bundle_region_prices 零小数货币单位归一（元→分 + cny_fen 去虚高）",
      _migrate_bundle_price_units),
     (3, "bundles.item_kind 形态列（0=bundle/1=sub）初始回填（沿用 mps 旧值，"
@@ -1428,6 +1759,28 @@ _MIGRATIONS: list[tuple[int, str, object]] = [    (2, "bundle_region_prices 零�
      _migrate_gph_snapshot_unique),
     (19, "价格事件与执行来源使用不可复用整数身份并保留通知引用高水位",
      _migrate_notification_identity),
+    (20, "补齐历史价格观察结果，保留已有成功与失败记录",
+     [
+         "UPDATE game_current_prices SET "
+         "attempt_outcome = CASE WHEN price_status IN ('ok', 'locked') "
+         "THEN 'success' ELSE 'failed' END, "
+         "steam_answer = CASE price_status WHEN 'ok' THEN 'ok' "
+         "WHEN 'locked' THEN 'locked' ELSE NULL END, "
+         "last_success_at = CASE WHEN price_status IN ('ok', 'locked') "
+         "THEN updated_at ELSE NULL END WHERE attempt_outcome IS NULL",
+     ]),
+    (21, "统一价格派生快照并保留输入日历版本", _migrate_price_snapshot),
+    (22, "退役无消费的运行事件副本", _migrate_retire_orchestration),
+    (23, "退役无消费的周期覆盖明细副本", _migrate_retire_coverage_snapshot),
+    (24, "节点身份单源与体检冷却记录归位", _migrate_proxy_ledger_columns),
+    (25, "供应商配置与密钥迁入现有供应商账本", _migrate_pilot_provider_config),
+    (26, "账单汇总和账户条目数直接读取交易与成员事实", _migrate_transaction_projections),
+    (27, "周期时长直接读取保留的阶段边界", _migrate_cycle_timing_projection),
+    (28, "监控资格和排序直接读取来源与排除，保留在册生命周期", _migrate_monitoring_projection),
+    (29, "成就白金直接读取计数，挑战目标直接读取目录", _migrate_achievement_projections),
+    (30, "退役无消费的执行会话扩展和账单探测副本", _migrate_unused_session_state),
+    (31, "节点身份承载体检冷却，退役独立冷却表", _migrate_node_cooldown),
+    (32, "周期覆盖比率直接读取冻结计数", _migrate_cycle_coverage_projection),
 ]
 
 
@@ -1615,7 +1968,6 @@ async def init_db(*, maintenance_token: str | None = None) -> None:
             return
 
     # 导入各域模型模块，确保表注册到 Base.metadata
-    from app.core import orchestration as _core_orchestration  # noqa: F401
     from app.domains.agent import models as _agent_models  # noqa: F401
     from app.domains.achievements import models as _achievements_models  # noqa: F401
     # 成就域有两处表注册：models 三张表 + level 的经验流水表（后者只在本模块
@@ -1656,6 +2008,8 @@ async def init_db(*, maintenance_token: str | None = None) -> None:
         async with get_engine().begin() as conn:
             await conn.execute(text("BEGIN IMMEDIATE"))
             await conn.run_sync(Base.metadata.create_all)
+            if any(v == 10 for v, _, _ in pending):
+                await _prepare_legacy_v10_columns(conn)
             await conn.run_sync(_ensure_schema)
 
         # 结构性迁移链（user_version 账本；v1 起步）
@@ -1701,7 +2055,7 @@ def get_engine():
 
     def check_read_access():
         if database_name and database_name != ":memory:":
-            from .backup import ensure_database_read_available
+            from .db_safety import ensure_database_read_available
 
             ensure_database_read_available(
                 Path(database_name), maintenance_token=_maintenance_authorized_token()
@@ -1717,6 +2071,9 @@ def get_engine():
 
     @event.listens_for(engine.sync_engine, "connect")
     def _sqlite_pragma(dbapi_conn, _record):
+        from app.domains.games.derived import install_functions
+
+        install_functions(dbapi_conn)
         cursor = dbapi_conn.cursor()
         cursor.execute("PRAGMA journal_mode=WAL")
         # NORMAL 保持事务一致性，但操作系统崩溃或断电可能丢失最近提交。
@@ -1996,121 +2353,13 @@ class WriteScheduler:
 
 
 _schedulers: dict[asyncio.AbstractEventLoop, WriteScheduler] = {}
-_process_write_locks: dict[str, threading.Lock] = {}
-_process_write_locks_guard = threading.Lock()
 
 
 def _process_write_lock_path(database_path: Path | None = None) -> Path:
-    """同一数据库的跨进程写锁文件路径；文件只承载操作系统锁，不存业务状态。"""
     database = str(database_path) if database_path is not None else get_engine().url.database
     if not database or database == ":memory:":
-        identity = f"memory:{id(get_engine().sync_engine)}"
-    else:
-        identity = str(Path(database).resolve())
-    digest = hashlib.sha256(os.path.normcase(identity).encode("utf-8")).hexdigest()[:24]
-    return Path(tempfile.gettempdir()) / f"holdexar-write-{digest}.lock"
-
-
-def _local_process_lock(path: Path) -> threading.Lock:
-    key = os.path.normcase(str(path))
-    with _process_write_locks_guard:
-        return _process_write_locks.setdefault(key, threading.Lock())
-
-
-def _try_lock_file(fd: int) -> bool:
-    try:
-        if os.name == "nt":
-            import msvcrt
-
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return True
-    except OSError as exc:
-        if isinstance(exc, BlockingIOError) or exc.errno in (errno.EACCES, errno.EAGAIN):
-            return False
-        if getattr(exc, "winerror", None) in (33, 36, 158):
-            return False
-        raise
-
-
-class _CrossProcessWriteLock:
-    """SQLite 写者共享的进程内与跨进程独占锁。"""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.local_lock: threading.Lock | None = None
-        self.fd: int | None = None
-        self.locked = False
-
-    async def acquire(self) -> _CrossProcessWriteLock:
-        try:
-            async with asyncio.timeout(_WRITE_WAIT_TIMEOUT):
-                local_lock = _local_process_lock(self.path)
-                while not local_lock.acquire(blocking=False):
-                    await asyncio.sleep(0.025)
-                self.local_lock = local_lock
-                self._open_file()
-                while not _try_lock_file(self.fd):
-                    await asyncio.sleep(0.025)
-                self.locked = True
-                return self
-        except BaseException:
-            self._release_handles(unlock=self.locked)
-            raise
-
-    def acquire_sync(self) -> _CrossProcessWriteLock:
-        deadline = time.monotonic() + _WRITE_WAIT_TIMEOUT
-        local_lock = _local_process_lock(self.path)
-        if not local_lock.acquire(timeout=_WRITE_WAIT_TIMEOUT):
-            raise TimeoutError("等待数据库写入超时")
-        self.local_lock = local_lock
-        try:
-            self._open_file()
-            while not _try_lock_file(self.fd):
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("等待数据库写入超时")
-                time.sleep(0.025)
-            self.locked = True
-            return self
-        except BaseException:
-            self._release_handles(unlock=self.locked)
-            raise
-
-    def _open_file(self) -> None:
-        self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
-        if os.fstat(self.fd).st_size == 0:
-            os.write(self.fd, b"\0")
-
-    def release(self) -> None:
-        self._release_handles(unlock=self.locked)
-
-    def _release_handles(self, *, unlock: bool = False) -> None:
-        try:
-            if self.fd is not None:
-                fd = self.fd
-                try:
-                    if unlock:
-                        if os.name == "nt":
-                            import msvcrt
-
-                            os.lseek(fd, 0, os.SEEK_SET)
-                            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-                        else:
-                            import fcntl
-
-                            fcntl.flock(fd, fcntl.LOCK_UN)
-                finally:
-                    os.close(fd)
-                    self.fd = None
-                    self.locked = False
-        finally:
-            if self.local_lock is not None:
-                self.local_lock.release()
-                self.local_lock = None
+        return db_safety._process_write_lock_path(identity=f"memory:{id(get_engine().sync_engine)}")
+    return db_safety._process_write_lock_path(Path(database))
 
 
 _ACTIVE_PROCESS_WRITE_LOCK: contextvars.ContextVar[
@@ -2222,13 +2471,11 @@ async def write_maintenance_barrier() -> AsyncIterator[None]:
 @contextmanager
 def sync_write_gate(database_path: Path | None = None, *, maintenance_token: str | None = None):
     """同步维护工具复用同一数据库的进程间写锁。"""
-    _check_write_maintenance(database_path, maintenance_token=maintenance_token)
-    lock = _CrossProcessWriteLock(_process_write_lock_path(database_path)).acquire_sync()
-    try:
-        _check_write_maintenance(database_path, maintenance_token=maintenance_token)
+    database = database_path if database_path is not None else sqlite_file_path()
+    with db_safety.sync_write_gate(
+        database, maintenance_token=maintenance_token, lock_path=_process_write_lock_path(database_path)
+    ):
         yield
-    finally:
-        lock.release()
 
 
 def _scheduler_for_loop() -> WriteScheduler:

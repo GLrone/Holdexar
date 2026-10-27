@@ -19,6 +19,7 @@ import pytest_asyncio
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core import app_info, updater  # noqa: E402
+from app.core import update_signing  # noqa: E402
 
 
 def _mock_transport(handler) -> httpx.MockTransport:
@@ -37,6 +38,32 @@ def _mock_client(handler):
         return real_client(transport=_mock_transport(handler), **kw)
 
     return factory
+
+
+@pytest.fixture
+def sign_manifest(monkeypatch):
+    """测试签名工厂：生成一次性 Ed25519 密钥并注入信任表（不碰真实公钥）。"""
+    import base64
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    key = Ed25519PrivateKey.generate()
+    pub_hex = key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    ).hex()
+    monkeypatch.setattr(update_signing, "TRUSTED_PUBKEYS", {"test": pub_hex})
+
+    def _sign(manifest: dict) -> dict:
+        signature = key.sign(update_signing.canonical_manifest_bytes(manifest))
+        signed = dict(manifest)
+        signed["signature"] = {
+            "alg": "ed25519", "keyId": "test",
+            "sig": base64.b64encode(signature).decode("ascii"),
+        }
+        return signed
+
+    return _sign
 
 
 @pytest.mark.parametrize(
@@ -64,7 +91,7 @@ def test_version_gt(latest: str, current: str, expect: bool) -> None:
 
 
 @pytest.mark.asyncio
-async def test_new_staging_clears_handoff_marks(tmp_path: Path, monkeypatch) -> None:
+async def test_new_staging_clears_handoff_marks(tmp_path: Path, monkeypatch, sign_manifest) -> None:
     """新解出的暂存包清掉上一包的交接标记：重下同一版本仍可自动换装。"""
     payload = tmp_path / "fake-release.zip"
     with zipfile.ZipFile(payload, "w") as zf:
@@ -87,7 +114,9 @@ async def test_new_staging_clears_handoff_marks(tmp_path: Path, monkeypatch) -> 
     )
 
     await updater.download_update(
-        "v0.2.0", expected_sha256=None, asset_name="fake-release.zip"
+        "v0.2.0",
+        expected_sha256=hashlib.sha256(payload.read_bytes()).hexdigest(),
+        asset_name="fake-release.zip",
     )
 
     assert not (staging / updater.HANDOFF_UNSUPPORTED_MARK).exists()
@@ -96,10 +125,10 @@ async def test_new_staging_clears_handoff_marks(tmp_path: Path, monkeypatch) -> 
 
 
 @pytest.mark.asyncio
-async def test_check_update_prefers_manifest(tmp_path: Path, monkeypatch) -> None:
-    """清单可达：一次请求拿全（版本/资产/校验值/说明），不打 GitHub API。"""
-    manifest = {
-        "schema": 1,
+async def test_check_update_prefers_manifest(tmp_path: Path, monkeypatch, sign_manifest) -> None:
+    """验签清单可达：一次请求拿全（版本/资产/校验值/说明），不打 GitHub API。"""
+    manifest = sign_manifest({
+        "schema": 2,
         "app": "Holdexar",
         "version": "9.9.9",
         "tag": "v9.9.9",
@@ -108,9 +137,8 @@ async def test_check_update_prefers_manifest(tmp_path: Path, monkeypatch) -> Non
         "assets": [
             {"role": "app", "name": "Holdexar-win64-v9.9.9.zip", "size": 4242,
              "sha256": "a" * 64},
-            {"role": "seed", "name": "holdexar_seed.db", "size": 99, "sha256": "b" * 64},
         ],
-    }
+    })
     seen: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -132,6 +160,84 @@ async def test_check_update_prefers_manifest(tmp_path: Path, monkeypatch) -> Non
     assert result["asset"] == "Holdexar-win64-v9.9.9.zip"
     assert "新增" in result["notes"]
     assert all("api.github.com" not in u for u in seen)
+
+
+@pytest.mark.asyncio
+async def test_check_update_rejects_unsigned_manifest(monkeypatch) -> None:
+    """镜像回未签名清单：按通道失败处理，回落 GitHub API（不拿它当可信数据）。"""
+    unsigned = {
+        "schema": 2, "version": "9.9.9", "tag": "v9.9.9",
+        "assets": [{"role": "app", "name": "x.zip", "size": 1, "sha256": "a" * 64}],
+    }
+    release = {
+        "tag_name": "v8.8.8",
+        "body": "",
+        "assets": [{"name": "Holdexar-win64-v8.8.8.zip", "size": 2, "digest": "sha256:" + "b" * 64}],
+        "published_at": "2026-09-10T12:00:00Z",
+    }
+    api_hit: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "releases/download" in url:
+            return httpx.Response(200, json=unsigned)
+        api_hit.append(url)
+        assert "releases/latest" in url
+        return httpx.Response(200, json=release)
+
+    monkeypatch.setattr(updater.httpx, "AsyncClient", _mock_client(handler))
+    result = await updater.check_update()
+    assert api_hit, "未签名清单必须被拒并回落 API"
+    assert result["source"] == "api"
+    assert result["latest"] == "8.8.8"
+
+
+@pytest.mark.asyncio
+async def test_check_update_rejects_tampered_manifest(monkeypatch, sign_manifest) -> None:
+    """清单被镜像篡改（签名后改版本号）：验签不过，等同通道失败。"""
+    manifest = sign_manifest({
+        "schema": 2, "version": "9.9.9", "tag": "v9.9.9",
+        "assets": [{"role": "app", "name": "x.zip", "size": 1, "sha256": "a" * 64}],
+    })
+    manifest["version"] = "99.99.99"  # 签名后篡改
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "releases/download" in url:
+            return httpx.Response(200, json=manifest)
+        raise httpx.ConnectError("no api fallback")
+
+    monkeypatch.setattr(updater.httpx, "AsyncClient", _mock_client(handler))
+    result = await updater.check_update()
+    assert result == {"available": False, "reason": "network", "error": "no api fallback"}
+
+
+@pytest.mark.asyncio
+async def test_check_update_picks_verified_among_racing_mirors(monkeypatch, sign_manifest) -> None:
+    """镜像竞速只在验签通过者中取：先到的未签名清单不挡后面的可信清单。"""
+    signed = sign_manifest({
+        "schema": 2, "version": "9.9.9", "tag": "v9.9.9", "notes": "signed",
+        "assets": [{"role": "app", "name": "good.zip", "size": 1, "sha256": "a" * 64}],
+    })
+    unsigned = {
+        "schema": 2, "version": "8.8.8", "tag": "v8.8.8",
+        "assets": [{"role": "app", "name": "bad.zip", "size": 1, "sha256": "b" * 64}],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        # ghfast.top 是镜像链第一条（竞速结果列表的第一位）
+        if "ghfast.top" in url:
+            return httpx.Response(200, json=unsigned)
+        if "releases/download" in url:
+            return httpx.Response(200, json=signed)
+        raise AssertionError(f"不应请求 GitHub API：{url}")
+
+    monkeypatch.setattr(updater.httpx, "AsyncClient", _mock_client(handler))
+    result = await updater.check_update()
+    assert result["source"] == "manifest"
+    assert result["latest"] == "9.9.9"
+    assert result["asset"] == "good.zip"
 
 
 @pytest.mark.asyncio
@@ -169,15 +275,34 @@ async def test_check_update_manifest_falls_back_to_api(tmp_path: Path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_check_update_bad_manifest_is_not_available(monkeypatch) -> None:
-    """清单有版本但无可用资产：available=False + reason=no_asset，不误报有更新。"""
+async def test_check_update_bad_manifest_is_not_available(monkeypatch, sign_manifest) -> None:
+    """验签清单有版本但无可用资产：available=False + reason=no_asset，不误报有更新。"""
+    manifest = sign_manifest({"schema": 2, "version": "0.9.0", "assets": []})
 
     def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"schema": 1, "version": "0.9.0", "assets": []})
+        return httpx.Response(200, json=manifest)
 
     monkeypatch.setattr(updater.httpx, "AsyncClient", _mock_client(handler))
     result = await updater.check_update()
     assert result == {"available": False, "reason": "no_asset"}
+
+
+@pytest.mark.asyncio
+async def test_check_update_signed_manifest_without_sha256_refused(monkeypatch, sign_manifest) -> None:
+    """验签清单的资产缺 sha256：按残缺清单拒绝（available=False），不给无校验下载留口。"""
+    manifest = sign_manifest({
+        "schema": 2, "version": "9.9.9", "tag": "v9.9.9",
+        "assets": [{"role": "app", "name": "x.zip", "size": 10}],
+    })
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "releases/download" in str(request.url):
+            return httpx.Response(200, json=manifest)
+        raise httpx.ConnectError("no api")
+
+    monkeypatch.setattr(updater.httpx, "AsyncClient", _mock_client(handler))
+    result = await updater.check_update()
+    assert result == {"available": False, "reason": "bad_manifest"}
 
 
 @pytest.mark.asyncio
@@ -193,6 +318,16 @@ async def test_check_update_network_fail_soft(tmp_path: Path, monkeypatch) -> No
 
 
 @pytest.mark.asyncio
+async def test_download_rejects_missing_sha256(tmp_path: Path, monkeypatch) -> None:
+    """校验值缺失即拒绝下载：不存在「无校验放行」的口子（护栏先于一切暂存动作）。"""
+    monkeypatch.setattr(updater, "staging_dir", lambda: tmp_path / "staging")
+    with pytest.raises(RuntimeError, match="校验值"):
+        await updater.download_update("v0.2.0", expected_sha256=None)
+    with pytest.raises(RuntimeError, match="校验值"):
+        await updater.download_update("v0.2.0", expected_sha256="   ")
+
+
+@pytest.mark.asyncio
 async def test_download_and_pending_flow(tmp_path: Path, monkeypatch) -> None:
     """下载 → 解包 → manifest：pending 状态翻转 + sha256 校验拒绝坏档。
 
@@ -203,6 +338,7 @@ async def test_download_and_pending_flow(tmp_path: Path, monkeypatch) -> None:
     with zipfile.ZipFile(payload, "w") as zf:
         zf.writestr("Holdexar/Holdexar.exe", "MZ-fake")
         zf.writestr("Holdexar/web/index.html", "<html/>")
+    real_sha = hashlib.sha256(payload.read_bytes()).hexdigest()
 
     def handler(request: httpx.Request) -> httpx.Response:
         if "releases/tags" in str(request.url):
@@ -217,15 +353,13 @@ async def test_download_and_pending_flow(tmp_path: Path, monkeypatch) -> None:
     )
     # 用例用的是几百字节的假包：体积下限（防镜像错误页）在测试里归零
     monkeypatch.setattr(updater, "_MIN_PACKAGE_BYTES", 0)
-    from unittest.mock import AsyncMock
 
     monkeypatch.setattr(
         "app.domains.proxies.clash_manager._download_attempts",
         lambda *_a, **_k: [(None, "直连")],
     )
 
-    # 无期望 sha256：跳过校验，正常暂存
-    result = await updater.download_update("v0.2.0", expected_sha256=None)
+    result = await updater.download_update("v0.2.0", expected_sha256=real_sha)
     assert result["ok"] is True
     status = updater.pending_status()
     assert status["pending"] is True and status["tag"] == "v0.2.0"
@@ -239,10 +373,6 @@ async def test_download_and_pending_flow(tmp_path: Path, monkeypatch) -> None:
     assert cleared["pending"] is False and cleared["swapFailed"] is False
 
     # 期望值不匹配：staging 清空 + 抛错
-    import hashlib
-
-    real_sha = hashlib.sha256(payload.read_bytes()).hexdigest()
-    await updater.download_update("v0.2.0", expected_sha256=None)  # 重新暂存
     with pytest.raises(RuntimeError, match="SHA256"):
         await updater.download_update("v0.2.0", expected_sha256="dead" * 16)
     assert updater.pending_status()["pending"] is False
@@ -277,7 +407,10 @@ async def test_download_uses_manifest_asset_name(tmp_path: Path, monkeypatch) ->
         lambda *_a, **_k: [(None, "直连")],
     )
 
-    await updater.download_update("v0.2.0", None, "Holdexar-win64-v9.9.9.zip")
+    await updater.download_update(
+        "v0.2.0", hashlib.sha256(payload.read_bytes()).hexdigest(),
+        "Holdexar-win64-v9.9.9.zip",
+    )
     assert updater.pending_status()["pending"] is True
     assert any("Holdexar-win64-v9.9.9.zip" in u for u in seen)
     updater.clear_staging()
@@ -316,7 +449,9 @@ async def test_download_skips_missing_channel_before_downloading(
         lambda *_a, **_k: [(None, "直连")],
     )
 
-    result = await updater.download_update("v0.2.0", None, "x.zip", expected_size=len(data))
+    result = await updater.download_update(
+        "v0.2.0", hashlib.sha256(data).hexdigest(), "x.zip", expected_size=len(data)
+    )
     assert result["ok"] is True
     # 404 通道只出现在探测请求里（带 Range），不出现在正式下载里
     assert [u for u, has_range in seen if "ghfast.top" in u and not has_range] == []
@@ -345,7 +480,7 @@ async def test_download_asset_missing_fails_fast(tmp_path: Path, monkeypatch) ->
     )
 
     with pytest.raises(updater.AssetMissing):
-        await updater.download_update("v0.2.0", None, "x.zip", expected_size=1234)
+        await updater.download_update("v0.2.0", "a" * 64, "x.zip", expected_size=1234)
     progress = updater.download_progress()
     assert progress["code"] == "asset_missing"
     assert progress["running"] is False
@@ -420,7 +555,9 @@ async def test_download_respects_cancel(tmp_path: Path, monkeypatch) -> None:
         return probes
 
     monkeypatch.setattr(updater, "_probe_channels", probe_then_cancel)
-    result = await updater.download_update("v0.2.0", None, "x.zip", expected_size=len(data))
+    result = await updater.download_update(
+        "v0.2.0", hashlib.sha256(data).hexdigest(), "x.zip", expected_size=len(data)
+    )
     assert result["ok"] is False and result["cancelled"] is True
     assert updater.download_progress()["code"] == "cancelled"
     # 取消下载后，保留已下的 .part 供后续续传
@@ -524,6 +661,26 @@ async def test_update_url_custom_override(monkeypatch) -> None:
     assert plan[0]["proxy"] is None
 
 
+def test_extract_sanitizes_malicious_zip_members(tmp_path: Path) -> None:
+    """全量包解包的 zip-slip 防线：`../`、盘符绝对路径成员不得写出暂存目录之外。"""
+    malicious = tmp_path / "evil.zip"
+    outside_marker = tmp_path / "escaped.txt"
+    with zipfile.ZipFile(malicious, "w") as zf:
+        zf.writestr("Holdexar/normal.txt", "ok")
+        zf.writestr("../escaped.txt", "should-not-land")
+        zf.writestr("Holdexar/../../escaped2.txt", "should-not-land")
+        zf.writestr("C:/absolute/escaped3.txt", "should-not-land")
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    updater._extract(malicious, staging)
+
+    assert (staging / "Holdexar" / "normal.txt").is_file()
+    assert not outside_marker.exists()
+    assert not (tmp_path / "escaped2.txt").exists()
+    assert not Path("C:/absolute/escaped3.txt").exists()
+
+
 def test_truncate_to_never_null_pads(tmp_path: Path) -> None:
     """_truncate_to 当文件小于期望大小时绝不能截断放大补零。"""
     p = tmp_path / "test.part"
@@ -565,8 +722,9 @@ async def test_download_all_channels_fail_preserves_part_file(tmp_path: Path, mo
     staging.mkdir()
     part = staging / "update.zip.part"
     part.write_bytes(b"downloaded-50MB-chunk")
+    expected_sha = "f" * 64
     meta = staging / "download_meta.json"
-    meta.write_text(json.dumps({"tag": "v0.3.6", "asset": "", "size": 0, "sha256": ""}), encoding="utf-8")
+    meta.write_text(json.dumps({"tag": "v0.3.6", "asset": "", "size": 0, "sha256": expected_sha}), encoding="utf-8")
 
     def handler(_request: httpx.Request):
         raise httpx.ConnectError("network down")
@@ -579,7 +737,7 @@ async def test_download_all_channels_fail_preserves_part_file(tmp_path: Path, mo
     )
 
     with pytest.raises(RuntimeError, match="所有下载通道均失败"):
-        await updater.download_update("v0.3.6")
+        await updater.download_update("v0.3.6", expected_sha256=expected_sha)
 
     # .part 文件依然存在，未被清空
     assert part.is_file()
@@ -647,57 +805,152 @@ def test_just_updated_status_ignores_mismatched_version(tmp_path: Path, monkeypa
     assert updater.just_updated_status() is None
 
 
-def test_pick_asset_prefers_matching_patch() -> None:
-    """当清单中包含与当前版本匹配的差量包时优先选择差量包。"""
+@pytest.mark.parametrize(
+    ("stage", "diagnosis_stage", "target", "attempt", "installing", "pending"),
+    [
+        ("verifying", "switching", None, "current", True, False),
+        ("committed", "switching", None, "current", True, False),
+        ("committed", "committed", None, "current", False, False),
+        ("rolled_back", "rolled_back", None, "current", False, True),
+        ("failed", "switching", None, "current", False, True),
+        ("verifying", "accepted_failure", None, "current", False, True),
+        ("verifying", "switching", "99.99.99", "current", False, True),
+        ("verifying", "switching", None, "other", False, True),
+        ("unknown", "switching", None, "current", False, True),
+    ],
+)
+def test_pending_status_projects_current_installation(
+    tmp_path: Path, monkeypatch, stage, diagnosis_stage, target, attempt, installing, pending,
+) -> None:
+    from app.core import layout
+
+    staging = tmp_path / "data" / "update-staging"
+    staging.mkdir(parents=True)
+    manifest = staging / "manifest.json"
+    manifest.write_text(json.dumps({"ready": True, "tag": f"v{updater.APP_VERSION}"}))
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    monkeypatch.setattr(updater, "staging_dir", lambda: staging)
+    monkeypatch.setattr("app.core.paths.install_root", lambda: tmp_path)
+    monkeypatch.setattr("app.core.paths.logs_dir", lambda: logs)
+    layout.start_transaction(tmp_path, target or updater.APP_VERSION, "previous", attempt_id="current")
+    layout.update_transaction(tmp_path, stage)
+    (logs / "update-diagnosis.json").write_text(json.dumps({
+        "attemptId": attempt, "targetVersion": target or updater.APP_VERSION,
+        "stage": diagnosis_stage, "success": diagnosis_stage == "committed", "acknowledged": True,
+    }))
+
+    status = updater.pending_status()
+    assert status["installing"] is installing
+    assert status["pending"] is pending
+    assert status["justUpdated"] is None
+    manifest.write_text(json.dumps({"ready": True, "tag": "v99.99.99"}))
+    assert updater.pending_status()["pending"] is True
+
+
+def test_pick_asset_ignores_patch_role() -> None:
+    """差量链已退役：role=patch 资产不再被择优，一律取全量应用包。"""
     assets = [
         {"role": "app", "name": "Holdexar-win64-v0.3.6.zip", "size": 50000000, "sha256": "app-sha"},
         {"role": "patch", "name": "Holdexar-patch-v0.3.5-to-v0.3.6.zip", "size": 2500000, "sha256": "patch-sha", "fromVersion": "0.3.5"},
     ]
 
-    # 1. 当前版本匹配差量包 -> 选中差量包
-    picked = updater._pick_asset(assets, from_version="0.3.5")
+    picked = updater._pick_asset(assets)
     assert picked is not None
-    assert picked["role"] == "patch"
-    assert picked["name"] == "Holdexar-patch-v0.3.5-to-v0.3.6.zip"
+    assert picked["role"] == "app"
+    assert picked["name"] == "Holdexar-win64-v0.3.6.zip"
 
-    # 2. 当前版本不匹配差量包 -> 自动回退完整应用包
-    fallback = updater._pick_asset(assets, from_version="0.2.0")
-    assert fallback is not None
-    assert fallback["role"] == "app"
-    assert fallback["name"] == "Holdexar-win64-v0.3.6.zip"
-
-    # 3. 显式指定文件名 -> 精确命中
-    explicit = updater._pick_asset(assets, name="Holdexar-win64-v0.3.6.zip", from_version="0.3.5")
+    explicit = updater._pick_asset(assets, name="Holdexar-win64-v0.3.6.zip")
     assert explicit is not None
     assert explicit["name"] == "Holdexar-win64-v0.3.6.zip"
 
 
-def test_payload_from_manifest_with_patch(monkeypatch) -> None:
-    """清单解析正确暴露差量包信息与体积对比。"""
+def test_payload_from_manifest_has_no_patch_fields(monkeypatch) -> None:
+    """清单解析不再产出差量字段（isPatch/patchFromVersion/fullSizeBytes 已随差量链退役）。"""
     manifest_data = {
         "version": "0.3.6",
         "tag": "v0.3.6",
         "notes": "Feature notes",
         "assets": [
             {"role": "app", "name": "Holdexar-win64-v0.3.6.zip", "size": 50000000, "sha256": "app-sha"},
-            {"role": "patch", "name": "Holdexar-patch-v0.3.5-to-v0.3.6.zip", "size": 3000000, "sha256": "patch-sha", "fromVersion": "0.3.5"},
         ],
     }
 
-    # 当前版本为 0.3.5 时，选中差量包
     class DummySettings:
         version = "0.3.5"
+
     monkeypatch.setattr(updater, "get_settings", lambda: DummySettings())
 
     payload = updater._payload_from_manifest(manifest_data)
     assert payload["available"] is True
-    assert payload["isPatch"] is True
-    assert payload["patchFromVersion"] == "0.3.5"
-    assert payload["sizeBytes"] == 3000000
-    assert payload["fullSizeBytes"] == 50000000
-    assert payload["asset"] == "Holdexar-patch-v0.3.5-to-v0.3.6.zip"
+    assert payload["sha256"] == "app-sha"
+    assert "isPatch" not in payload
+    assert "patchFromVersion" not in payload
+    assert "fullSizeBytes" not in payload
 
 
 
 
 
+
+
+@pytest.mark.parametrize("diagnosis", ["switching", "missing", "unrelated"])
+def test_committed_transaction_closes_display_when_diagnosis_write_failed(tmp_path, monkeypatch, diagnosis):
+    from app.core import layout, update_host
+
+    monkeypatch.setattr("app.core.paths.install_root", lambda: tmp_path)
+    monkeypatch.setattr("app.core.paths.logs_dir", lambda: tmp_path / "data/logs")
+    staging = tmp_path / "update-staging"
+    staging.mkdir()
+    (staging / "manifest.json").write_text(json.dumps({"ready": True, "tag": f"v{updater.APP_VERSION}"}))
+    monkeypatch.setattr(updater, "staging_dir", lambda: staging)
+    layout.start_transaction(tmp_path, updater.APP_VERSION, "old", attempt_id="current")
+    layout.update_transaction(tmp_path, layout.STAGE_COMMITTED, currentVersion=updater.APP_VERSION, dataAccepted=True)
+    if diagnosis != "missing":
+        logs = tmp_path / "logs"
+        logs.mkdir()
+        (logs / "update-diagnosis.json").write_text(json.dumps({
+            "attemptId": "other" if diagnosis == "unrelated" else "current",
+            "targetVersion": updater.APP_VERSION, "stage": "switching", "acknowledged": True,
+        }))
+    before = {p: p.read_bytes() for p in tmp_path.rglob("*.json")}
+    status = updater.pending_status()
+    assert status["pending"] is False and status["installing"] is False
+    assert status["justUpdated"]["currentVersion"] == updater.APP_VERSION
+    assert {p: p.read_bytes() for p in tmp_path.rglob("*.json")} == before
+    (staging / "manifest.json").write_text(json.dumps({"ready": True, "tag": "v99.99.99"}))
+    assert updater.pending_status()["pending"] is True
+    writer = update_host._write_diagnosis
+
+    def fail(*args, **kwargs):
+        raise OSError("diagnosis storage unavailable")
+
+    monkeypatch.setattr(update_host, "_write_diagnosis", fail)
+    with pytest.raises(OSError, match="storage unavailable"):
+        updater.acknowledge_update()
+    assert updater.pending_status()["justUpdated"] is not None
+    monkeypatch.setattr(update_host, "_write_diagnosis", writer)
+    assert updater.acknowledge_update()["acknowledged"] is True
+    assert updater.pending_status()["justUpdated"] is None
+    assert updater.acknowledge_update()["acknowledged"] is True
+
+
+def test_unaccepted_commit_cannot_report_success_without_diagnosis(tmp_path, monkeypatch):
+    from app.core import layout
+
+    monkeypatch.setattr("app.core.paths.install_root", lambda: tmp_path)
+    monkeypatch.setattr("app.core.paths.logs_dir", lambda: tmp_path / "logs")
+    layout.start_transaction(tmp_path, updater.APP_VERSION, "old", attempt_id="unaccepted")
+    layout.update_transaction(tmp_path, layout.STAGE_COMMITTED, currentVersion=updater.APP_VERSION, dataPrepared=True)
+    assert updater.just_updated_status() is None
+
+
+def test_committed_without_previous_database_is_complete(tmp_path, monkeypatch):
+    from app.core import layout
+
+    monkeypatch.setattr("app.core.paths.install_root", lambda: tmp_path)
+    monkeypatch.setattr("app.core.paths.logs_dir", lambda: tmp_path / "logs")
+    layout.start_transaction(tmp_path, updater.APP_VERSION, "old", attempt_id="empty-data")
+    layout.update_transaction(tmp_path, layout.STAGE_COMMITTED, currentVersion=updater.APP_VERSION,
+                              dataHadDatabase=False, dataPrepared=False)
+    assert updater.just_updated_status()["currentVersion"] == updater.APP_VERSION

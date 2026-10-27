@@ -6,81 +6,13 @@ import threading
 
 import pytest
 
-from app.core import database, seed_assets
+from app.core import database
 
 
 async def _until(predicate):
     async with asyncio.timeout(3):
         while not predicate():
             await asyncio.sleep(0.005)
-
-
-@pytest.mark.asyncio
-async def test_cancelled_seed_keeps_write_permission_until_sqlite_thread_closes(
-    tmp_path, monkeypatch
-):
-    from app.domains.settings import service as settings_service
-
-    db = tmp_path / "holdexar.db"
-    conn = sqlite3.connect(db)
-    conn.execute("CREATE TABLE result (value TEXT)")
-    conn.close()
-    seed = tmp_path / "seed.db"
-    seed.touch()
-    entered, release, closed = threading.Event(), threading.Event(), threading.Event()
-
-    async def no_marker(*args):
-        return None
-
-    def merge(*args):
-        conn = sqlite3.connect(db)
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute("INSERT INTO result VALUES ('committed')")
-            entered.set()
-            assert release.wait(3)
-            conn.commit()
-            return 1
-        finally:
-            conn.close()
-            closed.set()
-
-    monkeypatch.setattr(database, "sqlite_file_path", lambda: db)
-    monkeypatch.setattr(seed_assets, "read_seed_meta", lambda _: {"version": "test"})
-    monkeypatch.setattr(settings_service, "get_value", no_marker)
-    monkeypatch.setattr(seed_assets, "_merge_game_tags_sync", merge)
-    task = asyncio.create_task(seed_assets.merge_game_tags_seed(seed))
-    acquired = asyncio.Event()
-
-    async def maintenance():
-        async with database.write_maintenance_barrier():
-            acquired.set()
-            assert closed.is_set()
-            conn = sqlite3.connect(db, timeout=0)
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                assert conn.execute("SELECT value FROM result").fetchone() == ("committed",)
-                conn.rollback()
-            finally:
-                conn.close()
-
-    waiter = None
-    try:
-        await _until(entered.is_set)
-        task.cancel()
-        await asyncio.sleep(0.02)
-        task.cancel()
-        waiter = asyncio.create_task(maintenance())
-        await asyncio.sleep(0.02)
-        assert not task.done(), "cancel must not outlive its SQLite write thread"
-        assert not acquired.is_set(), "maintenance entered while SQLite was still writing"
-    finally:
-        release.set()
-        await asyncio.gather(task, return_exceptions=True)
-        if waiter is not None:
-            await waiter
-    assert task.cancelled()
-    assert not database.write_scheduler_diagnostics()["busy"]
 
 
 @pytest.mark.asyncio

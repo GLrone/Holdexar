@@ -4,7 +4,7 @@
 观测时刻的活动标签打桩为 None，使本用例不依赖活动日历表。
 """
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -299,26 +299,6 @@ async def test_mixed_free_state_batch_writes_history_once(
 
 
 @pytest.mark.asyncio
-async def test_curated_post_failure_does_not_rollback_main_segment(db, monkeypatch):
-    """收尾保存点失败只回滚收尾：主段价格照常落库、结果不降级。"""
-    import app.core.seed_assets as seed_assets
-
-    async def _boom(session, rows):
-        raise RuntimeError("curated boom")
-
-    monkeypatch.setattr(seed_assets, "apply_curated_rows", _boom)
-    w = DbWriter()
-    results = await w.upsert_task_batch(
-        [(_game(APPID_A, "甲"), _prices(APPID_A, 10000, 20000, 50))]
-    )
-    assert results == [True]
-    assert await _history_count(db, APPID_A) == 1
-    async with db() as session:
-        row = await session.get(GameCurrentPrice, (APPID_A, "CN"))
-    assert row is not None and row.price == 10000
-
-
-@pytest.mark.asyncio
 async def test_missing_ledger_batch_bump_and_dedup(db):
     """批量欠账记账：首记 fail_count=1；同批 (appid, 区) 去重不双计；
     再次失败冲突 bump 递增（保留 last good price 不动）。"""
@@ -336,6 +316,55 @@ async def test_missing_ledger_batch_bump_and_dedup(db):
     async with db() as session:
         a2 = await session.get(GameCurrentPrice, (APPID_A, "CN"))
     assert a2.fail_count == 2 and a2.price_status == "missing"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["single", "batch", "fallback"])
+@pytest.mark.parametrize("had_price", [False, True])
+async def test_invalid_price_preserves_last_success_without_confirming_answer(db, path, had_price):
+    writer = DbWriter()
+    previous = datetime.now() - timedelta(days=1)
+    if had_price:
+        game = _game(APPID_A)
+        game["updated_at"] = previous
+        assert await writer.upsert_game_and_prices(game, _prices(APPID_A, 1000, 2000, 50))
+
+    prices = _prices(APPID_A, None, None, 0)
+    if path == "single":
+        assert await writer.upsert_game_and_prices(_game(APPID_A), prices)
+    elif path == "batch":
+        assert await writer.upsert_task_batch([(_game(APPID_A), prices)]) == [True]
+    else:
+        assert await writer._upsert_task_batch_slow([(_game(APPID_A), prices)]) == [True]
+
+    async with db() as session:
+        row = await session.get(GameCurrentPrice, (APPID_A, "CN"))
+        assert row.updated_at > previous
+        assert (row.attempt_outcome, row.steam_answer, row.fail_count) == ("failed", None, 1)
+        assert row.price_status == "missing"
+        assert row.last_success_at == (previous if had_price else None)
+        assert (row.price, row.cny_fen, row.original_price, row.discount_percent) == (
+            (1000, 1000, 2000, 50) if had_price else (None, None, None, 0)
+        )
+    assert await _history_count(db, APPID_A) == int(had_price)
+    from app.domains.crawl.freshness import latest_price_observation
+
+    assert await latest_price_observation() == (previous if had_price else None)
+
+
+@pytest.mark.asyncio
+async def test_explicit_no_options_and_free_price_are_successful_observations(db):
+    unavailable = _prices(APPID_A, None, None, 0)
+    unavailable[0].update(price_status="missing", steam_answer="no_options")
+    assert await DbWriter().upsert_task_batch([
+        (_game(APPID_A), unavailable), (_game(APPID_B), _prices(APPID_B, 0, 0, 0)),
+    ]) == [True, True]
+    async with db() as session:
+        unavailable_row = await session.get(GameCurrentPrice, (APPID_A, "CN"))
+        free_row = await session.get(GameCurrentPrice, (APPID_B, "CN"))
+        assert (unavailable_row.attempt_outcome, unavailable_row.steam_answer) == ("success", "no_options")
+        assert (free_row.attempt_outcome, free_row.steam_answer, free_row.price) == ("success", "free", 0)
+        assert unavailable_row.last_success_at and free_row.last_success_at
 
 
 @pytest.mark.asyncio
