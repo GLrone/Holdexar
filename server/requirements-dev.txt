@@ -1,10 +1,11 @@
 # Development-only dependencies. NOT needed to run Holdexar.
 #
 # Why this file exists separately from requirements.txt:
-#   run.py installs requirements.txt on first launch for end users. Test tooling
-#   must not ride along there -- it would make every user's first start download
-#   pytest, and a broken test dep would break the app for people who never run
-#   tests. Keep this list strictly to what CI and local `pytest` need.
+#   requirements.txt is the runtime set for dev and packaging environments (end
+#   users get the frozen package, not a pip install). Test tooling must not ride
+#   along there -- it would drag pytest into every runtime install, and a broken
+#   test dep would break the app for people who never run tests. Keep this list
+#   strictly to what CI and local `pytest` need.
 #
 # NOTE: keep this file pure ASCII, same reason as requirements.txt -- pip decodes
 # requirements files with the OS locale (cp936 on zh-CN Windows) when there is no

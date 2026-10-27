@@ -1,18 +1,15 @@
 r"""Holdexar 发布构建：npm build → PyInstaller onedir → 产物消毒 → 绿色 zip。
 
 用法（发布机，建议用 server/.venv 的解释器运行）：
-    python scripts/build_release.py                    # 常规出包（沿用现有种子）
-    python scripts/build_release.py --refresh-seed     # 先从生产库重导资产种子
+    python scripts/build_release.py                    # 常规出包
     python scripts/build_release.py --skip-web         # 跳过前端构建（dist 已是最新）
 产物（全部要上传 Release；清单由 scripts/build_manifest.py 生成）：
 - release/Holdexar-win64-v<版本>.zip —— 应用包，解压双击即用。轻量包模式：
   **随包附带 mihomo 许可原文与来源说明**（assets/clash → _MEIPASS/clash），
-  **不捆绑内核二进制**（按需独立维护或自备），**不含种子**（首次启动按需下载）。
+  **不捆绑内核二进制**（按需独立维护或自备），**不附全量价格数据库**（可携带目录与人工资料小种子）
+  （游戏目录与价格历史由客户端采集逐步建立）。
   **用户数据支持完全便携**：打包态优先落在程序目录 `data/` 下（完全便携同盘携带），
   不可写时自动安全回退 `%LOCALAPPDATA%\Holdexar`。
-- release/holdexar_seed.db.gz —— 公共数据种子独立资产（压缩分发），供应用首启
-  按需下载与源码 clone 用户（run.py 首次启动）经 scripts/fetch_seed.py 自动获取。
-- release/holdexar_template.db —— 公共目录库模板（若有，作为独立资产上传）。
 - release/latest.json —— 更新清单，挂到固定 tag `updater` 供客户端检查更新。
   加 Scoop 渠道时另出 release/scoop/（用法见 packaging/scoop/README.md）。
 """
@@ -38,22 +35,14 @@ ROOT = Path(__file__).resolve().parents[1]
 SERVER = ROOT / "server"
 WEB = ROOT / "web"
 DESKTOP = ROOT / "desktop"
-SEED_DIR = ROOT / "assets" / "seed"
-SEED_DB = SEED_DIR / "holdexar_seed.db"
 CLASH_DIR = ROOT / "assets" / "clash"
+# 小种子（目录/人工列/捆绑主档，不含价格）：随包携带的离线豁免资产
+MINI_SEED_SRC = ROOT / "assets" / "seed" / "holdexar_mini_seed.db"
+MINI_SEED_BASENAME = "holdexar_mini_seed.db"
 RELEASE = ROOT / "release"
 DIST_DIR = RELEASE / "build"  # PyInstaller distpath（COLLECT 输出 DIST_DIR/<APP_NAME>/）
 WORK_DIR = RELEASE / "work"
 VENV_PY = SERVER / ".venv" / "Scripts" / "python.exe"
-
-SEED_BASENAME = "holdexar_seed.db"
-SEED_GZ_NAME = "holdexar_seed.db.gz"
-# 公共目录库模板（server/scripts/export_template_db.py 的落点同在 assets/seed/）。
-# 它与种子的分发路径不同：包内只留种子（sanitize 的 .db 白名单只认 SEED_BASENAME，
-# 模板库在打包产物里会被当残留剔除），因此它是**纯独立 Release 资产**——
-# 本脚本负责另存到 release/，由 publish_release.py 与其它产物一起上传。
-TEMPLATE_BASENAME = "holdexar_template.db"
-TEMPLATE_DB_SRC = SEED_DIR / TEMPLATE_BASENAME
 
 # 品牌常量与应用版本同源（app.core.app_info 是纯标准库模块，可直接导入；
 # kernel_release 同为纯标准库，故可在装依赖之前取到内核资产清单）
@@ -78,11 +67,6 @@ def pick_python() -> Path:
     if VENV_PY.is_file():
         return VENV_PY
     return Path(sys.executable)
-
-
-def refresh_seed() -> None:
-    print("[种子] 从生产库重导资产种子 ...")
-    subprocess.check_call([str(pick_python()), str(ROOT / "scripts" / "export_seed.py")])
 
 
 def ensure_clash_assets() -> None:
@@ -202,7 +186,18 @@ def assemble_versioned_layout(version: str, python: Path) -> None:
     updater_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(updater_dist / "UpdateHost.exe", updater_dir / "UpdateHost.exe")
 
-    # 4. state/current.json 版本指针
+    # 4. 版本目录携带小种子（目录/人工列/捆绑主档离线资产；消毒按严格名放行）
+    if MINI_SEED_SRC.is_file():
+        seed_dir = v_dir / "seed"
+        seed_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(MINI_SEED_SRC, seed_dir / MINI_SEED_BASENAME)
+        print(f"[布局] 小种子随包：{MINI_SEED_BASENAME}"
+              f"（{MINI_SEED_SRC.stat().st_size / 1048576:.1f} MB）")
+    else:
+        print("[提示] 未找到小种子（assets/seed/holdexar_mini_seed.db），"
+              "本轮包不含离线目录资产")
+
+    # 5. state/current.json 版本指针
     state_dir = APP_DIR / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
     current_state = {
@@ -230,7 +225,7 @@ def assemble_versioned_layout(version: str, python: Path) -> None:
 def sanitize() -> None:
     """产物消毒：任何用户数据/日志/db 与内核二进制残留即删除并复检，仍有则中止发布。
 
-    种子不随包（spec datas 已移除 seed/），产物里出现任何 .db 都是残留。
+    产物 .db 只放行小种子（严格文件名），其余都是残留。
     内核二进制独立维护（按需下载），产物里出现任何 mihomo 可执行文件均清理。
     """
     assert APP_DIR.is_dir(), f"打包产物缺失：{APP_DIR}"
@@ -239,7 +234,10 @@ def sanitize() -> None:
         if path.is_dir() and path.name == "data":
             residue.append(path)
         elif path.is_file() and (
-            path.suffix.lower() in (".log", ".db", ".sqlite3", ".db-wal", ".db-shm")
+            (
+                path.suffix.lower() in (".log", ".db", ".sqlite3", ".db-wal", ".db-shm")
+                and path.name != MINI_SEED_BASENAME
+            )
             or path.name.lower() in ("mihomo.exe", "mihomo")
         ):
             residue.append(path)
@@ -254,7 +252,10 @@ def sanitize() -> None:
         or (
             p.is_file()
             and (
-                p.suffix.lower() in (".log", ".db", ".sqlite3", ".db-wal", ".db-shm")
+                (
+                    p.suffix.lower() in (".log", ".db", ".sqlite3", ".db-wal", ".db-shm")
+                    and p.name != MINI_SEED_BASENAME
+                )
                 or p.name.lower() in ("mihomo.exe", "mihomo")
             )
         )
@@ -289,50 +290,6 @@ def make_zip(version: str) -> tuple[Path, str]:
     print(f"[完成] {zip_path}")
     print(f"[完成] 体积 {size / 1048576:.1f} MB  sha256 {h.hexdigest()}")
     return zip_path, h.hexdigest()
-
-
-def stage_seed_asset() -> Path | None:
-    """把种子压缩为 release/ 下的**独立 Release 资产**（holdexar_seed.db.gz）。
-
-    应用首启按需下载（core/seed_fetch.py）与源码 clone 用户（run.py 经
-    scripts/fetch_seed.py）都拉这份 gz——大体积二进制不入 git，走 Release
-    资产分发。源种子缺失时跳过（发布无种子，应用侧静默等下次发布）。
-    """
-    if not SEED_DB.is_file():
-        print("[提示] 未找到源种子（assets/seed/holdexar_seed.db），"
-              "本轮发布不含种子资产；需要时先跑 --refresh-seed")
-        return None
-    RELEASE.mkdir(parents=True, exist_ok=True)
-    dest = RELEASE / SEED_GZ_NAME
-    if dest.is_file() and dest.stat().st_size > 0 and dest.stat().st_mtime >= SEED_DB.stat().st_mtime:
-        print(f"[发布] 种子资产沿用现有：{dest.name}（{dest.stat().st_size / 1048576:.1f} MB）")
-        return dest
-    import gzip
-
-    with SEED_DB.open("rb") as fin, gzip.open(dest, "wb", compresslevel=9) as fout:
-        while chunk := fin.read(1 << 20):
-            fout.write(chunk)
-    print(f"[发布] 种子资产：{dest.name}（{dest.stat().st_size / 1048576:.1f} MB，"
-          f"源 {SEED_DB.stat().st_size / 1048576:.1f} MB）")
-    return dest
-
-
-def stage_template_asset() -> Path | None:
-    """把公共目录库模板另存为 release/ 下的独立 Release 资产（有则带，无则跳过）。
-
-    模板库 = 新装用户的初始游戏商店目录（游戏/价格/价格历史/捆绑包/汇率等
-    公共目录数据，见 server/scripts/export_template_db.py）。还没导出过就没有
-    这份产物——构建不因它中断，只是本轮发布少一件资产。
-    """
-    if not TEMPLATE_DB_SRC.is_file():
-        print("[提示] 未找到公共目录库模板（assets/seed/holdexar_template.db），"
-              "本轮发布不含该资产；需要时跑 python server/scripts/export_template_db.py")
-        return None
-    RELEASE.mkdir(parents=True, exist_ok=True)
-    dest = RELEASE / TEMPLATE_BASENAME
-    shutil.copy2(TEMPLATE_DB_SRC, dest)
-    print(f"[发布] 模板资产：{dest.name}（{dest.stat().st_size / 1048576:.1f} MB）")
-    return dest
 
 
 def write_release_body(version: str) -> Path:
@@ -370,9 +327,7 @@ def write_release_body(version: str) -> Path:
         "## 资产说明\n\n"
         "| 资产 | 用途 |\n"
         "|---|---|\n"
-        f"| `Holdexar-win64-v{version}.zip` | 应用包。解压后双击 `Holdexar.exe` 即可运行 |\n"
-        "| `holdexar_seed.db.gz` | 公共数据种子（目录 / 现价 / 历史价格 / 捆绑包）。应用首次启动自动下载，仅源码运行用户需手动获取 |\n"
-        "| `holdexar_template.db` | 公共目录库模板（新装初始目录） |\n\n"
+        f"| `Holdexar-win64-v{version}.zip` | 应用包。解压后双击 `Holdexar.exe` 即可运行 |\n\n"
         "## 已知问题\n\n"
         "- 暂无阻断性已知问题；如遇异常可前往「运行日志」页面导出日志并提交 Issue。\n",
         encoding="utf-8",
@@ -383,12 +338,9 @@ def write_release_body(version: str) -> Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Holdexar 一键发布构建")
-    parser.add_argument("--refresh-seed", action="store_true", help="出包前从生产库重导资产种子")
     parser.add_argument("--skip-web", action="store_true", help="跳过前端构建（web/dist 已最新）")
     args = parser.parse_args()
 
-    if args.refresh_seed:
-        refresh_seed()
     ensure_clash_assets()
     if not args.skip_web:
         build_web()
@@ -399,8 +351,6 @@ def main() -> None:
     version = APP_VERSION
     assemble_versioned_layout(version, python)
     sanitize()
-    stage_seed_asset()
-    stage_template_asset()
     zip_path, sha256 = make_zip(version)
     print(f"[完成] 应用包 sha256 {sha256}")
     write_release_body(version)

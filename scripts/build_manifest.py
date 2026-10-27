@@ -1,9 +1,12 @@
 """更新清单生成：release/latest.json（分发机制的稳定入口）+ Scoop 渠道清单。
 
 清单挂在固定 tag（见 app_info.MANIFEST_TAG），校验值与确切资产名随清单
-一并下发，客户端检查更新不依赖 GitHub API；assets[] 同时声明种子资产的
+一并下发，客户端检查更新不依赖 GitHub API；assets[] 声明应用包资产的
 体积与校验值。清单 Release 用 `--latest=false` 创建，不会占用
 `releases/latest`，种子的 `releases/latest/download/` 通道不受影响。
+
+**清单必须签名**（Ed25519，私钥在发布机、仓库外，公钥内嵌客户端）：
+不签名不出清单——客户端只认验签清单，发布无签名清单等于断更。
 
 产出：
 - release/latest.json         —— 上传到 tag `updater` 的 Release（版本 Release 也放一份）
@@ -13,6 +16,8 @@
     python scripts/build_manifest.py                 # 自动取 release/ 内应用包
     python scripts/build_manifest.py --zip <路径>     # 指定应用包
     python scripts/build_manifest.py --version 0.3.5-beta # 覆盖版本号（默认读后端配置）
+    python scripts/build_manifest.py --key <私钥路径>  # 签名私钥（或设 HOLDEXAR_UPDATE_SIGNING_KEY）
+    python scripts/build_manifest.py --generate-key <私钥路径>  # 首次生成密钥对
 
 清单 schema 变更时同步递增 app_info.MANIFEST_SCHEMA，客户端按需兼容。
 """
@@ -21,6 +26,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -36,14 +42,13 @@ if hasattr(sys.stderr, "reconfigure"):
 ROOT = Path(__file__).resolve().parents[1]
 SERVER = ROOT / "server"
 RELEASE = ROOT / "release"
-SEED_DB = ROOT / "assets" / "seed" / "holdexar_seed.db"
-SEED_GZ = RELEASE / "holdexar_seed.db.gz"
 SCOOP_DIR = RELEASE / "scoop"
 NOTES_FILE = RELEASE / "RELEASE_NOTES.md"
 MANIFEST_OUT = RELEASE / "latest.json"
 
 if str(SERVER) not in sys.path:
     sys.path.insert(0, str(SERVER))
+from app.core import update_signing  # noqa: E402
 from app.core.app_info import (  # noqa: E402
     APP_NAME,
     APP_SUBTITLE,
@@ -101,12 +106,9 @@ def read_notes() -> str:
 
 
 def build_manifest(version: str, zip_path: Path) -> dict:
-    """清单结构：app 元信息 + assets[]（role 区分应用包、种子与种子分发档）。
+    """清单结构：app 元信息 + assets[]（role=app 全量应用包）。
 
     role 让客户端不必靠文件名模式认资产；schema 号供将来兼容判断。
-    `seed` 声明的是**解压后的库**（历史字段，供人读与人工核对）；
-    `seed-archive` 声明的是**实际分发的压缩档**——客户端下载的就是它，
-    校验必须对着它的哈希，不能拿未压缩库的哈希去比一个 gz。
     """
     assets = [
         {
@@ -116,50 +118,6 @@ def build_manifest(version: str, zip_path: Path) -> dict:
             "sha256": sha256_of(zip_path),
         }
     ]
-    if SEED_DB.is_file():
-        assets.append(
-            {
-                "role": "seed",
-                "name": SEED_DB.name,
-                "size": SEED_DB.stat().st_size,
-                "sha256": sha256_of(SEED_DB),
-            }
-        )
-    if SEED_GZ.is_file():
-        assets.append(
-            {
-                "role": "seed-archive",
-                "name": SEED_GZ.name,
-                "size": SEED_GZ.stat().st_size,
-                "sha256": sha256_of(SEED_GZ),
-            }
-        )
-
-    # 扫描与收录本版本的目标差量包（Holdexar-patch-v*-to-v{version}.zip）
-    import zipfile
-
-    for p in sorted(RELEASE.glob(f"{APP_NAME}-patch-*.zip")):
-        if not p.is_file():
-            continue
-        try:
-            with zipfile.ZipFile(p, "r") as zf:
-                if "patch-manifest.json" in zf.namelist():
-                    pdata = json.loads(zf.read("patch-manifest.json").decode("utf-8"))
-                    from_v = pdata.get("fromVersion")
-                    to_v = pdata.get("toVersion")
-                    if to_v == version:
-                        assets.append(
-                            {
-                                "role": "patch",
-                                "name": p.name,
-                                "size": p.stat().st_size,
-                                "sha256": sha256_of(p),
-                                "fromVersion": from_v,
-                                "toVersion": to_v,
-                            }
-                        )
-        except Exception:
-            pass
 
     return {
         "schema": MANIFEST_SCHEMA,
@@ -208,7 +166,7 @@ def write_json(path: Path, payload: dict) -> None:
     )
 
 
-def build(explicit_zip: str | None = None, version: str | None = None) -> dict:
+def build(explicit_zip: str | None = None, version: str | None = None, key_path: str | None = None) -> dict:
     version = version or APP_VERSION
     zip_path = pick_zip(explicit_zip, version)
     expected_zip_name = f"{APP_NAME}-win64-v{version}.zip"
@@ -217,6 +175,11 @@ def build(explicit_zip: str | None = None, version: str | None = None) -> dict:
             f"[错误] 指定的应用包文件名 {zip_path.name} 与目标版本 v{version} 不一致（期望 {expected_zip_name}）"
         )
     manifest = build_manifest(version, zip_path)
+    # 清单必须签名：客户端只认内嵌公钥验签过的清单，未签名清单发出去等于废纸
+    manifest = update_signing.sign_manifest(manifest, resolve_signing_key(key_path))
+    ok, reason = update_signing.verify_manifest(manifest)
+    if not ok:
+        sys.exit(f"[错误] 清单签名后自校验失败：{reason}")
     scoop = build_scoop(version, zip_path, manifest["assets"][0]["sha256"])
 
     write_json(MANIFEST_OUT, manifest)
@@ -234,28 +197,39 @@ def build(explicit_zip: str | None = None, version: str | None = None) -> dict:
     roles = {a["role"]: a for a in manifest["assets"]}
     print(f"[清单] v{version} 应用包 {roles['app']['name']}"
           f"（{roles['app']['size'] / 1048576:.1f} MB）")
-    if "seed" in roles:
-        print(f"[清单] v{version} 种子 {roles['seed']['name']}"
-              f"（{roles['seed']['size'] / 1048576:.1f} MB）")
-    else:
-        print("[清单] 提示：未找到种子库（assets/seed/holdexar_seed.db），本次清单不含 seed 条目")
-    if "seed-archive" in roles:
-        print(f"[清单] v{version} 种子分发档 {roles['seed-archive']['name']}"
-              f"（{roles['seed-archive']['size'] / 1048576:.1f} MB）")
-    else:
-        print("[清单] 提示：未找到种子分发档（release/holdexar_seed.db.gz），客户端下载后无哈希可比对")
     print(f"[清单] → {MANIFEST_OUT}")
     print(f"[清单] → {SCOOP_DIR / f'{APP_NAME.lower()}.json'}")
     print(f"[发布] 下一步：python scripts/publish_release.py（创建 Release 并上传）")
     return manifest
 
 
+def resolve_signing_key(explicit: str | None) -> Path:
+    key = Path(explicit or os.environ.get("HOLDEXAR_UPDATE_SIGNING_KEY", ""))
+    if str(key) and key.is_file():
+        return key
+    sys.exit(
+        "[错误] 缺少更新签名私钥（--key 或环境变量 HOLDEXAR_UPDATE_SIGNING_KEY）。\n"
+        "       生成：python scripts/build_manifest.py --generate-key <私钥路径>\n"
+        "       再把打印出的公钥 hex 登记进 server/app/core/update_signing.py"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Holdexar 更新清单生成")
     parser.add_argument("--zip", help="应用包路径（默认取 release/ 内最新的）")
     parser.add_argument("--version", help="覆盖版本号（默认读后端 app.core.config）")
+    parser.add_argument("--key", help="签名私钥路径（默认读 HOLDEXAR_UPDATE_SIGNING_KEY）")
+    parser.add_argument("--generate-key", metavar="私钥路径",
+                        help="生成新的 Ed25519 签名密钥对并打印公钥（不生成清单）")
     args = parser.parse_args()
-    build(args.zip, args.version)
+    if args.generate_key:
+        out = Path(args.generate_key)
+        pub_hex = update_signing.generate_keypair(out)
+        print(f"[签名] 私钥已写入：{out}")
+        print(f"[签名] 公钥 hex：{pub_hex}")
+        print("[签名] 下一步：把公钥登记进 server/app/core/update_signing.py 的 TRUSTED_PUBKEYS")
+        return
+    build(args.zip, args.version, args.key)
 
 
 if __name__ == "__main__":
