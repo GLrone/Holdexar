@@ -19,6 +19,8 @@ def main() -> None:
         return
     parser = argparse.ArgumentParser(description="Holdexar 启动器")
     parser.add_argument("--server", action="store_true", help="无窗口模式，仅启动本地服务")
+    parser.add_argument("--background", action="store_true", help="关闭窗口后继续更新")
+    parser.add_argument("--data-dir", default=None, help=argparse.SUPPRESS)
     parser.parse_args()
     sys.exit(run_launcher(sys.argv[1:]))
 

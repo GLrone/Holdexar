@@ -3,13 +3,14 @@ r"""Holdexar 发布构建：npm build → PyInstaller onedir → 产物消毒 �
 用法（发布机，建议用 server/.venv 的解释器运行）：
     python scripts/build_release.py                    # 常规出包
     python scripts/build_release.py --skip-web         # 跳过前端构建（dist 已是最新）
+    python scripts/build_release.py --output-dir <目录> # 隔离出包，不覆盖 release/
 产物（全部要上传 Release；清单由 scripts/build_manifest.py 生成）：
 - release/Holdexar-win64-v<版本>.zip —— 应用包，解压双击即用。轻量包模式：
   **随包附带 mihomo 许可原文与来源说明**（assets/clash → _MEIPASS/clash），
   **不捆绑内核二进制**（按需独立维护或自备），**不附全量价格数据库**（可携带目录与人工资料小种子）
   （游戏目录与价格历史由客户端采集逐步建立）。
   **用户数据支持完全便携**：打包态优先落在程序目录 `data/` 下（完全便携同盘携带），
-  不可写时自动安全回退 `%LOCALAPPDATA%\Holdexar`。
+  目录不可写时中止启动，已登记的数据目录保持原有归属。
 - release/latest.json —— 更新清单，挂到固定 tag `updater` 供客户端检查更新。
   加 Scoop 渠道时另出 release/scoop/（用法见 packaging/scoop/README.md）。
 """
@@ -61,6 +62,16 @@ from desktop.version_resource import verify_exe_version_resources, write_version
 
 
 APP_DIR = DIST_DIR / APP_NAME
+
+AUX_EXCLUDES = [
+    "fastapi", "uvicorn", "starlette", "pydantic", "pydantic_settings",
+    "pydantic_core", "sqlalchemy", "aiosqlite", "greenlet", "httpx",
+    "httpcore", "h11", "anyio", "sniffio", "PIL", "Pillow",
+    "cryptography", "botocore", "asyncpg", "webview", "pywebview",
+    "tkinter", "setuptools", "distutils", "pkg_resources", "packaging",
+    "watchfiles", "pygments", "openpyxl", "apscheduler",
+    "app.crawler", "app.domains", "app.main",
+]
 
 
 def pick_python() -> Path:
@@ -141,6 +152,7 @@ def assemble_versioned_layout(version: str, python: Path) -> None:
     launcher_dist = DIST_DIR / "_launcher_build"
     launcher_ver_file = WORK_DIR / "launcher_version_info.txt"
     write_version_file(launcher_ver_file, role="launcher", version=version)
+    aux_exclude_flags = [arg for exc in AUX_EXCLUDES for arg in ("--exclude-module", exc)]
     subprocess.check_call([
         str(python), "-m", "PyInstaller", "--onefile", "--noconfirm", "--clean",
         "--paths", str(SERVER),
@@ -150,6 +162,7 @@ def assemble_versioned_layout(version: str, python: Path) -> None:
         "--workpath", str(WORK_DIR / "launcher"),
         "--specpath", str(WORK_DIR),
         "--name", APP_NAME,
+        *aux_exclude_flags,
         str(DESKTOP / "launcher_main.py"),
     ])
 
@@ -167,6 +180,7 @@ def assemble_versioned_layout(version: str, python: Path) -> None:
         "--workpath", str(WORK_DIR / "updater"),
         "--specpath", str(WORK_DIR),
         "--name", "UpdateHost",
+        *aux_exclude_flags,
         str(DESKTOP / "update_host_main.py"),
     ])
 
@@ -229,6 +243,12 @@ def sanitize() -> None:
     内核二进制独立维护（按需下载），产物里出现任何 mihomo 可执行文件均清理。
     """
     assert APP_DIR.is_dir(), f"打包产物缺失：{APP_DIR}"
+    # 清理所有 __pycache__ 与 .pyc 残留
+    for p in list(APP_DIR.rglob("__pycache__")):
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+    for p in list(APP_DIR.rglob("*.pyc")):
+        p.unlink(missing_ok=True)
     residue: list[Path] = []
     for path in APP_DIR.rglob("*"):
         if path.is_dir() and path.name == "data":
@@ -262,7 +282,7 @@ def sanitize() -> None:
     ]
     if residue:
         sys.exit(f"[错误] 产物消毒复检仍有残留，中止发布：{residue}")
-    print(f"[消毒] 产物干净（{sum(1 for _ in APP_DIR.rglob('*'))} 个文件，无 data/日志/db/内核二进制 残留）")
+    print(f"[消毒] 产物干净（{sum(p.is_file() for p in APP_DIR.rglob('*'))} 个文件，无 data/日志/db/内核二进制 残留）")
 
 
 
@@ -309,7 +329,7 @@ def write_release_body(version: str) -> Path:
         f"# Holdexar v{version}\n\n"
         "> 建议直接使用应用内「检查更新」升级；全新用户下载本页压缩包解压双击即用。\n"
         "> 用户数据默认保存在程序根目录 `data/` 下（完全便携）。\n\n"
-        "Windows x64 便携版，解压双击即用。首次启动会自动下载公共数据种子（约 2 GB，含完整游戏目录、现价、历史价格与捆绑包数据），下载完成前功能逐步可用。\n\n"
+        "Windows x64 便携版，解压双击即用。游戏目录与价格由应用采集逐步建立。\n\n"
         "## 本次更新\n\n"
         "### 新增功能 (New Features)\n"
         "- （在此写本次更新内容。发布前编辑本文件——客户端「检查更新」会直接展示这段文字。\n"
@@ -339,7 +359,15 @@ def write_release_body(version: str) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Holdexar 一键发布构建")
     parser.add_argument("--skip-web", action="store_true", help="跳过前端构建（web/dist 已最新）")
+    parser.add_argument("--output-dir", default=None, help="隔离构建输出目录（不覆盖现有 release/）")
     args = parser.parse_args()
+
+    global RELEASE, DIST_DIR, WORK_DIR, APP_DIR
+    if args.output_dir:
+        RELEASE = Path(args.output_dir).resolve()
+        DIST_DIR = RELEASE / "build"
+        WORK_DIR = RELEASE / "work"
+        APP_DIR = DIST_DIR / APP_NAME
 
     ensure_clash_assets()
     if not args.skip_web:
@@ -355,8 +383,10 @@ def main() -> None:
     print(f"[完成] 应用包 sha256 {sha256}")
     write_release_body(version)
 
-    # 清单（latest.json + Scoop）统一由 build_manifest.py 生成，顺跑一步防漏
-    subprocess.check_call([str(python), str(ROOT / "scripts" / "build_manifest.py")])
+    if not args.output_dir:
+        subprocess.check_call([str(python), str(ROOT / "scripts" / "build_manifest.py")])
+    else:
+        print(f"[提示] 隔离构建模式：跳过主清单覆盖（输出位于 {RELEASE}）")
 
 
 if __name__ == "__main__":

@@ -74,6 +74,10 @@ provideGlobalConfig(
 )
 document.title = APP_NAME
 
+// 立即挂载基础外壳，让主界面导航与布局瞬间可见，避免等待网络请求
+const root = document.getElementById('app')
+app.mount('#app')
+
 /** 本地会话自举：桌面壳经 bootstrap 票据已拿到 HttpOnly Cookie；开发态
  *  （Vite 直连后端）没有桌面壳，向 dev 端点要一次。发行版该端点不存在，
  *  返回 404 时静默——正常路径不经过这里。 */
@@ -87,35 +91,38 @@ async function ensureSession(): Promise<void> {
   }
 }
 
-// 区服元数据：挂载前从服务端拉一次（priceMatrix/下拉/筛选都依赖，本地接口毫秒级）
-ensureSession()
-  .then(() => useRegionsStore(pinia).load())
-  .finally(async () => {
-    const root = document.getElementById('app')
-    let health: { writeProtected?: boolean; updateDataProtocol?: number; updateAttemptId?: string }
-    try {
-      health = await (await fetch('/api/v1/health')).json()
-    } catch {
-      health = {}
-    }
-    if (root) root.inert = Boolean(health.writeProtected)
-    app.mount('#app')
-    await router.isReady()
-    await nextTick()
-    try {
-      if (health.writeProtected && health.updateDataProtocol === 1) {
+// 挂载后并发加载区服元数据与进行健康状态确认（不阻塞外壳首次渲染）
+const regionsStore = useRegionsStore(pinia)
+Promise.allSettled([
+  ensureSession().then(() => regionsStore.load()),
+  fetch('/api/v1/health')
+    .then((r) => r.json())
+    .catch(() => ({})),
+  router.isReady(),
+]).then(async ([, healthResult]) => {
+  const health = (healthResult.status === 'fulfilled' ? healthResult.value : {}) as {
+    writeProtected?: boolean
+    updateDataProtocol?: number
+    updateAttemptId?: string
+  }
+  if (health.writeProtected) {
+    if (root) root.inert = true
+    if (health.updateDataProtocol === 1) {
+      try {
         await fetch('/api/v1/system/update-ready', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ attemptId: health.updateAttemptId }),
         })
         while (health.writeProtected) {
-          await new Promise(resolve => setTimeout(resolve, 100))
-          health = await (await fetch('/api/v1/health')).json()
+          await new Promise((resolve) => setTimeout(resolve, 100))
+          const latest = await (await fetch('/api/v1/health')).json()
+          health.writeProtected = latest.writeProtected
         }
+      } catch {
+        // 更新验收由宿主在超时后处理。
       }
-      if (root) root.inert = false
-    } catch {
-      // 更新验收由宿主在超时后处理。
     }
-  })
+    if (root) root.inert = false
+  }
+})

@@ -4,11 +4,9 @@
 打包链：scripts/build_release.py（npm build → 本 spec → 产物消毒 → zip）。
 datas 布局与 app/core/config.py 的 sys.frozen 分支对齐：
   web/         ← web/dist        （web_dist_dir 命中 _MEIPASS/web）
-  clash/       ← assets/clash    （clash_dir 命中 _MEIPASS/clash；mihomo 内核 +
-                                  许可原文与来源说明，随包分发）
+  clash/       ← assets/clash    （仅许可原文与来源说明）
   app.ico      ← _MEIPASS 根     （desktop/main.py frozen icon 分支）
-  server/app   ← 后端源码落盘    （uvicorn.run("app.main:app") 字符串导入的
-                                  磁盘兜底，main.py frozen 态把它插进 sys.path）
+  后端模块由 PYZ 归档加载，主壳直接传入 app 对象，不另附 server/app 源码。
 """
 import os
 import re
@@ -26,12 +24,11 @@ if SERVER not in sys.path:
 from PyInstaller.utils.hooks import collect_submodules  # noqa: E402
 from app.core.app_info import APP_NAME, APP_VERSION  # noqa: E402
 
-from app.core.optional_deps import PYINSTALLER_EXCLUDES  # noqa: E402
 from app.domains.proxies.kernel_release import release_asset_names  # noqa: E402
 
 
 hiddenimports = [
-    # uvicorn.run("app.main:app") 字符串导入 + auto 协议模块运行时选择
+    # uvicorn 协议与生命周期模块运行时选择
     "uvicorn.logging",
     "uvicorn.protocols.http.auto",
     "uvicorn.protocols.http.httptools_impl",
@@ -72,7 +69,6 @@ a = Analysis(
             if os.path.exists(os.path.join(ROOT, "assets", "clash", name))
         ],
 
-        (os.path.join(SERVER, "app"), os.path.join("server", "app")),
         ("app.ico", "."),
         # 许可与第三方声明随包分发：GPL-3.0 要求实体副本随附许可原文（§4），
         # 包内那些 dist-info 只覆盖各自的依赖，本项目自己的 LICENSE 与聚合
@@ -83,9 +79,10 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    # tkinter 无引用；其余为依赖链拖入的零引用库（名单与运行时兜底同源，
-    # 见 app/core/optional_deps.py）
-    excludes=["tkinter", *PYINSTALLER_EXCLUDES],
+    excludes=[
+        "tkinter", "PIL", "asyncpg", "openpyxl", "packaging", "pygments", "setuptools", "watchfiles",
+        "boto3", "botocore", "s3transfer", "jmespath", "requests", "urllib3", "alembic", "mako",
+    ],
     noarchive=False,
     optimize=0,
 )

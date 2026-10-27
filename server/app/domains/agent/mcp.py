@@ -20,23 +20,11 @@ import os
 import secrets
 from pathlib import Path
 
-from mcp.server import Server
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from mcp.shared.exceptions import McpError
-from mcp.types import (
-    INVALID_PARAMS,
-    ErrorData,
-    TextContent,
-    Tool,
-    ToolAnnotations,
-)
+from typing import Any
 from starlette.responses import JSONResponse
 from starlette.types import Receive, Scope, Send
 
 from app.core import access
-from app.domains.agent.runtime import executor
-from app.domains.agent.tools import builtin as _builtin  # noqa: F401 — import 即完成注册
-from app.domains.agent.tools.registry import REGISTRY
 
 MOUNT_PATH = "/api/v1/mcp"
 TOKEN_HEADER = "x-holdexar-mcp"
@@ -54,12 +42,18 @@ EXCLUDED_TOOLS = frozenset({
 })
 
 
-def tool_projection() -> list[Tool]:
-    """注册表 → MCP Tool 投影（排除会话 / UI 绑定工具）。
+def _ensure_tools():
+    from app.domains.agent.tools import builtin as _builtin  # noqa: F401
+    from app.domains.agent.tools.registry import REGISTRY
 
-    readOnlyHint 只给 group=read 且 risk=low 的工具：同步 / 刷新类虽在
-    read 守卫组（不做批量删除守卫），但真实副作用是联网 + 写库，
-    按真实副作用标注而非组标签。"""
+    return REGISTRY
+
+
+def tool_projection() -> list[Any]:
+    """注册表 → MCP Tool 投影（排除会话 / UI 绑定工具）。"""
+    from mcp.types import Tool, ToolAnnotations
+
+    registry = _ensure_tools()
     return [
         Tool(
             name=s.name,
@@ -71,14 +65,19 @@ def tool_projection() -> list[Tool]:
                 idempotentHint=s.idempotent or None,
             ),
         )
-        for s in REGISTRY.all()
+        for s in registry.all()
         if s.name not in EXCLUDED_TOOLS
     ]
 
 
-async def execute_tool(name: str, arguments: dict) -> list[TextContent]:
+async def execute_tool(name: str, arguments: dict) -> list[Any]:
     """MCP 工具调用 → 公共执行边界（executor），结果 JSON 文本回传。"""
-    spec = REGISTRY.get(name)
+    from mcp.shared.exceptions import McpError
+    from mcp.types import INVALID_PARAMS, ErrorData, TextContent
+    from app.domains.agent.runtime import executor
+
+    registry = _ensure_tools()
+    spec = registry.get(name)
     if spec is None or spec.name in EXCLUDED_TOOLS:
         raise McpError(ErrorData(code=INVALID_PARAMS, message=f"unknown tool: {name}"))
     result = await executor.execute(spec, dict(arguments or {}))
@@ -86,22 +85,24 @@ async def execute_tool(name: str, arguments: dict) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, default=str))]
 
 
-def create_mcp_server() -> Server:
+def create_mcp_server() -> Any:
     """注册表 → MCP 工具协议投影（list_tools / call_tool 两个入口）。"""
+    from mcp.server import Server
+
     server = Server("holdexar")
 
     @server.list_tools()
-    async def _list_tools() -> list[Tool]:
+    async def _list_tools() -> list[Any]:
         return tool_projection()
 
     @server.call_tool()
-    async def _call_tool(name: str, arguments: dict) -> list[TextContent]:
+    async def _call_tool(name: str, arguments: dict) -> list[Any]:
         return await execute_tool(name, arguments)
 
     return server
 
 
-_manager: StreamableHTTPSessionManager | None = None
+_manager: Any | None = None
 _token: str | None = None
 _last_error: str | None = None
 _supervisor: asyncio.Task | None = None
@@ -164,6 +165,8 @@ async def _supervise(commands: asyncio.Queue) -> None:
         try:
             if cmd == "start" and cm is None:
                 token = _ensure_token_file(data_dir)
+                from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
                 manager = StreamableHTTPSessionManager(
                     app=create_mcp_server(), stateless=True, json_response=True,
                 )
@@ -244,7 +247,7 @@ async def shutdown() -> None:
 class McpAsgiApp:
     """挂到 FastAPI 的 ASGI 壳：未启用时 404，启用后交给会话管理器。"""
 
-    def __init__(self, manager: StreamableHTTPSessionManager | None = None) -> None:
+    def __init__(self, manager: Any | None = None) -> None:
         self._manager = manager
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:

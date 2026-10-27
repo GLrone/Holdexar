@@ -157,7 +157,6 @@ _MODULE_LABELS = {
     "app.core.database": "数据库",
     "app.core.backup": "数据备份",
     "app.core.updater": "应用更新",
-    "app.core.optional_deps": "可选依赖",
     "app.domains.pilot.context": "领航员上下文",
     "app.core.rekey": "密钥换装",
     "app.core.external_time": "时间校准",

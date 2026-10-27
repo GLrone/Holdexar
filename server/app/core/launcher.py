@@ -54,7 +54,7 @@ def find_target_version(root: Path) -> str | None:
     compatibility = read_data_compatibility(root)
     allowed = None
     if compatibility is not None:
-        from app.core.update_data import read_schema_version
+        from app.core.db_safety import read_schema_version
 
         if read_schema_version(Path(compatibility["dataDir"])) != compatibility["schemaVersion"]:
             raise RuntimeError("数据结构已变化，拒绝选择未经相容验收的程序")
@@ -209,7 +209,11 @@ def run_launcher(
 
     # 4. 拉起目标版本
     try:
-        launch_version(root, target_ver, argv=argv, detached=detached)
+        arguments = list(argv if argv is not None else sys.argv[1:])
+        foreground = "--server" in arguments
+        process = launch_version(root, target_ver, argv=arguments, detached=False if foreground else detached)
+        if foreground:
+            return process.wait()
         return 0
     except Exception as exc:  # noqa: BLE001
         logger.error("拉起版本 %s 失败：%s", target_ver, exc)

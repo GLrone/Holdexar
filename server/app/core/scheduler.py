@@ -709,6 +709,14 @@ _FX_REPAIR_MAX_WINDOWS = 8
 # 它同秒起跑会一起抢 SQLite 写锁（真实生产已出现 `database is locked`）。
 _BILLS_STAGGER = timedelta(minutes=2)
 
+# 启动期错峰排程：首屏 0~5s 关键窗口期让路给前台会话与聚合读，后台定时重活在 5s~30s 错峰分批执行。
+_STARTUP_STAGGER_PROXYPOOL_CYCLE = timedelta(seconds=5)
+_STARTUP_STAGGER_PRICE_REPAIR = timedelta(seconds=10)
+_STARTUP_STAGGER_SUBSCRIPTION_REFRESH = timedelta(seconds=15)
+_STARTUP_STAGGER_FX_REFRESH = timedelta(seconds=20)
+_STARTUP_STAGGER_MINI_SEED = timedelta(seconds=25)
+_STARTUP_STAGGER_WISHLIST_SYNC = timedelta(seconds=30)
+
 
 async def _job_proxypool_cycle() -> None:
     """先复用本地记录确保运行时，再执行正常L0/L1/L2维护。"""
@@ -1798,9 +1806,21 @@ def start_scheduler() -> None:
     if scheduler.running:
         return
     now = datetime.now()
-    scheduler.add_job(_acct("wishlist_sync", _job_wishlist_sync), "interval", minutes=15, id="wishlist_sync", next_run_time=now)
+    scheduler.add_job(
+        _acct("wishlist_sync", _job_wishlist_sync),
+        "interval",
+        minutes=15,
+        id="wishlist_sync",
+        next_run_time=now + _STARTUP_STAGGER_WISHLIST_SYNC,
+    )
     # 失败记录修复：5min 一轮，job 内部自判空闲（busy/任务表），占线即静默让路
-    scheduler.add_job(_job_price_repair, "interval", minutes=5, id="price_repair", next_run_time=now)
+    scheduler.add_job(
+        _job_price_repair,
+        "interval",
+        minutes=5,
+        id="price_repair",
+        next_run_time=now + _STARTUP_STAGGER_PRICE_REPAIR,
+    )
     # 池价格爬取：interval 6h 只做兜底（重锚链断裂也不脱轨；真实步长由
     # 设置 crawl.price_interval_hours 决定，初锚的 6h 网格点在启动 10s
     # 纠偏探针处按用户步长重算，注册期同步上下文读不到 KV）
@@ -1812,7 +1832,7 @@ def start_scheduler() -> None:
         next_run_time=local_next_grid()[0],
         coalesce=True, misfire_grace_time=None,
     )
-    scheduler.add_job(_acct("fx_refresh", _job_fx_refresh), "cron", hour=3, minute=0, id="fx_refresh", next_run_time=now)
+    scheduler.add_job(_acct("fx_refresh", _job_fx_refresh), "cron", hour=3, minute=0, id="fx_refresh", next_run_time=now + _STARTUP_STAGGER_FX_REFRESH)
     # 汇率历史修复：与实时刷新分离的独立任务（配额账本 + 缺口 + 爬虫空闲门禁）
     scheduler.add_job(
         _acct("fx_history_repair", _job_fx_history_repair), "cron", hour=4, minute=0, id="fx_history_repair"
@@ -1822,7 +1842,7 @@ def start_scheduler() -> None:
     # 爬虫空闲门禁——占线错过一拍不消费门槛，下一拍补上
     scheduler.add_job(
         _acct("subscription_refresh", _job_subscription_refresh), "interval", minutes=30, id="subscription_refresh",
-        next_run_time=now,
+        next_run_time=now + _STARTUP_STAGGER_SUBSCRIPTION_REFRESH,
     )
     scheduler.add_job(_acct("wallet_sync", _job_wallet_sync), "interval", minutes=1, id="wallet_sync")
     scheduler.add_job(
@@ -1869,7 +1889,7 @@ def start_scheduler() -> None:
     # 池 Runtime 未就绪时函数内部自行跳过；max_instances=1 防上一轮未跑完又叠一轮。
     scheduler.add_job(
         _acct("proxypool_cycle", _job_proxypool_cycle), "interval", minutes=5, id="proxypool_cycle",
-        next_run_time=now, max_instances=1, coalesce=True,
+        next_run_time=now + _STARTUP_STAGGER_PROXYPOOL_CYCLE, max_instances=1, coalesce=True,
     )
     # 运行账本保留：job 型 run 过窗清理（级联事件），每日 04:36
     scheduler.add_job(
@@ -1884,7 +1904,7 @@ def start_scheduler() -> None:
     # 跳拍事件监听（并发上限让路/到点错失）：remove 先行幂等，防 stop→start 重入双注册
     scheduler.remove_listener(_on_job_skipped)
     scheduler.add_listener(_on_job_skipped, EVENT_JOB_MAX_INSTANCES | EVENT_JOB_MISSED)
-    scheduler.add_job(_acct("mini_seed", _job_mini_seed), "interval", minutes=30, id="mini_seed", next_run_time=now)
+    scheduler.add_job(_acct("mini_seed", _job_mini_seed), "interval", minutes=30, id="mini_seed", next_run_time=now + _STARTUP_STAGGER_MINI_SEED)
     scheduler.start()
     log_event(
         logger,
