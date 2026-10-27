@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import json
 import logging
 import os
@@ -633,6 +634,27 @@ def _read_manifest(staging_dir: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _verify_staging_payload(staging_dir: Path, manifest: dict[str, Any]) -> str:
+    """暂存载荷逐文件核验（对照清单 files 哈希表）；返回错误描述，空串=通过。
+
+    旧版更新器写的清单没有 files 表（跨版本升级配对），跳过核验走原行为；
+    新版成对更新后全链核验生效。
+    """
+    expected = manifest.get("files")
+    if not isinstance(expected, dict) or not expected:
+        return ""
+    payload = staging_dir / APP_NAME
+    if not payload.is_dir():
+        return "暂存包载荷缺失"
+    for name in sorted(expected):
+        path = payload / name
+        if not path.is_file():
+            return f"暂存包载荷缺失：{name}"
+        if hashlib.sha256(path.read_bytes()).hexdigest() != str(expected[name]).lower():
+            return f"暂存包载荷校验不符：{name}"
+    return ""
+
+
 def _resolve_data_dir(root: Path, requested: Path | None) -> Path:
     """本次换装的数据目录：显式传入优先，否则安装根 data/。"""
     candidate = Path(requested).resolve() if requested else (root / "data").resolve()
@@ -908,6 +930,10 @@ def _execute_update_locked(
             return False
 
     manifest_data = _read_manifest(staging_dir)
+    payload_error = _verify_staging_payload(staging_dir, manifest_data)
+    if payload_error:
+        _log_update(root, f"暂存包完整性核验未通过：{payload_error}，拒绝换装并保留现装")
+        return False
     aid = attempt_id or manifest_data.get("attempt_id") or str(uuid.uuid4())
     tag = manifest_data.get("tag") or ""
     t_ver = target_version or version_from_tag(tag) or tag
