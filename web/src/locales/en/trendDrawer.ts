@@ -11,6 +11,7 @@ const trendDrawer: Partial<Record<MessageKey, string>> = {
 
   /* Version labels */
   'trendDrawer.version.standard': 'Standard',
+  'trendDrawer.version.unknown': 'Unidentified edition (community data)',
   'trendDrawer.version.gold': 'Gold Edition',
 
   /* All-time-low event markers */
@@ -40,6 +41,12 @@ const trendDrawer: Partial<Record<MessageKey, string>> = {
   /* All-versions block */
   'trendDrawer.versions.title': 'All versions',
   'trendDrawer.versions.hint': '(current region price · click to switch)',
+
+  /* History backfill (on-demand fetch states for empty charts) */
+  'trendDrawer.backfill.running': 'Fetching price history — the chart updates automatically',
+  'trendDrawer.backfill.error': 'Failed to fetch price history',
+  'trendDrawer.backfill.retry': 'Retry',
+  'trendDrawer.backfill.empty': 'No price history available for this region',
 
   /* Drawer footer link (the → arrow stays in the component) */
   'trendDrawer.detail.viewFull': 'View full details',

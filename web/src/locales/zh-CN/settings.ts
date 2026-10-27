@@ -10,6 +10,7 @@ const settings = {
   'settings.section.account': '账户',
   'settings.section.backup': '数据备份',
   'settings.section.update': '应用更新',
+  'settings.section.mcp': '外部 AI 接入（MCP）',
   'settings.section.tour': '新手教程',
 
   /* ── Steam 账户绑定卡片 ── */
@@ -260,6 +261,26 @@ const settings = {
   'settings.notification.stats':
     '已投递 {delivered} 条 · 失败 {failed} 条（其中 {retryable} 条可重试）',
   'settings.notification.unknownCount': '另有 {unknown} 封邮件的送达结果无法确认',
+
+  /* ── MCP 服务卡片（外部 AI 客户端接入面） ── */
+  'settings.mcp.desc':
+    '允许本机的 AI 客户端（如代码助手）通过标准协议直接使用本应用的查询与操作能力，与本应用内 AI 助手走同一执行边界。默认关闭。',
+  'settings.mcp.enabledLabel': '启用 MCP 服务',
+  'settings.mcp.enabledHint': '开启后本机 AI 客户端可凭数据目录中的令牌文件接入；关闭立即生效并移除令牌。',
+  'settings.mcp.forcedHint': '已由启动参数强制开启（HOLDEXAR_MCP），此开关不可用。',
+  'settings.mcp.statusRunning': '运行中',
+  'settings.mcp.statusOff': '已关闭',
+  'settings.mcp.statusFailed': '启动失败：{reason}',
+  'settings.mcp.onPost': 'MCP 服务已开启',
+  'settings.mcp.offPost': 'MCP 服务已关闭',
+  'settings.mcp.help': '接入说明',
+  'settings.mcp.helpTitle': '外部 AI 接入说明',
+  'settings.mcp.helpEndpoint': '服务端点',
+  'settings.mcp.helpToken': '接入令牌',
+  'settings.mcp.helpTokenNote': '启用后生成于数据目录的 mcp-token 文件',
+  'settings.mcp.helpBridge': '本机客户端接入命令',
+  'settings.mcp.helpNote':
+    '仅本机回环可访问，令牌不符即拒绝；完整配置示例见仓库内部集成手册。默认关闭，关闭立即断开接入。',
 } as const
 
 export default settings

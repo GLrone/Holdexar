@@ -81,6 +81,7 @@ const gameCard = {
   'gameCard.priceData.tipRegion.failedStale':
     '{region}：本次抓取失败，展示的是 {time} 的数据',
   'gameCard.priceData.tipRegion.notAttempted': '{region}：还没抓过',
+  'gameCard.priceData.tipRegion.outdated': '{region}：上次成功更新于 {time}，需要更新',
 
   /* ── 卡片操作行（regionPrice.title 与 GPW 弹窗小标题同条）── */
   'gameCard.regionPrice.title': '全区价格',

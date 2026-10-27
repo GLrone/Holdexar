@@ -65,4 +65,5 @@ export default {
   'updateDialog.toastRestartUnsupported': '浏览器模式无法自动重启，请手动关闭并重新打开应用',
   'updateDialog.toastRestartFailed': '重启失败，请手动关闭并重新打开应用',
   'updateDialog.toastCloseBlocked': '下载进行中，请先取消下载再关闭',
+  'updateDialog.toastAckFailed': '暂时无法保存确认，请稍后重试',
 } as const

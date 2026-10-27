@@ -67,4 +67,5 @@ export default {
   'updateDialog.toastRestartUnsupported': 'Browser mode cannot restart the app; please reopen it manually',
   'updateDialog.toastRestartFailed': 'Restart failed; please close and reopen the app manually',
   'updateDialog.toastCloseBlocked': 'Download in progress — cancel it before closing',
+  'updateDialog.toastAckFailed': 'Could not save your confirmation. Please try again',
 } as const

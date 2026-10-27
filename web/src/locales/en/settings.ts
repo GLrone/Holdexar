@@ -10,6 +10,7 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.section.account': 'Account',
   'settings.section.backup': 'Backups',
   'settings.section.update': 'App updates',
+  'settings.section.mcp': 'External AI access (MCP)',
   'settings.section.tour': 'Guided tour',
 
   /* Steam account binding card */
@@ -263,6 +264,26 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.notification.stats':
     'Delivered {delivered} · failed {failed} ({retryable} can retry)',
   'settings.notification.unknownCount': '{unknown} email delivery result(s) could not be confirmed',
+
+  /* ── MCP service card (external AI client access) ── */
+  'settings.mcp.desc':
+    'Lets local AI clients (such as coding assistants) use this app\'s queries and operations over a standard protocol, through the same execution boundary as the built-in assistant. Off by default.',
+  'settings.mcp.enabledLabel': 'Enable MCP service',
+  'settings.mcp.enabledHint': 'When on, local AI clients can connect with the token file in the data directory; turning it off takes effect immediately and removes the token.',
+  'settings.mcp.forcedHint': 'Force-enabled by the launch environment (HOLDEXAR_MCP); this switch is unavailable.',
+  'settings.mcp.statusRunning': 'Running',
+  'settings.mcp.statusOff': 'Off',
+  'settings.mcp.statusFailed': 'Failed to start: {reason}',
+  'settings.mcp.onPost': 'MCP service enabled',
+  'settings.mcp.offPost': 'MCP service disabled',
+  'settings.mcp.help': 'Setup guide',
+  'settings.mcp.helpTitle': 'External AI access',
+  'settings.mcp.helpEndpoint': 'Endpoint',
+  'settings.mcp.helpToken': 'Access token',
+  'settings.mcp.helpTokenNote': 'Generated as the mcp-token file in the data directory once enabled',
+  'settings.mcp.helpBridge': 'Local client command',
+  'settings.mcp.helpNote':
+    'Reachable on loopback only; a wrong token is rejected. Full configuration examples are in the internal integration manual. Off by default; turning it off disconnects clients immediately.',
 }
 
 export default settings

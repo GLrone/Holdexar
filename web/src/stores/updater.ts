@@ -46,7 +46,6 @@ export const useUpdaterStore = defineStore('updater', () => {
   const pendingDialogDismissed = ref(false)
   /** 刚刚完成换装更新并首次启动（展示更新成功弹窗的依据） */
   const justUpdated = ref<{ previousVersion: string; currentVersion: string; notes?: string } | null>(null)
-  const LAST_SEEN_KEY = 'holdexar_last_seen_version'
 
   /** 全局更新弹窗（模糊幕布）是否展开：更新模块已从设置页搬到这里 */
   const dialogOpen = ref(false)
@@ -57,6 +56,9 @@ export const useUpdaterStore = defineStore('updater', () => {
   const failure = ref<{ code: string; message: string } | null>(null)
 
   let timer: ReturnType<typeof setInterval> | null = null
+  let installing = false
+  let pendingRevision = 0
+  let pendingRequest: Promise<void> | null = null
 
   function stopPolling(): void {
     if (timer) {
@@ -67,6 +69,10 @@ export const useUpdaterStore = defineStore('updater', () => {
 
   /** 读一次进度；跑完即停轮询并把「待重启」置位 */
   async function poll(): Promise<void> {
+    if (installing) {
+      await refreshPending()
+      return
+    }
     try {
       const p = await systemApi.updateProgress()
       progress.value = p
@@ -94,13 +100,14 @@ export const useUpdaterStore = defineStore('updater', () => {
   }
 
   function startPolling(): void {
-    stopPolling()
+    if (timer) return
     timer = setInterval(() => void poll(), 800)
   }
 
   /** 与后端对齐（应用启动、进设置页时调用）：续上别人发起的下载 */
   async function sync(): Promise<void> {
     await refreshPending()
+    if (installing) return
     try {
       const p = await systemApi.updateProgress()
       progress.value = p
@@ -109,6 +116,7 @@ export const useUpdaterStore = defineStore('updater', () => {
         startPolling()
       } else {
         downloading.value = false
+        stopPolling()
       }
     } catch {
       /* 拉不到进度不影响页面其余部分 */
@@ -116,34 +124,33 @@ export const useUpdaterStore = defineStore('updater', () => {
   }
 
   /** 暂存状态刷新（换装完成或用户取消后后端即为准） */
-  async function refreshPending(): Promise<void> {
-    try {
-      const p = await systemApi.updatePending()
-      pendingTag.value = p.pending ? (p.tag || '') : ''
-      swapFailed.value = p.swapFailed === true
-      if (p.justUpdated) {
-        justUpdated.value = {
-          previousVersion: p.justUpdated.previousVersion,
-          currentVersion: p.justUpdated.currentVersion,
-          notes: p.justUpdated.notes || undefined,
-        }
-      } else {
-        try {
-          const infoRes = await systemApi.info()
-          const curVer = infoRes.version
-          const lastSeen = localStorage.getItem(LAST_SEEN_KEY)
-          if (lastSeen && curVer && lastSeen !== curVer) {
-            justUpdated.value = { previousVersion: lastSeen, currentVersion: curVer }
-          } else if (!lastSeen && curVer) {
-            localStorage.setItem(LAST_SEEN_KEY, curVer)
+  function refreshPending(): Promise<void> {
+    if (pendingRequest) return pendingRequest
+    const revision = pendingRevision
+    const request = (async () => {
+      try {
+        const p = await systemApi.updatePending()
+        if (revision !== pendingRevision) return
+        installing = p.installing === true
+        pendingTag.value = p.pending ? (p.tag || '') : ''
+        swapFailed.value = p.swapFailed === true
+        if (p.justUpdated) {
+          justUpdated.value = {
+            previousVersion: p.justUpdated.previousVersion,
+            currentVersion: p.justUpdated.currentVersion,
+            notes: p.justUpdated.notes || undefined,
           }
-        } catch {
-          /* 忽略本地版本比对异常 */
         }
+        if (installing) startPolling()
+        else if (!downloading.value) stopPolling()
+      } catch {
+        /* 安装中的瞬时读取失败保留原轮询，终态由后端确认。 */
       }
-    } catch {
-      /* 拉不到保持现值 */
-    }
+    })()
+    pendingRequest = request
+    return request.finally(() => {
+      if (pendingRequest === request) pendingRequest = null
+    })
   }
 
   /** 校验值：优先用清单下发的 sha256；旧发布（无清单）从 release body 的 SHA256 行兜底 */
@@ -190,12 +197,15 @@ export const useUpdaterStore = defineStore('updater', () => {
    *  取消是用户的明确意图，后端拒绝（如 409）也照常复位前端态，不能因为
    *  后端不让就卡在按钮上。 */
   async function cancel(): Promise<void> {
+    pendingRevision += 1
+    pendingRequest = null
+    stopPolling()
+    installing = false
     try {
       await systemApi.updateCancel()
     } catch {
       /* 后端拒绝也照常复位前端态 */
     }
-    stopPolling()
     progress.value = null
     downloading.value = false
     failure.value = null
@@ -270,21 +280,23 @@ export const useUpdaterStore = defineStore('updater', () => {
   }
 
   /** 关闭更新成功弹窗并闭合确认账本 */
-  async function dismissUpdated(): Promise<void> {
+  async function dismissUpdated(): Promise<boolean> {
+    pendingRevision += 1
+    pendingRequest = null
+    installing = false
+    if (!downloading.value) stopPolling()
     try {
-      await systemApi.updateAck()
+      const result = await systemApi.updateAck()
+      if (!result.acknowledged) return false
     } catch {
-      /* 忽略提交确认异常 */
+      return false
     }
-    if (justUpdated.value?.currentVersion) {
-      try {
-        localStorage.setItem(LAST_SEEN_KEY, justUpdated.value.currentVersion)
-      } catch {
-        /* 忽略存储异常 */
-      }
-    }
+    pendingRevision += 1
+    pendingRequest = null
     justUpdated.value = null
     dialogOpen.value = false
+    await refreshPending()
+    return true
   }
 
   const UPDATER_ACTIVITY_ID = 'updater:activity'

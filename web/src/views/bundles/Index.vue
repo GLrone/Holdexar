@@ -15,7 +15,7 @@
  */
 import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, watch } from 'vue'
 
-import { bundlesApi, ownershipApi, type BundleDetail, type BundleGame, type BundleSummary, type OwnershipInfo } from '@/api/client'
+import { bundlesApi, ownershipApi, type BundleDetail, type BundleGame, type BundleListQuery, type BundleSummary, type OwnershipInfo } from '@/api/client'
 import { regionSelectOptions } from '@/api/selectOptions'
 import { HlButton, HlCheckbox, HlDialog, HlDrawer, HlEmpty, HlIcon, HlSelect, HlSkeleton, HlSpinner, HlUndoToast, message } from '@/components/ui'
 import RegionFlag from '@/components/RegionFlag.vue'
@@ -23,7 +23,6 @@ import {
   autoExcludedAppIds,
   computeCompletion,
   formatForeignMinor,
-  inferBundleOwnership,
   orderedRegionCodes,
 } from '@/lib/bundleCalc'
 import {
@@ -34,7 +33,7 @@ import {
   markAssetOk,
   resolveAssetUrl,
 } from '@/lib/assetCache'
-import { canGift, computeGiftingAnalysis, type GiftingAnalysis, type RegionPriceInfo } from '@/lib/gifting'
+import { computeGiftingAnalysis, type GiftingAnalysis, type RegionPriceInfo } from '@/lib/gifting'
 import { agePart, freshnessBucket } from '@/lib/priceDataView'
 import { ageHoursOf } from '@/lib/priceEvents'
 import { vStagger } from '@/lib/stagger'
@@ -51,10 +50,15 @@ const loading = ref(true)
 const errorMsg = ref('')
 /** bundleId → 撞库推演结果 */
 const ownershipMap = ref<Record<number, OwnershipInfo>>({})
-const ownershipByBid = ref<Record<number, ReturnType<typeof inferBundleOwnership>>>({})
+const ownershipByBid = ref<Record<number, NonNullable<BundleSummary['ownership']>>>({})
+const total = ref(0)
+const completableCount = ref(0)
+const loadingMore = ref(false)
+const moreError = ref('')
+const nextOffset = ref(0)
 
 // ─── 导航栏（对齐游戏商店形态：搜索 + 排序下拉 + 地区维度 + 高级筛选 + 统计）───
-// 排序走服务端预计算列（smart=智能评分 / diff=差价）；搜索按包名前端过滤。
+// 搜索、筛选、排序与计数均由列表接口提供。
 // 无手动刷新键：切回页面由 onActivated 静默重拉保鲜，常驻刷新键无意义。
 type BundleSortKey = 'smart' | 'diff' | 'discount'
 const sortBy = ref<BundleSortKey>(
@@ -75,11 +79,6 @@ const currentSortLabel = computed(
 const searchInput = ref('')
 const committedSearch = ref('')
 
-// ─── 地区维度：选区后差价重新锚定到该区（国区价 − 该区 cnyFen）。
-// 列表载荷自带全区 cnyFen，锚定换算/过滤在前端做，无需新快照列；
-// smart 评分保持服务端序——评分是「国区对全区最低」视角，与所选地区无关，
-// 与 games 商店「smart 不挂地区前缀」同一取舍。
-// 地区维度是**视图态**：跟随页面实例在 keep-alive 中保留，切回不再回默认。
 type RegionMode = 'all' | 'cheaper' | 'locked'
 const region = ref('')
 const regionMode = ref<RegionMode>('all')
@@ -102,7 +101,6 @@ function selectRegion(code: string) {
   showRegionMenu.value = false
   if (code === region.value) return
   region.value = code
-  renderLimit.value = RENDER_STEP
   // 进地区维度即回顶：工具栏是吸顶层，滚动中途选区会把它
   // 钉在当前视口上、盖住正下方的卡片行（与游戏商店选排序回顶同一语义）
   ;(document.querySelector('.view-container') as HTMLElement | null)?.scrollTo({
@@ -113,7 +111,6 @@ function selectRegion(code: string) {
 
 function selectRegionMode(mode: RegionMode) {
   regionMode.value = mode
-  renderLimit.value = RENDER_STEP
 }
 
 // ─── 高级筛选：可补齐 / 国区最低 / 仅有折扣 / 隐藏已拥有 / 家庭共享 /
@@ -181,11 +178,9 @@ const activeFilterCount = computed(() => {
 })
 function setFilter<K extends keyof BundleFilters>(key: K, value: BundleFilters[K]) {
   filters.value = { ...filters.value, [key]: value }
-  renderLimit.value = RENDER_STEP
 }
 function resetFilters() {
   filters.value = { ...DEFAULT_FILTERS }
-  renderLimit.value = RENDER_STEP
 }
 
 /* 差价区间单位选项（与游戏商店高级筛选同一组词条） */
@@ -194,94 +189,12 @@ const diffTypeOptions = computed(() => [
   { value: 'percent', label: t('filterPanel.diff.percent') },
 ])
 
-// ─── 分批渲染：先渲 RENDER_STEP 张、滚动接近底部自动续批。列表形态是
-// 「前端全量管道」——全量载荷取回后筛选/排序都在前端算，批次只切 DOM 挂载；
-// 数据取回、解析与筛选都发生在切片之前，属首屏关键路径，不随分批而变小。
-// 挂载窗口同时是归属取数窗口（见 loadOwnership）。───
-const RENDER_STEP = 120
-const renderLimit = ref(RENDER_STEP)
-/** 展示管道：地区锚定换算 → 地区模式过滤 → 高级筛选 → 选区 diff 排序时
-   按该区差价前端重排 → 搜索过滤 → 分批渲染切片 */
-const enrichedBundles = computed(() =>
-  bundles.value.map((b) => {
-    let regionDiff: number | null = null
-    let regionLocked = false
-    const code = region.value.toUpperCase()
-    if (code) {
-      const rp = b.regionPrices[code]
-      if (!rp || rp.cnyFen == null) regionLocked = true
-      else if (b.cnCnyFen != null) regionDiff = b.cnCnyFen - rp.cnyFen
-    }
-    return { b, regionDiff, regionLocked }
-  }),
-)
-const filteredBundles = computed(() => {
-  let rows = enrichedBundles.value
-  const code = region.value.toUpperCase()
-  if (code && regionMode.value === 'cheaper') {
-    rows = rows.filter((r) => r.regionDiff != null && r.regionDiff > 0)
-  } else if (code && regionMode.value === 'locked') {
-    rows = rows.filter((r) => r.regionLocked)
-  }
-  const f = filters.value
-  if (f.followedOnly) rows = rows.filter((r) => followedIds.value.has(r.b.bundleId))
-  if (f.completableOnly) rows = rows.filter((r) => r.b.mustPurchaseAsSet === 0)
-  if (f.cnLowestOnly) rows = rows.filter((r) => r.b.lowestRegion === 'cn')
-  if (f.onlyDiscounted) rows = rows.filter((r) => maxDiscount(r.b) > 0)
-  const own = ownershipByBid.value
-  if (f.hideOwned) rows = rows.filter((r) => own[r.b.bundleId]?.type !== 'owned')
-  if (f.hideFamily) rows = rows.filter((r) => own[r.b.bundleId]?.type !== 'family')
-  const numeric = (s: string) => (s !== '' && Number.isFinite(Number(s)) ? Number(s) : null)
-  const pMin = numeric(f.priceMin)
-  const pMax = numeric(f.priceMax)
-  const dMin = numeric(f.diffMin)
-  const dMax = numeric(f.diffMax)
-  if (pMin != null) rows = rows.filter((r) => r.b.cnCnyFen != null && r.b.cnCnyFen >= pMin * 100)
-  if (pMax != null) rows = rows.filter((r) => r.b.cnCnyFen != null && r.b.cnCnyFen <= pMax * 100)
-  if (dMin != null || dMax != null) {
-    const asPercent = f.diffType === 'percent'
-    rows = rows.filter((r) => {
-      const base = code && r.regionDiff != null ? r.regionDiff : r.b.diffFen
-      if (asPercent) {
-        // 百分比口径：差价相对国区价的百分数；国区无价则无从计比
-        if (r.b.cnCnyFen == null || r.b.cnCnyFen <= 0) return false
-        const pct = (base / r.b.cnCnyFen) * 100
-        if (dMin != null && pct < dMin) return false
-        if (dMax != null && pct > dMax) return false
-        return true
-      }
-      if (dMin != null && base < dMin * 100) return false
-      if (dMax != null && base > dMax * 100) return false
-      return true
-    })
-  }
-  if (f.giftOnly) rows = rows.filter((r) => isBundleGiftable(r.b))
-  if (sortBy.value === 'discount') {
-    // 折扣力度：现折扣% 降序（选区=该区折扣，未选区=全区最大），同折扣按差价
-    rows = [...rows].sort(
-      (a, b) => discountOf(b.b) - discountOf(a.b) || b.b.diffFen - a.b.diffFen,
-    )
-  } else if (code && sortBy.value === 'diff') {
-    rows = [...rows].sort((a, b) => (b.regionDiff ?? -Infinity) - (a.regionDiff ?? -Infinity))
-  } else if (code && sortBy.value === 'smart') {
-    // 选区重锚：省钱因子按该区差价重算，其余三因子不变（真·因子驱动重排；
-    // 未选区保持服务端评分序——同一公式，二者等价）
-    rows = [...rows].sort(
-      (a, b) => anchoredSmart(b.b, b.regionDiff) - anchoredSmart(a.b, a.regionDiff),
-    )
-  }
-  const q = committedSearch.value
-  if (q) rows = rows.filter((r) => r.b.name.toLowerCase().includes(q))
-  return rows.map((r) => r.b)
-})
-const visibleBundles = computed(() => filteredBundles.value.slice(0, renderLimit.value))
-const completableCount = computed(
-  () => filteredBundles.value.filter((b) => b.mustPurchaseAsSet === 0).length,
-)
+const PAGE_SIZE = 120
+const visibleBundles = bundles
+const hasListFilters = computed(() => Boolean(committedSearch.value || region.value || activeFilterCount.value))
 
 function commitSearch() {
   committedSearch.value = searchInput.value.trim().toLowerCase()
-  renderLimit.value = RENDER_STEP
 }
 
 /** 清除搜索与筛选（「没有匹配」空态的出路）：搜索词 + 全部筛选回默认 */
@@ -291,21 +204,14 @@ function clearAllFilters() {
   resetFilters()
 }
 
-// ─── 滚动自动续批 ───
-// 哨兵进入视口下缘 200px 预判区即扩一批渲染。捆绑包数据全量已在前端，扩批
-// 不重新取列表；新进窗口的包会补拉一次归属（见 loadOwnership）。观察根是
-// 页面滚动容器 .view-container，网格与列表两种布局共用同一哨兵。
 const sentinel = ref<HTMLElement | null>(null)
 let observer: IntersectionObserver | null = null
 let scrollEl: HTMLElement | null = null
 
-const hasMoreToRender = computed(
-  () => filteredBundles.value.length > visibleBundles.value.length,
-)
+const hasMoreToRender = computed(() => nextOffset.value < total.value)
 
 function handleObserver(entries: IntersectionObserverEntry[]) {
-  const [entry] = entries
-  if (entry?.isIntersecting && hasMoreToRender.value) renderLimit.value += RENDER_STEP
+  if (entries[0]?.isIntersecting && hasMoreToRender.value && !moreError.value) void loadMore()
 }
 
 function setupObserver() {
@@ -320,27 +226,6 @@ function setupObserver() {
 }
 
 watch(sentinel, () => setupObserver())
-
-// ─── 排序因子（与 games/scoring 同式，前端可算的都在这）───
-/** 省钱因子（games/scoring.save_score 同式）：diffFen 分 → 元，对数压缩 ¥200 封顶 */
-function saveScore(diffFen: number): number {
-  const yuan = Math.max(0, diffFen) / 100
-  return Math.min(1, Math.log1p(yuan / 20) / Math.log(11))
-}
-/** smart 评分的地区无关余量 = 评分 − save(快照差价)，即质量+时机+熟悉度三因子和 */
-function smartRest(b: BundleSummary): number {
-  return Math.max(0, (b.smartScore || 0) - saveScore(b.diffFen))
-}
-/** 选区视角的 smart 评分：省钱因子按该区差价重算，其余三因子与地区无关 */
-function anchoredSmart(b: BundleSummary, regionDiff: number | null): number {
-  return saveScore(regionDiff ?? 0) + smartRest(b)
-}
-/** 折扣力度因子：选区 = 该区现折扣%；未选区 = 各区最大现折扣 */
-function discountOf(b: BundleSummary): number {
-  const code = region.value.toUpperCase()
-  if (!code) return maxDiscount(b)
-  return b.regionPrices[code]?.discountPercent || 0
-}
 
 // ─── 布局模式（对齐游戏商店：网格 ⊞ / 列表 ☰，持久化）───
 // 列表行 = 封面 128×60 + 名称标签 + 国区价 / 最低区 / 差价单行铺开，
@@ -366,8 +251,6 @@ let undoTimer: ReturnType<typeof setTimeout> | null = null
 function toggleRemovedView() {
   removedView.value = !removedView.value
   undoBid.value = null
-  renderLimit.value = RENDER_STEP
-  void load()
 }
 
 async function onToggleFollow(b: BundleSummary) {
@@ -379,6 +262,7 @@ async function onToggleFollow(b: BundleSummary) {
     if (wasFollowed) next.delete(b.bundleId)
     else next.add(b.bundleId)
     followedIds.value = next
+    await load(true)
   } catch {
     message.error(t('bundles.follow.fail'))
   }
@@ -400,6 +284,7 @@ async function onRemoveCard(b: BundleSummary) {
   undoTimer = setTimeout(() => {
     undoBid.value = null
   }, 6000)
+  await load(true)
 }
 
 async function undoRemove() {
@@ -429,6 +314,7 @@ async function onRestoreCard(b: BundleSummary) {
   }
   bundles.value = bundles.value.filter((x) => x.bundleId !== b.bundleId)
   message.success(t('bundles.restored.toast', { n: 1 }))
+  await load(true)
 }
 
 /** 卡片差价角标：未选区 = 服务端快照 diffFen（对全区最低）；选区 = 该区相对
@@ -441,13 +327,11 @@ function diffOf(b: BundleSummary): number {
   return Math.max(b.cnCnyFen - rp.cnyFen, 0)
 }
 
-async function selectSort(key: BundleSortKey) {
+function selectSort(key: BundleSortKey) {
   showSortMenu.value = false
   if (key === sortBy.value) return
   sortBy.value = key
   localStorage.setItem(`${APP_SLUG}.bundles.sort`, key)
-  renderLimit.value = RENDER_STEP
-  await load()
 }
 
 function onDocClick(e: MouseEvent) {
@@ -492,83 +376,71 @@ async function fetchOwnership(appids: number[]): Promise<boolean> {
   return landed
 }
 
-/** 归属数据补齐：只取**当前已挂载窗口**的包。
-    全量摊平所有包的 appid 是双输——摊平本身要逐个触碰响应式代理，结果还必然
-    被服务端 200 上限截断，命中的是「数组前 200 个 appid」而不是「屏幕上那几屏
-    的包」。改按已挂载窗口取；续批后新进窗口的包由 visibleBundles 的 watcher
-    增量补拉。 */
-async function loadOwnership() {
-  const need = new Set<number>()
-  for (const b of visibleBundles.value) {
-    for (const appid of b.appIds) {
-      if (!ownershipMap.value[appid]) need.add(appid)
+let lastListLoadedAt = 0
+const RELOAD_SKIP_MS = 10 * 60 * 1000
+let listRequest = 0
+const listQuery = computed<BundleListQuery>(() => {
+  const f = filters.value
+  const numeric = (value: string) => value.trim() !== '' && Number.isFinite(Number(value)) ? Number(value) : undefined
+  return {
+    sort: sortBy.value, removed: removedView.value, query: committedSearch.value,
+    region: region.value, region_mode: regionMode.value,
+    followed_only: f.followedOnly, completable_only: f.completableOnly,
+    cn_lowest_only: f.cnLowestOnly, only_discounted: f.onlyDiscounted,
+    hide_owned: f.hideOwned, hide_family: f.hideFamily, gift_only: f.giftOnly,
+    price_min: numeric(f.priceMin), price_max: numeric(f.priceMax),
+    diff_min: numeric(f.diffMin), diff_max: numeric(f.diffMax), diff_type: f.diffType,
+  }
+})
+
+async function load(silent = false, append = false) {
+  if (append && (loading.value || loadingMore.value || !hasMoreToRender.value)) return
+  const request = ++listRequest
+  if (append) loadingMore.value = true
+  else {
+    loadingMore.value = false
+    if (!silent) loading.value = true
+    errorMsg.value = ''
+    detailCache.clear()
+    if (!removedView.value) void loadFollows()
+  }
+  moreError.value = ''
+  try {
+    const res = await bundlesApi.list({ ...listQuery.value, offset: append ? nextOffset.value : 0, limit: PAGE_SIZE })
+    if (request !== listRequest) return
+    const existing = new Set(append ? bundles.value.map((b) => b.bundleId) : [])
+    bundles.value = [...(append ? bundles.value : []), ...res.bundles.filter((b) => !existing.has(b.bundleId))]
+    ownershipByBid.value = { ...(append ? ownershipByBid.value : {}), ...Object.fromEntries(
+      res.bundles.map((b) => [b.bundleId, b.ownership ?? { type: null, account: null }]),
+    ) }
+    total.value = res.total
+    completableCount.value = res.completableCount
+    nextOffset.value = res.offset + res.bundles.length
+    lastListLoadedAt = Date.now()
+  } catch (e) {
+    if (request !== listRequest) return
+    const error = e instanceof Error ? e.message : String(e)
+    if (append) moreError.value = error
+    else if (!silent) errorMsg.value = error
+  } finally {
+    if (request === listRequest) {
+      loading.value = false
+      loadingMore.value = false
     }
   }
-  if (need.size === 0) return
-  if (await fetchOwnership([...need])) refreshOwnershipBadges(visibleBundles.value)
 }
 
-/** 重算指定包的撞库结论，并入 ownershipByBid（增量，不重扫全量）。
-    未被覆盖的包不出徽章——归属是卡片附加状态，缺失时不冒充结论。 */
-function refreshOwnershipBadges(targets: BundleSummary[]) {
-  const next = { ...ownershipByBid.value }
-  for (const b of targets) {
-    next[b.bundleId] = inferBundleOwnership(b.appIds, null, ownershipMap.value)
-  }
-  ownershipByBid.value = next
+async function loadMore() {
+  await load(false, true)
 }
 
-/** silent = 静默保鲜（keep-alive 切回时）：不闪骨架屏、不重置渲染批数，
- *  失败保留原数据不把页面打成错误态 */
-let lastListLoadedAt = 0
-/** 切回保鲜节流：列表数据只在刷新链尾/汇率/用户动作时变化（小时级），
- *  全量载荷的重复取回+解析会把每次切页卡出可感顿挫——窗口内的切回直接
- *  用保留的卡片；关注/移除/切排序等动作路径不受此窗约束照常拉取 */
-const RELOAD_SKIP_MS = 10 * 60 * 1000
-
-async function load(silent = false) {
-  if (!silent) {
-    loading.value = true
-    errorMsg.value = ''
-  }
-  // 星标与列表互不依赖：并发发出，不排进首屏关键路径。
-  // 归属（撞库徽章数据）同样不是列表可用性的前置——由 visibleBundles 的
-  // watcher 在列表落地后按窗口增量补，骨架屏只等列表这一件事。
-  if (!removedView.value) void loadFollows()
-  try {
-    const res = await bundlesApi.list(sortBy.value, removedView.value)
-    bundles.value = res.bundles
-    lastListLoadedAt = Date.now()
-    if (!silent) renderLimit.value = RENDER_STEP
-  } catch (e) {
-    if (!silent) errorMsg.value = e instanceof Error ? e.message : String(e)
-  } finally {
-    loading.value = false
-  }
-}
-
-/* 挂载窗口变化（续批 / 换筛选 / 换地区）后，为新进窗口的包补拉归属。
-   窗口内容不变时是一次空转扫描；已在 ownershipMap 里的 appid 不重复请求。 */
-watch(visibleBundles, () => {
-  void loadOwnership()
-})
+watch(listQuery, () => { void load() })
 
 /** 差价降幅角标：各区折扣最大值 */
 function maxDiscount(b: BundleSummary): number {
   return Math.max(0, ...Object.values(b.regionPrices).map((r) => r.discountPercent || 0))
 }
 
-/** 任一外区与国区间可互送（canGift：双方有价且未锁区即可，新政策不限倍率） */
-function isBundleGiftable(b: BundleSummary): boolean {
-  const cn = b.cnCnyFen
-  if (cn == null || cn <= 0) return false
-  return Object.entries(b.regionPrices).some(([rpCode, rp]) => {
-    if (rpCode === 'CN') return false
-    return canGift(cn, rp.cnyFen) || canGift(rp.cnyFen, cn)
-  })
-}
-
-/** Unix 秒 → YYYY-MM-DD（ISO 文本中英同形，与游戏卡 formatDateTs 同口径） */
 function fmtTsDate(ts: number): string {
   const d = new Date(ts * 1000)
   const pad = (n: number) => String(n).padStart(2, '0')
@@ -766,8 +638,6 @@ async function ensureOwnershipForGames(games: BundleGame[]) {
   if (!need.length) return
   // 归属数据缺失时徽章不渲染，不阻断抽屉
   if (!(await fetchOwnership(need))) return
-  const open = drawerBundle.value
-  if (open) refreshOwnershipBadges([open])
 }
 
 /** 再点同包收回（抽屉开合开关语义）。
@@ -1127,8 +997,8 @@ onBeforeUnmount(() => {
         </div>
 
         <span class="stats">
-          {{ t('bundles.head.total', { n: filteredBundles.length }) }}
-          <template v-if="filteredBundles.length > 0">
+          {{ t('bundles.head.total', { n: total }) }}
+          <template v-if="total > 0">
             {{ t('bundles.head.completable', { n: completableCount }) }}
           </template>
         </span>
@@ -1286,15 +1156,15 @@ onBeforeUnmount(() => {
       </div>
     </HlEmpty>
     <HlSkeleton v-else-if="loading" variant="card" :count="8" />
-    <HlEmpty v-else-if="bundles.length === 0 && removedView" icon="">
+    <HlEmpty v-else-if="total === 0 && removedView && !hasListFilters" icon="">
       <h3>{{ t('bundles.removed.empty') }}</h3>
       <p>{{ t('bundles.removed.emptyHint') }}</p>
     </HlEmpty>
-    <HlEmpty v-else-if="bundles.length === 0" icon="">
+    <HlEmpty v-else-if="total === 0 && !hasListFilters" icon="">
       <h3>{{ t('bundles.empty.noData') }}</h3>
       <p>{{ t('bundles.empty.noDataHint') }}</p>
     </HlEmpty>
-    <HlEmpty v-else-if="filteredBundles.length === 0" icon="">
+    <HlEmpty v-else-if="total === 0" icon="">
       <h3>{{ t('bundles.empty.noMatch') }}</h3>
       <p>{{ t('bundles.empty.filterHint') }}</p>
       <div class="bundles-empty-actions">
@@ -1607,8 +1477,12 @@ onBeforeUnmount(() => {
     </template>
 
     <!-- 无限滚动哨兵：接近底部自动续批，网格/列表两种布局共用 -->
-    <div v-if="!errorMsg && !loading && filteredBundles.length > 0" ref="sentinel" class="loading-sentinel">
-      <template v-if="hasMoreToRender">
+    <div v-if="!errorMsg && !loading && total > 0" ref="sentinel" class="loading-sentinel">
+      <template v-if="moreError">
+        <span>{{ moreError }}</span>
+        <HlButton size="sm" @click="loadMore">{{ t('common.retry') }}</HlButton>
+      </template>
+      <template v-else-if="hasMoreToRender">
         <HlSpinner />
         {{ t('bundles.list.loadingMore') }}
       </template>

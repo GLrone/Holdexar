@@ -624,6 +624,46 @@ async function toggleBackupAuto(on: boolean) {
   }
 }
 
+/* ── MCP 服务（外部 AI 接入面）：开关 + 运行态 + 接入说明 ── */
+const mcpEnabled = ref(false)
+const mcpRunning = ref(false)
+const mcpError = ref('')
+const mcpForced = ref(false)
+const mcpToggling = ref(false)
+const mcpHelpOpen = ref(false)
+
+function applyMcpPayload(data: SettingsPayload) {
+  mcpEnabled.value = data.mcp_enabled
+  mcpRunning.value = data.mcp_running
+  mcpError.value = data.mcp_error
+  mcpForced.value = data.mcp_forced_by_env
+}
+
+const mcpStatusText = computed(() => {
+  if (mcpRunning.value) return t('settings.mcp.statusRunning')
+  if (mcpError.value) return t('settings.mcp.statusFailed', { reason: mcpError.value })
+  return t('settings.mcp.statusOff')
+})
+
+const mcpStatusTone = computed<'ok' | 'bad' | 'warn'>(() => {
+  if (mcpRunning.value) return 'ok'
+  if (mcpError.value) return 'bad'
+  return 'warn'
+})
+
+async function toggleMcp(on: boolean) {
+  if (mcpToggling.value || mcpForced.value) return
+  mcpToggling.value = true
+  try {
+    applyMcpPayload(await settingsApi.update({ mcp_enabled: on }))
+    message.success(t(on ? 'settings.mcp.onPost' : 'settings.mcp.offPost'))
+  } catch {
+    message.error(t('settings.update.switchFailed'))
+  } finally {
+    mcpToggling.value = false
+  }
+}
+
 async function load() {
   loading.value = true
   errorMsg.value = ''
@@ -637,6 +677,7 @@ async function load() {
     steamId.value = data.account.steam_id
     apiKeyMasked.value = data.account.steam_api_key
     hasApiKey.value = data.account.has_api_key
+    applyMcpPayload(data)
   } catch (e) {
     errorMsg.value = e instanceof Error ? e.message : String(e)
   } finally {
@@ -2199,6 +2240,52 @@ onUnmounted(stopLoginPolling)
         </div>
       </div>
 
+      <!-- MCP 服务：外部 AI 客户端接入面（默认关闭；写入即运行时启停） -->
+      <div class="card settings-card" data-section="settings.section.mcp">
+        <div class="section-title">{{ t('settings.section.mcp') }}</div>
+        <div class="section-desc">{{ t('settings.mcp.desc') }}</div>
+
+        <div class="settings-row">
+          <div class="settings-row__line">
+            <HlSwitch
+              :model-value="mcpForced ? mcpRunning : mcpEnabled"
+              accent
+              :disabled="mcpToggling || mcpForced"
+              :label="t('settings.mcp.enabledLabel')"
+              :title="mcpForced ? t('settings.mcp.forcedHint') : t('settings.mcp.enabledHint')"
+              @update:model-value="toggleMcp"
+            />            <span class="mcp-status" :class="`is-${mcpStatusTone}`">
+              <span class="mcp-status__dot" />
+              {{ mcpStatusText }}
+            </span>
+            <HlButton art="outline" tone="blue" size="sm" @click="mcpHelpOpen = true">
+              {{ t('settings.mcp.help') }}
+            </HlButton>
+          </div>
+          <div class="section-desc">
+            {{ mcpForced ? t('settings.mcp.forcedHint') : t('settings.mcp.enabledHint') }}
+          </div>
+        </div>
+
+        <HlDialog v-model="mcpHelpOpen" :title="t('settings.mcp.helpTitle')" width="560px">
+          <div class="mcp-help">
+            <div class="mcp-help__row">
+              <span class="mcp-help__label">{{ t('settings.mcp.helpEndpoint') }}</span>
+              <code>/api/v1/mcp</code>
+            </div>
+            <div class="mcp-help__row">
+              <span class="mcp-help__label">{{ t('settings.mcp.helpToken') }}</span>
+              <code>mcp-token</code>
+            </div>
+            <div class="mcp-help__row">
+              <span class="mcp-help__label">{{ t('settings.mcp.helpBridge') }}</span>
+              <code>python -m app.domains.agent.mcp_stdio</code>
+            </div>
+            <div class="section-desc">{{ t('settings.mcp.helpNote') }}</div>
+          </div>
+        </HlDialog>
+      </div>
+
       <!-- 产品导览：首次启动自动展示过，这里手动重开（幂等） -->
       <div class="card settings-card" data-section="settings.section.tour">
         <div class="section-title">{{ t('settings.section.tour') }}</div>
@@ -2790,6 +2877,46 @@ onUnmounted(stopLoginPolling)
 }
 .notify-status.is-bad .notify-status__dot {
   background: var(--danger);
+}
+.mcp-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  margin-left: 12px;
+}
+.mcp-status__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-secondary);
+  flex-shrink: 0;
+}
+.mcp-status.is-ok .mcp-status__dot {
+  background: var(--rate-good);
+}
+.mcp-status.is-bad .mcp-status__dot {
+  background: var(--danger);
+}
+.mcp-help {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.mcp-help__row {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  font-size: 13px;
+}
+.mcp-help__row code {
+  font-size: 12px;
+}
+.mcp-help__label {
+  color: var(--text-secondary);
+  flex-shrink: 0;
+  min-width: 88px;
 }
 .pilot-model-list {
   display: flex;

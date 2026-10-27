@@ -14,6 +14,8 @@ export interface VersionLike {
   subId: number | null
   suffix: string | null
   isGold: boolean
+  /** 商品归属：unknown=商品身份未知（社区源独立序列，不并入标准版） */
+  product?: 'standard' | 'sub' | 'unknown'
 }
 
 /** 可选条目：subId 缺失的行选不了，排除在列表之外 */
@@ -21,8 +23,13 @@ export interface SelectableVersion extends VersionLike {
   subId: number
 }
 
+/** 商品身份未知序列（社区历史源；无 sub/版本/金版字段但不是标准版） */
+export function isUnknownVersion(v: VersionLike): boolean {
+  return v.product === 'unknown'
+}
+
 export function isStandardVersion(v: VersionLike): boolean {
-  return !v.suffix && !v.isGold
+  return !v.suffix && !v.isGold && !isUnknownVersion(v)
 }
 
 /** 非标准版且 subId 可用的条目 */
@@ -52,17 +59,22 @@ export function versionLabels(
   return labels
 }
 
-/** 版本下拉选项：首项固定「标准版」（value 0 = 请求侧缺省 subId），其后为各变体 */
+/** 版本下拉选项：首项固定「标准版」（value 0 = 请求侧缺省 subId），其后为
+ *  各变体；存在商品身份未知序列时追加显式「版本未识别」项（value -1） */
 export function versionSelectOptions(
   list: VersionLike[],
   t: (key: MessageKey) => string,
 ): HlSelectOption[] {
   const labels = versionLabels(list, t)
-  return [
+  const options: HlSelectOption[] = [
     { value: 0, label: t('trendDrawer.version.standard') },
     ...selectableVariants(list).map((v) => ({
       value: v.subId,
       label: labels.get(v.subId) ?? `#${v.subId}`,
     })),
   ]
+  if (list.some(isUnknownVersion)) {
+    options.push({ value: -1, label: t('trendDrawer.version.unknown') })
+  }
+  return options
 }

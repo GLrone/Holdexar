@@ -172,6 +172,14 @@ export interface SettingsPayload {
   update_auto: boolean
   /** 直连模式加速器建议弹窗已看过：false = 首次使用直连（自动弹一次） */
   direct_notice_seen: boolean
+  /** MCP 服务开关值（KV）；运行态见 mcp_running / mcp_error / mcp_forced_by_env */
+  mcp_enabled: boolean
+  /** MCP 会话管理器是否在役（真实运行态，非开关值） */
+  mcp_running: boolean
+  /** MCP 启用失败原因（空串 = 无故障） */
+  mcp_error: string
+  /** 环境变量强制开启（界面开关不可用） */
+  mcp_forced_by_env: boolean
 }
 
 // ─── regions（区服元数据单一来源：服务端下发，前端零硬编码）───
@@ -257,6 +265,8 @@ export const settingsApi = {
     update_auto?: boolean
     /** 直连模式加速器建议弹窗已看过 */
     direct_notice_seen?: boolean
+    /** MCP 服务开关（写入即运行时启停） */
+    mcp_enabled?: boolean
   }) => request<SettingsPayload>('PUT', '/settings', payload),
   getFetch: () => request<FetchSettingsPayload>('GET', '/settings/fetch'),
   updateFetch: (payload: Partial<FetchSettingsPayload>) =>
@@ -788,8 +798,11 @@ export const pilotApi = {
     }>('POST', '/pilot/proposal/confirm', { session_id: sessionId, pid, approve }),
 }
 
-/** 运行账本（agent 域）：后台任务的只读投影 + 取消。与调度器同一事实源 */
+/** 后台任务的只读汇总与停止请求。 */
 export const agentApi = {
+  /** 两种价格动作的固定名称。 */
+  listTasks: () =>
+    request<{ kind: string; label: string }[]>('GET', '/agent/tasks', undefined, { noCache: true }),
   /** 最近运行列表（新→旧）；status 给定时按状态过滤 */
   listRuns: (status?: string, limit = 20) =>
     request<{ items: AgentRunView[] }>(
@@ -807,13 +820,13 @@ export const agentApi = {
     ),
 }
 
-/** 运行账本一行（agent_runs 投影）；runner=job 为调度任务，fake/task 为运行面自证 */
+/** 一条后台运行记录，价格运行直接读取域记录。 */
 export interface AgentRunView {
   run_id: string
   session_id: string
   runner: string
   trigger: string
-  /** job 型：{ job, entry, task?, ref? }；fake 型：{ scenario, steps, step_delay } */
+  /** 含任务名、域状态、原始进度与可停止标记。 */
   meta: Record<string, unknown> | null
   status: string
   error_code: string | null
@@ -1419,7 +1432,7 @@ export interface PriceCoverage {
 
 /** 价格数据状态。观察时间/新鲜度是**价格**维度，与 updatedAt（实体更新时间）不同源 */
 export interface PriceData {
-  /** 价格观察时刻（ISO，本对象价格行的 MAX(updated_at)）；null = 尚无价格行 */
+  /** 启用地区中最旧的成功观察时刻 */
   observedAt: string | null
   /** 距现在的时长（小时） */
   ageHours: number | null
@@ -1427,6 +1440,17 @@ export interface PriceData {
   freshness: 'fresh' | 'lagging' | 'stale' | null
   /** null = 不属本轮期望集（无 Cycle 归属，不冒充 100%） */
   coverage: PriceCoverage | null
+  regions?: Record<string, {
+    status: string
+    outcome: 'success' | 'failed' | 'notAttempted'
+    answer: string | null
+    lastSuccessAt: string | null
+    lastAttemptAt: string | null
+    ageHours: number | null
+    freshness: 'fresh' | 'lagging' | 'stale' | null
+    pending: boolean
+    needsUpdate: boolean
+  }>
 }
 
 /** 捆绑包价格数据状态：与 PriceData 同口径（观察时刻/新鲜度分档），无
@@ -1506,6 +1530,8 @@ export interface GameVersion {
   suffix: string | null
   isGold: boolean
   subId: number | null
+  /** 商品归属标注：standard=标准版 / sub=具体变体 / unknown=商品身份未知（社区源独立序列） */
+  product?: 'standard' | 'sub' | 'unknown'
 }
 
 /** 截至某日的价格上下文条目（单查与批量共用）；无有效快照时两值均 null */
@@ -1589,6 +1615,7 @@ export interface BundleSummary {
   /** smart 四因子评分（服务端预计算，0~1）。选区重锚排序用：
       save(该区差价) + (smartScore − save(diffFen)) 即该区视角的评分 */
   smartScore: number
+  ownership?: { type: 'owned' | 'family' | null; account: string | null }
   /** 价格数据状态（观察时刻/新鲜度，与游戏卡同口径）；列表聚合是缓存载荷，
       ageHours/freshness 冻结在构建时刻——展示期以 observedAt 现算为准 */
   priceData?: BundlePriceData | null
@@ -1660,6 +1687,15 @@ export interface HistoryPayload {
   lowestHits?: number
   /** 该 appid+region 库内 distinct 版本（下拉数据源；标准版 = suffix null 且非 gold，排首位） */
   versions?: GameVersion[]
+  /** 社区历史源回填的最小同步状态（行为状态，非事实） */
+  backfill?: HistoryBackfillState
+}
+
+/** 历史回填同步状态（GET history 附带；POST /history/backfill 派发） */
+export interface HistoryBackfillState {
+  state: 'idle' | 'running' | 'ok' | 'empty' | 'error'
+  lastOkAt: string | null
+  lastError: string | null
 }
 
 /** 版本 × 地区最新价（走势抽屉「全部版本」区块，/games/{appid}/versions） */
@@ -1748,10 +1784,16 @@ export const gamesApi = {
     request<GameDetail>('GET', `/games/${appid}`),
   // days 默认 0 = 全部时间：服务端按 sub 代际取并集，前端时间窗只在图表端开窗
   // （预设 365 会让调用方静默拿到截断序列——正是「库里更早有数据」那类投诉的来源）
-  history: (appid: number | string, region = 'cn', days = 0, subId?: number) =>
+  history: (appid: number | string, region = 'cn', days = 0, subId?: number, product?: 'unknown') =>
     request<HistoryPayload>(
       'GET',
-      `/games/${appid}/history${toQuery({ region, days, subId })}`,
+      `/games/${appid}/history${toQuery({ region, days, subId, product })}`,
+    ),
+  // 历史回填：无历史时派发一次后台采集（同键在飞服务端直接返回运行态）
+  historyBackfill: (appid: number | string, region = 'cn') =>
+    request<{ started: boolean; state: string }>(
+      'POST',
+      `/games/${appid}/history/backfill${toQuery({ region })}`,
     ),
   versions: (appid: number | string) =>
     request<{ versions: GameVersionPrices[] }>('GET', `/games/${appid}/versions`),
@@ -1787,14 +1829,43 @@ export const gamesApi = {
 
 // ─── bundles（捆绑包浏览视图：列表聚合 + 补齐计算详情） ──────────────────
 
+export interface BundleListQuery {
+  sort?: 'diff' | 'smart' | 'discount'
+  offset?: number
+  limit?: number
+  removed?: boolean
+  query?: string
+  region?: string
+  region_mode?: 'all' | 'cheaper' | 'locked'
+  followed_only?: boolean
+  completable_only?: boolean
+  cn_lowest_only?: boolean
+  only_discounted?: boolean
+  gift_only?: boolean
+  hide_owned?: boolean
+  hide_family?: boolean
+  price_min?: number
+  price_max?: number
+  diff_min?: number
+  diff_max?: number
+  diff_type?: 'absolute' | 'percent'
+}
+
+export interface BundleListPage {
+  bundles: BundleSummary[]
+  total: number
+  completableCount: number
+  offset: number
+  limit: number
+}
+
 export const bundlesApi = {
-  /** 全量捆绑包（sort=diff 差价降序 | smart 智能评分降序，服务端预计算列；
-   *  discount 折扣力度由前端排序，服务端按 diff 出底序）。
-   *  removed=true 只出已移除/已排除的包（恢复视图） */
-  list: (sort: 'diff' | 'smart' | 'discount' = 'diff', removed = false) =>
-    request<{ bundles: BundleSummary[] }>(
+  list: (params: BundleListQuery = {}) =>
+    request<BundleListPage>(
       'GET',
-      `/bundles${toQuery({ sort, removed: removed || undefined })}`,
+      `/bundles${toQuery(params as Record<string, unknown>)}`,
+      undefined,
+      { noCache: true },
     ),
   /** 单包详情：列表字段 + 包内游戏各区现价（补齐计算求和用） */
   detail: (bundleId: number | string) =>
@@ -2203,6 +2274,8 @@ export interface UpdateProgress {
 export interface UpdatePending {
   pending: boolean
   tag?: string
+  /** 当前运行版本正在验收，等待换装提交诊断 */
+  installing?: boolean
   /** 上次换装失败已回滚（前端给「重新下载」出路的依据） */
   swapFailed?: boolean
   /** 刚刚完成换装并首次启动（弹窗提醒升级成功） */
@@ -2520,7 +2593,6 @@ export const proxiesApi = {
       total: number
       usedCache: boolean
       restarted: boolean
-      prunedLedger: number
       /** 订阅有效且重拉时处于默认直连：已自动切到代理优先 */
       strategySwitched?: boolean
     }>('POST', `/proxies/subscriptions/${id}/sync`),
