@@ -199,7 +199,7 @@ def resolve_data_dir(slug: str = APP_SLUG, env_prefix: str = ENV_PREFIX) -> Path
             res = resolve_data_dir_conflict(target, old_dir, slug)
             if not res.get("completed"):
                 raise PermissionError(
-                    f"检测到数据库损坏且自动恢复失败，已停止启动以保护数据：{target} 与 {old_dir}"
+                    f"两处存在独立数据，均已保留，已停止启动以避免覆盖：{target} 与 {old_dir}"
                 )
         elif locs.get("hasAppdataDb") and old_dir and not db_file.is_file():
             result = migrate_appdata_to_portable(old_dir, target, slug)

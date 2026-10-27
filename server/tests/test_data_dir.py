@@ -218,7 +218,9 @@ def test_frozen_existing_machine_db_migrates_to_portable(fake_env, monkeypatch):
     assert resolved == target_data
     assert (target_data / paths.data_dir_filename()).is_file()
     assert (target_data / "migration.json").is_file()
-    assert not machine.exists()  # C 盘历史目录在校验无误后自动清理
+    assert db_path.is_file()
+    with sqlite3.connect(db_path) as source:
+        assert source.execute("SELECT note FROM test_data").fetchall() == [("legacy_appdata",)]
 
 
 def test_frozen_app_dir_readonly_raises_permission_error(fake_env, monkeypatch):

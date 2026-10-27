@@ -283,6 +283,14 @@ def detect_installed_version(target: Path) -> str | None:
 
 
 def get_version_dir(install_root: Path, version: str) -> Path:
+    name = version.rstrip(" .") if os.name == "nt" else version
+    if not is_managed_version_name(name):
+        raise ValueError("版本目录名称无效")
+    root = install_root.resolve()
+    versions = root / VERSIONS_DIR_NAME
+    target = versions / version
+    if versions.resolve() != versions or target.resolve() != versions / name:
+        raise ValueError("版本目录超出受管安装位置")
     return install_root / VERSIONS_DIR_NAME / version
 
 
@@ -317,21 +325,30 @@ def same_version_directory(install_root: Path, first: str, second: str) -> bool:
 
 
 def get_version_exe(install_root: Path, version: str) -> Path:
-    return get_version_dir(install_root, version) / f"{APP_NAME}.exe"
+    directory = get_version_dir(install_root, version)
+    exe = directory / f"{APP_NAME}.exe"
+    if exe.resolve() != directory.resolve() / f"{APP_NAME}.exe":
+        raise ValueError("版本程序超出受管版本目录")
+    return exe
 
 
 def is_version_valid(install_root: Path, version: str) -> bool:
     """验证版本目录及其主可执行文件是否完整存在。"""
     if not is_managed_version_name(version):
         return False
-    vdir = get_version_dir(install_root, version)
-    if not vdir.is_dir():
-        return False
-    exe = get_version_exe(install_root, version)
-    if not exe.is_file():
-        return False
-    internal = vdir / "_internal"
-    if internal.exists() and not (internal.is_dir() and any(internal.iterdir())):
+    try:
+        vdir = get_version_dir(install_root, version)
+        if not vdir.is_dir():
+            return False
+        exe = get_version_exe(install_root, version)
+        if not exe.is_file():
+            return False
+        internal = vdir / "_internal"
+        if internal.resolve() != vdir.resolve() / "_internal":
+            return False
+        if internal.exists() and not (internal.is_dir() and any(internal.iterdir())):
+            return False
+    except (OSError, ValueError, RuntimeError):
         return False
     return True
 
