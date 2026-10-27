@@ -484,10 +484,14 @@ def _install_navigation_guard(window, app_url: str) -> None:
         pass
 
 
-def _wait_and_navigate(window, app_url: str) -> None:
-    """health 就绪后把窗口从内联等待页切到真实应用（webview.start 后的
-    后台线程）。90s 未就绪不在此处理——watchdog 线程负责弹窗报错，本线程
-    停止轮询即可，窗口停在转圈页。"""
+def _wait_and_navigate(window, app_url: str, splash_rendered: threading.Event | None = None) -> None:
+    """等待内联页完成首绘且 health 就绪后平滑切到真实应用。
+
+    防过早跳转：等待页 DOM/CSS 首绘完成前不发起新导航，避免 WebView2
+    丢弃首绘回退到纯深蓝空白底色。
+    """
+    if splash_rendered is not None:
+        splash_rendered.wait(timeout=5.0)
     if _wait_health(HEALTH_TIMEOUT):
         _install_navigation_guard(window, app_url)
         try:
@@ -1835,10 +1839,26 @@ def _run_tray(window) -> None:
             _tray_state["tray"] = None
 
 
+def _apply_native_styling(window) -> None:
+    """WinForms 宿主与 WebView2 控件原生暗色背景注入。"""
+    try:
+        from System.Drawing import ColorTranslator
+        from webview.platforms.winforms import BrowserView
+
+        form = BrowserView.instances.get(window.uid)
+        if form:
+            dark_color = ColorTranslator.FromHtml("#1b2838")
+            form.BackColor = dark_color
+            for c in form.Controls:
+                c.BackColor = dark_color
+                if hasattr(c, "DefaultBackgroundColor"):
+                    c.DefaultBackgroundColor = dark_color
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _open_window(app_url: str) -> None:
-    """开主窗。首载内联等待页（零网络依赖，见 _SPLASH_HTML），health 就绪
-    后由 _wait_and_navigate 切到 app_url；窗口不可用时浏览器兜底直接开
-    app_url（等待页是进程内 HTML，系统浏览器里无意义，兜底必须走真实地址）。"""
+    """开主窗。就绪前首绘内联等待页并在首绘与 health 双就绪后平滑切到真实应用。"""
     try:
         import webview
     except ImportError:
@@ -1862,9 +1882,38 @@ def _open_window(app_url: str) -> None:
         # IsTextSelectionEnabled；置 True 后与浏览器一致（拖选 + Ctrl+C）。
         "text_select": True,
         "background_color": "#1b2838",
+        "hidden": True,
     }
     try:
-        window = webview.create_window(WINDOW_TITLE, html=_SPLASH_HTML, **kwargs)
+        backend_already_ready = _server_port_listening() and _wait_health(0.05)
+        target_url = _session_entry_url(app_url) if backend_already_ready else None
+
+        splash_rendered = threading.Event()
+        window_revealed = threading.Event()
+
+        def _reveal_window() -> None:
+            if not window_revealed.is_set():
+                window_revealed.set()
+                try:
+                    window.show()
+                except Exception:
+                    pass
+
+        def _on_loaded() -> None:
+            if not splash_rendered.is_set():
+                splash_rendered.set()
+            _reveal_window()
+
+        if target_url:
+            window = webview.create_window(WINDOW_TITLE, url=target_url, **kwargs)
+            _install_navigation_guard(window, app_url)
+        else:
+            window = webview.create_window(WINDOW_TITLE, html=_SPLASH_HTML, **kwargs)
+
+        window.events.before_show += lambda: _apply_native_styling(window)
+        window.events.loaded += _on_loaded
+        threading.Timer(2.5, _reveal_window).start()
+
         # 关闭窗口按后台设置释放窗口或退出应用。
         window.events.closing += _make_closing_guard(window)
         def closed():
@@ -1880,8 +1929,14 @@ def _open_window(app_url: str) -> None:
             # pywebview 5.x：icon 是 start() 的参数（create_window 无此参，
             # 传了会 TypeError 顶层炸穿兜底）
             start_kwargs["icon"] = icon
+
+        def _on_ready(win, url):
+            if not target_url:
+                threading.Thread(target=_wait_and_navigate, args=(win, url, splash_rendered), daemon=True).start()
+            _run_tray(win)
+
         # 托盘与 health 跳转都在窗口建好后由 start(func) 拉起（时序见 _run_tray）
-        webview.start(_on_window_ready, (window, app_url), **start_kwargs)
+        webview.start(_on_ready, (window, app_url), **start_kwargs)
     except Exception as e:  # noqa: BLE001 —— 窗口创建/渲染层初始化失败一并降级浏览器
         _browser_fallback(app_url, f"窗口初始化失败：{e}")
         return
