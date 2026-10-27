@@ -174,7 +174,7 @@ def run_launcher(
             res = resolve_data_dir_conflict(root / "data", appdata_dir)
             if not res.get("completed"):
                 _show_fatal(
-                    "检测到数据库文件损坏且自动恢复失败，已停止启动以保护数据。\n\n"
+                    "两处存在独立数据，均已保留，已停止启动以避免覆盖。\n\n"
                     f"安装目录数据：{root / 'data'}\n"
                     f"AppData 数据：{appdata_dir}\n"
                 )
@@ -222,13 +222,13 @@ def run_launcher(
 
 
 def _show_fatal(message: str) -> None:
-    """启动器无窗口：失败必须弹系统对话框，否则用户双击后什么都没发生。"""
+    """桌面启动失败显示对话框；无窗口服务仅返回错误。"""
     try:
         print(f"[错误] {message}", file=sys.stderr)
     except Exception:  # noqa: BLE001
         pass
     try:
-        if os.name == "nt":
+        if os.name == "nt" and "--server" not in sys.argv[1:]:
             import ctypes
 
             ctypes.windll.user32.MessageBoxW(0, message, "Holdexar 启动失败", 0x10)

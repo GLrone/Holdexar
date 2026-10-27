@@ -21,6 +21,18 @@ def _create_version(install_root: Path, version: str, has_exe: bool = True) -> P
     return vdir
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows error presentation")
+def test_server_failure_does_not_wait_for_a_desktop_dialog(monkeypatch, capsys):
+    import ctypes
+
+    calls = []
+    monkeypatch.setattr(sys, "argv", ["Holdexar.exe", "--server"])
+    monkeypatch.setattr(ctypes.windll.user32, "MessageBoxW", lambda *args: calls.append(args))
+    launcher._show_fatal("startup rejected")
+    assert calls == []
+    assert "startup rejected" in capsys.readouterr().err
+
+
 def test_find_target_version_normal(tmp_path):
     root = tmp_path / "app"
     _create_version(root, "0.3.5", has_exe=True)
@@ -127,8 +139,7 @@ def test_run_launcher_data_conflict_stops(tmp_path, monkeypatch):
     assert code == 1
 
 
-def test_run_launcher_data_conflict_auto_resolved(tmp_path, monkeypatch):
-    """双库冲突时 Launcher 自动进行仲裁裁决，收编最全库并安全拉起。"""
+def test_run_launcher_independent_data_conflict_preserves_both(tmp_path, monkeypatch):
     import sqlite3
     root = tmp_path / "app"
     _create_version(root, "0.3.5", has_exe=True)
@@ -164,6 +175,7 @@ def test_run_launcher_data_conflict_auto_resolved(tmp_path, monkeypatch):
         },
     )
     launched = []
+    monkeypatch.setattr(launcher, "_show_fatal", lambda msg: None)
     monkeypatch.setattr(
         launcher,
         "launch_version",
@@ -171,10 +183,9 @@ def test_run_launcher_data_conflict_auto_resolved(tmp_path, monkeypatch):
     )
 
     code = launcher.run_launcher(install_root_override=root, detached=False)
-    assert code == 0
-    assert len(launched) == 1
-    assert launched[0][0] == "0.3.5"
-    assert not appdata_dir.exists()
+    assert code == 1
+    assert not launched
+    assert target_db.is_file() and appdata_db.is_file()
 
 
 def test_run_launcher_cleans_old_executables(tmp_path, monkeypatch):
