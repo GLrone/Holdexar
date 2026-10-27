@@ -138,7 +138,6 @@ async def _seed_account(db, steamid=PRIMARY, kinds=None):
         session.add(TrackedAccount(
             steamid=steamid, label=None,
             kinds_json=kinds or {"wishlist": True, "owned": True},
-            item_count=0,
         ))
         await session.commit()
 

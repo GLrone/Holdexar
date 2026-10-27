@@ -10,7 +10,6 @@ from sqlalchemy import func, or_, select
 
 from app.core.app_info import APP_NAME
 from app.core.database import WritePriority, get_session_factory, write_session
-from app.core.database import write_gate
 from app.core.logging import log_event
 from app.crawler.config import APPDETAILS_URL
 from app.crawler.utils import get_beijing_time_obj
@@ -241,6 +240,11 @@ async def check_appids(appids: list[int]) -> list[dict]:
                         GamePriceHistory.appid == alert.appid,
                         GamePriceHistory.region_code == alert.region,
                         GamePriceHistory.price.is_not(None),
+                        # 商品身份未知的行不参与史低判定（未知保持未知）
+                        or_(
+                            GamePriceHistory.product_unknown.is_(False),
+                            GamePriceHistory.product_unknown.is_(None),
+                        ),
                     )
                 )
                 lowest = hist_min.scalar()
@@ -320,7 +324,7 @@ KEY_NEW_LOW_SENT = "alerts.new_low_sent"
 
 
 async def check_new_lows(appids: list[int]) -> list[dict]:
-    """新史低检查：refresh_hl_flags 落库后调用。
+    """新史低检查：update_price_derived 落库后调用。
 
     语义：本轮新史低 = 刚标为 hl_flag=1 的 appids ∩ 全库新史低集 −
     历史已通报集（游标存 app_settings）。命中非空才发信，且**不展示全部**：

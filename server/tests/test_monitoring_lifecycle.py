@@ -436,8 +436,7 @@ async def test_remove_account_recycles_historical_orphans(db):
             )
             session.add(
                 MonitorTarget(
-                    target_type="game", target_id=appid, state="active",
-                    priority=95 if src == "family_wishlist" else 40,
+                    target_type="game", target_id=appid,
                     created_at=now, updated_at=now,
                 )
             )

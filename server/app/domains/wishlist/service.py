@@ -21,7 +21,7 @@ import logging
 from datetime import datetime
 
 import httpx
-from sqlalchemy import delete, func, select
+from sqlalchemy import case, delete, func, select
 
 from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.database import write_gate
@@ -326,16 +326,16 @@ async def list_accounts() -> list[dict]:
                 select(TrackedAccount).order_by(TrackedAccount.created_at.desc())
             )
         ).scalars().all()
-        # 各账户已购条目数（账户设置弹窗展示「拥有的游戏数量」口径）
-        owned_counts: dict[str, int] = dict(
-            (
+        counts = {
+            sid: (total, owned) for sid, total, owned in (
                 await session.execute(
-                    select(WishlistItem.steamid, func.count())
-                    .where(WishlistItem.owned.is_(True), WishlistItem.active.is_(True))
+                    select(WishlistItem.steamid, func.count(),
+                           func.count(case((WishlistItem.owned.is_(True), 1))))
+                    .where(WishlistItem.active.is_(True))
                     .group_by(WishlistItem.steamid)
                 )
             ).all()
-        )
+        }
     # 档案回填三级链：账户行已有 → 家庭组快照补（离线零请求）→
     # miniprofile 后台拉（快照也没有时，如纯手动绑定的外账户）。
     # 快照补到的顺手落库——下次打开页面不再重复拼装。
@@ -380,8 +380,8 @@ async def list_accounts() -> list[dict]:
             "friendCode": friend_code(a.steamid),
             "kinds": a.kinds_json or {"wishlist": True, "owned": False},
             "lastSyncAt": a.last_sync_at.isoformat() if a.last_sync_at else None,
-            "itemCount": a.item_count,
-            "ownedCount": owned_counts.get(a.steamid, 0),
+            "itemCount": counts.get(a.steamid, (0, 0))[0],
+            "ownedCount": counts.get(a.steamid, (0, 0))[1],
         }
         for a in rows
     ]
@@ -400,7 +400,6 @@ async def add_account(steamid_or_vanity: str, label: str = "", kinds: dict | Non
             steamid=steamid,
             label=label or None,
             kinds_json=kinds or {"wishlist": True, "owned": True},
-            item_count=0,
             created_at=now,
         )
         _apply_persona(account, persona)
@@ -643,17 +642,13 @@ async def _sync_account_inflight(steamid: str, auto_crawl: bool) -> dict:
                             continue
                         row.active = False
 
-            total_active = (
-                await session.execute(
-                    select(WishlistItem.appid).where(
-                        WishlistItem.steamid == steamid, WishlistItem.active.is_(True)
-                    )
+            total_active = await session.scalar(
+                select(func.count()).select_from(WishlistItem).where(
+                    WishlistItem.steamid == steamid, WishlistItem.active.is_(True),
                 )
-            ).all()
-
+            )
             _apply_persona(account, persona)
             account.last_sync_at = now
-            account.item_count = len(total_active)
             await session.commit()
 
     # 账户同步会改写来源标记（成员资格覆写 / 反向核对停用），同步后按现状
@@ -668,7 +663,7 @@ async def _sync_account_inflight(steamid: str, auto_crawl: bool) -> dict:
         "ownedError": owned_error,
         "added": len(new_appids),
         "addedOwned": len(new_owned_appids),
-        "active": len(total_active),
+        "active": total_active,
         "newAppids": new_appids,
         "newOwnedAppids": new_owned_appids,
     }
@@ -729,7 +724,7 @@ async def _sync_account_inflight(steamid: str, auto_crawl: bool) -> dict:
                                 "regions": owned_cfg,
                                 "kind": "wishlist_sync_owned",
                             },
-                        ],
+                        ], trigger="automatic",
                     )
                 )
                 result["crawlTriggered"] = True
@@ -742,13 +737,13 @@ async def _sync_account_inflight(steamid: str, auto_crawl: bool) -> dict:
                         scope="appids",
                         appids=new_appids,
                         regions=owned_cfg,
-                        kind="wishlist_sync_owned",
+                        kind="wishlist_sync_owned", trigger="automatic",
                     )
                 else:
                     await crawl_service.start_job(
                         scope="appids",
                         appids=new_appids,
-                        kind="wishlist_sync",
+                        kind="wishlist_sync", trigger="automatic",
                     )
                 result["crawlTriggered"] = True
             except ValueError as e:
@@ -1140,26 +1135,6 @@ async def ownership(appids: list[int]) -> dict:
 #   15min 一轮的账户同步不会把用户删掉的条目洗回来。
 
 
-async def _refresh_item_counts(session, steamids: set[str]) -> None:
-    """池变动后重算受影响账户的 itemCount（active 条目数口径）。"""
-    for sid in steamids:
-        account = await session.get(TrackedAccount, sid)
-        if account is None:
-            continue
-        account.item_count = int(
-            (
-                await session.execute(
-                    select(func.count())
-                    .select_from(WishlistItem)
-                    .where(
-                        WishlistItem.steamid == sid,
-                        WishlistItem.active.is_(True),
-                    )
-                )
-            ).scalar_one()
-        )
-
-
 async def _sync_monitoring(appids: list[int], *, exclusion: bool | None = None) -> None:
     """监控条目变动后把 Tracking Source 同步到 monitoring 域。
 
@@ -1292,7 +1267,7 @@ async def add_pool_items(
 
     分类：added（新加入）/ restored（曾被排除或只剩账号来源）/ exists
     （已在关注）/ fail（无效 appid）。auto_crawl=True 且池内有变化时触发一次
-    首爬（kind="pool_add"）；任务占用等失败只记日志，下轮全池刷新兜底。
+    首爬（kind="pool_add", trigger="manual"）；任务占用等失败只记日志，下轮全池刷新兜底。
 
     source 非空（池页「导入文件」传文件名）时登记本机导入来源，不进入种子。
     """
@@ -1343,7 +1318,7 @@ async def add_pool_items(
             # 首爬：新增/恢复的条目若无 games 行（从未抓过），下轮全池刷新的
             # games 行侧看不到它——池内行本就排在全池 head，会随本轮一并抓。
             await crawl_service.start_job(
-                scope="appids", appids=touched, kind="pool_add"
+                scope="appids", appids=touched, kind="pool_add", trigger="manual"
             )
             crawl_triggered = True
         except (RuntimeError, ValueError) as e:
@@ -1425,7 +1400,6 @@ async def remove_pool_items(appids: list[int], *, reason: str = "pool_removed") 
                 row.active = False
                 row.excluded = True
                 row.manual = False
-            await _refresh_item_counts(session, {r.steamid for r in rows})
             await session.commit()
 
         for appid in clean:
@@ -1495,8 +1469,6 @@ async def release_free_games(appids: list[int]) -> int:
             row.active = False
             row.excluded = True
             row.manual = False
-        if rows:
-            await _refresh_item_counts(session, {r.steamid for r in rows})
         await session.commit()
     # 永久免费是业务状态（free_kind），不是用户排除：摘掉全部来源 → released，
     # 不写 monitor_exclusions（解除后仍可回到监控，届时由下次爬取再判）。

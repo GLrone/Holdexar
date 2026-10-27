@@ -188,8 +188,8 @@ async def test_baseline_idempotent_and_per_account(db):
                 (620, "LOCKED_ACH", 12.0, False, 0),          # 未解锁不计
             ],
         )
-        session.add(AchievementGame(steamid=PRIMARY, appid=620, playtime_min=500, platinum=True))
-        session.add(AchievementGame(steamid=PRIMARY, appid=440, playtime_min=0, platinum=False))
+        session.add(AchievementGame(steamid=PRIMARY, appid=620, playtime_min=500, total_achievements=1, unlocked=1))
+        session.add(AchievementGame(steamid=PRIMARY, appid=440, playtime_min=0))
         await session.commit()
 
     async with write_session() as session:

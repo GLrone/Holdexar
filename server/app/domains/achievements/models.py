@@ -11,7 +11,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Float, Integer, String
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, Integer, String, func
+from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -60,7 +61,6 @@ class AchievementGame(Base):
     last_played: Mapped[int] = mapped_column(BigInteger, default=0)
     total_achievements: Mapped[int] = mapped_column(Integer, default=0)
     unlocked: Mapped[int] = mapped_column(Integer, default=0)
-    platinum: Mapped[bool] = mapped_column(Boolean, default=False)
     # 来源：owned=本号已购（含玩过的免费游戏）；shared=库外（家庭共享等，
     # 本号未拥有但有解锁）；manual=手动补录。库外行 playtime_min 恒为 0
     # （Steam 不提供非拥有游戏的时长），前端据此标注「库外·时长未知」。
@@ -70,3 +70,13 @@ class AchievementGame(Base):
     # 解锁态上次抓取时刻
     state_synced_at: Mapped[datetime | None] = mapped_column(DateTime)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    @hybrid_property
+    def platinum(self) -> bool:
+        return (self.total_achievements or 0) > 0 and (self.unlocked or 0) >= self.total_achievements
+
+    @platinum.inplace.expression
+    @classmethod
+    def _platinum_expression(cls):
+        return ((func.coalesce(cls.total_achievements, 0) > 0)
+                & (func.coalesce(cls.unlocked, 0) >= cls.total_achievements)).label("platinum")

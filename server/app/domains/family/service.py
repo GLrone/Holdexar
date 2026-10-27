@@ -1594,7 +1594,7 @@ async def _kick_uncrawled_games(appids: list[int]) -> None:
 
     「未收录」的成因：games/game_current_prices 无行 = 爬虫从未抓到该游戏——
     愿望单聚合只做本地 join 不补数据，用户看到的就是名称空（AppID 兜底）+
-    价格「未收录」。这里把缺口 appid 送进爬取队列（kind="family_wishlist"），
+    价格「未收录」。这里把缺口 appid 送进爬取队列（kind="family_wishlist", trigger="automatic"），
     爬完名称/封面/CN 价自动补齐。
 
     任务互斥（占用抛错即放弃，下轮同步与全池刷新仍是兜底）；30 分钟冷却
@@ -1613,7 +1613,7 @@ async def _kick_uncrawled_games(appids: list[int]) -> None:
         from app.domains.crawl import service as crawl_service
 
         await crawl_service.start_job(
-            scope="appids", appids=appids, kind="family_wishlist"
+            scope="appids", appids=appids, kind="family_wishlist", trigger="automatic"
         )
         log_event(
             logger,

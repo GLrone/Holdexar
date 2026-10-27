@@ -131,9 +131,9 @@ async def test_progress_sources_from_states_and_games(db):
         session.add(AchievementState(steamid=PRIMARY, appid=440, image_name="S_C", achieved=True, unlock_time=1760000002))
         session.add(AchievementState(steamid=PRIMARY, appid=440, image_name="S_LOCKED", achieved=False, unlock_time=0))
         # 620 满盘白金 500 分钟；440 半盘 59 分钟；728 库外 shared（时长恒 0）
-        session.add(AchievementGame(steamid=PRIMARY, appid=620, playtime_min=500, total_achievements=2, unlocked=2, platinum=True, source="owned"))
-        session.add(AchievementGame(steamid=PRIMARY, appid=440, playtime_min=59, total_achievements=10, unlocked=3, platinum=False, source="owned"))
-        session.add(AchievementGame(steamid=PRIMARY, appid=728, playtime_min=0, total_achievements=8, unlocked=0, platinum=False, source="shared"))
+        session.add(AchievementGame(steamid=PRIMARY, appid=620, playtime_min=500, total_achievements=2, unlocked=2, source="owned"))
+        session.add(AchievementGame(steamid=PRIMARY, appid=440, playtime_min=59, total_achievements=10, unlocked=3, source="owned"))
+        session.add(AchievementGame(steamid=PRIMARY, appid=728, playtime_min=0, total_achievements=8, unlocked=0, source="shared"))
         await session.commit()
 
     rows = {r["challengeId"]: r for r in await challenges_mod.recompute_challenges(PRIMARY)}
@@ -201,7 +201,7 @@ async def test_progress_sources_notes_and_social(db, monkeypatch):
 @pytest.mark.asyncio
 async def test_lifecycle_active_completed_claimed(db):
     async with db() as session:
-        session.add(AchievementGame(steamid=PRIMARY, appid=620, platinum=True))
+        session.add(AchievementGame(steamid=PRIMARY, appid=620, total_achievements=1, unlocked=1))
         await session.commit()
 
     overview = await challenges_mod.challenges_overview(PRIMARY)
@@ -235,7 +235,7 @@ async def test_lifecycle_active_completed_claimed(db):
 @pytest.mark.asyncio
 async def test_claim_rejections_keep_ledger_intact(db):
     async with db() as session:
-        session.add(AchievementGame(steamid=PRIMARY, appid=620, platinum=True))
+        session.add(AchievementGame(steamid=PRIMARY, appid=620, total_achievements=1, unlocked=1))
         await session.commit()
     await challenges_mod.recompute_challenges(PRIMARY)
     result = await challenges_mod.claim(None, "platinum_first")
@@ -255,7 +255,7 @@ async def test_claim_rejections_keep_ledger_intact(db):
 @pytest.mark.asyncio
 async def test_claim_second_guard_on_xp_unique_key(db):
     async with db() as session:
-        session.add(AchievementGame(steamid=PRIMARY, appid=620, platinum=True))
+        session.add(AchievementGame(steamid=PRIMARY, appid=620, total_achievements=1, unlocked=1))
         await session.commit()
     await challenges_mod.recompute_challenges(PRIMARY)
     # 状态守卫被穿透形态：奖励流水已在、行状态仍停在 completed
@@ -306,7 +306,7 @@ async def test_challenge_completed_fact_fires_once(db):
 @pytest.mark.asyncio
 async def test_claim_crossing_level_fires_level_up_fact_once(db):
     async with db() as session:
-        session.add(AchievementGame(steamid=PRIMARY, appid=620, platinum=True))
+        session.add(AchievementGame(steamid=PRIMARY, appid=620, total_achievements=1, unlocked=1))
         await session.commit()
     await challenges_mod.recompute_challenges(PRIMARY)
     result = await challenges_mod.claim(None, "platinum_first")
@@ -332,14 +332,17 @@ async def test_claim_crossing_level_fires_level_up_fact_once(db):
 async def test_summary_counts_mixed_states(db):
     async with db() as session:
         session.add(AchievementState(steamid=PRIMARY, appid=620, image_name="M_1", achieved=True, unlock_time=1760000000))
-        session.add(AchievementGame(steamid=PRIMARY, appid=620, platinum=True))
+        session.add(AchievementGame(steamid=PRIMARY, appid=620, total_achievements=1, unlocked=1))
         await session.commit()
 
     overview = await challenges_mod.challenges_overview(PRIMARY)
-    assert overview["summary"] == {"total": 20, "completed": 2, "claimed": 0, "claimable": 2}
+    assert {c["challengeId"] for c in overview["challenges"] if c["status"] == "completed"} == {
+        "first_trophy", "platinum_first", "full_clear_first",
+    }
+    assert overview["summary"] == {"total": 20, "completed": 3, "claimed": 0, "claimable": 3}
     await challenges_mod.claim(None, "platinum_first")
     overview2 = await challenges_mod.challenges_overview(PRIMARY)
-    assert overview2["summary"] == {"total": 20, "completed": 2, "claimed": 1, "claimable": 1}
+    assert overview2["summary"] == {"total": 20, "completed": 3, "claimed": 1, "claimable": 2}
 
 
 # ─── 空形态 ────────────────────────────────────────────────
@@ -401,7 +404,7 @@ async def test_challenges_router_contract(db):
     assert uncompleted.status_code == 409
 
     async with db() as session:
-        session.add(AchievementGame(steamid=PRIMARY, appid=620, platinum=True))
+        session.add(AchievementGame(steamid=PRIMARY, appid=620, total_achievements=1, unlocked=1))
         await session.commit()
     assert client.get("/api/v1/achievements/challenges").status_code == 200
     ok = client.post("/api/v1/achievements/challenges/platinum_first/claim")

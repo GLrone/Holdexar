@@ -16,7 +16,6 @@ from __future__ import annotations
 from sqlalchemy import update
 
 from app.core.database import WritePriority, write_session
-from app.core.database import write_gate
 from .models import WishlistItem
 
 
@@ -33,8 +32,7 @@ async def follow(appid: int) -> dict:
 
     target = int(appid)
     # 关注 = 用户显式要求监控：解除「别再爬它」后挂来源
-    await monitoring_service.set_exclusion("game", target, False, "followed")
-    await monitoring_service.ensure_source("game", target, "favorite")
+    await monitoring_service.ensure_source("game", target, "favorite", clear_exclusion=True)
     return {"appid": target, "followed": True}
 
 

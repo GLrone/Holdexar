@@ -1400,7 +1400,7 @@ async def migrate_legacy_kv() -> int:
     if not cookie_sid:
         return 0
 
-    async with write_session(WritePriority.INTERACTIVE) as session:
+    async with write_session(WritePriority.BACKGROUND) as session:
         existing = await session.get(SteamAccount, cookie_sid)
         if existing is not None:
             # 表里已有该账号（多账号时代再回到旧部署不会发生，防御式跳过）
@@ -1447,7 +1447,7 @@ async def seal_credentials_at_rest() -> int:
     返回本次封装的条目数。
     """
     sealed = 0
-    async with write_session(WritePriority.INTERACTIVE) as session:
+    async with write_session(WritePriority.BACKGROUND) as session:
         rows = ((await session.execute(select(SteamAccount))).scalars().all())
         for row in rows:
             value = row.cookies or ""

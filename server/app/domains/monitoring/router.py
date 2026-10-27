@@ -1,7 +1,7 @@
 """monitoring 域路由：监控状态查询与用户侧的排除 / 停止 / 重新监控。
 
 排除与停止都不删除任何数据：Catalog 行、价格历史、愿望单来源全部保留，
-只改 Monitoring 层的状态。
+只改来源和排除事实，资格统一派生。
 """
 from __future__ import annotations
 

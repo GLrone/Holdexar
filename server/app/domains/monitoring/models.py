@@ -5,8 +5,7 @@ Catalog（games / bundles）只表达「Holdexar 知道这个对象存在」，�
 
 - `monitor_sources`：谁想监控它。一行 = 一个 (target, source) 来源；同一
   target 可有多个来源，多账户的同一 appid 只落成一行（家族愿望单去重）。
-- `monitor_targets`：监控对象当前状态。一行 = 一个 target，状态在
-  active / released / excluded 之间迁移，重新激活复用同一行。
+- `monitor_targets`：在册身份与生命周期时刻；资格和排序直接读取来源及排除。
 - `monitor_exclusions`：用户明确不要监控。排除不是删除——只有显式用户操作
   才落行；永久免费 / 下架是业务状态，由 `games.free_kind` / `games.removed_at`
   表达，不写这里。
@@ -17,8 +16,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Index, Integer, String, text
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import BigInteger, Boolean, DateTime, Index, Integer, String, case, func, select, text
+from sqlalchemy.orm import Mapped, column_property, mapped_column
 
 from app.core.database import Base
 
@@ -35,32 +34,6 @@ STATES = (STATE_ACTIVE, STATE_RELEASED, STATE_EXCLUDED)
 
 # 不进 crawl 的两个状态（refresh_bundles 的候选集过滤用）
 NON_CRAWL_STATES = (STATE_RELEASED, STATE_EXCLUDED)
-
-
-class MonitorTarget(Base):
-    """监控对象：一个 (target_type, target_id) 只有一行，状态就地迁移。"""
-
-    __tablename__ = "monitor_targets"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    target_type: Mapped[str] = mapped_column(String(16), default=TARGET_GAME)
-    target_id: Mapped[int] = mapped_column(BigInteger)
-    # active / released / excluded
-    state: Mapped[str] = mapped_column(String(16), default=STATE_RELEASED)
-    # 由当前有效来源里的最高优先级推导；只决定 crawl 队列先后，
-    # 不决定监控资格（资格由 state 独占表达）
-    priority: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime | None] = mapped_column(DateTime)
-    updated_at: Mapped[datetime | None] = mapped_column(DateTime)
-    activated_at: Mapped[datetime | None] = mapped_column(DateTime)
-    released_at: Mapped[datetime | None] = mapped_column(DateTime)
-    excluded_at: Mapped[datetime | None] = mapped_column(DateTime)
-
-    __table_args__ = (
-        Index("ux_monitor_target", "target_type", "target_id", unique=True),
-        Index("ix_monitor_target_state", "target_type", "state"),
-        Index("ix_monitor_target_order", "state", "priority", "target_id"),
-    )
 
 
 class MonitorSource(Base):
@@ -116,4 +89,40 @@ class MonitorExclusion(Base):
             sqlite_where=text("active = 1"),
         ),
         Index("ix_monitor_exclusion_target", "target_type", "target_id"),
+    )
+
+
+class MonitorTarget(Base):
+    """同一对象复用在册身份；生命周期时刻保留，资格与排序不另存副本。"""
+
+    __tablename__ = "monitor_targets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    target_type: Mapped[str] = mapped_column(String(16), default=TARGET_GAME)
+    target_id: Mapped[int] = mapped_column(BigInteger)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime)
+    excluded_at: Mapped[datetime | None] = mapped_column(DateTime)
+    state: Mapped[str] = column_property(case(
+        (select(MonitorExclusion.id).where(
+            MonitorExclusion.target_type == target_type,
+            MonitorExclusion.target_id == target_id, MonitorExclusion.active.is_(True),
+        ).correlate_except(MonitorExclusion).exists(), STATE_EXCLUDED),
+        (select(MonitorSource.id).where(
+            MonitorSource.target_type == target_type,
+            MonitorSource.target_id == target_id, MonitorSource.active.is_(True),
+        ).correlate_except(MonitorSource).exists(), STATE_ACTIVE),
+        else_=STATE_RELEASED,
+    ))
+    priority: Mapped[int] = column_property(func.coalesce(
+        select(func.max(MonitorSource.priority)).where(
+            MonitorSource.target_type == target_type,
+            MonitorSource.target_id == target_id, MonitorSource.active.is_(True),
+        ).correlate_except(MonitorSource).scalar_subquery(), 0,
+    ))
+
+    __table_args__ = (
+        Index("ux_monitor_target", "target_type", "target_id", unique=True),
     )

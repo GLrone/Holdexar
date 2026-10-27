@@ -785,7 +785,7 @@ async def test_remove_manual_member_keeps_tracked_account(db):
     async with db() as session:
         session.add(TrackedAccount(
             steamid=MANUAL, kinds_json={"wishlist": True, "owned": True},
-            item_count=0, created_at=datetime.utcnow(),
+            created_at=datetime.utcnow(),
         ))
         await session.commit()
 

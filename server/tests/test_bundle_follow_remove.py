@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import delete
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -27,12 +28,21 @@ BID_C = 99700403
 APPIDS = [99700411, 99700412]
 
 
-async def _seed() -> None:
-    from app.core.database import get_engine
+@pytest_asyncio.fixture(autouse=True)
+async def isolated_database(tmp_path, monkeypatch):
+    from app.core import database
+    from app.core.config import get_settings
 
-    async with get_engine().begin() as conn:
-        for table in (Bundle, BundleRegionPrice):
-            await conn.run_sync(lambda sc, t=table: t.__table__.create(sc, checkfirst=True))
+    monkeypatch.setenv("HOLDEXAR_DATA_DIR", str(tmp_path))
+    get_settings.cache_clear()
+    database.get_engine.cache_clear()
+    get_session_factory.cache_clear()
+    await database.init_db()
+    yield
+    await database.get_engine().dispose()
+
+
+async def _seed() -> None:
     async with get_session_factory()() as s:
         await s.execute(delete(Bundle).where(Bundle.bundle_id.in_([BID_A, BID_B, BID_C])))
         await s.execute(
@@ -48,7 +58,6 @@ async def _seed() -> None:
                 price_status="ok", cny_fen=10000 + i, app_ids=APPIDS,
             ))
         await s.commit()
-    bundles_service.invalidate_bundles_cache()
 
 
 async def _cleanup() -> None:
@@ -67,11 +76,10 @@ async def _cleanup() -> None:
                 )
             )
         await s.commit()
-    bundles_service.invalidate_bundles_cache()
 
 
-def _ids(items: list[dict]) -> set[int]:
-    return {i["bundleId"] for i in items}
+def _ids(items: dict) -> set[int]:
+    return {i["bundleId"] for i in items["bundles"]}
 
 
 @pytest.mark.asyncio
@@ -134,18 +142,18 @@ async def test_follow_pins_to_top_and_unfollow_releases():
     """关注置顶（组内保持原序）；取消关注回到原位。"""
     await _seed()
     try:
-        base = [i["bundleId"] for i in await bundles_service.list_bundles("diff")]
+        base = [i["bundleId"] for i in (await bundles_service.list_bundles("diff"))["bundles"]]
         assert base.index(BID_A) < base.index(BID_B)
 
         await bundles_service.follow_bundle(BID_B)
-        pinned = [i["bundleId"] for i in await bundles_service.list_bundles("diff")]
+        pinned = [i["bundleId"] for i in (await bundles_service.list_bundles("diff"))["bundles"]]
         assert pinned[0] == BID_B
         # 组内相对序保持：A 与 C 的先后不变
         assert pinned.index(BID_A) < pinned.index(BID_C)
         assert BID_B in await bundles_service.followed_bundle_ids()
 
         await bundles_service.unfollow_bundle(BID_B)
-        released = [i["bundleId"] for i in await bundles_service.list_bundles("diff")]
+        released = [i["bundleId"] for i in (await bundles_service.list_bundles("diff"))["bundles"]]
         assert released == base
     finally:
         await _cleanup()
