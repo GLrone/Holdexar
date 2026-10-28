@@ -5,6 +5,7 @@ import asyncio
 
 from app.domains.pilot import service as pilot_service
 from app.domains.pilot import tools as pilot_tools
+from app.domains.pilot.decision import DECISION_AGENT, CardDecision
 
 
 def _pts(rows):
@@ -40,7 +41,8 @@ def test_trend_series_downsample_keeps_lowest_and_last():
 
 def test_model_view_drops_trend_but_card_keeps_it():
     result = {"kind": "price", "appid": 1, "name": "A", "trend": [["2026-01-01", 100]]}
-    assert "trend" not in pilot_service._model_view(result)
+    decision = CardDecision(should_emit=True, card=None, kind="price", status="rendered", reason="ok")
+    assert "trend" not in DECISION_AGENT.enhance_model_view(result, decision)
     assert pilot_service._card_of("get_price_briefing", result)["trend"] == [["2026-01-01", 100]]
 
 

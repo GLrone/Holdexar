@@ -601,13 +601,6 @@ def _regions_card(result: dict) -> dict | None:
     }
 
 
-def _model_view(result: dict) -> dict:
-    """回灌模型的工具结果：去掉只服务卡片绘制的走势序列（不占上下文）。"""
-    if "trend" not in result:
-        return result
-    return {k: v for k, v in result.items() if k != "trend"}
-
-
 def _card_of(tool_name: str, result: dict) -> dict | None:
     """工具结果 → 前端可渲染的结构化卡片（组件复用的数据层）。"""
     kind = result.get("kind")
@@ -684,10 +677,6 @@ def _card_kind_hint(tool_name: str) -> str | None:
         return "rows"
     return None
 
-
-_STRUCTURED_KINDS = frozenset({
-    "structured", "metric-grid", "data-table", "time-series", "coverage-matrix", "status-board",
-})
 
 _MAX_CARDS_PER_TURN = 4
 
