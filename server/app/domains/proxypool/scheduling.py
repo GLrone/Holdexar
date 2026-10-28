@@ -46,7 +46,7 @@ from app.domains.proxypool.bridge import (
     purge_orphan_subscription_sources,
     rebind_missing_sources,
 )
-from app.domains.proxypool.exits import exit_snapshot, select_exit_slots, slot_signature
+from app.domains.proxypool.exits import select_exit_slots, slot_signature
 from app.domains.proxypool.health import (
     DEFAULT_BUSINESS_APPID,
     NODE_PROBE_FAILED,
@@ -54,7 +54,6 @@ from app.domains.proxypool.health import (
     BusinessOutcome,
     HealthOutcome,
     business_check_pool,
-    exit_ip_check_pool,
     health_check_pool,
     latest_l0_delays,
 )
@@ -79,12 +78,6 @@ logger = logging.getLogger(__name__)
 # 池内 L0 每探这么多个节点提交一次：写锁窗口 = 一块的落账耗时，不随池规模线性
 # 增长。与 L1/L2 内部分块（health.PROBE_COMMIT_EVERY）同值同源。
 L0_COMMIT_EVERY = PROBE_COMMIT_EVERY
-
-# 首轮出口身份发现的上限：启动链里跑的是一次**有界** L1——整池串行探完才开门是
-# 不可接受的（本地软件的开箱体验优先），但"一个出口都没探到"会让首轮爬取退化到
-# 按节点计容量。上限取与生产 worker 上限同量级，够把容量模型建出来即可。
-STARTUP_L1_MAX_NODES = 60
-STARTUP_L1_BUDGET_SECONDS = 240.0
 
 # rebuild 跨调用方互斥：take_rebuild_pending 的消费原子只保「取」不保「做」——
 # take 与 rebuild_runtime 之间的 await 窗口里新置位的 pending 会让第二个调用方
@@ -247,59 +240,6 @@ async def _conclude_maintenance(
         bus.publish("maintenance.ended", **payload)
     except Exception:  # noqa: BLE001
         pass
-
-
-async def run_startup_l1(
-    session: AsyncSession, *,
-    data_dir: Path,
-    controller_url: str,
-    secret: str,
-    now: datetime,
-    target_url: str | None = None,
-    max_nodes: int = STARTUP_L1_MAX_NODES,
-    budget_seconds: float = STARTUP_L1_BUDGET_SECONDS,
-) -> tuple:
-    """首轮出口身份发现（有界）：只探**还没有出口 IP** 的池内节点。
-
-    目的只有一个：让 bootstrap 之后、第一次真实价格刷新之前，`ProxyNode.exit_ip`
-    已经有值，容量模型（一个出口一个工位）从首轮起就成立。它不是新的健康机制——
-    用的是同一条 L1 探针，只是限了节点数与时间预算，并按块提交把写锁窗口压在秒级。
-
-    已经有出口 IP 的节点**不重探**：它们的身份由 5 分钟一拍的维护周期负责刷新，
-    启动链不该重复付这份时间。
-    """
-    known = await _names_with_exit(session)
-    names = tuple(n for n in pool_file_names(data_dir) if n not in known)[
-        : max(0, int(max_nodes))
-    ]
-    if not names:
-        return ()
-    extra = {"url": target_url} if target_url else {}
-    outcomes: list = []
-    deadline = time.monotonic() + max(0.0, float(budget_seconds))
-    for start in range(0, len(names), L0_COMMIT_EVERY):
-        if time.monotonic() >= deadline:
-            log_event(
-                logger,
-                f"首轮出口身份探测时间预算用尽，已探 {len(outcomes)}/{len(names)} 个节点，其余交给维护周期",
-                tag="未完成",
-                detail={
-                    "已探节点数": len(outcomes),
-                    "本轮计划节点数": len(names),
-                },
-            )
-            break
-        chunk = names[start:start + L0_COMMIT_EVERY]
-        outcomes.extend(await exit_ip_check_pool(
-            session, data_dir=data_dir, controller_url=controller_url, secret=secret,
-            now=now, names=chunk, **extra,
-        ))
-    return tuple(outcomes)
-
-
-async def _names_with_exit(session: AsyncSession) -> set[str]:
-    """已经有出口 IP 的合格节点名（启动链据此跳过重复探测）。"""
-    return set(await exit_snapshot(session))
 
 
 def request_rebuild() -> None:
