@@ -141,7 +141,7 @@ class SteamHttpClient:
     def __init__(
         self,
         timeout: int = 12,
-        max_retries: int = 4,
+        max_retries: int = 3,
         proxy_url: str | None = None,
         rate_limiter=None,
         breaker: Global429CircuitBreaker | None = None,
