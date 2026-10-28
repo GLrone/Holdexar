@@ -104,7 +104,6 @@ FAILED_TASKS: list[str] = []
 SKIPPED_UNITS: set[tuple[int, str]] = set()
 FOLLOW_PARENT = True
 EXTRAS_ENABLED = True
-DRY_RUN = False
 
 # 已有价格成功提交的批次。
 _WRITE_STARTED: set[str] = set()
@@ -208,8 +207,6 @@ def _item_tags(item: dict | None) -> list[tuple[int, int]]:
 
 async def _mark_missing_async(db_writer, appids: list[int], cc: str) -> int:
     """同上，异步版：整批一次事务写 missing 进账本。返回写入条数。"""
-    if DRY_RUN:
-        return 0
     return await db_writer.mark_region_status_missing_batch(
         [(int(appid), cc) for appid in appids]
     )
@@ -808,8 +805,7 @@ async def _browse_price_task_inner(context) -> None:
         # 即将推出且该区无购买选项（未开放预购）→ COMING_SOON 暂缓（同旧链路：
         # 「无价格付费游戏不入库」；有包预购走正常链路），由 coming_soon 重探转正
         if meta and meta.get("coming_soon") and status == "missing":
-            if not DRY_RUN:
-                await context.db_writer.mark_coming_soon(appid)
+            await context.db_writer.mark_coming_soon(appid)
             cleared_missing.append((appid, cc))
             counts["skip"] += 1
             continue
@@ -922,9 +918,6 @@ async def _browse_price_task_inner(context) -> None:
             ]
         counts[status if status in counts else "missing"] += 1
 
-        if DRY_RUN:
-            continue
-
         game_data = build_game_data(appid, meta, now_dt)
         if game_data is None:  # 元数据与库内原值双缺 → 不造空行
             cleared_missing.append((appid, cc))
@@ -973,30 +966,29 @@ async def _browse_price_task_inner(context) -> None:
     # ── 热门用户标签（include_tag_count 白送，与价格同发）：按 appid 整批替换。
     #    标签是区域无关的目录事实，不看本区价格状态——locked/无购买选项的条目
     #    同样落标签，覆盖率不会被区服设置切成碎片。
-    if not DRY_RUN:
-        tag_entries = [
-            (appid, rows) for appid in appids if (rows := _item_tags(items.get(appid)))
-        ]
-        if tag_entries:
-            try:
-                await tags_service.replace_game_tags_batch(tag_entries)
-                await tag_names.resolve_tag_names(
-                    context, {t for _, rows in tag_entries for t, _ in rows}
-                )
-            except Exception as e:  # noqa: BLE001 —— 标签是副产物，绝不拖垮价格链路
-                log_event(
-                    logger,
-                    f"价格抓取批次 {task_id} 的热门标签落库失败",
-                    level=logging.WARNING,
-                    detail={"批次": task_id or "未标注", "原因": e},
-                )
+    tag_entries = [
+        (appid, rows) for appid in appids if (rows := _item_tags(items.get(appid)))
+    ]
+    if tag_entries:
+        try:
+            await tags_service.replace_game_tags_batch(tag_entries)
+            await tag_names.resolve_tag_names(
+                context, {t for _, rows in tag_entries for t, _ in rows}
+            )
+        except Exception as e:  # noqa: BLE001 —— 标签是副产物，绝不拖垮价格链路
+            log_event(
+                logger,
+                f"价格抓取批次 {task_id} 的热门标签落库失败",
+                level=logging.WARNING,
+                detail={"批次": task_id or "未标注", "原因": e},
+            )
 
-    if cleared_missing and not DRY_RUN:
+    if cleared_missing:
         await context.db_writer.clear_missing_regions(cleared_missing)
         SKIPPED_UNITS.update((int(aid), str(region).upper()) for aid, region in cleared_missing)
-    if truncated_missing and not DRY_RUN:
+    if truncated_missing:
         await _mark_missing_async(context.db_writer, truncated_missing, cc)
-    if ledger_missing and not DRY_RUN:
+    if ledger_missing:
         await context.db_writer.mark_region_status_missing_batch(ledger_missing)
     if counts["write_fail"]:
         raise RegionStatusWriteError(failed_writes)
