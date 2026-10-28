@@ -64,18 +64,6 @@ def install_root() -> Path:
     return PROJECT_ROOT
 
 
-def state_dir() -> Path:
-    return install_root() / "state"
-
-
-def versions_dir() -> Path:
-    return install_root() / "versions"
-
-
-def updater_dir() -> Path:
-    return install_root() / "updater"
-
-
 def staging_dir() -> Path:
     return install_root() / "update-staging"
 
