@@ -410,9 +410,6 @@ async def _write_rates(data: dict[date, dict[str, float]]) -> tuple[int, dict[st
     return len(values), touched
 
 
-_write_observed = _write_rates
-
-
 async def revalue_dependents(touched: dict[str, set[date]]) -> dict:
     """修复落库后重估依赖方。
 
