@@ -1149,11 +1149,11 @@ class DbWriter:
             return 0
 
     async def mark_non_game_type(self, appid: int, app_type: str) -> None:
-        """非 game/dlc 短路路径落 type + updated_at（脱离回补池）。
+        """非 game/dlc 短路路径落 type + updated_at。
 
         app_handler 对 type 不在 (game, dlc) 或 coming_soon 无包的
-        任务静默丢弃——但挂名孤儿/首爬候选若不落 updated_at 会永留
-        回补池（updated_at IS NULL 判据），每天被空转重爬一次。此
+        任务静默丢弃——但首爬候选若不落 updated_at，占位行
+        （updated_at IS NULL 判据）会被榜单反哺重复纳入重爬集。此
         处只写 type/时间戳两列，不碰其他元数据（名字保持挂名值）。
         """
         try:

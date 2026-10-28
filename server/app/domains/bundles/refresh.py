@@ -794,15 +794,15 @@ async def _enqueue_new_bundle_apps() -> tuple[int, int]:
        型如 hardware/series 已打标，防重检）；
     3. 新 appid 逐一轻量预检 appdetails type（每轮限量 _PRECHECK_PER_RUN，
        余量顺延下轮——刷新时长兜底 + appdetails 礼貌限速）：
-       - game/dlc → 先落 games 占位行（updated_at NULL → 回补层/首爬放行通道
-         会带全量元数据回补中文名），再把 appid 加入爬取任务；
+       - game/dlc → 先落 games 占位行（updated_at NULL，由本次爬取任务
+         带全量元数据回补中文名），再把 appid 加入爬取任务；
        - 非 game/dlc（demo/mod/hardware/series…）→ mark_non_game_type 落
-         type+updated_at（脱离回补池，下次刷新不会再重复预检——games 表
+         type+updated_at（下次刷新不会再重复预检——games 表
          已有 type 即结案）；
        - 预检失败（网络/429）→ 不落任何标记，下次刷新重试（宁重试勿漏）。
 
-    爬取任务通过 crawl 域的 backfill 语义触发：直接调用 run_crawl 小批量
-    同步跑（几款游戏的量级，低 worker），避免依赖全局单任务槽位。
+    爬取任务直接调用 run_crawl 小批量同步跑（几款游戏的量级，低 worker），
+    避免依赖全局单任务槽位。
     返回 (入队爬取数, 非游戏标记数)。
     """
     from app.crawler.runner import CrawlRunConfig, run_crawl
@@ -881,7 +881,7 @@ async def _enqueue_new_bundle_apps() -> tuple[int, int]:
             try:
                 # 与 crawl 域同一条约束：走**爬取唯一取值口**（池有出口 + 有 lane +
                 # 逐位一致才交出地址），拿不到就**不启动**这次 run——
-                # 绝不退回直连/GLOBAL/旧订阅代理（占位行已落库，回补层消化）。
+                # 绝不退回直连/GLOBAL/旧订阅代理（占位行已落库，本轮未爬）。
                 from app.core.config import get_settings as _get_settings
                 from app.core.database import get_session_factory as _session_factory
                 from app.domains.proxypool.runtime import crawl_lane_plan
@@ -920,7 +920,7 @@ async def _enqueue_new_bundle_apps() -> tuple[int, int]:
             except Exception as e:  # noqa: BLE001
                 log_event(
                     logger,
-                    "新 AppID 爬取任务失败，占位行已落库由回补层消化",
+                    "新 AppID 爬取任务失败，占位行已落库（本批未爬取）",
                     tag="未完成",
                     level=logging.WARNING,
                     detail={"原因": str(e)},

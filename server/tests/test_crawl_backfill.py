@@ -123,50 +123,6 @@ async def test_backfill_specs_from_top100(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_backfill_pairs_excludes_ledger_orphans(monkeypatch, tmp_path):
-    """回补池排除已有价格行的孤儿（missing 账本通道负责，防双通道重复吃）。"""
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-
-    from app.core.database import Base
-    import app.domains.crawl.models  # noqa: F401
-    import app.domains.games.models  # noqa: F401
-    from app.domains.crawl import service as crawl_service
-
-    # 封闭库：真库的孤儿池规模随生产爬取波动，limit=5000 的页能否覆盖探针
-    # 不可控——探针语义只在自建的临时库上断言
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'pairs.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(crawl_service, "get_session_factory", lambda: factory)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    async with factory() as session:
-        now = datetime.now()
-        session.add_all(
-            [
-                Game(appid=APPID, name="挂名孤儿", created_at=None, updated_at=None),
-                Game(appid=APPID5, name="账本孤儿", created_at=None, updated_at=None),
-                GameCurrentPrice(
-                    appid=APPID5, region_code="CN", currency="",
-                    price=None, original_price=None, discount_percent=0,
-                    sub_id=None, price_status="locked", fail_count=0,
-                    cny_fen=None, updated_at=now,
-                ),
-            ]
-        )
-        await session.commit()
-
-    pairs = await crawl_service._backfill_pairs(limit=5000)
-    pair_ids = {a for a, _ in pairs}
-    assert APPID in pair_ids  # 无价格行的孤儿入选
-    assert APPID5 not in pair_ids  # 有 locked 状态行 = 账本通道，排除
-    # 库内可能存在的真实孤儿不受夹具影响——只断言合成 appid 语义
-    assert all(a not in (APPID2, APPID4) for a in pair_ids)
-
-
-@pytest.mark.asyncio
 async def test_backfill_specs_empty_when_all_crawled(monkeypatch):
     """无缺口：榜内全部已爬 → []（不产生空任务）。"""
     async def _fake_board(key: str) -> list[int]:
