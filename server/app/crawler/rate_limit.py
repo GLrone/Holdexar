@@ -53,7 +53,6 @@ class SlidingWindowRateLimiter:
         self.window_seconds = window_seconds
         self._timestamps: deque[float] = deque()
         self._lock = asyncio.Lock()
-        self._waited_total = 0.0  # 累计限流等待秒数（收尾日志观测用）
         self._waiting = 0  # 当前在窗口外排队的请求数（任务页「排队等发送窗口」读口）
 
     async def acquire(self) -> None:
@@ -78,7 +77,6 @@ class SlidingWindowRateLimiter:
                         return
                     # 窗口满：最旧一条出窗的时刻 = 最早可发的时刻
                     wait = self._timestamps[0] + self.window_seconds - now
-                    self._waited_total += max(wait, 0.0)
                     if first_wait:
                         self._waiting += 1
                 if first_wait:
@@ -116,11 +114,6 @@ class SlidingWindowRateLimiter:
     def reset(self) -> None:
         """清空窗口（测试隔离用）。"""
         self._timestamps.clear()
-        self._waited_total = 0.0
-
-    @property
-    def waited_total(self) -> float:
-        return self._waited_total
 
 
 # 进程级单例：单入口（GLOBAL 形态）下，爬虫各 worker + 捆绑包刷新共享同一份窗口预算
