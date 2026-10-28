@@ -25,7 +25,7 @@ const common = {
   'common.selectAll': '全选',
   'common.clear': '清空',
 
-  /* 控件默认值（HlSelect / HlDatePicker / HlPopconfirm）——
+  /* 控件默认值（HlSelect / HlPopconfirm）——
      注意这些**不能**写进 withDefaults：那里的默认值只在 defineProps
      求值那一刻算一次，会把语言冻结在组件创建时。 */
   'common.select': '请选择',
