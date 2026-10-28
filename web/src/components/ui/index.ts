@@ -10,11 +10,9 @@
 import type { App } from 'vue'
 
 import HlAvatar from './HlAvatar.vue'
-import HlBanner from './HlBanner.vue'
 import HlButton from './HlButton.vue'
 import HlCarousel from './HlCarousel.vue'
 import HlCheckbox from './HlCheckbox.vue'
-import HlDatePicker from './HlDatePicker.vue'
 import HlDialog from './HlDialog.vue'
 import HlChip from './HlChip.vue'
 import HlDrawer from './HlDrawer.vue'
@@ -37,7 +35,6 @@ import HlSideNav from './HlSideNav.vue'
 import HlSkeleton from './HlSkeleton.vue'
 import HlSpinner from './HlSpinner.vue'
 import HlStat from './HlStat.vue'
-import HlStepper from './HlStepper.vue'
 import HlSwitch from './HlSwitch.vue'
 import HlTable from './HlTable.vue'
 import HlTabs from './HlTabs.vue'
@@ -68,11 +65,9 @@ export type { HlSideNavGroup } from './HlSideNav.vue'
 
 export {
   HlAvatar,
-  HlBanner,
   HlButton,
   HlCarousel,
   HlCheckbox,
-  HlDatePicker,
   HlDialog,
   HlDrawer,
   HlDropdown,
@@ -95,7 +90,6 @@ export {
   HlSkeleton,
   HlSpinner,
   HlStat,
-  HlStepper,
   HlSwitch,
   HlTable,
   HlTabs,
@@ -110,11 +104,9 @@ export {
 /** 全局注册（Hl 前缀，模板中直接 <HlButton> 使用） */
 export default function install(app: App) {
   app.component('HlAvatar', HlAvatar)
-  app.component('HlBanner', HlBanner)
   app.component('HlButton', HlButton)
   app.component('HlCarousel', HlCarousel)
   app.component('HlCheckbox', HlCheckbox)
-  app.component('HlDatePicker', HlDatePicker)
   app.component('HlDialog', HlDialog)
   app.component('HlDrawer', HlDrawer)
   app.component('HlDropdown', HlDropdown)
@@ -137,7 +129,6 @@ export default function install(app: App) {
   app.component('HlSkeleton', HlSkeleton)
   app.component('HlSpinner', HlSpinner)
   app.component('HlStat', HlStat)
-  app.component('HlStepper', HlStepper)
   app.component('HlSwitch', HlSwitch)
   app.component('HlTable', HlTable)
   app.component('HlTabs', HlTabs)
