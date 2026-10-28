@@ -245,7 +245,7 @@ async def _job_wishlist_sync() -> None:
 
 
 # 未爬新增回补单轮配额帽：首绑大愿望单（几百款）一次全爬会长时间占住
-# 单任务模型；与孤儿回补层的日限量同思路，分轮消化、可预期。
+# 单任务模型；分轮消化、可预期。
 _WISH_UNCRAWLED_BATCH = 400
 
 
@@ -253,8 +253,8 @@ async def _uncrawled_active_appids() -> list[int]:
     """活跃监控条目中从未被爬过的 appid（games 无行**且**无任何价格状态行）。
 
     判据取「没有尝试痕迹」而非「没有价格」：locked/blocked/missing 都是
-    首爬尝试过但拿不到价的**账本结论**（有各自的补抓/修复通道，回补层再抓
-    属于双通道重复烧配额）；games 行（含 COMING_SOON/非游戏打标行）也是
+    首爬尝试过但拿不到价的**账本结论**（有各自的补抓/修复通道，重复
+    再抓属于双通道重复烧配额）；games 行（含 COMING_SOON/非游戏打标行）也是
     尝试痕迹。games 无行但有价格状态行的组合（browse 写价成功但元数据
     双缺跳过建行）同样算尝试过——只有**两处全空**（首爬从未抵达写入阶段）
     的条目才是真欠账。排除下架行。
@@ -267,7 +267,7 @@ async def _uncrawled_active_appids() -> list[int]:
     from app.domains.wishlist.models import WishlistItem
 
     async with get_session_factory()() as session:
-        # NOT EXISTS 反连接（判例同 _backfill_pairs）：短路价格表逐行扇出，
+        # NOT EXISTS 反连接：短路价格表逐行扇出，
         # DISTINCT 保留（多账号对同一 appid 复写行）
         not_in_games = (
             _select(Game.appid).where(Game.appid == WishlistItem.appid).exists()
@@ -298,7 +298,7 @@ async def _stamp_uncrawled_missing(appids: list[int]) -> int:
 
     只对「回补任务真跑完」的批次执行（调用方在 results 非空时触发）：
     全区 browse 仍不可见的条目没有 games 行，不落痕迹的话每 15min 都会
-    被回补层重新选中重扫。missing 行让它们转入 missing 账本通道（4min
+    被回补对账重新选中重扫。missing 行让它们转入 missing 账本通道（4min
     修复轮 + 5 次穷尽 blocked），与本批其余欠账同节奏。写的是 GameCurrentPrice
     的状态行，不动 games 表——后续真抓到数据会正常覆盖。
     """

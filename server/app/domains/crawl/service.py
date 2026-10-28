@@ -844,10 +844,6 @@ MISSING_RECOVERY_WORKERS = 6
 DIRECT_MODE_WORKERS = 4
 
 
-# 孤儿回补层：每日价格刷新第三层消化挂名孤儿（updated_at IS NULL），
-# 当日限量防挤占——779 级欠账按此配额多日自然消化，不阻塞关注层
-BACKFILL_DAILY_LIMIT = 60
-
 # 下架监控：removed_at 非空的游戏脱池停爬——已无商店页，
 # 每 41 区一次的 404 空转纯烧配额。36h 宽限期兜底误判（两轮价格刷新
 # 周期内可经复探通道自愈）；复活走「重新上榜反哺」或手动复探端点。
@@ -893,40 +889,6 @@ async def _excluded_free_appids() -> set[int]:
             )
         ).scalars().all()
     return {int(r) for r in rows}
-
-
-async def _backfill_pairs(limit: int = BACKFILL_DAILY_LIMIT) -> list[tuple[int, str]]:
-    """挂名孤儿 appid → 爬取对（updated_at IS NULL 且无任何价格行的 games 行）。
-
-    家庭组/愿望单展示层兜底落库只写 appid+name（无元数据无价格行），
-    这些行由本层在每日价格刷新里逐步回补。按 appid 升序稳定分批，
-    多日跑量可预期。
-
-    排除已有价格行的孤儿（meta 失败后 Phase 2 已写 locked/missing
-    状态行的）——它们进了 missing 账本通道由补抓层负责，回补层再
-    抓属于双通道重复吃配额。下架行（removed_at 非空）不回补。
-    """
-    from sqlalchemy import asc as _asc
-
-    async with get_session_factory()() as session:
-        has_price = (
-            select(GameCurrentPrice.appid)
-            .where(GameCurrentPrice.appid == Game.appid)
-            .exists()
-        )
-        rows = (
-            await session.execute(
-                select(Game.appid, Game.name)
-                .where(
-                    Game.updated_at.is_(None),
-                    ~has_price,
-                    Game.removed_at.is_(None),
-                )
-                .order_by(_asc(Game.appid))
-                .limit(limit)
-            )
-        ).all()
-    return [(int(a), n or "") for a, n in rows]
 
 
 async def _resolve_worker_count() -> int:
@@ -1007,8 +969,6 @@ async def start_job(
     COOLDOWN_MINUTES）——供 5min 空闲档修复轮高频复访失败区；
     仍失败的照常走 missing 计账（fail_count 递增，穷尽 5 次转 blocked），
     成功清账，与主爬虫逻辑完全一致。
-    kind="backfill" 为孤儿回补层：忽略 scope/appids，取挂名孤儿行
-    （updated_at IS NULL）首爬，低 worker、跳过预检、当日限量。
     missing_cooldown 显式传值时覆盖 missing/repair 两类冷却。
     """
     global _active
@@ -1052,11 +1012,6 @@ async def start_job(
             pre_tasks = await _missing_tasks(cooldown_minutes=cooldown)
             if not pre_tasks:
                 raise ValueError("没有待补抓的欠账（missing）数据")
-        elif kind == "backfill":
-            pairs = await _backfill_pairs()
-            if not pairs:
-                raise ValueError("没有待回补的挂名孤儿游戏")
-            effective = await effective_regions(regions)
         else:
             pairs = await resolve_scope_appids(scope, appids)
             if not pairs:
@@ -1074,7 +1029,7 @@ async def start_job(
         from app.domains.proxypool.exits import MAX_CRAWL_WORKERS
         from app.domains.proxypool.runtime import crawl_lane_plan
         worker_count = await _resolve_worker_count()
-        small_lane = kind in ("missing", "repair", "backfill")
+        small_lane = kind in ("missing", "repair")
         planned_workers = (
             min(worker_count, MISSING_RECOVERY_WORKERS) if small_lane else worker_count
         )

@@ -788,7 +788,7 @@ async def _browse_price_task_inner(context) -> None:
         meta = META.get(appid)
         keep = PRESERVED.get(appid)
 
-        # 只收 game/dlc；短路前落 type 防止该行永留回补池（与旧链路同语义）。
+        # 只收 game/dlc；短路前落 type 让该行脱离首爬候选（榜单反哺判据）。
         # 已知对象（库内有行）不再依赖网络预取：库内 type 与网络元数据同权重
         if (meta or {}).get("type") or (keep or {}).get("type"):
             eff_type = (meta or {}).get("type") or (keep or {}).get("type")
