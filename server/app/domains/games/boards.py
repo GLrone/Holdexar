@@ -4,8 +4,9 @@
 拓展，数千条量级不落监控池）。板参数：topsellers 5 页 500 条（前 100 兼作
 前端 TOP100 序）；popularnew Released_DESC 5 批；specials 全量翻页求差集；
 comingsoon popularcomingsoon&os=win（无价格字段，无包游戏由爬取层暂缓）。
-约束：拉榜封顶 5000 appid；只对 games 无行差集反哺，挂名孤儿留 kind=backfill
-回补层（防双通道重复吃配额）；连续 3 批零新增自动终止。缓存三级：1h 热缓存
+约束：拉榜封顶 5000 appid；只对 games 无行差集反哺（挂名孤儿由
+uncrawled_only=False 的板反哺，specials 不碰在库行）；连续 3 批零新增自动终止。
+缓存三级：1h 热缓存
 → 实时拉取 → 24h 旧值兜底，分板 key 隔离。出网走 proxy_first 独立轻量会话，
 不接爬虫主链路 429 熔断。
 """
@@ -297,8 +298,7 @@ async def backfill_specs(key: str, limit: int = 100) -> list[dict]:
     - False（topsellers/popularnew，现行语义）：games 无行（从未入库）
       **或** 挂名孤儿（updated_at NULL 且无任何价格行）。已有价格行
       （locked/missing 状态）的孤儿进 missing 账本通道，排除防双通道重复。
-    - True（specials）：**仅补 games 无行的差集**——挂名孤儿
-      一律留给 kind=backfill 回补层，特惠通道不碰在库行。
+    - True（specials）：**仅补 games 无行的差集**——特惠通道不碰在库行。
     - removed 复活语义（所有板统一）：removed_at 非空的在库游戏重新
       上榜 = 免费复活信号，一律反哺重爬（upsert 成功路径自动清标）。
 
@@ -338,8 +338,8 @@ async def backfill_specs(key: str, limit: int = 100) -> list[dict]:
             ).all()
             # 库内行分类：appid → 是否需要反哺
             if board.uncrawled_only:
-                # 特惠/comingsoon 语义：有 games 行的一律不碰（含挂名孤儿——
-                # 回补层/重探通道负责），唯一例外 removed 复活（重新上榜）
+                # 特惠/comingsoon 语义：有 games 行的一律不碰（含挂名孤儿），
+                # 唯一例外 removed 复活（重新上榜）
                 needs = {
                     int(a): (r is not None) for a, _, _, r in rows
                 }

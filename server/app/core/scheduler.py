@@ -245,7 +245,7 @@ async def _job_wishlist_sync() -> None:
 
 
 # 未爬新增回补单轮配额帽：首绑大愿望单（几百款）一次全爬会长时间占住
-# 单任务模型；与孤儿回补层的日限量同思路，分轮消化、可预期。
+# 单任务模型；分轮消化、跑量可预期。
 _WISH_UNCRAWLED_BATCH = 400
 
 
@@ -267,7 +267,7 @@ async def _uncrawled_active_appids() -> list[int]:
     from app.domains.wishlist.models import WishlistItem
 
     async with get_session_factory()() as session:
-        # NOT EXISTS 反连接（判例同 _backfill_pairs）：短路价格表逐行扇出，
+        # NOT EXISTS 反连接：短路价格表逐行扇出，
         # DISTINCT 保留（多账号对同一 appid 复写行）
         not_in_games = (
             _select(Game.appid).where(Game.appid == WishlistItem.appid).exists()
