@@ -22,7 +22,8 @@ VECTORS = (
     "pointer_replace_locked", "arguments_background_server",
     "previous_fallback", "runtime_junction", "versions_root_junction",
     "invalid_compatibility", "migration_resume", "migration_key_conflict",
-    "update_guard", "update_accepted", "mixed_case_migration",
+    "update_guard", "update_accepted", "mixed_case_migration", "external_data",
+    "missing_version", "empty_version", "numeric_version", "floating_schema", "sparse_rowid_migration", "case_alias_data",
 )
 
 
@@ -112,18 +113,15 @@ def invoke(entry, arguments, environment):
     return process.returncode, decoded(stdout), decoded(stderr)
 
 
-def run_vector(mode, name, options, destination, row):
-    case = destination / mode / name
+def run_vector(name, options, destination, row):
+    case = destination / name
     root = case / "中文 安装目录"
     root.mkdir(parents=True)
     (root / "versions").mkdir()
     for directory in ("local", "roaming", "home", "temp"):
         (case / directory).mkdir(exist_ok=True)
     entry = root / "Holdexar.exe"
-    shutil.copy2(getattr(options, f"{mode}_launcher"), entry)
-    if mode != "python" and options.native_design == "thin":
-        (root / ".launcher").mkdir()
-        shutil.copy2(options.python_launcher, root / ".launcher" / "SafetyHost.exe")
+    shutil.copy2(options.launcher, entry)
     environment = {key: value for key, value in os.environ.items() if not key.upper().startswith("HOLDEXAR_")}
     environment.update(
         HOLDEXAR_INSTALL_ROOT=str(root), HOLDEXAR_CONTRACT_OBSERVED=str(case / "observed.json"),
@@ -136,13 +134,15 @@ def run_vector(mode, name, options, destination, row):
     state = {"version": "0.3.8", "lastKnownGood": None}
     state["dataCompatibility"] = {
         "dataDir": str(root / "data"), "schemaVersion": 32,
-        "versions": ["0.3.8", "0.3.7"], "contractExtension": "keep",
+        "versions": ["0.3.8", "0.3.7"],
+        "contractExtension": {"largeInteger": 9007199254740993, "nested": {"sentinel": "keep"}},
     }
     pointer = root / "state" / "current.json"
     pointer.parent.mkdir()
     database = root / "data" / "holdexar.db"
     make_database(database, "current")
     expected_version, expected_code = "0.3.8", 37
+    expected_data = root / "data"
     arguments = ["--server"]
     preserved = [database]
 
@@ -193,10 +193,30 @@ def run_vector(mode, name, options, destination, row):
         if name == "invalid_compatibility":
             state["dataCompatibility"] = None
             expected_code = 1
+        if name == "floating_schema":
+            state["dataCompatibility"]["schemaVersion"] = 32.0
+            expected_code = 1
+        if name in {"missing_version", "empty_version", "numeric_version"}:
+            state["dataCompatibility"]["versions"] = ["0.3.7"]
+            if name == "missing_version":
+                state.pop("version")
+            else:
+                state["version"] = "" if name == "empty_version" else 123
+            expected_code = 1
+        if name == "external_data":
+            expected_data = case / "accepted external data"
+            make_database(expected_data / "holdexar.db", "accepted")
+            state["dataCompatibility"]["dataDir"] = str(expected_data)
+            preserved.append(expected_data / "holdexar.db")
+            environment["HOLDEXAR_INSTALL_ROOT"] = str(case / "untrusted install")
+        if name == "case_alias_data":
+            outside = case / "unaccepted data"
+            make_database(outside / "holdexar.db", "unaccepted")
+            state["dataCompatibility"]["datadir"] = str(outside)
+            preserved.append(outside / "holdexar.db")
         if name in {"update_guard", "update_accepted"}:
-            if mode != "python" and options.native_design == "full":
-                (root / ".launcher").mkdir()
-                shutil.copy2(options.python_launcher, root / ".launcher" / "SafetyHost.exe")
+            (root / "updater").mkdir()
+            shutil.copy2(options.updater, root / "updater" / "UpdateHost.exe")
             transaction = {
                 "stage": "verifying", "attemptId": "contract-interrupted",
                 "sourceVersion": "0.3.7", "targetVersion": "0.3.8",
@@ -221,11 +241,19 @@ def run_vector(mode, name, options, destination, row):
             preserved.append(Path(str(database) + "-wal"))
             row["walSchema"] = {"mainHeader": 32, "committedSql": 33}
             expected_code = 1
-        if name in {"database_conflict", "active_wal_migration", "migration_resume", "migration_key_conflict", "mixed_case_migration"}:
+        if name in {"database_conflict", "active_wal_migration", "migration_resume", "migration_key_conflict", "mixed_case_migration", "sparse_rowid_migration"}:
             state.pop("dataCompatibility")
             source = case / "local" / "holdexar"
             source_database = source / "holdexar.db"
             make_database(source_database, "legacy")
+            if name == "sparse_rowid_migration":
+                connection = sqlite3.connect(source_database)
+                try:
+                    connection.execute("CREATE TABLE legacy_records (payload TEXT)")
+                    connection.executemany("INSERT INTO legacy_records(rowid,payload) VALUES (?,?)", [(101, "first"), (909, "second")])
+                    connection.commit()
+                finally:
+                    connection.close()
             keys = ("SECRET.KEY", "Secret.MASTER", "SECRET.salt") if name == "mixed_case_migration" else ("secret.key", "secret.master", "secret.salt")
             for key in keys:
                 (source / key).write_bytes(f"sandbox-{key}".encode())
@@ -284,7 +312,7 @@ def run_vector(mode, name, options, destination, row):
             assert os.path.samefile(observed["exe"], root / "versions" / expected_version / "Holdexar.exe")
             assert observed["args"] == arguments
             assert os.path.samefile(observed["env"]["HOLDEXAR_INSTALL_ROOT"], root)
-            assert os.path.samefile(observed["env"]["HOLDEXAR_DATA_DIR"], root / "data")
+            assert os.path.samefile(observed["env"]["HOLDEXAR_DATA_DIR"], expected_data)
             assert observed["env"]["HOLDEXAR_CONTRACT_SENTINEL"] == "中文 inherited"
             assert not any(value == "contract-stale" for value in observed["env"].values())
             if name in {"fallback", "previous_fallback"}:
@@ -309,6 +337,12 @@ def run_vector(mode, name, options, destination, row):
             if name == "update_accepted":
                 transaction = json.loads(transaction_path.read_text(encoding="utf-8"))
                 assert transaction["stage"] == "committed" and transaction["dataAccepted"] is True
+            if name == "sparse_rowid_migration":
+                connection = sqlite3.connect(database)
+                try:
+                    assert connection.execute("SELECT rowid,payload FROM legacy_records ORDER BY rowid").fetchall() == [(101, "first"), (909, "second")]
+                finally:
+                    connection.close()
         assert {str(path): sha256(path) for path in preserved} == original_hashes, "source/database/key content changed"
         row["preservedSha256"] = original_hashes
         if name in {"wal_schema", "active_wal_migration"}:
@@ -317,10 +351,8 @@ def run_vector(mode, name, options, destination, row):
 
 def main():
     parser = argparse.ArgumentParser()
-    for name in ("python-launcher", "go-launcher", "rust-launcher", "version-fixture", "output"):
+    for name in ("launcher", "updater", "version-fixture", "output"):
         parser.add_argument(f"--{name}", type=Path, required=True)
-    parser.add_argument("--native-design", choices=("thin", "full"), default="thin")
-    parser.add_argument("--modes", choices=("python", "go", "rust"), nargs="+", default=("python", "go", "rust"))
     parser.add_argument("--vectors", choices=VECTORS, nargs="+", default=VECTORS)
     options = parser.parse_args()
     if os.name != "nt":
@@ -332,28 +364,26 @@ def main():
     destination.mkdir(parents=True)
     report = {
         "scope": "packaged launcher protection contracts; excludes GUI latency and UpdateHost upgrade/rollback",
-        "nativeDesign": options.native_design,
         "inputs": {name: {"path": str(value), "sha256": sha256(value), "bytes": value.stat().st_size}
                    for name, value in vars(options).items() if isinstance(value, Path) and name != "output"},
         "results": [],
     }
-    for mode in options.modes:
-        for name in options.vectors:
-            row = {"mode": mode, "vector": name, "status": "failed"}
-            started = time.perf_counter()
-            try:
-                run_vector(mode, name, options, destination, row)
-                row["status"] = "passed"
-            except Exception as error:
-                row["error"] = f"{type(error).__name__}: {error}"
-                if str(error).startswith("cleanup failed"):
-                    report["results"].append(row)
-                    (destination / "results.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-                    raise
-            row["elapsedSeconds"] = time.perf_counter() - started
-            report["results"].append(row)
-            (destination / "results.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(mode, name, row["status"], row.get("error", ""), flush=True)
+    for name in options.vectors:
+        row = {"vector": name, "status": "failed"}
+        started = time.perf_counter()
+        try:
+            run_vector(name, options, destination, row)
+            row["status"] = "passed"
+        except Exception as error:
+            row["error"] = f"{type(error).__name__}: {error}"
+            if str(error).startswith("cleanup failed"):
+                report["results"].append(row)
+                (destination / "results.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+                raise
+        row["elapsedSeconds"] = time.perf_counter() - started
+        report["results"].append(row)
+        (destination / "results.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(name, row["status"], row.get("error", ""), flush=True)
     print(destination / "results.json", flush=True)
     return int(any(row["status"] != "passed" for row in report["results"]))
 

@@ -458,3 +458,57 @@ def previous_version_entry(install_root: Path) -> Path | None:
     if not name or not is_managed_version_name(str(name)):
         return None
     return get_version_exe(install_root, str(name))
+
+
+def find_target_version(root: Path) -> str | None:
+    """定位当前应启动的目标版本，必要时自动执行自愈回滚。
+
+    指针与回退目标都不可用时，先认旧式扁平安装留在版本目录里的恢复入口
+    （`previousVersion`），再才按目录时间挑最新版本——旧版若还在，绝不为了
+    「看起来新」去拉起一个从未通过验收的版本。
+    """
+    curr = read_current_state(root)
+    compatibility = read_data_compatibility(root)
+    allowed = None
+    if compatibility is not None:
+        from app.core.db_safety import read_schema_version
+
+        if read_schema_version(Path(compatibility["dataDir"])) != compatibility["schemaVersion"]:
+            raise RuntimeError("数据结构已变化，拒绝选择未经相容验收的程序")
+        allowed = set(compatibility["versions"])
+
+    def usable(version):
+        return version and is_version_valid(root, version) and (allowed is None or version in allowed)
+
+    if curr:
+        active = curr.get("version")
+        if usable(active):
+            return active
+
+        # 目标版本损坏或丢失，尝试上一有效版本
+        last_good = curr.get("lastKnownGood")
+        if usable(last_good):
+            logger.warning(
+                "当前版本 %s 损坏，自动回退到上一有效版本 %s", active, last_good
+            )
+            write_current_state(root, last_good, last_known_good=None)
+            return last_good
+
+        previous = curr.get("previousVersion")
+        if usable(previous):
+            logger.warning("当前版本 %s 损坏，恢复旧版入口 %s", active, previous)
+            write_current_state(root, previous, last_known_good=None)
+            return previous
+
+    # 状态丢失或指定版本均不可用：扫描 versions/ 中最新有效版本
+    installed = [version for version in list_installed_versions(root) if usable(version)]
+    if not installed:
+        return None
+
+    # 按目录修改时间选取最新安装的有效版本
+    best = max(
+        installed,
+        key=lambda v: (root / "versions" / v).stat().st_mtime,
+    )
+    write_current_state(root, best)
+    return best

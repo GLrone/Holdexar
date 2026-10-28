@@ -10,7 +10,7 @@
     2. 门禁   scripts/check_secrets.py --all（命中即中止）
     3. 版本   --bump patch|minor|major 改 app_info.APP_VERSION，或 --version 指定
     4. 提交推 版本号变更单独提交并**先推送**（tag 必须落在这个提交上）
-    5. 构建   scripts/build_release.py（前端 → PyInstaller → 消毒 → zip → 清单）
+    5. 构建   scripts/build_release.py（前端 → Go 启动器/PyInstaller 应用与更新宿主 → 消毒 → zip → 清单）
     6. 发布   scripts/publish_release.py（版本 Release + updater 清单 Release）
     7. 复验   下载 latest.json，核对 schema / 版本 / sha256 与资产实际一致
 

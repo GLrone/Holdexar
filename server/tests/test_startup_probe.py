@@ -108,6 +108,24 @@ def test_vue_navigation_does_not_wait_for_remote_dashboard_content():
                              "visible": True, "entering": False, "leaving": False, "characters": 5}}, "/library")
 
 
+def test_navigation_reobserves_after_waiting_for_browser_paint():
+    connection = object.__new__(probe.Cdp)
+    calls = []
+
+    def call(method, params):
+        calls.append((method, params))
+        if len(calls) == 1:
+            assert params["awaitPromise"] is True
+            assert params["expression"].count("requestAnimationFrame") == 2
+            return {"result": {"value": True}}
+        return {"result": {"value": {"button": {"x": 42, "y": 84}}}}
+
+    connection.call = call
+    assert connection.painted_document("/library")["button"] == {"x": 42, "y": 84}
+    assert len(calls) == 2
+    assert "elementFromPoint" in calls[1][1]["expression"]
+
+
 def dpi_api(monkeypatch, *, process_ok=True, error=0, current_v2=True, thread_ok=True):
     state = {"current_v2": current_v2, "thread_calls": 0}
     monkeypatch.setattr(probe.ctypes, "set_last_error", lambda value: None, raising=False)
@@ -295,6 +313,10 @@ def test_dom_event_frames_are_saved_even_when_pixel_classification_is_unchanged(
                                          "present": self.clicked, "visible": self.clicked, "entering": False,
                                          "leaving": False, "characters": 5 if self.clicked else 0}}
 
+        def painted_document(self, route):
+            actions.append("paint")
+            return self.document(route)
+
         def click(self, point):
             actions.append("click")
             self.clicked = True
@@ -324,6 +346,7 @@ def test_dom_event_frames_are_saved_even_when_pixel_classification_is_unchanged(
     assert reasons == {"vue_document", "before_navigation_click", "after_navigation_click", "interaction_confirmed"}
     assert report["interactive_confirmed"] is True
     assert actions.index("click") >= 2
+    assert actions.index("paint") < actions.index("click")
 
 
 def test_health_must_match_process_root_and_data_directory(tmp_path):

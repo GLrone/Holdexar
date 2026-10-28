@@ -6,7 +6,7 @@
 
 **本地 Steam 多区价格监控终端**
 
-[![Version](https://img.shields.io/badge/version-v0.3.5--beta-orange)](../../releases)
+[![Version](https://img.shields.io/badge/version-v0.3.6--beta-orange)](../../releases)
 [![Python 3.13+](https://img.shields.io/badge/Python-3.13%2B-blue?logo=python&logoColor=white)](https://www.python.org)
 [![FastAPI](https://img.shields.io/badge/Backend-FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Vue 3](https://img.shields.io/badge/Frontend-Vue%203-42b883?logo=vuedotjs&logoColor=white)](https://vuejs.org)
@@ -131,7 +131,7 @@ Windows 系统对无商业签名程序的标准警示。请先核对下载包的
 <summary>我的账号密码安全吗？数据存在哪？连接了哪些网络服务？</summary>
 
 1. **凭据安全**：账号密码登录直调 Steam 官方认证接口，密码仅在登录鉴权时于内存中临时使用，**绝不落盘、不写日志**；鉴权成功后的凭据采用 AES-256-GCM 本地加密保存。
-2. **数据存储**：全部数据（SQLite 数据库与日志）保存在你自己的电脑上，新装默认优先保存在程序根目录 `data/` 下（完全便携同盘携带），若程序目录无写权限则自动安全回退至 `%LOCALAPPDATA%\Holdexar`。
+2. **数据存储**：全部数据（SQLite 数据库与日志）保存在你自己的电脑上，新装默认优先保存在程序根目录 `data/` 下（完全便携同盘携带），若安装目录无写权限则停止启动并保留原数据，不自动改用其他数据目录。
 3. **网络服务与隐私**：**零云端服务器、零账号系统、零行为遥测与隐私上报**。为了实现比价与资讯功能，程序直接与以下公开服务通信：
    - Steam 商店与用户数据相关网络请求；
    - Frankfurter API（欧洲央行公开基准汇率折算）；
@@ -177,7 +177,7 @@ scoop install holdexar
 
 | 层 | 组件 |
 |---|---|
-| 后端 | FastAPI · SQLAlchemy(async) · APScheduler(25 个定时任务) · aiohttp 爬核 |
+| 后端 | FastAPI · SQLAlchemy(async) · APScheduler(26 个定时任务) · aiohttp 爬核 |
 | 前端 | Vue 3 · TypeScript · Vite · 自制 Hl\* 组件体系(深浅双主题 / 中英双语) |
 | 桌面 | pywebview(WebView2) · onedir 绿色包 · 单实例锁 |
 | 网络 | 出网策略引擎(proxy_first 默认 / direct_only / direct_first / proxy_only) · 自备 Clash 订阅 · mihomo 内核按需获取与轻量分发 |
@@ -225,8 +225,10 @@ python run.py --port N   # 指定端口
 
 发布机(建议用 `server/.venv` 的解释器):
 
+Windows x64 发行构建还需安装符合 [`desktop/go_launcher/go.mod`](desktop/go_launcher/go.mod) 的 Go 工具链。根目录启动器只构建 Go 版本，主应用和独立 UpdateHost 仍由 PyInstaller 打包；Go 依赖按 `go.sum` 锁定。
+
 ```bash
-python scripts/build_release.py          # npm build → PyInstaller → 消毒 → zip,并生成清单
+python scripts/build_release.py          # npm build → Go Launcher + PyInstaller 应用/更新宿主 → 消毒 → zip
 #   编辑 release/RELEASE_NOTES.md 写本次 changelog(客户端检查更新直接展示这段文字)
 python scripts/publish_release.py --dry-run   # 预览发布动作,不碰网络
 python scripts/publish_release.py             # 正式发布(需 gh CLI 且已 gh auth login)

@@ -203,21 +203,26 @@ def process_image_path(pid: int) -> str | None:
 def _safe_replace_executable(src: Path, dest: Path) -> None:
     """安全覆盖可执行文件（针对 Windows 运行中文件锁做重命名保护）。"""
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if not dest.exists():
-        shutil.copy2(src, dest)
-        return
-    try:
-        shutil.copy2(src, dest)
-        return
-    except (PermissionError, OSError):
-        pass
     suffix = uuid.uuid4().hex[:8]
-    old_dest = dest.with_name(f"{dest.stem}.old_{suffix}{dest.suffix}")
+    temporary = dest.with_name(f"{dest.name}.{suffix}.tmp")
     try:
-        os.replace(dest, old_dest)
-    except OSError:
-        pass
-    shutil.copy2(src, dest)
+        shutil.copy2(src, temporary)
+        with temporary.open("rb+") as stream:
+            os.fsync(stream.fileno())
+        try:
+            os.replace(temporary, dest)
+        except OSError:
+            if not dest.is_file():
+                raise
+            old_dest = dest.with_name(f"{dest.stem}.old_{suffix}{dest.suffix}")
+            os.replace(dest, old_dest)
+            try:
+                os.replace(temporary, dest)
+            except OSError:
+                os.replace(old_dest, dest)
+                raise
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def cleanup_old_executables(directory: Path) -> None:
@@ -279,13 +284,13 @@ def install_version_payload(
         raise RuntimeError(f"安装到 {dest} 失败：缺少主可执行程序")
 
     if versions_sub.is_dir():
-        src_launcher = payload / f"{APP_NAME}.exe"
-        if src_launcher.is_file():
-            _safe_replace_executable(src_launcher, root / f"{APP_NAME}.exe")
         src_updater = payload / "updater" / "UpdateHost.exe"
         if src_updater.is_file():
             (root / "updater").mkdir(parents=True, exist_ok=True)
             _safe_replace_executable(src_updater, root / "updater" / "UpdateHost.exe")
+        src_launcher = payload / f"{APP_NAME}.exe"
+        if src_launcher.is_file():
+            _safe_replace_executable(src_launcher, root / f"{APP_NAME}.exe")
 
 
     _log_update(root, f"新版本文件已就绪：{dest}")
@@ -503,7 +508,8 @@ def probe_version_health(
 
     # 验收进程只起服务：端口交给启动逻辑按占用情况现选。预先钉死端口会让
     # 子进程在端口被占时自动漂移，而宿主还在盯原端口，结果把正常启动判成超时。
-    child_env.pop(f"{ENV_PREFIX}PORT", None)
+    if not require_window:
+        child_env.pop(f"{ENV_PREFIX}PORT", None)
     # 验收只看「装上以后能不能起来」，不能继承宿主身上的开发态调试变量：
     # 一旦带上开发服务器地址，子进程会去等一个不存在的 Vite，永远起不来。
     for debug_key in (f"{ENV_PREFIX}DEV_URL", f"{ENV_PREFIX}LAUNCHER_PID",
@@ -878,9 +884,7 @@ def recover_interrupted_update(root: Path) -> bool:
             return True
         if tx.get("dataAccepted"):
             update_data.accept(root)
-            from app.core.launcher import find_target_version
-
-            compatible = find_target_version(root)
+            compatible = layout.find_target_version(root)
             if not compatible:
                 raise RuntimeError("缺少与当前数据相容的程序，数据已保留；请重新解压已验收版本")
             layout.confirm_version(root, compatible)
@@ -1102,7 +1106,9 @@ def main(argv: list[str] | None = None) -> None:
     if report_data_protocol(argv if argv is not None else sys.argv[1:]):
         return
     parser = argparse.ArgumentParser(description=f"{APP_NAME} 独立更新宿主")
-    parser.add_argument("--staging", required=True, help="更新载荷暂存目录")
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("--staging", help="更新载荷暂存目录")
+    action.add_argument("--recover-only", action="store_true", help="恢复安装目录中断的更新事务")
     parser.add_argument("--target", default=None, help="安装根目录")
     parser.add_argument("--target-version", default=None, help="目标版本号")
     parser.add_argument("--source-version", default=None, help="源版本号")
@@ -1114,6 +1120,14 @@ def main(argv: list[str] | None = None) -> None:
 
     args = parser.parse_args(argv)
     root = Path(args.target).resolve() if args.target else resolve_default_install_root()
+    if args.recover_only:
+        try:
+            _validate_update_root(root)
+            recover_interrupted_update(root)
+        except Exception as exc:
+            print(f"更新恢复未完成，数据保护已保留：{exc}", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
     staging = Path(args.staging).resolve()
 
     ok = execute_update(

@@ -293,37 +293,6 @@ def test_migration_copies_existing_key_material_before_startup(tmp_path):
         assert (source / name).read_bytes() == (target / name).read_bytes()
 
 
-def test_launcher_stops_until_missing_key_material_is_retried(tmp_path, monkeypatch):
-    from app.core import launcher, layout
-
-    root, source = tmp_path / "install", tmp_path / "source"
-    _create_sample_db(source / "holdexar.db")
-    (source / "secret.master").write_bytes(b"existing master record")
-    exe = layout.get_version_exe(root, "1.0.0")
-    exe.parent.mkdir(parents=True)
-    exe.write_bytes(b"program")
-    layout.write_current_state(root, "1.0.0")
-    original_copy = migration.shutil.copy2
-    def copy(src, dst, *args, **kwargs):
-        if Path(src).name == "secret.master":
-            raise PermissionError("key temporarily unavailable")
-        return original_copy(src, dst, *args, **kwargs)
-    monkeypatch.setattr(migration.shutil, "copy2", copy)
-    monkeypatch.setattr(launcher, "detect_legacy_data_locations", lambda _root: {
-        "appdataDataDir": source, "hasAppdataDb": True,
-        "hasTargetDb": (root / "data" / "holdexar.db").exists(),
-        "hasConflict": (root / "data" / "holdexar.db").exists(),
-    })
-    errors, launched = [], []
-    monkeypatch.setattr(launcher, "_show_fatal", errors.append)
-    monkeypatch.setattr(launcher, "launch_version", lambda *args, **kwargs: launched.append(args))
-    assert launcher.run_launcher(install_root_override=root, argv=[]) == 1
-    assert errors and not launched
-    monkeypatch.setattr(migration.shutil, "copy2", original_copy)
-    assert launcher.run_launcher(install_root_override=root, argv=[]) == 0
-    assert launched
-    assert (root / "data" / "secret.master").read_bytes() == b"existing master record"
-    assert (source / "secret.master").read_bytes() == b"existing master record"
 
 
 def test_existing_different_key_material_is_preserved_and_blocks_migration(tmp_path):
@@ -354,32 +323,6 @@ def test_missing_required_key_cannot_turn_partial_migration_into_completed(tmp_p
     assert result["status"] == migration.MIGRATION_INCOMPLETE
 
 
-def test_pending_migration_stops_launcher_when_original_source_is_absent(tmp_path, monkeypatch):
-    from app.core import launcher, layout
-
-    root, local = tmp_path / "install", tmp_path / "appdata"
-    source = local / "holdexar"
-    _create_sample_db(source / "holdexar.db")
-    (source / "secret.master").write_bytes(b"required key")
-    monkeypatch.setenv("LOCALAPPDATA", str(local))
-    monkeypatch.setenv("APPDATA", str(tmp_path / "roaming"))
-    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
-    original_copy = migration.shutil.copy2
-    monkeypatch.setattr(migration.shutil, "copy2", lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError("unavailable")))
-    assert not migration.migrate_appdata_to_portable(source, root / "data")["completed"]
-    offline = tmp_path / "source-offline"
-    assert source.resolve().is_relative_to(tmp_path.resolve()) and offline.resolve().is_relative_to(tmp_path.resolve())
-    source.rename(offline)
-    monkeypatch.setattr(migration.shutil, "copy2", original_copy)
-    exe = layout.get_version_exe(root, "1.0.0")
-    exe.parent.mkdir(parents=True)
-    exe.write_bytes(b"program")
-    layout.write_current_state(root, "1.0.0")
-    errors, launched = [], []
-    monkeypatch.setattr(launcher, "_show_fatal", errors.append)
-    monkeypatch.setattr(launcher, "launch_version", lambda *args, **kwargs: launched.append(args))
-    assert launcher.run_launcher(install_root_override=root, argv=[]) == 1
-    assert errors and not launched
 
 
 def test_migrated_legacy_key_decrypts_existing_credential(tmp_path):

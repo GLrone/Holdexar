@@ -151,7 +151,6 @@ def test_version_links_cannot_escape_installation(tmp_path, linked):
 @pytest.mark.skipif(os.name != "nt", reason="Windows junction boundary")
 def test_version_junction_cannot_bypass_database_allowlist(tmp_path):
     import sqlite3
-    from app.core import launcher
 
     root = tmp_path / "install"
     forbidden = _create_mock_version(root, "2.0.0")
@@ -173,7 +172,7 @@ def test_version_junction_cannot_bypass_database_allowlist(tmp_path):
         assert not layout.is_version_valid(root, "1.0.0")
         with pytest.raises(ValueError):
             layout.get_version_dir(root, "1.0.0")
-        assert launcher.find_target_version(root) is None
+        assert layout.find_target_version(root) is None
     finally:
         alias.rmdir()
     assert (forbidden / f"{APP_NAME}.exe").is_file()
