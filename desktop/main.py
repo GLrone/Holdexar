@@ -1789,13 +1789,6 @@ def _make_closing_guard(window):
     return _guard
 
 
-def _on_window_ready(window, app_url: str) -> None:
-    """webview.start(func) 入口：窗口真正建好后拉起两件后台事——
-    health 等待跳转线程（等待页 → 真实应用）与托盘线程。"""
-    threading.Thread(target=_wait_and_navigate, args=(window, app_url), daemon=True).start()
-    _run_tray(window)
-
-
 def _run_tray(window) -> None:
     """托盘线程入口（经 webview.start(func) 在窗口建好后拉起）。
 
