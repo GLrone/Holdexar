@@ -24,7 +24,7 @@ from app.domains.games.models import Game, GameCurrentPrice
 
 
 def hl_priority(g: type[Game], cn: type[GameCurrentPrice]) -> ColumnElement[int]:
-    """史低优先度（对齐 HL_PRIORITY_SQL）。"""
+    """史低优先度分档。"""
     return case(
         (cn.discount_percent == 0, 0),
         (cn.discount_percent.is_(None), 0),
@@ -36,7 +36,7 @@ def hl_priority(g: type[Game], cn: type[GameCurrentPrice]) -> ColumnElement[int]
 
 
 def complex_sort(g: type[Game], cn: type[GameCurrentPrice]) -> list[ColumnElement]:
-    """5 级复杂排序（对齐 COMPLEX_SORT_MV/CTE；整数除法即梯队取整）。"""
+    """5 级复杂排序（整数除法即梯队取整）。"""
     return [
         desc(cn.price.is_not(None) & (cn.price > 0)),
         desc(hl_priority(g, cn)),
@@ -47,7 +47,7 @@ def complex_sort(g: type[Game], cn: type[GameCurrentPrice]) -> list[ColumnElemen
 
 
 def region_group_prefix(g: type[Game], cn: type[GameCurrentPrice]) -> list[ColumnElement[int]]:
-    """地区筛选 3-group 前缀（对齐 buildCteOrderBy）：史低组(0) → 折扣组(1) → 无折扣组(2)。"""
+    """地区筛选 3-group 前缀：史低组(0) → 折扣组(1) → 无折扣组(2)。"""
     return [
         case(
             (g.hl_flag.in_((1, 2)), 0),
@@ -65,7 +65,7 @@ def build_order_by(
     region_mode: bool = False,
     sr: type[GameCurrentPrice] | None = None,
 ) -> list[ColumnElement]:
-    """构建 ORDER BY（对齐 buildMvOrderBy / buildCteOrderBy 的组合规则）。
+    """构建 ORDER BY 的组合规则。
 
     region_mode=True（选择了具体地区）：组内默认按该区差价 (cn.price - sr.cny_fen) 降序；
     其余排序按对应分支，前缀带 3-group。

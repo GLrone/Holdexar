@@ -505,7 +505,7 @@ async def list_games(
 ) -> dict:
     """游戏列表。返回 {items, total, hasMore, nextCursor}。
 
-    翻译自 route.ts 的 MV/CTE 查询（预计算列版本）：
+    游戏列表（预计算列版本）：
     - filterMode（仅在选择了具体非国区时生效）：
       global: 该区价 < 国区-1元 且 该区价 ≈ 非 CN 全区最低价（默认±5元，tolerance_fen 可调）
       cheaper: 该区价 < 国区-1元
@@ -620,7 +620,7 @@ async def list_games(
         has_more = len(rows) > limit
         rows = rows[:limit]
 
-        # ── 页级取价：只拉当前页的全区价格（对齐 getLatestPricesForGames）──
+        # ── 页级取价：只拉当前页的全区价格 ──
         appid_list = [row[0].appid for row in rows]
         price_rows = await _load_page_prices(session, appid_list)
 
@@ -759,7 +759,7 @@ async def _list_games_top100(
         rows = (await session.execute(base)).all()
 
     # ── 榜序重排（等价 array_position；榜外 appid 不会出现——IN 过滤保证）──
-    # 排序优先级对齐 buildCteOrderBy，置顶前缀压过榜序（top100 分支的
+    # 排序优先级：置顶前缀压过榜序（top100 分支的
     # 收藏第一优先级）：锁国区最低价 ASC（早退分支，压过榜序）
     # > 地区模式 3-group 前缀 + 组内榜序 > 纯榜序。
     followed = set(await _followed_appids())
@@ -1493,7 +1493,7 @@ async def get_game_history(
 
     # 史低次数：价格追平/跌破历史最低值的事件数——同一促销期内的
     # 连续同价位快照只计一次（回升后再次到达 = 新的一次），对齐
-    # 外部价格服务「达到史低的次数」口径。
+    # 「达到史低的次数」计数口径。
     lowest_hits = 0
     running_low = lowest
     in_low_streak = False
@@ -1726,7 +1726,7 @@ def _build_list_item(
     regions_expected: list[str] | None = None,
     pending_units: set | None = None,
 ) -> dict:
-    """对齐 route.ts buildGameResponse。cn_row=None 为锁区（无国区行，LEFT JOIN）。
+    """cn_row=None 为锁区（无国区行，LEFT JOIN）。
 
     cnyFen 只读快照列（cny_fen）：GET 不回算汇率——回算会与排序快照
     （diff_fen/min_cny_fen）落在不同汇率基准上，出现「排名说省 ¥20 /

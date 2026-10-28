@@ -75,7 +75,7 @@ BOARDS: dict[str, Board] = {
         backfill_kind="top100_backfill",
         pool=True,
     ),
-    # 热门新品（对齐 popular_new_supplement.py：filter=popularnew + Released_DESC）
+    # 热门新品（filter=popularnew + Released_DESC）
     "popularnew": Board(
         key="popularnew",
         params={"filter": "popularnew", "sort_by": "Released_DESC",
