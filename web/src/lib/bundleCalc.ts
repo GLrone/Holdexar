@@ -1,17 +1,12 @@
 /**
  * bundleCalc.ts — 捆绑包补齐计算引擎
  *
- * - inferBundleOwnership 撞库推演（condition B：基准 appids 全部已拥有/家庭共享）
  * - calculateBundlePrice 补齐计算（排除后逐游戏求和 × 整包基础折扣）
  *
- * 行为口径说明：
- * 1. 无 sub 归属数据，不做 condition A（ownedPackages 确诊已购）；
- *    condition B 覆盖其主场景。
- * 2. 游戏现价库内既有外币 minor 原价又有 cny_fen，两币种各自
- *    直接求和，不做外币经汇率逆推（口径更准，判断结论一致）。
+ * 行为口径说明：游戏现价库内既有外币 minor 原价又有 cny_fen，两币种各自
+ * 直接求和，不做外币经汇率逆推（口径更准，判断结论一致）。
  */
 import type { BundleDetail, BundleGame, BundleRegionPrice } from '@/api/client'
-import type { OwnershipInfo } from '@/api/client'
 
 // ── 外币展示（后端 games/pricing.py 同款数据表的镜像） ──
 

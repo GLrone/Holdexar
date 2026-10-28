@@ -74,13 +74,3 @@ export function cachedGet<T>(
 export function invalidate(key: string): void {
   store.delete(key)
 }
-
-/** 按前缀失效（如某个 importId 下的全部账单查询） */
-export function invalidatePrefix(prefix: string): void {
-  for (const k of store.keys()) if (k.startsWith(prefix)) store.delete(k)
-}
-
-/** 清空全部（退出登录 / 切换数据集时调用） */
-export function invalidateAll(): void {
-  store.clear()
-}
