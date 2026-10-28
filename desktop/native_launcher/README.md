@@ -1,6 +1,6 @@
 # Windows Launcher Entry Experiments
 
-Go 与 Rust 是两种实验性 Windows 入口，均调用同一份独立 Python 启动保护核心。默认发行构建仍使用 Python 启动器；这些入口未替换正式构建。
+本目录的 Go 是转交独立 Python 启动保护核心的实验入口。Rust 的原生正常启动链与异常更新恢复边界见 [Rust 实验说明](../rust_launcher/README.md)。默认发行构建仍使用 Python 启动器；这些入口未替换正式构建。
 
 ## 安装布局与职责
 
@@ -31,15 +31,7 @@ New-Item -ItemType Directory -Force -Path "$out/go", "$out/rust" | Out-Null
 go build '-ldflags=-s -w -H=windowsgui' -o "$out/go/Holdexar.exe" desktop/native_launcher/main.go
 ```
 
-Rust 入口位于 `desktop/rust_launcher`，无外部 crate。使用已安装的 Windows GNU 工具链及其自带的链接器：
-
-```powershell
-$sysroot = rustc --print sysroot
-$lld = Join-Path $sysroot 'lib/rustlib/x86_64-pc-windows-gnu/bin/rust-lld.exe'
-rustc --edition=2024 -C opt-level=s -C strip=symbols -C panic=abort `
-  -C linker=$lld -C linker-flavor=ld.lld -C link-self-contained=yes `
-  desktop/rust_launcher/src/main.rs -o "$out/rust/Holdexar.exe"
-```
+Rust 使用 Cargo 构建；依赖、平台 SQLite 与恢复组件要求见 [Rust 实验说明](../rust_launcher/README.md)。
 
 编译入口不会生成 `SafetyHost.exe` 或完整安装包。真实启动比较还需为各组准备同一份保护核心、版本目录与隔离数据副本。
 
@@ -53,7 +45,7 @@ go test -c -o "$out/helper-fixture.exe" desktop/native_launcher/main.go desktop/
 python desktop/native_launcher/verify.py --launcher "$out/go/Holdexar.exe" `
   --fixture "$out/helper-fixture.exe" --output "$out/go-check"
 python desktop/native_launcher/verify.py --launcher "$out/rust/Holdexar.exe" `
-  --fixture "$out/helper-fixture.exe" --output "$out/rust-check"
+  --fixture "$out/helper-fixture.exe" --output "$out/rust-check" --design full
 ```
 
 检查覆盖保护核心缺失、目录冒充、junction 逃逸、中文和空格安装路径、空参数、引号、末尾反斜杠、环境继承及退出码传递。测试 fixture 仅验证入口交接，不代表真实 Python 保护核心的数据或更新安全契约通过，也不代表 GUI 启动性能验收。
