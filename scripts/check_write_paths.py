@@ -54,6 +54,12 @@ NETWORK_METHODS = {"request", "get", "post", "put", "patch", "delete", "send", "
 
 # (文件, 函数) → (语句种类及调用点上限, 理由)。
 ALLOW: dict[tuple[str, str], tuple[dict[str, int], str]] = {
+    ("scripts/check_launcher_contract.py", "make_database"): (
+        {"execute": 3, "commit": 1},
+        "启动器合同检查的测试夹具：沙盒内造带 schema 的迷你库，非生产数据"),
+    ("scripts/check_launcher_contract.py", "run_vector"): (
+        {"execute": 7, "executemany": 1, "commit": 4},
+        "启动器合同向量的夹具写：WAL 桩、迁移源库与事务样本均为沙盒临时数据"),
     ("core/update_data.py", "_read_only_source"): (
         {"execute": 1}, "同步维护锁内排空原库写者并保持快照窗口"),
     ("core/update_data.py", "prepare"): (

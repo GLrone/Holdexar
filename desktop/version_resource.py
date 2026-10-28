@@ -200,6 +200,25 @@ def read_pe_properties(exe_path: Path) -> dict[str, str]:
     return props
 
 
+def stamp_launcher_resources(exe_path: Path, version: str) -> None:
+    """给 Go PE 写入与现有发行程序一致的图标、版本与执行权限声明。"""
+    from PyInstaller.utils.win32 import icon, versioninfo, winmanifest, winutils
+
+    info = get_vs_version_info("launcher", version)
+    if info is None:
+        raise RuntimeError("构建解释器缺少 PyInstaller Windows 资源支持")
+    versioninfo.write_version_info_to_executable(str(exe_path), info)
+    icon.CopyIcons_FromIco(str(exe_path), [str(ROOT / "desktop" / "app.ico")])
+    winmanifest.write_manifest_to_executable(str(exe_path), winmanifest.create_application_manifest())
+    winutils.update_exe_pe_checksum(str(exe_path))
+    properties = read_pe_properties(exe_path)
+    expected = {"ProductName": APP_NAME, "ProductVersion": version,
+                "FileVersion": numeric_version_str(version),
+                "FileDescription": ROLE_META["launcher"]["description"], "CompanyName": COMPANY_NAME}
+    if any(properties.get(key) != value for key, value in expected.items()):
+        raise RuntimeError(f"Go Launcher 版本资源写入后校验失败：{exe_path}")
+
+
 def verify_exe_version_resources(install_dir: Path, version: str) -> dict[str, dict[str, str]]:
     """检查安装或发行包中三个 EXE 的版本属性。
 
@@ -243,3 +262,13 @@ def verify_exe_version_resources(install_dir: Path, version: str) -> dict[str, d
         results[role] = props
 
     return results
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="发行程序资源写入")
+    parser.add_argument("--stamp-launcher", type=Path, required=True)
+    parser.add_argument("--version", default=APP_VERSION)
+    arguments = parser.parse_args()
+    stamp_launcher_resources(arguments.stamp_launcher, arguments.version)

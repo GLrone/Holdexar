@@ -183,6 +183,12 @@ class Cdp:
                                                 "returnByValue": True})
         return result["result"]["value"]
 
+    def painted_document(self, route: str):
+        # DOM visibility can precede the WebView2 compositor replacing the HTML loader.
+        self.call("Runtime.evaluate", {"expression": "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))",
+                                       "awaitPromise": True, "returnByValue": True})
+        return self.document(route)
+
     def click(self, point: dict):
         parameters = {"x": point["x"], "y": point["y"], "button": "left", "clickCount": 1}
         try:
@@ -575,15 +581,21 @@ def probe(args) -> dict:
                         main_seen = True
                         emit("main_content_ready", path=document["path"], characters=len(document["content"]))
                     if not clicked and vue_seen and painted.is_set() and document.get("button"):
+                        document = connection.painted_document(args.target_route)
+                        if not vue_navigation_ready(document) or not document.get("button"):
+                            continue
                         if not request_frame("before_navigation_click", wait=True):
                             continue
-                        before = document
-                        if document["path"] == args.target_route:
+                        before = connection.document(args.target_route)
+                        if not vue_navigation_ready(before) or not before.get("button"):
+                            continue
+                        if before["path"] == args.target_route:
                             raise ValueError("Navigation target is already active; choose another target")
                         clicked = True
                         try:
-                            connection.click(document["button"])
-                            emit("navigation_click_dispatched", target=args.target_route)
+                            connection.click(before["button"])
+                            emit("navigation_click_dispatched", target=args.target_route,
+                                 point=before["button"], before_path=before["path"])
                         finally:
                             request_frame("after_navigation_click")
                     elif clicked and not interactive.is_set() and interaction_succeeded(before, document, args.target_route):

@@ -1,6 +1,7 @@
-r"""Holdexar 发布构建：npm build → PyInstaller onedir → 产物消毒 → 绿色 zip。
+r"""Holdexar 发布构建：npm build → Go Launcher + PyInstaller 应用/更新宿主 → 消毒 → zip。
 
 用法（发布机，建议用 server/.venv 的解释器运行）：
+    Go 工具链版本须满足 desktop/go_launcher/go.mod，依赖按 go.sum 锁定。
     python scripts/build_release.py                    # 常规出包
     python scripts/build_release.py --skip-web         # 跳过前端构建（dist 已是最新）
     python scripts/build_release.py --output-dir <目录> # 隔离出包，不覆盖 release/
@@ -19,6 +20,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -133,6 +135,26 @@ def run_pyinstaller(python: Path) -> None:
     ])
 
 
+def build_go_launcher(version: str, python: Path) -> Path:
+    """编译唯一生产启动器，并复用发行资源生成与校验链。"""
+    go = shutil.which("go")
+    if not go:
+        raise RuntimeError("构建 Go Launcher 需要安装与 desktop/go_launcher/go.mod 匹配的 Go 工具链")
+    destination = DIST_DIR / "_launcher_build" / f"{APP_NAME}.exe"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    environment = {**os.environ, "GOOS": "windows", "GOARCH": "amd64",
+                   "CGO_ENABLED": "0", "GOTOOLCHAIN": "local", "GOWORK": "off"}
+    subprocess.check_call([
+        go, "build", "-mod=readonly", "-trimpath", "-ldflags=-s -w -H=windowsgui",
+        "-o", str(destination), ".",
+    ], cwd=str(DESKTOP / "go_launcher"), env=environment)
+    subprocess.check_call([
+        str(python), str(DESKTOP / "version_resource.py"),
+        "--stamp-launcher", str(destination), "--version", version,
+    ], cwd=str(ROOT))
+    return destination
+
+
 def assemble_versioned_layout(version: str, python: Path) -> None:
     """将 PyInstaller onedir 产物组装为新架构布局：
     Holdexar/
@@ -147,24 +169,9 @@ def assemble_versioned_layout(version: str, python: Path) -> None:
         shutil.rmtree(temp_app)
     shutil.move(str(APP_DIR), str(temp_app))
 
-    # 编译轻量启动器 Holdexar.exe
-    print("[启动器] 编译 Holdexar.exe (Launcher)...")
-    launcher_dist = DIST_DIR / "_launcher_build"
-    launcher_ver_file = WORK_DIR / "launcher_version_info.txt"
-    write_version_file(launcher_ver_file, role="launcher", version=version)
+    print("[启动器] 编译 Go Holdexar.exe (Launcher)...")
+    launcher_exe = build_go_launcher(version, python)
     aux_exclude_flags = [arg for exc in AUX_EXCLUDES for arg in ("--exclude-module", exc)]
-    subprocess.check_call([
-        str(python), "-m", "PyInstaller", "--onefile", "--noconfirm", "--clean",
-        "--paths", str(SERVER),
-        "--icon", str(DESKTOP / "app.ico"),
-        "--version-file", str(launcher_ver_file),
-        "--distpath", str(launcher_dist),
-        "--workpath", str(WORK_DIR / "launcher"),
-        "--specpath", str(WORK_DIR),
-        "--name", APP_NAME,
-        *aux_exclude_flags,
-        str(DESKTOP / "launcher_main.py"),
-    ])
 
     # 编译独立更新宿主 UpdateHost.exe
     print("[更新宿主] 编译 UpdateHost.exe...")
@@ -193,7 +200,7 @@ def assemble_versioned_layout(version: str, python: Path) -> None:
     shutil.move(str(temp_app), str(v_dir))
 
     # 2. 根目录放置轻量启动器 Holdexar.exe
-    shutil.copy2(launcher_dist / f"{APP_NAME}.exe", APP_DIR / f"{APP_NAME}.exe")
+    shutil.copy2(launcher_exe, APP_DIR / f"{APP_NAME}.exe")
 
     # 3. updater 目录放置独立 UpdateHost.exe
     updater_dir = APP_DIR / "updater"
@@ -230,7 +237,7 @@ def assemble_versioned_layout(version: str, python: Path) -> None:
         print(f"  ✓ [{role}] {props.get('FileDescription')} | FileVersion={props.get('FileVersion')} | ProductVersion={props.get('ProductVersion')}")
 
     # 清理构建临时产物
-    shutil.rmtree(launcher_dist, ignore_errors=True)
+    shutil.rmtree(launcher_exe.parent, ignore_errors=True)
     shutil.rmtree(updater_dist, ignore_errors=True)
     print(f"[布局] 多版本结构组装完成：{APP_DIR}")
 

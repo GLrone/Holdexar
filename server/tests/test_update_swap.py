@@ -383,13 +383,11 @@ def test_handoff_does_not_remove_active_helper_staging(tmp_path, monkeypatch):
     assert (staging / "manifest.json").exists()
 
 
-@pytest.mark.parametrize("entry", ["main.py", "launcher_main.py"])
-def test_desktop_entries_reject_retired_update_switch(entry, monkeypatch):
+def test_desktop_entry_rejects_retired_update_switch(monkeypatch):
+    entry = "main.py"
     spec = importlib.util.spec_from_file_location("retired_update_entry", ROOT / "desktop" / entry)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    if entry == "launcher_main.py":
-        monkeypatch.setattr(module, "run_launcher", lambda _args: 0)
     monkeypatch.setattr(sys, "argv", ["Holdexar.exe", "--apply-update"])
     with pytest.raises(SystemExit) as result:
         module.main()

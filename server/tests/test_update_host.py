@@ -371,23 +371,23 @@ def test_install_version_payload_flat_package(tmp_path):
 
 
 def test_safe_replace_executable_fallback(tmp_path, monkeypatch):
-    """运行中文档锁场景：shutil.copy2 报 PermissionError 时自动重命名原文件后再覆盖。"""
+    """运行中文档锁场景：原子替换被占用时保留旧映像再落位。"""
     src = tmp_path / "new.exe"
     dest = tmp_path / "running.exe"
     src.write_bytes(b"new_content")
     dest.write_bytes(b"old_content")
 
-    real_copy = update_host.shutil.copy2
-    copied_once = False
+    real_replace = update_host.os.replace
+    blocked_once = False
 
-    def mock_copy(s, d):
-        nonlocal copied_once
-        if not copied_once:
-            copied_once = True
+    def mock_replace(s, d):
+        nonlocal blocked_once
+        if d == dest and not blocked_once:
+            blocked_once = True
             raise PermissionError("WinError 32: The process cannot access the file")
-        return real_copy(s, d)
+        return real_replace(s, d)
 
-    monkeypatch.setattr(update_host.shutil, "copy2", mock_copy)
+    monkeypatch.setattr(update_host.os, "replace", mock_replace)
     update_host._safe_replace_executable(src, dest)
     assert dest.read_bytes() == b"new_content"
     old_files = list(tmp_path.glob("running.old_*.exe"))
