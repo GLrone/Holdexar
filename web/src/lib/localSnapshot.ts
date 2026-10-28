@@ -43,15 +43,3 @@ export function writeSnapshot<T>(key: string, version: number, data: T): void {
     /* 快照只是加速手段，写不进去不影响功能 */
   }
 }
-
-/** 快照年龄（ms）；无快照返回 -1（页面上用来提示"数据截至何时"） */
-export function snapshotAge(key: string): number {
-  try {
-    const raw = localStorage.getItem(PREFIX + key)
-    if (!raw) return -1
-    const env = JSON.parse(raw) as Envelope<unknown>
-    return typeof env?.ts === 'number' ? Date.now() - env.ts : -1
-  } catch {
-    return -1
-  }
-}
