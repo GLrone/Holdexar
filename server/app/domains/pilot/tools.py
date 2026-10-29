@@ -61,7 +61,6 @@ _TREND_MAX_POINTS = 72
 
 _PRICE_TAG_RE = _shared._PRICE_TAG_RE
 _THRESH_RE = _shared._THRESH_RE
-_QUERY_CLEAN_RE = _shared._QUERY_CLEAN_RE
 
 TOOL_META: dict[str, dict] = REGISTRY.meta()
 
@@ -74,14 +73,6 @@ CORE_TOOLS = _CORE_TOOLS
 
 LIST_TOOLS = _LIST_TOOLS
 """按需解锁工具（builtin/info.py）。"""
-
-def clean_query_tokens(question: str) -> list[str]:
-    """问句清洗后的搜索词：先整句清洗，再拆 token（滤掉纯数字与单字）。"""
-    cleaned = _QUERY_CLEAN_RE.sub(" ", question or "").strip()
-    if not cleaned:
-        return []
-    tokens = [t for t in cleaned.split() if len(t) >= 2 and not t.isdigit()]
-    return [cleaned] + [t for t in tokens if t != cleaned]
 
 
 def extract_title(question: str) -> str | None:

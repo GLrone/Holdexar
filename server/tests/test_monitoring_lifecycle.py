@@ -450,5 +450,5 @@ async def test_remove_account_recycles_historical_orphans(db):
     assert await monitoring.active_ids("game") == []
     items = {it["appid"]: it for it in await wishlist_service.list_items()}
     assert 600 not in items and 601 not in items
-    # 再跑全量对账：无新回收（幂等）
-    assert await monitoring.sync_all_game_sources() == 0
+    # 再跑孤儿回收：无新回收（幂等）
+    assert await monitoring.recycle_orphan_game_sources() == 0

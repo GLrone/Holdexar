@@ -31,7 +31,6 @@ class ToolSpec:
     timeout_s: float = 20.0
     idempotent: bool = False
     requires_approval: bool | None = None   # None=按 group/risk 推导（审批 P5 生效）
-    card: Callable[[dict], dict | None] | None = None   # 缺省走 kind 驱动通用投影
 
 
 def derive_status(data: dict) -> Status:
