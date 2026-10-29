@@ -19,3 +19,17 @@ def free_local_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def is_ssl_error(exc: "Exception | str") -> bool:
+    """SSL 证书类错误判定（账户/账单/家庭/成就/兑换五域共用单实现）。
+
+    线索表为原五份拷贝的并集；本机加速器回环场景（hosts 劫持 +
+    127.0.0.1 自签证书）依赖此判定做证书校验降级重试。
+    """
+    text = f"{type(exc).__name__}: {exc}" if isinstance(exc, BaseException) else str(exc or "")
+    lowered = text.lower()
+    return any(clue in lowered for clue in (
+        "ssl", "certificate_verify_failed", "certificate verify failed",
+        "self-signed", "unable to get local issuer", "certifi",
+    ))

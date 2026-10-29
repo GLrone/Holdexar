@@ -18,6 +18,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 import httpx
+from app.core.net import is_ssl_error
 
 from app.core.logging import log_event
 from app.domains.account.steam_wallet import (
@@ -70,14 +71,6 @@ class SteamReportData:
             "history": self.history,
             "licenses": self.licenses,
         }
-
-
-def _has_ssl_error(message: str) -> bool:
-    lowered = message.lower()
-    return any(
-        clue in lowered
-        for clue in ("ssl", "certificate verify failed", "self-signed", "certifi")
-    )
 
 
 # ── 登录页守门（redeem 域 _redirect_chain_hits_login 同语义）────────────
@@ -652,7 +645,7 @@ async def fetch_full_report(
     try:
         return await _run(True)
     except (httpx.HTTPStatusError, httpx.RequestError, SteamFetchError) as exc:
-        if not _has_ssl_error(str(exc)):
+        if not is_ssl_error(exc):
             raise SteamFetchError(str(exc)) from exc
         log_event(
             logger,
@@ -691,7 +684,7 @@ async def probe_new_transactions(
     try:
         return await _probe(True)
     except (httpx.HTTPStatusError, httpx.RequestError, SteamFetchError) as exc:
-        if not _has_ssl_error(str(exc)):
+        if not is_ssl_error(exc):
             raise
         log_event(
             logger,
