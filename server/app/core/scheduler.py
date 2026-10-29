@@ -257,12 +257,11 @@ async def _uncrawled_active_appids() -> list[int]:
     再抓属于双通道重复烧配额）；games 行（含 COMING_SOON/非游戏打标行）也是
     尝试痕迹。games 无行但有价格状态行的组合（browse 写价成功但元数据
     双缺跳过建行）同样算尝试过——只有**两处全空**（首爬从未抵达写入阶段）
-    的条目才是真欠账。排除下架行。
+    的条目才是真欠账。
     """
     from sqlalchemy import select as _select
 
     from app.core.database import get_session_factory
-    from app.domains.crawl.service import _excluded_removed_appids
     from app.domains.games.models import Game, GameCurrentPrice
     from app.domains.wishlist.models import WishlistItem
 
@@ -289,8 +288,7 @@ async def _uncrawled_active_appids() -> list[int]:
             )
         ).scalars().all()
     appids = sorted({int(a) for a in rows})
-    excluded = await _excluded_removed_appids()
-    return [a for a in appids[:_WISH_UNCRAWLED_BATCH] if a not in excluded]
+    return appids[:_WISH_UNCRAWLED_BATCH]
 
 
 async def _stamp_uncrawled_missing(appids: list[int]) -> int:
