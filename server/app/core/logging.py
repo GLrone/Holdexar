@@ -34,6 +34,7 @@ import threading
 from collections import deque
 from collections.abc import Mapping
 from logging.handlers import RotatingFileHandler
+from urllib.parse import urlsplit
 from pathlib import Path
 
 from app.core.app_info import APP_SLUG
@@ -99,6 +100,19 @@ _REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (_AUTH_HEADER, r"\1 ***"),
     (_ENV_ASSIGN, r"\1\2***"),
 )
+
+def redact_url(url: str | None) -> str:
+    """订阅类 URL 的日志展示形态：保留 scheme+host，路径与查询一律打码。
+
+    订阅地址的身份凭据在路径段里的 token——逐行 redact 的正则对路径型
+    token 天然失明，所以落日志前在这里先降级成主机形态。"""
+    if not url:
+        return ""
+    parts = urlsplit(url.strip())
+    if not parts.netloc:
+        return "***"
+    return f"{parts.scheme}://{parts.netloc}/***"
+
 
 def redact(text: str) -> str:
     """抹掉一行文本里的凭据值，保留字段名。
