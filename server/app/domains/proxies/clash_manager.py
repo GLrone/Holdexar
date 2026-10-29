@@ -34,7 +34,7 @@ import httpx
 import yaml
 
 from app.core.config import get_settings
-from app.core.logging import log_event
+from app.core.logging import log_event, redact_url
 from app.core.net import free_local_port as _free_local_port
 from app.core.net import port_listening as _port_listening
 from app.domains.proxies.kernel_release import (
@@ -1273,7 +1273,7 @@ class ClashRuntime:
                 log_event(
                     logger,
                     "切换订阅：停掉当前内核并按新订阅重启",
-                    detail={"当前订阅": self.subscription_url, "新订阅": target},
+                    detail={"当前订阅": redact_url(self.subscription_url), "新订阅": redact_url(target)},
                 )
             else:
                 if self.config_path == config_path and config_unchanged(
@@ -1581,7 +1581,7 @@ class ClashRuntime:
             logger,
             "内核配置已热重载，进程未重启",
             tag="成功",
-            detail={"订阅": self.subscription_url, "混合端口": self.port},
+            detail={"订阅": redact_url(self.subscription_url), "混合端口": self.port},
         )
         return {**self.status(), "started": False, "reloaded": True}
 
