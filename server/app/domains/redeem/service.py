@@ -10,9 +10,6 @@
   15=无效激活码、24=需补充年龄验证等（详情以 detail 字段原文回传）。
   Steam 官方限制：无论成败，30 分钟窗口内最多 10 次激活。
 
-- 免费许可领取：POST https://store.steampowered.com/checkout/addfreelicense/{subid}
-  表单 {sessionid, action}（action=approve）。仅对免费 sub 有效；
-  502/400 通常意味着该 sub 并非免费许可或不可用。
 
 所有出网走代理策略引擎（proxy_first 默认）；Cookie 三件套含 sessionid。
 """
@@ -20,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 
 import httpx
 from app.core.net import is_ssl_error
@@ -34,7 +30,6 @@ from app.domains.redeem.models import RAW_MAX, RedeemActivation
 logger = logging.getLogger(__name__)
 
 REGISTER_KEY_URL = "https://store.steampowered.com/account/ajaxregisterkey/"
-ADD_FREE_LICENSE_URL = "https://store.steampowered.com/checkout/addfreelicense/"
 
 # Steam 官方激活限制：30 分钟窗口内 10 次（无论成败）
 ACT_LIMIT = 10
@@ -343,114 +338,6 @@ async def activate_batch(keys: list[str]) -> dict:
                 own += 1
             else:
                 fail += 1
-    return {"results": results, "ok": ok, "own": own, "fail": fail}
-
-
-async def _redirect_chain_hits_login(resp: httpx.Response, max_hops: int = 4) -> bool:
-    """跟随 30x 重定向链（GET），看终点是否登录页（checkout 域两跳后才拒绝）。
-
-    只读判定，不产生副作用——第一跳 POST 已完成，后续 GET 只是 Steam 引导页。
-    """
-    url = str(resp.headers.get("location") or "")
-    if not url:
-        return False
-    proxy = await _strategy_proxy()
-    try:
-        async with httpx.AsyncClient(timeout=15, proxy=proxy, verify=False, follow_redirects=True) as client:
-            final = await client.get(url)
-            final_url = str(final.url)
-            ok_html = "login" in final_url or "signin" in final_url
-            if not ok_html:
-                # 终点不是登录 URL，再看 HTML 特征（Sign In 标题）
-                m = re.search(r"<title>([^<]*)</title>", final.text[:2000], re.I)
-                ok_html = bool(m and ("sign in" in m.group(1).lower() or "登录" in m.group(1)))
-            return ok_html
-    except httpx.HTTPError:
-        # 跟随失败：保守按"疑似被拒"处理，不冒领
-        return True
-
-
-async def add_free_license(subid: int) -> dict:
-    """领取免费产品（SubID 通道）。返回 {status: ok|own|fail, detail}；结果落激活账本（来源类型 free）。"""
-    jar, sessionid, steamid = await _login_session()
-    referer = f"https://store.steampowered.com/checkout/freelicense/{subid}/"
-    url = ADD_FREE_LICENSE_URL.rstrip("/") + f"/{subid}"
-    resp: httpx.Response | None
-    try:
-        resp = await _post_steam(
-            url, {"sessionid": sessionid, "action": "approve"}, jar, referer=referer
-        )
-    except httpx.HTTPError as e:
-        resp = None
-        result: dict = {"status": "fail", "detail": f"领取请求失败：{e}"}
-
-    if resp is not None:
-        if resp.status_code == 401:
-            result = {"status": "fail", "detail": "Cookie 已失效，请重新绑定"}
-        elif resp.status_code == 429:
-            result = {"status": "fail", "detail": "领取节点被限流（429），请稍后再试或切换 Clash 节点"}
-        # 302 = 提交被受理（跳转回结算页）；200 且 body 为 JSON 也算受理。
-        # 200 但 HTML 多半是登录页/错误页（页面层会话校验拒绝，钱包模块同款）——不冒领。
-        # ⚠️ checkout 域重定向是**两跳**——第一跳 302 → checkout 页
-        # （看似受理），第二跳 302 → **登录页**（页面层拒绝，license 根本没发）。
-        # 只看第一跳 Location 会误报"已提交领取"；必须跟随整条链看终点是否登录页。
-        elif resp.status_code == 302:
-            if await _redirect_chain_hits_login(resp):
-                result = {"status": "fail",
-                          "detail": "Steam 页面层未认登录态（重定向到登录页）——请切换 Clash 节点重试"}
-            else:
-                result = {"status": "ok", "detail": "已提交领取"}
-        elif resp.status_code == 200:
-            body = ""
-            try:
-                body = resp.text[:400]
-            except Exception:  # noqa: BLE001
-                pass
-            if body.lstrip().startswith("{"):
-                data = resp.json()
-                if data.get("success") in (1, True):
-                    result = {"status": "ok", "detail": "已提交领取"}
-                elif int(data.get("error") or 0) == 24:
-                    result = {"status": "own", "detail": "已拥有该产品"}
-                else:
-                    result = {"status": "fail", "detail": f"领取被拒绝（{data.get('error_text') or data}）"}
-            else:
-                result = {"status": "fail",
-                          "detail": "Steam 页面层未认登录态（返回页面）——请切换 Clash 节点重试"}
-        else:
-            body_hint = ""
-            try:
-                body_hint = resp.text[:120]
-            except Exception:  # noqa: BLE001
-                pass
-            result = {"status": "fail", "detail": f"Steam 拒绝了领取请求（HTTP {resp.status_code}）{body_hint}"}
-
-    await _record_ledger(
-        kind="free",
-        status=result["status"],
-        subid=str(subid),
-        detail=result["detail"],
-        steamid=steamid,
-    )
-    return result
-
-
-async def add_free_licenses(subids: list[int]) -> dict:
-    """批量领取免费产品（串行）。返回逐 ID 结果与汇总。"""
-    if not subids:
-        raise ValueError("SubID 列表为空")
-    results: list[dict] = []
-    ok = own = fail = 0
-    for subid in subids:
-        r = await add_free_license(subid)
-        r = {"subid": subid, **r}
-        results.append(r)
-        if r["status"] == "ok":
-            ok += 1
-        elif r["status"] == "own":
-            own += 1
-        else:
-            fail += 1
     return {"results": results, "ok": ok, "own": own, "fail": fail}
 
 
