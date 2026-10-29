@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import importlib.util
-import os
 import sys
 from pathlib import Path
 
@@ -353,33 +352,6 @@ def test_handoff_ledger_not_recorded_when_popen_fails(tmp_path: Path, monkeypatc
     assert desktop._handoff_pending_update() is False
     assert not (data_dir / desktop.HANDOFF_LEDGER_NAME).exists()
     # 暂存包依然完好
-    assert (staging / "manifest.json").exists()
-
-
-def test_startup_preserves_staging_during_health_verification(tmp_path, monkeypatch):
-    data = tmp_path / "data"
-    staging = data / desktop.STAGING_DIR_NAME
-    staging.mkdir(parents=True)
-    marker = staging / "runtime.txt"
-    marker.write_text("in use", encoding="utf-8")
-    monkeypatch.setattr(desktop, "_data_dir", lambda: data)
-    desktop._health_checking_flag().write_text("verifying", encoding="utf-8")
-    desktop._cleanup_staging_leftover()
-    assert marker.exists()
-
-
-def test_handoff_does_not_remove_active_helper_staging(tmp_path, monkeypatch):
-    data = tmp_path / "data"
-    staging = data / "update-staging"
-    _make_payload(staging)
-    _stage_manifest(staging)
-    monkeypatch.setattr(desktop, "_data_dir", lambda: data)
-    monkeypatch.setattr(desktop, "is_frozen", lambda: True)
-    monkeypatch.setattr("app.core.update_host.supports_data_protocol", lambda *a: True)
-    desktop._health_checking_flag().write_text(
-        __import__("json").dumps({"pid": os.getpid(), "attemptId": "active"}), encoding="utf-8"
-    )
-    assert desktop._handoff_pending_update() is False
     assert (staging / "manifest.json").exists()
 
 

@@ -526,8 +526,6 @@ _MANIFEST_NAME = STAGING_MANIFEST_NAME
 _UNSUPPORTED_MARK = HANDOFF_UNSUPPORTED_MARK
 # 更新失败标记随数据目录保留。
 _FAILED_MARK = SWAP_FAILED_FLAG
-# 换装健康检查进行中标记：期间新旧实例均不许删除 __old__ 备份
-_HEALTH_CHECK_MARK = ".health-checking"
 
 
 def _update_log() -> Path:
@@ -547,32 +545,9 @@ def _log_update(message: str) -> None:
         pass
 
 
-def _update_diagnosis_file() -> Path:
-    """换装诊断报告路径。"""
-    logs = _data_dir() / "logs"
-    logs.mkdir(parents=True, exist_ok=True)
-    return logs / "update-diagnosis.json"
-
-
-def _read_diagnosis() -> dict:
-    """读取最近一次换装诊断记录。"""
-    try:
-        path = _update_diagnosis_file()
-        if path.is_file():
-            return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return {}
-
-
 def _swap_failed_flag() -> Path:
     """上次换装失败的安装状态标记。"""
     return _data_dir() / _FAILED_MARK
-
-
-def _health_checking_flag() -> Path:
-    """换装后健康验收进行中的标记。"""
-    return _data_dir() / _HEALTH_CHECK_MARK
 
 
 _SWAP_MUTEX_NAME = f"{APP_NAME}-update-swap"
@@ -705,19 +680,6 @@ def _handoff_pending_update() -> bool:
     if not is_frozen():
         return False
 
-    checking = _health_checking_flag()
-    if checking.is_file():
-        try:
-            owner = int(json.loads(checking.read_text(encoding="utf-8"))["pid"])
-            if owner > 0 and not _wait_pid_exit(owner, timeout=0):
-                _log_update("更新仍在验收，本次启动保留暂存与原版本备份")
-                return False
-        except (OSError, ValueError, TypeError, KeyError):
-            pass
-        if not _read_diagnosis().get("success"):
-            _mark_swap_failed(_app_root())
-        _clear_update_marker(checking)
-
     # 上次换装失败过：交接只会在旧进程退出后重演同一次失败，用户看到的是
     # 「点了更新、应用关掉、版本没变」。标记是安装状态，只在重新下载解出
     # 新暂存包时解除（见 app/core/updater.py）。
@@ -831,13 +793,6 @@ def _handoff_pending_update() -> bool:
     return True
 
 
-def _clear_update_marker(path: Path) -> None:
-    try:
-        path.unlink(missing_ok=True)
-    except OSError as exc:
-        _log_update(f"更新标记暂未清理：{exc}")
-
-
 def _mark_swap_failed(target: Path) -> None:
     """登记换装失败的安装状态。
 
@@ -853,12 +808,8 @@ def _mark_swap_failed(target: Path) -> None:
 
 
 def _should_clean_old_dir(old_dir: Path) -> bool:
-    """`__old__` 清理判据：存在，且没有换装失败标记或健康验收标记。"""
-    return (
-        old_dir.exists()
-        and not _swap_failed_flag().is_file()
-        and not _health_checking_flag().is_file()
-    )
+    """`__old__` 清理判据：存在，且没有换装失败标记。"""
+    return old_dir.exists() and not _swap_failed_flag().is_file()
 
 
 def _cleanup_old_dir_async(old_dir: Path) -> None:
@@ -882,8 +833,6 @@ def _cleanup_staging_leftover() -> None:
     """
 
     staging = _data_dir() / STAGING_DIR_NAME
-    if _health_checking_flag().is_file():
-        return
     if not staging.is_dir():
         return
     if (staging / _MANIFEST_NAME).is_file() and not _swap_failed_flag().is_file():
