@@ -21,7 +21,7 @@ from sqlalchemy.orm import aliased
 
 from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.logging import log_event
-from app.crawler.utils import get_beijing_time_obj
+from app.crawler.utils import clean_appids, get_beijing_time_obj
 from app.domains.crawl import freshness as freshness_service
 from app.domains.regions.service import effective_regions
 from app.domains.games import tags as game_tags
@@ -1922,18 +1922,6 @@ async def retry_removed_game(appid: int) -> dict:
 # ── 目录移除（假删除）：商店列表隐藏 + 停止价格刷新，可恢复 ──────────
 
 
-def _clean_appids(appids: list[int]) -> list[int]:
-    """入参规整：正整数、去重、保序。"""
-    clean: list[int] = []
-    for a in appids:
-        try:
-            appid = int(a)
-        except (TypeError, ValueError):
-            continue
-        if appid > 0 and appid not in clean:
-            clean.append(appid)
-    return clean
-
 
 async def remove_games(appids: list[int]) -> dict:
     """批量移出游戏商店（假删除）。
@@ -1948,7 +1936,7 @@ async def remove_games(appids: list[int]) -> dict:
     返回 {removed, missing}：removed 以落在目录里的 appid 计，missing 为
     目录中不存在的 appid 数。
     """
-    clean = _clean_appids(appids)
+    clean = clean_appids(appids)
     if not clean:
         return {"removed": 0, "missing": 0}
 
@@ -1995,7 +1983,7 @@ async def restore_games(appids: list[int]) -> dict:
 
     返回 {restored, missing}：restored 以实际删行的 appid 计。
     """
-    clean = _clean_appids(appids)
+    clean = clean_appids(appids)
     if not clean:
         return {"restored": 0, "missing": 0}
 
