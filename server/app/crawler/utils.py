@@ -111,3 +111,18 @@ def extract_version_suffix(option_text: str | None, name_en: str | None) -> str:
     if is_gold_edition(package_name):
         return "Gold Edition"
     return ""
+
+
+def clean_appids(values) -> list[int]:
+    """入参规整：正整数、去重、保序（域边界批量入口共用单实现）。"""
+    clean: list[int] = []
+    seen: set[int] = set()
+    for a in values or []:
+        try:
+            appid = int(a)
+        except (TypeError, ValueError):
+            continue
+        if appid > 0 and appid not in seen:
+            seen.add(appid)
+            clean.append(appid)
+    return clean
