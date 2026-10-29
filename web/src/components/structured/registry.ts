@@ -48,7 +48,6 @@ class StructuredComponentRegistry {
         componentId: 'metric-grid',
         nameKey: 'structured.components.metricGrid',
         descriptionKey: 'structured.components.metricGrid',
-        agentDescription: 'Presents KPI numbers, coverage rates, proxy health scores, or bills/achievements summary with trends and benchmarks.',
         supportedDensities: ['compact', 'standard', 'expanded'],
         supportedHosts: ['pilot-drawer', 'pilot-page', 'view-page', 'dashboard'],
         schemaType: 'MetricGridData',
@@ -61,7 +60,6 @@ class StructuredComponentRegistry {
         componentId: 'data-table',
         nameKey: 'structured.components.dataTable',
         descriptionKey: 'structured.components.dataTable',
-        agentDescription: 'Renders structured tabular records with sorting, pagination, status pills, and row actions.',
         supportedDensities: ['compact', 'standard', 'expanded'],
         supportedHosts: ['pilot-drawer', 'pilot-page', 'view-page', 'dashboard'],
         schemaType: 'DataTableData',
@@ -74,7 +72,6 @@ class StructuredComponentRegistry {
         componentId: 'time-series',
         nameKey: 'structured.components.timeSeries',
         descriptionKey: 'structured.components.timeSeries',
-        agentDescription: 'Renders step lines or smooth curves for price history, network latency, or system throughput over time.',
         supportedDensities: ['compact', 'standard', 'expanded'],
         supportedHosts: ['pilot-drawer', 'pilot-page', 'view-page', 'dashboard'],
         schemaType: 'TimeSeriesData',
@@ -87,7 +84,6 @@ class StructuredComponentRegistry {
         componentId: 'coverage-matrix',
         nameKey: 'structured.components.coverageMatrix',
         descriptionKey: 'structured.components.coverageMatrix',
-        agentDescription: '2D matrix showing multi-region crawl coverage, success/failed status, and reasons across games or nodes.',
         supportedDensities: ['compact', 'standard', 'expanded'],
         supportedHosts: ['pilot-drawer', 'pilot-page', 'view-page', 'dashboard'],
         schemaType: 'CoverageMatrixData',
@@ -100,7 +96,6 @@ class StructuredComponentRegistry {
         componentId: 'status-board',
         nameKey: 'structured.components.statusBoard',
         descriptionKey: 'structured.components.statusBoard',
-        agentDescription: 'System status board for proxies, scheduler, write gate, updater, and background tasks.',
         supportedDensities: ['compact', 'standard', 'expanded'],
         supportedHosts: ['pilot-drawer', 'pilot-page', 'view-page', 'dashboard'],
         schemaType: 'StatusBoardData',
@@ -114,7 +109,6 @@ class StructuredComponentRegistry {
         componentId: 'legacy-price',
         nameKey: 'structured.components.legacyPrice',
         descriptionKey: 'structured.components.legacyPrice',
-        agentDescription: 'Display single game price, discount, ATL benchmark, and 1-year median.',
         supportedDensities: ['standard', 'compact'],
         supportedHosts: ['pilot-drawer', 'pilot-page'],
         schemaType: 'PilotPriceFacts',
@@ -127,7 +121,6 @@ class StructuredComponentRegistry {
         componentId: 'legacy-games',
         nameKey: 'structured.components.legacyGames',
         descriptionKey: 'structured.components.legacyGames',
-        agentDescription: 'Display list of games with cover, rating, discount, and filter chips.',
         supportedDensities: ['standard', 'compact'],
         supportedHosts: ['pilot-drawer', 'pilot-page'],
         schemaType: 'PilotGameFacts',
@@ -140,7 +133,6 @@ class StructuredComponentRegistry {
         componentId: 'legacy-action',
         nameKey: 'structured.components.legacyAction',
         descriptionKey: 'structured.components.legacyAction',
-        agentDescription: 'Receipt for completed actions like following or setting alerts.',
         supportedDensities: ['compact', 'standard'],
         supportedHosts: ['pilot-drawer', 'pilot-page'],
         schemaType: 'PilotActionFacts',
@@ -153,7 +145,6 @@ class StructuredComponentRegistry {
         componentId: 'legacy-navigate',
         nameKey: 'structured.components.legacyNavigate',
         descriptionKey: 'structured.components.legacyNavigate',
-        agentDescription: 'Navigation guide to open specific app views.',
         supportedDensities: ['compact', 'standard'],
         supportedHosts: ['pilot-drawer', 'pilot-page'],
         schemaType: 'PilotNavigateFacts',
@@ -166,7 +157,6 @@ class StructuredComponentRegistry {
         componentId: 'legacy-rows',
         nameKey: 'structured.components.legacyRows',
         descriptionKey: 'structured.components.legacyRows',
-        agentDescription: 'Display diagnostic key-value rows.',
         supportedDensities: ['compact', 'standard'],
         supportedHosts: ['pilot-drawer', 'pilot-page'],
         schemaType: 'PilotRowsFacts',
@@ -179,7 +169,6 @@ class StructuredComponentRegistry {
         componentId: 'legacy-family',
         nameKey: 'structured.components.legacyFamily',
         descriptionKey: 'structured.components.legacyFamily',
-        agentDescription: 'Display Steam family group status and member quotas.',
         supportedDensities: ['standard', 'compact'],
         supportedHosts: ['pilot-drawer', 'pilot-page'],
         schemaType: 'PilotFamilyFacts',
@@ -192,7 +181,6 @@ class StructuredComponentRegistry {
         componentId: 'legacy-achievements',
         nameKey: 'structured.components.legacyAchievements',
         descriptionKey: 'structured.components.legacyAchievements',
-        agentDescription: 'Display platinum achievements and recent unlocks.',
         supportedDensities: ['standard', 'compact'],
         supportedHosts: ['pilot-drawer', 'pilot-page'],
         schemaType: 'PilotAchievementFacts',
@@ -205,7 +193,6 @@ class StructuredComponentRegistry {
         componentId: 'legacy-proposal',
         nameKey: 'structured.components.legacyProposal',
         descriptionKey: 'structured.components.legacyProposal',
-        agentDescription: 'Interactive proposal panel requiring user approval.',
         supportedDensities: ['standard', 'compact'],
         supportedHosts: ['pilot-drawer', 'pilot-page'],
         schemaType: 'PilotProposalFacts',
@@ -218,7 +205,6 @@ class StructuredComponentRegistry {
         componentId: 'legacy-regions',
         nameKey: 'structured.components.legacyRegions',
         descriptionKey: 'structured.components.legacyRegions',
-        agentDescription: 'Display multi-region price comparison matrix.',
         supportedDensities: ['standard', 'expanded'],
         supportedHosts: ['pilot-drawer', 'pilot-page'],
         schemaType: 'PilotRegionsFacts',
@@ -231,7 +217,6 @@ class StructuredComponentRegistry {
         componentId: 'legacy-compare',
         nameKey: 'structured.components.legacyCompare',
         descriptionKey: 'structured.components.legacyCompare',
-        agentDescription: 'Compare attributes and prices of multiple games side by side.',
         supportedDensities: ['standard', 'expanded'],
         supportedHosts: ['pilot-drawer', 'pilot-page'],
         schemaType: 'PilotCompareFacts',
@@ -244,7 +229,6 @@ class StructuredComponentRegistry {
         componentId: 'legacy-stepper',
         nameKey: 'structured.components.legacyStepper',
         descriptionKey: 'structured.components.legacyStepper',
-        agentDescription: 'Multi-step workflow progress indicator.',
         supportedDensities: ['standard', 'compact'],
         supportedHosts: ['pilot-drawer', 'pilot-page'],
         schemaType: 'PilotStepperFacts',
@@ -257,7 +241,6 @@ class StructuredComponentRegistry {
         componentId: 'legacy-epic',
         nameKey: 'structured.components.legacyEpic',
         descriptionKey: 'structured.components.legacyEpic',
-        agentDescription: 'Display Epic Games Store free promotions.',
         supportedDensities: ['standard', 'compact'],
         supportedHosts: ['pilot-drawer', 'pilot-page'],
         schemaType: 'PilotEpicFacts',
@@ -274,39 +257,9 @@ class StructuredComponentRegistry {
     this.registrations.set(meta.componentId, { meta, component })
   }
 
-  /** 获取组件元数据 */
-  getMeta(componentId: string): ComponentMeta | undefined {
-    return this.registrations.get(componentId)?.meta
-  }
-
   /** 获取组件渲染器 */
   getComponent(componentId: string): Component | undefined {
     return this.registrations.get(componentId)?.component
-  }
-
-  /** 检查是否已注册 */
-  has(componentId: string): boolean {
-    return this.registrations.has(componentId)
-  }
-
-  /** 获取所有注册元数据 */
-  getAllMeta(): ComponentMeta[] {
-    return Array.from(this.registrations.values()).map((r) => r.meta)
-  }
-
-  /**
-   * 导出供 Agent 自动发现与选择的轻量组件能力目录。
-   */
-  getAgentCatalog(): Array<{
-    id: string
-    description: string
-    schemaType?: string
-  }> {
-    return this.getAllMeta().map((m) => ({
-      id: m.componentId,
-      description: m.agentDescription,
-      schemaType: m.schemaType,
-    }))
   }
 }
 
