@@ -22,7 +22,7 @@ class CrawlRunRequest(BaseModel):
     # | wishlist_only | owned | pool（全池，愿望单优先序排前）
     appids: list[int] | None = None
     regions: list[str] | None = None
-    kind: str = "manual"  # manual | missing | backfill（定时层专用 kind 亦可显式触发）
+    kind: str = "manual"  # manual | missing（定时层专用 kind 亦可显式触发）
     # missing/repair 补抓冷却覆盖（分钟）；None=通道默认（missing 24h / repair 4min），
     # 0=立即补——「立即补抓失败地区」入口用它跳过冷却
     cooldown: int | None = None

@@ -1149,11 +1149,11 @@ class DbWriter:
             return 0
 
     async def mark_non_game_type(self, appid: int, app_type: str) -> None:
-        """非 game/dlc 短路路径落 type + updated_at（脱离回补池）。
+        """非 game/dlc 短路路径落 type + updated_at（脱离首爬候选）。
 
         app_handler 对 type 不在 (game, dlc) 或 coming_soon 无包的
-        任务静默丢弃——但挂名孤儿/首爬候选若不落 updated_at 会永留
-        回补池（updated_at IS NULL 判据），每天被空转重爬一次。此
+        任务静默丢弃——但挂名行若不落 updated_at 会一直被榜单反哺当
+        首爬候选（updated_at IS NULL 判据），每轮空转重爬一次。此
         处只写 type/时间戳两列，不碰其他元数据（名字保持挂名值）。
         """
         try:
@@ -1371,7 +1371,7 @@ class DbWriter:
     async def mark_coming_soon(self, appid: int) -> None:
         """coming_soon 无包（未开放预购/未上线）暂缓语义：type=COMING_SOON 挂名行。
 
-        与 mark_non_game_type 的脱池机制相同（updated_at 落值防回补池空转），
+        与 mark_non_game_type 的脱池机制相同（updated_at 落值防反哺空转），
         但 type 单独成类，区别于"永不入库"的 DEMO/MOD 等——重探通道按
         type=COMING_SOON 选候选，开放预购/上线后正常入库覆盖此行。
         只写 type/时间戳，不碰其他元数据（名字保持挂名值）。
@@ -1407,8 +1407,8 @@ class DbWriter:
     async def bump_removed_strike(self, appid: int) -> bool:
         """全 404 轮记一击；连续 ≥2 击（跨两个价格刷新周期）→ 落 removed_at 终态。
 
-        只对库内已有元数据（updated_at 有值）的行生效——挂名孤儿/COMING_SOON
-        无"曾经有数据"事实，不走下架判定（走回补/重探池）。返回是否已转终态。
+        只对库内已有元数据（updated_at 有值）的行生效——挂名行/COMING_SOON
+        无"曾经有数据"事实，不走下架判定（走反哺/重探通道）。返回是否已转终态。
         """
         try:
             async with write_session(WritePriority.BACKGROUND) as session:
@@ -1599,41 +1599,3 @@ class DbWriter:
                 detail={"原因": e},
             )
         return tasks
-
-    async def get_uncrawled_appids(self) -> set[int]:
-        """未爬过价格的游戏 appid（当前库内有行的部分）。
-
-        判定"已爬"= game_current_prices 存在 ok 且有价的价格行；
-        两种"无数据"形态都算未爬：
-        - games 行 updated_at IS NULL（挂名孤儿：展示层兜底只写
-          appid+name，无任何价格/元数据）；
-        - games 无行（从未入库）——本集合天然不包含（只查库内行），
-          从未入库的 appid 由消费方以"不在已爬集合"兜住。
-
-        预检只能判断"要不要刷新"，不能替代首爬；无价格数据的游戏
-        被预检 skip 就是永久漏抓（空库上全新 appid 会被预检
-        "两区均无打折"全 skip，如 620/570）。
-        """
-        try:
-            async with get_session_factory()() as session:
-                rows = await session.execute(
-                    select(GameCurrentPrice.appid).where(
-                        GameCurrentPrice.price_status == "ok",
-                        GameCurrentPrice.price.is_not(None),
-                    )
-                )
-                crawled = {int(r) for r in rows.scalars()}
-                # 挂名孤儿（有 games 行但 updated_at NULL）强制算未爬
-                orphan_rows = await session.execute(
-                    select(Game.appid).where(Game.updated_at.is_(None))
-                )
-                orphan_ids = {int(r) for r in orphan_rows.scalars()}
-                return orphan_ids - crawled
-        except Exception as e:
-            log_event(
-                logger,
-                "查询未爬取价格的游戏失败",
-                level=logging.ERROR,
-                detail={"原因": e},
-            )
-            return set()
