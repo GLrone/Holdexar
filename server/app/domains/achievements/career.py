@@ -16,8 +16,6 @@
 from __future__ import annotations
 
 import json
-import secrets
-import time
 from collections import Counter, defaultdict
 from datetime import date, datetime
 
@@ -37,11 +35,6 @@ from app.domains.games import tags as game_tags
 from app.domains.games.models import Game
 from app.domains.games.series import _display_name_for
 from app.domains.settings import service as settings_service
-
-# ─── 评语墙（用户手写便利贴，落 settings KV，与同步快照同一持久化通道）──
-WALL_KEY = "achievements.career_wall"
-WALL_MAX = 60
-WALL_TEXT_MAX = 140
 
 # 时长分布分档（分钟左闭右开；hi=None 表示不设上界），档位文案由前端按序取 key
 PLAYTIME_BUCKETS: tuple[tuple[int, int | None], ...] = (
@@ -855,48 +848,3 @@ def _fill_taste(career: dict, pairs: list, tag_map: dict[int, list[dict]]) -> No
             if newest else None
         ),
     })
-
-
-# ─── 评语墙（手写便利贴）──────────────────────────────────────
-
-
-def _clean_wall(raw) -> list[dict]:
-    if not isinstance(raw, list):
-        return []
-    out: list[dict] = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        text = str(item.get("text") or "").strip()
-        if not text:
-            continue
-        out.append({
-            "id": str(item.get("id") or secrets.token_hex(6)),
-            "text": text[:WALL_TEXT_MAX],
-            "at": int(item.get("at") or 0),
-        })
-    return out[-WALL_MAX:]
-
-
-async def list_wall() -> list[dict]:
-    return _clean_wall(await settings_service.get_value(WALL_KEY, []))
-
-
-async def add_wall(text: str) -> list[dict]:
-    """追加一条便利贴（超长/空白拒绝，超出上限丢最旧）。"""
-    body = " ".join(str(text or "").split())
-    if not body:
-        raise ValueError("评语不能为空")
-    if len(body) > WALL_TEXT_MAX:
-        raise ValueError(f"评语最长 {WALL_TEXT_MAX} 字")
-    notes = await list_wall()
-    notes.append({"id": secrets.token_hex(6), "text": body, "at": int(time.time())})
-    notes = notes[-WALL_MAX:]
-    await settings_service.set_value(WALL_KEY, notes)
-    return notes
-
-
-async def remove_wall(comment_id: str) -> list[dict]:
-    notes = [n for n in await list_wall() if n["id"] != comment_id]
-    await settings_service.set_value(WALL_KEY, notes)
-    return notes
