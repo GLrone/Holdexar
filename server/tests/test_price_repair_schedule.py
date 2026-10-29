@@ -395,16 +395,20 @@ async def test_price_refresh_calls_once_and_defers_to_next_repair_tick(db, monke
 
 @pytest.mark.asyncio
 async def test_repair_failure_keeps_missing_flag(db):
-    """修复仍失败 → mark_region_status('missing') 照常计账：失败标志
-    保留、fail_count 递增（穷尽 5 次转 blocked）——账本机制复用，不因
-    5min 高频改语义。"""
+    """修复仍失败 → 批量传输记账：失败标志保留，但不消耗烧尽预算——
+    fail_count 只累计真实响应缺价证据，4min 高频修复轮不再把传输故障
+    烧成 blocked 终态。"""
     db_ = DbWriter()
-    await db_.mark_region_status(APPID, "CN", "missing")
+    await db_.mark_region_status_missing_batch([(APPID, "CN")])
     async with db() as session:
         row = await session.get(GameCurrentPrice, (APPID, "CN"))
     assert row is not None
     assert row.price_status == "missing"
-    assert row.fail_count == 2  # 播种 1 + 本次失败 1
+    assert row.fail_count == 1  # 首记=1；传输失败不递增
+    await db_.mark_region_status_missing_batch([(APPID, "CN")])
+    async with db() as session:
+        row = await session.get(GameCurrentPrice, (APPID, "CN"))
+    assert row.fail_count == 1  # 重复传输失败不递增
 
 
 @pytest.mark.asyncio
