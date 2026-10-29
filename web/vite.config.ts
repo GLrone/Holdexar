@@ -56,7 +56,11 @@ export default defineConfig({
     port: 8080,
     proxy: {
       // 并行验证可 VITE_PROXY_TARGET 覆盖（默认 28765 主后端不动）
-      '/api': process.env.VITE_PROXY_TARGET || 'http://127.0.0.1:28765',
+      '/api': {
+        target: process.env.VITE_PROXY_TARGET || 'http://127.0.0.1:28765',
+        // 保留原始 Host，供后端核对 Origin。
+        changeOrigin: false,
+      },
     },
   },
   build: {
