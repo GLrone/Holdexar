@@ -433,15 +433,25 @@ async def sync_family_group(steam_id: str | None = None) -> dict:
         try:
             results.append(await _sync_group_for_account(sid, cookies, now))
         except Exception as e:  # noqa: BLE001 —— 单账号失败隔离
-            # 异常 str 可能为空（部分网络异常无消息）：类型名保底，失败必须可读
+            error = (f"Steam 家庭请求失败（HTTP {e.response.status_code}），请重试同步"
+                     if isinstance(e, httpx.HTTPStatusError) else "家庭组同步未完成，请重试同步")
+            async with write_session(WritePriority.BACKGROUND) as session:
+                row = await session.get(FamilyGroup, sid)
+                if row is None:
+                    row = FamilyGroup(steamid=sid, members_json=[], member_count=0)
+                    session.add(row)
+                row.fetch_ok = False
+                row.last_error = error
+                row.updated_at = now
+                await session.commit()
             log_event(
                 logger,
                 "该账号家庭组同步失败",
                 level=logging.WARNING,
-                detail={"SteamID": sid, "原因": str(e)},
+                detail={"SteamID": sid, "原因": error, "异常类型": type(e).__name__},
             )
             results.append({"steamid": sid, "joined": False,
-                            "error": (str(e) or type(e).__name__)[:200]})
+                            "error": error})
     joined = sum(1 for r in results if r.get("joined"))
     failed = sum(1 for r in results if "error" in r)
     return {"results": results, "synced": len(results), "joined": joined, "failed": failed}
@@ -863,8 +873,8 @@ async def get_status() -> dict:
         groups.append({
             "steamid": sid,
             "accountName": a.get("persona_name") or "",
-            "synced": row is not None,
-            "joined": bool(row.member_count) if row else None,
+            "synced": row is not None and not row.last_error,
+            "joined": bool(row.member_count) if row and (not row.last_error or row.member_count) else None,
             "familyName": row.family_name if row else None,
             "familyGroupid": row.family_groupid if row else None,
             "updatedAt": row.updated_at.isoformat() if row and row.updated_at else None,

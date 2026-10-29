@@ -64,6 +64,35 @@ async def _seed_account(db, sid=PRIMARY, cookies=COOKIE, wallet=None):
         await session.commit()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('had_group', [False, True])
+async def test_family_failure_keeps_members_and_reports_unsynced_without_token(db, monkeypatch, had_group):
+    import httpx
+    from app.domains.family.models import FamilyGroup
+
+    await _seed_account(db)
+    if had_group:
+        async with db() as session:
+            session.add(FamilyGroup(steamid=PRIMARY, family_groupid='1', member_count=1, fetch_ok=True,
+                                    members_json=[{'steamid': PRIMARY, 'personaName': 'A'}]))
+            await session.commit()
+    async def failed(token):
+        request = httpx.Request('GET', 'https://api.steampowered.com/?access_token=PRIVATE')
+        raise httpx.HTTPStatusError('PRIVATE', request=request, response=httpx.Response(403, request=request))
+    monkeypatch.setattr(family_service, '_fetch_family_group', failed)
+    result = await family_service.sync_family_group(PRIMARY)
+    assert result['failed'] == 1
+    assert 'PRIVATE' not in str(result)
+    async with db() as session:
+        row = await session.get(FamilyGroup, PRIMARY)
+        assert row.member_count == int(had_group) and len(row.members_json) == int(had_group)
+        assert row.fetch_ok is False and '403' in row.last_error
+    status = await family_service.get_status()
+    assert status['groups'][0]['synced'] is False
+    assert status['groups'][0]['joined'] is (True if had_group else None)
+    assert '403' in status['groups'][0]['lastError']
+
+
 async def _clear_account_cookie(db, sid=PRIMARY):
     """摘除账号行 Cookie（实时聚合必失败的模拟）。"""
     from app.domains.account.models import SteamAccount
@@ -564,8 +593,8 @@ async def test_sync_multi_account(db, monkeypatch):
     assert row_a.member_count == 2 and row_a.family_name == "甲组"
     assert row_a.members_json[1]["loccountrycode"] == "RU"
     assert row_b.member_count == 0  # 未加入也落行（joined=False 快照）
-    assert row_c is None  # 失败账号不落行（无旧快照可保）
-    assert "steam 500" in (r["results"][2].get("error") or "")
+    assert row_c.fetch_ok is False and row_c.last_error
+    assert r["results"][2]["error"] == row_c.last_error
     assert {t.steamid for t in tracked} >= {PRIMARY, FRIEND}
 
     # 指定账号单同步：只动该账号（单账号路径按 get_cookies_of 取 Cookie）
@@ -629,7 +658,7 @@ async def test_status_groups_and_region_chain(db, monkeypatch):
 
     g1, g2 = st["groups"]
     assert g1["joined"] is True and g1["familyName"] == "甲组"
-    assert g2["joined"] is False and g2["synced"] is True
+    assert g2["joined"] is None and g2["synced"] is False
     assert g2["members"] == []  # 未加入组：空成员而不是他组数据
 
     region = {m["steamid"]: (m["region"], m["regionSource"]) for m in g1["members"]}

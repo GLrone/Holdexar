@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 
 import {
   familyApi,
@@ -12,6 +12,7 @@ import {
 import { message } from '@/components/ui'
 import { useI18n } from '@/locales'
 import { normalizeAvatarUrl } from '@/api/avatar'
+import { useAccountStore } from './account'
 
 /**
  * 家庭共享库共享数据源：family 页各 tab 的统一真数据后端快照。
@@ -20,6 +21,7 @@ import { normalizeAvatarUrl } from '@/api/avatar'
  * message（未绑 Cookie / 未加入家庭组 → 诚实引导），tabs 各自渲染空态。
  */
 export const useFamilyStore = defineStore('familyLib', () => {
+  const accountStore = useAccountStore()
   const { t } = useI18n()
   const data = ref<FamilyLibraryPayload | null>(null)
   const loading = ref(false)
@@ -39,19 +41,23 @@ export const useFamilyStore = defineStore('familyLib', () => {
   function setGroups(list: FamilyGroupStatus[]) {
     groups.value = list
     if (!activeSteamId.value || !list.some((g) => g.steamid === activeSteamId.value)) {
-      activeSteamId.value = list.find((g) => g.joined)?.steamid ?? list[0]?.steamid ?? ''
+      activeSteamId.value = list.find(g => g.steamid === accountStore.active?.steam_id)?.steamid
+        ?? list.find((g) => g.joined)?.steamid ?? list[0]?.steamid ?? ''
+      data.value = null
       dataSteamId.value = '' // 组变了：旧库数据作废
     }
   }
 
   /** 切换当前组并按组重拉家庭库（同组重复调用是 no-op） */
   async function setActiveGroup(sid: string) {
-    if (!sid || sid === activeSteamId.value) return
+    if (sid === activeSteamId.value) return
     activeSteamId.value = sid
     data.value = null
     dataSteamId.value = ''
     await load()
   }
+
+  watch(() => accountStore.active?.steam_id, sid => { void setActiveGroup(sid || '') })
 
   // 成员头像 URL 就地归一（旧快照可能是已死/轮换 CDN 域）——7 个 tab 同源
   const members = computed<FamilyLibMember[]>(() =>
@@ -120,6 +126,7 @@ export const useFamilyStore = defineStore('familyLib', () => {
 
   async function load(force = false) {
     if (loading.value) return
+    if (!activeSteamId.value) activeSteamId.value = accountStore.active?.steam_id || ''
     // 已就绪（数据归属当前组）且非强制刷新：直接复用。守卫必须在这一层
     // （各 tab 组件只写自己那份），因为 family 首页的 onMounted 每次进入
     // 都会调一次 load()——不加这行，板块来回切就是一次次白等。
@@ -128,15 +135,19 @@ export const useFamilyStore = defineStore('familyLib', () => {
     loading.value = true
     error.value = ''
     try {
-      data.value = force
+      const next = force
         ? await familyApi.refreshLibrary(target || undefined)
         : await familyApi.library(target || undefined)
-      dataSteamId.value = target
+      if (target === activeSteamId.value) {
+        data.value = next
+        dataSteamId.value = target
+      }
     } catch (e) {
       error.value = e instanceof Error ? e.message : String(e)
       if (!data.value) data.value = null
     } finally {
       loading.value = false
+      if (target !== activeSteamId.value) await load()
     }
   }
 

@@ -8,8 +8,8 @@ import { normalizeAvatarUrl } from '@/api/avatar'
  * Steam 多账户绑定与钱包余额（顶栏胶囊 + 设置页「我」共享）。
  * load() 只读快照不触发抓取；sync() 强制向 Steam 抓一次（当前账号）。
  *
- * 多账号语义：主账号 = accounts[0]（第一个绑定的，愿望单/家庭/账单跟随）；
- * 当前账号（active）= is_active 的操作账号（钱包展示/CDK 激活/免费领取跟随）。
+ * 主账号 = 首个绑定账号；愿望单、家庭和账单按各自账号同步。
+ * 当前账号（active）是默认账单同步、钱包刷新与工具操作的目标。
  */
 export const useAccountStore = defineStore('account', () => {
   const status = ref<AccountStatus | null>(null)

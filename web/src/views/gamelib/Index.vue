@@ -19,7 +19,7 @@ import GlPlay from './tabs/GlPlay.vue'
 const { t } = useI18n()
 const ownedStore = useOwnedLibStore()
 onMounted(() => {
-  void ownedStore.load()
+  void ownedStore.load(true)
 })
 
 const activeTab = ref('owned')

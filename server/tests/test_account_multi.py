@@ -19,6 +19,27 @@ A = "76561198000000001"
 B = "76561198000000002"
 C = "76561198000000003"
 
+
+@pytest.mark.asyncio
+async def test_scheduled_bills_sync_continues_after_one_account_fails(monkeypatch):
+    from app.core import scheduler
+    from app.domains.bills import service as bills_service
+
+    async def accounts():
+        return [{"steam_id": A}, {"steam_id": B}]
+
+    calls = []
+    async def sync(*, force, steam_id):
+        calls.append((force, steam_id))
+        if steam_id == A:
+            raise RuntimeError("failed account")
+        return {"ok": True}
+
+    monkeypatch.setattr(account_service, "list_accounts", accounts)
+    monkeypatch.setattr(bills_service, "sync_bills", sync)
+    await scheduler._job_bills_sync()
+    assert calls == [(False, A), (False, B)]
+
 # 与 steamLoginSecure 编码格式一致的 Cookie 串构造器
 def cookie(sid: str, token: str = "jwt-token") -> str:
     return f"sessionid=s-{sid[-4:]}; steamLoginSecure={sid}%7C%7C{token}"
@@ -419,3 +440,100 @@ async def test_refresh_online_states_no_key_skips(db):
     result = await account_service.refresh_online_states()
     assert result["ok"] is False
     assert result["status"] == "no_key"
+
+
+@pytest.mark.asyncio
+async def test_second_account_owned_sync_delete_and_rebind(db, monkeypatch):
+    import httpx
+    from fastapi import FastAPI
+
+    from app.domains.account.router import router as account_router
+    from app.domains.family import service as family_service
+    from app.domains.wishlist import service as wishlist_service
+    from app.domains.wishlist.router import router as wishlist_router
+
+    async def no_persona(steamid):
+        return {}
+
+    async def no_wishlist(steamid):
+        return []
+
+    async def steam_get(url, params):
+        assert params["steamid"] == B
+        games = [{"appid": 620, "name": "Portal 2"}] if params["access_token"] == "own-token" else []
+        return httpx.Response(200, json={"response": {"games": games}})
+
+    monkeypatch.setattr(wishlist_service, "_fetch_persona", no_persona)
+    monkeypatch.setattr(wishlist_service, "fetch_wishlist", no_wishlist)
+    monkeypatch.setattr(family_service, "_steam_get", steam_get)
+    await account_service.save_cookies(cookie(A, "primary-token"))
+    await account_service.save_cookies(cookie(B, "own-token"))
+    await account_service.after_bind(B)
+
+    app = FastAPI()
+    app.include_router(account_router, prefix="/api/v1")
+    app.include_router(wishlist_router, prefix="/api/v1")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(f"/api/v1/accounts/{B}/sync?autoCrawl=false")
+        assert response.status_code == 200
+        assert response.json()["ownedCount"] == 1
+        status = (await client.get("/api/v1/account")).json()
+        counts = {row["steam_id"]: row["game_count"] for row in status["accounts"]}
+        assert counts == {A: 0, B: 1}
+        library = (await client.get("/api/v1/owned-library")).json()
+        assert [game["appid"] for game in library["games"]] == [620]
+        assert library["games"][0]["owners"][0]["steamid"] == B
+
+        removed = await client.delete(f"/api/v1/account/cookies/{B}")
+        assert removed.status_code == 200
+        library = (await client.get("/api/v1/owned-library")).json()
+        assert library["games"] == []
+        assert all(row["steamid"] != B for row in library["accounts"])
+        await account_service.save_cookies(cookie(B, "replacement-token"))
+        status = (await client.get("/api/v1/account")).json()
+        rebound = next(row for row in status["accounts"] if row["steam_id"] == B)
+        assert rebound["game_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_post_bind_fetch_includes_secondary_account_bills(db, monkeypatch):
+    from app.core import scheduler
+    from app.domains.wishlist import service as wishlist_service
+    from app.domains.family import service as family_service
+    from app.domains.bills import service as bills_service
+
+    calls = []
+    async def no_price():
+        return False
+    async def sync_wishlist(sid, **kwargs):
+        calls.append(('wishlist', sid))
+        return {}
+    async def sync_family(sid):
+        calls.append(('family', sid))
+        return {}
+    async def sync_bills(*, force, steam_id):
+        assert force is True
+        calls.append(('bills', steam_id))
+        return {'ok': True}
+    monkeypatch.setattr(scheduler, 'price_auto_enabled', no_price)
+    monkeypatch.setattr(wishlist_service, 'sync_account', sync_wishlist)
+    monkeypatch.setattr(family_service, 'sync_family_group', sync_family)
+    monkeypatch.setattr(bills_service, 'sync_bills', sync_bills)
+    await account_service._post_bind_fetch(B)
+    assert calls == [('wishlist', B), ('family', B), ('bills', B)]
+
+
+@pytest.mark.asyncio
+async def test_account_status_derives_bill_completion_from_owned_import(db):
+    from datetime import datetime
+    from app.domains.bills.models import BillImport
+
+    await account_service.save_cookies(cookie(A))
+    await account_service.save_cookies(cookie(B))
+    async with db() as session:
+        session.add(BillImport(steam_id=B, imported_at=datetime(2026, 1, 1)))
+        session.add(BillImport(nickname='Legacy', imported_at=datetime(2026, 1, 2)))
+        await session.commit()
+    accounts = {a['steam_id']: a for a in await account_service.list_accounts()}
+    assert accounts[A]['bills_synced_at'] is None
+    assert accounts[B]['bills_synced_at'] == '2026-01-01T00:00:00'

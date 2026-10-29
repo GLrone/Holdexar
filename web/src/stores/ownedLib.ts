@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 
 import {
   watchPoolApi,
@@ -8,6 +8,7 @@ import {
   type OwnedLibraryPayload,
 } from '@/api/client'
 import { normalizeAvatarUrl } from '@/api/avatar'
+import { useAccountStore } from './account'
 
 /**
  * 游戏库（owned-library）共享数据源：gamelib 页「账号游戏库 / 库分析」两个
@@ -16,6 +17,7 @@ import { normalizeAvatarUrl } from '@/api/avatar'
  * ready + 非强制直接复用，页签来回切不白等。
  */
 export const useOwnedLibStore = defineStore('ownedLib', () => {
+  const accountStore = useAccountStore()
   const data = ref<OwnedLibraryPayload | null>(null)
   const loading = ref(false)
   const error = ref('')
@@ -29,6 +31,8 @@ export const useOwnedLibStore = defineStore('ownedLib', () => {
   )
   const games = computed<OwnedLibGame[]>(() => data.value?.games ?? [])
   const ready = computed(() => data.value !== null)
+  const accountVersion = computed(() => accountStore.accounts.map(a =>
+    [a.steam_id, a.bound_at, a.game_count, a.wishlist_count].join(':')).join('|'))
 
   /** steamid → 账户档案 */
   const accountMap = computed(() => {
@@ -53,15 +57,22 @@ export const useOwnedLibStore = defineStore('ownedLib', () => {
     if (ready.value && !force) return
     loading.value = true
     error.value = ''
+    const version = accountVersion.value
     try {
-      data.value = await watchPoolApi.ownedLibrary()
+      const next = await watchPoolApi.ownedLibrary()
+      if (version === accountVersion.value) data.value = next
     } catch (e) {
       error.value = e instanceof Error ? e.message : String(e)
       if (!data.value) data.value = null
     } finally {
       loading.value = false
+      if (version !== accountVersion.value) await load(true)
     }
   }
+
+  watch(accountVersion, () => {
+    if (ready.value) void load(true)
+  })
 
   return {
     data,

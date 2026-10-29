@@ -358,7 +358,7 @@ async def get_cookies() -> str:
 
 
 async def get_primary_cookies() -> str:
-    """主账号 Cookie（账单/家庭组等主账号语义消费方专用）；语义同 get_cookies。"""
+    """主账号 Cookie（主账号语义消费方专用）；语义同 get_cookies。"""
     row = await get_primary_account()
     if row is None:
         return (await settings_service.get_value(KEY_COOKIES, "")) or ""
@@ -479,16 +479,8 @@ async def save_cookies(cookies_raw: str) -> dict:
     }
 
 
-async def _post_bind_fetch(steam_id: str, is_primary: bool) -> None:
-    """绑定后全量拉取（后台依次）：愿望单/已购 → 家庭组 → 账单（仅主账号）。
-
-    只主账号触发账单同步会使用户看到「绑了但游戏库/账单不来」。依次口径：
-      ① 愿望单 + 已购库（sync_account：差异入库 + 新增条目按自动价格链
-         开关即时首爬，与 15min 定时同步同口径）；
-      ② 家庭组（跟随**本账号**：成员自动入追踪，多账号各自成组）；
-      ③ 账单（跟随**主账号**：bills 表无 steamid 维度，混流即数据污染，
-         绑二号/切号不触发；主账号换绑时重拉一次）。
-    """
+async def _post_bind_fetch(steam_id: str) -> None:
+    """按本账号依次同步愿望单、已购、家庭组和账单。"""
     try:
         from app.core.scheduler import price_auto_enabled
         from app.domains.wishlist import service as wishlist_service
@@ -521,7 +513,8 @@ async def _post_bind_fetch(steam_id: str, is_primary: bool) -> None:
         r = await family_service.sync_family_group(steam_id)
         log_event(
             logger,
-            "绑定后家庭组同步完成",
+            "绑定后家庭组同步未完成" if r.get("failed") else "绑定后家庭组同步完成",
+            level=logging.WARNING if r.get("failed") else logging.INFO,
             detail={
                 "SteamID": steam_id,
                 "新加入成员": r.get("joined"),
@@ -531,12 +524,10 @@ async def _post_bind_fetch(steam_id: str, is_primary: bool) -> None:
     except Exception:  # noqa: BLE001 —— 单账号失败隔离，不拖垮绑定流程
         log_event(logger, "绑定后家庭组同步失败，下次同步兜底", level=logging.ERROR, exc_info=True)
 
-    if not is_primary:
-        return
     try:
         from app.domains.bills import service as bills_service
 
-        r = await bills_service.sync_bills(force=True)
+        r = await bills_service.sync_bills(force=True, steam_id=steam_id)
         if r.get("ok"):
             log_event(
                 logger,
@@ -582,8 +573,7 @@ async def bind_account(cookies_raw: str) -> dict:
             detail={"原因": sync.get("error")},
         )
     steam_id = result["steam_id"]
-    is_primary = steam_id == await get_primary_steam_id()
-    asyncio.get_running_loop().create_task(_post_bind_fetch(steam_id, is_primary))
+    asyncio.get_running_loop().create_task(_post_bind_fetch(steam_id))
     return {"result": result, "sync": sync}
 
 
@@ -1281,6 +1271,7 @@ async def _account_payload(row: SteamAccount, primary_id: str, counts: dict) -> 
         "session_has_refresh": freshness["has_refresh_token"],
         "wishlist_count": c.get("wishlist_count", 0),
         "game_count": c.get("game_count", 0),
+        "bills_synced_at": c.get("bills_synced_at"),
         "redeem_used": _account_usage(row.steam_id),
         "is_online": bool(row.is_online),
         "in_game": row.in_game or "",
@@ -1294,6 +1285,14 @@ async def list_accounts() -> list[dict]:
         return []
     primary_id = rows[0].steam_id
     counts = await _wishlist_counts([r.steam_id for r in rows])
+    from app.domains.bills.models import BillImport
+
+    async with get_session_factory()() as session:
+        imports = (await session.execute(select(BillImport.steam_id, func.max(BillImport.imported_at)).where(
+            BillImport.steam_id.in_([r.steam_id for r in rows]),
+        ).group_by(BillImport.steam_id))).all()
+    for sid, synced_at in imports:
+        counts.setdefault(sid, {})["bills_synced_at"] = synced_at.isoformat() if synced_at else None
     return [await _account_payload(r, primary_id, counts.get(r.steam_id, {})) for r in rows]
 
 

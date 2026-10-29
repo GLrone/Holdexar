@@ -20,6 +20,7 @@ class BillImport(Base):
     __tablename__ = "bill_imports"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    steam_id: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
     nickname: Mapped[str] = mapped_column(String(120), default="")
     avatar_base64: Mapped[str] = mapped_column(Text, default="")
     source_file: Mapped[str] = mapped_column(String(300), default="")

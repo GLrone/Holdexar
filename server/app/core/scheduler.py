@@ -1057,15 +1057,24 @@ async def _job_wallet_sync() -> None:
 
 
 async def _job_bills_sync() -> None:
-    """账单/许可常驻同步（Cookie 绑定后自动拉全量消费历史 + 入库记录）。
+    """每半小时按绑定账号同步账单，单账号失败不阻断其余账号。"""
+    from app.domains.account import service as account_service
 
-    半小时一轮；上一轮失败不重试，等下一轮到点再拉。单次失败
-    不再同步的语义由 sync_bills 的陈旧锁判定兜底（见其 docstring）。
-    """
+    try:
+        accounts = await account_service.list_accounts()
+        if not accounts:
+            await scheduler_bridge_note("bills_sync", {"skipped": "未绑定 Steam Cookie"})
+        for account in accounts:
+            await _sync_account_bills(account["steam_id"])
+    except Exception:  # noqa: BLE001
+        log_event(logger, "Steam 账单同步异常", level=logging.ERROR, exc_info=True)
+
+
+async def _sync_account_bills(steam_id: str) -> None:
     from app.domains.bills import service as bills_service
 
     try:
-        result = await bills_service.sync_bills(force=False)
+        result = await bills_service.sync_bills(force=False, steam_id=steam_id)
         if result.get("ok"):
             log_event(
                 logger,

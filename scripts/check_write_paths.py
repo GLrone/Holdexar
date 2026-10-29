@@ -103,6 +103,8 @@ ALLOW: dict[tuple[str, str], tuple[dict[str, int], str]] = {
         {"execute": 7}, "迁移事务内保全节点与冷却并退役重复列"),
     ("core/database.py", "_migrate_pilot_provider_config"): (
         {"execute": 2}, "既有迁移事务内批量迁入供方配置并清除旧键"),
+    ("core/database.py", "_migrate_bill_account_identity"): (
+        {"execute": 2}, "既有迁移事务内补齐账单归属列与索引；不独立提交"),
     ("core/database.py", "_drop_projection_columns"): (
         {"execute": 1}, "既有迁移事务校验依赖后退役派生列；不独立提交"),
     ("core/database.py", "_prepare_legacy_v10_columns"): (

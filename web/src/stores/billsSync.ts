@@ -96,12 +96,12 @@ export const useBillsSyncStore = defineStore('billsSync', () => {
    * 返回同步结果供发起页面刷新数据；返回 null = 未发起（重入）或按
    * 「续看进度」收场（busy），不弹错误。
    */
-  async function syncNow(): Promise<BillSyncResult | null> {
+  async function syncNow(steamId?: string): Promise<BillSyncResult | null> {
     if (syncing.value || snapshot.value?.running) return null
     syncing.value = true
     startDisplayPolling()
     try {
-      const res = await billsApi.syncBills()
+      const res = await billsApi.syncBills(steamId)
       if (res.status === 'busy') return null
       message.success(
         t('bills.sync.success', {

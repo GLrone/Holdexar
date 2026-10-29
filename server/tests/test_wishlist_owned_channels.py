@@ -1,7 +1,7 @@
 """wishlist 域单元测试：已购双通道拉取 + owned 标记保全语义（mock，不触网）。
 
 覆盖：
-- JWT 优先（主账号 Cookie 有 token 即走免 Key 通道）
+- JWT 优先（本账号 Cookie 优先，未绑定时借主账号）
 - JWT 失败回退 WebAPI Key
 - 两个通道都不可用 → OwnedFetchError；sync_account 中断覆写、保留标记
 - HTTP 200 + 空 games = 合法空库（回落愿望单条目语义）
@@ -29,14 +29,18 @@ def db(monkeypatch):
 
     # list_items / list_appids 会并入 monitoring 层的显式来源：同一测试库
 
-    # account 域 Cookie 读取不走测试库（其模块级 factory 引用未被打桩，
-    # 会直读生产库）；所有用例显式 mock get_primary_cookies。
+    # 通道选择用例隔离凭据读取，不触发真实登录续期。
     import app.domains.account.service as account_service
 
     async def _no_primary():
         return ""
 
     monkeypatch.setattr(account_service, "get_primary_cookies", _no_primary)
+
+    async def _no_own(steamid):
+        return ""
+
+    monkeypatch.setattr(account_service, "get_cookies_of", _no_own)
 
     # sync_account 会触发 regions 读取：mock 掉避免依赖未建表
     import app.domains.regions.service as regions_service
@@ -163,6 +167,28 @@ async def _get_items(db, steamid=PRIMARY):
 
 
 # ── 通道选择 ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_bound_account_uses_own_cookie_before_primary(db, monkeypatch):
+    from app.domains.account import service as account_service
+
+    _mock_account_cookies(monkeypatch, _jwt_cookies(PRIMARY, "primary-token"))
+    _mock_settings(monkeypatch, None)
+
+    async def own_cookie(steamid):
+        assert steamid == FRIEND
+        return _jwt_cookies(FRIEND, "own-token")
+
+    async def owned(steamid, token):
+        assert steamid == FRIEND
+        return GAMES if token == "own-token" else []
+
+    monkeypatch.setattr(account_service, "get_cookies_of", own_cookie)
+    monkeypatch.setattr(wishlist_service, "fetch_owned_games_via_jwt", owned)
+    games, source = await wishlist_service.fetch_owned_games(FRIEND)
+    assert source == "jwt"
+    assert games == GAMES
 
 
 @pytest.mark.asyncio

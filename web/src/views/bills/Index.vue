@@ -66,12 +66,11 @@ const overview = ref<BillOverview | null>(null)
 const loading = ref(false)
 const accountStore = useAccountStore()
 
-/** hero 头像统一口径：优先绑定账号的归一化 URL（与顶栏/设置页同源，昵称
- *  匹配同一人），匹配不到或未绑定再退回导入时内嵌 base64，最后占位符 */
+/** 按账号归属取头像，未归属的历史账单使用导入快照。 */
 const heroAvatar = computed(() => {
   const o = overview.value
   if (!o) return ''
-  const acc = accountStore.accounts.find((a) => a.persona_name === o.nickname)
+  const acc = accountStore.accounts.find((a) => a.steam_id === o.steamId)
   return normalizeAvatarUrl(acc?.avatar_url) || o.avatar || ''
 })
 
@@ -79,7 +78,8 @@ async function loadImports(keepActive = true) {
   const res = await billsApi.listImports()
   imports.value = res.imports
   if (keepActive && activeId.value && res.imports.some((i) => i.id === activeId.value)) return
-  activeId.value = res.imports[0]?.id ?? null
+  activeId.value = res.imports.find(i => i.steamId === accountStore.active?.steam_id)?.id
+    ?? res.imports[0]?.id ?? null
 }
 
 async function loadOverview() {
@@ -111,8 +111,19 @@ const billsSync = useBillsSyncStore()
 const syncing = computed(() => billsSync.syncing)
 const syncSnapshot = computed(() => billsSync.snapshot)
 
+watch(() => accountStore.accounts.map(a => [a.steam_id, a.bills_synced_at].join(':')).join('|'), async () => {
+  await loadImports(false)
+  await loadOverview()
+})
+
+watch(() => syncSnapshot.value?.syncedAt, async () => {
+  if (syncSnapshot.value?.running || !syncSnapshot.value?.importId) return
+  await loadImports(false)
+  await loadOverview()
+})
+
 async function syncNow() {
-  const res = await billsSync.syncNow()
+  const res = await billsSync.syncNow(overview.value?.steamId || accountStore.active?.steam_id)
   if (!res) return
   await loadImports(false)
   activeId.value = res.importId
