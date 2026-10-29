@@ -1,13 +1,11 @@
-"""爬虫队列回补行为验收（首爬放行 / 孤儿回补 / TOP100 反哺 / genres 分类）。
+"""爬虫队列首爬候选行为验收（首爬判据 / TOP100 反哺 / genres 分类）。
 
-队列回补链路的四条行为验收（合成 appid 播种，夹具清理）：
-1. get_uncrawled_appids：两种"无数据"形态都算未爬——无 games 行的
-   appid（全新入库候选）+ games 行 updated_at IS NULL 的挂名孤儿；
-   有 ok 价格行的已爬游戏排除（价格行被清的已爬游戏除外）
-2. backfill_specs：TOP100 榜单中未入库/挂名孤儿 → 爬取 spec（无缺口 []）
-3. app_handler genres 分类：Sexual Content/Nudity → is_adult；
+队列首爬链路的三条行为验收（合成 appid 播种，夹具清理）：
+1. backfill_specs：TOP100 榜单中未入库/挂名孤儿 → 爬取 spec（无缺口 []）
+2. app_handler genres 分类：Sexual Content/Nudity → is_adult；
    Visual Novel → is_visual_novel（提取逻辑单测，不起调度器）
-4. upsert 回补链：孤儿行首爬后 updated_at 落值（脱离孤儿集合）
+3. upsert 首爬链：挂名行首爬后 updated_at 落值（脱离首爬候选集合，
+   榜单反哺按 updated_at IS NULL 识别首爬候选）
 """
 from datetime import datetime
 
@@ -23,7 +21,7 @@ from app.domains.games import boards as boards_mod
 APPID = 996_001  # 挂名孤儿（updated_at NULL，无价格行）
 APPID2 = 996_002  # 已爬游戏（有 updated_at + ok 价格行）
 APPID3 = 996_003  # 榜上孤儿（games 行存在但无数据）
-APPID4 = 996_004  # 无 games 行（从未入库——预检同样要放行的形态）
+APPID4 = 996_004  # 无 games 行（从未入库——反哺同样要放行的形态）
 APPID5 = 996_005  # meta 失败孤儿（updated_at NULL 但有 locked 状态价格行——账本通道负责）
 
 
@@ -77,22 +75,12 @@ async def _seed():
 
 
 @pytest.mark.asyncio
-async def test_get_uncrawled_appids():
-    """未爬集合只含库内挂名孤儿，已有成功价格或库内无行的对象不入选。"""
+async def test_mark_non_game_type_marks_crawl_attempt():
+    """Phase 1 短路落 type：非 game/dlc / coming_soon 无包的挂名行
+    落 type + updated_at 后脱离首爬候选（不再被榜单反哺每轮空转重爬）。"""
     db = DbWriter()
-    ids = await db.get_uncrawled_appids()
-    assert APPID in ids
-    assert APPID3 in ids
-    assert APPID2 not in ids  # 有 ok 价格行 = 已爬
-
-
-@pytest.mark.asyncio
-async def test_mark_non_game_type_leaves_backfill_pool():
-    """Phase 1 短路落 type：非 game/dlc / coming_soon 无包的孤儿行
-    落 type + updated_at 后脱离回补池（不再被每天空转重爬一次）。"""
-    db = DbWriter()
-    ids = await db.get_uncrawled_appids()
-    assert APPID in ids  # 前置：还在池里
+    async with get_session_factory()() as session:
+        assert (await session.get(Game, APPID)).updated_at is None  # 前置：还是候选
 
     await db.mark_non_game_type(APPID, "hardware")
 
@@ -101,9 +89,6 @@ async def test_mark_non_game_type_leaves_backfill_pool():
         assert game.type == "HARDWARE"
         assert game.updated_at is not None
         assert game.name == "挂名孤儿"  # 挂名值不动（insert 分支才用 AppID_ 兜底）
-
-    ids = await db.get_uncrawled_appids()
-    assert APPID not in ids  # 已脱离回补池
 
 
 @pytest.mark.asyncio
@@ -120,50 +105,6 @@ async def test_backfill_specs_from_top100(monkeypatch):
     assert spec["kind"] == "top100_backfill"
     # 已爬（APPID2）与有 locked 价格行的账本孤儿（APPID5）排除
     assert sorted(spec["appids"]) == sorted([APPID, APPID3])
-
-
-@pytest.mark.asyncio
-async def test_backfill_pairs_excludes_ledger_orphans(monkeypatch, tmp_path):
-    """回补池排除已有价格行的孤儿（missing 账本通道负责，防双通道重复吃）。"""
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-
-    from app.core.database import Base
-    import app.domains.crawl.models  # noqa: F401
-    import app.domains.games.models  # noqa: F401
-    from app.domains.crawl import service as crawl_service
-
-    # 封闭库：真库的孤儿池规模随生产爬取波动，limit=5000 的页能否覆盖探针
-    # 不可控——探针语义只在自建的临时库上断言
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{(tmp_path / 'pairs.db').as_posix()}", echo=False
-    )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(crawl_service, "get_session_factory", lambda: factory)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    async with factory() as session:
-        now = datetime.now()
-        session.add_all(
-            [
-                Game(appid=APPID, name="挂名孤儿", created_at=None, updated_at=None),
-                Game(appid=APPID5, name="账本孤儿", created_at=None, updated_at=None),
-                GameCurrentPrice(
-                    appid=APPID5, region_code="CN", currency="",
-                    price=None, original_price=None, discount_percent=0,
-                    sub_id=None, price_status="locked", fail_count=0,
-                    cny_fen=None, updated_at=now,
-                ),
-            ]
-        )
-        await session.commit()
-
-    pairs = await crawl_service._backfill_pairs(limit=5000)
-    pair_ids = {a for a, _ in pairs}
-    assert APPID in pair_ids  # 无价格行的孤儿入选
-    assert APPID5 not in pair_ids  # 有 locked 状态行 = 账本通道，排除
-    # 库内可能存在的真实孤儿不受夹具影响——只断言合成 appid 语义
-    assert all(a not in (APPID2, APPID4) for a in pair_ids)
 
 
 @pytest.mark.asyncio
@@ -207,11 +148,11 @@ def test_genre_classification():
 
 
 @pytest.mark.asyncio
-async def test_orphan_crawled_leaves_backfill_pool():
-    """回补闭环：孤儿行首爬（upsert 带 updated_at）后脱离孤儿集合。"""
+async def test_orphan_crawled_leaves_first_crawl_pool():
+    """首爬闭环：挂名行首爬（upsert 带 updated_at）后脱离首爬候选集合。"""
     db = DbWriter()
-    ids = await db.get_uncrawled_appids()
-    assert APPID in ids
+    async with get_session_factory()() as session:
+        assert (await session.get(Game, APPID)).updated_at is None
 
     now = datetime.now()
     game_data = {
@@ -225,6 +166,3 @@ async def test_orphan_crawled_leaves_backfill_pool():
         assert game.updated_at is not None
         assert game.is_adult is True
         assert game.is_visual_novel is False
-
-    ids = await db.get_uncrawled_appids()
-    assert APPID not in ids  # 已脱离孤儿池
