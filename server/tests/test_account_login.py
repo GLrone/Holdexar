@@ -135,7 +135,7 @@ def _begin_ok(guards: list[int], *, interval: float = 0.01) -> _FakeResponse:
     content = (
         login_module._pb_varint_field(1, CLIENT_ID)
         + login_module._pb_bytes_field(2, b"\x11" * 16)
-        + login_module._pb_fixed32_field(3, struct.pack("<f", interval))
+        + struct.pack("<B", (3 << 3) | 5) + struct.pack("<f", interval)
         + b"".join(
             login_module._pb_bytes_field(4, login_module._pb_varint_field(1, g)) for g in guards
         )
