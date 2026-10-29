@@ -391,3 +391,19 @@ async def test_clear_missing_regions_deletes_only_missing():
         async with get_session_factory()() as session:
             await session.execute(delete(GameCurrentPrice).where(GameCurrentPrice.appid == APPID))
             await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_blocked_aging_reprobe():
+    """blocked 老化重探：窗口内的终态行不进补抓，过窗行放行一次。"""
+    db = DbWriter()
+    # 夹具的 APPID2/UA 行 blocked 且 updated_at=now（窗口内）→ 不入选
+    tasks = await db.generate_missing_tasks(cooldown_minutes=0)
+    assert not any(APPID2 in t.get("appids", []) and t.get("region") == "UA" for t in tasks)
+    # 行龄推过 BLOCKED_REPROBE_DAYS 窗口 → 放行重探
+    async with get_session_factory()() as session:
+        row = await session.get(GameCurrentPrice, (APPID2, "UA"))
+        row.updated_at = _now_naive() - timedelta(days=8)
+        await session.commit()
+    tasks = await db.generate_missing_tasks(cooldown_minutes=0)
+    assert any(APPID2 in t.get("appids", []) and t.get("region", "").upper() == "UA" for t in tasks)
