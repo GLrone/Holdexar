@@ -24,6 +24,8 @@ VECTORS = (
     "invalid_compatibility", "migration_resume", "migration_key_conflict",
     "update_guard", "update_accepted", "mixed_case_migration", "external_data",
     "missing_version", "empty_version", "numeric_version", "floating_schema", "sparse_rowid_migration", "case_alias_data",
+    "terminal_committed", "terminal_marker", "terminal_wal_schema",
+    "aborted_preparation", "aborted_switching", "aborted_marker",
 )
 
 
@@ -231,7 +233,33 @@ def run_vector(name, options, destination, row):
             if name == "update_guard":
                 expected_code = 1
 
-        if name == "wal_schema":
+        if name.startswith("terminal_") or name.startswith("aborted_"):
+            transaction = {
+                "attemptId": "contract-terminal", "stage": "committed",
+                "sourceVersion": "0.3.7", "targetVersion": "0.3.8",
+                "currentVersion": "0.3.8", "dataDir": str(database.parent),
+                "dataDbPath": str(database), "dataPrepared": True, "dataAccepted": True,
+                "dataRecoveryPhase": "accepted", "dataSchemaVersion": 32,
+            }
+            if name.startswith("aborted_"):
+                state["attemptId"] = "previous-successful-attempt"
+                transaction = {"attemptId": "contract-aborted", "stage": "rolled_back",
+                               "sourceVersion": "0.3.8", "targetVersion": "0.3.9",
+                               "dataDir": str(database.parent)}
+                if name == "aborted_switching":
+                    transaction["stage"] = "switching"
+            transaction_path = root / "state" / "transaction.json"
+            transaction_path.write_text(json.dumps(transaction), encoding="utf-8")
+            preserved.append(transaction_path)
+            # No UpdateHost is installed: success must use the completed native path.
+            if name in {"terminal_marker", "aborted_marker"}:
+                marker = database.parent / "backups" / ".restore.lock"
+                marker.parent.mkdir()
+                marker.write_text('{"purpose":"update","token":"unfinished"}', encoding="utf-8")
+                preserved.append(marker)
+                expected_code = 1
+
+        if name in {"wal_schema", "terminal_wal_schema"}:
             connection = hold_wal(database)
             stack.callback(connection.close)
             connection.execute("PRAGMA user_version=33")

@@ -11,7 +11,7 @@ go build -trimpath '-ldflags=-s -w -H=windowsgui' -o Holdexar.exe .
 
 Production packaging is owned by `scripts/build_release.py`, which supplies application identity metadata and assembles the complete versioned payload and independent UpdateHost. The command above only builds the entry executable.
 
-The launcher delegates interrupted or accepted update data transactions to the existing `updater/UpdateHost.exe --recover-only --target <installation-root>` path. It validates the host location, returns failure if recovery fails, and reloads the state after recovery. It does not restore update snapshots itself or depend on the versioned application for protection.
+The launcher delegates unfinished update data transactions to the existing `updater/UpdateHost.exe --recover-only --target <installation-root>` path. Fully committed or released rollback records skip the host only when the pointer, data ownership and compatibility agree and no maintenance marker remains. The normal version selection still checks the live database schema. It validates the host location, returns failure if recovery fails, and reloads the state after recovery. It does not restore update snapshots itself or depend on the versioned application for protection.
 
 `--server` waits for the versioned program and returns its exit status. Other launches detach the program. `--update-protocol` reports the existing update protocol without starting the application.
 
