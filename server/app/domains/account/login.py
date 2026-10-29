@@ -134,10 +134,6 @@ def _pb_fixed64_field(field: int, raw: bytes) -> bytes:
     return _pb_write_varint((field << 3) | 1) + raw
 
 
-def _pb_fixed32_field(field: int, raw: bytes) -> bytes:
-    return _pb_write_varint((field << 3) | 5) + raw
-
-
 def _pb_fields(data: bytes) -> list[tuple[int, int, "bytes | int"]]:
     """protobuf 消息平铺为 (字段号, 线型, 原始值)；长度界定段不解包。"""
     out: list[tuple[int, int, "bytes | int"]] = []
