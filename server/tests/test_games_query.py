@@ -4,7 +4,7 @@ from app.domains.games import derived as games_derived
 以 priceMatrix（区服键控 {"CN": [formatted, cnyFen, cents, null]}）为独立事实源，
 验证每条 SQL 筛选的语义正确性；不依赖实现细节。
 
-⚠️ 用例针对**真实本地库**（只读）。库被清空（如重置数据）时前提不成立，
+⚠️ 用例针对真实本地库的隔离快照。库被清空（如重置数据）时前提不成立，
 模块级 skip 而非误报失败——数据重新导入后自动恢复执行。
 
 sort=top100 用例在 test_top100.py（热榜数据源 mock，不用空集占位）。
@@ -16,45 +16,67 @@ import pytest_asyncio
 from sqlalchemy import delete
 
 from app.core.config import get_settings
-from app.core.database import get_session_factory, init_db
+from app.core.database import get_engine, get_session_factory, init_db
 from app.domains.games import service
 
-# 真实库用例豁免 conftest 的数据目录隔离（本文件声明：断言对象就是真实库）。
-# 必须是模块常量由夹具按文件作用域读取，不能用环境变量（进程全局会泄漏给
-# 同进程其后所有文件，把它们的隔离一并关掉）。
+# 本模块自行从真实库只读快照构建隔离目录。
 HOLDEXAR_TEST_REAL_DB = True
 
 
 TOLERANCE = 500  # 5 元（分）
 
 
-@pytest.fixture(autouse=True)
-def _require_populated_library():
-    """games 表为空时跳过（真实库用例，同步夹具内 skip 兼容性最好）。"""
+@pytest.fixture(scope="module")
+def _source_snapshot(tmp_path_factory):
     settings = get_settings()
     db_path = settings.data_dir / settings.db_filename
     if not db_path.is_file():
         # 库文件不存在（CI runner / 无库环境）：真实库前提不成立，与空库同语义 skip
         pytest.skip(f"真实库文件不存在（{db_path}），真实库用例跳过")
-    con = sqlite3.connect(str(db_path))
+    con = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
     try:
-        count = con.execute("SELECT COUNT(*) FROM games").fetchone()[0]
-    except sqlite3.OperationalError:
-        # 库文件在但 games 表缺（半初始化状态）：同属前提不成立
-        pytest.skip("真实库无 games 表（半初始化状态），真实库用例跳过")
+        try:
+            count = con.execute("SELECT COUNT(*) FROM games").fetchone()[0]
+        except sqlite3.OperationalError:
+            pytest.skip("真实库无 games 表，真实库用例跳过")
+        if count < 100:
+            pytest.skip(f"本地库 games 仅 {count} 行，真实库用例跳过")
+        target = tmp_path_factory.mktemp("holdexar-games-query")
+        dest = sqlite3.connect(target / settings.db_filename)
+        try:
+            con.backup(dest)
+        finally:
+            dest.close()
     finally:
         con.close()
-    if count < 100:
-        # 行数过少视为库处于测试/半清空状态（并行测试会话种合成行），
-        # 真实库前提不成立，skip 而非误报
-        pytest.skip(f"本地库 games 仅 {count} 行（数据已清空/测试种子中），真实库用例跳过")
+    yield target
+    for name in (settings.db_filename, settings.db_filename + "-wal", settings.db_filename + "-shm",
+                 settings.db_filename + ".pre-migration.bak"):
+        (target / name).unlink(missing_ok=True)
+    if (target / "logs").is_dir():
+        (target / "logs").rmdir()
+    target.rmdir()
+
+
+@pytest.fixture(autouse=True)
+def _require_populated_library(_source_snapshot, monkeypatch):
+    monkeypatch.setenv("HOLDEXAR_DATA_DIR", str(_source_snapshot))
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
+    return _source_snapshot
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _setup():
-    await init_db()
-    await games_derived.update_price_derived(None, history=False)  # 幂等，保证预计算列最新
-    yield
+async def _setup(_require_populated_library):
+    assert get_settings().data_dir == _require_populated_library
+    engine = get_engine()
+    try:
+        await init_db()
+        await games_derived.update_price_derived(None, history=False)
+        yield
+    finally:
+        await engine.dispose()
 
 
 def _matrix(item: dict) -> dict:
