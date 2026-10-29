@@ -537,7 +537,10 @@ async def download_update(
         # 上次换装失败的安装状态标记与交接账本一并解除——否则重新下载同一版本
         # 会被旧标记/旧账一直挡在自动换装之外。
         (staging / HANDOFF_UNSUPPORTED_MARK).unlink(missing_ok=True)
-        (staging.parent / SWAP_FAILED_FLAG).unlink(missing_ok=True)
+        # 换装失败标记与交接账本落在数据目录（与桌面壳写入侧同一路径判定，
+        # 不是安装根——staging 在安装根下，staging.parent 对错文件）
+        from app.core.paths import resolve_data_dir
+        (resolve_data_dir() / SWAP_FAILED_FLAG).unlink(missing_ok=True)
         (staging.parent / HANDOFF_LEDGER_NAME).unlink(missing_ok=True)
         _PROGRESS.update({"ok": True, "running": False, "phase": "done", "percent": 100})
         log_event(
@@ -968,7 +971,8 @@ def pending_status() -> dict:
     )
     staging = staging_dir()
     manifest = staging / "manifest.json"
-    swap_failed = (staging.parent / SWAP_FAILED_FLAG).is_file()
+    from app.core.paths import resolve_data_dir
+    swap_failed = (resolve_data_dir() / SWAP_FAILED_FLAG).is_file()
     result = {
         "pending": False,
         "installing": installing,
