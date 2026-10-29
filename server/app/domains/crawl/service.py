@@ -466,7 +466,8 @@ async def plan_scope_appids(scope: str, appids: list[int] | None = None) -> list
 
 # 欠账补抓冷却（分钟）。池价格爬取 6h 一轮 → 冷却是重试节奏的主闸：
 # 5 次重试上限（MISSING_MAX_RETRIES）× 24h ≈ 5 天烧尽转 blocked——
-# 持续多天的 429/锁区风暴也不会快速烧成终态，恢复后冷却期外自然续补。
+# 持续多天的 429/锁区风暴也不会快速烧成终态，恢复后冷却期外自然续补；
+# blocked 不是永固，每 7 天老化重探一次（BLOCKED_REPROBE_DAYS）。
 MISSING_RETRY_COOLDOWN_MINUTES = 24 * 60
 
 # 失败记录修复冷却（分钟）。修复线程 5min 一轮（空闲门禁），冷却须
@@ -487,10 +488,10 @@ async def _missing_tasks(
 ) -> list[dict]:
     """欠账账本 → 定向补抓任务（按区分组批量，每发只装该区的欠账行）。
 
-    locked/blocked 不进补抓（终态）；missing 连续 MISSING_MAX_RETRIES 次失败
-    已在 mark_region_status 里转 blocked。行数上限防积压账本一轮吃满挤占
-    关注层（老账先补）；任务形状与主轮一致（type=app），批量 handler 直接
-    消费，失败退避与 missing 记账语义同一条路径。
+    locked 不进补抓（真终态）；blocked 每 BLOCKED_REPROBE_DAYS 天老化重探
+    一次；missing 连续 MISSING_MAX_RETRIES 次失败已在标记路径转 blocked。
+    行数上限防积压账本一轮吃满挤占关注层（老账先补）；任务形状与主轮一致
+    （type=app），批量 handler 直接消费，失败退避与 missing 记账语义同一条路径。
     """
     from app.crawler.db_writer import DbWriter
 
