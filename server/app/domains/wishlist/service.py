@@ -10,7 +10,7 @@
 数据源（对齐 07_user_misc/fetch_user_games.py）：
 - 愿望单 IWishlistService/GetWishlist/v1 —— 免 Key，公开资料可读
 - 已购游戏 IPlayerService/GetOwnedGames/v1 —— 双通道：
-  JWT 优先（主账号 Cookie 的 steamLoginSecure 解 webapi_token，
+  JWT 优先（本账号 Cookie，未绑定时借主账号的 steamLoginSecure 解 webapi_token，
   与 family 域同款免 Key 通道）→ WebAPI Key 兜底（设置页 account.steam_api_key）
 同步后新增条目自动触发爬取任务（domains.crawl.start_job）。
 """
@@ -190,7 +190,7 @@ def _parse_owned_payload(data: dict) -> list[dict]:
 
 
 async def fetch_owned_games_via_jwt(steamid: str, token: str) -> list[dict]:
-    """已购拉取（免 Key 通道）：主账号 Cookie 的 webapi_token 直调。
+    """已购拉取（免 Key 通道）：Cookie 的 webapi_token 直调。
 
     与 family 域 fetch_member_owned_games_full 同款用法（access_token query 参数）。
     401/403 抛 OwnedFetchError（token 失效/无权读该账号）。
@@ -241,7 +241,7 @@ async def fetch_owned_games_via_key(steamid: str, api_key: str) -> list[dict]:
 async def fetch_owned_games(steamid: str) -> tuple[list[dict], str | None]:
     """已购游戏双通道拉取。返回 (games, source)；source ∈ {"jwt", "key"}。
 
-    优先级：主账号 Cookie JWT → 设置页 WebAPI Key。
+    优先级：本账号 Cookie JWT（未绑定时借主账号）→ 设置页 WebAPI Key。
     两个通道都不可用（未绑 Cookie 且未配 Key）抛 OwnedFetchError。
     HTTP 200 + 空 games 是合法结果（库空/私有/无已购），不是错误。
     """
@@ -249,12 +249,12 @@ async def fetch_owned_games(steamid: str) -> tuple[list[dict], str | None]:
     from app.domains.family.service import extract_webapi_token
 
     try:
-        cookies = await account_service.get_primary_cookies()
+        cookies = await account_service.get_cookies_of(steamid) or await account_service.get_primary_cookies()
         token = extract_webapi_token(cookies) if cookies else None
     except Exception as e:  # noqa: BLE001 —— Cookie 读取失败降级走 Key，不阻断同步
         log_event(
             logger,
-            "主账号 Cookie 读取失败，已购拉取改走 WebAPI Key 通道",
+            "账号 Cookie 读取失败，已购拉取改走 WebAPI Key 通道",
             tag="降级",
             detail={"原因": e},
             level=logging.WARNING,

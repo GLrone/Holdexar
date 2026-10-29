@@ -22,9 +22,9 @@ class CdkPriceRequest(BaseModel):
 
 
 @router.post("/sync")
-async def sync_bills() -> dict:
+async def sync_bills(steam_id: str | None = None) -> dict:
     """手动触发账单同步（Cookie 绑定与定时任务之外的前端入口）。"""
-    result = await service.sync_bills(force=True)
+    result = await service.sync_bills(force=True, steam_id=steam_id)
     if result.get("status") == "no_cookie":
         raise HTTPException(409, "尚未绑定 Steam Cookie，无法同步账单")
     if result.get("status") == "busy":

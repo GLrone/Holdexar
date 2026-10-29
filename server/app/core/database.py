@@ -393,7 +393,7 @@ def _ensure_schema(sync_conn) -> None:
 #   2. _MIGRATIONS 追加 (版本号, 描述, SQL 列表)；SQL 须幂等（中断续跑 +
 #      用户库版本乱序防御），复杂逻辑可登记 async fn(engine) 同位元素
 
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 
 
 # 零小数货币（Steam 以整数计价）：旧捆绑包链路的除数表按 1 处理，与「统一存分」
@@ -1678,6 +1678,15 @@ async def _migrate_pilot_provider_config(conn) -> None:
     await conn.execute(delete(AppSetting).where(AppSetting.key.in_(legacy_keys)))
 
 
+async def _migrate_bill_account_identity(conn) -> None:
+    from sqlalchemy import text
+
+    columns = {row[1] for row in (await conn.execute(text("PRAGMA table_info(bill_imports)"))).all()}
+    if "steam_id" not in columns:
+        await conn.execute(text("ALTER TABLE bill_imports ADD COLUMN steam_id VARCHAR(20)"))
+    await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_bill_imports_steam_id ON bill_imports(steam_id)"))
+
+
 _MIGRATIONS: list[tuple[int, str, object]] = [    (2, "bundle_region_prices 零小数货币单位归一（元→分 + cny_fen 去虚高）",
      _migrate_bundle_price_units),
     (3, "bundles.item_kind 形态列（0=bundle/1=sub）初始回填（沿用 mps 旧值，"
@@ -1781,6 +1790,7 @@ _MIGRATIONS: list[tuple[int, str, object]] = [    (2, "bundle_region_prices 零�
     (30, "退役无消费的执行会话扩展和账单探测副本", _migrate_unused_session_state),
     (31, "节点身份承载体检冷却，退役独立冷却表", _migrate_node_cooldown),
     (32, "周期覆盖比率直接读取冻结计数", _migrate_cycle_coverage_projection),
+    (33, "账单按 Steam 账号隔离，保留历史未归属账单", _migrate_bill_account_identity),
 ]
 
 

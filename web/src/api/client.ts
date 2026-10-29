@@ -54,6 +54,10 @@ const inflightGets = new Map<string, Promise<unknown>>()
  * 要么登记在这里，要么调用 request 时显式传 { noCache: true }。 */
 const NO_CACHE_PATHS = [
   '/account', // 顶栏每分钟轮转（在线状态/游戏中）
+  '/accounts',
+  '/owned-library',
+  '/family',
+  '/bills/imports',
   '/bills/sync', // 账单同步进行中的快照轮询
   '/crawl/active', // 任务状态（页内刷新）
   '/crawl/jobs',
@@ -1147,6 +1151,7 @@ export interface SteamAccountItem {
   session_has_refresh: boolean
   wishlist_count: number
   game_count: number
+  bills_synced_at: string | null
   /** 30 分钟窗口内已用激活次数（后端进程计数） */
   redeem_used: number
   /** Steam 真实在线状态（每分钟轮转刷新） */
@@ -2878,6 +2883,7 @@ export const ratesApi = {
 
 export interface BillImportItem {
   id: number
+  steamId: string | null
   nickname: string
   sourceFile: string
   importedAt: string | null
@@ -2988,6 +2994,7 @@ export interface BillMonthStat {
 
 export interface BillOverview {
   id: number
+  steamId: string | null
   nickname: string
   avatar: string
   sourceFile: string
@@ -3002,6 +3009,7 @@ export interface BillOverview {
 
 export interface BillSyncResult {
   importId: number
+  steamId?: string | null
   nickname: string
   gameTxs: number
   topupTxs: number
@@ -3018,6 +3026,7 @@ export interface BillSyncResult {
 
 export interface BillSyncSnapshot {
   running: boolean
+  steamId?: string
   ok?: boolean
   status?: string
   error?: string
@@ -3048,7 +3057,8 @@ export interface BillTxQuery {
 
 export const billsApi = {
   listImports: () => request<{ imports: BillImportItem[] }>('GET', '/bills/imports'),
-  syncBills: () => request<BillSyncResult>('POST', '/bills/sync'),
+  syncBills: (steamId?: string) =>
+    request<BillSyncResult>('POST', `/bills/sync${toQuery(steamId ? { steam_id: steamId } : {})}`),
   syncStatus: () => request<BillSyncSnapshot>('GET', '/bills/sync'),
   removeImport: (id: number) =>
     request<{ deleted: boolean; importId: number }>('DELETE', `/bills/imports/${id}`),

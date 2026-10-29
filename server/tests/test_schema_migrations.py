@@ -1067,3 +1067,24 @@ async def test_observation_backfill_migrates_once_and_preserves_existing_facts(i
     ]
     await database_module._run_schema_migrations()
     assert _user_version(isolated_db) == 20
+
+
+@pytest.mark.asyncio
+async def test_bill_owner_upgrade_preserves_unknown_legacy_and_snapshot(isolated_db):
+    async with database_module.get_engine().begin() as conn:
+        await conn.execute(text("CREATE TABLE bill_imports (id INTEGER PRIMARY KEY, nickname TEXT)"))
+        await conn.execute(text("INSERT INTO bill_imports VALUES (1,'Legacy')"))
+        await conn.execute(text("PRAGMA user_version=32"))
+    database_module._MIGRATIONS.append((33, "bill owner", database_module._migrate_bill_account_identity))
+    await database_module._run_schema_migrations()
+    assert _user_version(isolated_db) == 33
+    async with database_module.get_engine().connect() as conn:
+        assert (await conn.execute(text("SELECT id,nickname,steam_id FROM bill_imports"))).all() == [(1, 'Legacy', None)]
+    backup = isolated_db.with_name(isolated_db.name + '.pre-migration.bak')
+    with sqlite3.connect(backup) as conn:
+        assert conn.execute('PRAGMA user_version').fetchone()[0] == 32
+        assert conn.execute('SELECT id,nickname FROM bill_imports').fetchall() == [(1, 'Legacy')]
+    await database_module._run_schema_migrations()
+    async with database_module.get_engine().begin() as conn:
+        await database_module._migrate_bill_account_identity(conn)
+    assert _user_version(isolated_db) == 33

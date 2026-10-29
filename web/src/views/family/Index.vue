@@ -129,8 +129,8 @@ async function loadFamily() {
     groups.value = st.groups ?? []
     libStore.setGroups(groups.value)
     if (!activeGroupSid.value || !groups.value.some((g) => g.steamid === activeGroupSid.value)) {
-      activeGroupSid.value = groups.value.find((g) => g.joined)?.steamid
-        ?? groups.value[0]?.steamid ?? ''
+      activeGroupSid.value = libStore.activeSteamId || groups.value.find((g) => g.joined)?.steamid
+        || groups.value[0]?.steamid || ''
     }
     syncMembersFromGroup()
     // 只在成功路径置位：失败时留 false，下次进入本页会重试
@@ -474,7 +474,7 @@ const avatarColors: Record<string, string> = {
         {{ t('family.group.notJoined') }}
       </div>
       <div v-else-if="familyBound && activeGroup && !activeGroup.synced" class="fam-hint">
-        {{ t('family.group.notSynced') }}
+        {{ activeGroup.lastError || t('family.group.notSynced') }}
       </div>
 
       <!-- 地区选择二级窗：宽度 ≤ 模块宽；头部=正在修改的成员；搜索实时过滤；网格自适应 -->

@@ -16,9 +16,11 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-from datetime import date, datetime, timedelta
+from collections import deque
+from datetime import date, timedelta
 
 from sqlalchemy import and_, case, delete, func, or_, select
 
@@ -145,25 +147,37 @@ async def revalue_affected(touched: dict[str, set[date]]) -> dict:
     return {"bills": len(import_ids), "transactions": changed}
 
 
-async def import_report(data: dict, source_file: str = "") -> dict:
+async def import_report(data: dict, source_file: str = "", *, steam_id: str | None = None) -> dict:
     """解析 + 换算 + 落库一份 Steam_Report_*.json。返回导入摘要。
 
-    同昵称的旧账单会被覆盖（外部工具导出的是全量历史快照，新导入天然取代旧账）。
+    自动同步按账号替换；未归属的历史导入只在自身范围按昵称替换。
     """
     parsed = parse_report(data)
+    if steam_id and (len(steam_id) != 17 or not steam_id.isascii() or not steam_id.isdigit()):
+        raise ValueError("无效的账单账号标识")
 
     async with write_session(WritePriority.BACKGROUND) as session:
-        # 同昵称旧账单替换（昵称为空时跳过——避免误清其他匿名账单）
         nickname = parsed["account"]["nickname"]
         replaced = 0
-        if nickname:
+        manual_prices = {}
+        if steam_id or nickname:
+            owner = (BillImport.steam_id == steam_id) if steam_id else and_(
+                BillImport.steam_id.is_(None), BillImport.nickname == nickname,
+            )
             old_ids = [
                 r[0]
                 for r in (
-                    await session.execute(select(BillImport.id).where(BillImport.nickname == nickname))
+                    await session.execute(select(BillImport.id).where(owner))
                 ).fetchall()
             ]
             if old_ids:
+                rows = (await session.execute(select(BillCdkGame).where(
+                    BillCdkGame.import_id.in_(old_ids), BillCdkGame.manual_fen.is_not(None),
+                ).order_by(BillCdkGame.id))).scalars().all()
+                for row in rows:
+                    manual_prices.setdefault((row.appid or row.name, row.date, row.acq), deque()).append({
+                        key: getattr(row, key) for key in ("appid", "name", "date", "acq", "acq_label", "manual_fen")
+                    })
                 for model in (BillGameTx, BillTopupTx, BillCdkGame):
                     await session.execute(delete(model).where(model.import_id.in_(old_ids)))
                 await session.execute(delete(BillImport).where(BillImport.id.in_(old_ids)))
@@ -171,6 +185,7 @@ async def import_report(data: dict, source_file: str = "") -> dict:
 
         now = get_beijing_time_obj().replace(tzinfo=None)
         imp = BillImport(
+            steam_id=steam_id,
             nickname=parsed["account"]["nickname"],
             avatar_base64=parsed["account"]["avatar_base64"],
             source_file=source_file,
@@ -250,6 +265,8 @@ async def import_report(data: dict, source_file: str = "") -> dict:
             )
 
         for game in parsed["cdk_games"]:
+            prices = manual_prices.get((game.get("appid") or game["name"], game["date"], game["acq"]))
+            previous = prices.popleft() if prices else {}
             session.add(
                 BillCdkGame(
                     import_id=imp.id,
@@ -258,8 +275,11 @@ async def import_report(data: dict, source_file: str = "") -> dict:
                     date=game["date"],
                     acq=game["acq"],
                     acq_label=game["acq_label"],
+                    manual_fen=previous.get("manual_fen"),
                 )
             )
+
+        session.add_all(BillCdkGame(import_id=imp.id, **fields) for prices in manual_prices.values() for fields in prices)
 
         await session.commit()
 
@@ -278,6 +298,7 @@ async def import_report(data: dict, source_file: str = "") -> dict:
     )
     return {
         "importId": imp.id,
+        "steamId": imp.steam_id,
         "nickname": imp.nickname,
         "gameTxs": len(parsed["game_txs"]),
         "topupTxs": len(parsed["topup_txs"]),
@@ -291,7 +312,7 @@ async def import_report(data: dict, source_file: str = "") -> dict:
 # 同步状态快照（settings 键）——前端展示「自动同步」最近一次结果
 KEY_BILLS_SYNC = "bills.sync_snapshot"
 
-async def _latest_known_tx_date() -> str | None:
+async def _latest_known_tx_date(steam_id: str | None = None) -> str | None:
     """库内最新一笔交易日期（YYYY-MM-DD；无任何账单返回 None）。
 
     history 页倒序，首行即 Steam 侧最新——与库内最新比对即可判断
@@ -301,7 +322,8 @@ async def _latest_known_tx_date() -> str | None:
         for model in (BillGameTx, BillTopupTx, BillCdkGame):
             row = (
                 await session.execute(
-                    select(model.date).order_by(model.date.desc()).limit(1)
+                    select(model.date).join(BillImport, BillImport.id == model.import_id)
+                    .where(BillImport.steam_id == steam_id).order_by(model.date.desc()).limit(1)
                 )
             ).first()
             if row and row[0]:
@@ -309,13 +331,7 @@ async def _latest_known_tx_date() -> str | None:
     return None
 
 
-# 陈旧锁判定：同步周期 30min（调度器 bills_sync interval），超过即视为
-# 上次进程中途被杀留下的死锁——running 永久卡死会让后续所有定时触发
-# 都被判 busy 跳过（本地服务频繁重启时的实际故障模式）。
-_BILLS_SYNC_STALE_AFTER = timedelta(minutes=30)
-
-
-async def _with_live_session_retry(run):
+async def _with_live_session_retry(run, cookies: str):
     """执行一次账单抓取动作；store 会话衰减（登录页）时强制换发新会话重试。
 
     run 接收 Cookie 串返回结果。换发走 account 主账本（ensure_live_session
@@ -325,7 +341,6 @@ async def _with_live_session_retry(run):
     from app.domains.account import service as account_service
     from . import steam_fetch
 
-    cookies = await get_primary_cookies_fallback()
     try:
         return await run(cookies)
     except steam_fetch.StoreSessionExpiredError:
@@ -339,26 +354,38 @@ async def _with_live_session_retry(run):
         )
         if fresh == cookies:
             raise
+        if steam_id_from_cookies(fresh) != steam_id:
+            raise steam_fetch.SteamFetchError("续期后的账单凭据与目标账号不一致")
         log_event(
             logger,
-            "主账号商店会话已衰减，换发新会话后重试",
+            "账号商店会话已衰减，换发新会话后重试",
             tag="已修复",
             detail={"账号": steam_id},
         )
         return await run(fresh)
 
 
-async def get_primary_cookies_fallback() -> str:
-    """账单 Cookie 取值口径（与 sync_bills 一致）：主账号优先，回退当前账号。"""
-    from app.domains.account import service as account_service
-
-    cookies = await account_service.get_primary_cookies()
-    if not cookies or "steamLoginSecure" not in cookies:
-        cookies = await account_service.get_cookies()
-    return cookies or ""
+_sync_lock = asyncio.Lock()
 
 
-async def sync_bills(*, force: bool = False) -> dict:
+async def sync_bills(*, force: bool = False, steam_id: str | None = None) -> dict:
+    if steam_id is None and _sync_lock.locked():
+        return {"ok": False, "status": "busy"}
+    async with _sync_lock:
+        try:
+            return await _sync_bills_locked(force=force, steam_id=steam_id)
+        except asyncio.CancelledError:
+            from app.domains.settings import service as settings_service
+
+            snapshot = await settings_service.get_value(KEY_BILLS_SYNC, None) or {}
+            if snapshot.get("running"):
+                await settings_service.set_value(KEY_BILLS_SYNC, {
+                    **snapshot, "running": False, "ok": False, "error": "账单同步已中断",
+                })
+            raise
+
+
+async def _sync_bills_locked(*, force: bool, steam_id: str | None) -> dict:
     """从 Steam 在线拉全量账单 + 许可并落库（后端常驻在线拉取）。
 
     未绑 Cookie / 无变化静默跳过（force=False 供定时任务）；
@@ -373,65 +400,47 @@ async def sync_bills(*, force: bool = False) -> dict:
     from app.domains.settings import service as settings_service
     from . import steam_fetch
 
-    # 多账号语义：账单跟随**主账号**（第一个绑定的）——bills 表无 steamid
-    # 维度，跟随切换会混流两份账单。主账号不存在时回退当前账号（单账号等价）。
-    cookies = await account_service.get_primary_cookies()
-    if not cookies or "steamLoginSecure" not in cookies:
-        cookies = await account_service.get_cookies()
+    cookies = await account_service.get_cookies_of(steam_id) if steam_id else await account_service.get_cookies()
     if not cookies or "steamLoginSecure" not in cookies:
         return {"ok": False, "status": "no_cookie"}
+    from app.domains.account.steam_wallet import steam_id_from_cookies
 
-    snapshot: dict | None = await settings_service.get_value(KEY_BILLS_SYNC, None)
+    owner = steam_id_from_cookies(cookies)
+    if not owner or (steam_id and owner != steam_id):
+        return {"ok": False, "status": "error", "error": "账单登录凭据与目标账号不一致"}
+    steam_id = owner
+
     now = get_beijing_time_obj().replace(tzinfo=None)
-    if snapshot and snapshot.get("running"):
-        # running 卡死超过一个同步周期 → 进程中途被杀的死锁，放行重试；
-        # 周期内则保持 busy 语义（上一轮还在跑，不叠加第二份全量翻页）。
-        # 手动同步与绑定后首拉（force=True）同样受管：重复触发在这里收口。
-        since = snapshot.get("since")
-        stale = False
-        if since:
-            try:
-                since_dt = datetime.fromisoformat(since)
-                stale = (now - since_dt) > _BILLS_SYNC_STALE_AFTER
-            except ValueError:
-                stale = True
-        else:
-            stale = True
-        if not stale:
-            return {"ok": False, "status": "busy"}
-
-    # 先占 running 位再探测/翻页：busy 判定与探测之间隔着秒级网络段，并发
-    # 触发会双开全量翻页；各失败路径均以快照收尾，进程被杀的残留由 stale 兜底
-    await settings_service.set_value(KEY_BILLS_SYNC, {"running": True, "since": now.isoformat()})
+    await settings_service.set_value(KEY_BILLS_SYNC, {"running": True, "since": now.isoformat(), "steamId": steam_id})
 
     # 首屏探测：无新交易 → 本轮跳过（写探测跳过快照，等下一周期再探）
     if not force:
         try:
-            known_latest = await _latest_known_tx_date()
+            known_latest = await _latest_known_tx_date(steam_id)
             proxy_url = await account_service._strategy_proxy()
             has_new = await _with_live_session_retry(
                 lambda ck: steam_fetch.probe_new_transactions(
                     ck, known_latest_date=known_latest, proxy_url=proxy_url
-                )
+                ), cookies,
             )
         except steam_fetch.SteamFetchError as exc:
             # Cookie 失效等硬错误：写错误快照（与全量失败同语义），等下一轮
             await settings_service.set_value(KEY_BILLS_SYNC, {
-                "running": False, "error": str(exc), "syncedAt": now.isoformat(),
+                "running": False, "error": str(exc), "syncedAt": now.isoformat(), "steamId": steam_id,
             })
             return {"ok": False, "status": "error", "error": str(exc)}
         if not has_new:
             await settings_service.set_value(KEY_BILLS_SYNC, {
-                "running": False, "probedSkip": True, "syncedAt": now.isoformat(),
+                "running": False, "probedSkip": True, "syncedAt": now.isoformat(), "steamId": steam_id,
             })
-            return {"ok": True, "status": "probed_skip", "historyRows": 0, "licenseRows": 0}
+            return {"ok": True, "status": "probed_skip", "steamId": steam_id, "historyRows": 0, "licenseRows": 0}
 
     async def _progress(info: dict) -> None:
         # 阶段进度写进快照 KV：GET /bills/sync 的轮询方（前端进度气泡）实时可读；
         # 写失败只丢进度显示，不影响同步本体（_emit_progress 已兜一层，双保险）。
         try:
             await settings_service.set_value(
-                KEY_BILLS_SYNC, {"running": True, "since": now.isoformat(), **info}
+                KEY_BILLS_SYNC, {"running": True, "since": now.isoformat(), "steamId": steam_id, **info}
             )
         except Exception:  # noqa: BLE001
             log_event(logger, "账单同步进度写入失败", tag="忽略", level=logging.DEBUG, exc_info=True)
@@ -441,7 +450,7 @@ async def sync_bills(*, force: bool = False) -> dict:
         report = await _with_live_session_retry(
             lambda ck: steam_fetch.fetch_full_report(
                 ck, proxy_url=proxy_url, on_progress=_progress
-            )
+            ), cookies,
         )
         # 空报告门禁：0 账单 + 0 许可说明解析层根本没拿到数据（登录页守门
         # 漏网/Steam 改版清空表格），落库会生成空 import 遮住真实旧快照。
@@ -452,7 +461,7 @@ async def sync_bills(*, force: bool = False) -> dict:
             )
         await _progress({"stage": "import"})
         result = await import_report(
-            report.to_report_json(), source_file=f"auto-sync {now.strftime('%Y-%m-%d')}"
+            report.to_report_json(), source_file=f"auto-sync {now.strftime('%Y-%m-%d')}", steam_id=steam_id,
         )
         result.update(
             {
@@ -471,6 +480,7 @@ async def sync_bills(*, force: bool = False) -> dict:
             "running": False,
             "error": str(exc),
             "syncedAt": now.isoformat(),
+            "steamId": steam_id,
         }
         await settings_service.set_value(KEY_BILLS_SYNC, error_snapshot)
         return {"ok": False, "status": "error", "error": str(exc)}
@@ -481,7 +491,7 @@ async def get_sync_snapshot() -> dict:
     from app.domains.settings import service as settings_service
 
     snap = await settings_service.get_value(KEY_BILLS_SYNC, None) or {}
-    return {**snap, "running": bool(snap.get("running"))}
+    return {**snap, "running": bool(snap.get("running")) and _sync_lock.locked()}
 
 
 async def list_imports() -> list[dict]:
@@ -506,6 +516,7 @@ async def list_imports() -> list[dict]:
     return [
         {
             "id": r.id,
+            "steamId": r.steam_id,
             "nickname": r.nickname,
             "sourceFile": r.source_file,
             "importedAt": r.imported_at.isoformat() if r.imported_at else None,
@@ -717,6 +728,7 @@ async def overview(import_id: int) -> dict:
 
         return {
             "id": imp.id,
+            "steamId": imp.steam_id,
             "nickname": imp.nickname,
             "avatar": avatar,
             "sourceFile": imp.source_file,

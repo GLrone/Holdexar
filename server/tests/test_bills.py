@@ -6,6 +6,7 @@
 
 DB 用例隔离方式对齐 test_account_wallet.py：monkeypatch 临时库 session factory。
 """
+import asyncio
 import json
 import os
 import sys
@@ -770,6 +771,8 @@ def _patch_sync_env(monkeypatch, store: dict, fetch) -> list:
     from app.domains.account import service as account_service
     from app.domains.bills import steam_fetch
 
+    monkeypatch.setattr(bills_service, "_sync_lock", asyncio.Lock())
+
     async def fake_get(key, default=None):
         return store.get(key, default)
 
@@ -780,12 +783,13 @@ def _patch_sync_env(monkeypatch, store: dict, fetch) -> list:
     monkeypatch.setattr(settings_service, "set_value", fake_set)
 
     async def fake_primary():
-        return "steamLoginSecure=fake||12345"
+        return "steamLoginSecure=76561198000000001||12345"
 
     async def fake_strategy_proxy():
         return None
 
     monkeypatch.setattr(account_service, "get_primary_cookies", fake_primary)
+    monkeypatch.setattr(account_service, "get_cookies", fake_primary)
     monkeypatch.setattr(account_service, "_strategy_proxy", fake_strategy_proxy)
 
     calls: list = []
@@ -803,14 +807,153 @@ def _patch_sync_env(monkeypatch, store: dict, fetch) -> list:
 
     monkeypatch.setattr(steam_fetch, "probe_new_transactions", fake_probe)
 
-    async def fake_import(report_json, source_file=""):
+    async def fake_import(report_json, source_file="", *, steam_id=None):
         return {
-            "importId": 1, "nickname": "t", "gameTxs": 0, "topupTxs": 0,
+            "importId": 1, "steamId": steam_id, "nickname": "t", "gameTxs": 0, "topupTxs": 0,
             "cdkGames": 0, "fxMissing": 0, "warnings": [], "replaced": 0,
         }
 
     monkeypatch.setattr(bills_service, "import_report", fake_import)
     return calls
+
+
+@pytest.mark.asyncio
+async def test_account_owned_imports_do_not_replace_same_name_or_legacy(db):
+    report = {"account": {"nickname": "Same name", "avatar_base64": ""},
+              "history": [], "topup": [], "licenses": []}
+    legacy = await bills_service.import_report(report)
+    first = await bills_service.import_report(report, steam_id="76561198000000001")
+    await bills_service.import_report(report, steam_id="76561198000000002")
+    renamed = {**report, "account": {"nickname": "Renamed", "avatar_base64": ""}}
+    replacement = await bills_service.import_report(renamed, steam_id="76561198000000002")
+    imports = await bills_service.list_imports()
+    assert {row["id"] for row in imports} == {legacy["importId"], first["importId"], replacement["importId"]}
+    assert replacement["replaced"] == 1
+    assert next(row for row in imports if row["steamId"] == "76561198000000002")["nickname"] == "Renamed"
+    assert {row["steamId"] for row in imports} == {None, "76561198000000001", "76561198000000002"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prices", [(1234,), (1234, 5678)])
+async def test_account_sync_preserves_manual_license_prices(db, prices):
+    from sqlalchemy import select
+    from app.domains.bills.models import BillCdkGame
+
+    report = {"account": {"nickname": "A", "avatar_base64": ""}, "history": [],
+              "licenses": [{"date": "2026 年 1 月 6 日", "item": "CDK Game", "method": "零售", "appid": 1234}] * len(prices)}
+    await bills_service.import_report(report, steam_id="76561198000000001")
+    async with db() as session:
+        rows = (await session.execute(select(BillCdkGame).order_by(BillCdkGame.id))).scalars().all()
+        for row, price in zip(rows, prices):
+            row.manual_fen = price
+        await session.commit()
+    await bills_service.import_report(report, steam_id="76561198000000001")
+    async with db() as session:
+        assert (await session.execute(select(BillCdkGame.manual_fen).order_by(BillCdkGame.id))).scalars().all() == list(prices)
+    await bills_service.import_report({**report, "licenses": []}, steam_id="76561198000000001")
+    async with db() as session:
+        assert (await session.execute(select(BillCdkGame.manual_fen).order_by(BillCdkGame.id))).scalars().all() == list(prices)
+
+
+@pytest.mark.asyncio
+async def test_named_account_sync_uses_its_credentials_and_import_owner(db, monkeypatch):
+    from app.domains.account import service as account_service
+
+    async def fetch():
+        return _FakeReport()
+
+    store = {}
+    calls = _patch_sync_env(monkeypatch, store, fetch)
+    async def own(sid):
+        return f"steamLoginSecure={sid}||own-token"
+    monkeypatch.setattr(account_service, "get_cookies_of", own)
+    result = await bills_service.sync_bills(force=True, steam_id="76561198000000002")
+    assert calls[0]["cookies"] == "steamLoginSecure=76561198000000002||own-token"
+    assert result["steamId"] == "76561198000000002"
+    assert store[bills_service.KEY_BILLS_SYNC]["steamId"] == "76561198000000002"
+
+
+@pytest.mark.asyncio
+async def test_account_sync_rejects_renewed_credentials_from_another_owner(db, monkeypatch):
+    from app.domains.account import service as account_service
+    from app.domains.account.steam_wallet import StoreSessionExpiredError
+
+    async def fetch():
+        raise StoreSessionExpiredError('login')
+    store = {}
+    calls = _patch_sync_env(monkeypatch, store, fetch)
+    async def wrong_owner(sid, cookies, *, force):
+        return 'steamLoginSecure=76561198000000002||new'
+    monkeypatch.setattr(account_service, 'ensure_live_session', wrong_owner)
+    result = await bills_service.sync_bills(force=True)
+    assert result['ok'] is False and result['status'] == 'error'
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_import_failure_rolls_back_only_account_replacement(db, monkeypatch):
+    from app.domains.bills.models import BillImport
+    from sqlalchemy import select
+
+    original = {"account": {"nickname": "Original", "avatar_base64": ""}, "history": [], "licenses": []}
+    first = await bills_service.import_report(original, steam_id='76561198000000001')
+    async def fail_rate(*args):
+        raise RuntimeError('rate failure')
+    monkeypatch.setattr(bills_service, '_rate_for', fail_rate)
+    failing = {**original, 'history': [{"date": "2026 年 1 月 1 日", "item": "Game", "type": "购买", "total": "¥30"}]}
+    with pytest.raises(RuntimeError, match='rate failure'):
+        await bills_service.import_report(failing, steam_id='76561198000000001')
+    async with db() as session:
+        row = (await session.execute(select(BillImport))).scalar_one()
+        assert row.id == first['importId'] and row.nickname == 'Original'
+
+
+@pytest.mark.asyncio
+async def test_named_accounts_wait_for_each_other_without_dropping_sync(db, monkeypatch):
+    from app.domains.account import service as account_service
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def fetch():
+        entered.set()
+        await release.wait()
+        return _FakeReport()
+
+    store = {}
+    calls = _patch_sync_env(monkeypatch, store, fetch)
+    async def own(sid):
+        return f"steamLoginSecure={sid}||own-token"
+    monkeypatch.setattr(account_service, "get_cookies_of", own)
+    first = asyncio.create_task(bills_service.sync_bills(force=True, steam_id="76561198000000001"))
+    await entered.wait()
+    second = asyncio.create_task(bills_service.sync_bills(force=True, steam_id="76561198000000002"))
+    await asyncio.sleep(0)
+    try:
+        assert len(calls) == 1
+    finally:
+        release.set()
+        results = await asyncio.gather(first, second)
+    assert [r["steamId"] for r in results] == ["76561198000000001", "76561198000000002"]
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelled_sync_records_interruption_and_releases_executor(db, monkeypatch):
+    entered = asyncio.Event()
+
+    async def fetch():
+        entered.set()
+        await asyncio.Event().wait()
+
+    store = {}
+    _patch_sync_env(monkeypatch, store, fetch)
+    task = asyncio.create_task(bills_service.sync_bills(force=True))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not bills_service._sync_lock.locked()
+    assert store[bills_service.KEY_BILLS_SYNC]["running"] is False
+    assert store[bills_service.KEY_BILLS_SYNC]["error"]
 
 
 class _FakeReport:
@@ -845,6 +988,7 @@ async def test_sync_bills_retries_after_store_session_decay(db, monkeypatch):
         return "steamLoginSecure=76561198123456789%7C%7Ctok; steamRefresh_steam=76561198123456789%7C%7Cref"
 
     monkeypatch.setattr(account_service, "get_primary_cookies", fake_numeric_primary)
+    monkeypatch.setattr(account_service, "get_cookies", fake_numeric_primary)
 
     async def fake_ensure(steam_id, cookies, *, force=False):
         assert force is True
@@ -862,7 +1006,29 @@ async def test_sync_bills_retries_after_store_session_decay(db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_sync_bills_busy_within_cycle(db, monkeypatch):
-    """周期内 running=True → busy 跳过，不叠加第二份全量翻页。"""
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def fetch():
+        entered.set()
+        await release.wait()
+        return _FakeReport()
+
+    store: dict = {}
+    calls = _patch_sync_env(monkeypatch, store, fetch)
+
+    first = asyncio.create_task(bills_service.sync_bills(force=True))
+    await entered.wait()
+    try:
+        res = await bills_service.sync_bills(force=False)
+        assert res == {"ok": False, "status": "busy"}
+        assert len(calls) == 1
+    finally:
+        release.set()
+        await first
+
+
+@pytest.mark.asyncio
+async def test_sync_bills_orphan_running_snapshot_does_not_block_restart(db, monkeypatch):
     from app.crawler.utils import get_beijing_time_obj
 
     async def fetch():
@@ -873,27 +1039,6 @@ async def test_sync_bills_busy_within_cycle(db, monkeypatch):
 
     now = get_beijing_time_obj().replace(tzinfo=None)
     store[bills_service.KEY_BILLS_SYNC] = {"running": True, "since": now.isoformat()}
-
-    res = await bills_service.sync_bills(force=False)
-    assert res == {"ok": False, "status": "busy"}
-    assert calls == []
-
-
-@pytest.mark.asyncio
-async def test_sync_bills_stale_lock_released(db, monkeypatch):
-    """running 卡死超过一个同步周期（进程中途被杀）→ 死锁放行，本轮重新拉起。"""
-    from datetime import timedelta
-
-    from app.crawler.utils import get_beijing_time_obj
-
-    async def fetch():
-        return _FakeReport()
-
-    store: dict = {}
-    calls = _patch_sync_env(monkeypatch, store, fetch)
-
-    now = get_beijing_time_obj().replace(tzinfo=None)
-    store[bills_service.KEY_BILLS_SYNC] = {"running": True, "since": (now - timedelta(minutes=35)).isoformat()}
 
     res = await bills_service.sync_bills(force=False)
     assert res.get("ok") is True
