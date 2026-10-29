@@ -864,10 +864,15 @@ function startLoginPolling() {
 async function refreshLoginState() {
   try {
     const st = await accountLoginApi.status()
+    const wasLoggingIn = loginActive.value
     loginState.value = st
     if (st.state === 'done') {
       stopLoginPolling()
       loginCodeMode.value = false
+      if (!wasLoggingIn) {
+        loginState.value = null
+        return
+      }
       message.success(t('settings.steam.loginDone'))
       loginAccount.value = ''
       loginCodeInput.value = ''
