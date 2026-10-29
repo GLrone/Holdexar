@@ -23,6 +23,7 @@ import logging
 import re
 
 import httpx
+from app.core.net import is_ssl_error
 
 from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.logging import log_event
@@ -109,13 +110,6 @@ async def _login_session() -> tuple[dict, str, str]:
     return jar, sessionid, steamid
 
 
-def _is_ssl_error(exc: Exception) -> bool:
-    clues = ("CERTIFICATE_VERIFY_FAILED", "self-signed", "certificate verify failed",
-             "ssl", "SSL", "unable to get local issuer")
-    text = f"{type(exc).__name__}: {exc}"
-    return any(c in text for c in clues)
-
-
 async def _post_steam(url: str, data: dict, jar: dict, *, referer: str | None = None) -> httpx.Response:
     """商店端点 POST：代理优先 + SSL 证书降级重试（经 Clash vless 链路的既有规则）。"""
     headers = dict(_HEADERS)
@@ -126,7 +120,7 @@ async def _post_steam(url: str, data: dict, jar: dict, *, referer: str | None = 
         async with httpx.AsyncClient(timeout=20, proxy=proxy) as client:
             resp = await client.post(url, data=data, cookies=jar, headers=headers)
     except httpx.HTTPError as e:
-        if not _is_ssl_error(e):
+        if not is_ssl_error(e):
             raise
         log_event(
             logger,

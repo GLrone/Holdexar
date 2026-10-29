@@ -14,6 +14,7 @@ import re
 from dataclasses import dataclass
 
 import httpx
+from app.core.net import is_ssl_error
 
 from app.core.logging import log_event
 
@@ -465,7 +466,7 @@ async def fetch_wallet(cookies_raw: str, *, verify: bool | None = None, proxy_ur
     try:
         return await _try_channels(True, cookies, proxy_url)
     except WalletFetchError as exc:
-        if not _has_ssl_error(str(exc)):
+        if not is_ssl_error(exc):
             raise
         log_event(
             logger,
@@ -473,13 +474,6 @@ async def fetch_wallet(cookies_raw: str, *, verify: bool | None = None, proxy_ur
             tag="降级",
         )
         return await _try_channels(False, cookies, proxy_url)
-
-
-def _has_ssl_error(message: str) -> bool:
-    clues = ("SSLError", "CERTIFICATE_VERIFY_FAILED", "self-signed",
-             "certificate verify failed", "ssl")
-    lowered = message.lower()
-    return any(clue.lower() in lowered for clue in clues)
 
 
 # ── 头像 URL 归一（CDN 域名轮换治理）──────────────────
@@ -625,7 +619,7 @@ async def fetch_profile(
                 level=logging.DEBUG,
                 detail={"证书校验": verify_flag, "原因": str(exc)},
             )
-            if verify is None and _has_ssl_error(str(exc)):
+            if verify is None and is_ssl_error(exc):
                 continue  # 证书问题 → 降级重试一轮
             return empty
         if result.get("persona_name") or result.get("avatar_url"):
