@@ -2842,7 +2842,6 @@ function triggerFollowUp(prompt: string) {
           <div v-else-if="turn.kind === 'proposal'" class="pilot-proposal">
             <HlPilotCards
               :cards="turn.cards ?? []"
-              :busy-pid="busyPid"
               actions
               @proposal="onProposal"
               @quote="quoteToComposer"
@@ -2868,7 +2867,6 @@ function triggerFollowUp(prompt: string) {
             <HlPilotCards
               v-if="turn.cards?.length"
               :cards="turn.cards"
-              :busy-pid="busyPid"
               actions
               @proposal="onProposal"
               @quote="quoteToComposer"
@@ -2986,7 +2984,6 @@ function triggerFollowUp(prompt: string) {
             :phases="livePhases"
             :waiting-text="loadingText"
             :live-cards="liveChainCards"
-            :busy-pid="busyPid"
             @proposal="onProposal"
             @quote="quoteToComposer"
             @copy="onCopyText"

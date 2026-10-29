@@ -29,7 +29,6 @@ const props = withDefaults(
     hidePhaseText?: boolean
     failed?: boolean
     liveCards?: ChainLiveCard[]
-    busyPid?: string | null
   }>(),
   {
     phases: () => [],
@@ -42,7 +41,6 @@ const props = withDefaults(
     hidePhaseText: false,
     failed: false,
     liveCards: () => [],
-    busyPid: null,
   },
 )
 
@@ -256,7 +254,6 @@ function stepText(s: PilotStep): string {
             <HlPilotCards
               v-if="entry.card"
               :cards="[entry.card]"
-              :busy-pid="busyPid"
               actions
               @proposal="emit('proposal', $event)"
               @quote="emit('quote', $event)"
