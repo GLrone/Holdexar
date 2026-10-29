@@ -18,19 +18,6 @@ export interface RegionPriceInfo {
   locked: boolean
 }
 
-/** 可赠送判定：双方有价、未锁区即可（新政策不限价格倍率） */
-export function canGift(
-  senderPriceCnyFen: number | null | undefined,
-  receiverPriceCnyFen: number | null | undefined,
-): boolean {
-  return (
-    senderPriceCnyFen != null &&
-    receiverPriceCnyFen != null &&
-    senderPriceCnyFen > 0 &&
-    receiverPriceCnyFen > 0
-  )
-}
-
 /** 该笔赠送是否落入「按收礼方区价付款」轨道（收礼方区价超出送礼方 ×1.15） */
 export function isReceiverPriced(
   senderPriceCnyFen: number | null | undefined,

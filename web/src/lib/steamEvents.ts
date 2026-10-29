@@ -36,15 +36,6 @@ export function eventStartTs(e: SteamEventItem): number {
   return Date.UTC(y, (m || 1) - 1, d || 1, 10 + offset, 0, 0)
 }
 
-/** 活动结束时刻（毫秒）：精确时间戳优先，否则按结束日当天 10:00 PT 换算
- *  （官方窗口为「起始日 10:00 → 结束日 10:00」）。 */
-export function eventEndTs(e: SteamEventItem): number {
-  if (e.preciseEndTs) return e.preciseEndTs * 1000
-  const offset = isPacificDst(e.end) ? 7 : 8
-  const [y, m, d] = e.end.split('-').map(Number)
-  return Date.UTC(y, (m || 1) - 1, d || 1, 10 + offset, 0, 0)
-}
-
 function shiftIso(iso: string, days: number): string {
   const [y, m, d] = iso.split('-').map(Number)
   return new Date(Date.UTC(y, (m || 1) - 1, (d || 1) + days)).toISOString().slice(0, 10)

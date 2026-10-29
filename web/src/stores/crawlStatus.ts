@@ -227,7 +227,7 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
   function syncCrawlActivity(): void {
     if (running.value && total.value > 0) {
       const pDone = roundTracking.value ? roundDone.value + done.value : done.value
-      const pTotal = roundTracking.value ? Math.max(roundTotal.value, startedTotal.value, total.value) : total.value
+      const pTotal = roundTracking.value ? Math.max(roundTotal.value, total.value) : total.value
       const pct = pTotal > 0 ? Math.min(100, Math.round((pDone / pTotal) * 100)) : null
       const { t } = useI18n()
       activityManager.register({

@@ -135,7 +135,7 @@ async def test_topsellers_params_and_dedup(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_popularnew_params_and_batching(monkeypatch):
-    """popularnew：参数对齐 popular_new_supplement.py（filter + Released_DESC）。"""
+    """popularnew：参数口径（filter + Released_DESC）。"""
     session = _mock_fetch(monkeypatch, [
         _steam_page(list(range(1, 101))),
         _steam_page(list(range(101, 201))),

@@ -21,8 +21,7 @@
   库内已存在的行（不落占位），差量写入保证幂等。
 
 写库一律 UPDATE 已存在的 games 行（不创建新行）；重复导入幂等。
-当月包链与 Epic 链例外：新 appid 允许落占位行（updated_at NULL →
-榜单反哺/HB 补价通道按首爬候选消化）。
+当月包链与 Epic 链例外：新 appid 允许落占位行（updated_at NULL，待后续首爬补全）。
 """
 from __future__ import annotations
 
@@ -450,11 +449,10 @@ async def _resolve_appid(
 
 
 async def _mark_game_hb(appid: int, title: str, label: str) -> None:
-    """游戏侧标记：缺行落占位（updated_at NULL → 首爬候选），已有行补写标记。
+    """游戏侧标记：缺行落占位（updated_at NULL），已有行补写标记。
 
-    hb_data 多月逗号续写（与外部史低库 "Choice (A), Choice (B)" 同形态），
-    已含当月标记时不动（幂等）。占位行的元数据/中文名/价格由 HB 补价
-    通道与榜单反哺消化。
+    hb_data 多月逗号续写（"Choice (A), Choice (B)" 同形态），
+    已含当月标记时不动（幂等）。占位行由后续首爬通道带全量元数据回补。
     """
     from app.crawler.utils import get_beijing_time_obj
 
@@ -680,7 +678,7 @@ async def hb_choice_offers() -> dict:
 async def unpriced_hb_appids(limit: int = 60) -> list[int]:
     """已标记 HB 但一行价格都没有的 appid（补价通道候选集）。
 
-    两通道判据同源：**无任何价格行**的才归本通道首爬；
+    通道判据：**无任何价格行**的才归本通道首爬；
     已有价格行（missing/blocked 状态）的归补抓账本，这里再抓属双通道
     重复。下架与永久免费（价格事实已定）不补。按 appid 升序限量。
     """
@@ -875,7 +873,7 @@ def _norm_epic_date(raw: str) -> str | None:
 
 
 async def _mark_game_epic(appid: int, title: str, free_start: str | None) -> bool:
-    """游戏侧标记：缺行落占位（updated_at NULL → 首爬候选），已有行补缺。
+    """游戏侧标记：缺行落占位（updated_at NULL），已有行补缺。
 
     与当月包链同例外；已标记行只补空白 epic_date，不覆写既有值
     （静态档案/首见日期优先）。返回是否有写入（幂等判据）。

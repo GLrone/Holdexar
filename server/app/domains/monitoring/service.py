@@ -718,28 +718,6 @@ async def recycle_orphan_game_sources() -> int:
     )
 
 
-async def sync_all_game_sources() -> int:
-    """全库对账：wishlist_items 里出现过的 appid 全部重算一遍 + 孤儿派生来源回收。
-
-    兜底入口（迁移漏跑或监控表被清空的库按需手工调用）；账号同步与池内增删
-    走 `sync_game_sources` 按 appid 增量对账，解绑流程走精准对账 +
-    `recycle_orphan_game_sources`。返回重算 appid 数与回收对象数之和。
-    """
-    from app.domains.wishlist.models import WishlistItem
-
-    async with get_session_factory()() as session:
-        appids = [
-            int(a)
-            for a in (
-                await session.execute(select(WishlistItem.appid).distinct())
-            ).scalars().all()
-        ]
-    recycled = await recycle_orphan_game_sources()
-    if appids:
-        await sync_game_sources(appids)
-    return len(appids) + recycled
-
-
 # ── 统计（运行验证用）────────────────────────────────────────
 
 

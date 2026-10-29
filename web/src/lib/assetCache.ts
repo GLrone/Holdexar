@@ -105,8 +105,3 @@ export function assetRetryUrl(url: string, attempt: number): string {
   const sep = url.includes('?') ? '&' : '?'
   return `${url}${sep}hlretry=${attempt}`
 }
-
-/** 清空登记（测试 / 强制刷新用） */
-export function resetAssetRegistry(): void {
-  registry.clear()
-}
