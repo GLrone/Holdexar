@@ -30,8 +30,8 @@ const (
 	envPrefix = "HOLDEXAR_"
 	dbName    = appSlug + ".db"
 
-	stageCommitted   = "committed"
-	stageRolledBack  = "rolled_back"
+	stageCommitted  = "committed"
+	stageRolledBack = "rolled_back"
 
 	migrationFailed  = "failed"
 	migrationReused  = "reused"
@@ -940,7 +940,9 @@ func readTransaction(root string) map[string]any {
 		return nil
 	}
 	var tx map[string]any
-	if err := json.Unmarshal(raw, &tx); err != nil {
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.UseNumber()
+	if err := decoder.Decode(&tx); err != nil || !json.Valid(raw) {
 		return nil
 	}
 	return tx
@@ -1115,39 +1117,97 @@ func recoveryNeeded(tx map[string]any) bool {
 	dir, _ := tx["dataDir"].(string)
 	return dir != ""
 }
+
+func inactiveUpdateFlag(value any) bool {
+	return value == nil || value == false
+}
+
+func updateRecoveryComplete(root string, tx map[string]any, state *currentState) bool {
+	attempt, _ := tx["attemptId"].(string)
+	directory, _ := tx["dataDir"].(string)
+	database, _ := tx["dataDbPath"].(string)
+	if state == nil || attempt == "" || !isManagedVersionName(state.Version) ||
+		!filepath.IsAbs(directory) || !inactiveUpdateFlag(tx["launchPending"]) {
+		return false
+	}
+	if pending := state.Raw["pendingVersion"]; pending != nil && pending != "" {
+		return false
+	}
+	// A remaining maintenance marker still belongs to UpdateHost, even after a terminal write.
+	if _, err := os.Lstat(filepath.Join(directory, "backups", ".restore.lock")); !os.IsNotExist(err) {
+		return false
+	}
+	compat := state.DataCompatibility
+	allowed := map[string]bool{}
+	if compat != nil {
+		if _, err := validateDataCompat(compat); err != nil || !samePath(compat.DataDir, directory) {
+			return false
+		}
+		for _, version := range compat.Versions {
+			allowed[version] = true
+		}
+		if !allowed[state.Version] {
+			return false
+		}
+	} else if !samePath(directory, filepath.Join(root, "data")) {
+		return false
+	}
+	// Before prepare, abort_preparation leaves no work or terminal flags to repair.
+	children, childrenList := tx["children"].([]any)
+	target, _ := tx["targetVersion"].(string)
+	if inactiveUpdateFlag(tx["dataPrepared"]) && inactiveUpdateFlag(tx["dataAccepted"]) &&
+		tx["sourceVersion"] == state.Version && isManagedVersionName(target) && target != state.Version &&
+		(tx["children"] == nil || childrenList && len(children) == 0) {
+		return true
+	}
+	if !filepath.IsAbs(database) || !samePath(database, filepath.Join(directory, dbName)) {
+		return false
+	}
+	if currentAttempt := state.Raw["attemptId"]; currentAttempt != nil && currentAttempt != attempt {
+		return false
+	}
+	if tx["stage"] == stageRolledBack {
+		return tx["dataRollbackReleased"] == true && inactiveUpdateFlag(tx["dataAccepted"]) &&
+			tx["dataRecoveryPhase"] == "restored" && tx["sourceVersion"] == state.Version
+	}
+	if released, exists := tx["dataRollbackReleased"]; exists && released != false {
+		return false
+	}
+	schema, ok := tx["dataSchemaVersion"].(json.Number)
+	acceptedSchema, err := schema.Int64()
+	return tx["stage"] == stageCommitted && tx["dataPrepared"] == true && tx["dataAccepted"] == true &&
+		tx["dataRecoveryPhase"] == "accepted" &&
+		tx["currentVersion"] == state.Version && allowed[target] && compat != nil && ok && err == nil &&
+		acceptedSchema == int64(compat.SchemaVersion)
+}
+
 func recoverInterruptedUpdate(root string) error {
 	release, err := updateMutex()
 	if err != nil {
 		return err
 	}
 	tx := readTransaction(root)
-	release()
+	if tx == nil {
+		if _, err := os.Lstat(filepath.Join(root, "state", "transaction.json")); !os.IsNotExist(err) {
+			release()
+			return errors.New("更新事务无法读取，已停止启动并保留数据")
+		}
+	} else if attempt, ok := tx["attemptId"].(string); !ok || attempt == "" {
+		release()
+		return errors.New("更新事务缺少有效标识，已停止启动并保留数据")
+	}
 	if !recoveryNeeded(tx) {
+		release()
 		return nil
 	}
-	// 终态事务且账本记录完整：UpdateHost 已完成数据收尾，启动器校验指针与
-	// 账本一致后直接继续（无需宿主）；账本不完整则委托宿主恢复。
-	stage, _ := tx["stage"].(string)
 	state, stateErr := readCurrentState(root)
 	if stateErr != nil {
+		release()
 		return stateErr
 	}
-	pointer := ""
-	if state != nil {
-		pointer = state.Version
-	}
-	if target, ok := tx["targetVersion"].(string); ok && target != "" &&
-		tx["dataAccepted"] == true && stage == stageCommitted {
-		if pointer != target {
-			return errors.New("已验收版本与程序指向不一致，已停止启动以保护数据")
-		}
-		return nil
-	}
-	if source, ok := tx["sourceVersion"].(string); ok && source != "" &&
-		tx["dataRollbackReleased"] == true && stage == stageRolledBack {
-		if pointer != source {
-			return errors.New("已恢复的数据与当前程序指向不一致，已停止启动并保留数据")
-		}
+	complete := updateRecoveryComplete(root, tx, state)
+	release()
+	if complete {
 		return nil
 	}
 	host := filepath.Join(root, "updater", "UpdateHost.exe")
