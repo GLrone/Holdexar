@@ -11,9 +11,7 @@ router = APIRouter(prefix="/metadata", tags=["metadata"])
 
 class ImportRequest(BaseModel):
     source: str = Field(description="epic | xgp | hb | all")
-    source_dir: str | None = Field(
-        default=None, description="原项目数据目录（默认 E:\\STEAM-price）"
-    )
+    source_dir: str | None = Field(default=None, description="旧数据目录（缺省走环境变量）")
 
 
 @router.post("/import")
