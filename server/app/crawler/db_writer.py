@@ -1410,36 +1410,6 @@ class DbWriter:
         except Exception as e:
             log_event(logger, "标记即将推出暂缓失败", level=logging.ERROR, detail={"原因": e})
 
-    async def bump_removed_strike(self, appid: int) -> bool:
-        """全 404 轮记一击；连续 ≥2 击（跨两个价格刷新周期）→ 落 removed_at 终态。
-
-        只对库内已有元数据（updated_at 有值）的行生效——挂名行/COMING_SOON
-        无"曾经有数据"事实，不走下架判定（走反哺/重探通道）。返回是否已转终态。
-        """
-        try:
-            async with write_session(WritePriority.BACKGROUND) as session:
-                row = await session.get(Game, int(appid))
-                if row is None or row.updated_at is None:
-                    return False
-                row.removed_strikes = (row.removed_strikes or 0) + 1
-                if row.removed_strikes >= 2:
-                    row.removed_at = _naive(get_beijing_time_obj())
-                    log_event(
-                        logger,
-                        f"游戏 {appid} 连续 {row.removed_strikes} 轮全部 404，已标记为下架",
-                        detail={"游戏": appid, "连续轮数": row.removed_strikes},
-                    )
-                await session.commit()
-                return row.removed_at is not None
-        except Exception as e:
-            log_event(
-                logger,
-                "记录下架判定击数失败",
-                level=logging.ERROR,
-                detail={"原因": e},
-            )
-            return False
-
     async def clear_removed_mark(self, appid: int) -> None:
         """复活清标：upsert_game_and_prices 成功路径调用（抓到数据=商店健在）。
 
