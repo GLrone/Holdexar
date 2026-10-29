@@ -858,7 +858,7 @@ function stopLoginPolling() {
 
 function startLoginPolling() {
   stopLoginPolling()
-  loginTimer = window.setInterval(void refreshLoginState, 1000)
+  loginTimer = window.setInterval(refreshLoginState, 1000)
 }
 
 async function refreshLoginState() {
