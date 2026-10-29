@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.core import secretbox
 from app.core.database import Base
 from app.domains.account import service as account_service
-from app.domains.account.steam_wallet import _from_raw_amounts
+from app.domains.account.steam_wallet import WalletInfo
 from app.domains.settings import service as settings_service
 
 A = "76561198000000001"
@@ -255,7 +255,7 @@ async def test_rotational_sync_refreshes_all_accounts(db, monkeypatch):
         from app.domains.account.steam_wallet import steam_id_from_cookies
 
         sid = steam_id_from_cookies(cookies)
-        return _from_raw_amounts(10000 if sid == A else 20000, 0, 23, "CN")
+        return WalletInfo(balance=100.0 if sid == A else 200.0, currency_code="CNY", currency_symbol="¥", currency_id=23, country_code="CN")
 
     async def no_sleep(_seconds):
         return None
@@ -384,7 +384,7 @@ def test_parse_miniprofile_nonsteam_game():
 @pytest.mark.asyncio
 async def test_refresh_online_states_maps_personastate(db, monkeypatch):
     """官方通道：personastate>0=在线，缺失=离线，gameextrainfo=in_game。"""
-    from app.domains.account.steam_wallet import _from_raw_amounts  # noqa: F401 保持导入习惯
+    from app.domains.account.steam_wallet import WalletInfo  # noqa: F401 保持导入习惯
 
     async def fake_states(steam_ids, api_key, *, proxy_url=None):
         return {
