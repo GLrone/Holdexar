@@ -300,8 +300,9 @@ async def test_mixed_free_state_batch_writes_history_once(
 
 @pytest.mark.asyncio
 async def test_missing_ledger_batch_bump_and_dedup(db):
-    """批量欠账记账：首记 fail_count=1；同批 (appid, 区) 去重不双计；
-    再次失败冲突 bump 递增（保留 last good price 不动）。"""
+    """批量欠账记账（传输证据）：首记 fail_count=1；同批 (appid, 区) 去重
+    不双计；再次失败不递增——传输类失败不消耗烧尽预算（保留 last good
+    price 不动）。契约变更：递增语义收窄到门禁降级证据。"""
     w = DbWriter()
     wrote = await w.mark_region_status_missing_batch(
         [(APPID_A, "CN"), (APPID_A, "CN"), (APPID_B, "cn")]
@@ -315,7 +316,7 @@ async def test_missing_ledger_batch_bump_and_dedup(db):
     await w.mark_region_status_missing_batch([(APPID_A, "CN")])
     async with db() as session:
         a2 = await session.get(GameCurrentPrice, (APPID_A, "CN"))
-    assert a2.fail_count == 2 and a2.price_status == "missing"
+    assert a2.fail_count == 1 and a2.price_status == "missing"
 
 
 @pytest.mark.asyncio

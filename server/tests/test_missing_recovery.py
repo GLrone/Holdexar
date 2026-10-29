@@ -407,3 +407,98 @@ async def test_blocked_aging_reprobe():
         await session.commit()
     tasks = await db.generate_missing_tasks(cooldown_minutes=0)
     assert any(APPID2 in t.get("appids", []) and t.get("region", "").upper() == "UA" for t in tasks)
+
+
+# ── 根因修复回归：降级按行不扩散 + 证据分流预算 ──
+
+
+@pytest.mark.asyncio
+async def test_mixed_region_keeps_ok_semantics():
+    """混合区（同区 ok 有价标准行 + ok 无价 gold 行）→ 区保持 ok 语义：
+    价格真实刷新、成功章、不进欠账结转；坏行本无价格落点不受影响。"""
+    db = DbWriter()
+    now = _now_naive()
+    game_data = {"appid": APPID3, "name": "混合区", "updated_at": now}
+    prices = [
+        {"appid": APPID3, "region_code": "CN", "currency": "CNY",
+         "price": 9900, "original_price": 9900, "discount_percent": 0,
+         "sub_id": 1, "is_gold": False, "version_suffix": None,
+         "price_status": "ok", "crawled_at": now},
+        {"appid": APPID3, "region_code": "CN", "currency": "CNY",
+         "price": None, "original_price": None, "discount_percent": 0,
+         "sub_id": 2, "is_gold": True, "version_suffix": "Gold Edition",
+         "price_status": "ok", "crawled_at": now},
+    ]
+    assert await db.upsert_game_and_prices(game_data, prices) is True
+    async with get_session_factory()() as session:
+        row = await session.get(GameCurrentPrice, (APPID3, "CN"))
+        assert row.price_status == "ok" and row.price == 9900
+        assert row.attempt_outcome == "success" and row.last_success_at is not None
+        assert row.fail_count == 0
+    # 不进欠账选取
+    assert not any(APPID3 in task.get("appids", [])
+                   for task in await db.generate_missing_tasks(cooldown_minutes=0))
+
+
+@pytest.mark.asyncio
+async def test_mixed_region_batch_path_same_semantics():
+    """批量入口同形状：ok_groups 与欠账结转集合不再相交（钉 1 态消失）。"""
+    db = DbWriter()
+    now = _now_naive()
+    game = {"appid": APPID2, "name": "混合区批量", "updated_at": now}
+    prices = [
+        {"appid": APPID2, "region_code": "CN", "currency": "CNY",
+         "price": 8800, "original_price": 8800, "discount_percent": 0,
+         "sub_id": 1, "is_gold": False, "version_suffix": None,
+         "price_status": "ok", "crawled_at": now},
+        {"appid": APPID2, "region_code": "CN", "currency": "CNY",
+         "price": None, "original_price": None, "discount_percent": 0,
+         "sub_id": 2, "is_gold": True, "version_suffix": "Gold Edition",
+         "price_status": "ok", "crawled_at": now},
+    ]
+    assert await db.upsert_task_batch([(game, prices)]) == [True]
+    async with get_session_factory()() as session:
+        row = await session.get(GameCurrentPrice, (APPID2, "CN"))
+        assert row.price_status == "ok" and row.price == 8800
+        assert row.attempt_outcome == "success"
+        assert row.fail_count == 0
+
+
+@pytest.mark.asyncio
+async def test_pure_degraded_region_still_burns_budget():
+    """子情形 B（坏行是唯一标准候选）：纯降级区仍进欠账并消耗预算；
+    gold 有效价不顶替现价投影（现状钉住）。"""
+    db = DbWriter()
+    now = _now_naive()
+    game_data = {"appid": APPID3, "name": "纯降级区", "updated_at": now}
+    prices = [
+        {"appid": APPID3, "region_code": "CN", "currency": "CNY",
+         "price": None, "original_price": None, "discount_percent": 0,
+         "sub_id": 1, "is_gold": False, "version_suffix": None,
+         "price_status": "ok", "crawled_at": now},
+        {"appid": APPID3, "region_code": "CN", "currency": "CNY",
+         "price": 50000, "original_price": 50000, "discount_percent": 0,
+         "sub_id": 2, "is_gold": True, "version_suffix": "Gold Edition",
+         "price_status": "ok", "crawled_at": now},
+    ]
+    assert await db.upsert_game_and_prices(game_data, prices) is True
+    async with get_session_factory()() as session:
+        row = await session.get(GameCurrentPrice, (APPID3, "CN"))
+        assert row.price_status == "missing"
+        assert row.price == 10000  # failed 章保留上次成功价（夹具预置行）
+        assert row.fail_count == 1  # 门禁证据消耗 1 次预算
+        assert row.price != 50000  # gold 价不顶替现价投影
+
+
+@pytest.mark.asyncio
+async def test_transport_ledger_does_not_burn_budget():
+    """传输类记账不消耗预算：批量记账重复 5 次仍 missing、fail_count 不递增
+    （blocked 只由真实响应缺价证据抵达）。"""
+    db = DbWriter()
+    for _ in range(5):
+        await db.mark_region_status_missing_batch([(APPID, "RU")])
+    async with get_session_factory()() as session:
+        row = await session.get(GameCurrentPrice, (APPID, "RU"))
+        assert row.price_status == "missing"
+        assert row.fail_count == 1  # 首记=1，传输失败不递增
+        assert row.price_status != "blocked"
