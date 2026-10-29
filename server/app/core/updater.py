@@ -977,7 +977,7 @@ def pending_status() -> dict:
         "pending": False,
         "installing": installing,
         "swapFailed": swap_failed,
-        "justUpdated": _just_updated_status(diagnosis),
+        "justUpdated": just_updated_status(),
     }
     if not manifest.is_file():
         return result
