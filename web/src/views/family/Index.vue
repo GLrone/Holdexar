@@ -2,6 +2,7 @@
 import { computed, onMounted, ref, watch, type Component } from 'vue'
 import { useRoute } from 'vue-router'
 import { flagUrl } from '@/api/regions'
+import { friendCodeOrRaw } from '@/utils/steamId'
 import { useRegionsStore } from '@/stores/regions'
 import { useFamilyStore } from '@/stores/familyLib'
 import { familyApi, watchPoolApi, type FamilyGroupStatus, type FamilyMemberItem } from '@/api/client'
@@ -70,7 +71,7 @@ function syncMembersFromGroup() {
     avatar: '',
     avatarUrl: normalizeAvatarUrl(m.avatarUrl),
     role: m.steamid === g?.steamid ? 'primary' : 'family',
-    friendCode: String(BigInt(m.steamid) - 76561197960265728n),
+    friendCode: friendCodeOrRaw(m.steamid),
     region: m.region,
     regionSource: m.regionSource,
     contribution: 0,
