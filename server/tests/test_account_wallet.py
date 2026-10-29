@@ -15,12 +15,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.database import Base, init_db as _real_init_db
+from wallet_helpers import from_raw_amounts
 from app.domains.account import service as account_service
 from app.domains.account.steam_wallet import (
     NO_DIVIDE_CURRENCY_IDS,
     STEAM_CURRENCY_IDS,
     WalletInfo,
-    _from_raw_amounts,
     filter_login_cookies,
     has_login_cookie,
     parse_cookie_str,
@@ -129,7 +129,7 @@ def test_currency_ids_cover_cc_list_unique_currencies():
 
 
 def test_from_raw_amounts_divides_by_100():
-    info = _from_raw_amounts(12345, 500, 23, "CN")
+    info = from_raw_amounts(12345, 500, 23, "CN")
     assert info.currency_code == "CNY"
     assert info.balance == 128.45
     assert info.balance_display == "¥128.45"
@@ -139,7 +139,7 @@ def test_from_raw_amounts_divides_by_100():
 @pytest.mark.parametrize("currency_id", sorted(NO_DIVIDE_CURRENCY_IDS))
 def test_from_raw_amounts_no_divide_currencies(currency_id):
     code, symbol = STEAM_CURRENCY_IDS[currency_id]
-    info = _from_raw_amounts(1000, 0, currency_id, "JP")
+    info = from_raw_amounts(1000, 0, currency_id, "JP")
     assert info.balance == 1000.0
     assert info.balance_display == f"{symbol}1,000"
     assert code in {"JPY", "KRW", "VND"}
@@ -147,11 +147,11 @@ def test_from_raw_amounts_no_divide_currencies(currency_id):
 
 def test_from_raw_amounts_rejects_unknown_id():
     with pytest.raises(Exception, match="未知 Steam 钱包币种"):
-        _from_raw_amounts(100, 0, 9999, "XX")
+        from_raw_amounts(100, 0, 9999, "XX")
 
 
 def test_from_raw_amounts_normalizes_bad_country():
-    info = _from_raw_amounts(100, 0, 1, "usa")
+    info = from_raw_amounts(100, 0, 1, "usa")
     assert info.country_code == ""
 
 
@@ -177,7 +177,7 @@ async def test_derive_region_unknown_currency_returns_empty():
 @pytest.mark.asyncio
 async def test_sync_wallet_persists_snapshot(monkeypatch):
     async def fake_fetch(cookies, *, verify=None, proxy_url=None):
-        return _from_raw_amounts(20000, 0, 23, "CN")
+        return from_raw_amounts(20000, 0, 23, "CN")
 
     monkeypatch.setattr(account_service, "fetch_wallet", fake_fetch)
     # 多账号表：经 save_cookies 绑定（upsert + 置 active），不再种 KV
@@ -205,7 +205,7 @@ async def test_sync_wallet_without_cookie_is_soft_skip():
 async def test_sync_wallet_failure_preserves_ok_at(monkeypatch):
     """失败改写保留上次成功时刻（ok_at）：前端显示层缓存窗的事实来源。"""
     async def fake_ok(cookies, *, verify=None, proxy_url=None):
-        return _from_raw_amounts(20000, 0, 23, "CN")
+        return from_raw_amounts(20000, 0, 23, "CN")
 
     async def fake_fail(cookies, *, verify=None, proxy_url=None):
         raise account_service.WalletFetchError("模拟网络失败")
@@ -237,7 +237,7 @@ async def test_wallet_rotation_success_writes_ok_at(monkeypatch):
         return {"steamLoginSecure": "x"}
 
     async def fake_fetch(_steam_id, _cookies):
-        return _from_raw_amounts(15000, 0, 23, "CN")
+        return from_raw_amounts(15000, 0, 23, "CN")
 
     monkeypatch.setattr(account_service, "ensure_live_session", fake_live)
     monkeypatch.setattr(
@@ -265,7 +265,7 @@ async def test_wallet_rotation_success_writes_ok_at(monkeypatch):
 @pytest.mark.asyncio
 async def test_save_cookies_flags_mismatch(monkeypatch):
     async def fake_fetch(cookies, *, verify=None, proxy_url=None):
-        return _from_raw_amounts(1, 0, 1, "US")
+        return from_raw_amounts(1, 0, 1, "US")
 
     monkeypatch.setattr(account_service, "fetch_wallet", fake_fetch)
     await settings_service.set_value("account.steam_id", "76561198000000000")
@@ -295,7 +295,7 @@ async def test_fetch_wallet_falls_back_on_ssl_error(monkeypatch):
             raise steam_wallet.WalletFetchError(
                 "无法获取 Steam 钱包余额：_fetch_store_account: SSLError: certificate verify failed"
             )
-        return _from_raw_amounts(100, 0, 1, "US")
+        return from_raw_amounts(100, 0, 1, "US")
 
     monkeypatch.setattr(steam_wallet, "_try_channels", fake_try)
     info = await steam_wallet.fetch_wallet("steamLoginSecure=76561198000000000%7C%7Ct")

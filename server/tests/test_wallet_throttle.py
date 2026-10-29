@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.core.database import Base
 from app.domains.account import service as account_service
 from app.domains.account import steam_wallet
-from app.domains.account.steam_wallet import _from_raw_amounts
+from wallet_helpers import from_raw_amounts
 from app.domains.settings import service as settings_service
 
 A = "76561198000000001"
@@ -81,7 +81,7 @@ async def test_active_heartbeat_keeps_minute_freshness(db, monkeypatch):
 
     async def fake_fetch(cookies, *, verify=None, proxy_url=None):
         calls.append(cookies)
-        return _from_raw_amounts(10000, 0, 23, "CN")
+        return from_raw_amounts(10000, 0, 23, "CN")
 
     monkeypatch.setattr(account_service, "fetch_wallet", fake_fetch)
 
@@ -125,7 +125,7 @@ async def test_idle_stale_snapshot_still_refreshes(db, monkeypatch):
 
     async def fake_fetch(cookies, *, verify=None, proxy_url=None):
         calls.append(cookies)
-        return _from_raw_amounts(10000, 0, 23, "CN")
+        return from_raw_amounts(10000, 0, 23, "CN")
 
     monkeypatch.setattr(account_service, "fetch_wallet", fake_fetch)
 
@@ -146,7 +146,7 @@ async def test_heartbeat_recovery_triggers_refresh(db, monkeypatch):
 
     async def fake_fetch(cookies, *, verify=None, proxy_url=None):
         calls.append(cookies)
-        return _from_raw_amounts(10000, 0, 23, "CN")
+        return from_raw_amounts(10000, 0, 23, "CN")
 
     monkeypatch.setattr(account_service, "fetch_wallet", fake_fetch)
 
@@ -219,7 +219,7 @@ async def test_backoff_resets_on_success(db, monkeypatch):
     async def toggle_fetch(cookies, *, verify=None, proxy_url=None):
         if state["fail"]:
             raise account_service.WalletFetchError("网络抖动")
-        return _from_raw_amounts(10000, 0, 23, "CN")
+        return from_raw_amounts(10000, 0, 23, "CN")
 
     monkeypatch.setattr(account_service, "fetch_wallet", toggle_fetch)
 
@@ -377,7 +377,7 @@ async def test_manual_refresh_success_restores_rotation(db, monkeypatch):
     async def toggle_fetch(cookies, *, verify=None, proxy_url=None):
         if state["fail"]:
             raise account_service.WalletFetchError("网络抖动")
-        return _from_raw_amounts(10000, 0, 23, "CN")
+        return from_raw_amounts(10000, 0, 23, "CN")
 
     monkeypatch.setattr(account_service, "fetch_wallet", toggle_fetch)
     await account_service.save_cookies(cookie(A))
