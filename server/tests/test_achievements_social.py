@@ -250,21 +250,6 @@ async def test_feed_ordering_limit_and_fields(db):
     assert len(defaulted["items"]) == 3
 
 
-# ─── KV 便利贴墙回归（两本账本互不影响）───────────────────────
-
-
-@pytest.mark.asyncio
-async def test_career_wall_unaffected_by_notes(db):
-    await career.add_wall("便利贴一条")
-    await social_mod.save_note(None, 620, "IMG_A", "评语一条", None)
-    wall = await career.list_wall()
-    assert len(wall) == 1 and wall[0]["text"] == "便利贴一条"
-    assert (await social_mod.list_notes(None))["total"] == 1
-    await career.remove_wall(wall[0]["id"])
-    assert await career.list_wall() == []
-    assert (await social_mod.list_notes(None))["total"] == 1
-
-
 # ─── 路由层冒烟 ────────────────────────────────────────────────
 
 

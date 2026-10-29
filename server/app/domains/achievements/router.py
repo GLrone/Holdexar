@@ -57,35 +57,10 @@ async def sync_status():
     return await service.sync_status()
 
 
-# ─── 游戏生涯（称号 / 热力图 / 偏好画像 / 纪录 / 评语墙）──────────
+# ─── 游戏生涯（称号 / 热力图 / 偏好画像 / 纪录）──────────
 
 
 @router.get("/career")
 async def game_career(steamid: str = ""):
     """生涯原始度量：这里只吐数值，称号阈值与文案在前端词典。"""
     return await career.get_career(steamid or None)
-
-
-class WallPost(BaseModel):
-    text: str
-
-
-@router.get("/career/wall")
-async def wall_list():
-    """评语墙手写便利贴（最新在后）。"""
-    return {"comments": await career.list_wall()}
-
-
-@router.post("/career/wall")
-async def wall_add(payload: WallPost):
-    """追加一条便利贴（空白/超长返回 400）。"""
-    try:
-        return {"comments": await career.add_wall(payload.text)}
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.delete("/career/wall/{comment_id}")
-async def wall_remove(comment_id: str):
-    """删除一条便利贴（不存在时静默，返回最新列表）。"""
-    return {"comments": await career.remove_wall(comment_id)}
