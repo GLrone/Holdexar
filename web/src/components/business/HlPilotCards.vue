@@ -10,13 +10,11 @@ import HlButton from '@/components/ui/HlButton.vue'
 const props = withDefaults(
   defineProps<{
     cards: (PilotFacts | StructuredBlock | unknown)[]
-    busyPid?: string | null
     /** 悬停操作层（加引用 / 复制）：对话面传 true，纯展示（组件总览）不传 */
     actions?: boolean
   }>(),
   {
     actions: false,
-    busyPid: null,
   },
 )
 
@@ -71,14 +69,6 @@ function onCopy(text: string) {
         @quote="onQuote"
         @copy="onCopy"
       >
-        <!-- legacy 审批卡片内部事件转发插槽 -->
-        <template v-if="b.componentId === 'legacy-proposal'" #default>
-          <component
-            :is="b.data"
-            :busy-pid="busyPid"
-            @proposal="emit('proposal', $event)"
-          />
-        </template>
       </StructuredRenderer>
     </div>
 
