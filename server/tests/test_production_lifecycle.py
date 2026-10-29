@@ -21,12 +21,28 @@ async def test_production_owner_is_unique_per_data_directory(tmp_path):
         pass
 
 
-def test_background_close_releases_window_and_preserves_service(monkeypatch):
+@pytest.mark.parametrize("tray_available", [True, False])
+def test_background_close_preserves_tray_or_taskbar_access(monkeypatch, tray_available):
     import main as desktop
 
+    calls = []
+    tray = object() if tray_available else None
+    window = SimpleNamespace(hide=lambda: calls.append("hide"), minimize=lambda: calls.append("minimize"))
     monkeypatch.setattr(desktop, "_background_mode", True, raising=False)
     monkeypatch.setitem(desktop._tray_state, "quit", False)
+    monkeypatch.setitem(desktop._tray_state, "tray", tray)
     monkeypatch.setattr(desktop, "_ask_close_intent", lambda *args: pytest.fail("configured close asks again"))
+    assert desktop._make_closing_guard(window)() is False
+    assert calls == (["hide"] if tray_available else ["minimize"])
+    assert desktop._tray_state["tray"] is tray
+
+
+def test_background_tray_exit_allows_real_window_close(monkeypatch):
+    import main as desktop
+
+    monkeypatch.setattr(desktop, "_background_mode", True)
+    monkeypatch.setitem(desktop._tray_state, "quit", True)
+    monkeypatch.setattr(desktop, "_ask_close_intent", lambda *args: pytest.fail("tray exit asks again"))
     assert desktop._make_closing_guard(SimpleNamespace())() is True
 
 

@@ -1709,7 +1709,7 @@ def _ask_close_intent(owner=None, window=None) -> str:
 
 
 def _make_closing_guard(window):
-    """关窗守卫：点 X 先问意图——最小化到托盘 / 退出程序（弹窗 X = 留在窗口）。
+    """普通关窗询问意图，后台关窗最小化；明确退出才销毁窗口。
 
     pywebview closing 事件契约：handler 返回 **False** = 取消关闭
     （closing 事件 should_lock=True，handler 同步跑在 UI 线程，返回值
@@ -1719,10 +1719,8 @@ def _make_closing_guard(window):
     def _guard() -> bool:
         if _tray_state["quit"]:
             return True  # 托盘「退出」：放行真关闭
-        if _background_mode:
-            return True
         owner = getattr(window, "native", None)
-        intent = _ask_close_intent(owner, window)
+        intent = "minimize" if _background_mode else _ask_close_intent(owner, window)
         if intent == "quit":
             # 先撤窗再放行：点「退出程序」窗口必须当场消失，进程收尾期间窗口
             # 不滞留屏幕。撤窗只收走可见面；真关闭照常走（closed 事件里
@@ -1832,7 +1830,7 @@ def _open_window(app_url: str) -> None:
 
         window.events.loaded += _on_loaded
 
-        # 关闭窗口按后台设置释放窗口或退出应用。
+        # 隐藏时保留窗口与托盘的共同生命周期，明确退出再销毁。
         window.events.closing += _make_closing_guard(window)
         def closed():
             if _background_mode and not _tray_state["quit"]:
