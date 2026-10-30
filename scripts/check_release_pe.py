@@ -100,7 +100,7 @@ def packer_hit(stat: dict) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Holdexar 发行包 PE 体检")
-    parser.add_argument("--dir", default=str(DEFAULT_DIR), help="待检目录（onedir 产物根）")
+    parser.add_argument("--dir", default=str(DEFAULT_DIR), help="待检目录（构建产物安装根，默认 release/build/Holdexar）")
     parser.add_argument("--all-sections", action="store_true", help="逐条列出 DLL/PYD")
     args = parser.parse_args()
 
