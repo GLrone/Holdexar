@@ -684,6 +684,8 @@ const pilot = {
   'pilot.flywheel.export': '导出本机训练材料',
   'pilot.flywheel.exported': '已导出 {count} 条意图样本与 {pairs} 组回答对',
   'pilot.flywheel.exportFailed': '导出失败，稍后再试',
+  'pilot.flywheel.loadFailed': '加载失败，可能是本机服务暂不可用',
+  'pilot.flywheel.retry': '重试',
   'pilot.feedback.accepted': '标记回答满意',
   'pilot.feedback.rejected': '标记回答不满意',
   'pilot.feedback.saved': '已记录你的评价',

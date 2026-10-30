@@ -684,6 +684,8 @@ const pilot = {
   'pilot.flywheel.export': 'Export local training material',
   'pilot.flywheel.exported': 'Exported {count} intent samples and {pairs} answer pairs',
   'pilot.flywheel.exportFailed': 'Export failed, try again later',
+  'pilot.flywheel.loadFailed': 'Load failed — the local service may be unavailable',
+  'pilot.flywheel.retry': 'Retry',
   'pilot.feedback.accepted': 'Mark answer helpful',
   'pilot.feedback.rejected': 'Mark answer not helpful',
   'pilot.feedback.saved': 'Your rating was saved',

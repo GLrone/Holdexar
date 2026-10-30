@@ -105,12 +105,17 @@ const startRedeem = () => cdk.startRedeem()
 const resetRedeem = () => cdk.resetRedeem()
 
 /** 复制所有 SubID + 版本名（一行一个） */
-function copyResults() {
+async function copyResults() {
   const lines = resultRows.value
     .filter((r) => r.subId && r.subId !== '0')
     .map((r) => `${r.subId} ${r.subName}`)
   if (!lines.length) return
-  navigator.clipboard?.writeText(lines.join('\n'))
+  try {
+    await navigator.clipboard.writeText(lines.join('\n'))
+  } catch {
+    message.error(t('toolbox.copy.failedHint'))
+    return
+  }
   copied.value = true
   window.setTimeout(() => (copied.value = false), 1500)
 }
@@ -278,9 +283,18 @@ const billRatios = computed(() => {
 
 async function switchImport(id: number) {
   if (activeImportId.value === id || billLoading.value) return
+  const previousId = activeImportId.value
   activeImportId.value = id
-  billOverview.value = await billsApi.overview(id)
-  await loadBillRows()
+  billLoading.value = true
+  try {
+    billOverview.value = await billsApi.overview(id)
+    await loadBillRows()
+  } catch (e) {
+    activeImportId.value = previousId
+    message.error(e instanceof Error ? e.message : String(e))
+  } finally {
+    billLoading.value = false
+  }
 }
 
 function goBillsPage() {
