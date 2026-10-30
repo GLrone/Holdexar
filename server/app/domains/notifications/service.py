@@ -12,10 +12,12 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.logging import log_event
 from app.domains.alerts.notify import delivery_rejection_code, is_delivery_unknown, send_mail_ex, smtp_config
+from app.domains.alerts.models import AlertEvent
 from app.domains.crawl import events as events_service
 from app.domains.crawl import service as crawl_service
 from app.domains.crawl.cycle import PriceCycle
 from app.domains.games.models import Game
+from app.domains.games.pricing import format_minor_units
 from app.domains.notifications import policy as policy_mod
 from app.domains.notifications.mail import (
     MAX_DETAIL_ROWS,
@@ -23,7 +25,8 @@ from app.domains.notifications.mail import (
     digest_mail_html,
     event_label,
 )
-from app.domains.notifications.models import NotificationCandidate
+from app.domains.notifications.models import FactNotice, NotificationCandidate
+from app.domains.settings.models import AppSetting
 from app.domains.notifications.policy import (
     CATEGORY_LABELS,
     FAILED,
@@ -75,6 +78,121 @@ def retryable(error: str | None) -> bool:
 
 EVENT_BATCH = 1000
 SENDING_TIMEOUT = timedelta(minutes=30)
+
+NOTICE_TYPES = {
+    ("hb_choice", "bundle_changed"): "HB_CHOICE",
+    ("epic_free", "free_rotation"): "EPIC_FREE",
+    ("bundles", "discount_pick"): "BUNDLE_DEAL",
+    ("alerts", "proxy_health"): "PROXY_ALERT",
+    ("alerts", "system_alert"): "SYSTEM_ALERT",
+}
+
+
+async def _session_prefs(session) -> dict:
+    row = await session.get(AppSetting, policy_mod.PREFS_KEY)
+    return policy_mod._merge_prefs(row.value_json if row else None)
+
+
+async def enqueue_facts(source_kind: str, facts: list[dict], *, session=None) -> int:
+    """在来源事务中建立候选；资格和不可变来源共享一次提交。"""
+    if not facts:
+        return 0
+    if session is None:
+        async with write_session(WritePriority.BACKGROUND, "notification_facts") as owned:
+            created = await enqueue_facts(source_kind, facts, session=owned)
+            await owned.commit()
+            return created
+    models = {"price_event": events_service.PriceEvent, "alert_event": AlertEvent,
+              "fact_notice": FactNotice}
+    if source_kind not in models:
+        raise ValueError("不支持的通知事实来源")
+    prefs = await _session_prefs(session)
+    if not prefs.get("enabled"):
+        return 0
+    ids = {int(fact["id"]) for fact in facts}
+    model = models[source_kind]
+    sources = {row.id: row for row in (await session.execute(
+        select(model).where(model.id.in_(ids))
+    )).scalars().all()}
+    existing = set((await session.execute(select(NotificationCandidate.event_id).where(
+        NotificationCandidate.source_kind == source_kind, NotificationCandidate.event_id.in_(ids),
+    ))).scalars().all())
+    recipient = await _saved_recipient(session, "")
+    now, payloads = datetime.now(), []
+    for fact in facts:
+        identity, event_type = int(fact["id"]), fact["eventType"]
+        if identity in existing or not policy_mod.type_enabled(prefs, event_type):
+            continue
+        source = sources.get(identity)
+        if source is None:
+            raise ValueError("提醒依据不存在")
+        if source_kind == "alert_event":
+            expected = (int(source.appid), source.region, (source.details_json or {}).get("eventType"))
+            occurred = source.triggered_at
+        elif source_kind == "fact_notice":
+            expected = (int((source.data or {}).get("appid") or 0), None,
+                        NOTICE_TYPES.get((source.source, source.kind)))
+            occurred = source.occurred_at
+        else:
+            expected = (int(source.appid), source.region_code, source.event_type)
+            occurred = source.occurred_at
+        if expected != (int(fact.get("appid") or 0), fact.get("region"), event_type):
+            raise ValueError("提醒依据与来源不一致")
+        frequency = prefs["types"][event_type]["frequency"]
+        payloads.append(dict(
+            source_kind=source_kind, event_id=identity, cycle_id=int(fact.get("cycleId") or 0),
+            appid=expected[0], region_code=expected[1], event_type=event_type,
+            category=policy_mod.category_of(event_type), recipient=recipient,
+            status="suppressed" if policy_mod.in_quiet_window(now, prefs) else "pending",
+            payload_json=deepcopy(fact.get("payload") or {}),
+            due_at=policy_mod.delivery_due(occurred or now, frequency, prefs),
+            attempts=0, created_at=now, updated_at=now,
+        ))
+        existing.add(identity)
+    if not payloads:
+        return 0
+    result = await session.execute(sqlite_insert(NotificationCandidate.__table__)
+        .on_conflict_do_nothing(index_elements=["source_kind", "event_id", "recipient"]), payloads)
+    return int(result.rowcount or 0)
+
+
+async def pause_rule_candidates(session, rule_id: int) -> int:
+    result = await session.execute(update(NotificationCandidate).where(
+        NotificationCandidate.source_kind == "alert_event",
+        func.json_extract(NotificationCandidate.payload_json, "$.ruleId") == rule_id,
+        NotificationCandidate.status.in_((*UNDELIVERED, FAILED)),
+    ).values(status="suppressed", reason="rule_paused", updated_at=datetime.now()))
+    return int(result.rowcount or 0)
+
+async def record_fact_notices(source: str, kind: str, notices: list[dict]) -> list[str]:
+    """登记内容事实并在同事务建立候选；fact_key 幂等，重复发现不落第二行。
+
+    notices 每条 {factKey, data}，data 须带 appid（0 = 非单一游戏事实）与
+    展示字段（title 等）；返回本次新增并已进入候选的 factKey 列表。
+    """
+    event_type = NOTICE_TYPES.get((source, kind))
+    if event_type is None:
+        raise ValueError("未登记的通知事实来源")
+    if not notices:
+        return []
+    async with write_session(WritePriority.BACKGROUND, "fact_notice_record") as owned:
+        now = datetime.now()
+        rows = []
+        for offset in range(0, len(notices), 500):
+            values = [dict(source=source, kind=kind, fact_key=str(item["factKey"]),
+                           data=item.get("data") or {}, occurred_at=now)
+                      for item in notices[offset:offset + 500]]
+            statement = sqlite_insert(FactNotice.__table__).values(values).on_conflict_do_nothing(
+                index_elements=["fact_key"]).returning(*FactNotice.__table__.c)
+            rows.extend((await owned.execute(statement)).mappings().all())
+        if not rows:
+            return []
+        facts = [dict(id=int(row["id"]), appid=int((row["data"] or {}).get("appid") or 0),
+                      region=None, eventType=event_type, payload=row["data"] or {})
+                 for row in rows]
+        await enqueue_facts("fact_notice", facts, session=owned)
+        await owned.commit()
+    return [str(row["fact_key"]) for row in rows]
 
 async def _watched_appids() -> set[int]:
     """关注范围 = 监控池（与爬取同一口径）。目录层只是价格库维护，不通知。"""
@@ -233,10 +351,14 @@ def _deliverable_statement():
     )).order_by(NotificationCandidate.id)
 
 
-def _eligible(rows):
-    return [row for row in rows if row.status in UNDELIVERED
-            or (row.status == FAILED and int(row.attempts or 0) < MAX_ATTEMPTS
-                and retryable(row.last_error))]
+def _eligible(rows, *, prefs: dict | None = None, now: datetime | None = None):
+    now = now or datetime.now()
+    return [row for row in rows if row.reason != "rule_paused"
+            and (row.due_at is None or row.due_at <= now)
+            and (prefs is None or policy_mod.type_enabled(prefs, row.event_type))
+            and (row.status in UNDELIVERED
+                 or (row.status == FAILED and int(row.attempts or 0) < MAX_ATTEMPTS
+                     and retryable(row.last_error)))]
 
 
 async def _saved_recipient(session, fallback: str) -> str:
@@ -263,16 +385,17 @@ async def retarget_candidates(session, recipient: str) -> int:
             NotificationCandidate.event_id.in_(ids[offset:offset + 500])
         ).order_by(NotificationCandidate.id))).scalars().all()
         for row in candidates:
-            target = targets.get(row.event_id)
+            key = (row.source_kind, row.event_id)
+            target = targets.get(key)
             protected = row.status not in (*UNDELIVERED, FAILED)
             if target is None or (protected and target.status in (*UNDELIVERED, FAILED)) \
                     or (target.status in (*UNDELIVERED, FAILED) and row.recipient == recipient):
-                targets[row.event_id] = row
+                targets[key] = row
     now = datetime.now()
     moved = 0
     merged_ids = []
     for row in rows:
-        target = targets[row.event_id]
+        target = targets[(row.source_kind, row.event_id)]
         if target is row and row.recipient == recipient:
             continue
         history = [*(row.delivery_history_json or []), {
@@ -312,12 +435,31 @@ async def _retarget(recipient: str) -> int:
 
 def _matching_fact():
     fact = events_service.PriceEvent
-    return select(fact.id).where(
+    price = select(fact.id).where(
         fact.id == NotificationCandidate.event_id, fact.cycle_id == NotificationCandidate.cycle_id,
         fact.appid == NotificationCandidate.appid, fact.event_type == NotificationCandidate.event_type,
         fact.region_code.is_not_distinct_from(NotificationCandidate.region_code),
         fact.created_at <= NotificationCandidate.created_at,
     ).exists()
+    rule = select(AlertEvent.id).where(
+        AlertEvent.id == NotificationCandidate.event_id,
+        AlertEvent.appid == NotificationCandidate.appid,
+        AlertEvent.region == NotificationCandidate.region_code,
+        AlertEvent.triggered_at <= NotificationCandidate.created_at,
+        func.json_extract(AlertEvent.details_json, "$.eventType") == NotificationCandidate.event_type,
+    ).exists()
+    notice = select(FactNotice.id).where(
+        FactNotice.id == NotificationCandidate.event_id,
+        FactNotice.occurred_at <= NotificationCandidate.created_at,
+        func.coalesce(func.json_extract(FactNotice.data, "$.appid"), 0) == NotificationCandidate.appid,
+        NotificationCandidate.region_code.is_(None),
+        or_(*(and_(FactNotice.source == source, FactNotice.kind == kind,
+                   NotificationCandidate.event_type == event_type)
+              for (source, kind), event_type in NOTICE_TYPES.items())),
+    ).exists()
+    return or_(and_(NotificationCandidate.source_kind == "price_event", price),
+               and_(NotificationCandidate.source_kind == "alert_event", rule),
+               and_(NotificationCandidate.source_kind == "fact_notice", notice))
 
 
 async def _quarantine_invalid() -> int:
@@ -383,6 +525,7 @@ async def _claim(candidates: list[NotificationCandidate] | None = None,
     now = datetime.now()
     claimed: list[NotificationCandidate] = []
     async with write_session(WritePriority.BACKGROUND) as session:
+        prefs = await _session_prefs(session)
         if recipient is not None:
             recipient = await _saved_recipient(session, recipient)
             if not recipient:
@@ -390,8 +533,8 @@ async def _claim(candidates: list[NotificationCandidate] | None = None,
             await retarget_candidates(session, recipient)
             candidates = _eligible((await session.execute(_deliverable_statement().where(
                 NotificationCandidate.recipient == recipient
-            ))).scalars().all())
-        candidates = candidates or []
+            ))).scalars().all(), prefs=prefs, now=now)
+        candidates = _eligible(candidates or [], prefs=prefs, now=now)
         for offset in range(0, len(candidates), 100):
             batch = candidates[offset:offset + 100]
             predicates = [and_(NotificationCandidate.id == c.id,
@@ -486,11 +629,40 @@ async def _region_names(codes: set[str]) -> dict[str, str]:
     return {r["code"].upper(): r["name"] for r in rows if r.get("code")}
 
 
+def _rule_detail(payload: dict, region_names: dict[str, str], game_name: str | None) -> str:
+    """规则命中行：候选 payload 冻结的观测身份直接上信，不回查来源表。"""
+    parts = [event_label(str(payload.get("eventType") or "RULE_PRICE"))]
+    region = str(payload.get("region") or "").upper()
+    if region:
+        parts.append(region_names.get(region, region))
+    amount, currency = payload.get("price"), payload.get("currency")
+    if amount is not None and currency:
+        parts.append(format_minor_units(amount, str(currency)))
+    if game_name:
+        parts.append(game_name)
+    return " · ".join(str(part) for part in parts)
+
+
+def _notice_detail(payload: dict, game_name: str | None) -> str:
+    """内容变化行：标题与类别标签来自事实快照，缺什么就跳过不编。"""
+    parts: list[str] = []
+    title = payload.get("title")
+    if title:
+        parts.append(str(title))
+    for label in payload.get("labels") or []:
+        text = str(label)
+        if text not in parts:
+            parts.append(text)
+    if game_name and game_name not in parts:
+        parts.append(game_name)
+    return " · ".join(parts)
+
+
 async def _digest_rows(candidates: list[NotificationCandidate]) -> tuple[list[str], int]:
     """候选 → 明细行 + 涉及游戏数（明细超出 MAX_DETAIL_ROWS 的不逐条列）。"""
     detail_candidates = candidates[:MAX_DETAIL_ROWS]
-    appids = {c.appid for c in detail_candidates}
-    event_ids = [c.event_id for c in detail_candidates]
+    appids = {c.appid for c in detail_candidates if c.appid}
+    price_event_ids = [c.event_id for c in detail_candidates if c.source_kind == "price_event"]
     async with get_session_factory()() as session:
         names = {
             int(appid): name
@@ -505,32 +677,38 @@ async def _digest_rows(candidates: list[NotificationCandidate]) -> tuple[list[st
             for row in (
                 await session.execute(
                     select(events_service.PriceEvent).where(
-                        events_service.PriceEvent.id.in_(event_ids)
+                        events_service.PriceEvent.id.in_(price_event_ids)
                     )
                 )
             ).scalars().all()
-        }
+        } if price_event_ids else {}
 
     region_codes = {
         (c.region_code or "").upper() for c in candidates if c.region_code
     }
     region_names = await _region_names(region_codes)
 
-    details = [
-        describe_event(
-            event_type=candidate.event_type,
-            region_code=candidate.region_code,
-            previous=events[candidate.event_id].previous_json
-            if candidate.event_id in events
-            else None,
-            current=events[candidate.event_id].current_json
-            if candidate.event_id in events
-            else None,
-            region_names=region_names,
-            game_name=names.get(candidate.appid),
-        )
-        for candidate in candidates[:MAX_DETAIL_ROWS]
-    ]
+    details = []
+    for candidate in detail_candidates:
+        payload = candidate.payload_json or {}
+        game_name = payload.get("gameName") or names.get(candidate.appid)
+        if candidate.source_kind == "alert_event":
+            details.append(_rule_detail(payload, region_names, game_name))
+        elif candidate.source_kind == "fact_notice":
+            details.append(_notice_detail(payload, game_name))
+        else:
+            details.append(describe_event(
+                event_type=candidate.event_type,
+                region_code=candidate.region_code,
+                previous=events[candidate.event_id].previous_json
+                if candidate.event_id in events
+                else None,
+                current=events[candidate.event_id].current_json
+                if candidate.event_id in events
+                else None,
+                region_names=region_names,
+                game_name=game_name,
+            ))
     return details, len({c.appid for c in candidates})
 
 

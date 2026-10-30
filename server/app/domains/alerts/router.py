@@ -15,11 +15,12 @@ router = APIRouter(prefix="/alerts", tags=["alerts"])
 
 class AlertAdd(BaseModel):
     appid: int
-    region: str = "CN"
+    region: str
     targetType: str = "price"  # price | pct | historic_low
     targetValue: float | None = None
     repeatMode: str = "once"  # once | cooldown | always
     repeatHours: int = 24
+    config: dict | None = None
 
 
 class AlertUpdate(BaseModel):
@@ -29,6 +30,7 @@ class AlertUpdate(BaseModel):
     region: str | None = None
     repeatMode: str | None = None
     repeatHours: int | None = None
+    config: dict | None = None
 
 
 class SmtpUpdate(BaseModel):
@@ -53,6 +55,7 @@ async def add_alert(req: AlertAdd):
         return await service.add_alert(
             req.appid, req.region, req.targetType, req.targetValue,
             repeat_mode=req.repeatMode, repeat_hours=req.repeatHours,
+            config=req.config,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -63,9 +66,28 @@ async def events(limit: int = 50):
     return await service.list_events(limit)
 
 
+@router.post("/preview")
+async def preview_rule(payload: dict):
+    try:
+        return await service.preview_rule(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/featured/preview")
+async def preview_featured(payload: dict):
+    try:
+        return await service.preview_featured(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.delete("/events/{event_id}")
 async def delete_event(event_id: int):
-    removed = await service.delete_event(event_id)
+    try:
+        removed = await service.delete_event(event_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not removed:
         raise HTTPException(status_code=404, detail="触发记录不存在")
     return {"removed": True}
@@ -73,7 +95,7 @@ async def delete_event(event_id: int):
 
 @router.delete("/events")
 async def clear_events():
-    return {"removed": await service.clear_events()}
+    return await service.clear_events()
 
 
 @router.get("/smtp")
@@ -131,6 +153,7 @@ async def update_alert(alert_id: int, req: AlertUpdate):
             region=req.region,
             repeat_mode=req.repeatMode,
             repeat_hours=req.repeatHours,
+            config=req.config,
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))

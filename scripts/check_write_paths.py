@@ -153,6 +153,10 @@ ALLOW: dict[tuple[str, str], tuple[dict[str, int], str]] = {
         {"flush": 1}, "flush-only，事务边界在调用方闸内（record_start）"),
     ("domains/proxypool/exitstats.py", "record_run_exits"): (
         {"commit": 1}, "提交由调用方 write_run_exits 的 write_gate 覆盖"),
+    ("core/database.py", "_migrate_notification_sources"): (
+        {"execute": 2}, "迁移事务内重建候选三列身份唯一索引"),
+    ("domains/alerts/service.py", "_append_matches"): (
+        {"flush": 1}, "flush-only，规则命中与候选共享调用方写事务（闸在调用方）"),
 }
 
 SQL_WRITE_RE = re.compile(

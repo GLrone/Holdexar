@@ -42,18 +42,25 @@ async def _seed(db, *, baseline_price: int, current_price: int, status: str = "o
             GamePriceHistory(
                 appid=APP, region_code="CN", currency="CNY",
                 price=baseline_price, original_price=baseline_price,
-                discount_percent=0, sub_id=0, is_gold=False,
+                discount_percent=0, sub_id=1, is_gold=False,
                 version_suffix=None, price_status="ok",
                 cny_fen=baseline_price, snapshot_at=window_start - timedelta(minutes=5),
                 is_bundle=False,
             )
         )
+        observed_at = window_end - timedelta(minutes=1)
+        session.add(GamePriceHistory(
+            appid=APP, region_code="CN", currency="CNY", price=current_price,
+            original_price=baseline_price, sub_id=1, source="steam",
+            snapshot_at=observed_at, price_status="ok",
+        ))
         session.add(
             GameCurrentPrice(
-                appid=APP, region_code="CN", price=current_price,
+                appid=APP, region_code="CN", price=current_price, currency="CNY",
                 original_price=baseline_price, discount_percent=0,
-                sub_id=0, price_status=status, cny_fen=current_price,
-                updated_at=window_end - timedelta(minutes=1),
+                sub_id=1, price_status=status, cny_fen=current_price,
+                updated_at=observed_at, last_success_at=observed_at,
+                attempt_outcome="success", steam_answer="ok",
             )
         )
         await session.commit()
@@ -99,7 +106,7 @@ async def test_status_transition_emits_restored(db):
             GamePriceHistory(
                 appid=APP, region_code="CN", currency="CNY",
                 price=10000, original_price=10000, discount_percent=0,
-                sub_id=0, is_gold=False, version_suffix=None,
+                sub_id=1, is_gold=False, version_suffix=None,
                 price_status="ok", cny_fen=10000,
                 snapshot_at=window_start - timedelta(minutes=5), is_bundle=False,
             )
@@ -116,10 +123,12 @@ async def test_status_transition_emits_restored(db):
         )
         session.add(
             GameCurrentPrice(
-                appid=APP, region_code="CN", price=10000,
-                original_price=10000, discount_percent=0, sub_id=0,
+                appid=APP, region_code="CN", price=10000, currency="CNY",
+                original_price=10000, discount_percent=0, sub_id=1,
                 price_status="ok", cny_fen=10000,
                 updated_at=window_end - timedelta(minutes=1),
+                last_success_at=window_end - timedelta(minutes=1),
+                attempt_outcome="success", steam_answer="ok",
             )
         )
         await session.commit()

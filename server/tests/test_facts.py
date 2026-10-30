@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.core import database as database_module
 from app.domains.metadata import service as metadata_service
 from app.domains.notifications import facts as facts_service
+from app.domains.notifications import service as notifications_service
 from app.domains.notifications.models import FactNotice  # noqa: F401
 
 
@@ -159,3 +160,63 @@ async def test_publish_rotation_omits_cover_appid_for_multiple_games(db):
     rows = await _all_rows(db)
     assert len(rows) == 1
     assert "appid" not in rows[0].data
+
+
+@pytest.mark.asyncio
+async def test_new_content_fact_enqueues_actual_identity_and_frozen_source_once(db, monkeypatch):
+    calls = []
+    async def capture(source_kind, facts, *, session):
+        fact = facts[0]
+        stored = await session.get(FactNotice, fact["id"])
+        assert stored is not None
+        assert stored.fact_key == "epic-free-captured"
+        calls.append((source_kind, facts))
+    monkeypatch.setattr(notifications_service, "enqueue_facts", capture, raising=False)
+    data = {"appid": 7, "count": 1, "items": [{"name": "Example", "url": "https://store.epicgames.com/p/example",
+            "end": "2026-11-01T15:00:00Z"}]}
+    assert await facts_service.record_fact("epic_free", "free_rotation", "epic-free-captured", data)
+    assert not await facts_service.record_fact("epic_free", "free_rotation", "epic-free-captured", data)
+    assert len(calls) == 1
+    kind, facts = calls[0]
+    stored = (await _all_rows(db))[0]
+    assert kind == "fact_notice"
+    fact = facts[0]
+    assert fact["id"] == stored.id
+    assert fact["appid"] == 7 and fact["region"] is None
+    assert fact["eventType"] == "EPIC_FREE" and fact["category"] == "content"
+    assert fact["payload"]["items"] == data["items"]
+    assert fact["payload"]["source"] == "epic_free"
+    assert fact["payload"]["observedAt"] == stored.occurred_at.isoformat()
+    assert "price" not in fact["payload"]["items"][0]
+
+
+@pytest.mark.asyncio
+async def test_fact_and_qualification_rollback_together(db, monkeypatch):
+    async def fail(*args, **kwargs):
+        raise RuntimeError("qualification unavailable")
+    monkeypatch.setattr(notifications_service, "enqueue_facts", fail, raising=False)
+    assert not await facts_service.record_fact("hb_choice", "bundle_changed", "atomic-content", {"count": 2})
+    assert await _all_rows(db) == []
+
+
+@pytest.mark.asyncio
+async def test_unrelated_fact_source_is_not_reinterpreted_as_content_mail(db, monkeypatch):
+    calls = []
+    async def capture(*args, **kwargs):
+        calls.append(args)
+    monkeypatch.setattr(notifications_service, "enqueue_facts", capture, raising=False)
+    assert await facts_service.record_fact("achievements", "level_up", "level:2", {"level": 2})
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_epic_fact_preserves_original_names_official_link_and_period(db):
+    offer = {"appid": 7, "title": "Example", "titleCn": "示例", "url": "https://store.epicgames.com/p/example",
+             "image": "https://cdn.example.org/cover.jpg", "start": "2026-10-29", "end": "2026-11-05"}
+    await metadata_service._publish_epic_rotation(_payload({"appid": 1, "title": "Previous"}), _payload(offer))
+    fact = (await _all_rows(db))[0]
+    item = fact.data["items"][0]
+    assert item["name"] == "示例"
+    assert item["url"] == offer["url"] and item["end"] == offer["end"]
+    assert item["start"] == offer["start"]
+    assert "price" not in item

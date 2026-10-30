@@ -567,6 +567,10 @@ async def refresh_hb_choice(force: bool = False) -> dict:
             "label": label,
             "productName": parsed["productName"],
             "count": len(marked),
+            "url": _month_page_url(machine),
+            "end": parsed.get("endDate"),
+            "items": [{"appid": item["appid"], "name": item["title"],
+                       "url": _month_page_url(machine)} for item in marked],
         },
     )
     log_event(
@@ -852,6 +856,11 @@ async def _publish_epic_rotation(old_payload: dict | None, new_payload: dict) ->
                 str(offer.get("titleCn") or offer.get("title") or "").strip()
                 for offer in fresh
             ][:8],
+            "items": [{"appid": offer.get("appid"),
+                       "name": str(offer.get("titleCn") or offer.get("title") or "").strip(),
+                       "url": offer.get("url"), "image": offer.get("image"),
+                       "start": offer.get("start"), "end": offer.get("end")}
+                      for offer in fresh],
         },
     )
 

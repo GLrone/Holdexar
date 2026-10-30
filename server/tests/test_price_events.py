@@ -27,26 +27,49 @@ APP = 800001
 
 
 @pytest.mark.asyncio
-async def test_previous_evidence_only_scans_history_low_for_benchmark_region(db):
-    import json
-    import sqlite3
-    from app.core.database import get_engine
+async def test_new_low_is_detected_in_non_cn_region_and_freezes_currency(db):
+    cid = await _cycle(db, [APP], regions=("us",))
+    await _hist(db, APP, "us", price=1000, currency="USD")
+    await _hist(db, APP, "us", price=700, currency="USD", hours_ago=INSIDE)
+    await _cur(db, APP, "us", price=700, currency="USD")
+    events = await events_mod.detect(cid)
+    low = next(e for e in events if e["event_type"] == events_mod.NEW_HISTORICAL_LOW)
+    assert low["region_code"] == "US"
+    assert low["current_json"]["currency"] == "USD"
+    assert low["current_json"]["subId"] == 1
+    assert low["current_json"]["source"] == "steam"
+    assert low["current_json"]["observedAt"]
 
-    for region in ("CN", "US"):
-        await _hist(db, APP, region, price=700, hours_ago=8)
-        await _hist(db, APP, region, price=1000, hours_ago=5)
-    seen = []
-    with sqlite3.connect(get_engine().url.database) as conn:
-        conn.create_function("history_probe", 1, lambda value: seen.append(value) or value)
-        sql = str(events_mod._GPH_PREV_SQL).replace("MIN(h1.price)", "MIN(history_probe(h1.price))")
-        rows = conn.execute(sql, {
-            "want": json.dumps([{"a": APP, "r": r, "s": 1} for r in ("CN", "US")]),
-            "started": (datetime.now() - timedelta(hours=1)).isoformat(" "),
-        }).fetchall()
-    evidence = {r[1]: r for r in rows}
-    assert evidence["CN"][2:4] == (700, 1000)
-    assert evidence["US"][2:4] == (None, 1000)
-    assert seen == [700, 1000]
+
+@pytest.mark.asyncio
+async def test_community_backfill_cannot_create_current_price_events(db):
+    cid = await _cycle(db, [APP])
+    await _hist(db, APP, "cn", price=1000)
+    await _hist(db, APP, "cn", price=700, source="community", hours_ago=INSIDE)
+    await _cur(db, APP, "cn", price=700)
+    assert await events_mod.detect(cid) == []
+
+
+@pytest.mark.asyncio
+async def test_changed_currency_and_failed_retained_price_cannot_create_price_events(db):
+    cid = await _cycle(db, [APP], regions=("us",))
+    await _hist(db, APP, "us", price=1000, currency="EUR")
+    await _hist(db, APP, "us", price=700, currency="USD", hours_ago=INSIDE)
+    await _cur(db, APP, "us", price=700, currency="USD")
+    assert await events_mod.detect(cid) == []
+    async with db() as session:
+        row = await session.get(GameCurrentPrice, (APP, "US"))
+        row.attempt_outcome = "failed"
+        await session.commit()
+    assert await events_mod.detect(cid) == []
+
+
+@pytest.mark.asyncio
+async def test_later_history_does_not_establish_an_earlier_status_baseline(db):
+    cid = await _cycle(db, [APP])
+    await _hist(db, APP, "cn", price=1000, hours_ago=-1)
+    await _cur(db, APP, "cn", status="locked")
+    assert await events_mod.detect(cid) == []
 
 
 BEFORE = 5.0  # 窗口前的快照（小时前）
@@ -89,7 +112,8 @@ async def _game(db, appid, *, removed_at: datetime | None = None) -> None:
         await session.commit()
 
 
-async def _cur(db, appid, region, *, status="ok", price=None, hours_ago=INSIDE):
+async def _cur(db, appid, region, *, status="ok", price=None, hours_ago=INSIDE,
+               currency="CNY"):
     """写当前行（同单元重复调用即覆盖——当前表每个单元只有一行）。"""
     async with db() as session:
         row = await session.get(GameCurrentPrice, (appid, region.upper()))
@@ -97,20 +121,22 @@ async def _cur(db, appid, region, *, status="ok", price=None, hours_ago=INSIDE):
             await session.delete(row)
             await session.commit()
     async with db() as session:
+        observed_at = datetime.now() - timedelta(hours=hours_ago)
         session.add(GameCurrentPrice(
-            appid=appid, region_code=region.upper(), currency="CNY",
+            appid=appid, region_code=region.upper(), currency=currency,
             price=price, sub_id=1 if price is not None else None,
             price_status=status, fail_count=0, cny_fen=price,
-            updated_at=datetime.now() - timedelta(hours=hours_ago),
+            updated_at=observed_at, last_success_at=observed_at,
+            attempt_outcome="success", steam_answer="ok" if status == "ok" else status,
         ))
         await session.commit()
 
 
 async def _hist(db, appid, region, *, price, original=None, hours_ago=BEFORE,
-                sub_id=1):
+                sub_id=1, currency="CNY", source="steam"):
     async with db() as session:
         session.add(GamePriceHistory(
-            appid=appid, region_code=region.upper(), currency="CNY",
+            appid=appid, region_code=region.upper(), currency=currency, source=source,
             price=price, original_price=price if original is None else original,
             discount_percent=0, sub_id=sub_id, is_gold=False, version_suffix=None,
             is_bundle=False, price_status="ok", cny_fen=price,
@@ -149,8 +175,9 @@ async def test_price_drop(db):
 
     events = await events_mod.detect(cid)
     assert _types(events) == [events_mod.PRICE_DROP]
-    assert events[0]["previous_json"] == {"price": 19900, "cnyFen": 19900}
-    assert events[0]["current_json"] == {"price": 9900, "cnyFen": 9900}
+    assert events[0]["previous_json"]["price"] == 19900
+    assert events[0]["current_json"]["price"] == 9900
+    assert events[0]["current_json"]["currency"] == "CNY"
     assert events[0]["region_code"] == "CN"
 
 
@@ -253,8 +280,8 @@ async def test_permanent_price_change_only_on_change(db):
 
     events = await events_mod.detect(cid)
     assert _types(events) == [events_mod.PERMANENT_PRICE_CHANGE]
-    assert events[0]["previous_json"] == {"originalPrice": 19900}
-    assert events[0]["current_json"] == {"originalPrice": 29900}
+    assert events[0]["previous_json"]["originalPrice"] == 19900
+    assert events[0]["current_json"]["originalPrice"] == 29900
 
     # 下一轮原价未变 → 不重复
     cid2 = await _next_cycle(db, [APP])
