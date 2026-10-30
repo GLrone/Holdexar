@@ -13,6 +13,7 @@ import { HlButton, HlEmpty, HlSkeleton, HlStat, message } from '@/components/ui'
 const { t } = useI18n()
 
 const loading = ref(true)
+const loadFailed = ref(false)
 const exporting = ref(false)
 const stats = ref<PilotFlywheelStats | null>(null)
 
@@ -49,8 +50,11 @@ async function load() {
   loading.value = true
   try {
     stats.value = await pilotApi.flywheel()
+    loadFailed.value = false
   } catch {
+    // 读取失败与「暂无数据」是两回事：显式失败态，不冒充空数据
     stats.value = null
+    loadFailed.value = true
   } finally {
     loading.value = false
   }
@@ -95,6 +99,8 @@ defineExpose({ reload: load })
     </div>
 
     <HlSkeleton v-if="loading" :rows="2" />
+
+    <HlEmpty v-else-if="loadFailed" size="sm" :text="t('pilot.flywheel.loadFailed')" />
 
     <HlEmpty v-else-if="!hasData" size="sm" :text="t('pilot.flywheel.empty')" />
 
