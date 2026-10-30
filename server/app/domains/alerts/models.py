@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Float, Integer, String
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, Integer, JSON, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -26,6 +26,7 @@ class PriceAlert(Base):
     # | cooldown=repeat_hours 内不重复触发 | always=每次评估都触发
     repeat_mode: Mapped[str] = mapped_column(String(10), default="once")
     repeat_hours: Mapped[int] = mapped_column(Integer, default=24)
+    config_json: Mapped[dict | None] = mapped_column(JSON)
 
 
 class AlertEvent(Base):
@@ -40,3 +41,4 @@ class AlertEvent(Base):
     price_cny: Mapped[int | None] = mapped_column(BigInteger)
     triggered_at: Mapped[datetime | None] = mapped_column(DateTime)
     notified: Mapped[bool] = mapped_column(Boolean, default=False)
+    details_json: Mapped[dict | None] = mapped_column(JSON)

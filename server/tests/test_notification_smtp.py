@@ -1,4 +1,6 @@
 import asyncio
+from email import policy
+from email.parser import BytesParser
 import smtplib
 import socketserver
 import ssl
@@ -13,6 +15,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 from app.domains.alerts import notify
+from app.domains.notifications import mail as digest_mail
 from app.domains.notifications.service import retryable
 
 
@@ -123,6 +126,10 @@ async def test_actual_tls_receipt_boundary(smtp_sink, mode, success, unknown):
     else:
         assert len(smtp_sink.receipts) == 1
         assert smtp_sink.receipts[0]["recipient"] == "rcpt to:<frozen@example.invalid>"
+        message = BytesParser(policy=policy.default).parsebytes(smtp_sink.receipts[0]["body"])
+        assert message.get_content_type() == "multipart/alternative"
+        assert message.get_body(preferencelist=("plain",)).get_content().strip() == "local test"
+        assert message.get_body(preferencelist=("html",)).get_content().strip() == "<p>local test</p>"
         assert retryable(error) is (mode == "data451")
 
 
@@ -137,6 +144,24 @@ async def test_delayed_tls_response_does_not_block_other_async_work(smtp_sink):
         assert elapsed < 0.25
     finally:
         assert (await task)[0] is True
+
+
+@pytest.mark.asyncio
+async def test_actual_tls_mail_preserves_frozen_price_and_reason_with_failed_quit(smtp_sink):
+    smtp_sink.mode = "quit421"
+    html = digest_mail.digest_mail_html(
+        counts=[("价格变化", 1)],
+        details=["指定价格 · 美国 · A & B <C> · USD 12.34 · 价格低于 USD 15.00"],
+        total=1, games=1, deferred=0, when=datetime.now(),
+    )
+    assert await notify.send_mail_ex("local rendered mail", html) == (True, None)
+    message = BytesParser(policy=policy.default).parsebytes(smtp_sink.receipts[0]["body"])
+    plain = message.get_body(preferencelist=("plain",)).get_content()
+    body = message.get_body(preferencelist=("html",)).get_content()
+    assert body == html
+    for value in ("A & B <C>", "美国", "USD 12.34", "价格低于 USD 15.00"):
+        assert value in plain
+    assert "A &amp; B &lt;C&gt;" in body
 
 
 @pytest.mark.asyncio

@@ -1,10 +1,4 @@
-"""内容链事实通知：变更判定产生的用户可感知事实 → 岛/渠道的单一事实源。
-
-判定只发生在数据链路里（metadata 域 HB 记账点 / Epic 快照替换点），本模块
-只负责落行与增量读取——消费端（灵动岛轮询、后续渠道）不重复判断「变没变」。
-与候选层（service.py）的关系：候选是价格事件的**通知资格**，这里的事实
-**本身就是变化**，不需要策略判断，也没有静默期与重试。
-"""
+"""内容变化事实与其通知资格同事务保存，增量读取供用户界面消费。"""
 from __future__ import annotations
 
 import logging
@@ -21,17 +15,16 @@ logger = logging.getLogger(__name__)
 
 # 单次增量读取上限（轮询节拍 60s 下绰绰有余；防异常积压拖垮响应）
 FACTS_LIMIT = 50
+_CONTENT_TYPES = {("hb_choice", "bundle_changed"): "HB_CHOICE",
+                  ("epic_free", "free_rotation"): "EPIC_FREE"}
 
 
 async def record_fact(
     source: str, kind: str, fact_key: str, data: dict | None = None
 ) -> bool:
-    """落一条事实（幂等：fact_key 已存在即跳过）。返回是否新落。
-
-    任何失败都不上抛：事实记录是数据链路的下游副作用，落不进只少一条
-    岛上消息，不能拖垮调用它的抓取/记账主流程。
-    """
+    """新事实与通知资格原子落库；重复键跳过，失败回滚并返回False。"""
     try:
+        now = datetime.now()
         async with write_session(WritePriority.BACKGROUND) as session:
             stmt = (
                 sqlite_insert(FactNotice)
@@ -40,17 +33,34 @@ async def record_fact(
                     kind=kind,
                     fact_key=fact_key,
                     data=data,
-                    occurred_at=datetime.now(),
+                    occurred_at=now,
                 )
                 .on_conflict_do_nothing(index_elements=["fact_key"])
+                .returning(FactNotice.id)
             )
-            cursor = await session.execute(stmt)
+            fact_id = (await session.execute(stmt)).scalar_one_or_none()
+            event_type = _CONTENT_TYPES.get((source, kind))
+            if fact_id is not None and event_type:
+                from . import policy, service
+
+                content = data or {}
+                payload = {**content, "eventType": event_type, "source": source, "kind": kind,
+                           "title": content.get("title") or content.get("productName")
+                           or content.get("label") or policy.TYPE_LABELS[event_type],
+                           "items": content.get("items") or [],
+                           "labels": content.get("labels") or [policy.TYPE_LABELS[event_type]],
+                           "observedAt": now.isoformat()}
+                await service.enqueue_facts("fact_notice", [{
+                    "id": fact_id, "cycleId": 0, "appid": int(content.get("appid") or 0),
+                    "region": None, "eventType": event_type, "category": policy.category_of(event_type),
+                    "payload": payload, "occurredAt": now,
+                }], session=session)
             await session.commit()
-        return bool(cursor.rowcount)
+        return fact_id is not None
     except Exception:  # noqa: BLE001 —— 事实落库失败不影响数据链路
         log_event(
             logger,
-            "一条事实通知落库失败，灵动岛将少收到一条变化",
+            "一条变化及其通知资格未能保存",
             level=logging.ERROR,
             exc_info=True,
             detail={"来源": source, "类型": kind, "事实键": fact_key},

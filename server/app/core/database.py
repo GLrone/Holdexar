@@ -114,6 +114,7 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
     },
     # 告警触发后行为（once=触发即收敛 / cooldown=冷却 / always=持续提醒）
     "price_alerts": {
+        "config_json": "JSON",
         "repeat_mode": "VARCHAR(10) NOT NULL DEFAULT 'once'",
         "repeat_hours": "INTEGER NOT NULL DEFAULT 24",
     },
@@ -246,10 +247,14 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
     # 触发事件的人民币分快照（触发时刻 cny_fen 同源落库，历史行回看免再折算）
     "alert_events": {
         "price_cny": "BIGINT",
+        "details_json": "JSON",
     },
     # 投递账本：已尝试次数（首次投递记 1）与最近一次失败原因原文
     # （retryable 判定的输入）；已有行从 0 起算、无失败记录
     "notification_candidates": {
+        "source_kind": "VARCHAR(16) NOT NULL DEFAULT 'price_event'",
+        "payload_json": "JSON",
+        "due_at": "DATETIME",
         "attempts": "INTEGER DEFAULT 0",
         "last_error": "TEXT",
         "delivery_history_json": "JSON",
@@ -393,7 +398,7 @@ def _ensure_schema(sync_conn) -> None:
 #   2. _MIGRATIONS 追加 (版本号, 描述, SQL 列表)；SQL 须幂等（中断续跑 +
 #      用户库版本乱序防御），复杂逻辑可登记 async fn(engine) 同位元素
 
-SCHEMA_VERSION = 33
+SCHEMA_VERSION = 34
 
 
 # 零小数货币（Steam 以整数计价）：旧捆绑包链路的除数表按 1 处理，与「统一存分」
@@ -1687,6 +1692,16 @@ async def _migrate_bill_account_identity(conn) -> None:
     await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_bill_imports_steam_id ON bill_imports(steam_id)"))
 
 
+async def _migrate_notification_sources(conn) -> None:
+    from sqlalchemy import text
+
+    await conn.execute(text("DROP INDEX IF EXISTS ux_notification_candidate"))
+    await conn.execute(text(
+        "CREATE UNIQUE INDEX ux_notification_candidate "
+        "ON notification_candidates(source_kind,event_id,recipient)"
+    ))
+
+
 _MIGRATIONS: list[tuple[int, str, object]] = [    (2, "bundle_region_prices 零小数货币单位归一（元→分 + cny_fen 去虚高）",
      _migrate_bundle_price_units),
     (3, "bundles.item_kind 形态列（0=bundle/1=sub）初始回填（沿用 mps 旧值，"
@@ -1791,6 +1806,7 @@ _MIGRATIONS: list[tuple[int, str, object]] = [    (2, "bundle_region_prices 零�
     (31, "节点身份承载体检冷却，退役独立冷却表", _migrate_node_cooldown),
     (32, "周期覆盖比率直接读取冻结计数", _migrate_cycle_coverage_projection),
     (33, "账单按 Steam 账号隔离，保留历史未归属账单", _migrate_bill_account_identity),
+    (34, "通知候选区分价格、规则与内容事实", _migrate_notification_sources),
 ]
 
 

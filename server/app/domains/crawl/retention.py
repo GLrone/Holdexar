@@ -66,7 +66,8 @@ async def prune_price_cycles(
         "DELETE FROM price_events WHERE id IN ("
         "SELECT id FROM price_events"
         " WHERE occurred_at IS NOT NULL AND occurred_at < :cutoff"
-        " AND NOT EXISTS (SELECT 1 FROM notification_candidates n WHERE n.event_id=price_events.id)"
+        " AND NOT EXISTS (SELECT 1 FROM notification_candidates n"
+        " WHERE n.source_kind='price_event' AND n.event_id=price_events.id)"
         " AND NOT EXISTS (SELECT 1 FROM price_cycles c WHERE c.id=price_events.cycle_id"
         " AND json_extract(c.notification_scan_json, '$.state') IN ('pending','scanning'))"
         " ORDER BY id LIMIT :chunk)",

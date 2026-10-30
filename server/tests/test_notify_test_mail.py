@@ -84,10 +84,14 @@ async def test_subject_and_themed_body(fake_smtp, stored_password):
     _from, _to, msg = fake_smtp.last_instance.sent
     parsed = email.message_from_string(msg, policy=email.policy.default)
     assert "欢迎使用 Holdexar" in parsed["Subject"]
-    body = parsed.get_content()
+    assert parsed.get_content_type() == "multipart/alternative"
+    body = parsed.get_body(preferencelist=("html",)).get_content()
+    plain = parsed.get_body(preferencelist=("plain",)).get_content()
     # 主题化正文关键要素
     for needle in ("连接成功", "#66c0f4", "#1b2838", "SMTP 服务器", "smtp.qq.com:465", "SSL/TLS"):
         assert needle in body, f"正文缺少 {needle}"
+    for needle in ("连接成功", "SMTP 服务器", "smtp.qq.com:465", "SSL/TLS"):
+        assert needle in plain
 
 
 @pytest.mark.asyncio

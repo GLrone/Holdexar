@@ -10,7 +10,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from copy import deepcopy
+from datetime import datetime, timedelta
 
 from app.domains.crawl.events import (
     FREE_PROMO,
@@ -30,13 +31,17 @@ from app.domains.crawl.events import (
 PREFS_KEY = "notifications.prefs"
 
 # 用户类别：内部多个事件类型映射到同一类别，用户不必认识内部枚举
-CATEGORIES = ("price", "low", "availability", "lifecycle")
+CATEGORIES = ("price", "low", "availability", "lifecycle", "rules", "featured", "content", "system")
 
 CATEGORY_LABELS = {
     "price": "价格变化",
     "low": "历史低价",
     "availability": "可购买状态",
     "lifecycle": "免费与下架",
+    "rules": "我的提醒",
+    "featured": "价格精选",
+    "content": "免费游戏与月包",
+    "system": "运行提醒",
 }
 
 CATEGORY_EVENT_TYPES: dict[str, tuple[str, ...]] = {
@@ -44,6 +49,21 @@ CATEGORY_EVENT_TYPES: dict[str, tuple[str, ...]] = {
     "low": (NEW_HISTORICAL_LOW, HISTORICAL_LOW_MATCH),
     "availability": (PRICE_RESTORED, PRICE_UNAVAILABLE, REGION_LOCKED, REGION_UNLOCKED),
     "lifecycle": (FREE_PROMO, REMOVED),
+    "rules": ("RULE_PRICE", "RULE_PCT", "RULE_LOW"),
+    "featured": ("FEATURED", "BUNDLE_DEAL"),
+    "content": ("EPIC_FREE", "HB_CHOICE"),
+    "system": ("PROXY_ALERT", "SYSTEM_ALERT"),
+}
+
+TYPE_LABELS = {
+    PRICE_DROP: "价格下降", PRICE_INCREASE: "价格上涨", PERMANENT_PRICE_CHANGE: "原价调整",
+    NEW_HISTORICAL_LOW: "本地历史新低", HISTORICAL_LOW_MATCH: "追平本地历史低价",
+    PRICE_RESTORED: "恢复购买", PRICE_UNAVAILABLE: "暂不售", REGION_LOCKED: "进入锁区",
+    REGION_UNLOCKED: "解除锁区", FREE_PROMO: "限时免费", REMOVED: "游戏下架",
+    "RULE_PRICE": "指定价格", "RULE_PCT": "指定折扣", "RULE_LOW": "低价规则",
+    "FEATURED": "精选与监控池折扣", "BUNDLE_DEAL": "捆绑包精选",
+    "EPIC_FREE": "Epic 免费游戏", "HB_CHOICE": "Humble Choice",
+    "PROXY_ALERT": "连接通道提醒", "SYSTEM_ALERT": "系统运行提醒",
 }
 
 # 候选状态
@@ -69,6 +89,11 @@ DEFAULT_PREFS: dict = {
     "quietStart": "23:00",
     "quietEnd": "08:00",
     "includeDetails": True,
+    "manualRegion": None,
+    "digestTime": "08:00",
+    "digestWeekday": 0,
+    "types": {key: {"enabled": True, "frequency": "immediate"} for key in TYPE_LABELS},
+    "featured": {},
 }
 
 
@@ -91,16 +116,18 @@ def category_of(event_type: str) -> str | None:
 
 
 def _merge_prefs(raw: dict | None) -> dict:
-    """缺省补齐：旧版本键缺失 / 用户只改了一部分时，其余走默认值。"""
-    prefs = {
-        **DEFAULT_PREFS,
-        **(raw or {}),
-        "categories": {
-            **DEFAULT_PREFS["categories"],
-            **((raw or {}).get("categories") or {}),
-        },
+    from app.domains.alerts.rules import DEFAULT_FEATURED
+
+    defaults = dict(DEFAULT_PREFS, featured=DEFAULT_FEATURED)
+    return _merge_dict(defaults, raw or {})
+
+
+def _merge_dict(base: dict, patch: dict) -> dict:
+    return {
+        key: _merge_dict(value, patch.get(key, {}))
+        if isinstance(value, dict) else deepcopy(patch.get(key, value))
+        for key, value in base.items()
     }
-    return prefs
 
 
 async def load_prefs() -> dict:
@@ -111,18 +138,56 @@ async def load_prefs() -> dict:
 
 
 async def save_prefs(raw: dict) -> dict:
-    """写用户偏好（只接受已知键；类别只认已知类别）。"""
-    from app.domains.settings.service import set_value
+    from app.core.database import WritePriority, write_session
+    from app.domains.alerts.rules import validate_featured
+    from app.domains.settings.models import AppSetting
+    from app.crawler.config import CC_LIST
 
-    prefs = _merge_prefs(raw)
-    prefs["categories"] = {
-        c: bool(prefs["categories"].get(c, True)) for c in CATEGORIES
-    }
-    prefs["enabled"] = bool(prefs["enabled"])
-    prefs["quietEnabled"] = bool(prefs["quietEnabled"])
-    prefs["includeDetails"] = bool(prefs["includeDetails"])
-    await set_value(PREFS_KEY, prefs)
+    async with write_session(WritePriority.INTERACTIVE, "notification_prefs") as session:
+        row = await session.get(AppSetting, PREFS_KEY)
+        prefs = _merge_dict(_merge_prefs(row.value_json if row else None), raw)
+        for key in ("quietStart", "quietEnd", "digestTime"):
+            parsed = _parse_hhmm(prefs[key])
+            if parsed is None or not (0 <= parsed[0] < 24 and 0 <= parsed[1] < 60):
+                raise ValueError("通知时间须为有效的小时和分钟")
+        if type(prefs["digestWeekday"]) is not int or not 0 <= prefs["digestWeekday"] < 7:
+            raise ValueError("每周发送日须为0至6")
+        for config in prefs["types"].values():
+            if config["frequency"] not in ("immediate", "daily", "weekly", "off"):
+                raise ValueError("不支持的通知频率")
+        region = prefs["manualRegion"]
+        if region is not None:
+            region = str(region).strip().upper()
+            if region not in {code.upper() for code, _, _ in CC_LIST}:
+                raise ValueError("请选择已支持的通知地区")
+            prefs["manualRegion"] = region
+        prefs["featured"] = validate_featured(prefs["featured"])
+        if row is None:
+            session.add(AppSetting(key=PREFS_KEY, value_json=prefs, updated_at=datetime.now()))
+        else:
+            row.value_json, row.updated_at = prefs, datetime.now()
+        await session.commit()
     return prefs
+
+
+def type_enabled(prefs: dict, event_type: str) -> bool:
+    category = category_of(event_type)
+    config = prefs.get("types", {}).get(event_type, {})
+    return bool(prefs.get("enabled") and category
+                and prefs.get("categories", {}).get(category, True)
+                and config.get("enabled", True) and config.get("frequency", "immediate") != "off")
+
+
+def delivery_due(now: datetime, frequency: str, prefs: dict) -> datetime:
+    if frequency == "immediate":
+        return now
+    hour, minute = _parse_hhmm(prefs.get("digestTime", "08:00"))
+    due = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if frequency == "weekly":
+        due += timedelta(days=(int(prefs.get("digestWeekday", 0)) - now.weekday()) % 7)
+    if due <= now:
+        due += timedelta(days=7 if frequency == "weekly" else 1)
+    return due
 
 
 def _parse_hhmm(value) -> tuple[int, int] | None:
@@ -178,6 +243,8 @@ def decide(
         return Decision(False, reason="unknown_type")
     if not prefs["categories"].get(category, True):
         return Decision(False, reason="category_off")
+    if not type_enabled(prefs, event_type):
+        return Decision(False, reason="type_off")
     if in_quiet_window(now, prefs):
         return Decision(True, status=SUPPRESSED, category=category)
     return Decision(True, status=PENDING, category=category)

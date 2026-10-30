@@ -55,7 +55,9 @@ class NotificationCandidate(Base):
     __tablename__ = "notification_candidates"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    # price_events.id：事实身份的锚
+    source_kind: Mapped[str] = mapped_column(
+        String(16), default="price_event", server_default="price_event",
+    )
     event_id: Mapped[int] = mapped_column(Integer)
     cycle_id: Mapped[int] = mapped_column(Integer)
     appid: Mapped[int] = mapped_column(Integer)
@@ -76,10 +78,12 @@ class NotificationCandidate(Base):
     updated_at: Mapped[datetime | None] = mapped_column(DateTime)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime)
     delivery_history_json: Mapped[list | None] = mapped_column(JSON)
+    payload_json: Mapped[dict | None] = mapped_column(JSON)
+    due_at: Mapped[datetime | None] = mapped_column(DateTime)
 
     __table_args__ = (
         Index(
-            "ux_notification_candidate", "event_id", "recipient", unique=True
+            "ux_notification_candidate", "source_kind", "event_id", "recipient", unique=True
         ),
         Index("ix_notification_status", "status"),
         Index("ix_notification_cycle", "cycle_id"),

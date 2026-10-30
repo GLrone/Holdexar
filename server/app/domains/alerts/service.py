@@ -6,7 +6,8 @@ import time
 from datetime import datetime
 
 import httpx
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.app_info import APP_NAME
 from app.core.database import WritePriority, get_session_factory, write_session
@@ -19,8 +20,8 @@ from app.domains.games.models import (
     BundleRegionPrice,
     Game,
     GameCurrentPrice,
-    GamePriceHistory,
 )
+from app.domains.monitoring.models import MonitorExclusion, MonitorSource
 from app.domains.games.pricing import (
     REGION_TO_CURRENCY,
     build_steam_header_url,
@@ -32,6 +33,7 @@ from app.domains.settings import service as settings_service
 from app.domains.wishlist.models import WishlistItem
 from .models import AlertEvent, PriceAlert
 from . import notify
+from . import rules
 
 logger = logging.getLogger(__name__)
 
@@ -65,14 +67,13 @@ async def _owner_region_code() -> str:
 
 
 def _alert_dict(a: PriceAlert) -> dict:
-    # targetValue 口径：price 类 = 人民币分（与 cny_fen 同口径）；
-    # pct 类 = 百分数
     return {
         "id": a.id,
         "appid": int(a.appid),
         "region": a.region,
         "targetType": a.target_type,
         "targetValue": a.target_value,
+        "config": a.config_json,
         "active": a.active,
         "repeatMode": a.repeat_mode,
         "repeatHours": a.repeat_hours,
@@ -115,28 +116,36 @@ async def add_alert(
     *,
     repeat_mode: str = "once",
     repeat_hours: int = 24,
+    config: dict | None = None,
 ) -> dict:
-    """新增规则。target_value：price 类 = 人民币分（前端按元输入 ×100），pct 类 = 百分数。"""
-    if target_type not in ("price", "pct", "historic_low"):
-        raise ValueError(f"未知提醒类型: {target_type}")
-    if target_type in ("price", "pct") and target_value is None:
-        raise ValueError("该类型需要目标值")
-    if repeat_mode not in ("once", "cooldown", "always"):
-        raise ValueError(f"未知重复策略: {repeat_mode}")
+    """保存规则后立即使用已有观测求值。"""
+    from app.domains.notifications.policy import load_prefs
+
+    data = rules.validate_rule(dict(appid=appid, region=region, targetType=target_type,
+                                    targetValue=target_value, config=config,
+                                    repeatMode=repeat_mode, repeatHours=repeat_hours))
+    prefs = await load_prefs()
+    now = _naive(get_beijing_time_obj())
     async with write_session(WritePriority.INTERACTIVE) as session:
         alert = PriceAlert(
             appid=appid,
-            region=region.upper(),
+            region=data["region"],
             target_type=target_type,
-            target_value=target_value,
+            target_value=data.get("targetValue"),
+            config_json=data["config"],
             active=True,
             repeat_mode=repeat_mode,
             repeat_hours=max(1, int(repeat_hours)),
-            created_at=_naive(get_beijing_time_obj()),
+            created_at=now,
         )
         session.add(alert)
+        await session.flush()
+        identity = alert.id
+        triggered = await _check_rules(session, [appid], prefs, now, [identity])
         await session.commit()
-        return _alert_dict(alert)
+    await _dispatch_matches(triggered)
+    async with get_session_factory()() as session:
+        return _alert_dict(await session.get(PriceAlert, identity))
 
 
 async def update_alert(
@@ -148,34 +157,37 @@ async def update_alert(
     region: str | None = None,
     repeat_mode: str | None = None,
     repeat_hours: int | None = None,
+    config: dict | None = None,
 ) -> dict:
-    """更新提醒规则（支持编辑条件类型、目标值、区服、启停、重复策略）。
+    """更新条件；停用只暂停未开始的投递资格。"""
+    from app.domains.notifications.policy import load_prefs
 
-    target_value 口径同 add_alert：price 类 = 人民币分，pct 类 = 百分数。
-    改区不改值——阈值即人民币目标位，换区后继续按同一人民币口径比较。
-    """
+    prefs = await load_prefs()
+    now = _naive(get_beijing_time_obj())
     async with write_session(WritePriority.INTERACTIVE) as session:
         alert = await session.get(PriceAlert, alert_id)
         if alert is None:
             raise ValueError("提醒不存在")
+        data = _alert_dict(alert)
+        changes = {"targetType": target_type, "targetValue": target_value, "region": region,
+                   "repeatMode": repeat_mode, "repeatHours": repeat_hours, "config": config}
+        data.update({key: value for key, value in changes.items() if value is not None})
+        data = rules.validate_rule(data)
+        alert.target_type, alert.target_value = data["targetType"], data.get("targetValue")
+        alert.region, alert.config_json = data["region"], data["config"]
+        alert.repeat_mode, alert.repeat_hours = data["repeatMode"], data["repeatHours"]
         if active is not None:
             alert.active = active
-        if target_type is not None:
-            if target_type not in ("price", "pct", "historic_low"):
-                raise ValueError(f"未知提醒类型: {target_type}")
-            alert.target_type = target_type
-        if target_value is not None:
-            alert.target_value = target_value
-        if region is not None:
-            alert.region = region.upper()
-        if repeat_mode is not None:
-            if repeat_mode not in ("once", "cooldown", "always"):
-                raise ValueError(f"未知重复策略: {repeat_mode}")
-            alert.repeat_mode = repeat_mode
-        if repeat_hours is not None:
-            alert.repeat_hours = max(1, int(repeat_hours))
+        if active is False:
+            from app.domains.notifications.service import pause_rule_candidates
+            await pause_rule_candidates(session, alert_id)
+        appid = int(alert.appid)
+        await session.flush()
+        triggered = await _check_rules(session, [appid], prefs, now, [alert_id]) if active is not False else []
         await session.commit()
-        return _alert_dict(alert)
+    await _dispatch_matches(triggered)
+    async with get_session_factory()() as session:
+        return _alert_dict(await session.get(PriceAlert, alert_id))
 
 
 async def delete_alert(alert_id: int) -> bool:
@@ -183,288 +195,299 @@ async def delete_alert(alert_id: int) -> bool:
         alert = await session.get(PriceAlert, alert_id)
         if alert is None:
             return False
+        from app.domains.notifications.service import pause_rule_candidates
+        await pause_rule_candidates(session, alert_id)
         await session.delete(alert)
         await session.commit()
         return True
 
 
-async def check_appids(appids: list[int]) -> list[dict]:
-    """爬取落库后调用：对每个 appid 的活跃规则做触发检查。
+def _event_type(kind: str) -> str:
+    return {"price": "RULE_PRICE", "pct": "RULE_PCT", "historic_low": "RULE_LOW", "new_low": "RULE_LOW"}[kind]
 
-    - price:        该区当前价折算人民币分（cny_fen）<= target_value（人民币分）
-    - pct:          该区折扣率 >= target_value
-    - historic_low: 该区当前价 <= 历史最低价（创新低）
-    触发即写 AlertEvent（本币价 + 人民币分快照）并置 last_triggered_at；
-    合并成一封邮件通知。
-    """
-    if not appids:
+
+async def _inputs(session, appids: list[int] | None, region: str,
+                  scope: list[str] | None = None) -> tuple[list[dict], dict[int, dict]]:
+    prices = select(GameCurrentPrice, Game).select_from(Game).outerjoin(GameCurrentPrice, and_(
+        Game.appid == GameCurrentPrice.appid, GameCurrentPrice.region_code == region))
+    if appids is not None:
+        prices = prices.where(Game.appid.in_(appids))
+    if scope and "catalog" not in scope:
+        source_names = {"followed": "favorite", "wishlist": "family_wishlist", "owned": "owned", "manual": "manual"}
+        from_monitoring = select(MonitorSource.target_id).where(
+            MonitorSource.target_type == "game", MonitorSource.active.is_(True),
+            MonitorSource.source.in_([source_names[value] for value in scope]))
+        member_flags = []
+        if "wishlist" in scope:
+            member_flags.append(WishlistItem.wishlisted.is_(True))
+        if "owned" in scope:
+            member_flags.append(WishlistItem.owned.is_(True))
+        filters = [Game.appid.in_(from_monitoring)]
+        if member_flags:
+            filters.append(Game.appid.in_(select(WishlistItem.appid).where(
+                WishlistItem.active.is_(True), or_(*member_flags))))
+        prices = prices.where(or_(*filters))
+    rows = (await session.execute(prices)).all()
+    currents = []
+    for price, game in rows:
+        observed = {"appid": int(game.appid), "region": region,
+                    "positiveRate": game.positive_rate, "reviewCount": game.review_count,
+                    "gameName": game.name, "headerImage": game.header_image}
+        if price is not None:
+            observed.update(currency=str(price.currency or "").upper(), subId=price.sub_id,
+                            price=price.price, originalPrice=price.original_price,
+                            discount=price.discount_percent, status=price.price_status, cnyFen=price.cny_fen,
+                            observedAt=price.updated_at.isoformat() if price.updated_at else None)
+        currents.append(observed)
+    ids = [row["appid"] for row in currents]
+    memberships = {identity: {"sources": [], "owned": False, "wishlisted": False,
+                              "ignored": False, "priority": 0} for identity in ids}
+    if not ids:
+        return currents, memberships
+    for identity, source, priority in (await session.execute(select(
+            MonitorSource.target_id, MonitorSource.source, MonitorSource.priority).where(
+                MonitorSource.target_type == "game", MonitorSource.target_id.in_(ids),
+                MonitorSource.active.is_(True)))).all():
+        item = memberships[int(identity)]
+        item["sources"].append(source)
+        item["priority"] = max(item["priority"], priority or 0)
+    for identity in (await session.execute(select(MonitorExclusion.target_id).where(
+            MonitorExclusion.target_type == "game", MonitorExclusion.target_id.in_(ids),
+            MonitorExclusion.active.is_(True)))).scalars().all():
+        memberships[int(identity)]["ignored"] = True
+    for identity, owned, wished in (await session.execute(select(
+            WishlistItem.appid, WishlistItem.owned, WishlistItem.wishlisted).where(
+                WishlistItem.appid.in_(ids), WishlistItem.active.is_(True)))).all():
+        memberships[int(identity)]["owned"] |= bool(owned)
+        memberships[int(identity)]["wishlisted"] |= bool(wished)
+    return currents, memberships
+
+
+async def _contexts(session, currents: list[dict], window: int | None) -> dict:
+    from app.domains.games.price_comparison import history_context
+
+    if not currents:
+        return {}
+    return await history_context(session, currents, before=datetime.now(), window_days=window)
+
+
+def _comparison(contexts: dict, current: dict) -> dict:
+    key = (current["appid"], str(current.get("region") or "").upper(),
+           int(current.get("subId") or 0), str(current.get("currency") or "").upper())
+    return contexts.get(key, {})
+
+
+def _observation_key(current: dict, event_type: str = "") -> str:
+    import json
+
+    keys = ("appid", "region", "subId", "currency", "observationId") if event_type == "FEATURED" else (
+        "appid", "region", "subId", "currency", "observedAt", "price")
+    return json.dumps([current.get(key) for key in keys],
+                      ensure_ascii=True, separators=(",", ":"))
+
+
+async def preview_rule(payload: dict) -> dict:
+    data = rules.validate_rule(payload)
+    async with get_session_factory()() as session:
+        currents, _ = await _inputs(session, [data["appid"]], data["region"])
+        contexts = await _contexts(session, currents, (data.get("config") or {}).get("windowDays"))
+    current = currents[0] if currents else {"appid": data["appid"], "region": data["region"]}
+    history = _comparison(contexts, current)
+    current["currentKnown"] = history.get("currentKnown", False)
+    result = rules.evaluate_rule(data, current, history)
+    return {**result, "rule": data}
+
+
+async def _append_matches(session, matches: list[tuple[int, dict, str, dict]], now: datetime) -> list[dict]:
+    if not matches:
         return []
+    from app.domains.notifications.policy import category_of
+    from app.domains.notifications.service import enqueue_facts
+    rule_ids = {identity for identity, _, _, _ in matches}
+    keys = {_observation_key(result["observed"], event_type) for _, result, event_type, _ in matches}
+    existing = set()
+    for identity, details in (await session.execute(select(AlertEvent.alert_id, AlertEvent.details_json).where(
+            AlertEvent.alert_id.in_(rule_ids),
+            func.json_extract(AlertEvent.details_json, "$.observationKey").in_(keys)))).all():
+        if details:
+            existing.add((identity, details.get("observationKey")))
+    payloads = []
+    for identity, result, event_type, metadata in matches:
+        current = result["observed"]
+        key = _observation_key(current, event_type)
+        if (identity, key) in existing:
+            continue
+        details = {**metadata, "ruleId": identity or None, "observationKey": key,
+                   "eventType": event_type, "evaluation": result,
+                   **{field: current.get(field) for field in (
+                       "price", "currency", "subId", "observedAt", "originalPrice", "discount", "gameName", "headerImage")},
+                   "labels": result["labels"]}
+        payloads.append(dict(alert_id=identity, appid=current["appid"], region=current["region"],
+                             price=current["price"], price_cny=current.get("cnyFen"),
+                             triggered_at=now, notified=False, details_json=details))
+        existing.add((identity, key))
+    events = []
+    for offset in range(0, len(payloads), 500):
+        statement = sqlite_insert(AlertEvent.__table__).values(payloads[offset:offset + 500]).returning(
+            *AlertEvent.__table__.c)
+        events.extend((await session.execute(statement)).mappings().all())
+    await session.flush()
+    facts = [dict(id=event["id"], cycleId=0, appid=int(event["appid"]), region=event["region"],
+                  eventType=event["details_json"]["eventType"],
+                  category=category_of(event["details_json"]["eventType"]),
+                  payload=event["details_json"], occurredAt=now.isoformat()) for event in events]
+    await enqueue_facts("alert_event", facts, session=session)
+    return [event["details_json"] for event in events]
 
-    triggered: list[dict] = []
-    now = _naive(get_beijing_time_obj())
 
-    async with write_session(WritePriority.BACKGROUND) as session:
-        alerts = (
-            await session.execute(
-                select(PriceAlert).where(
-                    PriceAlert.active.is_(True), PriceAlert.appid.in_(appids)
-                )
-            )
-        ).scalars().all()
+async def _check_rules(session, appids: list[int], prefs: dict, now: datetime,
+                       alert_ids: list[int] | None = None) -> list[dict]:
+    from app.domains.notifications.policy import type_enabled
 
-        for alert in alerts:
+    statement = select(PriceAlert).where(PriceAlert.active.is_(True), PriceAlert.appid.in_(appids))
+    if alert_ids is not None:
+        statement = statement.where(PriceAlert.id.in_(alert_ids))
+    alerts = (await session.execute(statement)).scalars().all()
+    eligible = [alert for alert in alerts if type_enabled(prefs, _event_type(alert.target_type))]
+    by_region = {}
+    for alert in eligible:
+        by_region.setdefault(alert.region, []).append(alert)
+    matches = []
+    matched_alerts = {}
+    for region, region_alerts in by_region.items():
+        currents, _ = await _inputs(session, [int(alert.appid) for alert in region_alerts], region)
+        current_map = {row["appid"]: row for row in currents}
+        contexts = {}
+        for window in {(alert.config_json or {}).get("windowDays") for alert in region_alerts}:
+            contexts[window] = await _contexts(session, currents, window)
+        for alert in region_alerts:
             if alert.repeat_mode == "cooldown" and alert.last_triggered_at is not None:
-                elapsed_hours = (now - alert.last_triggered_at).total_seconds() / 3600
-                if elapsed_hours < (alert.repeat_hours or 24):
+                if (now - alert.last_triggered_at).total_seconds() < (alert.repeat_hours or 24) * 3600:
                     continue
-            price_row = await session.execute(
-                select(GameCurrentPrice).where(
-                    GameCurrentPrice.appid == alert.appid,
-                    GameCurrentPrice.region_code == alert.region,
-                    GameCurrentPrice.price_status == "ok",
-                )
-            )
-            current = price_row.scalars().first()
-            if current is None or current.price is None:
-                continue
-
-            hit = False
-            if alert.target_type == "price" and alert.target_value is not None:
-                # 阈值与比较同用人民币分口径；cny_fen 缺档（汇率缺失轮）跳过不判
-                hit = current.cny_fen is not None and int(current.cny_fen) <= int(alert.target_value)
-            elif alert.target_type == "pct" and alert.target_value is not None:
-                hit = (current.discount_percent or 0) >= int(alert.target_value)
-            elif alert.target_type == "historic_low":
-                hist_min = await session.execute(
-                    select(func.min(GamePriceHistory.price)).where(
-                        GamePriceHistory.appid == alert.appid,
-                        GamePriceHistory.region_code == alert.region,
-                        GamePriceHistory.price.is_not(None),
-                        # 商品身份未知的行不参与史低判定（未知保持未知）
-                        or_(
-                            GamePriceHistory.product_unknown.is_(False),
-                            GamePriceHistory.product_unknown.is_(None),
-                        ),
-                    )
-                )
-                lowest = hist_min.scalar()
-                hit = lowest is not None and int(current.price) <= int(lowest)
-
-            if not hit:
-                continue
-
-            game = await session.get(Game, alert.appid)
-            price = int(current.price)
-            price_cny = int(current.cny_fen) if current.cny_fen else None
-            currency = REGION_TO_CURRENCY.get(alert.region, "CNY")
-            session.add(
-                AlertEvent(
-                    alert_id=alert.id,
-                    appid=alert.appid,
-                    region=alert.region,
-                    price=price,
-                    price_cny=price_cny,
-                    triggered_at=now,
-                    notified=False,
-                )
-            )
-            alert.last_triggered_at = now
-            if alert.repeat_mode == "once":
-                # 到价提醒只说一次：触发即收敛，历史留 AlertEvent
-                alert.active = False
-            triggered.append(
-                {
-                    "appid": int(alert.appid),
-                    "name": game.name if game else str(alert.appid),
-                    "region": alert.region,
-                    "region_name": await region_display_name(alert.region),
-                    "price": price,
-                    "price_cny": price_cny,
-                    # 邮件价格列：本币现价为主、人民币参照为辅（国区行不重复）
-                    "price_text": format_minor_units(price, currency),
-                    "cn_price_text": (
-                        format_cny_fen(price_cny) if price_cny and alert.region != "CN" else ""
-                    ),
-                    "discount": current.discount_percent or 0,
-                    "alertType": alert.target_type,
-                    "targetValue": alert.target_value,
-                    # 邮件卡片的辨识度来源：封面 + 该区商店直链（notify 侧拼装）
-                    "headerImage": game.header_image if game else None,
-                }
-            )
-
-        await session.commit()
-
-    if triggered:
-        sent = await notify.send_mail(
-            f"{APP_NAME} 降价提醒：{len(triggered)} 条触发",
-            notify.alert_mail_html(triggered),
-        )
-        async with write_session(WritePriority.BACKGROUND) as session:
-            await session.execute(
-                AlertEvent.__table__.update().where(
-                    AlertEvent.triggered_at == now
-                ).values(notified=sent)  # SMTP 未配置/发送失败时诚实标 False
-            )
-            await session.commit()
-
-    if triggered:
-        log_event(logger, "价格提醒已触发", detail={"条数": len(triggered)})
+            current = current_map.get(int(alert.appid), {})
+            history = _comparison(contexts[(alert.config_json or {}).get("windowDays")], current) if current else {}
+            current = dict(current, currentKnown=history.get("currentKnown", False))
+            result = rules.evaluate_rule(_alert_dict(alert), current, history)
+            if result["matched"]:
+                matches.append((alert.id, result, _event_type(alert.target_type), {"rule": _alert_dict(alert)}))
+                matched_alerts[alert.id] = alert
+    triggered = await _append_matches(session, matches, now)
+    for result in triggered:
+        alert = matched_alerts[result["ruleId"]]
+        alert.last_triggered_at = now
+        if alert.repeat_mode == "once":
+            alert.active = False
     return triggered
 
 
-# ─── 新史低邮件（hl_flag=1 落库后自动通知）─────────────────────────
+async def _dispatch_matches(triggered: list[dict]) -> None:
+    if triggered:
+        from app.domains.notifications.service import dispatch
 
-# 每封邮件最多展示的新史低条数：全量清单无浏览价值，只递样本（用户语义）
-NEW_LOW_PICKS = 2
+        await dispatch(None)
+        log_event(logger, "价格提醒已触发", detail={"条数": len(triggered)})
 
-# 历史新史低 appid 游标（app_settings KV，list[int]）。本轮差集非空才发信，
-# 游标随每轮全量刷新（不随 picks 增长，避免漏报）
-KEY_NEW_LOW_SENT = "alerts.new_low_sent"
+
+async def check_appids(appids: list[int], *, alert_ids: list[int] | None = None) -> list[dict]:
+    from app.domains.notifications.policy import load_prefs
+
+    if not appids:
+        return []
+    prefs = await load_prefs()
+    now = _naive(get_beijing_time_obj())
+    async with write_session(WritePriority.BACKGROUND) as session:
+        triggered = await _check_rules(session, appids, prefs, now, alert_ids)
+        await session.commit()
+    await _dispatch_matches(triggered)
+    return triggered
+
+
+
+def _featured_sort(result: dict, sort: str):
+    cur, membership = result["observed"], result.get("membership", {})
+    if sort == "price":
+        value = cur.get("price") or 0
+    elif sort == "savings":
+        value = -((cur.get("originalPrice") or 0) - (cur.get("price") or 0))
+    elif sort == "quality":
+        value = -(cur.get("positiveRate") or 0)
+    elif sort == "followed":
+        value = -membership.get("priority", 0)
+    elif sort == "wishlist":
+        value = -int(membership.get("wishlisted", False) or "family_wishlist" in membership.get("sources", []))
+    else:
+        value = -(cur.get("discount") or 0)
+    return value, cur["appid"]
+
+
+async def _featured_results(session, config: dict, region: str, appids: list[int] | None = None) -> list[dict]:
+    currents, membership = await _inputs(session, appids, region, config["scope"])
+    contexts = await _contexts(session, currents, config["windowDays"])
+    results = []
+    for current in currents:
+        history = _comparison(contexts, current)
+        current["currentKnown"] = history.get("currentKnown", False)
+        current["observationId"] = history.get("observationId")
+        results.append(rules.evaluate_featured(config, current, history, membership[current["appid"]]))
+    return sorted(results, key=lambda result: (not result["matched"], *_featured_sort(result, config["sort"])))
+
+
+async def preview_featured(payload: dict) -> dict:
+    from app.domains.notifications.policy import load_prefs, type_enabled
+    from app.domains.notifications.region import resolve_region
+
+    prefs = await load_prefs()
+    config = rules.validate_featured(payload.get("featured", payload.get("config", payload)))
+    selected = resolve_region(explicit=payload.get("region"), prefs=prefs)
+    if not selected["region"]:
+        return {"items": [], "matched": 0, "total": 0, "region": selected, "config": config,
+                "exclusions": [{"code": "region_unknown"}]}
+    async with get_session_factory()() as session:
+        results = await _featured_results(session, config, selected["region"], payload.get("appids"))
+    return {"items": results, "matched": sum(result["matched"] for result in results),
+            "total": len(results), "region": selected, "config": config}
+
+
+async def check_featured(appids: list[int] | None = None) -> list[dict]:
+    from app.domains.notifications.policy import load_prefs, type_enabled
+    from app.domains.notifications.region import resolve_region
+    from app.domains.notifications.service import dispatch
+
+    prefs = await load_prefs()
+    if not type_enabled(prefs, "FEATURED"):
+        return []
+    config = rules.validate_featured(prefs.get("featured"))
+    selected = resolve_region(prefs=prefs)
+    if not selected["region"]:
+        return []
+    now = _naive(get_beijing_time_obj())
+    async with write_session(WritePriority.BACKGROUND) as session:
+        results = await _featured_results(session, config, selected["region"], appids)
+        matches = [(0, result, "FEATURED", {"featured": config}) for result in results if result["matched"]]
+        triggered = await _append_matches(session, matches, now)
+        await session.commit()
+    if triggered:
+        await dispatch(None)
+    return triggered
 
 
 async def check_new_lows(appids: list[int]) -> list[dict]:
-    """新史低检查：update_price_derived 落库后调用。
-
-    语义：本轮新史低 = 刚标为 hl_flag=1 的 appids ∩ 全库新史低集 −
-    历史已通报集（游标存 app_settings）。命中非空才发信，且**不展示全部**：
-    只挑 2 款，优先挑**最低价地区 = 号主所在地区**（主账号钱包区，即用户
-    可以直接入手的地区）的，按价差从大到小排；号主区无新史低时按价差
-    降序兜底，保证「有新史低就一定通知」。
-
-    返回挑中的 picks（空列表 = 无新增，未发信）。发信失败/未配置不重发，
-    游标仍前移（与降价提醒 notified 语义一致：诚实记录，不刷屏重试）。
-    """
-    if not appids:
-        return []
-    async with get_session_factory()() as session:
-        fresh = (
-            await session.execute(
-                select(Game.appid, Game.name, Game.header_image).where(
-                    Game.appid.in_(appids), Game.hl_flag == 1
-                )
-            )
-        ).all()
-        if not fresh:
-            return []
-
-        sent_before = await settings_service.get_value(KEY_NEW_LOW_SENT, [])
-        sent_set = {int(a) for a in sent_before} if isinstance(sent_before, list) else set()
-        news = [(int(a), n, h) for a, n, h in fresh if int(a) not in sent_set]
-        if not news:
-            return []
-
-        # 号主所在地区：主账号钱包快照 region_code（小写；钱包从未同步过则未知）
-        owner_region = await _owner_region_code()
-
-        # 每款附最低价行（全区含国区，口径对齐仪表盘跑马灯）：号主区命中的
-        # 直接用号主区价，否则取全区最低
-        rows: list[tuple[int, str, str, str, int, bool]] = []  # appid, name, region_code, price_text, diff, owner_hit
-        header_map: dict[int, str | None] = {}
-        for appid, _name, _header in news:
-            header_map[appid] = _header
-            prices = (
-                await session.execute(
-                    select(GameCurrentPrice).where(
-                        GameCurrentPrice.appid == appid,
-                        GameCurrentPrice.price_status == "ok",
-                        GameCurrentPrice.cny_fen.is_not(None),
-                        GameCurrentPrice.cny_fen > 0,
-                    )
-                )
-            ).scalars().all()
-            best = min(prices, key=lambda p: int(p.cny_fen)) if prices else None
-            if best is None:
-                continue
-            owner_row = next(
-                (p for p in prices if p.region_code == owner_region.upper()), None
-            ) if owner_region else None
-            chosen = owner_row or best
-            rows.append(
-                (
-                    appid,
-                    _name,
-                    chosen.region_code,
-                    format_minor_units(chosen.price, chosen.currency or "CNY"),
-                    int(chosen.cny_fen),
-                    owner_row is not None,
-                )
-            )
-
-        # 排序：号主区命中优先，价差大优先（国区价 - 该区价，省得多 = 降幅醒目）
-        cn_price_map = (
-            await session.execute(
-                select(GameCurrentPrice.appid, GameCurrentPrice.cny_fen, GameCurrentPrice.discount_percent)
-                .where(
-                    GameCurrentPrice.region_code == "CN",
-                    GameCurrentPrice.price_status == "ok",
-                    GameCurrentPrice.appid.in_([r[0] for r in rows]),
-                )
-            )
-        ).all()
-        cn_map = {int(a): (int(f) if f else 0, d or 0) for a, f, d in cn_price_map}
-        rows.sort(
-            key=lambda r: (not r[5], -(cn_map.get(r[0], (0, 0))[0] - r[4]))
-        )
-
-        picks = [
-            {
-                "appid": appid,
-                "name": name,
-                "region_code": region,
-                "region_name": await region_display_name(region),
-                "price_text": price_text,
-                "cn_price_text": format_cny_fen(cn_map.get(appid, (None, 0))[0]),
-                "discount": cn_map.get(appid, (0, 0))[1],
-                "header_image": header_map.get(appid),
-            }
-            for appid, name, region, price_text, _diff, _hit in rows[:NEW_LOW_PICKS]
-        ]
-        new_sent = sorted(sent_set | {r[0] for r in rows})
-
-    # 先写游标再发信（同一轮并发检查不会双发；发信失败游标已前移 = 不重试）
-    await settings_service.set_value(KEY_NEW_LOW_SENT, new_sent)
-
-    if picks:
-        sent = await notify.send_mail(
-            f"{APP_NAME} 新史低：{len(picks)} 款精选",
-            notify.new_low_mail_html(picks),
-        )
-        log_event(
-            logger,
-            "新史低精选邮件已发送"
-            if sent
-            else "新史低精选邮件发送失败（未配置 SMTP 或发送异常，本轮不重试）",
-            tag="成功" if sent else "未完成",
-            detail={"精选": len(picks), "新增": len(news), "号主地区": owner_region or "未知"},
-        )
-    return picks
+    return await check_featured(appids) if appids else []
 
 
-# ─── 监控范围扩展邮件：折扣速报 / 捆绑包 / Epic / HB / 通道告警 ──────
+# ─── 监控范围扩展通知：折扣速报 / 捆绑包 / Epic / HB / 通道告警 ──────
 #
-# 统一语义（与降价提醒、新史低一致）：
-# - 「先记账再发信」——游标与时间闸在 send_mail 之前写；SMTP 未配置或发送
-#   失败不重试、不刷屏，下一轮按新数据继续（诚实记录）；
-# - 每条监控面各自持有游标，互不干扰；
-# - 频次闸挡在噪音前面：折扣类 20h 上限（价格网格 6h 一轮 → 每天最多一封），
-#   告警类按 kind 冷却（SYS_ALERT_COOLDOWN_HOURS）。
+# 统一语义：新事实写 FactNotice 进候选管线（与降价提醒同一投递生命周期），
+# fact_key 幂等防重复发现；SMTP 未配置不消耗资格，下轮按新事实继续。
+# 发现闸挡噪音：折扣类 20h 上限，告警类按 kind 冷却（SYS_ALERT_COOLDOWN_HOURS）。
 
 DEAL_MIN_DISCOUNT = 50          # 折扣深度门槛（%）
-DEAL_PICKS = 6                  # 监控池速报单封最多展示条数
-BUNDLE_DEAL_PICKS = 4           # 捆绑包精选单封最多展示条数
-EPIC_FREE_PICKS = 4             # Epic 喜加一单封最多展示条数
 DEAL_MIN_INTERVAL_HOURS = 20.0  # 同类速报最小间隔
 BUNDLE_MIN_CNY_FEN = 500        # 捆绑包价格下限（¥5，滤掉拆分/占位包）
 PROXY_ALERT_RATIO = 0.2         # 可用通道占比低于此值即告警
 
-KEY_WISHLIST_DEAL_SENT = "alerts.wishlist_deal_sent"   # {appid: 已通报折扣}
-KEY_WISHLIST_DEAL_AT = "alerts.wishlist_deal_at"       # epoch 秒
-KEY_BUNDLE_DEAL_SENT = "alerts.bundle_deal_sent"       # {bundle_id: 已通报折扣}
-KEY_BUNDLE_DEAL_AT = "alerts.bundle_deal_at"           # epoch 秒
-KEY_EPIC_FREE_SENT = "alerts.epic_free_sent"           # [当期条目键]
-KEY_HB_CHOICE_SENT = "alerts.hb_choice_sent"           # 已通报的当月包标签
-KEY_SYS_ALERT_AT = "alerts.sys_alert_at"               # {kind: epoch 秒}
+KEY_BUNDLE_DEAL_AT = "alerts.bundle_deal_at"           # epoch 秒（发现闸）
+KEY_SYS_ALERT_AT = "alerts.sys_alert_at"               # {kind: epoch 秒（冷却）}
 
 SYS_ALERT_COOLDOWN_HOURS: dict[str, float] = {
     "backup": 24.0,   # 备份失败
@@ -480,24 +503,6 @@ def _hours_since_ts(ts) -> float:
         return (time.time() - float(ts)) / 3600
     except (TypeError, ValueError):
         return 1e9
-
-
-def _bundle_cover(header_image: str | None, bundle_id: int, item_kind: int) -> str:
-    """包封面第一优先：库内 header_image；Sub 形态再补一条可用的 CDN 路径。
-
-    **bundle 形态的裸 CDN 路径不能当兜底**：`/steam/bundles/{id}/header.jpg`
-    恒 404（真实资产名带哈希，只有 browse 的 asset_url_format 才拿得到），
-    所以这里不做猜测——缺失时由调用方回落到包内第一款游戏的封面
-    （见 check_bundle_deals），那是稳定可加载且辨识度更高的图。
-    """
-    if header_image:
-        return header_image
-    if int(item_kind or -1) == 1:
-        return (
-            "https://shared.akamai.steamstatic.com/store_item_assets/steam/"
-            f"subs/{int(bundle_id)}/header_ratio.jpg"
-        )
-    return ""
 
 
 def _bundle_url(url: str | None, bundle_id: int, item_kind: int, region: str) -> str:
@@ -519,122 +524,14 @@ def _pick_region_row(prices: list[dict], owner_region: str) -> dict:
 
 
 async def check_wishlist_deals() -> list[dict]:
-    """监控池折扣速报：池内（愿望单 / 星标）出现新折扣即通报。
-
-    监控范围＝wishlist_items 账户事实行里的主动关注条目；榜单发现入池
-    （board 来源）是发现面、已拥有的条目是推荐无用面，两者都不参与。
-    命中非空才发信，且只挑折扣最深的 DEAL_PICKS 款。
-
-    去重是双重闸：同类速报 20h 上限（价格网格 6h 一轮 → 每天最多一封）＋
-    逐款折扣游标（同一款只有折扣进一步加深才再次上榜）。游标随本轮候选
-    收敛，折扣消失的条目会被剪掉——下次重新打折仍能通报。
-    """
-    if _hours_since_ts(await settings_service.get_value(KEY_WISHLIST_DEAL_AT, 0)) < DEAL_MIN_INTERVAL_HOURS:
-        return []
-    async with get_session_factory()() as session:
-        rows = (
-            await session.execute(
-                select(
-                    WishlistItem.appid,
-                    Game.name,
-                    Game.header_image,
-                    GameCurrentPrice.region_code,
-                    GameCurrentPrice.currency,
-                    GameCurrentPrice.price,
-                    GameCurrentPrice.cny_fen,
-                    GameCurrentPrice.discount_percent,
-                )
-                .join(Game, Game.appid == WishlistItem.appid)
-                .join(GameCurrentPrice, GameCurrentPrice.appid == WishlistItem.appid)
-                .where(
-                    WishlistItem.active.is_(True),
-                    WishlistItem.owned.is_(False),
-                    # 愿望单成员 / 星标关注（账户事实行）；项目自加条目不落
-                    # 此表，折扣速报的候选面随账户事实走
-                    or_(
-                        WishlistItem.wishlisted.is_(True),
-                        WishlistItem.manual.is_(True),
-                    ),
-                    GameCurrentPrice.price_status == "ok",
-                    GameCurrentPrice.discount_percent >= DEAL_MIN_DISCOUNT,
-                    GameCurrentPrice.cny_fen.is_not(None),
-                    GameCurrentPrice.cny_fen > 0,
-                )
-            )
-        ).all()
-
-        sent_before = await settings_service.get_value(KEY_WISHLIST_DEAL_SENT, {})
-        sent = (
-            {int(k): int(v) for k, v in sent_before.items()}
-            if isinstance(sent_before, dict)
-            else {}
-        )
-        owner_region = await _owner_region_code()
-
-        grouped: dict[int, dict] = {}
-        for appid, name, header, region, currency, price, cny, discount in rows:
-            entry = grouped.setdefault(
-                int(appid), {"name": name, "header": header, "prices": []}
-            )
-            entry["prices"].append({
-                "region": (region or "").upper(),
-                "currency": currency or "CNY",
-                "price": int(price) if price is not None else None,
-                "cny": int(cny) if cny is not None else 0,
-                "discount": int(discount or 0),
-            })
-
-        picks: list[dict] = []
-        for appid, entry in grouped.items():
-            best_discount = max(p["discount"] for p in entry["prices"])
-            if best_discount <= sent.get(appid, 0):
-                continue  # 折扣没有进一步加深：已通报过
-            chosen = _pick_region_row(entry["prices"], owner_region)
-            cn_row = next((p for p in entry["prices"] if p["region"] == "CN"), None)
-            picks.append({
-                "appid": appid,
-                "name": entry["name"],
-                "header_image": entry["header"],
-                "region_code": chosen["region"],
-                "region_name": await region_display_name(chosen["region"]),
-                "price_text": format_minor_units(chosen["price"], chosen["currency"]),
-                "cn_price_text": format_cny_fen(cn_row["cny"]) if cn_row else "—",
-                "discount": chosen["discount"],
-                # 游标用「池内最深折扣」而非展示区折扣：展示区可能是号主区，
-                # 用展示折扣记账会让同一条每 20h 反复上榜
-                "max_discount": best_discount,
-            })
-        picks.sort(key=lambda p: (-p["max_discount"], p["appid"]))
-        picks = picks[:DEAL_PICKS]
-        new_sent = {str(a): sent[a] for a in grouped if a in sent}
-        for p in picks:
-            new_sent[str(p["appid"])] = p["max_discount"]
-
-    if not picks:
-        return []
-    # 先记账再发信（发信失败不重试、不刷屏）
-    await settings_service.set_value(KEY_WISHLIST_DEAL_SENT, new_sent)
-    await settings_service.set_value(KEY_WISHLIST_DEAL_AT, time.time())
-    sent_ok = await notify.send_mail(
-        f"{APP_NAME} 监控池折扣速报：{len(picks)} 款新折扣",
-        notify.wishlist_deal_mail_html(picks),
-    )
-    log_event(
-        logger,
-        "监控池折扣速报邮件已发送"
-        if sent_ok
-        else "监控池折扣速报邮件发送失败（未配置 SMTP 或发送异常，本轮不重试）",
-        tag="成功" if sent_ok else "未完成",
-        detail={"精选": len(picks), "池内折扣条目": len(grouped)},
-    )
-    return picks
+    return await check_featured()
 
 
 async def check_bundle_deals() -> list[dict]:
-    """捆绑包精选：全量刷包链尾调用，挑国区最低 / 高折扣的包通报。
+    """捆绑包精选：全量刷包链尾调用，新折扣按「包 + 深度」事实落账通报。
 
-    与监控池速报同款双重闸（20h 上限 + 逐包折扣游标）。低价垃圾包
-    （<BUNDLE_MIN_CNY_FEN）与无 CNY 快照的包直接排除。
+    20h 发现闸防折扣横跳噪音；同一包同深度 fact_key 幂等，仅更深折扣产生
+    新事实进候选。低价垃圾包（<BUNDLE_MIN_CNY_FEN）与无 CNY 快照的包直接排除。
     """
     if _hours_since_ts(await settings_service.get_value(KEY_BUNDLE_DEAL_AT, 0)) < DEAL_MIN_INTERVAL_HOURS:
         return []
@@ -644,7 +541,6 @@ async def check_bundle_deals() -> list[dict]:
                 select(
                     Bundle.bundle_id,
                     Bundle.name,
-                    Bundle.header_image,
                     Bundle.item_kind,
                     Bundle.url,
                     BundleRegionPrice.region_code,
@@ -664,19 +560,12 @@ async def check_bundle_deals() -> list[dict]:
             )
         ).all()
 
-        sent_before = await settings_service.get_value(KEY_BUNDLE_DEAL_SENT, {})
-        sent = (
-            {int(k): int(v) for k, v in sent_before.items()}
-            if isinstance(sent_before, dict)
-            else {}
-        )
         owner_region = await _owner_region_code()
 
         grouped: dict[int, dict] = {}
-        for bid, name, header, kind, url, region, currency, price, cny, discount, app_ids in rows:
+        for bid, name, kind, url, region, currency, price, cny, discount, app_ids in rows:
             entry = grouped.setdefault(int(bid), {
-                "name": name, "header": header, "kind": int(kind or -1),
-                "url": url, "prices": [],
+                "name": name, "kind": int(kind or -1), "url": url, "prices": [],
             })
             entry["prices"].append({
                 "region": (region or "").upper(),
@@ -685,78 +574,50 @@ async def check_bundle_deals() -> list[dict]:
                 "cny": int(cny) if cny is not None else 0,
                 "discount": int(discount or 0),
                 "count": len(app_ids or []),
-                # 封面兜底的取样点：包内第一款游戏（bundle 资产路径带哈希，
-                # 拼不出可用的包封面，游戏封面才是稳定可加载的那张）
-                "first_appid": int(app_ids[0]) if app_ids else None,
             })
 
         picks: list[dict] = []
         for bid, entry in grouped.items():
             best_discount = max(p["discount"] for p in entry["prices"])
-            if best_discount <= sent.get(bid, 0):
-                continue
             chosen = _pick_region_row(entry["prices"], owner_region)
             cn_row = next((p for p in entry["prices"] if p["region"] == "CN"), None)
             picks.append({
                 "bundle_id": bid,
                 "name": entry["name"],
-                "header_image": _bundle_cover(entry["header"], bid, entry["kind"]),
                 "url": _bundle_url(entry["url"], bid, entry["kind"], chosen["region"]),
                 "region_code": chosen["region"],
                 "region_name": await region_display_name(chosen["region"]),
                 "price_text": format_minor_units(chosen["price"], chosen["currency"]),
                 "cn_price_text": format_cny_fen(cn_row["cny"]) if cn_row else "—",
-                "discount": chosen["discount"],
                 "max_discount": best_discount,
-                "first_appid": chosen["first_appid"],
-                "condition": f"包内 {chosen['count']} 项 · 深度 {best_discount}%" if chosen["count"] else "",
+                "condition": f"包内 {chosen['count']} 项" if chosen["count"] else "",
             })
         picks.sort(key=lambda p: (-p["max_discount"], p["bundle_id"]))
-        picks = picks[:BUNDLE_DEAL_PICKS]
-
-        # 封面兜底只对入选的 ≤BUNDLE_DEAL_PICKS 个包做一次查询（不随候选集
-        # 膨胀），包内首款游戏封面优先，查不到再拼 Steam header（真实 appid
-        # 恒有图）
-        need = sorted({p["first_appid"] for p in picks
-                       if not p["header_image"] and p["first_appid"]})
-        cover_map: dict[int, str] = {}
-        if need:
-            for appid, header in (
-                await session.execute(
-                    select(Game.appid, Game.header_image).where(Game.appid.in_(need))
-                )
-            ).all():
-                cover_map[int(appid)] = header or build_steam_header_url(int(appid))
-        for p in picks:
-            if not p["header_image"]:
-                appid = p.pop("first_appid", None)
-                p["header_image"] = cover_map.get(appid) or (
-                    build_steam_header_url(appid) if appid else ""
-                )
-            else:
-                p.pop("first_appid", None)
-
-        new_sent = {str(b): sent[b] for b in grouped if b in sent}
-        for p in picks:
-            new_sent[str(p["bundle_id"])] = p["max_discount"]
 
     if not picks:
         return []
-    await settings_service.set_value(KEY_BUNDLE_DEAL_SENT, new_sent)
     await settings_service.set_value(KEY_BUNDLE_DEAL_AT, time.time())
-    sent_ok = await notify.send_mail(
-        f"{APP_NAME} 捆绑包精选：{len(picks)} 个新折扣",
-        notify.bundle_deal_mail_html(picks),
-    )
+    from app.domains.notifications.service import dispatch, record_fact_notices
+
+    created = set(await record_fact_notices("bundles", "discount_pick", [
+        {"factKey": f"bundle:{p['bundle_id']}:{p['max_discount']}",
+         "data": {"appid": 0, "title": f"{p['name']} -{p['max_discount']}%",
+                  "labels": ["捆绑包精选"], "bundleId": p["bundle_id"],
+                  "priceText": p["price_text"], "cnPriceText": p["cn_price_text"],
+                  "regionCode": p["region_code"], "regionName": p["region_name"],
+                  "url": p["url"], "condition": p["condition"]}}
+        for p in picks
+    ]))
+    fresh = [p for p in picks if f"bundle:{p['bundle_id']}:{p['max_discount']}" in created]
+    if fresh:
+        await dispatch(None)
     log_event(
         logger,
-        "捆绑包精选邮件已发送"
-        if sent_ok
-        else "捆绑包精选邮件发送失败（未配置 SMTP 或发送异常，本轮不重试）",
-        tag="成功" if sent_ok else "未完成",
-        detail={"精选": len(picks), "池内折扣包": len(grouped)},
+        "捆绑包精选新折扣已落账" if fresh else "捆绑包精选无新折扣",
+        tag="成功" if fresh else "跳过",
+        detail={"合格包": len(grouped), "新增": len(fresh)},
     )
-    return picks
+    return fresh
 
 
 def _epic_key(offer: dict) -> str:
@@ -767,79 +628,46 @@ def _epic_key(offer: dict) -> str:
     return "title:" + str(offer.get("title") or "").strip().lower()
 
 
-def _epic_item(offer: dict, *, upcoming: bool) -> dict:
-    """Epic 条目 → 邮件卡片字段（封面走 Epic keyImage，缺失回落 Steam header）。"""
-    appid = offer.get("appid")
-    end, start = offer.get("end"), offer.get("start")
-    worth = offer.get("priceOriginal")
-    if upcoming:
-        condition = f"{start} 起免费" if start else "即将免费"
-    else:
-        condition = f"免费领取至 {end}" if end else "限时免费"
-    if worth:
-        condition += f" · 原价 {worth}"
-    return {
-        "appid": int(appid) if appid else None,
-        "name": offer.get("titleCn") or offer.get("title") or "",
-        "header_image": offer.get("image") or "",
-        "url": offer.get("url") or "",
-        "price_text": "即将免费" if upcoming else "免费",
-        "cn_price_text": "",
-        "discount": 0,
-        "condition": condition,
-    }
-
-
 async def check_epic_free() -> list[dict]:
-    """Epic 喜加一：当期免费窗口出现新条目即通报（预告段只作展示不记账）。
+    """Epic 喜加一：当期免费条目逐条落账（fact_key 幂等），预告段不记账。
 
-    取数走展示链（`metadata.epic_free_offers`，含封面/商店页/原价），与
-    标记链 `refresh_epic_free` 分离——邮件要的是展示字段，标记链只落
-    is_epic/epic_date。记账只含当期条目：预告条目转正后才会自己发一封。
+    取数走展示链（`metadata.epic_free_offers`），与标记链 `refresh_epic_free`
+    分离——落账要的是标题与商店页，标记链只落 is_epic/epic_date。同一当期
+    条目重跑不重复通报；预告条目转正后才会自己产生新事实。
     """
     from app.domains.metadata import service as metadata_service
+    from app.domains.notifications.service import dispatch, record_fact_notices
 
     payload = await metadata_service.epic_free_offers()
     if not payload.get("ok"):
-        log_event(logger, "Epic 喜加一邮件跳过，展示链本轮无数据", tag="跳过")
+        log_event(logger, "Epic 喜加一跳过，展示链本轮无数据", tag="跳过")
         return []
     offers = [o for o in (payload.get("offers") or []) if o.get("title")]
     current = [o for o in offers if not o.get("upcoming")]
-    upcoming = [o for o in offers if o.get("upcoming")]
     if not current:
         return []
 
-    sent_before = await settings_service.get_value(KEY_EPIC_FREE_SENT, [])
-    sent = {str(x) for x in sent_before} if isinstance(sent_before, list) else set()
-    fresh = [o for o in current if _epic_key(o) not in sent]
-    if not fresh:
+    created = await record_fact_notices("epic_free", "free_rotation", [
+        {"factKey": f"epic:{_epic_key(o)}",
+         "data": {"appid": 0, "title": o.get("titleCn") or o["title"],
+                  "labels": ["Epic 免费游戏"], "url": str(o.get("url") or "")}}
+        for o in current
+    ])
+    if not created:
+        log_event(logger, "Epic 喜加一无新条目", tag="跳过", detail={"当期": len(current)})
         return []
-
-    picks = [_epic_item(o, upcoming=False) for o in fresh[:EPIC_FREE_PICKS]]
-    preview = [_epic_item(o, upcoming=True) for o in upcoming[:EPIC_FREE_PICKS]]
-    await settings_service.set_value(
-        KEY_EPIC_FREE_SENT, sorted(sent | {_epic_key(o) for o in current})
-    )
-    sent_ok = await notify.send_mail(
-        f"{APP_NAME} Epic 喜加一：{len(picks)} 款限免",
-        notify.epic_free_mail_html(picks, preview),
-    )
-    log_event(
-        logger,
-        "Epic 喜加一邮件已发送"
-        if sent_ok
-        else "Epic 喜加一邮件发送失败（未配置 SMTP 或发送异常，本轮不重试）",
-        tag="成功" if sent_ok else "未完成",
-        detail={"当期新": len(picks), "窗口": len(current), "预告": len(upcoming)},
-    )
-    return picks
+    await dispatch(None)
+    log_event(logger, "Epic 喜加一新条目已落账", tag="成功",
+              detail={"新增": len(created), "当期": len(current)})
+    fresh_keys = set(created)
+    return [o for o in current if f"epic:{_epic_key(o)}" in fresh_keys]
 
 
 async def check_hb_choice(result: dict) -> list[dict]:
     """Humble Choice 当月包：`refresh_hb_choice` 结案后调用（每天幂等）。
 
-    只在「新月包 + 已记账」时发一封；标签游标保证同一个月不重复。
-    marked 里的 appid 都已在 games 侧落行（占位行也算），补封面/中文名。
+    同月包 fact_key 幂等，新月包落账进候选；marked 里的 appid 都已在
+    games 侧落行（占位行也算），中文名随事实记录。
     """
     if not result or not result.get("recorded"):
         return []
@@ -848,47 +676,31 @@ async def check_hb_choice(result: dict) -> list[dict]:
     appids = [int(m["appid"]) for m in marked if m.get("appid")]
     if not label or not appids:
         return []
-    if await settings_service.get_value(KEY_HB_CHOICE_SENT, "") == label:
-        return []
 
-    names = {int(m["appid"]): m.get("title") or "" for m in marked if m.get("appid")}
-    headers: dict[int, str | None] = {}
+    titles = {int(m["appid"]): m.get("title") or "" for m in marked if m.get("appid")}
     async with get_session_factory()() as session:
-        for appid, name, header in (
+        for appid, name in (
             await session.execute(
-                select(Game.appid, Game.name, Game.header_image).where(Game.appid.in_(appids))
+                select(Game.appid, Game.name).where(Game.appid.in_(appids))
             )
         ).all():
-            headers[int(appid)] = header
-            names[int(appid)] = name or names.get(int(appid), "")
+            titles[int(appid)] = name or titles.get(int(appid), "")
+    game_titles = [titles.get(int(m["appid"])) or str(m["appid"]) for m in marked if m.get("appid")]
 
-    games = [
-        {
-            "appid": appid,
-            "name": names.get(appid) or str(appid),
-            "header_image": headers.get(appid),
-            "condition": "Steam 可兑换",
-        }
-        for appid in appids
-    ]
-    await settings_service.set_value(KEY_HB_CHOICE_SENT, label)
-    sent_ok = await notify.send_mail(
-        f"{APP_NAME} Humble Choice 当月包：{label}",
-        notify.hb_choice_mail_html(
-            month_label=label,
-            product_name=result.get("productName") or "",
-            games=games,
-        ),
-    )
-    log_event(
-        logger,
-        "Humble Choice 邮件已发送"
-        if sent_ok
-        else "Humble Choice 邮件发送失败（未配置 SMTP 或发送异常，本轮不重试）",
-        tag="成功" if sent_ok else "未完成",
-        detail={"月包": label, "款数": len(games)},
-    )
-    return games
+    from app.domains.notifications.service import dispatch, record_fact_notices
+
+    created = await record_fact_notices("hb_choice", "bundle_changed", [
+        {"factKey": f"hb_choice:{label}",
+         "data": {"appid": 0, "title": f"Humble Choice {label}：{len(game_titles)} 款可兑换",
+                  "labels": ["Humble Choice"], "games": game_titles}}
+    ])
+    if not created:
+        log_event(logger, "Humble Choice 当月包已记账", tag="跳过", detail={"月包": label})
+        return []
+    await dispatch(None)
+    log_event(logger, "Humble Choice 当月包已落账", tag="成功",
+              detail={"月包": label, "款数": len(game_titles)})
+    return game_titles
 
 
 async def _subscription_digest(proxies_service) -> list[dict]:
@@ -957,17 +769,22 @@ async def check_proxy_health() -> bool:
         "subscriptions": await _subscription_digest(proxies_service),
     }
     await _mark_alert("proxy")
-    sent_ok = await notify.send_mail(
-        f"{APP_NAME} 代理通道告警：{reason}",
-        notify.proxy_health_mail_html(snapshot),
-    )
+    from app.domains.notifications.service import dispatch, record_fact_notices
+
+    created = await record_fact_notices("alerts", "proxy_health", [
+        {"factKey": f"proxy_alert:{time.time_ns()}",
+         "data": {"appid": 0, "title": f"代理通道告警：{reason}",
+                  "labels": ["连接通道提醒"], **snapshot}}
+    ])
+    if created:
+        await dispatch(None)
     log_event(
         logger,
-        "代理通道告警邮件已发送" if sent_ok else "代理通道告警邮件发送失败（未配置 SMTP）",
-        tag="成功" if sent_ok else "未完成",
+        "代理通道告警已落账" if created else "代理通道告警落账失败",
+        tag="成功" if created else "未完成",
         detail={"原因": reason},
     )
-    return sent_ok
+    return bool(created)
 
 
 async def _alert_cooldown_ok(kind: str) -> bool:
@@ -996,42 +813,58 @@ async def send_system_alert(
     level: str = "warning",
     hint: str = "",
 ) -> bool:
-    """系统异常告警（备份失败 / 价格网格连续失败…）：按 kind 冷却后发一封。"""
+    """系统异常告警（备份失败 / 价格网格连续失败…）：按 kind 冷却后落账通报。"""
     if not await _alert_cooldown_ok(kind):
         return False
     await _mark_alert(kind)
-    sent_ok = await notify.send_mail(
-        f"{APP_NAME} 系统告警：{title}",
-        notify.system_alert_mail_html(
-            title=title, summary=summary, rows=rows or [], level=level, hint=hint
-        ),
-    )
+    from app.domains.notifications.service import dispatch, record_fact_notices
+
+    created = await record_fact_notices("alerts", "system_alert", [
+        {"factKey": f"system_alert:{kind}:{time.time_ns()}",
+         "data": {"appid": 0, "title": title, "labels": ["系统运行提醒"],
+                  "summary": summary, "rows": [list(row) for row in (rows or [])],
+                  "level": level, "hint": hint}}
+    ])
+    if created:
+        await dispatch(None)
     log_event(
         logger,
-        "系统告警邮件已发送" if sent_ok else "系统告警邮件发送失败（未配置 SMTP）",
-        tag="成功" if sent_ok else "未完成",
+        "系统告警已落账" if created else "系统告警落账失败",
+        tag="成功" if created else "未完成",
         detail={"标题": title},
     )
-    return sent_ok
+    return bool(created)
 
 
 async def delete_event(event_id: int) -> bool:
     """删除单条触发历史。"""
+    from app.domains.notifications.models import NotificationCandidate
+
     async with write_session(WritePriority.INTERACTIVE) as session:
         event = await session.get(AlertEvent, event_id)
         if event is None:
             return False
+        referenced = (await session.execute(select(NotificationCandidate.id).where(
+            NotificationCandidate.source_kind == "alert_event", NotificationCandidate.event_id == event_id,
+        ).limit(1))).scalar_one_or_none()
+        if referenced is not None:
+            raise ValueError("该记录是通知结果的依据，需要保留")
         await session.delete(event)
         await session.commit()
         return True
 
 
-async def clear_events() -> int:
-    """清空全部触发历史，返回删除条数。"""
+async def clear_events() -> dict:
+    """只清理没有通知引用的触发记录。"""
+    from app.domains.notifications.models import NotificationCandidate
+
     async with write_session(WritePriority.INTERACTIVE) as session:
-        result = await session.execute(AlertEvent.__table__.delete())
+        references = select(NotificationCandidate.event_id).where(NotificationCandidate.source_kind == "alert_event")
+        protected = (await session.execute(select(func.count()).select_from(AlertEvent).where(
+            AlertEvent.id.in_(references)))).scalar_one()
+        result = await session.execute(AlertEvent.__table__.delete().where(AlertEvent.id.not_in(references)))
         await session.commit()
-        return int(result.rowcount or 0)
+        return {"removed": int(result.rowcount or 0), "protected": protected}
 
 
 async def list_events(limit: int = 50) -> list[dict]:
@@ -1073,6 +906,7 @@ async def list_events(limit: int = 50) -> list[dict]:
             ),
             "triggeredAt": e.triggered_at.isoformat() if e.triggered_at else None,
             "notified": e.notified,
+            "details": e.details_json,
         }
         for e in rows
     ]
