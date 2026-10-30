@@ -1371,8 +1371,14 @@ function onCopyReply(e: MouseEvent) {
   void onCopyText(body?.innerText ?? '')
 }
 
-/** 会话记录点击委托：处理内嵌 SVG 图卡的预览/源码切换与复制操作 */
+/** 会话记录点击委托：处理内嵌 SVG 图卡的预览/源码切换、复制操作与代码块复制 */
 function onTurnsClick(e: MouseEvent) {
+  const codeCopy = (e.target as HTMLElement).closest<HTMLElement>('.pilot-code-copy')
+  if (codeCopy) {
+    const text = codeCopy.closest<HTMLElement>('.pilot-code')?.querySelector('code')?.textContent ?? ''
+    if (text) void onCopyText(text)
+    return
+  }
   const target = (e.target as HTMLElement).closest<HTMLElement>('.pilot-svg-tab, .pilot-svg-copy, .pilot-svg-quote')
   if (!target) return
   const card = target.closest<HTMLElement>('.pilot-svg')

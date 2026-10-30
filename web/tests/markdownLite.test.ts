@@ -60,15 +60,19 @@ test('HTML 全转义：script 与标签原样显示', () => {
   )
 })
 
-test('围栏代码块：内容原样转义、不解析行内标记', () => {
-  assert.equal(
-    mdLiteToHtml('看这个：\n```\n**不是粗体** <b>\n```'),
-    '<p>看这个：</p><pre><code>**不是粗体** &lt;b&gt;</code></pre>',
-  )
+test('围栏代码块：内容原样转义、不解析行内标记，带复制钮', () => {
+  const html = mdLiteToHtml('看这个：\n```\n**不是粗体** <b>\n```')
+  assert.ok(html.includes('<p>看这个：</p>'), html)
+  assert.ok(html.includes('<div class="pilot-code">'), html)
+  assert.ok(html.includes('<pre><code>**不是粗体** &lt;b&gt;</code></pre>'), html)
+  assert.ok(html.includes('data-action="copy-code"'), html)
+  assert.ok(html.includes('aria-label="Copy"'), html)
 })
 
 test('未闭合围栏：剩余内容按代码块收尾', () => {
-  assert.equal(mdLiteToHtml('```\nabc'), '<pre><code>abc</code></pre>')
+  const html = mdLiteToHtml('```\nabc')
+  assert.ok(html.includes('<pre><code>abc</code></pre>'), html)
+  assert.ok(html.includes('data-action="copy-code"'), html)
 })
 
 test('空输入与纯空白', () => {
