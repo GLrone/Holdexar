@@ -38,7 +38,15 @@ md.renderer.rules.softbreak = () => '<br>'
 md.renderer.rules.fence = (tokens, idx) => {
   const lang = tokens[idx]!.info.trim()
   const cls = lang ? ` class="language-${md.utils.escapeHtml(lang)}"` : ''
-  return `<pre><code${cls}>${md.utils.escapeHtml(tokens[idx]!.content.replace(/\n$/, ''))}</code></pre>`
+  const label = md.utils.escapeHtml(renderOpts?.codeCopyLabel || 'Copy')
+  return (
+    `<div class="pilot-code">` +
+    `<button type="button" class="pilot-code-copy" data-action="copy-code" aria-label="${label}" title="${label}">` +
+    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M15 5H6a2 2 0 0 0-2 2v9"></path></svg>` +
+    `</button>` +
+    `<pre><code${cls}>${md.utils.escapeHtml(tokens[idx]!.content.replace(/\n$/, ''))}</code></pre>` +
+    `</div>`
+  )
 }
 /* h1-h3 归 h3（聊天气泡视觉契约），h4-h6 真实级别 */
 const headingTagOf = (tag: string): string => {
@@ -212,12 +220,20 @@ function prepareSource(src: string, opts?: MdLiteOpts): { text: string; cards: s
   return { text: out.join('\n'), cards }
 }
 
+/* 渲染期标签文案（复制钮等）由入口按次传入；md.render 为同步执行，取值后即清 */
+let renderOpts: MdLiteOpts | undefined
+
 export function mdLiteToHtml(src: string, opts?: MdLiteOpts): string {
-  const prepared = prepareSource((src || '').replace(/\r\n?/g, '\n'), opts)
-  const html = md.render(protectTableCodePipes(prepared.text))
-  return html
-    .replace(/<p>\uE000(\d+)\uE001<\/p>/g, (_, n) => prepared.cards[Number(n)] ?? '')
-    .replace(/\uE000(\d+)\uE001/g, (_, n) => prepared.cards[Number(n)] ?? '')
+  renderOpts = opts
+  try {
+    const prepared = prepareSource((src || '').replace(/\r\n?/g, '\n'), opts)
+    const html = md.render(protectTableCodePipes(prepared.text))
+    return html
+      .replace(/<p>\uE000(\d+)\uE001<\/p>/g, (_, n) => prepared.cards[Number(n)] ?? '')
+      .replace(/\uE000(\d+)\uE001/g, (_, n) => prepared.cards[Number(n)] ?? '')
+  } finally {
+    renderOpts = undefined
+  }
 }
 
 /** 行内级渲染：带引用胶囊的消息按片段行内渲染（粗斜体/行内码/链接同契约），块级结构让位胶囊流 */
@@ -239,6 +255,8 @@ export interface MdLiteOpts {
   /** SVG 图卡「加到对话」按钮文案（引用整块图/代码到输入框） */
   svgQuoteLabel?: string
   svgDrawingLabel?: string
+  /** 围栏代码块复制按钮文案 */
+  codeCopyLabel?: string
 }
 
 const SVG_OPEN_RE = /<svg[\s>]/i

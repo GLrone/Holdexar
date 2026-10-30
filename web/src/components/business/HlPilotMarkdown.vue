@@ -26,6 +26,7 @@ const html = computed(() => (props.inline
       svgCodeLabel: t('pilot.svgCode'),
       svgCopyLabel: t('pilot.svgCopy'),
       svgQuoteLabel: t('pilot.svgQuote'),
+      codeCopyLabel: t('pilot.codeCopy'),
     })))
 </script>
 
@@ -75,12 +76,57 @@ const html = computed(() => (props.inline
 }
 
 .pilot-md :deep(pre) {
-  margin: 4px 0 8px;
+  margin: 0;
   padding: 10px 12px;
   border: 1px solid var(--border-soft);
   border-radius: 8px;
   background: var(--bg-card);
   overflow-x: auto;
+}
+
+.pilot-md :deep(.pilot-code) {
+  position: relative;
+  margin: 4px 0 8px;
+}
+
+.pilot-md :deep(.pilot-code pre) {
+  margin: 0;
+}
+
+.pilot-md :deep(.pilot-code-copy) {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: none;
+  color: var(--text-faint);
+  cursor: pointer;
+  opacity: 0;
+  transition: all calc(var(--duration-1) * var(--motion-scale)) ease;
+}
+
+.pilot-md :deep(.pilot-code:hover .pilot-code-copy),
+.pilot-md :deep(.pilot-code-copy:focus-visible) {
+  opacity: 1;
+}
+
+.pilot-md :deep(.pilot-code-copy:hover) {
+  color: var(--accent);
+  background: var(--bg-hover);
+  border-color: var(--border-soft);
+}
+
+.pilot-md :deep(.pilot-code-copy svg) {
+  width: 13px;
+  height: 13px;
 }
 
 .pilot-md :deep(pre code) {
