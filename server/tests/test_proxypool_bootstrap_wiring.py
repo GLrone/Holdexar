@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import socket
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 import yaml
@@ -68,10 +68,10 @@ async def _sub() -> int:
         return row.id
 
 
-async def _triage(data_dir, runtime, exe):
+async def _triage(data_dir, runtime, exe, now=NOW):
     async with get_session_factory()() as s:
         result = await bs.handle_subscription_refresh(
-            s, data_dir=data_dir, runtime=runtime, exe_path=str(exe), now=NOW,
+            s, data_dir=data_dir, runtime=runtime, exe_path=str(exe), now=now,
         )
         await s.commit()
         return result
@@ -140,7 +140,8 @@ async def test_signature_unchanged_does_not_rebuild(
 
     # 换个名字但**配置指纹相同**（name 不参与指纹）→ 合格集与签名都不变
     _script([_node("A-改名", "127.0.0.1")], monkeypatch)
-    second = await _triage(tmp_data_dir, pool_runtime, kernel_exe_path)
+    second = await _triage(tmp_data_dir, pool_runtime, kernel_exe_path,
+                           now=NOW + timedelta(hours=3))
 
     assert second.synced is True
     assert second.pool_changed is False
@@ -161,7 +162,8 @@ async def test_signature_changed_requests_rebuild_only(
     pid = pool_runtime.process.pid
 
     _script([_node("A", "127.0.0.1"), _node("B", "127.0.0.2")], monkeypatch)
-    result = await _triage(tmp_data_dir, pool_runtime, kernel_exe_path)
+    result = await _triage(tmp_data_dir, pool_runtime, kernel_exe_path,
+                           now=NOW + timedelta(hours=3))
 
     assert result.pool_changed is True
     assert result.action == "rebuild_requested"
@@ -183,7 +185,8 @@ async def test_pool_change_without_runtime_bootstraps(
         await s.commit()
 
     _script([_node("A", "127.0.0.1"), _node("B", "127.0.0.2")], monkeypatch)
-    result = await _triage(tmp_data_dir, pool_runtime, kernel_exe_path)
+    result = await _triage(tmp_data_dir, pool_runtime, kernel_exe_path,
+                           now=NOW + timedelta(hours=3))
 
     assert result.pool_changed is True
     assert result.action == "bootstrapped", "没 Runtime 时该 bootstrap，而不是 request_rebuild"
@@ -206,7 +209,8 @@ async def test_sync_failure_leaves_runtime_untouched(
         raise RuntimeError("订阅下载失败")
 
     monkeypatch.setattr(bs, "fetch_subscription", _boom)
-    result = await _triage(tmp_data_dir, pool_runtime, kernel_exe_path)
+    result = await _triage(tmp_data_dir, pool_runtime, kernel_exe_path,
+                           now=NOW + timedelta(hours=3))
 
     assert result.synced is False
     assert result.action == "none"
