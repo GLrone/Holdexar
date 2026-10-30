@@ -22,12 +22,12 @@ import {
   type PilotStep,
 } from '@/api/client'
 import { formatCnyFen } from '@/api/regions'
-import { mdLiteInlineToHtml, mdLiteToHtml } from '@/lib/markdownLite'
 import { buildCtxSegments, shouldShowCacheHitRate } from '@/lib/ctxSegments'
 import { canRateTurn, fmtTokens, isEmptyLlmFailure, isErrorReason, isLongAnswerText, pilotCoverUrl, positivePct, ratingClass, sessionTime } from '@/lib/pilotView'
 import HlImg from '@/components/ui/HlImg.vue'
 import HlPilotCards from '@/components/business/HlPilotCards.vue'
 import HlPilotChain from '@/components/business/HlPilotChain.vue'
+import HlPilotMarkdown from '@/components/business/HlPilotMarkdown.vue'
 import HlPilotOutline from '@/components/business/HlPilotOutline.vue'
 import HlPilotRuns from '@/components/business/HlPilotRuns.vue'
 import HlPilotStats from '@/components/business/HlPilotStats.vue'
@@ -225,13 +225,11 @@ function quoteSegments(q: string): { kind: 'text' | 'quote'; value: string; n?: 
   return out
 }
 
-/** 提问正文段渲染：带编号引用的消息按行内契约渲染（标号胶囊保持句内位置），
+/** 提问正文段是否行内渲染：带编号引用的消息片段走行内契约（标号胶囊保持句内位置），
     整条无标号消息走与回答相同的块级渲染；复制与编辑重问始终取原始文本 */
-function qSegmentHtml(turn: { q: string }, value: string): string {
+function qInline(turn: { q: string }): boolean {
   QUOTE_MARKER_RE.lastIndex = 0
   return QUOTE_MARKER_RE.test(turn.q || '')
-    ? mdLiteInlineToHtml(value)
-    : renderAnswerHtml(value)
 }
 
 /** 某编号引用的正文（发给后端 / 气泡悬停面板按编号取） */
@@ -248,25 +246,12 @@ const liveStepsFlat = computed(() => livePhases.value.flatMap((p) => p.steps))
 /* 终答就位渲染：回答层只承接「尚未被工具定性的当前段」正文——tool_start
    一到，该段正文划归过程链（链内 phasePre 就地展示），回答层空窗等待终答。
    模型在调工具前输出的过程叙述不再以「先文字后卡片」的形态占据回答层。 */
-const liveAnswerHtml = computed(() => {
+const liveAnswerSource = computed(() => {
   const phases = livePhases.value
   if (!phases.length) return ''
   const last = phases[phases.length - 1]!
-  const text = last.steps.length ? '' : last.text
-  return text ? renderAnswerHtml(text) : ''
+  return last.steps.length ? '' : last.text
 })
-
-/** 回答层统一渲染入口：支持 SVG 矢量图实时渐进式渲染与终态卡片呈现。 */
-function renderAnswerHtml(text: string): string {
-  return mdLiteToHtml(text, {
-    svgPendingLabel: t('pilot.svgPending'),
-    svgDrawingLabel: t('pilot.svgDrawing'),
-    svgPreviewLabel: t('pilot.svgPreview'),
-    svgCodeLabel: t('pilot.svgCode'),
-    svgCopyLabel: t('pilot.svgCopy'),
-    svgQuoteLabel: t('pilot.svgQuote'),
-  })
-}
 
 /** 流式期即时卡片账：tool_start 按类型预告挂骨架占位，card 事件原位填充——
  *  卡片归属产出它的阶段，在过程链内随思考时序内嵌展示；done 后由回答层
@@ -2635,11 +2620,11 @@ function triggerFollowUp(prompt: string) {
                 <span class="pilot-qchip__title">{{ quoteTextOf(turn, seg.n!) ? quoteTitleOf(quoteTextOf(turn, seg.n!)) : t('pilot.quote.gone') }}</span>
                 <span v-if="quoteTextOf(turn, seg.n!)" class="pilot-qchip__full">{{ quoteTextOf(turn, seg.n!) }}</span>
               </span>
-              <span
+              <HlPilotMarkdown
                 v-else-if="seg.value"
-                class="pilot-turn__md"
-                v-html="qSegmentHtml(turn, seg.value)"
-              ></span>
+                :inline="qInline(turn)"
+                :source="seg.value"
+              />
             </template>
           </div>
         </div>
@@ -2862,12 +2847,12 @@ function triggerFollowUp(prompt: string) {
               @quote="quoteToComposer"
               @copy="onCopyText"
             />
-            <div
+            <HlPilotMarkdown
               v-if="turn.text"
-              class="pilot-answer pilot-md"
+              class="pilot-answer"
               :class="{ 'is-clamped': isLongAnswer(turn) && !turn.expanded }"
-              v-html="renderAnswerHtml(turn.text)"
-            ></div>
+              :source="turn.text"
+            />
             <button
               v-if="isLongAnswer(turn)"
               type="button"
@@ -2888,12 +2873,12 @@ function triggerFollowUp(prompt: string) {
               @quote="quoteToComposer"
               @copy="onCopyText"
             />
-            <div
+            <HlPilotMarkdown
               v-if="turn.text"
-              class="pilot-answer pilot-md"
+              class="pilot-answer"
               :class="{ 'is-clamped': isLongAnswer(turn) && !turn.expanded }"
-              v-html="renderAnswerHtml(turn.text)"
-            ></div>
+              :source="turn.text"
+            />
             <button
               v-if="isLongAnswer(turn)"
               type="button"
@@ -3006,13 +2991,13 @@ function triggerFollowUp(prompt: string) {
             @copy="onCopyText"
           />
           <!-- 终答就位：文字流式期在链下原位生长，done 时正式卡接手卡区 -->
-          <div v-if="liveAnswerHtml" class="pilot-answer pilot-md" v-html="liveAnswerHtml"></div>
+          <HlPilotMarkdown v-if="liveAnswerSource" class="pilot-answer" :source="liveAnswerSource" />
           <div v-if="queuedHint" class="pilot-queued">
             {{ t(queuedHint === 'parallel' ? 'pilot.queued.parallel'
               : queuedHint === 'toolSlow' ? 'pilot.queued.toolSlow' : 'pilot.queued.waiting') }}
           </div>
           <!-- 运行中动作行：与终态回复同一位置同一套钮，只在已流出正文时给复制 -->
-          <div v-if="liveAnswerHtml" class="pilot-acts">
+          <div v-if="liveAnswerSource" class="pilot-acts">
             <button
               type="button"
               class="pilot-act"
@@ -5445,16 +5430,7 @@ function triggerFollowUp(prompt: string) {
   height: 13px;
 }
 
-/* 回答走对话流排版（不装箱）：markdown 标签由渲染器产出，scoped 下用 :deep() 着样式 */
-.pilot-answer {
-  margin: 0;
-  font-size: 13px;
-  line-height: 1.75;
-  color: var(--text-primary);
-  word-break: break-word;
-}
-
-/* 长回答折叠：渐隐裁切 + 展开/收起钮（阈值 700 字；展开态按轮记忆） */
+/* 回答排版由 HlPilotMarkdown 组件承载；此处只留折叠裁切等容器行为 */
 .pilot-answer.is-clamped {
   position: relative;
   max-height: 320px;
@@ -5541,296 +5517,6 @@ function triggerFollowUp(prompt: string) {
   width: 12px;
   height: 12px;
   flex: none;
-}
-
-.pilot-md :deep(p) {
-  margin: 0 0 6px;
-}
-
-.pilot-md :deep(p:last-child) {
-  margin-bottom: 0;
-}
-
-.pilot-md :deep(strong) {
-  font-weight: 600;
-}
-
-.pilot-md :deep(code) {
-  padding: 1px 5px;
-  border-radius: 4px;
-  background: var(--accent-a10);
-  font-size: 12px;
-}
-
-.pilot-md :deep(ul),
-.pilot-md :deep(ol) {
-  margin: 2px 0 6px;
-  padding-left: 18px;
-  display: grid;
-  gap: 2px;
-}
-
-.pilot-md :deep(li)::marker {
-  color: var(--text-secondary);
-}
-
-.pilot-md :deep(pre) {
-  margin: 4px 0 8px;
-  padding: 10px 12px;
-  border: 1px solid var(--border-soft);
-  border-radius: 8px;
-  background: var(--bg-card);
-  overflow-x: auto;
-}
-
-.pilot-md :deep(pre code) {
-  padding: 0;
-  background: none;
-  border-radius: 0;
-  font-size: 12px;
-  line-height: 1.6;
-}
-
-.pilot-md :deep(.pilot-svg) {
-  margin: 8px 0 12px;
-  border: 1px solid var(--border-soft);
-  border-radius: 10px;
-  background: var(--bg-card);
-  overflow: hidden;
-}
-
-.pilot-md :deep(.pilot-svg-toolbar) {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 6px 10px;
-  border-bottom: 1px solid var(--border-soft);
-  background: var(--bg-hover);
-  font-size: 11px;
-}
-
-.pilot-md :deep(.pilot-svg-badge) {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  font-size: 11px;
-}
-
-.pilot-md :deep(.pilot-svg-badge svg) {
-  width: 12px;
-  height: 12px;
-  color: var(--accent);
-}
-
-.pilot-md :deep(.pilot-svg-actions) {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.pilot-md :deep(.pilot-svg-tab) {
-  padding: 2px 8px;
-  border: 1px solid transparent;
-  border-radius: 5px;
-  background: none;
-  color: var(--text-secondary);
-  font-size: 11px;
-  cursor: pointer;
-  transition: all calc(var(--duration-1) * var(--motion-scale)) ease;
-}
-
-.pilot-md :deep(.pilot-svg-tab:hover) {
-  color: var(--text-primary);
-  background: var(--bg-card);
-}
-
-.pilot-md :deep(.pilot-svg-tab.is-active) {
-  color: var(--accent);
-  background: var(--bg-card);
-  border-color: var(--border-soft);
-  font-weight: 600;
-}
-
-.pilot-md :deep(.pilot-svg-quote),
-.pilot-md :deep(.pilot-svg-copy) {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 22px;
-  padding: 0;
-  border: none;
-  border-radius: 5px;
-  background: none;
-  color: var(--text-secondary);
-  cursor: pointer;
-  transition: all calc(var(--duration-1) * var(--motion-scale)) ease;
-}
-
-.pilot-md :deep(.pilot-svg-quote svg),
-.pilot-md :deep(.pilot-svg-copy svg) {
-  width: 13px;
-  height: 13px;
-}
-
-.pilot-md :deep(.pilot-svg-quote:hover),
-.pilot-md :deep(.pilot-svg-copy:hover) {
-  color: var(--accent);
-  background: var(--bg-card);
-}
-
-.pilot-md :deep(.pilot-svg-stage) {
-  padding: 12px;
-  overflow-x: auto;
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  background: var(--bg-card);
-}
-
-.pilot-md :deep(.pilot-svg-stage svg) {
-  display: block;
-  width: 100%;
-  height: auto;
-  max-width: 720px;
-}
-
-.pilot-md :deep(.pilot-svg-source) {
-  padding: 10px 12px;
-  background: var(--bg-card);
-  overflow-x: auto;
-}
-
-.pilot-md :deep(.pilot-svg-source pre) {
-  margin: 0;
-  padding: 0;
-  background: none;
-}
-
-.pilot-md :deep(.pilot-svg-source code) {
-  font-size: 12px;
-  line-height: 1.5;
-  color: var(--text-primary);
-}
-
-.pilot-md :deep(.pilot-svg.is-pending) {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 56px;
-  padding: 12px;
-  color: var(--text-secondary);
-  font-size: 12px;
-}
-
-.pilot-md :deep(.pilot-svg.is-drawing) {
-  border-color: var(--accent-a30);
-  box-shadow: 0 0 12px var(--accent-a08);
-}
-
-.pilot-md :deep(.pilot-svg-badge.is-drawing) {
-  color: var(--accent);
-}
-
-.pilot-md :deep(.pilot-svg-badge.is-drawing svg) {
-  animation: pilot-svg-spin 2s linear infinite;
-}
-
-@keyframes pilot-svg-spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .pilot-md :deep(.pilot-svg-badge.is-drawing svg) {
-    animation: none;
-  }
-}
-
-.pilot-md :deep(h3) {
-  margin: 10px 0 4px;
-  padding-left: 8px;
-  border-left: 3px solid var(--accent);
-  font-size: 13px;
-  font-weight: 600;
-  line-height: 1.5;
-  color: var(--text-primary);
-}
-
-.pilot-md :deep(h3:first-child) {
-  margin-top: 0;
-}
-
-.pilot-md :deep(mark) {
-  padding: 0 3px;
-  border-radius: 4px;
-  background: var(--accent-a15);
-  color: var(--text-primary);
-  font-weight: 600;
-}
-
-.pilot-md :deep(blockquote) {
-  margin: 4px 0 8px;
-  padding: 8px 10px;
-  border-left: 3px solid var(--accent);
-  border-radius: 0 8px 8px 0;
-  background: var(--accent-a10);
-}
-
-.pilot-md :deep(blockquote p) {
-  margin: 0;
-  font-size: 12px;
-  line-height: 1.6;
-  color: var(--text-secondary);
-}
-
-.pilot-md :deep(hr) {
-  margin: 8px 0;
-  border: none;
-  border-top: 1px solid var(--border-soft);
-}
-
-.pilot-md :deep(.pilot-table-wrap) {
-  margin: 8px 0 10px;
-  max-width: 100%;
-  overflow-x: auto;
-  border-radius: 8px;
-  border: 1px solid var(--border-soft);
-  background: var(--bg-card);
-}
-
-.pilot-md :deep(.pilot-table) {
-  width: 100%;
-  min-width: 100%;
-  border-collapse: collapse;
-  font-size: 12px;
-  line-height: 1.5;
-  text-align: left;
-}
-
-.pilot-md :deep(.pilot-table th) {
-  padding: 8px 10px;
-  background: var(--surface-inset);
-  color: var(--text-secondary);
-  font-weight: 600;
-  border-bottom: 1px solid var(--border-soft);
-  white-space: nowrap;
-}
-
-.pilot-md :deep(.pilot-table td) {
-  padding: 7px 10px;
-  border-bottom: 1px solid var(--border-soft);
-  color: var(--text-primary);
-}
-
-.pilot-md :deep(.pilot-table tr:last-child td) {
-  border-bottom: none;
-}
-
-.pilot-md :deep(.pilot-table tbody tr:hover) {
-  background: var(--accent-a10);
 }
 
 .pilot-briefing__title {
