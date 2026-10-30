@@ -20,3 +20,7 @@ pytest-asyncio>=1.4,<2.0
 # some tests reach for respx-style helpers; keep httpx pinned in lockstep with
 # requirements.txt rather than letting pip resolve a different major here).
 httpx>=0.28,<1.0
+
+# PE 属性体检（scripts/check_release_pe.py 手动诊断 + test_go_launcher_build 的
+# 函数内导入）：干净环境缺它则脚本不可用、发布门全量 pytest 必红。
+pefile>=2023.2.7
