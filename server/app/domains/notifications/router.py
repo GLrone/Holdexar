@@ -11,13 +11,16 @@ from sqlalchemy import func, select
 
 from app.core.database import get_session_factory
 from app.domains.alerts.notify import get_smtp_config, send_test_mail, smtp_config
+from app.domains.notifications.mail import event_label
 from app.domains.notifications.models import NotificationCandidate
 from app.domains.notifications.policy import (
     CATEGORIES,
     CATEGORY_EVENT_TYPES,
     CATEGORY_LABELS,
     MAX_ATTEMPTS,
+    TYPE_LABELS,
     UNKNOWN,
+    category_of,
     load_prefs,
     save_prefs,
 )
@@ -50,6 +53,47 @@ async def _smtp_view() -> dict:
     }
 
 
+def _prefs_view(prefs: dict, *, extras: dict | None = None) -> dict:
+    """设置页与提醒页共用的偏好投影；region 为当前生效地区解析结果。"""
+    from app.domains.notifications.region import resolve_region
+
+    view = {
+        "enabled": prefs["enabled"],
+        "quietEnabled": prefs["quietEnabled"],
+        "quietStart": prefs["quietStart"],
+        "quietEnd": prefs["quietEnd"],
+        "includeDetails": prefs["includeDetails"],
+        "maxAttempts": MAX_ATTEMPTS,
+        "manualRegion": prefs.get("manualRegion"),
+        "digestTime": prefs.get("digestTime", "08:00"),
+        "digestWeekday": prefs.get("digestWeekday", 0),
+        "featured": prefs.get("featured") or {},
+        "region": resolve_region(prefs=prefs),
+        "types": [
+            {
+                "key": key,
+                "label": TYPE_LABELS[key],
+                "category": category_of(key),
+                "enabled": (prefs.get("types", {}).get(key) or {}).get("enabled", True),
+                "frequency": (prefs.get("types", {}).get(key) or {}).get("frequency", "immediate"),
+            }
+            for key in TYPE_LABELS
+        ],
+        "categories": [
+            {
+                "key": key,
+                "label": CATEGORY_LABELS[key],
+                "enabled": prefs["categories"].get(key, True),
+                "eventTypes": len(CATEGORY_EVENT_TYPES[key]),
+            }
+            for key in CATEGORIES
+        ],
+    }
+    if extras:
+        view.update(extras)
+    return view
+
+
 @router.get("/notifications/prefs")
 async def get_prefs():
     """用户通知偏好 + 出口状态 + 最近一次投递结果（设置页一屏看全）。"""
@@ -74,32 +118,14 @@ async def get_prefs():
             "reason": row.reason,
             "retryable": notification_service.retryable(row.last_error),
         }
-    return {
-        "enabled": prefs["enabled"],
-        "quietEnabled": prefs["quietEnabled"],
-        "quietStart": prefs["quietStart"],
-        "quietEnd": prefs["quietEnd"],
-        "includeDetails": prefs["includeDetails"],
-        "maxAttempts": MAX_ATTEMPTS,
-        "categories": [
-            {
-                "key": key,
-                "label": CATEGORY_LABELS[key],
-                "enabled": prefs["categories"].get(key, True),
-                "eventTypes": len(CATEGORY_EVENT_TYPES[key]),
-            }
-            for key in CATEGORIES
-        ],
-        "smtp": await _smtp_view(),
-        "lastDelivery": last,
-    }
+    return _prefs_view(prefs, extras={"smtp": await _smtp_view(), "lastDelivery": last})
 
 
 @router.put("/notifications/prefs")
 async def update_prefs(payload: dict):
     """写用户偏好；未知键忽略，类别只认已知类别。"""
     prefs = await save_prefs(payload or {})
-    return {"ok": True, "enabled": prefs["enabled"]}
+    return {"ok": True, **_prefs_view(prefs)}
 
 
 @router.post("/notifications/test")
@@ -125,6 +151,20 @@ async def send_test():
     return {"ok": True}
 
 
+def _payload_detail(payload: dict, fallback_title: str | None) -> dict:
+    """候选冻结的展示摘要：游戏名/价格/币种/触发解释，来自创建时的 payload。"""
+    return {
+        "title": payload.get("gameName") or payload.get("title") or fallback_title,
+        "price": payload.get("price"),
+        "currency": payload.get("currency"),
+        "originalPrice": payload.get("originalPrice"),
+        "discount": payload.get("discount"),
+        "observedAt": payload.get("observedAt"),
+        "labels": payload.get("labels") or [],
+        "summary": payload.get("summary"),
+    }
+
+
 @router.get("/notifications/candidates")
 async def list_candidates(limit: int = Query(50, ge=1, le=500)):
     """最近的通知候选（投递账本，只读）。"""
@@ -136,26 +176,56 @@ async def list_candidates(limit: int = Query(50, ge=1, le=500)):
                 .limit(limit)
             )
         ).scalars().all()
-    return {
-        "items": [
-            {
-                "id": c.id,
-                "eventId": c.event_id,
-                "cycleId": c.cycle_id,
-                "appid": c.appid,
-                "region": c.region_code,
-                "eventType": c.event_type,
-                "category": c.category,
-                "recipient": c.recipient,
-                "status": c.status,
-                "reason": c.reason,
-                "attempts": c.attempts,
-                "deliveredAt": c.delivered_at.isoformat() if c.delivered_at else None,
-                "deliveryHistory": c.delivery_history_json or [],
+    from app.domains.crawl.events import PriceEvent
+    from app.domains.games.models import Game
+
+    appids = {c.appid for c in rows if c.appid}
+    price_ids = [c.event_id for c in rows if c.source_kind == "price_event"]
+    async with get_session_factory()() as session:
+        names = {int(a): n for a, n in (await session.execute(
+            select(Game.appid, Game.name).where(Game.appid.in_(appids)))).all()} if appids else {}
+        events = {int(row.id): row for row in (await session.execute(
+            select(PriceEvent).where(PriceEvent.id.in_(price_ids)))).scalars().all()} if price_ids else {}
+
+    items = []
+    for c in rows:
+        if c.source_kind == "price_event":
+            event = events.get(c.event_id)
+            current = (event.current_json or {}) if event else {}
+            detail = {
+                "title": names.get(c.appid),
+                "price": current.get("price"),
+                "currency": current.get("currency"),
+                "originalPrice": current.get("originalPrice"),
+                "discount": current.get("discount"),
+                "observedAt": current.get("observedAt") or current.get("at"),
+                "labels": [],
+                "summary": None,
             }
-            for c in rows
-        ]
-    }
+        else:
+            detail = _payload_detail(c.payload_json or {}, names.get(c.appid))
+        items.append({
+            "id": c.id,
+            "eventId": c.event_id,
+            "cycleId": c.cycle_id,
+            "appid": c.appid,
+            "region": c.region_code,
+            "sourceKind": c.source_kind,
+            "eventType": c.event_type,
+            "eventLabel": event_label(c.event_type),
+            "category": c.category,
+            "recipient": c.recipient,
+            "status": c.status,
+            "reason": c.reason,
+            "attempts": c.attempts,
+            "deliveredAt": c.delivered_at.isoformat() if c.delivered_at else None,
+            "deliveryHistory": c.delivery_history_json or [],
+            "payload": c.payload_json or {},
+            "createdAt": c.created_at.isoformat() if c.created_at else None,
+            "dueAt": c.due_at.isoformat() if c.due_at else None,
+            "detail": detail,
+        })
+    return {"items": items}
 
 
 @router.get("/notifications/stats")
