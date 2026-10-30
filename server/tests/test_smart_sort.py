@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.core.database import get_session_factory, init_db
 from app.domains.games import service as games_service
 from app.domains.games.models import Game, GameCurrentPrice
-from app.domains.games.scoring import smart_score
+from app.domains.games.scoring import quality_score, smart_score
 
 P1, P2 = 99600301, 99600302
 # 零评价成熟度对照组：P3 老游戏零评价 / P4 新发行零评价 / P5 有评测对照
@@ -106,23 +106,17 @@ async def test_smart_breaks_discount_wall():
 
 
 @pytest.mark.asyncio
-async def test_smart_score_persisted_and_exposed():
-    """落库值与响应拆解因子一致（实验池展示依赖同一口径）。"""
+async def test_smart_score_persisted_and_sorted():
+    """落库分值驱动 smart 排序（评分字段不再进响应；因子语义归 scoring 直测）。"""
     await _seed()
     try:
-        res = await games_service.list_games(sort="smart", limit=100, q="smart-probe")
-        by_id = {it["appid"]: it for it in res["items"]}
-        p1 = by_id[P1]
-        expected = smart_score(3000, 9700, 200000, 0, 0)
-        assert p1["smartScore"] == pytest.approx(expected, abs=1e-4)
-        # 四因子拆解：save(¥30)>0 / quality 高 / timing=0（原价）/ familiarity=1
-        f = p1["smartFactors"]
-        assert f["save"] > 0.3 and f["quality"] > 0.9
-        assert f["timing"] == 0.0 and f["familiarity"] == 1.0
-        # 打折款的 timing 拿满、save 几乎为 0——两款的差异来路一目了然
-        p2 = by_id[P2]
-        assert p2["smartFactors"]["timing"] == 1.0
-        assert p2["smartFactors"]["save"] < 0.05
+        ids = await _probe_ids("smart")
+        assert ids == [P1, P2]
+        async with get_session_factory()() as s:
+            row = (await s.execute(select(Game).where(Game.appid == P1))).scalar_one()
+        assert row.smart_score == pytest.approx(
+            smart_score(3000, 9700, 200000, 0, 0), abs=1e-4
+        )
     finally:
         await _cleanup()
 
@@ -203,17 +197,16 @@ async def test_old_zero_review_demoted_below_reviewed_rival():
     await _seed_zero_review()
     try:
         res = await games_service.list_games(sort="smart", limit=100, q="smart-probe")
-        by_id = {it["appid"]: it for it in res["items"]}
         ids = [it["appid"] for it in res["items"]]
         assert ids.index(P5) < ids.index(P3)
         assert ids.index(P4) < ids.index(P3)
-        # 质量因子语义：老零评价跌破中性；新零评价保持近中性
-        assert by_id[P3]["smartFactors"]["quality"] < 0.32
-        assert by_id[P4]["smartFactors"]["quality"] > 0.45
-        # 落库列与接口拆解同口径（零评价新路径同样核一遍）
+        # 质量因子语义：老零评价跌破中性；新零评价保持近中性（直测公式源，
+        # 评分字段不再进响应）
+        assert quality_score(None, 0, "2022-11-15") < 0.32
+        assert quality_score(None, 0, (date.today() - timedelta(days=7)).isoformat()) > 0.45
+        # 落库列与公式同口径（零评价新路径同样核一遍）
         async with get_session_factory()() as s:
             row = (await s.execute(select(Game).where(Game.appid == P3))).scalar_one()
-        assert row.smart_score == pytest.approx(by_id[P3]["smartScore"], abs=1e-4)
         assert row.smart_score == pytest.approx(
             smart_score(3000, None, 0, 1, 30, "2022-11-15"), abs=1e-4
         )
