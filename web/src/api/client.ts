@@ -2044,6 +2044,8 @@ export const watchPoolApi = {
 // ─── follows（关注列表：游戏卡星标 = 追踪池 manual 条目）──────────────────
 
 export const followsApi = {
+  /** 当前关注的 appid 全集（升序；星标状态一次性整表拉取） */
+  list: () => request<{ appids: number[] }>('GET', '/follows'),
   /** 关注：入追踪池 + manual 标（爬取最优先、同步免疫） */
   add: (appid: number) =>
     request<{ appid: number; followed: boolean }>('PUT', `/follows/${appid}`),
