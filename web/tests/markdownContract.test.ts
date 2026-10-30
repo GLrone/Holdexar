@@ -18,8 +18,8 @@ test('契约·表格行内代码竖线：码内裸竖线不切列', () => {
   const md = '| 描述 | 值 |\n| --- | --- |\n| 行内代码 | `left|right` |'
   const html = mdLiteToHtml(md)
   assert.ok(html.includes('<code>left|right</code>'), html)
-  const headerCells = (html.match(/<th /g) || []).length
-  const bodyCells = (html.match(/<td/g) || []).length
+  const headerCells = (html.match(/<th\b/g) || []).length
+  const bodyCells = (html.match(/<td\b/g) || []).length
   assert.equal(headerCells, 2, html)
   assert.equal(bodyCells, 2, html)
 })

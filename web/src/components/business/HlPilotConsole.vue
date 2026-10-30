@@ -22,7 +22,7 @@ import {
   type PilotStep,
 } from '@/api/client'
 import { formatCnyFen } from '@/api/regions'
-import { mdLiteToHtml } from '@/lib/markdownLite'
+import { mdLiteInlineToHtml, mdLiteToHtml } from '@/lib/markdownLite'
 import { buildCtxSegments, shouldShowCacheHitRate } from '@/lib/ctxSegments'
 import { canRateTurn, fmtTokens, isEmptyLlmFailure, isErrorReason, isLongAnswerText, pilotCoverUrl, positivePct, ratingClass, sessionTime } from '@/lib/pilotView'
 import HlImg from '@/components/ui/HlImg.vue'
@@ -223,6 +223,15 @@ function quoteSegments(q: string): { kind: 'text' | 'quote'; value: string; n?: 
   }
   if (last < text.length) out.push({ kind: 'text', value: text.slice(last) })
   return out
+}
+
+/** 提问正文段渲染：带编号引用的消息按行内契约渲染（标号胶囊保持句内位置），
+    整条无标号消息走与回答相同的块级渲染；复制与编辑重问始终取原始文本 */
+function qSegmentHtml(turn: { q: string }, value: string): string {
+  QUOTE_MARKER_RE.lastIndex = 0
+  return QUOTE_MARKER_RE.test(turn.q || '')
+    ? mdLiteInlineToHtml(value)
+    : renderAnswerHtml(value)
 }
 
 /** 某编号引用的正文（发给后端 / 气泡悬停面板按编号取） */
@@ -2612,8 +2621,9 @@ function triggerFollowUp(prompt: string) {
               </button>
             </div>
           </div>
-          <!-- 提问气泡：带编号引用时把正文里的标号就地渲染成胶囊，位置即用户在句中摆的位置 -->
-          <p v-else class="pilot-turn__q">
+          <!-- 提问气泡：文本段与助手回答同一 Markdown 契约（带标号时按行内渲染保胶囊句内位置，
+               无标号整条走块级渲染）；复制/编辑重问仍取原始文本 -->
+          <div v-else class="pilot-turn__q">
             <template v-for="(seg, si) in quoteSegments(turn.q)" :key="si">
               <span
                 v-if="seg.kind === 'quote'"
@@ -2625,9 +2635,13 @@ function triggerFollowUp(prompt: string) {
                 <span class="pilot-qchip__title">{{ quoteTextOf(turn, seg.n!) ? quoteTitleOf(quoteTextOf(turn, seg.n!)) : t('pilot.quote.gone') }}</span>
                 <span v-if="quoteTextOf(turn, seg.n!)" class="pilot-qchip__full">{{ quoteTextOf(turn, seg.n!) }}</span>
               </span>
-              <template v-else>{{ seg.value }}</template>
+              <span
+                v-else-if="seg.value"
+                class="pilot-turn__md"
+                v-html="qSegmentHtml(turn, seg.value)"
+              ></span>
             </template>
-          </p>
+          </div>
         </div>
 
         <!-- 发言动作行：挂在气泡下方独立一行（右沿对齐），hover 才显形；
@@ -2850,7 +2864,7 @@ function triggerFollowUp(prompt: string) {
             />
             <div
               v-if="turn.text"
-              class="pilot-answer"
+              class="pilot-answer pilot-md"
               :class="{ 'is-clamped': isLongAnswer(turn) && !turn.expanded }"
               v-html="renderAnswerHtml(turn.text)"
             ></div>
@@ -2876,7 +2890,7 @@ function triggerFollowUp(prompt: string) {
             />
             <div
               v-if="turn.text"
-              class="pilot-answer"
+              class="pilot-answer pilot-md"
               :class="{ 'is-clamped': isLongAnswer(turn) && !turn.expanded }"
               v-html="renderAnswerHtml(turn.text)"
             ></div>
@@ -2992,7 +3006,7 @@ function triggerFollowUp(prompt: string) {
             @copy="onCopyText"
           />
           <!-- 终答就位：文字流式期在链下原位生长，done 时正式卡接手卡区 -->
-          <div v-if="liveAnswerHtml" class="pilot-answer" v-html="liveAnswerHtml"></div>
+          <div v-if="liveAnswerHtml" class="pilot-answer pilot-md" v-html="liveAnswerHtml"></div>
           <div v-if="queuedHint" class="pilot-queued">
             {{ t(queuedHint === 'parallel' ? 'pilot.queued.parallel'
               : queuedHint === 'toolSlow' ? 'pilot.queued.toolSlow' : 'pilot.queued.waiting') }}
@@ -5529,38 +5543,38 @@ function triggerFollowUp(prompt: string) {
   flex: none;
 }
 
-.pilot-answer :deep(p) {
+.pilot-md :deep(p) {
   margin: 0 0 6px;
 }
 
-.pilot-answer :deep(p:last-child) {
+.pilot-md :deep(p:last-child) {
   margin-bottom: 0;
 }
 
-.pilot-answer :deep(strong) {
+.pilot-md :deep(strong) {
   font-weight: 600;
 }
 
-.pilot-answer :deep(code) {
+.pilot-md :deep(code) {
   padding: 1px 5px;
   border-radius: 4px;
   background: var(--accent-a10);
   font-size: 12px;
 }
 
-.pilot-answer :deep(ul),
-.pilot-answer :deep(ol) {
+.pilot-md :deep(ul),
+.pilot-md :deep(ol) {
   margin: 2px 0 6px;
   padding-left: 18px;
   display: grid;
   gap: 2px;
 }
 
-.pilot-answer :deep(li)::marker {
+.pilot-md :deep(li)::marker {
   color: var(--text-secondary);
 }
 
-.pilot-answer :deep(pre) {
+.pilot-md :deep(pre) {
   margin: 4px 0 8px;
   padding: 10px 12px;
   border: 1px solid var(--border-soft);
@@ -5569,7 +5583,7 @@ function triggerFollowUp(prompt: string) {
   overflow-x: auto;
 }
 
-.pilot-answer :deep(pre code) {
+.pilot-md :deep(pre code) {
   padding: 0;
   background: none;
   border-radius: 0;
@@ -5577,7 +5591,7 @@ function triggerFollowUp(prompt: string) {
   line-height: 1.6;
 }
 
-.pilot-answer :deep(.pilot-svg) {
+.pilot-md :deep(.pilot-svg) {
   margin: 8px 0 12px;
   border: 1px solid var(--border-soft);
   border-radius: 10px;
@@ -5585,7 +5599,7 @@ function triggerFollowUp(prompt: string) {
   overflow: hidden;
 }
 
-.pilot-answer :deep(.pilot-svg-toolbar) {
+.pilot-md :deep(.pilot-svg-toolbar) {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -5595,7 +5609,7 @@ function triggerFollowUp(prompt: string) {
   font-size: 11px;
 }
 
-.pilot-answer :deep(.pilot-svg-badge) {
+.pilot-md :deep(.pilot-svg-badge) {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -5604,19 +5618,19 @@ function triggerFollowUp(prompt: string) {
   font-size: 11px;
 }
 
-.pilot-answer :deep(.pilot-svg-badge svg) {
+.pilot-md :deep(.pilot-svg-badge svg) {
   width: 12px;
   height: 12px;
   color: var(--accent);
 }
 
-.pilot-answer :deep(.pilot-svg-actions) {
+.pilot-md :deep(.pilot-svg-actions) {
   display: inline-flex;
   align-items: center;
   gap: 4px;
 }
 
-.pilot-answer :deep(.pilot-svg-tab) {
+.pilot-md :deep(.pilot-svg-tab) {
   padding: 2px 8px;
   border: 1px solid transparent;
   border-radius: 5px;
@@ -5627,20 +5641,20 @@ function triggerFollowUp(prompt: string) {
   transition: all calc(var(--duration-1) * var(--motion-scale)) ease;
 }
 
-.pilot-answer :deep(.pilot-svg-tab:hover) {
+.pilot-md :deep(.pilot-svg-tab:hover) {
   color: var(--text-primary);
   background: var(--bg-card);
 }
 
-.pilot-answer :deep(.pilot-svg-tab.is-active) {
+.pilot-md :deep(.pilot-svg-tab.is-active) {
   color: var(--accent);
   background: var(--bg-card);
   border-color: var(--border-soft);
   font-weight: 600;
 }
 
-.pilot-answer :deep(.pilot-svg-quote),
-.pilot-answer :deep(.pilot-svg-copy) {
+.pilot-md :deep(.pilot-svg-quote),
+.pilot-md :deep(.pilot-svg-copy) {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -5655,19 +5669,19 @@ function triggerFollowUp(prompt: string) {
   transition: all calc(var(--duration-1) * var(--motion-scale)) ease;
 }
 
-.pilot-answer :deep(.pilot-svg-quote svg),
-.pilot-answer :deep(.pilot-svg-copy svg) {
+.pilot-md :deep(.pilot-svg-quote svg),
+.pilot-md :deep(.pilot-svg-copy svg) {
   width: 13px;
   height: 13px;
 }
 
-.pilot-answer :deep(.pilot-svg-quote:hover),
-.pilot-answer :deep(.pilot-svg-copy:hover) {
+.pilot-md :deep(.pilot-svg-quote:hover),
+.pilot-md :deep(.pilot-svg-copy:hover) {
   color: var(--accent);
   background: var(--bg-card);
 }
 
-.pilot-answer :deep(.pilot-svg-stage) {
+.pilot-md :deep(.pilot-svg-stage) {
   padding: 12px;
   overflow-x: auto;
   display: flex;
@@ -5676,32 +5690,32 @@ function triggerFollowUp(prompt: string) {
   background: var(--bg-card);
 }
 
-.pilot-answer :deep(.pilot-svg-stage svg) {
+.pilot-md :deep(.pilot-svg-stage svg) {
   display: block;
   width: 100%;
   height: auto;
   max-width: 720px;
 }
 
-.pilot-answer :deep(.pilot-svg-source) {
+.pilot-md :deep(.pilot-svg-source) {
   padding: 10px 12px;
   background: var(--bg-card);
   overflow-x: auto;
 }
 
-.pilot-answer :deep(.pilot-svg-source pre) {
+.pilot-md :deep(.pilot-svg-source pre) {
   margin: 0;
   padding: 0;
   background: none;
 }
 
-.pilot-answer :deep(.pilot-svg-source code) {
+.pilot-md :deep(.pilot-svg-source code) {
   font-size: 12px;
   line-height: 1.5;
   color: var(--text-primary);
 }
 
-.pilot-answer :deep(.pilot-svg.is-pending) {
+.pilot-md :deep(.pilot-svg.is-pending) {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -5711,16 +5725,16 @@ function triggerFollowUp(prompt: string) {
   font-size: 12px;
 }
 
-.pilot-answer :deep(.pilot-svg.is-drawing) {
+.pilot-md :deep(.pilot-svg.is-drawing) {
   border-color: var(--accent-a30);
   box-shadow: 0 0 12px var(--accent-a08);
 }
 
-.pilot-answer :deep(.pilot-svg-badge.is-drawing) {
+.pilot-md :deep(.pilot-svg-badge.is-drawing) {
   color: var(--accent);
 }
 
-.pilot-answer :deep(.pilot-svg-badge.is-drawing svg) {
+.pilot-md :deep(.pilot-svg-badge.is-drawing svg) {
   animation: pilot-svg-spin 2s linear infinite;
 }
 
@@ -5730,12 +5744,12 @@ function triggerFollowUp(prompt: string) {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .pilot-answer :deep(.pilot-svg-badge.is-drawing svg) {
+  .pilot-md :deep(.pilot-svg-badge.is-drawing svg) {
     animation: none;
   }
 }
 
-.pilot-answer :deep(h3) {
+.pilot-md :deep(h3) {
   margin: 10px 0 4px;
   padding-left: 8px;
   border-left: 3px solid var(--accent);
@@ -5745,11 +5759,11 @@ function triggerFollowUp(prompt: string) {
   color: var(--text-primary);
 }
 
-.pilot-answer :deep(h3:first-child) {
+.pilot-md :deep(h3:first-child) {
   margin-top: 0;
 }
 
-.pilot-answer :deep(mark) {
+.pilot-md :deep(mark) {
   padding: 0 3px;
   border-radius: 4px;
   background: var(--accent-a15);
@@ -5757,7 +5771,7 @@ function triggerFollowUp(prompt: string) {
   font-weight: 600;
 }
 
-.pilot-answer :deep(blockquote) {
+.pilot-md :deep(blockquote) {
   margin: 4px 0 8px;
   padding: 8px 10px;
   border-left: 3px solid var(--accent);
@@ -5765,20 +5779,20 @@ function triggerFollowUp(prompt: string) {
   background: var(--accent-a10);
 }
 
-.pilot-answer :deep(blockquote p) {
+.pilot-md :deep(blockquote p) {
   margin: 0;
   font-size: 12px;
   line-height: 1.6;
   color: var(--text-secondary);
 }
 
-.pilot-answer :deep(hr) {
+.pilot-md :deep(hr) {
   margin: 8px 0;
   border: none;
   border-top: 1px solid var(--border-soft);
 }
 
-.pilot-answer :deep(.pilot-table-wrap) {
+.pilot-md :deep(.pilot-table-wrap) {
   margin: 8px 0 10px;
   max-width: 100%;
   overflow-x: auto;
@@ -5787,7 +5801,7 @@ function triggerFollowUp(prompt: string) {
   background: var(--bg-card);
 }
 
-.pilot-answer :deep(.pilot-table) {
+.pilot-md :deep(.pilot-table) {
   width: 100%;
   min-width: 100%;
   border-collapse: collapse;
@@ -5796,7 +5810,7 @@ function triggerFollowUp(prompt: string) {
   text-align: left;
 }
 
-.pilot-answer :deep(.pilot-table th) {
+.pilot-md :deep(.pilot-table th) {
   padding: 8px 10px;
   background: var(--surface-inset);
   color: var(--text-secondary);
@@ -5805,17 +5819,17 @@ function triggerFollowUp(prompt: string) {
   white-space: nowrap;
 }
 
-.pilot-answer :deep(.pilot-table td) {
+.pilot-md :deep(.pilot-table td) {
   padding: 7px 10px;
   border-bottom: 1px solid var(--border-soft);
   color: var(--text-primary);
 }
 
-.pilot-answer :deep(.pilot-table tr:last-child td) {
+.pilot-md :deep(.pilot-table tr:last-child td) {
   border-bottom: none;
 }
 
-.pilot-answer :deep(.pilot-table tbody tr:hover) {
+.pilot-md :deep(.pilot-table tbody tr:hover) {
   background: var(--accent-a10);
 }
 
