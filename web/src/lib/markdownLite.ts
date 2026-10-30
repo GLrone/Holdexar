@@ -1,11 +1,10 @@
 /**
- * 领航台回答的极简 Markdown 渲染：先整体 HTML 转义再拼标签，无注入面。
- * 块级：围栏代码块、##/### 小节标题、> 提示框、--- 分隔线、无序/有序列表（含 · 分点）、
- * SVG 图块（白名单消毒后原样呈现）、段落；
- * 行内：`行内码`、**粗体**、==高亮==。不解析链接与图片（收敛可点击面）。
- * 产出仅含 <pre><code><ul><ol><li><p><br><strong><h3><blockquote><hr><mark>
- * 与消毒后的 SVG 子树这些自拼标签，样式由组件侧 :deep() 提供。
+ * 领航台消息的 Markdown 渲染：markdown-it 解析（html:false 全转义）+ SVG 图块独立白名单消毒。
+ * 用户消息、助手回答、历史回放与流式终态共用本入口；原生 HTML 一律转义，链接经协议白名单，
+ * SVG 走 sanitizeSvg 独立信任边界（白名单消毒后图卡呈现）。样式由组件侧 :deep() 提供。
  */
+import MarkdownIt from 'markdown-it'
+import mark from 'markdown-it-mark'
 
 const ESCAPES: Record<string, string> = {
   '&': '&amp;',
@@ -16,206 +15,214 @@ const ESCAPES: Record<string, string> = {
 }
 
 function escapeHtml(s: string): string {
-  return s.replace(/[&<>"']/g, (c) => ESCAPES[c])
+  return s.replace(/[&<>"']/g, (c) => ESCAPES[c]!)
 }
 
-/** 行内解析在已转义文本上进行：`code` 优先于 ==mark== 优先于 **bold**，成对为止不嵌套。 */
-function inline(escaped: string): string {
-  return escaped
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/==([^=]+)==/g, '<mark>$1</mark>')
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+const md = new MarkdownIt({ html: false, linkify: true, breaks: true })
+md.use(mark)
+
+/* 紧凑输出：块级标签间不产生换行，与既有对话气泡的视觉契约一致；
+   紧凑列表的段落 hidden 时不套 <p>（与默认渲染同判据） */
+md.renderer.rules.paragraph_open = (tokens, idx) => (tokens[idx]!.hidden ? '' : '<p>')
+md.renderer.rules.paragraph_close = (tokens, idx) => (tokens[idx]!.hidden ? '' : '</p>')
+md.renderer.rules.blockquote_open = () => '<blockquote>'
+md.renderer.rules.blockquote_close = () => '</blockquote>'
+md.renderer.rules.bullet_list_open = () => '<ul>'
+md.renderer.rules.bullet_list_close = () => '</ul>'
+md.renderer.rules.ordered_list_open = () => '<ol>'
+md.renderer.rules.ordered_list_close = () => '</ol>'
+md.renderer.rules.list_item_open = () => '<li>'
+md.renderer.rules.list_item_close = () => '</li>'
+md.renderer.rules.hr = () => '<hr>'
+md.renderer.rules.softbreak = () => '<br>'
+md.renderer.rules.fence = (tokens, idx) => {
+  const lang = tokens[idx]!.info.trim()
+  const cls = lang ? ` class="language-${md.utils.escapeHtml(lang)}"` : ''
+  return `<pre><code${cls}>${md.utils.escapeHtml(tokens[idx]!.content.replace(/\n$/, ''))}</code></pre>`
+}
+/* h1-h3 归 h3（聊天气泡视觉契约），h4-h6 真实级别 */
+const headingTagOf = (tag: string): string => {
+  const level = Number(tag.slice(1))
+  return level <= 3 ? 'h3' : `h${level}`
+}
+md.renderer.rules.heading_open = (tokens, idx) => `<${headingTagOf(tokens[idx]!.tag)}>`
+md.renderer.rules.heading_close = (tokens, idx) => `</${headingTagOf(tokens[idx]!.tag)}>`
+
+/* 表格：pilot-table 包裹与对齐样式契约 */
+md.renderer.rules.table_open = () => '<div class="pilot-table-wrap"><table class="pilot-table">'
+md.renderer.rules.table_close = () => '</table></div>'
+md.renderer.rules.thead_open = () => '<thead>'
+md.renderer.rules.thead_close = () => '</thead>'
+md.renderer.rules.tbody_open = () => '<tbody>'
+md.renderer.rules.tbody_close = () => '</tbody>'
+md.renderer.rules.tr_open = () => '<tr>'
+md.renderer.rules.tr_close = () => '</tr>'
+type RenderRule = NonNullable<MarkdownIt['renderer']['rules']['th_open']>
+const cellOpen = (tag: 'th' | 'td'): RenderRule => (tokens, idx) => {
+  const style = tokens[idx]!.attrGet('style')
+  if (!style) return `<${tag}>`
+  return `<${tag} style="text-align: ${style.replace(/^text-align:/, '').trim()}">`
+}
+md.renderer.rules.th_open = cellOpen('th')
+md.renderer.rules.th_close = () => '</th>'
+md.renderer.rules.td_open = cellOpen('td')
+md.renderer.rules.td_close = () => '</td>'
+
+/* 任务列表：列表项首段 [ ]/[x] 前缀换成纯展示 checkbox */
+md.core.ruler.after('inline', 'pilot_task_list', (state) => {
+  const tokens = state.tokens
+  for (let i = 0; i < tokens.length; i++) {
+    const inlineTok = tokens[i]
+    if (!inlineTok || inlineTok.type !== 'inline') continue
+    if (tokens[i - 1]?.type !== 'paragraph_open' || tokens[i - 2]?.type !== 'list_item_open') continue
+    const first = inlineTok.children?.[0]
+    if (!first || first.type !== 'text') continue
+    const m = /^\[([ xX])\]\s+/.exec(first.content)
+    if (!m) continue
+    const box = new state.Token('html_inline', '', 0)
+    box.content = `<input type="checkbox" disabled${m[1] === ' ' ? '' : ' checked'}>`
+    first.content = first.content.slice(m[0].length)
+    inlineTok.children!.unshift(box)
+  }
+})
+
+/* 预处理：围栏外的自有语法归一（·/•/* 分点统一为 - 防止换弹头断列，
+   「1、」中文序号；均要求后随空白，与旧行为同界） */
+function normalizeLine(line: string): string {
+  return line
+    .replace(/^(\s*)[*·•]\s+/, '$1- ')
+    .replace(/^(\s*)(\d+)、\s+/, '$1$2. ')
 }
 
-const UL_RE = /^\s*(?:[-*·•])\s+(.*)$/
-const OL_RE = /^\s*(\d+)[.、)]\s+(.*)$/
-const H_RE = /^\s*#{1,3}\s+(.+)$/
-const QUOTE_RE = /^\s*>\s?(.*)$/
-const HR_RE = /^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/
-const TABLE_DELIM_RE = /^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)+\|?\s*$/
-
-function parseTableRow(line: string): string[] {
-  let trimmed = line.trim()
-  if (trimmed.startsWith('|')) trimmed = trimmed.slice(1)
-  if (trimmed.endsWith('|')) trimmed = trimmed.slice(0, -1)
-  return trimmed.split('|').map((c) => c.trim())
+function isFenceOpen(line: string): RegExpExecArray | null {
+  return /^\s*(`{3,}|~{3,})/.exec(line)
 }
 
-function parseTableAligns(line: string): Array<'left' | 'center' | 'right' | null> {
-  return parseTableRow(line).map((cell) => {
-    const left = cell.startsWith(':')
-    const right = cell.endsWith(':')
-    if (left && right) return 'center'
-    if (right) return 'right'
-    if (left) return 'left'
-    return null
-  })
+function fenceCloseRe(ch: string, len: number): RegExp {
+  return new RegExp('^\\s*' + ch + '{' + len + ',}')
 }
 
-function renderTable(headers: string[], aligns: Array<'left' | 'center' | 'right' | null>, rows: string[][]): string {
-  const ths = headers
-    .map((h, idx) => {
-      const align = aligns[idx] ? ` style="text-align: ${aligns[idx]}"` : ''
-      return `<th${align}>${inline(escapeHtml(h))}</th>`
-    })
-    .join('')
-  const trs = rows
-    .map((r) => {
-      const tds = r
-        .map((c, idx) => {
-          const align = aligns[idx] ? ` style="text-align: ${aligns[idx]}"` : ''
-          return `<td${align}>${inline(escapeHtml(c))}</td>`
-        })
-        .join('')
-      return `<tr>${tds}</tr>`
-    })
-    .join('')
-  return `<div class="pilot-table-wrap"><table class="pilot-table"><thead><tr>${ths}</tr></thead><tbody>${trs}</tbody></table></div>`
+/* GFM 表格行内代码中的裸竖线按规范会切列；本产品契约要求码内竖线保字面，
+   故对表格各行的码段内裸竖线补 \| 转义（已是 \| 的不动）。 */
+const TABLE_DELIM_RE = /^\s*\|?\s*:?-{1,}:?\s*(?:\|\s*:?-{1,}:?\s*)+\|?\s*$|^\s*\|?\s*:?-{1,}:?\s*\|?\s*$/
+
+function tableCellCount(line: string): number {
+  let t = line.trim()
+  if (t.startsWith('|')) t = t.slice(1)
+  if (t.endsWith('|')) t = t.slice(0, -1)
+  if (!t) return 0
+  return t.split(/(?<!\\)\|/).length
 }
 
-export function mdLiteToHtml(src: string, opts?: MdLiteOpts): string {
-  const lines = (src || '').replace(/\r\n?/g, '\n').split('\n')
+function protectCodeSpans(line: string): string {
+  return line.replace(/(`+)[^`]*?\1/g, (m) => (m.includes('|') ? m.replace(/(?<!\\)\|/g, '\\|') : m))
+}
+
+function protectTableCodePipes(src: string): string {
+  const lines = src.split('\n')
+  let fence: { ch: string; len: number } | null = null
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!
+    if (fence) {
+      if (fenceCloseRe(fence.ch, fence.len).test(line)) fence = null
+      continue
+    }
+    const open = isFenceOpen(line)
+    if (open) {
+      const marker = open[1]!
+      fence = { ch: marker[0]!, len: marker.length }
+      continue
+    }
+    const next = lines[i + 1]
+    if (!line.includes('|') || !next || !TABLE_DELIM_RE.test(next)) continue
+    if (tableCellCount(line) !== tableCellCount(next)) continue
+    lines[i] = protectCodeSpans(line)
+    for (let j = i + 2; j < lines.length; j++) {
+      const row = lines[j]!
+      if (!row.trim() || !row.includes('|')) break
+      lines[j] = protectCodeSpans(row)
+    }
+  }
+  return lines.join('\n')
+}
+
+/* SVG 前置分离器：把 SVG 块从源文摘出换成占位行，markdown-it 只渲染剩余纯 Markdown；
+   渲染后按占位回填图卡，保持「Markdown 解析」与「SVG 消毒」两条信任边界互不污染 */
+const PUA_OPEN = '\uE000'
+const PUA_CLOSE = '\uE001'
+const SVG_HEAD_LINE_RE = /^\s*(?:<\?[\s\S]*?\?>|<!DOCTYPE[\s\S]*?>|<!--[\s\S]*?-->)\s*$/i
+
+function prepareSource(src: string, opts?: MdLiteOpts): { text: string; cards: string[] } {
+  const lines = src.split('\n')
   const out: string[] = []
-  let para: string[] = []
-  let quote: string[] = []
-  let list: { kind: 'ul' | 'ol'; items: string[] } | null = null
-  let code: string[] | null = null
+  const cards: string[] = []
+  let fence: { ch: string; len: number } | null = null
+  let fenceBuf: string[] = []
+  let fenceOpenLine = ''
 
-  const flushPara = () => {
-    if (para.length) {
-      out.push(`<p>${inline(escapeHtml(para.join('\n'))).replace(/\n/g, '<br>')}</p>`)
-      para = []
-    }
-  }
-  const flushQuote = () => {
-    if (quote.length) {
-      out.push(`<blockquote><p>${inline(escapeHtml(quote.join('\n'))).replace(/\n/g, '<br>')}</p></blockquote>`)
-      quote = []
-    }
-  }
-  const flushList = () => {
-    if (list) {
-      out.push(
-        `<${list.kind}>${list.items.map((it) => `<li>${inline(it)}</li>`).join('')}</${list.kind}>`,
-      )
-      list = null
-    }
-  }
-  const flushBlocks = () => {
-    flushPara()
-    flushQuote()
-    flushList()
+  const emitFence = (body: string, closed: boolean): boolean => {
+    const hasSvgStart = /<\?xml[\s\S]*?<svg[\s>]|<!--[\s\S]*?<svg[\s>]|^\s*<svg[\s>]/i.test(body)
+    const svgDoc = extractSvgDoc(body) ?? (closed || !hasSvgStart ? null : extractSvgDoc(body, true))
+    if (!svgDoc) return false
+    out.push(`${PUA_OPEN}${cards.length}${PUA_CLOSE}`)
+    cards.push(renderSvg(svgDoc, opts, body))
+    return true
   }
 
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i]!
-    if (code !== null) {
-      if (/^\s*```/.test(raw)) {
-        const body = code.join('\n')
-        // 围栏里整块就是一张图时按图渲染（模型几乎总给 SVG 套 ```xml/```svg 围栏）
-        const svgDoc = extractSvgDoc(body)
-        out.push(
-          svgDoc
-            ? renderSvg(svgDoc, opts, body)
-            : `<pre><code>${escapeHtml(body)}</code></pre>`,
-        )
-        code = null
+    if (fence) {
+      if (fenceCloseRe(fence.ch, fence.len).test(raw)) {
+        if (!emitFence(fenceBuf.join('\n'), true)) out.push(fenceOpenLine, ...fenceBuf, raw)
+        fence = null
+        fenceBuf = []
       } else {
-        code.push(raw)
+        fenceBuf.push(raw)
       }
       continue
     }
-    if (/^\s*```/.test(raw)) {
-      flushBlocks()
-      code = []
+    const open = isFenceOpen(raw)
+    if (open) {
+      const marker = open[1]!
+      fence = { ch: marker[0]!, len: marker.length }
+      fenceBuf = []
+      fenceOpenLine = raw
       continue
     }
-    // SVG 图块：块级提取（<svg …</svg>，可跨行），消毒后整体呈现；
-    // 流式期未闭合的尾部挂占位，避免原始标记闪现
-    {
-      const open = SVG_OPEN_RE.exec(raw)
-      if (open) {
-        if (para.length && para.every((p) => /^\s*(?:<\?xml|<!DOCTYPE|<!--)[\s\S]*(?:\?>|>|-->)\s*$/i.test(p))) {
-          para = []
-        }
-        flushBlocks()
-        if (open.index > 0) para.push(raw.slice(0, open.index))
-        const buf: string[] = [raw.slice(open.index)]
-        const end = collectSvg(lines, i, buf)
-        out.push(renderSvg(buf.join('\n'), opts))
-        if (end.tail) para.push(end.tail)
-        i = end.i
-        continue
-      }
-    }
-    if (HR_RE.test(raw)) {
-      flushBlocks()
-      out.push('<hr>')
+    const svgAt = SVG_OPEN_RE.exec(raw)
+    if (svgAt) {
+      // 图前紧邻的 XML 头/DOCTYPE/注释行按既有行为吞掉，不进正文
+      while (out.length && SVG_HEAD_LINE_RE.test(out[out.length - 1]!)) out.pop()
+      if (out.length && out[out.length - 1] !== '') out.push('')
+      if (svgAt.index > 0) out.push(raw.slice(0, svgAt.index))
+      const buf: string[] = [raw.slice(svgAt.index)]
+      const end = collectSvg(lines, i, buf)
+      out.push(`${PUA_OPEN}${cards.length}${PUA_CLOSE}`)
+      cards.push(renderSvg(buf.join('\n'), opts))
+      if (end.tail) out.push('', end.tail)
+      else out.push('')
+      i = end.i
       continue
     }
-    if (!raw.trim()) {
-      flushBlocks()
-      continue
-    }
-    // 表格识别：当前行含竖线且下一行为分割线
-    const nextLine = lines[i + 1]
-    if (raw.includes('|') && nextLine && TABLE_DELIM_RE.test(nextLine)) {
-      flushBlocks()
-      const headers = parseTableRow(raw)
-      const aligns = parseTableAligns(nextLine)
-      i++ // 跳过分割线
-      const rows: string[][] = []
-      while (i + 1 < lines.length && lines[i + 1]!.includes('|') && lines[i + 1]!.trim()) {
-        i++
-        rows.push(parseTableRow(lines[i]!))
-      }
-      out.push(renderTable(headers, aligns, rows))
-      continue
-    }
-    const h = H_RE.exec(raw)
-    if (h) {
-      flushBlocks()
-      out.push(`<h3>${inline(escapeHtml(h[1]))}</h3>`)
-      continue
-    }
-    const q = QUOTE_RE.exec(raw)
-    if (q) {
-      flushPara()
-      flushList()
-      quote.push(q[1])
-      continue
-    }
-    const ul = UL_RE.exec(raw)
-    const ol = ul ? null : OL_RE.exec(raw)
-    if (ul || ol) {
-      flushPara()
-      flushQuote()
-      const kind = ul ? 'ul' : 'ol'
-      const text = ul ? ul[1] : ol![2]
-      if (!list || list.kind !== kind) {
-        flushList()
-        list = { kind, items: [] }
-      }
-      list.items.push(escapeHtml(text))
-      continue
-    }
-    flushQuote()
-    flushList()
-    para.push(raw)
+    out.push(normalizeLine(raw))
   }
-  if (code !== null) {
-    // 围栏未闭合（流式途中）：若包含 SVG 片段，进行渐进式实时出图渲染
-    const body = code.join('\n')
-    const hasSvgStart = /<\?xml[\s\S]*?<svg[\s>]|<!--[\s\S]*?<svg[\s>]|^\s*<svg[\s>]/i.test(body)
-    const svgDoc = hasSvgStart ? extractSvgDoc(body, true) : null
-    out.push(
-      svgDoc
-        ? renderSvg(svgDoc, opts, body)
-        : `<pre><code>${escapeHtml(body)}</code></pre>`,
-    )
+  if (fence) {
+    if (!emitFence(fenceBuf.join('\n'), false)) out.push(fenceOpenLine, ...fenceBuf)
   }
-  flushBlocks()
-  return out.join('')
+  return { text: out.join('\n'), cards }
+}
+
+export function mdLiteToHtml(src: string, opts?: MdLiteOpts): string {
+  const prepared = prepareSource((src || '').replace(/\r\n?/g, '\n'), opts)
+  const html = md.render(protectTableCodePipes(prepared.text))
+  return html
+    .replace(/<p>\uE000(\d+)\uE001<\/p>/g, (_, n) => prepared.cards[Number(n)] ?? '')
+    .replace(/\uE000(\d+)\uE001/g, (_, n) => prepared.cards[Number(n)] ?? '')
+}
+
+/** 行内级渲染：带引用胶囊的消息按片段行内渲染（粗斜体/行内码/链接同契约），块级结构让位胶囊流 */
+export function mdLiteInlineToHtml(src: string): string {
+  return md.renderInline(src || '')
 }
 
 /* ───────────────────────── SVG 图块（白名单消毒与交互式展示） ─────────────────────────
@@ -407,7 +414,7 @@ function sanitizeCss(css: string): string | null {
     .replace(/\]\]>/g, '')
     .trim()
   if (!clean) return ''
-  if (/(?:javascript|vbscript|expression|behavior)\s*:/i.test(clean)) return null
+  if (/(?:javascript|vbscript|expression|behavior)\s*(?::|\()/i.test(clean)) return null
   if (/@import/i.test(clean)) return null
   if (/-moz-binding/i.test(clean)) return null
   if (/<\/?(?:script|style)/i.test(clean)) return null
