@@ -934,10 +934,11 @@ async def _job_subscription_refresh() -> None:
 
 
 async def _job_proxy_health() -> None:
-    """代理体检：手动代理池全测 + 订阅健康摘要（按权威节点账本聚合，不做探测）。
+    """代理体检：手动代理池全测。
 
-    节点级探测归池维护（5min 拍内的 L1/L2）；本任务只把已落账事实聚合成
-    订阅行口径并驱动降级判定，替代旧的 6h 全量重测。
+    节点级探测归池维护（5min 拍内的 L1/L2）；订阅健康摘要由 30 分钟重拉拍
+    聚合并驱动降级判定（原 6h 重复聚合退役——同一账本同口径，30 分钟拍
+    更早发现劣化）。
     """
     if not await content_fetch_enabled("proxy.health_auto"):
         await scheduler_bridge_note("proxy_health", {"skipped": "自动节点体检已关闭"})
@@ -950,13 +951,6 @@ async def _job_proxy_health() -> None:
             await proxies_service.test_all()
         except Exception:  # noqa: BLE001
             log_event(logger, "代理节点体检失败", level=logging.ERROR, exc_info=True)
-
-    try:
-        state = await proxies_service.refresh_subscription_health_summary()
-        if state == "refreshed":
-            log_event(logger, "订阅健康摘要已按节点账本刷新")
-    except Exception:  # noqa: BLE001
-        log_event(logger, "订阅健康摘要刷新失败", level=logging.ERROR, exc_info=True)
 
     # 体检后判定通道健康度：全灭 / 可用占比过低才发告警（12h 冷却，
     # 未配置任何通道视为用户选择，不告警）
