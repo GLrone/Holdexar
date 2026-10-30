@@ -1,7 +1,7 @@
 /**
  * Holdexar Structured UI System — 组件统一注册中心。
  *
- * 集中管理系统全部结构化展示组件的元数据、Schema 契约、渲染器绑定及 Agent 发现目录。
+ * 集中管理系统全部结构化展示组件的元数据、Schema 契约、渲染器绑定。
  */
 import type { Component } from 'vue'
 import type { ComponentMeta, StructuredBlock } from './types'
