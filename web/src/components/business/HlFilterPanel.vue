@@ -60,12 +60,16 @@ function handleSelectRegion(code: string) {
 }
 
 /* 持久化的旧筛选可能指向已停用的区（下拉收敛后不可见）：自动回落国区，
-   避免价格区间按一个无数据区筛选出空列表 */
+   避免价格区间按一个无数据区筛选出空列表。immediate 覆盖「先开其他页、
+   区服已加载完再进本页」的进入序——此时 options 恒定，无 immediate 则
+   watch 永不触发，持久化停用区残留直接筛出空列表；空 opts = 区服未
+   就绪，不动持久化值，等异步到位后再校验 */
 watch(priceRegionOptions, (opts) => {
+  if (!opts.length) return
   if (!opts.some((r) => r.code.toLowerCase() === store.filterRegion)) {
     store.setFilter('filterRegion', 'cn')
   }
-})
+}, { immediate: true })
 
 function handleSelectDiffType(type: 'absolute' | 'percent') {
   store.setFilter('diffType', type)
