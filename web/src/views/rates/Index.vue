@@ -103,11 +103,9 @@ async function load(withReveal = false) {
 }
 
 async function loadHistory() {
-  try {
-    history.value = await ratesApi.history(selectedCurrency.value, range.value)
-  } catch {
-    history.value = []
-  }
+  // 失败保留已有走势不动，错误上抛给调用方提示——静默清空会让瞬时故障
+  // 冒充「该区间无数据」，与同页主列表的失败提示口径一致
+  history.value = await ratesApi.history(selectedCurrency.value, range.value)
 }
 
 async function refresh() {
@@ -144,11 +142,13 @@ async function revealChart() {
 
 watch(selectedCurrency, () => {
   animateChart.value = false // 币种整体换数据，走展开动画，不叠加数据过渡
-  loadHistory().then(revealChart)
+  loadHistory()
+    .then(revealChart)
+    .catch((e) => message.error(e instanceof Error ? e.message : String(e)))
 })
 watch(range, () => {
   animateChart.value = true
-  loadHistory()
+  loadHistory().catch((e) => message.error(e instanceof Error ? e.message : String(e)))
 })
 
 watch(history, async () => {

@@ -14,6 +14,7 @@ const { t } = useI18n()
 
 const loading = ref(true)
 const exporting = ref(false)
+const loadFailed = ref(false)
 const stats = ref<PilotFlywheelStats | null>(null)
 
 const accepted = computed(() => stats.value?.by_feedback?.accepted ?? 0)
@@ -47,10 +48,12 @@ const intentRows = computed(() => {
 
 async function load() {
   loading.value = true
+  loadFailed.value = false
   try {
     stats.value = await pilotApi.flywheel()
   } catch {
-    stats.value = null
+    // 保留旧 stats 不清：失败要显式提示，不冒充「暂无数据」
+    loadFailed.value = true
   } finally {
     loading.value = false
   }
@@ -95,6 +98,13 @@ defineExpose({ reload: load })
     </div>
 
     <HlSkeleton v-if="loading" :rows="2" />
+
+    <div v-else-if="loadFailed" class="fw__failed" role="status">
+      {{ t('pilot.flywheel.loadFailed') }}
+      <HlButton size="sm" variant="text" @click="load">
+        {{ t('pilot.flywheel.retry') }}
+      </HlButton>
+    </div>
 
     <HlEmpty v-else-if="!hasData" size="sm" :text="t('pilot.flywheel.empty')" />
 
@@ -152,6 +162,12 @@ defineExpose({ reload: load })
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
+}
+
+.fw__failed {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .fw__heading {
