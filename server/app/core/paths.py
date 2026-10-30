@@ -295,7 +295,4 @@ __all__ = [
     "read_dev_pointer",
     "resolve_data_dir",
     "staging_dir",
-    "state_dir",
-    "updater_dir",
-    "versions_dir",
 ]
