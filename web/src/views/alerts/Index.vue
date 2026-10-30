@@ -1,898 +1,340 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
-import { useRouter } from 'vue-router'
-import { ElMessageBox } from 'element-plus'
-import { Delete, Edit, Plus, Search } from '@element-plus/icons-vue'
-
-import {
-  alertsApi,
-  ratesApi,
-  type AlertEventItem,
-  type PriceAlertItem,
-  type GameSearchResult,
-} from '@/api/client'
-import { formatCnyFen, flagUrl } from '@/api/regions'
-import { currencyName, formatMinor } from '@/api/currencies'
-import { pilotCoverUrl } from '@/lib/pilotView'
-import { useI18n } from '@/locales'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { alertsApi, notificationsApi, type AlertEventItem, type FeaturedConfig, type NotificationCandidate, type NotificationCondition, type NotificationFrequency, type NotificationPrefs, type NotificationPrefsUpdate, type NotificationStats, type PriceAlertDraft, type PriceAlertItem, type RuleEvaluation, type GameSearchResult } from '@/api/client'
+import { formatMinor } from '@/api/currencies'
+import { regionSelectOptions } from '@/api/selectOptions'
+import { amountToMinor, minorToInput } from '@/lib/notificationForms'
+import { useI18n, type MessageKey } from '@/locales'
 import { useRegionsStore } from '@/stores/regions'
 import RegionFlag from '@/components/RegionFlag.vue'
-import HlSelect, { type HlSelectOption } from '@/components/ui/HlSelect.vue'
-import HlImg from '@/components/ui/HlImg.vue'
-import HlTooltip from '@/components/ui/HlTooltip.vue'
-import { HlEmpty, message } from '@/components/ui'
+import CurrencyFlag from '@/components/CurrencyFlag.vue'
+import { HlButton, HlDialog, HlEmpty, HlInput, HlSelect, HlTabs, message } from '@/components/ui'
 
 const { t } = useI18n()
-const router = useRouter()
-const regionsStore = useRegionsStore()
-
-const alerts = ref<PriceAlertItem[]>([])
-const events = ref<AlertEventItem[]>([])
+const c = (key: string, params?: Record<string, string | number>) => t(`alerts.center.${key}` as MessageKey, params)
+const regions = useRegionsStore()
+const tab = ref('overview')
+const tabs = computed(() => ['overview', 'types', 'rules', 'history'].map(key => ({ key, label: c(key) })))
 const loading = ref(true)
-
-// ─── 添加规则：游戏搜索 ───
-const searchQuery = ref('')
-const searchResults = ref<GameSearchResult[]>([])
-const searchError = ref('')
-const searching = ref(false)
-const selectedGame = ref<GameSearchResult | null>(null)
-
-const form = reactive({
-  appid: 0,
-  region: 'CN',
-  targetType: 'price',
-  targetValue: '',
-})
-
-/** 地区下拉选项（带国旗） */
-const regionSelectOptions = computed<HlSelectOption[]>(() =>
-  regionsStore.metas.map((r) => ({
-    value: r.code,
-    label: r.name,
-    flag: flagUrl(r.code),
-  })),
-)
-
-/** 目标类型下拉选项。**computed 而非模块级常量**：模块级常量只在模块加载时求值一次，
- *  里面的 t() 会把语言冻死在那一刻；computed 在渲染期求值，切语言即重算。 */
-const targetTypeOptions = computed<HlSelectOption[]>(() => [
-  { value: 'price', label: t('alerts.rules.optionPrice') },
-  { value: 'pct', label: t('alerts.rules.optionPct') },
-  { value: 'historic_low', label: t('alerts.rules.optionHistoricLow') },
-])
-
-const targetText = computed(() => {
-  if (form.targetType === 'historic_low') return t('alerts.rules.hintHistoric')
-  if (form.targetType === 'price') return t('alerts.rules.hintPrice')
-  return t('alerts.rules.hintPct')
-})
-
-// ─── 元 ↔ 该区货币换算（阈值统一按人民币元设置，外区规则悬停换算）───
-// 汇率取 GET /rates 现值（rateToCny = 1 单位外币兑人民币元）；拉取失败只
-// 是换算气泡不展示，规则增删改不受影响。
-const rateMap = ref<Map<string, number>>(new Map())
-
-const regionCurrencyMap = computed(() => {
-  const m = new Map<string, string>()
-  regionsStore.metas.forEach((r) => m.set(r.code.toUpperCase(), (r.currency || 'CNY').toUpperCase()))
-  return m
-})
-
-function regionCurrency(region: string): string {
-  return regionCurrencyMap.value.get(region.toUpperCase()) ?? 'CNY'
+const busy = ref(false)
+const error = ref('')
+const prefs = ref<NotificationPrefs | null>(null)
+const stats = ref<NotificationStats | null>(null)
+const rules = ref<PriceAlertItem[]>([])
+const candidates = ref<NotificationCandidate[]>([])
+const legacyEvents = ref<AlertEventItem[]>([])
+const manualRegion = ref('')
+const regionOptions = computed(() => [{ value: '', label: c('unknownRegion') }, ...regionSelectOptions(undefined, { withCurrency: true })])
+const windows = computed(() => [0, 90, 180, 365].map(value => ({ value, label: value ? c('windowDays', { days: value }) : c('allHistory') })))
+const frequencies = computed(() => ['immediate', 'daily', 'weekly', 'off'].map(value => ({ value, label: c(`frequency.${value}`) })))
+const ruleTypes = computed(() => ['price', 'pct', 'historic_low', 'new_low'].map(value => ({ value, label: c(`ruleType.${value}`) })))
+const repeats = computed(() => ['once', 'cooldown', 'always'].map(value => ({ value, label: c(`repeat.${value}`) })))
+const effectiveCurrency = computed(() => prefs.value?.region.currency || '')
+const latestMatch = computed(() => candidates.value.map(item => item.createdAt).filter((value): value is string => !!value).sort().at(-1))
+const dateText = (value?: string | null) => value ? value.slice(0, 19).replace('T', ' ') : c('noRecord')
+function typeLabel(key: string) {
+  const translated = c(`type.${key}`)
+  return translated.startsWith('alerts.center.') ? c('otherType') : translated
 }
-
-function isForeignRegion(region: string): boolean {
-  return regionCurrency(region) !== 'CNY'
+function statusLabel(key: string) {
+  const translated = c(`status.${key}`)
+  return translated.startsWith('alerts.center.') ? c('status.unknown') : translated
 }
-
-/** 人民币分 → 该区货币最小单位（无汇率返回 null） */
-function cnyFenToLocal(cnyFen: number, region: string): number | null {
-  const rate = rateMap.value.get(regionCurrency(region))
-  return rate ? Math.round(cnyFen / rate) : null
+function priceText(price?: number | null, currency?: string | null) {
+  return price != null && currency ? `${formatMinor(price, currency)} (${currency})` : c('unconfirmedPrice')
 }
-
-/** 元输入的实时换算气泡：仅 price 类 + 外区 + 合法正数时非空 */
-function convertHint(region: string, type: string, valueStr: string): string {
-  if (type !== 'price' || !isForeignRegion(region)) return ''
-  const v = Number(valueStr)
-  if (!valueStr.trim() || !Number.isFinite(v) || v <= 0) return ''
-  const local = cnyFenToLocal(Math.round(v * 100), region)
-  if (local === null) return ''
-  const currency = regionCurrency(region)
-  return t('alerts.rules.convertHint', { value: formatMinor(local, currency), name: currencyName(currency) })
+function fail(cause: unknown) {
+  error.value = cause instanceof Error ? cause.message : String(cause)
+  message.error(error.value)
 }
-
-const addConvertHint = computed(() => convertHint(form.region, form.targetType, form.targetValue))
-const editConvertHint = computed(() =>
-  editingId.value === null ? '' : convertHint(editForm.region, editForm.targetType, editForm.targetValue),
-)
-
-/** 规则条件列的悬停换算文本（price 类外区规则：¥ 目标位 → 本币约价） */
-function ruleHoverText(row: PriceAlertItem): string {
-  if (row.targetType !== 'price' || row.targetValue === null || !isForeignRegion(row.region)) return ''
-  const local = cnyFenToLocal(row.targetValue, row.region)
-  if (local === null) return ''
-  const currency = regionCurrency(row.region)
-  return t('alerts.rules.convertHint', { value: formatMinor(local, currency), name: currencyName(currency) })
-}
-
-/** 历史行「当时价格」主文本：人民币快照优先，无快照的旧事件回退本币文本 */
-function eventPriceText(row: AlertEventItem): string {
-  if (row.priceCny !== null) return formatCnyFen(row.priceCny)
-  return row.priceText || '—'
-}
-
-/** 历史行「当时价格」悬停文本：外区且有人民币快照时展示本币原价 */
-function eventHoverText(row: AlertEventItem): string {
-  return row.priceCny !== null && isForeignRegion(row.region) ? row.priceText : ''
-}
-
-async function searchGames() {
-  const q = searchQuery.value.trim()
-  if (!q) return
-  searching.value = true
-  searchError.value = ''
-  try {
-    const res = await alertsApi.search(q, form.region)
-    searchResults.value = res.items
-    searchError.value = res.error ?? ''
-    if (res.items.length === 0 && searchError.value) {
-      message.warning(searchError.value)
-    }
-  } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
-  } finally {
-    searching.value = false
-  }
-}
-
-function selectGame(game: GameSearchResult) {
-  selectedGame.value = game
-  form.appid = game.appid
-  searchResults.value = []
-  searchQuery.value = game.name || String(game.appid)
-}
-
-function clearSearch() {
-  selectedGame.value = null
-  searchResults.value = []
-  searchError.value = ''
-  searchQuery.value = ''
-  form.appid = 0
-}
-
 async function load() {
   loading.value = true
+  error.value = ''
   try {
-    alerts.value = await alertsApi.list()
-    events.value = await alertsApi.events(50)
-  } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
-  } finally {
-    loading.value = false
-  }
+    const [config, counts, saved, history, old] = await Promise.all([
+      notificationsApi.prefs(), notificationsApi.stats(), alertsApi.list(), notificationsApi.candidates(), alertsApi.events(50), regions.load(),
+    ])
+    prefs.value = config
+    stats.value = counts
+    rules.value = saved
+    candidates.value = history.items
+    legacyEvents.value = old
+    manualRegion.value = config.manualRegion?.toLowerCase() || ''
+    if (!draft.region && config.region.region) draft.region = config.region.region.toLowerCase()
+    resetFeatured()
+  } catch (cause) { fail(cause) }
+  finally { loading.value = false }
+}
+async function patch(payload: NotificationPrefsUpdate) {
+  busy.value = true
+  try { prefs.value = await notificationsApi.updatePrefs(payload); message.success(c('saved')) }
+  catch (cause) { fail(cause) }
+  finally { busy.value = false }
+}
+async function setType(key: string, value: string | number | Array<string | number>) {
+  await patch({ types: { [key]: { frequency: String(value) as NotificationFrequency, enabled: value !== 'off' } } })
 }
 
-async function add() {
-  if (!form.appid) {
-    message.warning(t('alerts.toast.selectGameFirst'))
-    return
-  }
-  let value = form.targetValue.trim() === '' ? undefined : Number(form.targetValue)
-  if (form.targetType !== 'historic_low' && value === undefined) {
-    message.warning(t('alerts.toast.enterTarget'), { iconImageUrl: pilotCoverUrl(form.appid) })
-    return
-  }
-  // price 类按元输入 → 人民币分（阈值口径）；pct 保持百分数
-  if (form.targetType === 'price' && value !== undefined) value = Math.round(value * 100)
-  try {
-    await alertsApi.add(form.appid, form.region, form.targetType, value)
-    message.success(t('alerts.toast.added'), { iconImageUrl: pilotCoverUrl(form.appid) })
-    clearSearch()
-    form.targetValue = ''
-    await load()
-  } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e), { iconImageUrl: pilotCoverUrl(form.appid) })
-  }
-}
-
-async function toggle(alert: PriceAlertItem) {
-  await alertsApi.update(alert.id, { active: !alert.active })
-  message.success(alert.active ? t('alerts.toast.disabled') : t('alerts.toast.enabled'), {
-    iconImageUrl: pilotCoverUrl(alert.appid),
-  })
-  await load()
-}
-
-async function remove(alert: PriceAlertItem) {
-  /* 游戏名兜底（AppID 串）与整句一起走 {name} 参数：不做「删除 #」+「规则（」+「）？」
-     的片段拼接——中英括号形态与语序都不同，拼不出来。 */
-  const name = alert.gameName || `AppID ${alert.appid}`
-  const ok = await ElMessageBox.confirm(
-    t('alerts.rules.removeConfirm', { id: alert.id, name }),
-    t('alerts.rules.confirmTitle'),
-    { type: 'warning' },
-  ).then(() => true).catch(() => false)
-  if (!ok) return
-  try {
-    await alertsApi.remove(alert.id)
-    message.success(t('alerts.toast.removed', { id: alert.id }), { iconImageUrl: pilotCoverUrl(alert.appid) })
-    await load()
-  } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e), { iconImageUrl: pilotCoverUrl(alert.appid) })
-  }
-}
-
-// ─── 触发历史删除（单条 / 全部）───
-async function removeEvent(ev: AlertEventItem) {
-  const name = ev.gameName || `AppID ${ev.appid}`
-  const ok = await ElMessageBox.confirm(
-    t('alerts.history.removeConfirm', { name }),
-    t('alerts.rules.confirmTitle'),
-    { type: 'warning' },
-  ).then(() => true).catch(() => false)
-  if (!ok) return
-  try {
-    await alertsApi.removeEvent(ev.id)
-    message.success(t('alerts.toast.eventRemoved'), { iconImageUrl: pilotCoverUrl(ev.appid) })
-    await load()
-  } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e), { iconImageUrl: pilotCoverUrl(ev.appid) })
-  }
-}
-
-async function clearAllEvents() {
-  const ok = await ElMessageBox.confirm(
-    t('alerts.history.clearConfirm', { count: events.value.length }),
-    t('alerts.rules.confirmTitle'),
-    { type: 'warning' },
-  ).then(() => true).catch(() => false)
-  if (!ok) return
-  try {
-    const res = await alertsApi.clearEvents()
-    message.success(t('alerts.toast.historyCleared', { count: res.removed }))
-    await load()
-  } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
-  }
-}
-
-// ─── 编辑规则 ───
 const editingId = ref<number | null>(null)
-const editForm = reactive({
-  targetType: 'price',
-  targetValue: '',
-  region: 'CN',
-})
-
-function startEdit(alert: PriceAlertItem) {
-  editingId.value = alert.id
-  editForm.targetType = alert.targetType
-  // price 类阈值以人民币分存储，编辑时回显为元；pct 原样回显
-  editForm.targetValue =
-    alert.targetValue !== null
-      ? String(alert.targetType === 'price' ? alert.targetValue / 100 : alert.targetValue)
-      : ''
-  editForm.region = alert.region
+const draft = reactive({ appid: 0, region: '', targetType: 'price', amount: '', windowDays: 0, legacy: false, repeatMode: 'once' as 'once' | 'cooldown' | 'always', repeatHours: '24' })
+const search = ref('')
+const results = ref<GameSearchResult[]>([])
+const searching = ref(false)
+const draftCurrency = computed(() => draft.legacy ? 'CNY' : regions.metaByCode(draft.region)?.currency || '')
+const previewItems = ref<RuleEvaluation[]>([])
+const previewTotal = ref(0)
+const previewMatched = ref(0)
+const previewBusy = ref(false)
+const previewError = ref('')
+const previewKind = ref('')
+const previewStale = ref(false)
+watch(draft, () => { previewStale.value = true })
+async function searchGames() {
+  searching.value = true
+  try { const found = await alertsApi.search(search.value, draft.region || undefined); results.value = found.items; if (found.error) message.warning(found.error) }
+  catch (cause) { fail(cause) }
+  finally { searching.value = false }
 }
-
-function cancelEdit() {
+function chooseGame(game: GameSearchResult) { draft.appid = game.appid; search.value = game.name || String(game.appid); results.value = [] }
+function edit(rule: PriceAlertItem) {
+  editingId.value = rule.id
+  search.value = rule.gameName
+  Object.assign(draft, { appid: rule.appid, region: rule.region.toLowerCase(), targetType: rule.targetType, amount: rule.targetType === 'price' ? minorToInput(rule.targetValue) : String(rule.targetValue ?? ''), windowDays: rule.config?.windowDays || 0, legacy: rule.targetType === 'price' && !rule.config?.currency, repeatMode: rule.repeatMode || 'once', repeatHours: String(rule.repeatHours || 24) })
+  tab.value = 'rules'
+}
+function resetDraft() {
   editingId.value = null
+  search.value = ''
+  results.value = []
+  Object.assign(draft, { appid: 0, region: prefs.value?.region.region?.toLowerCase() || '', targetType: 'price', amount: '', windowDays: 0, legacy: false, repeatMode: 'once', repeatHours: '24' })
+  previewItems.value = []
 }
-
-async function saveEdit(alert: PriceAlertItem) {
-  let value = editForm.targetValue.trim() === '' ? undefined : Number(editForm.targetValue)
-  if (editForm.targetType !== 'historic_low' && value === undefined) {
-    message.warning(t('alerts.toast.enterTarget'), { iconImageUrl: pilotCoverUrl(alert.appid) })
-    return
+function rulePayload(): PriceAlertDraft {
+  if (!draft.appid || !draft.region) throw new Error(c('chooseGameRegion'))
+  const payload: PriceAlertDraft = { appid: draft.appid, region: draft.region.toUpperCase(), targetType: draft.targetType, repeatMode: draft.repeatMode, repeatHours: Number(draft.repeatHours), config: { windowDays: draft.windowDays || null } }
+  if (draft.targetType === 'price') {
+    if (!draftCurrency.value) throw new Error(c('unknownCurrency'))
+    const amount = amountToMinor(draft.amount)
+    if (amount === null) throw new Error(c('invalidAmount'))
+    payload.targetValue = amount
+    if (!draft.legacy) payload.config!.currency = draftCurrency.value
+  } else if (draft.targetType === 'pct') {
+    const amount = Number(draft.amount)
+    if (!draft.amount.trim() || !Number.isInteger(amount) || amount < 0 || amount > 100) throw new Error(c('invalidPercent'))
+    payload.targetValue = amount
   }
-  // price 类按元输入 → 人民币分（阈值口径）；pct 保持百分数
-  if (editForm.targetType === 'price' && value !== undefined) value = Math.round(value * 100)
+  return payload
+}
+async function saveRule() {
+  busy.value = true
   try {
-    await alertsApi.update(alert.id, {
-      targetType: editForm.targetType,
-      targetValue: value,
-      region: editForm.region,
-    })
-    message.success(t('alerts.toast.updated'), { iconImageUrl: pilotCoverUrl(alert.appid) })
-    editingId.value = null
-    await load()
-  } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e), { iconImageUrl: pilotCoverUrl(alert.appid) })
-  }
+    const payload = rulePayload()
+    if (editingId.value !== null) await alertsApi.update(editingId.value, payload)
+    else await alertsApi.add(payload.appid, payload.region, payload.targetType, payload.targetValue, payload)
+    rules.value = await alertsApi.list()
+    message.success(c('saved'))
+    resetDraft()
+  } catch (cause) { fail(cause) }
+  finally { busy.value = false }
+}
+async function toggleRule(rule: PriceAlertItem) {
+  busy.value = true
+  try { const updated = await alertsApi.update(rule.id, { active: !rule.active }); rules.value = rules.value.map(item => item.id === updated.id ? updated : item) }
+  catch (cause) { fail(cause) }
+  finally { busy.value = false }
+}
+const deleting = ref<PriceAlertItem | null>(null)
+const deleteOpen = computed({ get: () => deleting.value !== null, set: value => { if (!value) deleting.value = null } })
+async function removeRule() {
+  if (!deleting.value) return
+  busy.value = true
+  try { await alertsApi.remove(deleting.value.id); rules.value = rules.value.filter(item => item.id !== deleting.value!.id); deleting.value = null }
+  catch (cause) { fail(cause) }
+  finally { busy.value = false }
+}
+function ruleCondition(rule: PriceAlertItem) {
+  if (rule.targetType === 'price') return `${c('ruleType.price')} ${priceText(rule.targetValue, rule.config?.currency || 'CNY')}${!rule.config?.currency ? ` · ${c('legacyAmount')}` : ''}`
+  if (rule.targetType === 'pct') return `${c('ruleType.pct')} ${rule.targetValue}%`
+  return `${c(`ruleType.${rule.targetType}`)} · ${rule.config?.windowDays ? c('windowDays', { days: rule.config.windowDays }) : c('allHistory')}`
 }
 
-// ─── SMTP 邮件设置 ───
-const smtpLoading = ref(false)
-const smtpSaving = ref(false)
-const smtpForm = reactive({
-  host: '',
-  port: 465,
-  user: '',
-  password: '',
-  toAddr: '',
-  useSsl: true,
-})
-const smtpHasPassword = ref(false)
-const smtpMasked = ref('')
-
-async function loadSmtp() {
-  smtpLoading.value = true
+const featured = ref<FeaturedConfig | null>(null)
+const featuredAmounts = reactive({ minSavings: '', maxPrice: '', minPositiveRate: '', minReviews: '' })
+const scopes = ['followed', 'wishlist', 'owned', 'manual', 'catalog']
+const sorts = ['discount', 'price', 'savings', 'quality', 'followed', 'wishlist']
+function resetFeatured() {
+  if (!prefs.value?.featured) return
+  featured.value = { ...prefs.value.featured, scope: [...prefs.value.featured.scope] }
+  featuredAmounts.minSavings = minorToInput(featured.value.minSavings)
+  featuredAmounts.maxPrice = minorToInput(featured.value.maxPrice)
+  featuredAmounts.minPositiveRate = String(featured.value.minPositiveRate ?? '')
+  featuredAmounts.minReviews = String(featured.value.minReviews ?? '')
+}
+watch([featured, featuredAmounts], () => { if (previewKind.value === 'featured') previewStale.value = true }, { deep: true })
+function featuredPayload(): FeaturedConfig {
+  if (!featured.value) throw new Error(c('loadFailed'))
+  const config = { ...featured.value, scope: [...featured.value.scope] }
+  for (const key of ['minSavings', 'maxPrice'] as const) {
+    const input = featuredAmounts[key].trim()
+    config[key] = input ? amountToMinor(input) : null
+    if (input && (config[key] === null || !effectiveCurrency.value)) throw new Error(c('invalidAmount'))
+  }
+  for (const key of ['minPositiveRate', 'minReviews'] as const) {
+    const input = featuredAmounts[key].trim()
+    const value = Number(input)
+    if (input && (!Number.isSafeInteger(value) || value < 0 || (key === 'minPositiveRate' && value > 100))) throw new Error(c('invalidNumber'))
+    config[key] = input ? value : null
+  }
+  return config
+}
+function toggleScope(scope: string) {
+  if (!featured.value) return
+  featured.value.scope = featured.value.scope.includes(scope) ? featured.value.scope.filter(item => item !== scope) : [...featured.value.scope, scope]
+}
+async function saveFeatured() {
+  try { await patch({ featured: featuredPayload() }) }
+  catch (cause) { fail(cause) }
+}
+async function preview(kind: 'rule' | 'featured') {
+  previewBusy.value = true
+  previewError.value = ''
+  previewKind.value = kind
   try {
-    const cfg = await alertsApi.getSmtp()
-    smtpForm.host = cfg.host
-    smtpForm.port = cfg.port
-    smtpForm.user = cfg.user
-    smtpForm.toAddr = cfg.toAddr
-    smtpForm.useSsl = cfg.useSsl
-    smtpHasPassword.value = cfg.hasPassword
-    smtpMasked.value = cfg.password
-    smtpForm.password = ''
-  } catch {
-    // 静默
-  } finally {
-    smtpLoading.value = false
-  }
+    if (kind === 'rule') { const result = await alertsApi.preview(rulePayload()); previewItems.value = [result]; previewTotal.value = 1; previewMatched.value = Number(result.matched) }
+    else { const result = await alertsApi.featuredPreview(featuredPayload()); previewItems.value = result.items; previewTotal.value = result.total; previewMatched.value = result.matched; if (result.exclusions?.length) previewError.value = c('unknownRegion') }
+    previewStale.value = false
+  } catch (cause) { previewError.value = cause instanceof Error ? cause.message : String(cause); previewItems.value = [] }
+  finally { previewBusy.value = false }
 }
-
-async function saveSmtp() {
-  smtpSaving.value = true
-  try {
-    const payload = {
-      host: smtpForm.host,
-      port: smtpForm.port,
-      user: smtpForm.user,
-      password: smtpForm.password,
-      toAddr: smtpForm.toAddr,
-      useSsl: smtpForm.useSsl,
-    }
-    const cfg = await alertsApi.updateSmtp(payload)
-    smtpHasPassword.value = cfg.hasPassword
-    smtpMasked.value = cfg.password
-    smtpForm.password = ''
-    message.success(t('alerts.toast.smtpSaved'))
-  } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
-  } finally {
-    smtpSaving.value = false
-  }
+function conditionLabel(condition: NotificationCondition) {
+  const value = c(`condition.${condition.code}`)
+  return value.startsWith('alerts.center.') ? c('condition.other') : value
 }
-
-// ─── SMTP 连通性测试（发一封「欢迎使用 Holdexar」主题邮件）───
-const smtpTesting = ref(false)
-
-async function testSmtp() {
-  smtpTesting.value = true
-  try {
-    await alertsApi.testSmtp({
-      host: smtpForm.host,
-      port: smtpForm.port,
-      user: smtpForm.user,
-      password: smtpForm.password,
-      toAddr: smtpForm.toAddr,
-      useSsl: smtpForm.useSsl,
-    })
-    message.success(t('alerts.toast.testSent', { to: smtpForm.toAddr }))
-  } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
-  } finally {
-    smtpTesting.value = false
-  }
+function conditionNumbers(condition: NotificationCondition, evaluation: RuleEvaluation) {
+  const money = ['target_price', 'min_savings', 'max_price', 'low', 'new_low', 'no_baseline'].includes(condition.code)
+  const currency = condition.code === 'target_price' && evaluation.observed.thresholdBasis === 'legacy_cny' ? 'CNY' : evaluation.observed.currency
+  const actual = typeof condition.actual === 'number' ? (money ? priceText(condition.actual, currency) : String(condition.actual)) : ''
+  const expected = typeof condition.expected === 'number' ? (money ? priceText(condition.expected, currency) : String(condition.expected)) : ''
+  return actual || expected ? c('actualExpected', { actual: actual || c('missing'), expected: expected || c('missing') }) : ''
 }
-
-onMounted(() => {
-  load()
-  loadSmtp()
-  ratesApi
-    .list()
-    .then((res) => {
-      rateMap.value = new Map(res.rates.map((r) => [r.currency, r.rateToCny]))
-    })
-    .catch(() => {
-      /* 汇率不可用只影响换算气泡，页面其余功能不受影响 */
-    })
-})
+function candidatePrice(item: NotificationCandidate) { const value = item.payload; return priceText(value.price ?? value.current?.price, value.currency ?? value.current?.currency) }
+const historyPreview = ref<NotificationCandidate | null>(null)
+const historyOpen = computed({ get: () => historyPreview.value !== null, set: value => { if (!value) historyPreview.value = null } })
+onMounted(load)
 </script>
 
 <template>
-  <section class="alerts-page">
-    <!-- 添加规则 -->
-    <div class="card section-card" data-section="alerts.section.rules">
-      <div class="section-title">{{ t('alerts.section.rules') }}</div>
-      <div class="section-desc">{{ t('alerts.rules.desc') }}</div>
-
-      <!-- 游戏搜索 -->
-      <div class="search-row">
-        <el-input
-          v-model="searchQuery"
-          :placeholder="t('alerts.rules.searchPlaceholder')"
-          class="search-input"
-          :prefix-icon="Search"
-          @keyup.enter="searchGames"
-          @input="selectedGame = null"
-        />
-        <el-button :loading="searching" @click="searchGames">{{ t('alerts.rules.search') }}</el-button>
+  <section class="alerts-page" :aria-busy="loading">
+    <div class="page-actions"><HlButton size="sm" :loading="loading" @click="load">{{ t('common.refresh') }}</HlButton><router-link to="/settings?s=notification">{{ c('mailSettings') }}</router-link></div>
+    <p v-if="error" class="notice is-error" role="alert">{{ error }}</p>
+    <p v-if="loading">{{ t('common.loading') }}</p>
+    <HlTabs v-model="tab" :tabs="tabs">
+      <div v-if="tab === 'overview'" class="card section-card">
+        <h2>{{ c('overview') }}</h2>
+        <div class="summary-grid">
+          <div><span>{{ c('notificationSwitch') }}</span><strong>{{ prefs?.enabled ? c('enabled') : c('disabled') }}</strong></div>
+          <div><span>{{ c('mailConfig') }}</span><strong>{{ prefs?.smtp.complete ? c('complete') : prefs?.smtp.configured ? c('incomplete') : c('notConfigured') }}</strong></div>
+          <div><span>{{ c('defaultRegion') }}</span><strong><RegionFlag v-if="prefs?.region.region" :code="prefs.region.region" /><template v-else>{{ c('unknownRegion') }}</template></strong></div>
+          <div><span>{{ c('currency') }}</span><strong><CurrencyFlag v-if="effectiveCurrency" :code="effectiveCurrency" /><template v-else>{{ c('unknownCurrency') }}</template></strong></div>
+          <div><span>{{ c('ruleCount') }}</span><strong>{{ rules.length }}</strong></div>
+          <div><span>{{ c('pendingCount') }}</span><strong>{{ (stats?.pending || 0) + (stats?.suppressed || 0) }}</strong></div>
+          <div><span>{{ c('latestMatch') }}</span><strong>{{ dateText(latestMatch) }}</strong></div>
+          <div><span>{{ c('lastDelivery') }}</span><strong>{{ prefs?.lastDelivery ? statusLabel(prefs.lastDelivery.status) : c('noRecord') }}</strong><small>{{ dateText(prefs?.lastDelivery?.at) }}</small></div>
+        </div>
+        <p v-if="!prefs?.region.region" class="notice">{{ c('chooseRegionHint') }}</p>
+        <div class="form-grid">
+          <label class="field"><span>{{ c('manualRegion') }}</span><HlSelect v-model="manualRegion" :options="regionOptions" searchable /></label>
+          <div class="field action-end"><HlButton :disabled="busy || !prefs" @click="patch({ manualRegion: manualRegion || null })">{{ t('common.save') }}</HlButton></div>
+        </div>
+        <div class="actions"><HlButton :disabled="busy || !prefs" :aria-pressed="!!prefs?.enabled" @click="patch({ enabled: !prefs?.enabled })">{{ prefs?.enabled ? c('disableMail') : c('enableMail') }}</HlButton></div>
+        <p class="muted">{{ c('acceptedHint') }}</p>
       </div>
 
-      <!-- 搜索结果下拉 -->
-      <div v-if="searchResults.length > 0" class="search-results">
-        <div
-          v-for="game in searchResults"
-          :key="game.appid"
-          class="search-result-item"
-          @click="selectGame(game)"
-        >
-          <span class="result-name">{{ game.name || game.nameEn }}</span>
-          <span class="result-appid">AppID: {{ game.appid }}</span>
+      <div v-if="tab === 'types'" class="section-stack">
+        <div class="card section-card">
+          <h2>{{ c('types') }}</h2><p class="muted">{{ c('frequencyHint', { time: prefs?.digestTime || '08:00' }) }}</p>
+          <label class="field compact-field"><span>{{ c('weeklyDay') }}</span><HlSelect :model-value="prefs?.digestWeekday ?? 0" :disabled="busy" :options="[0,1,2,3,4,5,6].map(value => ({ value, label: c(`weekday.${value}`) }))" @update:model-value="value => patch({ digestWeekday: Number(value) })" /></label>
+          <div v-for="item in prefs?.types || []" :key="item.key" class="type-row"><div><strong>{{ typeLabel(item.key) }}</strong><p class="muted">{{ c(`purpose.${item.category}`) }}</p></div><HlSelect :model-value="item.enabled ? item.frequency : 'off'" :options="frequencies" :disabled="busy" @update:model-value="value => setType(item.key, value)" /></div>
+        </div>
+        <div v-if="featured" class="card section-card">
+          <h2>{{ c('featured') }}</h2><p class="muted">{{ c('featuredHint') }}</p>
+          <div class="actions"><HlButton v-for="scope in scopes" :key="scope" size="sm" :variant="featured.scope.includes(scope) ? 'primary' : 'default'" :aria-pressed="featured.scope.includes(scope)" @click="toggleScope(scope)">{{ c(`scope.${scope}`) }}</HlButton></div>
+          <div class="form-grid">
+            <label class="field"><span>{{ c('minDiscount') }}</span><HlInput :model-value="String(featured.minDiscount ?? '')" type="number" @update:model-value="value => featured && (featured.minDiscount = value === '' ? null : Number(value))" /></label>
+            <label class="field"><span>{{ c('minSavings') }} <CurrencyFlag v-if="effectiveCurrency" :code="effectiveCurrency" /></span><HlInput v-model="featuredAmounts.minSavings" inputmode="decimal" /></label>
+            <label class="field"><span>{{ c('maxPrice') }} <CurrencyFlag v-if="effectiveCurrency" :code="effectiveCurrency" /></span><HlInput v-model="featuredAmounts.maxPrice" inputmode="decimal" /></label>
+            <label class="field"><span>{{ c('lowRequirement') }}</span><HlSelect v-model="featured.lowMode" :options="['any','low','new_low'].map(value => ({ value, label: c(`lowMode.${value}`) }))" /></label>
+            <label class="field"><span>{{ c('window') }}</span><HlSelect :model-value="featured.windowDays || 0" :options="windows" @update:model-value="value => featured && (featured.windowDays = Number(value) || null)" /></label>
+            <label class="field"><span>{{ c('sort') }}</span><HlSelect v-model="featured.sort" :options="sorts.map(value => ({ value, label: c(`sort.${value}`) }))" /></label>
+          </div>
+          <details><summary>{{ c('advanced') }}</summary><div class="form-grid">
+            <label class="field"><span>{{ c('minPositiveRate') }}</span><HlInput v-model="featuredAmounts.minPositiveRate" type="number" /></label>
+            <label class="field"><span>{{ c('minReviews') }}</span><HlInput v-model="featuredAmounts.minReviews" type="number" /></label>
+            <label class="field"><span>{{ c('missingReviews') }}</span><HlSelect v-model="featured.missingReviews" :options="['include','exclude'].map(value => ({ value, label: c(value) }))" /></label>
+          </div><div class="actions"><HlButton v-for="key in (['allowFullPrice','includeOwned','includeIgnored'] as const)" :key="key" size="sm" :aria-pressed="featured[key]" :variant="featured[key] ? 'primary' : 'default'" @click="featured[key] = !featured[key]">{{ c(key) }}</HlButton></div></details>
+          <div class="actions"><HlButton :loading="previewBusy" @click="preview('featured')">{{ c('previewDraft') }}</HlButton><HlButton variant="primary" :loading="busy" @click="saveFeatured">{{ t('common.save') }}</HlButton><HlButton @click="resetFeatured">{{ c('restoreSaved') }}</HlButton></div>
         </div>
       </div>
-      <div v-if="searchError && searchResults.length === 0" class="search-error">
-        {{ searchError }}
-      </div>
 
-      <!-- 已选中游戏 -->
-      <div v-if="selectedGame" class="selected-game">
-        <span class="selected-name">{{ selectedGame.name || selectedGame.nameEn }}</span>
-        <span class="selected-appid">AppID: {{ selectedGame.appid }}</span>
-        <el-button size="small" text @click="clearSearch">{{ t('alerts.rules.clear') }}</el-button>
-      </div>
-
-      <!-- 规则条件 -->
-      <div class="add-row">
-        <HlSelect v-model="form.region" :options="regionSelectOptions" class="add-row__region" />
-        <HlSelect v-model="form.targetType" :options="targetTypeOptions" class="add-row__type" />
-        <!-- 外区 price 类输入时悬停出实时换算气泡（约 X.XX 该区货币）；气泡内容为空时 HlTooltip 不弹泡 -->
-        <HlTooltip v-if="form.targetType !== 'historic_low'" :content="addConvertHint">
-          <el-input v-model="form.targetValue" :placeholder="targetText" class="add-row__value">
-            <template #suffix>
-              <span class="unit-suffix">{{ form.targetType === 'price' ? t('alerts.rules.unitCny') : '%' }}</span>
-            </template>
-          </el-input>
-        </HlTooltip>
-        <span v-else class="section-desc" style="display: inline; margin: 0">{{ targetText }}</span>
-        <el-button type="primary" :icon="Plus" @click="add">{{ t('alerts.rules.add') }}</el-button>
-      </div>
-    </div>
-
-    <!-- 规则列表 -->
-    <div class="card section-card" data-section="alerts.section.list">
-      <div class="section-title">{{ t('alerts.section.list') }}</div>
-      <el-table v-if="alerts.length" :data="alerts" style="width: 100%" size="small" v-loading="loading">
-        <el-table-column prop="id" label="#" width="56" />
-        <el-table-column :label="t('alerts.table.game')" min-width="240">
-          <template #default="{ row }">
-            <div class="game-cell">
-              <HlImg :src="row.gameHeader" class="game-cover" :alt="row.gameName || String(row.appid)">
-                <template #fallback><span class="game-cover game-cover--empty" /></template>
-              </HlImg>
-              <a class="game-link" @click="router.push(`/game/${row.appid}`)">
-                {{ row.gameName || `AppID ${row.appid}` }} ↗
-              </a>
-            </div>
-          </template>
-        </el-table-column>
-        <el-table-column label="AppID" width="120">
-          <template #default="{ row }">
-            <span class="appid-text">{{ row.appid }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column :label="t('alerts.table.region')" width="120">
-          <template #default="{ row }">
-            <RegionFlag :code="row.region" />
-          </template>
-        </el-table-column>
-        <el-table-column :label="t('alerts.table.condition')" min-width="140">
-          <template #default="{ row }">
-            <!-- 阈值默认按元展示；外区 price 类悬停显示该区货币换算约价。
-                 表格滚动容器裁剪 absolute 气泡，表内气泡走 fixed 定位 -->
-            <HlTooltip v-if="row.targetType === 'price'" :content="ruleHoverText(row)" fixed>
-              <span class="cond-text">{{ t('alerts.rules.condPrice', { value: formatCnyFen(row.targetValue) }) }}</span>
-            </HlTooltip>
-            <span v-else-if="row.targetType === 'pct'">{{ t('alerts.rules.condPct', { value: row.targetValue }) }}</span>
-            <span v-else>{{ t('alerts.rules.condHistoricLow') }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column :label="t('alerts.table.enabled')" width="80">
-          <template #default="{ row }">
-            <el-switch :model-value="row.active" @change="toggle(row)" />
-          </template>
-        </el-table-column>
-        <el-table-column :label="t('alerts.table.actions')" width="120" align="right">
-          <template #default="{ row }">
-            <div class="action-btns">
-              <el-button size="small" plain :icon="Edit" @click="startEdit(row)" />
-              <el-button size="small" type="danger" plain :icon="Delete" @click="remove(row)" />
-            </div>
-          </template>
-        </el-table-column>
-        <el-table-column :label="t('alerts.table.lastTriggered')" width="170">
-          <template #default="{ row }">
-            <span class="muted">{{ row.lastTriggeredAt?.slice(5, 19).replace('T', ' ') ?? t('alerts.rules.never') }}</span>
-          </template>
-        </el-table-column>
-      </el-table>
-      <HlEmpty v-else-if="!loading" size="sm" icon="" :text="t('alerts.rules.empty')" />
-
-      <!-- 内联编辑面板（选中编辑时展开） -->
-      <div v-if="editingId !== null" class="edit-panel">
-        <div class="edit-panel-title">{{ t('alerts.rules.editTitle', { id: editingId ?? '' }) }}</div>
-        <div class="edit-row">
-          <HlSelect v-model="editForm.targetType" :options="targetTypeOptions" class="edit-select" />
-          <HlTooltip v-if="editForm.targetType !== 'historic_low'" :content="editConvertHint">
-            <el-input
-              v-model="editForm.targetValue"
-              size="small"
-              :placeholder="t('alerts.rules.targetValuePlaceholder')"
-              class="edit-input"
-            >
-              <template #suffix>
-                <span class="unit-suffix">{{ editForm.targetType === 'price' ? t('alerts.rules.unitCny') : '%' }}</span>
-              </template>
-            </el-input>
-          </HlTooltip>
-          <HlSelect v-model="editForm.region" :options="regionSelectOptions" class="edit-region" />
-          <el-button size="small" type="primary" @click="saveEdit(alerts.find(a => a.id === editingId)!)">{{ t('alerts.rules.save') }}</el-button>
-          <el-button size="small" @click="cancelEdit">{{ t('common.cancel') }}</el-button>
+      <div v-if="tab === 'rules'" class="section-stack">
+        <div class="card section-card" data-section="alerts.section.rules">
+          <h2>{{ editingId === null ? t('alerts.section.rules') : t('alerts.rules.editTitle', { id: editingId }) }}</h2>
+          <form @submit.prevent="searchGames"><label class="field"><span>{{ t('alerts.table.game') }}</span><div class="search-row"><HlInput v-model="search" :placeholder="t('alerts.rules.searchPlaceholder')" /><HlButton type="submit" :loading="searching">{{ t('alerts.rules.search') }}</HlButton></div></label></form>
+          <div v-if="results.length" class="search-results"><HlButton v-for="game in results" :key="game.appid" variant="text" block @click="chooseGame(game)">{{ game.name }} · {{ game.appid }}</HlButton></div>
+          <p v-if="draft.appid" class="muted">{{ c('selectedGame', { name: search, id: draft.appid }) }}</p>
+          <div class="form-grid">
+            <label class="field"><span>{{ c('region') }}</span><HlSelect v-model="draft.region" :options="regionOptions" searchable /></label>
+            <label class="field"><span>{{ c('conditionTitle') }}</span><HlSelect v-model="draft.targetType" :options="ruleTypes" /></label>
+            <label v-if="draft.targetType === 'price' || draft.targetType === 'pct'" class="field"><span>{{ c('target') }} <CurrencyFlag v-if="draft.targetType === 'price' && draftCurrency" :code="draftCurrency" /><template v-if="draft.targetType === 'pct'">%</template></span><HlInput v-model="draft.amount" inputmode="decimal" /></label>
+            <label v-if="draft.targetType === 'historic_low' || draft.targetType === 'new_low'" class="field"><span>{{ c('window') }}</span><HlSelect v-model="draft.windowDays" :options="windows" /></label>
+            <label class="field"><span>{{ c('repeatTitle') }}</span><HlSelect v-model="draft.repeatMode" :options="repeats" /></label>
+            <label v-if="draft.repeatMode === 'cooldown'" class="field"><span>{{ c('repeatHours') }}</span><HlInput v-model="draft.repeatHours" type="number" /></label>
+          </div>
+          <p v-if="draft.legacy && draft.targetType === 'price'" class="notice">{{ c('legacyHint') }}</p>
+          <p v-else-if="draft.targetType === 'price' && !draftCurrency" class="notice">{{ c('unknownCurrency') }}</p>
+          <div class="actions"><HlButton :loading="previewBusy" @click="preview('rule')">{{ c('previewDraft') }}</HlButton><HlButton variant="primary" :loading="busy" @click="saveRule">{{ editingId === null ? t('alerts.rules.add') : t('common.save') }}</HlButton><HlButton @click="resetDraft">{{ t('common.cancel') }}</HlButton></div>
+        </div>
+        <div class="card section-card"><h2>{{ c('rules') }}</h2><HlEmpty v-if="!rules.length && !loading" :text="t('alerts.rules.empty')" />
+          <article v-for="rule in rules" :key="rule.id" class="record-row"><div><router-link :to="`/game/${rule.appid}`">{{ rule.gameName || rule.appid }}</router-link><p><RegionFlag :code="rule.region" /> · {{ ruleCondition(rule) }}</p><small>{{ c('latestMatch') }}: {{ dateText(rule.lastTriggeredAt) }}</small></div><div class="actions"><HlButton size="sm" :disabled="busy" :aria-pressed="rule.active" @click="toggleRule(rule)">{{ rule.active ? c('enabled') : c('disabled') }}</HlButton><HlButton size="sm" @click="edit(rule)">{{ c('edit') }}</HlButton><HlButton size="sm" variant="text" @click="deleting = rule">{{ c('delete') }}</HlButton></div></article>
         </div>
       </div>
-    </div>
 
-    <!-- 触发历史 -->
-    <div class="card section-card" data-section="alerts.section.history">
-      <div class="history-head">
-        <div class="section-title">{{ t('alerts.section.history') }}</div>
-        <el-button
-          v-if="events.length"
-          size="small"
-          type="danger"
-          plain
-          :icon="Delete"
-          @click="clearAllEvents"
-        >
-          {{ t('alerts.history.clearAll') }}
-        </el-button>
-      </div>
-      <el-table v-if="events.length" :data="events" style="width: 100%" size="small" max-height="280">
-        <el-table-column :label="t('alerts.table.time')" width="160">
-          <template #default="{ row }">{{ row.triggeredAt?.slice(5, 19).replace('T', ' ') }}</template>
-        </el-table-column>
-        <el-table-column :label="t('alerts.table.game')" min-width="230">
-          <template #default="{ row }">
-            <div class="game-cell">
-              <HlImg :src="row.gameHeader" class="game-cover" :alt="row.gameName || String(row.appid)">
-                <template #fallback><span class="game-cover game-cover--empty" /></template>
-              </HlImg>
-              <a class="game-link" @click="router.push(`/game/${row.appid}`)">
-                {{ row.gameName || `AppID ${row.appid}` }} ↗
-              </a>
-            </div>
-          </template>
-        </el-table-column>
-        <el-table-column label="AppID" width="110">
-          <template #default="{ row }">
-            <span class="appid-text">{{ row.appid }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column :label="t('alerts.table.region')" width="110">
-          <template #default="{ row }">
-            <RegionFlag :code="row.region" />
-          </template>
-        </el-table-column>
-        <el-table-column :label="t('alerts.table.priceThen')" width="130">
-          <template #default="{ row }">
-            <!-- 人民币快照优先；外区行悬停看触发时的本币原价 -->
-            <HlTooltip :content="eventHoverText(row)" fixed>
-              <span class="hl-num">{{ eventPriceText(row) }}</span>
-            </HlTooltip>
-          </template>
-        </el-table-column>
-        <el-table-column :label="t('alerts.table.email')" width="80">
-          <template #default="{ row }">
-            <span class="tag" :class="row.notified ? 'tag--success' : ''">
-              {{ row.notified ? t('alerts.history.notifiedEmail') : t('alerts.history.notifiedInApp') }}
-            </span>
-          </template>
-        </el-table-column>
-        <el-table-column :label="t('alerts.table.actions')" width="70" align="right">
-          <template #default="{ row }">
-            <el-button size="small" type="danger" plain :icon="Delete" @click="removeEvent(row)" />
-          </template>
-        </el-table-column>
-      </el-table>
-      <HlEmpty v-else size="sm" icon="" :text="t('alerts.history.empty')" />
-    </div>
-
-    <!-- 邮件设置 -->
-    <div class="card section-card" v-loading="smtpLoading" data-section="alerts.section.smtp">
-      <div class="section-title">{{ t('alerts.section.smtp') }}</div>
-      <div class="section-desc">{{ t('alerts.smtp.desc') }}</div>
-      <el-form label-position="top" class="smtp-form">
-        <div class="smtp-grid">
-          <!-- 两条示例占位符的示例值（服务器域名 / 邮箱）留在视图侧传入，
-               词典里只有句式 {host} / {email}——连接信息不进词条 -->
-          <el-form-item :label="t('alerts.smtp.host')">
-            <el-input
-              v-model="smtpForm.host"
-              :placeholder="t('alerts.smtp.hostPlaceholder', { host: 'smtp.qq.com' })"
-            />
-          </el-form-item>
-          <el-form-item :label="t('alerts.smtp.port')">
-            <el-input-number v-model="smtpForm.port" :min="1" :max="65535" controls-position="right" />
-          </el-form-item>
-          <el-form-item :label="t('alerts.smtp.user')">
-            <el-input
-              v-model="smtpForm.user"
-              :placeholder="t('alerts.smtp.userPlaceholder', { email: 'your@qq.com' })"
-            />
-          </el-form-item>
-          <el-form-item :label="t('alerts.smtp.password')">
-            <el-input
-              v-model="smtpForm.password"
-              type="password"
-              show-password
-              :placeholder="
-                smtpHasPassword
-                  ? t('alerts.smtp.passwordConfigured', { masked: smtpMasked })
-                  : t('alerts.smtp.passwordPlaceholder')
-              "
-            />
-          </el-form-item>
-          <el-form-item :label="t('alerts.smtp.toAddr')">
-            <el-input
-              v-model="smtpForm.toAddr"
-              :placeholder="t('alerts.smtp.toAddrPlaceholder')"
-            />
-          </el-form-item>
-          <el-form-item :label="t('alerts.smtp.encryption')">
-            <el-switch
-              v-model="smtpForm.useSsl"
-              :active-text="t('alerts.smtp.ssl')"
-              :inactive-text="t('alerts.smtp.starttls')"
-            />
-          </el-form-item>
+      <div v-if="tab === 'history'" class="section-stack">
+        <div class="card section-card"><h2>{{ c('history') }}</h2><p class="muted">{{ c('acceptedHint') }}</p><HlEmpty v-if="!candidates.length && !loading" :text="c('historyEmpty')" />
+          <article v-for="item in candidates" :key="item.id" class="record-row"><div><strong>{{ item.payload.gameName || typeLabel(item.eventType) }}</strong><p>{{ typeLabel(item.eventType) }} · {{ statusLabel(item.status) }}</p><p><RegionFlag v-if="item.region" :code="item.region" /> {{ candidatePrice(item) }}</p><small>{{ c('matchedAt') }}: {{ dateText(item.createdAt) }} · {{ c('earliestSend') }}: {{ dateText(item.dueAt) }}</small><p v-if="item.reason" class="muted">{{ item.reason }}</p></div><HlButton size="sm" @click="historyPreview = item">{{ c('viewContent') }}</HlButton></article>
         </div>
-      </el-form>
-      <div class="smtp-footer">
-        <el-button :loading="smtpTesting" @click="testSmtp">{{ t('alerts.smtp.test') }}</el-button>
-        <el-button type="primary" :loading="smtpSaving" @click="saveSmtp">{{ t('alerts.smtp.save') }}</el-button>
+        <details v-if="legacyEvents.length" class="card section-card"><summary>{{ c('legacyHistory') }}</summary><article v-for="item in legacyEvents" :key="item.id" class="record-row"><div><router-link :to="`/game/${item.appid}`">{{ item.gameName || item.appid }}</router-link><p><RegionFlag :code="item.region" /> · {{ item.priceText || c('unconfirmedPrice') }}</p><small>{{ dateText(item.triggeredAt) }} · {{ item.notified ? c('status.delivered') : c('legacyNoReceipt') }}</small></div></article></details>
       </div>
-    </div>
+    </HlTabs>
+
+    <section v-if="previewKind && ((tab === 'rules' && previewKind === 'rule') || (tab === 'types' && previewKind === 'featured'))" class="card section-card" aria-live="polite">
+      <h2>{{ c('previewTitle') }}</h2><p class="muted">{{ c('previewHint') }}</p><p v-if="previewStale" class="notice">{{ c('previewStale') }}</p><p v-if="previewBusy">{{ t('common.loading') }}</p><p v-else>{{ c('previewCount', { matched: previewMatched, total: previewTotal }) }}</p><p v-if="previewError" role="alert">{{ previewError }}</p>
+      <article v-for="(item, index) in previewItems" :key="`${item.observed.appid}-${index}`" class="preview-row"><h3>{{ item.observed.gameName || item.observed.appid }} · {{ item.matched ? c('matched') : c('excluded') }}</h3><p><RegionFlag v-if="item.observed.region" :code="item.observed.region" /> · {{ priceText(item.observed.price, item.observed.currency) }}</p><p class="muted">{{ c('observedAt') }}: {{ dateText(item.observed.observedAt) }}</p><ul class="condition-list"><li v-for="condition in item.conditions" :key="condition.code" :class="{ 'is-error': !condition.passed }">{{ condition.passed ? c('passed') : c('notPassed') }} · {{ conditionLabel(condition) }} <small>{{ conditionNumbers(condition, item) }}</small></li></ul><p v-if="item.comparison.points != null">{{ c('baseline', { price: priceText(item.comparison.baselineLow, item.observed.currency), points: item.comparison.points }) }}</p><p v-if="item.comparison.firstAt" class="muted">{{ dateText(item.comparison.firstAt) }} — {{ dateText(item.comparison.lastAt) }}</p><p v-if="item.comparison.points != null" class="muted">{{ c('coverageHint') }}</p></article>
+    </section>
+    <HlDialog v-model="deleteOpen" :title="c('delete')"><p>{{ t('alerts.rules.removeConfirm', { id: deleting?.id || '', name: deleting?.gameName || '' }) }}</p><template #footer><HlButton @click="deleteOpen = false">{{ t('common.cancel') }}</HlButton><HlButton variant="danger" :loading="busy" @click="removeRule">{{ c('delete') }}</HlButton></template></HlDialog>
+    <HlDialog v-model="historyOpen" :title="c('viewContent')"><template v-if="historyPreview"><h3>{{ historyPreview.payload.gameName || typeLabel(historyPreview.eventType) }}</h3><p>{{ candidatePrice(historyPreview) }}</p><p>{{ statusLabel(historyPreview.status) }} · {{ dateText(historyPreview.deliveredAt) }}</p><p>{{ c('observedAt') }}: {{ dateText(historyPreview.payload.observedAt || historyPreview.payload.current?.observedAt) }}</p><ul v-if="historyPreview.payload.evaluation"><li v-for="condition in historyPreview.payload.evaluation.conditions" :key="condition.code">{{ conditionLabel(condition) }} · {{ condition.passed ? c('passed') : c('notPassed') }}</li></ul><p v-if="historyPreview.reason">{{ historyPreview.reason }}</p></template></HlDialog>
   </section>
 </template>
 
 <style scoped>
-.alerts-page {
-  max-width: 960px;
-  margin: 0 auto;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-
-.section-card {
-  padding: 20px 24px;
-}
-
-.search-row {
-  display: flex;
-  gap: 8px;
-  margin-top: 12px;
-}
-
-.search-input {
-  flex: 1;
-}
-
-.search-results {
-  margin-top: 8px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius);
-  max-height: 240px;
-  overflow-y: auto;
-  background: var(--bg-card);
-}
-
-.search-result-item {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 8px 12px;
-  cursor: pointer;
-  transition: background var(--transition);
-  border-bottom: 1px solid var(--border-soft);
-}
-
-.search-result-item:last-child {
-  border-bottom: none;
-}
-
-.search-result-item:hover {
-  background: var(--accent-soft);
-}
-
-.result-name {
-  font-size: 13px;
-  color: var(--text-primary);
-}
-
-.result-appid {
-  font-size: 11px;
-  color: var(--text-muted);
-  font-family: var(--font-mono);
-}
-
-.search-error {
-  margin-top: 8px;
-  padding: 8px 12px;
-  border: 1px solid var(--danger-a30);
-  border-radius: var(--radius);
-  background: var(--danger-a15);
-  color: var(--danger);
-  font-size: 12px;
-}
-
-.selected-game {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 8px;
-  padding: 8px 12px;
-  border: 1px solid var(--accent-a30);
-  border-radius: var(--radius);
-  background: var(--accent-soft);
-}
-
-.selected-name {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--accent);
-}
-
-.selected-appid {
-  font-size: 11px;
-  color: var(--text-muted);
-  font-family: var(--font-mono);
-}
-
-.add-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 12px;
-  flex-wrap: wrap;
-}
-
-.add-row__region {
-  /* ≥ .hl-select-wrap 的 min-width:170px——宿主比 wrap 窄会溢出压到相邻控件 */
-  width: 170px;
-}
-
-.add-row__type {
-  width: 170px;
-}
-
-.add-row__value {
-  width: 160px;
-}
-
-.appid-text {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  color: var(--text-muted);
-}
-
-/* 游戏列：封面 + 名称链接（规则表 / 触发历史表共用） */
-.game-cell {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-}
-
-.game-cover {
-  width: 92px;
-  height: 43px;
-  flex: none;
-  border-radius: 4px;
-  object-fit: cover;
-  display: block;
-  background: var(--accent-soft);
-}
-
-.game-cover--empty {
-  border: 1px solid var(--border-soft);
-}
-
-/* 金额输入框后缀单位（元 / %） */
-.unit-suffix {
-  font-size: 12px;
-  color: var(--text-muted);
-}
-
-.cond-text {
-  cursor: default;
-}
-
-.history-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.muted {
-  font-size: 12px;
-  color: var(--text-muted);
-}
-
-.game-link {
-  color: var(--accent);
-  cursor: pointer;
-  font-size: 12.5px;
-}
-
-.game-link:hover {
-  text-decoration: underline;
-}
-
-.action-btns {
-  display: flex;
-  gap: 6px;
-  justify-content: flex-end;
-}
-
-.edit-panel {
-  margin-top: 12px;
-  padding: 12px 16px;
-  border: 1px solid var(--accent);
-  border-radius: var(--radius);
-  background: var(--accent-soft);
-}
-
-.edit-panel-title {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--accent);
-  margin-bottom: 8px;
-}
-
-.edit-row {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  flex-wrap: wrap;
-}
-
-.edit-select {
-  width: 170px;
-}
-
-.edit-input {
-  width: 120px;
-}
-
-.edit-region {
-  width: 170px;
-}
-
-.smtp-form {
-  margin-top: 12px;
-}
-
-.smtp-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-  gap: 0 16px;
-}
-
-.smtp-grid .el-form-item {
-  margin-bottom: 12px;
-}
-
-.smtp-footer {
-  display: flex;
-  justify-content: flex-end;
-  margin-top: 8px;
-}
+.alerts-page { max-width: 1080px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+.page-actions, .actions, .search-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.page-actions { justify-content: space-between; }
+.section-stack { display: grid; gap: 16px; }
+.section-card { padding: 22px; min-width: 0; }
+h2 { margin: 0 0 16px; font-size: 17px; } h3 { margin: 8px 0; font-size: 14px; }
+p { line-height: 1.7; margin: 8px 0; } small, .muted { color: var(--text-muted); font-size: 12px; }
+.summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(195px, 1fr)); gap: 20px; margin-bottom: 24px; }
+.summary-grid > div { display: flex; flex-direction: column; gap: 8px; } .summary-grid span { color: var(--text-muted); font-size: 12px; } .summary-grid strong { font-size: 14px; overflow-wrap: anywhere; }
+.form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin: 18px 0; }
+.field { display: flex; flex-direction: column; gap: 8px; min-width: 0; font-size: 12px; color: var(--text-muted); }
+.field > span { display: flex; align-items: center; gap: 8px; } .compact-field { max-width: 250px; margin-bottom: 20px; } .action-end { justify-content: end; align-items: start; }
+.actions { margin: 12px 0; } .search-row { flex-wrap: nowrap; } .search-row > :first-child { flex: 1; min-width: 0; }
+.search-results { max-height: 220px; overflow-y: auto; border: 1px solid var(--border-soft); border-radius: var(--radius); }
+.type-row, .record-row { display: flex; justify-content: space-between; align-items: center; gap: 18px; padding: 16px 0; border-bottom: 1px solid var(--border-soft); }
+.type-row > :last-child { min-width: 175px; } .record-row > div { min-width: 0; } .record-row p { overflow-wrap: anywhere; } .record-row .actions { flex-shrink: 0; }
+.notice { padding: 12px; background: var(--accent-soft); border-radius: var(--radius); } .is-error { color: var(--danger); }
+.preview-row { padding: 16px 0; border-top: 1px solid var(--border-soft); } .condition-list { padding-left: 20px; line-height: 1.9; } .condition-list small { margin-left: 6px; }
+summary { cursor: pointer; padding: 8px 0; font-weight: 600; } a { color: var(--accent); }
+@media (max-width: 640px) { .section-card { padding: 16px; } .type-row, .record-row { align-items: stretch; flex-direction: column; gap: 6px; } .form-grid { grid-template-columns: 1fr; } .type-row > :last-child { width: 100%; } .summary-grid { grid-template-columns: 1fr 1fr; gap: 16px; } }
 </style>

@@ -2656,6 +2656,60 @@ export interface PriceAlertItem {
   active: boolean
   createdAt: string | null
   lastTriggeredAt: string | null
+  config: PriceAlertConfig | null
+  repeatMode: 'once' | 'cooldown' | 'always'
+  repeatHours: number
+}
+
+export interface PriceAlertConfig { currency?: string; windowDays?: number | null }
+export interface PriceAlertDraft {
+  appid: number
+  region: string
+  targetType: string
+  targetValue?: number
+  config?: PriceAlertConfig | null
+  repeatMode?: 'once' | 'cooldown' | 'always'
+  repeatHours?: number
+}
+
+export interface NotificationCondition {
+  code: string
+  passed: boolean
+  actual?: unknown
+  expected?: unknown
+}
+
+export interface RuleEvaluation {
+  matched: boolean
+  conditions: NotificationCondition[]
+  exclusions: NotificationCondition[]
+  comparison: { baselineLow?: number | null; previousPrice?: number | null; firstAt?: string | null; lastAt?: string | null; points?: number; complete: boolean; windowDays?: number | null }
+  observed: { appid?: number; gameName?: string; region?: string; currency?: string | null; price?: number | null; originalPrice?: number | null; discount?: number | null; observedAt?: string | null; thresholdBasis?: string }
+  labels: string[]
+}
+
+export interface FeaturedConfig {
+  scope: string[]
+  minDiscount: number | null
+  minSavings: number | null
+  maxPrice: number | null
+  lowMode: 'any' | 'low' | 'new_low'
+  allowFullPrice: boolean
+  minPositiveRate: number | null
+  minReviews: number | null
+  missingReviews: 'include' | 'exclude'
+  includeOwned: boolean
+  includeIgnored: boolean
+  sort: string
+  windowDays: number | null
+}
+
+export interface FeaturedPreview {
+  items: RuleEvaluation[]
+  matched: number
+  total: number
+  config: FeaturedConfig
+  exclusions?: NotificationCondition[]
 }
 
 export interface AlertEventItem {
@@ -2678,15 +2732,18 @@ export interface AlertEventItem {
 
 export const alertsApi = {
   list: () => request<PriceAlertItem[]>('GET', '/alerts'),
-  add: (appid: number, region: string, targetType: string, targetValue?: number) =>
-    request<PriceAlertItem>('POST', '/alerts', { appid, region, targetType, targetValue }),
-  update: (id: number, payload: { active?: boolean; targetValue?: number; targetType?: string; region?: string }) =>
+  add: (appid: number, region: string, targetType: string, targetValue?: number, options: Partial<PriceAlertDraft> = {}) =>
+    request<PriceAlertItem>('POST', '/alerts', { ...options, appid, region, targetType, targetValue }),
+  update: (id: number, payload: Partial<PriceAlertDraft> & { active?: boolean }) =>
     request<PriceAlertItem>('PUT', `/alerts/${id}`, payload),
+  preview: (payload: PriceAlertDraft) => request<RuleEvaluation>('POST', '/alerts/preview', payload),
+  featuredPreview: (featured: FeaturedConfig, region?: string) =>
+    request<FeaturedPreview>('POST', '/alerts/featured/preview', { featured, region }),
   remove: (id: number) => request<{ removed: boolean }>('DELETE', `/alerts/${id}`),
   events: (limit = 50) => request<AlertEventItem[]>('GET', `/alerts/events${toQuery({ limit })}`),
   removeEvent: (id: number) => request<{ removed: boolean }>('DELETE', `/alerts/events/${id}`),
   /** 清空全部触发历史，返回删除条数 */
-  clearEvents: () => request<{ removed: number }>('DELETE', '/alerts/events'),
+  clearEvents: () => request<{ removed: number; protected: number }>('DELETE', '/alerts/events'),
   getSmtp: () => request<SmtpConfig>('GET', '/alerts/smtp'),
   updateSmtp: (payload: SmtpConfigPayload) => request<SmtpConfig>('PUT', '/alerts/smtp', payload),
   /** 连通性测试：按表单当前值发测试邮件（密码空 = 用已存密码） */
@@ -2757,9 +2814,16 @@ export interface NotificationPrefs {
   /** 单条候选最多投递次数 */
   maxAttempts: number
   categories: NotificationCategory[]
+  manualRegion: string | null
+  digestTime: string
+  digestWeekday: number
+  featured: FeaturedConfig
+  region: { region: string | null; source: string; currency?: string | null; currencySource?: string | null }
+  types: { key: string; label: string; category: string; enabled: boolean; frequency: NotificationFrequency }[]
   /** SMTP 的可公开部分：不含密码 / 授权码 */
   smtp: {
     configured: boolean
+    complete: boolean
     host: string
     port: number
     userMasked: string
@@ -2783,6 +2847,28 @@ export interface NotificationPrefsUpdate {
   includeDetails?: boolean
   /** 只传要改的类别，后端按已知类别合并 */
   categories?: Record<string, boolean>
+  manualRegion?: string | null
+  digestTime?: string
+  digestWeekday?: number
+  featured?: Partial<FeaturedConfig>
+  types?: Record<string, Partial<{ enabled: boolean; frequency: NotificationFrequency }>>
+}
+
+export type NotificationFrequency = 'immediate' | 'daily' | 'weekly' | 'off'
+export interface NotificationCandidate {
+  id: number
+  appid: number
+  sourceKind: string
+  eventType: string
+  eventLabel: string
+  region: string | null
+  status: string
+  reason: string | null
+  attempts: number
+  createdAt: string | null
+  dueAt: string | null
+  deliveredAt: string | null
+  payload: { gameName?: string; price?: number | null; currency?: string | null; observedAt?: string | null; current?: RuleEvaluation['observed']; evaluation?: RuleEvaluation; rule?: PriceAlertDraft; labels?: string[] }
 }
 
 export interface NotificationStats {
@@ -2805,7 +2891,8 @@ export interface NotificationStats {
 export const notificationsApi = {
   prefs: () => request<NotificationPrefs>('GET', '/notifications/prefs'),
   updatePrefs: (payload: NotificationPrefsUpdate) =>
-    request<{ ok: boolean; enabled: boolean }>('PUT', '/notifications/prefs', payload),
+    request<NotificationPrefs & { ok: boolean }>('PUT', '/notifications/prefs', payload),
+  candidates: (limit = 100) => request<{ items: NotificationCandidate[] }>('GET', `/notifications/candidates${toQuery({ limit })}`),
   /** 连通性测试：与 Price Event / Candidate / Cycle 无关，不写任何业务数据 */
   test: () => request<{ ok: boolean }>('POST', '/notifications/test'),
   stats: () => request<NotificationStats>('GET', '/notifications/stats'),
