@@ -24,7 +24,7 @@ import time
 from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import IntEnum
 from functools import lru_cache, partial
 from pathlib import Path
@@ -1796,6 +1796,9 @@ _MIGRATIONS: list[tuple[int, str, object]] = [    (2, "bundle_region_prices 零�
 
 # 迁移前快照后缀：与生产库同在数据目录，**不进 backups/**
 _PRE_MIGRATION_SUFFIX = ".pre-migration.bak"
+# 快照保留窗：回滚点只为「刚迁移完就出问题」的窗口服务；结构已达最新且
+# 超窗后，快照只剩与生产库同量级的磁盘占用，到点由启动链回收
+_PRE_MIGRATION_RETENTION = timedelta(days=7)
 
 
 def _db_file_path() -> Path | None:
@@ -1865,6 +1868,28 @@ async def _snapshot_before_migration(current: int, target: int) -> None:
             detail={"当前版本": current, "目标版本": target},
         )
         raise RuntimeError("迁移前快照未完成，已阻止数据库结构变更")
+
+
+def _reclaim_stale_pre_migration_snapshots(src: Path | None = None) -> None:
+    """结构已达最新且快照超保留窗时回收迁移前快照；保留期内绝不触碰。"""
+    if src is None:
+        src = _db_file_path()
+    if src is None:
+        return
+    bak = src.with_name(src.name + _PRE_MIGRATION_SUFFIX)
+    if not bak.is_file():
+        return
+    age = datetime.now() - datetime.fromtimestamp(bak.stat().st_mtime)
+    if age < _PRE_MIGRATION_RETENTION:
+        return
+    try:
+        bak.unlink()
+        log_event(
+            logger,
+            f"迁移前快照已过 {_PRE_MIGRATION_RETENTION.days} 天保留窗，已回收 {bak.name}",
+        )
+    except OSError:
+        log_event(logger, "迁移前快照回收失败，下次启动重试", level=logging.ERROR)
 
 
 def _headline(text: str) -> str:
@@ -1953,6 +1978,9 @@ async def _run_schema_migrations(*, snapshot_ready: bool = False) -> None:
             except Exception:
                 await conn.rollback()
                 raise
+
+    # 迁移链收尾（含无差额的稳态启动）：结构已确认不超过 latest，到期快照在此回收
+    _reclaim_stale_pre_migration_snapshots()
 
 
 async def init_db(*, maintenance_token: str | None = None) -> None:
