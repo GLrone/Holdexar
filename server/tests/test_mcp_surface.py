@@ -20,9 +20,18 @@ def test_projection_excludes_session_bound_tools():
     names = {t.name for t in tools}
     assert len(names) == len(tools)
     assert len(tools) >= 60  # 注册表非空防线：builtin 未导入时此处暴露
-    assert names == set(REGISTRY.names()) - mcp.EXCLUDED_TOOLS
+    assert names == {s.name for s in REGISTRY.all()
+                     if s.name not in mcp.EXCLUDED_TOOLS and s.group != "write"}
     assert not names & {"navigate", "present_ui", "read_attachment",
-                        "propose_bulk", "propose_delete", "find_deletables"}
+                        "propose_bulk", "propose_delete", "find_deletables", "start_task"}
+
+
+def test_projection_excludes_write_group():
+    # 外部客户端没有审批通道：写组工具不进 MCP 面，也不接受直调
+    write_names = {s.name for s in REGISTRY.all() if s.group == "write"}
+    assert write_names, "注册表写组为空时本测试失去意义"
+    names = {t.name for t in mcp.tool_projection()}
+    assert not names & write_names
 
 
 def test_projection_schema_passthrough():
@@ -36,7 +45,7 @@ def test_projection_readonly_hint_follows_real_side_effects():
     tools = {t.name: t for t in mcp.tool_projection()}
     # 同步 / 刷新类在 read 守卫组但有联网写库副作用 → 不得标只读
     for name in ("sync_wallet", "refresh_game_price", "sync_subscriptions",
-                 "notify_test", "ingest_appids", "start_task"):
+                 "notify_test", "ingest_appids"):
         assert tools[name].annotations.readOnlyHint is False, name
 
 
@@ -47,6 +56,10 @@ async def test_execute_unknown_tool_raises_protocol_error():
         await mcp.execute_tool("__nope__", {})
     with pytest.raises(McpError):
         await mcp.execute_tool("navigate", {})  # 排除面不可经 MCP 调用
+    with pytest.raises(McpError):
+        await mcp.execute_tool("add_follow", {"appid": 1})  # 写组不可经 MCP 直达
+    with pytest.raises(McpError):
+        await mcp.execute_tool("start_task", {})  # 编排入口不进外部面
 
 
 async def test_execute_known_tool_returns_status_payload():
@@ -56,8 +69,17 @@ async def test_execute_known_tool_returns_status_payload():
     assert payload["status"] == "ok"
 
 
-async def test_acknowledge_update_uses_shared_writer(monkeypatch):
+async def test_acknowledge_update_rejected_over_mcp():
+    from mcp.shared.exceptions import McpError
+
+    with pytest.raises(McpError):
+        await mcp.execute_tool("acknowledge_update", {})
+
+
+async def test_acknowledge_update_write_path_intact_outside_mcp(monkeypatch):
+    # 写组工具只是不进外部面：领航台侧执行边界与共享写者行为保持不变
     from app.core import updater
+    from app.domains.agent.runtime import executor
 
     calls = []
     def acknowledge():
@@ -65,28 +87,21 @@ async def test_acknowledge_update_uses_shared_writer(monkeypatch):
         return {"acknowledged": True, "updated": len(calls) == 1}
 
     monkeypatch.setattr(updater, "acknowledge_update", acknowledge)
-    tool = next(t for t in mcp.tool_projection() if t.name == "acknowledge_update")
-    assert tool.annotations.readOnlyHint is False
-    assert tool.annotations.idempotentHint is True
+    spec = REGISTRY.get("acknowledge_update")
+    assert spec is not None
     for updated in (True, False):
-        out = await mcp.execute_tool("acknowledge_update", {})
-        assert json.loads(out[0].text) == {
-            "status": "ok", "acknowledged": True, "updated": updated,
-        }
+        result = await executor.execute(spec, {})
+        assert result.status == "ok"
+        assert result.data == {"acknowledged": True, "updated": updated}
     assert len(calls) == 2
-
-
-async def test_acknowledge_update_reports_write_failure(monkeypatch):
-    from app.core import updater
 
     def fail():
         raise OSError("confirmation write failed")
 
     monkeypatch.setattr(updater, "acknowledge_update", fail)
-    out = await mcp.execute_tool("acknowledge_update", {})
-    payload = json.loads(out[0].text)
-    assert payload["status"] == "error"
-    assert "acknowledged" not in payload
+    result = await executor.execute(spec, {})
+    assert result.status == "error"
+    assert "acknowledged" not in result.data
 
 
 async def test_update_status_projects_completion_without_acknowledging(monkeypatch):
@@ -239,7 +254,7 @@ async def test_stateless_protocol_round_trip():
         status, err = await _rpc(app, "tools/call", {"name": "__nope__", "arguments": {}})
         assert status == 200
         assert err["result"]["isError"] is True
-        assert "unknown tool" in err["result"]["content"][0]["text"]
+        assert "not available over MCP" in err["result"]["content"][0]["text"]
 
 
 @pytest.mark.parametrize("suffix", ["", "/"])
