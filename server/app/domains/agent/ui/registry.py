@@ -61,55 +61,8 @@ class ServerComponentRegistry:
             )
         )
 
-        # 既有业务卡种（作为 legacy 契约挂牌注册）
-        self.register(
-            ComponentMeta(
-                component_id="legacy-price",
-                name="游戏价格卡",
-                description="单款游戏的当前价格、史低比对与年份区间",
-                schema_type="PilotPriceFacts",
-            )
-        )
-        self.register(
-            ComponentMeta(
-                component_id="legacy-games",
-                name="游戏卡片流",
-                description="游戏图文卡片列表，包含封面、评分与价格",
-                schema_type="PilotGameFacts",
-            )
-        )
-        self.register(
-            ComponentMeta(
-                component_id="legacy-compare",
-                name="游戏对比卡",
-                description="多款游戏横向比对价格与评价指标",
-                schema_type="PilotCompareFacts",
-            )
-        )
-        self.register(
-            ComponentMeta(
-                component_id="legacy-regions",
-                name="多区比价表",
-                description="单款游戏在全球各区服的折合人民币价格排序",
-                schema_type="PilotRegionsFacts",
-            )
-        )
-        self.register(
-            ComponentMeta(
-                component_id="legacy-stepper",
-                name="步骤工作流",
-                description="连续工作流或排查步骤执行状态",
-                schema_type="PilotStepperFacts",
-            )
-        )
-        self.register(
-            ComponentMeta(
-                component_id="legacy-proposal",
-                name="操作确认面板",
-                description="涉及批量增删或敏感配置变更的双向确认面板",
-                schema_type="PilotProposalFacts",
-            )
-        )
+        # legacy 业务卡种不经 present_ui 白名单：它们由数据工具的卡片流直通
+        # 前端 legacy-* 渲染，进入白名单只会让模型选到降级路径。
 
     def register(self, meta: ComponentMeta) -> None:
         if meta.component_id in self._registry:

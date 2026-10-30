@@ -57,7 +57,7 @@ SPECS: tuple[ToolSpec, ...] = (
         group="read",
         risk="low",
         handler=present_ui,
-        description="自主选择标准 UI 组件呈现结构化分析结果（支持 metric-grid, data-table, time-series, coverage-matrix, status-board 等）。当用户明确需要图表、矩阵或多维排查对比时使用。",
+        description="自主选择标准 UI 组件呈现结构化分析结果（白名单：metric-grid, data-table, time-series, coverage-matrix, status-board）。当用户明确需要图表、矩阵或多维排查对比时使用。",
         step_label="presentUI",
         parameters={
             "type": "object",
