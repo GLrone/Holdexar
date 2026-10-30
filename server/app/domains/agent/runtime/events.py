@@ -56,11 +56,15 @@ _MAX_PAYLOAD_BYTES = 8192
 def build_payload(event_type: str, payload: dict | None) -> dict:
     """payload 入账边界：白名单键 → 敏感键剔除 → 体积上限。
 
+    事件类型不在 EVENT_FIELDS 声明内 = fail-closed：外部数据一字节都不入账，
+    只留固定拒绝标记让账本保留「发生过未知类型事件」的诊断痕迹。
     返回新 dict，绝不修改调用方传入对象。"""
     allowed = EVENT_FIELDS.get(event_type)
+    if allowed is None:
+        return {"rejected": "unknown_event_type"}
     clean: dict = {}
     for key, value in (payload or {}).items():
-        if allowed is not None and key not in allowed:
+        if key not in allowed:
             continue
         if _SENSITIVE_KEY_RE.search(str(key)):
             continue
