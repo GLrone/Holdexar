@@ -40,10 +40,6 @@ PROBE_TARGET_URL = "http://www.gstatic.com/generate_204"
 
 PROBE_LEVEL = "L0"
 DEFAULT_TIMEOUT_MS = 5000
-# DEAD 恢复探测每轮上限：DEAD 不在池文件里，池内 L0 探不到它，没有这条路节点一旦
-# DEAD 就永久出局。分批轮转补探；批大小同时受 L0 写事务窗口约束，取值以「一轮能
-# 覆盖可回收集的显著比例」为准，不随池规模无限放大。
-RECOVERY_BATCH_SIZE = 24
 
 # ── L1：出口 IP ──────────────────────────────────────────────────
 L1_LEVEL = "L1"
