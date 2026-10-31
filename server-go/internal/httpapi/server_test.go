@@ -132,6 +132,9 @@ func TestUnknownAPIPath(t *testing.T) {
 		if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
 			t.Fatalf("Content-Type=%s，应为 application/json", ct)
 		}
-		assertDetailNull(t, decodeJSON(t, rec.Body.Bytes()))
+		body := decodeJSON(t, rec.Body.Bytes())
+		if body["detail"] != "Not Found" {
+			t.Fatalf("未知 API 404 文案=%v，应为 Not Found", body["detail"])
+		}
 	}
 }
