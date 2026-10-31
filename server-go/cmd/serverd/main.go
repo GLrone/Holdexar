@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"holdexar/server-go/internal/access"
+	"holdexar/server-go/internal/agent"
 	"holdexar/server-go/internal/config"
 	"holdexar/server-go/internal/events"
 	"holdexar/server-go/internal/eventstream"
@@ -34,6 +35,7 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:28765", "监听地址")
 	dataDirFlag := flag.String("data-dir", "", "显式数据目录，跳过自动判定")
 	devSession := flag.Bool("dev-session", false, "开放开发态会话发放通道（发行版无此入口）")
+	mcpEnabled := flag.Bool("mcp", false, "启用 MCP 面（等价环境变量 HOLDEXAR_MCP=1）")
 	flag.Parse()
 
 	// 日志接线点：stderr 之外同步写入环形缓冲（日志页 SSE 的回放事实源）；
@@ -92,6 +94,14 @@ func main() {
 			settings.Register(mux, db, writeGate)
 			notifications.Register(mux, db)
 			eventstream.Register(mux, bus, ring)
+			if err := agent.Register(mux, db, gate, agent.Options{
+				DataDir:       dataDir,
+				EnabledByFlag: *mcpEnabled,
+				Log:           logLine,
+			}); err != nil {
+				logLine("%v", err)
+				os.Exit(1)
+			}
 		},
 	}
 	httpServer := &http.Server{Addr: *addr, Handler: gate.Middleware(server.Handler())}
