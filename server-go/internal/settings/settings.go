@@ -1,7 +1,7 @@
 // Package settings：settings 域读写（KV 配置，首个走写闸的写路径）。
 // 读路径直查 app_settings；写路径必须经 store.WriteGate 串行落库，
-// 闸内只做库写，不做网络与文件 IO。
-// 凭据加密（secretbox）与 MCP 运行态未迁移，相关字段按在场事实降级。
+// 凭据加密等纯计算在闸外完成，闸内只做库写。
+// MCP 运行态未迁移，相关字段按未在役形状输出。
 package settings
 
 import (
@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"holdexar/server-go/internal/config"
+	"holdexar/server-go/internal/secretbox"
 	"holdexar/server-go/internal/store"
 )
 
@@ -35,23 +37,31 @@ const (
 	keyMCPEnabled     = "mcp.enabled"
 )
 
-// secretPrefix 凭据密文前缀（secretbox enc1 格式；明文键无此前缀）。
-const secretPrefix = "enc1:"
-
 const upsertSQL = `INSERT INTO app_settings (key, value_json, updated_at) VALUES (?, ?, ?)
 ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`
+
+// resolveDataDir 数据目录判定（凭据主密钥托管挂在其下），Register 时调用
+// 一次；测试可替换。与 systemx 同款装配。
+var resolveDataDir = func() string {
+	dir, err := config.ResolveDataDir()
+	if err != nil {
+		return ""
+	}
+	return dir
+}
 
 // Register 装配 settings 域端点：GET/PUT /api/v1/settings。
 // 其余端点（fetch 节奏、steam 本机账号导入）不在此注册。
 func Register(mux *http.ServeMux, db *sql.DB, gate *store.WriteGate) {
-	h := &handler{db: db, gate: gate}
+	h := &handler{db: db, gate: gate, dataDir: resolveDataDir()}
 	mux.HandleFunc("GET /api/v1/settings", h.handleGet)
 	mux.HandleFunc("PUT /api/v1/settings", h.handlePut)
 }
 
 type handler struct {
-	db   *sql.DB
-	gate *store.WriteGate
+	db      *sql.DB
+	gate    *store.WriteGate
+	dataDir string
 }
 
 type accountPayload struct {
@@ -98,16 +108,11 @@ func (h *handler) readSettings(ctx context.Context) (*settingsResponse, error) {
 		resp.Account.SteamID = orEmpty(v)
 	}
 
-	switch v, err := h.kvString(ctx, keySteamAPIKey); {
-	case err != nil:
+	if apiKey, err := h.kvString(ctx, keySteamAPIKey); err != nil {
 		return nil, err
-	case v.decrypted:
-		resp.Account.SteamAPIKey = maskKey(v.text)
-		resp.Account.HasAPIKey = v.text != ""
-	case v.encrypted:
-		// 密文无法解密（解密能力未迁移）：凭据在场事实保留，掩码退化为全星。
-		resp.Account.SteamAPIKey = "****"
-		resp.Account.HasAPIKey = true
+	} else {
+		resp.Account.SteamAPIKey = maskKey(apiKey)
+		resp.Account.HasAPIKey = apiKey != ""
 	}
 
 	boolKeys := []struct {
@@ -184,26 +189,26 @@ func (h *handler) kvValue(ctx context.Context, key string) (kvValue, error) {
 	return kvValue{present: true, val: val}, nil
 }
 
-type secretValue struct {
-	text      string // 可读明文（legacy 明文或解密结果）
-	decrypted bool
-	encrypted bool // 在场但为密文（解密能力未迁移）
-}
-
-// kvString 读凭据键：明文原样返回；密文按不可解密降级（Python 解密失败同径返回 default）。
-func (h *handler) kvString(ctx context.Context, key string) (secretValue, error) {
+// kvString 读凭据键明文（Python get_secret_value 同径）：明文原样返回；
+// enc1: 密文解密，解密失败（篡改/密钥不符/格式损坏/锁定态）一律按无凭据
+// 降级返回空串（Python SecretBoxError → default 同径）。
+func (h *handler) kvString(ctx context.Context, key string) (string, error) {
 	v, err := h.kvValue(ctx, key)
 	if err != nil || !v.present {
-		return secretValue{}, err
+		return "", err
 	}
 	s, ok := v.val.(string)
 	if !ok || s == "" {
-		return secretValue{}, nil
+		return "", nil
 	}
-	if strings.HasPrefix(s, secretPrefix) {
-		return secretValue{encrypted: true}, nil
+	if !secretbox.IsEncrypted(s) {
+		return s, nil
 	}
-	return secretValue{text: s, decrypted: true}, nil
+	plain, derr := secretbox.DecryptSecretIn(h.dataDir, s, secretbox.SecretPurpose(key))
+	if derr != nil {
+		return "", nil
+	}
+	return plain, nil
 }
 
 // maskKey 掩码回显：保留末 4 字符（Steam Key 恒 ASCII，字符/字节切片同形）。
@@ -288,13 +293,18 @@ func (h *handler) handlePut(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, detailNull())
 		return
 	}
-	writes, vErrs, fatal := parseUpdate(body)
+	req, vErrs, fatal := parseUpdate(body)
 	if fatal != nil {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": []any{*fatal}})
 		return
 	}
 	if len(vErrs) > 0 {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": vErrs})
+		return
+	}
+	writes, err := h.buildWrites(req)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, detailNull())
 		return
 	}
 	if len(writes) > 0 {
@@ -384,6 +394,7 @@ const (
 // updateReq 校验后的写入意图；nil 表示该字段不在请求中（含显式 null）。
 type updateReq struct {
 	steamID          *string
+	steamAPIKey      *string // 已 strip 的明文；加密在 buildWrites 闸外完成
 	onboardingDone   *bool
 	autoPrice        *bool
 	backupAuto       *bool
@@ -398,7 +409,7 @@ type updateReq struct {
 
 // parseUpdate 解析并校验 PUT 请求体：全部字段错误合并上报（Pydantic 非短路同径）。
 // fatal 为整体形状错误（非法 JSON / 顶层非对象），直接替代字段级结果。
-func parseUpdate(body []byte) (writes []kvWrite, vErrs []valErr, fatal *valErr) {
+func parseUpdate(body []byte) (*updateReq, []valErr, *valErr) {
 	if len(body) == 0 {
 		return nil, nil, &valErr{Type: errMissing, Loc: []any{"body"}, Msg: errMissingMsg, Input: nil}
 	}
@@ -414,6 +425,7 @@ func parseUpdate(body []byte) (writes []kvWrite, vErrs []valErr, fatal *valErr) 
 	}
 
 	req := &updateReq{}
+	vErrs := []valErr{}
 	if raw, ok := fields["account"]; ok && raw != nil {
 		obj, ok := raw.(map[string]any)
 		if !ok {
@@ -428,11 +440,13 @@ func parseUpdate(body []byte) (writes []kvWrite, vErrs []valErr, fatal *valErr) 
 				}
 			}
 			if v, present := obj["steam_api_key"]; present && v != nil {
-				if _, e := wantStr(v, "account", "steam_api_key"); e != nil {
+				if s, e := wantStr(v, "account", "steam_api_key"); e != nil {
 					vErrs = append(vErrs, *e)
+				} else {
+					trimmed := strings.TrimSpace(s)
+					req.steamAPIKey = &trimmed
 				}
 			}
-			// steam_api_key 写入需凭据加密，未迁移：合法形状收下不落库。
 		}
 	}
 	boolSpecs := []struct {
@@ -486,14 +500,30 @@ func parseUpdate(body []byte) (writes []kvWrite, vErrs []valErr, fatal *valErr) 
 	if len(vErrs) > 0 {
 		return nil, vErrs, nil
 	}
+	return req, nil, nil
+}
 
-	// 写入意图按 KV 键落 JSON 文本；主题只认两值，异常值忽略（防脏配置）。
+// buildWrites 校验后的写入意图 → KV 写列表（值已 JSON 序列化）。
+// 凭据加密在此完成：纯计算放闸外，落库统一经写闸单事务。
+// 掩码回显（**** 前缀）与空串不落库（Python 掩码防回写同径）。
+func (h *handler) buildWrites(req *updateReq) ([]kvWrite, error) {
+	var writes []kvWrite
 	push := func(key string, val any) {
 		b, _ := json.Marshal(val)
 		writes = append(writes, kvWrite{key: key, value: string(b)})
 	}
 	if req.steamID != nil {
 		push(keySteamID, *req.steamID)
+	}
+	if req.steamAPIKey != nil {
+		key := *req.steamAPIKey
+		if key != "" && !strings.HasPrefix(key, "****") {
+			token, err := secretbox.EncryptSecretIn(h.dataDir, key, secretbox.SecretPurpose(keySteamAPIKey))
+			if err != nil {
+				return nil, err
+			}
+			push(keySteamAPIKey, token)
+		}
 	}
 	if req.onboardingDone != nil {
 		push(keyOnboardingDone, *req.onboardingDone)
@@ -519,13 +549,14 @@ func parseUpdate(body []byte) (writes []kvWrite, vErrs []valErr, fatal *valErr) 
 	if req.directNoticeSeen != nil {
 		push(keyDirectNotice, *req.directNoticeSeen)
 	}
+	// 主题只认两值，异常值忽略（防脏配置）。
 	if req.theme != nil && (*req.theme == "dark" || *req.theme == "light") {
 		push(keyTheme, *req.theme)
 	}
 	if req.mcpEnabled != nil {
 		push(keyMCPEnabled, *req.mcpEnabled)
 	}
-	return writes, nil, nil
+	return writes, nil
 }
 
 // wantStr 字符串字段校验（Pydantic string_type 同径）。

@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
+
+	"holdexar/server-go/internal/secretbox"
 )
 
 func newTestDB(t *testing.T) *sql.DB {
@@ -621,11 +624,18 @@ func TestGetPrefsPatched(t *testing.T) {
 
 // TestGetPrefsSmtpAndLastDelivery SMTP 投影脱敏 + 最近投递选取。
 func TestGetPrefsSmtpAndLastDelivery(t *testing.T) {
+	dir := t.TempDir()
+	overrideDataDir(t, dir)
+	token, err := secretbox.EncryptSecretIn(dir, "auth-code-123",
+		secretbox.SecretPurpose(smtpPasswordKey))
+	if err != nil {
+		t.Fatalf("密文准备失败：%v", err)
+	}
 	db := newTestDB(t)
 	seedSetting(t, db, "smtp.host", `"smtp.example.com"`)
 	seedSetting(t, db, "smtp.port", `465`)
 	seedSetting(t, db, "smtp.user", `"zhangsan@example.com"`)
-	seedSetting(t, db, "smtp.password", `"enc1:AAAA"`)
+	seedSetting(t, db, smtpPasswordKey, strconv.Quote(token))
 	seedSetting(t, db, "smtp.to_addr", `"me@example.com"`)
 	seedSetting(t, db, "smtp.use_ssl", `false`)
 	seedCandidates(t, db, []candSeed{
@@ -661,6 +671,82 @@ func TestGetPrefsSmtpAndLastDelivery(t *testing.T) {
 	wantNil(t, last, "attempts")
 	wantStr(t, last, "reason", "smtp: timeout")
 	wantBool(t, last, "retryable", true)
+}
+
+// overrideDataDir 把 secretbox 密钥材料落点指向临时目录（测试隔离，不触真实数据目录）。
+func overrideDataDir(t *testing.T, dir string) {
+	t.Helper()
+	orig := dataDirResolver
+	dataDirResolver = func() (string, error) { return dir, nil }
+	t.Cleanup(func() { dataDirResolver = orig })
+}
+
+// TestGetPrefsHasPasswordStates 授权码判定三态：可解/不可解/锁定态（真实密文，
+// 判定语义对齐 Python get_secret_value：SecretBoxError 一律降级为无凭据）。
+func TestGetPrefsHasPasswordStates(t *testing.T) {
+	purpose := secretbox.SecretPurpose(smtpPasswordKey)
+
+	t.Run("decryptable", func(t *testing.T) {
+		dir := t.TempDir()
+		overrideDataDir(t, dir)
+		token, err := secretbox.EncryptSecretIn(dir, "auth-code-123", purpose)
+		if err != nil {
+			t.Fatalf("密文准备失败：%v", err)
+		}
+		db := newTestDB(t)
+		seedSetting(t, db, smtpPasswordKey, strconv.Quote(token))
+		body := decodeBody(t, doGet(t, newServer(t, db), "/api/v1/notifications/prefs"))
+		wantBool(t, obj(t, body, "smtp"), "hasPassword", true)
+	})
+
+	t.Run("undecryptable wrong purpose", func(t *testing.T) {
+		dir := t.TempDir()
+		overrideDataDir(t, dir)
+		// 同主密钥、异用途：跨用途解密恒失败（Python 用途不符直接 SecretBoxError）
+		token, err := secretbox.EncryptSecretIn(dir, "auth-code-123", "kv:smtp.to_addr")
+		if err != nil {
+			t.Fatalf("密文准备失败：%v", err)
+		}
+		db := newTestDB(t)
+		seedSetting(t, db, smtpPasswordKey, strconv.Quote(token))
+		body := decodeBody(t, doGet(t, newServer(t, db), "/api/v1/notifications/prefs"))
+		wantBool(t, obj(t, body, "smtp"), "hasPassword", false)
+	})
+
+	t.Run("passphrase locked", func(t *testing.T) {
+		dir := t.TempDir()
+		overrideDataDir(t, dir)
+		token, err := secretbox.EncryptSecretIn(dir, "auth-code-123", purpose) // 记录写入前仍是 legacy
+		if err != nil {
+			t.Fatalf("密文准备失败：%v", err)
+		}
+		master, err := secretbox.LegacyMaster(dir)
+		if err != nil {
+			t.Fatalf("legacy 主密钥准备失败：%v", err)
+		}
+		rec, err := secretbox.WrapPassphrase(master, "test-passphrase")
+		if err != nil {
+			t.Fatalf("口令封装失败：%v", err)
+		}
+		if err := secretbox.WriteRecord(dir, rec); err != nil {
+			t.Fatalf("密钥记录写入失败：%v", err)
+		}
+		secretbox.Lock() // 清进程内解锁态 → 口令模式进入锁定
+		db := newTestDB(t)
+		seedSetting(t, db, smtpPasswordKey, strconv.Quote(token))
+		body := decodeBody(t, doGet(t, newServer(t, db), "/api/v1/notifications/prefs"))
+		wantBool(t, obj(t, body, "smtp"), "hasPassword", false)
+	})
+
+	t.Run("plaintext passthrough", func(t *testing.T) {
+		// 存量明文（启动加密未跑到）原样算已配置，不经解密链
+		dir := t.TempDir()
+		overrideDataDir(t, dir)
+		db := newTestDB(t)
+		seedSetting(t, db, smtpPasswordKey, `"legacy-plain"`)
+		body := decodeBody(t, doGet(t, newServer(t, db), "/api/v1/notifications/prefs"))
+		wantBool(t, obj(t, body, "smtp"), "hasPassword", true)
+	})
 }
 
 // TestListFacts 事实增量：对齐/增量/上限/校验。

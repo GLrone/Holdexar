@@ -1,12 +1,23 @@
 package notifications
 
 import (
+	"context"
 	"encoding/json"
 	"math"
 	"net/http"
 	"strconv"
 	"strings"
+
+	"holdexar/server-go/internal/config"
+	"holdexar/server-go/internal/secretbox"
 )
+
+// smtpPasswordKey SMTP 授权码的 KV 键（加密存储）。
+const smtpPasswordKey = "smtp.password"
+
+// dataDirResolver secretbox 密钥材料落点，读时解析（对齐 Python
+// get_settings().data_dir 的取值时机）；测试可替换。
+var dataDirResolver = config.ResolveDataDir
 
 // smtpView SMTP 出口的可公开投影：不含密码与授权码，只给「是否已配置」。
 // 行缺席与行内 NULL 语义分开（Python get_value 缺席回默认、NULL 回 None）。
@@ -27,7 +38,7 @@ func (h *handler) smtpView(r *http.Request) (*orderedObj, error) {
 	if err != nil {
 		return nil, err
 	}
-	pwdRaw, _, err := h.settingValue(ctx, "smtp.password")
+	pwdConfigured, err := h.passwordConfigured(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -49,11 +60,42 @@ func (h *handler) smtpView(r *http.Request) (*orderedObj, error) {
 	v.set("host", host)
 	v.set("port", pyInt(portRaw, 465))
 	v.set("userMasked", maskAccount(user))
-	// 密文解密链（keyring/secretbox）未迁移：非空即视为已配置。
-	// 与 Python 的差异仅在锁定态 / 换钥崩溃窗口（Python 回无凭据）。
-	v.set("hasPassword", truthy(pwdRaw))
+	v.set("hasPassword", pwdConfigured)
 	v.set("useSsl", truthy(useSsl))
 	return v, nil
+}
+
+// passwordConfigured SMTP 授权码是否已配置，判定对齐 Python get_secret_value：
+// 键缺席/空值/NULL 回无凭据；存量明文（无 enc1: 前缀）原样算已配置；密文
+// 解密失败（篡改、用途不符、keyring 锁定态、换钥窗口外）一律按无凭据降级。
+func (h *handler) passwordConfigured(ctx context.Context) (bool, error) {
+	stored, present, err := h.settingValue(ctx, smtpPasswordKey)
+	if err != nil || !present {
+		return false, err
+	}
+	if stored == nil {
+		return false, nil
+	}
+	s, isStr := stored.(string)
+	if !isStr {
+		// 非字符串值：Python str() 后必非密文前缀 → 原样返回，按真值判定
+		return truthy(stored), nil
+	}
+	if s == "" {
+		return false, nil
+	}
+	if !secretbox.IsEncrypted(s) {
+		return true, nil
+	}
+	dataDir, err := dataDirResolver()
+	if err != nil {
+		return false, err
+	}
+	plain, err := secretbox.DecryptSecretIn(dataDir, s, secretbox.SecretPurpose(smtpPasswordKey))
+	if err != nil {
+		return false, nil
+	}
+	return plain != "", nil
 }
 
 // maskAccount 邮箱账号脱敏：保留首尾各 1 位与域名（按 Unicode 字符切，对齐 Python 切片）。
