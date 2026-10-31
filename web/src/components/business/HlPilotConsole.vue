@@ -22,12 +22,14 @@ import {
   type PilotStep,
 } from '@/api/client'
 import { formatCnyFen } from '@/api/regions'
-import { mdLiteToHtml } from '@/lib/markdownLite'
 import { buildCtxSegments, shouldShowCacheHitRate } from '@/lib/ctxSegments'
 import { canRateTurn, fmtTokens, isEmptyLlmFailure, isErrorReason, isLongAnswerText, pilotCoverUrl, positivePct, ratingClass, sessionTime } from '@/lib/pilotView'
 import HlImg from '@/components/ui/HlImg.vue'
 import HlPilotCards from '@/components/business/HlPilotCards.vue'
 import HlPilotChain from '@/components/business/HlPilotChain.vue'
+import HlPilotMarkdown from '@/components/business/HlPilotMarkdown.vue'
+import HlPilotSidebar from '@/components/business/HlPilotSidebar.vue'
+import { useSessionRowActions } from '@/composables/useSessionRowActions'
 import HlPilotOutline from '@/components/business/HlPilotOutline.vue'
 import HlPilotRuns from '@/components/business/HlPilotRuns.vue'
 import HlPilotStats from '@/components/business/HlPilotStats.vue'
@@ -225,6 +227,13 @@ function quoteSegments(q: string): { kind: 'text' | 'quote'; value: string; n?: 
   return out
 }
 
+/** 提问正文段是否行内渲染：带编号引用的消息片段走行内契约（标号胶囊保持句内位置），
+    整条无标号消息走与回答相同的块级渲染；复制与编辑重问始终取原始文本 */
+function qInline(turn: { q: string }): boolean {
+  QUOTE_MARKER_RE.lastIndex = 0
+  return QUOTE_MARKER_RE.test(turn.q || '')
+}
+
 /** 某编号引用的正文（发给后端 / 气泡悬停面板按编号取） */
 function quoteTextOf(turn: { quotes?: { n: number; text: string }[] }, n: number): string {
   return turn.quotes?.find((q) => q.n === n)?.text ?? ''
@@ -239,25 +248,12 @@ const liveStepsFlat = computed(() => livePhases.value.flatMap((p) => p.steps))
 /* 终答就位渲染：回答层只承接「尚未被工具定性的当前段」正文——tool_start
    一到，该段正文划归过程链（链内 phasePre 就地展示），回答层空窗等待终答。
    模型在调工具前输出的过程叙述不再以「先文字后卡片」的形态占据回答层。 */
-const liveAnswerHtml = computed(() => {
+const liveAnswerSource = computed(() => {
   const phases = livePhases.value
   if (!phases.length) return ''
   const last = phases[phases.length - 1]!
-  const text = last.steps.length ? '' : last.text
-  return text ? renderAnswerHtml(text) : ''
+  return last.steps.length ? '' : last.text
 })
-
-/** 回答层统一渲染入口：支持 SVG 矢量图实时渐进式渲染与终态卡片呈现。 */
-function renderAnswerHtml(text: string): string {
-  return mdLiteToHtml(text, {
-    svgPendingLabel: t('pilot.svgPending'),
-    svgDrawingLabel: t('pilot.svgDrawing'),
-    svgPreviewLabel: t('pilot.svgPreview'),
-    svgCodeLabel: t('pilot.svgCode'),
-    svgCopyLabel: t('pilot.svgCopy'),
-    svgQuoteLabel: t('pilot.svgQuote'),
-  })
-}
 
 /** 流式期即时卡片账：tool_start 按类型预告挂骨架占位，card 事件原位填充——
  *  卡片归属产出它的阶段，在过程链内随思考时序内嵌展示；done 后由回答层
@@ -404,21 +400,13 @@ const sessions = ref<PilotSessionListItem[] | null>(null)
 const sessionsLoadFailed = ref(false)
 /** 本会话分叉自哪个会话（账本事实；非派生会话为 null） */
 const forkedFrom = ref<string | null>(null)
-const renamingSid = ref('')
-const renameText = ref('')
-const deleteArmSid = ref('')
-let deleteArmTimer: ReturnType<typeof setTimeout> | null = null
 const referenceSession = ref<{ sid: string; title: string } | null>(null)
 // 标签栏打开集：× 只关标签不删会话；账本里的会话随时可从历史面板找回
 const openSids = ref<string[]>([])
 const historyOpen = ref(false)
 const historyRoot = ref<HTMLElement | null>(null)
-// 会话列检索/归档折叠：检索走后端账本投影（标题与问答正文命中），不在前端过滤
+// 会话列检索词（输入与防抖在 HlPilotSidebar，账本重投影留此）
 const sessionQuery = ref('')
-let sessionSearchTimer: ReturnType<typeof setTimeout> | null = null
-const archivedOpen = ref(false)
-// 会话级动作在途集合（置顶/归档按钮防连点；同名 sid 只压一次）
-const flagBusy = ref<string>('')
 
 const ctxPercent = computed(() => {
   if (!lastCtx.value || lastCtx.value.budget <= 0) return 0
@@ -716,70 +704,17 @@ async function loadSessions() {
   }
 }
 
-/** 检索输入：防抖 300ms 后按关键词重投影（账本侧过滤，非前端筛） */
-function onSessionQueryInput() {
-  if (sessionSearchTimer) clearTimeout(sessionSearchTimer)
-  sessionSearchTimer = setTimeout(() => {
-    sessionSearchTimer = null
-    void loadSessions()
-  }, 300)
-}
+/** 会话列分区/检索防抖/行内动作归 HlPilotSidebar；账本清单（sessions）与切换语义留此 */
+const { renamingSid, renameText, deleteArmSid, flagBusy, startRename, submitRename, armDelete } =
+  useSessionRowActions({ sessions: () => sessions.value, refresh: loadSessions, deleted: onSessionDeleted })
 
-/** 会话列分区：归档项从主列收进折叠区；置顶由后端排序在前（前端不再重排）。
-    检索态下不分区——命中结果平铺，避免归档命中被折叠区藏住。 */
-const searchingSessions = computed(() => sessionQuery.value.trim().length > 0)
-const liveSessions = computed(() => {
-  const all = sessions.value ?? []
-  return searchingSessions.value ? all : all.filter((s) => !s.archived)
-})
-const archivedSessions = computed(() => (sessions.value ?? []).filter((s) => s.archived))
-
-/** 会话列渲染行：主列 + （非检索态下的）归档折叠头 + 展开的归档项，扁平成一个数组 */
-interface SideRow { head?: boolean; item?: PilotSessionListItem; count?: number }
-const sideRows = computed<SideRow[]>(() => {
-  const out: SideRow[] = liveSessions.value.map((it) => ({ item: it }))
-  if (!searchingSessions.value && archivedSessions.value.length) {
-    out.push({ head: true, count: archivedSessions.value.length })
-    if (archivedOpen.value) for (const it of archivedSessions.value) out.push({ item: it })
-  }
-  return out
-})
-
-/** 置顶/归档开关：账本追加记录，成功后回填本行并重投影（排序随之后端定） */
-async function togglePin(it: PilotSessionListItem) {
-  if (flagBusy.value) return
-  flagBusy.value = it.sid
-  try {
-    const r = await pilotApi.pinSession(it.sid, !it.pinned)
-    if (!r.ok) {
-      message.error(t('pilot.session.flagFailed'))
-      return
-    }
-    it.pinned = !it.pinned
-    await loadSessions()
-  } catch {
-    message.error(t('pilot.session.flagFailed'))
-  } finally {
-    flagBusy.value = ''
-  }
-}
-
-async function toggleArchive(it: PilotSessionListItem) {
-  if (flagBusy.value) return
-  flagBusy.value = it.sid
-  try {
-    const r = await pilotApi.archiveSession(it.sid, !it.archived)
-    if (!r.ok) {
-      message.error(t('pilot.session.flagFailed'))
-      return
-    }
-    it.archived = !it.archived
-    await loadSessions()
-  } catch {
-    message.error(t('pilot.session.flagFailed'))
-  } finally {
-    flagBusy.value = ''
-  }
+/** 置顶/归档/删除后交账本重投影；删除当前会话则回新对话 */
+function onSessionDeleted(sid: string) {
+  sessions.value = (sessions.value ?? []).filter((x) => x.sid !== sid)
+  openSids.value = openSids.value.filter((s) => s !== sid)
+  saveOpenSids()
+  if (sid === sessionId.value) startNewChat()
+  void loadSessions()
 }
 
 /** 分叉失败机器码 → 人话（复用编辑重问的失败码口径） */
@@ -850,56 +785,6 @@ async function switchSession(sid: string) {
   pendingQuotes.value = []
   draftReady = true
   await restoreSession(sid)
-}
-
-function startRename(it: PilotSessionListItem) {
-  renamingSid.value = it.sid
-  renameText.value = it.title
-}
-
-async function submitRename() {
-  const sid = renamingSid.value
-  const text = renameText.value.trim()
-  renamingSid.value = ''
-  if (!sid || !text) return
-  try {
-    await pilotApi.renameSession(sid, text)
-    const item = (sessions.value ?? []).find((x) => x.sid === sid)
-    if (item) item.title = text
-  } catch {
-    message.error(t('pilot.history.renameFailed'))
-  }
-}
-
-/** 两段式删除：首点武装（4s 内再点执行），防误删 */
-function armDelete(sid: string) {
-  if (deleteArmSid.value === sid) {
-    void deleteSession(sid)
-    return
-  }
-  deleteArmSid.value = sid
-  if (deleteArmTimer) clearTimeout(deleteArmTimer)
-  deleteArmTimer = setTimeout(() => {
-    deleteArmSid.value = ''
-  }, 4000)
-}
-
-async function deleteSession(sid: string) {
-  deleteArmSid.value = ''
-  if (deleteArmTimer) clearTimeout(deleteArmTimer)
-  try {
-    await pilotApi.deleteSession(sid)
-  } catch (e) {
-    // 404 = 账本本无此会话（竞态/TTL 清扫）：视为已删；其余失败如实报错
-    if (!(e instanceof ApiError && e.status === 404)) {
-      message.error(t('pilot.history.deleteFailed'))
-      return
-    }
-  }
-  sessions.value = (sessions.value ?? []).filter((x) => x.sid !== sid)
-  openSids.value = openSids.value.filter((s) => s !== sid)
-  saveOpenSids()
-  if (sid === sessionId.value) startNewChat()
 }
 
 // + 菜单的快捷动作（本项目专属直达工具）：点选即执行，不经模型
@@ -1384,8 +1269,14 @@ function onCopyReply(e: MouseEvent) {
   void onCopyText(body?.innerText ?? '')
 }
 
-/** 会话记录点击委托：处理内嵌 SVG 图卡的预览/源码切换与复制操作 */
+/** 会话记录点击委托：处理内嵌 SVG 图卡的预览/源码切换、复制操作与代码块复制 */
 function onTurnsClick(e: MouseEvent) {
+  const codeCopy = (e.target as HTMLElement).closest<HTMLElement>('.pilot-code-copy')
+  if (codeCopy) {
+    const text = codeCopy.closest<HTMLElement>('.pilot-code')?.querySelector('code')?.textContent ?? ''
+    if (text) void onCopyText(text)
+    return
+  }
   const target = (e.target as HTMLElement).closest<HTMLElement>('.pilot-svg-tab, .pilot-svg-copy, .pilot-svg-quote')
   if (!target) return
   const card = target.closest<HTMLElement>('.pilot-svg')
@@ -2242,168 +2133,26 @@ function triggerFollowUp(prompt: string) {
 
 <template>
   <div class="pilot-console" :class="{ 'is-page': page }">
-    <!-- 整页会话列：账本全量清单常驻左侧（sticky 跟随视口），新对话/对话目录在列头；
-         行内双击重命名、hover × 两段式删除——与标签栏同一套动作语义 -->
-    <!-- 会话列 Teleport 到页面级挂点（Index 提供 #pilot-side-target，位于居中对话列
-         之外的左侧空白区）——列与思考链/输入框的布局彻底解耦，尺寸由挂点约束；
-         defer 必需：子组件挂载早于 Index 子树插入 document，目标须延后解析 -->
-    <Teleport v-if="page" defer to="#pilot-side-target">
-    <aside class="pilot-side">
-      <div class="pilot-side__tools">
-        <button
-          type="button"
-          class="pilot-side__new"
-          :class="{ 'is-current': onFreshChat }"
-          :disabled="streaming"
-          @click="startNewChat"
-        >
-          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
-          </svg>
-          {{ t('pilot.newChat') }}
-        </button>
-        <HlPilotRuns variant="side" />
-        <HlPilotOutline
-          v-if="page"
-          side="right"
-          :turns="turns"
-          :count="outlineCount"
-          :active-index="outlineActive"
-          @jump="jumpToTurn"
-          @toggle="onOutlineToggle"
-        />
-      </div>
-      <div class="pilot-side__search">
-        <HlInput
-          v-model="sessionQuery"
-          class="pilot-side__search-box"
-          :placeholder="t('pilot.session.search')"
-          :aria-label="t('pilot.session.search')"
-          @input="onSessionQueryInput"
-        />
-      </div>
-      <div class="pilot-side__scroll">
-        <div v-if="sessions == null" class="pilot-side__empty">{{ t('pilot.history.empty') }}</div>
-        <div v-else-if="!sessions.length" class="pilot-side__empty">
-          {{ searchingSessions ? t('pilot.session.noHit') : t('pilot.history.empty') }}
-        </div>
-        <template v-else>
-          <template v-for="row in sideRows" :key="row.head ? '__arch' : row.item?.sid">
-            <!-- 归档折叠头：点开才列归档项（检索态不出现，命中结果平铺） -->
-            <button
-              v-if="row.head"
-              type="button"
-              class="pilot-side__arch"
-              @click="archivedOpen = !archivedOpen"
-            >
-              <svg class="pilot-side__arch-ico" :class="{ 'is-open': archivedOpen }" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                <path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
-              </svg>
-              <span>{{ t('pilot.session.archived', { n: row.count ?? 0 }) }}</span>
-            </button>
-            <div
-              v-else
-              class="pilot-side__row"
-              :class="{ 'is-current': row.item?.sid === sessionId, 'is-arch': row.item?.archived }"
-              :title="`${sessionLabel(row.item ?? {})} · ${t('pilot.history.turns', { n: row.item?.turn_total ?? 0 })}${row.item?.running ? ' · ' + t('pilot.session.running') : ''}`"
-              @click="row.item && openFromHistory(row.item.sid)"
-              @dblclick="row.item && startRename(row.item)"
-            >
-              <template v-if="renamingSid === row.item?.sid">
-                <HlInput
-                  v-model="renameText"
-                  class="pilot-side__rename"
-                  @keydown.enter="submitRename"
-                  @keydown.esc="renamingSid = ''"
-                />
-                <button type="button" class="pilot-side__x is-ok" :title="t('pilot.history.rename')" @click.stop="submitRename">
-                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                    <path d="M5 13l4 4L19 7" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" />
-                  </svg>
-                </button>
-              </template>
-              <template v-else>
-                <span class="pilot-side__main">
-                  <span class="pilot-side__name">
-                    <span
-                      v-if="row.item?.pinned"
-                      class="pilot-side__pinmark"
-                      :title="t('pilot.session.pinned')"
-                      aria-hidden="true"
-                    >
-                      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                        <path d="M12 17v4M9 3h6l-1 7 3 3H7l3-3-1-7Z" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" />
-                      </svg>
-                    </span>
-                    <span
-                      v-if="row.item?.running"
-                      class="pilot-side__running"
-                      :title="t('pilot.session.running')"
-                      aria-hidden="true"
-                    ></span>
-                    <!-- 派生标记：窄列会省略标题尾部，故标记走标题前缀而非后缀 -->
-                    <span
-                      v-if="row.item?.forked_from"
-                      class="pilot-forkmark"
-                      :title="t('pilot.session.forked')"
-                      aria-hidden="true"
-                    >
-                      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                        <circle cx="6.5" cy="6" r="2.4" />
-                        <circle cx="6.5" cy="18" r="2.4" />
-                        <circle cx="17.5" cy="9.5" r="2.4" />
-                        <path d="M6.5 8.4v7.2M8.9 6h4.1a4.5 4.5 0 0 1 4.5 1.4" />
-                      </svg>
-                    </span>
-                    {{ row.item?.title || t('pilot.session.untitled') }}
-                  </span>
-                  <span class="pilot-side__meta">
-                    {{ t('pilot.history.turns', { n: row.item?.turn_total ?? 0 }) }} · {{ sessionTime(row.item?.updated_at ?? null) }}
-                  </span>
-                  <span v-if="row.item?.snippet" class="pilot-side__snippet">{{ row.item.snippet }}</span>
-                </span>
-                <span class="pilot-side__acts">
-                  <button
-                    type="button"
-                    class="pilot-side__x"
-                    :class="{ 'is-on': row.item?.pinned }"
-                    :title="row.item?.pinned ? t('pilot.session.unpin') : t('pilot.session.pin')"
-                    @click.stop="row.item && togglePin(row.item)"
-                  >
-                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                      <path d="M12 17v4M9 3h6l-1 7 3 3H7l3-3-1-7Z" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" />
-                    </svg>
-                  </button>
-                  <button
-                    type="button"
-                    class="pilot-side__x"
-                    :class="{ 'is-on': row.item?.archived }"
-                    :title="row.item?.archived ? t('pilot.session.unarchive') : t('pilot.session.archive')"
-                    @click.stop="row.item && toggleArchive(row.item)"
-                  >
-                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                      <path d="M3 7h18M5 7v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V7M9 11h6" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" />
-                    </svg>
-                  </button>
-                  <button
-                    type="button"
-                    class="pilot-side__x"
-                    :class="{ 'is-armed': deleteArmSid === row.item?.sid }"
-                    :title="deleteArmSid === row.item?.sid ? t('pilot.history.deleteConfirm') : t('pilot.history.delete')"
-                    @click.stop="row.item && armDelete(row.item.sid)"
-                  >
-                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                      <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
-                    </svg>
-                  </button>
-                </span>
-              </template>
-            </div>
-          </template>
-        </template>
-      </div>
-    </aside>
-    </Teleport>
+    <!-- 整页会话列：账本全量清单常驻左侧（Teleport 到页面级挂点，Index 提供 #pilot-side-target） -->
+    <HlPilotSidebar
+      v-if="page"
+      v-model="sessionQuery"
+      :sessions="sessions"
+      :session-id="sessionId"
+      :streaming="streaming"
+      :fresh-chat="onFreshChat"
+      :label-of="sessionLabel"
+      :turns="turns"
+      :outline-count="outlineCount"
+      :outline-active="outlineActive"
+      @new="startNewChat"
+      @open="openFromHistory"
+      @search="loadSessions"
+      @refresh="loadSessions"
+      @deleted="onSessionDeleted"
+      @jump="jumpToTurn"
+      @outline-toggle="onOutlineToggle"
+    />
 
     <header class="pilot-head">
       <span class="pilot-head__title">{{ t('pilot.title') }} · {{ t('pilot.console') }}</span>
@@ -2620,8 +2369,9 @@ function triggerFollowUp(prompt: string) {
               </button>
             </div>
           </div>
-          <!-- 提问气泡：带编号引用时把正文里的标号就地渲染成胶囊，位置即用户在句中摆的位置 -->
-          <p v-else class="pilot-turn__q">
+          <!-- 提问气泡：文本段与助手回答同一 Markdown 契约（带标号时按行内渲染保胶囊句内位置，
+               无标号整条走块级渲染）；复制/编辑重问仍取原始文本 -->
+          <div v-else class="pilot-turn__q">
             <template v-for="(seg, si) in quoteSegments(turn.q)" :key="si">
               <span
                 v-if="seg.kind === 'quote'"
@@ -2633,9 +2383,13 @@ function triggerFollowUp(prompt: string) {
                 <span class="pilot-qchip__title">{{ quoteTextOf(turn, seg.n!) ? quoteTitleOf(quoteTextOf(turn, seg.n!)) : t('pilot.quote.gone') }}</span>
                 <span v-if="quoteTextOf(turn, seg.n!)" class="pilot-qchip__full">{{ quoteTextOf(turn, seg.n!) }}</span>
               </span>
-              <template v-else>{{ seg.value }}</template>
+              <HlPilotMarkdown
+                v-else-if="seg.value"
+                :inline="qInline(turn)"
+                :source="seg.value"
+              />
             </template>
-          </p>
+          </div>
         </div>
 
         <!-- 发言动作行：挂在气泡下方独立一行（右沿对齐），hover 才显形；
@@ -2855,12 +2609,12 @@ function triggerFollowUp(prompt: string) {
               @quote="quoteToComposer"
               @copy="onCopyText"
             />
-            <div
+            <HlPilotMarkdown
               v-if="turn.text"
               class="pilot-answer"
               :class="{ 'is-clamped': isLongAnswer(turn) && !turn.expanded }"
-              v-html="renderAnswerHtml(turn.text)"
-            ></div>
+              :source="turn.text"
+            />
             <button
               v-if="isLongAnswer(turn)"
               type="button"
@@ -2880,12 +2634,12 @@ function triggerFollowUp(prompt: string) {
               @quote="quoteToComposer"
               @copy="onCopyText"
             />
-            <div
+            <HlPilotMarkdown
               v-if="turn.text"
               class="pilot-answer"
               :class="{ 'is-clamped': isLongAnswer(turn) && !turn.expanded }"
-              v-html="renderAnswerHtml(turn.text)"
-            ></div>
+              :source="turn.text"
+            />
             <button
               v-if="isLongAnswer(turn)"
               type="button"
@@ -2997,13 +2751,13 @@ function triggerFollowUp(prompt: string) {
             @copy="onCopyText"
           />
           <!-- 终答就位：文字流式期在链下原位生长，done 时正式卡接手卡区 -->
-          <div v-if="liveAnswerHtml" class="pilot-answer" v-html="liveAnswerHtml"></div>
+          <HlPilotMarkdown v-if="liveAnswerSource" class="pilot-answer" :source="liveAnswerSource" />
           <div v-if="queuedHint" class="pilot-queued">
             {{ t(queuedHint === 'parallel' ? 'pilot.queued.parallel'
               : queuedHint === 'toolSlow' ? 'pilot.queued.toolSlow' : 'pilot.queued.waiting') }}
           </div>
           <!-- 运行中动作行：与终态回复同一位置同一套钮，只在已流出正文时给复制 -->
-          <div v-if="liveAnswerHtml" class="pilot-acts">
+          <div v-if="liveAnswerSource" class="pilot-acts">
             <button
               type="button"
               class="pilot-act"
@@ -3522,128 +3276,7 @@ function triggerFollowUp(prompt: string) {
 }
 
 /* 列体尺寸由宿主挂点（Index 的 .pilot-page__side）约束，这里只管纵向分布 */
-.pilot-side {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.pilot-side__tools {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.pilot-side__new {
-  flex: 1;
-  min-width: 0;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 10px;
-  border: 1px dashed var(--border-soft);
-  border-radius: 8px;
-  background: none;
-  color: var(--text-secondary);
-  font-size: 12px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-
-.pilot-side__new:hover:not(:disabled),
-.pilot-side__new.is-current {
-  border-color: var(--accent-a30);
-  background: var(--accent-a10);
-  color: var(--accent);
-}
-
-.pilot-side__new:disabled {
-  opacity: 0.4;
-}
-
-.pilot-side__new svg {
-  width: 13px;
-  height: 13px;
-  flex: none;
-}
-
-.pilot-side__scroll {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 2px;
-  scrollbar-width: thin;
-  scrollbar-color: var(--scroll-thumb) transparent;
-}
-
-.pilot-side__row {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 8px;
-  border-radius: 8px;
-  cursor: pointer;
-}
-
-.pilot-side__row:hover {
-  background: var(--accent-a10);
-}
-
-.pilot-side__row.is-current {
-  background: var(--accent-a10);
-}
-
-.pilot-side__row.is-current::before {
-  content: '';
-  position: absolute;
-  left: 0;
-  top: 6px;
-  bottom: 6px;
-  width: 2px;
-  border-radius: 1px;
-  background: var(--accent);
-}
-
-.pilot-side__main {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.pilot-side__name {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 12px;
-  color: var(--text-primary);
-}
-
-.pilot-side__row.is-current .pilot-side__name {
-  color: var(--accent);
-}
-
-.pilot-side__meta {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 11px;
-  color: var(--text-secondary);
-  font-variant-numeric: tabular-nums;
-}
-
-/* 生成中脉动点：accent 圆点呼吸（reduced-motion 降级为常亮） */
+/* 生成中脉动点（标签栏）：accent 圆点呼吸；会话列同类规则在 HlPilotSidebar 内 */
 .pilot-side__running {
   flex: none;
   width: 6px;
@@ -3669,107 +3302,6 @@ function triggerFollowUp(prompt: string) {
   }
 }
 
-.pilot-side__x {
-  flex: none;
-  display: grid;
-  place-items: center;
-  width: 20px;
-  height: 20px;
-  padding: 0;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--text-secondary);
-  cursor: pointer;
-  opacity: 0;
-  transition: opacity 0.15s;
-}
-
-.pilot-side__row:hover .pilot-side__x,
-.pilot-side__x.is-armed,
-.pilot-side__x.is-ok {
-  opacity: 1;
-}
-
-.pilot-side__x:hover,
-.pilot-side__x.is-armed {
-  background: var(--accent-a10);
-  color: var(--warning);
-}
-
-.pilot-side__x.is-ok {
-  color: var(--success);
-}
-
-.pilot-side__x svg {
-  width: 12px;
-  height: 12px;
-}
-
-/* 已置顶/已归档动作钮：状态恒显（不靠 hover），用 accent 标「开着」 */
-.pilot-side__x.is-on {
-  opacity: 1;
-  color: var(--accent);
-}
-
-/* 搜索框：常驻列头（固定不随列表滚动） */
-.pilot-side__search {
-  flex: none;
-}
-
-.pilot-side__search-box {
-  width: 100%;
-}
-
-/* 归档折叠头：点开条，弱色不抢主列注意力 */
-.pilot-side__arch {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  padding: 5px 8px;
-  border: none;
-  background: none;
-  color: var(--text-dim);
-  font-size: 11px;
-  text-align: left;
-  cursor: pointer;
-}
-
-.pilot-side__arch:hover {
-  color: var(--text-secondary);
-}
-
-.pilot-side__arch-ico {
-  width: 11px;
-  height: 11px;
-  flex: none;
-  transition: transform 0.15s;
-}
-
-.pilot-side__arch-ico.is-open {
-  transform: rotate(90deg);
-}
-
-/* 归档项在主列之外再压一档：名与元信息降色 */
-.pilot-side__row.is-arch .pilot-side__name {
-  color: var(--text-secondary);
-}
-
-/* 置顶标记：小图钉恒显（不是 hover 才出的动作钮） */
-.pilot-side__pinmark {
-  flex: none;
-  display: grid;
-  place-items: center;
-  width: 11px;
-  height: 11px;
-  color: var(--accent);
-}
-
-.pilot-side__pinmark svg {
-  width: 11px;
-  height: 11px;
-}
-
 /* 派生标记：标题前缀的常驻小图标（会话列 / 标签栏 / 历史面板共用）——
    放前缀是因为窄列会省略标题尾部，后缀标记会被截掉 */
 .pilot-forkmark {
@@ -3787,35 +3319,6 @@ function triggerFollowUp(prompt: string) {
   width: 11px;
   height: 11px;
   stroke: currentColor;
-}
-
-/* 检索命中的正文片段：单行省略（「…」由后端裁好） */
-.pilot-side__snippet {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 11px;
-  color: var(--text-dim);
-}
-
-/* 行内动作组：置顶/归档/删除三钮并排（占位恒定，hover 才显形） */
-.pilot-side__acts {
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: 2px;
-}
-
-.pilot-side__rename {
-  flex: 1;
-  min-width: 0;
-}
-
-.pilot-side__empty {
-  padding: 12px 8px;
-  font-size: 12px;
-  color: var(--text-secondary);
-  text-align: center;
 }
 
 /* 窄屏整页回落标签栏：左列由 Index 隐藏，tabbar 恢复（会话入口不丢） */
@@ -5436,16 +4939,7 @@ function triggerFollowUp(prompt: string) {
   height: 13px;
 }
 
-/* 回答走对话流排版（不装箱）：markdown 标签由渲染器产出，scoped 下用 :deep() 着样式 */
-.pilot-answer {
-  margin: 0;
-  font-size: 13px;
-  line-height: 1.75;
-  color: var(--text-primary);
-  word-break: break-word;
-}
-
-/* 长回答折叠：渐隐裁切 + 展开/收起钮（阈值 700 字；展开态按轮记忆） */
+/* 回答排版由 HlPilotMarkdown 组件承载；此处只留折叠裁切等容器行为 */
 .pilot-answer.is-clamped {
   position: relative;
   max-height: 320px;
@@ -5532,296 +5026,6 @@ function triggerFollowUp(prompt: string) {
   width: 12px;
   height: 12px;
   flex: none;
-}
-
-.pilot-answer :deep(p) {
-  margin: 0 0 6px;
-}
-
-.pilot-answer :deep(p:last-child) {
-  margin-bottom: 0;
-}
-
-.pilot-answer :deep(strong) {
-  font-weight: 600;
-}
-
-.pilot-answer :deep(code) {
-  padding: 1px 5px;
-  border-radius: 4px;
-  background: var(--accent-a10);
-  font-size: 12px;
-}
-
-.pilot-answer :deep(ul),
-.pilot-answer :deep(ol) {
-  margin: 2px 0 6px;
-  padding-left: 18px;
-  display: grid;
-  gap: 2px;
-}
-
-.pilot-answer :deep(li)::marker {
-  color: var(--text-secondary);
-}
-
-.pilot-answer :deep(pre) {
-  margin: 4px 0 8px;
-  padding: 10px 12px;
-  border: 1px solid var(--border-soft);
-  border-radius: 8px;
-  background: var(--bg-card);
-  overflow-x: auto;
-}
-
-.pilot-answer :deep(pre code) {
-  padding: 0;
-  background: none;
-  border-radius: 0;
-  font-size: 12px;
-  line-height: 1.6;
-}
-
-.pilot-answer :deep(.pilot-svg) {
-  margin: 8px 0 12px;
-  border: 1px solid var(--border-soft);
-  border-radius: 10px;
-  background: var(--bg-card);
-  overflow: hidden;
-}
-
-.pilot-answer :deep(.pilot-svg-toolbar) {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 6px 10px;
-  border-bottom: 1px solid var(--border-soft);
-  background: var(--bg-hover);
-  font-size: 11px;
-}
-
-.pilot-answer :deep(.pilot-svg-badge) {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  font-size: 11px;
-}
-
-.pilot-answer :deep(.pilot-svg-badge svg) {
-  width: 12px;
-  height: 12px;
-  color: var(--accent);
-}
-
-.pilot-answer :deep(.pilot-svg-actions) {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.pilot-answer :deep(.pilot-svg-tab) {
-  padding: 2px 8px;
-  border: 1px solid transparent;
-  border-radius: 5px;
-  background: none;
-  color: var(--text-secondary);
-  font-size: 11px;
-  cursor: pointer;
-  transition: all calc(var(--duration-1) * var(--motion-scale)) ease;
-}
-
-.pilot-answer :deep(.pilot-svg-tab:hover) {
-  color: var(--text-primary);
-  background: var(--bg-card);
-}
-
-.pilot-answer :deep(.pilot-svg-tab.is-active) {
-  color: var(--accent);
-  background: var(--bg-card);
-  border-color: var(--border-soft);
-  font-weight: 600;
-}
-
-.pilot-answer :deep(.pilot-svg-quote),
-.pilot-answer :deep(.pilot-svg-copy) {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 22px;
-  padding: 0;
-  border: none;
-  border-radius: 5px;
-  background: none;
-  color: var(--text-secondary);
-  cursor: pointer;
-  transition: all calc(var(--duration-1) * var(--motion-scale)) ease;
-}
-
-.pilot-answer :deep(.pilot-svg-quote svg),
-.pilot-answer :deep(.pilot-svg-copy svg) {
-  width: 13px;
-  height: 13px;
-}
-
-.pilot-answer :deep(.pilot-svg-quote:hover),
-.pilot-answer :deep(.pilot-svg-copy:hover) {
-  color: var(--accent);
-  background: var(--bg-card);
-}
-
-.pilot-answer :deep(.pilot-svg-stage) {
-  padding: 12px;
-  overflow-x: auto;
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  background: var(--bg-card);
-}
-
-.pilot-answer :deep(.pilot-svg-stage svg) {
-  display: block;
-  width: 100%;
-  height: auto;
-  max-width: 720px;
-}
-
-.pilot-answer :deep(.pilot-svg-source) {
-  padding: 10px 12px;
-  background: var(--bg-card);
-  overflow-x: auto;
-}
-
-.pilot-answer :deep(.pilot-svg-source pre) {
-  margin: 0;
-  padding: 0;
-  background: none;
-}
-
-.pilot-answer :deep(.pilot-svg-source code) {
-  font-size: 12px;
-  line-height: 1.5;
-  color: var(--text-primary);
-}
-
-.pilot-answer :deep(.pilot-svg.is-pending) {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 56px;
-  padding: 12px;
-  color: var(--text-secondary);
-  font-size: 12px;
-}
-
-.pilot-answer :deep(.pilot-svg.is-drawing) {
-  border-color: var(--accent-a30);
-  box-shadow: 0 0 12px var(--accent-a08);
-}
-
-.pilot-answer :deep(.pilot-svg-badge.is-drawing) {
-  color: var(--accent);
-}
-
-.pilot-answer :deep(.pilot-svg-badge.is-drawing svg) {
-  animation: pilot-svg-spin 2s linear infinite;
-}
-
-@keyframes pilot-svg-spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .pilot-answer :deep(.pilot-svg-badge.is-drawing svg) {
-    animation: none;
-  }
-}
-
-.pilot-answer :deep(h3) {
-  margin: 10px 0 4px;
-  padding-left: 8px;
-  border-left: 3px solid var(--accent);
-  font-size: 13px;
-  font-weight: 600;
-  line-height: 1.5;
-  color: var(--text-primary);
-}
-
-.pilot-answer :deep(h3:first-child) {
-  margin-top: 0;
-}
-
-.pilot-answer :deep(mark) {
-  padding: 0 3px;
-  border-radius: 4px;
-  background: var(--accent-a15);
-  color: var(--text-primary);
-  font-weight: 600;
-}
-
-.pilot-answer :deep(blockquote) {
-  margin: 4px 0 8px;
-  padding: 8px 10px;
-  border-left: 3px solid var(--accent);
-  border-radius: 0 8px 8px 0;
-  background: var(--accent-a10);
-}
-
-.pilot-answer :deep(blockquote p) {
-  margin: 0;
-  font-size: 12px;
-  line-height: 1.6;
-  color: var(--text-secondary);
-}
-
-.pilot-answer :deep(hr) {
-  margin: 8px 0;
-  border: none;
-  border-top: 1px solid var(--border-soft);
-}
-
-.pilot-answer :deep(.pilot-table-wrap) {
-  margin: 8px 0 10px;
-  max-width: 100%;
-  overflow-x: auto;
-  border-radius: 8px;
-  border: 1px solid var(--border-soft);
-  background: var(--bg-card);
-}
-
-.pilot-answer :deep(.pilot-table) {
-  width: 100%;
-  min-width: 100%;
-  border-collapse: collapse;
-  font-size: 12px;
-  line-height: 1.5;
-  text-align: left;
-}
-
-.pilot-answer :deep(.pilot-table th) {
-  padding: 8px 10px;
-  background: var(--surface-inset);
-  color: var(--text-secondary);
-  font-weight: 600;
-  border-bottom: 1px solid var(--border-soft);
-  white-space: nowrap;
-}
-
-.pilot-answer :deep(.pilot-table td) {
-  padding: 7px 10px;
-  border-bottom: 1px solid var(--border-soft);
-  color: var(--text-primary);
-}
-
-.pilot-answer :deep(.pilot-table tr:last-child td) {
-  border-bottom: none;
-}
-
-.pilot-answer :deep(.pilot-table tbody tr:hover) {
-  background: var(--accent-a10);
 }
 
 .pilot-briefing__title {

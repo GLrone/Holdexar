@@ -789,6 +789,28 @@ def test_run_tool_quick_path(monkeypatch):
     assert raised
 
 
+def test_run_tool_busy_session_gated(monkeypatch):
+    """快捷直达与会话在飞轮同闸：同会话在飞时拒绝并发写账本。"""
+    import asyncio
+
+    from app.domains.pilot import service as pilot_service
+
+    monkeypatch.setattr(
+        pilot_tools.rates_service, "list_rates",
+        _async_return({"rates": [{"currency": "USD", "rateToCny": 7.24, "fetchedAt": None}]}),
+    )
+    monkeypatch.setattr(pilot_service, "_INFLIGHT_TURNS", {"sid-busy": 1})
+    try:
+        asyncio.run(pilot_service.run_tool("rates_overview", label="x", session_id="sid-busy"))
+        raised = False
+    except ValueError:
+        raised = True
+    assert raised
+    # 空会话不受闸影响
+    out = asyncio.run(pilot_service.run_tool("rates_overview", label="x", session_id=None))
+    assert out["step"]["label"] == "rates"
+
+
 def test_parse_ddg_extracts_results():
     html = (
         '<div class="result results_links">'

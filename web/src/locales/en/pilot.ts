@@ -289,6 +289,7 @@ const pilot = {
   'pilot.svgPreview': 'Preview',
   'pilot.svgCode': 'Code',
   'pilot.svgCopy': 'Copy code',
+  'pilot.codeCopy': 'Copy code',
   'pilot.svgQuote': 'Add to chat',
   'pilot.reason.busy': 'This chat already has a turn in progress — wait for it to finish before asking again.',
   'pilot.reason.need_target': 'Several similar games found — tap one or reply with a number.',

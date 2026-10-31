@@ -31,7 +31,8 @@ TOKEN_HEADER = "x-holdexar-mcp"
 TOKEN_FILENAME = "mcp-token"
 
 # 不进 MCP 面的工具：依赖领航员会话（sid）的提议确认流与附件读取，
-# 或只对领航台 UI 有意义的导航 / 组件投影。
+# 或只对领航台 UI 有意义的导航 / 组件投影；编排入口 start_task 可触发任务
+# 执行（含 dev_pytest），外部客户端无审批通道，同不暴露。
 EXCLUDED_TOOLS = frozenset({
     "navigate",
     "present_ui",
@@ -39,6 +40,7 @@ EXCLUDED_TOOLS = frozenset({
     "find_deletables",
     "propose_delete",
     "propose_bulk",
+    "start_task",
 })
 
 
@@ -50,7 +52,7 @@ def _ensure_tools():
 
 
 def tool_projection() -> list[Any]:
-    """注册表 → MCP Tool 投影（排除会话 / UI 绑定工具）。"""
+    """注册表 → MCP Tool 投影（排除会话 / UI 绑定工具与写组工具）。"""
     from mcp.types import Tool, ToolAnnotations
 
     registry = _ensure_tools()
@@ -66,20 +68,23 @@ def tool_projection() -> list[Any]:
             ),
         )
         for s in registry.all()
-        if s.name not in EXCLUDED_TOOLS
+        if s.name not in EXCLUDED_TOOLS and s.group != "write"
     ]
 
 
 async def execute_tool(name: str, arguments: dict) -> list[Any]:
-    """MCP 工具调用 → 公共执行边界（executor），结果 JSON 文本回传。"""
+    """MCP 工具调用 → 公共执行边界（executor），结果 JSON 文本回传。
+
+    写组工具与排除面同闸：外部客户端没有审批 UI，写动作只能经领航台
+    提议流确认，不允许从 MCP 直达（fail-closed）。"""
     from mcp.shared.exceptions import McpError
     from mcp.types import INVALID_PARAMS, ErrorData, TextContent
     from app.domains.agent.runtime import executor
 
     registry = _ensure_tools()
     spec = registry.get(name)
-    if spec is None or spec.name in EXCLUDED_TOOLS:
-        raise McpError(ErrorData(code=INVALID_PARAMS, message=f"unknown tool: {name}"))
+    if spec is None or spec.name in EXCLUDED_TOOLS or spec.group == "write":
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=f"tool not available over MCP: {name}"))
     result = await executor.execute(spec, dict(arguments or {}))
     payload = {"status": result.status, **result.data}
     return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, default=str))]

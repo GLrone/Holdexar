@@ -289,6 +289,7 @@ const pilot = {
   'pilot.svgPreview': '预览',
   'pilot.svgCode': '源码',
   'pilot.svgCopy': '复制代码',
+  'pilot.codeCopy': '复制代码',
   'pilot.svgQuote': '添加到对话',
   'pilot.reason.busy': '这个会话正有一轮在处理，等它完成后再继续提问。',
   'pilot.reason.need_target': '库里找到几款相近的游戏——点一个，或回复编号。',
