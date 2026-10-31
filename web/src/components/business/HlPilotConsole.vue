@@ -1150,8 +1150,6 @@ onBeforeUnmount(() => {
   if (outlineProbeTimer !== null) clearTimeout(outlineProbeTimer)
   scrollBox.value?.removeEventListener('load', pinIfFollow, true)
   window.removeEventListener('resize', pinIfFollow)
-  if (deleteArmTimer) clearTimeout(deleteArmTimer)
-  if (sessionSearchTimer) clearTimeout(sessionSearchTimer)
 })
 
 /* 流式 delta 合帧：token 级 setState 是逐字全量重渲染（v-html 整段重跑
