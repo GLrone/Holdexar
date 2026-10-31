@@ -54,6 +54,10 @@ CONTENT_PATTERNS: list[tuple[str, str]] = [
     (r"""steam_api_key["']?\s*[:=]\s*["']?[A-Fa-f0-9]{32}""", "Steam Web API Key（32 位十六进制）"),
     # SMTP 授权码：QQ/163 等为 16 位纯字母数字。测试里的 "saved-pass" 因含连字符且不足 12 位而漏过。
     (r"""smtp\.password["']?\s*[:=]\s*["'][A-Za-z0-9]{12,}["']""", "SMTP 授权码"),
+    # 代理节点 URI：真实订阅链接/节点分享链不得入库。解析器测试的合成向量
+    # （RFC 文档主机 + 假凭据的节点分享链样例）是合法测试输入，无法凭形状
+    # 与真值区分——该规则对测试文件收窄（_test.go / *_test.py / test_*.py），
+    # 其余规则对测试文件照常全量扫描。
     (r"\b(?:vless|vmess|trojan|ss|ssr|hysteria2?)://", "代理节点 / 订阅链接"),
     (r"-----BEGIN [A-Z ]*PRIVATE KEY-----", "私钥"),
     # 含密码的数据库连接串。要求密码段为 ≥8 位可打印 ASCII，
@@ -65,6 +69,13 @@ CONTENT_PATTERNS: list[tuple[str, str]] = [
 
 _COMPILED_PATHS = [(re.compile(p), label) for p, label in PATH_DENY]
 _COMPILED_CONTENT = [(re.compile(p), label) for p, label in CONTENT_PATTERNS]
+
+# 测试文件后缀：内容层里被标记「测试收窄」的规则在这些文件跳过（见
+# CONTENT_PATTERNS 内代理节点规则的注释）。匹配目标是路径结尾，不碰目录段。
+_TEST_FILE = re.compile(r"(?:_test\.go|(?:test_[^/]*|[^/]*_test)\.py)$")
+
+# 内容层里对测试文件收窄的规则标签（与 CONTENT_PATTERNS 的 label 对应）。
+_TEST_NARROWED_LABELS = {"代理节点 / 订阅链接"}
 
 
 def _mask(value: str) -> str:
@@ -114,9 +125,12 @@ def check_size(path: str, size: int) -> list[Finding]:
 
 def scan_lines(path: str, lines: list[tuple[int, str]]) -> list[Finding]:
     """扫 (行号, 行内容) 列表；命中只报标签 + 位置 + 掩码。"""
+    is_test_file = bool(_TEST_FILE.search(path))
     findings = []
     for lineno, text in lines:
         for pattern, label in _COMPILED_CONTENT:
+            if is_test_file and label in _TEST_NARROWED_LABELS:
+                continue
             match = pattern.search(text)
             if match:
                 findings.append(Finding(path, label, f"第 {lineno} 行，{_mask(match.group(0))}"))
