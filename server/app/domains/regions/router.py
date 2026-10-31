@@ -19,15 +19,6 @@ class OwnedUpdate(BaseModel):
     regions: list[str] | None = None
 
 
-@router.get("")
-async def get_regions() -> dict:
-    """区服元数据单一来源：前端删除硬编码副本，从这里下发。"""
-    return {
-        "regions": await service.list_regions(),
-        "ownedRegions": await service.owned_regions(),
-    }
-
-
 @router.put("/enabled")
 async def update_enabled(payload: EnabledUpdate) -> dict:
     try:
