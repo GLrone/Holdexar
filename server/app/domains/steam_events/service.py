@@ -15,7 +15,7 @@ import logging
 import re
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import func, select, text
+from sqlalchemy import select, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.database import WritePriority, get_session_factory, write_session
@@ -37,8 +37,6 @@ _REQUEST_HEADERS = {
         "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
     ),
 }
-# 启动兜底阈值：快照龄超过该值才真正抓取（每日 cron 是常规同步拍）
-SYNC_STALE_HOURS = 72
 # API 响应的 stale 标记阈值：超过则前端提示「数据较旧」
 RESPONSE_STALE_HOURS = 24 * 7
 # 打标窗口缓存有效期（爬虫高频调用，避免每行观测都查库）
@@ -327,28 +325,6 @@ async def active_event_key_at(ts: datetime) -> str | None:
         if start <= day <= end:
             return key
     return None
-
-
-async def refresh_if_stale() -> bool:
-    """快照龄超阈值即补同步（启动链兜底）。返回是否触发了同步。"""
-    from app.domains.settings.service import get_value
-
-    if not await get_value("fetch.steam_events", True):
-        return False
-    async with get_session_factory()() as session:
-        last = (
-            await session.execute(select(func.max(SteamEvent.source_updated_at)))
-        ).scalar()
-    if last is not None:
-        age_hours = (_now() - _as_naive(last)).total_seconds() / 3600
-        if age_hours < SYNC_STALE_HOURS:
-            return False
-    try:
-        await sync()
-        return True
-    except Exception:  # noqa: BLE001 —— 失败留日志等下一拍，旧数据继续展示
-        log_event(logger, "Steam 活动日历启动补同步失败", level=logging.ERROR, exc_info=True)
-        return False
 
 
 def _serialize(row: SteamEvent) -> dict:

@@ -47,6 +47,8 @@ class ApplyResult:
     state_changes: tuple[tuple[str, str, str], ...] = ()
     # 输入快照比已落库的最新成功快照更旧 → 整体跳过（见「顺序语义」注释）
     skipped_stale: bool = False
+    # 输入快照就是最新成功快照（同内容重放）→ 无需对齐，跳过同值重写
+    skipped_identical: bool = False
 
 
 async def lock_subscription_mutation(session: AsyncSession, subscription_id: int) -> None:
@@ -184,6 +186,17 @@ async def settle_nodes_after_source_change(
     return tuple(changes)
 
 
+def _desired_nodes(nodes: Iterable[Mapping], tag: str) -> dict[str, Mapping]:
+    """快照 → 指纹表（信息占位节点不进 Registry；同指纹首见者胜）。"""
+    desired: dict[str, Mapping] = {}
+    for node in nodes:
+        # 信息占位节点（旧快照重放仍可能携带）不进 Registry——它们不是代理端点
+        if is_info_placeholder(str(node.get("name") or "")):
+            continue
+        desired.setdefault(node_fingerprint(node, tag), node)
+    return desired
+
+
 async def apply_snapshot(
     session: AsyncSession,
     *,
@@ -223,6 +236,24 @@ async def apply_snapshot(
         )
         if newest_id is not None and incoming_id < newest_id:
             return ApplyResult((), (), (), (), skipped_stale=True)
+        if newest_id is not None and incoming_id == newest_id:
+            # 同内容重放：本订阅名下节点集合与快照指纹集一致、且每行的名称与
+            # 归一化配置逐字段相等 = 注册表已完整反映这份事实——对齐的其余
+            # 产出只有无读者的时间戳推进，跳过（同值 UPDATE 不进 WAL）。
+            # 任一不等（首次应用/改名/改配置/改绑补登/内容回退）都走对齐。
+            desired = _desired_nodes(snapshot.nodes, tag)
+            rows = (await session.execute(
+                select(ProxyNode.node_id, ProxyNode.original_name,
+                       ProxyNode.normalized_config).where(
+                    ProxyNode.subscription_id == subscription_id,
+                )
+            )).all()
+            if {r.node_id for r in rows} == set(desired) and all(
+                r.original_name == str(desired[r.node_id].get("name") or "")
+                and (r.normalized_config or {}) == dict(desired[r.node_id])
+                for r in rows
+            ):
+                return ApplyResult((), (), (), (), skipped_identical=True)
 
     return await _apply_nodes(session, subscription_id=subscription_id, nodes=snapshot.nodes,
                               now=now, tag=tag)
@@ -233,12 +264,7 @@ async def _apply_nodes(
     now: datetime, tag: str, restore_only: bool = False,
 ) -> ApplyResult:
     """登记节点身份；缓存恢复只补缺口，不刷新健康或替换当前来源集合。"""
-    desired: dict[str, Mapping] = {}
-    for node in nodes:
-        # 信息占位节点（旧快照重放仍可能携带）不进 Registry——它们不是代理端点
-        if is_info_placeholder(str(node.get("name") or "")):
-            continue
-        desired.setdefault(node_fingerprint(node, tag), node)
+    desired = _desired_nodes(nodes, tag)
     desired_fp = set(desired)
 
     rows = (await session.execute(select(ProxyNode).where(

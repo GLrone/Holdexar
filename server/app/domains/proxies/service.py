@@ -2444,6 +2444,8 @@ async def _merge_last_stats(sub_id: int, **fields) -> None:
             if key == "traffic" and not value:
                 continue
             stats[key] = value
+        if stats == (sub.last_stats or {}):
+            return  # 同值重算不落写：周期拍的无变化回填不再逐次进 WAL
         sub.last_stats = stats
         await session.commit()
 

@@ -71,6 +71,9 @@ logger = logging.getLogger(__name__)
 
 MAX_CONCURRENT_SUBSCRIPTION_FETCHES = 5
 POOL_FETCH_HEALTH_MAX_AGE = timedelta(hours=72)
+# 订阅自动重拉最短间隔：距上次成功拉取不足该时长的订阅，30 分钟拍整条跳过
+# （同内容重拉无收益；节点活性由池健康层守护，手动重拉与单订阅口径不受限）
+AUTO_REPULL_MIN_INTERVAL_HOURS = 2
 
 
 @dataclass(frozen=True)
@@ -270,6 +273,24 @@ async def _sync_subscriptions_under_locks(
                 detail={"订阅编号": "、".join(str(i) for i in off)},
             )
         subs = auto_subs
+        # 重拉间隔门：距上次成功拉取不足间隔的订阅本轮整条跳过——不下载、
+        # 不动节点账本；失败的订阅不受此门（照常按拍重试）
+        fresh_cutoff = now - timedelta(hours=AUTO_REPULL_MIN_INTERVAL_HOURS)
+        gated = [
+            s for s in subs
+            if s.last_fetch_status == "OK"
+            and s.last_fetch_at is not None
+            and s.last_fetch_at > fresh_cutoff
+        ]
+        if gated:
+            subs = [s for s in subs if s not in gated]
+            log_event(
+                logger,
+                f"{len(gated)} 条订阅距上次成功拉取不足 "
+                f"{AUTO_REPULL_MIN_INTERVAL_HOURS} 小时，本轮跳过",
+                tag="跳过",
+                detail={"订阅编号": "、".join(str(s.id) for s in gated)},
+            )
     if skip_sub_ids:
         subs = [sub for sub in subs if sub.id not in skip_sub_ids]
     subs = [sub for sub in subs if int(sub.id) in locked_ids]

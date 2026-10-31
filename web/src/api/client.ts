@@ -1483,8 +1483,6 @@ export interface GameListItem {
   releaseDate: string
   /** 国区折后现价分（历史名沿用：base=当前基础报价，非原价） */
   basePriceFen: number | null
-  /** 国区原价（未折价分）；划线原价展示用 */
-  cnOriginalFen: number | null
   lowestPriceFen: number | null
   savingsFen: number
   headerImage: string
@@ -1512,15 +1510,6 @@ export interface GameListItem {
   bundleCount: number | null
   /** 下架监控：非空 = 已判定下架（ISO）；null = 在售 */
   removedAt: string | null
-  /** smart 排序评分（0~1 加权和；公式见后端 scoring.py） */
-  smartScore?: number
-  /** smart 四因子拆解（实验池对照展示用；0~1 归一值） */
-  smartFactors?: {
-    save: number
-    quality: number
-    timing: number
-    familiarity: number
-  }
 }
 
 export interface GamesListPayload {
@@ -2044,6 +2033,8 @@ export const watchPoolApi = {
 // ─── follows（关注列表：游戏卡星标 = 追踪池 manual 条目）──────────────────
 
 export const followsApi = {
+  /** 当前关注的 appid 全集（升序；星标状态一次性整表拉取） */
+  list: () => request<{ appids: number[] }>('GET', '/follows'),
   /** 关注：入追踪池 + manual 标（爬取最优先、同步免疫） */
   add: (appid: number) =>
     request<{ appid: number; followed: boolean }>('PUT', `/follows/${appid}`),
