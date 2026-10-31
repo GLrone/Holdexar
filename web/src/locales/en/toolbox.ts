@@ -132,6 +132,7 @@ const toolbox: Partial<Record<MessageKey, string>> = {
   'toolbox.cdk.history.col.item': 'Item',
   'toolbox.cdk.history.col.detail': 'Notes',
   'toolbox.cdk.history.freeItem': 'Free claim · SubID {subid}',
+  'toolbox.copy.failedHint': 'Copy failed — check browser clipboard permission and retry',
 }
 
 export default toolbox

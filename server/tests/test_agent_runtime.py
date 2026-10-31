@@ -257,6 +257,10 @@ class TestEventLedger:
         truncated = ev.build_payload(ev.EV_STEP_COMPLETED, {"step": 1, "summary": "x" * 20000})
         assert truncated["truncated"] is True
         assert truncated["bytes"] > 8192
+        # 纯函数层：未知事件类型 fail-closed——外部数据一字节不入账，只留拒绝标记
+        rejected = ev.build_payload("rogue_type", {"rogue": "x", "api_key": "k"})
+        assert rejected == {"rejected": "unknown_event_type"}
+        assert ev.build_payload("rogue_type", None) == {"rejected": "unknown_event_type"}
 
     @pytest.mark.asyncio
     async def test_events_survive_restart(self, db, monkeypatch):

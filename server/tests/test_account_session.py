@@ -19,7 +19,7 @@ from app.core.secretbox import decrypt_secret, is_encrypted
 from app.domains.account import service as account_service
 from app.domains.account import session as session_module
 from app.domains.account.models import SteamAccount
-from app.domains.account.steam_wallet import WalletInfo
+from wallet_helpers import from_raw_amounts
 from app.domains.account.session import (
     SessionRefreshError,
     access_token_expires_at,
@@ -411,7 +411,7 @@ async def test_wallet_sync_retries_after_store_session_decay(db, monkeypatch):
         seen.append(parse_cookie_str(cookies)["steamLoginSecure"])
         if len(seen) == 1:
             raise StoreSessionExpiredError("商店账户页把我们送回了登录页")
-        return WalletInfo(balance=1.0, currency_code="USD", currency_symbol="$", currency_id=1, country_code="US")
+        return from_raw_amounts(100, 0, 1, "US")
 
     monkeypatch.setattr(account_service, "fetch_wallet", _fake_fetch)
 

@@ -249,15 +249,22 @@ def _classify_free_kind(
     return ("promo", max(ends) if ends else None)
 
 
-def _missing_ledger_bump() -> dict:
-    """missing 计账 SET 片段：fail_count 旧值+1，第 MISSING_MAX_RETRIES 次
-    失败即转 blocked 终态（"连续 N 次仍失败"语义，含当次）；同时盖尝试
-    失败章（attempt_outcome=failed——两条调用方都是失败路径，价格与
-    last_success_at 不在此列，由调用方语义决定保留）。
+def _missing_ledger_bump(burn: bool = True) -> dict:
+    """missing 计账 SET 片段。fail_count 语义 = 连续「真实响应缺价」次数
+    （门禁降级证据，burn=True）：第 MISSING_MAX_RETRIES 次转 blocked——
+    blocked 的产品语义是「该区大概率无货」。
+
+    传输类失败（连接/中断/落库异常，burn=False）不消耗预算：只盖失败章，
+    冷却节奏由调用方刷新 updated_at 维持——两类时间尺度差 360 倍的失败
+    证据流（24h 补抓 vs 4min 修复轮）不得共享无归属计数，否则连续网络
+    故障会在分钟级把真游戏烧成 blocked 终态；blocked 老化重探兜底残余。
 
     UPDATE SET 与 UPSERT DO UPDATE SET 中表列均引用旧行值，两处语义一致，
-    单一定义避免转移规则漂移。
+    单一定义避免转移规则漂移。价格与 last_success_at 不在此列，由调用方
+    语义决定保留。
     """
+    if not burn:
+        return {"attempt_outcome": "failed", "steam_answer": None}
     return {
         "price_status": case(
             (GameCurrentPrice.fail_count + 1 >= MISSING_MAX_RETRIES, "blocked"),
@@ -368,7 +375,6 @@ class DbWriter:
         known_suffix, latest_snapshots = baseline
         history_batch: list[dict] = []
         standard_candidates: dict[str, list[dict]] = {}
-        degraded_regions: set[str] = set()  # 本次门禁降级的区（需欠账结转）
 
         # ── 历史差量门禁基线：该 appid 每个 (区, sub) 的最新快照。
         #    价格未变不写快照（走势图只需要变化点——线是平的，语义不损）。
@@ -395,10 +401,13 @@ class DbWriter:
             is_bundle = p.get("is_bundle", False)
             status = p.get("price_status", "ok")
             # 质量门禁：ok 但无价格 = 成功响应里的坏数据（如 gold 版
-            # 无 sub 价格），降级 missing 进账本走补抓自愈
+            # 无 sub 价格）。行级降级记史不记现；区级欠账结转只在
+            # 「选中行自身被降级」时发生（选择后重算）——混合区的
+            # 有效价选中行不再替同区坏行受过
+            row_degraded = False
             if status == "ok" and not _is_ok_price_row(price_cents):
                 status = "missing"
-                degraded_regions.add(region)
+                row_degraded = True
             cny_fen = (
                 self._compute_cny_fen(price_cents, currency)
                 if price_cents is not None
@@ -471,6 +480,7 @@ class DbWriter:
                         "discount_percent": p.get("discount_percent", 0),
                         "sub_id": p.get("sub_id") or 0,
                         "price_status": status,
+                        "degraded": row_degraded,
                         "cny_fen": cny_fen,
                         "discount_end_ts": p.get("discount_end_ts"),
                         "updated_at": now_dt,
@@ -520,11 +530,8 @@ class DbWriter:
             # 门禁降级行的实时状态在主循环里已算过，重算保持独立
             raw_status = p.get("price_status", "ok")
             price_cents = p.get("price")
-            status = (
-                "missing"
-                if raw_status == "ok" and not _is_ok_price_row(price_cents)
-                else raw_status
-            )
+            row_degraded = raw_status == "ok" and not _is_ok_price_row(price_cents)
+            status = "missing" if row_degraded else raw_status
             currency = p.get("currency", "")
             current_batch.append(
                 {
@@ -536,6 +543,7 @@ class DbWriter:
                     "discount_percent": p.get("discount_percent", 0),
                     "sub_id": p.get("sub_id") or 0,
                     "price_status": status,
+                    "degraded": row_degraded,
                     "cny_fen": self._compute_cny_fen(price_cents, currency)
                     if price_cents is not None
                     else None,
@@ -544,6 +552,13 @@ class DbWriter:
                     "steam_answer": p.get("steam_answer"),
                 }
             )
+
+        # 门禁降级按行不扩散：只对「选中行自身被门禁降级」的区欠账结转。
+        # 混合区（同区坏行 + 有效价选中行）恢复 ok 语义——坏行本就没有
+        # 价格落点，与此前一致，不构成新缺口
+        degraded_regions = {
+            row["region_code"] for row in current_batch if row.pop("degraded", False)
+        }
 
         # 门禁降级是失败观察；明确答复含 locked / 无购买选项。
         # 导入和旧调用方没有显式 answer 时按状态推导。
@@ -1311,7 +1326,7 @@ class DbWriter:
                     GameCurrentPrice.region_code,
                 ],
                 set_={
-                    **_missing_ledger_bump(),
+                    **_missing_ledger_bump(burn=False),
                     "attempt_outcome": "failed",
                     "steam_answer": None,
                     "updated_at": stmt.excluded.updated_at,

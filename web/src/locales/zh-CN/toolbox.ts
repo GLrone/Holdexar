@@ -139,6 +139,7 @@ const toolbox = {
   'toolbox.cdk.history.col.item': '内容',
   'toolbox.cdk.history.col.detail': '说明',
   'toolbox.cdk.history.freeItem': '免费领取 · SubID {subid}',
+  'toolbox.copy.failedHint': '复制失败——请检查浏览器剪贴板权限后重试',
 } as const
 
 export default toolbox
