@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type ComponentPublicInstance } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import {
   ApiError,
@@ -14,7 +14,6 @@ import {
   type PilotNavigateFacts,
   type PilotPhase,
   type PilotPriceFacts,
-  type PilotProvider,
   type PilotRegionsFacts,
   type PilotResumePayload,
   type PilotSessionListItem,
@@ -22,9 +21,9 @@ import {
   type PilotStep,
 } from '@/api/client'
 import { formatCnyFen } from '@/api/regions'
-import { buildCtxSegments, shouldShowCacheHitRate } from '@/lib/ctxSegments'
-import { canRateTurn, fmtTokens, isEmptyLlmFailure, isErrorReason, isLongAnswerText, pilotCoverUrl, positivePct, ratingClass, sessionTime } from '@/lib/pilotView'
+import { canRateTurn, isEmptyLlmFailure, isErrorReason, isLongAnswerText, pilotCoverUrl, positivePct, quoteTitleOf, ratingClass, sessionTime } from '@/lib/pilotView'
 import HlImg from '@/components/ui/HlImg.vue'
+import HlPilotComposer from '@/components/business/HlPilotComposer.vue'
 import HlPilotCards from '@/components/business/HlPilotCards.vue'
 import HlPilotChain from '@/components/business/HlPilotChain.vue'
 import HlPilotMarkdown from '@/components/business/HlPilotMarkdown.vue'
@@ -35,13 +34,8 @@ import HlPilotRuns from '@/components/business/HlPilotRuns.vue'
 import HlPilotStats from '@/components/business/HlPilotStats.vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useI18n, type MessageKey } from '@/locales'
-import HlButton from '@/components/ui/HlButton.vue'
-import HlTextarea from '@/components/ui/HlTextarea.vue'
-import HlChip from '@/components/ui/HlChip.vue'
-import HlDropdown from '@/components/ui/HlDropdown.vue'
 import HlInput from '@/components/ui/HlInput.vue'
 import { message } from '@/components/ui'
-import { useElementPicker } from '@/composables/useElementPicker'
 
 /**
  * 领航台对话核心（抽屉与整页 /pilot 共用同一实现——一事实一实现）。
@@ -81,25 +75,7 @@ const viewContext = computed(() => {
 })
 
 /** 页面元素选择器：用户点击输入框中的按钮进入选择模式，点击页面元素采集引用 */
-const {
-  isPicking: elPicking,
-  picked: pickedElements,
-  startPicking: startElPicking,
-  cancelPicking: cancelElPicking,
-  removePicked: removePickedEl,
-  clearPicked: clearPickedEls,
-} = useElementPicker()
-
-/** 已选元素引用 → 随提问发送的精简数据（只传 agent 需要的字段） */
-const elementRefs = computed(() =>
-  pickedElements.value.map((p) => ({
-    tag: p.tag,
-    label: p.label,
-    text: p.text,
-    selector: p.selector,
-    role: p.role,
-  })),
-)
+/* 页面元素选择器与待发引用/附件清单归 HlPilotComposer；发送载荷经组件 expose 取用 */
 
 interface Turn {
   q: string
@@ -175,41 +151,10 @@ function clearQueuedHint() {
   queuedHint.value = null
 }
 
-/* ── 引用：带编号（引用1 / 引用2），编号在句子里标位置 ──
-   内容存在 pendingQuotes，用户在输入框用「引用N」指明这句里各引用对应哪一段；
-   发送时把编号与正文一并交给后端，agent 据编号理解引用在句中的位置。 */
-interface PendingQuote {
-  id: string
-  /** 稳定编号：取最小未占用正整数，删除后不回填重排（句中标号保持有效） */
-  n: number
-  text: string
-  /** 展示标题：过长截断，完整内容留给悬停面板 */
-  title: string
-}
-
-const pendingQuotes = ref<PendingQuote[]>([])
-
-/** 引用在提问正文里的标号：文案走词条（中英各自的形态用户都读得懂），编号用于回取正文 */
-function quoteMarker(n: number): string {
-  return `\u3010${t('pilot.quote.markerPrefix')}${n}\u3011`
-}
-
-/** 两种语言的标号都认：括号内非数字前缀 + 编号，中英界面切换后旧轮仍解析得出 */
+/* ── 引用：带编号（引用1 / 引用2）——待发清单、标号生成与光标回填都在 HlPilotComposer；
+   消息气泡的标号解析（quoteSegments / QUOTE_MARKER_RE）留此，两种语言的标号都认：
+   括号内非数字前缀 + 编号，中英界面切换后旧轮仍解析得出 ── */
 const QUOTE_MARKER_RE = /\u3010[^\u3011\d]*(\d+)\u3011/g
-
-/** 新引用的编号：最小未占用正整数（删掉引用1后新建仍可复用 1，旧标号不受影响） */
-function nextQuoteNo(): number {
-  const used = new Set(pendingQuotes.value.map((q) => q.n))
-  let n = 1
-  while (used.has(n)) n += 1
-  return n
-}
-
-/** 引用展示标题：压平空白后截断（完整正文在悬停面板里） */
-function quoteTitleOf(text: string): string {
-  const flat = text.replace(/\s+/g, ' ').trim()
-  return flat.length > 28 ? `${flat.slice(0, 28)}…` : flat
-}
 
 /** 提问正文按引用标号切片：文本段与引用段交替，渲染层据此把标号换成胶囊 */
 function quoteSegments(q: string): { kind: 'text' | 'quote'; value: string; n?: number }[] {
@@ -240,9 +185,6 @@ function quoteTextOf(turn: { quotes?: { n: number; text: string }[] }, n: number
 }
 
 /** 本轮编号引用 → 随提问发送的结构（编号 + 正文） */
-function quotePayload(): { n: number; text: string }[] {
-  return pendingQuotes.value.map((q) => ({ n: q.n, text: q.text }))
-}
 /** 流式期步骤展平（过程链的旧口径 prop；阶段记录在场时以 phases 为准） */
 const liveStepsFlat = computed(() => livePhases.value.flatMap((p) => p.steps))
 /* 终答就位渲染：回答层只承接「尚未被工具定性的当前段」正文——tool_start
@@ -303,28 +245,13 @@ const turns = ref<Turn[]>([])
 // 追问与指代靠它串起；「新对话」重新生成。
 const sessionId = ref('')
 const scrollBox = ref<HTMLDivElement | null>(null)
-// 输入区状态栏：在用模型 + 最近一轮上下文占用（均来自后端账本/配置，前端不自测）
-const pilotModel = ref('')
-// 三态：null=尚未拿到配置（不渲染，避免误报「未配置」）/ true=可用 / false=确认未配
-const pilotReady = ref<boolean | null>(null)
-// 多供应商：菜单按厂商分组收敛/展开（活跃组默认展开）
-const pilotProviders = ref<PilotProvider[]>([])
-const pilotActiveId = ref('')
-const openGroups = ref<Set<string>>(new Set())
+// 输入区状态栏：最近一轮上下文占用（模型菜单与切换在 HlPilotComposer 内自持）
 const lastCtx = ref<{
   tokens: number
   budget: number
   breakdown?: { source: string; chars: number }[] | null
   hitRate?: number | null
 } | null>(null)
-const ctxOpen = ref(false)
-const ctxSegments = computed(() => buildCtxSegments(lastCtx.value?.breakdown))
-const ctxTitle = computed(() =>
-  lastCtx.value
-    ? t('pilot.composer.ctx', { n: `${fmtTokens(lastCtx.value.tokens)}/${fmtTokens(lastCtx.value.budget)}` })
-    : t('pilot.ctx.empty'),
-)
-const ctxCacheVisible = computed(() => shouldShowCacheHitRate(lastCtx.value?.hitRate, import.meta.env.DEV))
 // 会话统计投影（底栏 HlPilotStats 与 ctx 面板消耗段）：getSession 折叠为种子，
 // 每轮 done 原位累加——与后端 session_stats 同口径的增量折叠，不另算一遍
 const sessionStats = ref<PilotSessionStats | null>(null)
@@ -374,26 +301,7 @@ const statsTotal = computed(() => {
   if (!s) return 0
   return (s.cache_base_tokens ?? s.usage_in) + s.usage_out
 })
-const statsNumFmt = computed(() => new Intl.NumberFormat(useI18n().locale.value === 'zh-CN' ? 'zh-CN' : 'en'))
-function fmtInt(v: number): string {
-  return statsNumFmt.value.format(v)
-}
-/** 命中率百分比：部分命中永不进位到 100（99.9x 诚实显示） */
-function fmtHit(hit: number): string {
-  const p = hit * 100
-  if (p >= 100) return '100'
-  if (p > 99.9) return '99.9'
-  return String(Math.round(p * 10) / 10)
-}
-const pctFmt = new Intl.NumberFormat(useI18n().locale.value === 'zh-CN' ? 'zh-CN' : 'en', {
-  style: 'percent',
-  maximumFractionDigits: 1,
-})
-function fmtPct(v: number | null | undefined): string {
-  return typeof v === 'number' && Number.isFinite(v) ? pctFmt.format(v) : '—'
-}
 // 模型就地切换：chip 弹清单，选中即 PUT 配置（不关抽屉不跳页）
-const switchingModel = ref(false)
 // 会话管理：常驻标签栏 + 跨会话引用（清单是后端账本投影，轮后刷新；null = 投影未到，不猜）
 const sessions = ref<PilotSessionListItem[] | null>(null)
 // 历史清单读取失败标记：失败保留旧清单（可能陈旧但不静默清空），面板给显式提示
@@ -407,11 +315,6 @@ const historyOpen = ref(false)
 const historyRoot = ref<HTMLElement | null>(null)
 // 会话列检索词（输入与防抖在 HlPilotSidebar，账本重投影留此）
 const sessionQuery = ref('')
-
-const ctxPercent = computed(() => {
-  if (!lastCtx.value || lastCtx.value.budget <= 0) return 0
-  return Math.min(Math.round((lastCtx.value.tokens / lastCtx.value.budget) * 100), 100)
-})
 
 
 const REASON_KEYS: Record<string, MessageKey> = {
@@ -514,7 +417,6 @@ function openFromHistory(sid: string) {
 
 onMounted(() => {
   document.addEventListener('click', onDocClickCloseMenu)
-  void loadPilotStatus()
   void loadSessions()
   const saved = readSavedSessionId()
   if (saved) {
@@ -533,86 +435,14 @@ onMounted(() => {
 })
 
 /** 领航员在用模型与可用态（设置页保存后重开表面即刷新）。 */
-async function loadPilotStatus(retry = 0): Promise<void> {
-  try {
-    const cfg = await pilotApi.getConfig()
-    pilotModel.value = cfg.model || ''
-    pilotProviders.value = cfg.providers || []
-    pilotActiveId.value = cfg.active || ''
-    // 与后端 llm_ready 同口径：enabled + base_url + model；密钥可选，不参与判定
-    pilotReady.value = Boolean(cfg.enabled && cfg.base_url && cfg.model)
-  } catch {
-    // 冷启动窗口（后端装配/DB 写锁排队）内首次拉取会失败：按退避重拉，
-    // 不把一次失败当终态——否则整个会话都停在「未配置」，只有刷新页面才恢复
-    if (retry < 4) {
-      setTimeout(() => void loadPilotStatus(retry + 1), 800 * (retry + 1))
-      return
-    }
-    pilotReady.value = false
-  }
-}
-
-// 模型就地切换：ghost chip 弹向上清单，点击即切不关抽屉
-/** 分组清单：按供应商收敛，每组只出启用模型；当前模型不在启用清单也保底可见 */
-const menuGroups = computed(() =>
-  pilotProviders.value.map((p) => {
-    const disabled = new Set(p.models_disabled)
-    const models = p.models.filter((m) => !disabled.has(m))
-    if (p.id === pilotActiveId.value && pilotModel.value && !models.includes(pilotModel.value)) {
-      models.unshift(pilotModel.value)
-    }
-    return { id: p.id, name: p.name || t('pilot.title'), models, active: p.id === pilotActiveId.value }
-  }),
-)
-
-function toggleGroup(id: string) {
-  const next = new Set(openGroups.value)
-  if (next.has(id)) next.delete(id)
-  else next.add(id)
-  openGroups.value = next
-}
-
-const modelMenuOpen = ref(false)
-const modelPickRoot = ref<HTMLElement | null>(null)
-
-function openModelMenu() {
-  const next = new Set(openGroups.value)
-  if (pilotActiveId.value) next.add(pilotActiveId.value)
-  openGroups.value = next
-  modelMenuOpen.value = !modelMenuOpen.value
-}
-
 function onDocClickCloseMenu(e: MouseEvent) {
-  if (modelPickRoot.value && !modelPickRoot.value.contains(e.target as Node)) modelMenuOpen.value = false
   if (historyRoot.value && !historyRoot.value.contains(e.target as Node)) historyOpen.value = false
-}
-
-async function pickModel(providerId: string, m: string) {
-  const sameProvider = providerId === pilotActiveId.value
-  if (switchingModel.value || (sameProvider && m === pilotModel.value)) {
-    modelMenuOpen.value = false
-    return
-  }
-  switchingModel.value = true
-  try {
-    await pilotApi.updateConfig(sameProvider ? { model: m } : { active: providerId, model: m })
-    pilotActiveId.value = providerId
-    pilotModel.value = m
-    modelMenuOpen.value = false
-  } catch {
-    message.error(t('pilot.modelMenu.switchFailed'))
-  }
-  switchingModel.value = false
 }
 
 /* 等待话术：每轮轮换一句（有活力、说人话，不重复出现感） */
 const LOADING_KEYS = ['pilot.loading.scan', 'pilot.loading.compare', 'pilot.loading.brief', 'pilot.loading.low'] as const
 const loadingSeq = ref(0)
 const loadingText = computed(() => t(LOADING_KEYS[loadingSeq.value % LOADING_KEYS.length] as MessageKey))
-
-function goSettings() {
-  void router.push('/settings')
-}
 
 /** 重开表面 / 重启应用后续接上次对话（后端会话账本还原历史轮）。 */
 async function restoreSession(sid: string) {
@@ -683,7 +513,7 @@ function startNewChat() {
   sessionId.value = newSessionId()
   saveSessionId(sessionId.value)
   question.value = ''
-  pendingQuotes.value = []
+  composerRef.value?.clearQuotes()
   draftReady = true
   loadQueue()
   referenceSession.value = null
@@ -782,7 +612,7 @@ async function switchSession(sid: string) {
   referenceSession.value = null
   forkedFrom.value = null
   question.value = readDraft(sid)
-  pendingQuotes.value = []
+  composerRef.value?.clearQuotes()
   draftReady = true
   await restoreSession(sid)
 }
@@ -1360,59 +1190,26 @@ const selBarStyle = computed(() => {
   return { top: `${Math.max(s.top - 44, 8)}px`, left: `${Math.min(Math.max(s.left, half), limit)}px` }
 })
 
-const composer = ref<ComponentPublicInstance | null>(null)
+const composerRef = ref<InstanceType<typeof HlPilotComposer> | null>(null)
 
-/** 取回一颗待发引用：移除并回填到输入框 */
-function removePendingQuote(id: string) {
-  pendingQuotes.value = pendingQuotes.value.filter((q) => q.id !== id)
-}
-
-/** 引用回填：拖选正文收成一颗带编号的引用（「引用N」插到光标处，正文存起来） */
+/** 引用回填：消息面引用钮 / 拖选浮条 → 组件插入光标处；浮选与选区清理留在消息面 */
 function quoteToComposer(text: string) {
-  const body = text.trim()
-  if (!body) return
-  const n = nextQuoteNo()
-  pendingQuotes.value = [...pendingQuotes.value, { id: newSessionId(), n, text: body, title: quoteTitleOf(body) }]
-  // 光标处插入标号：引用在句中的位置由用户自己摆，「引用1 不如 引用2」这种对比才写得出
-  const el = composer.value?.$el as HTMLTextAreaElement | undefined
-  const cur = question.value
-  const at = el?.selectionStart ?? cur.length
-  const end = el?.selectionEnd ?? cur.length
-  const marker = quoteMarker(n)
-  question.value = `${cur.slice(0, at)}${marker}${cur.slice(end)}`
+  composerRef.value?.insertQuoteAtCursor(text)
   hideSelQuote()
   window.getSelection()?.removeAllRanges()
-  const caret = at + marker.length
-  void nextTick(() => {
-    el?.focus()
-    el?.setSelectionRange(caret, caret)
-  })
-}
-
-function onComposerKeydown(e: KeyboardEvent) {
-  // Enter 发送；输入法组词确认的 Enter（isComposing）不是发送意图，放行给编辑器
-  if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return
-  if (e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) return
-  e.preventDefault()
-  ask()
 }
 
 let abortCtrl: AbortController | null = null
 
-/* ── 长文本附件：粘贴超阈值即落盘，消息里只带引用（与后端 attachments 同源口径） ──
-   内联上限 15360 字符（对齐后端常量）：超过就不进提问字段，改存附件文件，
-   提问只带「名称 / 字符数 / 行数」；正文按需展开（区间读取，一次一块，可续读）。
-   这样输入长度不再有天花板，长文本也不会每轮重复挤占上下文。 */
-const ATTACH_INLINE_LIMIT = 15360
-/** 待发附件（发送后随本轮上屏并清空） */
-const pendingAttachments = ref<PilotAttachmentRef[]>([])
-const attachBusy = ref(false)
 /** 展开中的附件（同一时刻只展开一枚）；chunk 为空 = 正在取块 */
 const openAtt = ref<{ ref: PilotAttachmentRef; chunk: PilotAttachmentChunk | null; busy: boolean } | null>(null)
 
 function fmtChars(n: number): string {
   return n >= 10000 ? `${(n / 1000).toFixed(1)}k` : String(n)
 }
+
+/** 附件上传在途（Console 持有会话权威并驱动 API；清单展示在 HlPilotComposer） */
+const attachBusy = ref(false)
 
 async function attachText(text: string, name?: string) {
   if (!sessionId.value) {
@@ -1422,47 +1219,13 @@ async function attachText(text: string, name?: string) {
   attachBusy.value = true
   try {
     const ref_ = await pilotApi.createAttachment(sessionId.value, text, name)
-    pendingAttachments.value = [...pendingAttachments.value, ref_]
+    composerRef.value?.addAttachment(ref_)
     message.success(t('pilot.attach.added', { name: ref_.name, n: ref_.lines }))
   } catch {
     message.error(t('pilot.attach.failed'))
   } finally {
     attachBusy.value = false
   }
-}
-
-function removePendingAttachment(id: string) {
-  pendingAttachments.value = pendingAttachments.value.filter((a) => a.id !== id)
-}
-
-/** 同类引用收拢胶囊：悬停/点击弹清单（面板内单条删除，胶囊 ✕ 全清）；条目清空即收起 */
-const attGroupOpen = ref(false)
-const elGroupOpen = ref(false)
-watch(pendingAttachments, (v) => {
-  if (!v.length) attGroupOpen.value = false
-})
-watch(pickedElements, (v) => {
-  if (!v.length) elGroupOpen.value = false
-})
-const attachGroupLabel = computed(() => {
-  const atts = pendingAttachments.value
-  if (!atts.length) return t('pilot.attach.uploading')
-  if (atts.length === 1) return t('pilot.attach.chip', { name: atts[0].name, n: atts[0].lines })
-  return t('pilot.attach.group', { n: atts.length })
-})
-const elGroupLabel = computed(() => {
-  const els = pickedElements.value
-  if (els.length === 1) return t('pilot.elPicker.chip', { tag: els[0].tag, label: els[0].label || els[0].text })
-  return t('pilot.elPicker.group', { n: els.length })
-})
-
-/** 粘贴拦截：短文本照常进输入框；长文本落盘换引用（长度不再是输入的天花板） */
-function onComposerPaste(e: ClipboardEvent) {
-  const text = e.clipboardData?.getData('text/plain') ?? ''
-  if (!text || text.length <= ATTACH_INLINE_LIMIT) return
-  e.preventDefault()
-  const first = (text.split('\n')[0] ?? '').trim().slice(0, 24)
-  void attachText(text, first || t('pilot.attach.pastedName'))
 }
 
 /** 展开/收起附件内容：块按需取（truncated 时可按提示续读下一块） */
@@ -1733,7 +1496,7 @@ async function retryTurn(index: number) {
     // 未落账失败轮：直接从对话记录中移除该轮，原位重发
     turns.value.splice(index)
   }
-  if (retryAtts.length) pendingAttachments.value = retryAtts
+  if (retryAtts.length) composerRef.value?.restoreAttachments(retryAtts)
   void ask(retryQ, undefined, retryQuotes.length ? retryQuotes : undefined)
 }
 
@@ -1774,9 +1537,11 @@ function sessionLabel(item: { title?: string | null; forked_from?: string | null
 
 async function ask(text?: string, resume?: PilotResumePayload, quotes?: { n: number; text: string }[]) {
   const typedQ = (text ?? question.value).trim()
-  const sentAtts = pendingAttachments.value
-  // 编号引用：常规输入走待发区；重试/续跑由调用方把该轮的引用原样带回来
-  const sentQuotes = quotes ?? quotePayload()
+  // 待发载荷（引用/附件/元素引用）自组件取用；重试/续跑由调用方把该轮的引用原样带回来
+  const payload = composerRef.value?.getComposerPayload()
+    ?? { quotes: [] as { n: number; text: string }[], attachments: [], elements: [] }
+  const sentAtts = payload.attachments
+  const sentQuotes = quotes ?? payload.quotes
   // 允许「只挂附件、不写问题」的提交（附件本体已是内容）；提问留空时补一句，
   // 与后端回落用同一句，气泡与账本才不会一边空一边有字
   if (!typedQ && !sentAtts.length) return
@@ -1795,11 +1560,9 @@ async function ask(text?: string, resume?: PilotResumePayload, quotes?: { n: num
     question.value = ''
     dropDraft(sessionId.value)
   }
-  pendingAttachments.value = []
-  pendingQuotes.value = []
   // 元素引用随本轮发送后即清空（一次性，与附件同语义）
-  const sentElRefs = elementRefs.value.length ? [...elementRefs.value] : null
-  clearPickedEls()
+  const sentElRefs = payload.elements.length ? [...payload.elements] : null
+  composerRef.value?.clearPending()
   streaming.value = true
   abortCtrl = new AbortController()
   livePhases.value = []
@@ -1923,7 +1686,7 @@ async function ask(text?: string, resume?: PilotResumePayload, quotes?: { n: num
       failed = true
       failedMsg = String((err as Error)?.message ?? '')
       // 附件已落盘仍有效：放回待发区，用户可一键重试（不重传内容）
-      if (sentAtts.length) pendingAttachments.value = sentAtts
+      if (sentAtts.length) composerRef.value?.restoreAttachments(sentAtts)
     }
   }
   referenceSession.value = null
@@ -2858,364 +2621,24 @@ function triggerFollowUp(prompt: string) {
       </div>
     </div>
 
-    <div class="pilot-composer">
-      <!-- 引用区：一次性上下文（当前对象 / 跨会话引用 / 待发引用 / 待发附件 / 页面元素），顶置在输入文本上方，多枚自动换行 -->
-      <div
-        v-if="game || referenceSession || pendingQuotes.length || pendingAttachments.length || attachBusy || pickedElements.length"
-        class="pilot-composer__refs"
-      >
-        <!-- 当前对象上下文：随页面而来，不可移除 -->
-        <span v-if="game" class="pilot-ref" :title="game.name">
-          <HlImg
-            :src="pilotCoverUrl(game.appid)"
-            :alt="game.name"
-            loading="lazy"
-            class="pilot-ref__cover"
-          >
-            <template #fallback>
-              <span class="pilot-ref__cover-fallback">{{ (game.name || '').slice(0, 1) }}</span>
-            </template>
-          </HlImg>
-          <span class="pilot-ref__label">{{ t('pilot.context.of') }} · {{ game.name }}</span>
-        </span>
-        <!-- 跨会话引用：+ 弹最近会话清单（排除当前），选中后下一轮提问携带其要点（一次性） -->
-        <span v-if="referenceSession" class="pilot-ref" :title="referenceSession.title">
-          <svg class="pilot-ref__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-            <path d="M4 6a3 3 0 0 1 3-3h10a3 3 0 0 1 3 3v7a3 3 0 0 1-3 3H9l-5 4V6z" stroke-linecap="round" stroke-linejoin="round" />
-          </svg>
-          <span class="pilot-ref__label">{{ t('pilot.ref.chip', { title: referenceSession.title }) }}</span>
-          <button type="button" class="pilot-ref__x" :aria-label="t('pilot.ref.remove')" @click="referenceSession = null">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">
-              <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
-            </svg>
-          </button>
-        </span>
-        <!-- 待发引用：拖选后落成带编号的胶囊；编号由用户在正文里摆位置，这里显示同一编号 -->
-        <span
-          v-for="quote in pendingQuotes"
-          :key="quote.id"
-          class="pilot-ref pilot-ref--quote"
-          tabindex="0"
-        >
-          <span class="pilot-ref__no">{{ quote.n }}</span>
-          <span class="pilot-ref__label">{{ quote.title }}</span>
-          <button
-            type="button"
-            class="pilot-ref__x"
-            :aria-label="t('pilot.ref.remove')"
-            @click.stop="removePendingQuote(quote.id)"
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">
-              <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
-            </svg>
-          </button>
-          <span class="pilot-ref__quote-full">{{ quote.text }}</span>
-        </span>
-        <!-- 待发附件：同类收拢为一颗胶囊，悬停/点击弹清单（面板内单条删除，胶囊 ✕ 全清） -->
-        <div
-          v-if="pendingAttachments.length || attachBusy"
-          class="pilot-ref is-group"
-          :class="{ 'is-busy': !pendingAttachments.length }"
-          @click="attGroupOpen = !attGroupOpen"
-          @mouseenter="attGroupOpen = true"
-          @mouseleave="attGroupOpen = false"
-        >
-          <svg class="pilot-ref__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" stroke-linecap="round" stroke-linejoin="round" />
-          </svg>
-          <span class="pilot-ref__label">{{ attachGroupLabel }}</span>
-          <button
-            v-if="pendingAttachments.length"
-            type="button"
-            class="pilot-ref__x"
-            :aria-label="t('pilot.ref.remove')"
-            @click.stop="pendingAttachments = []"
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">
-              <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
-            </svg>
-          </button>
-          <Transition name="hl-pop">
-            <div v-if="attGroupOpen && pendingAttachments.length" class="pilot-ref__panel">
-              <div v-for="a in pendingAttachments" :key="a.id" class="pilot-ref__row" :title="a.name">
-                <svg class="pilot-ref__row-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-                  <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" stroke-linecap="round" stroke-linejoin="round" />
-                </svg>
-                <div class="pilot-ref__row-main">
-                  <div class="pilot-ref__row-title">{{ a.name }}</div>
-                  <div class="pilot-ref__row-meta">{{ t('pilot.attach.meta', { chars: fmtChars(a.chars), lines: a.lines }) }}</div>
-                </div>
-                <button
-                  type="button"
-                  class="pilot-ref__row-x"
-                  :aria-label="t('pilot.ref.remove')"
-                  @click.stop="removePendingAttachment(a.id)"
-                >
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">
-                    <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
-                  </svg>
-                </button>
-              </div>
-            </div>
-          </Transition>
-        </div>
-        <!-- 页面元素引用：同类收拢为一颗胶囊，悬停/点击弹清单；选择模式内再点已选元素仍可取消 -->
-        <div
-          v-if="pickedElements.length"
-          class="pilot-ref is-group"
-          @click="elGroupOpen = !elGroupOpen"
-          @mouseenter="elGroupOpen = true"
-          @mouseleave="elGroupOpen = false"
-        >
-          <svg class="pilot-ref__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-            <path d="M3 3l7 19 2-8 8-2L3 3z" stroke-linecap="round" stroke-linejoin="round" />
-          </svg>
-          <span class="pilot-ref__label">{{ elGroupLabel }}</span>
-          <button type="button" class="pilot-ref__x" :aria-label="t('pilot.ref.remove')" @click.stop="clearPickedEls()">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">
-              <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
-            </svg>
-          </button>
-          <Transition name="hl-pop">
-            <div v-if="elGroupOpen" class="pilot-ref__panel">
-              <div v-for="el in pickedElements" :key="el.id" class="pilot-ref__row" :title="el.selector">
-                <svg class="pilot-ref__row-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-                  <path d="M3 3l7 19 2-8 8-2L3 3z" stroke-linecap="round" stroke-linejoin="round" />
-                </svg>
-                <div class="pilot-ref__row-main">
-                  <div class="pilot-ref__row-title">{{ el.label || el.text }}</div>
-                  <div class="pilot-ref__row-meta">{{ el.tag }} · {{ el.selector }}</div>
-                </div>
-                <button
-                  type="button"
-                  class="pilot-ref__row-x"
-                  :aria-label="t('pilot.ref.remove')"
-                  @click.stop="removePickedEl(el.id)"
-                >
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">
-                    <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
-                  </svg>
-                </button>
-              </div>
-            </div>
-          </Transition>
-        </div>
-      </div>
-      <HlTextarea
-        ref="composer"
-        v-model="question"
-        :rows="2"
-        class="pilot-composer__input"
-        :placeholder="t('pilot.ask.placeholder')"
-        @keydown="onComposerKeydown"
-        @paste="onComposerPaste"
-      />
-      <div class="pilot-composer__bar">
-        <div class="pilot-composer__chips">
-          <HlDropdown :items="plusMenuItems" trigger="click" direction="up" @select="onMenuSelect">
-            <HlChip tone="neutral" class="pilot-ref-add" :title="t('pilot.ref.add')">
-              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                <path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
-              </svg>
-            </HlChip>
-          </HlDropdown>
-          <!-- 页面元素选择：点击进入选择模式，再点已选元素可取消 -->
-          <button
-            type="button"
-            class="pilot-el-pick"
-            :class="{ 'is-active': elPicking }"
-            :title="elPicking ? t('pilot.elPicker.cancel') : t('pilot.elPicker.start')"
-            :aria-label="elPicking ? t('pilot.elPicker.cancel') : t('pilot.elPicker.start')"
-            @click="elPicking ? cancelElPicking() : startElPicking({ pickedHint: t('pilot.elPicker.picked') })"
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-              <path d="M3 3l7 19 2-8 8-2L3 3z" stroke-linecap="round" stroke-linejoin="round" />
-            </svg>
-          </button>
-          <div
-            class="pilot-ctxpick"
-            @click.stop
-            @mouseenter="ctxOpen = true"
-            @mouseleave="ctxOpen = false"
-          >
-            <button
-              type="button"
-              class="pilot-ctxpick__btn"
-              :class="{ 'is-warn': ctxPercent > 85 }"
-              :title="ctxTitle"
-              :aria-label="ctxTitle"
-              @click="ctxOpen = !ctxOpen"
-            >
-              <svg class="pilot-ctxpick__ring" viewBox="0 0 20 20" aria-hidden="true">
-                <circle cx="10" cy="10" r="8" fill="none" stroke="currentColor"
-                        stroke-width="2.5" opacity="0.25" />
-                <circle cx="10" cy="10" r="8" fill="none" stroke="currentColor"
-                        stroke-width="2.5" stroke-linecap="round"
-                        stroke-dasharray="50.265 50.265"
-                        :stroke-dashoffset="50.265 * (1 - ctxPercent / 100)"
-                        transform="rotate(-90 10 10)" />
-              </svg>
-              <span v-if="lastCtx" class="pilot-ctxpick__num">{{ `${fmtTokens(lastCtx.tokens)}/${fmtTokens(lastCtx.budget)}` }}</span>
-            </button>
-            <Transition name="hl-pop">
-              <div v-if="ctxOpen" class="pilot-ctxpick__panel">
-                <div class="pilot-ctxpick__head">
-                  <span>{{ t('pilot.ctx.title') }}</span>
-                  <span class="pilot-ctxpick__num">
-                    {{ lastCtx ? `${fmtTokens(lastCtx.tokens)} / ${fmtTokens(lastCtx.budget)}` : t('pilot.ctx.empty') }}
-                  </span>
-                </div>
-                <div class="pilot-ctxpick__track">
-                  <div
-                    class="pilot-ctxpick__fill"
-                    :class="{ 'is-warn': ctxPercent > 85 }"
-                    :style="{ width: ctxPercent + '%' }"
-                  >
-                    <i
-                      v-for="seg in ctxSegments"
-                      :key="seg.source"
-                      :class="`is-${seg.source}`"
-                      :style="{ flexGrow: seg.share }"
-                      aria-hidden="true"
-                    ></i>
-                  </div>
-                </div>
-                <div v-if="ctxSegments.length" class="pilot-ctxpick__legend">
-                  <div v-for="seg in ctxSegments" :key="seg.source" class="pilot-ctxpick__row">
-                    <i :class="`is-${seg.source}`" aria-hidden="true"></i>
-                    <span class="pilot-ctxpick__src">{{ t(`pilot.ctx.src.${seg.source}` as MessageKey) }}</span>
-                    <span class="pilot-ctxpick__pct">{{ fmtPct(seg.share) }}</span>
-                  </div>
-                </div>
-                <div
-                  v-if="typeof lastCtx?.hitRate === 'number'"
-                  class="pilot-ctxpick__cache"
-                  :class="{ 'is-low': !ctxCacheVisible }"
-                >
-                  <span>{{ t('pilot.ctx.cacheHit') }}</span>
-                  <span class="pilot-ctxpick__pct">{{ fmtPct(lastCtx.hitRate) }}</span>
-                </div>
-                <!-- 本会话消耗：账本全轮折叠（用量药丸口径——分桶精确数，
-                     部分命中永不显示 100%；provider 未报告的桶整行不出） -->
-                <div v-if="statsTotal > 0 && sessionStats" class="pilot-ctxpick__usage">
-                  <div class="pilot-ctxpick__usage-head">
-                    <span>{{ t('pilot.usage.title') }}</span>
-                    <span class="pilot-ctxpick__pct">{{ fmtInt(statsTotal) }}</span>
-                  </div>
-                  <div v-if="statsCacheHit != null" class="pilot-ctxpick__urow">
-                    <span>{{ t('pilot.usage.cacheHit') }}</span>
-                    <span>{{ fmtHit(statsCacheHit) }}</span>
-                  </div>
-                  <div class="pilot-ctxpick__urow">
-                    <span>{{ t('pilot.usage.uncached') }}</span>
-                    <span>{{ fmtInt((sessionStats.cache_base_tokens ?? sessionStats.usage_in) - (sessionStats.cache_read_tokens ?? 0)) }}</span>
-                  </div>
-                  <div v-if="sessionStats.cache_read_tokens != null" class="pilot-ctxpick__urow">
-                    <span>{{ t('pilot.usage.cacheRead') }}</span>
-                    <span>{{ fmtInt(sessionStats.cache_read_tokens) }}</span>
-                  </div>
-                  <div v-if="sessionStats.cache_write_tokens != null" class="pilot-ctxpick__urow">
-                    <span>{{ t('pilot.usage.cacheWrite') }}</span>
-                    <span>{{ fmtInt(sessionStats.cache_write_tokens) }}</span>
-                  </div>
-                  <div class="pilot-ctxpick__urow">
-                    <span>{{ t('pilot.usage.output') }}</span>
-                    <span>{{ fmtInt(sessionStats.usage_out) }}</span>
-                  </div>
-                </div>
-              </div>
-            </Transition>
-          </div>
-        </div>
-
-        <div class="pilot-composer__right">
-          <!-- 模型就地切换：ghost chip + 向上清单 + 底部管理入口 -->
-          <div v-if="pilotReady" ref="modelPickRoot" class="pilot-modelpick" @click.stop>
-            <button
-              type="button"
-              class="pilot-modelpick__chip"
-              :class="{ 'is-open': modelMenuOpen, 'is-busy': switchingModel }"
-              @click="openModelMenu()"
-            >
-              <span class="pilot-modelpick__name">{{ pilotModel || t('pilot.composer.modelOff') }}</span>
-              <span class="pilot-modelpick__chevron" aria-hidden="true"></span>
-            </button>
-            <Transition name="hl-pop">
-              <div v-if="modelMenuOpen" class="pilot-modelpick__menu">
-                <div class="pilot-modelpick__list">
-                  <div v-for="g in menuGroups" :key="g.id" class="pilot-modelpick__group">
-                    <button
-                      type="button"
-                      class="pilot-modelpick__group-head"
-                      :class="{ 'is-open': openGroups.has(g.id) }"
-                      @click="toggleGroup(g.id)"
-                    >
-                      <span class="pilot-modelpick__group-name" :title="g.name">{{ g.name }}</span>
-                      <span
-                        v-if="g.active"
-                        class="pilot-modelpick__group-badge"
-                      >{{ t('pilot.modelMenu.inUse') }}</span>
-                      <span class="pilot-modelpick__group-chev" aria-hidden="true"></span>
-                    </button>
-                    <template v-if="openGroups.has(g.id)">
-                      <button
-                        v-for="m in g.models"
-                        :key="m"
-                        type="button"
-                        class="pilot-modelpick__item"
-                        :class="{ 'is-on': m === pilotModel && g.active }"
-                        @click="pickModel(g.id, m)"
-                      >
-                        <span class="pilot-modelpick__item-name" :title="m">{{ m }}</span>
-                        <span
-                          v-if="m === pilotModel && g.active"
-                          class="pilot-modelpick__check"
-                          aria-hidden="true"
-                        ></span>
-                      </button>
-                    </template>
-                  </div>
-                </div>
-                <div class="pilot-modelpick__foot">
-                  <button type="button" class="pilot-modelpick__manage" @click="goSettings">
-                    {{ t('pilot.modelMenu.empty') }}
-                  </button>
-                </div>
-              </div>
-            </Transition>
-          </div>
-          <!-- 配置尚未取回（null）时不渲染，避免把「还在取」显示成「未配置」 -->
-          <HlChip v-else-if="pilotReady === false" tone="accent" @click="goSettings">{{ t('pilot.composer.modelOff') }}</HlChip>
-          <button
-            v-if="streaming"
-            type="button"
-            class="pilot-send pilot-send--stop"
-            :title="t('pilot.stop')"
-            :aria-label="t('pilot.stop')"
-            @click="stopPilot"
-          >
-            <span class="pilot-send__square" aria-hidden="true"></span>
-          </button>
-          <HlButton
-            v-else
-            variant="primary"
-            size="sm"
-            class="pilot-send"
-            :disabled="!question.trim()"
-            :title="t('pilot.ask.button')"
-            :aria-label="t('pilot.ask.button')"
-            @click="ask()"
-          >
-            <span class="pilot-send__arrow" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none">
-                <path d="M12 5v14M5 12l7-7 7 7" stroke="currentColor" stroke-width="2.2"
-                      stroke-linecap="round" stroke-linejoin="round" />
-              </svg>
-            </span>
-          </HlButton>
-        </div>
-      </div>
-    </div>
+    <HlPilotComposer
+      ref="composerRef"
+      v-model="question"
+      :game="game"
+      :reference-session="referenceSession"
+      :streaming="streaming"
+      :attach-busy="attachBusy"
+      :last-ctx="lastCtx"
+      :session-stats="sessionStats"
+      :stats-total="statsTotal"
+      :stats-cache-hit="statsCacheHit"
+      :menu-items="plusMenuItems"
+      @send="ask()"
+      @stop="stopPilot"
+      @menu-select="onMenuSelect"
+      @attach="attachText"
+      @remove-reference="referenceSession = null"
+    />
 
     <!-- 拖选浮条：答复里划一段松手即浮出，两个去处——整段拿走 / 带回输入框。
          Teleport 到 body：会话区是滚动容器，浮条在里面会被裁掉 -->
@@ -3252,6 +2675,7 @@ function triggerFollowUp(prompt: string) {
 </template>
 
 <style scoped>
+<style scoped>
 .pilot-console {
   position: relative;
   display: flex;
@@ -3261,7 +2685,6 @@ function triggerFollowUp(prompt: string) {
   /* 撑满宿主（抽屉 body）：对话区吃掉剩余空间，输入框恒在底部 */
   height: 100%;
 }
-
 /* ── 整页：会话列 Teleport 到页面级左侧挂点（与对话列布局解耦）；
    head 标题与页面标题重复故整页隐藏 ── */
 /* 高度由宿主（Index 的定高容器）给出：对话记录吃掉剩余空间内滚，
@@ -3269,12 +2692,10 @@ function triggerFollowUp(prompt: string) {
 .pilot-console.is-page {
   height: 100%;
 }
-
 .pilot-console.is-page .pilot-head,
 .pilot-console.is-page .pilot-tabbar {
   display: none;
 }
-
 /* 列体尺寸由宿主挂点（Index 的 .pilot-page__side）约束，这里只管纵向分布 */
 /* 生成中脉动点（标签栏）：accent 圆点呼吸；会话列同类规则在 HlPilotSidebar 内 */
 .pilot-side__running {
@@ -3285,7 +2706,6 @@ function triggerFollowUp(prompt: string) {
   background: var(--accent);
   animation: pilot-running-pulse 1.2s ease-in-out infinite;
 }
-
 @keyframes pilot-running-pulse {
   0%,
   100% {
@@ -3295,13 +2715,11 @@ function triggerFollowUp(prompt: string) {
     opacity: 0.3;
   }
 }
-
 @media (prefers-reduced-motion: reduce) {
   .pilot-side__running {
     animation: none;
   }
 }
-
 /* 派生标记：标题前缀的常驻小图标（会话列 / 标签栏 / 历史面板共用）——
    放前缀是因为窄列会省略标题尾部，后缀标记会被截掉 */
 .pilot-forkmark {
@@ -3314,13 +2732,11 @@ function triggerFollowUp(prompt: string) {
   vertical-align: -1px;
   color: var(--text-muted);
 }
-
 .pilot-forkmark svg {
   width: 11px;
   height: 11px;
   stroke: currentColor;
 }
-
 /* 窄屏整页回落标签栏：左列由 Index 隐藏，tabbar 恢复（会话入口不丢） */
 @media (max-width: 1080px) {
   .pilot-console.is-page .pilot-head {
@@ -3331,19 +2747,16 @@ function triggerFollowUp(prompt: string) {
     display: flex;
   }
 }
-
 .pilot-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
 }
-
 .pilot-head__title {
   font-size: 15px;
   font-weight: 600;
   color: var(--text-primary);
 }
-
 /* 会话标签栏：账本投影小标签（横向滚动，双击重命名，× 两段式删除，+ 即新对话） */
 .pilot-tabbar {
   display: flex;
@@ -3351,7 +2764,6 @@ function triggerFollowUp(prompt: string) {
   gap: 4px;
   padding: 2px;
 }
-
 /* 滚动区只包标签（overflow 会裁剪历史下拉面板，按钮必须在 overflow 之外）；
    scrollbar-width/color 配对取 token——单设 scrollbar-width 会让 Chromium
    绕开全局 ::-webkit-scrollbar 主题出原生细滚条 */
@@ -3366,7 +2778,6 @@ function triggerFollowUp(prompt: string) {
   scrollbar-width: thin;
   scrollbar-color: var(--scroll-thumb) transparent;
 }
-
 .pilot-tabbar__add {
   flex: none;
   display: grid;
@@ -3377,27 +2788,23 @@ function triggerFollowUp(prompt: string) {
   border-radius: 8px;
   color: var(--text-secondary);
 }
-
 /* 当前停留在未落账本的新对话上：+ 即「所在位置」 */
 .pilot-tabbar__add.is-current {
   border-color: var(--accent-a30);
   background: var(--accent-a10);
   color: var(--accent);
 }
-
 /* 历史入口：与 + 同语言的方钮，面板向下弹（账本只读投影，找回/删除都在这） */
 .pilot-history {
   position: relative;
   flex: none;
 }
-
 .pilot-tabbar__hist.is-open {
   border-style: solid;
   border-color: var(--accent-a30);
   background: var(--accent-a10);
   color: var(--accent);
 }
-
 .pilot-history__menu {
   position: absolute;
   top: calc(100% + 6px);
@@ -3416,18 +2823,15 @@ function triggerFollowUp(prompt: string) {
   scrollbar-width: thin;
   scrollbar-color: var(--scroll-thumb) transparent;
 }
-
 .pilot-history__row {
   display: flex;
   align-items: center;
   gap: 2px;
   border-radius: 6px;
 }
-
 .pilot-history__row:hover {
   background: var(--accent-a10);
 }
-
 .pilot-history__item {
   flex: 1;
   min-width: 0;
@@ -3441,7 +2845,6 @@ function triggerFollowUp(prompt: string) {
   cursor: pointer;
   text-align: left;
 }
-
 .pilot-history__name {
   min-width: 0;
   overflow: hidden;
@@ -3450,45 +2853,37 @@ function triggerFollowUp(prompt: string) {
   font-size: 12px;
   color: var(--text-primary);
 }
-
 .pilot-history__meta {
   flex: none;
   font-size: 11px;
   color: var(--text-secondary);
 }
-
 .pilot-history__row .pilot-tab__x {
   opacity: 0;
   transition: opacity 0.15s;
 }
-
 .pilot-history__row:hover .pilot-tab__x,
 .pilot-history__row .pilot-tab__x.is-armed {
   opacity: 1;
 }
-
 .pilot-history__empty {
   padding: 12px 10px;
   font-size: 12px;
   color: var(--text-secondary);
   text-align: center;
 }
-
 .pilot-tabbar__add:hover:not(:disabled) {
   border-color: var(--accent-a30);
   background: var(--accent-a10);
   color: var(--accent);
 }
-
 .pilot-tabbar__add:disabled {
   opacity: 0.4;
 }
-
 .pilot-tabbar__add svg {
   width: 14px;
   height: 14px;
 }
-
 .pilot-tab {
   flex: none;
   display: flex;
@@ -3500,26 +2895,22 @@ function triggerFollowUp(prompt: string) {
   border-radius: 8px;
   background: var(--bg-card);
 }
-
 .pilot-tab.is-current {
   border-color: var(--accent-a30);
   background: var(--accent-a10);
 }
-
 .pilot-tab__cur {
   flex: none;
   width: 12px;
   height: 12px;
   color: var(--accent);
 }
-
 .pilot-tab__main {
   flex: 1;
   min-width: 0;
   padding: 6px 0;
   text-align: left;
 }
-
 .pilot-tab__name {
   display: block;
   max-width: 118px;
@@ -3529,13 +2920,11 @@ function triggerFollowUp(prompt: string) {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-
 .pilot-tab__rename {
   /* 击穿框架 .hl-input-wrap 的 min-width:180px——否则改名框撑破 172px 标签盒漫过 + 号 */
   width: 118px;
   min-width: 0;
 }
-
 .pilot-tab__x {
   flex: none;
   display: grid;
@@ -3545,610 +2934,35 @@ function triggerFollowUp(prompt: string) {
   border-radius: 6px;
   color: var(--text-secondary);
 }
-
 .pilot-tab__x svg {
   width: 12px;
   height: 12px;
 }
-
 .pilot-tab__x:hover {
   background: var(--accent-a15);
   color: var(--accent);
 }
-
 .pilot-tab__x.is-ok {
   color: var(--success);
 }
-
 .pilot-tab__x.is-armed {
   color: var(--ink-on-fill);
   background: var(--danger);
 }
-
 .pilot-tab__x.is-disabled {
   opacity: 0.4;
   pointer-events: none;
 }
-
-/* 加号引用入口：与右侧 chip 同语言的小方钮 */
-.pilot-ref-add {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 26px;
-  padding: 0;
-}
-
-.pilot-ref-add svg {
-  width: 14px;
-  height: 14px;
-}
-
-/* 页面元素选择按钮：与 + 引用按钮同尺寸同风格，激活时高亮 */
-.pilot-el-pick {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 26px;
-  height: 26px;
-  padding: 0;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--text-secondary);
-  cursor: pointer;
-  transition: background calc(var(--duration-2) * var(--motion-scale)) ease,
-    color calc(var(--duration-2) * var(--motion-scale)) ease;
-}
-.pilot-el-pick:hover {
-  background: var(--bg-hover);
-  color: var(--text-primary);
-}
-.pilot-el-pick.is-active {
-  background: var(--accent-a20);
-  color: var(--accent-a);
-}
-.pilot-el-pick svg {
-  width: 14px;
-  height: 14px;
-}
-
 .pilot-head__actions {
   display: flex;
   align-items: center;
   gap: 4px;
 }
-
-/* 输入区 = 唯一 accent 描边面（对话区无 accent 边框），聚焦时亮起光晕——
-   与用户气泡/agent 面板三层互异，抽屉里一眼可辨「这是输入的地方」 */
-.pilot-composer {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 10px;
-  border: 1px solid var(--accent-a30);
-  border-radius: 12px;
-  background: var(--bg-base);
-  transition: border-color var(--duration-4) var(--motion-scale),
-              box-shadow var(--duration-4) var(--motion-scale);
-}
-
-.pilot-composer:focus-within {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px var(--accent-a15) inset, 0 0 18px var(--accent-a15);
-}
-
-.pilot-composer .pilot-composer__input {
-  min-height: 0;
-  padding: 2px 4px;
-  background: transparent;
-  border-radius: 0;
-  box-shadow: none;
-  resize: none;
-}
-
-/* 聚焦光晕由容器承载，textarea 自身的内发光关掉 */
-.pilot-composer .pilot-composer__input:focus {
-  box-shadow: none;
-}
-
-/* 圆形发送钮：复用 HlButton（primary 配色 + 内置 loading），这里只改尺寸 */
-.pilot-send {
-  flex: none;
-  width: 34px;
-  height: 34px;
-  padding: 0;
-  border-radius: 50%;
-}
-
-.pilot-send__arrow {
-  display: grid;
-  place-items: center;
-}
-
-.pilot-send__arrow svg {
-  width: 16px;
-  height: 16px;
-}
-
-.pilot-send svg {
-  width: 16px;
-  height: 16px;
-}
-
-.pilot-send--stop {
-  display: grid;
-  place-items: center;
-  border: 1px solid var(--border-soft);
-  background: var(--bg-card);
-  color: var(--danger);
-  cursor: pointer;
-}
-
-.pilot-send--stop:hover {
-  border-color: var(--danger);
-}
-
-.pilot-send__square {
-  width: 10px;
-  height: 10px;
-  border-radius: 2px;
-  background: currentColor;
-}
-
 .pilot-stopped {
   margin-top: 2px;
   font-size: 12px;
   color: var(--text-secondary);
 }
-
-/* 引用区：一次性上下文胶囊（当前对象 / 引用 / 附件 / 页面元素），删除钮 hover 显形 */
-.pilot-composer__refs {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-}
-
-.pilot-ref {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  max-width: 100%;
-  padding: 3px 6px 3px 9px;
-  border: 1px solid var(--border-soft);
-  border-radius: 999px;
-  background: var(--bg-soft);
-  color: var(--text-secondary);
-  font-size: 12px;
-  line-height: 18px;
-}
-
-.pilot-ref__icon {
-  width: 13px;
-  height: 13px;
-  flex: none;
-  color: var(--text-muted);
-}
-
-.pilot-ref__label {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 200px;
-}
-
-.pilot-ref__cover {
-  width: 26px;
-  aspect-ratio: 460 / 215;
-  border-radius: var(--radius-xs, 2px);
-  overflow: hidden;
-  background: var(--surface-inset);
-  display: grid;
-  place-items: center;
-  flex: none;
-}
-
-.pilot-ref__cover :deep(img) {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-}
-
-.pilot-ref__cover-fallback {
-  font-size: 9px;
-  font-weight: 700;
-  color: var(--text-muted);
-}
-
-.pilot-ref__x {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  padding: 0;
-  border: none;
-  border-radius: 50%;
-  background: transparent;
-  color: var(--text-muted);
-  cursor: pointer;
-  opacity: 0;
-  transition: opacity calc(var(--duration-2) * var(--motion-scale)) ease,
-    background calc(var(--duration-2) * var(--motion-scale)) ease,
-    color calc(var(--duration-2) * var(--motion-scale)) ease;
-}
-
-.pilot-ref:hover .pilot-ref__x,
-.pilot-ref__x:focus-visible {
-  opacity: 1;
-}
-
-.pilot-ref__x:hover {
-  background: var(--bg-hover);
-  color: var(--text-primary);
-}
-
-.pilot-ref__x svg {
-  width: 9px;
-  height: 9px;
-  display: block;
-}
-
-@media (hover: none) {
-  .pilot-ref__x {
-    opacity: 1;
-  }
-}
-
-.pilot-ref.is-busy {
-  padding: 3px 9px;
-  border-style: dashed;
-  background: transparent;
-  color: var(--text-muted);
-}
-
-/* 收拢组：同类引用一颗胶囊，清单面板向上弹（同上下文环面板语言） */
-.pilot-ref.is-group {
-  position: relative;
-  cursor: default;
-}
-
-.pilot-ref__panel {
-  position: absolute;
-  bottom: calc(100% + 8px);
-  left: 0;
-  z-index: 7;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  width: 320px;
-  max-height: 264px;
-  overflow-y: auto;
-  padding: 6px;
-  background: var(--bg-card);
-  border: 1px solid var(--border-soft);
-  border-radius: 10px;
-  box-shadow: var(--shadow-lg);
-}
-
-.pilot-ref__row {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 5px 26px 5px 8px;
-  border-radius: 8px;
-}
-
-.pilot-ref__row:hover {
-  background: var(--bg-hover);
-}
-
-.pilot-ref__row-icon {
-  width: 12px;
-  height: 12px;
-  flex: none;
-  color: var(--text-muted);
-}
-
-.pilot-ref__row-main {
-  min-width: 0;
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.pilot-ref__row-title {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 12px;
-  color: var(--text-primary);
-}
-
-.pilot-ref__row-meta {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 11px;
-  color: var(--text-muted);
-}
-
-.pilot-ref__row-x {
-  position: absolute;
-  right: 4px;
-  top: 50%;
-  transform: translateY(-50%);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  padding: 0;
-  border: none;
-  border-radius: 50%;
-  background: transparent;
-  color: var(--text-muted);
-  cursor: pointer;
-  opacity: 0;
-  transition: opacity calc(var(--duration-2) * var(--motion-scale)) ease,
-    background calc(var(--duration-2) * var(--motion-scale)) ease,
-    color calc(var(--duration-2) * var(--motion-scale)) ease;
-}
-
-.pilot-ref__row:hover .pilot-ref__row-x,
-.pilot-ref__row-x:focus-visible {
-  opacity: 1;
-}
-
-.pilot-ref__row-x:hover {
-  background: var(--border-soft);
-  color: var(--text-primary);
-}
-
-@media (hover: none) {
-  .pilot-ref__row-x {
-    opacity: 1;
-  }
-}
-
-.pilot-ctxpick {
-  position: relative;
-  min-width: 0;
-}
-
-/* + 菜单向上弹出且不遮按键：bottom 锚在按键上方（同模型菜单），覆盖框架的 top+translate 技巧 */
-.pilot-composer :deep(.hl-dropdown-pop.is-open-up) {
-  top: auto;
-  bottom: calc(100% + 6px);
-  --pop-y: 0px;
-}
-
-.pilot-ctxpick__btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 3px 8px;
-  font: inherit;
-  font-size: 12px;
-  color: var(--accent);
-  border: none;
-  border-radius: 999px;
-  background: var(--accent-a10);
-  cursor: pointer;
-}
-
-.pilot-ctxpick__btn:hover {
-  color: var(--text-primary);
-}
-
-.pilot-ctxpick__btn.is-warn {
-  color: var(--warning);
-}
-
-.pilot-ctxpick__ring {
-  width: 14px;
-  height: 14px;
-}
-
-.pilot-ctxpick__num {
-  font-variant-numeric: tabular-nums;
-}
-
-.pilot-ctxpick__panel {
-  position: absolute;
-  bottom: calc(100% + 8px);
-  left: 0;
-  z-index: 7;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  width: 260px;
-  padding: 12px;
-  background: var(--bg-card);
-  border: 1px solid var(--border-soft);
-  border-radius: 10px;
-  box-shadow: var(--shadow-lg);
-}
-
-.pilot-ctxpick__head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-
-.pilot-ctxpick__num,
-.pilot-ctxpick__pct {
-  font-family: var(--font-mono, monospace);
-  font-size: 12px;
-  color: var(--text-primary);
-}
-
-.pilot-ctxpick__track {
-  height: 6px;
-  border-radius: 3px;
-  background: var(--accent-a10);
-  overflow: hidden;
-}
-
-.pilot-ctxpick__fill {
-  display: flex;
-  height: 100%;
-  border-radius: 3px;
-  overflow: hidden;
-  min-width: 2px;
-  transition: width calc(var(--duration-4, 0.2s) * var(--motion-scale, 1)) ease;
-}
-
-.pilot-ctxpick__fill.is-warn i {
-  filter: saturate(0.6) brightness(0.9);
-}
-
-.pilot-ctxpick__fill i {
-  display: block;
-  min-width: 2px;
-}
-
-.pilot-ctxpick__fill i.is-system {
-  background: var(--accent);
-}
-
-.pilot-ctxpick__fill i.is-tools {
-  background: color-mix(in oklab, var(--accent) 78%, var(--bg-card));
-}
-
-.pilot-ctxpick__fill i.is-summary {
-  background: color-mix(in oklab, var(--accent) 58%, var(--bg-card));
-}
-
-.pilot-ctxpick__fill i.is-history {
-  background: color-mix(in oklab, var(--accent) 42%, var(--bg-card));
-}
-
-.pilot-ctxpick__fill i.is-current {
-  background: color-mix(in oklab, var(--accent) 28%, var(--bg-card));
-}
-
-.pilot-ctxpick__legend {
-  display: grid;
-  gap: 4px;
-}
-
-.pilot-ctxpick__row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-
-.pilot-ctxpick__row i {
-  flex: none;
-  width: 8px;
-  height: 8px;
-  border-radius: 2px;
-  border: 1px solid var(--border-soft);
-}
-
-.pilot-ctxpick__row i.is-system {
-  background: var(--accent);
-}
-
-.pilot-ctxpick__row i.is-tools {
-  background: color-mix(in oklab, var(--accent) 78%, var(--bg-card));
-}
-
-.pilot-ctxpick__row i.is-summary {
-  background: color-mix(in oklab, var(--accent) 58%, var(--bg-card));
-}
-
-.pilot-ctxpick__row i.is-history {
-  background: color-mix(in oklab, var(--accent) 42%, var(--bg-card));
-}
-
-.pilot-ctxpick__row i.is-current {
-  background: color-mix(in oklab, var(--accent) 28%, var(--bg-card));
-}
-
-.pilot-ctxpick__src {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.pilot-ctxpick__pct {
-  margin-left: auto;
-}
-
-.pilot-ctxpick__cache {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding-top: 8px;
-  border-top: 1px solid var(--border-soft);
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-
-.pilot-ctxpick__cache.is-low .pilot-ctxpick__pct {
-  color: var(--text-secondary);
-}
-
-/* 本会话消耗段：段头（合计精确数）+ 分桶行，与图例行同字层 */
-.pilot-ctxpick__usage {
-  margin-top: 8px;
-  padding-top: 8px;
-  border-top: 1px solid var(--border-soft);
-}
-
-.pilot-ctxpick__usage-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-  padding-bottom: 2px;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-primary);
-}
-
-.pilot-ctxpick__urow {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 2px 0;
-  font-size: 11px;
-  color: var(--text-secondary);
-}
-
-.pilot-ctxpick__urow span:last-child {
-  color: var(--text-primary);
-  font-variant-numeric: tabular-nums;
-}
-
-.pilot-composer__bar {
-  position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.pilot-composer__right {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex: none;
-}
-
 /* 压缩分隔线：两侧细线 + 居中状态 pill（账本边界事件，历史不动） */
 .pilot-compact {
   display: flex;
@@ -4156,13 +2970,11 @@ function triggerFollowUp(prompt: string) {
   gap: 10px;
   padding: 4px 0;
 }
-
 .pilot-compact__line {
   flex: 1;
   height: 1px;
   background: var(--border-soft);
 }
-
 .pilot-compact__pill {
   display: inline-flex;
   align-items: center;
@@ -4174,7 +2986,6 @@ function triggerFollowUp(prompt: string) {
   color: var(--text-secondary);
   background: var(--bg-card);
 }
-
 .pilot-queued {
   display: flex;
   align-items: center;
@@ -4182,7 +2993,6 @@ function triggerFollowUp(prompt: string) {
   font-size: 12px;
   color: var(--text-secondary);
 }
-
 .pilot-queued::before {
   content: '';
   flex: none;
@@ -4192,25 +3002,14 @@ function triggerFollowUp(prompt: string) {
   background: var(--warning);
   animation: pilot-queued-pulse 1.2s ease-in-out infinite;
 }
-
 @keyframes pilot-queued-pulse {
   0%, 100% { opacity: 0.35; }
   50% { opacity: 1; }
 }
-
 .pilot-compact__pill svg {
   width: 12px;
   height: 12px;
 }
-
-.pilot-composer__chips {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-  /* 不能 overflow:hidden：+ 菜单与上下文面板都从这里向上弹出，剪掉=「点了没反应」 */
-}
-
 .pilot-turns {
   display: flex;
   flex-direction: column;
@@ -4221,7 +3020,6 @@ function triggerFollowUp(prompt: string) {
   overflow-y: auto;
   padding-right: 4px;
 }
-
 .pilot-turn {
   display: flex;
   flex-direction: column;
@@ -4229,7 +3027,6 @@ function triggerFollowUp(prompt: string) {
   min-width: 0;
   max-width: 100%;
 }
-
 /* agent 回复统一图层：去盒子化，通透流式布局与 Agent 身份标 */
 .pilot-reply {
   display: flex;
@@ -4242,7 +3039,6 @@ function triggerFollowUp(prompt: string) {
   max-width: 100%;
   box-sizing: border-box;
 }
-
 .pilot-reply__header {
   display: inline-flex;
   align-items: center;
@@ -4250,7 +3046,6 @@ function triggerFollowUp(prompt: string) {
   margin-bottom: 2px;
   align-self: flex-start;
 }
-
 .pilot-reply__avatar {
   width: 22px;
   height: 22px;
@@ -4262,29 +3057,24 @@ function triggerFollowUp(prompt: string) {
   align-items: center;
   justify-content: center;
 }
-
 .pilot-reply__avatar svg {
   width: 13px;
   height: 13px;
 }
-
 .pilot-reply__avatar.is-live {
   background: var(--accent-a15);
   border-color: var(--accent);
   animation: pavatar-pulse 1.8s ease-in-out infinite alternate;
 }
-
 @keyframes pavatar-pulse {
   from { box-shadow: 0 0 0 1px var(--accent-a20); }
   to { box-shadow: 0 0 0 4px var(--accent-a20); }
 }
-
 .pilot-reply__role {
   font-size: 12px;
   font-weight: 600;
   color: var(--text-secondary);
 }
-
 /* 发言行：气泡 + 复制钮同一行右沿对齐；钮常驻占位，hover 才显形 */
 .pilot-turn__row {
   display: flex;
@@ -4293,7 +3083,6 @@ function triggerFollowUp(prompt: string) {
   gap: 6px;
   min-width: 0;
 }
-
 .pilot-turn__q {
   align-self: flex-end;
   max-width: 82%;
@@ -4309,54 +3098,6 @@ function triggerFollowUp(prompt: string) {
   word-break: break-word;
   box-shadow: 0 2px 8px var(--surface-inset-sm);
 }
-
-/* 待发引用胶囊的编号徽标：与发出去后的气泡内胶囊同一套编号视觉 */
-.pilot-ref__no {
-  flex: none;
-  display: inline-grid;
-  place-items: center;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: var(--accent-a20);
-  color: var(--accent);
-  font-size: 10px;
-  font-weight: 600;
-  line-height: 1;
-}
-
-/* 待发引用胶囊：只露一行标题，完整引用悬停/聚焦才浮出 */
-.pilot-ref--quote {
-  position: relative;
-  cursor: default;
-  outline: none;
-}
-
-.pilot-ref__quote-full {
-  position: absolute;
-  right: 0;
-  bottom: calc(100% + 6px);
-  z-index: 7;
-  display: none;
-  max-width: min(420px, 78vw);
-  padding: 8px 10px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-sm);
-  background: var(--bg-card);
-  box-shadow: var(--shadow-lg);
-  font-size: 12px;
-  line-height: 1.6;
-  color: var(--text-secondary);
-  white-space: pre-wrap;
-  word-break: break-word;
-  text-align: left;
-}
-
-.pilot-ref--quote:hover .pilot-ref__quote-full,
-.pilot-ref--quote:focus-visible .pilot-ref__quote-full {
-  display: block;
-}
-
 /* ── 发出去的提问气泡内：编号引用就地渲染成胶囊（位置即用户在句中摆的位置）── */
 .pilot-qchip {
   position: relative;
@@ -4376,12 +3117,10 @@ function triggerFollowUp(prompt: string) {
   cursor: default;
   outline: none;
 }
-
 .pilot-qchip.is-missing {
   border-style: dashed;
   color: var(--text-muted);
 }
-
 .pilot-qchip__no {
   flex: none;
   display: inline-grid;
@@ -4395,14 +3134,12 @@ function triggerFollowUp(prompt: string) {
   font-weight: 600;
   line-height: 1;
 }
-
 .pilot-qchip__title {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 180px;
 }
-
 /* 完整引用：只在悬停/聚焦时浮出，默认不占位 */
 .pilot-qchip__full {
   position: absolute;
@@ -4424,12 +3161,10 @@ function triggerFollowUp(prompt: string) {
   word-break: break-word;
   text-align: left;
 }
-
 .pilot-qchip:hover .pilot-qchip__full,
 .pilot-qchip:focus-visible .pilot-qchip__full {
   display: block;
 }
-
 /* ── 附件：引用芯片 + 展开的内容面板（长文本不进消息体，按需取块） ── */
 .pilot-atts {
   display: flex;
@@ -4440,7 +3175,6 @@ function triggerFollowUp(prompt: string) {
   max-width: 82%;
   margin-top: 6px;
 }
-
 .pilot-att {
   display: inline-flex;
   align-items: center;
@@ -4455,32 +3189,27 @@ function triggerFollowUp(prompt: string) {
   cursor: pointer;
   transition: color 0.15s ease, border-color 0.15s ease;
 }
-
 .pilot-att:hover,
 .pilot-att.is-open {
   color: var(--text-primary);
   border-color: var(--border-strong);
 }
-
 .pilot-att svg {
   width: 12px;
   height: 12px;
   flex: none;
   display: block;
 }
-
 .pilot-att__name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 150px;
 }
-
 .pilot-att__meta {
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
 }
-
 .pilot-att-panel {
   align-self: stretch;
   margin-top: 6px;
@@ -4489,7 +3218,6 @@ function triggerFollowUp(prompt: string) {
   background: var(--bg-soft);
   overflow: hidden;
 }
-
 .pilot-att-panel__body {
   margin: 0;
   padding: 8px 10px;
@@ -4502,7 +3230,6 @@ function triggerFollowUp(prompt: string) {
   white-space: pre-wrap;
   word-break: break-all;
 }
-
 .pilot-att-panel__bar {
   display: flex;
   align-items: center;
@@ -4511,12 +3238,10 @@ function triggerFollowUp(prompt: string) {
   padding: 4px 8px;
   border-top: 1px solid var(--border-soft);
 }
-
 .pilot-att-panel__note {
   font-size: 11px;
   color: var(--text-muted);
 }
-
 .pilot-att-panel__more {
   flex: none;
   padding: 2px 8px;
@@ -4527,12 +3252,10 @@ function triggerFollowUp(prompt: string) {
   font-size: 11px;
   cursor: pointer;
 }
-
 .pilot-att-panel__more:disabled {
   opacity: 0.5;
   cursor: default;
 }
-
 /* 动作行：挂在它作用的那条消息下方，与消息同侧对齐。
    整行常驻占位（高度恒定）只切透明度——显隐不推动上方内容，
    气泡/正文不因出现动作而位移。 */
@@ -4544,25 +3267,21 @@ function triggerFollowUp(prompt: string) {
   opacity: 0;
   transition: opacity 0.15s ease;
 }
-
 .pilot-acts--end {
   justify-content: flex-end;
 }
-
 /* 发言动作：鼠标落在提问那一行或动作行自身时显形 */
 .pilot-turn__row:hover ~ .pilot-acts--end,
 .pilot-acts--end:hover,
 .pilot-acts--end:focus-within {
   opacity: 1;
 }
-
 /* 回复动作：鼠标落在回复层或动作行自身时显形 */
 .pilot-reply:hover .pilot-acts,
 .pilot-reply .pilot-acts:hover,
 .pilot-reply .pilot-acts:focus-within {
   opacity: 1;
 }
-
 /* 单枚动作钮：复制 / 编辑 / 分叉共用同一形态 */
 .pilot-act {
   flex: none;
@@ -4577,36 +3296,29 @@ function triggerFollowUp(prompt: string) {
   cursor: pointer;
   transition: background 0.15s ease, color 0.15s ease;
 }
-
 .pilot-act svg {
   width: 13px;
   height: 13px;
   display: block;
 }
-
 .pilot-act:hover {
   background: var(--surface-chip);
   color: var(--text-primary);
 }
-
 .pilot-act:focus-visible {
   outline: 1px solid var(--accent);
   outline-offset: 1px;
 }
-
 .pilot-feedback.is-selected {
   color: var(--success);
 }
-
 .pilot-feedback.is-rejected {
   color: var(--danger-deep);
 }
-
 .pilot-feedback:disabled {
   cursor: default;
   opacity: 0.5;
 }
-
 /* 编辑重问：气泡原位换成可改的文本框，其后轮次会被作废（有提示） */
 .pilot-edit {
   flex: 1;
@@ -4620,7 +3332,6 @@ function triggerFollowUp(prompt: string) {
   border: 1px solid var(--accent-a40);
   border-radius: 16px 16px 4px 16px;
 }
-
 .pilot-edit__box {
   width: 100%;
   min-height: 50px;
@@ -4634,20 +3345,17 @@ function triggerFollowUp(prompt: string) {
   resize: vertical;
   outline: none;
 }
-
 .pilot-edit__bar {
   display: flex;
   align-items: center;
   gap: 8px;
 }
-
 .pilot-edit__warn {
   flex: 1;
   min-width: 0;
   font-size: 11px;
   color: var(--danger-deep);
 }
-
 .pilot-edit__btn {
   flex: none;
   padding: 4px 11px;
@@ -4658,27 +3366,22 @@ function triggerFollowUp(prompt: string) {
   font-size: 12px;
   cursor: pointer;
 }
-
 .pilot-edit__btn.is-ghost {
   background: transparent;
   border-color: var(--border-soft);
   color: var(--text-secondary);
 }
-
 .pilot-edit__btn:disabled {
   opacity: 0.5;
   cursor: default;
 }
-
 .pilot-edit__btn:hover:not(:disabled) {
   background: var(--accent-fill-hover);
 }
-
 .pilot-edit__btn.is-ghost:hover:not(:disabled) {
   background: var(--surface-chip);
   color: var(--text-primary);
 }
-
 /* 中断续跑：答复头上的「继续」，只有被用户停止过的轮才有 */
 .pilot-resume {
   display: inline-flex;
@@ -4694,18 +3397,15 @@ function triggerFollowUp(prompt: string) {
   cursor: pointer;
   transition: background 0.15s ease, border-color 0.15s ease;
 }
-
 .pilot-resume svg {
   width: 11px;
   height: 11px;
   display: block;
 }
-
 .pilot-resume:hover {
   background: var(--accent-a20);
   border-color: var(--accent-a50);
 }
-
 /* 消息队列：生成中提交的问题排队等本轮结束（可改序/取回/移除） */
 .pilot-queue {
   display: flex;
@@ -4716,24 +3416,20 @@ function triggerFollowUp(prompt: string) {
   border-radius: 12px;
   background: var(--bg-soft);
 }
-
 .pilot-queue__head {
   display: flex;
   align-items: center;
   gap: 8px;
 }
-
 .pilot-queue__title {
   font-size: 12px;
   font-weight: 600;
   color: var(--text-secondary);
 }
-
 .pilot-queue__paused {
   font-size: 11px;
   color: var(--danger-deep);
 }
-
 .pilot-queue__resume {
   margin-left: auto;
   padding: 2px 9px;
@@ -4744,18 +3440,15 @@ function triggerFollowUp(prompt: string) {
   font-size: 11px;
   cursor: pointer;
 }
-
 .pilot-queue__resume:hover {
   background: var(--accent-a20);
 }
-
 .pilot-queue__row {
   display: flex;
   align-items: center;
   gap: 6px;
   min-width: 0;
 }
-
 .pilot-queue__idx {
   flex: none;
   width: 16px;
@@ -4763,7 +3456,6 @@ function triggerFollowUp(prompt: string) {
   font-size: 11px;
   color: var(--text-muted);
 }
-
 .pilot-queue__text {
   flex: 1;
   min-width: 0;
@@ -4773,7 +3465,6 @@ function triggerFollowUp(prompt: string) {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-
 .pilot-queue__btn {
   flex: none;
   display: inline-flex;
@@ -4788,23 +3479,19 @@ function triggerFollowUp(prompt: string) {
   color: var(--text-muted);
   cursor: pointer;
 }
-
 .pilot-queue__btn svg {
   width: 12px;
   height: 12px;
   display: block;
 }
-
 .pilot-queue__btn:hover:not(:disabled) {
   background: var(--surface-chip);
   color: var(--text-primary);
 }
-
 .pilot-queue__btn:disabled {
   opacity: 0.35;
   cursor: default;
 }
-
 /* 拖选浮条：定在选区正上方居中，@mousedown.prevent 保住选区不散 */
 .pilot-selbar {
   position: fixed;
@@ -4819,7 +3506,6 @@ function triggerFollowUp(prompt: string) {
   border: 1px solid var(--border-soft);
   box-shadow: 0 6px 20px var(--surface-inset-sm);
 }
-
 .pilot-selbar__btn {
   display: inline-flex;
   align-items: center;
@@ -4833,21 +3519,14 @@ function triggerFollowUp(prompt: string) {
   white-space: nowrap;
   cursor: pointer;
 }
-
 .pilot-selbar__btn svg {
   width: 13px;
   height: 13px;
 }
-
 .pilot-selbar__btn:hover {
   background: var(--surface-chip);
   color: var(--text-primary);
 }
-
-.pilot-composer .hl-button {
-  flex: none;
-}
-
 .pilot-reason {
   display: flex;
   align-items: center;
@@ -4861,13 +3540,11 @@ function triggerFollowUp(prompt: string) {
   background: var(--bg-card);
   border: 1px dashed var(--border-soft);
 }
-
 .pilot-reason.is-error {
   color: var(--danger);
   background: var(--danger-a15);
   border: 1px solid var(--danger-a30);
 }
-
 .pilot-reason__body {
   display: flex;
   align-items: center;
@@ -4875,38 +3552,32 @@ function triggerFollowUp(prompt: string) {
   flex: 1;
   min-width: 0;
 }
-
 .pilot-reason__icon {
   width: 15px;
   height: 15px;
   flex-shrink: 0;
   color: var(--danger);
 }
-
 .pilot-reason__text {
   flex: 1;
   word-break: break-word;
 }
-
 .pilot-error-diagnostic {
   margin: 6px 0 8px 23px;
   color: var(--text-secondary);
   font-size: 12px;
   line-height: 1.5;
 }
-
 .pilot-error-diagnostic summary {
   width: fit-content;
   color: var(--danger);
   cursor: pointer;
 }
-
 .pilot-error-diagnostic p {
   margin: 5px 0 2px;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
-
 .pilot-reason__retry-btn {
   display: inline-flex;
   align-items: center;
@@ -4922,30 +3593,25 @@ function triggerFollowUp(prompt: string) {
   flex-shrink: 0;
   transition: all var(--duration-fast) var(--ease-out);
 }
-
 .pilot-reason__retry-btn:hover:not(:disabled) {
   background: var(--danger);
   color: var(--text-on-fill);
   border-color: var(--danger);
 }
-
 .pilot-reason__retry-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
-
 .pilot-reason__retry-icon {
   width: 13px;
   height: 13px;
 }
-
 /* 回答排版由 HlPilotMarkdown 组件承载；此处只留折叠裁切等容器行为 */
 .pilot-answer.is-clamped {
   position: relative;
   max-height: 320px;
   overflow: hidden;
 }
-
 .pilot-answer.is-clamped::after {
   content: '';
   position: absolute;
@@ -4956,7 +3622,6 @@ function triggerFollowUp(prompt: string) {
   background: linear-gradient(to bottom, transparent, var(--bg-base));
   pointer-events: none;
 }
-
 .pilot-answer__more {
   align-self: flex-start;
   margin-top: 4px;
@@ -4968,13 +3633,11 @@ function triggerFollowUp(prompt: string) {
   font-size: 11px;
   cursor: pointer;
 }
-
 .pilot-answer__more:hover {
   border-color: var(--accent-a30);
   background: var(--accent-a10);
   color: var(--accent);
 }
-
 /* 分叉溯源分隔线：与压缩分隔线同一套「两侧细线 + 居中胶囊」语言——
    派生是本会话的起点事实，占对话流首行；可点跳回源会话，故用按钮而非徽章 */
 .pilot-forkline {
@@ -4987,13 +3650,11 @@ function triggerFollowUp(prompt: string) {
   background: none;
   cursor: pointer;
 }
-
 .pilot-forkline__line {
   flex: 1;
   height: 1px;
   background: var(--border-soft);
 }
-
 .pilot-forkline__pill {
   display: inline-flex;
   align-items: center;
@@ -5010,38 +3671,32 @@ function triggerFollowUp(prompt: string) {
   text-overflow: ellipsis;
   transition: color 0.15s ease, border-color 0.15s ease;
 }
-
 .pilot-forkline:hover .pilot-forkline__pill,
 .pilot-forkline:focus-visible .pilot-forkline__pill {
   border-color: var(--accent-a30);
   background: var(--accent-a10);
   color: var(--accent);
 }
-
 .pilot-forkline:focus-visible {
   outline: none;
 }
-
 .pilot-forkline__pill svg {
   width: 12px;
   height: 12px;
   flex: none;
 }
-
 .pilot-briefing__title {
   font-size: 12px;
   font-weight: 600;
   color: var(--text-secondary);
   margin-bottom: 6px;
 }
-
 .pilot-cands-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
   gap: 8px;
   margin-top: 8px;
 }
-
 .pilot-cand {
   display: flex;
   align-items: center;
@@ -5055,19 +3710,16 @@ function triggerFollowUp(prompt: string) {
   text-align: left;
   transition: all var(--duration-2) ease;
 }
-
 .pilot-cand:hover:not(.is-locked) {
   border-color: var(--accent);
   background: var(--accent-a08);
   transform: translateY(-1px);
   box-shadow: var(--shadow-sm);
 }
-
 .pilot-cand.is-locked {
   cursor: default;
   opacity: 0.65;
 }
-
 .pilot-cand__idx {
   flex: none;
   width: 16px;
@@ -5076,7 +3728,6 @@ function triggerFollowUp(prompt: string) {
   color: var(--text-faint);
   text-align: center;
 }
-
 .pilot-cand__cover {
   flex: none;
   width: 68px;
@@ -5087,20 +3738,17 @@ function triggerFollowUp(prompt: string) {
   display: grid;
   place-items: center;
 }
-
 .pilot-cand__cover :deep(img) {
   width: 100%;
   height: 100%;
   object-fit: cover;
   display: block;
 }
-
 .pilot-cand__cover-fallback {
   font-size: 10px;
   font-weight: 600;
   color: var(--text-muted);
 }
-
 .pilot-cand__main {
   flex: 1;
   min-width: 0;
@@ -5108,7 +3756,6 @@ function triggerFollowUp(prompt: string) {
   flex-direction: column;
   gap: 3px;
 }
-
 .pilot-cand__name {
   font-size: 13px;
   font-weight: 500;
@@ -5117,7 +3764,6 @@ function triggerFollowUp(prompt: string) {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-
 .pilot-cand__meta {
   display: flex;
   align-items: center;
@@ -5125,12 +3771,10 @@ function triggerFollowUp(prompt: string) {
   font-size: 11px;
   white-space: nowrap;
 }
-
 .pilot-cand__price {
   font-weight: 600;
   color: var(--text-primary);
 }
-
 .pilot-cand__disc {
   padding: 1px 4px;
   border-radius: var(--radius-sm);
@@ -5140,255 +3784,43 @@ function triggerFollowUp(prompt: string) {
   font-weight: 700;
   line-height: 1.2;
 }
-
 .pilot-cand__rating {
   font-size: 11px;
   font-weight: 600;
   color: var(--success);
 }
-
 .pilot-cand__rating.medium {
   color: var(--warning);
 }
-
 .pilot-cand__rating.low {
   color: var(--text-muted);
 }
-
 .pilot-guide p {
   margin: 0 0 6px;
   font-size: 13px;
   line-height: 1.7;
   color: var(--text-primary);
 }
-
 .pilot-guide__title {
   font-weight: 600;
 }
-
 .pilot-guide__link {
   font-size: 13px;
 }
-
-/* 模型就地切换：ghost chip + 向上弹清单 */
-.pilot-modelpick {
-  position: relative;
-}
-
-.pilot-modelpick__chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  max-width: 220px;
-  padding: 4px 8px;
-  border: none;
-  border-radius: 8px;
-  background: transparent;
-  cursor: pointer;
-}
-
-.pilot-modelpick__chip:hover,
-.pilot-modelpick__chip.is-open {
-  background: var(--accent-a10);
-}
-
-.pilot-modelpick__chip.is-busy {
-  opacity: 0.6;
-  cursor: wait;
-}
-
-.pilot-modelpick__name {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--text-secondary);
-}
-
-.pilot-modelpick__chip.is-open .pilot-modelpick__name {
-  color: var(--text-primary);
-}
-
-.pilot-modelpick__chevron {
-  flex: none;
-  width: 7px;
-  height: 7px;
-  border-right: 1.5px solid var(--text-faint);
-  border-bottom: 1.5px solid var(--text-faint);
-  transform: rotate(45deg) translateY(-1px);
-  transition: transform 0.2s;
-}
-
-.pilot-modelpick__chip.is-open .pilot-modelpick__chevron {
-  transform: rotate(-135deg) translateY(-2px);
-}
-
-.pilot-modelpick__menu {
-  position: absolute;
-  bottom: calc(100% + 8px);
-  right: 0;
-  z-index: 6;
-  display: flex;
-  flex-direction: column;
-  min-width: 208px;
-  max-width: min(300px, calc(100vw - 3rem));
-  background: var(--bg-card);
-  border: 1px solid var(--border-soft);
-  border-radius: 10px;
-  box-shadow: var(--shadow-lg);
-  overflow: hidden;
-}
-
-.pilot-modelpick__list {
-  max-height: 288px;
-  overflow-y: auto;
-  padding: 4px;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.pilot-modelpick__item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  /* 按钮默认按内容收缩：不写 100% 时只有文字那一段可点，行内空白区点不动 */
-  width: 100%;
-  box-sizing: border-box;
-  min-height: 32px;
-  padding: 6px 10px;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
-  cursor: pointer;
-  text-align: left;
-}
-
-.pilot-modelpick__item:hover {
-  background: var(--accent-a10);
-}
-
-.pilot-modelpick__item-name {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 12px;
-  font-family: var(--font-mono, monospace);
-  color: var(--text-primary);
-}
-
-.pilot-modelpick__item.is-on .pilot-modelpick__item-name {
-  color: var(--accent);
-  font-weight: 600;
-}
-
-.pilot-modelpick__check {
-  flex: none;
-  width: 10px;
-  height: 5px;
-  border-left: 1.8px solid var(--accent);
-  border-bottom: 1.8px solid var(--accent);
-  transform: rotate(-45deg) translateY(-1px);
-}
-
-.pilot-modelpick__foot {
-  border-top: 1px solid var(--border-soft);
-  padding: 4px;
-}
-
-.pilot-modelpick__manage {
-  width: 100%;
-  padding: 6px 10px;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
-  cursor: pointer;
-  font-size: 12px;
-  color: var(--text-secondary);
-  text-align: left;
-}
-
-.pilot-modelpick__manage:hover {
-  background: var(--accent-a10);
-  color: var(--text-primary);
-}
-
-
-/* 菜单分组：厂商收敛头 + 组内模型行 */
-.pilot-modelpick__group + .pilot-modelpick__group {
-  border-top: 1px solid var(--border-soft);
-}
-
-.pilot-modelpick__group-head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  width: 100%;
-  padding: 7px 10px 5px;
-  border: none;
-  background: none;
-  cursor: pointer;
-  text-align: left;
-}
-
-.pilot-modelpick__group-head:hover {
-  background: var(--accent-a10);
-}
-
-.pilot-modelpick__group-name {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--text-secondary);
-}
-
-.pilot-modelpick__group-badge {
-  flex: none;
-  padding: 1px 6px;
-  border-radius: 999px;
-  background: var(--accent-a10);
-  font-size: 10px;
-  color: var(--accent);
-}
-
-.pilot-modelpick__group-chev {
-  flex: none;
-  width: 6px;
-  height: 6px;
-  border-right: 1.5px solid var(--text-faint);
-  border-bottom: 1.5px solid var(--text-faint);
-  transform: rotate(45deg);
-}
-
-.pilot-modelpick__group-head.is-open .pilot-modelpick__group-chev {
-  transform: rotate(-135deg);
-}
-
 .pilot-followups {
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
-
 /* dock 变体：钉在输入框正上方，位置恒定（间距由 console 的 flex gap 供给） */
 .pilot-followups--dock {
   padding-inline: 2px;
 }
-
 .pilot-followups__label {
   font-size: 11px;
   font-weight: 500;
   color: var(--text-secondary);
 }
-
 .pilot-followups__list {
   display: flex;
   flex-wrap: nowrap;
@@ -5397,11 +3829,9 @@ function triggerFollowUp(prompt: string) {
   gap: 8px;
   padding-bottom: 2px;
 }
-
 .pilot-followups__list::-webkit-scrollbar {
   display: none;
 }
-
 .pilot-followup-chip {
   appearance: none;
   border: 1px solid var(--border-soft);
@@ -5419,20 +3849,17 @@ function triggerFollowUp(prompt: string) {
   flex-shrink: 0;
   transition: all 0.15s ease;
 }
-
 .pilot-followup-chip__icon {
   width: 10px;
   height: 10px;
   color: var(--text-muted);
   transition: transform 0.15s ease, color 0.15s ease;
 }
-
 .pilot-followup-chip:hover {
   border-color: var(--accent);
   color: var(--accent);
   background: var(--accent-a10);
 }
-
 .pilot-followup-chip:hover .pilot-followup-chip__icon {
   color: var(--accent);
   transform: translateX(2px);
