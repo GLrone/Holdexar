@@ -1335,3 +1335,96 @@ async def test_fetch_history_login_page_raises():
 
     with pytest.raises(steam_fetch.StoreSessionExpiredError, match="登录页"):
         await steam_fetch._fetch_history(_LoginClient())
+
+
+# ── 删号即清：账号删除时名下账单随删（NULL 归属存量不动）────
+
+
+async def _seed_bill(db, sid: str | None, label: str) -> int:
+    """直种一份账单导入（主行 + 三类行级数据），返回导入 ID。"""
+    from app.domains.bills.models import BillCdkGame, BillGameTx, BillImport, BillTopupTx
+
+    async with db() as session:
+        imp = BillImport(steam_id=sid, nickname=label, source_file=f"{label}.json")
+        session.add(imp)
+        await session.flush()
+        session.add(BillGameTx(import_id=imp.id, date="2026 年 1 月 1 日", tx_type="购买",
+                               currency="CNY", amount=30.0, sign=1))
+        session.add(BillTopupTx(import_id=imp.id, date="2026 年 1 月 9 日",
+                                currency="CNY", amount=50.0, sign=1))
+        session.add(BillCdkGame(import_id=imp.id, name=f"CDK {label}", acq="cdk"))
+        await session.commit()
+        return imp.id
+
+
+def _sid(n: int) -> str:
+    return f"765611980000000{n:02d}"
+
+
+@pytest.mark.asyncio
+async def test_remove_account_purges_owned_bills_keeps_null_owner(db):
+    """删除账号：该账号的账单导入与行级数据随删；他人账单与 NULL 归属存量保留。"""
+    from datetime import datetime
+
+    from sqlalchemy import select
+
+    from app.domains.account import service as account_service
+    from app.domains.account.models import SteamAccount
+    from app.domains.bills.models import BillCdkGame, BillGameTx, BillImport, BillTopupTx
+
+    a, b = _sid(91), _sid(92)
+    async with db() as session:
+        session.add(SteamAccount(steam_id=a, is_active=True, bound_at=datetime.utcnow()))
+        session.add(SteamAccount(steam_id=b, is_active=True, bound_at=datetime.utcnow()))
+        await session.commit()
+
+    await _seed_bill(db, a, "甲")
+    await _seed_bill(db, b, "乙")
+    legacy_id = await _seed_bill(db, None, "存量无归属")
+
+    r = await account_service.remove_account(a)
+    assert r["ok"] is True and r["billsRemoved"] == 1
+
+    async with db() as session:
+        owners = {sid for (sid,) in (await session.execute(select(BillImport.steam_id))).all()}
+        live_ids = [
+            int(i) for (i,) in (await session.execute(select(BillImport.id))).all()
+        ]
+        game_txs = (await session.execute(select(BillGameTx.import_id))).scalars().all()
+        topups = (await session.execute(select(BillTopupTx.import_id))).scalars().all()
+        cdks = (await session.execute(select(BillCdkGame.import_id))).scalars().all()
+    assert owners == {b, None}, "被删账号的导入消失，他人与无归属存量保留"
+    assert legacy_id in live_ids
+    assert set(game_txs) == set(live_ids) and set(topups) == set(live_ids) and set(cdks) == set(live_ids), \
+        "行级数据与剩余导入一一对应，无孤儿行"
+
+
+@pytest.mark.asyncio
+async def test_clear_cookies_purges_all_account_bills_keeps_null_owner(db):
+    """解绑全部：所有有归属账号的账单随删，只留 NULL 归属存量。"""
+    from datetime import datetime
+
+    from sqlalchemy import select
+
+    from app.domains.account import service as account_service
+    from app.domains.account.models import SteamAccount
+    from app.domains.bills.models import BillImport
+
+    a, b = _sid(93), _sid(94)
+    async with db() as session:
+        session.add(SteamAccount(steam_id=a, is_active=True, bound_at=datetime.utcnow()))
+        session.add(SteamAccount(steam_id=b, is_active=True, bound_at=datetime.utcnow()))
+        await session.commit()
+
+    await _seed_bill(db, a, "甲")
+    await _seed_bill(db, b, "乙")
+    await _seed_bill(db, None, "存量无归属")
+
+    await account_service.clear_cookies()
+
+    async with db() as session:
+        rows = (await session.execute(select(BillImport))).scalars().all()
+        accounts = (await session.execute(select(SteamAccount))).scalars().all()
+    assert accounts == []
+    assert [(r.steam_id, r.nickname) for r in rows] == [(None, "存量无归属")], \
+        "全删后仅剩无归属存量旧数据"

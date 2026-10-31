@@ -21,7 +21,7 @@ import asyncio
 import logging
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from app.core import secretbox
 from app.core.database import (
@@ -34,6 +34,8 @@ from app.core.logging import log_event
 from app.core.secretbox import SecretBoxError
 from app.crawler.utils import get_beijing_time_obj
 from app.domains.account.models import SteamAccount
+from app.domains.bills.models import BillCdkGame, BillGameTx, BillImport, BillTopupTx
+from app.domains.family.models import FamilyGroup, FamilyLibrarySnapshot
 from app.domains.regions.models import CrawlRegion
 from app.domains.settings import service as settings_service
 from .session import (
@@ -630,9 +632,51 @@ async def _teardown_tracking(steam_id: str) -> dict:
     }
 
 
+async def _purge_account_data(session, steam_id: str) -> dict:
+    """删号即清：该账号名下的账单导入与家庭组随账号一并删除。
+
+    账单按 steam_id 归属列删（NULL 归属是无账号的存量旧数据，不动）；
+    家庭组行随删（手动添加的成员条目也随组行删除，由账号同步重建），
+    共享家庭组由其他账号的组行继续持有，仅清失去全部组行的孤儿库快照。
+    须在调用方写事务内执行，与账号行删除同事务提交或整体回滚。
+    """
+    import_ids = [
+        int(r[0])
+        for r in (
+            await session.execute(select(BillImport.id).where(BillImport.steam_id == steam_id))
+        ).all()
+    ]
+    if import_ids:
+        for model in (BillGameTx, BillTopupTx, BillCdkGame):
+            await session.execute(delete(model).where(model.import_id.in_(import_ids)))
+        await session.execute(delete(BillImport).where(BillImport.id.in_(import_ids)))
+    removed_groups = (
+        await session.execute(delete(FamilyGroup).where(FamilyGroup.steamid == steam_id))
+    ).rowcount or 0
+    # 孤儿快照全局回收（组行是快照唯一读取入口，无组行引用即不可达）：
+    # 被删账号独有组→快照清，共享组由仍绑定账号的组行继续持有
+    removed_snapshots = (
+        await session.execute(
+            delete(FamilyLibrarySnapshot).where(
+                FamilyLibrarySnapshot.family_groupid.not_in(
+                    select(FamilyGroup.family_groupid).where(
+                        FamilyGroup.family_groupid.is_not(None)
+                    )
+                )
+            )
+        )
+    ).rowcount or 0
+    return {
+        "billsRemoved": len(import_ids),
+        "familyGroupsRemoved": removed_groups,
+        "familySnapshotsRemoved": removed_snapshots,
+    }
+
+
 async def remove_account(steam_id: str) -> dict:
     """删除指定账号。删除 active 时回退剩余首个（即新主账号）。
 
+    名下账单导入与家庭组随删（删号即清，重绑/同步后再补回）；
     绑定时自动注册的监控追踪随删（与绑定对称）：复用监控池解绑链。
     重绑同一账号会经绑定后置任务自动重新注册追踪，拆除实际可逆。
     """
@@ -641,6 +685,7 @@ async def remove_account(steam_id: str) -> dict:
         if row is None:
             raise ValueError(f"账号不存在: {steam_id}")
         was_active = row.is_active
+        purge = await _purge_account_data(session, steam_id)
         await session.delete(row)
         await session.flush()
         rest = (
@@ -660,7 +705,7 @@ async def remove_account(steam_id: str) -> dict:
         await session.commit()
         remaining = len(rest)
     teardown = await _teardown_tracking(steam_id)
-    return {"ok": True, "removed": steam_id, "remaining": remaining, **teardown}
+    return {"ok": True, "removed": steam_id, "remaining": remaining, **purge, **teardown}
 
 
 # ── 钱包 / 资料 同步 ────────────────────────────────────────
@@ -1168,8 +1213,9 @@ async def _sync_wallet_of(steam_id: str) -> dict:
 async def clear_cookies() -> None:
     """解绑全部（清账号表 + 旧 KV；手填 SteamID64 / API Key 不动）。
 
-    被删账号的监控追踪随删（绑定自动注册的对称拆除）；从未绑定凭据、
-    仅在监控池手动追踪的账号不受影响。
+    被删账号名下账单导入与家庭组随删（删号即清）；监控追踪随删
+    （绑定自动注册的对称拆除）。从未绑定凭据、仅在监控池手动追踪的
+    账号不受影响。
     """
     async with write_session(WritePriority.INTERACTIVE) as session:
         rows = (
@@ -1180,6 +1226,8 @@ async def clear_cookies() -> None:
             .all()
         )
         removed_ids = [r.steam_id for r in rows]
+        for steam_id in removed_ids:
+            await _purge_account_data(session, steam_id)
         for r in rows:
             await session.delete(r)
         await session.commit()
