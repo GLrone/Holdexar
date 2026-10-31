@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"holdexar/server-go/internal/access"
 	"holdexar/server-go/internal/config"
 	"holdexar/server-go/internal/games"
 	"holdexar/server-go/internal/httpapi"
@@ -28,6 +29,7 @@ const schemaVersion = 34
 func main() {
 	addr := flag.String("addr", "127.0.0.1:28765", "监听地址")
 	dataDirFlag := flag.String("data-dir", "", "显式数据目录，跳过自动判定")
+	devSession := flag.Bool("dev-session", false, "开放开发态会话发放通道（发行版无此入口）")
 	flag.Parse()
 
 	if *dataDirFlag != "" {
@@ -60,6 +62,7 @@ func main() {
 	}
 	defer db.Close()
 
+	gate := access.New()
 	server := &httpapi.Server{
 		App:     config.AppName(),
 		Version: config.Version(),
@@ -70,9 +73,10 @@ func main() {
 			rates.Register(mux, db)
 			games.Register(mux, db)
 			systemx.Register(mux, db)
+			systemx.RegisterSession(mux, gate, *devSession)
 		},
 	}
-	httpServer := &http.Server{Addr: *addr, Handler: server.Handler()}
+	httpServer := &http.Server{Addr: *addr, Handler: gate.Middleware(server.Handler())}
 
 	fmt.Fprintf(os.Stderr, "数据目录：%s\n", dataDir)
 	fmt.Fprintf(os.Stderr, "数据库：%s\n", dbPath)
