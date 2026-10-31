@@ -18,7 +18,6 @@ const pool: Partial<Record<MessageKey, string>> = {
   'pool.account.labelPlaceholder': 'Label (optional)',
   'pool.account.bind': 'Bind',
   'pool.account.bindSuccess': 'Account bound: {code}',
-  'pool.account.unbindTitle': 'Confirm',
   'pool.account.unbindConfirm': 'Unbind {name}? Their tracked items will be deleted too.',
   'pool.account.unbindSuccess': 'Account unbound',
   'pool.account.sync': 'Sync',
