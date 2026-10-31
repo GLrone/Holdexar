@@ -11,7 +11,6 @@ import epZhCn from 'element-plus/es/locale/lang/zh-cn'
 import epEn from 'element-plus/es/locale/lang/en'
 import 'element-plus/dist/index.css'
 import 'element-plus/theme-chalk/dark/css-vars.css'
-import * as ElementPlusIconsVue from '@element-plus/icons-vue'
 
 import './styles/tokens.css'
 // 框架标准层（hl-* 隔离类名，规范来源 web/dev/component-framework.html）
@@ -34,10 +33,6 @@ import { setupForceReload } from './lib/forceReload'
 
 const app = createApp(App)
 const pinia = createPinia()
-
-for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
-  app.component(key, component)
-}
 
 app.use(pinia)
 app.use(router)
