@@ -360,10 +360,6 @@ async def _local_sub_identity(
 _INFLIGHT: dict[tuple[int, str], asyncio.Task] = {}
 
 
-def inflight_regions(appid: int) -> list[str]:
-    return sorted(r for (a, r) in _INFLIGHT if a == appid)
-
-
 def is_inflight(appid: int, region_code: str) -> bool:
     return (int(appid), region_code.lower()) in _INFLIGHT
 

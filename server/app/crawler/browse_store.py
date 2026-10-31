@@ -70,9 +70,6 @@ DATA_REQUEST_EXTRAS = {
     "include_coming_soon": True,  # → 即将推出标记
     "include_tag_count": 20,      # → tags[]{tagid,weight}（热门用户标签，含票重）
 }
-# 热门标签条数上限：店铺页「该产品的热门用户自定义标签」最多回 20 条，
-# 请求值给更大也只回这么多
-TAG_COUNT_LIMIT = 20
 
 # browse 的 item.type 标定：
 #   0=游戏 1=Demo 2=Mod 3=Tool 4=DLC 6=应用(如 Wallpaper Engine，按 GAME 收)

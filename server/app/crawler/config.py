@@ -6,9 +6,6 @@ from __future__ import annotations
 
 # Steam 端点
 APPDETAILS_URL = "https://store.steampowered.com/api/appdetails"
-REVIEWS_URL = (
-    "https://store.steampowered.com/appreviews/{appid}?json=1&language=all&purchase_type=all"
-)
 
 # 数据新鲜度阈值（小时）
 STALE_HOURS = 12
@@ -60,8 +57,6 @@ CC_LIST: list[tuple[str, str, str]] = [
     ("il", "以色列（ILS）", "ILS"),
     ("ch", "瑞士（CHF）", "CHF"),
 ]
-
-CIS_REGIONS = ["kz", "ua"]
 
 DEFAULT_WORKER_COUNT = 30
 # 直连 Steam 在部分网络下 TLS 握手可能超过 10s，超时放宽到 20s
