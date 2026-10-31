@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"holdexar/server-go/internal/derived"
 	"holdexar/server-go/internal/store"
 )
 
@@ -32,6 +33,9 @@ type Writer struct {
 	EventKey func(time.Time) *string          // 观测时刻所属活动窗口 key；nil = 无活动
 	FxRates  map[string]float64               // 汇率缓存；LoadFxRates 装载
 	Log      func(format string, args ...any) // 运行事件出口；缺省 stderr
+	// SeriesOverrides 系列覆盖表（数据目录文件在闸外由宿主装填；
+	// nil = 无覆盖）。派生链闸内零文件 IO。
+	SeriesOverrides map[string][]int64
 }
 
 // NewWriter 构造写层。
@@ -123,6 +127,14 @@ func (w *Writer) writeChunkTx(ctx context.Context, conn *sql.Conn, entries []Bat
 	known, latest, err := queryBaselines(ctx, conn, okIDs)
 	if err != nil {
 		return fmt.Errorf("基线查询失败: %w", err)
+	}
+
+	// 派生目录输入快照（写入前旧值）：系列联动的变化判定输入
+	var catalogBefore map[int64]derived.CatalogRow
+	if len(okIDs) > 0 {
+		if catalogBefore, err = derived.CatalogInputs(ctx, conn, okIDs); err != nil {
+			return fmt.Errorf("派生目录快照读取失败: %w", err)
+		}
 	}
 
 	// 归一化 + 免费态分组：免费态字段缺省的行保留已有标记，两组列形状不同
@@ -232,7 +244,19 @@ func (w *Writer) writeChunkTx(ctx context.Context, conn *sql.Conn, entries []Bat
 	} else if _, err := conn.ExecContext(ctx, "RELEASE SAVEPOINT hx_clear_removed"); err != nil {
 		return fmt.Errorf("收尾保存点释放失败: %w", err)
 	}
-	// 派生列维护（hl_flag/系列识别等）未迁移，接线上随 update_price_derived 落地
+	// 派生列维护（hl/史低标记/系列识别/智能评分）：与 Python 同一写事务
+	// 内、批写完成后执行；系列覆盖表由宿主闸外装填
+	if len(okIDs) > 0 {
+		derived.Clock = w.Now
+		if _, err := derived.UpdatePriceDerived(ctx, conn, okIDs, derived.Options{
+			Now:           w.Now(),
+			Overrides:     w.SeriesOverrides,
+			History:       true,
+			CatalogBefore: catalogBefore,
+		}); err != nil {
+			return fmt.Errorf("派生列维护失败: %w", err)
+		}
+	}
 	return nil
 }
 
