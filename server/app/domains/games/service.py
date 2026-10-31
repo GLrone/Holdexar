@@ -34,12 +34,6 @@ from app.domains.games.models import (
     GameCurrentPrice,
     GamePriceHistory,
 )
-from app.domains.games.scoring import (
-    familiarity_score,
-    quality_score,
-    save_score,
-    timing_score,
-)
 from app.domains.games.sorting import build_order_by
 from app.domains.games.pricing import (
     DEFAULT_EXCHANGE_RATES,
@@ -1755,7 +1749,10 @@ def _build_list_item(
             continue
         price_cents = int(p.price)
         cny_fen = int(p.cny_fen) if p.cny_fen is not None else None
-        price_map[code] = {"cents": price_cents, "cnyFen": cny_fen, "stale": stale}
+        price_map[code] = {
+            "cents": price_cents, "cnyFen": cny_fen, "stale": stale,
+            "discount": int(p.discount_percent or 0),
+        }
 
     all_prices: dict[str, list] = {}
     lowest_cny_fen = min((v for v in (base_cn_price, game.min_cny_fen) if v is not None), default=None)
@@ -1764,28 +1761,11 @@ def _build_list_item(
         if not data:
             continue
         all_prices[code.upper()] = [
-            format_minor_units(data["cents"], currency), data["cnyFen"] or 0, data["cents"], None,
-            data["stale"],
+            format_minor_units(data["cents"], currency), data["cnyFen"] or 0,
+            data["cents"], data["discount"], data["stale"],
         ]
     diff = int(game.diff_fen or 0)
     discount = cn_row.discount_percent or 0 if cn_row is not None else 0
-    cn_original_fen = (
-        int(cn_row.original_price)
-        if cn_row is not None and cn_row.original_price is not None
-        else None
-    )
-
-    # smart 评分因子（与 games.smart_score 同公式同口径，scoring.py）——
-    # 展示期现算即可：每页 40 行的纯数学，无需回读落库值（落库值只服务
-    # ORDER BY）；零评价的发行年龄按请求日现算，与刷新落库同公式
-    smart_factors = {
-        "save": round(save_score(game.diff_fen), 3),
-        "quality": round(
-            quality_score(game.positive_rate, game.review_count, game.release_date), 3
-        ),
-        "timing": round(timing_score(game.hl_flag, discount), 2),
-        "familiarity": round(familiarity_score(game.review_count), 3),
-    }
 
     # 覆盖（唯一事实源 = 活表尝试状态，与触发方无关）：分母 = 启用区服；
     # regions 只点名非成功区（outcome/answer/lastSuccessAt 供前端说
@@ -1848,21 +1828,15 @@ def _build_list_item(
         "isVisualNovel": game.is_visual_novel or False,
         "releaseDate": game.release_date or "",
         "basePriceFen": base_cn_price,
-        # 国区原价（未折价分，original_price）；划线原价展示用——
-        # basePriceFen 是折后现价，不能当原价画删除线
-        "cnOriginalFen": cn_original_fen,
         "lowestPriceFen": lowest_cny_fen,
         "savingsFen": diff,
         "headerImage": game.header_image or build_steam_header_url(int(game.appid)),
-        # 区服键控价格矩阵：{"CN": [formatted, cnyFen, cents, null], ...}，只含有价区
+        # 区服键控价格矩阵：{"CN": [formatted, cnyFen, cents, discountPct, stale], ...}，只含有价区
         "priceMatrix": all_prices,
         # 爬过但未抓到价格的区（大写码，missing/blocked）：前端黄框区分「待更新」与锁区
         "unavailableRegions": sorted(unavailable_regions),
         "hlFlag": game.hl_flag or 0,
         "ppFlag": game.pp_flag or 0,
-        # smart 评分（0~1 加权和）与四因子拆解（实验池对照展示用）
-        "smartScore": round(game.smart_score or 0, 4),
-        "smartFactors": smart_factors,
         # 最近一次原价跳变时刻：永降/永涨徽章 14 天时效判据（前端判定显隐）
         "ppChangedAt": game.pp_changed_at.isoformat() if game.pp_changed_at else None,
         "updatedAt": game.updated_at.isoformat() if game.updated_at else None,
