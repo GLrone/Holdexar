@@ -480,3 +480,43 @@ func mustRequest(name, url, body string) *http.Request {
 	req.Header.Set("Content-Type", "application/json")
 	return req
 }
+
+// TestPutMCPEnabledTriggersHook mcp_enabled 落库成功后触发运行时重载回调；
+// 未携带该字段时不触发（Python 写入口 reapply 同径）。
+func TestPutMCPEnabledTriggersHook(t *testing.T) {
+	_, h := newTestEnv(t)
+	var fired int
+	prev := OnMCPEnabledWrite
+	OnMCPEnabledWrite = func() { fired++ }
+	t.Cleanup(func() { OnMCPEnabledWrite = prev })
+
+	if rec := do(t, h, http.MethodPut, "/api/v1/settings", `{"mcp_enabled":true}`); rec.Code != http.StatusOK {
+		t.Fatalf("PUT 状态码 = %d, want 200", rec.Code)
+	}
+	if fired != 1 {
+		t.Fatalf("携带 mcp_enabled 应触发一次重载回调：%d", fired)
+	}
+	do(t, h, http.MethodPut, "/api/v1/settings", `{"theme":"light"}`)
+	if fired != 1 {
+		t.Fatalf("未携带 mcp_enabled 不应触发回调：%d", fired)
+	}
+}
+
+// TestGetMCPStatusProjection 注入运行态快照后 GET 的三个运行态字段跟随投影。
+func TestGetMCPStatusProjection(t *testing.T) {
+	_, h := newTestEnv(t)
+	prev := MCPStatus
+	MCPStatus = func() (bool, string, bool) { return true, "启用失败：注入", true }
+	t.Cleanup(func() { MCPStatus = prev })
+
+	rec := do(t, h, http.MethodGet, "/api/v1/settings", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{`"mcp_running":true`, `"mcp_error":"启用失败：注入"`, `"mcp_forced_by_env":true`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("运行态投影缺 %s：%s", want, body)
+		}
+	}
+}

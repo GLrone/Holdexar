@@ -58,6 +58,14 @@ func Register(mux *http.ServeMux, db *sql.DB, gate *store.WriteGate) {
 	mux.HandleFunc("PUT /api/v1/settings", h.handlePut)
 }
 
+// OnMCPEnabledWrite mcp.enabled 落库成功后的运行时重载回调；cmd/serverd 注入
+// agent 侧实现（函数字段注入，避免 settings → agent 依赖）。nil 时跳过。
+var OnMCPEnabledWrite func()
+
+// MCPStatus MCP 运行态快照（GET 的 mcp_running/mcp_error/mcp_forced_by_env）；
+// cmd/serverd 注入 agent 侧实现，nil 保持未在役占位形状。
+var MCPStatus func() (running bool, errText string, forcedByEnv bool)
+
 type handler struct {
 	db      *sql.DB
 	gate    *store.WriteGate
@@ -83,7 +91,7 @@ type settingsResponse struct {
 	DirectNoticeSeen bool           `json:"direct_notice_seen"`
 	Theme            string         `json:"theme"`
 	MCPEnabled       bool           `json:"mcp_enabled"`
-	// MCP 运行态：会话管理器未迁移，恒为未在役形状（Python _manager 为空同形）。
+	// MCP 运行态：cmd/serverd 注入 agent 侧快照；未注入时恒为未在役形状。
 	MCPRunning     bool   `json:"mcp_running"`
 	MCPError       string `json:"mcp_error"`
 	MCPForcedByEnv bool   `json:"mcp_forced_by_env"`
@@ -157,6 +165,9 @@ func (h *handler) readSettings(ctx context.Context) (*settingsResponse, error) {
 			v.val = s.def
 		}
 		*s.target = pyStrOr(v.val, s.def)
+	}
+	if MCPStatus != nil {
+		resp.MCPRunning, resp.MCPError, resp.MCPForcedByEnv = MCPStatus()
 	}
 	return resp, nil
 }
@@ -314,6 +325,10 @@ func (h *handler) handlePut(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, detailNull())
 			return
+		}
+		// mcp.enabled 变更后运行时重应用（Python 写入口 reapply 同径）
+		if req.mcpEnabled != nil && OnMCPEnabledWrite != nil {
+			OnMCPEnabledWrite()
 		}
 	}
 	resp, err := h.readSettings(r.Context())

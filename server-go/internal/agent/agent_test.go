@@ -542,3 +542,66 @@ func TestToolHandlersMissing(t *testing.T) {
 		}
 	}
 }
+
+// TestReapplyToggle 设置写 mcp.enabled 后的运行时重应用：开→令牌文件与闸放行，
+// 关→令牌文件清除、前缀闸回 404；env 强制通道优先于设置关闭。
+func TestReapplyToggle(t *testing.T) {
+	t.Setenv("HOLDEXAR_MCP", "")
+	_, db, gate, dataDir := newTestSurface(t, false)
+	setEnabled := func(on bool) {
+		v := "false"
+		if on {
+			v = "true"
+		}
+		if _, err := db.Exec(`INSERT INTO app_settings (key, value_json, updated_at)
+			VALUES ('mcp.enabled', ?, '2026-01-01 00:00:00.000000')
+			ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json`, v); err != nil {
+			t.Fatalf("设置写入失败：%v", err)
+		}
+	}
+	req := httptest.NewRequest(http.MethodPost, MountPath, nil)
+	req.Host = "127.0.0.1:28765"
+
+	if got := gateCode(gate, req); got != http.StatusNotFound {
+		t.Fatalf("初始关闭应 404: got %d", got)
+	}
+	setEnabled(true)
+	Reapply()
+	if got := gateCode(gate, req); got != http.StatusUnauthorized {
+		t.Fatalf("开启后无令牌应 401: got %d", got)
+	}
+	tokenRaw, err := os.ReadFile(filepath.Join(dataDir, TokenFilename))
+	if err != nil {
+		t.Fatalf("令牌文件应落盘: %v", err)
+	}
+	req.Header.Set(TokenHeader, strings.TrimSpace(string(tokenRaw)))
+	if got := gateCode(gate, req); got != 0 {
+		t.Fatalf("开启后对令牌应放行: got %d", got)
+	}
+	running, errText, forced := MCPStatus()
+	if !running || errText != "" || forced {
+		t.Fatalf("运行态投影不符: running=%v err=%q forced=%v", running, errText, forced)
+	}
+
+	setEnabled(false)
+	Reapply()
+	if got := gateCode(gate, req); got != http.StatusNotFound {
+		t.Fatalf("关闭后应回 404: got %d", got)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, TokenFilename)); !os.IsNotExist(err) {
+		t.Fatalf("关闭后令牌文件应被清除: %v", err)
+	}
+	if running, _, _ = MCPStatus(); running {
+		t.Fatalf("关闭后运行态应为未在役")
+	}
+
+	// env 强制通道：设置关闭不生效（Python enabled = env or settings 同径）
+	t.Setenv("HOLDEXAR_MCP", "1")
+	Reapply()
+	if got := gateCode(gate, req); got != http.StatusUnauthorized {
+		t.Fatalf("env 强制开启应 401（无令牌）: got %d", got)
+	}
+	if _, _, forced = MCPStatus(); !forced {
+		t.Fatalf("env 强制应投影 forcedByEnv=true")
+	}
+}
