@@ -69,23 +69,6 @@ _USER_TABLES = (
     "bill_cdk_games",
 )
 
-# 随包种子 / 公共目录数据：不进导出（由发布包与爬虫重建，非用户资产）
-_SEED_TABLES = (
-    "games", "game_current_prices", "game_price_history",
-    "bundles", "bundle_region_prices", "preset_games", "catalog_removals",
-    "game_tags", "tags", "fx_rates", "fx_rate_history",
-    "crawl_regions", "achievement_defs",
-)
-
-# 运行期派生 / 采集数据：不进导出（可重建，且含大量噪声）
-_RUNTIME_TABLES = (
-    "price_cycles", "crawl_jobs", "price_events", "subscription_snapshots",
-    "proxy_job_runs", "proxy_events", "health_runs", "health_observations",
-    "worker_leases", "proxy_run_exits", "proxy_nodes",
-    "exit_groups", "lanes", "pool_generations", "orchestration_events",
-    "notification_candidates", "agent_sessions", "agent_runs", "agent_events",
-)
-
 # app_settings 里属于「种子状态」的键（种子版本 marker），不进导出
 _SEED_KEY_PREFIX = "seed."
 

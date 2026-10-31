@@ -23,6 +23,7 @@ from datetime import datetime
 
 from sqlalchemy import bindparam, delete, func, select
 
+from app.crawler.utils import clean_appids
 from app.core.database import WritePriority, get_session_factory, write_session
 from app.domains.monitoring.models import (
     NON_CRAWL_STATES,
@@ -631,16 +632,7 @@ async def sync_game_sources(appids: list[int]) -> dict[int, str]:
     关注 favorite / 手动入池 manual 不被账号对账改写。
     排除状态不被本函数改写——它只由用户显式操作维护。
     """
-    clean: list[int] = []
-    seen: set[int] = set()
-    for a in appids or []:
-        try:
-            appid = int(a)
-        except (TypeError, ValueError):
-            continue
-        if appid > 0 and appid not in seen:
-            seen.add(appid)
-            clean.append(appid)
+    clean = clean_appids(appids)
     if not clean:
         return {}
 

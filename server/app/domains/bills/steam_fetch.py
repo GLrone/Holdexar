@@ -18,6 +18,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 import httpx
+from app.core.net import is_ssl_error
 
 from app.core.logging import log_event
 from app.domains.account.steam_wallet import (
@@ -72,15 +73,7 @@ class SteamReportData:
         }
 
 
-def _has_ssl_error(message: str) -> bool:
-    lowered = message.lower()
-    return any(
-        clue in lowered
-        for clue in ("ssl", "certificate verify failed", "self-signed", "certifi")
-    )
-
-
-# ── 登录页守门（redeem 域 _redirect_chain_hits_login 同语义）────────────
+# ── 登录页守门────────────
 # Cookie 过期/失效时 account/* 会被 302 到登录页（follow_redirects 终点即登录页）。
 # 登录页没有账单/许可表格，照常解析会产出 0 行"空报告"——空 import 按 id
 # 倒序排最前，把真实的旧快照整个遮住，故登录页命中即中止。
@@ -652,7 +645,7 @@ async def fetch_full_report(
     try:
         return await _run(True)
     except (httpx.HTTPStatusError, httpx.RequestError, SteamFetchError) as exc:
-        if not _has_ssl_error(str(exc)):
+        if not is_ssl_error(exc):
             raise SteamFetchError(str(exc)) from exc
         log_event(
             logger,
@@ -691,7 +684,7 @@ async def probe_new_transactions(
     try:
         return await _probe(True)
     except (httpx.HTTPStatusError, httpx.RequestError, SteamFetchError) as exc:
-        if not _has_ssl_error(str(exc)):
+        if not is_ssl_error(exc):
             raise
         log_event(
             logger,

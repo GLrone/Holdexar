@@ -90,16 +90,8 @@ class ComponentMeta:
     component_id: str
     name: str
     description: str
-    agent_description: str
     supported_densities: tuple[StructuredDensity, ...] = ("standard", "compact", "expanded")
     supported_hosts: tuple[StructuredHost, ...] = ("pilot-drawer", "pilot-page", "view-page", "dashboard")
     default_title: str | None = None
     schema_type: str | None = None
 
-    def to_agent_summary(self) -> dict[str, Any]:
-        return {
-            "id": self.component_id,
-            "name": self.name,
-            "description": self.agent_description,
-            "schemaType": self.schema_type,
-        }

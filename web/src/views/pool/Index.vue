@@ -3,6 +3,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import { watchPoolApi, type PoolItemPayload, type TrackedAccount } from '@/api/client'
+import { friendCodeOrRaw } from '@/utils/steamId'
 import { useRegionsStore } from '@/stores/regions'
 import { useI18n, type MessageKey } from '@/locales'
 import { parseFavoritesRefs } from '@/lib/appidRefs'
@@ -131,23 +132,14 @@ watch([search, filterKind, items], () => {
   page.value = 1
 })
 
-/** 好友码 = SteamID64 - 76561197960265728（BigInt，超出 Number 精度） */
-function toFriendCode(steamid: string): string {
-  try {
-    return String(BigInt(steamid) - 76561197960265728n)
-  } catch {
-    return steamid
-  }
-}
-
 /** 展示名：Steam 昵称优先，备注名兜底，最后好友码 */
 function acctName(a: TrackedAccount): string {
-  return a.personaName || a.label || a.friendCode || toFriendCode(a.steamid)
+  return a.personaName || a.label || a.friendCode || friendCodeOrRaw(a.steamid)
 }
 
 /** 第二行好友码：展示名已是好友码（无昵称/备注的降级态）时不重复 */
 function acctCode(a: TrackedAccount): string {
-  const code = a.friendCode || toFriendCode(a.steamid)
+  const code = a.friendCode || friendCodeOrRaw(a.steamid)
   return acctName(a) === code ? '' : t('pool.account.friendCode', { code })
 }
 
@@ -211,7 +203,7 @@ async function add() {
   try {
     const res = await watchPoolApi.add(raw, newLabel.value.trim())
     message.success(
-      t('pool.account.bindSuccess', { code: res.friendCode || toFriendCode(res.steamid) }),
+      t('pool.account.bindSuccess', { code: res.friendCode || friendCodeOrRaw(res.steamid) }),
     )
     newSteamid.value = ''
     newLabel.value = ''

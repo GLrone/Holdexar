@@ -414,3 +414,24 @@ def test_every_used_tag_is_in_the_vocabulary():
         used.update(re.findall(r'tag="([^"]+)"', path.read_text(encoding="utf-8")))
     unknown = sorted(used - set(app_logging.TAG_SEVERITY))
     assert not unknown, f"以下结果词未登记（前端分色会漏）：{unknown}"
+
+
+# ── redact_url：订阅类 URL 的主机形态降级 ────────────────────
+# 订阅地址的凭据在路径段 token 里，逐行 redact 正则对路径型 token 失明；
+# 落日志前必须先过 redact_url。URL 用拼接构造（原因同上：字面订阅形状
+# 会被提交门禁拦住本文件）。
+
+
+def test_redact_url_masks_path_and_query():
+    url = "https://" + "sub.example.com" + "/api/" + "tok" + "en12345/extra?key=abc"
+    out = app_logging.redact_url(url)
+    assert out == "https://sub.example.com/***"
+    assert "tok" not in out and "key=abc" not in out
+
+
+def test_redact_url_edge_cases():
+    assert app_logging.redact_url(None) == ""
+    assert app_logging.redact_url("") == ""
+    assert app_logging.redact_url("not a url") == "***"
+    out = app_logging.redact_url("https://" + "host.example")
+    assert out == "https://host.example/***"

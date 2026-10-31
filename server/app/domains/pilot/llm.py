@@ -354,7 +354,9 @@ async def _responses_parse(aiter_lines):
 # ── anthropic（Messages API）────────────────────────────────────────
 
 def _anthropic_convert(messages: list[dict]) -> tuple[str | None, list[dict]]:
-    """内部消息 → Anthropic 形态：system 提顶、工具结果转 tool_result 块。"""
+    """内部消息 → Anthropic 形态：system 提顶、工具结果转 tool_result 块、
+    连续同角色合并为单条多块消息（协议要求 user/assistant 交替，而环境注入
+    与并行批次天然产生连续 user / 连续 tool 轮）。"""
     system = "\n".join(m["content"] for m in messages if m["role"] == "system") or None
     out: list[dict] = []
     for m in messages:
@@ -362,9 +364,9 @@ def _anthropic_convert(messages: list[dict]) -> tuple[str | None, list[dict]]:
         if role == "system":
             continue
         if role == "user":
-            out.append({"role": "user", "content": [{"type": "text", "text": m["content"]}]})
+            blocks: list[dict] = [{"type": "text", "text": m["content"]}]
         elif role == "assistant":
-            blocks: list[dict] = []
+            blocks = []
             if m.get("content"):
                 blocks.append({"type": "text", "text": m["content"]})
             for tc in m.get("tool_calls") or []:
@@ -374,13 +376,20 @@ def _anthropic_convert(messages: list[dict]) -> tuple[str | None, list[dict]]:
                     "name": tc["function"]["name"],
                     "input": json.loads(tc["function"]["arguments"] or "{}"),
                 })
-            out.append({"role": "assistant", "content": blocks})
         elif role == "tool":
-            out.append({"role": "user", "content": [{
+            # Anthropic 无 tool 角色：工具结果以 tool_result 块收进 user 轮
+            blocks = [{
                 "type": "tool_result",
                 "tool_use_id": m.get("tool_call_id") or "",
                 "content": m.get("content") or "",
-            }]})
+            }]
+            role = "user"
+        else:
+            continue
+        if out and out[-1]["role"] == role:
+            out[-1]["content"].extend(blocks)
+        else:
+            out.append({"role": role, "content": blocks})
     return system, out
 
 

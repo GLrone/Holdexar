@@ -289,14 +289,19 @@ def _scrypt(passphrase: str, salt: bytes) -> bytes:
 
 
 def write_record(data_dir: Path, record: dict) -> None:
-    """密钥文件落盘（POSIX 收紧 0600；Windows 走 ACL 继承）。"""
+    """密钥文件落盘（先写临时文件再替换：断电时要么旧要么新，不留半截）。
+
+    POSIX 收紧 0600；Windows 走 ACL 继承。
+    """
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     path = _master_path(data_dir)
+    tmp = path.with_suffix(".tmp")
     try:
-        path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
         if sys.platform != "win32":
-            path.chmod(0o600)
+            tmp.chmod(0o600)
+        tmp.replace(path)
     except OSError as exc:
         raise KeyringError(f"密钥文件写入失败（数据目录不可写？）：{exc}") from exc
 
@@ -315,14 +320,19 @@ def snapshot_record(data_dir: Path) -> bytes | None:
 
 
 def restore_record(data_dir: Path, raw: bytes | None) -> None:
-    """按原始字节恢复密钥文件；None = 删除（回滚到 legacy）。"""
+    """按原始字节恢复密钥文件（先临时后替换，同 write_record）；None = 删除。"""
     path = _master_path(data_dir)
     if raw is None:
         path.unlink(missing_ok=True)
         return
-    path.write_bytes(raw)
-    if sys.platform != "win32":
-        path.chmod(0o600)
+    tmp = path.with_suffix(".tmp")
+    try:
+        tmp.write_bytes(raw)
+        if sys.platform != "win32":
+            tmp.chmod(0o600)
+        tmp.replace(path)
+    except OSError as exc:
+        raise KeyringError(f"密钥文件恢复失败（数据目录不可写？）：{exc}") from exc
 
 
 # ── 换钥过渡记录（崩溃恢复的唯一依据）────────────────────────

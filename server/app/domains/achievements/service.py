@@ -18,6 +18,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import httpx
+from app.core.net import is_ssl_error
 from sqlalchemy import delete, func, select
 
 from app.core.database import WritePriority, get_session_factory, write_session
@@ -136,20 +137,13 @@ async def _post_form(url: str, data: dict) -> httpx.Response:
         async with httpx.AsyncClient(timeout=30, proxy=proxy, verify=_ssl_context(True)) as client:
             resp = await client.post(url, data=data)
     except httpx.HTTPError as e:
-        if not _is_ssl_error(e):
+        if not is_ssl_error(e):
             raise
         log_event(logger, "Steam 接口证书校验失败（经代理场景），降级跳过校验重试", tag="降级")
         async with httpx.AsyncClient(timeout=30, proxy=proxy, verify=_ssl_context(False)) as client:
             resp = await client.post(url, data=data)
     resp.raise_for_status()
     return resp
-
-
-def _is_ssl_error(exc: Exception) -> bool:
-    clues = ("CERTIFICATE_VERIFY_FAILED", "self-signed", "certificate verify failed",
-             "ssl", "SSL", "unable to get local issuer")
-    text = f"{type(exc).__name__}: {exc}"
-    return any(c in text for c in clues)
 
 
 async def _api_call(

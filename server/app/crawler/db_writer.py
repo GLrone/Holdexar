@@ -12,7 +12,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
-from sqlalchemy import case, delete, func, or_, select, text, update
+from sqlalchemy import and_, case, delete, func, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.database import (
@@ -122,6 +122,12 @@ def _current_updates(excluded) -> dict:
 # 只有 status=ok 且 price=None 才是"成功响应里的坏数据"；连续补抓失败上限，
 # 超过即终态化（blocked），防止"该区根本无货"被当成可重试错误死磕。
 MISSING_MAX_RETRIES = 5
+
+# blocked 老化重探窗口（天）。blocked 是「该区大概率无货」的终态，但持续传输
+# 类故障也会把真游戏烧成 blocked——不给出口就成了永久固化。每窗口放行一次
+# 重探：成功自然复活，失败 bump 刷新 updated_at 重新计时（一行一窗口一次
+# 请求，配额有界）。
+BLOCKED_REPROBE_DAYS = 7
 
 # 批量参数列表分块，限制单段内存与驱动调用规模。
 _INSERT_CHUNK_ROWS = 2000
@@ -1404,36 +1410,6 @@ class DbWriter:
         except Exception as e:
             log_event(logger, "标记即将推出暂缓失败", level=logging.ERROR, detail={"原因": e})
 
-    async def bump_removed_strike(self, appid: int) -> bool:
-        """全 404 轮记一击；连续 ≥2 击（跨两个价格刷新周期）→ 落 removed_at 终态。
-
-        只对库内已有元数据（updated_at 有值）的行生效——挂名行/COMING_SOON
-        无"曾经有数据"事实，不走下架判定（走反哺/重探通道）。返回是否已转终态。
-        """
-        try:
-            async with write_session(WritePriority.BACKGROUND) as session:
-                row = await session.get(Game, int(appid))
-                if row is None or row.updated_at is None:
-                    return False
-                row.removed_strikes = (row.removed_strikes or 0) + 1
-                if row.removed_strikes >= 2:
-                    row.removed_at = _naive(get_beijing_time_obj())
-                    log_event(
-                        logger,
-                        f"游戏 {appid} 连续 {row.removed_strikes} 轮全部 404，已标记为下架",
-                        detail={"游戏": appid, "连续轮数": row.removed_strikes},
-                    )
-                await session.commit()
-                return row.removed_at is not None
-        except Exception as e:
-            log_event(
-                logger,
-                "记录下架判定击数失败",
-                level=logging.ERROR,
-                detail={"原因": e},
-            )
-            return False
-
     async def clear_removed_mark(self, appid: int) -> None:
         """复活清标：upsert_game_and_prices 成功路径调用（抓到数据=商店健在）。
 
@@ -1521,10 +1497,11 @@ class DbWriter:
     ) -> list[dict]:
         """从欠账账本生成定向补抓任务（按区分组批量：1 任务 = 1 区 × ≤300 appid）。
 
-        选取规则：price_status='missing' 且已过冷却（updated_at < now - cooldown），
-        空区行不在选取之列。locked/blocked 不进补抓（终态合理）；missing 连补
-        MISSING_MAX_RETRIES 次仍失败会在 mark_region_status 里转 blocked，不再
-        出现在这里。
+        选取规则：price_status='missing' 且已过冷却（updated_at < now - cooldown）；
+        blocked 为老化重探——每 BLOCKED_REPROBE_DAYS 天放行一次，成功复活、
+        失败 bump 刷新窗口重新计时；locked 才是真终态不进补抓。空区行不在
+        选取之列。missing 连补 MISSING_MAX_RETRIES 次仍失败会在标记路径转
+        blocked，之后按老化窗口进入这里。
 
         任务形状与主轮一致（type=app，批量 handler 现成消费）：同一区的欠账凑满
         一发再发，请求次数 = 区数 × ⌈行/300⌉，不再逐行一发。limit_rows > 0 时
@@ -1547,9 +1524,17 @@ class DbWriter:
                 # 与选取解耦（不占 LIMIT 槽位），冷却窗内的新鲜空区行等过冷却再清
                 cleared = await session.execute(
                     delete(GameCurrentPrice).where(
-                        GameCurrentPrice.price_status == "missing",
                         GameCurrentPrice.region_code == "",
-                        GameCurrentPrice.updated_at < cutoff,
+                        or_(
+                            and_(
+                                GameCurrentPrice.price_status == "missing",
+                                GameCurrentPrice.updated_at < cutoff,
+                            ),
+                            and_(
+                                GameCurrentPrice.price_status == "blocked",
+                                GameCurrentPrice.updated_at < _naive(get_beijing_time_obj()) - timedelta(days=BLOCKED_REPROBE_DAYS),
+                            ),
+                        ),
                     )
                 )
                 await session.commit()
@@ -1563,9 +1548,17 @@ class DbWriter:
                 query = (
                     select(GameCurrentPrice.appid, GameCurrentPrice.region_code)
                     .where(
-                        GameCurrentPrice.price_status == "missing",
                         GameCurrentPrice.region_code != "",
-                        GameCurrentPrice.updated_at < cutoff,
+                        or_(
+                            and_(
+                                GameCurrentPrice.price_status == "missing",
+                                GameCurrentPrice.updated_at < cutoff,
+                            ),
+                            and_(
+                                GameCurrentPrice.price_status == "blocked",
+                                GameCurrentPrice.updated_at < _naive(get_beijing_time_obj()) - timedelta(days=BLOCKED_REPROBE_DAYS),
+                            ),
+                        ),
                     )
                     .order_by(GameCurrentPrice.updated_at)
                 )

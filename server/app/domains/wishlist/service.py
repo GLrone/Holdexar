@@ -26,7 +26,7 @@ from sqlalchemy import case, delete, func, select
 from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.database import write_gate
 from app.core.logging import log_event
-from app.crawler.utils import get_beijing_time_obj
+from app.crawler.utils import clean_appids, get_beijing_time_obj
 from app.domains.games import tags as game_tags
 from .models import TrackedAccount, WishlistItem
 
@@ -1185,16 +1185,7 @@ async def ensure_board_pool(appids: list[int], *, source: str = "board") -> dict
 
     返回 {added, exists, skipped}。
     """
-    clean: list[int] = []
-    seen: set[int] = set()
-    for a in appids:
-        try:
-            appid = int(a)
-        except (TypeError, ValueError):
-            continue
-        if appid > 0 and appid not in seen:
-            seen.add(appid)
-            clean.append(appid)
+    clean = clean_appids(appids)
     if not clean:
         return {"added": 0, "exists": 0, "skipped": 0}
 
@@ -1371,14 +1362,7 @@ async def remove_pool_items(appids: list[int], *, reason: str = "pool_removed") 
     """
     results: list[dict] = []
     removed = missing = 0
-    clean: list[int] = []
-    for a in appids:
-        try:
-            appid = int(a)
-        except (TypeError, ValueError):
-            continue
-        if appid > 0 and appid not in clean:
-            clean.append(appid)
+    clean = clean_appids(appids)
     if clean:
         from app.domains.monitoring import service as monitoring_service
 
@@ -1430,14 +1414,7 @@ async def release_free_games(appids: list[int]) -> int:
 
     返回实际脱池的 appid 数（爬前在池内的）。
     """
-    clean: list[int] = []
-    for a in appids or []:
-        try:
-            appid = int(a)
-        except (TypeError, ValueError):
-            continue
-        if appid > 0 and appid not in clean:
-            clean.append(appid)
+    clean = clean_appids(appids)
     if not clean:
         return 0
 

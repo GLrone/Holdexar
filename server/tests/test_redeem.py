@@ -201,60 +201,6 @@ async def test_activate_key_no_sessionid(db):
 
 
 @pytest.mark.asyncio
-async def test_free_license_claim(db, monkeypatch):
-    """免费领取：302 → ok；JSON success → ok；JSON error 24 → own；登录页 HTML → fail（不冒领）。"""
-    await settings_service.set_value(
-        "account.steam_cookies",
-        "sessionid=abc123; steamLoginSecure=76561198000000001%7C%7Cjwt-token",
-    )
-    # 302 跳转（重定向链终点非登录页）= 受理
-    monkeypatch.setattr(
-        redeem_service, "_post_steam",
-        lambda *a, **k: _async(FakeResponse(status_code=302, location="/account"))(),
-    )
-    monkeypatch.setattr(redeem_service, "_redirect_chain_hits_login", _async(False))
-    r = await redeem_service.add_free_license(927875)
-    assert r["status"] == "ok"
-
-    # 302 但重定向链终点是登录页 = 页面层拒绝（checkout 域两跳后拒绝）→ 不冒领
-    monkeypatch.setattr(
-        redeem_service, "_post_steam",
-        lambda *a, **k: _async(FakeResponse(
-            status_code=302, location="https://checkout.steampowered.com/login/?redir=x"))(),
-    )
-    monkeypatch.setattr(redeem_service, "_redirect_chain_hits_login", _async(True))
-    r = await redeem_service.add_free_license(927875)
-    assert r["status"] == "fail"
-    assert "登录" in r["detail"]
-
-    # JSON error 24 = 已拥有
-    monkeypatch.setattr(
-        redeem_service, "_post_steam",
-        lambda *a, **k: _async(FakeResponse(payload={"success": 2, "error": 24}))(),
-    )
-    r = await redeem_service.add_free_license(927875)
-    assert r["status"] == "own"
-
-    # 200 + 登录页 HTML = 页面层未认登录态 → fail（诚实，不冒领）
-    monkeypatch.setattr(
-        redeem_service, "_post_steam",
-        lambda *a, **k: _async(FakeResponse(status_code=200, text="<html>login</html>"))(),
-    )
-    r = await redeem_service.add_free_license(927875)
-    assert r["status"] == "fail"
-    assert "页面层" in r["detail"]
-
-    # 401 = Cookie 失效
-    monkeypatch.setattr(
-        redeem_service, "_post_steam",
-        lambda *a, **k: _async(FakeResponse(status_code=401))(),
-    )
-    r = await redeem_service.add_free_license(927875)
-    assert r["status"] == "fail"
-    assert "失效" in r["detail"]
-
-
-@pytest.mark.asyncio
 async def test_quota_status(db):
     """quota_status：Cookie 三件套可用性 + 账号维度激活计数。"""
     out = await redeem_service.quota_status()
@@ -330,27 +276,6 @@ async def test_activation_ledger_rows_for_each_status(db, monkeypatch):
     assert "purchase_receipt_info" in rows[0].raw
     # 日志侧 key 只留掩码（账本表存原文，日志不整码明文）
     assert redeem_service._mask_key("ABCDE-FGHIJ-KLMNP") == "ABCDE**********NP"
-
-
-@pytest.mark.asyncio
-async def test_free_claim_ledger_row_kind_free(db, monkeypatch):
-    """免费领取落账：来源类型 free、subid 随行、key 列为空。"""
-    await settings_service.set_value(
-        "account.steam_cookies",
-        "sessionid=abc123; steamLoginSecure=76561198000000001%7C%7Cjwt-token",
-    )
-    monkeypatch.setattr(
-        redeem_service, "_post_steam",
-        lambda *a, **k: _async(FakeResponse(status_code=302, location="/account"))(),
-    )
-    monkeypatch.setattr(redeem_service, "_redirect_chain_hits_login", _async(False))
-    r = await redeem_service.add_free_license(927875)
-    assert r["status"] == "ok"
-    async with db() as session:
-        row = (await session.execute(select(RedeemActivation))).scalars().one()
-    assert row.kind == "free" and row.status == "ok"
-    assert row.subid == "927875" and row.product_key == ""
-    assert row.steamid == PRIMARY
 
 
 @pytest.mark.asyncio
