@@ -12,13 +12,16 @@ import (
 	"sync"
 	"testing"
 
+	"holdexar/server-go/internal/secretbox"
 	"holdexar/server-go/internal/store"
 )
 
-// newTestEnv 真实临时库 + 真实写闸 + 已装配路由。
+// newTestEnv 真实临时库 + 真实写闸 + 已装配路由；凭据主密钥托管指向
+// 同一临时数据目录（测试隔离，不触真实数据目录）。
 func newTestEnv(t *testing.T) (*sql.DB, http.Handler) {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "holdexar.db")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "holdexar.db")
 	db, err := store.Open(path)
 	if err != nil {
 		t.Fatalf("打开临时库失败：%v", err)
@@ -31,6 +34,9 @@ func newTestEnv(t *testing.T) (*sql.DB, http.Handler) {
 )`); err != nil {
 		t.Fatalf("建表失败：%v", err)
 	}
+	prev := resolveDataDir
+	resolveDataDir = func() string { return dir }
+	t.Cleanup(func() { resolveDataDir = prev })
 	gate := store.NewWriteGate(db, path)
 	mux := http.NewServeMux()
 	Register(mux, db, gate)
@@ -96,9 +102,9 @@ func TestGetSettingsSeeded(t *testing.T) {
 	}
 }
 
-func TestGetSettingsEncryptedKeyDegrades(t *testing.T) {
+func TestGetSettingsUndecryptableKeyDegrades(t *testing.T) {
 	db, h := newTestEnv(t)
-	seedKV(t, db, "account.steam_api_key", `"enc1:QUJDREVGR0g"`)
+	seedKV(t, db, "account.steam_api_key", `"enc1:QUJDREVGR0g"`) // 伪密文，解密必失败
 	rec := do(t, h, http.MethodGet, "/api/v1/settings", "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("状态码 = %d, want 200", rec.Code)
@@ -107,9 +113,95 @@ func TestGetSettingsEncryptedKeyDegrades(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("响应解析失败：%v", err)
 	}
-	// 凭据在场事实保留；掩码因解密能力未迁移退化为全星。
-	if !resp.Account.HasAPIKey || resp.Account.SteamAPIKey != "****" {
-		t.Fatalf("密文凭据降级形状不符：%+v", resp.Account)
+	// 解密失败按无凭据降级（Python SecretBoxError → default 同径）。
+	if resp.Account.HasAPIKey || resp.Account.SteamAPIKey != "" {
+		t.Fatalf("解密失败降级形状不符：%+v", resp.Account)
+	}
+}
+
+// TestPutSecretKeyRoundTrip 凭据写读全链：PUT 明文 → 库内 enc1: 密文 →
+// GET 掩码回显 → 同数据目录 secretbox 解密还原明文；掩码回显与空串不落库。
+func TestPutSecretKeyRoundTrip(t *testing.T) {
+	db, h := newTestEnv(t)
+	rec := do(t, h, http.MethodPut, "/api/v1/settings", `{"account":{"steam_api_key":" sk-test-abcd1234 "}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, body %s", rec.Code, rec.Body.String())
+	}
+
+	// 库内是 enc1: 前缀密文（JSON 字符串），不是明文。
+	var stored string
+	if err := db.QueryRow(
+		"SELECT value_json FROM app_settings WHERE key = ?", keySteamAPIKey).Scan(&stored); err != nil {
+		t.Fatalf("读回失败：%v", err)
+	}
+	if !strings.HasPrefix(stored, `"enc1:`) {
+		t.Fatalf("库内应为 enc1: 密文，实际 %s", stored)
+	}
+	token := strings.Trim(stored, `"`)
+
+	// GET 掩码回显（**** + 末 4 字符）。
+	var resp settingsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("响应解析失败：%v", err)
+	}
+	if resp.Account.SteamAPIKey != "****1234" || !resp.Account.HasAPIKey {
+		t.Fatalf("掩码回显不符：%+v", resp.Account)
+	}
+
+	// 同数据目录下 secretbox 解密还原明文（purpose 与 Python _secret_purpose 同径）。
+	plain, err := secretbox.DecryptSecretIn(resolveDataDir(), token, secretbox.SecretPurpose(keySteamAPIKey))
+	if err != nil {
+		t.Fatalf("密文解密失败：%v", err)
+	}
+	if plain != "sk-test-abcd1234" {
+		t.Fatalf("还原明文不符：%q", plain)
+	}
+
+	// 掩码回显不落库：库内密文不变。
+	before := stored
+	if rec := do(t, h, http.MethodPut, "/api/v1/settings", `{"account":{"steam_api_key":"****1234"}}`); rec.Code != http.StatusOK {
+		t.Fatalf("掩码回显请求状态码 = %d", rec.Code)
+	}
+	var after string
+	if err := db.QueryRow(
+		"SELECT value_json FROM app_settings WHERE key = ?", keySteamAPIKey).Scan(&after); err != nil {
+		t.Fatalf("读回失败：%v", err)
+	}
+	if after != before {
+		t.Fatalf("掩码回显不应落库：%s -> %s", before, after)
+	}
+
+	// 空串不落库（Python `if key` 短路同径）。
+	if rec := do(t, h, http.MethodPut, "/api/v1/settings", `{"account":{"steam_api_key":"  "}}`); rec.Code != http.StatusOK {
+		t.Fatalf("空串请求状态码 = %d", rec.Code)
+	}
+	if err := db.QueryRow(
+		"SELECT value_json FROM app_settings WHERE key = ?", keySteamAPIKey).Scan(&after); err != nil {
+		t.Fatalf("读回失败：%v", err)
+	}
+	if after != before {
+		t.Fatalf("空串不应落库：%s -> %s", before, after)
+	}
+}
+
+// TestGetSeededRealTokenMask 存量密文行（先于 Go 写入存在）GET 解密掩码。
+func TestGetSeededRealTokenMask(t *testing.T) {
+	db, h := newTestEnv(t)
+	token, err := secretbox.EncryptSecretIn(resolveDataDir(), "seedkey9999", secretbox.SecretPurpose(keySteamAPIKey))
+	if err != nil {
+		t.Fatalf("种子密文生成失败：%v", err)
+	}
+	seedKV(t, db, keySteamAPIKey, fmt.Sprintf("%q", token))
+	rec := do(t, h, http.MethodGet, "/api/v1/settings", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, want 200", rec.Code)
+	}
+	var resp settingsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("响应解析失败：%v", err)
+	}
+	if resp.Account.SteamAPIKey != "****9999" || !resp.Account.HasAPIKey {
+		t.Fatalf("存量密文掩码不符：%+v", resp.Account)
 	}
 }
 
@@ -131,9 +223,9 @@ func TestPutSettingsRoundTrip(t *testing.T) {
 	if acct["steam_id"] != "76561198" {
 		t.Fatalf("steam_id = %v, want 76561198（去空白）", acct["steam_id"])
 	}
-	// 凭据写未迁移：不落库，掩码维持空。
-	if acct["steam_api_key"] != "" || acct["has_api_key"] != false {
-		t.Fatalf("凭据字段应维持未配置：%+v", acct)
+	// 凭据已加密落库：掩码回显 + 在场标记。
+	if acct["steam_api_key"] != "****9988" || acct["has_api_key"] != true {
+		t.Fatalf("凭据掩码回显不符：%+v", acct)
 	}
 	checks := []struct {
 		key  string
