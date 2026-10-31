@@ -769,3 +769,20 @@ class TestFork:
         finally:
             service._store = None
         assert out["ok"] is False and out["reason"] == "no_session"
+
+@pytest.mark.asyncio
+async def test_load_refolds_when_ledger_file_changed_externally(store, tmp_path):
+    """缓存命中必须校验账本 stat 键：外部直改文件（测试工具/手工检修）后读账不得给旧折叠态。"""
+    sid = "s-ext1"
+    await store.load_or_new(sid)
+    await store.append_turn(sid, _turn("问", "答"))
+    path = tmp_path / "sessions" / f"{sid}.jsonl"
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    records.append({"t": "title", "text": "外部改名", "ts": "2026-10-31T00:00:00"})
+    path.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n", encoding="utf-8")
+
+    reloaded = await store.load(sid)
+    assert reloaded is not None and reloaded.title == "外部改名"
+    # 外部删除同样按失配处理：缓存不再复活已删账本
+    path.unlink()
+    assert await store.load(sid) is None
