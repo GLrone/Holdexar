@@ -22,6 +22,12 @@ export function pilotCoverUrl(appid: number): string {
 }
 
 /** token 数展示：≥1000 缩写 K（一位小数），上下文占用与记忆条目共用 */
+/** 引用展示标题：压平空白后截断（完整正文留给悬停面板；创建与回显两侧共用一口径） */
+export function quoteTitleOf(text: string): string {
+  const flat = text.replace(/\s+/g, ' ').trim()
+  return flat.length > 28 ? `${flat.slice(0, 28)}…` : flat
+}
+
 export function fmtTokens(n: number): string {
   return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n)
 }
