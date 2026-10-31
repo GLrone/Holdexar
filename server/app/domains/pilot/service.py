@@ -481,9 +481,15 @@ async def _fallback_deterministic(
             target_type, value = pilot_tools.extract_alert(question)
             if target_type == "price" and value is None:
                 return _empty("guide", None, None)
-            result = await pilot_tools.alert_add(
-                matches[0]["appid"], target_type=target_type, target_value_fen=value
+            # 写动作走公共执行边界：守卫词命中（批量/删除语义）时拒绝，不直调绕闸
+            result = await pilot_tools.execute_tool(
+                "create_price_alert",
+                {"appid": matches[0]["appid"], "target_type": target_type,
+                 "target_value_yuan": (value / 100) if value is not None else None},
+                guarded=pilot_intent.is_guarded(question),
             )
+            if result.get("kind") == "denied":
+                return _empty("guide", None, None)
             return _empty("facts", None, {"kind": "action", **result})
         if matches:
             return _empty("facts", "need_target", {"kind": "games", "items": matches})
@@ -493,7 +499,12 @@ async def _fallback_deterministic(
         matches = await pilot_tools.search_games(question, query=title) if title \
             else await pilot_tools.search_games(question)
         if len(matches) == 1:
-            result = await pilot_tools.monitor_add(matches[0]["appid"])
+            result = await pilot_tools.execute_tool(
+                "add_follow", {"appid": matches[0]["appid"]},
+                guarded=pilot_intent.is_guarded(question),
+            )
+            if result.get("kind") == "denied":
+                return _empty("guide", None, None)
             return _empty("facts", None, {"kind": "action", **result})
         if matches:
             return _empty("facts", "need_target", {"kind": "games", "items": matches})
@@ -1998,6 +2009,9 @@ async def run_tool(name: str, *, label: str, session_id: str | None) -> dict:
     还原同一条链），罗盘飞轮记 mode=quick。"""
     if name not in pilot_tools.QUICK_TOOLS:
         raise ValueError("unknown_tool")
+    # 与流式问答同一会话闸：快捷直达不得与在飞轮并发写会话账本
+    if session_id and (_INFLIGHT_TURNS.get(session_id, 0) > 0 or session_running(session_id)):
+        raise ValueError("busy")
     state = await get_store().load_or_new(session_id) if session_id else None
     result = await pilot_tools.execute_tool(name, {}, guarded=False, sid=session_id)
     step = pilot_tools.tool_step(name, result)
