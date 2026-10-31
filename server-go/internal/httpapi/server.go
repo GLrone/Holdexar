@@ -18,20 +18,25 @@ type Server struct {
 	// UpdateWriteProtected / UpdatePageReady 更新验收期间的运行保护位。
 	UpdateWriteProtected bool
 	UpdatePageReady      bool
+	// Register 业务模块路由装配方；nil 时仅骨架路由（health / 静态 / 统一 404）。
+	Register func(mux *http.ServeMux)
 }
 
 // Handler 装配全部路由。
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	if s.Register != nil {
+		s.Register(mux)
+	}
 	mux.HandleFunc("/api/v1/health", s.handleHealth)
 	mux.HandleFunc("/api/", s.handleAPINotFound)
 	mux.HandleFunc("/", s.handleStatic)
 	return mux
 }
 
-// handleAPINotFound 未匹配的 API 路径统一回 404。
+// handleAPINotFound 未匹配的 API 路径统一回 404（文案与线上一致）。
 func (s *Server) handleAPINotFound(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusNotFound, detailNull())
+	writeJSON(w, http.StatusNotFound, map[string]any{"detail": "Not Found"})
 }
 
 // detailNull 错误响应体：{"detail": null}。
