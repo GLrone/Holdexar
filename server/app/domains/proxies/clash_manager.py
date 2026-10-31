@@ -384,13 +384,6 @@ def _looks_like_opaque_token(text: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9_\-=]+", text))
 
 
-# 机场面板普遍校验 UA：httpx 默认 UA 会被 403，伪装 Clash 系客户端（内核拉取
-# provider 时的同款标识）。**必须含 "clash" 关键字**——面板按 UA 分流订阅格式，
-# 含 clash/meta 才回 Clash YAML；只写 mihomo 会被当成通用客户端回落 base64
-# 节点表（本项目校验只认 YAML，「更新失败」即此因）。版本随 kernel_release。
-_SUB_HEADERS = {"User-Agent": f"clash.meta/{MIHOMO_VERSION.lstrip('v')}"}
-
-
 # External local proxy defaults. Holdexar's own listener comes from runtime status.
 LOCAL_MIXED_PORTS: tuple[int, ...] = (7897,)
 # 借道口探活后的最小可用性验证：口在听不代表出口能出网
@@ -1098,13 +1091,6 @@ def parse_probe_lanes(config_text: str) -> list[tuple[str, int]]:
             lanes.append((proxy, port))
     lanes.sort(key=lambda lane: lane[0])
     return lanes
-
-
-# 非真实节点（控制器逻辑节点/内置）
-_NON_NODE_TYPES = {
-    "selector", "urltest", "fallback", "loadbalance", "relay",
-    "direct", "reject", "rejectdrop", "compatible", "pass", "dns",
-}
 
 
 def parse_node_names(config_text: str) -> list[str]:
