@@ -326,3 +326,53 @@ def test_anthropic_convert_system_extracted_and_alternating():
     system, out = pilot_llm._anthropic_convert(msgs)
     assert system == "S"
     assert [m["role"] for m in out] == ["user", "assistant"]
+
+
+# ── anthropic 协议真实请求循环：连续同角色在发出的报文里不得再现 ──
+# （回归：合并逻辑丢失时真实端点 400 交替角色违约——此处捕获实际发出的
+#  请求体，在服务端位置断言交替角色契约，并回放标准 SSE 验证解析闭环。）
+
+
+def _anthropic_sse() -> bytes:
+    events = [
+        {"type": "message_start", "message": {"usage": {"input_tokens": 10}}},
+        {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "回答"}},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+         "usage": {"output_tokens": 3}},
+        {"type": "message_stop"},
+    ]
+    return "\n".join(f"data: {json.dumps(e)}" for e in events).encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_anthropic_chat_stream_request_roles_alternate():
+    captured: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, request=request, content=_anthropic_sse())
+
+    msgs = [
+        {"role": "system", "content": "系统提示"},
+        {"role": "user", "content": "第一句"},
+        {"role": "user", "content": "第二句"},
+        {"role": "assistant", "content": "答",
+         "tool_calls": [{"id": "t1", "function": {"name": "f", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "t1", "content": "结果"},
+        {"role": "user", "content": "追问"},
+    ]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        chunks = [
+            (k, d) async for k, d in pilot_llm.chat_stream(
+                protocol="anthropic", base_url="https://provider.test",
+                api_key="sk-test", model="test-model", messages=msgs, client=client,
+            )
+        ]
+    assert [k for k, _ in chunks][:2] == ["cache", "answer"], chunks  # 流尾部还有 usage/context 汇总
+    body = captured[0]
+    roles = [m["role"] for m in body["messages"]]
+    assert roles == ["user", "assistant", "user"], roles  # 严格交替，无连续同角色
+    # 工具结果收进 user 轮 tool_result 块，末接追问文本
+    last = body["messages"][-1]["content"]
+    assert [b["type"] for b in last] == ["tool_result", "text"]
+    assert any(m["role"] == "system" for m in body["messages"]) is False
