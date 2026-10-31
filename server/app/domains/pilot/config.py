@@ -292,12 +292,14 @@ async def usage_month() -> dict:
 async def add_usage(inp: int, out: int) -> None:
     if inp <= 0 and out <= 0:
         return
-    cur = await usage_month()
-    await settings_service.set_value(_usage_key(), {
-        "inp": cur["inp"] + max(0, inp),
-        "out": cur["out"] + max(0, out),
-        "calls": cur["calls"] + 1,
-    })
+    # 用量读改写过闸：多会话并发回合对同一台账键累加，闸外读改写会丢增量
+    async with write_gate(WritePriority.INTERACTIVE, label="pilot_usage"):
+        cur = await usage_month()
+        await settings_service.set_value(_usage_key(), {
+            "inp": cur["inp"] + max(0, inp),
+            "out": cur["out"] + max(0, out),
+            "calls": cur["calls"] + 1,
+        })
 
 
 def over_cap(usage: dict, cap: int) -> bool:
