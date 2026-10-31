@@ -1814,7 +1814,7 @@ _MIGRATIONS: list[tuple[int, str, object]] = [    (2, "bundle_region_prices 零�
 _PRE_MIGRATION_SUFFIX = ".pre-migration.bak"
 # 快照保留窗：回滚点只为「刚迁移完就出问题」的窗口服务；结构已达最新且
 # 超窗后，快照只剩与生产库同量级的磁盘占用，到点由启动链回收
-_PRE_MIGRATION_RETENTION = timedelta(days=7)
+_PRE_MIGRATION_RETENTION = timedelta(days=1)
 
 
 def _db_file_path() -> Path | None:

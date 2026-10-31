@@ -34,7 +34,6 @@ logger = logging.getLogger(__name__)
 
 # 短命内核使用独立端口段，避免与其他 Runtime 的监听端口冲突。
 PROBE_PORT_BASE = 23200
-PROBE_PORT_SPAN = 200
 # 每批探测的节点数上限：一个进程内每个节点占一个 listener，批次越大启动越慢
 BATCH_SIZE = 24
 # 启动后等控制器就绪的上限
