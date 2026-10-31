@@ -151,6 +151,11 @@ func resolvePath(path string) string {
 	if parent == "" {
 		return abs
 	}
+	// 裸盘符（如 "E:"）会被 CreateFileW 解析成该盘的进程当前目录而非盘根，
+	// 必须先补全成 "E:\" 再递归。
+	if vol := filepath.VolumeName(parent); vol != "" && vol == parent {
+		parent = vol + `\`
+	}
 	return filepath.Join(resolvePath(parent), name)
 }
 
