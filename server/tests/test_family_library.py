@@ -912,3 +912,84 @@ async def test_local_member_survives_later_binding(db):
     assert await family_service.remove_family_member(MANUAL) == {"ok": True, "removed": True}
     st2 = await family_service.get_status()
     assert [m["steamid"] for m in st2["groups"][0]["members"]] == []
+
+
+# ── 删号即清：账号删除时名下家庭组与孤儿快照随删 ──────────
+
+
+async def _seed_family_purge_data(db):
+    """直种三账号家庭数据（组行主键=steamid，一账号一行）：
+    A 持独有组 222，B、C 共享组 111（B 行含手动条目），另种一条无组行
+    引用的陈旧孤儿快照 333。"""
+    from app.domains.account.models import SteamAccount
+    from app.domains.family.models import FamilyGroup, FamilyLibrarySnapshot
+
+    a, b, c = "76561198000000091", "76561198000000092", "76561198000000093"
+    async with db() as session:
+        for sid in (a, b, c):
+            session.add(SteamAccount(
+                steam_id=sid, is_active=True, bound_at=datetime.utcnow(),
+            ))
+        session.add(FamilyGroup(
+            steamid=b, family_groupid="111", member_count=2, fetch_ok=True,
+            members_json=[
+                {"steamid": b, "role": "1", "origin": "steam"},
+                {"steamid": "76561198999999999", "role": "", "origin": "manual"},
+            ],
+        ))
+        session.add(FamilyGroup(
+            steamid=c, family_groupid="111", members_json=[], member_count=2, fetch_ok=True,
+        ))
+        session.add(FamilyGroup(
+            steamid=a, family_groupid="222", members_json=[], member_count=1, fetch_ok=True,
+        ))
+        session.add(FamilyLibrarySnapshot(appid=620, family_groupid="111", time_acquired=1690000000))
+        session.add(FamilyLibrarySnapshot(appid=570, family_groupid="222", time_acquired=1695000000))
+        session.add(FamilyLibrarySnapshot(appid=440, family_groupid="333", time_acquired=1694000000))
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_remove_account_purges_groups_and_orphan_snapshots(db):
+    """删号即清：该账号组行随删（其上手动条目同删、由同步补回）；仍被他人
+    组行引用的共享组快照保留，独有组与陈旧孤儿快照清除。"""
+    from sqlalchemy import select
+
+    from app.domains.family.models import FamilyGroup, FamilyLibrarySnapshot
+
+    a, b, c = "76561198000000091", "76561198000000092", "76561198000000093"
+    await _seed_family_purge_data(db)
+
+    r = await account_service.remove_account(a)
+    assert r["ok"] is True
+    assert r["familyGroupsRemoved"] == 1 and r["familySnapshotsRemoved"] == 2
+
+    async with db() as session:
+        group_owners = {sid for (sid,) in (await session.execute(select(FamilyGroup.steamid))).all()}
+        survivor = (await session.execute(
+            select(FamilyGroup).where(FamilyGroup.family_groupid == "111")
+        )).scalars().all()
+        snap_groupids = {
+            gid for (gid,) in
+            (await session.execute(select(FamilyLibrarySnapshot.family_groupid))).all()
+        }
+    assert group_owners == {b, c}
+    assert {g.steamid for g in survivor} == {b, c}, "共享组行全部保留"
+    assert snap_groupids == {"111"}, "共享组快照保留，独有组与陈旧孤儿快照清除"
+
+
+@pytest.mark.asyncio
+async def test_clear_cookies_purges_all_family_groups_and_snapshots(db):
+    """解绑全部：家庭组与库快照全空。"""
+    from sqlalchemy import select
+
+    from app.domains.family.models import FamilyGroup, FamilyLibrarySnapshot
+
+    await _seed_family_purge_data(db)
+
+    await account_service.clear_cookies()
+
+    async with db() as session:
+        groups = (await session.execute(select(FamilyGroup))).scalars().all()
+        snaps = (await session.execute(select(FamilyLibrarySnapshot))).scalars().all()
+    assert groups == [] and snaps == []
