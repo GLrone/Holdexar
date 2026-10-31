@@ -102,6 +102,9 @@ func main() {
 				logLine("%v", err)
 				os.Exit(1)
 			}
+			// mcp.enabled 运行时重载与运行态投影：函数字段注入，settings 不反向依赖 agent
+			settings.OnMCPEnabledWrite = agent.Reapply
+			settings.MCPStatus = agent.MCPStatus
 		},
 	}
 	httpServer := &http.Server{Addr: *addr, Handler: gate.Middleware(server.Handler())}

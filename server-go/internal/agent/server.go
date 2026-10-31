@@ -35,10 +35,18 @@ type Surface struct {
 	db       *sql.DB
 	handler  http.Handler
 
+	dataDir      string
+	logf         func(format string, args ...any)
+	forcedByFlag bool // -mcp 启动旗标：与 env 同级的强制通道，设置关闭不生效
+
 	enabled atomic.Bool
 	token   atomic.Value // string
 	lastErr atomic.Value // string
 }
+
+// Default 最近一次 Register 装配的运行态；settings 写 mcp.enabled 后经包级
+// Reapply/Status 转发到这里（函数字段注入见 settings 包）。
+var Default *Surface
 
 // Register 装配 MCP 面：注册表构建（重名即错，启动即失败）→ 协议服务器 →
 // 挂载路径与前缀闸 → 启用判定（env HOLDEXAR_MCP 或设置 mcp.enabled）→
@@ -48,7 +56,11 @@ func Register(mux *http.ServeMux, db *sql.DB, gate *access.Gate, opts Options) e
 	if err != nil {
 		return err
 	}
-	s := &Surface{registry: registry, fetcher: newMuxFetcher(mux), db: db}
+	s := &Surface{
+		registry: registry, fetcher: newMuxFetcher(mux), db: db,
+		dataDir: opts.DataDir, logf: opts.Log, forcedByFlag: opts.EnabledByFlag,
+	}
+	Default = s
 
 	impl := &mcp.Implementation{Name: "holdexar", Version: config.Version()}
 	server := mcp.NewServer(impl, nil)
@@ -87,6 +99,48 @@ func (s *Surface) log(opts Options, format string, args ...any) {
 	if opts.Log != nil {
 		opts.Log(format, args...)
 	}
+}
+
+// Reapply mcp.enabled 写入后的运行时重应用（Python reapply 同语义：重算启用态，
+// 开→令牌文件与在役态，关→清令牌文件、前缀闸与挂载壳回 404）。env/启动旗标
+// 强制开启时设置关闭不生效（Python enabled = env or settings 同径）。无在役
+// 装配时为空操作。
+func Reapply() {
+	if Default != nil {
+		Default.reapply()
+	}
+}
+
+func (s *Surface) reapply() {
+	if !envEnabled() && !s.forcedByFlag && !settingsEnabled(s.db) {
+		s.enabled.Store(false)
+		s.token.Store("")
+		_ = os.Remove(filepath.Join(s.dataDir, TokenFilename))
+		return
+	}
+	token, err := ensureTokenFile(s.dataDir)
+	if err != nil {
+		// 启用失败不拖垮主程序：保持关闭态，原因经 lastError 留痕
+		s.enabled.Store(false)
+		s.lastErr.Store("MCP 启用失败：" + err.Error())
+		if s.logf != nil {
+			s.logf("MCP 启用失败，保持关闭态：%v", err)
+		}
+		return
+	}
+	s.token.Store(token)
+	s.enabled.Store(true)
+	s.lastErr.Store("")
+}
+
+// MCPStatus 运行态快照（settings GET 投影消费；Python mcp.status 同形）。
+// running=启用态在役；forcedByEnv 含 env 与 -mcp 启动旗标两条强制通道。
+func MCPStatus() (running bool, errText string, forcedByEnv bool) {
+	if Default == nil {
+		return false, "", envEnabled()
+	}
+	errText, _ = Default.lastErr.Load().(string)
+	return Default.enabled.Load(), errText, envEnabled() || Default.forcedByFlag
 }
 
 // envEnabled 环境开关：HOLDEXAR_MCP ∈ {1,true,yes,on}（大小写不敏感）。
