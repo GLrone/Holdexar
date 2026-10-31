@@ -17,8 +17,10 @@ import (
 	"holdexar/server-go/internal/config"
 	"holdexar/server-go/internal/games"
 	"holdexar/server-go/internal/httpapi"
+	"holdexar/server-go/internal/notifications"
 	"holdexar/server-go/internal/rates"
 	"holdexar/server-go/internal/regions"
+	"holdexar/server-go/internal/settings"
 	"holdexar/server-go/internal/store"
 	"holdexar/server-go/internal/systemx"
 )
@@ -61,6 +63,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer db.Close()
+	writeGate := store.NewWriteGate(db, dbPath)
 
 	gate := access.New()
 	server := &httpapi.Server{
@@ -74,6 +77,8 @@ func main() {
 			games.Register(mux, db)
 			systemx.Register(mux, db)
 			systemx.RegisterSession(mux, gate, *devSession)
+			settings.Register(mux, db, writeGate)
+			notifications.Register(mux, db)
 		},
 	}
 	httpServer := &http.Server{Addr: *addr, Handler: gate.Middleware(server.Handler())}
