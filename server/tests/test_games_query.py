@@ -180,7 +180,7 @@ async def test_region_ua_highdiff():
     for item in r["items"]:
         m = _matrix(item)
         cn, ua = m["CN"], m["UA"]
-        assert cn[2] == cn[3] or cn[3] is None  # originalPrice == price → 未打折
+        assert cn[3] == 0  # 折扣位 0 = 未打折
         assert cn[1] - ua[1] >= 5000
         lowest = min((d[1] for k, d in m.items() if k != "CN" and d[1]), default=ua[1])
         assert ua[1] <= lowest + TOLERANCE
