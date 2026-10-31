@@ -100,6 +100,18 @@ var testDDL = []string{
 appid, region_code, snapshot_at, COALESCE(sub_id, -1),
 COALESCE(price, 0), COALESCE(is_gold, 0))`,
 	`CREATE INDEX ix_gph_snapshot_at ON game_price_history(snapshot_at)`,
+	`CREATE TABLE app_settings (
+	key VARCHAR(64) NOT NULL,
+	value_json JSON,
+	updated_at DATETIME,
+	PRIMARY KEY (key)
+)`,
+	`CREATE TABLE fx_rates (
+	currency_code VARCHAR(10) NOT NULL,
+	rate_to_cny REAL NOT NULL,
+	fetched_at DATETIME,
+	PRIMARY KEY (currency_code)
+)`,
 }
 
 func newTestWriter(t *testing.T) (*Writer, *sql.DB) {
