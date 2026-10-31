@@ -17,7 +17,6 @@ const pool = {
   'pool.account.labelPlaceholder': '备注名（可选）',
   'pool.account.bind': '绑定',
   'pool.account.bindSuccess': '已绑定 {code}',
-  'pool.account.unbindTitle': '确认',
   'pool.account.unbindConfirm': '解除绑定 {name}？其监控条目将一并删除。',
   'pool.account.unbindSuccess': '已解除绑定',
   'pool.account.sync': '同步',
