@@ -116,6 +116,9 @@ class SessionStore:
     def __init__(self, base: Path):
         self.base = base
         self._cache: dict[str, tuple[float, SessionState]] = {}
+        # 缓存态对应的账本 stat 键（mtime_ns+size；文件未建为 None）——命中须校验，
+        # 账本被本进程之外改写/新增/删除时弃缓存重折叠（与列表投影同一口径）
+        self._cache_stat: dict[str, tuple[int, int] | None] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         # 列表投影缓存：sid → (mtime_ns+size 键, 摘要)。命中零折叠——
         # 列表接口高频刷新，逐文件全量折叠是 O(全部历史) 的重复劳动
@@ -125,26 +128,34 @@ class SessionStore:
     # ── 读 ────────────────────────────────────────────────────────────
 
     async def load(self, sid: str) -> SessionState | None:
-        """载入会话（缓存优先）；无文件返回 None，不创建。
+        """载入会话（缓存优先，账本 stat 键失配即重折叠）；无文件返回 None，不创建。
 
         冷读的文件 IO 与折叠入线程执行：大账本的首开不在事件循环上阻塞
         并发的流式回合。"""
         if not valid_sid(sid):
             return None
-        hit = self._cache.get(sid)
-        if hit is not None:
-            self._cache[sid] = (time.monotonic(), hit[1])
-            return hit[1]
         async with self._lock(sid):
             hit = self._cache.get(sid)
-            if hit is not None:
+            if hit is not None and not self._stale(sid):
+                self._cache[sid] = (time.monotonic(), hit[1])
                 return hit[1]
             path = self._path(sid)
             if not path.is_file():
+                self._cache.pop(sid, None)
+                self._cache_stat.pop(sid, None)
                 return None
             state = await asyncio.to_thread(self._load_fresh, sid, path)
             self._cache_put(state)
             return state
+
+    def _stale(self, sid: str) -> bool:
+        """缓存态与账本文件的 stat 键是否失配（外部改写/新增/删除都算失配）。"""
+        try:
+            st = self._path(sid).stat()
+            key: tuple[int, int] | None = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            key = None
+        return key != self._cache_stat.get(sid)
 
     def _load_fresh(self, sid: str, path: Path) -> SessionState:
         state = self._fold(sid, self._read_lines(path))
@@ -232,6 +243,7 @@ class SessionStore:
                       detail={"会话": sid, "原因": repr(e)})
             return "delete_failed"
         self._cache.pop(sid, None)
+        self._cache_stat.pop(sid, None)
         self._list_cache.pop(sid, None)
         try:
             attachments.purge(sid, sessions_base=self.base)
@@ -536,10 +548,12 @@ class SessionStore:
 
     def _cache_put(self, state: SessionState) -> None:
         self._cache[state.sid] = (time.monotonic(), state)
+        self._cache_stat[state.sid] = _stat_key(self._path(state.sid))
         if len(self._cache) > _STATE_CACHE_MAX:
             oldest = min(self._cache, key=lambda k: self._cache[k][0])
             self._locks.pop(oldest, None)
             self._cache.pop(oldest, None)
+            self._cache_stat.pop(oldest, None)
 
     @staticmethod
     def _mtime_iso(path: Path) -> str | None:
@@ -551,6 +565,14 @@ class SessionStore:
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _stat_key(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
 
 
 def _iso_ts(ts: float) -> str:
