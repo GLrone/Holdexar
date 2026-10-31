@@ -9,6 +9,7 @@ import {
   type TrackedAccount,
 } from '@/api/client'
 import { bundlesApi } from '@/api/client'
+import { friendCodeOrRaw } from '@/utils/steamId'
 import { useCrawlStatusStore } from '@/stores/crawlStatus'
 import { useSettingsStore } from '@/stores/settings'
 import { flagUrl } from '@/api/regions'
@@ -465,21 +466,12 @@ const acctRows = ref<TrackedAccount[]>([])
 const acctLoading = ref(false)
 const acctToggling = ref('')
 
-/** 好友码 = SteamID64 - 76561197960265728（BigInt；旧后端无字段时前端换算兜底） */
-function toFriendCode(steamid: string): string {
-  try {
-    return String(BigInt(steamid) - 76561197960265728n)
-  } catch {
-    return steamid
-  }
-}
-
 function acctName(a: TrackedAccount): string {
-  return a.personaName || a.label || a.friendCode || toFriendCode(a.steamid)
+  return a.personaName || a.label || a.friendCode || friendCodeOrRaw(a.steamid)
 }
 
 function acctCode(a: TrackedAccount): string {
-  return a.friendCode || toFriendCode(a.steamid)
+  return a.friendCode || friendCodeOrRaw(a.steamid)
 }
 
 async function openAcctSet() {

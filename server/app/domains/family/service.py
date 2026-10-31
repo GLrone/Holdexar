@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 from urllib.parse import unquote
 
 import httpx
+from app.core.net import is_ssl_error
 from sqlalchemy import select
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -58,13 +59,6 @@ async def _strategy_proxy() -> str | None:
     return await strategy_proxy_or_direct()
 
 
-def _is_ssl_error(exc: Exception) -> bool:
-    clues = ("CERTIFICATE_VERIFY_FAILED", "self-signed", "certificate verify failed",
-             "ssl", "SSL", "unable to get local issuer")
-    text = f"{type(exc).__name__}: {exc}"
-    return any(c in text for c in clues)
-
-
 async def _steam_get(url: str, params: dict, *, method: str = "GET") -> httpx.Response:
     """Steam API 请求（access_token 通道）：代理优先 + SSL 证书降级重试。
 
@@ -77,7 +71,7 @@ async def _steam_get(url: str, params: dict, *, method: str = "GET") -> httpx.Re
         async with httpx.AsyncClient(timeout=20, proxy=proxy, verify=_ssl_context(True)) as client:
             resp = await client.request(method, url, params=params)
     except httpx.HTTPError as e:
-        if not _is_ssl_error(e):
+        if not is_ssl_error(e):
             raise
         log_event(logger, "Steam 接口证书校验失败（经代理场景），降级跳过校验重试", tag="降级")
         async with httpx.AsyncClient(timeout=20, proxy=proxy, verify=_ssl_context(False)) as client:

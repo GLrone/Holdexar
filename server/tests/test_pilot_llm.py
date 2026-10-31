@@ -294,3 +294,35 @@ def test_protocol_requests_preserve_tool_calls_and_results(protocol):
         assert body["messages"][-1]["content"] == "res"
         expected = {"name": "f", "arguments": {"a": 1}} if protocol == "ollama" else {"name": "f", "arguments": '{"a":1}'}
         assert body["messages"][-2]["tool_calls"][0]["function"] == expected
+
+
+# ── _anthropic_convert：连续同角色合并（协议要求 user/assistant 交替）──
+
+
+def test_anthropic_convert_merges_consecutive_same_role():
+    msgs = [
+        {"role": "user", "content": "第一句"},
+        {"role": "user", "content": "第二句"},
+        {"role": "assistant", "content": "答",
+         "tool_calls": [{"id": "t1", "function": {"name": "f", "arguments": "{\"a\":1}"}}]},
+        {"role": "tool", "tool_call_id": "t1", "content": "结果1"},
+        {"role": "tool", "tool_call_id": "t1", "content": "结果2"},
+        {"role": "user", "content": "追问"},
+    ]
+    system, out = pilot_llm._anthropic_convert(msgs)
+    assert system is None
+    assert [m["role"] for m in out] == ["user", "assistant", "user"]
+    assert [b["type"] for b in out[0]["content"]] == ["text", "text"]
+    assert [b["type"] for b in out[2]["content"]] == ["tool_result", "tool_result", "text"]
+    assert out[2]["content"][2] == {"type": "text", "text": "追问"}
+
+
+def test_anthropic_convert_system_extracted_and_alternating():
+    msgs = [
+        {"role": "system", "content": "S"},
+        {"role": "user", "content": "U"},
+        {"role": "assistant", "content": "A"},
+    ]
+    system, out = pilot_llm._anthropic_convert(msgs)
+    assert system == "S"
+    assert [m["role"] for m in out] == ["user", "assistant"]

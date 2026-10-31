@@ -80,13 +80,6 @@ DOMAIN_TERMINAL_TO_RUN: dict[str, str] = {
 }
 
 
-def map_domain_status(status: str | None) -> str | None:
-    """域终态 → run 终态；未观测到业务结论（None/未知/非终态）返回 None。"""
-    if status is None:
-        return None
-    return DOMAIN_TERMINAL_TO_RUN.get(str(status))
-
-
 def is_terminal(status: str) -> bool:
     return status in TERMINAL_STATES
 

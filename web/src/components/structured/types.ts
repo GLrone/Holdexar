@@ -69,8 +69,6 @@ export interface ComponentMeta {
   componentId: string
   nameKey: MessageKey
   descriptionKey: MessageKey
-  /** 供 Agent 意图识别与组件选择理解的英文/无中文能力描述 */
-  agentDescription: string
   /** 支持的展示密度 */
   supportedDensities: StructuredDensity[]
   /** 支持的宿主环境 */

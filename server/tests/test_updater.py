@@ -103,7 +103,11 @@ async def test_new_staging_clears_handoff_marks(tmp_path: Path, monkeypatch, sig
     staging = tmp_path / "staging"
     staging.mkdir(parents=True)
     (staging / updater.HANDOFF_UNSUPPORTED_MARK).write_text("stale", encoding="utf-8")
-    (staging.parent / updater.SWAP_FAILED_FLAG).write_text("stale", encoding="utf-8")
+    # 换装失败标记的真实写入侧是数据目录（桌面壳落点），不是安装根
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / updater.SWAP_FAILED_FLAG).write_text("stale", encoding="utf-8")
+    monkeypatch.setattr("app.core.paths.resolve_data_dir", lambda: data_dir)
 
     monkeypatch.setattr(updater.httpx, "AsyncClient", _mock_client(handler))
     monkeypatch.setattr(updater, "staging_dir", lambda: staging)
@@ -120,7 +124,7 @@ async def test_new_staging_clears_handoff_marks(tmp_path: Path, monkeypatch, sig
     )
 
     assert not (staging / updater.HANDOFF_UNSUPPORTED_MARK).exists()
-    assert not (staging.parent / updater.SWAP_FAILED_FLAG).exists()
+    assert not (data_dir / updater.SWAP_FAILED_FLAG).exists()
     assert updater.pending_status()["pending"] is True
 
 

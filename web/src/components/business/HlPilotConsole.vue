@@ -400,6 +400,8 @@ function fmtPct(v: number | null | undefined): string {
 const switchingModel = ref(false)
 // 会话管理：常驻标签栏 + 跨会话引用（清单是后端账本投影，轮后刷新；null = 投影未到，不猜）
 const sessions = ref<PilotSessionListItem[] | null>(null)
+// 历史清单读取失败标记：失败保留旧清单（可能陈旧但不静默清空），面板给显式提示
+const sessionsLoadFailed = ref(false)
 /** 本会话分叉自哪个会话（账本事实；非派生会话为 null） */
 const forkedFrom = ref<string | null>(null)
 const renamingSid = ref('')
@@ -673,8 +675,11 @@ async function restoreSession(sid: string) {
           }
         : null
     void scrollBottom()
-  } catch {
-    /* 会话不存在（过期清理）或读取失败：按空白新会话继续 */
+  } catch (e) {
+    // 会话不存在（过期清理）＝预期归宿，按空白新会话继续；
+    // 其他读取失败不能冒充空会话——显式提示，账本原样保留
+    if (e instanceof ApiError && e.status === 404) return
+    message.error(t('pilot.history.loadFailed'))
   }
 }
 
@@ -704,8 +709,10 @@ async function loadSessions() {
   try {
     const data = await pilotApi.listSessions(50, sessionQuery.value.trim())
     sessions.value = data.items
+    sessionsLoadFailed.value = false
   } catch {
-    sessions.value = []
+    // 读取失败保留既有清单（可能陈旧但不静默清空），面板给显式提示
+    sessionsLoadFailed.value = true
   }
 }
 
@@ -2494,7 +2501,8 @@ function triggerFollowUp(prompt: string) {
         </button>
         <Transition name="hl-pop">
           <div v-if="historyOpen" class="pilot-history__menu">
-            <div v-if="!(sessions ?? []).length" class="pilot-history__empty">{{ t('pilot.history.empty') }}</div>
+            <div v-if="sessionsLoadFailed" class="pilot-history__empty" role="status">{{ t('pilot.history.loadFailed') }}</div>
+            <div v-else-if="!(sessions ?? []).length" class="pilot-history__empty">{{ t('pilot.history.empty') }}</div>
             <div v-for="it in sessions ?? []" :key="it.sid" class="pilot-history__row">
               <button type="button" class="pilot-history__item" @click="openFromHistory(it.sid)">
                 <span class="pilot-history__name">
@@ -2842,7 +2850,6 @@ function triggerFollowUp(prompt: string) {
           <div v-else-if="turn.kind === 'proposal'" class="pilot-proposal">
             <HlPilotCards
               :cards="turn.cards ?? []"
-              :busy-pid="busyPid"
               actions
               @proposal="onProposal"
               @quote="quoteToComposer"
@@ -2868,7 +2875,6 @@ function triggerFollowUp(prompt: string) {
             <HlPilotCards
               v-if="turn.cards?.length"
               :cards="turn.cards"
-              :busy-pid="busyPid"
               actions
               @proposal="onProposal"
               @quote="quoteToComposer"
@@ -2986,7 +2992,6 @@ function triggerFollowUp(prompt: string) {
             :phases="livePhases"
             :waiting-text="loadingText"
             :live-cards="liveChainCards"
-            :busy-pid="busyPid"
             @proposal="onProposal"
             @quote="quoteToComposer"
             @copy="onCopyText"

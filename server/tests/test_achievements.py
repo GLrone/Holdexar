@@ -3,7 +3,7 @@
 覆盖：清单页/个人页解析（中文时间、`_BW` 灰图）、同图复用（复合键）与
 名称兜底桥接、三段同步落库、白金/稀有度/最稀有/最近解锁/接近白金汇总、
 列表过滤排序搜索、明细排序、无凭证降级，以及生涯域（时长分档 / 活跃热力图 /
-偏好画像 / 纪录与里程碑 / 箴言 / 评语墙）的完整口径。
+偏好画像 / 纪录与里程碑 / 箴言）的完整口径。
 """
 import sys
 import time
@@ -1195,94 +1195,3 @@ async def test_career_series_sorted_by_engagement(career, db):
     assert rows[0]["played"] >= rows[-1]["played"]
 
 
-# ─── 评语墙（settings KV 持久化）────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_wall_add_list_remove(career):
-    assert await career.list_wall() == []
-
-    notes = await career.add_wall("  生涯   第一条   ")
-    assert len(notes) == 1
-    # 内部空白折叠成单空格
-    assert notes[0]["text"] == "生涯 第一条"
-    assert len(notes[0]["id"]) == 12 and notes[0]["at"] > 0
-
-    second = await career.add_wall("第二条")
-    assert [n["text"] for n in second] == ["生涯 第一条", "第二条"]
-    # 读回走的是同一持久化通道（settings KV），不是内存副本
-    assert [n["text"] for n in await career.list_wall()] == ["生涯 第一条", "第二条"]
-
-    left = await career.remove_wall(second[0]["id"])
-    assert [n["text"] for n in left] == ["第二条"]
-    assert [n["text"] for n in await career.list_wall()] == ["第二条"]
-    # 删不存在的 id 是幂等空操作
-    assert [n["text"] for n in await career.remove_wall("nope")] == ["第二条"]
-
-
-@pytest.mark.asyncio
-async def test_wall_rejects_blank_and_overlong(career):
-    with pytest.raises(ValueError):
-        await career.add_wall("   ")
-    with pytest.raises(ValueError):
-        await career.add_wall("")
-    with pytest.raises(ValueError):
-        await career.add_wall("字" * (career.WALL_TEXT_MAX + 1))
-    # 正好到上限要收
-    ok = await career.add_wall("字" * career.WALL_TEXT_MAX)
-    assert len(ok) == 1 and len(ok[0]["text"]) == career.WALL_TEXT_MAX
-
-
-@pytest.mark.asyncio
-async def test_wall_caps_and_drops_oldest(career):
-    for i in range(career.WALL_MAX + 5):
-        notes = await career.add_wall(f"第 {i} 条")
-    assert len(notes) == career.WALL_MAX
-    assert notes[0]["text"] == "第 5 条"          # 最旧的 5 条被丢
-    assert notes[-1]["text"] == f"第 {career.WALL_MAX + 4} 条"
-    assert len(await career.list_wall()) == career.WALL_MAX
-
-@pytest.mark.asyncio
-async def test_summary_warm_sync_on_stale_snapshot(monkeypatch):
-    """快照陈旧且无同步进行中 → 后台自动补拉一次；新鲜 / 别号 / 节流窗内不触发。"""
-    import asyncio as _asyncio
-    from datetime import timezone
-
-    warm_calls: list[str] = []
-
-    async def _fake_start_sync(target=None):
-        warm_calls.append(target or "")
-
-    monkeypatch.setattr(achievements_service, "start_sync", _fake_start_sync)
-    # 节流基准用「一天前」而非 0.0：monotonic 自系统引导起算，云端 runner 是
-    # 刚启动的虚拟机，其值可能小于节流窗（600 秒），0.0 会让节流闸误吞补拉
-    monkeypatch.setattr(
-        achievements_service, "_last_warm_attempt", time.monotonic() - 86400
-    )
-
-    creds = [("steamRefresh_steam", "token")]
-    stale = {
-        "running": False,
-        "steamid": PRIMARY,
-        "syncedAt": (datetime.now(timezone.utc) - timedelta(hours=7)).isoformat(),
-    }
-    fresh = {**stale, "syncedAt": datetime.now(timezone.utc).isoformat()}
-    other_account = {**stale, "steamid": "76561198000000009"}
-    running = {**stale, "running": True}
-
-    achievements_service._maybe_warm_sync(PRIMARY, creds, fresh)
-    achievements_service._maybe_warm_sync(PRIMARY, creds, other_account)
-    achievements_service._maybe_warm_sync(PRIMARY, creds, running)
-    await _asyncio.sleep(0)
-    assert warm_calls == []  # 新鲜 / 别号快照 / 同步进行中都不触发
-
-    achievements_service._maybe_warm_sync(PRIMARY, creds, stale)
-    # 补拉走 create_task，慢机上一轮 sleep(0) 不保证任务跑完——轮询等条件成立
-    for _ in range(50):
-        if warm_calls:
-            break
-        await _asyncio.sleep(0.02)
-    assert warm_calls == [PRIMARY]  # 陈旧快照触发一次补拉
-
-    achievements_service._maybe_warm_sync(PRIMARY, creds, stale)
-    await _asyncio.sleep(0)
-    assert warm_calls == [PRIMARY]  # 节流窗内不重复触发

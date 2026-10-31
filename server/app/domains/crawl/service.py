@@ -319,7 +319,7 @@ async def resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tup
     pool 与 catalog 是两个不同的层，不是一个集合的两段：
     - pool = Monitoring：monitor_targets 里 state=active 的对象，来源是
       家族愿望单 / 关注 / 手动入池 / 已购 / 榜单，排除门在 state 上；
-    - catalog = Catalog：games 主档里未被业务状态（下架宽限期外、永久免费）
+    - catalog = Catalog：games 主档里未被业务状态（永久免费）
       摘除的行，减去 monitor_targets 全部在册对象（active 由 pool 段覆盖，
       released / excluded 按状态定义不进 crawl）——价格库维护轮。
     主轮 6h 网格两段都跑（先 pool 后 catalog），总覆盖与合并成一个 job 时
@@ -354,9 +354,8 @@ async def resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tup
             seen_ids.add(a)
             deduped_ids.append(a)
         wl_ids = deduped_ids
-        # 下架脱池（宽限期外）：Steam 愿望单对下架游戏仍返回条目，
-        # 留着只会让每日价格刷新全 41 区空转打 404；永久免费同理
-        excluded = await _excluded_removed_appids() | await _excluded_free_appids()
+        # 永久免费脱池：Steam 愿望单对免费游戏仍返回条目，留着只会空转
+        excluded = await _excluded_free_appids()
         wl_ids = [a for a in wl_ids if a not in excluded]
         return [
             (a, "")
@@ -364,15 +363,15 @@ async def resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tup
         ]
 
     if scope == "pool":
-        # 监控池：只取 Monitoring 层（有有效来源且未被排除）。下架宽限期外
-        # 与永久免费是业务状态，在 crawl 侧再过滤一层——它们不写监控排除，
+        # 监控池：只取 Monitoring 层（有有效来源且未被排除）。永久免费
+        # 是业务状态，在 crawl 侧再过滤一层——它不写监控排除，
         # 仍留在 monitor_targets 里。
         from app.domains.monitoring import service as monitoring_service
 
         ids = await monitoring_service.crawl_order("game")
         if not ids:
             return []
-        excluded = await _excluded_removed_appids() | await _excluded_free_appids()
+        excluded = await _excluded_free_appids()
         return [(a, "") for a in ids if a not in excluded]
 
     if scope == "catalog":
@@ -409,7 +408,7 @@ async def resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tup
         if not await _kv("fetch.boards", True):
             return []
         board_ids = await games_boards.get_board("specials")
-        excluded = await _excluded_removed_appids() | await _excluded_free_appids()
+        excluded = await _excluded_free_appids()
         excluded |= await monitoring_service.blocked_ids("game")
         known = set(await monitoring_service.active_ids("game"))
         async with get_session_factory()() as session:
@@ -434,8 +433,8 @@ async def resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tup
     if scope == "discounts":
         # 直连折扣队列：特惠榜（search specials 接口）**全量**作爬取对象——
         # 不减目录集（目录段直连默认关，榜内在库游戏由本段刷新价格），只减
-        # 监控层（active 由 pool 段覆盖，同轮不重复爬）与业务排除（下架/
-        # 永久免费）。新面孔爬取落库即完成目录发现。受 fetch.boards 门控。
+        # 监控层（active 由 pool 段覆盖，同轮不重复爬）与业务排除（永久
+        # 免费）。新面孔爬取落库即完成目录发现。受 fetch.boards 门控。
         from app.domains.games import boards as games_boards
         from app.domains.monitoring import service as monitoring_service
         from app.domains.settings.service import get_value as _kv
@@ -443,7 +442,7 @@ async def resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tup
         if not await _kv("fetch.boards", True):
             return []
         board_ids = await games_boards.get_board("specials")
-        excluded = await _excluded_removed_appids() | await _excluded_free_appids()
+        excluded = await _excluded_free_appids()
         excluded |= await monitoring_service.blocked_ids("game")
         monitored = set(await monitoring_service.active_ids("game"))
         return [
@@ -466,7 +465,8 @@ async def plan_scope_appids(scope: str, appids: list[int] | None = None) -> list
 
 # 欠账补抓冷却（分钟）。池价格爬取 6h 一轮 → 冷却是重试节奏的主闸：
 # 5 次重试上限（MISSING_MAX_RETRIES）× 24h ≈ 5 天烧尽转 blocked——
-# 持续多天的 429/锁区风暴也不会快速烧成终态，恢复后冷却期外自然续补。
+# 持续多天的 429/锁区风暴也不会快速烧成终态，恢复后冷却期外自然续补；
+# blocked 不是永固，每 7 天老化重探一次（BLOCKED_REPROBE_DAYS）。
 MISSING_RETRY_COOLDOWN_MINUTES = 24 * 60
 
 # 失败记录修复冷却（分钟）。修复线程 5min 一轮（空闲门禁），冷却须
@@ -487,10 +487,10 @@ async def _missing_tasks(
 ) -> list[dict]:
     """欠账账本 → 定向补抓任务（按区分组批量，每发只装该区的欠账行）。
 
-    locked/blocked 不进补抓（终态）；missing 连续 MISSING_MAX_RETRIES 次失败
-    已在 mark_region_status 里转 blocked。行数上限防积压账本一轮吃满挤占
-    关注层（老账先补）；任务形状与主轮一致（type=app），批量 handler 直接
-    消费，失败退避与 missing 记账语义同一条路径。
+    locked 不进补抓（真终态）；blocked 每 BLOCKED_REPROBE_DAYS 天老化重探
+    一次；missing 连续 MISSING_MAX_RETRIES 次失败已在标记路径转 blocked。
+    行数上限防积压账本一轮吃满挤占关注层（老账先补）；任务形状与主轮一致
+    （type=app），批量 handler 直接消费，失败退避与 missing 记账语义同一条路径。
     """
     from app.crawler.db_writer import DbWriter
 
@@ -542,7 +542,7 @@ async def _recovery_excluded_appids() -> set[int]:
     from app.domains.monitoring import service as monitoring_service
 
     return (await monitoring_service.blocked_ids("game")
-            | await _excluded_removed_appids() | await _excluded_free_appids())
+            | await _excluded_free_appids())
 
 
 _JOB_TARGET_UNITS_SQL = """
@@ -844,34 +844,7 @@ MISSING_RECOVERY_WORKERS = 6
 DIRECT_MODE_WORKERS = 4
 
 
-# 下架监控：removed_at 非空的游戏脱池停爬——已无商店页，
-# 每 41 区一次的 404 空转纯烧配额。36h 宽限期兜底误判（两轮价格刷新
-# 周期内可经复探通道自愈）；复活走「重新上榜反哺」或手动复探端点。
-_REMOVED_GRACE_HOURS = 36
-
-
-async def _excluded_removed_appids() -> set[int]:
-    """下架脱池名单：removed_at 落值且已过宽限期的 appid 集。
-
-    removed_at 刚落的 36h 内不排除（误判保险期，照常参与爬取——
-    真下架多烧一轮、误判自愈，代价可控）。
-    """
-    from datetime import timedelta
-
-    from app.crawler.utils import get_beijing_time_obj
-
-    cutoff = get_beijing_time_obj().replace(tzinfo=None) - timedelta(
-        hours=_REMOVED_GRACE_HOURS
-    )
-    async with get_session_factory()() as session:
-        rows = (
-            await session.execute(
-                select(Game.appid).where(
-                    Game.removed_at.is_not(None), Game.removed_at < cutoff
-                )
-            )
-        ).scalars().all()
-    return {int(r) for r in rows}
+# 永久免费脱池：free_kind='f2p' 的 appid 集——价格事实已定，再爬是空转配额。
 
 
 async def _excluded_free_appids() -> set[int]:

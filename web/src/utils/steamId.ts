@@ -10,3 +10,9 @@ export function friendCodeOf(steamId: string): string {
   if (!/^\d{17}$/.test(sid)) return ''
   return String(BigInt(sid) - FRIEND_CODE_OFFSET)
 }
+
+/** 视图列表侧换算：非法输入回显原值（不吞行；与 friendCodeOf 的空串语义区分）。 */
+export function friendCodeOrRaw(steamId: string): string {
+  const fc = friendCodeOf(steamId)
+  return fc || (steamId || '').trim()
+}

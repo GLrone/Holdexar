@@ -88,14 +88,6 @@ class ExitStatsCollector:
             })
         return out
 
-    @property
-    def total_requests(self) -> int:
-        return sum(b.requests for b in self._buckets.values())
-
-    @property
-    def exit_count(self) -> int:
-        return len({key for key, _endpoint in self._buckets})
-
     def merge_into(self, summary: dict) -> None:
         """把出口账本并入作业台账的 `error_summary`（固定枚举，长度有界）。"""
         by_exit: dict[str, int] = defaultdict(int)

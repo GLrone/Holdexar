@@ -90,6 +90,39 @@ def test_default_mode_is_legacy(tmp_path):
     assert keyring.is_locked(tmp_path) is False
 
 
+def test_write_record_preserves_old_on_tmp_failure(tmp_path, monkeypatch):
+    """主密钥写入是先临时后替换：临时文件写不进去时旧文件必须原样保留，
+    不留半截主密钥（半截 = dpapi/passphrase 方向唯一载体损坏）。"""
+    keyring.write_record(tmp_path, {"mode": "passphrase", "v": 1})
+    master = keyring._master_path(tmp_path)
+    original = master.read_bytes()
+
+    real_write_text = Path.write_text
+
+    def _boom(self, data, *args, **kwargs):
+        if self.suffix == ".tmp":
+            raise OSError("disk full")
+        return real_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", _boom)
+    with pytest.raises(keyring.KeyringError):
+        keyring.write_record(tmp_path, {"mode": "passphrase", "v": 2})
+    monkeypatch.undo()
+    assert master.read_bytes() == original  # 旧主密钥完好
+    assert list(tmp_path.glob("*.tmp")) == []  # 失败路径不留半截临时件
+
+
+def test_restore_record_replaces_atomically(tmp_path):
+    master = keyring._master_path(tmp_path)
+    keyring.restore_record(tmp_path, b"old-master-bytes")
+    assert master.read_bytes() == b"old-master-bytes"
+    keyring.restore_record(tmp_path, b"new-master-bytes")
+    assert master.read_bytes() == b"new-master-bytes"
+    assert list(tmp_path.glob("*.tmp")) == []  # 成功路径不留临时残件
+    keyring.restore_record(tmp_path, None)
+    assert master.exists() is False
+
+
 @pytest.mark.asyncio
 async def test_passphrase_enable_locks_then_unlocks(db, tmp_path):
     await _seed_user_rows()
