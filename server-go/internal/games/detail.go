@@ -101,8 +101,8 @@ func (h *handler) gameDetail(ctx context.Context, appid int64) (*gameDetail, err
 		"SELECT appid, name, name_en, type, header_image, store_url, chinese_support,"+
 			" family_sharing, trading_cards, release_date, developers, publishers, positive_rate,"+
 			" positive_reviews, review_count, is_adult, xgp_tier, is_visual_novel, hl_flag, pp_flag,"+
-			" pp_changed_at, series_id, is_hb, is_epic, epic_date, hb_data, bundle_count, view_count,"+
-			" removed_at, min_cny_fen, diff_fen, free_kind, promo_end_at FROM games WHERE appid = ?",
+			" CAST(pp_changed_at AS TEXT), series_id, is_hb, is_epic, epic_date, hb_data, bundle_count, view_count,"+
+			" CAST(removed_at AS TEXT), min_cny_fen, diff_fen, free_kind, promo_end_at FROM games WHERE appid = ?",
 		appid,
 	).Scan(
 		&g.appid, &g.name, &g.nameEn, &g.typ, &g.headerImage, &storeURL, &chineseSupport,
@@ -256,9 +256,9 @@ func (h *handler) gameDetail(ctx context.Context, appid int64) (*gameDetail, err
 		Developers: parseJSONList(developers), Publishers: parseJSONList(publishers),
 		PositiveRate: rateRatio(g.positiveRate), PositiveReviews: positiveReviews, ReviewCount: g.reviewCount,
 		IsAdult: g.isAdult, XgpTier: g.xgpTier, IsVisualNovel: g.isVisualNovel,
-		HlFlag: g.hlFlag, PpFlag: g.ppFlag, PpChangedAt: g.ppChangedAt,
+		HlFlag: g.hlFlag, PpFlag: g.ppFlag, PpChangedAt: goIsoformatPtr(g.ppChangedAt),
 		SeriesID: g.seriesID, IsHb: g.isHb, IsEpic: g.isEpic, EpicDate: g.epicDate, HbData: g.hbData,
-		BundleCount: g.bundleCount, ViewCount: viewCount, RemovedAt: g.removedAt,
+		BundleCount: g.bundleCount, ViewCount: viewCount, RemovedAt: goIsoformatPtr(g.removedAt),
 		StoreDataMissing: len(entries) == 0, FreeKind: freeKind, PromoEndAt: promoEndAt,
 		PriceMatrix: priceMatrix, UnavailableRegions: sortedStrings(unavailable),
 		CnPriceCents: cnPriceCents, CnCnyFen: cnCnyFen, CnDiscount: cnDiscount,

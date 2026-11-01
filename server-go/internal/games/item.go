@@ -141,7 +141,7 @@ func buildSteamStoreURL(appid int64) string {
 }
 
 // buildListItem 列表项：cnyFen 只读快照列（GET 不回算汇率）；覆盖分母 = 启用区服。
-func buildListItem(g gameRow, cn *cnRow, prices []priceRow, regionsExpected []string) listItem {
+func buildListItem(g gameRow, cn *cnRow, prices []priceRow, regionsExpected []string, pendingUnits map[string]bool) listItem {
 	var baseCnPrice *int64
 	if cn != nil {
 		baseCnPrice = cn.price
@@ -188,7 +188,7 @@ func buildListItem(g gameRow, cn *cnRow, prices []priceRow, regionsExpected []st
 	}
 
 	coverage := buildCoverage(prices, regionsExpected)
-	priceData := regionalFreshness(prices, regionsExpected)
+	priceData := regionalFreshness(prices, regionsExpected, pendingUnits)
 	priceData["coverage"] = coverage
 
 	var releaseDate string
@@ -221,8 +221,8 @@ func buildListItem(g gameRow, cn *cnRow, prices []priceRow, regionsExpected []st
 		UnavailableRegions: sortedStrings(unavailable),
 		HlFlag:             g.hlFlag,
 		PpFlag:             g.ppFlag,
-		PpChangedAt:        g.ppChangedAt,
-		UpdatedAt:          g.updatedAt,
+		PpChangedAt:        goIsoformatPtr(g.ppChangedAt),
+		UpdatedAt:          goIsoformatPtr(g.updatedAt),
 		PriceData:          priceData,
 		FamilySharing:      g.familySharing,
 		TradingCards:       g.tradingCards,
@@ -232,7 +232,7 @@ func buildListItem(g gameRow, cn *cnRow, prices []priceRow, regionsExpected []st
 		EpicDate:           g.epicDate,
 		HbData:             g.hbData,
 		BundleCount:        g.bundleCount,
-		RemovedAt:          g.removedAt,
+		RemovedAt:          goIsoformatPtr(g.removedAt),
 	}
 }
 
@@ -316,7 +316,7 @@ const (
 )
 
 // regionalFreshness 同一份价格行生成地区明细与对象新鲜度（纯函数，不取价）。
-func regionalFreshness(rows []priceRow, regions []string) map[string]any {
+func regionalFreshness(rows []priceRow, regions []string, pendingUnits map[string]bool) map[string]any {
 	indexed := map[string]*priceRow{}
 	for i := range rows {
 		c := strings.ToUpper(rows[i].regionCode)
@@ -324,7 +324,10 @@ func regionalFreshness(rows []priceRow, regions []string) map[string]any {
 			indexed[c] = &rows[i]
 		}
 	}
-	codes := regions
+	codes := make([]string, 0, len(regions))
+	for _, cc := range regions {
+		codes = append(codes, strings.ToUpper(cc))
+	}
 	if len(codes) == 0 {
 		for c := range indexed {
 			codes = append(codes, c)
@@ -350,7 +353,8 @@ func regionalFreshness(rows []priceRow, regions []string) map[string]any {
 		if row.attemptOutcome != nil && *row.attemptOutcome != "" {
 			outcome = *row.attemptOutcome
 		}
-		pending := outcome != "success" && row.priceStatus != "blocked"
+		pending := pendingUnits[strconv.FormatInt(row.appid, 10)+":"+code] ||
+			(outcome != "success" && row.priceStatus != "blocked")
 		ageAny := any(nil)
 		if age != nil {
 			ageAny = *age
@@ -361,7 +365,7 @@ func regionalFreshness(rows []priceRow, regions []string) map[string]any {
 			"outcome":       outcome,
 			"answer":        row.steamAnswer,
 			"lastSuccessAt": obs,
-			"lastAttemptAt": row.updatedAt,
+			"lastAttemptAt": goIsoformatPtr(row.updatedAt),
 			"ageHours":      ageAny,
 			"freshness":     fresh,
 			"pending":       pending,
@@ -388,6 +392,34 @@ func regionalFreshness(rows []priceRow, regions []string) map[string]any {
 	}
 }
 
+// goIsoformat 库内 naive 文本（空格分隔）→ Python datetime.isoformat 形态
+// （T 分隔；微秒为 0 时省略小数段）。无法解析时原样返回。
+func goIsoformat(text string) string {
+	t, ok := parseStoredTime(text)
+	if !ok {
+		return text
+	}
+	if t.Nanosecond() == 0 {
+		return t.Format("2006-01-02T15:04:05")
+	}
+	return t.Format("2006-01-02T15:04:05.000000")
+}
+
+// pyHours 复刻 Python (reference - observed).total_seconds() / 3600.0 的浮点
+// 路径：微秒整数（datetime 精度）→ /1e6 → /3600 两次除法，避免单次除法在
+// 舍入边界产生末位分歧。
+func pyHours(d time.Duration) float64 {
+	return (float64(int64(d)/1000) / 1e6) / 3600.0
+}
+
+func goIsoformatPtr(v *string) *string {
+	if v == nil {
+		return nil
+	}
+	s := goIsoformat(*v)
+	return &s
+}
+
 // freshnessOf 观察时刻 → (observedAt, ageHours, freshness)；无数据三者皆空。
 func freshnessOf(observedAt *string, now time.Time) (any, *float64, any) {
 	if observedAt == nil {
@@ -397,7 +429,7 @@ func freshnessOf(observedAt *string, now time.Time) (any, *float64, any) {
 	if !ok {
 		return nil, nil, nil
 	}
-	age := roundN(now.Sub(t).Hours(), 3)
+	age := roundN(pyHours(now.Sub(t)), 3)
 	var bucket string
 	switch {
 	case age < freshHours:
@@ -407,7 +439,8 @@ func freshnessOf(observedAt *string, now time.Time) (any, *float64, any) {
 	default:
 		bucket = "stale"
 	}
-	return *observedAt, &age, bucket
+	obs := goIsoformat(*observedAt)
+	return obs, &age, bucket
 }
 
 // parseStoredTime 库内 datetime 文本（naive）解析；按服务器本地时区解释。
