@@ -275,6 +275,7 @@ func TestRegistryFailClosed(t *testing.T) {
 		"search_games": true, "recommend_games": true, "game_detail": true,
 		"linked_bundles": true, "rates_history": true, "regions_config": true,
 		"notifications_status": true, "notification_history": true,
+		"list_accounts": true, "list_wishlist": true, "list_owned": true,
 	}
 	for _, spec := range r.all() {
 		if spec.Group == GroupWrite {

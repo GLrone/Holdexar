@@ -79,6 +79,24 @@ func buildRegistry() (*ToolRegistry, error) {
 			}}`,
 			Handler: notificationHistory,
 		},
+		{
+			Name: "list_accounts", Group: GroupRead, Risk: "low",
+			Description: "绑定 Steam 账号清单（名称/好友码/主账号/拥有统计）——只读账号面，无任何凭据",
+			Parameters:  `{"type": "object", "properties": {}}`,
+			Handler:     listAccounts,
+		},
+		{
+			Name: "list_wishlist", Group: GroupRead, Risk: "low",
+			Description: "账户愿望单游戏（监控池内 wishlisted 来源，库内快照，带国区现价简报）",
+			Parameters:  `{"type": "object", "properties": {}}`,
+			Handler:     listWishlist,
+		},
+		{
+			Name: "list_owned", Group: GroupRead, Risk: "low",
+			Description: "账户已拥有游戏（监控池内 owned 来源，带国区现价简报）",
+			Parameters:  `{"type": "object", "properties": {}}`,
+			Handler:     listOwned,
+		},
 	} {
 		spec.TimeoutS = budgetDefaultS
 		if err := r.register(spec); err != nil {
