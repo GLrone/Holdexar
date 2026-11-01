@@ -9,6 +9,7 @@ import { usePilotStore } from '@/stores/pilot'
 import { useRegionsStore } from '@/stores/regions'
 import { usePasteAdd } from '@/composables/usePasteAdd'
 import { qualifyingSources, qualifyingTargets } from '@/lib/gifting'
+import { errorText } from '@/lib/errorText'
 import { formatCnyFen } from '@/api/regions'
 import { mergeItemsByAppid } from '@/lib/priceRefresh'
 import { vStagger } from '@/lib/stagger'
@@ -168,7 +169,7 @@ async function load(reset: boolean) {
     initialized.value = true
   } catch (e) {
     isError.value = true
-    errorMsg.value = e instanceof Error ? e.message : String(e)
+    errorMsg.value = errorText(e)
   } finally {
     isLoading.value = false
     isFetchingNext.value = false
