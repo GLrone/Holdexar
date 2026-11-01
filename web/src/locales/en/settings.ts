@@ -78,6 +78,7 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.steam.redeems': 'Redeems',
   'settings.steam.setActive': 'Set active',
   'settings.steam.unbind': 'Unbind',
+  'settings.steam.unbindConfirm': 'Unbind {name}? Their bills, family data and tracking will be removed too; re-bind to sync again.',
   'settings.steam.syncOne': 'Sync',
   'settings.steam.accountCount': '{n} accounts',
   'settings.steam.syncMeta': 'Last synced {time} · the wallet refreshes every minute (accounts staggered at random)',

@@ -33,7 +33,7 @@ import { walletSyncOk, walletSyncedAt } from '@/lib/walletSync'
 import CurrencyFlag from '@/components/CurrencyFlag.vue'
 import RegionFlag from '@/components/RegionFlag.vue'
 import {
-  HlButton, HlCheckbox, HlDialog, HlIcon, HlImg, HlInput, HlSelect, HlSkeleton, HlSwitch, message,
+  HlButton, HlCheckbox, HlDialog, HlIcon, HlImg, HlInput, HlPopconfirm, HlSelect, HlSkeleton, HlSwitch, message,
 } from '@/components/ui'
 import HlPilotFlywheel from '@/components/business/HlPilotFlywheel.vue'
 
@@ -1693,14 +1693,14 @@ onUnmounted(() => {
                 >
                   {{ t('settings.steam.setActive') }}
                 </HlButton>
-                <HlButton
-                  variant="text"
-                  size="sm"
-                  tone="red"
-                  @click="removeAccount(acc.steam_id, acc.persona_name || acc.friend_code)"
+                <HlPopconfirm
+                  :text="t('settings.steam.unbindConfirm', { name: acc.persona_name || acc.friend_code })"
+                  @confirm="removeAccount(acc.steam_id, acc.persona_name || acc.friend_code)"
                 >
-                  {{ t('settings.steam.unbind') }}
-                </HlButton>
+                  <HlButton variant="text" size="sm" tone="red">
+                    {{ t('settings.steam.unbind') }}
+                  </HlButton>
+                </HlPopconfirm>
               </div>
             </div>
           </div>
