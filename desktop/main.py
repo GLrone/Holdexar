@@ -54,6 +54,7 @@ from app.core.app_info import (  # noqa: E402
     ENV_PREFIX,
     HANDOFF_LEDGER_NAME,
     HANDOFF_UNSUPPORTED_MARK,
+    HEALTH_TIMEOUT,
     STAGING_DIR_NAME,
     STAGING_MANIFEST_NAME,
     SWAP_FAILED_FLAG,
@@ -102,8 +103,6 @@ SERVER_PORT = int(os.environ.get(f"{ENV_PREFIX}PORT", "28765"))
 LOCK_PORT = int(os.environ.get(f"{ENV_PREFIX}LOCK_PORT", "28965"))
 # frozen 态服务端口被占时的自动扫描窗口（从默认端口起试 N 个）
 _PORT_SCAN_SPAN = 20
-# 健康检查等待上限：须覆盖首装时大数据量导入的耗时，兼顾低端机/机械盘。
-HEALTH_TIMEOUT = 90.0
 WINDOW_TITLE = APP_NAME
 DEFAULT_SIZE = (1280, 860)
 MIN_SIZE = (960, 600)
@@ -1953,7 +1952,8 @@ def main() -> None:
 
     url = os.environ.get(f"{ENV_PREFIX}DEV_URL") or f"http://{SERVER_HOST}:{SERVER_PORT}"
     if args.server:
-        if not _wait_health(HEALTH_TIMEOUT):
+        # 受保护验收实例（带事务标识）：等待预算归宿主管的验收循环，本地不再自尽
+        if not os.environ.get(f"{ENV_PREFIX}UPDATE_ATTEMPT_ID") and not _wait_health(HEALTH_TIMEOUT):
             detail = "".join(error_box)
             print("服务启动失败：")
             if detail:
