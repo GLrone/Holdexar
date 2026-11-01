@@ -515,11 +515,11 @@ func PoolSignatureChanged(before, after []string) bool {
 	return false
 }
 
-// RequestPoolRebuild 合格集变化 → 请求重建的注入点。默认 no-op：重建编排批次
-// 接线时替换为「置重建待办位」，由空闲期消费者对接 clashcfg.PrepareRuntimeConfig
-// 与 clashkernel 热重载完成收敛。退出条件：重建编排落地后本变量由其接管，
-// 调用方一律经 MaybeRequestPoolRebuild，不再直调本变量。
-var RequestPoolRebuild = func() {}
+// RequestPoolRebuild 合格集变化 → 请求重建的注入点。默认 RequestRebuild 置
+// 待办位（Python request_rebuild 同款可合并信号）；消费由重建接线装配
+// （占用释放钩子 / 周期拍）。调用方一律经 MaybeRequestPoolRebuild，不再直调
+// 本变量。
+var RequestPoolRebuild = RequestRebuild
 
 // MaybeRequestPoolRebuild 签名变化时请求重建（幂等：连续置位只算一次的语义
 // 由待办位持有方保证）。

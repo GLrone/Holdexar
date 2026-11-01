@@ -19,6 +19,7 @@ import (
 
 	"holdexar/server-go/internal/clashcfg"
 	"holdexar/server-go/internal/clashkernel"
+	"holdexar/server-go/internal/occupancy"
 	"holdexar/server-go/internal/store"
 )
 
@@ -520,4 +521,115 @@ func TestLiveOrchestrationMaintenanceRound(t *testing.T) {
 		t.Fatalf("出口账本应 1 行，实际 %d", got)
 	}
 	t.Logf("live 编排验收通过：一轮维护 + 签名变化热重载 + 扫批 + 出口聚合")
+}
+
+// TestLiveRebuildConsumeAfterCrawl 爬取释放消费点真内核验收：占用期间请求的
+// 重建在 EndCrawl 释放后立即热重建（进程不动、池跟上），维护预约在位时让路，
+// 释放后周期拍式消费收敛。
+func TestLiveRebuildConsumeAfterCrawl(t *testing.T) {
+	exe := liveKernelExe(t)
+	ctx := context.Background()
+
+	db, gate, dataDir := newOrchestrateDB(t)
+	sealed, err := SealURL(dataDir, "https://provider.example.com/live-sub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := db.Exec(`INSERT INTO proxy_subscriptions (url, kind, admission_status, auto_refresh)
+		VALUES (?, 'clash', 'ACTIVE', 1)`, sealed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subID, _ := res.LastInsertId()
+
+	syncer := &Syncer{DB: db, Gate: gate, DataDir: dataDir,
+		Fetch: func(ctx context.Context, url string, channels []Channel, opts FetchOptions) (*FetchResult, error) {
+			return stubFetchResult(stubSubBodyAt([]int{minimalSocks5Server(t), minimalSocks5Server(t)},
+				[]string{"Live-01", "Live-02"})), nil
+		}}
+	if _, err := syncer.SyncSubscriptions(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.WithWrite(ctx, store.PriorityBackground, func(conn *sql.Conn) error {
+		if err := EnsureSchema(ctx, conn); err != nil {
+			return err
+		}
+		_, err := BuildPool(ctx, conn, dataDir, time.Now())
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var runtime clashkernel.Runtime
+	configPath, _, err := clashcfg.PrepareRuntimeConfig(dataDir, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Start(exe, configPath, clashkernel.StartOptions{}); err != nil {
+		t.Fatalf("真内核启动失败：%v", err)
+	}
+	t.Cleanup(func() { runtime.Stop() })
+
+	// 库内补第三个 ACTIVE 节点：池文件（2 节点）与合格集漂移，消费后应热重建跟上。
+	// 配置须内核可装载（ss 要 cipher/password），否则 -t 校验拒绝热重载回滚磁盘。
+	seedPoolNode(t, db, "Live-03", "ACTIVE", subID,
+		`{"name": "Live-03", "type": "ss", "server": "s.example.com", "port": 8443, "cipher": "aes-256-gcm", "password": "p3"}`)
+	if names := PoolFileNames(dataDir); len(names) != 2 {
+		t.Fatalf("启动池应为 2 节点：%v", names)
+	}
+	pid0 := runtime.ProcessPid()
+
+	// 一键接线（serverd 同款形态）：释放钩子消费待重建。
+	restore := WireRebuildPipeline(gate, dataDir, exe, &runtime, 0)
+	defer restore()
+
+	// 占用期间请求重建 → 释放即异步消费：池跟上合格集、进程不动、待办位清空。
+	RequestRebuild()
+	if err := occupancy.BeginCrawl("live-rebuild"); err != nil {
+		t.Fatal(err)
+	}
+	occupancy.EndCrawl()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		names := PoolFileNames(dataDir)
+		kind := occupancy.MaintenanceKind()
+		if len(names) == 3 && kind != occupancy.MaintenanceRebuild {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("释放后 30s 内未完成重建消费：pool=%v kind=%q pending=%v",
+				names, kind, RebuildPending())
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if RebuildPending() {
+		t.Fatal("消费后待办位应清空")
+	}
+	if pid := runtime.ProcessPid(); pid != pid0 {
+		t.Fatalf("释放消费应为热重载（进程不动）：pid %d → %d", pid0, pid)
+	}
+	if !runtime.Status().Running {
+		t.Fatal("重建后内核应仍在跑")
+	}
+
+	// 维护预约在位时消费让路，待办位保留；释放预约后周期拍式消费收敛。
+	if err := occupancy.BeginMaintenance(occupancy.MaintenanceHealth); err != nil {
+		t.Fatal(err)
+	}
+	RequestRebuild()
+	occupancy.OnCrawlEnd()
+	if !RebuildPending() {
+		t.Fatal("占用互斥下消费应让路，待办位保留")
+	}
+	if names := PoolFileNames(dataDir); len(names) != 3 {
+		t.Fatalf("让路时池不得变动：%v", names)
+	}
+	occupancy.EndMaintenance()
+	ran, err := RunPendingRebuild(ctx, KernelRebuildFunc(gate, dataDir, exe, &runtime, 0))
+	if err != nil || !ran {
+		t.Fatalf("空闲拍应消费待重建：ran=%v err=%v", ran, err)
+	}
+	if RebuildPending() {
+		t.Fatal("周期拍消费后待办位应清空")
+	}
+	t.Logf("live 释放消费验收通过：释放即热重建 + 占用让路 + 空闲拍收敛")
 }

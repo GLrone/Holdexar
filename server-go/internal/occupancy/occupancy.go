@@ -90,12 +90,20 @@ func BeginCrawl(tag string) error {
 	return nil
 }
 
+// OnCrawlEnd 爬取占用释放后的钩子（接线方注入；nil = 无）。消费待重建归
+// proxypool 接线；钩子在占用已释放后异步执行（Python create_task 同款），
+// 自身故障不影响占用释放。
+var OnCrawlEnd func()
+
 // EndCrawl 释放爬取占用；与成功的 BeginCrawl 成对，异常路径由调用方 defer 配对。
-// Python 侧释放即触发重建消费，Go 侧归重建钩子批次，不在本域。
+// 释放即触发重建消费钩子（Python end_crawl → _kick_rebuild_consume 同款）。
 func EndCrawl() {
 	mu.Lock()
 	holder = ""
 	mu.Unlock()
+	if OnCrawlEnd != nil {
+		go OnCrawlEnd()
+	}
 }
 
 // BeginMaintenance 取得维护预约：已有预约或爬取占用在位即拒（不幂等，预约
