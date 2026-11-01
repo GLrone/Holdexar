@@ -29,6 +29,12 @@ from app.core.app_info import (
     STAGING_MANIFEST_NAME,
     version_from_tag,
 )
+from app.core.app_info import (
+    MIGRATION_IDLE_WINDOW,
+    MIGRATION_MAX_DURATION,
+    MIGRATION_SIGNAL_INTERVAL,
+)
+from app.core.db_safety import read_schema_version
 from app.core.paths import install_root as resolve_default_install_root
 
 def _http_get_json(host: str, port: int, path: str, timeout: float = 3.0) -> tuple[int, dict | None]:
@@ -469,6 +475,21 @@ def verify_health_response(
     return None
 
 
+def _read_migration_signal(data_dir: Path) -> tuple[int | None, int]:
+    """只读迁移存活信号：(库结构版本, 迁移前快照字节数)；读不到按无信号处理。"""
+    snapshot = -1
+    for p in data_dir.glob("*.pre-migration.bak"):
+        try:
+            snapshot = p.stat().st_size
+        except OSError:
+            snapshot = -1
+        break
+    try:
+        return read_schema_version(data_dir), snapshot
+    except Exception:  # noqa: BLE001 — 迁移写事务中的瞬时锁冲突不算故障
+        return None, snapshot
+
+
 def probe_version_health(
     root: Path,
     target_version: str,
@@ -553,6 +574,13 @@ def probe_version_health(
     last_reason = f"{HEALTH_BINDING_ERROR}：无可用健康响应"
     # 验收进程的映像在拉起后固化：后续只与自身比对，防止中途被替换
     expected_image = process_image_path(proc.pid)
+    # 迁移阶段与健康验收分账（只读信号，不进验收判据）：信号推进=迁移存活，刷新
+    # 空闲窗；空闲窗兜「真卡死」，总上限兜「无限慢」。
+    started = time.monotonic()
+    migration_cap = started + MIGRATION_MAX_DURATION
+    last_schema: int | None = None
+    last_snapshot = -1
+    next_signal = 0.0
 
     try:
         while time.monotonic() < deadline:
@@ -563,6 +591,16 @@ def probe_version_health(
                 current_image = process_image_path(proc.pid)
                 if current_image and not _same_path(current_image, expected_image):
                     return False, f"{HEALTH_BINDING_ERROR}：进程镜像被替换为 {current_image}"
+            now = time.monotonic()
+            if now >= migration_cap:
+                return False, f"数据库迁移超出总预算（{MIGRATION_MAX_DURATION:.0f}s），执行回滚"
+            if now >= next_signal:
+                next_signal = now + MIGRATION_SIGNAL_INTERVAL
+                schema_now, snapshot_now = _read_migration_signal(expected_data_dir)
+                if schema_now != last_schema or snapshot_now != last_snapshot:
+                    last_schema, last_snapshot = schema_now, snapshot_now
+                    deadline = max(deadline, now + MIGRATION_IDLE_WINDOW)
+                    _trace(f"迁移推进：schema={schema_now} 快照字节={snapshot_now}")
             _trace(f"验收轮询：pid={proc.pid} 监听端口={ports} 属主={owner_pid}")
             for candidate in ports:
                 if not _answers_http(candidate):
@@ -613,7 +651,9 @@ def probe_version_health(
                     preserved = True
                 return True, "健康检查通过"
             time.sleep(0.5)
-        return False, f"{HEALTH_TIMEOUT_ERROR}（{timeout}s）：{last_reason}"
+        budget = f"{timeout:.0f}s" if deadline <= started + timeout else (
+            f"验收窗 {timeout:.0f}s + 迁移空闲窗 {MIGRATION_IDLE_WINDOW:.0f}s")
+        return False, f"{HEALTH_TIMEOUT_ERROR}（{budget}）：{last_reason}"
     finally:
         if proc and not preserved:
             try:

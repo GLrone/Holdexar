@@ -815,3 +815,99 @@ def test_released_residue_with_incomplete_phase_stays_fail_closed(tmp_path):
     with pytest.raises(RuntimeError):
         update_host.recover_interrupted_update(root)
     assert layout.read_transaction(root)["attemptId"] == "previous"
+
+
+def test_read_migration_signal_reports_version_and_snapshot(tmp_path):
+    from app.core.update_host import _read_migration_signal
+
+    empty = tmp_path / "no-data"
+    assert _read_migration_signal(empty) == (None, -1)
+    data = tmp_path / "data"
+    data.mkdir()
+    conn = sqlite3.connect(data / "holdexar.db")
+    conn.execute("PRAGMA user_version=30")
+    conn.close()
+    bak = data / "holdexar.db.pre-migration.bak"
+    bak.write_bytes(b"x" * 128)
+    assert _read_migration_signal(data) == (30, 128)
+
+
+def test_migration_progress_extends_probe_window(tmp_path, monkeypatch):
+    """迁移信号持续推进时，验收窗随空闲窗延长，直到总上限才回滚。"""
+    import sys
+    import threading
+    import time as _time
+
+    root = tmp_path / "app"
+    data = tmp_path / "data"
+    data.mkdir()
+    stop = threading.Event()
+    real_popen = update_host.subprocess.Popen
+    real_sleep = _time.sleep
+
+    def fake_popen(_args, **kwargs):
+        return real_popen([sys.executable, "-c", "import time; time.sleep(60)"], **kwargs)
+
+    def grow():
+        bak = data / "holdexar.db.pre-migration.bak"
+        while not stop.is_set():
+            with bak.open("ab") as fh:
+                fh.write(b"progress")
+            real_sleep(0.15)
+
+    def bounded_sleep(seconds):
+        real_sleep(min(seconds, 0.05))
+
+    monkeypatch.setattr(update_host.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(update_host, "MIGRATION_MAX_DURATION", 2.2)
+    monkeypatch.setattr(update_host, "MIGRATION_IDLE_WINDOW", 0.8)
+    monkeypatch.setattr(update_host, "MIGRATION_SIGNAL_INTERVAL", 0.15)
+    monkeypatch.setattr(update_host.time, "sleep", bounded_sleep)
+    worker = threading.Thread(target=grow, daemon=True)
+    worker.start()
+    try:
+        started = _time.monotonic()
+        ok, reason = update_host.probe_version_health(
+            root, "9.9.9", "attempt-grow", timeout=0.4,
+            data_dir=data, target_exe=Path(sys.executable), require_guard=False,
+        )
+        elapsed = _time.monotonic() - started
+    finally:
+        stop.set()
+    assert ok is False
+    assert "迁移超出总预算" in reason
+    assert elapsed >= 2.0
+
+
+def test_stalled_migration_keeps_original_probe_budget(tmp_path, monkeypatch):
+    """无迁移信号推进时不得凭进程存在续期：按原验收窗超时回滚。"""
+    import sys
+    import time as _time
+
+    root = tmp_path / "app"
+    data = tmp_path / "data"
+    data.mkdir()
+    real_popen = update_host.subprocess.Popen
+    real_sleep = _time.sleep
+
+    def fake_popen(_args, **kwargs):
+        return real_popen([sys.executable, "-c", "import time; time.sleep(60)"], **kwargs)
+
+    def bounded_sleep(seconds):
+        real_sleep(min(seconds, 0.05))
+
+    monkeypatch.setattr(update_host.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(update_host, "MIGRATION_MAX_DURATION", 60.0)
+    monkeypatch.setattr(update_host, "MIGRATION_IDLE_WINDOW", 30.0)
+    monkeypatch.setattr(update_host, "MIGRATION_SIGNAL_INTERVAL", 0.15)
+    monkeypatch.setattr(update_host.time, "sleep", bounded_sleep)
+    started = _time.monotonic()
+    ok, reason = update_host.probe_version_health(
+        root, "9.9.9", "attempt-stalled", timeout=0.5,
+        data_dir=data, target_exe=Path(sys.executable), require_guard=False,
+    )
+    elapsed = _time.monotonic() - started
+    assert ok is False
+    assert "健康验收超时" in reason
+    assert "迁移超出总预算" not in reason
+    assert elapsed < 5.0
