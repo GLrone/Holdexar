@@ -439,7 +439,7 @@ func (h *handler) listGames(ctx context.Context, p listParams) (map[string]any, 
 	}
 	query := "SELECT g.appid, g.name, g.name_en, g.type, g.positive_rate, g.review_count," +
 		" g.is_adult, g.xgp_tier, g.is_visual_novel, g.release_date, g.min_cny_fen, g.diff_fen," +
-		" g.smart_score, g.header_image, g.hl_flag, g.pp_flag, g.pp_changed_at, g.updated_at," +
+		" g.smart_score, g.header_image, g.hl_flag, g.pp_flag, CAST(g.pp_changed_at AS TEXT), CAST(g.updated_at AS TEXT)," +
 		" g.family_sharing, g.trading_cards, g.series_id, g.is_hb, g.is_epic, g.epic_date," +
 		" g.hb_data, g.bundle_count, g.removed_at," +
 		" cp1.appid AS cn_appid, cp1.price AS cn_price, cp1.discount_percent AS cn_discount_percent," +
@@ -509,10 +509,14 @@ func (h *handler) listGames(ctx context.Context, p listParams) (map[string]any, 
 		return nil, err
 	}
 	regionsExpected := h.enabledRegions(ctx)
+	pending, err := h.pendingUnits(ctx, appids)
+	if err != nil {
+		return nil, err
+	}
 
 	items := make([]listItem, 0, len(listRows))
 	for _, r := range listRows {
-		items = append(items, buildListItem(r.game, r.cn, priceRows[r.game.appid], regionsExpected))
+		items = append(items, buildListItem(r.game, r.cn, priceRows[r.game.appid], regionsExpected, pending))
 	}
 	var nextCursor any
 	if hasMore {
@@ -623,6 +627,79 @@ func buildOrderBy(sort string, regionMode bool) string {
 	}
 }
 
+// jobTargetUnitsSQL 失败作业的目标单位 CTE（对齐 crawl service 同名常量）。
+const jobTargetUnitsSQL = `
+WITH target_jobs AS MATERIALIZED (
+    SELECT id, json_extract(stats_json, '$.targets.appids') AS appids,
+           json_extract(stats_json, '$.targets.regions') AS regions,
+           json_extract(stats_json, '$.targets.tasks') AS tasks,
+           replace(json_extract(stats_json, '$.targetStartedAt'), 'T', ' ') AS threshold
+    FROM crawl_jobs
+    WHERE status IN ('failed','interrupted')
+      AND NOT EXISTS (SELECT 1 FROM price_cycles c WHERE c.id = crawl_jobs.cycle_id AND c.status = 'cancelled')
+      AND json_type(stats_json, '$.targets') = 'object'
+      AND json_extract(stats_json, '$.targetStartedAt') IS NOT NULL
+      AND (?1 IS NULL OR id = ?1)
+), units AS (
+    SELECT j.id AS job_id, CAST(a.value AS INTEGER) AS appid,
+           upper(r.value) AS region, j.threshold
+    FROM target_jobs j, json_each(j.appids) a, json_each(j.regions) r
+    UNION ALL
+    SELECT j.id, CAST(a.value AS INTEGER),
+           upper(json_extract(t.value, '$.region')), j.threshold
+    FROM target_jobs j, json_each(j.tasks) t,
+         json_each(t.value, '$.appids') a
+), skipped AS (
+    SELECT s.value AS unit,
+           MAX(replace(json_extract(j.stats_json, '$.targetStartedAt'), 'T', ' ')) AS threshold
+    FROM crawl_jobs j, json_each(j.stats_json, '$.skipUnits') s
+    WHERE replace(json_extract(j.stats_json, '$.targetStartedAt'), 'T', ' ')
+          >= (SELECT MIN(threshold) FROM target_jobs)
+    GROUP BY s.value
+), unit_results AS (
+    SELECT u.*, CASE WHEN (
+        p.price_status IN ('ok','locked','missing','blocked')
+        AND (p.updated_at >= u.threshold OR p.last_success_at >= u.threshold)
+    ) OR s.threshold >= u.threshold THEN 1 ELSE 0 END AS settled
+    FROM units u
+    LEFT JOIN game_current_prices p ON p.appid = u.appid AND p.region_code = u.region
+    LEFT JOIN skipped s ON s.unit = CAST(u.appid AS TEXT) || ':' || u.region
+), unresolved AS (
+    SELECT DISTINCT appid, region, threshold FROM unit_results WHERE settled = 0
+)`
+
+// pendingUnits 未观察欠账集（对齐 _unobserved_job_targets 的 cooldown=0 /
+// 页内 appid / 不限行形态）：失败作业目标单位减去已观察单位。
+func (h *handler) pendingUnits(ctx context.Context, appids []int64) (map[string]bool, error) {
+	pending := map[string]bool{}
+	if len(appids) == 0 {
+		return pending, nil
+	}
+	ph := strings.TrimSuffix(strings.Repeat("?,", len(appids)), ",")
+	cutoff := time.Now().UTC().Add(8 * time.Hour).Format("2006-01-02 15:04:05.000000")
+	query := jobTargetUnitsSQL + " SELECT DISTINCT appid, region FROM unresolved" +
+		" WHERE threshold < ?1 AND appid IN (" + ph + ")"
+	args := make([]any, 0, len(appids)+2)
+	args = append(args, nil, cutoff)
+	for _, a := range appids {
+		args = append(args, a)
+	}
+	rows, err := h.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("欠账单位查询失败: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var appid int64
+		var region string
+		if err := rows.Scan(&appid, &region); err != nil {
+			return nil, fmt.Errorf("欠账单位行读取失败: %w", err)
+		}
+		pending[strconv.FormatInt(appid, 10)+":"+region] = true
+	}
+	return pending, rows.Err()
+}
+
 // loadPagePrices 页级取价：只拉给定 appid 的全区价格行（含非 ok 状态行）。
 func (h *handler) loadPagePrices(ctx context.Context, appids []int64) (map[int64][]priceRow, error) {
 	out := make(map[int64][]priceRow)
@@ -631,7 +708,7 @@ func (h *handler) loadPagePrices(ctx context.Context, appids []int64) (map[int64
 	}
 	ph := strings.TrimSuffix(strings.Repeat("?,", len(appids)), ",")
 	query := "SELECT appid, region_code, currency, price, discount_percent, price_status, cny_fen," +
-		" attempt_outcome, steam_answer, last_success_at, updated_at" +
+		" attempt_outcome, steam_answer, CAST(last_success_at AS TEXT), CAST(updated_at AS TEXT)" +
 		" FROM game_current_prices WHERE appid IN (" + ph + ")"
 	args := make([]any, 0, len(appids))
 	for _, a := range appids {

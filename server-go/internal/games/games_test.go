@@ -126,6 +126,8 @@ CREATE TABLE crawl_regions (
   updated_at TEXT
 );
 CREATE TABLE fx_rates (currency_code TEXT PRIMARY KEY, rate_to_cny REAL NOT NULL DEFAULT 1.0, fetched_at TEXT);
+CREATE TABLE crawl_jobs (id INTEGER PRIMARY KEY, status TEXT, cycle_id INTEGER, stats_json TEXT);
+CREATE TABLE price_cycles (id INTEGER PRIMARY KEY, status TEXT);
 `
 
 func newTestHandler(t *testing.T) (*httptest.Server, *sql.DB) {
@@ -353,8 +355,8 @@ func TestListDefault(t *testing.T) {
 		cov["notAttempted"].(float64) != 1 || cov["coverage"].(float64) != 0.6667 {
 		t.Fatalf("覆盖数值异常: %v", cov)
 	}
-	if pd["observedAt"].(string) != "2026-10-30 09:00:00" {
-		t.Fatalf("observedAt 应透传库内文本: %v", pd["observedAt"])
+	if pd["observedAt"].(string) != "2026-10-30T09:00:00" {
+		t.Fatalf("observedAt 应为 isoformat 形态: %v", pd["observedAt"])
 	}
 	third := items[2].(map[string]any)
 	pd3 := third["priceData"].(map[string]any)
