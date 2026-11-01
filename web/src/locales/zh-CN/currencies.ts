@@ -1,7 +1,7 @@
 /* 币种名词条（39 条）。zh 侧取值以本表为准，不要改成从 Intl.DisplayNames 现取
    （IDR / ILS 两条与 Intl 输出不同，既有短名与 CC_LIST 命名政策一致）。
    对齐单一来源：server/app/crawler/config.py 的 CC_LIST；末尾 TRY / ARS 为服务端永久保留币种。
-   新增区服货币：CC_LIST 加行 → api/currencies.ts 加一条 → 本表加中英各一条。 */
+   新增地区货币：CC_LIST 加行 → api/currencies.ts 加一条 → 本表加中英各一条。 */
 const currencies = {
   // ── 按 CC_LIST 首次出现顺序；末尾两条为服务端预留币种 ──
   'currencies.name.CNY': '人民币',
@@ -42,7 +42,7 @@ const currencies = {
   'currencies.name.ILS': '以色列谢克尔',
   'currencies.name.CHF': '瑞士法郎',
 
-  // ── 预留币种（当前无区服使用，服务端仍抓取落库） ──
+  // ── 预留币种（当前无地区使用，服务端仍抓取落库） ──
   'currencies.name.TRY': '土耳其里拉',
   'currencies.name.ARS': '阿根廷比索',
 } as const

@@ -83,12 +83,12 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.steam.syncMeta': 'Last synced {time} · the wallet refreshes every minute (accounts staggered at random)',
 
   /* Account card (SteamID64 / Web API Key) */
-  'settings.account.desc': 'Steam identity used for watch-pool sync (wishlist / owned games).',
+  'settings.account.desc': 'Steam identity used for Following sync (wishlist / owned games).',
   'settings.account.steamIdPlaceholder': 'e.g. 76561198000000000',
   'settings.account.lookup': 'Look up',
   'settings.account.localSteamLabel': 'Steam accounts on this PC',
   'settings.account.localSteamFind': 'Find local accounts',
-  'settings.account.localSteamHint': 'Reads saved account history, which may include accounts used in the past. Import saves only the SteamID64; it does not sign in or add a monitoring account.',
+  'settings.account.localSteamHint': 'Reads saved account history, which may include accounts used in the past. Import saves only the SteamID64; it does not sign in to any account.',
   'settings.account.localSteamNone': 'No local Steam account records were found.',
   'settings.account.localSteamFindFailed': 'Could not read local Steam accounts.',
   'settings.account.localSteamImport': 'Import',
@@ -224,7 +224,7 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.security.modeFailed': 'Switch failed; the previous mode was kept',
 
   /* Encrypted export (user data only) */
-  'settings.export.desc': 'Pack your local user data (credentials from the settings above, followed games, monitoring & alerts, bills, UI preferences, proxy subscriptions…) into a single passphrase-encrypted file for backup or migration.',
+  'settings.export.desc': 'Pack your local user data (credentials from the settings above, followed games & alerts, bills, UI preferences, proxy subscriptions…) into a single passphrase-encrypted file for backup or migration.',
   'settings.export.excludeNote': 'Note: the export does NOT include the bundled game catalog or price data (games, current prices, price history, bundles, FX rates, regions…). Those are public data rebuilt automatically, not part of your personal data.',
   'settings.export.passwordLabel': 'Export passphrase (min 6 characters)',
   'settings.export.passwordPlaceholder': 'Choose an export passphrase',

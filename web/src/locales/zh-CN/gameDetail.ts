@@ -31,7 +31,7 @@ const gameDetail = {
   'gameDetail.removed.retry': '重新探测',
   'gameDetail.removed.probing': '探测中…',
   'gameDetail.removed.requeued': '已发起重爬，稍后刷新查看',
-  'gameDetail.removed.cleared': '已清除下架标记，下一轮监控自动带上',
+  'gameDetail.removed.cleared': '已清除下架标记，下一轮更新自动带上',
 
   /* ── 无商店数据提示条（与下架共用「重新探测」入口）── */
   'gameDetail.storeMissing.tag': '暂无商店数据',

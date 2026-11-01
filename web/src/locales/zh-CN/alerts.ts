@@ -50,7 +50,7 @@ const alerts = {
 
   /* ── 规则表 / 触发历史表共用的表头 ── */
   'alerts.table.game': '游戏',
-  'alerts.table.region': '区服',
+  'alerts.table.region': '地区',
   'alerts.table.condition': '条件',
   'alerts.table.enabled': '启用',
   'alerts.table.lastTriggered': '上次触发',
@@ -160,7 +160,7 @@ const alerts = {
   'alerts.center.type.RULE_PRICE': '指定价格',
   'alerts.center.type.RULE_PCT': '指定折扣',
   'alerts.center.type.RULE_LOW': '低价规则',
-  'alerts.center.type.FEATURED': '精选与监控池折扣',
+  'alerts.center.type.FEATURED': '精选与我的关注折扣',
   'alerts.center.type.BUNDLE_DEAL': '捆绑包精选',
   'alerts.center.type.EPIC_FREE': 'Epic 免费游戏',
   'alerts.center.type.HB_CHOICE': 'Humble Choice',
@@ -256,7 +256,7 @@ const alerts = {
   'alerts.center.scope.followed': '我的关注',
   'alerts.center.scope.wishlist': '愿望单',
   'alerts.center.scope.owned': '我的库',
-  'alerts.center.scope.manual': '手动监控',
+  'alerts.center.scope.manual': '手动添加的关注',
   'alerts.center.scope.catalog': '全部收录游戏',
   'alerts.center.sort': '排序',
   'alerts.center.sort.discount': '折扣优先',
