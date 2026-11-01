@@ -1056,8 +1056,8 @@ async def _job_bills_sync() -> None:
         accounts = await account_service.list_accounts()
         if not accounts:
             await scheduler_bridge_note("bills_sync", {"skipped": "未绑定 Steam Cookie"})
-        for account in accounts:
-            await _sync_account_bills(account["steam_id"])
+        # 逐账号并发：同步锁按账号分键，同账号互斥、不同账号并行
+        await asyncio.gather(*(_sync_account_bills(a["steam_id"]) for a in accounts))
     except Exception:  # noqa: BLE001
         log_event(logger, "Steam 账单同步异常", level=logging.ERROR, exc_info=True)
 

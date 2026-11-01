@@ -365,13 +365,31 @@ async def _with_live_session_retry(run, cookies: str):
         return await run(fresh)
 
 
-_sync_lock = asyncio.Lock()
+# 同步锁按 steamid 分键：同账号串行防互踩，不同账号凭据与导入账互不相干、并行不互等
+_sync_locks: dict[str, asyncio.Lock] = {}
+
+
+def _sync_lock(steam_id: str) -> asyncio.Lock:
+    lock = _sync_locks.get(steam_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _sync_locks[steam_id] = lock
+    return lock
 
 
 async def sync_bills(*, force: bool = False, steam_id: str | None = None) -> dict:
-    if steam_id is None and _sync_lock.locked():
-        return {"ok": False, "status": "busy"}
-    async with _sync_lock:
+    target = steam_id
+    if target is None:
+        # 全局入口目标 = 当前账号（旧部署回退 KV Cookie 属主）；busy 短路防叠跑
+        from app.domains.account import service as account_service
+        from app.domains.account.steam_wallet import steam_id_from_cookies
+
+        target = steam_id_from_cookies(await account_service.get_cookies())
+        if not target:
+            return {"ok": False, "status": "no_cookie"}
+        if _sync_lock(target).locked():
+            return {"ok": False, "status": "busy"}
+    async with _sync_lock(target):
         try:
             return await _sync_bills_locked(force=force, steam_id=steam_id)
         except asyncio.CancelledError:
@@ -491,7 +509,7 @@ async def get_sync_snapshot() -> dict:
     from app.domains.settings import service as settings_service
 
     snap = await settings_service.get_value(KEY_BILLS_SYNC, None) or {}
-    return {**snap, "running": bool(snap.get("running")) and _sync_lock.locked()}
+    return {**snap, "running": bool(snap.get("running")) and any(l.locked() for l in _sync_locks.values())}
 
 
 async def list_imports() -> list[dict]:

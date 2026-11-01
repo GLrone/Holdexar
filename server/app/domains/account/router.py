@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from fastapi import APIRouter, HTTPException
@@ -14,6 +15,9 @@ from . import login, service
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/account", tags=["account"])
+
+# 后台全量拉取任务的持有引用（防 GC；任务自带逐段异常隔离）
+_REFRESH_TASKS: set[asyncio.Task] = set()
 
 
 class SteamCookiesPayload(BaseModel):
@@ -118,6 +122,29 @@ async def sync_wallet() -> AccountStatus:
     status = await service.get_status()
     status["sync_error"] = "" if sync.get("ok") else sync.get("error", "未知错误")
     return AccountStatus(**status)
+
+
+@router.post("/steam_id/{steam_id}/refresh")
+async def refresh_account(steam_id: str) -> dict:
+    """单账号聚合刷新：钱包+资料同步返回；账单/家庭组/愿望单后台依次拉。
+
+    便于管理的统一入口：对任一绑定账号一键拉全数据，不必逐域手动触发。
+    """
+    sid = steam_id.strip()
+    if not sid.isdigit():
+        raise HTTPException(400, "steam_id 需为数字 SteamID64")
+    if await service._get_row(sid) is None:
+        raise HTTPException(404, f"账号不存在: {sid}")
+    wallet = await service._sync_wallet_of(sid)
+    task = asyncio.create_task(service._post_bind_fetch(sid))
+    _REFRESH_TASKS.add(task)
+    task.add_done_callback(_REFRESH_TASKS.discard)
+    return {
+        "ok": bool(wallet.get("ok")),
+        "steamId": sid,
+        "wallet": wallet,
+        "queued": ["wishlist", "family", "bills"],
+    }
 
 
 # ── 应用内账号密码登录（Steam 认证 API 通道，见 login.py） ─────────────────
