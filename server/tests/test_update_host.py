@@ -70,9 +70,8 @@ def test_update_host_success(tmp_path):
     # 验证暂存清理
     assert not staging.exists()
 
-    # 验证事务终态
-    tx = layout.read_transaction(root)
-    assert tx["stage"] == layout.STAGE_COMMITTED
+    # 验证事务终态：提交即清场，指针与相容记录在 current.json
+    assert layout.read_transaction(root) is None
 
     # 验证日志与诊断报告生成
     diag_file = root / "logs" / "update-diagnosis.json"
@@ -587,8 +586,7 @@ def test_accepted_recovery_closes_success_diagnosis_without_repeating_ack(tmp_pa
         }), encoding="utf-8")
 
     assert update_host.recover_interrupted_update(root) is True
-    tx = layout.read_transaction(root)
-    assert tx["stage"] == layout.STAGE_COMMITTED
+    assert layout.read_transaction(root) is None
     diag = json.loads(diag_file.read_text(encoding="utf-8"))
     assert diag["attemptId"] == "accepted"
     assert diag["targetVersion"] == target
@@ -656,7 +654,9 @@ def test_update_preserves_explicit_external_data_directory(tmp_path, monkeypatch
     assert update_host.execute_update(
         root=root, staging_dir=staging, data_dir=data, launch_on_finish=False,
     ) is True
-    assert layout.read_transaction(root)["dataDir"] == str(data.resolve())
+    diag = json.loads((root / "logs" / "update-diagnosis.json").read_text(encoding="utf-8"))
+    assert diag["dataDir"] == str(data.resolve())
+    assert layout.read_current_state(root)["dataCompatibility"]["dataDir"] == str(data.resolve())
     assert not (root / "data" / "holdexar.db").exists()
     with sqlite3.connect(data / "holdexar.db") as db:
         assert db.execute("SELECT value FROM user_record").fetchone() == ("preserved",)
