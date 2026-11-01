@@ -316,6 +316,8 @@ watch(
   (now, before) => {
     if (before && !now && addedPending.value > 0) {
       addedPending.value = 0
+      // 添加时刻的列表响应还压在时间窗缓存里，先失效再取才见得到新条目
+      invalidateGetCache('/games')
       void load()
     }
   },
