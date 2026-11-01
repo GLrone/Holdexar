@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"holdexar/server-go/internal/store"
@@ -128,6 +130,8 @@ CREATE TABLE crawl_regions (
 CREATE TABLE fx_rates (currency_code TEXT PRIMARY KEY, rate_to_cny REAL NOT NULL DEFAULT 1.0, fetched_at TEXT);
 CREATE TABLE crawl_jobs (id INTEGER PRIMARY KEY, status TEXT, cycle_id INTEGER, stats_json TEXT);
 CREATE TABLE price_cycles (id INTEGER PRIMARY KEY, status TEXT);
+CREATE TABLE monitor_sources (target_type TEXT NOT NULL, target_id TEXT NOT NULL, source TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE wishlist_items (appid INTEGER NOT NULL, wishlisted INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1);
 `
 
 func newTestHandler(t *testing.T) (*httptest.Server, *sql.DB) {
@@ -421,18 +425,126 @@ func TestListQ(t *testing.T) {
 }
 
 // TestListParamValidation 形状越界回 400。
+// TestListParamValidation 422 形状（venv 实例实测锚点）：type/loc/msg/input/
+// ctx 逐字段一致，多错按字段声明序合并（Pydantic 非短路同径）。
 func TestListParamValidation(t *testing.T) {
 	srv, _ := newTestHandler(t)
-	for _, path := range []string{
-		"/api/v1/games?limit=0",
-		"/api/v1/games?limit=101",
-		"/api/v1/games?flag=bogus",
-		"/api/v1/games?minRating=101",
-	} {
-		status, body := getJSON(t, srv, path)
-		if status != 400 {
-			t.Fatalf("%s 应 400: %d %v", path, status, body)
+	longQ := strings.Repeat("x", 201)
+	cases := []struct {
+		query string
+		want  []valErr
+	}{
+		{"limit=0", []valErr{{Type: "greater_than_equal", Loc: []any{"query", "limit"},
+			Msg: "Input should be greater than or equal to 1", Input: "0",
+			Ctx: map[string]any{"ge": 1}}}},
+		{"limit=101", []valErr{{Type: "less_than_equal", Loc: []any{"query", "limit"},
+			Msg: "Input should be less than or equal to 100", Input: "101",
+			Ctx: map[string]any{"le": 100}}}},
+		{"limit=99999999999999999999", []valErr{{Type: "less_than_equal", Loc: []any{"query", "limit"},
+			Msg: "Input should be less than or equal to 100", Input: "99999999999999999999",
+			Ctx: map[string]any{"le": 100}}}},
+		{"limit=abc", []valErr{{Type: "int_parsing", Loc: []any{"query", "limit"},
+			Msg: "Input should be a valid integer, unable to parse string as an integer", Input: "abc"}}},
+		{"limit=", []valErr{{Type: "int_parsing", Loc: []any{"query", "limit"},
+			Msg: "Input should be a valid integer, unable to parse string as an integer", Input: ""}}},
+		{"minPrice=abc", []valErr{{Type: "int_parsing", Loc: []any{"query", "minPrice"},
+			Msg: "Input should be a valid integer, unable to parse string as an integer", Input: "abc"}}},
+		{"toleranceFen=-1", []valErr{{Type: "greater_than_equal", Loc: []any{"query", "toleranceFen"},
+			Msg: "Input should be greater than or equal to 0", Input: "-1",
+			Ctx: map[string]any{"ge": 0}}}},
+		{"minRating=101", []valErr{{Type: "less_than_equal", Loc: []any{"query", "minRating"},
+			Msg: "Input should be less than or equal to 100", Input: "101",
+			Ctx: map[string]any{"le": 100}}}},
+		{"flag=bogus", []valErr{{Type: "string_pattern_mismatch", Loc: []any{"query", "flag"},
+			Msg: "String should match pattern '" + flagPatternSrc + "'", Input: "bogus",
+			Ctx: map[string]any{"pattern": flagPatternSrc}}}},
+		{"giftSender=abc", []valErr{{Type: "string_pattern_mismatch", Loc: []any{"query", "giftSender"},
+			Msg: "String should match pattern '" + giftSenderPatternSrc + "'", Input: "abc",
+			Ctx: map[string]any{"pattern": giftSenderPatternSrc}}}},
+		{"diffType=bad", []valErr{{Type: "string_pattern_mismatch", Loc: []any{"query", "diffType"},
+			Msg: "String should match pattern '" + diffTypePatternSrc + "'", Input: "bad",
+			Ctx: map[string]any{"pattern": diffTypePatternSrc}}}},
+		{"onlyDiscounted=maybe", []valErr{{Type: "bool_parsing", Loc: []any{"query", "onlyDiscounted"},
+			Msg: "Input should be a valid boolean, unable to interpret input", Input: "maybe"}}},
+		{"hideOwned=maybe", []valErr{{Type: "bool_parsing", Loc: []any{"query", "hideOwned"},
+			Msg: "Input should be a valid boolean, unable to interpret input", Input: "maybe"}}},
+		{"q=" + longQ, []valErr{{Type: "string_too_long", Loc: []any{"query", "q"},
+			Msg: "String should have at most 200 characters", Input: longQ,
+			Ctx: map[string]any{"max_length": 200}}}},
+		{"region=abcdefg", []valErr{{Type: "string_too_long", Loc: []any{"query", "region"},
+			Msg: "String should have at most 6 characters", Input: "abcdefg",
+			Ctx: map[string]any{"max_length": 6}}}},
+		// 合并序 = 字段声明序（q → region → onlyDiscounted → toleranceFen）
+		{"q=" + longQ + "&region=abcdefg&onlyDiscounted=maybe&toleranceFen=-1", []valErr{
+			{Type: "string_too_long", Loc: []any{"query", "q"},
+				Msg: "String should have at most 200 characters", Input: longQ,
+				Ctx: map[string]any{"max_length": 200}},
+			{Type: "string_too_long", Loc: []any{"query", "region"},
+				Msg: "String should have at most 6 characters", Input: "abcdefg",
+				Ctx: map[string]any{"max_length": 6}},
+			{Type: "bool_parsing", Loc: []any{"query", "onlyDiscounted"},
+				Msg: "Input should be a valid boolean, unable to interpret input", Input: "maybe"},
+			{Type: "greater_than_equal", Loc: []any{"query", "toleranceFen"},
+				Msg: "Input should be greater than or equal to 0", Input: "-1",
+				Ctx: map[string]any{"ge": 0}},
+		}},
+	}
+	for _, tc := range cases {
+		status, body := getJSON(t, srv, "/api/v1/games?"+tc.query)
+		if status != http.StatusUnprocessableEntity {
+			t.Fatalf("?%s 应 422: %d %v", tc.query, status, body)
 		}
+		wantDetail(t, body, tc.want)
+	}
+
+	// 字节级锚点：与 Python 实例真实响应逐字节一致（含键序）。
+	resp, err := http.Get(srv.URL + "/api/v1/games?limit=0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"detail":[{"type":"greater_than_equal","loc":["query","limit"],"msg":"Input should be greater than or equal to 1","input":"0","ctx":{"ge":1}}]}`
+	if resp.StatusCode != http.StatusUnprocessableEntity || string(raw) != want {
+		t.Fatalf("字节锚点不符:\n got  %s %q\n want %q", resp.Status, raw, want)
+	}
+}
+
+// TestListParamLaxAccepted 宽松解析锚点：空白、下划线、整值小数、
+// pydantic 布尔集合全部接受（200）。
+func TestListParamLaxAccepted(t *testing.T) {
+	srv, _ := newTestHandler(t)
+	for _, query := range []string{
+		"limit=%205", "limit=1_0", "limit=5.0", "limit=%2B5", "limit=40",
+		"onlyDiscounted=ON", "onlyDiscounted=yes", "onlyDiscounted=Y", "onlyDiscounted=1",
+		"isLowest=0", "removed=OFF",
+	} {
+		status, body := getJSON(t, srv, "/api/v1/games?"+query)
+		if status != http.StatusOK {
+			t.Fatalf("?%s 应 200: %d %v", query, status, body)
+		}
+	}
+}
+
+func wantDetail(t *testing.T, body map[string]any, want []valErr) {
+	t.Helper()
+	raw, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var expected []any
+	if err := json.Unmarshal(raw, &expected); err != nil {
+		t.Fatal(err)
+	}
+	detail, ok := body["detail"].([]any)
+	if !ok {
+		t.Fatalf("detail 应为数组: %v", body)
+	}
+	if !reflect.DeepEqual(expected, detail) {
+		t.Fatalf("422 形状不符:\n got  %v\n want %v", detail, expected)
 	}
 }
 

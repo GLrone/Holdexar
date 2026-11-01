@@ -6,11 +6,16 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"holdexar/server-go/internal/wishlist"
 )
 
 const toleranceFenDefault = 500 // 近似全区最低容差（分）
@@ -25,212 +30,277 @@ const (
 		" g.diff_fen / 1000 DESC, g.review_count / 1000 DESC, g.positive_rate DESC"
 )
 
+// 列表查询参数正则约束；*Src 常量同时是 422 ctx 里的 pattern 原文（照抄
+// Python Query(pattern=...)）。
 var (
-	flagPattern       = regexp.MustCompile(`^(|hl|pp|any|(new|flat|nonhl)(,(new|flat|nonhl))*)$`)
-	giftModePattern   = regexp.MustCompile(`^(|out|in)$`)
-	giftSenderPattern = regexp.MustCompile(`^(|[a-z]{2})$`)
-	giftReceiversPat  = regexp.MustCompile(`^([a-z]{2}(,[a-z]{2})*)?$`)
-	diffTypePattern   = regexp.MustCompile(`^(absolute|percent)$`)
+	flagPatternSrc       = `^(|hl|pp|any|(new|flat|nonhl)(,(new|flat|nonhl))*)$`
+	giftModePatternSrc   = `^(|out|in)$`
+	giftSenderPatternSrc = `^(|[a-z]{2})$`
+	giftReceiversPatSrc  = `^([a-z]{2}(,[a-z]{2})*)?$`
+	diffTypePatternSrc   = `^(absolute|percent)$`
+
+	flagPattern       = regexp.MustCompile(flagPatternSrc)
+	giftModePattern   = regexp.MustCompile(giftModePatternSrc)
+	giftSenderPattern = regexp.MustCompile(giftSenderPatternSrc)
+	giftReceiversPat  = regexp.MustCompile(giftReceiversPatSrc)
+	diffTypePattern   = regexp.MustCompile(diffTypePatternSrc)
 )
 
 type listParams struct {
-	sort           string
-	limit          int
-	after          string
-	q              string
-	region         string
-	filterMode     string
-	onlyDiscounted bool
-	isLowest       bool
-	flag           string
-	giftMode       string
-	giftSender     string
-	giftReceivers  string
-	minRating      int
-	maxRating      *int
-	minReviews     int
-	maxReviews     *int
-	minPrice       *int
-	maxPrice       *int
-	onlyHb         bool
-	onlyEpic       bool
-	onlyXgp        bool
-	diffMinFen     *int
-	diffMaxFen     *int
-	diffType       string
-	toleranceFen   *int
-	strictLowest   bool
-	excludeDlc     bool
-	removed        bool
+	sort             string
+	limit            int
+	after            string
+	q                string
+	region           string
+	filterMode       string
+	onlyDiscounted   bool
+	isLowest         bool
+	flag             string
+	giftMode         string
+	giftSender       string
+	giftReceivers    string
+	minRating        int
+	maxRating        *int
+	minReviews       int
+	maxReviews       *int
+	minPrice         *int
+	maxPrice         *int
+	onlyHb           bool
+	onlyEpic         bool
+	onlyXgp          bool
+	diffMinFen       *int
+	diffMaxFen       *int
+	diffType         string
+	toleranceFen     *int
+	strictLowest     bool
+	excludeDlc       bool
+	removed          bool
+	wishlistPriority bool
 }
 
-// parseListParams 查询参数解析；形状越界回 false（400）。
+// ---- 列表查询参数校验（422 形状对齐 FastAPI/Pydantic 实测锚点） ----
+
+// valErr 校验错误项：type/loc/msg/input/ctx 与 Pydantic 查询参数 422 输出
+// 逐字段一致（ctx 仅约束类错误携带）。
+type valErr struct {
+	Type  string         `json:"type"`
+	Loc   []any          `json:"loc"`
+	Msg   string         `json:"msg"`
+	Input any            `json:"input"`
+	Ctx   map[string]any `json:"ctx,omitempty"`
+}
+
+const (
+	errIntParsing     = "int_parsing"
+	errIntParsingMsg  = "Input should be a valid integer, unable to parse string as an integer"
+	errBoolParsing    = "bool_parsing"
+	errBoolParsingMsg = "Input should be a valid boolean, unable to interpret input"
+)
+
+// pyIntRe 宽松整数形状：可选符号、数字间单下划线、整值小数（"5.0"）。
+var pyIntRe = regexp.MustCompile(`^[+-]?[0-9](_?[0-9])*(\.0(_?0+)*)?$`)
+
+// pyInt 宽松整数解析（Pydantic lax 同径，实测锚点：首尾空白忽略、下划线为
+// 数字分隔、"5.0" 收整；"1e2"/"5.5"/"0x10"/"5."/空串拒绝）。越界大数钳到
+// int64 极值交约束检查（Python 任意精度同效：出约束错误而非解析错误）。
+func pyInt(s string) (int, bool) {
+	t := strings.TrimSpace(s)
+	if !pyIntRe.MatchString(t) {
+		return 0, false
+	}
+	t = strings.ReplaceAll(t, "_", "")
+	if i := strings.IndexByte(t, '.'); i >= 0 {
+		t = t[:i]
+	}
+	v, err := strconv.Atoi(t)
+	if err != nil {
+		// 形状已过正则，仅可能越界
+		if strings.HasPrefix(t, "-") {
+			return math.MinInt64, true
+		}
+		return math.MaxInt64, true
+	}
+	return v, true
+}
+
+func intPtr(v int) *int { return &v }
+
+func queryErr(errType, name, msg string, input any, ctx map[string]any) valErr {
+	return valErr{Type: errType, Loc: []any{"query", name}, Msg: msg, Input: input, Ctx: ctx}
+}
+
+// checkInt 整数参数：q 中存在时宽松解析并查 ge/le；错误追加 errs。
+// 返回（值, 在场, 合法）；缺席时值无意义。
+func checkInt(errs *[]valErr, q url.Values, name string, ge, le *int) (int, bool, bool) {
+	vals, ok := q[name]
+	if !ok {
+		return 0, false, true
+	}
+	raw := vals[0]
+	v, ok := pyInt(raw)
+	if !ok {
+		*errs = append(*errs, queryErr(errIntParsing, name, errIntParsingMsg, raw, nil))
+		return 0, true, false
+	}
+	if ge != nil && v < *ge {
+		*errs = append(*errs, queryErr("greater_than_equal", name,
+			fmt.Sprintf("Input should be greater than or equal to %d", *ge), raw,
+			map[string]any{"ge": *ge}))
+		return v, true, false
+	}
+	if le != nil && v > *le {
+		*errs = append(*errs, queryErr("less_than_equal", name,
+			fmt.Sprintf("Input should be less than or equal to %d", *le), raw,
+			map[string]any{"le": *le}))
+		return v, true, false
+	}
+	return v, true, true
+}
+
+// checkBool 布尔参数（Pydantic lax 集合：true/false/t/f/y/n/yes/no/on/off/
+// 0/1，大小写不敏感）；非法追加 bool_parsing。返回（值, 在场且合法）。
+func checkBool(errs *[]valErr, q url.Values, name string) (bool, bool) {
+	vals, ok := q[name]
+	if !ok {
+		return false, false
+	}
+	raw := vals[0]
+	switch strings.ToLower(raw) {
+	case "true", "t", "y", "yes", "on", "1":
+		return true, true
+	case "false", "f", "n", "no", "off", "0":
+		return false, true
+	}
+	*errs = append(*errs, queryErr(errBoolParsing, name, errBoolParsingMsg, raw, nil))
+	return false, false
+}
+
+// checkStrMax 字符串参数最长 maxLen（按字符计数非字节，Pydantic max_length
+// 同径）。值恒返回（供后续默认填充），超长追加 string_too_long。
+func checkStrMax(errs *[]valErr, q url.Values, name string, maxLen int) string {
+	vals, ok := q[name]
+	if !ok {
+		return ""
+	}
+	s := vals[0]
+	if utf8.RuneCountInString(s) > maxLen {
+		*errs = append(*errs, queryErr("string_too_long", name,
+			fmt.Sprintf("String should have at most %d characters", maxLen), s,
+			map[string]any{"max_length": maxLen}))
+	}
+	return s
+}
+
+// checkStrPattern 正则约束（pattern 原文进 msg 与 ctx，照抄 Python）。
+func checkStrPattern(errs *[]valErr, q url.Values, name, pattern string, re *regexp.Regexp) string {
+	vals, ok := q[name]
+	if !ok {
+		return ""
+	}
+	s := vals[0]
+	if !re.MatchString(s) {
+		*errs = append(*errs, queryErr("string_pattern_mismatch", name,
+			fmt.Sprintf("String should match pattern '%s'", pattern), s,
+			map[string]any{"pattern": pattern}))
+	}
+	return s
+}
+
+// parseListParams 查询参数解析：约束全集与 422 形状对齐 FastAPI/Pydantic
+// 实测锚点，错误按字段声明序合并（Pydantic 非短路同径）。
 // hideOwned / hideFamilySharing / wishlistPriority 依赖其他域（wishlist / account），
-// 本包不实现：对应开关忽略，行为以无关注集 / 无愿望单集的降级路径呈现。
-func parseListParams(r *http.Request) (listParams, bool) {
+// 本包不实现：仅校验布尔形状，行为以无关注集 / 无愿望单集的降级路径呈现。
+func parseListParams(r *http.Request) (listParams, []valErr) {
 	q := r.URL.Query()
 	p := listParams{
-		sort:          q.Get("sort"),
-		after:         q.Get("after"),
-		q:             q.Get("q"),
-		region:        q.Get("region"),
-		filterMode:    q.Get("filterMode"),
-		flag:          q.Get("flag"),
-		giftMode:      q.Get("giftMode"),
-		giftSender:    q.Get("giftSender"),
-		giftReceivers: q.Get("giftReceivers"),
-		diffType:      q.Get("diffType"),
+		sort:       q.Get("sort"),
+		after:      q.Get("after"),
+		filterMode: q.Get("filterMode"),
 	}
+	var errs []valErr
 	if p.sort == "" {
 		p.sort = "default"
 	}
 	if p.filterMode == "" {
 		p.filterMode = "global"
 	}
+
+	p.q = checkStrMax(&errs, q, "q", 200)
+	p.region = checkStrMax(&errs, q, "region", 6)
+
+	p.limit = 40
+	if v, present, ok := checkInt(&errs, q, "limit", intPtr(1), intPtr(100)); present && ok {
+		p.limit = v
+	}
+	if v, ok := checkBool(&errs, q, "onlyDiscounted"); ok {
+		p.onlyDiscounted = v
+	}
+	if v, ok := checkBool(&errs, q, "isLowest"); ok {
+		p.isLowest = v
+	}
+	p.flag = checkStrPattern(&errs, q, "flag", flagPatternSrc, flagPattern)
+	p.giftMode = checkStrPattern(&errs, q, "giftMode", giftModePatternSrc, giftModePattern)
+	p.giftSender = checkStrPattern(&errs, q, "giftSender", giftSenderPatternSrc, giftSenderPattern)
+	p.giftReceivers = checkStrPattern(&errs, q, "giftReceivers", giftReceiversPatSrc, giftReceiversPat)
+	if v, present, ok := checkInt(&errs, q, "minRating", intPtr(0), intPtr(100)); present && ok {
+		p.minRating = v
+	}
+	if v, present, ok := checkInt(&errs, q, "maxRating", intPtr(0), intPtr(100)); present && ok {
+		p.maxRating = &v
+	}
+	if v, present, ok := checkInt(&errs, q, "minReviews", intPtr(0), nil); present && ok {
+		p.minReviews = v
+	}
+	if v, present, ok := checkInt(&errs, q, "maxReviews", intPtr(0), nil); present && ok {
+		p.maxReviews = &v
+	}
+	if v, present, ok := checkInt(&errs, q, "minPrice", nil, nil); present && ok {
+		p.minPrice = &v
+	}
+	if v, present, ok := checkInt(&errs, q, "maxPrice", nil, nil); present && ok {
+		p.maxPrice = &v
+	}
+	if v, ok := checkBool(&errs, q, "onlyHb"); ok {
+		p.onlyHb = v
+	}
+	if v, ok := checkBool(&errs, q, "onlyEpic"); ok {
+		p.onlyEpic = v
+	}
+	if v, ok := checkBool(&errs, q, "onlyXgp"); ok {
+		p.onlyXgp = v
+	}
+	checkBool(&errs, q, "hideOwned")
+	checkBool(&errs, q, "hideFamilySharing")
+	if v, present, ok := checkInt(&errs, q, "diffMin", nil, nil); present && ok {
+		p.diffMinFen = &v
+	}
+	if v, present, ok := checkInt(&errs, q, "diffMax", nil, nil); present && ok {
+		p.diffMaxFen = &v
+	}
+	p.diffType = checkStrPattern(&errs, q, "diffType", diffTypePatternSrc, diffTypePattern)
 	if p.diffType == "" {
 		p.diffType = "absolute"
 	}
-	if len(p.q) > 200 || len(p.region) > 6 {
-		return p, false
+	if v, present, ok := checkInt(&errs, q, "toleranceFen", intPtr(0), nil); present && ok {
+		p.toleranceFen = &v
 	}
-	if !flagPattern.MatchString(p.flag) || !giftModePattern.MatchString(p.giftMode) ||
-		!giftSenderPattern.MatchString(p.giftSender) || !giftReceiversPat.MatchString(p.giftReceivers) ||
-		!diffTypePattern.MatchString(p.diffType) {
-		return p, false
+	if v, ok := checkBool(&errs, q, "strictLowest"); ok {
+		p.strictLowest = v
+	}
+	if v, ok := checkBool(&errs, q, "wishlistPriority"); ok {
+		p.wishlistPriority = v
+	}
+	if v, ok := checkBool(&errs, q, "excludeDlc"); ok {
+		p.excludeDlc = v
+	}
+	if v, ok := checkBool(&errs, q, "removed"); ok {
+		p.removed = v
+	}
+	if len(errs) > 0 {
+		return p, errs
 	}
 	p.region = strings.ToUpper(strings.TrimSpace(p.region))
-
-	limit := 40
-	if v, ok := intParam(q, "limit"); ok {
-		if v == nil {
-			return p, false
-		}
-		limit = *v
-	}
-	if limit < 1 || limit > 100 {
-		return p, false
-	}
-	p.limit = limit
-
-	var err error
-	if p.onlyDiscounted, err = boolParam(q, "onlyDiscounted"); err != nil {
-		return p, false
-	}
-	if p.isLowest, err = boolParam(q, "isLowest"); err != nil {
-		return p, false
-	}
-	if p.onlyHb, err = boolParam(q, "onlyHb"); err != nil {
-		return p, false
-	}
-	if p.onlyEpic, err = boolParam(q, "onlyEpic"); err != nil {
-		return p, false
-	}
-	if p.onlyXgp, err = boolParam(q, "onlyXgp"); err != nil {
-		return p, false
-	}
-	if p.strictLowest, err = boolParam(q, "strictLowest"); err != nil {
-		return p, false
-	}
-	if p.excludeDlc, err = boolParam(q, "excludeDlc"); err != nil {
-		return p, false
-	}
-	if p.removed, err = boolParam(q, "removed"); err != nil {
-		return p, false
-	}
-
-	minRating := 0
-	if v, ok := intParam(q, "minRating"); ok {
-		if v == nil {
-			return p, false
-		}
-		minRating = *v
-	}
-	if minRating < 0 || minRating > 100 {
-		return p, false
-	}
-	p.minRating = minRating
-	if v, ok := intParam(q, "maxRating"); ok {
-		if v == nil || *v < 0 || *v > 100 {
-			return p, false
-		}
-		p.maxRating = v
-	}
-	minReviews := 0
-	if v, ok := intParam(q, "minReviews"); ok {
-		if v == nil {
-			return p, false
-		}
-		minReviews = *v
-	}
-	if minReviews < 0 {
-		return p, false
-	}
-	p.minReviews = minReviews
-	if v, ok := intParam(q, "maxReviews"); ok {
-		if v == nil || *v < 0 {
-			return p, false
-		}
-		p.maxReviews = v
-	}
-	if v, ok := intParam(q, "minPrice"); ok {
-		if v == nil {
-			return p, false
-		}
-		p.minPrice = v
-	}
-	if v, ok := intParam(q, "maxPrice"); ok {
-		if v == nil {
-			return p, false
-		}
-		p.maxPrice = v
-	}
-	if v, ok := intParam(q, "diffMin"); ok {
-		if v == nil {
-			return p, false
-		}
-		p.diffMinFen = v
-	}
-	if v, ok := intParam(q, "diffMax"); ok {
-		if v == nil {
-			return p, false
-		}
-		p.diffMaxFen = v
-	}
-	if v, ok := intParam(q, "toleranceFen"); ok {
-		if v == nil || *v < 0 {
-			return p, false
-		}
-		p.toleranceFen = v
-	}
-	return p, true
-}
-
-func intParam(q map[string][]string, key string) (*int, bool) {
-	vals, ok := q[key]
-	if !ok {
-		return nil, false
-	}
-	s := vals[0]
-	if s == "" {
-		return nil, true
-	}
-	v, err := strconv.Atoi(s)
-	if err != nil {
-		return nil, true
-	}
-	return &v, true
-}
-
-func boolParam(q map[string][]string, key string) (bool, error) {
-	vals, ok := q[key]
-	if !ok {
-		return false, nil
-	}
-	v, err := strconv.ParseBool(vals[0])
-	if err != nil {
-		return false, err
-	}
-	return v, nil
+	return p, nil
 }
 
 func parseAppID(s string) (int64, error) {
@@ -437,6 +507,15 @@ func (h *handler) listGames(ctx context.Context, p listParams) (map[string]any, 
 	if isLocked {
 		order = "COALESCE(g.min_cny_fen, 999999) ASC, g.appid DESC"
 	}
+	// 置顶前缀：关注位次 → 愿望单位次 → 原排序（对齐 list_games 的
+	// fav_order + wish_order 前置；空集不注入）。
+	prefixSQL, prefixArgs, err := wishlist.OrderPrefixFor(ctx, h.db, p.wishlistPriority)
+	if err != nil {
+		return nil, err
+	}
+	if prefixSQL != "" {
+		order = prefixSQL + ", " + order
+	}
 	query := "SELECT g.appid, g.name, g.name_en, g.type, g.positive_rate, g.review_count," +
 		" g.is_adult, g.xgp_tier, g.is_visual_novel, g.release_date, g.min_cny_fen, g.diff_fen," +
 		" g.smart_score, g.header_image, g.hl_flag, g.pp_flag, CAST(g.pp_changed_at AS TEXT), CAST(g.updated_at AS TEXT)," +
@@ -446,7 +525,9 @@ func (h *handler) listGames(ctx context.Context, p listParams) (map[string]any, 
 		" cp1.discount_end_ts AS cn_discount_end_ts, cp1.cny_fen AS cn_cny_fen" + srCol +
 		" FROM games g" + join + srJoin + " WHERE " + where +
 		" ORDER BY " + order + " LIMIT ? OFFSET ?"
-	rows, err := h.db.QueryContext(ctx, query, append(headArgs, p.limit+1, offset)...)
+	allArgs := append(headArgs, prefixArgs...)
+	allArgs = append(allArgs, p.limit+1, offset)
+	rows, err := h.db.QueryContext(ctx, query, allArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("游戏列表查询失败: %w", err)
 	}

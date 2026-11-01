@@ -21,6 +21,7 @@ import (
 	"holdexar/server-go/internal/eventstream"
 	"holdexar/server-go/internal/games"
 	"holdexar/server-go/internal/httpapi"
+	"holdexar/server-go/internal/middleware"
 	"holdexar/server-go/internal/notifications"
 	"holdexar/server-go/internal/rates"
 	"holdexar/server-go/internal/regions"
@@ -111,7 +112,18 @@ func main() {
 	}
 
 	var tickets *access.BootstrapFile
-	handler := http.Handler(gate.Middleware(server.Handler()))
+	// 叠序对齐现网：安全响应头（最外）→ 访问闸 → CORS → 路由。
+	corsMW := middleware.CORS{
+		AllowOrigins: []string{
+			"http://localhost:5173", "http://127.0.0.1:5173",
+			"http://localhost:8080", "http://127.0.0.1:8080",
+		},
+		AllowCredentials: true,
+		AllowMethods:     []string{"*"},
+	}
+	headersMW := middleware.Headers{WriteProtected: func() bool { return server.UpdateWriteProtected }}
+	handler := http.Handler(headersMW.Middleware(
+		gate.Middleware(corsMW.Middleware(server.Handler()))))
 	if *bootstrapFileFlag != "" {
 		tickets = access.NewBootstrapFile(*bootstrapFileFlag)
 		tickets.Log = logLine
