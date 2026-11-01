@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -36,6 +37,7 @@ func main() {
 	dataDirFlag := flag.String("data-dir", "", "显式数据目录，跳过自动判定")
 	devSession := flag.Bool("dev-session", false, "开放开发态会话发放通道（发行版无此入口）")
 	mcpEnabled := flag.Bool("mcp", false, "启用 MCP 面（等价环境变量 HOLDEXAR_MCP=1）")
+	bootstrapFileFlag := flag.String("bootstrap-file", "", "健康就绪后写入一次性引导票据的文件路径（桌面壳桥接，父目录由调用方创建）")
 	flag.Parse()
 
 	// 日志接线点：stderr 之外同步写入环形缓冲（日志页 SSE 的回放事实源）；
@@ -107,15 +109,39 @@ func main() {
 			settings.MCPStatus = agent.MCPStatus
 		},
 	}
-	httpServer := &http.Server{Addr: *addr, Handler: gate.Middleware(server.Handler())}
+
+	var tickets *access.BootstrapFile
+	handler := http.Handler(gate.Middleware(server.Handler()))
+	if *bootstrapFileFlag != "" {
+		tickets = access.NewBootstrapFile(*bootstrapFileFlag)
+		tickets.Log = logLine
+		handler = tickets.Middleware(handler)
+	}
+	httpServer := &http.Server{Addr: *addr, Handler: handler}
 
 	logLine("数据目录：%s", dataDir)
 	logLine("数据库：%s", dbPath)
 	logLine("监听地址：%s", *addr)
 
+	listener, err := net.Listen("tcp", *addr)
+	if err != nil {
+		logLine("服务启动失败：%v", err)
+		os.Exit(1)
+	}
+	// 监听就绪即健康可用（路由已装配完成）：此刻发布引导票据，壳侧
+	// health 轮询通过时票据必然已在场。
+	if tickets != nil {
+		if err := tickets.Publish(systemx.CreateBootstrap()); err != nil {
+			logLine("%v", err)
+			os.Exit(1)
+		}
+		defer tickets.Close()
+		logLine("引导票据就绪：%s", *bootstrapFileFlag)
+	}
+
 	serveErr := make(chan error, 1)
 	go func() {
-		serveErr <- httpServer.ListenAndServe()
+		serveErr <- httpServer.Serve(listener)
 	}()
 
 	stop := make(chan os.Signal, 1)
