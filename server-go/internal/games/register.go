@@ -23,9 +23,9 @@ type handler struct {
 }
 
 func (h *handler) handleList(w http.ResponseWriter, r *http.Request) {
-	p, ok := parseListParams(r)
-	if !ok {
-		writeJSON(w, http.StatusBadRequest, detailNull())
+	p, errs := parseListParams(r)
+	if len(errs) > 0 {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": errs})
 		return
 	}
 	resp, err := h.listGames(r.Context(), p)
