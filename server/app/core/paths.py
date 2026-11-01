@@ -65,7 +65,9 @@ def install_root() -> Path:
 
 
 def staging_dir() -> Path:
-    return install_root() / "update-staging"
+    from app.core.app_info import STAGING_DIR_NAME
+
+    return install_root() / STAGING_DIR_NAME
 
 
 def logs_dir() -> Path:

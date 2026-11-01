@@ -792,20 +792,6 @@ def _handoff_pending_update() -> bool:
     return True
 
 
-def _mark_swap_failed(target: Path) -> None:
-    """登记换装失败的安装状态。
-
-    本进程正跑在暂存载荷里，删不掉自己的目录；作废暂存由下一次启动的现装进程
-    （`_cleanup_staging_leftover`）执行，这里只落标记。
-    """
-    try:
-        _swap_failed_flag().write_text(
-            f"更新未完成 target={target}\n", encoding="utf-8"
-        )
-    except Exception as e:  # noqa: BLE001 —— 标记写不进去不阻断回滚后的正常启动
-        _log_update(f"写换装失败标记失败：{e}")
-
-
 def _should_clean_old_dir(old_dir: Path) -> bool:
     """`__old__` 清理判据：存在，且没有换装失败标记。"""
     return old_dir.exists() and not _swap_failed_flag().is_file()
@@ -831,12 +817,12 @@ def _cleanup_staging_leftover() -> None:
     否则它会一直占着几百兆，且 manifest 留着会让前端一直报「已下载待重启」。
     """
 
-    staging = _data_dir() / STAGING_DIR_NAME
-    if not staging.is_dir():
-        return
-    if (staging / _MANIFEST_NAME).is_file() and not _swap_failed_flag().is_file():
-        return
-    shutil.rmtree(staging, ignore_errors=True)
+    for staging in (_app_root() / STAGING_DIR_NAME, _data_dir() / STAGING_DIR_NAME):
+        if not staging.is_dir():
+            continue
+        if (staging / _MANIFEST_NAME).is_file() and not _swap_failed_flag().is_file():
+            continue
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def _browser_fallback(url: str, reason: str) -> None:
