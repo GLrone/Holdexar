@@ -55,6 +55,7 @@ from app.core.app_info import (  # noqa: E402
     HANDOFF_LEDGER_NAME,
     HANDOFF_UNSUPPORTED_MARK,
     HEALTH_TIMEOUT,
+    MIGRATION_MAX_DURATION,
     STAGING_DIR_NAME,
     STAGING_MANIFEST_NAME,
     SWAP_FAILED_FLAG,
@@ -1932,21 +1933,33 @@ def main() -> None:
 
     ready = threading.Event()
     error_box: list[str] = []
-    threading.Thread(target=_start_server, args=(ready, error_box), daemon=True).start()
+    server_thread = threading.Thread(target=_start_server, args=(ready, error_box), daemon=True)
+    server_thread.start()
     if lock is not None:
         threading.Thread(target=_listen_activation, args=(lock,), daemon=True).start()
 
     url = os.environ.get(f"{ENV_PREFIX}DEV_URL") or f"http://{SERVER_HOST}:{SERVER_PORT}"
     if args.server:
-        # 受保护验收实例（带事务标识）：等待预算归宿主管的验收循环，本地不再自尽
-        if not os.environ.get(f"{ENV_PREFIX}UPDATE_ATTEMPT_ID") and not _wait_health(HEALTH_TIMEOUT):
-            detail = "".join(error_box)
-            print("服务启动失败：")
-            if detail:
-                print(detail)
-            else:
-                print(f"{HEALTH_TIMEOUT:.0f}s 内健康检查未通过")
-            sys.exit(1)
+        if not os.environ.get(f"{ENV_PREFIX}UPDATE_ATTEMPT_ID"):
+            if not _wait_health(HEALTH_TIMEOUT):
+                detail = "".join(error_box)
+                print("服务启动失败：")
+                if detail:
+                    print(detail)
+                else:
+                    print(f"{HEALTH_TIMEOUT:.0f}s 内健康检查未通过")
+                sys.exit(1)
+        else:
+            # 受保护验收实例：等待预算归宿主；仅服务线程死亡（迁移异常等）或总预算
+            # 耗尽时自退，宿主据此快速归因，不与宿主的迁移存活信号抢判定
+            budget = time.monotonic() + MIGRATION_MAX_DURATION
+            while not _wait_health(2.0):
+                if not server_thread.is_alive() or time.monotonic() > budget:
+                    detail = "".join(error_box)
+                    print("服务启动失败：")
+                    if detail:
+                        print(detail)
+                    sys.exit(1)
         print(f"服务已就绪：{url}（Ctrl+C 退出）")
     if _background_mode:
         try:
