@@ -6,13 +6,16 @@
     python desktop/main.py                # 桌面窗口模式
     python desktop/main.py --server       # 无窗口（仅本地服务）
     HOLDEXAR_DEV_URL=http://localhost:8080 python desktop/main.py    # 加载 Vite 开发服务器
+    HOLDEXAR_SERVER_EXE=.../serverd.exe python desktop/main.py    # 外部服务子进程模式
 """
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -205,13 +208,112 @@ def _negotiate_ports() -> None:
 _LOCK_FALLBACKS = (28966, 28967, 28968, 29965, 29966)
 
 
+# 外部服务子进程模式：HOLDEXAR_SERVER_EXE 指向本地服务可执行文件时，
+# 壳以子进程方式承载本地服务（数据目录/端口与壳同源）；会话经一次性
+# 引导票据文件交接（服务端写、壳读、引导端点换 Cookie）。未设置时
+# 维持进程内 uvicorn 路径。
+_external_server: dict = {"proc": None, "ticket": None}
+_BOOTSTRAP_TICKET_NAME = "server-bootstrap.ticket"
+
+
+def _server_exe() -> Path | None:
+    """外部服务可执行文件路径；环境变量已设置但文件缺失按启动失败处理。"""
+    raw = os.environ.get(f"{ENV_PREFIX}SERVER_EXE", "").strip()
+    if not raw:
+        return None
+    exe = Path(raw)
+    if not exe.is_file():
+        raise FileNotFoundError(f"外部服务程序不存在：{exe}")
+    return exe
+
+
+def _bootstrap_ticket_path() -> Path:
+    """引导票据文件路径：票据文件放在数据目录，父目录由壳负责创建。"""
+    return _data_dir() / _BOOTSTRAP_TICKET_NAME
+
+
+def _wait_bootstrap_nonce(timeout: float = 3.0) -> str:
+    """外部服务模式：轮询票据文件取一次性 nonce（服务端健康就绪后写入）。"""
+    ticket = _external_server.get("ticket")
+    if ticket is None:
+        return ""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            nonce = ticket.read_text(encoding="utf-8").strip()
+        except OSError:
+            nonce = ""
+        if nonce:
+            return nonce
+        time.sleep(0.05)
+    return ""
+
+
+def _stop_server_process() -> None:
+    """回收外部服务子进程；os._exit 不跑解释器清理，退出点须显式调用。"""
+    proc = _external_server.get("proc")
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+    except Exception:  # noqa: BLE001 —— 回收失败不阻断退出（残留实例由单实例探活接管）
+        pass
+
+
 def _start_server(ready: threading.Event, error_box: list[str]) -> None:
     # sys.path 已在模块头部按开发/打包态配好；此处无需再注入
+    if os.environ.get(f"{ENV_PREFIX}SERVER_EXE", "").strip():
+        _start_server_process(ready, error_box)
+        return
     try:
         import uvicorn
         from app.main import app
 
         uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT, log_level="info")
+    except Exception:  # noqa: BLE001 —— 启动失败要完整带回主线程
+        error_box.append(traceback.format_exc())
+    finally:
+        ready.set()
+        _activation.set()
+        if _background_mode and _ui_active:
+            os._exit(1)
+
+
+def _start_server_process(ready: threading.Event, error_box: list[str]) -> None:
+    """外部服务子进程模式：拉起子进程承载本地服务，本线程陪跑至其退出。"""
+    try:
+        exe = _server_exe()
+        ticket = _bootstrap_ticket_path()
+        ticket.parent.mkdir(parents=True, exist_ok=True)
+        _remove_path(ticket)  # 清掉上次实例可能残留的旧票据，避免壳读到已失效 nonce
+        proc = subprocess.Popen(
+            [
+                str(exe),
+                "-addr", f"{SERVER_HOST}:{SERVER_PORT}",
+                "-data-dir", str(_data_dir()),
+                "--bootstrap-file", str(ticket),
+            ],
+            cwd=str(exe.parent),
+            # 独立进程组：控制台 Ctrl+C/Ctrl+Break 只到达壳，子进程的
+            # 生命周期由壳的退出路径统一回收（避免双重终止路径）
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+        _external_server["proc"] = proc
+        _external_server["ticket"] = ticket
+        print(f"[服务] 外部服务进程 {exe.name}（PID {proc.pid}）")
+        proc.wait()
+        if ready.is_set():
+            print(f"[退出] 外部服务进程已结束（exit={proc.returncode}）")
+        else:
+            error_box.append(
+                f"外部服务进程未能启动（exit={proc.returncode}），详见其控制台输出。"
+            )
     except Exception:  # noqa: BLE001 —— 启动失败要完整带回主线程
         error_box.append(traceback.format_exc())
     finally:
@@ -325,6 +427,7 @@ def _watch_launcher() -> None:
             kernel32.CloseHandle(handle)
             if _background_mode:
                 return
+            _stop_server_process()
             print(f"[退出] 启动器进程 {ppid} 已终止，本实例随之退出。")
             sys.stdout.flush()
             os._exit(0)
@@ -403,12 +506,16 @@ def _server_port_listening() -> bool:
 def _session_entry_url(app_url: str) -> str:
     """带一次性票据的入口地址：先换 HttpOnly 会话 Cookie 再跳回首页。
 
-    会话令牌只在后端进程内存里（见 app.core.access），页面自己拿不到。
-    桌面壳与后端同进程，直接取票据；导航到 bootstrap 端点后服务端写
-    Cookie 并 303 回首页，之后页面所有请求（含 EventSource）自动携带。
-    取不到票据时退回裸地址——至少让页面能加载并显示「缺少会话」提示，
-    比窗口停在转圈页可诊断。
+    会话令牌只在服务进程内存里（见 app.core.access），页面自己拿不到。
+    进程内模式直接取票据；外部服务模式经引导票据文件交接——服务端健康
+    就绪后把一次性 nonce 写进约定文件，壳读取后导航 bootstrap 端点，
+    服务端写 Cookie 并 303 回首页，之后页面所有请求（含 EventSource）
+    自动携带。取不到票据时退回裸地址——至少让页面能加载并显示
+    「缺少会话」提示，比窗口停在转圈页可诊断。
     """
+    if _external_server.get("proc") is not None:
+        nonce = _wait_bootstrap_nonce()
+        return f"{app_url}/api/v1/session/bootstrap?nonce={nonce}" if nonce else app_url
     try:
         from app.domains.system.session_router import create_bootstrap
 
@@ -489,6 +596,9 @@ class DesktopApi:
             clash_manager.runtime.stop()
         except Exception:  # noqa: BLE001 —— 停不掉不阻断重启（换装进程有兜底清理）
             pass
+
+        # 外部服务子进程同理先回收：它占着服务端口与数据目录文件锁。
+        _stop_server_process()
 
         child_env = {
             **os.environ,
@@ -907,6 +1017,7 @@ def _create_tray(window) -> object | None:
         except Exception:  # noqa: BLE001
             pass
         # closed 事件兜底之外直接终审：后台线程随进程内核终结
+        _stop_server_process()
         sys.stdout.flush()
         os._exit(0)
 
@@ -1784,6 +1895,7 @@ def _open_window(app_url: str) -> None:
         def closed():
             if _background_mode and not _tray_state["quit"]:
                 return
+            _stop_server_process()
             sys.stdout.flush()
             os._exit(0)
 
@@ -1846,8 +1958,16 @@ def _apply_webview2_static_args() -> None:
         os.environ[key] = "--disable-component-update --disable-background-networking"
 
 
+def _raise_keyboard_interrupt(*_args: object) -> None:
+    # Ctrl+Break 缺省硬终止进程、绕过解释器收尾；转成与 Ctrl+C 相同的异常，
+    # 让退出统一走正常路径（含外部服务子进程回收）
+    raise KeyboardInterrupt
+
+
 def main() -> None:
     global _background_mode, _ui_active
+    if os.name == "nt":
+        signal.signal(signal.SIGBREAK, _raise_keyboard_interrupt)
     from app.core.update_host import report_data_protocol
 
     if report_data_protocol(sys.argv[1:]):
@@ -1947,6 +2067,7 @@ def main() -> None:
 
     ready = threading.Event()
     error_box: list[str] = []
+    atexit.register(_stop_server_process)  # 正常退出路径的子进程回收兜底；os._exit 路径各自显式调用
     threading.Thread(target=_start_server, args=(ready, error_box), daemon=True).start()
     if lock is not None:
         threading.Thread(target=_listen_activation, args=(lock,), daemon=True).start()
