@@ -83,12 +83,12 @@ const settings = {
   'settings.steam.syncMeta': '当前账号同步时间：{time} · 钱包每分钟自动轮转刷新（多账号随机错峰）',
 
   /* ── 账户卡片（SteamID64 / Web API Key）── */
-  'settings.account.desc': '监控池同步（愿望单 / 已购）所用的 Steam 身份信息。',
+  'settings.account.desc': '我的关注同步（愿望单 / 已购）所用的 Steam 身份信息。',
   'settings.account.steamIdPlaceholder': '例如 76561198000000000',
   'settings.account.lookup': '查询',
   'settings.account.localSteamLabel': '本机 Steam 账号',
   'settings.account.localSteamFind': '查找本机账号',
-  'settings.account.localSteamHint': '只读取客户端保存的账号历史，可能包含过去使用过的账号；导入后仅保存 SteamID64，不会登录账号或加入监控账户。',
+  'settings.account.localSteamHint': '只读取客户端保存的账号历史，可能包含过去使用过的账号；导入后仅保存 SteamID64，不会登录账号。',
   'settings.account.localSteamNone': '没有找到本机 Steam 账号记录。',
   'settings.account.localSteamFindFailed': '读取本机 Steam 账号失败。',
   'settings.account.localSteamImport': '导入',
@@ -220,8 +220,8 @@ const settings = {
   'settings.security.modeFailed': '切换失败，已保持原方式',
 
   /* 加密导出（只含用户侧数据） */
-  'settings.export.desc': '把本机用户数据（上面各项设置的凭据、游戏关注、监控与提醒、账单、界面偏好、代理订阅等）打包成一个口令加密文件，便于备份或迁移。',
-  'settings.export.excludeNote': '注意：导出不含随包的游戏目录与价格数据（游戏、现价、价格历史、捆绑包、汇率、区服等公共数据）——这些由程序与抓取自动重建，不属于你的个人数据。',
+  'settings.export.desc': '把本机用户数据（上面各项设置的凭据、游戏关注与提醒、账单、界面偏好、代理订阅等）打包成一个口令加密文件，便于备份或迁移。',
+  'settings.export.excludeNote': '注意：导出不含随包的游戏目录与价格数据（游戏、现价、价格历史、捆绑包、汇率、地区等公共数据）——这些由程序与抓取自动重建，不属于你的个人数据。',
   'settings.export.passwordLabel': '导出口令（至少 6 位）',
   'settings.export.passwordPlaceholder': '设置一个导出口令',
   'settings.export.create': '加密导出',

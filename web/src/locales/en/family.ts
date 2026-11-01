@@ -58,7 +58,7 @@ const family: Partial<Record<MessageKey, string>> = {
   'family.add.placeholder': 'Add member: Steam friend code (e.g. 998167239) or SteamID64 — resolved as you type',
   'family.add.needInput': 'Enter a friend code or SteamID64 first — the account must resolve before it can be added',
   'family.add.trackFailed': 'Added to the list, but tracking failed: {err}',
-  'family.add.success': 'Added {name} — now tracked in the watch pool. Link a cookie and run “Sync family group” to fill in the rest.',
+  'family.add.success': 'Added {name} — now tracked in Following. Link a cookie and run “Sync family group” to fill in the rest.',
   'family.add.failed': 'Failed to add member: {err}',
   'family.add.confirming': 'Adding…',
   'family.add.action': 'Add',
