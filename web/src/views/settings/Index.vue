@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { useRouter, useRoute } from 'vue-router'
 
 import { currencyName } from '@/api/currencies'
 import {
   accountLoginApi,
+  alertsApi,
+  invalidateGetCache,
   notificationsApi,
   settingsApi,
   pilotApi,
@@ -17,6 +19,7 @@ import {
   type BackupItem,
   type SecurityStatus,
   type ExportItem,
+  type SmtpConfigPayload,
   type SteamAccountItem,
   type LocalSteamAccountCandidate,
 } from '@/api/client'
@@ -46,6 +49,7 @@ const tour = useTourStore()
 
 /* 工具箱次级入口：工具箱已移出一级导航，这里是其常驻入口 */
 const router = useRouter()
+const route = useRoute()
 function openToolbox() {
   void router.push('/toolbox')
 }
@@ -1122,6 +1126,123 @@ async function sendTestNotification() {
   }
 }
 
+/* ── SMTP 出口配置（本卡折叠面；提醒页「邮件设置」深链 ?s=notification 的落点）──
+ * 密码仅存本地；GET/PUT 返回的 password 都是掩码，表单留空 = 沿用已存授权码。 */
+const smtpOpen = ref(false)
+const smtpSaving = ref(false)
+const smtpTesting = ref(false)
+const smtpMaskedPassword = ref('')
+const smtpTestResult = ref<{ ok: boolean; text: string } | null>(null)
+const smtpForm = ref({ host: '', portText: '', user: '', password: '', toAddr: '', useSsl: true })
+
+const smtpEncryptOptions = computed(() => [
+  { label: t('alerts.smtp.ssl'), value: 'ssl' },
+  { label: t('alerts.smtp.starttls'), value: 'starttls' },
+])
+const smtpSslMode = computed({
+  get: () => (smtpForm.value.useSsl ? 'ssl' : 'starttls'),
+  set: (v: string | number | Array<string | number>) => {
+    smtpForm.value.useSsl = v === 'ssl'
+  },
+})
+const smtpPasswordPlaceholder = computed(() =>
+  smtpMaskedPassword.value
+    ? t('alerts.smtp.passwordConfigured', { masked: smtpMaskedPassword.value })
+    : t('alerts.smtp.passwordPlaceholder'),
+)
+
+async function toggleSmtpPanel(open?: boolean) {
+  smtpOpen.value = open ?? !smtpOpen.value
+  if (!smtpOpen.value) return
+  smtpTestResult.value = null
+  try {
+    invalidateGetCache('/alerts/smtp')
+    const cfg = await alertsApi.getSmtp()
+    smtpForm.value = {
+      host: cfg.host,
+      portText: String(cfg.port),
+      user: cfg.user,
+      password: '',
+      toAddr: cfg.toAddr,
+      useSsl: cfg.useSsl,
+    }
+    smtpMaskedPassword.value = cfg.password
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+  }
+}
+
+function smtpPayload(): SmtpConfigPayload {
+  const port = Number(smtpForm.value.portText.trim())
+  return {
+    host: smtpForm.value.host.trim(),
+    port: Number.isInteger(port) ? port : 0,
+    user: smtpForm.value.user.trim(),
+    password: smtpForm.value.password,
+    toAddr: smtpForm.value.toAddr.trim(),
+    useSsl: smtpForm.value.useSsl,
+  }
+}
+
+async function saveSmtp() {
+  smtpSaving.value = true
+  smtpTestResult.value = null
+  try {
+    const cfg = await alertsApi.updateSmtp(smtpPayload())
+    smtpForm.value.host = cfg.host
+    smtpForm.value.portText = String(cfg.port)
+    smtpForm.value.user = cfg.user
+    smtpForm.value.toAddr = cfg.toAddr
+    smtpForm.value.useSsl = cfg.useSsl
+    smtpForm.value.password = ''
+    smtpMaskedPassword.value = cfg.password
+    // GET /notifications/* 有 60s 时间窗缓存：不失效则状态区仍旧显示未配置
+    invalidateGetCache('/notifications/prefs')
+    invalidateGetCache('/notifications/stats')
+    await loadNotifications()
+    message.success(t('alerts.toast.smtpSaved'))
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+  } finally {
+    smtpSaving.value = false
+  }
+}
+
+async function testSmtpForm() {
+  smtpTesting.value = true
+  smtpTestResult.value = null
+  try {
+    await alertsApi.testSmtp(smtpPayload())
+    smtpTestResult.value = { ok: true, text: t('settings.notification.smtpTestOk') }
+  } catch (e) {
+    // 后端 400 detail 即可直接展示的失败原因，原样上屏
+    smtpTestResult.value = { ok: false, text: e instanceof Error ? e.message : String(e) }
+  } finally {
+    smtpTesting.value = false
+  }
+}
+
+/* 深链锚点：?s=notification → data-section="settings.section.notification"（缺省前缀回退）。
+ * 上方分节卡异步加载会持续改变页高，落点需滚动后两次收敛，否则停在目标上方两三百像素。 */
+function scrollToQuerySection(s: string) {
+  const sel = (v: string) => `[data-section="${CSS.escape(v)}"]`
+  const el =
+    document.querySelector<HTMLElement>(sel(`settings.section.${s}`)) ??
+    document.querySelector<HTMLElement>(sel(s))
+  el?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+function revealQuerySection(s: string) {
+  scrollToQuerySection(s)
+  window.setTimeout(() => scrollToQuerySection(s), 800)
+  window.setTimeout(() => scrollToQuerySection(s), 1800)
+}
+watch(
+  () => route.query.s,
+  (s) => {
+    if (typeof s === 'string' && s) void nextTick(() => revealQuerySection(s))
+  },
+)
+
 /* ── 数据与安全（密钥保护 + 加密导出）──
  * 保护方式切换会在后端做全库换钥重加密，耗时与库内凭据条数相关：期间禁用按钮，
  * 成功后才刷新状态。口令模式下 `locked` 为真时凭据不可读写，导出会直接失败。 */
@@ -1269,7 +1390,11 @@ onMounted(() => {
   /* 更新开关存在 settings store（启动逻辑与侧栏红点共用）：本页也要保证它拉到过
      ——深链直接进本页时 App 外壳虽会 load，但失败重试的兜底放在这里更稳。 */
   void settingsStore.load()
-  void load()
+  void load().then(() => {
+    // 分节卡在 loading 结束后才挂载：深链 ?s= 必须等渲染完再滚
+    const s = route.query.s
+    if (typeof s === 'string' && s) void nextTick(() => revealQuerySection(s))
+  })
   void loadNotifications()
   void loadPilot()
   void loadSecurity()
@@ -2252,6 +2377,14 @@ onUnmounted(() => {
           <div class="notify-status" :class="{ 'is-bad': notifyStateIsBad }">
             <span class="notify-status__dot" />
             <span>{{ t(notifyStateKey, notifyStateParams) }}</span>
+            <HlButton
+              v-if="notifyStateKey === 'settings.notification.smtpMissing'"
+              variant="text"
+              size="sm"
+              @click="toggleSmtpPanel(true)"
+            >
+              {{ t('settings.notification.smtpConfigure') }}
+            </HlButton>
           </div>
           <div v-if="notifyPrefs?.smtp.configured" class="section-desc">
             {{ t('settings.notification.smtpInfo', {
@@ -2272,6 +2405,77 @@ onUnmounted(() => {
           </div>
           <div v-if="notifyStats && notifyStats.unknown > 0" class="section-desc">
             {{ t('settings.notification.unknownCount', { unknown: notifyStats.unknown }) }}
+          </div>
+        </div>
+
+        <!-- SMTP 出口配置（默认收起，不占主开关层级）：测试只验连通不落库，保存才生效 -->
+        <div class="settings-row">
+          <div class="settings-row__line">
+            <HlButton variant="text" size="sm" @click="toggleSmtpPanel()">
+              <HlIcon :name="smtpOpen ? 'chevron-down' : 'chevron-right'" />
+              {{ t('settings.notification.smtpPanel') }}
+            </HlButton>
+          </div>
+          <div v-if="smtpOpen" class="smtp-form">
+            <div class="section-desc">{{ t('alerts.smtp.desc') }}</div>
+            <div class="settings-row__line">
+              <HlInput
+                v-model="smtpForm.host"
+                :placeholder="t('alerts.smtp.hostPlaceholder', { host: 'smtp.example.com' })"
+                class="smtp-form__host"
+              />
+              <HlInput v-model="smtpForm.portText" placeholder="465" class="smtp-form__port" />
+            </div>
+            <div class="settings-row__line">
+              <HlInput
+                v-model="smtpForm.user"
+                :placeholder="t('alerts.smtp.userPlaceholder', { email: 'user@example.com' })"
+                class="smtp-form__input"
+              />
+            </div>
+            <div class="settings-row__line">
+              <HlInput
+                v-model="smtpForm.password"
+                type="password"
+                :placeholder="smtpPasswordPlaceholder"
+                class="smtp-form__input"
+                @keydown.enter="saveSmtp"
+              />
+            </div>
+            <div class="settings-row__line">
+              <HlInput
+                v-model="smtpForm.toAddr"
+                :placeholder="t('alerts.smtp.toAddrPlaceholder')"
+                class="smtp-form__input"
+                @keydown.enter="saveSmtp"
+              />
+              <HlSelect v-model="smtpSslMode" :options="smtpEncryptOptions" class="smtp-form__select" />
+            </div>
+            <div class="settings-row__line">
+              <HlButton
+                art="outline"
+                tone="green"
+                size="sm"
+                :loading="smtpSaving"
+                :disabled="smtpTesting"
+                @click="saveSmtp"
+              >
+                {{ t('alerts.smtp.save') }}
+              </HlButton>
+              <HlButton
+                art="outline"
+                tone="blue"
+                size="sm"
+                :loading="smtpTesting"
+                :disabled="smtpSaving"
+                @click="testSmtpForm"
+              >
+                {{ t('alerts.smtp.test') }}
+              </HlButton>
+            </div>
+            <div v-if="smtpTestResult" class="smtp-test-result" :class="{ 'is-bad': !smtpTestResult.ok }">
+              {{ smtpTestResult.text }}
+            </div>
           </div>
         </div>
 
@@ -2936,6 +3140,31 @@ onUnmounted(() => {
 }
 .notify-status.is-bad .notify-status__dot {
   background: var(--danger);
+}
+/* 深链/分节轨落点留位：sticky 顶栏约 130px，scrollIntoView block:start 不被盖 */
+[data-section] {
+  scroll-margin-top: 140px;
+}
+.smtp-form__host {
+  flex: 1 1 180px;
+  max-width: 260px;
+}
+.smtp-form__port {
+  max-width: 90px;
+}
+.smtp-form__input {
+  max-width: 280px;
+}
+.smtp-form__select {
+  max-width: 200px;
+}
+.smtp-test-result {
+  font-size: 12.5px;
+  color: var(--rate-good);
+  word-break: break-all;
+}
+.smtp-test-result.is-bad {
+  color: var(--danger);
 }
 .mcp-status {
   display: inline-flex;
