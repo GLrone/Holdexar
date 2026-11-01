@@ -508,6 +508,7 @@ def test_new_update_cannot_overwrite_unfinished_data_ownership(tmp_path, monkeyp
     def unfinished(*args, **kwargs):
         raise RuntimeError("previous ownership cannot finish")
 
+    monkeypatch.setattr(update_data, "_read_marker", lambda _d: {"token": "t"})
     monkeypatch.setattr(update_data, "abort_preparation", unfinished)
     monkeypatch.setattr(update_data, "rollback", unfinished)
     monkeypatch.setattr(update_data, "accept", unfinished)
@@ -911,3 +912,36 @@ def test_stalled_migration_keeps_original_probe_budget(tmp_path, monkeypatch):
     assert "健康验收超时" in reason
     assert "迁移超出总预算" not in reason
     assert elapsed < 5.0
+
+
+def test_husk_residue_without_marker_clears_despite_pointer_drift(tmp_path, monkeypatch):
+    """P0-B 变体 D（真机）：准备前失败的残壳事务（无保护标记）+指针漂移=直接清场。"""
+    from app.core import update_data
+
+    root = tmp_path / "app"
+    data = root / "data"
+    data.mkdir(parents=True)
+    layout.write_current_state(root, "0.3.8-beta-rc2")
+    layout.start_transaction(root, "0.3.8-beta-rc2", "0.3.8-beta-rc1", attempt_id="husk")
+    layout.update_transaction(root, layout.STAGE_ROLLED_BACK, dataDir=str(data))
+    monkeypatch.setattr(update_data, "_read_marker", lambda _d: None)
+    assert update_host.recover_interrupted_update(root) is True
+    assert layout.read_transaction(root) is None
+
+
+def test_residue_with_live_marker_keeps_fail_closed_on_pointer_drift(tmp_path, monkeypatch):
+    """有准备标记且指针漂移=保护状态存疑：维持阻断，保留现场。"""
+    from app.core import update_data
+
+    root = tmp_path / "app"
+    data = root / "data"
+    data.mkdir(parents=True)
+    layout.write_current_state(root, "0.3.8-beta-rc2")
+    layout.start_transaction(root, "0.3.8-beta-rc2", "0.3.8-beta-rc1", attempt_id="guarded")
+    layout.update_transaction(root, layout.STAGE_ROLLED_BACK, dataDir=str(data))
+    monkeypatch.setattr(update_data, "_read_marker", lambda _d: {"token": "t"})
+    monkeypatch.setattr(update_data, "abort_preparation",
+                        lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("升级准备状态无法确认安全，保留数据保护")))
+    with pytest.raises(RuntimeError):
+        update_host.recover_interrupted_update(root)
+    assert layout.read_transaction(root)["attemptId"] == "guarded"

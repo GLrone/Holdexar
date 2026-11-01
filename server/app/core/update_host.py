@@ -959,8 +959,12 @@ def recover_interrupted_update(root: Path) -> bool:
                 raise RuntimeError("更新恢复尚未完成，原始快照与故障数据均已保留，请查看更新诊断")
             layout.clear_transaction(root)
         elif tx.get("dataDir"):
-            update_data.abort_preparation(root, data_dir=Path(tx["dataDir"]))
-            layout.clear_transaction(root)
+            if update_data._read_marker(Path(tx["dataDir"])) is None:
+                # 无准备标记=数据从未进入保护，事务只是残壳；指针归属由启动链相容校验管
+                layout.clear_transaction(root)
+            else:
+                update_data.abort_preparation(root, data_dir=Path(tx["dataDir"]))
+                layout.clear_transaction(root)
         return True
 
 
