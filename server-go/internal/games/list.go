@@ -27,7 +27,7 @@ const (
 		" WHEN g.hl_flag = 2 THEN 3 WHEN g.hl_flag = 3 THEN 2 ELSE 1 END"
 	regionGroupCase = "CASE WHEN g.hl_flag IN (1, 2) THEN 0 WHEN cp1.discount_percent > 0 THEN 1 ELSE 2 END"
 	complexSort     = "(cp1.price IS NOT NULL AND cp1.price > 0) DESC, " + hlPriorityCase + " DESC," +
-		" g.diff_fen / 1000 DESC, g.review_count / 1000 DESC, g.positive_rate DESC"
+		" g.diff_fen / 1000.0 DESC, g.review_count / 1000.0 DESC, g.positive_rate DESC"
 )
 
 // 列表查询参数正则约束；*Src 常量同时是 422 ctx 里的 pattern 原文（照抄
@@ -685,7 +685,7 @@ func buildOrderBy(sort string, regionMode bool) string {
 	if regionMode {
 		prefix = regionGroupCase + ", "
 		if sort == "rate" {
-			return prefix + "g.review_count / 1000 DESC, g.positive_rate DESC, g.appid DESC"
+			return prefix + "g.review_count / 1000.0 DESC, g.positive_rate DESC, g.appid DESC"
 		}
 		if sort == "new2026" {
 			return prefix + "g.release_date DESC, g.appid DESC"
@@ -694,7 +694,7 @@ func buildOrderBy(sort string, regionMode bool) string {
 	}
 	switch sort {
 	case "rate":
-		return "g.review_count / 1000 DESC, g.positive_rate DESC, g.appid DESC"
+		return "g.review_count / 1000.0 DESC, g.positive_rate DESC, g.appid DESC"
 	case "discount":
 		return "cp1.discount_percent DESC, " + complexSort + ", g.appid DESC"
 	case "new2026":
@@ -702,7 +702,7 @@ func buildOrderBy(sort string, regionMode bool) string {
 	case "updated":
 		return "g.updated_at DESC, g.appid DESC"
 	case "diff":
-		return "g.diff_fen / 500 DESC, " + complexSort + ", g.appid DESC"
+		return "g.diff_fen / 500.0 DESC, " + complexSort + ", g.appid DESC"
 	default:
 		return complexSort + ", g.appid DESC"
 	}
