@@ -34,6 +34,7 @@ const family: Partial<Record<MessageKey, string>> = {
   'family.member.exclusive': 'Exclusive {n}',
   'family.member.recent30': 'Acquired in last 30 days {n}',
   'family.member.remove': 'Remove',
+  'family.member.removeConfirm': 'Remove {name}? Tracking stops: manual entries are deleted, Steam family members are excluded from sync.',
   'family.remove.failed': 'Failed to remove member: {err}',
 
   /* Region popover */

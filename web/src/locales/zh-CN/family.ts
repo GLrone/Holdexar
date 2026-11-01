@@ -32,6 +32,7 @@ const family = {
   'family.member.exclusive': '独占 {n}',
   'family.member.recent30': '近30日活跃 {n}',
   'family.member.remove': '移除',
+  'family.member.removeConfirm': '移除 {name}？将停止跟踪该成员：手动添加的删除条目，家庭组成员不再同步。',
   'family.remove.failed': '移除成员失败：{err}',
 
   /* 地区二级窗 */

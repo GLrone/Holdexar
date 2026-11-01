@@ -78,6 +78,7 @@ const settings = {
   'settings.steam.redeems': '激活',
   'settings.steam.setActive': '设为当前',
   'settings.steam.unbind': '解绑',
+  'settings.steam.unbindConfirm': '解绑 {name}？该账号的账单导入、家庭组数据与相关监控追踪将一并删除；重新绑定后可重新同步。',
   'settings.steam.syncOne': '同步',
   'settings.steam.accountCount': '共 {n} 个账号',
   'settings.steam.syncMeta': '当前账号同步时间：{time} · 钱包每分钟自动轮转刷新（多账号随机错峰）',

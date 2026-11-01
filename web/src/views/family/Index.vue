@@ -8,7 +8,7 @@ import { useFamilyStore } from '@/stores/familyLib'
 import { familyApi, watchPoolApi, type FamilyGroupStatus, type FamilyMemberItem } from '@/api/client'
 import { normalizeAvatarUrl } from '@/api/avatar'
 import { useI18n, type MessageKey } from '@/locales'
-import { HlPaneSwitch, HlSelect, HlTabs, message } from '@/components/ui'
+import { HlButton, HlDialog, HlPaneSwitch, HlSelect, HlTabs, message } from '@/components/ui'
 import type { HlSelectOption, HlTabItem } from '@/components/ui'
 import FamContrib from './tabs/FamContrib.vue'
 import FamHeat from './tabs/FamHeat.vue'
@@ -375,6 +375,17 @@ async function removeMember(m: FamilyMember) {
   }
 }
 
+/** 移除确认：✕ 只开弹窗，确认才执行 */
+const removeTarget = ref<FamilyMember | null>(null)
+function openRemove(m: FamilyMember) {
+  removeTarget.value = m
+}
+async function confirmRemove() {
+  const m = removeTarget.value
+  removeTarget.value = null
+  if (m) await removeMember(m)
+}
+
 onMounted(() => {
   // 本组件不带 KeepAlive，板块来回切就会重挂载一次。两个请求都自带复用守卫：
   // /family/status 靠 familyLoaded，家庭库聚合靠 store 内的 ready（force=true 仍可穿透）。
@@ -462,7 +473,7 @@ const avatarColors: Record<string, string> = {
               <template v-else>{{ t('family.member.regionUnset') }}</template>
               <span class="car">▼</span>
             </button>
-            <span class="fam-del" :title="t('family.member.remove')" @click="removeMember(m)">
+            <span class="fam-del" :title="t('family.member.remove')" @click="openRemove(m)">
               <span v-if="removingSid === m.steamid" class="hl-spinner hl-spinner--inline" aria-hidden="true" />
               <template v-else>✕</template>
             </span>
@@ -590,6 +601,26 @@ const avatarColors: Record<string, string> = {
 
       </HlTabs>
     </div>
+
+    <!-- 移除成员确认：列表容器裁剪行内气泡，确认走弹窗（teleport 出列表）说清后果 -->
+    <HlDialog
+      :model-value="removeTarget !== null"
+      :title="t('family.member.remove')"
+      :width="420"
+      @update:model-value="removeTarget = null"
+    >
+      <p class="fam-remove-text">
+        {{ t('family.member.removeConfirm', { name: removeTarget ? removeTarget.name || removeTarget.steamid : '' }) }}
+      </p>
+      <template #footer>
+        <HlButton variant="text" size="sm" @click="removeTarget = null">
+          {{ t('common.cancel') }}
+        </HlButton>
+        <HlButton variant="danger" size="sm" :loading="!!removingSid" @click="confirmRemove">
+          {{ t('common.confirm') }}
+        </HlButton>
+      </template>
+    </HlDialog>
   </section>
 </template>
 
@@ -627,6 +658,14 @@ const avatarColors: Record<string, string> = {
 .fx-module__icon svg { width: 19px; height: 19px; }
 .fx-module__title { font-size: 15px; font-weight: 700; color: var(--text-primary); }
 .fx-module__sub { font-size: 12px; color: var(--text-muted); margin: 2px 0 14px 44px; }
+
+/* 移除确认弹窗正文 */
+.fam-remove-text {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--text-secondary);
+}
 
 /* 家庭成员行卡 */
 .fam-list {
