@@ -771,7 +771,7 @@ def _patch_sync_env(monkeypatch, store: dict, fetch) -> list:
     from app.domains.account import service as account_service
     from app.domains.bills import steam_fetch
 
-    monkeypatch.setattr(bills_service, "_sync_lock", asyncio.Lock())
+    monkeypatch.setattr(bills_service, "_sync_locks", {})
 
     async def fake_get(key, default=None):
         return store.get(key, default)
@@ -909,7 +909,8 @@ async def test_import_failure_rolls_back_only_account_replacement(db, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_named_accounts_wait_for_each_other_without_dropping_sync(db, monkeypatch):
+async def test_same_account_syncs_wait_for_each_other(db, monkeypatch):
+    """同账号互斥：在飞同步未结束时同账号再来只等待，不叠跑（calls 不增）。"""
     from app.domains.account import service as account_service
     entered, release = asyncio.Event(), asyncio.Event()
 
@@ -925,15 +926,51 @@ async def test_named_accounts_wait_for_each_other_without_dropping_sync(db, monk
     monkeypatch.setattr(account_service, "get_cookies_of", own)
     first = asyncio.create_task(bills_service.sync_bills(force=True, steam_id="76561198000000001"))
     await entered.wait()
-    second = asyncio.create_task(bills_service.sync_bills(force=True, steam_id="76561198000000002"))
+    second = asyncio.create_task(bills_service.sync_bills(force=True, steam_id="76561198000000001"))
     await asyncio.sleep(0)
     try:
         assert len(calls) == 1
     finally:
         release.set()
         results = await asyncio.gather(first, second)
-    assert [r["steamId"] for r in results] == ["76561198000000001", "76561198000000002"]
+    assert [r["steamId"] for r in results] == ["76561198000000001", "76561198000000001"]
     assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_different_account_syncs_run_in_parallel(db, monkeypatch):
+    """跨账号并行：账号一在飞时账号二直接开拉（calls 已增到 2），互不互等。"""
+    from app.domains.account import service as account_service
+    from app.domains.bills import steam_fetch
+
+    entered1, release1, entered2 = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    store = {}
+    calls = _patch_sync_env(monkeypatch, store, lambda: None)
+
+    async def fetch_by_cookies(cookies, proxy_url=None, on_progress=None):
+        sid = cookies.split("steamLoginSecure=")[1][:17]
+        calls.append({"cookies": cookies, "proxy_url": proxy_url})
+        if sid == "76561198000000001":
+            entered1.set()
+            await release1.wait()
+        else:
+            entered2.set()
+        return _FakeReport()
+
+    monkeypatch.setattr(steam_fetch, "fetch_full_report", fetch_by_cookies)
+    async def own(sid):
+        return f"steamLoginSecure={sid}||own-token"
+    monkeypatch.setattr(account_service, "get_cookies_of", own)
+    first = asyncio.create_task(bills_service.sync_bills(force=True, steam_id="76561198000000001"))
+    await entered1.wait()
+    second = asyncio.create_task(bills_service.sync_bills(force=True, steam_id="76561198000000002"))
+    await asyncio.wait_for(entered2.wait(), timeout=2)
+    try:
+        assert len(calls) == 2  # 账号二在账号一仍在飞时已开拉
+    finally:
+        release1.set()
+        results = await asyncio.gather(first, second)
+    assert {r["steamId"] for r in results} == {"76561198000000001", "76561198000000002"}
 
 
 @pytest.mark.asyncio
@@ -951,7 +988,7 @@ async def test_cancelled_sync_records_interruption_and_releases_executor(db, mon
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert not bills_service._sync_lock.locked()
+    assert all(not lock.locked() for lock in bills_service._sync_locks.values())
     assert store[bills_service.KEY_BILLS_SYNC]["running"] is False
     assert store[bills_service.KEY_BILLS_SYNC]["error"]
 

@@ -537,3 +537,121 @@ async def test_account_status_derives_bill_completion_from_owned_import(db):
     accounts = {a['steam_id']: a for a in await account_service.list_accounts()}
     assert accounts[A]['bills_synced_at'] is None
     assert accounts[B]['bills_synced_at'] == '2026-01-01T00:00:00'
+
+
+# ── 6 账号容量 / 单账号聚合刷新 / 共享组删除回归 ────────────
+
+SIX = [f"7656119800000000{i}" for i in range(1, 7)]
+
+
+@pytest.mark.asyncio
+async def test_six_accounts_bind_list_order_and_switch_each(db):
+    """6 账号绑定：list 按绑定序、首个恒主账号、末绑定为 active；逐一 switch 全部可达。"""
+    for sid in SIX:
+        await account_service.save_cookies(cookie(sid))
+
+    accounts = await account_service.list_accounts()
+    assert [a["steam_id"] for a in accounts] == SIX
+    assert accounts[0]["is_primary"] is True
+    assert all(a["is_primary"] is False for a in accounts[1:])
+    assert accounts[-1]["is_active"] is True
+
+    for sid in SIX:
+        await account_service.set_active(sid)
+        assert await account_service.get_active_steam_id() == sid
+        assert f"{sid}%7C%7C" in await account_service.get_cookies()
+    # 主账号不随切换变化
+    assert await account_service.get_primary_steam_id() == SIX[0]
+
+
+@pytest.mark.asyncio
+async def test_remove_one_of_six_shared_group_keeps_others_intact(db):
+    """6 账号删 1（其组为共享组）：名下账单与组行清，共享快照与余账号完好。"""
+    from datetime import datetime
+
+    from sqlalchemy import select
+
+    from app.domains.bills.models import BillGameTx, BillImport
+    from app.domains.family.models import FamilyGroup, FamilyLibrarySnapshot
+
+    d, e = SIX[3], SIX[4]  # d、e 同一真实家庭（共享组 777）
+    for sid in SIX:
+        await account_service.save_cookies(cookie(sid))
+    async with db() as session:
+        session.add(FamilyGroup(steamid=SIX[0], family_groupid="111", member_count=1, fetch_ok=True))
+        session.add(FamilyGroup(
+            steamid=d, family_groupid="777", member_count=2, fetch_ok=True,
+            members_json=[{"steamid": d, "role": "1"}],
+        ))
+        session.add(FamilyGroup(
+            steamid=e, family_groupid="777", member_count=2, fetch_ok=True,
+            members_json=[{"steamid": e, "role": "1"}],
+        ))
+        session.add(FamilyLibrarySnapshot(appid=620, family_groupid="777", time_acquired=1690000000))
+        session.add(FamilyLibrarySnapshot(appid=570, family_groupid="111", time_acquired=1695000000))
+        imp = BillImport(steam_id=d, nickname="d", imported_at=datetime(2026, 1, 1))
+        session.add(imp)
+        await session.flush()
+        session.add(BillGameTx(import_id=imp.id, date="2026-01-01", tx_type="purchase",
+                               currency="CNY", amount=30.0, cny_fen=3000))
+        await session.commit()
+
+    r = await account_service.remove_account(d)
+    assert r["ok"] is True and r["removed"] == d
+    assert r["billsRemoved"] == 1 and r["familyGroupsRemoved"] == 1
+
+    async with db() as session:
+        bill_owners = {sid for (sid,) in (await session.execute(select(BillImport.steam_id))).all()}
+        group_owners = {sid for (sid,) in (await session.execute(select(FamilyGroup.steamid))).all()}
+        snap_gids = {
+            gid for (gid,) in
+            (await session.execute(select(FamilyLibrarySnapshot.family_groupid))).all()
+        }
+        txs = (await session.execute(select(BillGameTx))).scalars().all()
+    assert d not in bill_owners  # 被删账号账单清，旧存量 NULL 归属不受影响
+    assert d not in group_owners and {e, SIX[0]} <= group_owners
+    assert snap_gids == {"111", "777"}  # 共享组 777 快照由 e 的组行继续持有
+    assert txs == []  # 被删账号的账单明细随导入一并清除
+    assert len(await account_service.list_accounts()) == 5
+
+
+@pytest.mark.asyncio
+async def test_refresh_endpoint_wallet_now_and_sections_background(db, monkeypatch):
+    """单账号聚合刷新端点：钱包同步即时返回；账单/家庭组/愿望单后台受理。"""
+    import httpx
+    from fastapi import FastAPI
+
+    from app.domains.account import router as account_router_module
+    from app.domains.account.router import router as account_router
+
+    for sid in SIX[:2]:
+        await account_service.save_cookies(cookie(sid))
+
+    wallets: list[str] = []
+    chains: list[str] = []
+
+    async def fake_wallet(sid):
+        wallets.append(sid)
+        return {"ok": True, "wallet": {"balance": 12.34}}
+
+    async def fake_chain(sid):
+        chains.append(sid)
+
+    monkeypatch.setattr(account_service, "_sync_wallet_of", fake_wallet)
+    monkeypatch.setattr(account_service, "_post_bind_fetch", fake_chain)
+
+    app = FastAPI()
+    app.include_router(account_router, prefix="/api/v1")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(f"/api/v1/account/steam_id/{SIX[1]}/refresh")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True and body["steamId"] == SIX[1]
+        assert body["wallet"]["wallet"]["balance"] == 12.34
+        assert body["queued"] == ["wishlist", "family", "bills"]
+        for t in list(account_router_module._REFRESH_TASKS):
+            await t
+        assert wallets == [SIX[1]] and chains == [SIX[1]]
+
+        assert (await client.post("/api/v1/account/steam_id/not-a-sid/refresh")).status_code == 400
+        assert (await client.post(f"/api/v1/account/steam_id/{SIX[5]}/refresh")).status_code == 404
