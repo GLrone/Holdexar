@@ -42,6 +42,14 @@ func encodeJSON(v any) string {
 }
 
 func encodeValue(b *strings.Builder, v any) {
+	// 实现 json.Marshaler 的类型（如 games 包的 pyFloat 浮点形态）优先走
+	// 自述序列化；产出必为合法 JSON 字面量，直接并入。
+	if m, ok := v.(json.Marshaler); ok {
+		if raw, err := m.MarshalJSON(); err == nil {
+			b.Write(raw)
+			return
+		}
+	}
 	switch x := v.(type) {
 	case nil:
 		b.WriteString("null")
