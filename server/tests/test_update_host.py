@@ -718,3 +718,100 @@ def test_verify_staging_payload_rejects_missing_file(tmp_path):
 
 def test_verify_staging_payload_skips_legacy_manifest(tmp_path):
     assert update_host._verify_staging_payload(tmp_path, {"tag": "v1"}) == ""
+
+
+def _seed_version(root, version, body=b"binary"):
+    vdir = layout.get_version_dir(root, version)
+    vdir.mkdir(parents=True, exist_ok=True)
+    (vdir / f"{APP_NAME}.exe").write_bytes(body)
+    return vdir
+
+
+def test_recovered_verifying_residue_allows_next_upgrade(tmp_path, monkeypatch):
+    """P0-B 主复现：verifying+prepared 残留恢复成功后，不得用恢复前快照裁决。"""
+    root = tmp_path / "app"
+    staging = tmp_path / "staging"
+    _seed_version(root, "0.3.5")
+    layout.write_current_state(root, "0.3.5")
+    _create_mock_app_payload(staging, "0.3.7")
+    layout.start_transaction(root, "0.3.7", "0.3.5", attempt_id="previous")
+    (root / "data").mkdir()
+    layout.update_transaction(root, "verifying", dataPrepared=True,
+                              dataRecoveryPhase="restored", dataDir=str(root / "data"),
+                              dataDbPath=str(root / "data" / "holdexar.db"), dataToken="tok",
+                              dataSnapshot=str(root / "data" / "backups" / "snap.db"),
+                              dataSnapshotSha256="a" * 64, dataSchemaVersion=17)
+
+    def fail_to_terminal(_root, _diagnosis, _error, **_kwargs):
+        layout.update_transaction(root, layout.STAGE_ROLLED_BACK, dataRollbackReleased=True,
+                                  dataRecoveryPhase="restored", error="recovered")
+        return True
+
+    monkeypatch.setattr(update_host, "_fail", fail_to_terminal)
+    assert update_host.execute_update(root, staging, target_version="0.3.7",
+                                      skip_health_check=True, launch_on_finish=False) is True
+    assert layout.read_current_state(root)["version"] == "0.3.7"
+
+
+def test_unprepared_residue_recovery_clears_and_allows_upgrade(tmp_path):
+    """P0-B 变体 B：未准备残留恢复后必须终态清场，否则升级被永久拦截。"""
+    root = tmp_path / "app"
+    staging = tmp_path / "staging"
+    _seed_version(root, "0.3.5")
+    layout.write_current_state(root, "0.3.5")
+    _create_mock_app_payload(staging, "0.3.7")
+    layout.start_transaction(root, "0.3.7", "0.3.5", attempt_id="previous")
+    layout.update_transaction(root, "switching", dataDir=str(root / "data"))
+    assert update_host.execute_update(root, staging, target_version="0.3.7",
+                                      skip_health_check=True, launch_on_finish=False) is True
+    tx = layout.read_transaction(root)
+    assert tx is None or tx.get("attemptId") != "previous"
+
+
+def test_unfinished_residue_after_failed_finalization_still_blocks(tmp_path, monkeypatch):
+    """恢复无法收尾（清场被阻）时维持 fail-closed：拦截新升级并标记重拉旧版。"""
+    root = tmp_path / "app"
+    staging = tmp_path / "staging"
+    _seed_version(root, "0.3.5")
+    layout.write_current_state(root, "0.3.5")
+    _create_mock_app_payload(staging, "0.3.7")
+    layout.start_transaction(root, "0.3.7", "0.3.5", attempt_id="previous")
+    layout.update_transaction(root, "switching", dataDir=str(root / "data"))
+    monkeypatch.setattr(layout, "clear_transaction", lambda *_a, **_kw: None)
+    assert update_host.execute_update(root, staging, target_version="0.3.7",
+                                      skip_health_check=True, launch_on_finish=False) is False
+    assert layout.read_transaction(root)["attemptId"] == "previous"
+
+
+def test_released_residue_with_drifted_pointer_clears_and_proceeds(tmp_path, monkeypatch):
+    """P0-B 变体 C（真机毒化场景）：终态已释放+指针漂移=事务已完结，清场放行。"""
+    from app.core import update_data
+
+    root = tmp_path / "app"
+    staging = tmp_path / "staging"
+    _seed_version(root, "0.3.5")
+    layout.write_current_state(root, "0.3.6")
+    _create_mock_app_payload(staging, "0.3.7")
+    layout.start_transaction(root, "0.3.6", "0.3.5", attempt_id="previous")
+    layout.update_transaction(root, layout.STAGE_ROLLED_BACK, dataRollbackReleased=True,
+                              dataRecoveryPhase="restored", dataDir=str(root / "data"),
+                              dataDbPath=str(root / "data" / "holdexar.db"), dataToken="tok",
+                              dataSnapshot=str(root / "data" / "backups" / "snap.db"),
+                              dataSnapshotSha256="a" * 64, dataSchemaVersion=17)
+    monkeypatch.setattr(update_data, "finish_rollback", lambda *_a, **_kw: None)
+    assert update_host.recover_interrupted_update(root) is True
+    assert layout.read_transaction(root) is None
+
+
+def test_released_residue_with_incomplete_phase_stays_fail_closed(tmp_path):
+    """相位无法证明恢复完整时保持阻断（安全类别三：保留现场）。"""
+    root = tmp_path / "app"
+    layout.start_transaction(root, "0.3.6", "0.3.5", attempt_id="previous")
+    layout.update_transaction(root, layout.STAGE_ROLLED_BACK, dataRollbackReleased=True,
+                              dataRecoveryPhase="restoring", dataDir=str(root / "data"),
+                              dataDbPath=str(root / "data" / "holdexar.db"), dataToken="tok",
+                              dataSnapshot=str(root / "data" / "backups" / "snap.db"),
+                              dataSnapshotSha256="a" * 64, dataSchemaVersion=17)
+    with pytest.raises(RuntimeError):
+        update_host.recover_interrupted_update(root)
+    assert layout.read_transaction(root)["attemptId"] == "previous"

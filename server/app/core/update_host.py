@@ -878,9 +878,11 @@ def recover_interrupted_update(root: Path) -> bool:
     with update_mutex():
         tx = layout.read_transaction(root) or {}
         if tx.get("dataRollbackReleased"):
+            # 已释放=数据已还原且保护解除，事务完结；指针归启动链相容性校验管
+            if tx.get("dataRecoveryPhase") not in (None, "restored"):
+                raise RuntimeError("更新恢复相位无法证明完成，已停止启动并保留数据")
             update_data.finish_rollback(root)
-            if layout.get_current_version(root) != tx.get("sourceVersion"):
-                raise RuntimeError("已恢复的数据与当前程序指向不一致，已停止启动并保留数据")
+            layout.clear_transaction(root)
             return True
         if tx.get("dataAccepted"):
             update_data.accept(root)
@@ -914,8 +916,10 @@ def recover_interrupted_update(root: Path) -> bool:
                     or layout.get_current_version(root) != current.get("sourceVersion")
                     or update_data._marker_path(Path(current["dataDir"])).exists()):
                 raise RuntimeError("更新恢复尚未完成，原始快照与故障数据均已保留，请查看更新诊断")
+            layout.clear_transaction(root)
         elif tx.get("dataDir"):
             update_data.abort_preparation(root, data_dir=Path(tx["dataDir"]))
+            layout.clear_transaction(root)
         return True
 
 
@@ -951,9 +955,10 @@ def _execute_update_locked(
     previous_tx = layout.read_transaction(root) or {}
     if previous_tx.get("dataDir"):
         recover_interrupted_update(root)
-        if (not previous_tx.get("dataAccepted") and not previous_tx.get("dataRollbackReleased")
-                and previous_tx.get("stage") != layout.STAGE_ROLLED_BACK):
-            current_tx = layout.read_transaction(root) or {}
+        # 裁决只认恢复后的最新事务：恢复已收尾（含清场）即放行
+        current_tx = layout.read_transaction(root) or {}
+        if current_tx.get("dataDir") and (not current_tx.get("dataAccepted")
+                and not current_tx.get("dataRollbackReleased")):
             layout.update_transaction(root, current_tx.get("stage", layout.STAGE_ROLLED_BACK), relaunchPrevious=True)
             return False
     curr_state = layout.read_current_state(root)
