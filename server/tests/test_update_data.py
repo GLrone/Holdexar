@@ -191,7 +191,7 @@ def test_recovery_finishes_abandoned_probe_registration(update_env, monkeypatch)
                               launchImage=str(layout.get_version_exe(root, "2.0.0")))
     monkeypatch.setattr(update_host, "_probe_processes", lambda _exe: [], raising=False)
     assert update_host.recover_interrupted_update(root) is True
-    assert layout.read_transaction(root)["launchPending"] is False
+    assert layout.read_transaction(root) is None
     assert not module()._marker_path(data).exists()
     with closing(sqlite3.connect(db)) as conn:
         assert conn.execute("SELECT value FROM original").fetchall() == [("before",)]
