@@ -60,7 +60,9 @@ async function load() {
     candidates.value = history.items
     legacyEvents.value = old
     manualRegion.value = config.manualRegion?.toLowerCase() || ''
-    if (!draft.region && config.region.region) draft.region = config.region.region.toLowerCase()
+    // 表单默认区：通知偏好的默认提醒地区（manualRegion 的解析投影）为空时，
+    // 回落到首个已启用监控区；两者都未配置才留「未知地区」诚实态
+    if (!draft.region) draft.region = config.region.region?.toLowerCase() || regions.enabledCodes[0] || ''
     resetFeatured()
   } catch (cause) { fail(cause) }
   finally { loading.value = false }
@@ -106,7 +108,7 @@ function resetDraft() {
   editingId.value = null
   search.value = ''
   results.value = []
-  Object.assign(draft, { appid: 0, region: prefs.value?.region.region?.toLowerCase() || '', targetType: 'price', amount: '', windowDays: 0, legacy: false, repeatMode: 'once', repeatHours: '24' })
+  Object.assign(draft, { appid: 0, region: prefs.value?.region.region?.toLowerCase() || regions.enabledCodes[0] || '', targetType: 'price', amount: '', windowDays: 0, legacy: false, repeatMode: 'once', repeatHours: '24' })
   previewItems.value = []
 }
 function rulePayload(): PriceAlertDraft {
