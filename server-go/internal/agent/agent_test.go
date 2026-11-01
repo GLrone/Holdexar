@@ -139,6 +139,8 @@ CREATE TABLE fx_rate_history (
 	UNIQUE (currency_code, rate_date)
 );
 CREATE TABLE app_settings (key TEXT PRIMARY KEY, value_json JSON, updated_at DATETIME);
+CREATE TABLE crawl_jobs (id INTEGER PRIMARY KEY, status TEXT, cycle_id INTEGER, stats_json TEXT);
+CREATE TABLE price_cycles (id INTEGER PRIMARY KEY, status TEXT);
 CREATE TABLE notification_candidates (
 	id INTEGER PRIMARY KEY AUTOINCREMENT, source_kind VARCHAR(16), event_id INTEGER,
 	cycle_id INTEGER, appid INTEGER, region_code VARCHAR(8), event_type VARCHAR(32),
