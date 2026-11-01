@@ -281,7 +281,7 @@ func TestSearchCatalogShape(t *testing.T) {
 	if !ok || base == nil || *base != 26800 {
 		t.Fatalf("basePriceFen 应为 cny_fen 26800: %v", row["basePriceFen"])
 	}
-	rate, ok := row["positiveRate"].(*float64)
+	rate, ok := row["positiveRate"].(*pyFloat)
 	if !ok || rate == nil || *rate != 96.0 {
 		t.Fatalf("positiveRate 应为 0-1 口径 96: %v", row["positiveRate"])
 	}
