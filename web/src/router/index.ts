@@ -12,8 +12,35 @@ import type { MessageKey } from '@/locales'
  */
 const titleKey = (key: MessageKey) => ({ titleKey: key })
 
+/** 自管滚动页：keep-alive 常驻，自行在 onActivated/onDeactivated 存还
+ *  .view-container 的 scrollTop（LibraryFinder / BundlesView 两页；
+ *  AchievementsHall 常驻但不管理容器滚动，不豁免）。
+ *  换页回顶对它们豁免——离开时立即清零会把过渡结束后才写入的存档污染成 0。 */
+const keepScroll = { keepScroll: true }
+
 const router = createRouter({
   history: createWebHistory(),
+  scrollBehavior(to, from) {
+    if (to.meta.keepScroll) return
+    const reset = () => {
+      // 页面滚动容器是 App 层 .view-container（窗口本身不滚），两处都清兜底
+      const el = document.querySelector('.view-container')
+      if (el) el.scrollTop = 0
+      window.scrollTo(0, 0)
+    }
+    if (from.meta.keepScroll) {
+      // 自管页的存档发生在离开过渡（App.vue route-fade :duration=200）结束后，
+      // 清零必须排在存档之后，否则往返丢滚动位置
+      return new Promise((resolve) => {
+        window.setTimeout(() => {
+          reset()
+          resolve({ left: 0, top: 0 })
+        }, 230)
+      })
+    }
+    reset()
+    return { left: 0, top: 0 }
+  },
   routes: [
     { path: '/', redirect: '/dashboard' },
     {
@@ -24,7 +51,7 @@ const router = createRouter({
     {
       path: '/library',
       component: () => import('@/views/library/Index.vue'),
-      meta: titleKey('nav.library'),
+      meta: { ...titleKey('nav.library'), ...keepScroll },
     },
     {
       path: '/pilot',
@@ -56,7 +83,7 @@ const router = createRouter({
     {
       path: '/bundles',
       component: () => import('@/views/bundles/Index.vue'),
-      meta: titleKey('nav.bundles'),
+      meta: { ...titleKey('nav.bundles'), ...keepScroll },
     },
     {
       path: '/crawl',

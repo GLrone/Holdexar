@@ -1,5 +1,7 @@
 <script setup lang="ts">
-import { watch } from 'vue'
+import { ref, watch } from 'vue'
+
+import { useOverlayA11y } from './useOverlayA11y'
 
 const props = withDefaults(
   defineProps<{
@@ -13,6 +15,9 @@ const props = withDefaults(
 )
 
 const model = defineModel<boolean>({ default: false })
+const panel = ref<HTMLElement | null>(null)
+
+useOverlayA11y(model, panel)
 
 watch(model, (v) => {
   document.body.style.overflow = v ? 'hidden' : ''
@@ -27,7 +32,16 @@ watch(model, (v) => {
         class="hl-overlay"
         @click="maskClosable && (model = false)"
       >
-        <div class="hl-dialog" :style="props.width > 0 ? { maxWidth: `${props.width}px` } : undefined" @click.stop>
+        <div
+          ref="panel"
+          class="hl-dialog"
+          role="dialog"
+          aria-modal="true"
+          :aria-label="title || undefined"
+          tabindex="-1"
+          :style="props.width > 0 ? { maxWidth: `${props.width}px` } : undefined"
+          @click.stop
+        >
           <div class="hl-dialog__head">
             <span class="hl-dialog__title">{{ title }}</span>
             <button type="button" class="hl-dialog__close" @click="model = false">✕</button>
