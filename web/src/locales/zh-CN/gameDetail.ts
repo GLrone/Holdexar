@@ -12,7 +12,8 @@ const gameDetail = {
   'gameDetail.section.bundles': '关联捆绑包',
 
   /* ── 渐变头部 ── */
-  'gameDetail.header.back': '返回游戏商店',
+  'gameDetail.header.back': '返回',
+  'gameDetail.header.setAlert': '设价格提醒',
   'gameDetail.header.developers': '开发：{names}',
   'gameDetail.header.publishers': '发行：{names}',
   'gameDetail.region.cn': '国区',
