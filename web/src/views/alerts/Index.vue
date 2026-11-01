@@ -4,6 +4,7 @@ import { alertsApi, notificationsApi, type AlertEventItem, type FeaturedConfig, 
 import { formatMinor } from '@/api/currencies'
 import { regionSelectOptions } from '@/api/selectOptions'
 import { amountToMinor, minorToInput } from '@/lib/notificationForms'
+import { errorText } from '@/lib/errorText'
 import { useI18n, type MessageKey } from '@/locales'
 import { useRegionsStore } from '@/stores/regions'
 import RegionFlag from '@/components/RegionFlag.vue'
@@ -44,7 +45,7 @@ function priceText(price?: number | null, currency?: string | null) {
   return price != null && currency ? `${formatMinor(price, currency)} (${currency})` : c('unconfirmedPrice')
 }
 function fail(cause: unknown) {
-  error.value = cause instanceof Error ? cause.message : String(cause)
+  error.value = errorText(cause)
   message.error(error.value)
 }
 async function load() {
@@ -205,7 +206,7 @@ async function preview(kind: 'rule' | 'featured') {
     if (kind === 'rule') { const result = await alertsApi.preview(rulePayload()); previewItems.value = [result]; previewTotal.value = 1; previewMatched.value = Number(result.matched) }
     else { const result = await alertsApi.featuredPreview(featuredPayload()); previewItems.value = result.items; previewTotal.value = result.total; previewMatched.value = result.matched; if (result.exclusions?.length) previewError.value = c('unknownRegion') }
     previewStale.value = false
-  } catch (cause) { previewError.value = cause instanceof Error ? cause.message : String(cause); previewItems.value = [] }
+  } catch (cause) { previewError.value = errorText(cause); previewItems.value = [] }
   finally { previewBusy.value = false }
 }
 function conditionLabel(condition: NotificationCondition) {
