@@ -1,6 +1,7 @@
 package games
 
 import (
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -66,7 +67,7 @@ type listItem struct {
 	Discount           int64            `json:"discount"`
 	DiscountLabel      string           `json:"discountLabel"`
 	DiscountEndsAt     *int64           `json:"discountEndsAt"`
-	PositiveRate       *float64         `json:"positiveRate"`
+	PositiveRate       *pyFloat         `json:"positiveRate"`
 	ReviewCount        int64            `json:"reviewCount"`
 	IsAdult            bool             `json:"isAdult"`
 	XgpTier            *string          `json:"xgpTier"`
@@ -109,12 +110,24 @@ func derefZero(v *int64) int64 {
 	return *v
 }
 
+// pyFloat Python float 的 JSON 形态：整值浮点必须带一位小数（96.0 而非 96），
+// 与 json.dumps 的浮点 repr 对齐。
+type pyFloat float64
+
+func (f pyFloat) MarshalJSON() ([]byte, error) {
+	v := float64(f)
+	if v == math.Trunc(v) && math.Abs(v) < 1e16 {
+		return []byte(strconv.FormatFloat(v, 'f', 1, 64)), nil
+	}
+	return []byte(strconv.FormatFloat(v, 'g', -1, 64)), nil
+}
+
 // rateRatio positive_rate / 100（Python 同款口径）。
-func rateRatio(v *int64) *float64 {
+func rateRatio(v *int64) *pyFloat {
 	if v == nil {
 		return nil
 	}
-	f := float64(*v) / 100
+	f := pyFloat(float64(*v) / 100)
 	return &f
 }
 

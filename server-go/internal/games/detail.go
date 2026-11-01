@@ -25,7 +25,7 @@ type gameDetail struct {
 	Tags               []tagItem        `json:"tags"`
 	Developers         []any            `json:"developers"`
 	Publishers         []any            `json:"publishers"`
-	PositiveRate       *float64         `json:"positiveRate"`
+	PositiveRate       *pyFloat         `json:"positiveRate"`
 	PositiveReviews    int64            `json:"positiveReviews"`
 	ReviewCount        int64            `json:"reviewCount"`
 	IsAdult            bool             `json:"isAdult"`
