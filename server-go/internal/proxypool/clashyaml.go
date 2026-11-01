@@ -307,6 +307,17 @@ func (p *blockParser) parseBlockMapping(indent int) (any, error) {
 			return nil, err
 		}
 		if !hasVal {
+			// PyYAML 语义：块序列允许与父键同缩进（`key:` 后顶格 `-`）——
+			// yaml.safe_dump 的列表值与多数订阅原文都是这一形态。
+			if p.pos < len(p.lines) && p.lines[p.pos].indent == indent &&
+				isSequenceItem(p.lines[p.pos].content) {
+				v, err := p.parseBlockSequence(indent)
+				if err != nil {
+					return nil, err
+				}
+				out[keyStr] = v
+				continue
+			}
 			v, err := p.parseChildBlock(indent)
 			if err != nil {
 				return nil, err
