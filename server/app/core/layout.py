@@ -34,13 +34,14 @@ DATA_DIR_NAME = "data"
 STAGING_DIR_NAME = "update-staging"
 LOGS_DIR_NAME = "logs"
 
-# 事务状态机枚举
+# 事务状态机枚举（failed 从未成为现役写入者，已退役；recovery_required=恢复
+# 失败需人工处理的第六态，fail-closed 保留现场）
 STAGE_STAGED = "staged"
 STAGE_SWITCHING = "switching"
 STAGE_VERIFYING = "verifying"
 STAGE_COMMITTED = "committed"
-STAGE_FAILED = "failed"
 STAGE_ROLLED_BACK = "rolled_back"
+STAGE_RECOVERY_REQUIRED = "recovery_required"
 
 
 def get_state_dir(install_root: Path) -> Path:

@@ -804,8 +804,8 @@ def _fail(
             update_data.rollback(root, children_stopped=True)
         except Exception as exc:
             error = f"{error}；数据恢复未完成，已保留现场：{exc}"
-            layout.update_transaction(root, "recovery_required", error=error)
-            diagnosis.update(success=False, error=error, dataPreserved=True, stage="recovery_required")
+            layout.update_transaction(root, layout.STAGE_RECOVERY_REQUIRED, error=error)
+            diagnosis.update(success=False, error=error, dataPreserved=True, stage=layout.STAGE_RECOVERY_REQUIRED)
             _write_diagnosis(root, diagnosis)
             return False
     elif tx.get("dataDir"):
@@ -814,7 +814,7 @@ def _fail(
         try:
             update_data.abort_preparation(root, data_dir=Path(tx["dataDir"]))
         except Exception as exc:
-            layout.update_transaction(root, "recovery_required", error=f"恢复点准备未结束：{exc}")
+            layout.update_transaction(root, layout.STAGE_RECOVERY_REQUIRED, error=f"恢复点准备未结束：{exc}")
             return False
     target_ver = str(diagnosis.get("targetVersion") or "")
     pointer = launched_version or layout.get_current_version(root)
@@ -832,8 +832,8 @@ def _fail(
             update_data.finish_rollback(root)
         except Exception as exc:
             error = f"{error}；程序与数据恢复尚未完成：{exc}"
-            layout.update_transaction(root, "recovery_required", error=error, relaunchPrevious=False)
-            diagnosis.update(success=False, error=error, stage="recovery_required", dataPreserved=True)
+            layout.update_transaction(root, layout.STAGE_RECOVERY_REQUIRED, error=error, relaunchPrevious=False)
+            diagnosis.update(success=False, error=error, stage=layout.STAGE_RECOVERY_REQUIRED, dataPreserved=True)
             _write_diagnosis(root, diagnosis)
             return False
     diagnosis.update({
@@ -932,6 +932,7 @@ def recover_interrupted_update(root: Path) -> bool:
             layout.confirm_version(root, compatible)
             layout.update_transaction(root, layout.STAGE_COMMITTED, currentVersion=compatible)
             _finish_diagnosis(root, compatible)
+            layout.clear_transaction(root)
             return True
         if tx.get("dataPrepared"):
             if tx.get("launchPending"):
@@ -1144,6 +1145,8 @@ def _commit(
     _log_update(root, f"换装成功！清理历史版本：{pruned}")
 
     _finish_diagnosis(root, target_version, diagnosis)
+    # 提交即终态：指针与相容记录已落 current.json，事务档案使命结束
+    layout.clear_transaction(root)
     return True
 
 
