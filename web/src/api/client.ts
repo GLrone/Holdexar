@@ -1196,6 +1196,19 @@ export const accountApi = {
   /** 解绑全部账号（清账号表；手填 SteamID64 / API Key 不动） */
   unbind: () => request<AccountStatus>('DELETE', '/account/cookies'),
   sync: () => request<AccountStatus>('POST', '/account/sync'),
+  /** 按账号聚合刷新：钱包+资料同步完成在响应内；queued 是后台受理标记，
+   *  完成与否要靠随后的账号快照重拉（GET /account）确认。400=steamid 非数字，404=账号不存在 */
+  refreshAccount: (steamId: string) =>
+    request<AccountRefreshResult>('POST', `/account/steam_id/${steamId}/refresh`),
+}
+
+/** 按账号聚合刷新响应（受理式：wallet 即时结果 + queued 后台受理标记） */
+export interface AccountRefreshResult {
+  ok: boolean
+  steamId: string
+  wallet: { ok: boolean; wallet: WalletSnapshot }
+  /** 后台受理的同步项（wishlist / family / bills） */
+  queued: string[]
 }
 
 /** 应用内账号密码登录的会话状态快照（后端状态机，见 /account/login/*） */

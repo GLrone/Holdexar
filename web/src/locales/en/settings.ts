@@ -78,6 +78,8 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.steam.redeems': 'Redeems',
   'settings.steam.setActive': 'Set active',
   'settings.steam.unbind': 'Unbind',
+  'settings.steam.syncOne': 'Sync',
+  'settings.steam.accountCount': '{n} accounts',
   'settings.steam.syncMeta': 'Last synced {time} · the wallet refreshes every minute (accounts staggered at random)',
 
   /* Account card (SteamID64 / Web API Key) */
@@ -139,6 +141,8 @@ const settings: Partial<Record<MessageKey, string>> = {
   /* Result toasts */
   'settings.toast.accountSwitched': 'Active account switched',
   'settings.toast.accountUnbound': 'Unbound {name}',
+  'settings.toast.accountSyncQueued': 'Sync started: {name}',
+  'settings.toast.accountSyncFailed': 'Sync failed: {error}',
   'settings.toast.backupCreated': 'Backup created: {name} ({size}, {games} games, integrity verified)',
   'settings.toast.backupVerified': 'Verified: {name} ({games} games)',
   'settings.toast.backupVerifiedDeep': 'Deep verify passed: {name} ({games} games, every index and constraint matches)',
