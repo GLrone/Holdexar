@@ -23,6 +23,8 @@ import (
 	"holdexar/server-go/internal/httpapi"
 	"holdexar/server-go/internal/middleware"
 	"holdexar/server-go/internal/notifications"
+	"holdexar/server-go/internal/occupancy"
+	"holdexar/server-go/internal/proxypool"
 	"holdexar/server-go/internal/rates"
 	"holdexar/server-go/internal/regions"
 	"holdexar/server-go/internal/settings"
@@ -108,6 +110,10 @@ func main() {
 			// mcp.enabled 运行时重载与运行态投影：函数字段注入，settings 不反向依赖 agent
 			settings.OnMCPEnabledWrite = agent.Reapply
 			settings.MCPStatus = agent.MCPStatus
+			// 体检进度发布位：仅维护包络为体检种类时发布（重建在位不发布）
+			proxypool.MaintenanceHealthActive = func() bool {
+				return occupancy.MaintenanceKind() == occupancy.MaintenanceHealth
+			}
 		},
 	}
 
