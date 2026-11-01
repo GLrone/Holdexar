@@ -310,6 +310,16 @@ const { addOpen, addText, addMsg, addBusy, submitAdd } = usePasteAdd({
   onSettled: () => load(),
 })
 
+// 无结果空态的添加出路（同一条粘贴添加链，不另起通道）：打开时预填搜索词，
+// 但搜索词多半不是链接——提示条引导换成商店页链接，可改可删
+const addFromSearch = ref(false)
+
+function toggleAdd(fromSearch = false) {
+  addFromSearch.value = fromSearch
+  if (fromSearch && !addText.value.trim()) addText.value = store.committedSearch
+  addOpen.value = !addOpen.value
+}
+
 // 首爬收敛（爬取从跑到停）→ 重取一次：条目补全后空态自然消失
 watch(
   () => crawlStatus.running,
@@ -625,7 +635,8 @@ onBeforeUnmount(() => {
       <!-- 空状态（挂 data-tour：ProductTour「找游戏」步的聚光锚点——空态
            正是那步要教的场景。不用 data-section：那会被 HlSectionRail 扫成
            分节刻度，找游戏页本无分节轨）
-           两态分开：A 库里没有游戏（给添加动作）≠ C 有条件但没匹配（给清除入口）。
+           两态分开：A 库里没有游戏（给添加动作）≠ C 有条件但没匹配（给清除与
+           添加入口——搜不到也能把游戏加进来，补齐「搜→没找到→加上」链）。
            添加只进目录并自动取一次价格，不需要 Steam 账号，也不经过任务页 -->
       <HlEmpty
         v-if="!isLoading && !isError && items.length === 0 && initialized"
@@ -646,6 +657,9 @@ onBeforeUnmount(() => {
             <HlButton size="sm" @click="clearFilters">
               {{ t('library.empty.filter.clear') }}
             </HlButton>
+            <HlButton size="sm" variant="primary" @click="toggleAdd(true)">
+              {{ t('library.empty.filter.add') }}
+            </HlButton>
           </div>
         </template>
         <template v-else-if="addedPending > 0">
@@ -656,33 +670,37 @@ onBeforeUnmount(() => {
           <h3>{{ t('library.empty.library.title') }}</h3>
           <p>{{ t('library.empty.library.hint') }}</p>
           <div class="lib-empty-actions">
-            <HlButton size="sm" variant="primary" @click="addOpen = !addOpen">
+            <HlButton size="sm" variant="primary" @click="toggleAdd()">
               {{ t('library.empty.library.paste') }}
             </HlButton>
             <HlButton size="sm" @click="router.push('/pool?add=1')">
               {{ t('library.empty.library.import') }}
             </HlButton>
           </div>
-          <!-- 内联粘贴区：粘贴即入库并自动取价（与仪表盘欢迎卡同一链路） -->
-          <div v-if="addOpen" class="lib-empty-add">
-            <HlTextarea v-model="addText" :rows="3" :placeholder="t('dashboard.welcome.pasteHint')" />
-            <div class="lib-empty-actions" style="margin-top: 8px">
-              <HlButton
-                size="sm"
-                variant="primary"
-                :loading="addBusy"
-                :disabled="addBusy || !addText.trim()"
-                @click="submitAdd"
-              >
-                {{ addBusy ? t('dashboard.welcome.adding') : t('dashboard.welcome.add') }}
-              </HlButton>
-              <HlButton variant="text" size="sm" :disabled="addBusy" @click="addOpen = false">
-                {{ t('common.cancel') }}
-              </HlButton>
-              <span v-if="addMsg" class="lib-empty-msg">{{ addMsg }}</span>
-            </div>
-          </div>
         </template>
+        <!-- 内联粘贴区：空库态与无结果态共用同一份（从无结果态进入时已预填
+             搜索词，用提示条说清「要换成商店链接」，避免用户以为名字能直接提交） -->
+        <div v-if="addOpen && !removedView" class="lib-empty-add">
+          <HlTextarea v-model="addText" :rows="3" :placeholder="t('dashboard.welcome.pasteHint')" />
+          <p v-if="addFromSearch" class="lib-empty-hint">
+            {{ t('library.empty.filter.addHint') }}
+          </p>
+          <div class="lib-empty-actions" style="margin-top: 8px">
+            <HlButton
+              size="sm"
+              variant="primary"
+              :loading="addBusy"
+              :disabled="addBusy || !addText.trim()"
+              @click="submitAdd"
+            >
+              {{ addBusy ? t('dashboard.welcome.adding') : t('dashboard.welcome.add') }}
+            </HlButton>
+            <HlButton variant="text" size="sm" :disabled="addBusy" @click="addOpen = false">
+              {{ t('common.cancel') }}
+            </HlButton>
+            <span v-if="addMsg" class="lib-empty-msg">{{ addMsg }}</span>
+          </div>
+        </div>
       </HlEmpty>
 
       <!-- 游戏卡片网格 -->
@@ -857,6 +875,12 @@ onBeforeUnmount(() => {
   margin-inline: auto;
 }
 .lib-empty-msg {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+/* 无结果态预填搜索词后的引导提示 */
+.lib-empty-hint {
+  margin: 6px 0 0;
   font-size: 12px;
   color: var(--text-secondary);
 }

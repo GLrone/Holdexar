@@ -25,10 +25,12 @@ const library = {
   'library.empty.library.paste': '粘贴游戏链接',
   'library.empty.library.import': '导入游戏列表',
 
-  /* 空态 C：有搜索/筛选条件但没匹配（与「库里没有游戏」分开说，给清除入口） */
+  /* 空态 C：有搜索/筛选条件但没匹配（与「库里没有游戏」分开说，给清除与添加入口） */
   'library.empty.filter.title': '没有找到符合条件的游戏',
   'library.empty.filter.hint': '试试调整搜索词，或清除筛选条件。',
   'library.empty.filter.clear': '清除搜索与筛选',
+  'library.empty.filter.add': '没找到？粘贴链接添加',
+  'library.empty.filter.addHint': '搜索词已填入，但它不是链接——请替换成该游戏的 Steam 商店页链接后再添加。',
 
   /* 无限滚动哨兵 */
   'library.loadingMore': '加载更多...',
