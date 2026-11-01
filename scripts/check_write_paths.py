@@ -54,6 +54,9 @@ NETWORK_METHODS = {"request", "get", "post", "put", "patch", "delete", "send", "
 
 # (文件, 函数) → (语句种类及调用点上限, 理由)。
 ALLOW: dict[tuple[str, str], tuple[dict[str, int], str]] = {
+    ("scripts/bridge_smoke.py", "make_data_dir"): (
+        {"execute": 1},
+        "桥接冒烟的夹具库：空库只盖结构版本号供服务端启动校验，非应用库"),
     ("scripts/check_launcher_contract.py", "make_database"): (
         {"execute": 3, "commit": 1},
         "启动器合同检查的测试夹具：沙盒内造带 schema 的迷你库，非生产数据"),
