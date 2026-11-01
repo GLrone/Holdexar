@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { alertsApi, notificationsApi, type AlertEventItem, type FeaturedConfig, type NotificationCandidate, type NotificationCondition, type NotificationFrequency, type NotificationPrefs, type NotificationPrefsUpdate, type NotificationStats, type PriceAlertDraft, type PriceAlertItem, type RuleEvaluation, type GameSearchResult } from '@/api/client'
 import { formatMinor } from '@/api/currencies'
 import { regionSelectOptions } from '@/api/selectOptions'
@@ -223,7 +224,17 @@ function conditionNumbers(condition: NotificationCondition, evaluation: RuleEval
 function candidatePrice(item: NotificationCandidate) { const value = item.payload; return priceText(value.price ?? value.current?.price, value.currency ?? value.current?.currency) }
 const historyPreview = ref<NotificationCandidate | null>(null)
 const historyOpen = computed({ get: () => historyPreview.value !== null, set: value => { if (!value) historyPreview.value = null } })
-onMounted(load)
+const route = useRoute()
+onMounted(async () => {
+  await load()
+  // 详情页「设价格提醒」跳入：query 带 appid+name，直开规则表单并预选该游戏（一次性读取）
+  const appid = Number(route.query.appid)
+  if (appid > 0) {
+    draft.appid = appid
+    search.value = String(route.query.name || appid)
+    tab.value = 'rules'
+  }
+})
 </script>
 
 <template>
