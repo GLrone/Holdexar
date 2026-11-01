@@ -410,7 +410,7 @@ def supports_data_protocol(exe: Path) -> bool:
     try:
         with tempfile.TemporaryDirectory(prefix="holdexar-update-protocol-") as tmp:
             result_path = Path(tmp) / "capability.json"
-            env = dict(os.environ, HOLDEXAR_UPDATE_PROTOCOL_RESULT=str(result_path))
+            env = dict(os.environ, **{f"{ENV_PREFIX}UPDATE_PROTOCOL_RESULT": str(result_path)})
             result = subprocess.run(
                 [str(exe), "--update-protocol", "--help"], env=env,
                 capture_output=True, timeout=25,
@@ -507,7 +507,7 @@ def probe_version_health(
     if not exe.is_file():
         return False, f"{HEALTH_BINDING_ERROR}：主程序不存在"
 
-    expected_data_dir = (data_dir or (root / "data")).resolve()
+    expected_data_dir = (data_dir or (root / layout.DATA_DIR_NAME)).resolve()
     transaction = layout.read_transaction(root) or {}
     protected = bool(transaction.get("dataPrepared") and not transaction.get("dataAccepted")
                      and transaction.get("dataRecoveryPhase") != "restored") if require_guard is None else require_guard
@@ -703,7 +703,7 @@ def _verify_staging_payload(staging_dir: Path, manifest: dict[str, Any]) -> str:
 
 def _resolve_data_dir(root: Path, requested: Path | None) -> Path:
     """本次换装的数据目录：显式传入优先，否则安装根 data/。"""
-    candidate = Path(requested).resolve() if requested else (root / "data").resolve()
+    candidate = Path(requested).resolve() if requested else (root / layout.DATA_DIR_NAME).resolve()
     return candidate
 
 
@@ -715,7 +715,7 @@ def _spawn_detached(root: Path, exe: Path, argv: list[str] | None = None) -> Non
         env.pop(f"{ENV_PREFIX}{key}", None)
     env[f"{ENV_PREFIX}INSTALL_ROOT"] = str(root)
     tx = layout.read_transaction(root) or {}
-    env[f"{ENV_PREFIX}DATA_DIR"] = str(tx.get("dataDir") or (root / "data"))
+    env[f"{ENV_PREFIX}DATA_DIR"] = str(tx.get("dataDir") or root / layout.DATA_DIR_NAME)
     subprocess.Popen(
         command,
         cwd=str(exe.parent),
@@ -736,7 +736,7 @@ def _relaunch_previous(root: Path, version: str | None) -> bool:
         tx = layout.read_transaction(root) or {}
         healthy, reason = probe_version_health(
             root, target_ver, str(tx.get("attemptId") or "recovery"),
-            data_dir=Path(tx.get("dataDir") or root / "data"), require_guard=False,
+            data_dir=Path(tx.get("dataDir") or root / layout.DATA_DIR_NAME), require_guard=False,
         )
         layout.update_transaction(root, tx.get("stage", layout.STAGE_ROLLED_BACK), sourceServiceHealthy=healthy)
         if not healthy:
