@@ -12,7 +12,7 @@ import { useThemeStore } from '@/stores/theme'
 import { useTourStore } from '@/stores/tour'
 import { useUpdaterStore } from '@/stores/updater'
 import { useI18n, type MessageKey } from '@/locales'
-import { ratesApi, type WalletSnapshot } from '@/api/client'
+import { ratesApi, type SteamAccountItem, type WalletSnapshot } from '@/api/client'
 import { buildRateMap, formatWalletCny, walletToCny, type RateMap } from '@/lib/walletCny'
 import { walletSyncOk, walletSyncedAt } from '@/lib/walletSync'
 import { APP_NAME } from '@/appInfo'
@@ -329,6 +329,18 @@ async function manualRefreshWallet() {
     message.error(accountStore.status?.sync_error || t('wallet.toastFailed'))
   }
 }
+
+/* 弹层行快捷切换当前账号：点击行内头像/昵称即生效（切换可逆，无需确认）；
+   余额区与行间空白不挂点击，避免误触 */
+async function switchWalletAccount(acc: SteamAccountItem) {
+  if (acc.is_active || accountStore.switching) return
+  try {
+    await accountStore.setActive(acc.steam_id)
+    message.success(t('wallet.toastSwitched', { name: acc.persona_name || acc.friend_code }))
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+  }
+}
 </script>
 
 <template>
@@ -413,18 +425,25 @@ async function manualRefreshWallet() {
                   class="wallet-balances-row"
                   :class="{ 'is-primary': acc.is_primary, 'is-active': acc.is_active }"
                 >
-                  <HlImg class="wallet-balances-row__avatar" :src="acc.avatar_url" alt="">
-                    <template #fallback>
-                      <span class="wallet-balances-row__avatar wallet-balances-row__avatar--fallback">
-                        {{ (acc.persona_name || acc.friend_code || '?').slice(0, 1) }}
-                      </span>
-                    </template>
-                  </HlImg>
-                  <span class="wallet-balances-row__name">
-                    {{ acc.persona_name || acc.friend_code || t('wallet.noNickname') }}
-                    <span v-if="acc.is_primary" class="wallet-balances-row__badge">{{ t('wallet.badgePrimary') }}</span>
-                    <span v-if="acc.is_active" class="wallet-balances-row__badge is-cur">{{ t('wallet.badgeCurrent') }}</span>
-                  </span>
+                  <button
+                    class="wallet-balances-row__id"
+                    :title="acc.is_active ? undefined : t('wallet.popSwitchTip')"
+                    :disabled="acc.is_active || accountStore.switching"
+                    @click="switchWalletAccount(acc)"
+                  >
+                    <HlImg class="wallet-balances-row__avatar" :src="acc.avatar_url" alt="">
+                      <template #fallback>
+                        <span class="wallet-balances-row__avatar wallet-balances-row__avatar--fallback">
+                          {{ (acc.persona_name || acc.friend_code || '?').slice(0, 1) }}
+                        </span>
+                      </template>
+                    </HlImg>
+                    <span class="wallet-balances-row__name">
+                      {{ acc.persona_name || acc.friend_code || t('wallet.noNickname') }}
+                      <span v-if="acc.is_primary" class="wallet-balances-row__badge">{{ t('wallet.badgePrimary') }}</span>
+                      <span v-if="acc.is_active" class="wallet-balances-row__badge is-cur">{{ t('wallet.badgeCurrent') }}</span>
+                    </span>
+                  </button>
                   <span class="wallet-balances-row__balance">
                     {{ acc.wallet?.balance_display ?? '—' }}
                     <!-- CNY 换算（原币 CNY 跳过；缺汇率 —） -->
@@ -681,6 +700,31 @@ async function manualRefreshWallet() {
   justify-content: center;
   font-size: 12px;
   color: var(--text-muted);
+}
+
+/* 行内头像+昵称是切换点击区（可点切换当前账号）；余额区与空白不挂点击 */
+.wallet-balances-row__id {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  border-radius: 6px;
+}
+
+.wallet-balances-row__id:disabled {
+  cursor: default;
+}
+
+.wallet-balances-row__id:hover:not(:disabled) .wallet-balances-row__name {
+  color: var(--accent);
 }
 
 .wallet-balances-row__name {

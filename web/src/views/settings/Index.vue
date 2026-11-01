@@ -470,6 +470,35 @@ async function removeAccount(steamId: string, label: string) {
   }
 }
 
+/* 行内「同步」：按账号聚合刷新（钱包/资料同步完成在响应内，账单/家庭/愿望单为
+   后台受理——完成与否看随后的账号快照重拉，这里安排一次延迟刷新更新该行） */
+const syncingSteamId = ref('')
+let snapshotRefreshTimer: ReturnType<typeof setTimeout> | null = null
+function scheduleSnapshotRefresh() {
+  if (snapshotRefreshTimer) clearTimeout(snapshotRefreshTimer)
+  snapshotRefreshTimer = setTimeout(() => {
+    snapshotRefreshTimer = null
+    void accountStore.load()
+  }, 4000)
+}
+async function refreshOneAccount(acc: SteamAccountItem) {
+  if (syncingSteamId.value) return
+  syncingSteamId.value = acc.steam_id
+  try {
+    const r = await accountStore.refreshAccount(acc.steam_id)
+    if (r.ok) {
+      message.success(t('settings.toast.accountSyncQueued', { name: acc.persona_name || acc.friend_code }))
+      scheduleSnapshotRefresh()
+    } else {
+      message.error(t('settings.toast.accountSyncFailed', { error: t('settings.steam.unknown') }))
+    }
+  } catch (e) {
+    message.error(t('settings.toast.accountSyncFailed', { error: e instanceof Error ? e.message : String(e) }))
+  } finally {
+    syncingSteamId.value = ''
+  }
+}
+
 /* ── 数据备份（VACUUM INTO 在线快照：不占用库文件、含 WAL 已提交事务）── */
 const backups = ref<BackupItem[]>([])
 const backingUp = ref(false)
@@ -1251,7 +1280,10 @@ onMounted(() => {
   })
 })
 
-onUnmounted(stopLoginPolling)
+onUnmounted(() => {
+  stopLoginPolling()
+  if (snapshotRefreshTimer) clearTimeout(snapshotRefreshTimer)
+})
 </script>
 
 <template>
@@ -1267,7 +1299,12 @@ onUnmounted(stopLoginPolling)
     <template v-else>
       <!-- Steam 账户绑定（Cookie → 钱包/结算区） -->
       <div class="card settings-card" data-section="settings.section.steamAccount">
-        <div class="section-title">{{ t('settings.section.steamAccount') }}</div>
+        <div class="section-title">
+          {{ t('settings.section.steamAccount') }}
+          <span v-if="accounts.length" class="section-title__count">
+            {{ t('settings.steam.accountCount', { n: accounts.length }) }}
+          </span>
+        </div>
         <div class="section-desc">{{ t('settings.steam.desc') }}</div>
 
         <!-- 应用内账号密码登录：后端直调 Steam 认证 API，二次验证与应用内完成 -->
@@ -1512,6 +1549,15 @@ onUnmounted(stopLoginPolling)
 
               <!-- 行操作 -->
               <div class="account-row__actions">
+                <HlButton
+                  variant="text"
+                  size="sm"
+                  :disabled="!!syncingSteamId"
+                  :loading="syncingSteamId === acc.steam_id"
+                  @click="refreshOneAccount(acc)"
+                >
+                  {{ t('settings.steam.syncOne') }}
+                </HlButton>
                 <HlButton
                   v-if="!acc.is_active"
                   variant="text"
@@ -2611,6 +2657,14 @@ onUnmounted(stopLoginPolling)
 .account-summary__head {
   display: flex;
   justify-content: flex-end;
+}
+
+/* 卡标题内的账号计数（非破坏性：只加内联小字，不动标题布局） */
+.section-title__count {
+  margin-left: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-muted);
 }
 
 /* ── 多账号列表行 ── */

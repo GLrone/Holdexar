@@ -63,6 +63,12 @@ export const useAccountStore = defineStore('account', () => {
     }
   }
 
+  /** 按账号聚合刷新：钱包/资料同步完成在响应内；账单/家庭/愿望单为后台受理，
+   *  完成与否要靠随后的账号快照重拉（load()）确认，本方法不整包 apply */
+  async function refreshAccount(steamId: string) {
+    return accountApi.refreshAccount(steamId)
+  }
+
   async function bindCookies(cookies: string) {
     apply(await accountApi.bindCookies(cookies))
   }
@@ -90,6 +96,6 @@ export const useAccountStore = defineStore('account', () => {
   return {
     status, syncing, loaded, switching,
     accounts, primary, active,
-    load, sync, bindCookies, setActive, removeAccount, unbind,
+    load, sync, bindCookies, setActive, removeAccount, unbind, refreshAccount,
   }
 })
