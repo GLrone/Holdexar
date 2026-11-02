@@ -18,6 +18,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"sort"
 	"fmt"
 	"os"
 	"strconv"
@@ -342,6 +343,10 @@ func main() {
 		seriesFull(dbPath)
 	case "derived":
 		derivedBatch(dbPath, os.Args[3])
+	case "listbench":
+		listBench(dbPath)
+	case "same":
+		fmt.Println(derived.IsSameSeries(os.Args[3], nil, os.Args[4], nil))
 	default:
 		die(fmt.Errorf("未知命令 %s", cmd))
 	}
@@ -389,4 +394,33 @@ func derivedBatch(dbPath, jsonPath string) {
 		die(err)
 	}
 	fmt.Printf("DERIVED_RESULT = PASS rows=%d elapsed=%s\n", n, time.Since(t0).Round(time.Millisecond))
+}
+
+
+// listBench G6-5 瓶颈定案：go 引擎内同 SQL 串行 100 发分位（排除 HTTP 层）。
+func listBench(dbPath string) {
+	db, _ := openDB(dbPath)
+	defer db.Close()
+	sql := "SELECT g.appid, g.name, g.smart_score, g.diff_fen, g.hl_flag, g.pp_flag," +
+		" cp1.price, cp1.discount_percent, cp1.cny_fen" +
+		" FROM games g JOIN game_current_prices cp1 ON cp1.appid=g.appid AND cp1.region_code='CN' AND cp1.price_status='ok'" +
+		" WHERE g.appid NOT IN (SELECT appid FROM catalog_removals)" +
+		" ORDER BY g.appid IN (21090) DESC, (cp1.price IS NOT NULL) DESC, g.smart_score DESC, g.diff_fen/(1000.0) DESC, g.review_count/(1000.0) DESC, g.positive_rate DESC, g.appid DESC" +
+		" LIMIT 21 OFFSET 0"
+	var ts []float64
+	for i := 0; i < 100; i++ {
+		t0 := time.Now()
+		rows, err := db.Query(sql)
+		if err != nil {
+			die(err)
+		}
+		for rows.Next() {
+			var a, b, c, d, e, f, g2, h, j any
+			_ = rows.Scan(&a, &b, &c, &d, &e, &f, &g2, &h, &j)
+		}
+		rows.Close()
+		ts = append(ts, float64(time.Since(t0).Microseconds())/1000)
+	}
+	sort.Float64s(ts)
+	fmt.Printf("LISTBENCH: n=100 p50=%.1fms p95=%.1fms\n", ts[50], ts[95])
 }
