@@ -44,42 +44,47 @@ func main() {
 	bootstrapFileFlag := flag.String("bootstrap-file", "", "健康就绪后写入一次性引导票据的文件路径（桌面壳桥接，父目录由调用方创建）")
 	flag.Parse()
 
-	// 日志接线点：stderr 之外同步写入环形缓冲（日志页 SSE 的回放事实源）；
-	// 完整日志设施迁移前，行格式为时刻前缀 + 原文案。
+	// 日志接线点：stderr 之外同步写入环形缓冲（日志页 SSE 的回放事实源）。
+	// 行格式对齐 py HumanFormatter：HH:MM:SS [结果词] 模块中文名 · 主句——
+	// 前端日志页按行首结果词分色（失败/严重→error，注意→warning，其余 info）；
+	// 模块中文名服务端面统一「服务端」。
 	bus := events.NewBus()
 	ring := eventstream.NewRing(2000)
-	logLine := func(format string, args ...any) {
+	logLineAt := func(level string, format string, args ...any) {
 		msg := fmt.Sprintf(format, args...)
-		fmt.Fprintln(os.Stderr, msg)
-		ring.Write(time.Now().Format("15:04:05") + " " + msg)
+		line := time.Now().Format("15:04:05") + " [" + level + "] 服务端 · " + msg
+		fmt.Fprintln(os.Stderr, line)
+		ring.Write(line)
 	}
+	logLine := func(format string, args ...any) { logLineAt("信息", format, args...) }
+	logFail := func(format string, args ...any) { logLineAt("失败", format, args...) }
 
 	if *dataDirFlag != "" {
 		os.Setenv(config.EnvPrefix+"DATA_DIR", *dataDirFlag)
 	}
 	dataDir, err := config.ResolveDataDir()
 	if err != nil {
-		logLine("%v", err)
+		logFail("%v", err)
 		os.Exit(1)
 	}
 	distDir, err := config.WebDistDir()
 	if err != nil {
-		logLine("%v", err)
+		logFail("%v", err)
 		os.Exit(1)
 	}
 
 	dbPath := filepath.Join(dataDir, "holdexar.db")
 	if _, err := os.Stat(dbPath); err != nil {
-		logLine("数据库不存在：%s（首次建库由初始化链负责，服务端不代建）", dbPath)
+		logFail("数据库不存在：%s（首次建库由初始化链负责，服务端不代建）", dbPath)
 		os.Exit(1)
 	}
 	if err := store.EnsureSupportedVersion(dbPath, schemaVersion); err != nil {
-		logLine("%v", err)
+		logFail("%v", err)
 		os.Exit(1)
 	}
 	db, err := store.Open(dbPath)
 	if err != nil {
-		logLine("%v", err)
+		logFail("%v", err)
 		os.Exit(1)
 	}
 	defer db.Close()
@@ -105,7 +110,7 @@ func main() {
 				EnabledByFlag: *mcpEnabled,
 				Log:           logLine,
 			}); err != nil {
-				logLine("%v", err)
+				logFail("%v", err)
 				os.Exit(1)
 			}
 			// mcp.enabled 运行时重载与运行态投影：函数字段注入，settings 不反向依赖 agent
@@ -133,7 +138,7 @@ func main() {
 				if _, err := proxypool.RunPendingRebuild(
 					context.Background(),
 					proxypool.KernelRebuildFunc(writeGate, dataDir, kernelExe, &kernelRuntime, 0)); err != nil {
-					logLine("代理池重建失败：%v", err)
+					logFail("代理池重建失败：%v", err)
 				}
 			}
 		}()
@@ -170,14 +175,14 @@ func main() {
 
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {
-		logLine("服务启动失败：%v", err)
+		logFail("服务启动失败：%v", err)
 		os.Exit(1)
 	}
 	// 监听就绪即健康可用（路由已装配完成）：此刻发布引导票据，壳侧
 	// health 轮询通过时票据必然已在场。
 	if tickets != nil {
 		if err := tickets.Publish(systemx.CreateBootstrap()); err != nil {
-			logLine("%v", err)
+			logFail("%v", err)
 			os.Exit(1)
 		}
 		defer tickets.Close()
@@ -194,7 +199,7 @@ func main() {
 	select {
 	case err := <-serveErr:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logLine("服务启动失败：%v", err)
+			logFail("服务启动失败：%v", err)
 			os.Exit(1)
 		}
 	case <-stop:
