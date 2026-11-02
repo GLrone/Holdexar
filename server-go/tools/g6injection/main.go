@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
@@ -24,6 +25,7 @@ import (
 	"time"
 
 	"holdexar/server-go/internal/crawler/dbwriter"
+	"holdexar/server-go/internal/derived"
 	"holdexar/server-go/internal/store"
 )
 
@@ -336,7 +338,55 @@ func main() {
 	case "migrationgate":
 		ver, _ := strconv.Atoi(os.Args[3])
 		migrationgate(dbPath, ver)
+	case "series":
+		seriesFull(dbPath)
+	case "derived":
+		derivedBatch(dbPath, os.Args[3])
 	default:
 		die(fmt.Errorf("未知命令 %s", cmd))
 	}
+}
+
+
+// seriesFull 实测集 2：全量 RefreshSeries（changed=nil, overrides=nil），计时。
+func seriesFull(dbPath string) {
+	db, _ := openDB(dbPath)
+	defer db.Close()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		die(err)
+	}
+	defer conn.Close()
+	t0 := time.Now()
+	n, err := derived.RefreshSeries(context.Background(), conn, nil, nil)
+	if err != nil {
+		die(err)
+	}
+	fmt.Printf("SERIES_RESULT = PASS rows=%d elapsed=%s\n", n, time.Since(t0).Round(time.Millisecond))
+}
+
+// derivedBatch 实测集 3：对 JSON appids 清单跑 UpdatePriceDerived(history=true)。
+func derivedBatch(dbPath, jsonPath string) {
+	raw, err := os.ReadFile(jsonPath)
+	if err != nil {
+		die(err)
+	}
+	var ids []int64
+	if err := json.Unmarshal(raw, &ids); err != nil {
+		die(err)
+	}
+	db, _ := openDB(dbPath)
+	defer db.Close()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		die(err)
+	}
+	defer conn.Close()
+	t0 := time.Now()
+	n, err := derived.UpdatePriceDerived(context.Background(), conn, ids,
+		derived.Options{History: true, Now: time.Now()})
+	if err != nil {
+		die(err)
+	}
+	fmt.Printf("DERIVED_RESULT = PASS rows=%d elapsed=%s\n", n, time.Since(t0).Round(time.Millisecond))
 }
