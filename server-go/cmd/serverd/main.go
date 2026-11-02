@@ -16,6 +16,7 @@ import (
 
 	"holdexar/server-go/internal/access"
 	"holdexar/server-go/internal/agent"
+	"holdexar/server-go/internal/clashkernel"
 	"holdexar/server-go/internal/config"
 	"holdexar/server-go/internal/events"
 	"holdexar/server-go/internal/eventstream"
@@ -115,6 +116,30 @@ func main() {
 				return occupancy.MaintenanceKind() == occupancy.MaintenanceHealth
 			}
 		},
+	}
+
+	// 内核运行时接线（G6-7）：随包/已位内核存在时构造 Runtime 并接上重建
+	// 消费链——占用释放钩子（爬取收尾即刻消费）+ 5min 周期拍（空闲消费，
+	// 对齐 Python proxypool_cycle 的重建成分）。内核缺席时代理面静默不接
+	// 线（数据目录无 clash 内核 = 用户未启用代理面）。
+	kernelExe := filepath.Join(dataDir, "clash", "mihomo.exe")
+	if _, err := os.Stat(kernelExe); err == nil {
+		var kernelRuntime clashkernel.Runtime
+		proxypool.WireRebuildPipeline(writeGate, dataDir, kernelExe, &kernelRuntime, 0)
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				if _, err := proxypool.RunPendingRebuild(
+					context.Background(),
+					proxypool.KernelRebuildFunc(writeGate, dataDir, kernelExe, &kernelRuntime, 0)); err != nil {
+					logLine("代理池重建失败：%v", err)
+				}
+			}
+		}()
+		logLine("代理池内核运行时就位：%s", kernelExe)
+	} else {
+		logLine("代理池内核未就位，代理面未接线（%s 不存在）", kernelExe)
 	}
 
 	var tickets *access.BootstrapFile
