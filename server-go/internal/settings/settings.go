@@ -1,7 +1,7 @@
 // Package settings：settings 域读写（KV 配置，首个走写闸的写路径）。
 // 读路径直查 app_settings；写路径必须经 store.WriteGate 串行落库，
 // 凭据加密等纯计算在闸外完成，闸内只做库写。
-// MCP 运行态未迁移，相关字段按未在役形状输出。
+// MCP 运行态经函数字段注入（serverd 装配 agent 实现），未注入时按未在役形状输出。
 package settings
 
 import (
