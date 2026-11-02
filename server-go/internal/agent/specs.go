@@ -97,6 +97,13 @@ func buildRegistry() (*ToolRegistry, error) {
 			Parameters:  `{"type": "object", "properties": {}}`,
 			Handler:     listOwned,
 		},
+		{
+			Name: "bills_summary", Group: GroupRead, Risk: "low",
+			Description: "本地账单导入记录与消费合计（新→旧，含退款口径）。" +
+				"用户问『我的账单/消费记录/花了多少钱』时调用",
+			Parameters: `{"type": "object", "properties": {}}`,
+			Handler:    billsSummary,
+		},
 	} {
 		spec.TimeoutS = budgetDefaultS
 		if err := r.register(spec); err != nil {
