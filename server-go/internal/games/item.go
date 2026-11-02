@@ -282,7 +282,7 @@ func buildCoverage(rows []priceRow, regionsExpected []string) map[string]any {
 			outcome = *p.attemptOutcome
 		}
 		problems[code] = map[string]any{
-			"outcome": outcome, "answer": p.steamAnswer, "lastSuccessAt": p.lastSuccessAt,
+			"outcome": outcome, "answer": p.steamAnswer, "lastSuccessAt": goIsoformatPtr(p.lastSuccessAt),
 		}
 	}
 	failed, notAttempted := 0, 0
