@@ -176,6 +176,11 @@ func enUsable(toks []string) bool {
 }
 
 // isSameSeries 两个名字是否同系列（宁缺毋滥，任一规则命中即算）。
+// IsSameSeries 系列判定纯函数导出面（G6 对拍与跨包复用）。
+func IsSameSeries(name1 string, en1 *string, name2 string, en2 *string) bool {
+	return isSameSeries(name1, en1, name2, en2)
+}
+
 func isSameSeries(name1 string, en1 *string, name2 string, en2 *string) bool {
 	t1 := seriesTokens(en1, name1)
 	t2 := seriesTokens(en2, name2)
@@ -686,7 +691,9 @@ const savedVersionKey = "games.derived_inputs"
 // 走增量窄化（覆盖版本未变）；覆盖版本变更时全量重算并保存版本。
 // 返回更新行数。事务与写闸由调用方持有。
 func RefreshSeries(ctx context.Context, conn *sql.Conn, changed map[int64]string, overrides map[string][]int64) (int, error) {
-	rows, err := querySeriesRows(ctx, conn, clusterableCond+" ORDER BY appid", nil)
+	// rows 序对齐 Python（无 ORDER BY，同库同计划返回序）——簇首成员
+	// 决定 series_id 锚名，两侧必须同序。
+	rows, err := querySeriesRows(ctx, conn, clusterableCond, nil)
 	if err != nil {
 		return 0, fmt.Errorf("系列候选行读取失败: %w", err)
 	}
@@ -707,7 +714,7 @@ func RefreshSeries(ctx context.Context, conn *sql.Conn, changed map[int64]string
 	if len(listed) > 0 {
 		sort.Slice(listed, func(i, j int) bool { return listed[i] < listed[j] })
 		extra, err := querySeriesRows(ctx, conn,
-			"appid IN ("+inPlaceholders(listed)+") ORDER BY appid", listed)
+			"appid IN ("+inPlaceholders(listed)+")", listed)
 		if err != nil {
 			return 0, fmt.Errorf("覆盖成员读取失败: %w", err)
 		}
