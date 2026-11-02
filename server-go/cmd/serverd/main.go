@@ -153,8 +153,10 @@ func main() {
 		AllowMethods:     []string{"*"},
 	}
 	headersMW := middleware.Headers{WriteProtected: func() bool { return server.UpdateWriteProtected }}
+	gzipMW := middleware.GZip{}
+	// 叠序对齐现网：安全响应头（最外）→ 访问闸 → GZip → CORS → 路由。
 	handler := http.Handler(headersMW.Middleware(
-		gate.Middleware(corsMW.Middleware(server.Handler()))))
+		gate.Middleware(gzipMW.Middleware(corsMW.Middleware(server.Handler())))))
 	if *bootstrapFileFlag != "" {
 		tickets = access.NewBootstrapFile(*bootstrapFileFlag)
 		tickets.Log = logLine
