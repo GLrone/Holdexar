@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -98,8 +99,9 @@ func newStubProxy(t *testing.T) *httptest.Server {
 // stubController 桩内核控制器：记录各 selector 的选中节点并回读核验，
 // delay 端点按名字给延迟（failDelay 非 0 时对全部名字返回该状态码）。
 type stubController struct {
-	server    *httptest.Server
-	now       map[string]string
+	server *httptest.Server
+	mu     sync.Mutex // now 由各请求 goroutine 读写，httptest 每请求独立 goroutine
+	now    map[string]string
 	delayFail atomic.Int32 // 0=正常回 delay；非 0 = 返回该 HTTP 状态码
 }
 
@@ -107,7 +109,10 @@ func newStubController(t *testing.T) *stubController {
 	t.Helper()
 	sc := &stubController{now: map[string]string{}}
 	proxies := func(name string) map[string]any {
-		if got, ok := sc.now[name]; ok {
+		sc.mu.Lock()
+		got, ok := sc.now[name]
+		sc.mu.Unlock()
+		if ok {
 			return map[string]any{"now": got}
 		}
 		return map[string]any{"now": ""}
@@ -128,7 +133,9 @@ func newStubController(t *testing.T) *stubController {
 				Name string `json:"name"`
 			}
 			_ = jsonUnmarshalUseNumber([]byte(readAllBody(r)), &body)
+			sc.mu.Lock()
 			sc.now[rest] = body.Name
+			sc.mu.Unlock()
 			w.WriteHeader(http.StatusNoContent)
 		default:
 			w.Header().Set("Content-Type", "application/json")
