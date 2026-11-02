@@ -343,6 +343,8 @@ func main() {
 		seriesFull(dbPath)
 	case "derived":
 		derivedBatch(dbPath, os.Args[3])
+	case "writebench":
+		writeBench(dbPath, os.Args[3])
 	case "listbench":
 		listBench(dbPath)
 	case "same":
@@ -423,4 +425,32 @@ func listBench(dbPath string) {
 	}
 	sort.Float64s(ts)
 	fmt.Printf("LISTBENCH: n=100 p50=%.1fms p95=%.1fms\n", ts[50], ts[95])
+}
+
+
+// writeBench G6-5 写入吞吐：单发事务 KV UPSERT n 发（rows/s）。
+func writeBench(dbPath string, nArg string) {
+	n, err := strconv.Atoi(nArg)
+	if err != nil || n <= 0 {
+		n = 500
+	}
+	db, gate := openDB(dbPath)
+	defer db.Close()
+	ctx := context.Background()
+	t0 := time.Now()
+	for i := 0; i < n; i++ {
+		e := gate.WithWrite(ctx, store.PriorityBackground, func(conn *sql.Conn) error {
+			_, e := conn.ExecContext(ctx,
+				`INSERT INTO app_settings(key, value_json, updated_at)
+				 VALUES(?, ?, datetime('now','localtime'))
+				 ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json`,
+				fmt.Sprintf("g6.wb.%d", i%50), fmt.Sprintf("\"%d\"", i))
+		return e
+		})
+		if e != nil {
+			die(e)
+		}
+	}
+	el := time.Since(t0).Seconds()
+	fmt.Printf("WRITEBENCH: n=%d rows_per_s=%.1f total=%.2fs\n", n, float64(n)/el, el)
 }
