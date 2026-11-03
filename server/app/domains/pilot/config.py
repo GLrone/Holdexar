@@ -198,7 +198,8 @@ async def load_config() -> dict:
     if cap == _LEGACY_DEFAULT_CAP:
         # 旧默认值不是用户的选择：一次性迁为不限，让「默认移除 token 上限」对存量库生效
         cap = 0
-        await settings_service.set_value(_CAP_KEY, 0)
+        async with write_gate(WritePriority.INTERACTIVE, label="pilot_config"):
+            await settings_service.set_value(_CAP_KEY, 0)
     providers = await load_providers()
     active_id = str(await settings_service.get_value(_ACTIVE_KEY, "") or "")
     active = next((p for p in providers if p["id"] == active_id), providers[0] if providers else None)
@@ -290,14 +291,16 @@ async def usage_month() -> dict:
 
 
 async def add_usage(inp: int, out: int) -> None:
+    """用量台账读改写过写闸：并发轮对同键累加，无闸读改写会互相覆盖少计。"""
     if inp <= 0 and out <= 0:
         return
-    cur = await usage_month()
-    await settings_service.set_value(_usage_key(), {
-        "inp": cur["inp"] + max(0, inp),
-        "out": cur["out"] + max(0, out),
-        "calls": cur["calls"] + 1,
-    })
+    async with write_gate(WritePriority.INTERACTIVE, label="pilot_usage"):
+        cur = await usage_month()
+        await settings_service.set_value(_usage_key(), {
+            "inp": cur["inp"] + max(0, inp),
+            "out": cur["out"] + max(0, out),
+            "calls": cur["calls"] + 1,
+        })
 
 
 def over_cap(usage: dict, cap: int) -> bool:
