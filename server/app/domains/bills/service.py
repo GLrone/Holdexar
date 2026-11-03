@@ -429,7 +429,10 @@ async def _sync_bills_locked(*, force: bool, steam_id: str) -> dict:
     cookies = await account_service.get_cookies_of(steam_id)
     if not cookies or "steamLoginSecure" not in cookies:
         return {"ok": False, "status": "no_cookie"}
-    from app.domains.account.steam_wallet import steam_id_from_cookies
+    from app.domains.account.steam_wallet import (
+        StoreSessionExpiredError,
+        steam_id_from_cookies,
+    )
 
     owner = steam_id_from_cookies(cookies)
     if not owner or owner != steam_id:
@@ -449,8 +452,9 @@ async def _sync_bills_locked(*, force: bool, steam_id: str) -> dict:
                     ck, known_latest_date=known_latest, proxy_url=proxy_url
                 ), cookies,
             )
-        except steam_fetch.SteamFetchError as exc:
-            # Cookie 失效等硬错误：写错误快照（与全量失败同语义），等下一轮
+        except (steam_fetch.SteamFetchError, StoreSessionExpiredError) as exc:
+            # 抓取层硬错误与会话失效（续期失败原样上抛的平级错误）：写错误
+            # 快照（与全量失败同语义），等下一轮
             await settings_service.set_value(snapshot_key(steam_id), {
                 "running": False, "error": str(exc), "syncedAt": now.isoformat(), "steamId": steam_id,
             })

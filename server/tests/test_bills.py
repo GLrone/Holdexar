@@ -1362,6 +1362,33 @@ async def test_sync_bills_probe_cookie_error_writes_error_snapshot(db, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_sync_bills_probe_session_expiry_writes_error_snapshot(db, monkeypatch):
+    """探测遇会话失效（续期失败原样上抛的平级硬错误）：错误写回快照，
+    异常不外逃（外逃会让调度器只见裸异常、快照停在 running 态）。"""
+
+    async def fetch():
+        raise AssertionError("不应走到全量拉取")  # pragma: no cover
+
+    store: dict = {}
+    calls = _patch_sync_env(monkeypatch, store, fetch)
+
+    from app.domains.account.steam_wallet import StoreSessionExpiredError
+    from app.domains.bills import steam_fetch as sf
+
+    async def failing_probe(cookies, *, known_latest_date=None, proxy_url=None):
+        raise StoreSessionExpiredError("商店会话已失效")
+
+    monkeypatch.setattr(sf, "probe_new_transactions", failing_probe)
+
+    res = await bills_service.sync_bills(force=False)
+    assert res["ok"] is False and res["status"] == "error"
+    assert "会话已失效" in res["error"]
+    assert calls == []
+    snap = store[bills_service.snapshot_key("76561198000000001")]
+    assert snap["running"] is False and "error" in snap
+
+
+@pytest.mark.asyncio
 async def test_probe_first_screen_logic(db):
     """探测判定核心逻辑：首行日期 > 库内最新 → True；≤ → False；无法解析 → 保守 True。"""
     from app.domains.bills import steam_fetch as sf
