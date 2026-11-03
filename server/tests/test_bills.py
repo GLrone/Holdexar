@@ -785,11 +785,15 @@ def _patch_sync_env(monkeypatch, store: dict, fetch) -> list:
     async def fake_primary():
         return "steamLoginSecure=76561198000000001||12345"
 
+    async def fake_cookies_of(sid):
+        return f"steamLoginSecure={sid}||12345"
+
     async def fake_strategy_proxy():
         return None
 
     monkeypatch.setattr(account_service, "get_primary_cookies", fake_primary)
     monkeypatch.setattr(account_service, "get_cookies", fake_primary)
+    monkeypatch.setattr(account_service, "get_cookies_of", fake_cookies_of)
     monkeypatch.setattr(account_service, "_strategy_proxy", fake_strategy_proxy)
 
     calls: list = []
@@ -870,7 +874,7 @@ async def test_named_account_sync_uses_its_credentials_and_import_owner(db, monk
     result = await bills_service.sync_bills(force=True, steam_id="76561198000000002")
     assert calls[0]["cookies"] == "steamLoginSecure=76561198000000002||own-token"
     assert result["steamId"] == "76561198000000002"
-    assert store[bills_service.KEY_BILLS_SYNC]["steamId"] == "76561198000000002"
+    assert store[bills_service.snapshot_key("76561198000000002")]["steamId"] == "76561198000000002"
 
 
 @pytest.mark.asyncio
@@ -882,6 +886,9 @@ async def test_account_sync_rejects_renewed_credentials_from_another_owner(db, m
         raise StoreSessionExpiredError('login')
     store = {}
     calls = _patch_sync_env(monkeypatch, store, fetch)
+    async def own(sid):
+        return f"steamLoginSecure={sid}||own-token"
+    monkeypatch.setattr(account_service, 'get_cookies_of', own)
     async def wrong_owner(sid, cookies, *, force):
         return 'steamLoginSecure=76561198000000002||new'
     monkeypatch.setattr(account_service, 'ensure_live_session', wrong_owner)
@@ -989,8 +996,139 @@ async def test_cancelled_sync_records_interruption_and_releases_executor(db, mon
     with pytest.raises(asyncio.CancelledError):
         await task
     assert all(not lock.locked() for lock in bills_service._sync_locks.values())
-    assert store[bills_service.KEY_BILLS_SYNC]["running"] is False
-    assert store[bills_service.KEY_BILLS_SYNC]["error"]
+    assert store[bills_service.snapshot_key("76561198000000001")]["running"] is False
+    assert store[bills_service.snapshot_key("76561198000000001")]["error"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_account_syncs_keep_separate_snapshots(db, monkeypatch):
+    """并发同步按账号分键：先收场账号不覆写在跑账号的进度，读侧聚合不假空闲
+    （旧单槽病灶：A 收场写共享槽 running=False，B 仍在跑却被展示为空闲）。"""
+    from app.domains.account import service as account_service
+    from app.domains.bills import steam_fetch as sf
+
+    release = asyncio.Event()
+
+    async def fetch():
+        return _FakeReport()
+
+    store: dict = {}
+    _patch_sync_env(monkeypatch, store, fetch)
+
+    async def own(sid):
+        return f"steamLoginSecure={sid}||own-token"
+
+    monkeypatch.setattr(account_service, "get_cookies_of", own)
+
+    async def account_paced_fetch(cookies, proxy_url=None, on_progress=None):
+        # 账号 A（…001）立即收场，账号 B（…002）阻塞等放行
+        if "76561198000000002" in cookies:
+            await release.wait()
+        return _FakeReport()
+
+    monkeypatch.setattr(sf, "fetch_full_report", account_paced_fetch)
+
+    async def fake_accounts():
+        return [{"steam_id": "76561198000000001"}, {"steam_id": "76561198000000002"}]
+
+    monkeypatch.setattr(account_service, "list_accounts", fake_accounts)
+
+    first = asyncio.create_task(bills_service.sync_bills(force=True, steam_id="76561198000000001"))
+    second = asyncio.create_task(bills_service.sync_bills(force=True, steam_id="76561198000000002"))
+    for _ in range(500):
+        if store.get(bills_service.snapshot_key("76561198000000002"), {}).get("running"):
+            break
+        await asyncio.sleep(0.01)
+    assert store[bills_service.snapshot_key("76561198000000002")]["running"] is True
+
+    r1 = await first
+    assert r1["steamId"] == "76561198000000001"
+    snap = await bills_service.get_sync_snapshot()
+    assert snap["running"] is True, "A 收场不得假空闲：B 仍在跑"
+    assert snap["steamId"] == "76561198000000002"
+
+    release.set()
+    r2 = await second
+    assert r2["steamId"] == "76561198000000002"
+    assert store[bills_service.snapshot_key("76561198000000001")]["syncedAt"]
+    assert store[bills_service.snapshot_key("76561198000000002")]["syncedAt"]
+    final = await bills_service.get_sync_snapshot()
+    assert final["running"] is False
+
+
+@pytest.mark.asyncio
+async def test_cancelled_sync_only_marks_its_own_snapshot(db, monkeypatch):
+    """取消 A 只中断 A：中断标记落 A 的账号键，B 的收场快照不受波及。"""
+    from app.domains.account import service as account_service
+    from app.domains.bills import steam_fetch as sf
+
+    entered = asyncio.Event()
+
+    async def fetch():
+        return _FakeReport()
+
+    store: dict = {}
+    _patch_sync_env(monkeypatch, store, fetch)
+
+    async def own(sid):
+        return f"steamLoginSecure={sid}||own-token"
+
+    monkeypatch.setattr(account_service, "get_cookies_of", own)
+
+    async def account_paced_fetch(cookies, proxy_url=None, on_progress=None):
+        if "76561198000000001" in cookies:
+            entered.set()
+            await asyncio.Event().wait()
+        return _FakeReport()
+
+    monkeypatch.setattr(sf, "fetch_full_report", account_paced_fetch)
+
+    task_a = asyncio.create_task(bills_service.sync_bills(force=True, steam_id="76561198000000001"))
+    task_b = asyncio.create_task(bills_service.sync_bills(force=True, steam_id="76561198000000002"))
+    await entered.wait()
+    r2 = await task_b
+    assert r2["ok"] is True and r2["steamId"] == "76561198000000002"
+
+    task_a.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task_a
+    a = store[bills_service.snapshot_key("76561198000000001")]
+    assert a["running"] is False and a["error"]
+    b = store[bills_service.snapshot_key("76561198000000002")]
+    assert b["running"] is False and "error" not in b
+
+
+@pytest.mark.asyncio
+async def test_global_entry_resolves_target_once(db, monkeypatch):
+    """无 sid 全局入口：目标只解析一次并下传——锁键与实际同步账号同源
+    （旧双解析：两次读 Cookie 之间切换账号会让锁键与同步账号错开）。"""
+    from app.domains.account import service as account_service
+
+    async def fetch():
+        return _FakeReport()
+
+    store: dict = {}
+    calls = _patch_sync_env(monkeypatch, store, fetch)
+
+    flips = {"n": 0}
+
+    async def flipping_cookies():
+        flips["n"] += 1
+        if flips["n"] > 1:
+            return "steamLoginSecure=76561198000000002||other"
+        return "steamLoginSecure=76561198000000001||12345"
+
+    monkeypatch.setattr(account_service, "get_cookies", flipping_cookies)
+
+    async def own(sid):
+        return f"steamLoginSecure={sid}||own-token"
+
+    monkeypatch.setattr(account_service, "get_cookies_of", own)
+
+    res = await bills_service.sync_bills(force=True)
+    assert flips["n"] == 1, "目标只解析一次"
+    assert res["steamId"] == "76561198000000001"
+    assert calls[0]["cookies"] == "steamLoginSecure=76561198000000001||own-token"
 
 
 class _FakeReport:
@@ -1075,13 +1213,13 @@ async def test_sync_bills_orphan_running_snapshot_does_not_block_restart(db, mon
     calls = _patch_sync_env(monkeypatch, store, fetch)
 
     now = get_beijing_time_obj().replace(tzinfo=None)
-    store[bills_service.KEY_BILLS_SYNC] = {"running": True, "since": now.isoformat()}
+    store[bills_service.snapshot_key("76561198000000001")] = {"running": True, "since": now.isoformat()}
 
     res = await bills_service.sync_bills(force=False)
     assert res.get("ok") is True
     assert len(calls) == 1
     # 快照落回非 running：死锁解除后不再阻塞后续周期
-    assert store[bills_service.KEY_BILLS_SYNC]["running"] is False
+    assert store[bills_service.snapshot_key("76561198000000001")]["running"] is False
 
 
 @pytest.mark.asyncio
@@ -1102,7 +1240,7 @@ async def test_sync_bills_failure_waits_next_cycle(db, monkeypatch):
     res = await bills_service.sync_bills(force=False)
     assert res["ok"] is False and res["status"] == "error" and "proxy dead" in res["error"]
     assert len(calls) == 1
-    assert store[bills_service.KEY_BILLS_SYNC]["running"] is False
+    assert store[bills_service.snapshot_key("76561198000000001")]["running"] is False
 
     # 下一轮：失败态不阻塞，再次发起同步并成功
     state["fail"] = False
@@ -1141,7 +1279,7 @@ async def test_sync_bills_empty_report_rejected(db, monkeypatch):
     assert "拒落空快照" in res["error"]
     assert import_calls == []  # DB 零接触：旧快照不被空 import 遮蔽
     assert len(calls) == 1
-    assert store[bills_service.KEY_BILLS_SYNC]["running"] is False
+    assert store[bills_service.snapshot_key("76561198000000001")]["running"] is False
 
 
 # ── sync_bills 首屏探测分流（降频机制：无新交易不全量翻页）──────────
@@ -1168,8 +1306,8 @@ async def test_sync_bills_probe_skip_when_no_new(db, monkeypatch):
     res = await bills_service.sync_bills(force=False)
     assert res["ok"] is True and res["status"] == "probed_skip"
     assert calls == []  # 全量抓取零调用——整轮只有探测 1 个 GET
-    assert store[bills_service.KEY_BILLS_SYNC]["probedSkip"] is True
-    assert set(store) == {bills_service.KEY_BILLS_SYNC}
+    assert store[bills_service.snapshot_key("76561198000000001")]["probedSkip"] is True
+    assert set(store) == {bills_service.snapshot_key("76561198000000001")}
 
 
 @pytest.mark.asyncio
@@ -1219,7 +1357,7 @@ async def test_sync_bills_probe_cookie_error_writes_error_snapshot(db, monkeypat
     assert res["ok"] is False and res["status"] == "error"
     assert "登录页" in res["error"]
     assert calls == []
-    snap = store[bills_service.KEY_BILLS_SYNC]
+    snap = store[bills_service.snapshot_key("76561198000000001")]
     assert snap["running"] is False and "error" in snap
 
 
