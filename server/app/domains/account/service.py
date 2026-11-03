@@ -33,6 +33,7 @@ from app.core.database import (
 from app.core.logging import log_event
 from app.core.secretbox import SecretBoxError
 from app.crawler.utils import get_beijing_time_obj
+from app.domains.proxies.service import strategy_proxy_or_direct
 from app.domains.account.models import SteamAccount
 from app.domains.bills.models import BillCdkGame, BillGameTx, BillImport, BillTopupTx
 from app.domains.family.models import FamilyGroup, FamilyLibrarySnapshot
@@ -276,7 +277,7 @@ async def ensure_live_session(steam_id: str, cookies: str, *, force: bool = Fals
         _session_refresh_at[steam_id] = now
         try:
             renewed = await refresh_login_cookies(
-                current, proxy_url=await _strategy_proxy()
+                current, proxy_url=await strategy_proxy_or_direct()
             )
         except SessionRefreshError as exc:
             log_event(
@@ -298,7 +299,7 @@ async def _fetch_wallet_with_live_session(steam_id: str, cookies: str) -> Wallet
     原错误上抛，由调用方走既有失败退避语义。
     """
     try:
-        return await fetch_wallet(cookies, proxy_url=await _strategy_proxy())
+        return await fetch_wallet(cookies, proxy_url=await strategy_proxy_or_direct())
     except StoreSessionExpiredError:
         fresh = await ensure_live_session(steam_id, cookies, force=True)
         if fresh == cookies:
@@ -308,7 +309,7 @@ async def _fetch_wallet_with_live_session(steam_id: str, cookies: str) -> Wallet
             "商店会话被服务端衰减，已换发新会话重试钱包抓取",
             detail={"SteamID": steam_id},
         )
-        return await fetch_wallet(fresh, proxy_url=await _strategy_proxy())
+        return await fetch_wallet(fresh, proxy_url=await strategy_proxy_or_direct())
 
 
 async def get_primary_account() -> SteamAccount | None:
@@ -934,7 +935,7 @@ async def _sync_profile_row(steam_id: str, cookies: str, now: datetime) -> None:
     时的兜底（粗糙：只区分离线/在线/游戏名）。
     """
     # 取数段在会话外：网络拉取不占连接池位（与 refresh_online_states 同形态）
-    fetched = await fetch_profile(steam_id, proxy_url=await _strategy_proxy())
+    fetched = await fetch_profile(steam_id, proxy_url=await strategy_proxy_or_direct())
     async with write_session(WritePriority.INTERACTIVE, label="account_sync") as session:
         row = await session.get(SteamAccount, steam_id)
         if row is None:
@@ -969,7 +970,7 @@ async def refresh_online_states(rows: list[SteamAccount] | None = None) -> dict:
         return {"ok": False, "status": "no_key"}
 
     states = await fetch_player_states(
-        [r.steam_id for r in rows], api_key, proxy_url=await _strategy_proxy()
+        [r.steam_id for r in rows], api_key, proxy_url=await strategy_proxy_or_direct()
     )
     if not states:
         return {"ok": False, "status": "fetch_failed"}
@@ -1423,13 +1424,6 @@ async def after_bind(steam_id: str) -> None:
             exc_info=True,
             detail={"SteamID": steam_id},
         )
-
-
-async def _strategy_proxy() -> str | None:
-    """按代理策略引擎解析出网代理；引擎不可用时 None（直连）。"""
-    from app.domains.proxies.service import strategy_proxy_or_direct
-
-    return await strategy_proxy_or_direct()
 
 
 # ── 旧单账号 KV → 多账号表 迁移（启动幂等）──────────────────

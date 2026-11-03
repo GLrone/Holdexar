@@ -794,7 +794,7 @@ def _patch_sync_env(monkeypatch, store: dict, fetch) -> list:
     monkeypatch.setattr(account_service, "get_primary_cookies", fake_primary)
     monkeypatch.setattr(account_service, "get_cookies", fake_primary)
     monkeypatch.setattr(account_service, "get_cookies_of", fake_cookies_of)
-    monkeypatch.setattr(account_service, "_strategy_proxy", fake_strategy_proxy)
+    monkeypatch.setattr(bills_service, "strategy_proxy_or_direct", fake_strategy_proxy)
 
     calls: list = []
 
