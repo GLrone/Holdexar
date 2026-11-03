@@ -1009,7 +1009,7 @@ async def get_game_detail(appid: int) -> dict | None:
     price_map: dict[str, dict] = {}
     unavailable_regions: list[str] = []
     for p in price_rows:
-        code = p.region_code.upper()
+        code = p.region_code
         if p.price_status in ("missing", "blocked"):
             unavailable_regions.append(code)
             continue
@@ -1242,7 +1242,7 @@ async def _fill_cny_fen_by_history(rows) -> dict[int, int]:
     for r in rows:
         if r.cny_fen is not None or r.price is None or r.price <= 0 or r.snapshot_at is None:
             continue
-        currency = (r.currency or REGION_TO_CURRENCY.get(r.region_code.upper()) or "").upper()
+        currency = (r.currency or REGION_TO_CURRENCY.get(r.region_code) or "").upper()
         if not currency:
             continue
         need_currencies.add(currency)
@@ -1258,7 +1258,7 @@ async def _fill_cny_fen_by_history(rows) -> dict[int, int]:
     for r in rows:
         if r.cny_fen is not None or r.price is None or r.price <= 0 or r.snapshot_at is None:
             continue
-        currency = (r.currency or REGION_TO_CURRENCY.get(r.region_code.upper()) or "").upper()
+        currency = (r.currency or REGION_TO_CURRENCY.get(r.region_code) or "").upper()
         if not currency:
             continue
         if currency == "CNY":
@@ -1688,11 +1688,11 @@ async def get_game_versions(appid: int) -> dict:
         price_cents = int(r.price)
         cny_fen = int(r.cny_fen) if r.cny_fen is not None else None
         if cny_fen is None:
-            currency = r.currency or REGION_TO_CURRENCY.get(region_code.upper())
+            currency = r.currency or REGION_TO_CURRENCY.get(region_code)
             if currency:
                 cny_fen = convert_minor_to_cny_fen(price_cents, currency, rates)
-        region_info = next((e for e in CC_LIST if e[0] == region_code.upper()), None)
-        v["regions"][region_code.upper()] = {
+        region_info = next((e for e in CC_LIST if e[0] == region_code), None)
+        v["regions"][region_code] = {
             "cents": price_cents,
             "formatted": format_minor_units(price_cents, region_info[2])
             if region_info
@@ -1737,7 +1737,7 @@ def _build_list_item(
     price_map: dict[str, dict] = {}
     unavailable_regions: list[str] = []
     for p in price_rows:
-        code = p.region_code.upper()
+        code = p.region_code
         if not code:
             continue
         stale = p.attempt_outcome != "success"
@@ -1773,7 +1773,7 @@ def _build_list_item(
     coverage: dict | None = None
     if regions_expected:
         rows_by_region = {
-            p.region_code.upper(): p for p in price_rows if p.region_code
+            p.region_code: p for p in price_rows if p.region_code
         }
         problem_regions: dict[str, dict] = {}
         success = 0

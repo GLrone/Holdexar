@@ -95,6 +95,7 @@ class GameCurrentPrice(Base):
     __tablename__ = "game_current_prices"
 
     appid: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    # 恒为大写：全部写入口（爬取链 / 导入 / 回补章）归一，读侧不得再自行 upper()
     region_code: Mapped[str] = mapped_column(String(10), primary_key=True)
     currency: Mapped[str | None] = mapped_column(String(10))
     price: Mapped[int | None] = mapped_column(BigInteger)  # 当前售价（分为单位）
@@ -139,6 +140,7 @@ class GamePriceHistory(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     appid: Mapped[int] = mapped_column(BigInteger)
+    # 恒为大写（写侧归一）：读侧不得再自行 upper()
     region_code: Mapped[str] = mapped_column(String(10))
     currency: Mapped[str | None] = mapped_column(String(10))
     price: Mapped[int | None] = mapped_column(BigInteger)
