@@ -27,6 +27,7 @@ from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.database import write_gate
 from app.core.logging import log_event
 from app.crawler.utils import clean_appids, get_beijing_time_obj
+from app.domains.proxies.service import strategy_proxy_or_direct
 from app.domains.games import tags as game_tags
 from .models import TrackedAccount, WishlistItem
 
@@ -41,13 +42,6 @@ RESOLVE_VANITY_URL = "https://api.steampowered.com/ISteamUser/ResolveVanityURL/v
 # （Steam 社区公开换算公式）
 STEAM64_BASE = 76561197960265728
 STEAMID64_REGEX = r"7656119\d{10}"
-
-
-async def _strategy_proxy() -> str | None:
-    """按代理策略引擎解析出网代理；引擎不可用时 None（直连）。"""
-    from app.domains.proxies.service import strategy_proxy_or_direct
-
-    return await strategy_proxy_or_direct()
 
 
 def _naive(dt: datetime) -> datetime:
@@ -70,7 +64,7 @@ async def _fetch_persona(steamid: str) -> dict:
     from app.domains.account.steam_wallet import fetch_profile
 
     try:
-        return await fetch_profile(steamid, proxy_url=await _strategy_proxy())
+        return await fetch_profile(steamid, proxy_url=await strategy_proxy_or_direct())
     except Exception:  # noqa: BLE001
         return {"persona_name": "", "avatar_url": "", "online": False, "in_game_name": ""}
 
@@ -155,7 +149,7 @@ async def _resolve_steamid(raw: str) -> str:
         raise ValueError(
             "非好友码/SteamID64 输入需要先在「我」页配置 Steam Web API Key 才能解析自定义 URL"
         )
-    async with httpx.AsyncClient(timeout=15, proxy=await _strategy_proxy()) as client:
+    async with httpx.AsyncClient(timeout=15, proxy=await strategy_proxy_or_direct()) as client:
         resp = await client.get(
             RESOLVE_VANITY_URL, params={"key": api_key, "vanityurl": vanity}
         )
@@ -167,7 +161,7 @@ async def _resolve_steamid(raw: str) -> str:
 
 async def fetch_wishlist(steamid: str) -> list[dict]:
     """返回 [{appid, added_at}]；私有/空返回 []。"""
-    async with httpx.AsyncClient(timeout=15, proxy=await _strategy_proxy()) as client:
+    async with httpx.AsyncClient(timeout=15, proxy=await strategy_proxy_or_direct()) as client:
         resp = await client.get(WISHLIST_URL, params={"steamid": steamid})
         resp.raise_for_status()
         items = resp.json().get("response", {}).get("items", []) or []
@@ -220,7 +214,7 @@ async def fetch_owned_games_via_jwt(steamid: str, token: str) -> list[dict]:
 async def fetch_owned_games_via_key(steamid: str, api_key: str) -> list[dict]:
     """已购拉取（WebAPI Key 通道，历史路径）。401/403/网络错抛 OwnedFetchError。"""
     try:
-        async with httpx.AsyncClient(timeout=20, proxy=await _strategy_proxy()) as client:
+        async with httpx.AsyncClient(timeout=20, proxy=await strategy_proxy_or_direct()) as client:
             resp = await client.get(
                 OWNED_URL,
                 params={

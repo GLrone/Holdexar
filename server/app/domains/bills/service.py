@@ -24,6 +24,7 @@ from datetime import date, timedelta
 
 from sqlalchemy import and_, case, delete, func, or_, select
 
+from app.domains.proxies.service import strategy_proxy_or_direct
 from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.logging import log_event
 from app.crawler.utils import get_beijing_time_obj
@@ -442,7 +443,7 @@ async def _sync_bills_locked(*, force: bool, steam_id: str) -> dict:
     if not force:
         try:
             known_latest = await _latest_known_tx_date(steam_id)
-            proxy_url = await account_service._strategy_proxy()
+            proxy_url = await strategy_proxy_or_direct()
             has_new = await _with_live_session_retry(
                 lambda ck: steam_fetch.probe_new_transactions(
                     ck, known_latest_date=known_latest, proxy_url=proxy_url
@@ -471,7 +472,7 @@ async def _sync_bills_locked(*, force: bool, steam_id: str) -> dict:
             log_event(logger, "账单同步进度写入失败", tag="忽略", level=logging.DEBUG, exc_info=True)
 
     try:
-        proxy_url = await account_service._strategy_proxy()
+        proxy_url = await strategy_proxy_or_direct()
         report = await _with_live_session_retry(
             lambda ck: steam_fetch.fetch_full_report(
                 ck, proxy_url=proxy_url, on_progress=_progress

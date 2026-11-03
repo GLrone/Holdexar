@@ -61,7 +61,7 @@ async def _no_proxy(monkeypatch):
     async def _none():
         return None
 
-    monkeypatch.setattr(account_service, "_strategy_proxy", _none)
+    monkeypatch.setattr(account_service, "strategy_proxy_or_direct", _none)
 
 
 # ── 绑定 upsert / active 语义 ─────────────────────────────
@@ -417,7 +417,7 @@ async def test_refresh_online_states_maps_personastate(db, monkeypatch):
         return None
 
     monkeypatch.setattr(account_service, "fetch_player_states", fake_states)
-    monkeypatch.setattr(account_service, "_strategy_proxy", _none)
+    monkeypatch.setattr(account_service, "strategy_proxy_or_direct", _none)
     await settings_service.set_value("account.steam_api_key", "TESTKEY")
 
     await account_service.save_cookies(cookie(A))

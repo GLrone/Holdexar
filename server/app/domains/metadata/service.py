@@ -48,6 +48,7 @@ from app.crawler.epic_free import (
     fetch_mobile_freebie,
     resolve_mobile_freebie,
 )
+from app.domains.proxies.service import strategy_proxy_or_direct
 from app.domains.games.models import Game
 
 logger = logging.getLogger(__name__)
@@ -389,13 +390,6 @@ def _hb_headers() -> dict:
     }
 
 
-async def _strategy_proxy() -> str | None:
-    """按代理策略引擎解析出网代理；引擎不可用时 None（直连）。"""
-    from app.domains.proxies.service import strategy_proxy_or_direct
-
-    return await strategy_proxy_or_direct()
-
-
 async def _fetch_membership_page(
     session: aiohttp.ClientSession, proxy: str | None
 ) -> str | None:
@@ -489,7 +483,7 @@ async def refresh_hb_choice(force: bool = False) -> dict:
     """
     from app.domains.settings.service import get_value, set_value
 
-    proxy = await _strategy_proxy()
+    proxy = await strategy_proxy_or_direct()
     connector = aiohttp.TCPConnector(limit=4, ttl_dns_cache=60)
     async with aiohttp.ClientSession(connector=connector) as session:
         page = await _fetch_membership_page(session, proxy)
@@ -923,7 +917,7 @@ async def refresh_epic_free() -> dict:
     每日调度与手动触发同入口，幂等（已标记跳过）；未匹配条目
     （storesearch 未命中）记 unresolved 留待次日重试，不阻塞其余。
     """
-    proxy = await _strategy_proxy()
+    proxy = await strategy_proxy_or_direct()
     games = await fetch_free_games(proxy=proxy)
     if not games:
         return {"source": "epic-free", "ok": False, "error": "促销端点本轮无白送元素"}
@@ -1055,7 +1049,7 @@ async def _fetch_offers_payload() -> dict | None:
     直链；该链失败退探测 PC 白送元素池，再退 breaker 立绘卡。封面优先
     游戏自己的官方 keyImage，缺图才落 breaker 营销图兜底。
     """
-    proxy = await _strategy_proxy()
+    proxy = await strategy_proxy_or_direct()
     games, freebie, breaker = await asyncio.gather(
         fetch_free_offers(proxy=proxy),
         fetch_mobile_freebie(proxy=proxy),
@@ -1288,7 +1282,7 @@ async def refresh_bundle_counts(force: bool = False) -> dict:
                     "fetchedAt": fetched_at, "lastUpdated": last.get("updated"),
                 }
 
-    proxy = await _strategy_proxy()
+    proxy = await strategy_proxy_or_direct()
     try:
         bundles_map = await _fetch_bartervg_bundles(proxy)
     except Exception as e:  # noqa: BLE001

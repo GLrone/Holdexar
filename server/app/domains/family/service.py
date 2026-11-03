@@ -30,6 +30,7 @@ from app.core.database import write_gate
 from app.core.logging import log_event
 # SSL 上下文缓存在 core.tls（成就同步/代理池探测同用一份，一事实一记录者）
 from app.core.tls import ssl_context as _ssl_context
+from app.domains.proxies.service import strategy_proxy_or_direct
 from app.domains.games import tags as game_tags
 from app.domains.settings import service as settings_service
 
@@ -52,13 +53,6 @@ def _norm_avatar(url: str | None) -> str:
     return normalize_avatar_url(url)
 
 
-async def _strategy_proxy() -> str | None:
-    """按代理策略引擎解析出网代理；引擎不可用时 None（直连）。"""
-    from app.domains.proxies.service import strategy_proxy_or_direct
-
-    return await strategy_proxy_or_direct()
-
-
 async def _steam_get(url: str, params: dict, *, method: str = "GET") -> httpx.Response:
     """Steam API 请求（access_token 通道）：代理优先 + SSL 证书降级重试。
 
@@ -66,7 +60,7 @@ async def _steam_get(url: str, params: dict, *, method: str = "GET") -> httpx.Re
     信任链接受），与钱包模块同规则：先严格跑，证书错则 verify=False 重试
     一次——本机回环/自选代理流量，属可接受折中。
     """
-    proxy = await _strategy_proxy()
+    proxy = await strategy_proxy_or_direct()
     try:
         async with httpx.AsyncClient(timeout=20, proxy=proxy, verify=_ssl_context(True)) as client:
             resp = await client.request(method, url, params=params)
@@ -117,7 +111,7 @@ async def _profile_xml_preview(steamid: str) -> dict:
     url = f"https://steamcommunity.com/profiles/{steamid}/?xml=1"
     try:
         async with httpx.AsyncClient(
-            timeout=10.0, proxy=await _strategy_proxy(),
+            timeout=10.0, proxy=await strategy_proxy_or_direct(),
             headers={"User-Agent": "Mozilla/5.0", "Referer": "https://steamcommunity.com/"},
         ) as client:
             resp = await client.get(url)
@@ -155,7 +149,7 @@ async def _persona_preview(steamid: str) -> dict:
     from app.domains.account.steam_wallet import fetch_profile
 
     try:
-        p = await fetch_profile(steamid, proxy_url=await _strategy_proxy())
+        p = await fetch_profile(steamid, proxy_url=await strategy_proxy_or_direct())
         if p.get("persona_name") and not _avatar_missing(p):
             return {"personaName": p["persona_name"], "avatarUrl": p.get("avatar_url", "")}
     except Exception:  # noqa: BLE001 —— 预览失败不阻断解析
@@ -256,7 +250,7 @@ async def _fetch_member_countries(steamids: list[str]) -> dict[str, str]:
         from app.domains.account.steam_wallet import fetch_player_states
 
         states = await fetch_player_states(
-            steamids, api_key, proxy_url=await _strategy_proxy()
+            steamids, api_key, proxy_url=await strategy_proxy_or_direct()
         )
     except Exception:  # noqa: BLE001 —— 国家补齐失败不阻断同步
         log_event(logger, "成员资料国家获取失败，不阻断同步")
