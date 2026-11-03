@@ -391,6 +391,8 @@ async def test_freshness_latest_endpoint(db):
 
     payload = await crawl_router.freshness_latest()
     assert payload["lastSuccessAt"] is not None
+    # 服务端参照时刻随载荷下发：消费端据此锚定本机钟偏移（岛钟零防御缺口 E3）
+    assert isinstance(payload["serverNow"], str) and payload["serverNow"]
 
 
 # ── 收敛统计落列（拆分随统计列落库；读路径由统计列重建，快照列仅存量）──
