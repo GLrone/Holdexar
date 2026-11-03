@@ -74,7 +74,7 @@ async def appid_freshness(appids: list[int]) -> list[dict]:
 
 def regional_freshness(rows: list, regions: list[str] | None = None, pending_units: set | None = None) -> dict:
     """同一份价格行生成地区明细和对象新鲜度，不重新取价。"""
-    indexed = {p.region_code.upper(): p for p in rows if p.region_code}
+    indexed = {p.region_code: p for p in rows if p.region_code}
     codes = [cc.upper() for cc in regions] if regions else list(indexed)
     units = {}
     successes = []
