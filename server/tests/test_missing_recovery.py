@@ -1,8 +1,8 @@
 """补抓链路行为验收（欠账账本设计）。
 
 覆盖四条链路（合成 appid 播种 game_current_prices，夹具清理）：
-1. mark_region_status('missing')：fail_count 递增；穷尽（>MISSING_MAX_RETRIES）
-   转 blocked 终态；locked/blocked 清零账本
+1. 欠账记账：传输类失败走 mark_region_status_missing_batch（首记
+   fail_count=1、重复不递增）；门禁降级（ok 且无价）递增，穷尽转 blocked
 2. generate_missing_tasks：欠账行按区分组凑批成 type=app 任务
    （每发 ≤300 行、只装该区欠账、冷却窗口内不选）；blocked/locked 不进补抓
 3. upsert 质量门禁：status=ok 且 price=None 降级 missing 进账本，
@@ -89,27 +89,22 @@ async def _seed():
 
 
 @pytest.mark.asyncio
-async def test_mark_missing_increments_ledger():
-    """missing 记账：首次插入 fail_count=1；重复标记递增。"""
+async def test_degradation_exhaustion_to_blocked():
+    """门禁降级穷尽转终态：fail_count 递增至 MISSING_MAX_RETRIES → blocked，
+    blocked 行不再进补抓任务。传输类失败不递增（另有传输通道测试钉）。"""
     db = DbWriter()
-    # 新区首次欠账（APPID3 的 UA 区此前无行）
-    await db.mark_region_status(APPID3, "ua", "missing")
-    async with get_session_factory()() as session:
-        row = await session.get(GameCurrentPrice, (APPID3, "UA"))
-        assert row.price_status == "missing"
-        assert row.fail_count == 1
-
-
-@pytest.mark.asyncio
-async def test_mark_missing_exhaustion_to_blocked():
-    """穷尽转终态：旧 fail_count 达上限后再次 missing → blocked，不再进补抓。"""
-    db = DbWriter()
-    # APPID2 CN 行 fail_count=1；补到 MISSING_MAX_RETRIES-1 后下一次应转 blocked
+    # APPID2 CN 行 fail_count=1；补到 MISSING_MAX_RETRIES-1 后下一次门禁降级应转 blocked
     async with get_session_factory()() as session:
         row = await session.get(GameCurrentPrice, (APPID2, "CN"))
         row.fail_count = MISSING_MAX_RETRIES - 1
         await session.commit()
-    await db.mark_region_status(APPID2, "cn", "missing")
+    await db.upsert_game_and_prices(
+        {"appid": APPID2, "name": "穷尽转终态", "updated_at": _now_naive()},
+        [{"appid": APPID2, "region_code": "CN", "currency": "CNY",
+          "price": None, "original_price": None, "discount_percent": 0,
+          "sub_id": 1, "is_gold": False, "version_suffix": None,
+          "price_status": "ok", "crawled_at": _now_naive()}],
+    )
     async with get_session_factory()() as session:
         row = await session.get(GameCurrentPrice, (APPID2, "CN"))
         assert row.price_status == "blocked"
@@ -117,17 +112,6 @@ async def test_mark_missing_exhaustion_to_blocked():
     # blocked 行不再出现在补抓任务里
     tasks = await db.generate_missing_tasks(cooldown_minutes=0)
     assert not any(APPID2 in t.get("appids", []) for t in tasks)
-
-
-@pytest.mark.asyncio
-async def test_mark_terminal_clears_ledger():
-    """locked/blocked 记账清零（非欠账语义）。"""
-    db = DbWriter()
-    await db.mark_region_status(APPID, "cn", "locked")
-    async with get_session_factory()() as session:
-        row = await session.get(GameCurrentPrice, (APPID, "CN"))
-        assert row.price_status == "locked"
-        assert row.fail_count == 0
 
 
 @pytest.mark.asyncio
@@ -381,7 +365,11 @@ async def test_clear_missing_regions_deletes_only_missing():
             row = await session.get(GameCurrentPrice, (APPID, "RU"))
         assert row is not None and row.price_status == "ok"
 
-        await db.mark_region_status(APPID, "ru", "missing")
+        async with get_session_factory()() as session:
+            row = await session.get(GameCurrentPrice, (APPID, "RU"))
+            row.price_status = "missing"
+            row.attempt_outcome = "failed"
+            await session.commit()
         cleared = await db.clear_missing_regions([(APPID, "ru")])
         assert cleared == 1
         async with get_session_factory()() as session:

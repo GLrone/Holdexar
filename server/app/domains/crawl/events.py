@@ -370,7 +370,7 @@ async def _history_evidence(
 async def _previous_status(appids: list[int]) -> dict[str, str]:
     """每个单元最近一条状态事件隐含的状态（每单元 SQL 侧取 MAX(id) 一行）。
 
-    价格状态没有历史行（`mark_region_status` 只 UPSERT 当前表），本表自身就是
+    价格状态没有历史行（现价账本只 UPSERT 当前表），本表自身就是
     状态跃迁的持久记忆；没有记录时不猜，由调用方回落到「窗口前有有效快照 ⇒ ok」。
     """
     async with get_session_factory()() as session:
