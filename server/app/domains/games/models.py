@@ -101,6 +101,9 @@ class GameCurrentPrice(Base):
     original_price: Mapped[int | None] = mapped_column(BigInteger)
     discount_percent: Mapped[int] = mapped_column(Integer, default=0)
     sub_id: Mapped[int | None] = mapped_column(Integer)
+    # 账本状态（欠账选取语义：missing/blocked 过冷却窗进入补抓选取）；
+    # 与 attempt_outcome 是两个正交事实——ok+failed（传输失败保旧价）合法，
+    # 谁也不能从谁推导，写入侧必须同时声明两列
     price_status: Mapped[str] = mapped_column(String(20), default="ok")
     # 补抓账本：该区进入 missing 后的补抓尝试次数（0=未欠账；≥MISSING_MAX_RETRIES
     # 仍失败则转 blocked 终态，由 mark_missing/补抓链路维护）
