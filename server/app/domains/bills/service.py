@@ -309,8 +309,15 @@ async def import_report(data: dict, source_file: str = "", *, steam_id: str | No
     }
 
 
-# 同步状态快照（settings 键）——前端展示「自动同步」最近一次结果
+# 同步状态快照（settings 键）——前端展示「自动同步」最近一次结果。
+# 按账号分键：同步已按账号并发（调度 gather / 绑定首拉 / 手动入口可并行），
+# 单槽会被并发账号互相覆写；「在跑」事实的属主是 _sync_locks，快照只是每账号投影。
 KEY_BILLS_SYNC = "bills.sync_snapshot"
+
+
+def snapshot_key(steam_id: str) -> str:
+    return f"{KEY_BILLS_SYNC}:{steam_id}"
+
 
 async def _latest_known_tx_date(steam_id: str | None = None) -> str | None:
     """库内最新一笔交易日期（YYYY-MM-DD；无任何账单返回 None）。
@@ -391,19 +398,19 @@ async def sync_bills(*, force: bool = False, steam_id: str | None = None) -> dic
             return {"ok": False, "status": "busy"}
     async with _sync_lock(target):
         try:
-            return await _sync_bills_locked(force=force, steam_id=steam_id)
+            return await _sync_bills_locked(force=force, steam_id=target)
         except asyncio.CancelledError:
             from app.domains.settings import service as settings_service
 
-            snapshot = await settings_service.get_value(KEY_BILLS_SYNC, None) or {}
+            snapshot = await settings_service.get_value(snapshot_key(target), None) or {}
             if snapshot.get("running"):
-                await settings_service.set_value(KEY_BILLS_SYNC, {
+                await settings_service.set_value(snapshot_key(target), {
                     **snapshot, "running": False, "ok": False, "error": "账单同步已中断",
                 })
             raise
 
 
-async def _sync_bills_locked(*, force: bool, steam_id: str | None) -> dict:
+async def _sync_bills_locked(*, force: bool, steam_id: str) -> dict:
     """从 Steam 在线拉全量账单 + 许可并落库（后端常驻在线拉取）。
 
     未绑 Cookie / 无变化静默跳过（force=False 供定时任务）；
@@ -418,18 +425,18 @@ async def _sync_bills_locked(*, force: bool, steam_id: str | None) -> dict:
     from app.domains.settings import service as settings_service
     from . import steam_fetch
 
-    cookies = await account_service.get_cookies_of(steam_id) if steam_id else await account_service.get_cookies()
+    cookies = await account_service.get_cookies_of(steam_id)
     if not cookies or "steamLoginSecure" not in cookies:
         return {"ok": False, "status": "no_cookie"}
     from app.domains.account.steam_wallet import steam_id_from_cookies
 
     owner = steam_id_from_cookies(cookies)
-    if not owner or (steam_id and owner != steam_id):
+    if not owner or owner != steam_id:
         return {"ok": False, "status": "error", "error": "账单登录凭据与目标账号不一致"}
     steam_id = owner
 
     now = get_beijing_time_obj().replace(tzinfo=None)
-    await settings_service.set_value(KEY_BILLS_SYNC, {"running": True, "since": now.isoformat(), "steamId": steam_id})
+    await settings_service.set_value(snapshot_key(steam_id), {"running": True, "since": now.isoformat(), "steamId": steam_id})
 
     # 首屏探测：无新交易 → 本轮跳过（写探测跳过快照，等下一周期再探）
     if not force:
@@ -443,12 +450,12 @@ async def _sync_bills_locked(*, force: bool, steam_id: str | None) -> dict:
             )
         except steam_fetch.SteamFetchError as exc:
             # Cookie 失效等硬错误：写错误快照（与全量失败同语义），等下一轮
-            await settings_service.set_value(KEY_BILLS_SYNC, {
+            await settings_service.set_value(snapshot_key(steam_id), {
                 "running": False, "error": str(exc), "syncedAt": now.isoformat(), "steamId": steam_id,
             })
             return {"ok": False, "status": "error", "error": str(exc)}
         if not has_new:
-            await settings_service.set_value(KEY_BILLS_SYNC, {
+            await settings_service.set_value(snapshot_key(steam_id), {
                 "running": False, "probedSkip": True, "syncedAt": now.isoformat(), "steamId": steam_id,
             })
             return {"ok": True, "status": "probed_skip", "steamId": steam_id, "historyRows": 0, "licenseRows": 0}
@@ -458,7 +465,7 @@ async def _sync_bills_locked(*, force: bool, steam_id: str | None) -> dict:
         # 写失败只丢进度显示，不影响同步本体（_emit_progress 已兜一层，双保险）。
         try:
             await settings_service.set_value(
-                KEY_BILLS_SYNC, {"running": True, "since": now.isoformat(), "steamId": steam_id, **info}
+                snapshot_key(steam_id), {"running": True, "since": now.isoformat(), "steamId": steam_id, **info}
             )
         except Exception:  # noqa: BLE001
             log_event(logger, "账单同步进度写入失败", tag="忽略", level=logging.DEBUG, exc_info=True)
@@ -489,7 +496,7 @@ async def _sync_bills_locked(*, force: bool, steam_id: str | None) -> dict:
             }
         )
         snapshot = {**result, "running": False, "syncedAt": now.isoformat()}
-        await settings_service.set_value(KEY_BILLS_SYNC, snapshot)
+        await settings_service.set_value(snapshot_key(steam_id), snapshot)
         return result
     except Exception as exc:  # noqa: BLE001
         log_event(logger, "账单自动同步失败", detail={"原因": exc}, level=logging.WARNING)
@@ -500,16 +507,34 @@ async def _sync_bills_locked(*, force: bool, steam_id: str | None) -> dict:
             "syncedAt": now.isoformat(),
             "steamId": steam_id,
         }
-        await settings_service.set_value(KEY_BILLS_SYNC, error_snapshot)
+        await settings_service.set_value(snapshot_key(steam_id), error_snapshot)
         return {"ok": False, "status": "error", "error": str(exc)}
 
 
 async def get_sync_snapshot() -> dict:
-    """最近一次自动同步状态（running / 结果 / 错误）。"""
+    """最近一次账单同步状态（running / 结果 / 错误），按账号分键后聚合。
+
+    展示口径：有在跑账号（锁注册表为进程内事实源）取其在跑快照，否则取
+    最近收场（syncedAt/since 最新）的账号；running = 任一账号在跑。
+    """
+    from app.domains.account import service as account_service
     from app.domains.settings import service as settings_service
 
-    snap = await settings_service.get_value(KEY_BILLS_SYNC, None) or {}
-    return {**snap, "running": bool(snap.get("running")) and any(l.locked() for l in _sync_locks.values())}
+    running_sids = {sid for sid, lock in _sync_locks.items() if lock.locked()}
+    snaps: dict[str, dict] = {}
+    for account in await account_service.list_accounts():
+        sid = str(account.get("steam_id") or "")
+        if not sid:
+            continue
+        snap = await settings_service.get_value(snapshot_key(sid), None)
+        if snap:
+            snaps[sid] = snap
+    if not snaps:
+        return {"running": bool(running_sids)}
+    active = [sid for sid in running_sids if sid in snaps]
+    pool = active or list(snaps)
+    picked = max(pool, key=lambda sid: snaps[sid].get("syncedAt") or snaps[sid].get("since") or "")
+    return {**snaps[picked], "running": bool(running_sids), "steamId": picked}
 
 
 async def list_imports() -> list[dict]:
