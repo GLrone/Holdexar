@@ -65,7 +65,11 @@ const IslandPlayground = isDev
 const showPlayground = ref(false)
 
 onMounted(() => {
-  crawl.start()
+  // EventSource 对 4xx 终态不重连：会话 cookie 未就绪就开事件流会整页失联
+  void fetch('/api/v1/settings', { credentials: 'same-origin' })
+    .then((r) => (r.status === 401 ? fetch('/api/v1/session/dev', { credentials: 'same-origin' }) : null))
+    .catch(() => {})
+    .then(() => crawl.start())
   // 内容链事实通知（HB 当月包 / Epic 喜加一）：60s 轮询增量上岛
   factNotices.start()
   settingsStore.load()
