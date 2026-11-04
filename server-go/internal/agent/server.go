@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -253,6 +254,25 @@ func (s *Surface) availabilityGuard(next mcp.MethodHandler) mcp.MethodHandler {
 	}
 }
 
+// validateArgs 按 spec 声明的 JSON Schema 校验必需参数：required 键缺失
+// 回 isError（对齐 Python validation error 拒执行语义——缺参静默按空执行
+// 会把「没找到」伪装成「查了确实没有」）；未声明键沿用 Python BaseHandler
+// 忽略语义不拦；schema 声明本身不可解析时放行，由 handler 取参路径兜底。
+func validateArgs(spec *ToolSpec, args map[string]any) error {
+	var schema struct {
+		Required []string `json:"required"`
+	}
+	if err := jsonDecoder([]byte(spec.Parameters)).Decode(&schema); err != nil {
+		return nil
+	}
+	for _, k := range schema.Required {
+		if _, ok := args[k]; !ok {
+			return fmt.Errorf("%s 缺少必需参数 %q", spec.Name, k)
+		}
+	}
+	return nil
+}
+
 // callHandler 工具调用 → 公共执行边界，结果 JSON 文本回传
 // （payload = {"status": 归一态, **data}）。
 func (s *Surface) callHandler(spec *ToolSpec) mcp.ToolHandler {
@@ -262,6 +282,12 @@ func (s *Surface) callHandler(spec *ToolSpec) mcp.ToolHandler {
 			if err := jsonDecoder(req.Params.Arguments).Decode(&args); err != nil {
 				return nil, err
 			}
+		}
+		if err := validateArgs(spec, args); err != nil {
+			return &mcp.CallToolResult{
+				IsError: true,
+				Content: []mcp.Content{&mcp.TextContent{Text: err.Error()}},
+			}, nil
 		}
 		result := Execute(&CallContext{Ctx: ctx, Args: args, fetch: s.fetcher, db: s.db}, spec, false)
 		payload := newObj()

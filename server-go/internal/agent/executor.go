@@ -86,11 +86,16 @@ func failedData(name, note string) *Obj {
 	return data
 }
 
-// typeName 异常类型名（Python type(e).__name__ 的等位投影）。
+// typeName 异常类型名（Python type(e).__name__ 的等位投影）。errors.New 产
+// 的 errorString 是实现细节（全部未包装错误共用一名，对读者零信息），泛化
+// 为 "error"；有语义的具体类型（如 *fs.PathError、超时类）原样保留。
 func typeName(cause any) string {
 	t := reflect.TypeOf(cause)
 	if t == nil {
 		return "unknown"
+	}
+	if t.String() == "*errors.errorString" || t.String() == "errors.errorString" {
+		return "error"
 	}
 	return t.String()
 }
