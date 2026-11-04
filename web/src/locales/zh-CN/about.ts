@@ -6,7 +6,7 @@
 const about = {
   /* 定位（hero 段落） */
   'about.hero.desc':
-    '单机自部署的个人终端——把 Steam 多区价格、愿望单监控、家庭共享库、消费账单与代理链路收进一个本地仪表盘。所有数据只存本机，出网走自有代理链路，不经过任何第三方服务器。',
+    '单机自部署的个人终端——把 Steam 多区价格、愿望单关注、家庭共享库、消费账单与代理链路收进一个本地仪表盘。所有数据只存本机，出网走自有代理链路，不经过任何第三方服务器。',
   'about.checkUpdate': '检查更新',
 
   /* 运行时长（页脚「已运行」后的值，由秒数分档） */
@@ -31,9 +31,9 @@ const about = {
   /* 功能特性卡（FEATURES 常量表，与侧边栏模块一一对应） */
   'about.feature.multiRegion.title': '多区价格矩阵',
   'about.feature.multiRegion.desc':
-    '41 区服实时价格 / 史低 / 折扣追踪，按汇率自动折算人民币横向对比',
-  'about.feature.wishlist.title': '监控池',
-  'about.feature.wishlist.desc': '多账户愿望单与已购追踪入池、区服圈定，15 分钟账户同步 + 每 6 小时价格爬取',
+    '41 地区实时价格 / 史低 / 折扣追踪，按汇率自动折算人民币横向对比',
+  'about.feature.wishlist.title': '我的关注',
+  'about.feature.wishlist.desc': '多账户愿望单与已购追踪并入我的关注、地区圈定，15 分钟账户同步 + 每 6 小时价格爬取',
   'about.feature.alerts.title': '价格提醒',
   'about.feature.alerts.desc': '降价与历史新低邮件推送，新低优先展示号主所在区',
   'about.feature.rates.title': '汇率追踪',
@@ -60,7 +60,7 @@ const about = {
   'about.tech.desktop.label': '桌面',
   'about.tech.desktop.desc': 'pywebview（WebView2）一键启动与登录回传',
   'about.tech.proxy.label': '代理链',
-  'about.tech.proxy.desc': 'mihomo（Clash 内核）+ 代理策略引擎（proxy_first）',
+  'about.tech.proxy.desc': 'mihomo（Clash 内核）+ 多出口代理策略引擎',
 
   /* 数据来源 */
   'about.source.price.label': '价格',
@@ -68,7 +68,7 @@ const about = {
   'about.source.account.label': '账户',
   'about.source.account.desc': 'Steam 官方 Web API（Cookie 的 JWT 免 Key 通道）',
   'about.source.network.label': '出网',
-  'about.source.network.desc': '一律经代理策略引擎（proxy_first），直连被墙域自动走代理',
+  'about.source.network.desc': '一律经代理策略引擎转发，直连被墙域自动走代理',
   'about.source.flags.label': '旗帜',
   /* 尾部的「；」绑定同一行里的下一对（旗帜 … ；汇率 …）——标点随语言走，
      故留在词条里，不在模板里写全角分号（英文界面下会很难看）。 */

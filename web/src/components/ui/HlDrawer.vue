@@ -1,5 +1,7 @@
 <script setup lang="ts">
-import { useAttrs, watch } from 'vue'
+import { ref, useAttrs, watch } from 'vue'
+
+import { useOverlayA11y } from './useOverlayA11y'
 
 const props = withDefaults(
   defineProps<{
@@ -19,6 +21,10 @@ const props = withDefaults(
 
 const attrs = useAttrs()
 const model = defineModel<boolean>({ default: false })
+const panel = ref<HTMLElement | null>(null)
+
+// 焦点管理与 Esc 只归模态管：非模态抽屉底层可交互，不抢焦点、不拦按键
+useOverlayA11y(model, panel, () => props.modal)
 
 // 仅模态时锁定 body 滚动；非模态不锁
 watch(model, (v) => {
@@ -38,8 +44,13 @@ defineOptions({ inheritAttrs: false })
     <Transition name="hl-drawer-slide" appear>
       <div
         v-if="model"
+        ref="panel"
         class="hl-drawer"
         :class="[attrs.class, { 'hl-drawer--non-modal': !modal }]"
+        :role="modal ? 'dialog' : undefined"
+        :aria-modal="modal ? true : undefined"
+        :aria-label="title || undefined"
+        :tabindex="modal ? -1 : undefined"
         :style="[
           attrs.style as Record<string, string>,
           {

@@ -32,6 +32,7 @@ const family = {
   'family.member.exclusive': '独占 {n}',
   'family.member.recent30': '近30日活跃 {n}',
   'family.member.remove': '移除',
+  'family.member.removeConfirm': '移除 {name}？将停止跟踪该成员：手动添加的删除条目，家庭组成员不再同步。',
   'family.remove.failed': '移除成员失败：{err}',
 
   /* 地区二级窗 */
@@ -56,7 +57,7 @@ const family = {
   'family.add.placeholder': '添加成员：Steam 好友码（如 998167239）或 SteamID64，输入即识别',
   'family.add.needInput': '请先输入好友码或 SteamID64（解析出账号后再添加）',
   'family.add.trackFailed': '已加入列表，但入库追踪失败：{err}',
-  'family.add.success': '已添加 {name}：已进入监控池追踪（绑定 Cookie 后点「同步家庭组」自动补齐全家）',
+  'family.add.success': '已添加 {name}：已加入我的关注（绑定 Cookie 后点「同步家庭组」自动补齐全家）',
   'family.add.failed': '添加成员失败：{err}',
   'family.add.confirming': '添加中…',
   'family.add.action': '添加',

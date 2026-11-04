@@ -153,7 +153,7 @@ async def _resolve_steamid(raw: str) -> str:
 
     if not api_key:
         raise ValueError(
-            "非好友码/SteamID64 输入需要先在「我」页配置 Steam Web API Key 才能解析自定义 URL"
+            "支持好友码、SteamID64 或个人资料链接；自定义链接需在设置「账户」页配置 API Key"
         )
     async with httpx.AsyncClient(timeout=15, proxy=await _strategy_proxy()) as client:
         resp = await client.get(

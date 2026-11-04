@@ -8,7 +8,7 @@ import type { MessageKey } from '../zh-CN'
 const about: Partial<Record<MessageKey, string>> = {
   /* Hero */
   'about.hero.desc':
-    'A self-hosted personal terminal that pulls Steam multi-region pricing, wishlist monitoring, family library analytics, purchase history and proxy routing into one local dashboard. All data stays on this machine, and every outbound request goes through your own proxy chain — never a third-party server.',
+    'A self-hosted personal terminal that pulls Steam multi-region pricing, wishlist following, family library analytics, purchase history and proxy routing into one local dashboard. All data stays on this machine, and every outbound request goes through your own proxy chain — never a third-party server.',
   'about.checkUpdate': 'Check for updates',
 
   /* Uptime value in the footer */
@@ -34,9 +34,9 @@ const about: Partial<Record<MessageKey, string>> = {
   'about.feature.multiRegion.title': 'Multi-region price matrix',
   'about.feature.multiRegion.desc':
     '41 regions with live prices, all-time lows and discounts, auto-converted to CNY for side-by-side comparison',
-  'about.feature.wishlist.title': 'Watch pool',
+  'about.feature.wishlist.title': 'Following',
   'about.feature.wishlist.desc':
-    'Wishlist and owned tracking in one pool, with watched-region picking — sync every 15 min, price crawl every 6 h',
+    'Wishlist and owned tracking joins Following, with watched-region picking — sync every 15 min, price crawl every 6 h',
   'about.feature.alerts.title': 'Price alerts',
   'about.feature.alerts.desc':
     'Email alerts on price drops and new all-time lows, with the account owner region shown first',
@@ -70,7 +70,7 @@ const about: Partial<Record<MessageKey, string>> = {
   'about.tech.desktop.label': 'Desktop',
   'about.tech.desktop.desc': 'pywebview (WebView2) one-click launch and login hand-off',
   'about.tech.proxy.label': 'Proxy chain',
-  'about.tech.proxy.desc': 'mihomo (Clash core) + proxy policy engine (proxy_first)',
+  'about.tech.proxy.desc': 'mihomo (Clash core) + multi-egress proxy policy engine',
 
   /* Data sources */
   'about.source.price.label': 'Prices',
@@ -80,7 +80,7 @@ const about: Partial<Record<MessageKey, string>> = {
   'about.source.account.desc': 'Official Steam Web API (JWT from cookie, no API key needed)',
   'about.source.network.label': 'Egress',
   'about.source.network.desc':
-    'Always through the proxy policy engine (proxy_first); blocked domains are proxied automatically',
+    'Always through the proxy policy engine; blocked domains are proxied automatically',
   'about.source.flags.label': 'Flags',
   'about.source.flags.desc': 'bundled artwork;',
   'about.source.rates.label': 'Rates',

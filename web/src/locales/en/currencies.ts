@@ -42,7 +42,7 @@ const currencies = {
   'currencies.name.ILS': 'Israeli New Shekel',
   'currencies.name.CHF': 'Swiss Franc',
 
-  // ── 预留币种（当前无区服使用，服务端仍抓取落库） ──
+  // ── 预留币种（当前无地区使用，服务端仍抓取落库） ──
   'currencies.name.TRY': 'Turkish Lira',
   'currencies.name.ARS': 'Argentine Peso',
 }

@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { alertsApi, notificationsApi, type AlertEventItem, type FeaturedConfig, type NotificationCandidate, type NotificationCondition, type NotificationFrequency, type NotificationPrefs, type NotificationPrefsUpdate, type NotificationStats, type PriceAlertDraft, type PriceAlertItem, type RuleEvaluation, type GameSearchResult } from '@/api/client'
 import { formatMinor } from '@/api/currencies'
 import { regionSelectOptions } from '@/api/selectOptions'
 import { amountToMinor, minorToInput } from '@/lib/notificationForms'
+import { errorText } from '@/lib/errorText'
 import { useI18n, type MessageKey } from '@/locales'
 import { useRegionsStore } from '@/stores/regions'
 import RegionFlag from '@/components/RegionFlag.vue'
@@ -44,7 +46,7 @@ function priceText(price?: number | null, currency?: string | null) {
   return price != null && currency ? `${formatMinor(price, currency)} (${currency})` : c('unconfirmedPrice')
 }
 function fail(cause: unknown) {
-  error.value = cause instanceof Error ? cause.message : String(cause)
+  error.value = errorText(cause)
   message.error(error.value)
 }
 async function load() {
@@ -60,7 +62,9 @@ async function load() {
     candidates.value = history.items
     legacyEvents.value = old
     manualRegion.value = config.manualRegion?.toLowerCase() || ''
-    if (!draft.region && config.region.region) draft.region = config.region.region.toLowerCase()
+    // 表单默认区：通知偏好的默认提醒地区（manualRegion 的解析投影）为空时，
+    // 回落到首个已启用监控区；两者都未配置才留「未知地区」诚实态
+    if (!draft.region) draft.region = config.region.region?.toLowerCase() || regions.enabledCodes[0] || ''
     resetFeatured()
   } catch (cause) { fail(cause) }
   finally { loading.value = false }
@@ -106,7 +110,7 @@ function resetDraft() {
   editingId.value = null
   search.value = ''
   results.value = []
-  Object.assign(draft, { appid: 0, region: prefs.value?.region.region?.toLowerCase() || '', targetType: 'price', amount: '', windowDays: 0, legacy: false, repeatMode: 'once', repeatHours: '24' })
+  Object.assign(draft, { appid: 0, region: prefs.value?.region.region?.toLowerCase() || regions.enabledCodes[0] || '', targetType: 'price', amount: '', windowDays: 0, legacy: false, repeatMode: 'once', repeatHours: '24' })
   previewItems.value = []
 }
 function rulePayload(): PriceAlertDraft {
@@ -203,7 +207,7 @@ async function preview(kind: 'rule' | 'featured') {
     if (kind === 'rule') { const result = await alertsApi.preview(rulePayload()); previewItems.value = [result]; previewTotal.value = 1; previewMatched.value = Number(result.matched) }
     else { const result = await alertsApi.featuredPreview(featuredPayload()); previewItems.value = result.items; previewTotal.value = result.total; previewMatched.value = result.matched; if (result.exclusions?.length) previewError.value = c('unknownRegion') }
     previewStale.value = false
-  } catch (cause) { previewError.value = cause instanceof Error ? cause.message : String(cause); previewItems.value = [] }
+  } catch (cause) { previewError.value = errorText(cause); previewItems.value = [] }
   finally { previewBusy.value = false }
 }
 function conditionLabel(condition: NotificationCondition) {
@@ -220,7 +224,17 @@ function conditionNumbers(condition: NotificationCondition, evaluation: RuleEval
 function candidatePrice(item: NotificationCandidate) { const value = item.payload; return priceText(value.price ?? value.current?.price, value.currency ?? value.current?.currency) }
 const historyPreview = ref<NotificationCandidate | null>(null)
 const historyOpen = computed({ get: () => historyPreview.value !== null, set: value => { if (!value) historyPreview.value = null } })
-onMounted(load)
+const route = useRoute()
+onMounted(async () => {
+  await load()
+  // 详情页「设价格提醒」跳入：query 带 appid+name，直开规则表单并预选该游戏（一次性读取）
+  const appid = Number(route.query.appid)
+  if (appid > 0) {
+    draft.appid = appid
+    search.value = String(route.query.name || appid)
+    tab.value = 'rules'
+  }
+})
 </script>
 
 <template>

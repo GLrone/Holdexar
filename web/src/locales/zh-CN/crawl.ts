@@ -136,13 +136,13 @@ const crawl = {
      这一条计数句式给已购分节的「自定义」态角标用。 */
   'crawl.regions.selected': '已选 {n} / {total} 区',
 
-  /* ── 已购游戏抓取地区（独立于监控地区的子集配置；圈定入口在监控池页）── */
+  /* ── 已购游戏抓取地区（独立于监控地区的子集配置；圈定入口在我的关注页）── */
   'crawl.owned.desc':
-    '「账户设置」按账户开关已购库同步（库太大的账户可关，只盯愿望单）；已购游戏随愿望单同步自动进监控池，地区跟随监控地区（默认，监控池页圈定）或圈定子集省配额。',
+    '「账户设置」按账户开关已购库同步（库太大的账户可关，只盯愿望单）；已购游戏随愿望单同步自动进监控池，地区跟随监控地区（默认，我的关注页圈定）或圈定子集省配额。',
   'crawl.owned.acctSet': '账户设置',
   'crawl.owned.acctSetTip': '按账户开关已购库同步',
   'crawl.owned.follow': '跟随监控地区',
-  'crawl.owned.hintFollow': '已购游戏与愿望单共用同一套区服抓取（监控池页可改）',
+  'crawl.owned.hintFollow': '已购游戏与愿望单共用同一套区服抓取（我的关注页可改）',
   'crawl.owned.hintCustom': '已购游戏仅抓取下方勾选的区服（至少一个）',
   'crawl.owned.savedFollow': '已保存：已购游戏跟随监控地区抓取',
   'crawl.owned.savedCustom': '已保存：已购游戏将抓取 {n} 个区的价格',
@@ -153,7 +153,7 @@ const crawl = {
   'crawl.acct.hint':
     '开 = 该账户已购库并入监控池；库太大的账户可关，只同步愿望单。开关下次同步生效。',
   'crawl.acct.meta': '好友码 {code} · 已购 {n} 款',
-  'crawl.acct.empty': '还没有绑定账户 —— 到「监控池」页绑定或同步家庭组。',
+  'crawl.acct.empty': '还没有绑定账户 —— 到「我的关注」页绑定或同步家庭组。',
   'crawl.acct.ownedOn': '已开启 {name} 的已购同步，下次同步生效',
   'crawl.acct.ownedOff': '已关闭 {name} 的已购同步，下次同步生效',
 

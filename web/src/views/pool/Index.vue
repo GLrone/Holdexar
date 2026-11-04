@@ -7,6 +7,7 @@ import { friendCodeOrRaw } from '@/utils/steamId'
 import { useRegionsStore } from '@/stores/regions'
 import { useI18n, type MessageKey } from '@/locales'
 import { parseFavoritesRefs } from '@/lib/appidRefs'
+import { errorText } from '@/lib/errorText'
 import RegionFlag from '@/components/RegionFlag.vue'
 import {
   HlAvatar,
@@ -174,7 +175,7 @@ async function load() {
     const failed = results.find((r) => r.status === 'rejected')
     if (failed) {
       const reason = failed.reason
-      message.error(reason instanceof Error ? reason.message : String(reason))
+      message.error(errorText(reason))
     }
   } finally {
     loading.value = false
@@ -209,7 +210,7 @@ async function add() {
     newLabel.value = ''
     await load()
   } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
+    message.error(errorText(e))
   }
 }
 
@@ -229,7 +230,7 @@ async function sync(account: TrackedAccount) {
     }
     await load()
   } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
+    message.error(errorText(e))
   } finally {
     syncingId.value = null
   }
@@ -271,7 +272,7 @@ async function onPickFile(ev: Event) {
     addText.value = await file.text()
     addSource.value = file.name
   } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
+    message.error(errorText(e))
   }
 }
 
@@ -303,7 +304,7 @@ async function submitAdd() {
     addSource.value = ''
     await load()
   } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
+    message.error(errorText(e))
   } finally {
     adding.value = false
   }
@@ -365,7 +366,7 @@ async function removeSelected() {
     selected.value = new Set()
     await load()
   } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
+    message.error(errorText(e))
   } finally {
     removing.value = false
   }
@@ -442,7 +443,7 @@ async function saveRegions() {
         : t('pool.regions.savedStrict'),
     )
   } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
+    message.error(errorText(e))
   } finally {
     savingRegions.value = false
   }
