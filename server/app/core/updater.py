@@ -14,9 +14,9 @@
 - 更新清单必须经内嵌公钥验签（core/update_signing）；验不过的清单不进
   检查/下载/换装链——镜像只当字节运输，不产生任何信任
 - 换装只动程序目录，data/ 等用户目录跳过（desktop 侧白名单）
-- 下载产物落 data/update-staging/，sha256 校验不过不进换装链（校验值
+- 下载产物解包进安装根 update-staging/，sha256 校验不过不进换装链（校验值
   缺失同样拒绝，不存在「无校验值放行」）
-- 旧程序目录整体移 __old__，失败可手工移回 = 永远有退路
+- 回滚由独立更新宿主执行：撤下未验收版本、指针交还上一有效版本 = 永远有退路
 
 网络通道：复用 clash_manager._download_attempts 的镜像 + 本地代理
 发现链（国内网络直连 GitHub Releases 基本不可用）。
@@ -69,9 +69,6 @@ _ASSET_PATTERN = re.compile(rf"^{re.escape(APP_NAME)}-win64-v[\w.-]+\.zip$", re.
 
 # 镜像前缀（单一来源 app.core.app_info.GITHUB_MIRRORS，空串 = 直连 GitHub）。
 _MIRRORS = GITHUB_MIRRORS
-
-STAGING_DIR = STAGING_DIR_NAME  # data/ 下的暂存目录（desktop 侧读同名目录）
-_PENDING_FILE = ".update-pending"  # 换装标记（staging 内 manifest.json 同目录）
 
 # 探测：候选通道各发一笔 `Range: bytes=0-0`（只读响应头，几十字节代价），一次并发
 # 同时判出「资产在不在」与「这条通道快不快」。
@@ -268,9 +265,6 @@ async def _check_update_via_api() -> dict:
         "source": "api",
     }
 
-
-# 版本比较统一在 app_info.version_gt（零依赖模块，桌面壳/发布脚本共用一份）
-_version_gt = version_gt
 
 
 def _plain_notes(body: str, limit: int = 8000) -> str:
@@ -541,7 +535,7 @@ async def download_update(
         # 不是安装根——staging 在安装根下，staging.parent 对错文件）
         from app.core.paths import resolve_data_dir
         (resolve_data_dir() / SWAP_FAILED_FLAG).unlink(missing_ok=True)
-        (staging.parent / HANDOFF_LEDGER_NAME).unlink(missing_ok=True)
+        (resolve_data_dir() / HANDOFF_LEDGER_NAME).unlink(missing_ok=True)
         _PROGRESS.update({"ok": True, "running": False, "phase": "done", "percent": 100})
         log_event(
             logger,

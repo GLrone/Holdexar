@@ -70,9 +70,8 @@ def test_update_host_success(tmp_path):
     # 验证暂存清理
     assert not staging.exists()
 
-    # 验证事务终态
-    tx = layout.read_transaction(root)
-    assert tx["stage"] == layout.STAGE_COMMITTED
+    # 验证事务终态：提交即清场，指针与相容记录在 current.json
+    assert layout.read_transaction(root) is None
 
     # 验证日志与诊断报告生成
     diag_file = root / "logs" / "update-diagnosis.json"
@@ -509,6 +508,7 @@ def test_new_update_cannot_overwrite_unfinished_data_ownership(tmp_path, monkeyp
     def unfinished(*args, **kwargs):
         raise RuntimeError("previous ownership cannot finish")
 
+    monkeypatch.setattr(update_data, "_read_marker", lambda _d: {"token": "t"})
     monkeypatch.setattr(update_data, "abort_preparation", unfinished)
     monkeypatch.setattr(update_data, "rollback", unfinished)
     monkeypatch.setattr(update_data, "accept", unfinished)
@@ -587,8 +587,7 @@ def test_accepted_recovery_closes_success_diagnosis_without_repeating_ack(tmp_pa
         }), encoding="utf-8")
 
     assert update_host.recover_interrupted_update(root) is True
-    tx = layout.read_transaction(root)
-    assert tx["stage"] == layout.STAGE_COMMITTED
+    assert layout.read_transaction(root) is None
     diag = json.loads(diag_file.read_text(encoding="utf-8"))
     assert diag["attemptId"] == "accepted"
     assert diag["targetVersion"] == target
@@ -656,7 +655,9 @@ def test_update_preserves_explicit_external_data_directory(tmp_path, monkeypatch
     assert update_host.execute_update(
         root=root, staging_dir=staging, data_dir=data, launch_on_finish=False,
     ) is True
-    assert layout.read_transaction(root)["dataDir"] == str(data.resolve())
+    diag = json.loads((root / "logs" / "update-diagnosis.json").read_text(encoding="utf-8"))
+    assert diag["dataDir"] == str(data.resolve())
+    assert layout.read_current_state(root)["dataCompatibility"]["dataDir"] == str(data.resolve())
     assert not (root / "data" / "holdexar.db").exists()
     with sqlite3.connect(data / "holdexar.db") as db:
         assert db.execute("SELECT value FROM user_record").fetchone() == ("preserved",)
@@ -718,3 +719,229 @@ def test_verify_staging_payload_rejects_missing_file(tmp_path):
 
 def test_verify_staging_payload_skips_legacy_manifest(tmp_path):
     assert update_host._verify_staging_payload(tmp_path, {"tag": "v1"}) == ""
+
+
+def _seed_version(root, version, body=b"binary"):
+    vdir = layout.get_version_dir(root, version)
+    vdir.mkdir(parents=True, exist_ok=True)
+    (vdir / f"{APP_NAME}.exe").write_bytes(body)
+    return vdir
+
+
+def test_recovered_verifying_residue_allows_next_upgrade(tmp_path, monkeypatch):
+    """P0-B 主复现：verifying+prepared 残留恢复成功后，不得用恢复前快照裁决。"""
+    root = tmp_path / "app"
+    staging = tmp_path / "staging"
+    _seed_version(root, "0.3.5")
+    layout.write_current_state(root, "0.3.5")
+    _create_mock_app_payload(staging, "0.3.7")
+    layout.start_transaction(root, "0.3.7", "0.3.5", attempt_id="previous")
+    (root / "data").mkdir()
+    layout.update_transaction(root, "verifying", dataPrepared=True,
+                              dataRecoveryPhase="restored", dataDir=str(root / "data"),
+                              dataDbPath=str(root / "data" / "holdexar.db"), dataToken="tok",
+                              dataSnapshot=str(root / "data" / "backups" / "snap.db"),
+                              dataSnapshotSha256="a" * 64, dataSchemaVersion=17)
+
+    def fail_to_terminal(_root, _diagnosis, _error, **_kwargs):
+        layout.update_transaction(root, layout.STAGE_ROLLED_BACK, dataRollbackReleased=True,
+                                  dataRecoveryPhase="restored", error="recovered")
+        return True
+
+    monkeypatch.setattr(update_host, "_fail", fail_to_terminal)
+    assert update_host.execute_update(root, staging, target_version="0.3.7",
+                                      skip_health_check=True, launch_on_finish=False) is True
+    assert layout.read_current_state(root)["version"] == "0.3.7"
+
+
+def test_unprepared_residue_recovery_clears_and_allows_upgrade(tmp_path):
+    """P0-B 变体 B：未准备残留恢复后必须终态清场，否则升级被永久拦截。"""
+    root = tmp_path / "app"
+    staging = tmp_path / "staging"
+    _seed_version(root, "0.3.5")
+    layout.write_current_state(root, "0.3.5")
+    _create_mock_app_payload(staging, "0.3.7")
+    layout.start_transaction(root, "0.3.7", "0.3.5", attempt_id="previous")
+    layout.update_transaction(root, "switching", dataDir=str(root / "data"))
+    assert update_host.execute_update(root, staging, target_version="0.3.7",
+                                      skip_health_check=True, launch_on_finish=False) is True
+    tx = layout.read_transaction(root)
+    assert tx is None or tx.get("attemptId") != "previous"
+
+
+def test_unfinished_residue_after_failed_finalization_still_blocks(tmp_path, monkeypatch):
+    """恢复无法收尾（清场被阻）时维持 fail-closed：拦截新升级并标记重拉旧版。"""
+    root = tmp_path / "app"
+    staging = tmp_path / "staging"
+    _seed_version(root, "0.3.5")
+    layout.write_current_state(root, "0.3.5")
+    _create_mock_app_payload(staging, "0.3.7")
+    layout.start_transaction(root, "0.3.7", "0.3.5", attempt_id="previous")
+    layout.update_transaction(root, "switching", dataDir=str(root / "data"))
+    monkeypatch.setattr(layout, "clear_transaction", lambda *_a, **_kw: None)
+    assert update_host.execute_update(root, staging, target_version="0.3.7",
+                                      skip_health_check=True, launch_on_finish=False) is False
+    assert layout.read_transaction(root)["attemptId"] == "previous"
+
+
+def test_released_residue_with_drifted_pointer_clears_and_proceeds(tmp_path, monkeypatch):
+    """P0-B 变体 C（真机毒化场景）：终态已释放+指针漂移=事务已完结，清场放行。"""
+    from app.core import update_data
+
+    root = tmp_path / "app"
+    staging = tmp_path / "staging"
+    _seed_version(root, "0.3.5")
+    layout.write_current_state(root, "0.3.6")
+    _create_mock_app_payload(staging, "0.3.7")
+    layout.start_transaction(root, "0.3.6", "0.3.5", attempt_id="previous")
+    layout.update_transaction(root, layout.STAGE_ROLLED_BACK, dataRollbackReleased=True,
+                              dataRecoveryPhase="restored", dataDir=str(root / "data"),
+                              dataDbPath=str(root / "data" / "holdexar.db"), dataToken="tok",
+                              dataSnapshot=str(root / "data" / "backups" / "snap.db"),
+                              dataSnapshotSha256="a" * 64, dataSchemaVersion=17)
+    monkeypatch.setattr(update_data, "finish_rollback", lambda *_a, **_kw: None)
+    assert update_host.recover_interrupted_update(root) is True
+    assert layout.read_transaction(root) is None
+
+
+def test_released_residue_with_incomplete_phase_stays_fail_closed(tmp_path):
+    """相位无法证明恢复完整时保持阻断（安全类别三：保留现场）。"""
+    root = tmp_path / "app"
+    layout.start_transaction(root, "0.3.6", "0.3.5", attempt_id="previous")
+    layout.update_transaction(root, layout.STAGE_ROLLED_BACK, dataRollbackReleased=True,
+                              dataRecoveryPhase="restoring", dataDir=str(root / "data"),
+                              dataDbPath=str(root / "data" / "holdexar.db"), dataToken="tok",
+                              dataSnapshot=str(root / "data" / "backups" / "snap.db"),
+                              dataSnapshotSha256="a" * 64, dataSchemaVersion=17)
+    with pytest.raises(RuntimeError):
+        update_host.recover_interrupted_update(root)
+    assert layout.read_transaction(root)["attemptId"] == "previous"
+
+
+def test_read_migration_signal_reports_version_and_snapshot(tmp_path):
+    from app.core.update_host import _read_migration_signal
+
+    empty = tmp_path / "no-data"
+    assert _read_migration_signal(empty) == (None, -1)
+    data = tmp_path / "data"
+    data.mkdir()
+    conn = sqlite3.connect(data / "holdexar.db")
+    conn.execute("PRAGMA user_version=30")
+    conn.close()
+    bak = data / "holdexar.db.pre-migration.bak"
+    bak.write_bytes(b"x" * 128)
+    assert _read_migration_signal(data) == (30, 128)
+
+
+def test_migration_progress_extends_probe_window(tmp_path, monkeypatch):
+    """迁移信号持续推进时，验收窗随空闲窗延长，直到总上限才回滚。"""
+    import sys
+    import threading
+    import time as _time
+
+    root = tmp_path / "app"
+    data = tmp_path / "data"
+    data.mkdir()
+    stop = threading.Event()
+    real_popen = update_host.subprocess.Popen
+    real_sleep = _time.sleep
+
+    def fake_popen(_args, **kwargs):
+        return real_popen([sys.executable, "-c", "import time; time.sleep(60)"], **kwargs)
+
+    def grow():
+        bak = data / "holdexar.db.pre-migration.bak"
+        while not stop.is_set():
+            with bak.open("ab") as fh:
+                fh.write(b"progress")
+            real_sleep(0.15)
+
+    def bounded_sleep(seconds):
+        real_sleep(min(seconds, 0.05))
+
+    monkeypatch.setattr(update_host.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(update_host, "MIGRATION_MAX_DURATION", 2.2)
+    monkeypatch.setattr(update_host, "MIGRATION_IDLE_WINDOW", 0.8)
+    monkeypatch.setattr(update_host, "MIGRATION_SIGNAL_INTERVAL", 0.15)
+    monkeypatch.setattr(update_host.time, "sleep", bounded_sleep)
+    worker = threading.Thread(target=grow, daemon=True)
+    worker.start()
+    try:
+        started = _time.monotonic()
+        ok, reason = update_host.probe_version_health(
+            root, "9.9.9", "attempt-grow", timeout=0.4,
+            data_dir=data, target_exe=Path(sys.executable), require_guard=False,
+        )
+        elapsed = _time.monotonic() - started
+    finally:
+        stop.set()
+    assert ok is False
+    assert "迁移超出总预算" in reason
+    assert elapsed >= 2.0
+
+
+def test_stalled_migration_keeps_original_probe_budget(tmp_path, monkeypatch):
+    """无迁移信号推进时不得凭进程存在续期：按原验收窗超时回滚。"""
+    import sys
+    import time as _time
+
+    root = tmp_path / "app"
+    data = tmp_path / "data"
+    data.mkdir()
+    real_popen = update_host.subprocess.Popen
+    real_sleep = _time.sleep
+
+    def fake_popen(_args, **kwargs):
+        return real_popen([sys.executable, "-c", "import time; time.sleep(60)"], **kwargs)
+
+    def bounded_sleep(seconds):
+        real_sleep(min(seconds, 0.05))
+
+    monkeypatch.setattr(update_host.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(update_host, "MIGRATION_MAX_DURATION", 60.0)
+    monkeypatch.setattr(update_host, "MIGRATION_IDLE_WINDOW", 30.0)
+    monkeypatch.setattr(update_host, "MIGRATION_SIGNAL_INTERVAL", 0.15)
+    monkeypatch.setattr(update_host.time, "sleep", bounded_sleep)
+    started = _time.monotonic()
+    ok, reason = update_host.probe_version_health(
+        root, "9.9.9", "attempt-stalled", timeout=0.5,
+        data_dir=data, target_exe=Path(sys.executable), require_guard=False,
+    )
+    elapsed = _time.monotonic() - started
+    assert ok is False
+    assert "健康验收超时" in reason
+    assert "迁移超出总预算" not in reason
+    assert elapsed < 5.0
+
+
+def test_husk_residue_without_marker_clears_despite_pointer_drift(tmp_path, monkeypatch):
+    """P0-B 变体 D（真机）：准备前失败的残壳事务（无保护标记）+指针漂移=直接清场。"""
+    from app.core import update_data
+
+    root = tmp_path / "app"
+    data = root / "data"
+    data.mkdir(parents=True)
+    layout.write_current_state(root, "0.3.8-beta-rc2")
+    layout.start_transaction(root, "0.3.8-beta-rc2", "0.3.8-beta-rc1", attempt_id="husk")
+    layout.update_transaction(root, layout.STAGE_ROLLED_BACK, dataDir=str(data))
+    monkeypatch.setattr(update_data, "_read_marker", lambda _d: None)
+    assert update_host.recover_interrupted_update(root) is True
+    assert layout.read_transaction(root) is None
+
+
+def test_residue_with_live_marker_keeps_fail_closed_on_pointer_drift(tmp_path, monkeypatch):
+    """有准备标记且指针漂移=保护状态存疑：维持阻断，保留现场。"""
+    from app.core import update_data
+
+    root = tmp_path / "app"
+    data = root / "data"
+    data.mkdir(parents=True)
+    layout.write_current_state(root, "0.3.8-beta-rc2")
+    layout.start_transaction(root, "0.3.8-beta-rc2", "0.3.8-beta-rc1", attempt_id="guarded")
+    layout.update_transaction(root, layout.STAGE_ROLLED_BACK, dataDir=str(data))
+    monkeypatch.setattr(update_data, "_read_marker", lambda _d: {"token": "t"})
+    monkeypatch.setattr(update_data, "abort_preparation",
+                        lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("升级准备状态无法确认安全，保留数据保护")))
+    with pytest.raises(RuntimeError):
+        update_host.recover_interrupted_update(root)
+    assert layout.read_transaction(root)["attemptId"] == "guarded"
