@@ -609,3 +609,29 @@ func TestReapplyToggle(t *testing.T) {
 		t.Fatalf("env 强制应投影 forcedByEnv=true")
 	}
 }
+
+// validateArgs：required 缺失必须拒执行（G7-C：缺参静默按空执行会把
+// 「没找到」伪装成「查了确实没有」）；未声明键沿用 Python 忽略语义。
+func TestValidateArgsRequiredParams(t *testing.T) {
+	spec := &ToolSpec{
+		Name:       "search_games",
+		Parameters: `{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}`,
+	}
+	if err := validateArgs(spec, map[string]any{}); err == nil {
+		t.Fatal("缺 required 参数应报错")
+	} else if !strings.Contains(err.Error(), `缺少必需参数 "q"`) {
+		t.Fatalf("报错文案 = %q", err.Error())
+	}
+	if err := validateArgs(spec, map[string]any{"q": "portal"}); err != nil {
+		t.Fatalf("全参应放行: %v", err)
+	}
+	// 未声明键放行（对齐 Python BaseHandler 忽略语义）
+	if err := validateArgs(spec, map[string]any{"q": "portal", "extra": 1}); err != nil {
+		t.Fatalf("未声明键应放行: %v", err)
+	}
+	// schema 不可解析时放行（handler 取参路径兜底）
+	broken := &ToolSpec{Name: "x", Parameters: `{not-json`}
+	if err := validateArgs(broken, map[string]any{}); err != nil {
+		t.Fatalf("schema 不可解析应放行: %v", err)
+	}
+}

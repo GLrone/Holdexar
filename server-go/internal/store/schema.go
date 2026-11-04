@@ -43,8 +43,9 @@ func ReadSchemaVersion(dbPath string) (int, error) {
 	return version, nil
 }
 
-// EnsureSupportedVersion 拒绝结构版本超前的存量库；版本账本只拦超前，
-// 落后版本交由迁移链推进。
+// EnsureSupportedVersion 是版本门，双向拒绝：结构版本超前说明库出自更高
+// 版本程序，无法安全降读；落后说明本程序不含迁移链（首次建库与结构升级
+// 由 Python 初始化链负责），落后库应先经 Python 侧升到当前版本再打开。
 func EnsureSupportedVersion(dbPath string, supported int) error {
 	current, err := ReadSchemaVersion(dbPath)
 	if err != nil {
@@ -52,6 +53,9 @@ func EnsureSupportedVersion(dbPath string, supported int) error {
 	}
 	if current > supported {
 		return fmt.Errorf("数据库结构版本 v%d 高于当前程序支持的数据库版本 v%d，拒绝启动", current, supported)
+	}
+	if current < supported {
+		return fmt.Errorf("数据库结构版本 v%d 低于当前程序支持的数据库版本 v%d，拒绝启动：本程序不含迁移链，请先由初始化链完成结构升级", current, supported)
 	}
 	return nil
 }

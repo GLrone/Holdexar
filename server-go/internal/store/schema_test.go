@@ -67,6 +67,22 @@ func TestEnsureSupportedVersionRejectsNewer(t *testing.T) {
 	}
 }
 
+// 伪造 user_version=33：低于支持版本时同样拒绝——本程序不含迁移链，
+// 落后库静默放行会在缺表/缺约束的老库上以 500 面目失败（G7-B R1）。
+func TestEnsureSupportedVersionRejectsOlder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "holdexar.db")
+	writeFixtureDB(t, path, 33)
+
+	err := EnsureSupportedVersion(path, 34)
+	if err == nil {
+		t.Fatal("user_version=33 应被拒绝启动")
+	}
+	want := "数据库结构版本 v33 低于当前程序支持的数据库版本 v34，拒绝启动：本程序不含迁移链，请先由初始化链完成结构升级"
+	if err.Error() != want {
+		t.Fatalf("拒绝文案 = %q，期望 %q", err.Error(), want)
+	}
+}
+
 // 库文件不存在必须报错，且不创建库文件与侧车文件。
 func TestSchemaVersionMissingFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "absent.db")
