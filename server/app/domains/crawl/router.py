@@ -8,6 +8,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.core.events import bus
+from app.crawler.utils import get_beijing_time_obj
 from . import coverage as coverage_service
 from . import cycle as cycle_service
 from . import events as events_service
@@ -155,7 +156,11 @@ async def freshness_latest():
     手动 / 回填 / 补抓作业的成功写入同样推进。从未成功观察为 null。
     """
     at = await freshness_service.latest_price_observation()
-    return {"lastSuccessAt": at.isoformat() if at else None}
+    return {
+        "lastSuccessAt": at.isoformat() if at else None,
+        # 服务端此刻：消费端据此锚定本机钟偏移，数据年龄不随本机钟漂移
+        "serverNow": get_beijing_time_obj().isoformat(),
+    }
 
 
 @router.get("/crawl/price-events")

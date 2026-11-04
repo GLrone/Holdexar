@@ -2204,7 +2204,7 @@ export const crawlApi = {
   cycles: (limit = 1) => request<PriceCycleItem[]>('GET', `/crawl/cycles${toQuery({ limit })}`),
   /** 全库最近一次成功价格观察（灵动岛时钟事实源，活表 last_success_at 的 MAX；
    *  自动轮/手动/补抓/回填的成功写入同样推进；null=从未成功观察） */
-  latestObservation: () => request<{ lastSuccessAt: string | null }>(
+  latestObservation: () => request<{ lastSuccessAt: string | null; serverNow: string | null }>(
     'GET',
     '/crawl/freshness/latest',
   ),

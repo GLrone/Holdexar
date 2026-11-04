@@ -76,7 +76,7 @@ async def test_profile_fill_uses_latest_name_after_waiting_for_writer(monkeypatc
         return row
 
     monkeypatch.setattr(accounts, "fetch_profile", profile)
-    monkeypatch.setattr(accounts, "_strategy_proxy", proxy)
+    monkeypatch.setattr(accounts, "strategy_proxy_or_direct", proxy)
     monkeypatch.setattr(AsyncSession, "get", observed_get)
     begin = asyncio.Event()
 
@@ -148,7 +148,7 @@ async def test_profile_commit_failure_preserves_previous_fields(monkeypatch):
         raise RuntimeError("profile commit rejected")
 
     monkeypatch.setattr(accounts, "fetch_profile", profile)
-    monkeypatch.setattr(accounts, "_strategy_proxy", proxy)
+    monkeypatch.setattr(accounts, "strategy_proxy_or_direct", proxy)
     monkeypatch.setattr(AsyncSession, "commit", reject)
     with pytest.raises(RuntimeError, match="profile commit"):
         await accounts._sync_profile_row(OWNER, "", datetime.now())

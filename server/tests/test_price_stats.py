@@ -54,7 +54,7 @@ async def _price(db, appid, region, status, *, hours_ago: float = 0.0) -> None:
             await session.commit()
     async with db() as session:
         session.add(GameCurrentPrice(
-            appid=appid, region_code=region, currency="CNY",
+            appid=appid, region_code=region.upper(), currency="CNY",
             price=9900 if status == "ok" else None, sub_id=1,
             price_status=status, fail_count=0,
             updated_at=datetime.now() - timedelta(hours=hours_ago),

@@ -96,17 +96,13 @@ def now():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("batch", [False, True])
-async def test_region_status_commit_failure_is_not_swallowed(monkeypatch, batch):
+async def test_region_status_commit_failure_is_not_swallowed(monkeypatch):
     async def reject(_):
         raise RuntimeError("status commit rejected")
 
     monkeypatch.setattr(AsyncSession, "commit", reject)
     with pytest.raises(Exception) as failure:
-        if batch:
-            await DbWriter().mark_region_status_missing_batch([(991001, "cn"), (991001, "CN")])
-        else:
-            await DbWriter().mark_region_status(991001, "cn", "locked")
+        await DbWriter().mark_region_status_missing_batch([(991001, "cn"), (991001, "CN")])
     assert failure.value.pairs == [(991001, "CN")]
     async with get_session_factory()() as session:
         assert await session.get(GameCurrentPrice, (991001, "CN")) is None
@@ -186,7 +182,12 @@ async def test_only_later_persisted_attempts_or_explicit_skips_resolve_targets()
         await session.commit()
     await seed_job(status="done", stats={"skipUnits": ["991002:US"], "targetStartedAt": now().isoformat()}, age=0)
     assert units(await crawl._missing_tasks(cooldown_minutes=4)) == {(991002, "CN")}
-    await DbWriter().mark_region_status(991002, "CN", "blocked")
+    async with write_session() as session:
+        row = await session.get(GameCurrentPrice, (991002, "CN"))
+        row.price_status = "blocked"
+        row.fail_count = 5
+        row.updated_at = now()
+        await session.commit()
     assert not await crawl.has_pending_missing()
     await crawl._missing_tasks(cooldown_minutes=4)
     async with get_session_factory()() as session:
@@ -261,7 +262,10 @@ async def test_retention_keeps_unresolved_failed_jobs_but_releases_settled_and_s
         assert await session.get(CrawlJob, failed) is not None
         assert await session.get(CrawlJob, stopped) is None
         assert await session.get(CrawlJob, done) is None
-    await DbWriter().mark_region_status(991001, "CN", "locked")
+    async with write_session() as session:
+        session.add(GameCurrentPrice(appid=991001, region_code="CN", currency="CNY",
+                                     price_status="locked", updated_at=now()))
+        await session.commit()
     assert await crawl.prune_crawl_jobs() == 1
 
 
@@ -409,7 +413,10 @@ async def test_older_resolver_cannot_restore_targets_or_overwrite_new_statistics
 
     jid = await seed_job(stats={"targets": {"appids": [991001, 991002, 991003], "regions": ["CN"]},
                                "targetStartedAt": (now()-timedelta(minutes=10)).isoformat()})
-    await DbWriter().mark_region_status(991001, "CN", "locked")
+    async with write_session() as session:
+        session.add(GameCurrentPrice(appid=991001, region_code="CN", currency="CNY",
+                                     price_status="locked", updated_at=now()))
+        await session.commit()
     queued = asyncio.Event()
     resume = asyncio.Event()
     old_resolver = None
@@ -426,7 +433,10 @@ async def test_older_resolver_cannot_restore_targets_or_overwrite_new_statistics
     monkeypatch.setattr(crawl, "write_session", delayed_session)
     old_resolver = asyncio.create_task(crawl._unobserved_job_targets(0, settle=True))
     await asyncio.wait_for(queued.wait(), 2)
-    await DbWriter().mark_region_status(991002, "CN", "locked")
+    async with write_session() as session:
+        session.add(GameCurrentPrice(appid=991002, region_code="CN", currency="CNY",
+                                     price_status="locked", updated_at=now()))
+        await session.commit()
     async with write_session() as session:
         row = await session.get(CrawlJob, jid)
         row.stats_json = {**row.stats_json, "newStatistic": 17}

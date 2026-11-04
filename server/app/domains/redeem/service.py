@@ -23,6 +23,7 @@ from app.core.net import is_ssl_error
 
 from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.logging import log_event
+from app.domains.proxies.service import strategy_proxy_or_direct
 from app.domains.account import service as account_service
 from app.domains.account.steam_wallet import parse_cookie_str
 from app.domains.redeem.models import RAW_MAX, RedeemActivation
@@ -81,13 +82,6 @@ def _record_activation(steamid: str) -> None:
     _ACT_LOG.setdefault(steamid, []).append(_time.monotonic())
 
 
-async def _strategy_proxy() -> str | None:
-    """按代理策略引擎解析出网代理；引擎不可用时 None（直连）。"""
-    from app.domains.proxies.service import strategy_proxy_or_direct
-
-    return await strategy_proxy_or_direct()
-
-
 async def _login_session() -> tuple[dict, str, str]:
     """取**当前账号**登录 Cookie jar、sessionid 与账号 SteamID；未绑定/缺 sessionid 时 raise ValueError。
 
@@ -110,7 +104,7 @@ async def _post_steam(url: str, data: dict, jar: dict, *, referer: str | None = 
     headers = dict(_HEADERS)
     if referer:
         headers["Referer"] = referer
-    proxy = await _strategy_proxy()
+    proxy = await strategy_proxy_or_direct()
     try:
         async with httpx.AsyncClient(timeout=20, proxy=proxy) as client:
             resp = await client.post(url, data=data, cookies=jar, headers=headers)

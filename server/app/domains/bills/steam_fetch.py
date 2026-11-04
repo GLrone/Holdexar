@@ -530,10 +530,7 @@ async def probe_history_first_screen(
             detail={"原因": exc},
         )
         return True
-    try:
-        _ensure_account_page(resp, "消费明细页")
-    except SteamFetchError:
-        raise  # Cookie 失效信号要冒泡给主流程（不是"无新交易"）
+    _ensure_account_page(resp, "消费明细页")
     tb_m = re.search(
         r'<table[^>]*class="[^"]*wallet_history_table[^"]*"[^>]*>(.*?)</table>', resp.text, re.DOTALL
     )

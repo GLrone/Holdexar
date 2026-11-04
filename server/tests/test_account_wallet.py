@@ -667,7 +667,7 @@ async def test_sync_profile_row_self_heals_avatar_domain(db, monkeypatch):
     async def _proxy():
         return None
 
-    monkeypatch.setattr(account_service, "_strategy_proxy", _proxy)
+    monkeypatch.setattr(account_service, "strategy_proxy_or_direct", _proxy)
 
     await account_service._sync_profile_row(sid, cookies="", now=get_beijing_time_obj())
 
@@ -701,7 +701,7 @@ async def test_sync_profile_row_keeps_avatar_when_fetch_empty(db, monkeypatch):
     async def _proxy():
         return None
 
-    monkeypatch.setattr(account_service, "_strategy_proxy", _proxy)
+    monkeypatch.setattr(account_service, "strategy_proxy_or_direct", _proxy)
 
     await account_service._sync_profile_row(sid, cookies="", now=get_beijing_time_obj())
 

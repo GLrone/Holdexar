@@ -107,7 +107,9 @@ async def test_locked_is_success_observation_without_price(db):
 
 @pytest.mark.asyncio
 async def test_failed_attempt_keeps_price_and_last_success(db):
-    """传输失败：outcome=failed，旧价与 last_success_at 原样保留。"""
+    """传输失败（批量欠账通道，已有 ok 行）：盖失败章，旧价与 last_success_at
+    原样保留；状态不翻转（有效价继续展示）、预算不递增。欠账首记只发生在
+    新行（另有批量记账测试钉）。"""
     now = datetime.now()
     good_at = now - timedelta(hours=4)
     async with db() as session:
@@ -123,7 +125,7 @@ async def test_failed_attempt_keeps_price_and_last_success(db):
 
     writer = DbWriter()
     await writer.connect()
-    await writer.mark_region_status(APPID, "CN", "missing")
+    await writer.mark_region_status_missing_batch([(APPID, "CN")])
 
     row = await _get_row(db)
     assert row is not None
@@ -133,13 +135,13 @@ async def test_failed_attempt_keeps_price_and_last_success(db):
     assert row.original_price == 2000
     assert row.cny_fen == 1000
     assert row.last_success_at == good_at
-    assert row.price_status == "missing"
-    assert row.fail_count == 1
+    assert row.price_status == "ok", "传输失败不翻转状态"
+    assert row.fail_count == 0, "传输类失败不递增预算"
 
 
 @pytest.mark.asyncio
-async def test_exhausted_failures_turn_blocked_and_keep_price(db):
-    """连败穷尽转 blocked 终态：仍是失败态，价照旧保留。"""
+async def test_degradation_exhaustion_turns_blocked_and_keeps_price(db):
+    """门禁降级穷尽转 blocked 终态：仍是失败态，价照旧保留。"""
     now = datetime.now()
     good_at = now - timedelta(hours=8)
     async with db() as session:
@@ -154,7 +156,10 @@ async def test_exhausted_failures_turn_blocked_and_keep_price(db):
 
     writer = DbWriter()
     await writer.connect()
-    await writer.mark_region_status(APPID, "CN", "missing")
+    await writer.upsert_task_batch([
+        ({"appid": APPID, "name": "g", "type": "game"},
+         [_price_row("cn", "ok", price=None)]),
+    ])
 
     row = await _get_row(db)
     assert row is not None
@@ -214,5 +219,5 @@ async def test_latest_observation_follows_success_only(db, monkeypatch):
     first = await freshness_mod.latest_price_observation()
     assert first is not None
 
-    await writer.mark_region_status(APPID, "CN", "missing")
+    await writer.mark_region_status_missing_batch([(APPID, "CN")])
     assert await freshness_mod.latest_price_observation() == first, "失败不回退时钟"
