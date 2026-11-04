@@ -29,6 +29,12 @@ from app.core.app_info import (
     STAGING_MANIFEST_NAME,
     version_from_tag,
 )
+from app.core.app_info import (
+    MIGRATION_IDLE_WINDOW,
+    MIGRATION_MAX_DURATION,
+    MIGRATION_SIGNAL_INTERVAL,
+)
+from app.core.db_safety import read_schema_version
 from app.core.paths import install_root as resolve_default_install_root
 
 def _http_get_json(host: str, port: int, path: str, timeout: float = 3.0) -> tuple[int, dict | None]:
@@ -404,7 +410,7 @@ def supports_data_protocol(exe: Path) -> bool:
     try:
         with tempfile.TemporaryDirectory(prefix="holdexar-update-protocol-") as tmp:
             result_path = Path(tmp) / "capability.json"
-            env = dict(os.environ, HOLDEXAR_UPDATE_PROTOCOL_RESULT=str(result_path))
+            env = dict(os.environ, **{f"{ENV_PREFIX}UPDATE_PROTOCOL_RESULT": str(result_path)})
             result = subprocess.run(
                 [str(exe), "--update-protocol", "--help"], env=env,
                 capture_output=True, timeout=25,
@@ -469,6 +475,21 @@ def verify_health_response(
     return None
 
 
+def _read_migration_signal(data_dir: Path) -> tuple[int | None, int]:
+    """只读迁移存活信号：(库结构版本, 迁移前快照字节数)；读不到按无信号处理。"""
+    snapshot = -1
+    for p in data_dir.glob("*.pre-migration.bak"):
+        try:
+            snapshot = p.stat().st_size
+        except OSError:
+            snapshot = -1
+        break
+    try:
+        return read_schema_version(data_dir), snapshot
+    except Exception:  # noqa: BLE001 — 迁移写事务中的瞬时锁冲突不算故障
+        return None, snapshot
+
+
 def probe_version_health(
     root: Path,
     target_version: str,
@@ -486,7 +507,7 @@ def probe_version_health(
     if not exe.is_file():
         return False, f"{HEALTH_BINDING_ERROR}：主程序不存在"
 
-    expected_data_dir = (data_dir or (root / "data")).resolve()
+    expected_data_dir = (data_dir or (root / layout.DATA_DIR_NAME)).resolve()
     transaction = layout.read_transaction(root) or {}
     protected = bool(transaction.get("dataPrepared") and not transaction.get("dataAccepted")
                      and transaction.get("dataRecoveryPhase") != "restored") if require_guard is None else require_guard
@@ -553,6 +574,13 @@ def probe_version_health(
     last_reason = f"{HEALTH_BINDING_ERROR}：无可用健康响应"
     # 验收进程的映像在拉起后固化：后续只与自身比对，防止中途被替换
     expected_image = process_image_path(proc.pid)
+    # 迁移阶段与健康验收分账（只读信号，不进验收判据）：信号推进=迁移存活，刷新
+    # 空闲窗；空闲窗兜「真卡死」，总上限兜「无限慢」。
+    started = time.monotonic()
+    migration_cap = started + MIGRATION_MAX_DURATION
+    last_schema: int | None = None
+    last_snapshot = -1
+    next_signal = 0.0
 
     try:
         while time.monotonic() < deadline:
@@ -563,6 +591,16 @@ def probe_version_health(
                 current_image = process_image_path(proc.pid)
                 if current_image and not _same_path(current_image, expected_image):
                     return False, f"{HEALTH_BINDING_ERROR}：进程镜像被替换为 {current_image}"
+            now = time.monotonic()
+            if now >= migration_cap:
+                return False, f"数据库迁移超出总预算（{MIGRATION_MAX_DURATION:.0f}s），执行回滚"
+            if now >= next_signal:
+                next_signal = now + MIGRATION_SIGNAL_INTERVAL
+                schema_now, snapshot_now = _read_migration_signal(expected_data_dir)
+                if schema_now != last_schema or snapshot_now != last_snapshot:
+                    last_schema, last_snapshot = schema_now, snapshot_now
+                    deadline = max(deadline, now + MIGRATION_IDLE_WINDOW)
+                    _trace(f"迁移推进：schema={schema_now} 快照字节={snapshot_now}")
             _trace(f"验收轮询：pid={proc.pid} 监听端口={ports} 属主={owner_pid}")
             for candidate in ports:
                 if not _answers_http(candidate):
@@ -613,7 +651,9 @@ def probe_version_health(
                     preserved = True
                 return True, "健康检查通过"
             time.sleep(0.5)
-        return False, f"{HEALTH_TIMEOUT_ERROR}（{timeout}s）：{last_reason}"
+        budget = f"{timeout:.0f}s" if deadline <= started + timeout else (
+            f"验收窗 {timeout:.0f}s + 迁移空闲窗 {MIGRATION_IDLE_WINDOW:.0f}s")
+        return False, f"{HEALTH_TIMEOUT_ERROR}（{budget}）：{last_reason}"
     finally:
         if proc and not preserved:
             try:
@@ -663,7 +703,7 @@ def _verify_staging_payload(staging_dir: Path, manifest: dict[str, Any]) -> str:
 
 def _resolve_data_dir(root: Path, requested: Path | None) -> Path:
     """本次换装的数据目录：显式传入优先，否则安装根 data/。"""
-    candidate = Path(requested).resolve() if requested else (root / "data").resolve()
+    candidate = Path(requested).resolve() if requested else (root / layout.DATA_DIR_NAME).resolve()
     return candidate
 
 
@@ -675,7 +715,7 @@ def _spawn_detached(root: Path, exe: Path, argv: list[str] | None = None) -> Non
         env.pop(f"{ENV_PREFIX}{key}", None)
     env[f"{ENV_PREFIX}INSTALL_ROOT"] = str(root)
     tx = layout.read_transaction(root) or {}
-    env[f"{ENV_PREFIX}DATA_DIR"] = str(tx.get("dataDir") or (root / "data"))
+    env[f"{ENV_PREFIX}DATA_DIR"] = str(tx.get("dataDir") or root / layout.DATA_DIR_NAME)
     subprocess.Popen(
         command,
         cwd=str(exe.parent),
@@ -696,7 +736,7 @@ def _relaunch_previous(root: Path, version: str | None) -> bool:
         tx = layout.read_transaction(root) or {}
         healthy, reason = probe_version_health(
             root, target_ver, str(tx.get("attemptId") or "recovery"),
-            data_dir=Path(tx.get("dataDir") or root / "data"), require_guard=False,
+            data_dir=Path(tx.get("dataDir") or root / layout.DATA_DIR_NAME), require_guard=False,
         )
         layout.update_transaction(root, tx.get("stage", layout.STAGE_ROLLED_BACK), sourceServiceHealthy=healthy)
         if not healthy:
@@ -764,8 +804,8 @@ def _fail(
             update_data.rollback(root, children_stopped=True)
         except Exception as exc:
             error = f"{error}；数据恢复未完成，已保留现场：{exc}"
-            layout.update_transaction(root, "recovery_required", error=error)
-            diagnosis.update(success=False, error=error, dataPreserved=True, stage="recovery_required")
+            layout.update_transaction(root, layout.STAGE_RECOVERY_REQUIRED, error=error)
+            diagnosis.update(success=False, error=error, dataPreserved=True, stage=layout.STAGE_RECOVERY_REQUIRED)
             _write_diagnosis(root, diagnosis)
             return False
     elif tx.get("dataDir"):
@@ -774,7 +814,7 @@ def _fail(
         try:
             update_data.abort_preparation(root, data_dir=Path(tx["dataDir"]))
         except Exception as exc:
-            layout.update_transaction(root, "recovery_required", error=f"恢复点准备未结束：{exc}")
+            layout.update_transaction(root, layout.STAGE_RECOVERY_REQUIRED, error=f"恢复点准备未结束：{exc}")
             return False
     target_ver = str(diagnosis.get("targetVersion") or "")
     pointer = launched_version or layout.get_current_version(root)
@@ -792,8 +832,8 @@ def _fail(
             update_data.finish_rollback(root)
         except Exception as exc:
             error = f"{error}；程序与数据恢复尚未完成：{exc}"
-            layout.update_transaction(root, "recovery_required", error=error, relaunchPrevious=False)
-            diagnosis.update(success=False, error=error, stage="recovery_required", dataPreserved=True)
+            layout.update_transaction(root, layout.STAGE_RECOVERY_REQUIRED, error=error, relaunchPrevious=False)
+            diagnosis.update(success=False, error=error, stage=layout.STAGE_RECOVERY_REQUIRED, dataPreserved=True)
             _write_diagnosis(root, diagnosis)
             return False
     diagnosis.update({
@@ -878,9 +918,11 @@ def recover_interrupted_update(root: Path) -> bool:
     with update_mutex():
         tx = layout.read_transaction(root) or {}
         if tx.get("dataRollbackReleased"):
+            # 已释放=数据已还原且保护解除，事务完结；指针归启动链相容性校验管
+            if tx.get("dataRecoveryPhase") not in (None, "restored"):
+                raise RuntimeError("更新恢复相位无法证明完成，已停止启动并保留数据")
             update_data.finish_rollback(root)
-            if layout.get_current_version(root) != tx.get("sourceVersion"):
-                raise RuntimeError("已恢复的数据与当前程序指向不一致，已停止启动并保留数据")
+            layout.clear_transaction(root)
             return True
         if tx.get("dataAccepted"):
             update_data.accept(root)
@@ -890,6 +932,7 @@ def recover_interrupted_update(root: Path) -> bool:
             layout.confirm_version(root, compatible)
             layout.update_transaction(root, layout.STAGE_COMMITTED, currentVersion=compatible)
             _finish_diagnosis(root, compatible)
+            layout.clear_transaction(root)
             return True
         if tx.get("dataPrepared"):
             if tx.get("launchPending"):
@@ -914,8 +957,14 @@ def recover_interrupted_update(root: Path) -> bool:
                     or layout.get_current_version(root) != current.get("sourceVersion")
                     or update_data._marker_path(Path(current["dataDir"])).exists()):
                 raise RuntimeError("更新恢复尚未完成，原始快照与故障数据均已保留，请查看更新诊断")
+            layout.clear_transaction(root)
         elif tx.get("dataDir"):
-            update_data.abort_preparation(root, data_dir=Path(tx["dataDir"]))
+            if update_data._read_marker(Path(tx["dataDir"])) is None:
+                # 无准备标记=数据从未进入保护，事务只是残壳；指针归属由启动链相容校验管
+                layout.clear_transaction(root)
+            else:
+                update_data.abort_preparation(root, data_dir=Path(tx["dataDir"]))
+                layout.clear_transaction(root)
         return True
 
 
@@ -951,9 +1000,10 @@ def _execute_update_locked(
     previous_tx = layout.read_transaction(root) or {}
     if previous_tx.get("dataDir"):
         recover_interrupted_update(root)
-        if (not previous_tx.get("dataAccepted") and not previous_tx.get("dataRollbackReleased")
-                and previous_tx.get("stage") != layout.STAGE_ROLLED_BACK):
-            current_tx = layout.read_transaction(root) or {}
+        # 裁决只认恢复后的最新事务：恢复已收尾（含清场）即放行
+        current_tx = layout.read_transaction(root) or {}
+        if current_tx.get("dataDir") and (not current_tx.get("dataAccepted")
+                and not current_tx.get("dataRollbackReleased")):
             layout.update_transaction(root, current_tx.get("stage", layout.STAGE_ROLLED_BACK), relaunchPrevious=True)
             return False
     curr_state = layout.read_current_state(root)
@@ -1099,6 +1149,8 @@ def _commit(
     _log_update(root, f"换装成功！清理历史版本：{pruned}")
 
     _finish_diagnosis(root, target_version, diagnosis)
+    # 提交即终态：指针与相容记录已落 current.json，事务档案使命结束
+    layout.clear_transaction(root)
     return True
 
 

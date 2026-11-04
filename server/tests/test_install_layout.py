@@ -54,8 +54,8 @@ def test_transaction_lifecycle(tmp_path):
     assert tx2["stage"] == layout.STAGE_SWITCHING
 
     # 3. 记录失败
-    tx3 = layout.update_transaction(root, stage=layout.STAGE_FAILED, error="Timeout")
-    assert tx3["stage"] == layout.STAGE_FAILED
+    tx3 = layout.update_transaction(root, stage="failed", error="Timeout")
+    assert tx3["stage"] == "failed"
     assert tx3["error"] == "Timeout"
 
     # 4. 清理
