@@ -15,6 +15,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import { crawlApi, type PriceCycleItem } from '@/api/client'
 import { priceStatusOf } from '@/lib/headerStatus'
+import { serverOffsetMs } from '@/lib/serverClock'
 import { useI18n } from '@/locales'
 import { useCrawlStatusStore } from '@/stores/crawlStatus'
 
@@ -39,6 +40,10 @@ export function usePriceStatus() {
   const sawActivity = ref(false)
   /** 相对时长的计算基准时刻 */
   const now = ref(Date.now())
+  /** 服务端钟偏移：每次读到 serverNow 就重锚，数据年龄一律按服务端钟计 */
+  const clockOffsetMs = ref(0)
+  /** 以服务端钟为本的「此刻」（本机钟漂移不改变「数据有多旧」的结论） */
+  const serverNow = computed(() => now.value + clockOffsetMs.value)
 
   let ticker: number | undefined
   let resyncTicker: number | undefined
@@ -51,6 +56,7 @@ export function usePriceStatus() {
       ])
       latestCycle.value = cycles[0] ?? null
       lastUpdatedAt.value = latest.lastSuccessAt
+      clockOffsetMs.value = serverOffsetMs(latest.serverNow, Date.now())
     } catch {
       /* 读不到就保持上一次的结论：不把状态改写成比实际更好或更坏 */
     }
@@ -98,7 +104,7 @@ export function usePriceStatus() {
   const stale = computed(() => {
     const at = lastUpdatedAt.value
     if (!at) return true
-    const ms = now.value - new Date(at).getTime()
+    const ms = serverNow.value - new Date(at).getTime()
     return !Number.isFinite(ms) || ms > FRESH_WINDOW_MS
   })
 
@@ -172,7 +178,7 @@ export function usePriceStatus() {
   const ago = computed(() => {
     const at = lastUpdatedAt.value
     if (!at) return ''
-    const ms = now.value - new Date(at).getTime()
+    const ms = serverNow.value - new Date(at).getTime()
     if (!Number.isFinite(ms) || ms < 0) return ''
     const minutes = Math.floor(ms / 60_000)
     if (minutes < 1) return t('island.ago.justNow')

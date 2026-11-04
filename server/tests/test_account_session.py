@@ -322,7 +322,7 @@ async def _isolate(monkeypatch):
     async def _none():
         return None
 
-    monkeypatch.setattr(account_service, "_strategy_proxy", _none)
+    monkeypatch.setattr(account_service, "strategy_proxy_or_direct", _none)
     account_service._session_refresh_at.clear()
     account_service._session_refresh_locks.clear()
 

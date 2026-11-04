@@ -21,8 +21,9 @@ import httpx
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicNumbers
 
+from app.domains.proxies.service import strategy_proxy_or_direct
 from app.core.logging import log_event
-from .service import _strategy_proxy, bind_account
+from .service import bind_account
 from .session import SessionRefreshError, web_cookies_from_refresh_token
 
 logger = logging.getLogger(__name__)
@@ -445,7 +446,7 @@ async def start_login(account_name: str, password: str) -> dict:
         _cancelled = asyncio.Event()
         _session = _new_session(STATE_SIGNING, "正在登录…")
         try:
-            proxy_url = await _strategy_proxy()
+            proxy_url = await strategy_proxy_or_direct()
             info = await _begin_session(account, password, proxy_url)
         except LoginError as exc:
             log_event(
@@ -572,7 +573,7 @@ async def submit_guard_code(code: str) -> dict:
     if not (code or "").strip():
         return {"ok": False, "state": login_status(), "error": "请输入验证码"}
     try:
-        proxy_url = await _strategy_proxy()
+        proxy_url = await strategy_proxy_or_direct()
         await _submit_guard_code(session, code, int(session["code_guard"]), proxy_url)
     except LoginError as exc:
         return {"ok": False, "state": login_status(), "error": str(exc)}

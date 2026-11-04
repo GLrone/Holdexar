@@ -103,7 +103,7 @@ def _no_proxy(monkeypatch):
     async def _none():
         return None
 
-    monkeypatch.setattr(login_module, "_strategy_proxy", _none)
+    monkeypatch.setattr(login_module, "strategy_proxy_or_direct", _none)
 
 
 @pytest.fixture(autouse=True)
